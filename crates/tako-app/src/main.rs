@@ -2135,6 +2135,10 @@ struct TakoApp {
     /// ファイルツリー内のドラッグで、いまカーソルが載っている行と判定（FR-3.32 / #1834）。
     /// 行をまたいだときだけ判定し直す（同名の stat を 1 行につき 1 回で済ませる）
     tree_drop: Option<sidebar::TreeDropHover>,
+    /// ファイルツリーで選んでいる行（⌘C / ⌘X / ⌘V の対象。FR-3.34 / #1860）
+    tree_selection: Option<sidebar::TreeSelection>,
+    /// ファイルツリーのクリップボードの tako 側の中身（#1860。切り取りはここにしか無い）
+    file_clipboard: Option<tako_core::file_clipboard::FileClipboard>,
     /// タブバーへのペイン D&D: ドロップ先タブ（Some(id) = 既存タブへ合流、None = 新タブ化）
     tab_drop_target: Option<Option<TabId>>,
     /// タブ D&D 並べ替え中の挿入位置インジケータ（#308）。
@@ -3461,6 +3465,8 @@ struct ContextMenu {
     path: std::path::PathBuf,
     is_dir: bool,
     is_pinned_root: bool,
+    /// 開いた時点でクリップボードに貼れるものがあるか（無ければ「貼り付け」を押せない見た目。#1860）
+    can_paste: bool,
     position: Point<Pixels>,
 }
 
@@ -4208,6 +4214,8 @@ impl TakoApp {
             drop_cmd_held: false,
             drop_target: None,
             tree_drop: None,
+            tree_selection: None,
+            file_clipboard: None,
             tab_drop_target: None,
             tab_reorder_indicator: None,
             dragging_tab: None,
@@ -5452,6 +5460,8 @@ impl TakoApp {
                         Some((
                             app.filetree.refresh_targets(),
                             app.filetree.roots().to_vec(),
+                            // #1860: 読み始めの世代（この後に同期で読み直した結果を古い一覧で潰さない）
+                            app.filetree.generation(),
                         ))
                     } else {
                         None
@@ -5874,7 +5884,7 @@ impl TakoApp {
                         }
                     }
                 }
-                if let Some((targets, git_roots)) = filetree_targets {
+                if let Some((targets, git_roots, since)) = filetree_targets {
                     let task = cx
                         .background_executor()
                         .spawn(async move { filetree::scan_dirs(&targets) });
@@ -5884,8 +5894,10 @@ impl TakoApp {
                     let results = task.await;
                     let git_status = git_task.await;
                     let ok = this.update(cx, |app: &mut TakoApp, cx| {
-                        let mut changed = app.filetree.apply_refresh(results);
+                        let mut changed = app.filetree.apply_refresh_since(results, since);
                         changed |= app.filetree.apply_git_status(git_status);
+                        // #1860: ほかのアプリで何かをコピーしたら、切り取り中の薄い行を戻す
+                        changed |= app.drop_stale_file_clipboard();
                         if changed {
                             cx.notify();
                         }
@@ -12980,6 +12992,11 @@ impl TakoApp {
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        // #1860: ツリーの行を選んでいる（最後に押したのがツリー）ならファイルのコピー
+        if let Some(sel) = self.active_tree_selection().cloned() {
+            self.tree_clip_action(tako_core::platform::keys::TreeClipKey::Copy, &sel, cx);
+            return;
+        }
         // #725: チャット表示のペインは会話本文の選択が最優先
         // （同じペインの端末側にも古い選択が残り得るため、表示中のものを採る）
         if let Some(text) = self.chat_selected_text() {
@@ -14388,6 +14405,14 @@ impl TakoApp {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
+        // #1860: ツリーの行を選んでいる（最後に押したのがツリー）ならファイルの貼り付け。
+        // 入力欄（パレット・インライン入力・コミット欄など）が開いている間は入力欄が勝つ
+        if !self.text_input_swallows_keys() {
+            if let Some(sel) = self.active_tree_selection().cloned() {
+                self.tree_clip_action(tako_core::platform::keys::TreeClipKey::Paste, &sel, cx);
+                return;
+            }
+        }
         let item = cx.read_from_clipboard();
         let Some(text) = item.as_ref().and_then(|item| item.text()) else {
             // #719 要件 1: 画像だけがクリップボードにあるときの ⌘V。
@@ -14594,6 +14619,16 @@ impl TakoApp {
         if self.web_dock_url_active() && self.handle_webview_dock_url_key(keystroke, cx) {
             cx.stop_propagation();
             return;
+        }
+
+        // #1860: ツリーの行を選んでいるときの ⌘C / ⌘X / ⌘V（Windows は Ctrl）と Esc。
+        // それ以外の打鍵は選択を外してペインへ流す（打ち始めた = もうツリーを見ていない）
+        if self.handle_tree_clip_keystroke(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.tree_selection.take().is_some() {
+            cx.notify();
         }
 
         if self.handle_preview_edit_key(keystroke, cx) {
@@ -23949,6 +23984,36 @@ impl PreviewHost for TakoApp {
         self.follow_file_move(from, to, follows);
     }
 
+    /// #1860: 写した先のフォルダを開いて読み直す（2 秒のポーリングを待たない）
+    fn file_copied(&mut self, to: &std::path::Path) {
+        self.filetree.note_copied(to);
+    }
+
+    fn file_clipboard(&self) -> Option<tako_core::file_clipboard::FileClipboard> {
+        self.file_clipboard.clone()
+    }
+
+    fn set_file_clipboard(&mut self, clip: Option<tako_core::file_clipboard::FileClipboard>) {
+        self.file_clipboard = clip;
+    }
+
+    /// #1860: OS のクリップボード（境界 B28）。GUI だけが本物へ繋ぐ
+    fn os_file_clipboard_write(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        cut: bool,
+    ) -> Result<u64, String> {
+        tako_control::platform::file_clipboard::write(paths, cut)
+    }
+
+    fn os_file_clipboard_read(&self) -> tako_core::file_clipboard::OsFiles {
+        tako_control::platform::file_clipboard::read()
+    }
+
+    fn os_file_clipboard_clear_if(&mut self, stamp: u64) {
+        tako_control::platform::file_clipboard::clear_if(stamp);
+    }
+
     fn preview_changelog_state(&self, pane: PaneId) -> Option<bool> {
         if self.previews.contains_key(&pane) {
             Some(self.preview_changelogs.contains_key(&pane))
@@ -26237,6 +26302,13 @@ impl Render for TakoApp {
                     this.on_modifiers_changed(event, window, cx);
                 },
             ))
+            // #1860: どこを押してもまず選択を外す（捕捉フェーズ = 行の押下より先）。
+            // ツリーの行は自分の押下 / クリックで選び直すので、ツリーの外を押したときだけ外れる
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if this.tree_selection.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.on_mouse_move(event, window, cx);
             }))
@@ -42351,6 +42423,11 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                "tree-clipboard" => {
+                    tree_clipboard_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -42360,7 +42437,8 @@ mod self_test {
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
-                         large-file-edit / large-file-decor / external-change / editor-font / tree-move）"
+                         large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
+                         tree-clipboard）"
                     );
                     std::process::exit(1);
                 }
@@ -44741,6 +44819,7 @@ mod self_test {
 
             // #1834: ツリーの行のドラッグ＆ドロップによる移動（実マウス）
             tree_move_visual(any, window, cx).await;
+            tree_clipboard_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
@@ -50913,6 +50992,708 @@ mod self_test {
                 t.remove_pinned_folder(&base);
             }
             app.tree_row_probe = false;
+            app.sync_filetree_roots();
+            cx.notify();
+        });
+        if base.starts_with(&tmp) && base != tmp {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// #1860 の道具: 行を**実 OS マウスと同じ `PlatformInput` 経路**で押す（左 = クリック /
+    /// 右 = メニュー）。押す位置は描いた行の実矩形（`tree_row_probe`）
+    #[cfg(feature = "visual-test")]
+    fn vt1860_click(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        at: Point<Pixels>,
+        button: MouseButton,
+    ) {
+        let send = |cx: &mut AsyncApp, input: gpui::PlatformInput| {
+            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+        };
+        let mods = Modifiers::default();
+        send(
+            cx,
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position: at,
+                pressed_button: None,
+                modifiers: mods,
+            }),
+        );
+        send(
+            cx,
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position: at,
+                modifiers: mods,
+                click_count: 1,
+                first_mouse: false,
+            }),
+        );
+        send(
+            cx,
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position: at,
+                modifiers: mods,
+                click_count: 1,
+            }),
+        );
+        notify_and_draw(any, window, cx);
+    }
+
+    /// #1860 の道具: 打鍵を **GPUI のキー配送**（キーバインド判定 → アクション → `on_key_down`）へ流す
+    #[cfg(feature = "visual-test")]
+    fn vt1860_press(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        spec: &str,
+    ) {
+        let keystroke = Keystroke::parse(spec).expect("visual-test tree-clipboard: 打鍵の綴り");
+        let _ = any.update(cx, |_, win, cx| win.dispatch_keystroke(keystroke, cx));
+        notify_and_draw(any, window, cx);
+    }
+
+    /// #1860 の道具: 条件が立つまで描き直しながら待つ（background のコピーの着地待ち）
+    #[cfg(feature = "visual-test")]
+    async fn vt1860_wait(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        timeout: Duration,
+        cond: &dyn Fn(&mut AsyncApp) -> bool,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            notify_and_draw(any, window, cx);
+            if cond(cx) {
+                return true;
+            }
+            if start.elapsed() > timeout {
+                return false;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+    }
+
+    /// #1860 の道具: 名前付きペーストボードを**別のプロセス**（`osascript` = AppKit）から
+    /// 読み書きする。Finder の ⌘C が置く形（NSURL のファイル URL）を書き、Finder の ⌘V が読む
+    /// API（`readObjectsForClasses:[NSURL]`）で読む = tako の外のアプリとの往復の代役
+    #[cfg(all(feature = "visual-test", target_os = "macos"))]
+    fn vt1860_osascript(script: &str, env: &[(&str, &str)]) -> Option<serde_json::Value> {
+        let mut command = std::process::Command::new("/usr/bin/osascript");
+        // macOS 専用の節だが、子プロセス起動は窓の抑止の口を通す決まり（#628 / #586）
+        tako_core::platform::process::no_console_window(&mut command);
+        command.args(["-l", "JavaScript", "-e", script]);
+        for (k, v) in env {
+            command.env(k, v);
+        }
+        let out = command.output().ok()?;
+        if !out.status.success() {
+            eprintln!(
+                "visual-test tree-clipboard: osascript が失敗: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return None;
+        }
+        serde_json::from_slice(&out.stdout).ok()
+    }
+
+    /// ファイルツリーのコピー / 切り取り / 貼り付け（FR-3.34 / #1860）を**実マウス・実キーで**確かめる。
+    ///
+    /// ①⌘C → ⌘V（フォルダの行 = その中・ファイルの行 = そのフォルダへ複製。同名は別名で
+    /// 上書きしない・選んだ行に枠が出る）②⌘X → ⌘V（移動。切り取り中の行が薄く出る・
+    /// 編集中・未保存のペインが付け替わり、待っても「外で削除された」にならない）③右クリックの
+    /// 「コピー」「貼り付け」（貼るものが無いと押せない）④自分の配下へは理由つきで断る・自分の行で
+    /// 貼ると複製 ⑤Finder 相当の別プロセスが置いたファイルを貼る ⑥tako のコピーを別プロセスが
+    /// Finder と同じ API で読める ⑦ほかの打鍵・ペインの押下で選択が外れ、⌘V がペインへ戻る。
+    ///
+    /// **ユーザーのクリップボードは触らない**: OS のクリップボードは `TAKO_FILE_PASTEBOARD` の
+    /// 名前付きペーストボード（無ければこの節が自分の名前で立てる）。
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1860_LEGACY=1` はツリーがキーを受けないので
+    /// ① が FAILED になる = 同一バイナリでの A/B。単独実行は `TAKO_VISUAL_ONLY=tree-clipboard`
+    #[cfg(feature = "visual-test")]
+    async fn tree_clipboard_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::{Direction, PreviewModeWire, Request as Req};
+        inject_section_failure("tree-clipboard");
+        // 一般のペーストボード（ユーザーのクリップボード）へ書かない
+        if std::env::var("TAKO_FILE_PASTEBOARD")
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
+            std::env::set_var(
+                "TAKO_FILE_PASTEBOARD",
+                format!("tako-vt1860-{}", std::process::id()),
+            );
+        }
+        let pasteboard = std::env::var("TAKO_FILE_PASTEBOARD").unwrap_or_default();
+        let p0 = ensure_fresh_scene(window, cx, "tree-clipboard").await;
+        let mac = cfg!(target_os = "macos");
+        let key = |letter: &str| {
+            if mac {
+                format!("cmd-{letter}")
+            } else {
+                format!("ctrl-{letter}")
+            }
+        };
+
+        // --- 場面: 一時 dir の中だけに fixture を作る（本物のファイルを書き換えない = #1811） ---
+        let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
+        let raw = tmp.join(format!("tako-vt1860-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&raw);
+        for dir in ["src", "folder/inner", "dst", "deep/sub", "finder"] {
+            std::fs::create_dir_all(raw.join(dir)).expect("visual-test tree-clipboard fixture");
+        }
+        let base = tako_core::platform::path::canonicalize_or_self(&raw);
+        if !base.starts_with(&tmp) || base == tmp {
+            fail(&format!(
+                "visual-test tree-clipboard: fixture が一時 dir の外 ({})",
+                base.display()
+            ));
+        }
+        let at = |rel: &str| base.join(rel);
+        for (rel, body) in [
+            ("src/a.txt", "A\n"),
+            ("src/b.txt", "B\n"),
+            ("folder/inner/x.txt", "X\n"),
+            ("deep/sub/s.txt", "S\n"),
+            ("finder/from-finder.txt", "F\n"),
+        ] {
+            std::fs::write(at(rel), body).expect("visual-test tree-clipboard fixture");
+        }
+        let tab = window
+            .update(cx, |app, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                app.filetree.visible = true;
+                let tab = app.workspace.active_tab_id();
+                if let Some(t) = app.workspace.get_tab_mut(tab) {
+                    t.add_pinned_folder(base.clone());
+                }
+                app.sync_filetree_roots();
+                for r in app.filetree.rows() {
+                    if r.root && r.expanded && r.entry.path != base {
+                        app.filetree.toggle_dir(&r.entry.path);
+                    }
+                }
+                app.filetree.expand_dir(&base);
+                for rel in ["src", "folder", "folder/inner", "dst", "deep"] {
+                    app.filetree.expand_dir(&base.join(rel));
+                }
+                app.tree_row_probe = true;
+                app.remote_notice = None;
+                app.file_clipboard = None;
+                app.tree_selection = None;
+                cx.notify();
+                tab
+            })
+            .unwrap_or_else(|_| fail("visual-test tree-clipboard: 場面づくり"));
+        let run = |cx: &mut AsyncApp, request: Req| {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(app, request, PaneOrigin::Cli);
+                    cx.notify();
+                    r
+                })
+                .unwrap_or_else(|_| fail("visual-test tree-clipboard: dispatch"))
+        };
+        // x.txt を編集中・未保存（自動保存 OFF）で開いておく（⌘X → ⌘V の付け替えの観測先）
+        let pv_x = run(
+            cx,
+            Req::OpenFile {
+                pane: Some(p0.as_u64()),
+                path: at("folder/inner/x.txt").display().to_string(),
+                mode: Some(PreviewModeWire::Code),
+                direction: Some(Direction::Right),
+                focus: Some(false),
+                new_tab: false,
+                line: None,
+                column: None,
+            },
+        )
+        .ok()
+        .and_then(|v| v["pane"].as_u64())
+        .map(PaneId::from_raw)
+        .unwrap_or_else(|| fail("visual-test tree-clipboard: x.txt を開けない"));
+        let edit_ok = [
+            Req::PreviewEdit {
+                pane: Some(pv_x.as_u64()),
+                enabled: Some(true),
+            },
+            Req::PreviewAutosave {
+                pane: Some(pv_x.as_u64()),
+                enabled: Some(false),
+            },
+            Req::PreviewApply {
+                pane: Some(pv_x.as_u64()),
+                text: "X\nunsaved\n".into(),
+            },
+        ]
+        .into_iter()
+        .all(|r| run(cx, r).is_ok());
+        check(
+            edit_ok,
+            "visual-test tree-clipboard: x.txt を編集中・未保存にする（前提。#1860）",
+        );
+        notify_and_draw(any, window, cx);
+
+        // 観測の道具
+        let rect_of = |cx: &mut AsyncApp, path: &std::path::Path| {
+            vt1834_rows(any, window, cx)
+                .into_iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, b)| b)
+        };
+        let row_point = |cx: &mut AsyncApp, path: &std::path::Path| {
+            let rect = rect_of(cx, path).unwrap_or_else(|| {
+                fail(&format!(
+                    "visual-test tree-clipboard: 行が描かれていない（{}）",
+                    path.display()
+                ))
+            });
+            (vt1834_grab(rect), rect)
+        };
+        let selection = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.active_tree_selection().map(|s| s.path.clone())
+                })
+                .ok()
+                .flatten()
+        };
+        let clip = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| app.file_clipboard.clone())
+                .ok()
+                .flatten()
+        };
+        let notice = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.remote_notice.as_ref().map(|n| n.text.clone())
+                })
+                .ok()
+                .flatten()
+        };
+        let clear_notice = |cx: &mut AsyncApp| {
+            let _ = window.update(cx, |app, _, cx| {
+                app.remote_notice = None;
+                cx.notify();
+            });
+        };
+        let theme = window
+            .update(cx, |app, _, _| app.theme.clone())
+            .unwrap_or_else(|_| fail("visual-test tree-clipboard: テーマ"));
+        let frame = |cx: &mut AsyncApp| {
+            capture_frame(any, cx).unwrap_or_else(|| fail("visual-test tree-clipboard: フレーム"))
+        };
+        let count_in = |img: &image::RgbaImage, row: Bounds<Pixels>, scale: f32, color| {
+            [false, true]
+                .into_iter()
+                .map(|flip| color_pixels_in_bounds(img, row, scale, color, 14, flip))
+                .max()
+                .unwrap_or(0)
+        };
+        let naming = tako_core::file_copy::CopyNaming::current();
+        let landed = Duration::from_secs(10);
+
+        // ① ⌘C → ⌘V
+        let (a_pt, _) = row_point(cx, &at("src/a.txt"));
+        vt1860_click(any, window, cx, a_pt, MouseButton::Left);
+        check(
+            selection(cx) == Some(at("src/a.txt")),
+            &format!(
+                "visual-test tree-clipboard ①: 行を押すと選ばれる (#1860。{:?})",
+                selection(cx)
+            ),
+        );
+        vt1860_press(any, window, cx, &key("c"));
+        let copied = clip(cx);
+        check(
+            copied.as_ref().is_some_and(|c| {
+                c.mode == tako_core::file_clipboard::ClipMode::Copy
+                    && c.paths == vec![at("src/a.txt")]
+            }),
+            &format!(
+                "visual-test tree-clipboard ①: ⌘C でツリーのクリップボードに載る (#1860。{copied:?})"
+            ),
+        );
+        let os = tako_control::platform::file_clipboard::read();
+        check(
+            os.paths == vec![at("src/a.txt")] && copied.as_ref().and_then(|c| c.stamp) == os.stamp,
+            &format!(
+                "visual-test tree-clipboard ①: ⌘C で OS のクリップボードにもファイルとして書く (#1860。{os:?})"
+            ),
+        );
+        let (dst_pt, dst_row) = row_point(cx, &at("dst"));
+        let (before, scale) = frame(cx);
+        vt1860_click(any, window, cx, dst_pt, MouseButton::Left);
+        // 押すとフォルダは畳まれる（展開の切り替え）ので開き直す
+        let _ = window.update(cx, |app, _, cx| {
+            app.filetree.expand_dir(&at("dst"));
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let (after, _) = frame(cx);
+        let gain = count_in(&after, dst_row, scale, theme.accent).saturating_sub(count_in(
+            &before,
+            dst_row,
+            scale,
+            theme.accent,
+        ));
+        let th = (60.0 * scale) as usize;
+        println!("TAKO_VISUAL_PIXEL: tree-clipboard ① selected accent_gain={gain} th={th}");
+        check(
+            selection(cx) == Some(at("dst")) && gain >= th,
+            &format!(
+                "visual-test tree-clipboard ①: 選んだ行に accent の枠が描かれる (#1860。gain={gain} sel={:?})",
+                selection(cx)
+            ),
+        );
+        vt1860_press(any, window, cx, &key("v"));
+        let ok = vt1860_wait(any, window, cx, landed, &|cx| {
+            at("dst/a.txt").is_file() && rect_of(cx, &at("dst/a.txt")).is_some()
+        })
+        .await;
+        check(
+            ok && std::fs::read_to_string(at("dst/a.txt")).ok().as_deref() == Some("A\n")
+                && at("src/a.txt").is_file(),
+            "visual-test tree-clipboard ①: フォルダの行で ⌘V するとその中へ複製され、ツリーに出る (#1860)",
+        );
+        check(
+            selection(cx) == Some(at("dst/a.txt")),
+            &format!(
+                "visual-test tree-clipboard ①: 貼ったものが選ばれる (#1860。{:?})",
+                selection(cx)
+            ),
+        );
+        // 選んでいるのはファイルの行 = そのフォルダへ。同名があるので別名
+        vt1860_press(any, window, cx, &key("v"));
+        let second = at("dst").join(tako_core::file_copy::copy_name("a.txt", false, 1, naming));
+        let ok = vt1860_wait(any, window, cx, landed, &|_| second.is_file()).await;
+        check(
+            ok && std::fs::read_to_string(at("dst/a.txt")).ok().as_deref() == Some("A\n"),
+            &format!(
+                "visual-test tree-clipboard ①: 同名は上書きせず別名で置く (#1860。{})",
+                second.display()
+            ),
+        );
+
+        // ② ⌘X → ⌘V（移動 = 開いているペインの付け替え）
+        let (folder_pt, folder_row) = row_point(cx, &at("folder"));
+        vt1860_click(any, window, cx, folder_pt, MouseButton::Left);
+        let (before, scale) = frame(cx);
+        vt1860_press(any, window, cx, &key("x"));
+        let (after, _) = frame(cx);
+        let cut = clip(cx);
+        let fg_before = count_in(&before, folder_row, scale, theme.foreground);
+        let fg_after = count_in(&after, folder_row, scale, theme.foreground);
+        println!(
+            "TAKO_VISUAL_PIXEL: tree-clipboard ② cut fg_before={fg_before} fg_after={fg_after}"
+        );
+        check(
+            cut.as_ref().is_some_and(|c| c.is_cut(&at("folder"))),
+            &format!("visual-test tree-clipboard ②: ⌘X で切り取り中になる (#1860。{cut:?})"),
+        );
+        check(
+            fg_before > 0 && fg_after * 2 <= fg_before,
+            &format!(
+                "visual-test tree-clipboard ②: 切り取り中の行が薄く描かれる (#1860。{fg_before}→{fg_after})"
+            ),
+        );
+        let (dst_pt, _) = row_point(cx, &at("dst"));
+        vt1860_click(any, window, cx, dst_pt, MouseButton::Left);
+        vt1860_press(any, window, cx, &key("v"));
+        let observe = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    let path = app.previews.get(&pv_x).map(|s| s.path.clone());
+                    let edit = app.preview_edits.get(&pv_x).map(|e| {
+                        (
+                            e.buffer.path().to_path_buf(),
+                            e.buffer.text().to_string(),
+                            e.dirty(),
+                            e.conflict.map(|c| c.state),
+                        )
+                    });
+                    (path, edit)
+                })
+                .unwrap_or((None, None))
+        };
+        let follow = |cx: &mut AsyncApp| {
+            let (path, edit) = observe(cx);
+            let moved = at("dst/folder/inner/x.txt");
+            path.as_ref() == Some(&moved)
+                && edit.as_ref().is_some_and(|(p, text, dirty, conflict)| {
+                    *p == moved && text == "X\nunsaved\n" && *dirty && conflict.is_none()
+                })
+        };
+        check(
+            at("dst/folder/inner/x.txt").is_file() && !at("folder").exists(),
+            "visual-test tree-clipboard ②: ⌘X → ⌘V で移る (#1860)",
+        );
+        check(
+            follow(cx),
+            &format!(
+                "visual-test tree-clipboard ②: 編集中のペインが新しいパスへ付け替わり、未保存の本文が残る (#1860。{:?})",
+                observe(cx)
+            ),
+        );
+        cx.background_executor()
+            .timer(Duration::from_millis(1500))
+            .await;
+        notify_and_draw(any, window, cx);
+        check(
+            follow(cx),
+            &format!(
+                "visual-test tree-clipboard ②: 待っても「外で削除された」の帯が出ない (#1860 × #1659。{:?})",
+                observe(cx)
+            ),
+        );
+        check(
+            clip(cx).is_none()
+                && tako_control::platform::file_clipboard::read()
+                    .paths
+                    .is_empty(),
+            "visual-test tree-clipboard ②: 移し終えたら tako と OS のクリップボードが空く (#1860)",
+        );
+
+        // ③ 右クリックの「コピー」「貼り付け」
+        let menu = |cx: &mut AsyncApp, row: &std::path::Path| {
+            let (pt, _) = row_point(cx, row);
+            vt1860_click(any, window, cx, pt, MouseButton::Right);
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let can = app.context_menu.as_ref().map(|m| m.can_paste);
+                    (can, app.tree_menu_item_rects.borrow().clone())
+                })
+                .unwrap_or((None, Vec::new()))
+        };
+        let press_item = |cx: &mut AsyncApp, items: &[(&'static str, Bounds<Pixels>)], id: &str| {
+            let Some((_, rect)) = items.iter().find(|(i, _)| *i == id) else {
+                fail(&format!(
+                    "visual-test tree-clipboard ③: メニューに {id} が無い"
+                ));
+            };
+            vt1860_click(any, window, cx, rect.center(), MouseButton::Left);
+        };
+        let listing = |dir: &std::path::Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .map(|it| {
+                    it.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        let dst_before = listing(&at("dst"));
+        let (can, items) = menu(cx, &at("dst"));
+        check(
+            can == Some(false),
+            &format!("visual-test tree-clipboard ③: 貼るものが無いと「貼り付け」を押せない (#1860。{can:?})"),
+        );
+        press_item(cx, &items, "clip-paste");
+        check(
+            listing(&at("dst")) == dst_before,
+            "visual-test tree-clipboard ③: 押せない「貼り付け」を押しても何も起きない (#1860)",
+        );
+        let (_, items) = menu(cx, &at("src/b.txt"));
+        press_item(cx, &items, "clip-copy");
+        check(
+            clip(cx).is_some_and(|c| c.paths == vec![at("src/b.txt")]),
+            "visual-test tree-clipboard ③: 右クリックの「コピー」で載る (#1860)",
+        );
+        let (can, items) = menu(cx, &at("dst"));
+        check(
+            can == Some(true),
+            "visual-test tree-clipboard ③: 貼るものがあれば「貼り付け」を押せる (#1860)",
+        );
+        press_item(cx, &items, "clip-paste");
+        let ok = vt1860_wait(any, window, cx, landed, &|_| at("dst/b.txt").is_file()).await;
+        check(
+            ok,
+            "visual-test tree-clipboard ③: 右クリックの「貼り付け」で複製される (#1860)",
+        );
+
+        // ④ 自分の配下へは断る・自分の行で貼ると複製
+        clear_notice(cx);
+        let (deep_pt, _) = row_point(cx, &at("deep"));
+        vt1860_click(any, window, cx, deep_pt, MouseButton::Left);
+        let _ = window.update(cx, |app, _, cx| {
+            app.filetree.expand_dir(&at("deep"));
+            cx.notify();
+        });
+        vt1860_press(any, window, cx, &key("c"));
+        let (sub_pt, _) = row_point(cx, &at("deep/sub"));
+        vt1860_click(any, window, cx, sub_pt, MouseButton::Left);
+        vt1860_press(any, window, cx, &key("v"));
+        let refused = vt1860_wait(any, window, cx, landed, &|cx| notice(cx).is_some()).await;
+        let n4 = notice(cx);
+        check(
+            refused
+                && n4.as_deref().is_some_and(|t| t.contains("配下"))
+                && !at("deep/sub/deep").exists(),
+            &format!("visual-test tree-clipboard ④: 自分の配下へは理由つきで断り何も作らない (#1860。{n4:?})"),
+        );
+        let (deep_pt, _) = row_point(cx, &at("deep"));
+        vt1860_click(any, window, cx, deep_pt, MouseButton::Left);
+        vt1860_press(any, window, cx, &key("v"));
+        let dup = base.join(tako_core::file_copy::copy_name("deep", true, 1, naming));
+        let ok = vt1860_wait(any, window, cx, landed, &|cx| {
+            dup.join("sub/s.txt").is_file() && rect_of(cx, &dup).is_some()
+        })
+        .await;
+        check(
+            ok,
+            &format!(
+                "visual-test tree-clipboard ④: 自分の行で ⌘V すると同じフォルダに中身ごと複製され、ツリーに出る (#1860。{})",
+                dup.display()
+            ),
+        );
+        // 2 秒ポーリングを 1 周以上待っても消えない（貼る前に読み始めた古い一覧で潰さない）
+        cx.background_executor()
+            .timer(Duration::from_millis(2500))
+            .await;
+        notify_and_draw(any, window, cx);
+        check(
+            rect_of(cx, &dup).is_some(),
+            "visual-test tree-clipboard ④: ポーリングを挟んでも貼ったものがツリーから消えない (#1860)",
+        );
+
+        // ⑤⑥ tako の外のアプリ（Finder 相当 = 別プロセスの AppKit）との往復
+        #[cfg(target_os = "macos")]
+        {
+            let from = at("finder/from-finder.txt");
+            let wrote = vt1860_osascript(
+                r#"ObjC.import("AppKit");
+                var env = $.NSProcessInfo.processInfo.environment;
+                var pb = $.NSPasteboard.pasteboardWithName(env.objectForKey("PB"));
+                pb.clearContents;
+                pb.writeObjects($.NSArray.arrayWithObject($.NSURL.fileURLWithPath(env.objectForKey("P"))));
+                JSON.stringify({count: pb.changeCount})"#,
+                &[
+                    ("PB", pasteboard.as_str()),
+                    ("P", &from.display().to_string()),
+                ],
+            );
+            check(
+                wrote.is_some(),
+                "visual-test tree-clipboard ⑤: 別プロセスがファイルを置ける（前提）",
+            );
+            let (dst_pt, _) = row_point(cx, &at("dst"));
+            vt1860_click(any, window, cx, dst_pt, MouseButton::Left);
+            vt1860_press(any, window, cx, &key("v"));
+            let ok = vt1860_wait(any, window, cx, landed, &|_| {
+                at("dst/from-finder.txt").is_file()
+            })
+            .await;
+            check(
+                ok && from.is_file() && !at("dst/deep").exists(),
+                "visual-test tree-clipboard ⑤: ほかのアプリがコピーしたファイルを ⌘V で貼れる（tako の古い中身は使わない。#1860）",
+            );
+            let (b_pt, _) = row_point(cx, &at("src/b.txt"));
+            vt1860_click(any, window, cx, b_pt, MouseButton::Left);
+            vt1860_press(any, window, cx, &key("c"));
+            let read = vt1860_osascript(
+                r#"ObjC.import("AppKit");
+                var env = $.NSProcessInfo.processInfo.environment;
+                var pb = $.NSPasteboard.pasteboardWithName(env.objectForKey("PB"));
+                var opts = $.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), $("NSPasteboardURLReadingFileURLsOnlyKey"));
+                var urls = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), opts);
+                var u = []; for (var i = 0; i < urls.count; i++) u.push(urls.objectAtIndex(i).path.js);
+                var legacy = pb.propertyListForType($("NSFilenamesPboardType"));
+                var l = []; if (legacy && !legacy.isNil()) { for (var i = 0; i < legacy.count; i++) l.push(legacy.objectAtIndex(i).js); }
+                var text = pb.stringForType($("public.utf8-plain-text"));
+                JSON.stringify({urls: u, legacy: l, text: (text && !text.isNil()) ? text.js : null})"#,
+                &[("PB", pasteboard.as_str())],
+            );
+            let want = at("src/b.txt").display().to_string();
+            // 一時 dir のパスは出さない（証拠ログに機ごとの置き場を写さない）。一致したかだけ
+            let field_ok = |key: &str| {
+                read.as_ref()
+                    .is_some_and(|v| v[key] == serde_json::json!([want.as_str()]))
+            };
+            let text_ok = read
+                .as_ref()
+                .is_some_and(|v| v["text"].as_str() == Some(want.as_str()));
+            println!(
+                "TAKO_VISUAL_PIXEL: tree-clipboard ⑥ file_url={} legacy_filenames={} text={}",
+                field_ok("urls"),
+                field_ok("legacy"),
+                text_ok
+            );
+            check(
+                field_ok("urls") && field_ok("legacy") && text_ok,
+                "visual-test tree-clipboard ⑥: tako の ⌘C をほかのアプリが Finder と同じ API で読める（ファイル URL・旧形式・テキスト。#1860）",
+            );
+        }
+
+        // ⑦ ほかの打鍵・ペインの押下で選択が外れ、⌘V がペインへ戻る
+        let (dst_pt, _) = row_point(cx, &at("dst"));
+        vt1860_click(any, window, cx, dst_pt, MouseButton::Left);
+        vt1860_press(any, window, cx, "escape");
+        check(
+            selection(cx).is_none(),
+            "visual-test tree-clipboard ⑦: Esc で選択が外れる (#1860)",
+        );
+        let (dst_pt, _) = row_point(cx, &at("dst"));
+        vt1860_click(any, window, cx, dst_pt, MouseButton::Left);
+        let pane_area = window
+            .update(cx, |app, _, _| {
+                app.pane_text_areas
+                    .iter()
+                    .find(|(id, _)| *id == p0)
+                    .map(|(_, b)| *b)
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test tree-clipboard ⑦: ペインの矩形が無い"));
+        vt1860_click(any, window, cx, pane_area.center(), MouseButton::Left);
+        // ⌘V は押さない（ペインへの貼り付けは一般のペーストボード = ユーザーのクリップボードを読む）。
+        // 宛先は `active_tree_selection` の 1 判定なので、外れたことを見れば足りる
+        check(
+            selection(cx).is_none(),
+            "visual-test tree-clipboard ⑦: ペインを押すと選択が外れ、⌘C / ⌘V はペインへ戻る (#1860)",
+        );
+        let (dst_pt, _) = row_point(cx, &at("dst"));
+        vt1860_click(any, window, cx, dst_pt, MouseButton::Left);
+        vt1860_press(any, window, cx, "a");
+        check(
+            selection(cx).is_none(),
+            "visual-test tree-clipboard ⑦: ほかの文字を打つと選択が外れる (#1860)",
+        );
+
+        let dump = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        if let Some(dump) = dump {
+            let (dst_pt, _) = row_point(cx, &at("dst"));
+            vt1860_click(any, window, cx, dst_pt, MouseButton::Left);
+            if let Some((f, _)) = capture_frame(any, cx) {
+                let _ = f.save(std::path::Path::new(&dump).join("tree-clipboard-selected.png"));
+            }
+        }
+        println!("TAKO_VISUAL_PIXEL: tree-clipboard ok");
+
+        // 後片付け: 編集を捨て、fixture とピン留めを外す
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pv_x);
+            if let Some(t) = app.workspace.get_tab_mut(tab) {
+                t.remove_pinned_folder(&base);
+            }
+            app.tree_row_probe = false;
+            app.tree_selection = None;
+            app.file_clipboard = None;
             app.sync_filetree_roots();
             cx.notify();
         });

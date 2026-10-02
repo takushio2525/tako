@@ -208,6 +208,38 @@ fn git_badge_spans(status: Option<filetree::TreeGitStatus>, theme: &Theme) -> Op
     Some(badge)
 }
 
+/// 切り取り中の行の不透明度（#1860。VSCode のエクスプローラーと同じく薄く描く）
+pub(crate) const TREE_CUT_OPACITY: f32 = 0.45;
+
+/// ファイルツリーで選んでいる行（⌘C / ⌘X / ⌘V の対象。FR-3.34 / #1860）。
+///
+/// 行を押す（左 / 右クリック）と立ち、**選んだ時点のタブとフォーカスペインを覚える**。
+/// どちらかが動いた・ツリーを閉じた・ツリーの外を押した・ほかのキーを打った、の
+/// どれかで効かなくなり、⌘C / ⌘V はペイン（端末のコピー・貼り付け）へ戻る
+/// （Windows の Ctrl+C を端末の SIGINT から奪いっぱなしにしない）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeSelection {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) is_dir: bool,
+    /// ワークスペースのフォルダの見出し行（切り取りは断る = #1834 と同じ方針）
+    pub(crate) root: bool,
+    /// リモート（SSH）の行（キーは理由を出して断る）
+    pub(crate) remote: bool,
+    pub(crate) tab: TabId,
+    pub(crate) pane: PaneId,
+}
+
+/// 右クリックメニューの項目 id → コピー / 切り取り / 貼り付け（#1860）
+fn tree_clip_menu_key(id: &str) -> Option<tako_core::platform::keys::TreeClipKey> {
+    use tako_core::platform::keys::TreeClipKey;
+    match id {
+        "clip-cut" => Some(TreeClipKey::Cut),
+        "clip-copy" => Some(TreeClipKey::Copy),
+        "clip-paste" => Some(TreeClipKey::Paste),
+        _ => None,
+    }
+}
+
 /// ツリー内のドラッグで、いまカーソルが載っている行と判定（FR-3.32 / #1834）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeDropHover {
@@ -1184,6 +1216,9 @@ impl TakoApp {
                                         } else {
                                             this.open_file_row(&ctx_path, cx);
                                         }
+                                        // #1860: 開いた後のフォーカスペインで選ぶ（開いたプレビューへ
+                                        // フォーカスが移っても ⌘C はこの行へ向く）
+                                        this.select_tree_row(&ctx_path, is_dir, false);
                                         cx.notify();
                                     }
                                 }))
@@ -1211,10 +1246,13 @@ impl TakoApp {
                                                             == canon
                                                     })
                                             };
+                                            this.select_tree_row(&ctx_path, is_dir, false);
+                                            let can_paste = this.tree_can_paste();
                                             this.context_menu = Some(ContextMenu {
                                                 path: ctx_path.clone(),
                                                 is_dir,
                                                 is_pinned_root,
+                                                can_paste,
                                                 position: e.position,
                                             });
                                             cx.notify();
@@ -1579,6 +1617,8 @@ impl TakoApp {
                     } else {
                         this.open_remote_file_row(&remote, cx);
                     }
+                    // #1860: リモートの行でも選ぶ（⌘C などは端末へ流さず理由を出して断る）
+                    this.select_tree_row(std::path::Path::new(&remote.path), is_dir, true);
                     cx.notify();
                 }
             }))
@@ -1876,6 +1916,7 @@ impl TakoApp {
         let path = ctx.path.clone();
         let is_dir = ctx.is_dir;
         let is_pinned_root = ctx.is_pinned_root;
+        let can_paste = ctx.can_paste;
         let pos = ctx.position;
         // ファイルマネージャ / ごみ箱の呼び名は OS で変わる（#617）
         let fm = tako_control::platform::os_integration::file_manager();
@@ -1888,6 +1929,13 @@ impl TakoApp {
         if !is_dir {
             items.push(("open-default", crate::ui_text::sidebar::menu_open_default()));
             items.push(("open-with", crate::ui_text::sidebar::menu_open_with()));
+        }
+        // #1860: コピー / 切り取り / 貼り付け（キーと同じ dispatch を通る）
+        if !tako_core::file_copy::tree_keys_legacy() {
+            items.push(("sep0", ""));
+            items.push(("clip-cut", crate::ui_text::sidebar::menu_cut()));
+            items.push(("clip-copy", crate::ui_text::sidebar::menu_copy()));
+            items.push(("clip-paste", crate::ui_text::sidebar::menu_paste()));
         }
         items.push(("sep1", ""));
         items.push(("rename", crate::ui_text::sidebar::menu_rename()));
@@ -1955,20 +2003,44 @@ impl TakoApp {
                 }
                 let path = path.clone();
                 let rects = self.tree_menu_item_rects.clone();
+                // #1860: 貼るものが無ければ押せない見た目にする（押しても何も起きない）
+                let disabled = id == "clip-paste" && !can_paste;
+                let hint = tree_clip_menu_key(id).map(|key| {
+                    tako_core::platform::keys::tree_clip_hint(
+                        tako_core::platform::support::Platform::current(),
+                        key,
+                    )
+                });
                 div()
                     .id(("ctx-item", i as u64))
                     .relative()
                     .w_full()
                     .px_2()
                     .py(px(2.0))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgba(theme.tab_active_background)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .when(!disabled, |d| {
+                        d.cursor_pointer()
+                            .hover(|d| d.bg(rgba(theme.tab_active_background)))
+                    })
+                    .when(disabled, |d| d.text_color(hsla(theme.text_muted)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.context_menu = None;
-                        this.handle_context_action(id, &path, is_dir, cx);
+                        if !disabled {
+                            this.handle_context_action(id, &path, is_dir, cx);
+                        }
+                        cx.notify();
                     }))
                     .when(id == "trash", |d| d.text_color(hsla(theme.red)))
-                    .child(SharedString::from(label.to_string()))
+                    .child(div().flex_1().child(SharedString::from(label.to_string())))
+                    .children(hint.map(|hint| {
+                        div()
+                            .flex_none()
+                            .pl_2()
+                            .text_color(hsla(theme.text_muted))
+                            .child(SharedString::from(hint))
+                    }))
                     // 何も描かない矩形採取（#1182 と同じ作法。見た目にもレイアウトにも出ない）
                     .child(
                         canvas(
@@ -2339,6 +2411,15 @@ impl TakoApp {
             "rename" | "new-file" | "new-dir" => {
                 if let Some(kind) = InlineEditKind::from_menu_id(action) {
                     self.open_inline_edit(kind, path);
+                }
+            }
+            // #1860: キーと同じ入口（選び直してから。続けて ⌘V を押せばこの行へ貼れる）
+            "clip-cut" | "clip-copy" | "clip-paste" => {
+                if let Some(key) = tree_clip_menu_key(action) {
+                    self.select_tree_row(path, _is_dir, false);
+                    if let Some(sel) = self.tree_selection.clone() {
+                        self.tree_clip_action(key, &sel, cx);
+                    }
                 }
             }
             "trash" => {
@@ -3194,6 +3275,35 @@ impl TakoApp {
         let is_dir = row.entry.is_dir;
         let mark = tree_drop_mark(self.tree_drop.as_ref(), &row.entry.path, remote);
         let mut el = with_tree_drop_mark(el, mark, theme);
+        // #1860: 切り取り中の行は薄く、選んでいる行は accent の枠（絶対配置の重ね = 行の高さを
+        // 1px も動かさない。#1834 の札と同じ作法）
+        if !remote
+            && self
+                .file_clipboard
+                .as_ref()
+                .is_some_and(|clip| clip.is_cut(&row.entry.path))
+        {
+            el = el.opacity(TREE_CUT_OPACITY);
+        }
+        let selected = self.active_tree_selection().is_some_and(|sel| {
+            sel.remote == remote
+                && match &row.remote {
+                    Some(r) => sel.path == std::path::Path::new(&r.path),
+                    None => sel.path == row.entry.path,
+                }
+        });
+        if selected {
+            el = el.relative().bg(rgba_alpha(theme.accent, 0.22)).child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .border_1()
+                    .border_color(hsla(theme.accent))
+                    .rounded_sm(),
+            );
+        }
         if remote {
             // 掴んだ時点で理由をゴーストに出す（どこにも落とせない）
             el = el.on_drag(
@@ -3387,6 +3497,268 @@ impl TakoApp {
         self.jump_history.retarget_path(from, to);
         self.filetree.note_moved(from, to);
         self.sync_preview_watches();
+    }
+
+    // --- コピー / 切り取り / 貼り付け（FR-3.34 / #1860） --------------------------------
+
+    /// 行を選ぶ（押した行を ⌘C / ⌘X / ⌘V の対象にする。#1860）。
+    /// 選んだ時点のタブとフォーカスペインを覚える（動いたら効かない = [`Self::active_tree_selection`]）
+    pub(crate) fn select_tree_row(&mut self, path: &std::path::Path, is_dir: bool, remote: bool) {
+        let root = !remote && self.filetree.roots().iter().any(|r| r == path);
+        self.tree_selection = Some(TreeSelection {
+            path: path.to_path_buf(),
+            is_dir,
+            root,
+            remote,
+            tab: self.workspace.active_tab_id(),
+            pane: self.focused_pane(),
+        });
+    }
+
+    /// いま効いている選択（キーの宛先がツリーか。#1860）。
+    ///
+    /// ツリーが見えていて、選んだときとタブ・フォーカスペインが同じときだけ。
+    /// ほかの経路（キーでのペイン移動・CLI / MCP の focus・タブの切り替え）でどちらかが
+    /// 動いたら、その時点で ⌘C / ⌘V はペインへ戻る（選択を畳み忘れる経路を作らない）
+    pub(crate) fn active_tree_selection(&self) -> Option<&TreeSelection> {
+        if tako_core::file_copy::tree_keys_legacy() {
+            return None;
+        }
+        self.tree_selection.as_ref().filter(|sel| {
+            self.filetree.visible
+                && sel.tab == self.workspace.active_tab_id()
+                && sel.pane == self.focused_pane()
+        })
+    }
+
+    /// ツリーへ向いた打鍵（⌘C / ⌘X / ⌘V・Esc。Windows は Ctrl）を処理する。処理したら真。
+    ///
+    /// `handle_key` が端末へ流す前に呼ぶ。⌘C / ⌘V はアクション（`CopySelection` /
+    /// `PasteClipboard`）が先に受けることもあるので、そちらも同じ [`Self::tree_clip_action`]
+    /// を呼ぶ（どちらが先に受けても 1 回だけ走る = 受けた側が伝播を止める）
+    pub(crate) fn handle_tree_clip_keystroke(
+        &mut self,
+        ks: &Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(sel) = self.active_tree_selection().cloned() else {
+            return false;
+        };
+        let m = ks.modifiers;
+        if ks.key == "escape" && !m.modified() {
+            // 選択を外す（Esc を端末へ流さない = エージェントの TUI を止めない）
+            self.tree_selection = None;
+            cx.notify();
+            return true;
+        }
+        let Some(key) = tako_core::platform::keys::tree_clip_key(
+            tako_core::platform::support::Platform::current(),
+            &ks.key,
+            m.platform,
+            m.control,
+            m.alt,
+            m.shift,
+        ) else {
+            return false;
+        };
+        self.tree_clip_action(key, &sel, cx);
+        true
+    }
+
+    /// コピー / 切り取り / 貼り付け（キー・右クリックメニューの共通の入口。#1860）。
+    ///
+    /// 中身はどれも dispatch `FileOp`（`clipboard_copy` / `clipboard_cut` / `paste`）=
+    /// CLI `tako file clipboard` / `tako file paste`・MCP `tako_file_op` と同じ 1 本
+    pub(crate) fn tree_clip_action(
+        &mut self,
+        key: tako_core::platform::keys::TreeClipKey,
+        sel: &TreeSelection,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_control::protocol::{FileOpKind, Request};
+        use tako_core::platform::keys::TreeClipKey;
+        // 右クリックメニューを開いたままキーで操作したときもメニューは畳む
+        self.context_menu = None;
+        let op = match key {
+            TreeClipKey::Copy => crate::ui_text::sidebar::menu_copy(),
+            TreeClipKey::Cut => crate::ui_text::sidebar::menu_cut(),
+            TreeClipKey::Paste => crate::ui_text::sidebar::menu_paste(),
+        };
+        let target = sel.path.display().to_string();
+        if sel.remote {
+            // ローカルのファイルシステムの操作を通さない（#919）。端末へも流さない
+            self.notify_tree_op_failed(
+                op,
+                Some(&target),
+                crate::ui_text::sidebar::clip_remote_refused(),
+            );
+            cx.notify();
+            return;
+        }
+        let kind = match key {
+            TreeClipKey::Copy => FileOpKind::ClipboardCopy,
+            TreeClipKey::Cut if sel.root => {
+                // 見出しのフォルダは画面からは動かさない（#1834 の D&D と同じ方針。
+                // CLI / MCP はパスを名指しした時点で意図が明らかなので断らない）
+                self.notify_tree_op_failed(
+                    op,
+                    Some(&target),
+                    &crate::ui_text::sidebar::move_refused(
+                        &tako_core::file_move::MoveRefusal::WorkspaceRoot,
+                    ),
+                );
+                cx.notify();
+                return;
+            }
+            TreeClipKey::Cut => FileOpKind::ClipboardCut,
+            TreeClipKey::Paste => {
+                self.tree_paste(&sel.path, cx);
+                return;
+            }
+        };
+        let result = tako_control::dispatch(
+            self,
+            Request::FileOp {
+                op: kind,
+                path: target.clone(),
+                name: None,
+                pane: None,
+                dest: None,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            self.notify_tree_dispatch_failed(op, Some(&target), &e);
+        }
+        cx.notify();
+    }
+
+    /// 右クリックメニューを開くときに「貼り付け」を押せるか（#1860）。
+    ///
+    /// **OS のクリップボードの中身は読まない**（変更番号と「ファイルがあるか」だけ =
+    /// `file_clipboard::can_paste`）。押しただけで中身を読むと、新しい macOS は
+    /// pasteboard のプライバシーの確認を出しうる。中身は実際に貼るときに dispatch が読む
+    pub(crate) fn tree_can_paste(&self) -> bool {
+        if tako_core::file_copy::tree_keys_legacy() {
+            return false;
+        }
+        tako_core::file_clipboard::can_paste(
+            self.file_clipboard.as_ref(),
+            &tako_control::platform::file_clipboard::peek(),
+        )
+    }
+
+    /// 貼り付け（#1860）。IPC と同じ 3 段を通る: `prepare_offload`（UI スレッドで
+    /// クリップボードを読んで段取り）→ `run_staged`（background で写す）→
+    /// `finish_offload`（UI スレッドでツリーの読み直し）。切り取り = 移動は
+    /// 付け替えに workspace が要るので同期の dispatch（`prepare_offload` が None を返す）
+    pub(crate) fn tree_paste(&mut self, row: &std::path::Path, cx: &mut Context<Self>) {
+        let request = tako_control::protocol::Request::FileOp {
+            op: tako_control::protocol::FileOpKind::Paste,
+            path: row.display().to_string(),
+            name: None,
+            pane: None,
+            dest: None,
+        };
+        let row = row.to_path_buf();
+        match tako_control::prepare_offload(self, &request) {
+            Some(Err(e)) => {
+                self.present_tree_paste(Err(e), &row, cx);
+            }
+            Some(Ok(job)) => {
+                let staged = cx
+                    .background_executor()
+                    .spawn(async move { job.run_staged() });
+                cx.spawn(async move |this, cx| {
+                    let outcome = staged.await;
+                    let _ = this.update(cx, |app, cx| {
+                        let result = match outcome {
+                            tako_control::OffloadOutcome::OnUi(next) => {
+                                app.finish_offload_on_ui(next, PaneOrigin::User, cx).0
+                            }
+                            tako_control::OffloadOutcome::Reply(result) => result,
+                        };
+                        app.present_tree_paste(result, &row, cx);
+                    });
+                })
+                .detach();
+            }
+            None => {
+                let result = tako_control::dispatch(self, request, PaneOrigin::User);
+                // 移動の付け替えは dispatch の中（`file_moved`）で済んでいる。読み込み中だった
+                // プレビューの読み直しと、パスの変わったレイアウトの保存だけ（D&D と同じ）
+                self.drain_pending_preview_loads(cx);
+                self.save_layout();
+                match result {
+                    Ok(value) => self.present_tree_paste(Ok(value), &row, cx),
+                    // #1399: 失敗を黙って捨てない（offload の経路と同じ通知の口）
+                    Err(e) => self.notify_tree_dispatch_failed(
+                        crate::ui_text::sidebar::menu_paste(),
+                        Some(&row.display().to_string()),
+                        &e,
+                    ),
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 貼り付けの答えの見せ方（#1860）。貼れたら最後に置いたものを選び直し
+    /// （続けて ⌘V を押すとそこへ貼れる = Finder / VSCode と同じ）、貼れなかったものは
+    /// 通知欄へ理由を出す（一部だけなら件数 + 1 件目の理由）
+    fn present_tree_paste(
+        &mut self,
+        result: Result<serde_json::Value, tako_control::DispatchError>,
+        row: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let op = crate::ui_text::sidebar::menu_paste();
+        let target = row.display().to_string();
+        match result {
+            Ok(value) => {
+                let pasted = value["pasted"].as_array().cloned().unwrap_or_default();
+                let failed = value["failed"].as_array().cloned().unwrap_or_default();
+                if let Some(first) = failed.first() {
+                    let reason = first["reason"].as_str().unwrap_or_default();
+                    let text = crate::ui_text::sidebar::clip_paste_partial(
+                        failed.len(),
+                        failed.len() + pasted.len(),
+                        reason,
+                    );
+                    self.notify_tree_op_failed(op, Some(&target), &text);
+                }
+                let landed = pasted
+                    .iter()
+                    .rev()
+                    .find_map(|v| v["to"].as_str())
+                    .map(std::path::PathBuf::from);
+                if let Some(landed) = landed {
+                    if self.tree_selection.is_some() || self.filetree.visible {
+                        let is_dir = landed.is_dir();
+                        self.select_tree_row(&landed, is_dir, false);
+                    }
+                }
+            }
+            Err(e) => self.notify_tree_dispatch_failed(op, Some(&target), &e),
+        }
+        cx.notify();
+    }
+
+    /// 切り取り中の tako の中身が古くなっていたら捨てる（#1860。2 秒のポーリングから呼ぶ）。
+    ///
+    /// Finder やほかのアプリで何かをコピーした = OS のクリップボードの変更番号が進んだら、
+    /// 貼るのは OS の中身（`file_clipboard::resolve`）なので、薄く描いた行も戻す
+    pub(crate) fn drop_stale_file_clipboard(&mut self) -> bool {
+        let Some(clip) = self.file_clipboard.as_ref() else {
+            return false;
+        };
+        // 変更番号だけを見る（中身は読まない = 2 秒ごとに pasteboard を読まない）
+        let stamp = tako_control::platform::file_clipboard::peek().stamp;
+        if !tako_core::file_clipboard::is_stale(clip, stamp) {
+            return false;
+        }
+        self.file_clipboard = None;
+        true
     }
 
     /// 表示中かつ対応形式のパスだけを親ディレクトリの非再帰監視へ同期する。

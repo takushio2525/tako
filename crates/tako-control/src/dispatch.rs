@@ -1229,6 +1229,24 @@ pub enum OffloadJob {
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
     RunResolve { ctx: RunResolveCtx },
+    /// ファイル・フォルダのコピー（#1860）。大きなフォルダの複製で UI を止めないよう
+    /// 写す本体だけを background へ出し、ツリーの読み直しは UI スレッドへ戻す
+    FileCopy(Box<FileCopyJob>),
+}
+
+/// コピーのジョブ（`op=copy` は 1 件、`op=paste` はクリップボードの数だけ。#1860）
+pub struct FileCopyJob {
+    /// （写すもの, 貼り付け先のフォルダ）
+    items: Vec<(PathBuf, PathBuf)>,
+    naming: tako_core::file_copy::CopyNaming,
+    /// 貼り付けなら段取り（応答の形が変わる）
+    paste: Option<PastePlan>,
+}
+
+/// コピーの結果を UI スレッドへ運ぶもの（#1860）
+pub struct FileCopyLanding {
+    job: FileCopyJob,
+    outcomes: Vec<Result<CopyDone, tako_core::file_copy::CopyRefusal>>,
 }
 
 /// background で走らせた結果（#1680）
@@ -1246,6 +1264,8 @@ pub enum OffloadContinuation {
     LspGoto(Box<LspGotoLanding>),
     /// 整形の答えを当てる（[`lsp_format_land`]。#1683）
     LspFormat(Box<LspFormatLanding>),
+    /// コピーの後始末（ツリーの読み直し）と応答（#1860）
+    FileCopied(Box<FileCopyLanding>),
 }
 
 /// background の結果を受けて UI スレッドで続きを行う（#1680）。IPC の受け口と GUI の
@@ -1259,6 +1279,21 @@ pub fn finish_offload(
     match continuation {
         OffloadContinuation::LspGoto(landing) => lsp_goto_land(host, origin, &landing),
         OffloadContinuation::LspFormat(landing) => lsp_format_land(host, &landing),
+        OffloadContinuation::FileCopied(landing) => {
+            let FileCopyLanding { job, outcomes } = *landing;
+            match &job.paste {
+                Some(plan) => finish_paste_copies(host, plan, outcomes),
+                None => {
+                    let (src, dest) = job.items.into_iter().next().unwrap_or_default();
+                    let outcome = outcomes.into_iter().next().unwrap_or_else(|| {
+                        Err(tako_core::file_copy::CopyRefusal::Io(
+                            "コピーが走らなかった".into(),
+                        ))
+                    });
+                    finish_file_copy(host, &src, &dest, outcome)
+                }
+            }
+        }
     }
 }
 
@@ -1307,6 +1342,39 @@ pub fn prepare_offload(
             include_closed: all.unwrap_or(false),
             sweep: !host.is_secondary(),
         })),
+        // #1860: コピーは写す量に比例して時間がかかる（大きなフォルダの複製で UI を止めない）。
+        // 切り取りの貼り付け = 移動は rename 1 回で、開いているペインの付け替えに workspace が
+        // 要るので同期のまま（None = dispatch が UI スレッドで回す）
+        Request::FileOp {
+            op: FileOpKind::Copy,
+            path,
+            dest,
+            ..
+        } => Some(match dest {
+            Some(dest) => Ok(OffloadJob::FileCopy(Box::new(FileCopyJob {
+                items: vec![(PathBuf::from(path), PathBuf::from(dest))],
+                naming: tako_core::file_copy::CopyNaming::current(),
+                paste: None,
+            }))),
+            None => Err(DispatchError::InvalidParams(
+                "dest（貼り付け先のフォルダ）を指定する".into(),
+            )),
+        }),
+        Request::FileOp {
+            op: FileOpKind::Paste,
+            path,
+            ..
+        } => match paste_plan(host, Path::new(path)) {
+            Err(e) => Some(Err(e)),
+            Ok(plan) if plan.clip.mode == tako_core::file_clipboard::ClipMode::Copy => {
+                Some(Ok(OffloadJob::FileCopy(Box::new(FileCopyJob {
+                    items: plan.items.clone(),
+                    naming: tako_core::file_copy::CopyNaming::current(),
+                    paste: Some(plan),
+                }))))
+            }
+            Ok(_) => None,
+        },
         Request::GitLog { pane, max_count } => {
             Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
                 cwd,
@@ -1422,6 +1490,17 @@ impl OffloadJob {
             OffloadJob::LspFormat(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspFormat(Box::new(job.run())))
             }
+            OffloadJob::FileCopy(job) => {
+                let outcomes = job
+                    .items
+                    .iter()
+                    .map(|(src, dir)| run_file_copy(src, dir, job.naming))
+                    .collect();
+                OffloadOutcome::OnUi(OffloadContinuation::FileCopied(Box::new(FileCopyLanding {
+                    job: *job,
+                    outcomes,
+                })))
+            }
             other => OffloadOutcome::Reply(other.run_reply()),
         }
     }
@@ -1457,6 +1536,10 @@ impl OffloadJob {
             )),
             OffloadJob::LspFormat(_) => Err(DispatchError::Operation(
                 "整形は run_staged で走らせる（当てるのに UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::FileCopy(_) => Err(DispatchError::Operation(
+                "コピーは run_staged で走らせる（ツリーの読み直しに UI スレッドの続きが要る）"
+                    .into(),
             )),
         }
     }
@@ -4124,6 +4207,41 @@ fn dispatch_inner(
                         "dest（移動先のフォルダ）を指定する".into(),
                     ))?;
                     run_file_move(host, &path, std::path::Path::new(&dest))
+                }
+                // FR-3.34 / #1860: ここは同期の経路（`TAKO_OFFLOAD=0`・テスト・直呼び）。
+                // IPC と GUI の ⌘V は `prepare_offload` が同じ `run_file_copy` を background で回す
+                FileOpKind::Copy => {
+                    let dest = dest.ok_or(DispatchError::InvalidParams(
+                        "dest（貼り付け先のフォルダ）を指定する".into(),
+                    ))?;
+                    let dest = std::path::PathBuf::from(dest);
+                    let outcome =
+                        run_file_copy(&path, &dest, tako_core::file_copy::CopyNaming::current());
+                    finish_file_copy(host, &path, &dest, outcome)
+                }
+                FileOpKind::ClipboardCopy => {
+                    clipboard_put(host, &path, tako_core::file_clipboard::ClipMode::Copy)
+                }
+                FileOpKind::ClipboardCut => {
+                    clipboard_put(host, &path, tako_core::file_clipboard::ClipMode::Cut)
+                }
+                FileOpKind::Clipboard => Ok(clipboard_show(host, &path)),
+                FileOpKind::Paste => {
+                    let plan = paste_plan(host, &path)?;
+                    match plan.clip.mode {
+                        tako_core::file_clipboard::ClipMode::Copy => {
+                            let naming = tako_core::file_copy::CopyNaming::current();
+                            let outcomes = plan
+                                .items
+                                .iter()
+                                .map(|(src, dir)| run_file_copy(src, dir, naming))
+                                .collect();
+                            finish_paste_copies(host, &plan, outcomes)
+                        }
+                        // 切り取り = 移動は #1834 の `run_file_move` の 1 実装（開いているペインの
+                        // 付け替えに workspace が要るので UI スレッドで同期に回す）
+                        tako_core::file_clipboard::ClipMode::Cut => run_paste_cut(host, &plan),
+                    }
                 }
             }
         }
@@ -15052,6 +15170,267 @@ fn run_file_move(
     }))
 }
 
+/// ファイル・フォルダを 1 つ写した結果（background から UI スレッドへ運ぶ。#1860）
+#[derive(Debug, Clone)]
+pub struct CopyDone {
+    pub plan: tako_core::file_copy::CopyPlan,
+    pub stats: tako_core::file_copy::CopyStats,
+}
+
+/// 1 つ写す（FR-3.34 / #1860）。**判定・別名・実行は `tako_core::file_copy` の 1 実装**。
+/// ファイルシステムだけを触り host は触らないので background でも回せる
+/// （後始末は [`finish_file_copy`] / [`finish_paste_copies`] が UI スレッドで行う）
+pub fn run_file_copy(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    naming: tako_core::file_copy::CopyNaming,
+) -> Result<CopyDone, tako_core::file_copy::CopyRefusal> {
+    let plan = tako_core::file_copy::plan(src, dest, naming)?;
+    let stats = tako_core::file_copy::execute(&plan)?;
+    Ok(CopyDone { plan, stats })
+}
+
+/// コピーを断ったときの文面（GUI の通知欄・CLI・MCP が同じ文面を出す）
+fn copy_refused_text(
+    refusal: &tako_core::file_copy::CopyRefusal,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> String {
+    format!(
+        "コピーできない: {}（{} → {}）",
+        refusal.reason(),
+        src.display(),
+        dest.display()
+    )
+}
+
+/// 写した 1 件の応答（`copied` / `from` / `to` / `kind` / `renamed` / `entries` / `bytes`）
+fn copy_json(done: &CopyDone) -> Value {
+    json!({
+        "copied": true,
+        "from": done.plan.from.display().to_string(),
+        "to": done.plan.to.display().to_string(),
+        "kind": done.plan.kind.slug(),
+        "renamed": done.plan.renamed,
+        "entries": done.stats.entries(),
+        "bytes": done.stats.bytes,
+    })
+}
+
+/// `op=copy` の後始末と応答（UI スレッド）。写せたらツリーへ知らせる
+fn finish_file_copy(
+    host: &mut dyn ControlHost,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    outcome: Result<CopyDone, tako_core::file_copy::CopyRefusal>,
+) -> Result<Value, DispatchError> {
+    let done = outcome.map_err(|r| DispatchError::Operation(copy_refused_text(&r, src, dest)))?;
+    host.file_copied(&done.plan.to);
+    Ok(copy_json(&done))
+}
+
+/// クリップボード系の操作が受け取るパスを絶対化する（OS のクリップボードは絶対パスの
+/// ファイル URL しか持てない。相対は GUI の cwd 基準 = `copy_absolute_path` と同じ）
+fn clipboard_abs(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    }
+}
+
+/// ⌘C / ⌘X（`op=clipboard_copy` / `clipboard_cut`。#1860）: tako のクリップボードへ置き、
+/// OS のクリップボードへもファイルとして書く（Finder / エクスプローラーへ貼れる）。
+/// OS へ書けなくても tako の中では貼れる（応答の `os` が偽 + `os_note` に理由）
+fn clipboard_put(
+    host: &mut dyn ControlHost,
+    path: &std::path::Path,
+    mode: tako_core::file_clipboard::ClipMode,
+) -> Result<Value, DispatchError> {
+    let path = clipboard_abs(path);
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(DispatchError::Operation(format!(
+            "パスが存在しない: {}",
+            path.display()
+        )));
+    }
+    let paths = vec![path];
+    let written =
+        host.os_file_clipboard_write(&paths, mode == tako_core::file_clipboard::ClipMode::Cut);
+    let stamp = written.as_ref().ok().copied();
+    host.set_file_clipboard(Some(tako_core::file_clipboard::FileClipboard {
+        paths: paths.clone(),
+        mode,
+        stamp,
+    }));
+    let mut out = json!({
+        "mode": mode.slug(),
+        "paths": paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "os": stamp.is_some(),
+    });
+    if let Err(e) = written {
+        out["os_note"] = json!(e);
+    }
+    Ok(out)
+}
+
+/// 貼り付けの段取り（何を・どのモードで・どこへ。#1860）
+#[derive(Debug, Clone)]
+pub struct PastePlan {
+    pub clip: tako_core::file_clipboard::Clip,
+    /// 貼ったツリーの行
+    pub row: std::path::PathBuf,
+    /// （貼るもの, 貼り付け先のフォルダ）
+    pub items: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// tako の中身（切り取りを貼った後に移せたものを抜くため。OS の中身を貼るときは None）
+    tako: Option<tako_core::file_clipboard::FileClipboard>,
+    /// 読んだときの OS のクリップボードの変更番号
+    os_stamp: Option<u64>,
+}
+
+/// クリップボードを読んで段取りを作る（UI スレッド。ファイルシステムは書かない）。
+/// 貼り付け先の規則は `tako_core::file_clipboard::paste_target` の 1 実装
+fn paste_plan(host: &dyn ControlHost, row: &std::path::Path) -> Result<PastePlan, DispatchError> {
+    if !row.exists() {
+        return Err(DispatchError::Operation(format!(
+            "貼り付け先が見つからない: {}",
+            row.display()
+        )));
+    }
+    let row_is_dir = row.is_dir();
+    let tako = host.file_clipboard();
+    let os = host.os_file_clipboard_read();
+    let clip = tako_core::file_clipboard::resolve(tako.as_ref(), &os).ok_or_else(|| {
+        DispatchError::Operation("貼り付けるファイルがクリップボードに無い".into())
+    })?;
+    let items = clip
+        .paths
+        .iter()
+        .map(|src| {
+            (
+                src.clone(),
+                tako_core::file_clipboard::paste_target(src, row, row_is_dir),
+            )
+        })
+        .collect();
+    let tako = tako.filter(|_| clip.source == tako_core::file_clipboard::ClipSource::Tako);
+    Ok(PastePlan {
+        clip,
+        row: row.to_path_buf(),
+        items,
+        tako,
+        os_stamp: os.stamp,
+    })
+}
+
+/// `op=clipboard`: 中身と、`row` で貼ったときの貼り付け先（何も変えない。#1860）
+fn clipboard_show(host: &dyn ControlHost, row: &std::path::Path) -> Value {
+    match paste_plan(host, row) {
+        Ok(plan) => json!({
+            "mode": plan.clip.mode.slug(),
+            "source": plan.clip.source.slug(),
+            "items": plan.items.iter().map(|(src, dir)| json!({
+                "path": src.display().to_string(),
+                "dest": dir.display().to_string(),
+            })).collect::<Vec<_>>(),
+        }),
+        Err(e) => json!({
+            "mode": Value::Null,
+            "source": Value::Null,
+            "items": [],
+            "note": e.to_string(),
+        }),
+    }
+}
+
+/// 貼り付けの応答（`mode` / `source` / `pasted` / `failed`）。1 件も貼れなければエラー
+fn paste_reply(
+    plan: &PastePlan,
+    pasted: Vec<Value>,
+    failed: Vec<(std::path::PathBuf, String)>,
+) -> Result<Value, DispatchError> {
+    if pasted.is_empty() && !failed.is_empty() {
+        let reasons: Vec<&str> = failed.iter().map(|(_, r)| r.as_str()).collect();
+        return Err(DispatchError::Operation(if reasons.len() == 1 {
+            reasons[0].to_string()
+        } else {
+            format!(
+                "貼り付けできない（{} 件すべて）: {}",
+                reasons.len(),
+                reasons.join(" / ")
+            )
+        }));
+    }
+    Ok(json!({
+        "mode": plan.clip.mode.slug(),
+        "source": plan.clip.source.slug(),
+        "pasted": pasted,
+        "failed": failed.iter().map(|(path, reason)| json!({
+            "path": path.display().to_string(),
+            "reason": reason,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// コピーを貼った後始末と応答（UI スレッド。#1860）。写せたものはツリーへ知らせる
+fn finish_paste_copies(
+    host: &mut dyn ControlHost,
+    plan: &PastePlan,
+    outcomes: Vec<Result<CopyDone, tako_core::file_copy::CopyRefusal>>,
+) -> Result<Value, DispatchError> {
+    let mut pasted = Vec::new();
+    let mut failed = Vec::new();
+    for ((src, dir), outcome) in plan.items.iter().zip(outcomes) {
+        match outcome {
+            Ok(done) => {
+                host.file_copied(&done.plan.to);
+                pasted.push(copy_json(&done));
+            }
+            Err(refusal) => failed.push((src.clone(), copy_refused_text(&refusal, src, dir))),
+        }
+    }
+    paste_reply(plan, pasted, failed)
+}
+
+/// 切り取りを貼る = 移す（#1860）。**移動は #1834 の `run_file_move` の 1 実装**
+/// （同名・配下・別のボリュームを断り、開いているペインを付け替える）。
+///
+/// 移せたものは tako のクリップボードから抜き、全部移せたら OS のクリップボードも
+/// 空にする（tako が書いたままのときだけ = もう無い場所を指すファイルを残さない）
+fn run_paste_cut(host: &mut dyn ControlHost, plan: &PastePlan) -> Result<Value, DispatchError> {
+    let mut pasted = Vec::new();
+    let mut failed = Vec::new();
+    let mut done = Vec::new();
+    for (src, dir) in &plan.items {
+        match run_file_move(host, src, dir) {
+            Ok(value) => {
+                done.push(src.clone());
+                pasted.push(value);
+            }
+            Err(e) => failed.push((src.clone(), e.to_string())),
+        }
+    }
+    match &plan.tako {
+        Some(clip) => {
+            let left = tako_core::file_clipboard::after_cut_paste(clip, &done);
+            if let (None, Some(stamp)) = (&left, clip.stamp) {
+                host.os_file_clipboard_clear_if(stamp);
+            }
+            host.set_file_clipboard(left);
+        }
+        // エクスプローラーの切り取りを貼った（tako は書いていない）: 全部移せたときだけ空にする
+        None => {
+            if let Some(stamp) = plan
+                .os_stamp
+                .filter(|_| failed.is_empty() && !done.is_empty())
+            {
+                host.os_file_clipboard_clear_if(stamp);
+            }
+        }
+    }
+    paste_reply(plan, pasted, failed)
+}
+
 /// ペインをそのまま SSH 化できるか（#1006 の `can_ssh_pane` を `list` に載せる。#1080）。
 ///
 /// `{ "ok": true }` か `{ "ok": false, "reason": <slug>, "note": <日本語の理由 + 次の一手> }`。
@@ -17240,6 +17619,12 @@ mod tests {
         font_scales: std::collections::HashMap<PaneId, Option<f32>>,
         /// #1834: `file_moved` が受け取った (from, to)（移した後の後始末が 1 回だけ走るかの検証用）
         file_moves: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        /// #1860: `file_copied` が受け取った置き場（写した後の後始末が 1 件 1 回かの検証用）
+        file_copies: Vec<std::path::PathBuf>,
+        /// #1860: tako 側のクリップボード（GUI の `file_clipboard` の代役）
+        file_clip: Option<tako_core::file_clipboard::FileClipboard>,
+        /// #1860: 偽の OS のクリップボード（**本物のクリップボードには触らない**）
+        os_clip: tako_core::file_clipboard::OsFiles,
         /// #1187: cleanup が受け取ったソケット（`--socket` が届いているかの検証用）と、
         /// 返させる結果
         cleanup_socket: std::cell::RefCell<Vec<Option<String>>>,
@@ -17313,6 +17698,12 @@ mod tests {
                 tab_cols: None,
                 font_scales: std::collections::HashMap::new(),
                 file_moves: Vec::new(),
+                file_copies: Vec::new(),
+                file_clip: None,
+                os_clip: tako_core::file_clipboard::OsFiles {
+                    stamp: Some(1),
+                    ..Default::default()
+                },
                 cleanup_socket: std::cell::RefCell::new(Vec::new()),
                 cleanup_report: None,
                 server_outcome: None,
@@ -18119,6 +18510,41 @@ mod tests {
                 if let Some((_, _, buffer)) = self.preview_edits.get_mut(&follow.pane) {
                     buffer.retarget(follow.to.clone());
                 }
+            }
+        }
+        fn file_copied(&mut self, to: &std::path::Path) {
+            self.file_copies.push(to.to_path_buf());
+        }
+        fn file_clipboard(&self) -> Option<tako_core::file_clipboard::FileClipboard> {
+            self.file_clip.clone()
+        }
+        fn set_file_clipboard(&mut self, clip: Option<tako_core::file_clipboard::FileClipboard>) {
+            self.file_clip = clip;
+        }
+        /// 偽の OS のクリップボード: 書くたびに変更番号が進む（NSPasteboard の changeCount と同じ）。
+        /// macOS と同じく「切り取り」の印は書かない（切り取りは tako の中にしか無い）
+        fn os_file_clipboard_write(
+            &mut self,
+            paths: &[std::path::PathBuf],
+            _cut: bool,
+        ) -> Result<u64, String> {
+            let stamp = self.os_clip.stamp.unwrap_or(0) + 1;
+            self.os_clip = tako_core::file_clipboard::OsFiles {
+                stamp: Some(stamp),
+                paths: paths.to_vec(),
+                cut: false,
+            };
+            Ok(stamp)
+        }
+        fn os_file_clipboard_read(&self) -> tako_core::file_clipboard::OsFiles {
+            self.os_clip.clone()
+        }
+        fn os_file_clipboard_clear_if(&mut self, stamp: u64) {
+            if self.os_clip.stamp == Some(stamp) {
+                self.os_clip = tako_core::file_clipboard::OsFiles {
+                    stamp: Some(stamp + 1),
+                    ..Default::default()
+                };
             }
         }
     }
@@ -28242,14 +28668,34 @@ mod tests {
         assert_eq!(result["requested"].as_u64(), Some(stale_id));
     }
 
+    /// このホストのワークスペースに**無いと保証された**ペイン ID（stale ID の代役）。
+    ///
+    /// ペイン ID は `PANE_ID_COUNTER`（プロセス全体で共有）で採番されるので、`305` のような
+    /// 決め打ちは**同じテストバイナリの他のテストが何枚ペインを作ったか**で実在しうる。
+    /// 並び順しだいでテストのペインがちょうど 305 を引くと、stale のつもりの ID が解けて
+    /// しまう（#1860 でテストが増えた後、CI の 3 並列で毎回落ちたのを実測）
+    fn absent_pane_id(host: &MockHost) -> u64 {
+        let max = host
+            .ws
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .map(|p| p.id().as_u64())
+            .max()
+            .unwrap_or(0);
+        max + 1_000_000
+    }
+
     #[test]
     fn resolve_pane_解決不能でもエラーにせずnullを返す() {
         let mut host = MockHost::new();
-        // stale map に登録の無い旧 ID（#567 の実事象: ペイン 305 は既に存在しない）
+        // stale map に登録の無い旧 ID（#567 の実事象: ペイン 305 は既に存在しない）。
+        // 値は決め打ちせず、このワークスペースに無いものを使う
+        let stale = absent_pane_id(&host);
         let result = dispatch(
             &mut host,
             Request::ResolvePane {
-                pane: Some(305),
+                pane: Some(stale),
                 caller_pid: None,
             },
             PaneOrigin::Cli,
@@ -29484,10 +29930,11 @@ mod tests {
         // ケース 2: pane env が stale（現存しない ID 305）→ stale map もなし →
         // role 検索に落ちるが、同一 role が 3 体あるため曖昧エラーになる
         // （旧実装では先頭の master_b を黙って返していた = 実事故の再現）
+        let stale = absent_pane_id(&host);
         let result_stale = dispatch(
             &mut host,
             Request::OrchestratorSelf {
-                pane: Some(305), // 現存しない stale ID
+                pane: Some(stale), // 現存しない stale ID（決め打ちの 305 は実在しうる）
                 caller_role: Some("master:fable".into()),
                 caller_pid: Some(99999), // pid 解決も失敗
             },
@@ -35194,5 +35641,389 @@ mod tests {
         .unwrap();
         assert!(out.get("format").is_none(), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #1860: コピー / 切り取り / 貼り付け ------------------------------------------
+
+    /// 置き場。**必ず一時 dir の中**（本物のファイルを書き換えない = #1811 の教訓）
+    fn issue1860_scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-1860-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("folder/inner")).unwrap();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("src/a.txt"), "disk\n").unwrap();
+        std::fs::write(dir.join("folder/inner/x.txt"), "x\n").unwrap();
+        let dir = tako_core::platform::path::canonicalize(&dir).unwrap();
+        let tmp = tako_core::platform::path::canonicalize(&std::env::temp_dir()).unwrap();
+        assert!(
+            dir.starts_with(&tmp) && dir != tmp,
+            "一時 dir の外: {}",
+            dir.display()
+        );
+        dir
+    }
+
+    fn issue1860_op(
+        op: FileOpKind,
+        path: &std::path::Path,
+        dest: Option<&std::path::Path>,
+    ) -> Request {
+        Request::FileOp {
+            op,
+            path: path.display().to_string(),
+            name: None,
+            pane: None,
+            dest: dest.map(|d| d.display().to_string()),
+        }
+    }
+
+    fn issue1860_path(v: &Value) -> std::path::PathBuf {
+        std::path::PathBuf::from(v.as_str().unwrap_or_default())
+    }
+
+    /// #1860: 同じフォルダへのコピーは別名で置き（上書き 0 件）、別のフォルダは元の名前のまま。
+    /// 写した後の後始末（ツリーへ知らせる）は 1 件 1 回、断ったら走らない
+    #[test]
+    fn issue1860_コピーは同名を上書きせず別名で置き後始末は1件1回() {
+        let dir = issue1860_scratch("copy");
+        let mut host = MockHost::new();
+        let a = dir.join("src/a.txt");
+        let same = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Copy, &a, Some(&dir.join("src"))),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(same["copied"].as_bool(), Some(true));
+        assert_eq!(same["renamed"].as_bool(), Some(true));
+        let dup = issue1860_path(&same["to"]);
+        assert_ne!(dup, a);
+        assert_eq!(dup.parent(), a.parent(), "同じフォルダに複製");
+        assert!(
+            dup.extension().is_some_and(|e| e == "txt"),
+            "拡張子は残す: {}",
+            dup.display()
+        );
+        assert_eq!(std::fs::read_to_string(&dup).unwrap(), "disk\n");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "disk\n", "元は残る");
+        let other = dispatch(
+            &mut host,
+            issue1860_op(
+                FileOpKind::Copy,
+                &dir.join("folder"),
+                Some(&dir.join("dst")),
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(other["renamed"].as_bool(), Some(false));
+        assert_eq!(other["kind"].as_str(), Some("dir"));
+        assert_eq!(other["entries"].as_u64(), Some(3), "folder / inner / x.txt");
+        assert!(dir.join("dst/folder/inner/x.txt").is_file());
+        assert!(
+            dir.join("folder/inner/x.txt").is_file(),
+            "コピーは元を動かさない"
+        );
+        assert_eq!(host.file_copies, vec![dup, dir.join("dst/folder")]);
+
+        let err = |host: &mut MockHost, request: Request| {
+            dispatch(host, request, PaneOrigin::Cli)
+                .unwrap_err()
+                .to_string()
+        };
+        let into = err(
+            &mut host,
+            issue1860_op(
+                FileOpKind::Copy,
+                &dir.join("folder"),
+                Some(&dir.join("folder/inner")),
+            ),
+        );
+        assert!(
+            into.contains("配下") && into.contains("コピーできない"),
+            "{into}"
+        );
+        assert!(!dir.join("folder/inner/folder").exists(), "何も作らない");
+        let missing = err(
+            &mut host,
+            issue1860_op(FileOpKind::Copy, &dir.join("nope"), Some(&dir.join("dst"))),
+        );
+        assert!(missing.contains("コピー元が見つからない"), "{missing}");
+        let no_dest = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Copy, &a, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(no_dest, DispatchError::InvalidParams(_)));
+        assert_eq!(host.file_copies.len(), 2, "断ったら後始末は走らない");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1860: ⌘C → ⌘V。OS のクリップボードにもファイルとして書き（Finder へ貼れる）、
+    /// フォルダの行 = その中・ファイルの行 = そのフォルダ・自分の行 = 親（複製）へ貼る。
+    /// コピーは貼っても中身が残る（何度でも貼れる）
+    #[test]
+    fn issue1860_コピーを貼ると行に応じた場所へ複製されクリップボードは残る() {
+        let dir = issue1860_scratch("paste-copy");
+        let mut host = MockHost::new();
+        let a = dir.join("src/a.txt");
+        let put = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::ClipboardCopy, &a, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(put["mode"].as_str(), Some("copy"));
+        assert_eq!(put["os"].as_bool(), Some(true));
+        assert_eq!(
+            host.os_clip.paths,
+            vec![a.clone()],
+            "OS のクリップボードにも書く"
+        );
+
+        let show = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Clipboard, &dir.join("dst"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(show["source"].as_str(), Some("tako"));
+        assert_eq!(issue1860_path(&show["items"][0]["dest"]), dir.join("dst"));
+        assert!(!dir.join("dst/a.txt").exists(), "clipboard は何も変えない");
+
+        // フォルダの行
+        let pasted = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &dir.join("dst"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(pasted["mode"].as_str(), Some("copy"));
+        assert_eq!(
+            issue1860_path(&pasted["pasted"][0]["to"]),
+            dir.join("dst/a.txt")
+        );
+        // ファイルの行 = そのファイルのフォルダ（もう一度貼れる = 別名）
+        let again = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &dir.join("dst/a.txt"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let second = issue1860_path(&again["pasted"][0]["to"]);
+        assert_eq!(second.parent(), Some(dir.join("dst").as_path()));
+        assert_ne!(second, dir.join("dst/a.txt"));
+        // 自分の行 = 親（同じフォルダに複製）
+        let itself = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &a, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            issue1860_path(&itself["pasted"][0]["to"]).parent(),
+            Some(dir.join("src").as_path())
+        );
+        assert!(host.file_clip.is_some(), "コピーは貼っても残る");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "disk\n");
+        assert_eq!(host.file_copies.len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1860: ⌘X → ⌘V は #1834 の移動（開いているペインが付け替わる）。全部移せたら
+    /// tako と OS のクリップボードを空にする。フォルダを自分の配下へは断り、切り取り中のまま残す
+    #[test]
+    fn issue1860_切り取りを貼ると移動になりペインが付け替わりクリップボードが空く() {
+        let dir = issue1860_scratch("paste-cut");
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let root = host.root_pane();
+        let viewer = issue1834_open(&mut host, root, &dir.join("folder/inner/x.txt"));
+        dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::ClipboardCut, &dir.join("folder"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(host
+            .file_clip
+            .as_ref()
+            .is_some_and(|c| c.is_cut(&dir.join("folder"))));
+        // 自分の配下へは断る（切り取り中のまま = 別の場所へ貼り直せる）
+        let refused = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &dir.join("folder/inner"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains("配下") && refused.contains("移動できない"),
+            "{refused}"
+        );
+        assert!(host.file_clip.is_some(), "断ったら切り取り中のまま");
+        assert!(host.file_moves.is_empty());
+
+        let pasted = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &dir.join("dst"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(pasted["mode"].as_str(), Some("cut"));
+        assert_eq!(pasted["pasted"][0]["moved"].as_bool(), Some(true));
+        assert!(dir.join("dst/folder/inner/x.txt").is_file());
+        assert!(!dir.join("folder").exists(), "移動 = 元は残らない");
+        assert_eq!(
+            host.file_moves,
+            vec![(dir.join("folder"), dir.join("dst/folder"))],
+            "移動は #1834 の後始末を 1 回だけ通る"
+        );
+        assert_eq!(
+            std::path::PathBuf::from(&host.previews[&viewer].0),
+            dir.join("dst/folder/inner/x.txt"),
+            "開いているペインが付け替わる"
+        );
+        assert!(
+            host.file_clip.is_none(),
+            "全部移したら tako のクリップボードは空"
+        );
+        assert!(
+            host.os_clip.paths.is_empty(),
+            "OS のクリップボードも空（もう無い場所を指さない）"
+        );
+        let empty = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &dir.join("dst"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(empty.contains("クリップボードに無い"), "{empty}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1860: tako が書いた後に Finder 等で何かをコピーしたら（変更番号が進んだら）、
+    /// tako の切り取りは古いので捨て、OS のクリップボードのファイルを複製する。
+    /// エクスプローラーの切り取り（`Preferred DropEffect` = 移動）は移動として貼る
+    #[test]
+    fn issue1860_osのクリップボードが書き換わったらそちらを貼る() {
+        let dir = issue1860_scratch("paste-os");
+        std::fs::write(dir.join("finder.png"), "png").unwrap();
+        let mut host = MockHost::new();
+        dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::ClipboardCut, &dir.join("src/a.txt"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        host.os_clip = tako_core::file_clipboard::OsFiles {
+            stamp: Some(500),
+            paths: vec![dir.join("finder.png")],
+            cut: false,
+        };
+        let pasted = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &dir.join("dst"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(pasted["source"].as_str(), Some("os"));
+        assert_eq!(pasted["mode"].as_str(), Some("copy"));
+        assert!(dir.join("dst/finder.png").is_file());
+        assert!(dir.join("finder.png").is_file(), "Finder のコピーは複製");
+        assert!(
+            dir.join("src/a.txt").is_file(),
+            "古い tako の切り取りで動かさない"
+        );
+
+        host.file_clip = None;
+        host.os_clip = tako_core::file_clipboard::OsFiles {
+            stamp: Some(600),
+            paths: vec![dir.join("finder.png")],
+            cut: true,
+        };
+        let moved = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::Paste, &dir.join("folder"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(moved["mode"].as_str(), Some("cut"));
+        assert!(dir.join("folder/finder.png").is_file());
+        assert!(!dir.join("finder.png").exists());
+        assert!(
+            host.os_clip.paths.is_empty(),
+            "移し終えたらエクスプローラーの切り取りも空にする"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1860: IPC の `op=copy` / `op=paste`（コピー）は background へ出し、UI スレッドで
+    /// 後始末する 3 段（`prepare_offload` → `run_staged` → `finish_offload`）。同期の
+    /// dispatch と同じ応答になる。切り取りの貼り付け = 移動は同期のまま（None）
+    #[test]
+    fn issue1860_コピーはoffloadの3段を通り切り取りの貼り付けは同期() {
+        let dir = issue1860_scratch("offload");
+        let mut host = MockHost::new();
+        let request = issue1860_op(
+            FileOpKind::Copy,
+            &dir.join("src/a.txt"),
+            Some(&dir.join("dst")),
+        );
+        let Some(Ok(job)) = prepare_offload(&mut host, &request) else {
+            panic!("コピーが offload されない");
+        };
+        assert!(host.file_copies.is_empty(), "準備の段では写さない");
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("後始末が UI スレッドへ戻らない");
+        };
+        assert!(dir.join("dst/a.txt").is_file(), "background の段で写す");
+        let value = finish_offload(&mut host, next, PaneOrigin::Cli).unwrap();
+        assert_eq!(issue1860_path(&value["to"]), dir.join("dst/a.txt"));
+        assert_eq!(host.file_copies, vec![dir.join("dst/a.txt")]);
+        // dest が無ければ準備の段で断る
+        assert!(matches!(
+            prepare_offload(
+                &mut host,
+                &issue1860_op(FileOpKind::Copy, &dir.join("src/a.txt"), None)
+            ),
+            Some(Err(DispatchError::InvalidParams(_)))
+        ));
+        // 貼り付け: コピーは offload・切り取りは同期・空は準備の段で理由つき
+        let paste = issue1860_op(FileOpKind::Paste, &dir.join("folder"), None);
+        assert!(matches!(prepare_offload(&mut host, &paste), Some(Err(_))));
+        dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::ClipboardCopy, &dir.join("src/a.txt"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(matches!(prepare_offload(&mut host, &paste), Some(Ok(_))));
+        dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::ClipboardCut, &dir.join("src/a.txt"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(prepare_offload(&mut host, &paste).is_none(), "移動は同期");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1860: 新しい op の wire 形（MCP の enum と同じ snake_case）
+    #[test]
+    fn issue1860_新しいopのwire形() {
+        for (op, wire) in [
+            (FileOpKind::Copy, "copy"),
+            (FileOpKind::ClipboardCopy, "clipboard_copy"),
+            (FileOpKind::ClipboardCut, "clipboard_cut"),
+            (FileOpKind::Clipboard, "clipboard"),
+            (FileOpKind::Paste, "paste"),
+        ] {
+            assert_eq!(serde_json::to_value(op).unwrap(), json!(wire));
+        }
     }
 }

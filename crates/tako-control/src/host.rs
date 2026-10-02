@@ -1018,6 +1018,35 @@ pub trait PreviewHost {
         _follows: &[tako_core::file_move::Follow],
     ) {
     }
+    /// ファイル・フォルダを写した**後**の後始末（FR-3.34 / #1860）。ファイルツリーで
+    /// 貼り付け先のフォルダを開いて読み直す（2 秒のポーリングを待たずに写したものを見せる）。
+    /// コピーの口は dispatch の `FileOpKind::Copy` / `Paste` で、GUI の ⌘V・CLI・MCP の
+    /// どれから来ても写したもの 1 つにつき 1 回だけ通る
+    fn file_copied(&mut self, _to: &std::path::Path) {}
+    /// ファイルツリーのクリップボードの tako 側の中身（⌘C / ⌘X で置いたもの。#1860）。
+    /// 切り取り（移動）は OS のクリップボードに印が無いので、ここにしか無い
+    fn file_clipboard(&self) -> Option<tako_core::file_clipboard::FileClipboard> {
+        None
+    }
+    fn set_file_clipboard(&mut self, _clip: Option<tako_core::file_clipboard::FileClipboard>) {}
+    /// OS のクリップボードへファイルを書く（#1860）。返り値は書いた後の変更番号。
+    ///
+    /// **既定は書かない**（テストのホストがユーザーのクリップボードを上書きしない）。
+    /// GUI だけが境界 B28（`platform::file_clipboard`）へ繋ぐ
+    fn os_file_clipboard_write(
+        &mut self,
+        _paths: &[std::path::PathBuf],
+        _cut: bool,
+    ) -> Result<u64, String> {
+        Err("このホストは OS のクリップボードを使わない".into())
+    }
+    /// OS のクリップボードのファイル（Finder / エクスプローラーでコピーしたもの。#1860）
+    fn os_file_clipboard_read(&self) -> tako_core::file_clipboard::OsFiles {
+        tako_core::file_clipboard::OsFiles::default()
+    }
+    /// 変更番号が `stamp` のまま（tako が書いたまま）なら OS のクリップボードを空にする（#1860。
+    /// 切り取りを貼り終えた後に、もう無い場所を指すファイルを残さない）
+    fn os_file_clipboard_clear_if(&mut self, _stamp: u64) {}
     /// 動画プレイヤーの操作（"play" / "pause" / "toggle" / "mute" / "unmute" /
     /// "toggle_mute" / "loop_on" / "loop_off" / "toggle_loop"）。
     /// 戻り値は現在の state（"playing" / "paused"）

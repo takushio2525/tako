@@ -359,7 +359,8 @@ fn rule_one_to_one(
         "MCP `tako_file_op` の dest が dispatch へ渡っていない",
     )?;
     catalog.must_have(
-        r#""open_in_tako","move"]"#,
+        // #1860 で後ろに copy 等が続くようになったので閉じ括弧までは見ない
+        r#""open_in_tako","move""#,
         "\"tako_file_op\"",
         "カタログの op の enum に move が無い（AI が選べない）",
     )?;

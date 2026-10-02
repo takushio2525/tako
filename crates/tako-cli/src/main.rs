@@ -1847,6 +1847,17 @@ enum TmuxCommand {
     },
 }
 
+/// `tako file clipboard` の操作（#1860）
+#[derive(Subcommand)]
+enum FileClipboardCommand {
+    /// コピーする（貼ると複製。OS のクリップボードにも書くのでファイルマネージャへも貼れる）
+    Copy { path: String },
+    /// 切り取る（貼ると移動）
+    Cut { path: String },
+    /// 中身と、DIR へ貼ったときの貼り付け先を表示する（省略時はカレントディレクトリ）
+    Show { dir: Option<String> },
+}
+
 #[derive(Subcommand)]
 enum FileCommand {
     /// ファイルの絶対パスを出力する（--relative でペイン cwd 基準の相対パス）
@@ -1874,6 +1885,25 @@ enum FileCommand {
         path: String,
         /// 移動先のフォルダ
         dest: String,
+    },
+    /// ファイル・フォルダを別のフォルダへ複製する（ファイルツリーのコピー → 貼り付けと同じ。
+    /// フォルダは中身ごと。同名は上書きせず「名前 のコピー」等の別名で置く。自分の配下へは断る）。
+    /// 最後の引数が貼り付け先のフォルダ。例: `tako file copy a.txt docs dst`
+    Copy {
+        /// コピー元（1 つ以上）と、最後に貼り付け先のフォルダ
+        #[arg(required = true, num_args = 2.., value_name = "SRC... DEST")]
+        paths: Vec<String>,
+    },
+    /// ファイルツリーのクリップボード（コピー・切り取り・中身の確認）。引数なしは中身の確認
+    Clipboard {
+        #[command(subcommand)]
+        action: Option<FileClipboardCommand>,
+    },
+    /// クリップボードの中身を貼る（ファイルツリーの貼り付けと同じ。コピーは複製・切り取りは移動。
+    /// ファイルマネージャでコピーしたものも貼れる）
+    Paste {
+        /// 貼り付け先（フォルダならその中・ファイルならそのフォルダ。省略時はカレントディレクトリ）
+        dest: Option<String>,
     },
     /// 新しいファイルを作成する（path 配下に name で作成）
     Create { path: String, name: String },
@@ -4061,6 +4091,8 @@ fn cli_main() -> ExitCode {
         // run --wait / --list は合成処理
         Command::Run(ref args) if args.wait => return wait_exit_code(run_wait(&cli.command)),
         Command::Run(ref args) if args.list => run_list(&cli.command),
+        // #1860: コピー元が複数なら 1 件ずつ同じ dispatch へ送る
+        Command::File(FileCommand::Copy { ref paths }) => file_copy_cli(paths),
         command => run(command),
     };
     match result {
@@ -8140,6 +8172,46 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: None,
             dest: Some(resolve_cli_path(dest)),
         },
+        // #1860: コピー元が 1 つのとき。複数は main の `file_copy_cli` が 1 件ずつ送る
+        Command::File(FileCommand::Copy { paths }) => {
+            let mut requests = file_copy_requests(paths)?;
+            if requests.len() != 1 {
+                return Err("コピー元が複数のときは 1 件ずつ送る（file_copy_cli）".into());
+            }
+            requests.remove(0)
+        }
+        Command::File(FileCommand::Clipboard { action }) => {
+            let (op, path) = match action {
+                Some(FileClipboardCommand::Copy { path }) => (
+                    tako_control::protocol::FileOpKind::ClipboardCopy,
+                    path.as_str(),
+                ),
+                Some(FileClipboardCommand::Cut { path }) => (
+                    tako_control::protocol::FileOpKind::ClipboardCut,
+                    path.as_str(),
+                ),
+                Some(FileClipboardCommand::Show { dir }) => (
+                    tako_control::protocol::FileOpKind::Clipboard,
+                    dir.as_deref().unwrap_or("."),
+                ),
+                None => (tako_control::protocol::FileOpKind::Clipboard, "."),
+            };
+            Request::FileOp {
+                op,
+                path: resolve_cli_path(path),
+                name: None,
+                pane: None,
+                dest: None,
+            }
+        }
+        // 貼り付け先は CLI の cwd 基準（GUI の cwd で読ませない = move と同じ）
+        Command::File(FileCommand::Paste { dest }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::Paste,
+            path: resolve_cli_path(dest.as_deref().unwrap_or(".")),
+            name: None,
+            pane: None,
+            dest: None,
+        },
         Command::File(FileCommand::Create { path, name }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::CreateFile,
             path: resolve_cli_path(path),
@@ -9368,6 +9440,53 @@ fn parse_direction(s: &str) -> Result<Direction, String> {
         "up" | "u" => Ok(Direction::Up),
         _ => Err(format!("不正な方向: {s}（right / down / left / up）")),
     }
+}
+
+/// `tako file copy SRC... DEST` の要求（コピー元 1 つにつき 1 件。#1860）。
+/// どれも CLI の cwd 基準で絶対化する（GUI の cwd で読ませない = move と同じ）
+fn file_copy_requests(paths: &[String]) -> Result<Vec<Request>, String> {
+    let Some((dest, sources)) = paths.split_last().filter(|(_, s)| !s.is_empty()) else {
+        return Err(
+            "コピー元と貼り付け先のフォルダを指定する（例: tako file copy a.txt dst）".into(),
+        );
+    };
+    let dest = resolve_cli_path(dest);
+    Ok(sources
+        .iter()
+        .map(|src| Request::FileOp {
+            op: tako_control::protocol::FileOpKind::Copy,
+            path: resolve_cli_path(src),
+            name: None,
+            pane: None,
+            dest: Some(dest.clone()),
+        })
+        .collect())
+}
+
+/// `tako file copy`（#1860）。コピー元が 1 つなら他の file 系と同じ 1 往復。複数なら
+/// 1 件ずつ送って 1 行ずつ結果を出し、断られたものは理由を出して続ける（`cp` と同じ）
+fn file_copy_cli(paths: &[String]) -> Result<(), String> {
+    let requests = file_copy_requests(paths)?;
+    let total = requests.len();
+    if total == 1 {
+        let result = send_request(requests.into_iter().next().expect("1 件"))?;
+        println!("{result}");
+        return Ok(());
+    }
+    let mut failed = 0usize;
+    for request in requests {
+        match send_request(request) {
+            Ok(result) => println!("{result}"),
+            Err(e) => {
+                failed += 1;
+                eprintln!("error: {e}");
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{total} 件中 {failed} 件をコピーできなかった"));
+    }
+    Ok(())
 }
 
 fn resolve_cli_path(path: &str) -> String {

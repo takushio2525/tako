@@ -18,6 +18,7 @@ pub mod editor_keys;
 pub mod exe;
 pub mod fd_inherit;
 pub mod font;
+pub mod fs_copy;
 pub mod ime;
 pub mod install_info;
 pub mod keys;

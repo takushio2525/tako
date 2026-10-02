@@ -113,6 +113,12 @@ pub struct FileTree {
     /// （実機で確認済み）。tako はホームを開いた初回印象が壊れるのを優先して
     /// ドット全体を既定で隠し、ワンクリックで戻せる形にしている
     show_hidden: bool,
+    /// 同期の読み直し（`refresh_dir` / `note_moved` / `note_copied`）の世代（#1860）
+    generation: u64,
+    /// ディレクトリごとに最後に同期で読み直した世代（#1860）。2 秒ポーリングの結果が
+    /// **読み直しより前に読み始めた古い一覧**なら当てない（当てると、貼り付けた・移したものが
+    /// 次のポーリングまでツリーから消える）
+    local_reads: HashMap<PathBuf, u64>,
 
     // --- リモート（SSH 先）のワークスペースフォルダ（#919 / #65） -------------
     //
@@ -245,10 +251,26 @@ impl FileTree {
         for dir in carried.iter().chain(dest.iter()) {
             self.expanded.insert(dir.clone());
             self.cache.insert(dir.clone(), read_dir_sorted(dir));
+            self.mark_local_read(dir);
         }
         if let Some(parent) = from.parent() {
             self.refresh_dir(parent);
         }
+        self.rows_cache = None;
+    }
+
+    /// ファイル・フォルダを写した**後**の追従（FR-3.34 / #1860）。
+    ///
+    /// 写した先のフォルダを開いてその場で読み直す（2 秒ポーリングを待たずに結果を見せる =
+    /// [`Self::note_moved`] と同じ扱い）。ディレクトリ 1 個の `read_dir` なので UI スレッドで
+    /// 同期に呼んでよい
+    pub fn note_copied(&mut self, to: &Path) {
+        let Some(dest) = to.parent() else {
+            return;
+        };
+        self.expanded.insert(dest.to_path_buf());
+        self.cache.insert(dest.to_path_buf(), read_dir_sorted(dest));
+        self.mark_local_read(dest);
         self.rows_cache = None;
     }
 
@@ -422,10 +444,41 @@ impl FileTree {
             return;
         }
         let fresh = read_dir_sorted(dir);
+        self.mark_local_read(dir);
         if self.cache.get(dir) != Some(&fresh) {
             self.cache.insert(dir.to_path_buf(), fresh);
             self.rows_cache = None;
         }
+    }
+
+    /// いまの世代（2 秒ポーリングが読み始める前に控え、[`Self::apply_refresh_since`] へ渡す）
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn mark_local_read(&mut self, dir: &Path) {
+        self.generation += 1;
+        self.local_reads.insert(dir.to_path_buf(), self.generation);
+    }
+
+    /// 世代 `since` で読み始めたポーリングの結果を当てる（#1860）。`since` より後に同期で
+    /// 読み直したディレクトリの結果は古いので捨てる（読み直した方が新しい）
+    pub fn apply_refresh_since(
+        &mut self,
+        results: Vec<(PathBuf, Option<DirListing>)>,
+        since: u64,
+    ) -> bool {
+        let reads = std::mem::take(&mut self.local_reads);
+        let fresh: Vec<_> = results
+            .into_iter()
+            .filter(|(dir, _)| reads.get(dir).is_none_or(|read| *read <= since))
+            .collect();
+        // 当て終えたポーリングより前の読み直しはもう要らない（ポーリングは 1 本ずつ）
+        self.local_reads = reads
+            .into_iter()
+            .filter(|(_, read)| *read > since)
+            .collect();
+        self.apply_refresh(fresh)
     }
 
     /// 同期 refresh（テスト用。本番は refresh_targets → scan_dirs → apply_refresh）
@@ -1176,6 +1229,39 @@ mod tests {
         assert!(tree.rows().iter().any(|r| r.entry.name == "created.txt"));
         // 未知のディレクトリは無視（キャッシュを作らない）
         tree.refresh_dir(Path::new("/no/such/dir"));
+        remove_temp_dir(&dir);
+    }
+
+    /// #1860: 貼り付けた直後にツリーへ出たものを、**貼る前に読み始めた** 2 秒ポーリングの
+    /// 結果で消さない（古い一覧を当てると次のポーリングまで行が消える = 実画面で観測した）。
+    /// 読み直した後に読み始めたポーリングの結果は当てる
+    #[test]
+    fn 貼り付けの読み直しより前に読み始めたポーリングの結果は当てない() {
+        let dir = fixture("t1860");
+        let mut tree = FileTree::default();
+        tree.set_roots(vec![dir.clone()]);
+        let has =
+            |tree: &mut FileTree, name: &str| tree.rows().iter().any(|r| r.entry.name == name);
+        // ポーリングが読み始める（この時点の一覧 = 貼る前）
+        let since = tree.generation();
+        let stale = scan_dirs(&tree.refresh_targets());
+        // 貼り付けが着地してツリーへ知らせる
+        std::fs::write(dir.join("pasted.txt"), "p").unwrap();
+        tree.note_copied(&dir.join("pasted.txt"));
+        assert!(has(&mut tree, "pasted.txt"), "知らせた時点で出る");
+        // 古いポーリングの結果は当てない
+        assert!(!tree.apply_refresh_since(stale, since));
+        assert!(has(&mut tree, "pasted.txt"), "古い一覧で消した");
+        // 次のポーリング（読み直しの後に読み始めた）は当てる = 外の変更も拾う
+        std::fs::write(dir.join("outside.txt"), "o").unwrap();
+        let since = tree.generation();
+        let fresh = scan_dirs(&tree.refresh_targets());
+        assert!(tree.apply_refresh_since(fresh, since));
+        assert!(has(&mut tree, "outside.txt") && has(&mut tree, "pasted.txt"));
+        assert!(
+            tree.local_reads.is_empty(),
+            "当て終えた読み直しの記録は残さない"
+        );
         remove_temp_dir(&dir);
     }
 

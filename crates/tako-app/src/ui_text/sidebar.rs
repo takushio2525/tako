@@ -218,6 +218,33 @@ pub fn move_refused(refusal: &tako_core::file_move::MoveRefusal) -> String {
     }
 }
 
+// --- コピー / 切り取り / 貼り付け（FR-3.34 / #1860。キー: sidebar.clip_*） ---
+
+/// 右クリックメニュー・失敗の通知の操作名（押した操作と失敗した操作の名前を揃える = #1399）
+pub fn menu_cut() -> &'static str {
+    tr!("切り取り", "Cut")
+}
+pub fn menu_copy() -> &'static str {
+    tr!("コピー", "Copy")
+}
+pub fn menu_paste() -> &'static str {
+    tr!("貼り付け", "Paste")
+}
+/// リモート（SSH）の行でキーを押したときの理由（ローカルのファイルシステムの操作を通さない = #919）
+pub fn clip_remote_refused() -> &'static str {
+    tr!(
+        "リモート（SSH）の項目はコピー・切り取り・貼り付けできない",
+        "Remote (SSH) items can't be copied, cut or pasted"
+    )
+}
+/// 一部だけ貼れなかったときの通知（理由は 1 件目だけ。全部は CLI / MCP の `failed` に載る）
+pub fn clip_paste_partial(failed: usize, total: usize, first: &str) -> String {
+    tr!(
+        format!("{total} 件中 {failed} 件を貼り付けられなかった: {first}"),
+        format!("Couldn't paste {failed} of {total} items: {first}")
+    )
+}
+
 // --- ヘッダのトグル（#550。キー: sidebar.hidden_*） ---
 
 pub fn hidden_show() -> &'static str {
