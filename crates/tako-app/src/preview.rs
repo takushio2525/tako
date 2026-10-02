@@ -432,6 +432,16 @@ pub struct EditState {
     pub conflict: Option<DiskConflict>,
     /// 帯で広げている差分（#1659）。広げたときに 1 回だけ作り、競合が変わる・解けると捨てる
     pub conflict_diff: Option<Arc<tako_core::DiskDiff>>,
+    /// セッションを開いたときの表示モード（#1661）。編集中の表示はエディタの行（`Code`）に
+    /// なるので、編集を抜けたらこれへ戻す（Markdown なら本文から描き直して目次も作り直す）
+    pub resume_mode: PreviewMode,
+    /// 編集中の目次と、それを作ったときの本文の版（#1661）。作るのは求められたとき
+    /// （目次パネルを開いている・CLI / MCP が読む）だけで、版が変わっていたら作り直す
+    /// （打鍵ごとには作らない = 10 万行で 1 回 14ms かかる）
+    pub source_outline: Option<(u64, Arc<PreviewOutline>)>,
+    /// 描画（Markdown）を最後に組んだときの本文の版（#1661）。同じ版を組み直さない
+    /// （抜けた後の `tako edit save` は本文を変えないので、描き直すと一瞬読み込み中になるだけ）
+    pub rendered_from: Option<u64>,
 }
 
 /// 編集中のファイルが外で書き換わった / 消された（#1659）
@@ -449,6 +459,14 @@ pub struct DiskConflict {
 /// 判定は dispatch の 1 実装（`OpenFile` の差し替え回避も同じ口で戻る）
 pub fn external_change_legacy() -> bool {
     tako_control::dispatch::external_change_legacy()
+}
+
+/// `TAKO_1661_LEGACY=1` で **#1661 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
+/// Markdown を編集して抜けてもコード表示のまま（目次も空のまま）・編集中の目次は出ない・
+/// レイアウトにも編集中の表示モード（`code`）を書く
+pub fn md_edit_resume_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1661_LEGACY").is_some())
 }
 
 /// 表示行の差し替え 1 回ぶん（#1660）。版 `from_rev` の表示行の `range` を `inserted` 行で
@@ -522,7 +540,57 @@ impl EditState {
             line_splice: None,
             conflict: None,
             conflict_diff: None,
+            resume_mode: preview.mode,
+            source_outline: None,
+            rendered_from: None,
         })
+    }
+
+    /// 編集を抜けたら描画（Markdown）へ戻すセッションか（#1661）
+    pub fn resumes_rendered(&self) -> bool {
+        self.resume_mode == PreviewMode::Markdown && !md_edit_resume_legacy()
+    }
+
+    /// 表示にエディタの行（`Code`）が要るか（#1661）。
+    ///
+    /// 要るのは編集中と、検索欄を開いているあいだ（ヒットはエディタの行の上に描く）。
+    /// 元がコード表示ならいつでもエディタの行のまま（#1661 前と同じ）
+    pub fn shows_editor_lines(&self) -> bool {
+        self.editing || self.search_visible || !self.resumes_rendered()
+    }
+
+    /// UI スレッドで全文を扱ってよい大きさか（#1661。編集の全文の塗り = #1660 と同じ線引き）。
+    /// 境目は表示の行数で数える（末尾の改行の後ろの空行は数えない = `apply_editor_text` と同じ）
+    pub fn fits_sync_render(&self) -> bool {
+        let text = self.buffer.text();
+        let shown_lines = self.buffer.line_count() - usize::from(text.ends_with('\n'));
+        shown_lines <= self.highlight.policy.sync_max_lines || sync_seed_forced()
+    }
+
+    /// 編集中に目次を出せるか（#1661）。Markdown のファイルを編集しているあいだ
+    pub fn offers_source_outline(&self) -> bool {
+        self.editing && is_markdown_path(self.buffer.path()) && !md_edit_resume_legacy()
+    }
+
+    /// 編集中の目次（#1661）。本文の版が前回と同じなら作り直さない
+    pub fn source_outline(&mut self) -> Arc<PreviewOutline> {
+        let version = self.buffer.version();
+        match &self.source_outline {
+            Some((built, outline)) if *built == version => outline.clone(),
+            _ => {
+                let outline = Arc::new(markdown_source_outline(self.buffer.text()));
+                self.source_outline = Some((version, outline.clone()));
+                outline
+            }
+        }
+    }
+
+    /// 書き換えずに読む口（`&self` しか無い CLI / MCP の読み取り）。版が合えば使い回す
+    pub fn source_outline_snapshot(&self) -> Arc<PreviewOutline> {
+        match &self.source_outline {
+            Some((built, outline)) if *built == self.buffer.version() => outline.clone(),
+            _ => Arc::new(markdown_source_outline(self.buffer.text())),
+        }
     }
 
     /// 外部変更の競合を記録する（#1659）。**知らせるのは新しく分かったときだけ**で、
@@ -2274,14 +2342,21 @@ struct MdParseState {
 
 /// Markdown をブロック列へパースする（FR-3.3）。GFM テーブルは表構造として保持し、
 /// HTML など未対応の構造はテキストとして段落へ劣化させ、内容を落とさない。
-fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
-    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-
+/// Markdown のパーサオプション（描画と編集中の目次が同じものを使う。#1661）
+fn markdown_options() -> pulldown_cmark::Options {
+    use pulldown_cmark::Options;
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     // Issue #656: 表を表構造として受け取る（従来は素のテキストへ潰れていた）
     options.insert(Options::ENABLE_TABLES);
+    options
+}
+
+fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+
+    let options = markdown_options();
     // Issue #1202: 先頭の UTF-8 BOM を落としてから渡す。BOM が `#` の直前に居ると
     // pulldown-cmark は行頭の `#` を見出しと認識せず、**1 行目だけ**生テキストで出る。
     // Windows は BOM 付き UTF-8 が既定で作られる場面が多い（PowerShell 5.1 の
@@ -2750,6 +2825,114 @@ fn markdown_document(text: &str) -> (Vec<MdBlock>, PreviewOutline) {
         })
         .collect();
     (blocks, PreviewOutline::new(items))
+}
+
+/// 編集セッションの本文から Markdown の表示を組む（#1661。編集を抜けたときの描き直し）。
+///
+/// ディスクから読むのではなく**本文**から組むので、未保存のまま抜けても書いたとおりに
+/// 描かれ、目次も書き換えた見出しで作り直される。上限（#1660）はファイルから読むときと
+/// 同じ判定で切り詰める（打鍵で上限を越えた本文を丸ごと描かない）
+pub fn markdown_from_text(path: &Path, text: &str) -> PreviewState {
+    let (text, truncated) = limit_text(text);
+    let (blocks, outline) = markdown_document(&text);
+    PreviewState {
+        path: path.to_path_buf(),
+        mode: PreviewMode::Markdown,
+        content: PreviewContent::Markdown(blocks),
+        outline: Arc::new(outline),
+        truncated,
+        content_rev: next_content_rev(),
+        file_stamp: FileStamp::from_path(path),
+        highlight_stamp: None,
+    }
+}
+
+/// レイアウト（`layout.json`）へ書く表示モード（#1661）。
+///
+/// 編集中の表示（`Code`）ではなく、**編集を抜けたら戻るモード**を書く。再起動で
+/// 編集セッションは戻らないので、`code` を書くと Markdown がコード表示のまま戻ってくる
+pub fn layout_mode(preview: &PreviewState, edit: Option<&EditState>) -> PreviewMode {
+    match edit {
+        Some(edit) if edit.resumes_rendered() => PreviewMode::Markdown,
+        _ => preview.mode,
+    }
+}
+
+/// 読み込みの上限（#1660）を本文へ掛ける。判定は [`read_text_source`] と同じ
+/// `Truncation::judge`（バイトの超過を先に見る）
+fn limit_text(text: &str) -> (std::borrow::Cow<'_, str>, Truncated) {
+    let lines = text.lines().count();
+    let truncated =
+        tako_core::preview_limit::Truncation::judge(text.len(), Some(text.len() as u64), lines);
+    if truncated.is_none() {
+        return (std::borrow::Cow::Borrowed(text), None);
+    }
+    let mut end = text.len().min(MAX_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &text[..end];
+    let cut = if cut.lines().count() > MAX_LINES {
+        cut.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n")
+    } else {
+        cut.to_string()
+    };
+    (std::borrow::Cow::Owned(cut), truncated)
+}
+
+/// 編集中の目次（#1661）。見出しの行（1 始まり）を指す。
+///
+/// **項目の並びとタイトルは [`markdown_document`] の目次と同じ規則**で作る（同じパーサ・
+/// 同じオプション・BOM の剥がし方・タイトルの組み方・空の見出しを落とす）。同じ本文なら
+/// k 番目どうしが同じ見出しを指し、`markdown_outlines_agree` テストが突き合わせる。
+/// 描画ブロックは組まない（コードブロックの色付けもしない）ので、全文を描くより軽い
+/// （実測 release・同じパーサとオプションで見出しだけを走査: 5,000 行 0.58ms / 10 万行 13.8ms）
+pub fn markdown_source_outline(text: &str) -> PreviewOutline {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    let body = tako_core::text::strip_bom(text);
+    let mut items = Vec::new();
+    // 見出しの中なら（level, 行, タイトル）
+    let mut heading: Option<(u8, usize, String)> = None;
+    // 行は前回の位置から数え足す（毎回先頭から数えない）
+    let (mut line, mut counted) = (1usize, 0usize);
+    for (event, range) in Parser::new_ext(body, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                line += body.as_bytes()[counted..range.start]
+                    .iter()
+                    .filter(|b| **b == b'\n')
+                    .count();
+                counted = range.start;
+                heading = Some((level as u8, line, String::new()));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, at, title)) = heading.take() {
+                    let title = title.trim();
+                    if !title.is_empty() {
+                        items.push(PreviewOutlineItem {
+                            title: title.to_string(),
+                            level,
+                            target: PreviewOutlineTarget::SourceLine { line: at },
+                        });
+                    }
+                }
+            }
+            // タイトルへ入るものは描画の見出しのスパンと同じ（`parse_markdown_blocks`）
+            Event::Text(t) | Event::Code(t) | Event::Html(t) | Event::InlineHtml(t) => {
+                if let Some((_, _, title)) = heading.as_mut() {
+                    title.push_str(&t);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, title)) = heading.as_mut() {
+                    title.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    PreviewOutline::new(items)
 }
 
 /// Markdown ブロックだけを必要とする経路（アウトライン不要のとき）。
@@ -4591,6 +4774,174 @@ mod tests {
         due.sort();
         assert_eq!(due, vec![1, 4]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #1661: Markdown の編集を抜けたら描画へ戻す ---------------------------
+
+    /// 目次の (レベル, タイトル) の並び
+    fn outline_heads(outline: &PreviewOutline) -> Vec<(u8, String)> {
+        outline
+            .items
+            .iter()
+            .map(|item| (item.level, item.title.clone()))
+            .collect()
+    }
+
+    /// 編集中の目次は描画の目次と**同じ並び・同じタイトル**になる（k 番目どうしが同じ見出し）。
+    /// 編集を抜けたときの「見ていた節」の対応づけと、CLI / MCP の項目番号がこれに乗っている
+    #[test]
+    fn markdown_outlines_agree() {
+        let cases = [
+            MARKDOWN_SHOWCASE.to_string(),
+            // setext・引用とリストの中の見出し・空の見出し・装飾とコードと HTML 入りの見出し
+            "Setext\n===\n\nSub\n---\n\n> # 引用の中\n\n- ## リストの中\n\n#\n\n## *強調* と `code` と <b>html</b> と [link](http://x)\n".to_string(),
+            // フェンスの中の `#` は見出しではない
+            "# A\n\n```sh\n# comment\n```\n\n## B\n".to_string(),
+            // BOM（#1202）と CRLF
+            "\u{feff}# 先頭\r\n\r\n## 次\r\n".to_string(),
+            // 複数行の setext（改行は空白 1 つになる）
+            "one\ntwo\n===\n".to_string(),
+        ];
+        for text in &cases {
+            let (_, rendered) = markdown_document(text);
+            let source = markdown_source_outline(text);
+            assert_eq!(
+                outline_heads(&source),
+                outline_heads(&rendered),
+                "描画の目次と編集中の目次が食い違う: {text:?}"
+            );
+            assert!(source
+                .items
+                .iter()
+                .all(|item| matches!(item.target, PreviewOutlineTarget::SourceLine { .. })));
+        }
+        // 確かめた並びが空振りでないこと（showcase は見出しを全レベル含む）
+        assert!(markdown_source_outline(MARKDOWN_SHOWCASE).len() >= 6);
+    }
+
+    /// 編集中の目次は見出しの原文の行（1 始まり）を指す。CRLF・BOM でも行はずれない
+    #[test]
+    fn 編集中の目次は見出しの原文の行を指す() {
+        let lines = |text: &str| -> Vec<usize> {
+            markdown_source_outline(text)
+                .items
+                .iter()
+                .map(|item| match item.target {
+                    PreviewOutlineTarget::SourceLine { line } => line,
+                    other => panic!("原文の行ではない: {other:?}"),
+                })
+                .collect()
+        };
+        let doc = "# A\n\ntext\n\n## B\n```\n# not\n```\nSetext\n===\n";
+        assert_eq!(lines(doc), vec![1, 5, 9]);
+        assert_eq!(lines(&doc.replace('\n', "\r\n")), vec![1, 5, 9]);
+        assert_eq!(lines(&format!("\u{feff}{doc}")), vec![1, 5, 9]);
+        assert!(lines("本文だけ\n").is_empty());
+    }
+
+    /// 描き直しは**本文**から組む（ディスクの中身ではない = 未保存の見出しも目次に出る）
+    #[test]
+    fn 本文から組んだmarkdownの目次は本文の見出しになる() {
+        let dir = tako_core::test_residue::ScratchDir::new("md-resume-1661");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "# Disk\n").unwrap();
+        let state = markdown_from_text(&path, "# Buffer\n\n## Sub\n");
+        assert_eq!(state.mode, PreviewMode::Markdown);
+        assert!(matches!(state.content, PreviewContent::Markdown(_)));
+        assert_eq!(
+            outline_heads(&state.outline),
+            vec![(1, "Buffer".to_string()), (2, "Sub".to_string())]
+        );
+        assert_eq!(state.truncated, None);
+        assert!(
+            state.file_stamp.is_some(),
+            "ライブリロードの比較に使うスタンプを持つ"
+        );
+    }
+
+    /// 上限（#1660）を越えた本文はファイルから読むときと同じ判定で切り詰める
+    #[test]
+    fn 本文から組むときも上限で切り詰める() {
+        let text: String = (0..MAX_LINES + 5).map(|i| format!("line {i}\n")).collect();
+        let (cut, truncated) = limit_text(&text);
+        assert_eq!(
+            truncated,
+            Some(tako_core::preview_limit::Truncation::Lines {
+                lines: MAX_LINES + 5
+            })
+        );
+        assert_eq!(cut.lines().count(), MAX_LINES);
+        let (same, none) = limit_text("# small\n");
+        assert_eq!((same.as_ref(), none), ("# small\n", None));
+    }
+
+    /// 描画から開いたセッションは抜けたら描画へ戻る。エディタの行が要るのは編集中と検索欄だけ
+    #[test]
+    fn 描画から開いた編集セッションの表示の判定() {
+        let dir = tako_core::test_residue::ScratchDir::new("md-resume-1661");
+        let md = dir.join("note.md");
+        std::fs::write(&md, "# T\n").unwrap();
+        let mut edit = EditState::open(&load(&md, PreviewMode::Markdown)).unwrap();
+        assert_eq!(edit.resume_mode, PreviewMode::Markdown);
+        assert!(edit.resumes_rendered());
+        assert!(edit.shows_editor_lines(), "編集中はエディタの行");
+        assert!(edit.offers_source_outline(), "編集中の md は目次を出す");
+        edit.editing = false;
+        assert!(!edit.shows_editor_lines(), "抜けたら描画");
+        assert!(!edit.offers_source_outline(), "抜けたら描画の目次へ戻る");
+        edit.search_visible = true;
+        assert!(edit.shows_editor_lines(), "検索欄はエディタの行の上に描く");
+
+        // コード表示から開いたら今までどおり（抜けてもエディタの行のまま）
+        let code = load(&md, PreviewMode::Code);
+        let mut edit = EditState::open(&code).unwrap();
+        edit.editing = false;
+        assert!(!edit.resumes_rendered());
+        assert!(edit.shows_editor_lines());
+        // md ではないファイルは編集中でも目次を出さない
+        let rs = dir.join("main.rs");
+        std::fs::write(&rs, "fn main() {}\n").unwrap();
+        let edit = EditState::open(&load(&rs, PreviewMode::Code)).unwrap();
+        assert!(!edit.offers_source_outline());
+    }
+
+    /// 編集中の目次は本文の版が同じあいだ作り直さない（打鍵ごとに全文を解かない）
+    #[test]
+    fn 編集中の目次は版が変わったときだけ作り直す() {
+        let dir = tako_core::test_residue::ScratchDir::new("md-resume-1661");
+        let md = dir.join("note.md");
+        std::fs::write(&md, "# One\n").unwrap();
+        let mut edit = EditState::open(&load(&md, PreviewMode::Markdown)).unwrap();
+        let first = edit.source_outline();
+        assert!(
+            Arc::ptr_eq(&first, &edit.source_outline()),
+            "同じ版なら使い回す"
+        );
+        assert!(Arc::ptr_eq(&first, &edit.source_outline_snapshot()));
+        edit.buffer.set_text("# One\n\n## Two\n".into());
+        let second = edit.source_outline();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.len(), 2);
+        // 版が進んだのに作り直していない写しは読まない（`&self` の口は作って返す）
+        edit.buffer.set_text("# Only\n".into());
+        assert_eq!(edit.source_outline_snapshot().len(), 1);
+    }
+
+    /// レイアウトへは編集中の表示（Code）ではなく、抜けたら戻るモードを書く
+    #[test]
+    fn レイアウトには抜けた先の表示モードを書く() {
+        let dir = tako_core::test_residue::ScratchDir::new("md-resume-1661");
+        let md = dir.join("note.md");
+        std::fs::write(&md, "# T\n").unwrap();
+        let mut shown = load(&md, PreviewMode::Markdown);
+        let mut edit = EditState::open(&shown).unwrap();
+        apply_editor_text(&mut shown, &mut edit);
+        assert_eq!(shown.mode, PreviewMode::Code, "編集中の表示はエディタの行");
+        assert_eq!(layout_mode(&shown, Some(&edit)), PreviewMode::Markdown);
+        assert_eq!(layout_mode(&shown, None), PreviewMode::Code);
+        let code = load(&md, PreviewMode::Code);
+        let edit = EditState::open(&code).unwrap();
+        assert_eq!(layout_mode(&code, Some(&edit)), PreviewMode::Code);
     }
 }
 
