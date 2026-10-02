@@ -955,7 +955,11 @@ pub fn lsp_format_on_save_prepare(
     pane: Option<u64>,
     force: bool,
 ) -> Option<Result<LspFormatJob, DispatchError>> {
-    if force || !host.lsp_format_on_save() || host.lsp().is_none() {
+    // LSP を止めている（`TAKO_1007_LEGACY=1`）なら挟まない（保存のたびに「使えない」を往復しない）
+    if force
+        || !host.lsp_format_on_save()
+        || !host.lsp().is_some_and(crate::lsp::LspManager::is_enabled)
+    {
         return None;
     }
     let (_, target) = resolve_pane(host.workspace(), pane).ok()?;
@@ -35069,18 +35073,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// 保存時整形は「ON・上書きでない・編集モード・競合なし・ローカル・サーバのある種類」の
-    /// ときだけ挟む。どれかが欠ければ `None` = 従来の保存と 1 バイトも変わらない
+    /// サーバを起こさない有効な manager（解決は常に「見つからない」= 子プロセスを 1 つも作らない）
+    fn not_installed_manager() -> crate::lsp::LspManager {
+        crate::lsp::LspManager::new(crate::lsp::LspConfig {
+            table: tako_core::lsp::servers::SERVERS,
+            launcher: std::sync::Arc::new(|spec: &tako_core::lsp::servers::ServerSpec| {
+                crate::lsp::Launch::NotFound {
+                    program: spec.program.to_string(),
+                    override_env: None,
+                }
+            }),
+            request_timeout: std::time::Duration::from_secs(10),
+            shutdown_timeout: std::time::Duration::from_secs(1),
+            idle_grace: crate::lsp::manager::DEFAULT_IDLE_GRACE,
+            restart: tako_core::lsp::state::RestartPolicy::default(),
+            raw_log_dir: None,
+        })
+    }
+
+    /// 保存時整形は「ON・上書きでない・LSP が有効・編集モード・競合なし・ローカル・サーバのある
+    /// 種類」のときだけ挟む。どれかが欠ければ `None` = 従来の保存と 1 バイトも変わらない
     #[test]
     fn 保存時整形を挟むのは条件がそろったときだけ() {
         let (mut host, pane, dir) = format_fixture("on-save-cond", "main.rs", UNFORMATTED_1683);
-        host.lsp = Some(crate::lsp::LspManager::disabled());
+        host.lsp = Some(not_installed_manager());
         host.set_preview_editing(PaneId::from_raw(pane), true)
             .unwrap();
         // 既定 OFF
         assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
         host.format_on_save = true;
         assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_some());
+        // LSP を止めている（`TAKO_1007_LEGACY=1`）なら挟まない
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
+        host.lsp = Some(not_installed_manager());
         // 上書き保存（競合の抜け道）は整形しない
         assert!(lsp_format_on_save_prepare(&mut host, Some(pane), true).is_none());
         // 外部変更の競合中は整形しない（保存が断られるだけ）
@@ -35100,7 +35126,7 @@ mod tests {
         assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
         // サーバの無い種類
         let (mut host, pane, dir2) = format_fixture("on-save-txt", "notes.txt", "a\n");
-        host.lsp = Some(crate::lsp::LspManager::disabled());
+        host.lsp = Some(not_installed_manager());
         host.format_on_save = true;
         host.set_preview_editing(PaneId::from_raw(pane), true)
             .unwrap();
@@ -35134,7 +35160,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["enabled"], json!(true));
-        host.lsp = Some(crate::lsp::LspManager::disabled());
+        host.lsp = Some(not_installed_manager());
         host.set_preview_editing(PaneId::from_raw(pane), true)
             .unwrap();
         let out = dispatch(
@@ -35147,7 +35173,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["saved"], json!(true), "{out}");
-        assert_eq!(out["format"]["status"], json!("disabled"));
+        assert_eq!(out["format"]["status"], json!("not-installed"));
+        assert!(
+            out["format"]["note"]
+                .as_str()
+                .is_some_and(|n| n.contains(&*out["format"]["reason"].as_str().unwrap_or("?"))),
+            "{out}"
+        );
         // OFF に戻せば format の節は付かない（従来の保存の応答と同じ形）
         host.format_on_save = false;
         let out = dispatch(

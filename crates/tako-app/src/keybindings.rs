@@ -259,6 +259,8 @@ fn action_for_palette_command(command_id: &str) -> Option<&'static str> {
         "split-down" => Some("tako::SplitDown"),
         "toggle-files" => Some("tako::ToggleSidebar"),
         "open-settings" => Some("tako::OpenSettings"),
+        // #1683: 整形（範囲の整形はキーを張らない = 併記しない）
+        "format-document" => Some("tako::FormatDocument"),
         _ => None,
     }
 }
@@ -1757,6 +1759,7 @@ mod tests {
             ("split-right", "tako::SplitRight"),
             ("split-down", "tako::SplitDown"),
             ("toggle-files", "tako::ToggleSidebar"),
+            ("format-document", "tako::FormatDocument"),
         ] {
             let hint = palette_shortcut(id)
                 .unwrap_or_else(|| panic!("{id}: パレットにショートカットが出ていない"));
@@ -1773,7 +1776,13 @@ mod tests {
             assert!(matched, "{id}: 表示 \"{hint}\" に対応するバインドが無い");
         }
         // バインドを持たない項目に嘘のショートカットを出さない
-        for id in ["toggle-theme", "panel-git", "toggle-drawer", "存在しないid"] {
+        for id in [
+            "toggle-theme",
+            "panel-git",
+            "toggle-drawer",
+            "format-selection",
+            "存在しないid",
+        ] {
             assert_eq!(
                 palette_shortcut(id),
                 None,
