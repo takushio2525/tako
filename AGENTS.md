@@ -106,6 +106,7 @@ tako/
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]` |
 | リリース（**両 OS 同時が既定**。#594/#965） | `scripts/release.sh` |
 | 夜間リリース（自動） | `scripts/nightly-release.sh` |
+| **安定版への昇格（Homebrew cask・docs の「最新の安定版」も追従。#403 / #1853）** | `scripts/release.sh --promote <tag>` |
 | **Windows 配布物生成（既定は CI。#587/#965）** | `.github/workflows/release-windows.yml` |
 | **Windows リリース（CI が使えないときの実機経路。#587/#965）** | `pwsh -File installer/windows/release-windows.ps1` |
 | Windows アプリアイコン再生成 | `pwsh -File installer/windows/make-icon.ps1` |
