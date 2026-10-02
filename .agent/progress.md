@@ -68,3 +68,7 @@
 ## 2026-10-02（#1682: LSP 補完（予測変換）= 打鍵中の一覧・仮想化・キーの優先順位・CLI / MCP）
 - core `lsp::completion`（読み取り・rank・truncate・route_key 20 通り・Session）+ `replace_position_ranges`（並べ方・重なり・最小化は #1683 の `order_changes`、当て方は離れた範囲をつないだ差分 = undo 1 回で範囲の外を抱えない）→ manager の取り消しの列（`$/cancelRequest`）・resolve・一時 didOpen は持ち手で加わる → dispatch 3 段 + `lsp_completion_apply` → CLI `tako lsp completion` / MCP `tako_lsp` の `action=completion` → GUI `lsp_completion_ui`（`gpui::list`）
 - 実測: `scripts/test-lsp-completion-1682.sh` 22 PASS（1000 件で組む行 10・基準画像との差分は一覧の中だけ・A/B 2 通りで FAILED・実の rust-analyzer で `s.le` → len）・e2e 8 本・注入 6 通りで名指しの FAILED
+
+## 2026-10-02（#1661: Markdown を編集して抜けたら描画へ戻し、目次を作り直すようにした）
+- 表示をエディタの行へ落とす判定を `refresh_preview_from_editor` の 1 か所（`EditState::shows_editor_lines`）へ寄せ、抜けたら**本文から**描き直す（5,000 行以下はその場・超えたら background）。抜けた後の save / reload・競合中も描画のまま・見ていた節の見出しから描く。編集中も目次が使える（`source_line`。CLI / MCP は既存の preview-outline）。layout へは抜けた先のモード
+- 実測: `scripts/test-md-edit-resume-1661.sh` 49 PASS 0 FAIL / main（048a2d9）は 22 PASS 23 FAIL（① で code のまま・目次 ERR）・A/B `TAKO_1661_LEGACY=1` で ① と visual 節が名指しで FAILED・番犬への注入 8 通りすべて file:line で FAILED・workspace 6362 passed・カタログ +132 B（並置 #1872 / ⌘F の同型 #1873）

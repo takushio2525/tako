@@ -1886,6 +1886,12 @@ struct TakoApp {
     /// dispatch 中に依頼された重量プレビュー（PDF / 動画）の background 読み込み
     /// （Issue #168。Loading 表示 → 完了時差し替え。GPUI の Context が要るため遅延実行）
     pending_preview_loads: Vec<(PaneId, std::path::PathBuf, preview::PreviewMode)>,
+    /// 編集を抜けた大きい Markdown の描き直し（#1661。ペイン, パス, 本文, 読み込み中の表示の版）。
+    /// 版が変わっていたら（編集へ戻った・別の表示へ差し替わった）組み終えても捨てる
+    pending_md_resumes: Vec<(PaneId, std::path::PathBuf, String, u64)>,
+    /// 編集を抜けた直後の md をどの見出しから描くか（#1661。目次の項目番号 0 始まり）。
+    /// 編集中に見ていた行の節の見出しで、次に md の器を組むときに 1 回だけ使う
+    preview_md_resume_heading: HashMap<PaneId, usize>,
     /// 現在の GPUI ウィンドウが属する display の device scale。
     /// PDF の実ピクセル解像度を表示幅へ合わせるため render 冒頭で更新する。
     preview_device_scale: f32,
@@ -4100,6 +4106,8 @@ impl TakoApp {
             pending_highlights: Vec::new(),
             pending_editor_seeds: Vec::new(),
             pending_preview_loads: Vec::new(),
+            pending_md_resumes: Vec::new(),
+            preview_md_resume_heading: HashMap::new(),
             preview_device_scale: 1.0,
             pending_pdf_rasters: HashMap::new(),
             active_pdf_rasters: std::collections::HashSet::new(),
@@ -10319,6 +10327,7 @@ impl TakoApp {
         let agent_resume_sessions = &self.agent_resume_sessions;
         let terminals = &self.terminals;
         let previews = &self.previews;
+        let preview_edits = &self.preview_edits;
         let webviews = &self.webviews;
         // #1446: SSH の追跡。借用のまま渡す（`PaneMetaRef` の作法と同じ）
         let ssh_tracked = &self.ssh_connect;
@@ -10341,9 +10350,11 @@ impl TakoApp {
                 .get(pane)
                 .map(|(agent, id)| (agent.as_str(), id)),
             logged_history: pane_log_history.get(&pane.as_u64()).copied(),
-            preview: previews
-                .get(&pane)
-                .map(|p| (p.path.as_path(), p.mode.to_wire().as_str())),
+            // #1661: 編集中の表示（`code`）ではなく、編集を抜けたら戻るモードを書く
+            preview: previews.get(&pane).map(|p| {
+                let mode = preview::layout_mode(p, preview_edits.get(&pane));
+                (p.path.as_path(), mode.to_wire().as_str())
+            }),
             webview: webviews
                 .iter()
                 .find(|e| e.pane == Some(pane))
@@ -13271,6 +13282,21 @@ impl TakoApp {
     }
 
     fn refresh_preview_from_editor(&mut self, pane_id: PaneId) {
+        // #1661: 表示をエディタの行（`Code`）へ落とすのは**要るあいだだけ**（編集中・検索欄）。
+        // 編集を抜けた Markdown へ本文の変更が来たら（未保存のまま `tako edit save` /
+        // 帯の「読み直す」）、エディタの行ではなく描画を組み直す。旧実装はここが無条件に
+        // `apply_editor_text` を呼び、抜けた後の保存・読み直しでもコード表示へ落ちていた
+        if self
+            .preview_edits
+            .get(&pane_id)
+            .is_some_and(|edit| !edit.shows_editor_lines())
+        {
+            self.restore_rendered_preview(pane_id);
+            self.sync_preview_lsp(pane_id);
+            return;
+        }
+        // 描き直しを待たずに編集へ戻った: 見出しの予約は md の器を組むまで残さない
+        self.preview_md_resume_heading.remove(&pane_id);
         let (previews, edits) = (&mut self.previews, &mut self.preview_edits);
         if let (Some(state), Some(edit)) = (previews.get_mut(&pane_id), edits.get_mut(&pane_id)) {
             preview::apply_editor_text(state, edit);
@@ -13285,6 +13311,74 @@ impl TakoApp {
         self.follow_preview_cursor(pane_id);
         // #1678: 言語サーバへの同期も同じ理由でここ 1 か所（本文が変わる経路はすべて通る）
         self.sync_preview_lsp(pane_id);
+    }
+
+    /// 編集中の目次を出す編集セッション（#1661。Markdown を編集しているあいだだけ）
+    fn preview_source_outline_session(&self, pane: PaneId) -> Option<&preview::EditState> {
+        self.preview_edits
+            .get(&pane)
+            .filter(|edit| edit.offers_source_outline())
+    }
+
+    /// 編集を抜けた Markdown を描画へ戻す（#1661）。
+    ///
+    /// 組むのは**編集セッションの本文**から（ディスクではない）。未保存のまま抜けても
+    /// 書いたとおりに描かれ、目次も書き換えた見出しで作り直される。小さい文書
+    /// （編集の全文の塗りと同じ線引き = [`preview::SYNC_FULL_HIGHLIGHT_MAX_LINES`] 行以下）は
+    /// その場で組み、大きい文書は background で組む（それまでは読み込み中の表示。
+    /// 目アイコンの切り替え・#232 の初回ロードと同じ構え）。同じ版をもう描いていれば何もしない
+    fn restore_rendered_preview(&mut self, pane_id: PaneId) {
+        // 編集中に見ていた行。キャレットが見えていればその行（いま書き換えた所）、
+        // 見えていなければ器の先頭可視行。コードの器でなければ None（= いまの位置のまま）
+        let anchor_line = match self.preview_cursor_viewport(pane_id) {
+            Some((caret, view)) if view.contains(caret) => Some(caret),
+            Some((_, view)) => Some(view.first_visible),
+            None => self.preview_first_visible_line(pane_id),
+        };
+        let Some(edit) = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .filter(|edit| edit.resumes_rendered())
+        else {
+            return;
+        };
+        let version = edit.buffer.version();
+        if edit.rendered_from == Some(version)
+            && self
+                .previews
+                .get(&pane_id)
+                .is_some_and(|p| p.mode == preview::PreviewMode::Markdown)
+        {
+            return;
+        }
+        edit.rendered_from = Some(version);
+        // 見ていた行の節の見出し（目次の k 番目）から描く。描画の目次も同じ規則で
+        // 作るので k 番目どうしが同じ見出しを指す（`markdown_source_outline`）
+        let resume_heading = anchor_line.and_then(|line| {
+            edit.source_outline().items.iter().rposition(|item| {
+                matches!(item.target, tako_core::PreviewOutlineTarget::SourceLine { line: at } if at <= line + 1)
+            })
+        });
+        let path = edit.buffer.path().to_path_buf();
+        let sync = edit.fits_sync_render();
+        let text = edit.buffer.text();
+        if sync {
+            let _span = tako_control::diag::perf_span("preview_md_resume");
+            let state = preview::markdown_from_text(&path, text);
+            self.previews.insert(pane_id, state);
+        } else {
+            let placeholder = preview::PreviewState::loading(&path, preview::PreviewMode::Markdown);
+            let ticket = placeholder.content_rev;
+            self.pending_md_resumes
+                .push((pane_id, path, text.to_string(), ticket));
+            self.previews.insert(pane_id, placeholder);
+        }
+        match resume_heading {
+            Some(heading) => self.preview_md_resume_heading.insert(pane_id, heading),
+            None => self.preview_md_resume_heading.remove(&pane_id),
+        };
+        // エディタの選択は原文の行・桁なので、描画の行（ブロックの行テキスト）へ持ち越さない
+        self.preview_selections.remove(&pane_id);
     }
 
     /// 編集セッション 1 つを言語サーバへ同期する（#1678）。
@@ -13460,7 +13554,24 @@ impl TakoApp {
         }
         if enabled {
             self.refresh_preview_from_editor(pane_id);
-        } else if self
+            return Ok(());
+        }
+        // #1661: 描画（Markdown）から編集を始めたなら描画へ戻し、目次を作り直す。
+        // 検索欄はエディタの行の上に描くものなので一緒に畳む（開いたままだと
+        // 表示がエディタの行に留まる = `EditState::shows_editor_lines`）
+        let resumes = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .filter(|edit| edit.resumes_rendered())
+            .map(|edit| {
+                edit.search_visible = false;
+                edit.buffer.release_search_cache();
+            })
+            .is_some();
+        if resumes {
+            self.restore_rendered_preview(pane_id);
+        }
+        if self
             .preview_edits
             .get(&pane_id)
             .is_some_and(|edit| !edit.dirty())
@@ -23444,6 +23555,10 @@ impl PreviewHost for TakoApp {
     }
 
     fn preview_outline(&self, pane: PaneId) -> Option<tako_core::PreviewOutline> {
+        // #1661: 編集中の Markdown は原文の行を指す目次（描画の目次はエディタの行に無い）
+        if let Some(edit) = self.preview_source_outline_session(pane) {
+            return Some((*edit.source_outline_snapshot()).clone());
+        }
         let preview = self.previews.get(&pane)?;
         matches!(
             preview.mode,
@@ -23457,6 +23572,18 @@ impl PreviewHost for TakoApp {
         pane: PaneId,
         item: usize,
     ) -> Result<tako_core::PreviewOutlineTarget, String> {
+        // #1661: 編集中の Markdown は原文の行へ飛ぶ（キャレットも置く = `tako open --line` と
+        // 同じ着地）。一覧（`preview_outline`）と同じ目次から引くので項目番号がずれない
+        let source = self
+            .preview_source_outline_session(pane)
+            .map(|edit| edit.source_outline_snapshot().target(item));
+        if let Some(target) = source {
+            let target = target?;
+            if let tako_core::PreviewOutlineTarget::SourceLine { line } = target {
+                self.reveal_preview_line(pane, line, None)?;
+            }
+            return Ok(target);
+        }
         let preview = self
             .previews
             .get(&pane)
@@ -23464,6 +23591,10 @@ impl PreviewHost for TakoApp {
         let target = preview.outline.target(item)?;
         let handle = self.preview_scroll_handles.entry(pane).or_default().clone();
         match target {
+            // 原文の行を指す目次は編集中にしか作らない（上で返している）
+            tako_core::PreviewOutlineTarget::SourceLine { .. } => {
+                return Err("Markdown アウトラインの対象ではない".into());
+            }
             tako_core::PreviewOutlineTarget::MarkdownBlock { block } => {
                 if preview.mode != preview::PreviewMode::Markdown {
                     return Err("Markdown アウトラインの対象ではない".into());
@@ -23820,6 +23951,7 @@ impl PreviewHost for TakoApp {
         self.preview_body_lists.remove(&pane);
         // #1676: 前のファイルへの着地予約は持ち越さない（行番号の意味が変わる）
         self.preview_pending_reveal.remove(&pane);
+        self.preview_md_resume_heading.remove(&pane);
         // #826: 中身が変わればブロック索引の意味も変わる（次の md 描画で作り直す）
         self.preview_md_block_index.remove(&pane);
         self.preview_line_starts.remove(&pane);
@@ -42483,6 +42615,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1661: Markdown を編集して抜けると描画へ戻り、目次が書き換えた見出しで
+                // 作り直されるか・編集中も目次から原文の行へ飛べるか（実マウスで押す）
+                "md-edit-resume" => {
+                    md_edit_resume_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1834: ツリーの行を実マウスでドラッグして移せるか・断る場所で理由が出るか・
                 // 開いているペインが付け替わるか・ペインへの既存の D&D が壊れていないか
                 "tree-move" => {
@@ -42505,7 +42644,7 @@ mod self_test {
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / completion / completion-real）"
+                         tree-clipboard / completion / completion-real / md-edit-resume）"
                     );
                     std::process::exit(1);
                 }
@@ -42571,6 +42710,8 @@ mod self_test {
             // #1659: 外部変更の帯（差分 / 上書き保存 / 読み直す）を実マウスで押して抜けられるか・
             // 競合中に打鍵を続けても知らせは 1 回のままか
             external_change_visual(any, window, cx).await;
+            // #1661: Markdown を編集して抜けると描画へ戻り、目次が作り直されるか
+            md_edit_resume_visual(any, window, cx).await;
             // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
             goto_hover_visual(any, window, cx).await;
 
@@ -50933,6 +51074,339 @@ mod self_test {
         println!("TAKO_VISUAL_1659: bar / notices=1 / diff / overwrite / reload OK");
 
         // 後片付け: 編集を捨ててから閉じられるようにする
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pane);
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Markdown を編集して抜けると描画へ戻り、目次が作り直されるか（#1661）。
+    ///
+    /// 場面: 描画表示の md を開き、ヘッダの「編集」を**実マウスで**押して見出しを書き換え
+    /// （本文は dispatch の範囲置換で入れる。打鍵の経路は editor-keys 節の担当）、「編集中」を
+    /// 押して抜ける。①抜けたら表示モードが Markdown へ戻り、目次が
+    /// 書き換えた見出しで作り直される（修正前はコード表示のまま・目次は空）②もう一度
+    /// 編集すると目次ボタンが出ていて、項目を押すとキャレットがその見出しの原文の行へ行く
+    /// ③自動保存を切って未保存のまま抜けても、描画と目次は本文（未保存の変更）から作られる。
+    /// A/B: `TAKO_1661_LEGACY=1` は ① の「描画へ戻る」で落ちる。
+    /// 単独実行は `TAKO_VISUAL_ONLY=md-edit-resume`
+    #[cfg(feature = "visual-test")]
+    async fn md_edit_resume_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let dir = std::env::temp_dir().join(format!("tako-visual-1661-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test md-edit-resume 一時ディレクトリ");
+        let path = dir.join("note.md");
+        // Beta は画面の外（目次から飛ぶと見える位置が動く距離）に置く
+        let filler: String = (0..80).map(|i| format!("filler line {i}\n\n")).collect();
+        // Beta の後ろにも本文を置く（Beta を器の頭へ出せる = スクロールが頭打ちにならない）
+        let tail: String = (0..40).map(|i| format!("tail line {i}\n\n")).collect();
+        let fixture = format!(
+            "# Title\n\nintro\n\n## Alpha\n\nbody a\n\n{filler}## Beta\n\nbody b\n\n{tail}"
+        );
+        let beta_line = fixture
+            .lines()
+            .position(|l| l == "## Beta")
+            .expect("fixture の Beta")
+            + 1;
+        std::fs::write(&path, &fixture).expect("visual-test md-edit-resume fixture");
+
+        let pane = window
+            .update(cx, |app, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let base = app.focused_pane().as_u64();
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(base),
+                        path: path.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Markdown),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(true),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .expect("visual-test md-edit-resume を dispatch で開ける");
+                cx.notify();
+                PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"))
+            })
+            .unwrap_or_else(|_| fail("visual-test md-edit-resume dispatch"));
+        let _ = window.update(cx, |app, _, _| {
+            let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+        });
+        // (表示モード, 目次のタイトル, 編集中か, 未保存か)
+        let observe = |cx: &mut AsyncApp| {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let preview = app.previews.get(&pane);
+                    let edit = app.preview_edits.get(&pane);
+                    (
+                        preview.map(|p| p.mode),
+                        preview
+                            .map(|p| p.outline.items.iter().map(|i| i.title.clone()).collect())
+                            .unwrap_or_default(),
+                        edit.is_some_and(|e| e.editing),
+                        edit.is_some_and(preview::EditState::dirty),
+                    )
+                })
+                .unwrap_or((None, Vec::new(), false, false))
+        };
+        // Markdown の background 読み込み（#232）が終わるまで待つ
+        async fn until_outline(
+            cx: &mut AsyncApp,
+            window: WindowHandle<TakoApp>,
+            pane: PaneId,
+            len: usize,
+        ) -> bool {
+            for _ in 0..100 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let ready = window
+                    .update(cx, |app, _, _| {
+                        app.previews.get(&pane).is_some_and(|p| {
+                            p.mode == preview::PreviewMode::Markdown && p.outline.items.len() == len
+                        })
+                    })
+                    .unwrap_or(false);
+                if ready {
+                    return true;
+                }
+            }
+            false
+        }
+        let probe = |cx: &mut AsyncApp, key: &str| {
+            let key = format!("{key}-{}", pane.as_u64());
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(&key).copied()
+                })
+                .ok()
+                .flatten()
+        };
+        let dump = |cx: &mut AsyncApp, name: &str| {
+            if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                if let Some((frame, _)) = capture_frame(any, cx) {
+                    let _ = frame.save(std::path::Path::new(&dir).join(name));
+                }
+            }
+        };
+        // 本文の書き換えは dispatch（CLI `tako edit replace-range` と同じ口）で入れる。打鍵の経路は
+        // editor-keys 節が見るもので、この節の対象（描画へ戻る経路と実マウスの押下）ではない。
+        // 実キーで打つ版は 10 回中 1 回、1 行目が見出しでなくなって落ちた（行頭へ入った形）。
+        // 機の入力ソース（IMK）が隔離窓へ未確定文字列を立てると End が「変換中は本文に触らない」で
+        // 呑まれる、と読める症状で、別の回では最初の 1 文字だけがターミナルへ流れたのも観測した
+        let append = |cx: &mut AsyncApp, line: usize, col: usize, text: &str| {
+            window
+                .update(cx, |app, _, cx| {
+                    let mut r = tako_control::dispatch(
+                        app,
+                        Req::PreviewEditRange {
+                            pane: Some(pane.as_u64()),
+                            start_line: line,
+                            start_col: col,
+                            end_line: line,
+                            end_col: col,
+                            text: text.to_string(),
+                            expected_version: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    // CLI と同じ後処理を通す（自動保存のタイマーはここが回す = #973）
+                    let _ = app.after_dispatch(&mut r, false, cx);
+                    cx.notify();
+                    r.is_ok()
+                })
+                .unwrap_or(false)
+        };
+        let click_edit_toggle =
+            |cx: &mut AsyncApp, step: &str| match probe(cx, "preview-edit-toggle") {
+                None => fail(&format!(
+                    "visual-test md-edit-resume: 編集ボタンが描かれない（{step}）(#1661)"
+                )),
+                Some(rect) => click_at(any, cx, rect.center()),
+            };
+        check(
+            until_outline(cx, window, pane, 3).await,
+            "visual-test md-edit-resume: 描画表示で開いて目次が 3 件 (#1661)",
+        );
+        dump(cx, "md-edit-0-rendered.png");
+
+        // ① 「編集」を押して見出しを書き換え、「編集中」を押して抜ける
+        click_edit_toggle(cx, "編集の開始");
+        wait(cx, 100).await;
+        let (mode, _, editing, _) = observe(cx);
+        check(
+            editing && mode == Some(preview::PreviewMode::Code),
+            "visual-test md-edit-resume: 編集ボタンで編集が始まる (#1661)",
+        );
+        check(
+            append(cx, 1, "# Title".len(), " v2"),
+            "visual-test md-edit-resume: 1 行目の見出しを書き換えられる (#1661)",
+        );
+        // 自動保存（500ms）が書き終わるのを待ってから抜ける
+        wait(cx, 900).await;
+        dump(cx, "md-edit-1-editing.png");
+        click_edit_toggle(cx, "編集の終了");
+        let resumed = until_outline(cx, window, pane, 3).await;
+        let (mode, titles, editing, _) = observe(cx);
+        if !resumed {
+            let detail = window
+                .update(cx, |app, _, _| {
+                    let shown = app.previews.get(&pane).map(|p| match &p.content {
+                        preview::PreviewContent::Markdown(blocks) => {
+                            format!("md {} blocks", blocks.len())
+                        }
+                        preview::PreviewContent::Code(lines) => {
+                            format!("code {} lines", lines.len())
+                        }
+                        preview::PreviewContent::Loading => "loading".to_string(),
+                        _ => "other".to_string(),
+                    });
+                    let buffer = app
+                        .preview_edits
+                        .get(&pane)
+                        .map(|e| e.buffer.text().lines().next().unwrap_or("").to_string());
+                    (shown, buffer)
+                })
+                .ok();
+            let disk = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| t.lines().next().map(str::to_string));
+            eprintln!(
+                "TAKO_VISUAL_1661: 抜けた後の mode={mode:?} titles={titles:?} 表示={detail:?} 1 行目（ディスク）={disk:?}"
+            );
+        }
+        check(
+            resumed && !editing && mode == Some(preview::PreviewMode::Markdown),
+            "visual-test md-edit-resume: 編集を抜けると描画（Markdown）へ戻り目次が作り直される (#1661)",
+        );
+        check(
+            titles == ["Title v2", "Alpha", "Beta"],
+            "visual-test md-edit-resume: 書き換えた見出しが抜けた後の目次に出る (#1661)",
+        );
+        check(
+            std::fs::read_to_string(&path).is_ok_and(|t| t.starts_with("# Title v2\n")),
+            "visual-test md-edit-resume: 自動保存が書いた本文がディスクにある (#1661)",
+        );
+        dump(cx, "md-edit-2-resumed.png");
+
+        // ② もう一度編集すると目次ボタンが出ていて、項目を押すとその見出しの行へ行く
+        click_edit_toggle(cx, "2 回目の編集の開始");
+        wait(cx, 100).await;
+        match probe(cx, "preview-outline-toggle") {
+            None => fail("visual-test md-edit-resume: 編集中に目次ボタンが描かれない (#1661)"),
+            Some(rect) => click_at(any, cx, rect.center()),
+        }
+        wait(cx, 100).await;
+        dump(cx, "md-edit-3-outline.png");
+        // 項目のキーは `preview-outline-item-<ペイン>-<番号>`
+        let item_key = format!("preview-outline-item-{}-3", pane.as_u64());
+        let item = window
+            .update(cx, |app, _, _| {
+                app.panel_click_probe_bounds
+                    .borrow()
+                    .get(&item_key)
+                    .copied()
+            })
+            .ok()
+            .flatten();
+        match item {
+            None => fail("visual-test md-edit-resume: 編集中の目次に 3 件目が描かれない (#1661)"),
+            Some(rect) => click_at(any, cx, rect.center()),
+        }
+        wait(cx, 150).await;
+        notify_and_draw(any, window, cx);
+        let caret_line = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| e.buffer.line_byte_col(e.buffer.cursor()).0 + 1)
+            })
+            .ok()
+            .flatten();
+        if caret_line != Some(beta_line) {
+            eprintln!(
+                "TAKO_VISUAL_1661: 目次で飛んだ後のキャレット行={caret_line:?}（期待 {beta_line}）"
+            );
+        }
+        check(
+            caret_line == Some(beta_line),
+            "visual-test md-edit-resume: 編集中の目次の項目でキャレットがその見出しの行へ行く (#1661)",
+        );
+        dump(cx, "md-edit-4-jumped.png");
+
+        // ③ 自動保存を切り、未保存のまま抜けても描画と目次は本文から作られる
+        let _ = window.update(cx, |app, _, cx| {
+            if let Some(edit) = app.preview_edits.get_mut(&pane) {
+                edit.autosave = false;
+            }
+            cx.notify();
+        });
+        check(
+            append(cx, beta_line, "## Beta".len(), " v3"),
+            "visual-test md-edit-resume: Beta の見出しを書き換えられる (#1661)",
+        );
+        wait(cx, 100).await;
+        click_edit_toggle(cx, "未保存のままの終了");
+        let resumed = until_outline(cx, window, pane, 3).await;
+        let (mode, titles, editing, dirty) = observe(cx);
+        check(
+            resumed && !editing && dirty && mode == Some(preview::PreviewMode::Markdown),
+            "visual-test md-edit-resume: 未保存のまま抜けても描画へ戻る (#1661)",
+        );
+        check(
+            titles == ["Title v2", "Alpha", "Beta v3"],
+            "visual-test md-edit-resume: 未保存の見出しも目次に出る（本文から描く）(#1661)",
+        );
+        check(
+            std::fs::read_to_string(&path).is_ok_and(|t| !t.contains("Beta v3")),
+            "visual-test md-edit-resume: 未保存の変更はディスクへ書かない (#1661)",
+        );
+        // 抜ける直前はキャレットのある Beta の節を見ていた = 描画も Beta の見出しから
+        notify_and_draw(any, window, cx);
+        let (top, beta_block) = window
+            .update(cx, |app, _, _| {
+                let top = app
+                    .preview_body_lists
+                    .get(&pane)
+                    .map(|(list, _, _)| list.logical_scroll_top().item_ix);
+                let beta =
+                    app.previews
+                        .get(&pane)
+                        .and_then(|p| match p.outline.items.get(2)?.target {
+                            tako_core::PreviewOutlineTarget::MarkdownBlock { block } => Some(block),
+                            _ => None,
+                        });
+                (top, beta)
+            })
+            .unwrap_or((None, None));
+        if top.is_none() || top != beta_block {
+            eprintln!("TAKO_VISUAL_1661: 抜けた後の先頭ブロック={top:?}（Beta = {beta_block:?}）");
+        }
+        check(
+            top.is_some() && top == beta_block,
+            "visual-test md-edit-resume: 編集中に見ていた節の見出しから描く (#1661)",
+        );
+        dump(cx, "md-edit-5-unsaved.png");
+        println!(
+            "TAKO_VISUAL_1661: resume / outline titles / outline jump / unsaved / resume heading OK"
+        );
+
+        // 後片付け: 未保存の編集を捨ててから閉じられるようにする
         let _ = window.update(cx, |app, _, cx| {
             app.preview_edits.remove(&pane);
             cx.notify();

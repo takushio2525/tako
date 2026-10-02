@@ -3255,6 +3255,43 @@ impl TakoApp {
         for (pane, path, mode) in std::mem::take(&mut self.pending_preview_loads) {
             self.spawn_preview_load(pane, path, mode, cx);
         }
+        for (pane, path, text, ticket) in std::mem::take(&mut self.pending_md_resumes) {
+            self.spawn_md_resume(pane, path, text, ticket, cx);
+        }
+    }
+
+    /// 編集を抜けた大きい Markdown を background で描き直す（#1661）。
+    ///
+    /// 取り込むのは**積んだときの読み込み中の表示がまだ出ている**ときだけ（`content_rev` が
+    /// 同じ）。その間に編集へ戻った・別のファイルや表示へ差し替わったなら組み終えても捨てる
+    fn spawn_md_resume(
+        &self,
+        pane: PaneId,
+        path: std::path::PathBuf,
+        text: String,
+        ticket: u64,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let state = cx
+                .background_executor()
+                .spawn(async move {
+                    let _span = tako_control::diag::perf_span("preview_md_resume");
+                    preview::markdown_from_text(&path, &text)
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app
+                    .previews
+                    .get(&pane)
+                    .is_some_and(|shown| shown.content_rev == ticket)
+                {
+                    app.previews.insert(pane, state);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// ツリーの行に移動の強調とドラッグの受け口を付ける（FR-3.32 / #1834）。
