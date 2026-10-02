@@ -434,7 +434,8 @@ fn 未応答とエラーと落ちたと未導入を区別する() {
     let manager = LspManager::new(config(&scratch, "normal", &json!([{ "silent": true }])));
     let mut req = request(&path, UNFORMATTED, None);
     req.timeout = Duration::from_secs(2);
-    let started = Instant::now();
+    // 上限で解けたことは「どの経路で抜けたか」（応答待ちの打ち切り = starting: false）で見る
+    // （実時間の絶対予算は負荷で反転する = `.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）
     assert_eq!(
         manager.format(&req),
         Err(FormatError::Lsp(GotoError::Timeout {
@@ -443,7 +444,6 @@ fn 未応答とエラーと落ちたと未導入を区別する() {
             starting: false
         }))
     );
-    assert!(started.elapsed() < Duration::from_secs(8), "上限で解く");
     manager.shutdown_all(Duration::from_secs(2));
 
     let scratch = Scratch::new("error");

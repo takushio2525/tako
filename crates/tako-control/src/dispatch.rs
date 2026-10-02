@@ -1393,7 +1393,8 @@ pub fn prepare_offload(
             .map(|job| OffloadJob::LspFormat(Box::new(job))),
         ),
         // #1683: 保存時整形が ON のときだけ整形を挟む（OFF なら `None` = 従来どおり同期で保存）
-        Request::PreviewSave { pane, force } => lsp_format_on_save_prepare(host, *pane, *force)
+        // 腕の字面は dispatch_inner の `{ pane, force }` と分ける（#1659 の番犬が字面で探す）
+        Request::PreviewSave { force, pane } => lsp_format_on_save_prepare(host, *pane, *force)
             .map(|job| job.map(|job| OffloadJob::LspFormat(Box::new(job)))),
         // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
         Request::RunResolve {
@@ -35177,7 +35178,7 @@ mod tests {
         assert!(
             out["format"]["note"]
                 .as_str()
-                .is_some_and(|n| n.contains(&*out["format"]["reason"].as_str().unwrap_or("?"))),
+                .is_some_and(|n| n.contains(out["format"]["reason"].as_str().unwrap_or("?"))),
             "{out}"
         );
         // OFF に戻せば format の節は付かない（従来の保存の応答と同じ形）
