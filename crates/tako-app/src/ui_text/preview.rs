@@ -356,6 +356,34 @@ pub fn format_not_code() -> &'static str {
     )
 }
 
+// --- ホバー（キー: preview.hover_*。#1681） ---
+// 理由・次の一手の日英は dispatch の応答（`tako_control::lsp::text`）が持つ。ここは画面だけの語
+
+/// コードのプレビューではないのでホバーを出せない
+pub fn hover_not_code() -> &'static str {
+    tr!(
+        "ホバー情報を出せるのはコードのプレビューだけ",
+        "Hover is available only in code previews"
+    )
+}
+
+/// 位置（編集カーソル / 選択）が無い
+pub fn hover_no_cursor() -> &'static str {
+    tr!(
+        "カーソルが無い（編集モードに入るか、文字を選んでから）",
+        "No cursor (enter edit mode or select some text first)"
+    )
+}
+
+/// 本文を上限で切ったカードの下の注記
+pub fn hover_truncated(total: usize) -> String {
+    let limit = tako_core::lsp::hover::MAX_CHARS;
+    tr!(
+        format!("長いので先頭 {limit} 字まで（全 {total} 字）"),
+        format!("Showing the first {limit} of {total} characters")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -420,6 +448,9 @@ mod tests {
                 format_running().to_string(),
                 format_no_selection().to_string(),
                 format_not_code().to_string(),
+                hover_not_code().to_string(),
+                hover_no_cursor().to_string(),
+                hover_truncated(40_000),
             ]
         });
     }

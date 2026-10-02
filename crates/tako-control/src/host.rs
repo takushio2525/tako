@@ -885,6 +885,18 @@ pub trait PreviewHost {
     ) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
     }
+    /// ホバーの答えを GUI のその位置にカードとして出す（#1681。`tako lsp hover --show` /
+    /// MCP `tako_lsp` の `show`）。`at` は問い合わせた位置（tako の座標 = 0 起点の行・行内の
+    /// UTF-8 バイト）。出せたら `Ok(true)`、その行が描かれていない（画面の外）なら `Ok(false)`。
+    /// GUI を持たない host は出さない（`Ok(false)`）
+    fn show_lsp_hover(
+        &mut self,
+        _pane: PaneId,
+        _at: tako_core::lsp::completion::At,
+        _answer: &crate::lsp::HoverAnswer,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     /// 行・桁で指定した**複数の範囲**を 1 回の操作として置き換える（#1682。補完の確定 =
     /// 本文 + 自動 import）。undo 1 回で全部戻る。編集モードでなければ始める（範囲編集と同じ）。
     /// 解けない指定・範囲の重なり・版違いは本文を触らずに失敗する

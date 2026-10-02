@@ -39,6 +39,10 @@ pub fn cmd_label(id: &str) -> &'static str {
         // #1683: 言語サーバの整形（編集メニューと同じ）
         "format-document" => tr!("コードを整形", "Format document"),
         "format-selection" => tr!("選択範囲を整形", "Format selection"),
+        "show-hover" => tr!(
+            "ホバー情報を表示（カーソル位置の型・doc）",
+            "Show hover (type and docs at the cursor)"
+        ),
         // 言語切替は両言語でネイティブ表記を併記（切替先を字面で探せるように）。
         // 英語側に「日本語」を含む意図的な例外のため、訳し漏れ検査の対象外
         "toggle-language" => tr!(
@@ -79,6 +83,7 @@ mod tests {
                 cmd_label("pin-tab-title").to_string(),
                 cmd_label("format-document").to_string(),
                 cmd_label("format-selection").to_string(),
+                cmd_label("show-hover").to_string(),
                 // toggle-language は意図的にネイティブ表記併記のため対象外（上記コメント）
             ]
         });

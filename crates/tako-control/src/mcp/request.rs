@@ -828,7 +828,7 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.unwrap_or_else(|| "status".to_string()),
             name: str_arg(args, "name")?,
         },
-        // #1679 / #1680: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
+        // #1679 / #1680 / #1683 / #1682 / #1681: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
         // （省略は LSP_FEATURE_ACTIONS の先頭 = diagnostics）
         "tako_lsp" => match str_arg(args, "action")?
             .as_deref()
@@ -860,6 +860,13 @@ pub(super) fn build_request(
                 pane: Some(target_pane(args, caller)?),
                 line: required_u64(args, "line")? as usize,
                 column: required_u64(args, "column")? as usize,
+            },
+            // #1681: ホバー（位置は定義ジャンプと同じ。show で GUI にカードも出す）
+            crate::dispatch::LSP_HOVER_ACTION => Request::LspHover {
+                pane: Some(target_pane(args, caller)?),
+                line: required_u64(args, "line")? as usize,
+                column: required_u64(args, "column")? as usize,
+                show: bool_arg(args, "show")?,
             },
             action if tako_core::lsp::goto::GotoKind::parse(action).is_some() => Request::LspGoto {
                 action: action.to_string(),

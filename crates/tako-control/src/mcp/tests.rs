@@ -26,12 +26,14 @@ mod tests {
                 severity: Some("warning".into())
             }
         );
-        let err = build_request("tako_lsp", &json!({"action": "hover"}), None, None).unwrap_err();
+        let err =
+            build_request("tako_lsp", &json!({"action": "no-such-action"}), None, None).unwrap_err();
         assert!(err.contains("diagnostics"), "{err}");
     }
 
     /// #1679 と #1680 の合流: `tako_lsp` は 1 本で、action の先頭が既定の diagnostics、
-    /// 続いて定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの、整形の 2 つ（#1683）、最後に補完（#1682）。
+    /// 続いて定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの、整形の 2 つ（#1683）、補完（#1682）、
+    /// 右クリックメニュー（#1684）、最後にホバー（#1681）。
     /// 種類を足したのに action の表へ載せ忘れる・振り分けが受けない、のどちらもここで落ちる
     #[test]
     fn tako_lsp_の_action_は診断と定義ジャンプの全種を振り分ける() {
@@ -39,7 +41,7 @@ mod tests {
         assert_eq!(actions[0], "diagnostics");
         let goto = &actions[1..=tako_core::lsp::goto::GotoKind::NAMES.len()];
         assert_eq!(goto, &tako_core::lsp::goto::GotoKind::NAMES[..]);
-        // 定義ジャンプの後ろは整形の 2 つと補完と右クリックメニュー（#1684）
+        // 定義ジャンプの後ろは整形の 2 つと補完と右クリックメニュー（#1684）とホバー（#1681）
         // （残りはこれだけ = 足し忘れはここで落ちる）
         assert_eq!(
             &actions[goto.len() + 1..],
@@ -48,6 +50,7 @@ mod tests {
                 crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION,
                 crate::dispatch::LSP_COMPLETION_ACTION,
                 crate::dispatch::LSP_MENU_ACTION,
+                crate::dispatch::LSP_HOVER_ACTION,
             ]
         );
         for action in goto {
@@ -222,6 +225,43 @@ mod tests {
                 "{item:?}: MCP の args と GUI のクリックの要求が違う"
             );
         }
+    }
+
+    /// #1681: `tako_lsp` の action=hover は CLI `tako lsp hover` と同じ要求になる
+    /// （pane の省略は呼び出し元 = 定義ジャンプと同じ。位置は必須。show は省略で wire に載らない）
+    #[test]
+    fn tako_lsp_のホバーは_cli_と同じ要求になる() {
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "hover", "line": 3, "column": 4}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspHover {
+                pane: Some(9),
+                line: 3,
+                column: 4,
+                show: None,
+            }
+        );
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "hover", "pane": 5, "line": 1, "column": 0, "show": true}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspHover {
+                pane: Some(5),
+                line: 1,
+                column: 0,
+                show: Some(true),
+            }
+        );
+        assert!(build_request("tako_lsp", &json!({"action": "hover"}), Some(9), None).is_err());
     }
 
     #[test]

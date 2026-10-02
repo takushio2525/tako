@@ -15,11 +15,14 @@
 //! [`completion`]、待つのは [`LspManager::completion`]。古い要求は `$/cancelRequest` で捨てる）。
 //! S7（#1684）の右クリックメニュー = `tako lsp menu`（項目 → dispatch の対応は [`menu`]、
 //! 能力を読むのは [`LspManager::menu_capabilities_now`] / [`LspManager::menu_capabilities`]）。
+//! S4（#1681）のホバー = `tako lsp hover`（問い合わせの型と応答は [`hover`]、待つのは
+//! [`LspManager::hover`]。マウスの要求は補完と同じく前の 1 つを `$/cancelRequest` で捨てる）。
 
 pub mod completion;
 pub mod diagnostics;
 pub mod format;
 pub mod goto;
+pub mod hover;
 pub mod manager;
 pub mod menu;
 pub mod rpc;
@@ -30,6 +33,7 @@ pub use completion::{CompletionAnswer, CompletionError, CompletionRequest};
 pub use diagnostics::DocDiagnostics;
 pub use format::{FormatAnswer, FormatError, FormatRequest};
 pub use goto::{GotoAnswer, GotoError, GotoRequest, GotoTarget};
+pub use hover::{HoverAnswer, HoverError, HoverRequest};
 pub use manager::{
     legacy, DocLease, DocLink, DocumentDiagnostics, Launch, LspConfig, LspDocument, LspManager,
     DIAGNOSTICS_EVENT_CAPACITY,

@@ -132,6 +132,10 @@ pub fn format_document() -> &'static str {
 pub fn format_selection() -> &'static str {
     tr!("選択範囲を整形", "Format Selection")
 }
+/// #1681: カーソル位置の型・doc をカードで出す
+pub fn show_hover() -> &'static str {
+    tr!("ホバー情報を表示", "Show Hover")
+}
 
 // --- 表示 -------------------------------------------------------------------
 
@@ -273,6 +277,7 @@ mod tests {
                 find().to_string(),
                 format_document().to_string(),
                 format_selection().to_string(),
+                show_hover().to_string(),
                 command_palette().to_string(),
                 toggle_sidebar().to_string(),
                 toggle_drawer().to_string(),

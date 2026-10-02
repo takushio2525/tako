@@ -421,6 +421,23 @@ pub(crate) struct ReadOnlyMdSink<'a> {
     layouts: Vec<Option<gpui::TextLayout>>,
 }
 
+impl<'a> ReadOnlyMdSink<'a> {
+    /// 受け皿を作る（ホバーカード = #1681 も同じ受け皿で読むだけの md を描く）
+    pub(crate) fn new(theme: &'a Theme, hovered: Option<(usize, Range<usize>)>) -> Self {
+        Self {
+            theme,
+            hovered,
+            line: 0,
+            layouts: Vec::new(),
+        }
+    }
+
+    /// 控えた `TextLayout`（行番号 → 実描画レイアウト。`md_link_at_layouts` が引く）
+    pub(crate) fn into_layouts(self) -> Vec<Option<gpui::TextLayout>> {
+        self.layouts
+    }
+}
+
 impl MdTextSink for ReadOnlyMdSink<'_> {
     fn text(
         &mut self,
@@ -453,12 +470,19 @@ pub(crate) fn render_document(
     blocks: &[MdBlock],
     hovered: Option<(usize, Range<usize>)>,
 ) -> (Vec<AnyElement>, Vec<Option<gpui::TextLayout>>) {
-    let mut sink = ReadOnlyMdSink {
-        theme,
-        hovered,
-        line: 0,
-        layouts: Vec::new(),
-    };
+    let mut sink = ReadOnlyMdSink::new(theme, hovered);
+    let elements = render_blocks(theme, theme.font_size, blocks, &mut sink);
+    (elements, sink.into_layouts())
+}
+
+/// ブロック列を 1 個ずつ [`render_block`] へ通して要素列にする（読むだけの md の共通の並べ方。
+/// アップデート詳細 = #690 とホバーカード = #1681）。`base` は本文の文字サイズ
+pub(crate) fn render_blocks(
+    theme: &Theme,
+    base: f32,
+    blocks: &[MdBlock],
+    sink: &mut impl MdTextSink,
+) -> Vec<AnyElement> {
     let mut code_blocks = 0usize;
     let mut elements = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -468,15 +492,9 @@ pub(crate) fn render_document(
             code_blocks += 1;
             code_blocks - 1
         });
-        elements.push(render_block(
-            theme,
-            theme.font_size,
-            block,
-            code_index,
-            &mut sink,
-        ));
+        elements.push(render_block(theme, base, block, code_index, sink));
     }
-    (elements, sink.layouts)
+    elements
 }
 
 /// 実描画レイアウトに対するリンクのヒットテスト（#680 と同じ規則。#690）。

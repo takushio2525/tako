@@ -1680,6 +1680,148 @@ pub fn lsp_completion_apply(
     Ok(out)
 }
 
+// --- ホバー（#1681）-------------------------------------------------------------
+
+/// ホバーの問い合わせ（#1681）。UI スレッドで [`lsp_hover_prepare`] が作り、[`LspHoverJob::run`] を
+/// 背景で走らせ、答えを載せた [`LspHoverLanding`] を UI スレッドの [`lsp_hover_land`] へ戻す
+/// （CLI / MCP と GUI の編集メニューの 3 段。GUI のマウスは同じ manager の問い合わせを直接背景で
+/// 待ち、カードを出すだけ = `show` の口と同じ `ControlHost::show_lsp_hover`）
+pub struct LspHoverJob {
+    manager: crate::lsp::LspManager,
+    request: crate::lsp::HoverRequest,
+    landing: LspHoverLanding,
+}
+
+impl LspHoverJob {
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。上限は `HoverRequest::timeout`）
+    pub fn run(self) -> LspHoverLanding {
+        let mut landing = self.landing;
+        landing.answer = Some(self.manager.hover(&self.request));
+        landing
+    }
+}
+
+/// ホバーの着地に要るもの（問い合わせたペインと引数）と、背景で得た答え（#1681）
+#[derive(Debug, Clone)]
+pub struct LspHoverLanding {
+    pub source_pane: PaneId,
+    pub source_path: String,
+    /// 問い合わせた位置（行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+    pub line: usize,
+    pub column: usize,
+    /// GUI のその位置にカードも出すか
+    pub show: bool,
+    /// 背景で得た答え（[`LspHoverJob::run`] が入れる）
+    pub answer: Option<Result<crate::lsp::HoverAnswer, crate::lsp::HoverError>>,
+}
+
+/// ホバーの準備（UI スレッド。#1681）。引数を検査し、編集セッションの本文を採る
+/// （言語サーバの座標へは manager がサーバの見ている本文で直す）。**1 プロセスも起こさない**
+pub fn lsp_hover_prepare(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    line: usize,
+    column: usize,
+    show: bool,
+) -> Result<LspHoverJob, DispatchError> {
+    if line == 0 {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::LINE_ONE_BASED.into(),
+        ));
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let Some((path, _)) = host.preview_state(target) else {
+        return Err(DispatchError::InvalidParams(format!(
+            "プレビューペインではない: {}",
+            target.as_u64()
+        )));
+    };
+    let source = host
+        .preview_goto_source(target, line - 1)
+        .map_err(DispatchError::InvalidParams)?;
+    // 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
+    if column > source.line_text.len() || !source.line_text.is_char_boundary(column) {
+        return Err(DispatchError::InvalidParams(format!(
+            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
+            source.line_text.len()
+        )));
+    }
+    let Some(manager) = host.lsp() else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    Ok(LspHoverJob {
+        manager: manager.clone(),
+        request: crate::lsp::HoverRequest {
+            path: PathBuf::from(&path),
+            line: line - 1,
+            column,
+            timeout: crate::lsp::hover::hover_timeout(),
+            document: source.document,
+            // 明示の問い合わせ = 取り消し合わない・開いていなければ問い合わせのあいだだけ開く
+            superseding: false,
+            open: true,
+        },
+        landing: LspHoverLanding {
+            source_pane: target,
+            source_path: path,
+            line,
+            column,
+            show,
+            answer: None,
+        },
+    })
+}
+
+/// ホバーの着地（UI スレッド。#1681）。答えを JSON にし、`show` なら GUI のその位置にカードを出す
+/// （[`ControlHost::show_lsp_hover`] = 編集メニューの「ホバー情報を表示」と同じ口）。
+/// 「何も無い」「未導入」等は `status` と理由・次の一手で返す（失敗ではなく答え）
+pub fn lsp_hover_land(
+    host: &mut dyn ControlHost,
+    landing: &LspHoverLanding,
+) -> Result<Value, DispatchError> {
+    let from = json!({
+        "pane": landing.source_pane.as_u64(),
+        "path": landing.source_path,
+        "line": landing.line,
+        "column": landing.column,
+    });
+    let answer = match &landing.answer {
+        Some(Ok(answer)) => answer,
+        Some(Err(error)) => {
+            let mut out = error.to_json();
+            out["from"] = from;
+            return Ok(out);
+        }
+        None => {
+            return Err(DispatchError::Operation(
+                "ホバーの答えがまだ無い（背景の問い合わせを経ずに着地しようとした）".into(),
+            ))
+        }
+    };
+    let Some(content) = &answer.content else {
+        let mut out = crate::lsp::hover::none_json(answer.server);
+        out["from"] = from;
+        return Ok(out);
+    };
+    let mut out = crate::lsp::hover::found_json(answer.server, content, answer.range);
+    out["from"] = from;
+    if landing.show {
+        // 待っているあいだに問い合わせたペインが閉じられた / 差し替わったら出さない
+        let still_there = host
+            .preview_state(landing.source_pane)
+            .is_some_and(|(path, _)| path == landing.source_path);
+        let at = tako_core::lsp::completion::At::new(landing.line - 1, landing.column);
+        let shown = still_there
+            && host
+                .show_lsp_hover(landing.source_pane, at, answer)
+                .map_err(DispatchError::Operation)?;
+        out["shown"] = json!(shown);
+    }
+    Ok(out)
+}
+
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
 /// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
@@ -1758,6 +1900,9 @@ pub enum OffloadJob {
     /// 右クリックメニューの LSP 項目（#1684）。握手が済んでいなければサーバを起こして待つので
     /// background へ出す（答えは能力を読むだけ = 応答をそのまま返す）
     LspMenu(Box<LspMenuJob>),
+    /// ホバーの問い合わせ（#1681）。待つのは background、カードを出す（`show`）のは
+    /// [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
+    LspHover(Box<LspHoverJob>),
     /// Code Runner の実行プロファイルと実行環境の一覧（#1730）。実行環境の Tier P
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
@@ -1801,6 +1946,8 @@ pub enum OffloadContinuation {
     FileCopied(Box<FileCopyLanding>),
     /// 補完の着地（[`lsp_completion_land`]）
     LspCompletion(Box<LspCompletionLanding>),
+    /// ホバーの着地（[`lsp_hover_land`]。#1681）
+    LspHover(Box<LspHoverLanding>),
 }
 
 /// background の結果を受けて UI スレッドで続きを行う（#1680）。IPC の受け口と GUI の
@@ -1830,6 +1977,7 @@ pub fn finish_offload(
             }
         }
         OffloadContinuation::LspCompletion(landing) => lsp_completion_land(host, &landing),
+        OffloadContinuation::LspHover(landing) => lsp_hover_land(host, &landing),
     }
 }
 
@@ -2025,6 +2173,16 @@ pub fn prepare_offload(
             lsp_menu_prepare(host, *pane, *line, *column)
                 .map(|job| OffloadJob::LspMenu(Box::new(job))),
         ),
+        // #1681: 準備（引数の検査）は UI スレッド、問い合わせは background
+        Request::LspHover {
+            pane,
+            line,
+            column,
+            show,
+        } => Some(
+            lsp_hover_prepare(host, *pane, *line, *column, show.unwrap_or(false))
+                .map(|job| OffloadJob::LspHover(Box::new(job))),
+        ),
         // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
         Request::RunResolve {
             path,
@@ -2064,6 +2222,9 @@ impl OffloadJob {
             }
             OffloadJob::LspCompletion(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspCompletion(Box::new(job.run())))
+            }
+            OffloadJob::LspHover(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::LspHover(Box::new(job.run())))
             }
             other => OffloadOutcome::Reply(other.run_reply()),
         }
@@ -2108,6 +2269,9 @@ impl OffloadJob {
             )),
             OffloadJob::LspCompletion(_) => Err(DispatchError::Operation(
                 "補完は run_staged で走らせる（絞り込みと確定に UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::LspHover(_) => Err(DispatchError::Operation(
+                "ホバーは run_staged で走らせる（カードを出すのに UI スレッドの続きが要る）".into(),
             )),
         }
     }
@@ -5206,6 +5370,18 @@ fn dispatch_inner(
                 resolve.unwrap_or(false),
             )?;
             lsp_completion_land(host, &job.run())
+        }
+
+        // #1681: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 問い合わせ → 着地）を直列に通る
+        Request::LspHover {
+            pane,
+            line,
+            column,
+            show,
+        } => {
+            let job = lsp_hover_prepare(host, pane, line, column, show.unwrap_or(false))?;
+            lsp_hover_land(host, &job.run())
         }
 
         Request::SetupMcp { scope, pane, agent } => {
@@ -14548,8 +14724,8 @@ pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs"];
 /// MCP `tako_lsp`（言語機能）の action。CLI は `tako lsp <action>`。
 /// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）と
 /// 整形・保存時整形の設定（#1683。綴りは [`LSP_FORMAT_ACTION`] / [`LSP_FORMAT_ON_SAVE_ACTION`]）と
-/// 補完（#1682。[`LSP_COMPLETION_ACTION`]）。
-/// 先頭が MCP の既定。ホバー等のスライスはここへ足す（ツールは増やさない）
+/// 補完（#1682。[`LSP_COMPLETION_ACTION`]）とホバー（#1681。[`LSP_HOVER_ACTION`]）。
+/// 先頭が MCP の既定。言語機能のスライスはここへ足す（ツールは増やさない）
 pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     "diagnostics",
     tako_core::lsp::goto::GotoKind::NAMES[0],
@@ -14560,6 +14736,7 @@ pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     LSP_FORMAT_ON_SAVE_ACTION,
     LSP_COMPLETION_ACTION,
     LSP_MENU_ACTION,
+    LSP_HOVER_ACTION,
 ];
 
 /// 整形の action（#1683。CLI は `tako lsp format`）
@@ -14573,6 +14750,9 @@ pub const LSP_COMPLETION_ACTION: &str = "completion";
 
 /// 右クリックメニューの LSP 項目（#1684）の action の綴り（CLI は `tako lsp menu`）
 pub const LSP_MENU_ACTION: &str = "menu";
+
+/// ホバー（#1681）の action の綴り（CLI は `tako lsp hover`）
+pub const LSP_HOVER_ACTION: &str = "hover";
 
 /// 言語サーバの操作の 1 実装（#1678）。CLI・MCP・同期実行・offload のすべてがここを通る。
 ///
@@ -18155,6 +18335,8 @@ mod tests {
         preview_real_files: bool,
         /// #1659: 外部変更の競合（GUI の `EditState::conflict` の代役）
         preview_conflicts: std::collections::HashMap<u64, crate::host::PreviewConflict>,
+        /// #1681: `show_lsp_hover` が出したカード（ペイン・位置・本文）。GUI の `LspHoverUi::card` の代役
+        hover_cards: Vec<(u64, tako_core::lsp::completion::At, String)>,
         collapsed: std::collections::HashSet<u64>,
         /// ピン留め: (group, id)
         pins: Vec<(bool, u64)>,
@@ -18272,6 +18454,7 @@ mod tests {
                 preview_limits: std::collections::HashMap::new(),
                 preview_real_files: false,
                 preview_conflicts: std::collections::HashMap::new(),
+                hover_cards: Vec::new(),
                 collapsed: std::collections::HashSet::new(),
                 pins: Vec::new(),
                 stale_pane_map: std::collections::HashMap::new(),
@@ -18668,6 +18851,20 @@ mod tests {
     }
 
     impl PreviewHost for MockHost {
+        fn show_lsp_hover(
+            &mut self,
+            pane: PaneId,
+            at: tako_core::lsp::completion::At,
+            answer: &crate::lsp::HoverAnswer,
+        ) -> Result<bool, String> {
+            let text = answer
+                .content
+                .as_ref()
+                .map(|c| c.value.clone())
+                .unwrap_or_default();
+            self.hover_cards.push((pane.as_u64(), at, text));
+            Ok(true)
+        }
         fn preview_reload_enabled(&self) -> bool {
             self.preview_reload.enabled()
         }
@@ -22072,6 +22269,105 @@ mod tests {
         assert_eq!(out["status"], json!("no-server"));
         assert_eq!(out["action"], json!("completion"));
         assert_eq!(out["from"]["pane"], json!(pane));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1681: ホバーの着地。見つかった答えは本文・種類・範囲（`tako edit replace-range` の形）を返し、
+    /// `show` のときだけカードを出す口（`show_lsp_hover`）を呼ぶ。何も無い / 失敗は理由つきの答え。
+    /// 待つあいだにペインが別のファイルへ差し替わったらカードを出さない（`shown: false`）
+    #[test]
+    fn ホバーの着地は答えを返し_show_のときだけカードを出す() {
+        use tako_core::lsp::completion::At;
+        use tako_core::lsp::hover::{Hover, Markup};
+        let dir = jump_fixture("hover-land", &["main.rs", "other.rs"]);
+        let main = dir.join("main.rs");
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        // 開いたときの表記（正規化した絶対パス）で照合する
+        let (source_path, _) = host.preview_state(PaneId::from_raw(pane)).unwrap();
+        let landing = |show: bool, answer| LspHoverLanding {
+            source_pane: PaneId::from_raw(pane),
+            source_path: source_path.clone(),
+            line: 3,
+            column: 4,
+            show,
+            answer: Some(answer),
+        };
+        let content = Hover {
+            markup: Markup::Markdown,
+            value: "```rust\nfn len(&self) -> usize\n```".into(),
+            truncated: false,
+            total_chars: 30,
+            range: Some(((2, 4), (2, 7))),
+        };
+        let found = || {
+            Ok(crate::lsp::HoverAnswer {
+                server: "fake",
+                content: Some(content.clone()),
+                range: Some((At::new(2, 4), At::new(2, 7))),
+            })
+        };
+        // show なし: 答えだけ（カードは出さない）
+        let out = lsp_hover_land(&mut host, &landing(false, found())).unwrap();
+        assert_eq!(out["status"], json!("found"));
+        assert_eq!(out["action"], json!("hover"));
+        assert_eq!(out["kind"], json!("markdown"));
+        assert_eq!(out["contents"], json!(content.value));
+        assert_eq!(out["range"]["start"], json!({"line": 3, "column": 4}));
+        assert_eq!(out["from"]["pane"], json!(pane));
+        assert!(out.get("shown").is_none());
+        assert!(host.hover_cards.is_empty(), "show なしでカードを出さない");
+        // show: 問い合わせた位置（0 起点の行）にカードを出す
+        let out = lsp_hover_land(&mut host, &landing(true, found())).unwrap();
+        assert_eq!(out["shown"], json!(true));
+        assert_eq!(
+            host.hover_cards,
+            vec![(pane, At::new(2, 4), content.value.clone())]
+        );
+        // 何も無い・失敗は理由つき（カードは出さない）
+        let none = lsp_hover_land(
+            &mut host,
+            &landing(
+                true,
+                Ok(crate::lsp::HoverAnswer {
+                    server: "fake",
+                    content: None,
+                    range: None,
+                }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(none["status"], json!("none"));
+        assert_eq!(
+            none["reason"],
+            json!(crate::lsp::text::HOVER_NONE_REASON.text())
+        );
+        let failed = lsp_hover_land(
+            &mut host,
+            &landing(
+                true,
+                Err(crate::lsp::HoverError::Query(
+                    crate::lsp::GotoError::NoServer,
+                )),
+            ),
+        )
+        .unwrap();
+        assert_eq!(failed["status"], json!("no-server"));
+        assert_eq!(
+            host.hover_cards.len(),
+            1,
+            "何も無い・失敗でカードを出さない"
+        );
+        // 待つあいだに別のファイルへ差し替わった: 答えは返すがカードは出さない
+        let other = dir.join("other.rs");
+        jump_open(&mut host, pane, &other, None, None);
+        let out = lsp_hover_land(&mut host, &landing(true, found())).unwrap();
+        assert_eq!(out["status"], json!("found"));
+        assert_eq!(out["shown"], json!(false));
+        assert_eq!(host.hover_cards.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -13,11 +13,13 @@
 //! - [`format`] — 整形（S6 / #1683）の要求・能力・答えの読み取り・範囲の規則
 //! - [`completion`] — 補完（S5 / #1682）の応答の読み取り・絞り込み・キーの振り分け表・版の照合
 //! - [`menu`] — 右クリックメニューの LSP 項目（S7 / #1684）の出し分け（能力・位置の種類・選択）
+//! - [`hover`] — ホバー（S4 / #1681）の応答の読み取り（3 形）・本文の上限・範囲・能力
 
 pub mod completion;
 pub mod diagnostic;
 pub mod format;
 pub mod goto;
+pub mod hover;
 pub mod menu;
 pub mod position;
 pub mod root;

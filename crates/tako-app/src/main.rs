@@ -41,6 +41,7 @@ mod limit_autoresume;
 mod lsp_completion_ui;
 mod lsp_format_ui;
 mod lsp_goto_ui;
+mod lsp_hover_ui;
 mod lsp_menu_ui;
 mod md_view;
 mod menu_bar;
@@ -1983,6 +1984,8 @@ struct TakoApp {
     lsp_format_on_save: bool,
     /// 補完（予測変換）の GUI の状態（#1682）。問い合わせは manager、確定は dispatch の 1 本
     lsp_completion: lsp_completion_ui::LspCompletionUi,
+    /// ホバー（型・doc のカード）の GUI の状態（#1681）。問い合わせは manager、カードは 1 枚
+    lsp_hover: lsp_hover_ui::LspHoverUi,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
@@ -4203,6 +4206,7 @@ impl TakoApp {
             lsp_format: crate::lsp_format_ui::LspFormatUi::default(),
             lsp_format_on_save: tako_control::settings::load().lsp_format_on_save,
             lsp_completion: lsp_completion_ui::LspCompletionUi::default(),
+            lsp_hover: lsp_hover_ui::LspHoverUi::default(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
@@ -11321,6 +11325,8 @@ impl TakoApp {
             // #1683: 言語サーバの整形（編集メニューと同じ）
             "format-document",
             "format-selection",
+            // #1681: カーソル位置のホバー情報（編集メニューと同じ）
+            "show-hover",
         ];
         for id in COMMANDS {
             items.push(PaletteItem::Command(
@@ -11426,6 +11432,7 @@ impl TakoApp {
                 }
                 "format-document" => self.format_focused_preview(false, cx),
                 "format-selection" => self.format_focused_preview(true, cx),
+                "show-hover" => self.show_hover_at_cursor(cx),
                 _ => {}
             },
             PaletteItem::SshHost(host, into_pane) => {
@@ -14194,6 +14201,12 @@ impl TakoApp {
         // 下のいつもの経路（検索欄 / 本文）へ流れる
         if let Some(handled) = self.route_completion_key(pane_id, keystroke, cx) {
             return handled;
+        }
+        // #1681: ホバーのカードを出していれば Esc はカードだけを閉じる（補完の一覧が先 = 両方
+        // 出ていれば 1 回目の Esc は一覧）。他の打鍵はメニュー / CLI で出したカードを閉じて流す
+        if self.route_lsp_hover_key(keystroke) {
+            cx.notify();
+            return true;
         }
 
         // 検索バー表示中: キーを検索/置換フィールドにルーティング
@@ -17019,6 +17032,8 @@ impl TakoApp {
         self.update_md_link_hover(event.position, link_mod, cx);
         // コードプレビューの識別子（定義ジャンプ。#1680）
         self.update_code_symbol_hover(event.position, link_mod, cx);
+        // コードプレビューのホバー（型・doc のカード。#1681）。ボタンを押したまま（選択のドラッグ）は出さない
+        self.update_lsp_hover(event.position, event.pressed_button.is_some(), cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
@@ -23979,6 +23994,8 @@ impl PreviewHost for TakoApp {
         self.forget_lsp_goto(pane);
         // #1682: 補完の一覧も前のファイルの行を指している
         self.forget_lsp_completion(pane);
+        // #1681: ホバーのカードも前のファイルの行を指している
+        self.forget_lsp_hover(pane);
         self.remove_preview_image_cache(pane);
         self.pending_pdf_rasters.remove(&pane);
         self.preview_views.remove(&pane);
@@ -24040,6 +24057,39 @@ impl PreviewHost for TakoApp {
         expected_version: Option<u64>,
     ) -> Result<(), String> {
         self.edit_preview_ranges_local(pane, edits, primary, expected_version)
+    }
+
+    /// #1681: CLI `tako lsp hover --show` / MCP の `show`・編集メニューの「ホバー情報を表示」の
+    /// カード（マウスのカードと同じ `open_lsp_hover_card` の 1 本）。語の範囲はその位置の識別子
+    /// （無ければその 1 字）。その行が描かれていなければ出さない
+    fn show_lsp_hover(
+        &mut self,
+        pane: PaneId,
+        at: tako_core::lsp::completion::At,
+        answer: &tako_control::lsp::HoverAnswer,
+    ) -> Result<bool, String> {
+        let line_text = self
+            .preview_line_texts
+            .get(&pane)
+            .and_then(|texts| texts.get(at.line))
+            .cloned()
+            .unwrap_or_default();
+        let range = tako_core::lsp::goto::symbol_at(&line_text, at.col)
+            .map(|symbol| symbol.range)
+            .unwrap_or_else(|| {
+                let end = line_text[at.col.min(line_text.len())..]
+                    .chars()
+                    .next()
+                    .map_or(at.col, |ch| at.col + ch.len_utf8());
+                at.col..end
+            });
+        Ok(self.open_lsp_hover_card(
+            pane,
+            at.line,
+            range,
+            answer,
+            lsp_hover_ui::HoverOrigin::Explicit,
+        ))
     }
 
     fn set_preview_cursor(
@@ -26452,6 +26502,8 @@ impl Render for TakoApp {
                     this.format_focused_preview(true, cx)
                 }),
             )
+            // #1681: カーソル位置のホバー情報（編集メニュー・パレット。キーは張らない）
+            .on_action(cx.listener(|this, _: &ShowHover, _, cx| this.show_hover_at_cursor(cx)))
             .on_action(cx.listener(|this, _: &UndoPreview, _, cx| {
                 let pane_id = this.focused_pane();
                 let _ = this.preview_undo_local(pane_id);
@@ -26676,6 +26728,8 @@ impl Render for TakoApp {
             .children(self.render_run_menu_overlay(cx))
             // #1680: 定義ジャンプの候補が複数のときの一覧
             .children(self.render_lsp_goto_menu(window, cx))
+            // #1681: ホバーのカード（語の行の真下か真上）。補完の一覧より奥（両方出ていれば一覧が手前）
+            .children(self.render_lsp_hover(window, cx))
             // #1682: 補完の候補の一覧（打っている語の頭の真下）
             .children(self.render_lsp_completion(window, cx))
             // #739: スターターのプロファイル選択。ビューポート実寸を渡して
@@ -27052,6 +27106,8 @@ fn edit_menu() -> gpui::Menu {
         MenuItem::separator(),
         MenuItem::action(m::format_document(), FormatDocument),
         MenuItem::action(m::format_selection(), FormatSelection),
+        // #1681: カーソル位置の型・doc をカードで出す（マウスを乗せたときと同じカード）
+        MenuItem::action(m::show_hover(), ShowHover),
     ])
 }
 

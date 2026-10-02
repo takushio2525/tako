@@ -948,6 +948,20 @@ pub enum Request {
         line: usize,
         column: usize,
     },
+    /// ホバー（型・doc。FR-3.36 / #1681。`tako lsp hover` / MCP `tako_lsp` の action=hover）。
+    /// GUI のマウスのホバー・編集メニューの「ホバー情報を表示」と同じ問い合わせの 1 本。
+    ///
+    /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
+    /// 行内 UTF-8 バイト）で、範囲外・文字の途中は丸めずに拒否する。答えは本文（`contents`。
+    /// Markdown / 平文のまま）と種類（`kind`）と範囲。`show` で GUI のその位置にカードも出す
+    LspHover {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        line: usize,
+        column: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show: Option<bool>,
+    },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },
     /// redo（#195）
@@ -2592,6 +2606,8 @@ pub fn changes_layout(request: &Request) -> bool {
         // --- ペインの中身だけを触る（再描画は端末・プレビュー自身の経路が行う） ---
         // 補完（#1682）は候補を返すか、`choice` で編集バッファへ入れるだけ（ペインを増やさない）
         | Request::LspCompletion { .. }
+        // ホバー（#1681）は答えを返すか、`show` でカード（重ね物）を出すだけ（ペインの寸法は不変）
+        | Request::LspHover { .. }
         | Request::Send { .. }
         | Request::Scroll { .. }
         | Request::Focus { .. }
