@@ -830,7 +830,7 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_preview_outline",
             "description": "Markdown 見出しまたは PDF 目次のアウトラインを取得し、項目へジャンプする。\
                 item は返却順の 1 始まり。item を省略すると一覧取得だけを行う。Markdown の重複見出しも\
-                別項目として保持され、PDF 項目は PDFKit のリンク先ページへ移動する。編集中の Markdown は\
+                別項目として保持され、PDF 項目は PDFKit のリンク先ページへ移動する。編集中の Markdown は \
                 target が source_line（原文の行）になり、ジャンプでキャレットもその行へ置く。",
             "inputSchema": {
                 "type": "object",

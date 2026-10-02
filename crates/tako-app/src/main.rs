@@ -51840,8 +51840,9 @@ mod self_test {
 
     /// Markdown を編集して抜けると描画へ戻り、目次が作り直されるか（#1661）。
     ///
-    /// 場面: 描画表示の md を開き、ヘッダの「編集」を**実マウスで**押して実キーで見出しを
-    /// 書き換え、「編集中」を押して抜ける。①抜けたら表示モードが Markdown へ戻り、目次が
+    /// 場面: 描画表示の md を開き、ヘッダの「編集」を**実マウスで**押して見出しを書き換え
+    /// （本文は dispatch の範囲置換で入れる。打鍵の経路は editor-keys 節の担当）、「編集中」を
+    /// 押して抜ける。①抜けたら表示モードが Markdown へ戻り、目次が
     /// 書き換えた見出しで作り直される（修正前はコード表示のまま・目次は空）②もう一度
     /// 編集すると目次ボタンが出ていて、項目を押すとキャレットがその見出しの原文の行へ行く
     /// ③自動保存を切って未保存のまま抜けても、描画と目次は本文（未保存の変更）から作られる。
@@ -51960,16 +51961,33 @@ mod self_test {
                 }
             }
         };
-        let press = |cx: &mut AsyncApp, key: &str| {
-            let _ = any.update(cx, |_, window, cx| {
-                window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
-            });
-        };
-        // 打つ前に変換状態を畳む（前提整備）。機の入力ソース（IMK）が隔離窓へ未確定文字列を
-        // 立てることがあり、そのときの宛先（起動直後に前面だったターミナル）へ最初の確定だけが
-        // 流れる（実測: 4 回中 1 回「 v2」の空白だけがターミナルへ行った。この節の検査対象外）
-        let clear_ime = |cx: &mut AsyncApp| {
-            let _ = window.update(cx, |app, _, _| app.ime = None);
+        // 本文の書き換えは dispatch（CLI `tako edit replace-range` と同じ口）で入れる。打鍵の経路は
+        // editor-keys 節が見るもので、この節の対象（描画へ戻る経路と実マウスの押下）ではない。
+        // 実キーで打つ版は 10 回中 1 回、1 行目が見出しでなくなって落ちた（行頭へ入った形）。
+        // 機の入力ソース（IMK）が隔離窓へ未確定文字列を立てると End が「変換中は本文に触らない」で
+        // 呑まれる、と読める症状で、別の回では最初の 1 文字だけがターミナルへ流れたのも観測した
+        let append = |cx: &mut AsyncApp, line: usize, col: usize, text: &str| {
+            window
+                .update(cx, |app, _, cx| {
+                    let mut r = tako_control::dispatch(
+                        app,
+                        Req::PreviewEditRange {
+                            pane: Some(pane.as_u64()),
+                            start_line: line,
+                            start_col: col,
+                            end_line: line,
+                            end_col: col,
+                            text: text.to_string(),
+                            expected_version: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    // CLI と同じ後処理を通す（自動保存のタイマーはここが回す = #973）
+                    let _ = app.after_dispatch(&mut r, false, cx);
+                    cx.notify();
+                    r.is_ok()
+                })
+                .unwrap_or(false)
         };
         let click_edit_toggle =
             |cx: &mut AsyncApp, step: &str| match probe(cx, "preview-edit-toggle") {
@@ -51992,10 +52010,10 @@ mod self_test {
             editing && mode == Some(preview::PreviewMode::Code),
             "visual-test md-edit-resume: 編集ボタンで編集が始まる (#1661)",
         );
-        // キャレットは見ている行の頭（#1649）= 1 行目の「# Title」
-        clear_ime(cx);
-        press(cx, "end");
-        type_text(any, cx, " v2", false);
+        check(
+            append(cx, 1, "# Title".len(), " v2"),
+            "visual-test md-edit-resume: 1 行目の見出しを書き換えられる (#1661)",
+        );
         // 自動保存（500ms）が書き終わるのを待ってから抜ける
         wait(cx, 900).await;
         dump(cx, "md-edit-1-editing.png");
@@ -52003,7 +52021,31 @@ mod self_test {
         let resumed = until_outline(cx, window, pane, 3).await;
         let (mode, titles, editing, _) = observe(cx);
         if !resumed {
-            eprintln!("TAKO_VISUAL_1661: 抜けた後の mode={mode:?} titles={titles:?}");
+            let detail = window
+                .update(cx, |app, _, _| {
+                    let shown = app.previews.get(&pane).map(|p| match &p.content {
+                        preview::PreviewContent::Markdown(blocks) => {
+                            format!("md {} blocks", blocks.len())
+                        }
+                        preview::PreviewContent::Code(lines) => {
+                            format!("code {} lines", lines.len())
+                        }
+                        preview::PreviewContent::Loading => "loading".to_string(),
+                        _ => "other".to_string(),
+                    });
+                    let buffer = app
+                        .preview_edits
+                        .get(&pane)
+                        .map(|e| e.buffer.text().lines().next().unwrap_or("").to_string());
+                    (shown, buffer)
+                })
+                .ok();
+            let disk = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| t.lines().next().map(str::to_string));
+            eprintln!(
+                "TAKO_VISUAL_1661: 抜けた後の mode={mode:?} titles={titles:?} 表示={detail:?} 1 行目（ディスク）={disk:?}"
+            );
         }
         check(
             resumed && !editing && mode == Some(preview::PreviewMode::Markdown),
@@ -52071,9 +52113,10 @@ mod self_test {
             }
             cx.notify();
         });
-        clear_ime(cx);
-        press(cx, "end");
-        type_text(any, cx, " v3", false);
+        check(
+            append(cx, beta_line, "## Beta".len(), " v3"),
+            "visual-test md-edit-resume: Beta の見出しを書き換えられる (#1661)",
+        );
         wait(cx, 100).await;
         click_edit_toggle(cx, "未保存のままの終了");
         let resumed = until_outline(cx, window, pane, 3).await;
