@@ -6535,7 +6535,9 @@ mod tests {
         empty
             .apply_changes(vec![change(0..0, "fn main() {}\n")], None)
             .unwrap();
-        assert_eq!(empty.text(), "fn main() {}\n");
+        // 空の文書の改行は OS の既定（Windows は CRLF。#1650）で、入れる本文もそれへ揃う
+        let newline = empty.line_ending().as_str();
+        assert_eq!(empty.text(), format!("fn main() {{}}{newline}"));
         assert!(empty.undo());
         assert_eq!(empty.text(), "");
         assert_eq!(empty.line_starts(), &[0][..]);
