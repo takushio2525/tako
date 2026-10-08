@@ -42,3 +42,6 @@ docs/node_modules/
 docs/dist/
 docs/.astro/
 .vite/
+
+# Claude Code が mod を読むたびに書く型定義（#1879。tako mod のソースで validate / test を回すと生える）
+crates/tako-core/claude-mod/.claude-plugin/types/

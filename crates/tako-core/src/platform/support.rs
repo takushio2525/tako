@@ -856,6 +856,17 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        key: "tako_mod",
+        macos: Support::Supported,
+        // 展開と env 注入（区切り `;` は単体テストで確認）は共通の経路だが、Windows の
+        // Claude Code が CLAUDE_CODE_PLUGIN_DIRS から mod を読むかは未実測（#1886）
+        windows: Support::Pending {
+            note: notes::WIN_UNVERIFIED,
+            issue: 1886,
+        },
+        windows_evidence: Evidence::Unverified,
+    },
+    Feature {
         key: "tako_move_pane_to_tab",
         macos: Support::Supported,
         windows: Support::Supported,

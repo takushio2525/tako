@@ -206,6 +206,10 @@ enum Command {
     /// 配置状態の確認と配置・解除（Issue #525）。引数なしで現在の状態を表示。
     /// unix は環境変数の注入だけで完結するので配置操作は不要
     ShellIntegration(ShellIntegrationArgs),
+    /// tako mod（Claude Code の mod 連携。FR-2.42 / Issue #1879）。引数なしで状態
+    /// （claude の版・注入の有無・ペインごとの報告 = ctx / 使用制限 / turn）を表示。
+    /// on / off は次に作るペインから効く
+    Mod(ModArgs),
     /// AI 系設定（tako の宣言的設定 + claude のグローバル指示）を
     /// git リポジトリでデバイス間共有する（Issue #513）。
     /// 引数なしで現在の配線状態と差分を表示する
@@ -3429,6 +3433,25 @@ struct TestResidueArgs {
 struct ShellIntegrationArgs {
     /// 操作（省略時は status）
     #[arg(value_parser = ["status", "install", "uninstall"])]
+    action: Option<String>,
+    /// 生の JSON で出力する
+    #[arg(long)]
+    json: bool,
+}
+
+/// tako mod の引数（Issue #1879）。
+///
+/// `report` は mod が stdin の JSON で状態を送る口で、人が打つものではないので
+/// `--help` の候補に出さない（受け付けはする）
+#[derive(Args)]
+struct ModArgs {
+    /// on / off（省略時は状態を表示）
+    #[arg(value_parser = clap::builder::PossibleValuesParser::new([
+        clap::builder::PossibleValue::new("status"),
+        clap::builder::PossibleValue::new("on"),
+        clap::builder::PossibleValue::new("off"),
+        clap::builder::PossibleValue::new("report").hide(true),
+    ]))]
     action: Option<String>,
     /// 生の JSON で出力する
     #[arg(long)]
@@ -6890,6 +6913,70 @@ fn caller_pane() -> Option<u64> {
     std::env::var("TAKO_PANE_ID").ok()?.parse().ok()
 }
 
+/// `tako mod report` の stdin（mod が組んだ報告の JSON。#1879）
+fn read_mod_report() -> Result<Value, String> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin()
+        .take(1 << 20)
+        .read_to_string(&mut input)
+        .map_err(|e| format!("報告を stdin から読めない: {e}"))?;
+    serde_json::from_str(&input).map_err(|e| format!("報告の JSON を読めない: {e}"))
+}
+
+/// `tako mod` の表示（#1879）。`report` は mod が読むので 1 行の JSON のまま
+fn print_mod(args: &ModArgs, result: &Value) {
+    if args.json || args.action.as_deref() == Some("report") {
+        println!("{result}");
+        return;
+    }
+    let reason = result["reason"]["message"].as_str();
+    match (result["injecting"].as_bool(), reason) {
+        (Some(true), _) => println!("tako mod: 新しく作るペインへ注入する"),
+        (_, Some(reason)) => println!("tako mod: 注入しない（{reason}）"),
+        _ => println!("tako mod: 注入しない"),
+    }
+    println!(
+        "claude {}（下限 {}）/ mod {} / 展開 {}",
+        result["claude_version"].as_str().unwrap_or("未判定"),
+        result["min_claude_version"].as_str().unwrap_or("-"),
+        result["mod_version"].as_str().unwrap_or("-"),
+        result["install"].as_str().unwrap_or("-"),
+    );
+    if let Some(note) = result["applies_to"].as_str() {
+        println!("{note}");
+    }
+    let percent = |v: &Value| v.as_f64().map_or("-".to_string(), |p| format!("{p:.0}%"));
+    for row in result["panes"].as_array().into_iter().flatten() {
+        let pane = row["pane"].as_u64().unwrap_or(0);
+        let state = row["state"].as_str().unwrap_or("-");
+        let report = &row["report"];
+        if report.is_object() {
+            let limit = |kind: &str| {
+                report["rate_limits"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|l| l["kind"] == kind)
+                    .map_or("-".to_string(), |l| percent(&l["percent_used"]))
+            };
+            println!(
+                "  pane {pane}  {state}  ctx {}  5h {}  7d {}  {}  {}  ({} 秒前)",
+                percent(&report["context"]["percent"]),
+                limit("five_hour"),
+                limit("seven_day"),
+                report["turn"].as_str().unwrap_or("-"),
+                report["model"].as_str().unwrap_or("-"),
+                report["age_ms"].as_u64().unwrap_or(0) / 1000,
+            );
+        } else if let Some(reason) = row["reason"]["message"].as_str() {
+            println!("  pane {pane}  {state}  {reason}");
+        } else {
+            println!("  pane {pane}  {state}");
+        }
+    }
+}
+
 /// MCP stdio ブリッジが呼び出し元ペインをどう決めるか（Issue #986）。
 ///
 /// **判断を純粋関数に置く**ので、env とアプリを触らずに新旧どちらの形も検査できる
@@ -7823,6 +7910,17 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Autorename(args) => Request::AutoRename {
             enabled: args.state.as_deref().map(|s| s == "on"),
+        },
+        // #1879: mod からの報告。stdin の JSON をそのまま渡し、送り主は TAKO_PANE_ID
+        Command::Mod(args) if args.action.as_deref() == Some("report") => Request::Mod {
+            action: Some("report".into()),
+            report: Some(read_mod_report()?),
+            pane: caller_pane(),
+        },
+        Command::Mod(args) => Request::Mod {
+            action: args.action.clone(),
+            report: None,
+            pane: None,
         },
         // #1857: 再 attach は切替ではなくペイン 1 枚の操作（MCP の `reattach` と同じ要求）
         Command::Persist(args) if args.state.as_deref() == Some("reattach") => {
@@ -10467,6 +10565,7 @@ fn print_result(command: &Command, result: &Value) {
         }
         // #813: 状態（stop / resume_at / attempts）が入れ子なので整形して出す
         Command::LimitResume(_) => println!("{}", pretty_json(result)),
+        Command::Mod(args) => print_mod(args, result),
         Command::Git(GitCommand::Log { .. })
         | Command::Git(GitCommand::Diff { .. })
         | Command::Git(GitCommand::Show { .. })

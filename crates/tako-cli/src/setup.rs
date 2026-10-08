@@ -2976,6 +2976,10 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     }
     remaining.extend(shell_integration.remaining);
 
+    // tako mod（Claude Code の mod。FR-2.42 / #1879）の展開。GUI 起動時と同じ 1 実装で、
+    // tako の data dir に置くだけ（Claude Code の設定ファイルは書かない）。止めない
+    eprintln!("{}", tako_control::claude_mod::run_setup_stage());
+
     // ゼロスタート導入（#868）。導入済みなら何も出さずに素通りする＝従来の検出型と同じ体験。
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
     let bootstrap = run_bootstrap_stage(assume_yes);

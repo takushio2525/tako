@@ -67,6 +67,8 @@ pub fn tmux_binary_present() -> bool {
 /// - `update-environment`: 再 attach 時にセッション環境の TAKO_SOCKET / TAKO_TOKEN /
 ///   TAKO_MCP_URL を新インスタンスの値へ更新する（既存プロセスには届かないが、
 ///   それは CLI の control.json フォールバック = FR-2.2.9 が吸収する）。
+///   tako mod（#1879）の CLAUDE_CODE_PLUGIN_DIRS / TAKO_CLI も同じく新インスタンスの値へ寄せる
+///   （展開先と CLI の置き場はインスタンスごとに違いうる）。
 ///   TAKO_PANE_ID / TAKO_TAB_ID はペイン固有の値のため update-environment には入れず、
 ///   `wrap_options` で `new-session -e` により各セッションに直接注入する
 /// - `copy-mode-position-format ''`: copy-mode（ホイールスクロール）右上の
@@ -169,7 +171,7 @@ const DIRECTIVES: &[Directive] = &[
     },
     Directive {
         needs: None,
-        line: "set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'",
+        line: "set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI'",
     },
     Directive {
         needs: Some(Need::SuppressesCopyModeIndicator),
@@ -1343,7 +1345,7 @@ set -s escape-time 10
 set -s extended-keys always
 set -sq extended-keys-format csi-u
 set -as terminal-features 'xterm*:extkeys:RGB'
-set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'
+set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI'
 set -gq copy-mode-position-format ''
 ";
 

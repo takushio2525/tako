@@ -88,7 +88,7 @@ set -g warm off
 set -g allow-passthrough on
 set -g focus-events on
 set -g set-clipboard on
-set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'
+set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI'
 ";
 
 pub struct PsmuxBackend {

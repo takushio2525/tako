@@ -1876,6 +1876,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<u64>,
     },
+    /// tako mod（Claude Code の mod 連携。FR-2.42 / Issue #1879）。
+    /// `action` = "status"（既定）/ "on" / "off" / "report"。
+    ///
+    /// `report` は mod が `tako mod report`（stdin の JSON）から送る状態報告で、`report` に
+    /// 報告本体、`pane` に送り主（CLI が `TAKO_PANE_ID` から埋める）が入る。
+    /// **MCP には載せない**（AI が叩くと自分の状態を偽れるだけ。理由は FR-2.42）
+    Mod {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+    },
     /// シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除（Issue #525 / #467）。
     /// `action` = "status"（既定）/ "install" / "uninstall"。
     ///
@@ -2663,6 +2677,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::Scrollback { .. }
         | Request::SleepGuard { .. }
         | Request::ShellIntegration { .. }
+        | Request::Mod { .. }
         | Request::RunnerDefaults { .. }
         | Request::Migrate { .. }
         | Request::ConfigShare { .. }

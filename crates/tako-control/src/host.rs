@@ -1302,6 +1302,19 @@ pub trait SystemHost {
     fn set_lsp_format_on_save(&mut self, _enabled: bool) -> Result<(), String> {
         Err("保存時整形の設定は未対応".into())
     }
+    /// tako mod（FR-2.42 / #1879）の状態。GUI のメモリだけに置く（永続化しない）。
+    /// `None` = mod を扱わない（2 つ目のインスタンス・テストのホスト）
+    fn claude_mod(&self) -> Option<&tako_core::claude_mod::ModHub> {
+        None
+    }
+    /// 同上の書き込み口（報告の受け取り）
+    fn claude_mod_mut(&mut self) -> Option<&mut tako_core::claude_mod::ModHub> {
+        None
+    }
+    /// 設定 `claude_mod` の切替（`tako mod on|off`）。settings.json への永続化は実装側の責務
+    fn set_claude_mod_enabled(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("この tako は mod を扱わない".into())
+    }
     /// ライブペインの現行ログファイル（Issue #112 B。クローズ済みペインは
     /// `pane_log::latest_for_pane` のファイル名検索にフォールバックする）
     fn pane_log_file(&self, _pane: PaneId) -> Option<std::path::PathBuf> {
