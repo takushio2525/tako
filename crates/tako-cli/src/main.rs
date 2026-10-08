@@ -1274,6 +1274,19 @@ enum TreeCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// ファイルツリーで選んでいる行を読む・選ぶ・キーと同じに動かす（#1908）。
+    /// 引数無し = いまの選択を表示 / <path> = その行だけを選ぶ（開かない）/
+    /// --key = 選んでいる行の上でそのキーを押したのと同じ（画面のキーと同じ dispatch を通る）
+    Selection {
+        /// 選ぶ行（ツリーに見えている行。CLI の cwd 基準で絶対化する）
+        path: Option<String>,
+        /// up / down / left / right / enter / extend_up / extend_down / extend_top / extend_bottom
+        #[arg(long, conflicts_with = "path")]
+        key: Option<String>,
+        /// アクティブタブの ID（照合だけ。ツリーはアクティブタブのものだけを出す）
+        #[arg(long)]
+        tab: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -9000,6 +9013,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 tab: *tab,
                 pane: caller_pane(),
                 limit: *limit,
+            },
+            // #1908: MCP `tako_tree_folder` の `action=selection` と同じ要求
+            TreeCommand::Selection { path, key, tab } => Request::TreeSelection {
+                path: path.as_deref().map(resolve_cli_path),
+                key: key.clone(),
+                tab: *tab,
             },
         },
         Command::Sessions(sub) => match sub {

@@ -10,6 +10,9 @@
 //! - ⌘⇧クリック = 起点からその行までを今の選択へ足す（[`ClickKind::RangeAdd`]）
 //! - ⇧↑ / ⇧↓ = 最後に押した行の 1 行上 / 下を ⇧クリックしたのと同じ（[`extend`]。#1895。
 //!   起点は動かないので、伸ばしてから逆へ打つと縮む = Finder / VS Code と同じ）
+//! - ↑ / ↓ = 選んだ行を 1 行動かす・← / → = 畳む・親へ / 開く・最初の子へ・Enter = 素の押下と
+//!   同じ・⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）= 端まで範囲を伸ばす（[`on_key`]。
+//!   #1908。画面のキーも CLI / MCP の `key` もこの 1 本を通る）
 //!
 //! まとめて扱う操作（コピー・切り取り・ごみ箱・移動）は、フォルダとその配下を同時に
 //! 選んでいたら配下を外して親だけを扱う（[`distinct_roots`]。VS Code の `distinctParents`
@@ -208,6 +211,185 @@ pub fn extend(prev: &Selection, step: Step, order: &[PathBuf]) -> Selection {
         return prev.clone();
     };
     apply(Some(prev), &order[next], ClickKind::Range, order).unwrap_or_else(|| prev.clone())
+}
+
+/// ⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）の後の選択（#1908）。先頭 / 末尾の行を
+/// ⇧クリックしたのと同じ = 起点から端までを選ぶ（起点は動かない）。
+///
+/// 最後に押した行が見えていなければ何も変えない（[`extend`] と同じ。どこから伸ばしたのか
+/// 決まらない）。行が無ければ何も変えない
+pub fn extend_to_edge(prev: &Selection, step: Step, order: &[PathBuf]) -> Selection {
+    if !order.contains(&prev.lead) {
+        return prev.clone();
+    }
+    let edge = match step {
+        Step::Up => order.first(),
+        Step::Down => order.last(),
+    };
+    let Some(edge) = edge else {
+        return prev.clone();
+    };
+    apply(Some(prev), edge, ClickKind::Range, order).unwrap_or_else(|| prev.clone())
+}
+
+/// ツリーの行の形（キーの判定に要るものだけ。#1908）。並びは画面の上から順で、
+/// リモート（SSH）の行と説明行は載せない（[`Selection`] の `order` と同じ行）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowShape {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    /// フォルダが開いている（ファイルは常に偽）
+    pub expanded: bool,
+    /// ワークスペースのフォルダの見出し（← で親へ上がらない）
+    pub root: bool,
+}
+
+/// 選んでいる行の上で押すキー（#1895 / #1908）。CLI / MCP の `key` の語彙も同じ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// ↑: 1 行上の行だけを選ぶ
+    Up,
+    /// ↓: 1 行下の行だけを選ぶ
+    Down,
+    /// ←: 開いたフォルダを畳む / それ以外は親のフォルダへ
+    Left,
+    /// →: 畳んだフォルダを開く / 開いたフォルダは最初の子へ
+    Right,
+    /// Enter: 素の押下と同じ（ファイルは開く・フォルダは開閉）
+    Enter,
+    /// ⇧↑ / ⇧↓: 範囲を 1 行伸ばす / 縮める（#1895）
+    ExtendUp,
+    ExtendDown,
+    /// ⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）: 端まで範囲を伸ばす
+    ExtendTop,
+    ExtendBottom,
+}
+
+impl Key {
+    pub const ALL: [Key; 9] = [
+        Key::Up,
+        Key::Down,
+        Key::Left,
+        Key::Right,
+        Key::Enter,
+        Key::ExtendUp,
+        Key::ExtendDown,
+        Key::ExtendTop,
+        Key::ExtendBottom,
+    ];
+
+    /// CLI / MCP の `key` の名前
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Key::Up => "up",
+            Key::Down => "down",
+            Key::Left => "left",
+            Key::Right => "right",
+            Key::Enter => "enter",
+            Key::ExtendUp => "extend_up",
+            Key::ExtendDown => "extend_down",
+            Key::ExtendTop => "extend_top",
+            Key::ExtendBottom => "extend_bottom",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Key> {
+        Key::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+}
+
+/// キーを押した結果（#1908）。状態遷移の正本はここで、画面と CLI / MCP（dispatch）は
+/// 結果を当てるだけ
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyOutcome {
+    /// 選択がこうなる（端・見えない行・何も起きないキーは `prev` のまま）
+    Select(Selection),
+    /// フォルダを開く / 畳む（← / → / フォルダの上の Enter）。選択はそのフォルダ 1 行
+    Expand {
+        dir: PathBuf,
+        expanded: bool,
+        selection: Selection,
+    },
+    /// ファイルを開く（ファイルの上の Enter = 素の押下と同じ）。選択はその行 1 行
+    Open { file: PathBuf, selection: Selection },
+}
+
+/// 選んでいる行の上でキーを押した結果（#1908）。`rows` = いま見えている行（上から順）。
+///
+/// 最後に押した行（`lead`）が見えていなければ（畳んだフォルダの中・消えた行）どのキーも
+/// 何も変えない（どこから動くのか決まらない = [`extend`] と同じ）。↑ / ↓ は端で止まり
+/// （折り返さない）、複数選んでいても動いた先の 1 行だけになる（VS Code と同じ）。
+/// ← は開いたフォルダなら畳み、それ以外（ファイル・畳んだフォルダ）は親のフォルダの行へ
+/// （見出しは上がらない）。→ は畳んだフォルダなら開き、開いたフォルダなら最初の子へ
+/// （空のフォルダ・ファイルは何もしない）
+pub fn on_key(prev: &Selection, key: Key, rows: &[RowShape]) -> KeyOutcome {
+    let order: Vec<PathBuf> = rows.iter().map(|r| r.path.clone()).collect();
+    let unchanged = || KeyOutcome::Select(prev.clone());
+    match key {
+        Key::ExtendUp => return KeyOutcome::Select(extend(prev, Step::Up, &order)),
+        Key::ExtendDown => return KeyOutcome::Select(extend(prev, Step::Down, &order)),
+        Key::ExtendTop => return KeyOutcome::Select(extend_to_edge(prev, Step::Up, &order)),
+        Key::ExtendBottom => {
+            return KeyOutcome::Select(extend_to_edge(prev, Step::Down, &order));
+        }
+        _ => {}
+    }
+    let Some(at) = rows.iter().position(|r| r.path == prev.lead) else {
+        return unchanged();
+    };
+    let row = &rows[at];
+    let only = |path: &Path| KeyOutcome::Select(Selection::single(path));
+    match key {
+        Key::Up => match at.checked_sub(1) {
+            Some(i) => only(&rows[i].path),
+            None => unchanged(),
+        },
+        Key::Down => match rows.get(at + 1) {
+            Some(next) => only(&next.path),
+            None => unchanged(),
+        },
+        Key::Left if row.is_dir && row.expanded => KeyOutcome::Expand {
+            dir: row.path.clone(),
+            expanded: false,
+            selection: Selection::single(&row.path),
+        },
+        Key::Left => {
+            if row.root {
+                return unchanged();
+            }
+            // 親は自分より上にある（同じパスが 2 か所に出ても、いま居る側の親を選ぶ）
+            let parent = row.path.parent();
+            match rows[..at]
+                .iter()
+                .rev()
+                .find(|r| Some(r.path.as_path()) == parent)
+            {
+                Some(p) => only(&p.path),
+                None => unchanged(),
+            }
+        }
+        Key::Right if row.is_dir && !row.expanded => KeyOutcome::Expand {
+            dir: row.path.clone(),
+            expanded: true,
+            selection: Selection::single(&row.path),
+        },
+        Key::Right => match rows.get(at + 1) {
+            Some(child) if row.is_dir && child.path.parent() == Some(row.path.as_path()) => {
+                only(&child.path)
+            }
+            _ => unchanged(),
+        },
+        Key::Enter if row.is_dir => KeyOutcome::Expand {
+            dir: row.path.clone(),
+            expanded: !row.expanded,
+            selection: Selection::single(&row.path),
+        },
+        Key::Enter => KeyOutcome::Open {
+            file: row.path.clone(),
+            selection: Selection::single(&row.path),
+        },
+        Key::ExtendUp | Key::ExtendDown | Key::ExtendTop | Key::ExtendBottom => unchanged(),
+    }
 }
 
 /// `from` から `to` までの行（両端を含む・上から順）。どちらかが見えていなければ None
@@ -440,6 +622,191 @@ mod tests {
         let sel = apply(sel.as_ref(), &p("/w/a"), ClickKind::Toggle, &o).unwrap();
         let sel = extend(&sel, Step::Down, &o);
         assert_eq!(sel.items, vec![p("/w/a"), p("/w/d")]);
+    }
+
+    /// `order()` の行の形（/w と /w/d は開いている・/w/e は畳んだフォルダ）
+    fn shapes() -> Vec<RowShape> {
+        let dirs = ["/w", "/w/d", "/w/e"];
+        let open = ["/w", "/w/d"];
+        order()
+            .into_iter()
+            .map(|path| RowShape {
+                is_dir: dirs.iter().any(|d| path == Path::new(d)),
+                expanded: open.iter().any(|d| path == Path::new(d)),
+                root: path == Path::new("/w"),
+                path,
+            })
+            .collect()
+    }
+
+    fn pressed(sel: &Selection, key: Key) -> Selection {
+        match on_key(sel, key, &shapes()) {
+            KeyOutcome::Select(s) => s,
+            other => panic!("選択だけが変わるはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 矢印は1行ずつ動き端で止まり複数選んでいても1行になる() {
+        let o = order();
+        let a = Selection::single(&p("/w/a"));
+        assert_eq!(pressed(&a, Key::Down), Selection::single(&p("/w/d")));
+        assert_eq!(pressed(&a, Key::Up), Selection::single(&p("/w")));
+        // 端では何も変えない（折り返さない）
+        let top = Selection::single(&p("/w"));
+        assert_eq!(pressed(&top, Key::Up), top);
+        let bottom = Selection::single(&p("/w/e"));
+        assert_eq!(pressed(&bottom, Key::Down), bottom);
+        // ⇧で伸ばした範囲の上で ↓ = 最後に押した行の下の 1 行だけ
+        let range = extend(&extend(&a, Step::Down, &o), Step::Down, &o);
+        assert_eq!(range.items.len(), 3);
+        assert_eq!(pressed(&range, Key::Down), Selection::single(&p("/w/d/y")));
+        // 最後に押した行が見えていない（畳んだフォルダの中）= どのキーも何も変えない
+        let hidden = Selection::single(&p("/w/d/x"));
+        let folded: Vec<RowShape> = shapes()
+            .into_iter()
+            .filter(|r| !r.path.starts_with("/w/d/"))
+            .collect();
+        for key in Key::ALL {
+            assert_eq!(
+                on_key(&hidden, key, &folded),
+                KeyOutcome::Select(hidden.clone()),
+                "{key:?}"
+            );
+        }
+        // 行が 1 つも無い
+        for key in Key::ALL {
+            assert_eq!(
+                on_key(&a, key, &[]),
+                KeyOutcome::Select(a.clone()),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 左右は畳んで親へ上がり開いて最初の子へ下りる() {
+        // 開いたフォルダの ← = 畳む
+        let d = Selection::single(&p("/w/d"));
+        assert_eq!(
+            on_key(&d, Key::Left, &shapes()),
+            KeyOutcome::Expand {
+                dir: p("/w/d"),
+                expanded: false,
+                selection: d.clone()
+            }
+        );
+        // ファイルの ← = 親のフォルダへ
+        let x = Selection::single(&p("/w/d/x"));
+        assert_eq!(pressed(&x, Key::Left), d);
+        assert_eq!(
+            pressed(&Selection::single(&p("/w/a")), Key::Left),
+            Selection::single(&p("/w"))
+        );
+        // 畳んだフォルダの ← も親へ。見出しの ← は畳むだけで上がらない
+        assert_eq!(
+            pressed(&Selection::single(&p("/w/e")), Key::Left),
+            Selection::single(&p("/w"))
+        );
+        let mut folded_root = shapes();
+        folded_root[0].expanded = false;
+        let root = Selection::single(&p("/w"));
+        assert_eq!(
+            on_key(&root, Key::Left, &folded_root[..1]),
+            KeyOutcome::Select(root.clone())
+        );
+        // 畳んだフォルダの → = 開く / 開いたフォルダの → = 最初の子へ
+        let e = Selection::single(&p("/w/e"));
+        assert_eq!(
+            on_key(&e, Key::Right, &shapes()),
+            KeyOutcome::Expand {
+                dir: p("/w/e"),
+                expanded: true,
+                selection: e.clone()
+            }
+        );
+        assert_eq!(pressed(&d, Key::Right), x);
+        // 開いているのに子が無い（空のフォルダ）・ファイルの → は何もしない
+        let mut empty = shapes();
+        empty[5].expanded = true;
+        assert_eq!(
+            on_key(&e, Key::Right, &empty),
+            KeyOutcome::Select(e.clone())
+        );
+        assert_eq!(pressed(&x, Key::Right), x);
+    }
+
+    #[test]
+    fn エンターは素の押下と同じでファイルは開きフォルダは開閉する() {
+        let a = Selection::single(&p("/w/a"));
+        assert_eq!(
+            on_key(&a, Key::Enter, &shapes()),
+            KeyOutcome::Open {
+                file: p("/w/a"),
+                selection: a.clone()
+            }
+        );
+        for (dir, expanded) in [("/w/d", false), ("/w/e", true)] {
+            let sel = Selection::single(&p(dir));
+            assert_eq!(
+                on_key(&sel, Key::Enter, &shapes()),
+                KeyOutcome::Expand {
+                    dir: p(dir),
+                    expanded,
+                    selection: sel.clone()
+                }
+            );
+        }
+        // 複数選んでいても最後に押した行だけ（素の押下と同じ）
+        let o = order();
+        let range = extend(&a, Step::Down, &o);
+        assert!(matches!(
+            on_key(&range, Key::Enter, &shapes()),
+            KeyOutcome::Expand { ref dir, .. } if *dir == p("/w/d")
+        ));
+    }
+
+    #[test]
+    fn 端までの範囲は起点を動かさず逆へ打つと縮む() {
+        let o = order();
+        let a = Selection::single(&p("/w/d"));
+        let bottom = pressed(&a, Key::ExtendBottom);
+        assert_eq!(
+            bottom.items,
+            vec![p("/w/d"), p("/w/d/x"), p("/w/d/y"), p("/w/e")]
+        );
+        assert_eq!(
+            (bottom.anchor.clone(), bottom.lead.clone()),
+            (p("/w/d"), p("/w/e"))
+        );
+        // 起点は動かない: 続けて端の上まで = 起点から先頭まで
+        let top = pressed(&bottom, Key::ExtendTop);
+        assert_eq!(top.items, vec![p("/w"), p("/w/a"), p("/w/d")]);
+        // ⇧↓ で縮む
+        assert_eq!(
+            extend(&top, Step::Down, &o).items,
+            vec![p("/w/a"), p("/w/d")]
+        );
+        // もう端に居る / 見えない行からは伸ばさない
+        assert_eq!(pressed(&bottom, Key::ExtendBottom), bottom);
+        let hidden = Selection::single(&p("/w/d/x"));
+        let folded: Vec<PathBuf> = ["/w", "/w/a", "/w/d", "/w/e"].into_iter().map(p).collect();
+        assert_eq!(extend_to_edge(&hidden, Step::Up, &folded), hidden);
+        // 起点が畳んだフォルダの中 = ⇧クリックと同じく端の 1 行だけ（起点も付け替える）
+        let mut sel = Selection::single(&p("/w/d/x"));
+        sel.lead = p("/w/a");
+        sel.items = vec![p("/w/a")];
+        let edge = extend_to_edge(&sel, Step::Down, &folded);
+        assert_eq!(edge, Selection::single(&p("/w/e")));
+    }
+
+    #[test]
+    fn キーの名前はcliとmcpの語彙で往復する() {
+        for key in Key::ALL {
+            assert_eq!(Key::parse(key.as_str()), Some(key));
+        }
+        assert_eq!(Key::parse("extend-up"), None, "語彙は 1 つ（_ 区切り）");
+        assert_eq!(Key::parse(""), None);
     }
 
     #[test]

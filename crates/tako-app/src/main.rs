@@ -23160,6 +23160,28 @@ impl UiStateHost for TakoApp {
         self.sync_filetree_roots();
     }
 
+    // --- ファイルツリーの選択（FR-3.40 / #1908。本体は sidebar.rs） ----------------
+
+    fn tree_rows(&mut self) -> Vec<tako_core::tree_select::RowShape> {
+        self.host_tree_rows()
+    }
+
+    fn tree_selection(&self) -> Option<(tako_core::tree_select::Selection, bool)> {
+        self.active_tree_selection()
+            .map(|sel| (sel.as_core(), sel.remote))
+    }
+
+    fn set_tree_selection(
+        &mut self,
+        selection: tako_core::tree_select::Selection,
+    ) -> Result<(), String> {
+        self.host_set_tree_selection(selection)
+    }
+
+    fn set_tree_expanded(&mut self, dir: &std::path::Path, expanded: bool) {
+        self.host_set_tree_expanded(dir, expanded);
+    }
+
     // --- リモート（SSH 先）のフォルダ（#919 / #65） ---------------------------
 
     fn request_remote_dir(&mut self, remote: &tako_core::remote_fs::RemoteRef) {
@@ -28747,6 +28769,11 @@ mod self_test {
     mod hover_1893;
     #[cfg(feature = "visual-test")]
     use hover_1893::{hover_1893_visual, hover_loading_real_visual, hover_loading_visual};
+    /// #1908: ↑ / ↓ / ← / → / Enter / ⇧⌘↑ / ⇧⌘↓・残り時間の数え下ろし（visual-test `tree-keys`）
+    #[cfg(feature = "visual-test")]
+    mod tree_keys;
+    #[cfg(feature = "visual-test")]
+    use tree_keys::tree_keys_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -43107,6 +43134,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1908: ↑ / ↓ / ← / → / Enter / ⇧⌘↑ / ⇧⌘↓・残り時間の数え下ろし
+                "tree-keys" => {
+                    tree_keys_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -43117,7 +43150,7 @@ mod self_test {
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / tree-multiselect / tree-keyboard-copy / completion / completion-real / lsp-context-menu / \
+                         tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real）"
                     );
@@ -45510,6 +45543,7 @@ mod self_test {
             tree_clipboard_visual(any, window, cx).await;
             tree_multiselect_visual(any, window, cx).await;
             tree_keyboard_copy_visual(any, window, cx).await;
+            tree_keys_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）

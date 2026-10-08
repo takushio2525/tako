@@ -3339,14 +3339,20 @@ pub fn tools() -> Vec<Value> {
                 git-status: ツリーの色とバッジの git 状態をそのまま返す。entries[] の state は modified / \
                 added / deleted / renamed / untracked / conflicted / ignored、staged / unstaged は git の XY\
                 （`git status --short` と同じ記号）、propagated=true はディレクトリ行（changed は配下の変更\
-                ファイル数）。「未コミットのファイルは？」には git を叩き直さずここから答えられる。",
+                ファイル数）。「未コミットのファイルは？」には git を叩き直さずここから答えられる。\
+                selection: ユーザーがツリーで選んでいる行を読む / path の行を選ぶ / key を押したのと同じに動かす。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "remove", "list", "git-status"],
+                        "enum": ["add", "remove", "list", "git-status", "selection"],
                         "description": "操作（list = 追加済み一覧）"
+                    },
+                    "key": {
+                        "type": "string",
+                        "enum": ["up", "down", "left", "right", "enter", "extend_up", "extend_down", "extend_top", "extend_bottom"],
+                        "description": "selection: left / right = 畳む・親へ / 開く・子へ、enter = 開く、extend_* = 範囲（top / bottom = 端まで）"
                     },
                     "path": {
                         "type": "string",

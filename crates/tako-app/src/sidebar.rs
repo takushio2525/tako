@@ -247,7 +247,7 @@ impl TreeSelection {
         self.paths.len() > 1
     }
 
-    fn as_core(&self) -> tako_core::tree_select::Selection {
+    pub(crate) fn as_core(&self) -> tako_core::tree_select::Selection {
         tako_core::tree_select::Selection {
             items: self.paths.clone(),
             anchor: self.anchor.clone(),
@@ -279,9 +279,20 @@ pub(crate) const COPY_ETA_PROBE: &str = "<copy-eta>";
 
 /// いま見えているローカルの行の並び（⇧クリックの範囲・見えない行を外す基準。#1867）
 pub(crate) fn tree_visible_order(rows: &[filetree::Row]) -> Vec<std::path::PathBuf> {
+    tree_row_shapes(rows).into_iter().map(|r| r.path).collect()
+}
+
+/// いま見えているローカルの行の形（キーでの選択 = `tako_core::tree_select::on_key` の材料。
+/// [`tree_visible_order`] と同じ行 = リモート（SSH）の行と説明行は載せない。#1908）
+pub(crate) fn tree_row_shapes(rows: &[filetree::Row]) -> Vec<tako_core::tree_select::RowShape> {
     rows.iter()
         .filter(|r| r.remote.is_none() && r.note.is_none())
-        .map(|r| r.entry.path.clone())
+        .map(|r| tako_core::tree_select::RowShape {
+            path: r.entry.path.clone(),
+            is_dir: r.entry.is_dir,
+            expanded: r.expanded,
+            root: r.root,
+        })
         .collect()
 }
 
@@ -3832,8 +3843,9 @@ impl TakoApp {
             cx.notify();
             return true;
         }
-        // #1895: ⇧↑ / ⇧↓ で範囲を伸ばす・⌘⌫（Windows は Delete）でごみ箱へ。A/B
-        // （`TAKO_1895_LEGACY=1`）では受けない = #1895 の前と同じくペインへ流れる
+        // #1895: ⇧↑ / ⇧↓ で範囲を伸ばす・⌘⌫（Windows は Delete）でごみ箱へ。#1908: ↑ / ↓ /
+        // ← / → / Enter / ⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）。A/B
+        // （`TAKO_1895_LEGACY=1` / `TAKO_1908_LEGACY=1`）では受けない = その前と同じくペインへ流れる
         if let Some(key) = tako_core::platform::keys::tree_select_key(
             tako_core::platform::support::Platform::current(),
             &ks.key,
@@ -3842,7 +3854,9 @@ impl TakoApp {
             m.alt,
             m.shift,
         ) {
-            if tako_core::file_copy::legacy_1895() {
+            if tako_core::file_copy::legacy_1895()
+                || (key.since_1908() && tako_core::file_copy::legacy_1908())
+            {
                 return false;
             }
             self.tree_select_key_action(key, &sel, cx);
@@ -4205,44 +4219,101 @@ impl TakoApp {
         }
     }
 
-    // --- キーでの範囲選択・ごみ箱（FR-3.39 / #1895） ---------------------------------------
+    // --- キーでの選択・範囲選択・ごみ箱（FR-3.39 / #1895・FR-3.40 / #1908） ---------------
 
-    /// ⇧↑ / ⇧↓ / ⌘⌫（Windows は Delete）。選んでいる間だけ `handle_tree_clip_keystroke` から来る
+    /// ↑ / ↓ / ← / → / Enter / ⇧↑ / ⇧↓ / ⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）/
+    /// ⌘⌫（Windows は Delete）。選んでいる間だけ `handle_tree_clip_keystroke` から来る
     pub(crate) fn tree_select_key_action(
         &mut self,
         key: tako_core::platform::keys::TreeSelectKey,
         sel: &TreeSelection,
         cx: &mut Context<Self>,
     ) {
-        use tako_core::platform::keys::TreeSelectKey;
         // 右クリックメニューを開いたままキーで操作したときもメニューは畳む
         self.context_menu = None;
-        let step = match key {
-            TreeSelectKey::ExtendUp => tako_core::tree_select::Step::Up,
-            TreeSelectKey::ExtendDown => tako_core::tree_select::Step::Down,
-            TreeSelectKey::Trash => {
-                self.trash_tree_selection(sel, cx);
-                cx.notify();
-                return;
-            }
+        let Some(select) = key.select_key() else {
+            self.trash_tree_selection(sel, cx);
+            cx.notify();
+            return;
         };
-        // リモート（SSH）の行は範囲の並び（ローカルの見えている行）に載らない = 伸ばさない
-        if !sel.remote {
-            let rows = self.filetree.rows();
-            let order = tree_visible_order(&rows);
-            // 状態遷移と範囲の正本は core（⇧クリックと同じ `apply` を 1 行上 / 下で呼ぶ）
-            let next = tako_core::tree_select::extend(&sel.as_core(), step, &order);
-            let lead = next.lead.clone();
-            self.tree_selection = Some(self.tree_selection_of(next, &rows));
-            // 伸ばした先の行を見えるところへ（ツリーの子 = 行の並びの添字）
-            if let Some(index) = rows
-                .iter()
-                .position(|r| r.remote.is_none() && r.entry.path == lead)
-            {
-                self.filetree_scroll_handle.scroll_to_item(index);
+        // 状態遷移の正本は core（`tree_select::on_key`。⇧↑ / ⇧↓ は ⇧クリックと同じ `apply` を
+        // 1 行上 / 下で呼ぶ `extend`）で、CLI `tako tree selection --key` / MCP `tako_tree_folder`
+        // の `selection` と同じ dispatch を通す（画面だけの経路を作らない。リモート（SSH）の行は
+        // dispatch が動かさない = #1895 と同じ）
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::TreeSelection {
+                path: None,
+                key: Some(select.as_str().to_string()),
+                tab: None,
+            },
+            PaneOrigin::User,
+        );
+        match result {
+            Ok(value) => {
+                if value.get("opened").is_some() {
+                    // 行を押して開いたときと同じ後始末（`open_file_row`）
+                    self.drain_pending_highlights(cx);
+                }
+            }
+            Err(e) if select == tako_core::tree_select::Key::Enter => {
+                // 行を押して開けなかったときと同じ文言（#1283 / #1399）
+                let target = sel.path.display().to_string();
+                self.notify_tree_open_failed("open-file", &target, &e.to_string());
+            }
+            Err(e) => {
+                let target = sel.path.display().to_string();
+                self.notify_tree_dispatch_failed(
+                    crate::ui_text::sidebar::tree_key_op(),
+                    Some(&target),
+                    &e,
+                );
             }
         }
         cx.notify();
+    }
+
+    /// host のプリミティブ（#1908）: いま見えているローカルの行の形（ツリーが閉じていれば空）
+    pub(crate) fn host_tree_rows(&mut self) -> Vec<tako_core::tree_select::RowShape> {
+        if !self.filetree.visible {
+            return Vec::new();
+        }
+        tree_row_shapes(&self.filetree.rows())
+    }
+
+    /// host のプリミティブ（#1908）: 選択を置き換えて、最後に押した行を見えるところへ
+    pub(crate) fn host_set_tree_selection(
+        &mut self,
+        sel: tako_core::tree_select::Selection,
+    ) -> Result<(), String> {
+        if !self.filetree.visible {
+            return Err("ファイルツリーが閉じている".into());
+        }
+        let rows = self.filetree.rows();
+        let lead = sel.lead.clone();
+        self.tree_selection = Some(self.tree_selection_of(sel, &rows));
+        // 動いた先の行を見えるところへ（ツリーの子 = 行の並びの添字）
+        if let Some(index) = rows
+            .iter()
+            .position(|r| r.remote.is_none() && r.entry.path == lead)
+        {
+            self.filetree_scroll_handle.scroll_to_item(index);
+        }
+        Ok(())
+    }
+
+    /// host のプリミティブ（#1908）: フォルダの行を開く / 畳む（行を押したのと同じ開閉）
+    pub(crate) fn host_set_tree_expanded(&mut self, dir: &std::path::Path, expanded: bool) {
+        let open = self
+            .filetree
+            .rows()
+            .iter()
+            .any(|r| r.remote.is_none() && r.entry.path == dir && r.expanded);
+        if expanded && !open {
+            self.filetree.expand_dir(dir);
+        } else if !expanded && open {
+            self.filetree.toggle_dir(dir);
+        }
     }
 
     /// ⌘⌫（Windows は Delete）: 選んでいるもの（見えている行だけ）をごみ箱へ。リモートと

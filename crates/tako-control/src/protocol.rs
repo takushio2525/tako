@@ -1977,6 +1977,21 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
+    /// ファイルツリーの選択を読む・選ぶ・キーと同じ操作をする（FR-3.40 / #1908）。
+    ///
+    /// どちらも省略 = いま効いている選択を返す（何も変えない）/ `path` = その行だけを選ぶ
+    /// （行を押したのと同じ。開かない）/ `key` = 選んでいる行の上でそのキーを押したのと同じ
+    /// （`tako_core::tree_select::Key` の名前。画面の ↑ / ↓ / ← / → / Enter / ⇧↑ / ⇧↓ /
+    /// ⇧⌘↑ / ⇧⌘↓ もここを通る）。ツリーはアクティブタブのものだけ（`tab` は照合だけ）。
+    /// CLI `tako tree selection [<path>] [--key K]` / MCP `tako_tree_folder` の `action=selection`
+    TreeSelection {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<u64>,
+    },
     /// セッションカタログの参照と復元（Issue #112 A）。
     /// `action`:
     /// - "list": カタログ一覧（`role` / `project` で絞り込み、`limit` 件まで）
@@ -2531,6 +2546,9 @@ pub fn changes_layout(request: &Request) -> bool {
         // タブとペインを作る**ので真。ここを一律で偽にすると、起動した master の
         // ペインへ winsize が渡らない（#1370 がこの操作で再発する）
         Request::UserTask { action, .. } => action == "respond",
+        // ファイルツリーの選択（#1908）。読むだけ・行を選ぶだけは偽、キーは Enter でファイルを
+        // 開く（ペインが生える）ので真（← / → の開閉は払うのが 1 フレームだけ）
+        Request::TreeSelection { key, .. } => key.is_some(),
         // --- ペインの木・寸法そのもの ---
         Request::Split { .. }
         | Request::Close { .. }

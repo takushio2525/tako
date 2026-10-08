@@ -740,6 +740,17 @@ tako tree git-status --limit 50
 - `staged` / `unstaged` — git の XY（`git status --short` と同じ記号）。ステージ済みと未ステージを分けて持ちます
 - `propagated` — `true` ならディレクトリ行で、`changed` が配下の変更ファイル数です
 
+`selection` で、ユーザーがファイルツリーで選んでいる行を読み、選び、キーと同じに動かせます（画面のキーと同じ処理を通ります）。
+
+```bash
+tako tree selection                       # いま選んでいる行（paths / lead / anchor）
+tako tree selection src/main.rs           # その行だけを選ぶ（開かない。ツリーに見えている行だけ）
+tako tree selection --key down            # ↓ を押したのと同じ
+tako tree selection --key extend_bottom   # ⇧⌘↓（Windows は Shift+Ctrl+End）と同じ = 末尾まで伸ばす
+```
+
+`--key` は `up` / `down` / `left` / `right` / `enter` / `extend_up` / `extend_down` / `extend_top` / `extend_bottom` です。応答の `changed` は選択・開閉・開いたかどうか、`expanded` はフォルダを開閉したとき、`opened` はファイルを開いたときに載ります。
+
 ### tako video
 
 プレビューペインで動画を開いているときの再生操作です。

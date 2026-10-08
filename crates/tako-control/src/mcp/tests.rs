@@ -2,6 +2,48 @@
 mod tests {
     use super::*;
 
+    /// #1908: `tako_tree_folder` の `selection` はツリーの選択の要求（CLI `tako tree selection`
+    /// と同じ）になり、ほかの action はこれまでどおり `TreeFolder`
+    #[test]
+    fn tako_tree_folder_の_selection_はツリーの選択の要求になる() {
+        assert_eq!(
+            build_request(
+                "tako_tree_folder",
+                &json!({"action": "selection", "key": "extend_bottom"}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::TreeSelection {
+                path: None,
+                key: Some("extend_bottom".into()),
+                tab: None,
+            }
+        );
+        assert_eq!(
+            build_request(
+                "tako_tree_folder",
+                &json!({"action": "selection", "path": "/w/a", "tab": 3}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::TreeSelection {
+                path: Some("/w/a".into()),
+                key: None,
+                tab: Some(3),
+            }
+        );
+        assert!(matches!(
+            build_request("tako_tree_folder", &json!({"action": "list"}), None, None).unwrap(),
+            Request::TreeFolder { .. }
+        ));
+        assert!(
+            validate_known_params("tako_tree_folder", &json!({"action": "selection", "key": "up"}))
+                .is_ok()
+        );
+    }
+
     /// #1867: `tako_file_op` の `paths` はまとめた要求（ツリーの複数選択と同じ 1 要求）になり、
     /// 進み具合・取り消しはパスを取らない。`path` も `paths` も無ければ断る
     #[test]

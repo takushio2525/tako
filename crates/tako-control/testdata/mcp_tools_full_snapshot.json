@@ -4217,7 +4217,7 @@
     "name": "tako_agents_sync_rules"
   },
   {
-    "description": "ファイルツリーへのフォルダの追加・削除・一覧と git ステータスの取得（タブ単位・永続化される）。プロジェクトの指示を受けたらそのルートを追加し、作業対象外になったら削除する。git-status: ツリーの色とバッジの git 状態をそのまま返す。entries[] の state は modified / added / deleted / renamed / untracked / conflicted / ignored、staged / unstaged は git の XY（`git status --short` と同じ記号）、propagated=true はディレクトリ行（changed は配下の変更ファイル数）。「未コミットのファイルは？」には git を叩き直さずここから答えられる。",
+    "description": "ファイルツリーへのフォルダの追加・削除・一覧と git ステータスの取得（タブ単位・永続化される）。プロジェクトの指示を受けたらそのルートを追加し、作業対象外になったら削除する。git-status: ツリーの色とバッジの git 状態をそのまま返す。entries[] の state は modified / added / deleted / renamed / untracked / conflicted / ignored、staged / unstaged は git の XY（`git status --short` と同じ記号）、propagated=true はディレクトリ行（changed は配下の変更ファイル数）。「未コミットのファイルは？」には git を叩き直さずここから答えられる。selection: ユーザーがツリーで選んでいる行を読む / path の行を選ぶ / key を押したのと同じに動かす。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -4227,7 +4227,23 @@
             "add",
             "remove",
             "list",
-            "git-status"
+            "git-status",
+            "selection"
+          ],
+          "type": "string"
+        },
+        "key": {
+          "description": "selection: left / right = 畳む・親へ / 開く・子へ、enter = 開く、extend_* = 範囲（top / bottom = 端まで）",
+          "enum": [
+            "up",
+            "down",
+            "left",
+            "right",
+            "enter",
+            "extend_up",
+            "extend_down",
+            "extend_top",
+            "extend_bottom"
           ],
           "type": "string"
         },
