@@ -245,6 +245,60 @@ pub fn clip_paste_partial(failed: usize, total: usize, first: &str) -> String {
     )
 }
 
+// --- 複数選択・移動として貼る・コピーの進み具合（FR-3.38 / #1867。キー: sidebar.multi_* / copy_*） ---
+
+/// 複数をまとめてドラッグしているときのゴースト
+pub fn drag_items(n: usize) -> String {
+    tr!(format!("{n} 項目"), format!("{n} items"))
+}
+/// 選んだ行の上で開いた右クリックメニューの項目に件数を添える
+pub fn menu_with_count(label: &str, n: usize) -> String {
+    tr!(
+        format!("{label}（{n} 項目）"),
+        format!("{label} ({n} items)")
+    )
+}
+/// 移動として貼る（Finder の「項目をここに移動」）
+pub fn menu_paste_move() -> &'static str {
+    tr!("項目をここに移動", "Move Items Here")
+}
+/// まとめて扱って一部できなかったときの通知（理由は 1 件目だけ。全部は CLI / MCP の `failed`）
+pub fn multi_partial(op: &str, failed: usize, total: usize, first: &str) -> String {
+    tr!(
+        format!("{op}: {total} 件中 {failed} 件は失敗した: {first}"),
+        format!("{op}: {failed} of {total} items failed: {first}")
+    )
+}
+/// コピーの進み具合の帯（数えている間）
+pub fn copy_counting(entries: u64) -> String {
+    tr!(
+        format!("コピーの準備中 {entries} 項目"),
+        format!("Preparing to copy {entries} items")
+    )
+}
+/// コピーの進み具合の帯（件数とバイト。バイトは `format_bytes` 済み）
+pub fn copy_progress(done: u64, total: u64, bytes_done: &str, bytes_total: &str) -> String {
+    tr!(
+        format!("コピー中 {done} / {total} 項目・{bytes_done} / {bytes_total}"),
+        format!("Copying {done} of {total} items, {bytes_done} of {bytes_total}")
+    )
+}
+/// 取り消しを受けて止まるのを待っている
+pub fn copy_cancelling() -> &'static str {
+    tr!("取り消しています", "Cancelling")
+}
+/// 帯の取り消しの押し口
+pub fn copy_cancel() -> &'static str {
+    tr!("取り消し", "Cancel")
+}
+/// 取り消した後の知らせ（失敗ではない = 自分で押した）
+pub fn copy_cancelled() -> &'static str {
+    tr!(
+        "コピーを取り消しました（写しかけのものは残していません）",
+        "Copy cancelled (nothing half-copied was left behind)"
+    )
+}
+
 // --- ヘッダのトグル（#550。キー: sidebar.hidden_*） ---
 
 pub fn hidden_show() -> &'static str {
@@ -503,6 +557,16 @@ mod tests {
                 // #1441: IPC の受け口が立たなかったときの案内（数値と OS の理由は言語非依存）
                 notice_ipc_too_long(160, 103),
                 notice_ipc_unavailable("Permission denied (os error 13)"),
+                // #1867: 件数・バイトと差し込む操作名は言語非依存
+                drag_items(3),
+                menu_with_count("Copy", 3),
+                menu_paste_move().to_string(),
+                multi_partial("Move", 1, 3, "no such path"),
+                copy_counting(12),
+                copy_progress(1, 2, "1 KB", "2 KB"),
+                copy_cancelling().to_string(),
+                copy_cancel().to_string(),
+                copy_cancelled().to_string(),
             ]
         });
     }

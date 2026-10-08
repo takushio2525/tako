@@ -176,9 +176,31 @@ pub fn open_with_dialog(path: &Path) -> Result<(), String> {
 ///
 /// ゴミ箱の概念が無い環境（その他 unix）では**削除せずエラーにする**。
 /// UI にもコマンドにも確認ダイアログが無い操作なので、
-/// 「ゴミ箱のつもりで完全削除」だけは起こさない
+/// 「ゴミ箱のつもりで完全削除」だけは起こさない。
+///
+/// 検証用に `TAKO_TRASH_DIR=<フォルダ>` を立てると、OS のゴミ箱の代わりにそのフォルダへ
+/// 移す（#1867。複数選択のごみ箱を実 GUI・CLI・MCP で確かめるときに**ユーザーのゴミ箱へ
+/// fixture を入れない**ため。#1860 の `TAKO_FILE_PASTEBOARD` と同じ作法）。本物のゴミ箱と同じく
+/// 同名があれば番号を付けて入れる（上書きしない）
 pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    if let Some(dir) = std::env::var_os("TAKO_TRASH_DIR").filter(|v| !v.is_empty()) {
+        return move_into_test_trash(Path::new(&dir), path);
+    }
     imp::move_to_trash(path)
+}
+
+/// `TAKO_TRASH_DIR` の行き先へ移す（同名があれば「名前 2」「名前 3」… = 上書きしない）
+fn move_into_test_trash(dir: &Path, path: &Path) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("ゴミ箱への移動に失敗: 名前が無い: {}", path.display()))?;
+    let mut to = dir.join(name);
+    let mut n = 2;
+    while std::fs::symlink_metadata(&to).is_ok() {
+        to = dir.join(format!("{} {n}", name.to_string_lossy()));
+        n += 1;
+    }
+    std::fs::rename(path, &to).map_err(|e| format!("ゴミ箱への移動に失敗: {e}"))
 }
 
 /// デスクトップ通知を出す（best-effort）。

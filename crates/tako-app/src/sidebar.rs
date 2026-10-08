@@ -216,7 +216,11 @@ pub(crate) const TREE_CUT_OPACITY: f32 = 0.45;
 /// 行を押す（左 / 右クリック）と立ち、**選んだ時点のタブとフォーカスペインを覚える**。
 /// どちらかが動いた・ツリーを閉じた・ツリーの外を押した・ほかのキーを打った、の
 /// どれかで効かなくなり、⌘C / ⌘V はペイン（端末のコピー・貼り付け）へ戻る
-/// （Windows の Ctrl+C を端末の SIGINT から奪いっぱなしにしない）
+/// （Windows の Ctrl+C を端末の SIGINT から奪いっぱなしにしない）。
+///
+/// #1867 で複数選択（⌘クリックで足す / 外す・⇧クリックで範囲）になった。`path` 以下の 4 つは
+/// **最後に押した行**（貼り付けの宛先・右クリックの基準）、`paths` が選んでいる行すべて
+/// （状態遷移の正本は `tako_core::tree_select`）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeSelection {
     pub(crate) path: std::path::PathBuf,
@@ -227,6 +231,112 @@ pub(crate) struct TreeSelection {
     pub(crate) remote: bool,
     pub(crate) tab: TabId,
     pub(crate) pane: PaneId,
+    /// 選んでいる行すべて（ツリーの並び順。1 行なら `[path]`。#1867）
+    pub(crate) paths: Vec<std::path::PathBuf>,
+    /// ⇧クリックの起点（#1867）
+    pub(crate) anchor: std::path::PathBuf,
+}
+
+impl TreeSelection {
+    pub(crate) fn contains(&self, path: &std::path::Path) -> bool {
+        self.paths.iter().any(|p| p == path)
+    }
+
+    /// 2 行以上を選んでいる（#1867）
+    pub(crate) fn is_multi(&self) -> bool {
+        self.paths.len() > 1
+    }
+
+    fn as_core(&self) -> tako_core::tree_select::Selection {
+        tako_core::tree_select::Selection {
+            items: self.paths.clone(),
+            anchor: self.anchor.clone(),
+            lead: self.path.clone(),
+        }
+    }
+}
+
+/// 複数選択の押下前の選択とコピーの進み具合の帯（FR-3.38 / #1867）
+#[derive(Debug, Default)]
+pub(crate) struct TreeMulti {
+    /// 押下の捕捉フェーズで外した選択（⌘クリックで足す・⇧クリックの起点・選んだ行を掴んで
+    /// まとめて運ぶ・右クリックメニューの対象の基準）。押下のたびに上書きされるので、
+    /// ツリーの外を押した後の ⌘クリックは何も足さない
+    pub(crate) stash: Option<TreeSelection>,
+    /// 進み具合の帯を描き直す刻みが回っている
+    ticking: bool,
+}
+
+/// コピーの進み具合の帯を出し始めるまでの時間（短いコピーで帯をちらつかせない。#1867）
+const COPY_PROGRESS_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+/// 帯を描き直す刻み
+const COPY_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis(150);
+/// 帯の「取り消し」の実矩形を行の矩形採取（`tree_row_probe`）へ載せるときの名前
+/// （実在のパスと取り違えない相対の名前。visual-test `tree-multiselect` が押す位置の正）
+pub(crate) const COPY_CANCEL_PROBE: &str = "<copy-cancel>";
+
+/// いま見えているローカルの行の並び（⇧クリックの範囲・見えない行を外す基準。#1867）
+pub(crate) fn tree_visible_order(rows: &[filetree::Row]) -> Vec<std::path::PathBuf> {
+    rows.iter()
+        .filter(|r| r.remote.is_none() && r.note.is_none())
+        .map(|r| r.entry.path.clone())
+        .collect()
+}
+
+/// コピーの断りが「取り消した」か（文面の正本は `tako_core::file_copy::CopyRefusal::Cancelled`）
+pub(crate) fn is_copy_cancelled(text: &str) -> bool {
+    text.contains(&tako_core::file_copy::CopyRefusal::Cancelled.reason())
+}
+
+/// バイト数の表記（帯に出す。1024 刻み・小数 1 桁）
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// 帯の棒の長さ（0〜1）。数えている間は None（母数が決まっていない）。
+/// バイトがあればバイト、無ければ件数で決める（空のフォルダだけのコピーでも進む）
+pub(crate) fn copy_ratio(snap: &tako_core::file_copy::ProgressSnapshot) -> Option<f32> {
+    if snap.counting {
+        return None;
+    }
+    let (done, total) = if snap.bytes_total > 0 {
+        (snap.bytes_done, snap.bytes_total)
+    } else {
+        (snap.entries_done, snap.entries_total)
+    };
+    if total == 0 {
+        return Some(0.0);
+    }
+    Some((done as f32 / total as f32).clamp(0.0, 1.0))
+}
+
+/// 押した行の修飾（押し下げた時点のもの。キーで押したクリックは修飾なし）
+fn click_modifiers(e: &gpui::ClickEvent) -> gpui::Modifiers {
+    match e {
+        gpui::ClickEvent::Mouse(m) => m.down.modifiers,
+        gpui::ClickEvent::Keyboard(_) => gpui::Modifiers::default(),
+    }
+}
+
+/// 修飾から行の押し方（正本は `tako_core::tree_select::click_kind`）
+pub(crate) fn tree_click_kind(m: gpui::Modifiers) -> tako_core::tree_select::ClickKind {
+    tako_core::tree_select::click_kind(
+        tako_core::platform::support::Platform::current(),
+        m.platform,
+        m.control,
+        m.shift,
+    )
 }
 
 /// 右クリックメニューの項目 id → コピー / 切り取り / 貼り付け（#1860）
@@ -236,6 +346,7 @@ fn tree_clip_menu_key(id: &str) -> Option<tako_core::platform::keys::TreeClipKey
         "clip-cut" => Some(TreeClipKey::Cut),
         "clip-copy" => Some(TreeClipKey::Copy),
         "clip-paste" => Some(TreeClipKey::Paste),
+        "clip-paste-move" => Some(TreeClipKey::PasteMove),
         _ => None,
     }
 }
@@ -291,6 +402,45 @@ pub(crate) fn tree_drop_hover(
         row_remote,
         dest,
         src: src.to_path_buf(),
+        verdict,
+    })
+}
+
+/// まとめてドラッグしているときの判定（#1867）。`items` = （運んでいるもの, 見出しの行か）、
+/// `grabbed` = 掴んだ行。掴んだ行そのものの上では何も出さない（離すと取り消し）。
+/// ほかの選んだ行の上は「自分自身へ」で断る（判定の正本は `file_move::drop_verdict_many`）
+pub(crate) fn tree_drop_hover_many(
+    items: &[(std::path::PathBuf, bool)],
+    grabbed: &std::path::Path,
+    row: &std::path::Path,
+    row_is_dir: bool,
+    row_remote: bool,
+) -> Option<TreeDropHover> {
+    use tako_core::file_move::{drop_verdict_many, DragItem};
+    if row == grabbed && !row_remote {
+        return None;
+    }
+    let dest = if row_is_dir || row_remote {
+        row.to_path_buf()
+    } else {
+        row.parent()?.to_path_buf()
+    };
+    let drag_items: Vec<DragItem<'_>> = items
+        .iter()
+        .map(|(path, root)| DragItem {
+            path,
+            workspace_root: *root,
+            remote: false,
+        })
+        .collect();
+    let verdict = drop_verdict_many(&drag_items, &dest, row_remote, |to| {
+        std::fs::symlink_metadata(to).is_ok()
+    });
+    Some(TreeDropHover {
+        row: row.to_path_buf(),
+        row_remote,
+        dest,
+        src: grabbed.to_path_buf(),
         verdict,
     })
 }
@@ -715,6 +865,12 @@ impl TakoApp {
         let open_paths: std::collections::HashSet<std::path::PathBuf> =
             self.previews.values().map(|p| p.path.clone()).collect();
         let mut rows = self.filetree.rows();
+        // #1867: 複数選んだ行を掴んだらその全部を運ぶ（見えている行だけ。行ごとに引き直さない）
+        let multi_drag: Option<Vec<std::path::PathBuf>> = self
+            .active_tree_selection()
+            .filter(|sel| sel.is_multi() && !sel.remote)
+            .and_then(|sel| sel.as_core().retain_visible(&tree_visible_order(&rows)))
+            .map(|sel| sel.items);
         let inline_new_insert = self
             .inline_edit
             .as_ref()
@@ -776,6 +932,7 @@ impl TakoApp {
             .remote_notice
             .as_ref()
             .map(|n| (n.text.clone(), n.is_error));
+        let copy_progress = self.render_copy_progress(&theme, cx);
         // #789: 親（root render）が渡す幅と同じ実効幅を使う（要求値ではない）
         let sidebar_w = self.effective_sidebar_width();
         let drop_highlight = self.sidebar_drop_highlight;
@@ -970,6 +1127,8 @@ impl TakoApp {
                                 )
                         })),
                 )
+                // #1867: コピーの進み具合（件数・バイト・取り消し）
+                .children(copy_progress)
                 // #919: リモート操作の通知（成功は数秒、失敗は次の操作まで残す）。
                 // 汎用のトーストが無いので、ユーザーが見ている場所へ出す
                 .children(remote_notice.map(|(text, is_error)| {
@@ -1184,6 +1343,14 @@ impl TakoApp {
                             let is_inline_parent =
                                 inline_parent_path.as_ref().is_some_and(|p| *p == path);
                             let drag_path = path.clone();
+                            // #1867: 選んでいる行を掴んだら選んだもの全部（ゴーストは件数）
+                            let (drag_paths, drag_label) = match &multi_drag {
+                                Some(all) if all.contains(&path) => (
+                                    all.clone(),
+                                    crate::ui_text::sidebar::drag_items(all.len()),
+                                ),
+                                _ => (vec![path.clone()], truncate_chars(&row.entry.name, 24)),
+                            };
                             let base = div()
                                 .id(("filetree-row", index as u64))
                                 .flex()
@@ -1212,9 +1379,33 @@ impl TakoApp {
                                         .text_color(hsla(theme.foreground))
                                 })
                                 .hover(|d| d.bg(rgba(theme.surface_hover)))
+                                // #1867: 選んでいる行を掴んだら選択を保つ（捕捉フェーズで外れた選択を
+                                // 戻す = 続けてドラッグするとまとめて運ぶ。離しただけならクリックが
+                                // その行だけを選び直す = Finder と同じ）
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let ctx_path = path.clone();
+                                        move |this, e: &MouseDownEvent, _, cx| {
+                                            if tree_click_kind(e.modifiers).is_plain()
+                                                && this.keep_tree_selection_for(&ctx_path)
+                                            {
+                                                cx.notify();
+                                            }
+                                        }
+                                    }),
+                                )
                                 .on_click(cx.listener({
                                     let ctx_path = path.clone();
-                                    move |this, _: &gpui::ClickEvent, _, cx| {
+                                    move |this, e: &gpui::ClickEvent, _, cx| {
+                                        // #1867: ⌘クリック（Windows は Ctrl）= 足す / 外す・⇧クリック =
+                                        // 範囲。開いたり開閉したりはしない（選ぶだけ = Finder と同じ）
+                                        let kind = tree_click_kind(click_modifiers(e));
+                                        if !kind.is_plain() {
+                                            this.click_tree_row(&ctx_path, kind);
+                                            cx.notify();
+                                            return;
+                                        }
                                         if is_dir {
                                             this.filetree.toggle_dir(&ctx_path);
                                         } else {
@@ -1250,7 +1441,11 @@ impl TakoApp {
                                                             == canon
                                                     })
                                             };
-                                            this.select_tree_row(&ctx_path, is_dir, false);
+                                            // #1867: 選んでいる行の右クリックは選択を保つ
+                                            // （メニューの切り取り / コピー / ごみ箱がまとめて効く）
+                                            if !this.keep_tree_selection_for(&ctx_path) {
+                                                this.select_tree_row(&ctx_path, is_dir, false);
+                                            }
                                             let can_paste = this.tree_can_paste();
                                             this.context_menu = Some(ContextMenu {
                                                 path: ctx_path.clone(),
@@ -1269,12 +1464,9 @@ impl TakoApp {
                                     FileDrag {
                                         path: drag_path,
                                         root: row.root,
+                                        paths: drag_paths,
                                     },
-                                    self.drag_ghost_builder(
-                                        DragKind::File,
-                                        truncate_chars(&row.entry.name, 24),
-                                        cx,
-                                    ),
+                                    self.drag_ghost_builder(DragKind::File, drag_label, cx),
                                 );
                             let row_el = if row.root {
                                 // ワークスペースフォルダの見出し行: 太字 + 上仕切り線（2 つ目以降）
@@ -1924,6 +2116,18 @@ impl TakoApp {
         let pos = ctx.position;
         // ファイルマネージャ / ごみ箱の呼び名は OS で変わる（#617）
         let fm = tako_control::platform::os_integration::file_manager();
+        // #1867: 選んだ行の上で開いたら、切り取り / コピー / ごみ箱は選んだもの全部へ効く（件数を添える）
+        let multi = self
+            .active_tree_selection()
+            .filter(|sel| sel.is_multi() && sel.contains(&path))
+            .map(|sel| sel.paths.len());
+        let counted = |label: &str| match multi {
+            Some(n) => crate::ui_text::sidebar::menu_with_count(label, n),
+            None => label.to_string(),
+        };
+        let cut_label = counted(crate::ui_text::sidebar::menu_cut());
+        let copy_label = counted(crate::ui_text::sidebar::menu_copy());
+        let trash_label = counted(crate::ui_text::sidebar::menu_trash(fm));
         let mut items: Vec<(&str, &str)> = vec![
             ("copy-rel", crate::ui_text::sidebar::menu_copy_rel()),
             ("copy-abs", crate::ui_text::sidebar::menu_copy_abs()),
@@ -1937,9 +2141,16 @@ impl TakoApp {
         // #1860: コピー / 切り取り / 貼り付け（キーと同じ dispatch を通る）
         if !tako_core::file_copy::tree_keys_legacy() {
             items.push(("sep0", ""));
-            items.push(("clip-cut", crate::ui_text::sidebar::menu_cut()));
-            items.push(("clip-copy", crate::ui_text::sidebar::menu_copy()));
+            items.push(("clip-cut", cut_label.as_str()));
+            items.push(("clip-copy", copy_label.as_str()));
             items.push(("clip-paste", crate::ui_text::sidebar::menu_paste()));
+            // #1867: 移動として貼る（Finder の「項目をここに移動」= ⌥⌘V）
+            if !tako_core::tree_select::multi_legacy() {
+                items.push((
+                    "clip-paste-move",
+                    crate::ui_text::sidebar::menu_paste_move(),
+                ));
+            }
         }
         items.push(("sep1", ""));
         items.push(("rename", crate::ui_text::sidebar::menu_rename()));
@@ -1956,7 +2167,7 @@ impl TakoApp {
             },
         ));
         items.push(("sep3", ""));
-        items.push(("trash", crate::ui_text::sidebar::menu_trash(fm)));
+        items.push(("trash", trash_label.as_str()));
         if is_pinned_root {
             items.push(("sep4", ""));
             items.push(("remove-root", crate::ui_text::sidebar::menu_remove_root()));
@@ -2008,7 +2219,7 @@ impl TakoApp {
                 let path = path.clone();
                 let rects = self.tree_menu_item_rects.clone();
                 // #1860: 貼るものが無ければ押せない見た目にする（押しても何も起きない）
-                let disabled = id == "clip-paste" && !can_paste;
+                let disabled = matches!(id, "clip-paste" | "clip-paste-move") && !can_paste;
                 let hint = tree_clip_menu_key(id).map(|key| {
                     tako_core::platform::keys::tree_clip_hint(
                         tako_core::platform::support::Platform::current(),
@@ -2417,16 +2628,33 @@ impl TakoApp {
                     self.open_inline_edit(kind, path);
                 }
             }
-            // #1860: キーと同じ入口（選び直してから。続けて ⌘V を押せばこの行へ貼れる）
-            "clip-cut" | "clip-copy" | "clip-paste" => {
+            // #1860: キーと同じ入口（選び直してから。続けて ⌘V を押せばこの行へ貼れる）。
+            // #1867: 選んだ行の上で開いたメニューは選んだもの全部へ効く（選択を保つ）
+            "clip-cut" | "clip-copy" | "clip-paste" | "clip-paste-move" => {
                 if let Some(key) = tree_clip_menu_key(action) {
-                    self.select_tree_row(path, _is_dir, false);
+                    if !self.keep_tree_selection_for(path) {
+                        self.select_tree_row(path, _is_dir, false);
+                    }
                     if let Some(sel) = self.tree_selection.clone() {
                         self.tree_clip_action(key, &sel, cx);
                     }
                 }
             }
             "trash" => {
+                // #1867: 選んだ行の上で開いたメニューのごみ箱は選んだもの全部（1 要求 = CLI
+                // `tako file trash a b` と同じ）
+                if self.keep_tree_selection_for(path) && self.tree_multi_selected() {
+                    let paths = self.tree_selection_paths();
+                    self.dispatch_tree_many(
+                        FileOpKind::Trash,
+                        paths,
+                        None,
+                        crate::ui_text::sidebar::menu_trash(fm),
+                        cx,
+                    );
+                    self.sync_filetree_roots();
+                    return;
+                }
                 // #1399: **削除を約束しているラベル**なので、失敗を無言にすると
                 // 「消えたのか押せていないのか」がユーザーに区別できない
                 let result = tako_control::dispatch(
@@ -3330,7 +3558,8 @@ impl TakoApp {
             sel.remote == remote
                 && match &row.remote {
                     Some(r) => sel.path == std::path::Path::new(&r.path),
-                    None => sel.path == row.entry.path,
+                    // #1867: 選んでいる行すべてに枠
+                    None => sel.contains(&row.entry.path),
                 }
         });
         if selected {
@@ -3404,7 +3633,7 @@ impl TakoApp {
         {
             return;
         }
-        let next = tree_drop_hover(&drag.path, drag.root, row, row_is_dir, row_remote);
+        let next = self.tree_drag_hover(drag, row, row_is_dir, row_remote);
         if self.tree_drop != next {
             self.tree_drop = next;
             cx.notify();
@@ -3432,14 +3661,18 @@ impl TakoApp {
         self.drag_kind = None;
         self.drop_cmd_held = false;
         self.drop_target = None;
-        let Some(hover) = tree_drop_hover(&drag.path, drag.root, row, row_is_dir, row_remote)
-        else {
+        let Some(hover) = self.tree_drag_hover(drag, row, row_is_dir, row_remote) else {
             // 掴んだ行へ戻した = 取り消し
             cx.notify();
             return;
         };
         let src = drag.path.display().to_string();
         let op = crate::ui_text::sidebar::move_op();
+        // #1867: まとめて運んでいる = 1 要求（`FileOpMany`。CLI `tako file move a b dst` と同じ）
+        if drag.paths.len() > 1 {
+            self.drop_many_on_tree_row(drag, &hover, cx);
+            return;
+        }
         match hover.verdict {
             DropVerdict::Unchanged => {}
             DropVerdict::Refused(refusal @ (MoveRefusal::Remote | MoveRefusal::WorkspaceRoot)) => {
@@ -3553,6 +3786,8 @@ impl TakoApp {
             remote,
             tab: self.workspace.active_tab_id(),
             pane: self.focused_pane(),
+            paths: vec![path.to_path_buf()],
+            anchor: path.to_path_buf(),
         });
     }
 
@@ -3599,9 +3834,16 @@ impl TakoApp {
             m.control,
             m.alt,
             m.shift,
+            ks.key_char.as_deref().is_some_and(|c| !c.is_empty()),
         ) else {
             return false;
         };
+        // #1867 の A/B: ⌥⌘V はツリーへ向けない（#1867 の前 = ペインへ流れる）
+        if key == tako_core::platform::keys::TreeClipKey::PasteMove
+            && tako_core::tree_select::multi_legacy()
+        {
+            return false;
+        }
         self.tree_clip_action(key, &sel, cx);
         true
     }
@@ -3624,6 +3866,7 @@ impl TakoApp {
             TreeClipKey::Copy => crate::ui_text::sidebar::menu_copy(),
             TreeClipKey::Cut => crate::ui_text::sidebar::menu_cut(),
             TreeClipKey::Paste => crate::ui_text::sidebar::menu_paste(),
+            TreeClipKey::PasteMove => crate::ui_text::sidebar::menu_paste_move(),
         };
         let target = sel.path.display().to_string();
         if sel.remote {
@@ -3636,9 +3879,16 @@ impl TakoApp {
             cx.notify();
             return;
         }
+        // #1867: 選んでいる行すべて（見えている行だけ。見出しが 1 つでも混ざれば切り取りは断る）
+        let paths = if sel.is_multi() {
+            self.tree_selection_paths()
+        } else {
+            vec![sel.path.clone()]
+        };
+        let any_root = sel.root || paths.iter().any(|p| self.filetree.roots().contains(p));
         let kind = match key {
             TreeClipKey::Copy => FileOpKind::ClipboardCopy,
-            TreeClipKey::Cut if sel.root => {
+            TreeClipKey::Cut if any_root => {
                 // 見出しのフォルダは画面からは動かさない（#1834 の D&D と同じ方針。
                 // CLI / MCP はパスを名指しした時点で意図が明らかなので断らない）
                 self.notify_tree_op_failed(
@@ -3653,21 +3903,32 @@ impl TakoApp {
             }
             TreeClipKey::Cut => FileOpKind::ClipboardCut,
             TreeClipKey::Paste => {
-                self.tree_paste(&sel.path, cx);
+                self.tree_paste(&sel.path, false, cx);
+                return;
+            }
+            // #1867: ⌥⌘V = 移動として貼る（宛先は最後に押した行 = ⌘V と同じ規則）
+            TreeClipKey::PasteMove => {
+                self.tree_paste(&sel.path, true, cx);
                 return;
             }
         };
-        let result = tako_control::dispatch(
-            self,
+        let request = if paths.len() > 1 {
+            // #1867: まとめて置く（CLI `tako file clipboard copy a b` / MCP `paths` と同じ 1 要求）
+            Request::FileOpMany {
+                op: kind,
+                paths: paths.iter().map(|p| p.display().to_string()).collect(),
+                dest: None,
+            }
+        } else {
             Request::FileOp {
                 op: kind,
                 path: target.clone(),
                 name: None,
                 pane: None,
                 dest: None,
-            },
-            PaneOrigin::User,
-        );
+            }
+        };
+        let result = tako_control::dispatch(self, request, PaneOrigin::User);
         if let Err(e) = result {
             self.notify_tree_dispatch_failed(op, Some(&target), &e);
         }
@@ -3693,9 +3954,19 @@ impl TakoApp {
     /// クリップボードを読んで段取り）→ `run_staged`（background で写す）→
     /// `finish_offload`（UI スレッドでツリーの読み直し）。切り取り = 移動は
     /// 付け替えに workspace が要るので同期の dispatch（`prepare_offload` が None を返す）
-    pub(crate) fn tree_paste(&mut self, row: &std::path::Path, cx: &mut Context<Self>) {
+    pub(crate) fn tree_paste(
+        &mut self,
+        row: &std::path::Path,
+        as_move: bool,
+        cx: &mut Context<Self>,
+    ) {
         let request = tako_control::protocol::Request::FileOp {
-            op: tako_control::protocol::FileOpKind::Paste,
+            // #1867: ⌥⌘V は移動として貼る（同期 = 切り取りの貼り付けと同じ経路）
+            op: if as_move {
+                tako_control::protocol::FileOpKind::PasteMove
+            } else {
+                tako_control::protocol::FileOpKind::Paste
+            },
             path: row.display().to_string(),
             name: None,
             pane: None,
@@ -3707,6 +3978,8 @@ impl TakoApp {
                 self.present_tree_paste(Err(e), &row, cx);
             }
             Some(Ok(job)) => {
+                // #1867: 写している間は帯で進み具合を見せる（取り消せる）
+                self.kick_copy_progress(cx);
                 let staged = cx
                     .background_executor()
                     .spawn(async move { job.run_staged() });
@@ -3734,7 +4007,11 @@ impl TakoApp {
                     Ok(value) => self.present_tree_paste(Ok(value), &row, cx),
                     // #1399: 失敗を黙って捨てない（offload の経路と同じ通知の口）
                     Err(e) => self.notify_tree_dispatch_failed(
-                        crate::ui_text::sidebar::menu_paste(),
+                        if as_move {
+                            crate::ui_text::sidebar::menu_paste_move()
+                        } else {
+                            crate::ui_text::sidebar::menu_paste()
+                        },
                         Some(&row.display().to_string()),
                         &e,
                     ),
@@ -3759,7 +4036,16 @@ impl TakoApp {
             Ok(value) => {
                 let pasted = value["pasted"].as_array().cloned().unwrap_or_default();
                 let failed = value["failed"].as_array().cloned().unwrap_or_default();
-                if let Some(first) = failed.first() {
+                let cancelled = failed
+                    .iter()
+                    .any(|f| is_copy_cancelled(f["reason"].as_str().unwrap_or_default()));
+                if cancelled {
+                    // #1867: 自分で押した「取り消し」は失敗として出さない（写し終えたものは残る）
+                    self.set_remote_notice(
+                        crate::ui_text::sidebar::copy_cancelled().to_string(),
+                        false,
+                    );
+                } else if let Some(first) = failed.first() {
                     let reason = first["reason"].as_str().unwrap_or_default();
                     let text = crate::ui_text::sidebar::clip_paste_partial(
                         failed.len(),
@@ -3768,17 +4054,19 @@ impl TakoApp {
                     );
                     self.notify_tree_op_failed(op, Some(&target), &text);
                 }
-                let landed = pasted
+                // #1867: 貼ったもの全部を選び直す（Finder と同じ。続けて ⌘X で全部を動かせる）
+                let landed: Vec<std::path::PathBuf> = pasted
                     .iter()
-                    .rev()
-                    .find_map(|v| v["to"].as_str())
-                    .map(std::path::PathBuf::from);
-                if let Some(landed) = landed {
-                    if self.tree_selection.is_some() || self.filetree.visible {
-                        let is_dir = landed.is_dir();
-                        self.select_tree_row(&landed, is_dir, false);
-                    }
+                    .filter_map(|v| v["to"].as_str())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                if !landed.is_empty() && (self.tree_selection.is_some() || self.filetree.visible) {
+                    self.select_tree_rows(&landed);
                 }
+            }
+            // #1867: 自分で押した「取り消し」は失敗として出さない（作りかけは消してある）
+            Err(e) if is_copy_cancelled(&e.to_string()) => {
+                self.set_remote_notice(crate::ui_text::sidebar::copy_cancelled().to_string(), false)
             }
             Err(e) => self.notify_tree_dispatch_failed(op, Some(&target), &e),
         }
@@ -3800,6 +4088,384 @@ impl TakoApp {
         }
         self.file_clipboard = None;
         true
+    }
+
+    // --- 複数選択・まとめた操作・コピーの進み具合（FR-3.38 / #1867） -------------------------
+
+    /// 押下の捕捉フェーズで選択を外して退避する（main の `capture_any_mouse_down`）。外したら真。
+    /// 行は自分の押下 / クリックで退避した選択を見て選び直す（⌘クリックで足す・選んだ行を掴む）
+    pub(crate) fn stash_tree_selection(&mut self) -> bool {
+        let had = self.tree_selection.is_some();
+        self.tree_multi.stash = self.tree_selection.take();
+        had
+    }
+
+    /// 押下の前に効いていた選択（[`Self::active_tree_selection`] と同じ条件 = タブ・フォーカス
+    /// ペインが同じでツリーが見えている）
+    fn tree_selection_base(&self) -> Option<&TreeSelection> {
+        if tako_core::file_copy::tree_keys_legacy() {
+            return None;
+        }
+        self.tree_multi.stash.as_ref().filter(|sel| {
+            self.filetree.visible
+                && sel.tab == self.workspace.active_tab_id()
+                && sel.pane == self.focused_pane()
+        })
+    }
+
+    /// 押した行が押下前の複数選択に含まれていたら、その選択を戻す（右クリック・掴んで運ぶ・
+    /// メニューの項目）。戻したら真。1 行だけの選択は戻さない（押した行を選び直すのと同じ）
+    pub(crate) fn keep_tree_selection_for(&mut self, path: &std::path::Path) -> bool {
+        let Some(base) = self
+            .tree_selection_base()
+            .filter(|sel| !sel.remote && sel.is_multi() && sel.contains(path))
+            .cloned()
+        else {
+            return false;
+        };
+        self.tree_selection = Some(base);
+        true
+    }
+
+    /// いま 2 行以上を選んでいる
+    pub(crate) fn tree_multi_selected(&self) -> bool {
+        self.active_tree_selection()
+            .is_some_and(TreeSelection::is_multi)
+    }
+
+    /// まとめて扱うもの（選んでいる行のうち、いま見えている行。畳んだフォルダの中は外す）
+    pub(crate) fn tree_selection_paths(&mut self) -> Vec<std::path::PathBuf> {
+        let Some(sel) = self.active_tree_selection().cloned() else {
+            return Vec::new();
+        };
+        let order = tree_visible_order(&self.filetree.rows());
+        sel.as_core()
+            .retain_visible(&order)
+            .map(|s| s.items)
+            .unwrap_or_else(|| vec![sel.path.clone()])
+    }
+
+    /// 修飾つきの押下（⌘ = 足す / 外す・⇧ = 範囲。素の押下は [`Self::select_tree_row`]）。
+    /// 状態遷移と範囲の正本は `tako_core::tree_select::apply`
+    pub(crate) fn click_tree_row(
+        &mut self,
+        path: &std::path::Path,
+        kind: tako_core::tree_select::ClickKind,
+    ) {
+        let rows = self.filetree.rows();
+        let order = tree_visible_order(&rows);
+        let base = self
+            .tree_selection_base()
+            .filter(|sel| !sel.remote)
+            .map(TreeSelection::as_core);
+        let next = tako_core::tree_select::apply(base.as_ref(), path, kind, &order);
+        self.tree_selection = next.map(|sel| {
+            let is_dir = rows
+                .iter()
+                .find(|r| r.remote.is_none() && r.entry.path == sel.lead)
+                .map_or_else(|| sel.lead.is_dir(), |r| r.entry.is_dir);
+            TreeSelection {
+                path: sel.lead.clone(),
+                is_dir,
+                root: self.filetree.roots().contains(&sel.lead),
+                remote: false,
+                tab: self.workspace.active_tab_id(),
+                pane: self.focused_pane(),
+                paths: sel.items,
+                anchor: sel.anchor,
+            }
+        });
+    }
+
+    /// 複数の行を選ぶ（貼った・移したものを選び直す）。最後のものが宛先・最初が起点
+    pub(crate) fn select_tree_rows(&mut self, paths: &[std::path::PathBuf]) {
+        let Some(last) = paths.last() else {
+            return;
+        };
+        self.select_tree_row(last, last.is_dir(), false);
+        if let Some(sel) = self.tree_selection.as_mut() {
+            sel.paths = paths.to_vec();
+            sel.anchor = paths[0].clone();
+        }
+    }
+
+    /// ドラッグ中の判定（1 つなら #1834 の `tree_drop_hover`、まとめてなら `tree_drop_hover_many`）
+    fn tree_drag_hover(
+        &self,
+        drag: &FileDrag,
+        row: &std::path::Path,
+        row_is_dir: bool,
+        row_remote: bool,
+    ) -> Option<TreeDropHover> {
+        if drag.paths.len() <= 1 {
+            return tree_drop_hover(&drag.path, drag.root, row, row_is_dir, row_remote);
+        }
+        let roots = self.filetree.roots();
+        let items: Vec<(std::path::PathBuf, bool)> = drag
+            .paths
+            .iter()
+            .map(|p| (p.clone(), roots.contains(p)))
+            .collect();
+        tree_drop_hover_many(&items, &drag.path, row, row_is_dir, row_remote)
+    }
+
+    /// まとめて運んだものをツリーの行へ落とす（#1867）。最終判断は dispatch の `FileOpMany`
+    /// （1 件ずつ #1834 の移動を通る）。画面が先に止めるのは、dispatch へ渡せないリモートの行と
+    /// 画面の方針で断る見出し・落とし先を壊す理由（選んだフォルダの上・その配下）だけ
+    fn drop_many_on_tree_row(
+        &mut self,
+        drag: &FileDrag,
+        hover: &TreeDropHover,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_control::protocol::FileOpKind;
+        use tako_core::file_move::{DropVerdict, MoveRefusal};
+        let op = crate::ui_text::sidebar::move_op();
+        match &hover.verdict {
+            DropVerdict::Unchanged => {}
+            DropVerdict::Refused(
+                refusal @ (MoveRefusal::Remote
+                | MoveRefusal::WorkspaceRoot
+                | MoveRefusal::IntoSelf
+                | MoveRefusal::IntoDescendant),
+            ) => {
+                let target = hover.dest.display().to_string();
+                self.notify_tree_op_failed(
+                    op,
+                    Some(&target),
+                    &crate::ui_text::sidebar::move_refused(refusal),
+                );
+            }
+            DropVerdict::Move | DropVerdict::Refused(_) => {
+                self.dispatch_tree_many(
+                    FileOpKind::Move,
+                    drag.paths.clone(),
+                    Some(hover.dest.clone()),
+                    op,
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// まとめた操作を dispatch へ渡し、結果を見せる（#1867）。移したものは移した先を選び直し、
+    /// 一部できなかったら件数 + 1 件目の理由を通知欄へ（全部は CLI / MCP の `failed`）
+    pub(crate) fn dispatch_tree_many(
+        &mut self,
+        op: tako_control::protocol::FileOpKind,
+        paths: Vec<std::path::PathBuf>,
+        dest: Option<std::path::PathBuf>,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let first = paths.first().map(|p| p.display().to_string());
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::FileOpMany {
+                op,
+                paths: paths.iter().map(|p| p.display().to_string()).collect(),
+                dest: dest.map(|d| d.display().to_string()),
+            },
+            PaneOrigin::User,
+        );
+        // 移動の付け替えは dispatch の中（`file_moved`）で済んでいる（D&D と同じ後始末）
+        self.drain_pending_preview_loads(cx);
+        self.save_layout();
+        match result {
+            Ok(value) => {
+                let failed = value["failed"].as_array().cloned().unwrap_or_default();
+                if let Some(reason) = failed.first().and_then(|f| f["reason"].as_str()) {
+                    let done = value["done"].as_array().map_or(0, Vec::len);
+                    let text = crate::ui_text::sidebar::multi_partial(
+                        label,
+                        failed.len(),
+                        done + failed.len(),
+                        reason,
+                    );
+                    self.notify_tree_op_failed(label, first.as_deref(), &text);
+                }
+                let moved: Vec<std::path::PathBuf> = value["done"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v["to"].as_str())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                if moved.is_empty() {
+                    self.tree_selection = None;
+                } else {
+                    self.select_tree_rows(&moved);
+                }
+            }
+            Err(e) => self.notify_tree_dispatch_failed(label, first.as_deref(), &e),
+        }
+        cx.notify();
+    }
+
+    /// コピーの進み具合の帯を描き直す刻みを回す（走っているコピーが無くなったら止まる）。
+    /// GUI の ⌘V は始めた直後に、CLI / MCP から始まったコピーは 2 秒のポーリングが呼ぶ
+    pub(crate) fn kick_copy_progress(&mut self, cx: &mut Context<Self>) {
+        if self.tree_multi.ticking || tako_core::file_copy::jobs().list().is_empty() {
+            return;
+        }
+        self.tree_multi.ticking = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(COPY_PROGRESS_TICK).await;
+            let alive = this.update(cx, |app, cx| {
+                cx.notify();
+                let running = !tako_core::file_copy::jobs().list().is_empty();
+                if !running {
+                    app.tree_multi.ticking = false;
+                }
+                running
+            });
+            if !matches!(alive, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// コピーの進み具合の帯（件数・バイト・取り消し）。走り始めて [`COPY_PROGRESS_DELAY`] 経った
+    /// コピーだけ出す（短いコピーでちらつかせない）。A/B（`TAKO_1867_LEGACY=1`）では出さない
+    pub(crate) fn render_copy_progress(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        if tako_core::tree_select::multi_legacy() {
+            return Vec::new();
+        }
+        let probe = self.tree_row_probe.then(|| self.tree_row_rects.clone());
+        tako_core::file_copy::jobs()
+            .list()
+            .into_iter()
+            .filter(|ticket| ticket.elapsed() >= COPY_PROGRESS_DELAY)
+            .map(|ticket| {
+                let snap = ticket.progress.snapshot();
+                let text = if snap.cancelled {
+                    crate::ui_text::sidebar::copy_cancelling().to_string()
+                } else if snap.counting {
+                    crate::ui_text::sidebar::copy_counting(snap.entries_total)
+                } else {
+                    crate::ui_text::sidebar::copy_progress(
+                        snap.entries_done,
+                        snap.entries_total,
+                        &format_bytes(snap.bytes_done),
+                        &format_bytes(snap.bytes_total),
+                    )
+                };
+                let ratio = copy_ratio(&snap);
+                let id = ticket.id;
+                div()
+                    .id(("copy-progress", id))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .text_size(px(11.0))
+                    .border_b_1()
+                    .border_color(hsla_alpha(theme.pane_border, 0.6))
+                    .bg(rgba_alpha(theme.accent, 0.08))
+                    .text_color(hsla(theme.foreground))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(text)),
+                            )
+                            .when(!snap.cancelled, |d| {
+                                d.child(
+                                    div()
+                                        .id(("copy-cancel", id))
+                                        .flex_none()
+                                        .px(px(6.0))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(hsla(theme.pane_border))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(rgba(theme.surface_hover)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel_copy(id, cx);
+                                        }))
+                                        // 何も描かない矩形採取（`tree_row_probe` のときだけ）
+                                        .when_some(probe.clone(), |d, rects| {
+                                            d.relative().child(
+                                                canvas(
+                                                    move |bounds, _, _| {
+                                                        rects.borrow_mut().push((
+                                                            std::path::PathBuf::from(
+                                                                COPY_CANCEL_PROBE,
+                                                            ),
+                                                            bounds,
+                                                        ))
+                                                    },
+                                                    |_, _, _, _| (),
+                                                )
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .size_full(),
+                                            )
+                                        })
+                                        .child(SharedString::from(
+                                            crate::ui_text::sidebar::copy_cancel(),
+                                        )),
+                                )
+                            }),
+                    )
+                    // 進み具合の棒（数えている間は出さない = 母数が決まっていない）
+                    .when_some(ratio, |d, ratio| {
+                        d.child(
+                            div()
+                                .h(px(3.0))
+                                .w_full()
+                                .rounded_sm()
+                                .bg(hsla_alpha(theme.pane_border, 0.5))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded_sm()
+                                        .bg(hsla(theme.accent))
+                                        .w(relative(ratio)),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// 帯の「取り消し」（CLI `tako file cancel <id>` / MCP `copy_cancel` と同じ dispatch）
+    pub(crate) fn cancel_copy(&mut self, id: u64, cx: &mut Context<Self>) {
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::FileOp {
+                op: tako_control::protocol::FileOpKind::CopyCancel,
+                path: String::new(),
+                name: Some(id.to_string()),
+                pane: None,
+                dest: None,
+            },
+            PaneOrigin::User,
+        );
+        // #1399: 失敗を黙って捨てない（押した直後に写し終えた = 「走っていない」もここへ出る）
+        if let Err(e) = result {
+            self.notify_tree_dispatch_failed(crate::ui_text::sidebar::copy_cancel(), None, &e);
+        }
+        cx.notify();
     }
 
     /// 表示中かつ対応形式のパスだけを親ディレクトリの非再帰監視へ同期する。

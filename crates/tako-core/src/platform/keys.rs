@@ -163,6 +163,9 @@ pub enum TreeClipKey {
     Copy,
     Cut,
     Paste,
+    /// 移動として貼る（⌥⌘V = Finder の「項目をここに移動」。Windows は Ctrl+Alt+V。
+    /// FR-3.38 / Issue #1867）
+    PasteMove,
 }
 
 impl TreeClipKey {
@@ -170,7 +173,7 @@ impl TreeClipKey {
         match self {
             Self::Copy => 'C',
             Self::Cut => 'X',
-            Self::Paste => 'V',
+            Self::Paste | Self::PasteMove => 'V',
         }
     }
 }
@@ -181,7 +184,11 @@ impl TreeClipKey {
 /// Windows = control のみ。ほかの修飾（shift / alt / もう片方）が混ざったら当たらない
 /// （⌘⇧V などの別の割り当てを奪わない）。**ツリーの行を選んでいるときだけ**呼ぶこと:
 /// Windows の Ctrl+C / Ctrl+X は端末の SIGINT / readline の入力なので、選んでいなければ
-/// 端末へ流す（判定はここ、宛先の判定は GUI）
+/// 端末へ流す（判定はここ、宛先の判定は GUI）。
+///
+/// 主修飾 + alt + V だけは**移動として貼る**（⌥⌘V / Windows は Ctrl+Alt+V。#1867）。
+/// Windows の AltGr は Ctrl+Alt として届くので、**文字を生む打鍵**（`text` = 欧州配列の
+/// AltGr+V = `@` 等）は文字入力のまま奪わない（macOS の ⌘ つきは文字入力にならない）
 pub fn tree_clip_key(
     platform: Platform,
     key: &str,
@@ -189,13 +196,18 @@ pub fn tree_clip_key(
     control: bool,
     alt: bool,
     shift: bool,
+    text: bool,
 ) -> Option<TreeClipKey> {
     let only_primary = match platform {
         Platform::MacOs => platform_key && !control,
         Platform::Windows => control && !platform_key,
     };
-    if !only_primary || alt || shift {
+    if !only_primary || shift {
         return None;
+    }
+    if alt {
+        let altgr_text = platform == Platform::Windows && text;
+        return (key == "v" && !altgr_text).then_some(TreeClipKey::PasteMove);
     }
     match key {
         "c" => Some(TreeClipKey::Copy),
@@ -208,9 +220,12 @@ pub fn tree_clip_key(
 /// ファイルツリーのコピー / 切り取り / 貼り付けの打鍵表記（右クリックメニューの右端。
 /// macOS = `⌘C` / Windows = `Ctrl+C`）
 pub fn tree_clip_hint(platform: Platform, key: TreeClipKey) -> String {
-    match platform {
-        Platform::MacOs => format!("\u{2318}{}", key.letter()),
-        Platform::Windows => format!("Ctrl+{}", key.letter()),
+    let alt = key == TreeClipKey::PasteMove;
+    match (platform, alt) {
+        (Platform::MacOs, false) => format!("\u{2318}{}", key.letter()),
+        (Platform::MacOs, true) => format!("\u{2325}\u{2318}{}", key.letter()),
+        (Platform::Windows, false) => format!("Ctrl+{}", key.letter()),
+        (Platform::Windows, true) => format!("Ctrl+Alt+{}", key.letter()),
     }
 }
 
@@ -231,15 +246,14 @@ mod tests {
     #[test]
     fn ツリーのクリップボードの打鍵は主修飾だけで当たる() {
         use TreeClipKey::*;
-        let mac = |key, p, c, a, s| tree_clip_key(Platform::MacOs, key, p, c, a, s);
-        let win = |key, p, c, a, s| tree_clip_key(Platform::Windows, key, p, c, a, s);
+        let mac = |key, p, c, a, s| tree_clip_key(Platform::MacOs, key, p, c, a, s, false);
+        let win = |key, p, c, a, s| tree_clip_key(Platform::Windows, key, p, c, a, s, false);
         assert_eq!(mac("c", true, false, false, false), Some(Copy));
         assert_eq!(mac("x", true, false, false, false), Some(Cut));
         assert_eq!(mac("v", true, false, false, false), Some(Paste));
-        // macOS の Ctrl+C は端末の SIGINT のまま・⌘⇧V / ⌥⌘V は別の割り当て
+        // macOS の Ctrl+C は端末の SIGINT のまま・⌘⇧V は別の割り当て
         assert_eq!(mac("c", false, true, false, false), None);
         assert_eq!(mac("v", true, false, false, true), None);
-        assert_eq!(mac("v", true, false, true, false), None);
         assert_eq!(mac("a", true, false, false, false), None);
         assert_eq!(win("c", false, true, false, false), Some(Copy));
         assert_eq!(win("x", false, true, false, false), Some(Cut));
@@ -249,6 +263,42 @@ mod tests {
         assert_eq!(win("c", false, true, false, true), None);
         assert_eq!(tree_clip_hint(Platform::MacOs, Copy), "\u{2318}C");
         assert_eq!(tree_clip_hint(Platform::Windows, Paste), "Ctrl+V");
+    }
+
+    /// #1867: ⌥⌘V（Windows は Ctrl+Alt+V）は移動として貼る。V 以外・⇧ 混じりは当たらず、
+    /// Windows で文字を生む AltGr（Ctrl+Alt）は文字入力のまま
+    #[test]
+    fn 主修飾とaltのvは移動として貼る() {
+        use TreeClipKey::*;
+        let mac = |key, s, t| tree_clip_key(Platform::MacOs, key, true, false, true, s, t);
+        let win = |key, s, t| tree_clip_key(Platform::Windows, key, false, true, true, s, t);
+        assert_eq!(mac("v", false, false), Some(PasteMove));
+        // macOS の ⌘ つきは文字入力にならない（⌥V の「√」を見ても移動のまま）
+        assert_eq!(mac("v", false, true), Some(PasteMove));
+        assert_eq!(mac("c", false, false), None);
+        assert_eq!(mac("x", false, false), None);
+        assert_eq!(mac("v", true, false), None, "⌥⇧⌘V は別の割り当て");
+        assert_eq!(win("v", false, false), Some(PasteMove));
+        assert_eq!(
+            win("v", false, true),
+            None,
+            "AltGr+V の文字（@ 等）は奪わない"
+        );
+        assert_eq!(win("c", false, false), None);
+        // 主修飾が無い ⌥V（macOS の「√」/ Windows の Alt+V = Claude Code の画像貼り付け）
+        assert_eq!(
+            tree_clip_key(Platform::MacOs, "v", false, false, true, false, true),
+            None
+        );
+        assert_eq!(
+            tree_clip_key(Platform::Windows, "v", false, false, true, false, false),
+            None
+        );
+        assert_eq!(
+            tree_clip_hint(Platform::MacOs, PasteMove),
+            "\u{2325}\u{2318}V"
+        );
+        assert_eq!(tree_clip_hint(Platform::Windows, PasteMove), "Ctrl+Alt+V");
     }
 
     #[test]

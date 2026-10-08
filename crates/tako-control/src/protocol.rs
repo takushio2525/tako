@@ -1027,6 +1027,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dest: Option<String>,
     },
+    /// 複数のファイル・フォルダへまとめて同じ操作をする（ファイルツリーの複数選択。
+    /// FR-3.38 / #1867）。`op` は `clipboard_copy` / `clipboard_cut` / `trash` / `move`
+    /// （`dest` 必須）だけ。フォルダとその配下を重ねて渡したら配下は親と一緒に扱う
+    /// （`tako_core::tree_select::distinct_roots`）。MCP は `tako_file_op` の `paths`
+    FileOpMany {
+        op: FileOpKind,
+        paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dest: Option<String>,
+    },
     /// git ログ取得（FR-3.6 git graph）。`pane` の cwd のリポジトリのコミット一覧・
     /// ブランチ・status を返す。`max_count` は取得上限（省略時 200）
     GitLog {
@@ -2663,6 +2673,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::VideoSeek { .. }
         | Request::VideoVolume { .. }
         | Request::FileOp { .. }
+        | Request::FileOpMany { .. }
         // --- 設定・外部プロセス・バックエンド操作（幾何に触らない） ---
         | Request::AutoRename { .. }
         | Request::PortDetect { .. }
@@ -2828,6 +2839,13 @@ pub enum FileOpKind {
     /// 貼り付け（⌘V。#1860）。`path` はツリーの行（フォルダ = その中 / ファイル = その
     /// フォルダ / 貼るもの自身 = その親 = 複製）。コピーは `Copy`・切り取りは `Move` を通る
     Paste,
+    /// 移動として貼る（⌥⌘V = Finder の「項目をここに移動」。Windows は Ctrl+Alt+V。
+    /// FR-3.38 / #1867）。コピーしたものも切り取りと同じく `Move` の 1 実装で移す
+    PasteMove,
+    /// 走っているコピーの進み具合（件数・バイト。何も変えない。#1867）
+    CopyProgress,
+    /// 走っているコピーを取り消す（`name` = 番号。省略で全部。作りかけは消す。#1867）
+    CopyCancel,
 }
 
 #[cfg(test)]

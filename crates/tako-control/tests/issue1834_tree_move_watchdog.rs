@@ -369,17 +369,23 @@ fn rule_one_to_one(
         "\"tako_file_op\"",
         "カタログに dest の引数が無い",
     )?;
+    // #1867 で移す元が複数取れるようになった（1 件 = `FileOp` / 複数 = `FileOpMany` を
+    // `file_op_for` が振り分ける）ので、腕の頭は `paths` を見る
     cli.arm_calls(
-        "Command::File(FileCommand::Move { path, dest }) => Request::FileOp {",
-        "dest: Some(resolve_cli_path(dest))",
-        6,
+        "Command::File(FileCommand::Move { paths }) =>",
+        "Some(resolve_cli_path(dest))",
+        10,
         "CLI `tako file move` の移動先を CLI の cwd 基準で絶対化していない（GUI の cwd で読まれる）",
     )?;
     cli.arm_calls(
-        "Command::File(FileCommand::Move { path, dest }) => Request::FileOp {",
+        "Command::File(FileCommand::Move { paths }) =>",
         "FileOpKind::Move",
-        3,
+        8,
         why,
+    )?;
+    cli.body("file_op_for")?.must_contain(
+        "resolve_cli_path(",
+        "CLI `tako file move` の移す元を CLI の cwd 基準で絶対化していない",
     )?;
     let drop = sidebar.body("drop_on_tree_row")?;
     drop.must_contain("FileOpKind::Move", why)?;

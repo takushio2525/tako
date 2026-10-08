@@ -27,9 +27,21 @@
 //! **リンクそのもの**（指す先は辿らない = 自分の祖先を指すリンクで無限に潜らない。
 //! Finder / `cp -R` と同じ）。FIFO・ソケット・デバイスは読むと止まる / 写す意味が無いので
 //! 理由つきで断る。
+//!
+//! ## 進み具合と取り消し（FR-3.38 / #1867）
+//!
+//! 写す前に件数とバイトを数え（[`measure`]）、1 項目ごとに [`Progress`] を進める。
+//! 取り消し（[`Progress::cancel`]）は**次の項目へ進む前**に見て、[`CopyRefusal::Cancelled`] で
+//! 抜ける = 失敗と同じく**この呼び出しで作った置き場だけを消して戻す**（作りかけを残さない）。
+//! 1 つのファイルの途中では止めない（`std::fs::copy` = macOS の `fcopyfile` / APFS の複製を
+//! そのまま使うため）。走っているコピーは [`jobs`] の一覧に載り、GUI のツリーの帯・
+//! CLI `tako file progress` / `cancel`・MCP `tako_file_op` の `copy_progress` / `copy_cancel` が
+//! 同じ一覧を読む。
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::file_move::{lexical_verdict, DropVerdict, EntryKind, MoveRefusal};
 use crate::i18n::Lang;
@@ -66,6 +78,8 @@ pub enum CopyRefusal {
     NoSpace,
     /// OS が断った（中身は OS のエラー文）
     Io(String),
+    /// 取り消した（#1867。作りかけは消してある）
+    Cancelled,
 }
 
 impl CopyRefusal {
@@ -85,6 +99,7 @@ impl CopyRefusal {
             Self::SymlinkPrivilege(_) => "symlink_privilege",
             Self::NoSpace => "no_space",
             Self::Io(_) => "io",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -110,6 +125,7 @@ impl CopyRefusal {
             ),
             Self::NoSpace => "空き容量が足りない".into(),
             Self::Io(e) => format!("OS が断った: {e}"),
+            Self::Cancelled => "取り消した（作りかけは消した）".into(),
         }
     }
 }
@@ -320,7 +336,18 @@ impl CopyStats {
 
 /// 写す。失敗したらこの呼び出しで作った置き場だけを消して戻す
 pub fn execute(plan: &CopyPlan) -> Result<CopyStats, CopyRefusal> {
-    let mut job = Job::default();
+    execute_with(plan, &Progress::default())
+}
+
+/// 進み具合を `progress` へ載せながら写す（#1867）。取り消されたら次の項目へ進む前に
+/// [`CopyRefusal::Cancelled`] で抜け、失敗と同じくこの呼び出しで作った置き場だけを消す
+pub fn execute_with(plan: &CopyPlan, progress: &Progress) -> Result<CopyStats, CopyRefusal> {
+    let mut job = Job {
+        progress,
+        stats: CopyStats::default(),
+        created_root: false,
+        dir_permissions: Vec::new(),
+    };
     match job.copy_root(plan) {
         Ok(()) => {
             job.apply_dir_permissions();
@@ -343,8 +370,9 @@ fn rollback(plan: &CopyPlan) {
     };
 }
 
-#[derive(Default)]
-struct Job {
+struct Job<'a> {
+    /// 進み具合と取り消し（#1867）
+    progress: &'a Progress,
     stats: CopyStats,
     /// 置き場を作れた（ここから先の失敗は戻す）
     created_root: bool,
@@ -352,12 +380,23 @@ struct Job {
     dir_permissions: Vec<(PathBuf, std::fs::Permissions)>,
 }
 
-impl Job {
+impl Job<'_> {
+    /// 次の項目へ進む前の関所（取り消しを見る。#1867）
+    fn step(&self) -> Result<(), CopyRefusal> {
+        injected_delay();
+        if self.progress.is_cancelled() {
+            return Err(CopyRefusal::Cancelled);
+        }
+        Ok(())
+    }
+
     fn copy_root(&mut self, plan: &CopyPlan) -> Result<(), CopyRefusal> {
+        self.step()?;
         match plan.kind {
             EntryKind::Dir => {
                 std::fs::create_dir(&plan.to).map_err(|e| write_error(&e, &plan.to))?;
                 self.created_root = true;
+                self.progress.add_done(1, 0);
                 self.copy_dir(&plan.from, &plan.to)
             }
             EntryKind::File => {
@@ -383,6 +422,7 @@ impl Job {
         let meta = std::fs::symlink_metadata(src).map_err(|e| read_error(&e, src))?;
         let entries = std::fs::read_dir(src).map_err(|e| read_error(&e, src))?;
         for entry in entries {
+            self.step()?;
             let entry = entry.map_err(|e| read_error(&e, src))?;
             let from = entry.path();
             let to = dst.join(entry.file_name());
@@ -391,6 +431,7 @@ impl Job {
                 self.copy_link(&from, &to)?;
             } else if file_type.is_dir() {
                 std::fs::create_dir(&to).map_err(|e| write_error(&e, &to))?;
+                self.progress.add_done(1, 0);
                 self.copy_dir(&from, &to)?;
             } else if file_type.is_file() {
                 // 作ったばかりのフォルダの中なので普通は空いている。大文字小文字を
@@ -414,6 +455,7 @@ impl Job {
         let bytes = std::fs::copy(src, dst).map_err(|e| write_error(&e, dst))?;
         self.stats.files += 1;
         self.stats.bytes += bytes;
+        self.progress.add_done(1, bytes);
         Ok(())
     }
 
@@ -426,6 +468,7 @@ impl Job {
             }
         })?;
         self.stats.links += 1;
+        self.progress.add_done(1, 0);
         Ok(())
     }
 
@@ -469,6 +512,232 @@ fn write_error(error: &std::io::Error, path: &Path) -> CopyRefusal {
 /// リンクを辿らずに「その名前の何かがあるか」（壊れたリンクも「ある」）
 fn exists_no_follow(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
+}
+
+// --- 進み具合と取り消し（FR-3.38 / #1867） ---------------------------------------
+
+/// コピーの進み具合と取り消しの印。background で写す側が進め、UI スレッド（GUI の帯・
+/// CLI / MCP の `copy_progress`）が読み、`copy_cancel` が印を立てる（どれも atomics だけ）
+#[derive(Debug, Default)]
+pub struct Progress {
+    entries_total: AtomicU64,
+    bytes_total: AtomicU64,
+    entries_done: AtomicU64,
+    bytes_done: AtomicU64,
+    /// 数え終えた（[`measure`] が済んだ）
+    counted: AtomicBool,
+    cancel: AtomicBool,
+    /// 写した件数がこれに達したら取り消したことにする（0 = 使わない）。単体テストが途中の
+    /// 取り消しを決定的に起こすための印で、本番の経路は立てない
+    cancel_at: AtomicU64,
+}
+
+/// ある時点の進み具合（応答・画面に載せる値）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgressSnapshot {
+    pub entries_done: u64,
+    pub entries_total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// まだ数えている（`*_total` は数えたところまで）
+    pub counting: bool,
+    /// 取り消しを受けた（次の項目へ進む前に止まる）
+    pub cancelled: bool,
+}
+
+impl Progress {
+    /// 取り消す（次の項目へ進む前に止まり、作りかけを消す）
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        let at = self.cancel_at.load(Ordering::Relaxed);
+        if at > 0 && self.entries_done.load(Ordering::Relaxed) >= at {
+            return true;
+        }
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// 数え終えた印（ここから先の `*_total` は確定）
+    pub fn finish_counting(&self) {
+        self.counted.store(true, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            entries_done: self.entries_done.load(Ordering::Relaxed),
+            entries_total: self.entries_total.load(Ordering::Relaxed),
+            bytes_done: self.bytes_done.load(Ordering::Relaxed),
+            bytes_total: self.bytes_total.load(Ordering::Relaxed),
+            counting: !self.counted.load(Ordering::Relaxed),
+            cancelled: self.is_cancelled(),
+        }
+    }
+
+    fn add_total(&self, entries: u64, bytes: u64) {
+        self.entries_total.fetch_add(entries, Ordering::Relaxed);
+        self.bytes_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_done(&self, entries: u64, bytes: u64) {
+        self.entries_done.fetch_add(entries, Ordering::Relaxed);
+        self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// 写す前に `src` の件数とバイトを数えて `progress` の合計へ足す（[`execute_with`] が数えるのと
+/// 同じ単位 = ファイル・フォルダ・リンクを 1 件、バイトはファイルの中身だけ）。
+///
+/// リンクは辿らない（祖先を指すリンクで潜らない）。読めないところは数えずに進む
+/// （断るのは写すときの [`execute_with`] = 理由の正本は 1 つ）。取り消されたら Cancelled
+pub fn measure(src: &Path, progress: &Progress) -> Result<(), CopyRefusal> {
+    if progress.is_cancelled() {
+        return Err(CopyRefusal::Cancelled);
+    }
+    let Ok(meta) = std::fs::symlink_metadata(src) else {
+        return Ok(());
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        progress.add_total(1, 0);
+    } else if file_type.is_file() {
+        progress.add_total(1, meta.len());
+    } else if file_type.is_dir() {
+        progress.add_total(1, 0);
+        if let Ok(entries) = std::fs::read_dir(src) {
+            for entry in entries.flatten() {
+                measure(&entry.path(), progress)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 走っているコピー 1 つ（[`jobs`] の一覧に載る）
+#[derive(Debug)]
+pub struct CopyTicket {
+    /// 一覧の中で一意の番号（`copy_cancel` の宛先）
+    pub id: u64,
+    pub progress: Progress,
+    /// 写すもの
+    pub sources: Vec<PathBuf>,
+    /// 貼り付け先のフォルダ（1 つ目のもの）
+    pub dest: PathBuf,
+    started: std::time::Instant,
+}
+
+impl CopyTicket {
+    /// 始めてからの時間（GUI は短いコピーで帯をちらつかせないよう、これで出し始めを遅らせる）
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+}
+
+/// 走っているコピーの一覧（GUI・CLI・MCP が同じものを読む）
+#[derive(Debug)]
+pub struct CopyJobs {
+    next: AtomicU64,
+    live: Mutex<Vec<Arc<CopyTicket>>>,
+}
+
+impl Default for CopyJobs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CopyJobs {
+    pub const fn new() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+            live: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 一覧へ載せる。返した札を落とすと一覧から外れる（写し終えた・断った・取り消した、の
+    /// どれでも外し忘れない）
+    pub fn register(&self, sources: Vec<PathBuf>, dest: PathBuf) -> TicketGuard<'_> {
+        let ticket = Arc::new(CopyTicket {
+            id: self.next.fetch_add(1, Ordering::Relaxed),
+            progress: Progress::default(),
+            sources,
+            dest,
+            started: std::time::Instant::now(),
+        });
+        self.lock().push(Arc::clone(&ticket));
+        TicketGuard { jobs: self, ticket }
+    }
+
+    /// 走っているコピー（始めた順）
+    pub fn list(&self) -> Vec<Arc<CopyTicket>> {
+        self.lock().clone()
+    }
+
+    /// 取り消す（`id` 省略 = 走っているものすべて）。印を立てた番号を返す
+    pub fn cancel(&self, id: Option<u64>) -> Vec<u64> {
+        let mut out = Vec::new();
+        for ticket in self.lock().iter() {
+            if id.is_none_or(|id| id == ticket.id) {
+                ticket.progress.cancel();
+                out.push(ticket.id);
+            }
+        }
+        out
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Arc<CopyTicket>>> {
+        // 一覧の読み書きで panic しない（持ち主が panic しても一覧そのものは壊れていない）
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// 一覧に載せた札。落とすと一覧から外れる
+#[derive(Debug)]
+pub struct TicketGuard<'a> {
+    jobs: &'a CopyJobs,
+    ticket: Arc<CopyTicket>,
+}
+
+impl TicketGuard<'_> {
+    pub fn ticket(&self) -> &CopyTicket {
+        &self.ticket
+    }
+
+    /// 写す側が進める進み具合
+    pub fn progress(&self) -> &Progress {
+        &self.ticket.progress
+    }
+}
+
+impl Drop for TicketGuard<'_> {
+    fn drop(&mut self) {
+        let id = self.ticket.id;
+        self.jobs.lock().retain(|t| t.id != id);
+    }
+}
+
+/// プロセスに 1 つの一覧（GUI のツリーの帯・dispatch の `copy_progress` / `copy_cancel`）
+pub fn jobs() -> &'static CopyJobs {
+    static JOBS: CopyJobs = CopyJobs::new();
+    &JOBS
+}
+
+/// 検証用の遅延（`TAKO_1867_COPY_DELAY_MS=<ミリ秒>` で 1 項目ごとに待つ）。進み具合の帯と
+/// 取り消しを**小さな fixture で**見るためのもの（大きなファイルを作る・CPU を焼く負荷で
+/// 遅くしない）。未設定なら何もしない
+fn injected_delay() {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    let delay = DELAY.get_or_init(|| {
+        std::env::var("TAKO_1867_COPY_DELAY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+    });
+    if let Some(delay) = delay {
+        std::thread::sleep(*delay);
+    }
 }
 
 /// `TAKO_1860_LEGACY=1` で**ファイルツリーがコピー / 切り取り / 貼り付けのキーを受けない**
@@ -824,6 +1093,103 @@ mod tests {
         let (p, _) = copy(&base.join("元 の場所"), &base).unwrap();
         assert_eq!(p.to, base.join("元 の場所 のコピー"));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 数えた件数とバイトは写した量と一致し進み具合が満ちる() {
+        let base = scratch("progress");
+        touch(&base.join("d/a.txt"), "aaaa");
+        touch(&base.join("d/sub/b.txt"), "bb");
+        std::fs::create_dir_all(base.join("d/empty")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let progress = Progress::default();
+        measure(&base.join("d"), &progress).unwrap();
+        let counted = progress.snapshot();
+        assert!(counted.counting, "数え終えた印を付けるまでは数えている");
+        progress.finish_counting();
+        // d / a.txt / sub / sub/b.txt / empty = 5 件、中身は 6 バイト
+        assert_eq!(
+            (counted.entries_total, counted.bytes_total),
+            (5, 6),
+            "{counted:?}"
+        );
+        assert_eq!((counted.entries_done, counted.bytes_done), (0, 0));
+        let p = plan(&base.join("d"), &base.join("dst"), finder_ja()).unwrap();
+        let stats = execute_with(&p, &progress).unwrap();
+        let done = progress.snapshot();
+        assert_eq!(done.entries_done, stats.entries());
+        assert_eq!(done.bytes_done, stats.bytes);
+        assert_eq!(
+            (done.entries_done, done.bytes_done),
+            (done.entries_total, done.bytes_total),
+            "写し終えたら満ちる: {done:?}"
+        );
+        assert!(!done.counting && !done.cancelled);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 取り消すと作りかけを消してコピー元は残る() {
+        let base = scratch("cancel");
+        for i in 0..5 {
+            touch(&base.join(format!("d/f{i}.txt")), "x");
+        }
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let p = plan(&base.join("d"), &base.join("dst"), finder_ja()).unwrap();
+        // 始める前に取り消してある = 置き場も作らない
+        let progress = Progress::default();
+        progress.cancel();
+        assert_eq!(execute_with(&p, &progress), Err(CopyRefusal::Cancelled));
+        assert!(!base.join("dst/d").exists());
+        assert_eq!(
+            measure(&base.join("d"), &progress),
+            Err(CopyRefusal::Cancelled)
+        );
+        // 写している途中で取り消す（フォルダ + 2 件写したところで印が立つ）
+        let progress = Progress::default();
+        progress.cancel_at.store(3, Ordering::Relaxed);
+        assert_eq!(execute_with(&p, &progress), Err(CopyRefusal::Cancelled));
+        assert_eq!(
+            progress.snapshot().entries_done,
+            3,
+            "途中まで写してから止まった"
+        );
+        assert!(
+            !base.join("dst/d").exists(),
+            "取り消したのに作りかけが残っている"
+        );
+        assert!(progress.snapshot().cancelled);
+        for i in 0..5 {
+            assert!(
+                base.join(format!("d/f{i}.txt")).is_file(),
+                "コピー元が消えた"
+            );
+        }
+        assert_eq!(CopyRefusal::Cancelled.slug(), "cancelled");
+        assert!(CopyRefusal::Cancelled.reason().contains("取り消した"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 走っているコピーの一覧は札を落とすと外れ番号で取り消せる() {
+        let jobs = CopyJobs::new();
+        let a = jobs.register(vec![PathBuf::from("/w/a")], PathBuf::from("/w/dst"));
+        let b = jobs.register(vec![PathBuf::from("/w/b")], PathBuf::from("/w/dst"));
+        assert_ne!(a.ticket().id, b.ticket().id);
+        let ids: Vec<u64> = jobs.list().iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![a.ticket().id, b.ticket().id]);
+        // 番号で 1 つだけ
+        assert_eq!(jobs.cancel(Some(b.ticket().id)), vec![b.ticket().id]);
+        assert!(b.ticket().progress.is_cancelled());
+        assert!(!a.ticket().progress.is_cancelled());
+        // 無い番号は何も取り消さない
+        assert!(jobs.cancel(Some(9999)).is_empty());
+        drop(b);
+        assert_eq!(jobs.list().len(), 1, "札を落としたら一覧から外れる");
+        // 省略 = 全部
+        assert_eq!(jobs.cancel(None), vec![a.ticket().id]);
+        drop(a);
+        assert!(jobs.list().is_empty());
     }
 
     #[test]

@@ -160,5 +160,6 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | テキスト選択 | 自動コピー（copy-on-select） |
 | <kbd>Cmd</kbd>+クリック（Windows は <kbd>Ctrl</kbd>+クリック） | URL・ファイルパスを開く（同じ修飾キーを押しながらのホバーで下線が出ます） |
 | ファイルツリーからペインへドラッグ | パス入力 / プレビュー表示 |
+| ファイルツリーの行を <kbd>Cmd</kbd>+クリック（Windows は <kbd>Ctrl</kbd>+クリック）/ <kbd>Shift</kbd>+クリック | 行を足す・外す / 範囲を選ぶ（まとめてコピー・切り取り・ゴミ箱・ドラッグ） |
 
 Windows は Win キーを OS が使うため、リンクを開く修飾キーだけ <kbd>Ctrl</kbd> になります（ほかのマウス操作は両 OS 共通です）。クリックを使わずに開きたいときは `tako file open-in-tako <path>`、リンクとして認識されている範囲を確認したいときは `tako links` が使えます。

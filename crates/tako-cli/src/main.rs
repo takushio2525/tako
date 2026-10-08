@@ -1949,13 +1949,20 @@ enum TmuxCommand {
     },
 }
 
-/// `tako file clipboard` の操作（#1860）
+/// `tako file clipboard` の操作（#1860 / 複数は #1867）
 #[derive(Subcommand)]
 enum FileClipboardCommand {
-    /// コピーする（貼ると複製。OS のクリップボードにも書くのでファイルマネージャへも貼れる）
-    Copy { path: String },
-    /// 切り取る（貼ると移動）
-    Cut { path: String },
+    /// コピーする（貼ると複製。OS のクリップボードにも書くのでファイルマネージャへも貼れる）。
+    /// 複数を渡すとまとめて置く（ファイルツリーの複数選択と同じ）
+    Copy {
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+    },
+    /// 切り取る（貼ると移動）。複数を渡すとまとめて置く
+    Cut {
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+    },
     /// 中身と、DIR へ貼ったときの貼り付け先を表示する（省略時はカレントディレクトリ）
     Show { dir: Option<String> },
 }
@@ -1981,12 +1988,12 @@ enum FileCommand {
     /// ファイル・フォルダの名前を変更する
     Rename { path: String, name: String },
     /// ファイル・フォルダを別のフォルダへ移す（ファイルツリーのドラッグ＆ドロップと同じ。
-    /// 同名・自分の配下・別のボリュームは断る。開いているペインは新しいパスへ付け替わる）
+    /// 同名・自分の配下・別のボリュームは断る。開いているペインは新しいパスへ付け替わる）。
+    /// 最後の引数が移動先のフォルダ。複数を渡すとまとめて移す（1 件でも断られたら終了コード 1）
     Move {
-        /// 移すファイル・フォルダ
-        path: String,
-        /// 移動先のフォルダ
-        dest: String,
+        /// 移すもの（1 つ以上）と、最後に移動先のフォルダ
+        #[arg(required = true, num_args = 2.., value_name = "SRC... DEST")]
+        paths: Vec<String>,
     },
     /// ファイル・フォルダを別のフォルダへ複製する（ファイルツリーのコピー → 貼り付けと同じ。
     /// フォルダは中身ごと。同名は上書きせず「名前 のコピー」等の別名で置く。自分の配下へは断る）。
@@ -2006,13 +2013,24 @@ enum FileCommand {
     Paste {
         /// 貼り付け先（フォルダならその中・ファイルならそのフォルダ。省略時はカレントディレクトリ）
         dest: Option<String>,
+        /// 移動として貼る（コピーしたものも移す = ファイルツリーの ⌥⌘V / Windows は Ctrl+Alt+V）
+        #[arg(long = "move")]
+        as_move: bool,
     },
+    /// 走っているコピーの進み具合（件数・バイト）を表示する
+    Progress,
+    /// 走っているコピーを取り消す（作りかけは消す。ID は `tako file progress` の id、省略で全部）
+    Cancel { id: Option<u64> },
     /// 新しいファイルを作成する（path 配下に name で作成）
     Create { path: String, name: String },
     /// 新しいフォルダを作成する（path 配下に name で作成）
     Mkdir { path: String, name: String },
-    /// ファイル・フォルダをゴミ箱（Windows はごみ箱）へ移動する（完全削除ではない）
-    Trash { path: String },
+    /// ファイル・フォルダをゴミ箱（Windows はごみ箱）へ移動する（完全削除ではない）。
+    /// 複数を渡すとまとめて移す（1 件でも断られたら終了コード 1）
+    Trash {
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+    },
     /// デフォルトアプリで開く
     Open { path: String },
     /// 指定アプリで開く
@@ -4221,6 +4239,10 @@ fn cli_main() -> ExitCode {
         Command::Run(ref args) if args.list => run_list(&cli.command),
         // #1860: コピー元が複数なら 1 件ずつ同じ dispatch へ送る
         Command::File(FileCommand::Copy { ref paths }) => file_copy_cli(paths),
+        // #1867: まとめた操作は 1 件でも断られたら終了コード 1（結果は出してから = mv / rm と同じ）
+        Command::File(FileCommand::Move { .. } | FileCommand::Trash { .. }) => {
+            file_many_cli(&cli.command)
+        }
         command => run(command),
     };
     match result {
@@ -8381,14 +8403,20 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: None,
             dest: None,
         },
-        // #1834: 移す元・移動先ともに CLI の cwd 基準で絶対パスへ（GUI の cwd で読ませない）
-        Command::File(FileCommand::Move { path, dest }) => Request::FileOp {
-            op: tako_control::protocol::FileOpKind::Move,
-            path: resolve_cli_path(path),
-            name: None,
-            pane: None,
-            dest: Some(resolve_cli_path(dest)),
-        },
+        // #1834: 移す元・移動先ともに CLI の cwd 基準で絶対パスへ（GUI の cwd で読ませない）。
+        // #1867: 移す元が複数ならまとめた要求（ツリーの複数選択の D&D と同じ 1 要求）
+        Command::File(FileCommand::Move { paths }) => {
+            let Some((dest, sources)) = paths.split_last().filter(|(_, s)| !s.is_empty()) else {
+                return Err(
+                    "移すものと移動先のフォルダを指定する（例: tako file move a.txt dst）".into(),
+                );
+            };
+            file_op_for(
+                tako_control::protocol::FileOpKind::Move,
+                sources,
+                Some(resolve_cli_path(dest)),
+            )
+        }
         // #1860: コピー元が 1 つのとき。複数は main の `file_copy_cli` が 1 件ずつ送る
         Command::File(FileCommand::Copy { paths }) => {
             let mut requests = file_copy_requests(paths)?;
@@ -8399,14 +8427,21 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::File(FileCommand::Clipboard { action }) => {
             let (op, path) = match action {
-                Some(FileClipboardCommand::Copy { path }) => (
-                    tako_control::protocol::FileOpKind::ClipboardCopy,
-                    path.as_str(),
-                ),
-                Some(FileClipboardCommand::Cut { path }) => (
-                    tako_control::protocol::FileOpKind::ClipboardCut,
-                    path.as_str(),
-                ),
+                // #1867: 複数ならまとめた要求（ツリーの複数選択の ⌘C / ⌘X と同じ 1 要求）
+                Some(FileClipboardCommand::Copy { paths }) => {
+                    return Ok(file_op_for(
+                        tako_control::protocol::FileOpKind::ClipboardCopy,
+                        paths,
+                        None,
+                    ))
+                }
+                Some(FileClipboardCommand::Cut { paths }) => {
+                    return Ok(file_op_for(
+                        tako_control::protocol::FileOpKind::ClipboardCut,
+                        paths,
+                        None,
+                    ))
+                }
                 Some(FileClipboardCommand::Show { dir }) => (
                     tako_control::protocol::FileOpKind::Clipboard,
                     dir.as_deref().unwrap_or("."),
@@ -8422,10 +8457,29 @@ fn build_request(command: &Command) -> Result<Request, String> {
             }
         }
         // 貼り付け先は CLI の cwd 基準（GUI の cwd で読ませない = move と同じ）
-        Command::File(FileCommand::Paste { dest }) => Request::FileOp {
-            op: tako_control::protocol::FileOpKind::Paste,
+        Command::File(FileCommand::Paste { dest, as_move }) => Request::FileOp {
+            // #1867: `--move` = ツリーの ⌥⌘V（コピーしたものも移す）
+            op: if *as_move {
+                tako_control::protocol::FileOpKind::PasteMove
+            } else {
+                tako_control::protocol::FileOpKind::Paste
+            },
             path: resolve_cli_path(dest.as_deref().unwrap_or(".")),
             name: None,
+            pane: None,
+            dest: None,
+        },
+        Command::File(FileCommand::Progress) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::CopyProgress,
+            path: String::new(),
+            name: None,
+            pane: None,
+            dest: None,
+        },
+        Command::File(FileCommand::Cancel { id }) => Request::FileOp {
+            op: tako_control::protocol::FileOpKind::CopyCancel,
+            path: String::new(),
+            name: id.map(|id| id.to_string()),
             pane: None,
             dest: None,
         },
@@ -8443,13 +8497,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: None,
             dest: None,
         },
-        Command::File(FileCommand::Trash { path }) => Request::FileOp {
-            op: tako_control::protocol::FileOpKind::Trash,
-            path: resolve_cli_path(path),
-            name: None,
-            pane: None,
-            dest: None,
-        },
+        Command::File(FileCommand::Trash { paths }) => {
+            file_op_for(tako_control::protocol::FileOpKind::Trash, paths, None)
+        }
         Command::File(FileCommand::Open { path }) => Request::FileOp {
             op: tako_control::protocol::FileOpKind::OpenDefault,
             path: resolve_cli_path(path),
@@ -9702,6 +9752,44 @@ fn file_copy_cli(paths: &[String]) -> Result<(), String> {
     }
     if failed > 0 {
         return Err(format!("{total} 件中 {failed} 件をコピーできなかった"));
+    }
+    Ok(())
+}
+
+/// 1 件なら単数の `FileOp`、複数ならまとめた `FileOpMany`（#1867。MCP の `path` / `paths` と
+/// 同じ振り分け = 同じ入力なら同じ要求・同じ応答）。パスは CLI の cwd 基準で絶対化する
+fn file_op_for(
+    op: tako_control::protocol::FileOpKind,
+    paths: &[String],
+    dest: Option<String>,
+) -> Request {
+    match paths {
+        [one] => Request::FileOp {
+            op,
+            path: resolve_cli_path(one),
+            name: None,
+            pane: None,
+            dest,
+        },
+        many => Request::FileOpMany {
+            op,
+            paths: many.iter().map(|p| resolve_cli_path(p)).collect(),
+            dest,
+        },
+    }
+}
+
+/// `tako file move` / `trash`（#1867）。結果を出してから、まとめた要求で断られたものがあれば
+/// 終了コード 1（`mv` / `rm` と同じ。続きは dispatch が続けている）
+fn file_many_cli(command: &Command) -> Result<(), String> {
+    let request = build_request(command)?;
+    let many = matches!(request, Request::FileOpMany { .. });
+    let result = send_request(request)?;
+    print_result(command, &result);
+    let failed = result["failed"].as_array().map_or(0, Vec::len);
+    if many && failed > 0 {
+        let done = result["done"].as_array().map_or(0, Vec::len);
+        return Err(format!("{} 件中 {failed} 件をできなかった", done + failed));
     }
     Ok(())
 }
