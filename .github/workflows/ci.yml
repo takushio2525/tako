@@ -156,6 +156,13 @@ jobs:
       # 戻ったらここで落ちる**（#1005 / #1136）
       - name: 夜間リリースのモックテスト
         run: bash scripts/test-nightly-reserve.sh
+      # 夜間リリースの前段の tako mod の検査（`claude plugin validate --strict` / `test`）の
+      # モックテスト。claude・osascript・release.sh はスタブ、HOME も隔離するので本番の
+      # 設定・記録・タグには触らない（実物の claude が無いランナーでは実物の段を「未実測」で飛ばす）。
+      # **壊れた登録で通知が出ない・検査の失敗で夜間リリースが止まる・固まった claude を
+      # 打ち切らない・利用者の設定 dir を使う形へ戻ったらここで落ちる**（#1892）
+      - name: 夜間の tako mod の検査のモックテスト
+        run: bash scripts/test-nightly-mod-check-1892.sh
       # .app の差し替え（置き場のパスを一度も空けない）のモックテスト。一時ディレクトリの
       # dummy .app だけを相手にするので本番の /Applications には触らない。
       # **Dock のピンが逃げる形へ戻ったらここで落ちる**（#1042）

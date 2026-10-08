@@ -434,7 +434,8 @@ S1〜S6 には入れない。
   `isSidechain` 除外と同じ理由）
 - 検証: `claude plugin validate` が通ること・`claude plugin test` の `*.test.ts` が terminal と
   desktop の両 surface で通ること。`scripts/` にまとめる（`claude` が無い CI では飛ばして
-  「未実測」と出す。CI に `claude` を入れるかは [提案]）
+  「未実測」と出す）。**夜間リリースの前段で毎晩回す**（`scripts/check-claude-mod.sh`。#1892。
+  運用は `.agent/release.md`「tako mod の検査」）。CI に `claude` を入れるかは [提案]
 
 ## 6. 落ち方（mod が無い・古い・止まったとき）
 
@@ -573,7 +574,8 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
 - **API の揺れ**: mod の API は early access。Claude Code の更新で mod が読まれなくなると、
   §6 のとおり画面読み取りへ落ちるだけで壊れはしないが、気づけないと「いつの間にか一次ソースが
   消えていた」になる。`tako mod status` / `check-health` に「claude を起動したのに 60 秒報告が
-  無い」ペインを出す（S1）。`claude` を CI に入れて validate / test を夜間に回すのは [提案]
+  無い」ペインを出す（S1）。validate / test は夜間リリースの前段で毎晩回し、落ちたら通知する
+  （#1892。前回合格した claude の版と比べて「Claude Code の更新で壊れた」かを出し分ける）
 - 版 2.1.287〜2.1.293 は未実測（下限を 2.1.294 にした理由）
 - Windows の Claude Code で mod（と `CLAUDE_CODE_PLUGIN_DIRS` の `;` 区切り）が動くかは未実測
 - desktop / VS Code 拡張 / Remote Control の surface は未実測（tako のペインは terminal だけなので

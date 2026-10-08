@@ -17,6 +17,9 @@
 #
 # 動作（1 回の実行）:
 #   1. 多重起動ロック（~/.claude-orchestrator/locks/）を取得。取れなければ即終了
+#   1.5 tako mod の検査（#1892）: origin/main の mod を `claude plugin validate --strict` /
+#      `claude plugin test` にかけ、落ちたら通知する。**リリースの有無に依らず毎晩**回し、
+#      **結果でリリースを止めない**（理由は run_mod_check の注記。claude が無ければ未実測）
 #   2. worktree が clean か確認（dirty = 人間の作業中 → スキップ）
 #   3. git fetch → 最新タグ vs origin/main。差分ゼロなら「変更なしスキップ」
 #   4. Cargo.toml の version == 最新タグのときのみ bump する
@@ -404,6 +407,44 @@ restore_detached_head() {
 }
 restore_detached_head
 HEAD_REF_AT_START=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+
+# ---- tako mod の検査（#1892）------------------------------------------------
+# Claude Code の更新で mod（crates/tako-core/claude-mod）が読まれなくなったことに気づくため、
+# origin/main の mod を `claude plugin validate --strict` / `claude plugin test` へ毎晩かける
+# （本体は scripts/check-claude-mod.sh。使い捨ての設定 dir で回し、利用者の設定には触らない）。
+# 壊すのは tako の変更より Claude Code の更新なので、**リリースの有無に依らず毎晩**回す
+# （変更なし / dirty / 手動リリース進行中で抜ける前に置く）。
+# **結果でリリースを止めない**（落ちても通知とログを出して先へ進む）:
+#   - 配布済みの版も同じ mod を持つので、止めても利用者は守れず、無関係な修正の配布だけが止まる
+#   - mod が読まれなくても tako は画面の読み取りへ落ちるだけで壊れない（設計書 §6）
+#   - 更新を tako が制御できない外部の CLI の揺れで、夜間リリースが止まる形にしない
+# 遅らせるのは実測 1〜2 秒。claude が固まっても各段の上限（既定 60 秒）で打ち切る
+run_mod_check() {
+  local script="$REPO_ROOT/scripts/check-claude-mod.sh" out rc=0 line summary
+  if [[ ! -f "$script" ]]; then
+    log "WARN: scripts/check-claude-mod.sh が無いので mod の検査を飛ばす（${REPO_ROOT}）"
+    return 0
+  fi
+  # 検査するのは origin/main（次に出る版）。取れなくても手元の origin/main で続ける
+  git -C "$REPO_ROOT" fetch origin --quiet 2>/dev/null \
+    || log "WARN: git fetch に失敗。手元の origin/main の mod で検査する"
+  out=$(/bin/bash "$script" --ref origin/main --record 2>&1) || rc=$?
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then log "  mod: ${line}"; fi
+  done <<< "$out"
+  summary=$(printf '%s\n' "$out" | sed -n 's/^結果: //p' | tail -1)
+  case "$rc" in
+    0) ;;
+    3) log "mod の検査は未実測（claude が無い）。夜間リリースは続ける" ;;
+    *)
+      log "ERROR: mod の検査が不合格（exit ${rc}）。夜間リリースは止めずに続ける（記録: ${HOME}/.claude-orchestrator/state/tako-mod-check）"
+      # 通知の本文は AppleScript の文字列へ入るので " を落とす
+      notify "mod の検査: ${summary//\"/}"
+      ;;
+  esac
+  return 0
+}
+run_mod_check || log "WARN: mod の検査が途中で失敗した。夜間リリースは続ける"
 
 # ---- 次回バージョン予約の読み取り（この時点では消費しない）------------------
 # 「リリースに至ったときだけ消費する」ため、以降のスキップ経路では保持したまま抜ける
