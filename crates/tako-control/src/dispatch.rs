@@ -4683,21 +4683,51 @@ fn dispatch_inner(
             direction,
             case_sensitive,
             whole_word,
+            visible,
         } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            // 条件の決め方は tako-core の 1 実装（#1653）。query を渡せば既定から、
-            // 省略すれば今の検索の条件から組む
-            let current = host.preview_search_options(target).unwrap_or_default();
-            let options =
-                SearchOptions::resolve(current, query.is_some(), case_sensitive, whole_word);
-            let mut result = host
-                .preview_search(target, query, options, direction.as_deref())
-                .map_err(DispatchError::Operation)?;
-            with_search_options(&mut result, options);
-            Ok(json!({
+            // #1873: 検索欄を開くのは探す前（開いた欄の上で探す = GUI の ⌘F → 打鍵と同じ順）
+            if visible == Some(true) {
+                host.set_preview_search_visible(target, true)
+                    .map_err(DispatchError::Operation)?;
+            }
+            // 開閉だけ（query も direction も無い）なら探さない（GUI の ⌘F・Escape は
+            // ヒットへ飛ばない）。開閉を渡さない呼び出しは従来どおり探す
+            let searches = visible.is_none() || query.is_some() || direction.is_some();
+            let mut result = if searches {
+                // 条件の決め方は tako-core の 1 実装（#1653）。query を渡せば既定から、
+                // 省略すれば今の検索の条件から組む
+                let current = host.preview_search_options(target).unwrap_or_default();
+                let options =
+                    SearchOptions::resolve(current, query.is_some(), case_sensitive, whole_word);
+                let mut result = host
+                    .preview_search(target, query, options, direction.as_deref())
+                    .map_err(DispatchError::Operation)?;
+                with_search_options(&mut result, options);
+                result
+            } else {
+                json!({})
+            };
+            // 閉じるのは探した後（閲覧中の Markdown はここで描画へ戻る）
+            if visible == Some(false) {
+                host.set_preview_search_visible(target, false)
+                    .map_err(DispatchError::Operation)?;
+            }
+            if let Some(search) = result.as_object_mut() {
+                search.insert(
+                    "visible".into(),
+                    json!(host.preview_search_visible(target).unwrap_or(false)),
+                );
+            }
+            let mut out = json!({
                 "pane": target.as_u64(),
                 "search": result,
-            }))
+            });
+            // 開閉で表示モードが変わる（閲覧中の Markdown は検索中 code・閉じたら markdown）
+            if let Some((_, mode)) = host.preview_state(target) {
+                out["mode"] = json!(mode.as_str());
+            }
+            Ok(out)
         }
         Request::PreviewReplace {
             pane,
@@ -18328,6 +18358,10 @@ mod tests {
             std::collections::HashMap<u64, (bool, bool, tako_core::text_edit::TextBuffer)>,
         /// 検索欄の状態（#1653）: (クエリ, 条件)。GUI の `EditState` の検索部分の写し
         preview_search: std::collections::HashMap<u64, (String, SearchOptions)>,
+        /// 検索欄を開いているペイン（#1873。GUI の `EditState::search_visible` の写し）
+        preview_search_bars: std::collections::HashSet<u64>,
+        /// 検索欄の開閉と検索が呼ばれた順（#1873。`open` / `close` / `search`）
+        preview_search_events: Vec<&'static str>,
         /// #1660: 上限を超えて末尾を省略したプレビュー（GUI の `PreviewState::truncated` の代役）
         preview_limits: std::collections::HashMap<u64, tako_core::preview_limit::Truncation>,
         /// #1659: 編集開始で**実ファイルを開く**か（既定 false = 従来どおり空のバッファ）。
@@ -18451,6 +18485,8 @@ mod tests {
                 last_outline_target: None,
                 preview_edits: std::collections::HashMap::new(),
                 preview_search: std::collections::HashMap::new(),
+                preview_search_bars: std::collections::HashSet::new(),
+                preview_search_events: Vec::new(),
                 preview_limits: std::collections::HashMap::new(),
                 preview_real_files: false,
                 preview_conflicts: std::collections::HashMap::new(),
@@ -19187,6 +19223,7 @@ mod tests {
             options: SearchOptions,
             _direction: Option<&str>,
         ) -> Result<serde_json::Value, String> {
+            self.preview_search_events.push("search");
             let buffer = &self
                 .preview_edits
                 .get(&pane.as_u64())
@@ -19202,6 +19239,29 @@ mod tests {
             state.1 = options;
             let total = buffer.find_all(&state.0, options).len();
             Ok(json!({ "query": state.0, "total": total }))
+        }
+        /// #1873: 開閉の順だけを記録する（描画へ戻す中身は GUI の visual 節と実経路テストが見る）
+        fn set_preview_search_visible(
+            &mut self,
+            pane: PaneId,
+            visible: bool,
+        ) -> Result<(), String> {
+            if !self.previews.contains_key(&pane.as_u64()) {
+                return Err("プレビューペインではない".into());
+            }
+            if visible {
+                self.preview_search_events.push("open");
+                self.preview_search_bars.insert(pane.as_u64());
+            } else {
+                self.preview_search_events.push("close");
+                self.preview_search_bars.remove(&pane.as_u64());
+            }
+            Ok(())
+        }
+        fn preview_search_visible(&self, pane: PaneId) -> Option<bool> {
+            self.previews
+                .contains_key(&pane.as_u64())
+                .then(|| self.preview_search_bars.contains(&pane.as_u64()))
         }
         fn preview_replace(
             &mut self,
@@ -23883,6 +23943,7 @@ mod tests {
                     direction: None,
                     case_sensitive,
                     whole_word,
+                    visible: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -23955,6 +24016,79 @@ mod tests {
         assert_eq!(out["replace"]["replaced"], 1);
         assert_eq!(out["replace"]["case_sensitive"], false);
         assert_eq!(body(&host), "let item = item::new();\nitem VALUE items\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1873: 検索欄の開閉（`visible`）は ControlHost の開閉の口を通る。
+    ///
+    /// - 開くのは探す前・閉じるのは探した後（開いた欄の上で探す = GUI の ⌘F → 打鍵と同じ順）
+    /// - 開閉だけ（query も direction も無い）なら探さない（GUI の ⌘F・Escape はヒットへ飛ばない）
+    /// - 開閉を渡さない呼び出しは従来どおり探す
+    /// - 応答の `search.visible` に開閉の状態、`mode` に表示モードが載る
+    /// - プレビューでないペインは理由つきで断る
+    #[test]
+    fn issue1873_検索欄の開閉は探す前に開き探した後に閉じる() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-1873-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let pane = preview_with_text(&mut host, &dir, "needle\n");
+        let send = |host: &mut MockHost,
+                    query: Option<&str>,
+                    direction: Option<&str>,
+                    visible: Option<bool>| {
+            host.preview_search_events.clear();
+            let out = dispatch(
+                host,
+                Request::PreviewSearch {
+                    pane: Some(pane),
+                    query: query.map(str::to_string),
+                    direction: direction.map(str::to_string),
+                    case_sensitive: None,
+                    whole_word: None,
+                    visible,
+                },
+                PaneOrigin::Cli,
+            );
+            (out, host.preview_search_events.clone())
+        };
+        let (out, events) = send(&mut host, None, None, Some(true));
+        let out = out.unwrap();
+        assert_eq!(events, ["open"], "開くだけなら探さない");
+        assert_eq!(out["search"], json!({ "visible": true }));
+        assert_eq!(out["mode"], "code");
+        let (out, events) = send(&mut host, Some("needle"), None, Some(true));
+        assert_eq!(events, ["open", "search"], "開いてから探す");
+        assert_eq!(out.unwrap()["search"]["total"], 1);
+        let (out, events) = send(&mut host, Some("needle"), None, None);
+        let out = out.unwrap();
+        assert_eq!(events, ["search"], "開閉を渡さなければ従来どおり探すだけ");
+        assert_eq!(out["search"]["visible"], true, "{out}");
+        let (out, events) = send(&mut host, None, Some("prev"), Some(false));
+        assert_eq!(events, ["search", "close"], "探してから閉じる");
+        assert_eq!(out.unwrap()["search"]["visible"], false);
+        let (out, events) = send(&mut host, None, None, Some(false));
+        assert_eq!(events, ["close"], "閉じるだけなら探さない");
+        assert_eq!(out.unwrap()["search"], json!({ "visible": false }));
+        // プレビューでないペイン（別のホストのルート = 端末）は断る
+        let mut terminal = MockHost::new();
+        let root = terminal.root_pane();
+        let refused = dispatch(
+            &mut terminal,
+            Request::PreviewSearch {
+                pane: Some(root),
+                query: None,
+                direction: None,
+                case_sensitive: None,
+                whole_word: None,
+                visible: Some(false),
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(
+            matches!(&refused, Err(DispatchError::Operation(m)) if m.contains("プレビューペインではない")),
+            "{refused:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

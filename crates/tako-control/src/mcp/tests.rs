@@ -296,6 +296,7 @@ mod tests {
                 direction: None,
                 case_sensitive: None,
                 whole_word: None,
+                visible: None,
             }]
         );
         let (_, requests) = run(
@@ -314,6 +315,7 @@ mod tests {
                 direction: None,
                 case_sensitive: Some(false),
                 whole_word: Some(true),
+                visible: None,
             }]
         );
         let (_, requests) = run(
@@ -368,6 +370,44 @@ mod tests {
         );
         assert!(requests.is_empty(), "型違いが Request まで届いた");
         assert!(response.unwrap().to_string().contains("case_sensitive"));
+    }
+
+    /// #1873: 検索欄の開閉は `visible` が CLI（`--open` / `--close`）と 1:1 で渡る。
+    /// 省略したときは wire に載らない（引数が生える前の JSON とバイト一致）
+    #[test]
+    fn issue1873_検索欄の開閉はvisibleでそのまま渡る() {
+        for visible in [true, false] {
+            let (_, requests) = run(
+                call("tako_preview_search", json!({ "visible": visible })),
+                Some(7),
+                true,
+            );
+            assert_eq!(
+                requests,
+                vec![Request::PreviewSearch {
+                    pane: Some(7),
+                    query: None,
+                    direction: None,
+                    case_sensitive: None,
+                    whole_word: None,
+                    visible: Some(visible),
+                }]
+            );
+        }
+        let (_, requests) = run(
+            call("tako_preview_search", json!({ "query": "v" })),
+            Some(7),
+            true,
+        );
+        let wire = serde_json::to_value(&requests[0]).unwrap();
+        assert!(wire.get("visible").is_none(), "{wire}");
+        let (response, requests) = run(
+            call("tako_preview_search", json!({ "visible": "open" })),
+            Some(7),
+            true,
+        );
+        assert!(requests.is_empty(), "型違いが Request まで届いた");
+        assert!(response.unwrap().to_string().contains("visible"));
     }
 
     /// 受けた Request を記録して固定値を返す exec

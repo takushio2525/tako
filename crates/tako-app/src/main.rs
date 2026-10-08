@@ -13964,6 +13964,64 @@ impl TakoApp {
         Ok(redone)
     }
 
+    /// 検索欄を開く（#1873。GUI の ⌘F と CLI / MCP の `PreviewSearch { visible: true }` の 1 実装）。
+    ///
+    /// 閲覧中でも開けるよう、編集セッションが無ければ `editing = false` で開く。
+    /// 開いただけでは表示を変えない（エディタの行へ落ちるのは探してヒットへ飛んだとき）
+    fn open_preview_search_bar(&mut self, pane_id: PaneId) -> Result<(), String> {
+        if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+            edit.search_visible = true;
+            return Ok(());
+        }
+        let state = self
+            .previews
+            .get(&pane_id)
+            .ok_or_else(|| "プレビューペインではない".to_string())?;
+        if !matches!(
+            state.mode,
+            preview::PreviewMode::Code | preview::PreviewMode::Markdown
+        ) {
+            return Err("テキスト以外のプレビュー（PDF・画像・動画）は検索欄を開けない".into());
+        }
+        let mut edit = preview::EditState::open(state)?;
+        edit.editing = false;
+        edit.search_visible = true;
+        self.preview_edits.insert(pane_id, edit);
+        Ok(())
+    }
+
+    /// 検索欄を閉じる（#1873。GUI の Escape・⌘F のトグルと CLI / MCP の
+    /// `PreviewSearch { visible: false }` の 1 実装）。
+    ///
+    /// 閲覧中に描画（Markdown）から開いた検索なら、エディタの行へ落ちた表示を描画へ戻して
+    /// 目次を作り直し（#1661 の `restore_rendered_preview`。ヒットのあった節の見出しから描く）、
+    /// 未保存の変更が無ければ編集セッションも畳む（残ると目アイコンが出ない）。
+    /// 描き直すのは表示が実際にエディタの行へ落ちていたときだけ（探さずに開いて閉じただけで
+    /// 組み直すと全文を解き直し、大きい文書は読み込み中の表示を挟む）。編集中・コード表示由来なら
+    /// 閉じるだけ
+    fn close_preview_search_bar(&mut self, pane_id: PaneId) {
+        let Some(edit) = self.preview_edits.get_mut(&pane_id) else {
+            return;
+        };
+        edit.search_visible = false;
+        // 区別しない検索の小文字写しは本文と同じ大きさがあるので、閉じたら手放す（#1653）
+        edit.buffer.release_search_cache();
+        if !edit.search_close_resumes_rendered() {
+            return;
+        }
+        let dirty = edit.dirty();
+        if self
+            .previews
+            .get(&pane_id)
+            .is_some_and(|p| p.mode != preview::PreviewMode::Markdown)
+        {
+            self.restore_rendered_preview(pane_id);
+        }
+        if !dirty {
+            self.preview_edits.remove(&pane_id);
+        }
+    }
+
     fn preview_search_local(
         &mut self,
         pane_id: PaneId,
@@ -14033,9 +14091,14 @@ impl TakoApp {
         let total = edit.search_hits.len();
         let index = if total > 0 { edit.search_index + 1 } else { 0 };
         let query = edit.search_query.clone();
-        // #1649: ヒットへ飛んだだけでは本文を組み直さないので、ここから直接追う
-        // （閲覧中の ⌘F も編集セッションを開くので同じ器で効く）
-        self.follow_preview_cursor(pane_id);
+        if edit.search_visible {
+            // #1873: 開いた検索欄の上で探した = 打鍵（`update_search_hits`）と同じく表示を組む
+            // （ヒットはエディタの行の上に描く。カーソルの追従もこの中で効く）
+            self.refresh_preview_from_editor(pane_id);
+        } else {
+            // #1649: ヒットへ飛んだだけでは本文を組み直さないので、ここから直接追う
+            self.follow_preview_cursor(pane_id);
+        }
         let mut out = serde_json::json!({
             "query": query,
             "total": total,
@@ -14375,9 +14438,8 @@ impl TakoApp {
         };
         match keystroke.key.as_str() {
             "escape" => {
-                edit.search_visible = false;
-                // 区別しない検索の小文字写しは本文と同じ大きさがあるので、閉じたら手放す（#1653）
-                edit.buffer.release_search_cache();
+                // #1873: 閉じる口は 1 実装（閲覧中の Markdown はここで描画へ戻る）
+                self.close_preview_search_bar(pane_id);
                 cx.notify();
                 true
             }
@@ -24177,6 +24239,25 @@ impl PreviewHost for TakoApp {
             .map(|edit| edit.search_options)
     }
 
+    fn set_preview_search_visible(&mut self, pane: PaneId, visible: bool) -> Result<(), String> {
+        if visible {
+            return self.open_preview_search_bar(pane);
+        }
+        if !self.previews.contains_key(&pane) {
+            return Err("プレビューペインではない".into());
+        }
+        self.close_preview_search_bar(pane);
+        Ok(())
+    }
+
+    fn preview_search_visible(&self, pane: PaneId) -> Option<bool> {
+        self.previews.contains_key(&pane).then(|| {
+            self.preview_edits
+                .get(&pane)
+                .is_some_and(|edit| edit.search_visible)
+        })
+    }
+
     fn preview_search(
         &mut self,
         pane: PaneId,
@@ -26519,20 +26600,17 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &JumpForward, _, cx| this.jump_step("forward", cx)))
             .on_action(cx.listener(|this, _: &FindPreview, _, cx| {
                 let pane_id = this.focused_pane();
-                if let Some(edit) = this.preview_edits.get_mut(&pane_id) {
-                    edit.search_visible = !edit.search_visible;
-                    // 閉じたら区別しない検索の小文字写しを手放す（Escape と同じ。#1653）
-                    if !edit.search_visible {
-                        edit.buffer.release_search_cache();
-                    }
-                } else if this.previews.contains_key(&pane_id) {
-                    if let Ok(mut new_edit) =
-                        preview::EditState::open(this.previews.get(&pane_id).unwrap())
-                    {
-                        new_edit.editing = false;
-                        new_edit.search_visible = true;
-                        this.preview_edits.insert(pane_id, new_edit);
-                    }
+                // #1873: 開閉は CLI / MCP（`PreviewSearch` の `visible`）と同じ 2 つの口を通る。
+                // 閉じる側は Escape と同じ（閲覧中の Markdown は描画へ戻る）
+                if this
+                    .preview_edits
+                    .get(&pane_id)
+                    .is_some_and(|edit| edit.search_visible)
+                {
+                    this.close_preview_search_bar(pane_id);
+                } else {
+                    // テキスト以外（PDF・画像）は開けないので何もしない（従来どおり）
+                    let _ = this.open_preview_search_bar(pane_id);
                 }
                 cx.notify();
             }))
@@ -39639,6 +39717,7 @@ mod self_test {
                             direction: Some("next".into()),
                             case_sensitive: None,
                             whole_word: None,
+                            visible: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -42781,6 +42860,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1873: 閲覧中の ⌘F 検索を閉じると描画へ戻り、目次が作られるか（実キーの経路）
+                "md-find-restore" => {
+                    md_find_restore_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1834: ツリーの行を実マウスでドラッグして移せるか・断る場所で理由が出るか・
                 // 開いているペインが付け替わるか・ペインへの既存の D&D が壊れていないか
                 "tree-move" => {
@@ -42804,7 +42889,7 @@ mod self_test {
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / completion / completion-real / lsp-context-menu / \
-                         lsp-context-menu-real / md-edit-resume）"
+                         lsp-context-menu-real / md-edit-resume / md-find-restore）"
                     );
                     std::process::exit(1);
                 }
@@ -42872,6 +42957,8 @@ mod self_test {
             external_change_visual(any, window, cx).await;
             // #1661: Markdown を編集して抜けると描画へ戻り、目次が作り直されるか
             md_edit_resume_visual(any, window, cx).await;
+            // #1873: 閲覧中の ⌘F 検索を閉じると描画へ戻り、目次が作られるか
+            md_find_restore_visual(any, window, cx).await;
             // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
             goto_hover_visual(any, window, cx).await;
             // #1684: 本文の右クリックメニューに言語サーバの項目が出て、押すと動くか（偽サーバ）。
@@ -49935,6 +50022,7 @@ mod self_test {
                             direction: None,
                             case_sensitive: None,
                             whole_word: None,
+                            visible: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -53015,6 +53103,421 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 閲覧中の ⌘F 検索を閉じると描画へ戻り、目次が作り直されるか（#1873）。
+    ///
+    /// 場面: 描画表示の md で ⌘F（Windows は Ctrl+Shift+F）を押し、クエリを入れて Enter で
+    /// ヒットへ飛ぶ（ここで表示はエディタの行 = `code` へ落ちる。ヒットはエディタの行の上に
+    /// 描くので意図どおり）。①Escape で閉じると表示モードが Markdown へ戻り、目次が作られ、
+    /// ヒットのあった節の見出しから描かれ、編集セッションも畳まれる（目アイコンが戻る）
+    /// ②⌘F のトグルで閉じても同じ ②'探さずに開いて閉じただけなら描き直さない（表示の版が
+    /// 変わらない・見ている位置が動かない）③未保存の編集中に ⌘F → 閉じても編集は保つ
+    /// ④編集を抜けた未保存のセッションでも閉じたら描画へ戻り、セッションは残る
+    /// ⑤コードのファイルは今までどおり（閉じてもコード表示）。
+    /// 打鍵は `window.dispatch_keystroke`（キーバインド判定 → `FindPreview` / 検索欄の
+    /// Escape・Enter）へ流す。**文字は打たない**: クエリは dispatch（CLI `tako edit search` と
+    /// 同じ口）で入れる（実キーの文字は機の入力ソースが未確定文字列を立てることがある = #1661）。
+    /// A/B: `TAKO_1873_LEGACY=1` は ① の「描画へ戻る」で落ちる。
+    /// 単独実行は `TAKO_VISUAL_ONLY=md-find-restore`
+    #[cfg(feature = "visual-test")]
+    async fn md_find_restore_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let find_key = if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-shift-f"
+        };
+        let dir = std::env::temp_dir().join(format!("tako-visual-1873-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("visual-test md-find-restore 一時ディレクトリ");
+        let path = dir.join("note.md");
+        // Beta は画面の外に置く（閉じた後に「ヒットのあった節から描く」が見分けられる距離）
+        let filler: String = (0..80).map(|i| format!("filler line {i}\n\n")).collect();
+        let tail: String = (0..40).map(|i| format!("tail line {i}\n\n")).collect();
+        let fixture = format!(
+            "# Title\n\nintro\n\n## Alpha\n\nbody a\n\n{filler}## Beta\n\nneedle b\n\n{tail}"
+        );
+        std::fs::write(&path, &fixture).expect("visual-test md-find-restore fixture");
+        let code_path = dir.join("main.rs");
+        std::fs::write(&code_path, "fn main() {\n    let needle = 1;\n}\n")
+            .expect("visual-test md-find-restore コードの fixture");
+
+        let open = |cx: &mut AsyncApp, path: &std::path::Path, mode| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.drawer_visible = false;
+                    app.panel_visible = false;
+                    let base = app.focused_pane().as_u64();
+                    let opened = tako_control::dispatch(
+                        app,
+                        Req::OpenFile {
+                            pane: Some(base),
+                            path: path.display().to_string(),
+                            mode: Some(mode),
+                            direction: Some(tako_control::protocol::Direction::Right),
+                            focus: Some(true),
+                            new_tab: false,
+                            line: None,
+                            column: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .expect("visual-test md-find-restore を dispatch で開ける");
+                    cx.notify();
+                    let pane =
+                        PaneId::from_raw(opened["pane"].as_u64().expect("OpenFile 応答の pane"));
+                    let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                    pane
+                })
+                .unwrap_or_else(|_| fail("visual-test md-find-restore dispatch"))
+        };
+        let pane = open(cx, &path, tako_control::protocol::PreviewModeWire::Markdown);
+        // (表示モード, 目次の件数, 検索欄が開いているか, 編集中か, 未保存か, セッションがあるか)
+        let observe = |cx: &mut AsyncApp, pane: PaneId| {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let preview = app.previews.get(&pane);
+                    let edit = app.preview_edits.get(&pane);
+                    (
+                        preview.map(|p| p.mode),
+                        preview.map_or(0, |p| p.outline.items.len()),
+                        edit.is_some_and(|e| e.search_visible),
+                        edit.is_some_and(|e| e.editing),
+                        edit.is_some_and(preview::EditState::dirty),
+                        edit.is_some(),
+                    )
+                })
+                .unwrap_or((None, 0, false, false, false, false))
+        };
+        async fn until_outline(
+            cx: &mut AsyncApp,
+            window: WindowHandle<TakoApp>,
+            pane: PaneId,
+            len: usize,
+        ) -> bool {
+            for _ in 0..100 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let ready = window
+                    .update(cx, |app, _, _| {
+                        app.previews.get(&pane).is_some_and(|p| {
+                            p.mode == preview::PreviewMode::Markdown && p.outline.items.len() == len
+                        })
+                    })
+                    .unwrap_or(false);
+                if ready {
+                    return true;
+                }
+            }
+            false
+        }
+        let key = |cx: &mut AsyncApp, spec: &str| {
+            press(any, cx, spec);
+            notify_and_draw(any, window, cx);
+        };
+        // クエリは dispatch で入れる（CLI `tako edit search <q>` と同じ口）
+        let query = |cx: &mut AsyncApp, pane: PaneId, q: &str| {
+            window
+                .update(cx, |app, _, cx| {
+                    let r = tako_control::dispatch(
+                        app,
+                        Req::PreviewSearch {
+                            pane: Some(pane.as_u64()),
+                            query: Some(q.to_string()),
+                            direction: None,
+                            case_sensitive: None,
+                            whole_word: None,
+                            visible: None,
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    r.ok()
+                        .and_then(|v| v["search"]["total"].as_u64())
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0)
+        };
+        let dump = |cx: &mut AsyncApp, name: &str| {
+            if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                if let Some((frame, _)) = capture_frame(any, cx) {
+                    let _ = frame.save(std::path::Path::new(&dir).join(name));
+                }
+            }
+        };
+        // 描画の先頭ブロックと、目次 k 番目のブロック
+        let top_and_heading = |cx: &mut AsyncApp, k: usize| {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    let top = app
+                        .preview_body_lists
+                        .get(&pane)
+                        .map(|(list, _, _)| list.logical_scroll_top().item_ix);
+                    let heading = app.previews.get(&pane).and_then(|p| {
+                        match p.outline.items.get(k)?.target {
+                            tako_core::PreviewOutlineTarget::MarkdownBlock { block } => Some(block),
+                            _ => None,
+                        }
+                    });
+                    (top, heading)
+                })
+                .unwrap_or((None, None))
+        };
+        let code = Some(preview::PreviewMode::Code);
+        let markdown = Some(preview::PreviewMode::Markdown);
+        check(
+            until_outline(cx, window, pane, 3).await,
+            "visual-test md-find-restore: 描画表示で開いて目次が 3 件 (#1873)",
+        );
+
+        // ① ⌘F → クエリ → Enter（code へ落ちる）→ Escape で描画へ戻る
+        key(cx, find_key);
+        let opened = observe(cx, pane);
+        check(
+            opened.2 && !opened.3 && opened.0 == markdown,
+            &format!(
+                "visual-test md-find-restore: ⌘F で検索欄が開く（開いただけでは描画のまま。{opened:?}）(#1873)"
+            ),
+        );
+        let total = query(cx, pane, "needle");
+        key(cx, "enter");
+        let searching = observe(cx, pane);
+        check(
+            total == 1 && searching.2 && searching.0 == code,
+            &format!(
+                "visual-test md-find-restore: 検索中はエディタの行（code）の上にヒットを描く（{total} 件。{searching:?}）(#1873)"
+            ),
+        );
+        dump(cx, "md-find-0-searching.png");
+        key(cx, "escape");
+        let restored = until_outline(cx, window, pane, 3).await;
+        let closed = observe(cx, pane);
+        if !restored {
+            eprintln!("TAKO_VISUAL_1873: Escape の後 = {closed:?}");
+        }
+        check(
+            restored && !closed.2 && closed.0 == markdown,
+            "visual-test md-find-restore: Escape で閉じると描画（Markdown）へ戻り目次が作られる (#1873)",
+        );
+        check(
+            !closed.5,
+            "visual-test md-find-restore: 未保存の変更が無ければ編集セッションも畳む（目アイコンが戻る）(#1873)",
+        );
+        let (top, beta) = top_and_heading(cx, 2);
+        if top.is_none() || top != beta {
+            eprintln!("TAKO_VISUAL_1873: 閉じた後の先頭ブロック={top:?}（Beta = {beta:?}）");
+        }
+        check(
+            top.is_some() && top == beta,
+            "visual-test md-find-restore: ヒットのあった節（Beta）の見出しから描く (#1873)",
+        );
+        dump(cx, "md-find-1-escape.png");
+
+        // ② ⌘F のトグルで閉じても同じ
+        key(cx, find_key);
+        let total = query(cx, pane, "body a");
+        key(cx, "enter");
+        let searching = observe(cx, pane);
+        check(
+            total == 1 && searching.0 == code,
+            "visual-test md-find-restore: 2 回目の検索でも code へ落ちる (#1873)",
+        );
+        key(cx, find_key);
+        let restored = until_outline(cx, window, pane, 3).await;
+        let closed = observe(cx, pane);
+        check(
+            restored && !closed.2 && closed.0 == markdown && !closed.5,
+            &format!(
+                "visual-test md-find-restore: ⌘F のトグルで閉じても描画へ戻りセッションを畳む（{closed:?}）(#1873)"
+            ),
+        );
+        let (top, alpha) = top_and_heading(cx, 1);
+        check(
+            top.is_some() && top == alpha,
+            &format!(
+                "visual-test md-find-restore: トグルで閉じてもヒットのあった節（Alpha）から描く（{top:?} / {alpha:?}）(#1873)"
+            ),
+        );
+        dump(cx, "md-find-2-toggle.png");
+
+        // ②' 探さずに開いて閉じただけなら描き直さない（表示の版 `content_rev` が変わらない・
+        // 見ている位置も動かない）。描き直すと全文を解き直し、大きい文書は読み込み中の表示を挟む。
+        // 位置は見出しではなく節の途中（Alpha と Beta のあいだ）を見ておく
+        let (_, beta) = top_and_heading(cx, 2);
+        let mid = alpha.zip(beta).map(|(a, b)| (a + b) / 2);
+        let _ = window.update(cx, |app, _, cx| {
+            if let (Some(mid), Some((list, _, _))) = (mid, app.preview_body_lists.get(&pane)) {
+                list.scroll_to(gpui::ListOffset {
+                    item_ix: mid,
+                    offset_in_item: px(0.0),
+                });
+            }
+            cx.notify();
+        });
+        wait(cx, 100).await;
+        let rev = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.previews.get(&pane).map(|p| p.content_rev)
+                })
+                .ok()
+                .flatten()
+        };
+        let (before, _) = top_and_heading(cx, 2);
+        let rev_before = rev(cx);
+        key(cx, find_key);
+        key(cx, "escape");
+        wait(cx, 100).await;
+        let (after, _) = top_and_heading(cx, 2);
+        let rev_after = rev(cx);
+        let closed = observe(cx, pane);
+        check(
+            before.is_some()
+                && before == mid
+                && after == before
+                && rev_before.is_some()
+                && rev_after == rev_before
+                && closed.0 == markdown
+                && !closed.2
+                && !closed.5,
+            &format!(
+                "visual-test md-find-restore: 探さずに開いて閉じたら描き直さない（版 {rev_before:?} → {rev_after:?}・位置 {before:?} → {after:?}・節の途中 = {mid:?}・{closed:?}）(#1873)"
+            ),
+        );
+
+        // ③ 未保存の編集中に ⌘F → 閉じても編集は保つ
+        let edited = window
+            .update(cx, |app, _, cx| {
+                let started = app.set_preview_editing_local(pane, true);
+                if let Some(edit) = app.preview_edits.get_mut(&pane) {
+                    edit.autosave = false;
+                }
+                let r = tako_control::dispatch(
+                    app,
+                    Req::PreviewEditRange {
+                        pane: Some(pane.as_u64()),
+                        start_line: 1,
+                        start_col: "# Title".len(),
+                        end_line: 1,
+                        end_col: "# Title".len(),
+                        text: " v2".into(),
+                        expected_version: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                started.is_ok() && r.is_ok()
+            })
+            .unwrap_or(false);
+        check(
+            edited,
+            "visual-test md-find-restore: 編集を始めて見出しを書き換えられる (#1873)",
+        );
+        for (step, closer) in [("Escape", "escape"), ("⌘F のトグル", find_key)] {
+            key(cx, find_key);
+            query(cx, pane, "needle");
+            key(cx, "enter");
+            key(cx, closer);
+            wait(cx, 100).await;
+            let kept = observe(cx, pane);
+            check(
+                !kept.2 && kept.3 && kept.4 && kept.0 == code,
+                &format!(
+                    "visual-test md-find-restore: 編集中に {step} で閉じても編集（code・未保存）を保つ（{kept:?}）(#1873)"
+                ),
+            );
+        }
+        dump(cx, "md-find-3-editing.png");
+
+        // ④ 未保存のまま編集を抜けたセッション: 閉じたら描画へ戻り、セッションは残す
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = app.set_preview_editing_local(pane, false);
+            cx.notify();
+        });
+        check(
+            until_outline(cx, window, pane, 3).await,
+            "visual-test md-find-restore: 未保存のまま編集を抜けると描画へ戻る（#1661 の経路）(#1873)",
+        );
+        key(cx, find_key);
+        query(cx, pane, "needle");
+        key(cx, "enter");
+        let searching = observe(cx, pane);
+        check(
+            searching.0 == code && searching.4,
+            "visual-test md-find-restore: 未保存のセッションでも検索中は code (#1873)",
+        );
+        key(cx, "escape");
+        let restored = until_outline(cx, window, pane, 3).await;
+        let closed = observe(cx, pane);
+        let titles = window
+            .update(cx, |app, _, _| {
+                app.previews
+                    .get(&pane)
+                    .map(|p| {
+                        p.outline
+                            .items
+                            .iter()
+                            .map(|i| i.title.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        check(
+            restored && closed.0 == markdown && closed.5 && closed.4 && !closed.3,
+            &format!(
+                "visual-test md-find-restore: 未保存のセッションは閉じても残し、描画へ戻す（{closed:?}）(#1873)"
+            ),
+        );
+        check(
+            titles == ["Title v2", "Alpha", "Beta"],
+            &format!(
+                "visual-test md-find-restore: 閉じた後の目次は未保存の本文から（{titles:?}）(#1873)"
+            ),
+        );
+        dump(cx, "md-find-4-unsaved.png");
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pane);
+            cx.notify();
+        });
+
+        // ⑤ コードのファイルは今までどおり（閉じてもコード表示）
+        let code_pane = open(
+            cx,
+            &code_path,
+            tako_control::protocol::PreviewModeWire::Code,
+        );
+        wait(cx, 200).await;
+        key(cx, find_key);
+        let total = query(cx, code_pane, "needle");
+        key(cx, "enter");
+        key(cx, "escape");
+        wait(cx, 100).await;
+        let closed = observe(cx, code_pane);
+        check(
+            total == 1 && !closed.2 && closed.0 == code,
+            &format!(
+                "visual-test md-find-restore: コードのファイルは閉じてもコード表示のまま（{closed:?}）(#1873)"
+            ),
+        );
+        println!("TAKO_VISUAL_1873: escape / toggle / editing kept / unsaved session / code OK");
+
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pane);
+            app.preview_edits.remove(&code_pane);
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1834 の道具: 1 回のドラッグで観測したもの
     #[cfg(feature = "visual-test")]
     struct Vt1834Drag {
@@ -54995,6 +55498,7 @@ mod self_test {
                             direction: None,
                             case_sensitive: None,
                             whole_word: None,
+                            visible: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -55115,6 +55619,7 @@ mod self_test {
                             direction: None,
                             case_sensitive: None,
                             whole_word: None,
+                            visible: None,
                         },
                         PaneOrigin::Cli,
                     );

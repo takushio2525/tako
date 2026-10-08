@@ -1167,9 +1167,11 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_search",
+            // 出自: #1873（visible = 画面の検索欄の開閉。閉じると閲覧中の Markdown が描画へ戻る）
             "description": "コードプレビューのテキスト検索。query でインクリメンタル検索し、direction で移動（next/prev）。\
                 編集モードでなくても使える。query 省略時は現在の検索状態を返す。\
-                search.viewport でヒットへ飛んだあとにその行が画面に入っているかが読める。",
+                search.viewport でヒットへ飛んだあとにその行が画面に入っているかが読める。\
+                visible で画面の検索欄を開閉する（閉じると閲覧中の Markdown は描画へ戻る）。開閉は search.visible、表示は mode で読める。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1178,6 +1180,7 @@ pub fn tools() -> Vec<Value> {
                     "direction": { "type": "string", "enum": ["next", "prev"], "description": "移動方向（省略時は next）" },
                     "case_sensitive": { "type": "boolean", "description": "大文字小文字を区別（既定 true。query 省略時は今の条件）" },
                     "whole_word": { "type": "boolean", "description": "単語単位（既定 false。同上）" },
+                    "visible": { "type": "boolean", "description": "true = 検索欄を開く / false = 閉じる（開閉だけなら移動しない）" },
                 },
                 "additionalProperties": false,
             },
