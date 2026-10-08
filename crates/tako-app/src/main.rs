@@ -48347,9 +48347,17 @@ mod self_test {
                 )
             })
             .unwrap_or((false, false));
-        let outside = point(
-            viewport.left() - px(40.0),
-            viewport.top() + viewport.size.height / 2.0,
+        // 押すのはカードの外（左の端末の、カードより下）。カードは右端で左へずらして置くので、
+        // プレビューの左端の近くはカードの中になりうる
+        let card_rect = window
+            .update(cx, |app, _, _| app.lsp_hover.bounds)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail("visual-test hover: show のカードの矩形が無い"));
+        let outside = point(px(30.0), card_rect.bottom() + px(30.0));
+        check(
+            !card_rect.contains(&outside),
+            &format!("visual-test hover: 押す点がカードの外 ({outside:?} / {card_rect:?})"),
         );
         for input in [
             gpui::PlatformInput::MouseDown(MouseDownEvent {
