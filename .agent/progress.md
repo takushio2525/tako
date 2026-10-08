@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-08（#1877 S0: tako mod の設計と試作 — 実物の Claude Code 2.1.294 で mod を動かし通信路と導入方式を決めた）
-- 設計書 `.agent/plans/2026-10-tako-mod.md`。隔離 GUI のペインで試作 mod を動かし `$.session.usage()`（初回応答まで tokens / rateLimits は欠ける・window と cost は claude が答える）・`turn.*`・権限 / 質問待ち（`classic.PermissionRequest`）・`session.append`・帯 / ペイン / ボタンからの `tako split` を実測
-- 決定: mod → tako は `$.process.run` で tako CLI（8.5 ms。tako 再起動をまたぐ tmux worker でも CLI フォールバックで繋がるのはこれだけ。MCP は `--strict-mcp-config` で policy 拒否・HTTP 直は 1.5 ms だが再起動で URL / トークンが古びる）。導入は `<data_dir>` へ展開 + ペインの env `CLAUDE_CODE_PLUGIN_DIRS`（設定ファイルを書かない・設定 dir の数に依らない）。版の下限 2.1.294。スライス S1〜S6 + 調査を子 Issue へ
-
 ## 2026-10-08（#1681: LSP ホバー = 識別子にマウスを乗せると型・doc のカード・CLI / MCP）
 - core `lsp::hover`（Hover の 3 形・16,000 字の上限・範囲・能力）→ manager の `hover`（マウスは補完と同じ取り消しの列 + `open: false` = 開いている文書に加わるだけ = 乗せただけでサーバを起こさない）→ dispatch 3 段（`show` でカード = `ControlHost::show_lsp_hover`）→ CLI `tako lsp hover` / MCP `tako_lsp` の `action=hover`（+290 B）→ GUI `lsp_hover_ui`（`render_block` 経由・1 フレーム目に測って語の行の上下へ・編集メニュー / パレットの口・右クリックメニューには載せない）
 - 実測: e2e `issue1681_lsp_hover` 9 本・番犬の注入 8 通りを file:line で名指し・`scripts/test-lsp-hover-1681.sh` 23 PASS（visual-test `hover` 8 相 = 基準画像との差分は矩形の外 0 px・100 回で保持件数が増えない・A/B `TAKO_1681_LEGACY=1` で FAILED / `hover-real` で実の rust-analyzer の `String` の doc がカードに出る / CLI・MCP 19 項目）
