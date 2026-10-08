@@ -29,16 +29,16 @@ pub fn detect_limit_stop(lines: &[String], observed_at: i64, tz_offset: i32) -> 
     detect_limit_stop_with(lines, observed_at, tz_offset, None)
 }
 
-/// 構造化ソースの手がかりを添えて判定する（#985）。
+/// 構造化ソースの手がかりを添えて判定する（#985 / #1880）。
 ///
-/// `hint` は codex の rollout（`codex_session::rate_limits_for_backend`）から採った
-/// **正確なリセット時刻**。画面の文言パースは版ごとの書式に依存する
+/// `hint` は codex の rollout（`codex_session::rate_limits_for_backend`）か claude の
+/// tako mod の報告（[`LimitHint::from_mod`]。#1880）から採った**正確なリセット時刻**。画面の文言パースは版ごとの書式に依存する
 /// （codex 0.150.1 は同日なら `4:24 AM`、日をまたぐと `Aug 28th, 2026 4:24 AM`）のに対し、
 /// こちらは epoch 秒なので**書式にもタイムゾーンにも依存しない**。
 ///
 /// **手がかりだけでは停止と判定しない**のが要点。停止の根拠は画面のままにしておくことで
 /// 「上限由来の停止に限る」という #813 の安全条件を 1 か所で守り続ける
-/// （claude 経路は `hint = None` で通るので 1 ビットも変わらない）
+/// （mod の報告が無い claude は `hint = None` で通るので 1 ビットも変わらない）
 pub fn detect_limit_stop_with(
     lines: &[String],
     observed_at: i64,
@@ -66,6 +66,15 @@ impl LimitHint {
     pub fn from_codex(rl: &crate::codex_session::RateLimits) -> Self {
         Self {
             reset_at: rl.reset_at(),
+        }
+    }
+
+    /// claude の tako mod の使用制限（アカウント単位で束ねた値。#1880）から手がかりを作る。
+    /// `resets_at` は ISO 8601（`2026-10-08T14:30:00.000Z`）で**秒精度**・タイムゾーンつき。
+    /// 画面の文言（`resets 3am`）より確か。**上限に当たっている窓が無ければ空**（codex と同じ型）
+    pub fn from_mod(limits: &[tako_core::claude_mod::ModRateLimit]) -> Self {
+        Self {
+            reset_at: tako_core::claude_mod::limit_reset_at(limits),
         }
     }
 }
@@ -640,6 +649,45 @@ try again at Aug 28th, 2026 4:24 AM.
             Some(CODEX_RESET_AT),
             "上限でない枠の resets_at で復帰予定を書き換えてはいけない"
         );
+    }
+
+    fn mod_limit(pct: f64, resets: &str) -> tako_core::claude_mod::ModRateLimit {
+        tako_core::claude_mod::ModRateLimit {
+            kind: "five_hour".into(),
+            percent_used: pct,
+            resets_at: Some(resets.into()),
+            observed_at: 0,
+        }
+    }
+
+    #[test]
+    fn issue1880_modの解除時刻は秒精度で画面のパースより優先される() {
+        // 画面は `resets 3am` 程度の粒度しか持たない。mod は秒まで答える
+        let exact = tako_core::claude_mod::parse_resets_at("2026-08-15T18:00:07.000Z").unwrap();
+        let hint = LimitHint::from_mod(&[mod_limit(100.0, "2026-08-15T18:00:07.000Z")]);
+        assert_eq!(hint.reset_at, Some(exact));
+        let stop = detect_limit_stop_with(&screen(LIMIT_IDLE), OBSERVED, JST, Some(&hint))
+            .expect("画面が上限なので検知される");
+        assert_eq!(stop.reset_at, Some(exact), "mod の秒精度の時刻を採る");
+        assert_eq!(exact % 60, 7, "秒が丸められていない");
+    }
+
+    #[test]
+    fn issue1880_modの値だけでは停止と判定しない() {
+        // 使用率 100% の報告があっても、画面が上限でなければ停止ではない（#813 の安全条件）
+        let hint = LimitHint::from_mod(&[mod_limit(100.0, "2026-08-15T18:00:00Z")]);
+        assert!(hint.reset_at.is_some());
+        assert!(
+            detect_limit_stop_with(&screen(NORMAL_IDLE), OBSERVED, JST, Some(&hint)).is_none(),
+            "mod の値だけで自動復帰が発動しうる"
+        );
+        // 上限に当たっていない窓は解除時刻を書き換えない
+        let under = LimitHint::from_mod(&[mod_limit(80.0, "2026-08-15T18:00:00Z")]);
+        assert_eq!(under, LimitHint::default());
+        let parsed = detect_limit_stop(&screen(LIMIT_IDLE), OBSERVED, JST).unwrap();
+        let with_under =
+            detect_limit_stop_with(&screen(LIMIT_IDLE), OBSERVED, JST, Some(&under)).unwrap();
+        assert_eq!(with_under.reset_at, parsed.reset_at);
     }
 
     #[test]

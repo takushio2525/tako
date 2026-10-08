@@ -1315,6 +1315,16 @@ pub trait SystemHost {
     fn set_claude_mod_enabled(&mut self, _enabled: bool) -> Result<(), String> {
         Err("この tako は mod を扱わない".into())
     }
+    /// #749 の自動ハンドオフの tick がこのペインで最後に見た ctx%（取得元つき。#1880）。
+    /// `orchestrator self` の `auto_handoff_tick` に載る。tick が見ていないペインは null
+    fn handoff_tick_ctx(&self, _pane: PaneId) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+    /// チャットヘッダ（#702）の残量バーが使っている ctx%（ペイン ID → 取得元つき。#1880）。
+    /// `tako ui-mode` の `chat_header` に載る。チャット表示でないペインは載らない
+    fn chat_header_ctx(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
     /// ライブペインの現行ログファイル（Issue #112 B。クローズ済みペインは
     /// `pane_log::latest_for_pane` のファイル名検索にフォールバックする）
     fn pane_log_file(&self, _pane: PaneId) -> Option<std::path::PathBuf> {

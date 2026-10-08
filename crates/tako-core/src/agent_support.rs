@@ -882,7 +882,10 @@ pub const MATRIX: &[AgentFeature] = &[
             "#984: rollout の token_count に last_token_usage.total_tokens と \
              model_context_window があり、worker_status の ctx_percent へ載せた（実測で 8%）。\
              master の #749 は terminal.rs の画面パターンを見る別経路なのでそこは未確認。\
-             #1033: agy の実況 JSONL は状態と発話を持つがトークン数は持たない",
+             #1033: agy の実況 JSONL は状態と発話を持つがトークン数は持たない。\
+             #1880（claude）: tako mod の報告があれば一次ソース（ctx_source=mod。窓も claude が答える）、\
+             無ければ画面 → transcript。statusLine を外した実 claude で 4 経路が mod を返し、\
+             報告を止めると 45 秒後に落ちて ctx_mod_reason=mod_stale が出た（scripts/test-mod-primary-1880.sh）",
         ),
     },
     AgentFeature {
@@ -1432,7 +1435,9 @@ pub const MATRIX: &[AgentFeature] = &[
              agy 1.1.22 は**窓つきの利用上限を持たない**（`agy --help` に usage / quota 系の \
              サブコマンドが無く、バイナリの `RateLimit` は全部 PR レビュー設定と \
              Go / sentry の内部名。残量は `/credits` = 前払いクレジット）ので、\
-             検知すべき「上限で止まった状態」自体が存在しない",
+             検知すべき「上限で止まった状態」自体が存在しない。\
+             #1880（claude）: 停止の判定は画面のまま。tako mod の報告があれば解除時刻だけを \
+             mod の値（秒精度）に差し替える（LimitHint::from_mod。mod の値だけでは停止と判定しない）",
         ),
     },
     AgentFeature {
@@ -1517,7 +1522,11 @@ pub const MATRIX: &[AgentFeature] = &[
         local: pending(notes::LOCAL_HARNESS_UNDECIDED, 991),
         evidence: AgentEvidence::Source(
             "claude_tui.rs の detect_permission_dialog は 3 系統のパターンを持ち、\
-             agy の「Do you want to proceed?」も対象に入っている",
+             agy の「Do you want to proceed?」も対象に入っている。\
+             #1880（claude）: tako mod の報告があれば権限待ち・質問待ちを先に見るが、\
+             答え方（respond）は画面のダイアログを読むので画面の検出を正にし、\
+             食い違い（classic_events=false の組織アカウントではルールの無い ask を mod が拾えない）を \
+             worker_status の warnings に出す",
         ),
     },
     AgentFeature {
@@ -1693,7 +1702,9 @@ pub const MATRIX: &[AgentFeature] = &[
              claude 15.40s / codex 11.68s と同水準で、旧側は北極星の 39.38s を再現する。\
              偽 idle（回答前に単発 status が idle を返す最早時刻）は 3.5〜6.1s → \
              4.3〜5.7s で増えておらず、watch の偽イベントは 6 ラウンドとも 0 件。\
-             (Thinking) 型の誤爆（#120）は弱マーカーの agent 別分離で構造的に起こらない",
+             (Thinking) 型の誤爆（#120）は弱マーカーの agent 別分離で構造的に起こらない。\
+             #1880（claude）: tako mod の報告があれば turn を一次ソースにする（status_source=mod）。\
+             無い・古い・止まったら claude agents --json → 画面へ落ちる",
         ),
     },
     AgentFeature {

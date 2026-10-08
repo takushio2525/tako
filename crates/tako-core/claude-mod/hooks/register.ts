@@ -41,6 +41,16 @@ let lastTurn: { duration_ms: number; reason: string } | undefined
 // 届かないときの権限待ちは tool.check の判定から確かなものだけを拾う
 let classicEvents = false
 
+// effort の値を読む。turn.step は文字列（2.1.294 の実測: "medium"）、classic 系は { level } で運ぶ
+function effortLevel(value: unknown): string | undefined {
+  if (typeof value === 'string') return value
+  if (typeof value === 'object' && value !== null && 'level' in value) {
+    const level = (value as { level: unknown }).level
+    if (typeof level === 'string') return level
+  }
+  return undefined
+}
+
 function rateLimit(limit: SessionRateLimit, at: number): TakoRateLimit {
   return { kind: limit.kind, percent_used: limit.percentUsed, resets_at: limit.resetsAt, observed_at: at }
 }
@@ -138,6 +148,22 @@ export const register: Register = on => {
     dirty = true
     return next(e)
   }).catch(($, e, next) => next(e))
+
+  // effort は各ステップの turn.step が運ぶ（関数フックなので classic 系が届かない組織アカウントでも
+  // 来る = FR-2.42.7 で欠けていた effort を埋める。#1880）。サブエージェントのステップは数えない。
+  // turn.step はモデルの出力を流すストリームのフック: 値を控えたら `yield*` で**そのまま素通し**し、
+  // チャンクには触らない（壊れても .catch が素通しへ戻す）
+  on('turn.step', async function* ($, e, next) {
+    const step = e as unknown as { effort?: unknown; agentId?: unknown }
+    const level = effortLevel(step.effort)
+    if (step.agentId === undefined && level !== undefined && level !== effort) {
+      effort = level
+      dirty = true
+    }
+    return yield* next(e)
+  }).catch(async function* ($, e, next) {
+    return yield* next(e)
+  })
 
   // classic 系が届くかの印（すべてのツール呼び出しで tool.check より先に来る）
   on('classic.PreToolUse', ($, e, next) => {

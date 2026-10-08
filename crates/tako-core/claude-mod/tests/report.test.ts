@@ -32,6 +32,10 @@ function world(on: On, sent: Sent[], exitCode = 0): void {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.step', async function* ($, e) {
+    yield { kind: 'text', index: 0, text: 'ok' }
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
   on('turn.complete', () => ({ text: '' }))
   on('classic.PermissionRequest', () => ({}))
   on('classic.Stop', () => ({}))
@@ -219,6 +223,28 @@ describe('tako mod の報告', () => {
     await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: {} })
     await clock.advance(1_000)
     expect(sent.at(-1)?.report).toEqual(expect.objectContaining({ turn: 'permission', classic_events: true }))
+  })
+
+  test('effort は turn.step から拾う（classic 系が届かない環境でも欠けない。#1880）', async ($, on) => {
+    const sent: Sent[] = []
+    world(on, sent)
+    const clock = mock.clock(on)
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    await $.session.start(START)
+    await $.turn.start({ text: '', turnId: 't1' })
+    // turn.step はストリーム = 読み切ってはじめてフックが最後まで走る
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', effort: 'medium', messageCount: 3 } as never)
+    let step = await stream.next()
+    while (step.done !== true) step = await stream.next()
+    expect(step.value.answer).toBe('ok')
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report).toEqual(expect.objectContaining({ effort: 'medium', classic_events: false }))
+    // サブエージェントのステップは親の effort を書き換えない
+    const sub = $.turn.step({ turnId: 't2', index: 0, model: 'x', effort: 'low', messageCount: 1, agentId: 'sub-1' } as never)
+    let subStep = await sub.next()
+    while (subStep.done !== true) subStep = await sub.next()
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report.effort).toBe('medium')
   })
 
   test('tako が落ちていてもターンは普通に流れる', async ($, on) => {

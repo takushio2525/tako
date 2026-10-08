@@ -10,6 +10,11 @@
 //!   （`tako mod off`）と A/B の [`AB_OFF_ENV`]、版の下限 [`MIN_CLAUDE_VERSION`]
 //! - **報告**: mod は `tako mod report` を叩き、状態（[`ModReport`]）を送ってくる。保持は GUI の
 //!   メモリだけ（[`ModHub`]）で、[`FRESH_FOR`] を過ぎた報告は「無い」とみなす
+//! - **一次ソース（S2 #1880）**: 新鮮な報告は ctx%・使用制限・ターン状態の**先頭**に来る。
+//!   引き当ては [`lookup`] の 1 本で、使えないときは理由（[`ModUnavailable`]）を返して
+//!   呼び出し側が今の経路（画面 / transcript）へ落ちる。使用制限は**アカウント単位**なので
+//!   [`ModHub::account_rate_limits`] で束ねる。**上限での停止は画面でしか判定しない**
+//!   （[`limit_reset_at`] は解除時刻の手がかりだけを返す = #813 の安全条件）
 //!
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
@@ -31,6 +36,9 @@ pub const CLI_ENV: &str = "TAKO_CLI";
 pub const INJECTED_KEYS: &[&str] = &[PLUGIN_DIRS_ENV, CLI_ENV];
 /// 同一バイナリで注入を止める A/B の入口（#1877 の規約。値が空でなければ立つ）
 pub const AB_OFF_ENV: &str = "TAKO_1877_NO_MOD";
+/// 報告を**一次ソースとして見ない** A/B の入口（S2 #1880）。注入と報告の受け取りは続けるが、
+/// ctx%・使用制限・ターン状態は #1880 前の経路（画面 / transcript）だけで決める
+pub const S2_LEGACY_ENV: &str = "TAKO_1877_S2_LEGACY";
 /// 注入する Claude Code の版の下限（**実測した版**。2.1.287〜2.1.293 は未実測なので下げるなら
 /// 実測してから。設計書 §1.6 / §3.4）
 pub const MIN_CLAUDE_VERSION: &str = "2.1.294";
@@ -357,6 +365,11 @@ pub fn ab_off() -> bool {
     std::env::var_os(AB_OFF_ENV).is_some_and(|v| !v.is_empty())
 }
 
+/// S2 の A/B（[`S2_LEGACY_ENV`]）が立っているか
+pub fn s2_legacy() -> bool {
+    std::env::var_os(S2_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
 /// 一覧の 1 項目が tako の mod の置き場か（どのインスタンスの data dir でも）。
 /// tako のペインから立てた tako（開発中の隔離起動など）は親の値を継承するので、
 /// それを「利用者自身の plugin dir」と取り違えないために見分ける
@@ -457,6 +470,26 @@ impl ModTurn {
             ModTurn::Question => "question",
         }
     }
+
+    /// 入力を待っている（権限ダイアログか質問が出ている）と mod が言っているか
+    pub fn awaits_answer(self) -> bool {
+        matches!(self, ModTurn::Permission | ModTurn::Question)
+    }
+
+    /// `worker_status` の語彙（idle / busy / waiting）へ写す（S2 #1880）。
+    ///
+    /// `permission` / `question` は**承認・回答の後もそのツールが返るまで残る**
+    /// （mod API に承認の瞬間を知らせるイベントが無い = FR-2.42.7）。承認後のツール実行中は
+    /// 画面が生成中を描くので、`screen_busy` なら busy を採る（待っていないものを waiting と
+    /// 言うと、master が存在しないダイアログへ respond しに行く）
+    pub fn status_word(self, screen_busy: bool) -> &'static str {
+        match self {
+            ModTurn::Idle => "idle",
+            ModTurn::Busy => "busy",
+            ModTurn::Permission | ModTurn::Question if screen_busy => "busy",
+            ModTurn::Permission | ModTurn::Question => "waiting",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -526,6 +559,19 @@ pub struct ModReport {
     pub ended: bool,
 }
 
+impl ModReport {
+    /// ctx% の材料（`ctx_usage::resolve_full` の mod の段）
+    pub fn ctx(&self) -> crate::ctx_usage::ModCtx {
+        crate::ctx_usage::ModCtx {
+            percent: self.context.as_ref().and_then(|c| c.percent),
+            tokens: self.context.as_ref().and_then(|c| c.tokens),
+            // 0 は「窓が分からない」と同じ（0 除算を作らない）
+            window: self.context.as_ref().map(|c| c.window).filter(|w| *w > 0),
+            model: self.model.clone(),
+        }
+    }
+}
+
 /// 文字列の上限（ツール名・モデル名など。おかしな値でメモリを食わせない）
 const MAX_TEXT: usize = 256;
 /// 使用制限の窓の数の上限
@@ -576,6 +622,128 @@ fn clip(text: &mut String) {
 /// 報告の鮮度（[`FRESH_FOR`]。純関数）
 pub fn is_fresh(received: Instant, now: Instant) -> bool {
     now.saturating_duration_since(received) <= FRESH_FOR
+}
+
+/// mod の報告を一次ソースに使えない理由（S2 #1880。応答の `ctx_mod_reason` / `mod_reason`）。
+///
+/// コードの語彙は `tako mod`（status）の行の `reason.code` と同じ（[`OffReason::code`] を含む）。
+/// 読み手が「なぜ画面へ落ちたか」を 1 つの語彙で追えるようにする
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModUnavailable {
+    /// [`S2_LEGACY_ENV`]（A/B。報告を見ない旧挙動）
+    Legacy,
+    /// 報告が 1 度も来ていない（mod が読まれていない・注入より前から動いていた claude・
+    /// claude ではないペイン・mod を扱わない tako）
+    Absent,
+    /// 最後の報告から [`FRESH_FOR`] を過ぎた（claude が止まった・mod が止まった）
+    Stale { age_secs: u64 },
+    /// このペインには注入しなかった（`tako mod off` / 版の下限未満 等）
+    NotInjected(OffReason),
+}
+
+impl ModUnavailable {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ModUnavailable::Legacy => "legacy_env",
+            ModUnavailable::Absent => "mod_absent",
+            ModUnavailable::Stale { .. } => "mod_stale",
+            ModUnavailable::NotInjected(reason) => reason.code(),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            ModUnavailable::Legacy => {
+                format!("{S2_LEGACY_ENV} が立っている（mod の報告を見ない旧挙動）")
+            }
+            ModUnavailable::Absent => "mod から報告が無い".into(),
+            ModUnavailable::Stale { age_secs } => format!(
+                "最後の報告から {age_secs} 秒（{} 秒で失効）",
+                FRESH_FOR.as_secs()
+            ),
+            ModUnavailable::NotInjected(reason) => reason.describe(),
+        }
+    }
+}
+
+/// ペイン 1 つぶんの報告を一次ソースとして引き当てる（S2 #1880。**引き当てはこの 1 本**）。
+///
+/// `hub` が `None`（mod を扱わない tako）なら [`ModUnavailable::Absent`]。
+/// `legacy` は [`s2_legacy`] の値（テストは env を触らずに両アームを検査できる）
+pub fn lookup(
+    hub: Option<&ModHub>,
+    pane: u64,
+    now: Instant,
+    legacy: bool,
+) -> Result<&StoredReport, ModUnavailable> {
+    if legacy {
+        return Err(ModUnavailable::Legacy);
+    }
+    hub.ok_or(ModUnavailable::Absent)?.lookup(pane, now)
+}
+
+/// [`lookup`] の結果を ctx% の材料へ
+pub fn ctx_input(
+    looked_up: &Result<&StoredReport, ModUnavailable>,
+) -> crate::ctx_usage::ModCtxInput {
+    match looked_up {
+        Ok(stored) => crate::ctx_usage::ModCtxInput::Fresh(stored.report.ctx()),
+        Err(why) => crate::ctx_usage::ModCtxInput::Unavailable(why.code()),
+    }
+}
+
+/// mod の `resets_at`（ISO 8601。`2026-10-08T14:30:00.000Z` / `…+09:00`）→ unix 秒。
+/// **秒精度**（小数部は捨てる）。タイムゾーンの無い表記・読めない表記は `None`
+/// （ローカル時刻と取り違えて 9 時間ずれた復帰予定を作らない）
+pub fn parse_resets_at(text: &str) -> Option<i64> {
+    let (date, rest) = text.trim().split_once('T')?;
+    let mut ymd = date.split('-');
+    let (y, m, d): (i64, i64, i64) = (
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+    );
+    if ymd.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let (clock, offset) = if let Some(c) = rest.strip_suffix(['Z', 'z']) {
+        (c, 0)
+    } else {
+        let at = rest.rfind(['+', '-'])?;
+        let (c, tz) = rest.split_at(at);
+        let sign = if tz.starts_with('-') { -1 } else { 1 };
+        let (oh, om) = tz[1..].split_once(':')?;
+        let (oh, om): (i64, i64) = (oh.parse().ok()?, om.parse().ok()?);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        (c, sign * (oh * 3_600 + om * 60))
+    };
+    let clock = clock.split('.').next()?;
+    let mut hms = clock.split(':');
+    let (hh, mm, ss): (i64, i64, i64) = (
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+    );
+    if hms.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let days = crate::limit_resume::days_from_civil(y, m, d);
+    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss - offset)
+}
+
+/// 上限に当たっている窓（`percent_used >= 100`）が解ける時刻（unix 秒）。
+/// 複数当たっていれば**遅い方**（両方解けるまで続けられない）。当たっていなければ `None`。
+///
+/// **これは解除時刻の手がかりで、停止の判定ではない**: 停止は画面でしか判定しない
+/// （`limit_stop::detect_limit_stop_with` の `LimitHint`。#813 の安全条件 = codex #985 と同じ型）
+pub fn limit_reset_at(limits: &[ModRateLimit]) -> Option<i64> {
+    limits
+        .iter()
+        .filter(|l| l.percent_used >= 100.0)
+        .filter_map(|l| l.resets_at.as_deref().and_then(parse_resets_at))
+        .max()
 }
 
 /// 1 ペインの最終報告
@@ -674,6 +842,65 @@ impl ModHub {
             .get(&pane)
             .filter(|s| is_fresh(s.received, now))
             .map(|s| &s.report)
+    }
+
+    /// 一次ソースとしての引き当て（[`lookup`] の本体）。新鮮な報告 → 古い報告 →
+    /// 注入の記録の順に見る（注入しなかったペインでも、利用者が自分で読ませた mod の報告が
+    /// 新鮮なら使う = 値そのものは正しい）
+    pub fn lookup(&self, pane: u64, now: Instant) -> Result<&StoredReport, ModUnavailable> {
+        if let Some(stored) = self.reports.get(&pane) {
+            if is_fresh(stored.received, now) {
+                return Ok(stored);
+            }
+            return Err(ModUnavailable::Stale {
+                age_secs: now.saturating_duration_since(stored.received).as_secs(),
+            });
+        }
+        match self.injections.get(&pane).and_then(|i| i.off.clone()) {
+            Some(off) => Err(ModUnavailable::NotInjected(off)),
+            None => Err(ModUnavailable::Absent),
+        }
+    }
+
+    /// このペインのアカウント（`config_dir`）の使用制限を、同じアカウントの新鮮な報告すべてから
+    /// 束ねる（窓の種類ごとに 1 つ。使用制限は**アカウント単位**の値 = 設計書 §4.2）。
+    ///
+    /// 窓の種類ごとに「`resets_at` が遅い（= 新しい窓）→ 同じ窓なら `percent_used` が大きい →
+    /// `observed_at` が新しい」を採る。**`observed_at` だけでは決めない**: mod は heartbeat の
+    /// たびに読み直した時刻を打つので、1 時間放置したペインの古い % も「今」の時刻で届く。
+    /// 同じ窓の中で使用率は減らないので、大きい方が新しい観測
+    pub fn account_rate_limits(&self, pane: u64, now: Instant) -> Vec<ModRateLimit> {
+        let Some(own) = self.fresh_report(pane, now) else {
+            return Vec::new();
+        };
+        let account = own.config_dir.as_deref();
+        let mut best: std::collections::BTreeMap<String, ModRateLimit> =
+            std::collections::BTreeMap::new();
+        let rank = |l: &ModRateLimit| {
+            (
+                l.resets_at.as_deref().and_then(parse_resets_at),
+                l.percent_used,
+                l.observed_at,
+            )
+        };
+        for stored in self.reports.values() {
+            if !is_fresh(stored.received, now) || stored.report.config_dir.as_deref() != account {
+                continue;
+            }
+            for limit in &stored.report.rate_limits {
+                let replace = best.get(&limit.kind).is_none_or(|cur| {
+                    let (a, b) = (rank(limit), rank(cur));
+                    a.0.cmp(&b.0)
+                        .then(a.1.total_cmp(&b.1))
+                        .then(a.2.cmp(&b.2))
+                        .is_gt()
+                });
+                if replace {
+                    best.insert(limit.kind.clone(), limit.clone());
+                }
+            }
+        }
+        best.into_values().collect()
     }
 
     /// 閉じたペインの記録を捨てる（ペイン ID が再利用されたとき前任の報告を名乗らない）
@@ -1033,6 +1260,189 @@ mod tests {
         hub.accept(5, parse_report(report_json()).unwrap(), Instant::now());
         hub.forget_pane(5);
         assert!(hub.injections.is_empty() && hub.reports.is_empty());
+    }
+
+    fn limit(kind: &str, pct: f64, resets: &str, observed: u64) -> ModRateLimit {
+        ModRateLimit {
+            kind: kind.into(),
+            percent_used: pct,
+            resets_at: Some(resets.into()),
+            observed_at: observed,
+        }
+    }
+
+    fn report_with(config_dir: Option<&str>, limits: Vec<ModRateLimit>) -> ModReport {
+        let mut r = parse_report(report_json()).unwrap();
+        r.config_dir = config_dir.map(str::to_string);
+        r.rate_limits = limits;
+        r
+    }
+
+    #[test]
+    fn issue1880_引き当ては新鮮_古い_注入の記録の順に理由を返す() {
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        hub.accept(1, parse_report(report_json()).unwrap(), t0);
+        hub.record_spawn(2, &on());
+        hub.record_spawn(3, &Injection::Off(OffReason::Disabled));
+        hub.record_spawn(
+            4,
+            &Injection::Off(OffReason::ClaudeTooOld("2.1.280".into())),
+        );
+        let at = |pane, secs| lookup(Some(&hub), pane, t0 + Duration::from_secs(secs), false);
+        assert!(at(1, 45).is_ok(), "45 秒までは新鮮");
+        assert_eq!(
+            at(1, 46).unwrap_err(),
+            ModUnavailable::Stale { age_secs: 46 }
+        );
+        assert_eq!(at(1, 46).unwrap_err().code(), "mod_stale");
+        assert_eq!(at(2, 0).unwrap_err().code(), "mod_absent");
+        assert_eq!(at(3, 0).unwrap_err().code(), "disabled");
+        assert_eq!(at(4, 0).unwrap_err().code(), "claude_too_old");
+        assert_eq!(at(9, 0).unwrap_err().code(), "mod_absent");
+        // A/B は報告があっても見ない
+        assert_eq!(
+            lookup(Some(&hub), 1, t0, true).unwrap_err().code(),
+            "legacy_env"
+        );
+        // mod を扱わない tako
+        assert_eq!(lookup(None, 1, t0, false).unwrap_err().code(), "mod_absent");
+        // 注入しなかったペインでも新鮮な報告があれば使う（値そのものは正しい）
+        hub.accept(3, parse_report(report_json()).unwrap(), t0);
+        assert!(lookup(Some(&hub), 3, t0, false).is_ok());
+    }
+
+    #[test]
+    fn issue1880_ctxの材料は欠けたまま渡す() {
+        let mut r = parse_report(report_json()).unwrap();
+        let ctx = r.ctx();
+        assert_eq!(
+            (ctx.percent, ctx.tokens, ctx.window),
+            (Some(6), Some(59426), Some(1_000_000))
+        );
+        assert_eq!(ctx.model.as_deref(), Some("claude-haiku-5-5"));
+        r.context = Some(ModContext {
+            tokens: None,
+            window: 0,
+            percent: None,
+        });
+        let ctx = r.ctx();
+        assert_eq!((ctx.percent, ctx.window), (None, None), "窓 0 は不明と同じ");
+    }
+
+    #[test]
+    fn issue1880_resets_atは秒精度でタイムゾーンを守って読む() {
+        // 2026-10-08T14:30:00Z
+        let base = 1_791_469_800;
+        assert_eq!(parse_resets_at("2026-10-08T14:30:00.000Z"), Some(base));
+        assert_eq!(parse_resets_at("2026-10-08T14:30:00Z"), Some(base));
+        assert_eq!(parse_resets_at("2026-10-08T14:30:07.999Z"), Some(base + 7));
+        assert_eq!(parse_resets_at("2026-10-08T23:30:00+09:00"), Some(base));
+        assert_eq!(parse_resets_at("2026-10-08T09:30:00-05:00"), Some(base));
+        // タイムゾーンの無い表記・壊れた表記は読まない
+        for bad in [
+            "2026-10-08T14:30:00",
+            "2026-10-08",
+            "3am",
+            "",
+            "2026-13-08T14:30:00Z",
+            "2026-10-08T25:30:00Z",
+        ] {
+            assert_eq!(parse_resets_at(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn issue1880_解除時刻の手がかりは上限に当たった窓だけから採る() {
+        let five = limit("five_hour", 100.0, "2026-10-08T14:30:00.000Z", 1);
+        let week = limit("seven_day", 40.0, "2026-10-10T13:00:00.000Z", 1);
+        assert_eq!(
+            limit_reset_at(&[five.clone(), week.clone()]),
+            parse_resets_at("2026-10-08T14:30:00Z")
+        );
+        // 当たっていなければ手がかり無し
+        let mut under = five.clone();
+        under.percent_used = 99.0;
+        assert_eq!(limit_reset_at(&[under, week.clone()]), None);
+        // 両方当たっていれば遅い方
+        let mut week_full = week;
+        week_full.percent_used = 100.0;
+        assert_eq!(
+            limit_reset_at(&[five, week_full]),
+            parse_resets_at("2026-10-10T13:00:00Z")
+        );
+    }
+
+    #[test]
+    fn issue1880_使用制限はアカウントごとに束ねて新しい窓と大きい方を採る() {
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        // pane 1: 1 時間放置（古い 20%）でも heartbeat の observed_at は新しい
+        hub.accept(
+            1,
+            report_with(
+                Some("/acct-a"),
+                vec![limit("five_hour", 20.0, "2026-10-08T14:30:00Z", 900)],
+            ),
+            t0,
+        );
+        // pane 2: 同じアカウント・同じ窓で 80%（observed_at は古い）
+        hub.accept(
+            2,
+            report_with(
+                Some("/acct-a"),
+                vec![
+                    limit("five_hour", 80.0, "2026-10-08T14:30:00Z", 500),
+                    limit("seven_day", 10.0, "2026-10-10T13:00:00Z", 500),
+                ],
+            ),
+            t0,
+        );
+        // pane 3: 別アカウントは混ぜない
+        hub.accept(
+            3,
+            report_with(
+                Some("/acct-b"),
+                vec![limit("five_hour", 99.0, "2026-10-08T15:00:00Z", 999)],
+            ),
+            t0,
+        );
+        let got = hub.account_rate_limits(1, t0);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].kind, "five_hour");
+        assert_eq!(got[0].percent_used, 80.0, "同じ窓なら大きい方 = 新しい観測");
+        assert_eq!(got[1].kind, "seven_day");
+        // 窓が替わった（resets_at が新しい）なら % が小さくても新しい窓を採る
+        hub.accept(
+            2,
+            report_with(
+                Some("/acct-a"),
+                vec![limit("five_hour", 3.0, "2026-10-08T19:30:00Z", 1000)],
+            ),
+            t0,
+        );
+        assert_eq!(hub.account_rate_limits(1, t0)[0].percent_used, 3.0);
+        // 古い報告は束ねない・自分が古ければ空
+        let later = t0 + Duration::from_secs(60);
+        assert!(hub.account_rate_limits(1, later).is_empty());
+        hub.accept(1, report_with(Some("/acct-a"), vec![]), later);
+        assert!(
+            hub.account_rate_limits(1, later).is_empty(),
+            "pane 2 の報告は失効している"
+        );
+    }
+
+    #[test]
+    fn issue1880_ターン状態の写像は承認後のツール実行中をbusyへ倒す() {
+        assert_eq!(ModTurn::Idle.status_word(false), "idle");
+        assert_eq!(ModTurn::Busy.status_word(false), "busy");
+        assert_eq!(ModTurn::Permission.status_word(false), "waiting");
+        assert_eq!(ModTurn::Question.status_word(false), "waiting");
+        // 承認後もツールが返るまで permission のまま = 画面が生成中なら busy
+        assert_eq!(ModTurn::Permission.status_word(true), "busy");
+        assert_eq!(ModTurn::Question.status_word(true), "busy");
+        // idle は画面の busy で変えない（倒すのは呼び出し側の既存の補正 = 1 実装）
+        assert_eq!(ModTurn::Idle.status_word(true), "idle");
     }
 
     #[test]

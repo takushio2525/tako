@@ -50,10 +50,22 @@
 //! `None`（= 推測しない）。実測は本番の稼働セッションで
 //! **8 ペイン / 3 モデル（`claude-opus-5` / `claude-fable-5` / `claude-fable-5-1`）**が
 //! 窓 1,000,000 で画面の `ctx NN%` と**すべて一致**した（200,000 を要求する値は 1 つも無い）。
+//!
+//! ## mod の報告が先頭（#1880。エピック #1877 の S2）
+//!
+//! tako mod（FR-2.42）の報告が新鮮なら、それが**画面より先**に来る（[`resolve_full`]）。
+//! mod の `percent` は claude 自身が `$.session.usage()` で答えた値で、**窓（`window`）も
+//! claude 自身が答える**ので `declared_context_window` の推測が要らない。statusLine を
+//! 設定していない利用者（画面に ctx が出ない構成）でも取れる。報告が無い・古い・止まったら
+//! 今の「画面 → transcript」へ落ち、落ちた理由を [`CtxResolution::mod_reason`] に残す
+//! （黙らない）。画面も数値を出していれば突き合わせて差を `screen_delta` に出す
+//! （#1021 の自己検証を続ける）。
 
 /// ctx% の取得元（応答の `ctx_source`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CtxSource {
+    /// tako mod の報告（`$.session.usage()`。#1880）= claude 自身の答え。窓も claude が答える
+    Mod,
     /// ペインの画面（TUI フッター / statusLine の出力）= claude 自身の答え
     Screen,
     /// transcript の最後の assistant 行の usage から上流と同じ式で算出
@@ -65,6 +77,7 @@ pub enum CtxSource {
 impl CtxSource {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Mod => "mod",
             Self::Screen => "screen",
             Self::Transcript => "transcript",
             Self::None => "none",
@@ -123,20 +136,47 @@ pub struct TranscriptCtx {
     pub model: Option<String>,
 }
 
+/// tako mod の報告から採った材料（#1880。`$.session.usage()` と `$.session.model()`）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModCtx {
+    /// claude が答えた使用率。**最初の API 応答までは欠ける**（0 埋めしない = 未観測）
+    pub percent: Option<u32>,
+    /// 分子（`input + cache_read + cache_creation`）。`percent` と同じく欠けうる
+    pub tokens: Option<u64>,
+    /// claude 自身が答えた文脈窓（起動直後から入る）
+    pub window: Option<u64>,
+    /// モデル id（例: `claude-haiku-5-5`）
+    pub model: Option<String>,
+}
+
+/// mod の段への入力（#1880）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModCtxInput {
+    /// 新鮮な報告がある（鮮度の判定は `claude_mod::ModHub::lookup`）
+    Fresh(ModCtx),
+    /// 使えない。中身は落ちた理由のコード（`claude_mod::ModUnavailable::code` の語彙）
+    Unavailable(&'static str),
+}
+
+/// 報告は新鮮だが ctx% がまだ無い（最初の API 応答の前）ときの `mod_reason`
+pub const MOD_NO_USAGE: &str = "mod_no_usage";
+
 /// 解決結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtxResolution {
     pub percent: Option<u32>,
     pub source: CtxSource,
-    /// モデル名（画面由来なら表示名、transcript 由来ならモデル id）
+    /// モデル名（mod / transcript 由来ならモデル id、画面由来なら表示名）
     pub model: Option<String>,
-    /// transcript から算出したときに使った文脈窓
+    /// mod が答えた文脈窓、または transcript から算出したときに使った文脈窓
     pub window: Option<u64>,
     /// `source == None` のときの理由
     pub reason: Option<CtxUnavailable>,
-    /// 画面と transcript の両方が数値を出したときの差（画面 − transcript）。
-    /// 丸め誤差の範囲（±1）を超えたら窓の解決が実態とずれている合図
+    /// 画面と比べ先（mod か transcript）の両方が数値を出したときの差（画面 − 比べ先）。
+    /// 丸め誤差の範囲（±1）を超えたら、どちらかが実態とずれている合図
     pub screen_delta: Option<i32>,
+    /// mod を使わなかった理由（#1880。`None` = mod を使った、または mod の段を通らない呼び出し）
+    pub mod_reason: Option<&'static str>,
 }
 
 impl CtxResolution {
@@ -148,6 +188,7 @@ impl CtxResolution {
             window: None,
             reason: Some(reason),
             screen_delta: None,
+            mod_reason: None,
         }
     }
 
@@ -215,6 +256,61 @@ pub fn declared_context_window(model_id: &str) -> Option<u64> {
 /// **画面を先に見る**のは、画面の数値が claude 自身の計算結果であり文脈窓の推定を
 /// 一切要らないため。transcript は式は厳密だが窓の解決が推定を含む
 pub fn resolve(screen: Option<&ScreenCtx>, transcript: Option<&TranscriptCtx>) -> CtxResolution {
+    resolve_with_window(screen, transcript, None)
+}
+
+/// mod → 画面 → transcript → none の優先順で解決する（#1880。**4 経路はこれを通る**）。
+///
+/// - mod の報告が新鮮で `percent` があればそれを採る（`source = Mod`。窓も mod の値）。
+///   画面も数値を出していれば差を `screen_delta` に出す（自己検証）
+/// - 新鮮だが `percent` が欠ける（最初の API 応答の前）なら落ちるが、**窓は mod の値**を
+///   transcript の計算に使う（`declared_context_window` の推測より確か）
+/// - どちらでもなければ [`resolve`] と同じ。落ちた理由は `mod_reason` に残す
+pub fn resolve_full(
+    mod_ctx: &ModCtxInput,
+    screen: Option<&ScreenCtx>,
+    transcript: Option<&TranscriptCtx>,
+) -> CtxResolution {
+    let fresh = match mod_ctx {
+        ModCtxInput::Fresh(c) => Some(c),
+        ModCtxInput::Unavailable(_) => None,
+    };
+    if let Some((c, p)) = fresh.and_then(|c| c.percent.map(|p| (c, p))) {
+        let screen_delta = screen
+            .and_then(|s| s.percent)
+            .map(|s| i64::from(s) as i32 - i64::from(p) as i32);
+        return CtxResolution {
+            percent: Some(p),
+            source: CtxSource::Mod,
+            // mod のモデル id を優先（画面の表示名は補助）
+            model: c
+                .model
+                .clone()
+                .or_else(|| screen.and_then(|s| s.model.clone())),
+            window: c.window,
+            reason: None,
+            screen_delta,
+            mod_reason: None,
+        };
+    }
+    let mut r = resolve_with_window(screen, transcript, fresh.and_then(|c| c.window));
+    r.mod_reason = Some(match mod_ctx {
+        ModCtxInput::Fresh(_) => MOD_NO_USAGE,
+        ModCtxInput::Unavailable(code) => code,
+    });
+    if r.model.is_none() {
+        r.model = fresh.and_then(|c| c.model.clone());
+    }
+    r
+}
+
+/// [`resolve`] の本体。`known_window` は claude 自身が答えた窓（mod。#1880）で、
+/// あれば画面からの逆算・宣言表より先に使う
+fn resolve_with_window(
+    screen: Option<&ScreenCtx>,
+    transcript: Option<&TranscriptCtx>,
+    known_window: Option<u64>,
+) -> CtxResolution {
     let screen_percent = screen.and_then(|s| s.percent);
     let screen_model = screen.and_then(|s| s.model.clone());
 
@@ -230,7 +326,7 @@ pub fn resolve(screen: Option<&ScreenCtx>, transcript: Option<&TranscriptCtx>) -
             // （宣言表が古くても実態に追従する）。合わなければ宣言表へ落ちる
             let calibrated = screen_percent.and_then(|p| implied_window(t.total_input_tokens, p));
             let declared = t.model.as_deref().and_then(declared_context_window);
-            match calibrated.or(declared) {
+            match known_window.or(calibrated).or(declared) {
                 Some(w) => {
                     window = Some(w);
                     transcript_percent = used_percent(t.total_input_tokens, w);
@@ -256,6 +352,7 @@ pub fn resolve(screen: Option<&ScreenCtx>, transcript: Option<&TranscriptCtx>) -
             window,
             reason: None,
             screen_delta,
+            mod_reason: None,
         };
     }
     if let Some(p) = transcript_percent {
@@ -266,6 +363,7 @@ pub fn resolve(screen: Option<&ScreenCtx>, transcript: Option<&TranscriptCtx>) -
             window,
             reason: None,
             screen_delta: None,
+            mod_reason: None,
         };
     }
     let reason = if transcript.is_none() {
@@ -528,6 +626,77 @@ mod tests {
         assert_eq!(r.source, CtxSource::None);
         assert_eq!(r.reason, Some(CtxUnavailable::Legacy));
         assert_eq!(r.reason.unwrap().as_str(), "legacy_env");
+    }
+
+    fn fresh(percent: Option<u32>, window: Option<u64>) -> ModCtxInput {
+        ModCtxInput::Fresh(ModCtx {
+            percent,
+            tokens: percent.map(|p| u64::from(p) * 10_000),
+            window,
+            model: Some("claude-haiku-5-5".into()),
+        })
+    }
+
+    #[test]
+    fn issue1880_新鮮なmodの値が画面より先に来て差を申告する() {
+        let screen = ScreenCtx {
+            percent: Some(9),
+            model: Some("Haiku 5.5".into()),
+        };
+        let r = resolve_full(&fresh(Some(6), Some(1_000_000)), Some(&screen), None);
+        assert_eq!(r.percent, Some(6));
+        assert_eq!(r.source, CtxSource::Mod);
+        assert_eq!(r.source.as_str(), "mod");
+        assert_eq!(r.window, Some(1_000_000), "窓は claude 自身の答え");
+        assert_eq!(r.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(r.mod_reason, None);
+        // 自己検証: 画面 − mod の差（丸め誤差を超えたら warnings の材料）
+        assert_eq!(r.screen_delta, Some(3));
+        assert!(r.window_looks_wrong());
+    }
+
+    #[test]
+    fn issue1880_画面にctxが出ない構成でもmodから取れる() {
+        // statusLine を外した claude = 画面は ctx を描かない（1M 窓では ~96.7% まで黙る）
+        let r = resolve_full(&fresh(Some(42), Some(200_000)), None, None);
+        assert_eq!((r.percent, r.source), (Some(42), CtxSource::Mod));
+        assert_eq!(r.screen_delta, None);
+    }
+
+    #[test]
+    fn issue1880_初回応答の前は落ちるが窓はmodの値を使う() {
+        // 宣言表に無い族でも、mod が窓を答えていれば transcript から算出できる
+        let t = TranscriptCtx {
+            total_input_tokens: 100_000,
+            model: Some("claude-haiku-4-5".into()),
+        };
+        assert_eq!(declared_context_window("claude-haiku-4-5"), None);
+        let r = resolve_full(&fresh(None, Some(200_000)), None, Some(&t));
+        assert_eq!(r.percent, Some(50));
+        assert_eq!(r.source, CtxSource::Transcript);
+        assert_eq!(r.window, Some(200_000));
+        assert_eq!(r.mod_reason, Some(MOD_NO_USAGE));
+        // 何も無ければ none + 理由 + mod の理由。モデルは mod から
+        let r = resolve_full(&fresh(None, Some(1_000_000)), None, None);
+        assert_eq!(r.source, CtxSource::None);
+        assert_eq!(r.reason, Some(CtxUnavailable::NoTranscript));
+        assert_eq!(r.mod_reason, Some(MOD_NO_USAGE));
+        assert_eq!(r.model.as_deref(), Some("claude-haiku-5-5"));
+    }
+
+    #[test]
+    fn issue1880_modが使えなければ今の経路へ落ちて理由を残す() {
+        let screen = ScreenCtx {
+            percent: Some(33),
+            model: None,
+        };
+        let r = resolve_full(&ModCtxInput::Unavailable("mod_stale"), Some(&screen), None);
+        assert_eq!((r.percent, r.source), (Some(33), CtxSource::Screen));
+        assert_eq!(r.mod_reason, Some("mod_stale"));
+        // 落ちた先の結果は旧経路（resolve）と 1 ビットも変わらない
+        let mut old = resolve(Some(&screen), None);
+        old.mod_reason = Some("mod_stale");
+        assert_eq!(r, old);
     }
 
     #[test]

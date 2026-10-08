@@ -166,6 +166,11 @@ pub(crate) struct ChatPaneState {
     pub messages: Vec<ChatMessage>,
     pub model: Option<String>,
     pub ctx_percent: Option<f64>,
+    /// `ctx_percent` の取得元（`agents` / `mod` / `screen` / `transcript` / `none`。#1880）。
+    /// `tako ui-mode` の `chat_header` に載る（残量バーの値がどこから来たかを外から読める）
+    pub ctx_source: &'static str,
+    /// mod を使わなかった理由（#1880。null = mod の値を採った）
+    pub ctx_mod_reason: Option<&'static str>,
     /// 生成中か（画面採取 `claude_tui::is_busy` + `claude agents --json` の status）
     pub busy: bool,
     /// busy 中に打たれた指示が claude のキューに滞留している（#572）
@@ -178,20 +183,6 @@ pub(crate) struct ChatPaneState {
     /// 表示条件を PWA（#425）と揃える: transcript からの推定は使わない
     /// （auto mode のツール実行中と承認待ちは transcript では区別できない）
     pub permission: Option<tako_control::claude_tui::PermissionDialog>,
-}
-
-/// モデル名 / ctx% の取得元の優先順（#1021）: `agents --json` → 画面 → transcript。
-///
-/// **画面を transcript より先に見る**のは、画面の数値が claude 自身の計算結果で
-/// 文脈窓の推定を一切要らないため（理由の全文は `tako_core::ctx_usage`）。
-/// `agents --json` を先頭に残すのは、上流が将来また返すようになったらそれが最も
-/// 権威だから（2.1.258 では返さない = だからこの関数がある）
-pub(crate) fn prefer_source<T>(
-    agents: Option<T>,
-    screen: Option<T>,
-    transcript: Option<T>,
-) -> Option<T> {
-    agents.or(screen).or(transcript)
 }
 
 impl ChatPaneState {
@@ -3831,6 +3822,8 @@ pub(crate) struct ChatRefreshTarget {
     /// （実測: claude 2.1.220 は両方とも欠落）ので、こちらが実データの拠り所になる
     screen_model: Option<String>,
     screen_ctx_percent: Option<f64>,
+    /// tako mod の報告（#1880。UI スレッドで引き当てて写す。新鮮なら ctx% の先頭）
+    mod_ctx: tako_core::ctx_usage::ModCtxInput,
     /// 前回の読み取り結果（mtime ゲートに使う）
     prev_session: Option<String>,
     prev_path: Option<std::path::PathBuf>,
@@ -3866,12 +3859,9 @@ pub(crate) struct ChatRefreshData {
     screen_busy: bool,
     queued: bool,
     permission: Option<tako_control::claude_tui::PermissionDialog>,
-    screen_model: Option<String>,
-    screen_ctx_percent: Option<f64>,
-    /// #1021: transcript から算出した ctx% / モデル id（`agents --json` が
-    /// `contextPercentUsed` / `model` を返さなくなった版のための代替ソース）
-    transcript_ctx_percent: Option<f64>,
-    transcript_model: Option<String>,
+    /// #1021 / #1880: mod → 画面 → transcript の解決結果（`agents --json` が
+    /// `contextPercentUsed` / `model` を返さなくなった版のための 1 実装）
+    ctx: tako_core::ctx_usage::CtxResolution,
 }
 
 impl TakoApp {
@@ -3892,6 +3882,9 @@ impl TakoApp {
         // 器を持たないペイン（tmux 未導入 / persist OFF = Homebrew cask の既定構成）は
         // 1 件も載らず、チャットビューが 1 度も立たない
         let legacy = tako_core::ui_mode::legacy_1397();
+        // #1880: tako mod の報告の引き当て（鮮度の基準時刻はこの収集で 1 つ）
+        let mod_now = std::time::Instant::now();
+        let mod_legacy = tako_core::claude_mod::s2_legacy();
         self.terminals
             .iter()
             // #853: セルフテストが注入した fixture のペインは読みに行かない。
@@ -3944,6 +3937,12 @@ impl TakoApp {
                     permission: tako_control::claude_tui::detect_permission_dialog(&lines),
                     screen_model: metrics.as_ref().and_then(|m| m.model.clone()),
                     screen_ctx_percent: metrics.and_then(|m| m.ctx_percent).map(f64::from),
+                    mod_ctx: tako_core::claude_mod::ctx_input(&tako_core::claude_mod::lookup(
+                        Some(&self.claude_mod),
+                        pane.as_u64(),
+                        mod_now,
+                        mod_legacy,
+                    )),
                     prev_session: previous.map(|p| p.session_id.clone()),
                     prev_path: previous.and_then(|p| p.transcript.clone()),
                     prev_stamp: previous.and_then(|p| p.stamp),
@@ -3988,15 +3987,18 @@ impl TakoApp {
                 transcript: data.transcript,
                 stamp: data.stamp,
                 messages,
-                // agents が返せば優先（将来版）→ 画面採取 → transcript（#1021）。
-                // 画面を transcript より先に見るのは、画面の数値が claude 自身の
-                // 計算結果で文脈窓の推定を要らないため（`tako_core::ctx_usage`）
-                model: prefer_source(data.model, data.screen_model, data.transcript_model),
-                ctx_percent: prefer_source(
-                    data.ctx_percent,
-                    data.screen_ctx_percent,
-                    data.transcript_ctx_percent,
-                ),
+                // agents が返せば優先（将来版）→ mod → 画面採取 → transcript（#1021 / #1880）。
+                // 後ろ 3 段は他の 3 経路と同じ `ctx_usage::resolve_full` の 1 実装。
+                // `agents --json` を先頭に残すのは、上流が将来また返すようになったら
+                // それが最も権威だから（2.1.258 では返さない）
+                model: data.model.or(data.ctx.model),
+                ctx_source: if data.ctx_percent.is_some() {
+                    "agents"
+                } else {
+                    data.ctx.source.as_str()
+                },
+                ctx_mod_reason: data.ctx.mod_reason,
+                ctx_percent: data.ctx_percent.or(data.ctx.percent.map(f64::from)),
                 busy,
                 queued: data.queued,
                 read_only: data.read_only,
@@ -4161,12 +4163,26 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
             };
             // #1021: 画面が ctx% を出していないとき（statusLine 未設定 = claude の
             // 組み込み表示は文脈が切迫するまで出ない）の代替。**解決済みのパスを
-            // そのまま使う**ので transcript の所在解決は増えない
-            let transcript_ctx = match (&path, target.screen_ctx_percent.is_none()) {
-                (Some(path), true) => tako_control::transcript::last_context_usage_at(path)
-                    .map(|usage| tako_core::ctx_usage::resolve(None, Some(&usage))),
-                _ => None,
+            // そのまま使う**ので transcript の所在解決は増えない。
+            // #1880: mod が答えていれば transcript は読まない
+            let mod_answered = matches!(
+                &target.mod_ctx,
+                tako_core::ctx_usage::ModCtxInput::Fresh(c) if c.percent.is_some()
+            );
+            let transcript_usage =
+                match (&path, target.screen_ctx_percent.is_none() && !mod_answered) {
+                    (Some(path), true) => tako_control::transcript::last_context_usage_at(path),
+                    _ => None,
+                };
+            let screen = tako_core::ctx_usage::ScreenCtx {
+                percent: target.screen_ctx_percent.map(|p| p.round() as u32),
+                model: target.screen_model.clone(),
             };
+            let ctx = tako_core::ctx_usage::resolve_full(
+                &target.mod_ctx,
+                Some(&screen),
+                transcript_usage.as_ref(),
+            );
             ChatRefreshResult {
                 pane: target.pane,
                 chat: Some(ChatRefreshData {
@@ -4182,13 +4198,7 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
                     screen_busy: target.screen_busy,
                     queued: target.queued,
                     permission: target.permission,
-                    screen_model: target.screen_model,
-                    screen_ctx_percent: target.screen_ctx_percent,
-                    transcript_ctx_percent: transcript_ctx
-                        .as_ref()
-                        .and_then(|c| c.percent)
-                        .map(f64::from),
-                    transcript_model: transcript_ctx.and_then(|c| c.model),
+                    ctx,
                 }),
             }
         })
@@ -4487,15 +4497,6 @@ mod tests {
         assert_eq!(capitalize_first("éclair"), "éclair");
         assert_eq!(capitalize_first("日本"), "日本");
         assert_eq!(capitalize_first("🎉x"), "🎉x");
-    }
-
-    #[test]
-    fn 取得元の優先順はagents_画面_transcript() {
-        // #1021: 3 段の優先順。画面が transcript より先（画面は claude 自身の答え）
-        assert_eq!(prefer_source(Some(1), Some(2), Some(3)), Some(1));
-        assert_eq!(prefer_source(None, Some(2), Some(3)), Some(2));
-        assert_eq!(prefer_source(None, None, Some(3)), Some(3));
-        assert_eq!(prefer_source::<i32>(None, None, None), None);
     }
 
     #[test]

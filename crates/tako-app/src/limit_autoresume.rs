@@ -141,6 +141,8 @@ impl TakoApp {
 
         let now = limit_resume::now_unix();
         let tz = limit_resume::local_utc_offset();
+        let mod_now = std::time::Instant::now();
+        let mod_legacy = tako_core::claude_mod::s2_legacy();
         let mut jobs = Vec::new();
         for pane in targets {
             let Some(session) = self.terminals.get(&pane) else {
@@ -150,11 +152,20 @@ impl TakoApp {
             let fingerprint = tako_control::limit_stop::screen_fingerprint(&lines);
             // #985: codex は rollout の `rate_limits.resets_at`（epoch）で解除時刻が
             // **書式にもタイムゾーンにも依存せず**分かる。画面の文言パースより確かなので
-            // 読めていればそちらを採る。**停止の根拠は画面のまま**（#813 の安全条件）
+            // 読めていればそちらを採る。**停止の根拠は画面のまま**（#813 の安全条件）。
+            // #1880: claude は tako mod の使用制限（アカウント単位で束ねた値。秒精度）
             let hint = self
                 .codex_limits
                 .get(&pane)
-                .map(tako_control::limit_stop::LimitHint::from_codex);
+                .map(tako_control::limit_stop::LimitHint::from_codex)
+                .or_else(|| {
+                    if mod_legacy {
+                        return None;
+                    }
+                    let limits = self.claude_mod.account_rate_limits(pane.as_u64(), mod_now);
+                    (!limits.is_empty())
+                        .then(|| tako_control::limit_stop::LimitHint::from_mod(&limits))
+                });
             let stop =
                 tako_control::limit_stop::detect_limit_stop_with(&lines, now, tz, hint.as_ref());
             let Some(stop) = stop else {

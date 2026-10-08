@@ -246,7 +246,8 @@ pub fn wait_for_worker(
                 let status = val["status"].as_str().unwrap_or("unknown");
                 let recent = val["recent_output"].as_str().unwrap_or("");
                 let source = val["status_source"].as_str().unwrap_or("screen");
-                // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8
+                // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8。
+                // #1880: tako mod の報告（`mod`）も claude 自身の一次シグナルなので 3
                 let need_streak: u32 = if source == "screen" { 8 } else { 3 };
 
                 // 非同期 run 用: 中間スナップショットを更新（#121）

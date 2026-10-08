@@ -12,7 +12,9 @@
 //! # 何を縛るか
 //!
 //! 1. `register.ts` のすべての `on(...)` の登録に `.catch(($, e, next) => next(e))` が付く
-//!    （判断を奪わず、失敗したら下へ流す = 設計書 §5）
+//!    （判断を奪わず、失敗したら下へ流す = 設計書 §5）。ストリームのフック（`turn.step`。#1880）は
+//!    async generator でしか書けないので、`.catch(async function* ($, e, next) {` +
+//!    `return yield* next(e)`（= 素通し）を同じ意味の形として認める
 //! 2. 報告に本文系のキーが無い: `register.ts` の `buildReport` の組み立て・`types/index.d.ts` の
 //!    契約・Rust の `ModReport` のフィールドのどれにも [`BODY_KEYS`] が出ない
 //! 3. MCP の `tako_mod` は `report` を受け付けない（AI が自分の状態を偽れるだけ = FR-2.42）
@@ -68,6 +70,11 @@ fn report(file: &str, line: usize, why: &str) -> String {
     format!("{file}:{line}: {why}")
 }
 
+/// 失敗したら下へ流す `.catch` の形（ふつうのフック）
+const CATCH_PLAIN: &str = ".catch(($, e, next) => next(e))";
+/// 同じ意味のストリームのフック用の形（#1880。`turn.step` は async generator でしか書けない）
+const CATCH_STREAM: &str = ".catch(async function* ($, e, next) {\n    return yield* next(e)\n  })";
+
 /// `register.ts` の登録（`  on('…'` で始まる行から次の登録の手前まで）ごとに `.catch` を見る
 fn scan_catch(src: &str) -> Vec<String> {
     let lines: Vec<&str> = src.lines().collect();
@@ -81,7 +88,7 @@ fn scan_catch(src: &str) -> Vec<String> {
     for (k, &start) in starts.iter().enumerate() {
         let end = starts.get(k + 1).copied().unwrap_or(lines.len());
         let block = lines[start..end].join("\n");
-        if !block.contains(".catch(($, e, next) => next(e))") {
+        if !block.contains(CATCH_PLAIN) && !block.contains(CATCH_STREAM) {
             out.push(report(
                 REGISTER,
                 start + 1,
@@ -325,6 +332,19 @@ fn 逆戻りを名指しできる() {
         s.register.replace_range(
             at + catch..at + catch + ".catch(($, e, next) => next(e))".len(),
             "",
+        );
+    });
+    assert_named(&found, REGISTER, ".catch");
+    // 1b. ストリームのフック（turn.step。#1880）の素通しを外す
+    let found = mutate(&|s| {
+        assert!(
+            s.register.contains(CATCH_STREAM),
+            "turn.step の素通しが見つからない"
+        );
+        s.register = s.register.replacen(
+            CATCH_STREAM,
+            ".catch(async function* () {\n    return undefined\n  })",
+            1,
         );
     });
     assert_named(&found, REGISTER, ".catch");
