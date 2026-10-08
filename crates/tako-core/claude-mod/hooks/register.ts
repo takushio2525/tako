@@ -36,6 +36,10 @@ let turn: TakoTurn = 'idle'
 let pendingTool: string | undefined
 let effort: string | undefined
 let lastTurn: { duration_ms: number; reason: string } | undefined
+// classic 系のイベント（classic.PreToolUse 等）がこのセッションの mod へ届いているか。
+// 組織アカウントでは 1 つも届かないことがある（2.1.294 で実測。設計書 §1.3 の追記）。
+// 届かないときの権限待ちは tool.check の判定から確かなものだけを拾う
+let classicEvents = false
 
 function rateLimit(limit: SessionRateLimit, at: number): TakoRateLimit {
   return { kind: limit.kind, percent_used: limit.percentUsed, resets_at: limit.resetsAt, observed_at: at }
@@ -60,6 +64,7 @@ async function buildReport($: EngineInterface, ended: boolean): Promise<TakoModR
     turn,
     pending_tool: pendingTool,
     last_turn: lastTurn,
+    classic_events: classicEvents,
     config_dir: await $.env.get('CLAUDE_CONFIG_DIR'),
     ended,
   }
@@ -134,8 +139,15 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // classic 系が届くかの印（すべてのツール呼び出しで tool.check より先に来る）
+  on('classic.PreToolUse', ($, e, next) => {
+    classicEvents = true
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   // ダイアログの表示と同時に来る（設計書 §1.3）。AskUserQuestion もここを通るのでツール名で分ける
   on('classic.PermissionRequest', ($, e, next) => {
+    classicEvents = true
     turn = e.tool_name === 'AskUserQuestion' ? 'question' : 'permission'
     pendingTool = e.tool_name
     if (e.effort !== undefined) effort = e.effort.level
@@ -143,8 +155,27 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // 承認・拒否・回答の瞬間を知らせるイベントは無いので、そのツールの呼び出しが返ったところで戻す
+  // classic 系が届かない環境の代わりの手がかり。判定が ask でも auto モードは分類器が黙って
+  // 通しうるので、**ダイアログが確かに出るものだけ**を拾う: ask ルールに当たった呼び出し
+  // （auto モードより優先される）と、人に計画の承認を求める ExitPlanMode
+  on('tool.check', async ($, e, next) => {
+    const verdict = await next(e)
+    if (!classicEvents && verdict.decision === 'ask' && (verdict.rule !== undefined || e.tool === 'ExitPlanMode')) {
+      turn = 'permission'
+      pendingTool = e.tool
+      dirty = true
+    }
+    return verdict
+  }).catch(($, e, next) => next(e))
+
+  // 承認・拒否・回答の瞬間を知らせるイベントは無いので、そのツールの呼び出しが返ったところで戻す。
+  // AskUserQuestion は呼び出しの開始と同時に質問が出る（classic 系が届かなくても分かる）
   on('tool.call', async ($, e, next) => {
+    if (e.tool === 'AskUserQuestion') {
+      turn = 'question'
+      pendingTool = e.tool
+      dirty = true
+    }
     const result = await next(e)
     if ((turn === 'permission' || turn === 'question') && e.tool === pendingTool) {
       turn = 'busy'

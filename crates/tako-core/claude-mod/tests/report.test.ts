@@ -164,6 +164,63 @@ describe('tako mod の報告', () => {
     expect(sent.at(-1)?.report.ended).toBe(false)
   })
 
+  test('AskUserQuestion は呼び出しの開始で question になり、返ると busy へ戻る', async ($, on) => {
+    const sent: Sent[] = []
+    world(on, sent)
+    let release: () => void = () => {}
+    const held = new Promise<void>(resolve => {
+      release = resolve
+    })
+    on('tool.call', async () => {
+      await held
+      return { result: { answers: {} } }
+    })
+    const clock = mock.clock(on)
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    await $.session.start(START)
+    await $.turn.start({ text: '', turnId: 't1' })
+    const call = $.tool.call({ tool: 'AskUserQuestion', questions: [] } as never)
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report).toEqual(expect.objectContaining({ turn: 'question', pending_tool: 'AskUserQuestion' }))
+    release()
+    await call
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report.turn).toBe('busy')
+  })
+
+  test('classic 系が届かないときは ask ルールに当たった判定だけ permission にする', async ($, on) => {
+    const sent: Sent[] = []
+    world(on, sent)
+    const verdicts: Record<string, { decision: 'ask'; rule?: string }> = {
+      Read: { decision: 'ask' },
+      Bash: { decision: 'ask', rule: 'Bash' },
+    }
+    on('tool.check', ($, e) => verdicts[e.tool] ?? { decision: 'allow' })
+    const clock = mock.clock(on)
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    await $.session.start(START)
+    await $.turn.start({ text: '', turnId: 't1' })
+    // ルールの無い ask は auto モードの分類器が黙って通しうるので拾わない
+    await $.tool.check({ tool: 'Read', input: {} })
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report).toEqual(expect.objectContaining({ turn: 'busy', classic_events: false }))
+    await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf secret' } })
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report).toEqual(expect.objectContaining({ turn: 'permission', pending_tool: 'Bash' }))
+    expect(JSON.stringify(sent.at(-1)?.report)).not.toContain('secret')
+  })
+
+  test('classic 系が届くときは PermissionRequest を正とし classic_events を立てる', async ($, on) => {
+    const sent: Sent[] = []
+    world(on, sent)
+    const clock = mock.clock(on)
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    await $.session.start(START)
+    await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: {} })
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report).toEqual(expect.objectContaining({ turn: 'permission', classic_events: true }))
+  })
+
   test('tako が落ちていてもターンは普通に流れる', async ($, on) => {
     const sent: Sent[] = []
     world(on, sent, 1)

@@ -39,6 +39,11 @@ export type TakoModReport = {
   turn: TakoTurn
   pending_tool?: string
   last_turn?: { duration_ms: number; reason: string }
+  /**
+   * classic 系のイベント（PermissionRequest 等）がこのセッションの mod へ届いているか。
+   * false のとき permission は ask ルール由来と ExitPlanMode だけ（ルールの無い ask は拾わない）
+   */
+  classic_events: boolean
   /** CLAUDE_CONFIG_DIR（使用制限はアカウント単位なので束ねる鍵にする。ログには出さない） */
   config_dir?: string
   /** session.end を受けた最後の報告。tako はそのペインの報告を即座に捨てる */

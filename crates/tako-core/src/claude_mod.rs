@@ -514,6 +514,11 @@ pub struct ModReport {
     pub pending_tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_turn: Option<ModLastTurn>,
+    /// classic 系のイベント（PermissionRequest 等）が mod へ届いているか。組織アカウントでは
+    /// 届かないことがあり（2.1.294 で実測）、そのとき `permission` は ask ルール由来と
+    /// ExitPlanMode だけ = 画面と突き合わせる判断材料（S2）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic_events: Option<bool>,
     /// 使用制限を束ねる鍵（アカウント単位）。**status には出さない**（ホームパスを含みうる）
     #[serde(default, skip_serializing)]
     pub config_dir: Option<String>,
