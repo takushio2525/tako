@@ -1679,13 +1679,14 @@ codex / agy は理由つき skip）。自動解決へ回った行は #1499（Z5�
 #1502（Z10）/ #1509（Z6）/ #1506（Z11）/ #1503 / #1504（Z9）/ #1505（Z19）/ #1524 / #1507（Z17）が着地済みで、
 #1508 / #1510 が進行中。
 
-### FR-2.42 tako mod（Claude Code の mod 連携）の基盤（✅ 2026-10-08、#1879。エピック #1877 の S1）
+### FR-2.42 tako mod（Claude Code の mod 連携）の基盤（✅ 2026-10-08、#1879。エピック #1877 の S1。S2 #1880 / S3 #1881 を含む）
 
 > tako が同梱する Claude Code の mod（プラグインの関数フック。2.1.287 以降）をペインの claude に
 > 読ませ、ctx・使用制限・ターンの状態を**構造で**受け取る。設計の正本は
 > `.agent/plans/2026-10-tako-mod.md`（通信路の比較 §2・置き場 §3・報告 §4・mod の規約 §5）。
 > S1 は「届くようにする」まで。届いた値を一次ソースに使う（S2 = FR-2.42.9〜12、#1880）・
-> Claude Code の画面に出す（S3）・Claude Code から tako を操作する（S4）・チャット表示（S5）は後続のスライス。
+> Claude Code の画面に出す（S3 = FR-2.42.13〜17、#1881）・Claude Code から tako を操作する（S4）・
+> チャット表示（S5）は後続のスライス。
 
 | ID | 要件 | 実装 |
 |---|---|---|
@@ -1701,8 +1702,13 @@ codex / agy は理由つき skip）。自動解決へ回った行は #1499（Z5�
 | FR-2.42.10 | **落ちた理由を黙らない**: mod を使えなかったときは今の経路（画面 → transcript）へ落ち、理由を `ctx_mod_reason` / `mod_reason` に出す（`mod_absent` / `mod_stale` / `disabled` / `claude_too_old` / `legacy_env` 等。`tako mod` の行の `reason.code` と同じ語彙。`mod_no_usage` = 報告は新鮮だが ctx% がまだ無い）。`ctx_reason` は「ctx% が null の理由」のまま変えない。A/B は `TAKO_1877_S2_LEGACY=1`（報告は受け取るが一次ソースに使わない = #1880 前の挙動） | `claude_mod::lookup` の 1 本（番犬 `issue1880_mod_primary_watchdog.rs` が `fresh_report(` の直呼びを落とす） |
 | FR-2.42.11 | **使用制限**: 5h / 7d の % と解除時刻を mod から採る（`orchestrator self` / `worker_status` の `rate_limits`。キー `limited` / `reset_at` は codex #985 と揃える。`reset_at` は unix 秒・**秒精度**）。使用制限は**アカウント単位**なので同じ `config_dir` の新鮮な報告を束ね、窓の種類ごとに「`resets_at` が遅い → 同じ窓なら % が大きい」を採る（mod は heartbeat のたびに読んだ時刻を打つので、`observed_at` だけでは放置ペインの古い % が勝つ）。**上限での停止の判定は画面のまま**（#813 の安全条件）: 自動復帰には上限に当たった窓の解除時刻を `LimitHint` として渡すだけで、mod の値だけでは停止と判定しない | `ModHub::account_rate_limits` / `limit_reset_at` / `LimitHint::from_mod` |
 | FR-2.42.12 | **ターン状態・権限待ち・質問待ち**: `worker_status` は新鮮な報告の `turn` を `claude agents --json` より先に見る（`status_source: "mod"`。watch の確定は一次シグナルと同じ 3 回）。`permission` / `question` は承認・回答の後もツールが返るまで残るので、画面が生成中なら busy を採る。**答え方（respond）は画面のダイアログを読むので**、mod と画面のダイアログ検出が食い違えば画面を正にして `warnings` に出す（`classic_events: false` の環境 = 組織アカウントでは、ルールの無い ask の権限ダイアログを mod から拾えない）。`read` は mod が待っていると言い画面が生成中でなければ `input_status` を null にする（ダイアログの選択カーソルを入力欄の下書きと読み違えない）。mod のモデル・effort は `mod_turn` に載る（effort は関数フックの `turn.step` から拾う = classic 系が届かない環境でも欠けない） | `ModTurn::status_word` / `ModSnapshot`（UI スレッドで写す） |
+| FR-2.42.13 | **帯（S3 #1881）**: プロンプトの上の帯（`ui.render` の `AbovePrompt`）に **1 行**で `tako \| ペイン名 \| タブ <名> \| worker N \| 要注意 M \| ctx P% \| 5h P% \| 7d P%` を出す。**ctx / 使用制限は tako が閾値（80% / 80%。チャットヘッダの残量バーの警告色と同じ）を超えたと判断したときだけ**（statusLine を持つ利用者の画面で二重にならない既定）。worker 0 本なら worker 数も要注意も出さず、タブ名がペイン名と同じなら出さない。名前は 24 桁で切り詰める。幅（`bodyColumns` = 端末の幅 − Claude Code の `[-]` の 5 桁）に収まらなければ**優先度の低い区切りから落とす**（タブ名 → worker 数 → 使用制限の小さい方 → ctx → 要注意。`tako` とペイン名は落とさない）、それでも溢れたら `wrap="truncate-end"` で末尾を切る = 必ず 1 行（S0 で 21 行のペインが `↓ 2 more` に畳んだ問題の解）。worker は右パネル orch と同じ規則（`Workspace::workers_of` = `spawned_by` + 唯一の master への寄せ）。**要注意** = 承認待ち（mod）・質問待ち（mod）・選択肢ダイアログ（画面。mod の無い codex / agy の worker も拾う）・使用制限の到達・非ゼロ終了。**「承認待ち」は帯に出さない**（権限ダイアログ・AskUserQuestion の表示中は Claude Code が帯ごと隠す。閉じれば戻る）。tako の外（`TAKO_PANE_ID` / `TAKO_CLI` が無い）・tako の応答が 45 秒途切れた・調査票が帯を使っている間は描かない。帯の材料は報告の応答で届くので、**worker の状態の変化はこのペインの次の報告（変化があれば 1 秒・無ければ 15 秒の heartbeat）で帯に出る**（tako からの常時 push は S6 #1884） | 判断は `tako_core::claude_mod::{band_view, classify_worker, band_warnings}`、詰めるのは `register.ts` の `fitBand` |
+| FR-2.42.14 | **`/tako` のサイドバー**: `$.ui.open` のペインに詳細（ペイン名・タブ・ctx の tokens / window・使用制限の全窓とリセットまでの残り・worker の一覧（要注意を先に、状態の語つき・最大 24 本）・帯に出す閾値・帯のトグルのボタン）。**頼まれずには開かない**（`/tako` からだけ。コマンドから開けば幅を問わず置かれる。置き方は Claude Code が決める = 実測では隔離 tmux の 144 桁で右に docked）。**設計原則 5 の例外**: サイドバーを開く操作そのものは CLI / MCP に無い（中身は AI にとって等価な `tako mod` / `tako orchestrator workers` で読める。Claude Code の画面の中の表示を tako から開くには tako → mod の常時 push = S6 #1884 が要る） | `register.ts` の `ui.render`（`Pane`）と `command.run`（`/tako`。`immediate`） |
+| FR-2.42.15 | **帯のトグル**: mod の `$.store` の `band`（`{hidden, at}`）が正本で、claude の再起動後も保たれる（実体は `<設定 dir>/plugins/store/tako_inline-<hash>.json`。hash は mod の名前で決まり置き場のパスに依らない = 設定 dir ごとに 1 つ）。切り替えの口は `/tako band on\|off`・サイドバーのボタン・**`tako mod band on\|off`**（MCP `tako_mod` の `band-on` / `band-off`。報告の応答の `view.band_request` で全 mod へ中継 = 次の報告（最大 15 秒）で届く。中継は GUI のメモリだけ）で、**時刻の新しいものが勝つ**（後から Claude Code の中で切り替えればそちらが勝つ）。同じ設定 dir の別セッションは報告のたびに `$.store` を読み直して揃う。`$.store` は Claude Code の設定ファイル（`settings*.json`）ではなく、トグルを変えたときにだけ書かれる | `ModHub::request_band` / `register.ts` の `setHidden` / `syncStore` |
+| FR-2.42.16 | **観測**: 報告に帯の状態 `band`（`hidden` / `shown` / `columns` / `segments` = 描いた区切りの種類 / `toggled_at`。**描いた文字列は載せない**）を載せ、`tako mod` の行（`report.band`）に出る。status の `band` に中継（`request`）・A/B（`legacy`）・閾値。報告の応答の `tako.view` が帯・サイドバーの材料（`claude-mod/types/index.d.ts` の `TakoView` = `BandView`） | `claude_mod::status` / `snapshot` |
+| FR-2.42.17 | **A/B と頑健さ**: `TAKO_1877_S3_LEGACY=1` で応答に `view` を載せない（報告と一次ソース化はそのまま = mod は描かない = #1881 前の挙動）。検証用の `TAKO_1881_BAND_THRESHOLD=<%>` で閾値（ctx / 使用制限の両方）を差し替える（`0` で区切りを全部並べて 1 行に収まるかを測る）。帯の準備（`$.store` の読み・`/tako` の登録）が失敗しても報告（S1 / S2）は止めない | `scripts/test-claude-mod-band-1881.sh` / `claude-mod/tests/band.test.ts`（terminal と desktop の両 surface） |
 
-対応状況: claude は Supported（`agent_support` の `claude_mod_state`）、codex / agy は同等の拡張点を未調査で Pending（#1885）。
+対応状況: claude は Supported（`agent_support` の `claude_mod_state` / `claude_mod_band`）、codex / agy は同等の拡張点を未調査で Pending（#1885）。
 Windows は Pending（#1886。区切り `;` の連結は単体テスト済み、実機の Claude Code で読むかは未実測）。
 
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース

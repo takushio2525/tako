@@ -685,41 +685,16 @@ impl TakoApp {
         for tab in self.workspace.tabs() {
             for pane in tab.tree().panes() {
                 let role = pane.role().unwrap_or("");
-                let is_master = role.contains("orchestrator-master")
-                    || role == "master"
-                    || role.starts_with("master:");
+                let is_master = tako_core::workspace::is_master_role(role);
                 let is_solo = role.contains("orchestrator-solo") || role.starts_with("solo");
                 if is_master {
                     let session = self.terminals.get(&pane.id());
-                    // spawned_by で紐づくワーカーを収集。復元後などで spawned_by が
-                    // 失われた worker role ペインは、master が唯一のときだけ
-                    // フォールバック紐づけする（複数 master の誤認防止 = #210 と同思想）
-                    let master_count = self
-                        .workspace
-                        .tabs()
-                        .iter()
-                        .flat_map(|t| t.tree().panes())
-                        .filter(|p| {
-                            p.role().is_some_and(|r| {
-                                r.contains("orchestrator-master")
-                                    || r == "master"
-                                    || r.starts_with("master:")
-                            })
-                        })
-                        .count();
+                    // ワーカーの紐づけ規則（spawned_by + 唯一の master への寄せ）は
+                    // tako mod の帯（#1881）と同じ 1 実装を引く
                     let workers = self
                         .workspace
-                        .tabs()
-                        .iter()
-                        .flat_map(|t| t.tree().panes())
-                        .filter(|p| {
-                            p.spawned_by() == Some(pane.id())
-                                || (master_count == 1
-                                    && p.spawned_by().is_none()
-                                    && p.role().is_some_and(|r| {
-                                        r.contains("orchestrator-worker") || r.starts_with("worker")
-                                    }))
-                        })
+                        .workers_of(pane.id())
+                        .into_iter()
                         .map(|p| {
                             let name = p
                                 .role()

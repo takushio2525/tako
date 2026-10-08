@@ -15,6 +15,10 @@
 //!   呼び出し側が今の経路（画面 / transcript）へ落ちる。使用制限は**アカウント単位**なので
 //!   [`ModHub::account_rate_limits`] で束ねる。**上限での停止は画面でしか判定しない**
 //!   （[`limit_reset_at`] は解除時刻の手がかりだけを返す = #813 の安全条件）
+//! - **画面に出す（S3 #1881）**: 報告の応答に帯・サイドバーの材料（[`BandView`]）を載せる。
+//!   何を出すか（worker の状態・要注意・閾値を超えた ctx / 使用制限）は [`band_view`] が決め、
+//!   mod は幅に合わせて 1 行に詰めて描くだけ。帯を隠すトグルは mod の `$.store` が正本で、
+//!   `tako mod band on|off` は応答に載せて中継する（[`ModHub::request_band`]）
 //!
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
@@ -52,6 +56,9 @@ pub const FRESH_FOR: Duration = Duration::from_secs(45);
 pub const HEARTBEAT: Duration = Duration::from_secs(15);
 /// 報告の契約の版（`register.ts` / `types/index.d.ts` の `schema`）
 pub const SCHEMA: u32 = 1;
+/// 帯・サイドバーを描かない A/B の入口（S3 #1881）。報告の受け取りと一次ソース化（S1 / S2）は
+/// 続けるが、`tako mod report` の応答に帯・サイドバーの材料（`view`）を載せない = mod は何も描かない
+pub const S3_LEGACY_ENV: &str = "TAKO_1877_S3_LEGACY";
 
 /// env の一覧の区切り（PATH と同じ。macOS / Linux は `:`、Windows は `;`）
 pub const LIST_SEP: char = if cfg!(windows) { ';' } else { ':' };
@@ -370,6 +377,11 @@ pub fn s2_legacy() -> bool {
     std::env::var_os(S2_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
+/// S3 の A/B（[`S3_LEGACY_ENV`]）が立っているか
+pub fn s3_legacy() -> bool {
+    std::env::var_os(S3_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
 /// 一覧の 1 項目が tako の mod の置き場か（どのインスタンスの data dir でも）。
 /// tako のペインから立てた tako（開発中の隔離起動など）は親の値を継承するので、
 /// それを「利用者自身の plugin dir」と取り違えないために見分ける
@@ -517,6 +529,30 @@ pub struct ModLastTurn {
     pub reason: String,
 }
 
+/// 帯（プロンプトの上の 1 行）の状態（S3 #1881。mod が描いたもの）。
+///
+/// **描いた文字列は持たない**: 何を描いたかは区切りの種類（`segments`）だけで表す
+/// （ペイン名・タブ名は tako が渡したもので、tako 側が既に知っている）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModBand {
+    /// 利用者が帯を隠している（`$.store` に保存したトグル = 再起動後も保たれる）
+    pub hidden: bool,
+    /// 直近の描画で帯を描いたか（隠している・tako の材料が無い / 古い・調査票が帯を使っている
+    /// ときは false）。**権限ダイアログ・質問の表示中は Claude Code が帯ごと隠す**ので、
+    /// そのあいだ描画は呼ばれず、この値は最後に描いたときのまま
+    pub shown: bool,
+    /// 直近の描画で帯の本文に使えた桁（`AbovePrompt` の `bodyColumns`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u32>,
+    /// 描いた区切りの種類（左から。`tako` / `pane` / `tab` / `workers` / `attention` / `ctx` /
+    /// 使用制限の窓の種類）。幅が足りないと優先度の低い順に落ちる
+    #[serde(default)]
+    pub segments: Vec<String>,
+    /// トグルを最後に変えた時刻（epoch ms。`tako mod band` の中継と突き合わせる）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toggled_at: Option<u64>,
+}
+
 /// mod からの報告（`schema: 1`。設計書 §4.2 / `claude-mod/types/index.d.ts`）。
 ///
 /// **本文・プロンプト・ツールの引数を持つフィールドを足さない**（AGENTS.md の絶対ルール。
@@ -555,6 +591,9 @@ pub struct ModReport {
     /// 使用制限を束ねる鍵（アカウント単位）。**status には出さない**（ホームパスを含みうる）
     #[serde(default, skip_serializing)]
     pub config_dir: Option<String>,
+    /// 帯の状態（S3 #1881。S3 前の mod は送らない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<ModBand>,
     #[serde(default)]
     pub ended: bool,
 }
@@ -576,6 +615,8 @@ impl ModReport {
 const MAX_TEXT: usize = 256;
 /// 使用制限の窓の数の上限
 const MAX_RATE_LIMITS: usize = 16;
+/// 帯の区切りの数の上限
+const MAX_BAND_SEGMENTS: usize = 16;
 
 /// 報告を読む。`schema` が違えば断る（mod と tako の版がずれたとき、黙って誤読しない）
 pub fn parse_report(value: serde_json::Value) -> Result<ModReport, String> {
@@ -605,6 +646,12 @@ pub fn parse_report(value: serde_json::Value) -> Result<ModReport, String> {
     report.rate_limits.truncate(MAX_RATE_LIMITS);
     for limit in &mut report.rate_limits {
         clip(&mut limit.kind);
+    }
+    if let Some(band) = &mut report.band {
+        band.segments.truncate(MAX_BAND_SEGMENTS);
+        for segment in &mut band.segments {
+            clip(segment);
+        }
     }
     Ok(report)
 }
@@ -780,6 +827,9 @@ pub struct ModHub {
     pub injections: HashMap<u64, PaneInjection>,
     /// ペインごとの最終報告
     pub reports: HashMap<u64, StoredReport>,
+    /// `tako mod band on|off` の中継（S3 #1881）。報告の応答に載せて全 mod へ渡す。
+    /// メモリだけ（mod 側の `$.store` が正本で、tako の再起動で消えても mod の保存は残る）
+    pub band_request: Option<BandRequest>,
 }
 
 /// [`ModHub::accept`] の結果
@@ -907,6 +957,312 @@ impl ModHub {
     pub fn forget_pane(&mut self, pane: u64) {
         self.injections.remove(&pane);
         self.reports.remove(&pane);
+    }
+
+    /// `tako mod band on|off`（S3 #1881）。`at` は epoch ms（mod の `$.store` の時刻と比べる）
+    pub fn request_band(&mut self, hidden: bool, at: u64) {
+        self.band_request = Some(BandRequest { hidden, at });
+    }
+}
+
+// --- 帯とサイドバー（S3 #1881）-------------------------------------------------------
+//
+// mod は `tako mod report` の応答に載った [`BandView`] で、帯（プロンプトの上の 1 行）と
+// `/tako` のサイドバーを描く。**何を出すかの判断はここ**（worker の状態・要注意・閾値）。
+// mod は幅に合わせて詰めるだけにする（判断を TS 側に散らさない）
+
+/// 帯に ctx% を出す閾値（%）。チャット表示の残量バーが警告色になる値と同じ。
+/// 閾値未満では出さない（statusLine を持つ利用者の画面で情報が二重にならない既定）
+pub const BAND_CTX_PERCENT: u32 = 80;
+/// 帯に使用制限（5h / 7d 等）を出す閾値（%）
+pub const BAND_LIMIT_PERCENT: f64 = 80.0;
+/// 応答に並べる worker の上限（数は [`BandView::worker_count`] で全部数える = 応答を太らせない）
+pub const BAND_MAX_WORKERS: usize = 24;
+/// 検証用: 帯に ctx / 使用制限を出す閾値（%）を両方まとめて差し替える（`0` で常に出す =
+/// 実画面で帯の区切りを全部並べて 1 行に収まるかを測る。`scripts/test-claude-mod-band-1881.sh`）
+pub const BAND_THRESHOLD_ENV: &str = "TAKO_1881_BAND_THRESHOLD";
+
+/// 帯の閾値（既定は [`BAND_CTX_PERCENT`] / [`BAND_LIMIT_PERCENT`]。[`BAND_THRESHOLD_ENV`] で差し替え）
+pub fn band_thresholds() -> BandThresholds {
+    match std::env::var(BAND_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(p) => BandThresholds {
+            ctx_percent: p,
+            limit_percent: f64::from(p),
+        },
+        None => BandThresholds {
+            ctx_percent: BAND_CTX_PERCENT,
+            limit_percent: BAND_LIMIT_PERCENT,
+        },
+    }
+}
+
+/// 帯・サイドバーに出す worker の状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    Busy,
+    Idle,
+    /// 権限ダイアログ・質問・選択肢ダイアログで止まっている
+    Waiting,
+    /// 使用制限に当たっている
+    Limited,
+    /// エージェントが非ゼロで終わってシェルへ戻った
+    Failed,
+    Unknown,
+}
+
+/// 要注意（人の手が要る）の理由
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Attention {
+    /// 権限ダイアログ（mod か画面）
+    Permission,
+    /// AskUserQuestion（mod）
+    Question,
+    /// そのほかの選択肢ダイアログ（画面から。mod の無い worker = codex / agy 等も拾う）
+    Dialog,
+    Limited,
+    Failed,
+}
+
+/// worker 1 本の手掛かり（tako-control がホストから集める。判断は [`classify_worker`]）
+#[derive(Debug, Clone, Default)]
+pub struct WorkerFacts {
+    pub pane: u64,
+    /// 表示名（ペインのタイトル → role → `pane N`）
+    pub name: String,
+    /// 新鮮な mod の報告のターン（無い・古い・A/B なら None）
+    pub mod_turn: Option<ModTurn>,
+    /// そのアカウントの使用制限が上限（100%）に当たっている（mod の値）
+    pub limited: bool,
+    /// 画面に人の答えを待つ選択肢ダイアログがある（tako が自動で答える trust / bypass は除く）
+    pub dialog_on_screen: bool,
+    /// そのダイアログが権限ダイアログ（ツール実行の承認）
+    pub permission_on_screen: bool,
+    /// 画面の選択肢ダイアログが使用制限の対処の選択
+    pub limit_dialog_on_screen: bool,
+    /// 画面が生成中
+    pub screen_busy: bool,
+    /// シェル統合のコマンド状態（エージェントが動いている間は Running）
+    pub command: crate::CommandState,
+}
+
+/// worker の状態と要注意の理由を決める（純関数）。
+///
+/// 順序: 使用制限 → mod の待ち（承認 / 質問）→ 画面のダイアログ → mod の busy / idle →
+/// コマンド状態。mod の `permission` / `question` は承認・回答の後もツールが返るまで残るので、
+/// 画面が生成中なら busy を採る（[`ModTurn::status_word`] と同じ規則）。**画面のダイアログは
+/// mod の busy / idle より先**に見る: 組織アカウントでは classic 系が届かず、ルールの無い ask の
+/// 権限ダイアログを mod が拾えない（FR-2.42.7。S2 の `worker_status` も画面を正にする）
+pub fn classify_worker(f: &WorkerFacts) -> (WorkerState, Option<Attention>) {
+    if f.limited || f.limit_dialog_on_screen {
+        return (WorkerState::Limited, Some(Attention::Limited));
+    }
+    let mod_word = f
+        .mod_turn
+        .map(|turn| (turn, turn.status_word(f.screen_busy)));
+    match mod_word {
+        Some((ModTurn::Question, "waiting")) => {
+            return (WorkerState::Waiting, Some(Attention::Question));
+        }
+        Some((_, "waiting")) => return (WorkerState::Waiting, Some(Attention::Permission)),
+        _ => {}
+    }
+    if f.permission_on_screen {
+        return (WorkerState::Waiting, Some(Attention::Permission));
+    }
+    if f.dialog_on_screen {
+        return (WorkerState::Waiting, Some(Attention::Dialog));
+    }
+    match mod_word {
+        Some((_, "busy")) => return (WorkerState::Busy, None),
+        Some(_) => return (WorkerState::Idle, None),
+        None => {}
+    }
+    match f.command {
+        crate::CommandState::Failed(_) => (WorkerState::Failed, Some(Attention::Failed)),
+        _ if f.screen_busy => (WorkerState::Busy, None),
+        crate::CommandState::Running | crate::CommandState::Idle => (WorkerState::Idle, None),
+        crate::CommandState::Unknown => (WorkerState::Unknown, None),
+    }
+}
+
+/// 帯に出す警告（閾値を超えた ctx% と使用制限）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BandWarning {
+    /// `ctx` か使用制限の窓の種類（`five_hour` / `seven_day` …）
+    pub kind: String,
+    pub percent: f64,
+    /// 使用制限の解除時刻（unix 秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+}
+
+/// 閾値（既定は [`BAND_CTX_PERCENT`] / [`BAND_LIMIT_PERCENT`]）を超えたものだけを並べる（純関数）。
+/// ctx が先、使用制限は % の大きい順
+pub fn band_warnings(
+    ctx_percent: Option<u32>,
+    limits: &[ModRateLimit],
+    thresholds: BandThresholds,
+) -> Vec<BandWarning> {
+    let mut out: Vec<BandWarning> = Vec::new();
+    if let Some(p) = ctx_percent.filter(|p| *p >= thresholds.ctx_percent) {
+        out.push(BandWarning {
+            kind: "ctx".into(),
+            percent: f64::from(p),
+            resets_at: None,
+        });
+    }
+    let mut over: Vec<&ModRateLimit> = limits
+        .iter()
+        .filter(|l| l.percent_used >= thresholds.limit_percent)
+        .collect();
+    over.sort_by(|a, b| b.percent_used.total_cmp(&a.percent_used));
+    out.extend(over.into_iter().map(|l| BandWarning {
+        kind: l.kind.clone(),
+        percent: l.percent_used,
+        resets_at: l.resets_at.as_deref().and_then(parse_resets_at),
+    }));
+    out
+}
+
+/// サイドバーの worker の行
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BandWorker {
+    pub pane: u64,
+    pub name: String,
+    pub state: WorkerState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention: Option<Attention>,
+}
+
+/// サイドバーの使用制限の行（閾値に関わらず全部）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BandLimit {
+    pub kind: String,
+    pub percent: f64,
+    /// 解除時刻（unix 秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+}
+
+/// `tako mod band on|off` の中継（[`ModHub::request_band`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BandRequest {
+    pub hidden: bool,
+    /// 頼んだ時刻（epoch ms）。mod は自分の `$.store` の時刻より新しいときだけ従う
+    /// （後から利用者が Claude Code の中で切り替えたら、そちらが勝つ）
+    pub at: u64,
+}
+
+/// 帯に ctx / 使用制限を出す閾値（判断は tako 側。mod へはサイドバーで
+/// 「何 % から帯に出るか」を見せるために渡す）
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct BandThresholds {
+    pub ctx_percent: u32,
+    pub limit_percent: f64,
+}
+
+/// 帯・サイドバーの材料（`tako mod report` の応答の `tako.view`。mod の契約は
+/// `claude-mod/types/index.d.ts` の `TakoView`。キーを変えるときは両方を同じコミットで直す）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BandView {
+    pub pane: u64,
+    /// このペインの名前（無ければ mod が `pane N` と描く）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_title: Option<String>,
+    /// tako の表示言語（`ja` / `en`）
+    pub lang: &'static str,
+    /// このペインに紐づく worker の数（[`crate::Workspace::workers_of`]）
+    pub worker_count: usize,
+    /// そのうち要注意の数
+    pub attention: usize,
+    /// 要注意を先に、最大 [`BAND_MAX_WORKERS`] 本
+    pub workers: Vec<BandWorker>,
+    /// 帯に出す警告（閾値超えだけ）
+    pub warnings: Vec<BandWarning>,
+    /// サイドバー用の ctx（閾値に関わらず。mod の報告の値）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx: Option<ModContext>,
+    /// サイドバー用の使用制限（アカウント単位で束ねた値。閾値に関わらず）
+    pub rate_limits: Vec<BandLimit>,
+    pub thresholds: BandThresholds,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub band_request: Option<BandRequest>,
+}
+
+/// [`band_view`] の入力
+#[derive(Debug, Clone, Default)]
+pub struct BandInput {
+    pub pane: u64,
+    pub pane_title: Option<String>,
+    pub tab_title: Option<String>,
+    pub lang: &'static str,
+    pub workers: Vec<WorkerFacts>,
+    /// このペインの報告の ctx（引き当てられなければ None）
+    pub ctx: Option<ModContext>,
+    /// このペインのアカウントの使用制限（束ね済み）
+    pub rate_limits: Vec<ModRateLimit>,
+    pub band_request: Option<BandRequest>,
+    pub thresholds: BandThresholds,
+}
+
+impl Default for BandThresholds {
+    fn default() -> Self {
+        Self {
+            ctx_percent: BAND_CTX_PERCENT,
+            limit_percent: BAND_LIMIT_PERCENT,
+        }
+    }
+}
+
+/// 帯・サイドバーの材料を組む（純関数）
+pub fn band_view(input: BandInput) -> BandView {
+    let mut workers: Vec<BandWorker> = input
+        .workers
+        .iter()
+        .map(|f| {
+            let (state, attention) = classify_worker(f);
+            BandWorker {
+                pane: f.pane,
+                name: f.name.clone(),
+                state,
+                attention,
+            }
+        })
+        .collect();
+    let worker_count = workers.len();
+    let attention = workers.iter().filter(|w| w.attention.is_some()).count();
+    // 要注意を先に、あとはペイン番号順（毎回同じ並び = 再描画で行が踊らない）
+    workers.sort_by_key(|w| (w.attention.is_none(), w.pane));
+    workers.truncate(BAND_MAX_WORKERS);
+    let ctx_percent = input.ctx.as_ref().and_then(|c| c.percent);
+    BandView {
+        pane: input.pane,
+        pane_title: input.pane_title,
+        tab_title: input.tab_title,
+        lang: input.lang,
+        worker_count,
+        attention,
+        workers,
+        warnings: band_warnings(ctx_percent, &input.rate_limits, input.thresholds),
+        ctx: input.ctx,
+        rate_limits: input
+            .rate_limits
+            .iter()
+            .map(|l| BandLimit {
+                kind: l.kind.clone(),
+                percent: l.percent_used,
+                resets_at: l.resets_at.as_deref().and_then(parse_resets_at),
+            })
+            .collect(),
+        thresholds: input.thresholds,
+        band_request: input.band_request,
     }
 }
 
@@ -1452,5 +1808,185 @@ mod tests {
         assert!(is_tako_mod_entry(r"C:\x\claude-mod\tako"));
         assert!(!is_tako_mod_entry("/x/claude-mod/other"));
         assert!(!is_tako_mod_entry("/x/tako"));
+    }
+
+    fn facts(pane: u64) -> WorkerFacts {
+        WorkerFacts {
+            pane,
+            name: format!("w{pane}"),
+            ..WorkerFacts::default()
+        }
+    }
+
+    #[test]
+    fn issue1881_workerの状態は使用制限_mod_画面_コマンドの順に決まる() {
+        use crate::CommandState as C;
+        let with = |f: fn(&mut WorkerFacts)| {
+            let mut w = facts(1);
+            f(&mut w);
+            classify_worker(&w)
+        };
+        // 使用制限が最優先（mod の値でも画面のダイアログでも）
+        let got = with(|w| {
+            w.limited = true;
+            w.mod_turn = Some(ModTurn::Busy);
+        });
+        assert_eq!(got, (WorkerState::Limited, Some(Attention::Limited)));
+        let got = with(|w| w.limit_dialog_on_screen = true);
+        assert_eq!(got, (WorkerState::Limited, Some(Attention::Limited)));
+        // mod が新鮮なら画面より先。承認後のツール実行中（画面が生成中）は busy
+        let got = with(|w| w.mod_turn = Some(ModTurn::Permission));
+        assert_eq!(got, (WorkerState::Waiting, Some(Attention::Permission)));
+        let got = with(|w| w.mod_turn = Some(ModTurn::Question));
+        assert_eq!(got, (WorkerState::Waiting, Some(Attention::Question)));
+        let got = with(|w| {
+            w.mod_turn = Some(ModTurn::Permission);
+            w.screen_busy = true;
+        });
+        assert_eq!(got, (WorkerState::Busy, None));
+        // 画面のダイアログは mod の busy / idle より先（組織アカウントではルールの無い ask を
+        // mod が拾えない = FR-2.42.7）
+        let got = with(|w| {
+            w.mod_turn = Some(ModTurn::Busy);
+            w.dialog_on_screen = true;
+            w.permission_on_screen = true;
+        });
+        assert_eq!(got, (WorkerState::Waiting, Some(Attention::Permission)));
+        let got = with(|w| {
+            w.mod_turn = Some(ModTurn::Idle);
+            w.dialog_on_screen = true;
+        });
+        assert_eq!(got, (WorkerState::Waiting, Some(Attention::Dialog)));
+        assert_eq!(
+            with(|w| w.mod_turn = Some(ModTurn::Idle)),
+            (WorkerState::Idle, None)
+        );
+        assert_eq!(
+            with(|w| w.mod_turn = Some(ModTurn::Busy)),
+            (WorkerState::Busy, None)
+        );
+        // mod の無い worker（codex / agy / 古い claude）は画面とコマンド状態から
+        let got = with(|w| w.dialog_on_screen = true);
+        assert_eq!(got, (WorkerState::Waiting, Some(Attention::Dialog)));
+        let got = with(|w| w.command = C::Failed(1));
+        assert_eq!(got, (WorkerState::Failed, Some(Attention::Failed)));
+        let got = with(|w| {
+            w.command = C::Running;
+            w.screen_busy = true;
+        });
+        assert_eq!(got, (WorkerState::Busy, None));
+        assert_eq!(with(|w| w.command = C::Running), (WorkerState::Idle, None));
+        assert_eq!(with(|_| {}), (WorkerState::Unknown, None));
+    }
+
+    #[test]
+    fn issue1881_帯の警告は閾値以上だけでctxが先_使用制限は大きい順() {
+        let th = BandThresholds::default();
+        assert!(band_warnings(Some(BAND_CTX_PERCENT - 1), &[], th).is_empty());
+        let limits = vec![
+            limit(
+                "five_hour",
+                BAND_LIMIT_PERCENT - 0.5,
+                "2026-10-08T19:30:00Z",
+                1,
+            ),
+            limit("seven_day", 85.0, "2026-10-10T13:00:00Z", 1),
+            limit("seven_day_opus", 100.0, "2026-10-10T13:00:00Z", 1),
+        ];
+        let got = band_warnings(Some(BAND_CTX_PERCENT), &limits, th);
+        let kinds: Vec<&str> = got.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(kinds, ["ctx", "seven_day_opus", "seven_day"]);
+        assert_eq!(got[0].percent, f64::from(BAND_CTX_PERCENT));
+        assert_eq!(got[2].resets_at, parse_resets_at("2026-10-10T13:00:00Z"));
+        // ctx が未観測（最初の応答の前）なら出さない（0% と描かない）
+        assert!(band_warnings(None, &[], th).is_empty());
+        // 検証用の閾値 0 なら全部出す
+        let zero = BandThresholds {
+            ctx_percent: 0,
+            limit_percent: 0.0,
+        };
+        assert_eq!(band_warnings(Some(3), &limits, zero).len(), 4);
+    }
+
+    #[test]
+    fn issue1881_帯の材料は要注意を数えて先に並べ上限で切る() {
+        let mut workers: Vec<WorkerFacts> = (1..=(BAND_MAX_WORKERS as u64 + 5))
+            .map(|p| {
+                let mut f = facts(p);
+                f.mod_turn = Some(ModTurn::Busy);
+                f
+            })
+            .collect();
+        let last = workers.len() - 1;
+        workers[last].mod_turn = Some(ModTurn::Question);
+        workers[3].command = crate::CommandState::Failed(2);
+        workers[3].mod_turn = None;
+        let view = band_view(BandInput {
+            pane: 7,
+            pane_title: Some("master".into()),
+            tab_title: Some("main".into()),
+            lang: "ja",
+            workers,
+            ctx: Some(ModContext {
+                tokens: Some(850),
+                window: 1000,
+                percent: Some(85),
+            }),
+            rate_limits: vec![limit("five_hour", 3.0, "2026-10-08T19:30:00Z", 1)],
+            band_request: Some(BandRequest {
+                hidden: true,
+                at: 42,
+            }),
+            thresholds: BandThresholds::default(),
+        });
+        assert_eq!(view.worker_count, BAND_MAX_WORKERS + 5, "数は全部数える");
+        assert_eq!(view.attention, 2);
+        assert_eq!(view.workers.len(), BAND_MAX_WORKERS, "並べるのは上限まで");
+        assert_eq!(view.workers[0].pane, 4, "要注意が先（ペイン番号順）");
+        assert_eq!(view.workers[0].attention, Some(Attention::Failed));
+        assert_eq!(view.workers[1].attention, Some(Attention::Question));
+        assert_eq!(view.warnings.len(), 1, "使用制限 3% は帯に出さない");
+        assert_eq!(view.warnings[0].kind, "ctx");
+        assert_eq!(
+            view.rate_limits.len(),
+            1,
+            "サイドバーには閾値に関わらず出す"
+        );
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["thresholds"]["ctx_percent"], BAND_CTX_PERCENT);
+        assert_eq!(v["band_request"]["hidden"], true);
+        assert_eq!(v["workers"][1]["state"], "waiting");
+        assert!(v["workers"][4].get("attention").is_none());
+    }
+
+    #[test]
+    fn issue1881_報告の帯の状態は読めて区切りは上限で切る() {
+        let mut v = report_json();
+        v["band"] = serde_json::json!({
+            "hidden": false, "shown": true, "columns": 75,
+            "segments": (0..40).map(|i| format!("s{i}")).collect::<Vec<_>>(),
+        });
+        let r = parse_report(v).unwrap();
+        let band = r.band.unwrap();
+        assert!(band.shown && !band.hidden);
+        assert_eq!(band.columns, Some(75));
+        assert_eq!(band.segments.len(), MAX_BAND_SEGMENTS);
+        // S3 前の mod（band を送らない）も読める
+        assert!(parse_report(report_json()).unwrap().band.is_none());
+    }
+
+    #[test]
+    fn issue1881_帯のトグルの中継は最後の依頼だけを持つ() {
+        let mut hub = ModHub::new(true);
+        assert!(hub.band_request.is_none());
+        hub.request_band(true, 10);
+        hub.request_band(false, 20);
+        assert_eq!(
+            hub.band_request,
+            Some(BandRequest {
+                hidden: false,
+                at: 20
+            })
+        );
     }
 }

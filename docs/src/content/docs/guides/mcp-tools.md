@@ -238,7 +238,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_setup_models` | エージェント CLI が使えるモデル一覧の実取得（モデルを勧める前に引く） |
 | `tako_agent_support` | agent 能力マトリクスの参照（系統ごとに使える / 縮退 / 未実装） |
 | `tako_shell_integration` | シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除 |
-| `tako_mod` | tako mod（Claude Code の mod）の状態と切替（ペインごとの ctx・使用制限・ターンの報告） |
+| `tako_mod` | tako mod（Claude Code の mod）の状態と切替（ペインごとの ctx・使用制限・ターンの報告。Claude Code の画面の帯の表示切替 = `band-on` / `band-off`） |
 | `tako_migrate` | 設定・データファイルの形式の確認と自動マイグレーションの手動発火 |
 | `tako_check_health` | tako 環境の健全性を診断する |
 | `tako_platform` | プラットフォーム対応マトリクスの参照（使える / 縮退 / 未実装） |

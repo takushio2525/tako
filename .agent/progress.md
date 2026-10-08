@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-08（#1873: 閲覧中の ⌘F 検索を閉じたら描画へ戻し目次を作り直すようにした）
-- 開閉を `open_preview_search_bar` / `close_preview_search_bar` の 1 実装へ寄せ（Escape・⌘F のトグル・CLI / MCP）、閲覧中に描画から開いた検索なら #1661 の `restore_rendered_preview` で戻してセッションも畳む（code へ落ちていたときだけ描き直す）。CLI `tako edit search --open|--close` / MCP `tako_preview_search` の `visible`（ツールは増やさない）。A/B `TAKO_1873_LEGACY=1`
-- 実測: 修正前の main は Escape 後 mode=code・目次 0 件（visual 節）。`scripts/test-md-find-restore-1873.sh` 43 PASS 0 FAIL・番犬の注入 8 通りを file:line で名指し
-
 ## 2026-10-08（#1879: tako mod S1 = Claude Code の mod の同梱・展開・ペインへの注入と状態報告）
 - mod（`crates/tako-core/claude-mod/`）を `<data_dir>/claude-mod/tako/` へ展開し、claude 2.1.294 以上のペインの env（`CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_CLI`）で読ませる（設定ファイルは書かない・tmux は `-e` 固定）。mod は 1 秒 flush / 15 秒 heartbeat で `tako mod report` を叩き、GUI のメモリに 45 秒の鮮度で持つ。`tako mod [on|off]` / MCP `tako_mod`（report は載せない = FR-2.42.6）。組織アカウントで classic 系が mod へ届かないのを実測し、tool.call / tool.check で拾う形を足した（FR-2.42.7）
 - 実測: `scripts/test-claude-mod-1879.sh`（隔離 GUI・実 claude）全段 41 PASS 0 FAIL・`claude plugin test` 11 本（注入 3 通りで fail）・番犬 3 本（注入 9 通り名指し）・カタログ +421 B
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1892: tako mod の validate / test を夜間リリースの前段で毎晩回し、落ちたら通知する）
 - 本体 `scripts/check-claude-mod.sh`（origin/main の mod を一時 dir へ取り出し、使い捨ての設定 dir で `claude plugin validate --strict` / `test`。各段 60 秒の上限でプロセスグループごと打ち切り・`.catch` 抜けと 0 本も不合格・claude が無ければ未実測 = exit 3）。`nightly-release.sh` はロック直後に毎晩呼び、**結果でリリースを止めない**（ERROR + 既存の通知）。`~/.claude-orchestrator/state/tako-mod-check` に検査した claude の版と前回合格の版・mod の木を記録し「更新で壊れた / mod の変更で壊れた」を出し分ける
 - 実測: `scripts/test-nightly-mod-check-1892.sh` 100 PASS（claude の無い PATH で 92 PASS + 未実測 1）・回帰の注入 6 通りを名指しで FAIL・実物の claude 2.1.294 で壊れた登録が exit 1・利用者の設定の mtime 一致・既存の nightly 139 / retry 55 / promote 125 緑
+
+## 2026-10-09（#1881: tako mod S3 = Claude Code の画面のプロンプトの上に帯 1 行と /tako のサイドバーを出した）
+- 判断は tako（`claude_mod::band_view` / `classify_worker` / `band_warnings` を `tako mod report` の応答の `tako.view` へ）、mod は `bodyColumns` に合わせて優先度の低い区切りから落とし `Text` 1 本（truncate-end）で描く。worker は右パネル orch と同じ `Workspace::workers_of` へ寄せた。トグルは `$.store`（`/tako band on|off`・ボタン・`tako mod band on|off` の中継。新しい方が勝つ）。A/B `TAKO_1877_S3_LEGACY=1`・検証用 `TAKO_1881_BAND_THRESHOLD`・MATRIX `claude_mod_band`・カタログ +74 B
+- 実測: `scripts/test-claude-mod-band-1881.sh` 49 PASS 0 FAIL（実 claude 2.1.294・組織 / 個人の設定 dir）で 80 / 144 / 300 桁 × 21 行の帯が 1 行・ダイアログ 4 回の後に戻る・再起動後もトグル保持・A/B で描かない・`claude plugin test` 26 本（terminal / desktop）・番犬 `issue1881_claude_mod_band_watchdog.rs`（注入 12 通りを file:line で名指し）

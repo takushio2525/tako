@@ -256,6 +256,16 @@ pub fn shelve_tab_legacy() -> bool {
     std::env::var("TAKO_1487_LEGACY").is_ok_and(|v| v == "1")
 }
 
+/// master の role か（`orchestrator-master…` / `master` / `master:<名前>`）
+pub fn is_master_role(role: &str) -> bool {
+    role.contains("orchestrator-master") || role == "master" || role.starts_with("master:")
+}
+
+/// worker の role か（`orchestrator-worker…` / `worker…`）
+pub fn is_worker_role(role: &str) -> bool {
+    role.contains("orchestrator-worker") || role.starts_with("worker")
+}
+
 impl Workspace {
     /// 最初のタブ（とそのルートペイン）込みで生成する
     pub fn new(initial_tab_title: impl Into<String>, root_pane: Pane) -> Self {
@@ -732,6 +742,28 @@ impl Workspace {
             .collect()
     }
 
+    /// `master` に紐づく worker（表示中のタブを跨いで探す）。右パネル orch のカードと
+    /// tako mod の帯（#1881）が同じ規則を引く 1 実装。
+    ///
+    /// `spawned_by` が `master` を指すペイン。復元などで `spawned_by` を失った worker の
+    /// role のペインは、`master` 自身が master の role で、かつ master が 1 枚だけのときに限り
+    /// そこへ寄せる（複数 master の誤認防止 = #210 と同じ考え方）
+    pub fn workers_of(&self, master: PaneId) -> Vec<&Pane> {
+        let panes: Vec<&Pane> = self.tabs.iter().flat_map(|t| t.tree().panes()).collect();
+        let is_master = |p: &Pane| p.role().is_some_and(is_master_role);
+        let sole_master = panes.iter().filter(|p| is_master(p)).count() == 1
+            && panes.iter().any(|p| p.id() == master && is_master(p));
+        panes
+            .into_iter()
+            .filter(|p| {
+                p.spawned_by() == Some(master)
+                    || (sole_master
+                        && p.spawned_by().is_none()
+                        && p.role().is_some_and(is_worker_role))
+            })
+            .collect()
+    }
+
     /// バックグラウンドのペイン 1 本を由来つきで引く（平坦な退避 + 退避タブ配下）。
     /// 返すのは (ペイン, 由来タブ ID, 由来タブ名)
     pub fn background_pane(&self, pane_id: PaneId) -> Option<(&Pane, TabId, &str)> {
@@ -1183,6 +1215,52 @@ mod tests {
 
     fn pane() -> Pane {
         Pane::new(PaneOrigin::User)
+    }
+
+    fn with_role(role: &str, spawned_by: Option<PaneId>) -> Pane {
+        let mut p = pane();
+        p.set_role(Some(role.into()));
+        p.set_spawned_by(spawned_by);
+        p
+    }
+
+    #[test]
+    fn workers_ofはspawned_byとタブ跨ぎで引き唯一のmasterにだけ親無しworkerを寄せる() {
+        let master = with_role("orchestrator-master", None);
+        let m = master.id();
+        let mut ws = Workspace::new("main", master);
+        let tab = ws.active_tab_id();
+        let w1 = with_role("worker:a", Some(m));
+        let w1_id = w1.id();
+        ws.get_tab_mut(tab)
+            .unwrap()
+            .tree_mut()
+            .split(m, SplitDirection::Right, w1)
+            .unwrap();
+        // 別タブの worker（spawned_by あり）と、親を失った worker の role のペイン
+        let w2 = with_role("worker:b", Some(m));
+        let w2_id = w2.id();
+        ws.create_tab("other", w2);
+        let orphan = with_role("orchestrator-worker", None);
+        let orphan_id = orphan.id();
+        ws.create_tab("orphan", orphan);
+        let ids = |ws: &Workspace, p: PaneId| {
+            let mut v: Vec<PaneId> = ws.workers_of(p).iter().map(|p| p.id()).collect();
+            v.sort_by_key(|id| id.as_u64());
+            v
+        };
+        let mut want = vec![w1_id, w2_id, orphan_id];
+        want.sort_by_key(|id| id.as_u64());
+        assert_eq!(ids(&ws, m), want);
+        // worker 自身には worker が居ない
+        assert!(ids(&ws, w1_id).is_empty());
+        // master が 2 枚になったら親無しの worker はどちらにも寄せない
+        ws.create_tab("m2", with_role("master:sol", None));
+        let mut want = vec![w1_id, w2_id];
+        want.sort_by_key(|id| id.as_u64());
+        assert_eq!(ids(&ws, m), want);
+        assert!(is_master_role("master:sol") && !is_master_role("worker:a"));
+        assert!(is_worker_role("worker:a") && !is_worker_role("orchestrator-master"));
     }
 
     #[test]
