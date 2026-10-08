@@ -2183,6 +2183,8 @@ struct TakoApp {
     tree_drop: Option<sidebar::TreeDropHover>,
     /// ファイルツリーで選んでいる行（⌘C / ⌘X / ⌘V の対象。FR-3.34 / #1860）
     tree_selection: Option<sidebar::TreeSelection>,
+    /// 複数選択の押下前の選択とコピーの進み具合の帯（FR-3.38 / #1867）
+    tree_multi: sidebar::TreeMulti,
     /// ファイルツリーのクリップボードの tako 側の中身（#1860。切り取りはここにしか無い）
     file_clipboard: Option<tako_core::file_clipboard::FileClipboard>,
     /// タブバーへのペイン D&D: ドロップ先タブ（Some(id) = 既存タブへ合流、None = 新タブ化）
@@ -3492,6 +3494,8 @@ struct FileDrag {
     path: std::path::PathBuf,
     /// ワークスペースのフォルダの見出し行から掴んだ（ツリー内の移動は断る。#1834）
     root: bool,
+    /// 運んでいるもの全部（複数選択した行を掴んだらその全部。それ以外は `path` だけ。#1867）
+    paths: Vec<std::path::PathBuf>,
 }
 
 /// D&D ペイロード: リモート（SSH）の行（#1834）。**どこにも落とせない**。
@@ -4271,6 +4275,7 @@ impl TakoApp {
             drop_target: None,
             tree_drop: None,
             tree_selection: None,
+            tree_multi: sidebar::TreeMulti::default(),
             file_clipboard: None,
             tab_drop_target: None,
             tab_reorder_indicator: None,
@@ -5971,6 +5976,8 @@ impl TakoApp {
                         changed |= app.filetree.apply_git_status(git_status);
                         // #1860: ほかのアプリで何かをコピーしたら、切り取り中の薄い行を戻す
                         changed |= app.drop_stale_file_clipboard();
+                        // #1867: CLI / MCP から始まったコピーの進み具合も帯に出す
+                        app.kick_copy_progress(cx);
                         if changed {
                             cx.notify();
                         }
@@ -16537,7 +16544,7 @@ impl TakoApp {
     /// ドロップ先がプレビューペインなら、同タブのフォーカスターミナルペインに送る
     fn drop_file_to_underlying_terminal(
         &mut self,
-        path: &std::path::Path,
+        paths: &[std::path::PathBuf],
         drop_target: PaneId,
         cx: &mut Context<Self>,
     ) {
@@ -16555,7 +16562,7 @@ impl TakoApp {
             Some(drop_target)
         };
         if let Some(target) = target_pane {
-            let text = tako_core::quote_paths_for_shell(std::slice::from_ref(&path.to_path_buf()));
+            let text = tako_core::quote_paths_for_shell(paths);
             let _ = tako_control::dispatch(
                 self,
                 tako_control::protocol::Request::Send {
@@ -16691,9 +16698,9 @@ impl TakoApp {
             .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, window, cx| {
                 let cmd_held = window.modifiers().platform;
                 if cmd_held {
-                    this.drop_file_to_underlying_terminal(&drag.path, pane_id, cx);
+                    this.drop_file_to_underlying_terminal(&drag.paths, pane_id, cx);
                 } else {
-                    this.drop_files(pane_id, std::slice::from_ref(&drag.path), false, cx);
+                    this.drop_files(pane_id, &drag.paths, false, cx);
                 }
             }))
             .on_drag_move::<ExternalPaths>(cx.listener(
@@ -26788,9 +26795,10 @@ impl Render for TakoApp {
                 },
             ))
             // #1860: どこを押してもまず選択を外す（捕捉フェーズ = 行の押下より先）。
-            // ツリーの行は自分の押下 / クリックで選び直すので、ツリーの外を押したときだけ外れる
+            // ツリーの行は自分の押下 / クリックで選び直すので、ツリーの外を押したときだけ外れる。
+            // #1867: 外した選択は退避する（⌘クリックで足す・選んだ行を掴んでまとめて運ぶ基準）
             .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                if this.tree_selection.take().is_some() {
+                if this.stash_tree_selection() {
                     cx.notify();
                 }
             }))
@@ -28645,6 +28653,12 @@ fn main() {
 mod self_test {
     use super::*;
     use gpui::{AnyWindowHandle, AsyncApp, WindowHandle};
+
+    /// #1867: ファイルツリーの複数選択・⌥⌘V・コピーの進み具合（visual-test `tree-multiselect`）
+    #[cfg(feature = "visual-test")]
+    mod tree_multiselect;
+    #[cfg(feature = "visual-test")]
+    use tree_multiselect::tree_multiselect_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -42969,6 +42983,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1867: 複数選択・まとめた操作・⌥⌘V・コピーの進み具合と取り消し
+                "tree-multiselect" => {
+                    tree_multiselect_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -42979,7 +42999,7 @@ mod self_test {
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / completion / completion-real / lsp-context-menu / \
+                         tree-clipboard / tree-multiselect / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore）"
                     );
                     std::process::exit(1);
@@ -45369,6 +45389,7 @@ mod self_test {
             // #1834: ツリーの行のドラッグ＆ドロップによる移動（実マウス）
             tree_move_visual(any, window, cx).await;
             tree_clipboard_visual(any, window, cx).await;
+            tree_multiselect_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）

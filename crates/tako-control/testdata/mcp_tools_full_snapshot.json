@@ -1716,7 +1716,7 @@
     "name": "tako_preview_changelog"
   },
   {
-    "description": "ファイル操作を実行する。op で種別を指定:\ncopy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\nreveal = ファイルマネージャ（Finder / エクスプローラー）で場所を表示 /\nopen_terminal = そのディレクトリへペイン内で cd /\nrename = name へ改名 / create_file・create_dir = path 配下に name で作成 /\ntrash = ゴミ箱へ移動（復元できる）/ open_default = デフォルトアプリで開く /\nopen_with = name のアプリで開く /\nopen_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そこのシェル。ターミナル内のパスリンクの<link-click>・修飾 + 右クリックメニューと同じ動作）/\nmove = dest のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る。開いているペインは新しいパスへ付け替わる）/\ncopy = dest のフォルダへ複製（フォルダは中身ごと。同名は上書きせず「名前 のコピー」等の別名。自分の配下へは断る。置いた先は応答の to）/\nclipboard_copy・clipboard_cut = ツリーのコピー・切り取り（OS のクリップボードにも書くのでファイルマネージャへ貼れる）/\npaste = 貼り付け（path の行へ。フォルダはその中・ファイルはそのフォルダ。切り取りは移動。ファイルマネージャでコピーしたものも貼れる）/ clipboard = 中身と paste したときの貼り付け先（何も変えない）。\nrename / create_file / create_dir / open_with は name、move / copy は dest が必須。",
+    "description": "ファイル操作を実行する。op で種別を指定:\ncopy_absolute_path = 絶対パスを取得 / copy_relative_path = ペイン cwd 基準の相対パスを取得 /\nreveal = ファイルマネージャ（Finder / エクスプローラー）で場所を表示 /\nopen_terminal = そのディレクトリへペイン内で cd /\nrename = name へ改名 / create_file・create_dir = path 配下に name で作成 /\ntrash = ゴミ箱へ移動（復元できる）/ open_default = デフォルトアプリで開く /\nopen_with = name のアプリで開く /\nopen_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そこのシェル。ターミナル内のパスリンクの<link-click>・修飾 + 右クリックメニューと同じ動作）/\nmove = dest のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る。開いているペインは新しいパスへ付け替わる）/\ncopy = dest のフォルダへ複製（フォルダは中身ごと。同名は上書きせず「名前 のコピー」等の別名。自分の配下へは断る。置いた先は応答の to）/\nclipboard_copy・clipboard_cut = ツリーのコピー・切り取り（OS のクリップボードにも書くのでファイルマネージャへ貼れる）/\npaste = 貼り付け（path の行へ。フォルダはその中・ファイルはそのフォルダ。切り取りは移動。ファイルマネージャでコピーしたものも貼れる）/ clipboard = 中身と paste したときの貼り付け先（何も変えない）/\npaste_move = 移動として貼る / copy_progress = 走っているコピーの件数・バイト / copy_cancel = name の id のコピーを取り消す（省略で全部）。\nrename / create_file / create_dir / open_with は name、move / copy は dest が必須。paths（path の代わり）で clipboard_copy・clipboard_cut・trash・move をまとめて行う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1747,7 +1747,10 @@
             "clipboard_copy",
             "clipboard_cut",
             "clipboard",
-            "paste"
+            "paste",
+            "paste_move",
+            "copy_progress",
+            "copy_cancel"
           ],
           "type": "string"
         },
@@ -1757,13 +1760,19 @@
           "type": "integer"
         },
         "path": {
-          "description": "対象のファイル・フォルダパス（必須）",
+          "description": "対象のファイル・フォルダパス",
           "type": "string"
+        },
+        "paths": {
+          "description": "まとめて扱うパス",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
-        "op",
-        "path"
+        "op"
       ],
       "type": "object"
     },

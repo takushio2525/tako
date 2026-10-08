@@ -95,6 +95,7 @@ pub mod theme;
 pub mod tmux;
 pub mod tmux_backend;
 pub mod tmux_cleanup;
+pub mod tree_select;
 pub mod ui_mode;
 pub mod url_guard;
 pub mod user_task;

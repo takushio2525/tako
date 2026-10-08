@@ -256,7 +256,8 @@ fn rule_no_overwrite(core: &Source) -> Check {
 }
 
 fn rule_rollback(core: &Source) -> Check {
-    core.body("execute")?.must_contain(
+    // #1867 で進み具合つきの `execute_with` が本体になった（`execute` はそれを呼ぶだけ）
+    core.body("execute_with")?.must_contain(
         "if job.created_root {",
         "戻すのが「この呼び出しで置き場を作れたとき」に限られていない（呼ぶ前からあったものを消す）",
     )?;
@@ -337,7 +338,8 @@ fn rule_one_to_one(
         )?;
     }
     catalog.must_have(
-        r#""move","copy","clipboard_copy","clipboard_cut","clipboard","paste"]"#,
+        // #1867 で後ろに paste_move 等が続くようになったので閉じ括弧までは見ない
+        r#""move","copy","clipboard_copy","clipboard_cut","clipboard","paste""#,
         "\"tako_file_op\"",
         "カタログの op の enum に copy / clipboard_* / paste が無い（AI が選べない）",
     )?;

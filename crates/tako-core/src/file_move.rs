@@ -162,6 +162,47 @@ pub fn drop_verdict(
     }
 }
 
+/// 複数をまとめてドラッグしているときの判定（FR-3.38 / #1867）。
+///
+/// 1 つずつ [`drop_verdict`] を通して束ねる:
+/// - **落とし先そのものが壊れる理由**（自分自身へ / 自分の配下へ / 見出し / リモート）が
+///   1 つでもあれば、その理由で**全部を断る**（Finder も選んだフォルダの上へは落とせない）
+/// - そうでなく 1 つでも移せるなら `Move`（同名があるものは落としたときに理由つきで残る）
+/// - 全部が既にそこにあるなら `Unchanged`
+/// - 残り（同名だけ・名前が無いだけ）は最初の理由で断る
+pub fn drop_verdict_many(
+    items: &[DragItem<'_>],
+    dest_dir: &Path,
+    dest_remote: bool,
+    name_taken: impl Fn(&Path) -> bool,
+) -> DropVerdict {
+    let verdicts: Vec<DropVerdict> = items
+        .iter()
+        .map(|item| drop_verdict(*item, dest_dir, dest_remote, &name_taken))
+        .collect();
+    let blocking = verdicts.iter().find(|v| {
+        matches!(
+            v,
+            DropVerdict::Refused(
+                MoveRefusal::IntoSelf
+                    | MoveRefusal::IntoDescendant
+                    | MoveRefusal::WorkspaceRoot
+                    | MoveRefusal::Remote
+            )
+        )
+    });
+    if let Some(blocking) = blocking {
+        return blocking.clone();
+    }
+    if verdicts.contains(&DropVerdict::Move) {
+        return DropVerdict::Move;
+    }
+    verdicts
+        .into_iter()
+        .find(|v| *v != DropVerdict::Unchanged)
+        .unwrap_or(DropVerdict::Unchanged)
+}
+
 /// 移す段取り（[`plan`] が作り、[`follows`] と [`execute`] が使う）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MovePlan {
@@ -335,6 +376,69 @@ pub fn follow_legacy() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1867: まとめてドラッグしたときの判定は、落とし先を壊す理由が 1 つでもあれば全部を断る
+    #[test]
+    fn まとめたドラッグは落とし先を壊す理由で全部を断り同名だけなら移す() {
+        let item = |p: &'static str| DragItem {
+            path: Path::new(p),
+            workspace_root: false,
+            remote: false,
+        };
+        let none = |_: &Path| false;
+        let items = [item("/w/a.txt"), item("/w/d")];
+        assert_eq!(
+            drop_verdict_many(&items, Path::new("/w/x"), false, none),
+            DropVerdict::Move
+        );
+        // 選んだフォルダの上（= 自分自身へ）・配下へ
+        assert_eq!(
+            drop_verdict_many(&items, Path::new("/w/d"), false, none),
+            DropVerdict::Refused(MoveRefusal::IntoSelf)
+        );
+        assert_eq!(
+            drop_verdict_many(&items, Path::new("/w/d/sub"), false, none),
+            DropVerdict::Refused(MoveRefusal::IntoDescendant)
+        );
+        // 1 つが既にそこにあっても、ほかが移せれば移す
+        let mixed = [item("/w/x/a.txt"), item("/w/b.txt")];
+        assert_eq!(
+            drop_verdict_many(&mixed, Path::new("/w/x"), false, none),
+            DropVerdict::Move
+        );
+        // 全部そこにある
+        assert_eq!(
+            drop_verdict_many(&[item("/w/x/a.txt")], Path::new("/w/x"), false, none),
+            DropVerdict::Unchanged
+        );
+        // 同名があるものだけ = 断る / ほかが移せれば移す（同名は落としたときに理由つきで残る）
+        let taken = |p: &Path| p.ends_with("a.txt");
+        assert_eq!(
+            drop_verdict_many(&[item("/w/a.txt")], Path::new("/w/x"), false, taken),
+            DropVerdict::Refused(MoveRefusal::NameTaken)
+        );
+        assert_eq!(
+            drop_verdict_many(&items, Path::new("/w/x"), false, taken),
+            DropVerdict::Move
+        );
+        // 見出し・リモートが混ざったら全部を断る
+        let root = DragItem {
+            workspace_root: true,
+            ..item("/w")
+        };
+        assert_eq!(
+            drop_verdict_many(&[item("/w/a.txt"), root], Path::new("/x"), false, none),
+            DropVerdict::Refused(MoveRefusal::WorkspaceRoot)
+        );
+        assert_eq!(
+            drop_verdict_many(&items, Path::new("/r"), true, none),
+            DropVerdict::Refused(MoveRefusal::Remote)
+        );
+        assert_eq!(
+            drop_verdict_many(&[], Path::new("/x"), false, none),
+            DropVerdict::Unchanged
+        );
+    }
 
     /// テストの置き場。**必ず一時 dir の中**（本物のファイルを動かさない = #1811 の教訓）
     fn scratch(name: &str) -> PathBuf {

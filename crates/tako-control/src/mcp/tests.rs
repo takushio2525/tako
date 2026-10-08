@@ -2,6 +2,66 @@
 mod tests {
     use super::*;
 
+    /// #1867: `tako_file_op` の `paths` はまとめた要求（ツリーの複数選択と同じ 1 要求）になり、
+    /// 進み具合・取り消しはパスを取らない。`path` も `paths` も無ければ断る
+    #[test]
+    fn tako_file_op_の_paths_はまとめた要求になり進み具合はパスを取らない() {
+        use crate::protocol::FileOpKind;
+        assert_eq!(
+            build_request(
+                "tako_file_op",
+                &json!({"op": "move", "paths": ["/w/a", "/w/b"], "dest": "/w/d"}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::FileOpMany {
+                op: FileOpKind::Move,
+                paths: vec!["/w/a".into(), "/w/b".into()],
+                dest: Some("/w/d".into()),
+            }
+        );
+        assert!(validate_known_params("tako_file_op", &json!({"op": "trash", "paths": []})).is_ok());
+        for (op, kind) in [
+            ("copy_progress", FileOpKind::CopyProgress),
+            ("copy_cancel", FileOpKind::CopyCancel),
+        ] {
+            assert_eq!(
+                build_request("tako_file_op", &json!({ "op": op }), None, None).unwrap(),
+                Request::FileOp {
+                    op: kind,
+                    path: String::new(),
+                    name: None,
+                    pane: None,
+                    dest: None,
+                }
+            );
+        }
+        assert!(matches!(
+            build_request(
+                "tako_file_op",
+                &json!({"op": "paste_move", "path": "/w/d"}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::FileOp {
+                op: FileOpKind::PasteMove,
+                ..
+            }
+        ));
+        let err = build_request("tako_file_op", &json!({"op": "trash"}), None, None).unwrap_err();
+        assert!(err.contains("path"), "{err}");
+        let err = build_request(
+            "tako_file_op",
+            &json!({"op": "trash", "paths": "/w/a"}),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("配列"), "{err}");
+    }
+
     /// #1679: `tako_lsp` は CLI `tako lsp diagnostics` と同じ要求になる。
     /// pane を省けば全文書（呼び出し元のペインで補わない。呼び出し元はたいてい端末）
     #[test]

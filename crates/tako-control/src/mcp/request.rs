@@ -468,11 +468,30 @@ pub(super) fn build_request(
                 "clipboard_cut" => crate::protocol::FileOpKind::ClipboardCut,
                 "clipboard" => crate::protocol::FileOpKind::Clipboard,
                 "paste" => crate::protocol::FileOpKind::Paste,
+                "paste_move" => crate::protocol::FileOpKind::PasteMove,
+                "copy_progress" => crate::protocol::FileOpKind::CopyProgress,
+                "copy_cancel" => crate::protocol::FileOpKind::CopyCancel,
                 other => return Err(format!("op が不正: {other}")),
+            };
+            // #1867: paths = まとめて（ツリーの複数選択と同じ 1 要求。扱える op の判定は dispatch）
+            if let Some(paths) = str_vec_arg(args, "paths")? {
+                return Ok(Request::FileOpMany {
+                    op,
+                    paths,
+                    dest: str_arg(args, "dest")?,
+                });
+            }
+            let path = match op {
+                // #1867: 進み具合・取り消しはパスを取らない
+                crate::protocol::FileOpKind::CopyProgress
+                | crate::protocol::FileOpKind::CopyCancel => {
+                    str_arg(args, "path")?.unwrap_or_default()
+                }
+                _ => str_arg(args, "path")?.ok_or("path（または paths）を指定する")?,
             };
             Request::FileOp {
                 op,
-                path: str_arg(args, "path")?.ok_or("path を指定する")?,
+                path,
                 name: str_arg(args, "name")?,
                 pane: match op {
                     crate::protocol::FileOpKind::OpenTerminal
