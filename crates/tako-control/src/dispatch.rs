@@ -25298,10 +25298,22 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
+        // `-f /dev/null`: 利用者の `~/.tmux.conf` を読ませない（#1874）
         assert!(
-            tmux(&["new-session", "-d", "-s", "sizeme", "-x", "100", "-y", "40"])
-                .status
-                .success(),
+            tmux(&[
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "sizeme",
+                "-x",
+                "100",
+                "-y",
+                "40"
+            ])
+            .status
+            .success(),
             "tmux new-session が失敗した"
         );
         assert_eq!(size(), "100x40", "前提: 作成時の寸法");
@@ -25377,10 +25389,22 @@ mod tests {
                 .collect()
         };
 
+        // `-f /dev/null`: 利用者の `~/.tmux.conf` を読ませない（#1874）
         assert!(
-            tmux(&["new-session", "-d", "-s", "killme", "-x", "100", "-y", "40"])
-                .status
-                .success(),
+            tmux(&[
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "killme",
+                "-x",
+                "100",
+                "-y",
+                "40"
+            ])
+            .status
+            .success(),
             "tmux new-session が失敗した"
         );
         tmux(&[
@@ -25539,9 +25563,12 @@ mod tests {
                 .find_map(|line| line.strip_suffix(":1")?.parse().ok())
         };
 
-        // ユーザー自前の 3 window セッション（`tako tmux open` の主用途）
+        // ユーザー自前の 3 window セッション（`tako tmux open` の主用途）。
+        // `-f /dev/null`: 利用者の `~/.tmux.conf` を読ませない（#1874）
         assert!(
             tmux(&[
+                "-f",
+                "/dev/null",
                 "new-session",
                 "-d",
                 "-s",
@@ -27708,8 +27735,6 @@ mod tests {
     // tmux ソケットと data ディレクトリ（worker レジストリ）はどちらも隔離するので
     // 本番の tako / tmux には触れない
 
-    const E2E_SOCKET_571: &str = "tako-e2e-571";
-
     fn e2e_571_base() -> std::path::PathBuf {
         std::path::PathBuf::from(format!("/private/tmp/tako-e2e-571-{}", std::process::id()))
     }
@@ -27732,12 +27757,13 @@ mod tests {
 
     struct E2e571Guard {
         dir: std::path::PathBuf,
+        socket: String,
     }
 
     impl Drop for E2e571Guard {
         fn drop(&mut self) {
             let _ = std::process::Command::new("tmux")
-                .args(["-L", E2E_SOCKET_571, "kill-server"])
+                .args(["-L", &self.socket, "kill-server"])
                 .output();
             remove_e2e_571_dir(&self.dir);
             // #1022: この e2e は worker を既定 config dir で走らせるので、事前信頼も
@@ -27761,10 +27787,16 @@ mod tests {
         for d in [&work, &data, &alt_config] {
             std::fs::create_dir_all(d).expect("一時ディレクトリを作れる");
         }
-        let guard = E2e571Guard { dir: base.clone() };
+        // 器の名前は pid を持つ（#1874: 固定名 `tako-e2e-571` は残骸掃除が `571` を所有 pid と
+        // 読み違え、同時に走る別プロセスとも同じ器を取り合う = #1300）
+        let socket = format!("tako-e2e-571-{}", std::process::id());
+        let guard = E2e571Guard {
+            dir: base.clone(),
+            socket: socket.clone(),
+        };
 
         // 隔離: tmux ソケットと data ディレクトリ（worker レジストリ / accounts.yaml）
-        std::env::set_var("TAKO_TMUX_SOCKET", E2E_SOCKET_571);
+        std::env::set_var("TAKO_TMUX_SOCKET", &socket);
         std::env::set_var("TAKO_DATA_DIR", &data);
         // 本番事故の再現: tako 側プロセスが別アカウントの config dir を継承している。
         // この状態で `claude agents --json` を素で実行すると worker が一覧に出ない
@@ -27779,7 +27811,7 @@ mod tests {
             .expect("事前信頼を書ける");
 
         let _ = std::process::Command::new("tmux")
-            .args(["-L", E2E_SOCKET_571, "kill-server"])
+            .args(["-L", &socket, "kill-server"])
             .output();
         let session = "w571";
         let status = std::process::Command::new("tmux")
@@ -27787,7 +27819,10 @@ mod tests {
             .env_remove(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
             .args([
                 "-L",
-                E2E_SOCKET_571,
+                &socket,
+                // 利用者の `~/.tmux.conf` を読ませない（#1874）
+                "-f",
+                "/dev/null",
                 "new-session",
                 "-d",
                 "-s",
@@ -27810,7 +27845,7 @@ mod tests {
 
         // プロンプト送達。ここから worker は busy になる
         let report = crate::claude_tui::deliver_via_tmux(
-            Some(E2E_SOCKET_571),
+            Some(socket.as_str()),
             session,
             "What is 40 + 2? Reply with only the answer spelled out in English words, lowercase.",
             true,
@@ -27888,8 +27923,6 @@ mod tests {
     // 前提: `claude` CLI がログイン済み / `tmux` がある / ネットワーク接続。
     // tmux ソケットと data ディレクトリは隔離するので本番の tako / tmux には触れない
 
-    const E2E_SOCKET_577: &str = "tako-e2e-577";
-
     fn e2e_577_base() -> std::path::PathBuf {
         std::path::PathBuf::from(format!("/private/tmp/tako-e2e-577-{}", std::process::id()))
     }
@@ -27911,12 +27944,13 @@ mod tests {
 
     struct E2e577Guard {
         dir: std::path::PathBuf,
+        socket: String,
     }
 
     impl Drop for E2e577Guard {
         fn drop(&mut self) {
             let _ = std::process::Command::new("tmux")
-                .args(["-L", E2E_SOCKET_577, "kill-server"])
+                .args(["-L", &self.socket, "kill-server"])
                 .output();
             remove_e2e_577_dir(&self.dir);
             remove_e2e_trust_entry(&self.dir.join("work"));
@@ -27979,9 +28013,14 @@ mod tests {
         for d in [&work, &data] {
             std::fs::create_dir_all(d).expect("一時ディレクトリを作れる");
         }
-        let guard = E2e577Guard { dir: base.clone() };
+        // 器の名前は pid を持つ（#1874。理由は #571 の e2e と同じ）
+        let socket = format!("tako-e2e-577-{}", std::process::id());
+        let guard = E2e577Guard {
+            dir: base.clone(),
+            socket: socket.clone(),
+        };
 
-        std::env::set_var("TAKO_TMUX_SOCKET", E2E_SOCKET_577);
+        std::env::set_var("TAKO_TMUX_SOCKET", &socket);
         std::env::set_var("TAKO_DATA_DIR", &data);
 
         // 信頼ダイアログを出さない（出ると permission ダイアログまで到達しない）
@@ -27993,7 +28032,7 @@ mod tests {
             .expect("事前信頼を書ける");
 
         let _ = std::process::Command::new("tmux")
-            .args(["-L", E2E_SOCKET_577, "kill-server"])
+            .args(["-L", &socket, "kill-server"])
             .output();
         let session = "w577";
         let status = std::process::Command::new("tmux")
@@ -28003,7 +28042,10 @@ mod tests {
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .args([
                 "-L",
-                E2E_SOCKET_577,
+                &socket,
+                // 利用者の `~/.tmux.conf` を読ませない（#1874）
+                "-f",
+                "/dev/null",
                 "new-session",
                 "-d",
                 "-s",
@@ -28029,7 +28071,7 @@ mod tests {
         // Issue #577 の再現プロンプト: brace expansion を含む Bash は
         // 「Contains brace_expression」で必ず承認を求められる
         let report = crate::claude_tui::deliver_via_tmux(
-            Some(E2E_SOCKET_577),
+            Some(socket.as_str()),
             session,
             "Use the Bash tool to run exactly this command, without asking me first: \
              for i in {1..3}; do echo $i; done",
@@ -28045,7 +28087,7 @@ mod tests {
         let dialog_deadline = Instant::now() + Duration::from_secs(180);
         let mut screen = String::new();
         while Instant::now() < dialog_deadline {
-            screen = tako_core::tmux::capture_session(Some(E2E_SOCKET_577), session)
+            screen = tako_core::tmux::capture_session(Some(socket.as_str()), session)
                 .map(|l| l.join("\n"))
                 .unwrap_or_default();
             if screen.contains("Do you want to proceed?") {

@@ -1269,7 +1269,11 @@ mod tests {
             return;
         }
         let socket = format!("tako-coretest-loc-{}", std::process::id());
-        let _ = run_tmux(Some(&socket), &["new-session", "-d", "-s", "loc-e2e"]);
+        // `-f /dev/null`: 利用者の `~/.tmux.conf` を読ませない（#1874）
+        let _ = run_tmux(
+            Some(&socket),
+            &["-f", "/dev/null", "new-session", "-d", "-s", "loc-e2e"],
+        );
         let _cleanup = crate::tmux_backend::TmuxTestGuard::new(vec![socket.clone()]);
 
         // カナリア（観測のみ）: C ロケールの素のクライアントでは TAB が `_` に

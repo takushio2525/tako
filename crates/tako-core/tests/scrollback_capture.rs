@@ -45,10 +45,13 @@ impl Fixture {
         let socket = format!("tako-972test-{}-{tag}", std::process::id());
         let session = format!("tako972{tag}");
         let script = "for i in $(seq 1 120); do echo LINE_$i; done; echo TAIL_MARKER; sleep 300";
+        // `-f /dev/null`: 利用者の `~/.tmux.conf` を読ませない（#1874）
         let ok = Command::new(&bin)
             .args([
                 "-L",
                 &socket,
+                "-f",
+                "/dev/null",
                 "new-session",
                 "-d",
                 "-x",
