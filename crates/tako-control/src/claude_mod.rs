@@ -16,7 +16,9 @@
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use tako_core::claude_mod::{self as core, Accepted, ModHub, OffReason, StoredReport};
+use tako_core::claude_mod::{
+    self as core, Accepted, ModHub, ModRateLimit, ModUnavailable, OffReason, StoredReport,
+};
 use tako_core::PaneId;
 
 use crate::dispatch::DispatchError;
@@ -55,6 +57,142 @@ pub fn run_setup_stage() -> String {
             format!("  [warn] tako mod を展開できない（claude の状態は画面から読むので続行）: {e}")
         }
     }
+}
+
+// --- S2（#1880）: 一次ソースとしての読み口 -----------------------------------------
+//
+// `orchestrator self` / `worker_status` / `read` が同じ形で mod の値を載せるための部品。
+// 判断（新鮮か・束ね方・停止の手がかり）は `tako_core::claude_mod` が持ち、ここは
+// ホストから引き当てて JSON に組むだけ
+
+/// ペインの報告を一次ソースとして引き当てる（`TAKO_1877_S2_LEGACY` を見る 1 本）
+pub fn lookup_pane(
+    host: &dyn ControlHost,
+    pane: PaneId,
+    now: Instant,
+) -> Result<&StoredReport, ModUnavailable> {
+    core::lookup(host.claude_mod(), pane.as_u64(), now, core::s2_legacy())
+}
+
+/// そのペインのアカウントの使用制限（束ね済み）。引き当てに失敗したら空
+pub fn account_rate_limits(
+    host: &dyn ControlHost,
+    pane: PaneId,
+    now: Instant,
+) -> Vec<ModRateLimit> {
+    if core::s2_legacy() {
+        return Vec::new();
+    }
+    host.claude_mod()
+        .map(|hub| hub.account_rate_limits(pane.as_u64(), now))
+        .unwrap_or_default()
+}
+
+/// `worker_status` のために UI スレッドで写し取る報告（`WorkerStatusCtx` は UI 外で仕上げるので、
+/// ホストへの借用を持ち出せない）
+#[derive(Debug, Clone)]
+pub struct ModSnapshot {
+    /// `Box` に入れる: 報告は数百バイトあり、`OffloadJob` の変種の大きさを揃える（clippy）
+    looked_up: Result<Box<StoredReport>, ModUnavailable>,
+    rate_limits: Vec<ModRateLimit>,
+    at: Instant,
+}
+
+impl Default for ModSnapshot {
+    /// 報告なし（ホストを持たない経路・ペインの同一性が崩れたとき）
+    fn default() -> Self {
+        Self {
+            looked_up: Err(ModUnavailable::Absent),
+            rate_limits: Vec::new(),
+            at: Instant::now(),
+        }
+    }
+}
+
+impl ModSnapshot {
+    pub fn capture(host: &dyn ControlHost, pane: PaneId) -> Self {
+        let at = Instant::now();
+        Self {
+            looked_up: lookup_pane(host, pane, at).map(|s| Box::new(s.clone())),
+            rate_limits: account_rate_limits(host, pane, at),
+            at,
+        }
+    }
+
+    /// テスト用: 報告をそのまま持たせる
+    pub fn with_report(stored: StoredReport, rate_limits: Vec<ModRateLimit>) -> Self {
+        Self {
+            looked_up: Ok(Box::new(stored)),
+            rate_limits,
+            at: Instant::now(),
+        }
+    }
+
+    pub fn view(&self) -> Result<&StoredReport, ModUnavailable> {
+        self.looked_up
+            .as_ref()
+            .map(|s| s.as_ref())
+            .map_err(Clone::clone)
+    }
+
+    pub fn rate_limits(&self) -> &[ModRateLimit] {
+        &self.rate_limits
+    }
+
+    pub fn at(&self) -> Instant {
+        self.at
+    }
+}
+
+/// ターン状態（応答の `mod_turn`）。使えなければ null（理由は `mod_reason`）
+pub fn turn_json(looked_up: &Result<&StoredReport, ModUnavailable>, now: Instant) -> Value {
+    match looked_up {
+        Ok(stored) => json!({
+            "turn": stored.report.turn.as_str(),
+            "pending_tool": stored.report.pending_tool,
+            "classic_events": stored.report.classic_events,
+            "model": stored.report.model,
+            "effort": stored.report.effort,
+            "age_ms": now.saturating_duration_since(stored.received).as_millis() as u64,
+        }),
+        Err(_) => Value::Null,
+    }
+}
+
+/// mod を使えなかった理由（応答の `mod_reason`。null = 使えた）
+pub fn reason_code(looked_up: &Result<&StoredReport, ModUnavailable>) -> Value {
+    match looked_up {
+        Ok(_) => Value::Null,
+        Err(why) => json!(why.code()),
+    }
+}
+
+/// 使用制限（応答の `rate_limits`。claude は mod から = #1880。空なら null）。
+///
+/// `limited` / `reset_at` のキー名は codex の `rate_limits`（#985）と揃える
+/// （読み手が系統で書き分けなくてよい）。`reset_at` は**上限に当たった窓の解除時刻**
+/// （unix 秒・秒精度）で、停止の判定は画面のまま（#813）
+pub fn rate_limits_json(limits: &[ModRateLimit]) -> Value {
+    if limits.is_empty() {
+        return Value::Null;
+    }
+    let windows: Vec<Value> = limits
+        .iter()
+        .map(|l| {
+            json!({
+                "kind": l.kind,
+                "used_percent": l.percent_used,
+                "resets_at": l.resets_at.as_deref().and_then(core::parse_resets_at),
+                "resets_at_iso": l.resets_at,
+            })
+        })
+        .collect();
+    json!({
+        "source": "mod",
+        "windows": windows,
+        "limited": limits.iter().any(|l| l.percent_used >= 100.0),
+        "reset_at": core::limit_reset_at(limits),
+    })
 }
 
 /// `Request::Mod` の本体

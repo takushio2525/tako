@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-02（#1866: 全体テストで tmux 系が毎回別の 1 本落ちる = 実 tmux e2e の器の数え方が隣の起動中の器を畳んでいた）
-- 真因（1259）: `tests/common/tmux_e2e.rs` が「new-session が返ってから数に入る」「減らしてから別に 0 か見て畳む」で、3 本目の起動中に先の 2 本が返ると器を kill + ソケット削除。叩く前に予約・減算〜kill を 1 ロックへ。A/B `TAKO_1866_LEGACY=1`・差し込み口の固定テスト・番犬 3 規則（1 実装外で畳む / 数に入る前に叩く / tako-core の器の名前の重複）
-- 実測: new-session の返りを遅らせる注入で main 1/1・旧アーム 3/3 が 202 行で FAILED、修正後 3/3 緑・全体テスト 3 回連続緑（6263 passed）。1857 は自分の器のソケットだけ消す注入で同じ行・同じ文言を再現（消し手は未特定。kill の結果と器の状態を失敗文言へ）
-
 ## 2026-10-02（#1684: コードの本文の右クリックメニューに言語サーバの項目を足した）
 - 識別子の上でだけ 定義 / 宣言 / 型定義 / 実装へ移動・コードを整形・選択範囲を整形 を先頭へ（出し分けは `tako_core::lsp::menu::items` = 申告に無い項目は出さない）。押すと `lsp::menu::item_request` の要求を ⌘クリック・編集メニューと同じ 3 段へ。握手前はすぐ開いて 1 行「問い合わせています」→ 背景で起こして差し替え。CLI `tako lsp menu` / MCP `tako_lsp` の `action=menu`（+261 B）。メニューの行の高さを見積もりと同じ定数にして下端の見切れも直した
 - 実測: `scripts/test-lsp-menu-1684.sh` 27 PASS 0 FAIL（実マウス・A/B `TAKO_1684_LEGACY=1` で FAILED・申告 4 通り・CLI/MCP 字面一致・実の rust-analyzer で 2.3 秒で着地）・注入 7 通りすべて file:line で FAILED
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1890: visual-test 節 large-file-decor が debug で必ず落ちる = 塗りの戻りを回数の窓で待っていたのを、走っている間だけ待つ状態待ちにした）
 - 真因: 読み取り表示 / 編集開始の全文の塗りを 3000 / 6000 回 × 10ms の窓で待ち、debug は 10 MB の 1 回の塗りが 418.8〜473.8 秒（窓は約 118 秒）。節が入った `deecfc9` の debug でも同じ箇所で落ちる = 実回帰ではない（release も CRLF で窓の 65%）。`wait_for_background_highlight`（`view_highlights_running` / `highlight_pending` の間だけ待ち、戻ったのに揃わなければ即偽）へ 2 節 4 か所を寄せた
 - 実測: `scripts/test-highlight-wait-1890.sh`（遅れ 150 秒の注入で緑・`TAKO_1890_LEGACY=view|seed` で名指しの FAILED・`drop` は上限前に Settled）・debug 単独で緑（30 分）・番犬 4 本（注入 7 通りを file:line で名指し）
+
+## 2026-10-09（#1880: tako mod S2 = mod の報告を ctx%・使用制限・ターン状態の一次ソースにした）
+- `ctx_usage::resolve_full`（mod → 画面 → transcript）を 4 経路（self / worker_status / #749 tick / チャットヘッダ）が通り、引き当ては `claude_mod::lookup` の 1 本（落ちた理由は `ctx_mod_reason` / `mod_reason`）。使用制限はアカウント単位で束ね（resets_at → % の大きい方）、解除時刻だけ `LimitHint::from_mod`（停止の判定は画面のまま）。ターン状態は mod の turn が先・respond は画面。effort は `turn.step` から（組織アカウントでも欠けない）。A/B `TAKO_1877_S2_LEGACY=1`
+- 実測: `scripts/test-mod-primary-1880.sh` fake 段・claude 段（statusLine なしの実 claude で 4 経路が mod / SIGSTOP で 47 秒後 mod_stale）・番犬 `issue1880_mod_primary_watchdog.rs`（注入 6 通り）・`claude plugin test` 12 本

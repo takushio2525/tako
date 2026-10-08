@@ -1,9 +1,11 @@
-//! claude_ctx — ctx% / モデル名の解決を **1 実装**に集める（Issue #1021）
+//! claude_ctx — ctx% / モデル名の解決を **1 実装**に集める（Issue #1021 / #1880）
 //!
 //! `claude agents --json` から `contextPercentUsed` / `model` が消えた（2.1.258 実測）ため、
-//! ctx% は「画面 → transcript → none」の優先順で解決する。判断そのものは
-//! [`tako_core::ctx_usage`]（純関数）が持ち、このモジュールは**材料の集め方**だけを担う:
+//! ctx% は「mod → 画面 → transcript → none」の優先順で解決する（mod の段は #1880）。
+//! 判断そのものは [`tako_core::ctx_usage`]（純関数）が持ち、このモジュールは
+//! **材料の集め方**だけを担う:
 //!
+//! - mod: tako mod の新鮮な報告（`tako_core::claude_mod::lookup` で引き当てた結果）
 //! - 画面: 生きたペインの表示行（GUI 層が持っている）→ `agent_metrics_from_*`
 //! - transcript: session_id → 所在解決 → 最後の assistant の usage
 //!
@@ -14,7 +16,9 @@
 //! （画面の数値は claude 自身の計算結果で文脈窓の推定が要らない）。
 
 use serde_json::{json, Value};
-use tako_core::ctx_usage::{self, CtxResolution, ScreenCtx};
+use tako_core::ctx_usage::{
+    self, CtxResolution, CtxSource, CtxUnavailable, ModCtxInput, ScreenCtx,
+};
 
 /// 画面から材料を採る（行の列。生きたペインが無ければ `None` を渡す）
 pub fn screen_ctx_from_lines(lines: &[String]) -> Option<ScreenCtx> {
@@ -38,13 +42,19 @@ pub fn screen_ctx_from_text(text: &str) -> Option<ScreenCtx> {
 
 /// ctx% とモデル名を解決する（**この 1 本を 4 経路が通る**）。
 ///
-/// - `session_id`: transcript を引く鍵。`None` なら画面だけで解く
+/// - `session_id`: transcript を引く鍵。`None` なら mod と画面だけで解く
 /// - `screen`: 生きたペインの画面から採った材料（無ければ `None`）
+/// - `mod_ctx`: tako mod の報告（#1880。`tako_core::claude_mod::ctx_input` で作る。
+///   S2 の A/B `TAKO_1877_S2_LEGACY=1` では引き当て側が `Unavailable("legacy_env")` を返す）
 ///
 /// `TAKO_1021_LEGACY=1` が置かれていれば #1021 前の挙動（= `agents --json` の値だけ
 /// なので claude では常に `null`）へ戻る。A/B を同一バイナリで取るための口
-pub fn resolve(session_id: Option<&str>, screen: Option<&ScreenCtx>) -> CtxResolution {
-    resolve_with(session_id, screen, ctx_usage::legacy_env())
+pub fn resolve(
+    session_id: Option<&str>,
+    screen: Option<&ScreenCtx>,
+    mod_ctx: &ModCtxInput,
+) -> CtxResolution {
+    resolve_with(session_id, screen, mod_ctx, ctx_usage::legacy_env())
 }
 
 /// [`resolve`] の legacy 判定を引数で受ける版（テストが env グローバルを触らないため。
@@ -52,16 +62,23 @@ pub fn resolve(session_id: Option<&str>, screen: Option<&ScreenCtx>) -> CtxResol
 pub fn resolve_with(
     session_id: Option<&str>,
     screen: Option<&ScreenCtx>,
+    mod_ctx: &ModCtxInput,
     legacy: bool,
 ) -> CtxResolution {
     if legacy {
         return ctx_usage::legacy_resolution();
     }
-    let Some(sid) = session_id else {
-        return ctx_usage::resolve_without_session(screen);
+    // mod が答えたなら transcript は読まない（数 MB のファイル I/O を省く）
+    let mod_answered = matches!(mod_ctx, ModCtxInput::Fresh(c) if c.percent.is_some());
+    let Some(sid) = session_id.filter(|_| !mod_answered) else {
+        let mut r = ctx_usage::resolve_full(mod_ctx, screen, None);
+        if r.source == CtxSource::None {
+            r.reason = Some(CtxUnavailable::NoSession);
+        }
+        return r;
     };
     let transcript = crate::transcript::last_context_usage(sid);
-    ctx_usage::resolve(screen, transcript.as_ref())
+    ctx_usage::resolve_full(mod_ctx, screen, transcript.as_ref())
 }
 
 /// 応答 JSON へ載せる形（`orchestrator self` / `worker_status` が同じキーを出す）。
@@ -74,8 +91,10 @@ pub fn response_fields(r: &CtxResolution) -> Value {
         "ctx_model": r.model,
         "ctx_window": r.window,
         "ctx_reason": r.reason.map(|x| x.as_str()),
-        // 画面と transcript の突き合わせ（丸め誤差の範囲を超えたら窓の宣言がずれている）
+        // 画面と比べ先（mod / transcript）の突き合わせ（丸め誤差の範囲を超えたらずれの合図）
         "ctx_screen_delta": r.screen_delta,
+        // #1880: mod を使わなかった理由（null = mod の値を採った）
+        "ctx_mod_reason": r.mod_reason,
     })
 }
 
@@ -99,6 +118,16 @@ pub fn window_warning(r: &CtxResolution) -> Option<String> {
         return None;
     }
     let delta = r.screen_delta?;
+    if r.source == CtxSource::Mod {
+        // #1880: mod と画面（statusLine の出力）は同じ claude の答えなので、ずれるのは
+        // どちらかが古いとき（statusLine の更新待ち・mod の flush 待ち）か、画面の読み違い
+        return Some(format!(
+            "ctx% の画面と mod の報告が {delta} ポイントずれています\
+             （mod の値 {}% を採用。statusLine の更新待ちなら次のターンで揃います。\
+             揃わなければ画面の読み取りか mod の報告を疑う）",
+            r.percent?
+        ));
+    }
     let window = r.window?;
     Some(format!(
         "ctx% の画面と transcript が {delta} ポイントずれています\
@@ -110,7 +139,11 @@ pub fn window_warning(r: &CtxResolution) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tako_core::ctx_usage::CtxSource;
+    use tako_core::ctx_usage::ModCtx;
+
+    fn absent() -> ModCtxInput {
+        ModCtxInput::Unavailable("mod_absent")
+    }
 
     #[test]
     fn 画面の行から材料を採る() {
@@ -140,14 +173,14 @@ mod tests {
         let lines = vec!["  ctx  41% ████░░░░░░".to_string()];
         let screen = screen_ctx_from_lines(&lines).unwrap();
         // セッション不明でも画面があれば採れる
-        let r = resolve(None, Some(&screen));
+        let r = resolve(None, Some(&screen), &absent());
         let v = response_fields(&r);
         assert_eq!(v["ctx_percent"], json!(41));
         assert_eq!(v["ctx_source"], json!("screen"));
         assert_eq!(v["ctx_reason"], Value::Null);
 
         // 材料ゼロなら理由が入る（**無説明の null にしない**）
-        let r = resolve(None, None);
+        let r = resolve(None, None, &absent());
         let v = response_fields(&r);
         assert_eq!(v["ctx_percent"], Value::Null);
         assert_eq!(v["ctx_source"], json!("none"));
@@ -158,7 +191,7 @@ mod tests {
     fn 応答へ混ぜ込む() {
         let lines = vec!["  ctx  12% █░░░░░░░░░".to_string()];
         let screen = screen_ctx_from_lines(&lines).unwrap();
-        let r = resolve(None, Some(&screen));
+        let r = resolve(None, Some(&screen), &absent());
         let mut target = json!({"pane_id": 7, "ctx_percent": Value::Null});
         merge_response_fields(&mut target, &r);
         assert_eq!(target["pane_id"], json!(7));
@@ -175,14 +208,72 @@ mod tests {
         let lines = vec!["  ctx  33% ███░░░░░░░".to_string()];
         let screen = screen_ctx_from_lines(&lines).unwrap();
         // 通常は画面から採れる
-        let now = resolve_with(None, Some(&screen), false);
+        let now = resolve_with(None, Some(&screen), &absent(), false);
         assert_eq!(now.percent, Some(33));
         assert_eq!(now.source, CtxSource::Screen);
         // #1021 前は画面も transcript も見ないので null（= 報告された症状そのもの）
-        let legacy = resolve_with(None, Some(&screen), true);
+        let legacy = resolve_with(None, Some(&screen), &absent(), true);
         assert_eq!(legacy.percent, None);
         assert_eq!(legacy.source, CtxSource::None);
         assert_eq!(legacy.reason.map(|x| x.as_str()), Some("legacy_env"));
+    }
+
+    #[test]
+    fn issue1880_modが答えればtranscriptを読まずmodを採る() {
+        let fresh = ModCtxInput::Fresh(ModCtx {
+            percent: Some(6),
+            tokens: Some(59_426),
+            window: Some(1_000_000),
+            model: Some("claude-haiku-5-5".into()),
+        });
+        // 存在しない session_id を渡しても transcript を引きに行かない（mod が答えた）
+        let r = resolve_with(Some("no-such-session"), None, &fresh, false);
+        let v = response_fields(&r);
+        assert_eq!(v["ctx_percent"], json!(6));
+        assert_eq!(v["ctx_source"], json!("mod"));
+        assert_eq!(v["ctx_window"], json!(1_000_000));
+        assert_eq!(v["ctx_mod_reason"], Value::Null);
+        assert_eq!(v["ctx_reason"], Value::Null);
+        // #1021 の A/B は mod より強い（同一バイナリで #1021 前を取れる口を壊さない）
+        let legacy = resolve_with(None, None, &fresh, true);
+        assert_eq!(legacy.source, CtxSource::None);
+    }
+
+    #[test]
+    fn issue1880_落ちた理由はctx_mod_reasonに出る() {
+        let lines = vec!["  ctx  41% ████░░░░░░".to_string()];
+        let screen = screen_ctx_from_lines(&lines).unwrap();
+        let r = resolve(None, Some(&screen), &ModCtxInput::Unavailable("mod_stale"));
+        let v = response_fields(&r);
+        assert_eq!(v["ctx_source"], json!("screen"));
+        assert_eq!(v["ctx_mod_reason"], json!("mod_stale"));
+        // 材料ゼロでも ctx_reason（null の理由）は今までどおり
+        let r = resolve(None, None, &ModCtxInput::Unavailable("disabled"));
+        let v = response_fields(&r);
+        assert_eq!(v["ctx_reason"], json!("no_session"));
+        assert_eq!(v["ctx_mod_reason"], json!("disabled"));
+    }
+
+    #[test]
+    fn issue1880_画面とmodのずれは警告文になる() {
+        let screen = ScreenCtx {
+            percent: Some(12),
+            model: None,
+        };
+        let fresh = ModCtxInput::Fresh(ModCtx {
+            percent: Some(6),
+            tokens: None,
+            window: Some(1_000_000),
+            model: None,
+        });
+        let r = resolve(None, Some(&screen), &fresh);
+        let w = window_warning(&r).expect("±1 を超えたら警告");
+        assert!(w.contains("mod の値 6%"), "{w}");
+        let screen_ok = ScreenCtx {
+            percent: Some(7),
+            model: None,
+        };
+        assert!(window_warning(&resolve(None, Some(&screen_ok), &fresh)).is_none());
     }
 
     #[test]

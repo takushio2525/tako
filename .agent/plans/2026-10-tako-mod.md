@@ -92,6 +92,25 @@
 - **ダイアログ・質問の表示中は AbovePrompt の帯が隠れる**（画面の抜粋で確認）。
   帯に「承認待ちです」を出す設計は成り立たない（出すならステータス行かトースト）
 
+**追記（S1 #1879 → S2 #1880 の実測）: 組織アカウントでは classic 系が届かない**
+
+- 2.1.294 の**組織アカウント**（`~/dev/tako` の direnv が `CLAUDE_CONFIG_DIR` を組織用の設定 dir へ
+  向ける環境）では、`classic.PreToolUse` / `classic.PermissionRequest` / `classic.Notification` が
+  mod へ **1 つも届かない**（`on('*')` で観測して 0 件）。関数フック（`tool.call` / `tool.check` /
+  `turn.*`）は届く。個人アカウントでは同じ版で 3 つとも届く
+- S1 はこれを受けて、PermissionRequest を正としつつ、届かないときは AskUserQuestion = `tool.call` の
+  開始で `question`、ask ルールに当たった `tool.check` と ExitPlanMode = `permission` で拾う。
+  どちらの環境かは報告の `classic_events` で分かる
+- **拾えないもの**: ルールの無い `ask`（default モードのダイアログ）は auto モードの分類器が黙って
+  通しうるので `tool.check` の判定だけでは「ダイアログが出た」と言えず、拾わない。S2 は
+  `classic_events: false` のとき画面のダイアログ検出と突き合わせ、食い違いを `worker_status` の
+  `warnings` に出す（画面を正にする。respond も画面を読む）
+- **effort**: classic 系（PermissionRequest / Stop）だけが運ぶと S1 では欠けていたが、`turn.step` の
+  イベントが毎ステップ `effort`（文字列。上の 1 ターンの流れの `"effort":"medium"`）を持つので S2 で
+  そこから拾う。`turn.step` は**ストリームのフック**で、`async function*` で受けて
+  `return yield* next(e)` で素通しする形でしか書けない（普通の関数で登録すると validate が
+  `turn.step streams, so it takes async function* ($, e, next)` で落とす）。`.catch` も同じ形
+
 ### 1.4 会話の行（チャット表示の材料）: `session.append`
 
 会話に行が足されるたびに 1 回ずつ来る。本文は記録せず形だけを取った（2 ターン分）:
@@ -429,6 +448,27 @@ S1〜S6 には入れない。
 
 「新鮮」は §4.3。落ちた理由（`mod_absent` / `mod_stale` / `claude_too_old` / `disabled`）を
 `tako mod status` と `ctx_reason` 等に**黙らず出す**。
+
+**S2（#1880）で実装した形**（要件は FR-2.42.9〜12）:
+
+- 理由のキーは `ctx_mod_reason`（ctx%）と `mod_reason`（ターン状態・使用制限）。`ctx_reason` は
+  「ctx% が null の理由」のまま変えていない（意味を混ぜると、画面から取れたときに理由が入って
+  読み手が null 判定を誤る）。語彙は `tako mod` の行の `reason.code` と同じ（+ `mod_no_usage` /
+  `legacy_env`）。引き当ては `tako_core::claude_mod::lookup` の 1 本
+- **使用制限の束ね方は「最新の `observed_at`」ではない**: mod は heartbeat（15 秒）のたびに
+  `$.session.usage()` を読み直して報告時刻を `observed_at` に打つので、1 時間放置したペインの古い %
+  も「今」の時刻で届く。窓の種類ごとに「`resets_at` が遅い（= 新しい窓）→ 同じ窓なら `percent_used`
+  が大きい（同じ窓の中で使用率は減らない）→ `observed_at`」で選ぶ
+- 停止の手がかり（`LimitHint::from_mod`）は `percent_used >= 100` の窓の解除時刻（複数なら遅い方）。
+  上限に当たっていなければ手がかり無し（画面のパースのまま）= codex #985 と同じ型
+- `permission` / `question` は承認・回答の後もそのツールが返るまで残る（FR-2.42.7）ので、
+  `worker_status` は画面が生成中なら busy を採る（`ModTurn::status_word`）。mod と画面の
+  ダイアログ検出の食い違いは `warnings` へ
+- 4 経路の取得元は外から読める: `orchestrator self` の `ctx_source` / `auto_handoff_tick`（#749 の
+  tick が最後に見た値）・`worker_status` の `ctx_source` / `status_source`・`tako ui-mode` の
+  `chat_header`（チャットヘッダの残量バー）
+- A/B: `TAKO_1877_S2_LEGACY=1`（報告は受け取るが一次ソースに使わない）。実経路テストは
+  `scripts/test-mod-primary-1880.sh`、番犬は `crates/tako-control/tests/issue1880_mod_primary_watchdog.rs`
 
 ## 7. スライス
 

@@ -506,6 +506,18 @@ struct HandoffNudgeTracker {
     last_sent: Option<std::time::Instant>,
     /// 送った回数
     sent: u32,
+    /// 最後の tick で見た ctx%（取得元つき。#1880）。`orchestrator self` の
+    /// `auto_handoff_tick` に出す = tick が mod / 画面 / transcript のどれで判定したか外から読める
+    last_ctx: Option<HandoffTickCtx>,
+}
+
+/// #749 の tick が見た ctx% の記録（#1880）
+#[derive(Debug, Clone)]
+struct HandoffTickCtx {
+    percent: Option<u32>,
+    source: tako_core::ctx_usage::CtxSource,
+    mod_reason: Option<&'static str>,
+    at: std::time::Instant,
 }
 
 impl HandoffNudgeTracker {
@@ -514,6 +526,7 @@ impl HandoffNudgeTracker {
             first_seen: now,
             last_sent: None,
             sent: 0,
+            last_ctx: None,
         }
     }
 }
@@ -15900,20 +15913,44 @@ impl TakoApp {
             // #1021: 画面 → transcript の順。画面だけに頼ると ①statusLine 未設定
             // （claude の組み込み表示は窓 − 33000 トークンを超えるまで出ない）
             // ②statusline が worker 一覧で伸びて ctx 行が走査窓から押し出される、
-            // のどちらでも閾値超過に気づけない。transcript ぶんは background が控える
-            let ctx_percent = self
+            // のどちらでも閾値超過に気づけない。transcript ぶんは background が控える。
+            // #1880: tako mod の報告が新鮮ならそれが先頭（どちらの穴も無い = claude 自身の答え）。
+            // 判断は他の 3 経路と同じ `ctx_usage::resolve_full` の 1 実装
+            let mod_ctx = tako_core::claude_mod::ctx_input(&tako_core::claude_mod::lookup(
+                Some(&self.claude_mod),
+                pane_id.as_u64(),
+                now,
+                tako_core::claude_mod::s2_legacy(),
+            ));
+            let screen = self
                 .terminals
                 .get(&pane_id)
                 .and_then(|s| s.agent_metrics())
-                .and_then(|m| m.ctx_percent);
-            if ctx_percent.is_none() {
-                needs_transcript.push(pane_id);
-            }
-            let ctx_percent = ctx_percent.or_else(|| self.transcript_ctx.get(&pane_id).copied());
+                .map(|m| tako_core::ctx_usage::ScreenCtx {
+                    percent: m.ctx_percent,
+                    model: m.model,
+                });
+            let resolved = tako_core::ctx_usage::resolve_full(&mod_ctx, screen.as_ref(), None);
+            let (ctx_percent, ctx_source) = match resolved.percent {
+                Some(pct) => (Some(pct), resolved.source),
+                None => {
+                    needs_transcript.push(pane_id);
+                    match self.transcript_ctx.get(&pane_id).copied() {
+                        Some(pct) => (Some(pct), tako_core::ctx_usage::CtxSource::Transcript),
+                        None => (None, tako_core::ctx_usage::CtxSource::None),
+                    }
+                }
+            };
             let tracker = self
                 .handoff_nudges
                 .entry(pane_id)
                 .or_insert_with(|| HandoffNudgeTracker::new(now));
+            tracker.last_ctx = Some(HandoffTickCtx {
+                percent: ctx_percent,
+                source: ctx_source,
+                mod_reason: resolved.mod_reason,
+                at: now,
+            });
             let pane_age = now.duration_since(tracker.first_seen);
             let since_last_nudge = tracker.last_sent.map(|t| now.duration_since(t));
             let sent_count = tracker.sent;
@@ -15951,7 +15988,11 @@ impl TakoApp {
                 &format!("master:{profile}"),
                 pane_id.as_u64(),
                 "ctx_handoff_nudge",
-                &format!("ctx={pct}% threshold={threshold}% count={}", sent_count + 1),
+                &format!(
+                    "ctx={pct}% source={} threshold={threshold}% count={}",
+                    ctx_source.as_str(),
+                    sent_count + 1
+                ),
             );
         }
         // #1021: 画面が黙っている master だけを transcript 補完の対象にする
@@ -24728,6 +24769,39 @@ impl SystemHost for TakoApp {
 
     fn claude_mod(&self) -> Option<&tako_core::claude_mod::ModHub> {
         Some(&self.claude_mod)
+    }
+
+    fn handoff_tick_ctx(&self, pane: PaneId) -> serde_json::Value {
+        let Some(c) = self
+            .handoff_nudges
+            .get(&pane)
+            .and_then(|t| t.last_ctx.as_ref())
+        else {
+            return serde_json::Value::Null;
+        };
+        serde_json::json!({
+            "ctx_percent": c.percent,
+            "ctx_source": c.source.as_str(),
+            "ctx_mod_reason": c.mod_reason,
+            "age_ms": c.at.elapsed().as_millis() as u64,
+        })
+    }
+
+    fn chat_header_ctx(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.chat_panes
+            .iter()
+            .map(|(pane, state)| {
+                (
+                    pane.as_u64().to_string(),
+                    serde_json::json!({
+                        "ctx_percent": state.ctx_percent,
+                        "ctx_source": state.ctx_source,
+                        "ctx_mod_reason": state.ctx_mod_reason,
+                        "model": state.model,
+                    }),
+                )
+            })
+            .collect()
     }
 
     fn claude_mod_mut(&mut self) -> Option<&mut tako_core::claude_mod::ModHub> {

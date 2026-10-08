@@ -549,6 +549,9 @@ spawn_session ── claude_mod::decide + pane_env ──▶ ペインの env: C
 claude（ペインの中）── mod: 1 秒 flush / 15 秒 heartbeat ──▶ $TAKO_CLI mod report（stdin の JSON）
    └▶ IPC → dispatch Request::Mod{report} → GUI のメモリの ModHub（45 秒で失効・session.end / close で破棄）
 tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無い理由も出す）
+（S2 #1880）claude_mod::lookup ──▶ ctx% / 使用制限 / ターン状態の一次ソース
+   orchestrator self / worker_status / #749 の tick / チャットヘッダ ──▶ ctx_usage::resolve_full（mod → 画面 → transcript）
+   limit_autoresume ──▶ LimitHint::from_mod（解除時刻だけ。停止の判定は画面）
 ```
 
 - **通信路は CLI**（`$.process.run`）: dispatch に 1:1 で載り、tako の再起動をまたいだ tmux の
@@ -561,6 +564,12 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   AskUserQuestion / ExitPlanMode だけ拾う。報告の `classic_events` で区別できる（FR-2.42.7）
 - 保持は**メモリだけ**（永続ファイルを増やさない = #916 のマイグレーション対象外）。
   設定 `claude_mod` だけが settings.json に載る（serde default で旧ファイルが読める）
+- **一次ソース化（S2 #1880。FR-2.42.9〜12）**: 新鮮な報告は ctx%（`ctx_source: "mod"`）・
+  使用制限（`rate_limits`。アカウント単位で束ねる）・ターン状態（`status_source: "mod"`）の**先頭**。
+  引き当ては `tako_core::claude_mod::lookup` の 1 本で、使えないときは理由（`mod_absent` /
+  `mod_stale` / `disabled` / `claude_too_old` / `legacy_env` …）を `ctx_mod_reason` / `mod_reason` に
+  出して今の経路へ落ちる。**上限での停止と、答え方（respond）は画面のまま**（#813 の安全条件・
+  respond は画面のダイアログを読む）。A/B は `TAKO_1877_S2_LEGACY=1`
 
 ## Phase 5.5: tmux バックエンド永続化（FR-5。2026-06-12 実装）
 
@@ -2850,13 +2859,17 @@ statusLine を外した実 claude で「フッターに ctx 表記が 1 つも�
 % を探す旧実装では取りこぼす（`Context low (12% remaining)` は残量なのに 12% 使用と
 **誤読**していた）。`terminal::builtin_ctx_percent` がこの 3 形式を先に見る。
 
-### だから優先順は「画面 → transcript → none」
+### だから優先順は「mod → 画面 → transcript → none」
 
+- **mod**（#1880）: tako mod の報告が新鮮（45 秒以内）ならそれが正。`$.session.usage()` は
+  claude 自身の答えで、**窓も claude が答える**ので statusLine の有無にも宣言表にも依らない。
+  初回応答の前（`percent` が欠ける）は落ちるが、窓は mod の値を transcript の計算に使う
 - **画面**が数値を出しているならそれが正（claude 自身の計算結果。窓の推定が要らない）
 - 画面が黙っていれば **transcript**（式は厳密だが窓の解決が推定を含む）
 - どちらも駄目なら **none + 理由**（`ctx_reason`。無説明の `null` を返さない）
 
-両方あるときは**突き合わせて差を申告する**（`ctx_screen_delta` / `warnings`）。
+両方あるときは**突き合わせて差を申告する**（`ctx_screen_delta` / `warnings`。mod を採ったときは
+画面 − mod の差）。mod を使わなかった理由は `ctx_mod_reason`（`ctx_reason` は「null の理由」のまま）。
 上流が窓の決め方を変えたら差として現れるので、静かに嘘をつくのではなく気づける
 （#1011 の「自己検証つきの内部レイアウト利用」と同じ型）。窓は**画面からの逆算**を
 先に試すので、宣言表が古くても画面が出ている環境では実態へ追従する。
@@ -2864,8 +2877,11 @@ statusLine を外した実 claude で「フッターに ctx 表記が 1 つも�
 ### 4 経路が同じ 1 実装を通る
 
 `tako-control::claude_ctx::resolve` が材料の集め方を持ち、判断は
-`tako_core::ctx_usage`（純関数）。通るのは `orchestrator self` / `worker_status` /
-#749 の tick（`tako-app::handoff_ctx`）/ チャットヘッダ（`chat_view::prefer_source`）。
+`tako_core::ctx_usage::resolve_full`（純関数。mod → 画面 → transcript）。通るのは
+`orchestrator self` / `worker_status` / #749 の tick（`drive_handoff_nudge` + `tako-app::handoff_ctx`）/
+チャットヘッダ（`chat_view::load_chat_refresh`）。各経路の取得元は外から読める
+（`orchestrator self` の `ctx_source` と `auto_handoff_tick` / `worker_status` の `ctx_source` /
+`tako ui-mode` の `chat_header`）。この配線は番犬 `issue1880_mod_primary_watchdog.rs` が縛る。
 
 **#749 の tick は 2 秒間隔なので transcript を UI スレッドで読まない**
 （`handoff_ctx` が 30 秒間隔の background でセッションカタログと transcript を読み、
@@ -2879,7 +2895,8 @@ transcript から算出した値が画面の `ctx NN%` と**すべて一致**し
 （200,000 を要求する組は 1 つも無い）。この 8 組は
 `ctx_usage::tests::本番で実測した8組がすべて窓1mで画面と一致する` が固定している。
 
-A/B は `TAKO_1021_LEGACY=1`（画面も transcript も見ない = #1021 前）。
+A/B は `TAKO_1021_LEGACY=1`（画面も transcript も見ない = #1021 前）と
+`TAKO_1877_S2_LEGACY=1`（mod を見ない = #1880 前）。
 
 ### ⚠️ 踏み抜きどころ
 

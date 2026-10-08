@@ -1584,6 +1584,8 @@ tako shell-integration uninstall # 配置を取り除く（書き足したブロ
 tako mod                     # tako mod（Claude Code の mod）の状態。ペインごとの ctx・使用制限・ターンの報告と、届かない理由
 tako mod off                 # 次に作るペインから mod を読ませない（動いている claude には効かない）
 tako mod on                  # 戻す（既定 ON。claude 2.1.294 以上のペインにだけ読ませる）
+                             # 届いた報告はコンテキスト残量・使用制限・作業状態の一次ソースになる
+                             # （orchestrator self / status の ctx_source が mod。報告が無ければ画面へ落ち、理由は ctx_mod_reason）
 
 tako context-budget          # 起動時ロードの予算の確認（何も書き換えない）
 tako context-budget fix      # 積もった作業ログを archive へ移送する

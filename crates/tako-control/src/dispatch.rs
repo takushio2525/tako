@@ -2355,6 +2355,8 @@ fn verify_ctx_pane_identity(
             ctx.live_tail = None;
             ctx.full_screen = None;
             ctx.has_running_children = false;
+            // #1880: mod の報告もそのペイン（= 別の worker）のものなので使わない
+            ctx.mod_state = crate::claude_mod::ModSnapshot::default();
         }
     }
     ctx
@@ -3191,6 +3193,16 @@ fn dispatch_inner(
             // ダイアログ中は**入力欄が存在しない**ので input_status は null にし、
             // 代わりに構造化した選択肢を返す
             let dialog = crate::claude_tui::detect_choice_dialog(&all);
+            // #1880: tako mod の報告を先に見る。mod が権限待ち・質問待ちと言っていて画面が
+            // 生成中でない（= 承認後のツール実行中ではない）なら、入力欄は無い。画面の
+            // ダイアログ検出が版の変化で外れても、選択カーソル `❯ 1. Yes` を入力欄の
+            // 下書きと読み違えない（#748 の観測 1 と同じ誤読を mod の側から塞ぐ）
+            let mod_now = std::time::Instant::now();
+            let mod_view = crate::claude_mod::lookup_pane(host, PaneId::from_raw(pane_id), mod_now);
+            let mod_awaits_answer = mod_view
+                .as_ref()
+                .is_ok_and(|stored| stored.report.turn.awaits_answer())
+                && !crate::claude_tui::is_busy(&all);
 
             while all.last().is_some_and(|l| l.is_empty()) {
                 all.pop();
@@ -3200,21 +3212,23 @@ fn dispatch_inner(
                     all.drain(..all.len() - n);
                 }
             }
-            let input_json = input_status.filter(|_| dialog.is_none()).map(|s| {
-                json!({
-                    "line": s.line,
-                    "text": s.text,
-                    "style": match s.style {
-                        tako_core::InputStyle::Ghost => "ghost",
-                        tako_core::InputStyle::User => "user",
-                        tako_core::InputStyle::Mixed => "mixed",
-                        tako_core::InputStyle::None => "none",
-                    },
-                    // #572: true = busy 中に打たれた指示が claude のキューにあり未送信。
-                    // 入力欄自体は空なので Enter 単独送達では発火しない
-                    "queued_messages_pending": queued_pending,
-                })
-            });
+            let input_json = input_status
+                .filter(|_| dialog.is_none() && !mod_awaits_answer)
+                .map(|s| {
+                    json!({
+                        "line": s.line,
+                        "text": s.text,
+                        "style": match s.style {
+                            tako_core::InputStyle::Ghost => "ghost",
+                            tako_core::InputStyle::User => "user",
+                            tako_core::InputStyle::Mixed => "mixed",
+                            tako_core::InputStyle::None => "none",
+                        },
+                        // #572: true = busy 中に打たれた指示が claude のキューにあり未送信。
+                        // 入力欄自体は空なので Enter 単独送達では発火しない
+                        "queued_messages_pending": queued_pending,
+                    })
+                });
             Ok(json!({
                 "pane": pane_id,
                 "text": all.join("\n"),
@@ -3223,6 +3237,9 @@ fn dispatch_inner(
                 // #748: 選択肢ダイアログ（null = ダイアログなし）。
                 // 非 null のときは入力欄が無いので send ではなく respond で応答する
                 "choice_dialog": dialog.as_ref().map(|d| d.to_json()),
+                // #1880: tako mod の報告（ターン状態等。null なら理由は mod_reason）
+                "mod_turn": crate::claude_mod::turn_json(&mod_view, mod_now),
+                "mod_reason": crate::claude_mod::reason_code(&mod_view),
                 // #813: 利用上限後の自動復帰。enabled = ペインのオプトイン、
                 // state = いま上限で止まっているか・いつ復帰するか（GUI 稼働時のみ）
                 "limit_resume": limit_resume_entry(host, PaneId::from_raw(pane_id)),
@@ -6783,6 +6800,8 @@ fn dispatch_inner(
                     "released_panes": released,
                     "pane_display": pane_display,
                     "pane_display_reason": pane_display_reason,
+                    // #1880: チャットヘッダの残量バーが使っている ctx%（取得元つき）
+                    "chat_header": host.chat_header_ctx(),
                 })
             };
             let apply = |host: &mut dyn ControlHost,
@@ -11003,12 +11022,20 @@ fn dispatch_orchestrator_self(
 
     // #1021: ctx% は `agents --json` からは採れなくなった（2.1.258 で
     // `contextPercentUsed` が消えた）ので、画面 → transcript の順で解決する。
-    // ペインが GUI に居れば画面（= claude 自身の答え）を、居なければ transcript を使う
+    // ペインが GUI に居れば画面（= claude 自身の答え）を、居なければ transcript を使う。
+    // #1880: tako mod の報告が新鮮ならそれが先頭（statusLine が無くても取れる・窓も claude の答え）
+    let now = std::time::Instant::now();
+    let mod_lookup = crate::claude_mod::lookup_pane(host, pane_id, now);
     let screen_ctx = host
         .session(pane_id)
         .and_then(|s| crate::claude_ctx::screen_ctx_from_lines(&s.visible_lines()));
-    let ctx = crate::claude_ctx::resolve(session_id.as_deref(), screen_ctx.as_ref());
+    let ctx = crate::claude_ctx::resolve(
+        session_id.as_deref(),
+        screen_ctx.as_ref(),
+        &tako_core::claude_mod::ctx_input(&mod_lookup),
+    );
     let ctx_percent = ctx.percent;
+    let mod_limits = crate::claude_mod::account_rate_limits(host, pane_id, now);
 
     // #749: 閾値はプロファイル → config.yaml → 既定 60 の順で解決し 50〜60 へ丸める
     let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
@@ -11074,7 +11101,16 @@ fn dispatch_orchestrator_self(
         "ctx_model": ctx.model,
         "ctx_window": ctx.window,
         "ctx_screen_delta": ctx.screen_delta,
+        // #1880: mod を使わなかった理由（null = mod の値を採った）
+        "ctx_mod_reason": ctx.mod_reason,
+        // #1880: tako mod の報告（ターン状態・モデル・effort。使えなければ null + mod_reason）
+        "mod_turn": crate::claude_mod::turn_json(&mod_lookup, now),
+        "mod_reason": crate::claude_mod::reason_code(&mod_lookup),
+        // #1880: 使用制限（5h / 7d の % と解除時刻。アカウント単位で束ねた mod の値）
+        "rate_limits": crate::claude_mod::rate_limits_json(&mod_limits),
         "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
+        // #1880: #749 の自動ハンドオフの tick が最後に見た ctx%（取得元つき。GUI 稼働時のみ）
+        "auto_handoff_tick": host.handoff_tick_ctx(pane_id),
         // #915: `handoff_path` は**プロファイル運用メモ**（共通置き場）のパス。
         // プロジェクト固有の引き継ぎは `project_handoffs` の各 path へ書く
         "handoff_path": handoff_path,
@@ -12810,6 +12846,8 @@ pub struct WorkerStatusCtx {
     has_running_children: bool,
     /// 利用上限後の自動復帰の状態（#813。UI スレッドで写し取る）
     limit_resume: Value,
+    /// tako mod の報告（#1880。UI スレッドで写し取る。ターン状態・ctx%・使用制限の一次ソース）
+    mod_state: crate::claude_mod::ModSnapshot,
 }
 
 /// 末尾の空行を除去し、最大 30 行に切り詰めて 1 本のテキストへ
@@ -12857,6 +12895,7 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
         full_screen,
         input_style,
         limit_resume: limit_resume_entry(host, target),
+        mod_state: crate::claude_mod::ModSnapshot::capture(host, target),
     }
 }
 
@@ -12996,7 +13035,10 @@ fn finish_worker_status(
         input_style,
         has_running_children: has_children,
         limit_resume,
+        mod_state,
     } = ctx;
+    // #1880: tako mod の報告（新鮮なら ctx%・ターン状態・使用制限の一次ソース）
+    let mod_view = mod_state.view();
 
     // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
     // 読めなくても既存動作は変えない（フォールバック層）
@@ -13123,13 +13165,18 @@ fn finish_worker_status(
 
     // #1021: claude の ctx% は `agents --json` からは採れない（2.1.258 で
     // `contextPercentUsed` が消えた）。codex は #984 の rollout が既に実数を返すので
-    // **埋まっていないときだけ**画面 → transcript で解決する
+    // **埋まっていないときだけ**画面 → transcript で解決する。
+    // #1880: tako mod の報告が新鮮なら（= claude）それが先頭
     let mut ctx = None;
-    if ctx_percent.is_none() {
+    if ctx_percent.is_none() || mod_view.is_ok() {
         let screen = full_screen
             .as_deref()
             .and_then(crate::claude_ctx::screen_ctx_from_text);
-        let resolved = crate::claude_ctx::resolve(resolved_sid.as_deref(), screen.as_ref());
+        let resolved = crate::claude_ctx::resolve(
+            resolved_sid.as_deref(),
+            screen.as_ref(),
+            &tako_core::claude_mod::ctx_input(&mod_view),
+        );
         ctx_percent = resolved.percent;
         ctx = Some(resolved);
     }
@@ -13143,6 +13190,31 @@ fn finish_worker_status(
         let (session, capture) = crate::reach::detached_capture(ts)?;
         Some(tail_join(capture.capture_screen(&session).ok()?))
     });
+
+    // #1880: tako mod の報告が新鮮ならターン状態の一次ソース（`claude agents --json` より先）。
+    // permission / question は承認後もツールが返るまで残るので、画面が生成中なら busy を採る
+    // （判断は `ModTurn::status_word` の 1 実装）。以降の補正（画面の busy で idle を取り消す・
+    // 画面のダイアログで waiting へ上げる）は今までどおり効く
+    let (status, status_source) = match &mod_view {
+        Ok(stored) if status != "gone" => {
+            let screen_busy = recent_output
+                .as_deref()
+                .is_some_and(crate::orchestrator::wait::screen_looks_busy);
+            (
+                stored.report.turn.status_word(screen_busy).to_string(),
+                "mod",
+            )
+        }
+        _ => (status, status_source),
+    };
+    let mod_now = mod_state.at();
+    let mod_turn = mod_view
+        .as_ref()
+        .ok()
+        .map(|stored| (stored.report.turn, stored.report.classic_events));
+    let mod_turn_json = crate::claude_mod::turn_json(&mod_view, mod_now);
+    let mod_reason = crate::claude_mod::reason_code(&mod_view);
+    let mod_rate_limits = crate::claude_mod::rate_limits_json(mod_state.rate_limits());
 
     // #390: エージェントプロセスの生存シグナル（突然死判定専用）。
     // ctx の has_children（pane 健在時のみ計算）に加え、pane 消失中は
@@ -13244,6 +13316,10 @@ fn finish_worker_status(
         limit_resume,
         codex_rate_limits,
         agent_work_started,
+        mod_turn,
+        mod_turn_json,
+        mod_reason,
+        mod_rate_limits,
     })
 }
 
@@ -13299,6 +13375,14 @@ struct ResolvedWorkerStatus {
     /// （#1034 の実測では `first_busy` が 0.67s に出ているが、実際は 1 文字も
     /// 進んでいなかった）
     agent_work_started: Option<bool>,
+    /// #1880: tako mod が報告したターン状態と classic 系が届いているか（新鮮なときだけ）。
+    /// 画面のダイアログ検出との突き合わせに使う
+    mod_turn: Option<(tako_core::claude_mod::ModTurn, Option<bool>)>,
+    /// #1880: 応答の `mod_turn` / `mod_reason`（組み立ては `claude_mod`）
+    mod_turn_json: Value,
+    mod_reason: Value,
+    /// #1880: claude の使用制限（mod。codex は `codex_rate_limits` が先）
+    mod_rate_limits: Value,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -13326,6 +13410,10 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         agent_process_alive,
         limit_resume,
         login_account_resolver,
+        mod_turn,
+        mod_turn_json,
+        mod_reason,
+        mod_rate_limits,
     } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
@@ -13366,8 +13454,11 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // 構造化ソースを足した意味が無い**: エージェント CLI の TUI 自身がペインシェルの
     // 子なので `has_children` は生きている限り必ず true で、idle が必ず busy へ
     // 上書きされてしまう（#571 で claude について踏んだのと同じ形）
+    // #1880: tako mod の報告（`mod`）も claude 自身の一次情報なので同じ権威を持たせる
+    // （claude の TUI 自身がペインシェルの子なので、入れないと idle が必ず busy へ倒れる）
     let agents_authoritative = status_source == "agents"
         || status_source == "agents-auto"
+        || status_source == "mod"
         || is_live_log_source(&status_source);
     if status == "idle" {
         let screen_busy = recent_output
@@ -13509,6 +13600,38 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     {
         status = "waiting".to_string();
     }
+    // #1880: mod のターン状態と画面のダイアログ検出を突き合わせる（食い違いは黙らない）。
+    // **答え方（respond）は画面のダイアログを読む**ので、どちらの向きでも画面の側を正にする
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some((turn, classic_events)) = mod_turn {
+        let screen_choice = choice_dialog
+            .as_ref()
+            .and_then(|d| d["kind"].as_str())
+            .map(str::to_string);
+        let screen_permission =
+            permission_dialog.is_some() || screen_choice.as_deref() == Some("plan_confirm");
+        if turn.awaits_answer() && status == "waiting" && screen_choice.is_none() {
+            warnings.push(format!(
+                "mod は {} を報告しているが、画面に選択肢ダイアログが見えない\
+                 （respond は画面のダイアログを読むので、画面に出るまで応答できない）",
+                turn.as_str()
+            ));
+        }
+        if !turn.awaits_answer() && screen_permission {
+            let why = if classic_events == Some(false) {
+                "classic 系のイベントが mod へ届かない環境（classic_events=false）では、\
+                 ルールの無い ask の権限ダイアログを mod から拾えない\
+                 （ask ルール由来なら次の報告 = 1 秒以内で揃う）"
+            } else {
+                "mod の報告がまだ追いついていない"
+            };
+            warnings.push(format!(
+                "画面に権限ダイアログがあるが mod は {}（{why}。画面の検出を採用）",
+                turn.as_str()
+            ));
+        }
+    }
+    warnings.extend(ctx.as_ref().and_then(crate::claude_ctx::window_warning));
 
     // 停止（idle）した worker の画面に既知のエラーパターン（API エラー・usage limit・
     // rate limit ダイアログ）があれば error へ細分類する（#157）。busy 中は判定しない
@@ -13623,9 +13746,12 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         }
     }
 
-    // #224 停滞検知: busy だが実行中子プロセスなし → stalled（停滞）
+    // #224 停滞検知: busy だが実行中子プロセスなし → stalled（停滞）。
+    // #1880: mod の busy は対象外。45 秒以内の heartbeat が「claude は生きていてターンが
+    // 終わっていない」を claude 自身の口で言っている（器なしの直接ペインは子プロセスを
+    // 数えられず has_children が常に false なので、入れると画面の busy 表示が無い瞬間に倒れる）
     let mut stalled_info: Option<Value> = None;
-    if status == "busy" && !has_children {
+    if status == "busy" && !has_children && status_source != "mod" {
         let screen_busy = recent_output
             .as_ref()
             .is_some_and(|out| crate::orchestrator::wait::screen_looks_busy(out));
@@ -13708,8 +13834,10 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // 単発照会では「疑い」であり、watch は 2 回連続観測で WORKER_DEAD を確定する。
     // 自動 resume はしない（クラッシュループの危険 + master の判断を奪わないため、
     // resume_command の提示まで）
-    let alive_by_agents =
-        status_source.starts_with("agents") && status != "unknown" && status != "gone";
+    // #1880: mod の報告が新鮮（45 秒以内に heartbeat が届いた）なら claude は生きている
+    let alive_by_agents = (status_source.starts_with("agents") || status_source == "mod")
+        && status != "unknown"
+        && status != "gone";
     let agent_dead = registry_session_detected
         && !agent_process_alive
         && !alive_by_agents
@@ -13760,12 +13888,25 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "ctx_reason": ctx.as_ref().and_then(|c| c.reason).map(|x| x.as_str()),
         "ctx_model": ctx.as_ref().and_then(|c| c.model.clone()),
         "ctx_window": ctx.as_ref().and_then(|c| c.window),
+        // #1880: mod を使わなかった理由（null = mod の値を採った）
+        "ctx_mod_reason": ctx.as_ref().and_then(|c| c.mod_reason),
         "recent_output": recent_output,
         "status_source": status_source,
+        // #1880: tako mod の報告（ターン状態・待っているツール名・モデル・effort）。
+        // 使えなければ null で、理由は `mod_reason`
+        "mod_turn": mod_turn_json,
+        "mod_reason": mod_reason,
         // #985: codex の**構造化された**利用制限（rollout の `rate_limits`）。
         // 画面スクレイピングと違い used_percent は数値、resets_at は epoch 秒なので、
-        // AI が「いつ解けるか」を書式に依存せず読める（claude / agy では null）
-        "rate_limits": codex_rate_limits.as_ref().map(rate_limits_json),
+        // AI が「いつ解けるか」を書式に依存せず読める。
+        // #1880: claude は tako mod の値（5h / 7d の % と解除時刻。アカウント単位で束ねる）。
+        // agy は null
+        "rate_limits": codex_rate_limits
+            .as_ref()
+            .map(rate_limits_json)
+            .unwrap_or(mod_rate_limits),
+        // #1880: mod と画面の食い違い・ctx% のずれ（空 = 何も無い）
+        "warnings": warnings,
         "resolved_session_id": resolved_sid,
         "error": error_info,
         "stalled": stalled_info,
@@ -26159,6 +26300,191 @@ mod tests {
         assert!(!gone.pane_exists);
     }
 
+    fn mod_snapshot_1880(
+        turn: &str,
+        classic: bool,
+        limits: serde_json::Value,
+    ) -> crate::claude_mod::ModSnapshot {
+        let report = tako_core::claude_mod::parse_report(json!({
+            "schema": 1, "mod_version": "t", "at": 1, "turn": turn,
+            "model": "claude-haiku-5-5", "effort": "medium",
+            "pending_tool": if turn == "permission" { json!("Bash") } else { Value::Null },
+            "classic_events": classic,
+            "context": {"tokens": 59426, "window": 1000000, "percent": 6},
+            "rate_limits": limits.clone(),
+        }))
+        .unwrap();
+        let limits: Vec<tako_core::claude_mod::ModRateLimit> =
+            serde_json::from_value(limits).unwrap();
+        crate::claude_mod::ModSnapshot::with_report(
+            tako_core::claude_mod::StoredReport {
+                report,
+                received: std::time::Instant::now(),
+                count: 1,
+            },
+            limits,
+        )
+    }
+
+    fn mod_ctx_1880(live_tail: &str, mod_state: crate::claude_mod::ModSnapshot) -> WorkerStatusCtx {
+        WorkerStatusCtx {
+            pane_id: 0,
+            pane_exists: true,
+            backend_session: None,
+            live_tail: Some(live_tail.into()),
+            full_screen: Some(live_tail.into()),
+            input_style: None,
+            has_running_children: true,
+            limit_resume: Value::Null,
+            mod_state,
+        }
+    }
+
+    /// #1880: 画面に ctx も状態も出ていなくても、mod の報告が一次ソースになる
+    #[test]
+    fn issue1880_modの報告がctxとターン状態と使用制限の一次ソースになる() {
+        let limits = json!([
+            {"kind": "five_hour", "percent_used": 3, "resets_at": "2026-10-08T14:30:00.000Z", "observed_at": 1},
+            {"kind": "seven_day", "percent_used": 2, "resets_at": "2026-10-10T13:00:00.000Z", "observed_at": 1},
+        ]);
+        // statusLine の無い画面（ctx 表記なし）+ 入力欄 = 画面推定なら idle
+        let v = finish_worker_status(
+            mod_ctx_1880("done\n❯ ", mod_snapshot_1880("busy", true, limits.clone())),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "busy", "mod の busy が画面推定より先: {v}");
+        assert_eq!(v["status_source"], "mod");
+        assert_eq!(v["ctx_percent"], 6);
+        assert_eq!(v["ctx_source"], "mod");
+        assert_eq!(v["ctx_window"], 1_000_000);
+        assert_eq!(v["ctx_mod_reason"], Value::Null);
+        assert_eq!(v["mod_turn"]["turn"], "busy");
+        assert_eq!(v["mod_turn"]["effort"], "medium");
+        assert_eq!(v["mod_reason"], Value::Null);
+        assert_eq!(v["rate_limits"]["source"], "mod");
+        assert_eq!(v["rate_limits"]["windows"][0]["kind"], "five_hour");
+        assert_eq!(
+            v["rate_limits"]["windows"][0]["resets_at"],
+            1_791_469_800_i64
+        );
+        assert_eq!(v["rate_limits"]["limited"], false);
+        assert_eq!(v["warnings"], json!([]));
+        // idle は has_children（claude の TUI 自身）で busy へ倒されない（一次ソースの権威）
+        let v = finish_worker_status(
+            mod_ctx_1880("done\n❯ ", mod_snapshot_1880("idle", true, json!([]))),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (v["status"].as_str(), v["status_source"].as_str()),
+            (Some("idle"), Some("mod"))
+        );
+        assert_eq!(
+            v["rate_limits"],
+            Value::Null,
+            "報告に使用制限が無ければ null"
+        );
+    }
+
+    /// #1880: 器なしの直接ペインは子プロセスを数えられない（has_children が常に false）。
+    /// mod の busy はターン中を claude 自身が言っているので、#224 の停滞へ倒さない
+    #[test]
+    fn issue1880_直接ペインでもmodのbusyは停滞にしない() {
+        let mut ctx = mod_ctx_1880("done\n❯ ", mod_snapshot_1880("busy", true, json!([])));
+        ctx.has_running_children = false;
+        let v = finish_worker_status(ctx, None, None).unwrap();
+        assert_eq!(v["status"], "busy", "{v}");
+        assert!(v["stalled"].is_null());
+        // mod が無ければ従来どおり（画面推定の idle）
+        let mut ctx = mod_ctx_1880("done\n❯ ", crate::claude_mod::ModSnapshot::default());
+        ctx.has_running_children = false;
+        let v = finish_worker_status(ctx, None, None).unwrap();
+        assert_eq!(v["status"], "idle");
+    }
+
+    /// #1880: 承認後もツールが返るまで permission が残る = 画面が生成中なら busy
+    #[test]
+    fn issue1880_承認後のツール実行中はpermissionでもbusy() {
+        let running = "⏺ Bash(sleep 30)\n✻ Running… (12s · esc to interrupt)";
+        let v = finish_worker_status(
+            mod_ctx_1880(running, mod_snapshot_1880("permission", true, json!([]))),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "busy", "{v}");
+        assert_eq!(v["mod_turn"]["turn"], "permission");
+        // ダイアログが画面に実在すれば waiting（突き合わせが一致 = 警告なし）
+        let v = finish_worker_status(
+            mod_ctx_1880(
+                PERMISSION_SCREEN_577,
+                mod_snapshot_1880("permission", true, json!([])),
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        assert!(!v["permission_dialog"].is_null());
+        assert_eq!(v["warnings"], json!([]));
+    }
+
+    /// #1880: classic 系が届かない環境（組織アカウント）ではルールの無い ask を mod が拾えない。
+    /// 画面の検出を採用し、食い違いを warnings に出す
+    #[test]
+    fn issue1880_modと画面のダイアログの食い違いはwarningsに出る() {
+        let v = finish_worker_status(
+            mod_ctx_1880(
+                PERMISSION_SCREEN_577,
+                mod_snapshot_1880("busy", false, json!([])),
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "waiting", "画面のダイアログが正: {v}");
+        let w = v["warnings"][0].as_str().unwrap_or_default();
+        assert!(w.contains("classic_events=false"), "{w}");
+        // 逆向き: mod は permission だが画面にダイアログが見えない（生成中でもない）
+        let v = finish_worker_status(
+            mod_ctx_1880("done\n❯ ", mod_snapshot_1880("permission", true, json!([]))),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status"], "waiting");
+        let w = v["warnings"][0].as_str().unwrap_or_default();
+        assert!(w.contains("画面に選択肢ダイアログが見えない"), "{w}");
+    }
+
+    /// #1880: 報告が無ければ今の経路のまま（理由つき）。pane の同一性が崩れたら mod も捨てる
+    #[test]
+    fn issue1880_報告が無ければ画面へ落ちて理由が出る() {
+        let v = finish_worker_status(
+            mod_ctx_1880(
+                "  ctx  41% ████░░░░░░\n❯ ",
+                crate::claude_mod::ModSnapshot::default(),
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["status_source"], "screen");
+        assert_eq!(v["ctx_source"], "screen");
+        assert_eq!(v["ctx_percent"], 41);
+        assert_eq!(v["ctx_mod_reason"], "mod_absent");
+        assert_eq!(v["mod_reason"], "mod_absent");
+        assert!(v["mod_turn"].is_null());
+        // 期待する tmux セッションと食い違うペイン = 別の worker の報告は使わない
+        let mut ctx = mod_ctx_1880("❯ ", mod_snapshot_1880("busy", true, json!([])));
+        ctx.backend_session = Some("other".into());
+        let ctx = verify_ctx_pane_identity(ctx, Some("expected"));
+        assert!(ctx.mod_state.view().is_err());
+    }
+
     #[test]
     fn finish_worker_statusがペイン不在でgoneを返す() {
         let ctx = WorkerStatusCtx {
@@ -26170,6 +26496,7 @@ mod tests {
             input_style: None,
             has_running_children: false,
             limit_resume: Value::Null,
+            mod_state: Default::default(),
         };
         let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "gone");
@@ -26190,6 +26517,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26208,6 +26536,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26225,6 +26554,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26248,6 +26578,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26274,6 +26605,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26294,6 +26626,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26315,6 +26648,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26339,6 +26673,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26365,6 +26700,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -26389,6 +26725,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -33972,6 +34309,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34001,6 +34339,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34036,6 +34375,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             Some("sid-7801-detected"),
             None,
@@ -34110,6 +34450,7 @@ mod tests {
                     input_style: None,
                     has_running_children: false,
                     limit_resume: Value::Null,
+                    mod_state: Default::default(),
                 },
                 None,
                 None,
@@ -34210,6 +34551,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34255,6 +34597,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34307,6 +34650,7 @@ mod tests {
                 // 実発生の観測（背景で cargo test / 隔離セルフテストが走っていた）
                 has_running_children: true,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34361,6 +34705,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34428,6 +34773,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34455,6 +34801,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34484,6 +34831,7 @@ mod tests {
                 input_style: None,
                 has_running_children: false,
                 limit_resume: Value::Null,
+                mod_state: Default::default(),
             },
             None,
             None,
@@ -34525,6 +34873,7 @@ mod tests {
                     input_style: None,
                     has_running_children: false,
                     limit_resume: Value::Null,
+                    mod_state: Default::default(),
                 },
                 None,
                 None,
@@ -34656,6 +35005,7 @@ mod tests {
                     // #1297: 入力欄の属性は見ない判定なので None（文字列だけで読む旧挙動）
                     input_style: None,
                     limit_resume: Value::Null,
+                    mod_state: Default::default(),
                 },
                 None,
                 None,
@@ -34735,6 +35085,7 @@ mod tests {
             input_style: None,
             has_running_children: has_children,
             limit_resume: Value::Null,
+            mod_state: Default::default(),
         };
 
         // 子プロセスなし → agent_dead イベント + resume_command
