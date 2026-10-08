@@ -83,7 +83,22 @@ jobs:
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
+      # rust-cache はルートの Cargo.toml（仮想マニフェスト）をキーへ混ぜないので、
+      # [profile.*] や [workspace.dependencies] の features を変えても変更前のキャッシュが
+      # 完全一致で復元され続け、保存もされない（#1912 で実測）。その指紋を key へ足す
+      # （版の bump とコメントは効かせない。理由はスクリプトの冒頭。#1915）。
+      # key は復元の前方一致の側にも入るので、指紋が変わった最初の 1 回は復元無しで組む。
+      # 指紋が版の bump で揺れる（= 毎日キャッシュが外れる）形や、rust-cache の箇所に
+      # 指紋を渡し忘れた形へ戻ったら、先にテストで落とす（数秒。cargo は要らない）
+      - name: ルートの Cargo.toml の指紋のテスト（#1915）
+        run: bash scripts/test-cargo-root-manifest-key-1915.sh
+      - name: ルートの Cargo.toml の指紋（rust-cache のキー。#1915）
+        id: cargo-root
+        shell: bash
+        run: key=$(bash scripts/lib/cargo-root-manifest-key.sh) && echo "key=$key" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: manifest-${{ steps.cargo-root.outputs.key }}
       - name: フォーマット検査
         run: cargo fmt --all --check
       - name: Clippy（warning をエラー扱い）
@@ -291,7 +306,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
+      # macOS ジョブと同じ理由（#1915）
+      - name: ルートの Cargo.toml の指紋（rust-cache のキー。#1915）
+        id: cargo-root
+        shell: bash
+        run: key=$(bash scripts/lib/cargo-root-manifest-key.sh) && echo "key=$key" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: manifest-${{ steps.cargo-root.outputs.key }}
       - name: ビルド
         run: cargo build --workspace
       # **テストの「コンパイル」だけは blocking** にする（#1264）。
