@@ -383,17 +383,17 @@ S1〜S6 には入れない。
 
 | キー（案） | 足すスライス | claude | codex / agy | local |
 |---|---|---|---|---|
-| `claude_mod_state` | S1 | Supported | Pending（#下記の調査 Issue） | `local_pending_first_class()` |
+| `claude_mod_state` | S1 | Supported | Pending（#1885） | `local_pending_first_class()` |
 | `claude_mod_band` | S3 | Supported | 同上 | 同上 |
 | `claude_mod_actions` | S4 | Supported | 同上 | 同上 |
 | `claude_mod_chat` | S5 | Supported | 同上 | 同上 |
 
 - codex / agy を **Unsupported にしない**。「上流に同等の拡張点が無い」はまだ調べていないので
-  Pending（調査 Issue）にする（`AgentSupport::Unsupported` の doc の禁止事項）
+  Pending（#1885）にする（`AgentSupport::Unsupported` の doc の禁止事項）
 - 既存のマス（`master_ctx_percent` / `worker_limit_detect` / `worker_permission_dialog` /
   `worker_status_detect`）は claude 列が既に Supported なので変えない。S2 で根拠欄に
   「mod があれば一次ソース、無ければ画面」と書き足す
-- OS 軸（`platform::support`）: Windows は Pending（#467 配下に子 Issue。区切り `;` の単体テストは
+- OS 軸（`platform::support`）: Windows は Pending（#1886。#467 との接点。区切り `;` の単体テストは
   S1 で入れるが、実機の Claude Code で mod が動くかは未実測）
 
 ## 5. mod の作りの規約（S1 で `crates/tako-core/claude-mod/` に入れるときに守る）
@@ -435,18 +435,19 @@ S1〜S6 には入れない。
 依存:
 
 ```text
-S1 基盤（同梱・展開・注入・報告・status）
- ├─ S2 一次ソース化（ctx・使用制限・状態）
- ├─ S3 Claude Code の画面に出す（帯・ペイン）
- ├─ S4 Claude Code から tako を操作（コマンド・ボタン）
- └─ S5 チャット表示を構造化通知で
-S6 tako → mod の push（S2〜S5 の後。[提案] を含む）
-調査: codex / agy の同等の拡張点（MATRIX の codex / agy 列を確定する。いつでも）
+S1 基盤（同梱・展開・注入・報告・status）                 #1879
+ ├─ S2 一次ソース化（ctx・使用制限・状態）                 #1880
+ ├─ S3 Claude Code の画面に出す（帯・ペイン）              #1881
+ ├─ S4 Claude Code から tako を操作（コマンド・ボタン）    #1882
+ ├─ S5 チャット表示を構造化通知で                          #1883
+ └─ Windows 実機確認                                       #1886
+S6 tako → mod の push（S2〜S5 の後。[提案] を含む）        #1884
+調査: codex / agy の同等の拡張点（いつでも）               #1885
 ```
 
 S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228）を避けるため着地は 1 本ずつ。
 
-### S1 基盤
+### S1 基盤（#1879）
 
 - やること: §3（展開・env 注入・版の下限・`claude_mod` 設定）+ §4（`Request::Mod`・
   `tako mod` / `tako mod report`・MCP `tako_mod`・報告の保持と鮮度）+ §5 の規約で書いた mod の
@@ -464,7 +465,7 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   8. `claude plugin validate` / `claude plugin test` が通る。番犬: mod のゲートになるフックに
      `.catch` が付いていること・報告の payload に本文系のキーが無いこと
 
-### S2 一次ソース化
+### S2 一次ソース化（#1880）
 
 - やること: §6 の表の上 4 行。`claude_ctx::resolve` / `limit_stop` の hint / `orchestrator::wait`・
   `worker_status` / チャットヘッダの残量バー（#702）/ #749 の自動ハンドオフの tick が mod の報告を
@@ -474,7 +475,7 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   取れる。報告を止める注入で 45 秒後に画面 / transcript へ落ちて理由が出る。使用制限の reset 時刻が
   mod の値（秒精度）になる。A/B: `TAKO_1877_S2_LEGACY=1`
 
-### S3 Claude Code の画面に出す
+### S3 Claude Code の画面に出す（#1881）
 
 - やること: 帯（1 行。このペインの名前・タブ・worker 数と要注意の数・ctx / 使用制限は閾値を
   超えたときだけ）・`/tako` でサイドバーのペイン（詳細）・帯を隠すトグル（`$.store` に保存）。
@@ -483,7 +484,7 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   `claude plugin test` で terminal と desktop の両 surface。statusLine を持つ利用者の画面で
   情報が二重にならない既定（閾値未満は出さない）。MATRIX `claude_mod_band`
 
-### S4 Claude Code から tako を操作
+### S4 Claude Code から tako を操作（#1882）
 
 - やること: スラッシュコマンド（`/tako split` 等。`immediate` = Claude のターン中でも即実行）と
   ペインのボタン。**中身は既存 CLI を `$.process.run` で呼ぶだけ**。右クリックメニューとの対応表:
@@ -505,7 +506,7 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
 - 受け入れ条件: 表の「呼ぶ」行がすべて実機で通る。**番犬**: 右クリックメニューに項目が増えたら
   この表（mod 側の対応表の正本）に「呼ぶ / 対象外 + 理由」の行が無いと落ちる。MATRIX `claude_mod_actions`
 
-### S5 チャット表示を構造化通知で
+### S5 チャット表示を構造化通知で（#1883）
 
 - やること: mod が `session.append` の `{uuid, door, origin, type, name}`（本文なし）と
   `turn.*`・`prompt.submit` を報告に載せ、tako の GUI ライク表示（#691 系）が transcript を
@@ -516,13 +517,13 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
 - 判断点: 報告の量（1 ターンで 10 行前後 = §1.4）を 1 秒 flush でまとめて送る形で足りるか、
   実測して決める
 
-### S6 tako → mod の push（[提案] を含む）
+### S6 tako → mod の push（[提案] を含む。#1884）
 
 - やること: §2.3 の常時 push の設計と、それで初めてできる機能（チャット入力を `$.prompt.submit`
   で送る / 権限ダイアログへ mod 経由で答える / tako から compact を頼む）の要否の判断
 - 受け入れ条件: 設計書の追記と、採るなら最初の 1 機能の実装
 
-### 調査: codex / agy の同等の拡張点
+### 調査: codex / agy の同等の拡張点（#1885）
 
 - codex / agy に「プロセス内で動き、状態を構造で取れ、画面に描ける」拡張点があるかを調べ、
   MATRIX の `claude_mod_*` の codex / agy 列を Pending → Supported / Unsupported（根拠つき）へ確定する
