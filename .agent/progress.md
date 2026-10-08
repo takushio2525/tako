@@ -63,3 +63,7 @@
 ## 2026-10-09（#1895: ファイルツリーの ⇧↑ / ⇧↓・⌘⌫、1 つのファイルの途中での取り消し、まとめたコピーを 1 つのジョブへ、帯の残り時間）
 - ⇧↑ / ⇧↓ = `tree_select::extend`（⇧クリックと同じ `apply`）・⌘⌫（Win は Delete）= 右クリックの「削除」と同じ `trash_tree_paths`（見出し・リモートは断る）。1 つのファイルは `fs_copy::copy_file_exclusive`（同じ APFS は clone・それ以外は fcopyfile / CopyFileExW の進み具合で 1 MiB ごとにバイトが進み途中で止めて作りかけを消す）。`tako file copy a b dst` / MCP `paths` の copy = `FileOpMany` の 1 ジョブ、`copy_progress` に `eta_secs`（2 秒・1% までは出さない）。カタログ +7 B
 - 実測: 製品の経路で 256 MiB の同じボリューム 61.8 → 22.6 ms（`create_new` の後の `std::fs::copy` で clone が外れていたのを直した）・別ボリューム 180.5 / 181.4 ms で差なし。`scripts/test-tree-keyboard-copy-1895.sh` 39 PASS 0 FAIL（A/B `TAKO_1895_LEGACY=1` で ① が名指しで FAILED）・番犬 13 本（注入 11 通りを file:line で名指し）
+
+## 2026-10-09（#748 / PR #754: 合成入力欄をダイアログと誤判定しない固定を今の main へ載せ直した）
+- `dialog.rs` のテストを描く側と同じ組み立てへ（#719 / #718 = 罫線 16 桁・#737 = 20 桁・#1067 = 30 桁 + フッター）。キュー滞留ヒントは #737 ではなく #1067 の形
+- 実測: 注入 A（罫線の棄却を外す）/ A+B（兄弟 1 つで並び）/ E（罫線の最小を 20 本）で形を名指しして FAILED（E は入力欄系でこれだけ）
