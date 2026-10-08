@@ -3347,21 +3347,37 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// syntect ハイライトを background executor で実行し、完了後にプレビューを差し替える
+    /// syntect ハイライトを background executor で実行し、完了後にプレビューを差し替える。
+    /// 走っている数を `view_highlights_running` へ数える（#1890。戻ったら取り込んだか
+    /// 捨てたかに依らず減らす）
     pub(crate) fn spawn_highlight(
-        &self,
+        &mut self,
         pane: PaneId,
         path: std::path::PathBuf,
         text: String,
         cx: &mut Context<Self>,
     ) {
+        *self.view_highlights_running.entry(pane).or_default() += 1;
+        let inject = preview::highlight_inject();
         cx.spawn(async move |this, cx| {
             let p = path.clone();
+            if let Some(delay) = inject.delay {
+                cx.background_executor().timer(delay).await;
+            }
             let task = cx
                 .background_executor()
                 .spawn(async move { preview::highlight_text(&p, &text) });
             let lines = task.await;
             let _ = this.update(cx, |app, cx| {
+                if let Some(running) = app.view_highlights_running.get_mut(&pane) {
+                    *running = running.saturating_sub(1);
+                    if *running == 0 {
+                        app.view_highlights_running.remove(&pane);
+                    }
+                }
+                if inject.drop {
+                    return;
+                }
                 // #1660: 編集セッションがあれば表示行はエディタの持ち物（打った分を
                 // 反映している）。読み取り表示の塗りで上書きすると、大きいファイルを
                 // 開いてすぐ編集を始めたとき（塗りに数秒かかる）打った文字が表示から消える
@@ -3408,7 +3424,11 @@ impl TakoApp {
         request: preview::SeedRequest,
         cx: &mut Context<Self>,
     ) {
+        let inject = preview::highlight_inject();
         cx.spawn(async move |this, cx| {
+            if let Some(delay) = inject.delay {
+                cx.background_executor().timer(delay).await;
+            }
             let task = cx
                 .background_executor()
                 .spawn(async move { preview::seed_editor_highlight(request) });
