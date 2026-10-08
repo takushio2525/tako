@@ -48088,7 +48088,7 @@ mod self_test {
         check(kept, "visual-test hover: カードの上では閉じない (#1681)");
         let away = window
             .update(cx, |app, _, _| {
-                let layout = app.preview_text_layouts.get(&pane)?.get(0)?.clone()?;
+                let layout = app.preview_text_layouts.get(&pane)?.first()?.clone()?;
                 let b = layout.bounds();
                 Some(point(
                     b.right() - px(4.0),
