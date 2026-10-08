@@ -2147,7 +2147,8 @@ property テスト（置換の 4 条件 = 大文字小文字 × 単語単位と�
 2 節が「読み取り表示の塗り」「編集開始の全文の塗り」の戻りを待つのは
 `wait_for_background_highlight` の 1 実装で、**まだ走っているか**（`TakoApp::view_highlights_running`
 = 起こした読み取り表示の塗りのうち戻っていない数 / `EditState::highlight_pending`）の間だけ待つ（#1890）。
-debug（visual-test 入り）では 10 MB の 1 回の塗りが 427.6 秒かかる（release は 7.8 秒）ので、
+debug（visual-test 入り）では 10 MB の 1 回の塗りが 427.6 秒かかる（release は 7.8 秒。#1901 で塗りの依存を
+debug でも最適化した後は 18.8〜44.8 秒）ので、
 旧の回数の窓（3000 回 / 6000 回 × 10ms）では debug の単独実行が節の入った時点から必ず落ちていた。
 A/B は `bash scripts/test-highlight-wait-1890.sh`（遅れの注入 `TAKO_1890_INJECT=slow:<ミリ秒>`・
 旧の窓へ戻す `TAKO_1890_LEGACY`）。

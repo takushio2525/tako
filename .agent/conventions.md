@@ -1529,7 +1529,8 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   `large-file-decor` / `large-file-edit`（#1660）は、読み取り表示の塗りと編集開始の全文の塗り
   （どちらも background の syntect）を `for _ in 0..3000 { 10ms 待って描く }` / `0..6000` で
   待っていた。窓の長さは release の塗り（10 MB で 7.8 秒）だけを見て決めていたが、
-  **debug（visual-test 入り）では 1 回の塗りが 427.6 秒**かかる（未最適化の正規表現。旧の窓は
+  **debug（visual-test 入り）では 1 回の塗りが 427.6 秒**かかる（未最適化の正規表現。#1901 で塗りの
+  依存を debug でも最適化した後は 18.8〜44.8 秒 = 状態待ちは引き続き要る。旧の窓は
   同じ周期で約 118 秒）ので、`large-file-decor` は節が入った `deecfc9` の時点から debug の
   単独実行では一度も通っていなかった（#1873 の worker が load 約 5 のときに踏んで負荷を疑ったが、
   load は無関係で release は同じ時間帯に緑）

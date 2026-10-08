@@ -19,6 +19,30 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# debug ビルドでも構文の塗り（syntect + fancy-regex と下の正規表現エンジン）だけは
+# 最適化する（#1901）。未最適化だと release の 14〜18 倍遅く、debug の visual-test で
+# 10 MB の塗りが 1 回 7 分かかっていた（#1890）。これで debug の塗りは release 並み
+# （10 MB: 53.8 → 4.3 秒）。自分のクレートは最適化しないので、デバッグ情報と差分ビルドの
+# 速さはそのまま（増えるのはこの 8 つのクリーンビルドの約 36 秒ぶんの CPU 時間だけ）。
+# どれを外しても遅くなる（1 MB の TS: 8 つ全部 4.8 秒 / fancy-regex を外すと 39 秒 /
+# memchr を外すと 5.4 秒）。前後の実測表は #1901
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.bit-set]
+opt-level = 3
+[profile.dev.package.bit-vec]
+opt-level = 3
+
 [workspace.dependencies]
 tako-core = { path = "crates/tako-core" }
 tako-control = { path = "crates/tako-control" }
