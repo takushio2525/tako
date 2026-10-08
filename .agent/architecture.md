@@ -1940,6 +1940,38 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   定数で数える（以前は見積もり 20px・実高さ 23.5px で、項目の多いメニューを下端で開くと下へ見切れていた。
   visual-test `lsp-context-menu` の ⑥ が実矩形で四隅を見る）
 
+### ホバー（#1681。2026-10-02）
+
+- **置き場**: 純粋部分は `tako_core::lsp::hover`（`Hover.contents` の 3 形の読み取り・本文の上限
+  `MAX_CHARS`・範囲の写し・能力）、問い合わせと取り消しは `tako_control::lsp::manager` の
+  `hover` / `cancel_hover` / `has_document`、CLI / MCP と編集メニューの 3 段は
+  `dispatch::lsp_hover_prepare` → `LspHoverJob::run` → `lsp_hover_land`（`show` なら
+  `ControlHost::show_lsp_hover`）、画面は tako-app の `lsp_hover_ui.rs`。カードを出す口は
+  `TakoApp::open_lsp_hover_card` の 1 本（マウス・メニュー・CLI / MCP の `show`）
+- **乗せただけでサーバを起こさない**: マウスの要求は `HoverRequest::open = false` で、manager は
+  開いている文書へ持ち手として加わる（`Shared::join`）だけ。GUI の入口も `has_document` で
+  つながっていない文書では背景の問い合わせを立てない（なぞるたびにスレッドを起こさない）。
+  明示の問い合わせ（CLI / MCP / メニュー）は定義ジャンプ・整形・補完と同じ `open_for_request`
+- **取り消しの列は補完と同じ仕組み**（`Lane::Hover`。#1682 の `supersede` / `request_in_lane`）:
+  次の語へ移った・カードを閉じたら前の要求を `$/cancelRequest` で捨てる。GUI 側は乗せ直すたびに
+  進む番号と編集バッファの版で答えを照合する（打ち足した後の答えは語の位置がずれている）
+- **描画は `md_view::render_block` の 1 実装**: Markdown は `preview::markdown_blocks` で
+  ブロックにし、`md_view::render_blocks`（アップデート詳細の `render_document` と共有した並べ方）で
+  1 ブロックずつ `render_block` へ通す。受け皿は読むだけの `ReadOnlyMdSink`（リンクの当たり判定の
+  `TextLayout` を控える）。平文は段落 1 つに素の文字列 1 本（`StyledText` が改行で折る）
+- **置き場は 1 フレーム目に測る**: Markdown の高さは組むまで分からないので、1 フレーム目は
+  `invisible`（paint だけ止まり prepaint は走る）のまま `canvas` の prepaint で実寸を `Cell` へ書き、
+  変わったら `cx.defer` で次のフレームを起こす（#684 の採取と同じ作法）。2 フレーム目から
+  `hover_card_placement` が測った高さで上下を決める（真上へ返すときカードの下端 = 語の行の上端）。
+  横は `compute_menu_position` のように返さず**ずらす**（返すと語の真下にカードが無くなり、語から
+  カードへマウスを下ろす経路が切れる）
+- **閉じる条件は描く直前の照合**（`hover_still_valid`）: ペイン・ファイル・版・語の行が描かれているか、
+  マウスで出したカードは窓のマウス位置が語かカードの上か（スクロールで語が動いても同じ照合で閉じる）。
+  メニュー / CLI で出したカードはマウスの位置でもフォーカスでも閉じない（CLI の `--show` は
+  フォーカスが端末のまま出す）。どちらもカードの外の押下（`on_mouse_down_out`。押下は止めない）・
+  そのペインでの打鍵・Esc で閉じる。重ね順は補完の一覧が手前。右クリックメニュー（#1684）を開いているあいだは
+  出さない（カードはメニューより手前に積まれる = 出すと隠す）。メニューの項目にはホバーを載せない（`NOT_IN_MENU`）
+
 ## 大きいファイルの編集（#1660。2026-09-27）
 
 プレビューの読み込み上限（= 編集の上限）が 1 MB / 5,000 行で、tako 自身の `main.rs`（8 万行超）・

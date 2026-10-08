@@ -1439,7 +1439,7 @@
     "name": "tako_lsp_server"
   },
   {
-    "description": "言語サーバの言語機能。action=diagnostics（既定）は編集モードのコードの診断（エラー・警告）を返す（pane で絞り・省略で全文書。severity でその重大度以上に絞る）。action=definition / declaration / type-definition / implementation はコードプレビューの pane・line・column にある識別子の飛び先へ飛ぶ（GUI の <link-click>と同じ。pane の省略は呼び出し元）。同じファイルは同じペイン、同じタブで開いているファイルはそのペイン、それ以外は新しいペイン（open で right / down / new-tab、none は開かずに場所だけ）。status=found / choose（候補が複数。choice で選ぶ）/ not-found / timeout / not-installed 等と reason / next_step を返す。飛ぶとジャンプ履歴に積まれ tako_jump で戻れる。action=format は pane（省略は呼び出し元）のコードを整形して編集バッファへ当てる（undo 1 回で戻る。line・column〜end_line・end_column で範囲の整形 = 範囲の外は変えない）。status=formatted / unchanged / stale 等。action=format-on-save は保存時整形（enabled。既定 false。明示的な保存だけで自動保存では整形しない）。action=completion はその位置の補完候補（GUI の打鍵中の一覧と同じ絞り込み）を limit 件（既定 50）返し、切った数を truncated に載せる。choice で候補を確定（undo 1 回で戻る）、resolve で説明を補う。action=menu はその位置の右クリックメニューの LSP 項目（サーバの能力に無いものは出ない。識別子でない位置は 0 件）を返し、items[].args をそのまま渡すと押したのと同じになる。位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）。",
+    "description": "言語サーバの言語機能。action=diagnostics（既定）は編集モードのコードの診断（エラー・警告）を返す（pane で絞り・省略で全文書。severity でその重大度以上に絞る）。action=definition / declaration / type-definition / implementation はコードプレビューの pane・line・column にある識別子の飛び先へ飛ぶ（GUI の <link-click>と同じ。pane の省略は呼び出し元）。同じファイルは同じペイン、同じタブで開いているファイルはそのペイン、それ以外は新しいペイン（open で right / down / new-tab、none は開かずに場所だけ）。status=found / choose（候補が複数。choice で選ぶ）/ not-found / timeout / not-installed 等と reason / next_step を返す。飛ぶとジャンプ履歴に積まれ tako_jump で戻れる。action=format は pane（省略は呼び出し元）のコードを整形して編集バッファへ当てる（undo 1 回で戻る。line・column〜end_line・end_column で範囲の整形 = 範囲の外は変えない）。status=formatted / unchanged / stale 等。action=format-on-save は保存時整形（enabled。既定 false。明示的な保存だけで自動保存では整形しない）。action=completion はその位置の補完候補（GUI の打鍵中の一覧と同じ絞り込み）を limit 件（既定 50）返し、切った数を truncated に載せる。choice で候補を確定（undo 1 回で戻る）、resolve で説明を補う。action=menu はその位置の右クリックメニューの LSP 項目（サーバの能力に無いものは出ない。識別子でない位置は 0 件）を返し、items[].args をそのまま渡すと押したのと同じになる。action=hover はその位置の型・doc を contents（kind=markdown / plaintext のまま）で返す（show で GUI にカードも出す）。位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1454,7 +1454,8 @@
             "format",
             "format-on-save",
             "completion",
-            "menu"
+            "menu",
+            "hover"
           ],
           "type": "string"
         },
@@ -1464,7 +1465,7 @@
           "type": "integer"
         },
         "column": {
-          "description": "定義ジャンプ / 補完 / menu: 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否。必須）/ format: 範囲の始まりの桁",
+          "description": "定義ジャンプ / 補完 / menu / ホバー: 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否。必須）/ format: 範囲の始まりの桁",
           "minimum": 0,
           "type": "integer"
         },
@@ -1492,7 +1493,7 @@
           "type": "integer"
         },
         "line": {
-          "description": "定義ジャンプ / 補完 / menu: 行（1 始まり。必須）/ format: 範囲の始まりの行",
+          "description": "定義ジャンプ / 補完 / menu / ホバー: 行（1 始まり。必須）/ format: 範囲の始まりの行",
           "minimum": 1,
           "type": "integer"
         },
@@ -1525,6 +1526,10 @@
             "hint"
           ],
           "type": "string"
+        },
+        "show": {
+          "description": "ホバー: GUI のその位置にカードも出す（既定 false）",
+          "type": "boolean"
         }
       },
       "type": "object"

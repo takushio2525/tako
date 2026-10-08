@@ -224,6 +224,8 @@ impl TakoApp {
                     OffloadContinuation::FileCopied(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#1682 の補完は別の続き）
                     OffloadContinuation::LspCompletion(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#1681 のホバーは別の続き）
+                    OffloadContinuation::LspHover(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

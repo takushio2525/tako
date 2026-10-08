@@ -26,6 +26,7 @@
 //! | `no-format` | 整形の能力（`documentFormattingProvider` / `documentRangeFormattingProvider`）を申告しない（#1683） |
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
 //! | `no-completion` | 補完の能力（`completionProvider`）を申告しない（#1682） |
+//! | `no-hover` | ホバーの能力（`hoverProvider`）を申告しない（#1681） |
 //!
 //! `--providers <json>` か `TAKO_LSP_FAKE_PROVIDERS`（JSON のオブジェクト）を渡すと、シナリオの
 //! 能力（定義ジャンプ・整形・補完の `…Provider`）を捨てて**そのオブジェクトの組だけ**を申告する
@@ -74,6 +75,13 @@
 //!   "word_edit": true,                             // 候補ごとにカーソルの直前の語を置き換える textEdit を付ける（自前の本文の模型で数える）
 //!   "resolve_doc": "doc of {label}" }              // resolve で documentation を足す（{label} は候補の label）
 //! ```
+//!
+//! ホバー（`textDocument/hover`。#1681）は `--hover <file>` か `TAKO_LSP_FAKE_HOVER` の規則で答える。
+//! 形は定義ジャンプの規則と同じく**上から順に最初に当たった 1 つ**（`uri_suffix` / `line` で絞る）で、
+//! `result`（`Hover` をそのまま返す。`null` も可）/ `silent` / `crash` / `delay_ms`（答えるまでの待ち。
+//! 待つ間に `$/cancelRequest` が来たら -32800 で答える = 補完と同じ）/ `echo`（問われた位置の語を
+//! 自前の本文の模型で引き、`**<語>**` の Markdown とその語の範囲を返す = 位置の往復を見る）を持つ。
+//! 当たる規則が無ければ `null`（= 表示するものが無い）で答える。
 //!
 //! ## 本文の模型（#1769）
 //!
@@ -454,6 +462,11 @@ fn main() {
             .unwrap_or(serde_json::Value::Null);
     let waiting: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         Default::default();
+    // #1681: ホバーの規則
+    let hover_rules: Vec<serde_json::Value> = arg_or_env(&args, "--hover", "TAKO_LSP_FAKE_HOVER")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
     let doc_log = arg_or_env(&args, "--doc-log", "TAKO_LSP_FAKE_DOC_LOG");
     let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     append(&spawns, &std::process::id().to_string());
@@ -544,6 +557,9 @@ fn main() {
                     if scenario != "no-range-format" {
                         capabilities["documentRangeFormattingProvider"] = serde_json::json!(true);
                     }
+                }
+                if scenario != "no-hover" {
+                    capabilities["hoverProvider"] = serde_json::json!(true);
                 }
                 if scenario != "no-completion" {
                     capabilities["completionProvider"] = serde_json::json!({
@@ -731,6 +747,54 @@ fn main() {
             ("textDocument/completion", Some(id)) => {
                 let result = completion_items(&completion, &docs, breaks, &message["params"]);
                 let delay = completion["delay_ms"].as_u64().unwrap_or(0);
+                if delay == 0 {
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                    continue;
+                }
+                let key = id.to_string();
+                waiting.lock().unwrap().insert(key.clone());
+                let (out, waiting) = (out.clone(), waiting.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    if waiting.lock().unwrap().remove(&key) {
+                        out.send(
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        );
+                    }
+                });
+            }
+            // #1681: ホバー。`delay_ms` のあいだに取り消されたら -32800 で答える（補完と同じ作法）
+            ("textDocument/hover", Some(id)) => {
+                let params = &message["params"];
+                let Some(rule) = goto_rule(&hover_rules, "textDocument/hover", params) else {
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+                    continue;
+                };
+                if rule["crash"].as_bool() == Some(true) {
+                    std::process::exit(6);
+                }
+                if rule["silent"].as_bool() == Some(true) {
+                    continue;
+                }
+                let result = if rule["echo"].as_bool() == Some(true) {
+                    let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                    let text = docs.get(uri).cloned().unwrap_or_default();
+                    let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
+                    let character = params["position"]["character"].as_u64().unwrap_or(0) as usize;
+                    let offset = offset_at(&text, breaks, line, character);
+                    match word_at(&text, offset) {
+                        Some((a, b)) => serde_json::json!({
+                            "contents": { "kind": "markdown", "value": format!("**{}**", &text[a..b]) },
+                            "range": range_json(&text, breaks, a, b),
+                        }),
+                        None => serde_json::Value::Null,
+                    }
+                } else {
+                    rule.get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                };
+                let delay = rule["delay_ms"].as_u64().unwrap_or(0);
                 if delay == 0 {
                     out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
                     continue;

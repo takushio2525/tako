@@ -74,7 +74,10 @@ actions!(
         // #1683: 編集中のコードを整形する（割当と理由は `format_bindings`）。
         // 範囲の整形はメニューとパレットから（キーは張らない = 既存の打鍵を奪わない）
         FormatDocument,
-        FormatSelection
+        FormatSelection,
+        // #1681: カーソル位置のホバー情報（型・doc のカード）。キーは張らない（⌘K は使用中で
+        // VS Code / Zed の ⌘K ⌘I が張れない = 既存の打鍵を奪わない）。編集メニューとパレットから
+        ShowHover
     ]
 );
 

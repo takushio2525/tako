@@ -3783,6 +3783,11 @@ impl TakoApp {
                                     return;
                                 }
                             }
+                            // #1681: 本文を押したらホバーのカードを閉じる（カードの上の押下は
+                            // カードが取る = occlude なのでここへは来ない）
+                            if this.lsp_hover.card.is_some() {
+                                this.close_lsp_hover();
+                            }
                             // 修飾 + クリック: コードの識別子の定義へ飛ぶ（#1680）。識別子の上で
                             // なければ下の選択へ落ちる（修飾なしのクリックはこの枝に入らない）
                             if crate::keybindings::link_modifier_active(&ev.modifiers)

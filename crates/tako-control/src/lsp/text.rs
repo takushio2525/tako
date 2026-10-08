@@ -381,3 +381,53 @@ pub const COMPLETION_TRUNCATED_NEXT_STEP: Note = Note::new(
 
 /// 機能の呼び名（「能力に無い」の文へ差し込む）
 pub const COMPLETION_LABEL: Note = Note::new("補完", "completion");
+
+// --- ホバー（#1681）-------------------------------------------------------------
+// 失敗の多く（未導入・未応答・落ちた…）は定義ジャンプと同じ言語サーバの状態なので、上の
+// GOTO_* の文をそのまま使う。ホバーに固有なのは「能力に無い」「置き換わった」「文書が開いていない」
+// 「何も無い」「本文を切った」の 5 つだけ
+
+/// 能力にホバーが無い。`{server}`
+pub const HOVER_UNSUPPORTED_REASON: Note = Note::new(
+    "{server} はホバーに対応していない",
+    "{server} does not support hover",
+);
+
+/// マウスの要求が次の要求に置き換わった（GUI の内側でだけ起きる）
+pub const HOVER_SUPERSEDED_REASON: Note = Note::new(
+    "次のホバーに置き換わったので取り消した",
+    "Cancelled because a newer hover request replaced it",
+);
+
+/// マウスのホバーは開いていない文書でサーバを起こさない（FR-3.28 の「編集モードで起こす」）
+pub const HOVER_NOT_OPEN_REASON: Note = Note::new(
+    "この文書は言語サーバにつながっていない（マウスのホバーではサーバを起こさない）",
+    "This document is not connected to a language server (mouse hover does not start one)",
+);
+
+/// 文書が開いていないときの次の一手
+pub const HOVER_NOT_OPEN_NEXT_STEP: Note = Note::new(
+    "編集モードに入るか、tako lsp hover で位置を指定して問い合わせる",
+    "Enter edit mode, or ask with tako lsp hover at a position",
+);
+
+/// 表示するものが無い（サーバは答えた）
+pub const HOVER_NONE_REASON: Note = Note::new(
+    "この位置に表示できる情報が無い（言語サーバが空で答えた）",
+    "Nothing to show at this position (the server returned an empty hover)",
+);
+
+/// 何も無いときの次の一手
+pub const HOVER_NONE_NEXT_STEP: Note = Note::new(
+    "識別子の上で試す（空白・コメント・文字列の中では情報が無いことがある）",
+    "Try on an identifier (whitespace, comments and strings may have none)",
+);
+
+/// 本文を上限で切った。`{total}` = 切る前の文字数・`{limit}` = 上限
+pub const HOVER_TRUNCATED_NOTE: Note = Note::new(
+    "全 {total} 字のうち先頭 {limit} 字まで",
+    "First {limit} of {total} characters",
+);
+
+/// 機能の呼び名（「能力に無い」の文へ差し込む）
+pub const HOVER_LABEL: Note = Note::new("ホバー", "hover");

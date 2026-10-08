@@ -58,6 +58,7 @@ use super::completion::{CompletionAnswer, CompletionError, CompletionRequest};
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
 use super::format::{FormatAnswer, FormatError, FormatRequest};
 use super::goto::{GotoAnswer, GotoError, GotoRequest};
+use super::hover::{HoverAnswer, HoverError, HoverRequest};
 use super::menu::{MenuCapabilities, MenuRequest};
 use super::rpc::RequestId;
 use super::server::{Handlers, RpcError, ServerProcess};
@@ -275,6 +276,8 @@ struct Inner {
     /// 次の要求が来たら前の 1 つを `$/cancelRequest` で捨てる
     completion_lane: Inflight,
     resolve_lane: Inflight,
+    /// マウスのホバー（#1681）。補完と同じく生きている要求は 1 つだけ
+    hover_lane: Inflight,
     /// 次に配る列の番号
     next_ticket: u64,
 }
@@ -286,6 +289,8 @@ enum Lane {
     Completion,
     /// 選んだ候補の説明（`completionItem/resolve`）
     Resolve,
+    /// マウスのホバー（`textDocument/hover`。#1681）
+    Hover,
 }
 
 /// 列の「いま生きている 1 つ」（#1682）
@@ -302,6 +307,7 @@ impl Inner {
         match lane {
             Lane::Completion => &mut self.completion_lane,
             Lane::Resolve => &mut self.resolve_lane,
+            Lane::Hover => &mut self.hover_lane,
         }
     }
 }
@@ -623,6 +629,38 @@ impl LspManager {
             Some(shared) => shared.format(request),
             None => Err(FormatError::Lsp(GotoError::Disabled)),
         }
+    }
+
+    /// ホバーの問い合わせ（#1681）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
+    /// 上限は `request.timeout`）。
+    ///
+    /// `request.superseding`（GUI のマウス）の要求は、次の `superseding` の要求が来た時点で
+    /// `$/cancelRequest` を送って捨て、待っていた側は [`HoverError::Superseded`] で返る
+    /// （なぞったあとの古い要求の答えを待たない）。`request.open` が偽（マウス）なら、文書が
+    /// 開いていなければ問い合わせずに [`HoverError::NotOpen`]（乗せただけでサーバを起こさない）。
+    /// 真（CLI / MCP・メニュー）なら定義ジャンプと同じく問い合わせのあいだだけ `didOpen` する
+    pub fn hover(&self, request: &HoverRequest) -> Result<HoverAnswer, HoverError> {
+        match &self.shared {
+            Some(shared) => shared.hover(request),
+            None => Err(GotoError::Disabled.into()),
+        }
+    }
+
+    /// 待っているマウスのホバーを捨てる（カードを閉じた・識別子から外れた。#1681）
+    pub fn cancel_hover(&self) {
+        if let Some(shared) = &self.shared {
+            shared.supersede(Lane::Hover);
+        }
+    }
+
+    /// この文書が言語サーバにつながっているか（#1681。マウスのホバーの入口が、サーバを
+    /// 起こさない文書で背景の問い合わせを立てないために見る。ロックを短く取るだけ）
+    pub fn has_document(&self, path: &Path) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        let uri = tako_core::file_uri::from_path(path);
+        shared.lock().docs.contains_key(&uri)
     }
 
     /// 補完の問い合わせ（#1682）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
@@ -2276,6 +2314,94 @@ impl Shared {
     }
 }
 
+// --- ホバー（#1681）-------------------------------------------------------------
+
+impl Shared {
+    fn hover(&self, request: &HoverRequest) -> Result<HoverAnswer, HoverError> {
+        use tako_core::lsp::hover as hv;
+        let deadline = Instant::now() + request.timeout;
+        // マウスの要求は列の前の 1 つを取り消してから（最新の 1 つだけを生かす。補完と同じ）
+        let lane = request
+            .superseding
+            .then(|| (Lane::Hover, self.supersede(Lane::Hover)));
+        let superseded = || lane.is_some_and(|(lane, ticket)| !self.is_current(lane, ticket));
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(GotoError::NoServer.into());
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        // マウスは開いている文書に持ち手として加わるだけ（乗せただけでサーバを起こさない =
+        // 設計書 §16-2）。明示の問い合わせは定義ジャンプ・整形・補完と同じ 1 本で開く
+        let _held = if request.open {
+            self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?
+        } else {
+            Some(self.join(&uri).ok_or(HoverError::NotOpen)?)
+        };
+        let ready = self.wait_ready(&uri, spec, request.timeout, deadline, &superseded);
+        if superseded() {
+            return Err(HoverError::Superseded);
+        }
+        let (process, capabilities, key) = ready?;
+        if !hv::server_supports(&capabilities) {
+            return Err(GotoError::Unsupported { server: spec.id }.into());
+        }
+        loop {
+            // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す（#1769）
+            let at = {
+                let inner = self.lock();
+                let Some(doc) = inner.docs.get(&uri) else {
+                    return Err(GotoError::Closed.into());
+                };
+                position::lsp_position_of_line_col(&doc.text, request.line, request.column)
+            };
+            let params = json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": at.0, "character": at.1 },
+            });
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            let answer =
+                match self.request_in_lane(lane, &process, "textDocument/hover", params, remaining)
+                {
+                    Ok(answer) => answer,
+                    Err(RpcError::Cancelled) => return Err(HoverError::Superseded),
+                    Err(e) => return Err(rpc_failure(spec, request.timeout, e).into()),
+                };
+            let content = hv::parse_response(&answer);
+            // 空の答え: 読み込み中のサーバ（rust-analyzer）なら済むのを待って問い直す（#1680 と同じ）。
+            // マウスの要求は待たない（次に乗せたときに問い直す。読み込みが済むまでカードは出ない）
+            if content.is_none() && !request.superseding {
+                match self.wait_loaded(&key, deadline) {
+                    super::goto::Loading::Retry => continue,
+                    super::goto::Loading::Settled => {}
+                    super::goto::Loading::TimedOut => {
+                        return Err(GotoError::Timeout {
+                            server: spec.id,
+                            secs: request.timeout.as_secs(),
+                            starting: true,
+                        }
+                        .into())
+                    }
+                }
+            }
+            // 範囲の写しは写しの全文が要る（ロックの中で写し取り、変換は外で = 打鍵の同期を待たせない）
+            let range = match content.as_ref().and_then(|c| c.range) {
+                Some(range) => {
+                    let text = self.lock().docs.get(&uri).map(|d| d.text.clone());
+                    text.map(|text| hv::locate_range(range, &text))
+                }
+                None => None,
+            };
+            return Ok(HoverAnswer {
+                server: spec.id,
+                content,
+                range,
+            });
+        }
+    }
+}
+
 /// 要求の失敗を言語サーバの状態の失敗へ（定義ジャンプと補完が共有する）
 fn rpc_failure(spec: &'static ServerSpec, timeout: Duration, error: RpcError) -> GotoError {
     match error {
@@ -2479,14 +2605,15 @@ fn stop_process(process: &ServerProcess, timeout: Duration) {
 }
 
 /// クライアントの能力。**実際に使うものだけ**を申告する（使わない能力を申告すると
-/// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種を足した
+/// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種、
+/// #1683 が整形、#1682 が補完、#1681 がホバーを足した
 fn initialize_params(root_uri: &str, root_name: &str) -> Value {
     use lsp_types::{
         ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
         CompletionItemCapabilityResolveSupport, CompletionItemTag, CompletionListCapability,
         DocumentFormattingClientCapabilities, DocumentRangeFormattingClientCapabilities,
-        GeneralClientCapabilities, GotoCapability, InitializeParams, MarkupKind,
-        PositionEncodingKind, PublishDiagnosticsClientCapabilities, TagSupport,
+        GeneralClientCapabilities, GotoCapability, HoverClientCapabilities, InitializeParams,
+        MarkupKind, PositionEncodingKind, PublishDiagnosticsClientCapabilities, TagSupport,
         TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri, WorkspaceFolder,
     };
     // #1680: 定義ジャンプの 4 種。`LocationLink` を受けられる（識別子の範囲へ正確に着地する）
@@ -2536,6 +2663,11 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
                 }),
                 range_formatting: Some(DocumentRangeFormattingClientCapabilities {
                     dynamic_registration: Some(false),
+                }),
+                // #1681: ホバー。Markdown を先に（カードは `render_block` で描く）。平文も受ける
+                hover: Some(HoverClientCapabilities {
+                    dynamic_registration: Some(false),
+                    content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                 }),
                 // #1682: 補完。スニペットは申告しない（跳び先の編集を持たない = 平文で入れる）。
                 // 長い説明（documentation）だけを後から resolve で補う。型の要約（detail）と
@@ -2639,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形と補完だけ() {
+    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形と補完とホバーだけ() {
         let params = initialize_params("file:///w", "w");
         assert_eq!(
             params["capabilities"]["general"]["positionEncodings"],
@@ -2655,6 +2787,7 @@ mod tests {
                 "declaration",
                 "definition",
                 "formatting",
+                "hover",
                 "implementation",
                 "publishDiagnostics",
                 "rangeFormatting",
@@ -2677,6 +2810,11 @@ mod tests {
         assert_eq!(
             params["capabilities"]["textDocument"]["definition"]["linkSupport"],
             json!(true)
+        );
+        // #1681: ホバーは Markdown を先に申告する（平文より Markdown を返させる）
+        assert_eq!(
+            params["capabilities"]["textDocument"]["hover"]["contentFormat"],
+            json!(["markdown", "plaintext"])
         );
         assert_eq!(params["rootUri"], json!("file:///w"));
         assert_eq!(params["workspaceFolders"][0]["name"], json!("w"));
