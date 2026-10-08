@@ -1,0 +1,8 @@
+{
+  "name": "tako",
+  "version": "0.0.0",
+  "description": "tako terminal integration: reports this pane's Claude Code state (context, rate limits, turn) to tako",
+  "author": {
+    "name": "tako"
+  }
+}

@@ -6681,6 +6681,12 @@ fn dispatch_inner(
             crate::shell_integration::run(action.as_deref()).map_err(DispatchError::InvalidParams)
         }
 
+        Request::Mod {
+            action,
+            report,
+            pane,
+        } => crate::claude_mod::run(host, action.as_deref(), report, pane),
+
         Request::Lang { action, value } => {
             use tako_core::i18n::{self, LangSetting};
             let action = action.as_deref().unwrap_or("status");
@@ -18465,6 +18471,8 @@ mod tests {
         format_on_save: bool,
         /// #1684: プレビューの選択（GUI の `preview_selections` の代役）
         selections: std::collections::HashMap<u64, crate::protocol::LineColRange>,
+        /// #1879: tako mod の状態（GUI の `claude_mod` の代役）
+        claude_mod: tako_core::claude_mod::ModHub,
     }
 
     impl MockHost {
@@ -18549,6 +18557,7 @@ mod tests {
                 lsp: None,
                 format_on_save: false,
                 selections: std::collections::HashMap::new(),
+                claude_mod: tako_core::claude_mod::ModHub::new(true),
             }
         }
 
@@ -19448,6 +19457,16 @@ mod tests {
         }
         fn set_lsp_format_on_save(&mut self, enabled: bool) -> Result<(), String> {
             self.format_on_save = enabled;
+            Ok(())
+        }
+        fn claude_mod(&self) -> Option<&tako_core::claude_mod::ModHub> {
+            Some(&self.claude_mod)
+        }
+        fn claude_mod_mut(&mut self) -> Option<&mut tako_core::claude_mod::ModHub> {
+            Some(&mut self.claude_mod)
+        }
+        fn set_claude_mod_enabled(&mut self, enabled: bool) -> Result<(), String> {
+            self.claude_mod.enabled = enabled;
             Ok(())
         }
     }
@@ -36929,6 +36948,149 @@ mod tests {
         assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    fn mod_report_body(turn: &str) -> Value {
+        json!({
+            "schema": 1, "mod_version": "t", "at": 1, "turn": turn,
+            "model": "claude-haiku-5-5",
+            "context": {"tokens": 59426, "window": 1000000, "percent": 6},
+            "rate_limits": [{"kind": "five_hour", "percent_used": 3, "observed_at": 1}],
+            "ended": false,
+        })
+    }
+
+    fn mod_request(action: &str, report: Option<Value>, pane: Option<u64>) -> Request {
+        Request::Mod {
+            action: Some(action.into()),
+            report,
+            pane,
+        }
+    }
+
+    /// #1879: mod の報告はそのペインの行に載り、`ended` で即座に消える
+    #[test]
+    fn modの報告はペインの行に載りendedで消える() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(mod_report_body("permission")), Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["accepted"], "stored");
+        assert_eq!(out["pane"], pane);
+        let status = dispatch(
+            &mut host,
+            Request::Mod {
+                action: None,
+                report: None,
+                pane: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let row = &status["panes"][0];
+        assert_eq!(row["state"], "reporting", "{status}");
+        assert_eq!(row["report"]["turn"], "permission");
+        assert_eq!(row["report"]["context"]["percent"], 6);
+        assert_eq!(status["summary"]["reporting"], 1);
+
+        let mut ended = mod_report_body("idle");
+        ended["ended"] = json!(true);
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(ended), Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["accepted"], "ended");
+        assert!(host.claude_mod.reports.is_empty());
+    }
+
+    /// #1879: tako の再起動をまたいで生き残った claude は古い TAKO_PANE_ID で報告してくる
+    /// （#210 の旧 ID → 新 ID の対応で読み替える）。知らない ID は断る
+    #[test]
+    fn modの報告は旧pane_idを読み替え知らないidは断る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.stale_pane_map
+            .insert(PaneId::from_raw(99_999), PaneId::from_raw(pane));
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(mod_report_body("busy")), Some(99_999)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["pane"], pane);
+        let err = dispatch(
+            &mut host,
+            mod_request("report", Some(mod_report_body("busy")), Some(12_345)),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::PaneNotFound(12_345)), "{err}");
+        let err = dispatch(
+            &mut host,
+            mod_request("report", Some(mod_report_body("busy")), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::NoTargetPane), "{err}");
+    }
+
+    /// #1879: 形の違う報告は黙って誤読せずに断る
+    #[test]
+    fn modの形の違う報告は断る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let mut bad = mod_report_body("busy");
+        bad["schema"] = json!(2);
+        for report in [Some(bad), None, Some(json!({"schema": 1}))] {
+            let err = dispatch(
+                &mut host,
+                mod_request("report", report, Some(pane)),
+                PaneOrigin::Cli,
+            )
+            .unwrap_err();
+            assert!(matches!(err, DispatchError::InvalidParams(_)), "{err}");
+        }
+        assert!(host.claude_mod.reports.is_empty());
+        let err =
+            dispatch(&mut host, mod_request("bogus", None, None), PaneOrigin::Cli).unwrap_err();
+        assert!(
+            err.to_string().contains("status / on / off / report"),
+            "{err}"
+        );
+    }
+
+    /// #1879: on / off は設定を切り替え、注入しない理由が status に出る
+    #[test]
+    fn modのon_offは設定を切り替え理由を出す() {
+        let mut host = MockHost::new();
+        host.claude_mod.plugin_dir = Some("/d/claude-mod/tako".into());
+        host.claude_mod.cli = Some("/a/tako".into());
+        host.claude_mod.claude_version = Some("2.1.294".into());
+        let out = dispatch(&mut host, mod_request("off", None, None), PaneOrigin::Cli).unwrap();
+        assert_eq!(out["enabled"], false);
+        assert_eq!(out["injecting"], false);
+        assert_eq!(out["reason"]["code"], "disabled");
+        assert!(out["applies_to"].as_str().is_some());
+        let out = dispatch(&mut host, mod_request("on", None, None), PaneOrigin::Cli).unwrap();
+        assert_eq!(out["enabled"], true);
+        assert_eq!(out["injecting"], !tako_core::claude_mod::ab_off());
+        host.claude_mod.claude_version = Some("2.1.280".into());
+        let out = dispatch(
+            &mut host,
+            mod_request("status", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        if !tako_core::claude_mod::ab_off() {
+            assert_eq!(out["reason"]["code"], "claude_too_old", "{out}");
+        }
+        assert_eq!(out["min_claude_version"], "2.1.294");
     }
 
     /// `tako lsp format-on-save [on|off]` は既定 OFF を返し、切り替えた値と適用の範囲の注記を返す。

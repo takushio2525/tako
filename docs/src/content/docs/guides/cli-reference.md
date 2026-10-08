@@ -1,12 +1,12 @@
 ---
 title: CLI リファレンス
 seoTitle: tako CLI リファレンス — コマンドの逆引き一覧
-description: tako コマンド全 88 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 89 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **88 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **89 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -23,7 +23,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 88 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 89 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -150,6 +150,7 @@ tako orchestrator spawn --help
 | [`check-health`](#その他) | 環境の健全性診断（`tako setup --check` と同じ項目を JSON でも返す） |
 | [`agent-support`](#tako-agent-support) | エージェント系統ごとの能力差 |
 | [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置（`tako setup` が自動で通る） |
+| [`mod`](#その他) | tako mod（Claude Code の mod 連携）の状態と切替。ペインの claude から ctx・使用制限・ターンの報告が届いているかを見る |
 | [`context-budget`](#その他) | 起動時ロードの予算の確認と作業ログの自動移送 |
 | [`test-residue`](#その他) | テスト・検証が残した一時 dir の掃除 |
 | [`fda`](#その他) | フルディスクアクセスの状態確認 |
@@ -1563,6 +1564,10 @@ tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・
 tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
 tako shell-integration install   # 配置する（tako setup が自分で通るので普段は不要）
 tako shell-integration uninstall # 配置を取り除く（書き足したブロックだけを消す）
+
+tako mod                     # tako mod（Claude Code の mod）の状態。ペインごとの ctx・使用制限・ターンの報告と、届かない理由
+tako mod off                 # 次に作るペインから mod を読ませない（動いている claude には効かない）
+tako mod on                  # 戻す（既定 ON。claude 2.1.294 以上のペインにだけ読ませる）
 
 tako context-budget          # 起動時ロードの予算の確認（何も書き換えない）
 tako context-budget fix      # 積もった作業ログを archive へ移送する

@@ -249,6 +249,8 @@ pub mod keys {
     pub const ACCOUNT_SWITCH: &str = "account_switch";
     /// spawn 時に系統を選べるか
     pub const AGENT_SELECT_AT_SPAWN: &str = "agent_select_at_spawn";
+    /// エージェントのプロセス内の拡張（Claude Code の mod）から状態を構造で受け取る（#1879）
+    pub const CLAUDE_MOD_STATE: &str = "claude_mod_state";
     /// thinking / reasoning effort の指定
     pub const EFFORT_CONTROL: &str = "effort_control";
     /// コンフリクト解消エージェントの起動
@@ -747,6 +749,22 @@ pub const MATRIX: &[AgentFeature] = &[
             "orchestrator/agent.rs の WorkerAgent が spawn 引数・プロファイルの両方から \
              解決され、build_worker_cmd_in が 3 系統ぶんのコマンドを組む。\
              ペイン単位・タスク単位の切替導線は #988",
+        ),
+    },
+    AgentFeature {
+        key: keys::CLAUDE_MOD_STATE,
+        summary: Note::new(
+            "エージェントの中で動く拡張（tako mod）から ctx・使用制限・ターン・権限待ちを構造で受け取る",
+            "Receives context, rate limits, turn and permission prompts as structured data from an extension running inside the agent (tako mod)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1885),
+        agy: pending(notes::NOT_INVESTIGATED, 1885),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1879: Claude Code 2.1.294 の mod を env CLAUDE_CODE_PLUGIN_DIRS で注入し、\
+             隔離 GUI の直接ペインと tmux ペインの両方で tako mod report が届いて tako mod の行に \
+             ctx・使用制限・turn・model が載った（scripts/test-claude-mod-1879.sh）",
         ),
     },
     AgentFeature {

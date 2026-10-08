@@ -43,6 +43,7 @@ tako_lsp
 tako_lsp_server
 tako_menu
 tako_migrate
+tako_mod
 tako_move_pane_to_tab
 tako_open_dir
 tako_open_file

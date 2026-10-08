@@ -228,6 +228,61 @@ fn extract_version_via_cli(binary: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 子プロセスを起こさずに claude の版を読む（#1879。tako mod の注入判定の控え）。
+///
+/// PATH の走査と `~/.local/bin/claude`（ネイティブインストーラの既定の置き場。Finder から
+/// 起動した .app の PATH には入っていない）を stat し、symlink の先のパスから版を読むだけ。
+/// GUI の起動直後に復元するペインへも注入を効かせたいので、ここは UI スレッドで呼べる重さに保つ。
+/// 読めなければ `None`（[`bounded_claude_version`] を背景で回す）
+pub fn quick_claude_version() -> Option<String> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map(|dir| dir.join(CLAUDE_BIN))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(home) = tako_core::paths::home_dir() {
+        candidates.push(home.join(".local").join("bin").join(CLAUDE_BIN));
+    }
+    candidates
+        .iter()
+        .filter(|c| is_executable_file(c))
+        .find_map(|c| {
+            let real = tako_core::platform::path::canonicalize(c).ok()?;
+            version_from_segments(&path_segments(&real))
+        })
+}
+
+/// 上限つきで claude の版を判定する（#1879。[`quick_claude_version`] で読めないときに背景で 1 回）。
+///
+/// ランチャの探索（ログインシェルの `command -v`）と `claude --version` の起動はどちらも
+/// 上限を持つ経路（#1503）を通す。**background executor から呼ぶこと**
+pub fn bounded_claude_version() -> Option<String> {
+    if let Some(version) = quick_claude_version() {
+        return Some(version);
+    }
+    let found =
+        tako_core::platform::exe::find_with_timeout("claude", tako_core::probe::probe_timeout());
+    let launcher = PathBuf::from(found.path?);
+    let real = tako_core::platform::path::canonicalize(&launcher).unwrap_or(launcher);
+    if let Some(version) = version_from_segments(&path_segments(&real)) {
+        return Some(version);
+    }
+    if let Some(version) = tako_core::platform::exe::file_version(&real) {
+        return Some(version);
+    }
+    let program = real.to_string_lossy().to_string();
+    let output = crate::agent_probe::output_with_timeout(&program, &["--version"]).into_output()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    tako_core::claude_mod::parse_version(text.trim())
+        .map(|(major, minor, patch)| format!("{major}.{minor}.{patch}"))
+}
+
 /// 稼働中プロセスのバイナリパスを取得する。
 ///
 /// #936: 旧実装は macOS の `proc_pidpath` と Linux の `/proc/<pid>/exe` だけで、

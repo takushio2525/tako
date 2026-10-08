@@ -2913,6 +2913,23 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1879（FR-2.42）。report は載せない（AI が自分の状態を偽れるだけ）
+        json!({
+            "name": "tako_mod",
+            "description": "tako mod（Claude Code の mod）の状態と切替。action: status（既定。\
+                claude の版・注入の有無・ペインごとの報告 = ctx / 使用制限 / turn と鮮度・\
+                報告が無い理由）/ on / off（次に作るペインから効く）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": crate::claude_mod::MCP_ACTIONS,
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
         // 出自: #525 / #467
         json!({
             "name": "tako_shell_integration",

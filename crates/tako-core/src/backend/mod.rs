@@ -163,8 +163,13 @@ pub const BACKEND_SOCKET_ENV: &str = "TAKO_BACKEND_SOCKET";
 /// - **インスタンスごとに違う**（[`crate::shell_integration::INJECTED_KEYS`]）:
 ///   シェル統合の置き場（data dir 配下）。#1105 まで継承任せだったので、同じ socket 名に
 ///   別インスタンスのサーバーが残っていると OSC 7 / 133 が黙って届かなくなっていた
+/// - **設定で変わる**（[`crate::claude_mod::INJECTED_KEYS`]。#1879）: tako mod の展開先と CLI。
+///   `tako mod off` にしても、前に注入した値がサーバーのグローバル環境に残っていれば
+///   新しいペインへ漏れる
 pub fn session_pinned_env(key: &str) -> bool {
-    PANE_SCOPED_ENV.contains(&key) || crate::shell_integration::INJECTED_KEYS.contains(&key)
+    PANE_SCOPED_ENV.contains(&key)
+        || crate::shell_integration::INJECTED_KEYS.contains(&key)
+        || crate::claude_mod::INJECTED_KEYS.contains(&key)
 }
 
 /// 器のセッション作成時に `-e` で固定する `(key, value)` の一覧。
@@ -178,6 +183,10 @@ pub fn session_pinned_env(key: &str) -> bool {
 ///    env へ足す形なので、器の中のシェルへはサーバー継承でしか届いていなかった。
 ///    サーバーの環境は最初のクライアントからの継承なので、同じ socket 名に別
 ///    インスタンスのサーバーが残っていると前のインスタンスの置き場を指す（#1105）
+///
+/// 3. **tako mod の 2 変数**（#1879）。注入するときは呼び出し側が `options.env` に載せる。
+///    載っていなければ「注入しない」をここで固定する（利用者自身の plugin dir だけを残し、
+///    CLI は空）。サーバーのグローバル環境に前の値が残っていても新しいペインへ漏れない
 ///
 /// 衝突したら `options.env`（呼び出し側の明示）が勝つ
 pub fn session_pinned_pairs(
@@ -204,6 +213,15 @@ pub fn session_pinned_pairs(
             continue;
         }
         out.push((key.clone(), val.clone()));
+    }
+    // #1879: tako mod を注入しないペインは、注入しないことを固定する
+    let (inherited_dirs, _) = crate::claude_mod::inherited_env();
+    for (key, value) in
+        crate::claude_mod::neutral_pairs(inherited_dirs.as_deref(), crate::claude_mod::LIST_SEP)
+    {
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, value));
+        }
     }
     // #1105: 器の同一性は**名前を明示して**伝える（接頭辞の推測に頼らない）。
     // 値はソケットの basename（`$TMUX` が持つのもパスの basename なので揃う）
@@ -1100,6 +1118,42 @@ pub(crate) fn strip_verification_histfile_env(args: &mut Vec<String>) -> Vec<Str
     removed
 }
 
+/// tako mod の 2 変数（#1879）を `-e <key>=<value>` ごと取り出す。
+///
+/// 注入しないペインでも「注入しない」を固定するので常に載るが、`CLAUDE_CODE_PLUGIN_DIRS` の値は
+/// 利用者自身の plugin dir（テストを走らせたプロセスの env）に依るのでスナップショットに書けない。
+/// [`strip_integration_env`] と同じ作法で外し、外した値そのものを返す
+#[cfg(test)]
+pub(crate) fn strip_claude_mod_env(args: &mut Vec<String>) -> Vec<String> {
+    let mut removed = Vec::new();
+    for key in crate::claude_mod::INJECTED_KEYS {
+        let Some(at) = args
+            .iter()
+            .position(|a| a.starts_with(&format!("{key}=")))
+            .filter(|at| *at > 0 && args[at - 1] == "-e")
+        else {
+            continue;
+        };
+        removed.push(args.remove(at));
+        args.remove(at - 1);
+    }
+    removed.sort();
+    removed
+}
+
+/// 注入しないペインで [`strip_claude_mod_env`] が取り出すはずの値（テスト用）
+#[cfg(test)]
+pub(crate) fn expected_neutral_claude_mod_env() -> Vec<String> {
+    let (inherited, _) = crate::claude_mod::inherited_env();
+    let mut out: Vec<String> =
+        crate::claude_mod::neutral_pairs(inherited.as_deref(), crate::claude_mod::LIST_SEP)
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod pane_scoped_env_tests {
     use super::*;
@@ -1196,6 +1250,51 @@ mod pane_scoped_env_tests {
                 "{key} が INJECTED_KEYS に無い（統合が撒くキーを増やしたら表も足す）"
             );
         }
+    }
+
+    /// #1879: tako mod の 2 変数は常にセッション作成時に固定される。
+    /// 注入するペインは呼び出し側の値、しないペインは「注入しない」（CLI は空・tako の mod を
+    /// 含まない一覧）。固定しないと、前に注入した値がサーバーのグローバル環境に残っていたとき
+    /// `tako mod off` や A/B の新しいペインへ漏れる
+    #[test]
+    fn modの2変数は常に固定され明示が勝つ() {
+        for key in crate::claude_mod::INJECTED_KEYS {
+            assert!(session_pinned_env(key), "{key} が固定対象から外れている");
+        }
+        let off = session_pinned_pairs(&[], "tako-unit");
+        let value = |pinned: &[(String, String)], key: &str| {
+            pinned
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(value(&off, crate::claude_mod::CLI_ENV), vec![String::new()]);
+        let dirs = value(&off, crate::claude_mod::PLUGIN_DIRS_ENV);
+        assert_eq!(dirs.len(), 1);
+        assert!(
+            !dirs[0].contains("claude-mod"),
+            "注入しないペインへ tako の mod が漏れる: {dirs:?}"
+        );
+        let on = vec![
+            (
+                crate::claude_mod::PLUGIN_DIRS_ENV.to_string(),
+                "/d/claude-mod/tako".to_string(),
+            ),
+            (
+                crate::claude_mod::CLI_ENV.to_string(),
+                "/a/tako".to_string(),
+            ),
+        ];
+        let pinned = session_pinned_pairs(&on, "tako-unit");
+        assert_eq!(
+            value(&pinned, crate::claude_mod::PLUGIN_DIRS_ENV),
+            vec!["/d/claude-mod/tako".to_string()]
+        );
+        assert_eq!(
+            value(&pinned, crate::claude_mod::CLI_ENV),
+            vec!["/a/tako".to_string()]
+        );
     }
 
     /// 呼び出し側の明示（`options.env`）が統合の既定に勝つ

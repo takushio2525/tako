@@ -973,6 +973,22 @@ pub(super) fn build_request(
             message: str_arg(args, "message")?.map(|s| s.to_string()),
             no_push: bool_arg(args, "no_push")?.unwrap_or(false),
         },
+        "tako_mod" => {
+            let action = str_arg(args, "action")?;
+            if let Some(a) = &action {
+                if !crate::claude_mod::MCP_ACTIONS.contains(&a.as_str()) {
+                    return Err(format!(
+                        "action は {} のどれか（report は MCP に無い）",
+                        crate::claude_mod::MCP_ACTIONS.join(" / ")
+                    ));
+                }
+            }
+            Request::Mod {
+                action,
+                report: None,
+                pane: None,
+            }
+        }
         "tako_shell_integration" => Request::ShellIntegration {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },

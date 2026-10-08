@@ -45,6 +45,12 @@ pub struct Settings {
     /// 要らない（`Settings` の指紋は動くが、読み書きは後方互換）
     #[serde(default)]
     pub lsp_format_on_save: bool,
+    /// tako mod（FR-2.42 / Issue #1879。既定 ON）: 新しく作るペインへ Claude Code の mod を
+    /// 読ませる（env `CLAUDE_CODE_PLUGIN_DIRS`）。OFF にしても動いている claude には効かない。
+    /// **旧ファイルはキーが無くても true で読める**（`default_true`）ので移行 Step は要らない
+    /// （`Settings` の指紋は動くが、読み書きは後方互換）
+    #[serde(default = "default_true")]
+    pub claude_mod: bool,
     /// PDF・画像・動画サムネのデコード済み画像キャッシュ上限（Issue #258。MiB）
     #[serde(default = "default_preview_cache_max_mb")]
     pub preview_cache_max_mb: u64,
@@ -201,6 +207,7 @@ impl Default for Settings {
             autosuggest_tab: true,
             preview_live_reload: true,
             lsp_format_on_save: false,
+            claude_mod: true,
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
@@ -636,6 +643,7 @@ mod tests {
             autosuggest_tab: false,
             preview_live_reload: false,
             lsp_format_on_save: true,
+            claude_mod: false,
             preview_cache_max_mb: 768,
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
@@ -701,6 +709,10 @@ mod tests {
         // 移行 Step 不要。指紋テストの更新理由がこれ）
         assert!(!parsed.lsp_format_on_save);
         assert!(!Settings::default().lsp_format_on_save);
+        // #1879: tako mod は既定 ON（旧ファイル = キー無しでも true = 移行 Step 不要。
+        // 指紋テストの更新理由がこれ）
+        assert!(parsed.claude_mod);
+        assert!(Settings::default().claude_mod);
         assert_eq!(parsed.preview_cache_max_mb, 512);
         assert!(parsed.tmux_persist);
         assert_eq!(

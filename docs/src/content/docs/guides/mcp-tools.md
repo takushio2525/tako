@@ -1,10 +1,10 @@
 ---
 title: MCP ツール一覧
 seoTitle: MCP ツール一覧 — AI エージェントがターミナルを操作するためのツール
-description: tako が AI エージェントに公開する 159 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 160 個の MCP ツールの全リスト
 ---
 
-tako は **159 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **160 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -238,6 +238,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_setup_models` | エージェント CLI が使えるモデル一覧の実取得（モデルを勧める前に引く） |
 | `tako_agent_support` | agent 能力マトリクスの参照（系統ごとに使える / 縮退 / 未実装） |
 | `tako_shell_integration` | シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除 |
+| `tako_mod` | tako mod（Claude Code の mod）の状態と切替（ペインごとの ctx・使用制限・ターンの報告） |
 | `tako_migrate` | 設定・データファイルの形式の確認と自動マイグレーションの手動発火 |
 | `tako_check_health` | tako 環境の健全性を診断する |
 | `tako_platform` | プラットフォーム対応マトリクスの参照（使える / 縮退 / 未実装） |

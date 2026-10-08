@@ -36,6 +36,7 @@ pub mod agents;
 pub mod agents_sync;
 pub mod agy_session;
 pub mod claude_ctx;
+pub mod claude_mod;
 pub mod claude_remote;
 pub mod claude_remote_link;
 pub mod claude_session;

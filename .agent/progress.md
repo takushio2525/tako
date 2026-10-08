@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-30（#1857: tmux の attach クライアントだけが外から終わってもペインを閉じず再 attach するようにした）
-- Exited で器へ生死を聞き（`list-clients`・上限 3 秒・background）、生きていて他のクライアントが居なければ attach 専用（`attach-session`）で同じペインを張り替える。60 秒に 5 回で止まり、閉じずにチップ + 画面 2 行。persist.log に 1 行・状態は list / read の `backend_reattach`・手動は `tako persist reattach` / MCP `tako_persist` の `reattach`（カタログ +204 B）
-- 実測: `scripts/test-reattach-1857.sh` 30 PASS 0 FAIL（v0.8.25 は ① で FAILED = ペインが閉じる）・番犬の注入 5 通りすべて main.rs:行 で FAILED・A/B `TAKO_1857_LEGACY=1`
-
 ## 2026-10-02（#1853 / #1592: 安定版への昇格で Homebrew cask と docs の「最新の安定版」も動かすようにした）
 - `release.sh --promote` が夜間の素のタグ（prerelease を外して Latest）も受け付け、続けて tap の cask を公開アセットの sha256 で更新（PR → merge → tap の main を読み直し）、releases.md を `check-releases-page.mjs --set-stable` で書き換えた PR を `merge-pr.sh` で merge。後続の失敗は exit 4・打ち直しは同じコマンド。bash 3.2 の set -u + EXIT trap が exit 0 に化ける穴も塞いだ
 - 実測: `scripts/test-release-promote-1853.sh` 125 PASS（注入 9 通りすべて FAILED）・既存の retry 55 / nightly 129 緑・docs の build + 検査 6 本 rc=0。releases.md の安定版は v0.8.26 へ
@@ -67,3 +63,7 @@
 ## 2026-10-08（#1873: 閲覧中の ⌘F 検索を閉じたら描画へ戻し目次を作り直すようにした）
 - 開閉を `open_preview_search_bar` / `close_preview_search_bar` の 1 実装へ寄せ（Escape・⌘F のトグル・CLI / MCP）、閲覧中に描画から開いた検索なら #1661 の `restore_rendered_preview` で戻してセッションも畳む（code へ落ちていたときだけ描き直す）。CLI `tako edit search --open|--close` / MCP `tako_preview_search` の `visible`（ツールは増やさない）。A/B `TAKO_1873_LEGACY=1`
 - 実測: 修正前の main は Escape 後 mode=code・目次 0 件（visual 節）。`scripts/test-md-find-restore-1873.sh` 43 PASS 0 FAIL・番犬の注入 8 通りを file:line で名指し
+
+## 2026-10-08（#1879: tako mod S1 = Claude Code の mod の同梱・展開・ペインへの注入と状態報告）
+- mod（`crates/tako-core/claude-mod/`）を `<data_dir>/claude-mod/tako/` へ展開し、claude 2.1.294 以上のペインの env（`CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_CLI`）で読ませる（設定ファイルは書かない・tmux は `-e` 固定）。mod は 1 秒 flush / 15 秒 heartbeat で `tako mod report` を叩き、GUI のメモリに 45 秒の鮮度で持つ。`tako mod [on|off]` / MCP `tako_mod`（report は載せない = FR-2.42.6）。組織アカウントで classic 系が mod へ届かないのを実測し、tool.call / tool.check で拾う形を足した（FR-2.42.7）
+- 実測: `scripts/test-claude-mod-1879.sh`（隔離 GUI・実 claude）全段 41 PASS 0 FAIL・`claude plugin test` 11 本（注入 3 通りで fail）・番犬 3 本（注入 9 通り名指し）・カタログ +421 B

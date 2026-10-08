@@ -503,6 +503,15 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // tako mod（#1879）: 同梱の mod を起動のたびに展開し直す（版はその端末の tako に揃う）
+    Entry {
+        root: Root::TakoData,
+        path: "claude-mod/",
+        class: Class::Local,
+        note: notes::GENERATED,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::TakoData,
         path: "setup/",

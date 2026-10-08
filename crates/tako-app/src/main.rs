@@ -870,6 +870,30 @@ fn initial_scrollback_lines() -> usize {
     tako_control::settings::load().resolved_scrollback_lines()
 }
 
+/// tako mod（FR-2.42 / #1879）の起動時の状態。
+///
+/// 展開（小さなファイル 5 本の比較・差し替え）と、子プロセスを起こさない版の判定は
+/// ここで済ませる = 起動直後に復元するペインから注入が効く。`claude --version` へ落ちる
+/// 判定だけは `TakoApp::new` が背景で 1 回回す。A/B（`TAKO_1877_NO_MOD=1`）では展開もしない
+/// （同一バイナリで旧挙動 = data dir に何も足さない）
+fn initial_claude_mod() -> tako_core::claude_mod::ModHub {
+    use tako_core::claude_mod;
+    let mut hub = claude_mod::ModHub::new(tako_control::settings::load().claude_mod);
+    hub.cli = tako_core::shell_integration::cli_dir()
+        .map(|dir| dir.join(tako_core::shell_integration::cli_file_name()));
+    if claude_mod::ab_off() {
+        return hub;
+    }
+    let installed = claude_mod::install();
+    match &installed {
+        Ok((dir, _)) => hub.plugin_dir = Some(dir.clone()),
+        Err(e) => eprintln!("warning: tako mod を展開できない（注入しない）: {e}"),
+    }
+    hub.install_result = Some(installed.map(|(_, outcome)| outcome));
+    hub.claude_version = tako_control::stale_binary::quick_claude_version();
+    hub
+}
+
 /// listen ポート検知（FR-2.4.4）の起動時の有効判定。
 /// セルフテストでは検知経路そのものを機械検証するため常に有効で始める
 fn initial_port_detect() -> bool {
@@ -1986,6 +2010,9 @@ struct TakoApp {
     lsp_completion: lsp_completion_ui::LspCompletionUi,
     /// ホバー（型・doc のカード）の GUI の状態（#1681）。問い合わせは manager、カードは 1 枚
     lsp_hover: lsp_hover_ui::LspHoverUi,
+    /// tako mod（FR-2.42 / #1879）: 展開先・claude の版の控え・ペインごとの注入と最終報告。
+    /// **メモリだけ**（永続化しない）。報告は dispatch の `tako mod report` が書き込む
+    claude_mod: tako_core::claude_mod::ModHub,
     /// タブ・ペイン名の AI 自動リネームの検知状態（FR-2.12。ループは new で張る）
     autorename: autorename::AutoRenamer,
     /// 自動命名した時刻（タブ ID → 命名時刻。#552 案 4）。命名直後だけタブに
@@ -4207,6 +4234,7 @@ impl TakoApp {
             lsp_format_on_save: tako_control::settings::load().lsp_format_on_save,
             lsp_completion: lsp_completion_ui::LspCompletionUi::default(),
             lsp_hover: lsp_hover_ui::LspHoverUi::default(),
+            claude_mod: initial_claude_mod(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
             port_detect: initial_port_detect(),
@@ -4488,6 +4516,23 @@ impl TakoApp {
         // #601: tako CLI の在り処を起動のたびに解決し直す。zip 展開先で起動していた人が
         // /Applications へ移した後でも、次に開くペインのシェルからは正しい実体が引ける
         tako_core::shell_integration::refresh_cli_dir();
+        // #1879: claude の版をパスから読めなかったときだけ、上限つきの判定を背景で 1 回回す
+        // （ログインシェルの `command -v` と `claude --version` を UI スレッドで待たない）。
+        // 結果は次に作るペインから効く
+        if app.claude_mod.claude_version.is_none() && !tako_core::claude_mod::ab_off() {
+            cx.spawn(async move |this, cx| {
+                let version = cx
+                    .background_executor()
+                    .spawn(async { tako_control::stale_binary::bounded_claude_version() })
+                    .await;
+                let _ = this.update(cx, |app: &mut TakoApp, _| {
+                    if app.claude_mod.claude_version.is_none() {
+                        app.claude_mod.claude_version = version;
+                    }
+                });
+            })
+            .detach();
+        }
         // #1502: 外側のターミナル向けに張った symlink も同じ理由で追従させる。
         // **切れているときだけ**張り直す（一度も設置していない人の $HOME は触らない）
         repair_tako_cli_link();
@@ -8436,6 +8481,12 @@ impl TakoApp {
         self.prompt_delivery_states.remove(&pane_id);
     }
 
+    /// tako mod の注入の記録と最終報告をペインごと落とす（#1879。**3 つの close 経路すべてから
+    /// 呼ぶ**）。残すと、ペイン ID が再利用されたとき前任の claude の ctx / 使用制限を名乗る
+    fn drop_claude_mod_state(&mut self, pane_id: PaneId) {
+        self.claude_mod.forget_pane(pane_id.as_u64());
+    }
+
     /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る。
     /// 制御プレーンの接続情報を環境変数で注入する（FR-2.1.1）。
     /// 失敗（fd 枯渇等での PTY 生成エラー）は Err で返す。ここで panic すると GPUI の
@@ -8478,6 +8529,17 @@ impl TakoApp {
                 options.env.push(("TAKO_TOKEN".into(), token.clone()));
             }
         }
+        // #1879: tako mod（Claude Code の mod）を読ませる env。判断は core の 1 実装
+        // （設定 / A/B / 展開 / CLI / claude の版）で、注入しないときも理由を控える
+        let injection = self.claude_mod.decide(tako_core::claude_mod::ab_off());
+        let (inherited_dirs, inherited_cli) = tako_core::claude_mod::inherited_env();
+        options.env.extend(tako_core::claude_mod::pane_env(
+            &injection,
+            inherited_dirs.as_deref(),
+            inherited_cli.as_deref(),
+            tako_core::claude_mod::LIST_SEP,
+        ));
+        self.claude_mod.record_spawn(pane_id.as_u64(), &injection);
         // 明示コマンドはログインシェル経由で実行する（.app の最小 PATH では
         // `tmux attach` や `npm` が直接 exec で見つからない。2026-06-12 リグレッション (7)）
         options.command = options.command.map(tako_core::login_shell_command);
@@ -9965,6 +10027,7 @@ impl TakoApp {
                 // #816: 可視性の申し送りは配送タスクと同じ寿命
                 self.pane_delivery.remove(&pane_id);
                 self.drop_prompt_delivery_state(pane_id);
+                self.drop_claude_mod_state(pane_id);
                 self.discard_ime_for_pane(pane_id);
                 self.drop_preview_pane_state(pane_id);
                 self.drop_pane_osc_sink(pane_id);
@@ -10068,6 +10131,7 @@ impl TakoApp {
                     self.terminals.remove(&id);
                     self.pane_delivery.remove(&id);
                     self.drop_prompt_delivery_state(id);
+                    self.drop_claude_mod_state(id);
                     // #826: タブ close もペイン close と同じ後始末を通す。
                     // ここが独自列挙のままだと、後から足したプレビュー状態
                     // （#821 の行レイアウト・#826 のブロック索引）がタブごと
@@ -15962,6 +16026,11 @@ impl TakoApp {
             return false;
         };
         self.stale_binary_scan = state;
+        // #1879: claude を入れ替えた（`claude update` 等）なら tako mod の版の控えも追従させる
+        // （次に作るペインの注入判定に効く）
+        if !current_version.is_empty() {
+            self.claude_mod.claude_version = Some(current_version.clone());
+        }
         let Some(current_path) = current_binary else {
             return false;
         };
@@ -22309,6 +22378,7 @@ impl SessionHost for TakoApp {
         self.terminals.remove(&pane);
         self.pane_delivery.remove(&pane);
         self.drop_prompt_delivery_state(pane);
+        self.drop_claude_mod_state(pane);
         self.discard_ime_for_pane(pane);
         // #821: GUI の close（`remove_pane_with`）と同じ一式を落とす。
         // ここが独自の列挙だった頃は、CLI / MCP で閉じたプレビューの
@@ -24643,6 +24713,27 @@ impl SystemHost for TakoApp {
 
     fn lsp_format_on_save(&self) -> bool {
         self.lsp_format_on_save
+    }
+
+    fn claude_mod(&self) -> Option<&tako_core::claude_mod::ModHub> {
+        Some(&self.claude_mod)
+    }
+
+    fn claude_mod_mut(&mut self) -> Option<&mut tako_core::claude_mod::ModHub> {
+        Some(&mut self.claude_mod)
+    }
+
+    /// tako mod の切替（#1879。`tako mod on|off`）。settings.json へ書き、次に作るペインから効く
+    fn set_claude_mod_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        // セルフテスト中はユーザー設定を汚さない（`set_lsp_format_on_save` と同じ）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.claude_mod = enabled;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定を保存できない: {e}"))?;
+        }
+        self.claude_mod.enabled = enabled;
+        Ok(())
     }
 
     /// 保存時整形の切替（#1683。`tako lsp format-on-save`・設定画面）。settings.json へ書く

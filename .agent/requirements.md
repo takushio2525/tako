@@ -1679,6 +1679,28 @@ codex / agy は理由つき skip）。自動解決へ回った行は #1499（Z5�
 #1502（Z10）/ #1509（Z6）/ #1506（Z11）/ #1503 / #1504（Z9）/ #1505（Z19）/ #1524 / #1507（Z17）が着地済みで、
 #1508 / #1510 が進行中。
 
+### FR-2.42 tako mod（Claude Code の mod 連携）の基盤（✅ 2026-10-08、#1879。エピック #1877 の S1）
+
+> tako が同梱する Claude Code の mod（プラグインの関数フック。2.1.287 以降）をペインの claude に
+> 読ませ、ctx・使用制限・ターンの状態を**構造で**受け取る。設計の正本は
+> `.agent/plans/2026-10-tako-mod.md`（通信路の比較 §2・置き場 §3・報告 §4・mod の規約 §5）。
+> S1 は「届くようにする」まで。届いた値を一次ソースに使う（S2）・Claude Code の画面に出す（S3）・
+> Claude Code から tako を操作する（S4）・チャット表示（S5）は後続のスライス。
+
+| ID | 要件 | 実装 |
+|---|---|---|
+| FR-2.42.1 | **同梱と展開**: mod のソースは `crates/tako-core/claude-mod/`（`shell-integration/` と同じ並び）。GUI 起動時と `tako setup` で `<data_dir>/claude-mod/tako/` へ展開する（冪等・中身が同じなら書かない・違えば一時 dir に書いてから差し替える）。**`.app` の中には置かない**（Claude Code が読むたびに `.claude-plugin/types/` を書くので署名済みの bundle が改変される） | `tako_core::claude_mod::install` / `tako_control::claude_mod::run_setup_stage`。`plugin.json` の版と `register.ts` の `MOD_VERSION` は展開時に tako の版へ揃える |
+| FR-2.42.2 | **注入はペインの env だけ**: 新しく作るペインに `CLAUDE_CODE_PLUGIN_DIRS`（展開先。既存値は上書きせず連結）と `TAKO_CLI`（実行中の tako CLI の絶対パス）を足す。**Claude Code の設定ファイルは 1 バイトも書かない**（tako の外の claude は mod を読まない）。tmux ペインはセッション作成時に `-e` で固定し（注入しないペインは「注入しない」を固定 = サーバーのグローバル環境に残った前の値が漏れない）、`update-environment` にも足す。app プロセスから起こす `claude -p`（自動リネーム等）には注入しない | 判断は `claude_mod::decide`、env は `claude_mod::pane_env` / `neutral_pairs` の 1 実装。直接ペインは `spawn_session`、tmux は `backend::session_pinned_pairs` |
+| FR-2.42.3 | **版の下限と止め方**: 下限は**実測した 2.1.294**（2.1.287〜2.1.293 は未実測。旧版に読ませると transcript に読み込み失敗の 1 行が出る）。版はパスから読む安い判定を起動時に、読めなければ上限つきの `claude --version` を背景で 1 回（以後は stale 検知の走査が追従）。未判定・下限未満なら注入しない。設定 `claude_mod`（settings.json。既定 true。旧ファイルはキーが無くても true で読める）と A/B の `TAKO_1877_NO_MOD=1`（同一バイナリで旧挙動。展開もしない） | `stale_binary::quick_claude_version` / `bounded_claude_version`。`tako mod on|off` は次に作るペインから効く |
+| FR-2.42.4 | **報告と鮮度**: mod は `tako mod report`（stdin の JSON。`schema: 1`）で ctx・使用制限・model・effort・turn（idle / busy / permission / question）・待っているツール名・直前のターンを送る。変化があれば最大 1 秒に 1 回、無くても 15 秒の heartbeat。tako は**GUI のメモリだけ**に持ち（永続化しない）、受け取りから 45 秒で失効・`session.end` で即座に捨てる・閉じたペインの分も捨てる。送り主は `TAKO_PANE_ID`（tako の再起動をまたいだ claude は #210 の旧 ID → 新 ID で読み替える。接続は CLI の control.json フォールバック = FR-2.2.9）。**会話の本文・プロンプト・ツールの引数は載せない**（未知のキーは serde が捨てる） | `tako_core::claude_mod::{ModReport, ModHub}`・`tako_control::claude_mod`。番犬 `issue1879_claude_mod_watchdog.rs` |
+| FR-2.42.5 | **状態を黙らずに出す**: `tako mod`（MCP `tako_mod`）は展開・claude の版・新しいペインへ注入するか（しないなら理由）と、ペインごとの行（`reporting` / `stale` / `no_report` / `not_injected` / `waiting`）を返す。claude が画面に居るのに報告が無いペインは理由（`--safe-mode` / `--bare` / `disableAllHooks` / 組織の `allowManagedModsOnly` / 注入前から動いていた claude）を出す | `claude_mod::status` |
+| FR-2.42.6 | **設計原則 5 の例外**: `report` は CLI だけで MCP に載せない。AI が叩くと**自分の状態を偽って注入できるだけ**で、AI にとっての等価物（読む側の `tako_mod` / `tako_orchestrator_self`）は別にあるため。`tako mod report` は `--help` の候補にも出さない（受け付けはする） | `claude_mod::MCP_ACTIONS`（status / on / off） |
+| FR-2.42.7 | **classic 系が届かない環境**: 2.1.294 の**組織アカウントでは `classic.*` が mod へ届かない**ことを実測した（`PreToolUse` / `PermissionRequest` / `Notification` を `on('*')` で観測して 1 つも来ない。関数フックの `tool.call` / `tool.check` / `turn.*` は届く。個人アカウントでは同じ版で 3 つとも届く）。effort は classic 系が運ぶので、この環境では欠ける。権限待ちは PermissionRequest（届けば正確）を正とし、届かないときは**ダイアログが確かに出るものだけ**を拾う: AskUserQuestion は `tool.call` の開始で `question`、ask ルールに当たった判定と ExitPlanMode は `tool.check` で `permission`。ルールの無い `ask` は auto モードの分類器が黙って通しうるので拾わない。どちらの環境かは報告の `classic_events` に載せる（S2 が画面と突き合わせる材料）。承認の瞬間を知らせるイベントは無いので、`permission` はそのツールが返るまで続く | `claude-mod/hooks/register.ts` |
+| FR-2.42.8 | **mod の作法**（設計書 §5）: すべての登録は `next(e)` へ流して `.catch(($, e, next) => next(e))` を付ける（判断を奪わない）・フックの中で CLI を待たない（1 秒の flush が叩く。`session.end` の最後の 1 回だけ待つ）・`TAKO_PANE_ID` か `TAKO_CLI` が無ければ休眠・失敗は debug ログだけ・サブエージェントのターンは数えない。`claude plugin validate` / `claude plugin test`（`tests/*.test.ts`）が通ること | 実経路 `scripts/test-claude-mod-1879.sh` の段 0 |
+
+対応状況: claude は Supported（`agent_support` の `claude_mod_state`）、codex / agy は同等の拡張点を未調査で Pending（#1885）。
+Windows は Pending（#1886。区切り `;` の連結は単体テスト済み、実機の Claude Code で読むかは未実測）。
+
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース
 
 | ID | 要件 | 優先度 |
