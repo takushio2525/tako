@@ -370,6 +370,7 @@ TerminalSession がシェルを spawn する際に注入する:
 | `TAKO_SOCKET` | IPC エンドポイント（macOS: Unix domain socket パス、Windows: named pipe 名） |
 | `TAKO_MCP_URL` | 内蔵 MCP サーバーの接続先（Layer2 自動発見用。**Phase 3 で注入開始**） |
 | `TAKO_TOKEN` | 接続認証トークン（セッション毎に生成。外部プロセスの接続拒否に使う） |
+| `CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_CLI` | tako mod（#1879。下の「Layer 3b」）の展開先と実行中の tako CLI。条件を満たすペインだけ |
 
 Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`（`SpawnOptions.env`）
 経由で注入済み（tako-app の `spawn_session`）。
@@ -533,6 +534,34 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
 - 検知結果は**提案チップ**（「localhost:5173 をプレビューで開く？」）として UI に出すだけ。
   承諾時のみペイン生成（強制分割はしない）。設定で全体を無効化可能（FR-2.4.4）
 
+### Layer 3b: tako mod（エージェントの中からの構造化報告。FR-2.42 / #1879。2026-10-08）
+
+画面の読み取り（Layer 3）は文言の変化に弱く、ctx% は statusLine を出していない claude からは
+取れない。Claude Code の mod（プラグインの関数フック。2.1.287〜）は claude の**プロセスの中で**
+動いて `$.session.usage()` や `turn.*` を構造で持つので、tako が mod を同梱して状態を送らせる。
+設計の正本は `.agent/plans/2026-10-tako-mod.md`、要件は FR-2.42。
+
+```text
+crates/tako-core/claude-mod/ ──include_str!──▶ claude_mod::install()
+                                               └▶ <data_dir>/claude-mod/tako/   （GUI 起動時 / tako setup。.app の外）
+spawn_session ── claude_mod::decide + pane_env ──▶ ペインの env: CLAUDE_CODE_PLUGIN_DIRS / TAKO_CLI
+                                                   （tmux は session_pinned_pairs で -e 固定 + update-environment）
+claude（ペインの中）── mod: 1 秒 flush / 15 秒 heartbeat ──▶ $TAKO_CLI mod report（stdin の JSON）
+   └▶ IPC → dispatch Request::Mod{report} → GUI のメモリの ModHub（45 秒で失効・session.end / close で破棄）
+tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無い理由も出す）
+```
+
+- **通信路は CLI**（`$.process.run`）: dispatch に 1:1 で載り、tako の再起動をまたいだ tmux の
+  claude も CLI の control.json フォールバック（FR-2.2.9）で新しいインスタンスへ届く（実測 6 秒）。
+  HTTP MCP 直叩きは速いが再起動でポートとトークンが変わって壊れる（設計書 §2）
+- **Claude Code の設定ファイルを書かない**: env で読ませるので設定 dir がいくつあっても関係なく、
+  tako の外の claude は mod を読まない。止めるのは tako の設定（`tako mod off`）
+- **classic 系が届かない環境がある**（組織アカウント。2.1.294 で実測）: 権限待ちは
+  `classic.PermissionRequest` を正とし、届かなければ `tool.check` の ask ルール由来と
+  AskUserQuestion / ExitPlanMode だけ拾う。報告の `classic_events` で区別できる（FR-2.42.7）
+- 保持は**メモリだけ**（永続ファイルを増やさない = #916 のマイグレーション対象外）。
+  設定 `claude_mod` だけが settings.json に載る（serde default で旧ファイルが読める）
+
 ## Phase 5.5: tmux バックエンド永続化（FR-5。2026-06-12 実装）
 
 全ペインの PTY を tako 専用 tmux サーバー（`tmux -L tako`。ユーザーの既定サーバーとは
@@ -597,7 +626,7 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   アプリへの SGR 生転送に必要。**非マウスペインのスクロールは SGR ではなく
   tako 自身が copy-mode を駆動する** → 下記「スクロール制御」）、`allow-passthrough on`、
   `extended-keys always` + `terminal-features extkeys`（kitty / CSI u 維持）、
-  `history-limit 10000`、`update-environment TAKO_*`、
+  `history-limit 10000`、`update-environment TAKO_*`（+ tako mod の `CLAUDE_CODE_PLUGIN_DIRS`。#1879）、
   `copy-mode-position-format ''`（copy-mode 右上の位置インジケータを消す。tmux 3.6 の
   既定書式は先頭行タイムスタンプ = **時刻表示**を含み、スクロール中に謎の時計として
   見える実機バグ (2) の正体だった。位置は tako 側スクロールバーが示す）。

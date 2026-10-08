@@ -37,7 +37,7 @@ let pendingTool: string | undefined
 let effort: string | undefined
 let lastTurn: { duration_ms: number; reason: string } | undefined
 // classic 系のイベント（classic.PreToolUse 等）がこのセッションの mod へ届いているか。
-// 組織アカウントでは 1 つも届かないことがある（2.1.294 で実測。設計書 §1.3 の追記）。
+// 組織アカウントでは 1 つも届かないことがある（2.1.294 で実測。FR-2.42.7）。
 // 届かないときの権限待ちは tool.check の判定から確かなものだけを拾う
 let classicEvents = false
 

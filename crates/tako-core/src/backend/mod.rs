@@ -1118,6 +1118,42 @@ pub(crate) fn strip_verification_histfile_env(args: &mut Vec<String>) -> Vec<Str
     removed
 }
 
+/// tako mod の 2 変数（#1879）を `-e <key>=<value>` ごと取り出す。
+///
+/// 注入しないペインでも「注入しない」を固定するので常に載るが、`CLAUDE_CODE_PLUGIN_DIRS` の値は
+/// 利用者自身の plugin dir（テストを走らせたプロセスの env）に依るのでスナップショットに書けない。
+/// [`strip_integration_env`] と同じ作法で外し、外した値そのものを返す
+#[cfg(test)]
+pub(crate) fn strip_claude_mod_env(args: &mut Vec<String>) -> Vec<String> {
+    let mut removed = Vec::new();
+    for key in crate::claude_mod::INJECTED_KEYS {
+        let Some(at) = args
+            .iter()
+            .position(|a| a.starts_with(&format!("{key}=")))
+            .filter(|at| *at > 0 && args[at - 1] == "-e")
+        else {
+            continue;
+        };
+        removed.push(args.remove(at));
+        args.remove(at - 1);
+    }
+    removed.sort();
+    removed
+}
+
+/// 注入しないペインで [`strip_claude_mod_env`] が取り出すはずの値（テスト用）
+#[cfg(test)]
+pub(crate) fn expected_neutral_claude_mod_env() -> Vec<String> {
+    let (inherited, _) = crate::claude_mod::inherited_env();
+    let mut out: Vec<String> =
+        crate::claude_mod::neutral_pairs(inherited.as_deref(), crate::claude_mod::LIST_SEP)
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod pane_scoped_env_tests {
     use super::*;

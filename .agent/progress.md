@@ -67,3 +67,6 @@
 ## 2026-10-08（#1873: 閲覧中の ⌘F 検索を閉じたら描画へ戻し目次を作り直すようにした）
 - 開閉を `open_preview_search_bar` / `close_preview_search_bar` の 1 実装へ寄せ（Escape・⌘F のトグル・CLI / MCP）、閲覧中に描画から開いた検索なら #1661 の `restore_rendered_preview` で戻してセッションも畳む（code へ落ちていたときだけ描き直す）。CLI `tako edit search --open|--close` / MCP `tako_preview_search` の `visible`（ツールは増やさない）。A/B `TAKO_1873_LEGACY=1`
 - 実測: 修正前の main は Escape 後 mode=code・目次 0 件（visual 節）。`scripts/test-md-find-restore-1873.sh` 43 PASS 0 FAIL・番犬の注入 8 通りを file:line で名指し
+## 2026-10-08（#1879: tako mod S1 = Claude Code の mod の同梱・展開・ペインへの注入と状態報告）
+- mod（`crates/tako-core/claude-mod/`）を `<data_dir>/claude-mod/tako/` へ展開し、claude 2.1.294 以上のペインの env（`CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_CLI`）で読ませる（設定ファイルは書かない・tmux は `-e` 固定）。mod は 1 秒 flush / 15 秒 heartbeat で `tako mod report` を叩き、GUI のメモリに 45 秒の鮮度で持つ。`tako mod [on|off]` / MCP `tako_mod`（report は載せない = FR-2.42.6）。組織アカウントで classic 系が mod へ届かないのを実測し、tool.call / tool.check で拾う形を足した（FR-2.42.7）
+- 実測: `scripts/test-claude-mod-1879.sh`（隔離 GUI・実 claude）直接 25 / tmux 7 / 版 5 / A/B 5 PASS・`claude plugin test` 11 本・番犬 3 本（注入 9 通り名指し）・カタログ +421 B

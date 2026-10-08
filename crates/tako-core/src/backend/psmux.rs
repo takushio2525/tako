@@ -1220,6 +1220,12 @@ mod tests {
         );
         // #1253: 検証プロセス（このテストもそう）のシェル履歴は使い捨てへ向ける。
         // 値は pid 依存なのでスナップショットからは外して別途突き合わせる
+        // #1879: tako mod を注入しないペインは「注入しない」を固定する（値は env 依存なので外して見る）
+        assert_eq!(
+            crate::backend::strip_claude_mod_env(&mut args),
+            crate::backend::expected_neutral_claude_mod_env(),
+            "tako mod の 2 変数がセッションへ固定されていない（#1879）"
+        );
         let histfile = crate::backend::strip_verification_histfile_env(&mut args);
         let mut expected_histfile: Vec<String> = crate::paths::verification_histfile_env()
             .iter()

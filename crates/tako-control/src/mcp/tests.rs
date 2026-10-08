@@ -1127,7 +1127,8 @@ mod tests {
         // #1678 の tako_lsp_server（言語サーバの状態と起動・停止）を追加して 157
         // #1677 の tako_jump（ジャンプ履歴の戻る / 進む / 一覧）を追加して 158
         // #1679 の tako_lsp（言語機能。診断の一覧）を追加して 159。#1680 の定義ジャンプは同じツールの action なので増えない
-        assert_eq!(tools.len(), 159);
+        // #1879 の tako_mod（Claude Code の mod 連携の状態と切替）を追加して 160
+        assert_eq!(tools.len(), 160);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
