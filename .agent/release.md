@@ -156,6 +156,46 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
 - **launchd が実行するのは install_root 側のスクリプト**（既定 `~/dev/tako/scripts/nightly-release.sh`）。
   予約機構を直したときは、そのパスへ反映されているか（= main を pull 済みか）まで確認する
 
+### tako mod の検査（#1892）
+
+tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude Code の更新で mod が
+読まれなくなっても tako は画面の読み取りへ落ちるだけで壊れない（`.agent/plans/2026-10-tako-mod.md` §6）。
+気づけないと「いつの間にか一次ソースが消えていた」になるので、夜間リリースの前段で毎晩検査する。
+
+- 本体は `scripts/check-claude-mod.sh`（1 実装。手で叩いても同じ）。夜間は
+  `--ref origin/main --record` で、**origin/main の mod**（次に出る版）を一時 dir へ取り出し、
+  `claude plugin validate --strict` と `claude plugin test` にかける。合格の条件は終了コード 0 に加えて、
+  ゲートになるフックの `.catch` 抜け（validate は注記に出すだけで合格させる = 設計書 §5 の規約違反）が
+  無いこと・テストが 1 本以上走ったこと
+- **リリースの有無に依らず毎晩**回す（壊すのは tako の変更より Claude Code の更新なので、
+  変更なし / dirty / 手動リリース進行中で抜ける前に置く。ロックを取った直後）
+- **結果でリリースを止めない**。落ちたらログに `ERROR` + 既存の通知（`tako 夜間リリース`）を出して先へ進む:
+  ①配布済みの版も同じ mod を持つので、止めても利用者は守れず無関係な修正の配布だけが止まる
+  ②mod が読まれなくても tako は壊れない（§6）③更新を tako が制御できない外部の CLI の揺れで
+  夜間リリースを止めない
+- **claude が無い**（`TAKO_CLAUDE_BIN` か PATH で見つからない）ときは「未実測」と出して飛ばす
+  （終了コード 3。通知はしない。#1879 の受け入れ 8 と同じ扱い）
+- **利用者の Claude Code の設定に触らない**: 設定 dir（`CLAUDE_CONFIG_DIR`）・mod の写し・claude の
+  作業 dir はすべて毎回作る一時 dir で、終わったら消す。自動更新と不要な通信は止める
+  （`DISABLE_AUTOUPDATER` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`）。実測で HOME 配下は一時の
+  設定 dir 以外に何も書かれない（2.1.294）
+- **遅らせない**: 実測は 1 段 1 秒前後（2.1.294 で validate 0 秒・test 1 秒）。各段（`--version` /
+  validate / test）に上限（`TAKO_MOD_CHECK_TIMEOUT`、既定 60 秒）を付け、超えたら `set -m` で分けた
+  プロセスグループごと止める（test は子プロセスでテストを走らせる。launchd の制御端末なしでも効く）。
+  前の段で打ち切ったら後ろの段は走らせない
+- **記録**: `~/.claude-orchestrator/state/tako-mod-check`（予約ファイルと同じ置き場。`--last` で読める）に、
+  検査した claude の版・mod の出どころ（`origin/main@<sha>` と mod の木）・各段の結果と、**最後に合格した
+  claude の版と mod の木**を持つ。不合格のときは前回の合格と比べて「Claude Code の更新で壊れた可能性」
+  「mod の変更で壊れた可能性」「両方が重なった」を通知とログで出し分ける。夜間のログ
+  （`tako-nightly-release.log`）にも毎晩の版と結果が `mod:` の行で残る（履歴はこちら）
+- 終了コード: 0 = 合格 / 1 = 不合格（打ち切り・mod を取り出せないを含む）/ 2 = 引数の誤り / 3 = 未実測
+- **launchd の登録は変えない**（既存の `com.takushio.tako-nightly-release` が install_root の
+  nightly-release.sh を叩くので、main を pull すれば翌晩から効く）
+- 検証は `bash scripts/test-nightly-mod-check-1892.sh`（CI の macOS ジョブ。claude・osascript・release.sh は
+  スタブ、HOME も隔離。壊れた登録の A/B・claude 無し・固まる claude・止めない実走・変更なしの夜・
+  設定 dir の隔離を見る。実物の claude（下限 2.1.294 以上）があれば本物の mod と壊れた写しも検査し、
+  利用者の設定ファイルの mtime が前後で一致することを見る）
+
 ## 安定版への昇格（#403 / #1853 / #1592）
 
 夜間リリースは常にテスト版（prerelease）で出るので、**安定版（Latest）は人が昇格させる**。

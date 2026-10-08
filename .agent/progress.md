@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-08（#1681: LSP ホバー = 識別子にマウスを乗せると型・doc のカード・CLI / MCP）
-- core `lsp::hover`（Hover の 3 形・16,000 字の上限・範囲・能力）→ manager の `hover`（マウスは補完と同じ取り消しの列 + `open: false` = 開いている文書に加わるだけ = 乗せただけでサーバを起こさない）→ dispatch 3 段（`show` でカード = `ControlHost::show_lsp_hover`）→ CLI `tako lsp hover` / MCP `tako_lsp` の `action=hover`（+290 B）→ GUI `lsp_hover_ui`（`render_block` 経由・1 フレーム目に測って語の行の上下へ・編集メニュー / パレットの口・右クリックメニューには載せない）
-- 実測: e2e `issue1681_lsp_hover` 9 本・番犬の注入 8 通りを file:line で名指し・`scripts/test-lsp-hover-1681.sh` 23 PASS（visual-test `hover` 8 相 = 基準画像との差分は矩形の外 0 px・100 回で保持件数が増えない・A/B `TAKO_1681_LEGACY=1` で FAILED / `hover-real` で実の rust-analyzer の `String` の doc がカードに出る / CLI・MCP 19 項目）
-
 ## 2026-10-08（#1873: 閲覧中の ⌘F 検索を閉じたら描画へ戻し目次を作り直すようにした）
 - 開閉を `open_preview_search_bar` / `close_preview_search_bar` の 1 実装へ寄せ（Escape・⌘F のトグル・CLI / MCP）、閲覧中に描画から開いた検索なら #1661 の `restore_rendered_preview` で戻してセッションも畳む（code へ落ちていたときだけ描き直す）。CLI `tako edit search --open|--close` / MCP `tako_preview_search` の `visible`（ツールは増やさない）。A/B `TAKO_1873_LEGACY=1`
 - 実測: 修正前の main は Escape 後 mode=code・目次 0 件（visual 節）。`scripts/test-md-find-restore-1873.sh` 43 PASS 0 FAIL・番犬の注入 8 通りを file:line で名指し
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1893: LSP ホバーの続き = 右クリックの項目・⇧⌘H・CLI / MCP の全文の口・読み込み中のマウス）
 - 右クリックに「ホバー情報を表示」（`MenuItem::Hover`。移動 → ホバー → 整形・`hoverProvider` の申告で出し分け）・キー ⇧⌘H / Ctrl+Shift+H（⌘K ⌘I はパレットの発火が遅れるので不採用）を編集メニューと同じ `request_lsp_hover` へ。manager は全文を返し、カードは 16,000 字・CLI `--full` / `--limit N` = MCP `limit`（0 = 全文。カタログ +60 B）。マウスも #1869 の `wait_loaded` で待ち、語の真下に「読み込み中」→ カード。取り消しの番号は UI で先に取る（`reserve_hover`。背景で取ると取り消しを追い越して待ち続ける）
 - 実測: `scripts/test-lsp-hover-1893.sh`（visual-test `hover-1893` / `hover-loading` / `hover-loading-real`・A/B `TAKO_1893_LEGACY=1` で名指しの FAILED・#1684 / #1681 の節の回帰・CLI / MCP 字面一致）・実の rust-analyzer は暖機なしで 0.08 秒で「読み込み中」→ 2.2 秒でカード（旧は 95 秒出ない）・e2e 7 本・番犬の注入 12 通りを file:line で名指し・右クリック前のマウスのホバーが明示のカードを消していたのを直した
+
+## 2026-10-09（#1892: tako mod の validate / test を夜間リリースの前段で毎晩回し、落ちたら通知する）
+- 本体 `scripts/check-claude-mod.sh`（origin/main の mod を一時 dir へ取り出し、使い捨ての設定 dir で `claude plugin validate --strict` / `test`。各段 60 秒の上限でプロセスグループごと打ち切り・`.catch` 抜けと 0 本も不合格・claude が無ければ未実測 = exit 3）。`nightly-release.sh` はロック直後に毎晩呼び、**結果でリリースを止めない**（ERROR + 既存の通知）。`~/.claude-orchestrator/state/tako-mod-check` に検査した claude の版と前回合格の版・mod の木を記録し「更新で壊れた / mod の変更で壊れた」を出し分ける
+- 実測: `scripts/test-nightly-mod-check-1892.sh` 100 PASS（claude の無い PATH で 92 PASS + 未実測 1）・回帰の注入 6 通りを名指しで FAIL・実物の claude 2.1.294 で壊れた登録が exit 1・利用者の設定の mtime 一致・既存の nightly 139 / retry 55 / promote 125 緑
