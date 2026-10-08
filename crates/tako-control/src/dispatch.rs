@@ -38714,9 +38714,10 @@ mod tests {
             json!([dir.join("folder/inner/x.txt").display().to_string()])
         );
         assert_eq!(done["done"][0]["copied"].as_bool(), Some(true));
+        // 置いた先は貼り付け先 + 名前（Windows は区切りが `\` なので join を重ねて比べる）
         assert_eq!(
             done["done"][1]["to"].as_str(),
-            Some(dir.join("dst/b.txt").display().to_string().as_str())
+            Some(dir.join("dst").join("b.txt").display().to_string().as_str())
         );
         assert!(dir.join("dst/a.txt").is_file() && dir.join("dst/b.txt").is_file());
         assert!(dir.join("dst/folder/inner/x.txt").is_file());

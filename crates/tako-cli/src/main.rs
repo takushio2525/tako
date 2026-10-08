@@ -10967,12 +10967,13 @@ mod tests {
     fn file_copyの複数指定はまとめた1要求になる() {
         let cwd = std::env::current_dir().unwrap();
         let abs = |p: &str| cwd.join(p).display().to_string();
-        let command = parse(&["tako", "file", "copy", "a.txt", "/w/b", "dst"]);
+        // 相対パスで渡す（`/w/b` は Windows ではドライブの無い相対扱いになり、OS で形が割れる）
+        let command = parse(&["tako", "file", "copy", "a.txt", "sub/b.txt", "dst"]);
         assert_eq!(
             build_request(&command).unwrap(),
             Request::FileOpMany {
                 op: tako_control::protocol::FileOpKind::Copy,
-                paths: vec![abs("a.txt"), "/w/b".into()],
+                paths: vec![abs("a.txt"), abs("sub/b.txt")],
                 dest: Some(abs("dst")),
             }
         );
