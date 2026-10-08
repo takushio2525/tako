@@ -2014,7 +2014,9 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
 - **入口は 1 本**: 編集メニュー・パレット・キー（⇧⌘H / Ctrl+Shift+H = `keybindings::hover_bindings`）・
   右クリックメニューの「ホバー情報を表示」（`MenuItem::Hover` → `item_request` = `LspHover { show: true }`）は
   どれも `TakoApp::request_lsp_hover`（CLI / MCP と同じ dispatch の 3 段）を通る。待つあいだはヘッダに
-  「問い合わせています」（`lsp_hover_header_status`。定義ジャンプ・整形の `pending` と同じ欄）
+  「問い合わせています」（`lsp_hover_header_status`。定義ジャンプ・整形の `pending` と同じ欄）。
+  本文の右クリックは待っているマウスのホバーを捨ててからメニューを開く（メニューはマウス移動を覆うので、
+  捨てないとメニューを閉じた後に古い語のホバーが発火して明示のカードを置き換える）
 - **本文の上限は出口ごと**: manager の答えは全文（`parse_response` は切らない）。カードは
   `open_lsp_hover_card` が `Hover::limited(Some(MAX_CHARS))`、CLI / MCP は `found_json` が `limit`
   （`hover::char_limit` = 省略 16,000 / 0 = 全文 / N）。manager で切ると `--full` が全文を返せない（番犬）

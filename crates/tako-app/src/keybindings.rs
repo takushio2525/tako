@@ -1878,7 +1878,8 @@ mod tests {
 
     /// #1893: ホバーの打鍵が**両 OS で**既存の割当（整形・ジャンプ・パレット・#585 の Windows の割当を
     /// 含む全部）と衝突しない（同じキーに 2 つのアクションを張らない）。⌘K（パレット）と 2 打鍵に
-    /// しない（2 打鍵目を待つ間パレットの発火が遅れる）
+    /// しない（2 打鍵目を待つ間パレットの発火が遅れる）。バインド表の外でツリーが取る打鍵
+    /// （⌘C / X / V・⌥⌘V・⇧↑ / ⇧↓・⌘⌫ / Delete）とも重ならない
     #[test]
     fn ホバーの打鍵は両osで既存の割当と衝突しない() {
         for platform in [Platform::MacOs, Platform::Windows] {
@@ -1917,6 +1918,23 @@ mod tests {
                 .map(|o| o.action().name())
                 .collect();
             assert!(prefixed.is_empty(), "{platform:?}: {prefixed:?}");
+            // ツリーの行を選んでいるときの打鍵（#1860 / #1867 / #1895。バインド表ではなくサイドバーの
+            // `on_key_down` が `tako_core::platform::keys` の判定で取る）にも当たらない
+            let m = mine.modifiers;
+            assert_eq!(
+                tako_core::platform::keys::tree_select_key(
+                    platform, &mine.key, m.platform, m.control, m.alt, m.shift
+                ),
+                None,
+                "{platform:?}: ホバーの打鍵がツリーの範囲選択 / ごみ箱の打鍵と重なる"
+            );
+            assert_eq!(
+                tako_core::platform::keys::tree_clip_key(
+                    platform, &mine.key, m.platform, m.control, m.alt, m.shift, false
+                ),
+                None,
+                "{platform:?}: ホバーの打鍵がツリーのコピー / 切り取り / 貼り付けの打鍵と重なる"
+            );
         }
         // パレットに併記される（Windows はメニューバーが無く、パレットが打鍵を知る唯一の手段）
         for platform in [Platform::MacOs, Platform::Windows] {

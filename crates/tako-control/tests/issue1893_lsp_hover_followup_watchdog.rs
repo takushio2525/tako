@@ -190,6 +190,13 @@ const RULES: &[Rule] = &[
     },
     Rule {
         file: GUI_MENU,
+        decl: "pub(crate) fn on_preview_body_right_click(",
+        must: &["self.close_lsp_hover();"],
+        must_not: &[],
+        why: "右クリックでメニューを開くときに待っているマウスのホバーを捨てていない（メニューを閉じた後に古い語のホバーが発火し、明示のカードを置き換えて消す）",
+    },
+    Rule {
+        file: GUI_MENU,
         decl: "pub(crate) fn run_lsp_menu_item(",
         must: &["MenuItem::Hover => self.request_lsp_hover("],
         must_not: &[],
@@ -414,6 +421,16 @@ fn 逆戻りを名指しできる() {
             "                self.supersede(Lane::Hover),",
         ),
         "    fn hover(&self, request: &HoverRequest)",
+    );
+    // L. 右クリックで待っているマウスのホバーを捨てない
+    assert_named(
+        "L 右クリックで捨てない",
+        GUI_MENU,
+        (
+            "        self.close_lsp_hover();\n        let lsp = self.lsp_pane_menu_at(pane, event.position, cx);",
+            "        let lsp = self.lsp_pane_menu_at(pane, event.position, cx);",
+        ),
+        "pub(crate) fn on_preview_body_right_click(",
     );
     // I. 項目からホバーを外す（NOT_IN_MENU へ戻す形）
     assert_named(

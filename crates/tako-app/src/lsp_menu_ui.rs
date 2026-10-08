@@ -94,6 +94,11 @@ impl TakoApp {
             return;
         }
         cx.stop_propagation();
+        // 右クリックの前に語の上で積んだマウスのホバー（デバウンス・待ち）を捨てる（#1893）。メニューは
+        // マウス移動を覆うので、メニューの上へ動いてもホバーの語は外れたことにならず、メニューを素早く
+        // 閉じる（項目を押す）とデバウンスが明けた古い語のホバーが発火し、明示のカード（「ホバー情報を
+        // 表示」）を置き換えてから「マウスが外れた」で消していた
+        self.close_lsp_hover();
         let lsp = self.lsp_pane_menu_at(pane, event.position, cx);
         self.pane_context_menu = Some(PaneContextMenu {
             pane,

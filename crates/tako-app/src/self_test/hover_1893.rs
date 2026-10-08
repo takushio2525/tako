@@ -174,6 +174,11 @@ pub(super) async fn hover_1893_visual(
     use tako_core::lsp::menu::MenuItem;
     const LABEL: &str = "hover-1893";
     inject_section_failure(LABEL);
+    // 右クリックの前のマウス移動が積むデバウンスを、項目を押すより後に明けさせる（1.5 秒）。
+    // 修正前はメニューを閉じた後にこのデバウンスが古い語のホバーを発火し、明示のカードを置き換えてから
+    // 「マウスが外れた」で消していた（通しの実行で 2 度観測 = 押すのが 300ms より速い回だけ）。
+    // ① の後に明けるまで待って、明示のカードが残ることを確かめる
+    std::env::set_var("TAKO_LSP_HOVER_DELAY_MS", "1500");
     // 3 行目（0 起点の 2）は 40,000 字を超える doc（カードは 16,000 字で切る）。他の語は語をそのまま返す
     let big: String = (0..2500)
         .map(|i| format!("line {i} of a very long doc\n"))
@@ -192,8 +197,9 @@ pub(super) async fn hover_1893_visual(
 
     // ① 識別子の右クリック → 「ホバー情報を表示」（移動の後・整形の前）→ 押すとカード。
     //    押した後にカードが無く、窓のマウス位置が押した位置からずれていた（= 実機のマウスの移動が
-    //    割り込んだ。蓋閉じの機では tako-vd が主画面）ときだけやり直す（#1681 の節と同じ。回数を
-    //    `interfered=` に出す）。押した位置のままで出なければ実装の不具合として落とす
+    //    割り込んだ。蓋閉じの機では tako-vd が主画面）か、押す直前にメニューが閉じていた（= 別の窓に
+    //    前面を取られた）ときだけやり直す（#1681 の節と同じ。回数を `interfered=` に出す）。
+    //    メニューを開いたまま押した位置で出なければ実装の不具合として落とす
     let hover_id = MenuItem::Hover.id();
     let mut interfered = 0;
     let (shown, card, item) = loop {
@@ -219,6 +225,10 @@ pub(super) async fn hover_1893_visual(
         );
         let item = vt1684_item_point(window, cx, hover_id)
             .unwrap_or_else(|| fail(&format!("visual-test {LABEL} ①: 項目の矩形が無い")));
+        // 押す直前にメニューが開いているか（閉じていれば押下は本文へ落ちる = 割り込みとして数える）
+        let menu_open = window
+            .update(cx, |app, _, _| app.pane_context_menu.is_some())
+            .unwrap_or(false);
         vt1860_click(any, window, cx, item, MouseButton::Left);
         let shown = until(any, window, cx, Duration::from_secs(20), &|cx| {
             card_state(window, cx).is_some()
@@ -243,12 +253,12 @@ pub(super) async fn hover_1893_visual(
             })
             .unwrap_or_default();
         println!(
-            "TAKO_VISUAL_PIXEL: {LABEL} ① shown={shown} card={card:?} item={item:?} interfered={interfered} {state}"
+            "TAKO_VISUAL_PIXEL: {LABEL} ① shown={shown} card={card:?} item={item:?} menu_open={menu_open} interfered={interfered} {state}"
         );
         let ok = card.as_ref().is_some_and(|(line, explicit, head, _)| {
             *line == 1 && *explicit && head.contains("total")
         });
-        if ok || !moved || interfered >= 3 {
+        if ok || (!moved && menu_open) || interfered >= 3 {
             break (shown, card, item);
         }
         interfered += 1;
@@ -258,6 +268,23 @@ pub(super) async fn hover_1893_visual(
         });
     };
     let _ = item;
+    // 右クリックの前に積まれたデバウンス（1.5 秒）が明けても、明示のカードは置き換わらない
+    let _ = until(any, window, cx, Duration::from_millis(2500), &|_| false).await;
+    let (after, invalid) = window
+        .update(cx, |app, _, _| {
+            (app.lsp_hover.shown, app.lsp_hover.last_invalid)
+        })
+        .unwrap_or((0, None));
+    let card_after = card_state(window, cx);
+    println!(
+        "TAKO_VISUAL_PIXEL: {LABEL} ① after-debounce card={card_after:?} shown={after} last_invalid={invalid:?}"
+    );
+    check(
+        card_after == card && invalid.is_none(),
+        &format!(
+            "visual-test {LABEL} ①: 右クリックの前のマウスのホバーが明けても明示のカードは置き換わらない ({card_after:?} / {invalid:?})"
+        ),
+    );
     dump(any, cx, "hover-1893-menu-card.png");
     check(
         shown
@@ -364,6 +391,7 @@ pub(super) async fn hover_1893_visual(
     );
     vt1860_press(any, window, cx, "escape");
 
+    std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
     if let Some(name) = override_env {
         std::env::remove_var(name);
     }
