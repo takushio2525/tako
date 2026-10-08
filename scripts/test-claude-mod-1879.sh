@@ -460,6 +460,17 @@ phase_ab() {
   check_eq "A/B では注入しない（理由 ab_off）" "ab_off" "$(mod_field reason.code)"
   check_eq "A/B のペインの env に mod が入らない" "dirs=none cli=none" "$(pane_env_state "$(root_pane)")"
   check_eq "A/B では data dir に mod を展開しない" "absent" "$( [ -e "$data/claude-mod" ] && echo present || echo absent)"
+  if claude_available; then
+    # 旧挙動の側で実 claude を起動しても報告は来ない（同じバイナリの before）
+    local p
+    p="$(root_pane)"
+    launch_claude "$p" --model haiku
+    sleep 20
+    check_eq "A/B の claude からは報告が来ない（state=not_injected のまま）" "not_injected" "$(mod_field "panes.pane=$p.state")"
+    exit_claude "$p"
+  else
+    unmeasured "claude が無いので A/B の実 claude の段を飛ばした"
+  fi
   stop_app
 }
 
