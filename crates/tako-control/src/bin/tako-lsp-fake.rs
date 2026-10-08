@@ -21,7 +21,7 @@
 //! | `ask` | initialized の後に `workspace/configuration` を問い合わせる |
 //! | `die` | 起動直後に即死する（initialize を読まない） |
 //! | `no-goto` | 定義ジャンプの能力（`definitionProvider` 等）を申告しない（#1680） |
-//! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で答え、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680） |
+//! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で、補完に `null` で答え（補完の規則が `hold_while_loading` なら答えずに済むまで待たせる）、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680 / #1869） |
 //! | `full-sync` | `normal` と同じだが全文同期（`change: 1`）を申告する |
 //! | `no-format` | 整形の能力（`documentFormattingProvider` / `documentRangeFormattingProvider`）を申告しない（#1683） |
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
@@ -72,6 +72,7 @@
 //!   "generate": 1000,                              // 代わりに cand0000.. を N 件作る
 //!   "incomplete": false,                           // CompletionList.isIncomplete
 //!   "delay_ms": 0,                                 // 答えるまでの待ち（待つ間に $/cancelRequest が来たら -32800 で答える）
+//!   "hold_while_loading": false,                   // `loading` の読み込み中は null で即答せず、済むまで答えない（#1869）
 //!   "word_edit": true,                             // 候補ごとにカーソルの直前の語を置き換える textEdit を付ける（自前の本文の模型で数える）
 //!   "resolve_doc": "doc of {label}" }              // resolve で documentation を足す（{label} は候補の label）
 //! ```
@@ -372,8 +373,15 @@ fn trailing_space_edits(
         if within.is_some_and(|(a, b)| from < a || to > b) {
             continue;
         }
+        // 位置はこの行の中だけで数える（`range_json` は呼ぶたびに行頭の表を作り直すので、
+        // 10 万行の答えを作ると本文の長さ × 10 万になる = #1869 の 10 万行の整形の検証で詰まった）
+        let utf16 = |s: &str| s.chars().map(char::len_utf16).sum::<usize>();
+        let (first, whole) = (utf16(&content[..kept]), utf16(content));
         edits.push(serde_json::json!({
-            "range": range_json(text, breaks, from, to),
+            "range": {
+                "start": { "line": line, "character": first },
+                "end": { "line": line, "character": whole },
+            },
             "newText": "",
         }));
     }
@@ -746,6 +754,28 @@ fn main() {
             // 取り消されても応答は返す）。待ちの表は答えた / 取り消した時点で外す
             ("textDocument/completion", Some(id)) => {
                 let result = completion_items(&completion, &docs, breaks, &message["params"]);
+                // #1869: 読み込み中（実測した rust-analyzer 1.95 の 2 段）。前半は即座に `null`、
+                // `hold_while_loading` なら答えずに済むまで待たせ、済んだ直後に答える
+                if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+                    if completion["hold_while_loading"].as_bool() != Some(true) {
+                        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+                        continue;
+                    }
+                    let key = id.to_string();
+                    waiting.lock().unwrap().insert(key.clone());
+                    let (out, waiting, loaded) = (out.clone(), waiting.clone(), loaded.clone());
+                    std::thread::spawn(move || {
+                        while !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        if waiting.lock().unwrap().remove(&key) {
+                            out.send(
+                                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                            );
+                        }
+                    });
+                    continue;
+                }
                 let delay = completion["delay_ms"].as_u64().unwrap_or(0);
                 if delay == 0 {
                     out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));

@@ -663,13 +663,30 @@ impl LspManager {
         shared.lock().docs.contains_key(&uri)
     }
 
+    /// この文書を受け持つサーバが起動中か、プロジェクトを読み込み中か（#1869。補完の一覧の
+    /// 代わりに「読み込み中」を出すかを、打鍵の問い合わせを出すときに GUI が見る）。
+    /// **待たない**（ロックを短く取るだけ）。文書が開いていなければ偽（サーバを起こさない）
+    pub fn server_loading(&self, path: &Path) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        let uri = tako_core::file_uri::from_path(path);
+        let inner = shared.lock();
+        inner
+            .docs
+            .get(&uri)
+            .and_then(|doc| inner.servers.get(&doc.key))
+            .is_some_and(|slot| slot.lifecycle.state == ServerState::Starting || slot_loading(slot))
+    }
+
     /// 補完の問い合わせ（#1682）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
     /// 上限は `request.timeout`）。
     ///
     /// `request.superseding`（GUI の打鍵）の要求は、次の `superseding` の要求が来た時点で
     /// `$/cancelRequest` を送って捨て、待っていた側は [`CompletionError::Superseded`] で返る
     /// （打鍵のたびに投げた古い要求の答えを待たない）。文書が開いていなければ定義ジャンプと
-    /// 同じく問い合わせのあいだだけ `didOpen` する
+    /// 同じく問い合わせのあいだだけ `didOpen` する。サーバが読み込み中で空を返したら、打鍵の
+    /// 要求も含めて済むのを待って問い直す（#1869。上限に当たれば [`CompletionError::Loading`]）
     pub fn completion(
         &self,
         request: &CompletionRequest,
@@ -1737,7 +1754,7 @@ impl Shared {
             }
             // 空の答え: 読み込み中のサーバ（rust-analyzer は読み込みの前の問い合わせに空で答える）
             // なら、済むのを待って問い直す。済んでいる / 状態を送らないサーバなら見つからない
-            match self.wait_loaded(&key, deadline) {
+            match self.wait_loaded(&key, deadline, &|| false) {
                 super::goto::Loading::Retry => continue,
                 super::goto::Loading::Settled => {
                     return Ok(GotoAnswer {
@@ -1752,6 +1769,8 @@ impl Shared {
                         starting: true,
                     })
                 }
+                // 定義ジャンプは待ちを打ち切らない（`|| false`）。届いたら閉じたのと同じに抜ける
+                super::goto::Loading::Abandoned => return Err(GotoError::Closed),
             }
         }
     }
@@ -1804,22 +1823,20 @@ impl Shared {
     /// 読み込み中と知らせていれば（`quiescent: false`）済むまで待って `Retry`。状態を
     /// まだ 1 度も知らせていなければ、握手の直後の猶予（[`super::goto::STATUS_GRACE`]）の
     /// あいだだけ知らせを待つ（送るサーバは握手の直後に送る）。済んでいる・送らないサーバは
-    /// 待たずに `Settled`（= 本当に見つからない）
-    fn wait_loaded(&self, key: &ServerKey, deadline: Instant) -> super::goto::Loading {
+    /// 待たずに `Settled`（= 本当に見つからない）。待つあいだに `abandoned` が真になったら
+    /// `Abandoned`（#1869: 補完の打鍵の要求は次の打鍵・閉じる・文書を閉じるで抜ける）
+    fn wait_loaded(
+        &self,
+        key: &ServerKey,
+        deadline: Instant,
+        abandoned: &dyn Fn() -> bool,
+    ) -> super::goto::Loading {
         let mut waited = false;
         loop {
-            let (quiescent, since) = {
-                let inner = self.lock();
-                match inner.servers.get(key) {
-                    Some(slot) => (slot.quiescent, slot.running_since),
-                    None => (None, None),
-                }
-            };
-            let loading = match quiescent {
-                Some(ready) => !ready,
-                None => since.is_some_and(|t| t.elapsed() < super::goto::STATUS_GRACE),
-            };
-            if !loading {
+            if abandoned() {
+                return super::goto::Loading::Abandoned;
+            }
+            if !self.loading_now(key) {
                 return if waited {
                     super::goto::Loading::Retry
                 } else {
@@ -1832,6 +1849,15 @@ impl Shared {
             waited = true;
             std::thread::sleep(super::goto::READY_POLL);
         }
+    }
+
+    /// サーバがいま読み込み中か（**待たない**。ロックを短く取るだけ）。
+    ///
+    /// `quiescent: false` を知らせている、または状態をまだ 1 度も知らせておらず握手の直後の
+    /// 猶予（[`super::goto::STATUS_GRACE`]）の中なら読み込み中。[`Self::wait_loaded`] と
+    /// 補完の「読み込み中」の答え（#1869）・`tako lsp status` の `loading` が同じ判定を引く
+    fn loading_now(&self, key: &ServerKey) -> bool {
+        self.lock().servers.get(key).is_some_and(slot_loading)
     }
 
     /// 未導入と分かっていれば、その理由と導入コマンド（#983）
@@ -2153,7 +2179,7 @@ impl Shared {
         let spec = resolved.spec;
         let uri = tako_core::file_uri::from_path(&request.path);
         // 開いていなければ問い合わせのあいだだけ開く（定義ジャンプ・整形と同じ 1 本）
-        let _transient =
+        let transient =
             self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?;
         // 起動を待つあいだに次の打鍵に置き換わったら待ちを抜ける（古いスレッドに上限まで
         // 状態を読ませ続けない）
@@ -2166,6 +2192,23 @@ impl Shared {
             return Err(GotoError::Unsupported { server: spec.id }.into());
         }
         let cursor = comp::At::new(request.line, request.column);
+        let started = Instant::now();
+        // サーバの読み込みを待ったか（#1869。答えの `waited_for_loading` = CLI / MCP が読み込み中
+        // だったと分かる）: 空の答えの後に済むのを待った、か、送ったときにサーバ自身が読み込み中と
+        // 知らせていた（rust-analyzer の後半は答えずに済むまで待たせる）
+        let mut waited = false;
+        // 読み込みを待つあいだに要らなくなったか（次の打鍵・一覧を閉じた・文書を閉じた）。
+        // この問い合わせ自身も持ち手として加わっているので、「文書を閉じた」= 始めに居た**ほかの**
+        // 持ち手（編集セッション）が全員抜けた（CLI が問い合わせのあいだだけ開いた文書は対象外）
+        let own = transient.as_ref().map(|lease| lease.holder);
+        let others_hold = || {
+            self.lock()
+                .docs
+                .get(&uri)
+                .is_some_and(|doc| doc.holders.keys().any(|holder| Some(*holder) != own))
+        };
+        let shared_at_start = others_hold();
+        let abandoned = || superseded() || (shared_at_start && !others_hold());
         loop {
             // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す（#1769）。
             // 送った時点の文書の版を覚え、答えが届いたときに違っていたらその答えは使わない
@@ -2175,6 +2218,10 @@ impl Shared {
                 let Some(doc) = inner.docs.get(&uri) else {
                     return Err(GotoError::Closed.into());
                 };
+                waited |= inner
+                    .servers
+                    .get(&key)
+                    .is_some_and(|slot| slot.quiescent == Some(false));
                 (
                     position::lsp_position_of_line_col(&doc.text, request.line, request.column),
                     doc.version,
@@ -2197,23 +2244,39 @@ impl Shared {
             ) {
                 Ok(answer) => answer,
                 Err(RpcError::Cancelled) => return Err(CompletionError::Superseded),
+                // 答えずに待たせたまま上限（rust-analyzer の読み込みの後半）: 読み込み中と分かる答えに
+                Err(RpcError::Timeout(_)) if self.loading_now(&key) => {
+                    return Err(CompletionError::Loading {
+                        server: spec.id,
+                        secs: request.timeout.as_secs(),
+                    })
+                }
                 Err(e) => return Err(rpc_failure(spec, request.timeout, e).into()),
             };
             let parsed = comp::parse_response(&answer);
-            // 空の答え: 読み込み中のサーバ（rust-analyzer）なら済むのを待って問い直す（#1680 と同じ）。
-            // 打鍵の要求は待たない（次の打鍵がすぐ問い直す。読み込みが済むまで一覧は出ない）
-            if parsed.items.is_empty() && !request.superseding {
-                match self.wait_loaded(&key, deadline) {
-                    super::goto::Loading::Retry => continue,
+            // 空の答え: 読み込み中のサーバ（rust-analyzer は読み込みの前半の問い合わせに即座に null で
+            // 答える = #1869 の実測）なら、済むのを待って問い直す（#1680 と同じ）。**打鍵の要求も待つ**
+            // （#1869。待たずに 0 件で返すと GUI は一覧を出さず、済んでも問い直さなかった）。待つあいだに
+            // 次の打鍵・一覧を閉じる・文書を閉じるで抜ける（古いスレッドを上限まで残さない）。
+            // A/B（`TAKO_1869_LEGACY=1`）は #1869 前 = 打鍵の要求は待たない
+            let wait = !request.superseding || !super::completion::legacy_1869();
+            if parsed.items.is_empty() && wait {
+                match self.wait_loaded(&key, deadline, &abandoned) {
+                    super::goto::Loading::Retry => {
+                        waited = true;
+                        continue;
+                    }
                     super::goto::Loading::Settled => {}
                     super::goto::Loading::TimedOut => {
-                        return Err(GotoError::Timeout {
+                        return Err(CompletionError::Loading {
                             server: spec.id,
                             secs: request.timeout.as_secs(),
-                            starting: true,
-                        }
-                        .into())
+                        })
                     }
+                    super::goto::Loading::Abandoned if superseded() => {
+                        return Err(CompletionError::Superseded)
+                    }
+                    super::goto::Loading::Abandoned => return Err(GotoError::Closed.into()),
                 }
             }
             // 写しはロックの中で写し取り、座標の変換（行頭の索引 = 本文の長さに比例）は外で行う
@@ -2246,6 +2309,7 @@ impl Shared {
                 cursor,
                 line_text,
                 resolvable,
+                waited_for_loading: waited.then(|| started.elapsed()),
             });
         }
     }
@@ -2372,7 +2436,7 @@ impl Shared {
             // 空の答え: 読み込み中のサーバ（rust-analyzer）なら済むのを待って問い直す（#1680 と同じ）。
             // マウスの要求は待たない（次に乗せたときに問い直す。読み込みが済むまでカードは出ない）
             if content.is_none() && !request.superseding {
-                match self.wait_loaded(&key, deadline) {
+                match self.wait_loaded(&key, deadline, &|| false) {
                     super::goto::Loading::Retry => continue,
                     super::goto::Loading::Settled => {}
                     super::goto::Loading::TimedOut => {
@@ -2383,6 +2447,8 @@ impl Shared {
                         }
                         .into())
                     }
+                    // 明示の問い合わせは待ちを打ち切らない（`|| false`）
+                    super::goto::Loading::Abandoned => return Err(GotoError::Closed.into()),
                 }
             }
             // 範囲の写しは写しの全文が要る（ロックの中で写し取り、変換は外で = 打鍵の同期を待たせない）
@@ -2441,6 +2507,17 @@ impl Slot {
     }
 }
 
+/// サーバがいま読み込み中か（#1680 / #1869）。`quiescent: false` を知らせている、または状態を
+/// まだ 1 度も知らせておらず握手の直後の猶予（[`super::goto::STATUS_GRACE`]）の中
+fn slot_loading(slot: &Slot) -> bool {
+    match slot.quiescent {
+        Some(ready) => !ready,
+        None => slot
+            .running_since
+            .is_some_and(|t| t.elapsed() < super::goto::STATUS_GRACE),
+    }
+}
+
 fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
     let docs: Vec<&String> = inner
         .docs
@@ -2477,6 +2554,8 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
         "received_messages": slot.process.as_ref().map(|p| p.received_count()),
         "garbage_messages": slot.process.as_ref().map(|p| p.garbage_count()),
         "pending_requests": slot.process.as_ref().map(|p| p.pending_count()),
+        // サーバがプロジェクトを読み込み中か（#1869。補完の「読み込み中」と同じ判定）
+        "loading": slot_loading(slot),
     });
     match slot.lifecycle.state {
         ServerState::NotInstalled => {

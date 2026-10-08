@@ -67,3 +67,6 @@
 ## 2026-10-08（#1867: ファイルツリーの複数選択・⌥⌘V（移動として貼る）・大きなコピーの進み具合と取り消し）
 - 選択の正本 `tako_core::tree_select`（⌘ / ⇧クリック・範囲・配下の除去）+ 押下の捕捉フェーズで外した選択を退避。まとめた操作は dispatch `FileOpMany`（clipboard / trash / move を単数と同じ口で 1 件ずつ）、⌥⌘V（Win は Ctrl+Alt+V・AltGr の文字は奪わない）は `paste_move` = #1834 の移動、コピーは `file_copy::Progress` + 一覧 `jobs` で帯と `copy_progress` / `copy_cancel`（作りかけは戻す）。CLI / MCP `tako_file_op` の `paths` と同名の op（カタログ +396 B）
 - 実測: `scripts/test-tree-multiselect-1867.sh` 57 PASS 0 FAIL（visual-test `tree-multiselect` 8 場面・A/B `TAKO_1867_LEGACY=1` で ① が FAILED・CLI と MCP 16 組が字面一致・CLI で始めたコピーを MCP で取り消す / 逆・権限エラー）・番犬 17 本（注入 8 通り file:line）
+## 2026-10-08（#1869: 整形を離れた箇所ごとの差分へ一本化・補完をサーバの読み込み中も出す）
+- 整形と補完の確定を `EditDelta::spans`（差分 1 件に離れた箇所を並べる）+ 書き換えの原始操作 `splice_text` の 1 本へ寄せた（`chained` は廃止）。真因の実測: rust-analyzer 1.95 は読み込みの前半に補完へ即 `null`、後半は答えずに待たせる。tako は打鍵の要求だけ待たずに 0 件で返していた → 打鍵も待って問い直し（次の打鍵・閉じるで抜ける）、GUI は「読み込み中」の 1 行、CLI / MCP は `waited_for_loading_ms` / `status: loading`、`tako lsp status` に `loading`（カタログ +117 B）
+- 実測: 10 万行の整形 → undo の履歴 2,600,298 B・深さ 2・undo 2 回ともバイト一致（旧 `TAKO_1869_LEGACY=1` は 17,399,988 B・深さ 1）・visual-test `completion-loading` 緑（旧で FAILED）・e2e 6 本・番犬の注入 9 通りを file:line で名指し・実の rust-analyzer は読み込み中に GUI で打っても 2.2 秒後に一覧（旧は 25 秒出ない）・整形も緑（`scripts/test-lsp-followup-1869.sh` 37 PASS）

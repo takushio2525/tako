@@ -14,7 +14,8 @@
 //! ## ここで止める 5 つ
 //!
 //! 1. [`履歴は全文の写しを持たない`] — スナップショットへ戻る（**Issue の本体**）
-//! 2. [`本文を書き換える口は1本`] — 履歴に載らない書き換え経路が増える
+//! 2. [`本文を書き換える口は1本`] — 履歴に載らない書き換え経路が増える（#1869 で書き換えは
+//!    原始操作 `splice_text` 1 本へ寄せ、それを呼ぶのは `apply_edit` / `undo` / `redo` だけ）
 //! 3. [`連続した編集をまとめる口を通る`] — まとめが外れて 1 文字粒度へ戻る
 //! 4. [`塊を閉じる口が配線されている`] — カーソル移動・保存で塊が切れなくなる
 //! 5. [`上限はバイト数でも効く`] — 予算が操作数だけへ戻る
@@ -41,7 +42,8 @@ const REL: &str = "crates/tako-core/src/text_edit.rs";
 
 /// 本文を直接書き換えるメソッド（#1651）。
 ///
-/// これを呼んでよいのは `apply_edit`（差分を積む口）と `undo` / `redo`（差分を戻す口）だけ
+/// これを書いてよいのは書き換えの原始操作 `splice_text` の中だけ（#1869）。`splice_text` を
+/// 呼んでよいのは `apply_edit`（差分を積む口）と `undo` / `redo`（差分を戻す口）だけ
 const MUTATORS: [&str; 5] = [
     "self.text.replace_range(",
     "self.text.insert_str(",
@@ -50,8 +52,11 @@ const MUTATORS: [&str; 5] = [
     "self.text = ",
 ];
 
-/// 本文を直接書き換えてよい関数
-const MUTATOR_OWNERS: [&str; 3] = ["apply_edit", "undo", "redo"];
+/// 本文を直接書き換えてよい関数（書き換えの原始操作。#1869 で 1 か所へ寄せた）
+const MUTATOR_OWNERS: [&str; 1] = ["splice_text"];
+
+/// 原始操作 `splice_text` を呼んでよい関数（差分を積む口と戻す口）
+const SPLICE_CALLERS: [&str; 3] = ["apply_edit", "undo", "redo"];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -174,35 +179,49 @@ impl Body {
 #[test]
 fn 履歴は全文の写しを持たない() {
     let target = target();
-    // 差分の型が「置換前 / 置換後」を持っている
-    let delta = target
-        .view
-        .find("struct EditDelta")
-        .map(|pos| {
-            let rest = &target.view[pos..];
-            let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
-            (target.line_of(pos), rest[..end].to_string())
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "{REL}:1 `struct EditDelta` が無い。\n\
-                 undo 履歴の 1 件は差分（範囲 + 置換前後の文字列）で持つこと（#1651）"
-            )
-        });
-    for field in ["start:", "before:", "after:"] {
+    // 差分の型が「どこを（箇所の表）・置換前・置換後」を持っている。どこを = 箇所（#1869 で
+    // 離れた複数の箇所を 1 件に並べる形へ）の開始位置
+    let item = |name: &str| {
+        target
+            .view
+            .find(&format!("struct {name} {{"))
+            .map(|pos| {
+                let rest = &target.view[pos..];
+                let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+                (target.line_of(pos), rest[..end].to_string())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{REL}:1 `struct {name}` が無い。\n\
+                     undo 履歴の 1 件は差分（箇所 + 置換前後の文字列）で持つこと（#1651 / #1869）"
+                )
+            })
+    };
+    let delta = item("EditDelta");
+    let span = item("DeltaSpan");
+    for (shape, field) in [
+        (&delta, "spans:"),
+        (&delta, "before:"),
+        (&delta, "after:"),
+        (&span, "start:"),
+    ] {
         assert!(
-            delta.1.contains(field),
-            "{REL}:{} `struct EditDelta` に `{field}` が無い。\n\
+            shape.1.contains(field),
+            "{REL}:{} `{}` に `{field}` が無い。\n\
              差分は「どこを・何から・何へ」の 3 つで表す（#1651）",
-            delta.0
+            shape.0,
+            shape.1.lines().next().unwrap_or_default()
         );
     }
-    assert!(
-        !delta.1.contains("text:"),
-        "{REL}:{} `struct EditDelta` が `text:` を持っている。\n\
-         全文のスナップショットへ戻っている（1 MB のファイルで 1 打鍵 1 MB = #1651 の症状）",
-        delta.0
-    );
+    for shape in [&delta, &span] {
+        assert!(
+            !shape.1.contains("text:"),
+            "{REL}:{} `{}` が `text:` を持っている。\n\
+             全文のスナップショットへ戻っている（1 MB のファイルで 1 打鍵 1 MB = #1651 の症状）",
+            shape.0,
+            shape.1.lines().next().unwrap_or_default()
+        );
+    }
 
     // 本文を丸ごと写す綴りが本番コードのどこにも無い
     let mut offenders = Vec::new();
@@ -220,19 +239,25 @@ fn 履歴は全文の写しを持たない() {
         offenders.join("\n")
     );
 
-    // 戻す側も差分を当てる（`self.text = snap.text` へ戻っていない）
+    // 戻す側も差分を当てる（`self.text = snap.text` へ戻っていない）。当て直しは差分が持つ
+    // 箇所の並び（`splices`）を書き換えの原始操作へ渡す（#1869）
     for name in ["undo", "redo"] {
         let body = target.require(name);
         body.must_contain(
-            "replace_range",
+            ".splices(",
             "戻すのは差分の当て直し。全文の代入へ戻ると履歴が全文を持つことになる（#1651）",
         );
-        for field in ["before", "after"] {
-            body.must_contain(
-                field,
-                "差分の `before` / `after` を使って往復すること（#1651）",
-            );
-        }
+        body.must_contain(
+            "self.splice_text(",
+            "当て直しは書き換えの原始操作 1 本を通す（#1869）",
+        );
+    }
+    let splices = target.require("splices");
+    for field in ["before", "after"] {
+        splices.must_contain(
+            field,
+            "差分の `before` / `after` を使って往復すること（#1651）",
+        );
     }
 }
 
@@ -269,10 +294,48 @@ fn 本文を書き換える口は1本() {
     assert!(
         offenders.is_empty(),
         "履歴を通さずに本文を書き換えている:\n{}\n\n\
-         本文を触るのは `apply_edit`（差分を積む）と `undo` / `redo`（差分を戻す）だけ。\n\
+         本文を触るのは書き換えの原始操作 `splice_text` だけ（#1869）。\n\
          ここを外れた書き換えは undo で戻らない（#1651）",
         offenders.join("\n")
     );
+    // 原始操作を呼ぶのは差分を積む口と戻す口だけ（ほかから呼ぶと履歴に載らない書き換えになる）
+    let callers: Vec<(usize, usize)> = SPLICE_CALLERS
+        .iter()
+        .map(|name| {
+            let body = target.require(name);
+            (body.start, body.end)
+        })
+        .collect();
+    let mut offenders = Vec::new();
+    let mut offset = 0;
+    for line in target.code.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if !line.contains("self.splice_text(") {
+            continue;
+        }
+        if callers.iter().any(|(s, e)| start >= *s && start < *e) {
+            continue;
+        }
+        offenders.push(format!(
+            "{REL}:{} {}",
+            target.line_of(start) + 1,
+            line.trim()
+        ));
+    }
+    assert!(
+        offenders.is_empty(),
+        "差分を積まずに書き換えの原始操作を呼んでいる:\n{}\n\n\
+         `splice_text` を呼ぶのは `apply_edit`（差分を積む）と `undo` / `redo`（差分を戻す）だけ。\n\
+         ここを外れた書き換えは undo で戻らない（#1651 / #1869）",
+        offenders.join("\n")
+    );
+    for name in SPLICE_CALLERS {
+        target.require(name).must_contain(
+            "self.splice_text(",
+            "差分を積む口・戻す口は書き換えの原始操作を通す（#1869）",
+        );
+    }
     // 積む口が本当に差分を作っていること
     let apply = target.require("apply_edit");
     apply.must_contain(
@@ -374,6 +437,8 @@ fn 番犬の走査が成立している() {
         "process_millis",
         "undo",
         "redo",
+        "splice_text",
+        "splices",
         "set_cursor",
         "select_all",
         "save",
@@ -385,14 +450,22 @@ fn 番犬の走査が成立している() {
         );
     }
     // 本文を書き換える綴りが実在すること（`MUTATORS` の綴りが腐ると 0 件で緑になる）。
-    // 差分へ寄せた今、実際に使う書き換えは `replace_range` だけ（積む 1 + 戻す 2 = 3 箇所）で、
-    // 残りの綴りは**戻ってきたら落とすため**に並べてある
-    let writes = target.code.matches(MUTATORS[0]).count();
+    // 原始操作へ寄せた今、実際に使う書き換えは `splice_text` の中の 1 か所の置き換え
+    // （`replace_range`）と離れた箇所の組み直し（`self.text = `）で、残りの綴りは
+    // **戻ってきたら落とすため**に並べてある
+    let splice = target.require("splice_text");
+    for mutator in [MUTATORS[0], MUTATORS[4]] {
+        assert!(
+            splice.text.contains(mutator),
+            "{REL}:{} `fn splice_text` に `{mutator}` が無い（1 か所はその場で・離れた箇所は組み直す）。\n\
+             書き換えの綴りを変えたなら `MUTATORS` も直すこと（番犬が空振りする）",
+            splice.line
+        );
+    }
+    let calls = target.code.matches("self.splice_text(").count();
     assert!(
-        writes >= 3,
-        "{REL}:1 `{}` が {writes} 箇所しか無い（`apply_edit` / `undo` / `redo` の 3 箇所が要る）。\n\
-         書き換えの綴りを変えたなら `MUTATORS` も直すこと（番犬が空振りする）",
-        MUTATORS[0]
+        calls >= SPLICE_CALLERS.len(),
+        "{REL}:1 `self.splice_text(` が {calls} 箇所しか無い（`apply_edit` / `undo` / `redo` の 3 箇所が要る）"
     );
     assert!(
         MUTATORS.iter().all(|m| m.starts_with("self.text")),
