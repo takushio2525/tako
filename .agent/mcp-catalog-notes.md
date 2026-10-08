@@ -253,3 +253,84 @@
 
 - 「ファイル先頭 64 行以内に以下の形式でコメント内に記述する」「`tako:cwd[name]: <ディレクトリ>` — プロファイル別作業ディレクトリ」は 1 行へ畳んだ（書式はすべて説明文に残る）
 - 「## tako:run 宣言の書式」「## 変数展開」「## 解決優先順位」の見出しと番号付きの並び（同じ中身を 1 行ずつにした）
+
+## #1896 で外した記述（2026-10-09）
+
+#1711 の後、LSP・ファイルツリー・⌘F・tako mod の口が足されて 199,050 バイト（160 本。#1880 の着地後）まで戻ったので、
+同じ方針で 38 本の説明文を短くした（187,678 バイトへ。ツールの増減・引数・型・enum・必須・既定値は不変）。
+並走 PR が触っていた `tako_file_op` / `tako_lsp` / `tako_mod` / `tako_orchestrator_self` /
+`tako_orchestrator_worker_status` には触れていない。以下はツールごとに外した記述（同じ情報が
+ほかにあるものは「→」の後に在り処）。言い換えだけで情報が減っていないものは載せていない。
+
+### tako_orchestrator_profiles
+- 「worker は … agent + agent_*（worker_agents.<agent> のモデル・effort・許可スキップ・追加引数）で指定する」の括弧内（各引数の説明に残る）
+- 「（プロファイル → config.yaml → 既定 60 の解決結果）」→ `ctx_threshold` の引数説明
+- agent_effort の「claude / agy: --effort / codex: model_reasoning_effort」（effort をどの CLI 引数へ渡すか）
+- agent_skip_permissions の「明示 opt-in」/ cwd の「相対パス・存在しないパスはエラー」（「実在パス」に縮めた）/ ctx_threshold の「範囲外はエラー」（schema の minimum / maximum）
+- auto_handoff の「false でも tako_orchestrator_self / tako_orchestrator_handoff は使える」のうち tako_orchestrator_self
+- remote_control の「--remote-control が付き」（付与するフラグ名）
+### tako_orchestrator_spawn
+- 「（agent = claude（既定）/ codex / agy）」→ `agent` の enum と引数説明
+- 「master が別タブにいると意図しないタブに子が出る」（pane / tab を省略したときの帰結）
+- 「session を解決する（session_id は不要）」→「pane_id だけで足りる」
+- model の「claude 語彙の既定（アカウントの default_model / プロファイルの worker_model）」の括弧内
+- effort の「claude = --effort / codex = -c model_reasoning_effort= / agy = --effort」（渡す CLI 引数）
+- tab の「複数 master 運用では明示を推奨」/ task_type の「task_type x model の成功率・差し戻し率を集計する」→ `tako_orchestrator_ledger`
+- limit_resume の「（ペイン単位の切替は tako_limit_resume）」
+### tako_orchestrator_layout
+- legacy の「worker が増えるほど全ペインが横に縮む」/ spiral の「半分ずつの」/ grid の「十字」四分割
+- 「master とユーザーが開いたペインの矩形は変わらない」（worker close 時のリフローの範囲）
+- 「それでも届かなければ床のサイズで置いて」/ auto_shrink_font の「false でも別タブへは出さない」→ 説明文の「worker は常に spawn 元と同じタブ」
+### tako_remote_folder
+- 「ファイルツリーに SSH 先のディレクトリ構造が並び」/ open の「（ローカルより前）」/ ls の「（構造の把握に使う）」
+- open の「terminal=false で開くだけ」/ push の「force=true で競合を承知のうえ上書き」→ 各引数の説明
+### tako_run / tako_run_resolve / tako_run_defaults
+- tako:run 宣言の「各言語のコメント記法に依存しない」→「接頭辞は任意」/ 変数展開の各値の言い換え（`${fileDir}` = ファイルのあるディレクトリ 等）
+- tako_run_resolve の「UI のドロップダウンと同じデータ」/ 要件番号 `FR-3.18`（run_resolve・run_defaults）→ `.agent/requirements.md`
+### tako_sessions
+- resume の「（「昨日の〜の子を呼び戻して」は list で特定 → resume）」/ link の「（「スマホから続きを見たい」に答える経路）」（使いどころの例）
+- account_label の「切り分けに使う」/「codex / agy は list に載るが復元・委譲不可」→「list だけ」
+### tako_setup_bootstrap / tako_setup_changes / tako_setup
+- bootstrap install の「（Windows は各 install.ps1 相当）」/ status-all の「（読み取り専用）」/ can_run=false の「= 状態照会と案内まで」/ path の「ログインシェルの」profile・ユーザー環境変数「Path」
+- setup_changes の「未適用の setup 関連変更（セットアップ項目・設定フォーマット・master 用システムプロンプト等の変更）」の括弧内 /「自動追従は `tako setup` を案内すること」（kind=auto の説明と重複）
+- setup の orchestrator の「（master / worker の挙動フラグ）」
+### tako_sleep_guard
+- open-battery-settings の「（フォールバック）」/ 安全弁が「必ず」働く / lid_battery_floor の「通常のスリープへ戻す」
+### tako_open_file
+- 「（「このファイルを見て」「成果物を確認して」の提示に使う）」の例示 / description の「direction を指定すると再利用せずその方向へ分割、new_tab でそのファイル専用の新しいタブ、line で開いた直後にその行へ飛ぶ」→ 各引数の説明
+- pane の「プレビューの表示先解決に使う」/ new_tab の「いまのタブを動かさずに見せたいとき」/ line の「（Markdown のレンダリング表示には原文の行が残らない）」（mode が code になる理由）
+### tako_web
+- 「ユーザーはクリック・スクロール・文字入力を直接行える」→「直接操作できる」/ navigate の「（back・forward・reload・URL）」→ `to` の引数説明 / eval の例「document.querySelector('button').click()」
+### tako_orchestrator_handoff
+- 2 節の中身「（決定事項・方針・残タスクの意図。pane / tab 番号を書かない）」「（worker とその pane / tab・実行中のもの）」→ guide `handoff`（`crates/tako-control/src/orchestrator/guides/handoff.md`）
+- 「どれも決まらなければ本文を貼らず」/ 旧形式の自動移行の「冪等・原本は退避」→ `tako_orchestrator_handoffs`・`tako-core::migration`
+- projects 引数の「推定より優先。…プロファイルの担当 + 稼働中 worker から推定」→ description の解決順
+### tako_send_input / tako_read_pane
+- send_input の「入力欄に残ったテキストの送信代行として」（Enter 単独送信の用途）/「テキストはダイアログのキー操作として食われ」（拒否する理由の前半）
+- read_pane の「mixed（混在）/ none（入力なし）」の括弧内 /「idle 継続時に」→「idle で」/「キューごと」
+### tako_show_command / tako_orchestrator_respond / tako_panel
+- show_command の「渡した文字列はそのまま保管され」/「対話中のペインは触らない」（新規ペインで実行の補足）
+- respond の「permission に限らず」/ 種別の言い換え（usage limit の「対処選択」・「モデル選択（/model）」・「一覧選択（/mcp）」）/「TUI 自身に」
+- panel の「view の値は GUI のタブ表示名と同じ（…）」→ `view` の引数説明（`panel_view_schema()` が同じ値を出す）/ sidebar_width の「GUI のドラッグと同じ規則で」
+### tako_open_remote / tako_tmux_cleanup / tako_config_share
+- open_remote の「パスワード認証しか無い相手でも」（接続共有の効き先の例）
+- tmux_cleanup の「（前回クラッシュ等で残った裸のバックエンドセッション）」/「消し忘れ掃除の定型操作に使う」
+- config_share の「宣言的」設定 /「（mac ⇔ Windows）」/「ホワイトリストで構造的に」除外
+### tako_window / tako_split_pane / tako_context_budget / tako_ui_mode / tako_session_restart / tako_orchestrator_accounts
+- window の「ビューポート方式」/ 各 action の言い換え（minimize = 最小化 等）/ restore の「元のサイズへ戻す」
+- split_pane の「ユーザーがどのタブを見ていても対象タブ内に分割できる」/ focus の「= ユーザーの入力中にフォーカスを奪わない」（既定 false の理由）
+- context_budget の「全文は git 履歴に残る」/「本文の要約も」
+- ui_mode の release の「再起動で gui 表示へ戻る」→「揮発」/ スターターの 3 ボタンの正式な文言「AI チームに任せる / AI と 1 対 1 で話す / コマンド入力へ」/ set の「（terminal / gui）」→ `mode` の enum
+- session_restart の「1 文字も」/「プロセスが旧版のまま残っている」（stale の意味）
+- accounts の「名前つきアカウント」/「未設定のまま = 」/ show・remove の「name 必須」→ `name` の引数説明 /「既定パスを明示しても」
+### tako_run_interactive / tako_theme / tako_orchestrator_ledger / tako_setup_mcp / tako_tree_folder / tako_orchestrator_workers / tako_migrate
+- run_interactive の「使い方: (1)〜(4)」の番号付き手順 →「流れ:」1 行
+- theme の reset-color の「ビルトインへ戻す」/ delete-preset の「プリセットを削除」
+- ledger の stats の「判断材料になる」/ amend の「実使用で」
+- setup_mcp の「env の転送設定 env_vars も書くが、値ではなく変数名だけなので」→「env_vars は変数名だけで」
+- tree_folder の「（cwd 由来のエントリと並んで表示される）」/「（配下からの伝播）」/「どのフォルダに変更がある？」の例示
+- workers の pane_alive「（GUI にペインが現存するか）」/ tmux_alive「（tmux session が生存中か）」/ resume_command の「session ID 検出済み」/ closed の「（明示 close 済み）」/「自動再送は撃たれない」→「しない」
+- migrate の「files[].steps に当てた（当てる）」/ status の「形式の」版数
+### tako_todo / tako_orchestrator_run
+- todo の「生成物の」レビュー・「宣伝」投稿 /「（master が閉じていれば起動して初回メッセージで渡す）」→「閉じていれば起動して渡す」/ expand の「tasks ビューで展開して」「（パネルが閉じていれば開く）」
+- orchestrator_run の「MCP 呼び出しが中断されても worker は孤児化せず」/「（完了判定は）バックグラウンドで繰り返し」/ sync の「（後方互換）」
