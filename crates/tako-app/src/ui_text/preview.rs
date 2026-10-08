@@ -359,6 +359,11 @@ pub fn format_not_code() -> &'static str {
 // --- ホバー（キー: preview.hover_*。#1681） ---
 // 理由・次の一手の日英は dispatch の応答（`tako_control::lsp::text`）が持つ。ここは画面だけの語
 
+/// 操作の名前（カードのリンクを開けなかったときの通知欄の「〜に失敗」と診断の op）
+pub fn hover_link_op() -> &'static str {
+    tr!("ホバーのリンクを開く", "Open a link in the hover card")
+}
+
 /// コードのプレビューではないのでホバーを出せない
 pub fn hover_not_code() -> &'static str {
     tr!(
@@ -448,6 +453,7 @@ mod tests {
                 format_running().to_string(),
                 format_no_selection().to_string(),
                 format_not_code().to_string(),
+                hover_link_op().to_string(),
                 hover_not_code().to_string(),
                 hover_no_cursor().to_string(),
                 hover_truncated(40_000),

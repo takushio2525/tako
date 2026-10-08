@@ -597,6 +597,9 @@ pub(crate) enum NoticeArm {
     /// 定義ジャンプ（⌘クリック）の未導入・未応答・落ちた等（`TAKO_1680_LEGACY`）。
     /// 旧挙動では ⌘クリックが定義を探さないので、通知だけ残っても意味がない
     Issue1680,
+    /// ホバーのカードのリンクを開けなかった（`TAKO_1681_LEGACY`）。旧挙動ではカードが出ないので、
+    /// 通知だけ残っても意味がない
+    Issue1681,
 }
 
 impl NoticeArm {
@@ -615,6 +618,7 @@ impl NoticeArm {
             NoticeArm::Issue1485 => tako_control::remote_autostart::legacy_mode(),
             NoticeArm::Issue1679 => tako_control::lsp::legacy(),
             NoticeArm::Issue1680 => tako_control::dispatch::lsp_goto_legacy(),
+            NoticeArm::Issue1681 => tako_control::lsp::hover::legacy(),
         }
     }
 }

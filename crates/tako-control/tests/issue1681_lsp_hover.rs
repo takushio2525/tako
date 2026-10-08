@@ -484,7 +484,7 @@ fn 巨大な_doc_は上限で切る() {
 /// 導入が重い・答えが環境依存）。`cargo test -p tako-control --test issue1681_lsp_hover -- --ignored`。
 /// rust-analyzer が PATH に無ければ何もせずに終わる（SKIPPED と出す）
 #[test]
-#[ignore]
+#[ignore = "実の rust-analyzer が要る（導入が重く答えが環境依存 = CI に入れない）。手で --ignored を付けて走らせる"]
 fn 実の_rust_analyzer_が_doc_を返す() {
     let Some(program) = tako_core::platform::exe::find("rust-analyzer") else {
         println!("SKIPPED: rust-analyzer が無い");

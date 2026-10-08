@@ -20,6 +20,14 @@
 
 ---
 
+## 2026-09-30（#1845: Windows の zip・インストーラーへライセンス 3 本を同梱し、両 OS の組み立てを番犬で固定した）
+- `tako.iss` の `[Files]` と `build-installer.ps1` の zip へ `THIRD-PARTY-NOTICES.md` / `THIRD-PARTY-LICENSES.md` を足した（`LICENSE.txt` は従来どおり）。`verify-assets.ps1` が zip を展開して 3 本が元ファイルとバイト一致するかを見て、CI だけがインストーラーを無人インストールしてインストール先も見る。`release-windows.yml` はタグ以外の ref から dispatch するとドライラン（Release へ添付しない）
+- 実測: 番犬 `license_bundle_watchdog.rs` 5 本緑・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・検査関数を pwsh 7.6 で 5 通り（正常 / 欠け / 食い違い / 空 / CI の外）
+
+## 2026-09-30（#1709: tako アプリのデータの扱いのページを最新の main で確かめ直し、窓口をメールと Issue の 2 本立てにして公開した）
+- PR #1714 を #1844 の上へ rebase（フッターは作者のサイト → tako のデータの扱い → 共通ポリシー → Cookie 設定）。事実の記述を現行コードと 1 件ずつ突き合わせ、食い違い 4 件（更新確認の時機・自動リネームの発火条件・設定の共有の始め方・導入の条件）を直し、抜けていた事実 5 件を足した
+- 窓口: 非公開は contact@takushio2525.com、不具合は GitHub Issue（telemetry.md の削除依頼も同じ）。docs 検査 6 本 rc=0・PC 幅 / スマホ幅の横はみ出し 0 px
+
 ## 2026-09-30（#1849: SECURITY.md を置いて脆弱性の非公開の報告先を案内した）
 - リポジトリ直下に日英併記の `SECURITY.md`（第一の窓口 = GitHub の Private vulnerability reporting、第二 = メール。対象の版 = 最新の安定版とテスト版・対象範囲・書いてほしいこと・受領の目安 7 日・公開の流れ）。README と privacy.md のお問い合わせ節に導線 1 行ずつ
 - 窓口の書き分けは PR #1714 のお問い合わせ節と同じ（非公開 = メール / 不具合・要望 = 公開の Issue）。GitHub の Markdown API で描画して見出し 6・リンク切れ 0 を確認

@@ -740,10 +740,18 @@ impl TakoApp {
         else {
             return;
         };
-        if let Some(url) = tako_core::md_links::browser_url(&card.links[index].url) {
-            if let Err(e) = tako_control::platform::os_integration::open_url(url) {
-                eprintln!("warning: ホバーのリンクを開けない: {e}");
-            }
+        let Some(url) = tako_core::md_links::browser_url(&card.links[index].url) else {
+            return;
+        };
+        // 開けなかったら通知欄へ理由を出す（リンクの文字列は診断へ出さない）
+        if let Err(e) = tako_control::platform::os_integration::open_url(url) {
+            self.notify_ui_op_failed(
+                crate::sidebar::NoticeArea::Preview,
+                crate::sidebar::NoticeArm::Issue1681,
+                crate::ui_text::preview::hover_link_op(),
+                None,
+                &e.to_string(),
+            );
         }
     }
 
