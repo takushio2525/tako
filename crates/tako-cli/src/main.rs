@@ -4237,7 +4237,7 @@ fn cli_main() -> ExitCode {
         // run --wait / --list は合成処理
         Command::Run(ref args) if args.wait => return wait_exit_code(run_wait(&cli.command)),
         Command::Run(ref args) if args.list => run_list(&cli.command),
-        // #1860: コピー元が複数なら 1 件ずつ同じ dispatch へ送る
+        // #1860 / #1895: 複数ならまとめた 1 要求（1 つのジョブ）。1 件でも断られたら終了コード 1
         Command::File(FileCommand::Copy { ref paths }) => file_copy_cli(paths),
         // #1867: まとめた操作は 1 件でも断られたら終了コード 1（結果は出してから = mv / rm と同じ）
         Command::File(FileCommand::Move { .. } | FileCommand::Trash { .. }) => {
@@ -8417,7 +8417,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 Some(resolve_cli_path(dest)),
             )
         }
-        // #1860: コピー元が 1 つのとき。複数は main の `file_copy_cli` が 1 件ずつ送る
+        // #1860 / #1895: 複数でもまとめた 1 要求（A/B の `TAKO_1895_LEGACY=1` だけ main の
+        // `file_copy_cli` が 1 件ずつ送る）
         Command::File(FileCommand::Copy { paths }) => {
             let mut requests = file_copy_requests(paths)?;
             if requests.len() != 1 {
@@ -9709,7 +9710,8 @@ fn parse_direction(s: &str) -> Result<Direction, String> {
     }
 }
 
-/// `tako file copy SRC... DEST` の要求（コピー元 1 つにつき 1 件。#1860）。
+/// `tako file copy SRC... DEST` の要求（#1860 / #1895）。コピー元が複数でも**まとめた 1 要求**
+/// （`FileOpMany` = 1 つのジョブ。進み具合も取り消しも 1 つ = MCP の `paths` と同じ要求・応答）。
 /// どれも CLI の cwd 基準で絶対化する（GUI の cwd で読ませない = move と同じ）
 fn file_copy_requests(paths: &[String]) -> Result<Vec<Request>, String> {
     let Some((dest, sources)) = paths.split_last().filter(|(_, s)| !s.is_empty()) else {
@@ -9718,6 +9720,14 @@ fn file_copy_requests(paths: &[String]) -> Result<Vec<Request>, String> {
         );
     };
     let dest = resolve_cli_path(dest);
+    if !tako_core::file_copy::legacy_1895() {
+        return Ok(vec![file_op_for(
+            tako_control::protocol::FileOpKind::Copy,
+            sources,
+            Some(dest),
+        )]);
+    }
+    // A/B（`TAKO_1895_LEGACY=1`）: #1895 の前 = コピー元 1 つにつき 1 件（別のジョブ）
     Ok(sources
         .iter()
         .map(|src| Request::FileOp {
@@ -9730,14 +9740,24 @@ fn file_copy_requests(paths: &[String]) -> Result<Vec<Request>, String> {
         .collect())
 }
 
-/// `tako file copy`（#1860）。コピー元が 1 つなら他の file 系と同じ 1 往復。複数なら
-/// 1 件ずつ送って 1 行ずつ結果を出し、断られたものは理由を出して続ける（`cp` と同じ）
+/// `tako file copy`（#1860 / #1895）。1 往復で結果を出し、まとめた要求で断られたものがあれば
+/// 終了コード 1（`cp` と同じ。写せたものは写してある）。A/B の 1 件ずつの要求は 1 行ずつ出す
 fn file_copy_cli(paths: &[String]) -> Result<(), String> {
     let requests = file_copy_requests(paths)?;
     let total = requests.len();
     if total == 1 {
-        let result = send_request(requests.into_iter().next().expect("1 件"))?;
+        let request = requests.into_iter().next().expect("1 件");
+        let many = matches!(request, Request::FileOpMany { .. });
+        let result = send_request(request)?;
         println!("{result}");
+        let failed = result["failed"].as_array().map_or(0, Vec::len);
+        if many && failed > 0 {
+            let done = result["done"].as_array().map_or(0, Vec::len);
+            return Err(format!(
+                "{} 件中 {failed} 件をコピーできなかった",
+                done + failed
+            ));
+        }
         return Ok(());
     }
     let mut failed = 0usize;
@@ -10939,6 +10959,38 @@ mod tests {
     fn 引数定義が壊れていない() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// #1895: `tako file copy a b dst` はまとめた 1 要求（= 1 つのジョブ。MCP の `paths` と同じ要求）、
+    /// 1 件なら単数の要求。どれも CLI の cwd 基準で絶対化する
+    #[test]
+    fn file_copyの複数指定はまとめた1要求になる() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = |p: &str| cwd.join(p).display().to_string();
+        let command = parse(&["tako", "file", "copy", "a.txt", "/w/b", "dst"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::FileOpMany {
+                op: tako_control::protocol::FileOpKind::Copy,
+                paths: vec![abs("a.txt"), "/w/b".into()],
+                dest: Some(abs("dst")),
+            }
+        );
+        let command = parse(&["tako", "file", "copy", "a.txt", "dst"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::FileOp {
+                op: tako_control::protocol::FileOpKind::Copy,
+                path: abs("a.txt"),
+                name: None,
+                pane: None,
+                dest: Some(abs("dst")),
+            }
+        );
+        assert!(
+            file_copy_requests(&["dst".into()]).is_err(),
+            "コピー元が無い"
+        );
     }
 
     #[test]

@@ -283,6 +283,25 @@ pub fn copy_progress(done: u64, total: u64, bytes_done: &str, bytes_total: &str)
         format!("Copying {done} of {total} items, {bytes_done} of {bytes_total}")
     )
 }
+/// 帯の棒の右端に添える残り時間の目安（#1895。粒度は `file_copy::eta_label` が決める）
+pub fn copy_eta(eta: tako_core::file_copy::EtaLabel) -> String {
+    use tako_core::file_copy::EtaLabel;
+    match eta {
+        EtaLabel::Soon => tr!("まもなく完了", "almost done").to_string(),
+        EtaLabel::Seconds(s) => tr!(format!("あと約 {s} 秒"), format!("about {s} s left")),
+        EtaLabel::Minutes(m) => tr!(format!("あと約 {m} 分"), format!("about {m} min left")),
+        EtaLabel::Hours { hours, minutes: 0 } => {
+            tr!(
+                format!("あと約 {hours} 時間"),
+                format!("about {hours} h left")
+            )
+        }
+        EtaLabel::Hours { hours, minutes } => tr!(
+            format!("あと約 {hours} 時間 {minutes} 分"),
+            format!("about {hours} h {minutes} min left")
+        ),
+    }
+}
 /// 取り消しを受けて止まるのを待っている
 pub fn copy_cancelling() -> &'static str {
     tr!("取り消しています", "Cancelling")
@@ -290,6 +309,21 @@ pub fn copy_cancelling() -> &'static str {
 /// 帯の取り消しの押し口
 pub fn copy_cancel() -> &'static str {
     tr!("取り消し", "Cancel")
+}
+/// ⌘⌫（Windows は Delete）でリモート（SSH）の行をごみ箱へ入れようとしたときの理由（#1895）
+pub fn trash_remote_refused() -> &'static str {
+    tr!(
+        "リモート（SSH）の項目はごみ箱へ入れられない",
+        "Remote (SSH) items can't be moved to the trash"
+    )
+}
+/// ⌘⌫（Windows は Delete）で見出しのフォルダをごみ箱へ入れようとしたときの理由（#1895。
+/// 打ち間違いでワークスペースごと入れない = 見出しは画面のキーでは動かさない）
+pub fn trash_root_refused() -> &'static str {
+    tr!(
+        "見出しのフォルダはキーではごみ箱へ入れない",
+        "Workspace folders can't be moved to the trash with a key"
+    )
 }
 /// 取り消した後の知らせ（失敗ではない = 自分で押した）
 pub fn copy_cancelled() -> &'static str {
@@ -564,6 +598,20 @@ mod tests {
                 multi_partial("Move", 1, 3, "no such path"),
                 copy_counting(12),
                 copy_progress(1, 2, "1 KB", "2 KB"),
+                // #1895: 残り時間の目安（数値は言語非依存）
+                copy_eta(tako_core::file_copy::EtaLabel::Seconds(25)),
+                copy_eta(tako_core::file_copy::EtaLabel::Soon),
+                copy_eta(tako_core::file_copy::EtaLabel::Minutes(3)),
+                copy_eta(tako_core::file_copy::EtaLabel::Hours {
+                    hours: 1,
+                    minutes: 20,
+                }),
+                copy_eta(tako_core::file_copy::EtaLabel::Hours {
+                    hours: 2,
+                    minutes: 0,
+                }),
+                trash_remote_refused().to_string(),
+                trash_root_refused().to_string(),
                 copy_cancelling().to_string(),
                 copy_cancel().to_string(),
                 copy_cancelled().to_string(),

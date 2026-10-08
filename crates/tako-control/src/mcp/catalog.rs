@@ -1234,7 +1234,7 @@ pub fn tools() -> Vec<Value> {
                 ファイルマネージャでコピーしたものも貼れる）/ clipboard = 中身と paste したときの貼り付け先（何も変えない）/\n\
                 paste_move = 移動として貼る / copy_progress = 走っているコピーの件数・バイト / copy_cancel = name の id のコピーを取り消す（省略で全部）。\n\
                 rename / create_file / create_dir / open_with は name、move / copy は dest が必須。\
-                paths（path の代わり）で clipboard_copy・clipboard_cut・trash・move をまとめて行う。", lc = link_click()),
+                paths（path の代わり）で clipboard_copy・clipboard_cut・trash・move・copy をまとめて行う。", lc = link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {

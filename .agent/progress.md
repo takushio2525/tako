@@ -63,3 +63,6 @@
 ## 2026-10-09（#1896: MCP ツールカタログの説明文を再び短くし、予算 200 KB に約 17 KB の余白を作った）
 - 160 本中 38 本の description / 引数説明を #1540 / #1711 の方針で短縮（大きい順に profiles -1,464 / spawn -775 / remote_folder -643 / open_file -640）。構造（名前・型・enum・必須・既定値）は不変、残っていた要件番号 FR-3.18 も外した。外した原文は `.agent/mcp-catalog-notes.md` の #1896 節。並走 PR の 5 本（file_op / lsp / mod / self / worker_status）は触らない
 - 実測: main（4bbbcc2）199,050 → 187,678 B（-11,372 B・残り 17,122 B。rebase 前に隔離 GUI + `tako mcp serve` の tools/list と `tako context-budget` の一致を確認）。description を落とした JSON が 160 本すべて一致
+## 2026-10-09（#1895: ファイルツリーの ⇧↑ / ⇧↓・⌘⌫、1 つのファイルの途中での取り消し、まとめたコピーを 1 つのジョブへ、帯の残り時間）
+- ⇧↑ / ⇧↓ = `tree_select::extend`（⇧クリックと同じ `apply`）・⌘⌫（Win は Delete）= 右クリックの「削除」と同じ `trash_tree_paths`（見出し・リモートは断る）。1 つのファイルは `fs_copy::copy_file_exclusive`（同じ APFS は clone・それ以外は fcopyfile / CopyFileExW の進み具合で 1 MiB ごとにバイトが進み途中で止めて作りかけを消す）。`tako file copy a b dst` / MCP `paths` の copy = `FileOpMany` の 1 ジョブ、`copy_progress` に `eta_secs`（2 秒・1% までは出さない）。カタログ +7 B
+- 実測: 製品の経路で 256 MiB の同じボリューム 61.8 → 22.6 ms（`create_new` の後の `std::fs::copy` で clone が外れていたのを直した）・別ボリューム 180.5 / 181.4 ms で差なし。`scripts/test-tree-keyboard-copy-1895.sh` 39 PASS 0 FAIL（A/B `TAKO_1895_LEGACY=1` で ① が名指しで FAILED）・番犬 13 本（注入 11 通りを file:line で名指し）

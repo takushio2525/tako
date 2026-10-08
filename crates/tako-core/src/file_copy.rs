@@ -23,7 +23,8 @@
 //!
 //! ## 写すもの
 //!
-//! 中身と権限（`std::fs::copy`。macOS は `fcopyfile` で拡張属性も）。シンボリックリンクは
+//! 中身と権限・拡張属性（[`fs_copy::copy_file_exclusive`]。同じ APFS ボリュームなら OS の複製 =
+//! clone、それ以外は macOS = `fcopyfile` / Windows = `CopyFileExW`）。シンボリックリンクは
 //! **リンクそのもの**（指す先は辿らない = 自分の祖先を指すリンクで無限に潜らない。
 //! Finder / `cp -R` と同じ）。FIFO・ソケット・デバイスは読むと止まる / 写す意味が無いので
 //! 理由つきで断る。
@@ -33,10 +34,19 @@
 //! 写す前に件数とバイトを数え（[`measure`]）、1 項目ごとに [`Progress`] を進める。
 //! 取り消し（[`Progress::cancel`]）は**次の項目へ進む前**に見て、[`CopyRefusal::Cancelled`] で
 //! 抜ける = 失敗と同じく**この呼び出しで作った置き場だけを消して戻す**（作りかけを残さない）。
-//! 1 つのファイルの途中では止めない（`std::fs::copy` = macOS の `fcopyfile` / APFS の複製を
-//! そのまま使うため）。走っているコピーは [`jobs`] の一覧に載り、GUI のツリーの帯・
+//! 走っているコピーは [`jobs`] の一覧に載り、GUI のツリーの帯・
 //! CLI `tako file progress` / `cancel`・MCP `tako_file_op` の `copy_progress` / `copy_cancel` が
 //! 同じ一覧を読む。
+//!
+//! ## 1 つのファイルの途中でも止める・バイトが進む（FR-3.39 / #1895）
+//!
+//! ファイルの中身は OS の写す単位ごと（macOS は 1 MiB）にバイトを進め、**そのファイルの途中でも**
+//! 取り消しを見て止まる（作りかけのファイルは [`fs_copy::copy_file_exclusive`] が消す）。
+//! 同じ APFS ボリュームの中は先に OS の複製（clone = 中身を写さず一瞬で終わる）を試すので
+//! 途中が無い。実測（256 MiB・M 系の Mac）: clone 0.1 ms / 中身を写す道は進み具合の
+//! コールバックがあっても無くても同じ速さ（同じボリューム 37〜40 ms・別のボリューム 173〜195 ms）。
+//! 残り時間の目安は [`eta`]（写し始めて [`ETA_MIN_ELAPSED`] 経ち、[`ETA_MIN_PERMILLE`] ‰ 以上
+//! 写してから、始めからの平均の速さで出す = 始めのぶれを見せない）。
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -344,6 +354,9 @@ pub fn execute(plan: &CopyPlan) -> Result<CopyStats, CopyRefusal> {
 pub fn execute_with(plan: &CopyPlan, progress: &Progress) -> Result<CopyStats, CopyRefusal> {
     let mut job = Job {
         progress,
+        // 遅延を注入した回は clone を試さない（一瞬で終わる clone には途中が無い = 進み具合と
+        // 途中の取り消しを見るための注入なので、中身を写す道を通す。#1895）
+        allow_clone: injected_chunk_delay().is_none() && !progress.no_clone.load(Ordering::Relaxed),
         stats: CopyStats::default(),
         created_root: false,
         dir_permissions: Vec::new(),
@@ -373,6 +386,8 @@ fn rollback(plan: &CopyPlan) {
 struct Job<'a> {
     /// 進み具合と取り消し（#1867）
     progress: &'a Progress,
+    /// 1 つのファイルを OS の複製（clone）で済ませてよいか（#1895）
+    allow_clone: bool,
     stats: CopyStats,
     /// 置き場を作れた（ここから先の失敗は戻す）
     created_root: bool,
@@ -401,14 +416,11 @@ impl Job<'_> {
             }
             EntryKind::File => {
                 probe_readable(&plan.from)?;
-                // 名前を押さえる（決めてから作るまでに誰かが作っていたら上書きせずに断る）
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&plan.to)
-                    .map_err(|e| write_error(&e, &plan.to))?;
+                // 置き場は `copy_file` が排他的に作る（決めてから作るまでに誰かが作っていたら
+                // 上書きせずに断る）。失敗・取り消しの作りかけも `copy_file` の側で消える
+                self.copy_file(&plan.from, &plan.to)?;
                 self.created_root = true;
-                self.copy_file(&plan.from, &plan.to)
+                Ok(())
             }
             EntryKind::Symlink => {
                 self.copy_link(&plan.from, &plan.to)?;
@@ -451,8 +463,57 @@ impl Job<'_> {
         Ok(())
     }
 
+    /// 1 つのファイルを写す。置き場は排他的に作り（同名は上書きせず断る）、中身を写す間は
+    /// バイトを進めて**そのファイルの途中でも**取り消しを見る（#1895）。失敗・取り消しの
+    /// 作りかけは `fs_copy::copy_file_exclusive` が消す
     fn copy_file(&mut self, src: &Path, dst: &Path) -> Result<(), CopyRefusal> {
-        let bytes = std::fs::copy(src, dst).map_err(|e| write_error(&e, dst))?;
+        if legacy_1895() {
+            return self.copy_file_legacy(src, dst);
+        }
+        let progress = self.progress;
+        let mut reported = 0u64;
+        let outcome = fs_copy::copy_file_exclusive(src, dst, self.allow_clone, &mut |copied| {
+            if let Some(delay) = injected_chunk_delay() {
+                std::thread::sleep(delay);
+            }
+            if copied > reported {
+                progress.add_done(0, copied - reported);
+                reported = copied;
+            }
+            !progress.is_cancelled()
+        });
+        let bytes = match outcome {
+            Ok((bytes, _route)) => bytes,
+            Err(fs_copy::FileCopyError::Cancelled) => return Err(CopyRefusal::Cancelled),
+            Err(fs_copy::FileCopyError::Io(e)) => return Err(write_error(&e, dst)),
+        };
+        // clone は途中が無いので、ここで一度に進める（中身を写した道は届いた残りだけ）
+        if bytes > reported {
+            progress.add_done(0, bytes - reported);
+        }
+        self.stats.files += 1;
+        self.stats.bytes += bytes;
+        progress.add_done(1, 0);
+        Ok(())
+    }
+
+    /// `TAKO_1895_LEGACY=1` の A/B: #1895 の前の写し方（名前を `create_new` で押さえて
+    /// `std::fs::copy` = 1 つのファイルの途中では止まらず、バイトは写し終えてから一度に進む。
+    /// 押さえた名前の上へ写すので APFS の clone も効かない）
+    fn copy_file_legacy(&mut self, src: &Path, dst: &Path) -> Result<(), CopyRefusal> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst)
+            .map_err(|e| write_error(&e, dst))?;
+        let bytes = match std::fs::copy(src, dst) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // 押さえた名前（この呼び出しが作ったもの）だけを消す
+                let _ = std::fs::remove_file(dst);
+                return Err(write_error(&e, dst));
+            }
+        };
         self.stats.files += 1;
         self.stats.bytes += bytes;
         self.progress.add_done(1, bytes);
@@ -530,6 +591,14 @@ pub struct Progress {
     /// 写した件数がこれに達したら取り消したことにする（0 = 使わない）。単体テストが途中の
     /// 取り消しを決定的に起こすための印で、本番の経路は立てない
     cancel_at: AtomicU64,
+    /// 写したバイトがこれに達したら取り消したことにする（0 = 使わない。#1895 の単体テストが
+    /// 1 つのファイルの途中の取り消しを決定的に起こすための印。本番の経路は立てない）
+    cancel_at_bytes: AtomicU64,
+    /// OS の複製（clone）を試さず中身を写す（#1895 の単体テストが同じ APFS の一時 dir の中で
+    /// 「1 つのファイルの途中」を作るための印。本番の経路は立てない）
+    no_clone: AtomicBool,
+    /// 数え終えた時刻（残り時間の目安の速さは、ここからの平均で測る。#1895）
+    counted_at: std::sync::OnceLock<std::time::Instant>,
 }
 
 /// ある時点の進み具合（応答・画面に載せる値）
@@ -541,8 +610,10 @@ pub struct ProgressSnapshot {
     pub bytes_total: u64,
     /// まだ数えている（`*_total` は数えたところまで）
     pub counting: bool,
-    /// 取り消しを受けた（次の項目へ進む前に止まる）
+    /// 取り消しを受けた（写している 1 件の途中でも止まる。#1895）
     pub cancelled: bool,
+    /// 数え終えてから（= 写し始めてから）の時間。数えている間は 0（#1895 の残り時間の目安）
+    pub copying_for: std::time::Duration,
 }
 
 impl Progress {
@@ -556,11 +627,16 @@ impl Progress {
         if at > 0 && self.entries_done.load(Ordering::Relaxed) >= at {
             return true;
         }
+        let at_bytes = self.cancel_at_bytes.load(Ordering::Relaxed);
+        if at_bytes > 0 && self.bytes_done.load(Ordering::Relaxed) >= at_bytes {
+            return true;
+        }
         self.cancel.load(Ordering::Relaxed)
     }
 
     /// 数え終えた印（ここから先の `*_total` は確定）
     pub fn finish_counting(&self) {
+        let _ = self.counted_at.set(std::time::Instant::now());
         self.counted.store(true, Ordering::Relaxed);
     }
 
@@ -572,6 +648,11 @@ impl Progress {
             bytes_total: self.bytes_total.load(Ordering::Relaxed),
             counting: !self.counted.load(Ordering::Relaxed),
             cancelled: self.is_cancelled(),
+            copying_for: self
+                .counted_at
+                .get()
+                .map(std::time::Instant::elapsed)
+                .unwrap_or_default(),
         }
     }
 
@@ -612,6 +693,86 @@ pub fn measure(src: &Path, progress: &Progress) -> Result<(), CopyRefusal> {
         }
     }
     Ok(())
+}
+
+// --- 残り時間の目安（FR-3.39 / #1895） ----------------------------------------------
+
+/// 残り時間の目安を出し始めるまでの写した時間。始めの数秒は速さがぶれる（読み先が
+/// キャッシュに乗っている・小さなファイルが続く・clone が一瞬で終わる）ので見せない
+pub const ETA_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(2);
+/// 残り時間の目安を出し始めるまでに写したバイトの割合（千分率 = 1%）
+pub const ETA_MIN_PERMILLE: u64 = 10;
+
+/// 残り時間の目安（GUI の帯・CLI / MCP の `copy_progress` の `eta_secs` が同じものを読む）。
+///
+/// 写し始めてから（数え終えてから）の**平均の速さ**で残りのバイトを割る（直近の速さで割ると
+/// 1 チャンクごとに揺れる）。出さないとき: 数えている・取り消した・バイトが無い（空のフォルダと
+/// リンクだけ）・写し終えた・写し始めて [`ETA_MIN_ELAPSED`] 経っていない・
+/// [`ETA_MIN_PERMILLE`] ‰ 写していない
+pub fn eta(snap: &ProgressSnapshot) -> Option<std::time::Duration> {
+    if snap.counting
+        || snap.cancelled
+        || snap.bytes_total == 0
+        || snap.bytes_done == 0
+        || snap.bytes_done >= snap.bytes_total
+        || snap.copying_for < ETA_MIN_ELAPSED
+    {
+        return None;
+    }
+    if u128::from(snap.bytes_done) * 1000
+        < u128::from(snap.bytes_total) * u128::from(ETA_MIN_PERMILLE)
+    {
+        return None;
+    }
+    let per_sec = snap.bytes_done as f64 / snap.copying_for.as_secs_f64();
+    let left = (snap.bytes_total - snap.bytes_done) as f64 / per_sec;
+    // 何日もかかる見積もりは見せる意味が無い（帯は時間までしか書かない）
+    (left.is_finite() && left < 100.0 * 3600.0).then(|| std::time::Duration::from_secs_f64(left))
+}
+
+/// 帯に書く残り時間（[`eta`] を粗く丸めたもの。150 ms ごとに描き直してもちらつかない粒度）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtaLabel {
+    /// 10 秒未満
+    Soon,
+    /// 1 分未満（5 秒単位へ切り上げ）
+    Seconds(u64),
+    /// 1 時間未満（分へ四捨五入・最低 1 分）
+    Minutes(u64),
+    /// 1 時間以上（10 分単位へ切り上げ）
+    Hours { hours: u64, minutes: u64 },
+}
+
+/// [`eta`] の値を帯に書く粒度へ丸める
+pub fn eta_label(left: std::time::Duration) -> EtaLabel {
+    let secs = left.as_secs_f64().ceil() as u64;
+    if secs < 10 {
+        return EtaLabel::Soon;
+    }
+    if secs < 60 {
+        let up = secs.div_ceil(5) * 5;
+        return if up < 60 {
+            EtaLabel::Seconds(up)
+        } else {
+            EtaLabel::Minutes(1)
+        };
+    }
+    if secs < 3600 {
+        let minutes = ((secs + 30) / 60).max(1);
+        return if minutes < 60 {
+            EtaLabel::Minutes(minutes)
+        } else {
+            EtaLabel::Hours {
+                hours: 1,
+                minutes: 0,
+            }
+        };
+    }
+    let tens = secs.div_ceil(600);
+    EtaLabel::Hours {
+        hours: tens / 6,
+        minutes: (tens % 6) * 10,
+    }
 }
 
 /// 走っているコピー 1 つ（[`jobs`] の一覧に載る）
@@ -740,6 +901,30 @@ fn injected_delay() {
     }
 }
 
+/// 検証用の遅延（`TAKO_1895_COPY_CHUNK_DELAY_MS=<ミリ秒>` で、1 つのファイルの中身を写す単位
+/// （macOS は 1 MiB）ごとに待つ）。**1 つのファイルの途中**の進み具合と取り消しを、数十 MiB の
+/// fixture で見るためのもの（数 GB のファイル・CPU を焼く負荷で遅くしない）。立てた回は
+/// clone を試さない（一瞬で終わる clone には途中が無い）。未設定なら None
+fn injected_chunk_delay() -> Option<std::time::Duration> {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("TAKO_1895_COPY_CHUNK_DELAY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+    })
+}
+
+/// `TAKO_1895_LEGACY=1` で **#1895 の前**へ戻す（同一バイナリの A/B）: 1 つのファイルは
+/// `create_new` + `std::fs::copy` で写す（途中で止まらない・バイトは写し終えてから進む・clone も
+/// 効かない）・ツリーの ⇧↑ / ⇧↓ / ⌘⌫（Windows は Delete）を受けない・帯に残り時間を出さない・
+/// CLI `tako file copy a b dst` は 1 件ずつ別の要求（別のジョブ）で送る
+pub fn legacy_1895() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1895_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
 /// `TAKO_1860_LEGACY=1` で**ファイルツリーがコピー / 切り取り / 貼り付けのキーを受けない**
 /// （#1860 の A/B）。⌘C / ⌘X / ⌘V は #1860 の前と同じくペインへ流れ、右クリックの
 /// 3 項目も出ない。CLI / MCP の `op=copy` は同じ経路のまま（画面の入口だけを外す）
@@ -780,6 +965,16 @@ mod tests {
 
     fn finder_ja() -> CopyNaming {
         CopyNaming::for_platform(Platform::MacOs, Lang::Ja)
+    }
+
+    /// `allow_clone` が偽なら clone を試さず中身を写す道を通す（#1895）
+    fn routed(
+        plan: &CopyPlan,
+        progress: &Progress,
+        allow_clone: bool,
+    ) -> Result<CopyStats, CopyRefusal> {
+        progress.no_clone.store(!allow_clone, Ordering::Relaxed);
+        execute_with(plan, progress)
     }
 
     fn copy(src: &Path, dest: &Path) -> Result<(CopyPlan, CopyStats), CopyRefusal> {
@@ -1168,6 +1363,394 @@ mod tests {
         assert_eq!(CopyRefusal::Cancelled.slug(), "cancelled");
         assert!(CopyRefusal::Cancelled.reason().contains("取り消した"));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 中身のあるファイル（`mib` MiB。同じ値が並ばないよう位置を混ぜる = 疎なファイルにしない）
+    fn big_file(path: &Path, mib: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = vec![0u8; mib << 20];
+        for (i, b) in body.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(2_654_435_761) >> 13) as u8;
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn 一つのファイルの途中で取り消すと作りかけを残さずバイトは途中まで進んでいる() {
+        let base = scratch("cancel-midfile");
+        big_file(&base.join("big.bin"), 8);
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let total = 8u64 << 20;
+        let p = plan(&base.join("big.bin"), &base.join("dst"), finder_ja()).unwrap();
+        let progress = Progress::default();
+        measure(&base.join("big.bin"), &progress).unwrap();
+        progress.finish_counting();
+        // 2 MiB 写したところで取り消しの印が立つ（clone を試さず中身を写す道）
+        progress.cancel_at_bytes.store(2 << 20, Ordering::Relaxed);
+        assert_eq!(routed(&p, &progress, false), Err(CopyRefusal::Cancelled));
+        let snap = progress.snapshot();
+        assert!(
+            !base.join("dst/big.bin").exists(),
+            "1 つのファイルの途中で取り消したのに作りかけが残っている"
+        );
+        assert_eq!(snap.entries_done, 0, "写し終えたことになっていない");
+        assert!(snap.cancelled);
+        // macOS は 1 MiB ごとに届く = 途中で止まる。Windows は CopyFileExW の単位しだい
+        // （止まり・作りかけを消すことは両 OS で見る）
+        if cfg!(target_os = "macos") {
+            assert!(
+                snap.bytes_done >= 2 << 20 && snap.bytes_done < total,
+                "ファイルの途中で止まっていない: {snap:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(base.join("big.bin")).unwrap().len(),
+            total,
+            "コピー元が欠けた"
+        );
+        // 取り消した直後にもう一度写すと最後まで写る（同じ名前が空いている = 作りかけが無い）
+        let again = Progress::default();
+        let stats = routed(&p, &again, false).unwrap();
+        assert_eq!(stats.bytes, total);
+        assert_eq!(
+            std::fs::read(base.join("dst/big.bin")).unwrap(),
+            std::fs::read(base.join("big.bin")).unwrap()
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 中身を写す道はバイトが単調に増えて写した量で満ちる() {
+        let base = scratch("bytes-monotonic");
+        big_file(&base.join("d/big.bin"), 4);
+        touch(&base.join("d/small.txt"), "small");
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let p = plan(&base.join("d"), &base.join("dst"), finder_ja()).unwrap();
+        let progress = std::sync::Arc::new(Progress::default());
+        measure(&base.join("d"), &progress).unwrap();
+        progress.finish_counting();
+        // 写している間の bytes_done を別のスレッドから読み続ける（減ったら単調でない）
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let progress = std::sync::Arc::clone(&progress);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    seen.push(progress.snapshot().bytes_done);
+                    std::thread::yield_now();
+                }
+                seen
+            })
+        };
+        let stats = routed(&p, &progress, false).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let seen = watcher.join().unwrap();
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "バイトの進み具合が減った: {:?}",
+            seen.windows(2).find(|w| w[0] > w[1])
+        );
+        let done = progress.snapshot();
+        assert_eq!(done.bytes_done, stats.bytes);
+        assert_eq!(
+            (done.bytes_done, done.entries_done),
+            (done.bytes_total, done.entries_total)
+        );
+        assert_eq!(
+            std::fs::read(base.join("dst/d/big.bin")).unwrap(),
+            std::fs::read(base.join("d/big.bin")).unwrap()
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 写す先に同名ができていたらどちらの道でも上書きしない() {
+        let base = scratch("exclusive");
+        big_file(&base.join("src/a.bin"), 1);
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        for allow_clone in [true, false] {
+            let p = plan(&base.join("src/a.bin"), &base.join("dst"), finder_ja()).unwrap();
+            touch(&base.join("dst/a.bin"), "割り込み");
+            assert_eq!(
+                routed(&p, &Progress::default(), allow_clone),
+                Err(CopyRefusal::NameTaken),
+                "allow_clone={allow_clone}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(base.join("dst/a.bin")).unwrap(),
+                "割り込み",
+                "割り込んだファイルを上書き・削除した（allow_clone={allow_clone}）"
+            );
+            std::fs::remove_file(base.join("dst/a.bin")).unwrap();
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 空のファイルはどちらの道でも写り進み具合が満ちる() {
+        let base = scratch("empty-file");
+        touch(&base.join("src/empty.txt"), "");
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        for (allow_clone, dir) in [(true, "dst"), (false, "dst2")] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+            let p = plan(&base.join("src/empty.txt"), &base.join(dir), finder_ja()).unwrap();
+            let progress = Progress::default();
+            measure(&base.join("src/empty.txt"), &progress).unwrap();
+            progress.finish_counting();
+            let stats = routed(&p, &progress, allow_clone).unwrap();
+            assert_eq!((stats.files, stats.bytes), (1, 0));
+            let snap = progress.snapshot();
+            assert_eq!((snap.entries_done, snap.bytes_done), (1, 0));
+            assert_eq!(
+                std::fs::read(base.join(dir).join("empty.txt")).unwrap(),
+                b""
+            );
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 同じapfsボリュームの中はcloneで一瞬で写り属性も写る() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("clone");
+        big_file(&base.join("src/a.bin"), 2);
+        std::fs::set_permissions(
+            base.join("src/a.bin"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        let mut calls = 0;
+        let (bytes, route) = fs_copy::copy_file_exclusive(
+            &base.join("src/a.bin"),
+            &base.join("dst/a.bin"),
+            true,
+            &mut |_| {
+                calls += 1;
+                true
+            },
+        )
+        .unwrap();
+        // 一時 dir が APFS でない環境（CI の一部）では中身を写す道へ落ちる = どちらでも中身は同じ
+        assert_eq!(bytes, 2 << 20);
+        if route == fs_copy::FileRoute::Clone {
+            assert_eq!(calls, 0, "clone は途中が無い");
+        }
+        assert_eq!(
+            std::fs::read(base.join("dst/a.bin")).unwrap(),
+            std::fs::read(base.join("src/a.bin")).unwrap()
+        );
+        let mode = std::fs::metadata(base.join("dst/a.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "権限が写っていない（route={route:?}）");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 写すバイトの口は累計を渡し偽で止めると作りかけを消す() {
+        let base = scratch("fs-copy-data");
+        big_file(&base.join("a.bin"), 6);
+        let mut seen = Vec::new();
+        let (bytes, route) = fs_copy::copy_file_exclusive(
+            &base.join("a.bin"),
+            &base.join("b.bin"),
+            false,
+            &mut |copied| {
+                seen.push(copied);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!((bytes, route), (6 << 20, fs_copy::FileRoute::Data));
+        assert!(!seen.is_empty(), "進み具合が 1 度も届かない");
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "累計が減った: {seen:?}"
+        );
+        assert_eq!(
+            seen.last().copied(),
+            Some(6 << 20),
+            "最後の累計が写した量と違う: {seen:?}"
+        );
+        // 1 回目の報告で止める
+        let mut calls = 0;
+        let stopped = fs_copy::copy_file_exclusive(
+            &base.join("a.bin"),
+            &base.join("c.bin"),
+            false,
+            &mut |_| {
+                calls += 1;
+                false
+            },
+        );
+        assert!(
+            matches!(stopped, Err(fs_copy::FileCopyError::Cancelled)),
+            "{stopped:?}"
+        );
+        assert_eq!(calls, 1, "止めた後も進み具合が届いた");
+        assert!(
+            !base.join("c.bin").exists(),
+            "止めたのに作りかけが残っている"
+        );
+        // 写す先が既にある = 断って触らない
+        touch(&base.join("d.bin"), "keep");
+        let taken = fs_copy::copy_file_exclusive(
+            &base.join("a.bin"),
+            &base.join("d.bin"),
+            false,
+            &mut |_| true,
+        );
+        match taken {
+            Err(fs_copy::FileCopyError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists)
+            }
+            other => panic!("同名を断っていない: {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(base.join("d.bin")).unwrap(), "keep");
+        // コピー元が無い = 何も作らない
+        let missing = fs_copy::copy_file_exclusive(
+            &base.join("nope"),
+            &base.join("e.bin"),
+            true,
+            &mut |_| true,
+        );
+        assert!(matches!(missing, Err(fs_copy::FileCopyError::Io(_))));
+        assert!(!base.join("e.bin").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 書けないフォルダへは途中を作らず理由つきで断る() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("unwritable-file");
+        big_file(&base.join("a.bin"), 1);
+        std::fs::create_dir_all(base.join("locked")).unwrap();
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        // root で走る CI では書けてしまう（その回は検査の対象外）
+        if std::fs::write(base.join("locked/probe"), "x").is_ok() {
+            std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::remove_dir_all(&base).unwrap();
+            return;
+        }
+        for allow_clone in [true, false] {
+            let p = plan(&base.join("a.bin"), &base.join("locked"), finder_ja()).unwrap();
+            assert_eq!(
+                routed(&p, &Progress::default(), allow_clone),
+                Err(CopyRefusal::Unwritable(base.join("locked/a.bin"))),
+                "allow_clone={allow_clone}"
+            );
+        }
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(std::fs::read_dir(base.join("locked")).unwrap().count(), 0);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn snap(done: u64, total: u64, secs: f64) -> ProgressSnapshot {
+        ProgressSnapshot {
+            entries_done: 1,
+            entries_total: 2,
+            bytes_done: done,
+            bytes_total: total,
+            counting: false,
+            cancelled: false,
+            copying_for: std::time::Duration::from_secs_f64(secs),
+        }
+    }
+
+    #[test]
+    fn 残り時間は始めの数秒と少ししか写していないうちは出さず平均の速さで割る() {
+        // 10 MB/s で 40% = 残り 60 MB = 6 秒
+        let left = eta(&snap(40_000_000, 100_000_000, 4.0)).unwrap();
+        assert!((left.as_secs_f64() - 6.0).abs() < 0.01, "{left:?}");
+        // 写し始めて 2 秒経っていない
+        assert_eq!(eta(&snap(40_000_000, 100_000_000, 1.9)), None);
+        // 1% 写していない（10 GB の 0.5%）
+        assert_eq!(eta(&snap(50_000_000, 10_000_000_000, 10.0)), None);
+        assert!(
+            eta(&snap(100_000_000, 10_000_000_000, 10.0)).is_some(),
+            "1% ちょうどで出す"
+        );
+        // 数えている・取り消した・バイトが無い・写し終えた・0 バイト
+        let mut s = snap(40, 100, 4.0);
+        s.counting = true;
+        assert_eq!(eta(&s), None);
+        let mut s = snap(40, 100, 4.0);
+        s.cancelled = true;
+        assert_eq!(eta(&s), None);
+        assert_eq!(eta(&snap(0, 0, 4.0)), None);
+        assert_eq!(eta(&snap(100, 100, 4.0)), None);
+        assert_eq!(eta(&snap(0, 100, 4.0)), None);
+        // 何日もかかる見積もりは出さない
+        assert_eq!(eta(&snap(1_000_000, 100_000_000_000_000, 10.0)), None);
+        // 巨大な母数でも桁あふれしない
+        assert!(eta(&snap(u64::MAX / 2, u64::MAX, 3.0)).is_some());
+    }
+
+    #[test]
+    fn 残り時間は帯に書く粒度へ丸める() {
+        use std::time::Duration;
+        let s = |secs: f64| eta_label(Duration::from_secs_f64(secs));
+        assert_eq!(s(0.2), EtaLabel::Soon);
+        assert_eq!(s(9.0), EtaLabel::Soon);
+        assert_eq!(s(9.5), EtaLabel::Seconds(10));
+        assert_eq!(s(11.0), EtaLabel::Seconds(15));
+        assert_eq!(s(25.0), EtaLabel::Seconds(25));
+        assert_eq!(s(56.0), EtaLabel::Minutes(1), "60 秒へ切り上がったら 1 分");
+        assert_eq!(s(60.0), EtaLabel::Minutes(1));
+        assert_eq!(s(89.0), EtaLabel::Minutes(1));
+        assert_eq!(s(90.0), EtaLabel::Minutes(2));
+        assert_eq!(s(3569.0), EtaLabel::Minutes(59));
+        assert_eq!(
+            s(3590.0),
+            EtaLabel::Hours {
+                hours: 1,
+                minutes: 0
+            },
+            "60 分へ丸まったら 1 時間"
+        );
+        assert_eq!(
+            s(3601.0),
+            EtaLabel::Hours {
+                hours: 1,
+                minutes: 10
+            }
+        );
+        assert_eq!(
+            s(4800.0),
+            EtaLabel::Hours {
+                hours: 1,
+                minutes: 20
+            }
+        );
+        assert_eq!(
+            s(7200.0),
+            EtaLabel::Hours {
+                hours: 2,
+                minutes: 0
+            }
+        );
+    }
+
+    #[test]
+    fn 数え終えてからの時間が進み具合に載る() {
+        let progress = Progress::default();
+        assert_eq!(progress.snapshot().copying_for, std::time::Duration::ZERO);
+        progress.finish_counting();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let first = progress.snapshot().copying_for;
+        assert!(first >= std::time::Duration::from_millis(20), "{first:?}");
+        // 2 度目の印は時刻を上書きしない（始めた時刻は 1 つ）
+        progress.finish_counting();
+        assert!(progress.snapshot().copying_for >= first);
     }
 
     #[test]
