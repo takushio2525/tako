@@ -2345,7 +2345,10 @@ set -gq copy-mode-position-format ''
         // **接頭辞をわざと外す**（`tako` で始まらない名前）。それでも残骸掃除が拾う
         // `tk-coretest-` にする（#1874: 旧名 `ct1105-<pid>` は途中で殺されると残り続けた）
         let socket = format!("tk-coretest-1105-{}", std::process::id());
-        assert!(!socket.starts_with("tako"), "この検査は名前が tako で始まらないことが前提");
+        assert!(
+            !socket.starts_with("tako"),
+            "この検査は名前が tako で始まらないことが前提"
+        );
         let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let options = SpawnOptions {
             command: None,

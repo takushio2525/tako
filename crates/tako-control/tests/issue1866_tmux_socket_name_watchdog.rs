@@ -274,7 +274,8 @@ fn test_sources(root: &Path) -> Vec<TestSource> {
             let src = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("{} を読める: {e}", path.display()));
             // `mod tests;` で切り出したファイル（`…/tests.rs`）と `tests/` 配下は丸ごとテスト
-            let whole = rel.contains("/tests/") || path.file_name().is_some_and(|n| n == "tests.rs");
+            let whole =
+                rel.contains("/tests/") || path.file_name().is_some_and(|n| n == "tests.rs");
             let text = if whole {
                 src
             } else {
@@ -353,7 +354,13 @@ fn plain_ident(expr: &str) -> Option<&str> {
     e = e.strip_prefix('&').unwrap_or(e).trim();
     loop {
         let before = e;
-        for suffix in [".clone()", ".as_str()", ".to_string()", ".as_ref()", ".into()"] {
+        for suffix in [
+            ".clone()",
+            ".as_str()",
+            ".to_string()",
+            ".as_ref()",
+            ".into()",
+        ] {
             e = e.strip_suffix(suffix).unwrap_or(e);
         }
         if e == before {
@@ -811,11 +818,13 @@ fn c() {
 
     #[test]
     fn 固定名と辿れない名前() {
+        // 断片は #1300 の番犬（`tmux_e2e_watchdog.rs`）の形（`Command::new("tmux")` と
+        // `"tako-e2e-<数字>"`）に当たらない綴りで書く（向こうは tests/ 直下を走査する）
         let text = r#"
-    const E2E_SOCKET_571: &str = "tako-e2e-571";
-    fn a() {
-        let _ = Command::new("tmux").args(["-L", E2E_SOCKET_571, "kill-server"]).output();
-        std::env::set_var("TAKO_TMUX_SOCKET", E2E_SOCKET_571);
+    const FIXED_SOCKET: &str = "tako-fixed-571";
+    fn a(bin: &str) {
+        let _ = Command::new(bin).args(["-L", FIXED_SOCKET, "kill-server"]).output();
+        std::env::set_var("TAKO_TMUX_SOCKET", FIXED_SOCKET);
     }
     fn run(bin: &str, socket: &str) {
         let _ = Command::new(bin).args(["-L", socket, "kill-server"]).output();
