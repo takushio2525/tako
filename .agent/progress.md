@@ -20,14 +20,6 @@
 
 ---
 
-## 2026-09-30（#1845: Windows の zip・インストーラーへライセンス 3 本を同梱し、両 OS の組み立てを番犬で固定した）
-- `tako.iss` の `[Files]` と `build-installer.ps1` の zip へ `THIRD-PARTY-NOTICES.md` / `THIRD-PARTY-LICENSES.md` を足した（`LICENSE.txt` は従来どおり）。`verify-assets.ps1` が zip を展開して 3 本が元ファイルとバイト一致するかを見て、CI だけがインストーラーを無人インストールしてインストール先も見る。`release-windows.yml` はタグ以外の ref から dispatch するとドライラン（Release へ添付しない）
-- 実測: 番犬 `license_bundle_watchdog.rs` 5 本緑・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・検査関数を pwsh 7.6 で 5 通り（正常 / 欠け / 食い違い / 空 / CI の外）
-
-## 2026-09-30（#1709: tako アプリのデータの扱いのページを最新の main で確かめ直し、窓口をメールと Issue の 2 本立てにして公開した）
-- PR #1714 を #1844 の上へ rebase（フッターは作者のサイト → tako のデータの扱い → 共通ポリシー → Cookie 設定）。事実の記述を現行コードと 1 件ずつ突き合わせ、食い違い 4 件（更新確認の時機・自動リネームの発火条件・設定の共有の始め方・導入の条件）を直し、抜けていた事実 5 件を足した
-- 窓口: 非公開は contact@takushio2525.com、不具合は GitHub Issue（telemetry.md の削除依頼も同じ）。docs 検査 6 本 rc=0・PC 幅 / スマホ幅の横はみ出し 0 px
-
 ## 2026-09-30（#1849: SECURITY.md を置いて脆弱性の非公開の報告先を案内した）
 - リポジトリ直下に日英併記の `SECURITY.md`（第一の窓口 = GitHub の Private vulnerability reporting、第二 = メール。対象の版 = 最新の安定版とテスト版・対象範囲・書いてほしいこと・受領の目安 7 日・公開の流れ）。README と privacy.md のお問い合わせ節に導線 1 行ずつ
 - 窓口の書き分けは PR #1714 のお問い合わせ節と同じ（非公開 = メール / 不具合・要望 = 公開の Issue）。GitHub の Markdown API で描画して見出し 6・リンク切れ 0 を確認
@@ -75,6 +67,7 @@
 ## 2026-10-02（#1864: set -e と EXIT trap を併用するスクリプトが bash 3.2 で途中の死を exit 0 に化けさせるのを塞いだ）
 - 条件は「set -e + EXIT trap + 展開エラー（set -u の未定義変数・`${x:?}`・不正な置換・readonly）」で、`/bin/sh` も同じ。番人の 1 実装 `scripts/lib/exit-guard.sh`（`tako_exit_trap` / `tako_exit 0`。印の無い 0 は 1）へ 11 本を寄せた（nightly-release.sh・release.sh --promote・promo 2・テスト 6・verify-setup-multiagent）。番犬 3 規則を `shell_scripts.rs` へ
 - 実測: 注入 A/B は修正前 rc=0 → 修正後 rc=1（nightly は Test 18 で番人を素の trap に戻すと 0・本物で 1 + ログと通知）。nightly 139 / promote 125 / retry 55 緑
+
 ## 2026-10-08（#1877 S0: tako mod の設計と試作 — 実物の Claude Code 2.1.294 で mod を動かし通信路と導入方式を決めた）
 - 設計書 `.agent/plans/2026-10-tako-mod.md`。隔離 GUI のペインで試作 mod を動かし `$.session.usage()`（初回応答まで tokens / rateLimits は欠ける・window と cost は claude が答える）・`turn.*`・権限 / 質問待ち（`classic.PermissionRequest`）・`session.append`・帯 / ペイン / ボタンからの `tako split` を実測
 - 決定: mod → tako は `$.process.run` で tako CLI（8.5 ms。tako 再起動をまたぐ tmux worker でも CLI フォールバックで繋がるのはこれだけ。MCP は `--strict-mcp-config` で policy 拒否・HTTP 直は 1.5 ms だが再起動で URL / トークンが古びる）。導入は `<data_dir>` へ展開 + ペインの env `CLAUDE_CODE_PLUGIN_DIRS`（設定ファイルを書かない・設定 dir の数に依らない）。版の下限 2.1.294。スライス S1〜S6 + 調査を子 Issue へ
