@@ -77,6 +77,10 @@ pub const NOT_IN_MENU: &[(&str, &str)] = &[
         crate::dispatch::LSP_MENU_ACTION,
         "このメニューの中身そのものを読む口",
     ),
+    (
+        crate::dispatch::LSP_HOVER_ACTION,
+        "入口はマウスを乗せること（右クリックした語にはもう乗っている = カードが出る）と、編集メニュー・パレットの「ホバー情報を表示」（#1681）",
+    ),
 ];
 
 /// 項目を押したときの位置と選択（行 1 始まり・桁 0 始まりの行内 UTF-8 バイト = `tako edit replace-range`）

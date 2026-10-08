@@ -267,7 +267,7 @@ impl TakoApp {
     /// このペインでマウスのホバーを使うか。コード表示で、検出表にこの拡張子を受け持つサーバがあり、
     /// LSP が有効で、A/B の旧挙動（`TAKO_1681_LEGACY=1`）でなく、**文書が言語サーバにつながっている**
     /// （編集モードか、別のペインが編集している = 乗せただけでサーバを起こさない）ときだけ。
-    /// 補完の一覧を出しているペインでは出さない（打っている最中に重ねない）
+    /// 補完の一覧を出しているペイン・右クリックメニューを開いているあいだは出さない（重ねない）
     pub(crate) fn lsp_hover_enabled_for(&self, pane: PaneId) -> bool {
         if tako_control::lsp::hover::legacy() || !self.lsp.is_enabled() {
             return false;
@@ -278,6 +278,10 @@ impl TakoApp {
         if state.mode != preview::PreviewMode::Code
             || tako_core::lsp::servers::resolve(&state.path).is_none()
             || self.lsp_completion_open_in(pane)
+            // 右クリックメニュー（#1684 の言語サーバの項目を含む）を開いているあいだは出さない
+            // （カードはメニューより手前に積まれるので、語の上でマウスが動くとメニューを隠す）
+            || self.pane_context_menu.is_some()
+            || self.context_menu.is_some()
         {
             return false;
         }
@@ -713,6 +717,10 @@ impl TakoApp {
             .is_some_and(Option::is_some);
         if !drawn {
             return Err("off-screen");
+        }
+        // 右クリックメニューを開いたら閉じる（メニューより手前に積まれて隠す）
+        if self.pane_context_menu.is_some() || self.context_menu.is_some() {
+            return Err("menu");
         }
         // メニュー / CLI で出したカードはマウスの位置では閉じない（CLI の `--show` はフォーカスが
         // 端末のまま出す = フォーカスでも閉じない。閉じるのはカードの外の押下・打鍵・Esc）

@@ -22,7 +22,7 @@
 //! 5. カードを出す口は `open_lsp_hover_card` の 1 本（CLI / MCP の `show` も GUI のマウスも）。
 //!    編集メニューは CLI と同じ dispatch の 3 段を通す（manager を直に叩かない）
 //! 6. 入口: マウス移動がホバーを更新し、打鍵の入口は補完の表を先に引いてからホバーの Esc を見る。
-//!    重ね順は補完の一覧が手前
+//!    重ね順は補完の一覧が手前。右クリックメニュー（#1684）を開いているあいだはカードを出さない
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -163,9 +163,14 @@ const RULES: &[Rule] = &[
     Rule {
         file: GUI,
         decl: "pub(crate) fn lsp_hover_enabled_for(",
-        must: &["legacy()", "self.lsp.has_document(", "lsp_completion_open_in("],
+        must: &[
+            "legacy()",
+            "self.lsp.has_document(",
+            "lsp_completion_open_in(",
+            "self.pane_context_menu.is_some()",
+        ],
         must_not: &[],
-        why: "マウスのホバーの入口が A/B・つながっていない文書・補完の一覧を見ていない",
+        why: "マウスのホバーの入口が A/B・つながっていない文書・補完の一覧・右クリックメニューを見ていない",
     },
     Rule {
         file: GUI,
@@ -386,6 +391,16 @@ fn 逆戻りを名指しできる() {
             "        let _ = self.lsp.hover(&Default::default());\n        let job = match tako_control::prepare_offload(self, &request) {",
         ),
         "self.lsp.hover(&Default::default())",
+    );
+    // H. 右クリックメニュー（#1684）を開いていてもカードを出す（メニューを隠す）
+    assert_named(
+        "H メニューを見ない",
+        GUI,
+        (
+            "            || self.pane_context_menu.is_some()\n            || self.context_menu.is_some()\n        {\n            return false;",
+            "        {\n            return false;",
+        ),
+        "pub(crate) fn lsp_hover_enabled_for(",
     );
     // G. ホバーの Esc を補完の表より先に見る
     assert_named(

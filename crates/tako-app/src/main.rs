@@ -47915,6 +47915,7 @@ mod self_test {
     /// (5) 下端の行ではカードを語の行の真上へ返し、ウィンドウの中に収める
     /// (6) Esc はカードだけを閉じる（編集モードは抜けない）/ 補完の一覧を出しているあいだは出さない
     /// (7) CLI / MCP の `show` はフォーカスが端末のままでも出し続け、カードの外の押下で閉じる
+    /// (8) 右クリックメニュー（#1684）を開いているあいだは出さず、閉じればまた出る
     ///
     /// 判定は新しい挙動を無条件に主張する。`TAKO_1681_LEGACY=1`（マウスで問い合わせない）では
     /// (1) で落ちる = A/B の検出力。単独実行は `TAKO_VISUAL_ONLY=hover`
@@ -48390,6 +48391,49 @@ mod self_test {
         check(
             closed_by_click,
             "visual-test hover: カードの外を押すと閉じる (#1681)",
+        );
+
+        // (8) 右クリックメニュー（#1684）を開いているあいだはカードを出さない（カードはメニューより
+        //     手前に積まれる = 出すとメニューを隠す）。閉じればまた出る
+        let Some(menu_word) = hover_point(window, cx, pane, 1, 9) else {
+            fail("visual-test hover: 右クリックする語の位置")
+        };
+        vt1860_click(any, window, cx, menu_word, MouseButton::Right);
+        notify_and_draw(any, window, cx);
+        std::env::set_var("TAKO_LSP_HOVER_DELAY_MS", "0");
+        hover_move(any, cx, on_word);
+        for _ in 0..15 {
+            notify_and_draw(any, window, cx);
+            cx.background_executor()
+                .timer(Duration::from_millis(20))
+                .await;
+        }
+        let (menu_open, card_with_menu) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.pane_context_menu.is_some(),
+                    app.lsp_hover.card.is_some(),
+                )
+            })
+            .unwrap_or((false, true));
+        let _ = window.update(cx, |app, _, cx| {
+            app.pane_context_menu = None;
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let (after_menu, retried) = hover_show(any, window, cx, echo_word, 200).await;
+        interfered += retried;
+        std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
+        println!(
+            "TAKO_VISUAL_PIXEL: hover with-menu menu_open={menu_open} card={card_with_menu} after_menu={after_menu:?} interfered={interfered}"
+        );
+        check(
+            menu_open && !card_with_menu,
+            "visual-test hover: 右クリックメニューを開いているあいだはカードを出さない (#1681)",
+        );
+        check(
+            after_menu.is_some(),
+            "visual-test hover: メニューを閉じればまたカードが出る (#1681)",
         );
 
         if let Some(name) = override_env {
