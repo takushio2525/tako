@@ -20,14 +20,6 @@
 
 ---
 
-## 2026-10-02（#1683: LSP の整形（全体 / 範囲）と保存時整形（既定 off）を足した）
-- 当て方は `TextBuffer::apply_changes` の 1 実装（安定ソート → 重なり拒否 → 最小化 → `apply_edit` 1 回 = undo 1 回）、範囲の外は変えない。CLI `tako lsp format [--range]` / `format-on-save` + MCP `tako_lsp` の action（ツール増やさず +841 B）+ 編集メニュー・⇧⌘I（Win は Ctrl+Shift+I）。保存時整形は明示的な保存だけで自動保存では整形しない
-- 実測: `scripts/test-lsp-format-1683.sh` 51 PASS 0 FAIL（v0.8.26 は 30 FAIL）・実 rust-analyzer の整形が rustfmt とバイト一致し undo 1 回で戻る・番犬の注入 7 通りを file:line で名指す
-
-## 2026-10-02（#1860: ファイルツリーでファイル・フォルダのコピー / 切り取り / 貼り付けをできるようにした）
-- ⌘C / ⌘X / ⌘V（Windows は Ctrl）と右クリックの 3 項目。コピーは `tako_core::file_copy`（Finder 式の別名・排他作成で上書き 0・失敗は作った分だけ戻す・リンクはリンク）、切り取りの貼り付けは #1834 の `run_file_move`、貼り付け先と中身の選び方は `file_clipboard`。OS のクリップボードは境界 B28（NSPasteboard / CF_HDROP）。dispatch `FileOp` の copy / clipboard_* / paste → `tako file copy|clipboard|paste` / MCP `tako_file_op`（+709 B）。2 秒ポーリングが古い一覧で貼ったものを消す競合も直した
-- 実測: `scripts/test-tree-clipboard-1860.sh` 48 PASS 0 FAIL（実マウス・実キー 7 場面・A/B `TAKO_1860_LEGACY=1` で FAILED・CLI/MCP 字面一致 13 組・一般のペーストボード往復は保存して戻す）・番犬 18 本（注入 9 通り file:line 名指し）
-
 ## 2026-10-02（#1682: LSP 補完（予測変換）= 打鍵中の一覧・仮想化・キーの優先順位・CLI / MCP）
 - core `lsp::completion`（読み取り・rank・truncate・route_key 20 通り・Session）+ `replace_position_ranges`（並べ方・重なり・最小化は #1683 の `order_changes`、当て方は離れた範囲をつないだ差分 = undo 1 回で範囲の外を抱えない）→ manager の取り消しの列（`$/cancelRequest`）・resolve・一時 didOpen は持ち手で加わる → dispatch 3 段 + `lsp_completion_apply` → CLI `tako lsp completion` / MCP `tako_lsp` の `action=completion` → GUI `lsp_completion_ui`（`gpui::list`）
 - 実測: `scripts/test-lsp-completion-1682.sh` 22 PASS（1000 件で組む行 10・基準画像との差分は一覧の中だけ・A/B 2 通りで FAILED・実の rust-analyzer で `s.le` → len）・e2e 8 本・注入 6 通りで名指しの FAILED
@@ -67,6 +59,7 @@
 ## 2026-10-08（#1867: ファイルツリーの複数選択・⌥⌘V（移動として貼る）・大きなコピーの進み具合と取り消し）
 - 選択の正本 `tako_core::tree_select`（⌘ / ⇧クリック・範囲・配下の除去）+ 押下の捕捉フェーズで外した選択を退避。まとめた操作は dispatch `FileOpMany`（clipboard / trash / move を単数と同じ口で 1 件ずつ）、⌥⌘V（Win は Ctrl+Alt+V・AltGr の文字は奪わない）は `paste_move` = #1834 の移動、コピーは `file_copy::Progress` + 一覧 `jobs` で帯と `copy_progress` / `copy_cancel`（作りかけは戻す）。CLI / MCP `tako_file_op` の `paths` と同名の op（カタログ +396 B）
 - 実測: `scripts/test-tree-multiselect-1867.sh` 57 PASS 0 FAIL（visual-test `tree-multiselect` 8 場面・A/B `TAKO_1867_LEGACY=1` で ① が FAILED・CLI と MCP 16 組が字面一致・CLI で始めたコピーを MCP で取り消す / 逆・権限エラー）・番犬 17 本（注入 8 通り file:line）
+
 ## 2026-10-08（#1869: 整形を離れた箇所ごとの差分へ一本化・補完をサーバの読み込み中も出す）
 - 整形と補完の確定を `EditDelta::spans`（差分 1 件に離れた箇所を並べる）+ 書き換えの原始操作 `splice_text` の 1 本へ寄せた（`chained` は廃止）。真因の実測: rust-analyzer 1.95 は読み込みの前半に補完へ即 `null`、後半は答えずに待たせる。tako は打鍵の要求だけ待たずに 0 件で返していた → 打鍵も待って問い直し（次の打鍵・閉じるで抜ける）、GUI は「読み込み中」の 1 行、CLI / MCP は `waited_for_loading_ms` / `status: loading`、`tako lsp status` に `loading`（カタログ +117 B）
 - 実測: 10 万行の整形 → undo の履歴 2,600,298 B・深さ 2・undo 2 回ともバイト一致（旧 `TAKO_1869_LEGACY=1` は 17,399,988 B・深さ 1）・visual-test `completion-loading` 緑（旧で FAILED）・e2e 6 本・番犬の注入 9 通りを file:line で名指し・実の rust-analyzer は読み込み中に GUI で打っても 2.2 秒後に一覧（旧は 25 秒出ない）・整形も緑（`scripts/test-lsp-followup-1869.sh` 37 PASS）
