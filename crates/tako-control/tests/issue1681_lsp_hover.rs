@@ -146,6 +146,7 @@ fn explicit(path: &Path, line: usize, column: usize) -> HoverRequest {
         document: None,
         superseding: false,
         open: true,
+        ticket: None,
     }
 }
 
@@ -408,6 +409,16 @@ fn 能力なし_未応答_落ちた_未導入_対象外は区別して返す() {
     let main = scratch.write("src/main.rs", text);
     let manager = LspManager::new(config(&scratch, "normal", &json!([{ "silent": true }])));
     let _link = open_editing(&manager, &main, text, 1);
+    // 状態を送らないサーバは握手の直後の猶予（`STATUS_GRACE`）のあいだ「読み込み中」とみなす
+    // （#1893 で補完と同じく、その間の上限は `loading`）。未応答の区別は猶予が明けてから測る
+    wait_until(
+        "握手の直後の猶予が明ける",
+        Duration::from_secs(10),
+        || {
+            let status = server_status(&manager);
+            status["state"] == json!("running") && status["loading"] == json!(false)
+        },
+    );
     let mut request = explicit(&main, 0, 12);
     request.timeout = Duration::from_secs(1);
     match manager.hover(&request) {
@@ -456,9 +467,10 @@ fn 能力なし_未応答_落ちた_未導入_対象外は区別して返す() {
     );
 }
 
-/// 巨大な doc は上限で切って印を付ける（カードはスクロール・CLI / MCP は注記つき）
+/// 巨大な doc: manager は**全文**を返し（#1893）、切るのは出口（CLI / MCP は `limit` = 省略で
+/// 16,000 字・0 で全文。カードはいつも 16,000 字 = tako-app の単体）。切ったら印と全文の取り方の注記
 #[test]
-fn 巨大な_doc_は上限で切る() {
+fn 巨大な_doc_は全文で届き出口で切る() {
     let scratch = Scratch::new("huge");
     let text = "fn main() { a }\n";
     let main = scratch.write("src/main.rs", text);
@@ -473,10 +485,17 @@ fn 巨大な_doc_は上限で切る() {
         .expect("答え")
         .content
         .expect("本文");
-    assert!(content.truncated);
+    assert!(!content.truncated, "manager は切らない");
+    assert_eq!(content.value, big);
     assert_eq!(content.total_chars, big.chars().count());
-    assert!(content.value.chars().count() <= tako_core::lsp::hover::MAX_CHARS);
-    assert!(big.starts_with(&content.value));
+    // 出口（CLI / MCP の応答）: 省略 = 既定の上限で切る / 0 = 全文
+    let cut = tako_control::lsp::hover::found_json("s", &content, None, None);
+    assert_eq!(cut["truncated"], json!(true));
+    let shown = cut["contents"].as_str().unwrap();
+    assert!(shown.chars().count() <= tako_core::lsp::hover::MAX_CHARS);
+    assert!(big.starts_with(shown));
+    let full = tako_control::lsp::hover::found_json("s", &content, None, Some(0));
+    assert_eq!(full["contents"], json!(big));
     manager.shutdown_all(Duration::from_secs(2));
 }
 

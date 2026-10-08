@@ -811,14 +811,18 @@ impl LspMenuJob {
 }
 
 impl LspMenuAnswer {
-    /// メニューに出す LSP 項目（出し分けの正本 `tako_core::lsp::menu::items` の 1 実装）
+    /// メニューに出す LSP 項目（出し分けの正本 `tako_core::lsp::menu::items` の 1 実装。
+    /// A/B の旧腕で消す項目 = `lsp::menu::shown` もここで落とす = GUI と CLI / MCP が揃う）
     pub fn items(&self) -> Vec<tako_core::lsp::menu::MenuItem> {
         match &self.verdict {
             LspMenuVerdict::Ready { capabilities, .. } => tako_core::lsp::menu::items(
                 capabilities,
                 self.context.symbol.as_ref().map(|s| s.kind),
                 self.context.selection.is_some(),
-            ),
+            )
+            .into_iter()
+            .filter(|item| crate::lsp::menu::shown(*item))
+            .collect(),
             _ => Vec::new(),
         }
     }
@@ -1713,18 +1717,23 @@ pub struct LspHoverLanding {
     pub column: usize,
     /// GUI のその位置にカードも出すか
     pub show: bool,
+    /// 応答の本文の字数の上限（#1893。省略 = 16,000 字・0 = 全文 = `tako_core::lsp::hover::char_limit`）。
+    /// カード（`show`）は字数に関わらずいつも 16,000 字まで
+    pub limit: Option<usize>,
     /// 背景で得た答え（[`LspHoverJob::run`] が入れる）
     pub answer: Option<Result<crate::lsp::HoverAnswer, crate::lsp::HoverError>>,
 }
 
 /// ホバーの準備（UI スレッド。#1681）。引数を検査し、編集セッションの本文を採る
-/// （言語サーバの座標へは manager がサーバの見ている本文で直す）。**1 プロセスも起こさない**
+/// （言語サーバの座標へは manager がサーバの見ている本文で直す）。**1 プロセスも起こさない**。
+/// `limit` は応答の本文の字数の上限（#1893。[`LspHoverLanding::limit`]）
 pub fn lsp_hover_prepare(
     host: &dyn ControlHost,
     pane: Option<u64>,
     line: usize,
     column: usize,
     show: bool,
+    limit: Option<usize>,
 ) -> Result<LspHoverJob, DispatchError> {
     if line == 0 {
         return Err(DispatchError::InvalidParams(
@@ -1764,6 +1773,7 @@ pub fn lsp_hover_prepare(
             // 明示の問い合わせ = 取り消し合わない・開いていなければ問い合わせのあいだだけ開く
             superseding: false,
             open: true,
+            ticket: None,
         },
         landing: LspHoverLanding {
             source_pane: target,
@@ -1771,6 +1781,7 @@ pub fn lsp_hover_prepare(
             line,
             column,
             show,
+            limit,
             answer: None,
         },
     })
@@ -1804,10 +1815,14 @@ pub fn lsp_hover_land(
     };
     let Some(content) = &answer.content else {
         let mut out = crate::lsp::hover::none_json(answer.server);
+        crate::lsp::completion::add_waited(&mut out, answer.waited_for_loading);
         out["from"] = from;
         return Ok(out);
     };
-    let mut out = crate::lsp::hover::found_json(answer.server, content, answer.range);
+    let mut out =
+        crate::lsp::hover::found_json(answer.server, content, answer.range, landing.limit);
+    // 読み込みを待ってから答えた（#1893。補完の #1869 と同じ `waited_for_loading_ms`）
+    crate::lsp::completion::add_waited(&mut out, answer.waited_for_loading);
     out["from"] = from;
     if landing.show {
         // 待っているあいだに問い合わせたペインが閉じられた / 差し替わったら出さない
@@ -2237,8 +2252,9 @@ pub fn prepare_offload(
             line,
             column,
             show,
+            limit,
         } => Some(
-            lsp_hover_prepare(host, *pane, *line, *column, show.unwrap_or(false))
+            lsp_hover_prepare(host, *pane, *line, *column, show.unwrap_or(false), *limit)
                 .map(|job| OffloadJob::LspHover(Box::new(job))),
         ),
         // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
@@ -5484,8 +5500,9 @@ fn dispatch_inner(
             line,
             column,
             show,
+            limit,
         } => {
-            let job = lsp_hover_prepare(host, pane, line, column, show.unwrap_or(false))?;
+            let job = lsp_hover_prepare(host, pane, line, column, show.unwrap_or(false), limit)?;
             lsp_hover_land(host, &job.run())
         }
 
@@ -22845,6 +22862,7 @@ mod tests {
             line: 3,
             column: 4,
             show,
+            limit: None,
             answer: Some(answer),
         };
         let content = Hover {
@@ -22859,6 +22877,7 @@ mod tests {
                 server: "fake",
                 content: Some(content.clone()),
                 range: Some((At::new(2, 4), At::new(2, 7))),
+                waited_for_loading: None,
             })
         };
         // show なし: 答えだけ（カードは出さない）
@@ -22887,6 +22906,7 @@ mod tests {
                     server: "fake",
                     content: None,
                     range: None,
+                    waited_for_loading: None,
                 }),
             ),
         )
@@ -22896,6 +22916,7 @@ mod tests {
             none["reason"],
             json!(crate::lsp::text::HOVER_NONE_REASON.text())
         );
+        assert!(none.get("waited_for_loading_ms").is_none());
         let failed = lsp_hover_land(
             &mut host,
             &landing(
@@ -22919,6 +22940,87 @@ mod tests {
         assert_eq!(out["status"], json!("found"));
         assert_eq!(out["shown"], json!(false));
         assert_eq!(host.hover_cards.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1893: 着地は `limit`（省略 = 16,000 字・0 = 全文・N 字）で本文を切り、読み込みを待った答えには
+    /// `waited_for_loading_ms` を載せる（found / none の両方 = 補完と同じ）。読み込みの上限は `loading`
+    #[test]
+    fn ホバーの着地は_limit_で切り_読み込みを待った時間と_loading_を返す() {
+        use std::time::Duration;
+        use tako_core::lsp::hover::{Hover, Markup};
+        let dir = jump_fixture("hover-limit", &["main.rs"]);
+        let main = dir.join("main.rs");
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let (source_path, _) = host.preview_state(PaneId::from_raw(pane)).unwrap();
+        let big: String = (0..2000)
+            .map(|i| format!("line {i} of the doc\n"))
+            .collect();
+        let answer = |content: Option<Hover>, waited: Option<Duration>| {
+            Ok(crate::lsp::HoverAnswer {
+                server: "fake",
+                content,
+                range: None,
+                waited_for_loading: waited,
+            })
+        };
+        let full = Hover {
+            markup: Markup::Markdown,
+            value: big.clone(),
+            truncated: false,
+            total_chars: big.chars().count(),
+            range: None,
+        };
+        let land = |host: &mut MockHost, limit, answer| {
+            lsp_hover_land(
+                host,
+                &LspHoverLanding {
+                    source_pane: PaneId::from_raw(pane),
+                    source_path: source_path.clone(),
+                    line: 1,
+                    column: 0,
+                    show: false,
+                    limit,
+                    answer: Some(answer),
+                },
+            )
+            .unwrap()
+        };
+        let out = land(&mut host, None, answer(Some(full.clone()), None));
+        assert_eq!(out["truncated"], json!(true));
+        assert_eq!(out["total_chars"], json!(big.chars().count()));
+        let out = land(&mut host, Some(0), answer(Some(full.clone()), None));
+        assert_eq!(out["contents"], json!(big), "0 = 全文");
+        assert!(out.get("truncated").is_none());
+        let out = land(
+            &mut host,
+            Some(64),
+            answer(Some(full), Some(Duration::from_millis(1234))),
+        );
+        assert!(out["contents"].as_str().unwrap().chars().count() <= 64);
+        assert_eq!(out["waited_for_loading_ms"], json!(1234));
+        let none = land(
+            &mut host,
+            None,
+            answer(None, Some(Duration::from_millis(77))),
+        );
+        assert_eq!(none["status"], json!("none"));
+        assert_eq!(none["waited_for_loading_ms"], json!(77));
+        let loading = land(
+            &mut host,
+            None,
+            Err(crate::lsp::HoverError::Loading {
+                server: "fake",
+                secs: 3,
+            }),
+        );
+        assert_eq!(loading["status"], json!("loading"));
+        assert_eq!(loading["server"], json!("fake"));
+        assert_eq!(loading["action"], json!("hover"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

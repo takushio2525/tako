@@ -1096,7 +1096,7 @@ pub fn tools() -> Vec<Value> {
                     "enabled": { "type": "boolean", "description": "format-on-save: 保存時整形の ON / OFF（省略で今の値）" },
                     "open": enum_schema(&tako_core::lsp::goto::Placement::NAMES, "定義ジャンプ: 別のファイルを開く新しいペインの置き場所（省略で right）"),
                     "choice": { "type": "integer", "minimum": 1, "description": "定義ジャンプ / 補完: 選ぶ候補の番号（1 始まり。補完は確定する）" },
-                    "limit": { "type": "integer", "minimum": 1, "description": "補完: 返す件数（既定 50）" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "補完: 返す件数（既定 50）/ ホバー: 本文の字数（既定 16000。0 で全文）" },
                     "resolve": { "type": "boolean", "description": "補完: 返す候補の説明を補う" },
                     "show": { "type": "boolean", "description": "ホバー: GUI のその位置にカードも出す（既定 false）" },
                     "focus": { "type": "boolean", "description": "定義ジャンプ: 着地したペインへフォーカスを移す（既定 false）" },

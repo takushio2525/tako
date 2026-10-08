@@ -380,6 +380,12 @@ pub fn hover_no_cursor() -> &'static str {
     )
 }
 
+/// メニュー / キーで頼んだホバーの答えを待っているあいだの印（プレビューのヘッダに出す。#1893）。
+/// サーバが読み込み中なら `tako_control::lsp::text::HOVER_LOADING_NOTE` の方を出す
+pub fn hover_searching() -> &'static str {
+    tr!("ホバー情報を問い合わせています…", "Fetching hover info…")
+}
+
 /// 本文を上限で切ったカードの下の注記
 pub fn hover_truncated(total: usize) -> String {
     let limit = tako_core::lsp::hover::MAX_CHARS;
@@ -456,6 +462,7 @@ mod tests {
                 hover_link_op().to_string(),
                 hover_not_code().to_string(),
                 hover_no_cursor().to_string(),
+                hover_searching().to_string(),
                 hover_truncated(40_000),
             ]
         });

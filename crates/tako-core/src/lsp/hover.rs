@@ -3,8 +3,10 @@
 //! プロセスも I/O も持たない部分だけをここに置く:
 //!
 //! - 応答の読み取り（`Hover.contents` の 3 形 = `MarkupContent` / `MarkedString` /
-//!   `MarkedString[]` と、`null`・空の本文）→ [`parse_response`]
-//! - 本文の上限（巨大な doc で UI と CLI / MCP の応答を膨らませない = [`MAX_CHARS`]。切ったら印を残す）
+//!   `MarkedString[]` と、`null`・空の本文）→ [`parse_response`]（**全文のまま**返す）
+//! - 本文の上限（巨大な doc で UI と CLI / MCP の応答を膨らませない = [`MAX_CHARS`]。切ったら印を残す）。
+//!   切るのは出口ごと（カード = [`MAX_CHARS`]・CLI / MCP = `limit` の指定 = [`char_limit`]）で、
+//!   どちらも [`Hover::limited`] の 1 本を通る（#1893）
 //! - `Hover.range` を tako の座標へ（[`locate_range`]）
 //! - 能力（`hoverProvider`）の読み取り（[`server_supports`]）
 //!
@@ -17,10 +19,20 @@ use serde_json::Value;
 use super::completion::{At, LspRange};
 use super::position::LineIndex;
 
-/// 1 回の答えで持つ本文の上限（文字数）。超えたら切って [`Hover::truncated`] を立てる。
-/// rust-analyzer は `Vec` の上で std の doc を丸ごと（数十 KB）返すので、カード（スクロールする）にも
-/// CLI / MCP の応答にもこの上限で載せる
+/// 本文の上限の既定（文字数）。超えたら切って [`Hover::truncated`] を立てる。
+/// rust-analyzer は `Vec` の上で std の doc を丸ごと（数十 KB）返すので、カード（スクロールする）は
+/// いつもこの上限で、CLI / MCP の応答は `limit` を省いたときこの上限で載せる（[`char_limit`]）
 pub const MAX_CHARS: usize = 16_000;
+
+/// CLI / MCP の `limit`（#1893）→ 本文の上限。省略 = [`MAX_CHARS`]、`0` = 全文（上限なし）、
+/// それ以外 = その字数
+pub fn char_limit(limit: Option<usize>) -> Option<usize> {
+    match limit {
+        None => Some(MAX_CHARS),
+        Some(0) => None,
+        Some(n) => Some(n),
+    }
+}
 
 /// 本文の種類（LSP の `MarkupKind`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +57,7 @@ impl Markup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hover {
     pub markup: Markup,
-    /// 本文（[`MAX_CHARS`] で切った後）
+    /// 本文（[`parse_response`] の答えは全文。[`Hover::limited`] の後は上限まで）
     pub value: String,
     /// 上限で切ったか
     pub truncated: bool,
@@ -53,6 +65,24 @@ pub struct Hover {
     pub total_chars: usize,
     /// `Hover.range`（ホバーの対象の範囲。サーバが付けたときだけ）
     pub range: Option<LspRange>,
+}
+
+impl Hover {
+    /// 本文を `limit` 文字まで（`None` = 全文）にしたもの（#1893）。切ったら [`Hover::truncated`] を
+    /// 立て、[`Hover::total_chars`] は切る前の数のまま。切り方は [`truncate`]（行の切れ目まで戻す）
+    pub fn limited(&self, limit: Option<usize>) -> Hover {
+        let Some(limit) = limit else {
+            return self.clone();
+        };
+        let (value, truncated, _) = truncate(&self.value, limit);
+        Hover {
+            markup: self.markup,
+            value,
+            truncated: self.truncated || truncated,
+            total_chars: self.total_chars,
+            range: self.range,
+        }
+    }
 }
 
 /// `textDocument/hover` の答えを読む。**表示するものが無ければ `None`**
@@ -94,11 +124,11 @@ pub fn parse_response(value: &Value) -> Option<Hover> {
         return None;
     }
     let range = value.get("range").and_then(read_range);
-    let (value, truncated, total_chars) = truncate(&text, MAX_CHARS);
+    let total_chars = text.chars().count();
     Some(Hover {
         markup,
-        value,
-        truncated,
+        value: text,
+        truncated: false,
         total_chars,
         range,
     })
@@ -185,9 +215,12 @@ pub fn locate_range(range: LspRange, text: &str) -> (At, At) {
     (to_at(range.0), to_at(range.1))
 }
 
+/// ホバーの能力の `ServerCapabilities` のキー（右クリックメニューの出し分け = #1893 も引く）
+pub const PROVIDER_KEY: &str = "hoverProvider";
+
 /// サーバがホバーに対応しているか（`hoverProvider` が `true` か options のオブジェクト）
 pub fn server_supports(capabilities: &Value) -> bool {
-    match capabilities.get("hoverProvider") {
+    match capabilities.get(PROVIDER_KEY) {
         Some(Value::Bool(supported)) => *supported,
         Some(Value::Object(_)) => true,
         _ => false,
@@ -281,17 +314,37 @@ mod tests {
     fn 巨大な本文は上限で行の切れ目まで切る() {
         let line = "あ".repeat(99);
         let big: String = (0..400).map(|i| format!("{line}{i}\n")).collect();
-        let hover =
+        let full =
             parse_response(&json!({ "contents": { "kind": "markdown", "value": big } })).unwrap();
+        // 読み取りは全文のまま（切るのは出口 = #1893）
+        assert!(!full.truncated);
+        assert_eq!(full.value, big);
+        let hover = full.limited(char_limit(None));
         assert!(hover.truncated);
         assert_eq!(hover.total_chars, big.chars().count());
         assert!(hover.value.chars().count() <= MAX_CHARS);
         assert!(!hover.value.ends_with('\n'));
         assert!(big.starts_with(&hover.value), "先頭から切る");
+        // 全文（limit 0）は切らない・指定の上限はその字数まで
+        assert_eq!(full.limited(char_limit(Some(0))), full);
+        let small = full.limited(char_limit(Some(250)));
+        assert!(small.truncated && small.value.chars().count() <= 250);
+        assert_eq!(small.total_chars, big.chars().count());
+        // 上限より短い本文は何もしない（印も立てない）
+        assert_eq!(full.limited(Some(big.chars().count())), full);
         // 改行の無い長い 1 行は字で切る
         let (one, cut, total) = truncate(&"x".repeat(50), 10);
         assert_eq!((one.as_str(), cut, total), ("xxxxxxxxxx", true, 50));
         assert_eq!(truncate("短い", 10), ("短い".to_string(), false, 2));
+    }
+
+    /// #1893: `limit` の読み替え（省略 = 既定の上限・0 = 全文・それ以外 = その字数）
+    #[test]
+    fn limit_の読み替え() {
+        assert_eq!(char_limit(None), Some(MAX_CHARS));
+        assert_eq!(char_limit(Some(0)), None);
+        assert_eq!(char_limit(Some(1)), Some(1));
+        assert_eq!(char_limit(Some(40_000)), Some(40_000));
     }
 
     #[test]

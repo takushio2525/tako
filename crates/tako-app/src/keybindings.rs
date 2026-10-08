@@ -75,15 +75,20 @@ actions!(
         // 範囲の整形はメニューとパレットから（キーは張らない = 既存の打鍵を奪わない）
         FormatDocument,
         FormatSelection,
-        // #1681: カーソル位置のホバー情報（型・doc のカード）。キーは張らない（⌘K は使用中で
-        // VS Code / Zed の ⌘K ⌘I が張れない = 既存の打鍵を奪わない）。編集メニューとパレットから
+        // #1681: カーソル位置のホバー情報（型・doc のカード）。#1893 でキーを張った
+        // （割当と理由は `hover_bindings`）。編集メニュー・パレット・右クリックメニューからも
         ShowHover
     ]
 );
 
-/// iTerm2 の操作感を踏襲したキーバインド（実行中のプラットフォームに実際に張るもの）
+/// iTerm2 の操作感を踏襲したキーバインド（実行中のプラットフォームに実際に張るもの）。
+/// A/B の旧腕（`TAKO_1893_LEGACY=1`）はホバーのキーを張らない（#1893 の前）
 pub(crate) fn key_bindings() -> Vec<KeyBinding> {
-    bindings_for(Platform::current())
+    let mut bindings = bindings_for(Platform::current());
+    if tako_control::lsp::hover::legacy_1893() {
+        bindings.retain(|b| b.action().name() != "tako::ShowHover");
+    }
+    bindings
 }
 
 /// **プラットフォームを引数で受ける**バインド表（#1203）。
@@ -94,7 +99,8 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
 /// を macOS の CI で押さえられなくなる（対応マトリクス = #515 と同じ方針）。
 ///
 /// 実際に GPUI へ登録するのは `Platform::current()` の分だけ。
-/// #585 / #517 当時の集合へ足したのは #1677 の [`jump_bindings`] だけ
+/// #585 / #517 当時の集合へ足したのは #1677 の [`jump_bindings`]・#1683 の [`format_bindings`]・
+/// #1893 の [`hover_bindings`] だけ
 fn bindings_for(platform: Platform) -> Vec<KeyBinding> {
     let mut bindings = base_bindings();
     match platform {
@@ -103,7 +109,32 @@ fn bindings_for(platform: Platform) -> Vec<KeyBinding> {
     }
     bindings.extend(jump_bindings(platform));
     bindings.extend(format_bindings(platform));
+    bindings.extend(hover_bindings(platform));
     bindings
+}
+
+/// カーソル位置のホバー情報（型・doc のカード。FR-3.37 / #1893）。案内の表記は
+/// `tako_core::platform::keys::show_hover`（番犬が突き合わせる）
+///
+/// ## macOS = ⇧⌘H
+///
+/// VS Code / Zed の ⌘K ⌘I は張れない: ⌘K はコマンドパレットで、2 打鍵目を待つ間 ⌘K の発火が遅れる。
+/// JetBrains の F1（Quick Documentation）は Mac の F キーが既定で輝度・音量なので届かない。
+/// 整形の ⇧⌘I（#1683）と同じ「⇧⌘ + 英字」の段に置き、英字は Hover の H。⇧⌘H は macOS 全体の
+/// 予約（⌘H = 隠す・⌥⌘H = 他を隠す）とも重ならず、cmd の付く打鍵は PTY へ何も送らないので
+/// 端末の入力手段は減らない
+///
+/// ## Windows = Ctrl+Shift+H
+///
+/// #585 の原則どおり ctrl + 英字は shift 段へ逃がした形（整形の Ctrl+Shift+I と同じ段）。
+/// `keystroke_to_bytes` は Ctrl+Shift+H を Ctrl+H と同じ C0 バイト（0x08 = Backspace）へ潰すので、
+/// 奪っても端末の Ctrl+H は無傷（`ctrl_shift_hを奪ってもctrl_hのbackspaceは残る` テストが実変換で固定）。
+/// JetBrains の Ctrl+Q は XON（フロー制御）で、Ctrl+Shift+Q は終了に使っている
+fn hover_bindings(platform: Platform) -> Vec<KeyBinding> {
+    match platform {
+        Platform::MacOs => vec![KeyBinding::new("cmd-shift-h", ShowHover, None)],
+        Platform::Windows => vec![KeyBinding::new("ctrl-shift-h", ShowHover, None)],
+    }
 }
 
 /// 編集中のコードの整形（FR-3.33 / #1683）。案内の表記は
@@ -264,6 +295,8 @@ fn action_for_palette_command(command_id: &str) -> Option<&'static str> {
         "open-settings" => Some("tako::OpenSettings"),
         // #1683: 整形（範囲の整形はキーを張らない = 併記しない）
         "format-document" => Some("tako::FormatDocument"),
+        // #1893: ホバー情報
+        "show-hover" => Some("tako::ShowHover"),
         _ => None,
     }
 }
@@ -1367,6 +1400,8 @@ mod tests {
             ("ctrl-alt-right", "tako::JumpForward"),
             // 整形（#1683。Zed / VS Code（Linux）と同じ）
             ("ctrl-shift-i", "tako::FormatDocument"),
+            // ホバー情報（#1893。整形と同じ shift 段・H = Hover）
+            ("ctrl-shift-h", "tako::ShowHover"),
         ]
     }
 
@@ -1699,16 +1734,17 @@ mod tests {
             .iter()
             .filter(|b| b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
             .count();
-        // #1683: 整形の ⇧⌘I は macOS では platform 修飾で 1 本増える（45 本は不変のまま。
-        // Windows の Ctrl+Shift+I は非 platform なので数に入らない）
-        let 整形 = format_bindings(Platform::current())
-            .iter()
+        // #1683: 整形の ⇧⌘I・#1893: ホバーの ⇧⌘H は macOS では platform 修飾で 1 本ずつ増える
+        // （45 本は不変のまま。Windows の Ctrl+Shift+I / H は非 platform なので数に入らない）
+        let 追加 = format_bindings(Platform::current())
+            .into_iter()
+            .chain(hover_bindings(Platform::current()))
             .filter(|b| b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
             .count();
         let 期待 = if cfg!(target_os = "macos") {
-            45 + 整形
+            45 + 追加
         } else {
-            45 - MACOS_ONLY.len() + 整形
+            45 - MACOS_ONLY.len() + 追加
         };
         assert_eq!(
             platform本数, 期待,
@@ -1840,6 +1876,97 @@ mod tests {
         }
     }
 
+    /// #1893: ホバーの打鍵が**両 OS で**既存の割当（整形・ジャンプ・パレット・#585 の Windows の割当を
+    /// 含む全部）と衝突しない（同じキーに 2 つのアクションを張らない）。⌘K（パレット）と 2 打鍵に
+    /// しない（2 打鍵目を待つ間パレットの発火が遅れる）。バインド表の外でツリーが取る打鍵
+    /// （⌘C / X / V・⌥⌘V・⇧↑ / ⇧↓・⌘⌫ / Delete）とも重ならない
+    #[test]
+    fn ホバーの打鍵は両osで既存の割当と衝突しない() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let all = bindings_for(platform);
+            let hover = hover_bindings(platform);
+            assert_eq!(hover.len(), 1, "{platform:?}: ホバーの打鍵は 1 本");
+            assert_eq!(
+                hover[0].keystrokes().len(),
+                1,
+                "{platform:?}: 2 打鍵にしない（1 打鍵目の割当の発火が遅れる）"
+            );
+            let mine = hover[0].keystrokes()[0].inner().clone();
+            let others: Vec<&str> = all
+                .iter()
+                .filter(|o| {
+                    let k = o.keystrokes()[0].inner();
+                    k.key == mine.key
+                        && k.modifiers == mine.modifiers
+                        && o.action().name() != "tako::ShowHover"
+                })
+                .map(|o| o.action().name())
+                .collect();
+            assert!(
+                others.is_empty(),
+                "{platform:?}: ホバーの打鍵が {others:?} と衝突している"
+            );
+            // 2 打鍵のバインドの 1 打鍵目にもなっていない（なっていればそちらの発火が遅れる）
+            let prefixed: Vec<&str> = all
+                .iter()
+                .filter(|o| {
+                    o.keystrokes().len() > 1 && {
+                        let k = o.keystrokes()[0].inner();
+                        k.key == mine.key && k.modifiers == mine.modifiers
+                    }
+                })
+                .map(|o| o.action().name())
+                .collect();
+            assert!(prefixed.is_empty(), "{platform:?}: {prefixed:?}");
+            // ツリーの行を選んでいるときの打鍵（#1860 / #1867 / #1895。バインド表ではなくサイドバーの
+            // `on_key_down` が `tako_core::platform::keys` の判定で取る）にも当たらない
+            let m = mine.modifiers;
+            assert_eq!(
+                tako_core::platform::keys::tree_select_key(
+                    platform, &mine.key, m.platform, m.control, m.alt, m.shift
+                ),
+                None,
+                "{platform:?}: ホバーの打鍵がツリーの範囲選択 / ごみ箱の打鍵と重なる"
+            );
+            assert_eq!(
+                tako_core::platform::keys::tree_clip_key(
+                    platform, &mine.key, m.platform, m.control, m.alt, m.shift, false
+                ),
+                None,
+                "{platform:?}: ホバーの打鍵がツリーのコピー / 切り取り / 貼り付けの打鍵と重なる"
+            );
+        }
+        // パレットに併記される（Windows はメニューバーが無く、パレットが打鍵を知る唯一の手段）
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert_eq!(
+                shortcut_hint_for("tako::ShowHover", platform).as_deref(),
+                Some(tako_core::platform::keys::show_hover(platform))
+            );
+        }
+        assert_eq!(
+            action_for_palette_command("show-hover"),
+            Some("tako::ShowHover")
+        );
+    }
+
+    /// #1893: Windows の Ctrl+Shift+H は Ctrl+H と同じ 0x08（Backspace）へ潰れる = 奪っても
+    /// 端末の Ctrl+H は残る（#585 の「shift 段へ逃がす」原則の前提を実変換で固定する）
+    #[test]
+    fn ctrl_shift_hを奪ってもctrl_hのbackspaceは残る() {
+        let mut shifted = ks_ctrl("h");
+        shifted.modifiers.shift = true;
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_ctrl("h")),
+            Some(vec![0x08]),
+            "Ctrl+H が 0x08 を送っていない（前提が変わったら判断をやり直すこと）"
+        );
+        assert_eq!(
+            keystroke_to_bytes_default(&shifted),
+            keystroke_to_bytes_default(&ks_ctrl("h")),
+            "Ctrl+Shift+H が Ctrl+H と同じバイトへ潰れていない"
+        );
+    }
+
     /// #1683: Windows の Ctrl+Shift+I は Ctrl+I と同じ 0x09（Tab）へ潰れる = 奪っても
     /// 端末の Ctrl+I は残る（#585 の「shift 段へ逃がす」原則の前提を実変換で固定する）
     #[test]
@@ -1951,6 +2078,10 @@ mod tests {
                 (
                     "tako::FormatDocument",
                     tako_core::platform::keys::format_document(platform),
+                ),
+                (
+                    "tako::ShowHover",
+                    tako_core::platform::keys::show_hover(platform),
                 ),
             ] {
                 let from_bindings = shortcut_hint_for(action, platform).unwrap_or_else(|| {

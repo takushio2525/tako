@@ -20,14 +20,6 @@
 
 ---
 
-## 2026-10-02（#1864: set -e と EXIT trap を併用するスクリプトが bash 3.2 で途中の死を exit 0 に化けさせるのを塞いだ）
-- 条件は「set -e + EXIT trap + 展開エラー（set -u の未定義変数・`${x:?}`・不正な置換・readonly）」で、`/bin/sh` も同じ。番人の 1 実装 `scripts/lib/exit-guard.sh`（`tako_exit_trap` / `tako_exit 0`。印の無い 0 は 1）へ 11 本を寄せた（nightly-release.sh・release.sh --promote・promo 2・テスト 6・verify-setup-multiagent）。番犬 3 規則を `shell_scripts.rs` へ
-- 実測: 注入 A/B は修正前 rc=0 → 修正後 rc=1（nightly は Test 18 で番人を素の trap に戻すと 0・本物で 1 + ログと通知）。nightly 139 / promote 125 / retry 55 緑
-
-## 2026-10-08（#1877 S0: tako mod の設計と試作 — 実物の Claude Code 2.1.294 で mod を動かし通信路と導入方式を決めた）
-- 設計書 `.agent/plans/2026-10-tako-mod.md`。隔離 GUI のペインで試作 mod を動かし `$.session.usage()`（初回応答まで tokens / rateLimits は欠ける・window と cost は claude が答える）・`turn.*`・権限 / 質問待ち（`classic.PermissionRequest`）・`session.append`・帯 / ペイン / ボタンからの `tako split` を実測
-- 決定: mod → tako は `$.process.run` で tako CLI（8.5 ms。tako 再起動をまたぐ tmux worker でも CLI フォールバックで繋がるのはこれだけ。MCP は `--strict-mcp-config` で policy 拒否・HTTP 直は 1.5 ms だが再起動で URL / トークンが古びる）。導入は `<data_dir>` へ展開 + ペインの env `CLAUDE_CODE_PLUGIN_DIRS`（設定ファイルを書かない・設定 dir の数に依らない）。版の下限 2.1.294。スライス S1〜S6 + 調査を子 Issue へ
-
 ## 2026-10-08（#1681: LSP ホバー = 識別子にマウスを乗せると型・doc のカード・CLI / MCP）
 - core `lsp::hover`（Hover の 3 形・16,000 字の上限・範囲・能力）→ manager の `hover`（マウスは補完と同じ取り消しの列 + `open: false` = 開いている文書に加わるだけ = 乗せただけでサーバを起こさない）→ dispatch 3 段（`show` でカード = `ControlHost::show_lsp_hover`）→ CLI `tako lsp hover` / MCP `tako_lsp` の `action=hover`（+290 B）→ GUI `lsp_hover_ui`（`render_block` 経由・1 フレーム目に測って語の行の上下へ・編集メニュー / パレットの口・右クリックメニューには載せない）
 - 実測: e2e `issue1681_lsp_hover` 9 本・番犬の注入 8 通りを file:line で名指し・`scripts/test-lsp-hover-1681.sh` 23 PASS（visual-test `hover` 8 相 = 基準画像との差分は矩形の外 0 px・100 回で保持件数が増えない・A/B `TAKO_1681_LEGACY=1` で FAILED / `hover-real` で実の rust-analyzer の `String` の doc がカードに出る / CLI・MCP 19 項目）
@@ -67,3 +59,7 @@
 ## 2026-10-09（#748 / PR #754: 合成入力欄をダイアログと誤判定しない固定を今の main へ載せ直した）
 - `dialog.rs` のテストを描く側と同じ組み立てへ（#719 / #718 = 罫線 16 桁・#737 = 20 桁・#1067 = 30 桁 + フッター）。キュー滞留ヒントは #737 ではなく #1067 の形
 - 実測: 注入 A（罫線の棄却を外す）/ A+B（兄弟 1 つで並び）/ E（罫線の最小を 20 本）で形を名指しして FAILED（E は入力欄系でこれだけ）
+
+## 2026-10-09（#1893: LSP ホバーの続き = 右クリックの項目・⇧⌘H・CLI / MCP の全文の口・読み込み中のマウス）
+- 右クリックに「ホバー情報を表示」（`MenuItem::Hover`。移動 → ホバー → 整形・`hoverProvider` の申告で出し分け）・キー ⇧⌘H / Ctrl+Shift+H（⌘K ⌘I はパレットの発火が遅れるので不採用）を編集メニューと同じ `request_lsp_hover` へ。manager は全文を返し、カードは 16,000 字・CLI `--full` / `--limit N` = MCP `limit`（0 = 全文。カタログ +60 B）。マウスも #1869 の `wait_loaded` で待ち、語の真下に「読み込み中」→ カード。取り消しの番号は UI で先に取る（`reserve_hover`。背景で取ると取り消しを追い越して待ち続ける）
+- 実測: `scripts/test-lsp-hover-1893.sh`（visual-test `hover-1893` / `hover-loading` / `hover-loading-real`・A/B `TAKO_1893_LEGACY=1` で名指しの FAILED・#1684 / #1681 の節の回帰・CLI / MCP 字面一致）・実の rust-analyzer は暖機なしで 0.08 秒で「読み込み中」→ 2.2 秒でカード（旧は 95 秒出ない）・e2e 7 本・番犬の注入 12 通りを file:line で名指し・右クリック前のマウスのホバーが明示のカードを消していたのを直した

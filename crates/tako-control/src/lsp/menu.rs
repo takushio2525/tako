@@ -51,15 +51,23 @@ pub enum MenuCapabilities {
 pub fn action_of(item: MenuItem) -> &'static str {
     match item {
         MenuItem::Goto(kind) => kind.slug(),
+        MenuItem::Hover => crate::dispatch::LSP_HOVER_ACTION,
         MenuItem::Format | MenuItem::FormatSelection => crate::dispatch::LSP_FORMAT_ACTION,
     }
+}
+
+/// この項目を出してよいか（A/B の旧腕 = `TAKO_1893_LEGACY=1` は #1893 前、`TAKO_1681_LEGACY=1` は
+/// ホバーそのものの前 = どちらもホバーの項目を出さない）。出し分けの正本 `tako_core::lsp::menu::items`
+/// の後で GUI と CLI / MCP の両方が通る
+pub fn shown(item: MenuItem) -> bool {
+    item != MenuItem::Hover || !(super::hover::legacy_1893() || super::hover::legacy())
 }
 
 /// メニューに**載せない**言語機能の action と理由。
 ///
 /// 言語機能の action（`dispatch::LSP_FEATURE_ACTIONS`）は「メニューの項目の action」か
 /// 「ここ」のどちらか一方に必ず入る（番犬はこのモジュールのテスト）。新しい action
-/// （ホバー・参照の検索・リネーム…）を足したら、項目にするかここへ理由を書くかを決める
+/// （参照の検索・リネーム…）を足したら、項目にするかここへ理由を書くかを決める
 pub const NOT_IN_MENU: &[(&str, &str)] = &[
     (
         "diagnostics",
@@ -76,10 +84,6 @@ pub const NOT_IN_MENU: &[(&str, &str)] = &[
     (
         crate::dispatch::LSP_MENU_ACTION,
         "このメニューの中身そのものを読む口",
-    ),
-    (
-        crate::dispatch::LSP_HOVER_ACTION,
-        "入口はマウスを乗せること（右クリックした語にはもう乗っている = カードが出る）と、編集メニュー・パレットの「ホバー情報を表示」（#1681）",
     ),
 ];
 
@@ -110,6 +114,15 @@ pub fn item_request(item: MenuItem, target: &ItemTarget, focus: Option<bool>) ->
             choice: None,
             focus,
         },
+        // #1893: 編集メニューの「ホバー情報を表示」・CLI の `tako lsp hover --show` と同じ要求
+        // （カードを出す。本文の上限はカードと同じ既定 = `limit` を付けない）
+        MenuItem::Hover => Request::LspHover {
+            pane: Some(target.pane),
+            line: target.line,
+            column: target.column,
+            show: Some(true),
+            limit: None,
+        },
         MenuItem::Format => Request::LspFormat {
             pane: Some(target.pane),
             range: None,
@@ -129,6 +142,13 @@ pub fn item_args(item: MenuItem, target: &ItemTarget) -> Option<Value> {
             "pane": target.pane,
             "line": target.line,
             "column": target.column,
+        }),
+        MenuItem::Hover => json!({
+            "action": action_of(item),
+            "pane": target.pane,
+            "line": target.line,
+            "column": target.column,
+            "show": true,
         }),
         MenuItem::Format => json!({
             "action": action_of(item),
@@ -215,6 +235,31 @@ mod tests {
                 pane: Some(7),
                 range: Some(range),
             })
+        );
+    }
+
+    /// #1893: 「ホバー情報を表示」は識別子の先頭で `show` つきのホバー（押すとカードが出る）
+    #[test]
+    fn ホバーの項目はカードを出すホバーの要求になる() {
+        assert_eq!(
+            item_request(MenuItem::Hover, &target(None), Some(true)),
+            Some(Request::LspHover {
+                pane: Some(7),
+                line: 3,
+                column: 4,
+                show: Some(true),
+                limit: None,
+            })
+        );
+        assert_eq!(
+            item_args(MenuItem::Hover, &target(None)),
+            Some(json!({"action": "hover", "pane": 7, "line": 3, "column": 4, "show": true}))
+        );
+        assert!(
+            NOT_IN_MENU
+                .iter()
+                .all(|(action, _)| *action != crate::dispatch::LSP_HOVER_ACTION),
+            "項目にしたので載せない側から外す"
         );
     }
 

@@ -367,6 +367,10 @@ impl TakoApp {
         if self.lsp_format.pending == Some(pane) {
             return Some((crate::ui_text::preview::format_running().to_string(), false));
         }
+        // #1893: メニュー / キーで頼んだホバーの答えを待っているあいだ
+        if let Some(text) = self.lsp_hover_header_status(pane) {
+            return Some((text, false));
+        }
         self.lsp_goto
             .status
             .as_ref()

@@ -953,7 +953,10 @@ pub enum Request {
     ///
     /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
     /// 行内 UTF-8 バイト）で、範囲外・文字の途中は丸めずに拒否する。答えは本文（`contents`。
-    /// Markdown / 平文のまま）と種類（`kind`）と範囲。`show` で GUI のその位置にカードも出す
+    /// Markdown / 平文のまま）と種類（`kind`）と範囲。`show` で GUI のその位置にカードも出す。
+    ///
+    /// `limit`（#1893）は本文の字数の上限: 省略 = 16,000 字（カードと同じ）・`0` = 全文・N = N 字
+    /// （`tako_core::lsp::hover::char_limit`）。カードはいつも 16,000 字まで。省略時は wire に現れない
     LspHover {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<u64>,
@@ -961,6 +964,8 @@ pub enum Request {
         column: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         show: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
     },
     /// undo（#195）
     PreviewUndo { pane: Option<u64> },

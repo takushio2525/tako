@@ -21,7 +21,7 @@
 //! | `ask` | initialized の後に `workspace/configuration` を問い合わせる |
 //! | `die` | 起動直後に即死する（initialize を読まない） |
 //! | `no-goto` | 定義ジャンプの能力（`definitionProvider` 等）を申告しない（#1680） |
-//! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で、補完に `null` で答え（補完の規則が `hold_while_loading` なら答えずに済むまで待たせる）、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680 / #1869） |
+//! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で、補完とホバーに `null` で答え（補完の規則・当たったホバーの規則が `hold_while_loading` なら答えずに済むまで待たせる）、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680 / #1869 / #1893） |
 //! | `full-sync` | `normal` と同じだが全文同期（`change: 1`）を申告する |
 //! | `no-format` | 整形の能力（`documentFormattingProvider` / `documentRangeFormattingProvider`）を申告しない（#1683） |
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
@@ -81,7 +81,8 @@
 //! 形は定義ジャンプの規則と同じく**上から順に最初に当たった 1 つ**（`uri_suffix` / `line` で絞る）で、
 //! `result`（`Hover` をそのまま返す。`null` も可）/ `silent` / `crash` / `delay_ms`（答えるまでの待ち。
 //! 待つ間に `$/cancelRequest` が来たら -32800 で答える = 補完と同じ）/ `echo`（問われた位置の語を
-//! 自前の本文の模型で引き、`**<語>**` の Markdown とその語の範囲を返す = 位置の往復を見る）を持つ。
+//! 自前の本文の模型で引き、`**<語>**` の Markdown とその語の範囲を返す = 位置の往復を見る）/
+//! `hold_while_loading`（`loading` の読み込み中は null で即答せず、済むまで答えない。#1893）を持つ。
 //! 当たる規則が無ければ `null`（= 表示するものが無い）で答える。
 //!
 //! ## 本文の模型（#1769）
@@ -824,6 +825,28 @@ fn main() {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null)
                 };
+                // #1893: 読み込み中（`loading`）は補完と同じ 2 段。前半は即座に `null`、規則が
+                // `hold_while_loading` なら答えずに済むまで待たせ（取り消されたら -32800）、済んだ直後に答える
+                if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+                    if rule["hold_while_loading"].as_bool() != Some(true) {
+                        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+                        continue;
+                    }
+                    let key = id.to_string();
+                    waiting.lock().unwrap().insert(key.clone());
+                    let (out, waiting, loaded) = (out.clone(), waiting.clone(), loaded.clone());
+                    std::thread::spawn(move || {
+                        while !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        if waiting.lock().unwrap().remove(&key) {
+                            out.send(
+                                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                            );
+                        }
+                    });
+                    continue;
+                }
                 let delay = rule["delay_ms"].as_u64().unwrap_or(0);
                 if delay == 0 {
                     out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));

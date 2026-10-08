@@ -319,6 +319,7 @@ mod tests {
                 line: 3,
                 column: 4,
                 show: None,
+                limit: None,
             }
         );
         assert_eq!(
@@ -334,9 +335,36 @@ mod tests {
                 line: 1,
                 column: 0,
                 show: Some(true),
+                limit: None,
             }
         );
         assert!(build_request("tako_lsp", &json!({"action": "hover"}), Some(9), None).is_err());
+        // #1893: limit は本文の字数の上限（0 = 全文 = CLI の --full）。負・文字列は拒否する
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "hover", "line": 2, "column": 1, "limit": 0}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspHover {
+                pane: Some(9),
+                line: 2,
+                column: 1,
+                show: None,
+                limit: Some(0),
+            }
+        );
+        for bad in [json!(-1), json!("all")] {
+            assert!(build_request(
+                "tako_lsp",
+                &json!({"action": "hover", "line": 2, "column": 1, "limit": bad}),
+                Some(9),
+                None
+            )
+            .is_err());
+        }
     }
 
     #[test]

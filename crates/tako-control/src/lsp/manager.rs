@@ -646,6 +646,15 @@ impl LspManager {
         }
     }
 
+    /// マウスのホバーの取り消しの番号を**UI スレッドで**先に取る（#1893。列の前の要求は取り消す）。
+    /// 要求の `ticket` に載せると、背景で番号を取り直さない = この後の `cancel_hover` を追い越さない。
+    /// LSP を止めていれば `None`。**待たない**（ロックを短く取るだけ）
+    pub fn reserve_hover(&self) -> Option<u64> {
+        self.shared
+            .as_ref()
+            .map(|shared| shared.supersede(Lane::Hover))
+    }
+
     /// 待っているマウスのホバーを捨てる（カードを閉じた・識別子から外れた。#1681）
     pub fn cancel_hover(&self) {
         if let Some(shared) = &self.shared {
@@ -2384,10 +2393,16 @@ impl Shared {
     fn hover(&self, request: &HoverRequest) -> Result<HoverAnswer, HoverError> {
         use tako_core::lsp::hover as hv;
         let deadline = Instant::now() + request.timeout;
-        // マウスの要求は列の前の 1 つを取り消してから（最新の 1 つだけを生かす。補完と同じ）
-        let lane = request
-            .superseding
-            .then(|| (Lane::Hover, self.supersede(Lane::Hover)));
+        // マウスの要求は列の前の 1 つを取り消してから（最新の 1 つだけを生かす。補完と同じ）。
+        // UI が先に取った番号があればそれを使う（取り直すと UI の取り消しを追い越す。#1893）
+        let lane = request.superseding.then(|| {
+            (
+                Lane::Hover,
+                request
+                    .ticket
+                    .unwrap_or_else(|| self.supersede(Lane::Hover)),
+            )
+        });
         let superseded = || lane.is_some_and(|(lane, ticket)| !self.is_current(lane, ticket));
         let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
             return Err(GotoError::NoServer.into());
@@ -2396,7 +2411,7 @@ impl Shared {
         let uri = tako_core::file_uri::from_path(&request.path);
         // マウスは開いている文書に持ち手として加わるだけ（乗せただけでサーバを起こさない =
         // 設計書 §16-2）。明示の問い合わせは定義ジャンプ・整形・補完と同じ 1 本で開く
-        let _held = if request.open {
+        let held = if request.open {
             self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?
         } else {
             Some(self.join(&uri).ok_or(HoverError::NotOpen)?)
@@ -2409,6 +2424,21 @@ impl Shared {
         if !hv::server_supports(&capabilities) {
             return Err(GotoError::Unsupported { server: spec.id }.into());
         }
+        let started = Instant::now();
+        // サーバの読み込みを待ったか（#1893。補完の #1869 と同じ = 答えの `waited_for_loading`）
+        let mut waited = false;
+        // 読み込みを待つあいだに要らなくなったか（次のマウスの要求・カードを閉じた・文書を閉じた）。
+        // この問い合わせ自身も持ち手として加わっているので、「文書を閉じた」= 始めに居た**ほかの**
+        // 持ち手（編集セッション）が全員抜けた（補完の `completion` と同じ組み立て）
+        let own = held.as_ref().map(|lease| lease.holder);
+        let others_hold = || {
+            self.lock()
+                .docs
+                .get(&uri)
+                .is_some_and(|doc| doc.holders.keys().any(|holder| Some(*holder) != own))
+        };
+        let shared_at_start = others_hold();
+        let abandoned = || superseded() || (shared_at_start && !others_hold());
         loop {
             // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す（#1769）
             let at = {
@@ -2416,6 +2446,10 @@ impl Shared {
                 let Some(doc) = inner.docs.get(&uri) else {
                     return Err(GotoError::Closed.into());
                 };
+                waited |= inner
+                    .servers
+                    .get(&key)
+                    .is_some_and(|slot| slot.quiescent == Some(false));
                 position::lsp_position_of_line_col(&doc.text, request.line, request.column)
             };
             let params = json!({
@@ -2430,24 +2464,37 @@ impl Shared {
                 {
                     Ok(answer) => answer,
                     Err(RpcError::Cancelled) => return Err(HoverError::Superseded),
+                    // 答えずに待たせたまま上限（rust-analyzer の読み込みの後半）: 読み込み中と分かる答えに
+                    Err(RpcError::Timeout(_)) if self.loading_now(&key) => {
+                        return Err(HoverError::Loading {
+                            server: spec.id,
+                            secs: request.timeout.as_secs(),
+                        })
+                    }
                     Err(e) => return Err(rpc_failure(spec, request.timeout, e).into()),
                 };
             let content = hv::parse_response(&answer);
-            // 空の答え: 読み込み中のサーバ（rust-analyzer）なら済むのを待って問い直す（#1680 と同じ）。
-            // マウスの要求は待たない（次に乗せたときに問い直す。読み込みが済むまでカードは出ない）
-            if content.is_none() && !request.superseding {
-                match self.wait_loaded(&key, deadline, &|| false) {
-                    super::goto::Loading::Retry => continue,
+            // 空の答え: 読み込み中のサーバ（rust-analyzer は読み込みの前半に即座に null で答える）なら、
+            // 済むのを待って問い直す（#1680 と同じ）。**マウスの要求も待つ**（#1893。補完の打鍵の
+            // 要求 = #1869 と同じ manager の待ち）。待つあいだに次のマウスの要求・カードを閉じる・
+            // 文書を閉じるで抜ける。A/B（`TAKO_1893_LEGACY=1`）は #1893 前 = マウスの要求は待たない
+            let wait = !request.superseding || !super::hover::legacy_1893();
+            if content.is_none() && wait {
+                match self.wait_loaded(&key, deadline, &abandoned) {
+                    super::goto::Loading::Retry => {
+                        waited = true;
+                        continue;
+                    }
                     super::goto::Loading::Settled => {}
                     super::goto::Loading::TimedOut => {
-                        return Err(GotoError::Timeout {
+                        return Err(HoverError::Loading {
                             server: spec.id,
                             secs: request.timeout.as_secs(),
-                            starting: true,
-                        }
-                        .into())
+                        })
                     }
-                    // 明示の問い合わせは待ちを打ち切らない（`|| false`）
+                    super::goto::Loading::Abandoned if superseded() => {
+                        return Err(HoverError::Superseded)
+                    }
                     super::goto::Loading::Abandoned => return Err(GotoError::Closed.into()),
                 }
             }
@@ -2463,6 +2510,7 @@ impl Shared {
                 server: spec.id,
                 content,
                 range,
+                waited_for_loading: waited.then(|| started.elapsed()),
             });
         }
     }

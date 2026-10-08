@@ -28742,6 +28742,11 @@ mod self_test {
     mod tree_keyboard_copy;
     #[cfg(feature = "visual-test")]
     use tree_keyboard_copy::tree_keyboard_copy_visual;
+    /// #1893: ホバーの続き（右クリックの項目・キー・読み込み中の待ち）
+    #[cfg(feature = "visual-test")]
+    mod hover_1893;
+    #[cfg(feature = "visual-test")]
+    use hover_1893::{hover_1893_visual, hover_loading_real_visual, hover_loading_visual};
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -42998,6 +43003,24 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1893: 右クリックの「ホバー情報を表示」・キー・補完中のキー・巨大な doc（偽サーバ）
+                "hover-1893" => {
+                    hover_1893_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1893: 読み込み中に乗せると「読み込み中」→ 済んだらカード / 終わらなければ loading
+                "hover-loading" => {
+                    hover_loading_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1893: 実の rust-analyzer を暖機せずに乗せる・キー（無ければ SKIPPED）
+                "hover-loading-real" => {
+                    hover_loading_real_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
                 "goto-hover" => {
                     goto_hover_visual(any, window, cx).await;
@@ -43095,7 +43118,8 @@ mod self_test {
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / completion / completion-real / lsp-context-menu / \
-                         lsp-context-menu-real / md-edit-resume / md-find-restore）"
+                         lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
+                         hover-1893 / hover-loading / hover-loading-real）"
                     );
                     std::process::exit(1);
                 }
@@ -46861,6 +46885,13 @@ mod self_test {
                 ))
             })
         };
+        // 選択が無いときに出る項目（全項目から「選択範囲を整形」を除いた並び = 移動 4 つ・ホバー（#1893）・
+        // 整形）と、編集モードでも必ず出る先頭（移動 4 つとホバー）
+        let plain_ids: Vec<&str> = MenuItem::ALL
+            .iter()
+            .filter(|i| **i != MenuItem::FormatSelection)
+            .map(|i| i.id())
+            .collect();
         let goto_ids: Vec<&str> = MenuItem::ALL[..5].iter().map(|i| i.id()).collect();
 
         // ① 閲覧中の識別子（`helper` = 16..22）を右クリック → すぐ開き、握手を待つ 1 行 → 項目へ
@@ -46899,14 +46930,15 @@ mod self_test {
         ) {
             let _ = frame.save(std::path::Path::new(&dump).join("lsp-context-menu-items.png"));
         }
+        let n = plain_ids.len();
         check(
-            drawn.len() > 5 && drawn[..5] == goto_ids[..],
+            drawn.len() > n && drawn[..n] == plain_ids[..],
             &format!(
-                "visual-test lsp-context-menu ①: 申告どおりの 5 項目が先頭に描かれる（{drawn:?}）"
+                "visual-test lsp-context-menu ①: 申告どおりの {n} 項目（ホバー = #1893 を含む）が先頭に描かれる（{drawn:?}）"
             ),
         );
         check(
-            drawn.get(5) == Some(&"copy-path"),
+            drawn.get(n) == Some(&"copy-path"),
             &format!("visual-test lsp-context-menu ①: 選択が無ければ「選択範囲を整形」は出ず、従来の項目が続く（{drawn:?}）"),
         );
 
@@ -47028,8 +47060,11 @@ mod self_test {
         );
         let all_ids: Vec<&str> = MenuItem::ALL.iter().map(|i| i.id()).collect();
         check(
-            drawn.len() > 6 && drawn[..6] == all_ids[..],
-            &format!("visual-test lsp-context-menu ⑤: 選択の中なら「選択範囲を整形」まで 6 項目（{drawn:?}）"),
+            drawn.len() > all_ids.len() && drawn[..all_ids.len()] == all_ids[..],
+            &format!(
+                "visual-test lsp-context-menu ⑤: 選択の中なら「選択範囲を整形」まで {} 項目（{drawn:?}）",
+                all_ids.len()
+            ),
         );
         let format = vt1684_item_point(window, cx, "lsp-format").unwrap_or_else(|| {
             fail("visual-test lsp-context-menu ⑤: 「コードを整形」の矩形が無い")
@@ -48915,6 +48950,7 @@ mod self_test {
                         line: 3,
                         column: 13,
                         show: Some(true),
+                        limit: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -49077,6 +49113,7 @@ mod self_test {
                     document: None,
                     superseding: false,
                     open: true,
+                    ticket: None,
                 })
             })
             .await;
