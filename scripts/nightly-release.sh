@@ -96,14 +96,19 @@ notify() {
   osascript -e "display notification \"$1\" with title \"tako 夜間リリース\"" 2>/dev/null || true
 }
 
-# 次回バージョン予約の正本（#1005。読み書き・検証・版種判定）
+# 次回バージョン予約の正本（#1005。読み書き・検証・版種判定）と、set -e と EXIT trap の
+# 併用で終了コードが 0 に化けるのを塞ぐ番人（#1864）
+for _lib in nightly-reserve.sh exit-guard.sh; do
+  if [[ ! -f "$REPO_ROOT/scripts/lib/$_lib" ]]; then
+    log "ERROR: scripts/lib/${_lib} が見つからない（${REPO_ROOT}）。リポジトリが不完全"
+    notify "失敗: ${_lib} が見つからない"
+    exit 1
+  fi
+done
 # shellcheck source=lib/nightly-reserve.sh
-if [[ ! -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" ]]; then
-  log "ERROR: scripts/lib/nightly-reserve.sh が見つからない（${REPO_ROOT}）。リポジトリが不完全"
-  notify "失敗: nightly-reserve.sh が見つからない"
-  exit 1
-fi
 source "$REPO_ROOT/scripts/lib/nightly-reserve.sh"
+# shellcheck source=lib/exit-guard.sh
+source "$REPO_ROOT/scripts/lib/exit-guard.sh"
 
 # ---- 次回バージョン予約の CLI（#1005）--------------------------------------
 
@@ -323,12 +328,19 @@ check_shared_tree_invariant() {
   return 0
 }
 
+# EXIT trap は tako_exit_trap で張る。launchd は /bin/bash（3.2）で起動するので、素の trap だと
+# 途中で未定義の変数などを踏んで死んでも exit 0 になり、夜間リリースが黙って成功扱いになる。
+# 成功で抜ける所はすべて tako_exit 0 を通す（印の無い 0 は番人が 1 にする。#1864）
 cleanup_all() {
+  if [[ "${TAKO_EXIT_GUARD_TRIPPED:-0}" == 1 ]]; then
+    log "ERROR: 夜間リリースが途中で止まった（終了コード 0 のまま抜けかけたので 1 にした。直前のエラー行は stderr = launchd 経由なら ${LOG_DIR}/launchd-tako-nightly-release.log）"
+    notify "失敗: 途中で止まった（ログを見る）"
+  fi
   cleanup_worktree
   check_shared_tree_invariant
   release_locks
 }
-trap 'cleanup_all' EXIT
+tako_exit_trap 'cleanup_all' "夜間リリース"
 trap 'log "ABORT: シグナルを受けたのでリリースを中止する（残骸は片付ける）"; exit 130' INT TERM
 
 # ---- 多重起動ロック --------------------------------------------------------
@@ -367,8 +379,8 @@ GIT_COMMON_DIR=$(git -C "$REPO_ROOT" rev-parse --git-common-dir)
 [[ "$GIT_COMMON_DIR" = /* ]] || GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR"
 REPO_LOCK_DIR="$GIT_COMMON_DIR/tako-nightly-release.lock"
 
-acquire_lock "$REPO_LOCK_DIR" "リポジトリ単位" || exit 0
-acquire_lock "$LOCK_DIR" "HOME 単位" || exit 0
+acquire_lock "$REPO_LOCK_DIR" "リポジトリ単位" || tako_exit 0
+acquire_lock "$LOCK_DIR" "HOME 単位" || tako_exit 0
 
 # ---- 共有ツリーに残った detached HEAD を戻す（#1136 の後始末）---------------
 # 旧版が残していった detached（先端が夜間リリースのコミット・かつ clean）だけを
@@ -410,7 +422,7 @@ fi
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   log "SKIP: 共有ツリーが dirty（人間の作業中と判断）: ${REPO_ROOT}${RESERVE_KEPT}"
   notify "スキップ: 共有ツリーが dirty"
-  exit 0
+  tako_exit 0
 fi
 
 git fetch origin --tags --quiet
@@ -425,7 +437,7 @@ COMMITS=$(git rev-list --count "$LATEST_TAG..origin/main")
 if [[ "$COMMITS" -eq 0 ]]; then
   # 予約は消費しない。リリースが 1 回も成立していないので次の夜へ持ち越す（#1005）
   log "SKIP: 変更なし（${LATEST_TAG} == origin/main）${RESERVE_KEPT}"
-  exit 0
+  tako_exit 0
 fi
 
 CUR_VERSION=$(git show origin/main:Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
@@ -433,14 +445,14 @@ TAG_VERSION="${LATEST_TAG#v}"
 if [[ "$CUR_VERSION" != "$TAG_VERSION" ]]; then
   log "SKIP: Cargo.toml version (${CUR_VERSION}) ≠ 最新タグ (${TAG_VERSION})。手動リリース進行中とみなす${RESERVE_KEPT}"
   notify "スキップ: 手動リリース進行中（${CUR_VERSION}）"
-  exit 0
+  tako_exit 0
 fi
 
 # テスト版バージョン（-test.N 等のプレリリースサフィックス付き）は bump の対象外
 if [[ "$CUR_VERSION" == *-* ]]; then
   log "SKIP: プレリリース版 (${CUR_VERSION})。夜間 bump は安定版のみ対象${RESERVE_KEPT}"
   notify "スキップ: プレリリース版（${CUR_VERSION}）"
-  exit 0
+  tako_exit 0
 fi
 
 # ---- 次回バージョンの決定（予約 > 既定の patch bump。#1005）------------------
@@ -475,7 +487,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   fi
   log "DRY-RUN: コミット一覧は下記"
   git log --format='  - %s' "$LATEST_TAG..origin/main" | tee -a "$LOG_FILE"
-  exit 0
+  tako_exit 0
 fi
 
 # ---- リリース用の使い捨て worktree（#1136）---------------------------------
@@ -631,3 +643,4 @@ case "$RELEASE_RC" in
     exit 1
     ;;
 esac
+tako_exit 0

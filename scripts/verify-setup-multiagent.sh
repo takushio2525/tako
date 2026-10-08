@@ -5,7 +5,11 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TAKO_BIN=${TAKO_BIN:-"$ROOT/target/debug/tako"}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/tako-setup-262.XXXXXX")
-trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+# 途中で死んだ検証を「完了」に化けさせない（macOS の /bin/sh も bash 3.2 で、set -e + EXIT trap の
+# 下で未定義の変数を踏むと終了コードが 0 になる。#1864）。成功で抜けるのは末尾の tako_exit 0 だけ
+. "$ROOT/scripts/lib/exit-guard.sh"
+tako_exit_trap 'rm -rf "$TMP"'
+trap 'rm -rf "$TMP"' HUP INT TERM
 
 fail() {
     printf '[FAILED] %s\n' "$1" >&2
@@ -327,3 +331,4 @@ if [ -n "${TAKO_REAL_CLAUDE_BIN:-}" ] &&
 fi
 
 printf '[OK] Issue #262 setup UX A-E verification completed\n'
+tako_exit 0

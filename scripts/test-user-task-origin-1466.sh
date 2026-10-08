@@ -50,7 +50,10 @@ cleanup() {
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
-trap cleanup EXIT
+# 途中で死んだテストを「緑」に化けさせない（bash 3.2 の set -e + EXIT trap。#1864）。
+# 成功で抜けるのは末尾の tako_exit 0 だけ
+. "$REPO_ROOT/scripts/lib/exit-guard.sh"
+tako_exit_trap cleanup
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
@@ -296,4 +299,5 @@ check_eq "legacy: 無関係な default の master へ届く（= #1466 の症状�
 
 echo
 echo "=== 結果: ${PASS} PASS / ${FAIL} FAIL ==="
-[ "$FAIL" -eq 0 ]
+[ "$FAIL" -eq 0 ] || exit 1
+tako_exit 0

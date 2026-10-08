@@ -18,7 +18,10 @@ check_eq() {
 }
 
 FAKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/tako-trust-residue-test.XXXXXX")"
-trap 'rm -rf "$FAKE_HOME"' EXIT
+# 途中で死んだテストを「緑」に化けさせない（bash 3.2 の set -e + EXIT trap。#1864）。
+# 成功で抜けるのは末尾の tako_exit 0 だけ
+. "$REPO_ROOT/scripts/lib/exit-guard.sh"
+tako_exit_trap 'rm -rf "$FAKE_HOME"'
 mkdir -p "$FAKE_HOME/.claude"
 
 # 実プロジェクト 2 件 + 一時ディレクトリの「テスト名でない」もの 1 件 + テスト残骸 4 件
@@ -75,4 +78,5 @@ check_eq "掃除対象 0 件" "0" "$(echo "$OUT2" | /usr/bin/env python3 -c 'imp
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
-[ "$FAIL" -eq 0 ]
+[ "$FAIL" -eq 0 ] || exit 1
+tako_exit 0

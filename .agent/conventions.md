@@ -2224,6 +2224,60 @@ file:line で名指しして落とす（#837 の全角展開の検査と同じ�
 観測すると `MISSING=()`。`$( )` の中で死ぬので**外側は生き延びるが案内の中身が消える**）。
 残りは「いまは空にならない」だけなので、次に空が渡る変更で同じ形で落ちる。
 
+### `set -e` と EXIT trap を併用するなら番人を通す（Issue #1864）
+
+3.2 は **`set -e` が効いているときに展開エラーで死ぬと、EXIT trap の中の `$?` が 0 になる**。
+trap が `exit` を呼ばなくても、スクリプトの終了コードが 0 に化ける。`/bin/sh` も中身は 3.2 で、
+同じく化ける。launchd は夜間リリースを `/bin/bash` で起動するので、途中で死んだ夜間リリースが
+黙って成功扱いになる型（#1853 の昇格で最初に踏んだ）。`/bin/bash` 3.2.57 で確かめた表:
+
+| 条件 | 未定義の変数で死んだときの終了コード |
+|---|---|
+| `set -eu` + EXIT trap | **0**（trap が `exit "$rc"` しても、何もしなくても） |
+| `set -u` だけ + EXIT trap | 1（化けない） |
+| `set -eu` で trap 無し / `trap - EXIT` で外した後 | 1 |
+| bash 5.x（どの組み合わせでも） | 1 |
+
+未定義の変数のほかに、`${x:?}`・不正な置換（`${x!}`）・readonly への代入でも、`set -e` だけで
+同じく 0 になる。`set -u` は踏む確率を跳ね上げるだけで、条件の本体は `set -e` の側にある。
+`exit 3` のような明示の非 0 と、`set -e` が拾うコマンドの失敗は正しく伝わる。
+
+trap の中からは死に方を見分けられない（`$?` も `$BASH_COMMAND` も正常終了と同じ形になる）ので、
+**成功の印を立てて抜けた 0 だけを本物の 0 とする**。1 実装は `scripts/lib/exit-guard.sh`:
+
+```bash
+. "$REPO_ROOT/scripts/lib/exit-guard.sh"
+tako_exit_trap cleanup "夜間リリース"   # `trap cleanup EXIT` の代わり（第 2 引数はエラー文の主語）
+...
+acquire_lock || tako_exit 0             # 成功で抜ける所はすべて tako_exit 0
+[ "$FAIL" -eq 0 ] || exit 1             # 非 0 はそのまま exit してよい
+tako_exit 0                             # 末尾へ落ちるだけでは 0 にならない
+```
+
+- 印の無い 0（素の `exit 0`・末尾への到達・展開エラーでの死）は 1 にして stderr へ 1 行出す。
+  補正したかどうかは後始末の中で `TAKO_EXIT_GUARD_TRIPPED`（1 = 化けかけた）から読める
+  （`nightly-release.sh` はこれでログと通知にも残す）
+- シグナルの trap（`INT` / `TERM`）は素の `trap` のまま張る（番人は EXIT だけを持つ）
+- シーンごとに張って `trap - EXIT` で外す形（`scripts/promo/record-*.sh`）は、外した後の
+  正常終了に印は要らない
+- POSIX sh からも source できる書き方にしてある（`verify-setup-multiagent.sh` は `#!/bin/sh`）
+
+番犬は `shell_scripts.rs` の `set_eとexit_trapの併用は番人の共通実装を通す`。リポジトリ全体の
+`.sh` をクォート・複数行の文字列・ヒアドキュメントの本文・サブシェルを読み分けて走査し、
+file:line で名指しする:
+
+1. `set -e` を宣言する（または `scripts/lib/` / `lib.sh` のように source されて呼び手の
+   `set -e` を継ぐ）ファイルの、素の EXIT trap（`set -u` だけのファイルは化けないので対象外）
+2. `tako_exit_trap` を呼ぶのに `exit-guard.sh` を source していない
+3. `tako_exit_trap` の後の素の `exit 0` / 引数なしの `exit`（印が立たずに 1 になる誤報）
+
+監査して確かめた箇所だけ、その行か直前の行に `# tako:exit-guard-ok <理由>` で外せる
+（理由の無い宣言は無効）。#1864 の棚卸しは 11 本。`release.sh --promote` は #1853 で自前の印を
+立てて塞いであったものを番人へ寄せ、残りの 10 本（`nightly-release.sh` /
+`promo/record-explainer.sh`・`record-scenes.sh` / テスト 6 本 / `verify-setup-multiagent.sh`）は
+trap を張った後のどこで死んでも 0 に化ける形だった。テストの 6 本は、途中で死ぬと
+FAIL=0 のまま「緑」で終わる形だった。
+
 ## `.app` の差し替えは置き場のパスを空けない（Issue #1042）
 
 **`/Applications/tako.app` を差し替えるときに、そのパスが空になる瞬間を作ってはいけない。**

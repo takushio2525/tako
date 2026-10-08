@@ -26,6 +26,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# シーンの収録中に張る EXIT trap の番人（bash 3.2 の set -e + EXIT trap で途中の死が exit 0 に
+# 化けるのを塞ぐ。#1864）。シーンの終わりで trap - EXIT するので、正常終了に印は要らない
+source "$SCRIPT_DIR/../lib/exit-guard.sh"
 
 SCENE=${1:-}
 [ -n "$SCENE" ] || { echo "usage: $0 <agent|preview|restore|outro|all>" >&2; exit 2; }
@@ -42,7 +45,7 @@ scene_preview() {
     rm -rf "$work"
     promo_make_demo_env
     promo_start_isolated "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
 
     local base; base=$(promo_base_pane)
     tko send --pane "$base" "cd $PROMO_DEMO/awesome-app && clear" >/dev/null
@@ -83,7 +86,7 @@ scene_agent() {
     rm -rf "$work"
     promo_make_demo_env
     promo_start_isolated "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
 
     local base; base=$(promo_base_pane)
     tko send --pane "$base" "cd $PROMO_DEMO/awesome-app && clear" >/dev/null
@@ -151,7 +154,7 @@ scene_setup() {
         "ANTHROPIC_MODEL=${TAKO_PROMO_SETUP_MODEL:-claude-sonnet-5}"
     )
     promo_start_isolated "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
 
     local base; base=$(promo_base_pane)
     # 収録機と無関係な listen ポート（他アプリ）の提案チップが写り込まないようにする
@@ -212,7 +215,7 @@ scene_project() {
         "ANTHROPIC_MODEL=${TAKO_PROMO_PROJECT_MODEL:-claude-sonnet-5}"
     )
     promo_start_isolated "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
 
     local base; base=$(promo_base_pane)
     tko portdetect off >/dev/null 2>&1 || true
@@ -275,7 +278,7 @@ scene_master() {
     rm -rf "$work"
     promo_make_demo_env
     promo_start_isolated "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
 
     local base; base=$(promo_base_pane)
     # master が spawn 先に使うプロジェクトを登録しておく（隔離 data_dir 配下の projects.yaml）
@@ -352,7 +355,7 @@ scene_restore() {
     promo_make_demo_env
     # 1 回目: 永続化 ON で起動しペインを組む
     promo_start_isolated "$work" "$socket" 1
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
 
     local base; base=$(promo_base_pane)
     tko send --pane "$base" "cd $PROMO_DEMO/awesome-app && clear" >/dev/null
@@ -393,7 +396,7 @@ scene_outro() {
     rm -rf "$work"
     promo_make_demo_env
     promo_start_isolated "$work" "$socket"
-    trap 'promo_stop_isolated '"$socket" EXIT
+    tako_exit_trap 'promo_stop_isolated '"$socket"
 
     local base; base=$(promo_base_pane)
     tko send --pane "$base" "cd $PROMO_DEMO/awesome-app && clear" >/dev/null
