@@ -106,7 +106,7 @@ fi
 
 echo
 echo "== ② A/B: 旧挙動（マウスで問い合わせない）で同じ節が落ちる =="
-run_section "$TMP/ab-legacy.log" hover TAKO_1681_LEGACY=1
+run_section "$TMP/ab-legacy.log" hover TAKO_1681_LEGACY=1 TAKO_VISUAL_DUMP_DIR="$DUMP/before"
 grep "TAKO_VISUAL_PIXEL: hover" "$TMP/ab-legacy.log" | head -3 | sed 's/^/    /'
 if grep -q "TAKO_APP_SELF_TEST_FAILED: visual-test hover: 識別子に乗せるとカードが出る" "$TMP/ab-legacy.log"; then
   pass "TAKO_1681_LEGACY=1 では落ちる: $(grep -o 'TAKO_APP_SELF_TEST_FAILED: .*' "$TMP/ab-legacy.log" | head -1 | cut -c1-140)"
@@ -119,8 +119,10 @@ echo "== ③ 実の rust-analyzer（visual-test 節 hover-real） =="
 if [ -n "$REAL_RA" ] && [ -n "$REAL_RUSTUP_HOME" ]; then
   run_section "$TMP/real.log" hover-real \
     TAKO_LSP_BIN_RUST_ANALYZER="$REAL_RA" RUSTUP_HOME="$REAL_RUSTUP_HOME" CARGO_HOME="$REAL_CARGO_HOME"
-  # before（#1681 前 = マウスで問い合わせない）: 同じ実サーバ・同じマウスでカードが出ない
+  # before（#1681 前 = マウスで問い合わせない）: 同じ実サーバ・同じマウスでカードが出ない。
+  # 画像は before/ へ分ける（同じ置き場だと after の hover-real.png をカードの無い 1 枚で上書きする）
   run_section "$TMP/real-legacy.log" hover-real TAKO_1681_LEGACY=1 \
+    TAKO_VISUAL_DUMP_DIR="$DUMP/before" \
     TAKO_LSP_BIN_RUST_ANALYZER="$REAL_RA" RUSTUP_HOME="$REAL_RUSTUP_HOME" CARGO_HOME="$REAL_CARGO_HOME"
   if grep -q "TAKO_APP_SELF_TEST_FAILED: visual-test hover-real: 実サーバの doc のカードが出る" "$TMP/real-legacy.log"; then
     pass "before（TAKO_1681_LEGACY=1）では実サーバでもカードが出ない"
@@ -139,7 +141,8 @@ else
   fail "実サーバの節が緑にならない"
   grep -E "FAILED|panicked" "$TMP/real.log" | tail -3 | sed 's/^/    /'
 fi
-ls "$DUMP"/hover*.png 2>/dev/null | sed 's/^/    画像: /'
+ls "$DUMP"/hover*.png 2>/dev/null | sed 's/^/    画像（after）: /'
+ls "$DUMP"/before/hover*.png 2>/dev/null | sed 's/^/    画像（before = TAKO_1681_LEGACY=1）: /'
 
 echo
 echo "== ④ CLI / MCP（隔離 GUI） =="
