@@ -111,6 +111,18 @@ pub const NO_DOCUMENTS_NOTE: Note = Note::new(
     "No document is connected to a language server (edit a supported file to see diagnostics)",
 );
 
+/// 右クリックメニュー（#1684）を問われた位置が識別子ではない
+pub const MENU_NOT_SYMBOL_REASON: Note = Note::new(
+    "この位置は識別子ではないので、言語サーバの項目は出ない（ペインの項目だけ）",
+    "This position is not an identifier, so no language server items are shown (pane items only)",
+);
+
+/// 識別子でないときの次の一手
+pub const MENU_NOT_SYMBOL_NEXT_STEP: Note = Note::new(
+    "識別子の上の位置（line / column）を指定する",
+    "Point line / column at an identifier",
+);
+
 /// `{…}` を差し込む
 pub fn fill(note: Note, values: &[(&str, &str)]) -> String {
     let mut text = note.text().to_string();

@@ -13,12 +13,15 @@
 //! 待つのは [`LspManager::format`]、当てるのは `TextBuffer::apply_changes`）。
 //! S5（#1682）の補完 = `tako lsp completion`（問い合わせの型と応答は
 //! [`completion`]、待つのは [`LspManager::completion`]。古い要求は `$/cancelRequest` で捨てる）。
+//! S7（#1684）の右クリックメニュー = `tako lsp menu`（項目 → dispatch の対応は [`menu`]、
+//! 能力を読むのは [`LspManager::menu_capabilities_now`] / [`LspManager::menu_capabilities`]）。
 
 pub mod completion;
 pub mod diagnostics;
 pub mod format;
 pub mod goto;
 pub mod manager;
+pub mod menu;
 pub mod rpc;
 pub mod server;
 pub mod text;
@@ -31,3 +34,4 @@ pub use manager::{
     legacy, DocLease, DocLink, DocumentDiagnostics, Launch, LspConfig, LspDocument, LspManager,
     DIAGNOSTICS_EVENT_CAPACITY,
 };
+pub use menu::{MenuCapabilities, MenuRequest};

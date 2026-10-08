@@ -55,6 +55,18 @@ impl TakoApp {
         pane: PaneId,
         position: Point<Pixels>,
     ) -> Option<(usize, Range<usize>)> {
+        self.code_symbol_hit(pane, position)
+            .map(|(line, _, symbol)| (line, symbol.range))
+    }
+
+    /// [`Self::code_symbol_at_position`] の本体: 0 起点の行・押した文字の行内バイト・対象。
+    /// 右クリックメニュー（#1684）は押したバイトをそのまま `tako lsp menu` と同じ準備へ渡す
+    /// （選択の中かどうかを CLI / MCP と同じ位置で判定する）
+    pub(crate) fn code_symbol_hit(
+        &self,
+        pane: PaneId,
+        position: Point<Pixels>,
+    ) -> Option<(usize, usize, tako_core::lsp::goto::Symbol)> {
         if !self.lsp_goto_enabled_for(pane) {
             return None;
         }
@@ -69,7 +81,7 @@ impl TakoApp {
             }
             let byte = layout.index_for_position(position).ok()?;
             let symbol = tako_core::lsp::goto::symbol_at(texts.get(line)?, byte)?;
-            return Some((line, symbol.range));
+            return Some((line, byte, symbol));
         }
         None
     }
@@ -148,6 +160,18 @@ impl TakoApp {
             // 利用者自身の操作なので、着地したペインへフォーカスを移す（CLI / MCP の既定は移さない）
             focus: Some(true),
         };
+        self.start_lsp_goto_request(pane, request, anchor, cx);
+    }
+
+    /// 定義ジャンプの要求（4 種のどれでも）を ⌘クリックと同じ 3 段へ渡す。
+    /// 右クリックメニューの「定義へ移動」等（#1684）もここを通る
+    pub(crate) fn start_lsp_goto_request(
+        &mut self,
+        pane: PaneId,
+        request: tako_control::protocol::Request,
+        anchor: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         self.lsp_goto.hovered = None;
         self.lsp_goto.menu = None;
         let job = match tako_control::prepare_offload(self, &request) {

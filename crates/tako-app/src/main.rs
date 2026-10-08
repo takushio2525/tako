@@ -41,6 +41,7 @@ mod limit_autoresume;
 mod lsp_completion_ui;
 mod lsp_format_ui;
 mod lsp_goto_ui;
+mod lsp_menu_ui;
 mod md_view;
 mod menu_bar;
 mod open_files;
@@ -2112,6 +2113,12 @@ struct TakoApp {
     /// ファイルツリーの右クリックメニューの各項目の実描画矩形（#1725。
     /// セルフテスト項目 154 が**合成マウスで実際に押す**ため。作法は `path_link_item_rects` と同じ）
     tree_menu_item_rects: PathLinkItemRects,
+    /// ペインの右クリックメニューの各項目の実描画矩形（#1684。visual-test `lsp-context-menu` が
+    /// **合成マウスで実際に押し**、ウィンドウの四隅で見切れないことを実矩形で見るため。
+    /// 作法は `path_link_item_rects` と同じ）
+    pane_menu_item_rects: PathLinkItemRects,
+    /// 右クリックメニューの LSP の節の問い合わせ番号（#1684。閉じた後に届いた答えを捨てる）
+    lsp_menu_seq: u64,
     /// ファイルツリー行（パス）の実描画矩形（#1725。項目 154 が右クリックする位置の正）。
     /// **`tree_row_probe` が立っているフレームだけ**採る（本番の行ごとに要素を増やさない）
     tree_row_rects: TreeRowRects,
@@ -3615,6 +3622,9 @@ struct PaneContextMenu {
     /// （メニューの描画は毎フレーム走るので、そこで役割・カタログを読み直すと
     /// #772 と同じ「メインスレッド専有」を作る）
     restart_modes: Vec<tako_core::session_restart::SessionRestartMode>,
+    /// #1684: コードの本文を識別子の上で右クリックしたときの言語サーバの節
+    /// （ヘッダ・タブ・ターミナル・識別子でない位置では `None` = 従来のメニュー）
+    lsp: Option<lsp_menu_ui::LspPaneMenu>,
 }
 
 #[derive(Clone, Copy)]
@@ -4133,6 +4143,8 @@ impl TakoApp {
             path_link_menu: None,
             path_link_item_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             tree_menu_item_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            pane_menu_item_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            lsp_menu_seq: 0,
             tree_row_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             tree_row_probe: false,
             tree_inline_input_rect: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -20445,6 +20457,7 @@ impl TakoApp {
                         kind: PaneContextKind::Terminal,
                         position: event.position,
                         restart_modes,
+                        lsp: None,
                     });
                     cx.notify();
                 }),
@@ -21074,6 +21087,7 @@ impl TakoApp {
                                             kind: PaneContextKind::Terminal,
                                             position: event.position,
                                             restart_modes,
+                                            lsp: None,
                                         });
                                         cx.notify();
                                     }),
@@ -23383,6 +23397,10 @@ impl PreviewHost for TakoApp {
         Ok(applied)
     }
 
+    fn preview_selection(&self, pane: PaneId) -> Option<tako_control::protocol::LineColRange> {
+        self.preview_selection_range(pane)
+    }
+
     fn preview_goto_source(
         &self,
         pane: PaneId,
@@ -25158,6 +25176,8 @@ impl TakoApp {
         let fm = tako_control::platform::os_integration::file_manager();
         // #1067: メニューを開いた瞬間に決めた出し分けをそのまま使う（毎フレーム読み直さない）
         let restart_modes = ctx.restart_modes.clone();
+        // #1684: 押したときの位置と選択は開いた瞬間に決めたもの（毎フレーム読み直さない）
+        let lsp_target = ctx.lsp.as_ref().map(|lsp| lsp.target);
         let items = pane_context_menu_items(PaneMenuFacts {
             is_preview,
             has_cwd: cwd.is_some(),
@@ -25165,30 +25185,18 @@ impl TakoApp {
             can_ssh: can_ssh_this_pane,
             restart_modes,
             file_manager: fm,
+            lsp: ctx.lsp.as_ref().map(|lsp| lsp.section.clone()),
         });
-        let pctx_menu_width: f32 = 200.0;
-        let pctx_item_height: f32 = 20.0;
-        let pctx_sep_height: f32 = 5.0;
-        let pctx_padding_y: f32 = 8.0;
-        let pctx_menu_height: f32 = items
-            .iter()
-            .map(|(id, _)| {
-                if id.starts_with("sep") {
-                    pctx_sep_height
-                } else {
-                    pctx_item_height
-                }
-            })
-            .sum::<f32>()
-            + pctx_padding_y;
+        let (pctx_menu_width, pctx_menu_height) = pane_menu_size(&items);
         let adjusted = clamp_menu_position(pos, pctx_menu_width, pctx_menu_height, window);
+        self.pane_menu_item_rects.borrow_mut().clear();
 
         let menu = div()
             .absolute()
             .left(adjusted.x)
             .top(adjusted.y)
             .w(px(pctx_menu_width))
-            .py(px(4.0))
+            .py(px((PANE_MENU_CHROME_Y - 2.0) / 2.0))
             .bg(rgba(theme.tab_bar_background))
             .border_1()
             .border_color(hsla(theme.pane_border))
@@ -25207,17 +25215,52 @@ impl TakoApp {
                         .bg(hsla_alpha(theme.pane_border, 0.5))
                         .into_any_element();
                 }
+                let rects = self.pane_menu_item_rects.clone();
+                // 何も描かない矩形採取（#1182 と同じ作法。見た目にもレイアウトにも出ない）
+                let probe = canvas(
+                    move |bounds, _, _| rects.borrow_mut().push((id, bounds)),
+                    |_, _, _, _| (),
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full();
+                // #1684: 押せない 1 行（言語サーバの握手を待っているあいだ）
+                if id.starts_with("note") {
+                    return div()
+                        .relative()
+                        .w_full()
+                        .h(px(PANE_MENU_ITEM_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .text_color(hsla(theme.text_tertiary))
+                        .child(SharedString::from(label.to_string()))
+                        .child(probe)
+                        .into_any_element();
+                }
                 let preview_path = preview_path.clone();
                 let cwd = cwd.clone();
                 div()
                     .id(("pctx-item", i as u64))
+                    .relative()
                     .w_full()
+                    .h(px(PANE_MENU_ITEM_HEIGHT))
+                    .flex()
+                    .items_center()
                     .px_2()
-                    .py(px(2.0))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgba(theme.tab_active_background)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pane_context_menu = None;
+                        // #1684: 言語サーバの項目は CLI / MCP と同じ要求を組んで dispatch へ
+                        if let (Some(item), Some(target)) =
+                            (tako_core::lsp::menu::MenuItem::from_id(id), lsp_target)
+                        {
+                            this.run_lsp_menu_item(pane_id, item, target, pos, cx);
+                            cx.notify();
+                            return;
+                        }
                         match id {
                             "copy-path" => {
                                 if let Some(p) = &preview_path {
@@ -25292,6 +25335,7 @@ impl TakoApp {
                     }))
                     .when(id == "close", |d| d.text_color(hsla(theme.red)))
                     .child(SharedString::from(label.to_string()))
+                    .child(probe)
                     .into_any_element()
             }));
         let backdrop = div()
@@ -25338,6 +25382,9 @@ pub(crate) struct PaneMenuFacts {
     pub restart_modes: Vec<tako_core::session_restart::SessionRestartMode>,
     /// ファイルマネージャの呼び名（#617）
     pub file_manager: tako_control::platform::os_integration::FileManager,
+    /// コードの本文を識別子の上で右クリックしたときの言語サーバの節（#1684）。
+    /// 項目の出し分けは `tako_core::lsp::menu::items` が済ませてある（ここは並べるだけ）
+    pub lsp: Option<lsp_menu_ui::LspMenuSection>,
 }
 
 /// ターミナル内のパスリンクの cmd+右クリックメニューの項目（id, 表示名）。#1182
@@ -25385,11 +25432,42 @@ pub(crate) fn path_link_menu_items(
         .collect()
 }
 
-/// ペインの右クリックメニューの項目（id, 表示名）。`sep*` は区切り線
+/// ペインの右クリックメニューの幅
+const PANE_MENU_WIDTH: f32 = 200.0;
+/// 項目 1 行の高さ。**描画もこの高さで組む**（#1684: 見積もりを 20px のまま行の実高さ 23.5px で
+/// 描いていたので、下端で上へ折り返す量が足りず、項目の多いメニューが下へ見切れていた）
+const PANE_MENU_ITEM_HEIGHT: f32 = 24.0;
+/// 区切り線（高さ 1px + 上下の余白 2px ずつ）
+const PANE_MENU_SEP_HEIGHT: f32 = 5.0;
+/// 上下の余白（4px ずつ）と枠線（1px ずつ）
+const PANE_MENU_CHROME_Y: f32 = 10.0;
+
+/// ペインの右クリックメニューの寸法（幅, 高さ）。描画の見切れ判定（`clamp_menu_position`）と
+/// 四隅の検査（#1684）が同じ値を使い、描画も同じ定数で行を組む
+pub(crate) fn pane_menu_size(items: &[(&'static str, &'static str)]) -> (f32, f32) {
+    let height = items
+        .iter()
+        .map(|(id, _)| {
+            if id.starts_with("sep") {
+                PANE_MENU_SEP_HEIGHT
+            } else {
+                PANE_MENU_ITEM_HEIGHT
+            }
+        })
+        .sum::<f32>()
+        + PANE_MENU_CHROME_Y;
+    (PANE_MENU_WIDTH, height)
+}
+
+/// ペインの右クリックメニューの項目（id, 表示名）。`sep*` は区切り線・`note*` は押せない 1 行
 pub(crate) fn pane_context_menu_items(facts: PaneMenuFacts) -> Vec<(&'static str, &'static str)> {
     use tako_core::session_restart::SessionRestartMode;
     let fm = facts.file_manager;
     let mut items: Vec<(&'static str, &'static str)> = Vec::new();
+    // #1684: 言語サーバの項目は先頭（VSCode / Zed と同じ。押したい操作がポインタの近くに来る）
+    if let Some(section) = &facts.lsp {
+        items.extend(lsp_menu_ui::section_rows(section));
+    }
     if facts.is_preview {
         items.push(("copy-path", ui_text::pane_menu::copy_path()));
         items.push(("reveal", ui_text::pane_menu::reveal(fm)));
@@ -42452,6 +42530,18 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1684: 本文の右クリックメニューに言語サーバの項目が出て、押すと動くか（偽サーバ）
+                "lsp-context-menu" => {
+                    lsp_context_menu_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1684: 実の rust-analyzer で右クリック → 項目 → 定義へ移動（無ければ SKIPPED）
+                "lsp-context-menu-real" => {
+                    lsp_context_menu_real_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1728: 実行コマンド / 検索欄を文字の途中で切って描画中に落ちないか
                 "run-command-truncate" => {
                     run_command_truncate_visual(any, window, cx).await;
@@ -42505,7 +42595,8 @@ mod self_test {
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / completion / completion-real）"
+                         tree-clipboard / completion / completion-real / lsp-context-menu / \
+                         lsp-context-menu-real）"
                     );
                     std::process::exit(1);
                 }
@@ -42573,6 +42664,9 @@ mod self_test {
             external_change_visual(any, window, cx).await;
             // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
             goto_hover_visual(any, window, cx).await;
+            // #1684: 本文の右クリックメニューに言語サーバの項目が出て、押すと動くか（偽サーバ）。
+            // 実の rust-analyzer の節（lsp-context-menu-real）は導入が環境依存なので単独実行だけ
+            lsp_context_menu_visual(any, window, cx).await;
 
             // #589: ファイルツリーのインデントガイド線が連続しているか。
             // 4 階層のフィクスチャを開き、ダーク / ライト / スクロール後の 3 状態で
@@ -46032,6 +46126,669 @@ mod self_test {
         check(
             released == 0,
             &format!("visual-test goto-hover: ⌘ を離すと下線が消える (#1680。rows={released})"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1684 の道具: `line` 行目（0 起点）の `start..end`（行内バイト）の真ん中（ウィンドウ座標）。
+    /// 描いた行の実レイアウトから採る（押す位置の正 = ⌘ホバーの当たり判定と同じ材料）
+    #[cfg(feature = "visual-test")]
+    fn vt1684_point(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        line: usize,
+        range: std::ops::Range<usize>,
+    ) -> Option<Point<Pixels>> {
+        window
+            .update(cx, |app, _, _| {
+                let layout = app.preview_text_layouts.get(&pane)?.get(line)?.clone()?;
+                let line_h = layout.line_height();
+                if range.is_empty() {
+                    // 空行: 行の左端の少し右（文字の無い所）
+                    let b = layout.bounds();
+                    return Some(point(b.origin.x + px(2.0), b.origin.y + line_h / 2.0));
+                }
+                let a = layout.position_for_index(range.start)?;
+                let b = layout.position_for_index(range.end)?;
+                Some(point((a.x + b.x) / 2.0, a.y + line_h / 2.0))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// #1684 の道具: 開いているペインのメニューの LSP の節と、**描いた**項目の id の並び
+    /// （`pane_menu_item_rects` = 実矩形の採取。区切り線は描画矩形を持たないので含まない）。
+    /// メニューが閉じていれば `None`
+    #[cfg(feature = "visual-test")]
+    fn vt1684_menu(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) -> Option<(
+        Option<crate::lsp_menu_ui::LspMenuSection>,
+        Vec<&'static str>,
+    )> {
+        notify_and_draw(any, window, cx);
+        window
+            .update(cx, |app, _, _| {
+                let menu = app.pane_context_menu.as_ref()?;
+                let drawn = app
+                    .pane_menu_item_rects
+                    .borrow()
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect();
+                Some((menu.lsp.as_ref().map(|l| l.section.clone()), drawn))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// #1684 の道具: メニューの LSP の節が「握手を待つ 1 行」でなくなるまで**状態で**待つ
+    /// （項目へ差し替わった・節ごと消えた・メニューが閉じた）
+    #[cfg(feature = "visual-test")]
+    async fn vt1684_settled(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        timeout: Duration,
+    ) -> bool {
+        vt1860_wait(any, window, cx, timeout, &|cx| {
+            window
+                .update(cx, |app, _, _| {
+                    app.pane_context_menu
+                        .as_ref()
+                        .and_then(|m| m.lsp.as_ref())
+                        .is_none_or(|l| l.section != crate::lsp_menu_ui::LspMenuSection::Pending)
+                })
+                .unwrap_or(true)
+        })
+        .await
+    }
+
+    /// #1684 の道具: 描いた項目 `id` の実矩形の真ん中
+    #[cfg(feature = "visual-test")]
+    fn vt1684_item_point(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        id: &str,
+    ) -> Option<Point<Pixels>> {
+        window
+            .update(cx, |app, _, _| {
+                app.pane_menu_item_rects
+                    .borrow()
+                    .iter()
+                    .find(|(i, _)| *i == id)
+                    .map(|(_, b)| b.center())
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// #1684 の道具: メニューを閉じる（背景を実マウスで押す = 利用者が外を押したのと同じ）
+    #[cfg(feature = "visual-test")]
+    fn vt1684_close(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
+        vt1860_click(any, window, cx, point(px(3.0), px(3.0)), MouseButton::Left);
+        let _ = window.update(cx, |app, _, _| app.pane_context_menu = None);
+    }
+
+    /// #1684 の道具: 実ファイルを開いて（閲覧のまま = 編集モードに入らない）行が描かれるまで待つ
+    #[cfg(feature = "visual-test")]
+    async fn vt1684_open(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        from: PaneId,
+        path: &std::path::Path,
+        label: &str,
+    ) -> PaneId {
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::OpenFile {
+                        pane: Some(from.as_u64()),
+                        path: path.display().to_string(),
+                        mode: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(false),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.drain_pending_highlights(cx);
+                cx.notify();
+                r.ok()
+                    .and_then(|v| v["pane"].as_u64())
+                    .map(PaneId::from_raw)
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                fail(&format!(
+                    "visual-test {label}: {} を開けない (#1684)",
+                    path.display()
+                ))
+            });
+        check(
+            wait_for_preview_maps(any, window, cx, pane, false).await,
+            &format!(
+                "visual-test {label}: {} の行が描かれる (#1684)",
+                path.display()
+            ),
+        );
+        pane
+    }
+
+    /// #1684: コードの本文の右クリックメニューに言語サーバの項目が出て、押すと動くか（偽サーバ）。
+    ///
+    /// 右クリック・項目の押下・ドラッグの選択はすべて**実 OS マウスと同じ `PlatformInput` 経路**で、
+    /// 押す位置は描いた行と描いた項目の実矩形。閲覧中のファイルを初めて右クリックすると
+    /// 「問い合わせています」の 1 行が出て、握手が済むと項目へ差し替わる（待たない読み口 → 背景）。
+    /// 識別子でない位置（字下げ・記号・数値・空行）・Markdown・未導入のサーバでは従来のメニューのまま。
+    /// 四隅は LSP の項目が全部出たメニューを置いて、描いた項目の実矩形がウィンドウに収まるかを見る。
+    ///
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1684_LEGACY=1`（本文の右クリックで何もしない）
+    /// では ① でメニューが開かず FAILED（A/B の検出力）。単独実行は `TAKO_VISUAL_ONLY=lsp-context-menu`
+    #[cfg(feature = "visual-test")]
+    async fn lsp_context_menu_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use crate::lsp_menu_ui::LspMenuSection;
+        use tako_core::lsp::menu::MenuItem;
+        const LABEL: &str = "lsp-context-menu";
+        inject_section_failure(LABEL);
+        let anchor = ensure_fresh_scene(window, cx, LABEL).await;
+        let dir = std::env::temp_dir().join(format!("tako-visual-lsp-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src"))
+            .expect("visual-test lsp-context-menu 一時ディレクトリ");
+        let _ = std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"v\"\n");
+        // 1 行目（0 起点）の `helper` を右クリックして 6 行目の定義へ飛ぶ。1 行目の行末の空白は
+        // 偽サーバの既定の整形（行末の空白を消す）が消す
+        let source = "fn main() {\n    let value = helper(1);   \n    // helper の説明\n\n}\n\nfn helper(x: i32) -> i32 {\n    x\n}\n";
+        let file = dir.join("src").join("main.rs");
+        std::fs::write(&file, source).expect("visual-test lsp-context-menu fixture");
+        let fake = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+            .map(|d| d.join(format!("tako-lsp-fake{}", std::env::consts::EXE_SUFFIX)))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| {
+                fail("visual-test lsp-context-menu: 偽サーバが無い（cargo build -p tako-control --bin tako-lsp-fake を先に）")
+            });
+        let spec_of = |path: &std::path::Path| {
+            tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, path)
+                .expect("fixture の拡張子を受け持つサーバが表に在る")
+                .spec
+        };
+        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
+        let rs_env = tako_core::lsp::servers::override_env_name(spec_of(&file).id);
+        std::env::set_var(&rs_env, &fake);
+        let goto = dir.join("goto.json");
+        std::fs::write(
+            &goto,
+            serde_json::json!([{
+                "method": "textDocument/definition",
+                "line": 1,
+                "result": {
+                    "uri": tako_core::file_uri::from_path(&file),
+                    "range": {
+                        "start": { "line": 6, "character": 3 },
+                        "end": { "line": 6, "character": 9 },
+                    },
+                },
+            }])
+            .to_string(),
+        )
+        .expect("goto.json");
+        std::env::set_var("TAKO_LSP_FAKE_GOTO", &goto);
+        let pane = vt1684_open(any, window, cx, anchor, &file, LABEL).await;
+        let at = |cx: &mut AsyncApp, line: usize, range: std::ops::Range<usize>| {
+            vt1684_point(window, cx, pane, line, range.clone()).unwrap_or_else(|| {
+                fail(&format!(
+                    "visual-test lsp-context-menu: {line} 行目の {range:?} の位置を採れない"
+                ))
+            })
+        };
+        let goto_ids: Vec<&str> = MenuItem::ALL[..5].iter().map(|i| i.id()).collect();
+
+        // ① 閲覧中の識別子（`helper` = 16..22）を右クリック → すぐ開き、握手を待つ 1 行 → 項目へ
+        let helper = at(cx, 1, 16..22);
+        vt1860_click(any, window, cx, helper, MouseButton::Right);
+        let first = vt1684_menu(any, window, cx);
+        println!("TAKO_VISUAL_PIXEL: {LABEL} ① first={first:?}");
+        check(
+            first.is_some(),
+            "visual-test lsp-context-menu ①: 識別子の右クリックでメニューが開く",
+        );
+        let (first_section, first_drawn) = first.unwrap();
+        check(
+            first_section.is_some(),
+            "visual-test lsp-context-menu ①: 識別子の上なら言語サーバの節がある",
+        );
+        check(
+            first_section != Some(LspMenuSection::Pending)
+                || first_drawn.first() == Some(&"note-lsp-pending"),
+            "visual-test lsp-context-menu ①: 握手を待つあいだは押せない 1 行を先頭に描く",
+        );
+        let started = std::time::Instant::now();
+        check(
+            vt1684_settled(any, window, cx, Duration::from_secs(20)).await,
+            "visual-test lsp-context-menu ①: 握手が済むと 1 行が項目へ差し替わる",
+        );
+        let (section, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} ① settled in {:.2}s section={section:?} drawn={drawn:?}",
+            started.elapsed().as_secs_f32()
+        );
+        // 目視の代わりの 1 枚（項目が出たメニュー）。`TAKO_VISUAL_DUMP_DIR` があるときだけ
+        if let (Ok(dump), Some((frame, _))) = (
+            std::env::var("TAKO_VISUAL_DUMP_DIR"),
+            capture_frame(any, cx),
+        ) {
+            let _ = frame.save(std::path::Path::new(&dump).join("lsp-context-menu-items.png"));
+        }
+        check(
+            drawn.len() > 5 && drawn[..5] == goto_ids[..],
+            &format!(
+                "visual-test lsp-context-menu ①: 申告どおりの 5 項目が先頭に描かれる（{drawn:?}）"
+            ),
+        );
+        check(
+            drawn.get(5) == Some(&"copy-path"),
+            &format!("visual-test lsp-context-menu ①: 選択が無ければ「選択範囲を整形」は出ず、従来の項目が続く（{drawn:?}）"),
+        );
+
+        // ② 「定義へ移動」を実マウスで押す → 同じファイルの 7 行目（1 始まり）へ着地する
+        let def = vt1684_item_point(window, cx, "lsp-definition")
+            .unwrap_or_else(|| fail("visual-test lsp-context-menu ②: 「定義へ移動」の矩形が無い"));
+        vt1860_click(any, window, cx, def, MouseButton::Left);
+        let landed = vt1860_wait(any, window, cx, Duration::from_secs(20), &|cx| {
+            window
+                .update(cx, |app, _, _| {
+                    app.lsp_goto.pending.is_none()
+                        && app.jump_history.current().and_then(|j| j.line) == Some(7)
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        let (menu_closed, current) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.pane_context_menu.is_none(),
+                    app.jump_history.current().cloned(),
+                )
+            })
+            .unwrap_or((false, None));
+        println!("TAKO_VISUAL_PIXEL: {LABEL} ② landed={landed} jump={current:?}");
+        check(
+            menu_closed,
+            "visual-test lsp-context-menu ②: 押すとメニューが閉じる",
+        );
+        check(
+            landed,
+            &format!(
+                "visual-test lsp-context-menu ②: 「定義へ移動」で定義の行へ着地する（{current:?}）"
+            ),
+        );
+
+        // ③ 識別子でない位置: 字下げ・`=`・数値・空行 → 従来のメニューのまま（LSP の行が 0）
+        for (what, line, range) in [
+            ("字下げ", 1usize, 1..2usize),
+            ("記号", 1, 14..15),
+            ("数値", 1, 23..24),
+            ("空行", 3, 0..0),
+        ] {
+            let p = at(cx, line, range);
+            vt1860_click(any, window, cx, p, MouseButton::Right);
+            let menu = vt1684_menu(any, window, cx);
+            println!("TAKO_VISUAL_PIXEL: {LABEL} ③ {what} menu={menu:?}");
+            let (section, drawn) = menu.unwrap_or_else(|| {
+                fail(&format!(
+                    "visual-test lsp-context-menu ③: {what}の右クリックでも従来のメニューは開く"
+                ))
+            });
+            check(
+                section.is_none()
+                    && !drawn.iter().any(|id| id.starts_with("lsp-") || id.starts_with("note"))
+                    && drawn.first() == Some(&"copy-path"),
+                &format!("visual-test lsp-context-menu ③: {what}では言語サーバの項目が 0 件（{drawn:?}）"),
+            );
+            vt1684_close(any, window, cx);
+        }
+
+        // ④ コメントの中の語: ⌘ホバーの下線と同じ字面の判定（他のエディタと同じく対象になる）
+        let in_comment = at(cx, 2, 7..13);
+        let hover_target = window
+            .update(cx, |app, _, _| {
+                app.code_symbol_at_position(pane, in_comment)
+            })
+            .ok()
+            .flatten();
+        vt1860_click(any, window, cx, in_comment, MouseButton::Right);
+        let menu = vt1684_menu(any, window, cx);
+        println!("TAKO_VISUAL_PIXEL: {LABEL} ④ comment hover={hover_target:?} menu={menu:?}");
+        check(
+            menu.as_ref().is_some_and(|(s, _)| s.is_some()) == hover_target.is_some(),
+            "visual-test lsp-context-menu ④: コメントの中の語の扱いが ⌘ホバーと同じ",
+        );
+        vt1684_close(any, window, cx);
+
+        // ⑤ 実ドラッグで 1 行目を選び、その中の識別子を右クリック → 握手済みなので**すぐ**項目が出て、
+        //    「選択範囲を整形」が足される。続けて「コードを整形」を押すと行末の空白が消える
+        let (from, to) = (at(cx, 1, 4..5), at(cx, 1, 24..25));
+        let send = |cx: &mut AsyncApp, input: gpui::PlatformInput| {
+            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+        };
+        send(
+            cx,
+            gpui::PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+        );
+        send(
+            cx,
+            gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                position: to,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            }),
+        );
+        send(
+            cx,
+            gpui::PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: to,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }),
+        );
+        notify_and_draw(any, window, cx);
+        vt1860_click(any, window, cx, helper, MouseButton::Right);
+        let (section, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
+        println!("TAKO_VISUAL_PIXEL: {LABEL} ⑤ selected section={section:?} drawn={drawn:?}");
+        check(
+            matches!(section, Some(LspMenuSection::Items(_))),
+            "visual-test lsp-context-menu ⑤: 握手済みのサーバなら待たずに項目が出る",
+        );
+        let all_ids: Vec<&str> = MenuItem::ALL.iter().map(|i| i.id()).collect();
+        check(
+            drawn.len() > 6 && drawn[..6] == all_ids[..],
+            &format!("visual-test lsp-context-menu ⑤: 選択の中なら「選択範囲を整形」まで 6 項目（{drawn:?}）"),
+        );
+        let format = vt1684_item_point(window, cx, "lsp-format").unwrap_or_else(|| {
+            fail("visual-test lsp-context-menu ⑤: 「コードを整形」の矩形が無い")
+        });
+        vt1860_click(any, window, cx, format, MouseButton::Left);
+        let formatted = vt1860_wait(any, window, cx, Duration::from_secs(20), &|cx| {
+            window
+                .update(cx, |app, _, _| {
+                    app.lsp_format.pending.is_none()
+                        && app
+                            .preview_edits
+                            .get(&pane)
+                            .is_some_and(|e| e.buffer.text().contains("helper(1);\n"))
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        let text = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| e.buffer.text().to_string())
+            })
+            .ok()
+            .flatten();
+        println!("TAKO_VISUAL_PIXEL: {LABEL} ⑤ formatted={formatted} text={text:?}");
+        check(
+            formatted && text.as_deref() == Some(&source.replace("helper(1);   \n", "helper(1);\n")),
+            "visual-test lsp-context-menu ⑤: 「コードを整形」で整形が当たる（行末の空白だけが消える）",
+        );
+        // ⑤' 整形で編集モードに入った後も同じ（文書が開いているので待たずに出る）
+        vt1860_click(any, window, cx, helper, MouseButton::Right);
+        let editing = window
+            .update(cx, |app, _, _| {
+                app.preview_edits.get(&pane).is_some_and(|e| e.editing)
+            })
+            .unwrap_or(false);
+        let (section, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} ⑤' editing={editing} section={section:?} drawn={drawn:?}"
+        );
+        check(
+            editing
+                && matches!(section, Some(LspMenuSection::Items(_)))
+                && drawn.len() > 5
+                && drawn[..5] == goto_ids[..],
+            &format!("visual-test lsp-context-menu ⑤': 編集モードでも識別子の右クリックで項目が出る（{drawn:?}）"),
+        );
+        vt1684_close(any, window, cx);
+
+        // ⑥ 四隅: LSP の項目が全部出たメニューを四隅に置き、描いた項目の実矩形がウィンドウに収まる
+        let viewport = window
+            .update(cx, |_, win, _| win.viewport_size())
+            .unwrap_or_else(|_| fail("visual-test lsp-context-menu ⑥: viewport"));
+        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        let target = tako_control::lsp::menu::ItemTarget {
+            pane: pane.as_u64(),
+            line: 2,
+            column: 16,
+            selection: None,
+        };
+        for (corner, x, y) in [
+            ("左上", 1.0, 1.0),
+            ("右上", vw - 1.0, 1.0),
+            ("左下", 1.0, vh - 1.0),
+            ("右下", vw - 1.0, vh - 1.0),
+        ] {
+            let _ = window.update(cx, |app, _, _| {
+                app.pane_context_menu = Some(PaneContextMenu {
+                    pane,
+                    kind: PaneContextKind::Preview,
+                    position: point(px(x), px(y)),
+                    restart_modes: Vec::new(),
+                    lsp: Some(crate::lsp_menu_ui::LspPaneMenu::with_items(
+                        target,
+                        MenuItem::ALL.to_vec(),
+                    )),
+                });
+            });
+            notify_and_draw(any, window, cx);
+            let rects: Vec<Bounds<Pixels>> = window
+                .update(cx, |app, _, _| {
+                    app.pane_menu_item_rects
+                        .borrow()
+                        .iter()
+                        .map(|(_, b)| *b)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let inside = rects.iter().all(|b| {
+                f32::from(b.origin.x) >= 0.0
+                    && f32::from(b.origin.y) >= 0.0
+                    && f32::from(b.origin.x + b.size.width) <= vw
+                    && f32::from(b.origin.y + b.size.height) <= vh
+            });
+            println!(
+                "TAKO_VISUAL_PIXEL: {LABEL} ⑥ {corner} items={} first={:?} last={:?} viewport={vw}x{vh}",
+                rects.len(),
+                rects.first(),
+                rects.last()
+            );
+            check(
+                rects.len() > MenuItem::ALL.len() && inside,
+                &format!(
+                    "visual-test lsp-context-menu ⑥: {corner}で右クリックしても項目が見切れない"
+                ),
+            );
+            let _ = window.update(cx, |app, _, _| app.pane_context_menu = None);
+        }
+
+        // ⑦ Markdown のプレビュー: 本文の語を右クリックしても言語サーバの項目は出ない
+        let md = dir.join("README.md");
+        std::fs::write(&md, "# Title\n\nhelper words here\n").expect("README.md");
+        let md_pane = vt1684_open(any, window, cx, pane, &md, LABEL).await;
+        let md_point = window
+            .update(cx, |app, _, _| {
+                app.preview_text_layouts
+                    .get(&md_pane)?
+                    .iter()
+                    .flatten()
+                    .last()
+                    .map(|l| {
+                        let b = l.bounds();
+                        point(b.origin.x + px(12.0), b.origin.y + l.line_height() / 2.0)
+                    })
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                fail("visual-test lsp-context-menu ⑦: Markdown の行の位置を採れない")
+            });
+        vt1860_click(any, window, cx, md_point, MouseButton::Right);
+        let menu = vt1684_menu(any, window, cx);
+        println!("TAKO_VISUAL_PIXEL: {LABEL} ⑦ markdown menu={menu:?}");
+        check(
+            menu.as_ref().is_some_and(|(s, d)| {
+                s.is_none()
+                    && d.first() == Some(&"copy-path")
+                    && !d.iter().any(|id| id.starts_with("lsp-"))
+            }),
+            "visual-test lsp-context-menu ⑦: Markdown では従来のメニューのまま",
+        );
+        vt1684_close(any, window, cx);
+
+        // ⑧ 未導入のサーバ（差し替え口が実行できないものを指す）: 1 行のあと節ごと消える
+        let py = dir.join("tool.py");
+        std::fs::write(&py, "def run():\n    return run\n").expect("tool.py");
+        let py_env = tako_core::lsp::servers::override_env_name(spec_of(&py).id);
+        std::env::set_var(&py_env, dir.join("no-such-server"));
+        let py_pane = vt1684_open(any, window, cx, pane, &py, LABEL).await;
+        let run = vt1684_point(window, cx, py_pane, 0, 4..7)
+            .unwrap_or_else(|| fail("visual-test lsp-context-menu ⑧: run の位置を採れない"));
+        vt1860_click(any, window, cx, run, MouseButton::Right);
+        let first = vt1684_menu(any, window, cx);
+        let settled = vt1684_settled(any, window, cx, Duration::from_secs(20)).await;
+        let menu = vt1684_menu(any, window, cx);
+        println!("TAKO_VISUAL_PIXEL: {LABEL} ⑧ not-installed first={first:?} settled={settled} menu={menu:?}");
+        check(
+            settled && menu.as_ref().is_some_and(|(s, d)| s.is_none() && d.first() == Some(&"copy-path")),
+            "visual-test lsp-context-menu ⑧: 未導入なら言語サーバの項目を出さず従来のメニューになる",
+        );
+        vt1684_close(any, window, cx);
+
+        std::env::remove_var(&rs_env);
+        std::env::remove_var(&py_env);
+        std::env::remove_var("TAKO_LSP_FAKE_GOTO");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1684: 実の rust-analyzer で、閲覧中のファイルを右クリック → 項目が出る → 「定義へ移動」を
+    /// 押すと定義の行へ着地する（実機目視の代わり）。`rust-analyzer` が差し替え口にも PATH にも
+    /// 無ければ SKIPPED。単独実行は `TAKO_VISUAL_ONLY=lsp-context-menu-real`
+    #[cfg(feature = "visual-test")]
+    async fn lsp_context_menu_real_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        const LABEL: &str = "lsp-context-menu-real";
+        let spec = tako_core::lsp::servers::resolve_in(
+            tako_core::lsp::servers::SERVERS,
+            std::path::Path::new("main.rs"),
+        )
+        .expect("rs を受け持つサーバが表に在る")
+        .spec;
+        let overridden = std::env::var(tako_core::lsp::servers::override_env_name(spec.id))
+            .ok()
+            .is_some_and(|p| std::path::Path::new(&p).is_file());
+        if !overridden && tako_core::platform::exe::find(spec.program).is_none() {
+            println!("TAKO_VISUAL_1684_REAL: SKIPPED（{} が無い）", spec.program);
+            return;
+        }
+        inject_section_failure(LABEL);
+        let anchor = ensure_fresh_scene(window, cx, LABEL).await;
+        let dir =
+            std::env::temp_dir().join(format!("tako-visual-lsp-menu-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src"))
+            .expect("visual-test lsp-context-menu-real 一時ディレクトリ");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"v\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("Cargo.toml");
+        let file = dir.join("src").join("main.rs");
+        std::fs::write(
+            &file,
+            "fn main() {\n    let n = helper();\n    println!(\"{n}\");\n}\n\nfn helper() -> i32 {\n    1\n}\n",
+        )
+        .expect("visual-test lsp-context-menu-real fixture");
+        let pane = vt1684_open(any, window, cx, anchor, &file, LABEL).await;
+        // `    let n = ` = 12 バイト → `helper` は 12..18
+        let helper = vt1684_point(window, cx, pane, 1, 12..18)
+            .unwrap_or_else(|| fail("visual-test lsp-context-menu-real: helper の位置を採れない"));
+        let started = std::time::Instant::now();
+        vt1860_click(any, window, cx, helper, MouseButton::Right);
+        let settled = vt1684_settled(any, window, cx, Duration::from_secs(90)).await;
+        let (section, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} settled={settled} in {:.1}s section={section:?} drawn={drawn:?}",
+            started.elapsed().as_secs_f32()
+        );
+        if let (Ok(dump), Some((frame, _))) = (
+            std::env::var("TAKO_VISUAL_DUMP_DIR"),
+            capture_frame(any, cx),
+        ) {
+            let _ = frame.save(std::path::Path::new(&dump).join("lsp-context-menu-real.png"));
+        }
+        check(
+            drawn.first() == Some(&"lsp-definition") && drawn.contains(&"lsp-format"),
+            &format!("visual-test lsp-context-menu-real: rust-analyzer の申告どおり定義へ移動と整形が出る（{drawn:?}）"),
+        );
+        let def = vt1684_item_point(window, cx, "lsp-definition").unwrap_or_else(|| {
+            fail("visual-test lsp-context-menu-real: 「定義へ移動」の矩形が無い")
+        });
+        let pressed = std::time::Instant::now();
+        vt1860_click(any, window, cx, def, MouseButton::Left);
+        let landed = vt1860_wait(any, window, cx, Duration::from_secs(90), &|cx| {
+            window
+                .update(cx, |app, _, _| {
+                    app.lsp_goto.pending.is_none()
+                        && app.jump_history.current().and_then(|j| j.line) == Some(6)
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        let (current, status) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.jump_history.current().cloned(),
+                    app.lsp_goto
+                        .status
+                        .as_ref()
+                        .map(|(_, m, e, _)| (m.clone(), *e)),
+                )
+            })
+            .unwrap_or((None, None));
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} landed={landed} in {:.1}s jump={current:?} status={status:?}",
+            pressed.elapsed().as_secs_f32()
+        );
+        check(
+            landed,
+            &format!("visual-test lsp-context-menu-real: 「定義へ移動」で fn helper の行へ着地する（{current:?} {status:?}）"),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -92717,6 +93474,7 @@ mod pane_menu_items_tests {
             can_ssh,
             restart_modes: Vec::new(),
             file_manager: FileManager::Finder,
+            lsp: None,
         }
     }
 
@@ -92824,5 +93582,139 @@ mod pane_menu_items_tests {
                 "close",
             ]
         );
+    }
+
+    /// #1684: プレビューのペインに LSP の節（出し分け済みの項目）を渡したときの並び
+    fn lsp_facts(section: crate::lsp_menu_ui::LspMenuSection) -> PaneMenuFacts {
+        PaneMenuFacts {
+            lsp: Some(section),
+            ..facts(true, false)
+        }
+    }
+
+    /// #1684: LSP の項目は先頭に `tako_core::lsp::menu::items` の順で並び、区切り線のあとに
+    /// 従来のプレビューの項目がそのまま続く（従来の項目を 1 つも動かさない）
+    #[test]
+    fn lsp_の項目は先頭に並び従来の項目は動かない() {
+        use crate::lsp_menu_ui::LspMenuSection;
+        use tako_core::lsp::goto::GotoKind;
+        use tako_core::lsp::menu::MenuItem;
+        let base = ids(facts(true, false));
+        let with = ids(lsp_facts(LspMenuSection::Items(vec![
+            MenuItem::Goto(GotoKind::Definition),
+            MenuItem::Goto(GotoKind::Implementation),
+            MenuItem::Format,
+        ])));
+        assert_eq!(
+            &with[..4],
+            &[
+                "lsp-definition",
+                "lsp-implementation",
+                "lsp-format",
+                "sep-lsp"
+            ]
+        );
+        assert_eq!(&with[4..], &base[..], "従来の項目はそのまま");
+        // 全項目: 項目の id は core の id そのもの（GUI だけの id を作らない）
+        let all = ids(lsp_facts(LspMenuSection::Items(MenuItem::ALL.to_vec())));
+        let lsp: Vec<_> = all
+            .iter()
+            .take_while(|id| **id != "sep-lsp")
+            .copied()
+            .collect();
+        assert_eq!(
+            lsp,
+            MenuItem::ALL
+                .iter()
+                .map(|item| item.id())
+                .collect::<Vec<_>>()
+        );
+        // 押せる項目は必ず core の項目に戻る（クリックの振り分けが受け取れる）
+        for id in &lsp {
+            assert!(MenuItem::from_id(id).is_some(), "{id}");
+        }
+    }
+
+    /// #1684: 握手を待つあいだは押せない 1 行と区切り線だけ。識別子でない位置（節が無い）では
+    /// LSP の行は 0（`lsp-` も `note-` も出ない = 従来のメニューと 1 項目も違わない）
+    #[test]
+    fn 握手待ちは押せない1行で識別子でない位置は従来のまま() {
+        use crate::lsp_menu_ui::LspMenuSection;
+        let pending = ids(lsp_facts(LspMenuSection::Pending));
+        assert_eq!(&pending[..2], &["note-lsp-pending", "sep-lsp"]);
+        assert!(
+            tako_core::lsp::menu::MenuItem::from_id(pending[0]).is_none(),
+            "押せない 1 行は項目ではない"
+        );
+        for plain in [facts(true, false), facts(false, false), facts(false, true)] {
+            let items = ids(plain);
+            assert!(
+                !items
+                    .iter()
+                    .any(|id| id.starts_with("lsp-") || id.starts_with("note")),
+                "{items:?}"
+            );
+        }
+    }
+
+    /// 受け入れ条件: LSP の項目が全部出たいちばん高いメニューでも、ウィンドウの四隅で右クリックして
+    /// 見切れない（`clamp_menu_position` の本体 `compute_menu_position` を描画と同じ寸法で通す）
+    #[test]
+    fn lsp_の項目つきメニューは四隅で見切れない() {
+        use crate::lsp_menu_ui::LspMenuSection;
+        use tako_core::lsp::menu::MenuItem;
+        let items =
+            pane_context_menu_items(lsp_facts(LspMenuSection::Items(MenuItem::ALL.to_vec())));
+        let (w, h) = super::pane_menu_size(&items);
+        assert!(h > 200.0, "LSP の 6 項目ぶん高くなっている（{h}）");
+        for (vw, vh) in [(1200.0_f32, 800.0_f32), (640.0, 400.0)] {
+            for (x, y) in [
+                (1.0, 1.0),
+                (vw - 1.0, 1.0),
+                (1.0, vh - 1.0),
+                (vw - 1.0, vh - 1.0),
+            ] {
+                let (rx, ry) = super::compute_menu_position(x, y, w, h, vw, vh);
+                assert!(
+                    rx >= 0.0 && ry >= 0.0 && rx + w <= vw && ry + h <= vh,
+                    "{vw}x{vh} の ({x}, {y}) で見切れる: ({rx}, {ry}) {w}x{h}"
+                );
+            }
+        }
+    }
+
+    /// #1684 の番犬: メニューの LSP の項目は**押すと CLI / MCP と同じ要求**を組んで dispatch へ渡す
+    /// （UI 限定の操作を作らない = 開発不変条件）。クリックの振り分けは core の id から項目へ戻し、
+    /// 要求は `lsp::menu::item_request` だけが組む（GUI の側で `LspGoto` / `LspFormat` を手で組まない）
+    #[test]
+    fn lsp_の項目のクリックは同じ要求を組んで_dispatch_へ渡す() {
+        let main_src = include_str!("main.rs");
+        let render = main_src
+            .split("fn render_pane_context_menu(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("render_pane_context_menu の本体");
+        assert!(
+            render.contains("MenuItem::from_id(id)") && render.contains("run_lsp_menu_item("),
+            "クリックの振り分けが core の id から項目へ戻していない"
+        );
+        let ui = include_str!("lsp_menu_ui.rs");
+        let run = ui
+            .split("fn run_lsp_menu_item(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("run_lsp_menu_item の本体");
+        assert!(
+            run.contains("item_request("),
+            "要求を item_request で組んでいない"
+        );
+        for literal in ["Request::LspGoto {", "Request::LspFormat {"] {
+            assert!(
+                !run.contains(literal),
+                "GUI の側で {literal} を手で組んでいる"
+            );
+        }
+        // 渡し先は ⌘クリック・編集メニューと同じ入口（dispatch の 3 段）
+        assert!(run.contains("start_lsp_goto_request(") && run.contains("format_preview_request("));
     }
 }

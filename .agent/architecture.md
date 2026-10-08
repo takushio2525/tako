@@ -1920,6 +1920,26 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   自動 import と下の方の語のように**離れた範囲**を入れるので、1 か所にするとあいだの本文がまるごと
   undo へ載る（undo の予算は 8 MB = 10 MB の文書なら 1 回で履歴が消える）。だから当て方だけを分けた
 
+### 右クリックメニューの言語サーバの項目（#1684。2026-10-02）
+
+- **置き場**: 出し分けの純粋部分は `tako_core::lsp::menu`（`MenuItem` の 6 つ・`items`・`selection_covers`）、
+  項目 → dispatch の対応（`action_of` / `item_request` / `item_args` / `NOT_IN_MENU`）は
+  `tako_control::lsp::menu`、能力の読み口は `LspManager::menu_capabilities_now`（待たない）/
+  `menu_capabilities`（握手を待つ）、準備と答えは `dispatch::lsp_menu_prepare` → `LspMenuJob::peek` / `run` →
+  `LspMenuAnswer`、画面は tako-app の `lsp_menu_ui.rs`（本文の右クリック・握手待ちの 1 行・答えの差し替え・項目の押下）
+- **能力はサーバの単位で読む**: 開いている文書なら文書の `ServerKey`、開いていなければ `open` と同じ規則
+  （検出表 + `root::find_root`）でキーを作ってスロットを引く。握手済みのサーバは別のファイルの右クリックでも
+  その場で答える（閲覧中の 2 回目以降は待たない）。まだなら定義ジャンプと同じ一時の didOpen で起こす
+- **GUI と CLI / MCP の違いは待ち方だけ**: どちらも `lsp_menu_prepare` で材料を採り、同じ `items` で出し分ける。
+  GUI は `peek` が決まればその場で、決まらなければ押せない 1 行で開いて `run` を背景で走らせ、番号（`lsp_menu_seq`）で
+  まだ同じメニューが開いているかを見てから差し替える。CLI / MCP は offload で `run` を待つ
+- **押したときは操作を持たない**: `item_request` が組む要求は CLI / MCP が組む要求と同じ（番犬が `item_args` を
+  MCP の入口へ通して突き合わせる）で、定義ジャンプは `start_lsp_goto_request`（⌘クリックと同じ入口）、整形は
+  `format_preview_request`（編集メニュー・⇧⌘I と同じ入口）へ渡す。押したときの位置と選択はメニューを開いた瞬間の値
+- **行の高さを 1 つの定数に**: `PANE_MENU_ITEM_HEIGHT`（24px）で行を組み、見切れ判定の `pane_menu_size` も同じ
+  定数で数える（以前は見積もり 20px・実高さ 23.5px で、項目の多いメニューを下端で開くと下へ見切れていた。
+  visual-test `lsp-context-menu` の ⑥ が実矩形で四隅を見る）
+
 ## 大きいファイルの編集（#1660。2026-09-27）
 
 プレビューの読み込み上限（= 編集の上限）が 1 MB / 5,000 行で、tako 自身の `main.rs`（8 万行超）・

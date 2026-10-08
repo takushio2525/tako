@@ -999,6 +999,28 @@ enum LspCommand {
     /// その位置の補完候補（GUI の打鍵中の一覧と同じ絞り込みと並び。#1682）。`--choice N` で
     /// N 番目の候補で確定する（undo 1 回で戻る）。MCP は `tako_lsp` の action=completion
     Completion(LspCompletionArgs),
+    /// その位置の右クリックメニューの LSP 項目（GUI のコードプレビューの本文を右クリックしたときと
+    /// 同じ出し分け = サーバの能力に無いものは出ない・識別子でない位置は 0 件。#1684）。
+    /// 項目ごとに押したときと同じコマンドを出す。MCP は `tako_lsp` の action=menu
+    Menu(LspMenuArgs),
+}
+
+/// `tako lsp menu` の引数（#1684）。位置は `tako edit replace-range` と同じ
+/// （行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+#[derive(clap::Args)]
+struct LspMenuArgs {
+    /// コードプレビューのペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 行（1 始まり）
+    #[arg(long)]
+    line: usize,
+    /// 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否）
+    #[arg(long)]
+    column: usize,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
 }
 
 /// `tako lsp format --range` の `行:桁-行:桁` を解く（#1683。行:桁は [`parse_position`]）
@@ -1121,6 +1143,11 @@ impl LspCommand {
                 choice: args.choice,
                 resolve: args.resolve.then_some(true),
             },
+            Self::Menu(args) => Request::LspMenu {
+                pane: target_pane(args.pane)?,
+                line: args.line,
+                column: args.column,
+            },
         })
     }
 
@@ -1147,6 +1174,7 @@ impl LspCommand {
             | Self::TypeDefinition(args)
             | Self::Implementation(args) => args.json,
             Self::Completion(args) => args.json,
+            Self::Menu(args) => args.json,
             _ => false,
         }
     }
@@ -9990,6 +10018,12 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
         }
         return;
     }
+    if !sub.json() && matches!(sub, LspCommand::Menu(_)) {
+        for line in lsp_menu_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
     if sub.json()
         || !matches!(
             sub,
@@ -10052,6 +10086,58 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
             }
         }
     }
+}
+
+/// `tako lsp menu` の人向けの体裁（#1684）。中身の正本は dispatch の応答。
+/// 1 行目は `status`・サーバ・識別子、続けて 1 項目 1 行（id と、押したときと同じコマンド）か
+/// 理由と次の一手
+fn lsp_menu_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    let mut head = vec![text(&result["status"])];
+    if let Some(server) = result["server"].as_str() {
+        head.push(server.to_string());
+    }
+    if let Some(symbol) = result["symbol"].as_object() {
+        head.push(format!(
+            "{}（{}）",
+            symbol.get("text").map(text).unwrap_or_default(),
+            symbol.get("kind").map(text).unwrap_or_default()
+        ));
+    }
+    let mut out = vec![head.join(" ")];
+    let items = result["items"].as_array().cloned().unwrap_or_default();
+    for item in &items {
+        out.push(format!(
+            "  {:<22} {}",
+            text(&item["id"]),
+            lsp_menu_command(&item["args"])
+        ));
+    }
+    if items.is_empty() {
+        for key in ["reason", "next_step"] {
+            if let Some(line) = result[key].as_str() {
+                out.push(format!("  {line}"));
+            }
+        }
+    }
+    out
+}
+
+/// 項目の `args`（MCP `tako_lsp` の引数）を同じ操作の CLI へ写す（#1684。表示だけ）
+fn lsp_menu_command(args: &Value) -> String {
+    let n = |key: &str| args[key].as_u64();
+    let mut cmd = format!("tako lsp {}", args["action"].as_str().unwrap_or_default());
+    if let Some(pane) = n("pane") {
+        cmd.push_str(&format!(" --pane {pane}"));
+    }
+    match (n("line"), n("column"), n("end_line"), n("end_column")) {
+        (Some(l), Some(c), Some(el), Some(ec)) => {
+            cmd.push_str(&format!(" --range {l}:{c}-{el}:{ec}"))
+        }
+        (Some(l), Some(c), None, None) => cmd.push_str(&format!(" --line {l} --column {c}")),
+        _ => {}
+    }
+    cmd
 }
 
 /// `tako lsp diagnostics` の人向けの体裁（#1679）。
@@ -10927,6 +11013,55 @@ mod tests {
 
         // --column は --line とセット（clap が引数解析の時点で弾く）
         assert!(Cli::try_parse_from(["tako", "open", abs, "--column", "3"]).is_err());
+    }
+
+    /// #1684: `tako lsp menu` は MCP の action=menu と同じ要求になり、人向けの表示は 1 項目 1 行で
+    /// 押したときと同じコマンドを出す（範囲の整形は `--range 行:桁-行:桁`）
+    #[test]
+    fn lsp_menuを操作へ写し押したときのコマンドを出す() {
+        let command = parse(&[
+            "tako", "lsp", "menu", "--pane", "7", "--line", "3", "--column", "4",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::LspMenu {
+                pane: Some(7),
+                line: 3,
+                column: 4,
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["tako", "lsp", "menu", "--pane", "7", "--line", "3"]).is_err()
+        );
+        let lines = lsp_menu_lines(&serde_json::json!({
+            "status": "ok", "server": "rust-analyzer",
+            "symbol": {"text": "helper", "kind": "identifier", "column": 4, "end_column": 10},
+            "items": [
+                {"id": "lsp-definition", "action": "definition",
+                 "args": {"action": "definition", "pane": 7, "line": 3, "column": 4}},
+                {"id": "lsp-format", "action": "format", "args": {"action": "format", "pane": 7}},
+                {"id": "lsp-format-selection", "action": "format",
+                 "args": {"action": "format", "pane": 7, "line": 2, "column": 0, "end_line": 5, "end_column": 1}},
+            ],
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "ok rust-analyzer helper（identifier）",
+                "  lsp-definition         tako lsp definition --pane 7 --line 3 --column 4",
+                "  lsp-format             tako lsp format --pane 7",
+                "  lsp-format-selection   tako lsp format --pane 7 --range 2:0-5:1",
+            ]
+        );
+        // 項目が無ければ理由と次の一手
+        let lines = lsp_menu_lines(&serde_json::json!({
+            "status": "not-symbol", "symbol": null, "items": [],
+            "reason": "識別子ではない", "next_step": "識別子を指す",
+        }));
+        assert_eq!(
+            lines,
+            vec!["not-symbol", "  識別子ではない", "  識別子を指す"]
+        );
     }
 
     #[test]

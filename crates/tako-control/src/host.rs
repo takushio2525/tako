@@ -729,6 +729,11 @@ pub trait PreviewHost {
     ) -> Result<PreviewLineTarget, String> {
         Err("行ジャンプは未対応".into())
     }
+    /// プレビューの選択（#1684。右クリックメニューの「選択範囲を整形」を出すか・その範囲）。
+    /// 行 1 始まり・桁 0 始まりの行内 UTF-8 バイト。選択が無い・空なら `None`
+    fn preview_selection(&self, _pane: PaneId) -> Option<crate::protocol::LineColRange> {
+        None
+    }
     /// 定義ジャンプの起点（#1680）: いま表示しているコードの `line`（0 起点）行目の本文と、
     /// 編集セッションがあればその全文。コードのプレビューでない・行が無ければ理由を返す
     fn preview_goto_source(

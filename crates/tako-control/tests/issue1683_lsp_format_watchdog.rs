@@ -257,8 +257,32 @@ fn scan_gui(main: &str, gui: &str) -> Vec<String> {
             ));
         }
     }
+    // 編集メニュー・⇧⌘I（`format_focused_preview`）と右クリックメニューの整形（#1684）は
+    // 共有の入口 `format_preview_request` を通り、そこが CLI / MCP と同じ準備を通る
+    match fn_window(gui, "pub(crate) fn format_focused_preview(") {
+        None => out.push(report(
+            GUI,
+            0,
+            "`pub(crate) fn format_focused_preview(` が見つからない（走査が空振り）",
+        )),
+        Some((at, window)) => {
+            if line_in(
+                at,
+                &window,
+                "self.format_preview_request(pane, request, cx)",
+            )
+            .is_none()
+            {
+                out.push(report(
+                    GUI,
+                    at,
+                    "編集メニューの整形が共有の入口（format_preview_request）を通っていない",
+                ));
+            }
+        }
+    }
     for name in [
-        "pub(crate) fn format_focused_preview(",
+        "pub(crate) fn format_preview_request(",
         "pub(crate) fn save_with_format(",
     ] {
         match fn_window(gui, name) {
@@ -359,6 +383,7 @@ fn 走査が空振りしていない() {
     assert!(fn_window(&main, "fn drive_autosave(").is_some());
     assert!(fn_window(&main, "fn apply_preview_changes(").is_some());
     assert!(fn_window(&gui, "pub(crate) fn format_focused_preview(").is_some());
+    assert!(fn_window(&gui, "pub(crate) fn format_preview_request(").is_some());
     assert!(fn_window(&gui, "pub(crate) fn save_with_format(").is_some());
     assert!(settings.contains("pub lsp_format_on_save: bool,"));
 }
