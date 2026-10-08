@@ -43,7 +43,6 @@ ONLY="${ONLY:-}"
 PASS=0
 FAIL=0
 UNMEASURED=0
-DONE=0
 
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  [NG] $1"; }
@@ -83,13 +82,8 @@ INLINE_EXISTED=0
 # claude を動かす作業 dir（信頼済みの dir。既定は main の worktree = 共有ツリー。読むだけ）
 WORKDIR="${CLAUDE_WORKDIR:-$(git -C "$REPO_ROOT" worktree list --porcelain | awk 'NR == 1 { print $2 }')}"
 
+# 後始末。終了コードの補正は exit-guard の番人（#1864）が受け持つ（印の無い 0 は 1）
 cleanup() {
-  local rc=$?
-  # bash 3.2 は set -u で死んだときだけ trap の中の $? が 0 になる（release.sh と同じ作法）
-  if [ "$rc" -eq 0 ] && [ "$DONE" != 1 ]; then
-    echo "エラー: 途中で止まった（終了コード 0 のまま抜けかけた）" >&2
-    rc=1
-  fi
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
@@ -98,9 +92,10 @@ cleanup() {
     rmdir "$INLINE_DATA" 2>/dev/null || true
   fi
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: $TMP を残した）"; else rm -rf "$TMP"; fi
-  exit "$rc"
 }
-trap cleanup EXIT
+# shellcheck source=lib/exit-guard.sh
+. "$REPO_ROOT/scripts/lib/exit-guard.sh"
+tako_exit_trap cleanup "tako mod の実経路テスト"
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
@@ -487,5 +482,5 @@ check_eq "Claude Code の設定ファイルの更新時刻が変わらない" "$
 
 echo
 echo "結果: PASS $PASS / FAIL $FAIL / 未実測 $UNMEASURED"
-DONE=1
-[ "$FAIL" -eq 0 ]
+[ "$FAIL" -eq 0 ] || exit 1
+tako_exit 0
