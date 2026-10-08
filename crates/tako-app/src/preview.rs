@@ -469,6 +469,14 @@ pub fn md_edit_resume_legacy() -> bool {
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1661_LEGACY").is_some())
 }
 
+/// `TAKO_1873_LEGACY=1` で **#1873 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
+/// 閲覧中の Markdown で ⌘F 検索をしてエディタの行（`code`）へ落ちた表示が、検索欄を
+/// 閉じても描画へ戻らない（目次も空のまま・編集セッションも残る）
+pub fn find_restore_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1873_LEGACY").is_some())
+}
+
 /// 表示行の差し替え 1 回ぶん（#1660）。版 `from_rev` の表示行の `range` を `inserted` 行で
 /// 置き換えると版 `to_rev` の表示行になる。描画は、自分が持っている行テキストが
 /// `from_rev` のもので、今の表示行が `to_rev` のときだけ写す（それ以外は作り直す）
@@ -557,6 +565,14 @@ impl EditState {
     /// 元がコード表示ならいつでもエディタの行のまま（#1661 前と同じ）
     pub fn shows_editor_lines(&self) -> bool {
         self.editing || self.search_visible || !self.resumes_rendered()
+    }
+
+    /// 検索欄を閉じたら描画（Markdown）へ戻すセッションか（#1873）。
+    ///
+    /// 閲覧中（編集していない）に描画から開いた検索だけ。編集中に閉じても編集は続くので
+    /// エディタの行のまま（描画へ戻すのは編集を抜ける口 = #1661）
+    pub fn search_close_resumes_rendered(&self) -> bool {
+        !self.editing && self.resumes_rendered() && !find_restore_legacy()
     }
 
     /// UI スレッドで全文を扱ってよい大きさか（#1661。編集の全文の塗り = #1660 と同じ線引き）。
@@ -4903,6 +4919,32 @@ mod tests {
         std::fs::write(&rs, "fn main() {}\n").unwrap();
         let edit = EditState::open(&load(&rs, PreviewMode::Code)).unwrap();
         assert!(!edit.offers_source_outline());
+    }
+
+    /// 検索欄を閉じたら描画へ戻すのは、閲覧中に描画から開いたセッションだけ（#1873）
+    #[test]
+    fn 検索欄を閉じたら描画へ戻すセッションの判定() {
+        let dir = tako_core::test_residue::ScratchDir::new("md-find-1873");
+        let md = dir.join("note.md");
+        std::fs::write(&md, "# T\n\nneedle\n").unwrap();
+        // 閲覧中の ⌘F（`editing = false` で開く）
+        let mut edit = EditState::open(&load(&md, PreviewMode::Markdown)).unwrap();
+        edit.editing = false;
+        edit.search_visible = true;
+        assert!(edit.shows_editor_lines(), "開いているあいだはエディタの行");
+        assert!(edit.search_close_resumes_rendered(), "閉じたら描画へ");
+        // 編集中に開いた検索は、閉じても編集を保つ（描画へ戻すのは編集を抜ける口）
+        edit.editing = true;
+        assert!(!edit.search_close_resumes_rendered());
+        // コード表示から開いた md・コードのファイルは今までどおり
+        let mut code = EditState::open(&load(&md, PreviewMode::Code)).unwrap();
+        code.editing = false;
+        assert!(!code.search_close_resumes_rendered());
+        let rs = dir.join("main.rs");
+        std::fs::write(&rs, "fn needle() {}\n").unwrap();
+        let mut rs = EditState::open(&load(&rs, PreviewMode::Code)).unwrap();
+        rs.editing = false;
+        assert!(!rs.search_close_resumes_rendered());
     }
 
     /// 編集中の目次は本文の版が同じあいだ作り直さない（打鍵ごとに全文を解かない）

@@ -993,6 +993,15 @@ pub trait PreviewHost {
     ) -> Result<serde_json::Value, String> {
         Err("プレビュー編集は未対応".into())
     }
+    /// 画面の検索欄を開く / 閉じる（#1873）。GUI の ⌘F・Escape と同じ口を通す
+    /// （閲覧中の Markdown は閉じると描画へ戻る）。開けないプレビュー（PDF 等）は理由つきで断る
+    fn set_preview_search_visible(&mut self, _pane: PaneId, _visible: bool) -> Result<(), String> {
+        Err("プレビュー編集は未対応".into())
+    }
+    /// 画面の検索欄が開いているか（#1873）。プレビューペインでなければ `None`
+    fn preview_search_visible(&self, _pane: PaneId) -> Option<bool> {
+        None
+    }
     /// 置換（#195）。`options` は省略した項目を既定で埋めた条件（#1653）
     fn preview_replace(
         &mut self,

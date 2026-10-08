@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-30（#1855: docs サイトの GA4 を同意まで読み込まない新しい形（basic 型）へ移した）
-- `docs/astro.config.mjs` の head から gtag.js と inline の config（保険の `consent default` を含む）を消し、ハブの consent.js 1 本に `data-ga-id` を付けた。gtag.js は consent.js が地域と同意を見て差し込む（Refs takushio2525/takushio2525.com#36）。`.agent/conventions.md` の同意の節も同じ形へ
-- 実測（ヘッドレス Chromium・国判定だけ差し替え・送信は 204 で打ち切り）: EEA 未選択で Google への要求 0・同意で gtag.js 1 / page_view 1・日本は 1 / 1。旧版の consent.js のままだと全場面 0 なので、merge はエッジの入れ替わりの後
-
 ## 2026-09-30（#1857: tmux の attach クライアントだけが外から終わってもペインを閉じず再 attach するようにした）
 - Exited で器へ生死を聞き（`list-clients`・上限 3 秒・background）、生きていて他のクライアントが居なければ attach 専用（`attach-session`）で同じペインを張り替える。60 秒に 5 回で止まり、閉じずにチップ + 画面 2 行。persist.log に 1 行・状態は list / read の `backend_reattach`・手動は `tako persist reattach` / MCP `tako_persist` の `reattach`（カタログ +204 B）
 - 実測: `scripts/test-reattach-1857.sh` 30 PASS 0 FAIL（v0.8.25 は ① で FAILED = ペインが閉じる）・番犬の注入 5 通りすべて main.rs:行 で FAILED・A/B `TAKO_1857_LEGACY=1`
@@ -67,3 +63,7 @@
 ## 2026-10-08（#1681: LSP ホバー = 識別子にマウスを乗せると型・doc のカード・CLI / MCP）
 - core `lsp::hover`（Hover の 3 形・16,000 字の上限・範囲・能力）→ manager の `hover`（マウスは補完と同じ取り消しの列 + `open: false` = 開いている文書に加わるだけ = 乗せただけでサーバを起こさない）→ dispatch 3 段（`show` でカード = `ControlHost::show_lsp_hover`）→ CLI `tako lsp hover` / MCP `tako_lsp` の `action=hover`（+290 B）→ GUI `lsp_hover_ui`（`render_block` 経由・1 フレーム目に測って語の行の上下へ・編集メニュー / パレットの口・右クリックメニューには載せない）
 - 実測: e2e `issue1681_lsp_hover` 9 本・番犬の注入 8 通りを file:line で名指し・`scripts/test-lsp-hover-1681.sh` 23 PASS（visual-test `hover` 8 相 = 基準画像との差分は矩形の外 0 px・100 回で保持件数が増えない・A/B `TAKO_1681_LEGACY=1` で FAILED / `hover-real` で実の rust-analyzer の `String` の doc がカードに出る / CLI・MCP 19 項目）
+
+## 2026-10-08（#1873: 閲覧中の ⌘F 検索を閉じたら描画へ戻し目次を作り直すようにした）
+- 開閉を `open_preview_search_bar` / `close_preview_search_bar` の 1 実装へ寄せ（Escape・⌘F のトグル・CLI / MCP）、閲覧中に描画から開いた検索なら #1661 の `restore_rendered_preview` で戻してセッションも畳む（code へ落ちていたときだけ描き直す）。CLI `tako edit search --open|--close` / MCP `tako_preview_search` の `visible`（ツールは増やさない）。A/B `TAKO_1873_LEGACY=1`
+- 実測: 修正前の main は Escape 後 mode=code・目次 0 件（visual 節）。`scripts/test-md-find-restore-1873.sh` 43 PASS 0 FAIL・番犬の注入 8 通りを file:line で名指し

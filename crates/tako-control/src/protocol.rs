@@ -971,7 +971,12 @@ pub enum Request {
     /// 条件（#1653）: `case_sensitive`（既定 true = 大文字小文字を区別する）と
     /// `whole_word`（既定 false）。**query を渡したときは既定から組み直し、省略したときは
     /// 今の検索の条件を引き継ぐ**（`tako_core::text_edit::SearchOptions::resolve`）。
-    /// 省略時は wire に現れない（引数が生える前の JSON とバイト一致）
+    /// 省略時は wire に現れない（引数が生える前の JSON とバイト一致）。
+    ///
+    /// `visible`（#1873）: 画面の検索欄を開く（true = GUI の ⌘F）/ 閉じる（false = Escape）。
+    /// 開くのは探す前・閉じるのは探した後。開閉だけ（query も direction も無い）なら探さない。
+    /// 閲覧中の Markdown は、開いた欄で探すとエディタの行（code）の上にヒットを描き、閉じると
+    /// 描画へ戻る。応答の `search.visible` に開閉の状態、`mode` に表示モードが載る
     PreviewSearch {
         pane: Option<u64>,
         query: Option<String>,
@@ -980,6 +985,8 @@ pub enum Request {
         case_sensitive: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         whole_word: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visible: Option<bool>,
     },
     /// 置換（#195）。query に一致する箇所を replacement で置換。all=true で全置換。
     ///

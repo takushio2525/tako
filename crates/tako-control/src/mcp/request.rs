@@ -428,6 +428,7 @@ pub(super) fn build_request(
             direction: str_arg(args, "direction")?,
             case_sensitive: bool_arg(args, "case_sensitive")?,
             whole_word: bool_arg(args, "whole_word")?,
+            visible: bool_arg(args, "visible")?,
         },
         "tako_preview_replace" => Request::PreviewReplace {
             pane: Some(target_pane(args, caller)?),

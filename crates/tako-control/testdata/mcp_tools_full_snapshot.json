@@ -1591,7 +1591,7 @@
     "name": "tako_preview_redo"
   },
   {
-    "description": "コードプレビューのテキスト検索。query でインクリメンタル検索し、direction で移動（next/prev）。編集モードでなくても使える。query 省略時は現在の検索状態を返す。search.viewport でヒットへ飛んだあとにその行が画面に入っているかが読める。",
+    "description": "コードプレビューのテキスト検索。query でインクリメンタル検索し、direction で移動（next/prev）。編集モードでなくても使える。query 省略時は現在の検索状態を返す。search.viewport でヒットへ飛んだあとにその行が画面に入っているかが読める。visible で画面の検索欄を開閉する（閉じると閲覧中の Markdown は描画へ戻る）。開閉は search.visible、表示は mode で読める。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1615,6 +1615,10 @@
         "query": {
           "description": "検索文字列",
           "type": "string"
+        },
+        "visible": {
+          "description": "true = 検索欄を開く / false = 閉じる（開閉だけなら移動しない）",
+          "type": "boolean"
         },
         "whole_word": {
           "description": "単語単位（既定 false。同上）",

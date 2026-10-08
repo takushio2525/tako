@@ -668,6 +668,14 @@ tako edit search --direction prev    # 次へ / 前へ（条件は今の検索�
 tako edit replace value item --all   # 全置換（区別するので Value は残る）
 ```
 
+画面の検索欄（⌘F、Windows は Ctrl+Shift+F）は `--open` / `--close` で開け閉めできます。開いた欄で探すと、Markdown もヒットをコード表示の行の上に描きます。閉じると元の描画（目次つき）へ戻ります。
+
+```bash
+tako edit search --open     # 検索欄を開く
+tako edit search value      # 開いた欄で探す（ヒットが画面に出る）
+tako edit search --close    # 閉じる（閲覧中の Markdown は描画へ戻る）
+```
+
 ### tako file
 
 ファイルツリーの右クリックメニューに相当する操作群です。

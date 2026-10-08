@@ -2166,19 +2166,26 @@ enum EditCommand {
         pane: Option<u64>,
     },
     /// テキスト検索（query 省略時は現在の検索状態を返す）。
-    /// 既定は大文字小文字を区別する。query を省略したときは今の検索の条件を引き継ぐ
+    /// 既定は大文字小文字を区別する。query を省略したときは今の検索の条件を引き継ぐ。
+    /// `--open` / `--close` は画面の検索欄を開く / 閉じる（GUI の ⌘F・Escape と同じ）
     Search {
         /// 検索文字列
         query: Option<String>,
-        /// 移動方向（next / prev）
-        #[arg(long, default_value = "next")]
-        direction: String,
+        /// 移動方向（next / prev。省略時は next。`--open` / `--close` だけのときは動かない）
+        #[arg(long)]
+        direction: Option<String>,
         /// 大文字小文字を区別しない（既定は区別する）
         #[arg(short = 'i', long)]
         ignore_case: bool,
         /// 単語単位で探す（前後が英数字・かな漢字・_ に続く一致を外す）
         #[arg(short = 'w', long)]
         whole_word: bool,
+        /// 画面の検索欄を開く（開いた欄で探すとヒットをエディタの行の上に描く）
+        #[arg(long, conflicts_with = "close")]
+        open: bool,
+        /// 画面の検索欄を閉じる（閲覧中の Markdown は描画へ戻る）
+        #[arg(long)]
+        close: bool,
         #[arg(long)]
         pane: Option<u64>,
     },
@@ -7672,14 +7679,28 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 direction,
                 ignore_case,
                 whole_word,
+                open,
+                close,
                 pane,
-            } => Request::PreviewSearch {
-                pane: target_pane(*pane)?,
-                query: query.clone(),
-                direction: Some(direction.clone()),
-                case_sensitive: search_flag(*ignore_case, false),
-                whole_word: search_flag(*whole_word, true),
-            },
+            } => {
+                // #1873: 検索欄の開閉（付けたときだけ送る = 付けなければ従来の JSON とバイト一致）
+                let visible = match (*open, *close) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                };
+                Request::PreviewSearch {
+                    pane: target_pane(*pane)?,
+                    query: query.clone(),
+                    // 開閉だけのときは移動しない（GUI の ⌘F・Escape はヒットへ飛ばない）
+                    direction: direction
+                        .clone()
+                        .or_else(|| visible.is_none().then(|| "next".to_string())),
+                    case_sensitive: search_flag(*ignore_case, false),
+                    whole_word: search_flag(*whole_word, true),
+                    visible,
+                }
+            }
             EditCommand::Replace {
                 query,
                 replacement,
@@ -11588,6 +11609,7 @@ mod tests {
                 direction: Some("next".into()),
                 case_sensitive: None,
                 whole_word: None,
+                visible: None,
             }
         );
         // #1653: -i / -w を付けたときだけ条件を送る（付けなければ既定 = 区別する）
@@ -11600,7 +11622,50 @@ mod tests {
                 direction: Some("next".into()),
                 case_sensitive: Some(false),
                 whole_word: Some(true),
+                visible: None,
             }
+        );
+        // #1873: --open / --close は検索欄の開閉。開閉だけのときは移動しない（direction を送らない）
+        for (flag, visible) in [("--open", true), ("--close", false)] {
+            let command = parse(&["tako", "edit", "search", flag, "--pane", "5"]);
+            assert_eq!(
+                build_request(&command).unwrap(),
+                Request::PreviewSearch {
+                    pane: Some(5),
+                    query: None,
+                    direction: None,
+                    case_sensitive: None,
+                    whole_word: None,
+                    visible: Some(visible),
+                },
+                "{flag}"
+            );
+        }
+        let command = parse(&[
+            "tako",
+            "edit",
+            "search",
+            "hello",
+            "--open",
+            "--direction",
+            "prev",
+            "--pane",
+            "5",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewSearch {
+                pane: Some(5),
+                query: Some("hello".into()),
+                direction: Some("prev".into()),
+                case_sensitive: None,
+                whole_word: None,
+                visible: Some(true),
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["tako", "edit", "search", "--open", "--close"]).is_err(),
+            "--open と --close は同時に渡せない"
         );
         let command = parse(&[
             "tako", "edit", "replace", "old", "new", "--all", "--pane", "5",
