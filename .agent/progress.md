@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-09-29（#1843: docs サイトの検索流入を増やす — 検索向けの title・構造化データ・フォントの非同期化・解説 2 本）
-- 主要 17 ページに `seoTitle`（見出しは変えず `<title>` と og:title だけ）・description 10 本を検索意図へ。JSON-LD（トップ WebSite / 各ページ BreadcrumbList / 「よくある質問」節から FAQPage）を `docs/src/structuredData.ts` の 1 か所で組む。フォントの `@import` を head の preconnect + 非同期読み込みへ。解説「Claude Code を複数同時に動かす」「tmux で AI エージェントを動かす」とハブへの導線
-- 実測: `docs/scripts/verify-seo.mjs`（新・CI の docs 節）33 ページ緑・注入 7 通りすべて名指しで FAILED・schema.org 語彙の検査 errors 0。Lighthouse の前後は PR 本文
-
 ## 2026-09-30（#1845: Windows の zip・インストーラーへライセンス 3 本を同梱し、両 OS の組み立てを番犬で固定した）
 - `tako.iss` の `[Files]` と `build-installer.ps1` の zip へ `THIRD-PARTY-NOTICES.md` / `THIRD-PARTY-LICENSES.md` を足した（`LICENSE.txt` は従来どおり）。`verify-assets.ps1` が zip を展開して 3 本が元ファイルとバイト一致するかを見て、CI だけがインストーラーを無人インストールしてインストール先も見る。`release-windows.yml` はタグ以外の ref から dispatch するとドライラン（Release へ添付しない）
 - 実測: 番犬 `license_bundle_watchdog.rs` 5 本緑・注入 12 通りすべて file:line 名指しで FAILED → 戻して緑・検査関数を pwsh 7.6 で 5 通り（正常 / 欠け / 食い違い / 空 / CI の外）
@@ -67,6 +63,11 @@
 ## 2026-10-02（#1866: 全体テストで tmux 系が毎回別の 1 本落ちる = 実 tmux e2e の器の数え方が隣の起動中の器を畳んでいた）
 - 真因（1259）: `tests/common/tmux_e2e.rs` が「new-session が返ってから数に入る」「減らしてから別に 0 か見て畳む」で、3 本目の起動中に先の 2 本が返ると器を kill + ソケット削除。叩く前に予約・減算〜kill を 1 ロックへ。A/B `TAKO_1866_LEGACY=1`・差し込み口の固定テスト・番犬 3 規則（1 実装外で畳む / 数に入る前に叩く / tako-core の器の名前の重複）
 - 実測: new-session の返りを遅らせる注入で main 1/1・旧アーム 3/3 が 202 行で FAILED、修正後 3/3 緑・全体テスト 3 回連続緑（6263 passed）。1857 は自分の器のソケットだけ消す注入で同じ行・同じ文言を再現（消し手は未特定。kill の結果と器の状態を失敗文言へ）
+
 ## 2026-10-02（#1684: コードの本文の右クリックメニューに言語サーバの項目を足した）
 - 識別子の上でだけ 定義 / 宣言 / 型定義 / 実装へ移動・コードを整形・選択範囲を整形 を先頭へ（出し分けは `tako_core::lsp::menu::items` = 申告に無い項目は出さない）。押すと `lsp::menu::item_request` の要求を ⌘クリック・編集メニューと同じ 3 段へ。握手前はすぐ開いて 1 行「問い合わせています」→ 背景で起こして差し替え。CLI `tako lsp menu` / MCP `tako_lsp` の `action=menu`（+261 B）。メニューの行の高さを見積もりと同じ定数にして下端の見切れも直した
 - 実測: `scripts/test-lsp-menu-1684.sh` 27 PASS 0 FAIL（実マウス・A/B `TAKO_1684_LEGACY=1` で FAILED・申告 4 通り・CLI/MCP 字面一致・実の rust-analyzer で 2.3 秒で着地）・注入 7 通りすべて file:line で FAILED
+
+## 2026-10-02（#1661: Markdown を編集して抜けたら描画へ戻し、目次を作り直すようにした）
+- 表示をエディタの行へ落とす判定を `refresh_preview_from_editor` の 1 か所（`EditState::shows_editor_lines`）へ寄せ、抜けたら**本文から**描き直す（5,000 行以下はその場・超えたら background）。抜けた後の save / reload・競合中も描画のまま・見ていた節の見出しから描く。編集中も目次が使える（`source_line`。CLI / MCP は既存の preview-outline）。layout へは抜けた先のモード
+- 実測: `scripts/test-md-edit-resume-1661.sh` 49 PASS 0 FAIL / main（048a2d9）は 22 PASS 23 FAIL（① で code のまま・目次 ERR）・A/B `TAKO_1661_LEGACY=1` で ① と visual 節が名指しで FAILED・番犬への注入 8 通りすべて file:line で FAILED・workspace 6362 passed・カタログ +132 B（並置 #1872 / ⌘F の同型 #1873）

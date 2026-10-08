@@ -13,6 +13,12 @@ pub enum PreviewOutlineTarget {
     MarkdownBlock { block: usize },
     /// PDF のページ番号（1 始まり）。
     PdfPage { page: usize },
+    /// 編集中の Markdown の原文の行（1 始まり。#1661）。
+    ///
+    /// 編集モードの表示は原文の行なので、描画ブロックの番号では飛べない。
+    /// 項目の並びとタイトルは描画時の目次（`MarkdownBlock`）と同じ規則で作るので、
+    /// 同じ本文なら k 番目どうしが同じ見出しを指す
+    SourceLine { line: usize },
 }
 
 /// プレビューのアウトライン 1 項目。
@@ -84,5 +90,21 @@ mod tests {
         );
         assert!(outline.target(0).is_err());
         assert!(outline.target(3).is_err());
+    }
+
+    /// #1661: 編集中の目次は原文の行を指す。ワイヤの形は `kind` で見分ける
+    /// （CLI / MCP の呼び手は `source_line` なら行、`markdown_block` ならブロックと読む）
+    #[test]
+    fn 原文の行のジャンプ先はkindで見分けられる() {
+        let target = PreviewOutlineTarget::SourceLine { line: 12 };
+        let wire = serde_json::to_value(target).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "source_line", "line": 12 })
+        );
+        assert_eq!(
+            serde_json::from_value::<PreviewOutlineTarget>(wire).unwrap(),
+            target
+        );
     }
 }
