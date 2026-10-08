@@ -62,6 +62,16 @@ pub fn legacy() -> bool {
     )
 }
 
+/// `TAKO_1869_LEGACY=1` で **#1869 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
+/// 打鍵の要求はサーバの読み込みを待たない（読み込み中の空の答えを 0 件のまま返す）・GUI は
+/// 「読み込み中」を出さない。整形の当て方も #1869 前へ戻る（`tako_core::text_edit` が同じ名前を読む）
+pub fn legacy_1869() -> bool {
+    matches!(
+        std::env::var("TAKO_1869_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 問い合わせ 1 回ぶん（UI スレッドで作り、背景スレッドで [`super::LspManager::completion`] へ渡す）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionRequest {
@@ -101,6 +111,9 @@ pub struct CompletionAnswer {
     pub line_text: String,
     /// サーバが `completionItem/resolve` を持つか（説明を後から補える）
     pub resolvable: bool,
+    /// サーバの読み込みを待ってから答えたなら、問い合わせ全体にかかった時間（#1869。CLI / MCP の
+    /// `waited_for_loading_ms` = 読み込み中に頼んだと分かる）
+    pub waited_for_loading: Option<Duration>,
 }
 
 /// 問い合わせの失敗
@@ -112,6 +125,9 @@ pub enum CompletionError {
     Superseded,
     /// 問い合わせのあいだに本文が変わった（候補の位置が今の本文と合わない）
     Edited,
+    /// サーバが上限（`secs` 秒）までプロジェクトを読み込み中だった（#1869。空で答え続けた /
+    /// 答えずに待たせた）。失敗ではなく「まだ」= 済んでから問い直せば出る
+    Loading { server: &'static str, secs: u64 },
 }
 
 impl From<GotoError> for CompletionError {
@@ -127,6 +143,7 @@ impl CompletionError {
             Self::Query(error) => error.status(),
             Self::Superseded => "superseded",
             Self::Edited => "edited",
+            Self::Loading { .. } => "loading",
         }
     }
 
@@ -138,6 +155,10 @@ impl CompletionError {
             ),
             Self::Superseded => text::COMPLETION_SUPERSEDED_REASON.text().to_string(),
             Self::Edited => text::COMPLETION_EDITED_REASON.text().to_string(),
+            Self::Loading { server, secs } => text::fill(
+                text::COMPLETION_LOADING_REASON,
+                &[("server", server), ("secs", &secs.to_string())],
+            ),
         }
     }
 
@@ -145,6 +166,7 @@ impl CompletionError {
         match self {
             Self::Query(error) => error.next_step(),
             Self::Superseded | Self::Edited => text::COMPLETION_EDITED_NEXT_STEP.text().to_string(),
+            Self::Loading { .. } => text::COMPLETION_LOADING_NEXT_STEP.text().to_string(),
         }
     }
 
@@ -156,10 +178,19 @@ impl CompletionError {
             "reason": self.reason(),
             "next_step": self.next_step(),
         });
-        if let Self::Query(error) = self {
-            error.add_server(&mut out);
+        match self {
+            Self::Query(error) => error.add_server(&mut out),
+            Self::Loading { server, .. } => out["server"] = json!(server),
+            Self::Superseded | Self::Edited => {}
         }
         out
+    }
+}
+
+/// 読み込みを待ってから答えたなら、答えの JSON にその時間を載せる（#1869。`found` / `none` の両方）
+pub fn add_waited(out: &mut Value, waited: Option<Duration>) {
+    if let Some(waited) = waited {
+        out["waited_for_loading_ms"] = json!(waited.as_millis() as u64);
     }
 }
 
@@ -231,6 +262,10 @@ mod tests {
         vec![
             CompletionError::Superseded,
             CompletionError::Edited,
+            CompletionError::Loading {
+                server: "s",
+                secs: 30,
+            },
             GotoError::Disabled.into(),
             GotoError::NoServer.into(),
             GotoError::NotInstalled {

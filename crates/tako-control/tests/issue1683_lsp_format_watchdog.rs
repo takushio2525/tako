@@ -440,8 +440,8 @@ fn 逆戻りを名指しできる() {
         &text_edit,
         TEXT_EDIT,
         (
-            "follow_changes(&ordered, anchor));\n        self.apply_edit(Edit {",
-            "follow_changes(&ordered, anchor));\n        for _change in &ordered {\n        self.apply_edit(Edit {",
+            "            splices_of(&ordered)\n        };\n        self.apply_edit(Edit {",
+            "            splices_of(&ordered)\n        };\n        for _change in &ordered {\n        self.apply_edit(Edit {",
         ),
         "pub fn apply_changes(>>self.apply_edit(",
         te,
@@ -452,8 +452,8 @@ fn 逆戻りを名指しできる() {
         &text_edit,
         TEXT_EDIT,
         (
-            "follow_changes(&ordered, anchor));\n        self.apply_edit(Edit {",
-            "follow_changes(&ordered, anchor));\n        self.apply_edit(Edit {\n            range: 0..0,\n            replacement: \"\",\n            cursor,\n            anchor,\n            kind: EditKind::Replace,\n            line_ending: None,\n        });\n        self.apply_edit(Edit {",
+            "            splices_of(&ordered)\n        };\n        self.apply_edit(Edit {",
+            "            splices_of(&ordered)\n        };\n        self.apply_edit(Edit {\n            splices: &[],\n            cursor,\n            anchor,\n            kind: EditKind::Replace,\n            line_ending: None,\n        });\n        self.apply_edit(Edit {",
         ),
         "pub fn apply_changes(>>self.apply_edit(",
         te,

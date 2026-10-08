@@ -1098,6 +1098,7 @@ pub fn tools() -> Vec<Value> {
                 action=format-on-save は保存時整形（enabled。既定 false。明示的な保存だけで自動保存では整形しない）。\
                 action=completion はその位置の補完候補（GUI の打鍵中の一覧と同じ絞り込み）を limit 件（既定 50）返し、\
                 切った数を truncated に載せる。choice で候補を確定（undo 1 回で戻る）、resolve で説明を補う。\
+                サーバの読み込み中は済むまで待って答え（waited_for_loading_ms）、上限なら status=loading。\
                 action=menu はその位置の右クリックメニューの LSP 項目（サーバの能力に無いものは出ない。\
                 識別子でない位置は 0 件）を返し、items[].args をそのまま渡すと押したのと同じになる。\
                 action=hover はその位置の型・doc を contents（kind=markdown / plaintext のまま）で返す（show で GUI にカードも出す）。\

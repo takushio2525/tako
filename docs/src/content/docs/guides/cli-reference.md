@@ -425,7 +425,7 @@ tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る�
 
 ### tako lsp
 
-コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」、整形は「コードを整形する」を参照してください。補完はこれから順に入ります。
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」、整形は「コードを整形する」、補完は「補完の候補を読む」を参照してください。
 
 ```bash
 tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド
@@ -465,7 +465,7 @@ tako lsp implementation --pane 3 --line 12 --column 8    # 実装へ（declarati
 
 #### コードを整形する（tako lsp format）
 
-編集メニューの「コードを整形」（**⇧⌘I**。Windows は Ctrl+Shift+I）で、言語サーバ（Rust なら rust-analyzer 経由の rustfmt）がコードを整形します。選択した範囲だけを整形するときは「選択範囲を整形」です。整形は編集の 1 回として入るので、**undo 1 回で整形の前に戻せます**。範囲の整形は範囲の外を 1 文字も変えません。
+編集メニューの「コードを整形」（**⇧⌘I**。Windows は Ctrl+Shift+I）で、言語サーバ（Rust なら rust-analyzer 経由の rustfmt）がコードを整形します。選択した範囲だけを整形するときは「選択範囲を整形」です。整形は編集の 1 回として入るので、**undo 1 回で整形の前に戻せます**。10 万行の大きなファイルを整形しても、その前に打った編集の undo は消えません。範囲の整形は範囲の外を 1 文字も変えません。
 
 ```bash
 tako lsp format --pane 3                       # そのペインのコード全体を整形する
@@ -474,6 +474,17 @@ tako lsp format-on-save on                     # 保存時整形を ON にする
 ```
 
 保存時整形は、**自分で保存したとき**（⌘S・`tako edit save`）だけ整形してから保存します。自動保存では整形しません（打っている途中で勝手に整形されないように）。整形できなかったとき（言語サーバが入っていない・応答しない）も保存は行い、理由を出します。設定画面の「保存時に整形」でも切り替えられます。MCP では `tako_lsp`（`action=format` / `format-on-save`）が同じ操作です。
+
+#### 補完の候補を読む（tako lsp completion）
+
+コードを編集モードで打つと、打っている語の真下に補完の候補が出ます（↑↓ で選び、Enter / Tab で入れ、Esc で閉じる）。開いた直後など、言語サーバがまだプロジェクトを読み込んでいるあいだに打つと、候補の代わりに「言語サーバが読み込み中です」の 1 行が出て、読み込みが済むと打ち足さなくても候補に差し替わります。同じことを CLI からも行えます。位置は `tako edit replace-range` と同じ（行は 1 始まり・桁は 0 始まりの行内バイト）です。
+
+```bash
+tako lsp completion --pane 3 --line 12 --column 8              # その位置の候補（既定 50 件）
+tako lsp completion --pane 3 --line 12 --column 8 --choice 2   # 2 番目の候補を入れる（undo 1 回で戻る）
+```
+
+読み込み中に頼んだときは、済むのを待ってから答え、答えに待った時間（`waited_for_loading_ms`）が載ります。待っても読み込みが終わらないときは `status: loading` と次の一手を返します（読み込み中かは `tako lsp status` の `loading` でも分かります）。MCP では `tako_lsp`（`action=completion`）が同じ操作です。
 
 #### 型・doc を見る（tako lsp hover）
 

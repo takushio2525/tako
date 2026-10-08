@@ -42891,6 +42891,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1869: 読み込み中に打つと「読み込み中」が出て、済んだ後に一覧が出るか（偽サーバ）
+                "completion-loading" => {
+                    completion_loading_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1682: 実の rust-analyzer の候補が出て Enter で入るか（無ければ SKIPPED）
                 "completion-real" => {
                     completion_real_visual(any, window, cx).await;
@@ -47857,6 +47863,271 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 補完の「読み込み中」（#1869）を**実 GUI の打鍵経路**と実ピクセルで見る。偽サーバを
+    /// `loading` シナリオ（読み込み 6 秒・その間は補完に `null` で即答 = 実測した rust-analyzer の前半）で
+    /// 受け持ちに差し替える。
+    ///
+    /// 相: (1) 読み込み中に 1 文字打つと一覧の代わりに「読み込み中」の 1 行が出て、基準画像（同じ場面
+    /// から 1 行だけを外した 1 枚）との差分がその矩形の外に無い (2) 語の外へ出る（空白）と消える
+    /// (3) もう一度打って**打ち足さずに待つ**と、読み込みが済んだ後に一覧（2 件）が出て「読み込み中」は
+    /// 消える (4) 読み込み中も 5 キーは奪わない（「読み込み中」だけのときは一覧が出ていない扱い）。
+    /// 判定は新しい挙動を無条件に主張する。`TAKO_1869_LEGACY=1`（#1869 前）では (1) で落ちる。
+    /// 単独実行は `TAKO_VISUAL_ONLY=completion-loading`
+    #[cfg(feature = "visual-test")]
+    async fn completion_loading_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        const LABEL: &str = "completion-loading";
+        inject_section_failure(LABEL);
+        // 読み込みの長さは偽サーバが起動のたびに env から読む（scene が編集モードへ入った時点で起きる）
+        std::env::set_var("TAKO_LSP_FAKE_SCENARIO", "loading");
+        std::env::set_var("TAKO_LSP_FAKE_LOADING_MS", "6000");
+        let source = "fn main() {\n    let total = 1;\n    \n}\n";
+        let rules = serde_json::json!({ "items": [{ "label": "alpha" }, { "label": "beta" }] });
+        let (pane, dir, override_env) =
+            completion_scene(any, window, cx, LABEL, Some(rules), source, (3, 4)).await;
+        // manager が知っているのは編集バッファのパス（一時ディレクトリは正規化で綴りが変わりうる）
+        let path = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| e.buffer.path().to_path_buf())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail(&format!("visual-test {LABEL}: 編集バッファが無い")));
+        let loading = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| app.lsp.server_loading(&path))
+                .unwrap_or(false)
+        };
+        let note = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| app.lsp_completion.loading.is_some())
+                .unwrap_or(false)
+        };
+        let popup = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.lsp_completion.popup.as_ref().map(|p| p.order.len())
+                })
+                .ok()
+                .flatten()
+        };
+        // 状態で待つ（上限つき）: 条件が立ったら真
+        async fn until(
+            any: AnyWindowHandle,
+            window: WindowHandle<TakoApp>,
+            cx: &mut AsyncApp,
+            limit: Duration,
+            done: &dyn Fn(&mut AsyncApp) -> bool,
+        ) -> bool {
+            let started = std::time::Instant::now();
+            loop {
+                notify_and_draw(any, window, cx);
+                if done(cx) {
+                    return true;
+                }
+                if started.elapsed() > limit {
+                    return false;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+            }
+        }
+        check(
+            until(any, window, cx, Duration::from_secs(10), &|cx| loading(cx)).await,
+            &format!("visual-test {LABEL}: 偽サーバが読み込み中と知らせる（素材の前提）"),
+        );
+
+        // (1) 読み込み中に 1 文字 → 「読み込み中」の 1 行
+        completion_type(any, cx, 'a');
+        let shown = until(any, window, cx, Duration::from_secs(3), &|cx| {
+            window
+                .update(cx, |app, _, _| app.lsp_completion.loading_bounds.is_some())
+                .unwrap_or(false)
+        })
+        .await;
+        let still_loading = loading(cx);
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} note={shown} still_loading={still_loading} popup={:?}",
+            popup(cx)
+        );
+        check(
+            still_loading,
+            &format!(
+                "visual-test {LABEL}: 打った時点でまだ読み込み中（素材の前提。読み込みを延ばす）"
+            ),
+        );
+        check(
+            shown,
+            &format!("visual-test {LABEL}: 読み込み中に打つと「読み込み中」の 1 行が出る (#1869)"),
+        );
+        // 実ピクセル: 基準画像（同じ場面から 1 行だけを外した 1 枚）との差分が矩形の外に無い
+        let Some((with_note, scale)) = capture_frame(any, cx) else {
+            fail(&format!("visual-test {LABEL}: フレーム採取"))
+        };
+        let bounds = window
+            .update(cx, |app, _, _| app.lsp_completion.loading_bounds)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail(&format!("visual-test {LABEL}: 「読み込み中」の矩形が無い")));
+        let saved = window
+            .update(cx, |app, _, cx| {
+                let saved = app.lsp_completion.loading.take();
+                cx.notify();
+                saved
+            })
+            .ok()
+            .flatten();
+        let Some((reference, _)) = capture_frame(any, cx) else {
+            fail(&format!("visual-test {LABEL}: 基準フレーム採取"))
+        };
+        let _ = window.update(cx, |app, _, cx| {
+            app.lsp_completion.loading = saved;
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let viewport = window
+            .update(cx, |app, _, _| app.preview_viewport_bounds(pane))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail(&format!("visual-test {LABEL}: ビューポート矩形")));
+        // 影（`shadow_lg`）が縁の外へ落ちるぶんを含める（`completion` 節と同じ幅）
+        let margin = 10.0 + 2.0 * 15.0;
+        let within = |b: &Bounds<Pixels>, m: f32, lx: f32, ly: f32| {
+            lx >= f32::from(b.left()) - m
+                && lx <= f32::from(b.right()) + m
+                && ly >= f32::from(b.top()) - m
+                && ly <= f32::from(b.bottom()) + m
+        };
+        let (width, height) = with_note.dimensions();
+        let count = |flip: bool| {
+            let (mut inner, mut outer) = (0usize, 0usize);
+            for y in 0..height {
+                for x in 0..width {
+                    if with_note.get_pixel(x, y) == reference.get_pixel(x, y) {
+                        continue;
+                    }
+                    let ly = if flip { height - 1 - y } else { y } as f32 / scale;
+                    let lx = x as f32 / scale;
+                    if within(&bounds, margin, lx, ly) {
+                        inner += 1;
+                    } else if within(&viewport, 0.0, lx, ly) {
+                        outer += 1;
+                    }
+                }
+            }
+            (inner, outer)
+        };
+        // Metal の読み戻しは上下の向きがありうるので、差分が多く収まる側を採る（#812 の作法）
+        let (a, b) = (count(false), count(true));
+        let (inner, outer) = if a.0 >= b.0 { a } else { b };
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} note bounds={:.1}x{:.1}@{:.1},{:.1} inner={inner} outer={outer} scale={scale}",
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            f32::from(bounds.left()),
+            f32::from(bounds.top()),
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            let dump = std::path::Path::new(&dump);
+            let _ = std::fs::create_dir_all(dump);
+            let _ = with_note.save(dump.join("completion-loading.png"));
+            let _ = reference.save(dump.join("completion-loading-reference.png"));
+            println!("TAKO_VISUAL_DUMP: {}", dump.display());
+        }
+        // 縁と 1 行の字のぶんは必ず変わる（器の周の長さの半分を下限にする）
+        let need =
+            ((f32::from(bounds.size.width) + f32::from(bounds.size.height)) * scale) as usize;
+        check(
+            inner >= need,
+            &format!(
+                "visual-test {LABEL}: 「読み込み中」が描かれている（差分 {inner} < {need} px）"
+            ),
+        );
+        check(
+            outer == 0,
+            &format!("visual-test {LABEL}: 基準画像との差分が「読み込み中」の矩形の外にある（{outer} px）"),
+        );
+
+        // (4) 「読み込み中」だけのときは 5 キーを奪わない（↓ は本文のカーソルを動かす = 語の外へ出て消える）
+        let before = completion_line(window, cx, pane, 2);
+        press(any, cx, "down");
+        notify_and_draw(any, window, cx);
+        let (moved, after_down) = window
+            .update(cx, |app, _, _| {
+                let line = app
+                    .preview_edits
+                    .get(&pane)
+                    .map(|e| e.buffer.line_byte_col(e.buffer.cursor()).0);
+                (line, app.lsp_completion.loading.is_some())
+            })
+            .unwrap_or((None, true));
+        println!("TAKO_VISUAL_PIXEL: {LABEL} down moved_to_line={moved:?} note_after={after_down}");
+        check(
+            moved == Some(3) && !after_down,
+            &format!("visual-test {LABEL}: 「読み込み中」は ↓ を奪わない（本文のカーソルが動き、語の外なので消える。{moved:?} / {after_down}）"),
+        );
+        check(
+            completion_line(window, cx, pane, 2) == before,
+            &format!("visual-test {LABEL}: ↓ で本文は変わらない"),
+        );
+        // ↑ で打っていた桁へ戻る（上下移動は桁を覚えている = #1652）
+        press(any, cx, "up");
+
+        // (2) 語の外へ出る（空白）と消える
+        completion_type(any, cx, 'b');
+        let again = until(any, window, cx, Duration::from_secs(3), &|cx| note(cx)).await;
+        completion_type(any, cx, ' ');
+        let gone = until(any, window, cx, Duration::from_secs(3), &|cx| !note(cx)).await;
+        println!("TAKO_VISUAL_PIXEL: {LABEL} retyped_note={again} space_cleared={gone}");
+        check(
+            again && gone,
+            &format!("visual-test {LABEL}: 空白を打って語の外へ出ると「読み込み中」は消える ({again} / {gone})"),
+        );
+
+        // (3) もう一度打って打ち足さずに待つ → 読み込みが済んだ後に一覧が出る
+        // （`a` = 候補の alpha / beta の両方に合う語。合わない語だと答えは来ても 0 件に絞れて出ない）
+        completion_type(any, cx, 'a');
+        let noted = until(any, window, cx, Duration::from_secs(3), &|cx| note(cx)).await;
+        let typed_at = std::time::Instant::now();
+        let listed = until(any, window, cx, Duration::from_secs(30), &|cx| {
+            popup(cx).is_some()
+        })
+        .await;
+        let (count_after, note_after, loading_after) = (popup(cx), note(cx), loading(cx));
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} waited_note={noted} listed={listed} after {:.1}s items={count_after:?} note_after={note_after} loading_after={loading_after}",
+            typed_at.elapsed().as_secs_f32()
+        );
+        check(
+            listed && count_after == Some(2),
+            &format!("visual-test {LABEL}: 打ち足さずに待つと、読み込みが済んだ後に一覧が出る (#1869。{count_after:?})"),
+        );
+        check(
+            !note_after && !loading_after,
+            &format!("visual-test {LABEL}: 一覧が出たら「読み込み中」は消える"),
+        );
+        if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+            if let Some((frame, _)) = capture_frame(any, cx) {
+                let _ = frame.save(std::path::Path::new(&dump).join("completion-loaded.png"));
+            }
+        }
+        press(any, cx, "escape");
+
+        std::env::remove_var("TAKO_LSP_FAKE_SCENARIO");
+        std::env::remove_var("TAKO_LSP_FAKE_LOADING_MS");
+        if let Some(name) = override_env {
+            std::env::remove_var(name);
+        }
+        std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 補完（#1682）を**実の rust-analyzer** で見る（実機目視の代わり）。`rust-analyzer` が
     /// PATH に無ければ SKIPPED。読み込み（`cargo metadata` と標準ライブラリ）が済むまでは
     /// CLI と同じ問い合わせ（`superseding: false` = 読み込みを待つ）で待ち、その後に
@@ -47893,38 +48164,67 @@ mod self_test {
             .update(cx, |app, _, _| app.lsp.clone())
             .unwrap_or_else(|_| fail("visual-test completion-real: manager"));
         let started = std::time::Instant::now();
-        let warm = cx
-            .background_executor()
-            .spawn(async move {
-                manager.completion(&tako_control::lsp::CompletionRequest {
-                    path,
-                    line: 2,
-                    column: 6,
-                    timeout: Duration::from_secs(120),
-                    document: None,
-                    trigger: tako_core::lsp::completion::Trigger::Character('.'),
-                    superseding: false,
-                    resolve_top: 0,
+        // #1869: `TAKO_1869_REAL_NO_WARM=1` は待ちを省いて**読み込みの最中に打つ**（打鍵の要求も読み込みを
+        // 待って問い直し、待つあいだ「読み込み中」を出すかを実サーバで見る）
+        if std::env::var_os("TAKO_1869_REAL_NO_WARM").is_none() {
+            let warm = cx
+                .background_executor()
+                .spawn(async move {
+                    manager.completion(&tako_control::lsp::CompletionRequest {
+                        path,
+                        line: 2,
+                        column: 6,
+                        timeout: Duration::from_secs(120),
+                        document: None,
+                        trigger: tako_core::lsp::completion::Trigger::Character('.'),
+                        superseding: false,
+                        resolve_top: 0,
+                    })
                 })
+                .await;
+            println!(
+                "TAKO_VISUAL_PIXEL: completion-real warm={} items={} in {:.1}s",
+                warm.as_ref()
+                    .map_or_else(|e| e.status().to_string(), |_| "ok".into()),
+                warm.as_ref().map_or(0, |a| a.items.len()),
+                started.elapsed().as_secs_f32()
+            );
+            check(
+                warm.is_ok(),
+                &format!(
+                    "visual-test completion-real: rust-analyzer が補完に答える ({:?})",
+                    warm.as_ref().err()
+                ),
+            );
+        }
+        let loading_at_typing = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .is_some_and(|e| app.lsp.server_loading(e.buffer.path()))
             })
-            .await;
-        println!(
-            "TAKO_VISUAL_PIXEL: completion-real warm={} items={} in {:.1}s",
-            warm.as_ref()
-                .map_or_else(|e| e.status().to_string(), |_| "ok".into()),
-            warm.as_ref().map_or(0, |a| a.items.len()),
-            started.elapsed().as_secs_f32()
-        );
-        check(
-            warm.is_ok(),
-            &format!(
-                "visual-test completion-real: rust-analyzer が補完に答える ({:?})",
-                warm.as_ref().err()
-            ),
-        );
+            .unwrap_or(false);
         completion_type(any, cx, 'l');
         completion_type(any, cx, 'e');
+        let typed = std::time::Instant::now();
+        let mut noted = false;
+        for _ in 0..20 {
+            notify_and_draw(any, window, cx);
+            noted |= window
+                .update(cx, |app, _, _| app.lsp_completion.loading_bounds.is_some())
+                .unwrap_or(false);
+            if noted {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(30))
+                .await;
+        }
         let shown = completion_wait_popup(any, window, cx, 400).await;
+        println!(
+            "TAKO_VISUAL_PIXEL: completion-real loading_at_typing={loading_at_typing} note={noted} popup_after={:.1}s",
+            typed.elapsed().as_secs_f32()
+        );
         let labels = window
             .update(cx, |app, _, _| {
                 app.lsp_completion

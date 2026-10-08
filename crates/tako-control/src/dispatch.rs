@@ -1554,6 +1554,7 @@ pub fn lsp_completion_land(
     if order.is_empty() {
         let mut out = crate::lsp::completion::none_json(answer.server);
         out["from"] = from;
+        crate::lsp::completion::add_waited(&mut out, answer.waited_for_loading);
         return Ok(out);
     }
     let total = order.len();
@@ -1623,6 +1624,7 @@ pub fn lsp_completion_land(
     if answer.dropped > 0 {
         out["dropped"] = json!(answer.dropped);
     }
+    crate::lsp::completion::add_waited(&mut out, answer.waited_for_loading);
     if truncated > 0 {
         out["next_step"] = json!(crate::lsp::text::fill(
             crate::lsp::text::COMPLETION_TRUNCATED_NEXT_STEP,
@@ -22300,6 +22302,7 @@ mod tests {
                 cursor,
                 line_text: line_text.into(),
                 resolvable: false,
+                waited_for_loading: None,
             })),
         }
     }
@@ -22345,6 +22348,60 @@ mod tests {
             (json!(3), json!(0))
         );
         assert!(out.get("next_step").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1869: 読み込み中に頼んだと CLI / MCP の答えから分かる。待ってから答えたら `found` / `none` に
+    /// `waited_for_loading_ms`、上限まで読み込み中なら `loading`（理由・次の一手・サーバ）。待たずに
+    /// 答えたときは欄を載せない（いつもの答えの形を変えない）
+    #[test]
+    fn 補完の答えから読み込み中だったと分かる_1869() {
+        use tako_core::lsp::completion::At;
+        let dir = jump_fixture("completion-loading", &["main.rs"]);
+        let main = dir.join("main.rs");
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let pane = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let items = vec![completion_item("cand", At::new(0, 4))];
+        let mut landing =
+            completion_landing(pane, &main, items, At::new(0, 4), "    ", 20, None, None);
+        let out = lsp_completion_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("found"));
+        assert!(out.get("waited_for_loading_ms").is_none(), "{out}");
+        if let Some(Ok(answer)) = landing.answer.as_mut() {
+            answer.waited_for_loading = Some(std::time::Duration::from_millis(1234));
+        }
+        let out = lsp_completion_land(&mut host, &landing).unwrap();
+        assert_eq!(out["waited_for_loading_ms"], json!(1234));
+        // 0 件（読み込みが済んでも候補が無い）にも載る
+        if let Some(Ok(answer)) = landing.answer.as_mut() {
+            answer.items.clear();
+        }
+        let out = lsp_completion_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("none"));
+        assert_eq!(out["waited_for_loading_ms"], json!(1234));
+        // 上限まで読み込み中
+        landing.answer = Some(Err(crate::lsp::CompletionError::Loading {
+            server: "fake",
+            secs: 30,
+        }));
+        let out = lsp_completion_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("loading"));
+        assert_eq!(out["server"], json!("fake"));
+        assert_eq!(
+            out["reason"],
+            json!(crate::lsp::text::fill(
+                crate::lsp::text::COMPLETION_LOADING_REASON,
+                &[("server", "fake"), ("secs", "30")]
+            ))
+        );
+        assert_eq!(
+            out["next_step"],
+            json!(crate::lsp::text::COMPLETION_LOADING_NEXT_STEP.text())
+        );
+        assert_eq!(out["from"]["pane"], json!(pane));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -16,6 +16,14 @@
 //! #821 と同じ「1 フレームで数千要素」になるので、一覧は `gpui::list`（可視の行だけを組む）で描く。
 //! 組んだ行の数は `rows_built` に数え、visual-test `completion` が 1000 件で可視ぶんだけかを測る
 //! （A/B は `TAKO_1682_NO_VIRTUAL_LIST=1` = 全件ぶん組む旧来の形）。
+//!
+//! ## 読み込み中（#1869）
+//!
+//! サーバが起動中 / プロジェクトを読み込み中に打つと、rust-analyzer は前半は即座に空で答え、後半は
+//! 答えずに待たせる（実測）。manager は打鍵の要求でも読み込みが済むのを待って問い直すので、
+//! ここは**待っているあいだ一覧の代わりに 1 行の「読み込み中」を出す**だけ（打鍵の問い合わせを
+//! 出す時点で `LspManager::server_loading` を見て立て、その答えが届いたら下ろす）。キーは奪わない。
+//! A/B は `TAKO_1869_LEGACY=1`（出さない・manager も待たない = #1869 前）。
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -43,6 +51,8 @@ const POPUP_WIDTH: f32 = 400.0;
 const DETAIL_LINES: usize = 4;
 /// 説明の帯の 1 行の高さ
 const DETAIL_LINE_HEIGHT: f32 = 15.0;
+/// 「読み込み中」の 1 行の高さ（#1869）
+const LOADING_NOTE_HEIGHT: f32 = 28.0;
 
 /// `TAKO_1682_NO_VIRTUAL_LIST=1` で**全件ぶん element を組む**旧来の形へ戻す（A/B の注入口。
 /// visual-test `completion` の「可視ぶんだけ」がこれで落ちることが検出力の証拠）
@@ -68,6 +78,21 @@ pub(crate) struct LspCompletionUi {
     /// 版の照合を通った答えの数（0 件に絞れて一覧を出さなかった答えも数える。visual-test が
     /// 「答えは来たが出さなかった」と「まだ答えが来ていない」を区別する）
     pub(crate) answers: u64,
+    /// 言語サーバの起動 / 読み込みを待っている印（#1869）。打鍵の問い合わせを出した時点で
+    /// サーバが起動中か読み込み中なら立て、その問い合わせの答え（一覧・0 件・失敗）が届くか、
+    /// 一覧を閉じる・語の外へ出るで下ろす。**表示だけ**（5 キーは奪わない = 一覧が出ていない扱い）
+    pub(crate) loading: Option<LoadingNote>,
+    /// 直近に描いた「読み込み中」の矩形（visual-test が差分の範囲を見る）
+    pub(crate) loading_bounds: Option<Bounds<Pixels>>,
+}
+
+/// 「読み込み中」の印 1 つ（#1869）。出すのは問い合わせた語の頭の真下（一覧と同じ位置）
+pub(crate) struct LoadingNote {
+    pub(crate) pane: PaneId,
+    /// 立てた問い合わせの番号（その答えが届いたら下ろす）
+    seq: u64,
+    line: usize,
+    word_start: usize,
 }
 
 impl LspCompletionUi {
@@ -216,6 +241,9 @@ impl TakoApp {
             .unwrap_or_default();
         if let Some(trigger) = comp::trigger_for(inserted, &triggers) {
             self.schedule_completion(pane, trigger, cx);
+        } else if self.lsp_completion.loading.is_some() {
+            // 語を打ち終えた（空白・記号）: 読み込みを待っている問い合わせはもう当たらない（#1869）
+            self.close_completion();
         }
         cx.notify();
     }
@@ -281,8 +309,19 @@ impl TakoApp {
         if edit.search_visible {
             return;
         }
-        let (at, _) = caret(edit);
+        let (at, line) = caret(edit);
+        let word_start = comp::word_start(line, at.col);
         let version = edit.buffer.version();
+        // #1869: サーバが起動中 / 読み込み中なら、答え（manager が読み込みを待って問い直す）が
+        // 届くまで一覧の代わりに「読み込み中」を出す。A/B の旧腕（`TAKO_1869_LEGACY=1`）は出さない
+        let loading = !tako_control::lsp::completion::legacy_1869()
+            && self.lsp.server_loading(edit.buffer.path());
+        self.lsp_completion.loading = loading.then_some(LoadingNote {
+            pane,
+            seq,
+            line: at.line,
+            word_start,
+        });
         let request = CompletionRequest {
             path: edit.buffer.path().to_path_buf(),
             line: at.line,
@@ -318,6 +357,17 @@ impl TakoApp {
         outcome: Result<CompletionAnswer, CompletionError>,
         cx: &mut Context<Self>,
     ) {
+        // 「読み込み中」はこの問い合わせの答え（一覧・0 件・失敗のどれでも）が届いたら下ろす（#1869）
+        if self
+            .lsp_completion
+            .loading
+            .as_ref()
+            .is_some_and(|note| note.seq == seq)
+        {
+            self.lsp_completion.loading = None;
+            self.lsp_completion.loading_bounds = None;
+            cx.notify();
+        }
         let Some(edit) = self.preview_edits.get(&pane) else {
             return;
         };
@@ -431,15 +481,43 @@ impl TakoApp {
             ui.list = None;
         }
         ui.bounds = None;
+        // 読み込みを待っている問い合わせも捨てる（manager の待ちは取り消しの列で抜ける。#1869）
+        ui.loading = None;
+        ui.loading_bounds = None;
         ui.session.cancel();
         self.lsp.cancel_completion();
     }
 
     /// ペインを閉じた / プレビューを差し替えた（一覧の行は前の本文の座標）
     pub(crate) fn forget_lsp_completion(&mut self, pane: PaneId) {
-        if self.lsp_completion_open_in(pane) {
+        let waiting = self
+            .lsp_completion
+            .loading
+            .as_ref()
+            .is_some_and(|note| note.pane == pane);
+        if self.lsp_completion_open_in(pane) || waiting {
             self.close_completion();
         }
+    }
+
+    /// 「読み込み中」がまだ今の打鍵に当たっているか（描く直前に見る。外れていれば閉じる = #1869）。
+    /// フォーカスが移った・編集モードを抜けた・カーソルが問い合わせた語の外へ出た、のどれでも外れる
+    fn loading_note_still_valid(&self) -> bool {
+        let Some(note) = &self.lsp_completion.loading else {
+            return false;
+        };
+        if self.focused_pane() != note.pane || !self.lsp_completion_enabled_for(note.pane) {
+            return false;
+        }
+        let Some(edit) = self.preview_edits.get(&note.pane) else {
+            return false;
+        };
+        let (at, line) = caret(edit);
+        at.line == note.line
+            && at.col >= note.word_start
+            && line
+                .get(note.word_start..at.col)
+                .is_some_and(|typed| typed.chars().all(comp::is_word_char))
     }
 
     /// 一覧がまだ今の本文に当たっているか（描く直前に見る。外れていれば閉じる）。
@@ -623,6 +701,9 @@ impl TakoApp {
         if self.lsp_completion.popup.is_some() && !self.completion_still_valid() {
             self.close_completion();
         }
+        if self.lsp_completion.popup.is_none() {
+            return self.render_loading_note(window);
+        }
         let popup = self.lsp_completion.popup.as_ref()?;
         // 位置は描いた行のレイアウトから（語の行が画面外なら出さない）
         let layout = self
@@ -733,6 +814,70 @@ impl TakoApp {
                 .occlude()
                 .child(body)
                 .children(detail)
+                .into_any_element(),
+        )
+    }
+
+    /// 「読み込み中」の 1 行（#1869。一覧と同じ位置 = 問い合わせた語の頭の真下、下に入らなければ上）。
+    /// 外れていれば閉じて何も描かない。**押下は下の本文へ通す**（表示だけ。押せばカーソルが動いて
+    /// 語の外へ出るので閉じる）
+    fn render_loading_note(&mut self, window: &gpui::Window) -> Option<gpui::AnyElement> {
+        if self.lsp_completion.loading.is_some() && !self.loading_note_still_valid() {
+            self.close_completion();
+        }
+        let note = self.lsp_completion.loading.as_ref()?;
+        let layout = self
+            .preview_text_layouts
+            .get(&note.pane)?
+            .get(note.line)?
+            .as_ref()?;
+        let anchor = layout.position_for_index(note.word_start)?;
+        let line_height = layout.line_height();
+        let viewport = window.viewport_size();
+        let below = f32::from(anchor.y + line_height) + 2.0;
+        let top = if below + LOADING_NOTE_HEIGHT > f32::from(viewport.height) - 4.0
+            && f32::from(anchor.y) - LOADING_NOTE_HEIGHT - 2.0 >= 0.0
+        {
+            f32::from(anchor.y) - LOADING_NOTE_HEIGHT - 2.0
+        } else {
+            below
+        };
+        // 左の余白（10px）+ 縁（1px）のぶん左へ寄せ、文字の頭を語の頭に揃える（種類の印は無い）
+        let left = (f32::from(anchor.x) - 11.0)
+            .min(f32::from(viewport.width) - POPUP_WIDTH - 4.0)
+            .max(0.0);
+        self.lsp_completion.loading_bounds = Some(Bounds {
+            origin: point(px(left), px(top)),
+            size: size(px(POPUP_WIDTH), px(LOADING_NOTE_HEIGHT)),
+        });
+        let theme = &self.theme;
+        Some(
+            div()
+                .id("lsp-completion-loading")
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(POPUP_WIDTH))
+                .h(px(LOADING_NOTE_HEIGHT))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .bg(rgba(theme.surface_1))
+                .border_1()
+                .border_color(hsla(theme.border_default))
+                .rounded(px(6.0))
+                .shadow_lg()
+                .text_size(px(12.0))
+                .text_color(hsla(theme.text_secondary))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(SharedString::from(
+                            tako_control::lsp::text::COMPLETION_LOADING_NOTE.text(),
+                        )),
+                )
                 .into_any_element(),
         )
     }

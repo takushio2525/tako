@@ -528,19 +528,25 @@ enum EditKind {
 
 /// undo/redo 1 件ぶんの差分（#1651）。
 ///
-/// 全文のスナップショットを持たない。`start` から始まる範囲を `before` ⇄ `after` で
+/// 全文のスナップショットを持たない。置き換えた箇所（`spans`）を `before` ⇄ `after` で
 /// 入れ替えるだけなので、1 打鍵の記録は数十バイトで済む
 /// （スナップショットは 1 MB のファイルなら 1 打鍵 1 MB だった = Issue の症状）。
+///
+/// 離れた複数の箇所を 1 回で置き換えた操作（整形の答え・補完の確定 + 自動 import）も
+/// **この 1 件に箇所を並べて持つ**（#1869）。あいだの本文は持たない（先頭から末尾までを
+/// 1 か所にすると、10 MB の文書では 1 回で undo の予算を超えて履歴が消えた）。
+/// 1 件なので undo / redo は 1 回で全部戻る・やり直す（つないだ差分の途中が上限で捨てられて
+/// 半端に戻ることも無い）。
 ///
 /// 改行コードも一緒に戻す。`set_text` はファイルの流儀を取り直すので、
 /// これを戻さないと undo した後の Enter が別の改行を挿す（#1650 の契約）
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EditDelta {
-    /// 置き換えた範囲の開始バイト位置
-    start: usize,
-    /// 置換前の中身（undo で書き戻す）
+    /// 置き換えた箇所（1 つ以上。始まりの順・重ならない。#1869）
+    spans: Vec<DeltaSpan>,
+    /// 置換前の中身（各箇所のぶんを `spans` の順につないだもの。undo で書き戻す）
     before: String,
-    /// 置換後の中身（redo で書き直す）
+    /// 置換後の中身（同じくつないだもの。redo で書き直す）
     after: String,
     cursor_before: usize,
     anchor_before: Option<usize>,
@@ -551,24 +557,77 @@ struct EditDelta {
     kind: EditKind,
     /// この塊に最後に足した時刻（まとめの判定用。[`TextBuffer::now_millis`] の刻み）
     at_millis: u64,
-    /// 直前の差分と**一緒に戻す**（複数の範囲を 1 回で置き換えた操作の 2 つ目以降。#1682）。
-    /// undo は `false` の差分に当たるまで戻し、redo は次の差分が `true` の間やり直す
-    chained: bool,
+}
+
+/// 差分 1 件の中の 1 か所（#1869）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeltaSpan {
+    /// 置き換えた範囲の開始バイト位置（**置き換える前**の本文）
+    start: usize,
+    /// この箇所の置換前のバイト数（`before` の中の長さ）
+    before_len: usize,
+    /// この箇所の置換後のバイト数（`after` の中の長さ）
+    after_len: usize,
 }
 
 impl EditDelta {
-    /// この 1 件が抱えている本文のバイト数（予算の勘定。#1651）
+    /// この 1 件が抱えている本文のバイト数（予算の勘定。#1651）。箇所の表（#1869）も数える
     fn bytes(&self) -> usize {
-        self.before.len() + self.after.len() + std::mem::size_of::<Self>()
+        self.before.len()
+            + self.after.len()
+            + std::mem::size_of::<Self>()
+            + self.spans.len() * std::mem::size_of::<DeltaSpan>()
+    }
+
+    /// 今の本文へ当てる置き換えの並び（#1869）。`undo` なら置換後の本文を置換前へ、
+    /// そうでなければ置換前の本文を置換後へ戻す。位置は**今の本文**で数える
+    /// （undo では前の箇所の伸び縮みを足す。箇所は始まりの順・重ならないので引いても負にならない）
+    fn splices(&self, undo: bool) -> Vec<Splice<'_>> {
+        let to = if undo { &self.before } else { &self.after };
+        let mut out = Vec::with_capacity(self.spans.len());
+        let (mut consumed, mut produced, mut taken) = (0, 0, 0);
+        for span in &self.spans {
+            let (start, from_len, to_len) = if undo {
+                (
+                    span.start - consumed + produced,
+                    span.after_len,
+                    span.before_len,
+                )
+            } else {
+                (span.start, span.before_len, span.after_len)
+            };
+            out.push(Splice::new(
+                start..start + from_len,
+                &to[taken..taken + to_len],
+            ));
+            taken += to_len;
+            consumed += span.before_len;
+            produced += span.after_len;
+        }
+        out
+    }
+}
+
+/// 本文の 1 か所の置き換え（借用。#1869）。[`Edit`] が 1 つ以上を始まりの順に持つ
+#[derive(Debug, Clone)]
+struct Splice<'a> {
+    /// 置き換える範囲（置き換える前の本文のバイト位置）
+    range: Range<usize>,
+    /// そこへ入る本文
+    text: &'a str,
+}
+
+impl<'a> Splice<'a> {
+    fn new(range: Range<usize>, text: &'a str) -> Self {
+        Self { range, text }
     }
 }
 
 /// 1 回の編集の指示（#1651）。本文を書き換える口はこれを [`TextBuffer::apply_edit`] へ渡す
 struct Edit<'a> {
-    /// 置き換える範囲
-    range: Range<usize>,
-    /// 置き換えた後にそこへ入る本文
-    replacement: &'a str,
+    /// 置き換える箇所（1 つ以上。始まりの順・重ならない。離れた複数の箇所 = 整形の答え・
+    /// 補完の確定は 1 回の編集 = undo 1 件になる。#1869）
+    splices: &'a [Splice<'a>],
     /// 編集後のカーソル
     cursor: usize,
     /// 編集後の選択端
@@ -860,8 +919,27 @@ pub fn order_changes(
         .collect())
 }
 
+/// 並べた書き換えを、当てる箇所の並びへ（#1869）。整形と補完の確定が同じこれで当てる
+/// （離れた箇所は離れたまま = あいだの本文を undo へ積まない）
+fn splices_of(ordered: &[TextChange]) -> Vec<Splice<'_>> {
+    ordered
+        .iter()
+        .map(|change| Splice::new(change.range.clone(), &change.text))
+        .collect()
+}
+
+/// `TAKO_1869_LEGACY=1` で **#1869 前の整形の当て方**へ戻す（同一バイナリで A/B を取る入口。
+/// 整形の答えを最初の始まり〜最後の終わりの 1 か所へまとめて当てる = あいだの本文も undo へ積む）
+fn legacy_1869() -> bool {
+    matches!(
+        std::env::var("TAKO_1869_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 並べた書き換えを 1 か所の置き換えへまとめる（#1683）。最初の始まりから最後の終わりまでを、
-/// あいだの本文を挟んだ置換後の文字列で置き換える = undo の 1 件に収まる形
+/// あいだの本文を挟んだ置換後の文字列で置き換える。**#1869 前の当て方で、今は A/B の旧腕
+/// （[`legacy_1869`]）だけが使う**（10 MB の文書では 1 回で undo の予算を超える）
 fn compose_changes(text: &str, ordered: &[TextChange]) -> (Range<usize>, String) {
     let (Some(first), Some(last)) = (ordered.first(), ordered.last()) else {
         return (0..0, String::new());
@@ -1091,8 +1169,7 @@ impl TextBuffer {
             self.indent = indent;
         }
         self.apply_edit(Edit {
-            range: 0..self.text.len(),
-            replacement: &text,
+            splices: &[Splice::new(0..self.text.len(), &text)],
             cursor: text.len(),
             anchor: None,
             kind: EditKind::Replace,
@@ -1178,8 +1255,7 @@ impl TextBuffer {
         };
         let cursor = range.start + text.len();
         self.apply_edit(Edit {
-            range,
-            replacement: &text,
+            splices: &[Splice::new(range, &text)],
             cursor,
             anchor: None,
             kind,
@@ -1211,8 +1287,7 @@ impl TextBuffer {
                 .unwrap_or(0)
         };
         self.apply_edit(Edit {
-            range: previous..self.cursor,
-            replacement: "",
+            splices: &[Splice::new(previous..self.cursor, "")],
             cursor: previous,
             anchor: None,
             kind: EditKind::DeleteBackward,
@@ -1240,8 +1315,7 @@ impl TextBuffer {
                     .unwrap_or(0)
         };
         self.apply_edit(Edit {
-            range: self.cursor..next,
-            replacement: "",
+            splices: &[Splice::new(self.cursor..next, "")],
             cursor: self.cursor,
             anchor: None,
             kind: EditKind::DeleteForward,
@@ -1285,8 +1359,7 @@ impl TextBuffer {
         }
         let start = range.start;
         self.apply_edit(Edit {
-            range,
-            replacement: "",
+            splices: &[Splice::new(range, "")],
             cursor: start,
             anchor: None,
             kind: EditKind::DeleteSpan,
@@ -1381,8 +1454,7 @@ impl TextBuffer {
             EditKind::Replace
         };
         self.apply_edit(Edit {
-            range: start..end,
-            replacement: &replacement,
+            splices: &[Splice::new(start..end, &replacement)],
             cursor,
             anchor: None,
             kind,
@@ -1472,8 +1544,7 @@ impl TextBuffer {
         let cursor = shift_point(self.cursor);
         let anchor = self.anchor.map(shift_point);
         self.apply_edit(Edit {
-            range: first..block_end,
-            replacement: &out,
+            splices: &[Splice::new(first..block_end, &out)],
             cursor,
             anchor,
             kind: EditKind::Replace,
@@ -1519,34 +1590,53 @@ impl TextBuffer {
     ///
     /// ここを通さずに `self.text` を書き換えると、その編集は履歴に載らない
     /// （undo が本文とずれる）。番犬 `issue1651_undo_delta_watchdog` が
-    /// 直接の書き換えを file:line で名指す
+    /// 直接の書き換えを file:line で名指す。離れた複数の箇所（#1869）も 1 回で受け、
+    /// 差分 1 件（= undo 1 回）として積む
     fn apply_edit(&mut self, edit: Edit<'_>) {
         let Edit {
-            range,
-            replacement,
+            splices,
             cursor,
             anchor,
             kind,
             line_ending,
         } = edit;
+        debug_assert!(!splices.is_empty(), "置き換える箇所の無い編集");
+        debug_assert!(
+            splices
+                .windows(2)
+                .all(|pair| pair[0].range.end <= pair[1].range.start),
+            "箇所は始まりの順・重ならない"
+        );
         let line_ending_before = self.line_ending;
         let line_ending_after = line_ending.unwrap_or(line_ending_before);
-        let start = range.start;
-        // 全文ではなく**置き換える範囲だけ**を写す（1 打鍵で 1 MB 積まない）
-        let before = self.text[range.clone()].to_string();
+        // 全文ではなく**置き換える箇所だけ**を写す（1 打鍵で 1 MB 積まない。離れた箇所の
+        // あいだの本文も写さない = #1869）
+        let mut before = String::with_capacity(splices.iter().map(|s| s.range.len()).sum());
+        let mut after = String::with_capacity(splices.iter().map(|s| s.text.len()).sum());
+        let spans = splices
+            .iter()
+            .map(|splice| {
+                before.push_str(&self.text[splice.range.clone()]);
+                after.push_str(splice.text);
+                DeltaSpan {
+                    start: splice.range.start,
+                    before_len: splice.range.len(),
+                    after_len: splice.text.len(),
+                }
+            })
+            .collect();
         let cursor_before = self.cursor;
         let anchor_before = self.anchor;
         let at_millis = self.now_millis();
-        self.splice_line_starts(range.clone(), replacement);
-        self.text.replace_range(range, replacement);
+        self.splice_text(splices);
         // 編集後の本文で丸める。丸めずに持つと、その位置が差分へ記録されて
         // **undo / redo のたびに再現される**（`replace_all` は編集前のカーソルを
         // 長さで切り詰めるだけなので、多バイト文字の途中を指しうる = 次の編集で panic）
         let cursor = snap_cursor(&self.text, cursor.min(self.text.len()));
         let delta = EditDelta {
-            start,
+            spans,
             before,
-            after: replacement.to_string(),
+            after,
             cursor_before,
             anchor_before,
             cursor_after: cursor,
@@ -1555,7 +1645,6 @@ impl TextBuffer {
             line_ending_after,
             kind,
             at_millis,
-            chained: false,
         };
         self.cursor = cursor;
         self.anchor = anchor;
@@ -1567,6 +1656,41 @@ impl TextBuffer {
         self.record(delta);
     }
 
+    /// 本文へ置き換えを当てる**ただ 1 つの書き換え**（#1651 / #1869）。行頭索引も一緒に直す。
+    ///
+    /// 呼んでよいのは差分を積む [`Self::apply_edit`] と、差分を戻す [`Self::undo`] /
+    /// [`Self::redo`] だけ（ほかから呼ぶと履歴に載らない書き換えになる。番犬
+    /// `issue1651_undo_delta_watchdog` が file:line で名指す）。
+    ///
+    /// 1 か所はその場で置き換える（打鍵 = 後ろを詰めるだけ）。離れた複数の箇所は**新しい本文を
+    /// 1 回で組み直す**（1 か所ずつ置き換えると箇所の数だけ後ろを詰め直す = 10 万箇所の整形で
+    /// 本文の長さ × 10 万の転送になる）。行頭索引も組み直した本文から 1 回で作る
+    fn splice_text(&mut self, splices: &[Splice<'_>]) {
+        match splices {
+            [] => {}
+            [one] => {
+                self.splice_line_starts(one.range.clone(), one.text);
+                self.text.replace_range(one.range.clone(), one.text);
+            }
+            many => {
+                // 箇所は始まりの順・重ならない = 前から引いて足しても負にならない
+                let len = many.iter().fold(self.text.len(), |len, splice| {
+                    len - splice.range.len() + splice.text.len()
+                });
+                let mut text = String::with_capacity(len);
+                let mut at = 0;
+                for splice in many {
+                    text.push_str(&self.text[at..splice.range.start]);
+                    text.push_str(splice.text);
+                    at = splice.range.end;
+                }
+                text.push_str(&self.text[at..]);
+                self.line_starts = compute_line_starts(&text);
+                self.text = text;
+            }
+        }
+    }
+
     /// 選択があればそれを消す（#1651）。消したら `true`
     fn delete_selection(&mut self) -> bool {
         let Some(range) = self.selection() else {
@@ -1575,8 +1699,7 @@ impl TextBuffer {
         };
         let cursor = range.start;
         self.apply_edit(Edit {
-            range,
-            replacement: "",
+            splices: &[Splice::new(range, "")],
             cursor,
             anchor: None,
             kind: EditKind::Replace,
@@ -1622,21 +1745,29 @@ impl TextBuffer {
         {
             return false;
         }
+        // まとめるのは 1 か所どうしだけ（離れた複数の箇所の操作 = 整形・補完は Replace で、
+        // そもそもまとめない。#1869）
+        let ([last_span], [span]) = (last.spans.as_mut_slice(), delta.spans.as_slice()) else {
+            return false;
+        };
         match delta.kind {
             // 打鍵は直前に書いた文字の**すぐ後ろ**に続くときだけ伸ばす
-            EditKind::Insert if delta.start == last.start + last.after.len() => {
+            EditKind::Insert if span.start == last_span.start + last_span.after_len => {
                 last.after.push_str(&delta.after);
+                last_span.after_len += span.after_len;
             }
             // Backspace は左へ伸びる。消した文字は前へ継ぎ足す
-            EditKind::DeleteBackward if delta.start + delta.before.len() == last.start => {
+            EditKind::DeleteBackward if span.start + span.before_len == last_span.start => {
                 let mut before = delta.before.clone();
                 before.push_str(&last.before);
                 last.before = before;
-                last.start = delta.start;
+                last_span.start = span.start;
+                last_span.before_len += span.before_len;
             }
             // Delete は同じ位置から右へ伸びる。消した文字は後ろへ継ぎ足す
-            EditKind::DeleteForward if delta.start == last.start => {
+            EditKind::DeleteForward if span.start == last_span.start => {
                 last.before.push_str(&delta.before);
+                last_span.before_len += span.before_len;
             }
             _ => return false,
         }
@@ -1659,8 +1790,8 @@ impl TextBuffer {
 
     /// undo できる回数（= 塊の数。#1651）。`hello` を 1 塊で打てば 1
     pub fn undo_depth(&self) -> usize {
-        // つながった差分（#1682 の複数範囲の 1 操作）は 1 回の undo で戻るので 1 つに数える
-        self.undo_stack.iter().filter(|d| !d.chained).count()
+        // 離れた複数の箇所の操作（整形・補完の確定）も差分 1 件 = 1 回の undo（#1869）
+        self.undo_stack.len()
     }
 
     /// 上限（操作数 / バイト数）を超えたぶんを古い側から捨てる（#1651）。
@@ -1678,57 +1809,37 @@ impl TextBuffer {
             };
             total = total.saturating_sub(dropped.bytes());
         }
-        // 1 操作の途中で捨てたら、残った先頭は「その操作の始まり」として扱う（#1682。
-        // つながったままだと undo がそれより前の差分まで巻き込もうとする）
-        if let Some(front) = self.undo_stack.front_mut() {
-            front.chained = false;
-        }
     }
 
     pub fn undo(&mut self) -> bool {
-        if self.undo_stack.is_empty() {
+        let Some(delta) = self.undo_stack.pop_back() else {
             return false;
-        }
+        };
         // 本文が変わるので版は**戻らずに進む**（#1658）。「元へ戻す」も 1 つの変更で、
         // 版を戻すと「別の中身なのに同じ版」が生まれて楽観ロックが効かなくなる
         self.bump_version();
-        // つながった差分（#1682 の複数範囲の 1 操作）は先頭の 1 つまでまとめて戻す
-        while let Some(delta) = self.undo_stack.pop_back() {
-            let end = delta.start + delta.after.len();
-            self.splice_line_starts(delta.start..end, &delta.before);
-            self.text.replace_range(delta.start..end, &delta.before);
-            self.cursor = delta.cursor_before;
-            self.anchor = delta.anchor_before;
-            self.line_ending = delta.line_ending_before;
-            let chained = delta.chained;
-            self.redo_stack.push(delta);
-            if !chained {
-                break;
-            }
-        }
+        // 置換後の本文を置換前へ（離れた複数の箇所も 1 回で戻る = #1869）
+        self.splice_text(&delta.splices(true));
+        self.cursor = delta.cursor_before;
+        self.anchor = delta.anchor_before;
+        self.line_ending = delta.line_ending_before;
+        self.redo_stack.push(delta);
         self.seal_undo_group();
         self.goal_column = None;
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        if self.redo_stack.is_empty() {
+        let Some(delta) = self.redo_stack.pop() else {
             return false;
-        }
+        };
         self.bump_version();
-        // 先頭の 1 つをやり直し、続きがつながっている（#1682）間は続けてやり直す
-        while let Some(delta) = self.redo_stack.pop() {
-            let end = delta.start + delta.before.len();
-            self.splice_line_starts(delta.start..end, &delta.after);
-            self.text.replace_range(delta.start..end, &delta.after);
-            self.cursor = delta.cursor_after;
-            self.anchor = delta.anchor_after;
-            self.line_ending = delta.line_ending_after;
-            self.undo_stack.push_back(delta);
-            if !self.redo_stack.last().is_some_and(|next| next.chained) {
-                break;
-            }
-        }
+        // 置換前の本文を置換後へ（離れた複数の箇所も 1 回でやり直す = #1869）
+        self.splice_text(&delta.splices(false));
+        self.cursor = delta.cursor_after;
+        self.anchor = delta.anchor_after;
+        self.line_ending = delta.line_ending_after;
+        self.undo_stack.push_back(delta);
         self.seal_undo_group();
         self.goal_column = None;
         true
@@ -1831,8 +1942,7 @@ impl TextBuffer {
         let replacement = normalize_line_endings(replacement, self.line_ending);
         let cursor = range.start + replacement.len();
         self.apply_edit(Edit {
-            range,
-            replacement: &replacement,
+            splices: &[Splice::new(range, &replacement)],
             cursor,
             anchor: None,
             kind: EditKind::Replace,
@@ -1878,8 +1988,7 @@ impl TextBuffer {
         let new_len = self.text.len() - (end - start) + after.len();
         let cursor = self.cursor.min(new_len);
         self.apply_edit(Edit {
-            range: start..end,
-            replacement: &after,
+            splices: &[Splice::new(start..end, &after)],
             cursor,
             anchor: None,
             kind: EditKind::Replace,
@@ -2118,9 +2227,13 @@ impl TextBuffer {
     /// 書き換えの組（言語サーバの整形の答え）を**まとめて 1 回で**当てる（#1683）。
     ///
     /// - 並べ方・重なり・最小化は [`order_changes`] の 1 実装（決めはそこに書いた）
-    /// - 当てるのは**最初の始まりから最後の終わりまでの 1 か所の置き換え**で、
+    /// - 当てるのは**書き換えの箇所だけ**（離れた箇所は離れたまま。#1869）で、
     ///   [`Self::apply_edit`] を 1 回だけ通る（種類は Replace = 前後の打鍵とまとまらない）。
-    ///   よって **undo 1 回で整形の前へ戻る**（#1651 の塊）。版も 1 つだけ進む
+    ///   よって **undo 1 回で整形の前へ戻る**（#1651 の塊）。版も 1 つだけ進む。
+    ///   undo へ積むのは箇所の中身だけで、あいだの本文は積まない（10 万行の文書の先頭と末尾を
+    ///   直す答えでも、積むのは直した数文字。#1683 の当初は最初の始まり〜最後の終わりを
+    ///   1 か所にしていたので、10 MB の文書では 1 回で undo の予算 8 MB を超えた）。
+    ///   当て方は補完の確定（[`Self::replace_position_ranges`]）と同じ 1 本
     /// - 入れる本文の改行はバッファの流儀へ揃える（#1650。範囲の外の改行は触らない）
     /// - カーソルと選択端は書き換えに合わせてずらす（打っていた場所から飛ばない）
     ///
@@ -2148,12 +2261,19 @@ impl TextBuffer {
         if ordered.is_empty() {
             return Ok(AppliedChanges { changes: 0 });
         }
-        let (range, replacement) = compose_changes(&self.text, &ordered);
         let cursor = follow_changes(&ordered, self.cursor);
         let anchor = self.anchor.map(|anchor| follow_changes(&ordered, anchor));
+        let composed;
+        let splices = if legacy_1869() {
+            // A/B の注入口: #1869 前の当て方（最初の始まり〜最後の終わりを 1 か所 = あいだの本文も
+            // undo へ積む）
+            composed = compose_changes(&self.text, &ordered);
+            vec![Splice::new(composed.0.clone(), &composed.1)]
+        } else {
+            splices_of(&ordered)
+        };
         self.apply_edit(Edit {
-            range,
-            replacement: &replacement,
+            splices: &splices,
             cursor,
             anchor,
             kind: EditKind::Replace,
@@ -2172,8 +2292,9 @@ impl TextBuffer {
     /// 通らなければ本文を触らずにエラーを返す。範囲は後ろから当てるので、前の範囲の位置は
     /// 当てるまで変わらない。カーソルは `primary` 番目の範囲へ入れた本文の末尾（前にある範囲の
     /// 伸び縮みを足した位置）。**undo 1 回で全部戻り、redo 1 回で全部やり直す**
-    /// （離れた範囲は別々の差分をつないで持つ = [`Self::apply_changes`] と違い、あいだの本文を
-    /// undo へ載せない）。各範囲の `expected_version` は見ない（版は `expected_version` 引数で見る）
+    /// （当て方は整形 [`Self::apply_changes`] と同じ 1 本 = 離れた範囲を差分 1 件に並べて持ち、
+    /// あいだの本文を undo へ載せない。#1869）。各範囲の `expected_version` は見ない（版は
+    /// `expected_version` 引数で見る）
     pub fn replace_position_ranges(
         &mut self,
         edits: &[RangeEdit],
@@ -2215,9 +2336,8 @@ impl TextBuffer {
             // 前に来る書き換えは互いに重ならず `primary` の始点より手前で終わる = 引いても負にならない
             cursor = cursor + changes[i].text.len() - changes[i].range.len();
         }
-        // 並べ方・重なり・最小化は整形と同じ 1 実装（#1683）。当て方だけが違う: 整形は
-        // 「最初の始まり〜最後の終わり」を 1 か所の置き換えにするが、補完は離れた範囲（先頭の自動
-        // import と下の方の語）を**別々の差分**のまま当ててつなぐ。1 か所にすると、あいだの本文が
+        // 並べ方・重なり・最小化も当て方も整形と同じ 1 実装（#1683 / #1869）: 離れた範囲（先頭の
+        // 自動 import と下の方の語）は離れたまま差分 1 件に並べる。1 か所にすると、あいだの本文が
         // まるごと undo へ載る（10 MB の文書なら 1 回で undo の予算を超えて履歴が消える）
         let ordered = order_changes(&self.text, changes)?;
         // 直前の打鍵の塊へ足さない（この操作は 1 回で閉じる）
@@ -2227,27 +2347,13 @@ impl TextBuffer {
             self.set_cursor(cursor, false);
             return Ok(());
         }
-        for (n, change) in ordered.iter().rev().enumerate() {
-            let last = n + 1 == ordered.len();
-            self.apply_edit(Edit {
-                range: change.range.clone(),
-                replacement: &change.text,
-                // 途中の差分のカーソルは当てた範囲の末尾（redo の途中経過）。最後の 1 つが最終位置
-                cursor: if last {
-                    cursor
-                } else {
-                    change.range.start + change.text.len()
-                },
-                anchor: None,
-                kind: EditKind::Replace,
-                line_ending: None,
-            });
-            if n > 0 {
-                if let Some(delta) = self.undo_stack.back_mut() {
-                    delta.chained = true;
-                }
-            }
-        }
+        self.apply_edit(Edit {
+            splices: &splices_of(&ordered),
+            cursor,
+            anchor: None,
+            kind: EditKind::Replace,
+            line_ending: None,
+        });
         self.seal_undo_group();
         Ok(())
     }
@@ -2400,8 +2506,7 @@ impl TextBuffer {
             // 直前の打鍵とまとめない（読み直しは 1 回で丸ごと戻る単位）
             self.seal_undo_group();
             self.apply_edit(Edit {
-                range,
-                replacement,
+                splices: &[Splice::new(range, replacement)],
                 cursor,
                 anchor: None,
                 kind: EditKind::Replace,
@@ -6290,5 +6395,186 @@ mod tests {
         .unwrap();
         assert_eq!(b.text(), "XYYYef\n");
         assert_eq!(b.cursor_position(), pos(1, 4));
+    }
+
+    // --- #1869: 整形も補完と同じく離れた箇所を差分 1 件に並べる（あいだの本文を積まない）-----
+
+    /// 10 万行（#1660 の上限 10 MB / 10 万行の付近）の本文。行末に空白 2 つ（整形が消す）
+    fn hundred_thousand_lines() -> String {
+        (0..100_000)
+            .map(|i| {
+                format!(
+                    "    let value_{i:06} = compute(alpha, beta, gamma, delta, epsilon, zeta, eta, theta);  \n"
+                )
+            })
+            .collect()
+    }
+
+    /// 各行の行末の空白 2 つを消す答え（10 万箇所。偽サーバの既定の整形と同じ形）
+    fn trailing_space_changes(text: &str) -> Vec<TextChange> {
+        let mut at = 0;
+        text.split_inclusive('\n')
+            .map(|line| {
+                let end = at + line.len() - 1;
+                at += line.len();
+                change(end - 2..end, "")
+            })
+            .collect()
+    }
+
+    /// 受け入れ条件 1: 10 万行の整形が undo の予算に収まり、undo 1 回で戻り、**その前の履歴も
+    /// 残る**（#1869 前は先頭〜末尾の 1 か所 = 本文 2 本ぶん約 19 MB を積み、予算 8 MB を超えて
+    /// その前の履歴を捨てていた）
+    #[test]
+    fn 十万行の整形は予算に収まり_undo_1_回で戻りその前の履歴も残る_1869() {
+        let original = hundred_thousand_lines();
+        assert!(original.len() > 8 * 1024 * 1024, "予算より大きい本文で測る");
+        let mut b = TextBuffer::from_text(path("big.rs"), original.clone());
+        // 整形の前の打鍵 1 塊（これが整形の後も戻れること = 履歴が捨てられていない）
+        b.set_cursor(0, false);
+        b.insert("//");
+        let typed = b.text().to_string();
+        b.set_cursor(0, false);
+        let applied = b
+            .apply_changes(trailing_space_changes(&typed), None)
+            .unwrap();
+        assert_eq!(applied.changes, 100_000);
+        let formatted = b.text().to_string();
+        assert_eq!(formatted.len(), typed.len() - 200_000);
+        assert!(!formatted.contains("  \n"), "行末の空白が残っている");
+        let bytes = b.undo_history_bytes();
+        assert!(
+            bytes <= UNDO_BYTE_LIMIT,
+            "整形 1 回で undo の予算を超えた（{bytes} > {UNDO_BYTE_LIMIT}）"
+        );
+        assert_eq!(
+            b.undo_depth(),
+            2,
+            "打鍵の塊 + 整形 1 件（どちらも捨てられていない）"
+        );
+        assert_eq!(b.line_starts(), &compute_line_starts(b.text())[..]);
+        assert!(b.undo());
+        assert_eq!(b.text(), typed, "undo 1 回で整形の前とバイト一致");
+        assert_eq!(b.line_starts(), &compute_line_starts(b.text())[..]);
+        assert!(b.undo());
+        assert_eq!(b.text(), original, "その前の打鍵も戻れる");
+        assert!(b.redo());
+        assert!(b.redo());
+        assert_eq!(b.text(), formatted, "redo 2 回で整形の後へ");
+        assert_eq!(b.undo_history_bytes(), bytes, "往復で履歴は増えない");
+    }
+
+    /// 先頭と末尾だけを直す答え: 積むのは直した数文字（あいだの 10 MB を積まない）
+    #[test]
+    fn 先頭と末尾だけの整形はあいだの本文を積まない_1869() {
+        let original = hundred_thousand_lines();
+        let mut b = TextBuffer::from_text(path("ends.rs"), original.clone());
+        let last_line = original.len() - original.lines().last().unwrap().len() - 1;
+        b.set_cursor(last_line, false);
+        b.apply_changes(
+            vec![
+                change(0..4, "\t"),
+                change(original.len() - 3..original.len() - 1, ""),
+            ],
+            None,
+        )
+        .unwrap();
+        let bytes = b.undo_history_bytes();
+        assert!(
+            bytes < 1024,
+            "離れた 2 か所なのにあいだを積んだ（{bytes} バイト）"
+        );
+        // カーソルは書き換えに合わせてずれる（先頭の 4 → 1 バイトの 3 つ分）
+        assert_eq!(b.cursor(), last_line - 3);
+        assert!(b.undo());
+        assert_eq!(b.text(), original);
+        assert_eq!(b.cursor(), last_line);
+    }
+
+    /// 離れた箇所の差分は undo / redo の往復で本文・行頭索引・カーソルがバイト一致する
+    /// （CRLF・多バイト・伸びる箇所と縮む箇所の混在）
+    #[test]
+    fn 離れた箇所の差分は往復でバイト一致する_1869() {
+        let original = "a😀b\r\nccc\r\n日本語\r\nd\r\n";
+        let mut b = TextBuffer::from_text(path("crlf.rs"), original.into());
+        let start = original.find("日本").unwrap();
+        b.set_cursor(start + "日本".len(), false);
+        b.apply_changes(
+            vec![
+                change(1..5, "XYZW"),
+                change(8..10, ""),
+                change(start..start + 3, "にほん\n"),
+                change(original.len() - 3..original.len() - 2, "dd"),
+            ],
+            None,
+        )
+        .unwrap();
+        let done = b.text().to_string();
+        assert_eq!(done, "aXYZWb\r\nc\r\nにほん\r\n本語\r\ndd\r\n");
+        let cursor = b.cursor();
+        for _ in 0..3 {
+            assert!(b.undo());
+            assert_eq!(b.text(), original);
+            assert_eq!(b.line_starts(), &compute_line_starts(b.text())[..]);
+            assert_eq!(b.cursor(), start + "日本".len());
+            assert!(b.redo());
+            assert_eq!(b.text(), done);
+            assert_eq!(b.line_starts(), &compute_line_starts(b.text())[..]);
+            assert_eq!(b.cursor(), cursor);
+        }
+    }
+
+    /// エッジ: 空の文書への整形・空の答え・重なる答え（本文も履歴も版も触らない）
+    #[test]
+    fn 空の文書と空の答えと重なる答え_1869() {
+        let mut empty = TextBuffer::from_text(path("empty.rs"), String::new());
+        let version = empty.version();
+        assert_eq!(empty.apply_changes(Vec::new(), None).unwrap().changes, 0);
+        assert_eq!(empty.version(), version, "空の答えは版を進めない");
+        assert_eq!(empty.undo_depth(), 0);
+        empty
+            .apply_changes(vec![change(0..0, "fn main() {}\n")], None)
+            .unwrap();
+        // 空の文書の改行は OS の既定（Windows は CRLF。#1650）で、入れる本文もそれへ揃う
+        let newline = empty.line_ending().as_str();
+        assert_eq!(empty.text(), format!("fn main() {{}}{newline}"));
+        assert!(empty.undo());
+        assert_eq!(empty.text(), "");
+        assert_eq!(empty.line_starts(), &[0][..]);
+
+        let mut b = TextBuffer::from_text(path("overlap.rs"), "abcdef\n".into());
+        let version = b.version();
+        let overlap = b.apply_changes(vec![change(0..3, "X"), change(2..4, "Y")], None);
+        assert!(matches!(overlap, Err(ChangesError::Overlap { .. })));
+        assert_eq!(b.text(), "abcdef\n");
+        assert_eq!(b.version(), version);
+        assert_eq!(b.undo_depth(), 0);
+    }
+
+    /// 上限（操作数 1000）は 1 操作を途中で割らない: 1500 箇所の整形も差分 1 件
+    /// （#1682 の「別々の差分をつなぐ」形では 1500 件積んで上限で前半が捨てられ、undo が半端に戻った）
+    #[test]
+    fn 上限の件数を超える箇所の整形も_undo_1_回で全部戻る_1869() {
+        let original: String = (0..1500).map(|i| format!("x{i} \n")).collect();
+        let mut b = TextBuffer::from_text(path("many.rs"), original.clone());
+        let changes = trailing_space_changes_1(&original);
+        assert_eq!(changes.len(), 1500);
+        b.apply_changes(changes, None).unwrap();
+        assert_eq!(b.undo_depth(), 1);
+        assert!(b.undo());
+        assert_eq!(b.text(), original);
+        assert!(!b.can_undo());
+    }
+
+    /// 各行の行末の空白 1 つを消す答え
+    fn trailing_space_changes_1(text: &str) -> Vec<TextChange> {
+        let mut at = 0;
+        text.split_inclusive('\n')
+            .map(|line| {
+                let end = at + line.len() - 1;
+                at += line.len();
+                change(end - 1..end, "")
+            })
+            .collect()
     }
 }

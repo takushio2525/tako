@@ -804,7 +804,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 1007,
         },
         windows_evidence: Evidence::UnitTest(
-            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）と issue1680_lsp_goto（偽サーバの Location / LocationLink → 行・桁の変換・UTF-16・見つからない / 未応答 / 未導入 / 未対応の区別・一時 didOpen の後始末）と issue1683_lsp_format（偽サーバの TextEdit 配列 4 形 → 固定値・undo 1 回・範囲の外を変えない・CRLF・待つあいだの変更）と issue1682_lsp_completion（偽サーバの補完 → 3 回の要求で $/cancelRequest 2 件・版が変わった答えを捨てる・UTF-16 の範囲・説明の補い）と issue1684_lsp_menu（偽サーバの申告 4 通り → 右クリックメニューの項目の列・握手以外を送らない・未導入）と issue1681_lsp_hover（偽サーバのホバー → Markdown / 平文 / 旧形式 / 空の読み取り・UTF-16 の往復・マウスの要求の取り消し・開いていない文書でサーバを起こさない・100 回で保持件数が増えない）が CI の Windows ジョブで緑。URI → パスの Windows 形式は lsp::goto の単体（macOS 上で固定）",
+            "issue1679_lsp_diagnostics（偽サーバの Diagnostic 配列 → tako lsp diagnostics の固定値・重大度の境界・UTF-16 の桁・閉じたら保持 0）と issue1680_lsp_goto（偽サーバの Location / LocationLink → 行・桁の変換・UTF-16・見つからない / 未応答 / 未導入 / 未対応の区別・一時 didOpen の後始末）と issue1683_lsp_format（偽サーバの TextEdit 配列 4 形 → 固定値・undo 1 回・範囲の外を変えない・CRLF・待つあいだの変更）と issue1682_lsp_completion（偽サーバの補完 → 3 回の要求で $/cancelRequest 2 件・版が変わった答えを捨てる・UTF-16 の範囲・説明の補い）と issue1684_lsp_menu（偽サーバの申告 4 通り → 右クリックメニューの項目の列・握手以外を送らない・未導入）と issue1681_lsp_hover（偽サーバのホバー → Markdown / 平文 / 旧形式 / 空の読み取り・UTF-16 の往復・マウスの要求の取り消し・開いていない文書でサーバを起こさない・100 回で保持件数が増えない）と issue1869_lsp_followup（偽サーバの読み込み中 → 打鍵の要求も待って問い直す・待ちは次の打鍵 / 閉じるで抜ける・上限で loading）が CI の Windows ジョブで緑。URI → パスの Windows 形式は lsp::goto の単体（macOS 上で固定）",
         ),
     },
     Feature {
