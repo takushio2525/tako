@@ -17,14 +17,16 @@
 
 use serde_json::Value;
 
-use super::format;
 use super::goto::{self, GotoKind, SymbolKind};
+use super::{format, hover};
 
 /// 右クリックメニューの LSP 項目
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MenuItem {
     /// 定義ジャンプの 4 種（⌘クリックと同じ問い合わせ。#1680）
     Goto(GotoKind),
+    /// その語の型・doc のカード（編集メニューの「ホバー情報を表示」と同じ。#1681 / #1893）
+    Hover,
     /// 文書全体の整形（編集メニューの「コードを整形」と同じ。#1683）
     Format,
     /// 選択範囲の整形（編集メニューの「選択範囲を整形」と同じ。#1683）
@@ -32,12 +34,13 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    /// 全項目。**メニューに出る順**（VSCode / Zed の並びに合わせ、移動 → 整形）
-    pub const ALL: [MenuItem; 6] = [
+    /// 全項目。**メニューに出る順**（VSCode / Zed の並びに合わせ、移動 → 情報 → 整形）
+    pub const ALL: [MenuItem; 7] = [
         MenuItem::Goto(GotoKind::Definition),
         MenuItem::Goto(GotoKind::Declaration),
         MenuItem::Goto(GotoKind::TypeDefinition),
         MenuItem::Goto(GotoKind::Implementation),
+        MenuItem::Hover,
         MenuItem::Format,
         MenuItem::FormatSelection,
     ];
@@ -51,6 +54,7 @@ impl MenuItem {
             MenuItem::Goto(GotoKind::Declaration) => "lsp-declaration",
             MenuItem::Goto(GotoKind::TypeDefinition) => "lsp-type-definition",
             MenuItem::Goto(GotoKind::Implementation) => "lsp-implementation",
+            MenuItem::Hover => "lsp-hover",
             MenuItem::Format => "lsp-format",
             MenuItem::FormatSelection => "lsp-format-selection",
         }
@@ -64,6 +68,7 @@ impl MenuItem {
     pub fn provider_key(self) -> &'static str {
         match self {
             MenuItem::Goto(kind) => kind.provider_key(),
+            MenuItem::Hover => hover::PROVIDER_KEY,
             MenuItem::Format => format::provider_key(false),
             MenuItem::FormatSelection => format::provider_key(true),
         }
@@ -74,6 +79,7 @@ impl MenuItem {
 pub fn server_supports(capabilities: &Value, item: MenuItem) -> bool {
     match item {
         MenuItem::Goto(kind) => goto::server_supports(capabilities, kind),
+        MenuItem::Hover => hover::server_supports(capabilities),
         MenuItem::Format => format::server_supports(capabilities, false),
         MenuItem::FormatSelection => format::server_supports(capabilities, true),
     }
@@ -82,11 +88,14 @@ pub fn server_supports(capabilities: &Value, item: MenuItem) -> bool {
 /// 位置の種類から見て、その項目を出してよいか（能力は別に見る）。
 ///
 /// - 識別子: すべて（「選択範囲を整形」は右クリックした位置が選択の中のときだけ）
-/// - `#include` のパス: 定義へ移動だけ（⌘クリックと同じくヘッダを開く。宣言・型定義・実装・
-///   整形はパスに対して意味を持たない）
+/// - `#include` のパス: 定義へ移動とホバー（⌘クリックと同じくヘッダを開く・マウスを乗せたときと
+///   同じくパスのカード = clangd は解決したヘッダのパスを返す。宣言・型定義・実装・整形はパスに
+///   対して意味を持たない）
 fn fits(item: MenuItem, kind: SymbolKind, selection_at_click: bool) -> bool {
     match kind {
-        SymbolKind::IncludePath => item == MenuItem::Goto(GotoKind::Definition),
+        SymbolKind::IncludePath => {
+            matches!(item, MenuItem::Goto(GotoKind::Definition) | MenuItem::Hover)
+        }
         SymbolKind::Identifier => item != MenuItem::FormatSelection || selection_at_click,
     }
 }
@@ -147,6 +156,7 @@ mod tests {
             "declarationProvider": {},
             "typeDefinitionProvider": true,
             "implementationProvider": { "id": "impl" },
+            "hoverProvider": true,
             "documentFormattingProvider": true,
             "documentRangeFormattingProvider": {},
             "completionProvider": { "triggerCharacters": ["."] },
@@ -158,6 +168,7 @@ mod tests {
                 "lsp-declaration",
                 "lsp-type-definition",
                 "lsp-implementation",
+                "lsp-hover",
                 "lsp-format",
                 "lsp-format-selection",
             ]
@@ -167,12 +178,22 @@ mod tests {
             "definitionProvider": false,
             "typeDefinitionProvider": true,
             "implementationProvider": false,
+            "hoverProvider": false,
             "documentFormattingProvider": false,
             "documentRangeFormattingProvider": true,
         });
         assert_eq!(
             ids(&items(&some, id, true)),
             ["lsp-type-definition", "lsp-format-selection"]
+        );
+        // #1893: ホバーだけ（options のオブジェクトも「応じる」）
+        assert_eq!(
+            ids(&items(
+                &json!({ "hoverProvider": { "workDoneProgress": false } }),
+                id,
+                false
+            )),
+            ["lsp-hover"]
         );
     }
 
@@ -184,6 +205,7 @@ mod tests {
             "declarationProvider": true,
             "typeDefinitionProvider": true,
             "implementationProvider": true,
+            "hoverProvider": true,
             "documentFormattingProvider": true,
             "documentRangeFormattingProvider": true,
         });
@@ -204,16 +226,20 @@ mod tests {
     }
 
     #[test]
-    fn includeのパスは定義へ移動だけ() {
+    fn includeのパスは定義へ移動とホバーだけ() {
         let all = json!({
             "definitionProvider": true,
             "declarationProvider": true,
+            "hoverProvider": true,
             "documentFormattingProvider": true,
         });
         let symbol = goto::symbol_at("#include \"foo.h\"", 11).map(|s| s.kind);
         assert_eq!(symbol, Some(SymbolKind::IncludePath));
-        assert_eq!(ids(&items(&all, symbol, true)), ["lsp-definition"]);
-        // 定義の能力が無ければ何も出ない
+        assert_eq!(
+            ids(&items(&all, symbol, true)),
+            ["lsp-definition", "lsp-hover"]
+        );
+        // 定義もホバーも能力に無ければ何も出ない
         assert!(items(&json!({ "declarationProvider": true }), symbol, true).is_empty());
     }
 

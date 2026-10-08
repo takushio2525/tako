@@ -881,12 +881,14 @@ pub(super) fn build_request(
                 line: required_u64(args, "line")? as usize,
                 column: required_u64(args, "column")? as usize,
             },
-            // #1681: ホバー（位置は定義ジャンプと同じ。show で GUI にカードも出す）
+            // #1681: ホバー（位置は定義ジャンプと同じ。show で GUI にカードも出す）。
+            // #1893: limit は本文の字数の上限（0 = 全文。CLI の --full / --limit）
             crate::dispatch::LSP_HOVER_ACTION => Request::LspHover {
                 pane: Some(target_pane(args, caller)?),
                 line: required_u64(args, "line")? as usize,
                 column: required_u64(args, "column")? as usize,
                 show: bool_arg(args, "show")?,
+                limit: u64_arg(args, "limit")?.map(|n| n as usize),
             },
             action if tako_core::lsp::goto::GotoKind::parse(action).is_some() => Request::LspGoto {
                 action: action.to_string(),

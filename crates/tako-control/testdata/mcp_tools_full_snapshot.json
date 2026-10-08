@@ -1488,8 +1488,8 @@
           "type": "boolean"
         },
         "limit": {
-          "description": "補完: 返す件数（既定 50）",
-          "minimum": 1,
+          "description": "補完: 返す件数（既定 50）/ ホバー: 本文の字数（既定 16000。0 で全文）",
+          "minimum": 0,
           "type": "integer"
         },
         "line": {

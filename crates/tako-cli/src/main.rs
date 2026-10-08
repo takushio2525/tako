@@ -1008,7 +1008,8 @@ enum LspCommand {
     /// 項目ごとに押したときと同じコマンドを出す。MCP は `tako_lsp` の action=menu
     Menu(LspMenuArgs),
     /// その位置の型・doc（GUI のマウスのホバーのカードと同じ問い合わせ。#1681）。本文は
-    /// Markdown / 平文のまま出す。`--show` で GUI のその位置にカードも出す。MCP は `tako_lsp` の action=hover
+    /// Markdown / 平文のまま出す（既定は 16,000 字まで。`--full` で全文・`--limit N` で N 字まで）。
+    /// `--show` で GUI のその位置にカードも出す。MCP は `tako_lsp` の action=hover（`limit`。0 = 全文）
     Hover(LspHoverArgs),
 }
 
@@ -1088,9 +1089,26 @@ struct LspHoverArgs {
     /// GUI のその位置にカードも出す
     #[arg(long)]
     show: bool,
+    /// 本文を切らずに全文を出す（既定は 16,000 字まで。#1893）
+    #[arg(long, conflicts_with = "limit")]
+    full: bool,
+    /// 本文の字数の上限（既定 16,000。0 は全文 = --full。#1893）
+    #[arg(long, value_parser = clap::value_parser!(usize))]
+    limit: Option<usize>,
     /// JSON のまま出す
     #[arg(long)]
     json: bool,
+}
+
+impl LspHoverArgs {
+    /// `limit` の wire 形（`--full` = 0 = 全文。どちらも無ければ省略 = 16,000 字。#1893）
+    fn wire_limit(&self) -> Option<usize> {
+        if self.full {
+            Some(0)
+        } else {
+            self.limit
+        }
+    }
 }
 
 /// `tako lsp definition` 等の引数（#1680）。位置は `tako edit replace-range` と同じ
@@ -1181,6 +1199,7 @@ impl LspCommand {
                 line: args.line,
                 column: args.column,
                 show: args.show.then_some(true),
+                limit: args.wire_limit(),
             },
         })
     }
@@ -11718,6 +11737,7 @@ mod tests {
                 line: 3,
                 column: 4,
                 show: None,
+                limit: None,
             }
         );
         assert_eq!(
@@ -11730,9 +11750,36 @@ mod tests {
                 line: 1,
                 column: 0,
                 show: Some(true),
+                limit: None,
             }
         );
         assert!(Cli::try_parse_from(["tako", "lsp", "hover", "--pane", "7"]).is_err());
+        // #1893: --full = limit 0（全文）/ --limit N = N 字。MCP の `limit` と同じ wire。同時は拒否
+        for (flags, limit) in [
+            (&["--full"][..], Some(0)),
+            (&["--limit", "500"][..], Some(500)),
+        ] {
+            let mut argv = vec![
+                "tako", "lsp", "hover", "--pane", "7", "--line", "3", "--column", "4",
+            ];
+            argv.extend_from_slice(flags);
+            assert_eq!(
+                build_request(&parse(&argv)).unwrap(),
+                Request::LspHover {
+                    pane: Some(7),
+                    line: 3,
+                    column: 4,
+                    show: None,
+                    limit,
+                },
+                "{flags:?}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "tako", "lsp", "hover", "--pane", "7", "--line", "3", "--column", "4", "--full",
+            "--limit", "9"
+        ])
+        .is_err());
         // 人向けの表示: 見出し（status・種類・範囲）→ 本文をそのまま（Markdown を解釈しない）
         let lines = lsp_hover_lines(&serde_json::json!({
             "status": "found", "kind": "markdown",

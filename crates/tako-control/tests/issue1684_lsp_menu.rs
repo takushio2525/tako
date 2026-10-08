@@ -151,10 +151,11 @@ fn 実プロセスの申告4通りで項目の列が固定値と一致する() {
             "lsp-declaration",
             "lsp-type-definition",
             "lsp-implementation",
+            "lsp-hover",
             "lsp-format",
             "lsp-format-selection",
         ],
-        "全部あり（偽サーバの既定）"
+        "全部あり（偽サーバの既定。ホバーは #1893 で項目になった）"
     );
     assert_eq!(
         ids_for(Some(json!({

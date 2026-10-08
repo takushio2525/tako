@@ -402,8 +402,8 @@ pub const COMPLETION_LOADING_NOTE: Note = Note::new(
 
 // --- ホバー（#1681）-------------------------------------------------------------
 // 失敗の多く（未導入・未応答・落ちた…）は定義ジャンプと同じ言語サーバの状態なので、上の
-// GOTO_* の文をそのまま使う。ホバーに固有なのは「能力に無い」「置き換わった」「文書が開いていない」
-// 「何も無い」「本文を切った」の 5 つだけ
+// GOTO_* の文をそのまま使う（読み込み中は補完の COMPLETION_LOADING_* = #1893）。ホバーに固有なのは
+// 「能力に無い」「置き換わった」「文書が開いていない」「何も無い」「本文を切った」「読み込み中の 1 行」だけ
 
 /// 能力にホバーが無い。`{server}`
 pub const HOVER_UNSUPPORTED_REASON: Note = Note::new(
@@ -441,10 +441,17 @@ pub const HOVER_NONE_NEXT_STEP: Note = Note::new(
     "Try on an identifier (whitespace, comments and strings may have none)",
 );
 
-/// 本文を上限で切った。`{total}` = 切る前の文字数・`{limit}` = 上限
+/// 本文を上限で切った。`{total}` = 切る前の文字数・`{limit}` = 上限。全文の取り方も言う（#1893）
 pub const HOVER_TRUNCATED_NOTE: Note = Note::new(
-    "全 {total} 字のうち先頭 {limit} 字まで",
-    "First {limit} of {total} characters",
+    "全 {total} 字のうち先頭 {limit} 字まで（全文は --full / MCP は limit=0）",
+    "First {limit} of {total} characters (full text: --full / MCP limit=0)",
+);
+
+/// GUI: マウスを乗せた / ホバーを頼んだときにサーバが起動中 / 読み込み中（カードの代わりに出す
+/// 1 行。#1893。補完の「読み込み中」= #1869 と同じ扱い）
+pub const HOVER_LOADING_NOTE: Note = Note::new(
+    "言語サーバが読み込み中です。済んだら表示します",
+    "Language server is loading; the info appears when ready",
 );
 
 /// 機能の呼び名（「能力に無い」の文へ差し込む）

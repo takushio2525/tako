@@ -2,7 +2,7 @@
 //!
 //! 本文を**識別子の上で**右クリックすると、ペインのメニュー（ヘッダの右クリックと同じ
 //! `pane_context_menu`）の先頭へ言語サーバの項目（定義へ移動・宣言へ移動・型定義へ移動・
-//! 実装へ移動・コードを整形・選択範囲を整形）を足す。識別子でない位置・受け持つサーバが無い
+//! 実装へ移動・ホバー情報を表示（#1893）・コードを整形・選択範囲を整形）を足す。識別子でない位置・受け持つサーバが無い
 //! ファイル・Markdown では従来のメニューのまま。
 //!
 //! ## 出し分けと操作はここに無い
@@ -11,7 +11,7 @@
 //!   出し分けは `tako_core::lsp::menu::items`（サーバの申告に無い項目は出さない）。CLI
 //!   `tako lsp menu` / MCP `tako_lsp` の action=menu と同じ 1 本を通る
 //! - 項目を押したときの要求は `tako_control::lsp::menu::item_request` が組み（CLI / MCP が組む
-//!   要求と同じ）、⌘クリック・編集メニューと同じ 3 段（`prepare_offload` → `run_staged` →
+//!   要求と同じ）、⌘クリック・編集メニュー・ホバーのキーと同じ 3 段（`prepare_offload` → `run_staged` →
 //!   `finish_offload`）へ渡す。**メニューの中に操作の実装を持たない**（UI 限定の操作を作らない）
 //!
 //! ここが持つのは「どこで開くか・握手を待つあいだの 1 行・答えの差し替え」だけ。
@@ -161,7 +161,7 @@ impl TakoApp {
     }
 
     /// LSP の項目を押した（#1684）。要求は CLI / MCP と同じ `item_request` が組み、
-    /// ⌘クリック（定義ジャンプ）・編集メニュー（整形）と同じ入口へ渡す
+    /// ⌘クリック（定義ジャンプ）・編集メニュー（整形・ホバー = #1893）と同じ入口へ渡す
     pub(crate) fn run_lsp_menu_item(
         &mut self,
         pane: PaneId,
@@ -176,6 +176,8 @@ impl TakoApp {
         };
         match item {
             MenuItem::Goto(_) => self.start_lsp_goto_request(pane, request, anchor, cx),
+            // #1893: 編集メニュー・キーの「ホバー情報を表示」と同じ入口（カードを出す）
+            MenuItem::Hover => self.request_lsp_hover(pane, request, cx),
             MenuItem::Format | MenuItem::FormatSelection => {
                 self.format_preview_request(pane, request, cx)
             }

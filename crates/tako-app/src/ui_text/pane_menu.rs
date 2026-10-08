@@ -60,7 +60,7 @@ pub fn restart_handoff() -> &'static str {
 
 /// コードの本文を識別子の上で右クリックしたときの言語サーバの項目（#1684）。
 ///
-/// 整形の 2 つは編集メニュー（#1683）と同じ操作なので**同じ関数を引く**
+/// 整形の 2 つ（#1683）とホバー（#1893）は編集メニューと同じ操作なので**同じ関数を引く**
 /// （同じ操作に別の言い回しを作らない）。定義ジャンプの 4 つは VSCode / Zed の並びと呼び名に合わせる
 pub fn lsp_item(item: tako_core::lsp::menu::MenuItem) -> &'static str {
     use tako_core::lsp::goto::GotoKind;
@@ -72,6 +72,7 @@ pub fn lsp_item(item: tako_core::lsp::menu::MenuItem) -> &'static str {
             tr!("型定義へ移動", "Go to Type Definition")
         }
         MenuItem::Goto(GotoKind::Implementation) => tr!("実装へ移動", "Go to Implementation"),
+        MenuItem::Hover => super::menu::show_hover(),
         MenuItem::Format => super::menu::format_document(),
         MenuItem::FormatSelection => super::menu::format_selection(),
     }

@@ -20,7 +20,8 @@
 //!    Markdown として読まない
 //! 4. カードの置き場は `hover_card_placement`（中で `compute_menu_position` の返しの判定を使う）
 //! 5. カードを出す口は `open_lsp_hover_card` の 1 本（CLI / MCP の `show` も GUI のマウスも）。
-//!    編集メニューは CLI と同じ dispatch の 3 段を通す（manager を直に叩かない）
+//!    編集メニュー・キー・右クリックメニュー（#1893）は `request_lsp_hover` の 1 本で CLI と同じ
+//!    dispatch の 3 段を通す（manager を直に叩かない）
 //! 6. 入口: マウス移動がホバーを更新し、打鍵の入口は補完の表を先に引いてからホバーの Esc を見る。
 //!    重ね順は補完の一覧が手前。右クリックメニュー（#1684）を開いているあいだはカードを出さない
 //!
@@ -175,9 +176,16 @@ const RULES: &[Rule] = &[
     Rule {
         file: GUI,
         decl: "pub(crate) fn show_hover_at_cursor(",
+        must: &["self.request_lsp_hover("],
+        must_not: &["manager.hover(", "self.lsp.hover("],
+        why: "編集メニュー / パレット / キー（#1893）の口が問い合わせの 1 本（`request_lsp_hover`）を通っていない",
+    },
+    Rule {
+        file: GUI,
+        decl: "pub(crate) fn request_lsp_hover(",
         must: &["prepare_offload(", "finish_offload_on_ui("],
         must_not: &["manager.hover(", "self.lsp.hover("],
-        why: "編集メニュー / パレットの口が CLI / MCP と同じ dispatch の 3 段を通っていない",
+        why: "メニュー / キー / 右クリックメニューの口が CLI / MCP と同じ dispatch の 3 段を通っていない",
     },
     Rule {
         file: DISPATCH,
@@ -340,8 +348,8 @@ fn 逆戻りを名指しできる() {
         "A 取り消しの列を外す",
         MANAGER,
         (
-            ".then(|| (Lane::Hover, self.supersede(Lane::Hover)));",
-            ".then(|| (Lane::Hover, 0));",
+            "                    .unwrap_or_else(|| self.supersede(Lane::Hover)),",
+            "                    .unwrap_or(0),",
         ),
         "    fn hover(&self, request: &HoverRequest)",
     );
@@ -382,7 +390,7 @@ fn 逆戻りを名指しできる() {
         ),
         "pub(crate) fn hover_card_placement(",
     );
-    // F. 編集メニューが manager を直に叩く（CLI と経路が割れる）
+    // F. 編集メニュー / キーが manager を直に叩く（CLI と経路が割れる）
     assert_named(
         "F manager を直に叩く",
         GUI,
@@ -391,6 +399,16 @@ fn 逆戻りを名指しできる() {
             "        let _ = self.lsp.hover(&Default::default());\n        let job = match tako_control::prepare_offload(self, &request) {",
         ),
         "self.lsp.hover(&Default::default())",
+    );
+    // F'. 編集メニュー / キーの口が共通の 1 本を通らない（#1893）
+    assert_named(
+        "F' 共通の口を外す",
+        GUI,
+        (
+            "        self.request_lsp_hover(pane, request, cx);\n    }",
+            "        let _ = request;\n    }",
+        ),
+        "pub(crate) fn show_hover_at_cursor(",
     );
     // H. 右クリックメニュー（#1684）を開いていてもカードを出す（メニューを隠す）
     assert_named(

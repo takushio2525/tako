@@ -7,8 +7,16 @@
 //! で捨てる・開いていない文書でサーバを起こさない）。応答の読み取り（3 形）と本文の上限は
 //! `tako_core::lsp::hover` の純粋関数。Markdown の描画は `md_view::render_block`（プレビュー・
 //! アップデート詳細と同じ 1 実装 = [`hover_body`] は `md_view::render_blocks` を呼ぶだけ）。
-//! 編集メニュー / パレットの「ホバー情報を表示」は CLI `tako lsp hover --show` / MCP `tako_lsp` と
-//! 同じ dispatch の 3 段を通り、カードを出すのは [`TakoApp::open_lsp_hover_card`] の 1 本。
+//! 編集メニュー / パレット / キー（⇧⌘H・Ctrl+Shift+H）/ 右クリックメニューの「ホバー情報を表示」
+//! （#1893）は CLI `tako lsp hover --show` / MCP `tako_lsp` と同じ dispatch の 3 段を通り
+//! （[`TakoApp::request_lsp_hover`] の 1 本）、カードを出すのは [`TakoApp::open_lsp_hover_card`] の 1 本。
+//!
+//! ## サーバの読み込み中（#1893）
+//!
+//! マウスの要求も manager が読み込みを待って問い直す（補完の打鍵 = #1869 と同じ待ち）。待つあいだは
+//! 語の真下に「読み込み中」の 1 行（[`LspHoverUi::loading`]）を出し、答えが届いたらカードへ差し替える。
+//! メニュー / キーの要求は定義ジャンプ・整形と同じくヘッダの「問い合わせています」（読み込み中なら
+//! その旨）を出す。カードの本文はいつも [`MAX_CHARS`] 字まで（CLI / MCP の `limit` はカードに効かない）。
 //!
 //! ここが持つのは画面だけ: いつ問い合わせるか（識別子に乗る → デバウンス）・カードをどこに
 //! 置くか（[`hover_card_placement`]。語の行の真下、入らなければ真上。ウィンドウの端で見切れない）・
@@ -31,7 +39,7 @@ use gpui::{
     Point, SharedString, Size,
 };
 use tako_control::lsp::{HoverAnswer, HoverError, HoverRequest};
-use tako_core::lsp::hover::{Hover, Markup};
+use tako_core::lsp::hover::{Hover, Markup, MAX_CHARS};
 use tako_core::PaneId;
 
 use crate::md_view::{self, MdTextSink};
@@ -46,6 +54,10 @@ pub(crate) const HOVER_CARD_MAX_HEIGHT: f32 = 360.0;
 pub(crate) const HOVER_EDGE: f32 = 4.0;
 /// カードの本文の文字サイズ（見出し・コードブロックの大きさはこれに対する比 = `render_block`）
 pub(crate) const HOVER_BASE: f32 = 12.5;
+/// 「読み込み中」の 1 行の高さ（#1893。補完の「読み込み中」と同じ寸法）
+pub(crate) const HOVER_LOADING_HEIGHT: f32 = 28.0;
+/// 「読み込み中」の 1 行の幅
+pub(crate) const HOVER_LOADING_WIDTH: f32 = 400.0;
 
 /// カードを出したきっかけ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +105,17 @@ pub(crate) struct LspHoverUi {
     pub(crate) last_failure: Option<&'static str>,
     /// 描く直前の照合でカードを閉じた直近の理由（visual-test が名指す）
     pub(crate) last_invalid: Option<&'static str>,
+    /// 言語サーバの起動 / 読み込みを待っているマウスの問い合わせ（#1893）。問い合わせを出した時点で
+    /// サーバが起動中か読み込み中なら立て（番号と編集バッファの版）、その答え（カード・何も無い・
+    /// 失敗）が届くか、語から外れる・閉じるで下ろす。**表示だけ**（押下は下の本文へ通す）
+    pub(crate) loading: Option<(u64, Option<u64>)>,
+    /// 直近に描いた「読み込み中」の矩形（visual-test が差分の範囲を見る）
+    pub(crate) loading_bounds: Option<Bounds<Pixels>>,
+    /// メニュー / キーで頼んで答えを待っている問い合わせ（ペインと番号。#1893）。ヘッダに
+    /// 「問い合わせています」を出す（定義ジャンプ・整形の `pending` と同じ）
+    pub(crate) pending: Option<(PaneId, u64)>,
+    /// メニュー / キーの問い合わせの番号（古い答えでヘッダの印を下ろさない）
+    explicit_seq: u64,
 }
 
 impl LspHoverUi {
@@ -100,7 +123,7 @@ impl LspHoverUi {
     #[cfg(feature = "visual-test")]
     pub(crate) fn debug_state(&self) -> String {
         format!(
-            "target={:?} seq={} card={} inflight={} shown={} last_failure={:?} last_invalid={:?}",
+            "target={:?} seq={} card={} inflight={} shown={} last_failure={:?} last_invalid={:?} loading={:?} pending={:?}",
             self.target.as_ref().map(|t| (t.line, t.range.clone())),
             self.seq,
             self.card.is_some(),
@@ -108,6 +131,8 @@ impl LspHoverUi {
             self.shown,
             self.last_failure,
             self.last_invalid,
+            self.loading,
+            self.pending,
         )
     }
 }
@@ -124,8 +149,8 @@ pub(crate) struct HoverCard {
     pub(crate) blocks: Arc<Vec<MdBlock>>,
     /// 本文のリンク（押すとブラウザで開く。当たり判定は `md_view::md_link_at_layouts`）
     links: Arc<Vec<MdLinkHit>>,
-    /// 上限で切った本文なら切る前の文字数
-    truncated: Option<usize>,
+    /// 上限で切った本文なら切る前の文字数（visual-test が巨大な doc の切り方を見る）
+    pub(crate) truncated: Option<usize>,
     /// 出したときの編集バッファの版（編集していなければ `None`）。変われば閉じる（語の位置がずれる）
     version: Option<u64>,
     generation: u64,
@@ -388,6 +413,8 @@ impl TakoApp {
                         // メニュー / CLI で出したカードはマウスでは閉じない（待ちだけ捨てる）
                         self.lsp_hover.target = None;
                         self.lsp_hover.seq = self.lsp_hover.seq.wrapping_add(1);
+                        self.lsp_hover.loading = None;
+                        self.lsp_hover.loading_bounds = None;
                         self.lsp.cancel_hover();
                     } else {
                         self.close_lsp_hover();
@@ -399,10 +426,12 @@ impl TakoApp {
                 if self.lsp_hover.target.as_ref() == Some(&target) {
                     return;
                 }
-                // 別の語へ移った: 前の語のカードと待ちを捨ててから、この語をデバウンスへ積む
+                // 別の語へ移った: 前の語のカード・「読み込み中」と待ちを捨ててから、この語をデバウンスへ積む
                 if self.mouse_hover_card_open() {
                     self.close_lsp_hover();
                 }
+                self.lsp_hover.loading = None;
+                self.lsp_hover.loading_bounds = None;
                 self.lsp.cancel_hover();
                 self.lsp_hover.target = Some(target.clone());
                 self.schedule_lsp_hover(target, column, cx);
@@ -450,6 +479,10 @@ impl TakoApp {
             return;
         };
         let version = self.hover_version(target.pane);
+        // #1893: サーバが起動中 / 読み込み中なら、答え（manager が読み込みを待って問い直す）が届くまで
+        // 語の真下に「読み込み中」を出す。A/B の旧腕（`TAKO_1893_LEGACY=1`）は出さない（待たない）
+        let loading = !tako_control::lsp::hover::legacy_1893() && self.lsp.server_loading(&path);
+        self.lsp_hover.loading = loading.then_some((seq, version));
         let request = HoverRequest {
             path,
             line: target.line,
@@ -461,6 +494,9 @@ impl TakoApp {
             superseding: true,
             // 開いていない文書でサーバを起こさない（すれ違いで閉じたら NotOpen で返る）
             open: false,
+            // 取り消しの番号はここ（UI スレッド）で先に取る = この後に語から外れた取り消しを
+            // 背景が追い越さない（追い越すと読み込みが済むまで待ち続ける。#1893）
+            ticket: self.lsp.reserve_hover(),
         };
         self.lsp_hover.inflight += 1;
         let manager = self.lsp.clone();
@@ -486,6 +522,12 @@ impl TakoApp {
         outcome: Result<HoverAnswer, HoverError>,
         cx: &mut Context<Self>,
     ) {
+        // 「読み込み中」はこの問い合わせの答え（カード・何も無い・失敗のどれでも）が届いたら下ろす
+        if self.lsp_hover.loading.is_some_and(|(s, _)| s == seq) {
+            self.lsp_hover.loading = None;
+            self.lsp_hover.loading_bounds = None;
+            cx.notify();
+        }
         if seq != self.lsp_hover.seq
             || self.lsp_hover.target.as_ref() != Some(&target)
             || self.hover_version(target.pane) != version
@@ -551,7 +593,9 @@ impl TakoApp {
             }
             _ => range,
         };
-        let blocks = hover_blocks(content);
+        // カードはいつも既定の上限まで（CLI / MCP の `limit` = 全文はカードに効かない。#1893）
+        let content = content.limited(Some(MAX_CHARS));
+        let blocks = hover_blocks(&content);
         let links = crate::md_document_links(&blocks);
         self.lsp_hover.generation = self.lsp_hover.generation.wrapping_add(1);
         self.lsp_hover.bounds = None;
@@ -578,6 +622,8 @@ impl TakoApp {
         ui.card = None;
         ui.bounds = None;
         ui.layouts.clear();
+        ui.loading = None;
+        ui.loading_bounds = None;
         ui.target = None;
         ui.seq = ui.seq.wrapping_add(1);
         self.lsp.cancel_hover();
@@ -601,6 +647,14 @@ impl TakoApp {
     /// （マウスで出したカードは本文が変われば閉じる = 描く直前の照合）。**カードがフォーカス中の
     /// ペインの上にあるときだけ**見る（別のペインのカードのために端末の Esc = vim 等を奪わない）
     pub(crate) fn route_lsp_hover_key(&mut self, pane: PaneId, keystroke: &Keystroke) -> bool {
+        // 「読み込み中」の 1 行も Esc で閉じる（待っている問い合わせも捨てる。#1893）
+        if self.hover_loading_target().is_some_and(|t| t.pane == pane)
+            && keystroke.key == "escape"
+            && keystroke.modifiers == gpui::Modifiers::default()
+        {
+            self.close_lsp_hover();
+            return true;
+        }
         let Some(card) = self.lsp_hover.card.as_ref().filter(|c| c.pane == pane) else {
             return false;
         };
@@ -618,9 +672,10 @@ impl TakoApp {
         false
     }
 
-    /// 編集メニュー / パレットの「ホバー情報を表示」: フォーカス中のコードの編集カーソル
-    /// （編集していなければ選択の先頭）の位置で問い合わせ、カードを出す。**CLI `tako lsp hover
-    /// --show` / MCP と同じ dispatch の 3 段を通す**（明示の問い合わせ = 開いていなければ一時的に開く）
+    /// 編集メニュー / パレット / キー（⇧⌘H・Ctrl+Shift+H。#1893）の「ホバー情報を表示」: フォーカス中の
+    /// コードの編集カーソル（編集していなければ選択の先頭）の位置で問い合わせ、カードを出す。
+    /// 問い合わせは [`Self::request_lsp_hover`]（右クリックメニューと同じ 1 本）。補完の一覧を出して
+    /// いれば閉じてから（同じ語の真下に重ねない。明示の操作が勝つ）
     pub(crate) fn show_hover_at_cursor(&mut self, cx: &mut Context<Self>) {
         if tako_control::lsp::hover::legacy() {
             return;
@@ -651,12 +706,29 @@ impl TakoApp {
             );
             return;
         };
+        if self.lsp_completion_open_in(pane) {
+            self.close_completion();
+        }
         let request = tako_control::protocol::Request::LspHover {
             pane: Some(pane.as_u64()),
             line: line + 1,
             column,
             show: Some(true),
+            limit: None,
         };
+        self.request_lsp_hover(pane, request, cx);
+    }
+
+    /// メニュー / キー / 右クリックメニューのホバーの問い合わせ（#1893 で 1 本へ）。**CLI `tako lsp hover
+    /// --show` / MCP と同じ dispatch の 3 段を通す**（明示の問い合わせ = 開いていなければ一時的に開き、
+    /// 読み込み中なら済むまで待つ）。待つあいだはヘッダに「問い合わせています」、見つかればカードが
+    /// 答え、何も無い・未導入… はヘッダに理由を出す
+    pub(crate) fn request_lsp_hover(
+        &mut self,
+        pane: PaneId,
+        request: tako_control::protocol::Request,
+        cx: &mut Context<Self>,
+    ) {
         let job = match tako_control::prepare_offload(self, &request) {
             Some(Ok(job)) => job,
             Some(Err(e)) => {
@@ -665,12 +737,18 @@ impl TakoApp {
             }
             None => return,
         };
+        self.lsp_hover.explicit_seq = self.lsp_hover.explicit_seq.wrapping_add(1);
+        let seq = self.lsp_hover.explicit_seq;
+        self.lsp_hover.pending = Some((pane, seq));
         let staged = cx
             .background_executor()
             .spawn(async move { job.run_staged() });
         cx.spawn(async move |this, cx| {
             let outcome = staged.await;
             let _ = this.update(cx, |app, cx| {
+                if app.lsp_hover.pending.is_some_and(|(_, s)| s == seq) {
+                    app.lsp_hover.pending = None;
+                }
                 let tako_control::OffloadOutcome::OnUi(next) = outcome else {
                     return;
                 };
@@ -691,6 +769,102 @@ impl TakoApp {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    /// ヘッダの「問い合わせています」（メニュー / キーで頼んだホバーの答えを待っているあいだ。#1893）。
+    /// サーバが読み込み中なら済んだら出すと言う（読み込みの待ちは manager が持つ）
+    pub(crate) fn lsp_hover_header_status(&self, pane: PaneId) -> Option<String> {
+        let (waiting, _) = self.lsp_hover.pending.filter(|(p, _)| *p == pane)?;
+        let loading = self
+            .previews
+            .get(&waiting)
+            .is_some_and(|p| self.lsp.server_loading(&p.path));
+        Some(if loading {
+            tako_control::lsp::text::HOVER_LOADING_NOTE
+                .text()
+                .to_string()
+        } else {
+            crate::ui_text::preview::hover_searching().to_string()
+        })
+    }
+
+    /// 「読み込み中」を出しているマウスの語（今の番号の問い合わせで、版も変わっていないときだけ。#1893）
+    fn hover_loading_target(&self) -> Option<&HoverTarget> {
+        let (seq, version) = self.lsp_hover.loading?;
+        let target = self.lsp_hover.target.as_ref()?;
+        (seq == self.lsp_hover.seq
+            && self.lsp_hover.card.is_none()
+            && self.hover_version(target.pane) == version)
+            .then_some(target)
+    }
+
+    /// 「読み込み中」の 1 行（#1893。補完の「読み込み中」= #1869 と同じ見た目と置き場 = 語の頭の真下、
+    /// 下に入らなければ真上）。外れていれば下ろして何も描かない。**押下は下の本文へ通す**（表示だけ）
+    fn render_lsp_hover_loading(&mut self, window: &gpui::Window) -> Option<AnyElement> {
+        let Some(target) = self.hover_loading_target().cloned() else {
+            if self.lsp_hover.loading.is_some() && self.lsp_hover.card.is_none() {
+                // 版が変わった（打った）・別の語の番号: 印だけ下ろす（待ちは語の移動 / 閉じるが捨てる）
+                self.lsp_hover.loading = None;
+            }
+            self.lsp_hover.loading_bounds = None;
+            return None;
+        };
+        if !self.lsp_hover_enabled_for(target.pane) {
+            self.lsp_hover.loading_bounds = None;
+            return None;
+        }
+        let layout = self
+            .preview_text_layouts
+            .get(&target.pane)?
+            .get(target.line)?
+            .as_ref()?;
+        let symbol = symbol_bounds(layout, &target.range)?;
+        let anchor = HoverAnchor {
+            left: f32::from(symbol.left()),
+            top: f32::from(symbol.top()),
+            bottom: f32::from(symbol.bottom()),
+        };
+        let viewport = window.viewport_size();
+        let placement = hover_card_placement(
+            anchor,
+            (HOVER_LOADING_WIDTH, HOVER_LOADING_HEIGHT),
+            (f32::from(viewport.width), f32::from(viewport.height)),
+        );
+        self.lsp_hover.loading_bounds = Some(Bounds {
+            origin: gpui::point(px(placement.left), px(placement.top)),
+            size: gpui::size(px(placement.width), px(placement.height)),
+        });
+        let theme = &self.theme;
+        Some(
+            div()
+                .id("lsp-hover-loading")
+                .absolute()
+                .left(px(placement.left))
+                .top(px(placement.top))
+                .w(px(placement.width))
+                .h(px(placement.height))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .bg(rgba(theme.surface_1))
+                .border_1()
+                .border_color(hsla(theme.border_default))
+                .rounded(px(6.0))
+                .shadow_lg()
+                .text_size(px(12.0))
+                .text_color(hsla(theme.text_secondary))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(SharedString::from(
+                            tako_control::lsp::text::HOVER_LOADING_NOTE.text(),
+                        )),
+                )
+                .into_any_element(),
+        )
     }
 
     /// カードがまだ今の画面に当たっているか（描く直前に見る。外れていれば閉じる）。
@@ -767,7 +941,10 @@ impl TakoApp {
                 self.close_lsp_hover();
             }
         }
-        let card = self.lsp_hover.card.as_ref()?;
+        // カードがまだ無ければ「読み込み中」の 1 行（#1893）
+        let Some(card) = self.lsp_hover.card.as_ref() else {
+            return self.render_lsp_hover_loading(window);
+        };
         let (generation, blocks, truncated) =
             (card.generation, Arc::clone(&card.blocks), card.truncated);
         let layout = self

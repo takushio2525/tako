@@ -2007,7 +2007,22 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   メニュー / CLI で出したカードはマウスの位置でもフォーカスでも閉じない（CLI の `--show` は
   フォーカスが端末のまま出す）。どちらもカードの外の押下（`on_mouse_down_out`。押下は止めない）・
   そのペインでの打鍵・Esc で閉じる。重ね順は補完の一覧が手前。右クリックメニュー（#1684）を開いているあいだは
-  出さない（カードはメニューより手前に積まれる = 出すと隠す）。メニューの項目にはホバーを載せない（`NOT_IN_MENU`）
+  出さない（カードはメニューより手前に積まれる = 出すと隠す）。メニューの項目のホバーは #1893 で足した（下）
+
+### ホバーの続き（#1893。2026-10-09）
+
+- **入口は 1 本**: 編集メニュー・パレット・キー（⇧⌘H / Ctrl+Shift+H = `keybindings::hover_bindings`）・
+  右クリックメニューの「ホバー情報を表示」（`MenuItem::Hover` → `item_request` = `LspHover { show: true }`）は
+  どれも `TakoApp::request_lsp_hover`（CLI / MCP と同じ dispatch の 3 段）を通る。待つあいだはヘッダに
+  「問い合わせています」（`lsp_hover_header_status`。定義ジャンプ・整形の `pending` と同じ欄）
+- **本文の上限は出口ごと**: manager の答えは全文（`parse_response` は切らない）。カードは
+  `open_lsp_hover_card` が `Hover::limited(Some(MAX_CHARS))`、CLI / MCP は `found_json` が `limit`
+  （`hover::char_limit` = 省略 16,000 / 0 = 全文 / N）。manager で切ると `--full` が全文を返せない（番犬）
+- **読み込み中のマウス**: マウスの要求も `wait_loaded` で待つ（#1869 の補完と同じ `abandoned` の組み立て）。
+  GUI は `fire_lsp_hover` で `server_loading` を見て `LspHoverUi::loading`（番号と版）を立て、語の真下に 1 行
+  （`render_lsp_hover_loading`。カードが無いときだけ描く・押下は通す）。答え・語の移動・閉じる・版の変化で下ろす。
+  取り消しの番号は `reserve_hover` で UI スレッドが先に取り、`HoverRequest::ticket` で背景へ渡す（背景で取ると
+  UI の取り消しを追い越して読み込みが済むまで待ち続ける）
 
 ### LSP の続き: 当て方の一本化と補完の読み込み中（#1869。2026-10-08）
 

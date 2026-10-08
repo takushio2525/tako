@@ -71,6 +71,18 @@ pub fn format_document(platform: Platform) -> &'static str {
     }
 }
 
+/// カーソル位置のホバー情報（型・doc のカード）を出す打鍵（FR-3.37 / #1893）。
+///
+/// macOS は `⇧⌘H`（整形の `⇧⌘I` と同じ段。VS Code / Zed の `⌘K ⌘I` は ⌘K = パレットと
+/// 衝突するので張れない）、Windows は `Ctrl+Shift+H`（`Ctrl+H` = Backspace と同じ C0 バイトへ
+/// 潰れるので端末の `Ctrl+H` は奪わない。理由の全文は tako-app の `keybindings::hover_bindings`）
+pub fn show_hover(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{21e7}\u{2318}H",
+        Platform::Windows => "Ctrl+Shift+H",
+    }
+}
+
 /// tako を終了する打鍵。
 pub fn quit(platform: Platform) -> &'static str {
     match platform {
