@@ -274,6 +274,8 @@ const COPY_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis
 /// 帯の「取り消し」の実矩形を行の矩形採取（`tree_row_probe`）へ載せるときの名前
 /// （実在のパスと取り違えない相対の名前。visual-test `tree-multiselect` が押す位置の正）
 pub(crate) const COPY_CANCEL_PROBE: &str = "<copy-cancel>";
+/// 帯の残り時間の目安の実矩形（#1895。出ているときだけ載る = visual-test `tree-keyboard-copy` が見る）
+pub(crate) const COPY_ETA_PROBE: &str = "<copy-eta>";
 
 /// いま見えているローカルの行の並び（⇧クリックの範囲・見えない行を外す基準。#1867）
 pub(crate) fn tree_visible_order(rows: &[filetree::Row]) -> Vec<std::path::PathBuf> {
@@ -2220,12 +2222,22 @@ impl TakoApp {
                 let rects = self.tree_menu_item_rects.clone();
                 // #1860: 貼るものが無ければ押せない見た目にする（押しても何も起きない）
                 let disabled = matches!(id, "clip-paste" | "clip-paste-move") && !can_paste;
-                let hint = tree_clip_menu_key(id).map(|key| {
-                    tako_core::platform::keys::tree_clip_hint(
-                        tako_core::platform::support::Platform::current(),
-                        key,
-                    )
-                });
+                let hint = tree_clip_menu_key(id)
+                    .map(|key| {
+                        tako_core::platform::keys::tree_clip_hint(
+                            tako_core::platform::support::Platform::current(),
+                            key,
+                        )
+                    })
+                    // #1895: ごみ箱の打鍵（⌘⌫ / Delete）。A/B では受けないので出さない
+                    .or_else(|| {
+                        (id == "trash" && !tako_core::file_copy::legacy_1895()).then(|| {
+                            tako_core::platform::keys::tree_trash_hint(
+                                tako_core::platform::support::Platform::current(),
+                            )
+                            .to_string()
+                        })
+                    });
                 div()
                     .id(("ctx-item", i as u64))
                     .relative()
@@ -2642,40 +2654,13 @@ impl TakoApp {
             }
             "trash" => {
                 // #1867: 選んだ行の上で開いたメニューのごみ箱は選んだもの全部（1 要求 = CLI
-                // `tako file trash a b` と同じ）
-                if self.keep_tree_selection_for(path) && self.tree_multi_selected() {
-                    let paths = self.tree_selection_paths();
-                    self.dispatch_tree_many(
-                        FileOpKind::Trash,
-                        paths,
-                        None,
-                        crate::ui_text::sidebar::menu_trash(fm),
-                        cx,
-                    );
-                    self.sync_filetree_roots();
-                    return;
-                }
-                // #1399: **削除を約束しているラベル**なので、失敗を無言にすると
-                // 「消えたのか押せていないのか」がユーザーに区別できない
-                let result = tako_control::dispatch(
-                    self,
-                    Request::FileOp {
-                        op: FileOpKind::Trash,
-                        path: path_str,
-                        name: None,
-                        pane: None,
-                        dest: None,
-                    },
-                    PaneOrigin::User,
-                );
-                if let Err(e) = result {
-                    self.notify_tree_dispatch_failed(
-                        crate::ui_text::sidebar::menu_trash(fm),
-                        Some(&target),
-                        &e,
-                    );
-                }
-                self.sync_filetree_roots();
+                // `tako file trash a b` と同じ）。#1895: ⌘⌫（Windows は Delete）と同じ口
+                let paths = if self.keep_tree_selection_for(path) && self.tree_multi_selected() {
+                    self.tree_selection_paths()
+                } else {
+                    vec![path.to_path_buf()]
+                };
+                self.trash_tree_paths(paths, cx);
             }
             "open-default" => {
                 let result = tako_control::dispatch(
@@ -3847,6 +3832,22 @@ impl TakoApp {
             cx.notify();
             return true;
         }
+        // #1895: ⇧↑ / ⇧↓ で範囲を伸ばす・⌘⌫（Windows は Delete）でごみ箱へ。A/B
+        // （`TAKO_1895_LEGACY=1`）では受けない = #1895 の前と同じくペインへ流れる
+        if let Some(key) = tako_core::platform::keys::tree_select_key(
+            tako_core::platform::support::Platform::current(),
+            &ks.key,
+            m.platform,
+            m.control,
+            m.alt,
+            m.shift,
+        ) {
+            if tako_core::file_copy::legacy_1895() {
+                return false;
+            }
+            self.tree_select_key_action(key, &sel, cx);
+            return true;
+        }
         let Some(key) = tako_core::platform::keys::tree_clip_key(
             tako_core::platform::support::Platform::current(),
             &ks.key,
@@ -4179,22 +4180,146 @@ impl TakoApp {
             .filter(|sel| !sel.remote)
             .map(TreeSelection::as_core);
         let next = tako_core::tree_select::apply(base.as_ref(), path, kind, &order);
-        self.tree_selection = next.map(|sel| {
-            let is_dir = rows
-                .iter()
-                .find(|r| r.remote.is_none() && r.entry.path == sel.lead)
-                .map_or_else(|| sel.lead.is_dir(), |r| r.entry.is_dir);
-            TreeSelection {
-                path: sel.lead.clone(),
-                is_dir,
-                root: self.filetree.roots().contains(&sel.lead),
-                remote: false,
-                tab: self.workspace.active_tab_id(),
-                pane: self.focused_pane(),
-                paths: sel.items,
-                anchor: sel.anchor,
+        self.tree_selection = next.map(|sel| self.tree_selection_of(sel, &rows));
+    }
+
+    /// core の選択を画面の選択へ（選んだ時点のタブとフォーカスペインを覚える）
+    fn tree_selection_of(
+        &self,
+        sel: tako_core::tree_select::Selection,
+        rows: &[filetree::Row],
+    ) -> TreeSelection {
+        let is_dir = rows
+            .iter()
+            .find(|r| r.remote.is_none() && r.entry.path == sel.lead)
+            .map_or_else(|| sel.lead.is_dir(), |r| r.entry.is_dir);
+        TreeSelection {
+            path: sel.lead.clone(),
+            is_dir,
+            root: self.filetree.roots().contains(&sel.lead),
+            remote: false,
+            tab: self.workspace.active_tab_id(),
+            pane: self.focused_pane(),
+            paths: sel.items,
+            anchor: sel.anchor,
+        }
+    }
+
+    // --- キーでの範囲選択・ごみ箱（FR-3.39 / #1895） ---------------------------------------
+
+    /// ⇧↑ / ⇧↓ / ⌘⌫（Windows は Delete）。選んでいる間だけ `handle_tree_clip_keystroke` から来る
+    pub(crate) fn tree_select_key_action(
+        &mut self,
+        key: tako_core::platform::keys::TreeSelectKey,
+        sel: &TreeSelection,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_core::platform::keys::TreeSelectKey;
+        // 右クリックメニューを開いたままキーで操作したときもメニューは畳む
+        self.context_menu = None;
+        let step = match key {
+            TreeSelectKey::ExtendUp => tako_core::tree_select::Step::Up,
+            TreeSelectKey::ExtendDown => tako_core::tree_select::Step::Down,
+            TreeSelectKey::Trash => {
+                self.trash_tree_selection(sel, cx);
+                cx.notify();
+                return;
             }
-        });
+        };
+        // リモート（SSH）の行は範囲の並び（ローカルの見えている行）に載らない = 伸ばさない
+        if !sel.remote {
+            let rows = self.filetree.rows();
+            let order = tree_visible_order(&rows);
+            // 状態遷移と範囲の正本は core（⇧クリックと同じ `apply` を 1 行上 / 下で呼ぶ）
+            let next = tako_core::tree_select::extend(&sel.as_core(), step, &order);
+            let lead = next.lead.clone();
+            self.tree_selection = Some(self.tree_selection_of(next, &rows));
+            // 伸ばした先の行を見えるところへ（ツリーの子 = 行の並びの添字）
+            if let Some(index) = rows
+                .iter()
+                .position(|r| r.remote.is_none() && r.entry.path == lead)
+            {
+                self.filetree_scroll_handle.scroll_to_item(index);
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⌘⌫（Windows は Delete）: 選んでいるもの（見えている行だけ）をごみ箱へ。リモートと
+    /// 見出しのフォルダは理由を出して断る（見出しは #1834 / #1860 と同じく画面からは動かさない =
+    /// 打ち間違いでワークスペースごとごみ箱へ入れない。CLI / MCP はパスを名指しするので断らない）
+    fn trash_tree_selection(&mut self, sel: &TreeSelection, cx: &mut Context<Self>) {
+        let fm = tako_control::platform::os_integration::file_manager();
+        let op = crate::ui_text::sidebar::menu_trash(fm);
+        let target = sel.path.display().to_string();
+        if sel.remote {
+            self.notify_tree_op_failed(
+                op,
+                Some(&target),
+                crate::ui_text::sidebar::trash_remote_refused(),
+            );
+            return;
+        }
+        let paths = if sel.is_multi() {
+            self.tree_selection_paths()
+        } else {
+            vec![sel.path.clone()]
+        };
+        let roots = self.filetree.roots();
+        if sel.root || paths.iter().any(|p| roots.contains(p)) {
+            self.notify_tree_op_failed(
+                op,
+                Some(&target),
+                crate::ui_text::sidebar::trash_root_refused(),
+            );
+            return;
+        }
+        self.trash_tree_paths(paths, cx);
+    }
+
+    /// ごみ箱へ（右クリックの「削除」と ⌘⌫ の共通の口）。1 件 = `FileOp`、複数 = `FileOpMany`
+    /// （CLI `tako file trash a` / `tako file trash a b` と同じ要求）。入れたら選択を外す
+    /// （無くなった行を ⌘C の対象に残さない）
+    pub(crate) fn trash_tree_paths(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_control::protocol::{FileOpKind, Request};
+        let fm = tako_control::platform::os_integration::file_manager();
+        let op = crate::ui_text::sidebar::menu_trash(fm);
+        if paths.len() > 1 {
+            self.dispatch_tree_many(FileOpKind::Trash, paths, None, op, cx);
+        } else if let Some(path) = paths.first() {
+            let target = path.display().to_string();
+            // #1399: **削除を約束しているラベル**なので、失敗を無言にすると
+            // 「消えたのか押せていないのか」がユーザーに区別できない
+            let result = tako_control::dispatch(
+                self,
+                Request::FileOp {
+                    op: FileOpKind::Trash,
+                    path: target.clone(),
+                    name: None,
+                    pane: None,
+                    dest: None,
+                },
+                PaneOrigin::User,
+            );
+            match result {
+                Ok(_) => {
+                    if self
+                        .tree_selection
+                        .as_ref()
+                        .is_some_and(|s| s.contains(path))
+                    {
+                        self.tree_selection = None;
+                    }
+                }
+                Err(e) => self.notify_tree_dispatch_failed(op, Some(&target), &e),
+            }
+        }
+        self.sync_filetree_roots();
+        cx.notify();
     }
 
     /// 複数の行を選ぶ（貼った・移したものを選び直す）。最後のものが宛先・最初が起点
@@ -4377,6 +4502,15 @@ impl TakoApp {
                     )
                 };
                 let ratio = copy_ratio(&snap);
+                // #1895: 残り時間の目安（出せないうちは出さない = `file_copy::eta` の 1 実装。
+                // CLI / MCP の `copy_progress` の `eta_secs` と同じ値を丸めて書く）。上の行は
+                // 狭いと末尾が省略されるので、棒の行の右端に置く
+                let eta = tako_core::file_copy::eta(&snap)
+                    .filter(|_| !tako_core::file_copy::legacy_1895())
+                    .map(|left| {
+                        crate::ui_text::sidebar::copy_eta(tako_core::file_copy::eta_label(left))
+                    });
+                let eta_probe = probe.clone().filter(|_| eta.is_some());
                 let id = ticket.id;
                 div()
                     .id(("copy-progress", id))
@@ -4446,21 +4580,61 @@ impl TakoApp {
                                 )
                             }),
                     )
-                    // 進み具合の棒（数えている間は出さない = 母数が決まっていない）
+                    // 進み具合の棒（数えている間は出さない = 母数が決まっていない）と、右端に
+                    // 残り時間の目安（#1895）。行の高さは棒が出た時点で決める（目安が後から
+                    // 出てもツリーの行を動かさない）
                     .when_some(ratio, |d, ratio| {
                         d.child(
                             div()
-                                .h(px(3.0))
-                                .w_full()
-                                .rounded_sm()
-                                .bg(hsla_alpha(theme.pane_border, 0.5))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .h(px(14.0))
                                 .child(
                                     div()
-                                        .h_full()
+                                        .flex_1()
+                                        .h(px(3.0))
                                         .rounded_sm()
-                                        .bg(hsla(theme.accent))
-                                        .w(relative(ratio)),
-                                ),
+                                        .bg(hsla_alpha(theme.pane_border, 0.5))
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .rounded_sm()
+                                                .bg(hsla(theme.accent))
+                                                .w(relative(ratio)),
+                                        ),
+                                )
+                                .when_some(eta, |d, eta| {
+                                    d.child(
+                                        div()
+                                            .flex_none()
+                                            .relative()
+                                            .whitespace_nowrap()
+                                            .text_color(hsla(theme.text_muted))
+                                            .child(SharedString::from(eta))
+                                            // 何も描かない矩形採取（`tree_row_probe` のときだけ）
+                                            .when_some(eta_probe, |d, rects| {
+                                                d.child(
+                                                    canvas(
+                                                        move |bounds, _, _| {
+                                                            rects.borrow_mut().push((
+                                                                std::path::PathBuf::from(
+                                                                    COPY_ETA_PROBE,
+                                                                ),
+                                                                bounds,
+                                                            ))
+                                                        },
+                                                        |_, _, _, _| (),
+                                                    )
+                                                    .absolute()
+                                                    .top_0()
+                                                    .left_0()
+                                                    .size_full(),
+                                                )
+                                            }),
+                                    )
+                                }),
                         )
                     })
                     .into_any_element()

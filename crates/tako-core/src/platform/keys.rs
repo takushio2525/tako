@@ -217,6 +217,57 @@ pub fn tree_clip_key(
     }
 }
 
+/// ファイルツリーで選んでいる間のキー（コピー / 切り取り / 貼り付け以外。Issue #1895）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeSelectKey {
+    /// ⇧↑: 範囲を 1 行上へ伸ばす / 縮める
+    ExtendUp,
+    /// ⇧↓: 範囲を 1 行下へ伸ばす / 縮める
+    ExtendDown,
+    /// 選んだものをごみ箱へ（macOS = ⌘⌫ / Windows = Delete。Finder / エクスプローラーと同じ）
+    Trash,
+}
+
+/// 打鍵がファイルツリーの範囲選択・ごみ箱か（Issue #1895）。**ツリーの行を選んでいるときだけ**
+/// 呼ぶこと（[`tree_clip_key`] と同じ。選んでいなければ ⇧↑ / Delete は端末へ流す）。
+///
+/// - ⇧↑ / ⇧↓: shift だけ（主修飾・alt・もう片方が混ざると当たらない = ⌘⇧↑ 等の別の割り当てを奪わない）
+/// - ごみ箱: macOS は ⌘⌫ だけ（⌫ 単独は奪わない）/ Windows は修飾無しの Delete だけ
+///   （Shift+Delete = エクスプローラーの「完全に削除」は扱わない = 端末へ流す）
+pub fn tree_select_key(
+    platform: Platform,
+    key: &str,
+    platform_key: bool,
+    control: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<TreeSelectKey> {
+    let none_but_shift = shift && !platform_key && !control && !alt;
+    match key {
+        "up" if none_but_shift => Some(TreeSelectKey::ExtendUp),
+        "down" if none_but_shift => Some(TreeSelectKey::ExtendDown),
+        "backspace"
+            if platform == Platform::MacOs && platform_key && !control && !alt && !shift =>
+        {
+            Some(TreeSelectKey::Trash)
+        }
+        "delete"
+            if platform == Platform::Windows && !platform_key && !control && !alt && !shift =>
+        {
+            Some(TreeSelectKey::Trash)
+        }
+        _ => None,
+    }
+}
+
+/// ごみ箱の打鍵表記（右クリックメニューの「削除」の右端。macOS = `⌘⌫` / Windows = `Delete`）
+pub fn tree_trash_hint(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{2318}\u{232B}",
+        Platform::Windows => "Delete",
+    }
+}
+
 /// ファイルツリーのコピー / 切り取り / 貼り付けの打鍵表記（右クリックメニューの右端。
 /// macOS = `⌘C` / Windows = `Ctrl+C`）
 pub fn tree_clip_hint(platform: Platform, key: TreeClipKey) -> String {
@@ -242,6 +293,36 @@ pub struct ModifierLabel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ツリーの範囲選択とごみ箱の打鍵はosの作法どおりに当たる() {
+        use TreeSelectKey::*;
+        let mac = |key, p, c, a, s| tree_select_key(Platform::MacOs, key, p, c, a, s);
+        let win = |key, p, c, a, s| tree_select_key(Platform::Windows, key, p, c, a, s);
+        for f in [mac, win] {
+            assert_eq!(f("up", false, false, false, true), Some(ExtendUp));
+            assert_eq!(f("down", false, false, false, true), Some(ExtendDown));
+            // 素の矢印・⌘⇧↑・⌥⇧↓・⌃⇧↑ は奪わない
+            assert_eq!(f("up", false, false, false, false), None);
+            assert_eq!(f("up", true, false, false, true), None);
+            assert_eq!(f("down", false, false, true, true), None);
+            assert_eq!(f("up", false, true, false, true), None);
+        }
+        // macOS は ⌘⌫ だけ（⌫ 単独・⌥⌫・⌘⇧⌫・Delete は奪わない）
+        assert_eq!(mac("backspace", true, false, false, false), Some(Trash));
+        assert_eq!(mac("backspace", false, false, false, false), None);
+        assert_eq!(mac("backspace", false, false, true, false), None);
+        assert_eq!(mac("backspace", true, false, false, true), None);
+        assert_eq!(mac("delete", false, false, false, false), None);
+        // Windows は修飾無しの Delete だけ（Shift+Delete = 完全に削除・Ctrl+Backspace は奪わない）
+        assert_eq!(win("delete", false, false, false, false), Some(Trash));
+        assert_eq!(win("delete", false, false, false, true), None);
+        assert_eq!(win("delete", false, true, false, false), None);
+        assert_eq!(win("backspace", false, true, false, false), None);
+        assert_eq!(win("backspace", true, false, false, false), None);
+        assert_eq!(tree_trash_hint(Platform::MacOs), "\u{2318}\u{232B}");
+        assert_eq!(tree_trash_hint(Platform::Windows), "Delete");
+    }
 
     #[test]
     fn ツリーのクリップボードの打鍵は主修飾だけで当たる() {

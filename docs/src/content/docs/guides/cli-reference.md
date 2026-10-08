@@ -699,14 +699,14 @@ tako file open-terminal ~/Documents/webapp  # ペイン内で cd
 tako file rename old.txt new.txt
 tako file move notes.md docs          # 別のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る）
 tako file move a.md b.md docs         # まとめて移す（最後が移動先。1 件でも断られたら終了コード 1）
-tako file copy notes.md src docs      # 複製（最後が貼り付け先。同名は「名前 のコピー」等の別名で置き上書きしない）
+tako file copy notes.md src docs      # 複製（最後が貼り付け先。同名は「名前 のコピー」等の別名で置き上書きしない。複数でも 1 つのコピー）
 tako file clipboard copy notes.md     # ツリーのコピーと同じ（Finder / エクスプローラーへも貼れる）
 tako file clipboard cut notes.md      # 切り取り（貼ると移動）
 tako file paste docs                  # 貼り付け（フォルダならその中・ファイルならそのフォルダ。省略時はカレントディレクトリ）
 tako file clipboard                   # 中身と、ここへ貼ったときの貼り付け先を表示
 tako file clipboard copy a.md b.md    # まとめてコピー（ツリーの複数選択と同じ）
 tako file paste --move docs           # 移動として貼る（ツリーの ⌥⌘V。コピーしたものも移す）
-tako file progress                    # 走っているコピーの進み具合（id・件数・バイト）
+tako file progress                    # 走っているコピーの進み具合（id・件数・バイト・残り時間の目安 eta_secs）
 tako file cancel 3                    # id 3 のコピーを取り消す（省略で全部。作りかけは消す）
 tako file create src helper.ts         # path 配下に name で作成
 tako file mkdir src components

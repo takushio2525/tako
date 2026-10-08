@@ -28737,6 +28737,11 @@ mod self_test {
     mod tree_multiselect;
     #[cfg(feature = "visual-test")]
     use tree_multiselect::tree_multiselect_visual;
+    /// #1895: ⇧↑ / ⇧↓・⌘⌫・1 つのファイルの途中の進み具合・残り時間（visual-test `tree-keyboard-copy`）
+    #[cfg(feature = "visual-test")]
+    mod tree_keyboard_copy;
+    #[cfg(feature = "visual-test")]
+    use tree_keyboard_copy::tree_keyboard_copy_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -43073,6 +43078,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1895: ⇧↑ / ⇧↓・⌘⌫・1 つのファイルの途中の進み具合と取り消し・残り時間
+                "tree-keyboard-copy" => {
+                    tree_keyboard_copy_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -43083,7 +43094,7 @@ mod self_test {
                          tasks-accordion / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / tree-multiselect / completion / completion-real / lsp-context-menu / \
+                         tree-clipboard / tree-multiselect / tree-keyboard-copy / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore）"
                     );
                     std::process::exit(1);
@@ -45474,6 +45485,7 @@ mod self_test {
             tree_move_visual(any, window, cx).await;
             tree_clipboard_visual(any, window, cx).await;
             tree_multiselect_visual(any, window, cx).await;
+            tree_keyboard_copy_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）

@@ -1914,26 +1914,57 @@ pub enum OffloadJob {
     FileCopy(Box<FileCopyJob>),
 }
 
-/// コピーのジョブ（`op=copy` は 1 件、`op=paste` はクリップボードの数だけ。#1860）
+/// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
+/// #1860 / #1895）。何件でも**札は 1 枚 = 1 つのジョブ**（進み具合も取り消しも 1 つ）
 pub struct FileCopyJob {
     /// （写すもの, 貼り付け先のフォルダ）
     items: Vec<(PathBuf, PathBuf)>,
     naming: tako_core::file_copy::CopyNaming,
-    /// 貼り付けなら段取り（応答の形が変わる）
-    paste: Option<PastePlan>,
+    /// 応答の形（1 件 / まとめた / 貼り付け）
+    reply: CopyReply,
     /// 走っているコピーの一覧に載せた札（#1867。進み具合と取り消しの印。ジョブを落とすと外れる）
     ticket: tako_core::file_copy::TicketGuard<'static>,
 }
 
+/// コピーの応答の形
+enum CopyReply {
+    /// `op=copy` の 1 件（`copied` / `from` / `to` …）
+    One,
+    /// `paths` のまとめた `op=copy`（#1895。`done` / `failed` / `skipped` = ほかのまとめた操作と同じ）
+    Many { skipped: Vec<PathBuf> },
+    /// `op=paste`（`mode` / `source` / `pasted` / `failed`）
+    Paste(Box<PastePlan>),
+}
+
 impl FileCopyJob {
-    fn new(items: Vec<(PathBuf, PathBuf)>, paste: Option<PastePlan>) -> Self {
+    fn new(items: Vec<(PathBuf, PathBuf)>, reply: CopyReply) -> Self {
         let ticket = copy_ticket(&items);
         Self {
             items,
             naming: tako_core::file_copy::CopyNaming::current(),
-            paste,
+            reply,
             ticket,
         }
+    }
+
+    /// `paths` のまとめた `op=copy`（#1895）。配下を重ねたものは親と一緒に写す（`skipped`）。
+    /// 全部を 1 つのジョブにする（CLI `tako file copy a b dst` = MCP `paths` = 1 要求・1 ジョブ）
+    fn many(paths: &[String], dest: Option<&str>) -> Result<Self, DispatchError> {
+        if paths.is_empty() {
+            return Err(DispatchError::InvalidParams(
+                "paths を 1 つ以上指定する".into(),
+            ));
+        }
+        let dest = dest.ok_or(DispatchError::InvalidParams(
+            "dest（貼り付け先のフォルダ）を指定する".into(),
+        ))?;
+        let sources: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let (roots, skipped) = tako_core::tree_select::distinct_roots(&sources);
+        let items = roots
+            .into_iter()
+            .map(|src| (src, PathBuf::from(dest)))
+            .collect();
+        Ok(Self::new(items, CopyReply::Many { skipped }))
     }
 }
 
@@ -1979,9 +2010,12 @@ pub fn finish_offload(
         OffloadContinuation::LspFormat(landing) => lsp_format_land(host, &landing),
         OffloadContinuation::FileCopied(landing) => {
             let FileCopyLanding { job, outcomes } = *landing;
-            match &job.paste {
-                Some(plan) => finish_paste_copies(host, plan, outcomes),
-                None => {
+            match &job.reply {
+                CopyReply::Paste(plan) => finish_paste_copies(host, plan, outcomes),
+                CopyReply::Many { skipped } => {
+                    finish_many_copies(host, &job.items, skipped, outcomes)
+                }
+                CopyReply::One => {
                     let (src, dest) = job.items.into_iter().next().unwrap_or_default();
                     let outcome = outcomes.into_iter().next().unwrap_or_else(|| {
                         Err(tako_core::file_copy::CopyRefusal::Io(
@@ -2053,7 +2087,7 @@ pub fn prepare_offload(
         } => Some(match dest {
             Some(dest) => Ok(OffloadJob::FileCopy(Box::new(FileCopyJob::new(
                 vec![(PathBuf::from(path), PathBuf::from(dest))],
-                None,
+                CopyReply::One,
             )))),
             None => Err(DispatchError::InvalidParams(
                 "dest（貼り付け先のフォルダ）を指定する".into(),
@@ -2065,11 +2099,24 @@ pub fn prepare_offload(
             ..
         } => match paste_plan(host, Path::new(path)) {
             Err(e) => Some(Err(e)),
-            Ok(plan) if plan.clip.mode == tako_core::file_clipboard::ClipMode::Copy => Some(Ok(
-                OffloadJob::FileCopy(Box::new(FileCopyJob::new(plan.items.clone(), Some(plan)))),
-            )),
+            Ok(plan) if plan.clip.mode == tako_core::file_clipboard::ClipMode::Copy => {
+                Some(Ok(OffloadJob::FileCopy(Box::new(FileCopyJob::new(
+                    plan.items.clone(),
+                    CopyReply::Paste(Box::new(plan)),
+                )))))
+            }
             Ok(_) => None,
         },
+        // #1895: まとめたコピー（CLI `tako file copy a b dst` / MCP `paths`）も 1 つのジョブとして
+        // background で写す（札は 1 枚 = 進み具合も取り消しも 1 つ）
+        Request::FileOpMany {
+            op: FileOpKind::Copy,
+            paths,
+            dest,
+        } => Some(
+            FileCopyJob::many(paths, dest.as_deref())
+                .map(|job| OffloadJob::FileCopy(Box::new(job))),
+        ),
         Request::GitLog { pane, max_count } => {
             Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {
                 cwd,
@@ -16215,7 +16262,7 @@ fn copy_progress_json() -> Value {
         .iter()
         .map(|ticket| {
             let s = ticket.progress.snapshot();
-            json!({
+            let mut copy = json!({
                 "id": ticket.id,
                 "paths": ticket.sources.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "dest": ticket.dest.display().to_string(),
@@ -16225,7 +16272,15 @@ fn copy_progress_json() -> Value {
                 "bytes_total": s.bytes_total,
                 "counting": s.counting,
                 "cancelled": s.cancelled,
-            })
+            });
+            // #1895: 残り時間の目安（秒・切り上げ）。出せないうち（始めの数秒・1% 未満・
+            // 数えている・バイトが無い）は null。GUI の帯も同じ `file_copy::eta` を読む。
+            // A/B（`TAKO_1895_LEGACY=1`）では載せない（#1895 の前の形）
+            if !tako_core::file_copy::legacy_1895() {
+                copy["eta_secs"] =
+                    json!(tako_core::file_copy::eta(&s).map(|d| d.as_secs_f64().ceil() as u64));
+            }
+            copy
         })
         .collect();
     json!({ "copies": copies })
@@ -16296,16 +16351,32 @@ fn file_op_many(
                 .map(|path| (path.clone(), run_file_move(host, path, Path::new(dest))))
                 .collect()
         }
+        // #1895: ここは同期の経路（`TAKO_OFFLOAD=0`・テスト・直呼び）。IPC は `prepare_offload` が
+        // 同じ `FileCopyJob::many` を background で回す。何件でも 1 つのジョブ
+        FileOpKind::Copy => {
+            let job = FileCopyJob::many(paths, dest)?;
+            let outcomes = run_copy_items(&job.items, job.naming, job.ticket.progress());
+            return finish_many_copies(host, &job.items, &skipped, outcomes);
+        }
         other => {
+            let name = serde_json::to_value(other)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
             return Err(DispatchError::InvalidParams(format!(
-                "paths で扱えるのは clipboard_copy / clipboard_cut / trash / move だけ（{}）",
-                serde_json::to_value(other)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default()
-            )))
+                "paths で扱えるのは clipboard_copy / clipboard_cut / trash / move / copy（{name}）"
+            )));
         }
     };
+    many_reply(results, &skipped)
+}
+
+/// まとめた操作の応答（`done` = 1 件ずつの単数の応答 / `failed` = `path` + `reason` /
+/// `skipped` = 配下を重ねたもの。あるときだけ）。全部断られたらエラー（理由を並べる）
+fn many_reply(
+    results: Vec<(PathBuf, Result<Value, DispatchError>)>,
+    skipped: &[PathBuf],
+) -> Result<Value, DispatchError> {
     let mut done = Vec::new();
     let mut failed = Vec::new();
     for (path, result) in results {
@@ -16521,6 +16592,22 @@ fn paste_reply(
             "reason": reason,
         })).collect::<Vec<_>>(),
     }))
+}
+
+/// まとめたコピーの後始末と応答（UI スレッド。#1895）。1 件ずつは `op=copy` と同じ後始末・応答
+/// （[`finish_file_copy`]）で、形はほかのまとめた操作と同じ（[`many_reply`]）
+fn finish_many_copies(
+    host: &mut dyn ControlHost,
+    items: &[(PathBuf, PathBuf)],
+    skipped: &[PathBuf],
+    outcomes: Vec<Result<CopyDone, tako_core::file_copy::CopyRefusal>>,
+) -> Result<Value, DispatchError> {
+    let results = items
+        .iter()
+        .zip(outcomes)
+        .map(|((src, dir), outcome)| (src.clone(), finish_file_copy(host, src, dir, outcome)))
+        .collect();
+    many_reply(results, skipped)
 }
 
 /// コピーを貼った後始末と応答（UI スレッド。#1860）。写せたものはツリーへ知らせる
@@ -38372,8 +38459,9 @@ mod tests {
             json!([dir.join("dst/folder/inner").display().to_string()])
         );
         assert!(dir.join("other/folder/inner/x.txt").is_file());
+        // まとめて扱えない op（#1895 で copy は扱えるようになった）・空の paths
         for (op, paths) in [
-            (FileOpKind::Copy, vec![dir.join("src/b.txt")]),
+            (FileOpKind::Rename, vec![dir.join("src/b.txt")]),
             (FileOpKind::Move, Vec::new()),
         ] {
             let err = dispatch(
@@ -38560,6 +38648,222 @@ mod tests {
             "folder / inner / x.txt / f0..f3"
         );
         assert_eq!(done["bytes"].as_u64(), Some(2 + 20));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- #1895: まとめたコピーを 1 つのジョブへ・残り時間の目安 ---------------------------------
+
+    /// #1895: `paths` のまとめたコピーは**札 1 枚 = 1 つのジョブ**で写し（進み具合の一覧に 1 つだけ
+    /// 載る・`paths` に全部）、配下を重ねたものは親と一緒に写して `skipped` に載せる。応答は
+    /// ほかのまとめた操作と同じ `done` / `failed` / `skipped`（offload の 3 段）
+    #[test]
+    fn issue1895_まとめたコピーは1つのジョブで配下は親と一緒に写す() {
+        let dir = issue1860_scratch("1895-many");
+        std::fs::write(dir.join("src/b.txt"), "bee\n").unwrap();
+        let mut host = MockHost::new();
+        let request = issue1867_many(
+            FileOpKind::Copy,
+            &[
+                dir.join("src/a.txt"),
+                dir.join("src/b.txt"),
+                dir.join("folder"),
+                dir.join("folder/inner/x.txt"),
+            ],
+            Some(&dir.join("dst")),
+        );
+        let Some(Ok(job)) = prepare_offload(&mut host, &request) else {
+            panic!("まとめたコピーが offload されない");
+        };
+        let OffloadJob::FileCopy(copy) = &job else {
+            panic!("FileCopy ではない");
+        };
+        let id = copy.ticket.ticket().id;
+        let progress = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::CopyProgress, std::path::Path::new(""), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let mine: Vec<&Value> = progress["copies"]
+            .as_array()
+            .map(|c| c.iter().filter(|c| c["id"].as_u64() == Some(id)).collect())
+            .unwrap_or_default();
+        assert_eq!(mine.len(), 1, "1 つのジョブとして載る: {progress}");
+        assert_eq!(
+            mine[0]["paths"],
+            json!([
+                dir.join("src/a.txt").display().to_string(),
+                dir.join("src/b.txt").display().to_string(),
+                dir.join("folder").display().to_string(),
+            ]),
+            "ジョブの paths に全部（配下は親と一緒）"
+        );
+        assert_eq!(
+            mine[0]["eta_secs"],
+            Value::Null,
+            "写し始める前は残り時間を出さない"
+        );
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("コピーの続きが UI スレッドへ戻らない");
+        };
+        let done = finish_offload(&mut host, next, PaneOrigin::Cli).unwrap();
+        assert_eq!(done["done"].as_array().map(Vec::len), Some(3), "{done}");
+        assert_eq!(done["failed"], json!([]));
+        assert_eq!(
+            done["skipped"],
+            json!([dir.join("folder/inner/x.txt").display().to_string()])
+        );
+        assert_eq!(done["done"][0]["copied"].as_bool(), Some(true));
+        // 置いた先は貼り付け先 + 名前（Windows は区切りが `\` なので join を重ねて比べる）
+        assert_eq!(
+            done["done"][1]["to"].as_str(),
+            Some(dir.join("dst").join("b.txt").display().to_string().as_str())
+        );
+        assert!(dir.join("dst/a.txt").is_file() && dir.join("dst/b.txt").is_file());
+        assert!(dir.join("dst/folder/inner/x.txt").is_file());
+        assert!(!dir.join("dst/x.txt").exists(), "配下を 2 回写さない");
+        assert_eq!(host.file_copies.len(), 3, "写したものはツリーへ知らせる");
+        // 札は落ちた = 一覧から外れる
+        let after = dispatch(
+            &mut host,
+            issue1860_op(FileOpKind::CopyProgress, std::path::Path::new(""), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(
+            !after["copies"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c["id"].as_u64() == Some(id))),
+            "{after}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1895: 同期の経路（`TAKO_OFFLOAD=0`・直呼び）も同じ応答の形。一部断られたら写せたものは
+    /// 写して `failed` に理由、全部断られたらエラー。`dest` が無い・空の `paths` は引数の誤り
+    #[test]
+    fn issue1895_まとめたコピーは同期でも同じ形で一部だけ断る() {
+        let dir = issue1860_scratch("1895-sync");
+        let mut host = MockHost::new();
+        let partial = dispatch(
+            &mut host,
+            issue1867_many(
+                FileOpKind::Copy,
+                &[dir.join("src/a.txt"), dir.join("src/nope")],
+                Some(&dir.join("dst")),
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            partial["done"].as_array().map(Vec::len),
+            Some(1),
+            "{partial}"
+        );
+        assert_eq!(
+            partial["failed"][0]["path"].as_str(),
+            Some(dir.join("src/nope").display().to_string().as_str())
+        );
+        assert!(
+            partial["failed"][0]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("コピーできない")),
+            "{partial}"
+        );
+        assert!(
+            partial.get("skipped").is_none(),
+            "重ねていなければ skipped は無い"
+        );
+        // 同じ場所へもう一度 = 上書きせず別名
+        let again = dispatch(
+            &mut host,
+            issue1867_many(
+                FileOpKind::Copy,
+                &[dir.join("src/a.txt")],
+                Some(&dir.join("dst")),
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(again["done"][0]["renamed"].as_bool(), Some(true), "{again}");
+        let all = dispatch(
+            &mut host,
+            issue1867_many(
+                FileOpKind::Copy,
+                &[dir.join("nope-1"), dir.join("nope-2")],
+                Some(&dir.join("dst")),
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(all.contains("2 件すべて"), "{all}");
+        for request in [
+            issue1867_many(FileOpKind::Copy, &[dir.join("src/a.txt")], None),
+            issue1867_many(FileOpKind::Copy, &[], Some(&dir.join("dst"))),
+        ] {
+            let err = dispatch(&mut host, request.clone(), PaneOrigin::Cli).unwrap_err();
+            assert!(matches!(err, DispatchError::InvalidParams(_)), "{err}");
+            let Some(Err(err)) = prepare_offload(&mut host, &request) else {
+                panic!("offload の入口でも引数の誤りを返す");
+            };
+            assert!(matches!(err, DispatchError::InvalidParams(_)), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1895: まとめたコピーを番号で取り消すと、写している 1 件の作りかけを消して残りを始めない
+    /// （1 つのジョブなので 1 回の取り消しで全部が止まる）
+    #[test]
+    fn issue1895_まとめたコピーは1回の取り消しで全部止まる() {
+        let dir = issue1860_scratch("1895-cancel");
+        std::fs::write(dir.join("src/b.txt"), "bee\n").unwrap();
+        let mut host = MockHost::new();
+        let request = issue1867_many(
+            FileOpKind::Copy,
+            &[
+                dir.join("src/a.txt"),
+                dir.join("src/b.txt"),
+                dir.join("folder"),
+            ],
+            Some(&dir.join("dst")),
+        );
+        let Some(Ok(job)) = prepare_offload(&mut host, &request) else {
+            panic!("まとめたコピーが offload されない");
+        };
+        let OffloadJob::FileCopy(copy) = &job else {
+            panic!("FileCopy ではない");
+        };
+        let id = copy.ticket.ticket().id;
+        let cancelled = dispatch(
+            &mut host,
+            Request::FileOp {
+                op: FileOpKind::CopyCancel,
+                path: String::new(),
+                name: Some(id.to_string()),
+                pane: None,
+                dest: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(cancelled, json!({ "cancelled": [id] }));
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("コピーの続きが UI スレッドへ戻らない");
+        };
+        let err = finish_offload(&mut host, next, PaneOrigin::Cli)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("3 件すべて") && err.contains("取り消した"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join("dst")).unwrap().count(),
+            0,
+            "取り消したら何も残さない"
+        );
+        assert!(host.file_copies.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

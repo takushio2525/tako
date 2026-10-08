@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-02（#1661: Markdown を編集して抜けたら描画へ戻し、目次を作り直すようにした）
-- 表示をエディタの行へ落とす判定を `refresh_preview_from_editor` の 1 か所（`EditState::shows_editor_lines`）へ寄せ、抜けたら**本文から**描き直す（5,000 行以下はその場・超えたら background）。抜けた後の save / reload・競合中も描画のまま・見ていた節の見出しから描く。編集中も目次が使える（`source_line`。CLI / MCP は既存の preview-outline）。layout へは抜けた先のモード
-- 実測: `scripts/test-md-edit-resume-1661.sh` 49 PASS 0 FAIL / main（048a2d9）は 22 PASS 23 FAIL（① で code のまま・目次 ERR）・A/B `TAKO_1661_LEGACY=1` で ① と visual 節が名指しで FAILED・番犬への注入 8 通りすべて file:line で FAILED・workspace 6362 passed・カタログ +132 B（並置 #1872 / ⌘F の同型 #1873）
-
 ## 2026-10-02（#1864: set -e と EXIT trap を併用するスクリプトが bash 3.2 で途中の死を exit 0 に化けさせるのを塞いだ）
 - 条件は「set -e + EXIT trap + 展開エラー（set -u の未定義変数・`${x:?}`・不正な置換・readonly）」で、`/bin/sh` も同じ。番人の 1 実装 `scripts/lib/exit-guard.sh`（`tako_exit_trap` / `tako_exit 0`。印の無い 0 は 1）へ 11 本を寄せた（nightly-release.sh・release.sh --promote・promo 2・テスト 6・verify-setup-multiagent）。番犬 3 規則を `shell_scripts.rs` へ
 - 実測: 注入 A/B は修正前 rc=0 → 修正後 rc=1（nightly は Test 18 で番人を素の trap に戻すと 0・本物で 1 + ログと通知）。nightly 139 / promote 125 / retry 55 緑
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1896: MCP ツールカタログの説明文を再び短くし、予算 200 KB に約 17 KB の余白を作った）
 - 160 本中 38 本の description / 引数説明を #1540 / #1711 の方針で短縮（大きい順に profiles -1,464 / spawn -775 / remote_folder -643 / open_file -640）。構造（名前・型・enum・必須・既定値）は不変、残っていた要件番号 FR-3.18 も外した。外した原文は `.agent/mcp-catalog-notes.md` の #1896 節。並走 PR の 5 本（file_op / lsp / mod / self / worker_status）は触らない
 - 実測: main（4bbbcc2）199,050 → 187,678 B（-11,372 B・残り 17,122 B。rebase 前に隔離 GUI + `tako mcp serve` の tools/list と `tako context-budget` の一致を確認）。description を落とした JSON が 160 本すべて一致
+
+## 2026-10-09（#1895: ファイルツリーの ⇧↑ / ⇧↓・⌘⌫、1 つのファイルの途中での取り消し、まとめたコピーを 1 つのジョブへ、帯の残り時間）
+- ⇧↑ / ⇧↓ = `tree_select::extend`（⇧クリックと同じ `apply`）・⌘⌫（Win は Delete）= 右クリックの「削除」と同じ `trash_tree_paths`（見出し・リモートは断る）。1 つのファイルは `fs_copy::copy_file_exclusive`（同じ APFS は clone・それ以外は fcopyfile / CopyFileExW の進み具合で 1 MiB ごとにバイトが進み途中で止めて作りかけを消す）。`tako file copy a b dst` / MCP `paths` の copy = `FileOpMany` の 1 ジョブ、`copy_progress` に `eta_secs`（2 秒・1% までは出さない）。カタログ +7 B
+- 実測: 製品の経路で 256 MiB の同じボリューム 61.8 → 22.6 ms（`create_new` の後の `std::fs::copy` で clone が外れていたのを直した）・別ボリューム 180.5 / 181.4 ms で差なし。`scripts/test-tree-keyboard-copy-1895.sh` 39 PASS 0 FAIL（A/B `TAKO_1895_LEGACY=1` で ① が名指しで FAILED）・番犬 13 本（注入 11 通りを file:line で名指し）

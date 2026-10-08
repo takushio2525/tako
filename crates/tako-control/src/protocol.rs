@@ -1029,7 +1029,8 @@ pub enum Request {
     },
     /// 複数のファイル・フォルダへまとめて同じ操作をする（ファイルツリーの複数選択。
     /// FR-3.38 / #1867）。`op` は `clipboard_copy` / `clipboard_cut` / `trash` / `move`
-    /// （`dest` 必須）だけ。フォルダとその配下を重ねて渡したら配下は親と一緒に扱う
+    /// （`dest` 必須）/ `copy`（`dest` 必須。何件でも 1 つのジョブ = 進み具合も取り消しも 1 つ。
+    /// FR-3.39 / #1895）だけ。フォルダとその配下を重ねて渡したら配下は親と一緒に扱う
     /// （`tako_core::tree_select::distinct_roots`）。MCP は `tako_file_op` の `paths`
     FileOpMany {
         op: FileOpKind,

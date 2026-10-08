@@ -19,7 +19,7 @@ const SECTION: &str = "tree-multiselect";
 
 /// 修飾つきの押下を**実 OS マウスと同じ `PlatformInput` 経路**で流す（#1860 の
 /// `vt1860_click` の修飾つき版。押下の捕捉フェーズ → 行の押下 → クリックの順に配送される）
-fn press(
+pub(super) fn press(
     any: AnyWindowHandle,
     window: WindowHandle<TakoApp>,
     cx: &mut AsyncApp,
@@ -608,7 +608,8 @@ pub(super) async fn tree_multiselect_visual(
         let (img, scale) = frame(cx);
         let band = Bounds::new(
             point(px(0.0), cancel_rect.top()),
-            size(cancel_rect.right(), cancel_rect.size.height + px(12.0)),
+            // #1895 で棒の行が残り時間の枠ぶん高くなった（棒はその行の縦の中央）
+            size(cancel_rect.right(), cancel_rect.size.height + px(24.0)),
         );
         let bar = count_in(&img, band, scale, theme.accent);
         println!(

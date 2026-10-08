@@ -53,6 +53,8 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | コマンドパレットを開く | <kbd>Cmd</kbd>+<kbd>K</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd> |
 | 設定画面を開く | <kbd>Cmd</kbd>+<kbd>,</kbd> | <kbd>Ctrl</kbd>+<kbd>,</kbd> |
 | ファイルツリー（左サイドバー）の表示 / 非表示 | <kbd>Cmd</kbd>+<kbd>B</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> |
+| ファイルツリーで選んでいる範囲を 1 行ずつ伸ばす / 縮める（行を選んでいる間） | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Shift</kbd>+<kbd>↓</kbd> | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Shift</kbd>+<kbd>↓</kbd> |
+| ファイルツリーで選んでいるものをゴミ箱へ（行を選んでいる間） | <kbd>Cmd</kbd>+<kbd>Delete</kbd> | <kbd>Delete</kbd> |
 
 :::tip[まずコマンドパレット]
 やりたいことの名前を覚えていなくても、コマンドパレットから探せます（macOS は <kbd>Cmd</kbd>+<kbd>K</kbd>、Windows は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>）。セットアップの実行や master の起動も、ここから直接行えます。分割・新しいタブ・サイドバー・設定など主な項目には、その環境で実際に効く打鍵が併記されます。

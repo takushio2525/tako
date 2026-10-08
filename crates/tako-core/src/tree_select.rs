@@ -8,6 +8,8 @@
 //! - ⌘クリック（Windows は Ctrl+クリック）= 足す / 外す（[`ClickKind::Toggle`]）
 //! - ⇧クリック = 起点からその行まで（[`ClickKind::Range`]。それまでの選択は捨てる）
 //! - ⌘⇧クリック = 起点からその行までを今の選択へ足す（[`ClickKind::RangeAdd`]）
+//! - ⇧↑ / ⇧↓ = 最後に押した行の 1 行上 / 下を ⇧クリックしたのと同じ（[`extend`]。#1895。
+//!   起点は動かないので、伸ばしてから逆へ打つと縮む = Finder / VS Code と同じ）
 //!
 //! まとめて扱う操作（コピー・切り取り・ごみ箱・移動）は、フォルダとその配下を同時に
 //! 選んでいたら配下を外して親だけを扱う（[`distinct_roots`]。VS Code の `distinctParents`
@@ -179,6 +181,33 @@ pub fn apply(
             ))
         }
     }
+}
+
+/// キーで範囲を伸ばす向き（⇧↑ / ⇧↓。#1895）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Up,
+    Down,
+}
+
+/// ⇧↑ / ⇧↓ の後の選択（#1895）。最後に押した行（`lead`）の 1 行上 / 下を ⇧クリックしたのと同じ
+/// = 起点（`anchor`）からその行までを選ぶ（起点は動かない）。
+///
+/// 先頭で ⇧↑・末尾で ⇧↓ は何も変えない（`prev` のまま）。最後に押した行が見えていなければ
+/// （畳んだフォルダの中・消えた行）どこから伸ばすか決まらないので何も変えない。畳んだフォルダは
+/// 1 行なので、範囲はその見出しだけを含む（中は見えていない = まとめた操作もフォルダごと）
+pub fn extend(prev: &Selection, step: Step, order: &[PathBuf]) -> Selection {
+    let Some(at) = order.iter().position(|p| *p == prev.lead) else {
+        return prev.clone();
+    };
+    let next = match step {
+        Step::Up => at.checked_sub(1),
+        Step::Down => Some(at + 1).filter(|i| *i < order.len()),
+    };
+    let Some(next) = next else {
+        return prev.clone();
+    };
+    apply(Some(prev), &order[next], ClickKind::Range, order).unwrap_or_else(|| prev.clone())
 }
 
 /// `from` から `to` までの行（両端を含む・上から順）。どちらかが見えていなければ None
@@ -358,6 +387,59 @@ mod tests {
         assert_eq!(visible.items, vec![p("/w/a")]);
         assert_eq!(visible.lead, p("/w/a"), "lead が隠れたら残りの最後");
         assert_eq!(sel.retain_visible(&[p("/w")]), None);
+    }
+
+    #[test]
+    fn シフト矢印は最後に押した行から1行ずつ伸びて逆へ打つと縮む() {
+        let o = order();
+        let sel = apply(None, &p("/w/a"), ClickKind::Replace, &o).unwrap();
+        let sel = extend(&sel, Step::Down, &o);
+        assert_eq!(sel.items, vec![p("/w/a"), p("/w/d")]);
+        assert_eq!(
+            (sel.anchor.clone(), sel.lead.clone()),
+            (p("/w/a"), p("/w/d"))
+        );
+        let sel = extend(&sel, Step::Down, &o);
+        assert_eq!(sel.items, vec![p("/w/a"), p("/w/d"), p("/w/d/x")]);
+        // 逆へ打つと縮む（起点は動かない）
+        let sel = extend(&sel, Step::Up, &o);
+        assert_eq!(sel.items, vec![p("/w/a"), p("/w/d")]);
+        let sel = extend(&sel, Step::Up, &o);
+        assert_eq!(sel.items, vec![p("/w/a")]);
+        // 起点を越えると反対側へ伸びる
+        let sel = extend(&sel, Step::Up, &o);
+        assert_eq!(sel.items, vec![p("/w"), p("/w/a")]);
+        assert_eq!((sel.anchor.clone(), sel.lead.clone()), (p("/w/a"), p("/w")));
+    }
+
+    #[test]
+    fn シフト矢印は先頭と末尾で止まり見えない行からは伸ばさない() {
+        let o = order();
+        let top = apply(None, &p("/w"), ClickKind::Replace, &o).unwrap();
+        assert_eq!(
+            extend(&top, Step::Up, &o),
+            top,
+            "先頭で上へ伸ばしても何も変えない"
+        );
+        let bottom = apply(None, &p("/w/e"), ClickKind::Replace, &o).unwrap();
+        assert_eq!(
+            extend(&bottom, Step::Down, &o),
+            bottom,
+            "末尾で下へ伸ばしても何も変えない"
+        );
+        // 最後に押した行が畳んだフォルダの中 = どこから伸ばすか決まらない
+        let hidden = apply(None, &p("/w/d/x"), ClickKind::Replace, &o).unwrap();
+        let folded: Vec<PathBuf> = ["/w", "/w/a", "/w/d", "/w/e"].into_iter().map(p).collect();
+        assert_eq!(extend(&hidden, Step::Down, &folded), hidden);
+        // 畳んだフォルダをまたぐ範囲は見出しの 1 行だけを含む（中は見えていない）
+        let a = apply(None, &p("/w/a"), ClickKind::Replace, &folded).unwrap();
+        let sel = extend(&extend(&a, Step::Down, &folded), Step::Down, &folded);
+        assert_eq!(sel.items, vec![p("/w/a"), p("/w/d"), p("/w/e")]);
+        // ⌘クリックで飛び飛びに選んでいても、⇧↓ は起点からの範囲へ置き換える（⇧クリックと同じ）
+        let sel = apply(None, &p("/w/e"), ClickKind::Replace, &o);
+        let sel = apply(sel.as_ref(), &p("/w/a"), ClickKind::Toggle, &o).unwrap();
+        let sel = extend(&sel, Step::Down, &o);
+        assert_eq!(sel.items, vec![p("/w/a"), p("/w/d")]);
     }
 
     #[test]

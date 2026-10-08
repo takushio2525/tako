@@ -22,6 +22,21 @@ mod tests {
             }
         );
         assert!(validate_known_params("tako_file_op", &json!({"op": "trash", "paths": []})).is_ok());
+        // #1895: `paths` の copy も 1 要求（CLI `tako file copy a b dst` と同じ要求 = 1 つのジョブ）
+        assert_eq!(
+            build_request(
+                "tako_file_op",
+                &json!({"op": "copy", "paths": ["/w/a", "/w/b"], "dest": "/w/d"}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::FileOpMany {
+                op: FileOpKind::Copy,
+                paths: vec!["/w/a".into(), "/w/b".into()],
+                dest: Some("/w/d".into()),
+            }
+        );
         for (op, kind) in [
             ("copy_progress", FileOpKind::CopyProgress),
             ("copy_cancel", FileOpKind::CopyCancel),

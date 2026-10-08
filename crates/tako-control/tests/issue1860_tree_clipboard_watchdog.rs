@@ -3,7 +3,9 @@
 //! ## ここで止める 8 つ
 //!
 //! 1. [`同名は上書きせず排他的に作る`] — 同名があれば別名へ逃がし、置き場は `create_dir` /
-//!    `create_new` で押さえる（`std::fs::copy` は既存のファイルを黙って上書きする）
+//!    排他的に作る OS の写す口（#1895 から `fs_copy::copy_file_exclusive` = clone の
+//!    `fclonefileat`・中身の `create_new`・Windows の `COPY_FILE_FAIL_IF_EXISTS`）で押さえる
+//!    （`std::fs::copy` は既存のファイルを黙って上書きする）
 //! 2. [`失敗したら作った置き場だけを戻す`] — 途中で失敗したら写した先だけを消す。
 //!    **コピー元を消す道を作らない**（戻す関数がコピー元を触ったら名指す）
 //! 3. [`自分の配下へは実体の形で断る`] — 字面で比べると `..`・リンク・大文字小文字で素通りし、
@@ -38,6 +40,7 @@ mod production_range;
 use production_range::code_view::{code_view, without_comments_checked};
 
 const COPY: &str = "crates/tako-core/src/file_copy.rs";
+const FS_COPY: &str = "crates/tako-core/src/platform/fs_copy.rs";
 const CLIP: &str = "crates/tako-core/src/file_clipboard.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const HOST: &str = "crates/tako-control/src/host.rs";
@@ -222,7 +225,7 @@ impl Body {
 
 // --- 規則（本物にも注入にも同じ関数を当てる） -------------------------------------
 
-fn rule_no_overwrite(core: &Source) -> Check {
+fn rule_no_overwrite(core: &Source, fs: &Source) -> Check {
     core.body("free_name")?.must_contain(
         "if !exists_no_follow(&dest_dir.join(name)) {",
         "同名が無いときだけ元の名前を使う、になっていない（同名の上へ写すと上書きする。#1860）",
@@ -234,15 +237,44 @@ fn rule_no_overwrite(core: &Source) -> Check {
     core.body("plan")?
         .must_contain("free_name(", "段取りが名前を決めていない")?;
     let root = core.body("copy_root")?;
-    root.must_order(
-        ".create_new(true)",
+    root.must_contain(
         "self.copy_file(&plan.from, &plan.to)",
-        "ファイルの置き場を `create_new` で押さえてから写していない（決めてから作るまでに\n\
-         できた同名を `std::fs::copy` が黙って上書きする）",
+        "ファイルの置き場を `copy_file`（排他的に作る口）で作っていない",
     )?;
     root.must_contain(
         "std::fs::create_dir(&plan.to)",
         "フォルダの置き場を排他的に作っていない（`create_dir_all` は既存のフォルダへ混ぜる）",
+    )?;
+    // #1895: 1 つのファイルは OS の写す口が排他的に作る（決めてから作るまでにできた同名を
+    // `std::fs::copy` は黙って上書きする）。A/B の写し方は #1860 のまま名前を押さえてから写す
+    core.body("copy_file")?.must_contain(
+        "fs_copy::copy_file_exclusive(",
+        "1 つのファイルを排他的に作る口（`fs_copy::copy_file_exclusive`）を通っていない",
+    )?;
+    core.body("copy_file_legacy")?.must_order(
+        ".create_new(true)",
+        "std::fs::copy(src, dst)",
+        "A/B の写し方が名前を `create_new` で押さえてから写していない",
+    )?;
+    // 最初の `fn copy` = macOS の実装（clone も中身を写す道も排他的に作る）
+    let mac = fs.body("copy")?;
+    mac.must_contain(
+        "libc::fclonefileat(",
+        "clone の道が `fclonefileat`（写す先があれば EEXIST で断る）を通っていない",
+    )?;
+    mac.must_order(
+        ".create_new(true)",
+        "fcopyfile(&reader, &writer, &mut ctx)",
+        "中身を写す道が置き場を `create_new` で押さえてから写していない",
+    )?;
+    fs.must_have(
+        "COPY_FILE_FAIL_IF_EXISTS,",
+        "fn copy_file_exclusive",
+        "Windows の `CopyFileExW` が COPY_FILE_FAIL_IF_EXISTS を渡していない（既存のファイルを黙って上書きする）",
+    )?;
+    fs.must_not_have(
+        "std::fs::copy(",
+        "OS の写す口が `std::fs::copy`（既存のファイルを黙って上書きする）を使っている",
     )?;
     core.body("copy_dir")?.must_order(
         "if exists_no_follow(&to) {",
@@ -450,7 +482,7 @@ fn ok(check: Check) {
 
 #[test]
 fn 同名は上書きせず排他的に作る() {
-    ok(rule_no_overwrite(&source(COPY)));
+    ok(rule_no_overwrite(&source(COPY), &source(FS_COPY)));
 }
 
 #[test]
@@ -602,15 +634,30 @@ fn 注入_同名で上書きさせると名指す() {
         "    if !exists_no_follow(&dest_dir.join(name)) {",
         "    if true {",
     );
-    must_name(rule_no_overwrite(&core), COPY, "fn free_name");
-    let core = injected(COPY, ".create_new(true)", ".create(true)");
-    must_name(rule_no_overwrite(&core), COPY, "fn copy_root");
+    let fs = source(FS_COPY);
+    must_name(rule_no_overwrite(&core, &fs), COPY, "fn free_name");
+    // #1895: 置き場を押さえる場所は OS の写す口（macOS の中身を写す道・Windows のフラグ）
+    let mac = injected(FS_COPY, ".create_new(true)", ".create(true)");
+    must_name(rule_no_overwrite(&source(COPY), &mac), FS_COPY, "fn copy");
+    let win = injected(
+        FS_COPY,
+        "                COPY_FILE_FAIL_IF_EXISTS,\n",
+        "                0,\n",
+    );
+    let err = rule_no_overwrite(&source(COPY), &win).expect_err("Windows のフラグを外しても通った");
+    assert!(err.starts_with(&format!("{FS_COPY}:")), "{err}");
+    let core = injected(
+        COPY,
+        "let outcome = fs_copy::copy_file_exclusive(",
+        "let outcome = fs_copy_overwrite(",
+    );
+    must_name(rule_no_overwrite(&core, &fs), COPY, "fn copy_file");
     let core = injected(
         COPY,
         "                if exists_no_follow(&to) {",
         "                if false {",
     );
-    must_name(rule_no_overwrite(&core), COPY, "fn copy_dir");
+    must_name(rule_no_overwrite(&core, &fs), COPY, "fn copy_dir");
 }
 
 #[test]
@@ -756,6 +803,7 @@ fn 注入_ポーリングの世代を外すと名指す() {
 fn 番犬が見るファイルが在る() {
     for rel in [
         COPY,
+        FS_COPY,
         CLIP,
         DISPATCH,
         HOST,
