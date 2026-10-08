@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-02（#1682: LSP 補完（予測変換）= 打鍵中の一覧・仮想化・キーの優先順位・CLI / MCP）
-- core `lsp::completion`（読み取り・rank・truncate・route_key 20 通り・Session）+ `replace_position_ranges`（並べ方・重なり・最小化は #1683 の `order_changes`、当て方は離れた範囲をつないだ差分 = undo 1 回で範囲の外を抱えない）→ manager の取り消しの列（`$/cancelRequest`）・resolve・一時 didOpen は持ち手で加わる → dispatch 3 段 + `lsp_completion_apply` → CLI `tako lsp completion` / MCP `tako_lsp` の `action=completion` → GUI `lsp_completion_ui`（`gpui::list`）
-- 実測: `scripts/test-lsp-completion-1682.sh` 22 PASS（1000 件で組む行 10・基準画像との差分は一覧の中だけ・A/B 2 通りで FAILED・実の rust-analyzer で `s.le` → len）・e2e 8 本・注入 6 通りで名指しの FAILED
-
 ## 2026-10-02（#1866: 全体テストで tmux 系が毎回別の 1 本落ちる = 実 tmux e2e の器の数え方が隣の起動中の器を畳んでいた）
 - 真因（1259）: `tests/common/tmux_e2e.rs` が「new-session が返ってから数に入る」「減らしてから別に 0 か見て畳む」で、3 本目の起動中に先の 2 本が返ると器を kill + ソケット削除。叩く前に予約・減算〜kill を 1 ロックへ。A/B `TAKO_1866_LEGACY=1`・差し込み口の固定テスト・番犬 3 規則（1 実装外で畳む / 数に入る前に叩く / tako-core の器の名前の重複）
 - 実測: new-session の返りを遅らせる注入で main 1/1・旧アーム 3/3 が 202 行で FAILED、修正後 3/3 緑・全体テスト 3 回連続緑（6263 passed）。1857 は自分の器のソケットだけ消す注入で同じ行・同じ文言を再現（消し手は未特定。kill の結果と器の状態を失敗文言へ）
@@ -63,3 +59,7 @@
 ## 2026-10-08（#1869: 整形を離れた箇所ごとの差分へ一本化・補完をサーバの読み込み中も出す）
 - 整形と補完の確定を `EditDelta::spans`（差分 1 件に離れた箇所を並べる）+ 書き換えの原始操作 `splice_text` の 1 本へ寄せた（`chained` は廃止）。真因の実測: rust-analyzer 1.95 は読み込みの前半に補完へ即 `null`、後半は答えずに待たせる。tako は打鍵の要求だけ待たずに 0 件で返していた → 打鍵も待って問い直し（次の打鍵・閉じるで抜ける）、GUI は「読み込み中」の 1 行、CLI / MCP は `waited_for_loading_ms` / `status: loading`、`tako lsp status` に `loading`（カタログ +117 B）
 - 実測: 10 万行の整形 → undo の履歴 2,600,298 B・深さ 2・undo 2 回ともバイト一致（旧 `TAKO_1869_LEGACY=1` は 17,399,988 B・深さ 1）・visual-test `completion-loading` 緑（旧で FAILED）・e2e 6 本・番犬の注入 9 通りを file:line で名指し・実の rust-analyzer は読み込み中に GUI で打っても 2.2 秒後に一覧（旧は 25 秒出ない）・整形も緑（`scripts/test-lsp-followup-1869.sh` 37 PASS）
+
+## 2026-10-09（#1890: visual-test 節 large-file-decor が debug で必ず落ちる = 塗りの戻りを回数の窓で待っていたのを、走っている間だけ待つ状態待ちにした）
+- 真因: 読み取り表示 / 編集開始の全文の塗りを 3000 / 6000 回 × 10ms の窓で待ち、debug は 10 MB の 1 回の塗りが 418.8〜473.8 秒（窓は約 118 秒）。節が入った `deecfc9` の debug でも同じ箇所で落ちる = 実回帰ではない（release も CRLF で窓の 65%）。`wait_for_background_highlight`（`view_highlights_running` / `highlight_pending` の間だけ待ち、戻ったのに揃わなければ即偽）へ 2 節 4 か所を寄せた
+- 実測: `scripts/test-highlight-wait-1890.sh`（遅れ 150 秒の注入で緑・`TAKO_1890_LEGACY=view|seed` で名指しの FAILED・`drop` は上限前に Settled）・debug 単独で緑（30 分）・番犬 4 本（注入 7 通りを file:line で名指し）

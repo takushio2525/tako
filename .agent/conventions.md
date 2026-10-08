@@ -1525,6 +1525,27 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     素の上限（30 秒）は旧の固定窓（10 秒 / 20 秒）より広く採る（#771 と同じ理由）
   - 番犬 `issue1308_pty_wait_watchdog` が、実 PTY を張るテスト
     （`TerminalSession::spawn(` を持つ関数）の自前の固定窓を `file:line` で落とす
+- **background の重い処理の戻りを回数の窓で待たない**（#1890）。visual-test 節
+  `large-file-decor` / `large-file-edit`（#1660）は、読み取り表示の塗りと編集開始の全文の塗り
+  （どちらも background の syntect）を `for _ in 0..3000 { 10ms 待って描く }` / `0..6000` で
+  待っていた。窓の長さは release の塗り（10 MB で 7.8 秒）だけを見て決めていたが、
+  **debug（visual-test 入り）では 1 回の塗りが 427.6 秒**かかる（未最適化の正規表現。旧の窓は
+  同じ周期で約 118 秒）ので、`large-file-decor` は節が入った `deecfc9` の時点から debug の
+  単独実行では一度も通っていなかった（#1873 の worker が load 約 5 のときに踏んで負荷を疑ったが、
+  load は無関係で release は同じ時間帯に緑）
+  - **相手が「まだ走っている」ことを製品の状態で言えるようにして、その間だけ待つ**
+    （`TakoApp::view_highlights_running` / `EditState::highlight_pending`）。上限は止まったときの
+    保険で `state_wait_budget`（素の上限は debug 1200 秒 / release 300 秒）。**素の上限は旧の窓
+    より十分広く採る**（#771 / #1308 と同じ理由）。遅れの注入で A/B を取るときは
+    「旧の窓 < 注入の遅れ < 新の上限」に収める（初版は release の上限 90 秒 × 1.4 = 126 秒が
+    注入 150 秒より短く、「まだ走っている」まま上限で諦めた = 実測で踏んだ）
+  - **戻ったのに揃っていないならその場で偽**（`HighlightWait::Settled`）= 待ちを長くしても
+    検出力は落ちない（注入 `TAKO_1890_INJECT=drop` で上限まで待たずに落ちることを実測）
+  - **節を足したら debug でも 1 回通す**。スクリプトが release で回す節でも、単独実行
+    （`TAKO_VISUAL_ONLY=<節>`。`isolated-gui.sh` の既定は debug）で回す worker が居る
+  - 1 実装は `wait_for_background_highlight`（A/B は `TAKO_1890_LEGACY=view|seed|1`・遅れの
+    注入は製品側の `TAKO_1890_INJECT=slow:<ミリ秒>`）。番犬 `issue1890_highlight_wait_watchdog` が
+    節の手書きの窓を `file:line` で落とす。実経路の A/B は `bash scripts/test-highlight-wait-1890.sh`
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 

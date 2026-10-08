@@ -919,6 +919,46 @@ pub(crate) fn sync_seed_forced() -> bool {
     *ON.get_or_init(|| std::env::var_os("TAKO_1660_SYNC_SEED").is_some())
 }
 
+/// background の塗りの戻りを変える検証専用の注入（`TAKO_1890_INJECT`。#1890）。
+/// visual-test の「塗りが戻るのを待つ」待ち（`wait_for_background_highlight`）を、
+/// CPU を焼かずに確かめるための口:
+///
+/// - `slow:<ミリ秒>` … 読み取り表示の塗り（`spawn_highlight`）と編集開始の全文の塗り
+///   （`spawn_editor_seed`）を、background へ出す前にその長さだけ遅らせる
+///   （debug ビルドや混んだ機で塗りが長引くのと同じ形）
+/// - `drop` … 読み取り表示の塗りが戻っても取り込まない（塗られずに終わる回帰の形）
+///
+/// **未設定の通常起動は変わらない**（env の読みは 1 度だけ）
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HighlightInject {
+    pub(crate) delay: Option<Duration>,
+    pub(crate) drop: bool,
+}
+
+pub(crate) fn highlight_inject() -> HighlightInject {
+    static INJECT: OnceLock<HighlightInject> = OnceLock::new();
+    *INJECT
+        .get_or_init(|| parse_highlight_inject(std::env::var("TAKO_1890_INJECT").ok().as_deref()))
+}
+
+/// `TAKO_1890_INJECT` の値を読む（読めない値は注入なし = 通常起動と同じ）
+fn parse_highlight_inject(raw: Option<&str>) -> HighlightInject {
+    match raw.map(str::trim) {
+        Some("drop") => HighlightInject {
+            delay: None,
+            drop: true,
+        },
+        Some(value) => HighlightInject {
+            delay: value
+                .strip_prefix("slow:")
+                .and_then(|ms| ms.trim().parse::<u64>().ok())
+                .map(Duration::from_millis),
+            drop: false,
+        },
+        None => HighlightInject::default(),
+    }
+}
+
 /// background executor 上で呼ぶ: 行状態ごと全文を塗る（#1660）
 pub fn seed_editor_highlight(request: SeedRequest) -> EditorSeed {
     let SeedRequest {
@@ -5493,6 +5533,34 @@ class Box {
 #[cfg(test)]
 mod large_file_tests {
     use super::*;
+
+    /// 検証専用の注入（#1890）は書いた値だけを効かせ、読めない値は通常起動と同じにする
+    #[test]
+    fn 塗りの注入は書いた値だけを効かせる() {
+        let none = HighlightInject::default();
+        assert_eq!(parse_highlight_inject(None), none);
+        assert_eq!(
+            parse_highlight_inject(Some("slow:90000")),
+            HighlightInject {
+                delay: Some(Duration::from_secs(90)),
+                drop: false,
+            }
+        );
+        assert_eq!(
+            parse_highlight_inject(Some(" drop ")),
+            HighlightInject {
+                delay: None,
+                drop: true,
+            }
+        );
+        for unreadable in ["", "slow", "slow:", "slow:abc", "fast:10", "1"] {
+            assert_eq!(
+                parse_highlight_inject(Some(unreadable)),
+                none,
+                "{unreadable:?}"
+            );
+        }
+    }
 
     /// 境目を 20 行・上限を 8 行にする（60 行の文書で境目を跨ぐ）
     const 小さい境目: DeferPolicy = DeferPolicy {

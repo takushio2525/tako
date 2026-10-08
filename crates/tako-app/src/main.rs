@@ -1906,6 +1906,9 @@ struct TakoApp {
     queued_recovery: std::collections::HashMap<PaneId, QueuedRecovery>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
     pending_highlights: Vec<(PaneId, std::path::PathBuf, String)>,
+    /// 起こした読み取り表示の塗り（`spawn_highlight`）のうち、まだ戻っていない数（#1890）。
+    /// 戻ったら取り込んだか捨てたかに依らず減らす = 「まだ塗っている」と「塗らずに終わった」の境
+    view_highlights_running: HashMap<PaneId, usize>,
     /// 大きい文書の編集で background へ出す全文の塗り（#1660）。
     /// 編集の経路は `Context` を持たないので、次の render の入口で起こす
     pending_editor_seeds: Vec<(PaneId, preview::SeedRequest)>,
@@ -4148,6 +4151,7 @@ impl TakoApp {
             agent_relaunches: Vec::new(),
             queued_recovery: std::collections::HashMap::new(),
             pending_highlights: Vec::new(),
+            view_highlights_running: HashMap::new(),
             pending_editor_seeds: Vec::new(),
             pending_preview_loads: Vec::new(),
             pending_md_resumes: Vec::new(),
@@ -49804,6 +49808,136 @@ mod self_test {
         println!("TAKO_VISUAL_PIXEL: editor-keys ok legacy={legacy}");
     }
 
+    /// background の構文の塗りの今（#1890。[`wait_for_background_highlight`] が見る）
+    #[cfg(feature = "visual-test")]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum HighlightWait {
+        /// 戻って揃った
+        Landed,
+        /// まだ background で塗っている
+        Running,
+        /// 塗りは戻ったのに揃っていない（捨てられた・色が無い）= 待っても揃わない
+        Settled,
+    }
+
+    /// 読み取り表示の塗り（`spawn_highlight`）の今: 先頭 50 行のどれかに色が付いたら揃った
+    #[cfg(feature = "visual-test")]
+    fn view_highlight_probe(app: &TakoApp, pane: PaneId) -> HighlightWait {
+        let colored = matches!(
+            app.previews.get(&pane).map(|s| &s.content),
+            Some(preview::PreviewContent::Code(lines))
+                if lines.iter().take(50).any(|l| l.iter().any(|s| s.color.is_some()))
+        );
+        if colored {
+            HighlightWait::Landed
+        } else if app
+            .view_highlights_running
+            .get(&pane)
+            .is_some_and(|n| *n > 0)
+        {
+            HighlightWait::Running
+        } else {
+            HighlightWait::Settled
+        }
+    }
+
+    /// 編集開始の全文の塗り（`spawn_editor_seed`）の今: 待ちの印が畳まれたら揃った
+    #[cfg(feature = "visual-test")]
+    fn seed_highlight_probe(app: &TakoApp, pane: PaneId) -> HighlightWait {
+        if app
+            .preview_edits
+            .get(&pane)
+            .is_some_and(preview::EditState::highlight_pending)
+        {
+            HighlightWait::Running
+        } else {
+            HighlightWait::Landed
+        }
+    }
+
+    /// `TAKO_1890_LEGACY` が `stage`（`view` / `seed`）を指しているか（`1` は全部）。
+    /// 段ごとに戻せるのは、`check` が 1 つ目の失敗でプロセスごと止まるため
+    /// （全部戻すと先に来る `view` しか観測できない = #1375 と同じ理由）
+    #[cfg(feature = "visual-test")]
+    fn legacy_1890(stage: &str) -> bool {
+        std::env::var("TAKO_1890_LEGACY")
+            .is_ok_and(|v| v.split(',').any(|s| s.trim() == "1" || s.trim() == stage))
+    }
+
+    /// **background の構文の塗りが戻るのを状態で待つ 1 実装**（#1890）。
+    ///
+    /// 旧実装は節ごとの `for _ in 0..N { 10ms 待って描く }` = **回数の窓**で、窓の長さは
+    /// release（`scripts/test-large-file-edit-1660.sh`）の塗り（10 MB で 7.8 秒）だけを見て
+    /// 決めていた。debug（visual-test 入り）の syntect は未最適化の正規表現で全文を塗るので
+    /// 窓を必ず使い切り、`large-file-decor` は節が入った `deecfc9` の時点から debug の
+    /// 単独実行では一度も通っていなかった（#1873 の worker が踏んだ）。
+    ///
+    /// - 塗りが**まだ走っている**（[`HighlightWait::Running`]）間は待つ。塗りは必ず戻るので、
+    ///   上限は止まったときの保険（[`state_wait_budget`] = 混み具合で伸ばすだけ・4 倍で
+    ///   打ち切り。debug は release より桁で遅いので素の上限を分ける）
+    /// - 塗りが戻ったのに揃っていない（[`HighlightWait::Settled`]）なら**その場で偽**
+    ///   （待っても揃わない = 検出力は回数の窓より強い）
+    /// - 毎回 `TAKO_VISUAL_1890` を 1 行（`outcome=` / `waited=` / `budget=` / 実行環境）、
+    ///   上限で諦めたときは `TAKO_SELF_TEST_STATE_TIMEOUT` を加える
+    /// - `TAKO_1890_LEGACY` で旧の回数の窓（`legacy_polls` 回 × 10ms）へ戻す（A/B の腕）。
+    ///   遅れの再現は製品側の注入 `TAKO_1890_INJECT=slow:<ミリ秒>`（`preview::highlight_inject`）
+    #[cfg(feature = "visual-test")]
+    async fn wait_for_background_highlight(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+        stage: &str,
+        legacy_polls: u32,
+        probe: impl Fn(&TakoApp) -> HighlightWait,
+    ) -> bool {
+        let legacy = legacy_1890(stage);
+        // 素の上限は旧の窓（release で seed 最大約 92 秒）と実測の塗り（release 33.4 秒 /
+        // debug 473.8 秒）より十分広く採る（#771 / #1308 と同じ理由）。走っている間だけの保険
+        let base = Duration::from_secs(if cfg!(debug_assertions) { 1200 } else { 300 });
+        let budget = state_wait_budget(base, machine_busy());
+        let started = std::time::Instant::now();
+        let mut polls = 0u32;
+        let outcome = loop {
+            let now = window
+                .update(cx, |app, _, _| probe(app))
+                .unwrap_or(HighlightWait::Settled);
+            // 旧の窓は「揃ったか」だけを見ていた（戻ったのに揃っていなくても窓の終わりまで回す）
+            if now == HighlightWait::Landed || (now == HighlightWait::Settled && !legacy) {
+                break now;
+            }
+            let spent = if legacy {
+                polls >= legacy_polls
+            } else {
+                started.elapsed() >= budget
+            };
+            if spent {
+                break now;
+            }
+            polls += 1;
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            notify_and_draw(any, window, cx);
+        };
+        let waited = started.elapsed().as_secs_f32();
+        println!(
+            "TAKO_VISUAL_1890: label={label:?} stage={stage} outcome={outcome:?} \
+             waited={waited:.1}s budget={:.0}s polls={polls} legacy={legacy} inject={:?} {}",
+            budget.as_secs_f32(),
+            preview::highlight_inject(),
+            env_line()
+        );
+        if outcome == HighlightWait::Running {
+            println!(
+                "TAKO_SELF_TEST_STATE_TIMEOUT: label={label:?} stage={stage} waited={waited:.1}s \
+                 legacy={legacy} {}",
+                env_line()
+            );
+        }
+        outcome == HighlightWait::Landed
+    }
+
     /// #1660: 大きいファイル（既定は tako 自身の `main.rs` の写し = 8 万行超）を
     /// **実 GUI の打鍵経路**で編集できるか・1 打鍵にいくらかかるか。
     ///
@@ -49913,26 +50047,18 @@ mod self_test {
             &format!("visual-test large-file-edit: 上限の内側なので全文を読む（{limit:?}）"),
         );
 
-        // (2) 読み取り表示の塗り（background）が戻るまで
+        // (2) 読み取り表示の塗り（background）が戻るまで（状態で待つ。#1890）
         let t = Instant::now();
-        let colored = |app: &TakoApp| {
-            matches!(
-                app.previews.get(&pane).map(|s| &s.content),
-                Some(preview::PreviewContent::Code(lines))
-                    if lines.iter().take(50).any(|l| l.iter().any(|s| s.color.is_some()))
-            )
-        };
-        let mut view_ready = false;
-        for _ in 0..3000 {
-            if window.update(cx, |app, _, _| colored(app)).unwrap_or(false) {
-                view_ready = true;
-                break;
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(10))
-                .await;
-            notify_and_draw(any, window, cx);
-        }
+        let view_ready = wait_for_background_highlight(
+            any,
+            window,
+            cx,
+            "large-file-edit",
+            "view",
+            3000,
+            |app| view_highlight_probe(app, pane),
+        )
+        .await;
         let view_highlight = t.elapsed();
         check(
             view_ready,
@@ -49967,28 +50093,22 @@ mod self_test {
 
         // (4) 全文の塗り（background）が戻るまで。打鍵はこの間も通る（塗りを待たない）
         let t = Instant::now();
-        let pending = |cx: &mut AsyncApp| {
-            window
-                .update(cx, |app, _, _| {
-                    app.preview_edits
-                        .get(&pane)
-                        .is_some_and(preview::EditState::highlight_pending)
-                })
-                .unwrap_or(false)
-        };
-        let deferred = pending(cx);
-        for _ in 0..6000 {
-            if !pending(cx) {
-                break;
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(10))
-                .await;
-            notify_and_draw(any, window, cx);
-        }
+        let deferred = window
+            .update(cx, |app, _, _| seed_highlight_probe(app, pane))
+            .is_ok_and(|now| now == HighlightWait::Running);
+        let seeded = wait_for_background_highlight(
+            any,
+            window,
+            cx,
+            "large-file-edit",
+            "seed",
+            6000,
+            |app| seed_highlight_probe(app, pane),
+        )
+        .await;
         let seed = t.elapsed();
         check(
-            !pending(cx),
+            seeded,
             "visual-test large-file-edit: 全文の塗りが戻って揃う",
         );
         let lsp_servers = window
@@ -50217,7 +50337,8 @@ mod self_test {
     ///     途中を通る）→ 最後の 1 件に強調が乗る。1 打鍵の所要を出す（判定には使わない）
     /// (5) 全置換（10 万か所）→ undo で元とバイト一致 → 探し直すと強調が同じ文字に乗る
     ///
-    /// 単独実行は `TAKO_VISUAL_ONLY=large-file-decor`
+    /// 単独実行は `TAKO_VISUAL_ONLY=large-file-decor`。debug でも通るが、10 MB の全文の塗りが
+    /// 1 回約 7 分 × 4 回かかる（release は 1 回 10〜35 秒。#1890）
     #[cfg(feature = "visual-test")]
     async fn large_file_decor_visual(
         any: AnyWindowHandle,
@@ -50397,25 +50518,14 @@ mod self_test {
             &format!("visual-test large-file-decor {label}: 行が描かれる"),
         );
         // 読み取り表示の塗り（background）が戻るのを待つ。戻ると表示行が差し替わって版が
-        // 進むので、待たないと ⌘F の後に版が進んで古い行頭が偶然消える（検出力が落ちる）
-        let colored = |app: &TakoApp| {
-            matches!(
-                app.previews.get(&pane).map(|s| &s.content),
-                Some(preview::PreviewContent::Code(lines))
-                    if lines.iter().take(50).any(|l| l.iter().any(|s| s.color.is_some()))
-            )
-        };
-        let mut view_ready = false;
-        for _ in 0..3000 {
-            if window.update(cx, |app, _, _| colored(app)).unwrap_or(false) {
-                view_ready = true;
-                break;
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(10))
-                .await;
-            notify_and_draw(any, window, cx);
-        }
+        // 進むので、待たないと ⌘F の後に版が進んで古い行頭が偶然消える（検出力が落ちる）。
+        // 塗りの所要はビルド（debug は桁で遅い）と混み具合で変わるので状態で待つ（#1890）
+        let section = format!("large-file-decor {label}");
+        let view_ready =
+            wait_for_background_highlight(any, window, cx, &section, "view", 3000, |app| {
+                view_highlight_probe(app, pane)
+            })
+            .await;
         check(
             view_ready,
             &format!("visual-test large-file-decor {label}: 読み取り表示が塗られる"),
@@ -50690,26 +50800,13 @@ mod self_test {
             editing,
             &format!("visual-test large-file-decor {label}: 編集モードを開始できる"),
         );
-        let pending = |cx: &mut AsyncApp| {
-            window
-                .update(cx, |app, _, _| {
-                    app.preview_edits
-                        .get(&pane)
-                        .is_some_and(preview::EditState::highlight_pending)
-                })
-                .unwrap_or(false)
-        };
-        for _ in 0..6000 {
-            if !pending(cx) {
-                break;
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(10))
-                .await;
-            notify_and_draw(any, window, cx);
-        }
+        let seeded =
+            wait_for_background_highlight(any, window, cx, &section, "seed", 6000, |app| {
+                seed_highlight_probe(app, pane)
+            })
+            .await;
         check(
-            !pending(cx),
+            seeded,
             &format!("visual-test large-file-decor {label}: 全文の塗りが戻って揃う"),
         );
         check(
