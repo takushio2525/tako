@@ -1093,6 +1093,14 @@ pub(super) fn build_request(
                 })
             },
         },
+        // #1908: `selection` はツリーの選択（CLI `tako tree selection` と同じ要求）
+        "tako_tree_folder" if str_arg(args, "action")?.as_deref() == Some("selection") => {
+            Request::TreeSelection {
+                path: str_arg(args, "path")?,
+                key: str_arg(args, "key")?,
+                tab: u64_arg(args, "tab")?,
+            }
+        }
         "tako_tree_folder" => Request::TreeFolder {
             action: str_arg(args, "action")?
                 .ok_or("action を指定する")?

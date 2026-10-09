@@ -229,7 +229,7 @@ pub fn tree_clip_key(
     }
 }
 
-/// ファイルツリーで選んでいる間のキー（コピー / 切り取り / 貼り付け以外。Issue #1895）
+/// ファイルツリーで選んでいる間のキー（コピー / 切り取り / 貼り付け以外。Issue #1895 / #1908）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeSelectKey {
     /// ⇧↑: 範囲を 1 行上へ伸ばす / 縮める
@@ -238,14 +238,57 @@ pub enum TreeSelectKey {
     ExtendDown,
     /// 選んだものをごみ箱へ（macOS = ⌘⌫ / Windows = Delete。Finder / エクスプローラーと同じ）
     Trash,
+    /// ↑ / ↓: 選んだ行を 1 行動かす（#1908）
+    Up,
+    Down,
+    /// ← / →: 畳む・親へ / 開く・最初の子へ（#1908）
+    Left,
+    Right,
+    /// Enter: 素の押下と同じ（ファイルは開く・フォルダは開閉。#1908）
+    Open,
+    /// ⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）: 端まで範囲を伸ばす（#1908）
+    ExtendTop,
+    ExtendBottom,
 }
 
-/// 打鍵がファイルツリーの範囲選択・ごみ箱か（Issue #1895）。**ツリーの行を選んでいるときだけ**
-/// 呼ぶこと（[`tree_clip_key`] と同じ。選んでいなければ ⇧↑ / Delete は端末へ流す）。
+impl TreeSelectKey {
+    /// 選択を動かすキーなら core の語彙（`tree_select::on_key` へ渡すもの）。ごみ箱は None
+    pub fn select_key(self) -> Option<crate::tree_select::Key> {
+        use crate::tree_select::Key;
+        Some(match self {
+            TreeSelectKey::ExtendUp => Key::ExtendUp,
+            TreeSelectKey::ExtendDown => Key::ExtendDown,
+            TreeSelectKey::Up => Key::Up,
+            TreeSelectKey::Down => Key::Down,
+            TreeSelectKey::Left => Key::Left,
+            TreeSelectKey::Right => Key::Right,
+            TreeSelectKey::Open => Key::Enter,
+            TreeSelectKey::ExtendTop => Key::ExtendTop,
+            TreeSelectKey::ExtendBottom => Key::ExtendBottom,
+            TreeSelectKey::Trash => return None,
+        })
+    }
+
+    /// #1908 で足したキーか（A/B の `TAKO_1908_LEGACY=1` ではツリーへ向けない）
+    pub fn since_1908(self) -> bool {
+        !matches!(
+            self,
+            TreeSelectKey::ExtendUp | TreeSelectKey::ExtendDown | TreeSelectKey::Trash
+        )
+    }
+}
+
+/// 打鍵がファイルツリーの選択・範囲選択・ごみ箱か（Issue #1895 / #1908）。**ツリーの行を
+/// 選んでいるときだけ**呼ぶこと（[`tree_clip_key`] と同じ。選んでいなければ矢印・Enter・
+/// Delete は端末へ流す）。
 ///
 /// - ⇧↑ / ⇧↓: shift だけ（主修飾・alt・もう片方が混ざると当たらない = ⌘⇧↑ 等の別の割り当てを奪わない）
+/// - ↑ / ↓ / ← / → / Enter: 修飾無しだけ（⌥↑ のペイン移動・⌘← 等は奪わない。#1908）
+/// - 端まで: macOS は ⇧⌘↑ / ⇧⌘↓ だけ / Windows は Shift+Ctrl+Home / End だけ（#1908。
+///   エクスプローラー・VS Code と同じ。Shift+Home / End 単独は奪わない）
 /// - ごみ箱: macOS は ⌘⌫ だけ（⌫ 単独は奪わない）/ Windows は修飾無しの Delete だけ
-///   （Shift+Delete = エクスプローラーの「完全に削除」は扱わない = 端末へ流す）
+///   （Shift+Delete = エクスプローラーの「完全に削除」は扱わない = 端末へ流す。#1908 で
+///   CLI / MCP に完全に削除する口が無いので、画面だけの削除の経路を作らない）
 pub fn tree_select_key(
     platform: Platform,
     key: &str,
@@ -255,9 +298,23 @@ pub fn tree_select_key(
     shift: bool,
 ) -> Option<TreeSelectKey> {
     let none_but_shift = shift && !platform_key && !control && !alt;
+    let plain = !shift && !platform_key && !control && !alt;
+    let to_edge = match platform {
+        Platform::MacOs => shift && platform_key && !control && !alt,
+        Platform::Windows => shift && control && !platform_key && !alt,
+    };
     match key {
         "up" if none_but_shift => Some(TreeSelectKey::ExtendUp),
         "down" if none_but_shift => Some(TreeSelectKey::ExtendDown),
+        "up" if plain => Some(TreeSelectKey::Up),
+        "down" if plain => Some(TreeSelectKey::Down),
+        "left" if plain => Some(TreeSelectKey::Left),
+        "right" if plain => Some(TreeSelectKey::Right),
+        "enter" if plain => Some(TreeSelectKey::Open),
+        "up" if platform == Platform::MacOs && to_edge => Some(TreeSelectKey::ExtendTop),
+        "down" if platform == Platform::MacOs && to_edge => Some(TreeSelectKey::ExtendBottom),
+        "home" if platform == Platform::Windows && to_edge => Some(TreeSelectKey::ExtendTop),
+        "end" if platform == Platform::Windows && to_edge => Some(TreeSelectKey::ExtendBottom),
         "backspace"
             if platform == Platform::MacOs && platform_key && !control && !alt && !shift =>
         {
@@ -314,12 +371,38 @@ mod tests {
         for f in [mac, win] {
             assert_eq!(f("up", false, false, false, true), Some(ExtendUp));
             assert_eq!(f("down", false, false, false, true), Some(ExtendDown));
-            // 素の矢印・⌘⇧↑・⌥⇧↓・⌃⇧↑ は奪わない
-            assert_eq!(f("up", false, false, false, false), None);
-            assert_eq!(f("up", true, false, false, true), None);
+            // #1908: 修飾無しの矢印と Enter は選択を動かす
+            assert_eq!(f("up", false, false, false, false), Some(Up));
+            assert_eq!(f("down", false, false, false, false), Some(Down));
+            assert_eq!(f("left", false, false, false, false), Some(Left));
+            assert_eq!(f("right", false, false, false, false), Some(Right));
+            assert_eq!(f("enter", false, false, false, false), Some(Open));
+            // ⌥⇧↓・⌥↑（ペイン移動）・⌘←・⌃→・⇧Enter・⇧← は奪わない
             assert_eq!(f("down", false, false, true, true), None);
-            assert_eq!(f("up", false, true, false, true), None);
+            assert_eq!(f("up", false, false, true, false), None);
+            assert_eq!(f("left", true, false, false, false), None);
+            assert_eq!(f("right", false, true, false, false), None);
+            assert_eq!(f("enter", false, false, false, true), None);
+            assert_eq!(f("left", false, false, false, true), None);
         }
+        // #1908: 端までは macOS = ⇧⌘↑ / ⇧⌘↓ だけ（⌃⇧↑・⌘⌃⇧↑ は奪わない）
+        assert_eq!(mac("up", true, false, false, true), Some(ExtendTop));
+        assert_eq!(mac("down", true, false, false, true), Some(ExtendBottom));
+        assert_eq!(mac("up", false, true, false, true), None);
+        assert_eq!(mac("up", true, true, false, true), None);
+        assert_eq!(mac("home", false, true, false, true), None);
+        // Windows = Shift+Ctrl+Home / End だけ（Shift+Home・Ctrl+Home・Win+Shift+↑ は奪わない）
+        assert_eq!(win("home", false, true, false, true), Some(ExtendTop));
+        assert_eq!(win("end", false, true, false, true), Some(ExtendBottom));
+        assert_eq!(win("home", false, false, false, true), None);
+        assert_eq!(win("end", false, true, false, false), None);
+        assert_eq!(win("up", true, false, false, true), None);
+        assert_eq!(win("up", false, true, false, true), None);
+        // core の語彙への対応（ごみ箱は選択を動かさない）と、#1908 の A/B の対象
+        assert_eq!(Open.select_key(), Some(crate::tree_select::Key::Enter));
+        assert_eq!(Trash.select_key(), None);
+        assert!(!ExtendUp.since_1908() && !Trash.since_1908());
+        assert!(Up.since_1908() && ExtendBottom.since_1908() && Open.since_1908());
         // macOS は ⌘⌫ だけ（⌫ 単独・⌥⌫・⌘⇧⌫・Delete は奪わない）
         assert_eq!(mac("backspace", true, false, false, false), Some(Trash));
         assert_eq!(mac("backspace", false, false, false, false), None);

@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1880: tako mod S2 = mod の報告を ctx%・使用制限・ターン状態の一次ソースにした）
-- `ctx_usage::resolve_full`（mod → 画面 → transcript）を 4 経路（self / worker_status / #749 tick / チャットヘッダ）が通り、引き当ては `claude_mod::lookup` の 1 本（落ちた理由は `ctx_mod_reason` / `mod_reason`）。使用制限はアカウント単位で束ね（resets_at → % の大きい方）、解除時刻だけ `LimitHint::from_mod`（停止の判定は画面のまま）。ターン状態は mod の turn が先・respond は画面。effort は `turn.step` から（組織アカウントでも欠けない）。A/B `TAKO_1877_S2_LEGACY=1`
-- 実測: `scripts/test-mod-primary-1880.sh` fake 段・claude 段（statusLine なしの実 claude で 4 経路が mod / SIGSTOP で 47 秒後 mod_stale）・番犬 `issue1880_mod_primary_watchdog.rs`（注入 6 通り）・`claude plugin test` 12 本
-
 ## 2026-10-09（#1896: MCP ツールカタログの説明文を再び短くし、予算 200 KB に約 17 KB の余白を作った）
 - 160 本中 38 本の description / 引数説明を #1540 / #1711 の方針で短縮（大きい順に profiles -1,464 / spawn -775 / remote_folder -643 / open_file -640）。構造（名前・型・enum・必須・既定値）は不変、残っていた要件番号 FR-3.18 も外した。外した原文は `.agent/mcp-catalog-notes.md` の #1896 節。並走 PR の 5 本（file_op / lsp / mod / self / worker_status）は触らない
 - 実測: main（4bbbcc2）199,050 → 187,678 B（-11,372 B・残り 17,122 B。rebase 前に隔離 GUI + `tako mcp serve` の tools/list と `tako context-budget` の一致を確認）。description を落とした JSON が 160 本すべて一致
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1915: CI の rust-cache のキーにルートの Cargo.toml の指紋を混ぜた）
 - rust-cache v2.9.2 はメンバーの Cargo.toml と Cargo.lock だけをキーに混ぜ、ルートの仮想マニフェストは入らない（ログの「Lockfiles considered」でも無い）。`scripts/lib/cargo-root-manifest-key.sh`（[workspace.package] の version・行全体のコメント・空行・CRLF を除いた 8 桁）を ci.yml の macOS / Windows と release-windows.yml の `key` へ渡す。規約は conventions.md「CI のビルドキャッシュのキー」
 - 実測: テスト 27 PASS（注入 8 通りを名指し・本物を正当に変えた 4 通りで偽の赤なし）・actionlint 0 件。CI ログのキー比較は PR のコメント
+
+## 2026-10-09（#1908: ファイルツリーの ↑↓ / ←→ / Enter / ⇧⌘↑↓（Win は Shift+Ctrl+Home / End）・選択の CLI / MCP・残り時間の数え下ろし）
+- 正本 `tree_select::on_key`（`RowShape` → `KeyOutcome`）を画面のキー（#1895 の ⇧↑↓ も）と CLI `tako tree selection [<path>] [--key K]` / MCP `tako_tree_folder` の `selection` が dispatch `TreeSelection` で通る（カタログ +412 B）。`eta` は最後にバイトが進んだ時点までの平均で数え下ろし、止まったら旧式の伸び方へ連続につなぐ。Shift+Delete は CLI / MCP に完全削除の口が無いので扱わない（FR-3.40 ③）
+- 実測: 単体の合成（1 MiB / 300 ms・150 ms ごと）で逆戻り合計 5.87 → 0 秒・表記の戻り 3 → 0 回、実 GUI の `eta_secs` は戻り 6 → 0 回（57 回読み）。visual-test `tree-keys` 緑・`TAKO_1908_LEGACY=1` で ① が名指しで FAILED・番犬 10 本（注入 11 通り）

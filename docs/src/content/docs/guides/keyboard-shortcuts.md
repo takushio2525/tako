@@ -53,7 +53,11 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | コマンドパレットを開く | <kbd>Cmd</kbd>+<kbd>K</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd> |
 | 設定画面を開く | <kbd>Cmd</kbd>+<kbd>,</kbd> | <kbd>Ctrl</kbd>+<kbd>,</kbd> |
 | ファイルツリー（左サイドバー）の表示 / 非表示 | <kbd>Cmd</kbd>+<kbd>B</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> |
+| ファイルツリーで選んでいる行を 1 行ずつ動かす（行を選んでいる間） | <kbd>↑</kbd> / <kbd>↓</kbd> | <kbd>↑</kbd> / <kbd>↓</kbd> |
+| ファイルツリーのフォルダを畳む・親へ / 開く・中へ（行を選んでいる間） | <kbd>←</kbd> / <kbd>→</kbd> | <kbd>←</kbd> / <kbd>→</kbd> |
+| ファイルツリーで選んでいる行を開く（クリックと同じ。行を選んでいる間） | <kbd>Enter</kbd> | <kbd>Enter</kbd> |
 | ファイルツリーで選んでいる範囲を 1 行ずつ伸ばす / 縮める（行を選んでいる間） | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Shift</kbd>+<kbd>↓</kbd> | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Shift</kbd>+<kbd>↓</kbd> |
+| ファイルツリーで選んでいる範囲を先頭 / 末尾まで伸ばす（行を選んでいる間） | <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>↓</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Home</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>End</kbd> |
 | ファイルツリーで選んでいるものをゴミ箱へ（行を選んでいる間） | <kbd>Cmd</kbd>+<kbd>Delete</kbd> | <kbd>Delete</kbd> |
 
 :::tip[まずコマンドパレット]

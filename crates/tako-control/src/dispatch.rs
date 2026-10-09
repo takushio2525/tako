@@ -6997,6 +6997,10 @@ fn dispatch_inner(
             limit,
         } => dispatch_tree_folder(host, &action, path, tab, pane, limit),
 
+        Request::TreeSelection { path, key, tab } => {
+            dispatch_tree_selection(host, path, key, tab, origin)
+        }
+
         Request::Sessions {
             action,
             id,
@@ -17827,6 +17831,157 @@ fn dispatch_tree_folder(
     }
 }
 
+/// ファイルツリーの選択の応答（`selection` = いま効いている選択。無ければ null）
+fn tree_selection_json(selection: Option<(tako_core::tree_select::Selection, bool)>) -> Value {
+    match selection {
+        Some((sel, remote)) => json!({
+            "paths": sel.items.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "lead": sel.lead.display().to_string(),
+            "anchor": sel.anchor.display().to_string(),
+            "remote": remote,
+        }),
+        None => Value::Null,
+    }
+}
+
+/// ファイルツリーの選択（FR-3.40 / #1908）。画面の ↑ / ↓ / ← / → / Enter / ⇧↑ / ⇧↓ /
+/// ⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）も CLI `tako tree selection` も MCP
+/// `tako_tree_folder` の `action=selection` もここを通る（状態遷移の正本は
+/// `tako_core::tree_select::on_key`。ここは結果を host へ当てるだけ）。
+///
+/// どちらも省略 = 読むだけ / `path` = その行だけを選ぶ（見えている行だけ。開かない）/
+/// `key` = 選んでいる行の上でそのキーを押したのと同じ。応答は `selection`（paths / lead /
+/// anchor / remote。無ければ null）+ キーと行を選んだときは `changed`、開閉したら
+/// `expanded`（path / expanded）、ファイルを開いたら `opened`（OpenFile の応答）
+fn dispatch_tree_selection(
+    host: &mut dyn ControlHost,
+    path: Option<String>,
+    key: Option<String>,
+    tab: Option<u64>,
+    origin: PaneOrigin,
+) -> Result<Value, DispatchError> {
+    use tako_core::tree_select::{on_key, Key, KeyOutcome, Selection};
+    if let Some(tab) = tab {
+        let active = host.workspace().active_tab_id().as_u64();
+        if tab != active {
+            return Err(DispatchError::InvalidParams(format!(
+                "ファイルツリーはアクティブタブ（{active}）のものだけを出す（受け取った tab: {tab}）"
+            )));
+        }
+    }
+    let closed = || {
+        DispatchError::Operation(
+            "ファイルツリーが閉じている（`tako panel --filetree on` で開く）".into(),
+        )
+    };
+    match (path, key) {
+        (Some(_), Some(_)) => Err(DispatchError::InvalidParams(
+            "path（その行を選ぶ）と key（選んでいる行の上で押す）は同時に指定しない".into(),
+        )),
+        (None, None) => Ok(json!({ "selection": tree_selection_json(host.tree_selection()) })),
+        (Some(path), None) => {
+            if !host.filetree_visible() {
+                return Err(closed());
+            }
+            let want = PathBuf::from(&path);
+            let rows = host.tree_rows();
+            // 字面で当たらなければ実体の形で（`/tmp` と `/private/tmp` 等。ツリーの行は境界
+            // B26 で解いた形）
+            let row = rows.iter().find(|r| r.path == want).or_else(|| {
+                let canon = tako_core::platform::path::canonicalize_or_self(&want);
+                rows.iter()
+                    .find(|r| tako_core::platform::path::canonicalize_or_self(&r.path) == canon)
+            });
+            let Some(row) = row else {
+                return Err(DispatchError::Operation(format!(
+                    "ファイルツリーに見えていない行: {path}（畳んだフォルダの中・リモートの行は選べない）"
+                )));
+            };
+            let before = host.tree_selection();
+            let next = Selection::single(&row.path);
+            host.set_tree_selection(next.clone())
+                .map_err(DispatchError::Operation)?;
+            let after = host.tree_selection();
+            Ok(json!({
+                "selection": tree_selection_json(after),
+                "changed": before.map(|(s, _)| s) != Some(next),
+            }))
+        }
+        (None, Some(name)) => {
+            let key = Key::parse(&name).ok_or_else(|| {
+                let names: Vec<&str> = Key::ALL.iter().map(|k| k.as_str()).collect();
+                DispatchError::InvalidParams(format!(
+                    "key は {} のいずれか（受け取った値: {name}）",
+                    names.join(" / ")
+                ))
+            })?;
+            if !host.filetree_visible() {
+                return Err(closed());
+            }
+            let Some((prev, remote)) = host.tree_selection() else {
+                return Err(DispatchError::Operation(
+                    "ファイルツリーの行を選んでいない（先に path で選ぶ）".into(),
+                ));
+            };
+            let mut out = json!({ "key": key.as_str() });
+            if remote {
+                // リモート（SSH）の行は範囲の並び（ローカルの見えている行）に載らない = 動かさない
+                // （#1895 の ⇧↑ / ⇧↓ と同じ）
+                out["selection"] = tree_selection_json(Some((prev, true)));
+                out["changed"] = json!(false);
+                out["note"] = json!("リモート（SSH）の行はキーで動かさない");
+                return Ok(out);
+            }
+            let rows = host.tree_rows();
+            let next = match on_key(&prev, key, &rows) {
+                KeyOutcome::Select(next) => next,
+                KeyOutcome::Expand {
+                    dir,
+                    expanded,
+                    selection,
+                } => {
+                    host.set_tree_expanded(&dir, expanded);
+                    out["expanded"] = json!({
+                        "path": dir.display().to_string(),
+                        "expanded": expanded,
+                    });
+                    selection
+                }
+                KeyOutcome::Open { file, selection } => {
+                    // 素の押下と同じ（`open_file_row` = フォーカスペインからプレビューを開く）。
+                    // 開いた後のフォーカスペインで選び直す（行を押したときと同じ順）
+                    let pane = host.workspace().active_tab().tree().focused().as_u64();
+                    let opened = dispatch(
+                        host,
+                        Request::OpenFile {
+                            pane: Some(pane),
+                            path: file.display().to_string(),
+                            mode: None,
+                            direction: None,
+                            focus: Some(true),
+                            new_tab: false,
+                            line: None,
+                            column: None,
+                        },
+                        origin,
+                    )?;
+                    out["opened"] = opened;
+                    selection
+                }
+            };
+            let changed =
+                next != prev || out.get("expanded").is_some() || out.get("opened").is_some();
+            if next != prev || out.get("opened").is_some() {
+                host.set_tree_selection(next)
+                    .map_err(DispatchError::Operation)?;
+            }
+            out["selection"] = tree_selection_json(host.tree_selection());
+            out["changed"] = json!(changed);
+            Ok(out)
+        }
+    }
+}
+
 /// ファイルツリーの git ステータス（#1009）。
 ///
 /// 走査の起点は**そのタブのワークスペースフォルダ**（各ペインの cwd + 明示追加フォルダ）で、
@@ -18907,6 +19062,17 @@ mod tests {
         selections: std::collections::HashMap<u64, crate::protocol::LineColRange>,
         /// #1879: tako mod の状態（GUI の `claude_mod` の代役）
         claude_mod: tako_core::claude_mod::ModHub,
+        /// #1908: ファイルツリー（GUI の `filetree` と `tree_selection` の代役）
+        tree: MockTree,
+    }
+
+    /// #1908: ファイルツリーの代役（見えている行・選択・開閉の記録）
+    #[derive(Default)]
+    struct MockTree {
+        visible: bool,
+        rows: Vec<tako_core::tree_select::RowShape>,
+        selection: Option<(tako_core::tree_select::Selection, bool)>,
+        expands: Vec<(PathBuf, bool)>,
     }
 
     impl MockHost {
@@ -18992,6 +19158,7 @@ mod tests {
                 format_on_save: false,
                 selections: std::collections::HashMap::new(),
                 claude_mod: tako_core::claude_mod::ModHub::new(true),
+                tree: MockTree::default(),
             }
         }
 
@@ -19144,6 +19311,38 @@ mod tests {
         /// #1479: 右パネルの状態（`expand` が開くことを実測するために持つ）
         fn panel_state(&self) -> (bool, f32, crate::protocol::PanelViewWire) {
             self.panel
+        }
+
+        // #1908: ファイルツリーの選択（GUI の `host_tree_*` の代役）
+        fn filetree_visible(&self) -> bool {
+            self.tree.visible
+        }
+
+        fn tree_rows(&mut self) -> Vec<tako_core::tree_select::RowShape> {
+            if self.tree.visible {
+                self.tree.rows.clone()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn tree_selection(&self) -> Option<(tako_core::tree_select::Selection, bool)> {
+            self.tree.selection.clone().filter(|_| self.tree.visible)
+        }
+
+        fn set_tree_selection(
+            &mut self,
+            selection: tako_core::tree_select::Selection,
+        ) -> Result<(), String> {
+            self.tree.selection = Some((selection, false));
+            Ok(())
+        }
+
+        fn set_tree_expanded(&mut self, dir: &std::path::Path, expanded: bool) {
+            self.tree.expands.push((dir.to_path_buf(), expanded));
+            if let Some(row) = self.tree.rows.iter_mut().find(|r| r.path == dir) {
+                row.expanded = expanded;
+            }
         }
 
         fn set_panel(
@@ -39170,5 +39369,213 @@ mod tests {
         );
         let back: Request = serde_json::from_value(wire).unwrap();
         assert_eq!(back, many);
+    }
+
+    /// #1908: 擬似ツリー（/w の下に a.txt・d/（x.txt）・e/。/w と /w/d は開いている）
+    fn issue1908_host() -> MockHost {
+        let mut host = MockHost::new();
+        host.tree.visible = true;
+        host.tree.rows = [
+            ("/w", true, true, true),
+            ("/w/a.txt", false, false, false),
+            ("/w/d", true, true, false),
+            ("/w/d/x.txt", false, false, false),
+            ("/w/e", true, false, false),
+        ]
+        .into_iter()
+        .map(
+            |(path, is_dir, expanded, root)| tako_core::tree_select::RowShape {
+                path: PathBuf::from(path),
+                is_dir,
+                expanded,
+                root,
+            },
+        )
+        .collect();
+        host
+    }
+
+    fn issue1908_sel(
+        host: &mut MockHost,
+        path: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<Value, DispatchError> {
+        dispatch(
+            host,
+            Request::TreeSelection {
+                path: path.map(Into::into),
+                key: key.map(Into::into),
+                tab: None,
+            },
+            PaneOrigin::Mcp,
+        )
+    }
+
+    #[test]
+    fn issue1908_ツリーの選択を読み行を選びキーで動かす() {
+        let mut host = issue1908_host();
+        let sel = |host: &mut MockHost, path: Option<&str>, key: Option<&str>| {
+            issue1908_sel(host, path, key).unwrap()
+        };
+        assert_eq!(sel(&mut host, None, None), json!({ "selection": null }));
+        let err = issue1908_sel(&mut host, None, Some("down")).unwrap_err();
+        assert!(err.to_string().contains("選んでいない"), "{err}");
+        // 行を選ぶ（同じ行を選び直しても変わらない）
+        let v = sel(&mut host, Some("/w/a.txt"), None);
+        assert_eq!(v["selection"]["paths"], json!(["/w/a.txt"]));
+        assert_eq!(v["changed"], json!(true));
+        assert_eq!(
+            sel(&mut host, Some("/w/a.txt"), None)["changed"],
+            json!(false)
+        );
+        // ↓ = 1 行下だけ
+        let v = sel(&mut host, None, Some("down"));
+        assert_eq!(v["key"], json!("down"));
+        assert_eq!(v["selection"]["lead"], json!("/w/d"));
+        assert_eq!(v["changed"], json!(true));
+        // 端まで = 起点（/w/d）から末尾まで。もう端なら何も変えない
+        let v = sel(&mut host, None, Some("extend_bottom"));
+        assert_eq!(
+            v["selection"]["paths"],
+            json!(["/w/d", "/w/d/x.txt", "/w/e"])
+        );
+        assert_eq!(v["selection"]["anchor"], json!("/w/d"));
+        assert_eq!(v["selection"]["lead"], json!("/w/e"));
+        assert_eq!(
+            sel(&mut host, None, Some("extend_bottom"))["changed"],
+            json!(false)
+        );
+        assert_eq!(sel(&mut host, None, Some("down"))["changed"], json!(false));
+        // ↑ = 最後に押した行（/w/e）の 1 行上だけ
+        let v = sel(&mut host, None, Some("up"));
+        assert_eq!(v["selection"]["paths"], json!(["/w/d/x.txt"]));
+        // ← = 親へ → もう一度 ← = 畳む
+        assert_eq!(
+            sel(&mut host, None, Some("left"))["selection"]["lead"],
+            json!("/w/d")
+        );
+        let v = sel(&mut host, None, Some("left"));
+        assert_eq!(v["expanded"], json!({ "path": "/w/d", "expanded": false }));
+        assert_eq!(v["changed"], json!(true));
+        assert_eq!(host.tree.expands, vec![(PathBuf::from("/w/d"), false)]);
+        // → = 開く → もう一度 → = 最初の子へ
+        let v = sel(&mut host, None, Some("right"));
+        assert_eq!(v["expanded"], json!({ "path": "/w/d", "expanded": true }));
+        assert_eq!(
+            sel(&mut host, None, Some("right"))["selection"]["lead"],
+            json!("/w/d/x.txt")
+        );
+        // フォルダの上の Enter = 開閉（素の押下と同じ）
+        sel(&mut host, Some("/w/e"), None);
+        let v = sel(&mut host, None, Some("enter"));
+        assert_eq!(v["expanded"], json!({ "path": "/w/e", "expanded": true }));
+        assert!(v.get("opened").is_none());
+        // ⇧↑ / ⇧↓（#1895）も同じ口
+        let v = sel(&mut host, None, Some("extend_up"));
+        assert_eq!(v["selection"]["paths"], json!(["/w/d/x.txt", "/w/e"]));
+        let v = sel(&mut host, None, Some("extend_top"));
+        assert_eq!(
+            v["selection"]["paths"],
+            json!(["/w", "/w/a.txt", "/w/d", "/w/d/x.txt", "/w/e"])
+        );
+    }
+
+    #[test]
+    fn issue1908_ファイルの上のエンターは素の押下と同じく開いて選び直す() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-1908-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let mut host = issue1908_host();
+        host.tree.rows.push(tako_core::tree_select::RowShape {
+            path: file.clone(),
+            is_dir: false,
+            expanded: false,
+            root: false,
+        });
+        let root = host.root_pane();
+        let shown = file.display().to_string();
+        issue1908_sel(&mut host, Some(&shown), None).unwrap();
+        let v = issue1908_sel(&mut host, None, Some("enter")).unwrap();
+        let pane = v["opened"]["pane"].as_u64().expect("OpenFile の応答が載る");
+        assert_ne!(pane, root, "プレビューのペインが生える");
+        assert_eq!(host.ws.active_tab().tree().focused().as_u64(), pane);
+        assert_eq!(v["selection"]["paths"], json!([shown]));
+        assert_eq!(v["changed"], json!(true));
+        // 開けない（消えた）ファイルはエラー（GUI は行を押したときと同じ文言で通知する）
+        std::fs::remove_file(&file).unwrap();
+        assert!(issue1908_sel(&mut host, None, Some("enter")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue1908_断る形と動かさない形() {
+        let mut host = issue1908_host();
+        // path と key を同時に・知らない key・見えていない行・別のタブ
+        let both = issue1908_sel(&mut host, Some("/w/a.txt"), Some("down")).unwrap_err();
+        assert!(matches!(both, DispatchError::InvalidParams(_)), "{both}");
+        let bad = issue1908_sel(&mut host, None, Some("extend-up")).unwrap_err();
+        assert!(
+            bad.to_string().contains("extend_up") && bad.to_string().contains("enter"),
+            "語彙を全部挙げる: {bad}"
+        );
+        let hidden = issue1908_sel(&mut host, Some("/w/d/zzz"), None).unwrap_err();
+        assert!(hidden.to_string().contains("見えていない"), "{hidden}");
+        let other_tab = dispatch(
+            &mut host,
+            Request::TreeSelection {
+                path: None,
+                key: None,
+                tab: Some(9999),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(
+            other_tab.to_string().contains("アクティブタブ"),
+            "{other_tab}"
+        );
+        // リモート（SSH）の行はキーで動かさない（#1895 の ⇧↑ / ⇧↓ と同じ）
+        host.tree.selection = Some((
+            tako_core::tree_select::Selection::single(std::path::Path::new("/remote/a")),
+            true,
+        ));
+        let v = issue1908_sel(&mut host, None, Some("down")).unwrap();
+        assert_eq!(v["changed"], json!(false));
+        assert_eq!(v["selection"]["remote"], json!(true));
+        assert!(v["note"].as_str().is_some());
+        // ツリーが閉じている = 選べない・キーも効かない・読むと null
+        host.tree.visible = false;
+        for (path, key) in [(Some("/w/a.txt"), None), (None, Some("down"))] {
+            let e = issue1908_sel(&mut host, path, key).unwrap_err();
+            assert!(e.to_string().contains("tako panel --filetree on"), "{e}");
+        }
+        assert_eq!(
+            issue1908_sel(&mut host, None, None).unwrap(),
+            json!({ "selection": null })
+        );
+        // wire: 省略したものは現れない
+        let wire = serde_json::to_value(Request::TreeSelection {
+            path: None,
+            key: Some("down".into()),
+            tab: None,
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            json!({ "method": "tree_selection", "params": { "key": "down" } })
+        );
+        // 読むだけ・行を選ぶだけは描画を強制しない（Enter はペインが生えうるので強制する）
+        assert!(!crate::protocol::changes_layout(&Request::TreeSelection {
+            path: Some("/w/a".into()),
+            key: None,
+            tab: None,
+        }));
+        assert!(crate::protocol::changes_layout(&Request::TreeSelection {
+            path: None,
+            key: Some("enter".into()),
+            tab: None,
+        }));
     }
 }

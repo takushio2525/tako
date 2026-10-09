@@ -599,6 +599,10 @@ pub struct Progress {
     no_clone: AtomicBool,
     /// 数え終えた時刻（残り時間の目安の速さは、ここからの平均で測る。#1895）
     counted_at: std::sync::OnceLock<std::time::Instant>,
+    /// 最後にバイトが進んだ時刻（数え終えてからのナノ秒。0 = まだ進んでいない。#1908）
+    bytes_at_nanos: AtomicU64,
+    /// バイトが進んだ回数（写す単位ごと = 止まったと見なすまでの目安。#1908）
+    advances: AtomicU64,
 }
 
 /// ある時点の進み具合（応答・画面に載せる値）
@@ -614,6 +618,10 @@ pub struct ProgressSnapshot {
     pub cancelled: bool,
     /// 数え終えてから（= 写し始めてから）の時間。数えている間は 0（#1895 の残り時間の目安）
     pub copying_for: std::time::Duration,
+    /// 最後にバイトが進んだ時点（数え終えてからの時間。まだ進んでいなければ 0。#1908）
+    pub bytes_at: std::time::Duration,
+    /// バイトが進んだ回数（#1908）
+    pub advances: u64,
 }
 
 impl Progress {
@@ -641,6 +649,9 @@ impl Progress {
     }
 
     pub fn snapshot(&self) -> ProgressSnapshot {
+        // 進んだ時刻は「いま」（`copying_for`）より先に読む（後に読むと、間に届いた進みで
+        // 進んだ時刻がいまを越え、#1908 の見積もりがその 1 回だけ旧式へ落ちる）
+        let bytes_at = std::time::Duration::from_nanos(self.bytes_at_nanos.load(Ordering::Relaxed));
         ProgressSnapshot {
             entries_done: self.entries_done.load(Ordering::Relaxed),
             entries_total: self.entries_total.load(Ordering::Relaxed),
@@ -653,6 +664,8 @@ impl Progress {
                 .get()
                 .map(std::time::Instant::elapsed)
                 .unwrap_or_default(),
+            bytes_at,
+            advances: self.advances.load(Ordering::Relaxed),
         }
     }
 
@@ -664,6 +677,14 @@ impl Progress {
     fn add_done(&self, entries: u64, bytes: u64) {
         self.entries_done.fetch_add(entries, Ordering::Relaxed);
         self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+        if bytes > 0 {
+            // 進んだ時刻を残す（#1908 の残り時間は、この時刻までの平均の速さで見積もる）
+            if let Some(start) = self.counted_at.get() {
+                let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.bytes_at_nanos.store(nanos, Ordering::Relaxed);
+            }
+            self.advances.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -703,12 +724,26 @@ pub const ETA_MIN_ELAPSED: std::time::Duration = std::time::Duration::from_secs(
 /// 残り時間の目安を出し始めるまでに写したバイトの割合（千分率 = 1%）
 pub const ETA_MIN_PERMILLE: u64 = 10;
 
+/// 止まったと見なすまでの時間の下限（#1908）。これより短い途切れは数え下ろしを続ける
+pub const ETA_STALL_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// 止まったと見なすまでの時間 = 進みの平均の間隔のこの倍（#1908。遅い媒体で 1 回ごとの
+/// 間隔が長くても、ふだんの間隔のうちは止まったと見なさない）
+pub const ETA_STALL_FACTOR: f64 = 3.0;
+
 /// 残り時間の目安（GUI の帯・CLI / MCP の `copy_progress` の `eta_secs` が同じものを読む）。
 ///
 /// 写し始めてから（数え終えてから）の**平均の速さ**で残りのバイトを割る（直近の速さで割ると
 /// 1 チャンクごとに揺れる）。出さないとき: 数えている・取り消した・バイトが無い（空のフォルダと
 /// リンクだけ）・写し終えた・写し始めて [`ETA_MIN_ELAPSED`] 経っていない・
-/// [`ETA_MIN_PERMILLE`] ‰ 写していない
+/// [`ETA_MIN_PERMILLE`] ‰ 写していない。
+///
+/// **#1908: 平均の速さは最後にバイトが進んだ時点までで測り、そこから見積もった「写し終える
+/// 時刻」までを数え下ろす**。#1895 は「いま」までの平均で割っていたので、次の進み（macOS は
+/// 1 MiB ごと）が届くまでの間は分母の時間だけが伸びて見積もりが増え、届いた瞬間に減る =
+/// 一定の速さでも 1 チャンクごとにのこぎり状に揺れ、帯の表記が前後の粒度を行き来した。
+/// 数え下ろしは一定の速さなら単調に減り、GUI・CLI・MCP が状態を持たずに同じ値を読める。
+/// 進みが途切れて [`stall_after`] を越えたら（止まった）、越えた分だけ #1895 と同じ伸び方
+/// （残りのバイト ÷ 写したバイトの割合）で見積もりを後ろへずらす（つなぎ目で値が飛ばない）
 pub fn eta(snap: &ProgressSnapshot) -> Option<std::time::Duration> {
     if snap.counting
         || snap.cancelled
@@ -724,10 +759,47 @@ pub fn eta(snap: &ProgressSnapshot) -> Option<std::time::Duration> {
     {
         return None;
     }
-    let per_sec = snap.bytes_done as f64 / snap.copying_for.as_secs_f64();
-    let left = (snap.bytes_total - snap.bytes_done) as f64 / per_sec;
+    let left = estimate(snap, legacy_1908());
     // 何日もかかる見積もりは見せる意味が無い（帯は時間までしか書かない）
     (left.is_finite() && left < 100.0 * 3600.0).then(|| std::time::Duration::from_secs_f64(left))
+}
+
+/// [`eta`] の見積もりの式（秒・0 以上。出すかどうかは [`eta`] が決める）。`legacy` = #1908 の
+/// 前（「いま」までの平均の速さで割る）。単体テストが同じ入力で新旧の振れ幅を比べるために
+/// 分けてある（外からは [`eta`] だけを呼ぶ）
+fn estimate(snap: &ProgressSnapshot, legacy: bool) -> f64 {
+    let now = snap.copying_for.as_secs_f64();
+    let at = snap.bytes_at.as_secs_f64();
+    let done = snap.bytes_done as f64;
+    // 残りのバイト ÷ 写したバイト（平均の速さで割ると、残り時間 = この比 × 測った時間）
+    let ratio = (snap.bytes_total - snap.bytes_done) as f64 / done;
+    let left = if legacy || at <= 0.0 || at > now {
+        // #1895: いままでの平均の速さで割る（進みの時刻が無いときもこれ）
+        ratio * now
+    } else {
+        // 最後の進みから写し終えるまで（その時点までの平均の速さ）から、経った分を引く
+        let base = ratio * at;
+        let idle = now - at;
+        let stall = stall_after(snap).as_secs_f64();
+        if idle <= stall {
+            base - idle
+        } else {
+            // 止まっている: 越えた分だけ #1895 と同じ伸び方で後ろへずらす
+            base - stall + (idle - stall) * ratio
+        }
+    };
+    left.max(0.0)
+}
+
+/// 進みが途切れて止まったと見なすまでの時間（#1908）: 進みの平均の間隔の
+/// [`ETA_STALL_FACTOR`] 倍と [`ETA_STALL_MIN`] の大きい方
+pub fn stall_after(snap: &ProgressSnapshot) -> std::time::Duration {
+    let interval = if snap.advances == 0 {
+        std::time::Duration::ZERO
+    } else {
+        snap.bytes_at / u32::try_from(snap.advances).unwrap_or(u32::MAX)
+    };
+    interval.mul_f64(ETA_STALL_FACTOR).max(ETA_STALL_MIN)
 }
 
 /// 帯に書く残り時間（[`eta`] を粗く丸めたもの。150 ms ごとに描き直してもちらつかない粒度）
@@ -923,6 +995,16 @@ fn injected_chunk_delay() -> Option<std::time::Duration> {
 pub fn legacy_1895() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_1895_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// `TAKO_1908_LEGACY=1` で **#1908 の前**へ戻す（同一バイナリの A/B）: ツリーの ↑ / ↓ /
+/// ← / → / Enter / ⇧⌘↑ / ⇧⌘↓（Windows は Shift+Ctrl+Home / End）を受けない（ペインへ流れる）・
+/// 残り時間は「いま」までの平均の速さで割る（1 チャンクごとにのこぎり状に揺れる）。
+/// CLI / MCP の `tako tree selection` / `tako_tree_folder` の `selection` は同じ経路のまま
+/// （画面の入口だけを外す）
+pub fn legacy_1908() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1908_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// `TAKO_1860_LEGACY=1` で**ファイルツリーがコピー / 切り取り / 貼り付けのキーを受けない**
@@ -1654,6 +1736,7 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// いま進んだばかりの時点（進んだ時刻 = いま = #1895 の式と同じ値になる）
     fn snap(done: u64, total: u64, secs: f64) -> ProgressSnapshot {
         ProgressSnapshot {
             entries_done: 1,
@@ -1663,7 +1746,181 @@ mod tests {
             counting: false,
             cancelled: false,
             copying_for: std::time::Duration::from_secs_f64(secs),
+            bytes_at: std::time::Duration::from_secs_f64(secs),
+            advances: 1,
         }
+    }
+
+    /// 帯の表記を秒の大小で並べる（Soon < 10 秒 < … < 1 分 < …）
+    fn label_rank(label: EtaLabel) -> u64 {
+        match label {
+            EtaLabel::Soon => 0,
+            EtaLabel::Seconds(s) => s,
+            EtaLabel::Minutes(m) => m * 60,
+            EtaLabel::Hours { hours, minutes } => hours * 3600 + minutes * 60,
+        }
+    }
+
+    /// 合成したコピー（`arrivals` = 1 MiB ずつ進んだ時刻）を 150 ms ごとに読んだときの、
+    /// 見積もりの振れ（逆戻りの最大・逆戻りの合計・帯の表記が戻った回数・真の残りとの差の最大）
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Swing {
+        max_rise: f64,
+        total_rise: f64,
+        label_back: usize,
+        max_err: f64,
+        samples: usize,
+    }
+
+    fn swing(arrivals: &[f64], finish: f64, legacy: bool) -> Swing {
+        const MIB: u64 = 1 << 20;
+        let total = arrivals.len() as u64 * MIB;
+        let mut prev: Option<(f64, u64)> = None;
+        let mut out = Swing {
+            max_rise: 0.0,
+            total_rise: 0.0,
+            label_back: 0,
+            max_err: 0.0,
+            samples: 0,
+        };
+        // 読む時刻は進みの時刻とずらす（帯の刻みと写す単位は揃っていない）
+        let mut now = 0.07;
+        while now < finish {
+            let done = arrivals.iter().filter(|t| **t <= now).count() as u64;
+            let at = arrivals
+                .iter()
+                .copied()
+                .filter(|t| *t <= now)
+                .fold(0.0, f64::max);
+            let snap = ProgressSnapshot {
+                entries_done: 0,
+                entries_total: 1,
+                bytes_done: done * MIB,
+                bytes_total: total,
+                counting: false,
+                cancelled: false,
+                copying_for: std::time::Duration::from_secs_f64(now),
+                bytes_at: std::time::Duration::from_secs_f64(at),
+                advances: done,
+            };
+            // 出すかどうかは本物の `eta` で決め（新旧で同じ門）、値は新旧の式で比べる
+            if eta(&snap).is_some() {
+                let secs = estimate(&snap, legacy);
+                let rank = label_rank(eta_label(std::time::Duration::from_secs_f64(secs)));
+                if let Some((p, prank)) = prev {
+                    let rise = secs - p;
+                    if rise > 1e-9 {
+                        out.max_rise = out.max_rise.max(rise);
+                        out.total_rise += rise;
+                    }
+                    if rank > prank {
+                        out.label_back += 1;
+                    }
+                }
+                out.max_err = out.max_err.max((secs - (finish - now)).abs());
+                out.samples += 1;
+                prev = Some((secs, rank));
+            }
+            now += 0.15;
+        }
+        out
+    }
+
+    #[test]
+    fn 一定の速さのコピーでは残り時間が単調に減り旧式より振れない() {
+        // 40 MiB を 1 MiB ずつ 300 ms ごと（`TAKO_1895_COPY_CHUNK_DELAY_MS=300` と同じ形）= 12 秒
+        let arrivals: Vec<f64> = (1..=40).map(|k| k as f64 * 0.3).collect();
+        let new = swing(&arrivals, 12.0, false);
+        let old = swing(&arrivals, 12.0, true);
+        println!("ETA_SWING constant new={new:?} old={old:?}");
+        assert!(
+            new.samples > 50 && old.samples == new.samples,
+            "{new:?} {old:?}"
+        );
+        assert_eq!(new.max_rise, 0.0, "一定の速さなら一度も増えない: {new:?}");
+        assert_eq!(new.label_back, 0, "帯の表記が前の粒度へ戻らない: {new:?}");
+        assert!(
+            new.max_err < 1e-6,
+            "一定の速さなら真の残りと一致する: {new:?}"
+        );
+        // #1895 の式は 1 チャンクごとに増えて減り、帯の表記も行き来する（比べる相手が揺れている）
+        assert!(old.max_rise > 0.3 && old.label_back > 0, "{old:?}");
+    }
+
+    #[test]
+    fn 速さが揺れても旧式より振れ幅が小さい() {
+        // 300 ms ± 30% の決まった並びで揺らす（乱数を使わない = 毎回同じ）
+        let mut t = 0.0;
+        let arrivals: Vec<f64> = (0..60)
+            .map(|k| {
+                t += 0.3 * (1.0 + 0.3 * ((k * 7 % 11) as f64 / 5.0 - 1.0));
+                t
+            })
+            .collect();
+        let finish = *arrivals.last().unwrap();
+        let new = swing(&arrivals, finish, false);
+        let old = swing(&arrivals, finish, true);
+        println!("ETA_SWING jitter new={new:?} old={old:?}");
+        assert!(new.total_rise < old.total_rise, "{new:?} {old:?}");
+        assert!(new.max_rise < old.max_rise, "{new:?} {old:?}");
+        assert!(new.label_back <= old.label_back, "{new:?} {old:?}");
+    }
+
+    #[test]
+    fn 止まったら見積もりは数え下ろしをやめてつなぎ目で飛ばずに伸びる() {
+        // 40 MiB のうち 10 MiB を 300 ms ごとに写し（最後の進みは 3 秒）、そこで止まった
+        let at = 3.0;
+        let snap_at = |now: f64| ProgressSnapshot {
+            entries_done: 0,
+            entries_total: 1,
+            bytes_done: 10 << 20,
+            bytes_total: 40 << 20,
+            counting: false,
+            cancelled: false,
+            copying_for: std::time::Duration::from_secs_f64(now),
+            bytes_at: std::time::Duration::from_secs_f64(at),
+            advances: 10,
+        };
+        let left = |now: f64| eta(&snap_at(now)).unwrap().as_secs_f64();
+        // 平均の間隔 300 ms × 3 < 2 秒 = 2 秒までは数え下ろす（9 秒 → 7 秒）
+        assert_eq!(stall_after(&snap_at(4.0)), ETA_STALL_MIN);
+        assert!((left(3.0) - 9.0).abs() < 1e-6, "{}", left(3.0));
+        assert!((left(5.0) - 7.0).abs() < 1e-6, "{}", left(5.0));
+        // 止まったと見なした後は #1895 と同じ伸び方（残り ÷ 写した = 3 倍）で伸びる
+        assert!((left(6.0) - 10.0).abs() < 1e-6, "{}", left(6.0));
+        // つなぎ目で飛ばない（2 秒の前後 1 ms で差が 0.01 秒未満）
+        assert!((left(5.001) - left(4.999)).abs() < 0.01);
+        // 止まっている間に 0 へ落ちて「まもなく完了」と言い続けない
+        assert!(left(12.0) > 9.0, "{}", left(12.0));
+        // 遅い媒体（1 回の間隔が 1 秒）は 3 秒までふだんの途切れとして数え下ろす
+        let mut slow = snap_at(13.0);
+        slow.bytes_at = std::time::Duration::from_secs(10);
+        assert_eq!(stall_after(&slow), std::time::Duration::from_secs(3));
+        // 写し終える前の最後の 1 チャンク待ち = 0 で止まる（負にしない）
+        let mut last = snap_at(3.2);
+        last.bytes_done = (40 << 20) - 1;
+        last.bytes_at = std::time::Duration::from_secs_f64(3.0);
+        assert_eq!(eta(&last), Some(std::time::Duration::ZERO));
+        // 進みの時刻が無い（まだ記録が無い）・いまを越えている = #1895 の式へ落ちる
+        let mut none = snap(40_000_000, 100_000_000, 4.0);
+        none.bytes_at = std::time::Duration::ZERO;
+        assert!((eta(&none).unwrap().as_secs_f64() - 6.0).abs() < 0.01);
+        none.bytes_at = std::time::Duration::from_secs(5);
+        assert!((eta(&none).unwrap().as_secs_f64() - 6.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn 進んだ時刻と回数がバイトの進みにだけ載る() {
+        let progress = Progress::default();
+        progress.finish_counting();
+        progress.add_done(1, 0);
+        let s = progress.snapshot();
+        assert_eq!((s.bytes_at, s.advances), (std::time::Duration::ZERO, 0));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        progress.add_done(0, 1 << 20);
+        let s = progress.snapshot();
+        assert_eq!(s.advances, 1);
+        assert!(s.bytes_at > std::time::Duration::ZERO && s.bytes_at <= s.copying_for);
     }
 
     #[test]

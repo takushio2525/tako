@@ -310,6 +310,11 @@ pub fn copy_cancelling() -> &'static str {
 pub fn copy_cancel() -> &'static str {
     tr!("取り消し", "Cancel")
 }
+/// 選んでいる行の上のキー（↑ / ↓ / ← / → / Enter / ⇧↑ / ⇧↓ / ⇧⌘↑ / ⇧⌘↓）が断られたときの
+/// 操作名（#1908。通知欄の「〜できなかった」の主語）
+pub fn tree_key_op() -> &'static str {
+    tr!("ツリーの選択", "Tree selection")
+}
 /// ⌘⌫（Windows は Delete）でリモート（SSH）の行をごみ箱へ入れようとしたときの理由（#1895）
 pub fn trash_remote_refused() -> &'static str {
     tr!(

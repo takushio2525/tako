@@ -346,6 +346,26 @@ pub trait UiStateHost {
     }
     /// ファイルツリーの root 同期をトリガーする（#134: pinned_folders 変更後に呼ぶ）
     fn sync_filetree(&mut self) {}
+    /// ファイルツリーでいま見えているローカルの行（上から順。リモート（SSH）の行と説明行は
+    /// 載せない = ⇧クリックの範囲と同じ並び。FR-3.40 / #1908）。ツリーが閉じていれば空
+    fn tree_rows(&mut self) -> Vec<tako_core::tree_select::RowShape> {
+        Vec::new()
+    }
+    /// いま効いているファイルツリーの選択（キーの宛先がツリーか = 選んだときとタブ・
+    /// フォーカスペインが同じでツリーが見えている。#1908）。真 = リモート（SSH）の行
+    fn tree_selection(&self) -> Option<(tako_core::tree_select::Selection, bool)> {
+        None
+    }
+    /// ファイルツリーの選択を置き換える（いまのタブ・フォーカスペインで選ぶ = 行を押したのと
+    /// 同じ。最後に押した行を見えるところへスクロールする。#1908）
+    fn set_tree_selection(
+        &mut self,
+        _selection: tako_core::tree_select::Selection,
+    ) -> Result<(), String> {
+        Err("このホストはファイルツリーを持たない".into())
+    }
+    /// ファイルツリーのフォルダの行を開く / 畳む（← / → / Enter。#1908）
+    fn set_tree_expanded(&mut self, _dir: &std::path::Path, _expanded: bool) {}
 
     /// タブ `tab` のペインが**タブ内容領域の幅の `fraction` を占める**ときに、
     /// フォント倍率 `font_scale`（既定サイズに対する比率）で収まる桁数

@@ -217,9 +217,20 @@ impl Body {
 // --- 規則（本物にも注入にも同じ関数を当てる） -------------------------------------
 
 fn rule_keys(select: &Source, keys: &Source, sidebar: &Source) -> Check {
-    sidebar.body("tree_select_key_action")?.must_contain(
-        "tako_core::tree_select::extend(",
-        "⇧↑ / ⇧↓ の範囲を UI が自前で決めている（正本は `tree_select::extend` = ⇧クリックと同じ規則）",
+    // #1908 から画面のキーは dispatch の `TreeSelection`（CLI / MCP と同じ口）→ core の
+    // `tree_select::on_key` → `extend` を通る。見るのは同じ意図（UI が範囲を自前で決めない）
+    let action = sidebar.body("tree_select_key_action")?;
+    action.must_contain(
+        "tako_control::protocol::Request::TreeSelection {",
+        "⇧↑ / ⇧↓ の範囲を UI が自前で決めている（正本は `tree_select::extend` = ⇧クリックと同じ規則。#1908 から dispatch の `TreeSelection` を通る）",
+    )?;
+    action.must_not_contain(
+        "tree_select::extend(",
+        "⇧↑ / ⇧↓ の範囲を UI が自前で決めている（dispatch を通らない = CLI / MCP と割れる）",
+    )?;
+    select.body("on_key")?.must_contain(
+        "Key::ExtendUp => return KeyOutcome::Select(extend(prev, Step::Up, &order)),",
+        "⇧↑ が core の `extend`（⇧クリックと同じ規則）を通っていない",
     )?;
     select.body("extend")?.must_contain(
         "apply(Some(prev), &order[next], ClickKind::Range, order)",
@@ -466,15 +477,36 @@ fn must_name(check: Check, rel: &str, what: &str) {
 
 #[test]
 fn 注入_uiが範囲を自前で決めると名指す() {
+    // dispatch を通らず（#1908 の前の形 = UI が core を直に呼んで自前で当てる）
     let sidebar = injected(
         SIDEBAR,
-        "let next = tako_core::tree_select::extend(&sel.as_core(), step, &order);",
-        "let next = sel.as_core();",
+        "tako_control::protocol::Request::TreeSelection {",
+        "tako_control::protocol::Request::List {",
     );
     must_name(
         rule_keys(&source(SELECT), &source(KEYS), &sidebar),
         SIDEBAR,
         "fn tree_select_key_action",
+    );
+    let sidebar = injected(
+        SIDEBAR,
+        "        self.context_menu = None;\n        let Some(select) = key.select_key() else {",
+        "        self.context_menu = None;\n        let _ = tako_core::tree_select::extend(&sel.as_core(), step, &order);\n        let Some(select) = key.select_key() else {",
+    );
+    must_name(
+        rule_keys(&source(SELECT), &source(KEYS), &sidebar),
+        SIDEBAR,
+        "fn tree_select_key_action",
+    );
+    let select = injected(
+        SELECT,
+        "Key::ExtendUp => return KeyOutcome::Select(extend(prev, Step::Up, &order)),",
+        "Key::ExtendUp => return KeyOutcome::Select(prev.clone()),",
+    );
+    must_name(
+        rule_keys(&select, &source(KEYS), &source(SIDEBAR)),
+        SELECT,
+        "fn on_key",
     );
     let keys = injected(
         KEYS,
