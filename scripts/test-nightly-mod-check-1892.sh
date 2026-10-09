@@ -23,6 +23,7 @@
 #   Test 10 実物の claude（あれば）: 本物の mod で合格・壊れた写しで不合格・利用者の設定の mtime が一致
 #           （claude が無い CI では「未実測」と出して飛ばす）
 #   Test 11 文言一致の自己検査（#1903）: validate / test の注記の文言が変わったら落ちる
+#   Test 12 skills-dir（#1959）: setup が置く skills/tako が tako@skills-dir として読まれなくなったら落ちる
 #
 # 使い方: bash scripts/test-nightly-mod-check-1892.sh
 set -uo pipefail
@@ -119,6 +120,26 @@ fi
 [ "$1" = plugin ] || exit 2
 sub="$2"
 shift 2
+# plugin list --json（#1959 の skills-dir の段）: 実物と同じく設定 dir の skills/*/ の plugin.json の
+# name を `<name>@skills-dir` で並べる。list_mode が missing = 置き場が読まれなくなった Claude Code
+if [ "$sub" = list ]; then
+  case "$(mode_of list)" in
+    hang) exec "$S/hang" ;;
+    fail) echo "✘ forced failure (list)"; exit 1 ;;
+    missing) echo '[]'; exit 0 ;;
+    errors) printf '[\n  {\n    "id": "tako@skills-dir",\n    "enabled": false,\n    "errors": ["x"]\n  }\n]\n'; exit 0 ;;
+  esac
+  printf '['
+  sep=''
+  for p in "${CLAUDE_CONFIG_DIR:-/nonexistent}"/skills/*/.claude-plugin/plugin.json; do
+    [ -f "$p" ] || continue
+    name=$(sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' "$p" | head -1)
+    printf '%s\n  {\n    "id": "%s@skills-dir",\n    "enabled": true\n  }' "$sep" "$name"
+    sep=','
+  done
+  printf '\n]\n'
+  exit 0
+fi
 [ "${1:-}" = --strict ] && shift
 dir="$1"
 case "$(mode_of "$sub")" in
@@ -265,7 +286,7 @@ test_isolation() {
     [[ "$upd" = 1 ]] || bad=$((bad + 1))
     [[ -e "$cfg" ]] && cfg_left=$((cfg_left + 1))
   done < "$dir/stub/calls"
-  assert_eq "claude を 3 回（--version / validate / test）呼んだ" "3" "$n"
+  assert_eq "claude を 4 回（--version / validate / test / plugin list = #1959）呼んだ" "4" "$n"
   assert_eq "設定 dir は利用者のものではない使い捨て・作業 dir はリポジトリの外・自動更新は止める" "0" "$bad"
   assert_eq "使い捨ての設定 dir は終わったら消える" "0" "$cfg_left"
   assert_eq "利用者の settings.json の mtime が変わらない" "202601010000" "$(stat -f %Sm -t %Y%m%d%H%M "$dir/home/.claude/settings.json")"
@@ -516,6 +537,35 @@ test_reworded() {
   rm -f "$dir/stub/test_mode"
 }
 
+# --- Test 12: skills-dir から読まれる（#1959）-------------------------------------
+test_skills_dir() {
+  echo ""
+  echo "Test 12: skills-dir — setup が置く skills/tako が tako@skills-dir として読まれなくなったら落ちる（#1959）"
+  local dir out rc script mode
+  dir=$(make_env t12)
+  script="$dir/repo/scripts/check-claude-mod.sh"
+  sa() { env -i HOME="$dir/home" PATH="$dir/home/.local/bin:/usr/bin:/bin" /bin/bash "$script" "$@" 2>&1; }
+
+  rc=0
+  out=$(sa) || rc=$?
+  assert_eq "読まれる: exit 0" "0" "$rc"
+  assert_contains "読まれる: 合格の行" "$out" "skills-dir: 合格（tako@skills-dir が読み込まれる）"
+  assert_contains "読まれる: plugin list を呼んだ" "$(cat "$dir/stub/calls")" "plugin list --json"
+
+  for mode in missing errors fail; do
+    echo "$mode" > "$dir/stub/list_mode"
+    rc=0
+    out=$(sa) || rc=$?
+    assert_eq "list_mode=${mode}: exit 1" "1" "$rc"
+    assert_contains "list_mode=${mode}: 結果の行が skills-dir を名指す" "$out" "で skills-dir（"
+  done
+  echo missing > "$dir/stub/list_mode"
+  out=$(sa) || true
+  assert_contains "読まれない: 理由" "$out" "tako setup で入れた mod が効かない"
+  rm -f "$dir/stub/list_mode"
+  assert_eq "利用者の設定 dir に skills/ を作らない" "no" "$([ -e "$dir/home/.claude/skills" ] && echo yes || echo no)"
+}
+
 # --- Test 10: 実物の claude（あれば）-------------------------------------------
 test_real_claude() {
   echo ""
@@ -576,6 +626,7 @@ test_release_not_blocked
 test_runs_on_no_change_night
 test_standalone
 test_reworded
+test_skills_dir
 test_real_claude
 
 echo ""

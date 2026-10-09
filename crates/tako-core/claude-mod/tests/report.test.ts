@@ -131,6 +131,41 @@ describe('tako mod の報告', () => {
     expect(sent.length).toBe(2)
   })
 
+  test('利用者が /plugin で止めていれば理由を 1 回だけ報告して休眠する（env で読まれていても。#1959）', async ($, on) => {
+    const sent: Sent[] = []
+    world(on, sent)
+    on('settings.read', () => ({ value: { enabledPlugins: { 'tako@skills-dir': false } } }))
+    const clock = mock.clock(on)
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    await $.session.start(START)
+    await clock.advance(60_000)
+    expect(sent.length).toBe(1)
+    expect(sent[0]?.report).toEqual(expect.objectContaining({ dormant: 'user_disabled', ended: false }))
+    // 休眠中はターンが動いても送らない
+    await $.turn.start({ text: 'hello', turnId: 't1' })
+    await clock.advance(20_000)
+    expect(sent.length).toBe(1)
+  })
+
+  test('走っている間に止められたら次の見直しで休眠する（#1959）', async ($, on) => {
+    const sent: Sent[] = []
+    world(on, sent)
+    let disabled = false
+    on('settings.read', () => ({ value: { enabledPlugins: disabled ? { 'tako@skills-dir': false } : {} } }))
+    const clock = mock.clock(on)
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    await $.session.start(START)
+    await clock.advance(1_000)
+    expect(sent.length).toBe(1)
+    expect(sent[0]?.report.dormant).toBeUndefined()
+    disabled = true
+    await clock.advance(15_000)
+    expect(sent.at(-1)?.report.dormant).toBe('user_disabled')
+    const count = sent.length
+    await clock.advance(60_000)
+    expect(sent.length).toBe(count)
+  })
+
   test('使用制限の observed_at は値が変わったときだけ打ち直す（heartbeat では前の時刻のまま。#1903）', async ($, on) => {
     const sent: Sent[] = []
     const FIVE = { kind: 'five_hour', percentUsed: 3, resetsAt: '2026-10-08T14:30:00.000Z' }

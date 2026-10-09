@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # check-claude-mod.sh — tako mod（Claude Code の mod。crates/tako-core/claude-mod）を
-# `claude plugin validate --strict` / `claude plugin test` にかける（Issue #1892）
+# `claude plugin validate --strict` / `claude plugin test` にかけ、設定 dir の skills/tako に置いた写しが
+# tako@skills-dir として読まれることを見る（Issue #1892 / #1959）
 #
 # 使い方:
 #   scripts/check-claude-mod.sh                    # 作業ツリーの mod を検査する
@@ -169,6 +170,7 @@ MOD_SOURCE=""
 MOD_TREE=""
 VALIDATE="skipped"
 TEST="skipped"
+SKILLS_DIR="skipped"
 PREV_PASS_VERSION="$(state_get last_pass_claude_version)"
 PREV_PASS_TREE="$(state_get last_pass_mod_tree)"
 PREV_PASS_AT="$(state_get last_pass_at)"
@@ -219,6 +221,7 @@ finish() {
       echo "mod_tree=${MOD_TREE}"
       echo "validate=${VALIDATE}"
       echo "test=${TEST}"
+      echo "skills_dir=${SKILLS_DIR}"
       echo "summary=${summary}"
       echo "last_pass_at=${pass_at}"
       echo "last_pass_claude_version=${pass_ver}"
@@ -370,8 +373,49 @@ else
   echo "  test: 合格${COUNTS:+（${COUNTS}）}"
 fi
 
+# --- 6. skills-dir から読まれる（#1959）-----------------------------------------------
+# tako setup は設定 dir の skills/tako へ管理印つきの写しを置く。Claude Code の更新で skills-dir
+# という置き場が読まれなくなると、setup で入れた mod が黙って効かなくなる（env の注入は効き続けるので
+# tako のペインでは気づけない）。使い捨ての設定 dir に写しを置き、`claude plugin list --json` に
+# tako@skills-dir が読み込み済み（enabled: true・errors なし）で出ることを見る
+mkdir -p "$WORK/config/skills"
+rm -rf "$WORK/config/skills/tako"
+cp -R "$WORK/mod" "$WORK/config/skills/tako"
+rm -rf "$WORK/config/skills/tako/tests"
+printf '%s\n' '{"schema":1,"managed_by":"tako","tako_version":"check","content_hash":"","files":[]}' \
+  > "$WORK/config/skills/tako/.tako-managed"
+rc=0
+run_step "$TIMEOUT" "$WORK/skills.out" isolated_claude plugin list --json || rc=$?
+# 整形された JSON を 1 行へ畳み、tako@skills-dir の項目（最初の `}` まで）を取り出す
+SKILLS_ENTRY="$(tr -d ' \n\r\t' < "$WORK/skills.out" | grep -o '{"id":"tako@skills-dir"[^}]*' | head -1 || true)"
+if [ "$rc" -eq 124 ]; then
+  SKILLS_DIR="timeout"
+  FAILED="${FAILED:+${FAILED}・}skills-dir（${TIMEOUT} 秒で打ち切り）"
+  echo "  skills-dir: plugin list が ${TIMEOUT} 秒で返らないので打ち切った"
+elif [ "$rc" -ne 0 ]; then
+  SKILLS_DIR="fail"
+  FAILED="${FAILED:+${FAILED}・}skills-dir（plugin list が失敗）"
+  echo "  skills-dir: 不合格（plugin list が exit ${rc}）"
+  show_tail "$WORK/skills.out" 5
+elif [ -z "$SKILLS_ENTRY" ]; then
+  SKILLS_DIR="fail"
+  FAILED="${FAILED:+${FAILED}・}skills-dir（読まれない）"
+  echo "  skills-dir: 不合格（skills/tako に置いた写しが plugin list に tako@skills-dir として出ない ="
+  echo "    tako setup で入れた mod が効かない。置き場の仕様が変わった可能性。設計書 §9.4）"
+  show_tail "$WORK/skills.out" 10
+elif ! printf '%s' "$SKILLS_ENTRY" | grep -q '"enabled":true' \
+  || printf '%s' "$SKILLS_ENTRY" | grep -q '"errors"'; then
+  SKILLS_DIR="fail"
+  FAILED="${FAILED:+${FAILED}・}skills-dir（読み込みに失敗）"
+  echo "  skills-dir: 不合格（tako@skills-dir は見えるが enabled ではないか errors がある）"
+  show_tail "$WORK/skills.out" 10
+else
+  SKILLS_DIR="pass"
+  echo "  skills-dir: 合格（tako@skills-dir が読み込まれる）"
+fi
+
 if [ -z "$FAILED" ]; then
-  finish pass "合格 — claude ${CLAUDE_VERSION}（validate --strict・test${COUNTS:+ ${COUNTS}}）"
+  finish pass "合格 — claude ${CLAUDE_VERSION}（validate --strict・test${COUNTS:+ ${COUNTS}}・skills-dir）"
 fi
 HINT="$(cause_hint)"
 finish fail "不合格 — claude ${CLAUDE_VERSION} で ${FAILED} が落ちた${HINT:+。${HINT}}"

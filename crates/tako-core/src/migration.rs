@@ -100,6 +100,12 @@ pub enum SchemaId {
     /// `<data_dir>/claude-mod/ui.json`（tako mod の定型の UI 設定。#1960）。
     /// 版数は `schema_version`（他の種別の `version` ではない）
     ClaudeModUi,
+    /// `<Claude Code の設定 dir>/skills/tako/.tako-managed`（tako mod の管理印。#1959）。
+    ///
+    /// **tako の data dir の外**に置く唯一の種別（設定 dir ごとに 1 つ）。在ること自体が
+    /// 「tako が置いた写し」の宣言なので、形式の検査で退避させない（退避すると印が消え、
+    /// 写しが「利用者のもの」に見えて以後 tako が触れなくなる）
+    ClaudeModMark,
 }
 
 impl SchemaId {
@@ -130,6 +136,7 @@ impl SchemaId {
             Self::RemoteShortcuts => "remote_shortcuts",
             Self::RemoteDesired => "remote_desired",
             Self::ClaudeModUi => "claude_mod_ui",
+            Self::ClaudeModMark => "claude_mod_mark",
         }
     }
 
@@ -164,6 +171,7 @@ impl SchemaId {
             Self::RemoteShortcuts,
             Self::RemoteDesired,
             Self::ClaudeModUi,
+            Self::ClaudeModMark,
         ]
     }
 }

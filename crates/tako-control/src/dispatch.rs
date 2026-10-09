@@ -6887,7 +6887,8 @@ fn dispatch_inner(
             report,
             pane,
             ui,
-        } => crate::claude_mod::run(host, action.as_deref(), report, pane, ui),
+            dry_run,
+        } => crate::claude_mod::run(host, action.as_deref(), report, pane, ui, dry_run),
 
         Request::Lang { action, value } => {
             use tako_core::i18n::{self, LangSetting};
@@ -38739,6 +38740,7 @@ mod tests {
             report,
             pane,
             ui: None,
+            dry_run: false,
         }
     }
 
@@ -38762,6 +38764,7 @@ mod tests {
                 report: None,
                 pane: None,
                 ui: None,
+                dry_run: false,
             },
             PaneOrigin::Cli,
         )
@@ -38927,6 +38930,7 @@ mod tests {
             report: None,
             pane: None,
             ui: Some(serde_json::from_value(ui).unwrap()),
+            dry_run: false,
         }
     }
 
@@ -39138,6 +39142,64 @@ mod tests {
             assert_eq!(out["reason"]["code"], "claude_too_old", "{out}");
         }
         assert_eq!(out["min_claude_version"], "2.1.294");
+    }
+
+    /// #1959: install / uninstall は mod の報告で見えた設定 dir も置く先に入れ、dry-run では書かない。
+    /// テストは検証プロセスなので、このプロセスの CLAUDE_CONFIG_DIR が本物を指していても書かない
+    #[test]
+    fn modのinstallは報告で見えた設定dirへ置きdry_runでは書かない() {
+        if tako_core::claude_mod_install::legacy() {
+            return;
+        }
+        let mut host = MockHost::new();
+        host.claude_mod.claude_version = Some("2.1.294".into());
+        let cfg = tako_core::test_residue::ScratchDir::new("1959-dispatch");
+        host.claude_mod
+            .reported_config_dirs
+            .insert(cfg.display().to_string());
+        let req = |action: &str, dry_run: bool| Request::Mod {
+            action: Some(action.into()),
+            report: None,
+            pane: None,
+            ui: None,
+            dry_run,
+        };
+        let reported = |out: &Value| {
+            out["skills"]["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| {
+                    t["sources"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("reported"))
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("報告で見えた dir が置く先に無い: {out}"))
+        };
+        let out = dispatch(&mut host, req("install", true), PaneOrigin::Mcp).unwrap();
+        assert_eq!(out["dry_run"], true);
+        assert_eq!(reported(&out)["action"], "write", "{out}");
+        assert_eq!(reported(&out)["outcome"], "planned");
+        assert!(!cfg.join("skills").exists(), "dry-run で書いた");
+        // 一時 dir の外を指す置く先（このプロセスの CLAUDE_CONFIG_DIR 等）は書かれない
+        for t in out["skills"]["targets"].as_array().unwrap() {
+            assert_ne!(t["outcome"], "written", "{t}");
+        }
+        let out = dispatch(&mut host, req("install", false), PaneOrigin::Mcp).unwrap();
+        assert_eq!(reported(&out)["outcome"], "written", "{out}");
+        assert!(cfg.join("skills/tako/.tako-managed").is_file());
+        let status = dispatch(
+            &mut host,
+            mod_request("status", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(reported(&status)["state"], "installed", "{status}");
+        let out = dispatch(&mut host, req("uninstall", false), PaneOrigin::Mcp).unwrap();
+        assert_eq!(reported(&out)["outcome"], "removed", "{out}");
+        assert!(!cfg.join("skills/tako").exists());
     }
 
     /// `tako lsp format-on-save [on|off]` は既定 OFF を返し、切り替えた値と適用の範囲の注記を返す。

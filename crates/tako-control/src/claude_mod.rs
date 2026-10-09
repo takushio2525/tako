@@ -9,6 +9,7 @@
 //! | `on` / `off` | 設定 `claude_mod` の切替（次に作るペインから） | `tako mod on` / `off` | `tako_mod` |
 //! | `band-on` / `band-off` | Claude Code の画面の帯を出す / 隠す（S3 #1881。正本は ui.json の `band.hidden` = #1960。報告の応答で全 mod へ中継） | `tako mod band on` / `off` | `tako_mod` |
 //! | `ui` | 定型の UI 設定 ui.json の表示と変更（#1960。本体は [`crate::claude_mod_ui`]） | `tako mod ui …`（ローカル処理） | `tako_mod` |
+//! | `install` / `uninstall` | 設定 dir ごとの `skills/tako` へ写しを置く / 印つきの写しだけ外す（S7-1 #1959。`dry_run` で判断だけ） | `tako mod install` / `uninstall [--dry-run]`（ローカル処理） | `tako_mod` |
 //! | `report` | mod からの状態報告。応答は tako 側のスナップショット（帯・サイドバーの材料） | `tako mod report`（stdin） | **出さない** |
 //!
 //! `report` を MCP に載せないのは、AI が叩くと**自分の状態を偽って注入できるだけ**で、
@@ -27,15 +28,35 @@ use crate::dispatch::DispatchError;
 use crate::host::ControlHost;
 
 /// CLI / dispatch が受け付ける action
-pub const ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off", "ui", "report"];
+pub const ACTIONS: &[&str] = &[
+    "status",
+    "on",
+    "off",
+    "band-on",
+    "band-off",
+    "ui",
+    "install",
+    "uninstall",
+    "report",
+];
 /// MCP が受け付ける action（`report` は載せない。モジュール冒頭の理由）
-pub const MCP_ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off", "ui"];
+pub const MCP_ACTIONS: &[&str] = &[
+    "status",
+    "on",
+    "off",
+    "band-on",
+    "band-off",
+    "ui",
+    "install",
+    "uninstall",
+];
 
 /// `tako setup` の段（設計書 §3.2。GUI 起動時と並ぶ 2 つ目の発火点）。
 ///
 /// 展開するのは tako の data dir の中だけなので予告も `[y/N]` も要らない（Claude Code の
-/// 設定ファイルは 1 バイトも書かない）。**止めない**: 展開に失敗しても tako は画面の読み取りで
-/// 動くので、利用者へ残る作業にはしない（1 行の注意だけ）
+/// 設定 dir へ写しを置くのは別の段 = `claude_mod_install::run_setup_stage`。#1959）。
+/// **止めない**: 展開に失敗しても tako は画面の読み取りで動くので、利用者へ残る作業にはしない
+/// （1 行の注意だけ）
 pub fn run_setup_stage() -> String {
     if core::ab_off() {
         return format!(
@@ -228,8 +249,28 @@ pub fn run(
     report: Option<Value>,
     pane: Option<u64>,
     ui: Option<tako_core::claude_mod_ui::UiRequest>,
+    dry_run: bool,
 ) -> Result<Value, DispatchError> {
     match action.unwrap_or("status") {
+        // S7-1（#1959）: 設定 dir ごとの skills/tako。GUI が知っている材料（mod の報告で見えた
+        // 設定 dir・控えた claude の版・設定）で、CLI のローカル処理と同じ 1 実装を呼ぶ
+        "install" | "uninstall" => {
+            let hub = hub(host)?;
+            let reported: Vec<String> = hub.reported_config_dirs.iter().cloned().collect();
+            let ctx = crate::claude_mod_install::Context {
+                enabled: hub.enabled,
+                legacy: tako_core::claude_mod_install::legacy(),
+                claude_version: hub.claude_version.clone(),
+                verification: tako_core::paths::is_verification_process(),
+            };
+            crate::claude_mod_install::run_action(
+                action.unwrap_or_default(),
+                dry_run,
+                &reported,
+                &ctx,
+            )
+            .map_err(DispatchError::InvalidParams)
+        }
         "status" => status(host),
         "on" | "off" => {
             let enabled = action == Some("on");
@@ -317,10 +358,7 @@ fn accept_report(
         .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?
         .accept(pane_id.as_u64(), parsed, Instant::now());
     Ok(json!({
-        "accepted": match accepted {
-            Accepted::Stored => "stored",
-            Accepted::Ended => "ended",
-        },
+        "accepted": accepted.as_str(),
         "pane": pane_id.as_u64(),
         "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
         "tako": snapshot(host, pane_id, accepted, core::s3_legacy()),
@@ -460,7 +498,11 @@ fn pane_row(
     let raw = pane.as_u64();
     let injection = hub.injections.get(&raw);
     let stored = hub.reports.get(&raw);
+    let dormant = hub.dormant.get(&raw);
     let (state, reason) = match (stored, injection) {
+        // #1959: 利用者が Claude Code 側で止めた（mod の最後の報告）。休眠した mod はもう
+        // 報告しないので鮮度に依らず出す
+        _ if dormant.is_some() => ("user_disabled", reason_json(&OffReason::UserDisabled)),
         (Some(s), _) if core::is_fresh(s.received, now) => ("reporting", Value::Null),
         (Some(s), _) => (
             "stale",
@@ -542,7 +584,15 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
         "stale": count("stale"),
         "no_report": count("no_report"),
         "not_injected": count("not_injected"),
+        "user_disabled": count("user_disabled"),
     });
+    // S7-1（#1959）: 設定 dir ごとの skills/tako（読むだけ。報告で見えた dir も含む）
+    let reported: Vec<String> = hub.reported_config_dirs.iter().cloned().collect();
+    let skills = crate::claude_mod_install::status_json(
+        &reported,
+        hub.claude_version.as_deref(),
+        hub.enabled,
+    );
     Ok(json!({
         "enabled": hub.enabled,
         "injecting": injection.is_on(),
@@ -573,6 +623,7 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
             .as_deref()
             .zip(ui.as_ref())
             .map(|(path, loaded)| crate::claude_mod_ui::status_json(path, loaded)),
+        "skills": skills,
         "panes": panes,
     }))
 }

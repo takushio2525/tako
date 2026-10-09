@@ -2866,9 +2866,10 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_mod",
             "description": "tako mod（Claude Code の mod）の状態と切替。action: status（既定。\
                 claude の版・注入の有無・ペインごとの報告 = ctx / 使用制限 / turn と鮮度・\
-                報告が無い理由）/ on / off（次に作るペインから効く）/ band-on / band-off\
-                （Claude Code の画面の帯）/ ui（画面の UI 設定 ui.json。op 省略で今の値と選べる値。\
-                不正な値は書かずに使える値を返す）",
+                報告が無い理由・skills = 設定 dir ごとの導入）/ on / off（次に作るペインから効く）/ \
+                band-on / band-off（Claude Code の画面の帯）/ ui（画面の UI 設定 ui.json。op 省略で\
+                今の値と選べる値。不正な値は書かずに使える値を返す）/ install / uninstall\
+                （設定 dir の skills/tako へ写しを置く / 外す）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2897,6 +2898,10 @@ pub fn tools() -> Vec<Value> {
                     "label": {"type": "string"},
                     "hotkey": {"type": "string"},
                     "to": {"description": "button_move の先（1〜8 / first / last / left / right）"},
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "判断だけ返し書かない",
+                    },
                 },
                 "additionalProperties": false,
             },

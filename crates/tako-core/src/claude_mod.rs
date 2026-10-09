@@ -26,7 +26,7 @@
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -287,6 +287,14 @@ pub enum OffReason {
     ClaudeUnknown,
     /// claude の版が下限未満
     ClaudeTooOld(String),
+    /// ペインの claude の設定 dir に別の出どころの同名 `tako` がある（S7-1 #1959）。
+    /// inline（env）は installed / skills-dir より先に読まれるので、注入すると利用者の `tako` を潰す。
+    /// 中身は衝突の説明（[`crate::claude_mod_install::Conflict::describe`]）。`Box<str>` にするのは
+    /// `String` の変種が 2 つになると enum にタグが要って 8 バイト増え、`ModSnapshot` 越しに
+    /// `OffloadJob` の変種の大きさの差が clippy の閾値を越えるため（単体テストで大きさを固定）
+    NameConflict(Box<str>),
+    /// 利用者が Claude Code 側で tako mod を止めた（`/plugin` の disable。#1959）
+    UserDisabled,
 }
 
 impl OffReason {
@@ -298,6 +306,8 @@ impl OffReason {
             OffReason::NoCli => "no_cli",
             OffReason::ClaudeUnknown => "claude_unknown",
             OffReason::ClaudeTooOld(_) => "claude_too_old",
+            OffReason::NameConflict(_) => "name_conflict",
+            OffReason::UserDisabled => "user_disabled",
         }
     }
 
@@ -312,6 +322,13 @@ impl OffReason {
             }
             OffReason::ClaudeTooOld(v) => {
                 format!("claude {v} は下限 {MIN_CLAUDE_VERSION} 未満（`claude update` で上がる）")
+            }
+            OffReason::NameConflict(why) => {
+                format!("{why}（利用者の tako を優先し、このペインには注入しない）")
+            }
+            OffReason::UserDisabled => {
+                "Claude Code の /plugin で tako@skills-dir が止められている（利用者の選択を優先）"
+                    .into()
             }
         }
     }
@@ -609,6 +626,10 @@ pub struct ModReport {
     /// 帯の状態（S3 #1881。S3 前の mod は送らない）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub band: Option<ModBand>,
+    /// mod が休眠に入った理由（S7-1 #1959。いまは `user_disabled` = 利用者が Claude Code 側で
+    /// `tako@skills-dir` を止めた）。これを最後に mod は報告を止める
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dormant: Option<String>,
     #[serde(default)]
     pub ended: bool,
 }
@@ -651,6 +672,7 @@ pub fn parse_report(value: serde_json::Value) -> Result<ModReport, String> {
         &mut report.effort,
         &mut report.pending_tool,
         &mut report.config_dir,
+        &mut report.dormant,
     ]
     .into_iter()
     .flatten()
@@ -920,6 +942,15 @@ pub struct ModHub {
     pub injections: HashMap<u64, PaneInjection>,
     /// ペインごとの最終報告
     pub reports: HashMap<u64, StoredReport>,
+    /// mod が休眠を告げたペイン → 理由（S7-1 #1959。報告の `dormant`）。休眠した mod はもう
+    /// 報告しないので鮮度では消さず、ペインが閉じるか次の報告が来るまで `tako mod` の行に出す
+    pub dormant: HashMap<u64, String>,
+    /// mod の報告で見えた設定 dir（`CLAUDE_CONFIG_DIR` の値。S7-1 #1959）。既定の dir は
+    /// `config_dir` 無しで届くので入らない（既定は初めから置く先に入っている）
+    pub reported_config_dirs: BTreeSet<String>,
+    /// [`Self::reported_config_dirs`] のうち、まだ `skills/tako` を置きに行っていないもの
+    /// （GUI が背景で片付ける = 起動時の差分検出の 2 段目）
+    pub pending_config_dirs: Vec<String>,
 }
 
 /// [`ModHub::accept`] の結果
@@ -928,6 +959,18 @@ pub enum Accepted {
     Stored,
     /// `ended: true` を受けて捨てた
     Ended,
+    /// `dormant` を受けた（mod は休眠に入り、これを最後に報告を止める。#1959）
+    Dormant,
+}
+
+impl Accepted {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Accepted::Stored => "stored",
+            Accepted::Ended => "ended",
+            Accepted::Dormant => "dormant",
+        }
+    }
 }
 
 impl ModHub {
@@ -960,10 +1003,22 @@ impl ModHub {
 
     /// 報告を受け取る。`ended` ならそのペインの報告を捨てる
     pub fn accept(&mut self, pane: u64, report: ModReport, now: Instant) -> Accepted {
+        if let Some(dir) = report.config_dir.as_ref().filter(|d| !d.is_empty()) {
+            if self.reported_config_dirs.insert(dir.clone()) {
+                self.pending_config_dirs.push(dir.clone());
+            }
+        }
         if report.ended {
             self.reports.remove(&pane);
             return Accepted::Ended;
         }
+        if let Some(why) = report.dormant {
+            // 休眠した mod の値は以後更新されないので一次ソースに使わない（画面の読み取りへ落ちる）
+            self.reports.remove(&pane);
+            self.dormant.insert(pane, why);
+            return Accepted::Dormant;
+        }
+        self.dormant.remove(&pane);
         let count = self.reports.get(&pane).map_or(0, |s| s.count) + 1;
         self.reports.insert(
             pane,
@@ -1048,6 +1103,12 @@ impl ModHub {
     pub fn forget_pane(&mut self, pane: u64) {
         self.injections.remove(&pane);
         self.reports.remove(&pane);
+        self.dormant.remove(&pane);
+    }
+
+    /// まだ置きに行っていない、報告で見えた設定 dir を取り出す（#1959）
+    pub fn take_pending_config_dirs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_config_dirs)
     }
 }
 
@@ -1708,6 +1769,64 @@ mod tests {
         hub.accept(5, parse_report(report_json()).unwrap(), Instant::now());
         hub.forget_pane(5);
         assert!(hub.injections.is_empty() && hub.reports.is_empty());
+    }
+
+    #[test]
+    fn issue1959_報告の設定dirは初めて見たときだけ置きに行く先へ積む() {
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        let report = parse_report(report_json()).unwrap();
+        hub.accept(1, report.clone(), t0);
+        hub.accept(2, report.clone(), t0);
+        assert_eq!(hub.take_pending_config_dirs(), vec!["/cfg".to_string()]);
+        hub.accept(3, report.clone(), t0);
+        assert!(
+            hub.take_pending_config_dirs().is_empty(),
+            "同じ dir を 2 度積んだ"
+        );
+        // 既定の dir（config_dir 無し）と空は積まない
+        let mut default_dir = report;
+        default_dir.config_dir = None;
+        hub.accept(4, default_dir.clone(), t0);
+        default_dir.config_dir = Some(String::new());
+        hub.accept(4, default_dir, t0);
+        assert!(hub.take_pending_config_dirs().is_empty());
+        assert_eq!(hub.reported_config_dirs.len(), 1);
+    }
+
+    #[test]
+    fn issue1959_注入しない理由はstring_1つ分の大きさに収まる() {
+        // 大きくなると ModSnapshot（ModUnavailable 越し）→ OffloadJob の変種の差が clippy の
+        // large_enum_variant の閾値を越える。変種に String を足すなら Box<str> にする
+        assert_eq!(
+            std::mem::size_of::<OffReason>(),
+            std::mem::size_of::<String>()
+        );
+    }
+
+    #[test]
+    fn issue1959_休眠の報告は一次ソースから外し理由を残す() {
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        let report = parse_report(report_json()).unwrap();
+        hub.accept(6, report.clone(), t0);
+        let mut dormant = report.clone();
+        dormant.dormant = Some("user_disabled".into());
+        assert_eq!(hub.accept(6, dormant, t0), Accepted::Dormant);
+        assert!(
+            hub.fresh_report(6, t0).is_none(),
+            "休眠した mod の値を使い続けた"
+        );
+        assert_eq!(
+            hub.dormant.get(&6).map(String::as_str),
+            Some("user_disabled")
+        );
+        // 利用者が戻して mod が報告を再開したら休眠の印は消える
+        assert_eq!(hub.accept(6, report, t0), Accepted::Stored);
+        assert!(hub.dormant.is_empty());
+        hub.dormant.insert(7, "user_disabled".into());
+        hub.forget_pane(7);
+        assert!(hub.dormant.is_empty());
     }
 
     fn limit(kind: &str, pct: f64, resets: &str, observed: u64) -> ModRateLimit {

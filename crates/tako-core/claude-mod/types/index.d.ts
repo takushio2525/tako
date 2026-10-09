@@ -56,6 +56,11 @@ export type TakoModReport = {
   config_dir?: string
   /** 帯の状態（#1881。描いた文字列は載せない = 区切りの種類だけ） */
   band?: TakoBand
+  /**
+   * 休眠に入った理由（#1959）。user_disabled = 利用者が Claude Code の /plugin で tako@skills-dir を
+   * 止めた（env の注入で読まれていても従う）。これを最後に mod は報告を止める
+   */
+  dormant?: 'user_disabled'
   /** session.end を受けた最後の報告。tako はそのペインの報告を即座に捨てる */
   ended: boolean
 }

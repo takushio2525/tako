@@ -51,6 +51,7 @@ const CATEGORIES = [
     'worker_prompt_undelivered', 'worker_death_resume',
     'worker_refusal_detect', 'worker_refusal_work_proof',
     'worker_login_expired_detect', 'claude_mod_state', 'claude_mod_band', 'claude_mod_ui',
+    'claude_mod_install',
   ]],
   ['worker への指示と応答', [
     'worker_prompt_delivery', 'worker_delivery_peer',
