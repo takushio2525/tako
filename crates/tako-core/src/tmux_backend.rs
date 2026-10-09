@@ -244,8 +244,12 @@ set -gq copy-mode-position-format ''
 /// サーバーは既定設定（status on / mouse off / extended-keys off / prefix C-b）で
 /// 立ち上がり、ステータスバーが出る・ホイールが素通しされない・Shift+Enter が
 /// 素の Enter に劣化する（#28 / #167 と同じ症状クラス）。rename は同一ディレクトリ内で
-/// 原子的なので、読み手は常に完全な conf を見る
-fn ensure_conf() -> PathBuf {
+/// 原子的なので、読み手は常に完全な conf を見る。
+///
+/// `pub` なのはセルフテスト（#772）が**この backend のソケット**へ自分で器を立てるため。
+/// そこでサーバーが初めて起きると、後続のペインは同じサーバーを使う（`-f` は起動時にしか
+/// 読まれない）ので、製品と同じ conf で起こす（#1918）
+pub fn ensure_conf() -> PathBuf {
     let body = conf_body();
     data_dir()
         .and_then(|dir| write_conf_in(&dir, &body).ok())
@@ -642,8 +646,9 @@ pub(crate) fn shell_quoted(command: &SpawnCommand) -> String {
 ///
 /// - `tako-coretest-`: 既定
 /// - `tk-coretest-`: **`tako` で始まらない名前**が要る検査用（#1105: シェル統合が名前の
-///   接頭辞 `tako*` で器を推測しないことを確かめる）。製品の掃除（`tako tmux cleanup`）も
-///   `tk*` を tako の系統として一覧に載せる（kill はしない = 残骸ソケットの削除だけ）
+///   接頭辞 `tako*` で器を推測しないことを確かめる）。製品の掃除（`tako tmux cleanup --servers`）も
+///   この接頭辞（`tmux_cleanup::CORE_TEST_SHORT_PREFIX`）だけは名前の pid の生死で kill する
+///   （#1918。`tk*` 全体は手書きの名前なので kill しない = 残骸ソケットの削除だけ）
 ///
 /// 接頭辞から外れた名前（#1874 の時点の `tako-coretest1857-<pid>` / `ct1105-<pid>`）は、
 /// テストプロセスが途中で殺されると誰にも回収されない。番犬

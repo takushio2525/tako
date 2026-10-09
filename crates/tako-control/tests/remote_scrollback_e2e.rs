@@ -37,12 +37,10 @@ fn container_bin() -> Option<String> {
 /// 「緑」に見せる。#796 の作法）。`-x` / `-y` は器によっては受けないので、
 /// 落ちたらサイズ指定なしで作り直す
 fn start_session(bin: &str, socket: &str) -> Result<(), String> {
-    // tmux は `-f /dev/null` で利用者の `~/.tmux.conf` を読ませない（#1874）。
-    // psmux（Windows）は `-f` が利用者の設定を外すかを実測していないので、これまでどおり渡さない
-    let conf: &[&str] = match tako_core::backend::binary() {
-        tako_core::backend::Binary::Tmux { .. } => &["-f", "/dev/null"],
-        _ => &[],
-    };
+    // 器は `-f` で利用者の設定（tmux は `~/.tmux.conf`、psmux は `~/.psmux.conf` 等）を
+    // 読ませない（#1874）。psmux も `-f` で既定の探索をしないことを実測済み（#1918）。
+    // 値は OS の null デバイス（psmux は読めないパスで設定警告を出す版がある）
+    let conf: &[&str] = &["-f", tako_core::tmux::NO_USER_CONF];
     let sized = run(
         bin,
         &[

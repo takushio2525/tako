@@ -542,9 +542,21 @@ impl ServerVerdict {
     }
 }
 
-/// kill してよい名前の系統（`tako-` で始まるもの限定。既定サーバー `tako` は含まない）
+/// tako-core の lib テストの器のうち、`tako` で始められない検査（#1105 = シェル統合の
+/// フォールバックが `tako*` を見る）が使う接頭辞。正本は `tmux_backend.rs` の
+/// `TEST_SOCKET_PREFIXES`（`#[cfg(test)]`）で、そちらとの一致はテストが見る
+pub const CORE_TEST_SHORT_PREFIX: &str = "tk-coretest-";
+
+/// kill してよい名前の系統（`tako-` と [`CORE_TEST_SHORT_PREFIX`]。既定サーバー `tako` は含まない）。
+///
+/// どちらも**コードが `std::process::id()` を `-` 区切りの 1 区画で埋める名前**なので、
+/// 名前の pid を所有者と読んでよい。`tk*` 全体は入れない: 単発検証で人や worker が手で
+/// 付ける名前（`tkrev0909` 等。#1192 の棚卸し）で、数字が日付や Issue 番号でありうる
+/// = 「名前の数字が死んでいる」を所有者の死と読めない（#625 の事故クラス）。
+/// `tk-coretest-` も入れていなかった間は、テストが途中で殺された器が `owner_unknown` のまま
+/// 次の tako-core の lib テスト（`TmuxTestGuard`）が走るまで残った（#1918）
 pub fn is_killable_socket_name(name: &str) -> bool {
-    name.starts_with("tako-")
+    name.starts_with("tako-") || name.starts_with(CORE_TEST_SHORT_PREFIX)
 }
 
 /// 残骸ソケット（サーバー不在）としてファイルを消してよい名前の系統。
@@ -1562,6 +1574,62 @@ mod tests {
                 verdict
             );
         }
+    }
+
+    /// #1918: tako-core の lib テストの器（`tk-coretest-<用途>-<pid>`）は所有者の生死で回収する。
+    /// 手で付ける `tk*` は名前の数字を pid と読めないので、これまでどおり触らない
+    #[test]
+    fn issue1918_tk_coretestは所有者の生死で回収しtkの手書きは触らない() {
+        let cases = [
+            // テストプロセスが生きている = 隣で走っている lib テストの器
+            (
+                server("tk-coretest-1105-4242", true, 0, &[4242]),
+                "owner_alive",
+            ),
+            // テストプロセスが途中で死んだ残骸（Drop が走っていない）
+            (server("tk-coretest-1105-4242", true, 0, &[]), "reclaimable"),
+            // 名前の区画のどれか 1 つでも生きて見えれば保護（pid の再利用は安全側）
+            (
+                server("tk-coretest-1105-4242", true, 0, &[1105]),
+                "owner_alive",
+            ),
+            // 接頭辞が合っていても pid の区画が無い・長すぎて pid と読めない名前は触らない
+            (server("tk-coretest-manual", true, 0, &[]), "owner_unknown"),
+            (
+                server("tk-coretest-x-123456789", true, 0, &[]),
+                "owner_unknown",
+            ),
+            // 単発検証の手書きの名前（#1192 の棚卸しの `tk*`）は数字があっても触らない
+            (server("tk-rev-0909", true, 0, &[]), "owner_unknown"),
+            (server("tkrev0909", true, 0, &[]), "owner_unknown"),
+            // サーバーが居ない残骸ソケットは従来どおり `tk*` 全体を消してよい
+            (server("tkrev0909", false, 0, &[]), "stale_socket"),
+        ];
+        for (entry, want) in cases {
+            let verdict = judge_server(&entry, "other", &[]);
+            assert_eq!(
+                verdict.code(),
+                want,
+                "socket={} live={:?} → {:?}",
+                entry.socket,
+                entry.live_owner_pids,
+                verdict
+            );
+        }
+    }
+
+    /// テストの器の接頭辞（`TmuxTestGuard` の正本）はすべて製品の掃除も kill できる名前。
+    /// 片方だけ増やすと、テストが途中で殺された器が製品の掃除から漏れる（#1918）
+    #[test]
+    fn issue1918_テストの器の接頭辞は製品の掃除もkillできる() {
+        for prefix in crate::tmux_backend::TEST_SOCKET_PREFIXES {
+            let name = format!("{prefix}x-4242");
+            assert!(
+                is_killable_socket_name(&name),
+                "{prefix} の器を製品の掃除が kill できない（owner_unknown のまま残る）"
+            );
+        }
+        assert!(crate::tmux_backend::TEST_SOCKET_PREFIXES.contains(&CORE_TEST_SHORT_PREFIX));
     }
 
     #[test]

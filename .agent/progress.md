@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1960: tako mod S7-2 = 画面の UI 設定 ui.json を CLI / MCP / setup の同じ口で選んで変える。既定ボタン /compact）
-- 正本 `tako_core::claude_mod_ui`（語彙・既定・検証・寛容な読み込み・一時ファイル → rename）を CLI `tako mod ui`（ローカル処理）/ MCP `tako_mod` の `action=ui` / setup（`--answers` の `mod_ui`・`--review` の最後の 3 択 + ボタン）が通る。帯のトグルの正本を `$.store` から ui.json の `band.hidden` へ（応答の `band_request` をここから作り、報告の新しい `toggled_at` は取り込む）・`tako.view.ui`・#916 の `SchemaId::ClaudeModUi`・MATRIX `claude_mod_ui`・カタログ +1,506 B
-- 実測: core 16 本（ランダムな操作列 1,000 通りで常に形を満たす）・dispatch 3 本・番犬 `issue1960_mod_ui_watchdog`（3 つの口で ui.json が字面で一致・注入 10 通りを file:line で名指し）・`scripts/test-mod-ui-1960.sh` 67 PASS 0 FAIL（/bin/bash・隔離 GUI 越しの MCP / report / band を含む）・`scripts/test-mod-ui-llm.sh` の採点器 oracle 20/20・null 1/20（実モデルは API キーが無く未実測）
-
 ## 2026-10-10（#1959: tako mod S7-1 = setup が Claude Code の設定 dir ごとに skills/tako へ管理印つきの写しを入れる）
 - 判断と書き込みは `tako_core::claude_mod_install`（印 `.tako-managed`・衝突の読み取り・`skills/.tako.tmp-*` からの差し替え・検証プロセスは一時 dir の外へ書かない番人）、置く先の解決と JSON / setup の文面は `tako_control::claude_mod_install`。発火は setup の段・GUI 起動時・mod の報告の `config_dir` の差分検出、口は `tako mod install|uninstall [--dry-run]`（MCP `tako_mod`・カタログ +217 B）。衝突 / `/plugin` で止めた設定 dir のペインへは env も注入せず mod も休眠（`dormant`）。A/B `TAKO_1959_LEGACY=1`・MATRIX `claude_mod_install`・SPECS `claude_mod_mark`
 - 実測: `scripts/test-mod-skills-1959.sh` CLI 62 PASS・GUI 13 PASS（実 claude 2.1.294・一時 HOME。plugin list に tako@skills-dir・env 注入と同時でも hooks module は tako@inline の 1 つ・本物の ~/.claude* は前後で同じ）・`claude plugin test` 30 本・番犬（注入 15 通りを file:line で名指し）
@@ -59,3 +55,7 @@
 ## 2026-10-09（#1921: release-windows の rust-cache を外し、タグごとに一度も当たらないキャッシュを毎晩約 1.6 GB 保存して main / PR のキャッシュを押し出すのを止めた）
 - 公式文書「タグの run は別のタグのキャッシュを読めない（読めるのは自分の ref と main）」と、v0.8.16〜v0.8.28 の 13 回すべての「No cache found.」+ 保存 1.60〜1.61 GB を実測。main は debug のキャッシュだけで release の target に効かない（依存の取得 約 60 秒 / その復元 約 55 秒）ので (a) save-if: false ではなく (b) 外す
 - `scripts/test-cargo-root-manifest-key-1915.sh` に「タグで起動しうる workflow の rust-cache は 0 本」（判定の自己検査 8 通り）。34 PASS・注入 2 通り（修正前の yml / ci.yml にタグ起動）で名指しの FAIL・actionlint 0 件。所要は rust-cache の前後ステップ平均 108 秒ぶん縮む見込み
+
+## 2026-10-09（#1918: セルフテストの器にも -f・tk-coretest の残骸を製品の掃除で回収・psmux の e2e も -f NUL）
+- セルフテストの `-f` なし 6 か所（字面 48 / 68 / 73 / 103 + シェルへ打ち込む 1d / 61f。1d は固定名 `takoST` → pid 入り。103 / 61f は backend の conf）を直し、番犬を `mod self_test` とシェル文字列の `-L … new-session` へ広げた。`is_killable_socket_name` に `tk-coretest-` だけ足した（`tk*` は手書きなので据え置き）。psmux は CI で v3.3.7 / v3.3.8 を実測し `-f NUL` で既定の探索をしない → e2e を `Fixture::new_session` へ寄せた
+- 実測: 偽の HOME の `.tmux.conf` がセルフテストで 5 → 0 回・番犬は土台の main.rs で 6 か所を file:line で名指し・回収の注入で新テスト 3 本が落ちる・psmux の `-f /dev/null` は v3.3.8 で設定警告

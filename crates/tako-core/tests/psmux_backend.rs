@@ -78,6 +78,19 @@ impl Fixture {
         (ran.ok, ran.text)
     }
 
+    /// 器を**利用者の設定を読まずに**起こす `new-session`（`rest` はその後ろの引数。#1918）。
+    ///
+    /// psmux は `-f` が無いと `~/.psmux.conf` → `~/.psmuxrc` → `~/.tmux.conf` → … の最初の
+    /// 1 つを読み、既定の設定を読み込んだ先読みサーバー（warm）を横取りしうる。`-f` を
+    /// 渡すとそのどちらもしない（psmux の `load_config` と `new-session` の分岐。CI の
+    /// Windows ランナーで v3.3.7 / v3.3.8 を実測）。読めないパスを渡すと設定警告を出す版が
+    /// あるので、値は `/dev/null` ではなく `NUL`（[`tako_core::tmux::NO_USER_CONF`]）
+    fn new_session(&self, rest: &[&str]) -> (bool, String) {
+        let mut args: Vec<&str> = vec!["-f", tako_core::tmux::NO_USER_CONF, "new-session"];
+        args.extend_from_slice(rest);
+        self.raw(&args)
+    }
+
     /// セッションの接続クライアント数（`None` = そのセッションがもう無い）。
     ///
     /// 「クライアントが死んでも器は生きている」を**固定 sleep ではなく状態**で
@@ -471,7 +484,7 @@ fn killはイコール無しで即座に効く() {
         .command
         .expect("wrap_spawn が起動コマンドを返す");
     // クライアントを立てずに器だけ作る（PTY を挟まない純粋な CLI 検証）
-    let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str()]);
     assert!(ok, "器を作れる: {out}");
     assert!(f.backend.exists(&name));
 
@@ -494,7 +507,7 @@ fn killは前方一致する別の器を巻き込まない() {
     let short = session("tako-m2prefix001");
     let long = session("tako-m2prefix0011");
     for name in [&short, &long] {
-        let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+        let (ok, out) = f.new_session(&["-d", "-s", name.as_str()]);
         assert!(ok, "器 {name} を作れる: {out}");
     }
     f.backend.kill(&short).expect("kill が成功する");
@@ -586,8 +599,7 @@ fn 本番が書くconfも警告なしで受理される() {
 fn セッション環境変数を全変数出力から取り出せる() {
     let f = fixture!("env");
     let name = session("tako-m2env000001");
-    let (ok, out) = f.raw(&[
-        "new-session",
+    let (ok, out) = f.new_session(&[
         "-d",
         "-s",
         name.as_str(),
@@ -627,7 +639,7 @@ fn セッション環境変数を全変数出力から取り出せる() {
 fn pane_ttyは偽のttyを外へ出さない() {
     let f = fixture!("tty");
     let name = session("tako-m2tty000001");
-    let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str()]);
     assert!(ok, "器を作れる: {out}");
 
     let (_, raw) = f.raw(&["list-panes", "-t", name.as_str(), "-F", "#{pane_tty}"]);
@@ -647,7 +659,7 @@ fn pane_ttyは偽のttyを外へ出さない() {
 fn history_bytesは空のままというカナリア() {
     let f = fixture!("hist");
     let name = session("tako-m2hist00001");
-    let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str()]);
     assert!(ok, "器を作れる: {out}");
     let (_, probe) = f.raw(&[
         "list-panes",
@@ -686,14 +698,7 @@ fn 一覧と存在確認とcwdが往復する() {
     let f = fixture!("list");
     let name = session("tako-m2list00001");
     let cwd = std::env::temp_dir();
-    let (ok, out) = f.raw(&[
-        "new-session",
-        "-d",
-        "-s",
-        name.as_str(),
-        "-c",
-        &cwd.display().to_string(),
-    ]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str(), "-c", &cwd.display().to_string()]);
     assert!(ok, "器を作れる: {out}");
 
     assert!(f.backend.exists(&name));
@@ -742,7 +747,7 @@ fn 器の全ペインをidとpidで列挙できる() {
     let a = session("tako-m2pids00001");
     let b = session("tako-m2pids00002");
     for name in [&a, &b] {
-        let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+        let (ok, out) = f.new_session(&["-d", "-s", name.as_str()]);
         assert!(ok, "器を作れる: {out}");
     }
 
@@ -860,16 +865,7 @@ fn wait_for_history(f: &Fixture, name: &SessionRef, want: usize) -> usize {
 fn 保持していないセッションの画面と履歴を採れる() {
     let f = fixture!("capture");
     let name = session("tako-m2cap000001");
-    let (ok, out) = f.raw(&[
-        "new-session",
-        "-d",
-        "-s",
-        name.as_str(),
-        "-x",
-        "60",
-        "-y",
-        "20",
-    ]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str(), "-x", "60", "-y", "20"]);
     assert!(ok, "器を作れる: {out}");
 
     let capture = f
@@ -1004,16 +1000,7 @@ fn 保持していないセッションの画面と履歴を採れる() {
 fn copy_mode_の位置を読み戻せる() {
     let f = fixture!("scrollpos");
     let name = session("tako-m2scr000001");
-    let (ok, out) = f.raw(&[
-        "new-session",
-        "-d",
-        "-s",
-        name.as_str(),
-        "-x",
-        "60",
-        "-y",
-        "20",
-    ]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str(), "-x", "60", "-y", "20"]);
     assert!(ok, "器を作れる: {out}");
     let capture = f.backend.detached_capture().expect("採取の到達手段");
 
@@ -1067,7 +1054,7 @@ fn copy_mode_の位置を読み戻せる() {
 fn 器の中のシェルのpidが取れる() {
     let f = fixture!("panepid");
     let name = session("tako-m2pid00000001");
-    let (ok, out) = f.raw(&["new-session", "-d", "-s", name.as_str()]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str()]);
     assert!(ok, "器を作れる: {out}");
 
     let mut pids = Vec::new();
@@ -1110,13 +1097,7 @@ fn 器の中のシェルのコードページをutf8へ固定できる() {
 
     // psmux の既定シェル（pwsh 7）は自分で UTF-8 にしてしまうので、
     // **自分では直さない** cmd.exe を明示して #659 の条件を作る
-    let (ok, out) = f.raw(&[
-        "new-session",
-        "-d",
-        "-s",
-        name.as_str(),
-        "cmd.exe /d /k prompt $G",
-    ]);
+    let (ok, out) = f.new_session(&["-d", "-s", name.as_str(), "cmd.exe /d /k prompt $G"]);
     assert!(ok, "器を作れる: {out}");
 
     let capture = |f: &Fixture| f.raw(&["capture-pane", "-t", name.as_str(), "-p"]).1;
