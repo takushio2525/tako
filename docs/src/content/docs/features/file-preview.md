@@ -161,6 +161,7 @@ tako tree selection --key down       # ↓ を押したのと同じ（up / left 
 | カテゴリ | 対応形式 |
 |---|---|
 | システム言語 | Rust, C, C++, Go, Swift, Kotlin, Java, C#, Objective-C, Scala, Haskell, D |
+| 組み込み | Arduino のスケッチ (.ino。C++ として色分け) |
 | Web / スクリプト | JavaScript (.js/.jsx/.mjs), TypeScript (.ts/.tsx), Python, Ruby, PHP, Lua, Perl, HTML, CSS |
 | シェル | Bash (.sh/.bash/.zsh), Fish |
 | データ形式 | JSON, TOML, YAML, XML, INI, CSV, DotENV (.env) |
@@ -168,7 +169,7 @@ tako tree selection --key down       # ↓ を押したのと同じ（up / left 
 | ビルド / 設定 | Dockerfile, Makefile, CMake, SQL, Diff/Patch |
 | その他 | Git Ignore, Git Attributes, AppleScript, R, Clojure, Erlang, Groovy, nginx.conf 等 |
 
-拡張子に加え、ファイル名でも判定します（例: `Cargo.lock` → TOML, `Dockerfile` → Dockerfile, `CMakeLists.txt` → CMake, `.gitignore` → Git Ignore）。shebang（`#!/bin/bash` 等）による自動検出にも対応しています。
+拡張子に加え、ファイル名でも判定します（例: `Cargo.lock` → TOML, `Dockerfile` → Dockerfile, `CMakeLists.txt` → CMake, `.gitignore` → Git Ignore）。shebang（`#!/bin/bash` 等）による自動検出にも対応しています。Markdown のコードブロックも同じ構文で塗り、```` ```ino ```` / ```` ```arduino ```` は C++ として扱います。
 
 ## Markdown プレビュー
 

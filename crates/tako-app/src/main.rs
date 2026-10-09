@@ -29012,6 +29012,11 @@ mod self_test {
     mod completion_cancel_1909;
     #[cfg(feature = "visual-test")]
     use completion_cancel_1909::completion_cancel_visual;
+    /// #1949: `.ino` を C++ の構文で塗り、構文セットを `.cpp` と同じ寿命で手放す（visual-test `ino-highlight`）
+    #[cfg(feature = "visual-test")]
+    mod ino_highlight_1949;
+    #[cfg(feature = "visual-test")]
+    use ino_highlight_1949::ino_highlight_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -43390,6 +43395,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1949: `.ino` が C++ の構文で塗られ、構文セットが `.cpp` と同じ寿命で手放されるか
+                "ino-highlight" => {
+                    ino_highlight_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -43402,7 +43413,7 @@ mod self_test {
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
-                         hover-1893 / hover-loading / hover-loading-real / mod-limits）"
+                         hover-1893 / hover-loading / hover-loading-real / mod-limits / ino-highlight）"
                     );
                     std::process::exit(1);
                 }
