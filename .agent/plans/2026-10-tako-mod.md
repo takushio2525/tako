@@ -1,7 +1,8 @@
-# tako mod: Claude Code の mod 連携の設計（エピック #1877 / S0）
+# tako mod: Claude Code の mod 連携の設計（エピック #1877 / S0・S7）
 
-> スライス（S1〜S6）の worker がこれを読んで実装に入れる粒度で書く。方針（やること 1〜5）の
-> 正本は #1877 の本文。ここに書くのは「実物で確かめたこと」「決めたこと」「切り方」。
+> スライス（S1〜S6・S7-0〜S7-7）の worker がこれを読んで実装に入れる粒度で書く。方針（やること 1〜5）の
+> 正本は #1877 の本文と追加依頼（2026-10-09 の 1 / 2 = §9）。ここに書くのは「実物で確かめたこと」「決めたこと」「切り方」。
+> **§9（S7）は §0〜§7 の一部を見直した**。食い違う箇所は §9 が正。
 > 試作は Claude Code **2.1.294**（2026-10-08）の実物で行った。mod の API は early access で
 > 版ごとに動くので、**型定義（`.claude-plugin/types/claude-code/index.d.ts`）と実物を正**とし、
 > この文書の API 記述が実物と食い違ったら文書を直してから実装する。
@@ -13,7 +14,9 @@
 | mod → tako の通信路 | **`$.process.run` で tako CLI（`tako mod report`）を叩く** | §2 |
 | tako → mod の通信路 | 当面は **report の応答に相乗り**（+ 1 秒 flush / 15 秒 heartbeat）。常時 push は S6 で `$.process.spawn` + 長ポーリング CLI | §2.3 |
 | Claude Code の中からの tako 操作 | ボタン・スラッシュコマンドから**既存の CLI をそのまま呼ぶ**（2 つ目の実装を作らない） | §2 / §7 S4 |
-| mod の置き場と導入 | tako が `<data_dir>/claude-mod/tako/` へ展開し、**ペインの env `CLAUDE_CODE_PLUGIN_DIRS` に足す**。Claude Code の設定ファイルは 1 バイトも書かない | §3 |
+| mod の置き場と導入 | tako が `<data_dir>/claude-mod/tako/` へ展開し、**ペインの env `CLAUDE_CODE_PLUGIN_DIRS` に足す**。Claude Code の設定ファイルは 1 バイトも書かない。**S7 で見直し**: 加えて `tako setup` が使っている設定 dir ごとに `skills/tako/` へ管理印つきの写しを置く（settings 系のファイルは書かない） | §3 / **§9.4** |
+| 描画の主（S7） | tako の GUI 側で描いていたコマンドカード・使用制限 / ctx のバー・チャット風の表示を **mod が Claude Code の中で描く**。mod が効いていないペインは今の tako 側の表示のまま | **§9.3 / §9.6** |
+| 定型の UI 設定（S7） | ボタン・表示項目・並び・色は `<data_dir>/claude-mod/ui.json`（スキーマ・検証・#916 の移行）。setup / CLI / MCP の同じ口で選んで変える。mod は報告の応答で受け取る | **§9.7** |
 | 対応する Claude Code の版 | **下限 2.1.294**（実測した版）。下限未満・不明ならその claude には注入しない | §1.6 / §3.4 |
 | 落ち方 | mod の報告が**新鮮な間だけ**一次ソース。無い・古い・止まったら今の画面 / transcript 読み取りへ落ちる | §6 |
 | MATRIX | 能力ごとに新しいマスを、**claude 側の実装が入るスライスの PR で**足す（claude 列は常に Supported = 番犬 `claudeは基準系なので全て対応済み`） | §4.4 |
@@ -289,7 +292,10 @@ D は双方向にできず掃除の責務が増えるので採らない。
 | B. marketplace として登録 + `claude plugin install`（user スコープ） | **設定 dir ごとに** `enabledPlugins` / `extraKnownMarketplaces` を書く | 設定 dir の数だけ入れ直す・どれに入れたか追跡が要る | 読み込まれる → mod 側で休眠が要る | フォルダ marketplace は `/reload-plugins` か次の起動で反映 | `/plugin` の UI |
 | C. tako が起動する claude にだけ `--plugin-dir` を付ける | なし | 関係ない | 読み込まれない | 同 A | `tako mod off` |
 
-**決定: A**。ゼロコンフィグ（設計原則）と「本番設定を書き換えない」を両立できるのは A だけ。
+**決定: A**（**S7 で見直し**: 2.1.294 には `<設定 dir>/skills/<名前>/` に置いた plugin を読む口があり、
+settings 系のファイルを書かずに「この PC の claude へ入れる」ができると実測した。A は残したまま、setup が
+そこへ写しを置く形を足した = §9.4。B も一時の設定 dir で 1 周して比べた）。
+ゼロコンフィグ（設計原則）と「本番設定を書き換えない」を両立できるのは A だけ（S0 時点の比較。S7 の C' も両立する）。
 C は master / solo / spawn は覆えるが、**利用者がペインで自分で打った `claude`** を覆えない。
 B は利用者の Claude Code 設定へ tako が書き込み続けることになり、設定 dir の追跡と後始末が要る。
 
@@ -501,7 +507,11 @@ S1 基盤（同梱・展開・注入・報告・status）                 #1879
  └─ Windows 実機確認                                       #1886
 S6 tako → mod の push（S2〜S5 の後。[提案] を含む）        #1884
 調査: codex / agy の同等の拡張点（いつでも）               #1885
+S7（描画の主を mod へ・setup で導入・定型の UI 設定）       #1958〜#1965 = §9.8
 ```
+
+**S7 で変わったこと**: S4（#1882）はボタンの語彙（ui.json の `tako`）の正本と `/tako <操作>` に絞り、
+S5（#1883）は #1964 に置き換えた。詳細は §9.8。
 
 S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228）を避けるため着地は 1 本ずつ。
 
@@ -609,6 +619,8 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
 
 ## 8. 未検証・リスク
 
+> S7 の未検証・リスクは §9.9。
+
 - **API の揺れ**: mod の API は early access。Claude Code の更新で mod が読まれなくなると、
   §6 のとおり画面読み取りへ落ちるだけで壊れはしないが、気づけないと「いつの間にか一次ソースが
   消えていた」になる。`tako mod status` / `check-health` に「claude を起動したのに 60 秒報告が
@@ -622,3 +634,263 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   ツールがモデルに載る可能性がある（未実測。コマンドの書き方が利用者の登録と違うと**ツール一式が
   二重に載る**ので、S1〜S5 では manifest に MCP を書かない）
 - SSH ペインのリモート側で動く claude には env も展開先も届かない（画面読み取りのまま）
+
+## 9. S7: 描画の主を mod へ・setup での導入・定型の UI 設定（2026-10-09）
+
+> エピック #1877 のユーザーの追加依頼 1（「GUI 表示を mod に落として描く・コマンドカードや使用制限も mod で・
+> setup で入れて他の mod と競合しない・mod なしでも今までどおり」）と追加依頼 2（「ステータスバーの 5h / 7d / ctx の
+> バーも mod で・カスタムボタン（`/compact` のワンボタン等）の土台・tako setup から定型化された UI で、
+> 軽いモデルでも壊さず調整できる」）を受けた見直し。**ここが §0〜§7 と食い違えばここが正**。
+
+### 9.0 結論（S7 で決めたこと）
+
+| 論点 | S0〜S3 | S7 の決定 | 節 |
+|---|---|---|---|
+| 導入 | ペインの env `CLAUDE_CODE_PLUGIN_DIRS` だけ | **setup が設定 dir ごとに `<設定 dir>/skills/tako/` へ管理印つきの写しを置く**（settings 系のファイルは書かない）。env 注入は残す（同名なら env 側だけが読まれ二重にならない） | §9.4 |
+| 描画の主 | 帯 1 行と `/tako` のサイドバーだけ mod | コマンドカード・使用制限 / ctx のバー・カスタムボタン・チャット風の描画も **mod が Claude Code の中で描く** | §9.3 |
+| tako 側の表示を止める条件 | （無し） | **新鮮な報告 ∧ 報告の `renders` にその表示がある ∧ ui.json の置き場が mod**。それ以外は今の表示のまま | §9.6 |
+| UI の調整 | `/tako band on\|off` だけ | `<data_dir>/claude-mod/ui.json`（スキーマ・検証・#916）。setup / CLI / MCP の同じ口で**選んで**変える。mod は報告の応答で受け取る | §9.7 |
+| 共存 | 帯は自分の行だけ返す | 描画は**必ず `next(e)` を包む**。帯は 1 行。名前 `tako` の衝突は入れない | §9.5 |
+| ボタンの押し方 | 帯は ctrl+x → Tab | tako は**クリックを TUI へ渡していない**ので当面はキー操作。クリックの転送は #1961（判断点つき） | §9.2 |
+
+### 9.1 試作の構成
+
+- **本物の認証を写さない**ため、Claude Code 2.1.294 の実物を**一時の `CLAUDE_CONFIG_DIR`** で動かし、
+  API は **ローカルの偽 Messages API**（`ANTHROPIC_BASE_URL`。Node の数十行・SSE で応答・ダミー鍵は一時の
+  `.claude.json` で承認済みにする）へ向けた。最後の発話の合言葉で台本を選ぶ（`tako_show_command` の
+  tool_use / 長いコマンドのコードブロック / Bash の権限 / AskUserQuestion / 既定は `ok`）
+  - API キー経由なので `$.session.usage().rateLimits` は空（使用制限のバーの見た目は固定値で確かめた）。
+    ctx は応答の usage から出る（`ctx 6%`）
+- 隔離 GUI（`scripts/lib/isolated-gui.sh`・仮想ディスプレイ・`TAKO_PERSIST=0`・main `d851f0d` 相当の debug ビルド）の
+  直接ペインと、素の tmux（`-f /dev/null`）で動かした。tako のペインの env（`TAKO_PANE_ID` / `TAKO_CLI` /
+  `CLAUDE_CODE_PLUGIN_DIRS`）はそのまま使い、本物の tako mod（S3）も同時に読ませた
+- 試作の mod は 3 本（使い捨て。製品コードには入れていない）: 描画の試作 `tako-s7`・他の mod の代役 `other-mod`
+  （帯を独占する / 包む、`$.ui.status`、`/tako` の同名登録、`ui.copy` の拒否）・導入方式を測る印の mod（名前は本物と同じ `tako`）
+- plugin-authoring スキルは使っていない（既定の書き先が自セッションへ効くため。メモリ「Claude Code の mod の試作手順」）
+
+### 9.2 実物で確かめた描画とボタン（2.1.294）
+
+| 確かめたこと | 結果 |
+|---|---|
+| コマンドカード（AI の `tako_show_command`） | MCP の呼び出しは **`ToolGroup`（「Called tako」の 1 行）に畳まれ、`ToolUse` のフックは呼ばれない**。`ToolGroup` を `isExpanded: true` で `next` へ渡すと `ToolUse` として描かれ、枠 + `Code` + ボタンのカードへ描き替えられた（下の採取） |
+| 長いコマンド | `Code`（`wrap`）で見た目だけ折り返し、Copy に渡るのは **157 字・改行なしの論理文字列** |
+| コードブロック（`AssistantMessage`） | エンジンの描画（`await next(e)`）の下にボタン行を足せる。画面のコードは物理改行されるが、ボタンが渡すのは論理文字列（FR-2.22 の問題を mod で解ける） |
+| 吹き出し（`UserMessage`） | `Box` の枠 + `justifyContent: flex-end` で右寄せの吹き出しになった |
+| `$.ui.status` | **「⚠ <plugin 名>: 」の警告の体裁**で、利用者の statusLine の**上**に 1 行増える（上書きはしない）。常時表示の情報には向かない |
+| `PromptHint.tail` | hint 行（`⏵⏵ auto mode on …`）の末尾に dim で足せる: `· 5h ▁ 4% 7d ▂ 22% ctx ▁ 6%`（tako のステータスバーと同じ見た目） |
+| `SessionMode` | 119 桁のペインでは出なかった（理由は未解明。採らない） |
+| トースト | 右上に「plugin 名」の見出しつきの小箱で約 4 秒 |
+| 帯（`AbovePrompt`）の行数 | `maxRows` は**全画面では下段の残り**（21 行のペインで **1 行**、窓を高くして 4 行）、main screen では端末の高さ。超えると「↓ N more」に畳まれ、フォーカスしてスクロール |
+| カスタムボタン | 帯のボタンから `$.command.run({ command: "compact" })` で **`/compact` が流れて会話が圧縮された**（「Compacted」）。`tako split --right` も通った |
+| ボタンの押し方 | 帯 / ペインは **ctrl+x → Tab でフォーカス → ホットキー**（main screen でも全画面でも押せた）。**会話の行のボタンはクリックでしか押せない**（フォーカスできる場所は `Pane` と `AbovePrompt` だけ = 型定義の `UiFocusComponent`）。main screen では会話の行も帯もクリックは効かない |
+| tako のクリック | **tako は TUI へクリックを渡していない**（`on_pane_mouse_down` = cmd+クリックのリンク / tako 自身の選択。渡すのはホイールだけ = `terminal.rs` の `wheel_report_bytes`）。ペインへ SGR のクリック列を送れば押せたので、Claude Code 側は受け取れる → #1961 |
+| 全画面 / main screen | 2.1.294 は**直接ペインでも素の tmux の中でも既定で全画面**（tmux の `alternate_on=1`・`mouse_any_flag=1`）。`CLAUDE_CODE_NO_FLICKER=0` で main screen（マウス報告 off）。型定義の「tmux では既定で main screen」は実物と食い違う |
+| 二重表示（今の tako） | カードが登録された瞬間に tako の GPUI のカード帯がペインの下に 7 行を取り、claude の viewport が **21 → 14 行**に縮んだ（mod のカードと同じものが二重に出る） |
+| Copy の経路 | `$.ui.copy` は**呼んだ plugin 自身の `ui.copy` フックを通らず、他の plugin のフックだけを通る**（他の mod が拒否・書き換えできる）。書き先は型定義では端末のクリップボードの道具（pbcopy 等）か OSC 52 |
+
+カードの採取（隔離 GUI の直接ペイン・119 桁。1 回目の採取。最後の行は #1958 で tako がカードを断ったときの表示）:
+
+```text
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│ tako  ビルドと確認                                                               │
+│ cargo build -p tako-cli && TAKO_ISOLATED=1 TAKO_DATA_DIR=/tmp/tako-s7-very-long- │
+│ data-dir-name ./target/debug/tako mod --json | jq ".panes[] | {pane, reason}"    │
+│ [ Copy 1 ] [ Run 1 in a new pane ]                                               │
+│ tako mod                                                                         │
+│ [ Copy 2 ] [ Run 2 in a new pane ]                                               │
+│ tako did not take the card (see ctrl+o)                                          │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+⏺ カードに出しました。
+```
+
+帯（本物の tako mod の行 + カスタムボタン）と PromptHint のバー:
+
+```text
+tako | <ペイン名> | タブ <タブ名>                                                    [-]
+[ compact ] [ split right ]
+─────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents · 5h ▁ 4% 7d ▂ 22% ctx ▁ 6%
+```
+
+「Run 1」を押すと mod が既存の `tako show-command --run --card 2 --index 1` を呼び、tako に新しいペインが立って
+カードの実行記録（`runs[0] = {pane: 2, state: exited, exit_code: 101}`）が付いた = PC の帯・スマホと同じ記録を通る。
+
+### 9.3 mod で描くもの / 描かないもの（棚卸し）
+
+| tako 側の表示（いま） | 決定 | mod でどう描くか | 理由・メモ | スライス |
+|---|---|---|---|---|
+| コマンドカード（FR-2.22。ペインの下の GPUI の帯） | **移す** | 会話の行 = `ToolGroup` を展開して `ToolUse` をカードに（全画面）。**押す口は帯の tako の行**（`カード N` + Copy / Run のホットキー。main screen でも押せる）。正本は tako の store（実行記録はスマホと共通） | 二重表示と viewport の縮み（§9.2）が消える。会話の行のボタンはクリック前提なので #1961 までは帯が主 | #1963 |
+| 使用制限・ctx のバー（画面下のステータスバーの claude の区画。FR-2.42.18） | **移す** | `PromptHint.tail` に `5h ▁ 4% 7d ▂ 22% ctx ▁ 6%`（置き場は ui.json で `band` / `off` も） | 追加依頼 2。利用者の statusLine が既に出していれば描かない。codex / agy / シェルにフォーカスしたとき・mod なしではステータスバーのまま | #1962 |
+| S3 の帯の ctx / 使用制限（閾値超え） | そのまま | バーと同じ値。バーが出ていれば帯からは外す | 同じ情報を 2 か所で動かさない | #1962 |
+| カスタムボタン（新規） | **mod で描く** | 帯の tako の行の中（1 行に詰める）。既定は `compact` 1 個 | 追加依頼 2 | #1960 / #1962 |
+| GUI ライク表示のチャット（FR-2.23。`tako ui-mode gui`） | **段階的に移す** | 吹き出し・コードのコピー・ツールの要約を mod で描き、GUI モードで mod が効いているペインは GPUI のチャットの代わりにターミナル表示（mod の描画）を出す | 入力欄のミラー（#737）・生成中やキューの画面推測が要らなくなる。描けないもの: 権限ダイアログ（エンジン専有）・プロポーショナルフォント・画像。初心者がクリックで押せるには #1961 が先 | #1964 |
+| チャットヘッダの残量バー（GUI モード） | チャットと一緒に | （mod のチャットでは PromptHint のバー） | | #1964 |
+| 承認カード（GUI モード） | **移さない** | （`$.ui.notice` で 1 行足すのが限界） | 型定義: 権限ダイアログはエンジンだけが描く | — |
+| スターター（空ペインの 3 カード） | **移さない** | | claude がまだ居ないペイン | — |
+| 右パネル（fleet / orch / git / tasks / diagnostics） | **移さない** | （`/tako` のサイドバーに worker 一覧は S3 で済み） | tako 全体の視界で、claude 以外のペインも含む | — |
+| ステータスバーの残り（ブランチ・ポート・codex の使用制限等） | **移さない** | | 窓の chrome。claude の外の情報 | — |
+| ペインの右クリックの操作（#1882） | ボタンの語彙へ | ui.json の `tako` 語彙（S4 の対応表が正本） | ボタンの中身は既存 CLI | #1882 / #1960 |
+
+### 9.4 導入方式の比較（一時の設定 dir で 1 周ずつ実測）
+
+| | A. ペインの env（S1） | B. ローカルの marketplace + `claude plugin install` | **C'. `<設定 dir>/skills/tako/` に写しを置く（採用）** |
+|---|---|---|---|
+| 設定 dir に書くもの | なし | `settings.json`（`extraKnownMarketplaces` / `enabledPlugins`。**Claude Code が書き直し、値は保つがキー順が変わる**）・`plugins/known_marketplaces.json`・`plugins/installed_plugins.json`・`plugins/cache/<mkt>/tako/<版>/` の写し | `skills/tako/` の dir 1 つだけ（**settings 系のファイルは不変**。`.claude.json` の記帳は普段の起動でも変わる） |
+| 読まれる場所 | env の dir | marketplace の**元の dir**（`plugin list` の「Read from」）。キャッシュの写しではない | `skills/tako`（symlink も辿る）。`tako@skills-dir` |
+| tako の外の claude | 読まれない | 読まれる（mod は休眠） | 読まれる（mod は休眠） |
+| `/plugin` の見え方 | 出ない | `tako@<mkt>  ✔ enabled` | `tako@skills-dir  ✔ loaded`。利用者の `disable` で `settings.json` に `"tako@skills-dir": false`（利用者の操作） |
+| 版の更新 | 展開先を書き換えるとホットリロード | 元の版を上げれば**次の起動**で反映（`plugin update` 不要）。走っているセッションは `/reload-plugins` まで旧（ファイル監視は inline だけ） | 書き換えると**ホットリロード**（`session.start` が再発火） |
+| 外したあと | — | `uninstall` + `marketplace remove` で値は元どおり。ただし空の `extraKnownMarketplaces: {}`・空の `plugins/*.json`・`.orphaned_at` つきの写しが残る（バイトは戻らない） | dir を消すだけ |
+| tako を消したら | 読まれない | 元の dir が無いと `/plugin` に「✘ failed to load（cache-miss）」。起動は黙って続く | 写しなら残って休眠。symlink なら宙に浮いて黙って読まれない |
+| `$.store` | `tako_inline-*.json` | `tako_<mkt>-*.json` | `tako_skills-dir-*.json`（**読み込み元ごとに別ファイル**） |
+
+**同名の扱い（3 方式に共通）**:
+
+- env / `--plugin-dir`（inline）に同名 `tako` があれば **inline だけが読まれる**（B では「Plugin "tako" from
+  --plugin-dir overrides installed version」、C' でも hooks module は `tako@inline` の 1 つだけ）= S1 の注入と
+  setup の導入を同時に持っても**二重には読まれない**（名前を `tako` に揃えている限り）
+- 別の出どころの同名 `tako`（利用者の別の marketplace 等）は、両方 enabled でも**先に来た方だけが読まれ、もう一方は
+  黙って読まれない**（「another plugin of that name loads first」）
+
+**決定: C'（写し + 管理印）を setup の導入にし、A は残す**（#1959）。
+
+- 理由: 「この PC の claude に入れる」（`/plugin` に出て、利用者が Claude Code 側で止められる）と、FR-2.42.2 の
+  「settings 系のファイルを書かない」を両立できるのは C' だけ。B は `settings.json` を書き直し、外しても空の
+  キーと写しが残り、ホットリロードもしない
+- A を残す理由: tako のペインでは inline が勝つので、**その tako の版の mod が必ず読まれ**、ホットリロードし、
+  setup が知らない設定 dir（direnv で切り替わる dir 等）の claude にも効く
+- **写しにする**（symlink にしない）: Windows の symlink は権限が要る（#513 の設定共有と同じ理由）・利用者が
+  `~/.claude` を dotfiles で同期していると、ホームパス入りの link が他の機械へ渡る（tako の設定共有は symlink を
+  辿らないので tako 経由では渡らない）。写しは tako の版の更新時に差し替える（中身が同じなら書かない）
+- **管理印** `skills/tako/.tako-managed`（tako が置いた印・版・内容のハッシュ）。**印の無い `skills/tako` は利用者のもの**
+  なので触らない（`name_conflict`）。別の出どころの `tako` があれば（`plugins/installed_plugins.json` と settings の
+  `enabledPlugins` を読むだけで分かる）その設定 dir には置かず、**そのペインへの env 注入もしない**（inline は installed
+  を上書きするので利用者の `tako` を潰す）
+- 置く先: accounts.yaml の設定 dir（`AccountsConfig::list_resolved()`）+ 既定（`claude_default_config_dir()`）+
+  実行時に mod の報告の `config_dir` で見えた dir（GUI 起動時の差分検出で足す = #916 と同じ二段構え）
+- 利用者が Claude Code 側で止めた（`enabledPlugins["tako@skills-dir"] === false`）ら、env で読まれた mod も
+  `$.settings.read()` で見て休眠し、最後の報告で `user_disabled` を返す（env 注入が利用者の選択を上書きしない）
+- 外し方: `tako mod uninstall`（印つきの写しだけ消す）と setup の undo
+- FR-2.42.2 の文言は #1959 で「settings 系のファイル（`settings*.json`・`plugins/*.json`）は書かない。置くのは
+  `skills/tako` の管理印つきの写しだけ」へ改める
+- env 注入なし・`skills/tako` の写しだけでも、本物の tako mod（S3）が tako のペインで読まれて報告と帯の描画まで
+  動くことを実測した（`TAKO_PANE_ID` / `TAKO_CLI` の env は今どおり要る = `tako mod off` でこの 2 つも止まれば休眠する）
+
+### 9.5 共存（他の mod / plugin / statusLine）の実測と規則
+
+- **読み込み順 = 外側から** `--plugin-dir`（引数の順）→ `CLAUDE_CODE_PLUGIN_DIRS`（並びの順）→ installed / skills-dir。
+  すべて tier `user` で、同じイベントのフックはこの順に入れ子になる（デバッグログの `environment N` の順）
+- **帯の取り合い**: 外側の mod が `next()` を呼ばずに答えると、内側の帯は描画で走らない（デバッグログ
+  「answered ui.render without next(); nothing beneath it ran」）。**いまの S3 の帯は描くときに自分の行だけを返す
+  ので、利用者が `skills/` や marketplace で入れた他の mod の帯を tako のペインで消している**（tako が env = 外側の
+  ため。実測で確認）。`next(e)` の答えは、下に誰も居なければ `{type: "engine"}`、居ればその描画
+- **規則**: tako の mod は `ui.render` の全フックで**必ず `next(e)` の答えを包む**（帯は「他の mod の行 + tako の行」を
+  縦に並べる・`AssistantMessage` 等はエンジンの描画の下に足す）。他の mod が tako を隠すのは防げないので、帯の
+  フックが呼ばれていない（`band.columns` が付かない）ことを `tako mod` に「帯は他の mod に隠された」と出す
+- **帯の行数は共有資源**: 全画面の 21 行のペインで 1 行。tako の行は**ボタン込みで 1 行**に詰める（2 行にすると
+  他の mod の行と合わせて「↓ N more」に畳まれる）。複数行の詳細は `/tako` のサイドバー（`$.ui.open`）
+- **`$.ui.status`**: plugin ごとに 1 行で並ぶ（他の mod・利用者の statusLine を上書きしない）。警告の体裁なので
+  tako は常時表示に使わない
+- **スラッシュコマンド**: `$.command.register` の同名は**先に登録した方が取り、後は失敗**（`session.start` の非同期の
+  速さで入れ替わりうる）。tako は `/tako` の登録の失敗を報告に出し、別名は作らない（ボタンと `/tako` の中身は
+  帯から届く）
+- **利用者の statusLine**: tako は書き換えない。使用量のバーは statusLine が既に ctx / 使用制限を出している構成
+  （`$.settings.read()` の statusLine + tako の画面読み取りで判定）では描かない
+- **コピー**: `$.ui.copy` は他の mod の `ui.copy` フックに拒否されうる → 結果が `isCopied: false` なら tako の
+  dispatch のコピー（`tako show-command --copy`）へ落とす
+- **同名 `tako`**: §9.4 のとおり検出して入れない・注入しない
+
+### 9.6 フォールバックと、tako 側の表示を止める条件
+
+| 状況 | mod | tako 側 |
+|---|---|---|
+| setup 前・管理外の設定 dir（env 注入は効く） | env で読まれて描く | mod の `renders` に従う |
+| `tako mod off` / 版の下限未満 / `name_conflict` | 置かない・注入しない | **今の表示**（GPUI のカード帯・ステータスバー・GPUI のチャット・画面読み取り） |
+| tako の外の claude | 休眠（`TAKO_PANE_ID` / `TAKO_CLI` が無い） | 関与しない |
+| 組織アカウント（classic 系が届かない） | 描画は関数フック（`ui.render`）なので**影響なし**（S3 で組織 / 個人の両方の設定 dir で帯を実測）。権限待ちは S1 の代替で拾う | mod の `renders` に従う |
+| `--safe-mode` / `--bare` / `disableAllHooks` / `allowManagedModsOnly` | 読まれない | 今の表示（`tako mod` に理由） |
+| 利用者が `/plugin` で disable | 休眠して `user_disabled` | 今の表示 |
+| 他の mod に帯を隠された | 帯の `renders` が偽 | 帯は mod 専用なので代わりは出さず `tako mod` に理由 |
+| 報告が古い（45 秒） | — | **1 tick（2 秒）で今の表示へ戻る** |
+
+**止める条件**は表示ごとに「**新鮮な報告 ∧ 報告の `renders` にその表示がある ∧ ui.json の置き場が mod**」:
+
+- 報告（`schema: 1` に後方互換で追加）の `renders`: `band`（描けたか）・`usage_bar`（置き場 or null）・
+  `buttons`（数）・`cards`（**描いたカードの id**）・`chat`（チャット風の描画をしているか）。無い = 何も描いていない
+  （古い mod は今の表示のまま）
+- コマンドカード: `renders.cards` に載った id だけ GPUI の帯から外す（store には残る = スマホ・CLI は同じ）
+- 使用量のバー: **フォーカス中のペイン**の claude の mod が `renders.usage_bar` なら、ステータスバーの claude の
+  5h / 7d / ctx の区画を出さない
+- チャット: GUI モードで `renders.chat` のペインは GPUI のチャットビューの代わりにターミナル表示
+
+### 9.7 定型の UI 設定（`ui.json`）
+
+- **置き場は tako の data dir 側**: `<data_dir>/claude-mod/ui.json`。Claude Code の設定 dir へは書かないので
+  FR-2.42.2 と矛盾しない。mod は**ファイルを読まず**、報告の応答 `tako.view.ui` で検証済みの値を受け取る
+  （tako の外では効かない・壊れた値は mod へ届かない・`$.store` の読み込み元ごとの分裂（§9.4）に左右されない）
+- **正本 1 実装** `tako_core::claude_mod_ui`（既定・検証・語彙・書き込みは一時ファイル → 差し替え）
+- 形（`schema_version: 1`。案）:
+
+```json
+{
+  "schema_version": 1,
+  "band": { "hidden": false, "segments": ["pane", "tab", "workers", "attention", "card", "buttons"] },
+  "usage_bar": { "place": "prompt_hint", "items": ["five_hour", "seven_day", "ctx"] },
+  "buttons": [{ "id": "compact", "label": "compact", "hotkey": "c", "action": { "kind": "slash", "command": "compact" } }],
+  "cards": { "place": "auto" },
+  "chat": { "place": "auto", "bubble": "gui_only", "code_copy": true, "tool_summary": "gui_only" },
+  "colors": { "accent": "suggestion", "warn": "warning", "dim": "subtle" }
+}
+```
+
+- **語彙（選ぶだけ。任意の JS は持たない）**: action は 4 種 — `slash`（許可リスト: compact / clear / context / cost /
+  model / effort と `/tako`。描くときに `$.command.list()` に無い名前は描かない）・`tako`（#1882 の対応表の操作 id）・
+  `shell`（利用者が書いたコマンドを**新しい tako のペイン**で実行 = カードの run と同じ経路・FR-2.22.7 の検証）・
+  `prompt`（入力欄へ文を入れるだけ = `$.prompt.fill`、送らない）。色は Claude Code のテーマのキーだけ。並びは id の
+  並べ替えだけ。ボタンは 8 個まで・label 16 桁・hotkey は数字か小文字 1 字で重複不可。**既定のボタンは `compact` 1 個**
+- **口は 3 つで同じ 1 実装**: CLI `tako mod ui`（今の値と**選べる値**の一覧）/ `set <key> <value>` / `button add|remove|move` /
+  `reset`、MCP `tako_mod` の `action=ui`（op と値の enum を inputSchema に載せる）、`tako setup` の段（対話 = 既定 /
+  おすすめ / 最小の 3 択 + ボタンを選ぶ・`--answers` のキー `mod_ui`）。#322 の最簡形の規約どおり、引数なしは表示
+- **軽いモデルでも壊さない**: すべて「選ぶ」口（enum）+ 検証で、不正な値は**書かずに許される値の一覧を返す**。読めない
+  ui.json は既定で動き、元は `.unreadable.bak` へ保全（#916 の機構）。性質テスト（ランダムな操作列で常にスキーマを満たす）
+- **軽いモデルでの検証方法**（今回は本物の認証を写さない制約で未実測）: 認証のある環境で Sonnet / Haiku に
+  `tako mod ui` の口だけで調整を 20 件（「compact のボタンを足して」「バーを消して」「ボタンを左へ」等）頼む
+  スクリプト `scripts/test-mod-ui-llm.sh`（一時の設定 dir・CI 外）で、スキーマ違反 0 件と依頼との一致率を測る（#1960）
+- **#916**: ui.json を `tako-control::migrations::SPECS` に登録（`migration_registry` の指紋に載る）。S3 の帯のトグル
+  （`$.store` の `band`）は ui.json の `band.hidden` を正本に移し、初回は mod の報告の `band.hidden` / `toggled_at` を取り込む
+- tako → mod の届き方は今の「報告の応答」のまま（変更は最大 15 秒の heartbeat で届く）。即時にしたければ #1884 の push
+
+### 9.8 スライス（S7）
+
+```text
+#1958 [バグ] MCP の tako_show_command の pane 省略（いつでも）
+#1959 S7-1 setup が設定 dir ごとに skills/tako へ入れる                 （依存なし）
+#1960 S7-2 定型の UI 設定 ui.json と setup / CLI / MCP の口              （依存なし。#1959 と並行可）
+#1961 [判断点] tako がクリックを TUI へ渡す                              （依存なし）
+#1962 S7-3 帯を next で包む 1 行に + カスタムボタン + バー               ← #1960
+#1963 S7-4 コマンドカードを mod で描く                                   ← #1958 #1960 #1962
+#1964 S7-6 チャット風の描画と GUI モードの切り替え（#1883 の置き換え）   ← #1960 #1963 #1961
+#1965 S7-7 この PC の claude へ setup で入れて実機で効く（最後）         ← #1959 #1960 #1962 #1963
+```
+
+- 既存のスライスとの関係: #1882（S4）は ui.json の `tako` 語彙の正本（右クリックメニューとの対応表）と `/tako <操作>`・
+  番犬に絞る（#1960 の後）。#1883（S5）は #1964 に置き換えて閉じる（GPUI のチャットを mod の通知で読み直す改善は
+  #1964 のフォールバック側に含める）。#1884（S6）は据え置き（ui.json の変更を即時に届けたくなったら）。#1891 の
+  check-health には #1959 の設定 dir ごとの導入状態も載せる。#1886（Windows）では `skills/` の写しも確かめる
+- 着地は 1 本ずつ（`progress.md` の衝突 = #1228）
+
+### 9.9 未検証・リスク（S7）
+
+- **使用制限の実値**: 偽 API（API キー）では `rateLimits` が空なので、バーの使用制限は見た目だけを固定値で確かめた。
+  実値の取り方は S2 / #1903 の実測に依る
+- **軽いモデルでの setup**: 本物の認証を写さない制約で未実測（§9.7 の検証方法を #1960 の受け入れに入れた）
+- **skills-dir という置き場**は 2.1.294 の `claude plugin init` が案内する口だが、mod と同じく early access で揺れうる →
+  夜間検査（#1892 の `scripts/check-claude-mod.sh`）に「skills-dir から読まれる」を足す（#1959）
+- 管理された環境（`strictKnownMarketplaces` / `allowManagedModsOnly`）で skills-dir が読まれるかは未実測
+- 版の下限未満の claude が `skills/tako` を見たときの振る舞い（1 台に複数の版が混在する場合）は未実測。setup は PATH の
+  claude の版で判定する
+- `SessionMode` が 119 桁で出なかった理由は未解明（採らないので影響なし）
+- クリックの転送（#1961）は claude ペインのドラッグ選択の手触りを変えるので、既定はユーザー判断
+- Windows（`skills/` の写し・`;` 区切り）は #1886
