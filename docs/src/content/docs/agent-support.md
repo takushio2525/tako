@@ -23,14 +23,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 56 件の内訳です。
+能力 57 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 56 / 56 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 36 / 56 | 4 | 13 | 3 |
-| Antigravity CLI | 24 / 56 | 4 | 18 | 10 |
-| Local LLM | 0 / 56 | 0 | 45 | 11 |
+| Claude Code（基準） | 57 / 57 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 36 / 57 | 4 | 14 | 3 |
+| Antigravity CLI | 24 / 57 | 4 | 19 | 10 |
+| Local LLM | 0 / 57 | 0 | 46 | 11 |
 
 ### 状態の意味
 
@@ -63,7 +63,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## OpenAI Codex CLI を選ぶと落ちるもの
 
-対応 36 / 56 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 36 / 57 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -76,7 +76,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（13 件）
+### 未対応（14 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -111,7 +111,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Antigravity CLI を選ぶと落ちるもの
 
-対応 24 / 56 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 24 / 57 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -124,7 +124,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（18 件）
+### 未対応（19 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -174,9 +174,9 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Local LLM でまだ使えないもの
 
-対応 0 / 56 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
+対応 0 / 57 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
 
-### 未対応（45 件）
+### 未対応（46 件）
 
 - **ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）**（追跡: [#990](https://github.com/takushio2525/tako/issues/990)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
