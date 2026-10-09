@@ -20,18 +20,6 @@
 
 ---
 
-## 2026-10-09（#1901: debug ビルドでも構文の塗りの依存 8 つだけ opt-level 3 にした）
-- `.cargo/config.toml` に `[profile.dev.package.*]` を syntect / fancy-regex / regex-automata / regex-syntax / aho-corasick / memchr / bit-set / bit-vec へ（どれを外しても遅くなるのを 1 MB の TS で実測。自分のクレートは未最適化のまま。ルートの Cargo.toml だと rust-cache のキーに入らず CI が毎回下流を作り直した = PR の初回 macOS 39 分）。commands.md の build 行・#1890 の「debug は 427.6 秒」2 か所に後の値を添えた
-- 実測（JOBS=2・前後交互に 2 回ずつ）: 10 MB の塗り 53.8 → 4.3 秒（12.4 倍）・visual-test `large-file-decor` の debug は 1 節 30 分 → 152 秒・差分ビルド tako-core 9.5 / 7.8 → 9.3 / 8.4 秒・クリーンは 8 つで +36 秒の CPU（壁時計は負荷のぶれ以下）・全体テスト 6515 passed（tako-app 単体 30 → 12 秒）
-
-## 2026-10-09（#1874: テストの tmux の器の名前を残骸掃除が拾う接頭辞へ揃え、`-f /dev/null` で起こすようにした）
-- 名前 4 つ（`tako-coretest1857-` → `tako-coretest-1857-`・`ct1105-` → `tk-coretest-1105-`（tako で始めないのが #1105 の検査の中身なので `TEST_SOCKET_PREFIXES` を足した）・固定名 `tako-e2e-571` / `-577` に pid）と `-f` なしの起動 12 か所（tmux_e2e の 1 実装・dispatch 5・#1857 の keep・loc・scrollback_capture・remote_scrollback 2）。番犬 `issue1866_tmux_socket_name_watchdog.rs` に名前（定義まで辿る）と `-f` の 2 規則
-- 実測: 読まれたら器の名前を記録する `.tmux.conf` を置いた偽 HOME で、修正前は 24 回読まれ修正後 0。途中で kill -9 した #1857 / #1105 の器を修正前の `TmuxTestGuard` は拾わず修正後は回収。番犬の注入（修正前の 5 ファイル・名前・接頭辞の正本）を file:line で名指し
-
-## 2026-10-09（#1922: 偽の言語サーバを起こす LSP の e2e が Windows で間欠的に落ちるのを、読み込みの終わりと manager が知った状態で揃えて直した）
-- 真因 3 つを注入で確定: ①manager が `quiescent: false` を処理する前に送る（`READY_POLL` 1 周期。知らせ遅延 20ms 以上で 10/10・CI と同じ :214 / :221。Windows の probe では修正前 100 回中 10 回・10 回ともこの順序）②読み込みが要求より先に済む ③上限つきの要求を起動ごと測る（起動遅延 1.2 秒で 1680:329）。`tests/common/lsp_fake_e2e.rs`（`LoadingGate` = `--loading-until`・`wait_loading_known`・`wait_running`）へ 4 ファイルを寄せ、偽サーバは知らせを 50ms 遅らせて送る
-- 実測: Windows CI で 4 本（37 テスト）× 20 周・修正後の形 100 + 50 回・起動 2.2 秒遅延の注入がすべて緑。番犬 `issue1922_lsp_loading_wait_watchdog`（注入 11 通りを file:line で名指し）
-
 ## 2026-10-09（#1915: CI の rust-cache のキーにルートの Cargo.toml の指紋を混ぜた）
 - rust-cache v2.9.2 はメンバーの Cargo.toml と Cargo.lock だけをキーに混ぜ、ルートの仮想マニフェストは入らない（ログの「Lockfiles considered」でも無い）。`scripts/lib/cargo-root-manifest-key.sh`（[workspace.package] の version・行全体のコメント・空行・CRLF を除いた 8 桁）を ci.yml の macOS / Windows と release-windows.yml の `key` へ渡す。規約は conventions.md「CI のビルドキャッシュのキー」
 - 実測: テスト 27 PASS（注入 8 通りを名指し・本物を正当に変えた 4 通りで偽の赤なし）・actionlint 0 件。CI ログのキー比較は PR のコメント
@@ -72,6 +60,7 @@
 ## 2026-10-09（#1926: #173 の disable_app_nap は /proc 前提で一度も効いていなかった = 消して、利用者が待つ読み込みだけ App Nap を止める）
 - 交互 2 周の実測で (2) を選択: 寿命の間止めるとアイドル 341〜365 → 856〜1,154 µW・裏の出力処理 2〜5 倍の電力、得をするのは待たれる重い処理だけ。エージェント稼働中は #173 のアサーションで App Nap の対象外（優先度 28）。`UserWork::begin_load` を PDF のラスタライズ（開く / ズーム）・Markdown の組み立て / 描き直しへ（A/B `TAKO_1926_LEGACY=1`）
 - 実測: PDF 117 ページ 7.2〜8.0 → 3.0 秒・ズーム 49.9 → 20.8 秒。`scripts/test-preview-load-app-nap-1926.sh` 7 PASS（旧の腕で ①② が名指しで FAILED）・番犬 `issue1926_app_nap_watchdog` 4 本（注入 12 通りを file:line で名指し）
+
 ## 2026-10-09（#1968: master の監視が UI スレッドで子プロセスを待つ・tako の子プロセスが本体の 4〜6 倍の CPU・target を Spotlight が索引）
 - 真因（本番の `sample` / perf.log / `proc_pid_rusage` + 同じ構成の隔離 GUI のシンボル付き A/B）: Report が丸ごと同期・status の準備部が `has_running_children`（tmux + ps）・照会ごとに ps 2〜3 本とレジストリ 200 KB の解釈・PATH の痩せた `.app` で 2 秒ごとにログインシェル・UI ストールの誤分類。`OffloadJob::Report`・`probe_running_children`・`agents::with_shared_scan`・レジストリの中身一致の使い回し・`which_claude` の覚え・`recent_spans_within`。A/B `TAKO_1968_LEGACY=1`・番犬 `issue1968_ui_thread_subprocess_watchdog`。`scripts/spotlight-noindex.sh`（target → `target.noindex` のリンク）
 - 実測（1 時間・左右同時）: 本体 CPU 6.69 → 3.88%・子プロセス 39.2 → 18.9%・ログインシェル 23 → 0 本/分・UI ストール 5 → 0・UI 専有 計 438 秒 → 0.25 秒・`list` p95 106 → 55ms・メモリは両方増えない。本番の「554 MB」は描画面の計上の出入り（151 MB）が主。描画ありの CPU 14% は出力の描画（37 fps）で差なし
