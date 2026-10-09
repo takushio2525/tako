@@ -459,11 +459,13 @@ fn ab_のenvを読むのは1か所だけ() {
             };
             for (i, line) in src.lines().enumerate() {
                 if line.contains(LEGACY_ENV) {
+                    // Windows はパスの区切りが `\` なので、比べる前に `/` へ揃える
+                    // （揃えないと `crates/tako-core/src\session_restart.rs` になり名指しが外れる）
                     let rel = file
                         .strip_prefix(&root)
                         .unwrap_or(&file)
-                        .display()
-                        .to_string();
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     readers.push(format!("{rel}:{}", i + 1));
                 }
             }
