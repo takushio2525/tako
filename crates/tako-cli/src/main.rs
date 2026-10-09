@@ -3476,20 +3476,24 @@ struct ShellIntegrationArgs {
     json: bool,
 }
 
-/// tako mod の引数（Issue #1879）。
+/// tako mod の引数（Issue #1879 / #1881）。
 ///
 /// `report` は mod が stdin の JSON で状態を送る口で、人が打つものではないので
 /// `--help` の候補に出さない（受け付けはする）
 #[derive(Args)]
 struct ModArgs {
-    /// on / off（省略時は状態を表示）
+    /// on / off（省略時は状態を表示）。band = Claude Code の画面の帯（band on / band off）
     #[arg(value_parser = clap::builder::PossibleValuesParser::new([
         clap::builder::PossibleValue::new("status"),
         clap::builder::PossibleValue::new("on"),
         clap::builder::PossibleValue::new("off"),
+        clap::builder::PossibleValue::new("band"),
         clap::builder::PossibleValue::new("report").hide(true),
     ]))]
     action: Option<String>,
+    /// band のとき: on = 帯を出す / off = 隠す（動いている claude へ次の報告で届く）
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
     /// 生の JSON で出力する
     #[arg(long)]
     json: bool,
@@ -6987,6 +6991,22 @@ fn print_mod(args: &ModArgs, result: &Value) {
     if let Some(note) = result["applies_to"].as_str() {
         println!("{note}");
     }
+    // #1881: Claude Code の画面の帯（プロンプトの上の 1 行）
+    let band = &result["band"];
+    if band["legacy"].as_bool() == Some(true) {
+        println!("帯: 描かない（TAKO_1877_S3_LEGACY）");
+    } else if band.is_object() {
+        let request = match band["request"]["hidden"].as_bool() {
+            Some(true) => "・tako mod band off を中継中",
+            Some(false) => "・tako mod band on を中継中",
+            None => "",
+        };
+        println!(
+            "帯: ctx {}% / 使用制限 {}% 以上で ctx・使用制限も出す{request}",
+            band["ctx_percent"].as_u64().unwrap_or(0),
+            band["limit_percent"].as_f64().unwrap_or(0.0),
+        );
+    }
     let percent = |v: &Value| v.as_f64().map_or("-".to_string(), |p| format!("{p:.0}%"));
     for row in result["panes"].as_array().into_iter().flatten() {
         let pane = row["pane"].as_u64().unwrap_or(0);
@@ -7001,8 +7021,25 @@ fn print_mod(args: &ModArgs, result: &Value) {
                     .find(|l| l["kind"] == kind)
                     .map_or("-".to_string(), |l| percent(&l["percent_used"]))
             };
+            let band = &report["band"];
+            let band = match (band["hidden"].as_bool(), band["shown"].as_bool()) {
+                (Some(true), _) => "  帯 非表示".to_string(),
+                (_, Some(true)) => format!(
+                    "  帯 {} 桁: {}",
+                    band["columns"].as_u64().unwrap_or(0),
+                    band["segments"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+                (_, Some(false)) => "  帯 描いていない".to_string(),
+                _ => String::new(),
+            };
             println!(
-                "  pane {pane}  {state}  ctx {}  5h {}  7d {}  {}  {}  ({} 秒前)",
+                "  pane {pane}  {state}  ctx {}  5h {}  7d {}  {}  {}  ({} 秒前){band}",
                 percent(&report["context"]["percent"]),
                 limit("five_hour"),
                 limit("seven_day"),
@@ -7958,6 +7995,25 @@ fn build_request(command: &Command) -> Result<Request, String> {
             report: Some(read_mod_report()?),
             pane: caller_pane(),
         },
+        // #1881: `tako mod band on|off` は dispatch の action `band-on` / `band-off`（MCP と同じ語）
+        Command::Mod(args) if args.action.as_deref() == Some("band") => Request::Mod {
+            action: Some(match args.state.as_deref() {
+                Some("on") => "band-on".into(),
+                Some("off") => "band-off".into(),
+                _ => {
+                    return Err(
+                        "band には on か off を付ける（tako mod band off で帯を隠す）".into(),
+                    )
+                }
+            }),
+            report: None,
+            pane: None,
+        },
+        Command::Mod(args) if args.state.is_some() => {
+            return Err(
+                "on / off は band の後ろにだけ付ける（帯の切替は tako mod band on|off）".into(),
+            )
+        }
         Command::Mod(args) => Request::Mod {
             action: args.action.clone(),
             report: None,

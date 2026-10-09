@@ -150,7 +150,7 @@ tako orchestrator spawn --help
 | [`check-health`](#その他) | 環境の健全性診断（`tako setup --check` と同じ項目を JSON でも返す） |
 | [`agent-support`](#tako-agent-support) | エージェント系統ごとの能力差 |
 | [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置（`tako setup` が自動で通る） |
-| [`mod`](#その他) | tako mod（Claude Code の mod 連携）の状態と切替。ペインの claude から ctx・使用制限・ターンの報告が届いているかを見る |
+| [`mod`](#その他) | tako mod（Claude Code の mod 連携）の状態と切替。ペインの claude から ctx・使用制限・ターンの報告が届いているかを見る。Claude Code の画面の帯の表示切替（`band on` / `off`） |
 | [`context-budget`](#その他) | 起動時ロードの予算の確認と作業ログの自動移送 |
 | [`test-residue`](#その他) | テスト・検証が残した一時 dir の掃除 |
 | [`fda`](#その他) | フルディスクアクセスの状態確認 |
@@ -1589,6 +1589,9 @@ tako mod off                 # 次に作るペインから mod を読ませな�
 tako mod on                  # 戻す（既定 ON。claude 2.1.294 以上のペインにだけ読ませる）
                              # 届いた報告はコンテキスト残量・使用制限・作業状態の一次ソースになる
                              # （orchestrator self / status の ctx_source が mod。報告が無ければ画面へ落ち、理由は ctx_mod_reason）
+tako mod band off            # Claude Code の画面のプロンプトの上の帯（tako | ペイン名 | タブ | worker 数・要注意）を隠す
+tako mod band on             # 戻す（動いている claude へ次の報告 = 最大 15 秒で届く。Claude Code の中では /tako band on|off）
+                             # 帯は 1 行。ctx / 使用制限は 80% を超えたときだけ出す。/tako でサイドバーに詳細
 
 tako context-budget          # 起動時ロードの予算の確認（何も書き換えない）
 tako context-budget fix      # 積もった作業ログを archive へ移送する

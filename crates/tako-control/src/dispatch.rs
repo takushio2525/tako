@@ -37793,6 +37793,143 @@ mod tests {
         assert!(host.claude_mod.reports.is_empty());
     }
 
+    /// #1881: 報告の応答に帯・サイドバーの材料（view）が載る。worker は右パネル orch と同じ
+    /// 規則で引き、mod の権限待ちは要注意に数える。帯の警告は閾値を超えたものだけ
+    #[test]
+    fn issue1881_報告の応答に帯とサイドバーの材料が載る() {
+        let mut host = MockHost::new();
+        let (_tab, master) = layout_with_workers(&mut host, 2);
+        let mut workers: Vec<u64> = host
+            .ws
+            .workers_of(master)
+            .iter()
+            .map(|p| p.id().as_u64())
+            .collect();
+        workers.sort_unstable();
+        // 片方の worker は権限ダイアログ待ち（mod の報告）
+        dispatch(
+            &mut host,
+            mod_request(
+                "report",
+                Some(mod_report_body("permission")),
+                Some(workers[1]),
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        // master は ctx 85%（閾値 80% 超え）・5h 3%（閾値未満）
+        let mut body = mod_report_body("busy");
+        body["context"]["percent"] = json!(85);
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(body.clone()), Some(master.as_u64())),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let view = &out["tako"]["view"];
+        assert_eq!(view["pane"], master.as_u64(), "{out}");
+        assert_eq!(view["worker_count"], 2);
+        assert_eq!(view["attention"], 1);
+        assert_eq!(view["workers"][0]["pane"], workers[1], "要注意が先");
+        assert_eq!(view["workers"][0]["attention"], "permission");
+        assert_eq!(view["workers"][0]["state"], "waiting");
+        assert_eq!(
+            view["workers"][1]["name"],
+            format!("pane {}", workers[0]),
+            "名前の無いペインは pane N"
+        );
+        assert_eq!(view["warnings"], json!([{"kind": "ctx", "percent": 85.0}]));
+        assert_eq!(view["ctx"]["percent"], 85);
+        assert_eq!(
+            view["rate_limits"][0]["kind"], "five_hour",
+            "サイドバーには全部"
+        );
+        assert_eq!(
+            view["thresholds"]["ctx_percent"],
+            tako_core::claude_mod::BAND_CTX_PERCENT
+        );
+        assert!(view.get("band_request").is_none(), "中継が無ければ載せない");
+        // worker 自身の帯は worker 0 本
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(mod_report_body("busy")), Some(workers[0])),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["tako"]["view"]["worker_count"], 0);
+        assert_eq!(out["tako"]["view"]["attention"], 0);
+        assert_eq!(out["tako"]["view"]["warnings"], json!([]));
+
+        // tako mod band off → 次の報告の応答で全 mod へ中継する
+        let status = dispatch(
+            &mut host,
+            mod_request("band-off", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(status["band"]["request"]["hidden"], true, "{status}");
+        assert!(status["applies_to"]
+            .as_str()
+            .unwrap()
+            .contains("/tako band"));
+        // 帯の状態（mod が描いたもの）は status の行に出る
+        body["band"] = json!({"hidden": true, "shown": false, "segments": [], "toggled_at": 7});
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(body), Some(master.as_u64())),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["tako"]["view"]["band_request"]["hidden"], true);
+        let status = dispatch(
+            &mut host,
+            mod_request("status", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let row = status["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pane"] == master.as_u64())
+            .unwrap()
+            .clone();
+        assert_eq!(row["report"]["band"]["hidden"], true, "{row}");
+        assert_eq!(row["report"]["band"]["toggled_at"], 7);
+        let status = dispatch(
+            &mut host,
+            mod_request("band-on", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(status["band"]["request"]["hidden"], false);
+    }
+
+    /// #1881: A/B（TAKO_1877_S3_LEGACY）と終わったセッションには帯の材料を載せない
+    /// （mod は何も描かない = #1881 前の挙動）。env を触らずに判断の引数で確かめる
+    #[test]
+    fn issue1881_ab_と終わったセッションには帯の材料を載せない() {
+        let host = MockHost::new();
+        let pane = PaneId::from_raw(host.root_pane());
+        let on = crate::claude_mod::snapshot(
+            &host,
+            pane,
+            tako_core::claude_mod::Accepted::Stored,
+            false,
+        );
+        assert!(on["view"].is_object(), "{on}");
+        let legacy =
+            crate::claude_mod::snapshot(&host, pane, tako_core::claude_mod::Accepted::Stored, true);
+        assert!(legacy.get("view").is_none(), "{legacy}");
+        assert_eq!(
+            legacy["mod_enabled"], on["mod_enabled"],
+            "S1 の中身はそのまま"
+        );
+        let ended =
+            crate::claude_mod::snapshot(&host, pane, tako_core::claude_mod::Accepted::Ended, false);
+        assert!(ended.get("view").is_none());
+    }
+
     /// #1879: tako の再起動をまたいで生き残った claude は古い TAKO_PANE_ID で報告してくる
     /// （#210 の旧 ID → 新 ID の対応で読み替える）。知らない ID は断る
     #[test]
@@ -37843,10 +37980,13 @@ mod tests {
         assert!(host.claude_mod.reports.is_empty());
         let err =
             dispatch(&mut host, mod_request("bogus", None, None), PaneOrigin::Cli).unwrap_err();
+        // 受け付ける action の一覧を名指す（#1881 で band-on / band-off が増えた）
         assert!(
-            err.to_string().contains("status / on / off / report"),
+            err.to_string()
+                .contains(&crate::claude_mod::ACTIONS.join(" / ")),
             "{err}"
         );
+        assert!(err.to_string().contains("band-off"), "{err}");
     }
 
     /// #1879: on / off は設定を切り替え、注入しない理由が status に出る

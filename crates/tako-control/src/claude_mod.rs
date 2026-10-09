@@ -7,7 +7,8 @@
 //! |---|---|---|---|
 //! | `status`（既定） | 展開先・版・注入の有無・ペインごとの最終報告（鮮度つき） | `tako mod` | `tako_mod` |
 //! | `on` / `off` | 設定 `claude_mod` の切替（次に作るペインから） | `tako mod on` / `off` | `tako_mod` |
-//! | `report` | mod からの状態報告。応答は tako 側のスナップショット | `tako mod report`（stdin） | **出さない** |
+//! | `band-on` / `band-off` | Claude Code の画面の帯を出す / 隠す（S3 #1881。報告の応答で全 mod へ中継） | `tako mod band on` / `off` | `tako_mod` |
+//! | `report` | mod からの状態報告。応答は tako 側のスナップショット（帯・サイドバーの材料） | `tako mod report`（stdin） | **出さない** |
 //!
 //! `report` を MCP に載せないのは、AI が叩くと**自分の状態を偽って注入できるだけ**で、
 //! AI にとっての等価物（読む側の `tako_mod` / `tako_orchestrator_self`）は別にあるから
@@ -25,9 +26,9 @@ use crate::dispatch::DispatchError;
 use crate::host::ControlHost;
 
 /// CLI / dispatch が受け付ける action
-pub const ACTIONS: &[&str] = &["status", "on", "off", "report"];
+pub const ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off", "report"];
 /// MCP が受け付ける action（`report` は載せない。モジュール冒頭の理由）
-pub const MCP_ACTIONS: &[&str] = &["status", "on", "off"];
+pub const MCP_ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off"];
 
 /// `tako setup` の段（設計書 §3.2。GUI 起動時と並ぶ 2 つ目の発火点）。
 ///
@@ -214,6 +215,22 @@ pub fn run(
             );
             Ok(out)
         }
+        "band-on" | "band-off" => {
+            let hidden = action == Some("band-off");
+            host.claude_mod_mut()
+                .ok_or_else(|| {
+                    DispatchError::Operation(
+                        "この tako は mod を扱わない（2 つ目のインスタンス等）".into(),
+                    )
+                })?
+                .request_band(hidden, epoch_ms());
+            let mut out = status(host)?;
+            out["applies_to"] = json!(
+                "動いている claude の帯へ次の報告（最大 15 秒）で届く。Claude Code の中で /tako band on|off \
+                 を後から打てば、そちらが勝つ"
+            );
+            Ok(out)
+        }
         "report" => accept_report(host, report, pane),
         other => Err(DispatchError::InvalidParams(format!(
             "未知の action: {other}（{}）",
@@ -247,13 +264,6 @@ fn accept_report(
         .claude_mod_mut()
         .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?
         .accept(pane_id.as_u64(), parsed, Instant::now());
-    let enabled = host.claude_mod().is_some_and(|h| h.enabled);
-    let ws = host.workspace();
-    let tab = ws.find_tab_of_pane(pane_id).and_then(|t| ws.get_tab(t));
-    let pane_title = tab
-        .and_then(|t| t.tree().get(pane_id))
-        .and_then(|p| p.title())
-        .map(str::to_string);
     Ok(json!({
         "accepted": match accepted {
             Accepted::Stored => "stored",
@@ -261,12 +271,110 @@ fn accept_report(
         },
         "pane": pane_id.as_u64(),
         "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
-        "tako": {
-            "pane_title": pane_title,
-            "tab_title": tab.map(|t| t.title().to_string()),
-            "mod_enabled": enabled,
-        },
+        "tako": snapshot(host, pane_id, accepted, core::s3_legacy()),
     }))
+}
+
+/// 報告の応答に載せる tako 側のスナップショット（設計書 §2.3）。
+///
+/// S3（#1881）から帯・サイドバーの材料（`view`）も載せる。終わったセッションには描く先が
+/// 無いので載せない。A/B（`legacy` = `TAKO_1877_S3_LEGACY`）でも載せない = mod は何も描かない
+pub(crate) fn snapshot(
+    host: &dyn ControlHost,
+    pane_id: PaneId,
+    accepted: Accepted,
+    legacy: bool,
+) -> Value {
+    let enabled = host.claude_mod().is_some_and(|h| h.enabled);
+    let ws = host.workspace();
+    let tab = ws.find_tab_of_pane(pane_id).and_then(|t| ws.get_tab(t));
+    let pane_title = tab
+        .and_then(|t| t.tree().get(pane_id))
+        .and_then(|p| p.title())
+        .map(str::to_string);
+    let mut out = json!({
+        "pane_title": pane_title,
+        "tab_title": tab.map(|t| t.title().to_string()),
+        "mod_enabled": enabled,
+    });
+    if accepted == Accepted::Stored && !legacy {
+        out["view"] =
+            serde_json::to_value(band_view(host, pane_id, Instant::now())).unwrap_or(Value::Null);
+    }
+    out
+}
+
+/// 帯・サイドバーの材料（S3 #1881。判断は `tako_core::claude_mod::band_view`）。
+///
+/// worker は右パネル orch と同じ規則（`Workspace::workers_of`）で引き、1 本ずつ mod の報告・
+/// 画面・コマンド状態の手掛かりを集める（報告は最大 1 秒に 1 回なので、画面の判定もその頻度）
+fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandView {
+    let ws = host.workspace();
+    let tab = ws.find_tab_of_pane(pane).and_then(|t| ws.get_tab(t));
+    let workers = ws
+        .workers_of(pane)
+        .into_iter()
+        .map(|p| worker_facts(host, p, now))
+        .collect();
+    core::band_view(core::BandInput {
+        pane: pane.as_u64(),
+        pane_title: tab
+            .and_then(|t| t.tree().get(pane))
+            .and_then(|p| p.title())
+            .map(str::to_string),
+        tab_title: tab.map(|t| t.title().to_string()),
+        lang: tako_core::i18n::lang().as_str(),
+        workers,
+        ctx: lookup_pane(host, pane, now)
+            .ok()
+            .and_then(|s| s.report.context.clone()),
+        rate_limits: account_rate_limits(host, pane, now),
+        band_request: host.claude_mod().and_then(|h| h.band_request),
+        thresholds: core::band_thresholds(),
+    })
+}
+
+/// worker 1 本の手掛かり（判断は `tako_core::claude_mod::classify_worker`）
+fn worker_facts(host: &dyn ControlHost, pane: &tako_core::Pane, now: Instant) -> core::WorkerFacts {
+    use crate::claude_tui::DialogKind;
+    let id = pane.id();
+    let mod_turn = lookup_pane(host, id, now).ok().map(|s| s.report.turn);
+    let limited = mod_turn.is_some()
+        && account_rate_limits(host, id, now)
+            .iter()
+            .any(|l| l.percent_used >= 100.0);
+    let session = host.session(id);
+    let lines = session.map(|s| s.visible_lines()).unwrap_or_default();
+    let dialog = crate::claude_tui::detect_choice_dialog(&lines);
+    core::WorkerFacts {
+        pane: id.as_u64(),
+        name: pane
+            .title()
+            .or_else(|| pane.role())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("pane {}", id.as_u64())),
+        mod_turn,
+        limited,
+        dialog_on_screen: dialog
+            .as_ref()
+            .is_some_and(|d| !d.kind.auto_accepted() && d.kind != DialogKind::UsageLimit),
+        permission_on_screen: dialog
+            .as_ref()
+            .is_some_and(|d| d.kind == DialogKind::Permission),
+        limit_dialog_on_screen: dialog
+            .as_ref()
+            .is_some_and(|d| d.kind == DialogKind::UsageLimit),
+        screen_busy: !lines.is_empty()
+            && crate::orchestrator::wait::screen_looks_busy(&lines.join("\n")),
+        command: session.map(|s| s.command_state()).unwrap_or_default(),
+    }
+}
+
+/// いまの時刻（epoch ms。mod の `$.clock.now()` と同じ物差し）
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// 報告の送り主のペイン。現世代にそのまま居ればそれ、居なければ #210 の旧 ID → 新 ID の対応
@@ -380,6 +488,13 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
     Ok(json!({
         "enabled": hub.enabled,
         "injecting": injection.is_on(),
+        // S3（#1881）: 帯の中継（`tako mod band on|off`）と A/B。ペインごとの帯の状態は行の report.band
+        "band": {
+            "request": hub.band_request,
+            "legacy": core::s3_legacy(),
+            "ctx_percent": core::band_thresholds().ctx_percent,
+            "limit_percent": core::band_thresholds().limit_percent,
+        },
         "reason": injection.off_reason().map(reason_json),
         "plugin_dir": hub.plugin_dir.as_ref().map(|p| p.display().to_string()),
         "install": match &hub.install_result {

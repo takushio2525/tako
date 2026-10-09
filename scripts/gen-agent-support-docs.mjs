@@ -50,7 +50,7 @@ const CATEGORIES = [
     'worker_idle_with_background',
     'worker_prompt_undelivered', 'worker_death_resume',
     'worker_refusal_detect', 'worker_refusal_work_proof',
-    'worker_login_expired_detect', 'claude_mod_state',
+    'worker_login_expired_detect', 'claude_mod_state', 'claude_mod_band',
   ]],
   ['worker への指示と応答', [
     'worker_prompt_delivery', 'worker_delivery_peer',

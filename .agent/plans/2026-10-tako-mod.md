@@ -525,6 +525,27 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   `claude plugin test` で terminal と desktop の両 surface。statusLine を持つ利用者の画面で
   情報が二重にならない既定（閾値未満は出さない）。MATRIX `claude_mod_band`
 
+**S3（#1881）で実装した形**（要件は FR-2.42.13〜17）:
+
+- **判断は tako、詰めるのは mod**: `tako mod report` の応答の `tako.view`（`tako_core::claude_mod::BandView`）に
+  ペイン名・タブ・worker と要注意（`classify_worker`）・閾値を超えた警告（`band_warnings`）・サイドバー用の
+  ctx / 使用制限・閾値・トグルの中継を載せる。mod は `bodyColumns` に合わせて優先度の低い区切りから落とし
+  （`fitBand`）、`wrap="truncate-end"` の 1 本の `Text` で描く。材料は `$.state`（`tako.view` /
+  `tako.bandHidden`）に写し、描画が購読する（書けば描き直される・ホットリロードでも残る）
+- 実画面（2.1.294・組織アカウント・隔離 tmux 21 行）の帯:
+  `tako | オーケストレーターの ma… | タブ tako-wt-1881 の帯の検証… | worker 2 | 要注意 1 | ctx 6% | 7d 42% | 5h 5%`
+  （閾値 0 の検証 env で区切りを全部並べた形）。80 桁ではタブ名と worker 数が落ちる。`bodyColumns` は
+  端末の幅 − 5 を実測。**`ui.render` / `command.run` / `$.store` / `$.ui.open` は組織アカウントでも届く**
+  （classic 系だけが届かない = FR-2.42.7 の差は帯に影響しない）
+- `$.store` の実体は `<設定 dir>/plugins/store/<mod 名>_inline-<hash>.json`。**hash は mod の名前で決まり
+  置き場のパスに依らない**（scratchpad の試作で置き場を変えても同じファイル名）= 隔離テストの claude も
+  本番の tako mod と同じファイルを読み書きするので、実経路テストは前後で退避・復元する
+- worker の数え方は右パネル orch と同じ 1 実装（`Workspace::workers_of`。orch ビューの inline の規則を寄せた）
+- A/B: `TAKO_1877_S3_LEGACY=1`（応答に view を載せない）。検証用: `TAKO_1881_BAND_THRESHOLD=<%>`。
+  実経路テストは `scripts/test-claude-mod-band-1881.sh`、mod のテストは `claude-mod/tests/band.test.ts`
+- 残る遅れ: worker の状態の変化は**master 側の次の報告**（変化が無ければ 15 秒の heartbeat）で帯に届く。
+  即時に届けるには tako → mod の push（S6）が要る
+
 ### S4 Claude Code から tako を操作（#1882）
 
 - やること: スラッシュコマンド（`/tako split` 等。`immediate` = Claude のターン中でも即実行）と

@@ -249,6 +249,8 @@ pub mod keys {
     pub const ACCOUNT_SWITCH: &str = "account_switch";
     /// spawn 時に系統を選べるか
     pub const AGENT_SELECT_AT_SPAWN: &str = "agent_select_at_spawn";
+    /// エージェントの画面の中（プロンプトの上の帯・サイドバー）に tako の状況を出す（#1881）
+    pub const CLAUDE_MOD_BAND: &str = "claude_mod_band";
     /// エージェントのプロセス内の拡張（Claude Code の mod）から状態を構造で受け取る（#1879）
     pub const CLAUDE_MOD_STATE: &str = "claude_mod_state";
     /// thinking / reasoning effort の指定
@@ -749,6 +751,23 @@ pub const MATRIX: &[AgentFeature] = &[
             "orchestrator/agent.rs の WorkerAgent が spawn 引数・プロファイルの両方から \
              解決され、build_worker_cmd_in が 3 系統ぶんのコマンドを組む。\
              ペイン単位・タスク単位の切替導線は #988",
+        ),
+    },
+    AgentFeature {
+        key: keys::CLAUDE_MOD_BAND,
+        summary: Note::new(
+            "エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー）に tako のペイン・タブ・worker と要注意の数を出す",
+            "Shows tako's pane, tab, workers and how many need attention inside the agent's own screen (a one-line band above the prompt and a /tako sidebar)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1885),
+        agy: pending(notes::NOT_INVESTIGATED, 1885),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1881: Claude Code 2.1.294 の mod（AbovePrompt の帯・$.ui.open のペイン・$.store のトグル）を\
+             隔離 GUI のペインと 80 / 144 / 300 桁の隔離 tmux で実 claude に描かせ、帯が 1 行に収まること・\
+             ダイアログの後に戻ること・トグルが再起動後も保たれることを画面の capture で確かめた\
+             （scripts/test-claude-mod-band-1881.sh）",
         ),
     },
     AgentFeature {

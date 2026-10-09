@@ -3740,7 +3740,7 @@
     "name": "tako_config_share"
   },
   {
-    "description": "tako mod（Claude Code の mod）の状態と切替。action: status（既定。claude の版・注入の有無・ペインごとの報告 = ctx / 使用制限 / turn と鮮度・報告が無い理由）/ on / off（次に作るペインから効く）",
+    "description": "tako mod（Claude Code の mod）の状態と切替。action: status（既定。claude の版・注入の有無・ペインごとの報告 = ctx / 使用制限 / turn と鮮度・報告が無い理由）/ on / off（次に作るペインから効く）/ band-on / band-off（Claude Code の画面の帯）",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -3748,7 +3748,9 @@
           "enum": [
             "status",
             "on",
-            "off"
+            "off",
+            "band-on",
+            "band-off"
           ],
           "type": "string"
         }
