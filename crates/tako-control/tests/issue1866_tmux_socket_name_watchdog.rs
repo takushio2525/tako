@@ -42,12 +42,25 @@
 //! `wrap_options` はバックエンドの conf を `-f` で渡すので、テスト側に `new-session` の字面が無い）。
 //!
 //! 見る形（どちらも**テスト領域だけ**。`src` は `production_range::tests_only` で切る）:
+//! **#1918 で tako-app のセルフテストも足した**（`main.rs` の `mod self_test { … }` と
+//! `src/self_test/` 配下）。セルフテストは `cfg(test)` ではなく本番バイナリに入るので
+//! `tests_only` では見えず、`-f` なしの器が 6 か所残っていた: 字面の `"new-session"` が
+//! 4 か所（48 / 68 / 73 / 103）と、ペインのシェルへ `tmux -L <器> new-session …` を
+//! **打ち込む**形が 2 か所（1d = 固定名 `takoST` / 61f）。後者は `"new-session"` の字面が
+//! 無いので、文字列の中の `-L … new-session` を別の規則（[`shell_new_sessions`]）で見る。
+//! 103（#772）と 61f は**そのインスタンスの backend のソケット**へ器を立てるので、`/dev/null`
+//! ではなく製品と同じ conf（`tmux_backend::ensure_conf`）を `-f` で渡す（そこで初めて起きた
+//! サーバーを後続のペインも使うため）。規則はどれも「器を起こすコマンドに `-f` がある」
 //!
 //! - 名前: 器の名前を受け取る書き方（[`NAME_SLOTS`] / [`NAME_SECOND_ARG`] /
 //!   `TmuxTestGuard::new(vec![…])`）へ渡した変数を、手前の `let x = format!("…", …)` /
 //!   `const X: &str = "…"` まで辿る
 //! - `-f`: `"new-session"` を含む文に `"-f"` があるか。文の中の変数が手前で `"-f"` を含む
-//!   式に束縛されていてもよい（tmux / psmux 共用の e2e が tmux のときだけ渡す形）
+//!   式に束縛されていてもよい（tmux / psmux 共用の e2e が `let conf = &["-f", …]` で渡す形）
+//!
+//! psmux（Windows）の e2e も #1918 から同じ規則で見る（それまでは `-f` の効き方が未実測で
+//! 除外していた。CI の Windows ランナーで v3.3.7 / v3.3.8 が `-f NUL` で `~/.tmux.conf` を
+//! 読まないことを実測した = `.agent/conventions.md` の #1874 / #1918 の節）。
 //!
 //! 対象外:
 //!
@@ -56,7 +69,6 @@
 //! | 既存のセッションへのグループ（`new-session -t`） | `new-session -d -t orig -s view` | 相手のセッションがある = 器は手前で起きている |
 //! | 引数の検査（`for` / 器を叩かない `assert`） | `for forbidden in ["new-session", …]` | 器を起こさない |
 //! | 名前を辿れない式 | 関数の引数・`self.socket`・`socket_for("1259")` | 定義側で見る（`socket_for` は `tmux_e2e_watchdog.rs`） |
-//! | psmux の e2e（`-f` の規則だけ） | `crates/tako-core/tests/psmux_backend.rs` | [`CONF_EXEMPT`] |
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -210,12 +222,8 @@ fn tako_coreの実tmuxテストは器の名前を重ねない() {
 /// この番犬自身（説明文と固定テストの断片に違反の形を書く）
 const SELF_FILE: &str = "crates/tako-control/tests/issue1866_tmux_socket_name_watchdog.rs";
 
-/// `-f` の規則から外すファイル（**理由つき**。増やすときは実測した理由を書く）
-const CONF_EXEMPT: &[(&str, &str)] = &[(
-    "crates/tako-core/tests/psmux_backend.rs",
-    "psmux（Windows）の器。psmux の `-f` が利用者の設定を外すかは未実測で、この番犬を書いた機\
-     （macOS）でも CI（Windows ランナーに psmux が無い）でも走らない",
-)];
+/// psmux（Windows）の e2e。#1918 までは `-f` の規則から外していた（効き方が未実測だった）
+const PSMUX_E2E: &str = "crates/tako-core/tests/psmux_backend.rs";
 
 /// 器の名前を受け取る書き方（この直後の式が `-L` へ渡る名前）
 const NAME_SLOTS: &[&str] = &[
@@ -250,7 +258,43 @@ impl TestSource {
     }
 }
 
-/// 全クレートの `src`（テスト領域）と `tests`（丸ごと）
+/// tako-app のセルフテストの置き場（#1918）。セルフテストは `cfg(test)` ではない
+/// （本番バイナリに入り `TAKO_SELF_TEST` で走る）ので `tests_only` では空白に潰れるが、
+/// 器を自分で起こすのはテストと同じなので同じ規則で見る
+const SELF_TEST_MAIN: &str = "crates/tako-app/src/main.rs";
+/// `main.rs` の中のセルフテスト本体（0 桁目の `mod self_test {` から 0 桁目の `}` まで）
+const SELF_TEST_MOD: &str = "mod self_test {";
+/// セルフテストから `mod` で切り出したファイルの置き場（丸ごとセルフテスト）
+const SELF_TEST_DIR: &str = "crates/tako-app/src/self_test/";
+
+/// `mod self_test { … }` のバイト範囲（行頭から閉じ括弧の行末まで）
+fn self_test_range(src: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    let mut start = None;
+    for line in src.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        match start {
+            None if body == SELF_TEST_MOD => start = Some(offset),
+            Some(s) if body == "}" => return Some((s, offset + line.len())),
+            _ => {}
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// `main.rs` のテスト領域に、セルフテストの範囲の原文を重ねた本文（行番号は原文と同じ）
+fn with_self_test(src: &str, tests_only: String) -> String {
+    let Some((start, end)) = self_test_range(src) else {
+        return tests_only;
+    };
+    let mut text = tests_only;
+    // `tests_only` は改行以外を空白へ置き換えるだけなのでバイト位置が一致する
+    text.replace_range(start..end, &src[start..end]);
+    text
+}
+
+/// 全クレートの `src`（テスト領域）と `tests`（丸ごと）と、tako-app のセルフテスト
 fn test_sources(root: &Path) -> Vec<TestSource> {
     let mut files = Vec::new();
     let crates = std::fs::read_dir(root.join("crates")).expect("crates を読める");
@@ -273,11 +317,15 @@ fn test_sources(root: &Path) -> Vec<TestSource> {
             }
             let src = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("{} を読める: {e}", path.display()));
-            // `mod tests;` で切り出したファイル（`…/tests.rs`）と `tests/` 配下は丸ごとテスト
-            let whole =
-                rel.contains("/tests/") || path.file_name().is_some_and(|n| n == "tests.rs");
+            // `mod tests;` で切り出したファイル（`…/tests.rs`）と `tests/` 配下は丸ごとテスト。
+            // セルフテストから切り出したファイルも丸ごと（#1918）
+            let whole = rel.contains("/tests/")
+                || rel.starts_with(SELF_TEST_DIR)
+                || path.file_name().is_some_and(|n| n == "tests.rs");
             let text = if whole {
                 src
+            } else if rel == SELF_TEST_MAIN {
+                with_self_test(&src, production_range::tests_only(&src))
             } else {
                 production_range::tests_only(&src)
             };
@@ -630,14 +678,56 @@ fn missing_conf(src: &TestSource, at: usize) -> Option<String> {
     Some(head.to_string())
 }
 
-/// `-f` の規則に当たる `"new-session"` の数と違反
-fn conf_problems(sources: &[TestSource]) -> (usize, Vec<String>) {
-    let mut seen = 0usize;
-    let mut problems = Vec::new();
-    for src in sources {
-        if CONF_EXEMPT.iter().any(|(rel, _)| *rel == src.rel) {
+/// シェルの 1 コマンドの区切り（`||` は `|` で切れる）
+const SHELL_SEPARATORS: &[&str] = &["&&", ";", "|"];
+
+/// 文字列に埋めたシェルのコマンドで器を起こす `new-session` の位置と、`-f` があるか（#1918）。
+///
+/// セルフテストはペインのシェルへ `tmux -L <器> new-session …` を**打ち込んで**器を立てる
+/// ことがあり、`"new-session"` の字面の規則では見えない（1d が固定名 `takoST` + `-f` なしの
+/// まま残っていた）。文字列の中の `new-session` のうち、同じコマンドの手前に `-L` がある
+/// （= 器を指している）ものだけを数える（「tmux new-session が失敗した」のような文言は
+/// `-L` が無いので当たらない）。`-t`（既存のセッションへのグループ）は器を起こさないので数えない
+fn shell_new_sessions(src: &TestSource) -> Vec<(usize, bool)> {
+    let code = src.code.as_bytes();
+    let mut out = Vec::new();
+    for (at, _) in src.lit.match_indices("new-session") {
+        // `"new-session"` の字面は [`missing_conf`] が見る。文字列の外（`code` で残る所）は見ない
+        if src.lit[..at].ends_with('"') || code.get(at) != Some(&b' ') {
             continue;
         }
+        let line_start = src.lit[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = src.lit[at..].find('\n').map_or(src.lit.len(), |i| at + i);
+        let before = &src.lit[line_start..at];
+        let cmd_start = SHELL_SEPARATORS
+            .iter()
+            .filter_map(|s| before.rfind(s).map(|i| i + s.len()))
+            .max()
+            .unwrap_or(0);
+        let cmd = &before[cmd_start..];
+        let Some(l_at) = cmd.find("-L ") else {
+            continue;
+        };
+        let after = &src.lit[at..line_end];
+        let after_end = SHELL_SEPARATORS
+            .iter()
+            .filter_map(|s| after.find(s))
+            .min()
+            .unwrap_or(after.len());
+        if after[..after_end].contains(" -t ") {
+            continue;
+        }
+        out.push((at, cmd[l_at..].contains(" -f ")));
+    }
+    out
+}
+
+/// `-f` の規則に当たる `"new-session"` の数・文字列に埋めたシェルの `new-session` の数・違反
+fn conf_problems(sources: &[TestSource]) -> (usize, usize, Vec<String>) {
+    let mut seen = 0usize;
+    let mut shell_seen = 0usize;
+    let mut problems = Vec::new();
+    for src in sources {
         for (at, _) in src.lit.match_indices("\"new-session\"") {
             seen += 1;
             if let Some(head) = missing_conf(src, at) {
@@ -648,25 +738,55 @@ fn conf_problems(sources: &[TestSource]) -> (usize, Vec<String>) {
                 ));
             }
         }
+        for (at, has_conf) in shell_new_sessions(src) {
+            shell_seen += 1;
+            if !has_conf {
+                let line = line_of(&src.lit, at);
+                let head = src.lit.lines().nth(line - 1).unwrap_or("").trim();
+                problems.push(format!(
+                    "  {}:{line} シェルへ打ち込むコマンドが `-f` なしで器を起こしている\
+                     （`-L <器>` と `new-session` の間に `-f` が無い）: {head}",
+                    src.rel
+                ));
+            }
+        }
     }
-    (seen, problems)
+    (seen, shell_seen, problems)
 }
 
 #[test]
 fn テストが起こす器は利用者の設定を読まない() {
     let root = repo_root();
     let sources = test_sources(&root);
-    // 除外は実在するファイルだけ（消えた・改名したファイルの除外が残ると理由が嘘になる）
-    for (rel, _) in CONF_EXEMPT {
-        assert!(
-            sources.iter().any(|s| s.rel == *rel),
-            "CONF_EXEMPT の {rel} が無い（除外を外す）"
-        );
-    }
-    let (seen, problems) = conf_problems(&sources);
+    // psmux の e2e も見ている（#1918 で除外を外した。改名で黙って外れない）
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.rel == PSMUX_E2E && s.lit.contains("\"new-session\"")),
+        "{PSMUX_E2E} の `\"new-session\"` を走査していない（改名したらこの番犬も追う）"
+    );
+    let (seen, _, problems) = conf_problems(&sources);
     assert!(
         seen >= 15,
         "テストの `\"new-session\"` を {seen} 個しか拾えない（走査の形が実装とずれている）"
+    );
+    // セルフテストの器も見ている（`mod self_test` の改名・移動で、緑のまま見張りが消えない。
+    // #1918 の時点で字面が 4 か所 = 48 / 68 / 73 / 103、シェルへ打ち込む形が 2 か所 = 1d / 61f）
+    let self_test = sources
+        .iter()
+        .find(|s| s.rel == SELF_TEST_MAIN)
+        .expect("tako-app の main.rs を走査している");
+    let in_self_test = self_test.lit.matches("\"new-session\"").count();
+    assert!(
+        in_self_test >= 4,
+        "{SELF_TEST_MAIN} のセルフテスト（`{SELF_TEST_MOD}`）から `\"new-session\"` を \
+         {in_self_test} 個しか拾えない（範囲の切り出しが実装とずれている）"
+    );
+    let shell_in_self_test = shell_new_sessions(self_test).len();
+    assert!(
+        shell_in_self_test >= 2,
+        "{SELF_TEST_MAIN} のセルフテストからシェルへ打ち込む `tmux -L … new-session` を \
+         {shell_in_self_test} 個しか拾えない（走査の形が実装とずれている）"
     );
     assert!(
         problems.is_empty(),
@@ -725,6 +845,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn セルフテストの範囲だけを原文へ戻す() {
+        let src = "fn product() {\n    run(&[\"new-session\"]);\n}\n\
+                   mod self_test {\n    fn a() {\n        run(&[\"new-session\"]);\n    }\n}\n\
+                   fn after() {}\n";
+        let (start, end) = self_test_range(src).expect("範囲を拾う");
+        assert!(src[start..].starts_with(SELF_TEST_MOD));
+        assert!(src[..end].ends_with("    }\n}\n"), "0 桁目の `}}` で閉じる");
+        // 本番コードは空白のまま、セルフテストだけが読める（行番号は変わらない）
+        let blanked: String = src
+            .chars()
+            .map(|c| if c == '\n' { '\n' } else { ' ' })
+            .collect();
+        let merged = with_self_test(src, blanked);
+        assert_eq!(merged.lines().count(), src.lines().count());
+        assert_eq!(merged.matches("\"new-session\"").count(), 1);
+        assert_eq!(
+            merged.lines().nth(5).map(str::trim),
+            Some("run(&[\"new-session\"]);")
+        );
+        // セルフテストが無ければ何も足さない
+        assert!(self_test_range("fn a() {}\n").is_none());
+    }
+
     /// 断片の `"new-session"` の違反行（行番号だけ）
     fn conf_lines(text: &str) -> Vec<usize> {
         let src = TestSource::new("crates/x/tests/fixture.rs", text);
@@ -748,6 +892,28 @@ fn a(socket: &str) {
 "##;
         // 1 つ目と、`-f` つきの文の後ろの 2 つ（文字列の中の `;` / `{` で文を取り違えない）
         assert_eq!(conf_lines(text), vec![3, 6, 7]);
+    }
+
+    #[test]
+    fn シェルへ打ち込むnew_sessionは器を指すものだけ数えfを見る() {
+        let text = r#"
+fn a(sock: &str, bin: &str) {
+    type_text("if command -v tmux; then tmux -L takoST kill-server 2>/dev/null; \
+               tmux -L takoST new-session -d 'sleep 5' && echo OK; fi");
+    type_text(&format!("tmux -L {sock} -f /dev/null new-session -d && tmux -L {sock} kill-server"));
+    assert!(ok, "tmux new-session が失敗した: 実行: tmux -L {sock} {args}");
+    type_text(&format!("{bin} -L {sock} new-session -d -t orig -s view"));
+    let new_session = run(&["new-session"]);
+}
+"#;
+        let src = TestSource::new("crates/x/tests/fixture.rs", text);
+        let found: Vec<(usize, bool)> = shell_new_sessions(&src)
+            .into_iter()
+            .map(|(at, conf)| (line_of(&src.lit, at), conf))
+            .collect();
+        // 継続行の `-L takoST new-session`（`-f` なし）と、`-f` つきの 1 本だけ。
+        // 文言・グループ化（`-t`）・`"new-session"` の字面・識別子は数えない
+        assert_eq!(found, vec![(4, false), (5, true)]);
     }
 
     #[test]

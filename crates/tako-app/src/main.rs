@@ -57111,12 +57111,20 @@ mod self_test {
             //     方言が POSIX でないときは対象外（psmux 側の起動検査は
             //     `tests/psmux_backend.rs` が実バイナリで見ている）
             if sh.is_posix() {
+                // 器の名前は pid 入り（並走する別のセルフテストと取り合わない・残骸は製品の掃除が
+                // 拾う）で、利用者の設定を読まずに起こす（#1918。旧実装は固定名 `takoST` + `-f` なしで、
+                // 隣のセルフテストの器を先頭の `kill-server` で落としうるうえ、`~/.tmux.conf` も読んでいた）
+                let sock = format!("tako-selftest-1d-{}", std::process::id());
+                let conf = tako_core::tmux::NO_USER_CONF;
                 type_text(
                     any,
                     cx,
-                    "if command -v tmux >/dev/null; then tmux -L takoST kill-server 2>/dev/null; \
-                     tmux -L takoST new-session -d 'sleep 5' && tmux -L takoST kill-server 2>/dev/null \
-                     && echo TMUX-OK-42; else echo TMUX-OK-42; fi",
+                    &format!(
+                        "if command -v tmux >/dev/null; then \
+                         tmux -L {sock} -f {conf} new-session -d 'sleep 5' \
+                         && tmux -L {sock} kill-server 2>/dev/null \
+                         && echo TMUX-OK-42; else echo TMUX-OK-42; fi"
+                    ),
                     true,
                 );
                 check(
@@ -60104,7 +60112,9 @@ mod self_test {
                 // 完全一致になっていない実装（`=` を解さない psmux へ `=` を渡す等）だと
                 // 「消えない」か「隣も消える」のどちらかで落ちる（#866）
                 for name in ["tako-test", "tako-test2"] {
+                    // 器は利用者の設定を読まずに起こす（#1918。psmux も通るので null デバイスは OS ごと）
                     let created = tako_core::tmux::tmux_command(Some(&sock))
+                        .args(["-f", tako_core::tmux::NO_USER_CONF])
                         .args(["new-session", "-d", "-s", name])
                         .status()
                         .map(|s| s.success())
@@ -61111,12 +61121,15 @@ mod self_test {
                 // この項目が落ちる。落ち方が #1105（統合が届かない）と同じ「環境の残骸」
                 // なので、テスト側の前提はテスト側で外しておく
                 let att_name = format!("att-e2e-{}", std::process::id());
+                // backend のソケットなので製品と同じ conf を渡す（ここではサーバーが既に起きて
+                // いて効かないが、器を起こす形は例外なく `-f` つきにする = #1918 の番犬の規則）
+                let backend_conf = shell_escape(&tako_core::tmux_backend::ensure_conf());
                 press(any, cx, sh.clear_line_key());
                 type_text(
                     any,
                     cx,
                     &format!(
-                        "{tmux_bin} -L {backend_sock} new-session -d -s {att_name} && \
+                        "{tmux_bin} -L {backend_sock} -f {backend_conf} new-session -d -s {att_name} && \
                          {tmux_bin} -L {backend_sock} attach -t {att_name}"
                     ),
                     true,
@@ -63886,8 +63899,10 @@ mod self_test {
             //     MovePane target）を機械検証する。tmux 系は専用 -L ソケットで隔離
             if has_tmux {
                 let dnd_sock = format!("tako-selftest-dnd-{}", std::process::id());
+                // 器は利用者の設定を読まずに起こす（#1918）
                 let created = std::process::Command::new("tmux")
-                    .args(["-L", &dnd_sock, "new-session", "-d", "-s", "dnd-src"])
+                    .args(["-L", &dnd_sock, "-f", tako_core::tmux::NO_USER_CONF])
+                    .args(["new-session", "-d", "-s", "dnd-src"])
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
@@ -64024,8 +64039,10 @@ mod self_test {
             //      実機バグの回帰検知）
             if has_tmux {
                 let view_sock = format!("tako-selftest-view-{}", std::process::id());
+                // 器は利用者の設定を読まずに起こす（#1918）
                 let created = std::process::Command::new("tmux")
-                    .args(["-L", &view_sock, "new-session", "-d", "-s", "view-src"])
+                    .args(["-L", &view_sock, "-f", tako_core::tmux::NO_USER_CONF])
+                    .args(["new-session", "-d", "-s", "view-src"])
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
@@ -77061,8 +77078,14 @@ mod self_test {
                 // ある（高負荷で実測）。数回だけ試し、駄目なら tmux の言い分を出して落とす
                 let mut session_made = false;
                 let mut session_err = String::new();
+                // この器は**このインスタンスの backend のソケット**なので、ここでサーバーが
+                // 初めて起きると後続のペインも同じサーバーを使う。利用者の設定ではなく
+                // 製品（`wrap_options`）と同じ conf で起こす（#1918）
+                let backend_conf = tako_core::tmux_backend::ensure_conf();
                 for _ in 0..5 {
                     let out = tako_core::tmux::tmux_command(Some(&socket))
+                        .arg("-f")
+                        .arg(&backend_conf)
                         .args([
                             "new-session",
                             "-d",
@@ -90156,9 +90179,10 @@ fn find_git_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     tako_core::git::repo_root(dir)
 }
 
-/// POSIX シェルへ渡すパスのクオート。残った呼び出しは `#[cfg(unix)]` の項目と
-/// visual-test 限定の検証コードだけなので、Windows 向けビルドでは未使用になる
-/// （#865 で項目 69c を `platform::shell_dialect` 経由へ寄せたため）
+/// POSIX シェルへ渡すパスのクオート。呼び出しは `#[cfg(unix)]` の項目・visual-test 限定の
+/// 検証コード・実 tmux が要る項目（61f。Windows では実行時に飛ぶ = #1918）だけ。
+/// #865 で項目 69c を `platform::shell_dialect` 経由へ寄せた時点では Windows 向けビルドで
+/// 未使用になったので `dead_code` を許している
 #[cfg_attr(not(unix), allow(dead_code))]
 fn shell_escape(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
