@@ -4740,10 +4740,12 @@ impl TakoApp {
             // 系統ごとの resume 件数（#1238）と新規シェルの理由（#1076）も同じ器が持つ
             let mut breakdown = tako_control::restore_report::RestoreBreakdown::new();
             // タブ配下に居ないペイン（たまり場 = FR-2.15.5 / 退避タブ = #1487）。
-            // どちらも**表に出すときに起こす**設計なので `spawn_session` を通らないのが
-            // 正しく、**復元の失敗ではない**（#1554）。実測 2026-09-22: 本番 layout.json は
-            // 17 ペインのうち 1 件がたまり場・1 件が退避タブ配下で、これが persist.log の
-            // 「内訳の合計が 1〜2 足りない」行（52 件中 8 件・すべて #1487 着地以降）の正体
+            // **復元の失敗ではない**（#1554。本番 persist.log の「内訳の合計が 1〜2 足りない」
+            // 行の正体）。#1576 からは表のペインと**同じ経路で器へ繋ぎ直し、退避のまま戻す**:
+            // 以前は「表に出すときに起こす」つもりで素通りさせていたが、表に出す経路は
+            // 端末を起こさず、器も `backend_sessions` へ登録されないので、起動時の orphan
+            // 自動復帰が器を「復帰」タブへ**別 pane** として拾い、退避エントリは端末の無い
+            // 幽霊として残っていた（2026-09-23 / 10-09 に worker の会話が消えた実害）
             let backgrounded: std::collections::HashSet<u64> = app
                 .workspace
                 .shelved_panes()
@@ -4757,32 +4759,64 @@ impl TakoApp {
                 .flat_map(|t| t.tab().tree().panes())
                 .map(|p| p.id().as_u64())
                 .collect();
+            // 退避をどう戻すか（起こす / 残す / 外す）の正本は `shelved_restore::plan`（#1576）。
+            // 器の取り合いを防ぐため、タブ配下のペインの器を先に押さえておく（表が勝つ）
+            let shelved_legacy = tako_control::shelved_restore::legacy();
+            let mut claimed_vessels =
+                tako_control::shelved_restore::claimed_by_tabs(&restored, |id| {
+                    pane_ids.iter().any(|p| p.as_u64() == id)
+                });
             // セッションカタログ（#112）は復元ループの外で 1 回だけ読む。
             // 起動条件（役割 / model / effort）の出どころで、読めなければ最小形へ落ちる
             let catalog = tako_control::sessions::SessionCatalog::load().ok();
             for r in &restored {
-                let Some(&pane) = pane_ids.iter().find(|p| p.as_u64() == r.pane) else {
-                    // タブ配下に居ないペイン。たまり場・退避タブ配下なら**起こさないのが
-                    // 正しい**ので失敗と数えず、そのどちらでもなければ復元失敗（#1554。
-                    // 黙って飛ばすと内訳の合計がペイン数より小さい行になる）
-                    let hidden = if backgrounded.contains(&r.pane) {
-                        Some(tako_control::restore_report::HiddenKind::Backgrounded)
-                    } else if shelved_tab_panes.contains(&r.pane) {
-                        Some(tako_control::restore_report::HiddenKind::ShelvedTab)
-                    } else {
-                        None
-                    };
-                    match hidden {
-                        Some(kind) => breakdown
-                            .record(tako_control::restore_report::PaneOutcome::Hidden(kind)),
-                        None => record_restore_failure(
-                            &mut breakdown,
-                            r.pane,
-                            tako_control::restore_report::FailureReason::NotPlaced,
-                            None,
-                        ),
+                // `hidden` = 退避のまま戻すペインの種別（表のペインは None）。以降の枝は表と
+                // 退避で共通で、結末だけを `PaneOutcome::within` が「たまり場・退避」へ数え替える
+                let (pane, hidden) = match pane_ids.iter().find(|p| p.as_u64() == r.pane) {
+                    Some(&pane) => (pane, None),
+                    None => {
+                        // タブ配下に居ないペイン。たまり場・退避タブ配下でなければ復元失敗
+                        // （#1554。黙って飛ばすと内訳の合計がペイン数より小さい行になる）
+                        let kind = if backgrounded.contains(&r.pane) {
+                            tako_control::restore_report::HiddenKind::Backgrounded
+                        } else if shelved_tab_panes.contains(&r.pane) {
+                            tako_control::restore_report::HiddenKind::ShelvedTab
+                        } else {
+                            record_restore_failure(
+                                &mut breakdown,
+                                r.pane,
+                                tako_control::restore_report::FailureReason::NotPlaced,
+                                None,
+                            );
+                            continue;
+                        };
+                        match tako_control::shelved_restore::plan(
+                            r,
+                            &mut claimed_vessels,
+                            tmux_available,
+                            shelved_legacy,
+                        ) {
+                            tako_control::shelved_restore::HiddenPlan::Wake => {
+                                (PaneId::from_raw(r.pane), Some(kind))
+                            }
+                            tako_control::shelved_restore::HiddenPlan::Leave => {
+                                breakdown.record(
+                                    tako_control::restore_report::PaneOutcome::Hidden(
+                                        kind,
+                                        tako_control::restore_report::HiddenWake::NotWoken,
+                                    ),
+                                );
+                                continue;
+                            }
+                            tako_control::shelved_restore::HiddenPlan::Drop(reason) => {
+                                // 幽霊を作らない: 退避から外す。器には触らない（同じ器は
+                                // 先に起こしたペインが持っている / そもそも器が無い）
+                                app.workspace.remove_shelved(PaneId::from_raw(r.pane));
+                                record_restore_failure(&mut breakdown, r.pane, reason, None);
+                                continue;
+                            }
+                        }
                     }
-                    continue;
                 };
                 // プレビューペイン（FR-3.2）はファイルを開き直すだけ（PTY は起動しない）
                 if let Some(p) = &r.preview {
@@ -4816,7 +4850,8 @@ impl TakoApp {
                     // Code Runner: 復元経路でも実行プロファイルを検出する（#453）。
                     // 検出しないと再生ボタンが淡色（クリック無効）のまま表示される
                     app.detect_preview_run_profiles(pane, path);
-                    breakdown.record(tako_control::restore_report::PaneOutcome::Preview);
+                    let outcome = tako_control::restore_report::PaneOutcome::Preview.within(hidden);
+                    breakdown.record(outcome);
                     continue;
                 }
                 // Web ビューペイン（FR-3.8 / #155）は URL を開き直すだけ（PTY は起動しない）。
@@ -4916,9 +4951,9 @@ impl TakoApp {
                     continue;
                 }
                 match plan {
-                    RestorePlan::Reattach => {
-                        breakdown.record(tako_control::restore_report::PaneOutcome::Reattached)
-                    }
+                    RestorePlan::Reattach => breakdown.record(
+                        tako_control::restore_report::PaneOutcome::Reattached.within(hidden),
+                    ),
                     RestorePlan::Resume {
                         agent,
                         command,
@@ -4930,10 +4965,13 @@ impl TakoApp {
                         // ペインも終了する）。
                         if let Some(session) = app.terminals.get(&pane) {
                             session.write(resume_input(&command));
-                            breakdown.record(tako_control::restore_report::PaneOutcome::Resumed {
-                                agent,
-                                with_role,
-                            });
+                            breakdown.record(
+                                tako_control::restore_report::PaneOutcome::Resumed {
+                                    agent,
+                                    with_role,
+                                }
+                                .within(hidden),
+                            );
                         } else {
                             // 起こせたのに投入先が無い = 会話は戻らない（#1554）。
                             // 構造上は起きない（`spawn_session` の成功は登録を伴う）が、
@@ -4947,7 +4985,8 @@ impl TakoApp {
                         }
                     }
                     RestorePlan::FreshShell(reason) => breakdown.record(
-                        tako_control::restore_report::PaneOutcome::FreshShell(reason),
+                        tako_control::restore_report::PaneOutcome::FreshShell(reason)
+                            .within(hidden),
                     ),
                 }
             }
@@ -10449,7 +10488,9 @@ impl TakoApp {
     /// layout.json に載っていない生存中 tmux セッション（orphan）を発見し、
     /// 「復帰」タブにまとめて自動追加する（Issue #191）。
     /// spawn_session を通すため backend_sessions に登録され、
-    /// 後続の cleanup_orphan_tmux からは protected として保護される
+    /// 後続の cleanup_orphan_tmux からは protected として保護される。
+    /// 退避（たまり場・退避タブ）の器は復元ループが先に登録するので、ここで拾わない
+    /// （#1576 以前は登録されず、退避の器がここで別 pane として「復帰」タブへ出ていた）
     fn recover_orphan_sessions(&mut self, cx: &mut Context<Self>) -> Vec<String> {
         let protected: std::collections::HashSet<String> =
             self.backend_sessions.values().cloned().collect();
@@ -10587,7 +10628,8 @@ impl TakoApp {
         let mut protected: std::collections::HashSet<String> = std::collections::HashSet::new();
         if target == backend_socket {
             protected.extend(self.backend_sessions.values().cloned());
-            // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが、
+            // バックグラウンド中ペインの backend セッションは backend_sessions に残るため上で網羅されるが
+            // （#1576 で再起動直後の退避も復元ループが登録するようになった）、
             // 念のため明示的に保護する（生かしたまま隠れている）
             // #1487: 退避タブ配下も同じく保護する（掃除で器を殺さない）
             for pane in self.workspace.all_background_panes() {

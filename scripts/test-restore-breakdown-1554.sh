@@ -8,7 +8,10 @@
 #      persist.log に 1 行ずつ残る（#1554 前は `eprintln!` 止まり = GUI の stderr は
 #      どこにも出ないので痕跡ゼロ）
 #   ③ たまり場ペイン（FR-2.15.5）と退避タブ配下のペイン（#1487）は
-#      **失敗ではなく `たまり場・退避`** として数えられる（実測でこれが差 1〜2 の正体）
+#      **失敗ではなく `たまり場・退避`** として数えられる（実測でこれが差 1〜2 の正体）。
+#      #1576 からは退避も表と同じ経路で器へ繋ぎ直すので、**起こせなかった退避は
+#      `復元失敗` の側**に入る（①②③ の起動を失敗させた復元）。細工なしの復元（④）では
+#      `たまり場・退避` に「戻し方: tmux 再 attach N」を添えて数えられる
 #   ④ 失敗 0 件の復元では従来の 4 カテゴリに加えて新カテゴリが 0 で並び、
 #      「内訳が全ペインを説明できていない」行は出ない
 #   ⑤ A/B `TAKO_1554_LEGACY=1` で修正前の症状（4 カテゴリのみ・合計が足りない・
@@ -69,6 +72,8 @@ TMUX_SOCKET="tako-1554-$$"
 cleanup() {
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  # サーバーが落ちてもソケットファイルが残ることがある（自分の名前の 1 本だけ消す）
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -197,6 +202,10 @@ if cmd == "shape":
     print("hidden", len(shelved) + len(bg))
     print("plain_count", len(plain(tab)))
     print("plain_ids_list", " ".join(str(p["id"]) for p in plain(tab)))
+    # 退避（たまり場 + 退避タブ配下）の端末ペイン。#1576 からは表と同じく起こすので、
+    # 起動を失敗させた復元では表の端末ペインと一緒に失敗する
+    print("hidden_plain", len(plain(shelved)) + len(plain(bg)))
+    print("hidden_ids_list", " ".join(str(p["id"]) for p in plain(shelved) + plain(bg)))
 elif cmd == "only_plain":
     # 端末ペイン 1 本だけの layout を書き出す（プレビュー / Web ビュー / たまり場・
     # 退避を外すと「1 つも起動できない」の致命終了が必ず起きる = ⑥ の条件）
@@ -257,30 +266,32 @@ echo "  2 行目: $DET_LINE"
 python3 "$TOOL" summary "$SUM_LINE" > "$TMP/verdict.txt" || { echo "1 行目を解析できない"; exit 1; }
 v() { awk -v k="$1" '$1==k {print $2}' "$TMP/verdict.txt"; }
 check_eq "1 行目を解析できた" "1" "$(v parsed)"
+# 起こせない端末ペイン = 表の端末ペイン + 退避の端末ペイン（#1576）
+FAILS_EXPECTED=$(( $(get plain_count) + $(get hidden_plain) ))
 check_eq "① 内訳の合計 == 復元ペイン数" "$(v panes)" "$(v total)"
 check_eq "① 1 行目のペイン数が layout と一致" "$(get all_panes)" "$(v panes)"
 check_eq "① カテゴリが 7 つ並ぶ" "7" "$(v categories)"
 check_eq "① プレビューの件数が layout と一致" "$(get previews)" "$(v seg:プレビュー)"
 check_eq "① Web ビューの件数が layout と一致" "$(get webviews)" "$(v seg:Web_ビュー)"
-check_eq "③ たまり場・退避の件数が layout と一致" "$(get hidden)" "$(v seg:たまり場・退避)"
-check_eq "② 復元失敗が端末ペインの数と一致" "$(get plain_count)" "$(v seg:復元失敗)"
+check_eq "③ 起こせなかった退避はたまり場・退避に入らない（#1576）" "0" "$(v seg:たまり場・退避)"
+check_eq "② 復元失敗が端末ペイン（表 + 退避）の数と一致" "$FAILS_EXPECTED" "$(v seg:復元失敗)"
 check_eq "① 内訳が全ペインを説明できていない行は出ない" "0" \
   "$(grep -c '説明できていない' "$PLOG" | tr -d ' ')"
 echo "  失敗行:"; grep '復元失敗（ペイン' "$PLOG" | sed 's/^/    /'
-check_eq "② 失敗行が端末ペインの数だけ出る" "$(get plain_count)" \
+check_eq "② 失敗行が端末ペイン（表 + 退避）の数だけ出る" "$FAILS_EXPECTED" \
   "$(grep -c '復元失敗（ペイン' "$PLOG" | tr -d ' ')"
-for pane in $(get_list plain_ids_list); do
+for pane in $(get_list plain_ids_list) $(get_list hidden_ids_list); do
   check_eq "② 失敗行がペイン ${pane} を名指す" "1" \
     "$(grep -c "復元失敗（ペイン ${pane}）" "$PLOG" | tr -d ' ')"
 done
 check_has "② 失敗行が理由の分類を載せる" "起動できない" "$(grep '復元失敗（ペイン' "$PLOG" | tail -1)"
-check_has "③ 2 行目にたまり場・退避の内訳が出る" "たまり場・退避 2（たまり場 1 / 退避タブ 1）" "$DET_LINE"
-check_has "② 2 行目に失敗の理由が出る" "復元失敗 $(get plain_count)（起動できない" "$DET_LINE"
+check_not "③ 2 行目に起こせなかった退避をたまり場・退避として出さない（#1576）" "たまり場・退避" "$DET_LINE"
+check_has "② 2 行目に失敗の理由が出る" "復元失敗 ${FAILS_EXPECTED}（起動できない" "$DET_LINE"
 check_not "② 診断にペインの中身が漏れていない" "example.com" "$(grep '復元' "$PLOG" | tr '\n' ' ')"
 # 同じ内訳が CLI / MCP（dispatch）からも読める = persist の last_restore（FR-5.7）
 LAST_RESTORE="$("$TAKO_BIN" persist 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("last_restore") or "")')"
 check_has "② tako persist の last_restore に同じ内訳が載る" \
-  "たまり場・退避 2 / 復元失敗 $(get plain_count)" "$LAST_RESTORE"
+  "たまり場・退避 0 / 復元失敗 ${FAILS_EXPECTED}" "$LAST_RESTORE"
 stop_app
 
 echo "== ⑤ A/B: TAKO_1554_LEGACY=1 で修正前の症状が再現する =="
@@ -315,6 +326,7 @@ check_has "④ 従来の 4 カテゴリはそのまま並ぶ" "tmux 再 attach" 
 check_eq "④ 復元失敗が 0 で並ぶ" "0" "$(o seg:復元失敗)"
 check_eq "④ Web ビューが 1 で並ぶ" "1" "$(o seg:Web_ビュー)"
 check_eq "④ たまり場・退避の件数が layout と一致" "$(get hidden)" "$(o seg:たまり場・退避)"
+check_has "④ 2 行目に退避の戻し方が出る（#1576）" "たまり場・退避 2（たまり場 1 / 退避タブ 1。戻し方: tmux 再 attach 2）" "$(detail_line)"
 check_eq "④ 失敗行は出ない" "0" "$(grep -c '復元失敗（ペイン' "$PLOG" | tr -d ' ')"
 check_eq "④ 食い違いの名指しも出ない" "0" "$(grep -c '説明できていない' "$PLOG" | tr -d ' ')"
 check_eq "④ 合計 == ペイン数（失敗 0 件でも成り立つ）" "$(o panes)" "$(o total)"

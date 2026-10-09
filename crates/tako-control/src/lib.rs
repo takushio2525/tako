@@ -85,6 +85,7 @@ pub mod setup_bootstrap;
 pub mod setup_deps;
 pub mod setup_remaining;
 pub mod shell_integration;
+pub mod shelved_restore;
 pub mod sleep_guard;
 pub mod ssh_detect;
 pub mod stale_binary;
