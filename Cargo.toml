@@ -60,6 +60,15 @@ syntect = { version = "5", default-features = false, features = [
 ] }
 # bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 270+ 構文。#320）
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+# TS の塗りの正規表現へ前置きを足す（#1917。tako-app/src/syntax_prefilter.rs）。4 つとも
+# syntect が既に使っている版そのもの（新しいクレートは増えない。flate2 は文脈の詰め直し・
+# regex-syntax は条件の文字クラスを広げる）。
+# fancy-regex は syntect と同じ 0.16 に揃える（正規表現を読むパーサと、実際に照合する
+# エンジンを 1 つにするため。2 版並ぶと番犬 issue1917_ts_highlight_prefilter_watchdog が落ちる）
+fancy-regex = "0.16.2"
+bincode = "1.3"
+flate2 = "1"
+regex-syntax = "0.8"
 # Markdown プレビューのパーサ（FR-3.3。イベントストリーム型で GPUI 独自描画に写す）
 pulldown-cmark = { version = "0.13", default-features = false }
 # 表示中プレビューファイルのイベント駆動監視（Issue #233）。macOS は FSEvents、

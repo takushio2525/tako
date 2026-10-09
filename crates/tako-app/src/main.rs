@@ -60,6 +60,7 @@ mod spinner;
 mod ssh_folders;
 mod starter;
 mod status_bar;
+mod syntax_prefilter;
 mod tab_bar;
 mod tab_shape;
 mod tasks_panel;
@@ -28481,6 +28482,10 @@ fn main() {
     // 登録前は従来どおり全スレッドが対象なので、この行より前の計測は変わらない
     tako_control::diag::mark_main_thread();
     tako_control::diag::spawn_stall_watchdog();
+    // #1917: TS の塗りの正規表現を書き換えた構文セットを先に作っておく（release 実測 34〜36 ms・
+    // プロセスで 1 回）。最初の塗りが UI スレッド（チャットのコードブロック・小さいファイルの
+    // 編集開始）でも、そこで払わずに済む
+    syntax_prefilter::warm_up();
     // #777: SIGTERM を正規の quit（`on_app_quit` を通る）へ読み替える。**本番も対象**
     // （#770 では隔離インスタンス限定だった）。`kill -TERM` / スクリプトからの停止でも
     // 直前の構成が layout.json に載り、蓋閉じ防止も解除される。握るからには

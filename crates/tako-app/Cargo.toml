@@ -27,6 +27,11 @@ serde_json.workspace = true
 # プレビューペイン: コードハイライト（FR-3.2）と Markdown パース（FR-3.3）
 syntect.workspace = true
 two-face.workspace = true
+# TS の塗りの前置き（#1917。syntax_prefilter.rs）。どれも syntect の依存と同じ版
+fancy-regex.workspace = true
+bincode.workspace = true
+flate2.workspace = true
+regex-syntax.workspace = true
 pulldown-cmark.workspace = true
 notify.workspace = true
 image.workspace = true

@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1892: tako mod の validate / test を夜間リリースの前段で毎晩回し、落ちたら通知する）
-- 本体 `scripts/check-claude-mod.sh`（origin/main の mod を一時 dir へ取り出し、使い捨ての設定 dir で `claude plugin validate --strict` / `test`。各段 60 秒の上限でプロセスグループごと打ち切り・`.catch` 抜けと 0 本も不合格・claude が無ければ未実測 = exit 3）。`nightly-release.sh` はロック直後に毎晩呼び、**結果でリリースを止めない**（ERROR + 既存の通知）。`~/.claude-orchestrator/state/tako-mod-check` に検査した claude の版と前回合格の版・mod の木を記録し「更新で壊れた / mod の変更で壊れた」を出し分ける
-- 実測: `scripts/test-nightly-mod-check-1892.sh` 100 PASS（claude の無い PATH で 92 PASS + 未実測 1）・回帰の注入 6 通りを名指しで FAIL・実物の claude 2.1.294 で壊れた登録が exit 1・利用者の設定の mtime 一致・既存の nightly 139 / retry 55 / promote 125 緑
-
 ## 2026-10-09（#1881: tako mod S3 = Claude Code の画面のプロンプトの上に帯 1 行と /tako のサイドバーを出した）
 - 判断は tako（`claude_mod::band_view` / `classify_worker` / `band_warnings` を `tako mod report` の応答の `tako.view` へ）、mod は `bodyColumns` に合わせて優先度の低い区切りから落とし `Text` 1 本（truncate-end）で描く。worker は右パネル orch と同じ `Workspace::workers_of` へ寄せた。トグルは `$.store`（`/tako band on|off`・ボタン・`tako mod band on|off` の中継。新しい方が勝つ）。A/B `TAKO_1877_S3_LEGACY=1`・検証用 `TAKO_1881_BAND_THRESHOLD`・MATRIX `claude_mod_band`・カタログ +74 B
 - 実測: `scripts/test-claude-mod-band-1881.sh` 49 PASS 0 FAIL（実 claude 2.1.294・組織 / 個人の設定 dir）で 80 / 144 / 300 桁 × 21 行の帯が 1 行・ダイアログ 4 回の後に戻る・再起動後もトグル保持・A/B で描かない・`claude plugin test` 26 本（terminal / desktop）・番犬 `issue1881_claude_mod_band_watchdog.rs`（注入 12 通りを file:line で名指し）
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1909: 補完の打鍵と説明の補いの取り消しの番号も UI スレッドで先に取る = ホバーの #1893 と同じ口へ）
 - `reserve_completion` / `reserve_resolve` → 要求の `ticket`。manager の背景は補完・説明・ホバーとも `enter_lane` の 1 口から列へ入り、`supersede(` は UI の口と `enter_lane` だけ（番犬が他を名指し）。残りは `tako lsp status` / MCP の `inflight`。A/B `TAKO_1909_LEGACY=1`・注入 `TAKO_1909_INJECT_HOLD`（背景の走り出しを合図まで止める）
 - 実測: visual-test `completion-cancel` で旧い形は閉じた後の背景がサーバへ届き `inflight=1` / `pending_requests=1`（③ で名指しの FAILED）、直した形は 0 / 0・問い合わせ 0。e2e 6 本（背景で取り直す注入で 5 本が落ちる）・番犬の注入 11 通りを file:line で名指し・`scripts/test-lsp-completion-cancel-1909.sh` 4 PASS 0 FAIL（2 回）
+
+## 2026-10-09（#1917: TS の構文の塗りを release の 1 MB で 5.9 → 1.8 秒にした = 正規表現へ「当たらない行で VM を起こさない」等価な前置き）
+- 真因: two-face の TS は先読み・後読みだらけで、fancy-regex は行の全バイト位置で VM を回す（正規表現 365 本に均等に散る・1 行 1 回ほぼ当たらない）。`syntax_prefilter.rs` が TS / TSX の 425 本を `\G(?=(?s:.)*?(?:必要条件))(?s:.)*?\K(?:元)` へ書き換え（構文セットの直列化を 2 構文だけ解いて詰め直す・往復検査・プロセスで 1 回 34 ms を起動時に別スレッドで）。A/B `TAKO_1917_LEGACY=1`
+- 実測（release・交互 3 回）: 1 MB の TS 5.90 → 1.73〜1.83 秒・TSX 6.1 → 1.7 秒・TS / Rust 4.6 → 1.4 倍・Rust は不変・40 行の冷えた 1 回目だけ 82 → 100 ms。塗りの全記録が実在の TS 12 本で 1 行残らず一致。単体 9 本（バックトラック回数の番犬）・番犬 4 本
