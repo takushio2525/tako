@@ -293,6 +293,15 @@ enum Lane {
     Hover,
 }
 
+impl Lane {
+    /// `tako lsp status` の `inflight` の名前（#1909）
+    const ALL: [(Lane, &'static str); 3] = [
+        (Lane::Completion, "completion"),
+        (Lane::Resolve, "resolve"),
+        (Lane::Hover, "hover"),
+    ];
+}
+
 /// 列の「いま生きている 1 つ」（#1682）
 #[derive(Default)]
 struct Inflight {
@@ -300,6 +309,9 @@ struct Inflight {
     ticket: u64,
     /// 送ったがまだ答えを受けていない要求（取り消す相手）
     call: Option<(Weak<ServerProcess>, RequestId)>,
+    /// 列へ入ってまだ答えを返していない問い合わせの数（#1909。置き換わった古い要求も、抜けるまで
+    /// 数える = 取り消しを追い越して読み込みを待ち続けている古い要求が見える）
+    running: usize,
 }
 
 impl Inner {
@@ -309,6 +321,41 @@ impl Inner {
             Lane::Resolve => &mut self.resolve_lane,
             Lane::Hover => &mut self.hover_lane,
         }
+    }
+}
+
+/// 列へ入った問い合わせ 1 つ（#1909。[`Shared::enter_lane`] が返し、落とすと `inflight` から外れる）
+struct LaneCall<'a> {
+    shared: &'a Shared,
+    lane: Lane,
+    ticket: u64,
+}
+
+impl LaneCall<'_> {
+    fn key(&self) -> (Lane, u64) {
+        (self.lane, self.ticket)
+    }
+}
+
+impl Drop for LaneCall<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.shared.lock();
+        let inflight = inner.lane(self.lane);
+        inflight.running = inflight.running.saturating_sub(1);
+    }
+}
+
+/// 検証用の注入（#1909）: `TAKO_1909_INJECT_HOLD=<ファイル>` があれば、取り消し合う問い合わせは
+/// 列の番号を決める**前に**そのファイルができるまで止まる（上限 60 秒）。GUI が要求を背景へ渡してから
+/// 背景が走り出すまでの遅れ（background executor が混んでいる）を演じ、その間に UI の取り消しが
+/// 入る順序をどの機でも作る（実時間の遅れに任せない）
+fn hold_for_injection() {
+    let Some(path) = std::env::var_os("TAKO_1909_INJECT_HOLD") else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !Path::new(&path).exists() && Instant::now() < deadline {
+        std::thread::sleep(super::goto::READY_POLL);
     }
 }
 
@@ -706,11 +753,35 @@ impl LspManager {
         }
     }
 
+    /// 打鍵の補完の取り消しの番号を**UI スレッドで**先に取る（#1909。列の前の要求は取り消す）。
+    /// 要求の `ticket` に載せると、背景で番号を取り直さない = この後の `cancel_completion` を
+    /// 追い越さない（ホバーの [`Self::reserve_hover`] と同じ口）。LSP を止めていれば `None`。
+    /// **待たない**（ロックを短く取るだけ）
+    pub fn reserve_completion(&self) -> Option<u64> {
+        self.shared
+            .as_ref()
+            .map(|shared| shared.supersede(Lane::Completion))
+    }
+
+    /// 説明の補いの取り消しの番号を**UI スレッドで**先に取る（#1909。前の説明の要求は取り消す）。
+    /// [`Self::resolve_completion`] の `ticket` に渡す。**待たない**
+    pub fn reserve_resolve(&self) -> Option<u64> {
+        self.shared
+            .as_ref()
+            .map(|shared| shared.supersede(Lane::Resolve))
+    }
+
     /// 選んだ候補の説明を補う（`completionItem/resolve`。#1682）。**背景スレッドから呼ぶ**。
-    /// 文書が開いている（編集中の）ときだけ。前の説明の要求は取り消す（選択を動かすたびに投げる）
-    pub fn resolve_completion(&self, path: &Path, item: &Value) -> Result<Value, CompletionError> {
+    /// 文書が開いている（編集中の）ときだけ。前の説明の要求は取り消す（選択を動かすたびに投げる）。
+    /// `ticket` は UI が先に取った番号（[`Self::reserve_resolve`]。#1909）で、`None` なら背景で取る
+    pub fn resolve_completion(
+        &self,
+        path: &Path,
+        item: &Value,
+        ticket: Option<u64>,
+    ) -> Result<Value, CompletionError> {
         match &self.shared {
-            Some(shared) => shared.resolve_completion(path, item),
+            Some(shared) => shared.resolve_completion(path, item, ticket),
             None => Err(GotoError::Disabled.into()),
         }
     }
@@ -1506,7 +1577,13 @@ impl Shared {
     // --- 読み取り -----------------------------------------------------------
 
     fn status(&self, name: Option<&str>) -> Value {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        // 取り消し合う要求（打鍵の補完・説明の補い・マウスのホバー）のうち、まだ答えを返していない数
+        // （#1909。取り消した古い要求が読み込み待ちに残っていれば 0 に戻らない）
+        let inflight: serde_json::Map<String, Value> = Lane::ALL
+            .iter()
+            .map(|&(lane, name)| (name.to_string(), json!(inner.lane(lane).running)))
+            .collect();
         let servers: Vec<Value> = inner
             .servers
             .iter()
@@ -1518,6 +1595,7 @@ impl Shared {
             "servers": servers,
             "documents": inner.docs.len(),
             "diagnostics_total": inner.diagnostics.total(),
+            "inflight": inflight,
         });
         if inner.servers.is_empty() {
             value["note"] = json!(text::IDLE_NOTE.text());
@@ -2123,14 +2201,35 @@ impl Shared {
             let mut inner = self.lock();
             inner.next_ticket = inner.next_ticket.wrapping_add(1);
             let ticket = inner.next_ticket;
-            let previous = std::mem::replace(inner.lane(lane), Inflight { ticket, call: None });
-            (ticket, previous.call)
+            // 走っている数（`running`）は置き換わった古い要求が抜けるまで数えるので残す
+            let inflight = inner.lane(lane);
+            inflight.ticket = ticket;
+            (ticket, inflight.call.take())
         };
         // 取り消しはロックの外で（待ちの表は別のロック）
         if let Some(process) = previous.and_then(|(p, id)| p.upgrade().map(|p| (p, id))) {
             process.0.cancel_request(&process.1);
         }
         ticket
+    }
+
+    /// 取り消し合う要求（打鍵の補完・説明の補い・マウスのホバー）が背景で列へ入る**唯一の口**
+    /// （#1893 / #1909）。UI が先に取った番号（`reserved` = `reserve_completion` / `reserve_resolve` /
+    /// `reserve_hover`）があればそれを使い、無いときだけここで取る。**背景でここに着く前に** UI が
+    /// 取り消していた（一覧を閉じた・語の外へ出た・語から外れた）なら、UI の番号は古くなっているので
+    /// 問い合わせずに `Superseded` で抜ける。ここで取り直すと取り消しを追い越して自分が最新になり、
+    /// 読み込みが済むまで待ち続ける。返した [`LaneCall`] が生きているあいだは `inflight` に数える
+    fn enter_lane(&self, lane: Lane, reserved: Option<u64>) -> LaneCall<'_> {
+        self.lock().lane(lane).running += 1;
+        // 落とすと数から外れる（注入で止まっているあいだも数える = 背景が走り出したと分かる）
+        let mut call = LaneCall {
+            shared: self,
+            lane,
+            ticket: 0,
+        };
+        hold_for_injection();
+        call.ticket = reserved.unwrap_or_else(|| self.supersede(lane));
+        call
     }
 
     fn is_current(&self, lane: Lane, ticket: u64) -> bool {
@@ -2177,10 +2276,12 @@ impl Shared {
 
     fn completion(&self, request: &CompletionRequest) -> Result<CompletionAnswer, CompletionError> {
         let deadline = Instant::now() + request.timeout;
-        // 打鍵の要求は列の前の 1 つを取り消してから（最新の 1 つだけを生かす）
-        let lane = request
+        // 打鍵の要求は列へ入る（最新の 1 つだけを生かす）。番号は UI が先に取ったもの（#1909。
+        // 背景で取り直すと一覧を閉じた取り消しを追い越す = ホバーと同じ口）
+        let entered = request
             .superseding
-            .then(|| (Lane::Completion, self.supersede(Lane::Completion)));
+            .then(|| self.enter_lane(Lane::Completion, request.ticket));
+        let lane = entered.as_ref().map(LaneCall::key);
         let superseded = || lane.is_some_and(|(lane, ticket)| !self.is_current(lane, ticket));
         let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
             return Err(GotoError::NoServer.into());
@@ -2355,16 +2456,23 @@ impl Shared {
         }
     }
 
-    fn resolve_completion(&self, path: &Path, item: &Value) -> Result<Value, CompletionError> {
+    fn resolve_completion(
+        &self,
+        path: &Path,
+        item: &Value,
+        ticket: Option<u64>,
+    ) -> Result<Value, CompletionError> {
         let timeout = super::completion::RESOLVE_TIMEOUT;
         let deadline = Instant::now() + timeout;
-        let lane = Some((Lane::Resolve, self.supersede(Lane::Resolve)));
+        // 番号は UI が先に取ったもの（#1909。打鍵の補完と同じ口）
+        let entered = self.enter_lane(Lane::Resolve, ticket);
+        let lane = Some(entered.key());
         let Some(resolved) = servers::resolve_in(self.config.table, path) else {
             return Err(GotoError::NoServer.into());
         };
         let spec = resolved.spec;
         let uri = tako_core::file_uri::from_path(path);
-        let current = || self.is_current(Lane::Resolve, lane.map_or(0, |(_, t)| t));
+        let current = || self.is_current(Lane::Resolve, entered.ticket);
         let ready = self.wait_ready(&uri, spec, timeout, deadline, &|| !current());
         if !current() {
             return Err(CompletionError::Superseded);
@@ -2393,16 +2501,12 @@ impl Shared {
     fn hover(&self, request: &HoverRequest) -> Result<HoverAnswer, HoverError> {
         use tako_core::lsp::hover as hv;
         let deadline = Instant::now() + request.timeout;
-        // マウスの要求は列の前の 1 つを取り消してから（最新の 1 つだけを生かす。補完と同じ）。
-        // UI が先に取った番号があればそれを使う（取り直すと UI の取り消しを追い越す。#1893）
-        let lane = request.superseding.then(|| {
-            (
-                Lane::Hover,
-                request
-                    .ticket
-                    .unwrap_or_else(|| self.supersede(Lane::Hover)),
-            )
-        });
+        // マウスの要求は列へ入る（最新の 1 つだけを生かす。補完と同じ口）。UI が先に取った番号が
+        // あればそれを使う（取り直すと UI の取り消しを追い越す。#1893）
+        let entered = request
+            .superseding
+            .then(|| self.enter_lane(Lane::Hover, request.ticket));
+        let lane = entered.as_ref().map(LaneCall::key);
         let superseded = || lane.is_some_and(|(lane, ticket)| !self.is_current(lane, ticket));
         let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
             return Err(GotoError::NoServer.into());

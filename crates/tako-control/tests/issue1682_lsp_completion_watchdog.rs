@@ -102,7 +102,7 @@ const RULES: &[Rule] = &[
     Rule {
         file: MANAGER,
         decl: "fn completion(&self, request: &CompletionRequest)",
-        must: &["self.supersede(Lane::Completion)", "request_in_lane("],
+        must: &["self.enter_lane(Lane::Completion", "request_in_lane("],
         must_not: &[],
         why: "打鍵の補完が取り消しの列を通っていない（前の要求を取り消せない）",
     },

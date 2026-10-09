@@ -155,6 +155,7 @@ fn request(path: &Path, superseding: bool, timeout: Duration) -> CompletionReque
         document: None,
         trigger: Trigger::Word,
         superseding,
+        ticket: None,
         resolve_top: 0,
     }
 }

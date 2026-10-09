@@ -101,7 +101,7 @@ const RULES: &[Rule] = &[
         file: MANAGER,
         decl: "    fn hover(&self, request: &HoverRequest)",
         must: &[
-            "self.supersede(Lane::Hover)",
+            "self.enter_lane(Lane::Hover",
             "request_in_lane(",
             "if request.open {",
             "self.join(&uri)",
@@ -348,8 +348,8 @@ fn 逆戻りを名指しできる() {
         "A 取り消しの列を外す",
         MANAGER,
         (
-            "                    .unwrap_or_else(|| self.supersede(Lane::Hover)),",
-            "                    .unwrap_or(0),",
+            "            .then(|| self.enter_lane(Lane::Hover, request.ticket));",
+            "            .then(|| unreachable!(\"列を通らない\"));",
         ),
         "    fn hover(&self, request: &HoverRequest)",
     );

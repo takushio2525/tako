@@ -332,6 +332,14 @@ impl TakoApp {
             trigger,
             // 打鍵の要求: 次の打鍵の要求が来たら manager が `$/cancelRequest` で捨てる
             superseding: true,
+            // 取り消しの番号はここ（UI スレッド）で先に取る = この後に一覧を閉じた・語の外へ出た
+            // 取り消しを背景が追い越さない（追い越すと読み込みが済むまで待ち続ける。#1909 = ホバーの
+            // #1893 と同じ形）。A/B の旧腕（`TAKO_1909_LEGACY=1`）は背景で取る
+            ticket: if tako_control::lsp::completion::legacy_1909() {
+                None
+            } else {
+                self.lsp.reserve_completion()
+            },
             resolve_top: 0,
         };
         self.lsp_completion.session.sent(seq, version);
@@ -668,10 +676,17 @@ impl TakoApp {
             return;
         }
         let (raw, path, generation) = (item.raw.clone(), popup.path.clone(), popup.generation);
+        // 取り消しの番号は UI スレッドで先に取る（#1909。打鍵の補完と同じ = 一覧を閉じた取り消しを
+        // 背景が追い越さない）。A/B の旧腕（`TAKO_1909_LEGACY=1`）は背景で取る
+        let ticket = if tako_control::lsp::completion::legacy_1909() {
+            None
+        } else {
+            self.lsp.reserve_resolve()
+        };
         let manager = self.lsp.clone();
         let task = cx
             .background_executor()
-            .spawn(async move { manager.resolve_completion(&path, &raw) });
+            .spawn(async move { manager.resolve_completion(&path, &raw, ticket) });
         cx.spawn(async move |this, cx| {
             let Ok(resolved) = task.await else {
                 return;
