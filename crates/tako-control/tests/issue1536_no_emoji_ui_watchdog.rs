@@ -58,15 +58,17 @@ const ALLOW: &[Allow] = &[
     Allow {
         rel: MAIN,
         ch: '\u{23FA}', // ⏺
-        count: 5,
+        // #1067 の疑似 TUI の 1 件は #1913 で tako-core の `synthetic_input` へ移った
+        count: 4,
         why: "claude の応答マーカー。セルフテストがターミナルへ流し込む画面データで、\
               フォールバックフォント（advance がセル幅と合わないグリフ）の描画そのものが検証対象",
     },
     Allow {
         rel: MAIN,
         ch: '\u{276F}', // ❯
-        count: 7,
-        why: "claude TUI の入力欄・選択肢の行頭。ダイアログ検知（#1293 / #633）と\
+        // 合成入力欄（#719 / #737 / #1067）の 3 件は #1913 で tako-core の `synthetic_input` へ移った
+        count: 4,
+        why: "claude TUI の選択肢の行頭。ダイアログ検知（#1293 / #633）と\
               リミット復帰（#813）の検証データで、実採取の形を 1 バイトも変えられない",
     },
     Allow {

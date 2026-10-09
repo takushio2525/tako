@@ -82,6 +82,7 @@ pub mod ssh_config;
 pub mod ssh_detect;
 pub mod ssh_progress;
 pub mod ssh_reconnect;
+pub mod synthetic_input;
 pub mod tab;
 pub mod tako_cli_path;
 pub mod task_checkpoint;

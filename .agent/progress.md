@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1881: tako mod S3 = Claude Code の画面のプロンプトの上に帯 1 行と /tako のサイドバーを出した）
-- 判断は tako（`claude_mod::band_view` / `classify_worker` / `band_warnings` を `tako mod report` の応答の `tako.view` へ）、mod は `bodyColumns` に合わせて優先度の低い区切りから落とし `Text` 1 本（truncate-end）で描く。worker は右パネル orch と同じ `Workspace::workers_of` へ寄せた。トグルは `$.store`（`/tako band on|off`・ボタン・`tako mod band on|off` の中継。新しい方が勝つ）。A/B `TAKO_1877_S3_LEGACY=1`・検証用 `TAKO_1881_BAND_THRESHOLD`・MATRIX `claude_mod_band`・カタログ +74 B
-- 実測: `scripts/test-claude-mod-band-1881.sh` 49 PASS 0 FAIL（実 claude 2.1.294・組織 / 個人の設定 dir）で 80 / 144 / 300 桁 × 21 行の帯が 1 行・ダイアログ 4 回の後に戻る・再起動後もトグル保持・A/B で描かない・`claude plugin test` 26 本（terminal / desktop）・番犬 `issue1881_claude_mod_band_watchdog.rs`（注入 12 通りを file:line で名指し）
-
 ## 2026-10-09（#1901: debug ビルドでも構文の塗りの依存 8 つだけ opt-level 3 にした）
 - `.cargo/config.toml` に `[profile.dev.package.*]` を syntect / fancy-regex / regex-automata / regex-syntax / aho-corasick / memchr / bit-set / bit-vec へ（どれを外しても遅くなるのを 1 MB の TS で実測。自分のクレートは未最適化のまま。ルートの Cargo.toml だと rust-cache のキーに入らず CI が毎回下流を作り直した = PR の初回 macOS 39 分）。commands.md の build 行・#1890 の「debug は 427.6 秒」2 か所に後の値を添えた
 - 実測（JOBS=2・前後交互に 2 回ずつ）: 10 MB の塗り 53.8 → 4.3 秒（12.4 倍）・visual-test `large-file-decor` の debug は 1 節 30 分 → 152 秒・差分ビルド tako-core 9.5 / 7.8 → 9.3 / 8.4 秒・クリーンは 8 つで +36 秒の CPU（壁時計は負荷のぶれ以下）・全体テスト 6515 passed（tako-app 単体 30 → 12 秒）
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1917: TS の構文の塗りを release の 1 MB で 5.9 → 1.8 秒にした = 正規表現へ「当たらない行で VM を起こさない」等価な前置き）
 - 真因: two-face の TS は先読み・後読みだらけで、fancy-regex は行の全バイト位置で VM を回す（正規表現 365 本に均等に散る・1 行 1 回ほぼ当たらない）。`syntax_prefilter.rs` が TS / TSX の 425 本を `\G(?=(?s:.)*?(?:必要条件))(?s:.)*?\K(?:元)` へ書き換え（構文セットの直列化を 2 構文だけ解いて詰め直す・往復検査・プロセスで 1 回 34 ms を起動時に別スレッドで）。A/B `TAKO_1917_LEGACY=1`
 - 実測（release・交互 3 回）: 1 MB の TS 5.90 → 1.73〜1.83 秒・TSX 6.1 → 1.7 秒・TS / Rust 4.6 → 1.4 倍・Rust は不変・40 行の冷えた 1 回目だけ 82 → 100 ms。塗りの全記録が実在の TS 12 本で 1 行残らず一致。単体 9 本（バックトラック回数の番犬）・番犬 4 本
+
+## 2026-10-09（#1913: 合成入力欄の組み立てを tako-core の `synthetic_input` へ寄せ、描く側 4 か所と #754 のテストが同じ形を使う）
+- 描く側（visual-test の #719 / #718・セルフテストの #737 / #1067）は `chat_g3_command` / `autogrow_command` / `gui_input_paint` / `restart_tui_paint`、dialog のテストは同じ `*_lines` を呼ぶ（描くバイトは必ず行から作る）。寄せる前の原文を切り出した比較で 13 状態がバイト一致
+- 実測: #754 の注入 A / A+B / E で同じ形を名指しして FAILED・番犬 `issue1913_synthetic_input_watchdog` 4 本（全戻し・1 か所戻し・テストへの手書き 1 行を file:line で名指し）
