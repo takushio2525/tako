@@ -5059,6 +5059,13 @@ impl TakoApp {
                 );
                 let offload = this.update(cx, |app: &mut TakoApp, _| {
                     if offload_enabled {
+                        // #1968: 準備（UI スレッド部）も測る。ここが子プロセスを待っていても
+                        // 計測区間の外だったので perf.log に出ず、UI ストールが「再開経路側の
+                        // 遅延」と誤分類されていた
+                        let _span = tako_control::diag::perf_span(format!(
+                            "offload_prepare:{}",
+                            incoming.request.kind_name()
+                        ));
                         tako_control::prepare_offload(app, &incoming.request)
                     } else {
                         None
@@ -5361,10 +5368,17 @@ impl TakoApp {
             let sched_lag = tako_control::diag::take_scheduler_lag_peak();
             if lag >= Duration::from_millis(500) {
                 let span = tako_control::diag::current_span_snapshot();
+                // #1968: このループ自身が UI スレッドで走るので、塞いでいた区間はもう
+                // 終わっている。遅延の窓（待った 1 秒 + 遅れ）に終わった区間で分類する
+                // （A/B の `TAKO_1968_LEGACY=1` は修正前と同じく使わない）
+                let recent = (!tako_control::diag::issue1968_legacy())
+                    .then(|| tako_control::diag::recent_spans_within(Duration::from_secs(1) + lag))
+                    .flatten();
                 tako_control::diag::perf_log(&tako_control::diag::classify_stall(
                     lag,
                     sched_lag,
                     span.as_ref().map(|(tag, ms)| (tag.as_str(), *ms)),
+                    recent.as_ref(),
                 ));
             }
             // View 破棄でループ終了（他の定期ループと同じ生存判定）

@@ -223,15 +223,45 @@ impl PromptDelivery {
     }
 }
 
+/// 読み取りの使い回し（#1968）。ファイルの中身が前回と**バイト単位で同じ**なら、前回の解釈結果を返す。
+///
+/// worker の状態照会・報告は 1 回ごとにレジストリを読み、master が watch で 5 秒ごとに
+/// 引くので毎秒数回になる。本番の workers.yaml は 200 KB あり、YAML の解釈が照会のたびに
+/// UI スレッド（`resolve_worker_query`）と background の両方で走っていた。
+/// 更新時刻や inode ではなく中身で比べるのは、Windows の更新時刻の粒度が粗く、同じ長さの
+/// 書き直しを取り違えうるから（読み取りと比較は解釈の 100 分の 1 未満）
+static LOAD_CACHE: std::sync::Mutex<Option<(PathBuf, String, WorkerRegistry)>> =
+    std::sync::Mutex::new(None);
+
 impl WorkerRegistry {
-    /// パス指定 load。不在は空、パース失敗は Err（0 件に丸めない。#169）
+    /// パス指定 load。不在は空、パース失敗は Err（0 件に丸めない。#169）。
+    ///
+    /// 中身が前回と同じなら解釈し直さずに写しを返す（#1968）
     pub fn load_from(path: &Path) -> Result<Self, String> {
         if !path.is_file() {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("workers.yaml の読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| format!("workers.yaml のパースに失敗: {e}"))
+        if crate::diag::issue1968_legacy() {
+            return Self::parse(&content);
+        }
+        {
+            let cache = LOAD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((p, c, reg)) = cache.as_ref() {
+                if p == path && *c == content {
+                    return Ok(reg.clone());
+                }
+            }
+        }
+        let registry = Self::parse(&content)?;
+        *LOAD_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((path.to_path_buf(), content, registry.clone()));
+        Ok(registry)
+    }
+
+    fn parse(content: &str) -> Result<Self, String> {
+        serde_yaml::from_str(content).map_err(|e| format!("workers.yaml のパースに失敗: {e}"))
     }
 
     pub fn load() -> Result<Self, String> {
@@ -242,6 +272,7 @@ impl WorkerRegistry {
     /// ロック付き read-modify-write（config_io。#169 と同型）
     pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
         let _lock = crate::config_io::lock_exclusive(path)?;
+        // ロックの下でファイルを読む（中身で比べる使い回しなので、書き手が読んでも古くならない）
         let mut registry = Self::load_from(path)?;
         let result = f(&mut registry);
         let content = serde_yaml::to_string(&registry)
@@ -1062,6 +1093,40 @@ mod tests {
         let path = dir.join(format!("{name}-{}.yaml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    /// #1968: 読み取りの使い回しは中身で比べる。同じ長さの書き直し（更新時刻や inode では
+    /// 取り違えうる形）でも、書き込みの後でも、古い解釈結果を返さない
+    #[test]
+    fn 読み取りの使い回しは中身が変われば読み直す_1968() {
+        let path = temp_registry_file("load-cache-1968");
+        let yaml = |pane: u64| {
+            format!("workers:\n  '1':\n    pane: {pane}\n    status: active\nnext_id: 2\n")
+        };
+        std::fs::write(&path, yaml(11)).unwrap();
+        let a = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(a.workers["1"].pane, 11);
+        // 同じ中身 = 使い回し（結果は同じ）
+        let again = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(again.workers["1"].pane, 11);
+        // 同じ長さで中身だけ変える（11 → 22。rename ではない上書き）
+        std::fs::write(&path, yaml(22)).unwrap();
+        assert_eq!(yaml(11).len(), yaml(22).len());
+        let b = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(b.workers["1"].pane, 22, "同じ長さの書き直しを取り違えた");
+        // 書き込み経路（mutate_at）の後も新しい中身
+        WorkerRegistry::mutate_at(&path, |r| {
+            r.workers.get_mut("1").unwrap().pane = 33;
+        })
+        .unwrap();
+        let c = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(
+            c.workers["1"].pane, 33,
+            "書き込みの後に古い解釈結果を返した"
+        );
+        // 壊れた中身は使い回しで隠さない（#169: パース失敗は Err）
+        std::fs::write(&path, "workers: [\n").unwrap();
+        assert!(WorkerRegistry::load_from(&path).is_err());
     }
 
     fn sample_record(pane: u64) -> RegisterSpawn {
