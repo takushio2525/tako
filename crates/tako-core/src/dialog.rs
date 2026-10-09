@@ -2046,43 +2046,24 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         // セルフテスト / visual-test は入力ボックスを自分で描いて入力欄の検査に使う。
         // これをダイアログと誤判定すると、ダイアログ中の送信ガード（#748）や再起動の
         // 関門（#1067）で **tako の検査自体が止まる**ので、描いている形をそのまま固定する。
-        // 組み立ては描く側（tako-app）と同じ: 罫線の桁数・`❯` の後の空白（#737 / #1067
-        // は NBSP = 実採取の形）・本文。実 claude の入力欄は実採取の fixture で別に
-        // 固定してある（`通常の入力欄はダイアログと判定しない` /
+        // 形は描く側（tako-app）と同じ `synthetic_input` の組み立てから作る（#1913。
+        // 手で写すと描く側の罫線の桁数・NBSP・フッターの変更に追従しない）。
+        // 本文は描く側が描き分ける状態を並べる。実 claude の入力欄は実採取の fixture で
+        // 別に固定してある（`通常の入力欄はダイアログと判定しない` /
         // claude_tui の `issue748_通常画面ではダイアログを検知しない`）
-        let boxed = |rule_width: usize, body: Vec<String>| -> Vec<String> {
-            let rule = "─".repeat(rule_width);
-            std::iter::once(rule.clone())
-                .chain(body)
-                .chain(std::iter::once(rule))
-                .collect()
-        };
+        use crate::synthetic_input as synth;
         let mut cases: Vec<(String, Vec<String>)> = Vec::new();
-        // #719（visual-test のチャット G3）: `clear` 直後の空行 + 罫線 16 桁の 2 行入力
-        let mut g3 = vec![String::new()];
-        g3.extend(boxed(
-            16,
-            vec![
-                "❯ テストの依頼を書きました".into(),
-                "  2 行目もあります".into(),
-            ],
-        ));
-        cases.push(("#719 の 2 行入力".into(), g3));
+        // #719（visual-test のチャット G3）: `clear` 直後の空行 + 2 行入力
+        cases.push(("#719 の 2 行入力".into(), synth::chat_g3_lines()));
         // #718（visual-test の高さ検査）: 1 → 2 → 4 行。4 行は兄弟 3 つ = 閾値超えで、
         // 上下の罫線で入力ボックスと判定して棄却される経路を通る
-        for rows in [1usize, 2, 4] {
-            let body = (0..rows)
-                .map(|i| {
-                    if i == 0 {
-                        "❯ row0".to_string()
-                    } else {
-                        format!("  row{i}")
-                    }
-                })
-                .collect();
-            cases.push((format!("#718 の {rows} 行入力"), boxed(16, body)));
+        for rows in synth::AUTOGROW_ROWS {
+            cases.push((
+                format!("#718 の {rows} 行入力"),
+                synth::autogrow_lines(rows),
+            ));
         }
-        // #737（セルフテストの GUI 入力欄）: 罫線 20 桁 + `❯` と NBSP + 本文の 1 行。
+        // #737（セルフテストの GUI 入力欄）: `❯` と NBSP + 本文の 1 行。
         // 本文は描き分ける 4 状態（案内文 / 空 / 入力中 / busy 中の追加指示）
         for body in [
             "Try \"how does <filepath> work?\"",
@@ -2092,12 +2073,13 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         ] {
             cases.push((
                 format!("#737 の 1 行入力（{body:?}）"),
-                boxed(20, vec![format!("❯\u{a0}{body}")]),
+                synth::gui_input_lines(body),
             ));
         }
-        // #1067（セルフテストのセッション再起動）: 直前の応答 + 罫線 30 桁の 1 行 +
-        // フッター 2 行。本文とフッターは描き分ける 5 状態（待機 / 生成中 /
-        // キュー滞留 / 下書き / 空の待機）
+        // #1067（セルフテストのセッション再起動）: 直前の応答 + 1 行入力 + フッター 2 行。
+        // 本文とフッターは描き分ける 5 状態（待機 / 生成中 / キュー滞留 / 下書き /
+        // 空の待機）。キュー滞留の本文は描く側では tako-control の
+        // `claude_tui::QUEUED_MESSAGES_HINT`（依存の向き上ここからは引けない）
         let idle_footer = "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
         for (body, footer) in [
             ("TAKO1067IDLE", idle_footer.to_string()),
@@ -2109,11 +2091,10 @@ Antigravity CLI requires permission to read, edit, and execute files here.
             ("TAKO1067DRAFT", "⏵⏵ auto mode on".to_string()),
             ("", format!("{idle_footer} TAKO1067IDLE2")),
         ] {
-            let mut lines = vec!["⏺ 直前の応答".to_string(), String::new()];
-            lines.extend(boxed(30, vec![format!("❯\u{a0}{body}")]));
-            lines.push("  [Opus 5 · xH]  ▸ 2.1.258".into());
-            lines.push(format!("  {footer}"));
-            cases.push((format!("#1067 の 1 行入力（{body:?}）"), lines));
+            cases.push((
+                format!("#1067 の 1 行入力（{body:?}）"),
+                synth::restart_tui_lines(body, &footer),
+            ));
         }
         // 1 件目で止めずに、ダイアログと誤判定した形をすべて名指しする
         let misjudged: Vec<&str> = cases

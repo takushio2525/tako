@@ -44983,14 +44983,15 @@ mod self_test {
                     readable_pixels_in_bounds(&gui_light, &[composer], scale, bg_light, 2.0);
                 // #719: 入力欄は TUI の入力行のミラーなので、**画面に入力ボックスを描いて**
                 // 見た目が変わること（= 箱が伸びて中身が映ること）を見る。複数行にするのは
-                // #718 のオートグローぶんの高さ変化まで実ピクセルに出すため
+                // #718 のオートグローぶんの高さ変化まで実ピクセルに出すため。
+                // 箱は dialog の単体テストと同じ組み立て（#1913）
                 let _ = window.update(cx, |app, _, cx| {
                     app.focus_chat_input(pane, cx);
                     let _ = tako_control::dispatch(
                         app,
                         tako_control::protocol::Request::Send {
                             pane: Some(pane.as_u64()),
-                            text: "clear; printf '\\n────────────────\\n❯ テストの依頼を書きました\\n  2 行目もあります\\n────────────────\\n'".into(),
+                            text: tako_core::synthetic_input::chat_g3_command(),
                             newline: true,
                             tmux_session: None,
                             await_prompt: false,
@@ -45031,21 +45032,9 @@ mod self_test {
                     .update(cx, |app, _, _| app.pane_line_height(pane))
                     .unwrap_or(17.0);
                 let mut heights: Vec<f32> = Vec::new();
-                for rows in [1usize, 2, 4] {
-                    let body: Vec<String> = (0..rows)
-                        .map(|i| {
-                            if i == 0 {
-                                "\\u276F row0".to_string()
-                            } else {
-                                format!("  row{i}")
-                            }
-                        })
-                        .collect();
-                    let rule = "\\u2500".repeat(16);
-                    let cmd = format!(
-                        "printf '%b' '{rule}\\n{}\\n{rule}\\n'",
-                        body.join("\\n")
-                    );
+                // 箱は dialog の単体テストと同じ組み立て（#1913）
+                for rows in tako_core::synthetic_input::AUTOGROW_ROWS {
+                    let cmd = tako_core::synthetic_input::autogrow_command(rows);
                     let _ = window.update(cx, |app, _, _| {
                         let _ = tako_control::dispatch(
                             app,
@@ -75464,19 +75453,10 @@ mod self_test {
                 let legacy = std::env::var_os("TAKO_903_LEGACY").is_some();
                 let body_path = std::env::temp_dir()
                     .join(format!("tako-selftest-737-{}.txt", std::process::id()));
-                // 箱の中身（実バイト）。`❯` の後は NBSP = 実採取の形
-                let box_body = |body: &str| {
-                    let rule = "\u{2500}".repeat(20);
-                    // 箱を描いたあとカーソルを**入力行の末尾へ戻す**（`\e[2A` で 2 行上、
-                    // `\e[NC` で N 桁右）。末尾がカーソル移動なので、それでは IME の
-                    // キャレットが「箱の外」になって位置検査ができない
-                    let width: usize = body
-                        .chars()
-                        .map(|c| if c.is_ascii() { 1 } else { 2 })
-                        .sum();
-                    let col = 2 + width;
-                    format!("{rule}\n\u{276F}\u{a0}{body}\n{rule}\n\u{1b}[2A\u{1b}[{col}C")
-                };
+                // 箱の中身（実バイト）。`❯` の後は NBSP = 実採取の形。描いたあとカーソルを
+                // 入力行の末尾へ戻す（IME のキャレット位置の検査のため）。
+                // 組み立ては dialog の単体テストと同じ 1 実装（#1913）
+                let box_body = tako_core::synthetic_input::gui_input_paint;
                 // 最初の状態を置いてからペインを作る（空ファイルだと描くものが無い）。
                 // (a) と同じ本文にしておくと、ペインの中のループが起動時に 1 回描いて
                 // そのまま (a) の待ちが通る
@@ -86928,14 +86908,9 @@ mod self_test {
                 let body_path = std::env::temp_dir()
                     .join(format!("tako-selftest-1067-{}.txt", std::process::id()));
                 // claude TUI 風の箱（`❯` の後は NBSP = 実採取の形）。
-                // `footer` に生成中ヒントや上限行を差し替えて関門を作る
-                let tui = |body: &str, footer: &str| {
-                    let rule = "\u{2500}".repeat(30);
-                    format!(
-                        "\u{1b}[2J\u{1b}[H⏺ 直前の応答\n\n{rule}\n\u{276F}\u{a0}{body}\n{rule}\n  \
-                         [Opus 5 · xH]  ▸ 2.1.258\n  {footer}\n"
-                    )
-                };
+                // `footer` に生成中ヒントや上限行を差し替えて関門を作る。
+                // 組み立ては dialog の単体テストと同じ 1 実装（#1913）
+                let tui = tako_core::synthetic_input::restart_tui_paint;
                 let idle_footer = "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
                 if std::fs::write(&body_path, tui("TAKO1067IDLE", idle_footer)).is_err() {
                     fail("#1067: 疑似 TUI の本文ファイルを書けない")
