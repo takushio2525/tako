@@ -6809,6 +6809,8 @@ dependencies = [
 name = "tako-control"
 version = "0.8.29"
 dependencies = [
+ "base64",
+ "flate2",
  "futures",
  "getrandom 0.3.4",
  "image",
@@ -6820,6 +6822,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.11.0",
  "tako-core",
  "thiserror 2.0.18",
  "tiny_http",

@@ -30,10 +30,93 @@ pub const RESOLVE_TIMEOUT_NEXT_STEP: Note = Note::new(
     "Check that your login shell profile (e.g. ~/.zprofile) is not waiting for input, then run tako lsp restart",
 );
 
-/// 未導入のときの次の一手。`{command}` = 導入コマンド
+/// 未導入のときの次の一手。`{command}` = 導入コマンド。tako のターミナルで入れれば
+/// シェル統合の合図で引き直して自動で起きる（#1944 / #1823 の 2）。外で入れたときだけ restart が要る
 pub const NOT_INSTALLED_NEXT_STEP: Note = Note::new(
-    "導入する: {command}（入れたら tako lsp restart）",
-    "Install it: {command} (then run tako lsp restart)",
+    "導入する: {command}（tako のターミナルで入れれば自動で起きる。外で入れたら tako lsp restart）",
+    "Install it: {command} (it starts automatically when installed from a tako terminal; otherwise run tako lsp restart)",
+);
+
+// --- 取得（#1944）--------------------------------------------------------------
+// 未導入のサーバを tako の data dir へ取る。失敗したら理由を出して上の「導入する」の案内へ落ちる
+
+/// 取れるサーバの未導入（自動の取得を止めている = `TAKO_LSP_AUTO_FETCH=0`）の次の一手。
+/// `{command}` = 導入コマンド・`{name}` = サーバの ID
+pub const FETCHABLE_NEXT_STEP: Note = Note::new(
+    "tako が取って入れる: tako lsp install --name {name}（グローバルへは入れない）。自分で入れるなら: {command}",
+    "Let tako fetch it: tako lsp install --name {name} (nothing is installed globally). Or install it yourself: {command}",
+);
+
+/// 取得を止めている（`TAKO_1944_LEGACY=1` / data dir が決まらない）
+pub const FETCH_DISABLED_REASON: Note = Note::new(
+    "言語サーバの取得を止めている（TAKO_1944_LEGACY=1 か、置き場の data dir が決まらない）",
+    "Fetching language servers is disabled (TAKO_1944_LEGACY=1, or the data dir is unknown)",
+);
+
+/// 取得に失敗したときの次の一手。`{command}` = 導入コマンド・`{name}` = サーバの ID
+pub const FETCH_FAILED_NEXT_STEP: Note = Note::new(
+    "ネットワークを確かめて tako lsp install --name {name} でもう一度取る。自分で入れるなら: {command}",
+    "Check the network and run tako lsp install --name {name} to try again. Or install it yourself: {command}",
+);
+
+/// 取得に失敗した理由の前置き。`{reason}` = 取得の失敗の理由
+pub const FETCH_FAILED_REASON: Note = Note::new(
+    "見つからないので取りに行ったが失敗した: {reason}",
+    "Not found, and fetching it failed: {reason}",
+);
+
+/// この OS / CPU 向けの取得物が無い
+pub const FETCH_UNSUPPORTED_REASON: Note = Note::new(
+    "この OS / CPU 向けに tako が取れる版が無い",
+    "tako has no download of it for this OS / CPU",
+);
+
+/// 届かない。`{item}` / `{detail}`
+pub const FETCH_NETWORK_REASON: Note = Note::new(
+    "{item} を取得できなかった（{detail}）",
+    "Could not download {item} ({detail})",
+);
+
+/// 配布元が 200 以外。`{item}` / `{status}`
+pub const FETCH_HTTP_REASON: Note = Note::new(
+    "{item} の取得で配布元が HTTP {status} を返した",
+    "The server returned HTTP {status} for {item}",
+);
+
+/// ハッシュが合わない。`{item}`
+pub const FETCH_DIGEST_REASON: Note = Note::new(
+    "{item} のハッシュが固定した値と合わないので捨てた（壊れた・差し替わった取得物は使わない）",
+    "{item} did not match its pinned hash, so it was discarded (corrupted or replaced downloads are never used)",
+);
+
+/// 想定の大きさを超えた。`{item}` / `{limit}`
+pub const FETCH_TOO_LARGE_REASON: Note = Note::new(
+    "{item} が想定の大きさ（{limit}）を超えたので打ち切った",
+    "{item} exceeded the expected size ({limit}), so the download was stopped",
+);
+
+/// 書き込めない（ディスクの空き・権限）。`{item}` / `{detail}`
+pub const FETCH_IO_REASON: Note = Note::new(
+    "{item} を書き込めなかった（{detail}）",
+    "Could not write {item} ({detail})",
+);
+
+/// 展開できない。`{item}` / `{detail}`
+pub const FETCH_ARCHIVE_REASON: Note = Note::new(
+    "{item} を展開できなかった（{detail}）",
+    "Could not unpack {item} ({detail})",
+);
+
+/// 置き場には済んだが起こし方が組めない（Node.js が消えた等）の詳細
+pub const FETCH_LAUNCH_DETAIL: Note = Note::new(
+    "起こすための実行ファイル（Node.js を含む）が見つからない",
+    "the executable to start it (including Node.js) was not found",
+);
+
+/// PATH で見つかったものが動かない。`{path}` / `{detail}`（#1944: rustup の代理だけが居る等）
+pub const BROKEN_GLOBAL_NOTE: Note = Note::new(
+    "PATH の {path} は動かない（{detail}）ので使わない",
+    "{path} on PATH does not run ({detail}), so it is not used",
 );
 
 /// 諦めた理由。`{count}` = 落ちた回数

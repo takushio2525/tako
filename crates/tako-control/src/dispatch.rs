@@ -15225,7 +15225,7 @@ pub struct CheckHealthCtx {
 }
 
 /// `tako lsp` / MCP `tako_lsp_server` の action（#1678）。CLI と MCP はこの綴りを共有する
-pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs"];
+pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs", "install"];
 
 /// MCP `tako_lsp`（言語機能）の action。CLI は `tako lsp <action>`。
 /// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）と
@@ -15297,6 +15297,8 @@ pub fn lsp_server_action(
         "restart" => manager.restart(name),
         "stop" => manager.stop(name),
         "logs" => manager.logs(name),
+        // #1944: 未導入のサーバを data dir へ取る（待つ = offload の背景で走る）
+        "install" => manager.install(name),
         _ => manager.status(name),
     })
 }
