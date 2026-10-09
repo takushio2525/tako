@@ -16,6 +16,10 @@
   実機依存を避けるためこの順で、実機経路（`installer/windows/release-windows.ps1`）は
   CI が使えないときの代替として残す。配布物の検査は
   `installer/windows/lib/verify-assets.ps1` の 1 実装を両経路が共有する
+- Windows の配布物のビルド（`release-windows.yml`）はビルドキャッシュ（rust-cache）を使わず、
+  毎回コールドで組む（#1921。PR / main の CI の `ci.yml` は使う）。
+  タグの run は別のタグのキャッシュを読めないので一度も当たらず、保存が main / PR の
+  キャッシュを押し出すだけだった。理由の全文は `.agent/conventions.md`「CI のビルドキャッシュのキー」
 - 待ち合わせ: `release.sh` は Windows の添付を待ってから、実アセットを読み直して
   ノートを作り直す（ダウンロード表 / 動作要件 / Windows 手順 / Known limitations が揃う）
 - 片肺の検出: `release.sh` の終了コード **3**（= Release は作られたが揃っていない）。

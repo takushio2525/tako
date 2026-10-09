@@ -4,7 +4,8 @@
 #   - ビルドに効く変更（[profile.*] / [workspace.dependencies] の features）で変わる
 #   - 夜間リリースの版の bump・コメント・空行・改行コードでは変わらない
 #     （変わるとほぼ毎日キャッシュが当たらなくなる = 効率が落ちる）
-# ことと、rust-cache を使う workflow がすべてこの指紋を key に渡していることを確かめる。
+# ことと、rust-cache を使う workflow がすべてこの指紋を key に渡していること、
+# タグで起動する workflow が rust-cache を使わないこと（#1921）を確かめる。
 # 本物の Cargo.toml は読むだけで、書き換えは一時 dir の写しにだけ行う。
 set -uo pipefail
 
@@ -143,6 +144,63 @@ for wf in "$ROOT"/.github/workflows/*.yml; do
     }
   ' "$wf")
   same "${rel}: 指紋のステップは rust-cache の直前" "" "$bad"
+done
+
+# GitHub のキャッシュは ref ごとに分かれ、タグの run が読めるのはそのタグと既定ブランチの
+# ものだけ（別のタグのものは読めない）。夜間リリースはタグが毎晩変わるので、タグで走る
+# rust-cache は一度も当たらないまま約 1.6 GB を毎回保存し、上限 10 GB の中で main / PR の
+# キャッシュを押し出す（#1921 で 13 回すべて「No cache found.」を実測）。
+# ref がタグになりうる起動: push の tags / tags-ignore、push の絞り込み無し
+# （`on: push` / `on: [push, …]` / branches も tags も無い push:）、release、create。
+# branches だけを書いた push はタグでは起動しない（GitHub の仕様）
+tag_trigger() {
+  awk '
+    /^on:/ {
+      inon = 1; rest = $0; sub(/^on:/, "", rest); sub(/#.*/, "", rest)
+      if (rest ~ /(^|[^A-Za-z_])(push|release|create)([^A-Za-z_]|$)/) tag = 1
+      next
+    }
+    inon && /^[^[:space:]#]/ { inon = 0 }
+    !inon { next }
+    /^  [A-Za-z_]+:/ {
+      ev = $0; sub(/^  /, "", ev); sub(/:.*/, "", ev)
+      if (ev == "push") push = 1
+      if (ev == "release" || ev == "create") tag = 1
+      next
+    }
+    ev == "push" && /^[[:space:]]+tags(-ignore)?:/ { tag = 1 }
+    ev == "push" && /^[[:space:]]+branches(-ignore)?:/ { branches = 1 }
+    END { if (tag || (push && !branches)) print "tag" }
+  ' "$1"
+}
+
+echo "== タグで起動するかの判定（固定の workflow で自己検査。#1921）"
+mkdir -p "$SANDBOX/wf"
+printf 'on:\n  push:\n    tags: [%s]\n  workflow_dispatch:\n' "'v*'" > "$SANDBOX/wf/tags.yml"
+printf 'on:\n  push:\n    branches: [main]\n  pull_request:\n' > "$SANDBOX/wf/branches.yml"
+printf 'on: push\njobs:\n  a:\n    runs-on: x\n' > "$SANDBOX/wf/bare.yml"
+printf 'on: [push, pull_request]\n' > "$SANDBOX/wf/inline.yml"
+printf 'on:\n  push:\n  pull_request:\n    branches: [main]\n' > "$SANDBOX/wf/push-unfiltered.yml"
+printf 'on:\n  push:\n    branches-ignore: [gh-pages]\n' > "$SANDBOX/wf/branches-ignore.yml"
+printf 'on:\n  release:\n    types: [published]\n' > "$SANDBOX/wf/release.yml"
+printf 'on:\n  pull_request:\n  workflow_dispatch:\njobs:\n  push:\n    runs-on: x\n' > "$SANDBOX/wf/pr.yml"
+same "push の tags はタグで起動" "tag" "$(tag_trigger "$SANDBOX/wf/tags.yml")"
+same "push の branches だけはタグで起動しない" "" "$(tag_trigger "$SANDBOX/wf/branches.yml")"
+same "on: push（絞り込み無し）はタグでも起動" "tag" "$(tag_trigger "$SANDBOX/wf/bare.yml")"
+same "on: [push, pull_request] はタグでも起動" "tag" "$(tag_trigger "$SANDBOX/wf/inline.yml")"
+same "絞り込みの無い push:（branches は pull_request 側）はタグでも起動" "tag" "$(tag_trigger "$SANDBOX/wf/push-unfiltered.yml")"
+same "push の branches-ignore だけはタグで起動しない" "" "$(tag_trigger "$SANDBOX/wf/branches-ignore.yml")"
+same "release はタグで起動" "tag" "$(tag_trigger "$SANDBOX/wf/release.yml")"
+same "pull_request / workflow_dispatch だけ（jobs の名前が push でも）はタグで起動しない" "" "$(tag_trigger "$SANDBOX/wf/pr.yml")"
+
+echo "== タグで起動する workflow は rust-cache を使わない（#1921）"
+same "前提: release-windows.yml はタグで起動すると判定できる" "tag" \
+  "$(tag_trigger "$ROOT/.github/workflows/release-windows.yml")"
+for wf in "$ROOT"/.github/workflows/*.yml; do
+  [ "$(tag_trigger "$wf")" = "tag" ] || continue
+  rel=${wf#"$ROOT"/}
+  uses=$(grep -c 'uses: Swatinem/rust-cache@' "$wf")
+  same "${rel}: タグで起動するので rust-cache は 0 本（タグのキャッシュは別のタグから読めず、保存は main / PR のキャッシュを押し出すだけ）" "0" "$uses"
 done
 
 echo
