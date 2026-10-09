@@ -59,8 +59,9 @@
 //! 整形の 2 種（`textDocument/formatting` / `rangeFormatting`。#1683）は `--format <file>` か
 //! `TAKO_LSP_FAKE_FORMAT` の規則で答える。形は定義ジャンプの規則と同じく**上から順に最初に
 //! 当たった 1 つ**（`method` / `uri_suffix` で絞る）で、`result`（`TextEdit` の配列をそのまま返す）/
-//! `error`（`{ code, message }` でエラー応答）/ `silent` / `crash` / `delay_ms`（答える前に待つ。
-//! 待つあいだに届いた通知は答えた後に読む）/ `reverse`（既定の答えを逆順で返す）を持つ。
+//! `error`（`{ code, message }` でエラー応答）/ `silent` / `crash` / `hold_until`（そのファイルが
+//! できるまで答えない。待つあいだに届いた通知は答えた後に読む = #1930）/ `reverse`（既定の答えを
+//! 逆順で返す）を持つ。
 //! 当たる規則が無い・`result` も `error` も無ければ**既定の整形**: 自分の本文の模型（下記）から
 //! 行末の空白（スペースとタブ）を消す `TextEdit` を作る（範囲の整形は範囲に収まる行末だけ）。
 //! 本文の模型から作るので、tako が送った `didChange` がずれていれば答えもずれる。
@@ -71,7 +72,7 @@
 //! { "items": [{ "label": "alpha", "kind": 3 }],   // そのまま返す候補
 //!   "generate": 1000,                              // 代わりに cand0000.. を N 件作る
 //!   "incomplete": false,                           // CompletionList.isIncomplete
-//!   "delay_ms": 0,                                 // 答えるまでの待ち（待つ間に $/cancelRequest が来たら -32800 で答える）
+//!   "hold_until": "/path/open",                    // そのファイルができるまで答えない（待つ間に $/cancelRequest が来たら -32800 で答える。配列なら k 本目の要求が k 番目を待つ。#1930）
 //!   "hold_while_loading": false,                   // `loading` の読み込み中は null で即答せず、済むまで答えない（#1869）
 //!   "word_edit": true,                             // 候補ごとにカーソルの直前の語を置き換える textEdit を付ける（自前の本文の模型で数える）
 //!   "resolve_doc": "doc of {label}" }              // resolve で documentation を足す（{label} は候補の label）
@@ -79,8 +80,9 @@
 //!
 //! ホバー（`textDocument/hover`。#1681）は `--hover <file>` か `TAKO_LSP_FAKE_HOVER` の規則で答える。
 //! 形は定義ジャンプの規則と同じく**上から順に最初に当たった 1 つ**（`uri_suffix` / `line` で絞る）で、
-//! `result`（`Hover` をそのまま返す。`null` も可）/ `silent` / `crash` / `delay_ms`（答えるまでの待ち。
-//! 待つ間に `$/cancelRequest` が来たら -32800 で答える = 補完と同じ）/ `echo`（問われた位置の語を
+//! `result`（`Hover` をそのまま返す。`null` も可）/ `silent` / `crash` / `hold_until`（そのファイルが
+//! できるまで答えない。待つ間に `$/cancelRequest` が来たら -32800 で答える = 補完と同じ。#1930）/
+//! `echo`（問われた位置の語を
 //! 自前の本文の模型で引き、`**<語>**` の Markdown とその語の範囲を返す = 位置の往復を見る）/
 //! `hold_while_loading`（`loading` の読み込み中は null で即答せず、済むまで答えない。#1893）を持つ。
 //! 当たる規則が無ければ `null`（= 表示するものが無い）で答える。
@@ -113,6 +115,24 @@
 //! - `--status-delay-ms <ms>`（`TAKO_LSP_FAKE_STATUS_DELAY_MS`）: `loading` が `initialized` を受けて
 //!   から `quiescent: false` を送るまで待つ（tako が知らせを受け取る前に要求を送った形）。
 //!   待つあいだは次のメッセージを読まないので、知らせ → didOpen の診断の順は変わらない
+//!
+//! ## 答えの合図と順序の注入（#1930）
+//!
+//! 答えを遅らせる口は**実時間を持たない**: 補完・ホバー・整形の規則の `hold_until`（上記）は、
+//! テストが「次の操作が済んだ」を確かめてから合図のファイルを作る（`delay_ms` の実時間の間に次の
+//! 操作が間に合う前提を置かない。遅い機では順序が入れ替わる）。
+//!
+//! 次の 3 つは CI の遅い機で入れ替わる順序を、どの機でも起こすための遅延・入れ替え:
+//!
+//! - `--empty-delay-ms <ms>`（`TAKO_LSP_FAKE_EMPTY_DELAY_MS`）: `loading` の読み込み中に即座に返す
+//!   空の答え（定義ジャンプの `[]`・補完とホバーの `null`）を送る前に待つ（テストが要求の届いたのを
+//!   見て読み込みを終えると、manager が空を見る前に済む形）
+//! - `--settle-on-empty <before|after>`（`TAKO_LSP_FAKE_SETTLE_ON_EMPTY`）: その空の答えの直前
+//!   （`before`）/ 直後（`after`）に、合図と無関係に読み込みを終える（`quiescent: true`）。
+//!   `before` は「読み込み中に受けた要求の空を、済んだ後に送る」= manager は空を受けた時点で
+//!   必ず済んだと知っている（#1930 の問い直しを決定的に通す）
+//! - `--log-delay-ms <ms>`（`TAKO_LSP_FAKE_LOG_DELAY_MS`）: 受けたメッセージを `--log` へ書く前に
+//!   待つ（manager が「送った」ものがログに「届いた」と載るのが遅れる = #1930 の 1684 の形）
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -452,6 +472,69 @@ fn completion_items(
     })
 }
 
+/// 注入の遅れ（0 なら何もしない = 渡さないテストのスケジューリングを変えない）
+fn pause(delay: std::time::Duration) {
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
+/// 答えを待たせる表（まだ答えていない補完・ホバーの要求の id。取り消されたら外れる）
+type Waiting = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// `path` ができるまで待つ（`still` が偽になったら待たずに抜ける）。テストが合図を作る（#1930）
+fn wait_file(path: &str, still: impl Fn() -> bool) {
+    while !std::path::Path::new(path).exists() && still() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// `hold_until` の合図のファイル。文字列ならそれ、配列なら**その method の `seq` 本目**（0 起点）の
+/// 要求が `seq` 番目を待つ（足りなければ最後。要求を 1 本ずつ返させる = #1930）
+fn hold_path(hold_until: &serde_json::Value, seq: usize) -> Option<String> {
+    match hold_until {
+        serde_json::Value::Array(paths) => paths.get(seq).or(paths.last())?.as_str(),
+        other => other.as_str(),
+    }
+    .map(str::to_string)
+}
+
+/// 補完・ホバーの答え: `hold_until` が無ければすぐ、あればその合図まで待たせて答える（#1930）。
+/// 待つあいだに `$/cancelRequest` が来たら答えない（取り消しの腕が -32800 で答えて表から外す）
+fn hold_answer(
+    out: &std::sync::Arc<Out>,
+    waiting: &Waiting,
+    hold: Option<String>,
+    id: serde_json::Value,
+    result: serde_json::Value,
+) {
+    let Some(open) = hold else {
+        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        return;
+    };
+    let key = id.to_string();
+    waiting.lock().unwrap().insert(key.clone());
+    let (out, waiting) = (out.clone(), waiting.clone());
+    std::thread::spawn(move || {
+        wait_file(&open, || waiting.lock().unwrap().contains(&key));
+        if waiting.lock().unwrap().remove(&key) {
+            out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        }
+    });
+}
+
+/// `loading` の読み込みを終える（済んだ印を立てて `quiescent: true` を送る。合図と
+/// `--settle-on-empty` のどちらが先でも 1 回だけ送る）
+fn finish_loading(out: &Out, loaded: &std::sync::atomic::AtomicBool) {
+    if !loaded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        out.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "experimental/serverStatus",
+            "params": { "health": "ok", "quiescent": true },
+        }));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let scenario = arg_or_env(&args, "--scenario", "TAKO_LSP_FAKE_SCENARIO")
@@ -483,8 +566,9 @@ fn main() {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or(serde_json::Value::Null);
-    let waiting: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-        Default::default();
+    let waiting: Waiting = Default::default();
+    // #1930: 読み込みの後に答える補完・ホバーの要求の通し番号（`hold_until` の配列の何番目を待つか）
+    let (mut completion_seq, mut hover_seq) = (0usize, 0usize);
     // #1681: ホバーの規則
     let hover_rules: Vec<serde_json::Value> = arg_or_env(&args, "--hover", "TAKO_LSP_FAKE_HOVER")
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -517,6 +601,12 @@ fn main() {
         )
     };
     let status_delay = delay_of("--status-delay-ms", "TAKO_LSP_FAKE_STATUS_DELAY_MS");
+    // #1930: 答えの順序を入れ替える注入（冒頭の説明）
+    let empty_delay = delay_of("--empty-delay-ms", "TAKO_LSP_FAKE_EMPTY_DELAY_MS");
+    let log_delay = delay_of("--log-delay-ms", "TAKO_LSP_FAKE_LOG_DELAY_MS");
+    let settle_on_empty = arg_or_env(&args, "--settle-on-empty", "TAKO_LSP_FAKE_SETTLE_ON_EMPTY");
+    let settle_before = settle_on_empty.as_deref() == Some("before");
+    let settle_after = settle_on_empty.as_deref() == Some("after");
     std::thread::sleep(delay_of("--start-delay-ms", "TAKO_LSP_FAKE_START_DELAY_MS"));
     // #1684: 申告する能力の組をそのまま差し替える（シナリオの能力は捨てる）
     let providers: Option<serde_json::Map<String, serde_json::Value>> =
@@ -527,7 +617,19 @@ fn main() {
             })
             .and_then(|v| serde_json::from_str(&v).ok());
     let mut input = BufReader::new(std::io::stdin());
+    // #1930: 読み込み中の前半の空の答え（定義ジャンプ・補完・ホバーの 3 つが通る 1 実装）
+    let early_empty = |id: serde_json::Value, empty: serde_json::Value| {
+        pause(empty_delay);
+        if settle_before {
+            finish_loading(&out, &loaded);
+        }
+        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": empty }));
+        if settle_after {
+            finish_loading(&out, &loaded);
+        }
+    };
     while let Some(message) = read_one(&mut input) {
+        pause(log_delay);
         append(&log, &message.to_string());
         let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = message.get("id").cloned();
@@ -634,12 +736,7 @@ fn main() {
                         {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                        loaded.store(true, std::sync::atomic::Ordering::SeqCst);
-                        out.send(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "experimental/serverStatus",
-                            "params": { "health": "ok", "quiescent": true },
-                        }));
+                        finish_loading(&out, &loaded);
                     });
                 }
                 "chatty" => {
@@ -691,7 +788,7 @@ fn main() {
             }
             (method, Some(id)) if GOTO_METHODS.contains(&method) => {
                 if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
-                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": [] }));
+                    early_empty(id, serde_json::json!([]));
                     continue;
                 }
                 let Some(rule) = goto_rule(&goto_rules, method, &message["params"]) else {
@@ -748,8 +845,8 @@ fn main() {
                     if rule["silent"].as_bool() == Some(true) {
                         continue;
                     }
-                    if let Some(ms) = rule["delay_ms"].as_u64() {
-                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    if let Some(open) = hold_path(&rule["hold_until"], 0) {
+                        wait_file(&open, || true);
                     }
                     if let Some(error) = rule.get("error") {
                         out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }));
@@ -783,15 +880,15 @@ fn main() {
                 }
                 out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": edits }));
             }
-            // #1682: 補完。`delay_ms` のあいだに取り消されたら -32800 で答える（LSP の作法 =
-            // 取り消されても応答は返す）。待ちの表は答えた / 取り消した時点で外す
+            // #1682: 補完。`hold_until` の合図を待つあいだに取り消されたら -32800 で答える（LSP の作法 =
+            // 取り消されても応答は返す）。待ちの表は答えた / 取り消した時点で外す（#1930）
             ("textDocument/completion", Some(id)) => {
                 let result = completion_items(&completion, &docs, breaks, &message["params"]);
                 // #1869: 読み込み中（実測した rust-analyzer 1.95 の 2 段）。前半は即座に `null`、
                 // `hold_while_loading` なら答えずに済むまで待たせ、済んだ直後に答える
                 if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
                     if completion["hold_while_loading"].as_bool() != Some(true) {
-                        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+                        early_empty(id, serde_json::Value::Null);
                         continue;
                     }
                     let key = id.to_string();
@@ -809,24 +906,11 @@ fn main() {
                     });
                     continue;
                 }
-                let delay = completion["delay_ms"].as_u64().unwrap_or(0);
-                if delay == 0 {
-                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-                    continue;
-                }
-                let key = id.to_string();
-                waiting.lock().unwrap().insert(key.clone());
-                let (out, waiting) = (out.clone(), waiting.clone());
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
-                    if waiting.lock().unwrap().remove(&key) {
-                        out.send(
-                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                        );
-                    }
-                });
+                let hold = hold_path(&completion["hold_until"], completion_seq);
+                completion_seq += 1;
+                hold_answer(&out, &waiting, hold, id, result);
             }
-            // #1681: ホバー。`delay_ms` のあいだに取り消されたら -32800 で答える（補完と同じ作法）
+            // #1681: ホバー。`hold_until` の合図を待つあいだに取り消されたら -32800 で答える（補完と同じ作法）
             ("textDocument/hover", Some(id)) => {
                 let params = &message["params"];
                 let Some(rule) = goto_rule(&hover_rules, "textDocument/hover", params) else {
@@ -861,7 +945,7 @@ fn main() {
                 // `hold_while_loading` なら答えずに済むまで待たせ（取り消されたら -32800）、済んだ直後に答える
                 if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
                     if rule["hold_while_loading"].as_bool() != Some(true) {
-                        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+                        early_empty(id, serde_json::Value::Null);
                         continue;
                     }
                     let key = id.to_string();
@@ -879,22 +963,9 @@ fn main() {
                     });
                     continue;
                 }
-                let delay = rule["delay_ms"].as_u64().unwrap_or(0);
-                if delay == 0 {
-                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-                    continue;
-                }
-                let key = id.to_string();
-                waiting.lock().unwrap().insert(key.clone());
-                let (out, waiting) = (out.clone(), waiting.clone());
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
-                    if waiting.lock().unwrap().remove(&key) {
-                        out.send(
-                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                        );
-                    }
-                });
+                let hold = hold_path(&rule["hold_until"], hover_seq);
+                hover_seq += 1;
+                hold_answer(&out, &waiting, hold, id, result);
             }
             ("$/cancelRequest", None) => {
                 let id = message["params"]["id"].clone();

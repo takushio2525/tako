@@ -58,6 +58,48 @@ pub enum Loading {
     Abandoned,
 }
 
+/// 空の答えの後に問い直すかの判定（#1930）。定義ジャンプ・補完・ホバーの 3 つが manager の
+/// `wait_after_empty` からこの 1 実装を通る。
+///
+/// 送ったときにサーバ自身が読み込み中と知らせていた（`quiescent: false`）要求の空の答えは、
+/// 読み込みの途中に作った**古い答え**。manager がそれを受けて状態を見る前に読み込みが済んでいると
+/// [`Loading::Settled`] になり、#1930 の前はその空を「見つからない / 候補 0 件」として返していた
+/// （補完なら一覧が出ず、済んでも問い直さない）。この場合も**1 回だけ**問い直す。
+/// 状態を送らないサーバ（`quiescent` が無い）と、済んだ後に送った要求の空は今までどおり本当の空。
+/// 問い直しの 2 回目の空は、送ったときの状態に関わらずそのまま返す（無限に繰り返さない）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyAnswer {
+    sent_while_loading: bool,
+    requeried: bool,
+}
+
+impl EmptyAnswer {
+    /// 要求を送る直前に呼ぶ: manager がサーバの読み込み中（`quiescent: false`）を知っていたか
+    pub fn sent(&mut self, reported_loading: bool) {
+        self.sent_while_loading = reported_loading;
+    }
+
+    /// 空の答えの後に読み込みを待った結果を、問い直すかどうかへ直す
+    pub fn decide(&mut self, waited: Loading) -> Loading {
+        match waited {
+            Loading::Settled if self.sent_while_loading && !self.requeried && !legacy_1930() => {
+                self.requeried = true;
+                Loading::Retry
+            }
+            other => other,
+        }
+    }
+}
+
+/// `TAKO_1930_LEGACY=1` で **#1930 前の形**へ戻す（同一バイナリで A/B を取る入口）: 読み込み中に
+/// 送った要求の空の答えも、見る前に読み込みが済んでいればそのまま返す
+pub fn legacy_1930() -> bool {
+    matches!(
+        std::env::var("TAKO_1930_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 候補の一覧に載せる行の抜粋の上限（文字数）
 pub const EXCERPT_CHARS: usize = 160;
 
@@ -459,5 +501,38 @@ mod tests {
         assert_eq!(goto_timeout(), Duration::from_secs(7));
         std::env::remove_var("TAKO_LSP_GOTO_TIMEOUT_SECS");
         assert_eq!(goto_timeout(), DEFAULT_GOTO_TIMEOUT);
+    }
+
+    /// #1930: 読み込み中に送った要求の空は、見る前に済んでいても 1 回だけ問い直す
+    #[test]
+    fn 読み込み中に送った空は済んでいても_1_回だけ問い直す() {
+        let mut empty = EmptyAnswer::default();
+        empty.sent(true);
+        assert_eq!(empty.decide(Loading::Settled), Loading::Retry);
+        // 問い直しも読み込み中に送った扱いになっても、2 回目の空はそのまま返す（繰り返さない）
+        empty.sent(true);
+        assert_eq!(empty.decide(Loading::Settled), Loading::Settled);
+        assert_eq!(empty.decide(Loading::Settled), Loading::Settled);
+    }
+
+    /// #1930: 状態を送らないサーバ・済んだ後に送った要求の空は今までどおり本当の空
+    #[test]
+    fn 読み込み中と知らずに送った空は問い直さない() {
+        let mut empty = EmptyAnswer::default();
+        assert_eq!(empty.decide(Loading::Settled), Loading::Settled);
+        empty.sent(false);
+        assert_eq!(empty.decide(Loading::Settled), Loading::Settled);
+    }
+
+    /// #1930: 待った結果が `Settled` 以外なら判定はそのまま（待って済んだ・上限・要らなくなった）
+    #[test]
+    fn settled_以外は判定を変えない() {
+        for waited in [Loading::Retry, Loading::TimedOut, Loading::Abandoned] {
+            let mut empty = EmptyAnswer::default();
+            empty.sent(true);
+            assert_eq!(empty.decide(waited), waited);
+            // 1 回目の問い直しの枠は使っていない
+            assert_eq!(empty.decide(Loading::Settled), Loading::Retry);
+        }
     }
 }

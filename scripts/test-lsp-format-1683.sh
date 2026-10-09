@@ -117,9 +117,12 @@ P="$TMP/proj"
 mkdir -p "$P/src"
 printf '[package]\nname = "p"\n' > "$P/Cargo.toml"
 RULES="$TMP/format.json"
-cat > "$RULES" <<'JSON'
+# slow.rs の答えは合図のファイル（SLOW_OPEN）ができるまで返さない（打鍵が答えより先に届くのを
+# 実時間に任せない。#1930）
+SLOW_OPEN="$TMP/slow-open"
+cat > "$RULES" <<JSON
 [
-  { "uri_suffix": "slow.rs", "delay_ms": 1500 },
+  { "uri_suffix": "slow.rs", "hold_until": "$SLOW_OPEN" },
   { "uri_suffix": "silent.rs", "silent": true }
 ]
 JSON
@@ -307,15 +310,22 @@ autosave_off "$W"
 check_eq "CRLF の整形" "formatted" "$(fmt --pane "$W" | json 'd["status"]')"
 save --pane "$W" >/dev/null
 if same_file "$P/src/crlf.rs" "$TMP/crlf.want"; then pass "CRLF は CRLF のまま（行末の空白だけ消える）"; else fail "CRLF: $(od -c "$P/src/crlf.rs" | head -3)"; fi
-# 待つあいだの変更（stale）: 偽サーバは slow.rs に 1.5 秒待ってから答える
+# 待つあいだの変更（stale）: 偽サーバは slow.rs の整形に合図があるまで答えない
 printf 'fn w() {  \n}\n' > "$P/src/slow.rs"
 L="$(open_code "$P/src/slow.rs")"
 "$TAKO_BIN" edit start --pane "$L" >/dev/null
 autosave_off "$L"
 ( fmt --pane "$L" > "$TMP/slow.json" ) &
 WAITER=$!
-sleep 0.5
+# 整形の要求が偽サーバへ届いてから打つ（状態で待つ。上限 30 秒）→ 打ってから答えを返させる
+SLOW_ASKED=""
+for _ in $(seq 1 300); do
+  if grep -q '"method":"textDocument/formatting".*slow\.rs' "$LOG" 2>/dev/null; then SLOW_ASKED=1; break; fi
+  sleep 0.1
+done
+[ -n "$SLOW_ASKED" ] || fail "slow.rs の整形の要求が偽サーバへ届かない"
 "$TAKO_BIN" edit replace-range 2:0 2:0 $'// typed\n' --pane "$L" >/dev/null
+: > "$SLOW_OPEN"
 wait "$WAITER"
 check_eq "待つあいだに打ったら当てない" "stale" "$(json 'd["status"]' < "$TMP/slow.json")"
 save --pane "$L" >/dev/null

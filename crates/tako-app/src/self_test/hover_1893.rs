@@ -6,7 +6,8 @@
 //!   ②カードが出ている間の右クリックでカードが閉じてメニューが開く ③識別子でない所の右クリックには
 //!   出ない ④キー（⇧⌘H / Ctrl+Shift+H）で編集カーソルの位置にカードが出て、本文は 1 字も変わらない・
 //!   巨大な doc はカードでは 16,000 字で切る ⑤補完の一覧が出ている間のキーは一覧を閉じてカードを出す
-//! - `hover-loading`（偽サーバの `loading` = 読み込みの遅延の注入）: ①読み込み中に乗せると語の真下に
+//! - `hover-loading`（偽サーバの `loading`。読み込みの終わりは相ごとの合図のファイルでこの節が決める =
+//!   実時間に任せない。#1930）: ①読み込み中に乗せると語の真下に
 //!   「読み込み中」の 1 行（基準画像との差分は矩形の外 0 px）②マウスを動かさずに待つと読み込みの後に
 //!   カードへ差し替わる ③待つあいだに語から外れると 1 行は消え、待ちも残らない ④読み込みが終わらない
 //!   ときは上限で 1 行が消えて `loading`（カードは出ない）
@@ -409,10 +410,32 @@ pub(super) async fn hover_loading_visual(
 ) {
     const LABEL: &str = "hover-loading";
     inject_section_failure(LABEL);
-    // 読み込みの長さは偽サーバが起動のたびに env から読む（scene が編集モードへ入った時点で起きる）
+    let work =
+        std::env::temp_dir().join(format!("tako-visual-1930-{LABEL}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("visual-test hover-loading の置き場");
+    // 合図は相ごとに別のファイル（偽サーバは起動のたびに env を読む = ③④の再起動は前の相の合図を
+    // 見ない）。③④の合図は作らない = 読み込みは終わらない
+    let (log, first_gate, never) = (
+        work.join("received.jsonl"),
+        work.join("loading-done-1"),
+        work.join("loading-never"),
+    );
+    // 偽サーバは起動のたびに env を読む（scene が編集モードへ入った時点で起きる）。読み込みは
+    // 合図まで終わらない = 読み込みの終わりを実時間に任せない（#1922 / #1930）
     std::env::set_var("TAKO_LSP_FAKE_SCENARIO", "loading");
-    std::env::set_var("TAKO_LSP_FAKE_LOADING_MS", "6000");
+    std::env::set_var("TAKO_LSP_FAKE_LOADING_MS", "0");
+    std::env::set_var("TAKO_LSP_FAKE_LOADING_UNTIL", &first_gate);
+    std::env::set_var("TAKO_LSP_FAKE_LOG", &log);
     std::env::set_var("TAKO_LSP_HOVER_DELAY_MS", "0");
+    // 偽サーバに 2 行目（0 起点の 1 行目）を問うホバーの要求が届いたか
+    let hovered = |log: &std::path::Path| {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|m| m["method"] == "textDocument/hover" && m["params"]["position"]["line"] == 1)
+    };
     let source = "fn main() {\n    let total = 1;\n    let v = total;\n}\n";
     let rules = serde_json::json!([
         { "line": 1, "result": { "contents": { "kind": "markdown", "value": "# total\n\nThe running total." } } },
@@ -440,10 +463,23 @@ pub(super) async fn hover_loading_visual(
             .ok()
             .flatten()
     };
+    // 起動が済んで（握手を終えて）から読み込み中になったのを待つ（`server_loading` は起動中も真 =
+    // それだけで進むと起動中に乗せる。#1930。`completion-cancel` と同じ前提）
+    let running_loading = move |cx: &mut AsyncApp| {
+        window
+            .update(cx, |app, _, _| {
+                let server = &app.lsp.status(None)["servers"][0];
+                server["state"] == "running" && server["loading"] == true
+            })
+            .unwrap_or(false)
+    };
     wait_linked(any, window, cx, pane, LABEL).await;
     check(
-        until(any, window, cx, Duration::from_secs(10), &|cx| loading(cx)).await,
-        &format!("visual-test {LABEL}: 偽サーバが読み込み中と知らせる（素材の前提）"),
+        until(any, window, cx, Duration::from_secs(30), &|cx| {
+            running_loading(cx) && loading(cx)
+        })
+        .await,
+        &format!("visual-test {LABEL}: 偽サーバが起動して読み込み中と知らせる（素材の前提）"),
     );
     let on_word = hover_point(window, cx, pane, 1, 9)
         .unwrap_or_else(|| fail(&format!("visual-test {LABEL}: 2 行目の total の位置")));
@@ -464,9 +500,7 @@ pub(super) async fn hover_loading_visual(
     println!("TAKO_VISUAL_PIXEL: {LABEL} ① note={shown} still_loading={still_loading} {state}");
     check(
         still_loading,
-        &format!(
-            "visual-test {LABEL} ①: 乗せた時点でまだ読み込み中（素材の前提。読み込みを延ばす）"
-        ),
+        &format!("visual-test {LABEL} ①: 乗せた時点でまだ読み込み中（素材の前提。合図はまだ）"),
     );
     check(
         shown,
@@ -557,8 +591,14 @@ pub(super) async fn hover_loading_visual(
         &format!("visual-test {LABEL} ①: 基準画像との差分が 1 行の矩形の外にある（{outer} px）"),
     );
 
-    // ② マウスを動かさずに待つ → 読み込みの後にカードへ差し替わる。窓のマウス位置がずれていた
-    //    （実機のマウスが割り込んで語から外れた）ときだけ置き直す（置いた位置のままで出なければ不具合）
+    // ② マウスを動かさずに待つ → 読み込みの後にカードへ差し替わる。①の要求が偽サーバへ届いてから
+    //    読み込みを終わらせる（先に終わると読み込み中に乗せたことにならない）。窓のマウス位置がずれて
+    //    いた（実機のマウスが割り込んで語から外れた）ときだけ置き直す（置いた位置のままで出なければ不具合）
+    check(
+        until(any, window, cx, Duration::from_secs(10), &|_| hovered(&log)).await,
+        &format!("visual-test {LABEL} ②: ①の要求が偽サーバへ届く（素材の前提）"),
+    );
+    std::fs::write(&first_gate, b"").expect("読み込みの合図");
     let mut interfered = 0;
     let mut swapped = false;
     for _ in 0..3 {
@@ -595,10 +635,14 @@ pub(super) async fn hover_loading_visual(
     hover_move(any, cx, away);
     notify_and_draw(any, window, cx);
 
-    // ③ もう一度読み込ませる（再起動）→ 乗せて 1 行 → 語から外れると消え、待ちも残らない
+    // ③ もう一度読み込ませる（再起動。合図は作らない）→ 乗せて 1 行 → 語から外れると消え、待ちも残らない
+    std::env::set_var("TAKO_LSP_FAKE_LOADING_UNTIL", &never);
     let _ = window.update(cx, |app, _, _| app.lsp.restart(None));
     check(
-        until(any, window, cx, Duration::from_secs(10), &|cx| loading(cx)).await,
+        until(any, window, cx, Duration::from_secs(30), &|cx| {
+            running_loading(cx) && loading(cx)
+        })
+        .await,
         &format!("visual-test {LABEL} ③: 再起動で読み込み中に戻る（素材の前提）"),
     );
     hover_move(any, cx, on_word);
@@ -639,12 +683,14 @@ pub(super) async fn hover_loading_visual(
         &format!("visual-test {LABEL} ③: 読み込みが済む前に待ちを抜ける（待ち 0・取り消しの答えまで済む）"),
     );
 
-    // ④ 読み込みが終わらない: 上限（3 秒）で 1 行が消え、`loading`（カードは出ない）
-    std::env::set_var("TAKO_LSP_FAKE_LOADING_MS", "600000");
+    // ④ 読み込みが終わらない（合図を作らない）: 上限（3 秒）で 1 行が消え、`loading`（カードは出ない）
     std::env::set_var("TAKO_LSP_HOVER_TIMEOUT_SECS", "3");
     let _ = window.update(cx, |app, _, _| app.lsp.restart(None));
     check(
-        until(any, window, cx, Duration::from_secs(10), &|cx| loading(cx)).await,
+        until(any, window, cx, Duration::from_secs(30), &|cx| {
+            running_loading(cx) && loading(cx)
+        })
+        .await,
         &format!("visual-test {LABEL} ④: 再起動で読み込み中に戻る（素材の前提）"),
     );
     hover_move(any, cx, on_word);
@@ -672,6 +718,8 @@ pub(super) async fn hover_loading_visual(
     for var in [
         "TAKO_LSP_FAKE_SCENARIO",
         "TAKO_LSP_FAKE_LOADING_MS",
+        "TAKO_LSP_FAKE_LOADING_UNTIL",
+        "TAKO_LSP_FAKE_LOG",
         "TAKO_LSP_HOVER_DELAY_MS",
         "TAKO_LSP_HOVER_TIMEOUT_SECS",
         "TAKO_LSP_FAKE_COMPLETION",
@@ -684,6 +732,7 @@ pub(super) async fn hover_loading_visual(
     }
     let _ = std::fs::remove_file(rules_file);
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
 }
 
 /// visual-test `hover-loading-real`（実の rust-analyzer。暖機しない）

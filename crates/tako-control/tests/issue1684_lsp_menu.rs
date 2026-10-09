@@ -21,6 +21,9 @@ use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
 
+#[path = "common/lsp_fake_e2e.rs"]
+mod lsp_fake_e2e;
+
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
 /// 使い捨ての置き場（固定名を使わない = 並行する cargo test 同士で消し合わない。#1666）
@@ -59,6 +62,11 @@ impl Drop for Scratch {
 
 /// `providers` = 偽サーバが申告する能力の組（`None` ならシナリオ `normal` の既定 = 全部あり）
 fn config(scratch: &Scratch, providers: Option<&Value>) -> LspConfig {
+    config_with(scratch, providers, Vec::new())
+}
+
+/// `extra` = 偽サーバへ足す引数（順序の注入。#1930）
+fn config_with(scratch: &Scratch, providers: Option<&Value>, extra: Vec<String>) -> LspConfig {
     let mut args = vec![
         "--scenario".to_string(),
         "normal".to_string(),
@@ -69,6 +77,7 @@ fn config(scratch: &Scratch, providers: Option<&Value>) -> LspConfig {
         args.push("--providers".to_string());
         args.push(providers.to_string());
     }
+    args.extend(extra);
     LspConfig {
         table: servers::SERVERS,
         launcher: Arc::new(move |_spec: &ServerSpec| Launch::Found {
@@ -231,14 +240,19 @@ fn 閲覧中の右クリックは握手だけして一時的に開いた文書�
     manager.shutdown_all(Duration::from_secs(5));
 }
 
-/// 編集中（文書が開いている）なら、握手が済んだ時点で待たない読み口が能力を返す
+/// 編集中（文書が開いている）なら、握手が済んだ時点で待たない読み口が能力を返す。
+///
+/// 偽サーバはログ書き込みを遅らせる（`log_delay_args`）: manager が握手の後に didOpen を
+/// 「送った」時点では、偽サーバのログにはまだ「届いて」いない（Windows の CI で落ちた順序を
+/// どの機でも演じる = #1930）。ログの数は止めた後に数える
 #[test]
 fn 編集中の文書は握手が済めば待たずに読める() {
     let scratch = Scratch::new("editing");
     let main = scratch.write("src/main.rs", "fn main() {}\n");
-    let manager = LspManager::new(config(
+    let manager = LspManager::new(config_with(
         &scratch,
         Some(&json!({ "typeDefinitionProvider": true })),
+        lsp_fake_e2e::log_delay_args(),
     ));
     let mut link = DocLink::default();
     manager.sync(&mut link, true, &main, "fn main() {}\n", 1);
@@ -258,7 +272,10 @@ fn 編集中の文書は握手が済めば待たずに読める() {
             .collect::<Vec<_>>(),
         ["lsp-type-definition"]
     );
-    // 一時的な didOpen は送らない（編集セッションの 1 つだけ）
+    drop(link);
+    // 一時的な didOpen は送らない（編集セッションの 1 つだけ）。数えるのは止めた後
+    // （握手が済んだ = manager が didOpen を送った、であって偽サーバに届いたではない）
+    lsp_fake_e2e::stop_and_settle(&manager, &scratch.log());
     assert_eq!(
         methods(&scratch)
             .iter()
@@ -266,8 +283,6 @@ fn 編集中の文書は握手が済めば待たずに読める() {
             .count(),
         1
     );
-    drop(link);
-    manager.shutdown_all(Duration::from_secs(5));
 }
 
 /// 未導入・受け持つサーバが無い種類は、待たない読み口でも起こして待つ読み口でも理由で返す

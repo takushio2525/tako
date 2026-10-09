@@ -242,7 +242,11 @@ fn scan_manager(src: &str) -> Vec<String> {
     ) else {
         return out;
     };
-    match code.iter().position(|l| l.contains("self.wait_loaded(")) {
+    // 空の答えの後の待ちは `wait_after_empty`（#1930。定義ジャンプ・ホバーと共有の 1 実装）
+    match code
+        .iter()
+        .position(|l| l.contains("self.wait_after_empty("))
+    {
         None => out.push(report(MANAGER, at, "空の答えの後に読み込みを待っていない")),
         Some(i) => {
             if !code[i].contains("&abandoned") {
@@ -505,10 +509,10 @@ fn 逆戻りを名指しできる() {
         &manager,
         MANAGER,
         (
-            "self.wait_loaded(&key, deadline, &abandoned)",
-            "self.wait_loaded(&key, deadline, &|| false)",
+            "self.wait_after_empty(&key, deadline, &abandoned, &mut empty)",
+            "self.wait_after_empty(&key, deadline, &|| false, &mut empty)",
         ),
-        "fn completion(&self, request: &CompletionRequest)>>self.wait_loaded(",
+        "fn completion(&self, request: &CompletionRequest)>>self.wait_after_empty(",
         mg,
     );
     // G. GUI が「読み込み中」を立てない

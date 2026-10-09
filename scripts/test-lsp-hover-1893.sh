@@ -267,11 +267,12 @@ check_eq "申告の無いサーバではメニューに hover が出ない" "lsp
   "$(printf '%s' "$MENU2" | json '",".join(i["id"] for i in d["items"])')"
 stop_isolated_gui "$APP_PID"; APP_PID=""
 
-# 終わらない読み込み: CLI も MCP も上限で loading（上限は env で 2 秒に縮める）
+# 終わらない読み込み: CLI も MCP も上限で loading（上限は env で 2 秒に縮める）。合図のファイルを
+# 作らない = 読み込みは終わらない（実時間の長さで「終わらない」を演じない。#1930）
 launch_isolated_gui "$TMP/app-loading.log" \
   TAKO_LSP_BIN_RUST_ANALYZER="$FAKE" \
   TAKO_LSP_FAKE_HOVER="$RULES" \
-  TAKO_LSP_FAKE_SCENARIO=loading TAKO_LSP_FAKE_LOADING_MS=600000 \
+  TAKO_LSP_FAKE_SCENARIO=loading TAKO_LSP_FAKE_LOADING_MS=0 TAKO_LSP_FAKE_LOADING_UNTIL="$TMP/loading-never" \
   TAKO_LSP_HOVER_TIMEOUT_SECS=2 || exit $?
 APP_PID="$ISOLATED_GUI_PID"
 wait_isolated_gui "$TMP/app-loading.log" || exit 1

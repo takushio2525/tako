@@ -1571,6 +1571,20 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   順序の注入は偽サーバの `TAKO_LSP_FAKE_START_DELAY_MS` / `TAKO_LSP_FAKE_STATUS_DELAY_MS`。
   番犬 `issue1922_lsp_loading_wait_watchdog` が `--loading-ms` の直書き・合図を通らない `loading`・
   前提の待ちを通らない要求を `file:line` で落とす
+
+  **答えの順序（#1930）**も同じ型だった。①答えの遅れ（偽サーバの `delay_ms`）の実時間の間に次の操作
+  （取り消し・打ち足し・重なった問い合わせ）が間に合う前提 → 偽サーバは `delay_ms` を読まない。規則の
+  `hold_until`（`AnswerGate`。配列なら k 本目の要求が k 番目を待つ）で、次の操作が済んでから返させる
+  ②「送った」直後に偽サーバのログを数えた（`issue1684_lsp_menu.rs:262`。ログ書き込みを 20ms 遅らせる
+  注入で 10 回中 9 回）→ ログの数は `stop_and_settle`（shutdown が届くまで待つ = それより前の送信は
+  すべてログにある）の後に数え、その e2e は `log_delay_args` を常に渡す ③読み込み中に返った空を
+  manager が見る前に読み込みが済む（`issue1869_lsp_followup.rs:197`）は**製品側の判定**が真因で、
+  `EmptyAnswer` が 1 回だけ問い直す（偽サーバの `--settle-on-empty before` が順序を決定的に起こす）。
+  visual-test・スクリプトも `TAKO_LSP_FAKE_LOADING_MS=0` + `TAKO_LSP_FAKE_LOADING_UNTIL` で読み込みを
+  終わらせ、終わらない読み込みは合図を作らない（`600000` の実時間で演じない）。前提の「読み込み中」は
+  `state=running && loading`（`server_loading` は起動中も真）。順序の注入は偽サーバの
+  `TAKO_LSP_FAKE_EMPTY_DELAY_MS` / `TAKO_LSP_FAKE_SETTLE_ON_EMPTY` / `TAKO_LSP_FAKE_LOG_DELAY_MS`。
+  番犬は同じ `issue1922_lsp_loading_wait_watchdog`
 - **隔離 GUI の性能は App Nap を分けて読む**（#1916）。隔離 GUI は前面に出ないので、起動から
   約 30 秒で App Nap に間引かれ（`ps -o pri=` が 46 → 4）、CPU を使う処理は E コアへ寄せられて
   2.2〜2.8 倍遅くなる。「回を追うごとに遅くなる」はまずこれを疑う
