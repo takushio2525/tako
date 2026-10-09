@@ -14,3 +14,35 @@
 # 追加・変更するとこのターゲットのビルドキャッシュが一度だけ丸ごと無効になる。
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# debug ビルドでも構文の塗り（syntect + fancy-regex と下の正規表現エンジン）だけは
+# 最適化する（#1901）。未最適化だと release の 14〜18 倍遅く、debug の visual-test で
+# 10 MB の塗りが 1 回 7 分かかっていた（#1890）。これで debug の塗りは release 並み
+# （10 MB: 53.8 → 4.3 秒）。自分のクレートは最適化しないので、デバッグ情報と差分ビルドの
+# 速さはそのまま（増えるのはこの 8 つのクリーンビルドの約 36 秒ぶんの CPU 時間だけ）。
+# どれを外しても遅くなる（1 MB の TS: 8 つ全部 4.8 秒 / fancy-regex を外すと 39 秒 /
+# memchr を外すと 5.4 秒）。前後の実測表は #1901
+#
+# **ルートの Cargo.toml ではなくここに置く理由**: CI のキャッシュ（Swatinem/rust-cache）の
+# キーはこのファイルと Cargo.lock・各クレートの Cargo.toml から作られ、ルートの Cargo.toml
+# （仮想マニフェスト）は入らない。ルートに書くとキーが変わらず、最適化前の memchr などで
+# 作った古いキャッシュを毎回復元して下流をほぼ全部作り直す（PR #1912 の初回で macOS ジョブ
+# 39 分 / main は 25〜36 分）うえ、キーが一致するので保存もされない。ここなら変えるたびに
+# キーが変わり、キャッシュの作り直しは一度だけで済む。
+# 変えると memchr に依存する大半の依存がローカルでも一度だけ作り直しになる。
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.bit-set]
+opt-level = 3
+[profile.dev.package.bit-vec]
+opt-level = 3

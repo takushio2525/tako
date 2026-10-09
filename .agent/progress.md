@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-08（#1879: tako mod S1 = Claude Code の mod の同梱・展開・ペインへの注入と状態報告）
-- mod（`crates/tako-core/claude-mod/`）を `<data_dir>/claude-mod/tako/` へ展開し、claude 2.1.294 以上のペインの env（`CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_CLI`）で読ませる（設定ファイルは書かない・tmux は `-e` 固定）。mod は 1 秒 flush / 15 秒 heartbeat で `tako mod report` を叩き、GUI のメモリに 45 秒の鮮度で持つ。`tako mod [on|off]` / MCP `tako_mod`（report は載せない = FR-2.42.6）。組織アカウントで classic 系が mod へ届かないのを実測し、tool.call / tool.check で拾う形を足した（FR-2.42.7）
-- 実測: `scripts/test-claude-mod-1879.sh`（隔離 GUI・実 claude）全段 41 PASS 0 FAIL・`claude plugin test` 11 本（注入 3 通りで fail）・番犬 3 本（注入 9 通り名指し）・カタログ +421 B
-
 ## 2026-10-08（#1867: ファイルツリーの複数選択・⌥⌘V（移動として貼る）・大きなコピーの進み具合と取り消し）
 - 選択の正本 `tako_core::tree_select`（⌘ / ⇧クリック・範囲・配下の除去）+ 押下の捕捉フェーズで外した選択を退避。まとめた操作は dispatch `FileOpMany`（clipboard / trash / move を単数と同じ口で 1 件ずつ）、⌥⌘V（Win は Ctrl+Alt+V・AltGr の文字は奪わない）は `paste_move` = #1834 の移動、コピーは `file_copy::Progress` + 一覧 `jobs` で帯と `copy_progress` / `copy_cancel`（作りかけは戻す）。CLI / MCP `tako_file_op` の `paths` と同名の op（カタログ +396 B）
 - 実測: `scripts/test-tree-multiselect-1867.sh` 57 PASS 0 FAIL（visual-test `tree-multiselect` 8 場面・A/B `TAKO_1867_LEGACY=1` で ① が FAILED・CLI と MCP 16 組が字面一致・CLI で始めたコピーを MCP で取り消す / 逆・権限エラー）・番犬 17 本（注入 8 通り file:line）
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1881: tako mod S3 = Claude Code の画面のプロンプトの上に帯 1 行と /tako のサイドバーを出した）
 - 判断は tako（`claude_mod::band_view` / `classify_worker` / `band_warnings` を `tako mod report` の応答の `tako.view` へ）、mod は `bodyColumns` に合わせて優先度の低い区切りから落とし `Text` 1 本（truncate-end）で描く。worker は右パネル orch と同じ `Workspace::workers_of` へ寄せた。トグルは `$.store`（`/tako band on|off`・ボタン・`tako mod band on|off` の中継。新しい方が勝つ）。A/B `TAKO_1877_S3_LEGACY=1`・検証用 `TAKO_1881_BAND_THRESHOLD`・MATRIX `claude_mod_band`・カタログ +74 B
 - 実測: `scripts/test-claude-mod-band-1881.sh` 49 PASS 0 FAIL（実 claude 2.1.294・組織 / 個人の設定 dir）で 80 / 144 / 300 桁 × 21 行の帯が 1 行・ダイアログ 4 回の後に戻る・再起動後もトグル保持・A/B で描かない・`claude plugin test` 26 本（terminal / desktop）・番犬 `issue1881_claude_mod_band_watchdog.rs`（注入 12 通りを file:line で名指し）
+
+## 2026-10-09（#1901: debug ビルドでも構文の塗りの依存 8 つだけ opt-level 3 にした）
+- `.cargo/config.toml` に `[profile.dev.package.*]` を syntect / fancy-regex / regex-automata / regex-syntax / aho-corasick / memchr / bit-set / bit-vec へ（どれを外しても遅くなるのを 1 MB の TS で実測。自分のクレートは未最適化のまま。ルートの Cargo.toml だと rust-cache のキーに入らず CI が毎回下流を作り直した = PR の初回 macOS 39 分）。commands.md の build 行・#1890 の「debug は 427.6 秒」2 か所に後の値を添えた
+- 実測（JOBS=2・前後交互に 2 回ずつ）: 10 MB の塗り 53.8 → 4.3 秒（12.4 倍）・visual-test `large-file-decor` の debug は 1 節 30 分 → 152 秒・差分ビルド tako-core 9.5 / 7.8 → 9.3 / 8.4 秒・クリーンは 8 つで +36 秒の CPU（壁時計は負荷のぶれ以下）・全体テスト 6515 passed（tako-app 単体 30 → 12 秒）
