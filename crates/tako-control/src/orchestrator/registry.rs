@@ -143,6 +143,36 @@ pub struct WorkerEntry {
     /// `residual_after_retries` / `flow_timeout`）。規約により画面内容・送信テキストは含めない
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_delivery_failure: Option<String>,
+    /// 起動に失敗したと観測した時刻（Issue #1940）。spawn は起動コマンドを積んで即返るので、
+    /// 「起動コマンドが実行された直後にエージェントが終わった」等は後からここへ記録する
+    /// （旧実装は spawn が成功を返したまま worker が黙って止まっていた）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_failed_at: Option<String>,
+    /// 起動失敗の理由コード（[`LaunchFailure`] の綴り）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_failure: Option<String>,
+    /// `agent_exited` のとき、シェルが報告した終了コード（OSC 133;D。無ければ None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_exit_code: Option<i32>,
+}
+
+/// 起動失敗の理由（Issue #1940）。綴りは `workers` の `launch_failure` にそのまま出る
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchFailure {
+    /// 起動コマンドは実行されたが、エージェントがすぐ終わってシェルへ戻った
+    /// （不正な引数・未認証・存在しないモデル等。終了コードは `launch_exit_code`）
+    AgentExited,
+    /// 起動コマンドを打ち切りまでに送り届けられなかった（シェルが立たない等）
+    CommandFlowTimeout,
+}
+
+impl LaunchFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentExited => "agent_exited",
+            Self::CommandFlowTimeout => "command_flow_timeout",
+        }
+    }
 }
 
 impl WorkerEntry {
@@ -335,6 +365,9 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
                 dead_since: None,
                 prompt_delivery_failed_at: None,
                 prompt_delivery_failure: None,
+                launch_failed_at: None,
+                launch_failure: None,
+                launch_exit_code: None,
             },
         );
         reg.gc();
@@ -433,11 +466,13 @@ pub fn record_session_detected_by_pane(pane: u64, session_id: &str) -> Result<()
     if !path.is_file() {
         return Ok(());
     }
+    let legacy = tako_core::shell_send::legacy_1940();
     let current = WorkerRegistry::load_from(&path)?;
     let needs_update = current.workers.values().any(|e| {
         e.is_active()
             && e.pane == pane
-            && (e.session_id.as_deref() != Some(session_id) || e.prompt_delivered_at.is_none())
+            && (e.session_id.as_deref() != Some(session_id)
+                || (legacy && e.prompt_delivered_at.is_none()))
     });
     if !needs_update {
         return Ok(());
@@ -447,7 +482,9 @@ pub fn record_session_detected_by_pane(pane: u64, session_id: &str) -> Result<()
         for entry in reg.workers.values_mut() {
             if entry.is_active() && entry.pane == pane {
                 entry.session_id = Some(session_id.to_string());
-                if entry.prompt_delivered_at.is_none() {
+                // #1940: 会話の検出は「起動した」証拠であって「依頼文が届いた」証拠ではない。
+                // 到達の時刻は送達フローの確認（`record_prompt_delivery`）だけが書く
+                if legacy && entry.prompt_delivered_at.is_none() {
                     entry.prompt_delivered_at = Some(now.clone());
                 }
             }
@@ -456,37 +493,109 @@ pub fn record_session_detected_by_pane(pane: u64, session_id: &str) -> Result<()
 }
 
 /// 検出済み claude session をレジストリへ反映する（tmux_session キー）。
-/// session_id の初観測 = transcript 生成 = プロンプト到達の証跡として
-/// `prompt_delivered_at` も同時に記録する。GUI の定期スキャンおよび
-/// worker_status の解決成功時（lazy 昇格）から呼ばれる
+/// GUI の定期スキャンおよび worker_status の解決成功時（lazy 昇格）から呼ばれる。
+///
+/// #1940: 以前は session_id の初観測を「プロンプト到達の証跡」として
+/// `prompt_delivered_at` も書いていた。しかし session_id は `claude agents --json`
+/// （起動中の会話一覧）から取るので**依頼文が届く前の起動直後に付く**。そのため
+/// `prompt_delivery` が届く前に `delivered` を返し、送達フローが諦めた後に
+/// `undelivered` へ反転していた（本番 10/9 の pane 2471）。到達の時刻は送達フローの
+/// 確認だけが書く（旧挙動は `TAKO_1940_LEGACY=1`）
 pub fn record_session_detected(tmux_session: &str, session_id: &str) -> Result<(), String> {
     let Some(path) = registry_path() else {
         return Ok(());
     };
+    record_session_detected_at(&path, tmux_session, session_id)
+}
+
+fn record_session_detected_at(
+    path: &Path,
+    tmux_session: &str,
+    session_id: &str,
+) -> Result<(), String> {
     if !path.is_file() {
         return Ok(());
     }
     // 変更が無いなら書き込みをスキップ（定期スキャンからの毎回書き込み防止）
-    let current = WorkerRegistry::load_from(&path)?;
+    let legacy = tako_core::shell_send::legacy_1940();
+    let current = WorkerRegistry::load_from(path)?;
     let needs_update = current.workers.values().any(|e| {
         e.is_active()
             && e.tmux_session.as_deref() == Some(tmux_session)
-            && (e.session_id.as_deref() != Some(session_id) || e.prompt_delivered_at.is_none())
+            && (e.session_id.as_deref() != Some(session_id)
+                || (legacy && e.prompt_delivered_at.is_none()))
     });
     if !needs_update {
         return Ok(());
     }
     let now = crate::sessions::now_iso();
-    WorkerRegistry::mutate_at(&path, |reg| {
+    WorkerRegistry::mutate_at(path, |reg| {
         for entry in reg.workers.values_mut() {
             if entry.is_active() && entry.tmux_session.as_deref() == Some(tmux_session) {
                 entry.session_id = Some(session_id.to_string());
-                if entry.prompt_delivered_at.is_none() {
+                if legacy && entry.prompt_delivered_at.is_none() {
                     entry.prompt_delivered_at = Some(now.clone());
                 }
             }
         }
     })
+}
+
+/// 起動の失敗をレジストリへ記録する（Issue #1940）。
+///
+/// pane 番号で引く（起動コマンドの送達フローが持つキー）。同番号ペインの再利用による
+/// 誤更新を防ぐため、active かつまだ起動失敗を記録していないエントリだけを対象にする。
+/// worker でないペイン（master の起動・手動のペイン）は該当が無く no-op
+pub fn record_launch_failure(
+    pane: u64,
+    failure: LaunchFailure,
+    exit_code: Option<i32>,
+) -> Result<(), String> {
+    let Some(path) = registry_path() else {
+        return Ok(());
+    };
+    record_launch_failure_at(&path, pane, failure, exit_code)
+}
+
+fn record_launch_failure_at(
+    path: &Path,
+    pane: u64,
+    failure: LaunchFailure,
+    exit_code: Option<i32>,
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let current = WorkerRegistry::load_from(path)?;
+    let target = |e: &WorkerEntry| e.is_active() && e.pane == pane && e.launch_failed_at.is_none();
+    if !current.workers.values().any(target) {
+        return Ok(());
+    }
+    let now = crate::sessions::now_iso();
+    WorkerRegistry::mutate_at(path, |reg| {
+        for entry in reg.workers.values_mut() {
+            if target(entry) {
+                entry.launch_failed_at = Some(now.clone());
+                entry.launch_failure = Some(failure.as_str().to_string());
+                entry.launch_exit_code = exit_code;
+            }
+        }
+    })
+}
+
+/// 起動の状態（Issue #1940）。`workers` の `launch` に出る。
+///
+/// - `failed`: 起動失敗を記録した（理由は `launch_failure`）
+/// - `started`: エージェントの会話を検出した / 依頼文の到達を確認した
+/// - `pending`: どちらもまだ（起動途中。会話を検出できない系統もここに留まる）
+pub fn launch_state(entry: &WorkerEntry) -> &'static str {
+    if entry.launch_failed_at.is_some() {
+        "failed"
+    } else if entry.session_id.is_some() || entry.prompt_delivered_at.is_some() {
+        "started"
+    } else {
+        "pending"
+    }
 }
 
 /// 送達フロー（PromptFlow）の結果をレジストリへ記録する（Issue #530 / #1294）。
@@ -824,7 +933,12 @@ pub fn prompt_delivery_assessment_with(
             tako_core::prompt_delivery::legacy_undelivered(),
         );
     }
-    if entry.session_id.is_some() || entry.prompt_delivered_at.is_some() {
+    // #1940: `delivered` は**依頼文の到達を確かめた証拠**があるときだけ返す。
+    // `prompt_delivered_at` を書くのは送達フローの確認（入力欄への反映 + 送信後の空、
+    // または peer の受信確認）だけ。会話の検出（session_id）は「起動した」証拠に留める
+    // （旧実装はこれを到達とみなし、届く前に delivered → 諦めた後に undelivered と反転した）
+    let legacy_1940 = tako_core::shell_send::legacy_1940();
+    if entry.prompt_delivered_at.is_some() || (legacy_1940 && entry.session_id.is_some()) {
         return PromptDelivery::Delivered;
     }
     if !entry.is_active() {
@@ -839,6 +953,12 @@ pub fn prompt_delivery_assessment_with(
     }
     if now_epoch - spawned <= PROMPT_DELIVERY_GRACE_SECS {
         return PromptDelivery::Pending;
+    }
+    // #1940: 起動は確認できた（会話を検出した）が、到達の証拠が無いまま猶予を過ぎた。
+    // 送達フローが失われた（GUI の再起動等）可能性があるので未達とは断定しない
+    // （断定すると supervisor の自動再送が「届いたかもしれない依頼」を撃つ = #1294）
+    if entry.session_id.is_some() {
+        return PromptDelivery::Unverified;
     }
     // 猶予超過。**何をもって未達と言えるか**は系統ごとに違う（マトリクスが正本）。
     // 知らない agent 名は「観測手段が無い」側へ倒す（黙らず、断定もしない）。
@@ -906,13 +1026,23 @@ pub fn list_payload(
             "tmux_alive": tmux_alive,
             "prompt_delivery": delivery.as_str(),
             "prompt_delivery_failure": e.prompt_delivery_failure,
+            // #1940: 起動の状態（failed / started / pending）と失敗の理由コード。
+            // spawn は即返るので、起動の失敗はここで初めて見える
+            "launch": launch_state(e),
+            "launch_failure": e.launch_failure,
+            "launch_exit_code": e.launch_exit_code,
+            "launch_failed_at": e.launch_failed_at,
             "resume_command": resume_command(e),
             // #822: 利用上限後の自動復帰（FR-2.27）が有効か。ペインが生きていないときは
             // ペイン属性を読めない（番号が別ペインへ再利用されている可能性もある）ので null
             "limit_resume": pane_alive.then(|| limit_resume_panes.contains(&e.pane)),
-            // 未達 worker にだけ再送コマンドを出す（#530 の受け入れ条件 3）
+            // 未達 worker にだけ再送コマンドを出す（#530 の受け入れ条件 3）。
+            // #1940: 起動に失敗した worker へ依頼文を再送しても届かない（エージェントが
+            // 居ない）ので出さない。次の一手は起動のやり直し
             "resend_command": match delivery {
-                PromptDelivery::OverdueSuspect => resend_command(e),
+                PromptDelivery::OverdueSuspect if e.launch_failed_at.is_none() => {
+                    resend_command(e)
+                }
                 _ => None,
             },
         }));
@@ -988,6 +1118,9 @@ mod tests {
                     dead_since: None,
                     prompt_delivery_failed_at: None,
                     prompt_delivery_failure: None,
+                    launch_failed_at: None,
+                    launch_failure: None,
+                    launch_exit_code: None,
                 },
             );
             reg.gc();
@@ -1119,8 +1252,19 @@ mod tests {
             prompt_delivery_assessment(&entry, now_epoch + PROMPT_DELIVERY_GRACE_SECS + 10),
             PromptDelivery::OverdueSuspect
         );
-        // session_id 検出済み = delivered（時間に関係なく）
+        // #1940: session_id 検出済み（= 起動した）だけでは delivered にしない。
+        // 猶予内は pending、猶予を過ぎて到達の記録が無ければ未確認
         entry.session_id = Some("abc".into());
+        assert_eq!(
+            prompt_delivery_assessment(&entry, now_epoch),
+            PromptDelivery::Pending
+        );
+        assert_eq!(
+            prompt_delivery_assessment(&entry, now_epoch + 10_000),
+            PromptDelivery::Unverified
+        );
+        // 送達フローが到達を確認した = delivered（時間に関係なく）
+        entry.prompt_delivered_at = Some(crate::sessions::now_iso());
         assert_eq!(
             prompt_delivery_assessment(&entry, now_epoch + 10_000),
             PromptDelivery::Delivered
@@ -1345,6 +1489,124 @@ mod tests {
             PromptDelivery::OverdueSuspect
         );
         assert_eq!(PromptDelivery::OverdueSuspect.as_str(), "undelivered");
+    }
+
+    /// #1940: 本番 10/9 の pane 2471 の順序を再現する。claude が起動して会話が
+    /// 検出された時点（依頼文はまだ届いていない）で `delivered` を返し、送達フローが
+    /// 諦めた後に `undelivered` へ反転していた。**届く前に delivered を返さない**
+    #[test]
+    fn issue1940_会話の検出だけでは依頼文の到達とみなさない() {
+        let path = temp_registry_file("issue1940-session");
+        register_at(&path, sample_record(2471));
+        let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+
+        // claude が起動して会話を検出した（`claude agents --json` は起動直後に返す）
+        record_session_detected_at(&path, "tako-pane-2471", "sid-2471").unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let e = reg.workers.values().find(|e| e.pane == 2471).unwrap();
+        assert_eq!(e.session_id.as_deref(), Some("sid-2471"));
+        assert!(
+            e.prompt_delivered_at.is_none(),
+            "会話の検出は到達の時刻を書かない"
+        );
+        assert_ne!(
+            prompt_delivery_assessment(e, now_epoch),
+            PromptDelivery::Delivered,
+            "送達フローが確かめる前に delivered を返さない"
+        );
+        assert_eq!(launch_state(e), "started", "起動したことは言う");
+
+        // 送達フローが諦めた → undelivered（反転ではなく、最初から delivered でない）
+        record_prompt_delivery_at(
+            &path,
+            2471,
+            PromptDeliveryFlow::SpawnPrompt,
+            Confidence::Undelivered,
+            "flow_timeout",
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let e = reg.workers.values().find(|e| e.pane == 2471).unwrap();
+        assert_eq!(
+            prompt_delivery_assessment(e, now_epoch),
+            PromptDelivery::OverdueSuspect
+        );
+
+        // 対照: 送達フローが到達を確かめたものだけが delivered
+        let ok = temp_registry_file("issue1940-session-ok");
+        register_at(&ok, sample_record(2472));
+        record_session_detected_at(&ok, "tako-pane-2472", "sid-2472").unwrap();
+        record_prompt_delivery_at(
+            &ok,
+            2472,
+            PromptDeliveryFlow::SpawnPrompt,
+            Confidence::Delivered,
+            tako_core::prompt_delivery::VERIFIED,
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&ok).unwrap();
+        let e = reg.workers.values().find(|e| e.pane == 2472).unwrap();
+        assert_eq!(
+            prompt_delivery_assessment(e, now_epoch),
+            PromptDelivery::Delivered
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ok);
+    }
+
+    /// #1940: 起動失敗の 3 欄は serde の default で足したので、欄の無い旧い
+    /// `workers.yaml` がそのまま読める（移行は要らない = #916 の指紋の更新理由）
+    #[test]
+    fn issue1940_起動失敗の欄が無い旧いworkers_yamlをそのまま読める() {
+        let old = "next_id: 1\nworkers:\n  '1':\n    project: tako\n    agent: claude\n    \
+                   pane: 7\n    spawned_at: '2026-10-01T00:00:00Z'\n    status: active\n";
+        let reg: WorkerRegistry = serde_yaml::from_str(old).expect("旧い形が読める");
+        let e = &reg.workers["1"];
+        assert!(e.launch_failed_at.is_none() && e.launch_failure.is_none());
+        assert_eq!(e.launch_exit_code, None);
+        assert_eq!(launch_state(e), "pending");
+        // 書き戻しても空の欄は出さない（旧い tako が読んでも困らない）
+        let back = serde_yaml::to_string(&reg).unwrap();
+        assert!(!back.contains("launch_"), "{back}");
+    }
+
+    /// #1940: 起動に失敗した spawn は `workers` に理由コードつきで出る
+    /// （spawn は即返るので、ここが無いと worker は成功のまま黙って止まる）
+    #[test]
+    fn issue1940_起動失敗は一覧に理由つきで出て再送コマンドを出さない() {
+        let path = temp_registry_file("issue1940-launch");
+        register_at(&path, sample_record(51));
+        register_at(&path, sample_record(52));
+        record_launch_failure_at(&path, 51, LaunchFailure::AgentExited, Some(1)).unwrap();
+        // 2 回目は上書きしない（最初の失敗が正本）
+        record_launch_failure_at(&path, 51, LaunchFailure::CommandFlowTimeout, None).unwrap();
+        // 送達フローも諦めた（相手が居ない）
+        record_prompt_delivery_at(
+            &path,
+            51,
+            PromptDeliveryFlow::SpawnPrompt,
+            Confidence::Undelivered,
+            tako_core::prompt_delivery::Stall::AgentExited.code(),
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let payload = list_payload(&reg, &[], &[], &[], false);
+        let items = payload["workers"].as_array().unwrap();
+        let failed = items.iter().find(|w| w["pane"] == 51).unwrap();
+        assert_eq!(failed["launch"], "failed");
+        assert_eq!(failed["launch_failure"], "agent_exited");
+        assert_eq!(failed["launch_exit_code"], 1);
+        assert!(failed["launch_failed_at"].is_string());
+        assert_eq!(failed["prompt_delivery"], "undelivered");
+        assert_eq!(failed["prompt_delivery_failure"], "agent_exited");
+        assert!(
+            failed["resend_command"].is_null(),
+            "エージェントが居ないので依頼文の再送は案内しない"
+        );
+        let other = items.iter().find(|w| w["pane"] == 52).unwrap();
+        assert_eq!(other["launch"], "pending", "別ペインは無傷");
+        assert!(other["launch_failure"].is_null());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

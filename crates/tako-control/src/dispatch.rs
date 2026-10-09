@@ -13311,6 +13311,11 @@ fn finish_worker_status(
     let registry_resume_command = registry_worker
         .as_ref()
         .and_then(|(_, e)| orchestrator::registry::resume_command(e));
+    let registry_launch_failure = registry_worker.as_ref().and_then(|(_, e)| {
+        e.launch_failure
+            .clone()
+            .map(|reason| (reason, e.launch_exit_code))
+    });
 
     // #390: session_id が今回の照会で解決できたらレジストリへ書き戻す（lazy 昇格）。
     // GUI の定期スキャンが止まっていても（セカンダリモード等）prompt 到達の証跡が残り、
@@ -13385,6 +13390,7 @@ fn finish_worker_status(
         prompt_delivery,
         registry_session_detected,
         registry_resume_command,
+        registry_launch_failure,
         agent_process_alive,
         limit_resume,
         codex_rate_limits,
@@ -13424,6 +13430,10 @@ struct ResolvedWorkerStatus {
     registry_session_detected: bool,
     /// #390: レジストリの session ID から組み立てた復旧コマンド（claude のみ）
     registry_resume_command: Option<String>,
+    /// #1940: レジストリに記録された起動の失敗（理由コード, 終了コード）。
+    /// 起動に失敗した worker へは依頼文の再送（`prompt_undelivered`）を撃たせない
+    /// （エージェントが居ないので、再送はシェルへ打ち込まれる）
+    registry_launch_failure: Option<(String, Option<i32>)>,
     /// #390: エージェントプロセスの生存シグナル（突然死判定専用。pane 消失中は
     /// tmux フォールバックで再計算済み。busy / stalled 補正には使わない）
     agent_process_alive: bool,
@@ -13480,6 +13490,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         prompt_delivery,
         registry_session_detected,
         registry_resume_command,
+        registry_launch_failure,
         agent_process_alive,
         limit_resume,
         login_account_resolver,
@@ -13873,8 +13884,12 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
             (assessment, since_spawn)
         }
     });
+    // #1940: 起動に失敗した worker（エージェントがすぐ終わってシェルへ戻った）へは
+    // 再送の引き金を出さない。supervisor の自動再送・master の再送が**シェルへ**
+    // 依頼文を打ち込む（次の一手は起動のやり直し = `launch_failure` を見る）
+    let launch_failed = registry_launch_failure.is_some() && !tako_core::shell_send::legacy_1940();
     if let Some((crate::orchestrator::registry::PromptDelivery::OverdueSuspect, since_spawn)) =
-        prompt_delivery_final
+        prompt_delivery_final.filter(|_| !launch_failed)
     {
         events.push(
             crate::orchestrator::wait::WorkerEvent {
@@ -14006,6 +14021,9 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         // #390: worker レジストリ由来の情報（未登録ペインは null）
         "worker_id": registry_worker_id,
         "prompt_delivery": prompt_delivery_final.map(|(d, _)| d.as_str()),
+        // #1940: 起動の失敗（`tako orchestrator workers` の launch_failure と同じ値）
+        "launch_failure": registry_launch_failure.as_ref().map(|(r, _)| r.as_str()),
+        "launch_exit_code": registry_launch_failure.as_ref().and_then(|(_, c)| *c),
         "resume_command": registry_resume_command,
         // #813: 利用上限後の自動復帰（enabled = ペインのオプトイン / state = 実行状態）
         "limit_resume": limit_resume,
@@ -34904,8 +34922,10 @@ mod tests {
             "busy 中は発火しない"
         );
 
-        // session_id を渡した照会（agents 解決相当）は delivered へ倒れ、
-        // レジストリへも lazy 昇格される
+        // session_id を渡した照会（agents 解決相当）はレジストリへ lazy 昇格される。
+        // #1940: ただし会話の検出は「起動した」証拠であって「依頼文が届いた」証拠では
+        // ない（起動直後に付く）ので delivered へは倒さない。猶予を過ぎて到達の記録が
+        // 無ければ「未確認」（自動再送は撃たない）
         WorkerRegistry::mutate_at(&path, |reg| {
             if let Some(e) = reg.workers.get_mut("q7801") {
                 e.tmux_session = Some("tako-q7801".into());
@@ -34928,7 +34948,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(v["prompt_delivery"], "delivered");
+        assert_eq!(v["prompt_delivery"], "unverified");
         let reg = WorkerRegistry::load().unwrap();
         let entry = &reg.workers["q7801"];
         assert_eq!(
@@ -34936,7 +34956,66 @@ mod tests {
             Some("sid-7801-detected"),
             "解決済み session_id がレジストリへ書き戻される"
         );
-        assert!(entry.prompt_delivered_at.is_some());
+        assert!(
+            entry.prompt_delivered_at.is_none(),
+            "会話の検出で到達の時刻を書かない（#1940）"
+        );
+    }
+
+    /// #1940: 起動に失敗した worker（エージェントがすぐ終わってシェルへ戻った）へは
+    /// 依頼文の再送の引き金（`prompt_undelivered` = supervisor の自動再送）を出さない。
+    /// 出すと依頼文が**シェルへ**打ち込まれる。代わりに起動失敗の理由を返す
+    #[test]
+    fn issue1940_起動に失敗したworkerへ再送の引き金を出さない() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let path = registry_path().unwrap();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.insert(
+                "q19401".into(),
+                WorkerEntry {
+                    pane: 19401,
+                    agent: "claude".into(),
+                    status: "active".into(),
+                    spawned_at: "2026-01-01T00:00:00Z".into(),
+                    prompt_delivery_failed_at: Some("2026-01-01T00:00:07Z".into()),
+                    prompt_delivery_failure: Some("agent_exited".into()),
+                    launch_failed_at: Some("2026-01-01T00:00:07Z".into()),
+                    launch_failure: Some("agent_exited".into()),
+                    launch_exit_code: Some(1),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        let v = finish_worker_status(
+            WorkerStatusCtx {
+                pane_id: 19401,
+                pane_exists: true,
+                backend_session: None,
+                live_tail: Some("error: option invalid\n[test@host:work]$ ".into()),
+                full_screen: None,
+                input_style: None,
+                has_running_children: false,
+                limit_resume: Value::Null,
+                mod_state: Default::default(),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["prompt_delivery"], "undelivered");
+        assert_eq!(v["launch_failure"], "agent_exited");
+        assert_eq!(v["launch_exit_code"], 1);
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(
+            !kinds.contains(&"prompt_undelivered"),
+            "起動に失敗した worker へ再送の引き金を出さない: {kinds:?}"
+        );
     }
 
     /// #1294: peer 送達の「送ったかもしれない」顛末（書き込みが始まった後に確認が

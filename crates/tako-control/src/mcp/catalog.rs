@@ -1917,6 +1917,7 @@ pub fn tools() -> Vec<Value> {
                 agents-auto（claude agents --json）/ screen（画面推定。codex / agy は常に screen）。\
                 ctx_source / ctx_mod_reason / mod_turn / rate_limits は tako_orchestrator_self と同じ。\
                 返るものは recommended_action / recent_output（直近 30 行）/ prompt_delivery / \
+                launch_failure（起動失敗。再送しない）/ \
                 events / background_work / resume_command / resolved_session_id。\
                 **次の一手は recommended_action に従う**（resume / wait_reset / respond_dialog / \
                 fix_launch / needs_human / relogin / verify_then_resend）。\
@@ -1957,11 +1958,13 @@ pub fn tools() -> Vec<Value> {
             "description": "worker レジストリの一覧（spawn 済み worker をペインの生死と無関係に列挙する。tako 再起動で\
                 ペインが消えても tmux_session / session_id 経由で watch / status / report を続けられる）。\
                 各エントリ: worker_id / pane / tmux_session / session_id / pane_alive / tmux_alive / \
-                prompt_delivery（delivered = 到達 / pending = 確認中 / undelivered = 未達の疑い / \
-                unverified = 送ったかもしれない。自動再送はしない）/ prompt_delivery_failure\
+                prompt_delivery（delivered = 到達を確認 / pending = 確認中 / undelivered = 未達の疑い / \
+                unverified = 送ったかもしれない・起動したが到達未確認。自動再送はしない）/ prompt_delivery_failure\
                 （choice_dialog = 初回のテーマ・ログイン方法選択で送れなかった / paste_not_reflected / \
-                residual_after_retries / flow_timeout / peer_send_stalled / peer_unconfirmed。peer_* は \
-                unverified）/ resend_command（未達だけ。tako_send_input で送り直すコマンド）/ \
+                residual_after_retries / flow_timeout / pane_too_short = 行数不足で入力欄が無い / \
+                agent_exited / peer_send_stalled / peer_unconfirmed。peer_* は unverified）/ \
+                launch（failed / started / pending）+ launch_failure（agent_exited = 起動直後に終了。\
+                launch_exit_code / command_flow_timeout）/ resend_command（未達だけ・起動失敗は除く）/ \
                 resume_command（claude worker の突然死からの復旧コマンド）。既定は active のみ、\
                 all=true で closed も含める。ペインも tmux も 5 分以上観測できない active は closed\
                 （close_reason = gone）へ倒す（resume_command / report は closed でも引ける）。",
