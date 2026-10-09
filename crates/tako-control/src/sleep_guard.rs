@@ -1,7 +1,10 @@
 //! スリープ防止機能（Issue #173 + #218 蓋閉じ対応 + #311 ディスプレイ消灯）
 //!
 //! IOKit の電源アサーション（PreventUserIdleSystemSleep）で macOS のアイドルスリープを防止する。
-//! ディスプレイスリープは妨げない。App Nap 無効化も行い、バックグラウンドで間引かれない。
+//! ディスプレイスリープは妨げない。アサーションは tako 自身のプロセスで握るので、握っている間は
+//! OS が tako を App Nap の対象から外す（#1926 で実測。前面に無くても優先度 28 のまま）。
+//! アプリ全体の App Nap は止めない（理由と、利用者が待つ処理だけ止める口は tako-app の
+//! `platform::user_work`）。
 //!
 //! 蓋閉じ（lid-close）対応（#218）:
 //! - 蓋の開閉を IORegistry AppleClamshellState で検知（root 不要）
@@ -843,24 +846,6 @@ mod iokit {
                 _ => super::ThermalState::Nominal,
             }
         }
-    }
-
-    /// App Nap を無効化する（NSProcessInfo.beginActivityWithOptions 経由）。
-    /// tako 本体のプロセスで一度だけ呼べばよい
-    pub fn disable_app_nap() {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let _ = std::process::Command::new("defaults")
-                .args([
-                    "write",
-                    &format!("/proc/{}/Info", std::process::id()),
-                    "NSAppSleepDisabled",
-                    "-bool",
-                    "YES",
-                ])
-                .output();
-        });
     }
 
     /// ディスプレイだけをスリープさせる（#311）。
@@ -1732,12 +1717,6 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
         }
         .with_decision()
     }
-}
-
-/// App Nap を無効化する（macOS のみ）
-pub fn disable_app_nap() {
-    #[cfg(target_os = "macos")]
-    iokit::disable_app_nap();
 }
 
 /// プロセスの QoS を確認する（macOS のみ、診断用）

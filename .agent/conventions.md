@@ -1578,7 +1578,12 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     （命令数が同じなら中身ではなく走る場所の差）。#1916 は入力の違い（3.6 倍）と App Nap
     （2.2〜2.8 倍）が重なって「4〜8 倍」に見えていた
   - 利用者が待っている重い background 処理は `platform::user_work::UserWork` を握って回す
-    （構文の塗りは握っている。実経路の A/B は `bash scripts/test-highlight-app-nap-1916.sh`）
+    （構文の塗りは `begin`、プレビューの読み込み = PDF のラスタライズ・Markdown は `begin_load`。
+    実経路の A/B は `bash scripts/test-highlight-app-nap-1916.sh` / `test-preview-load-app-nap-1926.sh`）。
+    **アプリの寿命の間は握らない**（#1926。誰も待っていない裏の処理まで P コアへ載り電力が 2〜5 倍。
+    `forget` / static / フィールドに持つ形は番犬 `issue1926_app_nap_watchdog` が落とす）
+  - **スリープ防止（#173）のアサーションを握っている間は間引かれない**（#1926 で実測。隔離 GUI でも
+    `tako sleep-guard set --mode on` で優先度 28 のまま）。性能を比べる腕ではスリープ防止の状態を揃える
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 

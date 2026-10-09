@@ -774,7 +774,11 @@ impl TakoApp {
             let key = request.key;
             let result = cx
                 .background_executor()
-                .spawn(async move { preview::rasterize_pdf(&path, key) })
+                .spawn(async move {
+                    // #1926: ズームした人が描き直しを待っている（初回の読み込みと同じ理由）
+                    let _work = crate::platform::user_work::UserWork::begin_load();
+                    preview::rasterize_pdf(&path, key)
+                })
                 .await;
 
             let retry = this

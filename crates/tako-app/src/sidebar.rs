@@ -3481,6 +3481,9 @@ impl TakoApp {
         cx.spawn(async move |this, cx| {
             let p = path.clone();
             let task = cx.background_executor().spawn(async move {
+                // #1926: 開いた人が待っている読み込みの間は App Nap に間引かせない
+                // （117 ページの PDF は間引かれたままだと 7.2〜8.0 秒、握ると 3.0 秒）
+                let _work = UserWork::begin_load();
                 match mode {
                     preview::PreviewMode::Pdf => preview::load_pdf_with_key(&p, pdf_raster_key),
                     preview::PreviewMode::Markdown => {
@@ -3530,6 +3533,8 @@ impl TakoApp {
             let state = cx
                 .background_executor()
                 .spawn(async move {
+                    // #1926: 編集を抜けた人が描き直しを待っている
+                    let _work = UserWork::begin_load();
                     let _span = tako_control::diag::perf_span("preview_md_resume");
                     preview::markdown_from_text(&path, &text)
                 })

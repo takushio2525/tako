@@ -910,8 +910,8 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-control/src/sleep_guard.rs",
-            6,
-            "macOS 限定（pmset / osascript / defaults）",
+            5,
+            "macOS 限定（pmset / osascript / sudo / ps。#1926 で defaults を消した）",
         ),
         (
             "crates/tako-control/src/test_write_isolation.rs",

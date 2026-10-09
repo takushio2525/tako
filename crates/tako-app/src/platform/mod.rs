@@ -8,5 +8,5 @@
 //! 呼び出し側（`preview` / `preview_render` / UI）は単一のコードパスを持つ。
 
 pub mod pdf;
-/// 利用者が待っている重い background 処理を App Nap に間引かせない（#1916）
+/// 利用者が待っている重い background 処理を App Nap に間引かせない（#1916 / #1926）
 pub mod user_work;

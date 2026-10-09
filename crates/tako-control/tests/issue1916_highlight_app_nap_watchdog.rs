@@ -196,11 +196,20 @@ fn user_workはactivityを始めて最後の1つで終える() {
     );
     // 始める / 終える番は数で決める（重なった処理で依頼を二重に始めない・先に終えない）
     let (begin_at, begin) = body(&view, USER_WORK, "begin");
-    for needle in ["legacy()", "holders.acquire()", "sys::begin()"] {
+    for needle in ["legacy()", "Self::hold()"] {
         assert!(
             begin.contains(needle),
             "{USER_WORK}:{} `UserWork::begin` が `{needle}` を通っていない（#1916）",
             line_at(&view, begin_at)
+        );
+    }
+    // 握る本体は `begin`（塗り）と `begin_load`（読み込み。#1926）の 1 実装
+    let (hold_at, hold) = body(&view, USER_WORK, "hold");
+    for needle in ["holders.acquire()", "sys::begin()"] {
+        assert!(
+            hold.contains(needle),
+            "{USER_WORK}:{} `UserWork::hold` が `{needle}` を通っていない（#1916）",
+            line_at(&view, hold_at)
         );
     }
     let (drop_at, drop) = body(&view, USER_WORK, "drop");

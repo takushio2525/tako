@@ -4605,8 +4605,8 @@ impl TakoApp {
         // #1502: 外側のターミナル向けに張った symlink も同じ理由で追従させる。
         // **切れているときだけ**張り直す（一度も設置していない人の $HOME は触らない）
         repair_tako_cli_link();
-        // App Nap 無効化 + 初回スリープ防止更新（Issue #173）
-        tako_control::sleep_guard::disable_app_nap();
+        // App Nap はアプリ全体では止めない（#1926。利用者が待つ処理だけ `platform::user_work` で
+        // 止める。エージェント稼働中はスリープ防止のアサーションが OS の App Nap を外す）
         // 蓋閉じ防止の残留チェック（#218: 前回クラッシュ時の disablesleep=1 を自動復帰）
         // セカンダリモードはプライマリの状態を壊すためスキップ（#449。
         // TAKO_ISOLATED / other_tako_running のガードは関数内で実施）
