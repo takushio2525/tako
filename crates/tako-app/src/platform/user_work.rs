@@ -12,9 +12,6 @@
 //! ように見えていた。利用者でも、別のアプリを前面にしている間に AI が `tako open` で
 //! 大きいファイルを開くと同じことが起きる。
 //!
-//! なお起動時の `sleep_guard::disable_app_nap`（#173）は `defaults write /proc/<pid>/Info …`
-//! で、macOS には `/proc` が無いので一度も効いていない（`Could not write domain`）。
-//!
 //! ## 何をするか
 //!
 //! [`UserWork::begin`] で握ってから落とすまで、`NSProcessInfo` の
@@ -23,7 +20,24 @@
 //! 重なった処理は数で束ね、OS への依頼は常に 1 本だけ（最初の 1 つで始め、最後の 1 つで終える）。
 //! macOS 以外は何もしない（Windows の電力スロットリングは未実測）。
 //!
-//! `TAKO_1916_LEGACY=1` で握らない旧挙動へ戻す（A/B の腕。`scripts/test-highlight-app-nap-1916.sh`）
+//! 握るのは構文の塗り（[`UserWork::begin`]。#1916）とプレビューの読み込み
+//! （[`UserWork::begin_load`]。PDF のラスタライズ・Markdown の組み立て。#1926）。
+//! 117 ページの PDF は間引かれたままだと 7.2〜8.0 秒（E コア）、握ると 3.0 秒（P コア）。
+//!
+//! ## アプリ全体では止めない（#1926）
+//!
+//! 起動時の `sleep_guard::disable_app_nap`（#173）は `defaults write /proc/<pid>/Info …` で、
+//! macOS には `/proc` が無いので一度も効いていなかった。直して寿命の間止めるのではなく消した。
+//! 実測（release・隔離 GUI）で、止めて得をするのは利用者が待つ重い処理だけ（上の 2 つで足りる）で、
+//! アイドル時は 341〜365 → 856〜1,154 µW、誰も待っていない裏の処理（ペインへ流れる
+//! 30 万行の出力）は P コアへ載る分だけ 110〜319 → 550〜575 mJ の電力になる。ペインの子プロセス
+//! （エージェント本体）は tako が間引かれても優先度 31 のままで、影響を受けない。
+//! エージェント稼働中は #173 のスリープ防止が tako 自身のプロセスで電源アサーション
+//! （PreventUserIdleSystemSleep）を握り、握っている間は OS が App Nap の対象から外す
+//! （実測: 優先度 28 のまま）。
+//!
+//! A/B の腕: `TAKO_1916_LEGACY=1` で塗りの間も握らない（`scripts/test-highlight-app-nap-1916.sh`）、
+//! `TAKO_1926_LEGACY=1` で読み込みの間も握らない（`scripts/test-preview-load-app-nap-1926.sh`）
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -35,11 +49,24 @@ pub struct UserWork {
 }
 
 impl UserWork {
-    /// 握る。重い処理の closure の先頭で `let _work = UserWork::begin();` とする
+    /// 構文の塗りの間握る（#1916）。重い処理の closure の先頭で `let _work = UserWork::begin();` とする
     pub fn begin() -> Self {
         if legacy() {
             return Self { counted: false };
         }
+        Self::hold()
+    }
+
+    /// プレビューの読み込み（PDF のラスタライズ・Markdown の組み立て）の間握る（#1926）。
+    /// 使い方は [`UserWork::begin`] と同じで、A/B の腕だけが別
+    pub fn begin_load() -> Self {
+        if legacy_1926() {
+            return Self { counted: false };
+        }
+        Self::hold()
+    }
+
+    fn hold() -> Self {
         let mut state = state();
         if state.holders.acquire() {
             state.token = sys::begin();
@@ -62,10 +89,16 @@ impl Drop for UserWork {
     }
 }
 
-/// 握らない旧挙動へ戻す A/B の腕（`TAKO_1916_LEGACY=1`）
+/// 塗りの間も握らない旧挙動へ戻す A/B の腕（`TAKO_1916_LEGACY=1`）
 fn legacy() -> bool {
     static LEGACY: OnceLock<bool> = OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1916_LEGACY").is_some_and(|v| v == "1"))
+}
+
+/// 読み込みの間も握らない旧挙動へ戻す A/B の腕（`TAKO_1926_LEGACY=1`）
+fn legacy_1926() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1926_LEGACY").is_some_and(|v| v == "1"))
 }
 
 /// いま握っている数を数える（純粋な部分。OS への依頼の始め / 終わりを決める）
@@ -247,7 +280,7 @@ mod tests {
         sys::end(token);
         // 握って落とす口も通す（他のテストと並走しても数は 0 へ戻る形だけを見る）
         let first = UserWork::begin();
-        let second = UserWork::begin();
+        let second = UserWork::begin_load();
         drop(first);
         drop(second);
     }

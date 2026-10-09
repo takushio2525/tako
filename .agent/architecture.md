@@ -2289,7 +2289,7 @@ A/B は `bash scripts/test-highlight-wait-1890.sh`（遅れの注入 `TAKO_1890_
   「回を追うごとに伸びる」は時間が経って間引かれたから。利用者でも、別のアプリを前面にしている
   間に AI が `tako open` で大きいファイルを開くと同じことが起きる。起動時の
   `sleep_guard::disable_app_nap`（#173）は `defaults write /proc/<pid>/Info …` で、macOS には
-  `/proc` が無いので一度も効いていない（`Could not write domain`）
+  `/proc` が無いので一度も効いていなかった（`Could not write domain`。#1926 で消した = 次節）
 
 塗りの background の closure（`spawn_highlight` / `spawn_editor_seed`）は塗る前に
 `platform::user_work::UserWork` を握る。握っている間は `NSProcessInfo
@@ -2306,6 +2306,46 @@ beginActivityWithOptions:reason:`（`NSActivityUserInitiatedAllowingIdleSystemSl
 `issue1916_highlight_app_nap_watchdog`（closure が握るか・activity の始め方と終え方・A/B の腕）と
 `platform::user_work` の単体、実経路の A/B は `bash scripts/test-highlight-app-nap-1916.sh`
 （間引かれたのを状態で待ってから塗り、P コアで走った比率で判定。旧挙動は `TAKO_1916_LEGACY=1`）。
+
+### App Nap はアプリ全体では止めない（#1926。2026-10-09）
+
+#173 の `disable_app_nap` は一度も効いていなかったので、「直してアプリの寿命の間止める」か
+「消して利用者が待つ処理だけ止める」かを測ってから選び、**後者**にした。実測は release・
+隔離 GUI（tako-vd・前面に出ない）・Apple M5 Max。修正前 / 修正後 / 寿命の間止める試作を交互に
+2 周ずつ測った（スワップ 6.1 GB 使用中・空きメモリ 63〜67%・ロードアベレージ 2.3〜8.4 = 他の
+worker が並走。電力は `powermetrics` が sudo のパスワードを要するので、カーネルのプロセス別
+エネルギー `proc_pid_rusage` v6 の `ri_energy_nj` と `top` の POWER で読んだ）。
+
+| | 修正前（間引かれる） | 修正後 | 寿命の間止める（不採用） |
+|---|---|---|---|
+| アイドル 120 秒の電力 | 365.0 / 340.8 µW | 363.5 / 359.8 µW | 855.6 / 1,153.5 µW |
+| ペインへ 30 万行の出力（誰も待っていない裏の処理）の電力 | 238 / 319 mJ | 110 / 163 mJ | 575 / 550 mJ |
+| 同・画面へ反映されるまで | 1,530 / 437 ms | 445 / 655 ms | 440 / 438 ms |
+| IPC 往復の中央値（`tako sleep-guard status` × 40） | 7.6 / 14.3 ms | 7.0 / 7.3 ms | 6.9 / 7.1 ms |
+| PDF 117 ページを開く（ラスタライズ） | 7,217〜7,952 ms（E コア 100%） | 3,029〜3,084 ms（P コア 98〜99%） | 3,037〜3,167 ms |
+| 同・ズーム 200% の描き直し（120 ページ・実経路テスト） | 49,891 ms | 20,829 ms | — |
+| Markdown を開く（2 MB 前後で打ち切り） | 111〜125 ms | 111〜117 ms | 112〜116 ms |
+
+- **止めて得をするのは利用者が待つ重い処理だけ**で、そこは `UserWork` で足りる。寿命の間止めると
+  アイドルで 2.4〜3.2 倍、誰も待っていない裏の処理で 2〜5 倍の電力になる（P コアへ載るため。
+  同じ PDF でも E コア 4.2〜4.8 J ↔ P コア 8.9 J）。IPC の往復は間引かれても遅くならない
+- **ペインの子プロセス（エージェント本体）は tako が間引かれても優先度 31 のまま**で影響を受けない
+- **エージェント稼働中は #173 のスリープ防止が App Nap を外している**: アサーション
+  （PreventUserIdleSystemSleep）は tako 自身のプロセスで握る（`platform::power::set_hold`）ので、
+  握っている間は OS が App Nap の対象から外す（隔離 GUI で `tako sleep-guard set --mode on` すると
+  優先度 4 → 28 に戻り 45 秒たっても落ちない・外すとまた 4）。本番で効かない `disable_app_nap` が
+  表に出なかったのはこのため。間引かれるのはエージェントが止まっている間と、スリープ防止の
+  電源条件（既定 `ac-only`）を満たさないバッテリー駆動中
+
+形: `sleep_guard::disable_app_nap` と起動時の呼び出しを消した。プレビューの読み込みの background
+（`spawn_preview_load` = PDF / Markdown / その他を開く・表示の切替・退避からの復帰、`spawn_md_resume`
+= 編集を抜けた描き直し、`ensure_pdf_raster_quality` = ズーム・幅の変化での描き直し）は処理の前に
+`UserWork::begin_load()` を握る（塗りの `begin` と同じ 1 実装 `hold` を通り、A/B の腕だけが別 =
+`TAKO_1926_LEGACY=1`）。回帰検出は番犬 `issue1926_app_nap_watchdog`（効かない止め方 =
+`disable_app_nap` / `NSAppSleepDisabled` が戻る・読み込みが握らない・`forget` / static / フィールドで
+寿命の間握る・A/B の腕と実経路の判定のずれ）、実経路の A/B は
+`bash scripts/test-preview-load-app-nap-1926.sh`（① 開く × 2 と ② ズームを P コアの比率で判定・
+③ 戻ったらまた間引かれる・④ Markdown・⑤ スリープ防止のアサーションの前提）。
 
 ## 編集カーソルの追従スクロール（#1649。2026-09-23）
 
