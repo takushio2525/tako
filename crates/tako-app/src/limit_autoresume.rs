@@ -121,15 +121,25 @@ impl TakoApp {
     /// 自動復帰の駆動（2 秒 tick から呼ぶ）。
     /// 戻り値はバックグラウンドで実行すべきダイアログ応答ジョブ
     pub(crate) fn drive_limit_autoresume(&mut self) -> Vec<LimitResumeJob> {
-        // 有効なペインの収集。既定 OFF なので通常運転ではここで終わる（NFR-8）
-        let targets: Vec<PaneId> = self
-            .workspace
-            .tabs()
-            .iter()
-            .flat_map(|tab| tab.tree().panes())
-            .filter(|p| p.limit_autoresume())
-            .map(|p| p.id())
-            .collect();
+        // 有効なペインの収集。既定 OFF なので通常運転ではここで終わる（NFR-8）。
+        // #1945: 退避中のペインも対象（一括で ON にした退避中の master が上限で止まったら
+        // 戻す。端末を持たない退避中 = 再起動後まだ表へ出していないペインは下で飛ばす）
+        let targets: Vec<PaneId> = if tako_core::limit_resume_all::legacy() {
+            self.workspace
+                .tabs()
+                .iter()
+                .flat_map(|tab| tab.tree().panes())
+                .filter(|p| p.limit_autoresume())
+                .map(|p| p.id())
+                .collect()
+        } else {
+            self.workspace
+                .all_panes()
+                .into_iter()
+                .filter(|p| p.limit_autoresume())
+                .map(|p| p.id())
+                .collect()
+        };
         if targets.is_empty() {
             if !self.limit_resume.is_empty() {
                 self.limit_resume.clear();
@@ -272,6 +282,120 @@ impl TakoApp {
             }
         }
         jobs
+    }
+
+    /// ペインで手起動のエージェント CLI が動いていると検出済みか（#1945）。
+    /// 材料は会話の検出（claude = `claude agents --json` / codex・agy = プロセス表。
+    /// #1076 / #1238 の保持規則つき）で、ここは引くだけ = 新しい走査を増やさない
+    pub(crate) fn limit_resume_agent_detected(&self, pane: PaneId) -> bool {
+        self.claude_resume_sessions.get(pane).is_some()
+            || self.agent_resume_sessions.get(pane).is_some()
+    }
+
+    /// 検出済みのペインの集合（`limit_resume_all` の判断へ渡す。workspace を可変で
+    /// 借りる前に作っておく）
+    fn limit_resume_detected(&self) -> std::collections::HashSet<PaneId> {
+        self.workspace
+            .all_panes()
+            .into_iter()
+            .map(|p| p.id())
+            .filter(|id| self.limit_resume_agent_detected(*id))
+            .collect()
+    }
+
+    /// 全体の既定（#1945）を書き換えて settings.json へ残す。一括ボタン・CLI・MCP の
+    /// どれも dispatch（`limit_resume_bulk`）からここへ来る
+    pub(crate) fn set_limit_resume_all(&mut self, enabled: bool) {
+        self.limit_resume_all = enabled;
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.limit_resume_all = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                // 次の起動で既定が戻ってしまうので黙らない（GUI の stderr は誰も読めない = #1399）
+                self.notify_ui_op_failed(
+                    crate::sidebar::NoticeArea::StatusBar,
+                    crate::sidebar::NoticeArm::Issue1945,
+                    crate::ui_text::pane_menu::limit_resume_all_save(),
+                    None,
+                    &e.to_string(),
+                );
+            }
+        }
+    }
+
+    /// ステータスバーの一括ボタンの集計を数え直す。変わったら true（呼び出し側が再描画する）。
+    ///
+    /// 呼ぶのは 2 秒 tick と切り替えの直後だけ（**描画のたびには数えない**）
+    pub(crate) fn refresh_limit_resume_summary(&mut self) -> bool {
+        let detected = self.limit_resume_detected();
+        let next =
+            tako_core::limit_resume_all::summarize(&self.workspace, self.limit_resume_all, |id| {
+                detected.contains(&id)
+            });
+        if next == self.limit_resume_summary {
+            return false;
+        }
+        self.limit_resume_summary = next;
+        true
+    }
+
+    /// 以後にエージェントになったペインへ全体の既定を当てる（#1945）。
+    /// 会話の検出が更新された直後に呼ぶ（手起動の claude / codex はここでしか分からない）。
+    /// 値を変えたら layout.json の保存が要るので true を返す
+    pub(crate) fn adopt_limit_resume_default(&mut self) -> bool {
+        if tako_core::limit_resume_all::legacy() || !self.limit_resume_all {
+            return false;
+        }
+        let detected = self.limit_resume_detected();
+        let adopted = tako_core::limit_resume_all::adopt_default(
+            &mut self.workspace,
+            self.limit_resume_all,
+            |id| detected.contains(&id),
+        );
+        for pane in &adopted {
+            tako_control::diag::persist_log(&format!(
+                "[limit-autoresume] pane={} enabled=true 発生源 all:detected",
+                pane.as_u64()
+            ));
+        }
+        !adopted.is_empty()
+    }
+
+    /// 復元したエージェントのペインを「決定済み」にする（#1945）。
+    /// 保存されていた値は人の選択なので、再起動で全体の既定へ戻さない
+    pub(crate) fn mark_restored_limit_resume_decided(&mut self) {
+        let detected = self.limit_resume_detected();
+        tako_core::limit_resume_all::mark_restored_agents_decided(&mut self.workspace, |id| {
+            detected.contains(&id)
+        });
+    }
+
+    /// ステータスバーの一括ボタン（#1945）。押した向きは集計が決め
+    /// （全部 ON なら OFF、それ以外は ON）、CLI / MCP と同じ dispatch を通る
+    pub(crate) fn toggle_limit_resume_all(&mut self) {
+        self.refresh_limit_resume_summary();
+        let next = self.limit_resume_summary.next_enabled();
+        if let Err(e) = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::LimitResume {
+                pane: None,
+                enabled: Some(next),
+                all: Some(true),
+            },
+            tako_core::PaneOrigin::User,
+        ) {
+            // 押した操作の失敗は通知欄へ（#1399 の「弾いたら黙って捨てない」）
+            self.notify_ui_dispatch_failed(
+                crate::sidebar::NoticeArea::StatusBar,
+                crate::sidebar::NoticeArm::Issue1945,
+                crate::ui_text::pane_menu::limit_resume_all_toggle_op(next),
+                None,
+                &e,
+            );
+        }
+        // 属性は layout.json へ載るので、ここで保存して再起動に備える
+        self.save_layout();
+        self.refresh_limit_resume_summary();
     }
 
     /// バックグラウンドのダイアログ応答が終わったときの後始末（結果の記録）

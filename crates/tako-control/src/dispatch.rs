@@ -2525,19 +2525,44 @@ fn collect_limit_resume_panes(host: &dyn ControlHost) -> Vec<u64> {
 ///
 /// **true のときだけ立てる**: 人が `tako limit-resume on` したペインを、role の
 /// 貼り直しで黙って OFF へ戻さない（#813 のペイン単位オプトインを壊さない）。
-/// 記録も状態が変わったときだけ残す（既定 OFF の起動で persist.log を埋めない）
-fn apply_master_pane_profile_defaults(pane: &mut tako_core::Pane, role: Option<&str>) {
+/// 記録も状態が変わったときだけ残す（既定 OFF の起動で persist.log を埋めない）。
+///
+/// プロファイルが何も言っていなければ**全体の既定**（Issue #1945。`all_default`）を採る。
+/// role を貼った瞬間がエージェントになった瞬間なので、以後に立つ master / solo / worker は
+/// ここで既定を受け取る。人が個別に決めたペインは触らない（`Pane::adopt_limit_resume_default`）
+fn apply_master_pane_profile_defaults(
+    pane: &mut tako_core::Pane,
+    role: Option<&str>,
+    all_default: bool,
+) {
     let Some(role) = role.filter(|r| !r.is_empty()) else {
         return;
     };
-    if pane.limit_autoresume() || !crate::orchestrator::master_pane_limit_resume(role) {
-        return;
+    let legacy = tako_core::limit_resume_all::legacy();
+    match crate::orchestrator::master_pane_limit_resume_setting(role) {
+        Some(true) => {
+            if pane.limit_autoresume() {
+                return;
+            }
+            pane.set_limit_autoresume(true);
+            crate::diag::persist_log(&format!(
+                "[limit-autoresume] pane={} enabled=true 発生源 profile:{role}",
+                pane.id().as_u64()
+            ));
+        }
+        // プロファイルの明示 OFF は全体の ON より強い（ON の人を OFF へは戻さない）
+        Some(false) if !legacy => pane.mark_limit_resume_decided(),
+        Some(false) => {}
+        None if legacy || !tako_core::limit_resume_all::is_agent_role(role) => {}
+        None => {
+            if pane.adopt_limit_resume_default(all_default) {
+                crate::diag::persist_log(&format!(
+                    "[limit-autoresume] pane={} enabled=true 発生源 all:{role}",
+                    pane.id().as_u64()
+                ));
+            }
+        }
     }
-    pane.set_limit_autoresume(true);
-    crate::diag::persist_log(&format!(
-        "[limit-autoresume] pane={} enabled=true 発生源 profile:{role}",
-        pane.id().as_u64()
-    ));
 }
 
 /// OrchestratorWorkers のサブプロセス実行部分（tmux ls + レジストリ読み）。
@@ -3499,6 +3524,7 @@ fn dispatch_inner(
                 ));
             }
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            let all_default = host.limit_resume_default();
             let pane = tree_mut(host.workspace_mut(), tab)
                 .get_mut(target)
                 .expect("resolve_pane で存在確認済み");
@@ -3511,7 +3537,7 @@ fn dispatch_inner(
                 // `tako master` / `tako solo` / リモートからの master 起動（#1078）は
                 // どれも起動コマンドを流す前にここで role を貼るので、
                 // 「起動直後から ON」がこの 1 か所で揃う
-                apply_master_pane_profile_defaults(pane, Some(r.as_str()));
+                apply_master_pane_profile_defaults(pane, Some(r.as_str()), all_default);
             }
             Ok(Value::Null)
         }
@@ -4308,20 +4334,35 @@ fn dispatch_inner(
         }
 
         Request::LimitResume { pane, enabled, all } => {
-            // 一覧（#813。有効なペインがどれかを 1 回で把握する）
+            let legacy = tako_core::limit_resume_all::legacy();
             if all.unwrap_or(false) {
-                if enabled.is_some() {
-                    return Err(DispatchError::InvalidParams(
-                        "all と enabled は併用できない（一覧か設定のどちらか）".into(),
-                    ));
+                match enabled {
+                    // 一括（#1945）: 退避中を含む全エージェントのペインを揃え、
+                    // 以後に立つペインの既定（settings.json）も同じ値にする
+                    Some(val) if !legacy => return Ok(limit_resume_bulk(host, val)),
+                    Some(_) => {
+                        return Err(DispatchError::InvalidParams(
+                            "all と enabled は併用できない（一覧か設定のどちらか）".into(),
+                        ))
+                    }
+                    // 一覧（#813。有効なペインがどれかを 1 回で把握する）
+                    None => return Ok(limit_resume_list(host)),
                 }
-                return Ok(json!({ "panes": limit_resume_panes(host) }));
             }
-            let (tab, target) = resolve_pane(host.workspace(), pane)?;
+            // #1945: 退避中のペインも ID で引く（#1945 前は「ペインが見つからない」で
+            // 断っていたので、表へ出して ON にして戻すしか手が無かった）
+            let target = match pane {
+                Some(raw) if !legacy => host
+                    .workspace()
+                    .pane_anywhere(PaneId::from_raw(raw))
+                    .map(|p| p.id())
+                    .ok_or(DispatchError::PaneNotFound(raw))?,
+                _ => resolve_pane(host.workspace(), pane)?.1,
+            };
             if let Some(val) = enabled {
-                tree_mut(host.workspace_mut(), tab)
-                    .get_mut(target)
-                    .expect("resolve_pane で存在確認済み")
+                host.workspace_mut()
+                    .pane_anywhere_mut(target)
+                    .expect("存在確認済み")
                     .set_limit_autoresume(val);
                 // 有効・無効はペイン属性なので layout.json の保存で永続化される
                 // （保存は UI 層が dispatch 後に回す。CLI / MCP / 右クリックで同じ経路）
@@ -9065,6 +9106,7 @@ fn dispatch_sessions_resume(
         }),
         _ => None,
     };
+    let all_default = host.limit_resume_default();
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)
         .get_mut(new_id)
         .expect("直前に split で追加済み");
@@ -9073,7 +9115,7 @@ fn dispatch_sessions_resume(
     }
     // #1140: 会話を引き継いで立て直した master / solo も本人のペイン
     // （ここを外すと「再起動したら自動復帰だけ落ちていた」になる）
-    apply_master_pane_profile_defaults(pane_obj, role.as_deref());
+    apply_master_pane_profile_defaults(pane_obj, role.as_deref(), all_default);
     pane_obj.set_role(role);
 
     Ok(json!({
@@ -9265,6 +9307,7 @@ fn dispatch_orchestrator_adopt(
     let changed = !legacy && pane_role.as_deref() != Some(new_role.as_str());
     let mut limit_resume = false;
     if !legacy {
+        let all_default = host.limit_resume_default();
         // role ラベルの貼り替え。**ここが adopt の唯一の書き換え**（#1453 の番犬が
         // 「adopt を経由しない master の role 書き換え」が増えていないかを見張る）
         let pane_obj = tree_mut(host.workspace_mut(), tab_id)
@@ -9274,7 +9317,7 @@ fn dispatch_orchestrator_adopt(
         // タブ名 / 表示名の形は `tako master -<名前>` と同じ 1 実装から採る（#761 の語彙）
         pane_obj.set_title(Some(orchestrator::master_launch::tab_title_for(name)));
         // #1140 の 1 実装。採用先のプロファイル既定を本人のペインへ配る
-        apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()));
+        apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()), all_default);
         limit_resume = pane_obj.limit_autoresume();
     }
     if changed {
@@ -12041,6 +12084,7 @@ fn dispatch_orchestrator_handoff(
 
     // タイトルと role 設定
     let window_title = format!("master-{profile_name}");
+    let all_default = host.limit_resume_default();
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)
         .get_mut(new_id)
         .expect("直前に split で追加済み");
@@ -12049,7 +12093,7 @@ fn dispatch_orchestrator_handoff(
     pane_obj.set_role(Some(new_role.clone()));
     // #1140: 後任 master も本人のペイン。**前任の設定ではなくプロファイル既定から
     // 決める**（同プロファイルで立て直すのが引き継ぎの約束 = #1055 の cwd と同じ流儀）
-    apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()));
+    apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()), all_default);
     let limit_resume_applied = pane_obj.limit_autoresume();
 
     let handoff_path = orchestrator::handoff_path(profile_name);
@@ -12757,6 +12801,12 @@ fn dispatch_orchestrator_spawn(
     host.queue_spawn_prompt_flow(new_id, prompt.to_string());
 
     // タイトルと role 設定
+    // #1945: 一括ボタンの全体の既定（spawn 引数・プロファイルが何も言わないときの最後の段）
+    let all_default = if tako_core::limit_resume_all::legacy() {
+        false
+    } else {
+        host.limit_resume_default()
+    };
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)
         .get_mut(new_id)
         .expect("直前に split で追加済み");
@@ -12768,15 +12818,18 @@ fn dispatch_orchestrator_spawn(
     };
     pane_obj.set_role(Some(pane_role));
     // 利用上限後の自動復帰（FR-2.27 / #813）の既定を worker ペインへ適用する（#822）。
-    // 解決順は spawn 引数 → プロファイル → false。ON のときだけ監査行を残す
+    // 解決順は spawn 引数 → プロファイル → 全体の既定（#1945）。ON のときだけ監査行を残す
     // （既定 OFF の spawn で persist.log を埋めない）
-    let limit_resume_applied = orchestrator::resolve_worker_limit_resume(&profile, limit_resume);
+    let limit_resume_applied =
+        orchestrator::resolve_worker_limit_resume_in(&profile, limit_resume, all_default);
     pane_obj.set_limit_autoresume(limit_resume_applied);
     if limit_resume_applied {
         let source = if limit_resume.is_some() {
             "spawn"
-        } else {
+        } else if profile.limit_resume.is_some() {
             "profile"
+        } else {
+            "all"
         };
         crate::diag::persist_log(&format!(
             "[limit-autoresume] pane={} enabled=true 発生源 spawn:{source}",
@@ -15659,35 +15712,88 @@ fn video_response(host: &(impl ControlHost + ?Sized), target: PaneId) -> serde_j
 /// 1 ペインぶんの自動復帰の状態（#813）。
 ///
 /// `enabled` はペイン属性（layout.json 永続化）、`state` は GUI が持つ実行状態。
-/// GUI 以外のホスト（テスト・CLI 単体）では `state` は null になる
+/// GUI 以外のホスト（テスト・CLI 単体）では `state` は null になる。
+/// `agent` は一括（#1945）の対象か、`shelved` は退避中か
 fn limit_resume_entry(host: &dyn ControlHost, target: PaneId) -> Value {
-    let enabled = host
-        .workspace()
-        .tabs()
-        .iter()
-        .flat_map(|t| t.tree().panes())
-        .find(|p| p.id() == target)
-        .map(|p| p.limit_autoresume())
-        .unwrap_or(false);
+    let ws = host.workspace();
+    let pane = ws.pane_anywhere(target);
     json!({
         "pane": target.as_u64(),
-        "enabled": enabled,
+        "enabled": pane.is_some_and(|p| p.limit_autoresume()),
+        "agent": pane.is_some_and(|p| {
+            tako_core::limit_resume_all::is_agent_pane(p, host.agent_detected(target))
+        }),
+        "shelved": ws.background_pane(target).is_some(),
         "state": host.limit_resume_state(target),
     })
 }
 
-/// 全ペインの自動復帰状態（`all` 指定時）
+/// 全ペインの自動復帰状態（`all` 指定時）。表示中のタブ → 退避中の順（#1945 前は
+/// 表示中だけで、退避中の master が一覧に出なかった）
 fn limit_resume_panes(host: &dyn ControlHost) -> Vec<Value> {
-    let targets: Vec<PaneId> = host
-        .workspace()
-        .tabs()
-        .iter()
-        .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
-        .collect();
+    let targets: Vec<PaneId> = if tako_core::limit_resume_all::legacy() {
+        host.workspace()
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id()))
+            .collect()
+    } else {
+        host.workspace()
+            .all_panes()
+            .into_iter()
+            .map(|p| p.id())
+            .collect()
+    };
     targets
         .into_iter()
         .map(|id| limit_resume_entry(host, id))
         .collect()
+}
+
+/// 全エージェントのペインの集計（#1945。ステータスバーのボタンと同じ 1 実装）
+fn limit_resume_summary(host: &dyn ControlHost) -> tako_core::limit_resume_all::BulkSummary {
+    tako_core::limit_resume_all::summarize(host.workspace(), host.limit_resume_default(), |id| {
+        host.agent_detected(id)
+    })
+}
+
+/// `tako limit-resume --all` の応答（#813 の `panes` + #1945 の既定と集計）
+fn limit_resume_list(host: &dyn ControlHost) -> Value {
+    let mut v = json!({ "panes": limit_resume_panes(host) });
+    if !tako_core::limit_resume_all::legacy() {
+        v["default"] = json!(host.limit_resume_default());
+        v["summary"] = limit_resume_summary(host).to_json();
+    }
+    v
+}
+
+/// 一括の ON / OFF（#1945）。ステータスバーのボタン・`tako limit-resume on|off --all`・
+/// MCP `tako_limit_resume`（`all` + `enabled`）の 3 経路がここを通る。
+///
+/// 退避中を含む全エージェントのペインを揃え、以後に立つペインの既定も同じ値にする。
+/// 応答の `changed` は値が変わったペイン（揃っていたペインは載らない）
+fn limit_resume_bulk(host: &mut dyn ControlHost, enabled: bool) -> Value {
+    host.set_limit_resume_default(enabled);
+    let detected: std::collections::HashSet<PaneId> = host
+        .workspace()
+        .all_panes()
+        .into_iter()
+        .map(|p| p.id())
+        .filter(|id| host.agent_detected(*id))
+        .collect();
+    let changed = tako_core::limit_resume_all::apply_bulk(host.workspace_mut(), enabled, |id| {
+        detected.contains(&id)
+    });
+    let changed: Vec<u64> = changed.iter().map(|id| id.as_u64()).collect();
+    // 有効・無効はペイン属性なので layout.json の保存で永続化される（保存は UI 層が
+    // dispatch 後に回す）。既定は host が settings.json へ書く
+    crate::diag::persist_log(&format!(
+        "[limit-autoresume] all enabled={enabled} changed={changed:?} 発生源 bulk"
+    ));
+    let mut v = limit_resume_list(host);
+    v["enabled"] = json!(enabled);
+    v["changed"] = json!(changed);
+    v
 }
 
 /// リモート閲覧のショートカット（#1451）。CLI / MCP / dispatch の 1 実装。
@@ -19119,6 +19225,10 @@ mod tests {
         lang_resolved: Option<tako_core::i18n::Lang>,
         /// #321: 利用制限表示サービス
         limit_service: tako_core::LimitService,
+        /// #1945: 自動復帰の全体の既定（GUI の `TakoApp::limit_resume_all` の代役）
+        limit_resume_all: bool,
+        /// #1945: 手起動のエージェントを検出済みのペイン（GUI の会話検出の代役）
+        agents_detected: std::collections::HashSet<u64>,
         preview_reload: tako_core::PreviewReloadState,
         preview_cache: tako_core::PreviewCacheStats,
         /// #818: スクロールバック上限（適用先のペインは `scrollback_applied` が数える）
@@ -19247,6 +19357,8 @@ mod tests {
                 lang_setting: tako_core::i18n::LangSetting::System,
                 lang_resolved: None,
                 limit_service: tako_core::LimitService::Claude,
+                limit_resume_all: false,
+                agents_detected: std::collections::HashSet::new(),
                 preview_reload: tako_core::PreviewReloadState::default(),
                 preview_cache: tako_core::PreviewCacheStats {
                     max_bytes: 512 * 1024 * 1024,
@@ -19446,6 +19558,18 @@ mod tests {
     }
 
     impl UiStateHost for MockHost {
+        fn limit_resume_default(&self) -> bool {
+            self.limit_resume_all
+        }
+
+        fn set_limit_resume_default(&mut self, enabled: bool) {
+            self.limit_resume_all = enabled;
+        }
+
+        fn agent_detected(&self, pane: PaneId) -> bool {
+            self.agents_detected.contains(&pane.as_u64())
+        }
+
         /// #1479: 右パネルの状態（`expand` が開くことを実測するために持つ）
         fn panel_state(&self) -> (bool, f32, crate::protocol::PanelViewWire) {
             self.panel
@@ -20941,20 +21065,8 @@ mod tests {
         .unwrap();
         assert_eq!(off["enabled"], false);
 
-        // all と enabled の併用は拒否（設定と一覧の取り違えを構造的に防ぐ）
-        let bad = dispatch(
-            &mut host,
-            Request::LimitResume {
-                pane: None,
-                enabled: Some(true),
-                all: Some(true),
-            },
-            PaneOrigin::Cli,
-        );
-        assert!(
-            matches!(bad, Err(DispatchError::InvalidParams(_))),
-            "{bad:?}"
-        );
+        // all と enabled の併用は #1945 から一括の ON / OFF（拒否しない）。
+        // 中身は `issue1945_*` が見る
 
         // 存在しないペインはエラー
         let missing = dispatch(
@@ -20967,6 +21079,250 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(matches!(missing, Err(DispatchError::PaneNotFound(9999))));
+    }
+
+    /// #1945 の作業場: 表示中に master / シェル / 手起動の claude（検出のみ）、
+    /// 退避中に worker。返り値は (master, shell, manual, worker)
+    fn issue1945_host() -> (MockHost, u64, u64, u64, u64) {
+        let mut host = MockHost::new();
+        let master = host.root_pane();
+        let shell = split(&mut host, master);
+        let manual = split(&mut host, master);
+        let worker = split(&mut host, master);
+        for (pane, role) in [
+            (master, "orchestrator-master"),
+            (worker, "orchestrator-worker:x"),
+        ] {
+            host.ws
+                .pane_anywhere_mut(PaneId::from_raw(pane))
+                .unwrap()
+                .set_role(Some(role.into()));
+        }
+        host.agents_detected.insert(manual);
+        host.ws.shelve_pane(PaneId::from_raw(worker)).unwrap();
+        (host, master, shell, manual, worker)
+    }
+
+    fn issue1945_bulk(host: &mut MockHost, enabled: Option<bool>) -> Value {
+        dispatch(
+            host,
+            Request::LimitResume {
+                pane: None,
+                enabled,
+                all: Some(true),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()
+    }
+
+    fn issue1945_enabled(host: &mut MockHost, pane: u64) -> bool {
+        dispatch(
+            host,
+            Request::LimitResume {
+                pane: Some(pane),
+                enabled: None,
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap()["enabled"]
+            == json!(true)
+    }
+
+    /// #1945: `all` + `enabled` = 一括。退避中を含む全エージェントのペインが揃い、
+    /// シェルは触らず、全体の既定も同じ値になる。一覧に退避中が載り、集計が追従する。
+    ///
+    /// **`TAKO_1945_LEGACY=1` の A/B ではこのテストが落ちる**（一括が併用エラーになる）
+    #[test]
+    fn issue1945_一括は退避中を含む全エージェントを揃え既定も書く() {
+        let (mut host, master, shell, manual, worker) = issue1945_host();
+        // 前: 全部 OFF・既定 OFF・退避中の worker も一覧に載る
+        let before = issue1945_bulk(&mut host, None);
+        assert_eq!(before["summary"]["state"], "all_off", "{before}");
+        assert_eq!(before["summary"]["total"], 3, "{before}");
+        assert_eq!(before["default"], false);
+        let entry = |v: &Value, pane: u64| {
+            v["panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["pane"] == pane)
+                .cloned()
+                .unwrap_or_else(|| panic!("ペイン {pane} が一覧に無い: {v}"))
+        };
+        assert_eq!(entry(&before, worker)["shelved"], true);
+        assert_eq!(entry(&before, shell)["agent"], false);
+        assert_eq!(entry(&before, manual)["agent"], true);
+
+        let on = issue1945_bulk(&mut host, Some(true));
+        assert_eq!(on["enabled"], true);
+        assert_eq!(on["changed"], json!([master, manual, worker]), "{on}");
+        assert_eq!(on["summary"]["state"], "all_on", "{on}");
+        assert_eq!(on["default"], true);
+        assert!(host.limit_resume_all, "全体の既定が書かれていない");
+        assert!(
+            issue1945_enabled(&mut host, worker),
+            "退避中の worker が漏れた"
+        );
+        assert!(!issue1945_enabled(&mut host, shell), "シェルまで ON にした");
+        // 2 回目は何も変わらない（冪等）
+        assert_eq!(issue1945_bulk(&mut host, Some(true))["changed"], json!([]));
+
+        // 1 本だけ個別に切る = 一部
+        dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(manual),
+                enabled: Some(false),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let partial = issue1945_bulk(&mut host, None);
+        assert_eq!(partial["summary"]["state"], "partial", "{partial}");
+        assert_eq!(partial["summary"]["on"], 2);
+
+        let off = issue1945_bulk(&mut host, Some(false));
+        assert_eq!(off["changed"], json!([master, worker]), "{off}");
+        assert_eq!(off["summary"]["state"], "all_off");
+        assert!(!host.limit_resume_all);
+    }
+
+    /// #1945: 退避中のペインも `--pane N` で読み書きできる（#1945 前は PaneNotFound）
+    #[test]
+    fn issue1945_退避中のペインもpane指定で切り替えられる() {
+        let (mut host, _, _, _, worker) = issue1945_host();
+        let on = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(worker),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("退避中のペインを指定できない");
+        assert_eq!(on["enabled"], true);
+        assert_eq!(on["shelved"], true);
+        assert!(host
+            .ws
+            .pane_anywhere(PaneId::from_raw(worker))
+            .unwrap()
+            .limit_autoresume());
+        // 存在しないペインは従来どおりエラー
+        let missing = dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(9999),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(matches!(missing, Err(DispatchError::PaneNotFound(9999))));
+    }
+
+    /// #1945（master の実測 2026-10-09）: 表で ON にした worker を退避すると
+    /// `worker_status` の `limit_resume.enabled` が false と答えていた。値は退避で消えて
+    /// おらず（ペインごと退避側へ移る）、**読み出しが表示中のタブしか探さなかった**。
+    /// 退避中・表へ戻した後のどちらでも ON と読めることを固定する
+    #[test]
+    fn issue1945_表でonにしたペインを退避してもworker_statusはonと読む() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let worker = split(&mut host, root);
+        dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(worker),
+                enabled: Some(true),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let worker_id = PaneId::from_raw(worker);
+        host.ws.shelve_pane(worker_id).unwrap();
+        // 値そのものは退避で消えていない
+        assert!(host.ws.pane_anywhere(worker_id).unwrap().limit_autoresume());
+        let ctx = collect_worker_status_ctx(&host, worker);
+        assert!(ctx.pane_exists);
+        assert_eq!(
+            ctx.limit_resume["enabled"], true,
+            "退避中の worker の自動復帰を false と読んだ: {}",
+            ctx.limit_resume
+        );
+        assert_eq!(ctx.limit_resume["shelved"], true);
+        // 表へ戻しても ON のまま
+        host.ws
+            .unshelve_pane(worker_id, PaneId::from_raw(root), SplitDirection::Right)
+            .unwrap();
+        let ctx = collect_worker_status_ctx(&host, worker);
+        assert_eq!(ctx.limit_resume["enabled"], true, "{}", ctx.limit_resume);
+        assert_eq!(ctx.limit_resume["shelved"], false);
+    }
+
+    /// #1945: 全体の既定は以後に role を貼ったペイン（master / solo / worker）へ当たり、
+    /// 人が先に決めたペインと、エージェントでない role は触らない
+    #[test]
+    fn issue1945_以後にroleを貼ったペインは全体の既定で始まる() {
+        let (mut host, master, ..) = issue1945_host();
+        issue1945_bulk(&mut host, Some(true));
+        let solo = split(&mut host, master);
+        let dev = split(&mut host, master);
+        let decided = split(&mut host, master);
+        // 人が先に OFF と決めたペイン
+        dispatch(
+            &mut host,
+            Request::LimitResume {
+                pane: Some(decided),
+                enabled: Some(false),
+                all: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        for (pane, role) in [(solo, "solo"), (dev, "dev-server"), (decided, "master")] {
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(pane),
+                    title: None,
+                    role: Some(role.into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+        }
+        assert!(
+            issue1945_enabled(&mut host, solo),
+            "新しい solo が既定で始まらない"
+        );
+        assert!(
+            !issue1945_enabled(&mut host, dev),
+            "エージェントでない role まで ON"
+        );
+        assert!(
+            !issue1945_enabled(&mut host, decided),
+            "人の OFF を既定で上書きした"
+        );
+
+        // 全体の既定が OFF なら、新しいペインは OFF のまま（#813 の既定）
+        issue1945_bulk(&mut host, Some(false));
+        let later = split(&mut host, master);
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(later),
+                title: None,
+                role: Some("solo".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert!(!issue1945_enabled(&mut host, later));
     }
 
     /// #1140: role を貼った瞬間にプロファイル既定が master / solo **本人**へ配られる。
@@ -30986,6 +31342,71 @@ mod tests {
             assert_eq!(spawn(Some(true)), (true, true));
 
             // 後始末（プロファイルファイルを残さない）
+            let _ = dispatch_orchestrator_profiles(ProfilesParams {
+                action: "delete".into(),
+                name: Some(profile.into()),
+                ..Default::default()
+            });
+        });
+    }
+
+    /// #1945: spawn の解決順は spawn 引数 → プロファイル → **全体の既定**。
+    /// プロファイルの明示 OFF は全体の ON より強い
+    #[test]
+    fn issue1945_spawnは全体の既定を最後の段に採る() {
+        let profile = "_tako_1945_";
+        let set = |limit_resume: Option<bool>, clear: bool| {
+            dispatch_orchestrator_profiles(ProfilesParams {
+                action: "set".into(),
+                name: Some(profile.into()),
+                limit_resume,
+                clear_limit_resume: clear,
+                ..Default::default()
+            })
+            .expect("set は成功する")
+        };
+        let spawn = |all_default: bool, override_value: Option<bool>| -> bool {
+            let mut host = MockHost::new();
+            host.limit_resume_all = all_default;
+            let master = host.root_pane();
+            let params = SpawnParams {
+                project: TEST_PROJECT,
+                prompt: "limit resume all test",
+                label: None,
+                model: None,
+                effort: Some("high"),
+                pane: Some(master),
+                tab: None,
+                caller_role: Some(&format!("master:{profile}")),
+                agent: None,
+                caller_pid: None,
+                task_type: None,
+                account: None,
+                limit_resume: override_value,
+            };
+            let val = dispatch_orchestrator_spawn(&mut host, PaneOrigin::Mcp, params)
+                .expect("spawn は成功する");
+            let applied = host
+                .ws
+                .pane_anywhere(PaneId::from_raw(val["pane_id"].as_u64().unwrap()))
+                .expect("新ペインが存在する")
+                .limit_autoresume();
+            assert_eq!(val["limit_resume"].as_bool(), Some(applied));
+            applied
+        };
+        with_test_project(|| {
+            set(None, true);
+            assert!(!spawn(false, None), "全体 OFF・プロファイル未設定は OFF");
+            assert!(
+                spawn(true, None),
+                "全体 ON がプロファイル未設定の worker へ届かない"
+            );
+            assert!(!spawn(true, Some(false)), "spawn 引数の明示 OFF が負けた");
+            set(Some(false), false);
+            assert!(
+                !spawn(true, None),
+                "プロファイルの明示 OFF が全体の ON に負けた"
+            );
             let _ = dispatch_orchestrator_profiles(ProfilesParams {
                 action: "delete".into(),
                 name: Some(profile.into()),

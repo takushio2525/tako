@@ -388,6 +388,61 @@ impl TakoApp {
                         ),
                 )
             }))
+            // リミット後の自動復帰の一括ボタン（#1945）。隣のスリープ防止チップと同じ並び・
+            // 同じ作法（SVG アイコン + 短い言葉）。集計は tick と切り替えの直後に数えた
+            // `limit_resume_summary` を読むだけ（描画のたびに全ペインを数えない）
+            .children((!tako_core::limit_resume_all::legacy()).then(|| {
+                use tako_core::limit_resume_all::BulkState;
+                let summary = self.limit_resume_summary;
+                let (icon_color, text_color) = match summary.state() {
+                    BulkState::AllOn => (theme.accent, theme.text_muted),
+                    BulkState::Partial => (theme.yellow, theme.text_muted),
+                    BulkState::AllOff => (theme.text_tertiary, theme.text_tertiary),
+                };
+                let tip = crate::ui_text::pane_menu::limit_resume_all_tooltip(&summary);
+                let tip_theme = theme.clone();
+                div()
+                    .id("statusbar-limit-resume")
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .h_full()
+                    .px(px(11.0))
+                    .border_r_1()
+                    .border_color(hsla(theme.border_subtle))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.surface_hover)))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::tab_bar::HintTooltip::new(tip.clone(), tip_theme.clone()))
+                            .into()
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_limit_resume_all();
+                            cx.notify();
+                        }),
+                    )
+                    // ペインヘッダの自動復帰インジケータと同じ絵柄（#813。SVG = 絵文字を使わない）
+                    .child(
+                        svg()
+                            .path(ui_icon::LOOP_REPEAT)
+                            .w(px(13.0))
+                            .h(px(13.0))
+                            .text_color(hsla(icon_color)),
+                    )
+                    .child(div().text_color(hsla(text_color)).child(SharedString::from(
+                        crate::ui_text::pane_menu::limit_resume_all_chip(&summary),
+                    )))
+                    // セルフテスト（visual-test）が**合成マウスで**押すための実矩形
+                    .child(crate::tab_shape::probe_canvas(
+                        self.panel_click_probe_bounds.clone(),
+                        "statusbar-limit-resume".to_string(),
+                    ))
+            }))
             .child(div().flex_grow(1.0))
             // アップデート表示はここには置かない（#616）。下部バーが詰まったため
             // 上部通知カード + 専用ウィンドウ（`update_window`）へ移した

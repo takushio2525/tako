@@ -192,7 +192,7 @@ tako/
 | **スクロールバック保持上限（直接ペインの RAM。#818）** | `tako scrollback [lines]` |
 | スリープ防止 | `tako sleep-guard status` |
 | **会話を引き継いだセッション再起動（ペインの右クリック。#1067）** | `tako session-restart [--mode harness|handoff] [--pane N]` |
-| **リミット後の自動復帰（ペイン単位。#813）** | `tako limit-resume [on|off] [--pane N] [--all]` |
+| **リミット後の自動復帰（ペイン単位 / 一括 = ステータスバーのボタン。#813 / #1945）** | `tako limit-resume [on|off] [--pane N] [--all]` |
 | 入力予測（tako 内 zsh のゴースト予測。#600/#614） | `tako autosuggest [on|off]` |
 | UI テーマ切替 | `tako theme [dark|light|toggle]` |
 | UI 表示モード切替（GUI ライク表示。#691/#694/#702/#715/#716/#720/#725/#737/#739） | `tako ui-mode [gui|terminal|toggle]` |

@@ -30,6 +30,7 @@ pub mod i18n;
 pub mod ipc_socket;
 pub mod jump_history;
 pub mod limit_resume;
+pub mod limit_resume_all;
 pub mod links;
 pub mod lsp;
 pub mod md_links;

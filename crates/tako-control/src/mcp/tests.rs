@@ -2,6 +2,36 @@
 mod tests {
     use super::*;
 
+    /// #1945: `tako_limit_resume` の `all` + `enabled` は一括（呼び出し元ペインを解かない =
+    /// tako の外の MCP クライアントからも押せる）。`pane` は退避中でも素通しして dispatch が引く
+    #[test]
+    fn tako_limit_resume_の_all_と_enabled_は一括の要求になる() {
+        assert_eq!(
+            build_request(
+                "tako_limit_resume",
+                &json!({"all": true, "enabled": true}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::LimitResume {
+                pane: None,
+                enabled: Some(true),
+                all: Some(true),
+            }
+        );
+        assert_eq!(
+            build_request("tako_limit_resume", &json!({"pane": 42, "enabled": false}), Some(7), None)
+                .unwrap(),
+            Request::LimitResume {
+                pane: Some(42),
+                enabled: Some(false),
+                all: None,
+            }
+        );
+        assert!(validate_known_params("tako_limit_resume", &json!({"all": true, "enabled": false})).is_ok());
+    }
+
     /// #1908: `tako_tree_folder` の `selection` はツリーの選択の要求（CLI `tako tree selection`
     /// と同じ）になり、ほかの action はこれまでどおり `TreeFolder`
     #[test]

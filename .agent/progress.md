@@ -64,3 +64,6 @@
 ## 2026-10-09（#1576: 退避（たまり場・退避タブ）のペインを再起動で退避のまま同じ器へ繋ぎ直す）
 - 真因（修正前バイナリで実測確定）: 復元ループが退避を `let-else` で素通りさせ器を `backend_sessions` へ登録しない → orphan 自動復帰が「復帰」タブへ別 pane id で拾い、退避エントリは端末の無い幽霊（次の保存で器 null）。退避も表と同じ枝で起こし、判断（起こす / 残す / 外す = 器も手掛かりも無い・同じ器の重複）は `shelved_restore::plan`。内訳に「戻し方」。A/B `TAKO_1576_LEGACY=1`
 - 実測: `scripts/test-shelved-restore-1576.sh` 修正前 22 NG → 58 PASS 0 FAIL（orphan 0・同じ pane id / role / タイトル / limit_resume・器の pid 不変・表に出すと目印が見える・A/B で「復帰」タブ再現）・#1554 の実経路 42 PASS・番犬 6 本（修正前の main.rs で 6 本とも file:line を名指し）
+## 2026-10-09（#1945: ステータスバーのワンボタンで全エージェントのリミット後の自動復帰を一括 ON / OFF・以後に立つペインも従う・退避中も対象）
+- 正本 `tako_core::limit_resume_all`（エージェント = role か会話の検出・3 状態・一括・既定の採用・「決定済み」の印）を dispatch `LimitResume` の `all` + `enabled` が通り、ボタン / `tako limit-resume on|off --all` / MCP が 1 実装。既定は settings.json `limit_resume_all`（serde default）。退避中も `--pane N`・駆動の対象。`worker_status` が退避した worker を false と読んでいたのは読み出しが表のタブしか見ていなかったため（値は消えていない）。A/B `TAKO_1945_LEGACY=1`・カタログ +403 B
+- 実測: `scripts/test-limit-resume-all-1945.sh` 24 PASS（旧 19 NG。再起動後も保持・手起動の codex を約 5 秒で検出して ON）・visual-test `limit-resume-all` を実マウスで 8 段（旧は ① で FAILED）・番犬 `issue1945_limit_resume_all_watchdog`（注入で `dispatch.rs:15587` を名指し）
