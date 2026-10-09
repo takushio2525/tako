@@ -20,22 +20,6 @@
 
 ---
 
-## 2026-10-08（#1681: LSP ホバー = 識別子にマウスを乗せると型・doc のカード・CLI / MCP）
-- core `lsp::hover`（Hover の 3 形・16,000 字の上限・範囲・能力）→ manager の `hover`（マウスは補完と同じ取り消しの列 + `open: false` = 開いている文書に加わるだけ = 乗せただけでサーバを起こさない）→ dispatch 3 段（`show` でカード = `ControlHost::show_lsp_hover`）→ CLI `tako lsp hover` / MCP `tako_lsp` の `action=hover`（+290 B）→ GUI `lsp_hover_ui`（`render_block` 経由・1 フレーム目に測って語の行の上下へ・編集メニュー / パレットの口・右クリックメニューには載せない）
-- 実測: e2e `issue1681_lsp_hover` 9 本・番犬の注入 8 通りを file:line で名指し・`scripts/test-lsp-hover-1681.sh` 23 PASS（visual-test `hover` 8 相 = 基準画像との差分は矩形の外 0 px・100 回で保持件数が増えない・A/B `TAKO_1681_LEGACY=1` で FAILED / `hover-real` で実の rust-analyzer の `String` の doc がカードに出る / CLI・MCP 19 項目）
-
-## 2026-10-08（#1873: 閲覧中の ⌘F 検索を閉じたら描画へ戻し目次を作り直すようにした）
-- 開閉を `open_preview_search_bar` / `close_preview_search_bar` の 1 実装へ寄せ（Escape・⌘F のトグル・CLI / MCP）、閲覧中に描画から開いた検索なら #1661 の `restore_rendered_preview` で戻してセッションも畳む（code へ落ちていたときだけ描き直す）。CLI `tako edit search --open|--close` / MCP `tako_preview_search` の `visible`（ツールは増やさない）。A/B `TAKO_1873_LEGACY=1`
-- 実測: 修正前の main は Escape 後 mode=code・目次 0 件（visual 節）。`scripts/test-md-find-restore-1873.sh` 43 PASS 0 FAIL・番犬の注入 8 通りを file:line で名指し
-
-## 2026-10-08（#1879: tako mod S1 = Claude Code の mod の同梱・展開・ペインへの注入と状態報告）
-- mod（`crates/tako-core/claude-mod/`）を `<data_dir>/claude-mod/tako/` へ展開し、claude 2.1.294 以上のペインの env（`CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_CLI`）で読ませる（設定ファイルは書かない・tmux は `-e` 固定）。mod は 1 秒 flush / 15 秒 heartbeat で `tako mod report` を叩き、GUI のメモリに 45 秒の鮮度で持つ。`tako mod [on|off]` / MCP `tako_mod`（report は載せない = FR-2.42.6）。組織アカウントで classic 系が mod へ届かないのを実測し、tool.call / tool.check で拾う形を足した（FR-2.42.7）
-- 実測: `scripts/test-claude-mod-1879.sh`（隔離 GUI・実 claude）全段 41 PASS 0 FAIL・`claude plugin test` 11 本（注入 3 通りで fail）・番犬 3 本（注入 9 通り名指し）・カタログ +421 B
-
-## 2026-10-08（#1867: ファイルツリーの複数選択・⌥⌘V（移動として貼る）・大きなコピーの進み具合と取り消し）
-- 選択の正本 `tako_core::tree_select`（⌘ / ⇧クリック・範囲・配下の除去）+ 押下の捕捉フェーズで外した選択を退避。まとめた操作は dispatch `FileOpMany`（clipboard / trash / move を単数と同じ口で 1 件ずつ）、⌥⌘V（Win は Ctrl+Alt+V・AltGr の文字は奪わない）は `paste_move` = #1834 の移動、コピーは `file_copy::Progress` + 一覧 `jobs` で帯と `copy_progress` / `copy_cancel`（作りかけは戻す）。CLI / MCP `tako_file_op` の `paths` と同名の op（カタログ +396 B）
-- 実測: `scripts/test-tree-multiselect-1867.sh` 57 PASS 0 FAIL（visual-test `tree-multiselect` 8 場面・A/B `TAKO_1867_LEGACY=1` で ① が FAILED・CLI と MCP 16 組が字面一致・CLI で始めたコピーを MCP で取り消す / 逆・権限エラー）・番犬 17 本（注入 8 通り file:line）
-
 ## 2026-10-08（#1869: 整形を離れた箇所ごとの差分へ一本化・補完をサーバの読み込み中も出す）
 - 整形と補完の確定を `EditDelta::spans`（差分 1 件に離れた箇所を並べる）+ 書き換えの原始操作 `splice_text` の 1 本へ寄せた（`chained` は廃止）。真因の実測: rust-analyzer 1.95 は読み込みの前半に補完へ即 `null`、後半は答えずに待たせる。tako は打鍵の要求だけ待たずに 0 件で返していた → 打鍵も待って問い直し（次の打鍵・閉じるで抜ける）、GUI は「読み込み中」の 1 行、CLI / MCP は `waited_for_loading_ms` / `status: loading`、`tako lsp status` に `loading`（カタログ +117 B）
 - 実測: 10 万行の整形 → undo の履歴 2,600,298 B・深さ 2・undo 2 回ともバイト一致（旧 `TAKO_1869_LEGACY=1` は 17,399,988 B・深さ 1）・visual-test `completion-loading` 緑（旧で FAILED）・e2e 6 本・番犬の注入 9 通りを file:line で名指し・実の rust-analyzer は読み込み中に GUI で打っても 2.2 秒後に一覧（旧は 25 秒出ない）・整形も緑（`scripts/test-lsp-followup-1869.sh` 37 PASS）
@@ -75,6 +59,7 @@
 ## 2026-10-09（#1901: debug ビルドでも構文の塗りの依存 8 つだけ opt-level 3 にした）
 - `.cargo/config.toml` に `[profile.dev.package.*]` を syntect / fancy-regex / regex-automata / regex-syntax / aho-corasick / memchr / bit-set / bit-vec へ（どれを外しても遅くなるのを 1 MB の TS で実測。自分のクレートは未最適化のまま。ルートの Cargo.toml だと rust-cache のキーに入らず CI が毎回下流を作り直した = PR の初回 macOS 39 分）。commands.md の build 行・#1890 の「debug は 427.6 秒」2 か所に後の値を添えた
 - 実測（JOBS=2・前後交互に 2 回ずつ）: 10 MB の塗り 53.8 → 4.3 秒（12.4 倍）・visual-test `large-file-decor` の debug は 1 節 30 分 → 152 秒・差分ビルド tako-core 9.5 / 7.8 → 9.3 / 8.4 秒・クリーンは 8 つで +36 秒の CPU（壁時計は負荷のぶれ以下）・全体テスト 6515 passed（tako-app 単体 30 → 12 秒）
+
 ## 2026-10-09（#1874: テストの tmux の器の名前を残骸掃除が拾う接頭辞へ揃え、`-f /dev/null` で起こすようにした）
 - 名前 4 つ（`tako-coretest1857-` → `tako-coretest-1857-`・`ct1105-` → `tk-coretest-1105-`（tako で始めないのが #1105 の検査の中身なので `TEST_SOCKET_PREFIXES` を足した）・固定名 `tako-e2e-571` / `-577` に pid）と `-f` なしの起動 12 か所（tmux_e2e の 1 実装・dispatch 5・#1857 の keep・loc・scrollback_capture・remote_scrollback 2）。番犬 `issue1866_tmux_socket_name_watchdog.rs` に名前（定義まで辿る）と `-f` の 2 規則
 - 実測: 読まれたら器の名前を記録する `.tmux.conf` を置いた偽 HOME で、修正前は 24 回読まれ修正後 0。途中で kill -9 した #1857 / #1105 の器を修正前の `TmuxTestGuard` は拾わず修正後は回収。番犬の注入（修正前の 5 ファイル・名前・接頭辞の正本）を file:line で名指し
