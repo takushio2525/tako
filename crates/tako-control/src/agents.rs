@@ -89,6 +89,41 @@ fn find_ancestor_pane<T: Copy>(
     None
 }
 
+/// 1 回の照会の間だけ使い回す走査結果（#1968）。
+///
+/// worker の状態照会 1 回は `has_running_children`（`tmux list-panes -a` + `ps`）と
+/// claude / codex / agy の会話 ID 解決（それぞれ `tmux list-panes -a` + `ps`）を順に呼び、
+/// 同じ走査を 2〜3 回起こしていた（報告 1 回で `ps` 3 本 = 隔離 GUI の `sample` で実測）。
+/// [`with_shared_scan`] の内側でだけ、最初の採取を同じスレッドの後続の呼び出しへ渡す。
+/// **照会をまたいでは持ち越さない**（時間で古くなる結果を返す余地を作らない）
+#[derive(Default)]
+struct SharedScan {
+    table: Option<(HashMap<u32, u32>, HashMap<u32, String>)>,
+    pane_pids: Option<Vec<(String, u32)>>,
+}
+
+thread_local! {
+    static SHARED_SCAN: std::cell::RefCell<Option<SharedScan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `f` の間、同じスレッドの [`capture_process_table`] / [`backend_pane_pids`] を 1 回の採取で
+/// 済ませる（#1968）。入れ子は外側に相乗りする。A/B の `TAKO_1968_LEGACY=1` は使い回さない
+pub fn with_shared_scan<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SHARED_SCAN.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    if crate::diag::issue1968_legacy() || SHARED_SCAN.with(|s| s.borrow().is_some()) {
+        return f();
+    }
+    SHARED_SCAN.with(|s| *s.borrow_mut() = Some(SharedScan::default()));
+    let _reset = Reset;
+    f()
+}
+
 /// 全プロセスの親子マップを作る（`ps` 1 回。argv は捨てる）
 pub fn process_parent_map() -> HashMap<u32, u32> {
     capture_process_table().0
@@ -110,7 +145,22 @@ pub fn process_parent_map() -> HashMap<u32, u32> {
 ///
 /// なお境界は実行ファイル名までしか返さないので、**その環境では argv が空になる**
 /// （= #976 の自動検知は働かない。対応マトリクスで Pending として申告する）。
+///
+/// [`with_shared_scan`] の内側なら 1 回目の結果を使い回す（#1968）
 pub fn capture_process_table() -> (HashMap<u32, u32>, HashMap<u32, String>) {
+    if let Some(table) = SHARED_SCAN.with(|s| s.borrow().as_ref().and_then(|x| x.table.clone())) {
+        return table;
+    }
+    let table = capture_process_table_uncached();
+    SHARED_SCAN.with(|s| {
+        if let Some(scan) = s.borrow_mut().as_mut() {
+            scan.table = Some(table.clone());
+        }
+    });
+    table
+}
+
+fn capture_process_table_uncached() -> (HashMap<u32, u32>, HashMap<u32, String>) {
     let snapshot = tako_core::platform::procinfo::snapshot();
     if !snapshot.is_empty() {
         return (
@@ -484,7 +534,18 @@ fn find_ancestor_backend(
 /// 器の binary と socket を知っているのは `tako_core::backend` だけなので、
 /// 自前のソケット指定が要らない経路はすべてここを通す
 pub fn backend_pane_pids() -> Vec<(String, u32)> {
-    tako_core::backend::backend().pane_pids_all()
+    // [`with_shared_scan`] の内側なら 1 回目の結果を使い回す（#1968）
+    if let Some(panes) = SHARED_SCAN.with(|s| s.borrow().as_ref().and_then(|x| x.pane_pids.clone()))
+    {
+        return panes;
+    }
+    let panes = tako_core::backend::backend().pane_pids_all();
+    SHARED_SCAN.with(|s| {
+        if let Some(scan) = s.borrow_mut().as_mut() {
+            scan.pane_pids = Some(panes.clone());
+        }
+    });
+    panes
 }
 
 /// caller_pid のプロセス祖先を辿り、tako バックエンドの pane_pid に一致するペインを返す（#288）
@@ -1132,6 +1193,30 @@ mod tests {
         // `command=` が空の行（カーネルスレッド等）は argv を持たない
         let (_, empty) = parse_process_table(" 42 0 \n");
         assert!(empty.is_empty());
+    }
+
+    /// #1968: 照会 1 回の内側では走査を 1 回で済ませ、外側へは持ち越さない
+    #[cfg(unix)]
+    #[test]
+    fn 走査の使い回しは照会の内側だけ_1968() {
+        assert!(SHARED_SCAN.with(|s| s.borrow().is_none()));
+        let (first, second, mut child) = with_shared_scan(|| {
+            let first = capture_process_table();
+            // 内側で子を起こしても 2 回目は 1 回目と同じ表 = `ps` を起こし直していない
+            let mut sleep = std::process::Command::new("sleep");
+            tako_core::platform::process::no_console_window(&mut sleep);
+            let child = sleep.arg("5").spawn().expect("sleep を起こせる");
+            let second = with_shared_scan(capture_process_table); // 入れ子は外側に相乗り
+            (first, second, child)
+        });
+        assert_eq!(first.0, second.0);
+        assert!(!second.0.contains_key(&child.id()));
+        // 抜けたら使い回さない（新しい子が見える）
+        assert!(SHARED_SCAN.with(|s| s.borrow().is_none()));
+        let after = capture_process_table();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(after.0.contains_key(&child.id()), "外側で古い表を返した");
     }
 
     #[test]

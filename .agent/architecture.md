@@ -1216,6 +1216,39 @@ lid-guard.json が使う）:
   fork+exec が秒級に伸び「画面が重い・点滅・スクロールもっさり」の主犯になった。
   IOKit FFI（`IOPSGetTimeRemainingEstimate`）へ置換済み。定期パスに外部コマンドが必要なら
   background executor へ逃がすこと
+- **offload の「準備」も UI スレッド**（#1968）: `prepare_offload` の文脈収集
+  （`collect_*_ctx`）は UI スレッドで走るので、ここで子プロセスを起こすと offload した意味が
+  消える。#1968 の本番実測では、master の watch（1 ペイン 5 秒ごと）が引く
+  `OrchestratorWorkerStatus` の準備部が `agents::has_running_children`（`tmux list-panes -a` +
+  `ps`）を呼び、さらに `OrchestratorReport` は丸ごと同期だった。本番の `sample` で
+  メインスレッドの 30%（10 秒）/ 47%（20 秒）が `poll`（子プロセスの出力待ち。stripped なので、
+  同じ構成の隔離 GUI のシンボル付きで `Command::output` → `read_output` → `poll` と確定）、
+  perf.log は Report の UI 専有が 38 分に 458 回・計 101 秒、UI ストールが 331 回・計 750 秒。
+  直し方 = 準備部はペインの器の名前と画面の写しだけを採り、子プロセスの有無は後段の
+  `probe_running_children`（background）が、報告は `OffloadJob::Report` が background で読む。
+  `resolve_worker_query` が毎回解釈していた worker レジストリ（本番 200 KB）は、
+  `WorkerRegistry::load_from` が**中身が前回とバイト単位で同じなら**解釈結果を使い回す
+  （更新時刻 / inode で比べないのは Windows の時刻の粒度が粗いため）。
+  準備部は `offload_prepare:<種別>` の計測区間で包む（再発したら perf.log に出る）。
+  番犬 `crates/tako-control/tests/issue1968_ui_thread_subprocess_watchdog.rs`、
+  A/B は同一バイナリの `TAKO_1968_LEGACY=1`（実測値は下の「#1968 の実測」）
+- **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
+  `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
+  `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の
+  内側では最初の採取を同じスレッドの後続へ渡す（スレッドローカル・照会をまたいで持ち越さない =
+  時間で古くなる結果を返さない）。`run_reply` の WorkerStatus / Report と同期経路が包む
+- **PATH の痩せた `.app` でログインシェルを毎回起こさない**（#1968）: stale binary 検知の
+  `launcher_path` は 2 秒ごとに呼ばれ、PATH 走査が空振りすると保険の `exe::find("claude")`
+  = ログインシェルの `command -v claude` へ落ちる。Dock / Finder 起動の `.app` は launchd の
+  PATH なので**毎回**落ちていた（本番で 20 秒に約 6 本。隔離 GUI の A/B で worker の役割つきペインが
+  あると 60 秒に 23 本 → 0 本）。`stale_binary::which_claude` は結果を覚える（見つかったパスは
+  実行できる限り・10 分ごとに引き直す / 見つからない結果は 60 秒）
+- **UI ストールの分類は「直前に終わった区間」で行う**（#1968）: 1 秒タイマーの監視ループ自身が
+  UI スレッドで走るので、記録する時点で塞いでいた区間は**必ず終わっている**
+  （`current_span_snapshot` は常に空）。旧実装はそのため tako 自身の専有まで
+  「再開経路（タイマー / キュー）側の遅延」と分類していた。`perf_span` がトップレベル
+  （ネストの外側）の区間を短い履歴へ残し、`recent_spans_within(1 秒 + 遅れ)` の合計が
+  遅れの半分以上なら「tako の専有（最長の区間名）」と書く
 - **プロセス走査の共有と変化検出**（#772 / #779）: `agents::ProcessSnapshot` が tmux pane PID と
   `ps` の親子関係を 1 回ずつ採取し、stale binary と sleep guard が同一 tick で共有する。
   sleep guard の 2 秒 tick は assertion の評価頻度であって、tmux / ps の採取頻度ではない。
@@ -1250,6 +1283,40 @@ lid-guard.json が使う）:
   同じ dispatch）で採り、アプリ未起動のときだけ自前計算へ落ちる（GUI 無しでも引けることは維持）。
   表示は 1 つのレンダラを通すので、`to_json` へフィールドを足したら `from_json` も足す
   （往復テストが拘束する）
+
+### #1968 の実測（2026-10-09・隔離 GUI・同一バイナリの A/B）
+
+構成は本番に合わせた: 12 タブ・38 ペイン（器つき 33）・PDF / 動画 / 画像 2 / コードのプレビュー・
+退避 18・棚上げタブ 2・worker レジストリ 200 KB（架空の 419 件）・PATH は launchd 相当。
+master 相当の監視 = status 2 回/秒 + report 0.2 回/秒、エージェント相当の出力 = worker 20 本で
+claude の TUI 相当の再描画（3 行 × 8 Hz）。仮想ディスプレイに 2 つの GUI を左右に並べて同時に測る
+（左 = `TAKO_1968_LEGACY=1`）。CPU は `proc_pid_rusage`（本体 / 回収済みの子プロセス）。
+
+| 指標（1 時間・画面が眠った放置） | 修正前の形 | 修正後 |
+|---|---|---|
+| tako-app 本体の CPU | 6.69% | **3.88%** |
+| tako が起こした子プロセスの CPU（`ps` / `tmux` / ログインシェル） | 39.2% | **18.9%** |
+| UI スレッドの専有（perf.log・16ms 超） | status の準備部 3,950 回・計 330 秒 + Report 395 回・計 108 秒（最大 1,405ms） | 準備部 6 回・計 0.25 秒（最大 83ms） |
+| UI ストール（1 秒タイマーの再開遅延 ≥ 0.5 秒） | 5 回・最大 0.62 秒（5 回とも「再開経路」と誤分類） | **0 回** |
+| `tako list` の往復（毎秒・p95 / 最大） | 106 / 1,345ms | 55 / 554ms |
+| footprint（立ち上がり後の最小〜最大） | 109〜125 MB（増えない） | 108〜121 MB（増えない） |
+| ログインシェル `command -v claude`（worker の役割つき・60 秒） | 23 本 | **0 本** |
+
+- **描画ありの 6 分**（蓋が開いていた時間帯）: 本体の CPU は両方とも 14% 前後で差が無い。
+  中身は見えているペイン 5 本 × 8 Hz の出力の描画（gpui の `BoundsTree::insert`・`Scene` の並べ替え・
+  グリフ描画・GPU への投入。約 37 fps）で、本番の「何もしていないのに 12%」はこれ（エージェントが
+  出力し続けている）。UI スレッドは修正前の形だけ status の準備部 222 回・計 46.5 秒 + Report
+  23 回・計 15.2 秒（最大 1,753ms）塞がれ、UI ストールが 3 回（最大 1.01 秒）
+- **メモリの「40 分で 353 → 554 MB」**: 本番の footprint を 2 分ごとに 90 分読むと 370 ↔ 550 MB を
+  往復し、差はほぼ全部 `Owned physical footprint (unmapped) (graphics)` の 7 MB ↔ 151 MB だった。
+  これは窓の大きさに比例する gpui の描画面（3024×1744 で描画面 3 枚 63 MB + パス描画用の 4 倍
+  MSAA テクスチャ 84 MB + 中間 21 MB）で、GPU の常駐状態で計上が出入りする（増え続けない）。
+  時間で増えたのは malloc の 35 MB/時ほど（本番・実エージェント 26 本）で、隔離 GUI（実エージェント
+  無し）では 1 時間で増えなかった
+- 本番の tako-app は本体の CPU 956 秒に対し回収済みの子プロセスが 4,636 秒（約 2 時間）。最大は
+  `claude agents --json` の走査（ログインシェル + Node を**アカウント数ぶん**・5 秒の寿命 = #1011）で、
+  本 PR の対象外。タブ / ペインの自動命名（FR-2.12）の `claude -p`（haiku）も子プロセスに数えられ、
+  **隔離 GUI でも既定で ON**（検証用 GUI がユーザーの認証で haiku を呼ぶ）
 
 ## ビュー単位の描画キャッシュ（#782 / #786。2026-08-07）
 

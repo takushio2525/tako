@@ -213,6 +213,85 @@ static PERF_WATCH: Mutex<PerfWatch> = Mutex::new(PerfWatch {
     samples: Vec::new(),
 });
 
+/// #1968 の A/B 用の逃げ道（`TAKO_1968_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// worker の報告を UI スレッドで同期実行する・状態照会の子プロセスの有無を UI スレッド部で
+/// 数える・worker レジストリを毎回読み直す・UI ストールの分類に終わった区間を使わない。
+/// 前後を同じ構成・同じ負荷で並べて測るためのもの（製品の既定は常に新しい形）
+pub fn issue1968_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1968_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 直近に終わったメインスレッドの**トップレベル**計測区間（UI ストールの分類用。#1968）。
+///
+/// UI ストールは 1 秒タイマーの再開遅延で測るが、その監視ループ自身が UI スレッドで走るので、
+/// 記録する時点では塞いでいた区間は**必ず終わっている**（`current` は常に空）。
+/// 旧実装はそのせいで、tako 自身の専有まで「再開経路（タイマー / キュー）側の遅延」と
+/// 書いていた（本番の perf.log で 38 分に 331 件・計 750 秒がこの分類）。
+/// 終わった区間を短い履歴に残し、遅延の窓に重なったものを分類に使う
+struct EndedSpan {
+    tag: Cow<'static, str>,
+    ended: Instant,
+    took_ms: u64,
+}
+
+/// 履歴へ残す最短の所要（これ未満は 1 秒の遅延の説明にならないので数えない）
+const RECENT_SPAN_MIN_MS: u64 = 5;
+/// 履歴の上限（古いものから捨てる。1 秒の窓に収まる数より十分大きい）
+const RECENT_SPAN_CAP: usize = 256;
+
+static RECENT_SPANS: Mutex<std::collections::VecDeque<EndedSpan>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// 呼び手が [`RECENT_SPAN_MIN_MS`] 以上のときだけ呼ぶ（短い区間で `Cow` を複製しない）
+fn record_ended_span(tag: Cow<'static, str>, took_ms: u64) {
+    let mut q = RECENT_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= RECENT_SPAN_CAP {
+        q.pop_front();
+    }
+    q.push_back(EndedSpan {
+        tag,
+        ended: Instant::now(),
+        took_ms,
+    });
+}
+
+/// 直前の `window` に終わったトップレベル区間の要約（最長の区間・合計・件数）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentSpans {
+    pub longest_tag: String,
+    pub longest_ms: u64,
+    pub total_ms: u64,
+    pub count: usize,
+}
+
+/// 直前の `window` に終わったメインスレッドのトップレベル区間を要約する（無ければ `None`）
+pub fn recent_spans_within(window: Duration) -> Option<RecentSpans> {
+    let q = RECENT_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    let since = Instant::now().checked_sub(window)?;
+    let mut out: Option<RecentSpans> = None;
+    for s in q.iter().filter(|s| s.ended >= since) {
+        let r = out.get_or_insert_with(|| RecentSpans {
+            longest_tag: s.tag.to_string(),
+            longest_ms: 0,
+            total_ms: 0,
+            count: 0,
+        });
+        r.total_ms += s.took_ms;
+        r.count += 1;
+        if s.took_ms > r.longest_ms {
+            r.longest_ms = s.took_ms;
+            r.longest_tag = s.tag.to_string();
+        }
+    }
+    out
+}
+
 /// メインスレッドの ThreadId（`mark_main_thread` で登録）。
 /// **未登録のプロセスはメインスレッドを持たない扱い**（#944）
 static MAIN_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
@@ -317,6 +396,8 @@ pub struct PerfSpan {
     prev: Option<SpanState>,
     /// メインスレッドで開始した区間か（別スレッドは記録の扱いを変える）
     on_main: bool,
+    /// 別の区間の内側か（UI ストールの分類では外側だけを数える = 二重に数えない。#1968）
+    nested: bool,
 }
 
 /// 既定しきい値（32ms、verbose 時 16ms）の計測区間を開始する
@@ -343,12 +424,14 @@ pub fn perf_span_over(tag: impl Into<Cow<'static, str>>, log_over_ms: u64) -> Pe
     } else {
         None
     };
+    let nested = prev.is_some();
     PerfSpan {
         tag,
         t0,
         log_over_ms,
         prev,
         on_main,
+        nested,
     }
 }
 
@@ -366,6 +449,9 @@ impl Drop for PerfSpan {
         {
             let mut w = watch_lock();
             w.current = self.prev.take();
+        }
+        if !self.nested && took >= RECENT_SPAN_MIN_MS {
+            record_ended_span(self.tag.clone(), took);
         }
         if perf_verbose() {
             push_sample(self.tag.clone(), took);
@@ -460,7 +546,12 @@ const SCHED_OVERLOAD_OVER: Duration = Duration::from_millis(500);
 ///
 /// 断定するのは根拠がある場合だけで、それ以外は「どこが遅れたか分からない」と
 /// 分かるように書く（原因を騙ると次の調査が丸ごと無駄になる）
-pub fn classify_stall(ui_lag: Duration, sched_lag: Duration, span: Option<(&str, u64)>) -> String {
+pub fn classify_stall(
+    ui_lag: Duration,
+    sched_lag: Duration,
+    span: Option<(&str, u64)>,
+    recent: Option<&RecentSpans>,
+) -> String {
     let head = format!(
         "UI ストール: foreground executor の再開が {:.2}s 遅延",
         ui_lag.as_secs_f64()
@@ -472,15 +563,24 @@ pub fn classify_stall(ui_lag: Duration, sched_lag: Duration, span: Option<(&str,
             sched_lag.as_secs_f64()
         );
     }
-    match span {
-        Some((tag, ms)) => format!(
+    if let Some((tag, ms)) = span {
+        return format!(
             "{head}（OS スレッドは正常。メインスレッドで {tag} が {ms}ms 継続中 = tako の専有）"
-        ),
-        None => format!(
-            "{head}（OS スレッドは正常・メインスレッドの計測区間も無し = \
-             再開経路（タイマー / キュー）側の遅延。#643）"
-        ),
+        );
     }
+    // #1968: 遅延の窓に終わった区間が遅延の半分以上を説明するなら tako の専有
+    if let Some(r) = recent.filter(|r| r.total_ms.saturating_mul(2) >= ui_lag.as_millis() as u64) {
+        return format!(
+            "{head}（OS スレッドは正常。直前にメインスレッドの計測区間が計 {}ms・{} 件 \
+             （最長 {} が {}ms）= tako の専有。#1968）",
+            r.total_ms, r.count, r.longest_tag, r.longest_ms
+        );
+    }
+    let measured = recent.map(|r| r.total_ms).unwrap_or(0);
+    format!(
+        "{head}（OS スレッドは正常・直前の計測区間は計 {measured}ms = \
+         計測区間の外か再開経路（タイマー / キュー）側の遅延。#643 / #1968）"
+    )
 }
 
 /// メインスレッド・ウォッチドッグを起動する（多重呼び出しは無視）。
@@ -612,6 +712,7 @@ mod tests {
             Duration::from_millis(3000),
             // 計測区間が走っていても、OS スレッドの遅れが勝つ（そちらが上流の原因）
             Some(("render", 40)),
+            None,
         );
         assert!(msg.contains("マシン全体の過負荷"), "{msg}");
         assert!(msg.contains("5.50s"), "{msg}");
@@ -624,6 +725,7 @@ mod tests {
             Duration::from_millis(2000),
             Duration::from_millis(10),
             Some(("dispatch:GitLog", 1900)),
+            None,
         );
         assert!(msg.contains("tako の専有"), "{msg}");
         assert!(msg.contains("dispatch:GitLog"), "{msg}");
@@ -633,17 +735,82 @@ mod tests {
 
     #[test]
     fn どちらでもなければ再開経路の遅延として原因を騙らない() {
-        let msg = classify_stall(Duration::from_millis(4000), Duration::from_millis(20), None);
+        let msg = classify_stall(
+            Duration::from_millis(4000),
+            Duration::from_millis(20),
+            None,
+            None,
+        );
         assert!(msg.contains("再開経路"), "{msg}");
         assert!(!msg.contains("tako の専有"), "{msg}");
         assert!(!msg.contains("マシン全体の過負荷"), "{msg}");
     }
 
     #[test]
+    fn 終わった区間が遅延の半分以上を説明すれば_tako_の専有と分かる() {
+        // #1968: 監視ループは UI スレッドで走るので、記録の時点で区間は終わっている
+        let r = RecentSpans {
+            longest_tag: "offload_prepare:OrchestratorWorkerStatus".into(),
+            longest_ms: 700,
+            total_ms: 1100,
+            count: 3,
+        };
+        let msg = classify_stall(
+            Duration::from_millis(2000),
+            Duration::from_millis(10),
+            None,
+            Some(&r),
+        );
+        assert!(msg.contains("tako の専有"), "{msg}");
+        assert!(
+            msg.contains("offload_prepare:OrchestratorWorkerStatus"),
+            "{msg}"
+        );
+        assert!(msg.contains("1100ms"), "{msg}");
+        // 半分に届かなければ騙らない（計測の外 / 再開経路のまま。合計は書く）
+        let small = RecentSpans {
+            total_ms: 900,
+            ..r.clone()
+        };
+        let msg = classify_stall(
+            Duration::from_millis(2000),
+            Duration::from_millis(10),
+            None,
+            Some(&small),
+        );
+        assert!(!msg.contains("tako の専有"), "{msg}");
+        assert!(msg.contains("900ms"), "{msg}");
+    }
+
+    #[test]
+    fn 終わった区間の履歴は外側だけを数える() {
+        let _main = scoped_main_thread();
+        let tag = format!("test1968-{}", std::process::id());
+        {
+            let _outer = perf_span(format!("{tag}-outer"));
+            {
+                let _inner = perf_span(format!("{tag}-inner"));
+                std::thread::sleep(Duration::from_millis(12));
+            }
+            std::thread::sleep(Duration::from_millis(12));
+        }
+        let q = RECENT_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+        let mine: Vec<&EndedSpan> = q.iter().filter(|s| s.tag.starts_with(&tag)).collect();
+        assert_eq!(mine.len(), 1, "外側の 1 件だけ");
+        assert!(mine[0].tag.ends_with("-outer"));
+        assert!(mine[0].took_ms >= 24, "{}", mine[0].took_ms);
+    }
+
+    #[test]
     fn 過負荷判定の境界はちょうど_500ms() {
         let ui = Duration::from_secs(3);
-        let just_under = classify_stall(ui, SCHED_OVERLOAD_OVER - Duration::from_millis(1), None);
-        let exactly = classify_stall(ui, SCHED_OVERLOAD_OVER, None);
+        let just_under = classify_stall(
+            ui,
+            SCHED_OVERLOAD_OVER - Duration::from_millis(1),
+            None,
+            None,
+        );
+        let exactly = classify_stall(ui, SCHED_OVERLOAD_OVER, None, None);
         assert!(!just_under.contains("マシン全体の過負荷"), "{just_under}");
         assert!(exactly.contains("マシン全体の過負荷"), "{exactly}");
     }

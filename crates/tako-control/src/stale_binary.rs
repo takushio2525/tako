@@ -130,8 +130,53 @@ fn is_executable_file(path: &Path) -> bool {
     tako_core::platform::exe::is_executable_file(path)
 }
 
+/// 保険の探索（[`which_claude`]）の結果の覚え（#1968）。
+///
+/// `.app` を Dock / Finder から起こすと PATH は launchd の痩せたもの（`/usr/bin:/bin:…`）で、
+/// 上の PATH 走査は**毎回**空振りする。保険の境界 B16 は unix ではログインシェルの
+/// `command -v claude` なので、2 秒ごとの指紋取りのたびにユーザーの rc を読み込む
+/// シェルが 1 本起動していた（#1968 の本番実測: 20 秒に約 6 本）。
+/// 見つかったパスは**まだ実行できる限り**使い回し（[`WHICH_HIT_TTL`] ごとに引き直す）、
+/// 見つからなかった結果は [`WHICH_MISS_TTL`] だけ覚える（後から入れた claude もその後に拾う）
+static WHICH_MEMO: Mutex<Option<WhichMemo>> = Mutex::new(None);
+
+struct WhichMemo {
+    at: std::time::Instant,
+    found: Option<PathBuf>,
+}
+
+/// 見つかったパスを引き直す間隔（置き場が変わった = 入れ直しを拾う）
+const WHICH_HIT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// 見つからなかった結果を覚える長さ（入れたばかりの claude を拾うまでの最長）
+const WHICH_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 覚えを通して探す（純粋な判定。テストで探索と時計を差し替える）
+fn memoized_find(
+    memo: &Mutex<Option<WhichMemo>>,
+    now: std::time::Instant,
+    still_valid: impl Fn(&Path) -> bool,
+    find: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    // 探索中もロックを持つ = 同時に呼ばれてもシェルは 1 本だけ
+    let mut memo = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = memo.as_ref() {
+        let age = now.saturating_duration_since(m.at);
+        match &m.found {
+            Some(path) if age < WHICH_HIT_TTL && still_valid(path) => return Some(path.clone()),
+            None if age < WHICH_MISS_TTL => return None,
+            _ => {}
+        }
+    }
+    let found = find();
+    *memo = Some(WhichMemo {
+        at: now,
+        found: found.clone(),
+    });
+    found
+}
+
 /// 上の PATH 走査で見つからなかったときの保険。境界 B16
-/// （[`tako_core::platform::exe::find`]）へ委ねる。
+/// （[`tako_core::platform::exe::find`]）へ委ねる。結果は [`WHICH_MEMO`] で覚える（#1968）。
 ///
 /// **`which` を起こしてはいけない**（#898）: Windows に `which` は無いので旧実装は
 /// 必ず `None` を返し、`claude` が PATH に伝播していない環境（インストーラが PATH を
@@ -142,7 +187,17 @@ fn is_executable_file(path: &Path) -> bool {
 /// 上の走査を残しているのは #772 のため（指紋取りは定期実行なので、
 /// 見つかる限り stat だけで済ませたい）。ここへ落ちるのは走査が空振りしたときだけ
 fn which_claude() -> Option<PathBuf> {
-    tako_core::platform::exe::find("claude").map(PathBuf::from)
+    let find = || tako_core::platform::exe::find("claude").map(PathBuf::from);
+    // A/B の `TAKO_1968_LEGACY=1` は修正前と同じく毎回探す
+    if crate::diag::issue1968_legacy() {
+        return find();
+    }
+    memoized_find(
+        &WHICH_MEMO,
+        std::time::Instant::now(),
+        is_executable_file,
+        find,
+    )
 }
 
 /// バイナリパスからバージョンを推定する。
@@ -567,6 +622,70 @@ pub fn status_to_json(status: &StaleStatus) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1968: 保険の探索（ログインシェル）は覚えを通す。見つかったパスは実行できる限り
+    /// 使い回し、見つからなかった結果は一定時間だけ覚える
+    #[test]
+    fn 保険の探索は覚えを通す_1968() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let memo: Mutex<Option<WhichMemo>> = Mutex::new(None);
+        let calls = Cell::new(0);
+        let t0 = Instant::now();
+        let hit = PathBuf::from("/opt/x/claude");
+        let find_hit = || {
+            calls.set(calls.get() + 1);
+            Some(hit.clone())
+        };
+        let valid = |_: &Path| true;
+        // 1 回目は探す・2 回目以降は使い回す（2 秒ごとの指紋取り 300 回 = 10 分ぶん）
+        assert_eq!(memoized_find(&memo, t0, valid, find_hit), Some(hit.clone()));
+        for i in 1..300 {
+            let now = t0 + Duration::from_secs(2 * i);
+            if now.duration_since(t0) >= WHICH_HIT_TTL {
+                break;
+            }
+            assert_eq!(
+                memoized_find(&memo, now, valid, find_hit),
+                Some(hit.clone())
+            );
+        }
+        assert_eq!(calls.get(), 1, "見つかったパスを使い回していない");
+        // 置き場が消えたら（実行できなくなったら）その場で探し直す
+        let gone = |_: &Path| false;
+        memoized_find(&memo, t0 + Duration::from_secs(10), gone, find_hit);
+        assert_eq!(calls.get(), 2);
+        // 引き直しの間隔を過ぎたら探し直す（入れ直しで置き場が変わった場合）
+        memoized_find(
+            &memo,
+            t0 + Duration::from_secs(10) + WHICH_HIT_TTL,
+            valid,
+            find_hit,
+        );
+        assert_eq!(calls.get(), 3);
+
+        // 見つからなかった結果は WHICH_MISS_TTL だけ覚える
+        let memo: Mutex<Option<WhichMemo>> = Mutex::new(None);
+        let misses = Cell::new(0);
+        let find_miss = || {
+            misses.set(misses.get() + 1);
+            None
+        };
+        assert_eq!(memoized_find(&memo, t0, valid, find_miss), None);
+        assert_eq!(
+            memoized_find(
+                &memo,
+                t0 + WHICH_MISS_TTL - Duration::from_millis(1),
+                valid,
+                find_miss
+            ),
+            None
+        );
+        assert_eq!(misses.get(), 1, "見つからなかった結果を覚えていない");
+        // 期限を過ぎたら探し直し、後から入れた claude を拾う
+        let found_later = memoized_find(&memo, t0 + WHICH_MISS_TTL, valid, find_hit);
+        assert_eq!(found_later, Some(hit));
+    }
 
     #[test]
     fn test_extract_version_from_path() {

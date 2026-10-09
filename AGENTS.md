@@ -212,6 +212,7 @@ tako/
 | アプリ内更新（#36/#403/#616/#690/#1042） | `tako update [status|check|apply|apply-zip|repair]` |
 | **テスト・検証プロセスの残骸の後片付け（一時 dir。既定は dry-run。#1296 / #1312）** | `tako test-residue [--apply]` |
 | target 掃除 | `scripts/clean-target.sh` |
+| **cargo の target を Spotlight の索引から外す（既定は状態だけ。#1968）** | `scripts/spotlight-noindex.sh [--apply]` |
 
 CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで build + test を回す。
 

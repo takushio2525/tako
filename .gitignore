@@ -1,4 +1,6 @@
 /target
+# cargo の target の実体（Spotlight の索引の外。scripts/spotlight-noindex.sh = #1968）
+/target.noindex
 /dist
 .DS_Store
 .claude/

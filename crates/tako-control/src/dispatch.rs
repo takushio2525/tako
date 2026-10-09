@@ -1866,6 +1866,16 @@ pub enum OffloadJob {
         ctx: WorkerStatusCtx,
         session_id: Option<String>,
         tmux_session: Option<String>,
+        /// 子プロセスの有無を準備（UI スレッド）で数え済みか（A/B の修正前の形だけ true。#1968）
+        children_probed: bool,
+    },
+    /// worker の報告（#1968）。UI スレッドではペインの器の名前だけを写し、
+    /// 器の採取（`tmux capture-pane`）と会話ログの読み取りは background で行う
+    /// （本番の perf.log で 38 分に 458 回・UI 専有の合計 101 秒・最大 2.25 秒だった）
+    Report {
+        ctx: ReportCtx,
+        lines: usize,
+        messages: usize,
     },
     Workers {
         live_panes: Vec<(u64, Option<String>)>,
@@ -2072,15 +2082,41 @@ pub fn prepare_offload(
                 Ok(q) => q,
                 Err(e) => return Some(Err(e)),
             };
+            let ctx = verify_ctx_pane_identity(
+                collect_worker_status_ctx(host, q.pane_id),
+                q.tmux_session.as_deref(),
+            );
+            // A/B の `TAKO_1968_LEGACY=1` だけ、修正前と同じく子プロセスの有無を
+            // ここ（UI スレッド）で数える。通常は background の後段が数える（#1968）
+            let children_probed = crate::diag::issue1968_legacy();
+            let ctx = if children_probed {
+                probe_running_children(ctx)
+            } else {
+                ctx
+            };
             Some(Ok(OffloadJob::WorkerStatus {
-                ctx: verify_ctx_pane_identity(
-                    collect_worker_status_ctx(host, q.pane_id),
-                    q.tmux_session.as_deref(),
-                ),
+                ctx,
                 session_id: q.session_id,
                 tmux_session: q.tmux_session,
+                children_probed,
             }))
         }
+        // #1968: 報告の本体（器の採取・会話ログの読み取り）は UI スレッドで走らせない
+        // （A/B の `TAKO_1968_LEGACY=1` は修正前と同じく `None` = UI スレッドで同期実行）
+        Request::OrchestratorReport {
+            pane_id,
+            lines,
+            messages,
+            worker,
+        } if !crate::diag::issue1968_legacy() => Some(
+            resolve_worker_query(*pane_id, worker.as_deref(), None, None).map(|q| {
+                OffloadJob::Report {
+                    ctx: collect_report_ctx(host, q),
+                    lines: lines.unwrap_or(2000),
+                    messages: messages.unwrap_or(1),
+                }
+            }),
+        ),
         // #1505: 診断の項目が `diagnostics::collect`（= エージェント CLI への
         // 問い合わせ）を含むようになったので、UI スレッドで走らせると窓が止まる
         Request::CheckHealth => Some(Ok(OffloadJob::CheckHealth {
@@ -2307,7 +2343,25 @@ impl OffloadJob {
                 ctx,
                 session_id,
                 tmux_session,
-            } => finish_worker_status(ctx, session_id.as_deref(), tmux_session.as_deref()),
+                children_probed,
+            } => crate::agents::with_shared_scan(|| {
+                finish_worker_status(
+                    if children_probed {
+                        ctx
+                    } else {
+                        probe_running_children(ctx)
+                    },
+                    session_id.as_deref(),
+                    tmux_session.as_deref(),
+                )
+            }),
+            OffloadJob::Report {
+                ctx,
+                lines,
+                messages,
+            } => {
+                crate::agents::with_shared_scan(|| finish_orchestrator_report(ctx, lines, messages))
+            }
             OffloadJob::Workers {
                 live_panes,
                 limit_resume_panes,
@@ -5818,7 +5872,13 @@ fn dispatch_inner(
                 collect_worker_status_ctx(host, q.pane_id),
                 q.tmux_session.as_deref(),
             );
-            finish_worker_status(ctx, q.session_id.as_deref(), q.tmux_session.as_deref())
+            crate::agents::with_shared_scan(|| {
+                finish_worker_status(
+                    probe_running_children(ctx),
+                    q.session_id.as_deref(),
+                    q.tmux_session.as_deref(),
+                )
+            })
         }
 
         // #390: worker レジストリの一覧（同期経路。IPC / MCP 経由は prepare_offload 側）
@@ -5874,7 +5934,10 @@ fn dispatch_inner(
             worker,
         } => {
             let q = resolve_worker_query(pane_id, worker.as_deref(), None, None)?;
-            dispatch_orchestrator_report(host, q, lines.unwrap_or(2000), messages.unwrap_or(1))
+            let ctx = collect_report_ctx(host, q);
+            crate::agents::with_shared_scan(|| {
+                finish_orchestrator_report(ctx, lines.unwrap_or(2000), messages.unwrap_or(1))
+            })
         }
 
         Request::OrchestratorSupervisor {
@@ -11417,35 +11480,65 @@ fn resolve_session_id_for_pane_via_pid(host: &dyn ControlHost, pane_id: PaneId) 
         .map(str::to_string)
 }
 
-/// #364: worker の報告内容を取得する。
+/// 報告（#364）の UI スレッド必須部分（#1968）。workspace から**ペインの器の名前だけ**を写す。
+///
+/// 器の採取（`tmux capture-pane` = 子プロセス）・会話ログの読み取り・pid 祖先辿りは
+/// [`finish_orchestrator_report`] が background で行う。旧実装はこれらを UI スレッドで
+/// 走らせており、本番の perf.log で 38 分に 458 回・UI 専有の合計 101 秒（p50 175ms・
+/// 最大 2.25 秒）だった（master が worker の報告を読むたびに窓が止まる）
+pub struct ReportCtx {
+    pane_id: u64,
+    /// 同一性を確かめた後のペインの器（期待する器と食い違えば `None` = 別ペイン。#390）
+    backend: Option<String>,
+    /// レジストリ由来の期待する器（ペイン消失後の追跡に使う。#390）
+    tmux_session: Option<String>,
+    /// レジストリ由来の session_id（ペインから解決できないときの継続。#390）
+    session_id: Option<String>,
+}
+
+fn collect_report_ctx(host: &dyn ControlHost, query: WorkerQuery) -> ReportCtx {
+    // pane ID 再利用の誤マッチ検証: 期待 tmux_session と現ペインの backend が
+    // 食い違えば別ペインなので、backend ではなく期待セッション側を読む
+    let backend = host
+        .backend_session(PaneId::from_raw(query.pane_id))
+        .filter(|b| {
+            query
+                .tmux_session
+                .as_deref()
+                .is_none_or(|expect| expect == b)
+        });
+    ReportCtx {
+        pane_id: query.pane_id,
+        backend,
+        tmux_session: query.tmux_session,
+        session_id: query.session_id,
+    }
+}
+
+/// #364: worker の報告内容を取得する（[`collect_report_ctx`] の後段。UI スレッドで呼ばない）。
 /// 第 1 層: tmux scrollback（capture-pane -p -J -S。全 agent 共通）。
 /// 第 2 層: 構造化ソース（claude transcript。アダプタ拡張可能）。
 /// source フィールドで判別。transcript 利用時は scrollback も併記し対比可能にする
-fn dispatch_orchestrator_report(
-    host: &dyn ControlHost,
-    query: WorkerQuery,
+fn finish_orchestrator_report(
+    ctx: ReportCtx,
     lines: usize,
     messages: usize,
 ) -> Result<Value, DispatchError> {
-    let pane_id = query.pane_id;
-    let target = PaneId::from_raw(pane_id);
+    let ReportCtx {
+        pane_id,
+        backend,
+        tmux_session,
+        session_id,
+    } = ctx;
     let mut result = json!({ "pane_id": pane_id });
 
     // 第 1 層: scrollback（全 agent 共通の主ソース）。
     // pane が GUI から消えていても、レジストリ由来の tmux_session が生きていれば
-    // そこから capture する（#390: ペイン消失後の追跡継続）。
-    // pane ID 再利用の誤マッチ検証: 期待 tmux_session と現ペインの backend が
-    // 食い違えば別ペインなので、backend ではなく期待セッション側を読む
-    let backend = host.backend_session(target).filter(|b| {
-        query
-            .tmux_session
-            .as_deref()
-            .is_none_or(|expect| expect == b)
-    });
+    // そこから capture する（#390: ペイン消失後の追跡継続）
     let pane_identity_ok = backend.is_some();
     let scrollback = if let Some(ref backend) = backend {
         capture_scrollback_joined(backend, lines)
-    } else if let Some(ref ts) = query.tmux_session {
+    } else if let Some(ref ts) = tmux_session {
         if crate::reach::session_alive(ts) {
             result["source_fallback"] = json!("registry_tmux");
             capture_scrollback_joined(ts, lines)
@@ -11462,12 +11555,15 @@ fn dispatch_orchestrator_report(
     // （pane ID 再利用時に別 worker の transcript を返さない。#390）。
     // pane から解決できなければレジストリ由来の session_id で継続
     let msg_count = messages.max(1);
+    // 同一性を確かめた器 = `host.backend_session(pane)` そのもの（`collect_report_ctx`）
     let pane_sid = if pane_identity_ok {
-        resolve_session_id_for_pane_via_host(host, target)
+        backend
+            .as_deref()
+            .and_then(crate::agents::resolve_session_id_for_backend)
     } else {
         None
     };
-    let transcript = pane_sid.or(query.session_id).and_then(|sid| {
+    let transcript = pane_sid.or(session_id).and_then(|sid| {
         let texts = crate::transcript::last_assistant_texts(&sid, msg_count).ok()?;
         if texts.is_empty() {
             return None;
@@ -12915,7 +13011,8 @@ pub struct WorkerStatusCtx {
     /// 入力欄のテキスト属性（#1297。`tako_read_pane` の `input_status.style` と同じ 1 実装）。
     /// **None = 属性が取れない**（ペインが GUI に無く素の tmux capture へ落ちた等）
     input_style: Option<tako_core::InputStyle>,
-    /// tmux セッション配下に実行中の子プロセスがあるか（#224）
+    /// tmux セッション配下に実行中の子プロセスがあるか（#224）。
+    /// UI スレッドの収集では埋めず、background の [`probe_running_children`] が埋める（#1968）
     has_running_children: bool,
     /// 利用上限後の自動復帰の状態（#813。UI スレッドで写し取る）
     limit_resume: Value,
@@ -12956,20 +13053,35 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
         .and_then(|session| session.analyze_input())
         .map(|status| status.style);
     let backend_session = host.backend_session(target);
-    let has_running_children = backend_session
-        .as_ref()
-        .is_some_and(|bs| crate::agents::has_running_children(bs));
     WorkerStatusCtx {
         pane_id,
         pane_exists: in_tree || host.workspace().is_shelved(target),
         backend_session,
-        has_running_children,
+        // 子プロセスの有無は `tmux list-panes` + `ps` の 2 プロセスを起こすので、ここ
+        // （UI スレッド）では数えない。後段の [`probe_running_children`] が background で埋める（#1968）
+        has_running_children: false,
         live_tail: lines.map(tail_join),
         full_screen,
         input_style,
         limit_resume: limit_resume_entry(host, target),
         mod_state: crate::claude_mod::ModSnapshot::capture(host, target),
     }
+}
+
+/// 器の配下に実行中の子プロセスがあるかを埋める（#224）。**UI スレッドで呼ばない**（#1968）。
+///
+/// `agents::has_running_children` は `tmux list-panes -a` と `ps` を 1 回ずつ起こす。
+/// 旧実装は [`collect_worker_status_ctx`]（= `prepare_offload` の UI スレッド部）で数えていたので、
+/// master の watch が worker の状態を引くたびに UI スレッドが子プロセスの出力待ち（`poll`）で
+/// 止まっていた。しかも `prepare_offload` は計測区間の外なので perf.log にも出なかった
+/// （本番と同じ構成の隔離 GUI の修正前の形で、メインスレッドの 10 秒 `sample` の約 11% がここ）。
+/// 同一性の検証（[`verify_ctx_pane_identity`]）の**後**に呼ぶ = 別ペインの器は数えない
+fn probe_running_children(mut ctx: WorkerStatusCtx) -> WorkerStatusCtx {
+    ctx.has_running_children = ctx
+        .backend_session
+        .as_deref()
+        .is_some_and(crate::agents::has_running_children);
+    ctx
 }
 
 /// `claude agents --json` の生 status を dispatch の語彙へ正規化する（#267）。
