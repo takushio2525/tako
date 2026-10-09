@@ -303,7 +303,8 @@ done
 check_eq "バイトの進み具合は単調に増える" "1" "$MONO"
 [ -n "$ETA" ] && pass "写し始めて 2 秒経つと eta_secs（残り時間の目安）が出る（${ETA} 秒）" \
   || fail "eta_secs が出ない"
-CANCEL="$(mcp_text "$(mcp_call "{\"op\":\"copy_cancel\",\"name\":\"${ID:-0}\"}")")"
+# JSON は jq で組む（`"$(f "{…,…}")"` の形は bash 3.2 が波括弧展開して語を割る = #1924）
+CANCEL="$(mcp_text "$(mcp_call "$(jq -n -c --arg id "${ID:-0}" '{op:"copy_cancel",name:$id}')")")"
 check_eq "MCP の copy_cancel が番号で取り消す" "[${ID:-}]" "$(printf '%s' "$CANCEL" | jq -c '.cancelled' 2>/dev/null)"
 wait "$BG_PID"
 RC=$?
@@ -368,7 +369,7 @@ chmod 755 "$E/locked"
 check_eq "書けないフォルダに何も残さない" "0" "$(find "$E/locked" -mindepth 1 | wc -l | tr -d ' ')"
 OUT="$(mcp_text "$(mcp_call '{"op":"copy","paths":[]}')")"
 case "$OUT" in *"1 つ以上"*) pass "MCP: 空の paths は断る（0 件）" ;; *) fail "空の paths: $OUT" ;; esac
-OUT="$(mcp_text "$(mcp_call "{\"op\":\"copy\",\"paths\":[\"$E/src/a.txt\"]}")")"
+OUT="$(mcp_text "$(mcp_call "$(jq -n -c --arg a "$E/src/a.txt" '{op:"copy",paths:[$a]}')")")"
 case "$OUT" in *dest*) pass "MCP: dest の無いまとめたコピーは断る" ;; *) fail "dest 無し: $OUT" ;; esac
 stop_isolated_gui "$APP_PID"
 APP_PID=""
