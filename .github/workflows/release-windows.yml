@@ -126,11 +126,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
+      # ci.yml と同じ理由（#1915）。[profile.release] はルートの Cargo.toml にあるので、
+      # 指紋が無いと lto / codegen-units を変えても変更前のキャッシュが当たり続ける
+      - name: ルートの Cargo.toml の指紋（rust-cache のキー。#1915）
+        id: cargo-root
+        shell: bash
+        run: key=$(bash scripts/lib/cargo-root-manifest-key.sh) && echo "key=$key" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           # ci.yml（debug）とは別のキャッシュ。release は lto=thin / codegen-units=1 で
           # 成果物が全く違うため、混ぜると毎回フルビルドになる
-          key: release-dist
+          key: release-dist-manifest-${{ steps.cargo-root.outputs.key }}
           # ドライランの release ビルドは数 GB あり、保存すると main の CI のキャッシュを
           # 押し出しうるので、保存はタグの実行だけにする
           save-if: ${{ github.ref_type == 'tag' }}

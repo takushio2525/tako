@@ -2762,6 +2762,27 @@ Windows ランナーには **psmux / tmux / claude / codex CLI が無く、セ�
 （例: #1557 = `remote::is_process_alive` が Windows で常に false）。
 「直したら ignore を外す」が Issue 側からも辿れる状態にする。
 
+## CI のビルドキャッシュのキー（Issue #1915）
+
+rust-cache（`Swatinem/rust-cache@v2`）を使う箇所（`ci.yml` の macOS / Windows・
+`release-windows.yml`）は、**直前のステップで `scripts/lib/cargo-root-manifest-key.sh` の
+指紋を作り、rust-cache の `key` へ渡す**。rust-cache を新しく足すときもこの 2 ステップの組にする
+（テスト `scripts/test-cargo-root-manifest-key-1915.sh` が CI の macOS ジョブで数と並びを見る）。
+
+- rust-cache がキーの末尾へ混ぜるのは、メンバーの Cargo.toml・Cargo.lock（レジストリ由来の行）・
+  `.cargo/config.toml`・rust-toolchain だけで、**ルートの仮想マニフェストは入らない**
+  （v2.9.2 のソースと CI ログの「Lockfiles considered」で確認。README の「どこにあっても」は
+  実装と食い違う）。指紋が無いと `[profile.*]` や `[workspace.dependencies]` の features を
+  変えても変更前のキャッシュが完全一致で当たり続け、下流を毎回作り直したうえ保存もされない（#1912 で実測）
+- 指紋は `[workspace.package]` の version・行全体のコメント・空行・改行コードを無視する。
+  version は夜間リリースがほぼ毎日上げる（直近 90 日で 65 回）ので、混ぜると毎日キャッシュが外れる
+- `key` 入力は**復元の前方一致キーの側にも入る**（rust-cache の `restoreKey` = 接頭辞 + 環境のハッシュ）。
+  だから指紋が変わった最初の 1 回は復元無し（コールド）で組む。Cargo.lock の変更のような
+  部分復元にはならない。版以外の変更は直近 90 日で 9 コミットなので、その回だけの費用として受け入れている
+- 設定の置き場で効き方が違う: `.cargo/config.toml` はキーの末尾に入る（変えると部分復元 + 保存）、
+  ルートの Cargo.toml は指紋経由で接頭辞に入る（変えるとコールド 1 回 + 保存）。
+  どちらも「変えたのにキャッシュが古いまま」にはならない
+
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
 **永続ファイルの形式や置き場を変えるときは自動移行を同梱する。手動移行を要求しない。**

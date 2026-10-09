@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1890: visual-test 節 large-file-decor が debug で必ず落ちる = 塗りの戻りを回数の窓で待っていたのを、走っている間だけ待つ状態待ちにした）
-- 真因: 読み取り表示 / 編集開始の全文の塗りを 3000 / 6000 回 × 10ms の窓で待ち、debug は 10 MB の 1 回の塗りが 418.8〜473.8 秒（窓は約 118 秒）。節が入った `deecfc9` の debug でも同じ箇所で落ちる = 実回帰ではない（release も CRLF で窓の 65%）。`wait_for_background_highlight`（`view_highlights_running` / `highlight_pending` の間だけ待ち、戻ったのに揃わなければ即偽）へ 2 節 4 か所を寄せた
-- 実測: `scripts/test-highlight-wait-1890.sh`（遅れ 150 秒の注入で緑・`TAKO_1890_LEGACY=view|seed` で名指しの FAILED・`drop` は上限前に Settled）・debug 単独で緑（30 分）・番犬 4 本（注入 7 通りを file:line で名指し）
-
 ## 2026-10-09（#1880: tako mod S2 = mod の報告を ctx%・使用制限・ターン状態の一次ソースにした）
 - `ctx_usage::resolve_full`（mod → 画面 → transcript）を 4 経路（self / worker_status / #749 tick / チャットヘッダ）が通り、引き当ては `claude_mod::lookup` の 1 本（落ちた理由は `ctx_mod_reason` / `mod_reason`）。使用制限はアカウント単位で束ね（resets_at → % の大きい方）、解除時刻だけ `LimitHint::from_mod`（停止の判定は画面のまま）。ターン状態は mod の turn が先・respond は画面。effort は `turn.step` から（組織アカウントでも欠けない）。A/B `TAKO_1877_S2_LEGACY=1`
 - 実測: `scripts/test-mod-primary-1880.sh` fake 段・claude 段（statusLine なしの実 claude で 4 経路が mod / SIGSTOP で 47 秒後 mod_stale）・番犬 `issue1880_mod_primary_watchdog.rs`（注入 6 通り）・`claude plugin test` 12 本
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1922: 偽の言語サーバを起こす LSP の e2e が Windows で間欠的に落ちるのを、読み込みの終わりと manager が知った状態で揃えて直した）
 - 真因 3 つを注入で確定: ①manager が `quiescent: false` を処理する前に送る（`READY_POLL` 1 周期。知らせ遅延 20ms 以上で 10/10・CI と同じ :214 / :221。Windows の probe では修正前 100 回中 10 回・10 回ともこの順序）②読み込みが要求より先に済む ③上限つきの要求を起動ごと測る（起動遅延 1.2 秒で 1680:329）。`tests/common/lsp_fake_e2e.rs`（`LoadingGate` = `--loading-until`・`wait_loading_known`・`wait_running`）へ 4 ファイルを寄せ、偽サーバは知らせを 50ms 遅らせて送る
 - 実測: Windows CI で 4 本（37 テスト）× 20 周・修正後の形 100 + 50 回・起動 2.2 秒遅延の注入がすべて緑。番犬 `issue1922_lsp_loading_wait_watchdog`（注入 11 通りを file:line で名指し）
+
+## 2026-10-09（#1915: CI の rust-cache のキーにルートの Cargo.toml の指紋を混ぜた）
+- rust-cache v2.9.2 はメンバーの Cargo.toml と Cargo.lock だけをキーに混ぜ、ルートの仮想マニフェストは入らない（ログの「Lockfiles considered」でも無い）。`scripts/lib/cargo-root-manifest-key.sh`（[workspace.package] の version・行全体のコメント・空行・CRLF を除いた 8 桁）を ci.yml の macOS / Windows と release-windows.yml の `key` へ渡す。規約は conventions.md「CI のビルドキャッシュのキー」
+- 実測: テスト 27 PASS（注入 8 通りを名指し・本物を正当に変えた 4 通りで偽の赤なし）・actionlint 0 件。CI ログのキー比較は PR のコメント
