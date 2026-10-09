@@ -2009,6 +2009,24 @@ syntect へ通していた**。release 実測（同じ構文セット・テー�
   そのペインでの打鍵・Esc で閉じる。重ね順は補完の一覧が手前。右クリックメニュー（#1684）を開いているあいだは
   出さない（カードはメニューより手前に積まれる = 出すと隠す）。メニューの項目のホバーは #1893 で足した（下）
 
+### 取り消しの番号の取り口の一本化（#1909。2026-10-09）
+
+- **競合**: 取り消し合う要求（打鍵の補完・説明の補い・マウスのホバー）は GUI が背景へ渡し、背景が走り出す
+  までに隙間がある。番号を背景で取ると、その隙間に UI が出した取り消し（一覧を閉じた・語の外へ出た・語から
+  外れた）を追い越して自分が最新になり、読み込みが済むまで待ち続ける（サーバが答えずに待たせていれば
+  `pending_requests` にも残り、済んだ後に閉じた一覧の答えを受け取る）。#1893 でホバーだけ直していた
+- **直し方**: 番号は UI スレッドで先に取る（`LspManager::reserve_completion` / `reserve_resolve` /
+  `reserve_hover` → `CompletionRequest::ticket` / `resolve_completion` の `ticket` / `HoverRequest::ticket`）。
+  背景は 3 つとも manager の `Shared::enter_lane` の 1 つの口から列へ入り、UI の番号があればそれを使う
+  （無いときだけその場で取る = CLI / MCP は `superseding: false` なので列へ入らない）。`supersede(` を呼んで
+  よいのは UI スレッドの口（`reserve_*` / `cancel_*`）と `enter_lane` だけ（番犬が他の関数の呼び出しを名指す）
+- **観測**: 列へ入ってまだ答えを返していない数を `Inflight::running` に数え（置き換えでは消さない）、
+  `tako lsp status` / MCP `tako_lsp_server` の `inflight`（`completion` / `resolve` / `hover`）に出す。
+  取り消した古い要求が読み込み待ちに残っていれば 0 に戻らない
+- **注入と A/B**: `TAKO_1909_INJECT_HOLD=<ファイル>` で背景の走り出しを合図まで止め（`enter_lane` の中で
+  番号を決める前）、その間に UI の取り消しが入る順序をどの機でも作る（visual-test `completion-cancel`）。
+  `TAKO_1909_LEGACY=1` は GUI が補完と説明の補いの番号を背景で取る #1909 の前の形
+
 ### ホバーの続き（#1893。2026-10-09）
 
 - **入口は 1 本**: 編集メニュー・パレット・キー（⇧⌘H / Ctrl+Shift+H = `keybindings::hover_bindings`）・

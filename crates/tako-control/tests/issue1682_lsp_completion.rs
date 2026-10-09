@@ -127,6 +127,7 @@ fn request(path: &Path, line: usize, column: usize, superseding: bool) -> Comple
         document: None,
         trigger: Trigger::Word,
         superseding,
+        ticket: None,
         resolve_top: 0,
     }
 }
@@ -315,7 +316,7 @@ fn 上位の候補だけ説明を補う() {
     assert_eq!(of_method(&scratch, "completionItem/resolve").len(), 3);
     // GUI の口（選んだ 1 件）: 元の JSON を渡すと説明つきで返る
     let one = manager
-        .resolve_completion(&main, &answer.items[7].raw)
+        .resolve_completion(&main, &answer.items[7].raw, None)
         .expect("resolve");
     assert_eq!(one["documentation"], json!("doc of cand0007"));
     manager.shutdown_all(Duration::from_secs(2));

@@ -28802,6 +28802,11 @@ mod self_test {
     mod mod_limits;
     #[cfg(feature = "visual-test")]
     use mod_limits::mod_limits_visual;
+    /// #1909: 補完の打鍵の取り消しの番号を UI スレッドで先に取る（visual-test `completion-cancel`）
+    #[cfg(feature = "visual-test")]
+    mod completion_cancel_1909;
+    #[cfg(feature = "visual-test")]
+    use completion_cancel_1909::completion_cancel_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -43040,6 +43045,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1909: 閉じた後に遅れて走り出した打鍵の要求が取り消しを追い越さないか（偽サーバ）
+                "completion-cancel" => {
+                    completion_cancel_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1682: 実の rust-analyzer の候補が出て Enter で入るか（無ければ SKIPPED）
                 "completion-real" => {
                     completion_real_visual(any, window, cx).await;
@@ -48371,6 +48382,7 @@ mod self_test {
                         document: None,
                         trigger: tako_core::lsp::completion::Trigger::Character('.'),
                         superseding: false,
+                        ticket: None,
                         resolve_top: 0,
                     })
                 })

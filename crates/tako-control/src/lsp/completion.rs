@@ -72,6 +72,16 @@ pub fn legacy_1869() -> bool {
     )
 }
 
+/// `TAKO_1909_LEGACY=1` で **#1909 前の形**へ戻す（同一バイナリで A/B を取る入口）: GUI は打鍵の
+/// 補完と説明の補いの取り消しの番号を UI スレッドで取らず、背景が問い合わせの頭で取る
+/// （一覧を閉じた・語の外へ出た取り消しを追い越して、読み込みが済むまで待ち続ける）
+pub fn legacy_1909() -> bool {
+    matches!(
+        std::env::var("TAKO_1909_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 問い合わせ 1 回ぶん（UI スレッドで作り、背景スレッドで [`super::LspManager::completion`] へ渡す）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionRequest {
@@ -89,6 +99,11 @@ pub struct CompletionRequest {
     /// （`$/cancelRequest` を送り、待っている側は [`CompletionError::Superseded`] で返る）。
     /// CLI / MCP の要求は `false`（1 回ずつ答えを待つ。互いに取り消し合わない）
     pub superseding: bool,
+    /// `superseding` の要求の取り消しの番号を、UI スレッドで先に取ったもの
+    /// （[`super::LspManager::reserve_completion`]。#1909）。`None` なら manager が背景で取る。
+    /// 背景で取ると、その前に UI が一覧を閉じた・語の外へ出た取り消し（`cancel_completion`）を
+    /// **追い越して**自分が最新になり、読み込みが済むまで待ち続ける（ホバーの #1893 と同じ競合）
+    pub ticket: Option<u64>,
     /// 絞り込み後の上位この件数の説明を `completionItem/resolve` で補ってから返す
     /// （CLI / MCP の `resolve`。0 = 補わない。GUI は選んだ 1 件だけを後から補う）
     pub resolve_top: usize,

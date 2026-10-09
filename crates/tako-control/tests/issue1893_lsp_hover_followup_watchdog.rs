@@ -126,7 +126,7 @@ const RULES: &[Rule] = &[
     Rule {
         file: MANAGER,
         decl: "    fn hover(&self, request: &HoverRequest)",
-        must: &["request\n                    .ticket"],
+        must: &["self.enter_lane(Lane::Hover, request.ticket)"],
         must_not: &[],
         why: "UI が先に取った取り消しの番号を使わずに背景で取り直している（取り消しを追い越す）",
     },
@@ -417,8 +417,8 @@ fn 逆戻りを名指しできる() {
         "K 番号を取り直す",
         MANAGER,
         (
-            "                request\n                    .ticket\n                    .unwrap_or_else(|| self.supersede(Lane::Hover)),",
-            "                self.supersede(Lane::Hover),",
+            "self.enter_lane(Lane::Hover, request.ticket)",
+            "self.enter_lane(Lane::Hover, Some(self.supersede(Lane::Hover)))",
         ),
         "    fn hover(&self, request: &HoverRequest)",
     );

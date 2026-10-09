@@ -1511,6 +1511,7 @@ pub fn lsp_completion_prepare(
             // 明示の問い合わせ = 語の途中でもきっかけの文字の直後でも「呼び出した」
             trigger: tako_core::lsp::completion::Trigger::Word,
             superseding: false,
+            ticket: None,
             resolve_top: if resolve { limit } else { 0 },
         },
         landing: LspCompletionLanding {
