@@ -24,7 +24,7 @@
 // - 会話の本文・プロンプト・ツールの引数は報告に載せない（ツール名だけ）
 import type { EngineInterface, Register, SessionRateLimit, Timer } from 'claude-code'
 
-import type { TakoModReport, TakoRateLimit, TakoTurn, TakoView, TakoWorker } from '../types'
+import type { TakoLimitsSeen, TakoModReport, TakoRateLimit, TakoTurn, TakoView, TakoWorker } from '../types'
 
 // 展開時（tako_core::claude_mod::install）に tako の版へ置き換わる
 const MOD_VERSION = '__TAKO_MOD_VERSION__'
@@ -50,6 +50,9 @@ const BAND_KEY = 'band'
 // $.state（セッションの値。描画が購読するので、書けば読み手が描き直される）
 const VIEW = { plugin: 'tako', key: 'view' } as const
 const HIDDEN = { plugin: 'tako', key: 'bandHidden' } as const
+// 使用制限の窓ごとの観測時刻（#1903）。$.state に置くのはホットリロード（tako の更新で mod が
+// 書き換わる）をまたいで残すため。モジュール変数だと読み込み直しのたびに全窓を「今」の観測にしてしまう
+const LIMITS_SEEN = { plugin: 'tako', key: 'limitsSeen' } as const
 
 // モジュール変数。ホットリロードで消えるが、そのとき session.start が再発火して張り直す
 let cli: string | undefined
@@ -90,8 +93,38 @@ function effortLevel(value: unknown): string | undefined {
   return undefined
 }
 
-function rateLimit(limit: SessionRateLimit, at: number): TakoRateLimit {
-  return { kind: limit.kind, percent_used: limit.percentUsed, resets_at: limit.resetsAt, observed_at: at }
+// 使用制限に観測時刻を付ける（#1903）。窓ごとに % か resetsAt が変わったときだけ今の時刻を打ち、
+// 変わらなければ前に打った時刻のまま送る。heartbeat で打ち直すと、1 時間放置したペインの古い % も
+// 「今」の観測に見え、tako が同じアカウントの値を最新の観測で束ねられない（設計書 §6）。
+// $.state を読めない・書けないときは今の時刻を打つ（報告そのものは止めない = §5 の「失敗で騒がない」）
+async function stampLimits($: EngineInterface, limits: readonly SessionRateLimit[], at: number): Promise<TakoRateLimit[]> {
+  let seen: TakoLimitsSeen = {}
+  try {
+    seen = (await $.state.get(LIMITS_SEEN)).value ?? {}
+  } catch (err) {
+    $.ui.log(`tako mod: limitsSeen unreadable: ${String(err).slice(0, 200)}`, { to: 'debug' })
+  }
+  const next: TakoLimitsSeen = {}
+  let changed = Object.keys(seen).length !== limits.length
+  const out = limits.map(limit => {
+    const prev = seen[limit.kind]
+    const same = prev !== undefined && prev.percent_used === limit.percentUsed && prev.resets_at === limit.resetsAt
+    if (!same) changed = true
+    const observed = same ? prev.observed_at : at
+    next[limit.kind] =
+      limit.resetsAt === undefined
+        ? { percent_used: limit.percentUsed, observed_at: observed }
+        : { percent_used: limit.percentUsed, resets_at: limit.resetsAt, observed_at: observed }
+    return { kind: limit.kind, percent_used: limit.percentUsed, resets_at: limit.resetsAt, observed_at: observed }
+  })
+  if (changed) {
+    try {
+      await $.state.set(LIMITS_SEEN, next)
+    } catch (err) {
+      $.ui.log(`tako mod: limitsSeen unwritable: ${String(err).slice(0, 200)}`, { to: 'debug' })
+    }
+  }
+  return out
 }
 
 // 報告を組む。欠けた値（最初の API 応答の前の ctx% など）は undefined のまま = JSON から落ちる
@@ -108,7 +141,7 @@ async function buildReport($: EngineInterface, ended: boolean): Promise<TakoModR
     model: await $.session.model(),
     effort,
     context: { tokens: usage.context.tokens, window: usage.context.window, percent: usage.context.percent },
-    rate_limits: usage.rateLimits.map(limit => rateLimit(limit, at)),
+    rate_limits: await stampLimits($, usage.rateLimits, at),
     cost_usd: usage.cost?.usd,
     turn,
     pending_tool: pendingTool,

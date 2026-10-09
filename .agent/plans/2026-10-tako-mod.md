@@ -456,10 +456,11 @@ S1〜S6 には入れない。
   「ctx% が null の理由」のまま変えていない（意味を混ぜると、画面から取れたときに理由が入って
   読み手が null 判定を誤る）。語彙は `tako mod` の行の `reason.code` と同じ（+ `mod_no_usage` /
   `legacy_env`）。引き当ては `tako_core::claude_mod::lookup` の 1 本
-- **使用制限の束ね方は「最新の `observed_at`」ではない**: mod は heartbeat（15 秒）のたびに
-  `$.session.usage()` を読み直して報告時刻を `observed_at` に打つので、1 時間放置したペインの古い %
-  も「今」の時刻で届く。窓の種類ごとに「`resets_at` が遅い（= 新しい窓）→ 同じ窓なら `percent_used`
-  が大きい（同じ窓の中で使用率は減らない）→ `observed_at`」で選ぶ
+- ~~使用制限の束ね方は「最新の `observed_at`」ではない~~（**#1903 で最新の観測へ戻した**。下記）:
+  S2 の時点の mod は heartbeat（15 秒）のたびに `$.session.usage()` を読み直して報告時刻を
+  `observed_at` に打っていたので、1 時間放置したペインの古い % も「今」の時刻で届いた。そのため
+  S2 は「`resets_at` が遅い（= 新しい窓）→ 同じ窓なら `percent_used` が大きい → `observed_at`」で
+  選んでいた（A/B `TAKO_1903_LEGACY=1` で今も選べる）
 - 停止の手がかり（`LimitHint::from_mod`）は `percent_used >= 100` の窓の解除時刻（複数なら遅い方）。
   上限に当たっていなければ手がかり無し（画面のパースのまま）= codex #985 と同じ型
 - `permission` / `question` は承認・回答の後もそのツールが返るまで残る（FR-2.42.7）ので、
@@ -470,6 +471,22 @@ S1〜S6 には入れない。
   `chat_header`（チャットヘッダの残量バー）
 - A/B: `TAKO_1877_S2_LEGACY=1`（報告は受け取るが一次ソースに使わない）。実経路テストは
   `scripts/test-mod-primary-1880.sh`、番犬は `crates/tako-control/tests/issue1880_mod_primary_watchdog.rs`
+
+**S2 の続き（#1903）で変えたこと**（要件は FR-2.42.11 / FR-2.42.18）:
+
+- **`observed_at` は値が変わったときだけ打つ**（`register.ts` の `stampLimits`）: 窓ごとに「% か
+  `resets_at` が前と違えば今の時刻、同じなら前の時刻」。窓ごとの時刻は `$.state` の `limitsSeen` に置く
+  （モジュール変数だとホットリロード = tako の更新で mod が書き換わるたびに全窓が「今」の観測になる）。
+  鮮度は従来どおり tako の受信時刻（`StoredReport::received`）で測るので、heartbeat の意味は変わらない
+- **束ね方を本節の表どおり「最新の観測」へ**: 窓の種類ごとに `observed_at` が新しい → 同時刻なら
+  `resets_at` が遅い → % が大きい。S2 の順と違いが出るのは「同じ窓の % が下がった」とき（上限の
+  引き上げ・早めのリセット）で、S2 の順は放置したペインの古い大きい % を採り続けていた
+- **ステータスバーの 5h / 7d も mod を先に見る**: フォーカス順で最初に mod の使用制限が引けたペインの
+  アカウントの値（`account_rate_limits` の 1 実装）。5h / 7d の窓が無ければ画面の値。取得元は
+  `tako limit-service --refresh` の `claude.source`
+- 検査スクリプトは 1 実装（`scripts/check-claude-mod.sh`）。注記の文言一致に肯定形の自己検査を足した
+  （`.agent/release.md`「tako mod の検査」）。実経路テストは `scripts/test-mod-limits-1903.sh`、
+  番犬は `crates/tako-control/tests/issue1903_mod_limits_watchdog.rs`
 
 ## 7. スライス
 

@@ -26886,6 +26886,56 @@ mod tests {
         assert_eq!(v["status"], "idle");
     }
 
+    /// #1903: ステータスバーの 5h / 7d は mod の報告を先に見る（フォーカス順で最初に引けたペインの
+    /// アカウント）。どのペインにも無い・古くなったら画面の値へ戻る
+    #[test]
+    fn issue1903_ステータスバーの使用制限はmodを先に見て古くなれば画面へ戻る() {
+        use tako_core::claude_mod::BarLimitSource;
+        let report = |config_dir: &str, five: f64, week: f64| {
+            tako_core::claude_mod::parse_report(json!({
+                "schema": 1, "mod_version": "t", "at": 1, "turn": "idle",
+                "config_dir": config_dir,
+                "rate_limits": [
+                    {"kind": "five_hour", "percent_used": five, "resets_at": "2026-10-08T14:30:00.000Z", "observed_at": 1},
+                    {"kind": "seven_day", "percent_used": week, "resets_at": "2026-10-10T13:00:00.000Z", "observed_at": 1},
+                ],
+            }))
+            .unwrap()
+        };
+        let mut host = MockHost::new();
+        let t0 = std::time::Instant::now();
+        host.claude_mod.accept(1, report("/acct-a", 42.0, 17.0), t0);
+        host.claude_mod.accept(2, report("/acct-b", 77.0, 61.0), t0);
+        let screen = (Some(23), Some(46));
+        let pane = PaneId::from_raw;
+        // フォーカス（9 = 報告の無いシェル）→ 2 → 1 の順: 最初に引けた 2 のアカウント
+        let bar =
+            crate::claude_mod::status_bar_limits(&host, &[pane(9), pane(2), pane(1)], screen, t0);
+        assert_eq!(
+            (bar.five_hour, bar.seven_day, bar.source),
+            (Some(77), Some(61), Some(BarLimitSource::Mod)),
+            "画面の 23 / 46 より mod を先に見る"
+        );
+        // フォーカスが 1 なら 1 のアカウント（別アカウントの値と混ぜない）
+        let bar = crate::claude_mod::status_bar_limits(&host, &[pane(1), pane(2)], screen, t0);
+        assert_eq!((bar.five_hour, bar.seven_day), (Some(42), Some(17)));
+        // mod の無いペインだけ = 画面の値
+        let bar = crate::claude_mod::status_bar_limits(&host, &[pane(9)], screen, t0);
+        assert_eq!(
+            (bar.five_hour, bar.seven_day, bar.source),
+            (Some(23), Some(46), Some(BarLimitSource::Screen))
+        );
+        // 報告が古くなる（45 秒で失効）と画面の値へ戻る・画面にも無ければ出さない
+        let later = t0 + tako_core::claude_mod::FRESH_FOR + std::time::Duration::from_secs(1);
+        let bar = crate::claude_mod::status_bar_limits(&host, &[pane(2), pane(1)], screen, later);
+        assert_eq!(
+            (bar.five_hour, bar.seven_day, bar.source),
+            (Some(23), Some(46), Some(BarLimitSource::Screen))
+        );
+        let bar = crate::claude_mod::status_bar_limits(&host, &[pane(2)], (None, None), later);
+        assert_eq!(bar, tako_core::claude_mod::BarLimits::default());
+    }
+
     /// #1880: 承認後もツールが返るまで permission が残る = 画面が生成中なら busy
     #[test]
     fn issue1880_承認後のツール実行中はpermissionでもbusy() {

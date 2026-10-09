@@ -22,9 +22,15 @@ export type TakoRateLimit = {
   kind: string
   percent_used: number
   resets_at?: string
-  /** この値を読んだ時刻（epoch ms）。アカウント単位の値を束ねるときに新しい方を採る */
+  /**
+   * この値を観測した時刻（epoch ms）。% か resets_at が変わったときだけ打ち直す（heartbeat では
+   * 前の時刻のまま = #1903）。tako はアカウント単位の値を束ねるときに新しい方を採る
+   */
   observed_at: number
 }
+
+/** $.state の limitsSeen（窓の種類 → 最後に値が変わった観測）。ホットリロードをまたいで残す */
+export type TakoLimitsSeen = Record<string, { percent_used: number; resets_at?: string; observed_at: number }>
 
 export type TakoModReport = {
   schema: 1
@@ -108,6 +114,8 @@ declare module 'claude-code' {
       view: TakoView | null
       /** 帯を隠すトグル（$.store の band の写し。描画が購読する） */
       bandHidden: boolean
+      /** 使用制限の窓ごとの観測時刻（#1903。描画は読まない） */
+      limitsSeen: TakoLimitsSeen
     }
   }
 }

@@ -2292,6 +2292,8 @@ struct TakoApp {
     video_ticker: bool,
     /// 全ペインから集約した Claude エージェントメトリクス（ctx/usage。ポーリングで更新）
     agent_metrics: AgentMetrics,
+    /// ステータスバーの 5h / 7d の取得元（#1903。mod / screen。`tako limit-service --refresh` に載る）
+    claude_limit_source: Option<tako_core::claude_mod::BarLimitSource>,
     /// master ペインごとの自動ハンドオフ通知の状態（Issue #749）。
     /// 揮発（再起動でリセット = 復元直後の誤爆は NUDGE_GRACE が受け止める）
     handoff_nudges: HashMap<PaneId, HandoffNudgeTracker>,
@@ -4329,6 +4331,7 @@ impl TakoApp {
             pinned_previews: Vec::new(),
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
+            claude_limit_source: None,
             handoff_nudges: HashMap::new(),
             handoff_policy_cache: HashMap::new(),
             limit_resume: HashMap::new(),
@@ -15802,8 +15805,8 @@ impl TakoApp {
         // 入るので**中身が素のシェルでも true**（`remote_open_watchdog` が固定している
         // 性質）= ここで落ちるのは器なしの素のシェルだけで、取りこぼしは増えない
         let gate_alt_screen = !tako_core::terminal::c2_legacy();
-        for pid in pane_ids {
-            if let Some(session) = self.terminals.get(&pid) {
+        for pid in &pane_ids {
+            if let Some(session) = self.terminals.get(pid) {
                 if gate_alt_screen && !session.is_alt_screen() {
                     continue;
                 }
@@ -15832,6 +15835,17 @@ impl TakoApp {
             }
         }
         self.agent_metrics = best_claude.unwrap_or_default();
+        // #1903: 5h / 7d は tako mod の報告（アカウント単位で束ねた値）を先に見る。同じフォーカス順で
+        // 最初に引けたペインのアカウント。どのペインにも無ければ画面の値のまま
+        let bar = tako_control::claude_mod::status_bar_limits(
+            self,
+            &pane_ids,
+            (self.agent_metrics.limit_5h, self.agent_metrics.limit_week),
+            std::time::Instant::now(),
+        );
+        self.agent_metrics.limit_5h = bar.five_hour;
+        self.agent_metrics.limit_week = bar.seven_day;
+        self.claude_limit_source = bar.source;
         // #985: 構造化ソース（rollout の rate_limits）があればそちらが正。
         // 画面由来（#357 のスクレイピング）は codex の TUI が数値を出していた版への
         // 後方互換として残す
@@ -22983,8 +22997,11 @@ impl UiStateHost for TakoApp {
                 l2: metrics.limit_week,
             })
         };
+        let mut claude = m(&self.agent_metrics, "5h", "7d");
+        // #1903: ステータスバーの 5h / 7d の取得元（mod = tako mod の報告 / screen = 画面 / null = 無し）
+        claude["source"] = serde_json::json!(self.claude_limit_source.map(|s| s.as_str()));
         serde_json::json!({
-            "claude": m(&self.agent_metrics, "5h", "7d"),
+            "claude": claude,
             "codex": m(&self.codex_metrics, "primary", "secondary"),
             "agy": { "status": "unsupported" },
         })
@@ -28780,6 +28797,11 @@ mod self_test {
     mod tree_keys;
     #[cfg(feature = "visual-test")]
     use tree_keys::tree_keys_visual;
+    /// #1903: ステータスバーの 5h / 7d が mod の報告の値で描かれるか（visual-test `mod-limits`）
+    #[cfg(feature = "visual-test")]
+    mod mod_limits;
+    #[cfg(feature = "visual-test")]
+    use mod_limits::mod_limits_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -43146,6 +43168,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1903: ステータスバーの 5h / 7d が mod の報告の値で描かれ、古くなると戻るか
+                "mod-limits" => {
+                    mod_limits_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -43158,7 +43186,7 @@ mod self_test {
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
-                         hover-1893 / hover-loading / hover-loading-real）"
+                         hover-1893 / hover-loading / hover-loading-real / mod-limits）"
                     );
                     std::process::exit(1);
                 }

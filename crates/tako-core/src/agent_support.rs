@@ -866,7 +866,9 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Measured(
             "#985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を \
              読む形になり、有料プランの実データが出る。agy は取得不能を再確認して \
-             unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持）",
+             unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持）。\
+             #1903（claude）: tako mod の報告があれば 5h / 7d はその値、無ければ画面 \
+             （取得元は tako limit-service --refresh の claude.source）",
         ),
     },
     AgentFeature {

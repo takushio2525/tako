@@ -167,6 +167,12 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
   `claude plugin validate --strict` と `claude plugin test` にかける。合格の条件は終了コード 0 に加えて、
   ゲートになるフックの `.catch` 抜け（validate は注記に出すだけで合格させる = 設計書 §5 の規約違反）が
   無いこと・テストが 1 本以上走ったこと
+- **文言一致の自己検査**（#1903）: 上の 2 つは注記の文言（`gating hook without .catch` / `Ran 0 tests`）で
+  見ているので、Claude Code の更新で文言が変わると黙って効かなくなる。そこで**肯定形の行が出ていること**
+  （validate の `gating hook with .catch: <event>` = この mod のゲートになるフックの申告・test の要約
+  `Ran N test(s)`）も要求し、出ていなければ「注記の文言が変わった」で不合格にして通知する
+  （直す場所は `scripts/check-claude-mod.sh` の文言一致）。追加の claude の呼び出しは無い。
+  `scripts/test-claude-mod-1879.sh` の段 0 も同じ本体を呼ぶ（検査の実装は 1 つ）
 - **リリースの有無に依らず毎晩**回す（壊すのは tako の変更より Claude Code の更新なので、
   変更なし / dirty / 手動リリース進行中で抜ける前に置く。ロックを取った直後）
 - **結果でリリースを止めない**。落ちたらログに `ERROR` + 既存の通知（`tako 夜間リリース`）を出して先へ進む:

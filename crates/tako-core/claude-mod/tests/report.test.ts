@@ -15,15 +15,16 @@ const USAGE = {
 // 報告に載せてはならないキー（本文・プロンプト・ツールの引数）
 const BODY_KEYS = ['text', 'answer', 'prompt', 'message', 'messages', 'content', 'tool_input', 'command']
 
-// エンジンの下の世界を用意する。exitCode を変えると「tako が落ちている」を作れる
-function world(on: On, sent: Sent[], exitCode = 0): void {
+// エンジンの下の世界を用意する。exitCode を変えると「tako が落ちている」を作れる。
+// usage を渡すと $.session.usage() の答えを途中で変えられる（使用制限の観測時刻の検査。#1903）
+function world(on: On, sent: Sent[], exitCode = 0, usage: () => unknown = () => USAGE): void {
   // `$` の呼び出しは { value } で答える
   on('process.run', ($, e) => {
     sent.push({ argv: e.argv, report: JSON.parse(e.init?.stdin ?? '{}') as Record<string, unknown> })
     const stderr = exitCode === 0 ? '' : 'tako の外'
     return { value: { exitCode, stdout: '{}', stderr, isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('session.usage', () => ({ value: USAGE }))
+  on('session.usage', () => ({ value: usage() }))
   on('session.model', () => ({ value: 'claude-haiku-5-5' }))
   on('session.id', () => ({ value: 'session-1' }))
   on('session.version', () => ({ value: { version: '2.1.294' } }))
@@ -128,6 +129,68 @@ describe('tako mod の報告', () => {
     expect(sent.length).toBe(1)
     await clock.advance(2_000)
     expect(sent.length).toBe(2)
+  })
+
+  test('使用制限の observed_at は値が変わったときだけ打ち直す（heartbeat では前の時刻のまま。#1903）', async ($, on) => {
+    const sent: Sent[] = []
+    const FIVE = { kind: 'five_hour', percentUsed: 3, resetsAt: '2026-10-08T14:30:00.000Z' }
+    const WEEK = { kind: 'seven_day', percentUsed: 2, resetsAt: '2026-10-10T13:00:00.000Z' }
+    let limits: unknown[] = [FIVE]
+    world(on, sent, 0, () => ({ ...USAGE, rateLimits: limits }))
+    const clock = mock.clock(on, { now: 1_000_000 })
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    const observed = (): [string, number][] =>
+      (sent.at(-1)?.report.rate_limits as { kind: string; observed_at: number }[]).map(l => [l.kind, l.observed_at])
+    await $.session.start(START)
+    await clock.advance(1_000)
+    expect(observed()).toEqual([['five_hour', 1_001_000]])
+    // 変化が無いまま heartbeat が 2 回: 報告は届く（at は進む）が観測時刻は動かない
+    await clock.advance(30_000)
+    expect(sent.length).toBe(3)
+    expect(sent.at(-1)?.report.at).toBe(1_031_000)
+    expect(observed()).toEqual([['five_hour', 1_001_000]])
+    // % が動いた窓は打ち直し、新しく現れた窓は今の時刻
+    limits = [{ ...FIVE, percentUsed: 4 }, WEEK]
+    await clock.advance(15_000)
+    expect(observed()).toEqual([
+      ['five_hour', 1_046_000],
+      ['seven_day', 1_046_000],
+    ])
+    // resetsAt だけが変わっても打ち直す（新しい窓）。変わらない窓は前の時刻のまま
+    limits = [{ ...FIVE, percentUsed: 4, resetsAt: '2026-10-08T19:30:00.000Z' }, WEEK]
+    await clock.advance(15_000)
+    expect(observed()).toEqual([
+      ['five_hour', 1_061_000],
+      ['seven_day', 1_046_000],
+    ])
+    // session.start（ホットリロードでも来る）をまたいでも観測時刻は保つ（$.state に置いている）
+    await $.session.start(START)
+    await clock.advance(1_000)
+    expect(sent.at(-1)?.report.at).toBe(1_062_000)
+    expect(observed()).toEqual([
+      ['five_hour', 1_061_000],
+      ['seven_day', 1_046_000],
+    ])
+  })
+
+  test('$.state を読めなくても報告は止めず、今の時刻を打つ（#1903）', async ($, on) => {
+    const sent: Sent[] = []
+    world(on, sent)
+    // 下の層が読み取りを断る = $.state.get が失敗する（throw は下の層が握りつぶして素通しになる）
+    on('state.get', () => ({ deny: 'state unavailable' }) as never)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    mock.env(on, { TAKO_PANE_ID: '7', TAKO_CLI: '/opt/tako/tako' })
+    await $.session.start(START)
+    await clock.advance(1_000)
+    expect(sent.length).toBe(1)
+    expect(sent.at(-1)?.report).toEqual(
+      expect.objectContaining({
+        turn: 'idle',
+        rate_limits: [
+          { kind: 'five_hour', percent_used: 3, resets_at: '2026-10-08T14:30:00.000Z', observed_at: 1_001_000 },
+        ],
+      }),
+    )
   })
 
   test('サブエージェントの turn.complete ではターンを終えない', async ($, on) => {

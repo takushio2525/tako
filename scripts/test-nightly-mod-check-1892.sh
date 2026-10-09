@@ -22,6 +22,7 @@
 #   Test 9  利用者の Claude Code の設定に触らない（設定 dir は使い捨て・mtime が前後で一致）
 #   Test 10 実物の claude（あれば）: 本物の mod で合格・壊れた写しで不合格・利用者の設定の mtime が一致
 #           （claude が無い CI では「未実測」と出して飛ばす）
+#   Test 11 文言一致の自己検査（#1903）: validate / test の注記の文言が変わったら落ちる
 #
 # 使い方: bash scripts/test-nightly-mod-check-1892.sh
 set -uo pipefail
@@ -124,8 +125,18 @@ case "$(mode_of "$sub")" in
   hang) exec "$S/hang" ;;
   fail) echo "✘ forced failure ($sub)"; exit 1 ;;
   # 実物の validate はゲートの .catch 抜けを注記に出すだけで合格させる（2.1.294 で実測）
-  nocatch) printf '  ❯ ./register.ts gating hook without .catch: tool.call\n✔ Validation passed\n'; exit 0 ;;
+  nocatch) printf '  ❯ ./register.ts gating hook with .catch: classic.Stop\n  ❯ ./register.ts gating hook without .catch: tool.call\n✔ Validation passed\n'; exit 0 ;;
   zero) printf ' 0 pass\n 0 fail\nRan 0 tests across 0 files.\n'; exit 0 ;;
+  one) printf ' 1 pass\n 0 fail\nRan 1 test across 1 file.\n'; exit 0 ;;
+  # Claude Code の更新で注記の文言が変わった（#1903 の自己検査の相手。.catch 抜けも 0 本も含む）
+  reworded)
+    if [ "$sub" = validate ]; then
+      printf '  ❯ ./register.ts gate tool.call: no catch handler\n✔ Validation passed\n'
+    else
+      printf ' 0 pass\n 0 fail\nExecuted 0 tests in 0 files.\n'
+    fi
+    exit 0
+    ;;
 esac
 # auto: hooks.json が名指すモジュールがすべて在れば合格（実物の path-not-found と同じ判定）
 for m in $(sed -n 's/.*"modules": *\[\(.*\)\].*/\1/p' "$dir/hooks/hooks.json" | tr ',' ' ' | tr -d '"'); do
@@ -138,7 +149,12 @@ for m in $(sed -n 's/.*"modules": *\[\(.*\)\].*/\1/p' "$dir/hooks/hooks.json" | 
     exit 1
   fi
 done
-if [ "$sub" = validate ]; then echo "✔ Validation passed"; else printf ' 3 pass\n 0 fail\nRan 3 tests across 1 file.\n'; fi
+# 実物の validate はゲートになるフックを 1 本ずつ `gating hook with .catch: <event>` と申告する（2.1.294 で実測）
+if [ "$sub" = validate ]; then
+  printf '  ❯ ./register.ts gating hook with .catch: tool.call\n✔ Validation passed\n'
+else
+  printf ' 3 pass\n 0 fail\nRan 3 tests across 1 file.\n'
+fi
 exit 0
 STUB
   chmod +x "$dir/home/.local/bin/claude"
@@ -465,6 +481,41 @@ test_standalone() {
   rm -f "$dir/stub/test_mode"
 }
 
+# --- Test 11: 文言一致の自己検査（#1903）------------------------------------------
+test_reworded() {
+  echo ""
+  echo "Test 11: 文言一致の自己検査 — validate / test の注記の文言が変わったら落ちる（#1903）"
+  local dir out rc script
+  dir=$(make_env t11)
+  script="$dir/repo/scripts/check-claude-mod.sh"
+  sa() { env -i HOME="$dir/home" PATH="$dir/home/.local/bin:/usr/bin:/bin" /bin/bash "$script" "$@" 2>&1; }
+
+  echo reworded > "$dir/stub/validate_mode"
+  rc=0
+  out=$(sa) || rc=$?
+  assert_eq "validate の文言が変わった: exit 1" "1" "$rc"
+  assert_contains "validate の文言が変わった: 理由" "$out" "『gating hook with .catch:』の行が無い"
+  assert_contains "validate の文言が変わった: 直す場所" "$out" "scripts/check-claude-mod.sh の文言一致を直す"
+  assert_contains "validate の文言が変わった: 結果の行" "$out" "で validate（注記の文言が変わった） が落ちた"
+  rm -f "$dir/stub/validate_mode"
+
+  echo reworded > "$dir/stub/test_mode"
+  rc=0
+  out=$(sa) || rc=$?
+  assert_eq "test の文言が変わった: exit 1" "1" "$rc"
+  assert_contains "test の文言が変わった: 理由" "$out" "要約行『Ran N tests』が読めない"
+  assert_contains "test の文言が変わった: 結果の行" "$out" "で test（要約行の文言が変わった） が落ちた"
+  rm -f "$dir/stub/test_mode"
+
+  # 1 本だけのときの単数形（`Ran 1 test`）は文言の変化ではない
+  echo one > "$dir/stub/test_mode"
+  rc=0
+  out=$(sa) || rc=$?
+  assert_eq "Ran 1 test（単数形）: exit 0" "0" "$rc"
+  assert_contains "Ran 1 test（単数形）: 合格" "$out" "test: 合格（1 pass/0 fail）"
+  rm -f "$dir/stub/test_mode"
+}
+
 # --- Test 10: 実物の claude（あれば）-------------------------------------------
 test_real_claude() {
   echo ""
@@ -524,6 +575,7 @@ test_timeout
 test_release_not_blocked
 test_runs_on_no_change_night
 test_standalone
+test_reworded
 test_real_claude
 
 echo ""

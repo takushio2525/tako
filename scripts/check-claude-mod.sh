@@ -27,6 +27,12 @@
 # 1 段 1 秒前後）で打ち切り、プロセスグループごと止める（test は子プロセスでテストを走らせる）。
 # 前の段で打ち切ったら後ろの段は走らせない。
 #
+# 文言一致の自己検査（#1903）: validate / test は終了コード 0 のまま問題を注記に出すことがあるので、
+# 注記の文言でも落とす（`.catch` 抜け・テスト 0 本）。文言が Claude Code の更新で変わると
+# 否定形の一致は黙って外れるので、**肯定形の行が出ていること**（validate の
+# `gating hook with .catch:` = この mod のゲートになるフック・test の要約 `Ran N test(s)`）も
+# 要求し、出ていなければ「文言が変わった」で落とす（追加の claude の呼び出しは要らない）。
+#
 # 記録（--record）: ~/.claude-orchestrator/state/tako-mod-check（夜間リリースの予約と同じ置き場）。
 # 検査した claude の版・mod の出どころと、最後に合格した claude の版・mod の木を持つ。
 # 不合格のときは前回の合格と比べて「Claude Code の更新で壊れた」「mod の変更で壊れた」を出し分ける。
@@ -321,6 +327,14 @@ elif grep -q 'gating hook without .catch' "$WORK/validate.out"; then
   FAILED="validate"
   echo "  validate --strict: 不合格（ゲートになるフックに .catch の無いものがある = 設計書 §5）"
   grep 'gating hook without .catch' "$WORK/validate.out" | mask | sed 's/^/    /'
+elif ! grep -q 'gating hook with .catch: ' "$WORK/validate.out"; then
+  # この mod にはゲートになるフック（tool.call 等）が必ずあるので、肯定形の行が 1 つも無いのは
+  # 文言が変わった（= 上の .catch 抜けの一致が黙って外れている）しるし
+  VALIDATE="fail"
+  FAILED="validate（注記の文言が変わった）"
+  echo "  validate --strict: 不合格（注記に『gating hook with .catch:』の行が無い = Claude Code の出力の"
+  echo "    文言が変わり、.catch 抜けの検出が効いていない可能性。scripts/check-claude-mod.sh の文言一致を直す）"
+  grep -i 'gating\|catch' "$WORK/validate.out" | mask | sed 's/^/    /' || true
 else
   VALIDATE="pass"
   echo "  validate --strict: 合格"
@@ -330,6 +344,8 @@ fi
 rc=0
 run_step "$TIMEOUT" "$WORK/test.out" isolated_claude plugin test "$WORK/mod" || rc=$?
 COUNTS="$(grep -Eo '^ *[0-9]+ (pass|fail)' "$WORK/test.out" | tr -s ' ' | sed 's/^ //' | paste -sd '/' - || true)"
+# 要約行 `Ran N tests across M files.`（1 本なら `Ran 1 test`）の N。読めなければ空 = 文言が変わった
+RAN="$(grep -Eo '^Ran [0-9]+ test' "$WORK/test.out" | grep -Eo '[0-9]+' | head -1 || true)"
 if [ "$rc" -eq 124 ]; then
   TEST="timeout"
   FAILED="${FAILED:+${FAILED}・}test（${TIMEOUT} 秒で打ち切り）"
@@ -339,7 +355,13 @@ elif [ "$rc" -ne 0 ]; then
   FAILED="${FAILED:+${FAILED}・}test"
   echo "  test: 不合格（exit ${rc}${COUNTS:+・${COUNTS}}）"
   show_tail "$WORK/test.out"
-elif grep -Eq '^Ran 0 tests' "$WORK/test.out"; then
+elif [ -z "$RAN" ]; then
+  TEST="fail"
+  FAILED="${FAILED:+${FAILED}・}test（要約行の文言が変わった）"
+  echo "  test: 不合格（要約行『Ran N tests』が読めない = Claude Code の出力の文言が変わり、"
+  echo "    0 本の検出が効いていない可能性。scripts/check-claude-mod.sh の文言一致を直す）"
+  show_tail "$WORK/test.out" 5
+elif [ "$RAN" -eq 0 ]; then
   TEST="fail"
   FAILED="${FAILED:+${FAILED}・}test（1 本も走らなかった）"
   echo "  test: 不合格（テストが 1 本も走らなかった）"
