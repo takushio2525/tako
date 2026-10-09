@@ -97,6 +97,9 @@ pub enum SchemaId {
     /// 再起動をまたいで残ることが存在意義）ので番地を持つ。中身は `since` だけで、
     /// **ファイルが在ること自体が意図**なので形式の検査は持たない
     RemoteDesired,
+    /// `<data_dir>/claude-mod/ui.json`（tako mod の定型の UI 設定。#1960）。
+    /// 版数は `schema_version`（他の種別の `version` ではない）
+    ClaudeModUi,
 }
 
 impl SchemaId {
@@ -126,6 +129,7 @@ impl SchemaId {
             Self::RemoteDevices => "remote_devices",
             Self::RemoteShortcuts => "remote_shortcuts",
             Self::RemoteDesired => "remote_desired",
+            Self::ClaudeModUi => "claude_mod_ui",
         }
     }
 
@@ -159,6 +163,7 @@ impl SchemaId {
             Self::RemoteDevices,
             Self::RemoteShortcuts,
             Self::RemoteDesired,
+            Self::ClaudeModUi,
         ]
     }
 }

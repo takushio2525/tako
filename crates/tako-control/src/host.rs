@@ -1356,6 +1356,12 @@ pub trait SystemHost {
     fn set_claude_mod_enabled(&mut self, _enabled: bool) -> Result<(), String> {
         Err("この tako は mod を扱わない".into())
     }
+    /// 定型の UI 設定 ui.json の置き場（#1960）。既定は `<data_dir>/claude-mod/ui.json`
+    /// （CLI のローカル処理と同じ場所）。テストのホストは自分の一時ファイルを返す
+    /// （同じプロセスの並行テストが 1 つの ui.json を取り合わない）
+    fn claude_mod_ui_path(&self) -> Option<std::path::PathBuf> {
+        tako_core::claude_mod_ui::ui_path()
+    }
     /// #749 の自動ハンドオフの tick がこのペインで最後に見た ctx%（取得元つき。#1880）。
     /// `orchestrator self` の `auto_handoff_tick` に載る。tick が見ていないペインは null
     fn handoff_tick_ctx(&self, _pane: PaneId) -> serde_json::Value {

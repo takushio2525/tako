@@ -86,6 +86,8 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         ("remote/", SchemaId::RemoteShortcuts),
         // #1485: 「起動していた」の記録も `remote/` 配下の 1 ファイル
         ("remote/", SchemaId::RemoteDesired),
+        // #1960: tako mod の定型の UI 設定（`claude-mod/` の中でこれだけが利用者の宣言 = Shared）
+        ("claude-mod/ui.json", SchemaId::ClaudeModUi),
     ];
     use tako_control::config_share::catalog;
     for (path, id) in MAPPING {
@@ -274,6 +276,29 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             // （`ServeHealth` / `PeerGuardState` と同じ短命な稼働状態で番地を持たない）
             "crates/tako-control/src/remote_autostart.rs",
             &["DesiredState"],
+        ),
+        (
+            // #1960: ui.json。語彙（enum）も載せる = 値を消したら旧いファイルが読めなくなるので
+            // schema_version を上げて移行を足すことになる（足すだけなら旧い tako は既定へ落として退避）
+            "crates/tako-core/src/claude_mod_ui.rs",
+            &[
+                "UiConfig",
+                "BandUi",
+                "UsageBarUi",
+                "Button",
+                "ButtonAction",
+                "CardsUi",
+                "ChatUi",
+                "ColorsUi",
+                "BandSegment",
+                "UsageBarPlace",
+                "UsageItem",
+                "Place",
+                "ChatShow",
+                "ThemeColor",
+                "SlashCommand",
+                "TakoOp",
+            ],
         ),
     ];
     let mut out = BTreeMap::new();

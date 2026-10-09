@@ -6886,7 +6886,8 @@ fn dispatch_inner(
             action,
             report,
             pane,
-        } => crate::claude_mod::run(host, action.as_deref(), report, pane),
+            ui,
+        } => crate::claude_mod::run(host, action.as_deref(), report, pane, ui),
 
         Request::Lang { action, value } => {
             use tako_core::i18n::{self, LangSetting};
@@ -19309,6 +19310,8 @@ mod tests {
         selections: std::collections::HashMap<u64, crate::protocol::LineColRange>,
         /// #1879: tako mod の状態（GUI の `claude_mod` の代役）
         claude_mod: tako_core::claude_mod::ModHub,
+        /// #1960: このホストだけの ui.json（テストの data dir の中。並行テストと取り合わない）
+        mod_ui_path: std::path::PathBuf,
         /// #1908: ファイルツリー（GUI の `filetree` と `tree_selection` の代役）
         tree: MockTree,
     }
@@ -19408,6 +19411,19 @@ mod tests {
                 format_on_save: false,
                 selections: std::collections::HashMap::new(),
                 claude_mod: tako_core::claude_mod::ModHub::new(true),
+                mod_ui_path: {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static SEQ: AtomicU64 = AtomicU64::new(0);
+                    // テストの一時の置き場（#944 の隔離先 = プロセスの終わりに消える）。製品が
+                    // data dir に置くファイルではないので、式を分けて共有分類カタログの被覆の
+                    // 走査（`data_dir()` の直後の join）に載せない
+                    let scratch =
+                        tako_core::paths::data_dir().expect("テストの data dir（#944 の隔離先）");
+                    scratch.join(format!(
+                        "mock-mod-ui-{}/ui.json",
+                        SEQ.fetch_add(1, Ordering::Relaxed)
+                    ))
+                },
                 tree: MockTree::default(),
             }
         }
@@ -20366,6 +20382,9 @@ mod tests {
         fn set_claude_mod_enabled(&mut self, enabled: bool) -> Result<(), String> {
             self.claude_mod.enabled = enabled;
             Ok(())
+        }
+        fn claude_mod_ui_path(&self) -> Option<std::path::PathBuf> {
+            Some(self.mod_ui_path.clone())
         }
     }
 
@@ -38719,6 +38738,7 @@ mod tests {
             action: Some(action.into()),
             report,
             pane,
+            ui: None,
         }
     }
 
@@ -38741,6 +38761,7 @@ mod tests {
                 action: None,
                 report: None,
                 pane: None,
+                ui: None,
             },
             PaneOrigin::Cli,
         )
@@ -38898,6 +38919,138 @@ mod tests {
         let ended =
             crate::claude_mod::snapshot(&host, pane, tako_core::claude_mod::Accepted::Ended, false);
         assert!(ended.get("view").is_none());
+    }
+
+    fn mod_ui_request(ui: Value) -> Request {
+        Request::Mod {
+            action: Some("ui".into()),
+            report: None,
+            pane: None,
+            ui: Some(serde_json::from_value(ui).unwrap()),
+        }
+    }
+
+    /// #1960: 報告の応答の `tako.view.ui` に検証済みの ui.json が載り、`tako mod ui` の変更が
+    /// 次の報告で届く。不正な値は書かずに許される値を返す（MCP の action=ui と同じ dispatch）
+    #[test]
+    fn issue1960_報告の応答に検証済みのuiが載り変更が次の報告で届く() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let report = |host: &mut MockHost| {
+            dispatch(
+                host,
+                mod_request("report", Some(mod_report_body("idle")), Some(pane)),
+                PaneOrigin::Cli,
+            )
+            .unwrap()
+        };
+        let out = report(&mut host);
+        let ui = &out["tako"]["view"]["ui"];
+        assert_eq!(ui["schema_version"], 1, "{out}");
+        assert_eq!(ui["buttons"][0]["id"], "compact", "既定のボタンは /compact");
+        assert_eq!(ui["buttons"][0]["action"]["kind"], "slash");
+        assert!(!host.mod_ui_path.exists(), "見るだけでは書かない");
+
+        let shown = dispatch(&mut host, mod_ui_request(json!({})), PaneOrigin::Mcp).unwrap();
+        assert!(
+            shown["choices"]["set"]["usage_bar.place"].is_object(),
+            "{shown}"
+        );
+        let out = dispatch(
+            &mut host,
+            mod_ui_request(json!({"op": "set", "key": "usage_bar.place", "value": "off"})),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["changed"], true);
+        assert_eq!(
+            report(&mut host)["tako"]["view"]["ui"]["usage_bar"]["place"],
+            "off"
+        );
+
+        let before = std::fs::read_to_string(&host.mod_ui_path).unwrap();
+        let err = dispatch(
+            &mut host,
+            mod_ui_request(json!({"op": "button_add", "kind": "slash", "value": "bash"})),
+            PaneOrigin::Mcp,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidParams(_)), "{err}");
+        assert!(err.to_string().contains("compact / clear"), "{err}");
+        assert_eq!(std::fs::read_to_string(&host.mod_ui_path).unwrap(), before);
+    }
+
+    /// #1960: 帯のトグルの正本は ui.json。`tako mod band on|off` は ui.json へ書き、
+    /// mod の中で切り替えた（報告の toggled_at が新しい）ぶんは取り込む
+    #[test]
+    fn issue1960_帯のトグルはuijsonへ書き報告の新しい切替を取り込む() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        dispatch(
+            &mut host,
+            mod_request("band-off", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&host.mod_ui_path).unwrap()).unwrap();
+        assert_eq!(on_disk["band"]["hidden"], true);
+        let cli_at = on_disk["band"]["toggled_at"].as_u64().unwrap();
+        // mod の中で後から出した（toggled_at が新しい）→ 取り込む
+        let mut body = mod_report_body("idle");
+        body["band"] =
+            json!({"hidden": false, "shown": true, "segments": [], "toggled_at": cli_at + 10});
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(body), Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(
+            out["tako"]["view"]["band_request"]["hidden"], false,
+            "{out}"
+        );
+        assert_eq!(out["tako"]["view"]["band_request"]["at"], cli_at + 10);
+        assert_eq!(out["tako"]["view"]["ui"]["band"]["hidden"], false);
+        // 古い切り替えの報告は捨てる
+        let mut body = mod_report_body("idle");
+        body["band"] = json!({"hidden": true, "shown": false, "segments": [], "toggled_at": 1});
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(body), Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["tako"]["view"]["ui"]["band"]["hidden"], false);
+        let status = dispatch(
+            &mut host,
+            mod_request("status", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(status["band"]["hidden"], false, "{status}");
+        assert_eq!(status["ui"]["state"], "valid");
+    }
+
+    /// #1960: 壊れた ui.json でも報告は止まらず、応答は既定の値（退避は残る）
+    #[test]
+    fn issue1960_壊れたuijsonでも報告は止まらず既定で動く() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        std::fs::create_dir_all(host.mod_ui_path.parent().unwrap()).unwrap();
+        std::fs::write(&host.mod_ui_path, "{\"schema_version\": 1, \"colors\": 3").unwrap();
+        let out = dispatch(
+            &mut host,
+            mod_request("report", Some(mod_report_body("busy")), Some(pane)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["accepted"], "stored");
+        assert_eq!(
+            out["tako"]["view"]["ui"],
+            json!(tako_core::claude_mod_ui::UiConfig::default())
+        );
+        assert!(tako_core::migration::quarantine_slot_path(&host.mod_ui_path, 1).exists());
     }
 
     /// #1879: tako の再起動をまたいで生き残った claude は古い TAKO_PANE_ID で報告してくる

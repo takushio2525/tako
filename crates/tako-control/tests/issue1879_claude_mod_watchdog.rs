@@ -374,8 +374,8 @@ fn 逆戻りを名指しできる() {
     // 3. MCP に report を載せる
     let found = mutate(&|s| {
         s.control = s.control.replacen(
-            "pub const MCP_ACTIONS: &[&str] = &[\"status\", \"on\", \"off\", \"band-on\", \"band-off\"];",
-            "pub const MCP_ACTIONS: &[&str] = &[\"status\", \"on\", \"off\", \"band-on\", \"band-off\", \"report\"];",
+            "pub const MCP_ACTIONS: &[&str] = &[\"status\", \"on\", \"off\", \"band-on\", \"band-off\", \"ui\"];",
+            "pub const MCP_ACTIONS: &[&str] = &[\"status\", \"on\", \"off\", \"band-on\", \"band-off\", \"ui\", \"report\"];",
             1,
         );
     });

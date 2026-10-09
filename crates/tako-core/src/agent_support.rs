@@ -253,6 +253,8 @@ pub mod keys {
     pub const CLAUDE_MOD_BAND: &str = "claude_mod_band";
     /// エージェントのプロセス内の拡張（Claude Code の mod）から状態を構造で受け取る（#1879）
     pub const CLAUDE_MOD_STATE: &str = "claude_mod_state";
+    /// エージェントの画面の中の UI（ボタン・バー・帯の区切り・色）を定型の設定で選んで調整する（#1960）
+    pub const CLAUDE_MOD_UI: &str = "claude_mod_ui";
     /// thinking / reasoning effort の指定
     pub const EFFORT_CONTROL: &str = "effort_control";
     /// コンフリクト解消エージェントの起動
@@ -784,6 +786,23 @@ pub const MATRIX: &[AgentFeature] = &[
             "#1879: Claude Code 2.1.294 の mod を env CLAUDE_CODE_PLUGIN_DIRS で注入し、\
              隔離 GUI の直接ペインと tmux ペインの両方で tako mod report が届いて tako mod の行に \
              ctx・使用制限・turn・model が載った（scripts/test-claude-mod-1879.sh）",
+        ),
+    },
+    AgentFeature {
+        key: keys::CLAUDE_MOD_UI,
+        summary: Note::new(
+            "エージェントの画面の中の UI（カスタムボタン・使用量のバー・帯の区切り・色）の設定を、選ぶだけの定型の口（ui.json）で持ち、検証済みの値をエージェントの中の拡張へ届ける",
+            "Keeps the settings for the UI inside the agent's own screen (custom buttons, the usage bar, band segments, colors) behind a fixed, pick-only interface (ui.json) and hands the validated values to the extension running inside the agent",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1885),
+        agy: pending(notes::NOT_INVESTIGATED, 1885),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::UnitTest(
+            "#1960: tako_core::claude_mod_ui の単体（語彙の外の値は書かずに許される値を返す・ランダムな操作列 1,000 通りで\
+             常に形を満たす・壊れた ui.json は読める部分で動き .unreadable.bak へ保全）、dispatch の issue1960_*（報告の応答の \
+             tako.view.ui に検証済みの値が載り、変更が次の報告で届く）、issue1960_mod_ui_watchdog（CLI / MCP / setup の 3 つの口で \
+             ui.json が字面で一致）。mod が効かせるのは今は帯のトグルで、ボタン・バー・区切り・色の描画は #1962",
         ),
     },
     AgentFeature {

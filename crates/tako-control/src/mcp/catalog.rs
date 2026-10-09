@@ -2867,7 +2867,8 @@ pub fn tools() -> Vec<Value> {
             "description": "tako mod（Claude Code の mod）の状態と切替。action: status（既定。\
                 claude の版・注入の有無・ペインごとの報告 = ctx / 使用制限 / turn と鮮度・\
                 報告が無い理由）/ on / off（次に作るペインから効く）/ band-on / band-off\
-                （Claude Code の画面の帯）",
+                （Claude Code の画面の帯）/ ui（画面の UI 設定 ui.json。op 省略で今の値と選べる値。\
+                不正な値は書かずに使える値を返す）",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2875,6 +2876,27 @@ pub fn tools() -> Vec<Value> {
                         "type": "string",
                         "enum": crate::claude_mod::MCP_ACTIONS,
                     },
+                    "op": {
+                        "type": "string",
+                        "enum": tako_core::claude_mod_ui::OPS,
+                        "description": "action=ui の操作",
+                    },
+                    "key": {
+                        "type": "string",
+                        "enum": <tako_core::claude_mod_ui::SetKey as tako_core::claude_mod_ui::Vocab>::words(),
+                    },
+                    "value": {
+                        "description": "set の値（真偽 / 語 / 語の配列）・button_add の中身（slash の語・tako の操作 id・shell のコマンド・prompt の文）・preset の名前",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": <tako_core::claude_mod_ui::ButtonKind as tako_core::claude_mod_ui::Vocab>::words(),
+                        "description": "button_add の動作（省略時は value から推す）",
+                    },
+                    "id": {"type": "string", "description": "button_remove / button_move の対象"},
+                    "label": {"type": "string"},
+                    "hotkey": {"type": "string"},
+                    "to": {"description": "button_move の先（1〜8 / first / last / left / right）"},
                 },
                 "additionalProperties": false,
             },
@@ -3293,6 +3315,23 @@ pub fn tools() -> Vec<Value> {
                                 "type": "string",
                                 "enum": ["ac-only", "always"],
                                 "description": "有効にする電源条件。ac-only = AC 接続時のみ（既定）/ always = バッテリー駆動でも",
+                            },
+                        },
+                        "additionalProperties": false,
+                    },
+                    "mod_ui": {
+                        "type": "object",
+                        "description": "Claude Code の画面の UI（ui.json）。tako_mod の action=ui と同じ検証",
+                        "properties": {
+                            "preset": {
+                                "type": "string",
+                                "enum": <tako_core::claude_mod_ui::Preset as tako_core::claude_mod_ui::Vocab>::words(),
+                            },
+                            "set": {"type": "object", "description": "tako_mod の key → value"},
+                            "buttons": {
+                                "type": "array",
+                                "description": "ボタンの並びの置き換え（要素は {kind?, value, label?, hotkey?}。8 個まで）",
+                                "items": {"type": "object"},
                             },
                         },
                         "additionalProperties": false,

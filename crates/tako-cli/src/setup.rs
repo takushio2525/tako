@@ -1337,6 +1337,94 @@ fn print_deps_human(action: &str, value: &serde_json::Value) {
     }
 }
 
+/// `--review` の対話: Claude Code の画面の UI の雛形（3 択）とボタンを選ぶ（#1960）。
+/// 選んだ結果は `--answers` の `mod_ui` と**同じ形**（[`UiAnswers`]）にして、同じ 1 実装で当てる。
+/// どちらも Enter なら何も変えない（`None`）。読めない入力はその問いだけ今のままにする
+fn review_mod_ui() -> Option<tako_core::claude_mod_ui::UiAnswers> {
+    use tako_core::claude_mod_ui::{
+        ButtonKind, ButtonSpec, Preset, SlashCommand, TakoOp, UiAnswers, Vocab, MAX_BUTTONS,
+    };
+    let read_line = || {
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok()?;
+        Some(input.trim().to_string())
+    };
+    let current = tako_control::claude_mod_ui::default_path()
+        .map(|p| tako_control::claude_mod_ui::load(&p).config)
+        .unwrap_or_default();
+    eprintln!();
+    eprintln!(
+        "  Claude Code の画面の UI（tako mod の帯・ボタン・バー）: {}",
+        tako_control::claude_mod_ui::summary(&current)
+    );
+    for (i, preset) in Preset::ALL.iter().enumerate() {
+        eprintln!("      [{}] {}", i + 1, preset.describe());
+    }
+    eprint!("      雛形を選択 [1-3]（Enter で今のまま）: ");
+    let mut answers = UiAnswers::default();
+    match read_line().as_deref() {
+        Some("") | None => {}
+        Some(choice) => match choice
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| Preset::ALL.get(n.wrapping_sub(1)))
+        {
+            Some(preset) => answers.preset = Some(preset.as_str().to_string()),
+            None => eprintln!("      不明な選択: {choice}。雛形は今のまま"),
+        },
+    }
+    // ボタンの候補: 組み込みコマンド → tako の操作（shell / prompt は `tako mod ui button add` で）
+    let mut candidates: Vec<(ButtonKind, &'static str, &'static str)> = SlashCommand::ALL
+        .iter()
+        .map(|c| (ButtonKind::Slash, c.as_str(), c.describe()))
+        .collect();
+    candidates.extend(
+        TakoOp::ALL
+            .iter()
+            .map(|o| (ButtonKind::Tako, o.as_str(), o.describe())),
+    );
+    eprintln!("      ボタン（{MAX_BUTTONS} 個まで。左から並ぶ）:");
+    for (i, (kind, value, about)) in candidates.iter().enumerate() {
+        let shown = match kind {
+            ButtonKind::Slash => format!("/{value}"),
+            _ => value.to_string(),
+        };
+        eprintln!("        [{:>2}] {shown:<26} {about}", i + 1);
+    }
+    eprintln!(
+        "      （コマンドの実行・文の入力のボタンは後から tako mod ui button add shell|prompt …）"
+    );
+    eprint!("      ボタンを選択 [番号をカンマ区切り]（Enter で雛形・今のまま）: ");
+    match read_line().as_deref() {
+        Some("") | None => {}
+        Some(choice) => {
+            let picked: Option<Vec<ButtonSpec>> = choice
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|w| !w.is_empty())
+                .map(|w| {
+                    let (kind, value, _) =
+                        candidates.get(w.parse::<usize>().ok()?.checked_sub(1)?)?;
+                    Some(ButtonSpec {
+                        kind: Some(kind.as_str().to_string()),
+                        value: value.to_string(),
+                        ..ButtonSpec::default()
+                    })
+                })
+                .collect();
+            match picked {
+                Some(list) if list.len() <= MAX_BUTTONS => answers.buttons = Some(list),
+                Some(_) => eprintln!("      ボタンは {MAX_BUTTONS} 個まで。ボタンは今のまま"),
+                None => eprintln!("      読めない番号がある: {choice}。ボタンは今のまま"),
+            }
+        }
+    }
+    if let Err(e) = tako_core::claude_mod_ui::check_answers(&answers) {
+        eprintln!("      {}。今のまま", e.message());
+        return None;
+    }
+    (!answers.is_empty()).then_some(answers)
+}
+
 /// スリープ防止（Issue #173）の設定案内。
 /// L0〜L3 の段階式で、ユーザーの利用スタイルに合わせたスリープ防止を設定する
 fn run_sleep_guard_check(interactive: bool) {
@@ -3330,6 +3418,23 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     let revision = mark_setup_complete(selected, &plans, answers.orchestrator.as_ref())?;
     sync_pending_changes_file(&dir, &[], revision)?;
+    // Claude Code の画面の UI（tako mod の ui.json。FR-2.42.23 / #1960）。`--answers` の `mod_ui` を
+    // 当てるか、`--review` の端末なら 3 択 + ボタンを選ぶ。標準は 1 行の表示だけ（質問ゼロ = #262）。
+    // **問いは setup の最後**に置く（既存の対話の答えの順を変えない）。当てるのは
+    // `tako mod ui` / MCP `tako_mod` と同じ 1 実装（tako_control::claude_mod_ui）
+    let mod_ui_answers = match &answers.mod_ui {
+        Some(given) => Some(given.clone()),
+        None if review_mode
+            && !assume_yes
+            && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
+        {
+            review_mod_ui()
+        }
+        None => None,
+    };
+    for line in tako_control::claude_mod_ui::run_setup_stage(mod_ui_answers.as_ref()) {
+        eprintln!("{line}");
+    }
     // 同じ道を 1 本にまとめる（判断は純粋関数。#1501）
     let remaining = setup_remaining::summarize(remaining);
     print_setup_summary(&plan);

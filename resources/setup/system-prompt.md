@@ -195,6 +195,20 @@ CLI 検出、認証確認、プラン確認、MCP 設定、推奨 profile 生成
 5. 2 台目の案内: `tako config link <URL>` → `tako config pull`。
    その後の同期は `tako config push` / `tako config pull`
 
+## Step 3.7: Claude Code の画面の UI（tako mod。望まれたときだけ）
+
+tako のペインで claude を使うと、Claude Code の画面の中に tako の帯（プロンプトの上の 1 行）・
+ボタン・使用量のバーが出る。ボタンや表示の調整を頼まれたら、**`tako mod ui` の口だけ**で行う
+（`claude-mod/ui.json` を直接編集しない。語彙の外の値は口が断り、使える値の一覧を返す）。
+
+- まず `tako mod ui` で今の値と選べる値を見る（`--json` で機械可読）
+- ボタン: `tako mod ui button add compact`（`/compact` のワンボタン）/ `tako mod ui button add split-right` /
+  `tako mod ui button add shell "npm test" --label test` / `tako mod ui button remove <id>` /
+  `tako mod ui button move <id> first`
+- 表示: `tako mod ui set usage_bar.place off` / `tako mod ui set band.segments pane,attention,buttons`
+- まとめて: `tako mod ui preset recommended`（default / recommended / minimal）/ `tako mod ui reset`
+- 断られたら、返ってきた「使える値」から選び直す（別の書き方を推測で試さない）
+
 ## Step 4: 完了サマリー
 
 変更したファイルと設定を一覧にし、次を案内する（コマンド案内の原則に従い最簡形で示す）。

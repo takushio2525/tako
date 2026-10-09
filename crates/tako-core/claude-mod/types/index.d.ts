@@ -1,6 +1,6 @@
 // tako mod が tako へ送る報告の契約（#1879。設計書 .agent/plans/2026-10-tako-mod.md §4.2）と、
-// tako が応答で返す帯・サイドバーの材料（#1881。§7 S3）、mod の $.state の契約。
-// 受け手 / 送り手の正本は tako_core::claude_mod::{ModReport, ModBand, BandView}。
+// tako が応答で返す帯・サイドバーの材料（#1881。§7 S3）・定型の UI 設定（#1960。§9.7）、mod の $.state の契約。
+// 受け手 / 送り手の正本は tako_core::claude_mod::{ModReport, ModBand, BandView} と tako_core::claude_mod_ui::UiConfig。
 // キーを増やすときは両方を同じコミットで直す。
 //
 // **会話の本文・プロンプト・ツールの引数は載せない**（AGENTS.md の絶対ルール）。
@@ -103,8 +103,68 @@ export type TakoView = {
   ctx?: TakoContext
   rate_limits: { kind: string; percent: number; resets_at?: number }[]
   thresholds: { ctx_percent: number; limit_percent: number }
-  /** `tako mod band on|off` の中継（at は epoch ms。$.store の時刻より新しいときだけ従う） */
+  /**
+   * 帯のトグルの中継（at は epoch ms。$.store の時刻より新しいときだけ従う）。正本は ui.json の
+   * band.hidden / toggled_at（#1960）で、`tako mod band on|off`・`tako mod ui set band.hidden`・
+   * この mod の報告の取り込みのどれで変わっても同じ形で届く
+   */
   band_request?: { hidden: boolean; at: number }
+  /** 定型の UI 設定（#1960。tako が検証した値だけが届く。古い tako の応答には無い） */
+  ui?: TakoUi
+}
+
+/** 帯に並べる区切り（tako_core::claude_mod_ui::BandSegment） */
+export type TakoBandSegment = 'pane' | 'tab' | 'workers' | 'attention' | 'ctx' | 'limits' | 'buttons' | 'card'
+/** カード・チャットを誰が描くか */
+export type TakoPlace = 'auto' | 'mod' | 'tako'
+/** チャット風の描き方をいつ出すか */
+export type TakoChatShow = 'always' | 'gui_only' | 'off'
+/** 色は Claude Code のテーマのキーだけ（ThemeKey の部分集合） */
+export type TakoThemeColor =
+  | 'text'
+  | 'inactive'
+  | 'subtle'
+  | 'suggestion'
+  | 'remember'
+  | 'success'
+  | 'error'
+  | 'warning'
+  | 'merged'
+  | 'claude'
+  | 'permission'
+  | 'planMode'
+  | 'autoAccept'
+  | 'ide'
+/** ボタンの動作（4 種の定型だけ。任意の JS は持たない） */
+export type TakoButtonAction =
+  | { kind: 'slash'; command: 'compact' | 'clear' | 'context' | 'cost' | 'model' | 'effort' | 'tako' }
+  | {
+      kind: 'tako'
+      op:
+        | 'split-right'
+        | 'split-down'
+        | 'session-restart-harness'
+        | 'session-restart-handoff'
+        | 'limit-resume-on'
+        | 'limit-resume-off'
+        | 'background'
+        | 'close'
+        | 'open-cwd'
+    }
+  | { kind: 'shell'; command: string }
+  | { kind: 'prompt'; text: string }
+/** カスタムボタン（8 個まで・label 16 桁・hotkey は数字か英小文字 1 字で重複なし） */
+export type TakoButton = { id: string; label: string; hotkey: string; action: TakoButtonAction }
+
+/** 定型の UI 設定（tako_core::claude_mod_ui::UiConfig = `<data_dir>/claude-mod/ui.json`） */
+export type TakoUi = {
+  schema_version: 1
+  band: { hidden: boolean; segments: TakoBandSegment[]; toggled_at?: number }
+  usage_bar: { place: 'prompt_hint' | 'band' | 'off'; items: ('five_hour' | 'seven_day' | 'ctx')[] }
+  buttons: TakoButton[]
+  cards: { place: TakoPlace }
+  chat: { place: TakoPlace; bubble: TakoChatShow; code_copy: boolean; tool_summary: TakoChatShow }
+  colors: { accent: TakoThemeColor; warn: TakoThemeColor; dim: TakoThemeColor }
 }
 
 declare module 'claude-code' {

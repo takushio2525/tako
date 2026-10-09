@@ -4,6 +4,14 @@ AcceptanceGateStore: version, gates
 AccountEntry: config_dir, inherit, description, default_model, default_effort
 AccountsConfig: accounts
 AgentResumeLayout: agent, id
+BandSegment: Pane, Tab, Workers, Attention, Ctx, Limits, Buttons, Card
+BandUi: hidden, segments, toggled_at
+Button: id, label, hotkey, action
+ButtonAction: Slash, Tako, Shell, Prompt
+CardsUi: place
+ChatShow: Always, GuiOnly, Off
+ChatUi: place, bubble, code_copy, tool_summary
+ColorsUi: accent, warn, dim
 ControlInfo: version, pid, socket, token, mcp_url
 CopyText: label, text
 Decision: Approve, Reject, NeedsChange, Answered
@@ -19,6 +27,7 @@ NodeLayout: Pane, Split, axis, ratio, first, second
 OrchestratorConfig: auto_close, auto_push
 PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume, ssh
 PendingSpawn: tmux_session, kind, label, project, agent, model, effort, issues, prompt_head, cwd, tab, pane, recorded_at
+Place: Auto, Mod, Tako
 PreviewLayout: path, mode
 Profile: master_agent, model, effort, worker_model_policy, worker_model, worker_effort, delegate_guidance, worker_agent, worker_agents, system_prompt, prompt_blocks, projects, tab_naming_convention, supervisor_mode, auto_resume_dead, supervisor_max_retries, cwd, env, master_account, worker_account, ctx_threshold, auto_handoff, limit_resume, bypass_sandbox, remote_control
 ProjectEntry: cwd, description
@@ -37,9 +46,11 @@ ShareState: repo, linked_at
 ShelvedTabLayout: tab, origin_window, origin_index
 Shortcut: id, path, name, added_at, builtin
 ShortcutsFile: version, shortcuts
+SlashCommand: Compact, Clear, Context, Cost, Model, Effort, Tako
 SpawnLayoutSection: policy, master_ratio, algorithm, min_worker_cols, auto_shrink_font, min_worker_font_scale
 SshPaneLayout: host, reconnect_line
 TabLayout: id, title, title_source, focused, tree, pinned_folders, remote_folders
+TakoOp: SplitRight, SplitDown, SessionRestartHarness, SessionRestartHandoff, LimitResumeOn, LimitResumeOff, Background, Close, OpenCwd
 TaskCheckpoint: task_id, pane_id, issue, branch, phase, last_commit, agent, model, prompt_head, suspended_reason, project, cwd, updated_at
 TaskCheckpointStore: version, checkpoints
 TaskKind: Review, Confirm, Permission, Post, Other
@@ -47,7 +58,12 @@ TaskOrigin: profile, session_id, pane, project
 TaskResponse: decision, comment, at, via
 TaskStatus: Open, Done, Dismissed
 TaskStore: version, tasks
+ThemeColor: Text, Inactive, Subtle, Suggestion, Remember, Success, Error, Warning, Merged, Claude, Permission, PlanMode, AutoAccept, Ide
 ThemePreset: base, colors
+UiConfig: schema_version, band, usage_bar, buttons, cards, chat, colors
+UsageBarPlace: PromptHint, Band, Off
+UsageBarUi: place, items
+UsageItem: FiveHour, SevenDay, Ctx
 UserTask: id, title, body, kind, status, created_by, project, attachments, copy_texts, links, due, created_at, updated_at, origin, responses, delivery
 Via: Pc, Pwa, Cli, Mcp
 WindowFrame: x, y, width, height, state
@@ -78,3 +94,4 @@ version discovery_instance: v1 steps=0
 version remote_devices: v1 steps=0
 version remote_shortcuts: v1 steps=0
 version remote_desired: v1 steps=0
+version claude_mod_ui: v1 steps=0
