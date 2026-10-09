@@ -3,7 +3,8 @@
 #
 # 隔離した data / discovery / tmux で**実 tako-app** を立て、ペインで**実 claude**（haiku の短いターン）を
 # 動かして次を実測する（番号は Issue #1879 の受け入れ条件）:
-#   0. 静的: `claude plugin validate` / `claude plugin test`（claude が無ければ「未実測」）
+#   0. 静的: `claude plugin validate --strict` / `claude plugin test`（本体は scripts/check-claude-mod.sh の
+#      1 実装 = 夜間リリースと同じ検査。claude が無ければ「未実測」）
 #   1. 直接ペインと tmux ペインの両方で、素の `claude` を打つだけで `tako mod` にそのペインの報告
 #      （ctx・使用制限・turn・model）が 1 ターン以内に載る
 #   2. 権限ダイアログ / AskUserQuestion の表示中に turn が permission / question になる
@@ -266,25 +267,22 @@ claude_available() { command -v claude >/dev/null 2>&1; }
 MTIMES_BEFORE="$(settings_mtimes)"
 
 # --- 0. 静的（validate / test）-------------------------------------------------
+# 検査の本体は scripts/check-claude-mod.sh（夜間リリースと同じ 1 実装。#1903）。使い捨ての設定 dir と
+# mod の写しで回すので、本番の設定にもソースツリーにも何も書かない。終了コード 0 = 合格 / 3 = 未実測
 phase_static() {
-  echo "== 0. claude plugin validate / test"
-  if ! claude_available; then
-    unmeasured "claude が無いので validate / test を飛ばした"
-    return
-  fi
-  local cfg="$TMP/ccfg" out
-  mkdir -p "$cfg"
-  # 設定 dir は使い捨て（validate / test は認証が要らない。本番の設定に何も書かせない）
-  out="$(CLAUDE_CONFIG_DIR="$cfg" claude plugin validate "$REPO_ROOT/crates/tako-core/claude-mod" 2>&1)"
-  if printf '%s' "$out" | grep -q 'Validation passed'; then pass "claude plugin validate"; else fail "claude plugin validate"; printf '%s\n' "$out" | mask | tail -20; fi
-  # ゲートになるフックはすべて .catch 付き（validate の申告で数える）
-  if printf '%s' "$out" | grep -q 'gating hook without .catch'; then fail "ゲートになるフックに .catch の無いものがある"; else pass "ゲートになるフックはすべて .catch 付き（validate の申告）"; fi
-  out="$(CLAUDE_CONFIG_DIR="$cfg" claude plugin test "$REPO_ROOT/crates/tako-core/claude-mod" 2>&1)"
-  if printf '%s' "$out" | grep -q ' 0 fail'; then pass "claude plugin test（$(printf '%s' "$out" | grep -E '^ *[0-9]+ pass' | tr -d ' ')）"; else fail "claude plugin test"; printf '%s\n' "$out" | mask | tail -30; fi
-  # validate / test がソースへ書く型定義は .gitignore 済み（コミットに混ざらない）
-  local dirty
-  dirty="$(git -C "$REPO_ROOT" status --porcelain -- crates/tako-core/claude-mod | head -1)"
-  check_eq "validate / test がソースツリーを汚さない（git status）" "" "$dirty"
+  echo "== 0. mod の validate --strict / test（本体は check-claude-mod.sh）"
+  local out rc=0 before after
+  # 作業中の変更があっても測れるよう、段の前後の git status を比べる
+  before="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- crates/tako-core/claude-mod)"
+  out="$(/bin/bash "$REPO_ROOT/scripts/check-claude-mod.sh" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | mask | sed 's/^/    | /'
+  case "$rc" in
+    0) pass "validate --strict / test（$(printf '%s\n' "$out" | sed -n 's/^結果: //p' | mask)）" ;;
+    3) unmeasured "claude が無いので validate / test を飛ばした" ;;
+    *) fail "validate --strict / test（exit ${rc}）" ;;
+  esac
+  after="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- crates/tako-core/claude-mod)"
+  check_eq "validate / test がソースツリーを汚さない（段の前後の git status）" "$before" "$after"
 }
 
 # --- 1〜3. 直接ペイン ------------------------------------------------------------

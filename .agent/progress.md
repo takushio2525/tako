@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1895: ファイルツリーの ⇧↑ / ⇧↓・⌘⌫、1 つのファイルの途中での取り消し、まとめたコピーを 1 つのジョブへ、帯の残り時間）
-- ⇧↑ / ⇧↓ = `tree_select::extend`（⇧クリックと同じ `apply`）・⌘⌫（Win は Delete）= 右クリックの「削除」と同じ `trash_tree_paths`（見出し・リモートは断る）。1 つのファイルは `fs_copy::copy_file_exclusive`（同じ APFS は clone・それ以外は fcopyfile / CopyFileExW の進み具合で 1 MiB ごとにバイトが進み途中で止めて作りかけを消す）。`tako file copy a b dst` / MCP `paths` の copy = `FileOpMany` の 1 ジョブ、`copy_progress` に `eta_secs`（2 秒・1% までは出さない）。カタログ +7 B
-- 実測: 製品の経路で 256 MiB の同じボリューム 61.8 → 22.6 ms（`create_new` の後の `std::fs::copy` で clone が外れていたのを直した）・別ボリューム 180.5 / 181.4 ms で差なし。`scripts/test-tree-keyboard-copy-1895.sh` 39 PASS 0 FAIL（A/B `TAKO_1895_LEGACY=1` で ① が名指しで FAILED）・番犬 13 本（注入 11 通りを file:line で名指し）
-
 ## 2026-10-09（#748 / PR #754: 合成入力欄をダイアログと誤判定しない固定を今の main へ載せ直した）
 - `dialog.rs` のテストを描く側と同じ組み立てへ（#719 / #718 = 罫線 16 桁・#737 = 20 桁・#1067 = 30 桁 + フッター）。キュー滞留ヒントは #737 ではなく #1067 の形
 - 実測: 注入 A（罫線の棄却を外す）/ A+B（兄弟 1 つで並び）/ E（罫線の最小を 20 本）で形を名指しして FAILED（E は入力欄系でこれだけ）
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1916: GUI 内の塗りが遅いのは App Nap（E コア落ち）と比べた入力の違い = 塗りの間は activity を握る）
 - 真因: 実行器の優先度ではない（GCD / 専用スレッド・QoS 0x15 / 0x19 で同じ）。同じ入力ならテストスレッドと GUI は 12.0 秒で同じ（「4〜8 倍」の 3.6 倍は入力の違い）、隔離 GUI は約 30 秒で App Nap に間引かれ E コアで 26.9〜33.4 秒（命令数は同じ）。`disable_app_nap`（#173）は `/proc` 前提で空振り。`platform::user_work::UserWork`（NSProcessInfo の UserInitiated activity を数で束ねる）を塗りの 2 経路が握る。`tako edit` の応答に `highlighting`
 - 実測: `scripts/test-highlight-app-nap-1916.sh` 8 PASS（間引かれた後の比 1.02 / 1.11 / 1.10・P コア 0.99。A/B `TAKO_1916_LEGACY=1` は 2.56 / 2.54 / 2.80・P コア 0.000 で ③ が FAILED）・番犬 3 本（注入 10 通りを file:line で名指し）
+
+## 2026-10-09（#1903: tako mod S2 の続き = ステータスバーの 5h / 7d も mod から・observed_at を値の変化時だけ・MCP 説明文・検査スクリプトの 1 実装化）
+- mod の `stampLimits` が窓ごとに値が変わったときだけ `observed_at` を打つ（`$.state` に置きホットリロードをまたぐ）→ 束ね方を最新の観測へ（A/B `TAKO_1903_LEGACY=1` = #1880 の順）。ステータスバーは `status_bar_limits`（フォーカス順で最初に引けたペインのアカウント → 無ければ画面。取得元は `tako limit-service --refresh` の `claude.source`）。MCP 説明文 +527 B。`check-claude-mod.sh` に肯定形の文言の自己検査、1879 の段 0 はそれを呼ぶだけ
+- 実測: `scripts/test-mod-limits-1903.sh`（visual-test `mod-limits` で 42 / 18 の帯・旧は ① FAILED / fake 17 PASS = 46 秒で画面へ戻る・放置 80% と動いている 20% で 20）・`claude plugin test` 28 本（旧の打ち方の注入で #1903 の 1 本が名指しで落ちる）・番犬の注入 12 通りを file:line で名指し

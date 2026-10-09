@@ -1913,8 +1913,9 @@ pub fn tools() -> Vec<Value> {
                 pane_id（tako_list_panes）か worker（tako_orchestrator_spawn の worker_id / \
                 tako_orchestrator_workers。消失後も追える）のどちらかが必須。\
                 status = busy / idle（入力待ち・完了）/ waiting（選択肢ダイアログ）/ error / \
-                gone（ペインも tmux も消滅）/ unknown。status_source = agents-auto（claude agents --json）/ \
-                screen（画面推定。codex / agy は常に screen）。\
+                gone（ペインも tmux も消滅）/ unknown。status_source = mod（tako mod の報告）/ \
+                agents-auto（claude agents --json）/ screen（画面推定。codex / agy は常に screen）。\
+                ctx_source / ctx_mod_reason / mod_turn / rate_limits は tako_orchestrator_self と同じ。\
                 返るものは recommended_action / recent_output（直近 30 行）/ prompt_delivery / \
                 events / background_work / resume_command / resolved_session_id。\
                 **次の一手は recommended_action に従う**（resume / wait_reset / respond_dialog / \
@@ -1978,7 +1979,11 @@ pub fn tools() -> Vec<Value> {
             "description": "master / solo が自分自身の pane・tab・ctx%・session_id を取得する。\
                 ctx_percent はコンテキスト使用率（0〜100）、ctx_threshold は引き継ぎ閾値\
                 （プロファイル → config.yaml → 既定 60。出どころは ctx_threshold_source）、\
-                ctx_over_threshold は閾値超えフラグ。**ctx_over_threshold が true になったら、\
+                ctx_over_threshold は閾値超えフラグ。ctx_source = mod（tako mod の報告）/ screen / \
+                transcript / none、mod を使えなかった理由は ctx_mod_reason（mod_absent / mod_stale 等）。\
+                mod_turn はターン状態（idle / busy / permission / question）、rate_limits は \
+                5h / 7d の used_percent と解除時刻（アカウント単位）。\
+                **ctx_over_threshold が true になったら、\
                 ユーザーの許可を待たずに**引き継ぎファイル（project_handoffs と handoff_path）を\
                 最新化して tako_orchestrator_handoff を呼ぶ（手順は tako_orchestrator_guide の handoff）。\
                 auto_handoff が有効なら閾値超過で「【tako 自動通知】」で始まる指示が届くので、\
@@ -3078,7 +3083,8 @@ pub fn tools() -> Vec<Value> {
                 ステータスバーの 5h / 7d リミットメーターにどのサービス（claude / codex / agy）の値を表示するかを制御する。\
                 action=status（既定）: 現在の選択サービスと利用可能サービス一覧を返す。\
                 action=set: service で指定したサービスへ切り替える。変更は settings.json に永続化され、GUI に即時反映される。\
-                action=refresh: 全ペインの TUI フッターを即時再走査し、各サービスの最新メトリクスを返す。",
+                action=refresh: 全ペインの TUI フッターを即時再走査し、各サービスの最新メトリクスを返す\
+                （claude は tako mod の報告を先に見る。取得元は claude.source = mod / screen）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

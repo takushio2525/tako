@@ -89,6 +89,30 @@ pub fn account_rate_limits(
         .unwrap_or_default()
 }
 
+/// 画面下のステータスバーの 5h / 7d（#1903）。`panes` はフォーカス順（フォーカス → 他のペイン）。
+///
+/// 最初に mod の使用制限が引けたペインのアカウントの値（[`account_rate_limits`] の 1 実装 =
+/// `orchestrator self` / `worker_status` / 帯と同じ束ね方）を先に見て、どのペインにも無ければ画面の値
+/// （`screen` = `refresh_agent_metrics` が画面から読んだ 5h / 7d）。判断は
+/// `tako_core::claude_mod::bar_limits`。A/B の `TAKO_1903_LEGACY` では画面の値だけ（#1903 前）
+pub fn status_bar_limits(
+    host: &dyn ControlHost,
+    panes: &[PaneId],
+    screen: (Option<u32>, Option<u32>),
+    now: Instant,
+) -> core::BarLimits {
+    let mod_limits = if core::limits_legacy() {
+        Vec::new()
+    } else {
+        panes
+            .iter()
+            .map(|pane| account_rate_limits(host, *pane, now))
+            .find(|limits| !limits.is_empty())
+            .unwrap_or_default()
+    };
+    core::bar_limits(&mod_limits, screen.0, screen.1)
+}
+
 /// `worker_status` のために UI スレッドで写し取る報告（`WorkerStatusCtx` は UI 外で仕上げるので、
 /// ホストへの借用を持ち出せない）
 #[derive(Debug, Clone)]

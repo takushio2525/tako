@@ -13,8 +13,9 @@
 //! - **一次ソース（S2 #1880）**: 新鮮な報告は ctx%・使用制限・ターン状態の**先頭**に来る。
 //!   引き当ては [`lookup`] の 1 本で、使えないときは理由（[`ModUnavailable`]）を返して
 //!   呼び出し側が今の経路（画面 / transcript）へ落ちる。使用制限は**アカウント単位**なので
-//!   [`ModHub::account_rate_limits`] で束ねる。**上限での停止は画面でしか判定しない**
-//!   （[`limit_reset_at`] は解除時刻の手がかりだけを返す = #813 の安全条件）
+//!   [`ModHub::account_rate_limits`] で束ねる（最新の観測が勝つ。#1903）。**上限での停止は
+//!   画面でしか判定しない**（[`limit_reset_at`] は解除時刻の手がかりだけを返す = #813 の安全条件）。
+//!   画面下のステータスバーの 5h / 7d も同じ束ねた値を先に見る（[`bar_limits`]。#1903）
 //! - **画面に出す（S3 #1881）**: 報告の応答に帯・サイドバーの材料（[`BandView`]）を載せる。
 //!   何を出すか（worker の状態・要注意・閾値を超えた ctx / 使用制限）は [`band_view`] が決め、
 //!   mod は幅に合わせて 1 行に詰めて描くだけ。帯を隠すトグルは mod の `$.store` が正本で、
@@ -43,6 +44,10 @@ pub const AB_OFF_ENV: &str = "TAKO_1877_NO_MOD";
 /// 報告を**一次ソースとして見ない** A/B の入口（S2 #1880）。注入と報告の受け取りは続けるが、
 /// ctx%・使用制限・ターン状態は #1880 前の経路（画面 / transcript）だけで決める
 pub const S2_LEGACY_ENV: &str = "TAKO_1877_S2_LEGACY";
+/// 使用制限の束ね方とステータスバーの 5h / 7d を **#1903 前**へ戻す A/B の入口。
+/// 束ね方は S2 の「`resets_at` が遅い → % が大きい」（[`ModHub::account_rate_limits_by`]）、
+/// ステータスバーは画面の値だけ（[`bar_limits`] を通さない）。報告の受け取りと S2 の一次ソース化は続ける
+pub const LIMITS_LEGACY_ENV: &str = "TAKO_1903_LEGACY";
 /// 注入する Claude Code の版の下限（**実測した版**。2.1.287〜2.1.293 は未実測なので下げるなら
 /// 実測してから。設計書 §1.6 / §3.4）
 pub const MIN_CLAUDE_VERSION: &str = "2.1.294";
@@ -382,6 +387,11 @@ pub fn s3_legacy() -> bool {
     std::env::var_os(S3_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
+/// #1903 の A/B（[`LIMITS_LEGACY_ENV`]）が立っているか
+pub fn limits_legacy() -> bool {
+    std::env::var_os(LIMITS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
 /// 一覧の 1 項目が tako の mod の置き場か（どのインスタンスの data dir でも）。
 /// tako のペインから立てた tako（開発中の隔離起動など）は親の値を継承するので、
 /// それを「利用者自身の plugin dir」と取り違えないために見分ける
@@ -520,6 +530,9 @@ pub struct ModRateLimit {
     pub percent_used: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
+    /// この値を**観測した**時刻（epoch ms）。mod は % か `resets_at` が変わったときだけ打ち直す
+    /// （#1903。heartbeat で打ち直すと放置したペインの古い値が「今」の観測に見える）。
+    /// 報告の鮮度は tako の受信時刻（[`StoredReport::received`]）で別に測る
     pub observed_at: u64,
 }
 
@@ -793,6 +806,84 @@ pub fn limit_reset_at(limits: &[ModRateLimit]) -> Option<i64> {
         .max()
 }
 
+/// 同じ種類の窓の 2 つの観測のうち `a` を採るか（[`ModHub::account_rate_limits_by`] の順序）
+fn newer_limit(a: &ModRateLimit, b: &ModRateLimit, legacy: bool) -> bool {
+    let resets = |l: &ModRateLimit| l.resets_at.as_deref().and_then(parse_resets_at);
+    let order = if legacy {
+        resets(a)
+            .cmp(&resets(b))
+            .then(a.percent_used.total_cmp(&b.percent_used))
+            .then(a.observed_at.cmp(&b.observed_at))
+    } else {
+        a.observed_at
+            .cmp(&b.observed_at)
+            .then(resets(a).cmp(&resets(b)))
+            .then(a.percent_used.total_cmp(&b.percent_used))
+    };
+    order.is_gt()
+}
+
+/// ステータスバーの 5h / 7d の取得元（#1903。`tako limit-service --refresh` の `claude.source`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarLimitSource {
+    /// tako mod の報告（アカウント単位で束ねた値）
+    Mod,
+    /// claude の画面（statusLine の `5h NN%` / `7d NN%`。#217）
+    Screen,
+}
+
+impl BarLimitSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BarLimitSource::Mod => "mod",
+            BarLimitSource::Screen => "screen",
+        }
+    }
+}
+
+/// ステータスバーの 5h / 7d メーターに出す値
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BarLimits {
+    pub five_hour: Option<u32>,
+    pub seven_day: Option<u32>,
+    /// どちらも無ければ `None`
+    pub source: Option<BarLimitSource>,
+}
+
+/// ステータスバーの 5h / 7d を決める（#1903。**判断はこの 1 本**）。
+///
+/// `mod_limits` は束ね済みの使用制限（[`ModHub::account_rate_limits`]。呼び出し側がフォーカス順で
+/// 最初に引けたペインのものを渡す）。`five_hour` / `seven_day` の窓が 1 つでもあれば **mod だけで**
+/// 決め（画面の値と窓ごとに混ぜない = 出どころを 1 つに保つ）、無ければ画面の値のまま。
+/// % は帯（S3）と同じく四捨五入（mod は小数 1 桁まで送る）
+pub fn bar_limits(
+    mod_limits: &[ModRateLimit],
+    screen_five_hour: Option<u32>,
+    screen_seven_day: Option<u32>,
+) -> BarLimits {
+    let percent = |kind: &str| {
+        mod_limits
+            .iter()
+            .find(|l| l.kind == kind)
+            // f64 → u32 の `as` は飽和する（負・NaN は 0）
+            .map(|l| l.percent_used.round() as u32)
+    };
+    let (five_hour, seven_day) = (percent("five_hour"), percent("seven_day"));
+    if five_hour.is_some() || seven_day.is_some() {
+        return BarLimits {
+            five_hour,
+            seven_day,
+            source: Some(BarLimitSource::Mod),
+        };
+    }
+    BarLimits {
+        five_hour: screen_five_hour,
+        seven_day: screen_seven_day,
+        source: (screen_five_hour.is_some() || screen_seven_day.is_some())
+            .then_some(BarLimitSource::Screen),
+    }
+}
+
 /// 1 ペインの最終報告
 #[derive(Debug, Clone)]
 pub struct StoredReport {
@@ -915,36 +1006,37 @@ impl ModHub {
     /// このペインのアカウント（`config_dir`）の使用制限を、同じアカウントの新鮮な報告すべてから
     /// 束ねる（窓の種類ごとに 1 つ。使用制限は**アカウント単位**の値 = 設計書 §4.2）。
     ///
-    /// 窓の種類ごとに「`resets_at` が遅い（= 新しい窓）→ 同じ窓なら `percent_used` が大きい →
-    /// `observed_at` が新しい」を採る。**`observed_at` だけでは決めない**: mod は heartbeat の
-    /// たびに読み直した時刻を打つので、1 時間放置したペインの古い % も「今」の時刻で届く。
-    /// 同じ窓の中で使用率は減らないので、大きい方が新しい観測
+    /// 窓の種類ごとに**最新の観測**（`observed_at` が新しい）を採る（設計書 §6。#1903）。
+    /// mod は値が変わったときだけ `observed_at` を打つ（heartbeat では打ち直さない）ので、
+    /// 1 時間放置したペインの古い % は 1 時間前の観測のまま届き、動いているペインの値が勝つ。
+    /// 同じ時刻なら `resets_at` が遅い（= 新しい窓）→ % が大きい方
     pub fn account_rate_limits(&self, pane: u64, now: Instant) -> Vec<ModRateLimit> {
+        self.account_rate_limits_by(pane, now, limits_legacy())
+    }
+
+    /// [`Self::account_rate_limits`] の本体。`legacy`（[`LIMITS_LEGACY_ENV`]）は S2（#1880）の
+    /// 束ね方 =「`resets_at` が遅い → % が大きい → `observed_at`」（mod が heartbeat のたびに
+    /// 今の時刻を打っていた頃の回避策）。テストは env を触らずに両アームを見る
+    pub fn account_rate_limits_by(
+        &self,
+        pane: u64,
+        now: Instant,
+        legacy: bool,
+    ) -> Vec<ModRateLimit> {
         let Some(own) = self.fresh_report(pane, now) else {
             return Vec::new();
         };
         let account = own.config_dir.as_deref();
         let mut best: std::collections::BTreeMap<String, ModRateLimit> =
             std::collections::BTreeMap::new();
-        let rank = |l: &ModRateLimit| {
-            (
-                l.resets_at.as_deref().and_then(parse_resets_at),
-                l.percent_used,
-                l.observed_at,
-            )
-        };
         for stored in self.reports.values() {
             if !is_fresh(stored.received, now) || stored.report.config_dir.as_deref() != account {
                 continue;
             }
             for limit in &stored.report.rate_limits {
-                let replace = best.get(&limit.kind).is_none_or(|cur| {
-                    let (a, b) = (rank(limit), rank(cur));
-                    a.0.cmp(&b.0)
-                        .then(a.1.total_cmp(&b.1))
-                        .then(a.2.cmp(&b.2))
-                        .is_gt()
-                });
+                let replace = best
+                    .get(&limit.kind)
+                    .is_none_or(|cur| newer_limit(limit, cur, legacy));
                 if replace {
                     best.insert(limit.kind.clone(), limit.clone());
                 }
@@ -1731,6 +1823,8 @@ mod tests {
 
     #[test]
     fn issue1880_使用制限はアカウントごとに束ねて新しい窓と大きい方を採る() {
+        // S2 の束ね方（#1903 の A/B = legacy アーム）。mod が heartbeat のたびに今の時刻を
+        // 打っていた頃の回避策なので、observed_at は放置したペインの方が新しい前提で組む
         let t0 = Instant::now();
         let mut hub = ModHub::new(true);
         // pane 1: 1 時間放置（古い 20%）でも heartbeat の observed_at は新しい
@@ -1763,7 +1857,7 @@ mod tests {
             ),
             t0,
         );
-        let got = hub.account_rate_limits(1, t0);
+        let got = hub.account_rate_limits_by(1, t0, true);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, "five_hour");
         assert_eq!(got[0].percent_used, 80.0, "同じ窓なら大きい方 = 新しい観測");
@@ -1777,15 +1871,146 @@ mod tests {
             ),
             t0,
         );
-        assert_eq!(hub.account_rate_limits(1, t0)[0].percent_used, 3.0);
+        assert_eq!(hub.account_rate_limits_by(1, t0, true)[0].percent_used, 3.0);
         // 古い報告は束ねない・自分が古ければ空
         let later = t0 + Duration::from_secs(60);
-        assert!(hub.account_rate_limits(1, later).is_empty());
+        assert!(hub.account_rate_limits_by(1, later, true).is_empty());
         hub.accept(1, report_with(Some("/acct-a"), vec![]), later);
         assert!(
-            hub.account_rate_limits(1, later).is_empty(),
+            hub.account_rate_limits_by(1, later, true).is_empty(),
             "pane 2 の報告は失効している"
         );
+    }
+
+    #[test]
+    fn issue1903_使用制限は最新の観測で束ねる() {
+        // mod は値が変わったときだけ observed_at を打つ（#1903）= 放置したペインの値は古い時刻のまま
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        // pane 1: 1 時間前に 80% を観測したきり放置（heartbeat で鮮度は保っている）
+        hub.accept(
+            1,
+            report_with(
+                Some("/acct-a"),
+                vec![
+                    limit("five_hour", 80.0, "2026-10-08T14:30:00Z", 1_000),
+                    limit("seven_day", 30.0, "2026-10-10T13:00:00Z", 1_000),
+                ],
+            ),
+            t0,
+        );
+        // pane 2: 動いている。上限の引き上げ（プラン変更・早めのリセット）で同じ窓の % が下がった
+        hub.accept(
+            2,
+            report_with(
+                Some("/acct-a"),
+                vec![limit("five_hour", 20.0, "2026-10-08T14:30:00Z", 3_601_000)],
+            ),
+            t0,
+        );
+        // pane 3: 別アカウントのもっと新しい観測は混ぜない
+        hub.accept(
+            3,
+            report_with(
+                Some("/acct-b"),
+                vec![limit("five_hour", 99.0, "2026-10-08T15:00:00Z", 9_999_000)],
+            ),
+            t0,
+        );
+        for pane in [1, 2] {
+            let got = hub.account_rate_limits_by(pane, t0, false);
+            assert_eq!(got.len(), 2, "pane {pane}");
+            assert_eq!(
+                (got[0].kind.as_str(), got[0].percent_used),
+                ("five_hour", 20.0),
+                "pane {pane}: 動いているペインの最新の観測"
+            );
+            assert_eq!(
+                (got[1].kind.as_str(), got[1].percent_used),
+                ("seven_day", 30.0),
+                "pane {pane}: 他に観測が無い窓は放置したペインの値"
+            );
+        }
+        // A/B: S2 の束ね方は同じ窓の大きい方 = 放置したペインの古い 80% が勝つ
+        assert_eq!(
+            hub.account_rate_limits_by(2, t0, true)[0].percent_used,
+            80.0
+        );
+        // 同じ時刻なら新しい窓 → 大きい方
+        hub.accept(
+            1,
+            report_with(
+                Some("/acct-a"),
+                vec![limit("five_hour", 5.0, "2026-10-08T19:30:00Z", 3_601_000)],
+            ),
+            t0,
+        );
+        assert_eq!(
+            hub.account_rate_limits_by(2, t0, false)[0].percent_used,
+            5.0
+        );
+        // 古い報告は束ねない（最新の観測でも失効した報告の値は採らない）
+        let later = t0 + Duration::from_secs(60);
+        hub.accept(
+            2,
+            report_with(
+                Some("/acct-a"),
+                vec![limit("five_hour", 40.0, "2026-10-08T14:30:00Z", 100)],
+            ),
+            later,
+        );
+        assert_eq!(
+            hub.account_rate_limits_by(2, later, false)[0].percent_used,
+            40.0
+        );
+    }
+
+    #[test]
+    fn issue1903_ステータスバーはmodの窓があればmodだけで決める() {
+        let mod_limits = vec![
+            limit("five_hour", 42.4, "2026-10-08T14:30:00Z", 1),
+            limit("seven_day", 17.5, "2026-10-10T13:00:00Z", 1),
+            limit("spend_limit", 3.0, "2026-10-10T13:00:00Z", 1),
+        ];
+        assert_eq!(
+            bar_limits(&mod_limits, Some(23), Some(46)),
+            BarLimits {
+                five_hour: Some(42),
+                seven_day: Some(18),
+                source: Some(BarLimitSource::Mod),
+            },
+            "画面の値（23 / 46）より mod を先に見る・帯と同じ四捨五入"
+        );
+        // 片方の窓だけでも mod で決める（画面の 7d と混ぜない）
+        assert_eq!(
+            bar_limits(&mod_limits[..1], Some(23), Some(46)),
+            BarLimits {
+                five_hour: Some(42),
+                seven_day: None,
+                source: Some(BarLimitSource::Mod),
+            }
+        );
+        // mod に 5h / 7d が無い（報告なし・初回応答の前・ゲートウェイの窓だけ）なら画面の値
+        for none in [&[][..], &mod_limits[2..]] {
+            assert_eq!(
+                bar_limits(none, Some(23), Some(46)),
+                BarLimits {
+                    five_hour: Some(23),
+                    seven_day: Some(46),
+                    source: Some(BarLimitSource::Screen),
+                }
+            );
+        }
+        assert_eq!(bar_limits(&[], None, None), BarLimits::default());
+        // 上限を超えた値・壊れた値でも落ちない（as は飽和）
+        let odd = vec![
+            limit("five_hour", 104.6, "2026-10-08T14:30:00Z", 1),
+            limit("seven_day", -1.0, "2026-10-10T13:00:00Z", 1),
+        ];
+        let got = bar_limits(&odd, None, None);
+        assert_eq!((got.five_hour, got.seven_day), (Some(105), Some(0)));
+        assert_eq!(BarLimitSource::Mod.as_str(), "mod");
+        assert_eq!(BarLimitSource::Screen.as_str(), "screen");
     }
 
     #[test]
