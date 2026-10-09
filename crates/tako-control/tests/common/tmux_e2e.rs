@@ -26,6 +26,7 @@
 //! - **器を畳むのは「誰も借りていない」が確定しているときだけ**（#1866）。
 //!   借りる側は `tmux new-session` を叩く**前に**数に入り（予約）、返す側は
 //!   「数を減らす → 0 か見る → `kill-server` → ソケットを消す」を**同じロックの中で**行う
+//! - 器は `-f /dev/null` で起こす（#1874。利用者の `~/.tmux.conf` を読ませない）
 //!
 //! ## #1866: 器を畳む判定が、隣のテストの起動中の器を消していた
 //!
@@ -243,7 +244,11 @@ pub fn run_tmux(socket: &str, args: &[&str], base: Duration) -> Ran {
     }
 }
 
-/// `tmux -L <socket> new-session <args…>` を走らせ、失敗したら
+/// 器を起こす `new-session` の頭。`-f /dev/null` で利用者の `~/.tmux.conf` を読ませない
+/// （#1874: 無いと利用者の prefix・status・フック・`run-shell` までテストの器で動く）
+const NEW_SESSION: [&str; 3] = ["-f", "/dev/null", "new-session"];
+
+/// `tmux -L <socket> -f /dev/null new-session <args…>` を走らせ、失敗したら
 /// **理由 + 器の状態**を `Err` で返す（そのまま `panic!` へ流せる 1 枚の診断）
 pub fn new_session(socket: &str, args: &[&str]) -> Result<(), String> {
     let legacy = legacy_1866();
@@ -254,11 +259,11 @@ pub fn new_session(socket: &str, args: &[&str]) -> Result<(), String> {
     }
     if inject_duplicate() {
         // 先に同じセッションを作っておく = 本番と同じ「取り合い」の形にする
-        let mut first = vec!["new-session"];
+        let mut first = NEW_SESSION.to_vec();
         first.extend_from_slice(args);
         let _ = run_tmux(socket, &first, BASE);
     }
-    let mut full = vec!["new-session"];
+    let mut full = NEW_SESSION.to_vec();
     full.extend_from_slice(args);
     let ran = run_tmux(socket, &full, BASE);
     if ran.ok {

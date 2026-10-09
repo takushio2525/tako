@@ -637,8 +637,23 @@ pub(crate) fn shell_quoted(command: &SpawnCommand) -> String {
         .join(" ")
 }
 
+/// テストの器の名前の接頭辞。**残骸掃除（[`TmuxTestGuard`]）はこの接頭辞の器しか拾わない**
+/// ので、lib テストの器はどれかで始め、pid を `-` 区切りの 1 区画で持たせる（#1874）。
+///
+/// - `tako-coretest-`: 既定
+/// - `tk-coretest-`: **`tako` で始まらない名前**が要る検査用（#1105: シェル統合が名前の
+///   接頭辞 `tako*` で器を推測しないことを確かめる）。製品の掃除（`tako tmux cleanup`）も
+///   `tk*` を tako の系統として一覧に載せる（kill はしない = 残骸ソケットの削除だけ）
+///
+/// 接頭辞から外れた名前（#1874 の時点の `tako-coretest1857-<pid>` / `ct1105-<pid>`）は、
+/// テストプロセスが途中で殺されると誰にも回収されない。番犬
+/// `crates/tako-control/tests/issue1866_tmux_socket_name_watchdog.rs` がこの定義を
+/// ソースから読み、外れた名前を file:line で落とす
+#[cfg(test)]
+pub(crate) const TEST_SOCKET_PREFIXES: &[&str] = &["tako-coretest-", "tk-coretest-"];
+
 /// テスト用: tmux 隔離ソケットの後始末ガード。
-/// 生成時に前回テストの残骸ソケット（tako-coretest-*）を掃除し、Drop でサーバー kill +
+/// 生成時に前回テストの残骸ソケット（[`TEST_SOCKET_PREFIXES`]）を掃除し、Drop でサーバー kill +
 /// ソケットファイル削除を行う
 #[cfg(test)]
 pub(crate) struct TmuxTestGuard(Vec<String>);
@@ -650,7 +665,7 @@ impl TmuxTestGuard {
         Self(sockets)
     }
 
-    /// 前回テストの残骸（tako-coretest-* ソケット + ゾンビサーバー）を一括掃除する。
+    /// 前回テストの残骸（[`TEST_SOCKET_PREFIXES`] のソケット + ゾンビサーバー）を一括掃除する。
     /// テスト途中の kill -9 で Drop が走らずサーバーが残る場合の回収
     fn cleanup_stale_sockets() {
         use std::sync::Once;
@@ -671,7 +686,7 @@ impl TmuxTestGuard {
     }
 }
 
-/// テストソケット名（`tako-coretest-<用途>-<pid>`）の所有プロセス ID。
+/// テストソケット名（`<接頭辞><用途>-<pid>`）の所有プロセス ID。
 /// 抽出は製品コードと 1 実装（#1192 の `owner_pid_candidates`）
 #[cfg(test)]
 fn socket_owner_pid(name: &str) -> Option<u32> {
@@ -693,7 +708,7 @@ fn socket_owner_pid(name: &str) -> Option<u32> {
 fn is_stale_socket(name: &str, is_alive: impl Fn(u32) -> bool) -> bool {
     // tmux は /tmp → /private/tmp の解決でソケット名末尾に `=` を付けることがある
     let base = name.trim_end_matches('=');
-    if !base.starts_with("tako-coretest-") {
+    if !TEST_SOCKET_PREFIXES.iter().any(|p| base.starts_with(p)) {
         return false;
     }
     socket_owner_pid(base).is_some_and(|pid| !is_alive(pid))
@@ -1545,6 +1560,26 @@ set -gq copy-mode-position-format ''
         assert!(!is_stale_socket("tako-coretest-nopid", |_| false));
     }
 
+    /// #1874: `tako` で始まらない名前が要る検査（#1105）の接頭辞も拾い、接頭辞から外れた
+    /// 名前は拾わない（= 外れた名前の器はテストプロセスが殺されると誰にも回収されない。
+    /// テスト側の名前の揃えは番犬 `issue1866_tmux_socket_name_watchdog.rs` が見張る）
+    #[test]
+    fn 残骸掃除はテストの器の接頭辞をすべて拾う() {
+        let dead = |_: u32| false;
+        for prefix in TEST_SOCKET_PREFIXES {
+            assert!(
+                is_stale_socket(&format!("{prefix}1105-999999="), dead),
+                "{prefix}"
+            );
+        }
+        assert!(is_stale_socket("tk-coretest-1105-999999", dead));
+        // #1874 の時点で外れていた 2 つ（接頭辞の `-` 抜け / `tako` で始まらない名前）
+        assert!(!is_stale_socket("tako-coretest1857-999999", dead));
+        assert!(!is_stale_socket("ct1105-999999", dead));
+        // 生きている所有者の器は接頭辞が何であれ触らない（#625）
+        assert!(!is_stale_socket("tk-coretest-1105-4242", |pid| pid == 4242));
+    }
+
     #[test]
     fn テストソケット名から所有pidを取れる() {
         assert_eq!(socket_owner_pid("tako-coretest-scr0-1234"), Some(1234));
@@ -1962,7 +1997,7 @@ set -gq copy-mode-position-format ''
             eprintln!("skip: tmux が無い環境");
             return;
         }
-        let socket = format!("tako-coretest1857-{}", std::process::id());
+        let socket = format!("tako-coretest-1857-{}", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let session = "tako-e2e-1857";
         let base = SpawnOptions {
@@ -2015,9 +2050,18 @@ set -gq copy-mode-position-format ''
             }
             None
         };
-        // サーバーが最後のセッションと一緒に消えない（exit-empty）よう、別のセッションを置く
+        // サーバーが最後のセッションと一緒に消えない（exit-empty）よう、別のセッションを置く。
+        // 器を起こすのはこの行なので `-f /dev/null` で利用者の `~/.tmux.conf` を読ませない（#1874）
         let _ = crate::tmux::tmux_command(Some(&socket))
-            .args(["new-session", "-d", "-s", "tako-e2e-1857-keep", "sleep 600"])
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "tako-e2e-1857-keep",
+                "sleep 600",
+            ])
             .status();
 
         let (mut first, mut rx1) =
@@ -2298,8 +2342,13 @@ set -gq copy-mode-position-format ''
             eprintln!("skip: zsh が無い環境");
             return;
         }
-        // **接頭辞をわざと外す**（`tako` で始まらない名前）
-        let socket = format!("ct1105-{}", std::process::id());
+        // **接頭辞をわざと外す**（`tako` で始まらない名前）。それでも残骸掃除が拾う
+        // `tk-coretest-` にする（#1874: 旧名 `ct1105-<pid>` は途中で殺されると残り続けた）
+        let socket = format!("tk-coretest-1105-{}", std::process::id());
+        assert!(
+            !socket.starts_with("tako"),
+            "この検査は名前が tako で始まらないことが前提"
+        );
         let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let options = SpawnOptions {
             command: None,

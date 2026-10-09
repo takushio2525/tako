@@ -2583,6 +2583,22 @@ stderr・そのソケットのセッション一覧・PTY / ソケット / サ�
 `file:line` で落とす）、振る舞いの固定と A/B（`TAKO_1866_LEGACY=1`）は
 `crates/tako-control/tests/issue1866_tmux_e2e_refcount.rs`。
 
+**テストの器の名前は残骸掃除が拾う形にし、`-f /dev/null` で起こす（Issue #1874）**。
+テストプロセスが途中で殺されると Drop が走らず器が残り、回収するのは名前で判定する掃除だけ:
+tako-core の lib テストは `TmuxTestGuard`（`tmux_backend.rs` の `TEST_SOCKET_PREFIXES` =
+`tako-coretest-` / `tk-coretest-`）、それ以外は `tako tmux cleanup --servers`（`tako-`）。
+どちらも所有者を名前の pid（`-` 区切りで数字だけの区画）で見分けるので、名前は
+`<接頭辞><用途>-<pid>` にする。`tako` で始まらない名前が要る検査（#1105）は `tk-coretest-` を使う
+（製品の掃除は `tk*` を kill しない = 回収は `TmuxTestGuard` だけ）。修正前の
+`tako-coretest1857-<pid>` / `ct1105-<pid>` は途中で殺すと `TmuxTestGuard` が拾わず、
+`ct1105-` は製品の掃除でも `foreign` だった。固定名（`tako-e2e-571`）は製品の掃除が `571` を
+所有 pid と読み違える。**テストが自分で `new-session` を叩くときは `-f /dev/null`** を渡す
+（無いと利用者の `~/.tmux.conf` を読む。読まれたら器の名前を記録する `.tmux.conf` を置いた
+偽の HOME で修正前の main を走らせると、tmux_e2e 経由・dispatch・scrollback_capture などの器が
+読んでいた）。psmux の e2e は `-f` の扱いが未実測なので対象外。番犬は
+`crates/tako-control/tests/issue1866_tmux_socket_name_watchdog.rs`（外れた名前の定義行と
+`-f` の無い `new-session` の行を `file:line` で落とす）。
+
 ## 新しい worktree は PWA のビルドから始まる（Issue #1309 / #574）
 
 `git worktree add` 直後のツリーには `web/tako-remote/dist/` が無い（`.gitignore` 対象）。
