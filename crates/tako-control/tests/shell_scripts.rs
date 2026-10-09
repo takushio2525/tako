@@ -4,7 +4,8 @@
 //! **CI で落とす**ための検査。`.agent/conventions.md` の
 //! 「シェルスクリプトで日本語を出すときの変数展開（Issue #837）」と
 //! 「シェルスクリプトは macOS 同梱の bash 3.2 で通す（Issue #1499 / #1518）」に
-//! 書いてある規約の機械化（同じ節の「`set -e` と EXIT trap を併用するなら番人を通す」= #1864 も）。
+//! 書いてある規約の機械化（同じ節の「`set -e` と EXIT trap を併用するなら番人を通す」= #1864 と
+//! 「`"$( … )"` の中のダブルクォートに `{…,…}` を置かない」= #1924 も）。
 
 use std::path::{Path, PathBuf};
 
@@ -992,4 +993,846 @@ fn 番犬は併用の3つの崩れ方をfile_lineで名指しする() {
     assert!(exit_guard_violations("scripts/x.sh", src).is_empty());
     let src = "set -e\n# tako:exit-guard-ok\ntrap 'exit 1' EXIT\n";
     assert_eq!(exit_guard_violations("scripts/x.sh", src).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// bash 3.2 の波括弧展開がクォートを取り違える（Issue #1924）
+// ---------------------------------------------------------------------------
+
+/// 1 つの語（クォート込みの原文）
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RawWord {
+    /// ファイル先頭からの文字位置（`chars()` の添字）
+    start: usize,
+    text: String,
+    /// bash が波括弧展開をかける語か（素の代入・`[[ ]]`・case の対象と腕のパターン・
+    /// ヒアストリングは false。`/bin/bash` 3.2.57 で 1 つずつ確かめた）
+    brace_expanded: bool,
+}
+
+/// case 文の中のどこに居るか（腕の `)` をサブシェルの閉じと取り違えないため）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseState {
+    Subject,
+    ExpectIn,
+    Pattern,
+    Body,
+}
+
+/// `.sh` を**語**へ分ける字句解析（クォートは外さず原文のまま）。
+///
+/// `$( … )` の中のコマンドも 1 つずつ語へ分ける（入れ子の深さを問わない）。
+/// クォートされた語のヒアドキュメント（`<<'X'`）の本文は読まない。素の `<<X` の本文は
+/// 語ではない（展開されるが波括弧展開はかからない）が、中の `$( … )` は読む。
+struct WordLexer {
+    c: Vec<char>,
+    i: usize,
+    words: Vec<RawWord>,
+    pending: Vec<Heredoc>,
+}
+
+const WORD_END: &[char] = &[' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>'];
+
+impl WordLexer {
+    fn new(text: &str) -> Self {
+        WordLexer {
+            c: text.chars().collect(),
+            i: 0,
+            words: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn peek(&self, k: usize) -> Option<char> {
+        self.c.get(self.i + k).copied()
+    }
+
+    fn at(&self, s: &str) -> bool {
+        s.chars()
+            .enumerate()
+            .all(|(k, ch)| self.peek(k) == Some(ch))
+    }
+
+    /// コマンドの並び。`until_close` なら対応する `)` を食べて戻る（`$( … )` / `( … )`）
+    fn list(&mut self, until_close: bool) {
+        let mut cmd_start = true;
+        let mut dbl_bracket = false;
+        let mut dbl_paren = 0usize; // `[[ … ]]` の中の `( … )`（サブシェルではない）
+        let mut next_exempt = false;
+        let mut case: Vec<CaseState> = Vec::new();
+        while let Some(ch) = self.peek(0) {
+            match ch {
+                '\n' => {
+                    self.i += 1;
+                    cmd_start = true;
+                    self.heredoc_bodies();
+                }
+                ' ' | '\t' => self.i += 1,
+                '\\' if self.peek(1) == Some('\n') => self.i += 2, // 行末の `\` = 続き
+                '#' => {
+                    while self.peek(0).is_some_and(|c| c != '\n') {
+                        self.i += 1;
+                    }
+                }
+                ';' => {
+                    // `;;` / `;&` / `;;&` は case の腕の終わり
+                    if self.at(";;") || self.at(";&") {
+                        self.i += 2;
+                        if self.peek(0) == Some('&') {
+                            self.i += 1;
+                        }
+                        if let Some(s) = case.last_mut() {
+                            *s = CaseState::Pattern;
+                        }
+                    } else {
+                        self.i += 1;
+                    }
+                    cmd_start = true;
+                }
+                '&' | '|' => {
+                    self.i += 1;
+                    cmd_start = true;
+                }
+                ')' => {
+                    self.i += 1;
+                    if dbl_bracket && dbl_paren > 0 {
+                        dbl_paren -= 1;
+                    } else if case.last() == Some(&CaseState::Pattern) {
+                        *case.last_mut().expect("case") = CaseState::Body;
+                        cmd_start = true;
+                    } else if until_close {
+                        return;
+                    }
+                }
+                '(' => {
+                    if self.at("((") {
+                        self.arith();
+                    } else if dbl_bracket {
+                        self.i += 1;
+                        dbl_paren += 1;
+                    } else if case.last() == Some(&CaseState::Pattern) {
+                        self.i += 1; // 腕のパターンの先頭の `(`
+                    } else {
+                        self.i += 1;
+                        self.list(true);
+                    }
+                    cmd_start = false;
+                }
+                '<' | '>' => {
+                    if self.at("<<<") {
+                        self.i += 3;
+                        next_exempt = true; // ヒアストリングは波括弧展開されない
+                    } else if self.at("<<") {
+                        self.heredoc_op();
+                    } else if self.at("<(") || self.at(">(") {
+                        self.i += 2;
+                        self.list(true);
+                    } else {
+                        self.i += 1;
+                        while matches!(self.peek(0), Some('>' | '&' | '|')) {
+                            self.i += 1;
+                        }
+                    }
+                }
+                _ => {
+                    let start = self.i;
+                    let array = self.word(cmd_start);
+                    let text: String = self.c[start..self.i].iter().collect();
+                    let mut expanded = true;
+                    if next_exempt {
+                        next_exempt = false;
+                        expanded = false;
+                        if case.last() == Some(&CaseState::Subject) {
+                            *case.last_mut().expect("case") = CaseState::ExpectIn;
+                        }
+                    } else if case.last() == Some(&CaseState::ExpectIn) && text == "in" {
+                        *case.last_mut().expect("case") = CaseState::Pattern;
+                        expanded = false;
+                    } else if case.last() == Some(&CaseState::Pattern) {
+                        expanded = false; // 腕のパターン（`esac` で閉じる）
+                        if text == "esac" {
+                            case.pop();
+                        }
+                    } else if dbl_bracket {
+                        expanded = false;
+                        if text == "]]" {
+                            dbl_bracket = false;
+                        }
+                    } else if cmd_start {
+                        match text.as_str() {
+                            "[[" => {
+                                dbl_bracket = true;
+                                expanded = false;
+                                cmd_start = false;
+                            }
+                            "case" => {
+                                case.push(CaseState::Subject);
+                                next_exempt = true;
+                                cmd_start = false;
+                            }
+                            "esac" if case.last() == Some(&CaseState::Body) => {
+                                case.pop();
+                            }
+                            "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "!"
+                            | "{" | "}" | "time" | "fi" | "done" | "esac" => {}
+                            _ if is_assignment_word(&text) => expanded = array,
+                            _ => cmd_start = false,
+                        }
+                    } else {
+                        cmd_start = false;
+                    }
+                    if !array {
+                        self.words.push(RawWord {
+                            start,
+                            text,
+                            brace_expanded: expanded,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// 1 語を読む。`NAME=( … )` の配列代入なら要素を 1 語ずつ積んで true を返す
+    /// （要素は波括弧展開される = 代入の右辺でも素通りしない）
+    fn word(&mut self, cmd_start: bool) -> bool {
+        let start = self.i;
+        let mut array = false;
+        while let Some(ch) = self.peek(0) {
+            match ch {
+                '\\' => self.i += 2,
+                '\'' => self.single(),
+                '$' if self.peek(1) == Some('\'') => {
+                    self.i += 1;
+                    self.ansi_c();
+                }
+                '"' => self.dquote(),
+                '`' => self.backtick(),
+                '$' if self.peek(1) == Some('(') => self.cmdsub(),
+                '$' if self.peek(1) == Some('{') => self.param(false),
+                '(' if cmd_start && {
+                    let so_far: String = self.c[start..self.i].iter().collect();
+                    so_far.ends_with('=') && is_assignment_word(&so_far)
+                } =>
+                {
+                    self.i += 1;
+                    self.array_elements();
+                    array = true;
+                }
+                c if WORD_END.contains(&c) => break,
+                _ => self.i += 1,
+            }
+        }
+        // 末尾の `\` や閉じていないクォートで読み過ぎても、語の切り出しで落ちない
+        self.i = self.i.min(self.c.len());
+        array
+    }
+
+    /// `NAME=(` の後ろ、対応する `)` まで
+    fn array_elements(&mut self) {
+        while let Some(ch) = self.peek(0) {
+            match ch {
+                ')' => {
+                    self.i += 1;
+                    return;
+                }
+                ' ' | '\t' | '\n' => self.i += 1,
+                '#' => {
+                    while self.peek(0).is_some_and(|c| c != '\n') {
+                        self.i += 1;
+                    }
+                }
+                _ => {
+                    let start = self.i;
+                    self.word(false);
+                    if self.i == start {
+                        self.i += 1; // 区切り文字の取りこぼし（無限ループにしない）
+                        continue;
+                    }
+                    let text: String = self.c[start..self.i].iter().collect();
+                    self.words.push(RawWord {
+                        start,
+                        text,
+                        brace_expanded: true,
+                    });
+                }
+            }
+        }
+    }
+
+    fn single(&mut self) {
+        self.i += 1;
+        while self.peek(0).is_some_and(|c| c != '\'') {
+            self.i += 1;
+        }
+        self.i += 1;
+    }
+
+    /// `$'…'`（`\'` で閉じない）。`$` は呼び手が食べてある
+    fn ansi_c(&mut self) {
+        self.i += 1;
+        while let Some(ch) = self.peek(0) {
+            self.i += 1;
+            match ch {
+                '\\' => self.i += 1,
+                '\'' => return,
+                _ => {}
+            }
+        }
+    }
+
+    fn dquote(&mut self) {
+        self.i += 1;
+        while let Some(ch) = self.peek(0) {
+            match ch {
+                '\\' => self.i += 2,
+                '"' => {
+                    self.i += 1;
+                    return;
+                }
+                '`' => self.backtick(),
+                '$' if self.peek(1) == Some('(') => self.cmdsub(),
+                '$' if self.peek(1) == Some('{') => self.param(true),
+                _ => self.i += 1,
+            }
+        }
+    }
+
+    fn backtick(&mut self) {
+        self.i += 1;
+        while let Some(ch) = self.peek(0) {
+            self.i += 1;
+            match ch {
+                '\\' => self.i += 1,
+                '`' => return,
+                _ => {}
+            }
+        }
+    }
+
+    /// `$( … )`（中のコマンドも語へ分ける）か `$(( … ))`
+    fn cmdsub(&mut self) {
+        if self.at("$((") {
+            self.i += 1;
+            self.arith();
+        } else {
+            self.i += 2;
+            self.list(true);
+        }
+    }
+
+    /// `(( … ))`（入れ子の括弧を数えるだけ）
+    fn arith(&mut self) {
+        let mut depth = 0usize;
+        while let Some(ch) = self.peek(0) {
+            self.i += 1;
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `${ … }`（中のクォート・コマンド置換も読む）
+    fn param(&mut self, in_dquote: bool) {
+        self.i += 2;
+        let mut depth = 1usize;
+        while let Some(ch) = self.peek(0) {
+            match ch {
+                '\\' => self.i += 2,
+                '\'' if !in_dquote => self.single(),
+                '"' => self.dquote(),
+                '`' => self.backtick(),
+                '$' if self.peek(1) == Some('(') => self.cmdsub(),
+                '$' if self.peek(1) == Some('{') => {
+                    self.i += 2;
+                    depth += 1;
+                }
+                '}' => {
+                    self.i += 1;
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => self.i += 1,
+            }
+        }
+    }
+
+    /// `<<` / `<<-` の区切りの語を読み、次の改行で本文を読む予約をする
+    fn heredoc_op(&mut self) {
+        self.i += 2;
+        let strip_tabs = self.peek(0) == Some('-');
+        if strip_tabs {
+            self.i += 1;
+        }
+        while matches!(self.peek(0), Some(' ' | '\t')) {
+            self.i += 1;
+        }
+        let start = self.i;
+        while self.peek(0).is_some_and(|c| !WORD_END.contains(&c)) {
+            self.i += 1;
+        }
+        let raw: String = self.c[start..self.i].iter().collect();
+        let expanded = !raw.contains(['\'', '"', '\\']);
+        let delimiter: String = raw.chars().filter(|c| !"'\"\\".contains(*c)).collect();
+        if !delimiter.is_empty() {
+            self.pending.push(Heredoc {
+                delimiter,
+                expanded,
+                strip_tabs,
+            });
+        }
+    }
+
+    /// 改行の直後に、予約されたヒアドキュメントの本文を順に読む
+    fn heredoc_bodies(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        for hd in pending {
+            while self.i < self.c.len() {
+                let end = self.c[self.i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(self.c.len(), |p| self.i + p);
+                let line: String = self.c[self.i..end].iter().collect();
+                let probe = if hd.strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line.as_str()
+                };
+                if probe == hd.delimiter {
+                    self.i = (end + 1).min(self.c.len());
+                    break;
+                }
+                if !hd.expanded {
+                    self.i = (end + 1).min(self.c.len());
+                    continue;
+                }
+                // 本文は語ではない（`"` もただの文字）が、中の `$( … )` は語へ分ける
+                while let Some(ch) = self.peek(0) {
+                    match ch {
+                        '\n' => break,
+                        '\\' => self.i += 2,
+                        '`' => self.backtick(),
+                        '$' if self.peek(1) == Some('(') => self.cmdsub(),
+                        '$' if self.peek(1) == Some('{') => self.param(true),
+                        _ => self.i += 1,
+                    }
+                }
+                self.i += 1;
+            }
+        }
+    }
+}
+
+/// `NAME=…` / `NAME+=…` / `NAME[…]=…`（コマンドの先頭に並ぶ代入の語）か
+fn is_assignment_word(text: &str) -> bool {
+    let name_end = text
+        .char_indices()
+        .find(|&(k, c)| !(c == '_' || c.is_ascii_alphabetic() || (k > 0 && c.is_ascii_digit())))
+        .map_or(text.len(), |(k, _)| k);
+    if name_end == 0 {
+        return false;
+    }
+    let mut rest = &text[name_end..];
+    if rest.starts_with('[') {
+        match rest.find(']') {
+            Some(close) => rest = &rest[close + 1..],
+            None => return false,
+        }
+    }
+    rest.starts_with('=') || rest.starts_with("+=")
+}
+
+/// ファイル全体を語へ分ける
+fn raw_words(src: &str) -> Vec<RawWord> {
+    let mut lx = WordLexer::new(src);
+    lx.list(false);
+    lx.words
+}
+
+/// 正しい構文で読んだとき、語の中のその位置が**どのクォートにもコマンド置換にも入っていない**か
+fn top_level_unquoted(word: &[char]) -> Vec<bool> {
+    let mut top = vec![false; word.len()];
+    let mut lx = WordLexer {
+        c: word.to_vec(),
+        i: 0,
+        words: Vec::new(),
+        pending: Vec::new(),
+    };
+    while let Some(ch) = lx.peek(0) {
+        let before = lx.i;
+        match ch {
+            '\\' => lx.i += 2,
+            '\'' => lx.single(),
+            '$' if lx.peek(1) == Some('\'') => {
+                lx.i += 1;
+                lx.ansi_c();
+            }
+            '"' => lx.dquote(),
+            '`' => lx.backtick(),
+            '$' if lx.peek(1) == Some('(') => lx.cmdsub(),
+            '$' if lx.peek(1) == Some('{') => lx.param(false),
+            _ => {
+                top[lx.i] = true;
+                lx.i += 1;
+            }
+        }
+        if lx.i == before {
+            lx.i += 1;
+        }
+    }
+    top
+}
+
+/// bash 3.2 の `brace_gobbler`（braces.c）の写し: `from` から `satisfy` を探す。
+///
+/// **3.2 は `"…"` の中を「次の `"` まで」としか見ず、`$( … )` の入れ子を知らない**。
+/// だから `"$(f "{a,b}")"` は内側の `"` で外側のクォートが閉じたと読み、`{a,b}` を
+/// クォートの外と取り違える（4.0 以降は `"` の中の `$(` を読み飛ばすので起きない）。
+fn gobble32(t: &[char], from: usize, satisfy: char) -> Option<usize> {
+    let ws = |c: Option<&char>| matches!(c, Some(' ' | '\t' | '\n'));
+    let mut level = 0usize;
+    let mut quoted: Option<char> = None;
+    let mut i = from;
+    while i < t.len() {
+        let c = t[i];
+        if c == '\\' && matches!(quoted, None | Some('"') | Some('`')) {
+            i += 2;
+            continue;
+        }
+        if c == '$' && t.get(i + 1) == Some(&'{') && quoted != Some('\'') {
+            // 3.2 は `${` の次の 1 文字も読み飛ばす
+            i += 3;
+            if quoted.is_none() {
+                level += 1;
+            }
+            continue;
+        }
+        if let Some(q) = quoted {
+            if c == q {
+                quoted = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(c, '"' | '\'' | '`') {
+            quoted = Some(c);
+            i += 1;
+            continue;
+        }
+        if c == '$' && t.get(i + 1) == Some(&'(') {
+            // クォートの外の `$( … )` は 3.2 も正しく読み飛ばす
+            let mut lx = WordLexer {
+                c: t.to_vec(),
+                i,
+                words: Vec::new(),
+                pending: Vec::new(),
+            };
+            lx.cmdsub();
+            i = lx.i;
+            continue;
+        }
+        if c == satisfy && level == 0 {
+            // 空白で囲まれた `{`（と `{}`）は波括弧展開の始まりと見ない
+            let lone = c == '{'
+                && (i == from || ws(t.get(i - 1)))
+                && (ws(t.get(i + 1)) || t.get(i + 1) == Some(&'}'));
+            if !lone {
+                return Some(i);
+            }
+        } else if c == '{' {
+            level += 1;
+        } else if c == '}' && level > 0 {
+            level -= 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 3.2 がこの中身（`{` と `}` の間）を展開するか: エスケープされていない `,` があるか、
+/// 連番（`1..3` / `a..c`。3.2 は刻み `1..5..2` を知らない）
+fn amble_expands32(amble: &[char]) -> bool {
+    let mut i = 0;
+    while i < amble.len() {
+        match amble[i] {
+            '\\' => i += 2,
+            ',' => return true,
+            _ => i += 1,
+        }
+    }
+    let s: String = amble.iter().collect();
+    let Some((a, b)) = s.split_once("..") else {
+        return false;
+    };
+    let int = |x: &str| {
+        let d = x.strip_prefix('-').unwrap_or(x);
+        !d.is_empty() && d.chars().all(|c| c.is_ascii_digit())
+    };
+    let letter = |x: &str| x.chars().count() == 1 && x.chars().all(|c| c.is_ascii_alphabetic());
+    (int(a) && int(b)) || (letter(a) && letter(b))
+}
+
+/// 語の中で、**bash 3.2 だけが**波括弧展開してしまう `{` の位置（語の中の文字位置）。
+///
+/// 3.2 が展開する `{` のうち、正しく読めばクォートかコマンド置換の中に在るものだけを返す
+/// （クォートの外の `{a,b}` は意図した展開なので返さない = 過大申告しない）。
+fn brace32_misreads(word: &str) -> Vec<usize> {
+    let t: Vec<char> = word.chars().collect();
+    let top = top_level_unquoted(&t);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(open) = gobble32(&t, i, '{') {
+        let Some(close) = gobble32(&t, open + 1, '}') else {
+            i = open + 1;
+            continue;
+        };
+        if amble_expands32(&t[open + 1..close]) {
+            if !top[open] {
+                out.push(open);
+            }
+            i = close + 1;
+        } else {
+            i = open + 1;
+        }
+    }
+    out
+}
+
+/// 1 ファイルぶんの違反（file:line で名指しする文言）
+fn brace32_violations(rel: &str, src: &str) -> Vec<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let lines: Vec<&str> = src.lines().collect();
+    let line_of = |pos: usize| chars[..pos].iter().filter(|&&c| c == '\n').count() + 1;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for w in raw_words(src).into_iter().filter(|w| w.brace_expanded) {
+        for p in brace32_misreads(&w.text) {
+            let pos = w.start + p;
+            if !seen.insert(pos) {
+                continue;
+            }
+            let line_no = line_of(pos);
+            let exempt = lines.get(line_no - 1).is_some_and(|l| audited_exception(l))
+                || line_no
+                    .checked_sub(2)
+                    .and_then(|k| lines.get(k))
+                    .is_some_and(|l| audited_exception(l));
+            if !exempt {
+                out.push(format!(
+                    "{rel}:{line_no}: \"$( … \"{{…,…}}\" … )\" の波括弧（`{{…,…}}` / `{{a..c}}`）を 3.2 が展開する: {}",
+                    lines.get(line_no - 1).map_or("", |l| l.trim())
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn コマンド置換の中のダブルクォートの波括弧はbash32で割れない() {
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    for path in shell_scripts() {
+        let src = std::fs::read_to_string(&path).expect("読める .sh");
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        violations.extend(brace32_violations(&rel, &src));
+    }
+    assert!(
+        violations.is_empty(),
+        "macOS 同梱の bash 3.2（`/bin/bash` 3.2.57）は `\"$( … )\"` の中のダブルクォートの文字列を\n\
+         クォートの外と取り違え、`{{…,…}}` / `{{a..c}}` を波括弧展開して語を割る\n\
+         （`f \"$(g \"{{\\\"op\\\":\\\"x\\\",\\\"y\\\":1}}\")\"` の g は `\"op\":\"x\"` だけを受け取る）。\n\
+         JSON は `jq -n --arg …` で組むこと（単一引用符でも、値の中の `{{…,…}}` は割れる）\n\
+         （.agent/conventions.md「シェルスクリプトは macOS 同梱の bash 3.2 で通す」節。\n\
+         監査して確かめた箇所だけ、その行か直前の行に `# tako:bash32-ok <理由>` で外せる）:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn 検査はbash32が割る形だけを違反とする() {
+    let hits = |s: &str| brace32_violations("scripts/x.sh", &format!("{s}\n")).len();
+
+    // #1924 で直した実物そのもの（3.2 では mcp_call が `"op":"copy_cancel"` だけを受け取った）
+    assert_eq!(
+        hits(
+            r#"CANCEL="$(mcp_text "$(mcp_call "{\"op\":\"copy_cancel\",\"name\":\"${ID:-0}\"}")")""#
+        ),
+        1
+    );
+    assert_eq!(
+        hits(r#"OUT="$(mcp_text "$(mcp_call "{\"op\":\"copy\",\"paths\":[\"$E/src/a.txt\"]}")")""#),
+        1
+    );
+    // 直したあとの形（jq で組む）は割れない
+    assert_eq!(
+        hits(
+            r#"CANCEL="$(mcp_text "$(mcp_call "$(jq -n -c --arg id "${ID:-0}" '{op:"copy_cancel",name:$id}')")")""#
+        ),
+        0
+    );
+
+    // 3.2 で割れる形（`/bin/bash` 3.2.57 で 1 つずつ確かめた。bash 5 ではどれも割れない）
+    assert_eq!(hits(r#"echo "$(show "{a,b}")""#), 1);
+    assert_eq!(hits(r#"x=$(wrap "$(show "{a,b}")")"#), 1); // 外側が代入でも内側の語は割れる
+    assert_eq!(hits(r#"local x="$(show "{a,b}")""#), 1); // local / export の引数は代入ではない
+    assert_eq!(hits(r#"export X="$(show "{a,b}")""#), 1);
+    assert_eq!(hits(r#"arr=("$(show "{a,b}")")"#), 1); // 配列の要素は展開される
+    assert_eq!(hits(r#"for i in "$(show "{a,b}")"; do :; done"#), 1);
+    assert_eq!(hits(r#"[ "$(show "{a,b}")" = x ]"#), 1);
+    assert_eq!(hits(r#"show > "$(echo "/dev/null{a,b}")""#), 1); // リダイレクト先も
+    assert_eq!(hits(r#"echo "${U:-$(show "{a,b}")}""#), 1);
+    assert_eq!(hits(r#"echo "$(show $(echo "{a,b}"))""#), 1); // 3.2 は `"` を数えるだけ
+    assert_eq!(hits(r#"echo "$(show "x" "{a,b}")""#), 1);
+    assert_eq!(hits(r#"echo "$(show "{1..3}")""#), 1); // 連番も
+    assert_eq!(hits(r#"echo "$(show "{a..c}")""#), 1);
+    assert_eq!(hits(r#"echo "$(show "{ a,b }")""#), 1);
+    assert_eq!(hits("cat <<X\n$(printf '%s' \"$(show \"{a,b}\")\")\nX"), 1);
+
+    // 3.2 でも割れない形（過大申告しない）
+    assert_eq!(hits(r#"x="$(show "{a,b}")""#), 0); // 素の代入は波括弧展開されない
+    assert_eq!(hits(r#"x+="$(show "{a,b}")""#), 0);
+    assert_eq!(hits(r#"V="$(show "{a,b}")" cmd"#), 0); // 前置の代入も
+    assert_eq!(hits(r#"[[ "$(show "{a,b}")" == x ]]"#), 0);
+    // `[[ ]]` の中の `( … )` はサブシェルではない（中の語も展開されず、`)` で閉じを取り違えない）
+    assert_eq!(hits(r#"[[ ( "$(show "{a,b}")" == x ) ]]"#), 0);
+    assert_eq!(
+        hits(r#"x=$( [[ ( a == a ) ]] && echo "$(show "{a,b}")" )"#),
+        1
+    );
+    assert_eq!(hits(r#"case "$(show "{a,b}")" in x) : ;; esac"#), 0);
+    assert_eq!(hits(r#"cat <<< "$(show "{a,b}")""#), 0); // ヒアストリング
+    assert_eq!(
+        hits("cat <<X\n$(show \"{a,b}\")\n\"$(show \"{a,b}\")\"\nX"),
+        0
+    ); // 本文は語ではない
+    assert_eq!(hits("cat <<'X'\necho \"$(show \"{a,b}\")\"\nX"), 0); // 別スクリプトの本文
+    assert_eq!(hits(r#"echo $(show "{a,b}")"#), 0); // 外側がクォートされていない
+    assert_eq!(hits(r#"echo "$(show '{a,b}')""#), 0); // 単一引用符
+    assert_eq!(hits(r#"show "$(show '{"op":"x","y":1}')""#), 0); // 単一引用符の JSON
+                                                                 // …ただし値の中の `{…,…}` は 3.2 が `"` を数えた結果クォートの外になって割れる
+    assert_eq!(hits(r#"show "$(show '{"q":"{a,b}"}')""#), 1);
+    assert_eq!(hits(r#"echo "$(show "{a}")""#), 0); // `,` も連番も無い
+    assert_eq!(hits(r#"echo "$(show "{\"a\":1}")""#), 0);
+    assert_eq!(hits(r#"echo "$(show "[{\"a\":1},{\"b\":2}]")""#), 0); // `,` が波括弧の外
+    assert_eq!(hits(r#"echo "$(show "{1..5..2}")""#), 0); // 刻みつきの連番は 3.2 が知らない
+    assert_eq!(hits(r#"echo "$(show "\{a,b}")""#), 0);
+    assert_eq!(hits(r#"echo "$(show "{a\,b}")""#), 0);
+    assert_eq!(hits(r#"echo "$(show "${U:-{a,b}}")""#), 0);
+    assert_eq!(hits(r#"echo "$(show "it's {a,b}")""#), 0);
+    assert_eq!(hits(r#"mkdir -p "$D"/{a,b}"#), 0); // クォートの外の展開は意図したもの
+    assert_eq!(hits(r#"show {a,b}"$(show x)""#), 0);
+    assert_eq!(hits(r#"# echo "$(show "{a,b}")""#), 0); // コメント
+}
+
+#[test]
+fn 番犬は波括弧の取り違えをfile_lineで名指しする() {
+    // 複数行のコマンドでも `{` の在る行を名指しする
+    let src = "set -u\nOUT=\"$(mcp_text \\\n  \"$(mcp_call \"{\\\"op\\\":\\\"x\\\",\\\"y\\\":1}\")\")\"\n";
+    let v = brace32_violations("scripts/x.sh", src);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].starts_with("scripts/x.sh:3: "), "{v:?}");
+    // 閉じていないクォート・末尾の `\` でも panic しない（構文エラーの .sh で番犬が落ちない）
+    for broken in ["echo \"$(show \"{a,b}", "echo x\\", "a=(x 'y", "x=${a"] {
+        let _ = brace32_violations("scripts/x.sh", broken);
+    }
+    // 1 行に 2 つあれば 2 件
+    let v = brace32_violations(
+        "scripts/x.sh",
+        "echo \"$(show \"{a,b}\")\" \"$(show \"{c,d}\")\"\n",
+    );
+    assert_eq!(v.len(), 2, "{v:?}");
+    // case の腕の `)` をコマンド置換の閉じと取り違えない（後ろの語も読める）
+    let v = brace32_violations(
+        "scripts/x.sh",
+        "x=$(case \"$1\" in a) echo 1 ;; esac)\necho \"$(show \"{a,b}\")\"\n",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].starts_with("scripts/x.sh:2: "), "{v:?}");
+    // 例外宣言は理由つきのときだけ効く
+    let bad = "echo \"$(show \"{a,b}\")\"\n";
+    assert!(brace32_violations(
+        "scripts/x.sh",
+        &format!("# tako:bash32-ok show は 1 語目しか見ない\n{bad}")
+    )
+    .is_empty());
+    assert_eq!(
+        brace32_violations("scripts/x.sh", &format!("# tako:bash32-ok\n{bad}")).len(),
+        1
+    );
+}
+
+#[test]
+fn 語の字句解析は代入と展開されない文脈を読み分ける() {
+    let words = |s: &str| -> Vec<(String, bool)> {
+        raw_words(s)
+            .into_iter()
+            .map(|w| (w.text, w.brace_expanded))
+            .collect()
+    };
+    let w = |t: &str, e: bool| (t.to_string(), e);
+    // 代入はコマンドの先頭に並ぶ間だけ。コマンド名の後ろは引数
+    assert_eq!(
+        words(r#"A=1 B+="x y" cmd C=2"#),
+        vec![
+            w("A=1", false),
+            w(r#"B+="x y""#, false),
+            w("cmd", true),
+            w("C=2", true)
+        ]
+    );
+    // コマンド置換の中のコマンドも語へ分ける（外側の語は原文のまま 1 語）
+    assert_eq!(
+        words(r#"x="$(f "a b")""#),
+        vec![
+            w("f", true),
+            w(r#""a b""#, true),
+            w(r#"x="$(f "a b")""#, false)
+        ]
+    );
+    // 配列代入は要素が語
+    assert_eq!(
+        words("a=(x \"y z\")"),
+        vec![w("x", true), w("\"y z\"", true)]
+    );
+    // [[ ]] と case の対象・腕のパターンとヒアストリングは展開されない
+    assert!(words(r#"[[ "$a" == b ]]"#).iter().all(|(_, e)| !e));
+    assert_eq!(
+        words("case \"$x\" in a|b) run ;; esac"),
+        vec![
+            w("case", true),
+            w("\"$x\"", false),
+            w("in", false),
+            w("a", false),
+            w("b", false),
+            w("run", true),
+            w("esac", false)
+        ]
+    );
+    assert_eq!(
+        words("cat <<< \"$x\" y"),
+        vec![w("cat", true), w("\"$x\"", false), w("y", true)]
+    );
+    // $'…' の `\'` で閉じない・ヒアドキュメントの本文は語にならない
+    assert_eq!(
+        words(r"echo $'it\'s' x"),
+        vec![w("echo", true), w(r"$'it\'s'", true), w("x", true)]
+    );
+    assert_eq!(
+        words("cat <<X\n\"q\" $(f)\nX\necho y\n"),
+        vec![w("cat", true), w("f", true), w("echo", true), w("y", true)]
+    );
 }

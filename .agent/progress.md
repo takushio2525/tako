@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#748 / PR #754: 合成入力欄をダイアログと誤判定しない固定を今の main へ載せ直した）
-- `dialog.rs` のテストを描く側と同じ組み立てへ（#719 / #718 = 罫線 16 桁・#737 = 20 桁・#1067 = 30 桁 + フッター）。キュー滞留ヒントは #737 ではなく #1067 の形
-- 実測: 注入 A（罫線の棄却を外す）/ A+B（兄弟 1 つで並び）/ E（罫線の最小を 20 本）で形を名指しして FAILED（E は入力欄系でこれだけ）
-
 ## 2026-10-09（#1893: LSP ホバーの続き = 右クリックの項目・⇧⌘H・CLI / MCP の全文の口・読み込み中のマウス）
 - 右クリックに「ホバー情報を表示」（`MenuItem::Hover`。移動 → ホバー → 整形・`hoverProvider` の申告で出し分け）・キー ⇧⌘H / Ctrl+Shift+H（⌘K ⌘I はパレットの発火が遅れるので不採用）を編集メニューと同じ `request_lsp_hover` へ。manager は全文を返し、カードは 16,000 字・CLI `--full` / `--limit N` = MCP `limit`（0 = 全文。カタログ +60 B）。マウスも #1869 の `wait_loaded` で待ち、語の真下に「読み込み中」→ カード。取り消しの番号は UI で先に取る（`reserve_hover`。背景で取ると取り消しを追い越して待ち続ける）
 - 実測: `scripts/test-lsp-hover-1893.sh`（visual-test `hover-1893` / `hover-loading` / `hover-loading-real`・A/B `TAKO_1893_LEGACY=1` で名指しの FAILED・#1684 / #1681 の節の回帰・CLI / MCP 字面一致）・実の rust-analyzer は暖機なしで 0.08 秒で「読み込み中」→ 2.2 秒でカード（旧は 95 秒出ない）・e2e 7 本・番犬の注入 12 通りを file:line で名指し・右クリック前のマウスのホバーが明示のカードを消していたのを直した
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1903: tako mod S2 の続き = ステータスバーの 5h / 7d も mod から・observed_at を値の変化時だけ・MCP 説明文・検査スクリプトの 1 実装化）
 - mod の `stampLimits` が窓ごとに値が変わったときだけ `observed_at` を打つ（`$.state` に置きホットリロードをまたぐ）→ 束ね方を最新の観測へ（A/B `TAKO_1903_LEGACY=1` = #1880 の順）。ステータスバーは `status_bar_limits`（フォーカス順で最初に引けたペインのアカウント → 無ければ画面。取得元は `tako limit-service --refresh` の `claude.source`）。MCP 説明文 +527 B。`check-claude-mod.sh` に肯定形の文言の自己検査、1879 の段 0 はそれを呼ぶだけ
 - 実測: `scripts/test-mod-limits-1903.sh`（visual-test `mod-limits` で 42 / 18 の帯・旧は ① FAILED / fake 17 PASS = 46 秒で画面へ戻る・放置 80% と動いている 20% で 20）・`claude plugin test` 28 本（旧の打ち方の注入で #1903 の 1 本が名指しで落ちる）・番犬の注入 12 通りを file:line で名指し
+
+## 2026-10-09（#1924: `"$( … "{…,…}" … )"` を bash 3.2 が波括弧展開して語を割る形を直し、番犬を足した）
+- 真因: 3.2 の `brace_gobbler` は `"` の中の `$(` を知らず `"` の偶奇だけで読む。`test-tree-keyboard-copy-1895.sh` の 2 箇所（`mcp_call "{\"op\":…,…}"` を `mcp_text "$( … )"` の引数に入れた形）を jq で組む形へ。番犬 `shell_scripts.rs` は全 `.sh` を語へ分け 3.2 の写しで読む（実の 3.2 / 5 の出力の差と 48,000 通り突き合わせ、食い違い 3 件はどれも検査の外の事情）
+- 実測: `/bin/bash scripts/test-tree-keyboard-copy-1895.sh` 修正前 PASS=32 FAIL=7 → 後 39 / 0（bash 5 も 39 / 0。隔離 GUI・tako-vd）・棚卸し 118 本で 2 箇所 → 0・注入 6 通りを file:line で名指し。`local` / 配列 / `[[ ]]` / case 等の表は `.agent/conventions.md` の #1924 節
