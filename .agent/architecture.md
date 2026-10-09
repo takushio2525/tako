@@ -2153,6 +2153,40 @@ debug でも最適化した後は 18.8〜44.8 秒）ので、
 A/B は `bash scripts/test-highlight-wait-1890.sh`（遅れの注入 `TAKO_1890_INJECT=slow:<ミリ秒>`・
 旧の窓へ戻す `TAKO_1890_LEGACY`）。
 
+### 塗りの間は App Nap に間引かせない（#1916。2026-10-09）
+
+「GUI 内の塗りはテストスレッドの 4〜8 倍遅く、回を追うごとに伸びる」の真因は 2 つの重なりで、
+**実行器の優先度ではなかった**（GCD の既定キュー（QoS 0x19）と専用スレッド（QoS 0x15）で
+同じ所要・同じ挙動）。実測は release・Apple M5 Max・10 MB（1 行 100 バイト × 10 万行）で、
+`proc_pid_rusage` の P コアの時間と命令数を添えて切り分けた。
+
+- **比べた入力が違っていた**: テストスレッド側の `perf_大きいファイルの編集計測` は main.rs 由来の
+  行（3.3 秒・64 G 命令）、GUI 側の visual-test 節 `large-file-decor` は `let value_N = N; // ~~~`
+  の行（11.9 秒・243.6 G 命令）。**同じ入力ならテストスレッド 11.9〜12.0 秒・間引かれる前の
+  GUI 12.0 秒（P コア 99.7%）で差は無い**
+- **App Nap**: 隔離 GUI は前面に出ないので、起動から約 30 秒でプロセスの優先度が 46 → 4 に落ち、
+  以後の塗りは E コアへ寄せられる（26.9〜33.4 秒・P コア 0〜9%・塗り 1 本の命令数は同じ約 244 G）。
+  「回を追うごとに伸びる」は時間が経って間引かれたから。利用者でも、別のアプリを前面にしている
+  間に AI が `tako open` で大きいファイルを開くと同じことが起きる。起動時の
+  `sleep_guard::disable_app_nap`（#173）は `defaults write /proc/<pid>/Info …` で、macOS には
+  `/proc` が無いので一度も効いていない（`Could not write domain`）
+
+塗りの background の closure（`spawn_highlight` / `spawn_editor_seed`）は塗る前に
+`platform::user_work::UserWork` を握る。握っている間は `NSProcessInfo
+beginActivityWithOptions:reason:`（`NSActivityUserInitiatedAllowingIdleSystemSleep` = 利用者が
+待っている処理・アイドルスリープは妨げない）を保ち、重なった処理は数で束ねて OS への依頼を 1 本に
+する（最初の 1 つで始め、最後の 1 つを落としたら終える = 塗りが終われば元どおり間引かれる）。
+間引かれた後に握っても戻る（優先度 4 のプロセスで 12.1〜12.2 秒・P コア 99%）。macOS 以外は
+何もしない（Windows の電力スロットリングは未実測）。塗りを途中で取り消す仕組みは無く、閉じた
+ペインの塗りも最後まで走ってから依頼を手放す。
+
+色が揃ったかは GUI の外から状態で読める: `tako edit` の応答（`preview_edit_reply`）は読み取り表示の
+塗りが走っている間だけ `highlighting: true` を載せる（`ControlHost::preview_highlighting`。
+編集開始の全文の塗りは `document.highlight_pending`）。回帰検出は番犬
+`issue1916_highlight_app_nap_watchdog`（closure が握るか・activity の始め方と終え方・A/B の腕）と
+`platform::user_work` の単体、実経路の A/B は `bash scripts/test-highlight-app-nap-1916.sh`
+（間引かれたのを状態で待ってから塗り、P コアで走った比率で判定。旧挙動は `TAKO_1916_LEGACY=1`）。
+
 ## 編集カーソルの追従スクロール（#1649。2026-09-23）
 
 編集モードのプレビューには `ListState` へ「カーソルを見せる」スクロールの呼び出しが

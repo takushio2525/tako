@@ -2781,6 +2781,10 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
     if let Some(limit) = host.preview_limit(target) {
         out["limit"] = limit;
     }
+    // #1916: 読み取り表示の塗りが走っている間だけ載せる（揃ったらキーごと無い = 従来の形）
+    if host.preview_highlighting(target) {
+        out["highlighting"] = json!(true);
+    }
     // #1659: 外で変わった / 消されたなら、保存が通らない理由をどの応答でも読めるようにする
     // （競合していなければキーごと無い = 従来の応答と同じ形）
     if let Some(conflict) = host.preview_conflict(target) {
@@ -18959,6 +18963,8 @@ mod tests {
         preview_search_events: Vec<&'static str>,
         /// #1660: 上限を超えて末尾を省略したプレビュー（GUI の `PreviewState::truncated` の代役）
         preview_limits: std::collections::HashMap<u64, tako_core::preview_limit::Truncation>,
+        /// #1916: 読み取り表示の塗りが走っているペイン（GUI の `view_highlights_running` の代役）
+        preview_highlighting: std::collections::HashSet<u64>,
         /// #1659: 編集開始で**実ファイルを開く**か（既定 false = 従来どおり空のバッファ）。
         /// 外部変更の往復を本物の `TextBuffer` の保存・読み直しで確かめるテストだけが立てる
         preview_real_files: bool,
@@ -19096,6 +19102,7 @@ mod tests {
                 preview_search_bars: std::collections::HashSet::new(),
                 preview_search_events: Vec::new(),
                 preview_limits: std::collections::HashMap::new(),
+                preview_highlighting: std::collections::HashSet::new(),
                 preview_real_files: false,
                 preview_conflicts: std::collections::HashMap::new(),
                 hover_cards: Vec::new(),
@@ -19746,6 +19753,9 @@ mod tests {
         /// #1649: 器の寸法を持たないモックでも「応答へ載るか」は測れるので、
         /// 編集セッションがあるときだけ固定の形を返す（値の正しさは
         /// `tako_core::editor_scroll` の単体テストと visual-test 節が見る）
+        fn preview_highlighting(&self, pane: PaneId) -> bool {
+            self.preview_highlighting.contains(&pane.as_u64())
+        }
         fn preview_limit(&self, pane: PaneId) -> Option<serde_json::Value> {
             self.preview_limits
                 .get(&pane.as_u64())
@@ -24986,6 +24996,62 @@ mod tests {
             ok.get("limit").is_none(),
             "上限の内側なら limit は無い: {ok}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1916: 読み取り表示の塗りが走っている間だけ `tako edit` の応答に `highlighting: true` が載る
+    /// （CLI と MCP で同じ。揃ったらキーごと無い = 従来の応答と同じ形）
+    #[test]
+    fn preview_editの応答は塗りが走っている間だけhighlightingを載せる() {
+        let dir =
+            std::env::temp_dir().join(format!("tako-dispatch-highlighting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let opened = dispatch(
+            &mut host,
+            Request::OpenFile {
+                pane: Some(root),
+                path: file.display().to_string(),
+                mode: Some(PreviewModeWire::Code),
+                direction: None,
+                focus: None,
+                new_tab: false,
+                line: None,
+                column: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane = opened["pane"].as_u64().unwrap();
+        let status = |host: &mut MockHost, origin| {
+            dispatch(
+                host,
+                Request::PreviewEdit {
+                    pane: Some(pane),
+                    enabled: None,
+                },
+                origin,
+            )
+            .unwrap()
+        };
+        host.preview_highlighting.insert(pane);
+        for origin in [PaneOrigin::Cli, PaneOrigin::Mcp] {
+            let running = status(&mut host, origin);
+            assert_eq!(running["highlighting"].as_bool(), Some(true), "{running}");
+            assert_eq!(running["editing"].as_bool(), Some(false));
+        }
+        host.preview_highlighting.clear();
+        for origin in [PaneOrigin::Cli, PaneOrigin::Mcp] {
+            let settled = status(&mut host, origin);
+            assert!(
+                settled.get("highlighting").is_none(),
+                "塗りが戻ったらキーごと無い: {settled}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
