@@ -200,7 +200,9 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
 - 検証は `bash scripts/test-nightly-mod-check-1892.sh`（CI の macOS ジョブ。claude・osascript・release.sh は
   スタブ、HOME も隔離。壊れた登録の A/B・claude 無し・固まる claude・止めない実走・変更なしの夜・
   設定 dir の隔離を見る。実物の claude（下限 2.1.294 以上）があれば本物の mod と壊れた写しも検査し、
-  利用者の設定ファイルの mtime が前後で一致することを見る）
+  利用者の設定ファイルの mtime が前後で一致することを見る）。assert が落ちると、その環境の段（夜間 /
+  検査の 1 回の実行）の出力と終了コード・記録ファイル・通知のスタブの記録・claude のスタブの呼び出しが
+  ログに出る（#1933。`TAKO_1933_INJECT=version|validate|test` で Test 2 の注入前の 1 回を落として確かめられる）
 
 ## 安定版への昇格（#403 / #1853 / #1592）
 
