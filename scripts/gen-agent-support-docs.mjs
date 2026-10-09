@@ -60,7 +60,7 @@ const CATEGORIES = [
   ]],
   ['報告と会話ログ', [
     'worker_report_scrollback', 'worker_report_transcript',
-    'sessions_catalog', 'sessions_resume',
+    'sessions_catalog', 'sessions_resume', 'resume_launch_args',
     'session_restart_harness', 'session_restart_handoff',
     'restore_after_reboot',
   ]],

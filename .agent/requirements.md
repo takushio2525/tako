@@ -1427,7 +1427,7 @@ A/B は `TAKO_1068_LEGACY=1`（opt-in を無視して `--remote-control` を一�
 | FR-2.35.3 | **アカウント UUID を保持しない**。`bridge-session` 行の `ownerAccountUuid` / `ownerOrganizationUuid` は読まない。どのアカウント配下かは accounts.yaml の**名前**（`account_label`）で表す。スマホが別アカウントだとそのセッションは一覧に出ないので、この表示が無いと切り分け不能になる | M | ✅ |
 | FR-2.35.4 | **公開は 3 経路 1:1 で同じ 1 実装**（`RemoteLink::to_json`）。`GET /api/agents` / `GET /api/v2/panes` の `remote_link` / CLI `tako sessions link [--pane N]` / MCP `tako_sessions` の `action=link` | M | ✅ |
 | FR-2.35.5 | **URL を診断ログへ出さない**。開くには claude.ai ログインが要る（実測 403）ので秘密ではないが、セッション id は follow-up 送信の宛先になるためペイン内容と同基準で扱う（番犬 = `crates/tako-control/tests/remote_link_watchdog.rs`） | M | ✅ |
-### FR-2.38 会話を引き継いだセッション再起動（✅ 2026-09-02、#1067。基盤は #498 / #390 / #112 / #640 / #749 / #915 / #982）
+### FR-2.38 会話を引き継いだセッション再起動（✅ 2026-09-02、#1067。#1967 で再開の組み立て・見張り・記録を直した。基盤は #498 / #390 / #112 / #640 / #749 / #915 / #982）
 
 > claude CLI は symlink の張り替えで更新されるので、長生きのセッションは**起動時の
 > 旧バイナリを握り続ける**（#498 の stale 警告）。直す手段が「ペインを閉じて立て直す」
@@ -1440,15 +1440,17 @@ A/B は `TAKO_1068_LEGACY=1`（opt-in を無視して `--remote-control` を一�
 | ID | 要件 | 優先度 | 状態 |
 |---|---|---|---|
 | FR-2.38.1 | **2 種を明確に分ける**。`harness` = エージェント CLI のプロセスだけを建て直し `--resume` で**同じ会話**を続ける（会話コンテキストを 1 文字も失わない）。`handoff` = 引き継ぎを書かせてから**新しいセッション**へ交代する（ctx をリセットできるが引き継ぎファイルに書いた分しか残らない）。語彙の正本は `tako_core::session_restart::SessionRestartMode` で、CLI の possible values / MCP の enum / GUI の分岐がすべてこの表から引く | M | ✅ |
-| FR-2.38.2 | **落ちたことを確かめてから打つ**。旧プロセスへ SIGTERM を送り、**終了を確認してから** resume の行を #640 の送達確認つき経路へ渡す。落ちる前に打つと動いている TUI の入力欄へ流れ込む（#694 / #1006 と同じ罠）。猶予（5 秒）を過ぎたら SIGKILL、上限（30 秒）で断念して**理由をペインのバナーへ出す**（黙って諦めない）。ゾンビは終了済みとして扱う（#619） | M | ✅ |
-| FR-2.38.3 | **resume コマンドは既存の 1 実装で組む**（`sessions::resume_command`）。アカウント（`CLAUDE_CONFIG_DIR`）・role（`TAKO_ORCHESTRATOR_ROLE`）・モデル・effort が元のまま復元される。カタログに無い会話でも role から最小のメタを合成して同じ関数を通す（コマンドの形を 2 系統に分けない） | M | ✅ |
-| FR-2.38.4 | **会話 ID を解決できないまま終了させない**。解決は 生きた claude（`agents` 経由）→ セッションカタログの逆引き（transcript の実在つき）の順。どちらでも決まらなければ**プロセスに触らずに**断る（resume 先が分からないまま殺すと会話を失う）。終了直後に claude 自身が画面へ印字する `Resume this session with: claude --resume <id>`（実測 2.1.258）を拾えたら、そちらを**権威**として ID を差し替える（同一ペイン番号に世代が堆積する = #466 の実測への保険） | M | ✅ |
+| FR-2.38.2 | **落ちたことを確かめてから打つ**。旧プロセスへ SIGTERM を送り、**終了を確認してから** resume の行を #640 / #1940 の送達確認つき経路へ渡す。落ちる前に打つと動いている TUI の入力欄へ流れ込む（#694 / #1006 と同じ罠）。猶予（5 秒）を過ぎたら SIGKILL、上限（30 秒）で断念して**理由をペインのバナーへ出す**（黙って諦めない）。ゾンビは終了済みとして扱う（#619）。**#1967: 落ちても、シェルがプロンプトへ戻る（OSC 133;A の回数が終了要求の前より増える）までは打たない**（上限 10 秒。印を観測していないペインは待たない = `session_restart::shell_back`）。戻る前に打つと起動フックの最中の先行入力になる（#1940 と同じ型） | M | ✅ |
+| FR-2.38.3 | **resume コマンドは元の起動と同じ組み立てで組む（#1967）**。正本は `tako_control::resume_launch`（ペインの再起動・`tako sessions resume` が同じ 1 実装を通る）: master / solo は `build_master_cmd`（`tako master -<名前>` / `tako solo -<名前>` と同じ = model・effort・`--append-system-prompt-file`・Remote Control）、worker は `build_worker_cmd`（spawn と同じ = 起動した master のプロファイルの許可モード・追加引数 + レジストリに記録した model / effort）に `--resume <id>` を足すだけ。system prompt のファイルは起動の直前に書き直す（消えていても起動できる。下見では書かない）。アカウントだけは**会話の記録がある設定 dir** へ寄せ、プロファイルのアカウントと食い違えば `warnings` に出す。**壊れたプロファイルを既定へ化けさせない**（ファイルが無いとき = ラベルだけで起動した旧い master だけ既定で組んで `warnings` に出す）。claude 以外と role の無いペインは従来のカタログのメタ（`sessions::resume_command`）。応答の `recipe`（`master_profile` / `solo_profile` / `worker_profile` / `catalog`）でどの組み立てかが分かる。#1967 前は master の会話がカタログに model / effort を一度も持たず（本番で 38 件中 0 件）、再開すると effort が medium・system prompt が落ちた claude が立っていた | M | ✅ |
+| FR-2.38.4 | **会話 ID を解決できないまま終了させない**。解決は 生きた claude（`agents` 経由）→ セッションカタログの逆引きの順。どちらでも決まらなければ**プロセスに触らずに**断る（resume 先が分からないまま殺すと会話を失う）。**#1967: どちらの出どころでも会話の記録（transcript）の実在を確かめ**、無ければ `conversation_missing` で断る。終了直後に claude 自身が画面へ印字する `Resume this session with: claude --resume <id>`（実測 2.1.258）を拾えたら ID を差し替える（同一ペイン番号に世代が堆積する = #466 の実測への保険）が、**#1967 から案内は折り返しに依らず UUID の全長で読み（空白を落として行を連結する）、その ID の記録が実在するときだけ採る**。旧実装は 1 行の中だけを読み形の検査も「8 文字以上」だけだったので、細いペインで折り返した途中までの ID を権威として正しい ID を壊した（本番 10/9: `…-b897-065b9` の resume が実行され claude は会話が見つからずに終わった） | M | ✅ |
 | FR-2.38.5 | **関門は 2 段で意味が違う**。**構造的**（セッションの有無・role・agent 系統・handoff は master のみ）は**メニューの出し分け**に使う（#1006 の「出た項目が断られない」）。**一時的**（会話 ID 未解決・生成中・キュー滞留・入力欄の下書き・選択肢ダイアログ）は**実行時に断って理由 + 次の一手を返す**（メニューから消すと機能そのものを見つけられず、右クリックした瞬間の状態で項目が出たり消えたりする）。判断は `is_eligible` / `can_restart` の 2 関数で、GUI・CLI・MCP が同じものを通る | M | ✅ |
 | FR-2.38.6 | **メニューの出し分けに重い処理を置かない**。会話 ID の解決は `claude agents --json`（Node 起動）とカタログ読みを伴うので、**右クリックした瞬間に 1 度だけ**軽い材料（画面・role・レジストリ / カタログの agent 種別）を集め、メニューの描画中には読み直さない（#772 の「メインスレッド専有」を作らない） | M | ✅ |
 | FR-2.38.7 | **生成中の判定に `is_busy` を使わない**。あれは advisory で経過秒トークンを拾うため、**生成が終わった後も画面に残る**完了行（実測 `✻ Brewed for 2s · done 9:22 PM`）を busy と読む = アイドルなペインを永久に busy と申告する。プロセスを終わらせてよいかの判断は中断ヒント（`esc to interrupt` / `esc to cancel` / `Generating`）だけを見る（`claude_tui::interrupt_hint_visible`） | M | ✅ |
 | FR-2.38.8 | **引き継ぎ再起動は tako が代行しない**。#749 の自動ナッジと**同じ 1 実装の文面**（見出しだけ差し替え）でエージェント自身へ「引き継ぎを書き直す → `tako_orchestrator_handoff` を呼ぶ」を依頼する。tako が直接 handoff を呼ぶと**更新されていない引き継ぎファイル**で後任を立てることになる。前任のペインを閉じるのは後任（#749 の順序をそのまま使う） | M | ✅ |
 | FR-2.38.9 | **AI フルコントロール**: `tako session-restart [--mode harness\|handoff] [--pane N]`（**引数なしで下見** = 何ができるか + できない理由を返すだけで何も起こさない。#748 の respond と同じ形・#322 の最簡形）と MCP `tako_session_restart` へ 1:1 公開する。ペインの右クリックの 2 項目も**同じ dispatch** を通る。#498 の張り直しボタン（`tako stale-binary restart`）も同一実装へ寄せ、**会話を保つ harness を優先**して会話 ID を解決できないときだけ handoff へ落ちる | M | ✅ |
-| FR-2.38.10 | **系統差はマトリクスの 1 マスで宣言する**（#982）。`session_restart_harness` / `session_restart_handoff` を新設し、claude 以外は `Pending`（手段は上流に在る = `codex resume` / `agy --conversation` ので `Unsupported` にはしない）。判定を `if agent == claude` で散らさず `agent_support::supports` を通す | M | ✅ |
+| FR-2.38.10 | **系統差はマトリクスの 1 マスで宣言する**（#982）。`session_restart_harness` / `session_restart_handoff` を新設し、claude 以外は `Pending`（手段は上流に在る = `codex resume` / `agy --conversation` ので `Unsupported` にはしない）。判定を `if agent == claude` で散らさず `agent_support::supports` を通す。#1967 で `resume_launch_args`（再開が元の起動と同じ引数を持つ。claude のみ）を足した | M | ✅ |
+| FR-2.38.11 | **送った後を見張り、失敗を黙らない（#1967）**。起動コマンドを送った後 10 秒、エージェントが**すぐ終わらないか**を見る（終了の印 OSC 133;D が増えた / `No conversation found` が増えた = `session_restart::launch_verdict`）。終わったら、会話の記録が実在するときだけ tako が組んだ行で **1 回だけ打ち直し**、だめなら理由（`conversation_not_found` / `agent_exited` / `command_flow_timeout` / `process_stuck` / `pane_closed`）と終了コードを **ペインのバナー・persist.log・下見の `last_restart`**（`phase` = waiting_exit / launching / watching / started / failed・`reason`・`attempts`・`message`）の 3 か所へ出す。会話の記録の有無は画面の文言だけでなく**送った ID の記録の実在**でも判断する（2 行のペインでは文言がプロンプトに押し出されて残らない = 実測）。persist.log には開始（モード・agent・会話の短縮 ID・組み立て・プロファイル・終了要求の有無）・断った理由・打ち直し・結果を残し、**コマンドの本文は出さない**。引き継ぎの依頼の届き方は下見の `handoff_delivery` | M | ✅ |
+| FR-2.38.12 | **重ねない・届け先の無い依頼を積まない・シェルだけのペインを戻せる（#1967）**。建て直しの最中（`last_restart` が決着する前）の再起動は `restart_in_progress` で断る（立ち上がったばかりのエージェントをまた終了させない）。引き継ぎ再起動は、**エージェントが見つからずシェルが入力待ち**のペインでは `agent_process_not_found` で断り harness を案内する（依頼が届かないまま時間切れにしない。前景で何かが動いているなら従来どおり依頼を積む = プロセスの特定は実行ファイルのパス頼みなので、名前の違うエージェント CLI まで止めない）。ハーネス更新は、エージェントが既に終わっていても**シェルが入力待ち（OSC 133 が Idle / Failed）なら終了させずに打つ**（下見の `shell_idle`。本番 10/9 は zsh だけが残り master が手で再開した）。OSC 133 は「シェルが入力待ちか」にだけ使い、生成中の判断には使わない（FR-2.38.7） | M | ✅ |
 
 実装メモ（2026-09-02）: 判断は `tako_core::session_restart`（モードの語彙・`is_eligible` /
 `can_restart`・`relaunch_step`・`parse_resume_hint` / `apply_resume_hint`。すべて純関数）、
@@ -1460,6 +1462,16 @@ Windows は**ハーネス更新だけ使えない**（境界 B5 の `platform::p
 A/B は `TAKO_1067_LEGACY` を持たない（#498 の旧経路は意図どおり動いていなかったので
 戻す価値が無い）。機械検証は unit 16 本 + セルフテスト項目 140
 （出し分け / 下見 / 関門 3 種 / 会話未解決での不実行 / 引き継ぎ依頼）。
+
+実装メモ（2026-10-10・#1967）: 再開の組み立ては `tako_control::resume_launch`（1 実装）、
+シェルの戻り・見張り・失敗の語彙・記録は `tako_core::session_restart`（`shell_back` /
+`launch_verdict` / `RelaunchFailure` / `RestartRecord`。純関数）、駆動は `tako-app` の
+`drive_agent_relaunches`（WaitingExit → Launching → Watching の 3 段）。A/B は
+`TAKO_1967_LEGACY=1`（カタログのメタだけで組む・案内を 1 行で読む・落ちたら即打つ・見張らない）。
+番犬は `crates/tako-control/tests/issue1967_session_restart_watchdog.rs`（注入 15 通りを
+file:line で名指し）、実測は `scripts/test-session-restart-1967.sh`（隔離 GUI・偽 claude・
+「細く低い」と「細く高い」の 2 形 × 新旧の 2 腕。旧挙動は細く低い形で #1940 型の化け、
+細く高い形で本番と同じ途中までの ID の resume を再現する）。
 
 ### FR-2.36 起動時ロードの予算と自動修正（✅ 2026-09-06、#1139）
 

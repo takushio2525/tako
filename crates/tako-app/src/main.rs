@@ -616,24 +616,59 @@ struct ShellCommandFlow {
     pane: PaneId,
     flow: tako_core::shell_send::ShellSendFlow,
     created_at: std::time::Instant,
+    /// #1967 の建て直し（ハーネス更新）の起動コマンドか。終わったら
+    /// `relaunch_flow_events` へ顛末を渡し、起動後の見張りへ進める
+    relaunch: bool,
 }
 
 /// エージェント CLI の建て直し（#1067 のハーネス更新）の進行状態。
 ///
 /// dispatch は終了要求までを同期で済ませ、**落ちたことの確認**と resume の投入を
-/// ここへ積む。落ちる前に打つと resume の行が動いている TUI の入力欄へ流れ込む
+/// ここへ積む。落ちる前に打つと resume の行が動いている TUI の入力欄へ流れ込む。
+///
+/// #1967 で 3 段にした: 落ちて**シェルがプロンプトへ戻る**のを待つ → #640 / #1940 の
+/// 送達フローで送る → 送った後**すぐ終わらないか**を見張る（終わったら 1 回だけ
+/// 打ち直し、だめなら理由をバナー・persist.log・`last_restart` へ出す）
 #[derive(Debug)]
 struct AgentRelaunch {
     pane: PaneId,
-    /// 終了させたエージェントのプロセス（不明なら None = 待たずに進む）
+    /// 終了させたエージェントのプロセス（None = もとから居ない = シェルが入力待ち）
     pid: Option<u32>,
-    /// `sessions::resume_command` が組んだ起動コマンド
+    /// 送る起動コマンド（`resume_launch` が組んだ。画面の案内で差し替えたらその後の値）
     command: String,
+    /// dispatch が組んだそのままの起動コマンド（案内で差し替えた行が落ちたら打ち直しはこちら）
+    original_command: String,
     /// 差し替え検査に使う元の会話 ID（画面の案内と食い違ったら差し替える）
     session_id: Option<String>,
     /// SIGKILL を送ったか（二重送出しない）
     forced: bool,
     started_at: std::time::Instant,
+    /// 終了要求の前に控えたプロンプトの印の回数（#1967。`session_restart::shell_back` の基準）
+    prompts_before: Option<u64>,
+    /// 旧プロセスが落ちたのを最初に見た時刻（#1967。シェルの戻りを待つ上限の起点）
+    dead_since: Option<std::time::Instant>,
+    phase: RelaunchPhase,
+    /// 送った回数（打ち直しを含む）
+    attempts: u32,
+    /// どの組み立てで起動コマンドを作ったか（診断ログ用の語彙）
+    recipe: String,
+    /// `TAKO_1967_LEGACY=1` の旧挙動か（構築時に決める）
+    legacy: bool,
+}
+
+/// 建て直しの段（#1967）
+#[derive(Debug, Clone, Copy)]
+enum RelaunchPhase {
+    /// 旧プロセスの終了とシェルの戻りを待っている
+    WaitingExit,
+    /// 起動コマンドを送達フローで送っている（`relaunch_flow_events` を待つ）
+    Launching,
+    /// 送った後、すぐ終わらないかを見張っている
+    Watching {
+        since: std::time::Instant,
+        submit: tako_core::shell_send::ShellMarks,
+        missing_before: usize,
+    },
 }
 
 /// 起動コマンド送達フローの打ち切り時間。
@@ -1968,6 +2003,11 @@ struct TakoApp {
     launch_baselines: HashMap<PaneId, tako_core::shell_send::ShellMarks>,
     /// エージェント CLI の建て直し待ち（#1067）。落ちたら resume を command_flows へ積む
     agent_relaunches: Vec<AgentRelaunch>,
+    /// 建て直しの起動コマンドの送達フローが終わった顛末（#1967。`Some` = 送れた・
+    /// そのときの印 / `None` = 打ち切り）。`drive_agent_relaunches` が次の tick で拾う
+    relaunch_flow_events: Vec<(PaneId, Option<tako_core::shell_send::ShellMarks>)>,
+    /// ペインごとの最後の建て直しの記録（#1967。`tako session-restart` の `last_restart`）
+    session_restart_records: HashMap<PaneId, tako_core::session_restart::RestartRecord>,
     /// #572: claude のメッセージキューに滞留した指示の救出状態（ペインごと）
     queued_recovery: std::collections::HashMap<PaneId, QueuedRecovery>,
     /// dispatch 中に依頼されたプレビューの background ハイライト（ペイン, パス, 生テキスト）
@@ -4251,6 +4291,8 @@ impl TakoApp {
             command_flows: Vec::new(),
             launch_baselines: HashMap::new(),
             agent_relaunches: Vec::new(),
+            relaunch_flow_events: Vec::new(),
+            session_restart_records: HashMap::new(),
             queued_recovery: std::collections::HashMap::new(),
             pending_highlights: Vec::new(),
             view_highlights_running: HashMap::new(),
@@ -5557,6 +5599,9 @@ impl TakoApp {
                 }
                 if !app.agent_relaunches.is_empty() {
                     app.drive_agent_relaunches();
+                } else {
+                    // 建て直しが残っていなければ顛末は宙に浮く（取りこぼしで溜めない）
+                    app.relaunch_flow_events.clear();
                 }
                 if !app.command_flows.is_empty() {
                     app.drive_command_flows();
@@ -7532,75 +7577,279 @@ impl TakoApp {
     /// エージェント CLI の建て直しを駆動する（Issue #1067 のハーネス更新）。
     ///
     /// 500ms tick で「落ちたか」を見て、落ちたら resume の行を #640 の送達確認つき
-    /// 経路へ渡す。**落ちる前に打たない**のが唯一の要点（動いている TUI の入力欄へ
-    /// 流れ込む）。判断は `tako_core::session_restart::relaunch_step`
+    /// 経路へ渡す。**落ちる前に打たない**のが要点（動いている TUI の入力欄へ
+    /// 流れ込む）。判断は `tako_core::session_restart::relaunch_step`。
+    ///
+    /// #1967: 落ちても**シェルがプロンプトへ戻るまで**は打たない（`shell_back`）。
+    /// 送った後は `launch_verdict` で見張り、すぐ終わったら 1 回だけ打ち直す。
+    /// 結果は `session_restart_records`（= `last_restart`）・バナー・persist.log へ出す
     fn drive_agent_relaunches(&mut self) {
-        use tako_core::session_restart::{self as sr, RelaunchStep};
+        use tako_core::session_restart::{
+            self as sr, LaunchVerdict, RelaunchFailure, RelaunchStep,
+        };
 
+        let mut events = std::mem::take(&mut self.relaunch_flow_events);
         let mut remaining = Vec::new();
         for mut entry in std::mem::take(&mut self.agent_relaunches) {
             // ペインが閉じられていたら建て直す先が無い
             if !self.terminals.contains_key(&entry.pane) {
-                tako_control::diag::flow_log(&format!(
-                    "セッション再起動: pane={} ペインが無くなったので中止",
-                    entry.pane.as_u64()
-                ));
+                self.finish_relaunch(&entry, Err((RelaunchFailure::PaneClosed, None)));
                 continue;
             }
-            // ゾンビも終了済みとして扱う（#619 の教訓。`kill(pid,0)` はゾンビにも成功する）
-            let alive = entry
-                .pid
-                .is_some_and(|pid| !tako_control::platform::process::has_terminated(pid));
-            let elapsed = entry.started_at.elapsed().as_secs();
-            match sr::relaunch_step(alive, elapsed, entry.forced) {
-                RelaunchStep::Wait => remaining.push(entry),
-                RelaunchStep::Force => {
-                    if let Some(pid) = entry.pid {
-                        let _ = tako_control::platform::process::terminate(pid, true);
+            match entry.phase {
+                RelaunchPhase::WaitingExit => {
+                    // ゾンビも終了済みとして扱う（#619 の教訓。`kill(pid,0)` はゾンビにも成功する）
+                    let alive = entry
+                        .pid
+                        .is_some_and(|pid| !tako_control::platform::process::has_terminated(pid));
+                    if !alive && entry.dead_since.is_none() {
+                        entry.dead_since = Some(std::time::Instant::now());
                     }
-                    entry.forced = true;
-                    tako_control::diag::flow_log(&format!(
-                        "セッション再起動: pane={} 猶予切れで強制終了（pid={:?}）",
-                        entry.pane.as_u64(),
-                        entry.pid
-                    ));
-                    remaining.push(entry);
-                }
-                RelaunchStep::GiveUp => {
-                    let msg = crate::ui_text::stale::relaunch_gave_up(entry.pid);
-                    tako_control::diag::flow_log(&format!(
-                        "セッション再起動: pane={} 断念（プロセスが終わらない。pid={:?}）",
-                        entry.pane.as_u64(),
-                        entry.pid
-                    ));
-                    self.set_agent_restart_notice(entry.pane, Some(msg));
-                }
-                RelaunchStep::Launch => {
-                    // 終了した claude 自身が画面へ残した案内を優先する（世代ずれの保険）
-                    let screen = self
-                        .terminals
-                        .get(&entry.pane)
-                        .map(|s| s.visible_lines())
-                        .unwrap_or_default();
-                    let mut command = entry.command.clone();
-                    if let (Some(old), Some(hint)) =
-                        (entry.session_id.as_deref(), sr::parse_resume_hint(&screen))
-                    {
-                        let (next, changed) = sr::apply_resume_hint(&command, old, &hint);
-                        if changed {
-                            tako_control::diag::flow_log(&format!(
-                                "セッション再起動: pane={} 画面の案内で会話 ID を差し替えた",
-                                entry.pane.as_u64()
+                    let shell_back = entry.legacy
+                        || sr::shell_back(
+                            entry.prompts_before,
+                            self.terminals
+                                .get(&entry.pane)
+                                .map_or(0, |s| s.shell_marks().prompts),
+                            entry.dead_since.map_or(0, |t| t.elapsed().as_secs()),
+                        );
+                    let elapsed = entry.started_at.elapsed().as_secs();
+                    match sr::relaunch_step(alive, shell_back, elapsed, entry.forced) {
+                        RelaunchStep::Wait => remaining.push(entry),
+                        RelaunchStep::Force => {
+                            if let Some(pid) = entry.pid {
+                                let _ = tako_control::platform::process::terminate(pid, true);
+                            }
+                            entry.forced = true;
+                            tako_control::diag::persist_log(&format!(
+                                "セッション再起動: 猶予切れで強制終了 pane={} pid={:?}",
+                                entry.pane.as_u64(),
+                                entry.pid
                             ));
-                            command = next;
+                            remaining.push(entry);
+                        }
+                        RelaunchStep::GiveUp => {
+                            self.finish_relaunch(
+                                &entry,
+                                Err((RelaunchFailure::ProcessStuck, None)),
+                            );
+                        }
+                        RelaunchStep::Launch => {
+                            self.apply_resume_hint_to(&mut entry);
+                            self.launch_relaunch(&mut entry);
+                            remaining.push(entry);
                         }
                     }
-                    self.queue_command_flow(entry.pane, command);
-                    self.stale_binary_banners.remove(&entry.pane);
+                }
+                RelaunchPhase::Launching => {
+                    let Some(pos) = events.iter().position(|(p, _)| *p == entry.pane) else {
+                        remaining.push(entry);
+                        continue;
+                    };
+                    let (_, outcome) = events.remove(pos);
+                    let Some(submit) = outcome else {
+                        self.finish_relaunch(
+                            &entry,
+                            Err((RelaunchFailure::CommandFlowTimeout, None)),
+                        );
+                        continue;
+                    };
+                    if entry.legacy {
+                        // 旧挙動: 送ったら成功扱い（起動後を見張らない）
+                        self.finish_relaunch(&entry, Ok(()));
+                        continue;
+                    }
+                    let missing_before = self
+                        .terminals
+                        .get(&entry.pane)
+                        .map_or(0, |s| sr::conversation_missing_count(&s.visible_lines()));
+                    entry.phase = RelaunchPhase::Watching {
+                        since: std::time::Instant::now(),
+                        submit,
+                        missing_before,
+                    };
+                    self.set_restart_phase(entry.pane, sr::RestartPhase::Watching);
+                    remaining.push(entry);
+                }
+                RelaunchPhase::Watching {
+                    since,
+                    submit,
+                    missing_before,
+                } => {
+                    let (marks, screen) = self
+                        .terminals
+                        .get(&entry.pane)
+                        .map(|s| (s.shell_marks(), s.visible_lines()))
+                        .unwrap_or_default();
+                    match sr::launch_verdict(
+                        submit,
+                        marks,
+                        &screen,
+                        missing_before,
+                        since.elapsed().as_secs(),
+                    ) {
+                        LaunchVerdict::Pending => remaining.push(entry),
+                        LaunchVerdict::Started => self.finish_relaunch(&entry, Ok(())),
+                        LaunchVerdict::Exited {
+                            conversation_missing,
+                            exit_code,
+                        } => {
+                            // 画面の文言は細いペインでプロンプトに押し出されて残らないことがある
+                            // （2 行のペインで実測）ので、**送った ID の会話の記録が無い**ことでも
+                            // 「会話が見つからない」と判断する
+                            let launched_missing =
+                                sr::resume_id_of(&entry.command).is_some_and(|id| {
+                                    tako_control::transcript::find_transcript(&id).is_none()
+                                });
+                            let failure = if conversation_missing || launched_missing {
+                                RelaunchFailure::ConversationNotFound
+                            } else {
+                                RelaunchFailure::AgentExited
+                            };
+                            // 打ち直すのは「会話の記録はあるのにすぐ終わった」ときだけ
+                            // （記録が無いなら何度打っても同じ。化けた行・案内の取り違えが相手）
+                            let record_exists = entry.session_id.as_deref().is_some_and(|id| {
+                                tako_control::transcript::find_transcript(id).is_some()
+                            });
+                            if entry.attempts < sr::MAX_RELAUNCH_ATTEMPTS && record_exists {
+                                tako_control::diag::persist_log(&format!(
+                                    "セッション再起動: 打ち直し pane={} 理由={} 終了コード={} 試行={}",
+                                    entry.pane.as_u64(),
+                                    failure.as_str(),
+                                    exit_code.map_or_else(|| "-".to_string(), |c| c.to_string()),
+                                    entry.attempts + 1
+                                ));
+                                // 画面の案内で差し替えた行が落ちたなら、tako が組んだ行へ戻す
+                                entry.command = entry.original_command.clone();
+                                self.launch_relaunch(&mut entry);
+                                remaining.push(entry);
+                            } else {
+                                self.finish_relaunch(&entry, Err((failure, exit_code)));
+                            }
+                        }
+                    }
                 }
             }
         }
+        // 対応する建て直しの無い顛末（ペインが閉じた等）は捨てる
+        events.retain(|(p, _)| remaining.iter().any(|r: &AgentRelaunch| r.pane == *p));
+        self.relaunch_flow_events = events;
         self.agent_relaunches = remaining;
+    }
+
+    /// 終了した claude 自身が画面へ残した案内を優先する（世代ずれの保険。#1067）。
+    ///
+    /// #1967: 案内は**折り返しに依らず UUID の全長**だけを読み（`parse_resume_hint`）、
+    /// さらに**その会話の記録が実在するときだけ**差し替える。旧実装は細いペインで折り返した
+    /// 案内の 1 行目（途中までの ID）を採り、正しい ID を壊していた（本番 10/9）
+    fn apply_resume_hint_to(&self, entry: &mut AgentRelaunch) {
+        use tako_core::session_restart as sr;
+        let screen = self
+            .terminals
+            .get(&entry.pane)
+            .map(|s| s.visible_lines())
+            .unwrap_or_default();
+        let hint = if entry.legacy {
+            sr::parse_resume_hint_legacy(&screen)
+        } else {
+            sr::parse_resume_hint(&screen)
+        };
+        let (Some(old), Some(hint)) = (entry.session_id.as_deref(), hint) else {
+            return;
+        };
+        if hint == old {
+            return;
+        }
+        if !entry.legacy && tako_control::transcript::find_transcript(&hint).is_none() {
+            tako_control::diag::persist_log(&format!(
+                "セッション再起動: 画面の案内の会話 ID は記録が無いので採らない pane={}",
+                entry.pane.as_u64()
+            ));
+            return;
+        }
+        let (next, changed) = sr::apply_resume_hint(&entry.command, old, &hint);
+        if changed {
+            tako_control::diag::persist_log(&format!(
+                "セッション再起動: 画面の案内で会話 ID を差し替えた pane={}",
+                entry.pane.as_u64()
+            ));
+            entry.command = next;
+        }
+    }
+
+    /// 起動コマンドを #640 / #1940 の送達フローへ積み、送っている段へ進める（#1967）
+    fn launch_relaunch(&mut self, entry: &mut AgentRelaunch) {
+        entry.attempts += 1;
+        entry.phase = RelaunchPhase::Launching;
+        self.command_flows.push(ShellCommandFlow {
+            pane: entry.pane,
+            flow: tako_core::shell_send::ShellSendFlow::new(entry.command.clone()),
+            created_at: std::time::Instant::now(),
+            relaunch: true,
+        });
+        if let Some(record) = self.session_restart_records.get_mut(&entry.pane) {
+            record.phase = tako_core::session_restart::RestartPhase::Launching;
+            record.attempts = entry.attempts;
+        }
+    }
+
+    fn set_restart_phase(&mut self, pane: PaneId, phase: tako_core::session_restart::RestartPhase) {
+        if let Some(record) = self.session_restart_records.get_mut(&pane) {
+            record.phase = phase;
+        }
+    }
+
+    /// 建て直しの決着（#1967）。記録・バナー・persist.log の 3 か所へ同じ結果を出す
+    /// （**コマンドの本文は出さない** = 規約）
+    fn finish_relaunch(
+        &mut self,
+        entry: &AgentRelaunch,
+        result: Result<(), (tako_core::session_restart::RelaunchFailure, Option<i32>)>,
+    ) {
+        use tako_core::session_restart::{RelaunchFailure, RestartPhase};
+        let pane = entry.pane;
+        if let Some(record) = self.session_restart_records.get_mut(&pane) {
+            record.attempts = entry.attempts;
+            record.finished_at = Some(tako_control::sessions::now_iso());
+            match result {
+                Ok(()) => record.phase = RestartPhase::Started,
+                Err((failure, code)) => {
+                    record.phase = RestartPhase::Failed;
+                    record.reason = Some(failure);
+                    record.exit_code = code;
+                }
+            }
+        }
+        match result {
+            Ok(()) => {
+                tako_control::diag::persist_log(&format!(
+                    "セッション再起動: 結果=起動 pane={} 試行={} 組み立て={}",
+                    pane.as_u64(),
+                    entry.attempts,
+                    entry.recipe
+                ));
+                self.stale_binary_banners.remove(&pane);
+            }
+            Err((failure, code)) => {
+                tako_control::diag::persist_log(&format!(
+                    "セッション再起動: 結果=失敗 pane={} 理由={} 終了コード={} 試行={}",
+                    pane.as_u64(),
+                    failure.as_str(),
+                    code.map_or_else(|| "-".to_string(), |c| c.to_string()),
+                    entry.attempts
+                ));
+                // ペインが無いならバナーの出し先も無い
+                if failure != RelaunchFailure::PaneClosed {
+                    let msg = match failure {
+                        RelaunchFailure::ProcessStuck => {
+                            crate::ui_text::stale::relaunch_gave_up(entry.pid)
+                        }
+                        other => crate::ui_text::stale::relaunch_failed(other.as_str(), code),
+                    };
+                    self.set_agent_restart_notice(pane, Some(msg));
+                }
+            }
+        }
     }
 
     /// 建て直しの進行 / 失敗をペインの通知バナーへ出す（#1067）。
@@ -7635,6 +7884,8 @@ impl TakoApp {
         // #1940: 送り終えたペインの「送った時点の印」（ループの後で反映する。
         // `self.terminals` を借りている間は他のフィールドを書き換えられない）
         let mut launched: Vec<(PaneId, tako_core::shell_send::ShellMarks)> = Vec::new();
+        // #1967: 建て直しの起動コマンドの顛末（ループの後で渡す。理由は上と同じ）
+        let mut relaunched: Vec<(PaneId, Option<tako_core::shell_send::ShellMarks>)> = Vec::new();
         // 同一ペインへ複数フローが重なると本文と Enter が混線するため、先行フローが
         // 完了するまで後続は待たせる（Vec の順序 = 送信順。`drive_prompt_flows` と同型）。
         // #1006 で「ssh の行 → 接続後の cd」を同じペインへ 2 本積むようになった
@@ -7667,6 +7918,9 @@ impl TakoApp {
                     tako_control::orchestrator::registry::LaunchFailure::CommandFlowTimeout,
                     None,
                 );
+                if entry.relaunch {
+                    self.relaunch_flow_events.push((entry.pane, None));
+                }
                 continue;
             }
             // セッションがまだ起動していない / 既に閉じた場合は次 tick へ持ち越す
@@ -7706,13 +7960,14 @@ impl TakoApp {
                         entry.flow.confirmation().as_str(),
                         entry.flow.rewrites()
                     ));
-                    launched.push((
-                        entry.pane,
-                        entry
-                            .flow
-                            .submit_marks()
-                            .unwrap_or_else(|| session.shell_marks()),
-                    ));
+                    let marks = entry
+                        .flow
+                        .submit_marks()
+                        .unwrap_or_else(|| session.shell_marks());
+                    launched.push((entry.pane, marks));
+                    if entry.relaunch {
+                        relaunched.push((entry.pane, Some(marks)));
+                    }
                     continue;
                 }
             }
@@ -7733,6 +7988,7 @@ impl TakoApp {
         for (pane, marks) in launched {
             self.launch_baselines.insert(pane, marks);
         }
+        self.relaunch_flow_events.extend(relaunched);
         // 閉じたペインの基準は捨てる（同じ番号が別ペインへ再利用されても誤検知しない）
         let terminals = &self.terminals;
         self.launch_baselines
@@ -22920,21 +23176,56 @@ impl SessionHost for TakoApp {
             pane,
             flow: tako_core::shell_send::ShellSendFlow::new(command),
             created_at: std::time::Instant::now(),
+            relaunch: false,
         });
     }
 
-    fn queue_agent_relaunch(&mut self, pane: PaneId, pid: Option<u32>, command: String) {
-        // 同じペインへ重ねない（前の建て直しを捨てて最後の指示を通す）
+    fn queue_agent_relaunch(
+        &mut self,
+        pane: PaneId,
+        request: tako_core::session_restart::RelaunchRequest,
+    ) {
+        use tako_core::session_restart as sr;
+        // 同じペインへ重ねない（dispatch が進行中の再起動を断るので、ここへ来るのは
+        // 決着した後か旧挙動のとき。前の段取りは捨てて最後の指示を通す）
         self.agent_relaunches.retain(|r| r.pane != pane);
-        let session_id = tako_core::session_restart::resume_id_of(&command);
+        let session_id = sr::resume_id_of(&request.command);
+        let legacy = sr::legacy_1967();
+        self.session_restart_records.insert(
+            pane,
+            sr::RestartRecord {
+                mode: sr::SessionRestartMode::Harness,
+                phase: sr::RestartPhase::WaitingExit,
+                reason: None,
+                exit_code: None,
+                attempts: 0,
+                recipe: request.recipe.clone(),
+                started_at: tako_control::sessions::now_iso(),
+                finished_at: None,
+            },
+        );
         self.agent_relaunches.push(AgentRelaunch {
             pane,
-            pid,
-            command,
+            pid: request.pid,
+            original_command: request.command.clone(),
+            command: request.command,
             session_id,
             forced: false,
             started_at: std::time::Instant::now(),
+            prompts_before: request.prompts_before,
+            dead_since: None,
+            phase: RelaunchPhase::WaitingExit,
+            attempts: 0,
+            recipe: request.recipe,
+            legacy,
         });
+    }
+
+    fn session_restart_record(
+        &self,
+        pane: PaneId,
+    ) -> Option<tako_core::session_restart::RestartRecord> {
+        self.session_restart_records.get(&pane).cloned()
     }
 
     fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {

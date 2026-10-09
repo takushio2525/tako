@@ -281,6 +281,9 @@ pub mod keys {
     pub const REMOTE_CONTROL: &str = "remote_control";
     /// PC 再起動（tmux サーバーごと消える）後の復元で、会話ごと戻せるか（#1238）
     pub const RESTORE_AFTER_REBOOT: &str = "restore_after_reboot";
+    /// 会話の再開コマンドが元の起動と同じ引数（model / effort / system prompt / 許可モード /
+    /// Remote Control）を持つ（#1967。`tako session-restart --mode harness` / `tako sessions resume`）
+    pub const RESUME_LAUNCH_ARGS: &str = "resume_launch_args";
     /// ハーネスだけ建て直して会話を続ける（#1067。ペインの右クリック / `tako session-restart`）
     pub const SESSION_RESTART_HARNESS: &str = "session_restart_harness";
     /// 引き継ぎを書かせてセッションを交代する（#1067。#749 の手動版）
@@ -1046,6 +1049,23 @@ pub const MATRIX: &[AgentFeature] = &[
              `agy --conversation <id>` が会話を履歴ごと戻した。\
              **Windows は lsof が無いので ID を採れない**（復元の内訳は `resume 非対応` と出す。\
              判定は tako_core::agent_resume::restore_support）",
+        ),
+    },
+    AgentFeature {
+        key: keys::RESUME_LAUNCH_ARGS,
+        summary: Note::new(
+            "会話を再開するとき、元の起動と同じ引数（モデル・effort・system prompt・許可モード・Remote Control）で立てる（#1967）",
+            "A resumed conversation starts with the same arguments as its original launch (model, effort, system prompt, permission mode, Remote Control) (#1967)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_WIRED, 975),
+        agy: pending(notes::NOT_WIRED, 975),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Source(
+            "tako-control/src/resume_launch.rs が master / solo は build_master_cmd、worker は \
+             build_worker_cmd（元の起動の正本）で組んで `--resume <id>` を足す。claude 以外は \
+             起動の引数を resume へ持ち込めない・持ち込まない（`codex resume` は --model を受けない = \
+             agent_resume::ResumeSpec の accepts_launch_flags）ので従来のカタログのメタだけの組み立てに残る",
         ),
     },
     AgentFeature {

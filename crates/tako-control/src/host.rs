@@ -118,7 +118,26 @@ pub trait SessionHost {
     /// 落ちる前に打つと、resume の行が**まだ動いている TUI の入力欄へ**流れ込む
     /// （#694 / #1006 で踏んだ「代替画面のまま書く」と同じ事故）。判断は
     /// `tako_core::session_restart::relaunch_step`。既定実装は何もしない（テスト用モック等）
-    fn queue_agent_relaunch(&mut self, _pane: PaneId, _pid: Option<u32>, _command: String) {}
+    ///
+    /// #1967: 依頼には「終了要求の**前**に控えたプロンプトの印の回数」を載せる。落ちた後に
+    /// シェルがプロンプトへ戻るのを待ってから打つため（戻る前に打つと起動フックの最中の
+    /// 先行入力になる = #1940 と同じ型）。送った後は、すぐ終わらないかを見張って
+    /// 失敗を [`ControlHost::session_restart_record`] とペインのバナー・persist.log へ出す
+    fn queue_agent_relaunch(
+        &mut self,
+        _pane: PaneId,
+        _request: tako_core::session_restart::RelaunchRequest,
+    ) {
+    }
+    /// ペインの最後の建て直しの記録（#1967。`tako session-restart` の下見の `last_restart`）。
+    /// 進行中なら重ねて再起動させない（`RestartBlock::RestartInProgress`）。
+    /// 既定は None（GUI が居ない host では騙らない）
+    fn session_restart_record(
+        &self,
+        _pane: PaneId,
+    ) -> Option<tako_core::session_restart::RestartRecord> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
