@@ -5,6 +5,7 @@ use gpui::{
 use tako_core::PaneId;
 
 use super::*;
+use crate::platform::user_work::UserWork;
 
 /// 新規作成のインライン入力欄を表す仮行のファイル名（#559）。
 /// 行の判定は挿入位置（index）で行うのでパスは表示にも一致判定にも使わない
@@ -3360,9 +3361,12 @@ impl TakoApp {
             if let Some(delay) = inject.delay {
                 cx.background_executor().timer(delay).await;
             }
-            let task = cx
-                .background_executor()
-                .spawn(async move { preview::highlight_text(&p, &text) });
+            let task = cx.background_executor().spawn(async move {
+                // #1916: 塗りの間は App Nap に間引かせない（間引かれると E コアへ寄せられ、
+                // 10 MB で 12.0 秒 → 26.9〜33.4 秒になる）
+                let _work = UserWork::begin();
+                preview::highlight_text(&p, &text)
+            });
             let lines = task.await;
             let _ = this.update(cx, |app, cx| {
                 if let Some(running) = app.view_highlights_running.get_mut(&pane) {
@@ -3425,9 +3429,11 @@ impl TakoApp {
             if let Some(delay) = inject.delay {
                 cx.background_executor().timer(delay).await;
             }
-            let task = cx
-                .background_executor()
-                .spawn(async move { preview::seed_editor_highlight(request) });
+            let task = cx.background_executor().spawn(async move {
+                // #1916: 読み取り表示の塗りと同じ理由で、塗りの間は App Nap に間引かせない
+                let _work = UserWork::begin();
+                preview::seed_editor_highlight(request)
+            });
             let seed = task.await;
             let _ = this.update(cx, |app, cx| {
                 let (previews, edits) = (&mut app.previews, &mut app.preview_edits);

@@ -3593,6 +3593,32 @@ mod tests {
         }
     }
 
+    /// 構文の塗りをテストスレッドで直接呼んだ所要（#1916。GUI 内の塗りと比べる側）。
+    /// 入力は `TAKO_1916_PERF_FILE`（GUI に開かせるのと同じファイル）、回数は
+    /// `TAKO_1916_PERF_ROUNDS`（既定 2）。`scripts/test-highlight-app-nap-1916.sh` が呼ぶ
+    #[test]
+    #[ignore = "性能計測（--release で --ignored 指定のとき手動実行）"]
+    fn perf_塗りの所要_テストスレッド() {
+        let Some(path) = std::env::var_os("TAKO_1916_PERF_FILE").map(PathBuf::from) else {
+            eprintln!("[perf] 1916: TAKO_1916_PERF_FILE が無いので測らない");
+            return;
+        };
+        let rounds: usize = std::env::var("TAKO_1916_PERF_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let text = std::fs::read_to_string(&path).expect("計測の入力");
+        for round in 1..=rounds {
+            let t0 = std::time::Instant::now();
+            let lines = highlight_text(&path, &text);
+            eprintln!(
+                "[perf] 1916 test-thread round={round} ms={} lines={}",
+                t0.elapsed().as_millis(),
+                lines.len()
+            );
+        }
+    }
+
     /// 大きいファイルの編集計測（#1660）。`TAKO_1660_PERF_FILE` があればそのファイル、
     /// 無ければ main.rs の行を巡回して 10 万行 / 10 MB を合成する。
     /// `cargo test -p tako-app --release -- --ignored --nocapture perf_大きいファイル`

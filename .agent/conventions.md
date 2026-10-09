@@ -1571,6 +1571,14 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   順序の注入は偽サーバの `TAKO_LSP_FAKE_START_DELAY_MS` / `TAKO_LSP_FAKE_STATUS_DELAY_MS`。
   番犬 `issue1922_lsp_loading_wait_watchdog` が `--loading-ms` の直書き・合図を通らない `loading`・
   前提の待ちを通らない要求を `file:line` で落とす
+- **隔離 GUI の性能は App Nap を分けて読む**（#1916）。隔離 GUI は前面に出ないので、起動から
+  約 30 秒で App Nap に間引かれ（`ps -o pri=` が 46 → 4）、CPU を使う処理は E コアへ寄せられて
+  2.2〜2.8 倍遅くなる。「回を追うごとに遅くなる」はまずこれを疑う
+  - 比べるときは**同じ入力**で、所要に `proc_pid_rusage` の **P コアの時間の比率と命令数**を添える
+    （命令数が同じなら中身ではなく走る場所の差）。#1916 は入力の違い（3.6 倍）と App Nap
+    （2.2〜2.8 倍）が重なって「4〜8 倍」に見えていた
+  - 利用者が待っている重い background 処理は `platform::user_work::UserWork` を握って回す
+    （構文の塗りは握っている。実経路の A/B は `bash scripts/test-highlight-app-nap-1916.sh`）
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 

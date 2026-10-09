@@ -24316,6 +24316,12 @@ impl PreviewHost for TakoApp {
         self.run_preview_command_local(pane, command, expected_version)
     }
 
+    fn preview_highlighting(&self, pane: PaneId) -> bool {
+        self.view_highlights_running
+            .get(&pane)
+            .is_some_and(|running| *running > 0)
+    }
+
     fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
         let edit = self.preview_edits.get(&pane)?;
         let mut document = edit.buffer.document_state();

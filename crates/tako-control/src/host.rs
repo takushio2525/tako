@@ -886,6 +886,14 @@ pub trait PreviewHost {
     fn preview_limit(&self, _pane: PaneId) -> Option<serde_json::Value> {
         None
     }
+    /// 読み取り表示の構文の塗り（background）がまだ走っているか（#1916）。
+    ///
+    /// 開いた直後の本文は平文で、色は塗りが戻ってから付く。`tako edit` の応答は走っている間だけ
+    /// `highlighting: true` を載せるので、**色が揃ったかを GUI の外から状態で待てる**
+    /// （編集開始の全文の塗りは `document.highlight_pending` が同じ役）
+    fn preview_highlighting(&self, _pane: PaneId) -> bool {
+        false
+    }
     /// 編集モード切替。開始時のファイル読み込み・UTF-8 検査は実装側が core API で行う。
     fn set_preview_editing(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())
