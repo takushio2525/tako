@@ -2772,10 +2772,21 @@ Windows ランナーには **psmux / tmux / claude / codex CLI が無く、セ�
 
 ## CI のビルドキャッシュのキー（Issue #1915）
 
-rust-cache（`Swatinem/rust-cache@v2`）を使う箇所（`ci.yml` の macOS / Windows・
-`release-windows.yml`）は、**直前のステップで `scripts/lib/cargo-root-manifest-key.sh` の
+rust-cache（`Swatinem/rust-cache@v2`）を使う箇所（`ci.yml` の macOS / Windows）は、
+**直前のステップで `scripts/lib/cargo-root-manifest-key.sh` の
 指紋を作り、rust-cache の `key` へ渡す**。rust-cache を新しく足すときもこの 2 ステップの組にする
 （テスト `scripts/test-cargo-root-manifest-key-1915.sh` が CI の macOS ジョブで数と並びを見る）。
+
+**タグで起動する workflow（`release-windows.yml`）には rust-cache を置かない（#1921）**。
+GitHub のキャッシュは ref ごとに分かれ、タグの run が復元できるのは「そのタグ」と
+「既定ブランチ（main）」のものだけで、別のタグのものは読めない（公式文書の
+「Workflow runs also cannot restore caches created for different tag names.」）。
+夜間リリースはタグが毎晩変わるので、v0.8.16〜v0.8.28 の 13 回すべてが「No cache found.」のまま
+毎回約 1.6 GB を保存し、上限 10 GB の中で main / PR のキャッシュを押し出していた。
+`save-if: false` で main から復元だけする案も、main にあるのは debug のキャッシュだけで
+release の target は流用できず（効くのは依存の取得の約 60 秒、その復元に Windows で約 55 秒）、
+採らなかった。同じテストが「タグで起動しうる workflow（push の tags / 絞り込み無しの push /
+release / create）の rust-cache は 0 本」を見る。
 
 - rust-cache がキーの末尾へ混ぜるのは、メンバーの Cargo.toml・Cargo.lock（レジストリ由来の行）・
   `.cargo/config.toml`・rust-toolchain だけで、**ルートの仮想マニフェストは入らない**
