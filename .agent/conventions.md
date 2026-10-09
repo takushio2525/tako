@@ -1547,6 +1547,30 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   - 1 実装は `wait_for_background_highlight`（A/B は `TAKO_1890_LEGACY=view|seed|1`・遅れの
     注入は製品側の `TAKO_1890_INJECT=slow:<ミリ秒>`）。番犬 `issue1890_highlight_wait_watchdog` が
     節の手書きの窓を `file:line` で落とす。実経路の A/B は `bash scripts/test-highlight-wait-1890.sh`
+- **偽の言語サーバの e2e は「相手が何を知っているか」を状態で揃えてから送る**（#1922）。
+  `tako-lsp-fake` を起こす e2e（`crates/tako-control/tests/issue*_lsp*.rs`）が Windows の CI で
+  だけ間欠的に落ちていた。真因は 3 つとも「テストが前提にした順序を実時間の速さに任せた」:
+  - **読み込み中と知る前に送った**（#1869 / #1893 の「読み込みの後半」）。偽サーバは `initialized`
+    を受けて `quiescent: false` を送るが、manager は起動待ちを 20ms おき（`READY_POLL`）に見るので、
+    知らせの処理が 1 周期遅れると知る前に要求を送り、待たされても `waited_for_loading` が `None` に
+    なる。知らせを遅らせる注入で 10ms までは 10 回中 0 回・15ms は 4 回・20ms 以上は 10 回とも
+    CI と同じ行で落ちた
+  - **読み込みが要求より先に終わった**（読み込みの長さを `--loading-ms 1500` の実時間で決めていた。
+    1ms に縮める注入で前半の検査まで落ちる = CI で落ちた後半だけとは形が違う）
+  - **上限つきの要求をサーバの起動ごと測った**（#1680 の上限 1 秒の未応答が `starting: true`。
+    起動を 1.2 秒遅らせる注入で再現、2.2 秒で上限 2 秒の同型 3 本も落ちる）
+
+  直し方は 1 実装（`tests/common/lsp_fake_e2e.rs`）へ寄せた。読み込みの終わりは**テストが決める**
+  （`LoadingGate` = 偽サーバの `--loading-until`。要求が偽サーバのログへ届いたのを
+  `wait_received` で確かめてから `finish`）。読み込み中のサーバへ送る要求は、manager が**読み込み中と
+  知った**のを待ってから送る（`wait_loading_known`。偽サーバは知らせ → didOpen の診断の順に送り、
+  reader は届いた順に 1 本のスレッドで処理するので「診断が数に載った」が処理済みの印）。上限つきの
+  要求で起動の後の経路（`starting: false` / `Loading`）を見るなら**起動済みを待ってから**測る
+  （`wait_running`）。偽サーバは知らせを `READY_POLL` より長く遅らせて送る
+  （`status_delay_args`）ので、待ちを抜けば**どの機でも必ず**落ちる（Windows でだけ赤、にならない）。
+  順序の注入は偽サーバの `TAKO_LSP_FAKE_START_DELAY_MS` / `TAKO_LSP_FAKE_STATUS_DELAY_MS`。
+  番犬 `issue1922_lsp_loading_wait_watchdog` が `--loading-ms` の直書き・合図を通らない `loading`・
+  前提の待ちを通らない要求を `file:line` で落とす
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 

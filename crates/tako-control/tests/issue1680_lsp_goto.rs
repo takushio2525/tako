@@ -6,6 +6,9 @@
 //! （`lsp_goto_land` を MockHost で）と、GUI のセルフテストが持つ。
 //!
 //! 文言は `tako_control::lsp::text` の定数から読んで比べる（理由文を直書きしない）。
+//!
+//! 上限つきの要求で起動の後の経路を見るときは起動済みを待ってから測り、`loading` の読み込みの
+//! 終わりはテストが決める（`common/lsp_fake_e2e.rs`。#1922）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +22,11 @@ use tako_core::lsp::goto::GotoKind;
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
+
+#[path = "common/lsp_fake_e2e.rs"]
+mod lsp_fake_e2e;
+
+use lsp_fake_e2e::LoadingGate;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
@@ -51,6 +59,11 @@ impl Scratch {
 
     fn rules(&self) -> PathBuf {
         self.0.join("goto.json")
+    }
+
+    /// `loading` の読み込みを終わらせる合図（作るまで読み込みは終わらない）
+    fn gate(&self) -> LoadingGate {
+        LoadingGate::new(&self.0)
     }
 }
 
@@ -129,6 +142,14 @@ fn wait_until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// 編集モードで開いた状態にする（GUI の編集セッションと同じ = `sync` の 1 回目で didOpen）
+fn open_editing(manager: &LspManager, path: &Path, text: &str) -> DocLink {
+    let mut link = DocLink::default();
+    manager.sync(&mut link, true, path, text, 1);
+    assert!(matches!(link, DocLink::Open(_)), "文書が開く");
+    link
 }
 
 fn request(path: &Path, line: usize, column: usize, secs: u64) -> GotoRequest {
@@ -324,6 +345,10 @@ fn 見つからない_未応答_未導入は別の文言() {
     let scratch = Scratch::new("timeout");
     let main = scratch.write("src/main.rs", "fn main() {}\n");
     let manager = LspManager::new(config(&scratch, "normal", &json!([{ "silent": true }])));
+    // 上限の 1 秒は起動の後の待ちだけで測る（起動ごと 1 秒で測ると、遅い機では起動が上限を越えて
+    // `starting: true` になる = #1922 の Windows ランナー）
+    let link = open_editing(&manager, &main, "fn main() {}\n");
+    lsp_fake_e2e::wait_running(&manager);
     // 上限で打ち切ったことは経路（`Timeout`・起動済み）で見る（実時間の予算で比べない = #962）
     let timeout = manager.goto(&request(&main, 0, 3, 1)).unwrap_err();
     assert!(
@@ -341,6 +366,7 @@ fn 見つからない_未応答_未導入は別の文言() {
     wait_until("$/cancelRequest", Duration::from_secs(5), || {
         methods(&scratch).contains(&"$/cancelRequest".to_string())
     });
+    drop(link);
     manager.shutdown_all(Duration::from_secs(2));
 
     // 未導入
@@ -417,6 +443,15 @@ fn 起動が終わらなければ上限で未応答() {
     manager.shutdown_all(Duration::from_secs(2));
 }
 
+/// `loading` シナリオの偽サーバ。読み込みは `scratch.gate()` を終わらせるまで続き、読み込み中の
+/// 知らせは `READY_POLL` より遅れて届く（待たずに送れば必ず落ちる順序 = #1922）
+fn loading_config(scratch: &Scratch, rules: &Value) -> LspConfig {
+    let mut extra = scratch.gate().args();
+    extra.extend(lsp_fake_e2e::status_delay_args());
+    let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+    config_with(scratch, "loading", rules, &extra)
+}
+
 fn config_with(scratch: &Scratch, scenario: &str, rules: &Value, extra: &[&str]) -> LspConfig {
     let mut config = config(scratch, scenario, rules);
     let mut args = vec![
@@ -451,13 +486,21 @@ fn definition_count(scratch: &Scratch) -> usize {
 #[test]
 fn 読み込み中の空の答えは済むのを待って問い直す() {
     let scratch = Scratch::new("loading");
-    let main = scratch.write("src/main.rs", "fn main() { helper(); }\n");
+    let text = "fn main() { helper(); }\n";
+    let main = scratch.write("src/main.rs", text);
     let other = scratch.write("src/other.rs", "pub fn helper() {}\n");
     let rules = json!([{ "result": location(&other, 0, 7) }]);
-    let manager = LspManager::new(config(&scratch, "loading", &rules));
-    let answer = manager
-        .goto(&request(&main, 0, 12, 10))
-        .expect("答えが来る");
+    let manager = LspManager::new(loading_config(&scratch, &rules));
+    let link = open_editing(&manager, &main, text);
+    lsp_fake_e2e::wait_loading_known(&manager);
+    let asking = {
+        let (manager, main) = (manager.clone(), main.clone());
+        std::thread::spawn(move || manager.goto(&request(&main, 0, 12, 60)))
+    };
+    // 読み込み中の 1 回目（空の答え）が届いてから読み込みを終わらせる（先に終わると問い直さない）
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/definition", 1);
+    scratch.gate().finish();
+    let answer = asking.join().unwrap().expect("答えが来る");
     assert_eq!(
         answer.targets.len(),
         1,
@@ -473,6 +516,7 @@ fn 読み込み中の空の答えは済むのを待って問い直す() {
         received(&scratch)[0]["params"]["capabilities"]["experimental"]["serverStatusNotification"],
         json!(true)
     );
+    drop(link);
     manager.shutdown_all(Duration::from_secs(2));
 }
 
@@ -480,18 +524,19 @@ fn 読み込み中の空の答えは済むのを待って問い直す() {
 #[test]
 fn 読み込みが上限までに済まなければ未応答() {
     let scratch = Scratch::new("loading-slow");
-    let main = scratch.write("src/main.rs", "fn main() { helper(); }\n");
-    let manager = LspManager::new(config_with(
-        &scratch,
-        "loading",
-        &json!([]),
-        &["--loading-ms", "60000"],
-    ));
+    let text = "fn main() { helper(); }\n";
+    let main = scratch.write("src/main.rs", text);
+    // 読み込みは終わらせない（合図を作らない）
+    let manager = LspManager::new(loading_config(&scratch, &json!([])));
+    let link = open_editing(&manager, &main, text);
+    // 上限の 1 秒は読み込みの待ちだけで測る（起動の未応答と取り違えない = #1922）
+    lsp_fake_e2e::wait_loading_known(&manager);
     let error = manager.goto(&request(&main, 0, 12, 1)).unwrap_err();
     assert!(
         matches!(error, GotoError::Timeout { starting: true, .. }),
         "{error:?}"
     );
+    drop(link);
     manager.shutdown_all(Duration::from_secs(2));
 }
 

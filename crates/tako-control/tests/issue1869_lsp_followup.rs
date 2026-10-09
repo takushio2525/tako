@@ -23,6 +23,10 @@
 //! 打鍵の要求も済むのを待って問い直すこと・待つあいだに次の打鍵 / 閉じる / 文書を閉じるで
 //! 抜けること・上限に当たったら `loading`（読み込み中）と分かる答えになることを固定する。
 //! 状態の待ちは `wait_until`（状態で待つ。実時間の比較を持ち込まない = `.agent/conventions.md`）。
+//!
+//! 読み込みの終わりはテストが決め（偽サーバの `--loading-until`）、読み込み中のサーバへ送る要求は
+//! manager が読み込み中と知ってから送る（偽サーバは知らせを `READY_POLL` より遅らせて送る =
+//! 待たずに送れば必ず落ちる順序をどの機でも演じる）。どちらも `common/lsp_fake_e2e.rs`（#1922）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +42,11 @@ use tako_core::lsp::completion::Trigger;
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
+
+#[path = "common/lsp_fake_e2e.rs"]
+mod lsp_fake_e2e;
+
+use lsp_fake_e2e::LoadingGate;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
@@ -71,6 +80,11 @@ impl Scratch {
     fn rules(&self) -> PathBuf {
         self.0.join("completion.json")
     }
+
+    /// 読み込みを終わらせる合図（作るまで読み込みは終わらない）
+    fn gate(&self) -> LoadingGate {
+        LoadingGate::new(&self.0)
+    }
 }
 
 impl Drop for Scratch {
@@ -79,19 +93,19 @@ impl Drop for Scratch {
     }
 }
 
-/// `loading` シナリオの偽サーバ（読み込みは `loading_ms`）
-fn config(scratch: &Scratch, loading_ms: u64, rules: &Value) -> LspConfig {
+/// `loading` シナリオの偽サーバ（読み込みは `scratch.gate()` を終わらせるまで続く）
+fn config(scratch: &Scratch, rules: &Value) -> LspConfig {
     std::fs::write(scratch.rules(), rules.to_string()).unwrap();
-    let args = vec![
+    let mut args = vec![
         "--scenario".to_string(),
         "loading".to_string(),
-        "--loading-ms".to_string(),
-        loading_ms.to_string(),
         "--log".to_string(),
         scratch.log().display().to_string(),
         "--completion".to_string(),
         scratch.rules().display().to_string(),
     ];
+    args.extend(scratch.gate().args());
+    args.extend(lsp_fake_e2e::status_delay_args());
     LspConfig {
         table: servers::SERVERS,
         launcher: Arc::new(move |_spec: &ServerSpec| Launch::Found {
@@ -165,11 +179,19 @@ fn rules() -> Value {
 fn 読み込みの前半に出した打鍵の要求も済むのを待って一覧を返す() {
     let scratch = Scratch::new("early");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, 1500, &rules()));
+    let manager = LspManager::new(config(&scratch, &rules()));
     let _link = open_editing(&manager, &main, TEXT);
-    let answer = manager
-        .completion(&request(&main, true, Duration::from_secs(10)))
-        .expect("答えが来る");
+    lsp_fake_e2e::wait_loading_known(&manager);
+    let asking = {
+        let (manager, main) = (manager.clone(), main.clone());
+        std::thread::spawn(move || {
+            manager.completion(&request(&main, true, Duration::from_secs(60)))
+        })
+    };
+    // 読み込み中の 1 回目（即座に null）が届いてから読み込みを終わらせる
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 1);
+    scratch.gate().finish();
+    let answer = asking.join().unwrap().expect("答えが来る");
     let asked = of_method(&scratch, "textDocument/completion").len();
     assert_eq!(
         answer.items.len(),
@@ -200,11 +222,20 @@ fn 読み込みの後半に待たされた要求は済んだ後の答えを返�
     let main = scratch.write("src/main.rs", TEXT);
     let mut rules = rules();
     rules["hold_while_loading"] = json!(true);
-    let manager = LspManager::new(config(&scratch, 1500, &rules));
+    let manager = LspManager::new(config(&scratch, &rules));
     let _link = open_editing(&manager, &main, TEXT);
-    let answer = manager
-        .completion(&request(&main, true, Duration::from_secs(10)))
-        .expect("答えが来る");
+    // 送る前に manager が読み込み中と知っている（知らずに送ると待ったことが答えに載らない = #1922）
+    lsp_fake_e2e::wait_loading_known(&manager);
+    let asking = {
+        let (manager, main) = (manager.clone(), main.clone());
+        std::thread::spawn(move || {
+            manager.completion(&request(&main, true, Duration::from_secs(60)))
+        })
+    };
+    // 待たされた要求が届いてから読み込みを終わらせる（先に終わると待たされない）
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 1);
+    scratch.gate().finish();
+    let answer = asking.join().unwrap().expect("答えが来る");
     assert_eq!(answer.items.len(), 2);
     assert_eq!(
         of_method(&scratch, "textDocument/completion").len(),
@@ -221,27 +252,36 @@ fn 読み込みの後半に待たされた要求は済んだ後の答えを返�
 fn 読み込みを待つあいだに次の打鍵が来たら前の待ちは抜ける() {
     let scratch = Scratch::new("supersede");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, 2500, &rules()));
+    let manager = LspManager::new(config(&scratch, &rules()));
     let _link = open_editing(&manager, &main, TEXT);
+    lsp_fake_e2e::wait_loading_known(&manager);
     let first = {
         let (manager, main) = (manager.clone(), main.clone());
         std::thread::spawn(move || {
-            let outcome = manager.completion(&request(&main, true, Duration::from_secs(10)));
+            let outcome = manager.completion(&request(&main, true, Duration::from_secs(60)));
             (outcome, manager.server_loading(&main))
         })
     };
     // 状態で待つ: 1 本目が null を受けて読み込みの待ちへ入った（= 問い合わせが 1 回届いた）
-    wait_until("1 本目の completion", Duration::from_secs(10), || {
-        !of_method(&scratch, "textDocument/completion").is_empty()
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 1);
     assert!(manager.server_loading(&main), "読み込み中と分かる");
-    let second = manager.completion(&request(&main, true, Duration::from_secs(10)));
+    let second = {
+        let (manager, main) = (manager.clone(), main.clone());
+        std::thread::spawn(move || {
+            manager.completion(&request(&main, true, Duration::from_secs(60)))
+        })
+    };
+    // 読み込みはまだ終わらせていない = 前の要求が抜けたのは読み込みが済んだからではない
     let (first, loading_when_first_returned) = first.join().unwrap();
     assert_eq!(first, Err(CompletionError::Superseded));
     assert!(
         loading_when_first_returned,
         "前の要求は読み込みが済む前に抜けている（済むまで残っていない）"
     );
+    // 後の要求の 1 回目（即座に null）が届いてから読み込みを終わらせる
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 2);
+    scratch.gate().finish();
+    let second = second.join().unwrap();
     assert_eq!(second.expect("後の要求は答えを受ける").items.len(), 2);
     manager.shutdown_all(Duration::from_secs(2));
 }
@@ -252,8 +292,9 @@ fn 読み込みを待つあいだに次の打鍵が来たら前の待ちは抜�
 fn 読み込みを待つあいだに閉じたら待ちを抜ける() {
     let scratch = Scratch::new("close");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, 600_000, &rules()));
+    let manager = LspManager::new(config(&scratch, &rules()));
     let mut link = open_editing(&manager, &main, TEXT);
+    lsp_fake_e2e::wait_loading_known(&manager);
     // 一覧を閉じた
     let waiting = {
         let (manager, main) = (manager.clone(), main.clone());
@@ -261,9 +302,7 @@ fn 読み込みを待つあいだに閉じたら待ちを抜ける() {
             manager.completion(&request(&main, true, Duration::from_secs(60)))
         })
     };
-    wait_until("1 本目の completion", Duration::from_secs(10), || {
-        !of_method(&scratch, "textDocument/completion").is_empty()
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 1);
     manager.cancel_completion();
     assert_eq!(waiting.join().unwrap(), Err(CompletionError::Superseded));
     // 文書を閉じた（編集モードを抜けた・ペインを閉じた）
@@ -273,9 +312,7 @@ fn 読み込みを待つあいだに閉じたら待ちを抜ける() {
             manager.completion(&request(&main, true, Duration::from_secs(60)))
         })
     };
-    wait_until("2 本目の completion", Duration::from_secs(10), || {
-        of_method(&scratch, "textDocument/completion").len() >= 2
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 2);
     manager.sync(&mut link, false, &main, TEXT, 2);
     let closed = waiting.join().unwrap();
     assert!(
@@ -294,8 +331,10 @@ fn 読み込みを待つあいだに閉じたら待ちを抜ける() {
 fn 読み込みが終わらなければ上限で_loading_を返す() {
     let scratch = Scratch::new("never");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, 600_000, &rules()));
+    let manager = LspManager::new(config(&scratch, &rules()));
     let _link = open_editing(&manager, &main, TEXT);
+    // 上限の 2 秒は起動の後の待ちだけで測る（起動ごと測ると遅い機で起動の未応答になる = #1922）
+    lsp_fake_e2e::wait_loading_known(&manager);
     for superseding in [false, true] {
         let outcome = manager.completion(&request(&main, superseding, Duration::from_secs(2)));
         let Err(error) = outcome else {
@@ -316,8 +355,9 @@ fn 読み込みが終わらなければ上限で_loading_を返す() {
     let main = scratch.write("src/main.rs", TEXT);
     let mut rules = rules();
     rules["hold_while_loading"] = json!(true);
-    let held = LspManager::new(config(&scratch, 600_000, &rules));
+    let held = LspManager::new(config(&scratch, &rules));
     let _link = open_editing(&held, &main, TEXT);
+    lsp_fake_e2e::wait_loading_known(&held);
     let outcome = held.completion(&request(&main, false, Duration::from_secs(2)));
     assert!(
         matches!(outcome, Err(CompletionError::Loading { .. })),
@@ -333,9 +373,13 @@ fn 読み込みが終わらなければ上限で_loading_を返す() {
 fn 読み込みが済んだ後は待たずに答える() {
     let scratch = Scratch::new("settled");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, 300, &rules()));
+    let manager = LspManager::new(config(&scratch, &rules()));
     let _link = open_editing(&manager, &main, TEXT);
-    wait_until("読み込みが済む", Duration::from_secs(10), || {
+    // 読み込み中と知ってから終わらせる = この後の `loading: false` は「済んだと知らせた」
+    // （知らせが届かないまま握手の直後の猶予が明けた、と読み違えない）
+    lsp_fake_e2e::wait_loading_known(&manager);
+    scratch.gate().finish();
+    wait_until("読み込みが済む", Duration::from_secs(60), || {
         manager.status(None)["servers"][0]["loading"] == json!(false)
             && manager.status(None)["servers"][0]["state"] == json!("running")
     });

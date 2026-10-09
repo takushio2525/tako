@@ -21,7 +21,7 @@
 //! | `ask` | initialized の後に `workspace/configuration` を問い合わせる |
 //! | `die` | 起動直後に即死する（initialize を読まない） |
 //! | `no-goto` | 定義ジャンプの能力（`definitionProvider` 等）を申告しない（#1680） |
-//! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`）が済むまで定義ジャンプに空（`[]`）で、補完とホバーに `null` で答え（補完の規則・当たったホバーの規則が `hold_while_loading` なら答えずに済むまで待たせる）、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680 / #1869 / #1893） |
+//! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`。`--loading-until` を渡せばその合図まで = #1922）が済むまで定義ジャンプに空（`[]`）で、補完とホバーに `null` で答え（補完の規則・当たったホバーの規則が `hold_while_loading` なら答えずに済むまで待たせる）、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680 / #1869 / #1893） |
 //! | `full-sync` | `normal` と同じだが全文同期（`change: 1`）を申告する |
 //! | `no-format` | 整形の能力（`documentFormattingProvider` / `documentRangeFormattingProvider`）を申告しない（#1683） |
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
@@ -99,6 +99,20 @@
 //! `--doc-log <file>`（`TAKO_LSP_FAKE_DOC_LOG`）を渡すと、当てた後の全文（`fake_doc`）と
 //! `echo` で問われた位置の語（`fake_goto`）を 1 行 1 JSON で残す（`--log` とは別のファイル =
 //! 受けたメッセージの並びを数えるテストの添字をずらさない）。
+//!
+//! ## 読み込みの終わりと順序の注入（#1922）
+//!
+//! `--loading-until <file>`（`TAKO_LSP_FAKE_LOADING_UNTIL`）を渡すと、`loading` の読み込みは
+//! `--loading-ms` が過ぎたうえで**そのファイルができるまで**終わらない（テストが「要求が届いた」を
+//! 確かめてから作る = 読み込みの終わりを実時間で決めない）。
+//!
+//! 次の 2 つは CI の遅い機で入れ替わる順序を、どの機でも起こすための遅延:
+//!
+//! - `--start-delay-ms <ms>`（`TAKO_LSP_FAKE_START_DELAY_MS`）: 起動してから stdin を読み始めるまで
+//!   待つ（Windows のランナーで起動が上限の 1 秒を越えた形）
+//! - `--status-delay-ms <ms>`（`TAKO_LSP_FAKE_STATUS_DELAY_MS`）: `loading` が `initialized` を受けて
+//!   から `quiescent: false` を送るまで待つ（tako が知らせを受け取る前に要求を送った形）。
+//!   待つあいだは次のメッセージを読まないので、知らせ → didOpen の診断の順は変わらない
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -493,6 +507,17 @@ fn main() {
     let loading_ms: u64 = arg_or_env(&args, "--loading-ms", "TAKO_LSP_FAKE_LOADING_MS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(800);
+    // #1922: 読み込みを終わらせる合図のファイルと、順序を入れ替える遅延（冒頭の説明）
+    let loading_until = arg_or_env(&args, "--loading-until", "TAKO_LSP_FAKE_LOADING_UNTIL");
+    let delay_of = |flag: &str, env: &str| {
+        std::time::Duration::from_millis(
+            arg_or_env(&args, flag, env)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        )
+    };
+    let status_delay = delay_of("--status-delay-ms", "TAKO_LSP_FAKE_STATUS_DELAY_MS");
+    std::thread::sleep(delay_of("--start-delay-ms", "TAKO_LSP_FAKE_START_DELAY_MS"));
     // #1684: 申告する能力の組をそのまま差し替える（シナリオの能力は捨てる）
     let providers: Option<serde_json::Map<String, serde_json::Value>> =
         arg_or_env(&args, "--providers", "TAKO_LSP_FAKE_PROVIDERS")
@@ -594,14 +619,21 @@ fn main() {
             ("initialized", None) => match scenario.as_str() {
                 "crash" => std::process::exit(3),
                 "loading" => {
+                    std::thread::sleep(status_delay);
                     out.send(serde_json::json!({
                         "jsonrpc": "2.0",
                         "method": "experimental/serverStatus",
                         "params": { "health": "ok", "quiescent": false },
                     }));
-                    let (out, loaded) = (out.clone(), loaded.clone());
+                    let (out, loaded, until) = (out.clone(), loaded.clone(), loading_until.clone());
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(loading_ms));
+                        while until
+                            .as_deref()
+                            .is_some_and(|path| !std::path::Path::new(path).exists())
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
                         loaded.store(true, std::sync::atomic::Ordering::SeqCst);
                         out.send(serde_json::json!({
                             "jsonrpc": "2.0",
