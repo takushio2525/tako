@@ -2003,8 +2003,9 @@ pub struct SyntectHighlighter {
 
 impl SyntectHighlighter {
     fn new() -> Self {
-        // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 270+ 構文。#320）
-        let syntaxes = two_face::syntax::extra_newlines();
+        // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 270+ 構文。#320）。
+        // TS / TSX の正規表現だけ「当たらない行で VM を起こさない」等価形へ書き換えたもの（#1917）
+        let syntaxes = crate::syntax_prefilter::syntax_set();
         let mut themes = syntect::highlighting::ThemeSet::load_defaults().themes;
         let theme = themes
             .remove("base16-eighties.dark")

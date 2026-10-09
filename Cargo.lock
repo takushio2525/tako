@@ -6768,6 +6768,9 @@ checksum = "8bdb6fa0dfa67b38c1e66b7041ba9dcf23b99d8121907cd31c807a332f7a0bbb"
 name = "tako-app"
 version = "0.8.28"
 dependencies = [
+ "bincode",
+ "fancy-regex",
+ "flate2",
  "futures",
  "gpui",
  "gpui_platform",
@@ -6776,6 +6779,7 @@ dependencies = [
  "notify",
  "pulldown-cmark",
  "raw-window-handle",
+ "regex-syntax",
  "serde",
  "serde_json",
  "syntect",
