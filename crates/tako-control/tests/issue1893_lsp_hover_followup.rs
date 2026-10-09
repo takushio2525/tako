@@ -7,8 +7,11 @@
 //! - A/B（`TAKO_1893_LEGACY=1`）はマウスの要求が待たずに空で終わる（#1893 の前）
 //! - 右クリックメニューの「ホバー情報を表示」はサーバの申告（`hoverProvider`）があるときだけ
 //!
-//! 読み込みの再現は偽サーバの `loading` シナリオの遅延（`--loading-ms`）だけで行う（CPU を焼く
-//! 負荷は使わない）。env を読む A/B があるので、このファイルのテストは [`ENV_LOCK`] で 1 本ずつ走る。
+//! 読み込みの再現は偽サーバの `loading` シナリオだけで行う（CPU を焼く負荷は使わない）。読み込みの
+//! 終わりはテストが決め（`--loading-until`）、読み込み中のサーバへ送る要求は manager が読み込み中と
+//! 知ってから送る（偽サーバは知らせを `READY_POLL` より遅らせて送る = 待たずに送れば必ず落ちる
+//! 順序をどの機でも演じる）。どちらも `common/lsp_fake_e2e.rs`（#1922）。
+//! env を読む A/B があるので、このファイルのテストは [`ENV_LOCK`] で 1 本ずつ走る。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +28,11 @@ use tako_core::lsp::menu::items;
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
+
+#[path = "common/lsp_fake_e2e.rs"]
+mod lsp_fake_e2e;
+
+use lsp_fake_e2e::LoadingGate;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
@@ -67,6 +75,11 @@ impl Scratch {
     fn rules(&self) -> PathBuf {
         self.0.join("hover.json")
     }
+
+    /// `loading` の読み込みを終わらせる合図（作るまで読み込みは終わらない）
+    fn gate(&self) -> LoadingGate {
+        LoadingGate::new(&self.0)
+    }
 }
 
 impl Drop for Scratch {
@@ -75,19 +88,20 @@ impl Drop for Scratch {
     }
 }
 
-/// 偽サーバ（`scenario`。`loading` なら読み込みは `loading_ms`）。ホバーの規則は `rules`
-fn config(scratch: &Scratch, scenario: &str, loading_ms: u64, rules: &Value) -> LspConfig {
+/// 偽サーバ（`scenario`。`loading` なら読み込みは `scratch.gate()` を終わらせるまで続く）。
+/// ホバーの規則は `rules`
+fn config(scratch: &Scratch, scenario: &str, rules: &Value) -> LspConfig {
     std::fs::write(scratch.rules(), rules.to_string()).unwrap();
-    let args = vec![
+    let mut args = vec![
         "--scenario".to_string(),
         scenario.to_string(),
-        "--loading-ms".to_string(),
-        loading_ms.to_string(),
         "--log".to_string(),
         scratch.log().display().to_string(),
         "--hover".to_string(),
         scratch.rules().display().to_string(),
     ];
+    args.extend(scratch.gate().args());
+    args.extend(lsp_fake_e2e::status_delay_args());
     LspConfig {
         table: servers::SERVERS,
         launcher: Arc::new(move |_spec: &ServerSpec| Launch::Found {
@@ -115,17 +129,6 @@ fn of_method(scratch: &Scratch, method: &str) -> Vec<Value> {
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter(|m| m.get("method").and_then(Value::as_str) == Some(method))
         .collect()
-}
-
-fn wait_until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + limit;
-    while !done() {
-        assert!(
-            Instant::now() < deadline,
-            "{what} が {limit:?} 以内に起きなかった"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 const TEXT: &str = "fn main() { total }\n";
@@ -175,12 +178,18 @@ fn 読み込みの前半に乗せたマウスの要求も済むのを待って�
     let _env = serial();
     let scratch = Scratch::new("early");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, "loading", 1500, &rules(false)));
+    let manager = LspManager::new(config(&scratch, "loading", &rules(false)));
     let _link = open_editing(&manager, &main);
+    lsp_fake_e2e::wait_loading_known(&manager);
     let started = Instant::now();
-    let answer = manager
-        .hover(&mouse(&main, Duration::from_secs(10)))
-        .expect("答えが来る");
+    let asking = {
+        let (manager, main) = (manager.clone(), main.clone());
+        std::thread::spawn(move || manager.hover(&mouse(&main, Duration::from_secs(60))))
+    };
+    // 読み込み中の 1 回目（即座に null）が届いてから読み込みを終わらせる
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", 1);
+    scratch.gate().finish();
+    let answer = asking.join().unwrap().expect("答えが来る");
     let asked = of_method(&scratch, "textDocument/hover").len();
     let content = answer.content.expect("読み込みが済んでから問い直した本文");
     assert_eq!(content.value, "**total**");
@@ -211,11 +220,18 @@ fn 読み込みの後半に待たされたマウスの要求は済んだ後の�
     let _env = serial();
     let scratch = Scratch::new("hold");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, "loading", 1500, &rules(true)));
+    let manager = LspManager::new(config(&scratch, "loading", &rules(true)));
     let _link = open_editing(&manager, &main);
-    let answer = manager
-        .hover(&mouse(&main, Duration::from_secs(10)))
-        .expect("答えが来る");
+    // 送る前に manager が読み込み中と知っている（知らずに送ると待ったことが答えに載らない = #1922）
+    lsp_fake_e2e::wait_loading_known(&manager);
+    let asking = {
+        let (manager, main) = (manager.clone(), main.clone());
+        std::thread::spawn(move || manager.hover(&mouse(&main, Duration::from_secs(60))))
+    };
+    // 待たされた要求が届いてから読み込みを終わらせる（先に終わると待たされない）
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", 1);
+    scratch.gate().finish();
+    let answer = asking.join().unwrap().expect("答えが来る");
     assert_eq!(answer.content.expect("本文").value, "**total**");
     assert_eq!(of_method(&scratch, "textDocument/hover").len(), 1);
     assert!(answer.waited_for_loading.is_some());
@@ -229,8 +245,9 @@ fn 読み込みを待つあいだに乗せ直す_閉じると待ちを抜ける(
     let _env = serial();
     let scratch = Scratch::new("abandon");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, "loading", 600_000, &rules(false)));
+    let manager = LspManager::new(config(&scratch, "loading", &rules(false)));
     let mut link = open_editing(&manager, &main);
+    lsp_fake_e2e::wait_loading_known(&manager);
     // 上限は長く・読み込みは終わらせない: 待ちを抜けたことは答えの種類（`Superseded` / `Closed`。
     // 抜けなければ上限で `Loading`）で分かる（実時間は測らない）
     let spawn = |manager: &LspManager| {
@@ -239,23 +256,17 @@ fn 読み込みを待つあいだに乗せ直す_閉じると待ちを抜ける(
     };
     // 次のマウスの要求（別の語へ移った）
     let first = spawn(&manager);
-    wait_until("1 本目の hover", Duration::from_secs(10), || {
-        !of_method(&scratch, "textDocument/hover").is_empty()
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", 1);
     assert!(manager.server_loading(&main), "読み込み中と分かる");
     let second = spawn(&manager);
     assert_eq!(first.join().unwrap(), Err(HoverError::Superseded));
     // カードを閉じた / 語から外れた
-    wait_until("2 本目の hover", Duration::from_secs(10), || {
-        of_method(&scratch, "textDocument/hover").len() >= 2
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", 2);
     manager.cancel_hover();
     assert_eq!(second.join().unwrap(), Err(HoverError::Superseded));
     // 文書を閉じた（編集モードを抜けた・ペインを閉じた）
     let third = spawn(&manager);
-    wait_until("3 本目の hover", Duration::from_secs(10), || {
-        of_method(&scratch, "textDocument/hover").len() >= 3
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", 3);
     manager.sync(&mut link, false, &main, TEXT, 2);
     assert_eq!(
         third.join().unwrap(),
@@ -279,8 +290,10 @@ fn 先に取った番号は背景が走り出す前の取り消しで抜ける()
     let _env = serial();
     let scratch = Scratch::new("ticket");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, "loading", 600_000, &rules(false)));
+    let manager = LspManager::new(config(&scratch, "loading", &rules(false)));
     let _link = open_editing(&manager, &main);
+    // 上限の 3 秒は起動の後の待ちだけで測る（起動ごと測ると遅い機で起動の未応答になる = #1922）
+    lsp_fake_e2e::wait_loading_known(&manager);
     // UI: 番号を取って背景へ渡す前に、語から外れて取り消した
     let ticket = manager.reserve_hover();
     assert!(ticket.is_some());
@@ -312,8 +325,10 @@ fn 読み込みが終わらなければ上限で_loading_を返す() {
     for hold in [false, true] {
         let scratch = Scratch::new("never");
         let main = scratch.write("src/main.rs", TEXT);
-        let manager = LspManager::new(config(&scratch, "loading", 600_000, &rules(hold)));
+        let manager = LspManager::new(config(&scratch, "loading", &rules(hold)));
         let _link = open_editing(&manager, &main);
+        // 上限の 2 秒は起動の後の待ちだけで測る（起動ごと測ると遅い機で起動の未応答になる = #1922）
+        lsp_fake_e2e::wait_loading_known(&manager);
         for request in [
             mouse(&main, Duration::from_secs(2)),
             explicit(&main, Duration::from_secs(2)),
@@ -345,18 +360,24 @@ fn 旧挙動のマウスの要求は読み込みを待たずに空で終わる()
     let _env = serial();
     let scratch = Scratch::new("legacy");
     let main = scratch.write("src/main.rs", TEXT);
-    let manager = LspManager::new(config(&scratch, "loading", 3000, &rules(false)));
+    let manager = LspManager::new(config(&scratch, "loading", &rules(false)));
     let _link = open_editing(&manager, &main);
+    lsp_fake_e2e::wait_loading_known(&manager);
     std::env::set_var("TAKO_1893_LEGACY", "1");
     let legacy = manager.hover(&mouse(&main, Duration::from_secs(10)));
     std::env::remove_var("TAKO_1893_LEGACY");
     let legacy = legacy.expect("答えは来る");
     assert_eq!(legacy.content, None, "旧挙動は空で終わる（カードが出ない）");
     assert_eq!(of_method(&scratch, "textDocument/hover").len(), 1);
-    // 同じサーバの同じ読み込み中に、新しい挙動は待って本文を返す
-    let new = manager
-        .hover(&mouse(&main, Duration::from_secs(10)))
-        .expect("答えが来る");
+    // 同じサーバの同じ読み込み中に、新しい挙動は待って本文を返す（読み込みは 2 回目の要求が
+    // 届いてから終わらせる = 旧挙動の 1 回目は読み込み中に答えを受けている）
+    let new = {
+        let (manager, main) = (manager.clone(), main.clone());
+        std::thread::spawn(move || manager.hover(&mouse(&main, Duration::from_secs(60))))
+    };
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", 2);
+    scratch.gate().finish();
+    let new = new.join().unwrap().expect("答えが来る");
     assert_eq!(new.content.expect("本文").value, "**total**");
     manager.shutdown_all(Duration::from_secs(2));
 }
@@ -369,7 +390,7 @@ fn 右クリックメニューのホバーの項目は申告があるときだ�
     let ids = |scenario: &str| {
         let scratch = Scratch::new(scenario);
         let main = scratch.write("src/main.rs", TEXT);
-        let manager = LspManager::new(config(&scratch, scenario, 0, &json!([])));
+        let manager = LspManager::new(config(&scratch, scenario, &json!([])));
         let (_, capabilities) = manager
             .menu_capabilities(&MenuRequest {
                 path: main,

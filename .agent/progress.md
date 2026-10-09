@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-08（#1869: 整形を離れた箇所ごとの差分へ一本化・補完をサーバの読み込み中も出す）
-- 整形と補完の確定を `EditDelta::spans`（差分 1 件に離れた箇所を並べる）+ 書き換えの原始操作 `splice_text` の 1 本へ寄せた（`chained` は廃止）。真因の実測: rust-analyzer 1.95 は読み込みの前半に補完へ即 `null`、後半は答えずに待たせる。tako は打鍵の要求だけ待たずに 0 件で返していた → 打鍵も待って問い直し（次の打鍵・閉じるで抜ける）、GUI は「読み込み中」の 1 行、CLI / MCP は `waited_for_loading_ms` / `status: loading`、`tako lsp status` に `loading`（カタログ +117 B）
-- 実測: 10 万行の整形 → undo の履歴 2,600,298 B・深さ 2・undo 2 回ともバイト一致（旧 `TAKO_1869_LEGACY=1` は 17,399,988 B・深さ 1）・visual-test `completion-loading` 緑（旧で FAILED）・e2e 6 本・番犬の注入 9 通りを file:line で名指し・実の rust-analyzer は読み込み中に GUI で打っても 2.2 秒後に一覧（旧は 25 秒出ない）・整形も緑（`scripts/test-lsp-followup-1869.sh` 37 PASS）
-
 ## 2026-10-09（#1890: visual-test 節 large-file-decor が debug で必ず落ちる = 塗りの戻りを回数の窓で待っていたのを、走っている間だけ待つ状態待ちにした）
 - 真因: 読み取り表示 / 編集開始の全文の塗りを 3000 / 6000 回 × 10ms の窓で待ち、debug は 10 MB の 1 回の塗りが 418.8〜473.8 秒（窓は約 118 秒）。節が入った `deecfc9` の debug でも同じ箇所で落ちる = 実回帰ではない（release も CRLF で窓の 65%）。`wait_for_background_highlight`（`view_highlights_running` / `highlight_pending` の間だけ待ち、戻ったのに揃わなければ即偽）へ 2 節 4 か所を寄せた
 - 実測: `scripts/test-highlight-wait-1890.sh`（遅れ 150 秒の注入で緑・`TAKO_1890_LEGACY=view|seed` で名指しの FAILED・`drop` は上限前に Settled）・debug 単独で緑（30 分）・番犬 4 本（注入 7 通りを file:line で名指し）
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1874: テストの tmux の器の名前を残骸掃除が拾う接頭辞へ揃え、`-f /dev/null` で起こすようにした）
 - 名前 4 つ（`tako-coretest1857-` → `tako-coretest-1857-`・`ct1105-` → `tk-coretest-1105-`（tako で始めないのが #1105 の検査の中身なので `TEST_SOCKET_PREFIXES` を足した）・固定名 `tako-e2e-571` / `-577` に pid）と `-f` なしの起動 12 か所（tmux_e2e の 1 実装・dispatch 5・#1857 の keep・loc・scrollback_capture・remote_scrollback 2）。番犬 `issue1866_tmux_socket_name_watchdog.rs` に名前（定義まで辿る）と `-f` の 2 規則
 - 実測: 読まれたら器の名前を記録する `.tmux.conf` を置いた偽 HOME で、修正前は 24 回読まれ修正後 0。途中で kill -9 した #1857 / #1105 の器を修正前の `TmuxTestGuard` は拾わず修正後は回収。番犬の注入（修正前の 5 ファイル・名前・接頭辞の正本）を file:line で名指し
+
+## 2026-10-09（#1922: 偽の言語サーバを起こす LSP の e2e が Windows で間欠的に落ちるのを、読み込みの終わりと manager が知った状態で揃えて直した）
+- 真因 3 つを注入で確定: ①manager が `quiescent: false` を処理する前に送る（`READY_POLL` 1 周期。知らせ遅延 20ms 以上で 10/10・CI と同じ :214 / :221。Windows の probe では修正前 100 回中 10 回・10 回ともこの順序）②読み込みが要求より先に済む ③上限つきの要求を起動ごと測る（起動遅延 1.2 秒で 1680:329）。`tests/common/lsp_fake_e2e.rs`（`LoadingGate` = `--loading-until`・`wait_loading_known`・`wait_running`）へ 4 ファイルを寄せ、偽サーバは知らせを 50ms 遅らせて送る
+- 実測: Windows CI で 4 本（37 テスト）× 20 周・修正後の形 100 + 50 回・起動 2.2 秒遅延の注入がすべて緑。番犬 `issue1922_lsp_loading_wait_watchdog`（注入 11 通りを file:line で名指し）

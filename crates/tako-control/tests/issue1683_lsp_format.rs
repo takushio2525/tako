@@ -6,6 +6,9 @@
 //! 版が変わっていないか）は dispatch の単体（MockHost）が持つ。
 //!
 //! 文言は `tako_control::lsp::text` の定数から読んで比べる（理由文を直書きしない）。
+//!
+//! 上限つきの要求で起動の後の経路を見るときは起動済みを待ってから測る
+//! （`common/lsp_fake_e2e.rs`。#1922）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +25,9 @@ use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
 use tako_core::text_edit::{IndentUnit, TextBuffer};
+
+#[path = "common/lsp_fake_e2e.rs"]
+mod lsp_fake_e2e;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
@@ -432,6 +438,11 @@ fn 未応答とエラーと落ちたと未導入を区別する() {
     let scratch = Scratch::new("silent");
     let path = scratch.write("src/main.rs", UNFORMATTED);
     let manager = LspManager::new(config(&scratch, "normal", &json!([{ "silent": true }])));
+    // 上限の 2 秒は起動の後の待ちだけで測る（起動ごと 2 秒で測ると、遅い機では起動が上限を越えて
+    // `starting: true` になる = #1922 の Windows ランナー）
+    let mut link = DocLink::default();
+    manager.sync(&mut link, true, &path, UNFORMATTED, 1);
+    lsp_fake_e2e::wait_running(&manager);
     let mut req = request(&path, UNFORMATTED, None);
     req.timeout = Duration::from_secs(2);
     // 上限で解けたことは「どの経路で抜けたか」（応答待ちの打ち切り = starting: false）で見る
@@ -444,6 +455,7 @@ fn 未応答とエラーと落ちたと未導入を区別する() {
             starting: false
         }))
     );
+    drop(link);
     manager.shutdown_all(Duration::from_secs(2));
 
     let scratch = Scratch::new("error");
