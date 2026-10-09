@@ -700,6 +700,8 @@ struct PromptFlow {
     /// 起動コマンド待ちで保留を始めた時刻（#1259）。保留のあいだ `created_at` を
     /// 現在時刻へ戻すので、総合タイムアウトの代わりにこちらで上限をかける
     hold_started_at: Option<std::time::Instant>,
+    /// 入力欄を描けない短いペインで、peer 送達を次に試し直す時刻（#1940）
+    peer_retry_at: Option<std::time::Instant>,
 }
 
 /// peer 送達の背景試行と UI スレッドの受け渡し口（#790 + #1259）。
@@ -752,6 +754,41 @@ enum PeerAttemptResult {
     Refused { note: String },
 }
 
+/// 起動コマンドで立てたエージェントがもう終わったか（#1940）。終わっていれば
+/// `Some(終了コード)`（コードの無い終了の印は `Some(None)`）。
+///
+/// 判断は**シェル統合の印**（OSC 133）だけで行う: 起動コマンドを送った時点より後に
+/// コマンド終了の印（133;D）が来た = 起動コマンドの行が終わってシェルへ戻った。
+/// その後に別のコマンドが走っている（実行中の印のまま = 手で起動し直した等）なら
+/// 問わない。統合が効いていないペインは印が来ないので常に None（従来どおり待つ）。
+///
+/// **alt screen は見ない**: tmux の器のペインでは、外側の端末から見ると tmux クライアント
+/// 自身が alt screen を使うので常に真になる（隔離 GUI で実測。シェルのプロンプトに
+/// 戻っていても `alt_screen: true`）
+fn launched_agent_exit(
+    baseline: Option<&tako_core::shell_send::ShellMarks>,
+    session: &TerminalSession,
+) -> Option<Option<i32>> {
+    let base = baseline?;
+    let marks = session.shell_marks();
+    if marks.finished <= base.finished
+        || session.command_state() == tako_core::terminal::CommandState::Running
+    {
+        return None;
+    }
+    Some(marks.last_exit)
+}
+
+/// エージェント TUI が入力欄を描けない行数（#1940）。これ未満のペインで入力欄が
+/// 見えないときは、貼り付け（キー操作）を諦めて peer 送達だけを試し続ける。
+/// claude 2.1.294 は 2 行で空白、3 行でステータス 1 行だけになるのを本番で実測した。
+/// 入力欄は枠を含めて 3 行 + フッターが要るので、余裕を見てこの値にする
+const SHORT_PANE_ROWS: usize = 8;
+
+/// 短いペインで peer 送達を試し直す間隔（#1940。宛先の解決は `ps` / `tmux` を叩くので
+/// tick ごとには撃たない）
+const PEER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 一時的な不成立（起動途中で受信箱がまだ無い）を待つ猶予。
 /// claude の受信箱 bind は入力欄表示とほぼ同時（実測 1.1 秒）だが、負荷が高いと遅れる。
 /// 猶予を過ぎたら従来経路へ落ちる（待ち続けて送達が遅れる方が悪い）
@@ -793,6 +830,7 @@ impl PromptFlow {
             stall: None,
             journal: tako_core::prompt_delivery::Journal::default(),
             hold_started_at: None,
+            peer_retry_at: None,
         }
     }
 
@@ -1914,6 +1952,10 @@ struct TakoApp {
         HashMap<PaneId, (tako_core::prompt_delivery::Status, std::time::Instant)>,
     /// 新規ペインの素のシェルへ起動コマンドを送り届けるステートマシン（Issue #640）
     command_flows: Vec<ShellCommandFlow>,
+    /// 起動コマンドを送り終えた時点のシェル統合の印（Issue #1940）。この後に
+    /// コマンド終了の印（OSC 133;D）が来たら、起動したエージェントがすぐ終わった
+    /// = 起動失敗。TUI の起動を待つ送達フローがこれを見て、待たずに理由つきで決着する
+    launch_baselines: HashMap<PaneId, tako_core::shell_send::ShellMarks>,
     /// エージェント CLI の建て直し待ち（#1067）。落ちたら resume を command_flows へ積む
     agent_relaunches: Vec<AgentRelaunch>,
     /// #572: claude のメッセージキューに滞留した指示の救出状態（ペインごと）
@@ -4164,6 +4206,7 @@ impl TakoApp {
             prompt_flows: Vec::new(),
             prompt_delivery_states: HashMap::new(),
             command_flows: Vec::new(),
+            launch_baselines: HashMap::new(),
             agent_relaunches: Vec::new(),
             queued_recovery: std::collections::HashMap::new(),
             pending_highlights: Vec::new(),
@@ -7411,6 +7454,9 @@ impl TakoApp {
     /// worker が素のプロンプトのまま何時間も止まる
     fn drive_command_flows(&mut self) {
         let mut remaining = Vec::new();
+        // #1940: 送り終えたペインの「送った時点の印」（ループの後で反映する。
+        // `self.terminals` を借りている間は他のフィールドを書き換えられない）
+        let mut launched: Vec<(PaneId, tako_core::shell_send::ShellMarks)> = Vec::new();
         // 同一ペインへ複数フローが重なると本文と Enter が混線するため、先行フローが
         // 完了するまで後続は待たせる（Vec の順序 = 送信順。`drive_prompt_flows` と同型）。
         // #1006 で「ssh の行 → 接続後の cd」を同じペインへ 2 本積むようになった
@@ -7436,6 +7482,13 @@ impl TakoApp {
                     entry.flow.rewrites(),
                     entry.flow.command_len()
                 ));
+                // #1940: spawn は成功を返しているので、ここで黙ると worker が黙って止まる。
+                // worker のペインなら `workers` の `launch` に理由つきで出す
+                Self::report_launch_failure(
+                    entry.pane,
+                    tako_control::orchestrator::registry::LaunchFailure::CommandFlowTimeout,
+                    None,
+                );
                 continue;
             }
             // セッションがまだ起動していない / 既に閉じた場合は次 tick へ持ち越す
@@ -7445,7 +7498,16 @@ impl TakoApp {
                 continue;
             };
             let before = entry.flow.stage_name();
-            match entry.flow.tick(&session.visible_lines()) {
+            // #1940: 画面に加えて寸法とシェル統合の印を渡す（畳まれた入力行でも
+            // 実行を状態で確かめるため）
+            let screen = session.visible_lines();
+            let observed = tako_core::shell_send::ShellObservation {
+                screen: &screen,
+                cols: session.size().0,
+                marks: session.shell_marks(),
+                marks_expected: tako_core::terminal::shell_marks_seen(),
+            };
+            match entry.flow.observe(&observed) {
                 tako_core::shell_send::ShellSendAction::Wait => {}
                 tako_core::shell_send::ShellSendAction::Write(bytes) => session.write(bytes),
                 tako_core::shell_send::ShellSendAction::Done { verified } => {
@@ -7453,12 +7515,26 @@ impl TakoApp {
                         // 確認できないまま従来どおり書き切った経路。あとで
                         // 「なぜ動かないのか」を追えるように痕跡だけ残す
                         tako_control::diag::perf_log(&format!(
-                            "起動コマンドの送達を確認できずに送信: pane={} 書き直し={} 長さ={}",
+                            "起動コマンドの送達を確認できずに送信: pane={} 書き直し={} 長さ={} 確かめ方={}",
                             entry.pane.as_u64(),
                             entry.flow.rewrites(),
-                            entry.flow.command_len()
+                            entry.flow.command_len(),
+                            entry.flow.confirmation().as_str()
                         ));
                     }
+                    tako_control::diag::flow_log(&format!(
+                        "起動コマンド送達: pane={} 完了（確かめ方 {}・書き直し {} 回）",
+                        entry.pane.as_u64(),
+                        entry.flow.confirmation().as_str(),
+                        entry.flow.rewrites()
+                    ));
+                    launched.push((
+                        entry.pane,
+                        entry
+                            .flow
+                            .submit_marks()
+                            .unwrap_or_else(|| session.shell_marks()),
+                    ));
                     continue;
                 }
             }
@@ -7476,6 +7552,36 @@ impl TakoApp {
             remaining.push(entry);
         }
         self.command_flows = remaining;
+        for (pane, marks) in launched {
+            self.launch_baselines.insert(pane, marks);
+        }
+        // 閉じたペインの基準は捨てる（同じ番号が別ペインへ再利用されても誤検知しない）
+        let terminals = &self.terminals;
+        self.launch_baselines
+            .retain(|pane, _| terminals.contains_key(pane));
+    }
+
+    /// 起動の失敗を worker レジストリと persist.log へ残す（Issue #1940）。
+    /// worker でないペイン（master の起動・手動のペイン）はレジストリ側が no-op
+    fn report_launch_failure(
+        pane: PaneId,
+        failure: tako_control::orchestrator::registry::LaunchFailure,
+        exit_code: Option<i32>,
+    ) {
+        tako_control::diag::persist_log(&format!(
+            "起動失敗: pane={} 理由={} 終了コード={}",
+            pane.as_u64(),
+            failure.as_str(),
+            exit_code.map_or_else(|| "-".to_string(), |c| c.to_string())
+        ));
+        let pane = pane.as_u64();
+        std::thread::spawn(move || {
+            if let Err(e) = tako_control::orchestrator::registry::record_launch_failure(
+                pane, failure, exit_code,
+            ) {
+                eprintln!("warning: worker レジストリへの起動失敗の記録に失敗: {e}");
+            }
+        });
     }
 
     /// claude TUI へのプロンプト送達フローを駆動する（Issue #32 送達確認ループ）。
@@ -7494,6 +7600,8 @@ impl TakoApp {
         // 触れないので、応答用の状態はここへ溜めてループの後で反映する
         // （`persist.log` への記録は自由関数なのでその場で書ける）
         let mut states: Vec<(PaneId, Status)> = Vec::new();
+        // #1940: 起動したエージェントがすぐ終わったペイン（ループの後で起動失敗として残す）
+        let mut exited: Vec<(PaneId, Option<i32>)> = Vec::new();
         for mut flow in std::mem::take(&mut self.prompt_flows) {
             // 起動コマンドがまだ届いていないペインでは、プロンプトを送り始めない（#640）。
             // WaitAltScreen は 15 秒で「未知の TUI」とみなして先へ進むので、
@@ -7635,6 +7743,38 @@ impl TakoApp {
                     )
                 })
             };
+            // #1940: 起動したエージェントがすぐ終わってシェルへ戻ったなら、TUI を待っても
+            // 来ない（旧実装は 120 秒の総合タイムアウトまで no_input_box で待ち、
+            // spawn は成功のまま worker が黙って止まっていた）。待たずに理由つきで決着し、
+            // 起動の失敗として `workers` へ出す
+            if flow.wait_tui
+                && !flow.enter_only
+                && matches!(
+                    flow.state,
+                    PromptFlowState::WaitAltScreen | PromptFlowState::WaitPromptReady
+                )
+                && !tako_core::shell_send::legacy_1940()
+            {
+                if let Some(exit_code) =
+                    launched_agent_exit(self.launch_baselines.get(&flow.pane), session)
+                {
+                    eprintln!(
+                        "warning: 起動したエージェントがすぐ終わった（pane={}）",
+                        flow.pane.as_u64()
+                    );
+                    let elapsed = flow.created_at.elapsed().as_secs() as u32;
+                    let code = Stall::AgentExited.code();
+                    flow.state = PromptFlowState::Done;
+                    Self::report_prompt_delivery(&flow, code);
+                    Self::finish_flow(
+                        &mut flow,
+                        Status::gave_up(code, Some(Stall::AgentExited), elapsed),
+                        &mut states,
+                    );
+                    exited.push((flow.pane, exit_code));
+                    continue;
+                }
+            }
             match flow.state {
                 PromptFlowState::WaitAltScreen => {
                     // agy 1.1.0 は inline モード（非 alt_screen）で動くため、alt_screen 遷移
@@ -7738,72 +7878,46 @@ impl TakoApp {
                         // 長文の取りこぼし（#530）・生成中のキュー誤認（#572）が起きない。
                         // 使えなければ従来経路（貼り付け + 分離 Enter + 空検証）へ落ちる
                         let elapsed = flow.created_at.elapsed().as_secs() as u32;
-                        match Self::drive_peer_attempt(&mut flow, peer_ctx.as_ref()) {
-                            // 次 tick で結果を見る（#1259: 何を待っているかは言う）
-                            PeerStep::Pending => flow.stall = Some(Stall::PeerPending),
-                            PeerStep::Sent { received } => {
-                                flow.state = PromptFlowState::Done;
-                                if received {
-                                    Self::report_prompt_delivery_ok(&flow);
-                                    Self::finish_flow(
-                                        &mut flow,
-                                        Status::delivered("peer", "delivered", elapsed),
-                                        &mut states,
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "warning: peer 送達の受信を確認できない（pane={}）",
-                                        flow.pane.as_u64()
-                                    );
-                                    // #1294: 顛末コードの綴りは正本（tako-core）から引く。
-                                    // 「書き切ったが受信を確認できない」= 届いた可能性が
-                                    // あるので、レジストリでも未達と断定させない
-                                    let reason = tako_core::prompt_delivery::PEER_UNCONFIRMED;
-                                    Self::report_prompt_delivery(&flow, reason);
-                                    Self::finish_flow(
-                                        &mut flow,
-                                        Status::delivered("peer", reason, elapsed),
-                                        &mut states,
-                                    );
-                                }
-                            }
-                            PeerStep::Refused { note } => {
-                                eprintln!("warning: {note}（pane={}）", flow.pane.as_u64());
-                                flow.state = PromptFlowState::Done;
-                                Self::report_prompt_delivery(&flow, "peer_refused");
-                                Self::finish_flow(
-                                    &mut flow,
-                                    Status::gave_up("peer_refused", None, elapsed),
-                                    &mut states,
+                        let step = Self::drive_peer_attempt(&mut flow, peer_ctx.as_ref());
+                        if let Some(reason) =
+                            Self::settle_peer_step(&mut flow, step, elapsed, &mut states)
+                        {
+                            if let Some((backend, _)) = peer_ctx.as_ref() {
+                                tako_control::delivery::log_fallback(
+                                    Some(flow.pane.as_u64()),
+                                    backend,
+                                    reason,
                                 );
                             }
-                            // #1259: 書き込みを始めた後に返らなくなった。キー経路へ
-                            // 落ちると二重投函になるので、未確認のまま決着させる
-                            PeerStep::StopUnconfirmed { reason } => {
-                                eprintln!(
-                                    "warning: peer 送達が返らない（pane={} 理由={reason}）",
-                                    flow.pane.as_u64()
-                                );
-                                flow.state = PromptFlowState::Done;
-                                Self::report_prompt_delivery(&flow, reason);
-                                Self::finish_flow(
-                                    &mut flow,
-                                    Status::gave_up(reason, Some(Stall::PeerSendStalled), elapsed),
-                                    &mut states,
-                                );
-                            }
-                            PeerStep::UseKeys { reason } => {
-                                if let Some((backend, _)) = peer_ctx.as_ref() {
-                                    tako_control::delivery::log_fallback(
-                                        Some(flow.pane.as_u64()),
-                                        backend,
-                                        reason,
-                                    );
-                                }
-                                Self::paste_prompt(&flow, session, &backend_for_flow);
-                                flow.state = PromptFlowState::WaitTextInInput;
-                                flow.state_entered_at = now;
-                                flow.stall = None;
+                            Self::paste_prompt(&flow, session, &backend_for_flow);
+                            flow.state = PromptFlowState::WaitTextInInput;
+                            flow.state_entered_at = now;
+                            flow.stall = None;
+                        }
+                    } else if flow.wait_tui
+                        && session.size().1 < SHORT_PANE_ROWS
+                        && !tako_core::shell_send::legacy_1940()
+                    {
+                        // #1940: ペインの行数が少なすぎて入力欄が描かれない（本番 10/9 は
+                        // 2〜3 行。claude は 2 行で空白・3 行でステータス 1 行だけ）。
+                        // 画面に頼る貼り付けは使えないが、peer 送達は画面に依らないので
+                        // それだけを間を置いて試し続ける（旧実装は no_input_box のまま
+                        // 120 秒待って諦め、worker が依頼文を受け取れず止まっていた）
+                        flow.unverified_reason = Some(Stall::PaneTooShort.code());
+                        flow.stall = Some(Stall::PaneTooShort);
+                        let due = flow.peer_retry_at.is_none_or(|at| now >= at);
+                        if due && peer_ctx.is_some() {
+                            let elapsed = flow.created_at.elapsed().as_secs() as u32;
+                            let step = Self::drive_peer_attempt(&mut flow, peer_ctx.as_ref());
+                            if Self::settle_peer_step(&mut flow, step, elapsed, &mut states)
+                                .is_some()
+                            {
+                                // キー操作へは落とせない（入力欄が無い）。試行を捨てて
+                                // 間を置いて試し直す（受信箱がまだ開いていない等）
+                                flow.peer_attempt = None;
+                                flow.peer_started_at = None;
+                                flow.peer_retry_at = Some(now + PEER_RETRY_INTERVAL);
+                                flow.stall = Some(Stall::PaneTooShort);
                             }
                         }
                     } else {
@@ -7954,6 +8068,15 @@ impl TakoApp {
             self.prompt_delivery_states
                 .insert(pane, (status, std::time::Instant::now()));
         }
+        for (pane, exit_code) in exited {
+            // 1 回の起動につき 1 回だけ記録する（基準を捨てる）
+            self.launch_baselines.remove(&pane);
+            Self::report_launch_failure(
+                pane,
+                tako_control::orchestrator::registry::LaunchFailure::AgentExited,
+                exit_code,
+            );
+        }
     }
 
     /// 送達フローの現況を `persist.log` と応答用の状態へ流す（Issue #1259）。
@@ -8077,6 +8200,69 @@ impl TakoApp {
             }
             Some(PeerAttemptResult::Refused { note }) => PeerStep::Refused { note },
         }
+    }
+
+    /// peer 送達の 1 tick ぶんの進みを決着させる（#790 / #1259。#1940 で切り出し）。
+    ///
+    /// 送り切った・断られた・書き込み後に返らない、はここで決着する。待っているなら
+    /// 理由だけ置く。**キー操作経路へ落ちてよいときだけ** `Some(理由)` を返す
+    /// （落とし方 = 貼り付けるか・試し直すか は呼び出し側が決める）
+    fn settle_peer_step(
+        flow: &mut PromptFlow,
+        step: PeerStep,
+        elapsed: u32,
+        states: &mut Vec<(PaneId, tako_core::prompt_delivery::Status)>,
+    ) -> Option<&'static str> {
+        use tako_core::prompt_delivery::{Stall, Status};
+        match step {
+            // 次 tick で結果を見る（#1259: 何を待っているかは言う）
+            PeerStep::Pending => flow.stall = Some(Stall::PeerPending),
+            PeerStep::Sent { received } => {
+                flow.state = PromptFlowState::Done;
+                if received {
+                    Self::report_prompt_delivery_ok(flow);
+                    Self::finish_flow(
+                        flow,
+                        Status::delivered("peer", "delivered", elapsed),
+                        states,
+                    );
+                } else {
+                    eprintln!(
+                        "warning: peer 送達の受信を確認できない（pane={}）",
+                        flow.pane.as_u64()
+                    );
+                    // #1294: 顛末コードの綴りは正本（tako-core）から引く。
+                    // 「書き切ったが受信を確認できない」= 届いた可能性が
+                    // あるので、レジストリでも未達と断定させない
+                    let reason = tako_core::prompt_delivery::PEER_UNCONFIRMED;
+                    Self::report_prompt_delivery(flow, reason);
+                    Self::finish_flow(flow, Status::delivered("peer", reason, elapsed), states);
+                }
+            }
+            PeerStep::Refused { note } => {
+                eprintln!("warning: {note}（pane={}）", flow.pane.as_u64());
+                flow.state = PromptFlowState::Done;
+                Self::report_prompt_delivery(flow, "peer_refused");
+                Self::finish_flow(flow, Status::gave_up("peer_refused", None, elapsed), states);
+            }
+            // #1259: 書き込みを始めた後に返らなくなった。キー経路へ
+            // 落ちると二重投函になるので、未確認のまま決着させる
+            PeerStep::StopUnconfirmed { reason } => {
+                eprintln!(
+                    "warning: peer 送達が返らない（pane={} 理由={reason}）",
+                    flow.pane.as_u64()
+                );
+                flow.state = PromptFlowState::Done;
+                Self::report_prompt_delivery(flow, reason);
+                Self::finish_flow(
+                    flow,
+                    Status::gave_up(reason, Some(Stall::PeerSendStalled), elapsed),
+                    states,
+                );
+            }
+            PeerStep::UseKeys { reason } => return Some(reason),
+        }
+        None
     }
 
     /// 返らない peer の背景試行をどうするか（Issue #1259）。

@@ -563,6 +563,23 @@ persist.log / ペインログを文字列一致で突き合わせられる（正
 値で分岐する消費側は無いので移行は行わない。**PTY 死亡（`exit`）ではここを倒さない**
 ——「ペインが消えても worker は生きている」追跡を維持するため（#390）。
 
+**起動の成否（`launch`。#1940）**: spawn は起動コマンドを積んで即返るので、起動の失敗は
+`workers` で初めて見える。`launch` = `failed`（`launch_failure` に理由）/ `started`
+（会話を検出した・依頼文の到達を確認した）/ `pending`。`launch_failure` は
+`agent_exited`（起動コマンドは実行されたがエージェントがすぐ終わってシェルへ戻った。
+`launch_exit_code` にシェルが報告した終了コード）/ `command_flow_timeout`（起動コマンドを
+送り届けられなかった）。判定はシェル統合の印（OSC 133;C / D）なので、統合が効かない
+シェルでは `failed` にならず `pending` に留まる。起動に失敗した worker には `resend_command`
+を出さない（依頼文を送る相手が居ない。次の一手は spawn のやり直し）。`worker_status` も同じ
+`launch_failure` / `launch_exit_code` を返し、再送の引き金（`prompt_undelivered`）は出さない
+（出すと supervisor の自動再送が依頼文を**シェルへ**打ち込む）。
+
+**`prompt_delivery=delivered` の根拠（#1940）**: 送達フローが**到達を確かめたときだけ**
+（貼り付けが入力欄へ反映され送信後に空へ戻った / peer 送達の受信を transcript で確認した）。
+会話の検出（`session_id`。`claude agents --json` は依頼文が届く前の起動直後に返す）は
+「起動した」証拠に留め、猶予内は `pending`・猶予後も到達の記録が無ければ `unverified`。
+旧実装は会話の検出で `delivered` を返し、送達フローが諦めた後に `undelivered` へ反転していた。
+
 GC は `workers` の列挙のついでに走る（別コマンドは要らない）。**1 回の観測では倒さない**
 ——器の列挙が一時的に失敗した・アプリ再起動直後でペインがまだ揃っていない、といった
 過渡状態で生きている worker を落とさないため、`dead_since` を刻んでから確認期間を待つ。

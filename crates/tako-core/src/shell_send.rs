@@ -43,6 +43,25 @@
 //! 再送のたびに Ctrl+C を打つのは、本文がまだ実行されていない `WaitEcho` の間だけ。
 //! この経路は**新規に作ったペイン**の起動コマンド専用で、そこでは Ctrl+C は
 //! 「入力行を捨てる」以上のことをしない（PSReadLine も POSIX シェルも同じ）。
+//!
+//! # 全文を画面に出せない寸法（#1940）
+//!
+//! 全文一致は「入力行の全文が画面に出る」ことを前提にしている。本番（10/9）で worker が
+//! 立たなかった 4 件は worker ペインが **2〜3 行**まで潰れていて、zsh は 2 行では入力行を
+//! 1 行の横スクロール（`<…`）、3 行では `>....` に畳むので、**全文が一度も画面に出ない**
+//! （実測）。旧実装はそこで書き直しを使い切り、最後に**消していない前の本文へ**
+//! 「本文 + Enter」を書き足していた = `…--permission-mode auto` + `export …` が
+//! `autoexport` に化け、起動先が化けた引数と正しい引数で 2 回起動した（実測）。
+//!
+//! 直し方は 2 つ:
+//!
+//! 1. 寸法から**全文を出せないと分かるとき**は書き直さない（何度書いても一致しない）。
+//!    書いた本文の反映が落ち着くのを待ってから Enter を 1 回だけ送り、実行は
+//!    シェル統合の印（OSC 133;C = preexec）の回数で確かめる（画面に依らない状態の観測）
+//! 2. 書き直しを使い切った後の書き切りは、**必ず Ctrl+C で行を捨ててから**書く
+//!    （同じ入力を消さずに 2 回打たない）
+//!
+//! 旧挙動は同じバイナリで `TAKO_1940_LEGACY=1`（[`legacy_1940`]）。
 
 /// tick の間隔（呼び出し側と共有する前提値。ミリ秒）
 pub const TICK_MS: u64 = 500;
@@ -51,6 +70,13 @@ pub const TICK_MS: u64 = 500;
 const READY_SETTLE_TICKS: u32 = 1;
 /// シェルの起動を待つ上限 tick 数（超えたら待たずに書く = 従来動作へ落ちる）
 const READY_MAX_TICKS: u32 = 60;
+/// 最初のプロンプトの印（OSC 133;A）を待つ上限 tick 数（#1940）。
+///
+/// direnv 等の precmd の後に印が出るので、印を待てば「シェルの起動フックが終わった
+/// プロンプト」で書ける（フックの最中に書くと、kernel のエコーと先行入力になり、
+/// 画面の変化を実行と取り違える = 準備 40 秒の direnv で実測）。印を出さない環境で
+/// spawn が毎回遅れないよう上限で従来の据え置き判定へ落ちる
+const READY_MARK_MAX_TICKS: u32 = 30;
 /// エコーが**まったく進まなくなった**とみなす連続 tick 数。
 ///
 /// 経過時間で打ち切ってはいけない。負荷が高いと器はエコーを 1 秒あたり数文字しか
@@ -77,6 +103,14 @@ const RECOVER_SETTLE_TICKS: u32 = 2;
 const RECOVER_MAX_TICKS: u32 = 20;
 /// Enter を送ってから画面の変化を待つ tick 数
 const SUBMIT_WAIT_TICKS: u32 = 6;
+/// 起動フックの最中に Enter した（= 先行入力になった）とき、実行の印を待つ上限 tick 数
+/// （#1940）。direnv 等が終わって最初のプロンプトが出れば、先行入力はそこで実行される
+/// （準備 40 秒の direnv で実測）。上限を過ぎたら確認できなかったとして終える
+const TYPEAHEAD_MAX_TICKS: u32 = 140;
+/// 先行入力のあと最初のプロンプトの印が来てから、実行の印を待つ tick 数（#1940）。
+/// 2 つの印は同じ tick に届くとは限らない（プロンプトの描き直しが先に画面へ出て、
+/// 実行の印が次の tick に来る順序を実測）。待たないと画面の変化だけで決着してしまう
+const TYPEAHEAD_PROMPT_GRACE_TICKS: u32 = 4;
 /// Enter の再送回数の上限。
 ///
 /// 実機で「本文は全文正しく入ったのに Enter だけ落ちて実行されない」試行が出ている
@@ -88,6 +122,111 @@ const MAX_ENTER_RESENDS: u32 = 4;
 /// 行を捨てるキー。PSReadLine では `CopyOrCancelLine`、POSIX シェルでは SIGINT で
 /// どちらも「入力行を捨てて新しいプロンプト」になる
 const CTRL_C: u8 = 0x03;
+
+/// 入力行の全文を画面に出せる最小の行数（#1940）。
+///
+/// zsh は端末が 3 行未満だと入力行を 1 行の横スクロール（`<…`）で描く（2 行で実測）。
+/// 3 行以上でも、本文が「プロンプト行を除いた残り」に収まらなければ `>....` に畳む
+/// （3 行 × 63 桁で実測）ので、そちらは [`echo_unviewable`] が桁数から判断する
+const MIN_ECHO_ROWS: usize = 3;
+
+/// A/B 用の逃げ道（`TAKO_1940_LEGACY=1`）。#1940 の修正を切って**旧挙動を再現**する
+/// （寸法を見ずに書き直しを使い切り、消していない行へ本文 + Enter を書き足す）。
+/// 実測（`tests/issue1940_launch_e2e.rs`）と番犬の検出力の確認に使う
+pub fn legacy_1940() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1940_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// シェル統合（OSC 133）の印を受けた回数（#1940）。
+///
+/// 回数で持つのは「Enter を送った**後に**実行の印が来たか」を前後比較で見るため
+/// （状態だけだと、速く終わるコマンドの Running を tick の間に取りこぼす）。
+/// 統合が効いていないシェルではすべて 0 のまま = 画面の観測だけで判断する
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellMarks {
+    /// プロンプトの印（133;A）
+    pub prompts: u64,
+    /// コマンド実行の印（133;C = preexec）
+    pub executed: u64,
+    /// コマンド終了の印（133;D）
+    pub finished: u64,
+    /// 直近の 133;D の終了コード（コードの無い D は None）
+    pub last_exit: Option<i32>,
+}
+
+/// 1 tick ぶんの観測（#1940）
+#[derive(Debug, Clone, Copy)]
+pub struct ShellObservation<'a> {
+    /// ペインの可視行（行数 = ペインの行数）
+    pub screen: &'a [String],
+    /// ペインの桁数。0 = 不明（寸法による判断をしない）
+    pub cols: usize,
+    pub marks: ShellMarks,
+    /// このプロセスの別ペインでシェル統合の印を観測済みか
+    /// （[`crate::terminal::shell_marks_seen`]）。true なら、まだ印の無い新しいペインは
+    /// 最初のプロンプトの印を待ってから書く。印を出さない環境では false のまま = 待たない
+    pub marks_expected: bool,
+}
+
+impl<'a> ShellObservation<'a> {
+    /// 画面だけの観測（寸法・印を持たない呼び出し元 = 旧来の `tick` 用）
+    pub fn screen_only(screen: &'a [String]) -> Self {
+        Self {
+            screen,
+            cols: 0,
+            marks: ShellMarks::default(),
+            marks_expected: false,
+        }
+    }
+}
+
+/// どうやって送達を確かめたか（#1940。診断ログ用の安定した語彙）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmation {
+    /// 全文のエコーを見てから Enter し、実行を観測した（#640 の本来の経路）
+    Echo,
+    /// 全文を画面に出せない寸法だったので書き直さずに Enter し、実行の印で確かめた
+    FoldedByMark,
+    /// 全文を画面に出せない寸法で、実行の印も無い（画面の変化だけを見た = 中身は未確認）
+    FoldedUnverified,
+    /// 書き直しを使い切り、行を捨ててから書き切った（確認なし）
+    WriteThrough,
+    /// まだ決着していない / Enter が効いた気配が無いまま打ち切った
+    Unconfirmed,
+}
+
+impl Confirmation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Echo => "echo",
+            Self::FoldedByMark => "folded_mark",
+            Self::FoldedUnverified => "folded_unverified",
+            Self::WriteThrough => "write_through",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// 入力行の全文を画面に出せない寸法か（#1940）。
+///
+/// **出せないと確信できるときだけ true**（寸法が不明・ぎりぎりは false = 従来の
+/// 書き直しで確かめる側へ倒す）。幅は全角を 2 セルとして数える
+pub fn echo_unviewable(cols: usize, rows: usize, command: &str) -> bool {
+    if cols == 0 || rows == 0 {
+        return false;
+    }
+    let width: usize = command
+        .chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    rows < MIN_ECHO_ROWS || width > (rows - 1) * cols
+}
 
 /// 1 tick ぶんの指示
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +246,8 @@ enum Stage {
     Recovering,
     WaitEcho,
     WaitSubmitted,
+    /// 書き直しを使い切った後、書き切りの前に行を捨てている（#1940）
+    FinalClear,
     Done,
 }
 
@@ -139,10 +280,35 @@ pub struct ShellSendFlow {
     /// Enter を送った時点の画面（変化検出の基準）
     submit_baseline: Option<String>,
     verified: bool,
+    /// 本文を書いた時点の画面（#1940。全文を出せない寸法で「何か反映されたか」を見る）
+    write_screen: Option<String>,
+    /// Enter を送った時点のシェル統合の印（#1940。実行の印が増えたかの基準）
+    submit_marks: Option<ShellMarks>,
+    /// 全文を出せない寸法と判断して、書き直さずに Enter を送ったか（#1940）
+    folded: bool,
+    /// 最初のプロンプトの印より前に Enter した = 起動フックの最中の先行入力（#1940）。
+    /// このあいだの画面の変化は kernel のエコーで、実行の証拠にならない
+    typeahead: bool,
+    /// 先行入力のあと最初のプロンプトの印を見た tick（`ticks_in_stage` の値）
+    typeahead_prompt_at: Option<u32>,
+    /// どう確かめたか（#1940。診断ログと起動失敗の判定に渡す）
+    confirmation: Confirmation,
+    /// `TAKO_1940_LEGACY=1` の旧挙動か（構築時に決める = tick 中に腕が変わらない）
+    legacy: bool,
+    /// 最初のプロンプトの印を待つか（#1940）。最初の観測で決める: 印を観測済みの
+    /// プロセスで、**このペインにまだ印が 1 つも無い**（= 起動したてのシェル）ときだけ。
+    /// 同じペインへの 2 本目のフロー（ssh 接続後の `cd` 等。相手は印を出さない遠隔の
+    /// シェル）には掛けない
+    wait_prompt_mark: Option<bool>,
 }
 
 impl ShellSendFlow {
     pub fn new(command: impl Into<String>) -> Self {
+        Self::with_legacy(command, legacy_1940())
+    }
+
+    /// 腕を明示して作る（テストが env を触らずに新旧を比べる口）
+    pub fn with_legacy(command: impl Into<String>, legacy: bool) -> Self {
         let command = command.into().trim_end_matches(['\r', '\n']).to_string();
         Self {
             needle: squash(&command),
@@ -158,7 +324,27 @@ impl ShellSendFlow {
             echo_idle_ticks: 0,
             submit_baseline: None,
             verified: false,
+            write_screen: None,
+            submit_marks: None,
+            folded: false,
+            typeahead: false,
+            typeahead_prompt_at: None,
+            confirmation: Confirmation::Unconfirmed,
+            legacy,
+            wait_prompt_mark: None,
         }
+    }
+
+    /// どう確かめたか（#1940。決着前は `Unconfirmed`）
+    pub fn confirmation(&self) -> Confirmation {
+        self.confirmation
+    }
+
+    /// Enter を送った時点のシェル統合の印（#1940）。起動先がすぐ終わったか
+    /// （= 起動に失敗したか）を、呼び出し側が「この後に終了の印が来たか」で見る基準。
+    /// Enter を送っていなければ None
+    pub fn submit_marks(&self) -> Option<ShellMarks> {
+        self.submit_marks
     }
 
     /// 現在のステージ名（診断ログ用。本文は出さない）
@@ -168,6 +354,7 @@ impl ShellSendFlow {
             Stage::Recovering => "行クリア",
             Stage::WaitEcho => "エコー待ち",
             Stage::WaitSubmitted => "実行確認",
+            Stage::FinalClear => "書き切り前の行クリア",
             Stage::Done => "完了",
         }
     }
@@ -191,14 +378,23 @@ impl ShellSendFlow {
         self.rewrites
     }
 
-    /// 1 tick 進める。`screen` はペインの可視行
+    /// 1 tick 進める。`screen` はペインの可視行（寸法・シェル統合の印を持たない旧来の口）
     pub fn tick(&mut self, screen: &[String]) -> ShellSendAction {
+        self.observe(&ShellObservation::screen_only(screen))
+    }
+
+    /// 1 tick 進める（#1940）。画面に加えてペインの寸法とシェル統合の印を見る
+    pub fn observe(&mut self, obs: &ShellObservation) -> ShellSendAction {
         self.ticks_in_stage = self.ticks_in_stage.saturating_add(1);
+        let wait_mark = *self.wait_prompt_mark.get_or_insert(
+            !self.legacy && obs.marks_expected && obs.marks == ShellMarks::default(),
+        );
         match self.stage {
-            Stage::WaitReady => self.tick_ready(screen),
-            Stage::Recovering => self.tick_recovering(screen),
-            Stage::WaitEcho => self.tick_echo(screen),
-            Stage::WaitSubmitted => self.tick_submitted(screen),
+            Stage::WaitReady => self.tick_ready(obs.screen, wait_mark && obs.marks.prompts == 0),
+            Stage::Recovering => self.tick_recovering(obs.screen),
+            Stage::WaitEcho => self.tick_echo(obs),
+            Stage::WaitSubmitted => self.tick_submitted(obs),
+            Stage::FinalClear => self.tick_final_clear(obs.screen),
             Stage::Done => ShellSendAction::Done {
                 verified: self.verified,
             },
@@ -213,15 +409,29 @@ impl ShellSendFlow {
     /// 本文を書く。同時に「今そこに何個写っているか」を控えて、自分のエコーだけを
     /// 数えられるようにする
     fn write_command(&mut self, screen: &[String]) -> ShellSendAction {
-        self.echo_baseline_count = count_occurrences(&squash_screen(screen), &self.needle);
+        let now = squash_screen(screen);
+        self.echo_baseline_count = count_occurrences(&now, &self.needle);
+        self.write_screen = Some(now);
         self.last_echo_screen = None;
         self.echo_idle_ticks = 0;
         ShellSendAction::Write(self.command.clone().into_bytes())
     }
 
+    /// Enter を単独で送り、実行確認へ進む。基準（画面・印）はここで控える
+    fn submit(&mut self, now: String, marks: ShellMarks) -> ShellSendAction {
+        self.submit_baseline = Some(now);
+        self.submit_marks = Some(marks);
+        self.typeahead = self.wait_prompt_mark == Some(true) && marks.prompts == 0;
+        self.enter(Stage::WaitSubmitted);
+        // Enter は本文と分けて送る（#623: まとめて書くと「送信」と解釈されない
+        // 経路があり、分離した方がどの受け手でも素直に通る）
+        ShellSendAction::Write(vec![b'\r'])
+    }
+
     /// シェルが動き出したか。画面に何か出たうえで、内容が据え置きになるまで待つ。
-    /// **プロンプトの形は問わない**（シェルも OS も固定できないため）
-    fn tick_ready(&mut self, screen: &[String]) -> ShellSendAction {
+    /// **プロンプトの形は問わない**（シェルも OS も固定できないため）。
+    /// `awaiting_mark` = 最初のプロンプトの印をまだ待っている（#1940。上限つき）
+    fn tick_ready(&mut self, screen: &[String], awaiting_mark: bool) -> ShellSendAction {
         let now = squash_screen(screen);
         if !now.is_empty() {
             if self.last_screen.as_deref() == Some(now.as_str()) {
@@ -231,7 +441,10 @@ impl ShellSendFlow {
             }
         }
         self.last_screen = Some(now);
-        let settled = self.settled_ticks >= READY_SETTLE_TICKS;
+        // #1940: 起動フック（direnv 等）の最中は画面が据え置きでも準備ができていない。
+        // 印を待つペインでは印が来るまで（上限つきで）書かない
+        let settled = self.settled_ticks >= READY_SETTLE_TICKS
+            && (!awaiting_mark || self.ticks_in_stage >= READY_MARK_MAX_TICKS);
         // 何も出ないシェル（エコーしない・出力しない）でも従来どおり進むための上限
         if settled || self.ticks_in_stage >= READY_MAX_TICKS {
             self.enter(Stage::WaitEcho);
@@ -240,9 +453,9 @@ impl ShellSendFlow {
         ShellSendAction::Wait
     }
 
-    /// Ctrl+C を送った後。**行が消えきるのを待ってから**書き直す。
-    /// 消える前に書くと、遅れて届いた残りと混ざって余計に壊れる
-    fn tick_recovering(&mut self, screen: &[String]) -> ShellSendAction {
+    /// 画面が落ち着いたか（Ctrl+C の後に行が消えきったか）。据え置きの観測は
+    /// `last_echo_screen` / `echo_idle_ticks` を使い回す
+    fn line_cleared(&mut self, screen: &[String]) -> bool {
         let now = squash_screen(screen);
         if self.last_echo_screen.as_deref() == Some(now.as_str()) {
             self.echo_idle_ticks = self.echo_idle_ticks.saturating_add(1);
@@ -250,62 +463,141 @@ impl ShellSendFlow {
             self.echo_idle_ticks = 0;
             self.last_echo_screen = Some(now);
         }
-        if self.echo_idle_ticks < RECOVER_SETTLE_TICKS && self.ticks_in_stage < RECOVER_MAX_TICKS {
+        self.echo_idle_ticks >= RECOVER_SETTLE_TICKS || self.ticks_in_stage >= RECOVER_MAX_TICKS
+    }
+
+    /// Ctrl+C を送った後。**行が消えきるのを待ってから**書き直す。
+    /// 消える前に書くと、遅れて届いた残りと混ざって余計に壊れる
+    fn tick_recovering(&mut self, screen: &[String]) -> ShellSendAction {
+        if !self.line_cleared(screen) {
             return ShellSendAction::Wait;
         }
         self.enter(Stage::WaitEcho);
         self.write_command(screen)
     }
 
+    /// 書き直しを使い切った後（#1940）。**行を捨てきってから**本文 + Enter を書き切る。
+    /// 旧実装はここを飛ばして、最後に書き直した本文が残る行へ書き足していた
+    /// （`…auto` + `export …` = `autoexport` の化け）
+    fn tick_final_clear(&mut self, screen: &[String]) -> ShellSendAction {
+        if !self.line_cleared(screen) {
+            return ShellSendAction::Wait;
+        }
+        self.write_through()
+    }
+
+    /// 確認は諦めるが、**従来どおり本文 + Enter は書き切る**（#640 以前の動作が下限）。
+    /// ここで何も送らないと、確認できない環境で機能が丸ごと止まってしまう
+    fn write_through(&mut self) -> ShellSendAction {
+        self.stage = Stage::Done;
+        self.verified = false;
+        self.confirmation = Confirmation::WriteThrough;
+        let mut bytes = self.command.clone().into_bytes();
+        bytes.push(b'\r');
+        ShellSendAction::Write(bytes)
+    }
+
+    /// 行を捨てて撃ち直すか、使い切っていれば行を捨ててから書き切る
+    fn recover(&mut self) -> ShellSendAction {
+        // Ctrl+C の効きは改めて観測する（エコー待ちの据え置き観測を持ち込むと、
+        // 行が消える前に「落ち着いた」と判断してしまう）
+        self.last_echo_screen = None;
+        self.echo_idle_ticks = 0;
+        if self.rewrites >= MAX_REWRITES {
+            if self.legacy {
+                // 旧挙動（`TAKO_1940_LEGACY=1`）: 行を捨てずに書き足す
+                return self.write_through();
+            }
+            self.enter(Stage::FinalClear);
+            return ShellSendAction::Write(vec![CTRL_C]);
+        }
+        self.rewrites += 1;
+        self.enter(Stage::Recovering);
+        // 欠けた本文が入力行に残っている可能性があるので、書き直す前に必ず捨てる
+        ShellSendAction::Write(vec![CTRL_C])
+    }
+
     /// 書いた本文が画面に出たか。出たら Enter、出なければ Ctrl+C して書き直す
-    fn tick_echo(&mut self, screen: &[String]) -> ShellSendAction {
-        let now = squash_screen(screen);
+    fn tick_echo(&mut self, obs: &ShellObservation) -> ShellSendAction {
+        let now = squash_screen(obs.screen);
         // 「増えたか」で見る（画面に残る過去の失敗行を自分のエコーと誤認しないため）
         if self.needle.is_empty()
             || count_occurrences(&now, &self.needle) > self.echo_baseline_count
         {
             self.verified = true;
-            self.submit_baseline = Some(now);
-            self.enter(Stage::WaitSubmitted);
-            // Enter は本文と分けて送る（#623: まとめて書くと「送信」と解釈されない
-            // 経路があり、分離した方がどの受け手でも素直に通る）
-            return ShellSendAction::Write(vec![b'\r']);
+            self.confirmation = Confirmation::Echo;
+            return self.submit(now, obs.marks);
         }
         // まだ届いている最中か（画面が動いているうちは待つ）
         if self.last_echo_screen.as_deref() == Some(now.as_str()) {
             self.echo_idle_ticks = self.echo_idle_ticks.saturating_add(1);
         } else {
             self.echo_idle_ticks = 0;
-            self.last_echo_screen = Some(now);
+            self.last_echo_screen = Some(now.clone());
         }
         if self.echo_idle_ticks < ECHO_IDLE_TICKS && self.ticks_in_stage < ECHO_MAX_TICKS {
             return ShellSendAction::Wait;
         }
-        if self.rewrites >= MAX_REWRITES {
-            // 確認は諦めるが、**従来どおり本文 + Enter は書き切る**（#640 以前の動作が下限）。
-            // ここで何も送らないと、確認できない環境で機能が丸ごと止まってしまう
-            self.stage = Stage::Done;
-            self.verified = false;
-            let mut bytes = self.command.clone().into_bytes();
-            bytes.push(b'\r');
-            return ShellSendAction::Write(bytes);
+        // #1940: 全文を画面に出せない寸法では、何度書き直しても一致しない。書いた本文が
+        // 何か画面へ反映された（= シェルが受け取っている）なら、書き直さずに Enter を
+        // 1 回だけ送る。実行は印（OSC 133;C）で確かめる。何も反映されていない（全損）なら
+        // 消すものが無いので、従来どおり捨てて書き直してよい
+        let reflected = self.write_screen.as_deref() != Some(now.as_str());
+        if !self.legacy && reflected && echo_unviewable(obs.cols, obs.screen.len(), &self.command) {
+            self.folded = true;
+            return self.submit(now, obs.marks);
         }
-        self.rewrites += 1;
-        self.enter(Stage::Recovering);
-        // Ctrl+C の効きは改めて観測する（エコー待ちの据え置き観測を持ち込むと、
-        // 行が消える前に「落ち着いた」と判断してしまう）
-        self.last_echo_screen = None;
-        self.echo_idle_ticks = 0;
-        // 欠けた本文が入力行に残っている可能性があるので、書き直す前に必ず捨てる
-        ShellSendAction::Write(vec![CTRL_C])
+        self.recover()
     }
 
     /// Enter が効いたか。画面が動かなければ Enter を単独で撃ち直す
-    fn tick_submitted(&mut self, screen: &[String]) -> ShellSendAction {
-        let now = squash_screen(screen);
-        if self.submit_baseline.as_deref() != Some(now.as_str()) {
+    fn tick_submitted(&mut self, obs: &ShellObservation) -> ShellSendAction {
+        // #1940: シェル統合の実行の印（preexec）が Enter の後に増えた = 実行された。
+        // 画面の見え方（畳まれた入力行）に依らない
+        let executed = !self.legacy
+            && self
+                .submit_marks
+                .is_some_and(|base| obs.marks.executed > base.executed);
+        let now = squash_screen(obs.screen);
+        if self.typeahead && !executed {
+            if obs.marks.prompts == 0 {
+                // まだ起動フックの最中。画面の変化は kernel のエコーなので見ない。
+                // Enter も撃ち直さない（先行入力に余分な Enter が積もり、起動した
+                // エージェントの入力へ流れ込む）
+                if self.ticks_in_stage < TYPEAHEAD_MAX_TICKS {
+                    return ShellSendAction::Wait;
+                }
+                self.stage = Stage::Done;
+                self.verified = false;
+                self.confirmation = Confirmation::Unconfirmed;
+                return ShellSendAction::Done { verified: false };
+            }
+            // プロンプトが出た。先行入力はこの直後に実行される（印は少し遅れて届きうる）
+            let seen_at = *self.typeahead_prompt_at.get_or_insert(self.ticks_in_stage);
+            if self.ticks_in_stage.saturating_sub(seen_at) < TYPEAHEAD_PROMPT_GRACE_TICKS {
+                return ShellSendAction::Wait;
+            }
+            // プロンプトが出たのに実行の印が来ない = 先行入力が実行されなかった。
+            // ここからは通常の確かめ方（画面の変化・Enter の撃ち直し）へ戻る
+            self.typeahead = false;
+            self.submit_baseline = Some(now);
+            self.ticks_in_stage = 0;
+            return ShellSendAction::Wait;
+        }
+        if executed || self.submit_baseline.as_deref() != Some(now.as_str()) {
             self.stage = Stage::Done;
-            return ShellSendAction::Done { verified: true };
+            if self.folded {
+                // 中身は画面で確かめられていない。実行の印があれば「実行された」までは言える
+                self.verified = executed;
+                self.confirmation = if executed {
+                    Confirmation::FoldedByMark
+                } else {
+                    Confirmation::FoldedUnverified
+                };
+            }
+            return ShellSendAction::Done {
+                verified: self.verified,
+            };
         }
         if self.ticks_in_stage < SUBMIT_WAIT_TICKS {
             return ShellSendAction::Wait;
@@ -315,6 +607,7 @@ impl ShellSendFlow {
             // 「動かないのに成功と記録される」ので、確認できなかったこととして残す
             self.stage = Stage::Done;
             self.verified = false;
+            self.confirmation = Confirmation::Unconfirmed;
             return ShellSendAction::Done { verified: false };
         }
         self.enter_resends += 1;
@@ -624,6 +917,367 @@ mod tests {
             Some(CMD),
             "末尾の改行は落として本文だけ書く"
         );
+    }
+
+    // ---- #1940: 全文を画面に出せない寸法 / 書き切りの前の行クリア / 実行の印 ----
+
+    /// 本番（10/9）と同じ形の起動コマンド
+    const LAUNCH: &str =
+        "export CLAUDE_CONFIG_DIR='/tmp/x'; TAKO_ORCHESTRATOR_ROLE='worker:tako:l' \
+                          claude --model claude-opus-5-5 --effort xhigh --remote-control \
+                          --permission-mode auto";
+
+    fn obs<'a>(screen: &'a [String], cols: usize, marks: ShellMarks) -> ShellObservation<'a> {
+        ShellObservation {
+            screen,
+            cols,
+            marks,
+            marks_expected: false,
+        }
+    }
+
+    /// zsh が 2 行のペインで描く 1 行の横スクロール（`<` + 末尾）。全文は出ない
+    fn folded(tail_len: usize) -> Vec<String> {
+        let tail: String = LAUNCH
+            .chars()
+            .rev()
+            .take(tail_len)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        vec![
+            "direnv: export ~CLAUDE_CONFIG_DIR".into(),
+            format!("<{tail}"),
+        ]
+    }
+
+    fn two_rows_prompt() -> Vec<String> {
+        vec![
+            "direnv: export ~CLAUDE_CONFIG_DIR".into(),
+            "[test@host:work]$".into(),
+        ]
+    }
+
+    /// 1 試行ぶんの書き込みを全部集めて、**同じ本文を消さずに 2 回打っていない**ことを見る
+    /// （本文の書き込みの間には必ず Ctrl+C が挟まる）
+    fn assert_no_overlapping_writes(writes: &[Vec<u8>]) {
+        let mut pending_body = false;
+        for (i, w) in writes.iter().enumerate() {
+            if w.as_slice() == [CTRL_C] {
+                pending_body = false;
+            } else if w.starts_with(LAUNCH.as_bytes()) {
+                assert!(
+                    !pending_body,
+                    "{i} 回目の書き込みが、消していない本文へ本文を書き足している: {:?}",
+                    writes
+                        .iter()
+                        .map(|w| String::from_utf8_lossy(w)
+                            .chars()
+                            .take(12)
+                            .collect::<String>())
+                        .collect::<Vec<_>>()
+                );
+                pending_body = !w.ends_with(b"\r");
+            } else if w.as_slice() == b"\r" {
+                pending_body = false;
+            }
+        }
+    }
+
+    #[test]
+    fn 全文を出せない寸法の判定() {
+        let w = LAUNCH.chars().count();
+        assert!(
+            w > 125,
+            "前提: 本番の起動コマンドは 1 行に収まらない（{w} 桁）"
+        );
+        assert!(
+            echo_unviewable(125, 2, LAUNCH),
+            "2 行は zsh が 1 行表示に畳む"
+        );
+        assert!(
+            echo_unviewable(63, 3, LAUNCH),
+            "3 行 × 63 桁は `>....` に畳む"
+        );
+        assert!(!echo_unviewable(63, 30, LAUNCH), "行数が足りれば全文が出る");
+        assert!(!echo_unviewable(0, 2, LAUNCH), "寸法が不明なら判断しない");
+        assert!(!echo_unviewable(80, 0, LAUNCH), "寸法が不明なら判断しない");
+        // 全角は 2 セル。半角なら収まる幅でも、全角なら収まらない
+        assert!(!echo_unviewable(10, 3, "aaaaaaaaaaaaaaaaaaaa"));
+        assert!(echo_unviewable(10, 3, "ああああああああああああ"));
+    }
+
+    #[test]
+    fn 畳まれた入力行では書き直さずにenterを1回だけ送り実行の印で確かめる() {
+        let mut f = ShellSendFlow::with_legacy(LAUNCH, false);
+        let none = ShellMarks {
+            prompts: 1,
+            ..ShellMarks::default()
+        };
+        let p = two_rows_prompt();
+        f.observe(&obs(&p, 125, none));
+        let a = f.observe(&obs(&p, 125, none));
+        assert_eq!(
+            write_of(&a).as_deref(),
+            Some(LAUNCH),
+            "据え置き後に本文を書く"
+        );
+        // 反映されたが畳まれていて全文は出ない。落ち着くまでは待つ
+        let shown = folded(70);
+        let mut writes = vec![];
+        let mut enter_at = None;
+        for i in 0..(ECHO_MAX_TICKS + 5) {
+            match f.observe(&obs(&shown, 125, none)) {
+                ShellSendAction::Wait => {}
+                ShellSendAction::Write(b) => {
+                    writes.push(b.clone());
+                    if b == b"\r" {
+                        enter_at = Some(i);
+                        break;
+                    }
+                }
+                ShellSendAction::Done { .. } => panic!("Enter の前に終わった"),
+            }
+        }
+        assert_eq!(f.rewrites(), 0, "畳まれた寸法では書き直さない");
+        assert_eq!(
+            writes,
+            vec![b"\r".to_vec()],
+            "Ctrl+C を挟まず Enter を 1 回だけ送る"
+        );
+        assert!(
+            enter_at.unwrap() >= ECHO_IDLE_TICKS - 1,
+            "反映が落ち着くまで Enter を送らない"
+        );
+        // 画面は変わらないが、実行の印（preexec）が増えた = 実行された
+        let ran = ShellMarks {
+            prompts: 1,
+            executed: 1,
+            ..ShellMarks::default()
+        };
+        assert_eq!(
+            f.observe(&obs(&shown, 125, ran)),
+            ShellSendAction::Done { verified: true }
+        );
+        assert_eq!(f.confirmation(), Confirmation::FoldedByMark);
+    }
+
+    #[test]
+    fn 畳まれた入力行で印が無ければ画面の変化で決着し未確認として残す() {
+        let mut f = ShellSendFlow::with_legacy(LAUNCH, false);
+        let m = ShellMarks::default();
+        let p = two_rows_prompt();
+        f.observe(&obs(&p, 125, m));
+        f.observe(&obs(&p, 125, m));
+        let shown = folded(70);
+        let mut sent_enter = false;
+        for _ in 0..(ECHO_MAX_TICKS + 5) {
+            if let ShellSendAction::Write(b) = f.observe(&obs(&shown, 125, m)) {
+                assert_eq!(b, b"\r", "書き直さない");
+                sent_enter = true;
+                break;
+            }
+        }
+        assert!(sent_enter);
+        let after = vec!["<tail".into(), "FAKE-STARTED".into()];
+        assert_eq!(
+            f.observe(&obs(&after, 125, m)),
+            ShellSendAction::Done { verified: false },
+            "中身を確かめていないので verified にしない"
+        );
+        assert_eq!(f.confirmation(), Confirmation::FoldedUnverified);
+    }
+
+    #[test]
+    fn 畳まれた寸法でも1バイトも届いていなければ捨てて書き直す() {
+        // 全損（#640）は寸法に関係なく起きる。何も反映されていないなら消すものが無いので
+        // 書き直してよい（Enter だけ送っても空行が実行されるだけ）
+        let mut f = ShellSendFlow::with_legacy(LAUNCH, false);
+        let m = ShellMarks::default();
+        let p = two_rows_prompt();
+        f.observe(&obs(&p, 125, m));
+        f.observe(&obs(&p, 125, m));
+        let mut first = None;
+        for _ in 0..(ECHO_MAX_TICKS + 5) {
+            if let ShellSendAction::Write(b) = f.observe(&obs(&p, 125, m)) {
+                first = Some(b);
+                break;
+            }
+        }
+        assert_eq!(first, Some(vec![CTRL_C]), "まず行を捨てる");
+        assert_eq!(f.rewrites(), 1);
+    }
+
+    #[test]
+    fn 書き直しを使い切った後の書き切りは行を捨ててから書く() {
+        // #1940 の主症状: 最後に書き直した本文が残る行へ本文 + Enter を書き足し、
+        // `…auto` + `export …` = `autoexport` に化けた（実測）
+        for legacy in [false, true] {
+            let mut f = ShellSendFlow::with_legacy(LAUNCH, legacy);
+            let mut writes = vec![];
+            for _ in 0..1000 {
+                match f.tick(&prompt()) {
+                    ShellSendAction::Write(b) => writes.push(b),
+                    ShellSendAction::Done { .. } => break,
+                    ShellSendAction::Wait => {}
+                }
+            }
+            assert_eq!(f.rewrites(), MAX_REWRITES);
+            let last = writes.last().unwrap();
+            assert!(last.ends_with(b"\r") && last.starts_with(LAUNCH.as_bytes()));
+            let before_last = &writes[writes.len() - 2];
+            if legacy {
+                // 旧挙動（A/B の対照）: 書き直した本文を消さずに書き足す
+                assert!(
+                    before_last.starts_with(LAUNCH.as_bytes()),
+                    "旧挙動は行を捨てない"
+                );
+            } else {
+                assert_eq!(before_last, &vec![CTRL_C], "書き切りの直前に行を捨てる");
+                assert_no_overlapping_writes(&writes);
+                assert_eq!(f.confirmation(), Confirmation::WriteThrough);
+            }
+        }
+    }
+
+    #[test]
+    fn 旧挙動は畳まれた寸法でも書き直しを使い切る() {
+        // A/B の対照（`TAKO_1940_LEGACY=1`）が本当に旧挙動を再現していること
+        let mut f = ShellSendFlow::with_legacy(LAUNCH, true);
+        let m = ShellMarks::default();
+        let p = two_rows_prompt();
+        let shown = folded(70);
+        f.observe(&obs(&p, 125, m));
+        f.observe(&obs(&p, 125, m));
+        for _ in 0..1000 {
+            if matches!(
+                f.observe(&obs(&shown, 125, m)),
+                ShellSendAction::Done { .. }
+            ) {
+                break;
+            }
+        }
+        assert_eq!(f.rewrites(), MAX_REWRITES);
+    }
+
+    #[test]
+    fn 印を観測済みのプロセスでは新しいペインの最初のプロンプトの印を待ってから書く() {
+        let mut f = ShellSendFlow::with_legacy(LAUNCH, false);
+        let loading = vec!["direnv: loading ~/work/.envrc".into()];
+        let expect = |marks| ShellObservation {
+            screen: &loading,
+            cols: 63,
+            marks,
+            marks_expected: true,
+        };
+        // 画面は据え置きだが、起動フック（direnv）の最中 = 印がまだ無い
+        for _ in 0..(READY_MARK_MAX_TICKS - 1) {
+            assert_eq!(
+                f.observe(&expect(ShellMarks::default())),
+                ShellSendAction::Wait
+            );
+        }
+        let prompted = ShellMarks {
+            prompts: 1,
+            ..ShellMarks::default()
+        };
+        let a = f.observe(&expect(prompted));
+        assert_eq!(write_of(&a).as_deref(), Some(LAUNCH), "印が来たら書く");
+
+        // 上限: 印が来なくても READY_MARK_MAX_TICKS で従来の据え置き判定へ落ちる
+        let mut g = ShellSendFlow::with_legacy(LAUNCH, false);
+        let mut wrote_at = None;
+        for i in 0..=READY_MAX_TICKS {
+            if write_of(&g.observe(&expect(ShellMarks::default()))).is_some() {
+                wrote_at = Some(i);
+                break;
+            }
+        }
+        assert_eq!(
+            wrote_at,
+            Some(READY_MARK_MAX_TICKS - 1),
+            "上限で待つのをやめる"
+        );
+
+        // 印を観測していないプロセス（統合が効かない環境）では待たない
+        let mut h = ShellSendFlow::with_legacy(LAUNCH, false);
+        h.observe(&obs(&loading, 63, ShellMarks::default()));
+        assert!(write_of(&h.observe(&obs(&loading, 63, ShellMarks::default()))).is_some());
+    }
+
+    #[test]
+    fn 既に印のあるペインへの2本目のフローは印を待たない() {
+        // ssh 接続後の `cd`（#1006）は遠隔のシェルへ打つ。遠隔のシェルは印を出さないので
+        // 待つと毎回上限まで遅れる
+        let mut f = ShellSendFlow::with_legacy("cd /srv/app", false);
+        let local = ShellMarks {
+            prompts: 1,
+            executed: 1,
+            ..ShellMarks::default()
+        };
+        let remote = vec!["user@remote:~$".into()];
+        let o = ShellObservation {
+            screen: &remote,
+            cols: 80,
+            marks: local,
+            marks_expected: true,
+        };
+        f.observe(&o);
+        assert_eq!(write_of(&f.observe(&o)).as_deref(), Some("cd /srv/app"));
+    }
+
+    #[test]
+    fn 起動フックの最中の先行入力は画面の変化を実行とみなさずenterも撃ち直さない() {
+        // 準備に 40 秒かかる direnv の実測: 上限で書くと kernel のエコーと先行入力になり、
+        // Enter の改行のエコーで画面が動く。これを実行と取り違えると「完了」と言った後に
+        // まだ何も起動していない（実行は direnv の後）
+        let mut f = ShellSendFlow::with_legacy(LAUNCH, false);
+        let loading = vec!["direnv: loading ~/work/.envrc".into()];
+        fn o(screen: &[String], marks: ShellMarks) -> ShellObservation<'_> {
+            ShellObservation {
+                screen,
+                cols: 63,
+                marks,
+                marks_expected: true,
+            }
+        }
+        let zero = ShellMarks::default();
+        let mut wrote = false;
+        for _ in 0..=READY_MAX_TICKS {
+            if write_of(&f.observe(&o(&loading, zero))).is_some() {
+                wrote = true;
+                break;
+            }
+        }
+        assert!(wrote, "印が来なくても上限で書く");
+        let echoed = vec!["direnv: loading ~/work/.envrc".into(), LAUNCH.to_string()];
+        assert_eq!(
+            write_of(&f.observe(&o(&echoed, zero))).as_deref(),
+            Some("\r")
+        );
+        // 改行のエコーで画面が動くが、印はまだ 0 = 起動フックの最中
+        let moved = vec![LAUNCH.to_string(), String::new()];
+        for _ in 0..(SUBMIT_WAIT_TICKS * 5) {
+            assert_eq!(
+                f.observe(&o(&moved, zero)),
+                ShellSendAction::Wait,
+                "画面の変化では決着しない・Enter も撃ち直さない"
+            );
+        }
+        // direnv が終わって最初のプロンプト → 先行入力が実行される（印は次の tick）
+        let prompted = ShellMarks { prompts: 1, ..zero };
+        assert_eq!(f.observe(&o(&moved, prompted)), ShellSendAction::Wait);
+        let ran = ShellMarks {
+            prompts: 1,
+            executed: 1,
+            ..zero
+        };
+        assert_eq!(
+            f.observe(&o(&moved, ran)),
+            ShellSendAction::Done { verified: true }
+        );
+        assert_eq!(f.confirmation(), Confirmation::Echo);
     }
 
     #[test]

@@ -366,6 +366,9 @@ pub struct TerminalSession {
     command_state: CommandState,
     /// command_state が最後に遷移した時刻（稼働時間表示用。#217）
     command_state_since: Option<std::time::Instant>,
+    /// OSC 133 の印を受けた回数（#1940。起動コマンドが実行されたか・すぐ終わったかを
+    /// 画面の見え方に依らず前後比較で見る）
+    shell_marks: crate::shell_send::ShellMarks,
     /// PTY スレーブの tty 名（tmux クライアントとの対応付け。FR-2.13.2）
     tty_name: Option<String>,
     /// 検知された listen ポート（FR-2.4.2。UI 層のポーリングが更新する）
@@ -583,6 +586,7 @@ impl TerminalSession {
                 cwd: working_directory,
                 command_state: CommandState::default(),
                 command_state_since: None,
+                shell_marks: crate::shell_send::ShellMarks::default(),
                 tty_name,
                 listen_ports: Vec::new(),
                 scroll_fract: std::sync::Mutex::new(0.0),
@@ -1069,6 +1073,7 @@ impl TerminalSession {
         match event {
             OscEvent::CwdChanged(path) => self.cwd = Some(path),
             OscEvent::Mark(mark) => {
+                count_shell_mark(&mut self.shell_marks, mark);
                 let next = next_command_state(self.command_state, mark);
                 if next != self.command_state {
                     self.command_state = next;
@@ -1102,6 +1107,11 @@ impl TerminalSession {
     /// OSC 133 から導出したコマンド実行状態
     pub fn command_state(&self) -> CommandState {
         self.command_state
+    }
+
+    /// OSC 133 の印を受けた回数（#1940）。統合が効いていないシェルではすべて 0
+    pub fn shell_marks(&self) -> crate::shell_send::ShellMarks {
+        self.shell_marks
     }
 
     /// command_state が最後に遷移した時刻（稼働時間表示用。#217）。
@@ -1945,6 +1955,32 @@ fn wheel_action(mode: TermMode, delta_lines: i32, col: usize, row: usize) -> Whe
         }
     } else {
         WheelAction::ScrollDisplay(delta_lines)
+    }
+}
+
+/// このプロセスのどれかのペインでシェル統合の印（OSC 133）を受けたか（#1940）
+static SHELL_MARKS_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// このプロセスのどれかのペインでシェル統合の印を受けたか（#1940）。
+///
+/// 起動コマンドの送達（`shell_send`）が「新しいペインの最初のプロンプトの印を
+/// 待つべきか」の判断に使う。統合が効かない環境（印を出さないシェル・印を落とす器）
+/// では false のままなので、待ち時間を足さない
+pub fn shell_marks_seen() -> bool {
+    SHELL_MARKS_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// OSC 133 の印を数える（#1940）。B（入力開始）は数えない（実行の前後比較に使わない）
+fn count_shell_mark(marks: &mut crate::shell_send::ShellMarks, mark: PromptMark) {
+    SHELL_MARKS_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    match mark {
+        PromptMark::PromptStart => marks.prompts = marks.prompts.saturating_add(1),
+        PromptMark::CommandStart => {}
+        PromptMark::CommandExecuted => marks.executed = marks.executed.saturating_add(1),
+        PromptMark::CommandFinished(code) => {
+            marks.finished = marks.finished.saturating_add(1);
+            marks.last_exit = code;
+        }
     }
 }
 

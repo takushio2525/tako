@@ -52,7 +52,7 @@ UserTask: id, title, body, kind, status, created_by, project, attachments, copy_
 Via: Pc, Pwa, Cli, Mcp
 WindowFrame: x, y, width, height, state
 WindowLayout: id, tabs, active_tab, frame
-WorkerEntry: label, project, agent, model, effort, pane, tab, tmux_session, session_id, issues, ledger_id, cwd, prompt_head, spawned_at, status, closed_at, close_reason, prompt_delivered_at, dead_since, prompt_delivery_failed_at, prompt_delivery_failure
+WorkerEntry: label, project, agent, model, effort, pane, tab, tmux_session, session_id, issues, ledger_id, cwd, prompt_head, spawned_at, status, closed_at, close_reason, prompt_delivered_at, dead_since, prompt_delivery_failed_at, prompt_delivery_failure, launch_failed_at, launch_failure, launch_exit_code
 WorkerRegistry: workers, next_id
 
 version settings: v1 steps=0

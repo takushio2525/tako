@@ -105,6 +105,13 @@ pub enum Stall {
     PasteNotReflected,
     /// Enter を送ったが入力欄に残っているので再送している
     EnterResend,
+    /// ペインの行数が少なすぎてエージェント TUI が入力欄を描けない（#1940。
+    /// claude は 2 行で空白、3 行でステータス 1 行だけになるのを実測）。
+    /// peer 送達（#790）を試し続け、届かなければペインを広げるまで送れない
+    PaneTooShort,
+    /// 起動コマンドは実行されたが、エージェントがすぐ終わってシェルへ戻った（#1940）。
+    /// 依頼文を送る相手が居ない（起動からやり直す）
+    AgentExited,
 }
 
 impl Stall {
@@ -123,6 +130,8 @@ impl Stall {
             Stall::QueueDrain => "queue_drain",
             Stall::PasteNotReflected => "paste_not_reflected",
             Stall::EnterResend => "enter_resend",
+            Stall::PaneTooShort => "pane_too_short",
+            Stall::AgentExited => "agent_exited",
         }
     }
 
@@ -177,6 +186,14 @@ impl Stall {
                 "入力欄に残っているので Enter を再送している",
                 "text remains in the input box, resending Enter",
             ),
+            Stall::PaneTooShort => Text::new(
+                "ペインの行数が少なすぎて入力欄が描かれない（peer 送達を試している。届かなければペインを広げる）",
+                "the pane is too short for the agent to draw its input box (trying peer delivery; widen the pane if it does not arrive)",
+            ),
+            Stall::AgentExited => Text::new(
+                "起動したエージェントがすぐ終わってシェルへ戻った（起動からやり直す）",
+                "the agent exited right after launch and the shell is back (relaunch it)",
+            ),
         }
     }
 
@@ -194,7 +211,9 @@ impl Stall {
             Stall::SessionGone
             | Stall::NoInputBox
             | Stall::ChoiceDialog
-            | Stall::PeerSendStalled => false,
+            | Stall::PeerSendStalled
+            | Stall::PaneTooShort
+            | Stall::AgentExited => false,
         }
     }
 }
@@ -663,6 +682,8 @@ mod tests {
             Stall::QueueDrain,
             Stall::PasteNotReflected,
             Stall::EnterResend,
+            Stall::PaneTooShort,
+            Stall::AgentExited,
         ];
         let mut codes: Vec<&str> = all.iter().map(|s| s.code()).collect();
         codes.sort_unstable();
