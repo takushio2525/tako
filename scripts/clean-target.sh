@@ -29,7 +29,8 @@ echo ""
 
 # target/ のサイズ
 if [[ -d target ]]; then
-    TARGET_SIZE=$(size_of target)
+    # 末尾の / = リンク（#1968 の target → target.noindex）の先を測る
+    TARGET_SIZE=$(size_of target/)
     echo "target/: ${TARGET_SIZE}"
 else
     TARGET_SIZE="0B"
@@ -56,6 +57,15 @@ echo ""
 # 1. cargo clean
 echo "$ cargo clean"
 cargo clean
+# #1968: target が Spotlight 除外のリンク（scripts/spotlight-noindex.sh）だった場合、
+# cargo clean はリンクだけを消して実体の target.noindex/ を丸ごと残す（実測）。
+# 実体を空にしてリンクを張り直し、次のビルドも索引の外へ書かせる
+if [[ -d target.noindex && ! -e target ]]; then
+    rm -rf target.noindex
+    mkdir target.noindex
+    ln -s target.noindex target
+    echo "  → target.noindex/ も空にしてリンクを張り直した（Spotlight の索引の外のまま）"
+fi
 echo "  → target/ 削除完了（${TARGET_SIZE} 解放）"
 echo ""
 
