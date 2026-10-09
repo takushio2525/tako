@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1895: ファイルツリーの ⇧↑ / ⇧↓・⌘⌫、1 つのファイルの途中での取り消し、まとめたコピーを 1 つのジョブへ、帯の残り時間）
-- ⇧↑ / ⇧↓ = `tree_select::extend`（⇧クリックと同じ `apply`）・⌘⌫（Win は Delete）= 右クリックの「削除」と同じ `trash_tree_paths`（見出し・リモートは断る）。1 つのファイルは `fs_copy::copy_file_exclusive`（同じ APFS は clone・それ以外は fcopyfile / CopyFileExW の進み具合で 1 MiB ごとにバイトが進み途中で止めて作りかけを消す）。`tako file copy a b dst` / MCP `paths` の copy = `FileOpMany` の 1 ジョブ、`copy_progress` に `eta_secs`（2 秒・1% までは出さない）。カタログ +7 B
-- 実測: 製品の経路で 256 MiB の同じボリューム 61.8 → 22.6 ms（`create_new` の後の `std::fs::copy` で clone が外れていたのを直した）・別ボリューム 180.5 / 181.4 ms で差なし。`scripts/test-tree-keyboard-copy-1895.sh` 39 PASS 0 FAIL（A/B `TAKO_1895_LEGACY=1` で ① が名指しで FAILED）・番犬 13 本（注入 11 通りを file:line で名指し）
-
 ## 2026-10-09（#748 / PR #754: 合成入力欄をダイアログと誤判定しない固定を今の main へ載せ直した）
 - `dialog.rs` のテストを描く側と同じ組み立てへ（#719 / #718 = 罫線 16 桁・#737 = 20 桁・#1067 = 30 桁 + フッター）。キュー滞留ヒントは #737 ではなく #1067 の形
 - 実測: 注入 A（罫線の棄却を外す）/ A+B（兄弟 1 つで並び）/ E（罫線の最小を 20 本）で形を名指しして FAILED（E は入力欄系でこれだけ）
@@ -63,3 +59,7 @@
 ## 2026-10-09（#1916: GUI 内の塗りが遅いのは App Nap（E コア落ち）と比べた入力の違い = 塗りの間は activity を握る）
 - 真因: 実行器の優先度ではない（GCD / 専用スレッド・QoS 0x15 / 0x19 で同じ）。同じ入力ならテストスレッドと GUI は 12.0 秒で同じ（「4〜8 倍」の 3.6 倍は入力の違い）、隔離 GUI は約 30 秒で App Nap に間引かれ E コアで 26.9〜33.4 秒（命令数は同じ）。`disable_app_nap`（#173）は `/proc` 前提で空振り。`platform::user_work::UserWork`（NSProcessInfo の UserInitiated activity を数で束ねる）を塗りの 2 経路が握る。`tako edit` の応答に `highlighting`
 - 実測: `scripts/test-highlight-app-nap-1916.sh` 8 PASS（間引かれた後の比 1.02 / 1.11 / 1.10・P コア 0.99。A/B `TAKO_1916_LEGACY=1` は 2.56 / 2.54 / 2.80・P コア 0.000 で ③ が FAILED）・番犬 3 本（注入 10 通りを file:line で名指し）
+
+## 2026-10-09（#1918: セルフテストの器にも -f・tk-coretest の残骸を製品の掃除で回収・psmux の e2e も -f NUL）
+- セルフテストの `-f` なし 6 か所（字面 48 / 68 / 73 / 103 + シェルへ打ち込む 1d / 61f。1d は固定名 `takoST` → pid 入り。103 / 61f は backend の conf）を直し、番犬を `mod self_test` とシェル文字列の `-L … new-session` へ広げた。`is_killable_socket_name` に `tk-coretest-` だけ足した（`tk*` は手書きなので据え置き）。psmux は CI で v3.3.7 / v3.3.8 を実測し `-f NUL` で既定の探索をしない → e2e を `Fixture::new_session` へ寄せた
+- 実測: 偽の HOME の `.tmux.conf` がセルフテストで 5 → 0 回・番犬は土台の main.rs で 6 か所を file:line で名指し・回収の注入で新テスト 3 本が落ちる・psmux の `-f /dev/null` は v3.3.8 で設定警告

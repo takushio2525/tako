@@ -870,6 +870,15 @@ pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 器を**利用者の設定を読まずに**起こすときの `-f` の値（OS の null デバイス。#1874 / #1918）。
+///
+/// テスト・セルフテストが自分で `new-session` を叩く器だけが使う（製品の器は
+/// `tmux_backend::wrap_options` が専用 conf を `-f` で渡す）。`-f` が無いと tmux は
+/// `~/.tmux.conf`、psmux は `~/.psmux.conf` → `~/.psmuxrc` → `~/.tmux.conf` → … を読む。
+/// psmux（Windows）は `-f` に読めないパスを渡すと `cannot read` の設定警告を出す版が
+/// あるので、`/dev/null` ではなく `NUL` を渡す
+pub const NO_USER_CONF: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 /// tmux クライアント子プロセスの雛形。バイナリ解決（`tmux_bin`）と
 /// **UTF-8 ロケールの明示注入**を一手に引き受ける。
 ///
