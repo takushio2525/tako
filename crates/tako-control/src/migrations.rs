@@ -486,6 +486,12 @@ pub const SPECS: &[SchemaSpec] = &[
         validate: Some(tako_core::claude_mod_ui::validate_text),
         preserve_unreadable: true,
     },
+    // #1959: tako mod の管理印（Claude Code の設定 dir の skills/tako/.tako-managed）。
+    // **形式の検査を持たない**のは RemoteDesired と同じ理由で、在ること自体が「tako が置いた」の
+    // 宣言だから（退避すると写しが利用者のものに見え、以後 tako が置き直しも外しもできない）。
+    // 版は印の `schema`（`version` ではない）で、形を変えるときも**移行の手順は要らない**:
+    // 写しの中身が変われば同期（setup / GUI 起動時）が印ごと書き直す（`claude_mod_install`）
+    pristine(SchemaId::ClaudeModMark, None),
 ];
 
 /// 種別から登録を引く
@@ -542,6 +548,17 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         }
         SchemaId::RemoteDesired => single("remote/tako-remote.desired"),
         SchemaId::ClaudeModUi => tako_core::claude_mod_ui::ui_path().into_iter().collect(),
+        // #1959: data dir の外（設定 dir ごと）。置く先の解決は claude_mod_install の 1 実装
+        SchemaId::ClaudeModMark => crate::claude_mod_install::collect_targets(
+            &crate::claude_mod_install::target_inputs(&[]),
+        )
+        .into_iter()
+        .map(|t| {
+            tako_core::claude_mod_install::copy_dir(&t.dir)
+                .join(tako_core::claude_mod_install::MARK_FILE)
+        })
+        .filter(|p| p.is_file())
+        .collect(),
     }
 }
 

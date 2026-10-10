@@ -89,22 +89,32 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         // #1960: tako mod の定型の UI 設定（`claude-mod/` の中でこれだけが利用者の宣言 = Shared）
         ("claude-mod/ui.json", SchemaId::ClaudeModUi),
     ];
+    // tako の data dir の外（Claude Code の設定 dir = カタログの `Root::Claude`）に置く番地
+    const CLAUDE_MAPPING: &[(&str, SchemaId)] = &[
+        // #1959: tako mod の写しと管理印。設定 dir ごとに tako が置く（共有しない = Local）
+        ("skills/tako/", SchemaId::ClaudeModMark),
+    ];
     use tako_control::config_share::catalog;
-    for (path, id) in MAPPING {
-        assert!(
-            catalog::CATALOG
-                .iter()
-                .any(|e| e.root == catalog::Root::TakoData && e.path == *path),
-            "共有分類カタログに {path} が無い（対応表の側が古い）"
-        );
-        assert!(
-            migrations::spec(*id).is_some(),
-            "{} が移行の番地に無い",
-            id.as_str()
-        );
+    for (root, mapping) in [
+        (catalog::Root::TakoData, MAPPING),
+        (catalog::Root::Claude, CLAUDE_MAPPING),
+    ] {
+        for (path, id) in mapping {
+            assert!(
+                catalog::CATALOG
+                    .iter()
+                    .any(|e| e.root == root && e.path == *path),
+                "共有分類カタログに {path} が無い（対応表の側が古い）"
+            );
+            assert!(
+                migrations::spec(*id).is_some(),
+                "{} が移行の番地に無い",
+                id.as_str()
+            );
+        }
     }
     assert_eq!(
-        MAPPING.len(),
+        MAPPING.len() + CLAUDE_MAPPING.len(),
         SchemaId::all().len(),
         "番地を足したら対応表にも足す（どのファイルの版数かが分からなくなる）"
     );
@@ -299,6 +309,11 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
                 "SlashCommand",
                 "TakoOp",
             ],
+        ),
+        (
+            // #1959: Claude Code の設定 dir の skills/tako/.tako-managed（tako mod の管理印）
+            "crates/tako-core/src/claude_mod_install.rs",
+            &["ManagedMark"],
         ),
     ];
     let mut out = BTreeMap::new();

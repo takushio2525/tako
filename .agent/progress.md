@@ -20,14 +20,6 @@
 
 ---
 
-## 2026-10-09（#1909: 補完の打鍵と説明の補いの取り消しの番号も UI スレッドで先に取る = ホバーの #1893 と同じ口へ）
-- `reserve_completion` / `reserve_resolve` → 要求の `ticket`。manager の背景は補完・説明・ホバーとも `enter_lane` の 1 口から列へ入り、`supersede(` は UI の口と `enter_lane` だけ（番犬が他を名指し）。残りは `tako lsp status` / MCP の `inflight`。A/B `TAKO_1909_LEGACY=1`・注入 `TAKO_1909_INJECT_HOLD`（背景の走り出しを合図まで止める）
-- 実測: visual-test `completion-cancel` で旧い形は閉じた後の背景がサーバへ届き `inflight=1` / `pending_requests=1`（③ で名指しの FAILED）、直した形は 0 / 0・問い合わせ 0。e2e 6 本（背景で取り直す注入で 5 本が落ちる）・番犬の注入 11 通りを file:line で名指し・`scripts/test-lsp-completion-cancel-1909.sh` 4 PASS 0 FAIL（2 回）
-
-## 2026-10-09（#1917: TS の構文の塗りを release の 1 MB で 5.9 → 1.8 秒にした = 正規表現へ「当たらない行で VM を起こさない」等価な前置き）
-- 真因: two-face の TS は先読み・後読みだらけで、fancy-regex は行の全バイト位置で VM を回す（正規表現 365 本に均等に散る・1 行 1 回ほぼ当たらない）。`syntax_prefilter.rs` が TS / TSX の 425 本を `\G(?=(?s:.)*?(?:必要条件))(?s:.)*?\K(?:元)` へ書き換え（構文セットの直列化を 2 構文だけ解いて詰め直す・往復検査・プロセスで 1 回 34 ms を起動時に別スレッドで）。A/B `TAKO_1917_LEGACY=1`
-- 実測（release・交互 3 回）: 1 MB の TS 5.90 → 1.73〜1.83 秒・TSX 6.1 → 1.7 秒・TS / Rust 4.6 → 1.4 倍・Rust は不変・40 行の冷えた 1 回目だけ 82 → 100 ms。塗りの全記録が実在の TS 12 本で 1 行残らず一致。単体 9 本（バックトラック回数の番犬）・番犬 4 本
-
 ## 2026-10-09（#1913: 合成入力欄の組み立てを tako-core の `synthetic_input` へ寄せ、描く側 4 か所と #754 のテストが同じ形を使う）
 - 描く側（visual-test の #719 / #718・セルフテストの #737 / #1067）は `chat_g3_command` / `autogrow_command` / `gui_input_paint` / `restart_tui_paint`、dialog のテストは同じ `*_lines` を呼ぶ（描くバイトは必ず行から作る）。寄せる前の原文を切り出した比較で 13 状態がバイト一致
 - 実測: #754 の注入 A / A+B / E で同じ形を名指しして FAILED・番犬 `issue1913_synthetic_input_watchdog` 4 本（全戻し・1 か所戻し・テストへの手書き 1 行を file:line で名指し）
@@ -64,3 +56,7 @@
 ## 2026-10-09（#1960: tako mod S7-2 = 画面の UI 設定 ui.json を CLI / MCP / setup の同じ口で選んで変える。既定ボタン /compact）
 - 正本 `tako_core::claude_mod_ui`（語彙・既定・検証・寛容な読み込み・一時ファイル → rename）を CLI `tako mod ui`（ローカル処理）/ MCP `tako_mod` の `action=ui` / setup（`--answers` の `mod_ui`・`--review` の最後の 3 択 + ボタン）が通る。帯のトグルの正本を `$.store` から ui.json の `band.hidden` へ（応答の `band_request` をここから作り、報告の新しい `toggled_at` は取り込む）・`tako.view.ui`・#916 の `SchemaId::ClaudeModUi`・MATRIX `claude_mod_ui`・カタログ +1,506 B
 - 実測: core 16 本（ランダムな操作列 1,000 通りで常に形を満たす）・dispatch 3 本・番犬 `issue1960_mod_ui_watchdog`（3 つの口で ui.json が字面で一致・注入 10 通りを file:line で名指し）・`scripts/test-mod-ui-1960.sh` 67 PASS 0 FAIL（/bin/bash・隔離 GUI 越しの MCP / report / band を含む）・`scripts/test-mod-ui-llm.sh` の採点器 oracle 20/20・null 1/20（実モデルは API キーが無く未実測）
+
+## 2026-10-10（#1959: tako mod S7-1 = setup が Claude Code の設定 dir ごとに skills/tako へ管理印つきの写しを入れる）
+- 判断と書き込みは `tako_core::claude_mod_install`（印 `.tako-managed`・衝突の読み取り・`skills/.tako.tmp-*` からの差し替え・検証プロセスは一時 dir の外へ書かない番人）、置く先の解決と JSON / setup の文面は `tako_control::claude_mod_install`。発火は setup の段・GUI 起動時・mod の報告の `config_dir` の差分検出、口は `tako mod install|uninstall [--dry-run]`（MCP `tako_mod`・カタログ +217 B）。衝突 / `/plugin` で止めた設定 dir のペインへは env も注入せず mod も休眠（`dormant`）。A/B `TAKO_1959_LEGACY=1`・MATRIX `claude_mod_install`・SPECS `claude_mod_mark`
+- 実測: `scripts/test-mod-skills-1959.sh` CLI 62 PASS・GUI 13 PASS（実 claude 2.1.294・一時 HOME。plugin list に tako@skills-dir・env 注入と同時でも hooks module は tako@inline の 1 つ・本物の ~/.claude* は前後で同じ）・`claude plugin test` 30 本・番犬（注入 15 通りを file:line で名指し）

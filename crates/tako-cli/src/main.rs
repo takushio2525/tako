@@ -3491,20 +3491,23 @@ struct ShellIntegrationArgs {
     json: bool,
 }
 
-/// tako mod の引数（Issue #1879 / #1881）。
+/// tako mod の引数（Issue #1879 / #1881 / #1959）。
 ///
 /// `report` は mod が stdin の JSON で状態を送る口で、人が打つものではないので
 /// `--help` の候補に出さない（受け付けはする）
 #[derive(Args)]
 struct ModArgs {
     /// on / off（省略時は状態を表示）。band = Claude Code の画面の帯（band on / band off）。
-    /// ui = 画面の UI 設定（ボタン・バー・帯の区切り・色。引数なしで今の値と選べる値）
+    /// ui = 画面の UI 設定（ボタン・バー・帯の区切り・色。引数なしで今の値と選べる値）。
+    /// install / uninstall = Claude Code の設定 dir の skills/tako へ写しを置く / 外す
     #[arg(value_parser = clap::builder::PossibleValuesParser::new([
         clap::builder::PossibleValue::new("status"),
         clap::builder::PossibleValue::new("on"),
         clap::builder::PossibleValue::new("off"),
         clap::builder::PossibleValue::new("band"),
         clap::builder::PossibleValue::new("ui"),
+        clap::builder::PossibleValue::new("install"),
+        clap::builder::PossibleValue::new("uninstall"),
         clap::builder::PossibleValue::new("report").hide(true),
     ]))]
     action: Option<String>,
@@ -3521,6 +3524,9 @@ struct ModArgs {
     /// ui の button add: ボタンの id（省くと中身から決める）
     #[arg(long)]
     id: Option<String>,
+    /// install / uninstall のとき: どの設定 dir に何をするかだけを出して書かない
+    #[arg(long)]
+    dry_run: bool,
     /// 生の JSON で出力する
     #[arg(long)]
     json: bool,
@@ -4282,6 +4288,13 @@ fn cli_main() -> ExitCode {
         // **GUI が動いていなくても変えられる**（setup の途中・GUI を起動する前）。実体は
         // dispatch（MCP `tako_mod` の action=ui）と共通の tako_control::claude_mod_ui::run
         Command::Mod(ref args) if args.action.as_deref() == Some("ui") => mod_ui_local(args),
+        // #1959: 設定 dir の skills/tako への出し入れ。**GUI が動いていなくても外せる**ことが
+        // 本質（tako を消す前の後片付け）。実体は dispatch（MCP）と共通の claude_mod_install
+        Command::Mod(ref args)
+            if matches!(args.action.as_deref(), Some("install" | "uninstall")) =>
+        {
+            mod_install_local(args)
+        }
         Command::Config(ref args) => config_share_local(args),
         // run-interactive --wait は起動 + ポーリングの合成。終了コードは結末から決まる
         // （上限で打ち切ったら 124 = `timeout(1)` と同じ。#1778）
@@ -5896,6 +5909,90 @@ fn print_list_section(title: &str, value: &serde_json::Value) {
     }
 }
 
+/// `tako mod install|uninstall [--dry-run]`（#1959。ローカル処理・IPC 不要）。
+///
+/// claude の版は上限つきの判定（`bounded_claude_version`）で、置く先は accounts.yaml・既定・
+/// このシェルの `CLAUDE_CONFIG_DIR`。mod の報告で見えた dir は GUI しか知らないので、GUI が
+/// 動いていれば起動時の差分検出がそこへ置く（MCP `tako_mod` は GUI の材料ごと見る）
+fn mod_install_local(args: &ModArgs) -> Result<(), String> {
+    let action = args.action.as_deref().unwrap_or("install");
+    // 位置引数は #1960 で `rest`（band の on / off・ui の操作）、ui の button add は
+    // --label / --hotkey / --id になった。install / uninstall はどれも取らない
+    if !args.rest.is_empty() || args.label.is_some() || args.hotkey.is_some() || args.id.is_some() {
+        return Err(format!("{action} は on / off や ui の引数を取らない"));
+    }
+    let ctx = tako_control::claude_mod_install::Context::from_env(
+        tako_control::stale_binary::bounded_claude_version(),
+    );
+    let out = tako_control::claude_mod_install::run_action(action, args.dry_run, &[], &ctx)?;
+    // 置けない（外せない）設定 dir が 1 つでもあれば終了コード 1（JSON でも同じ）
+    let failed = out["skills"]["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|t| t["outcome"] == "error");
+    let result = if failed {
+        Err("置けない（外せない）設定 dir がある（targets の error）".to_string())
+    } else {
+        Ok(())
+    };
+    if args.json {
+        println!("{}", pretty_json(&out));
+        return result;
+    }
+    let verb = match (action, args.dry_run) {
+        ("install", true) => "tako mod install（dry-run。何も書いていない）",
+        ("install", false) => "tako mod install",
+        (_, true) => "tako mod uninstall（dry-run。何も書いていない）",
+        _ => "tako mod uninstall",
+    };
+    println!(
+        "{verb}: claude {}（下限 {}）",
+        out["claude_version"].as_str().unwrap_or("未判定"),
+        out["min_claude_version"].as_str().unwrap_or("-"),
+    );
+    print_mod_skills(&out["skills"]);
+    if let Some(note) = out["applies_to"].as_str() {
+        println!("{note}");
+    }
+    result
+}
+
+/// 設定 dir ごとの skills/tako の行（`tako mod` と `tako mod install|uninstall` で共通）
+fn print_mod_skills(skills: &Value) {
+    let Some(targets) = skills["targets"].as_array() else {
+        return;
+    };
+    if skills["legacy"].as_bool() == Some(true) {
+        println!("skills: 入れない（TAKO_1959_LEGACY / TAKO_1877_NO_MOD）");
+    }
+    for t in targets {
+        let state = t["state"].as_str().unwrap_or("-");
+        let doing = match (t["action"].as_str(), t["outcome"].as_str()) {
+            (_, Some("written")) => "  → 置いた".to_string(),
+            (_, Some("removed")) => "  → 外した".to_string(),
+            (Some("write"), Some("planned")) => "  → 置く予定".to_string(),
+            (Some("remove"), Some("planned")) => "  → 外す予定".to_string(),
+            (_, Some("error")) => format!("  → error: {}", t["error"].as_str().unwrap_or("?")),
+            _ => String::new(),
+        };
+        let sources = t["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "  {}  {state}  [{sources}]{doing}",
+            t["config_dir"].as_str().unwrap_or("?")
+        );
+        if let Some(reason) = t["reason"]["message"].as_str() {
+            println!("      {reason}");
+        }
+    }
+}
+
 /// プラットフォーム対応マトリクスの表示（#515。ローカル処理・IPC 不要）。
 ///
 /// 応答の組み立ては `tako_control::platform::report` を通す。MCP `tako_platform` と
@@ -7140,6 +7237,11 @@ fn print_mod(args: &ModArgs, result: &Value) {
     if let Some(note) = result["applies_to"].as_str() {
         println!("{note}");
     }
+    // #1959: 設定 dir ごとの skills/tako（Claude Code の /plugin に tako@skills-dir として出るもの）
+    if result["skills"]["targets"].is_array() {
+        println!("Claude Code の設定 dir（skills/tako）:");
+        print_mod_skills(&result["skills"]);
+    }
     // #1881: Claude Code の画面の帯（プロンプトの上の 1 行）
     let band = &result["band"];
     if band["legacy"].as_bool() == Some(true) {
@@ -8145,7 +8247,14 @@ fn build_request(command: &Command) -> Result<Request, String> {
             report: Some(read_mod_report()?),
             pane: caller_pane(),
             ui: None,
+            dry_run: false,
         },
+        Command::Mod(args) if args.dry_run => {
+            return Err(
+                "--dry-run は install / uninstall にだけ付ける（tako mod install --dry-run）"
+                    .into(),
+            )
+        }
         // #1881: `tako mod band on|off` は dispatch の action `band-on` / `band-off`（MCP と同じ語）
         Command::Mod(args) if args.action.as_deref() == Some("band") => Request::Mod {
             action: Some(
@@ -8162,6 +8271,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             report: None,
             pane: None,
             ui: None,
+            dry_run: false,
         },
         Command::Mod(args)
             if !args.rest.is_empty()
@@ -8175,11 +8285,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     .into(),
             )
         }
+        Command::Mod(args) if matches!(args.action.as_deref(), Some("install" | "uninstall")) => {
+            unreachable!("mod install / uninstall は run() を通らない（ローカル処理）")
+        }
         Command::Mod(args) => Request::Mod {
             action: args.action.clone(),
             report: None,
             pane: None,
             ui: None,
+            dry_run: false,
         },
         // #1857: 再 attach は切替ではなくペイン 1 枚の操作（MCP の `reattach` と同じ要求）
         Command::Persist(args) if args.state.as_deref() == Some("reattach") => {

@@ -3368,6 +3368,17 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     // 検出値・既定値だけの標準ケースは確認を挟まず適用する（Issue #262 要件 D）。
     remaining.extend(configure_agent_mcp(&agents));
+    // tako mod を Claude Code の設定 dir ごとの skills/tako へ（FR-2.42.25 / #1959）。
+    // claude を検出した**後**に置く（版の下限を見るため。未検出なら版の判定も回さない）。
+    // 実装・文面の正本は tako-control 側で、**止めない**（入れられなくても env の注入で動く）
+    let claude_version = agents
+        .iter()
+        .any(|agent| agent.kind == SetupAgent::Claude)
+        .then(tako_control::stale_binary::bounded_claude_version)
+        .flatten();
+    for line in tako_control::claude_mod_install::run_setup_stage(claude_version) {
+        eprintln!("{line}");
+    }
     let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
     apply_sleep_guard_answers(answers.sleep_guard.as_ref())?;
 

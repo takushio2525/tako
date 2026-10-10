@@ -1023,6 +1023,7 @@ pub(super) fn build_request(
                 report: None,
                 pane: None,
                 ui,
+                dry_run: bool_arg(args, "dry_run")?.unwrap_or(false),
             }
         }
         "tako_shell_integration" => Request::ShellIntegration {

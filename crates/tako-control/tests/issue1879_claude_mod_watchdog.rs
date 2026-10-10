@@ -172,11 +172,17 @@ fn scan_mcp(control: &str) -> Vec<String> {
             "MCP_ACTIONS が見つからない（走査が空振り）",
         )];
     };
-    let line = control.lines().nth(at).unwrap_or_default();
-    if line.contains("\"report\"") {
+    // 宣言の行から `];` で終わる行まで（#1959 で値が増えて複数行に折られた。1 行目だけを見ると
+    // 後ろの行に足した report を見逃す）。名指しは report を含む行
+    let lines: Vec<&str> = control.lines().collect();
+    let end = lines[at..]
+        .iter()
+        .position(|l| l.trim_end().ends_with("];"))
+        .map_or(lines.len(), |i| at + i + 1);
+    if let Some(i) = (at..end).find(|i| lines[*i].contains("\"report\"")) {
         return vec![report(
             CONTROL,
-            at + 1,
+            i + 1,
             "MCP の tako_mod が report を受け付ける（AI が自分の状態を偽れるだけ = FR-2.42）",
         )];
     }
@@ -371,11 +377,11 @@ fn 逆戻りを名指しできる() {
         );
     });
     assert_named(&found, CORE, "`prompt`");
-    // 3. MCP に report を載せる
+    // 3. MCP に report を載せる（宣言の最後の値の後ろ = 1 行目ではない行に足す）
     let found = mutate(&|s| {
         s.control = s.control.replacen(
-            "pub const MCP_ACTIONS: &[&str] = &[\"status\", \"on\", \"off\", \"band-on\", \"band-off\", \"ui\"];",
-            "pub const MCP_ACTIONS: &[&str] = &[\"status\", \"on\", \"off\", \"band-on\", \"band-off\", \"ui\", \"report\"];",
+            "    \"uninstall\",\n];\n\n/// `tako setup` の段",
+            "    \"uninstall\",\n    \"report\",\n];\n\n/// `tako setup` の段",
             1,
         );
     });

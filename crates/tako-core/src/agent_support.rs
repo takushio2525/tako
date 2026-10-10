@@ -251,6 +251,8 @@ pub mod keys {
     pub const AGENT_SELECT_AT_SPAWN: &str = "agent_select_at_spawn";
     /// エージェントの画面の中（プロンプトの上の帯・サイドバー）に tako の状況を出す（#1881）
     pub const CLAUDE_MOD_BAND: &str = "claude_mod_band";
+    /// エージェント自身の設定 dir へ tako の拡張を入れる（setup。外せる・他の拡張と取り合わない。#1959）
+    pub const CLAUDE_MOD_INSTALL: &str = "claude_mod_install";
     /// エージェントのプロセス内の拡張（Claude Code の mod）から状態を構造で受け取る（#1879）
     pub const CLAUDE_MOD_STATE: &str = "claude_mod_state";
     /// エージェントの画面の中の UI（ボタン・バー・帯の区切り・色）を定型の設定で選んで調整する（#1960）
@@ -770,6 +772,23 @@ pub const MATRIX: &[AgentFeature] = &[
              隔離 GUI のペインと 80 / 144 / 300 桁の隔離 tmux で実 claude に描かせ、帯が 1 行に収まること・\
              ダイアログの後に戻ること・トグルが再起動後も保たれることを画面の capture で確かめた\
              （scripts/test-claude-mod-band-1881.sh）",
+        ),
+    },
+    AgentFeature {
+        key: keys::CLAUDE_MOD_INSTALL,
+        summary: Note::new(
+            "tako setup がエージェントの設定 dir ごとに tako の拡張を入れる（管理印つき・同名の他の拡張があれば入れない・tako mod uninstall で外せる）",
+            "tako setup installs tako's extension into each of the agent's config dirs (with a managed marker, skipped when another extension uses the same name, removable with tako mod uninstall)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1885),
+        agy: pending(notes::NOT_INVESTIGATED, 1885),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1959: 一時の設定 dir 2 つへ tako setup の段が skills/tako の写しを置き、実物の Claude Code 2.1.294 の \
+             claude plugin list に tako@skills-dir（enabled）・デバッグログに hooks module tako@skills-dir が出た。\
+             env の注入と同時でも hooks module は tako@inline の 1 つだけ・利用者の skills/tako と別の出どころの \
+             同名 tako には触らない・uninstall で写しだけが消えることを確かめた（scripts/test-mod-skills-1959.sh）",
         ),
     },
     AgentFeature {

@@ -4595,18 +4595,46 @@ impl TakoApp {
         tako_core::shell_integration::refresh_cli_dir();
         // #1879: claude の版をパスから読めなかったときだけ、上限つきの判定を背景で 1 回回す
         // （ログインシェルの `command -v` と `claude --version` を UI スレッドで待たない）。
-        // 結果は次に作るペインから効く
-        if app.claude_mod.claude_version.is_none() && !tako_core::claude_mod::ab_off() {
+        // 結果は次に作るペインから効く。
+        // #1959: 版が分かったら、設定 dir ごとの skills/tako の同期（起動時の差分検出 = #916 と
+        // 同じ二段構えの GUI 側）も背景で 1 回。版を見てから置くので、判定の後ろに並べる
+        if !tako_core::claude_mod::ab_off() {
+            let known = app.claude_mod.claude_version.clone();
             cx.spawn(async move |this, cx| {
-                let version = cx
-                    .background_executor()
-                    .spawn(async { tako_control::stale_binary::bounded_claude_version() })
-                    .await;
-                let _ = this.update(cx, |app: &mut TakoApp, _| {
-                    if app.claude_mod.claude_version.is_none() {
-                        app.claude_mod.claude_version = version;
+                let version = match known {
+                    Some(version) => Some(version),
+                    None => {
+                        cx.background_executor()
+                            .spawn(async { tako_control::stale_binary::bounded_claude_version() })
+                            .await
                     }
-                });
+                };
+                let Ok(skills_ctx) = this.update(cx, |app: &mut TakoApp, _| {
+                    if app.claude_mod.claude_version.is_none() {
+                        app.claude_mod.claude_version = version.clone();
+                    }
+                    // 判定の前に届いた報告の dir も含めて片付ける（定期処理は版が分かるまで待つ）
+                    let reported: Vec<String> = app
+                        .claude_mod
+                        .reported_config_dirs
+                        .iter()
+                        .cloned()
+                        .collect();
+                    app.claude_mod.take_pending_config_dirs();
+                    (reported, app.claude_mod_install_context())
+                }) else {
+                    return;
+                };
+                let (reported, skills_ctx) = skills_ctx;
+                cx.background_executor()
+                    .spawn(async move {
+                        tako_control::claude_mod_install::sync_for_gui(
+                            &reported,
+                            false,
+                            &skills_ctx,
+                        )
+                    })
+                    .await;
             })
             .detach();
         }
@@ -5540,6 +5568,8 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:agent_metrics");
                         app.refresh_agent_metrics();
                     }
+                    // #1959: mod の報告で新しく見えた設定 dir へ skills/tako（読み書きは背景）
+                    app.drive_claude_mod_skills_sync(wcx);
                     {
                         // #572: busy 中に人間が打った指示が claude のキューに滞留したまま
                         // 止まっていないかを見張り、見つけたら送り出す
@@ -8785,6 +8815,35 @@ impl TakoApp {
         self.claude_mod.forget_pane(pane_id.as_u64());
     }
 
+    /// skills/tako の同期の材料（#1959。GUI のメモリの値 = `tako mod on|off`・控えた claude の版）
+    fn claude_mod_install_context(&self) -> tako_control::claude_mod_install::Context {
+        tako_control::claude_mod_install::Context {
+            enabled: self.claude_mod.enabled,
+            legacy: tako_core::claude_mod_install::legacy(),
+            claude_version: self.claude_mod.claude_version.clone(),
+            verification: tako_core::paths::is_verification_process(),
+        }
+    }
+
+    /// mod の報告で新しく見えた設定 dir へ skills/tako を置きに行く（#1959。定期処理から呼び、
+    /// ファイルの読み書きは背景で）。claude の版が分かるまでは積んだまま待つ（起動時の同期が
+    /// 版の判定の後にまとめて片付ける）
+    fn drive_claude_mod_skills_sync(&mut self, cx: &mut Context<Self>) {
+        if tako_core::claude_mod::ab_off()
+            || self.claude_mod.claude_version.is_none()
+            || self.claude_mod.pending_config_dirs.is_empty()
+        {
+            return;
+        }
+        let dirs = self.claude_mod.take_pending_config_dirs();
+        let skills_ctx = self.claude_mod_install_context();
+        cx.background_executor()
+            .spawn(async move {
+                tako_control::claude_mod_install::sync_for_gui(&dirs, true, &skills_ctx)
+            })
+            .detach();
+    }
+
     /// ペイン ID に対する新しい TerminalSession を起動し、イベント中継タスクを張る。
     /// 制御プレーンの接続情報を環境変数で注入する（FR-2.1.1）。
     /// 失敗（fd 枯渇等での PTY 生成エラー）は Err で返す。ここで panic すると GPUI の
@@ -8828,8 +8887,13 @@ impl TakoApp {
             }
         }
         // #1879: tako mod（Claude Code の mod）を読ませる env。判断は core の 1 実装
-        // （設定 / A/B / 展開 / CLI / claude の版）で、注入しないときも理由を控える
-        let injection = self.claude_mod.decide(tako_core::claude_mod::ab_off());
+        // （設定 / A/B / 展開 / CLI / claude の版）で、注入しないときも理由を控える。
+        // #1959: その claude の設定 dir に別の出どころの同名 tako がある・利用者が /plugin で
+        // 止めているなら注入しない（inline は利用者の tako を上書きする）
+        let injection = tako_control::claude_mod_install::refine_injection(
+            self.claude_mod.decide(tako_core::claude_mod::ab_off()),
+            &options.env,
+        );
         let (inherited_dirs, inherited_cli) = tako_core::claude_mod::inherited_env();
         options.env.extend(tako_core::claude_mod::pane_env(
             &injection,

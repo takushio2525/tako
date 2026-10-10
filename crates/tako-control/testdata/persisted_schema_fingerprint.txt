@@ -23,6 +23,7 @@ DevicesFile: devices
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows, shelved_tabs
 Ledger: entries
 LedgerEntry: id, ts, project, label, issue, task_type, model, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
+ManagedMark: schema, managed_by, tako_version, content_hash, files
 NodeLayout: Pane, Split, axis, ratio, first, second
 OrchestratorConfig: auto_close, auto_push
 PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume, ssh
@@ -95,3 +96,4 @@ version remote_devices: v1 steps=0
 version remote_shortcuts: v1 steps=0
 version remote_desired: v1 steps=0
 version claude_mod_ui: v1 steps=0
+version claude_mod_mark: v1 steps=0

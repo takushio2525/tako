@@ -2209,4 +2209,40 @@ mod tests {
             resp
         );
     }
+
+    /// #1959: `tako_mod` の install / uninstall は `dry_run` つきの要求になり、report は断る
+    #[test]
+    fn tako_mod_の_install_は_dry_run_つきの要求になる() {
+        assert_eq!(
+            build_request(
+                "tako_mod",
+                &json!({"action": "install", "dry_run": true}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::Mod {
+                action: Some("install".into()),
+                report: None,
+                pane: None,
+                ui: None,
+                dry_run: true,
+            }
+        );
+        assert_eq!(
+            build_request("tako_mod", &json!({"action": "uninstall"}), None, None).unwrap(),
+            Request::Mod {
+                action: Some("uninstall".into()),
+                report: None,
+                pane: None,
+                ui: None,
+                dry_run: false,
+            }
+        );
+        assert!(build_request("tako_mod", &json!({"action": "report"}), None, None).is_err());
+        assert!(
+            validate_known_params("tako_mod", &json!({"action": "install", "dry_run": true}))
+                .is_ok()
+        );
+    }
 }

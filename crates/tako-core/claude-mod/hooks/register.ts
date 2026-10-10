@@ -47,6 +47,8 @@ const NAME_MAX = 24
 const PANE_ID = 'tako'
 /** $.store のキー（帯のトグル） */
 const BAND_KEY = 'band'
+/** 利用者が Claude Code の /plugin で止める id（tako setup が skills/tako に置いた写し = #1959） */
+const SKILLS_ID = 'tako@skills-dir'
 
 // $.state（セッションの値。描画が購読するので、書けば読み手が描き直される）
 const VIEW = { plugin: 'tako', key: 'view' } as const
@@ -83,6 +85,8 @@ let lastBandKey: string | undefined
 // 組織アカウントでは 1 つも届かないことがある（2.1.294 で実測。FR-2.42.7）。
 // 届かないときの権限待ちは tool.check の判定から確かなものだけを拾う
 let classicEvents = false
+// 利用者が /plugin で止めたかを最後に見た時刻（#1959。heartbeat と同じ間隔で見直す）
+let lastDisabledCheck = 0
 
 // effort の値を読む。turn.step は文字列（2.1.294 の実測: "medium"）、classic 系は { level } で運ぶ
 function effortLevel(value: unknown): string | undefined {
@@ -128,8 +132,31 @@ async function stampLimits($: EngineInterface, limits: readonly SessionRateLimit
   return out
 }
 
+// 利用者が Claude Code 側で tako mod を止めたか（/plugin の disable = settings の enabledPlugins に
+// false。#1959）。env の注入（inline）で読まれていても従う = 注入が利用者の選択を上書きしない。
+// 読めなければ止めていない扱い（報告は止めない = §5 の「失敗で騒がない」）
+async function userDisabled($: EngineInterface): Promise<boolean> {
+  try {
+    const enabled = (await $.settings.read()).enabledPlugins
+    return typeof enabled === 'object' && enabled !== null && (enabled as Record<string, unknown>)[SKILLS_ID] === false
+  } catch (err) {
+    $.ui.log(`tako mod: settings unreadable: ${String(err).slice(0, 200)}`, { to: 'debug' })
+    return false
+  }
+}
+
+// 休眠に入る（#1959）: 理由を 1 回だけ報告して timer を止め、帯の材料を消す
+// （tako は画面の読み取りへ落ちる。次に起きるのは session.start = claude の起動し直しかホットリロード）
+async function goDormant($: EngineInterface, reason: 'user_disabled'): Promise<void> {
+  timer?.cancel()
+  timer = undefined
+  await send($, false, FINAL_TIMEOUT_MS, reason)
+  cli = undefined
+  await setView($, null)
+}
+
 // 報告を組む。欠けた値（最初の API 応答の前の ctx% など）は undefined のまま = JSON から落ちる
-async function buildReport($: EngineInterface, ended: boolean): Promise<TakoModReport> {
+async function buildReport($: EngineInterface, ended: boolean, dormant?: 'user_disabled'): Promise<TakoModReport> {
   const at = await $.clock.now()
   const usage = await $.session.usage()
   const version = await $.session.version()
@@ -150,23 +177,24 @@ async function buildReport($: EngineInterface, ended: boolean): Promise<TakoModR
     classic_events: classicEvents,
     config_dir: await $.env.get('CLAUDE_CONFIG_DIR'),
     band: { hidden: bandHidden, shown: bandShown, columns: bandColumns, segments: bandSegments, toggled_at: bandToggledAt },
+    dormant,
     ended,
   }
 }
 
 // 1 回送る。応答（tako 側のスナップショット = 帯・サイドバーの材料）を $.state へ写す
-async function send($: EngineInterface, ended: boolean, timeoutMs: number): Promise<void> {
+async function send($: EngineInterface, ended: boolean, timeoutMs: number, dormant?: 'user_disabled'): Promise<void> {
   const path = cli
   if (path === undefined) return
   dirty = false
   try {
     await syncStore($)
-    const report = await buildReport($, ended)
+    const report = await buildReport($, ended, dormant)
     lastSentAt = report.at
     const done = await $.process.run([path, 'mod', 'report'], { stdin: JSON.stringify(report), timeoutMs })
     if (done.exitCode !== 0) {
       $.ui.log(`tako mod: report exit ${done.exitCode}: ${done.stderr.trim().slice(0, 200)}`, { to: 'debug' })
-    } else if (!ended) {
+    } else if (!ended && dormant === undefined) {
       await absorb($, done.stdout)
     }
   } catch (err) {
@@ -182,10 +210,19 @@ async function tick($: EngineInterface): Promise<void> {
   if (lastViewJson !== undefined && lastViewJson !== 'null' && now - viewAt > VIEW_FRESH_MS) {
     await setView($, null)
   }
-  if (!dirty && now - lastSentAt < HEARTBEAT_MS) return
+  // 走っている間に /plugin で止められたら従う（#1959。見直しは heartbeat と同じ間隔）
+  const recheck = now - lastDisabledCheck >= HEARTBEAT_MS
+  if (!recheck && !dirty && now - lastSentAt < HEARTBEAT_MS) return
   sending = true
   try {
-    await send($, false, REPORT_TIMEOUT_MS)
+    if (recheck) {
+      lastDisabledCheck = now
+      if (await userDisabled($)) {
+        await goDormant($, 'user_disabled')
+        return
+      }
+    }
+    if (dirty || now - lastSentAt >= HEARTBEAT_MS) await send($, false, REPORT_TIMEOUT_MS)
   } finally {
     sending = false
   }
@@ -202,6 +239,12 @@ async function wake($: EngineInterface): Promise<void> {
     return
   }
   cli = path
+  // 利用者が /plugin で止めていれば、理由を 1 回だけ伝えて休眠する（#1959）
+  lastDisabledCheck = await $.clock.now()
+  if (await userDisabled($)) {
+    await goDormant($, 'user_disabled')
+    return
+  }
   dirty = true
   // ホットリロードでは $.state の材料が残っている。次の応答まで（最大 45 秒）はそれで描く
   viewAt = await $.clock.now()

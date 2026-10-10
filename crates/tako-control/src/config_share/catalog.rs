@@ -859,6 +859,16 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // tako mod の写し（#1959）: tako setup / GUI 起動時がその端末の tako の版で置き直す。
+    // 共有すると別の端末の版の写しが届き、置き直しと取り合う（`skills/` の他の中身は分類しない）
+    Entry {
+        root: Root::Claude,
+        path: "skills/tako/",
+        class: Class::Local,
+        note: notes::GENERATED,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::Claude,
         path: "ide/",
