@@ -91,8 +91,13 @@ impl TakoApp {
         let codex_primary = self.codex_metrics.limit_5h;
         let codex_secondary = self.codex_metrics.limit_week;
         let selected_limit_service = self.limit_service;
+        // #1962: フォーカス中のペインの mod が Claude Code の画面にバーを描いている = claude の
+        // 5h / 7d / ctx の区画を出さない（サービスの選択チップは残す = codex へ切り替えられる）
+        let claude_yields = self.claude_bar_owner.yields();
+        let claude_hidden = claude_yields && selected_limit_service == LimitService::Claude;
         // 選択中のサービスに応じてメーター表示データを選択（#357）
         let (limit_5h, limit_week) = match selected_limit_service {
+            LimitService::Claude if claude_yields => (None, None),
             LimitService::Claude => (claude_5h, claude_week),
             LimitService::Codex => (codex_primary, codex_secondary),
             LimitService::Agy => (None, None),
@@ -550,7 +555,8 @@ impl TakoApp {
                         d.children(limit_5h.map(|v| meter(l1, v)))
                             .children(limit_week.map(|v| meter(l2, v)))
                     })
-                    .when(!has_data, |d| {
+                    // #1962: mod が描いているときは「--」も出さない（データが無いのではない）
+                    .when(!has_data && !claude_hidden, |d| {
                         let label = if selected_limit_service == LimitService::Agy {
                             "unsupported"
                         } else {
@@ -633,8 +639,8 @@ impl TakoApp {
                 }
                 row
             }))
-            // ctx メーター（カンプ: タブ名 + 70/90% 目盛り線つきバー）
-            .child(
+            // ctx メーター（カンプ: タブ名 + 70/90% 目盛り線つきバー）。#1962: mod がバーを描いていれば出さない
+            .children((!claude_yields).then(|| {
                 div()
                     .flex()
                     .flex_row()
@@ -701,8 +707,8 @@ impl TakoApp {
                             .text_size(px(10.5))
                             .text_color(hsla(theme.text_muted))
                             .child(SharedString::from(detail))
-                    })),
-            )
+                    }))
+            }))
             .child(
                 toggle(
                     "statusbar-tmux",

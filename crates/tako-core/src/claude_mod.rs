@@ -22,11 +22,15 @@
 //!   （#1960。[`crate::claude_mod_ui`]）で、応答の `band_request` で全 mod へ中継する
 //! - **定型の UI 設定（S7-2 #1960）**: 報告の応答の `tako.view.ui` に検証済みの ui.json を載せる
 //!   （[`BandView::ui`]。mod はファイルを読まない）
+//! - **描画の主を mod へ（S7-3 #1962）**: 帯は他の mod の行を包んで 1 行（ボタン込み）、使用制限・ctx の
+//!   バーは入力欄の下の行の末尾。描くか（[`usage_bar_decision`]）とボタンの CLI の引数は tako が決めて
+//!   `view` に載せ、mod は描いたものを報告の `renders`（[`ModRenders`]）で返す。フォーカス中のペインの
+//!   mod がバーを描いていれば、ステータスバーの claude の区画を引っ込める（[`claude_bar_owner`]）
 //!
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -66,6 +70,10 @@ pub const SCHEMA: u32 = 1;
 /// 帯・サイドバーを描かない A/B の入口（S3 #1881）。報告の受け取りと一次ソース化（S1 / S2）は
 /// 続けるが、`tako mod report` の応答に帯・サイドバーの材料（`view`）を載せない = mod は何も描かない
 pub const S3_LEGACY_ENV: &str = "TAKO_1877_S3_LEGACY";
+/// 帯を S3（#1881）の描き方へ戻す A/B の入口（S7-3 #1962）。応答の `view` に `band_style: "s3"` を
+/// 載せ、バーの判断（`usage_bar`）とボタンの引数（`button_args`）を載せない = mod は `next(e)` を
+/// 包まず、ボタンとバーを描かず、`renders` を報告しない。ステータスバーの claude の区画も止めない
+pub const S7_LEGACY_ENV: &str = "TAKO_1877_S7_LEGACY";
 
 /// env の一覧の区切り（PATH と同じ。macOS / Linux は `:`、Windows は `;`）
 pub const LIST_SEP: char = if cfg!(windows) { ';' } else { ':' };
@@ -406,6 +414,11 @@ pub fn s3_legacy() -> bool {
     std::env::var_os(S3_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
+/// S7-3 の A/B（[`S7_LEGACY_ENV`]）が立っているか
+pub fn s7_legacy() -> bool {
+    std::env::var_os(S7_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
 /// #1903 の A/B（[`LIMITS_LEGACY_ENV`]）が立っているか
 pub fn limits_legacy() -> bool {
     std::env::var_os(LIMITS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
@@ -585,6 +598,42 @@ pub struct ModBand {
     pub toggled_at: Option<u64>,
 }
 
+/// mod が Claude Code の画面に描いているもの（S7-3 #1962。報告の `renders`）。
+///
+/// **無い = 何も描いていない**（S7-3 前の mod・A/B の `TAKO_1877_S7_LEGACY`）。tako 側の表示を止める
+/// 条件（[`claude_bar_owner`]）はこれを見る = mod が描いたと言ったものだけを tako が引っ込める
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModRenders {
+    /// 直近の帯の描画で tako の行を描いたか
+    #[serde(default)]
+    pub band: bool,
+    /// 使用制限・ctx のバーを描いた置き場（`prompt_hint` / `band`）。描いていなければ `None`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_bar: Option<String>,
+    /// 直近の帯の描画で描いたボタンの数
+    #[serde(default)]
+    pub buttons: u32,
+    /// 起きてから帯（`AbovePrompt`）のフックが 1 度でも呼ばれたか
+    #[serde(default)]
+    pub band_hook: bool,
+    /// 起きてから入力欄の下の行（`PromptHint`）のフックが 1 度でも呼ばれたか。これが真で
+    /// [`Self::band_hook`] が偽なら、外側の他の mod が `next` を呼ばずに帯を描いている
+    /// （[`band_hidden_by_other_mod`]）
+    #[serde(default)]
+    pub hint_hook: bool,
+}
+
+/// ボタンを押した結果（S7-3 #1962。報告の `last_press`）。**語彙の種類と成否だけ**を載せる
+/// （ラベル・コマンド・入力欄へ入れる文は載せない）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModPress {
+    /// `slash` / `tako` / `shell` / `prompt`
+    pub kind: String,
+    pub ok: bool,
+    /// 押した時刻（epoch ms）
+    pub at: u64,
+}
+
 /// mod からの報告（`schema: 1`。設計書 §4.2 / `claude-mod/types/index.d.ts`）。
 ///
 /// **本文・プロンプト・ツールの引数を持つフィールドを足さない**（AGENTS.md の絶対ルール。
@@ -630,6 +679,17 @@ pub struct ModReport {
     /// `tako@skills-dir` を止めた）。これを最後に mod は報告を止める
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dormant: Option<String>,
+    /// 利用者の Claude Code に statusLine が設定されているか（S7-3 #1962。`$.settings.read()` の
+    /// `statusLine` の有無だけで、中身は載せない）。画面の読み取りと合わせてバーを描くかを決める
+    /// （[`usage_bar_decision`]）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<bool>,
+    /// mod が描いているもの（S7-3 #1962。無い = 何も描いていない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renders: Option<ModRenders>,
+    /// 最後に押されたボタン（S7-3 #1962）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_press: Option<ModPress>,
     #[serde(default)]
     pub ended: bool,
 }
@@ -689,6 +749,12 @@ pub fn parse_report(value: serde_json::Value) -> Result<ModReport, String> {
         for segment in &mut band.segments {
             clip(segment);
         }
+    }
+    if let Some(place) = report.renders.as_mut().and_then(|r| r.usage_bar.as_mut()) {
+        clip(place);
+    }
+    if let Some(press) = &mut report.last_press {
+        clip(&mut press.kind);
     }
     Ok(report)
 }
@@ -1345,6 +1411,17 @@ pub struct BandView {
     pub band_request: Option<BandRequest>,
     /// 定型の UI 設定（#1960。検証済みの ui.json。mod の契約は `TakoUi`）
     pub ui: crate::claude_mod_ui::UiConfig,
+    /// 使用制限・ctx のバーを描くか（S7-3 #1962。[`usage_bar_decision`]。A/B では載せない）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_bar: Option<UsageBarDecision>,
+    /// `tako` / `shell` のボタンを押したときに mod が叩く CLI の引数（ボタンの id → tako の後ろの
+    /// argv。S7-3 #1962。**組むのは tako** = `claude_mod_ui::button_args`。A/B では載せない）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub button_args: Option<BTreeMap<String, Vec<String>>>,
+    /// 帯の描き方。`s3` = S7-3 前（`next` を包まない・ボタンとバーを描かない。A/B の
+    /// `TAKO_1877_S7_LEGACY`）。無い = S7-3 の描き方
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub band_style: Option<&'static str>,
 }
 
 /// [`band_view`] の入力
@@ -1362,6 +1439,15 @@ pub struct BandInput {
     pub thresholds: BandThresholds,
     /// 定型の UI 設定（#1960）。帯のトグルの中継（`band_request`）もここから作る
     pub ui: crate::claude_mod_ui::UiConfig,
+    /// このペインの報告の `status_line`（利用者の statusLine の有無。S7-3 #1962）
+    pub status_line: Option<bool>,
+    /// このペインの画面の末尾に ctx / 使用制限の数値が出ているか（mod のバーは除く。
+    /// [`screen_shows_usage`]）
+    pub screen_shows_usage: bool,
+    /// このペインの cwd（`open-cwd` のボタンの引数。分からなければそのボタンは描かれない）
+    pub cwd: Option<String>,
+    /// A/B の `TAKO_1877_S7_LEGACY`（[`s7_legacy`]）
+    pub s7_legacy: bool,
 }
 
 impl Default for BandThresholds {
@@ -1394,6 +1480,29 @@ pub fn band_view(input: BandInput) -> BandView {
     workers.sort_by_key(|w| (w.attention.is_none(), w.pane));
     workers.truncate(BAND_MAX_WORKERS);
     let ctx_percent = input.ctx.as_ref().and_then(|c| c.percent);
+    let (usage_bar, button_args, band_style) = if input.s7_legacy {
+        (None, None, Some("s3"))
+    } else {
+        (
+            Some(usage_bar_decision(
+                input.ui.usage_bar.place,
+                input.status_line,
+                input.screen_shows_usage,
+            )),
+            Some(crate::claude_mod_ui::button_args(
+                &input.ui.buttons,
+                input.pane,
+                input.cwd.as_deref(),
+            )),
+            None,
+        )
+    };
+    // バーを描くなら帯の ctx / 使用制限の警告は出さない（同じ値を 2 か所で動かさない。§9.3）
+    let warnings = if usage_bar.as_ref().is_some_and(|b| b.draw) {
+        Vec::new()
+    } else {
+        band_warnings(ctx_percent, &input.rate_limits, input.thresholds)
+    };
     BandView {
         pane: input.pane,
         pane_title: input.pane_title,
@@ -1402,7 +1511,7 @@ pub fn band_view(input: BandInput) -> BandView {
         worker_count,
         attention,
         workers,
-        warnings: band_warnings(ctx_percent, &input.rate_limits, input.thresholds),
+        warnings,
         ctx: input.ctx,
         rate_limits: input
             .rate_limits
@@ -1416,7 +1525,173 @@ pub fn band_view(input: BandInput) -> BandView {
         thresholds: input.thresholds,
         band_request: input.ui.band_request(),
         ui: input.ui,
+        usage_bar,
+        button_args,
+        band_style,
     }
+}
+
+// --- S7-3（#1962）: バー・ボタン・帯の共存と、tako 側の表示を止める条件 -------------------
+//
+// 何を描くかの判断はここ（tako 側）。mod は応答の `view` に従って描き、描いたものを報告の
+// `renders` で返す。tako は `renders` を見て自分の表示（ステータスバーの claude の区画）を引っ込める
+
+/// mod のバーの棒の 8 段（`register.ts` の `BAR_GLYPHS` と同じ。単体テストが突き合わせる）。
+/// バーの 1 項目は `<ラベル> <棒> <N>%`（例 `5h ▁ 4%`）
+pub const BAR_GLYPHS: &str = "▁▂▃▄▅▆▇█";
+/// 画面の末尾で statusLine の数値を探す行数（フッター = 入力欄の下の数行）
+pub const USAGE_SCAN_LINES: usize = 8;
+
+/// バー（使用制限・ctx）を mod に描かせるか（応答の `view.usage_bar`）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UsageBarDecision {
+    pub draw: bool,
+    /// 描かせない理由（`off` = ui.json の置き場が off / `status_line` = 利用者の statusLine が既に
+    /// ctx / 使用制限を出している）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// バーを描かせるかを決める（純関数。§9.5「利用者の statusLine」）。
+///
+/// statusLine が**設定されていて**画面の末尾に数値が出ているときだけ止める。設定の有無だけで
+/// 止めると、ctx を出さない statusLine（ブランチ名だけ等）の利用者にバーが出ない。画面だけで
+/// 止めると、mod 自身が描いたバーを見て止まり、次に消えて描き直す往復になる（画面の読み取りは
+/// mod のバーを除いて数える = [`screen_shows_usage`]）
+pub fn usage_bar_decision(
+    place: crate::claude_mod_ui::UsageBarPlace,
+    status_line: Option<bool>,
+    screen_shows_usage: bool,
+) -> UsageBarDecision {
+    if place == crate::claude_mod_ui::UsageBarPlace::Off {
+        return UsageBarDecision {
+            draw: false,
+            reason: Some("off"),
+        };
+    }
+    if status_line == Some(true) && screen_shows_usage {
+        return UsageBarDecision {
+            draw: false,
+            reason: Some("status_line"),
+        };
+    }
+    UsageBarDecision {
+        draw: true,
+        reason: None,
+    }
+}
+
+/// 画面の末尾（[`USAGE_SCAN_LINES`] 行）に ctx% か使用制限（`5h` / `7d` / `週`）の数値が出ているか。
+/// **mod のバー（`5h ▁ 4%` の形）は除いて**数える（純関数）
+pub fn screen_shows_usage(lines: &[String]) -> bool {
+    use crate::terminal::extract_labeled_percent as labeled;
+    lines.iter().rev().take(USAGE_SCAN_LINES).any(|line| {
+        let line = strip_mod_bar(line);
+        let lower = line.to_ascii_lowercase();
+        labeled(&line, "5h").is_some()
+            || labeled(&line, "7d").is_some()
+            || labeled(&line, "週").is_some()
+            || labeled(&lower, "ctx").is_some()
+            || labeled(&lower, "context").is_some()
+    })
+}
+
+/// 行から mod のバーの項目（`5h ▁ 4%` / `7d ▂ 22%` / `ctx ▁ 6%`）を取り除く
+fn strip_mod_bar(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    'scan: while let Some(ch) = rest.chars().next() {
+        for label in ["5h", "7d", "ctx"] {
+            if let Some(len) = rest
+                .strip_prefix(label)
+                .and_then(bar_item_tail_len)
+                .map(|tail| label.len() + tail)
+            {
+                rest = &rest[len..];
+                continue 'scan;
+            }
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// ラベルの後ろの ` ▁ 4%`（空白・棒・空白・数字・`%`）のバイト長
+fn bar_item_tail_len(s: &str) -> Option<usize> {
+    let after_space = s.strip_prefix(' ')?;
+    let glyph = after_space.chars().next()?;
+    if !BAR_GLYPHS.contains(glyph) {
+        return None;
+    }
+    let after_glyph = after_space[glyph.len_utf8()..].strip_prefix(' ')?;
+    let digits = after_glyph.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let after = after_glyph[digits..].strip_prefix('%')?;
+    Some(s.len() - after.len())
+}
+
+/// 画面下のステータスバーの claude の区画（5h / 7d / ctx）を誰が出すか
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeBarOwner {
+    /// tako のステータスバーが今のまま出す（理由のコード）
+    Tako(&'static str),
+    /// フォーカス中のペインの mod が Claude Code の画面に描いている（置き場）
+    Mod(String),
+}
+
+impl ClaudeBarOwner {
+    /// ステータスバーから claude の区画を外すか
+    pub fn yields(&self) -> bool {
+        matches!(self, Self::Mod(_))
+    }
+
+    /// `drawn_by` の語（`mod` / `tako`）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tako(_) => "tako",
+            Self::Mod(_) => "mod",
+        }
+    }
+
+    /// `tako mod` / `tako limit-service --refresh` に載せる形
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Tako(reason) => serde_json::json!({ "drawn_by": "tako", "reason": reason }),
+            Self::Mod(place) => serde_json::json!({ "drawn_by": "mod", "place": place }),
+        }
+    }
+}
+
+/// ステータスバーの claude の区画を止める条件（§9.6。**判断はこの 1 本**）。
+///
+/// `focused` は**フォーカス中のペイン**の新鮮な報告（45 秒以内。無い = mod なし・古い・codex / agy /
+/// シェルのペイン）。報告の `renders.usage_bar` に置き場が載っている = mod がバーを描いたと
+/// 言ったときだけ mod に任せる（ui.json の置き場が off なら mod は描かないので載らない）。
+/// A/B（`legacy` = [`S7_LEGACY_ENV`]）では止めない。値の取り方（FR-2.42.18）は変えない
+pub fn claude_bar_owner(focused: Option<&ModReport>, legacy: bool) -> ClaudeBarOwner {
+    if legacy {
+        return ClaudeBarOwner::Tako("legacy_env");
+    }
+    let Some(report) = focused else {
+        return ClaudeBarOwner::Tako("no_fresh_report");
+    };
+    match report.renders.as_ref().and_then(|r| r.usage_bar.clone()) {
+        Some(place) if !place.is_empty() => ClaudeBarOwner::Mod(place),
+        _ => ClaudeBarOwner::Tako("mod_not_drawing"),
+    }
+}
+
+/// 帯が他の mod に隠されているか（§9.5）。入力欄の下の行のフックは呼ばれているのに帯のフックが
+/// 1 度も呼ばれていない = 外側の他の mod が `next` を呼ばずに帯を描いている（tako が env で
+/// 外側にいれば起きないが、skills-dir で内側に読まれると起きる）
+pub fn band_hidden_by_other_mod(report: &ModReport) -> bool {
+    report
+        .renders
+        .as_ref()
+        .is_some_and(|r| r.hint_hook && !r.band_hook)
 }
 
 #[cfg(test)]
@@ -2284,6 +2559,10 @@ mod tests {
                 ui.band.toggled_at = Some(42);
                 ui
             },
+            // S3 の帯の警告（閾値超え）を見る。S7-3 ではバーを描くと警告は帯から外れる
+            // （issue1962_バーを描くなら帯の警告を外しabでは今の材料のまま）
+            s7_legacy: true,
+            ..BandInput::default()
         });
         assert_eq!(view.worker_count, BAND_MAX_WORKERS + 5, "数は全部数える");
         assert_eq!(view.attention, 2);
@@ -2347,5 +2626,241 @@ mod tests {
                 at: 20
             })
         );
+    }
+
+    fn renders(usage_bar: Option<&str>, band_hook: bool, hint_hook: bool) -> ModReport {
+        let mut v = report_json();
+        v["renders"] = serde_json::json!({
+            "band": true, "usage_bar": usage_bar, "buttons": 1,
+            "band_hook": band_hook, "hint_hook": hint_hook,
+        });
+        parse_report(v).unwrap()
+    }
+
+    /// #1962: renders / status_line / last_press は読めて、無い報告（S7-3 前の mod）も読める
+    #[test]
+    fn issue1962_報告のrendersは後方互換で読める() {
+        let r = renders(Some("prompt_hint"), true, true);
+        let got = r.renders.as_ref().unwrap();
+        assert!(got.band && got.band_hook && got.hint_hook);
+        assert_eq!(got.usage_bar.as_deref(), Some("prompt_hint"));
+        assert_eq!(got.buttons, 1);
+        let mut v = report_json();
+        v["status_line"] = serde_json::json!(true);
+        v["last_press"] = serde_json::json!({"kind": "slash", "ok": true, "at": 5});
+        let r = parse_report(v).unwrap();
+        assert_eq!(r.status_line, Some(true));
+        assert_eq!(
+            r.last_press,
+            Some(ModPress {
+                kind: "slash".into(),
+                ok: true,
+                at: 5
+            })
+        );
+        let old = parse_report(report_json()).unwrap();
+        assert!(old.renders.is_none() && old.status_line.is_none() && old.last_press.is_none());
+        // 一部だけ送る mod（キーの欠け）も既定で読む
+        let mut v = report_json();
+        v["renders"] = serde_json::json!({"band": true});
+        let r = parse_report(v).unwrap();
+        assert_eq!(r.renders.unwrap().usage_bar, None);
+        // 長すぎる置き場の語は切る
+        let mut v = report_json();
+        v["renders"] = serde_json::json!({"usage_bar": "x".repeat(1000)});
+        assert_eq!(
+            parse_report(v)
+                .unwrap()
+                .renders
+                .unwrap()
+                .usage_bar
+                .unwrap()
+                .len(),
+            MAX_TEXT
+        );
+    }
+
+    /// #1962: バーを描かせるか。statusLine が設定されていて画面に数値が出ているときだけ止める
+    #[test]
+    fn issue1962_バーはstatus_lineが数値を出しているときだけ止める() {
+        use crate::claude_mod_ui::UsageBarPlace as P;
+        let draw = |place, line, screen| usage_bar_decision(place, line, screen);
+        assert_eq!(
+            draw(P::PromptHint, None, false),
+            UsageBarDecision {
+                draw: true,
+                reason: None
+            }
+        );
+        assert!(
+            draw(P::PromptHint, Some(false), true).draw,
+            "statusLine なし"
+        );
+        assert!(
+            draw(P::PromptHint, Some(true), false).draw,
+            "ctx を出さない statusLine"
+        );
+        assert_eq!(
+            draw(P::PromptHint, Some(true), true).reason,
+            Some("status_line")
+        );
+        assert_eq!(draw(P::Band, Some(true), true).reason, Some("status_line"));
+        assert_eq!(draw(P::Off, None, false).reason, Some("off"));
+        assert!(!draw(P::Off, None, false).draw);
+    }
+
+    /// #1962: 画面の読み取りは mod 自身が描いたバーを数えない（描いたバーを見て止まる往復を作らない）
+    #[test]
+    fn issue1962_画面の数値はmodのバーを除いて数える() {
+        let lines = |text: &[&str]| text.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // mod のバーだけ（PromptHint の末尾）
+        assert!(!screen_shows_usage(&lines(&[
+            "❯ ",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · 5h ▁ 4% 7d ▂ 22% ctx ▁ 6%",
+        ])));
+        assert!(!screen_shows_usage(&lines(&["ctx █ 100% 5h ▄ 50%"])));
+        // 利用者の statusLine（#217 の形）
+        assert!(screen_shows_usage(&lines(&[
+            "  ⏵⏵ auto mode on",
+            "  [Opus 5] ctx 45% (90K/200K) 5h 12% 7d 3%",
+        ])));
+        assert!(screen_shows_usage(&lines(&["Context: 45%"])));
+        assert!(screen_shows_usage(&lines(&["週 30%"])));
+        // バーと statusLine が同じ行に並んでも statusLine の数値は残る
+        assert!(screen_shows_usage(&lines(&["5h ▁ 4% | ctx 45%"])));
+        // 数値の無い statusLine（ブランチ名だけ）
+        assert!(!screen_shows_usage(&lines(&["main* ~/work"])));
+        // 棒の形が崩れたもの（棒が無い・数字が無い）は除かない = 利用者の表示として数える
+        assert!(screen_shows_usage(&lines(&["5h 4%"])));
+        assert!(screen_shows_usage(&lines(&["ctx ▁ x 6%"])));
+        // 走査は末尾 USAGE_SCAN_LINES 行だけ（会話の本文の ctx 45% は数えない）
+        let mut many = lines(&["ctx 45%"]);
+        many.extend((0..USAGE_SCAN_LINES).map(|_| String::new()));
+        assert!(!screen_shows_usage(&many));
+        assert!(!screen_shows_usage(&[]));
+    }
+
+    /// #1962: register.ts の棒の 8 段は Rust の BAR_GLYPHS と同じ（画面の読み取りが除く形と揃う）
+    #[test]
+    fn issue1962_バーの棒はregister_tsと揃う() {
+        let want = format!("const BAR_GLYPHS = '{BAR_GLYPHS}'");
+        assert!(
+            REGISTER_TS.contains(&want),
+            "register.ts の BAR_GLYPHS が {BAR_GLYPHS} と違う（{want} を探した）"
+        );
+    }
+
+    /// #1962: ステータスバーの claude の区画を止める条件は「新鮮な報告 ∧ renders.usage_bar」だけ
+    #[test]
+    fn issue1962_ステータスバーのclaudeの区画はmodが描いたときだけ止める() {
+        let drawing = renders(Some("prompt_hint"), true, true);
+        assert_eq!(
+            claude_bar_owner(Some(&drawing), false),
+            ClaudeBarOwner::Mod("prompt_hint".into())
+        );
+        assert!(claude_bar_owner(Some(&drawing), false).yields());
+        // A/B
+        assert_eq!(
+            claude_bar_owner(Some(&drawing), true),
+            ClaudeBarOwner::Tako("legacy_env")
+        );
+        // 報告なし（mod なし・古い・codex / agy / シェルにフォーカス）
+        assert_eq!(
+            claude_bar_owner(None, false),
+            ClaudeBarOwner::Tako("no_fresh_report")
+        );
+        // 描いていない（statusLine が出している・置き場 off・値がまだ無い）・S7-3 前の mod
+        for report in [
+            renders(None, true, true),
+            parse_report(report_json()).unwrap(),
+        ] {
+            assert_eq!(
+                claude_bar_owner(Some(&report), false),
+                ClaudeBarOwner::Tako("mod_not_drawing")
+            );
+        }
+        let v = ClaudeBarOwner::Mod("band".into()).to_json();
+        assert_eq!(v["drawn_by"], "mod");
+        assert_eq!(v["place"], "band");
+        assert_eq!(ClaudeBarOwner::Tako("x").to_json()["reason"], "x");
+    }
+
+    /// #1962: 帯のフックが呼ばれず入力欄の下の行のフックだけが呼ばれた = 他の mod に隠された
+    #[test]
+    fn issue1962_帯が他のmodに隠されたことを見分ける() {
+        assert!(band_hidden_by_other_mod(&renders(None, false, true)));
+        assert!(!band_hidden_by_other_mod(&renders(None, true, true)));
+        // どちらもまだ（起きた直後・PromptHint ごと他の mod が描いている）は言い切らない
+        assert!(!band_hidden_by_other_mod(&renders(None, false, false)));
+        assert!(!band_hidden_by_other_mod(
+            &parse_report(report_json()).unwrap()
+        ));
+    }
+
+    /// #1962: バーを描くなら帯の ctx / 使用制限の警告は出さない。A/B では今の材料（S3）のまま
+    #[test]
+    fn issue1962_バーを描くなら帯の警告を外しabでは今の材料のまま() {
+        let input = || BandInput {
+            pane: 7,
+            lang: "ja",
+            ctx: Some(ModContext {
+                tokens: Some(850),
+                window: 1000,
+                percent: Some(85),
+            }),
+            rate_limits: vec![limit("five_hour", 92.0, "2026-10-08T19:30:00Z", 1)],
+            cwd: Some("/w".into()),
+            ..BandInput::default()
+        };
+        let view = band_view(input());
+        assert_eq!(
+            view.usage_bar,
+            Some(UsageBarDecision {
+                draw: true,
+                reason: None
+            })
+        );
+        assert!(
+            view.warnings.is_empty(),
+            "バーと帯で同じ値を 2 か所に出さない"
+        );
+        assert_eq!(view.band_style, None);
+        // 既定のボタンは slash の compact だけ = CLI の引数は載らない（空の表）
+        assert_eq!(view.button_args, Some(BTreeMap::new()));
+        // statusLine が数値を出している → バーを描かないので帯の警告（閾値超え）は今のまま
+        let view = band_view(BandInput {
+            status_line: Some(true),
+            screen_shows_usage: true,
+            ..input()
+        });
+        assert_eq!(view.usage_bar.as_ref().unwrap().reason, Some("status_line"));
+        assert_eq!(view.warnings.len(), 2);
+        // tako の操作のボタンは tako が CLI の引数を組んで渡す
+        let mut ui = crate::claude_mod_ui::UiConfig::default();
+        ui.buttons.push(crate::claude_mod_ui::Button {
+            id: "split-right".into(),
+            label: "split right".into(),
+            hotkey: "s".into(),
+            action: crate::claude_mod_ui::ButtonAction::Tako {
+                op: crate::claude_mod_ui::TakoOp::SplitRight,
+            },
+        });
+        let view = band_view(BandInput { ui, ..input() });
+        assert_eq!(
+            view.button_args.unwrap()["split-right"],
+            ["split", "--pane", "7", "--right"]
+        );
+        // A/B: S3 の描き方の印だけを載せ、バーの判断とボタンの引数は載せない
+        let view = band_view(BandInput {
+            s7_legacy: true,
+            ..input()
+        });
+        assert_eq!(view.band_style, Some("s3"));
+        assert_eq!(view.usage_bar, None);
+        assert_eq!(view.button_args, None);
+        assert_eq!(view.warnings.len(), 2);
+        let v = serde_json::to_value(&view).unwrap();
+        assert!(v.get("usage_bar").is_none() && v.get("button_args").is_none());
+        assert_eq!(v["band_style"], "s3");
     }
 }

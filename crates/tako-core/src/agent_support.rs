@@ -251,6 +251,8 @@ pub mod keys {
     pub const AGENT_SELECT_AT_SPAWN: &str = "agent_select_at_spawn";
     /// エージェントの画面の中（プロンプトの上の帯・サイドバー）に tako の状況を出す（#1881）
     pub const CLAUDE_MOD_BAND: &str = "claude_mod_band";
+    /// エージェントの画面の中に定型のカスタムボタン（/compact・tako の操作等）を描き、押して実行する（#1962）
+    pub const CLAUDE_MOD_BUTTONS: &str = "claude_mod_buttons";
     /// エージェント自身の設定 dir へ tako の拡張を入れる（setup。外せる・他の拡張と取り合わない。#1959）
     pub const CLAUDE_MOD_INSTALL: &str = "claude_mod_install";
     /// エージェントのプロセス内の拡張（Claude Code の mod）から状態を構造で受け取る（#1879）
@@ -760,8 +762,8 @@ pub const MATRIX: &[AgentFeature] = &[
     AgentFeature {
         key: keys::CLAUDE_MOD_BAND,
         summary: Note::new(
-            "エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー）に tako のペイン・タブ・worker と要注意の数を出す",
-            "Shows tako's pane, tab, workers and how many need attention inside the agent's own screen (a one-line band above the prompt and a /tako sidebar)",
+            "エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー・入力欄の下の行の使用制限 / ctx のバー）に tako のペイン・タブ・worker と要注意の数を出す。利用者の他の拡張の帯は消さない",
+            "Shows tako's pane, tab, workers and how many need attention inside the agent's own screen (a one-line band above the prompt, a /tako sidebar and a rate-limit / context bar on the hint line under the prompt), without hiding the user's other extensions' bands",
         ),
         claude: S::Supported,
         codex: pending(notes::NOT_INVESTIGATED, 1885),
@@ -771,7 +773,27 @@ pub const MATRIX: &[AgentFeature] = &[
             "#1881: Claude Code 2.1.294 の mod（AbovePrompt の帯・$.ui.open のペイン・$.store のトグル）を\
              隔離 GUI のペインと 80 / 144 / 300 桁の隔離 tmux で実 claude に描かせ、帯が 1 行に収まること・\
              ダイアログの後に戻ること・トグルが再起動後も保たれることを画面の capture で確かめた\
-             （scripts/test-claude-mod-band-1881.sh）",
+             （scripts/test-claude-mod-band-1881.sh）。#1962: 帯は next(e) の答え（他の mod の行）を包む形にし、\
+             帯を描く別の mod と読み込み順を入れ替えて両方の行が出ること・PromptHint の末尾のバーが出て\
+             同じときにステータスバーの claude の区画が消え報告を止めて 45 秒で戻ること・statusLine が ctx を\
+             出す構成では描かないことを一時の設定 dir の実 claude で確かめた（scripts/test-mod-band-buttons-1962.sh）",
+        ),
+    },
+    AgentFeature {
+        key: keys::CLAUDE_MOD_BUTTONS,
+        summary: Note::new(
+            "エージェントの画面の中（プロンプトの上の帯）に定型のカスタムボタン（既定は /compact。組み込みコマンド・tako の操作・新しいペインで実行するコマンド・入力欄へ入れる文）を描き、キーで押して実行する",
+            "Draws fixed-vocabulary custom buttons (default /compact; built-in commands, tako actions, a command run in a new pane, or text put in the prompt) inside the agent's own screen (the band above the prompt), pressed from the keyboard",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1885),
+        agy: pending(notes::NOT_INVESTIGATED, 1885),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1962: 一時の設定 dir の実 Claude Code 2.1.294 で、帯の /compact のボタンを ctrl+x → Tab → ホットキーで\
+             押すと会話が圧縮され、tako の操作（split right）のボタンで隔離 GUI のペインが増えた。押した結果（種類と\
+             成否）は tako mod の行の report.last_press に出る（scripts/test-mod-band-buttons-1962.sh）。クリックで\
+             押すのは tako がクリックを TUI へ渡す #1961 から",
         ),
     },
     AgentFeature {

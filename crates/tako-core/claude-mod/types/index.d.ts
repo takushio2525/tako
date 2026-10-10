@@ -1,6 +1,6 @@
 // tako mod が tako へ送る報告の契約（#1879。設計書 .agent/plans/2026-10-tako-mod.md §4.2）と、
-// tako が応答で返す帯・サイドバーの材料（#1881。§7 S3）・定型の UI 設定（#1960。§9.7）、mod の $.state の契約。
-// 受け手 / 送り手の正本は tako_core::claude_mod::{ModReport, ModBand, BandView} と tako_core::claude_mod_ui::UiConfig。
+// tako が応答で返す帯・サイドバーの材料（#1881。§7 S3）・定型の UI 設定（#1960。§9.7）・描いたもの（#1962）、mod の $.state の契約。
+// 受け手 / 送り手の正本は tako_core::claude_mod::{ModReport, ModBand, ModRenders, BandView} と tako_core::claude_mod_ui::UiConfig。
 // キーを増やすときは両方を同じコミットで直す。
 //
 // **会話の本文・プロンプト・ツールの引数は載せない**（AGENTS.md の絶対ルール）。
@@ -61,8 +61,39 @@ export type TakoModReport = {
    * 止めた（env の注入で読まれていても従う）。これを最後に mod は報告を止める
    */
   dormant?: 'user_disabled'
+  /**
+   * 利用者の Claude Code に statusLine が設定されているか（#1962。$.settings.read() の statusLine の
+   * 有無だけで中身は載せない。読めなければ欠ける）。tako は画面の読み取りと合わせてバーを描くか決める
+   */
+  status_line?: boolean
+  /** 描いているもの（#1962。無い = 何も描いていない = S7-3 前の mod・A/B の S3 の描き方） */
+  renders?: TakoRenders
+  /** 最後に押されたボタン（#1962。種類と成否だけ） */
+  last_press?: TakoPress
   /** session.end を受けた最後の報告。tako はそのペインの報告を即座に捨てる */
   ended: boolean
+}
+
+/** 描いているもの（tako_core::claude_mod::ModRenders）。tako はこれを見て自分の表示を引っ込める */
+export type TakoRenders = {
+  /** 直近の帯の描画で tako の行を描いたか */
+  band: boolean
+  /** 使用制限・ctx のバーを描いた置き場（描いていなければ欠ける） */
+  usage_bar?: 'prompt_hint' | 'band'
+  /** 直近の帯の描画で描いたボタンの数 */
+  buttons: number
+  /** 起きてから帯（AbovePrompt）のフックが呼ばれたか（偽で hint_hook が真 = 外側の他の mod に帯を隠された） */
+  band_hook: boolean
+  /** 起きてから入力欄の下の行（PromptHint）のフックが呼ばれたか */
+  hint_hook: boolean
+}
+
+/** ボタンを押した結果（tako_core::claude_mod::ModPress）。ラベル・コマンド・入力欄へ入れる文は載せない */
+export type TakoPress = {
+  kind: 'slash' | 'tako' | 'shell' | 'prompt'
+  ok: boolean
+  /** 押した時刻（epoch ms） */
+  at: number
 }
 
 /** 帯（プロンプトの上の 1 行）の状態（tako_core::claude_mod::ModBand） */
@@ -116,6 +147,15 @@ export type TakoView = {
   band_request?: { hidden: boolean; at: number }
   /** 定型の UI 設定（#1960。tako が検証した値だけが届く。古い tako の応答には無い） */
   ui?: TakoUi
+  /**
+   * 使用制限・ctx のバーを描くか（#1962。tako が決める: 置き場が off・利用者の statusLine が既に数値を
+   * 出している = 描かない）。A/B と古い tako の応答には無い
+   */
+  usage_bar?: { draw: boolean; reason?: 'off' | 'status_line' }
+  /** tako / shell のボタンを押したときに叩く CLI の引数（ボタンの id → tako の後ろの argv。tako が組む） */
+  button_args?: Record<string, string[]>
+  /** 帯の描き方。's3' = #1962 前（next を包まない・ボタンとバーなし。A/B の TAKO_1877_S7_LEGACY） */
+  band_style?: 's3'
 }
 
 /** 帯に並べる区切り（tako_core::claude_mod_ui::BandSegment） */

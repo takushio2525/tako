@@ -1679,7 +1679,7 @@ fn extract_model_name(line: &str) -> Option<String> {
 
 /// 「<label> NN%」形式のパーセント値を抽出する（#217。ラベルの直前が英数字なら
 /// 別トークンの一部とみなして飛ばす。例: "15h" の "5h" 誤マッチ防止）
-fn extract_labeled_percent(line: &str, label: &str) -> Option<u32> {
+pub(crate) fn extract_labeled_percent(line: &str, label: &str) -> Option<u32> {
     let mut search = 0;
     while let Some(rel) = line[search..].find(label) {
         let pos = search + rel;
