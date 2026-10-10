@@ -980,15 +980,27 @@ pub(super) fn build_request(
         "tako_welcome" => Request::Welcome {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
-        "tako_show_command" => Request::ShowCommand {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            commands: command_array_arg(args, "commands")?,
-            label: str_arg(args, "label")?.map(|s| s.to_string()),
-            pane: u64_arg(args, "pane")?,
-            card: u64_arg(args, "card")?,
-            index: u64_arg(args, "index")?.map(|i| i as usize),
-            focus: bool_arg(args, "focus")?,
-        },
+        "tako_show_command" => {
+            let action = str_arg(args, "action")?.map(|s| s.to_string());
+            let card = u64_arg(args, "card")?;
+            // #1958: pane 省略時は呼び出し元（= 自分の会話ペイン。カタログの説明どおり）。
+            // card 指定の list / copy / run / dismiss は dispatch がカードの所在ペインを引くので
+            // 埋めない（呼び出し元を混ぜると別ペインのカードを呼び出し元のものと取り違える）
+            let pane = match action.as_deref().unwrap_or("show") {
+                "show" => Some(target_pane(args, caller)?),
+                _ if card.is_none() => u64_arg(args, "pane")?.or(caller),
+                _ => u64_arg(args, "pane")?,
+            };
+            Request::ShowCommand {
+                action,
+                commands: command_array_arg(args, "commands")?,
+                label: str_arg(args, "label")?.map(|s| s.to_string()),
+                pane,
+                card,
+                index: u64_arg(args, "index")?.map(|i| i as usize),
+                focus: bool_arg(args, "focus")?,
+            }
+        }
         "tako_config_share" => Request::ConfigShare {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             target: str_arg(args, "target")?.map(|s| s.to_string()),
@@ -1132,8 +1144,12 @@ pub(super) fn build_request(
         "tako_sessions" => {
             let action = str_arg(args, "action")?.ok_or("action を指定する")?;
             Request::Sessions {
-                // resume はペイン省略時に呼び出し元（master 自身の隣）へ分割する
-                pane: if action == "resume" && u64_arg(args, "tab")?.is_none() {
+                // resume はペイン省略時に呼び出し元（master 自身の隣）へ分割する。
+                // #1958: link も id・pane 省略時は呼び出し元の会話（埋めないと dispatch が
+                // アクティブタブのフォーカスペインへ倒れ、裏のペインの AI が他人の会話を受け取る）
+                pane: if (action == "resume" && u64_arg(args, "tab")?.is_none())
+                    || (action == "link" && str_arg(args, "id")?.is_none())
+                {
                     u64_arg(args, "pane")?.or(caller)
                 } else {
                     u64_arg(args, "pane")?

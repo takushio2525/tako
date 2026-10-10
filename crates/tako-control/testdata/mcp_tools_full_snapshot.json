@@ -4352,7 +4352,7 @@
           "type": "string"
         },
         "tab": {
-          "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）",
+          "description": "対象タブ ID（省略時は呼び出し元ペインのタブ。selection はアクティブタブのツリーだけを扱う = 省略時もアクティブタブ）",
           "type": "integer"
         }
       },
@@ -4518,7 +4518,7 @@
           "type": "string"
         },
         "pane": {
-          "description": "対象ペイン ID（target=pane は SSH 化するペイン / target=split は分割元。省略時は呼び出し元ペイン）",
+          "description": "対象ペイン ID（target=pane は SSH 化するペイン / target=split は分割元。省略時はアクティブタブのフォーカス中ペイン）",
           "type": "integer"
         },
         "remote_dir": {

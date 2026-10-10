@@ -29375,6 +29375,11 @@ mod self_test {
     mod ino_highlight_1949;
     #[cfg(feature = "visual-test")]
     use ino_highlight_1949::ino_highlight_visual;
+    /// #1958: pane を省いた MCP のカードが呼び出し元ペインの実ピクセルに描かれる（visual-test `show-command-caller`）
+    #[cfg(feature = "visual-test")]
+    mod show_command_caller_1958;
+    #[cfg(feature = "visual-test")]
+    use show_command_caller_1958::show_command_caller_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -43772,6 +43777,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1958: pane を省いた MCP の show のカードが呼び出し元の実ピクセルに描かれるか
+                "show-command-caller" => {
+                    show_command_caller_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -43784,7 +43795,8 @@ mod self_test {
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
-                         hover-1893 / hover-loading / hover-loading-real / mod-limits / ino-highlight）"
+                         hover-1893 / hover-loading / hover-loading-real / mod-limits / ino-highlight / \
+                         show-command-caller）"
                     );
                     std::process::exit(1);
                 }
