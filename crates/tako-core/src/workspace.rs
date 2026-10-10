@@ -728,6 +728,42 @@ impl Workspace {
             .collect()
     }
 
+    /// tako が抱えている**すべての**ペイン（表示中のタブ → バックグラウンドの順。#1945）。
+    ///
+    /// 「全エージェントのペイン」を数える・揃える側（自動復帰の一括切り替えと
+    /// ステータスバーの集計）はここを通す。表示中のタブだけを見ると、退避中の
+    /// master が一括から漏れる（#1945 の実害）
+    pub fn all_panes(&self) -> Vec<&Pane> {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .chain(self.all_background_panes())
+            .collect()
+    }
+
+    /// ペインを表示中のタブ・バックグラウンドのどちらからでも引く（#1945）
+    pub fn pane_anywhere(&self, pane_id: PaneId) -> Option<&Pane> {
+        self.tabs
+            .iter()
+            .find_map(|t| t.tree().get(pane_id))
+            .or_else(|| self.background_pane(pane_id).map(|(p, _, _)| p))
+    }
+
+    /// [`Self::pane_anywhere`] の可変版。退避中のペインの属性（自動復帰のオプトイン等）を
+    /// 表へ出さずに書き換えるのに使う（#1945。以前は「ペインが見つからない」で断っていた）
+    pub fn pane_anywhere_mut(&mut self, pane_id: PaneId) -> Option<&mut Pane> {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.tree().contains(pane_id)) {
+            return tab.tree_mut().get_mut(pane_id);
+        }
+        if let Some(p) = self.shelved.iter_mut().find(|p| p.pane.id() == pane_id) {
+            return Some(&mut p.pane);
+        }
+        self.shelved_tabs
+            .iter_mut()
+            .find(|t| t.tab.tree().contains(pane_id))
+            .and_then(|t| t.tab.tree_mut().get_mut(pane_id))
+    }
+
     /// tako が抱えている**すべての**ペイン ID（表示中のタブ + バックグラウンド）。
     ///
     /// 「このペインはまだ生きているか」を判定する側（コマンドカードの掃除・

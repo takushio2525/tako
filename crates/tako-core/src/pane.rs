@@ -101,6 +101,12 @@ pub struct Pane {
     /// 利用上限（5h / 週次）後の自動復帰を有効にするか（#813）。既定 OFF。
     /// ペイン単位のオプトインで、layout.json に保存して再起動・復元をまたいで維持する
     limit_autoresume: bool,
+    /// 自動復帰の値が「決まった」ペインか（#1945。セッション内で使い捨て・layout.json には
+    /// 保存しない）。人の切り替え・一括・プロファイル・spawn のどれかで値が入ったら立つ。
+    /// 立っていないペインだけが、エージェントになった瞬間に全体の既定を採る
+    /// （[`Self::adopt_limit_resume_default`]）。**個別に切ったペインを後から全体の既定で
+    /// 上書きしない**ための印
+    limit_autoresume_decided: bool,
 }
 
 impl Pane {
@@ -115,6 +121,7 @@ impl Pane {
             interactive_meta: None,
             exit_file: None,
             limit_autoresume: false,
+            limit_autoresume_decided: false,
         }
     }
 
@@ -139,6 +146,9 @@ impl Pane {
             interactive_meta: None,
             exit_file: None,
             limit_autoresume,
+            // 復元したペインの「決定済み」は呼び出し側（復元の後にエージェントかを
+            // 知っている GUI）が [`Self::mark_limit_resume_decided`] で立てる
+            limit_autoresume_decided: false,
         }
     }
 
@@ -222,9 +232,40 @@ impl Pane {
         self.limit_autoresume
     }
 
-    /// 自動復帰のオプトインを設定する（右クリック / CLI / MCP の 3 経路が同じここを通る）
+    /// 自動復帰のオプトインを設定する（右クリック / CLI / MCP の 3 経路が同じここを通る）。
+    /// 値が決まったので、以後は全体の既定（#1945）に上書きされない
     pub fn set_limit_autoresume(&mut self, enabled: bool) {
         self.limit_autoresume = enabled;
+        self.limit_autoresume_decided = true;
+    }
+
+    /// 自動復帰の値が決まっているか（#1945）
+    pub fn limit_resume_decided(&self) -> bool {
+        self.limit_autoresume_decided
+    }
+
+    /// 値は変えずに「決まった」とだけ印を付ける（#1945）。
+    /// 復元したエージェントのペイン（保存時の値が人の選択）と、プロファイルが
+    /// 明示 OFF を言っているペインに使う
+    pub fn mark_limit_resume_decided(&mut self) {
+        self.limit_autoresume_decided = true;
+    }
+
+    /// エージェントになったペインへ全体の既定（#1945）を当てる。値を変えたら true。
+    ///
+    /// **ON にする方向だけ**: 既定が OFF なら何もしない（印も立てない = 後から全体を
+    /// ON にしたときに、まだ決まっていないペインとして ON を採れる）。決まったペインは
+    /// 触らない（個別に OFF にしたペインを全体の ON で戻さない）
+    pub fn adopt_limit_resume_default(&mut self, default: bool) -> bool {
+        if self.limit_autoresume_decided || !default {
+            return false;
+        }
+        self.limit_autoresume_decided = true;
+        if self.limit_autoresume {
+            return false;
+        }
+        self.limit_autoresume = true;
+        true
     }
 }
 

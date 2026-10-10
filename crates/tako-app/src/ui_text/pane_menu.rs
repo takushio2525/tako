@@ -116,6 +116,70 @@ pub fn limit_resume_indicator() -> &'static str {
     )
 }
 
+/// ステータスバーの自動復帰の一括ボタン（#1945）。隣の「スリープ防止中」と同じく、
+/// いまの状態を短い言葉で言う（全部 ON / 全部 OFF / 一部は ON の数 / 対象の数）
+pub fn limit_resume_all_chip(summary: &tako_core::limit_resume_all::BulkSummary) -> String {
+    use tako_core::limit_resume_all::BulkState;
+    let (on, total) = (summary.on, summary.total);
+    match summary.state() {
+        BulkState::AllOn => tr!("自動復帰 ON", "Auto-resume on").to_string(),
+        BulkState::AllOff => tr!("自動復帰 OFF", "Auto-resume off").to_string(),
+        BulkState::Partial => tr!(
+            format!("自動復帰 一部 {on}/{total}"),
+            format!("Auto-resume {on}/{total}")
+        ),
+    }
+}
+
+/// 一括ボタンのツールチップ（#1945）。数・以後に立つペインの既定・押したときの向きを言葉で添える
+pub fn limit_resume_all_tooltip(summary: &tako_core::limit_resume_all::BulkSummary) -> String {
+    let (on, total) = (summary.on, summary.total);
+    let default = if summary.default {
+        tr!("有効", "on")
+    } else {
+        tr!("無効", "off")
+    };
+    let action = if summary.next_enabled() {
+        tr!(
+            "クリックで全エージェントの自動復帰を ON",
+            "Click to turn auto-resume on for every agent"
+        )
+    } else {
+        tr!(
+            "クリックで全エージェントの自動復帰を OFF",
+            "Click to turn auto-resume off for every agent"
+        )
+    };
+    tr!(
+        format!(
+            "リミット後の自動復帰: エージェント {on} / {total} ペインで有効（退避中を含む）\n以後に立つペイン: {default}\n{action}"
+        ),
+        format!(
+            "Auto-resume after limit: on in {on} of {total} agent panes (including backgrounded)\nNew panes: {default}\n{action}"
+        )
+    )
+}
+
+/// 一括ボタンの操作名（#1945。失敗の通知に「何を押したか」として出す）
+pub fn limit_resume_all_toggle_op(enabled: bool) -> &'static str {
+    if enabled {
+        tr!(
+            "自動復帰を全エージェントで ON",
+            "Turn auto-resume on for every agent"
+        )
+    } else {
+        tr!(
+            "自動復帰を全エージェントで OFF",
+            "Turn auto-resume off for every agent"
+        )
+    }
+}
+
+/// 全体の既定を settings.json へ残せなかったときの操作名（#1945）
+pub fn limit_resume_all_save() -> &'static str {
+    tr!("自動復帰の既定の保存", "Saving the auto-resume default")
+}
+
 /// 実行ペインのタイトルバーのバッジ（#1657）: まだ終了コードが届いていない
 pub fn run_badge_running() -> &'static str {
     tr!("実行中", "Running")
@@ -177,7 +241,35 @@ mod tests {
                 run_badge_tooltip(None),
                 run_badge_tooltip(Some(1)),
                 lsp_pending().to_string(),
+                limit_resume_all_chip(&summary(3, 3, true)),
+                limit_resume_all_chip(&summary(0, 3, false)),
+                limit_resume_all_chip(&summary(1, 3, true)),
+                limit_resume_all_tooltip(&summary(3, 3, true)),
+                limit_resume_all_tooltip(&summary(1, 3, false)),
+                limit_resume_all_toggle_op(true).to_string(),
+                limit_resume_all_toggle_op(false).to_string(),
+                limit_resume_all_save().to_string(),
             ]
+        });
+    }
+
+    fn summary(on: usize, total: usize, default: bool) -> tako_core::limit_resume_all::BulkSummary {
+        tako_core::limit_resume_all::BulkSummary { on, total, default }
+    }
+
+    /// #1945: 一括ボタンの 3 状態は言葉で見分けられる（色だけに頼らない）
+    #[test]
+    fn 一括ボタンの3状態は文言が違う() {
+        tests_support::for_each_lang(|| {
+            let texts = [
+                limit_resume_all_chip(&summary(3, 3, true)),
+                limit_resume_all_chip(&summary(0, 3, false)),
+                limit_resume_all_chip(&summary(1, 3, true)),
+            ];
+            assert_ne!(texts[0], texts[1]);
+            assert_ne!(texts[0], texts[2]);
+            assert_ne!(texts[1], texts[2]);
+            assert!(texts[2].contains("1/3"), "{}", texts[2]);
         });
     }
 

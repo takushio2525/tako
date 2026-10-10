@@ -3242,20 +3242,22 @@ struct AutosuggestArgs {
     state: Option<String>,
 }
 
-/// 利用上限後の自動復帰の引数（Issue #813）。
+/// 利用上限後の自動復帰の引数（Issue #813 / #1945）。
 ///
 /// `tako limit-resume` = 呼び出し元ペインの現在値、`on` / `off` で切替、
-/// `--all` で全ペインの一覧。素のコマンドが最短で済む形にしてある（#322）
+/// `--all` で全ペインの一覧、`on --all` / `off --all` で一括（ステータスバーのボタンと同じ）。
+/// 素のコマンドが最短で済む形にしてある（#322）
 #[derive(Args)]
 struct LimitResumeArgs {
     /// on / off（省略時は現在状態を表示）
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
-    /// 対象ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID）
+    /// 対象ペイン ID（省略時は呼び出し元 = TAKO_PANE_ID。退避中のペインも指定できる）
     #[arg(long)]
     pane: Option<u64>,
-    /// 全ペインの状態を一覧する（state とは併用しない）
-    #[arg(long)]
+    /// 全ペインを対象にする。単独なら一覧、on / off と併用すると退避中を含む全エージェントの
+    /// ペインを一括で切り替え、以後に立つペインの既定も同じ値にする（#1945）
+    #[arg(long, conflicts_with = "pane")]
     all: bool,
 }
 
@@ -12173,6 +12175,20 @@ mod tests {
                 enabled: None,
                 all: Some(true)
             }
+        );
+        // #1945: on / off + --all は一括（dispatch が all + enabled を一括として扱う）
+        let bulk = parse(&["tako", "limit-resume", "on", "--all"]);
+        assert_eq!(
+            build_request(&bulk).unwrap(),
+            Request::LimitResume {
+                pane: caller_pane(),
+                enabled: Some(true),
+                all: Some(true)
+            }
+        );
+        // 一括とペイン指定は同時に言えない（どちらの意味か取り違えない）
+        assert!(
+            Cli::try_parse_from(["tako", "limit-resume", "off", "--all", "--pane", "3"]).is_err()
         );
         // on / off 以外は clap が弾く（誤った語で黙って状態取得にならない）
         assert!(Cli::try_parse_from(["tako", "limit-resume", "yes"]).is_err());

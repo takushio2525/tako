@@ -590,6 +590,19 @@ pub trait UiStateHost {
         _resolved: tako_core::i18n::Lang,
     ) {
     }
+    /// リミット後の自動復帰の全体の既定（#1945。以後にエージェントになったペインが採る値）。
+    /// GUI 以外のホストは既定 OFF（#813 のペイン単位オプトインのまま）
+    fn limit_resume_default(&self) -> bool {
+        false
+    }
+    /// 全体の既定の書き換え（永続化と表示の更新は実装側の責務）
+    fn set_limit_resume_default(&mut self, _enabled: bool) {}
+    /// ペインで手起動のエージェント CLI（claude / codex / agy）が動いていると検出済みか
+    /// （#1945 の「エージェントのペイン」の材料。role の無いペインはこれでしか分からない）。
+    /// 検出を持たないホストは false = role だけで判断する
+    fn agent_detected(&self, _pane: PaneId) -> bool {
+        false
+    }
     /// 利用上限後の自動復帰（#813）の**実行状態**（いま上限で止まっているか・
     /// いつ復帰するか・これまでの試行）。オプトインそのものは Pane 属性なので
     /// ここには無い。GUI 以外のホストは追跡状態を持たないので既定は None

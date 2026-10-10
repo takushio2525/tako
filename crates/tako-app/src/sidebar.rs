@@ -696,6 +696,9 @@ pub(crate) enum NoticeArea {
     /// 「起動していたのに戻らない」は黙って起きてはいけないので同じ通知欄へ出す
     /// （成功は出さない = チップが running になるので分かる）
     RemoteAutostart,
+    /// ステータスバーのボタン（#1945 の自動復帰の一括 ON / OFF）。
+    /// 押した操作の失敗と、全体の既定を settings.json へ残せなかったことを出す
+    StatusBar,
 }
 
 impl NoticeArea {
@@ -715,6 +718,7 @@ impl NoticeArea {
             NoticeArea::UserTasks => "user_tasks",
             NoticeArea::SleepGuard => "sleep_guard",
             NoticeArea::RemoteAutostart => "remote_autostart",
+            NoticeArea::StatusBar => "status_bar",
         }
     }
 }
@@ -764,6 +768,9 @@ pub(crate) enum NoticeArm {
     /// ホバーのカードのリンクを開けなかった（`TAKO_1681_LEGACY`）。旧挙動ではカードが出ないので、
     /// 通知だけ残っても意味がない
     Issue1681,
+    /// 自動復帰の一括ボタンの失敗・既定を保存できなかった（`TAKO_1945_LEGACY`）。
+    /// 旧挙動ではボタンが無いので、通知だけ残っても意味がない
+    Issue1945,
 }
 
 impl NoticeArm {
@@ -783,6 +790,7 @@ impl NoticeArm {
             NoticeArm::Issue1679 => tako_control::lsp::legacy(),
             NoticeArm::Issue1680 => tako_control::dispatch::lsp_goto_legacy(),
             NoticeArm::Issue1681 => tako_control::lsp::hover::legacy(),
+            NoticeArm::Issue1945 => tako_core::limit_resume_all::legacy(),
         }
     }
 }

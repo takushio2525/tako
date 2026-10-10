@@ -1811,12 +1811,12 @@
     "name": "tako_confirm_close"
   },
   {
-    "description": "利用上限（5h / 週次）後の自動復帰を**ペイン単位**で ON/OFF する（enabled 省略時は状態取得のみ。既定 OFF。layout.json に永続化され再起動・復元をまたぐ）。有効なペインが上限で止まると、リセット時刻（画面の「reset at …」から解決）+ 数分の安全マージンを過ぎたところで再開させる: 上限対処ダイアログがあれば「解除まで待つ」相当をラベル一致で確定し（課金・モデル変更を伴う選択肢は構造的に選ばない）、無ければ継続ナッジを送る。発動するのは上限由来の停止だけで、permission ダイアログ・API エラー・通常の idle・人間の下書きが入力欄にあるときは発動しない。試行は 1 回の上限あたり 3 回まで。記録は <data_dir>/supervisor.log の action=limit_autoresume。all=true で全ペインの一覧。応答の state は現在の停止状況・復帰予定時刻・試行回数。",
+    "description": "利用上限（5h / 週次）後の自動復帰を**ペイン単位**で ON/OFF する（enabled 省略時は状態取得のみ。既定 OFF。layout.json に永続化され再起動・復元をまたぐ）。有効なペインが上限で止まると、リセット時刻（画面の「reset at …」から解決）+ 数分の安全マージンを過ぎたところで再開させる: 上限対処ダイアログがあれば「解除まで待つ」相当をラベル一致で確定し（課金・モデル変更を伴う選択肢は構造的に選ばない）、無ければ継続ナッジを送る。発動するのは上限由来の停止だけで、permission ダイアログ・API エラー・通常の idle・人間の下書きが入力欄にあるときは発動しない。試行は 1 回の上限あたり 3 回まで。記録は <data_dir>/supervisor.log の action=limit_autoresume。all=true で全ペインの一覧（退避中を含む。default = 以後に立つペインの既定・summary = 全部 ON / 一部 / 全部 OFF）。all=true + enabled で一括: 退避中を含む全エージェントのペイン（master / worker / solo /手起動の claude 等。シェル・プレビューは除く）を揃え、既定も同じ値にする（ステータスバーのボタンと同じ）。pane は退避中も指定可。応答の state は現在の停止状況・復帰予定時刻・試行回数。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "all": {
-          "description": "true = 全ペインの状態を一覧（enabled とは併用しない）",
+          "description": "true = 全ペインの一覧。enabled と併用で一括 ON / OFF",
           "type": "boolean"
         },
         "enabled": {

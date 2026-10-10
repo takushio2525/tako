@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1903: tako mod S2 の続き = ステータスバーの 5h / 7d も mod から・observed_at を値の変化時だけ・MCP 説明文・検査スクリプトの 1 実装化）
-- mod の `stampLimits` が窓ごとに値が変わったときだけ `observed_at` を打つ（`$.state` に置きホットリロードをまたぐ）→ 束ね方を最新の観測へ（A/B `TAKO_1903_LEGACY=1` = #1880 の順）。ステータスバーは `status_bar_limits`（フォーカス順で最初に引けたペインのアカウント → 無ければ画面。取得元は `tako limit-service --refresh` の `claude.source`）。MCP 説明文 +527 B。`check-claude-mod.sh` に肯定形の文言の自己検査、1879 の段 0 はそれを呼ぶだけ
-- 実測: `scripts/test-mod-limits-1903.sh`（visual-test `mod-limits` で 42 / 18 の帯・旧は ① FAILED / fake 17 PASS = 46 秒で画面へ戻る・放置 80% と動いている 20% で 20）・`claude plugin test` 28 本（旧の打ち方の注入で #1903 の 1 本が名指しで落ちる）・番犬の注入 12 通りを file:line で名指し
-
 ## 2026-10-09（#1924: `"$( … "{…,…}" … )"` を bash 3.2 が波括弧展開して語を割る形を直し、番犬を足した）
 - 真因: 3.2 の `brace_gobbler` は `"` の中の `$(` を知らず `"` の偶奇だけで読む。`test-tree-keyboard-copy-1895.sh` の 2 箇所（`mcp_call "{\"op\":…,…}"` を `mcp_text "$( … )"` の引数に入れた形）を jq で組む形へ。番犬 `shell_scripts.rs` は全 `.sh` を語へ分け 3.2 の写しで読む（実の 3.2 / 5 の出力の差と 48,000 通り突き合わせ、食い違い 3 件はどれも検査の外の事情）
 - 実測: `/bin/bash scripts/test-tree-keyboard-copy-1895.sh` 修正前 PASS=32 FAIL=7 → 後 39 / 0（bash 5 も 39 / 0。隔離 GUI・tako-vd）・棚卸し 118 本で 2 箇所 → 0・注入 6 通りを file:line で名指し。`local` / 配列 / `[[ ]]` / case 等の表は `.agent/conventions.md` の #1924 節
@@ -64,3 +60,7 @@
 ## 2026-10-09（#1576: 退避（たまり場・退避タブ）のペインを再起動で退避のまま同じ器へ繋ぎ直す）
 - 真因（修正前バイナリで実測確定）: 復元ループが退避を `let-else` で素通りさせ器を `backend_sessions` へ登録しない → orphan 自動復帰が「復帰」タブへ別 pane id で拾い、退避エントリは端末の無い幽霊（次の保存で器 null）。退避も表と同じ枝で起こし、判断（起こす / 残す / 外す = 器も手掛かりも無い・同じ器の重複）は `shelved_restore::plan`。内訳に「戻し方」。A/B `TAKO_1576_LEGACY=1`
 - 実測: `scripts/test-shelved-restore-1576.sh` 修正前 22 NG → 58 PASS 0 FAIL（orphan 0・同じ pane id / role / タイトル / limit_resume・器の pid 不変・表に出すと目印が見える・A/B で「復帰」タブ再現）・#1554 の実経路 42 PASS・番犬 6 本（修正前の main.rs で 6 本とも file:line を名指し）
+
+## 2026-10-09（#1945: ステータスバーのワンボタンで全エージェントのリミット後の自動復帰を一括 ON / OFF・以後に立つペインも従う・退避中も対象）
+- 正本 `tako_core::limit_resume_all`（エージェント = role か会話の検出・3 状態・一括・既定の採用・「決定済み」の印）を dispatch `LimitResume` の `all` + `enabled` が通り、ボタン / `tako limit-resume on|off --all` / MCP が 1 実装。既定は settings.json `limit_resume_all`（serde default）。退避中も `--pane N`・駆動の対象。`worker_status` が退避した worker を false と読んでいたのは読み出しが表のタブしか見ていなかったため（値は消えていない）。A/B `TAKO_1945_LEGACY=1`・カタログ +403 B
+- 実測: `scripts/test-limit-resume-all-1945.sh` 24 PASS（旧 19 NG。再起動後も保持・手起動の codex を約 5 秒で検出して ON）・visual-test `limit-resume-all` を実マウスで 8 段（旧は ① で FAILED）・番犬 `issue1945_limit_resume_all_watchdog`（注入で `dispatch.rs:15587` を名指し）

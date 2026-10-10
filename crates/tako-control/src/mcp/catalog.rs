@@ -1299,14 +1299,18 @@ pub fn tools() -> Vec<Value> {
                 ラベル一致で確定し（課金・モデル変更を伴う選択肢は構造的に選ばない）、無ければ継続ナッジを送る。\
                 発動するのは上限由来の停止だけで、permission ダイアログ・API エラー・通常の idle・\
                 人間の下書きが入力欄にあるときは発動しない。試行は 1 回の上限あたり 3 回まで。\
-                記録は <data_dir>/supervisor.log の action=limit_autoresume。all=true で全ペインの一覧。\
+                記録は <data_dir>/supervisor.log の action=limit_autoresume。all=true で全ペインの一覧\
+                （退避中を含む。default = 以後に立つペインの既定・summary = 全部 ON / 一部 / 全部 OFF）。\
+                all=true + enabled で一括: 退避中を含む全エージェントのペイン（master / worker / solo /\
+                手起動の claude 等。シェル・プレビューは除く）を揃え、既定も同じ値にする\
+                （ステータスバーのボタンと同じ）。pane は退避中も指定可。\
                 応答の state は現在の停止状況・復帰予定時刻・試行回数。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象ペイン"),
                     "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
-                    "all": { "type": "boolean", "description": "true = 全ペインの状態を一覧（enabled とは併用しない）" },
+                    "all": { "type": "boolean", "description": "true = 全ペインの一覧。enabled と併用で一括 ON / OFF" },
                 },
                 "additionalProperties": false,
             },

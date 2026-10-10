@@ -270,7 +270,22 @@ pub fn auto_handoff_enabled(profile: &Profile) -> bool {
 /// 「ペイン単位のオプトイン」を崩さない）。spawn 引数は `Some(false)` で
 /// プロファイル ON を明示的に打ち消せる（`or` ではなく `Option` の有無で判定する）。
 pub fn resolve_worker_limit_resume(profile: &Profile, spawn_override: Option<bool>) -> bool {
-    spawn_override.or(profile.limit_resume).unwrap_or(false)
+    resolve_worker_limit_resume_in(profile, spawn_override, false)
+}
+
+/// [`resolve_worker_limit_resume`] の最後の段を**全体の既定**（Issue #1945。ステータスバーの
+/// 一括ボタン / `tako limit-resume on --all` が書く settings.json の `limit_resume_all`）にした版。
+///
+/// 解決順は **spawn 引数 → プロファイル → 全体の既定**。プロファイルの明示 OFF は全体の
+/// ON より強い（そのプロファイルだけ切りたい、を一括で潰さない）
+pub fn resolve_worker_limit_resume_in(
+    profile: &Profile,
+    spawn_override: Option<bool>,
+    all_default: bool,
+) -> bool {
+    spawn_override
+        .or(profile.limit_resume)
+        .unwrap_or(all_default)
 }
 
 /// master / solo **本人**のペインに適用する利用上限後の自動復帰（FR-2.27 / #813）の
@@ -306,6 +321,15 @@ fn master_limit_resume_legacy() -> bool {
 ///
 /// 解釈は `ProfileHint::from_role`（daemon / dispatch が共有する 1 実装）を通す
 pub fn master_pane_limit_resume(role: &str) -> bool {
+    master_pane_limit_resume_setting(role).unwrap_or(false)
+}
+
+/// [`master_pane_limit_resume`] の「プロファイルが明示しているか」まで返す版（Issue #1945）。
+///
+/// `None` = プロファイルが何も言っていない（master / solo でない role・未設定・
+/// `TAKO_1140_LEGACY=1`）。このときだけ全体の既定が効く。`Some(false)` はプロファイルの
+/// 明示 OFF で、全体の ON より強い（worker の解決順 = [`resolve_worker_limit_resume_in`] と揃える）
+pub fn master_pane_limit_resume_setting(role: &str) -> Option<bool> {
     let profile = match crate::claude_remote_link::ProfileHint::from_role(role) {
         crate::claude_remote_link::ProfileHint::Master(name) => {
             Profile::load(name.unwrap_or("default")).unwrap_or_default()
@@ -313,9 +337,12 @@ pub fn master_pane_limit_resume(role: &str) -> bool {
         crate::claude_remote_link::ProfileHint::Solo(name) => {
             load_solo_profile(name.unwrap_or("default")).unwrap_or_else(|_| solo_default_profile())
         }
-        crate::claude_remote_link::ProfileHint::Unknown => return false,
+        crate::claude_remote_link::ProfileHint::Unknown => return None,
     };
-    resolve_master_limit_resume(&profile)
+    if master_limit_resume_legacy() {
+        return None;
+    }
+    profile.limit_resume
 }
 
 /// `~` を `$HOME` に展開する

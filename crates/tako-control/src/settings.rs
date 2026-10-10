@@ -51,6 +51,13 @@ pub struct Settings {
     /// （`Settings` の指紋は動くが、読み書きは後方互換）
     #[serde(default = "default_true")]
     pub claude_mod: bool,
+    /// リミット後の自動復帰の全体の既定（FR-2.27.16 / Issue #1945。**既定 OFF** = #813 の
+    /// ペイン単位オプトインを崩さない）。ステータスバーのボタン / `tako limit-resume on --all` /
+    /// MCP `tako_limit_resume`（`all` + `enabled`）が書き、以後にエージェントになったペインが
+    /// 最初に採る値になる。**旧ファイルはキーが無くても false で読める**（`#[serde(default)]`）
+    /// ので移行 Step は要らない（`Settings` の指紋は動くが、読み書きは後方互換）
+    #[serde(default)]
+    pub limit_resume_all: bool,
     /// PDF・画像・動画サムネのデコード済み画像キャッシュ上限（Issue #258。MiB）
     #[serde(default = "default_preview_cache_max_mb")]
     pub preview_cache_max_mb: u64,
@@ -208,6 +215,7 @@ impl Default for Settings {
             preview_live_reload: true,
             lsp_format_on_save: false,
             claude_mod: true,
+            limit_resume_all: false,
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
@@ -644,6 +652,7 @@ mod tests {
             preview_live_reload: false,
             lsp_format_on_save: true,
             claude_mod: false,
+            limit_resume_all: true,
             preview_cache_max_mb: 768,
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,
@@ -709,6 +718,10 @@ mod tests {
         // 移行 Step 不要。指紋テストの更新理由がこれ）
         assert!(!parsed.lsp_format_on_save);
         assert!(!Settings::default().lsp_format_on_save);
+        // #1945: 自動復帰の全体の既定は OFF（旧ファイル = キー無しでも false =
+        // 移行 Step 不要。指紋テストの更新理由がこれ）
+        assert!(!parsed.limit_resume_all);
+        assert!(!Settings::default().limit_resume_all);
         // #1879: tako mod は既定 ON（旧ファイル = キー無しでも true = 移行 Step 不要。
         // 指紋テストの更新理由がこれ）
         assert!(parsed.claude_mod);

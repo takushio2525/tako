@@ -2346,6 +2346,12 @@ struct TakoApp {
     /// 利用上限後の自動復帰の追跡状態（Issue #813）。オプトイン自体は Pane 属性
     /// （layout.json 永続化）で、ここは揮発する実行状態だけを持つ
     limit_resume: limit_autoresume::LimitResumeTrackers,
+    /// 自動復帰の全体の既定（Issue #1945。settings.json の `limit_resume_all`）。
+    /// 以後にエージェントになったペインが最初に採る値で、一括ボタンが書く
+    limit_resume_all: bool,
+    /// ステータスバーの一括ボタンが描く集計（Issue #1945）。**描画のたびに数えない**:
+    /// 2 秒 tick・一括 / 個別の切り替えの直後だけ数え直す（`refresh_limit_resume_summary`）
+    limit_resume_summary: tako_core::limit_resume_all::BulkSummary,
     /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
     codex_metrics: AgentMetrics,
     /// codex の**構造化されたレート制限**（#985。ペイン → rollout の `rate_limits`）。
@@ -4379,6 +4385,8 @@ impl TakoApp {
             handoff_nudges: HashMap::new(),
             handoff_policy_cache: HashMap::new(),
             limit_resume: HashMap::new(),
+            limit_resume_all: tako_control::settings::load().limit_resume_all,
+            limit_resume_summary: Default::default(),
             codex_limits: HashMap::new(),
             transcript_ctx: HashMap::new(),
             transcript_ctx_scan: handoff_ctx::TranscriptCtxScan::default(),
@@ -5020,6 +5028,9 @@ impl TakoApp {
                 app.spawn_highlight(pane, path, text, cx);
             }
             app.drain_pending_preview_loads(cx);
+            // #1945: 復元したエージェントのペインの自動復帰は保存時の値（人の選択）を保つ。
+            // 会話 ID の種まき（上のループ）が済んだ後でないと手起動の claude を数えられない
+            app.mark_restored_limit_resume_decided();
         }
         // Web ビュー dock の退避分（ペイン無し）も初回 render で開き直す（#155）
         for url in webview_dock_restore {
@@ -5191,7 +5202,19 @@ impl TakoApp {
                             | tako_control::protocol::Request::Panel { .. }
                     );
                     let prev_window = app.workspace.active_window_id();
+                    // #1945: 自動復帰の切り替えはステータスバーの一括ボタンへすぐ映す
+                    // （2 秒 tick を待たない。CLI / MCP から押しても表示が追従する）
+                    let limit_resume_changed = matches!(
+                        incoming.request,
+                        tako_control::protocol::Request::LimitResume {
+                            enabled: Some(_),
+                            ..
+                        }
+                    );
                     let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
+                    if limit_resume_changed && app.refresh_limit_resume_summary() {
+                        cx.notify();
+                    }
                     if clears_text_focus {
                         app.clear_text_input_focus();
                     }
@@ -5344,6 +5367,9 @@ impl TakoApp {
                 let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
                     app.apply_claude_resume_sessions(&detected);
                     app.apply_agent_resume_sessions(&detected_agents);
+                    // #1945: 手起動の claude / codex はここで初めてエージェントと分かるので、
+                    // 全体の既定（一括ボタン）をこの時点で当てる（保存は直後の save_layout）
+                    app.adopt_limit_resume_default();
                     app.save_layout();
                     app.collect_pane_meta_snapshots()
                 });
@@ -5537,6 +5563,11 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:limit_autoresume");
                         app.drive_limit_autoresume()
                     };
+                    // #1945: ステータスバーの一括ボタンの集計（role の付与・ペインの開閉・退避は
+                    // ここで拾う）。変わったときだけ描き直す = 描画のたびに数えない
+                    if app.refresh_limit_resume_summary() {
+                        wcx.notify();
+                    }
                     // #1010: SSH の接続待ちを進める（待っているペインが無ければ即 return）。
                     // 変わったらヘッダだけ汚す（本体は触らない = 無関係な再描画を作らない）
                     {
@@ -22964,6 +22995,18 @@ impl UiStateHost for TakoApp {
         self.limit_resume_state_json(pane)
     }
 
+    fn limit_resume_default(&self) -> bool {
+        self.limit_resume_all
+    }
+
+    fn set_limit_resume_default(&mut self, enabled: bool) {
+        self.set_limit_resume_all(enabled);
+    }
+
+    fn agent_detected(&self, pane: PaneId) -> bool {
+        self.limit_resume_agent_detected(pane)
+    }
+
     fn auto_rename_enabled(&self) -> bool {
         self.autorename.enabled
     }
@@ -26033,6 +26076,8 @@ impl TakoApp {
                                 );
                                 // 属性は layout.json へ載るので、ここで保存して再起動に備える
                                 this.save_layout();
+                                // #1945: ステータスバーの一括ボタンの集計も追従させる
+                                this.refresh_limit_resume_summary();
                             }
                             // #1067: CLI / MCP と同じ dispatch を通す（3 経路で同じ判断・同じ手順）
                             "restart-harness" => {
@@ -43233,6 +43278,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1945: ステータスバーの自動復帰の一括ボタンを**実マウスで**押すと、
+                // 退避中を含む全エージェントのペインが揃い、表示が 3 状態で切り替わるか
+                "limit-resume-all" => {
+                    limit_resume_all_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1536: 絵文字を置き換えたアイコンが実ピクセルで描かれているか
                 "no-emoji" => {
                     no_emoji_visual(any, window, cx).await;
@@ -56567,6 +56619,296 @@ mod self_test {
             cx.notify();
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1945: ステータスバーの自動復帰の一括ボタン（実マウス）。
+    ///
+    /// 場面は master（role）・シェル・手起動の claude（会話検出の種）・退避中の worker（role）。
+    /// 見るのは ① 全部 OFF の表示 ② 押すと退避中を含む 3 本が ON・シェルは OFF・既定も ON
+    /// ③ 1 本を個別に切ると「一部」④ 一部で押すと全部 ON ⑤ 退避中だけ OFF でも一部 → 押して戻る
+    /// ⑥ 押した直後に立てた solo が ON で始まる ⑦ 全部 ON で押すと全部 OFF ⑧ エージェント 0 本でも
+    /// 既定だけが切り替わる。表示の 3 状態は `TAKO_VISUAL_DUMP_DIR` へ PNG で残す。
+    ///
+    /// **`TAKO_1945_LEGACY=1` では ① で落ちる**（ボタンを描かない = #1945 前の画面）
+    #[cfg(feature = "visual-test")]
+    async fn limit_resume_all_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let dump = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        let save = |cx: &mut AsyncApp, name: &str| {
+            if let (Some(dir), Some((frame, _))) = (dump.as_ref(), capture_frame(any, cx)) {
+                let _ = frame.save(std::path::Path::new(dir).join(name));
+            }
+        };
+        let made = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let master = app.workspace.active_tab().tree().focused();
+                if let Some(p) = app.workspace.pane_anywhere_mut(master) {
+                    p.set_role(Some("orchestrator-master".into()));
+                }
+                let split = |app: &mut TakoApp, at: PaneId| {
+                    let pane = Pane::new(PaneOrigin::User);
+                    let id = pane.id();
+                    app.workspace
+                        .active_tab_mut()
+                        .tree_mut()
+                        .split(at, SplitDirection::Right, pane)
+                        .ok()
+                        .map(|_| id)
+                };
+                let shell = split(app, master)?;
+                let manual = split(app, shell)?;
+                let worker = split(app, manual)?;
+                // 手起動の claude = 会話の検出に載ったペイン（role は無い）
+                app.claude_resume_sessions
+                    .seed(manual, "00000000-0000-4000-8000-000000001945");
+                if let Some(p) = app.workspace.pane_anywhere_mut(worker) {
+                    p.set_role(Some("orchestrator-worker:tako".into()));
+                }
+                app.workspace.shelve_pane(worker).ok()?;
+                app.limit_resume_all = false;
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                app.refresh_limit_resume_summary();
+                cx.notify();
+                Some((master, shell, manual, worker))
+            })
+            .ok()
+            .flatten();
+        let Some((master, shell, manual, worker)) = made else {
+            check(false, "1945: 検証用のペインを組めない");
+            return;
+        };
+        // (master, shell, manual, worker, 既定, 集計の状態) を読む
+        let read = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    let on = |id: PaneId| {
+                        app.workspace
+                            .pane_anywhere(id)
+                            .is_some_and(|p| p.limit_autoresume())
+                    };
+                    (
+                        [on(master), on(shell), on(manual), on(worker)],
+                        app.limit_resume_all,
+                        app.limit_resume_summary.state(),
+                        crate::ui_text::pane_menu::limit_resume_all_chip(&app.limit_resume_summary),
+                    )
+                })
+                .ok()
+        };
+        let click = |cx: &mut AsyncApp| {
+            let rect = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.panel_click_probe_bounds
+                        .borrow()
+                        .get("statusbar-limit-resume")
+                        .copied()
+                })
+                .ok()
+                .flatten();
+            if let Some(rect) = rect {
+                click_at(any, cx, rect.center());
+            }
+            rect.is_some()
+        };
+        // CLI / MCP と同じ口で 1 本だけ切る（IPC の後処理と同じく集計を数え直す）
+        let set_one = |cx: &mut AsyncApp, pane: PaneId, enabled: bool| {
+            let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::LimitResume {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(enabled),
+                        all: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.refresh_limit_resume_summary();
+                cx.notify();
+            });
+        };
+        use tako_core::limit_resume_all::BulkState;
+
+        // ① 全部 OFF（ボタンが描かれている）
+        notify_and_draw(any, window, cx);
+        wait(cx, 200).await;
+        notify_and_draw(any, window, cx);
+        let drawn = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                app.panel_click_probe_bounds
+                    .borrow()
+                    .contains_key("statusbar-limit-resume")
+            })
+            .unwrap_or(false);
+        save(cx, "limit-resume-all-off.png");
+        check(
+            drawn,
+            "1945 ①: ステータスバーに自動復帰の一括ボタンが描かれない",
+        );
+        let r = read(cx);
+        println!("TAKO_VISUAL_1945: ① {r:?}");
+        check(
+            matches!(
+                r,
+                Some(([false, false, false, false], false, BulkState::AllOff, _))
+            ),
+            "1945 ①: 初期状態が全部 OFF ではない",
+        );
+
+        // ② 押す → 退避中を含む 3 本が ON・シェルは OFF・既定も ON
+        check(click(cx), "1945 ②: ボタンの実矩形が無い");
+        wait(cx, 150).await;
+        notify_and_draw(any, window, cx);
+        save(cx, "limit-resume-all-on.png");
+        let r = read(cx);
+        println!("TAKO_VISUAL_1945: ② {r:?}");
+        check(
+            matches!(
+                r,
+                Some(([true, false, true, true], true, BulkState::AllOn, _))
+            ),
+            "1945 ②: 押しても退避中を含む全エージェントが ON にならない（またはシェルまで ON）",
+        );
+
+        // ③ 1 本を個別に切る = 一部
+        set_one(cx, manual, false);
+        notify_and_draw(any, window, cx);
+        wait(cx, 150).await;
+        notify_and_draw(any, window, cx);
+        save(cx, "limit-resume-partial.png");
+        let r = read(cx);
+        println!("TAKO_VISUAL_1945: ③ {r:?}");
+        check(
+            matches!(&r, Some(([true, false, false, true], true, BulkState::Partial, label)) if label.contains("2/3")),
+            "1945 ③: 1 本を切っても「一部 2/3」にならない",
+        );
+
+        // ④ 一部で押す → 全部 ON
+        check(click(cx), "1945 ④: ボタンの実矩形が無い");
+        wait(cx, 150).await;
+        let r = read(cx);
+        println!("TAKO_VISUAL_1945: ④ {r:?}");
+        check(
+            matches!(
+                r,
+                Some(([true, false, true, true], true, BulkState::AllOn, _))
+            ),
+            "1945 ④: 一部の状態で押しても全部 ON に揃わない",
+        );
+
+        // ⑤ 退避中だけ OFF → 一部 → 押すと退避中も戻る
+        set_one(cx, worker, false);
+        let r = read(cx);
+        check(
+            matches!(
+                r,
+                Some(([true, false, true, false], true, BulkState::Partial, _))
+            ),
+            "1945 ⑤: 退避中のペインを --pane で切れない",
+        );
+        check(click(cx), "1945 ⑤: ボタンの実矩形が無い");
+        wait(cx, 150).await;
+        let r = read(cx);
+        println!("TAKO_VISUAL_1945: ⑤ {r:?}");
+        check(
+            matches!(
+                r,
+                Some(([true, false, true, true], true, BulkState::AllOn, _))
+            ),
+            "1945 ⑤: 押しても退避中のペインが ON へ戻らない",
+        );
+
+        // ⑥ 押した直後に立てた solo は全体の既定（ON）で始まる（role の付与 = dispatch の Title）
+        let solo = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                let pane = Pane::new(PaneOrigin::User);
+                let id = pane.id();
+                app.workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split(master, SplitDirection::Down, pane)
+                    .ok()?;
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Title {
+                        pane: Some(id.as_u64()),
+                        title: None,
+                        role: Some("solo".into()),
+                    },
+                    PaneOrigin::Cli,
+                );
+                app.refresh_limit_resume_summary();
+                cx.notify();
+                app.workspace
+                    .pane_anywhere(id)
+                    .map(|p| (id, p.limit_autoresume()))
+            })
+            .ok()
+            .flatten();
+        println!("TAKO_VISUAL_1945: ⑥ {solo:?}");
+        check(
+            matches!(solo, Some((_, true))),
+            "1945 ⑥: 一括 ON の直後に立てた solo が OFF で始まった",
+        );
+
+        // ⑦ 全部 ON で押す → 全部 OFF（⑥ の solo も）
+        check(click(cx), "1945 ⑦: ボタンの実矩形が無い");
+        wait(cx, 150).await;
+        let r = read(cx);
+        let solo_on = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                solo.and_then(|(id, _)| app.workspace.pane_anywhere(id))
+                    .is_some_and(|p| p.limit_autoresume())
+            })
+            .unwrap_or(true);
+        println!("TAKO_VISUAL_1945: ⑦ {r:?} solo={solo_on}");
+        check(
+            matches!(
+                r,
+                Some(([false, false, false, false], false, BulkState::AllOff, _))
+            ) && !solo_on,
+            "1945 ⑦: 全部 ON の状態で押しても全部 OFF に揃わない",
+        );
+
+        // ⑧ エージェント 0 本: 既定だけが切り替わる（押しても落ちない・シェルは触らない）
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            for id in app.workspace.all_pane_ids() {
+                if let Some(p) = app.workspace.pane_anywhere_mut(id) {
+                    p.set_role(None);
+                }
+            }
+            app.claude_resume_sessions.remove(manual);
+            app.refresh_limit_resume_summary();
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        check(click(cx), "1945 ⑧: ボタンの実矩形が無い");
+        wait(cx, 150).await;
+        let r8 = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                (
+                    app.limit_resume_summary,
+                    app.workspace
+                        .all_panes()
+                        .iter()
+                        .any(|p| p.limit_autoresume()),
+                )
+            })
+            .ok();
+        println!("TAKO_VISUAL_1945: ⑧ {r8:?}");
+        check(
+            matches!(r8, Some((s, false)) if s.total == 0 && s.default && s.state() == BulkState::AllOn),
+            "1945 ⑧: エージェント 0 本で押すと既定だけが ON になる（ペインは触らない）",
+        );
+        // 後始末: 既定を戻す（隔離 data dir の settings.json）
+        check(click(cx), "1945 ⑧: ボタンの実矩形が無い");
+        wait(cx, 100).await;
     }
 
     /// UI の絵文字を置き換えた 4 箇所が**実ピクセルで描かれている**か（#1536）。
