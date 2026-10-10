@@ -3426,7 +3426,8 @@ pub fn tools() -> Vec<Value> {
                     },
                     "tab": {
                         "type": "integer",
-                        "description": "対象タブ ID（省略時は呼び出し元ペインのタブ）"
+                        "description": "対象タブ ID（省略時は呼び出し元ペインのタブ。\
+                            selection はアクティブタブのツリーだけを扱う = 省略時もアクティブタブ）"
                     },
                     "limit": {
                         "type": "integer",
@@ -3596,7 +3597,7 @@ pub fn tools() -> Vec<Value> {
                     "pane": {
                         "type": "integer",
                         "description": "対象ペイン ID（target=pane は SSH 化するペイン / \
-                            target=split は分割元。省略時は呼び出し元ペイン）",
+                            target=split は分割元。省略時はアクティブタブのフォーカス中ペイン）",
                     },
                     "tab": {
                         "type": "integer",
