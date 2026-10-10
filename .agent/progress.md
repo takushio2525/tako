@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-10-09（#1940: spawn の起動コマンドが 2〜3 行のペインで化ける・届く前に delivered と言う・起動失敗が黙る を直した）
-- 真因（実測）: worker ペインが 2〜3 行だと zsh は入力行を `<…` / `>....` に畳み全文一致が成立しない → `shell_send` が書き直し 10 回（45〜47 秒）の末に**消していない行へ**本文 + Enter を書き足し `autoexport` + 正しい引数で 2 回目の起動。会話の検出（起動直後）を到達とみなして delivered → 諦めた後に undelivered。claude は 2 行で空白・器の tmux も同寸法（capture でも読めない）
-- 修正: 寸法で全文を出せないなら書き直さず Enter 1 回 + OSC 133;C で実行確認・書き切り前に必ず Ctrl+C・新しいペインは最初のプロンプトの印を待つ・起動フック中の先行入力を区別 / delivered は送達フローの確認だけ / 起動直後の終了を `agent_exited` で即決着し `workers` の `launch=failed` / 8 行未満で入力欄が無ければ peer だけ（`pane_too_short`）。A/B `TAKO_1940_LEGACY=1`・カタログ +280 B
-- 実測: `scripts/test-spawn-launch-1940.sh`（隔離 GUI・86×2 行・direnv 3 秒）旧 = `autoexport` + 2 回起動 / 新 = 1 回・正しい引数、失敗は 7 秒で agent_exited（12 PASS）。e2e 8 条件・番犬 4 本（注入 10 通りを file:line で名指し）
-
 ## 2026-10-09（#1926: #173 の disable_app_nap は /proc 前提で一度も効いていなかった = 消して、利用者が待つ読み込みだけ App Nap を止める）
 - 交互 2 周の実測で (2) を選択: 寿命の間止めるとアイドル 341〜365 → 856〜1,154 µW・裏の出力処理 2〜5 倍の電力、得をするのは待たれる重い処理だけ。エージェント稼働中は #173 のアサーションで App Nap の対象外（優先度 28）。`UserWork::begin_load` を PDF のラスタライズ（開く / ズーム）・Markdown の組み立て / 描き直しへ（A/B `TAKO_1926_LEGACY=1`）
 - 実測: PDF 117 ページ 7.2〜8.0 → 3.0 秒・ズーム 49.9 → 20.8 秒。`scripts/test-preview-load-app-nap-1926.sh` 7 PASS（旧の腕で ①② が名指しで FAILED）・番犬 `issue1926_app_nap_watchdog` 4 本（注入 12 通りを file:line で名指し）
@@ -60,3 +55,7 @@
 ## 2026-10-10（#1979: 本番 GUI が `ps` の poll で 10 分固まった件 = UI スレッドから届く子プロセスの待ちに上限・`tako list` の採り直しを background へ・フォーカスの無いペインの再描画に上限）
 - 真因（stripped の sample を同じ日の main のシンボル付き release と命令列で突き合わせ）: IPC → `prepare_offload` → `collect_worker_status_ctx` → `has_running_children` → `process_parent_map` → `ps` の `output()` → `poll(-1)`（= #1976 が外した経路）。型を塞いだ: 親子表は libproc（`PROC_PIDT_SHORTBSDINFO` + `KERN_PROCARGS2`）・tmux / `claude agents` は `probe::command_output_with_timeout`・打ち切り後は同期に wait しない・`OffloadJob::List`。再描画は `tako redraw-limit` / MCP `tako_scrollback` の `unfocused_fps`（既定 30・フォーカス中 60）。A/B `TAKO_1979_LEGACY=1`・番犬 `issue1979_*`・カタログ +330 B
 - 実測: `scripts/test-ui-thread-wait-1979.sh` 修正後 15 PASS / 修正前は①②で UI が固まる（別の要求が 8 秒で返らない・メインスレッドに本番と同じ関数の並び）・GUI 無しの注入（修正後 0.03 / 2.4 秒・修正前 10 秒で返らず）・再描画の要求 55〜72 → 29.5 回/秒。CPU は蓋閉じでフレームが組まれず（`body_renders` 0）差が出ない = 蓋を開けた機では未測
+
+## 2026-10-09（#1944: 未導入の言語サーバを開いた時点で data dir へ取って起こし、エディタに状態を出した）
+- 検出表の各行に `fetch`（pyright 1.1.414・ts-ls 5.1.3 + typescript 5.9.3 = npm の tarball、rust-analyzer 2026-09-21 = GitHub の単体、Node.js 24.21.0 は足りる node が PATH に無いときだけ。clangd は取らない）を配布元の公開ハッシュで検証して `<data_dir>/lsp-servers` へ。解決は env → PATH（`probe_args` で動くか確かめる）→ 置き場 → 取得。状態「取得中」・タイトルの 1 行と失敗の帯（入れる / もう一度取得）・`tako lsp install`（GUI 無しでも）・シェル統合の合図で引き直し（#1823 の 2）。A/B `TAKO_1944_LEGACY=1`・カタログ +235 B
+- 実測: まっさら（一時 HOME・最小 PATH）で .py を開くだけで Node.js 52.9 MB + pyright 4.2 MB を取り 11.6 秒で読み込み済み・診断 2 件・補完 34 件・常駐 155 MB（ts-ls 4.9 MB / 4.2 秒・RA 13.9 MB / 21 秒）。e2e 10 本・番犬（注入 10 通り）・`scripts/test-lsp-fetch-1944.sh` 25 PASS

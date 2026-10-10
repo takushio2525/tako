@@ -1489,6 +1489,10 @@ impl TakoApp {
         let edit_message = edit_snap.as_ref().and_then(|s| s.message.clone());
         // #1680: 定義ジャンプの問い合わせ中 / 結果（見つからない等）の一時表示
         let goto_status = self.lsp_goto_header_status(pane_id);
+        // #1944: 言語サーバの状態（取得中 / 起動中 / 読み込み中 / 動作中）と、未導入・失敗の帯
+        let lsp_badge = self.lsp_status_badge(pane_id);
+        let lsp_badge_shown = lsp_badge.is_some();
+        let lsp_bar = self.render_lsp_status_bar(pane_id, &theme, cx);
         // キャレット位置はコード行を組むときに `render_preview_code_line` が
         // その場で引き直す（#821 の仮想リストは TakoApp の描画を伴わずに
         // item を組み直すので、ここでキャプチャすると古い位置が焼き付く）
@@ -2638,6 +2642,9 @@ impl TakoApp {
                                 d.child(
                                     div()
                                         .min_w(px(0.0))
+                                        // #1944: 言語サーバの状態が出ているときはファイル名を縮めない
+                                        // （1 px でも縮むと省略記号が付く。状態とパスが先に譲る）
+                                        .when(lsp_badge_shown, |d| d.flex_shrink_0())
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .whitespace_nowrap()
@@ -2678,6 +2685,9 @@ impl TakoApp {
                                 d.child(
                                     div()
                                         .min_w(px(0.0))
+                                        // #1944: 言語サーバの状態が出ているときはパスから先に譲る
+                                        // （ファイル名 > 状態 > パス の順で残す）
+                                        .flex_shrink(if lsp_badge_shown { 50.0 } else { 1.0 })
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .whitespace_nowrap()
@@ -2696,6 +2706,24 @@ impl TakoApp {
                                         theme.green
                                     }))
                                     .child(SharedString::from(truncate_chars(&message, 36)))
+                            }))
+                            .children(lsp_badge.map(|(message, tone)| {
+                                let busy = tone == crate::lsp_status_ui::BadgeTone::Busy;
+                                // パス（重み 50）の次に譲る（ファイル名 > 状態 > パス）
+                                div()
+                                    .id(("preview-lsp-badge", pane_id.as_u64()))
+                                    .min_w(px(0.0))
+                                    .max_w(px(320.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(10.0))
+                                    .text_color(if busy {
+                                        hsla(theme.accent)
+                                    } else {
+                                        hsla_alpha(theme.tab_inactive_foreground, 0.7)
+                                    })
+                                    .child(SharedString::from(message))
                             }))
                             .children(goto_status.map(|(message, is_error)| {
                                 div()
@@ -3291,6 +3319,7 @@ impl TakoApp {
                     )
             })
             .children(conflict_bar)
+            .children(lsp_bar)
             .children(navigation_panel.map(|panel| {
                 let (label, rows): (&str, Vec<gpui::AnyElement>) = match panel {
                     PreviewNavigationPanel::Outline => {

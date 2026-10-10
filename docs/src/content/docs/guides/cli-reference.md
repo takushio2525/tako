@@ -426,12 +426,13 @@ tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る�
 
 ### tako lsp
 
-コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」、整形は「コードを整形する」、補完は「補完の候補を読む」を参照してください。
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright）が自動的に起きます。**入っていなければ、tako がその場で取ってきて起こします**（pyright / typescript-language-server / rust-analyzer。置き場は tako のデータフォルダで、npm や brew のグローバルには入れません。Node.js が要るサーバは、足りる Node.js が無ければそれも取ります。PATH に入っている版があればそちらを使います）。エディタのタイトルに「取得中 / 起動中 / 読み込み中 / 動作中」が出て、取れなかったときはタイトルの下に理由と「もう一度取得」のボタンが出ます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」、整形は「コードを整形する」、補完は「補完の候補を読む」を参照してください。
 
 ```bash
 tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド
 tako lsp servers         # 対応している言語サーバと、入っているかどうか
-tako lsp restart         # 起こし直す（サーバを入れた後はこれ）
+tako lsp restart         # 起こし直す（tako の外のターミナルでサーバを入れた後はこれ）
+tako lsp install         # 前もって取っておく / 取れなかったものを取り直す（tako が起動していなくても動く）
 tako lsp stop            # 止める（restart するまで起こさない）
 tako lsp logs            # サーバが出したエラー出力の直近
 tako lsp diagnostics     # 編集中のコードの診断（言語サーバにつながった文書すべて）

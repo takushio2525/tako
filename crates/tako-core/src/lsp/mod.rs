@@ -5,6 +5,7 @@
 //!
 //! - [`position`] — UTF-8 バイト ⇄ UTF-16 コードユニットの変換（入口は 2 本だけ）
 //! - [`servers`] — サーバ検出表（言語の追加 = 表への行追加）
+//! - [`fetch`] — 未導入のサーバを data dir へ取る表（取得元・版・ハッシュ・置き場。#1944）
 //! - [`root`] — プロジェクトルートの検出
 //! - [`state`] — ライフサイクルの状態機械
 //! - [`sync`] — `didChange` の中身（送った本文の写しとの差分）
@@ -17,6 +18,7 @@
 
 pub mod completion;
 pub mod diagnostic;
+pub mod fetch;
 pub mod format;
 pub mod goto;
 pub mod hover;

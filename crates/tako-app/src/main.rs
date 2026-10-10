@@ -43,6 +43,7 @@ mod lsp_format_ui;
 mod lsp_goto_ui;
 mod lsp_hover_ui;
 mod lsp_menu_ui;
+mod lsp_status_ui;
 mod md_view;
 mod menu_bar;
 mod open_files;
@@ -5162,6 +5163,7 @@ impl TakoApp {
 
         // #1679: 言語サーバの診断の知らせを受けて波線・右パネルを描き直す
         app.spawn_lsp_diagnostics_loop(cx);
+        app.spawn_lsp_state_loop(cx);
 
         // IPC リクエストを UI スレッドで dispatch するループ。
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
@@ -14022,6 +14024,30 @@ impl TakoApp {
                 let applied = this.update(cx, |app: &mut TakoApp, cx| {
                     let all = app.lsp.take_events_overflow();
                     app.apply_lsp_diagnostics(&uris, all, cx);
+                });
+                if applied.is_err() {
+                    break; // View が破棄された
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 言語サーバの状態の知らせ（#1944。取得中・起動・未導入 → 使える）を受けて描き直すループ。
+    /// 状態が変わった回は編集セッションを同期し直す（断っていた文書が使えるようになっていれば開く）。
+    /// 口は容量 1 なので、続けて届いた知らせは 1 回にまとまる。LSP が無効なら何もしない
+    fn spawn_lsp_state_loop(&self, cx: &mut Context<Self>) {
+        let Some(mut rx) = self.lsp.state_events() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                let applied = this.update(cx, |app: &mut TakoApp, cx| {
+                    if app.lsp.take_refresh_wanted() {
+                        app.refresh_lsp_links(cx);
+                    } else {
+                        cx.notify();
+                    }
                 });
                 if applied.is_err() {
                     break; // View が破棄された
@@ -29324,6 +29350,11 @@ mod self_test {
     mod hover_1893;
     #[cfg(feature = "visual-test")]
     use hover_1893::{hover_1893_visual, hover_loading_real_visual, hover_loading_visual};
+    /// #1944: 言語サーバを取って起こす・エディタの状態（visual-test `lsp-fetch`）
+    #[cfg(feature = "visual-test")]
+    mod lsp_fetch_1944;
+    #[cfg(feature = "visual-test")]
+    use lsp_fetch_1944::lsp_fetch_visual;
     /// #1908: ↑ / ↓ / ← / → / Enter / ⇧⌘↑ / ⇧⌘↓・残り時間の数え下ろし（visual-test `tree-keys`）
     #[cfg(feature = "visual-test")]
     mod tree_keys;
@@ -43634,6 +43665,12 @@ mod self_test {
                 // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
                 "goto-hover" => {
                     goto_hover_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1944: まっさらで .py を開くと取って起こし、状態が出て、押せば入るか（ミラー）
+                "lsp-fetch" => {
+                    lsp_fetch_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

@@ -24,3 +24,7 @@ rust-embed.workspace = true
 libc.workspace = true
 ureq.workspace = true
 lsp-types.workspace = true
+# 言語サーバの取得（#1944）: ハッシュの検証と gzip / deflate の展開
+sha2.workspace = true
+base64.workspace = true
+flate2.workspace = true

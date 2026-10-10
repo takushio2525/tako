@@ -9,9 +9,14 @@
 //! 番号はプロセス全体で 1 つ（GUI の全ペインのシェルが同じ番号を進める。manager も同じ GUI
 //! プロセスにある）。進めるのは `TerminalSession::process_osc_event` の 1 か所で、PTY の流れも
 //! 側路（#766 の `feed_osc_bytes`）もここを通る。アイドル中は何も起きない（タイマーを持たない = #772）
+//!
+//! #1944: 番号を数えるだけでは「未導入だった言語サーバを入れた」に誰も気付かない（次に解決するまで
+//! 待つ）。[`subscribe`] で合図を受け取れる（LSP の manager が未導入のサーバを引き直す = #1823 の 2）。
+//! 受け手は**待たない**こと（合図を出したスレッドを止めない。重い仕事は自分のスレッドへ出す）
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::osc_tap::{OscEvent, PromptMark};
 
@@ -22,9 +27,39 @@ pub fn epoch() -> u64 {
     EPOCH.load(Ordering::SeqCst)
 }
 
-/// 1 つ進める（PATH が変わりうる出来事が起きた）
+/// 合図の受け手。偽を返したら外れる（持ち主が居なくなった）
+type Listener = Arc<dyn Fn() -> bool + Send + Sync>;
+
+fn listeners() -> &'static Mutex<Vec<Listener>> {
+    static LISTENERS: OnceLock<Mutex<Vec<Listener>>> = OnceLock::new();
+    LISTENERS.get_or_init(Default::default)
+}
+
+/// 1 つ進める（PATH が変わりうる出来事が起きた）。受け手へ合図する（錠の外で呼ぶ）
 pub fn note() {
     EPOCH.fetch_add(1, Ordering::SeqCst);
+    let current: Vec<Listener> = listeners()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if current.is_empty() {
+        return;
+    }
+    let gone: Vec<Listener> = current.into_iter().filter(|l| !l()).collect();
+    if !gone.is_empty() {
+        listeners()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|l| !gone.iter().any(|g| Arc::ptr_eq(g, l)));
+    }
+}
+
+/// 合図を受け取る（[`note`] のたびに呼ばれる。偽を返すと外れる）
+pub fn subscribe(listener: impl Fn() -> bool + Send + Sync + 'static) {
+    listeners()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Arc::new(listener));
 }
 
 /// その出来事は「PATH が変わりうる」か。`cwd` はそのペインの今の cwd（出来事の前）。
@@ -41,6 +76,32 @@ pub fn is_activity(cwd: Option<&Path>, event: &OscEvent) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn 合図は受け手へ届き偽を返した受け手は外れる() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (h, a) = (Arc::clone(&hits), Arc::clone(&alive));
+        subscribe(move || {
+            if !a.load(Ordering::SeqCst) {
+                return false;
+            }
+            h.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        note();
+        assert!(hits.load(Ordering::SeqCst) >= 1);
+        alive.store(false, Ordering::SeqCst);
+        note();
+        let after = hits.load(Ordering::SeqCst);
+        note();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            after,
+            "外れた受け手は呼ばれない"
+        );
+    }
 
     #[test]
     fn cwd_の変化とコマンドの終わりだけを数える() {

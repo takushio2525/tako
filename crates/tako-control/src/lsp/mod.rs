@@ -17,9 +17,13 @@
 //! 能力を読むのは [`LspManager::menu_capabilities_now`] / [`LspManager::menu_capabilities`]）。
 //! S4（#1681）のホバー = `tako lsp hover`（問い合わせの型と応答は [`hover`]、待つのは
 //! [`LspManager::hover`]。マウスの要求は補完と同じく前の 1 つを `$/cancelRequest` で捨てる）。
+//! #1944 の取得 = `tako lsp install`（未導入のサーバを data dir へ取る。ダウンロード・検証・確定は
+//! [`fetch`]、展開は [`archive`]、開いた時点で取るのと状態は [`LspManager`]）。
 
+pub mod archive;
 pub mod completion;
 pub mod diagnostics;
+pub mod fetch;
 pub mod format;
 pub mod goto;
 pub mod hover;
@@ -31,11 +35,12 @@ pub mod text;
 
 pub use completion::{CompletionAnswer, CompletionError, CompletionRequest};
 pub use diagnostics::DocDiagnostics;
+pub use fetch::FetchConfig;
 pub use format::{FormatAnswer, FormatError, FormatRequest};
 pub use goto::{GotoAnswer, GotoError, GotoRequest, GotoTarget};
 pub use hover::{HoverAnswer, HoverError, HoverRequest};
 pub use manager::{
-    legacy, DocLease, DocLink, DocumentDiagnostics, Launch, LspConfig, LspDocument, LspManager,
-    DIAGNOSTICS_EVENT_CAPACITY,
+    legacy, DocLease, DocLink, DocumentDiagnostics, DocumentServer, Launch, LspConfig, LspDocument,
+    LspManager, DIAGNOSTICS_EVENT_CAPACITY,
 };
 pub use menu::{MenuCapabilities, MenuRequest};

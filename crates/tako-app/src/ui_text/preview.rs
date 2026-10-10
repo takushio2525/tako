@@ -395,6 +395,59 @@ pub fn hover_truncated(total: usize) -> String {
     )
 }
 
+// --- 言語サーバの状態（#1944。キー: preview.lsp_*）。エディタのタイトルの 1 行と、未導入・失敗の帯 ---
+
+/// 取得中（取得物が決まっていれば `Some((取得物, 受けた MB, 全体の MB))`。Node.js を取るなら先に Node.js）
+pub fn lsp_fetching(name: &str, progress: Option<(&str, f64, f64)>) -> String {
+    match progress {
+        Some((item, done_mb, total_mb)) => tr!(
+            format!("{name} を取得中（{item} {done_mb:.1} / {total_mb:.1} MB）"),
+            format!("Fetching {name} ({item} {done_mb:.1} / {total_mb:.1} MB)")
+        ),
+        None => tr!(format!("{name} を取得中"), format!("Fetching {name}")),
+    }
+}
+pub fn lsp_starting(name: &str) -> String {
+    tr!(format!("{name} 起動中"), format!("{name} starting"))
+}
+pub fn lsp_loading(name: &str) -> String {
+    tr!(format!("{name} 読み込み中"), format!("{name} loading"))
+}
+pub fn lsp_running(name: &str) -> String {
+    tr!(format!("{name} 動作中"), format!("{name} running"))
+}
+/// 帯の見出し: 入っていない（補完・診断が出ないことを先に言う = 黙って出ない状態を無くす）
+pub fn lsp_not_installed(name: &str) -> String {
+    tr!(
+        format!("言語サーバ {name} が入っていないので、補完・診断・ホバーは出ません"),
+        format!("Language server {name} is not installed, so completion, diagnostics and hover are unavailable")
+    )
+}
+/// 帯の見出し: 取りに行って失敗した
+pub fn lsp_fetch_failed(name: &str) -> String {
+    tr!(
+        format!("言語サーバ {name} を取得できませんでした（補完・診断は出ません）"),
+        format!("Could not fetch language server {name} (no completion or diagnostics)")
+    )
+}
+/// 帯の見出し: 諦めた・止めた
+pub fn lsp_unavailable(name: &str) -> String {
+    tr!(
+        format!("言語サーバ {name} が止まっています（補完・診断は出ません）"),
+        format!("Language server {name} is not running (no completion or diagnostics)")
+    )
+}
+/// 取って入れるボタン（グローバルへは入れない）
+pub fn lsp_install() -> &'static str {
+    tr!("入れる", "Install")
+}
+pub fn lsp_retry() -> &'static str {
+    tr!("もう一度取得", "Retry")
+}
+pub fn lsp_restart() -> &'static str {
+    tr!("起こし直す", "Restart")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -464,6 +517,17 @@ mod tests {
                 hover_no_cursor().to_string(),
                 hover_searching().to_string(),
                 hover_truncated(40_000),
+                lsp_fetching("pyright", Some(("Node.js 24.21.0", 1.0, 52.9))),
+                lsp_fetching("pyright", None),
+                lsp_starting("pyright"),
+                lsp_loading("pyright"),
+                lsp_running("pyright"),
+                lsp_not_installed("clangd"),
+                lsp_fetch_failed("pyright"),
+                lsp_unavailable("pyright"),
+                lsp_install().to_string(),
+                lsp_retry().to_string(),
+                lsp_restart().to_string(),
             ]
         });
     }
