@@ -438,6 +438,11 @@ fn cases() -> Vec<((&'static str, &'static str), Cover)> {
             ("PaneLayout", "ssh"),
             Cover::Mutate(|f| leaf(f, 102).ssh = None),
         ),
+        // #1946: spawn 元（親 master ごとのまとまりの材料）
+        (
+            ("PaneLayout", "spawned_by"),
+            Cover::Mutate(|f| leaf(f, 102).spawned_by = Some(101)),
+        ),
         // ---- SshPaneLayout（#1446）----
         (
             ("SshPaneLayout", "host"),
@@ -665,6 +670,8 @@ fn pane(id: u64, title: &str) -> PaneLayout {
             host: "work-host".into(),
             reconnect_line: "ssh -o ConnectTimeout=10 work-host".into(),
         }),
+        // #1946: 復元で 201（実在）へ戻るので「保存 → 復元 → 保存」がバイト一致する
+        spawned_by: Some(201),
     }
 }
 

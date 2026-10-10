@@ -1573,7 +1573,9 @@ pub fn tools() -> Vec<Value> {
                 グループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。\
                 tabs には**タブ単位で退避されたタブ**（tab / title / origin_window / panes / tree）が並ぶ。\
                 退避タブ配下のペインは backgrounded にも shelved_tab 付きで出るので、\
-                1 本だけ取り出すことも tako_foreground_pane の tab でまとめて戻すこともできる。",
+                1 本だけ取り出すことも tako_foreground_pane の tab でまとめて戻すこともできる。\
+                各ペインの vessel は器（tmux / direct / preview / web / none = 器の無い幽霊）、\
+                parent_master は親 master。groups は画面と同じ「由来タブ → 親 master」のまとまり。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -1583,7 +1585,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_background_kill",
             "description": "バックグラウンドのペインを kill する。プロセスとバックエンド\
-                セッションも終了する。復帰不要なペインの片付けに使う。",
+                セッションも終了する。復帰不要なペインの片付けに使う。\
+                幽霊（vessel=none）は一覧から外すだけで、他の器には触らない。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

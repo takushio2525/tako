@@ -1172,6 +1172,11 @@ pub struct VideoStatus {
 // ---------------------------------------------------------------------------
 
 pub trait WebViewHost {
+    /// ペインに Web ビューが付いているか（#1946。退避ペインの器の判定に使う。
+    /// Web ビューを持たない実装の既定は false）
+    fn pane_has_webview(&self, _pane: PaneId) -> bool {
+        false
+    }
     /// Web ビューを生成してペインへ表示する（FR-3.8 / #155）。UI 層で wry WebView を
     /// 生成する。失敗時は Err を返し、呼び出し元がペインを巻き戻す。
     /// 成功時は `{ "id": u64, "pane": u64, "url": String }` を返す

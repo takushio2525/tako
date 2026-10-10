@@ -26,7 +26,7 @@ LedgerEntry: id, ts, project, label, issue, task_type, model, effort, agent, dur
 ManagedMark: schema, managed_by, tako_version, content_hash, files
 NodeLayout: Pane, Split, axis, ratio, first, second
 OrchestratorConfig: auto_close, auto_push
-PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume, ssh
+PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume, ssh, spawned_by
 PendingSpawn: tmux_session, kind, label, project, agent, model, effort, issues, prompt_head, cwd, tab, pane, recorded_at
 Place: Auto, Mod, Tako
 PreviewLayout: path, mode

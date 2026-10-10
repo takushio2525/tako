@@ -915,16 +915,33 @@ impl TakoApp {
     /// プレビュー本文（実画面サムネイル）。Pane は端末の現在グリッドをそのまま読む
     /// （リサイズしない＝バックグラウンドのプログラムを乱さない）。ClosedGroup はグループ内の
     /// 全バックグラウンドペインを均等高で縦に積む（FR-2.16.16）。ライブ更新は `on_term_event` が出力ごとに
-    /// 呼ぶ `cx.notify()` の再描画で自動的に得られる
-    fn preview_content(&self, target: PreviewTarget) -> gpui::Div {
+    /// 呼ぶ `cx.notify()` の再描画で自動的に得られる。
+    ///
+    /// #1946: `inner` は本文の箱の寸法（余白込み）。ペインは画面**全体**をそこへ収まる
+    /// 縮尺で描く（以前は左上から切り取っていたので、大きいペインは一部しか見えなかった）
+    fn preview_content(&self, target: PreviewTarget, inner: (f32, f32)) -> gpui::Div {
         let theme = &self.theme;
+        let scaled = !crate::drawer::drawer_legacy1946();
+        let (inner_w, inner_h) = (
+            (inner.0 - PANE_PADDING * 2.0).max(20.0),
+            (inner.1 - PANE_PADDING * 2.0).max(20.0),
+        );
+        let whole = |pane_id: PaneId, max_w: f32, max_h: f32| {
+            let (rows, cols, lines) = self.screen_rows_now(pane_id)?;
+            self.scaled_grid(pane_id, rows, cols, lines, max_w, max_h)
+        };
         match target {
-            PreviewTarget::Pane(pane_id) => div()
-                .flex_1()
-                .p(px(PANE_PADDING))
-                .overflow_hidden()
-                .bg(rgba(theme.background))
-                .children(self.terminal_screen_lines(pane_id, false)),
+            PreviewTarget::Pane(pane_id) => {
+                let body = div()
+                    .flex_1()
+                    .p(px(PANE_PADDING))
+                    .overflow_hidden()
+                    .bg(rgba(theme.background));
+                match whole(pane_id, inner_w, inner_h).filter(|_| scaled) {
+                    Some(grid) => body.flex().items_start().justify_center().child(grid),
+                    None => body.children(self.terminal_screen_lines(pane_id, false)),
+                }
+            }
             PreviewTarget::ClosedGroup(tab) => {
                 let mut body = div()
                     .flex_1()
@@ -935,8 +952,14 @@ impl TakoApp {
                     .p(px(PANE_PADDING))
                     .overflow_hidden()
                     .bg(rgba(theme.background));
-                for entry in self.background_entries_of_tab(tab) {
-                    let lines = self.terminal_screen_lines(entry.pane, false);
+                let entries = self.background_entries_of_tab(tab);
+                // 1 枚ぶんの箱（均等高から見出しと境目を引く）
+                let slot_h = (inner_h / entries.len().max(1) as f32 - 18.0).max(12.0);
+                for entry in entries {
+                    let lines = match whole(entry.pane, inner_w - 2.0, slot_h).filter(|_| scaled) {
+                        Some(grid) => vec![div().flex().justify_center().child(grid)],
+                        None => self.terminal_screen_lines(entry.pane, false),
+                    };
                     body = body.child(
                         div()
                             .flex_1()
@@ -1002,6 +1025,7 @@ impl TakoApp {
         target: PreviewTarget,
         live: bool,
         extra_title: Option<gpui::Div>,
+        size: (f32, f32),
     ) -> gpui::Div {
         let theme = &self.theme;
         let label = self.preview_label(target);
@@ -1035,7 +1059,39 @@ impl TakoApp {
             .flex_col()
             .size_full()
             .child(titlebar)
-            .child(self.preview_content(target))
+            .child(self.preview_content(target, (size.0, size.1 - PIN_TITLE_BAR)))
+    }
+
+    /// ホバーの寸法（#1946）。ペイン 1 枚は画面全体が**読める大きさ**になるよう、窓の 6 割まで
+    /// 広げる（元の大きさを超えない）。それ以外・旧挙動は従来の固定寸法
+    pub(crate) fn hover_preview_size(
+        &self,
+        target: PreviewTarget,
+        viewport: Size<Pixels>,
+    ) -> (f32, f32) {
+        let fixed = (PREVIEW_POPUP_W, PREVIEW_POPUP_H);
+        let PreviewTarget::Pane(pane_id) = target else {
+            return fixed;
+        };
+        if crate::drawer::drawer_legacy1946() {
+            return fixed;
+        }
+        let Some((cols, lines)) = self.terminals.get(&pane_id).map(|s| s.size()) else {
+            return fixed;
+        };
+        let Some((nat_w, nat_h)) = self.grid_natural_px(pane_id, cols, lines) else {
+            return fixed;
+        };
+        let max_w = (f32::from(viewport.width) * 0.6).max(PREVIEW_POPUP_W);
+        let max_h = (f32::from(viewport.height) * 0.6).max(PREVIEW_POPUP_H);
+        let pad = PANE_PADDING * 2.0;
+        let scale = ((max_w - pad) / nat_w)
+            .min((max_h - pad - PIN_TITLE_BAR) / nat_h)
+            .min(1.0);
+        (
+            (nat_w * scale + pad + 2.0).max(PREVIEW_POPUP_W * 0.6),
+            nat_h * scale + pad + PIN_TITLE_BAR + 2.0,
+        )
     }
 
     /// ホバープレビューのポップアップ（FR-2.16.13 / FR-2.16.16）。マウス位置の左側に実画面
@@ -1049,23 +1105,31 @@ impl TakoApp {
             return None;
         }
         let viewport = window.viewport_size();
-        let left = (f32::from(hp.anchor.x) - PREVIEW_POPUP_W - 12.0).max(8.0);
+        let (w, h) = self.hover_preview_size(hp.target, viewport);
+        // 左に収まらなければマウスの右へ出す（たまり場の左端のカードでも
+        // ポップアップがマウスの下に来て、ホバーが外れて消える…を繰り返さない）
+        let anchor_x = f32::from(hp.anchor.x);
+        let left = if anchor_x - w - 12.0 >= 8.0 {
+            anchor_x - w - 12.0
+        } else {
+            (anchor_x + 16.0).min((f32::from(viewport.width) - w - 8.0).max(8.0))
+        };
         let top = f32::from(hp.anchor.y)
-            .min((f32::from(viewport.height) - PREVIEW_POPUP_H - 8.0).max(8.0))
+            .min((f32::from(viewport.height) - h - 8.0).max(8.0))
             .max(8.0);
         Some(
             div()
                 .absolute()
                 .left(px(left))
                 .top(px(top))
-                .w(px(PREVIEW_POPUP_W))
-                .h(px(PREVIEW_POPUP_H))
+                .w(px(w))
+                .h(px(h))
                 .rounded_md()
                 .overflow_hidden()
                 .border_1()
                 .border_color(hsla(theme.accent))
                 .bg(rgba(theme.background))
-                .child(self.preview_body(hp.target, true, None))
+                .child(self.preview_body(hp.target, true, None, (w, h)))
                 .into_any_element(),
         )
     }
@@ -1182,7 +1246,7 @@ impl TakoApp {
                                     )),
                             ),
                     )
-                    .child(self.preview_content(target))
+                    .child(self.preview_content(target, (PIN_W, PIN_H - PIN_TITLE_BAR)))
                     .into_any_element()
             })
             .collect()
@@ -1239,6 +1303,61 @@ impl TakoApp {
         if let Some((_, frame)) = self.video_frame_cache.remove(&pane_id) {
             self.pending_video_frame_evictions.push(frame);
         }
+    }
+
+    /// たまり場カードのサムネイルに使う画像（#1946）。画像そのもの・動画のサムネ・
+    /// PDF の現在ページを、本体の描画と同じキャッシュ（LRU）から取り出す。
+    /// 返すのは (画像, 横 / 縦)。画像を持たないプレビュー（コード / Markdown 等）は None
+    pub(crate) fn preview_thumbnail_image(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Option<(std::sync::Arc<gpui::Image>, f32)> {
+        let ratio = |w: u32, h: u32| {
+            if w > 0 && h > 0 {
+                w as f32 / h as f32
+            } else {
+                4.0 / 3.0
+            }
+        };
+        let (index, aspect) = match &self.previews.get(&pane_id)?.content {
+            preview::PreviewContent::Pdf(data) => {
+                let index = self
+                    .preview_views
+                    .get(&pane_id)
+                    .map(|view| view.page.saturating_sub(1))
+                    .unwrap_or(0)
+                    .min(data.total_pages.saturating_sub(1));
+                let aspect = data
+                    .pixel_sizes
+                    .get(index)
+                    .map(|[w, h]| ratio(*w, *h))
+                    .unwrap_or(1.0 / 1.414);
+                (index, aspect)
+            }
+            preview::PreviewContent::Image(data) => (
+                0,
+                data.pixel_size
+                    .map(|(w, h)| ratio(w, h))
+                    .unwrap_or(4.0 / 3.0),
+            ),
+            preview::PreviewContent::Video(data) if !data.thumbnail.is_empty() => (
+                0,
+                data.resolution
+                    .map(|(w, h)| ratio(w, h))
+                    .unwrap_or(16.0 / 9.0),
+            ),
+            _ => return None,
+        };
+        self.ensure_preview_image_cache(pane_id, &[index]);
+        let image = self
+            .preview_image_cache
+            .get(&pane_id)?
+            .images
+            .get(index)?
+            .as_ref()?
+            .image
+            .clone();
+        Some((image, aspect))
     }
 
     /// 必要なページだけプレビュー画像キャッシュへ遅延追加する（Issue #168 / #258）。
