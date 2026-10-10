@@ -22,6 +22,13 @@
 //! 本当の失敗が埋もれる）。だから「復元しなかった」と「復元できなかった」を
 //! 別のカテゴリで数える。
 //!
+//! **#1576 で前提を訂正した**: 表に出す経路（`reattach_backgrounded`）は端末を起こさないので、
+//! 起こさなかった退避は**端末の無い幽霊**になり、器は `backend_sessions` に居ないせいで
+//! orphan 自動復帰が「復帰」タブへ別 pane として拾っていた。いまは退避も表と同じ経路で
+//! 器へ繋ぎ直す（判断は `crate::shelved_restore`）。`たまり場・退避` は「退避のまま戻した」
+//! 件数で、どう戻したか（tmux 再 attach / resume / 新規シェル / プレビュー）は 2 行目に出る。
+//! 起こせなかった退避は `復元失敗` の側で数える（退避のペインが起きなかったことを隠さない）
+//!
 //! 一方、本当の失敗（`spawn_session` の `Err`）は `eprintln!` 止まり（GUI の stderr は
 //! どこにも出ない = `log show --predicate 'process == "tako"'` で 0 件）で
 //! persist.log に痕跡が無かった。
@@ -77,12 +84,23 @@ pub enum FailureReason {
     /// 構造上の保険（`spawn_session` は成功すれば必ず登録する）だが、
     /// **ここを数えないと「エージェントが戻らない」1 件が無言で消える**
     ResumeNotDelivered,
+    /// 退避（たまり場・退避タブ）のエントリが器も戻す手掛かり（cwd / 会話 / プレビュー）も
+    /// 持たない = 旧版（#1576 以前）の復元が残した幽霊。退避から外す
+    NoVessel,
+    /// 退避のエントリが指す器を、先に起こした別のペインが持っている。
+    /// 2 本の端末で 1 つの器を取り合わないよう退避から外す（#1576）
+    DuplicateVessel,
 }
 
 impl FailureReason {
     /// 列挙の正本（テスト・網羅の基準）
-    pub const ALL: [FailureReason; 3] =
-        [Self::NotPlaced, Self::SpawnFailed, Self::ResumeNotDelivered];
+    pub const ALL: [FailureReason; 5] = [
+        Self::NotPlaced,
+        Self::SpawnFailed,
+        Self::ResumeNotDelivered,
+        Self::NoVessel,
+        Self::DuplicateVessel,
+    ];
 
     /// 診断ログ用の日本語ラベル（`FreshShellReason::label` と同じ役目）
     pub const fn label(self) -> &'static str {
@@ -90,12 +108,15 @@ impl FailureReason {
             Self::NotPlaced => "ワークスペースに配置されていない",
             Self::SpawnFailed => "起動できない",
             Self::ResumeNotDelivered => "resume 入力の宛先が無い",
+            Self::NoVessel => "器も戻す手掛かりも無い退避を外した",
+            Self::DuplicateVessel => "同じ器を別のペインが持つ退避を外した",
         }
     }
 }
 
-/// タブ配下に居ないペインの種別（#1554）。**復元の失敗ではない**（どちらも
-/// 「表に出すときに起こす」設計で、`spawn_session` を通らないのが正しい）
+/// タブ配下に居ないペインの種別（#1554）。**復元の失敗ではない**。
+/// #1576 からは表のペインと同じ経路で器へ繋ぎ直し、退避のまま戻す
+/// （どう戻したかは [`HiddenWake`]）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenKind {
     /// たまり場ペイン（FR-2.15.5 / FR-2.15.6）
@@ -117,6 +138,47 @@ impl HiddenKind {
     }
 }
 
+/// タブ配下に居ないペインをどう戻したか（#1576）。
+///
+/// #1576 以前は**起こさなかった**（`NotWoken`）。器を `backend_sessions` へ登録しないので
+/// 起動時の orphan 自動復帰が器を「復帰」タブへ別 pane として拾い、退避エントリは
+/// 端末の無い幽霊として残っていた。いまは表のペインと同じ判断（`restore_plan`）で起こす
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenWake {
+    /// 器が生きていた = 実行中プロセスごと再 attach した
+    Reattached,
+    /// 器が消えていたので保存済みの会話を resume した
+    Resumed,
+    /// 器が消えていたので新しいシェルを開いた
+    FreshShell,
+    /// プレビューペイン（ファイルを開き直しただけ）
+    Preview,
+    /// 起こしていない（A/B の旧挙動 `TAKO_1576_LEGACY=1` と、Web ビューのペイン）
+    NotWoken,
+}
+
+impl HiddenWake {
+    /// 列挙の正本（テスト・網羅の基準）
+    pub const ALL: [HiddenWake; 5] = [
+        Self::Reattached,
+        Self::Resumed,
+        Self::FreshShell,
+        Self::Preview,
+        Self::NotWoken,
+    ];
+
+    /// 診断ログ用の日本語ラベル（1 行目のカテゴリに合わせた言葉。resume は系統を問わない）
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reattached => "tmux 再 attach",
+            Self::Resumed => "resume",
+            Self::FreshShell => "新規シェル",
+            Self::Preview => "プレビュー",
+            Self::NotWoken => "起こしていない",
+        }
+    }
+}
+
 /// 1 ペインの結末。復元ループは **1 ペインについてちょうど 1 つ**記録する
 /// （`continue` で抜ける枝も含む）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,10 +193,32 @@ pub enum PaneOutcome {
     Preview,
     /// Web ビューペイン（PTY を起こさない。wry の生成は初回 render まで遅延する）
     Webview,
-    /// タブ配下に居ないので起こさなかった（たまり場 / 退避タブ配下）
-    Hidden(HiddenKind),
+    /// タブ配下に居ないペイン（たまり場 / 退避タブ配下）を退避のまま戻した。
+    /// 2 つ目はどう戻したか（#1576）
+    Hidden(HiddenKind, HiddenWake),
     /// 復元できなかった
     Failed(FailureReason),
+}
+
+impl PaneOutcome {
+    /// タブ配下に居ないペインなら「たまり場・退避」の側へ数え替える（#1576）。
+    ///
+    /// 復元ループは表と退避で**同じ枝**を通る（器の判断・spawn・resume を 2 系統に
+    /// 分けない）ので、結末だけをここで振り分ける。失敗は失敗のまま返す
+    /// （「たまり場・退避」へ隠すと、退避のペインが起きなかったことが 1 行目から消える）
+    pub fn within(self, hidden: Option<HiddenKind>) -> Self {
+        let Some(kind) = hidden else {
+            return self;
+        };
+        let wake = match self {
+            Self::Reattached => HiddenWake::Reattached,
+            Self::Resumed { .. } => HiddenWake::Resumed,
+            Self::FreshShell(_) => HiddenWake::FreshShell,
+            Self::Preview => HiddenWake::Preview,
+            Self::Webview | Self::Hidden(..) | Self::Failed(_) => return self,
+        };
+        Self::Hidden(kind, wake)
+    }
 }
 
 /// 復元の内訳。`record` で結末を積み、`summary` / `detail` / `mismatch` が
@@ -156,6 +240,9 @@ pub struct RestoreBreakdown {
     /// タブ配下に居ないペインの内訳（たまり場 / 退避タブ）。件数の合計が
     /// `たまり場・退避` の件数（別に持つと食い違う）
     hidden: BTreeMap<&'static str, usize>,
+    /// 同じペインの戻し方（#1576）。`hidden` と同じ `record` の 1 か所でだけ増えるので、
+    /// 件数の合計は常に `hidden` の合計と等しい
+    hidden_wakes: BTreeMap<&'static str, usize>,
     /// 失敗の理由の内訳。件数の合計が `復元失敗` の件数（別に持つと食い違う）
     failures: BTreeMap<&'static str, usize>,
 }
@@ -177,6 +264,7 @@ impl RestoreBreakdown {
             previews: 0,
             webviews: 0,
             hidden: BTreeMap::new(),
+            hidden_wakes: BTreeMap::new(),
             failures: BTreeMap::new(),
         }
     }
@@ -201,8 +289,9 @@ impl RestoreBreakdown {
             }
             PaneOutcome::Preview => self.previews += 1,
             PaneOutcome::Webview => self.webviews += 1,
-            PaneOutcome::Hidden(kind) => {
+            PaneOutcome::Hidden(kind, wake) => {
                 *self.hidden.entry(kind.label()).or_insert(0) += 1;
+                *self.hidden_wakes.entry(wake.label()).or_insert(0) += 1;
             }
             PaneOutcome::Failed(reason) => {
                 *self.failures.entry(reason.label()).or_insert(0) += 1;
@@ -215,7 +304,7 @@ impl RestoreBreakdown {
         self.failures.values().sum()
     }
 
-    /// タブ配下に居ないので起こさなかったペインの件数（たまり場 + 退避タブ配下）
+    /// 退避のまま戻したペインの件数（たまり場 + 退避タブ配下）
     pub fn hidden(&self) -> usize {
         self.hidden.values().sum()
     }
@@ -303,12 +392,15 @@ impl RestoreBreakdown {
             })
             .collect();
         let reasons = join_counts(&self.fresh_reasons);
+        // 戻し方（#1576）は種別の後ろへ「。」で続ける（種別と戻し方は同じペインを
+        // 別の軸で数えたものなので、` / ` で並べると件数を足してしまう読み方を誘う）
         let hidden = if hidden == 0 {
             String::new()
         } else {
             format!(
-                " / {LABEL_HIDDEN} {hidden}（{}）",
-                join_counts(&self.hidden)
+                " / {LABEL_HIDDEN} {hidden}（{}。戻し方: {}）",
+                join_counts(&self.hidden),
+                join_counts(&self.hidden_wakes)
             )
         };
         let failures = if failed == 0 {
@@ -411,7 +503,9 @@ mod tests {
             ]
             .map(PaneOutcome::FreshShell),
         );
-        out.extend(HiddenKind::ALL.map(PaneOutcome::Hidden));
+        for kind in HiddenKind::ALL {
+            out.extend(HiddenWake::ALL.map(|wake| PaneOutcome::Hidden(kind, wake)));
+        }
         out.extend(FailureReason::ALL.map(PaneOutcome::Failed));
         out
     }
@@ -492,7 +586,10 @@ mod tests {
         for _ in 0..5 {
             b.record(PaneOutcome::Preview);
         }
-        b.record(PaneOutcome::Hidden(HiddenKind::ShelvedTab));
+        b.record(PaneOutcome::Hidden(
+            HiddenKind::ShelvedTab,
+            HiddenWake::Reattached,
+        ));
         assert_eq!(b.total(), 23, "22 ≠ 23 の 1 件が説明された");
         assert_eq!(b.mismatch(23), None);
         let line = b.summary(10, 23);
@@ -504,7 +601,7 @@ mod tests {
             b.detail().as_deref(),
             Some(
                 "復元の内訳: Claude resume 0（役割つき 0 / 役割なし 0） / 新規シェル 0 / \
-                 たまり場・退避 1（退避タブ 1）"
+                 たまり場・退避 1（退避タブ 1。戻し方: tmux 再 attach 1）"
             )
         );
     }
@@ -522,7 +619,7 @@ mod tests {
                 with_role: false,
             },
             PaneOutcome::FreshShell(FreshShellReason::NoSessionId),
-            PaneOutcome::Hidden(HiddenKind::Backgrounded),
+            PaneOutcome::Hidden(HiddenKind::Backgrounded, HiddenWake::Resumed),
             PaneOutcome::Failed(FailureReason::SpawnFailed),
             PaneOutcome::Failed(FailureReason::NotPlaced),
         ]);
@@ -531,7 +628,7 @@ mod tests {
             detail,
             "復元の内訳: Claude resume 1（役割つき 1 / 役割なし 0） / \
              codex resume 1（役割つき 0 / 役割なし 1） / 新規シェル 1（ID なし 1） / \
-             たまり場・退避 1（たまり場 1） / \
+             たまり場・退避 1（たまり場 1。戻し方: resume 1） / \
              復元失敗 2（ワークスペースに配置されていない 1 / 起動できない 1）"
         );
     }
@@ -586,6 +683,9 @@ mod tests {
         for kind in HiddenKind::ALL {
             assert!(!kind.label().is_empty());
         }
+        for wake in HiddenWake::ALL {
+            assert!(!wake.label().is_empty());
+        }
     }
 
     /// A/B: `TAKO_1554_LEGACY=1` 相当は修正前の症状を再現する
@@ -600,7 +700,10 @@ mod tests {
             b.record(PaneOutcome::Preview);
         }
         b.record(PaneOutcome::Webview);
-        b.record(PaneOutcome::Hidden(HiddenKind::ShelvedTab));
+        b.record(PaneOutcome::Hidden(
+            HiddenKind::ShelvedTab,
+            HiddenWake::NotWoken,
+        ));
         assert_eq!(
             b.summary(10, 24),
             "復元成功: 10 タブ / 24 ペイン（tmux 再 attach 17 / Claude resume 0 / \
@@ -609,5 +712,64 @@ mod tests {
         assert_eq!(b.mismatch(24), None, "旧挙動は食い違いを名指さない");
         b.record(PaneOutcome::Failed(FailureReason::SpawnFailed));
         assert_eq!(b.detail(), None, "旧挙動は失敗・たまり場の内訳を出さない");
+    }
+
+    /// #1576: 退避のペインは表と同じ枝を通り、結末だけが「たまり場・退避」へ数え替わる。
+    /// 失敗は失敗のまま（退避が起きなかったことを 1 行目から消さない）
+    #[test]
+    fn 退避のペインは戻し方つきで数え替わる() {
+        let shelved = Some(HiddenKind::Backgrounded);
+        assert_eq!(
+            PaneOutcome::Reattached.within(shelved),
+            PaneOutcome::Hidden(HiddenKind::Backgrounded, HiddenWake::Reattached)
+        );
+        assert_eq!(
+            PaneOutcome::Resumed {
+                agent: Agent::Claude,
+                with_role: true
+            }
+            .within(Some(HiddenKind::ShelvedTab)),
+            PaneOutcome::Hidden(HiddenKind::ShelvedTab, HiddenWake::Resumed)
+        );
+        assert_eq!(
+            PaneOutcome::FreshShell(FreshShellReason::NoSessionId).within(shelved),
+            PaneOutcome::Hidden(HiddenKind::Backgrounded, HiddenWake::FreshShell)
+        );
+        assert_eq!(
+            PaneOutcome::Preview.within(shelved),
+            PaneOutcome::Hidden(HiddenKind::Backgrounded, HiddenWake::Preview)
+        );
+        for reason in FailureReason::ALL {
+            assert_eq!(
+                PaneOutcome::Failed(reason).within(shelved),
+                PaneOutcome::Failed(reason),
+                "失敗をたまり場・退避へ隠している"
+            );
+        }
+        // 表のペインは何も変わらない
+        assert_eq!(
+            PaneOutcome::Reattached.within(None),
+            PaneOutcome::Reattached
+        );
+        // 実測の形（たまり場 1 + 退避タブ 1 を再 attach）
+        let mut b = RestoreBreakdown::with_legacy(false);
+        b.record(PaneOutcome::Reattached);
+        b.record(PaneOutcome::Reattached.within(Some(HiddenKind::Backgrounded)));
+        b.record(PaneOutcome::Reattached.within(Some(HiddenKind::ShelvedTab)));
+        b.record(PaneOutcome::Failed(FailureReason::NoVessel));
+        assert_eq!(b.total(), 4);
+        assert_eq!(
+            b.summary(1, 4),
+            "復元成功: 1 タブ / 4 ペイン（tmux 再 attach 1 / Claude resume 0 / \
+             新規シェル 0 / プレビュー 0 / Web ビュー 0 / たまり場・退避 2 / 復元失敗 1）"
+        );
+        assert_eq!(
+            b.detail().as_deref(),
+            Some(
+                "復元の内訳: Claude resume 0（役割つき 0 / 役割なし 0） / 新規シェル 0 / \
+                 たまり場・退避 2（たまり場 1 / 退避タブ 1。戻し方: tmux 再 attach 2） / \
+                 復元失敗 1（器も戻す手掛かりも無い退避を外した 1）"
+            )
+        );
     }
 }

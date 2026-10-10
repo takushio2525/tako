@@ -33,7 +33,8 @@
 use std::path::{Path, PathBuf};
 
 use tako_control::restore_report::{
-    FailureReason, HiddenKind, PaneOutcome, RestoreBreakdown, LABEL_FAILED, LABEL_HIDDEN,
+    FailureReason, HiddenKind, HiddenWake, PaneOutcome, RestoreBreakdown, LABEL_FAILED,
+    LABEL_HIDDEN,
 };
 use tako_core::agent_support::Agent;
 
@@ -285,8 +286,8 @@ fn 内訳の合計は記録したペイン数と一致する() {
         },
         PaneOutcome::Preview,
         PaneOutcome::Webview,
-        PaneOutcome::Hidden(HiddenKind::Backgrounded),
-        PaneOutcome::Hidden(HiddenKind::ShelvedTab),
+        PaneOutcome::Hidden(HiddenKind::Backgrounded, HiddenWake::Reattached),
+        PaneOutcome::Hidden(HiddenKind::ShelvedTab, HiddenWake::FreshShell),
         PaneOutcome::Failed(FailureReason::SpawnFailed),
         PaneOutcome::Failed(FailureReason::NotPlaced),
         PaneOutcome::Failed(FailureReason::ResumeNotDelivered),
@@ -306,12 +307,14 @@ fn 内訳の合計は記録したペイン数と一致する() {
 }
 
 /// 1': たまり場（FR-2.15.5）と退避タブ配下（#1487）は**失敗ではない**
+/// （#1576 からは退避のまま器へ繋ぎ直し、どう戻したかを添えて数える。起こせなかった
+/// 退避だけが失敗になる = `issue1576_shelved_restore_watchdog`）
 #[test]
 fn たまり場と退避タブは失敗として数えない() {
     // 器の側: 別カテゴリとして数え、`failed()` を増やさない
     let mut b = RestoreBreakdown::with_legacy(false);
     for kind in HiddenKind::ALL {
-        b.record(PaneOutcome::Hidden(kind));
+        b.record(PaneOutcome::Hidden(kind, HiddenWake::Reattached));
     }
     assert_eq!(b.hidden(), 2);
     assert_eq!(
