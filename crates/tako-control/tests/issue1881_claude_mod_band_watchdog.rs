@@ -10,9 +10,12 @@
 //!
 //! # 何を縛るか
 //!
-//! 1. 帯は 1 行: `AbovePrompt` の描画は `wrap: 'truncate-end'` の `Text` 1 本を返し、`Box` /
-//!    `flexDirection` / `Button` を使わない。幅（`bodyColumns`）に合わせて詰め（`fitBand(`）、
-//!    調査票（`hasSurvey`）には譲る
+//! 1. tako の行は 1 行: S7-3（#1962）から帯は他の mod の行を包むので、縛るのは tako の行。
+//!    `bandRow`（区切りの Text とボタンの横並び）は `flexDirection: 'row'` で縦に並べず、A/B の
+//!    `drawBandS3` は `wrap: 'truncate-end'` の `Text` 1 本で `Box` / `flexDirection` / `Button` を
+//!    使わない。どちらも幅に合わせて詰め（`fitBand(`）、帯のフックは幅（`bodyColumns`）を読み、
+//!    調査票（`hasSurvey`）には譲り、木を直に組まない（`next` を包むことは
+//!    `issue1962_mod_band_buttons_watchdog` が縛る）
 //! 2. 帯に出すものの判断は tako: `segmentsOf` は `view.warnings` だけを読み、`view.ctx` /
 //!    `view.rate_limits`（サイドバー用の全部入り）や worker の状態（承認待ち）を見ない
 //! 3. サイドバーは頼まれずに開かない: `$.ui.open(` は `command.run`（`/tako`）の登録の中だけ
@@ -144,37 +147,99 @@ fn current() -> Sources {
 
 /// 1. 帯は 1 行（`Text` 1 本・幅に合わせて詰める・調査票に譲る）
 fn scan_band(register: &str) -> Vec<String> {
-    let Some(w) = window(register, BAND_OPEN, REG_CLOSE) else {
-        return vec![report(
+    // `barText(` のような別の名前の末尾には当てない（直前が識別子の文字でない呼び出しだけ）
+    let calls = |src: &str, name: &str| {
+        src.match_indices(name).find_map(|(at, _)| {
+            let before = src[..at].chars().next_back();
+            (!before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .then(|| src[..at].lines().count().max(1))
+        })
+    };
+    let mut out = Vec::new();
+    match window(register, BAND_OPEN, REG_CLOSE) {
+        Some(w) => {
+            for bad in ["Box(", "Button(", "Text("] {
+                if let Some(nth) = calls(&w.1, bad) {
+                    out.push(report(
+                        REGISTER,
+                        w.0 + nth - 1,
+                        &format!("帯のフックが `{bad}` で木を直に組んでいる（tako の行は bandRow / drawBandS3 だけが組む = 1 行の形を 1 か所で縛る）"),
+                    ));
+                }
+            }
+            for need in ["e.props.bodyColumns", "e.props.hasSurvey"] {
+                if !w.1.contains(need) {
+                    out.push(report(
+                        REGISTER,
+                        w.0,
+                        &format!(
+                            "帯の描画に `{need}` が無い（幅に合わせて 1 行に詰め、調査票に譲る）"
+                        ),
+                    ));
+                }
+            }
+        }
+        None => out.push(report(
             REGISTER,
             1,
             "帯の描画（AbovePrompt）が見つからない（走査が空振り）",
-        )];
-    };
-    let mut out = Vec::new();
-    for bad in ["Box(", "flexDirection", "Button("] {
-        if w.1.contains(bad) {
-            out.push(report(
-                REGISTER,
-                line_of(&w, bad),
-                &format!("帯の描画に `{bad}` がある（帯は 1 行の Text 1 本。行を足すと 21 行のペインで `↓ N more` に畳まれる）"),
-            ));
-        }
+        )),
     }
-    for need in [
-        "wrap: 'truncate-end'",
-        "return Text(",
-        "fitBand(",
-        "e.props.bodyColumns",
-        "e.props.hasSurvey",
-    ] {
-        if !w.1.contains(need) {
-            out.push(report(
-                REGISTER,
-                w.0,
-                &format!("帯の描画に `{need}` が無い（幅に合わせて 1 行に詰め、調査票に譲る）"),
-            ));
+    // tako の行（S7-3 #1962）: 横に 1 行。縦に並べると 21 行のペインで `↓ N more` に畳まれる
+    match window(register, "function bandRow(", "}") {
+        Some(w) => {
+            for need in ["wrap: 'truncate-end'", "fitBand(", "flexDirection: 'row'"] {
+                if !w.1.contains(need) {
+                    out.push(report(
+                        REGISTER,
+                        w.0,
+                        &format!(
+                            "tako の行に `{need}` が無い（区切りとボタンを横に 1 行で詰める）"
+                        ),
+                    ));
+                }
+            }
+            if w.1.contains("'column'") {
+                out.push(report(
+                    REGISTER,
+                    line_of(&w, "'column'"),
+                    "tako の行が縦に並ぶ（`'column'`。帯の行数は他の mod と共有 = tako はボタン込みで 1 行）",
+                ));
+            }
         }
+        None => out.push(report(
+            REGISTER,
+            1,
+            "bandRow が見つからない（走査が空振り）",
+        )),
+    }
+    // A/B（TAKO_1877_S7_LEGACY）の S3 の描き方: Text 1 本
+    match window(register, "function drawBandS3(", "}") {
+        Some(w) => {
+            for bad in ["Box(", "flexDirection", "Button("] {
+                if w.1.contains(bad) {
+                    out.push(report(
+                        REGISTER,
+                        line_of(&w, bad),
+                        &format!("S3 の帯の描画に `{bad}` がある（S3 の帯は 1 行の Text 1 本。行を足すと 21 行のペインで `↓ N more` に畳まれる）"),
+                    ));
+                }
+            }
+            for need in ["wrap: 'truncate-end'", "return Text(", "fitBand("] {
+                if !w.1.contains(need) {
+                    out.push(report(
+                        REGISTER,
+                        w.0,
+                        &format!("S3 の帯の描画に `{need}` が無い（幅に合わせて 1 行に詰める）"),
+                    ));
+                }
+            }
+        }
+        None => out.push(report(
+            REGISTER,
+            1,
+            "drawBandS3 が見つからない（走査が空振り）",
+        )),
     }
     out
 }
@@ -512,8 +577,15 @@ fn 走査が空振りしていない() {
         band.contains("segments") && band.contains("hidden"),
         "{band:?}"
     );
-    // 帯の窓の中身（描画と詰め）が採れている
+    // 帯の窓（フック・tako の行・S3 の描き方）の中身が採れている
     let (_, w) = window(&s.register, BAND_OPEN, REG_CLOSE).unwrap();
+    assert!(
+        w.contains("e.props.bodyColumns") && w.contains("bandRow("),
+        "{w}"
+    );
+    let (_, w) = window(&s.register, "function bandRow(", "}").unwrap();
+    assert!(w.contains("fitBand(") && w.contains("Button("), "{w}");
+    let (_, w) = window(&s.register, "function drawBandS3(", "}").unwrap();
     assert!(w.contains("fitBand(") && w.contains("return Text("), "{w}");
     // env の走査の対象が採れている
     assert!(
@@ -538,16 +610,35 @@ fn 逆戻りを名指しできる() {
         f(&mut s);
         all(&s)
     };
-    // 1. 帯に 2 行目（Box の縦並び）を足す
+    // 1. S3 の帯に 2 行目（Box の縦並び）を足す
     let found = mutate(&|s| {
         s.register = s.register.replacen(
-            "    return Text({ dimColor: true, wrap: 'truncate-end', children: parts })",
-            "    return Box({ flexDirection: 'column', children: [Text({ children: parts }), Text({ children: 'more' })] })",
+            "  return Text({ dimColor: true, wrap: 'truncate-end', children: parts })",
+            "  return Box({ flexDirection: 'column', children: [Text({ children: parts }), Text({ children: 'more' })] })",
             1,
         );
     });
     assert_named(&found, REGISTER, "`Box(`");
     assert_named(&found, REGISTER, "wrap: 'truncate-end'");
+    // 1a. tako の行（S7-3）を縦に並べる（ボタンを 2 行目へ）
+    let found = mutate(&|s| {
+        s.register = s.register.replacen(
+            "  return Box({ flexDirection: 'row', columnGap: BUTTON_GAP, children: [line, ...buttons] })",
+            "  return Box({ flexDirection: 'column', children: [line, ...buttons] })",
+            1,
+        );
+    });
+    assert_named(&found, REGISTER, "`'column'`");
+    assert_named(&found, REGISTER, "flexDirection: 'row'");
+    // 1c. 帯のフックで木を直に組む（tako の行の形を 2 つの関数の外へ散らす）
+    let found = mutate(&|s| {
+        s.register = s.register.replacen(
+            "    if (view.band_style === 's3') return drawBandS3($, e, view, columns)",
+            "    if (view.band_style === 's3') return $.ui.resolve(e).Text({ children: 'tako' })",
+            1,
+        );
+    });
+    assert_named(&found, REGISTER, "`Text(`");
     // 1b. 調査票に譲らない
     let found = mutate(&|s| {
         s.register = s.register.replacen(" || e.props.hasSurvey", "", 1);
@@ -556,8 +647,8 @@ fn 逆戻りを名指しできる() {
     // 2. 帯の区切りが mod 側で閾値を判断する
     let found = mutate(&|s| {
         s.register = s.register.replacen(
-            "  view.warnings.forEach((warn, i) => {",
-            "  if ((view.ctx?.percent ?? 0) >= 80) out.push({ kind: 'ctx', label: 'ctx', rank: 3 })\n  view.warnings.forEach((warn, i) => {",
+            "    view.warnings.forEach((warn, i) => out.push(warning(warn, i, 3)))",
+            "    if ((view.ctx?.percent ?? 0) >= 80) out.push({ kind: 'ctx', label: 'ctx', rank: 3 })\n    view.warnings.forEach((warn, i) => out.push(warning(warn, i, 3)))",
             1,
         );
     });

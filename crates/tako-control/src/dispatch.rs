@@ -39088,7 +39088,10 @@ mod tests {
             format!("pane {}", workers[0]),
             "名前の無いペインは pane N"
         );
-        assert_eq!(view["warnings"], json!([{"kind": "ctx", "percent": 85.0}]));
+        // #1962: バーを描く（statusLine の報告が無い = 描かせる）ので、閾値超えの ctx も帯の警告には
+        // 載せない（同じ値を 2 か所で動かさない）。A/B（S3 の描き方）の警告は core の単体で見る
+        assert_eq!(view["usage_bar"]["draw"], true, "{out}");
+        assert_eq!(view["warnings"], json!([]));
         assert_eq!(view["ctx"]["percent"], 85);
         assert_eq!(
             view["rate_limits"][0]["kind"], "five_hour",
@@ -39188,6 +39191,148 @@ mod tests {
             ui: Some(serde_json::from_value(ui).unwrap()),
             dry_run: false,
         }
+    }
+
+    /// #1962: 報告の renders で、フォーカス中のペインの mod がバーを描いていればステータスバーの
+    /// claude の区画を mod に任せる（`tako mod` の `status_bar`）。帯のフックが呼ばれていなければ
+    /// 「他の mod に隠された」を行に出す。tako の操作のボタンの CLI の引数は tako が組んで応答に載せる
+    #[test]
+    fn issue1962_rendersでステータスバーの区画と帯の状態を決めボタンの引数を渡す() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let with_renders = |renders: Value| {
+            let mut body = mod_report_body("idle");
+            body["renders"] = renders;
+            body["status_line"] = json!(false);
+            body["last_press"] = json!({"kind": "slash", "ok": true, "at": 5});
+            body
+        };
+        let report = |host: &mut MockHost, pane: u64, body: Value| {
+            dispatch(
+                host,
+                mod_request("report", Some(body), Some(pane)),
+                PaneOrigin::Cli,
+            )
+            .unwrap()
+        };
+        let status = |host: &mut MockHost| {
+            dispatch(host, mod_request("status", None, None), PaneOrigin::Mcp).unwrap()
+        };
+        // 報告が無い = 今のまま tako が出す
+        let st = status(&mut host);
+        assert_eq!(st["status_bar"]["drawn_by"], "tako", "{st}");
+        assert_eq!(st["status_bar"]["reason"], "no_fresh_report");
+        assert_eq!(st["status_bar"]["pane"], pane);
+        assert_eq!(st["band"]["s7_legacy"], false);
+
+        // バーを描いた（renders.usage_bar）→ mod に任せる。押した結果は種類と成否だけ行に出る
+        let out = report(
+            &mut host,
+            pane,
+            with_renders(json!({
+                "band": true, "usage_bar": "prompt_hint", "buttons": 1,
+                "band_hook": true, "hint_hook": true,
+            })),
+        );
+        assert_eq!(out["tako"]["view"]["usage_bar"]["draw"], true, "{out}");
+        let st = status(&mut host);
+        assert_eq!(st["status_bar"]["drawn_by"], "mod", "{st}");
+        assert_eq!(st["status_bar"]["place"], "prompt_hint");
+        let row = &st["panes"][0];
+        assert_eq!(row["band"]["state"], "drawn", "{row}");
+        assert_eq!(row["band"]["buttons"], 1);
+        assert_eq!(row["report"]["last_press"]["kind"], "slash");
+        assert_eq!(row["report"]["status_line"], false);
+
+        // 帯のフックだけ呼ばれない = 外側の他の mod に帯を隠された
+        report(
+            &mut host,
+            pane,
+            with_renders(json!({
+                "band": false, "usage_bar": "prompt_hint", "buttons": 0,
+                "band_hook": false, "hint_hook": true,
+            })),
+        );
+        let row = status(&mut host)["panes"][0].clone();
+        assert_eq!(row["band"]["state"], "hidden_by_other_mod", "{row}");
+        assert!(row["band"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("他の mod"));
+
+        // 描いていない（statusLine が出している・off）→ tako が出す
+        report(
+            &mut host,
+            pane,
+            with_renders(json!({"band": true, "buttons": 1, "band_hook": true, "hint_hook": true})),
+        );
+        let st = status(&mut host);
+        assert_eq!(st["status_bar"]["drawn_by"], "tako", "{st}");
+        assert_eq!(st["status_bar"]["reason"], "mod_not_drawing");
+
+        // S7-3 前の mod（renders なし）は行に帯の状態を出さず、ステータスバーも今のまま
+        report(&mut host, pane, mod_report_body("idle"));
+        let st = status(&mut host);
+        assert!(st["panes"][0].get("band").is_none(), "{st}");
+        assert_eq!(st["status_bar"]["drawn_by"], "tako");
+
+        // tako の操作のボタンは tako が CLI の引数を組んで応答に載せる（slash は載せない）
+        dispatch(
+            &mut host,
+            mod_ui_request(json!({"op": "button_add", "kind": "tako", "value": "split-right"})),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let out = report(&mut host, pane, mod_report_body("idle"));
+        let args = &out["tako"]["view"]["button_args"];
+        assert_eq!(
+            args["split-right"],
+            json!(["split", "--pane", pane.to_string(), "--right"]),
+            "{out}"
+        );
+        assert!(
+            args.get("compact").is_none(),
+            "slash は Claude Code の中で済む"
+        );
+        assert!(out["tako"]["view"].get("band_style").is_none());
+    }
+
+    /// #1962: フォーカスしていないペインの mod がバーを描いていても、ステータスバーは
+    /// フォーカス中のペイン（シェル・codex 等 = 報告なし）に合わせて今のまま
+    #[test]
+    fn issue1962_フォーカスしていないペインのバーではステータスバーを止めない() {
+        let mut host = MockHost::new();
+        layout_with_workers(&mut host, 1);
+        let focused = host.ws.active_tab().tree().focused();
+        let other = host
+            .ws
+            .active_tab()
+            .tree()
+            .panes()
+            .into_iter()
+            .map(|p| p.id())
+            .find(|id| *id != focused)
+            .expect("2 枚ある");
+        let mut body = mod_report_body("idle");
+        body["renders"] = json!({
+            "band": true, "usage_bar": "prompt_hint", "buttons": 1,
+            "band_hook": true, "hint_hook": true,
+        });
+        dispatch(
+            &mut host,
+            mod_request("report", Some(body), Some(other.as_u64())),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let st = dispatch(
+            &mut host,
+            mod_request("status", None, None),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(st["status_bar"]["drawn_by"], "tako", "{st}");
+        assert_eq!(st["status_bar"]["pane"], focused.as_u64());
+        assert_eq!(st["status_bar"]["reason"], "no_fresh_report");
     }
 
     /// #1960: 報告の応答の `tako.view.ui` に検証済みの ui.json が載り、`tako mod ui` の変更が

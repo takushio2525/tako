@@ -1,7 +1,7 @@
 {
   "name": "tako",
   "version": "0.0.0",
-  "description": "tako terminal integration: reports this pane's Claude Code state (context, rate limits, turn) to tako and shows tako's status in a band above the prompt and a /tako sidebar",
+  "description": "tako terminal integration: reports this pane's Claude Code state (context, rate limits, turn) to tako and shows tako's status in a band above the prompt (with custom buttons, keeping other mods' rows), a rate-limit / context bar on the hint line and a /tako sidebar",
   "author": {
     "name": "tako"
   },

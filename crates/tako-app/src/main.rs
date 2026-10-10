@@ -2347,6 +2347,9 @@ struct TakoApp {
     agent_metrics: AgentMetrics,
     /// ステータスバーの 5h / 7d の取得元（#1903。mod / screen。`tako limit-service --refresh` に載る）
     claude_limit_source: Option<tako_core::claude_mod::BarLimitSource>,
+    /// ステータスバーの claude の区画（5h / 7d / ctx）を誰が出すか（#1962。フォーカス中のペインの mod が
+    /// バーを描いていれば mod = ステータスバーから外す。`refresh_agent_metrics` が 2 秒ごとに決め直す）
+    claude_bar_owner: tako_core::claude_mod::ClaudeBarOwner,
     /// master ペインごとの自動ハンドオフ通知の状態（Issue #749）。
     /// 揮発（再起動でリセット = 復元直後の誤爆は NUDGE_GRACE が受け止める）
     handoff_nudges: HashMap<PaneId, HandoffNudgeTracker>,
@@ -4419,6 +4422,7 @@ impl TakoApp {
             dragging_pin: None,
             agent_metrics: AgentMetrics::default(),
             claude_limit_source: None,
+            claude_bar_owner: tako_core::claude_mod::ClaudeBarOwner::Tako("no_fresh_report"),
             handoff_nudges: HashMap::new(),
             handoff_policy_cache: HashMap::new(),
             limit_resume: HashMap::new(),
@@ -16349,6 +16353,10 @@ impl TakoApp {
         self.agent_metrics.limit_5h = bar.five_hour;
         self.agent_metrics.limit_week = bar.seven_day;
         self.claude_limit_source = bar.source;
+        // #1962: フォーカス中のペインの mod がバーを描いていれば、ステータスバーの claude の区画を
+        // 出さない（値の取り方は上のまま。報告が 45 秒途切れれば次の 2 秒の tick で戻る）
+        self.claude_bar_owner =
+            tako_control::claude_mod::status_bar_owner(self, focused, std::time::Instant::now());
         // #985: 構造化ソース（rollout の rate_limits）があればそちらが正。
         // 画面由来（#357 のスクレイピング）は codex の TUI が数値を出していた版への
         // 後方互換として残す
@@ -23552,6 +23560,9 @@ impl UiStateHost for TakoApp {
         let mut claude = m(&self.agent_metrics, "5h", "7d");
         // #1903: ステータスバーの 5h / 7d の取得元（mod = tako mod の報告 / screen = 画面 / null = 無し）
         claude["source"] = serde_json::json!(self.claude_limit_source.map(|s| s.as_str()));
+        // #1962: ステータスバーに claude の区画を出しているか（mod = フォーカス中のペインの mod が
+        // Claude Code の画面にバーを描いているので外した。値は上のまま読める）
+        claude["status_bar"] = self.claude_bar_owner.to_json();
         serde_json::json!({
             "claude": claude,
             "codex": m(&self.codex_metrics, "primary", "secondary"),
@@ -29365,6 +29376,11 @@ mod self_test {
     mod mod_limits;
     #[cfg(feature = "visual-test")]
     use mod_limits::mod_limits_visual;
+    /// #1962: mod がバーを描いているとき、ステータスバーの claude の区画を外すか（visual-test `mod-bar`）
+    #[cfg(feature = "visual-test")]
+    mod mod_bar_1962;
+    #[cfg(feature = "visual-test")]
+    use mod_bar_1962::mod_bar_visual;
     /// #1909: 補完の打鍵の取り消しの番号を UI スレッドで先に取る（visual-test `completion-cancel`）
     #[cfg(feature = "visual-test")]
     mod completion_cancel_1909;
@@ -43766,6 +43782,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1962: mod がバーを描いているとき、ステータスバーの claude の 5h / 7d / ctx を外すか
+                "mod-bar" => {
+                    mod_bar_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1949: `.ino` が C++ の構文で塗られ、構文セットが `.cpp` と同じ寿命で手放されるか
                 "ino-highlight" => {
                     ino_highlight_visual(any, window, cx).await;
@@ -43784,7 +43806,7 @@ mod self_test {
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
-                         hover-1893 / hover-loading / hover-loading-real / mod-limits / ino-highlight）"
+                         hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight）"
                     );
                     std::process::exit(1);
                 }

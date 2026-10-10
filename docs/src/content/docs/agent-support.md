@@ -23,14 +23,14 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## 全体
 
-能力 56 件の内訳です。
+能力 57 件の内訳です。
 
 | エージェント | 対応 | 一部対応 | 未対応 | 対象外 |
 | --- | --- | --- | --- | --- |
-| Claude Code（基準） | 56 / 56 | 0 | 0 | 0 |
-| OpenAI Codex CLI | 36 / 56 | 4 | 13 | 3 |
-| Antigravity CLI | 24 / 56 | 4 | 18 | 10 |
-| Local LLM | 0 / 56 | 0 | 45 | 11 |
+| Claude Code（基準） | 57 / 57 | 0 | 0 | 0 |
+| OpenAI Codex CLI | 36 / 57 | 4 | 14 | 3 |
+| Antigravity CLI | 24 / 57 | 4 | 19 | 10 |
+| Local LLM | 0 / 57 | 0 | 46 | 11 |
 
 ### 状態の意味
 
@@ -63,7 +63,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## OpenAI Codex CLI を選ぶと落ちるもの
 
-対応 36 / 56 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 36 / 57 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -76,12 +76,13 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（13 件）
+### 未対応（14 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
 - **この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）**（追跡: [#1885](https://github.com/takushio2525/tako/issues/1885)）
-  - エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー）に tako のペイン・タブ・worker と要注意の数を出す（`claude_mod_band`）
+  - エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー・入力欄の下の行の使用制限 / ctx のバー）に tako のペイン・タブ・worker と要注意の数を出す。利用者の他の拡張の帯は消さない（`claude_mod_band`）
+  - エージェントの画面の中（プロンプトの上の帯）に定型のカスタムボタン（既定は /compact。組み込みコマンド・tako の操作・新しいペインで実行するコマンド・入力欄へ入れる文）を描き、キーで押して実行する（`claude_mod_buttons`）
   - tako setup がエージェントの設定 dir ごとに tako の拡張を入れる（管理印つき・同名の他の拡張があれば入れない・tako mod uninstall で外せる）（`claude_mod_install`）
   - エージェントの中で動く拡張（tako mod）から ctx・使用制限・ターン・権限待ちを構造で受け取る（`claude_mod_state`）
   - エージェントの画面の中の UI（カスタムボタン・使用量のバー・帯の区切り・色）の設定を、選ぶだけの定型の口（ui.json）で持ち、検証済みの値をエージェントの中の拡張へ届ける（`claude_mod_ui`）
@@ -110,7 +111,7 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Antigravity CLI を選ぶと落ちるもの
 
-対応 24 / 56 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
+対応 24 / 57 件。以下は Claude Code との差分です（同じ理由のものはまとめています）。
 
 ### 一部対応（4 件）
 
@@ -123,12 +124,13 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**
   - 作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）（`worker_trust`）
 
-### 未対応（18 件）
+### 未対応（19 件）
 
 - **設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない**（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
 - **この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）**（追跡: [#1885](https://github.com/takushio2525/tako/issues/1885)）
-  - エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー）に tako のペイン・タブ・worker と要注意の数を出す（`claude_mod_band`）
+  - エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー・入力欄の下の行の使用制限 / ctx のバー）に tako のペイン・タブ・worker と要注意の数を出す。利用者の他の拡張の帯は消さない（`claude_mod_band`）
+  - エージェントの画面の中（プロンプトの上の帯）に定型のカスタムボタン（既定は /compact。組み込みコマンド・tako の操作・新しいペインで実行するコマンド・入力欄へ入れる文）を描き、キーで押して実行する（`claude_mod_buttons`）
   - tako setup がエージェントの設定 dir ごとに tako の拡張を入れる（管理印つき・同名の他の拡張があれば入れない・tako mod uninstall で外せる）（`claude_mod_install`）
   - エージェントの中で動く拡張（tako mod）から ctx・使用制限・ターン・権限待ちを構造で受け取る（`claude_mod_state`）
   - エージェントの画面の中の UI（カスタムボタン・使用量のバー・帯の区切り・色）の設定を、選ぶだけの定型の口（ui.json）で持ち、検証済みの値をエージェントの中の拡張へ届ける（`claude_mod_ui`）
@@ -172,9 +174,9 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 
 ## Local LLM でまだ使えないもの
 
-対応 0 / 56 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
+対応 0 / 57 件。この系統が成立したときに埋まるマスの一覧です（同じ理由のものはまとめています）。
 
-### 未対応（45 件）
+### 未対応（46 件）
 
 - **ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）**（追跡: [#990](https://github.com/takushio2525/tako/issues/990)）
   - アカウント（資格情報）の切替に追従する（`account_switch`）
@@ -191,7 +193,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
   - setup が起動プロファイルを組み立てる（`setup_profile_recommend`）
   - worker として起動できる（`worker_spawn`）
 - **ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）**（追跡: [#991](https://github.com/takushio2525/tako/issues/991)）
-  - エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー）に tako のペイン・タブ・worker と要注意の数を出す（`claude_mod_band`）
+  - エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー・入力欄の下の行の使用制限 / ctx のバー）に tako のペイン・タブ・worker と要注意の数を出す。利用者の他の拡張の帯は消さない（`claude_mod_band`）
+  - エージェントの画面の中（プロンプトの上の帯）に定型のカスタムボタン（既定は /compact。組み込みコマンド・tako の操作・新しいペインで実行するコマンド・入力欄へ入れる文）を描き、キーで押して実行する（`claude_mod_buttons`）
   - tako setup がエージェントの設定 dir ごとに tako の拡張を入れる（管理印つき・同名の他の拡張があれば入れない・tako mod uninstall で外せる）（`claude_mod_install`）
   - エージェントの中で動く拡張（tako mod）から ctx・使用制限・ターン・権限待ちを構造で受け取る（`claude_mod_state`）
   - エージェントの画面の中の UI（カスタムボタン・使用量のバー・帯の区切り・色）の設定を、選ぶだけの定型の口（ui.json）で持ち、検証済みの値をエージェントの中の拡張へ届ける（`claude_mod_ui`）
@@ -298,7 +301,8 @@ tako agent-support --agent agy --status pending   # まだ使えないものだ�
 | **実行拒否と判定する前に「作業を 1 歩も始めていない」ことの直接の証拠（一次シグナルの実観測）を要求できる（#1295）**<br />`worker_refusal_work_proof` | 対応 | 対応 | 対象外<br />実行の拒否が会話の作成前に起こるので、作業を 1 歩も始めていないことを実況ログで直接は確かめられない（#1034 の実物では拒否の時点で会話がまだ無い）。代わりに「会話が 1 件も解決できない」ことを作業ゼロの代理の証拠として使う | 対象外<br />自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない） | 実測: #1034: agy の実物では拒否が **CLI の起動直後**（会話が作られる前）に出るので、実況 JSONL がまだ無く「作業ゼロ」を直接は観測できない。代わりに会話が 1 件も 解決できないことを代理の証拠にしている（`agy_session::resolve_conversation_id_for_backend` の解決は sticky なので、一度でも会話を開いたペインは以後ずっと `Some(..)` を返す = 「解決できない」が durable に言える）。#1295: claude / codex にはこの代理が要らない。両系統で観測されている拒否は 未認証（#983 の `detect_launch_failure`）と時間で解けない利用阻害（#1106）で、どちらも別の分類が先に error にする。むしろ代理を許すと害がある: **claude の腕（`dispatch.rs` の `query_agent_status`）は `agent_work_started` を一度も代入しない**ので、`None` を作業ゼロと数えると 正常に働いた worker（`status=idle` / `prompt_delivery=delivered`）の画面に 同じ文字列が流れただけで完了を `error` / `retry_spawn` へ落とす （#983 が `command not found` で避けた誤検知と同型）。再現は `dispatch::tests::issue1295_claudeの正常完了を実行拒否へ落とさない`。local は断る主体がそもそも居ない（`worker_refusal_detect` と同じ理由） |
 | **アカウントのログイン失効で止まったことを検知する（#757）**<br />`worker_login_expired_detect` | 対応 | 未対応 [#975](https://github.com/takushio2525/tako/issues/975)<br />この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない） | 未対応 [#975](https://github.com/takushio2525/tako/issues/975)<br />この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない） | 対象外<br />自分のマシンで動かすモデルなので、ベンダーへのログインとその失効という概念が無い（失効する資格情報がそもそも存在しない） | 実測: #757（2026-08-01 / 08-03 / 08-05 の実観測を 3 回）: claude の worker が              `OAuth refresh token is no longer valid; run /login to re-authenticate` /              `Login expired · Please run /login` / `Please run /login` を出して止まる。             画面には先に `API Error: Unable to connect to API (ENOTFOUND / ECONNRESET)` が              出るため、#757 前は `api_error`（推奨 `resume`）に分類され、**続行ナッジを              何度撃っても復帰しなかった**（master が 3 回空回りした）。この 3 文言を              `orchestrator::agent_cli::login_expired_line`（#983 の起動時未認証検知と              **同じ正本**）で受け、`WorkerErrorKind::LoginExpired`（`relogin`）として返す。             対象アカウントは会話（session_id）の transcript の所在から逆引きする              （`orchestrator::login_expired_account`。#652 の resume と同じ根拠）ので、             **会話が claude の config ディレクトリに在る系統でしか名指しできない**。             codex / agy は失効時の実画面を採れていないので文言を足していない              （推測を置かないのは #1034 の `execution_refused_patterns` と同じ作法）。             **実機で失効させる再現はしていない**（同一アカウントを別マシンから使った              直後に起きるもので、任意のタイミングでは作れない）ので、検証は実観測の              文言を描いた fixture と隔離 tmux のペインで行った |
 | **エージェントの中で動く拡張（tako mod）から ctx・使用制限・ターン・権限待ちを構造で受け取る**<br />`claude_mod_state` | 対応 | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1879: Claude Code 2.1.294 の mod を env CLAUDE_CODE_PLUGIN_DIRS で注入し、隔離 GUI の直接ペインと tmux ペインの両方で tako mod report が届いて tako mod の行に ctx・使用制限・turn・model が載った（scripts/test-claude-mod-1879.sh） |
-| **エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー）に tako のペイン・タブ・worker と要注意の数を出す**<br />`claude_mod_band` | 対応 | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1881: Claude Code 2.1.294 の mod（AbovePrompt の帯・$.ui.open のペイン・$.store のトグル）を隔離 GUI のペインと 80 / 144 / 300 桁の隔離 tmux で実 claude に描かせ、帯が 1 行に収まること・ダイアログの後に戻ること・トグルが再起動後も保たれることを画面の capture で確かめた（scripts/test-claude-mod-band-1881.sh） |
+| **エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー・入力欄の下の行の使用制限 / ctx のバー）に tako のペイン・タブ・worker と要注意の数を出す。利用者の他の拡張の帯は消さない**<br />`claude_mod_band` | 対応 | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1881: Claude Code 2.1.294 の mod（AbovePrompt の帯・$.ui.open のペイン・$.store のトグル）を隔離 GUI のペインと 80 / 144 / 300 桁の隔離 tmux で実 claude に描かせ、帯が 1 行に収まること・ダイアログの後に戻ること・トグルが再起動後も保たれることを画面の capture で確かめた（scripts/test-claude-mod-band-1881.sh）。#1962: 帯は next(e) の答え（他の mod の行）を包む形にし、帯を描く別の mod と読み込み順を入れ替えて両方の行が出ること・PromptHint の末尾のバーが出て同じときにステータスバーの claude の区画が消え報告を止めて 45 秒で戻ること・statusLine が ctx を出す構成では描かないことを一時の設定 dir の実 claude で確かめた（scripts/test-mod-band-buttons-1962.sh） |
+| **エージェントの画面の中（プロンプトの上の帯）に定型のカスタムボタン（既定は /compact。組み込みコマンド・tako の操作・新しいペインで実行するコマンド・入力欄へ入れる文）を描き、キーで押して実行する**<br />`claude_mod_buttons` | 対応 | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1962: 一時の設定 dir の実 Claude Code 2.1.294 で、帯の /compact のボタンを ctrl+x → Tab → ホットキーで押すと会話が圧縮され、tako の操作（split right）のボタンで隔離 GUI のペインが増えた。押した結果（種類と成否）は tako mod の行の report.last_press に出る（scripts/test-mod-band-buttons-1962.sh）。クリックで押すのは tako がクリックを TUI へ渡す #1961 から |
 | **エージェントの画面の中の UI（カスタムボタン・使用量のバー・帯の区切り・色）の設定を、選ぶだけの定型の口（ui.json）で持ち、検証済みの値をエージェントの中の拡張へ届ける**<br />`claude_mod_ui` | 対応 | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | テスト: #1960: tako_core::claude_mod_ui の単体（語彙の外の値は書かずに許される値を返す・ランダムな操作列 1,000 通りで常に形を満たす・壊れた ui.json は読める部分で動き .unreadable.bak へ保全）、dispatch の issue1960_*（報告の応答の tako.view.ui に検証済みの値が載り、変更が次の報告で届く）、issue1960_mod_ui_watchdog（CLI / MCP / setup の 3 つの口で ui.json が字面で一致）。mod が効かせるのは今は帯のトグルで、ボタン・バー・区切り・色の描画は #1962 |
 | **tako setup がエージェントの設定 dir ごとに tako の拡張を入れる（管理印つき・同名の他の拡張があれば入れない・tako mod uninstall で外せる）**<br />`claude_mod_install` | 対応 | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#1885](https://github.com/takushio2525/tako/issues/1885)<br />この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない） | 未対応 [#991](https://github.com/takushio2525/tako/issues/991)<br />ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い） | 実測: #1959: 一時の設定 dir 2 つへ tako setup の段が skills/tako の写しを置き、実物の Claude Code 2.1.294 の claude plugin list に tako@skills-dir（enabled）・デバッグログに hooks module tako@skills-dir が出た。env の注入と同時でも hooks module は tako@inline の 1 つだけ・利用者の skills/tako と別の出どころの 同名 tako には触らない・uninstall で写しだけが消えることを確かめた（scripts/test-mod-skills-1959.sh） |
 

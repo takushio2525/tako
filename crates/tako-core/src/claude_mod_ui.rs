@@ -390,6 +390,73 @@ impl TakoOp {
             Self::OpenCwd => "このペインのフォルダを開く",
         }
     }
+
+    /// ボタンを押したときに mod が叩く既存 CLI の引数（`tako` の後ろ。S7-3 #1962）。
+    /// 対象のペインは名指しする（tako の再起動をまたいだ claude の `TAKO_PANE_ID` は古いことがある）。
+    /// `open-cwd` はペインの cwd が分からなければ `None`（mod はそのボタンを描かない）。
+    /// 右クリックメニューとの対応表の正本化は #1882
+    pub fn cli_args(self, pane: u64, cwd: Option<&str>) -> Option<Vec<String>> {
+        let p = pane.to_string();
+        let args: Vec<&str> = match self {
+            Self::SplitRight => vec!["split", "--pane", &p, "--right"],
+            Self::SplitDown => vec!["split", "--pane", &p, "--down"],
+            Self::SessionRestartHarness => {
+                vec!["session-restart", "--mode", "harness", "--pane", &p]
+            }
+            Self::SessionRestartHandoff => {
+                vec!["session-restart", "--mode", "handoff", "--pane", &p]
+            }
+            Self::LimitResumeOn => vec!["limit-resume", "on", "--pane", &p],
+            Self::LimitResumeOff => vec!["limit-resume", "off", "--pane", &p],
+            Self::Background => vec!["background", "--pane", &p],
+            Self::Close => vec!["close", "--pane", &p],
+            // ペインの右クリックの「Finder で開く」と同じ（既定のアプリでフォルダを開く）
+            Self::OpenCwd => vec!["file", "open", cwd.filter(|c| !c.is_empty())?],
+        };
+        Some(args.into_iter().map(str::to_string).collect())
+    }
+}
+
+/// `shell` のボタンの CLI の引数: 新しい tako のペインで実行する（コマンドカードの実行と同じ
+/// `spawn_command_pane` = 呼んだペインの下に 35%・ペインの cwd・終わっても閉じない）。
+/// コマンドは ui.json へ書く前に `command_card::normalize_command_text` で検証済み
+pub fn shell_cli_args(pane: u64, command: &str) -> Vec<String> {
+    let p = pane.to_string();
+    [
+        "run-interactive",
+        "--pane",
+        &p,
+        "--down",
+        "--ratio",
+        "0.35",
+        "--auto-close",
+        "never",
+        "--",
+        command,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// `tako` / `shell` のボタンの id → CLI の引数（応答の `view.button_args`。S7-3 #1962）。
+/// `slash` / `prompt` は mod が Claude Code の中で済ませるので載せない
+pub fn button_args(
+    buttons: &[Button],
+    pane: u64,
+    cwd: Option<&str>,
+) -> BTreeMap<String, Vec<String>> {
+    buttons
+        .iter()
+        .filter_map(|b| {
+            let args = match &b.action {
+                ButtonAction::Tako { op } => op.cli_args(pane, cwd)?,
+                ButtonAction::Shell { command } => shell_cli_args(pane, command),
+                ButtonAction::Slash { .. } | ButtonAction::Prompt { .. } => return None,
+            };
+            Some((b.id.clone(), args))
+        })
+        .collect()
 }
 
 /// ボタンの動作の種類（ui.json の `action.kind`）
@@ -2911,5 +2978,76 @@ mod tests {
             "{accepted} / {refused}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod issue1962_tests {
+    use super::*;
+
+    /// #1962: tako の操作 9 つすべてが CLI の引数になり、対象のペインを名指しする
+    /// （実際に CLI が受け付けるかは tako-cli の `issue1962_ボタンの引数はcliが受け付ける`）
+    #[test]
+    fn issue1962_takoの操作は対象のペインを名指しするcliの引数になる() {
+        for op in TakoOp::ALL {
+            let args = op
+                .cli_args(7, Some("/w"))
+                .unwrap_or_else(|| panic!("{op:?} の引数が組めない"));
+            if *op == TakoOp::OpenCwd {
+                assert_eq!(args, ["file", "open", "/w"]);
+            } else {
+                let at = args
+                    .iter()
+                    .position(|a| a == "--pane")
+                    .unwrap_or_else(|| panic!("{op:?} が --pane を名指ししない: {args:?}"));
+                assert_eq!(args[at + 1], "7");
+            }
+        }
+        // cwd が分からなければフォルダを開くボタンは描かない
+        assert_eq!(TakoOp::OpenCwd.cli_args(7, None), None);
+        assert_eq!(TakoOp::OpenCwd.cli_args(7, Some("")), None);
+    }
+
+    /// #1962: shell は新しいペインで実行する（`--` の後ろに 1 引数のまま = `-` で始まっても割れない）
+    #[test]
+    fn issue1962_shellのボタンは新しいペインで実行する引数になる() {
+        let args = shell_cli_args(3, "-n echo 'a b'");
+        assert_eq!(args[0], "run-interactive");
+        assert_eq!(args.last().map(String::as_str), Some("-n echo 'a b'"));
+        assert_eq!(args[args.len() - 2], "--");
+        assert!(args.windows(2).any(|w| w == ["--pane", "3"]));
+        assert!(args.windows(2).any(|w| w == ["--auto-close", "never"]));
+    }
+
+    /// #1962: 応答の button_args は tako / shell のボタンだけ（slash / prompt は Claude Code の中で済む）
+    #[test]
+    fn issue1962_button_argsはtakoとshellだけ() {
+        let mut buttons = default_buttons();
+        for spec in [
+            ("tako", "split-down"),
+            ("shell", "make test"),
+            ("prompt", "続けて"),
+            ("tako", "open-cwd"),
+        ] {
+            let b = build_button(
+                &ButtonSpec {
+                    kind: Some(spec.0.into()),
+                    value: spec.1.into(),
+                    ..ButtonSpec::default()
+                },
+                &buttons,
+            )
+            .unwrap();
+            buttons.push(b);
+        }
+        let ids: Vec<String> = buttons.iter().map(|b| b.id.clone()).collect();
+        let args = button_args(&buttons, 9, Some("/w"));
+        assert!(!args.contains_key(&ids[0]), "slash は載せない");
+        assert_eq!(args[&ids[1]], ["split", "--pane", "9", "--down"]);
+        assert_eq!(args[&ids[2]].last().map(String::as_str), Some("make test"));
+        assert!(!args.contains_key(&ids[3]), "prompt は載せない");
+        assert_eq!(args[&ids[4]], ["file", "open", "/w"]);
+        // cwd が分からなければ open-cwd は落ちる（mod はそのボタンを描かない）
+        assert!(!button_args(&buttons, 9, None).contains_key(&ids[4]));
     }
 }

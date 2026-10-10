@@ -11429,6 +11429,37 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// #1962: mod の帯のボタン（tako の操作 9 つと shell）が叩く引数を、この CLI が要求へ組める
+    /// （引数は tako-core が組んで報告の応答で mod へ渡す = ここで受け付けなければボタンは押しても失敗する）
+    #[test]
+    fn issue1962_ボタンの引数はcliが受け付ける() {
+        use tako_core::claude_mod_ui::{shell_cli_args, TakoOp, Vocab};
+        let mut all: Vec<Vec<String>> = TakoOp::ALL
+            .iter()
+            .map(|op| op.cli_args(7, Some("/w")).expect("cwd があれば組める"))
+            .collect();
+        all.push(shell_cli_args(7, "-n echo 'a b'"));
+        for args in all {
+            let argv: Vec<&str> = std::iter::once("tako")
+                .chain(args.iter().map(String::as_str))
+                .collect();
+            let command = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("{argv:?} を CLI が受け付けない: {e}"))
+                .command;
+            let request = build_request(&command)
+                .unwrap_or_else(|e| panic!("{argv:?} を要求へ組めない: {e}"));
+            let debug = format!("{request:?}");
+            // ペインを名指しする操作は 7 番を指す（open-cwd はパスだけ）
+            if args.iter().any(|a| a == "--pane") {
+                assert!(debug.contains("pane: Some(7)"), "{argv:?} → {debug}");
+            }
+            if args[0] == "run-interactive" {
+                assert!(debug.contains("-n echo 'a b'"), "{debug}");
+                assert!(debug.contains("auto_close: Some(\"never\")"), "{debug}");
+            }
+        }
+    }
+
     /// #1895: `tako file copy a b dst` はまとめた 1 要求（= 1 つのジョブ。MCP の `paths` と同じ要求）、
     /// 1 件なら単数の要求。どれも CLI の cwd 基準で絶対化する
     #[test]
