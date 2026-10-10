@@ -21,8 +21,11 @@
 //! 2. **約束の範囲を限る説明は事例で縛る**（[`scoped_cases`]）— 「open / show: …」のように
 //!    action や引数で約束を限っているツールは、埋める側と**埋めない側**の両方を明示する
 //!    （例: `card` 指定の copy は呼び出し元を混ぜない = 別ペインのカードを取り違えない）
-//! 3. **未解決の食い違いは「まだ食い違っている」ことも縛る**（[`KNOWN_GAPS`]）— 直したら
-//!    ここから外させる（黙って古い例外表が残らない）
+//! 3. **「省略時はアクティブタブ」と説明するツールは呼び出し元を混ぜない**（[`active_cases`] + 自動）—
+//!    呼び出し元ではなくアクティブタブ（のフォーカス中ペイン）を対象にすると言うツールは、
+//!    呼び出し元付きで呼んでも要求に呼び出し元が入らない。#1958 の棚卸しで `tako_open_remote` は
+//!    説明（呼び出し元）と挙動（アクティブタブ）が食い違っていた。呼び出し元 = AI 自身のペインは
+//!    agent_role で SSH 化を断られるので、埋めると失敗が増えるだけ = 説明を挙動へ寄せた
 //! 4. **走査が空振りしていない** — 約束を拾えたツールの数に下限を置く
 //!
 //! # 見逃す側へ倒れないための作り
@@ -38,24 +41,27 @@ use tako_control::mcp::{self, McpSession};
 /// 呼び出し元ペイン（実在し得ない大きな値 = 引数の既定値や他の数値と取り違えない）
 const CALLER: u64 = 987_654;
 
-/// 約束を拾えたツール数の下限（#1958 の棚卸し時点の実数。減ったら走査の空振りを疑う）
-const MIN_PROMISING_TOOLS: usize = 59;
+/// 約束を拾えたツール数の下限（#1958 の棚卸し時点の実数。`tako_open_remote` は説明をアクティブタブへ
+/// 寄せたので数えない。減ったら走査の空振りを疑う）
+const MIN_PROMISING_TOOLS: usize = 58;
 
-/// 説明が約束しているのに、まだ呼び出し元で埋めていないツール（判断待ち）。
-/// (ツール, 理由)。直したらここから外す（外し忘れは [`既知の食い違いはまだ食い違っている`] が落とす）
-const KNOWN_GAPS: &[(&str, &str)] = &[(
-    "tako_open_remote",
-    "#1958 の棚卸しで判明。説明は「省略時は呼び出し元ペイン」だが、開き先の正本 \
-     `tako_core::remote_open` は「いま開いているタブ」と書き、dispatch はアクティブタブの \
-     フォーカスペインへ倒す。target=pane で呼び出し元（= AI 自身のペイン）を SSH 化の対象に \
-     するかは挙動の判断が要るので、説明と挙動のどちらへ寄せるかを決めるまで据え置く",
-)];
+/// 「省略時はアクティブタブ」を拾えたツール数の下限（同じく棚卸し時点の実数）
+const MIN_ACTIVE_TOOLS: usize = 2;
 
-/// 説明の文に「省略 … 呼び出し元」の約束があるか。
-/// 「呼び出し元」の直前 8 文字以内に「省略」がある形だけを約束と読む
-/// （「相対パスは呼び出し元ペインの cwd 基準」のような、省略時の挙動でない言及を拾わない）
+/// 説明の文に「省略 … 呼び出し元」の約束があるか（[`omitted_means`]）
 fn promises_caller(text: &str) -> bool {
-    text.match_indices("呼び出し元").any(|(at, _)| {
+    omitted_means(text, "呼び出し元")
+}
+
+/// 説明の文に「省略 … アクティブタブ」の約束があるか（= 呼び出し元を混ぜない約束）
+fn promises_active(text: &str) -> bool {
+    omitted_means(text, "アクティブタブ")
+}
+
+/// `target` の直前 8 文字以内に「省略」がある形だけを「省略時の対象」の約束と読む
+/// （「相対パスは呼び出し元ペインの cwd 基準」のような、省略時の挙動でない言及を拾わない）
+fn omitted_means(text: &str, target: &str) -> bool {
+    text.match_indices(target).any(|(at, _)| {
         let before: String = text[..at]
             .chars()
             .rev()
@@ -68,8 +74,17 @@ fn promises_caller(text: &str) -> bool {
     })
 }
 
-/// ツールの約束（ツールの説明・各引数の説明のどこかで約束していれば true）
+/// 呼び出し元を約束しているか（ツールの説明・各引数の説明のどこかで約束していれば true）
 fn tool_promises(tool: &Value) -> bool {
+    tool_says(tool, promises_caller)
+}
+
+/// アクティブタブを約束し、呼び出し元は約束していないか
+fn tool_promises_active(tool: &Value) -> bool {
+    tool_says(tool, promises_active) && !tool_promises(tool)
+}
+
+fn tool_says(tool: &Value, says: fn(&str) -> bool) -> bool {
     let props = tool["inputSchema"]["properties"]
         .as_object()
         .cloned()
@@ -78,10 +93,10 @@ fn tool_promises(tool: &Value) -> bool {
     if !props.contains_key("pane") && !props.contains_key("tab") {
         return false;
     }
-    promises_caller(tool["description"].as_str().unwrap_or(""))
+    says(tool["description"].as_str().unwrap_or(""))
         || props
             .values()
-            .any(|p| promises_caller(p["description"].as_str().unwrap_or("")))
+            .any(|p| says(p["description"].as_str().unwrap_or("")))
 }
 
 /// スキーマから必須引数の仮の値を作る
@@ -272,9 +287,23 @@ fn scoped_cases(tools: &[Value]) -> Vec<Case> {
         "action",
         json!({}),
         |a| a != "selection",
-        "selection はアクティブタブのツリーだけを扱う（dispatch が他タブを断る）",
+        "selection はアクティブタブのツリーだけを扱う（説明どおり。dispatch が他タブを断る）",
     ));
     cases
+}
+
+/// 「省略時はアクティブタブ」のツールで、開き方ごとに呼び出し元を混ぜないことを並べる事例
+fn active_cases(tools: &[Value]) -> Vec<Case> {
+    // 説明: 「省略時はアクティブタブのフォーカス中ペイン」（#1958 で挙動へ寄せた）。
+    // 呼び出し元 = AI 自身のペインは agent_role で SSH 化を断られるので、埋めると失敗が増えるだけ
+    by_kind(
+        tools,
+        "tako_open_remote",
+        "target",
+        json!({}),
+        |_| false,
+        "省略時はアクティブタブのフォーカス中ペイン（呼び出し元 = AI 自身のペインは SSH 化できない）",
+    )
 }
 
 /// ツールの約束と要求の食い違い（名指しの文）
@@ -292,7 +321,6 @@ fn 約束したツールは呼び出し元で埋める() {
     let tools = mcp::tools();
     let scoped = scoped_cases(&tools);
     let scoped_tools: BTreeSet<&str> = scoped.iter().map(|c| c.tool).collect();
-    let gaps: BTreeSet<&str> = KNOWN_GAPS.iter().map(|(t, _)| *t).collect();
     let mut problems = Vec::new();
     let mut promising = 0;
 
@@ -302,7 +330,7 @@ fn 約束したツールは呼び出し元で埋める() {
             continue;
         }
         promising += 1;
-        if scoped_tools.contains(name) || gaps.contains(name) {
+        if scoped_tools.contains(name) {
             continue;
         }
         for action in enum_values(tool, "action") {
@@ -348,35 +376,84 @@ fn 約束したツールは呼び出し元で埋める() {
 }
 
 #[test]
-fn 事例表と既知の食い違いは約束したツールだけを指す() {
+fn アクティブタブを約束したツールは呼び出し元を混ぜない() {
     let tools = mcp::tools();
-    let named: Vec<&str> = scoped_cases(&tools)
-        .iter()
-        .map(|c| c.tool)
-        .chain(KNOWN_GAPS.iter().map(|(t, _)| *t))
-        .collect();
-    for name in named {
-        let tool = tools
-            .iter()
-            .find(|t| t["name"] == name)
-            .unwrap_or_else(|| panic!("{name} がカタログに無い（表が古い）"));
-        assert!(
-            tool_promises(tool),
-            "{name} はもう呼び出し元を約束していない（表から外す）"
-        );
+    let cases = active_cases(&tools);
+    let case_tools: BTreeSet<&str> = cases.iter().map(|c| c.tool).collect();
+    let mut problems = Vec::new();
+    let mut promising = 0;
+
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap();
+        if !tool_promises_active(tool) {
+            continue;
+        }
+        promising += 1;
+        if case_tools.contains(name) {
+            continue;
+        }
+        for action in enum_values(tool, "action") {
+            let mut args = required_args(tool);
+            if let Some(a) = &action {
+                args.insert("action".into(), json!(a));
+            }
+            let args = Value::Object(args);
+            let got = request_for(name, &args);
+            match &got {
+                Ok(request) if !carries_caller(request) => {}
+                Err(e) => problems.push(format!(
+                    "{name} {args}: 仮の引数で要求が組めない。active_cases に正しい引数の事例を足す（{e}）"
+                )),
+                Ok(_) => problems.push(violation(name, &args, false, &got)),
+            }
+        }
     }
+    for case in &cases {
+        let got = request_for(case.tool, &case.args);
+        let filled = matches!(&got, Ok(r) if carries_caller(r));
+        if got.is_err() || filled != case.fills {
+            problems.push(format!(
+                "{}（{}）",
+                violation(case.tool, &case.args, case.fills, &got),
+                case.why
+            ));
+        }
+    }
+
+    assert!(
+        promising >= MIN_ACTIVE_TOOLS,
+        "「省略時はアクティブタブ」を拾えたツールが {promising} 本しかない（下限 {MIN_ACTIVE_TOOLS}）"
+    );
+    assert!(
+        problems.is_empty(),
+        "カタログの「省略時はアクティブタブ」と変換が食い違っている（{} 件）:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
 }
 
 #[test]
-fn 既知の食い違いはまだ食い違っている() {
+fn 事例表は約束したツールだけを指す() {
     let tools = mcp::tools();
-    for (name, why) in KNOWN_GAPS {
-        let tool = tools.iter().find(|t| t["name"] == *name).unwrap();
-        let args = Value::Object(required_args(tool));
-        let got = request_for(name, &args);
+    let find = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} がカタログに無い（表が古い）"))
+            .clone()
+    };
+    for case in scoped_cases(&tools) {
         assert!(
-            matches!(&got, Ok(r) if !carries_caller(r)),
-            "{name} は呼び出し元で埋めるようになった = KNOWN_GAPS から外す（{why} / 要求: {got:?}）"
+            tool_promises(&find(case.tool)),
+            "{} はもう呼び出し元を約束していない（scoped_cases から外す）",
+            case.tool
+        );
+    }
+    for case in active_cases(&tools) {
+        assert!(
+            tool_promises_active(&find(case.tool)),
+            "{} はもう「省略時はアクティブタブ」と言っていない（active_cases から外す）",
+            case.tool
         );
     }
 }
@@ -399,5 +476,14 @@ fn 約束の読み取りは省略時の言及だけを拾う() {
     ));
     assert!(!promises_caller(
         "profile_source=pane_role は呼び出し元の TAKO_ORCHESTRATOR_ROLE が失われ"
+    ));
+    assert!(promises_active(
+        "target=split は分割元。省略時はアクティブタブのフォーカス中ペイン）"
+    ));
+    assert!(promises_active(
+        "selection はアクティブタブのツリーだけを扱う = 省略時もアクティブタブ）"
+    ));
+    assert!(!promises_active(
+        "由来タブへ戻す（由来タブが閉じていればアクティブタブ）"
     ));
 }
