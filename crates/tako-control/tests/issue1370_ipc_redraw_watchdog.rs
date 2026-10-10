@@ -171,7 +171,10 @@ fn 描く相手は全ビューポート() {
 }
 
 /// #1680: background から戻った続き（定義ジャンプの着地 = 新しいペインを生やしうる）も
-/// 同じ後処理を通り、A/B の口を通して 1 フレーム描く
+/// 同じ後処理を通り、A/B の口を通して 1 フレーム描く。
+///
+/// #1979 で読み取りの続き（`tako list` の応答）は描かないようにした。描くかどうかは
+/// `OffloadContinuation::changes_layout` の 1 実装で決め、A/B の口と両方を通ること
 #[test]
 fn 続きの着地も同じ後処理で描く() {
     let src = read(APP);
@@ -179,8 +182,10 @@ fn 続きの着地も同じ後処理で描く() {
     let body = code_only(body);
     assert!(
         body.contains("tako_control::finish_offload(self, next, origin)")
-            && body.contains("self.after_dispatch(&mut result, !Self::ipc_redraw_legacy(), cx)"),
-        "{APP}:{line} 続きの着地が後処理（after_dispatch）と強制描画の A/B を通っていない"
+            && body.contains("next.changes_layout() && !Self::ipc_redraw_legacy()")
+            && body.contains("self.after_dispatch(&mut result, needs_frame, cx)"),
+        "{APP}:{line} 続きの着地が後処理（after_dispatch）と強制描画の A/B・\
+         レイアウトを変える続きの判定（changes_layout）を通っていない"
     );
     let (ipc, line) = ipc_loop();
     let _ = ipc;

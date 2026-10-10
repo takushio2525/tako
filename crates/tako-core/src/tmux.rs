@@ -10,6 +10,16 @@
 
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
+
+/// tmux への問い合わせ 1 回の上限（#1979）。
+///
+/// 根拠（実測 2026-10-10・本番の器 21 セッション）: `list-windows -a` / `list-panes -a` は
+/// 0.01 秒未満。5 秒はその 500 倍以上で、正当な問い合わせがここに届くことは無い。
+/// 上限が無かったころは、子が終わらない（またはパイプの書き手が長生きのプロセスへ
+/// 漏れた）だけで呼び手が**永久に**止まった。UI スレッドから呼ばれる経路が残っているので
+/// （右パネルの切替の `TmuxList` 等）、ここで止まると窓ごと固まる
+pub const TMUX_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// tmux バイナリの場所（プロセス内で 1 回だけ解決してキャッシュする）。
 /// Dock 起動の .app は PATH が最小構成（/usr/bin:/bin:…）で Homebrew の tmux が
@@ -110,10 +120,11 @@ pub fn version_announcement() -> Option<&'static str> {
 fn probe_version() -> Option<String> {
     // #586: バージョン照会も GUI プロセスから走る（コンソールウィンドウを出させない）。
     // psmux は 2 行目で自分を名乗るが、実装によっては stderr へ出しうるので両方読む
-    let output = crate::platform::process::no_console_window(&mut Command::new(tmux_bin()))
-        .arg("-V")
-        .output()
-        .ok()?;
+    let mut command = Command::new(tmux_bin());
+    crate::platform::process::no_console_window(&mut command).arg("-V");
+    let output =
+        crate::probe::command_output_with_timeout(&mut command, "tmux -V", TMUX_QUERY_TIMEOUT)
+            .into_output()?;
     if !output.status.success() {
         return None;
     }
@@ -696,11 +707,23 @@ pub fn paste_text(socket: Option<&str>, session: &str, text: &str) -> Result<(),
         .expect("直前に Stdio::piped() を設定済み")
         .write_all(text.as_bytes())
         .map_err(|e| format!("tmux load-buffer へ書き込めない: {e}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("tmux load-buffer の終了を待てない: {e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    // #1979: 終わりの待ちも上限つきの 1 実装を通す（`wait_with_output` は子が終わらないと
+    // 永久に返らない。送信は UI スレッドの dispatch から来る）
+    let (status, stderr) =
+        match crate::probe::wait_with_timeout(child, "tmux load-buffer", TMUX_QUERY_TIMEOUT) {
+            crate::probe::Outcome::Done { status, stderr, .. } => (status, stderr),
+            crate::probe::Outcome::TimedOut { waited, .. } => {
+                return Err(format!(
+                    "tmux load-buffer が {} 秒応答しないので打ち切った",
+                    waited.as_secs()
+                ))
+            }
+            crate::probe::Outcome::Failed { reason, .. } => {
+                return Err(format!("tmux load-buffer の終了を待てない: {reason}"))
+            }
+        };
+    if !status.success() {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_string());
     }
 
     // -d でバッファを使い捨てにする（tmux バッファ一覧を汚さない）
@@ -863,11 +886,7 @@ pub fn capture_scrollback_args(session: &str, count: usize) -> Vec<String> {
 
 /// セッションが生きているか確認する（`has-session`）
 pub fn session_alive(socket: Option<&str>, session: &str) -> bool {
-    tmux_command(socket)
-        .args(["has-session", "-t", &exact_target(session)])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    run_tmux(socket, &["has-session", "-t", &exact_target(session)]).is_ok()
 }
 
 /// tmux クライアント子プロセスの雛形。バイナリ解決（`tmux_bin`）と
@@ -901,28 +920,64 @@ pub(crate) fn run_tmux_at(path: &std::path::Path, args: &[&str]) -> Result<Strin
     crate::platform::process::no_console_window(&mut command);
     command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
     command.arg("-S").arg(path);
-    let output = command
-        .args(args)
-        .output()
-        .map_err(|e| format!("tmux を実行できない: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    run_bounded(command, args)
 }
 
 /// tmux CLI 実行。サーバー未起動（list 系の "no server running"）はエラー文字列を返す
-/// （list 側で空扱いにする）。tmux バイナリ不在も同様
+/// （list 側で空扱いにする）。tmux バイナリ不在も同様。
+///
+/// **待ちには上限がある**（[`TMUX_QUERY_TIMEOUT`]。#1979）。打ち切ったら `Err`
+/// = 呼び手は「サーバー未起動」と同じく無害に劣化する
 pub(crate) fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
-    let output = tmux_command(socket)
-        .args(args)
-        .output()
-        .map_err(|e| format!("tmux を実行できない: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    run_bounded(tmux_command(socket), args)
+}
+
+/// [`run_tmux`] の crate 外向けの口（#1979）。tako-control の器の走査
+/// （`agents::tmux_pane_pids`）が上限つきの同じ 1 実装を通るためにある
+pub fn query(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
+    run_tmux(socket, args)
+}
+
+/// 雛形（`tmux_command` / `-S` 版）に引数を足して、**上限つきで**待つ（#1979 の 1 実装）。
+///
+/// `Command::output()` は子が終わらないと永久に返らない。さらに macOS の std は
+/// パイプを `pipe()` → `set_cloexec` の 2 手で作るので、その間に別スレッドが起こした
+/// 長生きの子（器のサーバー・ペインのシェル）へ書き手が漏れると、**子が終わっても**
+/// EOF が来ずに返らない（#1768 で同じ穴を実測）。2026-10-10 の本番ハングは
+/// メインスレッドがこの形（`ps` の `output()` の `poll`）で 10 分止まった
+fn run_bounded(mut command: Command, args: &[&str]) -> Result<String, String> {
+    command.args(args);
+    // A/B（`TAKO_1979_LEGACY=1`）: 修正前の上限なしの待ち
+    if crate::probe::issue1979_legacy() {
+        let output = command
+            .output()
+            .map_err(|e| format!("tmux を実行できない: {e}"))?;
+        return if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        };
+    }
+    let label = crate::probe::label("tmux", args);
+    match crate::probe::command_output_with_timeout(&mut command, &label, TMUX_QUERY_TIMEOUT) {
+        crate::probe::Outcome::Done {
+            status,
+            stdout,
+            stderr,
+        } => {
+            if status.success() {
+                Ok(String::from_utf8_lossy(&stdout).into_owned())
+            } else {
+                Err(String::from_utf8_lossy(&stderr).trim().to_string())
+            }
+        }
+        crate::probe::Outcome::TimedOut { waited, .. } => Err(format!(
+            "tmux が {} 秒応答しないので打ち切った",
+            waited.as_secs()
+        )),
+        crate::probe::Outcome::Failed { reason, .. } => {
+            Err(format!("tmux を実行できない: {reason}"))
+        }
     }
 }
 

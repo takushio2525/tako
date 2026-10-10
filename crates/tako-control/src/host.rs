@@ -163,8 +163,26 @@ pub trait TmuxHost {
         None
     }
     /// [`Self::backend_windows`] を**要求時点の実態**へ合わせる（#1191）。
-    /// `Request::List` の直前に 1 回だけ呼ばれる。UI を持たない実装では何もしない
+    /// `Request::List` の直前に 1 回だけ呼ばれる。UI を持たない実装では何もしない。
+    ///
+    /// **同期の採り直し**なので、IPC の受け口は使わない（#1979: 採取は
+    /// [`Self::backend_windows_fetch_plan`] → background → [`Self::apply_backend_windows_fetch`]）。
+    /// ここを通るのは offload を通らない同期の呼び手だけ
     fn refresh_backend_windows(&mut self) {}
+    /// `tako list` の前に器から window 一覧を採り直す必要があるか（#1979）。要るなら
+    /// 器のソケット名を返す。**ここで tmux を起こさない**（判断だけ。メモリ操作のみ）。
+    /// 採取（`tmux list-windows -a`）は background で行い、結果は
+    /// [`Self::apply_backend_windows_fetch`] で UI スレッドへ戻す
+    fn backend_windows_fetch_plan(&self) -> Option<String> {
+        None
+    }
+    /// background で採った器の window 一覧を反映する（#1979。メモリ操作のみ）。
+    /// `None` = 採取できなかった（tmux 不在・サーバー未起動・上限で打ち切り）
+    fn apply_backend_windows_fetch(
+        &mut self,
+        _by_session: Option<std::collections::HashMap<String, Vec<tako_core::TmuxWindow>>>,
+    ) {
+    }
     /// `tako tmux open` で取り込んだビューペインが指している tmux（#1185）。
     /// window 操作は **`backend_session` より優先**してこれを見る。取り込みペインは
     /// 「外側 = tako のバックエンドセッション」「内側 = 取り込んだセッション」の

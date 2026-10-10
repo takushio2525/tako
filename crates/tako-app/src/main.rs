@@ -6744,8 +6744,11 @@ impl TakoApp {
         Vec<gpui::AnyWindowHandle>,
     ) {
         let _span = tako_control::diag::perf_span("ipc_turn");
+        // #1979: 読み取りの続き（`tako list` の応答）は描かない。強制描画は
+        // レイアウトを変えうる着地だけ（`changes_layout` の 1 実装）
+        let needs_frame = next.changes_layout() && !Self::ipc_redraw_legacy();
         let mut result = tako_control::finish_offload(self, next, origin);
-        let redraw = self.after_dispatch(&mut result, !Self::ipc_redraw_legacy(), cx);
+        let redraw = self.after_dispatch(&mut result, needs_frame, cx);
         (result, redraw)
     }
 
@@ -7283,6 +7286,10 @@ impl TakoApp {
     /// backend ペインが 1 つも無ければ tmux を起動すらしない。連打・リモートの
     /// ポーリング（`AppIpcClient::probe` は毎回 `Request::List` を打つ）で毎回
     /// 起動しないよう、直前の採取から [`BACKEND_WINDOWS_FRESH`] 以内は使い回す
+    ///
+    /// **同期の採り直し**（#1979）。IPC の受け口は [`Self::backend_windows_plan`] の判断だけを
+    /// UI スレッドで行い、`list-windows` は background で待つ（`tako_control::prepare_offload`）。
+    /// ここへ来るのは offload を通らない同期の呼び手だけ
     fn refresh_backend_windows_now(&mut self) {
         // #1191 の A/B: 修正前と同じ「要求時には採らない」へ戻す
         if legacy_1191() {
@@ -7294,17 +7301,29 @@ impl TakoApp {
             self.backend_windows_at = None;
             return;
         }
-        if self
-            .backend_windows_at
-            .is_some_and(|t| t.elapsed() < BACKEND_WINDOWS_FRESH)
-        {
+        let Some(socket) = self.backend_windows_plan() else {
             return;
-        }
-        let socket = tako_core::tmux_backend::socket_name();
+        };
         let by_session = tako_core::tmux::list_windows_by_session(Some(&socket));
         // ホバープレビューのキャプチャ対象は捨てる: capture-pane は window 数ぶんの
         // サブプロセスで、右パネルが見えていないときに払う理由が無い（Issue #113）
         let _ = self.apply_backend_windows(by_session.as_ref());
+    }
+
+    /// 要求時の採り直しが要るか（#1979。**判断だけ**で tmux は起こさない）。要るなら器の
+    /// ソケット名。backend ペインが無い・#1191 の A/B・直前の採取から
+    /// [`BACKEND_WINDOWS_FRESH`] 以内なら `None`
+    fn backend_windows_plan(&self) -> Option<String> {
+        if legacy_1191() || self.backend_sessions.is_empty() {
+            return None;
+        }
+        if self
+            .backend_windows_at
+            .is_some_and(|t| t.elapsed() < BACKEND_WINDOWS_FRESH)
+        {
+            return None;
+        }
+        Some(tako_core::tmux_backend::socket_name())
     }
 
     /// backend セッション名 → window 一覧を `backend_windows` へ反映する（メモリ操作のみ）。
@@ -22935,6 +22954,20 @@ impl TmuxHost for TakoApp {
     /// #1191: `tako list` は要求時点の実態を返す（右パネルの表示状態に依存しない）
     fn refresh_backend_windows(&mut self) {
         self.refresh_backend_windows_now();
+    }
+
+    /// #1979: 採り直しの判断だけ（tmux は background が起こす）
+    fn backend_windows_fetch_plan(&self) -> Option<String> {
+        self.backend_windows_plan()
+    }
+
+    /// #1979: background で採った window 一覧の反映（ホバープレビューのキャプチャ対象は
+    /// 捨てる = 同期の採り直しと同じ扱い）
+    fn apply_backend_windows_fetch(
+        &mut self,
+        by_session: Option<HashMap<String, Vec<tako_core::TmuxWindow>>>,
+    ) {
+        let _ = self.apply_backend_windows(by_session.as_ref());
     }
 
     fn backend_scroll_view(

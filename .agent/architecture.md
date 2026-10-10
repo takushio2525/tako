@@ -1232,6 +1232,40 @@ lid-guard.json が使う）:
   準備部は `offload_prepare:<種別>` の計測区間で包む（再発したら perf.log に出る）。
   番犬 `crates/tako-control/tests/issue1968_ui_thread_subprocess_watchdog.rs`、
   A/B は同一バイナリの `TAKO_1968_LEGACY=1`（実測値は下の「#1968 の実測」）
+- **子プロセスの待ちには必ず上限を付ける**（#1979）: 2026-10-10 01:20 に本番の GUI が
+  10 分固まった（CPU 0%・IPC の受け口は backlog で接続拒否・KILL で再起動）。stripped の
+  `sample` をシンボル付きの同じコミット（`d851f0d`）の release と命令列で突き合わせると、
+  メインスレッドは IPC 受信ループ → `prepare_offload` → `collect_worker_status_ctx` →
+  `has_running_children` → `process_parent_map` → `capture_process_table` →
+  `Command::output()`（`ps -axo pid=,ppid=,command=`）→ `read_output` → `poll(-1)` で止まっていた
+  （= #1968 が外した経路。本番の版は #1976 の着地の 16 分前）。`output()` は子が終わらないと
+  返らないうえ、macOS の std はパイプを `pipe()` → `set_cloexec` の 2 手で作るので、別スレッドが
+  同時に起こした長生きの子（器のサーバー・ペインのシェル）へ書き手が漏れると**子が終わっても**
+  EOF が来ない（#1768 で同じ穴を実測。CPU 0% のまま止まる形と合う）。直し方 =
+  ①親子表は macOS で libproc（`ports::process_table` = `proc_listpids` + `PROC_PIDT_SHORTBSDINFO` +
+  `KERN_PROCARGS2`。子プロセスもパイプも無い。`PROC_PIDTBSDINFO` は root のプロセスで失敗するので
+  使わない）、libproc の無い unix の `ps` は上限つき ②器への問い合わせ（`tmux::run_tmux` /
+  `run_tmux_at` / `session_alive` / `paste_text` / backend の `pane_pids*` / `capture_history_joined` /
+  `scroll_probe` / `agents::tmux_pane_pids`）は `probe::command_output_with_timeout`
+  （`TMUX_QUERY_TIMEOUT` = 5 秒。実測 0.01 秒未満）を通す。`claude agents --json` の走査
+  （`run_claude_agents_json_live`。スマホの一覧 `RemoteAgents`・セッション再起動の計画から同期の
+  dispatch でも届く）も同じ口で probe の既定（15 秒）③上限つきの待ちは、子が終わったあと
+  パイプの読み切りを 2 秒で頭打ちにし（漏れた書き手で止まらない）、打ち切った子を同期に `wait`
+  しない（`reap_in_background`。カーネルの中で止まった子は SIGKILL でも出てくるまで終わらない）
+  ④`tako list` の器の採り直し（`list-windows -a`）は `prepare_offload` が `OffloadJob::List` で
+  background へ出し、UI スレッドは判断（`backend_windows_fetch_plan`）と反映
+  （`apply_backend_windows_fetch`）と応答の組み立てだけを行う（読み取りなので強制描画もしない =
+  `OffloadContinuation::changes_layout`）。番犬
+  `crates/tako-control/tests/issue1979_ui_thread_unbounded_wait_watchdog.rs`（注入 7 通りを
+  file:line で名指し）、A/B は同一バイナリの `TAKO_1979_LEGACY=1`（親子表・器の問い合わせ・
+  `tako list` の同期の採り直し・再描画の上限。`claude agents` の上限は戻さない）。型の再現は
+  GUI 無しの `crates/tako-control/tests/issue1979_unbounded_wait_injection.rs`（孫がパイプを握る
+  偽の `ps` / tmux を本番ハングと同じ関数へ当て、修正前の腕は返らない・後は返る）、UI スレッドの
+  経路そのものは隔離 GUI の `scripts/test-ui-thread-wait-1979.sh`。
+  **まだ同期のまま残る子プロセスの待ち**（上限つきにはなった）: `tako list` 以外の UI スレッドの
+  dispatch（`RemoteAgents` / `resolve_caller_pane` / spawn / セッション再起動の計画）と、
+  右パネルの切替時の `TmuxList`（`refresh_tmux_data`）。漏れた書き手では読み切りの猶予（2 秒）、
+  返らない子では上限（5 秒 / 15 秒）だけ止まりうる
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の
