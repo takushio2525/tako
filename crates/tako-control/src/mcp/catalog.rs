@@ -2680,9 +2680,11 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_session_restart",
             "description": "エージェントペインを**会話を引き継いだまま**建て直す。mode 省略は**下見**\
                 （何ができるか + できない理由）だけで何も起こさない。harness: CLI のプロセスだけを終了させ、\
-                落ちたのを確かめてから `claude --resume <session-id>` を送達確認つきで投入する\
+                落ちてシェルが戻ったのを確かめてから、元の起動と同じ引数（モデル・effort・\
+                system prompt・許可モード）+ `--resume <session-id>` を送達確認つきで投入する\
                 （**会話コンテキストは失われない**。claude CLI の自動更新後の stale 警告の解決手段。\
-                アカウント・role・モデル・effort も復元）。handoff: 引き継ぎの書き直しと \
+                エージェントが既に終わりシェルだけのペインも戻せる）。送った後すぐ落ちたら 1 回打ち直し、\
+                結果は下見の last_restart（phase / reason）に出る。handoff: 引き継ぎの書き直しと \
                 tako_orchestrator_handoff を master 自身へ依頼する（ctx はリセットされ、引き継ぎファイルに\
                 書いた分だけ残る。**master のみ**）。生成中・キュー滞留・入力欄に人の下書き・\
                 選択肢ダイアログ中は実行せず理由 + 次の一手を返す。claude 以外は対象外\
@@ -3446,7 +3448,8 @@ pub fn tools() -> Vec<Value> {
                 list: role / project で絞り込み、last_seen の新しい順に limit 件。\
                 show: id（前方一致可）のメタ情報 + 会話冒頭の抜粋。\
                 resume: ペイン・タブ・tmux / psmux が全滅していても、記録された cwd で新ペインを\
-                分割起動し `claude --resume <session_id>` で復元する。\
+                分割起動し、元の起動と同じ引数（モデル・effort・system prompt・許可モード）+ \
+                `--resume <session_id>` で復元する（応答の recipe に組み立て方）。\
                 link: その会話を Claude 公式アプリ / claude.ai で開く session URL を返す。\
                 remote_link.state = connected（url あり）/ not_connected / ineligible: <理由> / \
                 unknown（会話が特定できない）。繋がっていなければ url は無く、remote_link.reason を読み \

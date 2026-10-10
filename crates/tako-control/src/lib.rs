@@ -79,6 +79,7 @@ pub mod remote_setup;
 pub mod remote_ssh;
 pub mod remote_tasks;
 pub mod restore_report;
+pub mod resume_launch;
 pub mod runtime_probe;
 pub mod sessions;
 pub mod settings;

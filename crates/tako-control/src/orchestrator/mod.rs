@@ -2246,18 +2246,34 @@ pub fn build_master_cmd_in(
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, String> {
-    use crate::launch_cmd as lc;
     // env 検証（内部変数の上書きを拒否。Issue #500）
     profile.validate_env()?;
-
-    let agent = profile.resolve_master_agent()?;
     // env 計画をコマンド先頭で注入する。direnv より後勝ちで上書き / 解除する。
     // master_account があれば worker と同じ規則でアカウントの config dir を反映する
     // （未登録アカウントはここで Err = 起動前に落ちる。Issue #547）
     let plan = profile.resolved_env_plan_for_master()?;
+    build_master_cmd_with_plan_in(role_env, profile, &plan, prompt_path, tako_bin, dialect)
+}
+
+/// env 計画を呼び出し側が決めて組み立てる（#1967）。
+///
+/// 会話の再開（`resume_launch`）は、アカウントの config dir を**会話の記録がある場所**へ
+/// 寄せた計画で同じコマンドを組む（記録の無い dir で resume すると `No conversation found`）。
+/// それ以外は [`build_master_cmd_in`] と 1 バイトも変わらない（同じ本体を通る）
+pub fn build_master_cmd_with_plan_in(
+    role_env: &str,
+    profile: &Profile,
+    plan: &EnvPlan,
+    prompt_path: &Path,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+) -> Result<String, String> {
+    use crate::launch_cmd as lc;
+    profile.validate_env()?;
+    let agent = profile.resolve_master_agent()?;
     // Remote Control（#1068）は claude だけ・opt-in だけ・適格なときだけ。
     // 判定材料は「起動先が実際に見る env」なので plan を反映した後で集める
-    let remote_control = remote_control_decision(profile, agent, &plan);
+    let remote_control = remote_control_decision(profile, agent, plan);
     let mut cmd = String::new();
     for k in &plan.unsets {
         cmd.push_str(&lc::unset_prefix(dialect, k));
