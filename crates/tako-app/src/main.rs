@@ -48273,8 +48273,9 @@ mod self_test {
     }
 
     /// 補完の「読み込み中」（#1869）を**実 GUI の打鍵経路**と実ピクセルで見る。偽サーバを
-    /// `loading` シナリオ（読み込み 6 秒・その間は補完に `null` で即答 = 実測した rust-analyzer の前半）で
-    /// 受け持ちに差し替える。
+    /// `loading` シナリオ（読み込み中は補完に `null` で即答 = 実測した rust-analyzer の前半）で
+    /// 受け持ちに差し替える。読み込みの終わりは合図のファイル（`TAKO_LSP_FAKE_LOADING_UNTIL`）で
+    /// この節が決める（(3) の打鍵が偽サーバへ届いてから終える = 実時間に任せない。#1930）。
     ///
     /// 相: (1) 読み込み中に 1 文字打つと一覧の代わりに「読み込み中」の 1 行が出て、基準画像（同じ場面
     /// から 1 行だけを外した 1 枚）との差分がその矩形の外に無い (2) 語の外へ出る（空白）と消える
@@ -48290,9 +48291,29 @@ mod self_test {
     ) {
         const LABEL: &str = "completion-loading";
         inject_section_failure(LABEL);
-        // 読み込みの長さは偽サーバが起動のたびに env から読む（scene が編集モードへ入った時点で起きる）
+        let work =
+            std::env::temp_dir().join(format!("tako-visual-1930-{LABEL}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).expect("visual-test completion-loading の置き場");
+        let (log, gate) = (work.join("received.jsonl"), work.join("loading-done"));
+        // 偽サーバは起動のたびに env を読む（scene が編集モードへ入った時点で起きる）。読み込みは
+        // 合図（`gate`）まで終わらない = 読み込みの終わりを実時間に任せない（#1922 / #1930）
         std::env::set_var("TAKO_LSP_FAKE_SCENARIO", "loading");
-        std::env::set_var("TAKO_LSP_FAKE_LOADING_MS", "6000");
+        std::env::set_var("TAKO_LSP_FAKE_LOADING_MS", "0");
+        std::env::set_var("TAKO_LSP_FAKE_LOADING_UNTIL", &gate);
+        std::env::set_var("TAKO_LSP_FAKE_LOG", &log);
+        // 偽サーバに届いた補完の要求のうち、`at`（LSP の行・桁）を問うたもの
+        let asked_at = |log: &std::path::Path, at: (usize, usize)| {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|m| {
+                    m["method"] == "textDocument/completion"
+                        && m["params"]["position"]
+                            == serde_json::json!({ "line": at.0, "character": at.1 })
+                })
+        };
         let source = "fn main() {\n    let total = 1;\n    \n}\n";
         let rules = serde_json::json!({ "items": [{ "label": "alpha" }, { "label": "beta" }] });
         let (pane, dir, override_env) =
@@ -48347,9 +48368,23 @@ mod self_test {
                     .await;
             }
         }
+        // 起動が済んで（握手を終えて）から読み込み中になったのを待つ。`server_loading` は起動中も
+        // 真なので、それだけで進むと「読み込み中」を待ったつもりで起動中に打つ（#1930。
+        // `completion-cancel` と同じ前提）
+        let running_loading = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    let server = &app.lsp.status(None)["servers"][0];
+                    server["state"] == "running" && server["loading"] == true
+                })
+                .unwrap_or(false)
+        };
         check(
-            until(any, window, cx, Duration::from_secs(10), &|cx| loading(cx)).await,
-            &format!("visual-test {LABEL}: 偽サーバが読み込み中と知らせる（素材の前提）"),
+            until(any, window, cx, Duration::from_secs(30), &|cx| {
+                running_loading(cx) && loading(cx)
+            })
+            .await,
+            &format!("visual-test {LABEL}: 偽サーバが起動して読み込み中と知らせる（素材の前提）"),
         );
 
         // (1) 読み込み中に 1 文字 → 「読み込み中」の 1 行
@@ -48367,9 +48402,7 @@ mod self_test {
         );
         check(
             still_loading,
-            &format!(
-                "visual-test {LABEL}: 打った時点でまだ読み込み中（素材の前提。読み込みを延ばす）"
-            ),
+            &format!("visual-test {LABEL}: 打った時点でまだ読み込み中（素材の前提。合図はまだ）"),
         );
         check(
             shown,
@@ -48503,6 +48536,26 @@ mod self_test {
         // （`a` = 候補の alpha / beta の両方に合う語。合わない語だと答えは来ても 0 件に絞れて出ない）
         completion_type(any, cx, 'a');
         let noted = until(any, window, cx, Duration::from_secs(3), &|cx| note(cx)).await;
+        // この打鍵の問い合わせ（打った後のカーソルの位置を問う = 前の相の打鍵と取り違えない）が
+        // 偽サーバへ届いてから読み込みを終わらせる（先に終わると読み込み中に打ったことにならない）
+        let at = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|e| e.buffer.line_byte_col(e.buffer.cursor()))
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail(&format!("visual-test {LABEL}: (3) のカーソル位置")));
+        let reached = until(any, window, cx, Duration::from_secs(10), &|_| {
+            asked_at(&log, at)
+        })
+        .await;
+        check(
+            reached,
+            &format!("visual-test {LABEL}: (3) の打鍵が偽サーバへ届く（素材の前提。{at:?}）"),
+        );
+        std::fs::write(&gate, b"").expect("読み込みの合図");
         let typed_at = std::time::Instant::now();
         let listed = until(any, window, cx, Duration::from_secs(30), &|cx| {
             popup(cx).is_some()
@@ -48528,13 +48581,20 @@ mod self_test {
         }
         press(any, cx, "escape");
 
-        std::env::remove_var("TAKO_LSP_FAKE_SCENARIO");
-        std::env::remove_var("TAKO_LSP_FAKE_LOADING_MS");
+        for name in [
+            "TAKO_LSP_FAKE_SCENARIO",
+            "TAKO_LSP_FAKE_LOADING_MS",
+            "TAKO_LSP_FAKE_LOADING_UNTIL",
+            "TAKO_LSP_FAKE_LOG",
+            "TAKO_LSP_FAKE_COMPLETION",
+        ] {
+            std::env::remove_var(name);
+        }
         if let Some(name) = override_env {
             std::env::remove_var(name);
         }
-        std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     /// 補完（#1682）を**実の rust-analyzer** で見る（実機目視の代わり）。`rust-analyzer` が

@@ -1831,7 +1831,9 @@ impl Shared {
             };
             position::lsp_position_of_line_col(&doc.text, request.line, request.column)
         };
+        let mut empty = super::goto::EmptyAnswer::default();
         loop {
+            empty.sent(self.reported_loading(&key));
             let targets = self.goto_once(&process, &uri, spec, request, at, deadline)?;
             if !targets.is_empty() {
                 return Ok(GotoAnswer {
@@ -1841,7 +1843,7 @@ impl Shared {
             }
             // 空の答え: 読み込み中のサーバ（rust-analyzer は読み込みの前の問い合わせに空で答える）
             // なら、済むのを待って問い直す。済んでいる / 状態を送らないサーバなら見つからない
-            match self.wait_loaded(&key, deadline, &|| false) {
+            match self.wait_after_empty(&key, deadline, &|| false, &mut empty) {
                 super::goto::Loading::Retry => continue,
                 super::goto::Loading::Settled => {
                     return Ok(GotoAnswer {
@@ -1936,6 +1938,30 @@ impl Shared {
             waited = true;
             std::thread::sleep(super::goto::READY_POLL);
         }
+    }
+
+    /// 空の答えの後: 読み込みを待ち、問い直すかを決める（#1930。定義ジャンプ・補完・ホバーの
+    /// 3 つが呼ぶ 1 実装）。待ち方は [`Self::wait_loaded`]、問い直しの判定は
+    /// [`super::goto::EmptyAnswer`]（読み込み中に送った要求の空は、見る前に済んでいても 1 回だけ
+    /// 問い直す）。`empty` は要求を送る直前に、サーバ自身が読み込み中と知らせているか
+    /// （[`slot_reported_loading`]）で記録しておく
+    fn wait_after_empty(
+        &self,
+        key: &ServerKey,
+        deadline: Instant,
+        abandoned: &dyn Fn() -> bool,
+        empty: &mut super::goto::EmptyAnswer,
+    ) -> super::goto::Loading {
+        empty.decide(self.wait_loaded(key, deadline, abandoned))
+    }
+
+    /// サーバ自身が読み込み中と知らせているか（`quiescent: false`。**待たない**）。握手の直後の
+    /// 猶予は含まない（状態を送らないサーバでは常に偽 = #1930 の問い直しが効かない）
+    fn reported_loading(&self, key: &ServerKey) -> bool {
+        self.lock()
+            .servers
+            .get(key)
+            .is_some_and(slot_reported_loading)
     }
 
     /// サーバがいま読み込み中か（**待たない**。ロックを短く取るだけ）。
@@ -2319,6 +2345,7 @@ impl Shared {
         };
         let shared_at_start = others_hold();
         let abandoned = || superseded() || (shared_at_start && !others_hold());
+        let mut empty = super::goto::EmptyAnswer::default();
         loop {
             // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す（#1769）。
             // 送った時点の文書の版を覚え、答えが届いたときに違っていたらその答えは使わない
@@ -2328,10 +2355,9 @@ impl Shared {
                 let Some(doc) = inner.docs.get(&uri) else {
                     return Err(GotoError::Closed.into());
                 };
-                waited |= inner
-                    .servers
-                    .get(&key)
-                    .is_some_and(|slot| slot.quiescent == Some(false));
+                let reported = inner.servers.get(&key).is_some_and(slot_reported_loading);
+                empty.sent(reported);
+                waited |= reported;
                 (
                     position::lsp_position_of_line_col(&doc.text, request.line, request.column),
                     doc.version,
@@ -2371,7 +2397,7 @@ impl Shared {
             // A/B（`TAKO_1869_LEGACY=1`）は #1869 前 = 打鍵の要求は待たない
             let wait = !request.superseding || !super::completion::legacy_1869();
             if parsed.items.is_empty() && wait {
-                match self.wait_loaded(&key, deadline, &abandoned) {
+                match self.wait_after_empty(&key, deadline, &abandoned, &mut empty) {
                     super::goto::Loading::Retry => {
                         waited = true;
                         continue;
@@ -2543,6 +2569,7 @@ impl Shared {
         };
         let shared_at_start = others_hold();
         let abandoned = || superseded() || (shared_at_start && !others_hold());
+        let mut empty = super::goto::EmptyAnswer::default();
         loop {
             // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す（#1769）
             let at = {
@@ -2550,10 +2577,9 @@ impl Shared {
                 let Some(doc) = inner.docs.get(&uri) else {
                     return Err(GotoError::Closed.into());
                 };
-                waited |= inner
-                    .servers
-                    .get(&key)
-                    .is_some_and(|slot| slot.quiescent == Some(false));
+                let reported = inner.servers.get(&key).is_some_and(slot_reported_loading);
+                empty.sent(reported);
+                waited |= reported;
                 position::lsp_position_of_line_col(&doc.text, request.line, request.column)
             };
             let params = json!({
@@ -2584,7 +2610,7 @@ impl Shared {
             // 文書を閉じるで抜ける。A/B（`TAKO_1893_LEGACY=1`）は #1893 前 = マウスの要求は待たない
             let wait = !request.superseding || !super::hover::legacy_1893();
             if content.is_none() && wait {
-                match self.wait_loaded(&key, deadline, &abandoned) {
+                match self.wait_after_empty(&key, deadline, &abandoned, &mut empty) {
                     super::goto::Loading::Retry => {
                         waited = true;
                         continue;
@@ -2657,6 +2683,12 @@ impl Slot {
             running_since: None,
         }
     }
+}
+
+/// サーバ自身が読み込み中と知らせているか（[`Shared::reported_loading`] と、補完・ホバーが
+/// 送る直前にロックの中で引く判定の 1 実装。#1930）
+fn slot_reported_loading(slot: &Slot) -> bool {
+    slot.quiescent == Some(false)
 }
 
 /// サーバがいま読み込み中か（#1680 / #1869）。`quiescent: false` を知らせている、または状態を

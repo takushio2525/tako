@@ -87,6 +87,30 @@ doc() { "$TAKO_BIN" edit status --pane "$1" 2>/dev/null | json "d[\"document\"][
 autosave_off() { "$TAKO_BIN" edit autosave false --pane "$1" >/dev/null 2>&1; }
 open_code() { "$TAKO_BIN" open "$1" --pane "$ROOT" --right 2>/dev/null | json 'd["pane"]'; }
 completion() { "$TAKO_BIN" lsp completion "$@" --json 2>/dev/null; }
+# 偽サーバのログ（TAKO_LSP_FAKE_LOG）に届いた補完の要求の数（#1930: 順序は実時間でなくこれで決める）
+asked() {
+  local n
+  n="$(grep -c '"method":"textDocument/completion"' "$1" 2>/dev/null)"
+  echo "${n:-0}"
+}
+# 偽サーバに補完の要求が $2 件以上届くまで待つ（状態で待つ。上限 30 秒）
+wait_asked() {
+  local i
+  for i in $(seq 1 300); do
+    [ "$(asked "$1")" -ge "$2" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+# 言語サーバが起動を終えて読み込み中になるまで待つ（起動中も loading は真 = それだけで進まない。#1930）
+wait_running_loading() {
+  local i
+  for i in $(seq 1 300); do
+    [ "$("$TAKO_BIN" lsp status --json 2>/dev/null | json 'd["servers"][0]["state"] == "running" and d["servers"][0]["loading"]')" = "True" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
 
 mcp() { # 引数のツール名と JSON → 応答本文
   printf '%s\n%s\n' \
@@ -228,16 +252,27 @@ echo "== ④ CLI / MCP: 読み込み中に頼むと待って答え、終わら�
 printf 'fn main() { ab }\n' > "$P/src/main.rs"
 RULES="$TMP/completion.json"
 printf '{ "items": [{ "label": "abc" }, { "label": "abd" }] }' > "$RULES"
+# 読み込みの終わりは合図のファイルで決める（要求が偽サーバへ届いてから作る = 実時間に任せない。#1930）
+GATE_CLI="$TMP/loading-done-cli"
+FAKE_LOG_CLI="$TMP/fake-cli.jsonl"
 start_gui "$TMP/app-cli.log" TAKO_LSP_BIN_RUST_ANALYZER="$FAKE" \
-  TAKO_LSP_FAKE_SCENARIO=loading TAKO_LSP_FAKE_LOADING_MS=3000 \
+  TAKO_LSP_FAKE_SCENARIO=loading TAKO_LSP_FAKE_LOADING_MS=0 TAKO_LSP_FAKE_LOADING_UNTIL="$GATE_CLI" \
+  TAKO_LSP_FAKE_LOG="$FAKE_LOG_CLI" \
   TAKO_LSP_FAKE_COMPLETION="$RULES" TAKO_LSP_COMPLETION_TIMEOUT_SECS=20
 A="$(open_code "$P/src/main.rs")"
 "$TAKO_BIN" edit start --pane "$A" >/dev/null
 autosave_off "$A"
+wait_running_loading || fail "言語サーバが起動して読み込み中にならない（素材の前提）"
 LOADING_NOW="$("$TAKO_BIN" lsp status --json 2>/dev/null | json 'd["servers"][0]["loading"]')"
 t0="$(now_ms)"
-R1="$(completion --pane "$A" --line 1 --column 14)"
+completion --pane "$A" --line 1 --column 14 > "$TMP/r1.json" &
+R1_PID=$!
+# 要求が偽サーバへ届いてから読み込みを終わらせる（先に終わると読み込み中に頼んだことにならない）
+wait_asked "$FAKE_LOG_CLI" 1 || fail "読み込み中の補完の要求が偽サーバへ届かない"
+: > "$GATE_CLI"
+wait "$R1_PID"
 t1="$(now_ms)"
+R1="$(cat "$TMP/r1.json")"
 echo "    読み込み中の CLI: $((t1 - t0))ms status=$(printf '%s' "$R1" | json 'd["status"]') total=$(printf '%s' "$R1" | json 'd["total"]') waited_for_loading_ms=$(printf '%s' "$R1" | json 'd.get("waited_for_loading_ms")')"
 check_eq "頼んだ時点の tako lsp status は loading" "True" "$LOADING_NOW"
 check_eq "読み込みを待って一覧を返す" "found" "$(printf '%s' "$R1" | json 'd["status"]')"
@@ -257,8 +292,11 @@ check_eq "MCP と CLI の候補が字面一致" \
 stop_gui
 
 echo "  -- 終わらない読み込み（上限 3 秒）"
+# 合図のファイルを作らない = 読み込みは終わらない（#1930）
+FAKE_LOG_NEVER="$TMP/fake-never.jsonl"
 start_gui "$TMP/app-never.log" TAKO_LSP_BIN_RUST_ANALYZER="$FAKE" \
-  TAKO_LSP_FAKE_SCENARIO=loading TAKO_LSP_FAKE_LOADING_MS=600000 \
+  TAKO_LSP_FAKE_SCENARIO=loading TAKO_LSP_FAKE_LOADING_MS=0 TAKO_LSP_FAKE_LOADING_UNTIL="$TMP/loading-never" \
+  TAKO_LSP_FAKE_LOG="$FAKE_LOG_NEVER" \
   TAKO_LSP_FAKE_COMPLETION="$RULES" TAKO_LSP_COMPLETION_TIMEOUT_SECS=3
 B="$(open_code "$P/src/main.rs")"
 "$TAKO_BIN" edit start --pane "$B" >/dev/null
@@ -274,9 +312,11 @@ check_eq "tako lsp status の loading は真のまま" "True" "$("$TAKO_BIN" lsp
 echo
 echo "== ⑤ エッジ =="
 # 読み込み中にペインを閉じる: 待っている CLI の問い合わせは上限を待たずに抜ける
+ASKED_BEFORE="$(asked "$FAKE_LOG_NEVER")"
 completion --pane "$B" --line 1 --column 14 > "$TMP/close.json" &
 CLOSE_PID=$!
-sleep 0.5
+# 要求が偽サーバへ届いて（= 読み込みを待ち始めて）から閉じる（実時間で待たない。#1930）
+wait_asked "$FAKE_LOG_NEVER" $((ASKED_BEFORE + 1)) || fail "閉じる前の補完の要求が偽サーバへ届かない"
 t0="$(now_ms)"
 "$TAKO_BIN" close --pane "$B" --force >/dev/null 2>&1
 wait "$CLOSE_PID"

@@ -513,15 +513,17 @@ fn 未応答とエラーと落ちたと未導入を区別する() {
     );
 }
 
-/// 答えを待つあいだに本文が変わったら当てない（古い本文への答えは位置がずれる）
+/// 答えを待つあいだに本文が変わったら当てない（古い本文への答えは位置がずれる）。偽サーバは
+/// 答えを扉（`hold_until`）が開くまで待たせる（打鍵が答えより先に届くのを実時間に任せない = #1930）
 #[test]
 fn 待つあいだに本文が変わったら古い答えを返さない() {
     let scratch = Scratch::new("stale");
     let path = scratch.write("src/main.rs", UNFORMATTED);
+    let answers = lsp_fake_e2e::AnswerGate::new(&scratch.0);
     let manager = LspManager::new(config(
         &scratch,
         "normal",
-        &json!([{ "delay_ms": 600, "result": three_edits() }]),
+        &json!([{ "hold_until": answers.path(), "result": three_edits() }]),
     ));
     let mut link = DocLink::default();
     manager.sync(&mut link, true, &path, UNFORMATTED, 1);
@@ -541,6 +543,8 @@ fn 待つあいだに本文が変わったら古い答えを返さない() {
         "// typed\nfn main(){\nlet x=1;\nx\n}\n",
         2,
     );
+    // 打鍵を manager が受けてから答えを返させる
+    answers.open();
     assert_eq!(worker.join().unwrap(), Err(FormatError::Stale));
     drop(link);
     manager.shutdown_all(Duration::from_secs(2));

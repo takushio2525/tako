@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1908: ファイルツリーの ↑↓ / ←→ / Enter / ⇧⌘↑↓（Win は Shift+Ctrl+Home / End）・選択の CLI / MCP・残り時間の数え下ろし）
-- 正本 `tree_select::on_key`（`RowShape` → `KeyOutcome`）を画面のキー（#1895 の ⇧↑↓ も）と CLI `tako tree selection [<path>] [--key K]` / MCP `tako_tree_folder` の `selection` が dispatch `TreeSelection` で通る（カタログ +412 B）。`eta` は最後にバイトが進んだ時点までの平均で数え下ろし、止まったら旧式の伸び方へ連続につなぐ。Shift+Delete は CLI / MCP に完全削除の口が無いので扱わない（FR-3.40 ③）
-- 実測: 単体の合成（1 MiB / 300 ms・150 ms ごと）で逆戻り合計 5.87 → 0 秒・表記の戻り 3 → 0 回、実 GUI の `eta_secs` は戻り 6 → 0 回（57 回読み）。visual-test `tree-keys` 緑・`TAKO_1908_LEGACY=1` で ① が名指しで FAILED・番犬 10 本（注入 11 通り）
-
 ## 2026-10-09（#1916: GUI 内の塗りが遅いのは App Nap（E コア落ち）と比べた入力の違い = 塗りの間は activity を握る）
 - 真因: 実行器の優先度ではない（GCD / 専用スレッド・QoS 0x15 / 0x19 で同じ）。同じ入力ならテストスレッドと GUI は 12.0 秒で同じ（「4〜8 倍」の 3.6 倍は入力の違い）、隔離 GUI は約 30 秒で App Nap に間引かれ E コアで 26.9〜33.4 秒（命令数は同じ）。`disable_app_nap`（#173）は `/proc` 前提で空振り。`platform::user_work::UserWork`（NSProcessInfo の UserInitiated activity を数で束ねる）を塗りの 2 経路が握る。`tako edit` の応答に `highlighting`
 - 実測: `scripts/test-highlight-app-nap-1916.sh` 8 PASS（間引かれた後の比 1.02 / 1.11 / 1.10・P コア 0.99。A/B `TAKO_1916_LEGACY=1` は 2.56 / 2.54 / 2.80・P コア 0.000 で ③ が FAILED）・番犬 3 本（注入 10 通りを file:line で名指し）
@@ -64,3 +60,7 @@
 ## 2026-10-09（#1949: `.ino`（Arduino のスケッチ）を C++ の構文で塗る・```ino / ```arduino・ツリーのアイコン）
 - `preview.rs` の `extension_alias` / `fence_alias`（純関数。#1948 で `file_type` へ移る）+ `file_icons.rs`。A/B `TAKO_1949_LEGACY=1`・visual-test `ino-highlight`（`scripts/test-ino-highlight-1949.sh` が新旧を別の dir へ書き出す）
 - 実測: 9 色・同じ中身の `.cpp` と span が完全一致・開いたまま 31.7 秒で構文セットを手放す（猶予 30 秒）・閉じて 1.8 秒・ヒープ `.ino` +30.35 / 解放 −28.58 / `.cpp` +28.90 MB（構文は増えない）・旧は ① で名指しの FAILED
+
+## 2026-10-10（#1930: LSP の e2e の答えの順序を合図で決め、読み込み中に返った古い空を製品側で 1 回だけ問い直すようにした）
+- 製品: 定義ジャンプ・補完・ホバーの空の答えの後は `wait_after_empty` → `EmptyAnswer` の 1 実装（読み込み中に送った要求の空は、見る前に済んでいても 1 回だけ問い直す・状態を送らないサーバは不変・A/B `TAKO_1930_LEGACY=1`）。テスト: 偽サーバの `delay_ms` を `hold_until`（`AnswerGate`）へ・1684 は `stop_and_settle` の後に数える・visual-test / スクリプトは `LOADING_UNTIL`・番犬 #1922 に規則 4 つ
+- 実測: CI の間欠 2 つを注入で再現（1684:262 = ログ 20ms 遅れで 9/10・1869:197 = 空の直後に読み込みを終えると 10/10）。修正後は 3 本 × 注入 3 種で 0/10・旧挙動は 10/10 で名指し、7 か所は扉を先に開ける注入と本来の回帰 8 種で名指し、visual-test 7 段・スクリプト 3 本（bash 3.2）緑

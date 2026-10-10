@@ -102,7 +102,8 @@ const RULES: &[Rule] = &[
         decl: "    fn hover(&self, request: &HoverRequest)",
         must: &[
             "let wait = !request.superseding || !super::hover::legacy_1893();",
-            "self.wait_loaded(&key, deadline, &abandoned)",
+            // 空の答えの後の待ち（#1930 で定義ジャンプ・補完と共有の `wait_after_empty` へ）
+            "self.wait_after_empty(&key, deadline, &abandoned, &mut empty)",
             "Err(RpcError::Timeout(_)) if self.loading_now(&key) =>",
             "waited_for_loading: waited.then(|| started.elapsed())",
         ],
@@ -340,8 +341,8 @@ fn 逆戻りを名指しできる() {
         "B 待ちが抜けない",
         MANAGER,
         (
-            "            if content.is_none() && wait {\n                match self.wait_loaded(&key, deadline, &abandoned) {",
-            "            if content.is_none() && wait {\n                match self.wait_loaded(&key, deadline, &|| false /* 1893-B */) {",
+            "            if content.is_none() && wait {\n                match self.wait_after_empty(&key, deadline, &abandoned, &mut empty) {",
+            "            if content.is_none() && wait {\n                match self.wait_after_empty(&key, deadline, &|| false /* 1893-B */, &mut empty) {",
         ),
         "/* 1893-B */",
     );

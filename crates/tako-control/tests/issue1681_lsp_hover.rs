@@ -23,6 +23,11 @@ use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
 
+#[path = "common/lsp_fake_e2e.rs"]
+mod lsp_fake_e2e;
+
+use lsp_fake_e2e::AnswerGate;
+
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
 /// 受け入れ条件の Markdown（見出し / コードブロック / リンク の 3 種）。tako-app の単体
@@ -62,6 +67,11 @@ impl Scratch {
 
     fn rules(&self) -> PathBuf {
         self.0.join("hover.json")
+    }
+
+    /// 答えを待たせる扉（規則の `hold_until`。開くまで答えない = 答えの遅れを実時間で決めない。#1930）
+    fn answers(&self) -> AnswerGate {
+        AnswerGate::new(&self.0)
     }
 }
 
@@ -281,13 +291,15 @@ fn 位置と範囲は_utf16_で往復する() {
 }
 
 /// マウスの要求（`superseding`）は次の要求が来た時点で前の要求を `$/cancelRequest` で取り消す。
-/// 連続して 3 回乗せ直すと取り消しは 2 件で、最後の 1 本だけが答えを受ける
+/// 連続して 3 回乗せ直すと取り消しは 2 件で、最後の 1 本だけが答えを受ける。偽サーバは答えを
+/// 扉（`hold_until`）が開くまで待たせる（前の要求がまだ待っているのを実時間に任せない = #1930）
 #[test]
 fn マウスの要求は前の要求を取り消す() {
     let scratch = Scratch::new("cancel");
     let text = "fn main() { alpha }\n";
     let main = scratch.write("src/main.rs", text);
-    let rules = json!([{ "echo": true, "delay_ms": 1500 }]);
+    let answers = scratch.answers();
+    let rules = json!([{ "echo": true, "hold_until": answers.path() }]);
     let manager = LspManager::new(config(&scratch, "normal", &rules));
     let _link = open_editing(&manager, &main, text, 1);
     let mut handles = Vec::new();
@@ -297,17 +309,19 @@ fn マウスの要求は前の要求を取り消す() {
             manager.hover(&mouse(&main, 0, 13))
         }));
         // 状態で待つ: n 本目が偽サーバへ届いてから次を出す（実時間で比べない）
-        wait_until(
-            &format!("{n} 本目の hover"),
-            Duration::from_secs(10),
-            || of_method(&scratch, "textDocument/hover").len() >= n,
-        );
+        lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", n);
     }
+    // 3 本とも届いてから答えを返させる（前の 2 本は取り消し済みなので答えを受けない）
+    answers.open();
     let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert_eq!(outcomes[0], Err(HoverError::Superseded));
     assert_eq!(outcomes[1], Err(HoverError::Superseded));
     let last = outcomes[2].as_ref().expect("最後の 1 本は答えを受ける");
     assert_eq!(last.content.as_ref().unwrap().value, "**alpha**");
+    assert_eq!(server_status(&manager)["pending_requests"], json!(0));
+    // 数えるのは止めた後（前の要求が列へ載る前に次が来ると、取り消しは前の要求が自分で送る =
+    // 「3 本目が届いた」より後に届きうる）
+    lsp_fake_e2e::stop_and_settle(&manager, &scratch.log());
     let asked: Vec<Value> = of_method(&scratch, "textDocument/hover")
         .iter()
         .map(|m| m["id"].clone())
@@ -317,18 +331,28 @@ fn マウスの要求は前の要求を取り消す() {
         .map(|m| m["params"]["id"].clone())
         .collect();
     assert_eq!(cancels, asked[..2].to_vec(), "取り消すのは前の 2 本");
-    // カードを閉じた（`cancel_hover`）ら、待っている要求も取り消す
+}
+
+/// カードを閉じた（`cancel_hover`）ら、答えを待っているマウスの要求も取り消す（扉は開けない =
+/// 答えは取り消されるまで来ない。閉じるのが答えに間に合う前提を置かない = #1930）
+#[test]
+fn カードを閉じたら待っている要求を取り消す() {
+    let scratch = Scratch::new("close");
+    let text = "fn main() { alpha }\n";
+    let main = scratch.write("src/main.rs", text);
+    let answers = scratch.answers();
+    let rules = json!([{ "echo": true, "hold_until": answers.path() }]);
+    let manager = LspManager::new(config(&scratch, "normal", &rules));
+    let _link = open_editing(&manager, &main, text, 1);
     let handle = {
         let (manager, main) = (manager.clone(), main.clone());
         std::thread::spawn(move || manager.hover(&mouse(&main, 0, 13)))
     };
-    wait_until("4 本目", Duration::from_secs(10), || {
-        of_method(&scratch, "textDocument/hover").len() == 4
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/hover", 1);
     manager.cancel_hover();
     assert_eq!(handle.join().unwrap(), Err(HoverError::Superseded));
-    wait_until("3 件目の取り消し", Duration::from_secs(10), || {
-        of_method(&scratch, "$/cancelRequest").len() == 3
+    wait_until("取り消し", Duration::from_secs(10), || {
+        of_method(&scratch, "$/cancelRequest").len() == 1
     });
     assert_eq!(server_status(&manager)["pending_requests"], json!(0));
     manager.shutdown_all(Duration::from_secs(2));

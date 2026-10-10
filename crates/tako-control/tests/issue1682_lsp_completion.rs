@@ -22,6 +22,11 @@ use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
 
+#[path = "common/lsp_fake_e2e.rs"]
+mod lsp_fake_e2e;
+
+use lsp_fake_e2e::AnswerGate;
+
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
 /// 使い捨ての置き場（固定名を使わない = 並行する cargo test 同士で消し合わない。#1666）
@@ -53,6 +58,15 @@ impl Scratch {
 
     fn rules(&self) -> PathBuf {
         self.0.join("completion.json")
+    }
+
+    /// 答えを待たせる扉（規則の `hold_until`。開くまで答えない = 答えの遅れを実時間で決めない。#1930）
+    fn answers(&self) -> AnswerGate {
+        AnswerGate::new(&self.0)
+    }
+
+    fn answers_named(&self, name: &str) -> AnswerGate {
+        AnswerGate::named(&self.0, name)
     }
 }
 
@@ -143,14 +157,19 @@ fn open_editing(manager: &LspManager, path: &Path, text: &str, version: u64) -> 
 /// 受け入れ条件: 連続して 3 回要求を出したとき、偽サーバが受け取る `$/cancelRequest` が **2 件**。
 ///
 /// 打鍵の要求（`superseding`）は次の要求が来た時点で前の要求を取り消す。偽サーバは答えを
-/// 遅らせる（`delay_ms`）ので、2 本目・3 本目が出たときに前の要求はまだ答えを待っている。
-/// 取り消された 2 本は `Superseded` で返り（答えを待たない）、最後の 1 本だけが答えを受ける
+/// 扉（`hold_until`）が開くまで待たせるので、2 本目・3 本目が出たときに前の要求はまだ答えを
+/// 待っている（実時間の遅れに任せない = #1930）。取り消された 2 本は `Superseded` で返り
+/// （答えを待たない）、最後の 1 本だけが答えを受ける
 #[test]
 fn 連続して_3_回要求を出すと取り消しは_2_件() {
     let scratch = Scratch::new("cancel");
     let text = "fn main() {\n    let x = ab\n}\n";
     let main = scratch.write("src/main.rs", text);
-    let rules = json!({ "items": [{ "label": "abc" }, { "label": "abd" }], "delay_ms": 1500 });
+    let answers = scratch.answers();
+    let rules = json!({
+        "items": [{ "label": "abc" }, { "label": "abd" }],
+        "hold_until": answers.path(),
+    });
     let manager = LspManager::new(config(&scratch, "normal", &rules));
     let _link = open_editing(&manager, &main, text, 1);
     let mut handles = Vec::new();
@@ -160,17 +179,21 @@ fn 連続して_3_回要求を出すと取り消しは_2_件() {
             manager.completion(&request(&main, 1, 14, true))
         }));
         // 状態で待つ: n 本目が偽サーバへ届いてから次を出す（実時間で比べない）
-        wait_until(
-            &format!("{n} 本目の completion"),
-            Duration::from_secs(10),
-            || of_method(&scratch, "textDocument/completion").len() >= n,
-        );
+        lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", n);
     }
+    // 3 本とも届いてから答えを返させる（前の 2 本は取り消し済みなので答えを受けない）
+    answers.open();
     let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert_eq!(outcomes[0], Err(CompletionError::Superseded));
     assert_eq!(outcomes[1], Err(CompletionError::Superseded));
     let last = outcomes[2].as_ref().expect("最後の 1 本は答えを受ける");
     assert_eq!(last.items.len(), 2);
+    // 取り消した要求は待ちの表に残らない（遅れて届く -32800 は捨てる）
+    let status = manager.status(None);
+    assert_eq!(status["servers"][0]["pending_requests"], json!(0));
+    // 数えるのは止めた後（前の要求が列へ載る前に次が来ると、取り消しは前の要求が自分で送る =
+    // 「3 本目が届いた」より後に届きうる）
+    lsp_fake_e2e::stop_and_settle(&manager, &scratch.log());
     let asked: Vec<Value> = of_method(&scratch, "textDocument/completion")
         .iter()
         .map(|m| m["id"].clone())
@@ -181,10 +204,6 @@ fn 連続して_3_回要求を出すと取り消しは_2_件() {
         .collect();
     assert_eq!(cancels.len(), 2, "取り消しは 2 件: {cancels:?}");
     assert_eq!(cancels, asked[..2].to_vec(), "取り消すのは前の 2 本");
-    // 取り消した要求は待ちの表に残らない（遅れて届く -32800 は捨てる）
-    let status = manager.status(None);
-    assert_eq!(status["servers"][0]["pending_requests"], json!(0));
-    manager.shutdown_all(Duration::from_secs(2));
 }
 
 /// CLI / MCP の要求（`superseding: false`）は互いに取り消し合わない（1 回ずつ答えを待つ）
@@ -193,7 +212,8 @@ fn cli_の要求は互いに取り消さない() {
     let scratch = Scratch::new("no-cancel");
     let text = "fn main() { ab }\n";
     let main = scratch.write("src/main.rs", text);
-    let rules = json!({ "items": [{ "label": "abc" }], "delay_ms": 300 });
+    let answers = scratch.answers();
+    let rules = json!({ "items": [{ "label": "abc" }], "hold_until": answers.path() });
     let manager = LspManager::new(config(&scratch, "normal", &rules));
     let _link = open_editing(&manager, &main, text, 1);
     let handles: Vec<_> = (0..2)
@@ -202,11 +222,14 @@ fn cli_の要求は互いに取り消さない() {
             std::thread::spawn(move || manager.completion(&request(&main, 0, 14, false)))
         })
         .collect();
+    // 2 本とも届いて（= 答えを待つのが重なって）から答えを返させる（重なりを実時間で作らない）
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 2);
+    answers.open();
     for handle in handles {
         assert_eq!(handle.join().unwrap().expect("答えが来る").items.len(), 1);
     }
+    lsp_fake_e2e::stop_and_settle(&manager, &scratch.log());
     assert!(of_method(&scratch, "$/cancelRequest").is_empty());
-    manager.shutdown_all(Duration::from_secs(2));
 }
 
 /// 一覧を閉じた（`cancel_completion`）ら、答えを待っている打鍵の要求を取り消す
@@ -215,7 +238,9 @@ fn 一覧を閉じたら待っている要求を取り消す() {
     let scratch = Scratch::new("close");
     let text = "fn main() { ab }\n";
     let main = scratch.write("src/main.rs", text);
-    let rules = json!({ "items": [{ "label": "abc" }], "delay_ms": 3000 });
+    // 扉は開けない = 答えは取り消されるまで来ない（閉じるのが答えに間に合う前提を置かない。#1930）
+    let answers = scratch.answers();
+    let rules = json!({ "items": [{ "label": "abc" }], "hold_until": answers.path() });
     let manager = LspManager::new(config(&scratch, "normal", &rules));
     let _link = open_editing(&manager, &main, text, 1);
     let handle = {
@@ -239,7 +264,8 @@ fn 待つあいだに本文が変わった答えは捨てる() {
     let scratch = Scratch::new("edited");
     let text = "fn main() { ab }\n";
     let main = scratch.write("src/main.rs", text);
-    let rules = json!({ "items": [{ "label": "abc" }], "delay_ms": 800 });
+    let answers = scratch.answers();
+    let rules = json!({ "items": [{ "label": "abc" }], "hold_until": answers.path() });
     let manager = LspManager::new(config(&scratch, "normal", &rules));
     let mut link = open_editing(&manager, &main, text, 1);
     let handle = {
@@ -254,6 +280,8 @@ fn 待つあいだに本文が変わった答えは捨てる() {
     wait_until("didChange", Duration::from_secs(10), || {
         !of_method(&scratch, "textDocument/didChange").is_empty()
     });
+    // 打ち足しが届いてから答えを返させる（答えが打ち足しより先に届く順序を実時間に任せない。#1930）
+    answers.open();
     assert_eq!(handle.join().unwrap(), Err(CompletionError::Edited));
     manager.shutdown_all(Duration::from_secs(2));
 }
@@ -370,25 +398,37 @@ fn 能力なし_未導入_対象外は区別して返す() {
 fn 一時的に開いた文書は重なった問い合わせが終わるまで閉じない() {
     let scratch = Scratch::new("transient");
     let main = scratch.write("src/main.rs", "fn main() { ab }\n");
-    let rules = json!({ "items": [{ "label": "abc" }], "delay_ms": 400 });
+    // 答えは 1 本ずつ扉で返させる（k 本目の要求が k 番目の扉を待つ = 先に終わる側を決める。#1930）
+    let (first_gate, second_gate) = (
+        scratch.answers_named("first"),
+        scratch.answers_named("second"),
+    );
+    let rules = json!({
+        "items": [{ "label": "abc" }],
+        "hold_until": [first_gate.path(), second_gate.path()],
+    });
     let manager = LspManager::new(config(&scratch, "normal", &rules));
     let first = {
         let (manager, main) = (manager.clone(), main.clone());
         std::thread::spawn(move || manager.completion(&request(&main, 0, 14, false)))
     };
-    wait_until("1 本目", Duration::from_secs(10), || {
-        !of_method(&scratch, "textDocument/completion").is_empty()
-    });
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 1);
     let second = {
         let (manager, main) = (manager.clone(), main.clone());
         std::thread::spawn(move || manager.completion(&request(&main, 0, 14, false)))
     };
+    // 2 本とも届いて（= 一時の持ち手が重なって）から、1 本目だけ答えを返させる
+    lsp_fake_e2e::wait_received(&scratch.log(), "textDocument/completion", 2);
+    first_gate.open();
     assert!(first.join().unwrap().is_ok());
+    assert!(
+        manager.has_document(&main),
+        "先に終わった側の持ち手が抜けても、待っている 2 本目が文書を持っている"
+    );
+    second_gate.open();
     assert!(second.join().unwrap().is_ok(), "2 本目も答えを受ける");
-    wait_until("didClose", Duration::from_secs(10), || {
-        of_method(&scratch, "textDocument/didClose").len() == 1
-    });
-    assert_eq!(of_method(&scratch, "textDocument/didOpen").len(), 1);
     assert_eq!(manager.status(None)["documents"], json!(0));
-    manager.shutdown_all(Duration::from_secs(2));
+    lsp_fake_e2e::stop_and_settle(&manager, &scratch.log());
+    assert_eq!(of_method(&scratch, "textDocument/didOpen").len(), 1);
+    assert_eq!(of_method(&scratch, "textDocument/didClose").len(), 1);
 }

@@ -1,4 +1,4 @@
-//! LSP の e2e の「読み込み中・起動中の待ち」の番犬（#1922）
+//! LSP の e2e の「読み込み中・起動中の待ち」と「答えの順序」の番犬（#1922 / #1930）
 //!
 //! # なぜ要るか
 //!
@@ -26,6 +26,18 @@
 //!   送る（別スレッドから送ると「診断が数に載った = 知らせも処理済み」が崩れる）・
 //!   `wait_loading_known` は診断の数を見る・合図は `--loading-until`・組み込みの知らせの遅れは
 //!   `READY_POLL` より長い（待ちを抜けば**どの機でも必ず**落ちる）
+//!
+//! #1930 で同じ発想の残りを足した（真因と実測は `tests/common/lsp_fake_e2e.rs` の「答えの順序」）:
+//!
+//! - [`読み込みの終わりを実時間で決めていない`] を visual-test・セルフテスト（`crates/tako-app/src`）と
+//!   スクリプト（`scripts/*.sh`）にも広げる: `TAKO_LSP_FAKE_LOADING_MS` は 0 だけ、`loading` を
+//!   起こす関数 / コマンドは `TAKO_LSP_FAKE_LOADING_UNTIL`（合図のファイル）を渡す
+//! - [`答えの遅れを実時間で決めていない`] — 偽サーバは `delay_ms` を読まず、e2e・visual-test・
+//!   スクリプトも書かない（答えは `hold_until` = `AnswerGate` で、次の操作が済んでから返させる）
+//! - [`ログを数える前に区切る`] — 「送った」直後に偽サーバのログを数えて落ちた 1684 の e2e は、
+//!   ログ書き込みの遅れ（テストの待ちの周期より長い）を常に渡し、`stop_and_settle` の後に数える
+//! - [`空の答えの判定は_1_実装`] — 定義ジャンプ・補完・ホバーの空の答えの後は `wait_after_empty`
+//!   （`EmptyAnswer`）だけを通る。偽サーバの `--settle-on-empty` は空の前後で読み込みを終える
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -313,6 +325,7 @@ fn scan_fake(src: &str) -> Vec<String> {
     if !view.contains("\"--loading-until\"") {
         out.push(report(FAKE, 0, "`--loading-until` を読んでいない"));
     }
+    out.extend(scan_fake_answers(&view));
     out
 }
 
@@ -439,13 +452,7 @@ fn assert_named(label: &str, rel: &str, (from, to): (&str, &str), expect: &str) 
         "{label}: 注入の元の字面が {rel} に無い（ソースが変わった。注入を作り直す）: {from:?}"
     );
     let injected = src.replacen(from, to, 1);
-    let out = if rel == FAKE {
-        scan_fake(&injected)
-    } else if rel == COMMON {
-        scan_common(&injected)
-    } else {
-        scan_e2e(rel, &injected).0
-    };
+    let out = scan_one(rel, &injected);
     assert!(
         out.iter()
             .any(|o| o.starts_with(&format!("{rel}:")) && o.contains(expect)),
@@ -559,5 +566,561 @@ fn 逆戻りを名指しできる() {
             "\"--status-delay-ms\".to_string(), \"10\".to_string()",
         ),
         "READY_POLL",
+    );
+}
+
+// --- #1930: 答えの順序・visual-test / スクリプト・空の答えの判定 ---------------------------------
+
+const MANAGER: &str = "crates/tako-control/src/lsp/manager.rs";
+const GOTO_RS: &str = "crates/tako-control/src/lsp/goto.rs";
+const MENU_E2E: &str = "crates/tako-control/tests/issue1684_lsp_menu.rs";
+const APP_SRC: &str = "crates/tako-app/src";
+const SCRIPTS: &str = "scripts";
+
+/// LSP の e2e が状態を読み直す周期（各ファイルの `wait_until` の `sleep`）。ログ書き込みの遅れの
+/// 注入はこれより長くないと、「送った」直後に数える形でも速い機では通ってしまう
+const TEST_POLL_MS: u128 = 20;
+
+/// ファイル 1 つを、その種類の検査へ振り分ける（注入した中身を渡せる = [`assert_named`]）
+fn scan_one(rel: &str, src: &str) -> Vec<String> {
+    if rel == FAKE {
+        scan_fake(src)
+    } else if rel == COMMON {
+        let mut out = scan_common(src);
+        out.extend(scan_log_order(src, &read(MENU_E2E)));
+        out
+    } else if rel == MANAGER {
+        scan_empty_answer(src, &read(GOTO_RS))
+    } else if rel == GOTO_RS {
+        scan_empty_answer(&read(MANAGER), src)
+    } else if rel.ends_with(".sh") {
+        scan_script(rel, src).0
+    } else if rel.starts_with(APP_SRC) {
+        scan_self_test(rel, src).0
+    } else {
+        let mut out = scan_e2e(rel, src).0;
+        let view = code_view::without_comments_checked(src, rel);
+        out.extend(scan_answer_delay(rel, &view.lines().collect::<Vec<_>>()));
+        if rel == MENU_E2E {
+            out.extend(scan_log_order(&read(COMMON), src));
+        }
+        out
+    }
+}
+
+fn rel_of(path: &Path) -> String {
+    path.strip_prefix(workspace_root())
+        .expect("ワークスペースの中")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// 偽サーバを env で起こすファイル（visual-test・セルフテスト = `crates/tako-app/src`、スクリプト）
+fn fake_env_files() -> Vec<String> {
+    let root = workspace_root();
+    let mut out = Vec::new();
+    let mut stack = vec![root.join(APP_SRC)];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir:?} が読める: {e}"))
+        {
+            let path = entry.expect("ディレクトリの項目").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(rel_of(&path));
+            }
+        }
+    }
+    for entry in std::fs::read_dir(root.join(SCRIPTS)).expect("scripts が読める") {
+        let path = entry.expect("ディレクトリの項目").path();
+        if path.extension().is_some_and(|e| e == "sh") {
+            out.push(rel_of(&path));
+        }
+    }
+    out.retain(|rel| read(rel).contains("TAKO_LSP_FAKE"));
+    out.sort();
+    out
+}
+
+const WHY_DELAY: &str =
+    "偽サーバの答えの遅れを実時間（`delay_ms`）で決めている（遅い機では次の操作より先に \
+     答えが届く = #1930 の 4）。偽サーバは `delay_ms` を読まない。規則の `hold_until`（e2e は \
+     `AnswerGate`）で、次の操作が済んでから答えを返させる";
+
+/// 答えの遅れの字面（`"delay_ms"`）。`lines` はコメントを落とした行
+fn scan_answer_delay(rel: &str, lines: &[&str]) -> Vec<String> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("\"delay_ms\""))
+        .map(|(i, _)| report(rel, i + 1, WHY_DELAY))
+        .collect()
+}
+
+/// `at` 行を含む関数（字下げした入れ子・impl の中も）の窓。入れ子の関数を飛び越えて外側を探す。
+/// 関数の頭の判定は `source_scan::fn_head_name` の 1 実装（#1496）
+fn enclosing_any_fn(lines: &[&str], at: usize) -> Option<(usize, usize)> {
+    (0..=at)
+        .rev()
+        .filter(|&j| fn_head_name(lines[j]).is_some())
+        .find_map(|head| {
+            let indent = lines[head].len() - lines[head].trim_start().len();
+            let close = format!("{}}}", " ".repeat(indent));
+            let end = (head + 1..lines.len()).find(|&j| lines[j] == close)?;
+            (end >= at).then_some((head, end))
+        })
+}
+
+const WHY_LOADING_APP: &str =
+    "visual-test / セルフテスト / スクリプトが偽サーバの読み込みの長さを実時間で決めている \
+     （遅い機では操作より先に済む・速い機では待たされる = #1922 の 2 と同じ）。\
+     `TAKO_LSP_FAKE_LOADING_MS` は 0 にして `TAKO_LSP_FAKE_LOADING_UNTIL`（合図のファイル）を渡し、\
+     要求が偽サーバへ届いてから作る（終わらない読み込みは合図を作らない。#1930）";
+
+/// visual-test・セルフテスト（`crates/tako-app/src`）: 読み込みの長さと答えの遅れ。
+/// 見つけた `loading` の起動の数も返す（空振りの検査に使う）
+fn scan_self_test(rel: &str, src: &str) -> (Vec<String>, usize) {
+    let view = code_view::without_comments_checked(src, rel);
+    let lines: Vec<&str> = view.lines().collect();
+    let mut out = scan_answer_delay(rel, &lines);
+    let mut launches = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(rest) = line.split("set_var(\"TAKO_LSP_FAKE_LOADING_MS\", ").nth(1) {
+            if !rest.starts_with("\"0\"") {
+                out.push(report(rel, i + 1, WHY_LOADING_APP));
+            }
+        }
+        if line.contains("set_var(\"TAKO_LSP_FAKE_SCENARIO\", \"loading\")") {
+            launches += 1;
+            let gated = enclosing_any_fn(&lines, i).is_some_and(|(from, to)| {
+                (from..=to).any(|j| lines[j].contains("set_var(\"TAKO_LSP_FAKE_LOADING_UNTIL\""))
+            });
+            if !gated {
+                out.push(report(rel, i + 1, WHY_LOADING_APP));
+            }
+        }
+    }
+    (out, launches)
+}
+
+/// スクリプト: 継続行（末尾の `\`）を 1 つのコマンドへつないで、読み込みの長さと答えの遅れを見る。
+/// 見つけた `loading` の起動の数も返す
+fn scan_script(rel: &str, src: &str) -> (Vec<String>, usize) {
+    let lines: Vec<&str> = src
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with('#') {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect();
+    let mut out = scan_answer_delay(rel, &lines);
+    let mut launches = 0;
+    let (mut command, mut head) = (String::new(), 0);
+    for (i, line) in lines.iter().enumerate() {
+        if command.is_empty() {
+            head = i;
+        }
+        let (body, continued) = match line.strip_suffix('\\') {
+            Some(body) => (body, true),
+            None => (*line, false),
+        };
+        command.push_str(body);
+        command.push(' ');
+        if continued {
+            continue;
+        }
+        let real_time = command.split_whitespace().any(|word| {
+            word.strip_prefix("TAKO_LSP_FAKE_LOADING_MS=")
+                .is_some_and(|v| v.trim_matches(|c| c == '"' || c == '\'') != "0")
+        });
+        let launches_loading = command.contains("TAKO_LSP_FAKE_SCENARIO=loading");
+        launches += usize::from(launches_loading);
+        if real_time || (launches_loading && !command.contains("TAKO_LSP_FAKE_LOADING_UNTIL=")) {
+            out.push(report(rel, head + 1, WHY_LOADING_APP));
+        }
+        command.clear();
+    }
+    (out, launches)
+}
+
+/// 偽サーバの答え・空の答えの口（#1930）
+fn scan_fake_answers(view: &str) -> Vec<String> {
+    let lines: Vec<&str> = view.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("[\"delay_ms\"]") {
+            out.push(report(FAKE, i + 1, WHY_DELAY));
+        }
+    }
+    // 前半の空の答えは 3 つ（定義ジャンプ・補完・ホバー）とも 1 実装を通り、`before` は送る前に、
+    // `after` は送った後に読み込みを終える
+    let calls = lines
+        .iter()
+        .filter(|l| l.contains("early_empty(id,"))
+        .count();
+    if calls != 3 {
+        out.push(report(
+            FAKE,
+            0,
+            &format!(
+                "前半の空の答えが `early_empty` を通っていない（呼び出し {calls} 箇所 / 3 = 定義ジャンプ・\
+                 補完・ホバー）。`--settle-on-empty` / `--empty-delay-ms` が効かない口がある（#1930 の 6）"
+            ),
+        ));
+    }
+    match lines.iter().position(|l| l.contains("let early_empty =")) {
+        None => out.push(report(
+            FAKE,
+            0,
+            "`early_empty` が見つからない（#1930 の 6）",
+        )),
+        Some(at) => {
+            let indent = lines[at].len() - lines[at].trim_start().len();
+            let close = format!("{}}};", " ".repeat(indent));
+            let end = (at..lines.len()).find(|&j| lines[j] == close).unwrap_or(at);
+            let find = |needle: &str| (at..=end).find(|&j| lines[j].contains(needle));
+            let ordered = match (
+                find("if settle_before"),
+                find("out.send("),
+                find("if settle_after"),
+            ) {
+                (Some(b), Some(send), Some(a)) => b < send && send < a,
+                _ => false,
+            };
+            if !ordered {
+                out.push(report(
+                    FAKE,
+                    at + 1,
+                    "`--settle-on-empty` が空の答えの前（before）/ 後（after）で読み込みを終えていない \
+                     （古い空を決定的に起こす注入が意味を失う = #1930 の 6）",
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// 空の答えの判定（#1930 の 6）: `wait_loaded` は `wait_after_empty` の中だけ、`wait_after_empty`
+/// は定義ジャンプ・補完・ホバーの 3 つから、3 つとも送る直前に `empty.sent(` で記録する。
+/// `EmptyAnswer::decide` は A/B（`legacy_1930`）と 1 回だけの印を見る
+fn scan_empty_answer(manager_src: &str, goto_src: &str) -> Vec<String> {
+    let view = code_view::without_comments_checked(manager_src, MANAGER);
+    let lines: Vec<&str> = view.lines().collect();
+    let mut out = Vec::new();
+    let name_at = |i: usize| {
+        enclosing_any_fn(&lines, i)
+            .and_then(|(head, _)| fn_head_name(lines[head]).map(str::to_string))
+    };
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("self.wait_loaded(") && name_at(i).as_deref() != Some("wait_after_empty") {
+            out.push(report(
+                MANAGER,
+                i + 1,
+                "空の答えの後の待ちを `wait_after_empty` を通さずに呼んでいる（読み込み中に返った古い空を \
+                 1 回だけ問い直す判定 `EmptyAnswer` を通らない = #1930 の 6）",
+            ));
+        }
+    }
+    let mut callers: Vec<(String, usize)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("self.wait_after_empty("))
+        .map(|(i, _)| (name_at(i).unwrap_or_default(), i))
+        .collect();
+    callers.sort();
+    let names: Vec<&str> = callers.iter().map(|(n, _)| n.as_str()).collect();
+    if names != ["completion", "goto", "hover"] {
+        out.push(report(
+            MANAGER,
+            0,
+            &format!(
+                "`wait_after_empty` の呼び手が定義ジャンプ・補完・ホバーの 3 つと一致しない（{names:?}。\
+                 #1930 の 6）"
+            ),
+        ));
+    }
+    for (name, i) in &callers {
+        let recorded = enclosing_any_fn(&lines, *i)
+            .is_some_and(|(from, to)| (from..=to).any(|j| lines[j].contains("empty.sent(")));
+        if !recorded {
+            out.push(report(
+                MANAGER,
+                i + 1,
+                &format!(
+                    "`{name}` が要求を送る直前に `empty.sent(` で読み込み中を記録していない（古い空と \
+                     本当の空を見分けられない = #1930 の 6）"
+                ),
+            ));
+        }
+    }
+    let goto_view = code_view::without_comments_checked(goto_src, GOTO_RS);
+    match fn_window(&goto_view, "pub fn decide(") {
+        Some((at, body)) if !(body.contains("legacy_1930()") && body.contains("requeried")) => {
+            out.push(report(
+                GOTO_RS,
+                at,
+                "`EmptyAnswer::decide` が A/B（`legacy_1930`）か 1 回だけの印（`requeried`）を見ていない \
+                 （#1930 の 6）",
+            ))
+        }
+        Some(_) => {}
+        None => out.push(report(GOTO_RS, 0, "`EmptyAnswer::decide` が見つからない（#1930 の 6）")),
+    }
+    out
+}
+
+/// 最初の数字の字面（`"50"` → 50）
+fn first_number(body: &str) -> Option<u128> {
+    body.split('"')
+        .filter_map(|piece| piece.parse().ok())
+        .next()
+}
+
+/// 「送った」と「届いた」の区切り（#1930 の 5）: 1684 の編集中の e2e はログ書き込みの遅れを渡し、
+/// 止めた後に数える。共通部品の遅れはテストの待ちの周期より長く、区切りは shutdown を待つ
+fn scan_log_order(common_src: &str, menu_src: &str) -> Vec<String> {
+    let view = code_view::without_comments_checked(common_src, COMMON);
+    let mut out = Vec::new();
+    match fn_window(&view, "pub fn log_delay_args(") {
+        Some((at, body)) => {
+            let ms = first_number(&body);
+            if ms.is_none_or(|ms| ms <= TEST_POLL_MS) {
+                out.push(report(
+                    COMMON,
+                    at,
+                    &format!(
+                        "ログ書き込みの遅れ（{ms:?} ms）がテストの待ちの周期（{TEST_POLL_MS} ms）以下。\
+                         「送った」直後に数えても速い機では通ってしまう（#1930 の 5）"
+                    ),
+                ));
+            }
+        }
+        None => out.push(report(
+            COMMON,
+            0,
+            "`log_delay_args` が見つからない（#1930 の 5）",
+        )),
+    }
+    match fn_window(&view, "pub fn stop_and_settle(") {
+        Some((at, body)) if !(body.contains("shutdown_all(") && body.contains("\"shutdown\"")) => {
+            out.push(report(
+                COMMON,
+                at,
+                "`stop_and_settle` が shutdown の届いたのを待っていない（区切りにならない = #1930 の 5）",
+            ))
+        }
+        Some(_) => {}
+        None => out.push(report(COMMON, 0, "`stop_and_settle` が見つからない（#1930 の 5）")),
+    }
+    match fn_window(&view, "pub fn settle_before_empty_args(") {
+        Some((at, body)) if !body.contains("\"before\"") => out.push(report(
+            COMMON,
+            at,
+            "`settle_before_empty_args` が空の答えの前に読み込みを終えさせていない（#1930 の 6）",
+        )),
+        Some(_) => {}
+        None => out.push(report(
+            COMMON,
+            0,
+            "`settle_before_empty_args` が見つからない",
+        )),
+    }
+    let menu = code_view::without_comments_checked(menu_src, MENU_E2E);
+    match fn_window(&menu, "fn 編集中の文書は握手が済めば待たずに読める(") {
+        Some((at, body))
+            if !(body.contains("lsp_fake_e2e::log_delay_args()")
+                && body.contains("lsp_fake_e2e::stop_and_settle(")) =>
+        {
+            out.push(report(
+                MENU_E2E,
+                at,
+                "握手の後の didOpen を数える e2e が、ログ書き込みの遅れ（`log_delay_args`）を渡して \
+                 止めた後（`stop_and_settle`）に数えていない（Windows の CI で落ちた順序 = #1930 の 5）",
+            ))
+        }
+        Some(_) => {}
+        None => out.push(report(MENU_E2E, 0, "1684 の編集中の e2e が見つからない（#1930 の 5）")),
+    }
+    out
+}
+
+/// #1930 の検査をすべて走らせる（見つけた `loading` の起動の数 = 空振りの検査も返す）
+fn scan_1930() -> (Vec<String>, usize, usize) {
+    let mut out = Vec::new();
+    let (mut app_launches, mut script_launches) = (0, 0);
+    for rel in e2e_files() {
+        let view = code_view::without_comments_checked(&read(&rel), &rel);
+        let lines: Vec<&str> = view.lines().collect();
+        out.extend(scan_answer_delay(&rel, &lines));
+    }
+    for rel in fake_env_files() {
+        if rel.ends_with(".sh") {
+            let (found, n) = scan_script(&rel, &read(&rel));
+            out.extend(found);
+            script_launches += n;
+        } else {
+            let (found, n) = scan_self_test(&rel, &read(&rel));
+            out.extend(found);
+            app_launches += n;
+        }
+    }
+    let fake = code_view::without_comments_checked(&read(FAKE), FAKE);
+    out.extend(scan_fake_answers(&fake));
+    out.extend(scan_empty_answer(&read(MANAGER), &read(GOTO_RS)));
+    out.extend(scan_log_order(&read(COMMON), &read(MENU_E2E)));
+    (out, app_launches, script_launches)
+}
+
+#[test]
+fn visual_test_とスクリプトの読み込みも合図で終わる() {
+    let (out, _, _) = scan_1930();
+    let loading: Vec<&String> = out.iter().filter(|o| o.contains("#1922 の 2")).collect();
+    assert!(loading.is_empty(), "\n{}", join(&loading));
+}
+
+#[test]
+fn 答えの遅れを実時間で決めていない() {
+    let (out, _, _) = scan_1930();
+    let delay: Vec<&String> = out.iter().filter(|o| o.contains("#1930 の 4")).collect();
+    assert!(delay.is_empty(), "\n{}", join(&delay));
+}
+
+#[test]
+fn ログを数える前に区切る() {
+    let (out, _, _) = scan_1930();
+    let order: Vec<&String> = out.iter().filter(|o| o.contains("#1930 の 5")).collect();
+    assert!(order.is_empty(), "\n{}", join(&order));
+}
+
+#[test]
+fn 空の答えの判定は_1_実装() {
+    let (out, _, _) = scan_1930();
+    let stale: Vec<&String> = out.iter().filter(|o| o.contains("#1930 の 6")).collect();
+    assert!(stale.is_empty(), "\n{}", join(&stale));
+}
+
+/// #1930 の走査も空振りしていない（読み先の取り違えで何も見ない番犬にならない）
+#[test]
+fn 答えの順序の走査が空振りしていない() {
+    let files = fake_env_files();
+    for needed in [
+        "crates/tako-app/src/main.rs",
+        "crates/tako-app/src/self_test/hover_1893.rs",
+        "scripts/test-lsp-followup-1869.sh",
+        "scripts/test-lsp-hover-1893.sh",
+        "scripts/test-lsp-format-1683.sh",
+    ] {
+        assert!(
+            files.iter().any(|f| f == needed),
+            "{needed} を走査していない: {files:?}"
+        );
+    }
+    let (_, app_launches, script_launches) = scan_1930();
+    // completion-loading / completion-cancel / hover-loading
+    assert!(
+        app_launches >= 3,
+        "visual-test の `loading` を拾えていない: {app_launches}"
+    );
+    // 1869 の ④（2 回）・1893 の終わらない読み込み
+    assert!(
+        script_launches >= 3,
+        "スクリプトの `loading` を拾えていない: {script_launches}"
+    );
+}
+
+#[test]
+fn 答えの順序の逆戻りを名指しできる() {
+    let e2e_1682 = "crates/tako-control/tests/issue1682_lsp_completion.rs";
+    let main_rs = "crates/tako-app/src/main.rs";
+    let script_1869 = "scripts/test-lsp-followup-1869.sh";
+    // K. 補完の e2e が答えの遅れを実時間へ戻す
+    assert_named(
+        "K 1682 の delay_ms",
+        e2e_1682,
+        (
+            "        \"hold_until\": answers.path(),\n",
+            "        \"delay_ms\": 1500,\n",
+        ),
+        "#1930 の 4",
+    );
+    // L. 偽サーバが `delay_ms` を読み直す
+    assert_named(
+        "L 偽サーバの delay_ms",
+        FAKE,
+        (
+            "                let hold = hold_path(&completion[\"hold_until\"], completion_seq);\n",
+            "                let _ = completion[\"delay_ms\"].as_u64();\n                let hold = hold_path(&completion[\"hold_until\"], completion_seq);\n",
+        ),
+        "#1930 の 4",
+    );
+    // M. visual-test が読み込みの長さを実時間へ戻す（合図も外す）
+    assert_named(
+        "M completion-loading の実時間",
+        main_rs,
+        (
+            "        std::env::set_var(\"TAKO_LSP_FAKE_LOADING_MS\", \"0\");\n        std::env::set_var(\"TAKO_LSP_FAKE_LOADING_UNTIL\", &gate);\n",
+            "        std::env::set_var(\"TAKO_LSP_FAKE_LOADING_MS\", \"6000\");\n",
+        ),
+        "#1922 の 2",
+    );
+    // N. スクリプトが読み込みの長さを実時間へ戻す
+    assert_named(
+        "N 1869 のスクリプトの実時間",
+        script_1869,
+        (
+            "TAKO_LSP_FAKE_LOADING_MS=0 TAKO_LSP_FAKE_LOADING_UNTIL=\"$GATE_CLI\"",
+            "TAKO_LSP_FAKE_LOADING_MS=3000",
+        ),
+        "#1922 の 2",
+    );
+    // O. 補完が空の答えの後に `wait_loaded` を直に呼ぶ（古い空の判定を通らない）
+    assert_named(
+        "O 補完が判定を素通り",
+        MANAGER,
+        (
+            "match self.wait_after_empty(&key, deadline, &abandoned, &mut empty) {",
+            "match self.wait_loaded(&key, deadline, &abandoned) {",
+        ),
+        "#1930 の 6",
+    );
+    // P. 判定が A/B を見ない
+    assert_named(
+        "P decide が legacy を見ない",
+        GOTO_RS,
+        (" && !legacy_1930()", ""),
+        "#1930 の 6",
+    );
+    // Q. ログ書き込みの遅れをテストの待ちの周期以下へ縮める
+    assert_named(
+        "Q ログの遅れが短い",
+        COMMON,
+        (
+            "\"--log-delay-ms\".to_string(), \"50\".to_string()",
+            "\"--log-delay-ms\".to_string(), \"10\".to_string()",
+        ),
+        "#1930 の 5",
+    );
+    // R. 1684 の編集中の e2e がログの遅れを外す
+    assert_named(
+        "R 1684 のログの遅れなし",
+        MENU_E2E,
+        (
+            "        lsp_fake_e2e::log_delay_args(),\n",
+            "        Vec::new(),\n",
+        ),
+        "#1930 の 5",
+    );
+    // S. 偽サーバの `before` が空を送った後に読み込みを終える（順序が意味を失う）
+    assert_named(
+        "S settle の順序",
+        FAKE,
+        (
+            "        if settle_before {\n            finish_loading(&out, &loaded);\n        }\n        out.send(",
+            "        out.send(",
+        ),
+        "#1930 の 6",
     );
 }
