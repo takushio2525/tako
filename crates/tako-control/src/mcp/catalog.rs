@@ -917,7 +917,9 @@ pub fn tools() -> Vec<Value> {
             "description": "直接ペイン（tmux バックエンドを使わないペイン）のスクロールバック保持上限を確認・変更する。\
                 lines 省略時は現在値と既定・下限・上限・適用中のペイン数を返す。変更値は settings.json に永続化し、\
                 生存中のペインへもその場で適用する（下げれば履歴が切り詰められて RAM が戻る）。\
-                飽和時のフットプリントは 行 × 桁 × 24 バイトに比例するので、軽量運用では下げる。",
+                飽和時のフットプリントは 行 × 桁 × 24 バイトに比例するので、軽量運用では下げる。\
+                unfocused_fps はフォーカスの無いペインの出力による再描画の上限（フォーカス中は常に 60）。\
+                応答の unfocused_redraw に現在値と累計の再描画回数（flushes）が載る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -926,6 +928,12 @@ pub fn tools() -> Vec<Value> {
                         "minimum": 100,
                         "maximum": 100000,
                         "description": "保持行数（既定 10000）"
+                    },
+                    "unfocused_fps": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60,
+                        "description": "再描画の上限 fps（既定 30）"
                     },
                 },
                 "additionalProperties": false,

@@ -487,7 +487,13 @@ impl SettingsWindow {
                 Err(_) => self.message = Some((txt::error_number().to_string(), true)),
             },
             EditField::ScrollbackLines => match value.parse::<usize>() {
-                Ok(lines) => self.run(Request::Scrollback { lines: Some(lines) }, cx),
+                Ok(lines) => self.run(
+                    Request::Scrollback {
+                        lines: Some(lines),
+                        unfocused_fps: None,
+                    },
+                    cx,
+                ),
                 Err(_) => self.message = Some((txt::error_number().to_string(), true)),
             },
             EditField::PaneLogMaxMb => match value.parse::<u64>() {
@@ -675,6 +681,7 @@ impl SettingsWindow {
             },
             Request::Scrollback {
                 lines: Some(s.resolved_scrollback_lines()),
+                unfocused_fps: None,
             },
             Request::LimitService {
                 action: Some("set".into()),

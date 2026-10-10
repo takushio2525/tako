@@ -4700,11 +4700,24 @@ fn dispatch_inner(
                 "entries": stats.entries,
             }))
         }
-        Request::Scrollback { lines } => {
+        Request::Scrollback {
+            lines,
+            unfocused_fps,
+        } => {
+            // 両方を検証してから当てる（片方だけ範囲外のとき、もう片方だけ効いた状態を作らない）
+            let lines = lines
+                .map(tako_core::scrollback::validate_lines)
+                .transpose()
+                .map_err(DispatchError::InvalidParams)?;
+            let unfocused_fps = unfocused_fps
+                .map(tako_core::redraw_limit::validate_fps)
+                .transpose()
+                .map_err(DispatchError::InvalidParams)?;
             if let Some(lines) = lines {
-                let lines = tako_core::scrollback::validate_lines(lines)
-                    .map_err(DispatchError::InvalidParams)?;
                 host.set_scrollback_lines(lines);
+            }
+            if let Some(fps) = unfocused_fps {
+                host.set_unfocused_redraw_fps(fps);
             }
             let status = host.scrollback_status();
             let mut out = json!({
@@ -4722,6 +4735,7 @@ fn dispatch_inner(
                     status.max_cols
                 ));
             }
+            out["unfocused_redraw"] = redraw_limit_json(&host.redraw_limit_status());
             Ok(out)
         }
         Request::PreviewEdit { pane, enabled } => {
@@ -17271,6 +17285,26 @@ fn pinned_json(host: &dyn ControlHost) -> Value {
 }
 
 /// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
+/// フォーカスの無いペインの再描画の上限の応答（#1979。`tako redraw-limit` / MCP
+/// `tako_scrollback` の `unfocused_redraw`）。`flushes` は起動からの累計の再描画回数で、
+/// 2 回読んだ差を経過時間で割ると実際の fps になる（上限が効いているかを外から確かめる口）
+fn redraw_limit_json(status: &tako_core::redraw_limit::RedrawLimitStatus) -> Value {
+    use tako_core::redraw_limit as rl;
+    json!({
+        "fps": status.unfocused_fps,
+        "default_fps": rl::DEFAULT_UNFOCUSED_FPS,
+        "min_fps": rl::MIN_UNFOCUSED_FPS,
+        "max_fps": rl::MAX_UNFOCUSED_FPS,
+        "focused_fps": rl::FOCUSED_FPS,
+        "flushes": {
+            "focused": status.focused_flushes,
+            "unfocused": status.unfocused_flushes,
+        },
+        "body_renders": status.body_renders,
+        "legacy": status.legacy,
+    })
+}
+
 fn title_source_str(source: tako_core::TitleSource) -> &'static str {
     source.as_str()
 }
@@ -19281,6 +19315,8 @@ mod tests {
         preview_cache: tako_core::PreviewCacheStats,
         /// #818: スクロールバック上限（適用先のペインは `scrollback_applied` が数える）
         scrollback: tako_core::scrollback::ScrollbackStatus,
+        /// #1979: フォーカスの無いペインの再描画の上限
+        redraw_limit: tako_core::redraw_limit::RedrawLimitStatus,
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
         /// #1442: UI 層へ依頼した窓の位置・寸法（window ID, 矩形）
@@ -19420,6 +19456,7 @@ mod tests {
                     panes: 2,
                     max_cols: 119,
                 },
+                redraw_limit: tako_core::redraw_limit::RedrawLimitStatus::default(),
                 window_state_ops: Vec::new(),
                 window_geometry_ops: Vec::new(),
                 window_frames: std::collections::HashMap::new(),
@@ -19507,6 +19544,12 @@ mod tests {
         }
         fn set_scrollback_lines(&mut self, lines: usize) {
             self.scrollback.lines = tako_core::scrollback::clamp_lines(lines);
+        }
+        fn redraw_limit_status(&self) -> tako_core::redraw_limit::RedrawLimitStatus {
+            self.redraw_limit
+        }
+        fn set_unfocused_redraw_fps(&mut self, fps: u32) {
+            self.redraw_limit.unfocused_fps = tako_core::redraw_limit::clamp_fps(fps);
         }
         fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
             self.sessions.get(&pane.as_u64())
@@ -24660,7 +24703,10 @@ mod tests {
         let mut host = MockHost::new();
         let initial = dispatch(
             &mut host,
-            Request::Scrollback { lines: None },
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None,
+            },
             PaneOrigin::Cli,
         )
         .unwrap();
@@ -24675,7 +24721,10 @@ mod tests {
 
         let changed = dispatch(
             &mut host,
-            Request::Scrollback { lines: Some(1_000) },
+            Request::Scrollback {
+                lines: Some(1_000),
+                unfocused_fps: None,
+            },
             PaneOrigin::Mcp,
         )
         .unwrap();
@@ -24686,7 +24735,10 @@ mod tests {
         for bad in [0_usize, 99, 1_000_000] {
             let error = dispatch(
                 &mut host,
-                Request::Scrollback { lines: Some(bad) },
+                Request::Scrollback {
+                    lines: Some(bad),
+                    unfocused_fps: None,
+                },
                 PaneOrigin::Cli,
             )
             .unwrap_err();
@@ -24696,6 +24748,72 @@ mod tests {
             );
         }
         assert_eq!(host.scrollback.lines, 1_000, "弾いた値で書き換えていない");
+    }
+
+    /// #1979: 同じ口（CLI `tako redraw-limit` / MCP `tako_scrollback` の `unfocused_fps`）で
+    /// フォーカスの無いペインの再描画の上限を読み書きでき、範囲外は理由つきで弾く。
+    /// 片方だけ範囲外のとき、もう片方だけ効いた状態を作らない
+    #[test]
+    fn scrollbackの口でフォーカスの無いペインの再描画の上限を読み書きできる() {
+        let mut host = MockHost::new();
+        let status = dispatch(
+            &mut host,
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let redraw = &status["unfocused_redraw"];
+        assert_eq!(redraw["fps"], 30);
+        assert_eq!(redraw["default_fps"], 30);
+        assert_eq!(redraw["min_fps"], 1);
+        assert_eq!(redraw["max_fps"], 60);
+        assert_eq!(redraw["focused_fps"], 60);
+        assert_eq!(redraw["flushes"]["unfocused"], 0);
+        assert_eq!(redraw["legacy"], false);
+
+        let changed = dispatch(
+            &mut host,
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: Some(12),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(changed["unfocused_redraw"]["fps"], 12);
+        assert_eq!(
+            changed["lines"],
+            tako_core::scrollback::DEFAULT_LINES,
+            "スクロールバックには触らない"
+        );
+
+        for bad in [0_u32, 61, u32::MAX] {
+            let error = dispatch(
+                &mut host,
+                Request::Scrollback {
+                    lines: Some(1_000),
+                    unfocused_fps: Some(bad),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap_err();
+            let DispatchError::InvalidParams(message) = error else {
+                panic!("{bad} が InvalidParams で弾かれていない");
+            };
+            assert!(message.contains("1〜60"), "範囲を言う: {message}");
+        }
+        assert_eq!(
+            host.redraw_limit.unfocused_fps, 12,
+            "弾いた値で書き換えていない"
+        );
+        assert_eq!(
+            host.scrollback.lines,
+            tako_core::scrollback::DEFAULT_LINES,
+            "fps が範囲外のとき lines だけ効いた状態を作らない"
+        );
     }
 
     #[test]

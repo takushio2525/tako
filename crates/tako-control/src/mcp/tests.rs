@@ -1257,13 +1257,28 @@ mod tests {
     #[test]
     fn scrollbackは状態取得と上限変更をrequestへ写す() {
         let (_, requests) = run(call("tako_scrollback", json!({})), None, true);
-        assert_eq!(requests, vec![Request::Scrollback { lines: None }]);
+        assert_eq!(requests, vec![Request::Scrollback { lines: None, unfocused_fps: None }]);
 
         let (_, requests) = run(call("tako_scrollback", json!({ "lines": 2000 })), None, true);
         assert_eq!(
             requests,
             vec![Request::Scrollback {
-                lines: Some(2_000)
+                lines: Some(2_000),
+                unfocused_fps: None,
+            }]
+        );
+
+        // #1979: フォーカスの無いペインの再描画の上限も同じツールの引数（ツールは増やさない）
+        let (_, requests) = run(
+            call("tako_scrollback", json!({ "unfocused_fps": 20 })),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Scrollback {
+                lines: None,
+                unfocused_fps: Some(20),
             }]
         );
     }

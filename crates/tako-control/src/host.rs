@@ -53,6 +53,12 @@ pub trait SessionHost {
     /// 保持上限を変更する（Issue #818）。生存中のペインへも適用し、
     /// settings.json へ永続化するのは実装側（GUI）の責務
     fn set_scrollback_lines(&mut self, _lines: usize) {}
+    /// フォーカスの無いペインの再描画の上限の現在状態（#1979）
+    fn redraw_limit_status(&self) -> tako_core::redraw_limit::RedrawLimitStatus {
+        tako_core::redraw_limit::RedrawLimitStatus::default()
+    }
+    /// フォーカスの無いペインの再描画の上限を変える（#1979。値は検証済み・永続化は実装側）
+    fn set_unfocused_redraw_fps(&mut self, _fps: u32) {}
     /// バックグラウンドから復帰させたペインのセッションを再接続する（FR-2.15.3）。
     /// セッション自体はバックグラウンド送り時に破棄していないため、UI 層で再描画するだけでよい場合が多い
     fn reattach_backgrounded(&mut self, _pane: PaneId) {}

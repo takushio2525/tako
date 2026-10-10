@@ -60,6 +60,7 @@ pub mod prompt_append;
 pub mod prompt_delivery;
 pub mod pty_loop;
 pub mod recent;
+pub mod redraw_limit;
 pub mod remote_fs;
 pub mod remote_open;
 pub mod remote_shortcuts;
