@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1915: CI の rust-cache のキーにルートの Cargo.toml の指紋を混ぜた）
-- rust-cache v2.9.2 はメンバーの Cargo.toml と Cargo.lock だけをキーに混ぜ、ルートの仮想マニフェストは入らない（ログの「Lockfiles considered」でも無い）。`scripts/lib/cargo-root-manifest-key.sh`（[workspace.package] の version・行全体のコメント・空行・CRLF を除いた 8 桁）を ci.yml の macOS / Windows と release-windows.yml の `key` へ渡す。規約は conventions.md「CI のビルドキャッシュのキー」
-- 実測: テスト 27 PASS（注入 8 通りを名指し・本物を正当に変えた 4 通りで偽の赤なし）・actionlint 0 件。CI ログのキー比較は PR のコメント
-
 ## 2026-10-09（#1908: ファイルツリーの ↑↓ / ←→ / Enter / ⇧⌘↑↓（Win は Shift+Ctrl+Home / End）・選択の CLI / MCP・残り時間の数え下ろし）
 - 正本 `tree_select::on_key`（`RowShape` → `KeyOutcome`）を画面のキー（#1895 の ⇧↑↓ も）と CLI `tako tree selection [<path>] [--key K]` / MCP `tako_tree_folder` の `selection` が dispatch `TreeSelection` で通る（カタログ +412 B）。`eta` は最後にバイトが進んだ時点までの平均で数え下ろし、止まったら旧式の伸び方へ連続につなぐ。Shift+Delete は CLI / MCP に完全削除の口が無いので扱わない（FR-3.40 ③）
 - 実測: 単体の合成（1 MiB / 300 ms・150 ms ごと）で逆戻り合計 5.87 → 0 秒・表記の戻り 3 → 0 回、実 GUI の `eta_secs` は戻り 6 → 0 回（57 回読み）。visual-test `tree-keys` 緑・`TAKO_1908_LEGACY=1` で ① が名指しで FAILED・番犬 10 本（注入 11 通り）
@@ -64,3 +60,7 @@
 ## 2026-10-09（#1968: master の監視が UI スレッドで子プロセスを待つ・tako の子プロセスが本体の 4〜6 倍の CPU・target を Spotlight が索引）
 - 真因（本番の `sample` / perf.log / `proc_pid_rusage` + 同じ構成の隔離 GUI のシンボル付き A/B）: Report が丸ごと同期・status の準備部が `has_running_children`（tmux + ps）・照会ごとに ps 2〜3 本とレジストリ 200 KB の解釈・PATH の痩せた `.app` で 2 秒ごとにログインシェル・UI ストールの誤分類。`OffloadJob::Report`・`probe_running_children`・`agents::with_shared_scan`・レジストリの中身一致の使い回し・`which_claude` の覚え・`recent_spans_within`。A/B `TAKO_1968_LEGACY=1`・番犬 `issue1968_ui_thread_subprocess_watchdog`。`scripts/spotlight-noindex.sh`（target → `target.noindex` のリンク）
 - 実測（1 時間・左右同時）: 本体 CPU 6.69 → 3.88%・子プロセス 39.2 → 18.9%・ログインシェル 23 → 0 本/分・UI ストール 5 → 0・UI 専有 計 438 秒 → 0.25 秒・`list` p95 106 → 55ms・メモリは両方増えない。本番の「554 MB」は描画面の計上の出入り（151 MB）が主。描画ありの CPU 14% は出力の描画（37 fps）で差なし
+
+## 2026-10-09（#1949: `.ino`（Arduino のスケッチ）を C++ の構文で塗る・```ino / ```arduino・ツリーのアイコン）
+- `preview.rs` の `extension_alias` / `fence_alias`（純関数。#1948 で `file_type` へ移る）+ `file_icons.rs`。A/B `TAKO_1949_LEGACY=1`・visual-test `ino-highlight`（`scripts/test-ino-highlight-1949.sh` が新旧を別の dir へ書き出す）
+- 実測: 9 色・同じ中身の `.cpp` と span が完全一致・開いたまま 31.7 秒で構文セットを手放す（猶予 30 秒）・閉じて 1.8 秒・ヒープ `.ino` +30.35 / 解放 −28.58 / `.cpp` +28.90 MB（構文は増えない）・旧は ① で名指しの FAILED

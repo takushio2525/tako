@@ -1945,6 +1945,38 @@ pub(crate) fn full_highlight_forced() -> bool {
     *ON.get_or_init(|| std::env::var_os("TAKO_1648_FULL_HIGHLIGHT").is_some())
 }
 
+/// `.ino`（Arduino のスケッチ）を C++ の構文で塗るのをやめ、#1949 以前の Plain Text へ戻す
+/// 逃げ道（`TAKO_1949_LEGACY=1`）。同じバイナリで A/B するためのもの（#815 / #1648 と同じ流儀）
+pub(crate) fn ino_highlight_legacy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TAKO_1949_LEGACY").is_ok_and(|v| v == "1"))
+}
+
+/// 構文セットに定義が無い拡張子（小文字）を、塗れる構文の拡張子へ寄せる。`legacy_1949` は A/B。
+///
+/// `.ino` は C++ として塗る（#1949）。two-face に Arduino の構文は無く、VS Code 同梱の
+/// cpp 言語定義も `.ino` を C++ に含める。寄せるのは**色だけ**で、言語サーバは別
+/// （clangd へ `.ino` を渡すと正しいスケッチに嘘のエラーが出る = #1951）。
+/// この表は #1948 で言語の同定の正本（`file_type`）へ移る
+fn extension_alias(ext: &str, legacy_1949: bool) -> Option<&'static str> {
+    Some(match ext {
+        "jsx" => "js",
+        "mjs" | "cjs" => "js",
+        "mts" | "cts" => "ts",
+        "ino" if !legacy_1949 => "cpp",
+        _ => return None,
+    })
+}
+
+/// Markdown のコードブロックの言語トークン（```` ```ino ````）のうち、構文セットが知らない
+/// 名前を塗れる構文のトークンへ寄せる（大文字小文字は問わない）。Arduino は C++（#1949）
+fn fence_alias(token: &str, legacy_1949: bool) -> Option<&'static str> {
+    let arduino = ["ino", "arduino"]
+        .iter()
+        .any(|alias| token.eq_ignore_ascii_case(alias));
+    (arduino && !legacy_1949).then_some("cpp")
+}
+
 /// 行の開始バイト（[`syntect::util::LinesWithEndings`] と同じ切り方）
 fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = Vec::new();
@@ -2078,12 +2110,7 @@ impl SyntectHighlighter {
         &'a self,
         ext: &str,
     ) -> Option<&'a syntect::parsing::SyntaxReference> {
-        let mapped = match ext {
-            "jsx" => "js",
-            "mjs" | "cjs" => "js",
-            "mts" | "cts" => "ts",
-            _ => return None,
-        };
+        let mapped = extension_alias(ext, ino_highlight_legacy())?;
         self.syntaxes.find_syntax_by_extension(mapped)
     }
 
@@ -2379,6 +2406,10 @@ impl Highlighter for SyntectHighlighter {
         let syntax = self
             .syntaxes
             .find_syntax_by_token(lang)
+            .or_else(|| {
+                fence_alias(lang, ino_highlight_legacy())
+                    .and_then(|token| self.syntaxes.find_syntax_by_token(token))
+            })
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
         self.run(syntax, text)
     }
@@ -4360,6 +4391,11 @@ mod tests {
                 "sample.cpp",
                 "#include <iostream>\nint main() { return 0; }\n",
             ),
+            // #1949: Arduino のスケッチ（C++ として塗る）
+            (
+                "sample.ino",
+                "void setup() {\n  pinMode(LED_BUILTIN, OUTPUT);\n}\n",
+            ),
             ("sample.js", "const answer = () => 42;\n"),
             ("sample.ts", "const answer: number = 42;\n"),
             (
@@ -5092,6 +5128,58 @@ mod syntax_resolution_tests {
         assert_syntax("test.swift", "Swift");
         assert_syntax("test.kt", "Kotlin");
         assert_syntax("test.java", "Java");
+    }
+
+    /// #1949: Arduino のスケッチは C++ で塗る（大文字の拡張子でも）
+    #[test]
+    fn arduinoのスケッチはcppで塗る() {
+        assert_syntax("sketch.ino", "C++");
+        assert_syntax("Sketch.INO", "C++");
+    }
+
+    /// #1949: 寄せ先は A/B（`TAKO_1949_LEGACY=1`）で `.ino` だけが外れ、他の行は変わらない
+    #[test]
+    fn inoの寄せ先はabで外れる() {
+        assert_eq!(extension_alias("ino", false), Some("cpp"));
+        assert_eq!(extension_alias("ino", true), None);
+        for legacy in [false, true] {
+            assert_eq!(extension_alias("jsx", legacy), Some("js"));
+            assert_eq!(extension_alias("mts", legacy), Some("ts"));
+            assert_eq!(extension_alias("pde", legacy), None);
+        }
+        assert_eq!(fence_alias("ino", false), Some("cpp"));
+        assert_eq!(fence_alias("Arduino", false), Some("cpp"));
+        assert_eq!(fence_alias("INO", false), Some("cpp"));
+        assert_eq!(fence_alias("arduino", true), None);
+        // 構文セットが知っている名前は寄せない（`find_syntax_by_token` が先に当たる）
+        assert_eq!(fence_alias("cpp", false), None);
+    }
+
+    /// #1949: Markdown の ```ino / ```arduino が ```cpp と同じ塗りになる
+    #[test]
+    fn markdownのinoとarduinoのコードブロックはcppと同じに塗る() {
+        let body = "void setup() {\n  pinMode(LED_BUILTIN, OUTPUT); // 出力\n}\n";
+        let lines_of = |token: &str| {
+            let blocks = markdown_blocks(&format!("```{token}\n{body}```\n"));
+            blocks
+                .into_iter()
+                .find_map(|b| match b.kind {
+                    MdBlockKind::CodeBlock { lines, .. } => Some(lines),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("```{token} のコードブロックが無い"))
+        };
+        let cpp = lines_of("cpp");
+        let colors = cpp
+            .iter()
+            .flatten()
+            .filter_map(|span| span.color)
+            .map(|c| (c.r, c.g, c.b))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(colors.len() > 1, "```cpp に複数の構文色が付く");
+        for token in ["ino", "arduino"] {
+            assert_eq!(lines_of(token), cpp, "```{token} は ```cpp と同じ塗り");
+        }
     }
 
     #[test]

@@ -542,7 +542,8 @@ fn match_extension(ext: &str) -> FileIconKind {
         "py" | "pyi" | "pyw" => FileIconKind::Python,
         "go" => FileIconKind::Go,
         "c" | "h" => FileIconKind::C,
-        "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "hh" => FileIconKind::Cpp,
+        // `.ino`（Arduino のスケッチ）は C++ として塗る（#1949）ので見た目も C++ に揃える
+        "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "hh" | "ino" => FileIconKind::Cpp,
         "java" | "class" | "jar" => FileIconKind::Java,
         "rb" | "erb" => FileIconKind::Ruby,
         "swift" => FileIconKind::Swift,
@@ -707,6 +708,10 @@ mod tests {
             FileIconKind::TypeScript
         );
         assert_eq!(resolve_file_icon(Path::new("App.tsx")), FileIconKind::React);
+        assert_eq!(
+            resolve_file_icon(Path::new("sketch.ino")),
+            FileIconKind::Cpp
+        );
         assert_eq!(
             resolve_file_icon(Path::new("data.json")),
             FileIconKind::Settings
