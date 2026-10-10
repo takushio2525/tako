@@ -860,8 +860,10 @@ pub enum Request {
     /// - "restart": 止めて起こし直す（未導入・諦めた・止めたも対象）
     /// - "stop": 止める（restart まで自動では起こさない）
     /// - "logs": サーバの stderr の直近の行（診断用）
+    /// - "install": 未導入のサーバを tako の data dir へ取る（#1944。グローバルには入れない・
+    ///   グローバルに入っていれば取らない。待ちうる）
     ///
-    /// `name` はサーバの ID（省略で全部）。言語機能（診断の描画・補完…）は各スライスが足す
+    /// `name` はサーバの ID（省略で全部。install は取れるもの全部）。言語機能（診断の描画・補完…）は各スライスが足す
     LspServer {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

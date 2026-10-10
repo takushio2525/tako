@@ -1053,15 +1053,16 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_lsp_server",
             "description": "言語サーバ（LSP）の状態と起動・停止。コードプレビューを編集モードにすると\
-                拡張子に合うサーバ（rust-analyzer 等）が起きる。action=status（既定）で状態・能力・診断件数、\
+                拡張子に合うサーバ（rust-analyzer 等）が起きる。無ければ tako の data dir へ取って起こす（state=fetching。\
+                グローバルの版を優先）。action=status（既定）で状態・source（path / managed）・取得の進捗・能力・診断件数、\
                 list で検出表と導入済みか（解決はキャッシュ。restart で引き直す）、restart で起こし直す（未導入・諦めたも）、stop で止める、\
-                logs で stderr の直近。未導入なら reason / next_step / install_command を返す。",
+                logs で stderr の直近、install で未導入のサーバを取る（name 省略で全部）。未導入なら reason / next_step / install_command を返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "list", "restart", "stop", "logs"],
+                        "enum": ["status", "list", "restart", "stop", "logs", "install"],
                         "default": "status",
                     },
                     "name": { "type": "string", "description": "サーバの ID（省略で全部）" },

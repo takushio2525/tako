@@ -87,6 +87,11 @@ raw-window-handle = "0.6"
 tungstenite = "0.26"
 # アプリ内更新の GitHub Releases チェック（tako-app::update_checker）
 ureq = "3"
+# 言語サーバの取得物のハッシュ検証（#1944。tako-control::lsp::fetch）。どちらも依存の木に既にある版
+# （sha2 0.11 は rust-embed-utils、base64 0.22 は ureq / alacritty_terminal が使っている = 新しいクレートは増えない）。
+# npm の `dist.integrity` は SHA-512 の base64、nodejs.org / GitHub Releases は SHA-256 の 16 進
+sha2 = "0.11"
+base64 = "0.22"
 # exe へのアイコン / バージョン情報リソース埋め込み（#587。ビルドスクリプト専用）。
 # 未メンテの winres（最終更新 2021）ではなく、その保守フォークである winresource を採る。
 # .rc を自前で書く embed-resource と違い Cargo のメタデータからバージョン情報を組める

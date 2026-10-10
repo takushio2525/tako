@@ -956,6 +956,15 @@ enum LspCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// 未導入の言語サーバを tako の data dir へ取る（グローバルには入れない。#1944）。
+    /// 省略で取れるもの全部。グローバルに入っていれば取らない。tako が起動していなくても取れる
+    Install {
+        /// サーバの ID（省略で取れるもの全部）
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// 編集中のコードの診断（エラー・警告）。位置は `tako edit replace-range` と同じ
     /// （行 1 始まり・桁 0 始まりの UTF-8 バイト）。MCP は `tako_lsp` の action=diagnostics（#1679）
     Diagnostics {
@@ -1156,6 +1165,7 @@ impl LspCommand {
             Self::Restart { name } => server("restart", name),
             Self::Stop { name } => server("stop", name),
             Self::Logs { name } => server("logs", name),
+            Self::Install { name, .. } => server("install", name),
             Self::Diagnostics { pane, severity, .. } => Request::LspDiagnostics {
                 pane: *pane,
                 severity: severity.clone(),
@@ -1222,6 +1232,7 @@ impl LspCommand {
         match self {
             Self::Status { json, .. }
             | Self::Servers { json }
+            | Self::Install { json, .. }
             | Self::Diagnostics { json, .. }
             | Self::Format { json, .. } => *json,
             Self::Definition(args)
@@ -7087,9 +7098,34 @@ fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
 
 fn run(command: Command) -> Result<(), String> {
     let request = build_request(&command)?;
+    // #1944: 言語サーバの取得は tako が起動していなくても取れる（同じ実装を CLI のプロセスで走らせる）
+    if let Command::Lsp(LspCommand::Install { name, .. }) = &command {
+        let result = match send_request_classified(request, None) {
+            Ok(value) => value,
+            Err(SendFailure::Unreachable(_)) => lsp_install_local(name.as_deref())?,
+            Err(SendFailure::Operation(message)) => return Err(message),
+        };
+        print_result(&command, &result);
+        return Ok(());
+    }
     let result = send_request(request)?;
     print_result(&command, &result);
     Ok(())
+}
+
+/// `tako lsp install` を GUI 抜きで行う（#1944）。GUI の manager と同じ `LspManager::install` を通り、
+/// 置き場（`<data_dir>/lsp-servers`）も同じ。名前の検査も dispatch と同じ 1 実装
+fn lsp_install_local(name: Option<&str>) -> Result<Value, String> {
+    tako_control::dispatch::lsp_server_action(
+        Some(&tako_control::lsp::LspManager::from_env()),
+        "install",
+        name,
+    )
+    .map(|mut value| {
+        value["local"] = Value::Bool(true);
+        value
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// `TAKO_PANE_ID`（呼び出し元ペイン）。tako 内のシェルなら必ず入っている（FR-2.1.1）
@@ -10222,6 +10258,14 @@ fn send_request(request: Request) -> Result<Value, String> {
     send_request_via(request, None)
 }
 
+/// 送れなかった理由（#1944: GUI が居ないときだけ CLI のプロセスで代わりに走らせる口のため）
+enum SendFailure {
+    /// tako アプリへ届かない（接続情報が無い・どの候補にも接続できない / 認証できない）
+    Unreachable(String),
+    /// 届いたが操作が失敗した
+    Operation(String),
+}
+
 /// 接続情報の解決とフォールバック（FR-2.2.9）。
 /// ①環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で試行し、接続不可・認証失敗
 /// （= アプリ再起動で env が古い）なら ②発見ファイルの候補列（current →
@@ -10230,6 +10274,13 @@ fn send_request(request: Request) -> Result<Value, String> {
 /// 生きているメインへ自動で届く（2026-06-12 バグ (8) の恒久対策）。
 /// 操作エラーはフォールバックせずそのまま返す。どの情報源も無ければ「tako の外」
 fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, String> {
+    send_request_classified(request, origin).map_err(|e| match e {
+        SendFailure::Unreachable(m) | SendFailure::Operation(m) => m,
+    })
+}
+
+/// [`send_request_via`] の本体。届かなかったのか、届いて操作が失敗したのかを分けて返す
+fn send_request_classified(request: Request, origin: Option<&str>) -> Result<Value, SendFailure> {
     let env_pair = match (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")) {
         (Ok(socket), Ok(token)) if !socket.is_empty() && !token.is_empty() => Some((socket, token)),
         _ => None,
@@ -10238,7 +10289,7 @@ fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, Str
     if let Some((socket, token)) = &env_pair {
         match transport::roundtrip(socket, token, request.clone(), origin) {
             Ok(value) => return Ok(value),
-            Err(TransportError::Other(message)) => return Err(message),
+            Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
             Err(stale) => last_failure = Some(stale),
         }
     }
@@ -10254,15 +10305,15 @@ fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, Str
         tried.push(key);
         match transport::roundtrip(&info.socket, &info.token, request.clone(), origin) {
             Ok(value) => return Ok(value),
-            Err(TransportError::Other(message)) => return Err(message),
+            Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
             // 死んだ残骸・別インスタンスのトークン → 次の候補へ
             Err(stale) => last_failure = Some(stale),
         }
     }
-    Err(match last_failure {
+    Err(SendFailure::Unreachable(match last_failure {
         Some(stale) => stale.message(),
         None => OUTSIDE_TAKO.to_string(),
-    })
+    }))
 }
 
 fn pretty_json(v: &Value) -> String {
@@ -10676,6 +10727,12 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
         }
         return;
     }
+    if !sub.json() && matches!(sub, LspCommand::Install { .. }) {
+        for line in lsp_install_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
     if sub.json()
         || !matches!(
             sub,
@@ -10711,14 +10768,17 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
             } else {
                 "-".into()
             };
+            // #1944: 出どころ（path / override / managed = tako が取った版）
+            let source = server["source"].as_str().unwrap_or("-");
             println!(
-                "{:<28} {:<14} {}",
+                "{:<28} {:<14} {:<8} {}",
                 text(&server["id"]),
                 if installed {
                     "installed"
                 } else {
                     "not_installed"
                 },
+                source,
                 where_
             );
         } else {
@@ -10738,6 +10798,36 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
             }
         }
     }
+}
+
+/// `tako lsp install` の人向けの体裁（#1944）。1 サーバ 1 行（ID・結果・置き場か理由）+ 次の一手
+fn lsp_install_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    if result["enabled"] == Value::Bool(false) {
+        return vec![text(&result["reason"])];
+    }
+    let mut out = Vec::new();
+    for server in result["servers"].as_array().cloned().unwrap_or_default() {
+        let status = text(&server["status"]);
+        let detail = match status.as_str() {
+            "installed" | "present" => {
+                let mb = server["disk_bytes"].as_u64().unwrap_or(0) as f64 / 1_000_000.0;
+                let secs = server["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0;
+                format!("{} ({mb:.1} MB, {secs:.1}s)", text(&server["path"]))
+            }
+            "global" => text(&server["path"]),
+            _ => text(&server["reason"]),
+        };
+        out.push(format!(
+            "{:<28} {:<11} {detail}",
+            text(&server["id"]),
+            status
+        ));
+        if let Some(next) = server["next_step"].as_str() {
+            out.push(format!("  {next}"));
+        }
+    }
+    out
 }
 
 /// `tako lsp menu` の人向けの体裁（#1684）。中身の正本は dispatch の応答。
@@ -11966,6 +12056,13 @@ mod tests {
             ),
             (vec!["tako", "lsp", "stop"], "stop", None),
             (vec!["tako", "lsp", "logs"], "logs", None),
+            // #1944: 取得も同じ 1 ツール（MCP `tako_lsp_server` の action=install）
+            (vec!["tako", "lsp", "install"], "install", None),
+            (
+                vec!["tako", "lsp", "install", "--name", "x"],
+                "install",
+                Some("x"),
+            ),
         ] {
             assert!(tako_control::dispatch::LSP_ACTIONS.contains(&action));
             assert_eq!(
@@ -13289,6 +13386,7 @@ mod platform_matrix_parity {
         ("lsp restart", "tako_lsp_server"),
         ("lsp stop", "tako_lsp_server"),
         ("lsp logs", "tako_lsp_server"),
+        ("lsp install", "tako_lsp_server"),
         ("lsp", "tako_lsp"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),

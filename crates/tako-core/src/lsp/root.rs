@@ -78,6 +78,7 @@ mod tests {
             macos: "",
             windows: "",
         },
+        fetch: None,
     };
 
     const 入れ子なし: ServerSpec = ServerSpec {

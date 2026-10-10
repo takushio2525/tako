@@ -3,6 +3,9 @@
 //! ```text
 //! [未起動] --(編集モードで開いた)--> [起動中]
 //! [起動中] --(実行ファイルが無い)--> [未導入]
+//! [起動中] --(無いが取れる)--> [取得中] --(取れた)--> [起動中]（同じ起動の流れが続ける。#1944）
+//!                                  └-(取れない)--> [未導入]（理由 = 取得の失敗）
+//! [未導入] --(入ったと分かった・取り直す)--> [起動中]（#1944 / #1823）
 //! [起動中] --(initialize の応答)--> [稼働]
 //! [起動中 / 稼働] --(プロセスが死んだ)--> [クラッシュ] --(待ってから)--> [起動中]
 //!                                          └-(上限を超えた)--> [諦めた]
@@ -29,6 +32,8 @@ pub enum ServerState {
     Stopped,
     /// 実行ファイルが見つからない（理由 + 導入コマンドを案内する）
     NotInstalled,
+    /// tako の data dir へ取ってきている（#1944。プロセスはまだ居ない）
+    Fetching,
     /// 落ちた。待ってから起こし直す
     Crashed,
     /// 再起動の上限を超えた（restart まで起こさない）
@@ -45,18 +50,20 @@ impl ServerState {
             Self::Stopping => "stopping",
             Self::Stopped => "stopped",
             Self::NotInstalled => "not_installed",
+            Self::Fetching => "fetching",
             Self::Crashed => "crashed",
             Self::GaveUp => "gave_up",
         }
     }
 
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::NotStarted,
         Self::Starting,
         Self::Running,
         Self::Stopping,
         Self::Stopped,
         Self::NotInstalled,
+        Self::Fetching,
         Self::Crashed,
         Self::GaveUp,
     ];
@@ -74,6 +81,16 @@ pub enum Event {
     Open,
     /// 実行ファイルが見つからなかった
     NotFound,
+    /// 見つからないので取りに行く（#1944）
+    FetchStarted,
+    /// 取れた（続きの spawn は同じ起動の流れが行う）
+    Fetched,
+    /// 取れたが、取っているあいだに文書がすべて閉じられた（起こさない）
+    FetchedUnused,
+    /// 取れなかった（理由は呼び手が記録する）
+    FetchFailed,
+    /// 未導入だったサーバが入ったと分かった（シェル統合の合図で引き直した・取った。#1823 の 2）
+    Installed,
     /// initialize の応答が来た
     Initialized,
     /// プロセスが死んだ（spawn の失敗・initialize の失敗 / タイムアウトを含む）
@@ -185,6 +202,19 @@ impl Lifecycle {
             }
             (S::NotStarted, Event::Open) => (self.with(S::Starting), Action::Spawn),
             (S::Starting, Event::NotFound) => (self.with(S::NotInstalled), Action::None),
+            (S::Starting, Event::FetchStarted) => (self.with(S::Fetching), Action::None),
+            (S::Fetching, Event::Fetched) => (self.with(S::Starting), Action::None),
+            (S::Fetching, Event::FetchedUnused) => (self.with(S::NotStarted), Action::None),
+            (S::Fetching, Event::FetchFailed) => (self.with(S::NotInstalled), Action::None),
+            // 入ったと分かったら restart を待たずに起こす（落ちた回数は 0 から数え直す）
+            (S::NotInstalled, Event::Installed) => (
+                Self {
+                    state: S::Starting,
+                    crashes: 0,
+                    held: false,
+                },
+                Action::Spawn,
+            ),
             (S::Starting, Event::Initialized) => (self.with(S::Running), Action::None),
             (S::Starting | S::Running, Event::Exited) => {
                 let crashes = self.crashes.saturating_add(1);
@@ -344,6 +374,51 @@ mod tests {
         // プロセスの無い状態の stop はその場で「止めた」
         let idle = Lifecycle::default();
         assert_eq!(idle.step(Event::UserStop, policy()).0.state, S::Stopped);
+    }
+
+    #[test]
+    fn 無ければ取って同じ流れで起こす() {
+        let (lc, actions) = run(&[
+            Event::Open,
+            Event::FetchStarted,
+            Event::Fetched,
+            Event::Initialized,
+        ]);
+        assert_eq!(lc.state, S::Running);
+        assert_eq!(
+            actions,
+            vec![Action::Spawn, Action::None, Action::None, Action::None],
+            "取れた後の spawn は同じ起動の流れが続ける（2 本目のスレッドを立てない）"
+        );
+    }
+
+    #[test]
+    fn 取れなければ未導入で止まり入ったと分かれば起こす() {
+        let (lc, _) = run(&[Event::Open, Event::FetchStarted, Event::FetchFailed]);
+        assert_eq!(lc.state, S::NotInstalled);
+        assert_eq!(lc.step(Event::Open, policy()), (lc, Action::None));
+        let (next, action) = lc.step(Event::Installed, policy());
+        assert_eq!((next.state, action), (S::Starting, Action::Spawn));
+        // 取っているあいだに閉じられたら起こさない
+        let (lc, _) = run(&[Event::Open, Event::FetchStarted, Event::FetchedUnused]);
+        assert_eq!(lc.state, S::NotStarted);
+    }
+
+    #[test]
+    fn 取得中の_stop_と_restart() {
+        let (fetching, _) = run(&[Event::Open, Event::FetchStarted]);
+        // 止めたら取れても起こさない
+        let (stopped, action) = fetching.step(Event::UserStop, policy());
+        assert_eq!((stopped.state, action), (S::Stopped, Action::None));
+        assert_eq!(stopped.step(Event::Fetched, policy()).0.state, S::Stopped);
+        // restart は起こし直す（取得の続きは新しい起動の流れが待って受ける）
+        assert_eq!(fetching.step(Event::UserRestart, policy()).1, Action::Spawn);
+        // 稼働中に「入った」が来ても何もしない
+        let (running, _) = run(&[Event::Open, Event::Initialized]);
+        assert_eq!(
+            running.step(Event::Installed, policy()),
+            (running, Action::None)
+        );
     }
 
     #[test]

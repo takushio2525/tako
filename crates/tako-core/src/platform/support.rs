@@ -215,8 +215,8 @@ pub mod notes {
     /// #1678。起動・同期の経路は OS 分岐を持たず偽サーバの e2e が Windows でも走るが、
     /// 実サーバとの握手は macOS の rust-analyzer でしか実測していない
     pub const WIN_LSP_REAL_SERVER_UNMEASURED: Note = Note::new(
-        "言語サーバの起動・握手・文書同期は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことはまだ無い（#1007）",
-        "Starting, handshaking and syncing documents are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken on real Windows hardware yet (#1007)",
+        "言語サーバの起動・握手・文書同期と、未導入のサーバを data dir へ取って起こす経路（#1944）は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことも、配布元から実際に取ったこともまだ無い（#1007）",
+        "Starting, handshaking, syncing documents and fetching a missing server into the data dir (#1944) are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken or downloaded from its real source on real Windows hardware yet (#1007)",
     );
 
     /// LSP の言語機能（診断 #1679 / 定義ジャンプ #1680）。受信・問い合わせ・変換・絞り込み・着地は
@@ -811,14 +811,18 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_lsp_server",
         // #1678: 実行ファイルの探索は exe::find（Windows は PATHEXT）、起動は child_cmd
         // （Windows はシェルを経由しない）を通り、I/O は std のパイプとスレッドだけ。
-        // それでも Supported と名乗らないのは、Windows 実機で実サーバと握手していないため
+        // それでも Supported と名乗らないのは、Windows 実機で実サーバと握手していないため。
+        // #1944 の取得: Windows は rust-analyzer / Node.js が zip の中の 1 つ（tako の zip 読み）、
+        // npm の tarball は OS 共通、置き場の実行ファイルはシェルを経由せず絶対パスで起こす。
+        // 取得・検証・展開・起動は偽サーバの gzip とローカルの配布元の e2e が Windows の CI で通るが、
+        // zip の取得物（実の rust-analyzer / node.exe）を Windows 実機で取って起こしたことはまだ無い
         macos: Support::Supported,
         windows: Support::Pending {
             note: notes::WIN_LSP_REAL_SERVER_UNMEASURED,
             issue: 1007,
         },
         windows_evidence: Evidence::UnitTest(
-            "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）が CI の Windows ジョブで緑",
+            "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）と issue1944_lsp_fetch（ローカルの配布元から偽サーバの gzip を取ってハッシュを検証して起こす・グローバル優先・ハッシュ不一致 / オフライン / 404 / 大きすぎるで未導入へ落ちる・2 つの器で 1 回だけ取る・取っている途中で閉じたら起こさない）が CI の Windows ジョブで緑。zip の中の 1 つを取り出すのは lsp::archive の単体（stored / deflate）",
         ),
     },
     Feature {

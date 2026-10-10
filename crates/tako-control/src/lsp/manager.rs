@@ -23,6 +23,19 @@
 //! `probe::output_with_timeout` の上限を通る（profile が入力を待つ形でも固まらず、打ち切ったことを
 //! [`Launch::TimedOut`] で知らせる）。
 //!
+//! ## 未導入のサーバを取る（#1944）
+//!
+//! 起こすときの解決は **差し替えの env → 利用者の PATH（動くことを確かめる）→ tako の置き場
+//! （`<data_dir>/lsp-servers`）→ 取る** の順。グローバルに入っている版があればそちらを使う。
+//! 取るのは開いた時点（[`FetchConfig::auto`]）か `tako lsp install` / 画面の「入れる」で、
+//! 取っているあいだの状態は「取得中」（[`ServerState::Fetching`]）。取れなければ理由を記録して
+//! 「未導入」へ落ち（#1678 の導入コマンドの案内は残す）、自動では取り直さない（`restart` /
+//! `install` で取り直す）。未導入のサーバは、シェル統合の合図（[`tako_core::shell_activity`]）で
+//! 引き直して見つかれば restart を待たずに起こす（#1823 の 2。間隔は [`RECHECK_INTERVAL`] 以上あける）。
+//! UI へは診断の知らせとは**別の口**（[`LspManager::state_events`]。中身を運ばず起こすだけ）で知らせる:
+//! 状態が変わったら「つながりを作り直して描き直す」（[`LspManager::take_refresh_wanted`] が真）、取得の
+//! 進捗は描き直すだけ。診断の口は従来どおり URI だけを運ぶ（#1679 の約束を崩さない）。
+//!
 //! ## 文書の同期
 //!
 //! 文書ごとに**サーバへ送った本文の写し**を持ち、今の本文との差分を `didChange` で送る
@@ -56,6 +69,7 @@ use tako_core::platform::child_cmd::{self, ChildCmd};
 
 use super::completion::{CompletionAnswer, CompletionError, CompletionRequest};
 use super::diagnostics::{DiagnosticsStore, DocDiagnostics};
+use super::fetch::{self, FetchConfig, FetchError};
 use super::format::{FormatAnswer, FormatError, FormatRequest};
 use super::goto::{GotoAnswer, GotoError, GotoRequest};
 use super::hover::{HoverAnswer, HoverError, HoverRequest};
@@ -77,6 +91,11 @@ const EXIT_WAIT: Duration = Duration::from_secs(1);
 /// `INCOMING_MESSAGE_QUEUE_CAPACITY` の実測値。設計書 §2 / §18）。
 /// 溢れたら捨てて「全部読み直して」の印を立てる（UI が詰まってもメモリを食わない）
 pub const DIAGNOSTICS_EVENT_CAPACITY: usize = 128;
+
+/// 未導入のサーバの引き直し（シェル統合の合図）の最小間隔（#1944 / #1823 の 2）。
+/// 引き直しはサーバ 1 つにつきログインシェル 1 つを起こすので、コマンドを打つたびには起こさない
+/// （間隔の中に来た合図は、間隔が明けたときに 1 回だけ引き直す）
+pub const RECHECK_INTERVAL: Duration = Duration::from_secs(15);
 
 /// `TAKO_1007_LEGACY=1` で LSP を丸ごと止める（同一バイナリで旧挙動へ戻す A/B の入口）
 pub fn legacy() -> bool {
@@ -101,6 +120,12 @@ pub enum Launch {
     },
     /// 探すのに起こしたログインシェルが上限までに返らなかった（#1769。打ち切った）
     TimedOut { program: String, waited_secs: u64 },
+    /// PATH で見つかったが動かない（#1944。検出表の `probe_args` で確かめて落ちた。
+    /// rustup の代理だけが居て component が無い等）。見つからないのと同じに扱う
+    Broken {
+        program_path: String,
+        detail: String,
+    },
 }
 
 /// 起動の方法を決める関数（本番は [`default_launch`]。テストは偽サーバを返す）
@@ -144,6 +169,16 @@ pub fn default_launch(spec: &ServerSpec) -> Launch {
             override_env: None,
         };
     };
+    // #1944: 検出表が確かめ方を持つサーバは、PATH のものが動くかを確かめてから信じる
+    // （差し替えの env は利用者の明示なので確かめない）
+    if std::env::var(&override_env).map_or(true, |v| v.trim().is_empty()) {
+        if let Some(detail) = probe_failure(spec, &program_path) {
+            return Launch::Broken {
+                program_path,
+                detail,
+            };
+        }
+    }
     let mut snippet = format!("exec {}", tako_core::shell::quote_for_shell(&program_path));
     for arg in spec.args {
         snippet.push(' ');
@@ -155,6 +190,42 @@ pub fn default_launch(spec: &ServerSpec) -> Launch {
             program: spec.program.to_string(),
             override_env: None,
         },
+    }
+}
+
+/// PATH で見つかったものを `probe_args` で起こし、成功で終わらなければその理由（#1944）
+fn probe_failure(spec: &ServerSpec, program_path: &str) -> Option<String> {
+    let Some(tako_core::lsp::fetch::Fetch::Binary { probe_args, .. }) = spec.fetch else {
+        return None;
+    };
+    if probe_args.is_empty() {
+        return None;
+    }
+    match tako_core::probe::output_with_timeout(
+        program_path,
+        probe_args,
+        tako_core::probe::probe_timeout(),
+    ) {
+        tako_core::probe::Outcome::Done { status, stderr, .. } if !status.success() => {
+            // 理由はサーバの stderr の 1 行目（rustup の「component が無い」）。本文は含まない
+            let first = String::from_utf8_lossy(&stderr)
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or_default()
+                .chars()
+                .take(160)
+                .collect::<String>();
+            Some(if first.is_empty() {
+                format!("exit {}", status.code().unwrap_or(-1))
+            } else {
+                first
+            })
+        }
+        tako_core::probe::Outcome::Done { .. } => None,
+        tako_core::probe::Outcome::TimedOut { waited, .. } => {
+            Some(format!("{} 秒で返らない", waited.as_secs()))
+        }
+        tako_core::probe::Outcome::Failed { reason, .. } => Some(reason),
     }
 }
 
@@ -251,6 +322,8 @@ pub struct LspManager {
 
 struct Shared {
     config: LspConfig,
+    /// 未導入のサーバを取る設定（#1944）。`None` は取らない（`TAKO_1944_LEGACY=1`・テストの既定）
+    fetch: Option<FetchConfig>,
     inner: Mutex<Inner>,
     /// 自分自身への弱参照（スレッドへ渡す）
     this: Weak<Shared>,
@@ -265,6 +338,10 @@ struct Inner {
     events: Option<futures::channel::mpsc::Sender<String>>,
     /// キューが満杯で知らせを捨てた（UI は次に読んだとき全部を読み直す）
     events_overflowed: bool,
+    /// 状態が変わったことを UI へ知らせる口（#1944。中身は運ばず起こすだけ = [`LspManager::state_events`]）
+    ui_wake: Option<futures::channel::mpsc::Sender<()>>,
+    /// 次に起きた UI がつながりを作り直すか（状態が変わった。進捗だけなら偽のまま）
+    ui_refresh_wanted: bool,
     /// 未導入と分かったサーバ（ID ごと。restart で消える）
     not_installed: BTreeMap<&'static str, NotInstalled>,
     /// 実行ファイルの解決の結果（ID ごと。#1769 = モジュール冒頭）
@@ -280,6 +357,10 @@ struct Inner {
     hover_lane: Inflight,
     /// 次に配る列の番号
     next_ticket: u64,
+    /// 未導入のサーバを引き直しているか・最後に引き直した時刻・間隔の中に合図が来たか（#1944）
+    rechecking: bool,
+    last_recheck: Option<Instant>,
+    recheck_pending: bool,
 }
 
 /// 取り消し合う要求の列（#1682）
@@ -388,6 +469,11 @@ struct Slot {
     quiescent: Option<bool>,
     /// 握手が済んだ時刻（状態を送るサーバかを起動直後の猶予のあいだだけ待って確かめる。#1680）
     running_since: Option<Instant>,
+    /// 起こした実行ファイルの出どころ（`path` / `override` / `managed`。#1944）と、そのパス・
+    /// Node.js で起こしたならその Node.js
+    source: Option<&'static str>,
+    program_path: Option<String>,
+    runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,11 +508,51 @@ struct Doc {
     holders: BTreeMap<u64, u64>,
 }
 
+#[derive(Clone)]
 struct NotInstalled {
     program: String,
     override_env: Option<String>,
     /// 解決のログインシェルを打ち切った（秒。#1769）。`None` は見つからなかった
     timed_out: Option<u64>,
+    /// PATH で見つかったが動かなかった（パスと理由。#1944）
+    broken: Option<(String, String)>,
+    /// 取りに行って失敗した（#1944）。記録があるあいだは開き直しても自動では取り直さない
+    fetch_error: Option<FetchError>,
+}
+
+impl NotInstalled {
+    /// 解決の答え（見つからない・打ち切った・動かない）から
+    fn from_launch(spec: &ServerSpec, launch: Launch) -> Self {
+        let mut record = Self {
+            program: spec.program.to_string(),
+            override_env: None,
+            timed_out: None,
+            broken: None,
+            fetch_error: None,
+        };
+        match launch {
+            Launch::NotFound {
+                program,
+                override_env,
+            } => {
+                record.program = program;
+                record.override_env = override_env;
+            }
+            Launch::TimedOut {
+                program,
+                waited_secs,
+            } => {
+                record.program = program;
+                record.timed_out = Some(waited_secs);
+            }
+            Launch::Broken {
+                program_path,
+                detail,
+            } => record.broken = Some((program_path, detail)),
+            Launch::Found { .. } => {}
+        }
+        record
+    }
 }
 
 /// 解決 1 つぶん（#1769）
@@ -482,24 +608,40 @@ fn uri_key(uri: &str) -> String {
 }
 
 impl LspManager {
-    /// 設定を渡して作る。`TAKO_1007_LEGACY=1` なら何もしない manager になる
+    /// 設定を渡して作る（未導入のサーバは取らない = #1678 の振る舞い）。
+    /// `TAKO_1007_LEGACY=1` なら何もしない manager になる
     pub fn new(config: LspConfig) -> Self {
+        Self::with_fetch(config, None)
+    }
+
+    /// 取得の設定も渡して作る（#1944。`None` なら取らない）
+    pub fn with_fetch(config: LspConfig, fetch: Option<FetchConfig>) -> Self {
         if legacy() {
             return Self::disabled();
         }
         let shared = Arc::new_cyclic(|this| Shared {
             config,
+            fetch,
             inner: Mutex::new(Inner::default()),
             this: this.clone(),
+        });
+        // #1944 / #1823 の 2: シェル統合の合図で、未導入のサーバを引き直す（manager が消えたら外れる）
+        let weak = Arc::downgrade(&shared);
+        tako_core::shell_activity::subscribe(move || match weak.upgrade() {
+            Some(shared) => {
+                shared.on_shell_activity();
+                true
+            }
+            None => false,
         });
         Self {
             shared: Some(shared),
         }
     }
 
-    /// 本番の設定で作る
+    /// 本番の設定で作る（未導入のサーバは data dir へ取る。#1944）
     pub fn from_env() -> Self {
-        Self::new(LspConfig::from_env())
+        Self::with_fetch(LspConfig::from_env(), FetchConfig::from_env())
     }
 
     /// 何もしない manager
@@ -560,6 +702,23 @@ impl LspManager {
             return disabled_status();
         };
         shared.stop(name)
+    }
+
+    /// 未導入のサーバを data dir へ取る（`tako lsp install`。#1944）。`name` 省略で表の取れるもの全部。
+    /// **待つ**（ネットワーク）: dispatch は offload で、GUI の「入れる」は背景で呼ぶ。
+    /// グローバルに入っていれば取らない。取れたら、その言語の文書を待っている未導入のサーバを起こす
+    pub fn install(&self, name: Option<&str>) -> Value {
+        let Some(shared) = &self.shared else {
+            return disabled_status();
+        };
+        shared.install(name)
+    }
+
+    /// 編集している文書を受け持つサーバの、画面に出す状態（#1944）。**待たない**（ロックを短く取るのと
+    /// 置き場の印の stat だけ。UI スレッドで描くたびに呼んでよい）。受け持つサーバが無い・まだ
+    /// 起こしていなければ `None`
+    pub fn document_server(&self, path: &Path) -> Option<DocumentServer> {
+        self.shared.as_ref()?.document_server(path)
     }
 
     /// stderr の直近の行（`tako lsp logs`）
@@ -625,6 +784,25 @@ impl LspManager {
         inner.events = Some(tx);
         inner.events_overflowed = false;
         Some(rx)
+    }
+
+    /// 状態が変わったことの知らせを受け取る口（#1944。UI が 1 つだけ持つ）。中身は運ばず起こすだけで
+    /// （容量 1 = 満杯ならもう起こしてある）、起きた UI は [`Self::take_refresh_wanted`] が真なら
+    /// 編集セッションを同期し直してから描き直し、偽なら描き直すだけ（取得の進捗）。
+    /// 呼ぶたびに前の口は閉じる。無効な manager（`TAKO_1007_LEGACY=1`）は `None`
+    pub fn state_events(&self) -> Option<futures::channel::mpsc::Receiver<()>> {
+        let shared = self.shared.as_ref()?;
+        let (tx, rx) = futures::channel::mpsc::channel(0);
+        shared.lock().ui_wake = Some(tx);
+        Some(rx)
+    }
+
+    /// 状態が変わって UI がつながりを作り直すべきか（読むと倒れる。#1944）
+    pub fn take_refresh_wanted(&self) -> bool {
+        let Some(shared) = &self.shared else {
+            return false;
+        };
+        std::mem::take(&mut shared.lock().ui_refresh_wanted)
     }
 
     /// キューが溢れて知らせを捨てたか（読むと倒れる）。`true` なら全文書を読み直す
@@ -732,7 +910,12 @@ impl LspManager {
             .docs
             .get(&uri)
             .and_then(|doc| inner.servers.get(&doc.key))
-            .is_some_and(|slot| slot.lifecycle.state == ServerState::Starting || slot_loading(slot))
+            .is_some_and(|slot| {
+                matches!(
+                    slot.lifecycle.state,
+                    ServerState::Starting | ServerState::Fetching
+                ) || slot_loading(slot)
+            })
     }
 
     /// 補完の問い合わせ（#1682）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
@@ -887,6 +1070,25 @@ pub struct DocumentDiagnostics {
     pub diagnostics: DocDiagnostics,
 }
 
+/// 編集している文書を受け持つサーバの、画面に出す状態（[`LspManager::document_server`]。#1944）
+#[derive(Debug, Clone)]
+pub struct DocumentServer {
+    /// 検出表の ID
+    pub id: &'static str,
+    pub state: ServerState,
+    /// 稼働しているがプロジェクトを読み込み中（`tako lsp status` の `loading` と同じ判定）
+    pub loading: bool,
+    /// 取っている最中の様子（状態が未導入でも `tako lsp install` が取っていれば出る）
+    pub fetch: Option<fetch::ProgressSnapshot>,
+    /// 未導入・諦めた・止めたの理由と次の一手（`tako lsp status` と同じ文）
+    pub reason: Option<String>,
+    pub next_step: Option<String>,
+    /// tako が取って入れられる（この OS / CPU 向けの取得物があり、取得を止めていない）
+    pub can_install: bool,
+    /// 取りに行って失敗した
+    pub fetch_failed: bool,
+}
+
 /// 診断が変わった知らせを UI へ積む（満杯なら捨てて印を立てる。待たない）
 fn notify_diagnostics(inner: &mut Inner, uri: &str) {
     let Some(tx) = inner.events.as_mut() else {
@@ -898,6 +1100,29 @@ fn notify_diagnostics(inner: &mut Inner, uri: &str) {
         } else {
             // 受け手が居なくなった
             inner.events = None;
+        }
+    }
+}
+
+/// 状態が変わったことを UI へ知らせる（#1944。つながりの作り直し + 描き直し）
+fn notify_refresh(inner: &mut Inner) {
+    inner.ui_refresh_wanted = true;
+    wake_ui(inner);
+}
+
+/// 取得の進捗が動いたことを UI へ知らせる（#1944。描き直しだけ）
+fn notify_redraw(inner: &mut Inner) {
+    wake_ui(inner);
+}
+
+/// UI を起こす（待たない。満杯 = もう起こしてあるので捨ててよい）
+fn wake_ui(inner: &mut Inner) {
+    let Some(tx) = inner.ui_wake.as_mut() else {
+        return;
+    };
+    if let Err(error) = tx.try_send(()) {
+        if error.is_disconnected() {
+            inner.ui_wake = None;
         }
     }
 }
@@ -1142,43 +1367,24 @@ impl Shared {
             return;
         };
         let (launch, _) = self.resolve(spec);
-        // 見つからない / 打ち切った は同じ「未導入」の扱い（理由の文だけが違う。#1769）
-        let found = match launch {
-            Launch::Found { plan, .. } => Ok(plan),
-            Launch::NotFound {
-                program,
-                override_env,
-            } => Err((program, override_env, None)),
-            Launch::TimedOut {
-                program,
-                waited_secs,
-            } => Err((program, None, Some(waited_secs))),
-        };
-        let plan = match found {
-            Ok(plan) => plan,
-            Err((program, override_env, timed_out)) => {
-                let mut inner = self.lock();
-                let Some(slot) = inner.servers.get_mut(key) else {
-                    return;
-                };
-                if slot.generation != generation {
-                    return;
-                }
-                self.step(slot, Event::NotFound);
-                crate::diag::persist_log(&match timed_out {
-                    Some(secs) => format!("LSP 解決の打ち切り: server={} {secs} 秒", spec.id),
-                    None => format!("LSP 未導入: server={}", spec.id),
-                });
-                inner.not_installed.insert(
-                    spec.id,
-                    NotInstalled {
-                        program,
-                        override_env,
-                        timed_out,
-                    },
-                );
-                return;
+        // #1944: 差し替えの env → 利用者の PATH → tako の置き場 → 取る の順。グローバルがあればそれ
+        let (plan, source, program_path, runtime) = match launch {
+            Launch::Found { plan, program_path } => {
+                let overridden = std::env::var(servers::override_env_name(spec.id))
+                    .is_ok_and(|v| !v.trim().is_empty());
+                let source = if overridden { "override" } else { "path" };
+                (plan, source, program_path, None)
             }
+            // 見つからない / 打ち切った / 動かない は同じ「未導入」の扱い（理由の文だけが違う。#1769）
+            missing => match self.start_managed(key, generation, spec, missing) {
+                Some(managed) => (
+                    managed.plan,
+                    "managed",
+                    managed.program_path,
+                    managed.runtime,
+                ),
+                None => return,
+            },
         };
         let handlers = self.handlers(key, generation);
         let raw_log = self
@@ -1213,6 +1419,9 @@ impl Shared {
             }
             slot.spawn_count = slot.spawn_count.saturating_add(1);
             slot.process = Some(Arc::clone(&process));
+            slot.source = Some(source);
+            slot.program_path = Some(program_path);
+            slot.runtime = runtime;
             crate::diag::persist_log(&format!(
                 "LSP 起動: server={} pid={} 世代={generation} 回数={}",
                 spec.id,
@@ -1260,6 +1469,7 @@ impl Shared {
         let _ = process.notify("initialized", json!({}));
         self.step(slot, Event::Initialized);
         slot.running_since = Some(Instant::now());
+        notify_refresh(inner);
         for (uri, doc) in inner.docs.iter_mut() {
             if doc.key == *key {
                 send_did_open(&process, uri, doc, generation);
@@ -1271,6 +1481,378 @@ impl Shared {
                 self.schedule_idle_stop(slot, key);
             }
         }
+    }
+
+    /// 見つからなかったサーバ: 置き場にあればそれを、無ければ取って起こし方を返す（#1944）。
+    /// 取れない・取らない・取れなかった・取っているあいだに要らなくなったら状態を遷移させて `None`
+    fn start_managed(
+        &self,
+        key: &ServerKey,
+        generation: u64,
+        spec: &'static ServerSpec,
+        missing: Launch,
+    ) -> Option<fetch::Managed> {
+        let record = NotInstalled::from_launch(spec, missing);
+        if let Some(config) = &self.fetch {
+            if let Some(managed) = fetch::installed(config, spec) {
+                return Some(managed);
+            }
+            // 前に取りに行って失敗していれば自動では取り直さない（オフラインで開くたびに取りに行かない。
+            // restart / install / 画面の「もう一度」で取り直す）
+            let failed_before = self
+                .lock()
+                .not_installed
+                .get(spec.id)
+                .is_some_and(|r| r.fetch_error.is_some());
+            if config.auto && config.can_fetch(spec) && !failed_before {
+                return self.fetch_and_start(config, key, generation, spec, record);
+            }
+        }
+        // 取れない / 取らない: 未導入（#1678 の振る舞い。前の取得の失敗の記録は残す）
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let previous_error = inner
+            .not_installed
+            .get(spec.id)
+            .and_then(|r| r.fetch_error.clone());
+        let slot = inner.servers.get_mut(key)?;
+        if slot.generation != generation {
+            return None;
+        }
+        self.step(slot, Event::NotFound);
+        crate::diag::persist_log(&match (record.timed_out, &record.broken) {
+            (Some(secs), _) => format!("LSP 解決の打ち切り: server={} {secs} 秒", spec.id),
+            (None, Some(_)) => format!("LSP PATH のものが動かない: server={}", spec.id),
+            (None, None) => format!("LSP 未導入: server={}", spec.id),
+        });
+        inner.not_installed.insert(
+            spec.id,
+            NotInstalled {
+                fetch_error: previous_error,
+                ..record
+            },
+        );
+        notify_refresh(inner);
+        None
+    }
+
+    /// 取得中へ遷移して取り、取れたら起こし方を返す（起こすのは呼び手 = 同じ起動の流れ）
+    fn fetch_and_start(
+        &self,
+        config: &FetchConfig,
+        key: &ServerKey,
+        generation: u64,
+        spec: &'static ServerSpec,
+        record: NotInstalled,
+    ) -> Option<fetch::Managed> {
+        {
+            let mut guard = self.lock();
+            let inner = &mut *guard;
+            let slot = inner.servers.get_mut(key)?;
+            if slot.generation != generation {
+                return None;
+            }
+            self.step(slot, Event::FetchStarted);
+            if slot.lifecycle.state != ServerState::Fetching {
+                return None;
+            }
+            notify_refresh(inner);
+        }
+        crate::diag::persist_log(&format!("LSP 取得の開始: server={}", spec.id));
+        let weak = self.this.clone();
+        let result = fetch::ensure(config, spec, &move || {
+            if let Some(shared) = weak.upgrade() {
+                notify_redraw(&mut shared.lock());
+            }
+        });
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let has_docs = inner.docs.values().any(|d| d.key == *key);
+        let slot = inner.servers.get_mut(key)?;
+        if slot.generation != generation {
+            return None;
+        }
+        match result {
+            Ok(managed) => {
+                let event = if has_docs {
+                    Event::Fetched
+                } else {
+                    Event::FetchedUnused
+                };
+                self.step(slot, event);
+                let starting = slot.lifecycle.state == ServerState::Starting;
+                notify_refresh(inner);
+                // 止めた（取っているあいだの stop）・閉じられた なら起こさない
+                starting.then_some(managed)
+            }
+            Err(error) => {
+                self.step(slot, Event::FetchFailed);
+                crate::diag::persist_log(&format!(
+                    "LSP 取得の失敗: server={} 種別={}",
+                    spec.id,
+                    error.slug()
+                ));
+                inner.not_installed.insert(
+                    spec.id,
+                    NotInstalled {
+                        fetch_error: Some(error),
+                        ..record
+                    },
+                );
+                notify_refresh(inner);
+                None
+            }
+        }
+    }
+
+    /// 未導入だったサーバが使えるようになった（取れた・PATH に現れた）: 記録を消し、待っている
+    /// 未導入の器を起こす（#1944 / #1823 の 2）。断った文書（`DocLink::Declined`）は epoch を
+    /// 進めるので、UI が次に同期したとき（状態の知らせ = [`LspManager::state_events`] で直ちに）開き直す
+    fn on_installed(&self, id: &'static str) {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        inner.not_installed.remove(id);
+        // 解決のキャッシュも捨てる（PATH に現れたなら次の起動で拾う）
+        inner.resolved.remove(id);
+        inner.epoch = inner.epoch.wrapping_add(1);
+        let keys: Vec<ServerKey> = inner
+            .servers
+            .iter()
+            .filter(|(k, slot)| k.id == id && slot.lifecycle.state == ServerState::NotInstalled)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys {
+            let has_docs = inner.docs.values().any(|d| d.key == *key);
+            let Some(slot) = inner.servers.get_mut(key) else {
+                continue;
+            };
+            if !has_docs {
+                // 待っている文書が無い器は未起動へ戻すだけ（次に開いたときに起こす）
+                slot.lifecycle = Lifecycle::default();
+                continue;
+            }
+            if self.step(slot, Event::Installed) == Action::Spawn {
+                self.begin_spawn(slot, key, None);
+            }
+        }
+        crate::diag::persist_log(&format!(
+            "LSP 導入を検知: server={id} 起こす器={} 件",
+            keys.len()
+        ));
+        notify_refresh(inner);
+    }
+
+    fn install(&self, name: Option<&str>) -> Value {
+        let Some(config) = self.fetch.clone() else {
+            return json!({
+                "action": "install",
+                "enabled": false,
+                "reason": text::FETCH_DISABLED_REASON.text(),
+            });
+        };
+        let targets: Vec<&'static ServerSpec> = self
+            .config
+            .table
+            .iter()
+            .filter(|spec| match name {
+                Some(n) => n == spec.id,
+                None => spec.fetch.is_some(),
+            })
+            .collect();
+        let rows: Vec<Value> = targets
+            .into_iter()
+            .map(|spec| self.install_one(&config, spec))
+            .collect();
+        json!({
+            "action": "install",
+            "enabled": true,
+            "root": config.root.display().to_string(),
+            "servers": rows,
+        })
+    }
+
+    fn install_one(&self, config: &FetchConfig, spec: &'static ServerSpec) -> Value {
+        let command = spec.install.command();
+        if !config.can_fetch(spec) {
+            return json!({
+                "id": spec.id,
+                "status": "unavailable",
+                "reason": text::FETCH_UNSUPPORTED_REASON.text(),
+                "next_step": text::fill(text::NOT_INSTALLED_NEXT_STEP, &[("command", command)]),
+                "install_command": command,
+            });
+        }
+        // グローバルに入っていればそれを使う（取らない）
+        if let (Launch::Found { program_path, .. }, _) = self.resolve(spec) {
+            return json!({ "id": spec.id, "status": "global", "path": program_path });
+        }
+        let present = fetch::present(config, spec);
+        let started = Instant::now();
+        let weak = self.this.clone();
+        let result = fetch::ensure(config, spec, &move || {
+            if let Some(shared) = weak.upgrade() {
+                notify_redraw(&mut shared.lock());
+            }
+        });
+        match result {
+            Ok(managed) => {
+                self.on_installed(spec.id);
+                json!({
+                    "id": spec.id,
+                    "status": if present { "present" } else { "installed" },
+                    "path": managed.program_path,
+                    "runtime": managed.runtime,
+                    "runtime_source": managed.runtime_source,
+                    "dir": managed.dir.display().to_string(),
+                    "disk_bytes": fetch::dir_size(&managed.dir),
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                })
+            }
+            Err(error) => {
+                // 記録があれば理由を差し替える（無ければ作らない = 開いていない言語を断る記録を増やさない）
+                {
+                    let mut inner = self.lock();
+                    if let Some(record) = inner.not_installed.get_mut(spec.id) {
+                        record.fetch_error = Some(error.clone());
+                    }
+                    notify_refresh(&mut inner);
+                }
+                json!({
+                    "id": spec.id,
+                    "status": "failed",
+                    "error_kind": error.slug(),
+                    "reason": error.reason(),
+                    "next_step": text::fill(
+                        text::FETCH_FAILED_NEXT_STEP,
+                        &[("name", spec.id), ("command", command)]
+                    ),
+                    "install_command": command,
+                })
+            }
+        }
+    }
+
+    /// シェル統合の合図（cwd の変化・コマンドの終わり）: 未導入のサーバを引き直す（#1944 / #1823 の 2）。
+    /// **待たない**（合図を出したスレッドを止めない。引き直しは背景のスレッド 1 本）
+    fn on_shell_activity(&self) {
+        let mut inner = self.lock();
+        if inner.not_installed.is_empty() || inner.rechecking {
+            return;
+        }
+        if let Some(last) = inner.last_recheck {
+            let since = last.elapsed();
+            if since < RECHECK_INTERVAL {
+                // 間隔の中: 明けたときに 1 回だけ引き直す
+                if !inner.recheck_pending {
+                    inner.recheck_pending = true;
+                    let weak = self.this.clone();
+                    let wait = RECHECK_INTERVAL - since;
+                    let _ = std::thread::Builder::new()
+                        .name("lsp-recheck-wait".into())
+                        .spawn(move || {
+                            std::thread::sleep(wait);
+                            if let Some(shared) = weak.upgrade() {
+                                shared.lock().recheck_pending = false;
+                                shared.on_shell_activity();
+                            }
+                        });
+                }
+                return;
+            }
+        }
+        inner.rechecking = true;
+        inner.last_recheck = Some(Instant::now());
+        let ids: Vec<&'static str> = inner.not_installed.keys().copied().collect();
+        drop(inner);
+        let Some(shared) = self.arc() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("lsp-recheck".into())
+            .spawn(move || {
+                for id in ids {
+                    let Some(spec) = servers::find_in(shared.config.table, id) else {
+                        continue;
+                    };
+                    // キャッシュは合図の番号が変わったので引き直しになる
+                    let usable = matches!(shared.resolve(spec).0, Launch::Found { .. })
+                        || shared
+                            .fetch
+                            .as_ref()
+                            .is_some_and(|config| fetch::present(config, spec));
+                    if usable {
+                        shared.on_installed(spec.id);
+                    }
+                }
+                shared.lock().rechecking = false;
+            });
+    }
+
+    fn document_server(&self, path: &Path) -> Option<DocumentServer> {
+        let resolved = servers::resolve_in(self.config.table, path)?;
+        let spec = resolved.spec;
+        let progress = self
+            .fetch
+            .as_ref()
+            .and_then(|config| fetch::progress_of(config, spec));
+        let can_install = self
+            .fetch
+            .as_ref()
+            .is_some_and(|config| config.can_fetch(spec));
+        let uri = tako_core::file_uri::from_path(path);
+        let inner = self.lock();
+        let slot = inner
+            .docs
+            .get(&uri)
+            .and_then(|doc| inner.servers.get(&doc.key));
+        let record = inner.not_installed.get(spec.id);
+        let state = match (slot, record) {
+            (Some(slot), _) => slot.lifecycle.state,
+            // 断った文書（未導入と分かったあとに開いた）は記録から
+            (None, Some(_)) => ServerState::NotInstalled,
+            (None, None) if progress.is_some() => ServerState::Fetching,
+            (None, None) => return None,
+        };
+        let loading = slot.is_some_and(slot_loading);
+        let (reason, next_step) = match state {
+            ServerState::NotInstalled => {
+                let fallback;
+                let record = match record {
+                    Some(record) => record,
+                    None => {
+                        fallback = NotInstalled::from_launch(
+                            spec,
+                            Launch::NotFound {
+                                program: spec.program.to_string(),
+                                override_env: None,
+                            },
+                        );
+                        &fallback
+                    }
+                };
+                let guidance = not_installed_guidance(spec, record, can_install);
+                (
+                    guidance["reason"].as_str().map(str::to_string),
+                    guidance["next_step"].as_str().map(str::to_string),
+                )
+            }
+            ServerState::GaveUp | ServerState::Stopped => {
+                let slot = slot?;
+                let (reason, next) = stopped_guidance(slot);
+                (Some(reason), Some(next))
+            }
+            _ => (None, None),
+        };
+        Some(DocumentServer {
+            id: spec.id,
+            state,
+            loading,
+            fetch: progress,
+            reason,
+            next_step,
+            can_install,
+            fetch_failed: record.is_some_and(|r| r.fetch_error.is_some()),
+        })
     }
 
     fn handlers(&self, key: &ServerKey, generation: u64) -> Handlers {
@@ -1293,8 +1875,16 @@ impl Shared {
     fn on_notification(&self, key: &ServerKey, method: &str, params: Value) {
         // #1680: 読み込みが済んだか（定義ジャンプが空の答えを「見つからない」と読み違えないため）
         if method == super::goto::SERVER_STATUS_METHOD {
-            if let Some(slot) = self.lock().servers.get_mut(key) {
-                slot.quiescent = super::goto::quiescent_of(&params);
+            let mut guard = self.lock();
+            let inner = &mut *guard;
+            if let Some(slot) = inner.servers.get_mut(key) {
+                let quiescent = super::goto::quiescent_of(&params);
+                let changed = slot.quiescent != quiescent;
+                slot.quiescent = quiescent;
+                // #1944: 画面の「読み込み中 → 動作中」を描き直す
+                if changed {
+                    notify_refresh(inner);
+                }
             }
             return;
         }
@@ -1346,6 +1936,7 @@ impl Shared {
                 slot.last_exit = Some("exited".into());
             }
             self.on_crash(slot, key, generation);
+            notify_refresh(inner);
         }
     }
 
@@ -1588,7 +2179,7 @@ impl Shared {
             .servers
             .iter()
             .filter(|(k, _)| name.is_none_or(|n| n == k.id))
-            .map(|(key, slot)| slot_status(&inner, key, slot))
+            .map(|(key, slot)| slot_status(&inner, self.fetch.as_ref(), key, slot))
             .collect();
         let mut value = json!({
             "enabled": true,
@@ -1596,6 +2187,8 @@ impl Shared {
             "documents": inner.docs.len(),
             "diagnostics_total": inner.diagnostics.total(),
             "inflight": inflight,
+            // #1944: 未導入のサーバを取るか・置き場（取っている最中のものは各サーバの `fetch`）
+            "fetch": fetch_summary(self.fetch.as_ref()),
         });
         if inner.servers.is_empty() {
             value["note"] = json!(text::IDLE_NOTE.text());
@@ -1620,29 +2213,60 @@ impl Shared {
                     // #1769: 解決をキャッシュから答えたか（false = いま引いた）
                     "cached": cached,
                 });
+                let can_fetch = self.fetch.as_ref().is_some_and(|c| c.can_fetch(spec));
+                // #1944: tako が取れるか・取った版（取れない行は `available: false`）
+                row["fetch"] = json!({
+                    "available": can_fetch,
+                    "label": spec.fetch.map(|f| f.label(spec.id)),
+                });
                 match launch {
                     Launch::Found { program_path, .. } => {
                         row["installed"] = json!(true);
+                        row["source"] =
+                            json!(if std::env::var(servers::override_env_name(spec.id))
+                                .is_ok_and(|v| !v.trim().is_empty())
+                            {
+                                "override"
+                            } else {
+                                "path"
+                            });
                         row["path"] = json!(program_path);
                     }
-                    Launch::NotFound {
-                        program,
-                        override_env,
-                    } => {
-                        row["installed"] = json!(false);
-                        let guidance =
-                            not_installed_guidance(spec, &program, override_env.as_deref(), None);
-                        merge(&mut row, guidance);
-                    }
-                    Launch::TimedOut {
-                        program,
-                        waited_secs,
-                    } => {
-                        row["installed"] = json!(false);
-                        row["timed_out"] = json!(true);
-                        let guidance =
-                            not_installed_guidance(spec, &program, None, Some(waited_secs));
-                        merge(&mut row, guidance);
+                    missing => {
+                        // グローバルに無くても tako の置き場にあれば使える（印の stat だけ。Node.js は
+                        // 探さない = 2 回目以降の `servers` がログインシェルを起こさない #1769 を保つ）
+                        let managed = self
+                            .fetch
+                            .as_ref()
+                            .and_then(|config| fetch::managed_entry(config, spec));
+                        if let Launch::TimedOut { .. } = &missing {
+                            row["timed_out"] = json!(true);
+                        }
+                        if let Launch::Broken {
+                            program_path,
+                            detail,
+                        } = &missing
+                        {
+                            row["broken"] = json!({ "path": program_path, "detail": detail });
+                        }
+                        match managed {
+                            Some((program, dir)) => {
+                                row["installed"] = json!(true);
+                                row["source"] = json!("managed");
+                                row["path"] = json!(program.display().to_string());
+                                row["disk_bytes"] = json!(fetch::dir_size(&dir));
+                            }
+                            None => {
+                                row["installed"] = json!(false);
+                                let mut record = NotInstalled::from_launch(spec, missing);
+                                record.fetch_error = self
+                                    .lock()
+                                    .not_installed
+                                    .get(spec.id)
+                                    .and_then(|r| r.fetch_error.clone());
+                                merge(&mut row, not_installed_guidance(spec, &record, can_fetch));
+                            }
+                        }
                     }
                 }
                 row
@@ -1977,12 +2601,8 @@ impl Shared {
     fn not_installed_error(&self, spec: &'static ServerSpec) -> Option<GotoError> {
         let inner = self.lock();
         let record = inner.not_installed.get(spec.id)?;
-        let guidance = not_installed_guidance(
-            spec,
-            &record.program,
-            record.override_env.as_deref(),
-            record.timed_out,
-        );
+        let can_fetch = self.fetch.as_ref().is_some_and(|c| c.can_fetch(spec));
+        let guidance = not_installed_guidance(spec, record, can_fetch);
         let field = |key: &str| guidance[key].as_str().unwrap_or_default().to_string();
         Some(GotoError::NotInstalled {
             server: spec.id,
@@ -2681,6 +3301,9 @@ impl Slot {
             last_stderr: Vec::new(),
             quiescent: None,
             running_since: None,
+            source: None,
+            program_path: None,
+            runtime: None,
         }
     }
 }
@@ -2702,7 +3325,12 @@ fn slot_loading(slot: &Slot) -> bool {
     }
 }
 
-fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
+fn slot_status(
+    inner: &Inner,
+    fetch_config: Option<&FetchConfig>,
+    key: &ServerKey,
+    slot: &Slot,
+) -> Value {
     let docs: Vec<&String> = inner
         .docs
         .iter()
@@ -2740,45 +3368,109 @@ fn slot_status(inner: &Inner, key: &ServerKey, slot: &Slot) -> Value {
         "pending_requests": slot.process.as_ref().map(|p| p.pending_count()),
         // サーバがプロジェクトを読み込み中か（#1869。補完の「読み込み中」と同じ判定）
         "loading": slot_loading(slot),
+        // #1944: 起こした実行ファイルの出どころ（path / override / managed）とパス
+        "source": slot.source,
+        "program_path": slot.program_path,
+        "runtime": slot.runtime,
+        // #1944: 取っている最中の様子（取っていなければ null）
+        "fetch": fetch_config
+            .and_then(|config| fetch::progress_of(config, slot.spec))
+            .map(|p| p.to_json()),
     });
     match slot.lifecycle.state {
         ServerState::NotInstalled => {
-            let (program, override_env, timed_out) = inner
-                .not_installed
-                .get(key.id)
-                .map(|n| (n.program.clone(), n.override_env.clone(), n.timed_out))
-                .unwrap_or_else(|| (slot.spec.program.to_string(), None, None));
+            let fallback = NotInstalled::from_launch(
+                slot.spec,
+                Launch::NotFound {
+                    program: slot.spec.program.to_string(),
+                    override_env: None,
+                },
+            );
+            let record = inner.not_installed.get(key.id).unwrap_or(&fallback);
+            let can_fetch = fetch_config.is_some_and(|c| c.can_fetch(slot.spec));
             merge(
                 &mut value,
-                not_installed_guidance(slot.spec, &program, override_env.as_deref(), timed_out),
+                not_installed_guidance(slot.spec, record, can_fetch),
             );
         }
-        ServerState::GaveUp => {
-            value["reason"] = json!(text::fill(
-                text::GAVE_UP_REASON,
-                &[("count", &slot.lifecycle.crashes.to_string())]
-            ));
-            value["next_step"] = json!(text::GAVE_UP_NEXT_STEP.text());
-        }
-        ServerState::Stopped => {
-            value["reason"] = json!(text::STOPPED_REASON.text());
-            value["next_step"] = json!(text::STOPPED_NEXT_STEP.text());
+        ServerState::GaveUp | ServerState::Stopped => {
+            let (reason, next_step) = stopped_guidance(slot);
+            value["reason"] = json!(reason);
+            value["next_step"] = json!(next_step);
         }
         _ => {}
     }
     value
 }
 
+/// 諦めた・止めたの理由と次の一手（`tako lsp status` と画面の 1 行が同じ文を出す）
+fn stopped_guidance(slot: &Slot) -> (String, String) {
+    if slot.lifecycle.state == ServerState::GaveUp {
+        (
+            text::fill(
+                text::GAVE_UP_REASON,
+                &[("count", &slot.lifecycle.crashes.to_string())],
+            ),
+            text::GAVE_UP_NEXT_STEP.text().to_string(),
+        )
+    } else {
+        (
+            text::STOPPED_REASON.text().to_string(),
+            text::STOPPED_NEXT_STEP.text().to_string(),
+        )
+    }
+}
+
+/// `tako lsp status` の `fetch`（#1944）
+fn fetch_summary(config: Option<&FetchConfig>) -> Value {
+    match config {
+        Some(config) => json!({
+            "enabled": true,
+            "auto": config.auto,
+            "root": config.root.display().to_string(),
+            "base": config.base,
+        }),
+        None => json!({
+            "enabled": false,
+            "reason": text::FETCH_DISABLED_REASON.text(),
+        }),
+    }
+}
+
 /// 未導入の「理由 + 次の一手（導入コマンド）」（#983 の作法）。`timed_out` は解決の
-/// ログインシェルを打ち切った秒数（#1769。見つからないのではなく、確かめられなかった）
-fn not_installed_guidance(
-    spec: &ServerSpec,
-    program: &str,
-    override_env: Option<&str>,
-    timed_out: Option<u64>,
-) -> Value {
+/// ログインシェルを打ち切った秒数（#1769。見つからないのではなく、確かめられなかった）。
+/// #1944: 取りに行って失敗していればその理由（+ 取り直し方）、取れるサーバなら `tako lsp install` を
+/// 先に案内する。どちらも導入コマンド（今の案内）は残す
+fn not_installed_guidance(spec: &ServerSpec, record: &NotInstalled, can_fetch: bool) -> Value {
     let command = spec.install.command();
-    if let Some(secs) = timed_out {
+    let program = record.program.as_str();
+    if let Some(error) = &record.fetch_error {
+        return json!({
+            "reason": text::fill(text::FETCH_FAILED_REASON, &[("reason", &error.reason())]),
+            "next_step": text::fill(
+                text::FETCH_FAILED_NEXT_STEP,
+                &[("name", spec.id), ("command", command)]
+            ),
+            "install_command": command,
+            "fetch_error": error.slug(),
+        });
+    }
+    let next_step = if can_fetch {
+        text::fill(
+            text::FETCHABLE_NEXT_STEP,
+            &[("name", spec.id), ("command", command)],
+        )
+    } else {
+        text::fill(text::NOT_INSTALLED_NEXT_STEP, &[("command", command)])
+    };
+    if let Some((path, detail)) = &record.broken {
+        return json!({
+            "reason": text::fill(text::BROKEN_GLOBAL_NOTE, &[("path", path), ("detail", detail)]),
+            "next_step": next_step,
+            "install_command": command,
+        });
+    }
+    if let Some(secs) = record.timed_out {
         return json!({
             "reason": text::fill(
                 text::RESOLVE_TIMEOUT_REASON,
@@ -2788,7 +3480,7 @@ fn not_installed_guidance(
             "install_command": command,
         });
     }
-    let reason = match override_env {
+    let reason = match &record.override_env {
         Some(env) => text::fill(
             text::OVERRIDE_INVALID_REASON,
             &[("env", env), ("path", program)],
@@ -2797,7 +3489,7 @@ fn not_installed_guidance(
     };
     json!({
         "reason": reason,
-        "next_step": text::fill(text::NOT_INSTALLED_NEXT_STEP, &[("command", command)]),
+        "next_step": next_step,
         "install_command": command,
     })
 }
@@ -3088,5 +3780,57 @@ mod tests {
     fn 版は_i32_に収める() {
         assert_eq!(to_lsp_version(7), 7);
         assert_eq!(to_lsp_version(u64::MAX), i32::MAX);
+    }
+
+    /// #1944: PATH で見つかった物を表の `probe_args` で確かめ、落ちたら理由（stderr の 1 行目）を返す。
+    /// rustup の代理は component が無くても PATH に居て、起こすと即座に落ちる（諦めた まで 3 回）
+    #[cfg(unix)]
+    #[test]
+    fn path_の物が動かなければ理由を返す() {
+        use std::os::unix::fs::PermissionsExt;
+        use tako_core::lsp::fetch::{Archive, Asset, Digest, Fetch, PlatformAsset};
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1944-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        };
+        let broken = script(
+            "broken",
+            "echo \"error: Unknown binary 'x' in official toolchain 'stable'\" >&2; exit 1",
+        );
+        let fine = script("fine", "echo 'x 1.0.0'");
+        const ASSETS: &[PlatformAsset] = &[PlatformAsset {
+            os: "macos",
+            arch: "aarch64",
+            asset: Asset {
+                url: "https://example.test/x.gz",
+                digest: Digest::Sha256("00"),
+                archive: Archive::Gzip,
+                size: 1,
+            },
+        }];
+        let mut spec = servers::SERVERS[0];
+        spec.fetch = Some(Fetch::Binary {
+            version: "t",
+            assets: ASSETS,
+            probe_args: &["--version"],
+        });
+        let detail = probe_failure(&spec, &broken).expect("落ちる物は理由を返す");
+        assert!(detail.contains("Unknown binary"), "{detail}");
+        assert_eq!(probe_failure(&spec, &fine), None, "動く物は信じる");
+        // 確かめ方を持たない行は起こさずに信じる（従来どおり）
+        spec.fetch = None;
+        assert_eq!(probe_failure(&spec, &broken), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1926: #173 の disable_app_nap は /proc 前提で一度も効いていなかった = 消して、利用者が待つ読み込みだけ App Nap を止める）
-- 交互 2 周の実測で (2) を選択: 寿命の間止めるとアイドル 341〜365 → 856〜1,154 µW・裏の出力処理 2〜5 倍の電力、得をするのは待たれる重い処理だけ。エージェント稼働中は #173 のアサーションで App Nap の対象外（優先度 28）。`UserWork::begin_load` を PDF のラスタライズ（開く / ズーム）・Markdown の組み立て / 描き直しへ（A/B `TAKO_1926_LEGACY=1`）
-- 実測: PDF 117 ページ 7.2〜8.0 → 3.0 秒・ズーム 49.9 → 20.8 秒。`scripts/test-preview-load-app-nap-1926.sh` 7 PASS（旧の腕で ①② が名指しで FAILED）・番犬 `issue1926_app_nap_watchdog` 4 本（注入 12 通りを file:line で名指し）
-
 ## 2026-10-09（#1968: master の監視が UI スレッドで子プロセスを待つ・tako の子プロセスが本体の 4〜6 倍の CPU・target を Spotlight が索引）
 - 真因（本番の `sample` / perf.log / `proc_pid_rusage` + 同じ構成の隔離 GUI のシンボル付き A/B）: Report が丸ごと同期・status の準備部が `has_running_children`（tmux + ps）・照会ごとに ps 2〜3 本とレジストリ 200 KB の解釈・PATH の痩せた `.app` で 2 秒ごとにログインシェル・UI ストールの誤分類。`OffloadJob::Report`・`probe_running_children`・`agents::with_shared_scan`・レジストリの中身一致の使い回し・`which_claude` の覚え・`recent_spans_within`。A/B `TAKO_1968_LEGACY=1`・番犬 `issue1968_ui_thread_subprocess_watchdog`。`scripts/spotlight-noindex.sh`（target → `target.noindex` のリンク）
 - 実測（1 時間・左右同時）: 本体 CPU 6.69 → 3.88%・子プロセス 39.2 → 18.9%・ログインシェル 23 → 0 本/分・UI ストール 5 → 0・UI 専有 計 438 秒 → 0.25 秒・`list` p95 106 → 55ms・メモリは両方増えない。本番の「554 MB」は描画面の計上の出入り（151 MB）が主。描画ありの CPU 14% は出力の描画（37 fps）で差なし
@@ -59,3 +55,7 @@
 ## 2026-10-10（#1958: pane を省いた `tako_show_command` / `sessions link` を呼び出し元ペインで埋める）
 - 真因: MCP の変換（`mcp/request.rs`）と CLI が pane 省略時に呼び出し元（`TAKO_PANE_ID` / `X-Tako-Pane`）で埋めず、show は「対象ペインが未指定」・link はフォーカスペインの会話を返していた。show は `target_pane`、card 指定は埋めない。番犬 `issue1958_caller_pane_watchdog` がカタログで約束する 58 本 × 全 action を公開の入口で検査。`tako_open_remote` は説明を挙動（アクティブタブ）へ寄せ、「混ぜない」側として縛る
 - 実測: `scripts/test-show-command-caller-1958.sh`（隔離 GUI・呼び出し元とフォーカスを分ける・HTTP / stdio / CLI + visual `show-command-caller` の実ピクセル）新 22 PASS / 旧 9 PASS 13 FAIL・注入 7 通りで単体と番犬が名指し
+
+## 2026-10-09（#1944: 未導入の言語サーバを開いた時点で data dir へ取って起こし、エディタに状態を出した）
+- 検出表の各行に `fetch`（pyright 1.1.414・ts-ls 5.1.3 + typescript 5.9.3 = npm の tarball、rust-analyzer 2026-09-21 = GitHub の単体、Node.js 24.21.0 は足りる node が PATH に無いときだけ。clangd は取らない）を配布元の公開ハッシュで検証して `<data_dir>/lsp-servers` へ。解決は env → PATH（`probe_args` で動くか確かめる）→ 置き場 → 取得。状態「取得中」・タイトルの 1 行と失敗の帯（入れる / もう一度取得）・`tako lsp install`（GUI 無しでも）・シェル統合の合図で引き直し（#1823 の 2）。A/B `TAKO_1944_LEGACY=1`・カタログ +235 B
+- 実測: まっさら（一時 HOME・最小 PATH）で .py を開くだけで Node.js 52.9 MB + pyright 4.2 MB を取り 11.6 秒で読み込み済み・診断 2 件・補完 34 件・常駐 155 MB（ts-ls 4.9 MB / 4.2 秒・RA 13.9 MB / 21 秒）。e2e 10 本・番犬（注入 10 通り）・`scripts/test-lsp-fetch-1944.sh` 25 PASS

@@ -13,6 +13,8 @@
 
 use std::path::Path;
 
+use super::fetch::{Archive, Asset, Digest, Fetch, NpmPackage, PlatformAsset};
+
 /// 表の 1 行 = 1 つの言語サーバ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerSpec {
@@ -30,6 +32,9 @@ pub struct ServerSpec {
     pub workspace_root: Option<WorkspaceRoot>,
     /// 未導入のときに案内する導入コマンド
     pub install: InstallHint,
+    /// 見つからないときに tako が data dir へ取ってくる方法（#1944）。取れないサーバは `None`
+    /// （導入コマンドの案内だけ = #1678 の振る舞い）
+    pub fetch: Option<Fetch>,
 }
 
 /// 拡張子 1 つぶん
@@ -97,6 +102,62 @@ pub const SERVERS: &[ServerSpec] = &[
             macos: "rustup component add rust-analyzer",
             windows: "rustup component add rust-analyzer",
         },
+        // 2026-09-21 の週次リリース（公開から 2 週間以上置いた版）。ハッシュは GitHub Releases の
+        // asset の digest。macOS は gzip 1 枚、Windows は zip の中の 1 つ
+        fetch: Some(Fetch::Binary {
+            version: "2026-09-21",
+            assets: &[
+                PlatformAsset {
+                    os: "macos",
+                    arch: "aarch64",
+                    asset: Asset {
+                        url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-21/rust-analyzer-aarch64-apple-darwin.gz",
+                        digest: Digest::Sha256(
+                            "eb474adfd12b6e66a6d0a7c25ed51210a64a0237f326f898e32e25164c9b11ad",
+                        ),
+                        archive: Archive::Gzip,
+                        size: 13_874_039,
+                    },
+                },
+                PlatformAsset {
+                    os: "macos",
+                    arch: "x86_64",
+                    asset: Asset {
+                        url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-21/rust-analyzer-x86_64-apple-darwin.gz",
+                        digest: Digest::Sha256(
+                            "1e2f706ee97d9f931ea36ed4e83f839efd0ac09870e18ec8350877d7b98ad8a0",
+                        ),
+                        archive: Archive::Gzip,
+                        size: 14_625_353,
+                    },
+                },
+                PlatformAsset {
+                    os: "windows",
+                    arch: "x86_64",
+                    asset: Asset {
+                        url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-21/rust-analyzer-x86_64-pc-windows-msvc.zip",
+                        digest: Digest::Sha256(
+                            "f62a18aad35568fd9205006a62f97613eac8c4f2ec5fe43c830dde09684e5e6f",
+                        ),
+                        archive: Archive::ZipMember("rust-analyzer.exe"),
+                        size: 17_509_495,
+                    },
+                },
+                PlatformAsset {
+                    os: "windows",
+                    arch: "aarch64",
+                    asset: Asset {
+                        url: "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-21/rust-analyzer-aarch64-pc-windows-msvc.zip",
+                        digest: Digest::Sha256(
+                            "2cfbd8fc8eb8f8232cc81eb338462abaf78081b4fda7a9fed91a6bf5b2f1ace0",
+                        ),
+                        archive: Archive::ZipMember("rust-analyzer.exe"),
+                        size: 15_642_814,
+                    },
+                },
+            ],
+            probe_args: &["--version"],
+        }),
     },
     ServerSpec {
         id: "clangd",
@@ -118,6 +179,10 @@ pub const SERVERS: &[ServerSpec] = &[
             macos: "brew install llvm",
             windows: "winget install LLVM.LLVM",
         },
+        // 取らない（#1944）: 配布の zip が macOS で 100 MB（ヘッダ込み）あり、C / C++ の解析には
+        // コンパイラのヘッダ（Xcode の Command Line Tools / MSVC / MinGW）が別に要る。
+        // macOS はコンパイラを入れれば /usr/bin/clangd も入るので、取っても足りるのは稀
+        fetch: None,
     },
     ServerSpec {
         id: "typescript-language-server",
@@ -139,6 +204,27 @@ pub const SERVERS: &[ServerSpec] = &[
             macos: "npm install -g typescript-language-server typescript",
             windows: "npm install -g typescript-language-server typescript",
         },
+        // 5.1.3（node >= 20・依存なし）+ typescript 5.9.3（JS 版の最後の系列・依存なし）。
+        // 6.x は node >= 22.22 を求め、typescript 7.x は OS ごとのネイティブ包みに分かれるので採らない。
+        // プロジェクトの node_modules に typescript があればサーバはそちらを使う
+        fetch: Some(Fetch::Npm {
+            packages: &[
+                NpmPackage {
+                    name: "typescript-language-server",
+                    version: "5.1.3",
+                    integrity: "r+pAcYtWdN8tKlYZPwiiHNA2QPjXnI02NrW5Sf2cVM3TRtuQ3V9EKKwOxqwaQ0krsaEXk/CbN90I5erBuf84Vg==",
+                    size: 503_836,
+                },
+                NpmPackage {
+                    name: "typescript",
+                    version: "5.9.3",
+                    integrity: "jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+                    size: 4_377_468,
+                },
+            ],
+            entry: "node_modules/typescript-language-server/lib/cli.mjs",
+            node_major: 20,
+        }),
     },
     ServerSpec {
         id: "pyright",
@@ -157,6 +243,17 @@ pub const SERVERS: &[ServerSpec] = &[
             macos: "npm install -g pyright",
             windows: "npm install -g pyright",
         },
+        // 1.1.414（2026-09-09 公開。中身は 1 本に束ねてあり、依存の fsevents は省いても動く）
+        fetch: Some(Fetch::Npm {
+            packages: &[NpmPackage {
+                name: "pyright",
+                version: "1.1.414",
+                integrity: "FPZZb51jepDX4eP7TEYDeNFtmE3WgwkkEcJpvH3/QmUSsj0EAy3LXu+xB4T/FWDejtsXlCfFr/rbWFjwuwuXww==",
+                size: 4_226_827,
+            }],
+            entry: "node_modules/pyright/langserver.index.js",
+            node_major: 14,
+        }),
     },
 ];
 
@@ -277,6 +374,7 @@ mod tests {
                 macos: "npm install -g vscode-langservers-extracted",
                 windows: "npm install -g vscode-langservers-extracted",
             },
+            fetch: None,
         };
         let path = Path::new("site/index.html");
         assert!(
