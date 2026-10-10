@@ -769,10 +769,12 @@ tako | <ペイン名> | タブ <タブ名>                                      
   `enabledPlugins` を読むだけで分かる）その設定 dir には置かず、**そのペインへの env 注入もしない**（inline は installed
   を上書きするので利用者の `tako` を潰す）
 - 置く先: accounts.yaml の設定 dir（`AccountsConfig::list_resolved()`）+ 既定（`claude_default_config_dir()`）+
-  実行時に mod の報告の `config_dir` で見えた dir（GUI 起動時の差分検出で足す = #916 と同じ二段構え）
+  プロセスの `CLAUDE_CONFIG_DIR`（出どころ `env`）+ 実行時に mod の報告の `config_dir` で見えた dir（GUI 起動時の
+  差分検出で足す = #916 と同じ二段構え）。出どころの語（`default` / `account:<名>` / `env` / `reported`）は FR-2.42.32
 - 利用者が Claude Code 側で止めた（`enabledPlugins["tako@skills-dir"] === false`）ら、env で読まれた mod も
   `$.settings.read()` で見て休眠し、最後の報告で `user_disabled` を返す（env 注入が利用者の選択を上書きしない）
-- 外し方: `tako mod uninstall`（印つきの写しだけ消す）と setup の undo
+- 外し方: `tako mod uninstall`（印つきの写しだけ消す）の 1 本。setup に全体の undo は無いので、setup の案内も
+  これを出す（FR-2.42.30）
 - FR-2.42.2 の文言は #1959 で「settings 系のファイル（`settings*.json`・`plugins/*.json`）は書かない。置くのは
   `skills/tako` の管理印つきの写しだけ」へ改める
 - env 注入なし・`skills/tako` の写しだけでも、本物の tako mod（S3）が tako のペインで読まれて報告と帯の描画まで
@@ -788,7 +790,8 @@ tako | <ペイン名> | タブ <タブ名>                                      
   ため。実測で確認）。`next(e)` の答えは、下に誰も居なければ `{type: "engine"}`、居ればその描画
 - **規則**: tako の mod は `ui.render` の全フックで**必ず `next(e)` の答えを包む**（帯は「他の mod の行 + tako の行」を
   縦に並べる・`AssistantMessage` 等はエンジンの描画の下に足す）。他の mod が tako を隠すのは防げないので、帯の
-  フックが呼ばれていない（`band.columns` が付かない）ことを `tako mod` に「帯は他の mod に隠された」と出す
+  フックが呼ばれていない（報告の `renders.hint_hook` が真で `band_hook` が偽）ことを `tako mod` の `band.state` =
+  `hidden_by_other_mod` で出す（FR-2.42.39）
 - **帯の行数は共有資源**: 全画面の 21 行のペインで 1 行。tako の行は**ボタン込みで 1 行**に詰める（2 行にすると
   他の mod の行と合わせて「↓ N more」に畳まれる）。複数行の詳細は `/tako` のサイドバー（`$.ui.open`）
 - **`$.ui.status`**: plugin ごとに 1 行で並ぶ（他の mod・利用者の statusLine を上書きしない）。警告の体裁なので
@@ -812,17 +815,21 @@ tako | <ペイン名> | タブ <タブ名>                                      
 | 組織アカウント（classic 系が届かない） | 描画は関数フック（`ui.render`）なので**影響なし**（S3 で組織 / 個人の両方の設定 dir で帯を実測）。権限待ちは S1 の代替で拾う | mod の `renders` に従う |
 | `--safe-mode` / `--bare` / `disableAllHooks` / `allowManagedModsOnly` | 読まれない | 今の表示（`tako mod` に理由） |
 | 利用者が `/plugin` で disable | 休眠して `user_disabled` | 今の表示 |
-| 他の mod に帯を隠された | 帯の `renders` が偽 | 帯は mod 専用なので代わりは出さず `tako mod` に理由 |
+| 他の mod に帯を隠された | 帯のフックが呼ばれない（`renders.band_hook` が偽・`hint_hook` は真） | 帯は mod 専用なので代わりは出さず `tako mod` の `band.state` = `hidden_by_other_mod`（FR-2.42.39） |
 | 報告が古い（45 秒） | — | **1 tick（2 秒）で今の表示へ戻る** |
 
-**止める条件**は表示ごとに「**新鮮な報告 ∧ 報告の `renders` にその表示がある ∧ ui.json の置き場が mod**」:
+**止める条件**は表示ごとに「**新鮮な報告 ∧ 報告の `renders` にその表示がある ∧ ui.json の置き場が mod**」
+（使用量のバーの置き場は `prompt_hint` / `band` / `off` で「mod」の語は無く、`renders.usage_bar` に置き場が
+あること自体が条件 = FR-2.42.38）:
 
-- 報告（`schema: 1` に後方互換で追加）の `renders`: `band`（描けたか）・`usage_bar`（置き場 or null）・
-  `buttons`（数）・`cards`（**描いたカードの id**）・`chat`（チャット風の描画をしているか）。無い = 何も描いていない
-  （古い mod は今の表示のまま）
+- 報告（`schema: 1` に後方互換で追加）の `renders`: `band`（直近の帯で tako の行を描いたか）・`usage_bar`（描いた
+  置き場。描いていなければ欠ける）・`buttons`（描いたボタンの数）・`band_hook` / `hint_hook`（帯 / 入力欄の下の行の
+  フックが呼ばれたか）。`cards`（**描いたカードの id**）と `chat`（チャット風の描画をしているか）は #1963 / #1964 で
+  足す。報告には `status_line`（利用者の statusLine の有無だけ）と `last_press`（押したボタンの結果）も載る
+  （FR-2.42.37）。無い = 何も描いていない（古い mod は今の表示のまま）
 - コマンドカード: `renders.cards` に載った id だけ GPUI の帯から外す（store には残る = スマホ・CLI は同じ）
-- 使用量のバー: **フォーカス中のペイン**の claude の mod が `renders.usage_bar` なら、ステータスバーの claude の
-  5h / 7d / ctx の区画を出さない
+- 使用量のバー: **フォーカス中のペイン**の claude の mod の新鮮な報告に `renders.usage_bar` があれば、ステータス
+  バーの claude の 5h / 7d / ctx のメーターを出さない（サービスの選択チップは残す = codex へ切り替えられる。FR-2.42.38）
 - チャット: GUI モードで `renders.chat` のペインは GPUI のチャットビューの代わりにターミナル表示
 
 ### 9.7 定型の UI 設定（`ui.json`）
@@ -851,7 +858,7 @@ tako | <ペイン名> | タブ <タブ名>                                      
   `prompt`（入力欄へ文を入れるだけ = `$.prompt.fill`、送らない）。色は Claude Code のテーマのキーだけ。並びは id の
   並べ替えだけ。ボタンは 8 個まで・label 16 桁・hotkey は数字か小文字 1 字で重複不可。**既定のボタンは `compact` 1 個**
 - **口は 3 つで同じ 1 実装**: CLI `tako mod ui`（今の値と**選べる値**の一覧）/ `set <key> <value>` / `button add|remove|move` /
-  `reset`、MCP `tako_mod` の `action=ui`（op と値の enum を inputSchema に載せる）、`tako setup` の段（対話 = 既定 /
+  `preset <default|recommended|minimal>`（FR-2.42.21）/ `reset`、MCP `tako_mod` の `action=ui`（op と値の enum を inputSchema に載せる）、`tako setup` の段（対話 = 既定 /
   おすすめ / 最小の 3 択 + ボタンを選ぶ・`--answers` のキー `mod_ui`）。#322 の最簡形の規約どおり、引数なしは表示
 - **軽いモデルでも壊さない**: すべて「選ぶ」口（enum）+ 検証で、不正な値は**書かずに許される値の一覧を返す**。読めない
   ui.json は既定で動き、元は `.unreadable.bak` へ保全（#916 の機構）。性質テスト（ランダムな操作列で常にスキーマを満たす）
@@ -866,10 +873,10 @@ tako | <ペイン名> | タブ <タブ名>                                      
 
 ```text
 #1958 [バグ] MCP の tako_show_command の pane 省略（いつでも）
-#1959 S7-1 setup が設定 dir ごとに skills/tako へ入れる                 （依存なし）
-#1960 S7-2 定型の UI 設定 ui.json と setup / CLI / MCP の口              （依存なし。#1959 と並行可）
+#1959 S7-1 setup が設定 dir ごとに skills/tako へ入れる                 （依存なし）✅ 済（PR #1980）
+#1960 S7-2 定型の UI 設定 ui.json と setup / CLI / MCP の口              （依存なし。#1959 と並行可）✅ 済（PR #1974）
 #1961 [判断点] tako がクリックを TUI へ渡す                              （依存なし）
-#1962 S7-3 帯を next で包む 1 行に + カスタムボタン + バー               ← #1960
+#1962 S7-3 帯を next で包む 1 行に + カスタムボタン + バー               ← #1960 ✅ 済（PR #1987）
 #1963 S7-4 コマンドカードを mod で描く                                   ← #1958 #1960 #1962
 #1964 S7-6 チャット風の描画と GUI モードの切り替え（#1883 の置き換え）   ← #1960 #1963 #1961
 #1965 S7-7 この PC の claude へ setup で入れて実機で効く（最後）         ← #1959 #1960 #1962 #1963

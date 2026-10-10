@@ -406,6 +406,8 @@ fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandVi
         .into_iter()
         .map(|p| worker_facts(host, p, now))
         .collect();
+    let looked_up = lookup_pane(host, pane, now).ok();
+    let session = host.session(pane);
     core::band_view(core::BandInput {
         pane: pane.as_u64(),
         pane_title: tab
@@ -415,9 +417,7 @@ fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandVi
         tab_title: tab.map(|t| t.title().to_string()),
         lang: tako_core::i18n::lang().as_str(),
         workers,
-        ctx: lookup_pane(host, pane, now)
-            .ok()
-            .and_then(|s| s.report.context.clone()),
+        ctx: looked_up.and_then(|s| s.report.context.clone()),
         rate_limits: account_rate_limits(host, pane, now),
         thresholds: core::band_thresholds(),
         // #1960: 検証済みの ui.json（読めない部分は既定。帯のトグルの中継もここから作る）
@@ -425,7 +425,28 @@ fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandVi
             .claude_mod_ui_path()
             .map(|p| crate::claude_mod_ui::view(&p))
             .unwrap_or_default(),
+        // #1962: バーを描かせるか（利用者の statusLine の有無 × 画面の末尾の数値）とボタンの引数の材料
+        status_line: looked_up.and_then(|s| s.report.status_line),
+        screen_shows_usage: session
+            .is_some_and(|s| core::screen_shows_usage(&s.tail_lines(core::USAGE_SCAN_LINES))),
+        cwd: session
+            .and_then(|s| s.cwd())
+            .map(|p| p.display().to_string()),
+        s7_legacy: core::s7_legacy(),
     })
+}
+
+/// 画面下のステータスバーの claude の区画（5h / 7d / ctx）を誰が出すか（#1962。判断は
+/// `tako_core::claude_mod::claude_bar_owner`）。`focused` はフォーカス中のペイン。その新鮮な報告
+/// （45 秒以内。引き当ては一次ソースと同じ [`lookup_pane`] の 1 本）が無ければ（mod なし・古い・
+/// codex / agy / シェル・S2 の A/B）今のまま tako が出す
+pub fn status_bar_owner(
+    host: &dyn ControlHost,
+    focused: PaneId,
+    now: Instant,
+) -> core::ClaudeBarOwner {
+    let report = lookup_pane(host, focused, now).ok().map(|s| &s.report);
+    core::claude_bar_owner(report, core::s7_legacy())
 }
 
 /// worker 1 本の手掛かり（判断は `tako_core::claude_mod::classify_worker`）
@@ -542,8 +563,32 @@ fn pane_row(
     }
     if let Some(s) = stored {
         row["report"] = report_json(s, now);
+        // #1962: 帯を描けているか（新鮮で renders を送ってくる mod だけ）
+        if core::is_fresh(s.received, now) {
+            if let Some(band) = band_state_json(&s.report) {
+                row["band"] = band;
+            }
+        }
     }
     row
+}
+
+/// 帯の状態（#1962。`drawn` / `not_drawn` / `hidden_by_other_mod`）。renders を送らない mod
+/// （S7-3 前・A/B の S3 の描き方）は `None`
+fn band_state_json(report: &core::ModReport) -> Option<Value> {
+    let renders = report.renders.as_ref()?;
+    if core::band_hidden_by_other_mod(report) {
+        return Some(json!({
+            "state": "hidden_by_other_mod",
+            "message": "帯は他の mod に隠された（Claude Code の帯のフックが呼ばれていない = 外側の mod が next を\
+                呼ばずに帯を描いている）。入力欄の下の行のバーとサイドバー（/tako）はそのまま使える",
+        }));
+    }
+    Some(json!({
+        "state": if renders.band { "drawn" } else { "not_drawn" },
+        "buttons": renders.buttons,
+        "usage_bar": renders.usage_bar,
+    }))
 }
 
 fn report_json(stored: &StoredReport, now: Instant) -> Value {
@@ -556,6 +601,14 @@ fn report_json(stored: &StoredReport, now: Instant) -> Value {
         map.insert("reports".into(), json!(stored.count));
     }
     v
+}
+
+/// ステータスバーの claude の区画の持ち主（`tako mod` の `status_bar`。フォーカス中のペインつき）
+pub fn status_bar_json(host: &dyn ControlHost, now: Instant) -> Value {
+    let focused = host.workspace().active_tab().tree().focused();
+    let mut out = status_bar_owner(host, focused, now).to_json();
+    out["pane"] = json!(focused.as_u64());
+    out
 }
 
 /// `tako mod`（status）
@@ -602,9 +655,14 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
             "request": ui.as_ref().and_then(|u| u.config.band_request()),
             "hidden": ui.as_ref().is_some_and(|u| u.config.band.hidden),
             "legacy": core::s3_legacy(),
+            // #1962: S3 の描き方へ戻す A/B（TAKO_1877_S7_LEGACY）
+            "s7_legacy": core::s7_legacy(),
             "ctx_percent": core::band_thresholds().ctx_percent,
             "limit_percent": core::band_thresholds().limit_percent,
         },
+        // #1962: 画面下のステータスバーの claude の区画（5h / 7d / ctx）を誰が出しているか
+        // （フォーカス中のペインの mod がバーを描いていれば mod = ステータスバーからは外す）
+        "status_bar": status_bar_json(host, now),
         "reason": injection.off_reason().map(reason_json),
         "plugin_dir": hub.plugin_dir.as_ref().map(|p| p.display().to_string()),
         "install": match &hub.install_result {

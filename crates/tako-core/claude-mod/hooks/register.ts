@@ -1,17 +1,24 @@
-// tako mod（#1877 / S1 #1879 / S3 #1881）: このペインの Claude Code の状態を集めて tako へ報告し、
-// tako の応答（帯・サイドバーの材料）で Claude Code の画面に tako の状況を出す。
-// 設計の正本は .agent/plans/2026-10-tako-mod.md §5（規約）と §7 S3（帯・サイドバー）。
+// tako mod（#1877 / S1 #1879 / S3 #1881 / S7-3 #1962）: このペインの Claude Code の状態を集めて tako へ
+// 報告し、tako の応答（帯・バー・サイドバーの材料）で Claude Code の画面に tako の状況を出す。
+// 設計の正本は .agent/plans/2026-10-tako-mod.md §5（規約）・§7 S3（帯・サイドバー）・§9.3 / §9.5 / §9.6（S7）。
 //
-// 画面に出すもの（S3）:
-// - 帯（プロンプトの上の 1 行）: このペインの名前・タブ・worker 数と要注意の数。ctx / 使用制限は
-//   tako が閾値を超えたと判断したときだけ（statusLine を持つ利用者の画面で二重にならない既定）。
-//   幅（bodyColumns）に収まらなければ優先度の低い区切りから落とし、それでも溢れたら末尾を切る
-//   = **必ず 1 行**。権限ダイアログ・質問の表示中は Claude Code が帯ごと隠すので「承認待ち」は出さない
+// 画面に出すもの:
+// - 帯（プロンプトの上）: **他の mod の行を包み**（next(e) の答えを上に並べる = 利用者の他の mod の帯を
+//   消さない。#1962）、その下に tako の行を**ボタン込みで 1 行**。tako の行はこのペインの名前・タブ・worker 数と
+//   要注意の数・カスタムボタン（ui.json の buttons。既定は /compact）。並びと出すものは ui.json の
+//   band.segments。幅（bodyColumns）に収まらなければ優先度の低いものから落とし、それでも溢れたら末尾を切る。
+//   権限ダイアログ・質問の表示中は Claude Code が帯ごと隠すので「承認待ち」は出さない
+// - 使用制限・ctx のバー（#1962）: 入力欄の下の行（PromptHint）の末尾に `5h ▁ 4% 7d ▂ 22% ctx ▁ 6%`。
+//   描くかは tako が決める（view.usage_bar。利用者の statusLine が既に出していれば描かない）。描いたら
+//   報告の renders.usage_bar で返し、tako は画面下のステータスバーの claude の区画を引っ込める
 // - `/tako`: サイドバーのペイン（$.ui.open）に詳細。頼まれずには開かない（開くのはコマンドだけ）
 // - 帯を隠すトグル: 正本は tako の ui.json の band.hidden（#1960）。$.store の `band`（{ hidden, at }）は
 //   この読み込み元の写しで、`/tako band on|off`・ペインのボタンで変えたら報告の band.toggled_at で tako へ
 //   渡り、tako が ui.json へ取り込む。tako からは応答の view.band_request で届く。時刻の新しいものが勝つ
-// 何を出すかの判断は tako 側（tako_core::claude_mod::band_view）。ここは幅に合わせて詰めて描くだけ
+// 何を出すかの判断は tako 側（tako_core::claude_mod::band_view）。ここは幅に合わせて詰めて描くだけ。
+// ボタンの tako の操作・shell も、叩く CLI の引数は tako が組んで view.button_args で渡す
+// A/B の TAKO_1877_S7_LEGACY では view.band_style が 's3' で届き、S3 の描き方（next を包まない・
+// ボタンとバーなし・renders を報告しない）へ戻る
 //
 // 守っていること（§5 の規約。番犬 crates/tako-control/tests/issue1879_claude_mod_watchdog.rs が走査する）:
 // - 観測だけで判断を奪わない: すべての on(...) は next(e) へ流し、.catch(($, e, next) => next(e)) を付ける
@@ -23,9 +30,21 @@
 // - 失敗で騒がない: CLI の失敗は $.ui.log(…, { to: 'debug' }) だけ
 // - $ を渡す補助関数はファイル最上位の関数宣言（validate の規則）
 // - 会話の本文・プロンプト・ツールの引数は報告に載せない（ツール名だけ）
-import type { EngineInterface, Register, SessionRateLimit, Timer } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, RenderInput, SessionRateLimit, Timer } from 'claude-code'
 
-import type { TakoLimitsSeen, TakoModReport, TakoRateLimit, TakoTurn, TakoView, TakoWorker } from '../types'
+import type {
+  TakoBandSegment,
+  TakoButton,
+  TakoLimitsSeen,
+  TakoModReport,
+  TakoPress,
+  TakoRateLimit,
+  TakoRenders,
+  TakoThemeColor,
+  TakoTurn,
+  TakoView,
+  TakoWorker,
+} from '../types'
 
 // 展開時（tako_core::claude_mod::install）に tako の版へ置き換わる
 const MOD_VERSION = '__TAKO_MOD_VERSION__'
@@ -49,6 +68,25 @@ const PANE_ID = 'tako'
 const BAND_KEY = 'band'
 /** 利用者が Claude Code の /plugin で止める id（tako setup が skills/tako に置いた写し = #1959） */
 const SKILLS_ID = 'tako@skills-dir'
+/**
+ * バーの棒の 8 段（#1962。tako_core::claude_mod::BAR_GLYPHS と同じ = tako が画面を読むときに
+ * mod 自身のバーを除く形。単体テストが突き合わせる）
+ */
+const BAR_GLYPHS = '▁▂▃▄▅▆▇█'
+/** 端末のボタンの枠（`[ ` と ` ]`）の桁 */
+const BUTTON_CHROME = 4
+/** 帯の区切りとボタンの間・ボタンどうしの間の桁 */
+const BUTTON_GAP = 1
+/** ボタンで叩く CLI 1 回の上限（session-restart は引き継ぎの書き出しを待つので長め） */
+const PRESS_TIMEOUT_MS = 30_000
+/** ui.json が届く前（古い tako）の帯の並び（tako_core::claude_mod_ui::BandUi の既定と同じ） */
+const DEFAULT_SEGMENTS: readonly TakoBandSegment[] = ['pane', 'tab', 'workers', 'attention', 'card', 'buttons']
+/** ui.json が届く前の色（tako_core::claude_mod_ui::ColorsUi の既定と同じ） */
+const DEFAULT_COLORS: { accent: TakoThemeColor; warn: TakoThemeColor; dim: TakoThemeColor } = {
+  accent: 'suggestion',
+  warn: 'warning',
+  dim: 'subtle',
+}
 
 // $.state（セッションの値。描画が購読するので、書けば読み手が描き直される）
 const VIEW = { plugin: 'tako', key: 'view' } as const
@@ -70,6 +108,8 @@ let lastTurn: { duration_ms: number; reason: string } | undefined
 // 帯（S3）: 最後に受け取った tako の材料の時刻・JSON（同じなら $.state を書かない = 無駄に描き直さない）
 let viewAt = 0
 let lastViewJson: string | undefined
+// 最後に受け取った材料の描き方（#1962。's3' = A/B。renders を報告するかを決める）
+let lastStyle: 's3' | undefined
 let lang = 'en'
 // `/tako` の説明文を登録した言語（tako の表示言語が応答で分かったら登録し直す）
 let commandLang: string | undefined
@@ -87,6 +127,20 @@ let lastBandKey: string | undefined
 let classicEvents = false
 // 利用者が /plugin で止めたかを最後に見た時刻（#1959。heartbeat と同じ間隔で見直す）
 let lastDisabledCheck = 0
+// 利用者の statusLine の有無（#1962。設定と同じ間隔で見直す。読めなければ undefined = tako は画面だけで見ない）
+let statusLine: boolean | undefined
+// Claude Code に今あるスラッシュコマンドの名前（#1962。無い名前の slash ボタンは描かない。
+// 読めなければ undefined = 絞らない）
+let commandNames: Set<string> | undefined
+// 描いたもの（#1962。報告の renders）: 帯のボタンの数・帯 / 入力欄の下の行にバーを描いたか・
+// 起きてからフックが呼ばれたか（帯だけ呼ばれない = 外側の他の mod が next を呼ばずに帯を描いている）
+let bandButtons = 0
+let bandBar = false
+let hintBar = false
+let bandHookSeen = false
+let hintHookSeen = false
+// 最後に押されたボタン（語彙の種類と成否だけ）
+let lastPress: TakoPress | undefined
 
 // effort の値を読む。turn.step は文字列（2.1.294 の実測: "medium"）、classic 系は { level } で運ぶ
 function effortLevel(value: unknown): string | undefined {
@@ -134,14 +188,32 @@ async function stampLimits($: EngineInterface, limits: readonly SessionRateLimit
 
 // 利用者が Claude Code 側で tako mod を止めたか（/plugin の disable = settings の enabledPlugins に
 // false。#1959）。env の注入（inline）で読まれていても従う = 注入が利用者の選択を上書きしない。
-// 読めなければ止めていない扱い（報告は止めない = §5 の「失敗で騒がない」）
+// 読めなければ止めていない扱い（報告は止めない = §5 の「失敗で騒がない」）。
+// 同じ 1 回の読みで statusLine の有無も控える（#1962。中身は読まない・報告に載せるのは有無だけ）
 async function userDisabled($: EngineInterface): Promise<boolean> {
   try {
-    const enabled = (await $.settings.read()).enabledPlugins
+    const settings = await $.settings.read()
+    const line = settings.statusLine
+    const next = typeof line === 'object' && line !== null
+    if (next !== statusLine) {
+      statusLine = next
+      dirty = true
+    }
+    const enabled = settings.enabledPlugins
     return typeof enabled === 'object' && enabled !== null && (enabled as Record<string, unknown>)[SKILLS_ID] === false
   } catch (err) {
     $.ui.log(`tako mod: settings unreadable: ${String(err).slice(0, 200)}`, { to: 'debug' })
     return false
+  }
+}
+
+// Claude Code に今あるスラッシュコマンドの名前を控える（#1962。slash のボタンは無い名前を描かない）。
+// 読めなければ前の値のまま（初回なら絞らない）
+async function syncCommands($: EngineInterface): Promise<void> {
+  try {
+    commandNames = new Set((await $.command.list()).map(c => c.name))
+  } catch (err) {
+    $.ui.log(`tako mod: command list unreadable: ${String(err).slice(0, 200)}`, { to: 'debug' })
   }
 }
 
@@ -178,7 +250,22 @@ async function buildReport($: EngineInterface, ended: boolean, dormant?: 'user_d
     config_dir: await $.env.get('CLAUDE_CONFIG_DIR'),
     band: { hidden: bandHidden, shown: bandShown, columns: bandColumns, segments: bandSegments, toggled_at: bandToggledAt },
     dormant,
+    status_line: statusLine,
+    renders: currentRenders(),
+    last_press: lastPress,
     ended,
+  }
+}
+
+// 描いたもの（#1962）。S3 の描き方（A/B）では載せない = tako は今の表示のまま（S3 の mod と同じ）
+function currentRenders(): TakoRenders | undefined {
+  if (lastStyle === 's3') return undefined
+  return {
+    band: bandShown,
+    usage_bar: hintBar ? 'prompt_hint' : bandBar ? 'band' : undefined,
+    buttons: bandButtons,
+    band_hook: bandHookSeen,
+    hint_hook: hintHookSeen,
   }
 }
 
@@ -221,6 +308,7 @@ async function tick($: EngineInterface): Promise<void> {
         await goDormant($, 'user_disabled')
         return
       }
+      await syncCommands($)
     }
     if (dirty || now - lastSentAt >= HEARTBEAT_MS) await send($, false, REPORT_TIMEOUT_MS)
   } finally {
@@ -255,6 +343,7 @@ async function wake($: EngineInterface): Promise<void> {
   try {
     await syncStore($)
     await registerCommand($)
+    await syncCommands($)
   } catch (err) {
     $.ui.log(`tako mod: band setup failed: ${String(err).slice(0, 200)}`, { to: 'debug' })
   }
@@ -407,29 +496,81 @@ function limitName(kind: string): string {
 }
 
 /** 帯の区切り 1 つ。rank が小さいほど最後まで残す（0 / 1 = tako とペイン名は落とさない） */
-type BandSegment = { kind: string; label: string; tone?: 'warning'; rank: number }
+type BandSegment = { kind: string; label: string; tone?: 'warning' | 'accent'; rank: number }
 
-// 帯の区切りを左から並べる（何を出すかは tako の view が決めている）
-function segmentsOf(view: TakoView): BandSegment[] {
+/** 押したときにすること（#1962）。tako / shell の argv は tako が組んだもの（view.button_args） */
+type Press = { kind: 'slash'; command: string } | { kind: 'prompt'; text: string } | { kind: 'tako' | 'shell'; argv: string[] }
+
+/** 帯のボタン 1 つ（#1962）。rank は区切りと同じ物差し（左のボタンほど最後まで残す） */
+type BandButton = { button: TakoButton; press: Press; rank: number }
+
+// 帯の区切りを左から並べる（何を出すかは tako の view が決めている）。
+// s3 = #1881 の並び（A/B の S3 の描き方と、ui.json が届かない古い tako の応答）。S7 は ui.json の
+// band.segments の並びで、バーの置き場が帯なら bar（tako が描くと決めたバーの文字列）を ctx / limits の
+// 位置（無ければボタンの前）に 1 つ置く（バーを描くなら tako は警告を送ってこない = 同じ値を 2 か所で
+// 動かさない）
+function segmentsOf(view: TakoView, s3: boolean, bar: string | null): BandSegment[] {
   const w = words(view.lang)
   const name = view.pane_title ?? `pane ${view.pane}`
-  const out: BandSegment[] = [
-    { kind: 'tako', label: 'tako', rank: 0 },
-    { kind: 'pane', label: clipCells(name, NAME_MAX), rank: 1 },
-  ]
-  if (view.tab_title !== undefined && view.tab_title !== '' && view.tab_title !== name) {
-    out.push({ kind: 'tab', label: `${w.tab} ${clipCells(view.tab_title, NAME_MAX)}`, rank: 6 })
-  }
-  if (view.worker_count > 0) out.push({ kind: 'workers', label: w.workers(view.worker_count), rank: 5 })
-  if (view.attention > 0) out.push({ kind: 'attention', label: w.attention(view.attention), tone: 'warning', rank: 2 })
-  view.warnings.forEach((warn, i) => {
+  const pane: BandSegment = { kind: 'pane', label: clipCells(name, NAME_MAX), rank: 1 }
+  const hasTab = view.tab_title !== undefined && view.tab_title !== '' && view.tab_title !== name
+  const tab = (rank: number): BandSegment => ({ kind: 'tab', label: `${w.tab} ${clipCells(view.tab_title ?? '', NAME_MAX)}`, rank })
+  const workers = (rank: number): BandSegment => ({ kind: 'workers', label: w.workers(view.worker_count), rank })
+  const attention: BandSegment = { kind: 'attention', label: w.attention(view.attention), tone: 'warning', rank: 2 }
+  // 使用制限は % の大きい順に来る。小さい方から落とす
+  const warning = (warn: TakoView['warnings'][number], i: number, base: number): BandSegment => {
     const pct = `${Math.round(warn.percent)}%`
-    if (warn.kind === 'ctx') {
-      out.push({ kind: 'ctx', label: `ctx ${pct}`, tone: 'warning', rank: 3 })
+    return warn.kind === 'ctx'
+      ? { kind: 'ctx', label: `ctx ${pct}`, tone: 'warning', rank: base }
+      : { kind: warn.kind, label: `${limitName(warn.kind)} ${pct}`, tone: 'warning', rank: base + 1 + i / 100 }
+  }
+  if (s3) {
+    const out: BandSegment[] = [{ kind: 'tako', label: 'tako', rank: 0 }, pane]
+    if (hasTab) out.push(tab(6))
+    if (view.worker_count > 0) out.push(workers(5))
+    if (view.attention > 0) out.push(attention)
+    view.warnings.forEach((warn, i) => out.push(warning(warn, i, 3)))
+    return out
+  }
+  const out: BandSegment[] = [{ kind: 'tako', label: 'tako', tone: 'accent', rank: 0 }]
+  let barPlaced = bar === null
+  const placeBar = (): void => {
+    if (!barPlaced) out.push({ kind: 'usage', label: bar ?? '', rank: 4 })
+    barPlaced = true
+  }
+  for (const seg of view.ui?.band.segments ?? DEFAULT_SEGMENTS) {
+    if (seg === 'pane') out.push(pane)
+    else if (seg === 'tab' && hasTab) out.push(tab(7))
+    else if (seg === 'workers' && view.worker_count > 0) out.push(workers(6))
+    else if (seg === 'attention' && view.attention > 0) out.push(attention)
+    else if ((seg === 'ctx' || seg === 'limits') && bar !== null) placeBar()
+    else if (seg === 'ctx') view.warnings.filter(warn => warn.kind === 'ctx').forEach((warn, i) => out.push(warning(warn, i, 4)))
+    else if (seg === 'limits') view.warnings.filter(warn => warn.kind !== 'ctx').forEach((warn, i) => out.push(warning(warn, i, 4)))
+    else if (seg === 'buttons') placeBar()
+    // card はコマンドカードを mod で描く #1963 から
+  }
+  placeBar()
+  return out
+}
+
+// 帯のボタン（#1962。ui.json の buttons の並び）。押せないもの（Claude Code に無いコマンド・tako が
+// 引数を組めなかった操作）は描かない。band.segments に buttons が無ければ 1 つも描かない
+function buttonsOf(view: TakoView): BandButton[] {
+  const segments: readonly TakoBandSegment[] = view.ui?.band.segments ?? DEFAULT_SEGMENTS
+  if (!segments.includes('buttons')) return []
+  const out: BandButton[] = []
+  ;(view.ui?.buttons ?? []).forEach((button, i) => {
+    const action = button.action
+    let press: Press | undefined
+    if (action.kind === 'slash') {
+      if (commandNames === undefined || commandNames.has(action.command)) press = { kind: 'slash', command: action.command }
+    } else if (action.kind === 'prompt') {
+      press = { kind: 'prompt', text: action.text }
     } else {
-      // 使用制限は % の大きい順に来る。小さい方から落とす
-      out.push({ kind: warn.kind, label: `${limitName(warn.kind)} ${pct}`, tone: 'warning', rank: 4 + i / 100 })
+      const argv = view.button_args?.[button.id]
+      if (argv !== undefined) press = { kind: action.kind, argv }
     }
+    if (press !== undefined) out.push({ button, press, rank: 3 + i / 100 })
   })
   return out
 }
@@ -438,26 +579,132 @@ function lineWidth(segments: readonly BandSegment[]): number {
   return segments.reduce((sum, seg, i) => sum + cellWidth(seg.label) + (i === 0 ? 0 : SEP.length), 0)
 }
 
-// columns 桁に収まるまで、優先度の低い区切りから落とす（並びは変えない）。
+// tako の行の桁: 区切りの Text と、ボタン 1 つごとに間の 1 桁 + `[ ` ラベル ` ]`
+function rowWidth(segments: readonly BandSegment[], buttons: readonly BandButton[]): number {
+  return lineWidth(segments) + buttons.reduce((sum, b) => sum + BUTTON_GAP + BUTTON_CHROME + cellWidth(b.button.label), 0)
+}
+
+// columns 桁に収まるまで、優先度の低いもの（区切りもボタンも同じ物差し）から落とす（並びは変えない）。
 // tako とペイン名だけでも溢れる幅では、描画側の wrap="truncate-end" が末尾を切る = 必ず 1 行
-function fitBand(view: TakoView, columns: number): BandSegment[] {
-  let kept = segmentsOf(view)
-  const order = [...kept].sort((a, b) => b.rank - a.rank)
+function fitBand(
+  segments: BandSegment[],
+  buttons: BandButton[],
+  columns: number,
+): { segments: BandSegment[]; buttons: BandButton[] } {
+  let keptSegments = segments
+  let keptButtons = buttons
+  const order: Array<BandSegment | BandButton> = [...segments, ...buttons].sort((a, b) => b.rank - a.rank)
   for (const drop of order) {
-    if (lineWidth(kept) <= columns || drop.rank <= 1) break
-    kept = kept.filter(seg => seg !== drop)
+    if (rowWidth(keptSegments, keptButtons) <= columns || drop.rank <= 1) break
+    keptSegments = keptSegments.filter(seg => seg !== drop)
+    keptButtons = keptButtons.filter(b => b !== drop)
   }
-  return kept
+  return { segments: keptSegments, buttons: keptButtons }
 }
 
 // 直近の描画を控え、変わったら次の報告で tako へ返す
-function noteBand(shown: boolean, columns: number | undefined, segments: string[]): void {
-  const key = JSON.stringify([shown, columns, segments])
+function noteBand(shown: boolean, columns: number | undefined, segments: string[], buttons = 0, bar = false): void {
+  const key = JSON.stringify([shown, columns, segments, buttons, bar])
   if (key === lastBandKey) return
   lastBandKey = key
   bandShown = shown
   bandColumns = columns
   bandSegments = segments
+  bandButtons = buttons
+  bandBar = bar
+  dirty = true
+}
+
+// 入力欄の下の行にバーを描いたか（#1962）
+function noteHint(bar: boolean): void {
+  if (bar === hintBar) return
+  hintBar = bar
+  dirty = true
+}
+
+// 使用制限・ctx のバーの文字列（#1962）。描くかは tako が決める（view.usage_bar.draw）。値の無い項目は
+// 飛ばし、1 つも無ければ描かない。形は `<ラベル> <棒> <N>%`（tako は画面を読むときにこの形を除く）
+function barText(view: TakoView): string | null {
+  if (view.band_style === 's3' || view.usage_bar?.draw !== true) return null
+  const parts: string[] = []
+  for (const item of view.ui?.usage_bar.items ?? ['five_hour', 'seven_day', 'ctx']) {
+    const percent = item === 'ctx' ? view.ctx?.percent : view.rate_limits.find(l => l.kind === item)?.percent
+    if (percent === undefined) continue
+    const p = Math.max(0, Math.min(100, Math.round(percent)))
+    parts.push(`${item === 'ctx' ? 'ctx' : limitName(item)} ${BAR_GLYPHS[Math.min(7, Math.floor(p / 12.5))]} ${p}%`)
+  }
+  return parts.length === 0 ? null : parts.join(' ')
+}
+
+// バーの置き場（ui.json が届く前 = 古い tako は既定の prompt_hint）
+function barPlace(view: TakoView): 'prompt_hint' | 'band' | 'off' {
+  return view.ui?.usage_bar.place ?? 'prompt_hint'
+}
+
+// S3（#1881）の描き方（A/B の TAKO_1877_S7_LEGACY）: tako の行の Text 1 本だけを返す（next を包まない）
+function drawBandS3($: EngineInterface, e: RenderInput<'AbovePrompt'>, view: TakoView, columns: number): RenderElement {
+  const segments = fitBand(segmentsOf(view, true, null), [], columns).segments
+  noteBand(true, columns, segments.map(seg => seg.kind))
+  const { Text } = $.ui.resolve(e)
+  const parts: Array<ReturnType<typeof Text> | string> = []
+  segments.forEach((seg, i) => {
+    if (i > 0) parts.push(SEP)
+    parts.push(seg.tone === 'warning' ? Text({ color: 'warning', children: seg.label }) : seg.label)
+  })
+  return Text({ dimColor: true, wrap: 'truncate-end', children: parts })
+}
+
+// tako の行（#1962）: 区切りの Text とボタンを横に並べて 1 行。幅に合わせて優先度の低いものから落とす。
+// 色は ui.json の colors（Claude Code のテーマのキー）
+function bandRow($: EngineInterface, e: RenderInput<'AbovePrompt'>, view: TakoView, columns: number, bar: string | null): RenderElement {
+  const fitted = fitBand(segmentsOf(view, view.ui === undefined, bar), buttonsOf(view), columns)
+  const kinds = fitted.segments.map(seg => seg.kind)
+  if (fitted.buttons.length > 0) kinds.push('buttons')
+  noteBand(true, columns, kinds, fitted.buttons.length, kinds.includes('usage'))
+  const colors = view.ui?.colors ?? DEFAULT_COLORS
+  const { Box, Button, Text } = $.ui.resolve(e)
+  const parts: Array<ReturnType<typeof Text> | string> = []
+  fitted.segments.forEach((seg, i) => {
+    if (i > 0) parts.push(SEP)
+    if (seg.tone === 'warning') parts.push(Text({ color: colors.warn, children: seg.label }))
+    else if (seg.tone === 'accent') parts.push(Text({ color: colors.accent, children: seg.label }))
+    else parts.push(seg.label)
+  })
+  const line = Text({ color: colors.dim, wrap: 'truncate-end', children: parts })
+  if (fitted.buttons.length === 0) return line
+  const buttons = fitted.buttons.map(b =>
+    Button({ key: `tako-button-${b.button.id}`, label: b.button.label, hotkey: b.button.hotkey, onPress: () => pressButton($, b.press) }),
+  )
+  return Box({ flexDirection: 'row', columnGap: BUTTON_GAP, children: [line, ...buttons] })
+}
+
+// 他の mod の行（next(e) の答え）を上に、tako の行を下に並べる（#1962 / 設計書 §9.5）。下に誰も
+// 居なければ答えはエンジン自身の描画（{ type: 'engine' }。調査票の無い帯は空）なので tako の行だけ
+function stackBand($: EngineInterface, e: RenderInput<'AbovePrompt'>, below: RenderElement, row: RenderElement): RenderElement {
+  if (below.type === 'engine') return row
+  const { Box } = $.ui.resolve(e)
+  return Box({ flexDirection: 'column', children: [below, row] })
+}
+
+// ボタンを押したとき（#1962）。語彙どおりに実行し、結果（種類と成否だけ）を次の報告で tako へ返す。
+// tako / shell は tako が組んだ CLI の引数をそのまま渡す（ここでシェルの文字列は組まない）
+async function pressButton($: EngineInterface, press: Press): Promise<void> {
+  let ok = false
+  try {
+    if (press.kind === 'slash') {
+      await $.command.run({ command: press.command })
+      ok = true
+    } else if (press.kind === 'prompt') {
+      ok = (await $.prompt.fill({ text: press.text, mode: 'insert' })).isFilled
+    } else if (cli !== undefined) {
+      const done = await $.process.run([cli, ...press.argv], { timeoutMs: PRESS_TIMEOUT_MS })
+      ok = done.exitCode === 0
+      if (!ok) $.ui.log(`tako mod: button exit ${done.exitCode}: ${done.stderr.trim().slice(0, 200)}`, { to: 'debug' })
+    }
+  } catch (err) {
+    $.ui.log(`tako mod: button failed: ${String(err).slice(0, 200)}`, { to: 'debug' })
+  }
+  lastPress = { kind: press.kind, ok, at: await $.clock.now() }
   dirty = true
 }
 
@@ -537,6 +784,11 @@ async function absorb($: EngineInterface, stdout: string): Promise<void> {
   if (view !== null) {
     viewAt = await $.clock.now()
     lang = view.lang
+    const style = view.band_style === 's3' ? 's3' : undefined
+    if (style !== lastStyle) {
+      lastStyle = style
+      dirty = true
+    }
     if (commandLang !== lang) {
       try {
         await registerCommand($)
@@ -663,9 +915,14 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // 帯（プロンプトの上の 1 行）。tako の外・材料が無い（古い）・隠している・調査票が使っている
-  // ときは何も描かない。権限ダイアログ・質問の表示中はそもそも Claude Code が帯を出さない
+  // 帯（プロンプトの上）。他の mod の行（next(e) の答え）を必ず包み、その下に tako の行を 1 行（#1962）。
+  // tako の外・材料が無い（古い）・隠している・調査票が使っているときは下へ譲るだけ。
+  // 権限ダイアログ・質問の表示中はそもそも Claude Code が帯を出さない
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!bandHookSeen) {
+      bandHookSeen = true
+      dirty = true
+    }
     const view = (await $.state.get(VIEW)).value ?? null
     const hidden = (await $.state.get(HIDDEN)).value ?? false
     const columns = e.props.bodyColumns
@@ -673,15 +930,27 @@ export const register: Register = on => {
       noteBand(false, columns, [])
       return next(e)
     }
-    const segments = fitBand(view, columns)
-    noteBand(true, columns, segments.map(seg => seg.kind))
-    const { Text } = $.ui.resolve(e)
-    const parts: Array<ReturnType<typeof Text> | string> = []
-    segments.forEach((seg, i) => {
-      if (i > 0) parts.push(SEP)
-      parts.push(seg.tone === 'warning' ? Text({ color: 'warning', children: seg.label }) : seg.label)
-    })
-    return Text({ dimColor: true, wrap: 'truncate-end', children: parts })
+    // A/B（TAKO_1877_S7_LEGACY）: S3 の描き方 = tako の行だけを返す
+    if (view.band_style === 's3') return drawBandS3($, e, view, columns)
+    const below = await next(e)
+    const bar = barPlace(view) === 'band' ? barText(view) : null
+    return stackBand($, e, below, bandRow($, e, view, columns, bar))
+  }).catch(($, e, next) => next(e))
+
+  // 入力欄の下の行（#1962）: 末尾（tail）に使用制限・ctx のバー。描くかは tako（view.usage_bar）。
+  // 行そのもの（hint）は書き換えず、他の mod が足した tail の後ろへ足して必ず next へ流す。
+  // tail を描くのは端末だけ（desktop は描かない = 描いたと報告しない）
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (!hintHookSeen) {
+      hintHookSeen = true
+      dirty = true
+    }
+    const view = (await $.state.get(VIEW)).value ?? null
+    const bar = cli === undefined || view === null || e.surface !== 'terminal' || barPlace(view) !== 'prompt_hint' ? null : barText(view)
+    noteHint(bar !== null)
+    if (bar === null) return next(e)
+    const tail = e.props.tail === undefined || e.props.tail === '' ? bar : `${e.props.tail} · ${bar}`
+    return next({ ...e, props: { ...e.props, tail } })
   }).catch(($, e, next) => next(e))
 
   // `/tako` のサイドバー（詳細）
