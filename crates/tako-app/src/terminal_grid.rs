@@ -395,7 +395,9 @@ pub(crate) fn strikeout_y(line_height: f32, ascent: Option<(f32, f32)>) -> f32 {
 
 /// 端末グリッド 1 ペインぶんを描く element（#787）
 pub(crate) struct TerminalGrid {
-    rows: Vec<RowPlan>,
+    /// 行の組み立て結果。たまり場のサムネイル（#1946）は変化したときだけ組み直して
+    /// フレームをまたいで使い回すので、深いコピーをしない `Rc` で持つ
+    rows: std::rc::Rc<Vec<RowPlan>>,
     cell: Size<Pixels>,
     font_size: Pixels,
     base_font: Font,
@@ -405,14 +407,14 @@ pub(crate) struct TerminalGrid {
 
 impl TerminalGrid {
     pub(crate) fn new(
-        rows: Vec<RowPlan>,
+        rows: impl Into<std::rc::Rc<Vec<RowPlan>>>,
         cell: Size<Pixels>,
         font_size: Pixels,
         base_font: Font,
         subline: Pixels,
     ) -> Self {
         Self {
-            rows,
+            rows: rows.into(),
             cell,
             font_size,
             base_font,

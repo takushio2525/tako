@@ -8,6 +8,7 @@ pub mod agent_resume;
 pub mod agent_support;
 pub mod backend;
 pub mod backend_reattach;
+pub mod background_groups;
 pub mod byte_lru;
 pub mod claude_mod;
 pub mod claude_mod_install;
