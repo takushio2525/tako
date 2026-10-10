@@ -433,3 +433,24 @@ changes:
         具体的な行数つきで返る
       - AI からは MCP `tako_orchestrator_guide({ topic: "local-rules" })` /
         `tako_migrate` で同じ操作ができる
+  - revision: 20
+    version: "0.8.29"
+    date: "2026-10-09"
+    kind: auto
+    title: Claude Code の画面の UI（tako mod のボタン・バー・帯の区切り・色）を選んで調整できるようになった
+    description: |
+      tako のペインの Claude Code に出る tako の帯・ボタン・使用量のバーの調整を、
+      選ぶだけの定型の設定（`<data_dir>/claude-mod/ui.json`。Issue #1960）で持つようにした。
+      Claude Code の設定 dir には何も書かない。既定のボタンは `/compact` のワンボタン 1 個。
+
+      変える口（どれも同じ検証で、語彙の外の値は書かずに使える値を返す）:
+        - `tako mod ui`（引数なしで今の値と選べる値）/ `tako mod ui button add compact` /
+          `tako mod ui set usage_bar.place off` / `tako mod ui preset recommended` / `tako mod ui reset`
+        - MCP `tako_mod` の `action=ui`
+        - `tako setup --review` の最後の 3 択（既定 / おすすめ / 最小）とボタン選び、`--answers` の `mod_ui`
+
+      確認事項（**手作業は不要**）:
+      - ファイルが無いあいだは既定で動く（setup も書かない）。読めない ui.json は読める部分で動き、
+        元は `ui.json.unreadable.bak` に残る
+      - 帯の表示 / 非表示（`tako mod band on|off`・Claude Code の中の `/tako band on|off`）も
+        ui.json の `band.hidden` に揃う。ボタン・バーの描画は mod の更新で入る（Issue #1962）

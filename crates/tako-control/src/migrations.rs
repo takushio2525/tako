@@ -474,6 +474,18 @@ pub const SPECS: &[SchemaSpec] = &[
     // いても意図は在ったとみなす）。検査を付けると、壊れた `since` を理由に
     // 移行が `.unreadable.bak` へ退避 = **ユーザーの意図が黙って消える**
     pristine(SchemaId::RemoteDesired, None),
+    // #1960: tako mod の定型の UI 設定。版数は `schema_version` で持つ（`detect` は core の 1 実装）。
+    // 検査は core の寛容な読み込みと同じ判定（壊れた部分があれば退避 = 読む側は読める部分を使う）。
+    // 新しい形（schema_version が大きい）は検査を通して、計画が「目標超過」で触らずに断る
+    SchemaSpec {
+        id: SchemaId::ClaudeModUi,
+        target_version: tako_core::claude_mod_ui::SCHEMA_VERSION,
+        detect: tako_core::claude_mod_ui::detect_version,
+        steps: &[],
+        once_markers: &[],
+        validate: Some(tako_core::claude_mod_ui::validate_text),
+        preserve_unreadable: true,
+    },
 ];
 
 /// 種別から登録を引く
@@ -529,6 +541,7 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
             single(&format!("remote/{}", tako_core::remote_shortcuts::FILENAME))
         }
         SchemaId::RemoteDesired => single("remote/tako-remote.desired"),
+        SchemaId::ClaudeModUi => tako_core::claude_mod_ui::ui_path().into_iter().collect(),
     }
 }
 

@@ -1893,11 +1893,12 @@ pub enum Request {
         pane: Option<u64>,
     },
     /// tako mod（Claude Code の mod 連携。FR-2.42 / Issue #1879）。
-    /// `action` = "status"（既定）/ "on" / "off" / "report"。
+    /// `action` = "status"（既定）/ "on" / "off" / "band-on" / "band-off" / "ui" / "report"。
     ///
     /// `report` は mod が `tako mod report`（stdin の JSON）から送る状態報告で、`report` に
     /// 報告本体、`pane` に送り主（CLI が `TAKO_PANE_ID` から埋める）が入る。
-    /// **MCP には載せない**（AI が叩くと自分の状態を偽れるだけ。理由は FR-2.42）
+    /// **MCP には載せない**（AI が叩くと自分の状態を偽れるだけ。理由は FR-2.42）。
+    /// `ui` は定型の UI 設定 ui.json の操作（#1960。`action` = "ui" のときだけ読む）
     Mod {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         action: Option<String>,
@@ -1905,6 +1906,8 @@ pub enum Request {
         report: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui: Option<tako_core::claude_mod_ui::UiRequest>,
     },
     /// シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除（Issue #525 / #467）。
     /// `action` = "status"（既定）/ "install" / "uninstall"。

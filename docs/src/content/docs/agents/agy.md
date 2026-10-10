@@ -85,7 +85,7 @@ agy だけが入っている環境でも `tako setup` は完了しますが、`t
 
 ## Claude Code との差分
 
-現時点で 54 件中 24 件が「対応」です（一部対応 4 件・未対応 16 件・対象外 10 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 55 件中 24 件が「対応」です（一部対応 4 件・未対応 17 件・対象外 10 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent agy

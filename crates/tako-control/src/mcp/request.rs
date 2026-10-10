@@ -1004,10 +1004,25 @@ pub(super) fn build_request(
                     ));
                 }
             }
+            // #1960: action=ui の引数（op / key / value / kind / id / label / hotkey / to）は
+            // CLI `tako mod ui` と同じ形（`UiRequest`）へそのまま写す。検証は dispatch の 1 実装
+            let ui = if action.as_deref() == Some("ui") {
+                let mut fields = args.as_object().cloned().unwrap_or_default();
+                fields.remove("action");
+                Some(
+                    serde_json::from_value::<tako_core::claude_mod_ui::UiRequest>(Value::Object(
+                        fields,
+                    ))
+                    .map_err(|e| format!("action=ui の引数が読めない: {e}"))?,
+                )
+            } else {
+                None
+            };
             Request::Mod {
                 action,
                 report: None,
                 pane: None,
+                ui,
             }
         }
         "tako_shell_integration" => Request::ShellIntegration {

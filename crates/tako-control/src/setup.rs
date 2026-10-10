@@ -162,6 +162,9 @@ pub struct SetupAnswers {
     /// AI 系設定の git 共有（Issue #513）。**オプション**なので省略時は何もしない
     /// （標準 setup の質問ゼロ原則 #262 を守る）。明示指定か `--review` でだけ配線する
     pub config_share: Option<SetupConfigShareAnswers>,
+    /// Claude Code の画面の UI（tako mod の ui.json。#1960）。省略時は今の値のまま。
+    /// 検証は `tako mod ui` / MCP `tako_mod` の `action=ui` と同じ 1 実装
+    pub mod_ui: Option<tako_core::claude_mod_ui::UiAnswers>,
 }
 
 /// 設定共有の回答（Issue #513）
@@ -244,6 +247,11 @@ impl SetupAnswers {
                     "launch_agent は claude / codex / agy / none のいずれかです: {agent}"
                 ));
             }
+        }
+        if let Some(mod_ui) = &self.mod_ui {
+            // 書く前に断る（setup の途中で半端に止まらない）。文言は CLI / MCP と同じ
+            tako_core::claude_mod_ui::check_answers(mod_ui)
+                .map_err(|e| format!("mod_ui: {}", e.message()))?;
         }
         if let Some(sleep) = &self.sleep_guard {
             if let Some(mode) = sleep.mode.as_deref() {

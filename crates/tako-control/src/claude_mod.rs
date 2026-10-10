@@ -7,7 +7,8 @@
 //! |---|---|---|---|
 //! | `status`（既定） | 展開先・版・注入の有無・ペインごとの最終報告（鮮度つき） | `tako mod` | `tako_mod` |
 //! | `on` / `off` | 設定 `claude_mod` の切替（次に作るペインから） | `tako mod on` / `off` | `tako_mod` |
-//! | `band-on` / `band-off` | Claude Code の画面の帯を出す / 隠す（S3 #1881。報告の応答で全 mod へ中継） | `tako mod band on` / `off` | `tako_mod` |
+//! | `band-on` / `band-off` | Claude Code の画面の帯を出す / 隠す（S3 #1881。正本は ui.json の `band.hidden` = #1960。報告の応答で全 mod へ中継） | `tako mod band on` / `off` | `tako_mod` |
+//! | `ui` | 定型の UI 設定 ui.json の表示と変更（#1960。本体は [`crate::claude_mod_ui`]） | `tako mod ui …`（ローカル処理） | `tako_mod` |
 //! | `report` | mod からの状態報告。応答は tako 側のスナップショット（帯・サイドバーの材料） | `tako mod report`（stdin） | **出さない** |
 //!
 //! `report` を MCP に載せないのは、AI が叩くと**自分の状態を偽って注入できるだけ**で、
@@ -26,9 +27,9 @@ use crate::dispatch::DispatchError;
 use crate::host::ControlHost;
 
 /// CLI / dispatch が受け付ける action
-pub const ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off", "report"];
+pub const ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off", "ui", "report"];
 /// MCP が受け付ける action（`report` は載せない。モジュール冒頭の理由）
-pub const MCP_ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off"];
+pub const MCP_ACTIONS: &[&str] = &["status", "on", "off", "band-on", "band-off", "ui"];
 
 /// `tako setup` の段（設計書 §3.2。GUI 起動時と並ぶ 2 つ目の発火点）。
 ///
@@ -226,6 +227,7 @@ pub fn run(
     action: Option<&str>,
     report: Option<Value>,
     pane: Option<u64>,
+    ui: Option<tako_core::claude_mod_ui::UiRequest>,
 ) -> Result<Value, DispatchError> {
     match action.unwrap_or("status") {
         "status" => status(host),
@@ -240,14 +242,15 @@ pub fn run(
             Ok(out)
         }
         "band-on" | "band-off" => {
-            let hidden = action == Some("band-off");
-            host.claude_mod_mut()
-                .ok_or_else(|| {
-                    DispatchError::Operation(
-                        "この tako は mod を扱わない（2 つ目のインスタンス等）".into(),
-                    )
-                })?
-                .request_band(hidden, epoch_ms());
+            hub(host)?;
+            // #1960: 正本は ui.json の band.hidden（`tako mod ui set band.hidden` と同じ 1 実装）
+            let request = tako_core::claude_mod_ui::UiRequest {
+                op: Some("set".into()),
+                key: Some("band.hidden".into()),
+                value: Some(json!(action == Some("band-off"))),
+                ..Default::default()
+            };
+            crate::claude_mod_ui::run(&ui_path(host)?, &request).map_err(ui_error)?;
             let mut out = status(host)?;
             out["applies_to"] = json!(
                 "動いている claude の帯へ次の報告（最大 15 秒）で届く。Claude Code の中で /tako band on|off \
@@ -255,11 +258,28 @@ pub fn run(
             );
             Ok(out)
         }
+        "ui" => {
+            crate::claude_mod_ui::run(&ui_path(host)?, &ui.unwrap_or_default()).map_err(ui_error)
+        }
         "report" => accept_report(host, report, pane),
         other => Err(DispatchError::InvalidParams(format!(
             "未知の action: {other}（{}）",
             ACTIONS.join(" / ")
         ))),
+    }
+}
+
+/// ui.json の置き場（ホストが決める。テストのホストは自分の一時ファイル）
+fn ui_path(host: &dyn ControlHost) -> Result<std::path::PathBuf, DispatchError> {
+    host.claude_mod_ui_path().ok_or_else(|| {
+        DispatchError::Operation("データディレクトリが決まらない（HOME が無い）".into())
+    })
+}
+
+fn ui_error(e: crate::claude_mod_ui::RunError) -> DispatchError {
+    match e {
+        crate::claude_mod_ui::RunError::Invalid(m) => DispatchError::InvalidParams(m),
+        crate::claude_mod_ui::RunError::Refused(m) => DispatchError::Operation(m),
     }
 }
 
@@ -284,6 +304,14 @@ fn accept_report(
     })?;
     let parsed = core::parse_report(value).map_err(DispatchError::InvalidParams)?;
     let pane_id = resolve_reporting_pane(host, pane)?;
+    // #1960: 帯のトグルの正本は ui.json。mod の中で切り替えた（`$.store` の時刻が新しい）なら取り込む
+    if let (Some(band), Some(path), false) = (
+        parsed.band.as_ref(),
+        host.claude_mod_ui_path(),
+        core::s3_legacy(),
+    ) {
+        crate::claude_mod_ui::import_band(&path, band);
+    }
     let accepted = host
         .claude_mod_mut()
         .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?
@@ -353,8 +381,12 @@ fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandVi
             .ok()
             .and_then(|s| s.report.context.clone()),
         rate_limits: account_rate_limits(host, pane, now),
-        band_request: host.claude_mod().and_then(|h| h.band_request),
         thresholds: core::band_thresholds(),
+        // #1960: 検証済みの ui.json（読めない部分は既定。帯のトグルの中継もここから作る）
+        ui: host
+            .claude_mod_ui_path()
+            .map(|p| crate::claude_mod_ui::view(&p))
+            .unwrap_or_default(),
     })
 }
 
@@ -395,7 +427,7 @@ fn worker_facts(host: &dyn ControlHost, pane: &tako_core::Pane, now: Instant) ->
 }
 
 /// いまの時刻（epoch ms。mod の `$.clock.now()` と同じ物差し）
-fn epoch_ms() -> u64 {
+pub(crate) fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -488,6 +520,8 @@ fn report_json(stored: &StoredReport, now: Instant) -> Value {
 fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
     let hub = hub(host)?;
     let now = Instant::now();
+    let ui_path = host.claude_mod_ui_path();
+    let ui = ui_path.as_deref().map(crate::claude_mod_ui::load);
     let injection = hub.decide(core::ab_off());
     let mut panes = Vec::new();
     for tab in host.workspace().tabs() {
@@ -512,9 +546,11 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
     Ok(json!({
         "enabled": hub.enabled,
         "injecting": injection.is_on(),
-        // S3（#1881）: 帯の中継（`tako mod band on|off`）と A/B。ペインごとの帯の状態は行の report.band
+        // S3（#1881）: 帯の中継と A/B。ペインごとの帯の状態は行の report.band。
+        // 中継の正本は ui.json の band.hidden（#1960）
         "band": {
-            "request": hub.band_request,
+            "request": ui.as_ref().and_then(|u| u.config.band_request()),
+            "hidden": ui.as_ref().is_some_and(|u| u.config.band.hidden),
             "legacy": core::s3_legacy(),
             "ctx_percent": core::band_thresholds().ctx_percent,
             "limit_percent": core::band_thresholds().limit_percent,
@@ -532,6 +568,11 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
         "mod_version": env!("CARGO_PKG_VERSION"),
         "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
         "summary": summary,
+        // #1960: 定型の UI 設定（詳細と変更は `tako mod ui`）
+        "ui": ui_path
+            .as_deref()
+            .zip(ui.as_ref())
+            .map(|(path, loaded)| crate::claude_mod_ui::status_json(path, loaded)),
         "panes": panes,
     }))
 }

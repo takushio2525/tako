@@ -378,18 +378,18 @@ fn load_and_report(path: &std::path::Path) -> (Option<Settings>, Option<String>)
 /// 「1 プロセス 1 回」で抑えていたので、実行中にもう一度（別の中身で）壊れても
 /// 記録が残らなかった（実測）。いまは「そのファイルで直前に申告した中身と違う」ときに
 /// 申告し、読めた回に忘れる（壊れる → 直る → 同じ中身でまた壊れる、も 2 回と数える）
-struct UnreadableSeen(std::sync::Mutex<Vec<(PathBuf, String)>>);
+pub(crate) struct UnreadableSeen(std::sync::Mutex<Vec<(PathBuf, String)>>);
 
 static UNREADABLE_SEEN: UnreadableSeen = UnreadableSeen::new();
 
 impl UnreadableSeen {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self(std::sync::Mutex::new(Vec::new()))
     }
 
     /// そのファイルがこの中身で壊れているのを見たのが初めてなら true
     /// （以後は同じ中身のあいだ false）
-    fn first_sighting(&self, path: &std::path::Path, body: &str) -> bool {
+    pub(crate) fn first_sighting(&self, path: &std::path::Path, body: &str) -> bool {
         let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match seen.iter_mut().find(|(p, _)| p == path) {
             Some((_, last)) if last == body => false,
@@ -405,7 +405,7 @@ impl UnreadableSeen {
     }
 
     /// 読めた = 直った。次に壊れたら中身が前と同じでも申告する
-    fn forget(&self, path: &std::path::Path) {
+    pub(crate) fn forget(&self, path: &std::path::Path) {
         let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
         seen.retain(|(p, _)| p != path);
     }

@@ -512,6 +512,16 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // #1960: `claude-mod/` の中で ui.json だけは利用者が選んだ画面の好み（ボタン・バー・色）。
+    // settings.json と同じ宣言的な設定なので共有する（完全一致がディレクトリより優先）
+    Entry {
+        root: Root::TakoData,
+        path: "claude-mod/ui.json",
+        class: Class::Shared,
+        note: notes::DECLARATIVE,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::TakoData,
         path: "setup/",

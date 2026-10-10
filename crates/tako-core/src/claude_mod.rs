@@ -18,8 +18,10 @@
 //!   画面下のステータスバーの 5h / 7d も同じ束ねた値を先に見る（[`bar_limits`]。#1903）
 //! - **画面に出す（S3 #1881）**: 報告の応答に帯・サイドバーの材料（[`BandView`]）を載せる。
 //!   何を出すか（worker の状態・要注意・閾値を超えた ctx / 使用制限）は [`band_view`] が決め、
-//!   mod は幅に合わせて 1 行に詰めて描くだけ。帯を隠すトグルは mod の `$.store` が正本で、
-//!   `tako mod band on|off` は応答に載せて中継する（[`ModHub::request_band`]）
+//!   mod は幅に合わせて 1 行に詰めて描くだけ。帯を隠すトグルの正本は ui.json の `band.hidden`
+//!   （#1960。[`crate::claude_mod_ui`]）で、応答の `band_request` で全 mod へ中継する
+//! - **定型の UI 設定（S7-2 #1960）**: 報告の応答の `tako.view.ui` に検証済みの ui.json を載せる
+//!   （[`BandView::ui`]。mod はファイルを読まない）
 //!
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
@@ -918,9 +920,6 @@ pub struct ModHub {
     pub injections: HashMap<u64, PaneInjection>,
     /// ペインごとの最終報告
     pub reports: HashMap<u64, StoredReport>,
-    /// `tako mod band on|off` の中継（S3 #1881）。報告の応答に載せて全 mod へ渡す。
-    /// メモリだけ（mod 側の `$.store` が正本で、tako の再起動で消えても mod の保存は残る）
-    pub band_request: Option<BandRequest>,
 }
 
 /// [`ModHub::accept`] の結果
@@ -1049,11 +1048,6 @@ impl ModHub {
     pub fn forget_pane(&mut self, pane: u64) {
         self.injections.remove(&pane);
         self.reports.remove(&pane);
-    }
-
-    /// `tako mod band on|off`（S3 #1881）。`at` は epoch ms（mod の `$.store` の時刻と比べる）
-    pub fn request_band(&mut self, hidden: bool, at: u64) {
-        self.band_request = Some(BandRequest { hidden, at });
     }
 }
 
@@ -1241,7 +1235,9 @@ pub struct BandLimit {
     pub resets_at: Option<i64>,
 }
 
-/// `tako mod band on|off` の中継（[`ModHub::request_band`]）
+/// 帯のトグルの中継（応答の `band_request`）。正本は ui.json の `band.hidden` / `toggled_at`
+/// （#1960。[`crate::claude_mod_ui::UiConfig::band_request`]）で、`tako mod band on|off`・
+/// `tako mod ui set band.hidden`・mod の報告の取り込みのどれで変わっても同じ形で届く
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BandRequest {
     pub hidden: bool,
@@ -1286,6 +1282,8 @@ pub struct BandView {
     pub thresholds: BandThresholds,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band_request: Option<BandRequest>,
+    /// 定型の UI 設定（#1960。検証済みの ui.json。mod の契約は `TakoUi`）
+    pub ui: crate::claude_mod_ui::UiConfig,
 }
 
 /// [`band_view`] の入力
@@ -1300,8 +1298,9 @@ pub struct BandInput {
     pub ctx: Option<ModContext>,
     /// このペインのアカウントの使用制限（束ね済み）
     pub rate_limits: Vec<ModRateLimit>,
-    pub band_request: Option<BandRequest>,
     pub thresholds: BandThresholds,
+    /// 定型の UI 設定（#1960）。帯のトグルの中継（`band_request`）もここから作る
+    pub ui: crate::claude_mod_ui::UiConfig,
 }
 
 impl Default for BandThresholds {
@@ -1354,7 +1353,8 @@ pub fn band_view(input: BandInput) -> BandView {
             })
             .collect(),
         thresholds: input.thresholds,
-        band_request: input.band_request,
+        band_request: input.ui.band_request(),
+        ui: input.ui,
     }
 }
 
@@ -2158,11 +2158,13 @@ mod tests {
                 percent: Some(85),
             }),
             rate_limits: vec![limit("five_hour", 3.0, "2026-10-08T19:30:00Z", 1)],
-            band_request: Some(BandRequest {
-                hidden: true,
-                at: 42,
-            }),
             thresholds: BandThresholds::default(),
+            ui: {
+                let mut ui = crate::claude_mod_ui::UiConfig::default();
+                ui.band.hidden = true;
+                ui.band.toggled_at = Some(42);
+                ui
+            },
         });
         assert_eq!(view.worker_count, BAND_MAX_WORKERS + 5, "数は全部数える");
         assert_eq!(view.attention, 2);
@@ -2180,6 +2182,13 @@ mod tests {
         let v = serde_json::to_value(&view).unwrap();
         assert_eq!(v["thresholds"]["ctx_percent"], BAND_CTX_PERCENT);
         assert_eq!(v["band_request"]["hidden"], true);
+        assert_eq!(
+            v["band_request"]["at"], 42,
+            "中継は ui.json の toggled_at から作る"
+        );
+        // #1960: 検証済みの ui.json を `ui` に載せる（既定のボタンは /compact）
+        assert_eq!(v["ui"]["schema_version"], 1);
+        assert_eq!(v["ui"]["buttons"][0]["action"]["command"], "compact");
         assert_eq!(v["workers"][1]["state"], "waiting");
         assert!(v["workers"][4].get("attention").is_none());
     }
@@ -2200,14 +2209,20 @@ mod tests {
         assert!(parse_report(report_json()).unwrap().band.is_none());
     }
 
+    /// #1960: 中継の正本は ui.json。誰も切り替えていなければ載せない（mod の `$.store` のまま）
     #[test]
-    fn issue1881_帯のトグルの中継は最後の依頼だけを持つ() {
-        let mut hub = ModHub::new(true);
-        assert!(hub.band_request.is_none());
-        hub.request_band(true, 10);
-        hub.request_band(false, 20);
+    fn issue1960_帯のトグルの中継はuijsonから作る() {
+        let view = band_view(BandInput::default());
+        assert_eq!(view.band_request, None);
+        let mut ui = crate::claude_mod_ui::UiConfig::default();
+        ui.band.hidden = false;
+        ui.band.toggled_at = Some(20);
+        let view = band_view(BandInput {
+            ui,
+            ..BandInput::default()
+        });
         assert_eq!(
-            hub.band_request,
+            view.band_request,
             Some(BandRequest {
                 hidden: false,
                 at: 20

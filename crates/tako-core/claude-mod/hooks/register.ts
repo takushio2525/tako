@@ -8,8 +8,9 @@
 //   幅（bodyColumns）に収まらなければ優先度の低い区切りから落とし、それでも溢れたら末尾を切る
 //   = **必ず 1 行**。権限ダイアログ・質問の表示中は Claude Code が帯ごと隠すので「承認待ち」は出さない
 // - `/tako`: サイドバーのペイン（$.ui.open）に詳細。頼まれずには開かない（開くのはコマンドだけ）
-// - 帯を隠すトグル: $.store の `band`（{ hidden, at }）が正本。`/tako band on|off`・ペインのボタン・
-//   tako からの中継（`tako mod band on|off` = 応答の view.band_request）のうち、時刻の新しいものが勝つ
+// - 帯を隠すトグル: 正本は tako の ui.json の band.hidden（#1960）。$.store の `band`（{ hidden, at }）は
+//   この読み込み元の写しで、`/tako band on|off`・ペインのボタンで変えたら報告の band.toggled_at で tako へ
+//   渡り、tako が ui.json へ取り込む。tako からは応答の view.band_request で届く。時刻の新しいものが勝つ
 // 何を出すかの判断は tako 側（tako_core::claude_mod::band_view）。ここは幅に合わせて詰めて描くだけ
 //
 // 守っていること（§5 の規約。番犬 crates/tako-control/tests/issue1879_claude_mod_watchdog.rs が走査する）:
@@ -445,7 +446,8 @@ async function setView($: EngineInterface, view: TakoView | null): Promise<void>
   await $.state.set(VIEW, view)
 }
 
-// トグルを変える（$.store が正本。$.state は描画の購読のための写し）
+// トグルを変える（$.store はこの読み込み元の写し。正本の ui.json へは報告の toggled_at で渡る = #1960。
+// $.state は描画の購読のための写し）
 async function setHidden($: EngineInterface, hidden: boolean, at: number): Promise<void> {
   bandToggledAt = at
   if (hidden !== bandHidden) {

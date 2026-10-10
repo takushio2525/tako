@@ -3497,18 +3497,30 @@ struct ShellIntegrationArgs {
 /// `--help` の候補に出さない（受け付けはする）
 #[derive(Args)]
 struct ModArgs {
-    /// on / off（省略時は状態を表示）。band = Claude Code の画面の帯（band on / band off）
+    /// on / off（省略時は状態を表示）。band = Claude Code の画面の帯（band on / band off）。
+    /// ui = 画面の UI 設定（ボタン・バー・帯の区切り・色。引数なしで今の値と選べる値）
     #[arg(value_parser = clap::builder::PossibleValuesParser::new([
         clap::builder::PossibleValue::new("status"),
         clap::builder::PossibleValue::new("on"),
         clap::builder::PossibleValue::new("off"),
         clap::builder::PossibleValue::new("band"),
+        clap::builder::PossibleValue::new("ui"),
         clap::builder::PossibleValue::new("report").hide(true),
     ]))]
     action: Option<String>,
-    /// band のとき: on = 帯を出す / off = 隠す（動いている claude へ次の報告で届く）
-    #[arg(value_parser = ["on", "off"])]
-    state: Option<String>,
+    /// band のとき: on = 帯を出す / off = 隠す（動いている claude へ次の報告で届く）。
+    /// ui のとき: set <キー> <値> / button add [<kind>] <中身> / button remove <id> /
+    /// button move <id> <先> / preset <名前> / reset
+    rest: Vec<String>,
+    /// ui の button add: ボタンの表示名（16 桁まで。省くと中身から決める）
+    #[arg(long)]
+    label: Option<String>,
+    /// ui の button add: 押すキー（数字か英小文字 1 字。省くと空いている英字）
+    #[arg(long)]
+    hotkey: Option<String>,
+    /// ui の button add: ボタンの id（省くと中身から決める）
+    #[arg(long)]
+    id: Option<String>,
     /// 生の JSON で出力する
     #[arg(long)]
     json: bool,
@@ -4266,6 +4278,10 @@ fn cli_main() -> ExitCode {
         // GUI を必要としないローカル処理（platform と同じ扱い）。
         // 実体は dispatch と共通の tako_control::shell_integration::run
         Command::ShellIntegration(ref args) => shell_integration_local(args),
+        // #1960: 画面の UI 設定（ui.json）は tako の data dir のファイルなのでローカル処理。
+        // **GUI が動いていなくても変えられる**（setup の途中・GUI を起動する前）。実体は
+        // dispatch（MCP `tako_mod` の action=ui）と共通の tako_control::claude_mod_ui::run
+        Command::Mod(ref args) if args.action.as_deref() == Some("ui") => mod_ui_local(args),
         Command::Config(ref args) => config_share_local(args),
         // run-interactive --wait は起動 + ポーリングの合成。終了コードは結末から決まる
         // （上限で打ち切ったら 124 = `timeout(1)` と同じ。#1778）
@@ -6984,6 +7000,124 @@ fn read_mod_report() -> Result<Value, String> {
     serde_json::from_str(&input).map_err(|e| format!("報告の JSON を読めない: {e}"))
 }
 
+/// `tako mod ui …`（#1960。ローカル処理 = GUI 不要）。引数の読み方も操作も
+/// `tako_control::claude_mod_ui` の 1 実装（MCP `tako_mod` の action=ui と同じ応答）。
+/// 断ったら理由と使える値を出して終了コード 1（ui.json は書いていない）
+fn mod_ui_local(args: &ModArgs) -> Result<(), String> {
+    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    let request = tako_control::claude_mod_ui::cli_request(
+        &args.rest,
+        args.label.as_deref(),
+        args.hotkey.as_deref(),
+        args.id.as_deref(),
+    )?;
+    let path = tako_control::claude_mod_ui::default_path()?;
+    let out =
+        tako_control::claude_mod_ui::run(&path, &request).map_err(|e| e.message().to_string())?;
+    if args.json {
+        println!("{}", pretty_json(&out));
+    } else {
+        print_mod_ui(&out);
+    }
+    Ok(())
+}
+
+/// `tako mod ui` の表示（今の値・ボタン・選べる値。変更の後は結果と今の値だけ）
+fn print_mod_ui(out: &Value) {
+    let path = tako_core::paths::shorten_home(out["path"].as_str().unwrap_or("-"));
+    let state = match out["state"].as_str() {
+        Some("absent") => "（ファイルは無い = 既定で動いている）".to_string(),
+        Some("repaired") => format!(
+            "（読めない部分を既定で動かした。元は {} に残した）",
+            tako_core::paths::shorten_home(out["quarantine"].as_str().unwrap_or("-"))
+        ),
+        Some("future") => "（新しい tako が書いた形。読める範囲で使い、書き換えない）".to_string(),
+        Some("read_error") => "（読めないので既定で動いている）".to_string(),
+        _ => String::new(),
+    };
+    match out["changed"].as_bool() {
+        Some(true) => println!("変えた: {path}"),
+        Some(false) => println!("変わらない（もうその値）: {path}"),
+        None => println!("Claude Code の画面の UI（tako mod）: {path}{state}"),
+    }
+    let choices = &out["choices"];
+    let word_list = |v: &Value| {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .map(|w| w.as_str().map_or_else(|| w.to_string(), str::to_string))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // 並びは語彙の順（JSON のオブジェクトはキーの辞書順に並ぶので、そのまま回さない）
+    use tako_core::claude_mod_ui::Vocab;
+    for key in tako_core::claude_mod_ui::SetKey::words() {
+        let value = &out["values"][key];
+        if value.is_null() {
+            continue;
+        }
+        let shown = match value {
+            Value::Array(_) => word_list(value),
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let allowed = &choices["set"][key];
+        if allowed.is_object() {
+            let how = if allowed["type"] == "list" {
+                " から並べる"
+            } else {
+                ""
+            };
+            println!(
+                "  {key:<18} {shown:<36} （{}{how}）",
+                word_list(&allowed["values"]).replace(", ", " / ")
+            );
+        } else {
+            println!("  {key:<18} {shown}");
+        }
+    }
+    let buttons = out["ui"]["buttons"].as_array().cloned().unwrap_or_default();
+    println!(
+        "  ボタン（{} / {} 個）:",
+        buttons.len(),
+        tako_core::claude_mod_ui::MAX_BUTTONS
+    );
+    for (i, b) in buttons.iter().enumerate() {
+        let action: Result<tako_core::claude_mod_ui::ButtonAction, _> =
+            serde_json::from_value(b["action"].clone());
+        println!(
+            "    {}. {}  [{}]  {}  (id {})",
+            i + 1,
+            b["label"].as_str().unwrap_or("-"),
+            b["hotkey"].as_str().unwrap_or("-"),
+            action.map(|a| a.summary()).unwrap_or_default(),
+            b["id"].as_str().unwrap_or("-"),
+        );
+    }
+    if choices.is_object() {
+        let kinds = &choices["button"]["kinds"];
+        let values = |kind: &str| {
+            kinds[kind]["values"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v["value"].as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        println!("  ボタンに使える動作:");
+        println!("    slash  {}", values("slash"));
+        println!("    tako   {}", values("tako"));
+        println!("    shell  \"<コマンド>\"（新しいペインで実行）・prompt \"<文>\"（入力欄へ入れるだけ）");
+        println!("  例:");
+        for example in choices["examples"].as_array().into_iter().flatten() {
+            println!("    {}", example.as_str().unwrap_or_default());
+        }
+    } else if let Some(note) = out["applies_to"].as_str() {
+        println!("{note}");
+    }
+}
+
 /// `tako mod` の表示（#1879）。`report` は mod が読むので 1 行の JSON のまま
 fn print_mod(args: &ModArgs, result: &Value) {
     if args.json || args.action.as_deref() == Some("report") {
@@ -7011,10 +7145,11 @@ fn print_mod(args: &ModArgs, result: &Value) {
     if band["legacy"].as_bool() == Some(true) {
         println!("帯: 描かない（TAKO_1877_S3_LEGACY）");
     } else if band.is_object() {
-        let request = match band["request"]["hidden"].as_bool() {
-            Some(true) => "・tako mod band off を中継中",
-            Some(false) => "・tako mod band on を中継中",
-            None => "",
+        // #1960: 正本は ui.json の band.hidden（中継は toggled_at があるときだけ）
+        let request = match (band["hidden"].as_bool(), band["request"].is_object()) {
+            (Some(true), _) => "・隠す（tako mod band on で戻す）",
+            (_, true) => "・出す",
+            _ => "",
         };
         println!(
             "帯: ctx {}% / 使用制限 {}% 以上で ctx・使用制限も出す{request}",
@@ -8009,30 +8144,42 @@ fn build_request(command: &Command) -> Result<Request, String> {
             action: Some("report".into()),
             report: Some(read_mod_report()?),
             pane: caller_pane(),
+            ui: None,
         },
         // #1881: `tako mod band on|off` は dispatch の action `band-on` / `band-off`（MCP と同じ語）
         Command::Mod(args) if args.action.as_deref() == Some("band") => Request::Mod {
-            action: Some(match args.state.as_deref() {
-                Some("on") => "band-on".into(),
-                Some("off") => "band-off".into(),
-                _ => {
-                    return Err(
-                        "band には on か off を付ける（tako mod band off で帯を隠す）".into(),
-                    )
-                }
-            }),
+            action: Some(
+                match args.rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                    ["on"] => "band-on".into(),
+                    ["off"] => "band-off".into(),
+                    _ => {
+                        return Err(
+                            "band には on か off を付ける（tako mod band off で帯を隠す）".into(),
+                        )
+                    }
+                },
+            ),
             report: None,
             pane: None,
+            ui: None,
         },
-        Command::Mod(args) if args.state.is_some() => {
+        Command::Mod(args)
+            if !args.rest.is_empty()
+                || args.label.is_some()
+                || args.hotkey.is_some()
+                || args.id.is_some() =>
+        {
             return Err(
-                "on / off は band の後ろにだけ付ける（帯の切替は tako mod band on|off）".into(),
+                "on / off は band の後ろにだけ付ける（帯の切替は tako mod band on|off。\
+                 画面の UI 設定は tako mod ui）"
+                    .into(),
             )
         }
         Command::Mod(args) => Request::Mod {
             action: args.action.clone(),
             report: None,
             pane: None,
+            ui: None,
         },
         // #1857: 再 attach は切替ではなくペイン 1 枚の操作（MCP の `reattach` と同じ要求）
         Command::Persist(args) if args.state.as_deref() == Some("reattach") => {

@@ -443,6 +443,12 @@ pub fn band_height(rows: usize, cell_height: f32) -> f32 {
 
 /// コマンド 1 件の正規化。**論理文字列を壊さないこと**が最優先で、
 /// 折り返しのための加工は一切しない（表示側の責務）
+/// 1 本のコマンドの正規化・検証（FR-2.22.7）の公開の入口。tako mod のカスタムボタンの
+/// `shell`（#1960）が同じ規則で受け入れるために使う（規則を 2 か所に書かない）
+pub fn normalize_command_text(raw: &str) -> Result<String, CommandCardError> {
+    normalize_command(raw, 1)
+}
+
 fn normalize_command(raw: &str, index: usize) -> Result<String, CommandCardError> {
     // CRLF / CR を LF へ寄せる（Windows 由来の文字列をそのまま貼れるように）。
     // 行内の空白・インデントは意味を持つので触らない
