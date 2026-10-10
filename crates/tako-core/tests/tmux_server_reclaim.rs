@@ -144,6 +144,65 @@ fn 所有者が生きているサーバーはapplyでも消えない() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #1918: tako-core の lib テストの器（`tk-coretest-<用途>-<pid>`）は、テストプロセスが
+/// 生きていれば残り、死んだ残骸は回収される。手書きの `tk*` は数字があっても触らない
+#[test]
+fn issue1918_tk_coretestの残骸は所有者の生死で回収される() {
+    if !tmux_available() {
+        eprintln!("skip: tmux が無い環境");
+        return;
+    }
+    let Some(dead_owner) = dead_pid() else {
+        eprintln!("skip: この環境の process_alive は死んだ pid を報告しない");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("tako-1918-tk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+    // 用途の区画に数字を入れない（数字の区画はすべて所有 pid 候補になり、生きた pid に
+    // 当たると保護側に倒れて「死んだ残骸」を作れない）
+    let alive = spawn_server(&dir, &format!("tk-coretest-reclaim-{}", std::process::id()));
+    let dead = spawn_server(&dir, &format!("tk-coretest-reclaim-{dead_owner}"));
+    // 単発検証の手書きの名前（数字は pid ではない扱い）
+    let adhoc = spawn_server(&dir, &format!("tkadhoc-{dead_owner}"));
+
+    let entries = scan_servers_in(&dir, tako_core::ports::process_alive);
+    assert_eq!(entries.len(), 3, "ダミー 3 本だけを見ている: {entries:?}");
+    let outcome = cleanup_servers_from(entries, "tako", &[], true, 0);
+    let verdict_of = |path: &Path| {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        outcome
+            .entries
+            .iter()
+            .find(|(e, _)| e.socket == name)
+            .map(|(_, v)| v.code())
+            .unwrap_or_else(|| panic!("{name} が結果に無い"))
+    };
+    let running = |path: &Path| {
+        Command::new("tmux")
+            .arg("-S")
+            .arg(path)
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+
+    assert_eq!(verdict_of(&alive), "owner_alive", "{:?}", outcome.entries);
+    assert!(running(&alive), "テストプロセスが生きている器を落とした");
+    assert_eq!(verdict_of(&dead), "reclaimable", "{:?}", outcome.entries);
+    assert!(!dead.exists(), "死んだ残骸のソケットが残っている");
+    assert_eq!(verdict_of(&adhoc), "owner_unknown", "{:?}", outcome.entries);
+    assert!(
+        running(&adhoc),
+        "手書きの `tk*` を落とした（数字を pid と読んだ）"
+    );
+
+    kill_server(&alive);
+    kill_server(&dead);
+    kill_server(&adhoc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 残骸ソケット（サーバー不在）はファイルだけ消える。出来たては触らない
 #[test]
 fn 残骸ソケットは消えるが出来たては触らない() {
