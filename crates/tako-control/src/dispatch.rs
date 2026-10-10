@@ -1938,6 +1938,10 @@ pub enum OffloadJob {
     /// ファイル・フォルダのコピー（#1860）。大きなフォルダの複製で UI を止めないよう
     /// 写す本体だけを background へ出し、ツリーの読み直しは UI スレッドへ戻す
     FileCopy(Box<FileCopyJob>),
+    /// `tako list` の器の window 一覧の採り直し（#1979）。`tmux list-windows -a` を
+    /// UI スレッドで待たない。反映と応答の組み立て（`list_json`）は UI スレッドへ戻す
+    /// （[`OffloadContinuation::List`]）
+    List { socket: String },
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -2021,6 +2025,20 @@ pub enum OffloadContinuation {
     LspCompletion(Box<LspCompletionLanding>),
     /// ホバーの着地（[`lsp_hover_land`]。#1681）
     LspHover(Box<LspHoverLanding>),
+    /// `tako list` の応答（#1979）。background で採った器の window 一覧を反映してから組む。
+    /// `None` = 採取できなかった（tmux 不在・サーバー未起動・上限で打ち切り）
+    List(Option<std::collections::HashMap<String, Vec<tako_core::TmuxWindow>>>),
+}
+
+impl OffloadContinuation {
+    /// 着地でレイアウト（ペインの生成・cols / rows）が変わりうるか（#1979）。
+    ///
+    /// 真なら受け口は着地のあとに 1 フレーム強制描画する（#1370 / #1680 と同じ）。
+    /// `tako list` の応答は読み取りなので描かない（リモートの監視は数秒ごとに `List` を
+    /// 打つので、ここで描くと読み取りのたびに #786 の描画の固定費を払う）
+    pub fn changes_layout(&self) -> bool {
+        !matches!(self, Self::List(_))
+    }
 }
 
 /// background の結果を受けて UI スレッドで続きを行う（#1680）。IPC の受け口と GUI の
@@ -2054,7 +2072,19 @@ pub fn finish_offload(
         }
         OffloadContinuation::LspCompletion(landing) => lsp_completion_land(host, &landing),
         OffloadContinuation::LspHover(landing) => lsp_hover_land(host, &landing),
+        OffloadContinuation::List(by_session) => {
+            host.apply_backend_windows_fetch(by_session);
+            Ok(list_reply(host))
+        }
     }
+}
+
+/// `tako list` の応答（同期の腕と #1979 の続きの 1 実装）。
+///
+/// #1657: 実行ペインの終了を確定させてから組む（`run` 欄が要求時点の実態になる）
+fn list_reply(host: &mut dyn ControlHost) -> Value {
+    settle_run_panes(host);
+    list_json(host)
 }
 
 /// リクエストが offload 対象なら UI スレッド必須の文脈を収集してジョブ化する。
@@ -2122,6 +2152,13 @@ pub fn prepare_offload(
         Request::CheckHealth => Some(Ok(OffloadJob::CheckHealth {
             ctx: collect_check_health_ctx(host),
         })),
+        // #1979: `tako list` の器の採り直し（`tmux list-windows -a`）を UI スレッドで待たない。
+        // 採り直しが要らない（使い回せる・器のペインが無い）ときは `None` = 同期の腕で組む
+        // （そのときの腕は子プロセスを起こさない）。A/B の `TAKO_1979_LEGACY=1` は修正前と同じ
+        // 同期の採り直し
+        Request::List if !tako_core::probe::issue1979_legacy() => host
+            .backend_windows_fetch_plan()
+            .map(|socket| Ok(OffloadJob::List { socket })),
         Request::OrchestratorWorkers { all } => Some(Ok(OffloadJob::Workers {
             live_panes: collect_live_panes(host),
             limit_resume_panes: collect_limit_resume_panes(host),
@@ -2333,6 +2370,9 @@ impl OffloadJob {
             OffloadJob::LspHover(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspHover(Box::new(job.run())))
             }
+            OffloadJob::List { socket } => OffloadOutcome::OnUi(OffloadContinuation::List(
+                tako_core::tmux::list_windows_by_session(Some(&socket)),
+            )),
             other => OffloadOutcome::Reply(other.run_reply()),
         }
     }
@@ -2397,6 +2437,10 @@ impl OffloadJob {
             )),
             OffloadJob::LspHover(_) => Err(DispatchError::Operation(
                 "ホバーは run_staged で走らせる（カードを出すのに UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::List { .. } => Err(DispatchError::Operation(
+                "一覧は run_staged で走らせる（反映と応答の組み立てに UI スレッドの続きが要る）"
+                    .into(),
             )),
         }
     }
@@ -3144,11 +3188,13 @@ fn dispatch_inner(
             // #1191: `backend_windows` を要求時点の実態へ合わせてから組み立てる。
             // 旧実装は右パネル（fleet ビュー）の 2 秒ポーリングだけがこの値を更新して
             // いたので、パネルを開いたことがなければ常に null・閉じているあいだは
-            // 陳腐化していた。backend ペインが 1 つも無ければ tmux は起動しない
+            // 陳腐化していた。backend ペインが 1 つも無ければ tmux は起動しない。
+            // #1979: IPC の受け口は採取（`list-windows -a`）を `prepare_offload` で
+            // background へ出してから [`finish_offload`] でここと同じ応答を組む。
+            // ここで採り直すのは offload を通らない同期の呼び手（`TAKO_OFFLOAD=0` /
+            // テスト）だけで、IPC 経路では採取直後なので使い回しで済む
             host.refresh_backend_windows();
-            // #1657: 実行ペインの終了を確定させてから組む（`run` 欄が要求時点の実態になる）
-            settle_run_panes(host);
-            Ok(list_json(host))
+            Ok(list_reply(host))
         }
 
         Request::ResolvePane { pane, caller_pid } => {
@@ -4654,11 +4700,24 @@ fn dispatch_inner(
                 "entries": stats.entries,
             }))
         }
-        Request::Scrollback { lines } => {
+        Request::Scrollback {
+            lines,
+            unfocused_fps,
+        } => {
+            // 両方を検証してから当てる（片方だけ範囲外のとき、もう片方だけ効いた状態を作らない）
+            let lines = lines
+                .map(tako_core::scrollback::validate_lines)
+                .transpose()
+                .map_err(DispatchError::InvalidParams)?;
+            let unfocused_fps = unfocused_fps
+                .map(tako_core::redraw_limit::validate_fps)
+                .transpose()
+                .map_err(DispatchError::InvalidParams)?;
             if let Some(lines) = lines {
-                let lines = tako_core::scrollback::validate_lines(lines)
-                    .map_err(DispatchError::InvalidParams)?;
                 host.set_scrollback_lines(lines);
+            }
+            if let Some(fps) = unfocused_fps {
+                host.set_unfocused_redraw_fps(fps);
             }
             let status = host.scrollback_status();
             let mut out = json!({
@@ -4676,6 +4735,7 @@ fn dispatch_inner(
                     status.max_cols
                 ));
             }
+            out["unfocused_redraw"] = redraw_limit_json(&host.redraw_limit_status());
             Ok(out)
         }
         Request::PreviewEdit { pane, enabled } => {
@@ -17225,6 +17285,26 @@ fn pinned_json(host: &dyn ControlHost) -> Value {
 }
 
 /// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
+/// フォーカスの無いペインの再描画の上限の応答（#1979。`tako redraw-limit` / MCP
+/// `tako_scrollback` の `unfocused_redraw`）。`flushes` は起動からの累計の再描画回数で、
+/// 2 回読んだ差を経過時間で割ると実際の fps になる（上限が効いているかを外から確かめる口）
+fn redraw_limit_json(status: &tako_core::redraw_limit::RedrawLimitStatus) -> Value {
+    use tako_core::redraw_limit as rl;
+    json!({
+        "fps": status.unfocused_fps,
+        "default_fps": rl::DEFAULT_UNFOCUSED_FPS,
+        "min_fps": rl::MIN_UNFOCUSED_FPS,
+        "max_fps": rl::MAX_UNFOCUSED_FPS,
+        "focused_fps": rl::FOCUSED_FPS,
+        "flushes": {
+            "focused": status.focused_flushes,
+            "unfocused": status.unfocused_flushes,
+        },
+        "body_renders": status.body_renders,
+        "legacy": status.legacy,
+    })
+}
+
 fn title_source_str(source: tako_core::TitleSource) -> &'static str {
     source.as_str()
 }
@@ -19235,6 +19315,8 @@ mod tests {
         preview_cache: tako_core::PreviewCacheStats,
         /// #818: スクロールバック上限（適用先のペインは `scrollback_applied` が数える）
         scrollback: tako_core::scrollback::ScrollbackStatus,
+        /// #1979: フォーカスの無いペインの再描画の上限
+        redraw_limit: tako_core::redraw_limit::RedrawLimitStatus,
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
         /// #1442: UI 層へ依頼した窓の位置・寸法（window ID, 矩形）
@@ -19374,6 +19456,7 @@ mod tests {
                     panes: 2,
                     max_cols: 119,
                 },
+                redraw_limit: tako_core::redraw_limit::RedrawLimitStatus::default(),
                 window_state_ops: Vec::new(),
                 window_geometry_ops: Vec::new(),
                 window_frames: std::collections::HashMap::new(),
@@ -19462,6 +19545,12 @@ mod tests {
         fn set_scrollback_lines(&mut self, lines: usize) {
             self.scrollback.lines = tako_core::scrollback::clamp_lines(lines);
         }
+        fn redraw_limit_status(&self) -> tako_core::redraw_limit::RedrawLimitStatus {
+            self.redraw_limit
+        }
+        fn set_unfocused_redraw_fps(&mut self, fps: u32) {
+            self.redraw_limit.unfocused_fps = tako_core::redraw_limit::clamp_fps(fps);
+        }
         fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
             self.sessions.get(&pane.as_u64())
         }
@@ -19519,6 +19608,27 @@ mod tests {
                     )
                 })
                 .collect();
+        }
+        /// #1979: 器のペインがあれば採り直しが要る（製品は直前の採取から 0.5 秒は使い回す）
+        fn backend_windows_fetch_plan(&self) -> Option<String> {
+            (!self.backend_sessions.is_empty()).then(|| "mock-sock".to_string())
+        }
+        /// #1979: background で採った「セッション名 → window」を backend ペイン全件へ写す
+        /// （製品の `apply_backend_windows` と同じ形。採取できなかった = 全件「不明」）
+        fn apply_backend_windows_fetch(
+            &mut self,
+            by_session: Option<std::collections::HashMap<String, Vec<tako_core::TmuxWindow>>>,
+        ) {
+            self.backend_windows = match by_session {
+                Some(by_session) => self
+                    .backend_sessions
+                    .iter()
+                    .map(|(pane, session)| {
+                        (*pane, by_session.get(session).cloned().unwrap_or_default())
+                    })
+                    .collect(),
+                None => Default::default(),
+            };
         }
         fn track_tmux_view(
             &mut self,
@@ -24593,7 +24703,10 @@ mod tests {
         let mut host = MockHost::new();
         let initial = dispatch(
             &mut host,
-            Request::Scrollback { lines: None },
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None,
+            },
             PaneOrigin::Cli,
         )
         .unwrap();
@@ -24608,7 +24721,10 @@ mod tests {
 
         let changed = dispatch(
             &mut host,
-            Request::Scrollback { lines: Some(1_000) },
+            Request::Scrollback {
+                lines: Some(1_000),
+                unfocused_fps: None,
+            },
             PaneOrigin::Mcp,
         )
         .unwrap();
@@ -24619,7 +24735,10 @@ mod tests {
         for bad in [0_usize, 99, 1_000_000] {
             let error = dispatch(
                 &mut host,
-                Request::Scrollback { lines: Some(bad) },
+                Request::Scrollback {
+                    lines: Some(bad),
+                    unfocused_fps: None,
+                },
                 PaneOrigin::Cli,
             )
             .unwrap_err();
@@ -24629,6 +24748,72 @@ mod tests {
             );
         }
         assert_eq!(host.scrollback.lines, 1_000, "弾いた値で書き換えていない");
+    }
+
+    /// #1979: 同じ口（CLI `tako redraw-limit` / MCP `tako_scrollback` の `unfocused_fps`）で
+    /// フォーカスの無いペインの再描画の上限を読み書きでき、範囲外は理由つきで弾く。
+    /// 片方だけ範囲外のとき、もう片方だけ効いた状態を作らない
+    #[test]
+    fn scrollbackの口でフォーカスの無いペインの再描画の上限を読み書きできる() {
+        let mut host = MockHost::new();
+        let status = dispatch(
+            &mut host,
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let redraw = &status["unfocused_redraw"];
+        assert_eq!(redraw["fps"], 30);
+        assert_eq!(redraw["default_fps"], 30);
+        assert_eq!(redraw["min_fps"], 1);
+        assert_eq!(redraw["max_fps"], 60);
+        assert_eq!(redraw["focused_fps"], 60);
+        assert_eq!(redraw["flushes"]["unfocused"], 0);
+        assert_eq!(redraw["legacy"], false);
+
+        let changed = dispatch(
+            &mut host,
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: Some(12),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(changed["unfocused_redraw"]["fps"], 12);
+        assert_eq!(
+            changed["lines"],
+            tako_core::scrollback::DEFAULT_LINES,
+            "スクロールバックには触らない"
+        );
+
+        for bad in [0_u32, 61, u32::MAX] {
+            let error = dispatch(
+                &mut host,
+                Request::Scrollback {
+                    lines: Some(1_000),
+                    unfocused_fps: Some(bad),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap_err();
+            let DispatchError::InvalidParams(message) = error else {
+                panic!("{bad} が InvalidParams で弾かれていない");
+            };
+            assert!(message.contains("1〜60"), "範囲を言う: {message}");
+        }
+        assert_eq!(
+            host.redraw_limit.unfocused_fps, 12,
+            "弾いた値で書き換えていない"
+        );
+        assert_eq!(
+            host.scrollback.lines,
+            tako_core::scrollback::DEFAULT_LINES,
+            "fps が範囲外のとき lines だけ効いた状態を作らない"
+        );
     }
 
     #[test]
@@ -38059,6 +38244,75 @@ mod tests {
             "有効な方針の 1 行がタブ分けなしを言っていない: {}",
             effective_policy_text(&resolved)
         );
+    }
+
+    /// #1979: IPC の受け口の `tako list` は器の採り直し（`tmux list-windows -a`）を
+    /// UI スレッドで待たない。準備は判断だけ・採取は background・反映と応答は続き（UI スレッド）。
+    /// どこでも同期の採り直し（`refresh_backend_windows`）を呼ばないことを数で見る
+    #[test]
+    fn issue1979_listの器の採り直しはbackgroundへ出て続きで反映される() {
+        let mut host = MockHost::new();
+        let backend = host.ws.active_tab().tree().focused();
+        host.backend_sessions
+            .insert(backend.as_u64(), "tako-1979".into());
+        let windows_of = |v: &Value| {
+            v["tabs"][0]["panes"]
+                .as_array()
+                .expect("panes")
+                .iter()
+                .find(|p| p["id"] == backend.as_u64())
+                .expect("対象ペインが載る")["backend_windows"]
+                .clone()
+        };
+
+        // 準備（UI スレッド）: 採り直しが要るので background のジョブになる。器は叩かない
+        let job = match prepare_offload(&mut host, &Request::List) {
+            Some(Ok(job)) => job,
+            _ => panic!("tako list の採り直しが offload されない"),
+        };
+        let OffloadJob::List { socket } = &job else {
+            panic!("List のジョブでない");
+        };
+        assert_eq!(socket, "mock-sock");
+        assert_eq!(
+            host.backend_windows_refreshes.get(),
+            0,
+            "準備で同期の採り直し（tmux list-windows）をしない"
+        );
+
+        // background の採取の結果を続きへ渡す（本物は `list_windows_by_session`）
+        let mut fetched = std::collections::HashMap::new();
+        fetched.insert(
+            "tako-1979".to_string(),
+            vec![tako_core::TmuxWindow {
+                index: 0,
+                name: "zsh".into(),
+                active: true,
+                panes: 1,
+            }],
+        );
+        let next = OffloadContinuation::List(Some(fetched));
+        assert!(!next.changes_layout(), "読み取りの続きは強制描画しない");
+        let list = finish_offload(&mut host, next, PaneOrigin::Cli).unwrap();
+        assert_eq!(
+            windows_of(&list),
+            json!([{ "index": 0, "name": "zsh", "active": true, "panes": 1 }]),
+            "続きで反映した window が応答に載る"
+        );
+        assert_eq!(
+            host.backend_windows_refreshes.get(),
+            0,
+            "続き（UI スレッド）でも同期の採り直しをしない"
+        );
+
+        // 採取できなかった（tmux 不在・上限で打ち切り）= 「不明」の null
+        let list =
+            finish_offload(&mut host, OffloadContinuation::List(None), PaneOrigin::Cli).unwrap();
+        assert_eq!(windows_of(&list), Value::Null);
+
+        // 器のペインが無ければジョブにしない（同期の腕で組む = 子プロセスを起こさない）
+        host.backend_sessions.clear();
+        assert!(prepare_offload(&mut host, &Request::List).is_none());
     }
 
     /// #1191: `tako list` の `backend_windows` は**要求時点の実態**を返す。

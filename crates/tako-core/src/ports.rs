@@ -552,10 +552,15 @@ pub fn process_env_vars(_pid: u32, _names: &[&str]) -> Option<HashMap<String, St
 /// `KERN_PROCARGS2` の生バイト列（argc + exec path + argv + env）
 #[cfg(target_os = "macos")]
 fn procargs2(pid: u32) -> Option<Vec<u8>> {
-    if pid == 0 || pid > i32::MAX as u32 {
-        return None;
-    }
-    // バッファ長は kern.argmax（環境ごとに違う。既定 1 MB 前後）
+    let mut buf = vec![0u8; kern_argmax()?];
+    let len = procargs2_into(pid, &mut buf)?;
+    buf.truncate(len);
+    Some(buf)
+}
+
+/// `kern.argmax`（`KERN_PROCARGS2` のバッファ長。環境ごとに違う。既定 1 MB 前後）
+#[cfg(target_os = "macos")]
+fn kern_argmax() -> Option<usize> {
     let mut argmax: libc::c_int = 0;
     let mut size = size_of::<libc::c_int>();
     let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -569,10 +574,16 @@ fn procargs2(pid: u32) -> Option<Vec<u8>> {
             0,
         )
     };
-    if ok != 0 || argmax <= 0 {
+    (ok == 0 && argmax > 0).then_some(argmax as usize)
+}
+
+/// `KERN_PROCARGS2` を `buf`（長さ = `kern.argmax`）へ読み、書かれたバイト数を返す。
+/// 全プロセスぶん引く [`process_table`] が 1 枚のバッファを使い回すための形
+#[cfg(target_os = "macos")]
+fn procargs2_into(pid: u32, buf: &mut [u8]) -> Option<usize> {
+    if pid == 0 || pid > i32::MAX as u32 {
         return None;
     }
-    let mut buf = vec![0u8; argmax as usize];
     let mut len = buf.len();
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let ok = unsafe {
@@ -586,11 +597,148 @@ fn procargs2(pid: u32) -> Option<Vec<u8>> {
         )
     };
     // 別ユーザーのプロセス・既に死んだ pid は EPERM / EINVAL で失敗する（= 不明）
-    if ok != 0 || len < size_of::<u32>() {
+    (ok == 0 && len >= size_of::<u32>()).then_some(len)
+}
+
+/// 全プロセスの親子関係（pid → ppid）とコマンド行（pid → argv を空白で繋いだもの）を
+/// **子プロセスを起こさずに**引く（#1979。`ps -axo pid=,ppid=,command=` の置き換え）。
+///
+/// ## なぜ `ps` をやめるか
+///
+/// 照会のたびに `ps` を起こしていた（worker の状態照会・stale binary 検知・ssh の宛先の
+/// 自動検知が 2 秒 tick と監視ごとに）。さらに `Command::output()` は子が終わらないと
+/// **永久に返らない**。2026-10-10 の本番ハングは、メインスレッドがこの `ps` の
+/// `output()` の `poll` で 10 分止まったもの（sample のスタックで特定）。libproc なら
+/// 子プロセスもパイプも無いので、その形の待ちがそもそも生まれない。
+///
+/// ## `ps` との違い（実測で揃えた）
+///
+/// - コマンド行は `KERN_PROCARGS2` の argv を空白で繋ぐ（`ps` の `command` 列と同じ材料）
+/// - 読めないプロセスは `ps` の流儀で `(名前)` を入れる。**別ユーザー（root）のプロセスの
+///   コマンド行は読めない**: `/bin/ps` は Apple の特権付きバイナリなので読めるが、tako からの
+///   `KERN_PROCARGS2` は拒まれる（実測 2026-10-10: 自分のプロセスは 791 件中 789 件が `ps` と
+///   一致し、ずれた 2 件は採取の間に argv が変わったもの。root の約 320 件は `(名前)`）。
+///   読み手（ssh の宛先・agent の判定・stale binary）が見るのはペインの子孫 = 自分の
+///   プロセスなので困らない。`sudo ssh` のように**ペインの中で root になった子**の宛先だけは
+///   読めなくなる
+/// - 親子は `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)` の `pbsi_ppid`。**`PROC_PIDTBSDINFO` では
+///   ない**: あちらは別ユーザー（root）のプロセスで失敗し、実測で 1,111 件中 787 件しか
+///   取れなかった（`sudo` 配下の子が「子なし」に化ける）。短いほうは 1,107 件取れる
+///
+/// 列挙できなければ `None`（呼び手は上限つきの `ps` へ落ちる）
+#[cfg(target_os = "macos")]
+pub fn process_table() -> Option<(HashMap<u32, u32>, HashMap<u32, String>)> {
+    let pids = all_pids();
+    if pids.is_empty() {
         return None;
     }
-    buf.truncate(len);
-    Some(buf)
+    let mut buf = vec![0u8; kern_argmax()?];
+    let mut parents = HashMap::with_capacity(pids.len());
+    let mut argv = HashMap::with_capacity(pids.len());
+    for pid in pids {
+        let Some(info) = bsd_short_info(pid) else {
+            continue; // 列挙と問い合わせの間に終わった
+        };
+        let pid = pid as u32;
+        parents.insert(pid, info.pbsi_ppid);
+        let line = procargs2_into(pid, &mut buf)
+            .and_then(|len| procargs2_argv(&buf[..len]))
+            .unwrap_or_else(|| format!("({})", comm_of(&info.pbsi_comm)));
+        argv.insert(pid, line);
+    }
+    Some((parents, argv))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_table() -> Option<(HashMap<u32, u32>, HashMap<u32, String>)> {
+    None
+}
+
+/// `struct proc_bsdshortinfo`（`sys/proc_info.h`）。tako が使う libc 0.2.186 には無いので
+/// 転記する（新しい libc には同じ形で入っている。ずれは下の大きさの assert と
+/// 「ps と同じ答え」の単体テストで捕まえる）
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pbsi_pid: u32,
+    pbsi_ppid: u32,
+    pbsi_pgid: u32,
+    pbsi_status: u32,
+    pbsi_comm: [libc::c_char; 16],
+    pbsi_flags: u32,
+    pbsi_uid: libc::uid_t,
+    pbsi_gid: libc::gid_t,
+    pbsi_ruid: libc::uid_t,
+    pbsi_rgid: libc::gid_t,
+    pbsi_svuid: libc::uid_t,
+    pbsi_svgid: libc::gid_t,
+    pbsi_rfu: u32,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<ProcBsdShortInfo>() == 64);
+
+/// `PROC_PIDT_SHORTBSDINFO`（`sys/proc_info.h`）
+#[cfg(target_os = "macos")]
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+/// 親 pid と短い名前（`PROC_PIDT_SHORTBSDINFO`）。**別ユーザーのプロセスでも取れる**
+/// （[`bsd_info`] の `PROC_PIDTBSDINFO` は root のプロセスで失敗する。#1979 の実測）
+#[cfg(target_os = "macos")]
+fn bsd_short_info(pid: i32) -> Option<ProcBsdShortInfo> {
+    // SAFETY: POD（整数と固定長配列だけ）なので全 0 は正しい値
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<ProcBsdShortInfo>() as libc::c_int;
+    // SAFETY: 渡すバッファは size ぴったりのローカル変数で、
+    // 書き込まれたバイト数が size と一致したときだけ中身を読む
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdShortInfo).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info)
+}
+
+/// 短い名前（`pbsi_comm`。NUL まで）
+#[cfg(target_os = "macos")]
+fn comm_of(comm: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = comm
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// `KERN_PROCARGS2` から argv を取り出し、空白で繋ぐ（純粋関数。`ps` の `command` 列と同じ形）。
+/// argv が 1 つも無い（argc = 0）ときは `None`
+#[cfg(target_os = "macos")]
+fn procargs2_argv(buf: &[u8]) -> Option<String> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let body = &buf[4..];
+    // exec path（最初の NUL まで）と詰めの NUL を飛ばす
+    let mut pos = body.iter().position(|&b| b == 0)? + 1;
+    while body.get(pos) == Some(&0) {
+        pos += 1;
+    }
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let rest = body.get(pos..)?;
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        args.push(String::from_utf8_lossy(&rest[..end]).into_owned());
+        pos += end + 1;
+        if pos > body.len() {
+            break;
+        }
+    }
+    (!args.is_empty()).then(|| args.join(" "))
 }
 
 /// `KERN_PROCARGS2` のレイアウトを解く（純粋関数）。
@@ -994,5 +1142,94 @@ mod tests {
             !is_live_tako_app(std::process::id()),
             "テストランナー（プロセス名が tako-app でない）は false"
         );
+    }
+
+    /// #1979: libproc の親子表が `ps -axo pid=,ppid=,command=` と**同じ答え**を返す。
+    ///
+    /// 置き換えの前後で ssh の宛先検知（#976）・agent の判定（argv）・stale binary 検知が
+    /// 黙って変わらないことの実測。2 回の採取の間に生まれた / 消えたプロセスは比べない
+    /// （両方に居る pid だけを見る）。親子は**全ユーザーぶん**、コマンド行は**自分の
+    /// プロセス**の一致を求める（別ユーザーのものは特権付きの `/bin/ps` にしか読めない）
+    #[test]
+    fn libprocの親子表はpsと同じ答えを返す() {
+        let (parents, argv) = process_table().expect("macOS は列挙できる");
+        let me = std::process::id();
+        assert!(parents.contains_key(&me), "自分が載っていない");
+        let mut ps = std::process::Command::new("/bin/ps");
+        let out = crate::platform::process::no_console_window(&mut ps)
+            .args(["-axo", "pid=,ppid=,command="])
+            .output()
+            .expect("ps");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (mut common, mut ppid_same, mut argv_same, mut mine, mut mine_same) = (0, 0, 0, 0, 0);
+        let mut diffs = Vec::new();
+        // SAFETY: getuid は引数を取らず必ず成功する
+        let my_uid = unsafe { libc::getuid() };
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
+                continue;
+            };
+            let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+                continue;
+            };
+            let Some(&got_ppid) = parents.get(&pid) else {
+                continue; // 2 回の採取の間に生まれた
+            };
+            let command = it.collect::<Vec<_>>().join(" ");
+            common += 1;
+            ppid_same += usize::from(got_ppid == ppid);
+            let got = argv.get(&pid).map(String::as_str).unwrap_or("");
+            // 空白の連続は 1 つに畳んで比べる（`ps` の列の組み立てと同じ扱い）
+            let got_norm = got.split_whitespace().collect::<Vec<_>>().join(" ");
+            let same = got_norm == command;
+            argv_same += usize::from(same);
+            if owner_uid(pid) == Some(my_uid) {
+                mine += 1;
+                mine_same += usize::from(same);
+            }
+            if !same && diffs.len() < 5 {
+                diffs.push(format!(
+                    "pid {pid}: ps の長さ {} / libproc の長さ {}",
+                    command.len(),
+                    got_norm.len()
+                ));
+            }
+        }
+        eprintln!(
+            "共通 {common} 件: ppid 一致 {ppid_same} / コマンド行一致 {argv_same} \
+             （自分のプロセス {mine} 件中 {mine_same}）。不一致の例: {diffs:?}"
+        );
+        assert!(common > 10, "比べる材料が無い（ps が空?）");
+        // 採取の間に親が変わる（孤児が launchd へ付け替わる）ことはあるので、全件一致は求めない
+        assert!(ppid_same * 100 >= common * 99, "親子が ps とずれている");
+        // 自分のプロセスはどちらも KERN_PROCARGS2 を読めるので一致する（採取の間に
+        // argv を書き換えるプロセスがあるので 1 % の揺れだけ許す）
+        assert!(mine > 0, "自分のプロセスが 1 つも比べられていない");
+        assert!(
+            mine_same * 100 >= mine * 99,
+            "自分のプロセスのコマンド行が ps とずれている"
+        );
+    }
+
+    /// 所有ユーザー（`pbi_uid`）。比べる対象を「自分のプロセス」に絞るためだけに使う
+    fn owner_uid(pid: u32) -> Option<u32> {
+        bsd_info(pid as i32).map(|info| info.pbi_uid)
+    }
+
+    #[test]
+    fn procargs2のargvは空白で繋がる() {
+        let mut buf = 2u32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/sleep\0\0\0sleep\x00600\0HOME=/x\0\0");
+        assert_eq!(procargs2_argv(&buf).as_deref(), Some("sleep 600"));
+        // argc = 0 は「argv が無い」
+        let mut empty = 0u32.to_ne_bytes().to_vec();
+        empty.extend_from_slice(b"/bin/x\0\0");
+        assert_eq!(procargs2_argv(&empty), None);
+        // 途中で切れていても読めたぶんだけ返す（壊れた入力で panic しない）
+        let mut cut = 3u32.to_ne_bytes().to_vec();
+        cut.extend_from_slice(b"/bin/x\0x\0y");
+        assert_eq!(procargs2_argv(&cut).as_deref(), Some("x y"));
+        assert_eq!(procargs2_argv(&[1, 0]), None);
     }
 }

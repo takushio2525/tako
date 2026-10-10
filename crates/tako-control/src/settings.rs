@@ -100,6 +100,11 @@ pub struct Settings {
     /// tmux バックエンドペイン（persist ON）は alt screen のため元々ほぼ 0
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
+    /// フォーカスの無いペインの出力による再描画の上限（fps。Issue #1979。既定 30）。
+    /// フォーカス中のペインは常に 60 fps。**項目が無い旧ファイルは既定で読める**
+    /// （serde の default。移行は要らない）
+    #[serde(default = "default_unfocused_redraw_fps")]
+    pub unfocused_redraw_fps: u32,
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -187,6 +192,10 @@ fn default_scrollback_lines() -> usize {
     tako_core::scrollback::DEFAULT_LINES
 }
 
+fn default_unfocused_redraw_fps() -> u32 {
+    tako_core::redraw_limit::DEFAULT_UNFOCUSED_FPS
+}
+
 fn default_lid_battery_floor() -> u8 {
     crate::sleep_guard::DEFAULT_LID_BATTERY_FLOOR
 }
@@ -227,6 +236,7 @@ impl Default for Settings {
             pane_log_max_mb: default_pane_log_max_mb(),
             pane_log_total_max_mb: default_pane_log_total_max_mb(),
             scrollback_lines: default_scrollback_lines(),
+            unfocused_redraw_fps: default_unfocused_redraw_fps(),
             theme: default_theme(),
             ui_mode: default_ui_mode(),
             sidebar_width: default_sidebar_width(),
@@ -303,6 +313,12 @@ impl Settings {
     /// 0 を書かれて履歴ゼロのペインが立つより、下限で起動するほうが直せる）
     pub fn resolved_scrollback_lines(&self) -> usize {
         tako_core::scrollback::clamp_lines(self.scrollback_lines)
+    }
+
+    /// フォーカスの無いペインの再描画の上限を解決する（Issue #1979）。
+    /// 手書きの 0 は既定へ、上限超えは上限へ丸める（起動は必ず成立させる）
+    pub fn resolved_unfocused_redraw_fps(&self) -> u32 {
+        tako_core::redraw_limit::clamp_fps(self.unfocused_redraw_fps)
     }
 
     /// テーマモードを tako-core の型へ解決する（不明値は既定ダーク。Issue #217）
@@ -664,6 +680,7 @@ mod tests {
             pane_log_max_mb: 10,
             pane_log_total_max_mb: 300,
             scrollback_lines: 2_000,
+            unfocused_redraw_fps: 12,
             theme: "light".into(),
             ui_mode: "gui".into(),
             sidebar_width: 300,
@@ -699,6 +716,22 @@ mod tests {
         assert_eq!(
             parsed.resolved_scrollback_lines(),
             tako_core::scrollback::DEFAULT_LINES
+        );
+        // #1979: 旧ファイル（キー無し）はそのまま読めて既定 30 fps（移行 Step 不要の根拠）
+        assert_eq!(
+            parsed.resolved_unfocused_redraw_fps(),
+            tako_core::redraw_limit::DEFAULT_UNFOCUSED_FPS
+        );
+        // 手書きの 0 / 桁違いでも起動は成立する（0 = 書いていない扱い・上限超えは上限）
+        let zero: Settings = serde_json::from_str(r#"{"unfocused_redraw_fps":0}"#).unwrap();
+        assert_eq!(
+            zero.resolved_unfocused_redraw_fps(),
+            tako_core::redraw_limit::DEFAULT_UNFOCUSED_FPS
+        );
+        let huge: Settings = serde_json::from_str(r#"{"unfocused_redraw_fps":100000}"#).unwrap();
+        assert_eq!(
+            huge.resolved_unfocused_redraw_fps(),
+            tako_core::redraw_limit::MAX_UNFOCUSED_FPS
         );
         assert_eq!(parsed.lang_setting(), tako_core::i18n::LangSetting::System);
         assert!(parsed.auto_rename);

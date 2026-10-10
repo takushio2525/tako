@@ -349,6 +349,9 @@ pub(super) fn build_request(
         },
         "tako_scrollback" => Request::Scrollback {
             lines: u64_arg(args, "lines")?.map(|n| n as usize),
+            // #1979: フォーカスの無いペインの再描画の上限（ツールは増やさない）
+            unfocused_fps: u64_arg(args, "unfocused_fps")?
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         },
         // #1654: `command` を渡すと Tab / Shift+Tab / Enter と同じ編集（ツールは増やさない）
         "tako_preview_edit" => match str_arg(args, "command")? {

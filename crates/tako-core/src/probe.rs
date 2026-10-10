@@ -64,11 +64,23 @@
 //! 聞き直しの上限は [`poll_with_timeout`] の 1 実装で、既定は
 //! [`DEFAULT_RUN_WAIT_TIMEOUT`]（env [`RUN_WAIT_TIMEOUT_ENV`]。扱いは probe と同じで
 //! 0 / 不正 / 空は既定へ落ちる = 外せない）
+//!
+//! ## UI スレッドから届く待ち（Issue #1979）
+//!
+//! 2026-10-10 に本番の GUI が 10 分固まった。メインスレッドが worker の状態照会の中で
+//! `ps` の `Command::output()` の `poll` に止まっていた。macOS の std はパイプを `pipe()` →
+//! `set_cloexec` の 2 手で作るので、別スレッドが同時に起こした長生きの子へ書き手が漏れると、
+//! **子が終わっても** EOF が来ない。器への問い合わせ（`tmux::run_tmux` ほか）と
+//! `claude agents --json` の走査も、組み立て済みの `Command` を渡せる
+//! [`command_output_with_timeout`] でこの待ちを通す。打ち切った子の刈り取りは**同期に待たない**
+//! （カーネルの中で止まった子は SIGKILL でも出てくるまで終わらない。`reap_in_background`）。
+//! 速いコマンドの待ちが伸びないよう、`try_wait` の間隔は 1ms から倍々で 20ms まで伸ばす。
+//! A/B は `issue1979_legacy`（`TAKO_1979_LEGACY=1`）の 1 か所
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// probe（読み取りだけの問い合わせ）の既定の上限。根拠はモジュール冒頭の実測表
@@ -117,8 +129,14 @@ const NOTICE_HEAD: &str = "[確認できません] ";
 const NOTICE_OPEN: char = '（';
 const NOTICE_TAIL: &str = " 秒応答なし）";
 
-/// `try_wait` のポーリング間隔。いちばん速い probe（0.12 秒）に対して十分細かい
+/// `try_wait` のポーリング間隔の上限。いちばん速い probe（0.12 秒）に対して十分細かい
 const POLL: Duration = Duration::from_millis(20);
+
+/// `try_wait` の最初の間隔（#1979）。ここから倍々で [`POLL`] まで伸ばす。
+///
+/// tmux の問い合わせ（実測 0.01 秒未満）もこの待ちを通るようになったので、最初から
+/// 20ms 眠ると「速いコマンドほど待ちのほうが長い」になる（UI スレッドの経路で効く）
+const POLL_FIRST: Duration = Duration::from_millis(1);
 
 /// **子が終わったあと**、パイプに残ったぶんを読み切るのに待つ上限。
 ///
@@ -345,6 +363,22 @@ pub fn legacy_unbounded() -> bool {
     std::env::var("TAKO_1503_LEGACY").is_ok_and(|v| v == "1")
 }
 
+/// #1979 の A/B（`TAKO_1979_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// 器への問い合わせ（`tmux::run_tmux`）と親子表の採取（`ps`）を上限なしの
+/// `Command::output()` で待つ・`tako list` の `list-windows` を UI スレッドで待つ・
+/// フォーカスの無いペインの再描画に上限を設けない。前後を同じ構成で並べて測るためのもの
+/// （製品の既定は常に新しい形）。**ゲートはこの 1 か所**で、tako-control / tako-app も
+/// ここを読む
+pub fn issue1979_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1979_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。
@@ -387,6 +421,34 @@ pub fn output_with_timeout_in(
     }
 }
 
+/// **組み立て済みの** `Command` を上限つきで待つ（#1979）。
+///
+/// 環境の手当てを雛形が持つ子（`tmux::tmux_command` の UTF-8 ロケール注入等）のための口。
+/// `stdin` の遮断と stdout / stderr のパイプ化はここで行う。コンソールウィンドウの抑止
+/// （#586）は**雛形の側**が済ませている前提（`tmux_command` は済ませている）。
+///
+/// `Command::output()` を UI スレッドで呼ぶと、子（`ps` / `tmux`）が終わらないとき・
+/// パイプの書き手が別の長生きのプロセスへ漏れたときに**永久に返らない**
+/// （2026-10-10 の本番ハング: メインスレッドが `ps` の `output()` の `poll` で 10 分）。
+/// 名札（`label`）にパスを含めないのは [`label`] と同じ（#927）
+pub fn command_output_with_timeout(
+    command: &mut Command,
+    label: &str,
+    budget: Duration,
+) -> Outcome {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match command.spawn() {
+        Ok(child) => wait_with_timeout(child, label, budget),
+        Err(e) => Outcome::Failed {
+            label: label.to_string(),
+            reason: e.to_string(),
+        },
+    }
+}
+
 /// 起こし済みの子を上限つきで待つ（**待ちの 1 実装**）。
 ///
 /// `stdout` / `stderr` がパイプなら吸い出す。呼び手が既に `take()` していても動く
@@ -401,6 +463,7 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
     let start = Instant::now();
+    let mut nap = POLL_FIRST;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -408,11 +471,13 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
                 // `Command::output()` はここで無限に待つので、読み切りにも予算を掛ける。
                 // 予算の残り全部ではなく [`READ_GRACE`] で頭打ちにする
                 let grace = Instant::now();
+                let mut nap = POLL_FIRST;
                 while !(out.finished() && err.finished())
                     && grace.elapsed() < READ_GRACE
                     && start.elapsed() < budget
                 {
-                    std::thread::sleep(POLL);
+                    std::thread::sleep(nap);
+                    nap = (nap * 2).min(POLL);
                 }
                 return Outcome::Done {
                     status,
@@ -423,7 +488,10 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
             Ok(None) => {
                 if start.elapsed() >= budget {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    // 刈り取り（`wait`）は**ここで待たない**（#1979）。カーネルの中で止まった
+                    // 子は SIGKILL を受けても出てくるまで終わらず、ここで `wait` すると
+                    // 上限そのものが意味を失う。刈り取り係へ渡して呼び手には今すぐ返す
+                    reap_in_background(child);
                     return Outcome::TimedOut {
                         label: label.to_string(),
                         waited: budget,
@@ -431,7 +499,8 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
                         stderr: err.snapshot(),
                     };
                 }
-                std::thread::sleep(POLL);
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(POLL);
             }
             Err(e) => {
                 return Outcome::Failed {
@@ -441,6 +510,22 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
             }
         }
     }
+}
+
+/// 打ち切った子の刈り取りを別スレッドへ渡す（#1979）。
+///
+/// kill した子は普通はすぐ終わるが、カーネルの中で止まっている子は出てくるまで
+/// 終わらない。呼び手（UI スレッドのこともある）をそこで待たせないため、`wait` は
+/// 刈り取り係が持つ。刈り取らないとゾンビが残るので、手放しはしない
+fn reap_in_background(mut child: Child) {
+    let spawned = std::thread::Builder::new()
+        .name("tako-probe-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    // スレッドを作れない（資源切れ）ときは刈り取りを諦める。ここで同期に待つと
+    // 上限の意味が消えるので、ゾンビ 1 つを残すほうを選ぶ
+    drop(spawned);
 }
 
 /// パイプを吸い出す係。**join しない**のが要点（孫が書き手として残っていると
@@ -603,6 +688,80 @@ mod tests {
                 CHUNKS * 1024,
                 "読み切りの予算が無いと、子の終了後にパイプへ残ったぶんが欠ける"
             ),
+            other => panic!("Done を期待したが {other:?}"),
+        }
+    }
+
+    /// #1979: 子は終わったのに**孫がパイプの書き手を握り続ける**（= 別スレッドの長生きの子へ
+    /// 書き手が漏れた形の再現）でも、読み切りの猶予で返り、子が出したぶんは全部持ち帰る。
+    /// `Command::output()` はこの形で孫が終わるまで返らない（2026-10-10 の本番ハングの型）。
+    ///
+    /// 「返った」は実時間ではなく**仕組み**で見る: 返った時点で孫がまだ生きている
+    /// = パイプの EOF を待たずに返った（孫は 30 秒握るので、負荷で遅れても反転しない）
+    #[cfg(unix)]
+    #[test]
+    fn 孫がパイプを握り続けても読み切りの猶予で返る() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1979-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時 dir");
+        let pid_file = dir.join("holder.pid");
+        let script = format!(
+            "printf %s table; sleep 30 & echo $! > '{}'",
+            pid_file.display()
+        );
+        let outcome = run_shell(&script, Duration::from_secs(60));
+        let holder: Option<i32> = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        // SAFETY: シグナル 0 は送らずに生存だけを見る
+        let holder_alive = holder.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+        if let Some(pid) = holder {
+            // SAFETY: 自分が起こした sleep だけを落とす
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        match outcome {
+            Outcome::Done { status, stdout, .. } => {
+                assert!(status.success());
+                assert_eq!(
+                    String::from_utf8_lossy(&stdout),
+                    "table",
+                    "子の出力を取りこぼさない"
+                );
+            }
+            other => panic!("Done を期待したが {other:?}"),
+        }
+        assert!(
+            holder.is_some(),
+            "孫の pid を書けていない（注入が効いていない）"
+        );
+        assert!(
+            holder_alive,
+            "孫がパイプを手放す（= 終わる）まで待ってから返った = `output()` と同じ待ち方"
+        );
+    }
+
+    /// #1979: 組み立て済みの `Command`（tmux の雛形）も同じ待ちを通り、上限で打ち切られる
+    #[cfg(unix)]
+    #[test]
+    fn 組み立て済みのcommandも上限で打ち切られる() {
+        let mut command = Command::new("/bin/sh");
+        crate::platform::process::no_console_window(&mut command).args(["-c", "sleep 600"]);
+        let outcome =
+            command_output_with_timeout(&mut command, "sh sleep", Duration::from_millis(300));
+        assert!(
+            matches!(outcome, Outcome::TimedOut { .. }),
+            "打ち切りになる: {outcome:?}"
+        );
+        let mut ok = Command::new("/bin/sh");
+        crate::platform::process::no_console_window(&mut ok).args(["-c", "printf %s ok"]);
+        match command_output_with_timeout(&mut ok, "sh printf", Duration::from_secs(30)) {
+            Outcome::Done { stdout, .. } => assert_eq!(stdout, b"ok"),
             other => panic!("Done を期待したが {other:?}"),
         }
     }

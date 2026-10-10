@@ -168,9 +168,34 @@ fn capture_process_table_uncached() -> (HashMap<u32, u32>, HashMap<u32, String>)
             HashMap::new(),
         );
     }
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,command="])
-        .output();
+    // A/B（`TAKO_1979_LEGACY=1`）: 修正前の上限なしの `ps`
+    if tako_core::probe::issue1979_legacy() {
+        return ps_table_unbounded_legacy();
+    }
+    // #1979: macOS は libproc で引く（子プロセスもパイプも無い = 待ちが生まれない）
+    if let Some(table) = tako_core::ports::process_table() {
+        return table;
+    }
+    // libproc が無い unix は `ps` を**上限つきで**待つ（打ち切ったら空 = 走査しない側へ倒れる）
+    match tako_core::probe::output_with_timeout("ps", &PS_ARGS, PS_TIMEOUT) {
+        tako_core::probe::Outcome::Done { stdout, .. } => {
+            parse_process_table(&String::from_utf8_lossy(&stdout))
+        }
+        _ => (HashMap::new(), HashMap::new()),
+    }
+}
+
+/// `ps` の引数（libproc が無い unix の落ち先と A/B で同じ列）
+const PS_ARGS: [&str; 2] = ["-axo", "pid=,ppid=,command="];
+
+/// `ps` 1 回の上限（#1979）。実測（2026-10-10・約 1,100 プロセス）で 0.04 秒。
+/// 5 秒はその 100 倍以上で、正当な走査がここに届くことは無い
+const PS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// #1979 の A/B の再現アーム（**修正前の上限なしの待ち**をわざと残している）。
+/// 子が終わらない・パイプの書き手が長生きのプロセスへ漏れると永久に返らない
+fn ps_table_unbounded_legacy() -> (HashMap<u32, u32>, HashMap<u32, String>) {
+    let output = std::process::Command::new("ps").args(PS_ARGS).output();
     let Ok(output) = output else {
         return (HashMap::new(), HashMap::new());
     };
@@ -573,22 +598,21 @@ pub fn resolve_pane_by_pid(caller_pid: u32, pane_backends: &[(u64, String)]) -> 
 
 /// tmux バックエンドの全ペイン（ID と pane_pid）を列挙する。
 /// ID は remote API のペイン ID 形式（`session:window.pane`）と一致させる
+///
+/// 待ちは `tako_core::tmux::query` の上限つきの 1 実装を通す（#1979。打ち切ったら空）
 pub fn tmux_pane_pids(socket: Option<&str>) -> Vec<(String, u32)> {
-    let output = tako_core::tmux::tmux_command(socket)
-        .args([
+    let Ok(output) = tako_core::tmux::query(
+        socket,
+        &[
             "list-panes",
             "-a",
             "-F",
             "#{session_name}:#{window_index}.#{pane_index} #{pane_pid}",
-        ])
-        .output();
-    let Ok(output) = output else {
+        ],
+    ) else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
+    output
         .lines()
         .filter_map(|line| {
             let (id, pid) = line.rsplit_once(' ')?;

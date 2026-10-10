@@ -175,22 +175,19 @@ impl SessionBackend for TmuxBackend {
     /// Windows では tmux を器に選ばない（`decide` の実測理由）。それでも
     /// **API が嘘をつかない**よう実装しておく（「器の中の pid が取れない器」ではない）
     fn pane_pids(&self, session: &SessionRef) -> Vec<u32> {
-        let Ok(output) = crate::tmux::tmux_command(self.sock())
-            .args([
+        let Ok(output) = crate::tmux::run_tmux(
+            self.sock(),
+            &[
                 "list-panes",
                 "-t",
                 &crate::tmux::session_pane_target(session.as_str()),
                 "-F",
                 "#{pane_pid}",
-            ])
-            .output()
-        else {
+            ],
+        ) else {
             return Vec::new();
         };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        String::from_utf8_lossy(&output.stdout)
+        output
             .lines()
             .filter_map(|line| line.trim().parse::<u32>().ok())
             .filter(|pid| *pid != 0)
@@ -199,21 +196,18 @@ impl SessionBackend for TmuxBackend {
 
     /// 器の中の全ペイン（#728）。`list-panes -a` で器の全セッションを 1 回で取る
     fn pane_pids_all(&self) -> Vec<(String, u32)> {
-        let Ok(output) = crate::tmux::tmux_command(self.sock())
-            .args([
+        let Ok(output) = crate::tmux::run_tmux(
+            self.sock(),
+            &[
                 "list-panes",
                 "-a",
                 "-F",
                 "#{session_name}:#{window_index}.#{pane_index} #{pane_pid}",
-            ])
-            .output()
-        else {
+            ],
+        ) else {
             return Vec::new();
         };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        super::parse_pane_pids_all(&String::from_utf8_lossy(&output.stdout))
+        super::parse_pane_pids_all(&output)
     }
 
     // `pane_in_mode` / `copy_mode_exit_bytes` は**あえて既定（None）のまま**にしてある。
@@ -254,8 +248,9 @@ impl DetachedCapture for TmuxBackend {
     fn capture_history_joined(&self, session: &SessionRef, lines: usize) -> Option<String> {
         // `-J` で折り返し行を結合する。`capture_history`（`-J` 無し）とは別物
         let start = format!("-{lines}");
-        let output = crate::tmux::tmux_command(self.sock())
-            .args([
+        let output = crate::tmux::run_tmux(
+            self.sock(),
+            &[
                 "capture-pane",
                 "-p",
                 "-J",
@@ -263,14 +258,11 @@ impl DetachedCapture for TmuxBackend {
                 &crate::tmux::session_pane_target(session.as_str()),
                 "-S",
                 &start,
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
+            ],
+        )
+        .ok()?;
         // 行単位で組み直してから末尾を落とす（CRLF 正規化。移設元と同一）
-        let text = String::from_utf8_lossy(&output.stdout)
+        let text = output
             .lines()
             .collect::<Vec<_>>()
             .join("\n")
@@ -321,20 +313,18 @@ impl DetachedCapture for TmuxBackend {
     /// tmux の `#{scroll_position}` は copy mode の外では**空文字**に展開される
     /// （psmux は 0 を返す）。どちらも「最下部」なので 0 へ寄せる
     fn scroll_probe(&self, session: &SessionRef) -> Option<ScrollProbe> {
-        let output = crate::tmux::tmux_command(self.sock())
-            .args([
+        let output = crate::tmux::run_tmux(
+            self.sock(),
+            &[
                 "display-message",
                 "-p",
                 "-t",
                 &crate::tmux::session_pane_target(session.as_str()),
                 "#{scroll_position}\t#{history_size}\t#{pane_in_mode}\t#{alternate_on}",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        super::parse_scroll_probe(&String::from_utf8_lossy(&output.stdout))
+            ],
+        )
+        .ok()?;
+        super::parse_scroll_probe(&output)
     }
 }
 

@@ -3525,13 +3525,32 @@ fn run_claude_agents_json_live(target: &AgentScanTarget) -> Option<Vec<u8>> {
         None => command.env_remove(CLAUDE_CONFIG_DIR_ENV),
         Some(path) => command.env(CLAUDE_CONFIG_DIR_ENV, path),
     };
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(e) => {
+    // #1979: 待ちには上限を付ける（`Command::output()` は claude が返らないと永久に待つ。
+    // この走査はスマホの一覧（`RemoteAgents`）・セッション再起動の計画から UI スレッドの
+    // 同期の dispatch でも届く）。上限は他のエージェント CLI の問い合わせと同じ probe の既定
+    let output = match tako_core::probe::command_output_with_timeout(
+        &mut command,
+        "claude agents --json",
+        tako_core::probe::probe_timeout(),
+    ) {
+        tako_core::probe::Outcome::Done {
+            status,
+            stdout,
+            stderr,
+        } => std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        tako_core::probe::Outcome::TimedOut { waited, .. } => {
             crate::diag::flow_log(&format!(
-                "agents 走査: 子プロセスを起こせない（{:?}）",
-                e.kind()
+                "agents 走査: claude が {} 秒応答しないので打ち切った",
+                waited.as_secs()
             ));
+            return None;
+        }
+        tako_core::probe::Outcome::Failed { reason, .. } => {
+            crate::diag::flow_log(&format!("agents 走査: 子プロセスを起こせない（{reason}）"));
             return None;
         }
     };

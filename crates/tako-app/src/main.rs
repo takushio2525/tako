@@ -922,6 +922,15 @@ fn initial_scrollback_lines() -> usize {
     tako_control::settings::load().resolved_scrollback_lines()
 }
 
+/// フォーカスの無いペインの再描画の上限（#1979）の起動時の値。
+/// セルフテストはユーザーの設定に左右されないよう既定で走る
+fn initial_unfocused_redraw_fps() -> u32 {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return tako_core::redraw_limit::DEFAULT_UNFOCUSED_FPS;
+    }
+    tako_control::settings::load().resolved_unfocused_redraw_fps()
+}
+
 /// tako mod（FR-2.42 / #1879）の起動時の状態。
 ///
 /// 展開（小さなファイル 5 本の比較・差し替え）と、子プロセスを起こさない版の判定は
@@ -2383,6 +2392,19 @@ struct TakoApp {
     term_notify_pending: bool,
     /// 出力起因の再描画を要求した回数（Issue #782 の可視性ゲートの検証用。単調増加）
     term_redraw_requests: u64,
+    /// フォーカスの無いペインの出力による再描画の上限（fps。#1979。`tako redraw-limit`）
+    unfocused_redraw_fps: u32,
+    /// フォーカスの無いペインの再描画: 最後に流した時刻（#1979。`last_term_notify` の対）
+    last_unfocused_flush: std::time::Instant,
+    /// 同: 遅延フラッシュのタイマーが稼働中か（`term_notify_pending` の対）
+    unfocused_notify_pending: bool,
+    /// 同: 待っているあいだに出力があったペイン（`term_pending_panes` の対）
+    unfocused_pending_panes: Vec<PaneId>,
+    /// 同: 待っている変化がペインの外にも出るか（`term_pending_app` の対）
+    unfocused_pending_app: bool,
+    /// 出力起因の再描画を流した回数（フォーカス中 / それ以外。#1979 の上限の実測の口。単調増加）
+    focused_flushes: u64,
+    unfocused_flushes: u64,
     /// 画面に映っていないペインの出力で再描画を省いた回数（同上）
     term_redraw_skipped: u64,
     /// ペインごとのイベント配送状態（#816）。
@@ -3063,6 +3085,20 @@ struct PaneDelivery {
     hops: std::sync::atomic::AtomicU64,
     /// 見えないので渡さなかった回数
     skipped: std::sync::atomic::AtomicU64,
+    /// Wakeup でメインスレッドへ渡る最小間隔（ミリ秒。#1979）。`hidden` と同じく
+    /// `on_term_event` が申し送る。フォーカスの無いペインは再描画の上限の間隔、
+    /// それ以外は 0（= [`TakoApp::TERM_REDRAW_INTERVAL`] のまま）
+    min_hop_ms: std::sync::atomic::AtomicU64,
+}
+
+impl PaneDelivery {
+    /// 次に Wakeup でメインスレッドへ渡ってよいまでの間隔（#816 の 16ms と #1979 の
+    /// 上限の大きいほう）。渡っても描くのは上限の間隔ごとなので、それより速く渡るのは
+    /// メインスレッドの往復の無駄（`on_term_event` は遅延フラッシュを積むだけ）
+    fn hop_interval(&self) -> Duration {
+        Duration::from_millis(self.min_hop_ms.load(std::sync::atomic::Ordering::Relaxed))
+            .max(TakoApp::TERM_REDRAW_INTERVAL)
+    }
 }
 
 /// 未処理 `Wakeup` ゲート（#816。`TerminalSession::wakeup_gate`）を倒す。
@@ -3141,7 +3177,7 @@ async fn batch_term_events(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
-        if events.is_empty() && last_hop.elapsed() < TakoApp::TERM_REDRAW_INTERVAL {
+        if events.is_empty() && last_hop.elapsed() < delivery.hop_interval() {
             // #816: Wakeup だけの窓で、まだ次の再描画時刻に達していない。
             // いま渡しても `on_term_event` は遅延フラッシュを積むだけなので、
             // 持ち越して窓をもう 1 周する（描かれる時刻は変わらない）
@@ -4405,6 +4441,13 @@ impl TakoApp {
             last_term_notify: std::time::Instant::now(),
             term_notify_pending: false,
             term_redraw_requests: 0,
+            unfocused_redraw_fps: initial_unfocused_redraw_fps(),
+            last_unfocused_flush: std::time::Instant::now(),
+            unfocused_notify_pending: false,
+            unfocused_pending_panes: Vec::new(),
+            unfocused_pending_app: false,
+            focused_flushes: 0,
+            unfocused_flushes: 0,
             term_redraw_skipped: 0,
             pane_delivery: HashMap::new(),
             term_pending_panes: Vec::new(),
@@ -6744,8 +6787,11 @@ impl TakoApp {
         Vec<gpui::AnyWindowHandle>,
     ) {
         let _span = tako_control::diag::perf_span("ipc_turn");
+        // #1979: 読み取りの続き（`tako list` の応答）は描かない。強制描画は
+        // レイアウトを変えうる着地だけ（`changes_layout` の 1 実装）
+        let needs_frame = next.changes_layout() && !Self::ipc_redraw_legacy();
         let mut result = tako_control::finish_offload(self, next, origin);
-        let redraw = self.after_dispatch(&mut result, !Self::ipc_redraw_legacy(), cx);
+        let redraw = self.after_dispatch(&mut result, needs_frame, cx);
         (result, redraw)
     }
 
@@ -7283,6 +7329,10 @@ impl TakoApp {
     /// backend ペインが 1 つも無ければ tmux を起動すらしない。連打・リモートの
     /// ポーリング（`AppIpcClient::probe` は毎回 `Request::List` を打つ）で毎回
     /// 起動しないよう、直前の採取から [`BACKEND_WINDOWS_FRESH`] 以内は使い回す
+    ///
+    /// **同期の採り直し**（#1979）。IPC の受け口は [`Self::backend_windows_plan`] の判断だけを
+    /// UI スレッドで行い、`list-windows` は background で待つ（`tako_control::prepare_offload`）。
+    /// ここへ来るのは offload を通らない同期の呼び手だけ
     fn refresh_backend_windows_now(&mut self) {
         // #1191 の A/B: 修正前と同じ「要求時には採らない」へ戻す
         if legacy_1191() {
@@ -7294,17 +7344,29 @@ impl TakoApp {
             self.backend_windows_at = None;
             return;
         }
-        if self
-            .backend_windows_at
-            .is_some_and(|t| t.elapsed() < BACKEND_WINDOWS_FRESH)
-        {
+        let Some(socket) = self.backend_windows_plan() else {
             return;
-        }
-        let socket = tako_core::tmux_backend::socket_name();
+        };
         let by_session = tako_core::tmux::list_windows_by_session(Some(&socket));
         // ホバープレビューのキャプチャ対象は捨てる: capture-pane は window 数ぶんの
         // サブプロセスで、右パネルが見えていないときに払う理由が無い（Issue #113）
         let _ = self.apply_backend_windows(by_session.as_ref());
+    }
+
+    /// 要求時の採り直しが要るか（#1979。**判断だけ**で tmux は起こさない）。要るなら器の
+    /// ソケット名。backend ペインが無い・#1191 の A/B・直前の採取から
+    /// [`BACKEND_WINDOWS_FRESH`] 以内なら `None`
+    fn backend_windows_plan(&self) -> Option<String> {
+        if legacy_1191() || self.backend_sessions.is_empty() {
+            return None;
+        }
+        if self
+            .backend_windows_at
+            .is_some_and(|t| t.elapsed() < BACKEND_WINDOWS_FRESH)
+        {
+            return None;
+        }
+        Some(tako_core::tmux_backend::socket_name())
     }
 
     /// backend セッション名 → window 一覧を `backend_windows` へ反映する（メモリ操作のみ）。
@@ -9014,10 +9076,10 @@ impl TakoApp {
                 // 静かなペインへの打鍵（= 直前の往復が 16ms 以上前）は即時のまま
                 if wakeup_only {
                     let since = last_hop.elapsed();
-                    if since < TakoApp::TERM_REDRAW_INTERVAL {
-                        cx.background_executor()
-                            .timer(TakoApp::TERM_REDRAW_INTERVAL - since)
-                            .await;
+                    // #1979: フォーカスの無いペインは再描画の上限の間隔まで待つ
+                    let interval = delivery.hop_interval();
+                    if since < interval {
+                        cx.background_executor().timer(interval - since).await;
                     }
                 }
                 last_hop = std::time::Instant::now();
@@ -9190,15 +9252,36 @@ impl TakoApp {
         // 裏タブ・たまり場のペインが吐く出力で 60fps の再描画を回し続けるのは、
         // 見た目が 1 ピクセルも変わらない純粋な浪費
         let visibility = self.pane_visibility(pane_id);
+        // #1979: フォーカスの無いペインの出力は再描画の上限（既定 30 fps）の間隔でまとめて
+        // 描く。フォーカス中のペインは従来どおり 16ms（~60fps）。A/B は上限なし
+        let unfocused = !tako_core::probe::issue1979_legacy() && pane_id != self.focused_pane();
         // #816: 判定結果を配送側へ申し送る（次の Wakeup からメインスレッド往復ごと省ける）
         if let Some(state) = self.pane_delivery.get(&pane_id) {
             state.hidden.store(
                 visibility == PaneVisibility::Hidden,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            let hop_ms = if unfocused {
+                tako_core::redraw_limit::interval(self.unfocused_redraw_fps).as_millis() as u64
+            } else {
+                0
+            };
+            state
+                .min_hop_ms
+                .store(hop_ms, std::sync::atomic::Ordering::Relaxed);
         }
         if !ui_outside_pane && visibility == PaneVisibility::Hidden {
             self.term_redraw_skipped = self.term_redraw_skipped.saturating_add(1);
+            return;
+        }
+        if unfocused {
+            // 汚す範囲の決め方は下（フォーカス中）と同じ（#786）
+            if ui_outside_pane || visibility != PaneVisibility::OwnPane {
+                self.unfocused_pending_app = true;
+            } else if !self.unfocused_pending_panes.contains(&pane_id) {
+                self.unfocused_pending_panes.push(pane_id);
+            }
+            self.schedule_unfocused_redraw(cx);
             return;
         }
         // Issue #786: 変化がペイン本体の中だけなら、**そのペインのビューだけ**を汚す。
@@ -9238,14 +9321,70 @@ impl TakoApp {
         // #803: ヘッダの時計だけは時間で変わる。出力が流れているあいだも 1 秒に 1 回
         // 進める（ゲートは中で見るので、ここの呼び出しは Instant の比較 1 回）
         self.tick_pane_header_clocks(cx);
+        // #1979: フォーカスの無いペインの溜まり分も、間隔が来ていれば同じフレームへ
+        // 相乗りさせる（別のフレームを 1 枚増やさない）
+        if (self.unfocused_pending_app || !self.unfocused_pending_panes.is_empty())
+            && self.last_unfocused_flush.elapsed()
+                >= tako_core::redraw_limit::interval(self.unfocused_redraw_fps)
+        {
+            self.flush_unfocused_redraw(cx);
+        }
         let app_scope = std::mem::take(&mut self.term_pending_app);
         let panes = std::mem::take(&mut self.term_pending_panes);
         if !app_scope && panes.is_empty() {
             return;
         }
         self.term_redraw_requests = self.term_redraw_requests.saturating_add(1);
+        self.focused_flushes = self.focused_flushes.saturating_add(1);
         if app_scope {
             // #858: 「出力なのにアプリ全体が汚れた」を後から名指しできるようにする
+            self.term_app_notifies = self.term_app_notifies.saturating_add(1);
+            cx.notify();
+            return;
+        }
+        for pane in panes {
+            self.notify_pane_body(pane, cx);
+        }
+    }
+
+    /// フォーカスの無いペインの出力による再描画を、上限の間隔で 1 回にまとめる（#1979）。
+    /// 形はフォーカス中の 16ms のデバウンス（`on_term_event` の末尾）と同じで、
+    /// 間隔だけが [`tako_core::redraw_limit::interval`]
+    fn schedule_unfocused_redraw(&mut self, cx: &mut Context<Self>) {
+        let interval = tako_core::redraw_limit::interval(self.unfocused_redraw_fps);
+        let elapsed = self.last_unfocused_flush.elapsed();
+        if elapsed >= interval {
+            self.flush_unfocused_redraw(cx);
+        } else if !self.unfocused_notify_pending {
+            self.unfocused_notify_pending = true;
+            let remaining = interval - elapsed;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(remaining).await;
+                let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                    app.unfocused_notify_pending = false;
+                    // 発火の時点で間隔を測り直す（タイマーは数 ms 早く起きることがあり、
+                    // そのまま流すと上限を 1 割ほど超えた = 30 fps の上限で 32.9 fps を実測）。
+                    // 早ければ残りぶんで張り直す
+                    app.schedule_unfocused_redraw(cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// 溜まっていたフォーカスの無いペインの再描画要求を流す（#1979。`flush_term_redraw` の対）
+    fn flush_unfocused_redraw(&mut self, cx: &mut Context<Self>) {
+        self.last_unfocused_flush = std::time::Instant::now();
+        // #803: 出力がフォーカスの無いペインだけでもヘッダの時計は進める
+        self.tick_pane_header_clocks(cx);
+        let app_scope = std::mem::take(&mut self.unfocused_pending_app);
+        let panes = std::mem::take(&mut self.unfocused_pending_panes);
+        if !app_scope && panes.is_empty() {
+            return;
+        }
+        self.term_redraw_requests = self.term_redraw_requests.saturating_add(1);
+        self.unfocused_flushes = self.unfocused_flushes.saturating_add(1);
+        if app_scope {
             self.term_app_notifies = self.term_app_notifies.saturating_add(1);
             cx.notify();
             return;
@@ -22813,6 +22952,29 @@ impl SessionHost for TakoApp {
         }
     }
 
+    fn redraw_limit_status(&self) -> tako_core::redraw_limit::RedrawLimitStatus {
+        tako_core::redraw_limit::RedrawLimitStatus {
+            unfocused_fps: self.unfocused_redraw_fps,
+            focused_flushes: self.focused_flushes,
+            unfocused_flushes: self.unfocused_flushes,
+            body_renders: self.pane_body_renders,
+            legacy: tako_core::probe::issue1979_legacy(),
+        }
+    }
+
+    fn set_unfocused_redraw_fps(&mut self, fps: u32) {
+        // 生存中のペインへはその場で効く（次の出力から新しい間隔で描く）
+        self.unfocused_redraw_fps = tako_core::redraw_limit::clamp_fps(fps);
+        // セルフテスト中はユーザー設定を汚さない（scrollback と同じ規約）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.unfocused_redraw_fps = self.unfocused_redraw_fps;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
     fn set_scrollback_lines(&mut self, lines: usize) {
         let lines = tako_core::scrollback::clamp_lines(lines);
         self.scrollback_lines = lines;
@@ -22935,6 +23097,20 @@ impl TmuxHost for TakoApp {
     /// #1191: `tako list` は要求時点の実態を返す（右パネルの表示状態に依存しない）
     fn refresh_backend_windows(&mut self) {
         self.refresh_backend_windows_now();
+    }
+
+    /// #1979: 採り直しの判断だけ（tmux は background が起こす）
+    fn backend_windows_fetch_plan(&self) -> Option<String> {
+        self.backend_windows_plan()
+    }
+
+    /// #1979: background で採った window 一覧の反映（ホバープレビューのキャプチャ対象は
+    /// 捨てる = 同期の採り直しと同じ扱い）
+    fn apply_backend_windows_fetch(
+        &mut self,
+        by_session: Option<HashMap<String, Vec<tako_core::TmuxWindow>>>,
+    ) {
+        let _ = self.apply_backend_windows(by_session.as_ref());
     }
 
     fn backend_scroll_view(

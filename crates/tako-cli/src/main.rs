@@ -95,6 +95,8 @@ enum Command {
     Scroll(ScrollArgs),
     /// 直接ペインのスクロールバック保持上限（行）の確認・変更（Issue #818）
     Scrollback(ScrollbackArgs),
+    /// フォーカスの無いペインの出力による再描画の上限（fps）の確認・変更（Issue #1979）
+    RedrawLimit(RedrawLimitArgs),
     /// ペインを閉じる（タブ最後の 1 ペインならタブごと閉じる）
     Close(CloseArgs),
     /// ペインのタイトル・役割ラベルを設定する（空文字でクリア）
@@ -3291,6 +3293,15 @@ struct LinksArgs {
 struct ScrollbackArgs {
     /// 保持行数（100〜100000。省略時は現在値と適用中のペイン数を表示）
     lines: Option<usize>,
+}
+
+/// フォーカスの無いペインの再描画の上限の引数（Issue #1979）。
+/// 最簡形（#322）: `tako redraw-limit` で現在値、`tako redraw-limit 20` で変更
+#[derive(Args)]
+struct RedrawLimitArgs {
+    /// 上限（1〜60 fps。既定 30。フォーカス中のペインは常に 60。省略時は現在値と
+    /// 起動からの再描画回数を表示）
+    fps: Option<u32>,
 }
 
 /// チェンジログビューの引数（Issue #338）
@@ -7915,7 +7926,15 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::PreviewCache(args) => Request::PreviewCache {
             max_mb: args.max_mb,
         },
-        Command::Scrollback(args) => Request::Scrollback { lines: args.lines },
+        Command::Scrollback(args) => Request::Scrollback {
+            lines: args.lines,
+            unfocused_fps: None,
+        },
+        // #1979: 再描画の上限は MCP `tako_scrollback` の `unfocused_fps` と同じ操作
+        Command::RedrawLimit(args) => Request::Scrollback {
+            lines: None,
+            unfocused_fps: args.fps,
+        },
         // #1677: 基準ペインは閉じたペインの項目を開き直すときだけ使う。tako の外から
         // 叩いて呼び出し元が分からなくても失敗させない（dispatch がアクティブタブへ倒す）
         Command::Jump(sub) => {
@@ -11009,6 +11028,8 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Scrollback(_) => {
             println!("{result}")
         }
+        // #1979: 再描画の上限の部分だけを出す（スクロールバックは `tako scrollback`）
+        Command::RedrawLimit(_) => println!("{}", pretty_json(&result["unfocused_redraw"])),
         // #666: カードの内容（論理文字列）は改行込みで読みたいので整形して出す
         Command::ShowCommand(_) => println!("{}", pretty_json(result)),
         Command::Autorename(_)
@@ -12584,12 +12605,40 @@ mod tests {
         let status = parse(&["tako", "scrollback"]);
         assert_eq!(
             build_request(&status).unwrap(),
-            Request::Scrollback { lines: None }
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None
+            }
         );
         let changed = parse(&["tako", "scrollback", "2000"]);
         assert_eq!(
             build_request(&changed).unwrap(),
-            Request::Scrollback { lines: Some(2_000) }
+            Request::Scrollback {
+                lines: Some(2_000),
+                unfocused_fps: None
+            }
+        );
+    }
+
+    /// #1979: 最簡形（引数なし = 現在値 / 数値 1 個 = 変更）が MCP `tako_scrollback` の
+    /// `unfocused_fps` と同じ操作へ写る（スクロールバックの値には触らない）
+    #[test]
+    fn redraw_limitは状態取得と上限変更を操作へ写す() {
+        let status = parse(&["tako", "redraw-limit"]);
+        assert_eq!(
+            build_request(&status).unwrap(),
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None
+            }
+        );
+        let changed = parse(&["tako", "redraw-limit", "20"]);
+        assert_eq!(
+            build_request(&changed).unwrap(),
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: Some(20)
+            }
         );
     }
 
@@ -13147,6 +13196,8 @@ mod platform_matrix_parity {
         ("portdetect", "tako_port_detect"),
         ("preview", "tako_preview_view"),
         ("read", "tako_read_pane"),
+        // #1979: MCP は `tako_scrollback` の `unfocused_fps` 引数（ツールを増やさない）
+        ("redraw-limit", "tako_scrollback"),
         ("resize", "tako_resize_pane"),
         ("run-default", "tako_run_defaults"),
         ("scroll", "tako_scroll_pane"),
