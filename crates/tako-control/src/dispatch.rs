@@ -5429,7 +5429,9 @@ fn dispatch_inner(
                     })
                 })
                 .collect();
-            Ok(json!({ "backgrounded": items, "tabs": tabs }))
+            // #1946: 由来タブ → 親 master のまとまり（たまり場の見出しと同じ構造）
+            let groups = background_groups_json(host.workspace());
+            Ok(json!({ "backgrounded": items, "tabs": tabs, "groups": groups }))
         }
 
         Request::CollapseTab {
@@ -5479,20 +5481,29 @@ fn dispatch_inner(
 
         Request::BackgroundKill { pane } => {
             let pane_id = PaneId::from_raw(pane);
-            if host.workspace_mut().remove_shelved(pane_id).is_none() {
+            if !host.workspace().is_shelved(pane_id) {
                 return Err(DispatchError::PaneNotFound(pane));
             }
+            // #1946: 器を外す前に見る（外した後では幽霊と区別できない）
+            let vessel = background_vessel(host, pane_id);
+            let plan = tako_core::background_groups::close_plan(vessel);
+            host.workspace_mut().remove_shelved(pane_id);
+            // 幽霊は器（tmux の登録）を持たないので、ここで kill される器は無い
+            // （`Vessel::Missing` = バックエンドの登録が無い、が判定の定義）
             host.detach_session(pane_id, close_origin_of(origin), None);
             // #775: たまり場の kill も明示 close なのでレジストリへ記録する
-            // （GUI のたまり場カードと対の経路。UI でできることは AI からも同じに見える）
-            if let Err(e) = crate::orchestrator::registry::mark_closed_by_origin(
-                pane_id.as_u64(),
-                close_origin_of(origin),
-                None,
-            ) {
-                eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
+            // （GUI のたまり場カードと対の経路。UI でできることは AI からも同じに見える）。
+            // #1946: 幽霊は記録しない（本物が別の pane id で生きていることがある）
+            if plan.record_worker_close {
+                if let Err(e) = crate::orchestrator::registry::mark_closed_by_origin(
+                    pane_id.as_u64(),
+                    close_origin_of(origin),
+                    None,
+                ) {
+                    eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
+                }
             }
-            Ok(json!({ "killed": pane }))
+            Ok(json!({ "killed": pane, "vessel": vessel.as_str() }))
         }
 
         Request::CheckHealth => Ok(check_health(host)),
@@ -17194,6 +17205,12 @@ fn background_entry_json(
         "origin_tab": origin_tab.as_u64(),
         "origin_tab_title": origin_tab_title,
         "surface": "background",
+        // #1946: 器（`none` = 幽霊）と親 master（たまり場の見出しと同じ解決）
+        "vessel": background_vessel(host, pane.id()).as_str(),
+        "parent_master": master_json(
+            host.workspace(),
+            tako_core::background_groups::parent_master(host.workspace(), pane.id()),
+        ),
     });
     if let Some((path, mode)) = preview {
         entry["preview"] = json!({
@@ -17205,6 +17222,59 @@ fn background_entry_json(
         entry["shelved_tab"] = json!(tab);
     }
     entry
+}
+
+/// 退避ペインの器（#1946）。たまり場のカードと `BackgroundList` / `BackgroundKill` が
+/// 同じ判定を通す 1 実装（GUI も `self` を host として渡してここを呼ぶ）
+pub fn background_vessel(
+    host: &dyn ControlHost,
+    pane: PaneId,
+) -> tako_core::background_groups::Vessel {
+    tako_core::background_groups::Vessel::classify(tako_core::background_groups::VesselFacts {
+        preview: host.preview_state(pane).is_some(),
+        web: host.pane_has_webview(pane),
+        terminal: host.session(pane).is_some(),
+        backend: host.backend_session(pane).is_some(),
+    })
+}
+
+/// 親 master の JSON（#1946。親不明は null）
+fn master_json(ws: &Workspace, key: tako_core::background_groups::MasterKey) -> Value {
+    use tako_core::background_groups::{master_info, MasterPlace};
+    match master_info(ws, key) {
+        None => Value::Null,
+        Some(info) => json!({
+            "pane": info.pane.as_u64(),
+            "profile": info.profile,
+            "title": info.title,
+            "place": info.place.as_str(),
+            "tab": match info.place {
+                MasterPlace::Tab(t) => Some(t.as_u64()),
+                _ => None,
+            },
+        }),
+    }
+}
+
+/// 退避ペインの「由来タブ → 親 master」のまとまり（#1946。たまり場の見出しと同じ構造）
+fn background_groups_json(ws: &Workspace) -> Value {
+    Value::Array(
+        tako_core::background_groups::groups(ws)
+            .iter()
+            .map(|g| {
+                json!({
+                    "origin_tab": g.origin_tab.as_u64(),
+                    "title": g.title,
+                    "origin": g.origin.as_str(),
+                    "count": g.pane_count(),
+                    "masters": g.masters.iter().map(|m| json!({
+                        "master": master_json(ws, m.master),
+                        "panes": m.panes.iter().map(|p| p.as_u64()).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// ピン留め中のプレビュー一覧を JSON 配列へ（list / Pin 応答で共用。FR-2.16.15）
@@ -21593,6 +21663,10 @@ mod tests {
         let mut host = MockHost::new();
         let root = host.root_pane();
         let pane = split(&mut host, root);
+        // 実機の worker と同じく器（tmux の登録）を持たせる。器が無いと #1946 の
+        // 幽霊になり、レジストリへは書かない（それは別のテストが縛る）
+        host.backend_sessions
+            .insert(pane, format!("tako-st775-{pane}"));
         let worker_id = crate::orchestrator::registry::record_spawn(RegisterSpawn {
             label: Some("bg-kill".into()),
             project: "st775".into(),
@@ -21640,6 +21714,145 @@ mod tests {
         let _ = WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.remove(&worker_id);
         });
+    }
+
+    /// #1946: 器の無い退避エントリ（幽霊）を閉じても、レジストリへ closed を書かない。
+    ///
+    /// #1576 の機序では本物の器が**別の pane id**で生きていることがあり、ここで
+    /// closed を書くと生きている worker を閉じたことにしてしまう（死んでいれば #658 の GC が閉じる）
+    #[test]
+    fn background_killは幽霊ならレジストリへ書かず一覧から外すだけ() {
+        use crate::orchestrator::registry::{registry_path, RegisterSpawn, WorkerRegistry};
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let ghost = split(&mut host, root);
+        let alive = split(&mut host, root);
+        host.backend_sessions
+            .insert(alive, format!("tako-st1946-{alive}"));
+        let worker_id = crate::orchestrator::registry::record_spawn(RegisterSpawn {
+            label: Some("ghost-kill".into()),
+            project: "st1946".into(),
+            agent: "claude".into(),
+            model: None,
+            effort: None,
+            pane: ghost,
+            tab: None,
+            tmux_session: None,
+            issues: vec![],
+            ledger_id: None,
+            cwd: None,
+            prompt_head: None,
+        })
+        .expect("レジストリへ登録できる");
+        for pane in [ghost, alive] {
+            dispatch(
+                &mut host,
+                Request::Background {
+                    pane: Some(pane),
+                    tab: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+        }
+        let list = dispatch(&mut host, Request::BackgroundList, PaneOrigin::Cli).unwrap();
+        let vessel_of = |list: &Value, pane: u64| {
+            list["backgrounded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["pane"].as_u64() == Some(pane))
+                .map(|e| e["vessel"].as_str().unwrap_or("").to_string())
+        };
+        assert_eq!(vessel_of(&list, ghost).as_deref(), Some("none"));
+        assert_eq!(vessel_of(&list, alive).as_deref(), Some("tmux"));
+
+        let killed = dispatch(
+            &mut host,
+            Request::BackgroundKill { pane: ghost },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(killed["vessel"].as_str(), Some("none"));
+        assert!(!host.ws.is_shelved(PaneId::from_raw(ghost)));
+        let reg = WorkerRegistry::load().unwrap();
+        assert!(
+            reg.resolve(&worker_id).unwrap().1.is_active(),
+            "幽霊を外しただけで worker を closed にしてはいけない"
+        );
+        // 生きている器は登録も退避もそのまま
+        assert!(host.ws.is_shelved(PaneId::from_raw(alive)));
+        assert!(host.backend_sessions.contains_key(&alive));
+        let list = dispatch(&mut host, Request::BackgroundList, PaneOrigin::Cli).unwrap();
+        assert_eq!(vessel_of(&list, ghost), None);
+        assert_eq!(vessel_of(&list, alive).as_deref(), Some("tmux"));
+        let path = registry_path().unwrap();
+        let _ = WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.remove(&worker_id);
+        });
+    }
+
+    /// #1946: 一覧の `groups` は由来タブ → 親 master のまとまりで、各エントリに親 master が載る
+    #[test]
+    fn backgroundリストは由来タブと親masterのまとまりを返す() {
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let beta = split(&mut host, root);
+        let role = |host: &mut MockHost, pane: u64, role: &str, parent: Option<u64>| {
+            let p = host.ws.pane_anywhere_mut(PaneId::from_raw(pane)).unwrap();
+            p.set_role(Some(role.to_string()));
+            p.set_spawned_by(parent.map(PaneId::from_raw));
+        };
+        role(&mut host, root, "orchestrator-master:alpha", None);
+        role(&mut host, beta, "orchestrator-master:beta", None);
+        let work = host.ws.create_tab("work", Pane::new(PaneOrigin::User));
+        let keep = host.ws.get_tab(work).unwrap().tree().focused().as_u64();
+        let wa = split(&mut host, keep);
+        let wb = split(&mut host, keep);
+        let wa2 = split(&mut host, keep);
+        role(&mut host, wa, "orchestrator-worker:p", Some(root));
+        role(&mut host, wb, "orchestrator-worker:q", Some(beta));
+        role(&mut host, wa2, "orchestrator-worker:r", Some(root));
+        for pane in [wa, wb, wa2] {
+            dispatch(
+                &mut host,
+                Request::Background {
+                    pane: Some(pane),
+                    tab: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+        }
+        let list = dispatch(&mut host, Request::BackgroundList, PaneOrigin::Cli).unwrap();
+        let groups = list["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{list}");
+        let g = &groups[0];
+        assert_eq!(g["origin_tab"].as_u64(), Some(work.as_u64()));
+        assert_eq!(g["origin"].as_str(), Some("tab"));
+        assert_eq!(g["count"].as_u64(), Some(3));
+        let masters = g["masters"].as_array().unwrap();
+        assert_eq!(masters.len(), 2);
+        assert_eq!(masters[0]["master"]["profile"].as_str(), Some("alpha"));
+        assert_eq!(masters[0]["master"]["place"].as_str(), Some("tab"));
+        assert_eq!(masters[0]["panes"], json!([wa, wa2]));
+        assert_eq!(masters[1]["master"]["pane"].as_u64(), Some(beta));
+        assert_eq!(masters[1]["panes"], json!([wb]));
+        let entry = list["backgrounded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["pane"].as_u64() == Some(wb))
+            .unwrap();
+        assert_eq!(entry["parent_master"]["profile"].as_str(), Some("beta"));
+        // 退避 0 本なら groups も空
+        let empty = dispatch(
+            &mut MockHost::new(),
+            Request::BackgroundList,
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(empty["groups"], json!([]));
     }
 
     #[test]

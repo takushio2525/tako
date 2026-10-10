@@ -278,6 +278,12 @@ pub struct PaneLayout {
     /// **旧ファイルには無いので serde default で後方互換**（移行 Step は不要）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshPaneLayout>,
+    /// spawn 元のペイン ID（#1946）。たまり場と `tako background list` の
+    /// 「親 master ごと」のまとまりが GUI を再起動しても崩れないように残す
+    /// （ペイン ID は復元で保たれる）。**旧ファイルには無いので serde default で
+    /// 後方互換**（移行 Step は不要）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<u64>,
 }
 
 /// SSH ペインの再接続材料（#1446）。
@@ -399,6 +405,7 @@ pub fn capture(
                     origin_tab_title: Some(shelved.origin_tab_title().to_string()),
                     limit_autoresume: pane.limit_autoresume(),
                     ssh: m.ssh,
+                    spawned_by: pane.spawned_by().map(|p| p.as_u64()),
                 }
             })
             .collect(),
@@ -487,6 +494,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 origin_tab_title: None,
                 limit_autoresume: pane.limit_autoresume(),
                 ssh: m.ssh,
+                spawned_by: pane.spawned_by().map(|p| p.as_u64()),
             }))
         }
         PaneNode::Split {
@@ -740,6 +748,7 @@ pub const CHANGE_KEY_FIELDS: &[(&str, &str)] = &[
     ("PaneLayout", "origin_tab_title"),
     ("PaneLayout", "limit_autoresume"),
     ("PaneLayout", "ssh"),
+    ("PaneLayout", "spawned_by"),
     // SshPaneLayout（#1446）
     ("SshPaneLayout", "host"),
     ("SshPaneLayout", "reconnect_line"),
@@ -900,6 +909,8 @@ fn feed_pane<'a>(pane: &Pane, meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>, h: &mut 
     pane.role().hash(h);
     origin_str(pane.origin()).hash(h);
     pane.limit_autoresume().hash(h);
+    // PaneLayout.spawned_by（#1946）
+    pane.spawned_by().map(|p| p.as_u64()).hash(h);
     meta(pane.id()).feed(h);
 }
 
@@ -1023,7 +1034,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
         if !pane_ids.insert(p.id) {
             return Err(LayoutError::DuplicateId);
         }
-        let pane = Pane::restore(
+        let mut pane = Pane::restore(
             p.id,
             parse_origin(&p.origin),
             p.title.clone(),
@@ -1031,6 +1042,7 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             p.role.clone(),
             p.limit_autoresume,
         );
+        pane.set_spawned_by(p.spawned_by.map(PaneId::from_raw));
         restored.push(RestoredPane {
             pane: p.id,
             session: p.session.clone(),
@@ -1134,7 +1146,7 @@ fn restore_node(
 ) -> Option<(PaneNode, PaneId)> {
     match node {
         NodeLayout::Pane(p) => {
-            let pane = Pane::restore(
+            let mut pane = Pane::restore(
                 p.id,
                 parse_origin(&p.origin),
                 p.title.clone(),
@@ -1142,6 +1154,8 @@ fn restore_node(
                 p.role.clone(),
                 p.limit_autoresume,
             );
+            // #1946: spawn 元を戻す（親 master ごとのまとまりを再起動で崩さない）
+            pane.set_spawned_by(p.spawned_by.map(PaneId::from_raw));
             let id = pane.id();
             restored.push(RestoredPane {
                 pane: p.id,
@@ -2022,6 +2036,7 @@ mod tests {
                 origin_tab_title: None,
                 limit_autoresume: false,
                 ssh: None,
+                spawned_by: None,
             }))
         }
         let mut tree = pane(1);
@@ -2084,6 +2099,7 @@ mod tests {
             origin_tab_title: None,
             limit_autoresume: false,
             ssh: None,
+            spawned_by: None,
         });
         assert_eq!(layout.pane_count(), 4);
         assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-bg"]);
@@ -2182,6 +2198,7 @@ mod tests {
                 origin_tab_title: None,
                 limit_autoresume: false,
                 ssh: None,
+                spawned_by: None,
             }))
         }
         let mut id = 1u64;
@@ -2280,6 +2297,7 @@ mod tests {
             origin_tab_title: None,
             limit_autoresume: false,
             ssh: None,
+            spawned_by: None,
         });
         assert!(
             !loses_backend_session(&base, &shelved),

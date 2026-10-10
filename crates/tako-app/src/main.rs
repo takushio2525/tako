@@ -1838,7 +1838,26 @@ enum PaneVisibility {
     OwnPane,
     /// たまり場サムネイル・ホバー / ピン留めプレビュー等、ペイン本体の外にも描かれている
     Elsewhere,
+    /// たまり場カードの**縮小サムネイルにだけ**描かれている（#1946）。字が読める
+    /// 大きさではないので、出力のたびに 60fps で描き直さず間引いた再描画へ回す
+    Thumbnail,
 }
+
+/// たまり場カードのサムネイル 1 枚ぶん（#1946）。端末の画面・プレビューの本文を
+/// 端末グリッドの行（`RowPlan`）にしたもの。縮尺は描くときに決める
+struct ShelfThumb {
+    rows: std::rc::Rc<Vec<terminal_grid::RowPlan>>,
+    /// 元の画面の寸法（セル数）。カードの縦横比と縮尺はここから出す
+    cols: usize,
+    lines: usize,
+    /// プレビューの版（`content_rev`）。端末は `shelf_thumbs_dirty` で組み直す
+    rev: u64,
+    /// 組んだときのテーマの前景・背景（切り替えたら組み直す）
+    theme_key: (tako_core::Rgb, tako_core::Rgb),
+}
+
+/// サムネイルにだけ映っているペインの出力で描き直す間隔（#1946。4 回/秒）
+const SHELF_THUMB_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// 定義ジャンプの GUI の状態（#1680）。問い合わせ・着地は dispatch の 1 実装
 /// （`tako_control::dispatch::lsp_goto_*`）で、ここは画面だけが持つもの
@@ -2428,6 +2447,20 @@ struct TakoApp {
     chrome_renders: u64,
     /// 出力起因の再描画で**アプリ全体**を汚した回数（#858 の切り分け用。単調増加）
     term_app_notifies: u64,
+    /// たまり場カードのサムネイル（#1946）。変化したペインだけ組み直して使い回す
+    shelf_thumbs: HashMap<PaneId, ShelfThumb>,
+    /// 出力があってサムネイルの組み直しが要るペイン（#1946）
+    shelf_thumbs_dirty: std::collections::HashSet<PaneId>,
+    /// サムネイルにだけ映っているペインの出力で、間引いた再描画を予約済みか（#1946）
+    shelf_thumb_redraw_pending: bool,
+    /// 直前の描画でたまり場を開いていたか（#1946。開いた瞬間に申し送りを落とし、
+    /// 閉じたらサムネイルを捨てる）
+    shelf_drawer_was_visible: bool,
+    /// サムネイルを組み直した回数 / 間引いた再描画の回数 / ドロワーを描いた回数
+    /// （#1946 の計測用。単調増加）
+    shelf_thumb_rebuilds: u64,
+    shelf_thumb_redraws: u64,
+    drawer_renders: u64,
     /// ペイン本体のビューが無くアプリ全体へ落ちた回数（#858。同上）
     pane_body_notify_fallbacks: u64,
     /// ヘッダの時計（1 秒に 1 回）でヘッダを汚した回数（#858。同上）
@@ -4420,6 +4453,13 @@ impl TakoApp {
             pane_header_renders: 0,
             chrome_renders: 0,
             term_app_notifies: 0,
+            shelf_thumbs: HashMap::new(),
+            shelf_thumbs_dirty: std::collections::HashSet::new(),
+            shelf_thumb_redraw_pending: false,
+            shelf_drawer_was_visible: false,
+            shelf_thumb_rebuilds: 0,
+            shelf_thumb_redraws: 0,
+            drawer_renders: 0,
             pane_body_notify_fallbacks: 0,
             header_clock_ticks: 0,
             video_players: HashMap::new(),
@@ -9197,8 +9237,20 @@ impl TakoApp {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        // #1946: サムネイルを組んであるペインは、出力があったら組み直しの印を付ける
+        // （見えていない間の出力も、次にドロワーを描くときに拾えるように）
+        if self.shelf_thumbs.contains_key(&pane_id) {
+            self.shelf_thumbs_dirty.insert(pane_id);
+        }
         if !ui_outside_pane && visibility == PaneVisibility::Hidden {
             self.term_redraw_skipped = self.term_redraw_skipped.saturating_add(1);
+            return;
+        }
+        // #1946: たまり場の縮小サムネイルにだけ映っているペインは、出力のたびに
+        // アプリ全体を 60fps で描き直さず、間引いた再描画（4 回/秒）へ回す
+        if !ui_outside_pane && visibility == PaneVisibility::Thumbnail {
+            self.shelf_thumbs_dirty.insert(pane_id);
+            self.schedule_shelf_thumb_redraw(cx);
             return;
         }
         // Issue #786: 変化がペイン本体の中だけなら、**そのペインのビューだけ**を汚す。
@@ -9253,6 +9305,29 @@ impl TakoApp {
         for pane in panes {
             self.notify_pane_body(pane, cx);
         }
+    }
+
+    /// たまり場サムネイルの間引いた再描画を予約する（#1946）。
+    ///
+    /// 何本の退避ペインが何回出力しても、アプリ全体の描き直しは
+    /// [`SHELF_THUMB_REDRAW_INTERVAL`] に 1 回まで。最後の出力の後にも必ず 1 回描く
+    /// （予約は出力が来た時点で立てるので、止まった直後の画面も取りこぼさない）
+    fn schedule_shelf_thumb_redraw(&mut self, cx: &mut Context<Self>) {
+        if self.shelf_thumb_redraw_pending {
+            return;
+        }
+        self.shelf_thumb_redraw_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(SHELF_THUMB_REDRAW_INTERVAL)
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.shelf_thumb_redraw_pending = false;
+                app.shelf_thumb_redraws = app.shelf_thumb_redraws.saturating_add(1);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// ペイン本体のビューだけを汚す（#786）。
@@ -9315,13 +9390,36 @@ impl TakoApp {
             // タブに居ない = たまり場（退避中）。ドロワーを開いているときだけ見えている。
             // たまり場にも居なければ過渡状態なので描画を止めない（保守的）
             None => {
-                if self.drawer_visible || self.workspace.shelved(pane_id).is_none() {
+                if crate::drawer::drawer_legacy1946() {
+                    // TAKO_1946_LEGACY_ARM 開始（#1946 前: ドロワーが開いていれば全部
+                    // `Elsewhere`。退避タブ配下はドロワーが閉じていても `Elsewhere`）
+                    if self.drawer_visible || self.workspace.shelved(pane_id).is_none() {
+                        return PaneVisibility::Elsewhere;
+                    }
+                    return PaneVisibility::Hidden;
+                    // TAKO_1946_LEGACY_ARM 終了
+                }
+                // #1946: 退避タブ（#1487）配下も「退避中」に数える。以前は平坦な退避だけを
+                // 見ていたので、タブごと退避したペインはドロワーを閉じていても出力のたびに
+                // アプリ全体を描き直していた（タブ形カードにサムネイルは無い）
+                if !self.workspace.is_shelved(pane_id) {
                     PaneVisibility::Elsewhere
+                } else if self.drawer_visible && self.shelf_has_thumbnail(pane_id) {
+                    PaneVisibility::Thumbnail
                 } else {
                     PaneVisibility::Hidden
                 }
             }
         }
+    }
+
+    /// たまり場にこのペインの縮小サムネイル（カード）が出ているか（#1946）。
+    /// 退避タブ（#1487）の配下・同じ由来の平坦な退避はタブ形カード 1 枚にまとまり、
+    /// サムネイルを持たない（[`tako_core::background_groups::groups`] の分け方と同じ）
+    fn shelf_has_thumbnail(&self, pane_id: PaneId) -> bool {
+        self.workspace
+            .shelved(pane_id)
+            .is_some_and(|p| !self.workspace.is_shelved_tab(p.origin_tab()))
     }
 
     fn focused_pane(&self) -> PaneId {
@@ -10314,8 +10412,21 @@ impl TakoApp {
     /// ここもそれを通す。UI 側に残すのは確認状態とドロワーの開閉だけ。
     /// 返り値は「実際に kill したか」（既に居ないペインは false）
     fn kill_shelved_pane(&mut self, pane_id: PaneId, origin: CloseOrigin) -> bool {
-        if self.workspace.remove_shelved(pane_id).is_none() {
+        if !self.workspace.is_shelved(pane_id) {
             return false;
+        }
+        // #1946: 器を外す前に見る（外した後では幽霊と区別できない）。
+        // 判定は dispatch の `BackgroundKill` と同じ 1 実装
+        let vessel = tako_control::dispatch::background_vessel(self, pane_id);
+        let plan = tako_core::background_groups::close_plan(vessel);
+        self.workspace.remove_shelved(pane_id);
+        self.shelf_thumbs.remove(&pane_id);
+        self.shelf_thumbs_dirty.remove(&pane_id);
+        if vessel.is_missing() && !self.secondary {
+            persist_diag(&format!(
+                "退避の幽霊を一覧から外した: pane={}（器なし。器の kill・レジストリの記録はしない）",
+                pane_id.as_u64()
+            ));
         }
         self.terminals.remove(&pane_id);
         self.previews.remove(&pane_id);
@@ -10329,11 +10440,16 @@ impl TakoApp {
         self.scroll_accum.remove(&pane_id);
         self.scroll_ctls.remove(&pane_id);
         self.drop_tmux_view_session(pane_id);
-        // たまり場カードの kill も GUI のボタン操作（#770 の監査記録）
-        self.drop_backend_session(pane_id, origin, None);
+        // たまり場カードの kill も GUI のボタン操作（#770 の監査記録）。
+        // #1946: 幽霊は器を持たない（= 登録が無い）ので、ここで kill する相手は居ない。
+        // 閉じ方の判断（`close_plan`）に従って、構造の上でも触らない
+        if plan.kill_vessel {
+            self.drop_backend_session(pane_id, origin, None);
+        }
         // #775: 明示 close なので worker レジストリへも記録する。
-        // A/B（`TAKO_775_LEGACY=1`）は記録しない旧挙動へ戻す
-        if std::env::var("TAKO_775_LEGACY").as_deref() != Ok("1") {
+        // A/B（`TAKO_775_LEGACY=1`）は記録しない旧挙動へ戻す。
+        // #1946: 幽霊は記録しない（本物が別の pane id で生きていることがある）
+        if plan.record_worker_close && std::env::var("TAKO_775_LEGACY").as_deref() != Ok("1") {
             self.mark_worker_closed(pane_id, CloseReason::Explicit(origin));
         }
         true
@@ -19362,6 +19478,83 @@ impl TakoApp {
             .unwrap_or_default()
     }
 
+    /// 端末グリッドのリンク装飾（⌘ホバー中のリンクの色。本体とサムネイルで共用）
+    fn link_decoration(&self) -> terminal_grid::LinkDecoration {
+        terminal_grid::LinkDecoration {
+            fg: hsla(self.theme.accent),
+            bg: hsla_alpha(self.theme.accent, 0.22),
+            underline: hsla(self.theme.accent),
+        }
+    }
+
+    /// 端末の今の画面を端末グリッドの行にする（#1946。たまり場のサムネイルとホバーの拡大用）。
+    /// 返すのは (行, 列数, 行数)。リンク装飾・カーソルは載せない（読むだけの縮小表示）
+    fn screen_rows_now(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<(Vec<terminal_grid::RowPlan>, usize, usize)> {
+        let screen = self
+            .terminals
+            .get(&pane_id)?
+            .screen_opts(&self.theme, false);
+        let fg = hsla(self.theme.foreground);
+        let link = self.link_decoration();
+        let rows = screen
+            .lines
+            .iter()
+            .map(|line| terminal_grid::plan_row(line, fg, None, link))
+            .collect();
+        Some((rows, screen.cols, screen.rows))
+    }
+
+    /// 画面 `cols` × `lines` をこのペインの字の大きさで描いたときの寸法（論理 px）
+    fn grid_natural_px(&self, pane_id: PaneId, cols: usize, lines: usize) -> Option<(f32, f32)> {
+        let cell = self.cell_size_for_pane(pane_id)?;
+        let w = cols.max(1) as f32 * f32::from(cell.width);
+        let h = lines.max(1) as f32 * f32::from(cell.height);
+        (w > 0.0 && h > 0.0).then_some((w, h))
+    }
+
+    /// 画面**全体**を `max_w` × `max_h` に収まる縮尺で描く（#1946。切り取らない。
+    /// 元より大きくはしない）。セル・字の大きさを同じ比で縮めた端末グリッドなので、
+    /// 本体と同じ描画経路（#787）がそのまま使える
+    fn scaled_grid(
+        &self,
+        pane_id: PaneId,
+        rows: impl Into<std::rc::Rc<Vec<terminal_grid::RowPlan>>>,
+        cols: usize,
+        lines: usize,
+        max_w: f32,
+        max_h: f32,
+    ) -> Option<gpui::Div> {
+        let cell = self.cell_size_for_pane(pane_id)?;
+        let (nat_w, nat_h) = self.grid_natural_px(pane_id, cols, lines)?;
+        let scale = (max_w / nat_w).min(max_h / nat_h).clamp(0.01, 1.0);
+        let has_custom_font = self.pane_font_sizes.contains_key(&pane_id);
+        let (font, font_size) = if has_custom_font {
+            (
+                self.pane_text_style(pane_id).font(),
+                self.pane_font_size(pane_id),
+            )
+        } else {
+            (self.text_style().font(), self.theme.font_size)
+        };
+        let grid = terminal_grid::TerminalGrid::new(
+            rows,
+            size(cell.width * scale, cell.height * scale),
+            px(font_size * scale),
+            font,
+            px(0.0),
+        );
+        Some(
+            div()
+                .flex_none()
+                .w(px(nat_w * scale))
+                .h(px(nat_h * scale))
+                .child(grid),
+        )
+    }
+
     /// ペイン本体の端末グリッドを描く element を組む（#787）。
     ///
     /// 行 div のスタック（[`Self::terminal_screen_lines`]）を置き換える本体側の経路。
@@ -19390,13 +19583,9 @@ impl TakoApp {
             .get(&pane_id)
             .map(|s| s.screen_opts(theme, show_cursor))?;
         let link_spans = self.hovered_link_spans(pane_id);
-        let link_style = terminal_grid::LinkDecoration {
-            fg: hsla(theme.accent),
-            bg: hsla_alpha(theme.accent, 0.22),
-            underline: hsla(theme.accent),
-        };
+        let link_style = self.link_decoration();
         let fg = hsla(theme.foreground);
-        let rows = self
+        let rows: Vec<terminal_grid::RowPlan> = self
             .display_lines(pane_id, screen)
             .iter()
             .enumerate()
@@ -24977,6 +25166,10 @@ impl RemoteHost for TakoApp {
 }
 
 impl WebViewHost for TakoApp {
+    fn pane_has_webview(&self, pane: PaneId) -> bool {
+        self.webviews.iter().any(|e| e.pane == Some(pane))
+    }
+
     fn web_open(&mut self, pane: PaneId, url: &str) -> Result<serde_json::Value, String> {
         let id = self.create_webview(&webview::normalize_url(url))?;
         if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
@@ -43559,6 +43752,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1946: たまり場の縮小サムネイル・親 master の見出し・幽霊の後始末・間引き
+                "background-drawer" => {
+                    background_drawer_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -43571,7 +43770,8 @@ mod self_test {
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
-                         hover-1893 / hover-loading / hover-loading-real / mod-limits / ino-highlight）"
+                         hover-1893 / hover-loading / hover-loading-real / mod-limits / ino-highlight / \
+                         background-drawer）"
                     );
                     std::process::exit(1);
                 }
@@ -56682,6 +56882,656 @@ mod self_test {
             app.preview_run_menu = None;
             cx.notify();
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1946: たまり場（退避ペインの一覧）の見え方と後始末を実フレーム・実マウスで確かめる。
+    ///
+    /// 場面: master 2 枚（alpha / beta）・作業タブ（claude 風 TUI / シェル / Markdown プレビュー /
+    /// beta の worker / 器の無い幽霊 / 親が閉じた worker）・負荷タブ（出力し続ける worker 10 本）・
+    /// タブ単位の退避 1 枚。見るのは
+    /// ① ドロワーを開いても退避ペインの寸法が変わらない（カード寸法へ resize しない）
+    /// ② カードは画面**全体**（全行）を縮小で描き、カードの枠に収まる
+    /// ③ 作業タブの中が親 master ごとの見出しで alpha → beta → 親が閉じた の順に並ぶ
+    /// ④ 退避 10 本以上が出力し続けても、アプリ全体の描き直しは 4 回/秒程度に間引かれる
+    /// ⑤ ホバーで画面全体が読める大きさ（固定寸法より大きく）で出る
+    /// ⑥ 幽霊を実マウスの × → はい で閉じても、他の器（tmux セッション）は 1 本も減らない
+    /// ⑦ 退避 0 本でも描ける。画像は `TAKO_VISUAL_DUMP_DIR` へ残す。
+    ///
+    /// **`TAKO_1946_LEGACY=1` では ① で落ちる**（#1946 前はカード寸法へ resize していた）
+    #[cfg(feature = "visual-test")]
+    async fn background_drawer_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::protocol::Request;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let dump = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        let save = |cx: &mut AsyncApp, name: &str| {
+            if let (Some(dir), Some((frame, _))) = (dump.as_ref(), capture_frame(any, cx)) {
+                let path = std::path::Path::new(dir).join(name);
+                if frame.save(&path).is_ok() {
+                    println!("TAKO_VISUAL_DUMP_FILE: {}", path.display());
+                }
+            }
+        };
+        let legacy = crate::drawer::drawer_legacy1946();
+        let base = ensure_fresh_scene(window, cx, "background-drawer").await;
+
+        // --- 道具: 偽の claude 風 TUI・出力し続ける worker・Markdown ---
+        let dir = std::env::temp_dir().join(format!("tako-1946-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let tui = dir.join("tui.sh");
+        let _ = std::fs::write(
+            &tui,
+            "for i in $(seq 1 16); do printf '\\033[1;35m*\\033[0m 会話の行 %02d: たまり場に画面全体が縮小で見えるか\\n' \"$i\"; done\n\
+             draw() { c=$(tput cols); r=$(tput lines); l=$(printf '%*s' $((c-2)) '' | tr ' ' '-');\n\
+             printf '\\033[%d;1H\\033[J' $((r-3)); printf '\\033[36m+%s+\\033[0m\\n' \"$l\";\n\
+             printf '\\033[36m|\\033[0m > 入力欄\\n'; printf '\\033[36m+%s+\\033[0m\\n' \"$l\";\n\
+             printf '\\033[2m  ? for shortcuts  ctx 42%%\\033[0m'; }\n\
+             trap draw WINCH\ndraw\nwhile :; do sleep 1; done\n",
+        );
+        let log = dir.join("log.sh");
+        let _ = std::fs::write(
+            &log,
+            "i=0; while :; do i=$((i+1)); printf 'build step %d: compiling crate_%02d ... ok\\n' \"$i\" $((i%40)); sleep 0.2; done\n",
+        );
+        let shell = dir.join("shell.sh");
+        let _ = std::fs::write(
+            &shell,
+            "for i in $(seq 1 30); do printf 'line %02d %s\\n' \"$i\" \"$(printf '%*s' $((i%40)) '' | tr ' ' '=')\"; done\nexec bash --norc -i\n",
+        );
+        let md = dir.join("notes-1946.md");
+        let _ = std::fs::write(
+            &md,
+            "# たまり場の見え方\n\n退避中のペインを**画面全体の縮小**で見せる。\n\n## やること\n\n- 縮小で全体を見せる\n- 由来タブ → 親 master でまとめる\n- [ ] 器の無い幽霊を安全に消す\n\n```rust\nfn main() {\n    println!(\"1946\");\n}\n```\n\n| 列 | 値 |\n|---|---|\n| a | 1 |\n",
+        );
+        let bash =
+            |path: &std::path::Path| Some(vec!["bash".to_string(), path.display().to_string()]);
+
+        // --- 場面 ---
+        let made = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let split_to = |app: &mut TakoApp,
+                                at: PaneId,
+                                direction: Option<tako_control::protocol::Direction>,
+                                ratio: Option<f32>,
+                                command: Option<Vec<String>>| {
+                    tako_control::dispatch(
+                        app,
+                        Request::Split {
+                            pane: Some(at.as_u64()),
+                            tab: None,
+                            direction,
+                            ratio,
+                            command,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::User,
+                    )
+                    .ok()
+                    .and_then(|v| v["pane"].as_u64())
+                    .map(PaneId::from_raw)
+                };
+                let split = |app: &mut TakoApp, at: PaneId, command: Option<Vec<String>>| {
+                    split_to(app, at, None, None, command)
+                };
+                use tako_control::protocol::Direction;
+                let new_tab = |app: &mut TakoApp, title: &str| {
+                    tako_control::dispatch(
+                        app,
+                        Request::TabNew {
+                            title: Some(title.to_string()),
+                            focus: Some(false),
+                            cwd: None,
+                        },
+                        PaneOrigin::User,
+                    )
+                    .ok()
+                    .and_then(|v| v["tab"].as_u64())
+                    .map(TabId::from_raw)
+                };
+                let set = |app: &mut TakoApp,
+                           pane: PaneId,
+                           role: &str,
+                           title: &str,
+                           by: Option<PaneId>| {
+                    if let Some(p) = app.workspace.pane_anywhere_mut(pane) {
+                        p.set_role(Some(role.to_string()));
+                        p.set_title(Some(title.to_string()));
+                        p.set_spawned_by(by);
+                    }
+                };
+                let _ = tako_control::dispatch(
+                    app,
+                    Request::TabRename {
+                        pane: Some(base.as_u64()),
+                        tab: None,
+                        title: "masters".into(),
+                        source: None,
+                    },
+                    PaneOrigin::User,
+                );
+                let alpha = base;
+                let beta = split(app, alpha, None)?;
+                set(
+                    app,
+                    alpha,
+                    "orchestrator-master:alpha",
+                    "alpha の master",
+                    None,
+                );
+                set(
+                    app,
+                    beta,
+                    "orchestrator-master:beta",
+                    "beta の master",
+                    None,
+                );
+
+                let work = new_tab(app, "work")?;
+                let keep = app.workspace.get_tab(work)?.tree().focused();
+                // 実際の作業タブに近い寸法にする（右 6 割に claude 風 TUI、その下にビルド、
+                // 左下にシェル 2 枚、ビルドの右に Markdown）
+                let w_tui = split_to(app, keep, Some(Direction::Right), Some(0.6), bash(&tui))?;
+                let w_log = split_to(app, w_tui, Some(Direction::Down), Some(0.3), bash(&log))?;
+                let w_shell = split_to(app, keep, Some(Direction::Down), None, bash(&shell))?;
+                let w_orphan = split_to(app, w_shell, Some(Direction::Right), None, bash(&shell))?;
+                let w_doc = tako_control::dispatch(
+                    app,
+                    Request::OpenFile {
+                        pane: Some(w_log.as_u64()),
+                        path: md.display().to_string(),
+                        mode: None,
+                        direction: Some(Direction::Right),
+                        focus: Some(false),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::User,
+                )
+                .ok()
+                .and_then(|v| v["pane"].as_u64())
+                .map(PaneId::from_raw)?;
+                set(
+                    app,
+                    w_tui,
+                    "orchestrator-worker:tako",
+                    "claude 風 TUI",
+                    Some(alpha),
+                );
+                set(
+                    app,
+                    w_shell,
+                    "orchestrator-worker:shell",
+                    "シェル",
+                    Some(alpha),
+                );
+                set(
+                    app,
+                    w_doc,
+                    "orchestrator-worker:doc",
+                    "notes-1946.md",
+                    Some(alpha),
+                );
+                set(
+                    app,
+                    w_log,
+                    "orchestrator-worker:build",
+                    "beta のビルド",
+                    Some(beta),
+                );
+                // 親が閉じた worker（spawned_by の先がもう居ない）
+                set(
+                    app,
+                    w_orphan,
+                    "orchestrator-worker:orphan",
+                    "親が閉じた",
+                    Some(PaneId::from_raw(9_999_946)),
+                );
+                // 器の無い幽霊: セッションを起こさずにツリーへ足す（#1576 の機序で残った形）
+                let ghost_pane = Pane::new(PaneOrigin::User);
+                let ghost = ghost_pane.id();
+                app.workspace
+                    .get_tab_mut(work)?
+                    .tree_mut()
+                    .split(keep, SplitDirection::Down, ghost_pane)
+                    .ok()?;
+                set(app, ghost, "orchestrator-worker:ghost", "幽霊", Some(beta));
+
+                // 出力し続ける worker 10 本（④ の負荷。CPU は焼かない: 0.2 秒ごとに 1 行）
+                let load = new_tab(app, "load")?;
+                let load_root = app.workspace.get_tab(load)?.tree().focused();
+                let mut loaders = Vec::new();
+                for i in 0..10 {
+                    let p = split(app, load_root, bash(&log))?;
+                    set(
+                        app,
+                        p,
+                        "orchestrator-worker:load",
+                        &format!("負荷 {i}"),
+                        Some(beta),
+                    );
+                    loaders.push(p);
+                }
+                // タブ単位の退避（#1487）
+                let shelf = new_tab(app, "shelf")?;
+                let shelf_root = app.workspace.get_tab(shelf)?.tree().focused();
+                split(app, shelf_root, None)?;
+
+                let _ = app.attach_pending_sessions(cx);
+                cx.notify();
+                Some((
+                    alpha, beta, work, w_tui, w_shell, w_log, w_doc, w_orphan, ghost, loaders,
+                    shelf,
+                ))
+            })
+            .ok()
+            .flatten();
+        let Some((
+            alpha,
+            beta,
+            work,
+            w_tui,
+            w_shell,
+            w_log,
+            w_doc,
+            w_orphan,
+            ghost,
+            loaders,
+            shelf,
+        )) = made
+        else {
+            fail("background-drawer: 場面を組めない (#1946)");
+        };
+        // 中身が描かれるのを状態で待つ（TUI の下端の帯・シェルの 30 行）
+        for pane in [w_tui, w_shell, w_log, w_orphan] {
+            wait_for_pane_ready(window, cx, pane, Duration::from_secs(15)).await;
+        }
+        wait(cx, 1200).await;
+
+        // --- 退避（ペイン単位 + タブ単位）---
+        let sizes_before = window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                for pane in [w_tui, w_shell, w_log, w_doc, w_orphan, ghost]
+                    .into_iter()
+                    .chain(loaders.iter().copied())
+                    .chain([alpha])
+                {
+                    let _ = app.workspace.shelve_pane(pane);
+                }
+                app.background_tab(shelf, cx);
+                cx.notify();
+                [w_tui, w_shell, w_log, w_orphan]
+                    .iter()
+                    .map(|p| app.terminals.get(p).map(|s| s.size()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let tmux_sessions = || -> Vec<String> {
+            let socket = tako_core::tmux_backend::socket_name();
+            let mut tmux = std::process::Command::new("tmux");
+            tmux.args(["-L", &socket, "list-sessions", "-F", "#{session_name}"]);
+            let out = tako_core::platform::process::no_console_window(&mut tmux).output();
+            let mut names: Vec<String> = out
+                .ok()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        let cpu_seconds = || -> Option<f64> {
+            let mut ps = std::process::Command::new("ps");
+            ps.args(["-o", "time=", "-p", &std::process::id().to_string()]);
+            let out = tako_core::platform::process::no_console_window(&mut ps)
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let (m, s) = text.rsplit_once(':')?;
+            let minutes: f64 = m.rsplit(':').next()?.trim().parse().ok()?;
+            Some(minutes * 60.0 + s.trim().parse::<f64>().ok()?)
+        };
+
+        // --- ドロワーを開く ---
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = true;
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+            })
+            .ok();
+        for _ in 0..4 {
+            notify_and_draw(any, window, cx);
+            wait(cx, 300).await;
+        }
+        save(cx, "background-drawer.png");
+        let sizes_after = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                [w_tui, w_shell, w_log, w_orphan]
+                    .iter()
+                    .map(|p| app.terminals.get(p).map(|s| s.size()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // ④ の実測（両方の腕で出す。判定は新しい腕だけ）
+        let counters = |cx: &mut AsyncApp| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    (
+                        app.term_app_notifies,
+                        app.shelf_thumb_redraws,
+                        app.drawer_renders,
+                        app.shelf_thumb_rebuilds,
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let (n0, r0, d0, b0) = counters(cx);
+        let cpu0 = cpu_seconds();
+        let started = std::time::Instant::now();
+        wait(cx, 5000).await;
+        let secs = started.elapsed().as_secs_f64();
+        let (n1, r1, d1, b1) = counters(cx);
+        let cpu1 = cpu_seconds();
+        let shelved_total = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                app.workspace.all_background_panes().len()
+            })
+            .unwrap_or(0);
+        let per_sec = |a: u64, b: u64| (b.saturating_sub(a)) as f64 / secs;
+        let cpu = match (cpu0, cpu1) {
+            (Some(a), Some(b)) => format!("{:.1}%", (b - a) / secs * 100.0),
+            _ => "n/a".to_string(),
+        };
+        println!(
+            "TAKO_VISUAL_PERF: background-drawer legacy={legacy} shelved={shelved_total} secs={secs:.1} \
+             app_notify/s={:.1} thumb_redraw/s={:.1} drawer_render/s={:.1} thumb_rebuild/s={:.1} cpu={cpu}",
+            per_sec(n0, n1),
+            per_sec(r0, r1),
+            per_sec(d0, d1),
+            per_sec(b0, b1),
+        );
+        println!(
+            "TAKO_VISUAL_PIXEL: background-drawer sizes before={sizes_before:?} after={sizes_after:?}"
+        );
+
+        // ① 開いても寸法が変わらない（#1946 前はカード寸法へ resize していた）
+        check(
+            !sizes_before.is_empty()
+                && sizes_before.iter().all(Option::is_some)
+                && sizes_before == sizes_after,
+            "① ドロワーを開いても退避ペインの寸法が変わらない（カード寸法へ resize しない） (#1946)",
+        );
+
+        // ② カードは全行を縮小で描き、枠に収まる
+        let whole = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                let body_h = app.shelf_body_height();
+                [w_tui, w_shell]
+                    .iter()
+                    .map(|p| {
+                        let size = app.terminals.get(p).map(|s| s.size());
+                        let thumb = app.shelf_thumbs.get(p).map(|t| (t.cols, t.lines));
+                        let card = app
+                            .panel_click_probe_bounds
+                            .borrow()
+                            .get(&format!("drawer-shelf-card-{}", p.as_u64()))
+                            .copied();
+                        let fits = match (thumb, card) {
+                            (Some((cols, lines)), Some(card)) => {
+                                app.grid_natural_px(*p, cols, lines).is_some_and(|(w, h)| {
+                                    let s =
+                                        (f32::from(card.size.width) / w).min(body_h / h).min(1.0);
+                                    w * s <= f32::from(card.size.width) + 0.5
+                                        && h * s <= body_h + 0.5
+                                })
+                            }
+                            _ => false,
+                        };
+                        (size, thumb, fits)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        println!("TAKO_VISUAL_PIXEL: background-drawer whole={whole:?}");
+        check(
+            whole.len() == 2
+                && whole
+                    .iter()
+                    .all(|(size, thumb, fits)| size.is_some() && *size == *thumb && *fits),
+            "② カードは画面の全行を縮小で描き、カードの枠に収まる (#1946)",
+        );
+
+        // ③ 作業タブの中が親 master ごとの見出しで並ぶ（左から alpha → beta → 親が閉じた）
+        let headers = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                let probes = app.panel_click_probe_bounds.borrow();
+                (0..4)
+                    .map(|i| {
+                        probes
+                            .get(&format!("drawer-master-group-{}-{i}", work.as_u64()))
+                            .map(|b| f32::from(b.origin.x))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let groups = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                tako_core::background_groups::groups(&app.workspace)
+                    .into_iter()
+                    .find(|g| g.origin_tab == work)
+                    .map(|g| {
+                        g.masters
+                            .iter()
+                            .map(|m| (m.master, m.panes.clone()))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        println!("TAKO_VISUAL_PIXEL: background-drawer headers={headers:?} groups={groups:?}");
+        use tako_core::background_groups::MasterKey;
+        check(
+            groups.len() == 3
+                && groups[0] == (MasterKey::Pane(alpha), vec![w_tui, w_shell, w_doc])
+                && groups[1] == (MasterKey::Pane(beta), vec![w_log, ghost])
+                && groups[2] == (MasterKey::Gone(PaneId::from_raw(9_999_946)), vec![w_orphan]),
+            "③ 作業タブの退避が親 master（alpha / beta / 親が閉じた）ごとにまとまる (#1946)",
+        );
+        check(
+            matches!(headers.as_slice(), [Some(a), Some(b), Some(c), None] if a < b && b < c),
+            "③ 見出しが左から alpha → beta → 親が閉じた の順に描かれる (#1946)",
+        );
+
+        // ④ 出力し続ける退避 10 本以上でも、アプリ全体の描き直しは間引かれる
+        check(
+            shelved_total >= 10 && per_sec(n0, n1) <= 2.0 && per_sec(r0, r1) <= 5.0,
+            "④ 退避 10 本以上が出力し続けても、出力起因の全体再描画は 4 回/秒程度 (#1946)",
+        );
+
+        // ⑤ ホバーで画面全体が読める大きさで出る
+        let card = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                app.panel_click_probe_bounds
+                    .borrow()
+                    .get(&format!("drawer-shelf-card-{}", w_tui.as_u64()))
+                    .copied()
+            })
+            .ok()
+            .flatten();
+        let hovered = match card {
+            Some(rect) => {
+                let _ = any.update(cx, |_, win, cx| {
+                    win.dispatch_event(
+                        gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                            position: rect.center(),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    )
+                });
+                notify_and_draw(any, window, cx);
+                wait(cx, 200).await;
+                notify_and_draw(any, window, cx);
+                save(cx, "background-drawer-hover.png");
+                window
+                    .update(cx, |app: &mut TakoApp, win, _| {
+                        let target = app.hover_preview.map(|h| h.target);
+                        let size = target.map(|t| app.hover_preview_size(t, win.viewport_size()));
+                        (target, size)
+                    })
+                    .ok()
+            }
+            None => None,
+        };
+        println!("TAKO_VISUAL_PIXEL: background-drawer hover={hovered:?}");
+        check(
+            matches!(hovered, Some((Some(PreviewTarget::Pane(p)), Some((w, h))))
+                if p == w_tui && w > PREVIEW_POPUP_W && h > PREVIEW_POPUP_H),
+            "⑤ カードのホバーで画面全体が固定寸法より大きく出る (#1946)",
+        );
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.hover_preview = None;
+                cx.notify();
+            })
+            .ok();
+
+        // ⑥ 幽霊を実マウスで閉じても、他の器は 1 本も減らない
+        let vessels_before = tmux_sessions();
+        let probe = |cx: &mut AsyncApp, key: String| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.panel_click_probe_bounds.borrow().get(&key).copied()
+                })
+                .ok()
+                .flatten()
+        };
+        let ghost_vessel = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                tako_control::dispatch::background_vessel(app, ghost)
+            })
+            .ok();
+        check(
+            ghost_vessel == Some(tako_core::background_groups::Vessel::Missing),
+            "⑥ 器の無い退避エントリが幽霊（vessel=none）と判定される (#1946)",
+        );
+        notify_and_draw(any, window, cx);
+        // 幽霊のカードが窓の右へはみ出していたら、たまり場を実ホイールで横へ送る
+        let viewport_w = any
+            .update(cx, |_, win, _| f32::from(win.viewport_size().width))
+            .unwrap_or(0.0);
+        for _ in 0..12 {
+            let Some(rect) = probe(cx, format!("drawer-shelf-kill-{}", ghost.as_u64())) else {
+                break;
+            };
+            if f32::from(rect.right()) < viewport_w - 24.0 {
+                break;
+            }
+            let at = point(px(viewport_w * 0.5), rect.center().y);
+            let _ = any.update(cx, |_, win, cx| {
+                win.dispatch_event(
+                    gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: at,
+                        delta: ScrollDelta::Pixels(point(px(-320.0), px(0.0))),
+                        ..ScrollWheelEvent::default()
+                    }),
+                    cx,
+                )
+            });
+            notify_and_draw(any, window, cx);
+            wait(cx, 60).await;
+            notify_and_draw(any, window, cx);
+        }
+        save(cx, "background-drawer-ghost.png");
+        match probe(cx, format!("drawer-shelf-kill-{}", ghost.as_u64())) {
+            Some(rect) if f32::from(rect.right()) < viewport_w => click_at(any, cx, rect.center()),
+            Some(rect) => fail(&format!(
+                "⑥ 幽霊のカードの × が窓の外のまま（x={:.0} / 窓 {viewport_w:.0}） (#1946)",
+                f32::from(rect.origin.x)
+            )),
+            None => fail("⑥ 幽霊のカードに × が描かれない (#1946)"),
+        }
+        notify_and_draw(any, window, cx);
+        wait(cx, 150).await;
+        notify_and_draw(any, window, cx);
+        save(cx, "background-drawer-ghost-confirm.png");
+        match probe(cx, format!("drawer-shelf-kill-yes-{}", ghost.as_u64())) {
+            Some(rect) => click_at(any, cx, rect.center()),
+            None => fail("⑥ 幽霊の × で確認（はい）が出ない (#1946)"),
+        }
+        wait(cx, 300).await;
+        let vessels_after = tmux_sessions();
+        let (ghost_gone, alive) = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                (
+                    !app.workspace.is_shelved(ghost),
+                    [w_tui, w_shell, w_log, w_orphan]
+                        .iter()
+                        .all(|p| app.workspace.is_shelved(*p) && app.terminals.contains_key(p)),
+                )
+            })
+            .unwrap_or((false, false));
+        println!(
+            "TAKO_VISUAL_PIXEL: background-drawer tmux before={} after={} {vessels_before:?} -> {vessels_after:?}",
+            vessels_before.len(),
+            vessels_after.len()
+        );
+        check(ghost_gone, "⑥ 幽霊が × → はい で一覧から外れる (#1946)");
+        check(
+            alive && vessels_before == vessels_after,
+            "⑥ 幽霊を閉じても他の退避ペインと器（tmux セッション）は 1 本も減らない (#1946)",
+        );
+
+        // ⑦ 退避 0 本でも描ける
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                let panes: Vec<PaneId> = app
+                    .workspace
+                    .shelved_panes()
+                    .iter()
+                    .map(|p| p.id())
+                    .collect();
+                for pane in panes {
+                    app.kill_shelved_pane(pane, tako_core::pane_log::CloseOrigin::PaneButton);
+                }
+                let _ = app.workspace.unshelve_tab(shelf);
+                app.drawer_visible = true;
+                cx.notify();
+            })
+            .ok();
+        notify_and_draw(any, window, cx);
+        save(cx, "background-drawer-empty.png");
+        let empty = window
+            .update(cx, |app: &mut TakoApp, _, _| {
+                tako_core::background_groups::groups(&app.workspace).is_empty()
+                    && app.shelf_thumbs.is_empty()
+            })
+            .unwrap_or(false);
+        check(
+            empty,
+            "⑦ 退避 0 本でもドロワーを描け、サムネイルも残らない (#1946)",
+        );
+        window
+            .update(cx, |app: &mut TakoApp, _, cx| {
+                app.drawer_visible = false;
+                cx.notify();
+            })
+            .ok();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

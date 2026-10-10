@@ -2192,7 +2192,7 @@
     "name": "tako_foreground_pane"
   },
   {
-    "description": "バックグラウンドのペイン一覧を取得する。各ペインのID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）とsurface（常に background = 裏で実行中）を返す。バックグラウンドペインはこの由来タブでグループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。tabs には**タブ単位で退避されたタブ**（tab / title / origin_window / panes / tree）が並ぶ。退避タブ配下のペインは backgrounded にも shelved_tab 付きで出るので、1 本だけ取り出すことも tako_foreground_pane の tab でまとめて戻すこともできる。",
+    "description": "バックグラウンドのペイン一覧を取得する。各ペインのID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）とsurface（常に background = 裏で実行中）を返す。バックグラウンドペインはこの由来タブでグループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。tabs には**タブ単位で退避されたタブ**（tab / title / origin_window / panes / tree）が並ぶ。退避タブ配下のペインは backgrounded にも shelved_tab 付きで出るので、1 本だけ取り出すことも tako_foreground_pane の tab でまとめて戻すこともできる。各ペインの vessel は器（tmux / direct / preview / web / none = 器の無い幽霊）、parent_master は親 master。groups は画面と同じ「由来タブ → 親 master」のまとまり。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},
@@ -2201,7 +2201,7 @@
     "name": "tako_background_list"
   },
   {
-    "description": "バックグラウンドのペインを kill する。プロセスとバックエンドセッションも終了する。復帰不要なペインの片付けに使う。",
+    "description": "バックグラウンドのペインを kill する。プロセスとバックエンドセッションも終了する。復帰不要なペインの片付けに使う。幽霊（vessel=none）は一覧から外すだけで、他の器には触らない。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
