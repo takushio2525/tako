@@ -8513,7 +8513,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
             action: Some(args.action().to_string()),
             commands: args.commands.clone(),
             label: args.label.clone(),
-            pane: args.pane,
+            // #1958: --pane 省略時は呼び出し元（MCP の tako_show_command と同じ規則）。
+            // --card 指定時は dispatch がカードの所在ペインを引くので埋めない
+            pane: match args.action() {
+                "show" => target_pane(args.pane)?,
+                _ if args.card.is_none() => args.pane.or_else(caller_pane),
+                _ => args.pane,
+            },
             card: args.card,
             index: args.index,
             focus: Some(args.focus).filter(|f| *f),
@@ -9325,7 +9331,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 role: None,
                 project: None,
                 limit: None,
-                pane: *pane,
+                // #1958: 明示指定 → 呼び出し元ペイン（TAKO_PANE_ID）→ None（resume と同じ。
+                // None は dispatch がアクティブタブのフォーカスペインへ倒す = tako 外の CLI 用）
+                pane: if id.is_some() {
+                    *pane
+                } else {
+                    pane.or_else(caller_pane)
+                },
                 tab: None,
                 direction: None,
             },
@@ -12474,6 +12486,100 @@ mod tests {
         );
         // on / off 以外は clap が弾く（誤った語で黙って状態取得にならない）
         assert!(Cli::try_parse_from(["tako", "limit-resume", "yes"]).is_err());
+    }
+
+    /// #1958: 呼び出し元（`TAKO_PANE_ID`）の**有無の両方の腕**を子プロセスで回す。
+    ///
+    /// env は起動時にしか変えられず、期待値を `caller_pane()` で書いたテストは CI（env 無し）だと
+    /// 「埋めない」逆戻りを見分けられない（期待値も逆戻りも `None`）。子では `TAKO_PANE_ID=4242`
+    /// と「無し」で同じテストを `--exact` で 1 本だけ走らせ、1 件通ったことまで確かめる
+    fn issue1958_both_caller_arms(test: &str) {
+        if std::env::var_os("TAKO_1958_CHILD").is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        for caller in [Some("4242"), None] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+                .env("TAKO_1958_CHILD", "1");
+            match caller {
+                Some(pane) => cmd.env("TAKO_PANE_ID", pane),
+                None => cmd.env_remove("TAKO_PANE_ID"),
+            };
+            let out = cmd.output().expect("自分自身を起動できる");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                out.status.success() && text.contains("1 passed"),
+                "TAKO_PANE_ID={caller:?} の腕が落ちた:\n{text}"
+            );
+        }
+    }
+
+    /// #1958: `tako show-command` の `--pane` 省略は呼び出し元（TAKO_PANE_ID）。修正前は
+    /// `args.pane` をそのまま送り、最簡形 `tako show-command "…"` が「対象ペインが未指定」で
+    /// 断られていた。`--card` 指定は dispatch がカードの所在ペインを引くので埋めない。
+    /// 期待値は `caller_pane()` で書き、env の有無の両方を [`issue1958_both_caller_arms`] で回す
+    #[test]
+    fn issue1958_show_commandのpane省略は呼び出し元() {
+        issue1958_both_caller_arms("tests::issue1958_show_commandのpane省略は呼び出し元");
+        let pane_of = |args: &[&str]| match build_request(&parse(args)) {
+            Ok(Request::ShowCommand { pane, .. }) => Ok(pane),
+            Ok(other) => panic!("ShowCommand になるはず: {other:?}"),
+            Err(e) => Err(e),
+        };
+        match caller_pane() {
+            Some(caller) => assert_eq!(
+                pane_of(&["tako", "show-command", "echo a"]),
+                Ok(Some(caller))
+            ),
+            // tako の外（CI）: 送らずに何を渡せばよいかを言う
+            None => {
+                let err = pane_of(&["tako", "show-command", "echo a"]).unwrap_err();
+                assert!(err.contains("対象ペインを特定できない"), "{err}");
+            }
+        }
+        assert_eq!(
+            pane_of(&["tako", "show-command", "--pane", "3", "echo a"]),
+            Ok(Some(3))
+        );
+        for flag in ["--list", "--copy", "--run", "--dismiss"] {
+            assert_eq!(
+                pane_of(&["tako", "show-command", flag]),
+                Ok(caller_pane()),
+                "{flag}"
+            );
+            // --card 指定は今のまま（呼び出し元を混ぜない）
+            assert_eq!(
+                pane_of(&["tako", "show-command", flag, "--card", "5"]),
+                Ok(None),
+                "{flag}"
+            );
+            assert_eq!(
+                pane_of(&["tako", "show-command", flag, "--card", "5", "--pane", "3"]),
+                Ok(Some(3)),
+                "{flag}"
+            );
+        }
+    }
+
+    /// #1958: `tako sessions link` の `--pane` 省略は呼び出し元（ヘルプの説明どおり。resume と同じ）
+    #[test]
+    fn issue1958_sessions_linkのpane省略は呼び出し元() {
+        issue1958_both_caller_arms("tests::issue1958_sessions_linkのpane省略は呼び出し元");
+        let pane_of = |args: &[&str]| match build_request(&parse(args)).unwrap() {
+            Request::Sessions { pane, .. } => pane,
+            other => panic!("Sessions になるはず: {other:?}"),
+        };
+        assert_eq!(pane_of(&["tako", "sessions", "link"]), caller_pane());
+        assert_eq!(
+            pane_of(&["tako", "sessions", "link", "--pane", "3"]),
+            Some(3)
+        );
+        assert_eq!(pane_of(&["tako", "sessions", "link", "--id", "abc"]), None);
     }
 
     /// #600: 入力予測は素の `tako autosuggest` で状態確認、on / off で切替

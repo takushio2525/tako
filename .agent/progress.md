@@ -20,11 +20,6 @@
 
 ---
 
-## 2026-10-09（#1940: spawn の起動コマンドが 2〜3 行のペインで化ける・届く前に delivered と言う・起動失敗が黙る を直した）
-- 真因（実測）: worker ペインが 2〜3 行だと zsh は入力行を `<…` / `>....` に畳み全文一致が成立しない → `shell_send` が書き直し 10 回（45〜47 秒）の末に**消していない行へ**本文 + Enter を書き足し `autoexport` + 正しい引数で 2 回目の起動。会話の検出（起動直後）を到達とみなして delivered → 諦めた後に undelivered。claude は 2 行で空白・器の tmux も同寸法（capture でも読めない）
-- 修正: 寸法で全文を出せないなら書き直さず Enter 1 回 + OSC 133;C で実行確認・書き切り前に必ず Ctrl+C・新しいペインは最初のプロンプトの印を待つ・起動フック中の先行入力を区別 / delivered は送達フローの確認だけ / 起動直後の終了を `agent_exited` で即決着し `workers` の `launch=failed` / 8 行未満で入力欄が無ければ peer だけ（`pane_too_short`）。A/B `TAKO_1940_LEGACY=1`・カタログ +280 B
-- 実測: `scripts/test-spawn-launch-1940.sh`（隔離 GUI・86×2 行・direnv 3 秒）旧 = `autoexport` + 2 回起動 / 新 = 1 回・正しい引数、失敗は 7 秒で agent_exited（12 PASS）。e2e 8 条件・番犬 4 本（注入 10 通りを file:line で名指し）
-
 ## 2026-10-09（#1926: #173 の disable_app_nap は /proc 前提で一度も効いていなかった = 消して、利用者が待つ読み込みだけ App Nap を止める）
 - 交互 2 周の実測で (2) を選択: 寿命の間止めるとアイドル 341〜365 → 856〜1,154 µW・裏の出力処理 2〜5 倍の電力、得をするのは待たれる重い処理だけ。エージェント稼働中は #173 のアサーションで App Nap の対象外（優先度 28）。`UserWork::begin_load` を PDF のラスタライズ（開く / ズーム）・Markdown の組み立て / 描き直しへ（A/B `TAKO_1926_LEGACY=1`）
 - 実測: PDF 117 ページ 7.2〜8.0 → 3.0 秒・ズーム 49.9 → 20.8 秒。`scripts/test-preview-load-app-nap-1926.sh` 7 PASS（旧の腕で ①② が名指しで FAILED）・番犬 `issue1926_app_nap_watchdog` 4 本（注入 12 通りを file:line で名指し）
@@ -60,3 +55,7 @@
 ## 2026-10-10（#1979: 本番 GUI が `ps` の poll で 10 分固まった件 = UI スレッドから届く子プロセスの待ちに上限・`tako list` の採り直しを background へ・フォーカスの無いペインの再描画に上限）
 - 真因（stripped の sample を同じ日の main のシンボル付き release と命令列で突き合わせ）: IPC → `prepare_offload` → `collect_worker_status_ctx` → `has_running_children` → `process_parent_map` → `ps` の `output()` → `poll(-1)`（= #1976 が外した経路）。型を塞いだ: 親子表は libproc（`PROC_PIDT_SHORTBSDINFO` + `KERN_PROCARGS2`）・tmux / `claude agents` は `probe::command_output_with_timeout`・打ち切り後は同期に wait しない・`OffloadJob::List`。再描画は `tako redraw-limit` / MCP `tako_scrollback` の `unfocused_fps`（既定 30・フォーカス中 60）。A/B `TAKO_1979_LEGACY=1`・番犬 `issue1979_*`・カタログ +330 B
 - 実測: `scripts/test-ui-thread-wait-1979.sh` 修正後 15 PASS / 修正前は①②で UI が固まる（別の要求が 8 秒で返らない・メインスレッドに本番と同じ関数の並び）・GUI 無しの注入（修正後 0.03 / 2.4 秒・修正前 10 秒で返らず）・再描画の要求 55〜72 → 29.5 回/秒。CPU は蓋閉じでフレームが組まれず（`body_renders` 0）差が出ない = 蓋を開けた機では未測
+
+## 2026-10-10（#1958: pane を省いた `tako_show_command` / `sessions link` を呼び出し元ペインで埋める）
+- 真因: MCP の変換（`mcp/request.rs`）と CLI が pane 省略時に呼び出し元（`TAKO_PANE_ID` / `X-Tako-Pane`）で埋めず、show は「対象ペインが未指定」・link はフォーカスペインの会話を返していた。show は `target_pane`、card 指定は埋めない。番犬 `issue1958_caller_pane_watchdog` がカタログで約束する 59 本 × 全 action を公開の入口で検査（`tako_open_remote` は判断待ちの KNOWN_GAPS）
+- 実測: `scripts/test-show-command-caller-1958.sh`（隔離 GUI・呼び出し元とフォーカスを分ける・HTTP / stdio / CLI + visual `show-command-caller` の実ピクセル）新 22 PASS / 旧 9 PASS 13 FAIL・注入 7 通りで単体と番犬が名指し

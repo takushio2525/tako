@@ -1358,7 +1358,8 @@ mod tests {
                 action: None,
                 commands: vec!["brew install tmux".into(), "tako setup".into()],
                 label: Some("依存を入れる".into()),
-                pane: None,
+                // #1958: pane 省略 = 呼び出し元
+                pane: Some(7),
                 card: None,
                 index: None,
                 focus: None,
@@ -1383,6 +1384,91 @@ mod tests {
         assert!(requests.is_empty(), "不正な引数で dispatch しない");
         let text = response.unwrap().to_string();
         assert!(text.contains("commands"), "{text}");
+    }
+
+    /// #1958: `tako_show_command` の pane 省略は呼び出し元（stdio: TAKO_PANE_ID / HTTP:
+    /// X-Tako-Pane）。修正前は埋めておらず、pane を省いた show が「対象ペインが未指定」で断られた。
+    /// card 指定の list / copy / run / dismiss は dispatch がカードの所在ペインを引くので埋めない
+    #[test]
+    fn issue1958_show_commandのpane省略は呼び出し元() {
+        let pane_of = |args: Value, caller: Option<u64>| -> Option<u64> {
+            let (response, requests) = run(call("tako_show_command", args), caller, true);
+            match requests.as_slice() {
+                [Request::ShowCommand { pane, .. }] => *pane,
+                other => panic!("ShowCommand が 1 件届くはず: {other:?} / {response:?}"),
+            }
+        };
+        // show（action 省略 / 明示）は呼び出し元へ出す
+        assert_eq!(pane_of(json!({ "commands": ["echo a"] }), Some(7)), Some(7));
+        assert_eq!(
+            pane_of(json!({ "action": "show", "commands": ["echo a"] }), Some(7)),
+            Some(7)
+        );
+        // pane 明示は呼び出し元より優先（既存の挙動のまま）
+        assert_eq!(
+            pane_of(json!({ "commands": ["echo a"], "pane": 3 }), Some(7)),
+            Some(3)
+        );
+        // card 省略の list / copy / run / dismiss も呼び出し元のカードを対象にする
+        for action in ["list", "copy", "run", "dismiss"] {
+            assert_eq!(
+                pane_of(json!({ "action": action }), Some(7)),
+                Some(7),
+                "{action}"
+            );
+        }
+        // card 指定は今のまま（呼び出し元を混ぜない = 別ペインのカードを取り違えない）
+        for action in ["list", "copy", "run", "dismiss"] {
+            assert_eq!(
+                pane_of(json!({ "action": action, "card": 5 }), Some(7)),
+                None,
+                "{action}"
+            );
+            assert_eq!(
+                pane_of(json!({ "action": action, "card": 5, "pane": 3 }), Some(7)),
+                Some(3),
+                "{action}"
+            );
+        }
+        // 呼び出し元が無い経路（tako の外の MCP クライアント）の show は dispatch へ送らず、
+        // 何を渡せばよいかを言う（split と同じ文面）
+        let (response, requests) = run(
+            call("tako_show_command", json!({ "commands": ["echo a"] })),
+            None,
+            true,
+        );
+        assert!(requests.is_empty(), "呼び出し元も pane も無い show は送らない");
+        let text = response.unwrap().to_string();
+        assert!(text.contains("対象ペインを特定できない"), "{text}");
+        assert!(text.contains("X-Tako-Pane"), "{text}");
+        // card 指定の copy は呼び出し元が無くても通る（ペイン指定なしの CLI と同じ）
+        assert_eq!(pane_of(json!({ "action": "copy", "card": 5 }), None), None);
+    }
+
+    /// #1958: `tako_sessions` の link も id・pane 省略時は呼び出し元の会話（カタログの説明どおり）。
+    /// 埋めないと dispatch がアクティブタブのフォーカスペインへ倒れ、裏のペインの AI が
+    /// 他人の会話のリンクを受け取る
+    #[test]
+    fn issue1958_sessions_linkのpane省略は呼び出し元() {
+        let pane_of = |args: Value| -> Option<u64> {
+            let (_, requests) = run(call("tako_sessions", args), Some(7), true);
+            match requests.as_slice() {
+                [Request::Sessions { pane, .. }] => *pane,
+                other => panic!("Sessions が 1 件届くはず: {other:?}"),
+            }
+        };
+        assert_eq!(pane_of(json!({ "action": "link" })), Some(7));
+        assert_eq!(pane_of(json!({ "action": "link", "pane": 3 })), Some(3));
+        // id で引くときはペインを使わない（今のまま）
+        assert_eq!(pane_of(json!({ "action": "link", "id": "abc" })), None);
+        // resume は今のまま（tab 指定時は埋めない）
+        assert_eq!(pane_of(json!({ "action": "resume", "id": "abc" })), Some(7));
+        assert_eq!(
+            pane_of(json!({ "action": "resume", "id": "abc", "tab": 2 })),
+            None
+        );
+        // list / show はペインを取らない
+        assert_eq!(pane_of(json!({ "action": "list" })), None);
     }
 
     #[test]
