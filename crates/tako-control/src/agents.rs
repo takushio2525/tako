@@ -230,7 +230,7 @@ fn parse_process_table(text: &str) -> (HashMap<u32, u32>, HashMap<u32, String>) 
 /// `tmux list-panes -a` と `ps -axo pid=,ppid=` はどちらもサブプロセスを起動するため、
 /// 2 秒 tick の各機能が別々に採取してはならない。#772 の stale binary 検知と #779 の
 /// sleep guard は、同じ tick ではこの 1 個を共有する。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcessSnapshot {
     /// `session:window.pane` → ペインのシェル PID
     panes: Vec<(String, u32)>,

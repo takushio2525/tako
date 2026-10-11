@@ -174,26 +174,46 @@ fn 描く相手は全ビューポート() {
 /// 同じ後処理を通り、A/B の口を通して 1 フレーム描く。
 ///
 /// #1979 で読み取りの続き（`tako list` の応答）は描かないようにした。描くかどうかは
-/// `OffloadContinuation::changes_layout` の 1 実装で決め、A/B の口と両方を通ること
+/// `OffloadContinuation::changes_layout` の 1 実装で決め、A/B の口と両方を通ること。
+///
+/// #1984 で IPC の受け口の続きは「もう一巡」（先取りの答えが足りなければ background へ戻す）を
+/// 持つ `drive_offload` → `land_offload_on_ui` を通るようになった。GUI の定義ジャンプ等は
+/// 引き続き `finish_offload_on_ui` を通るので、**両方の着地**が同じ後処理・A/B・判定を通ること
 #[test]
 fn 続きの着地も同じ後処理で描く() {
     let src = read(APP);
-    let (body, line) = region(&src, APP, "    fn finish_offload_on_ui(", "\n    }\n");
+    for (head, landing) in [
+        (
+            "    fn finish_offload_on_ui(",
+            "tako_control::finish_offload(self, next, origin)",
+        ),
+        (
+            "    fn land_offload_on_ui(",
+            "tako_control::land_offload(self, next, origin)",
+        ),
+    ] {
+        let (body, line) = region(&src, APP, head, "\n    }\n");
+        let body = code_only(body);
+        assert!(
+            body.contains(landing)
+                && body.contains("next.changes_layout() && !Self::ipc_redraw_legacy()")
+                && body.contains("self.after_dispatch(&mut result, needs_frame, cx)"),
+            "{APP}:{line} 続きの着地（{head:?}）が後処理（after_dispatch）と強制描画の A/B・\
+             レイアウトを変える続きの判定（changes_layout）を通っていない"
+        );
+    }
+    // IPC の受け口の続き（OffloadOutcome::OnUi）は `drive_offload` で UI スレッドへ着地させて描く
+    let (body, line) = region(&src, APP, "async fn drive_offload(", "\n}\n");
     let body = code_only(body);
     assert!(
-        body.contains("tako_control::finish_offload(self, next, origin)")
-            && body.contains("next.changes_layout() && !Self::ipc_redraw_legacy()")
-            && body.contains("self.after_dispatch(&mut result, needs_frame, cx)"),
-        "{APP}:{line} 続きの着地が後処理（after_dispatch）と強制描画の A/B・\
-         レイアウトを変える続きの判定（changes_layout）を通っていない"
+        body.contains("app.land_offload_on_ui(next, origin, cx)")
+            && body.contains("window.draw(cx).clear()"),
+        "{APP}:{line} IPC の続き（OffloadOutcome::OnUi）を UI スレッドで着地させて描いていない"
     );
-    let (ipc, line) = ipc_loop();
-    let _ = ipc;
     let whole = code_only(&src);
     assert!(
-        whole.contains("app.finish_offload_on_ui(next, origin, cx)")
-            && whole.contains("window.draw(cx).clear()"),
-        "{APP}:{line} IPC の続き（OffloadOutcome::OnUi）を UI スレッドで着地させて描いていない"
+        whole.contains("tako_control::OffloadOutcome::OnUi(next),"),
+        "{APP}: IPC の受け口が続き（OffloadOutcome::OnUi）を `drive_offload` へ渡していない"
     );
 }
 

@@ -2080,6 +2080,13 @@ struct TakoApp {
     dragging_panel: bool,
     /// tmux 一覧の最新スナップショット（dispatch の TmuxList 結果。表示は描画側の責務）
     tmux_sessions: Vec<serde_json::Value>,
+    /// 右パネルの tmux 一覧の取り直しを頼まれた（#1984。dispatch の内側 = Context が無い所から
+    /// 頼まれたぶんを `after_dispatch` が background へ出す）
+    tmux_refresh_pending: bool,
+    /// tmux 一覧の取り直しの世代（#1984。古い取り直しが後から着いても新しい結果を上書きしない）
+    tmux_refresh_gen: u64,
+    /// 反映済みの取り直しの世代
+    tmux_refresh_applied: u64,
     /// kill の確認待ち（セッション名, window index, tmux サーバー名）。誤爆防止（FR-2.13.3）。
     /// サーバー名は tako バックエンド（Phase 5.5）のセッションを kill するときに使う
     tmux_pending_kill: Option<(String, Option<u32>, Option<String>)>,
@@ -3186,6 +3193,58 @@ impl PaneDelivery {
 #[inline]
 fn release_wakeup_gate(gate: &std::sync::atomic::AtomicBool) {
     gate.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// background の結果を UI スレッドで着地させ、先取りの答えが足りなければもう一巡
+/// background へ出す（#1984）。IPC の受け口と GUI のボタン（[`TakoApp::dispatch_off_ui`]）が通る。
+///
+/// UI スレッドが持つのは着地（[`TakoApp::land_offload_on_ui`]）の間だけで、問い合わせの
+/// 待ちは常に background に居る
+async fn drive_offload(
+    this: gpui::WeakEntity<TakoApp>,
+    mut outcome: tako_control::OffloadOutcome,
+    origin: PaneOrigin,
+    cx: &mut gpui::AsyncApp,
+) -> Result<serde_json::Value, tako_control::DispatchError> {
+    loop {
+        let next = match outcome {
+            tako_control::OffloadOutcome::Reply(result) => return result,
+            tako_control::OffloadOutcome::OnUi(next) => next,
+        };
+        let landed = this.update(cx, |app: &mut TakoApp, cx| {
+            app.land_offload_on_ui(next, origin, cx)
+        });
+        match landed {
+            Err(_) => {
+                return Err(tako_control::DispatchError::Operation(
+                    "アプリが終了した".into(),
+                ))
+            }
+            Ok(OffloadLanded::Done(result, redraw)) => {
+                for any in redraw {
+                    let _ = any.update(cx, |_, window, cx| window.draw(cx).clear());
+                }
+                return result;
+            }
+            Ok(OffloadLanded::Again(job)) => {
+                outcome = cx
+                    .background_executor()
+                    .spawn(async move { job.run_staged() })
+                    .await;
+            }
+        }
+    }
+}
+
+/// [`TakoApp::land_offload_on_ui`] の結末（#1984）
+enum OffloadLanded {
+    /// 応答と、強制描画する窓
+    Done(
+        Result<serde_json::Value, tako_control::DispatchError>,
+        Vec<AnyWindowHandle>,
+    ),
+    /// 先取りの答えがまだ足りない（もう一巡 background で走らせる）
+    Again(Box<tako_control::OffloadJob>),
 }
 
 /// 端末イベントを 4ms 窓でまとめて 1 回にする（Issue #782。zed の
@@ -4352,6 +4411,9 @@ impl TakoApp {
             panel_width: PANEL_DEFAULT_WIDTH,
             dragging_panel: false,
             tmux_sessions: Vec::new(),
+            tmux_refresh_pending: false,
+            tmux_refresh_gen: 0,
+            tmux_refresh_applied: 0,
             tmux_pending_kill: None,
             pending_pane_kill: None,
             collapsed_tmux_tabs,
@@ -5306,22 +5368,14 @@ impl TakoApp {
                                 let Some((next, reply)) = staged.await else {
                                     return;
                                 };
-                                let outcome = weak.update(cx, |app: &mut TakoApp, cx| {
-                                    app.finish_offload_on_ui(next, origin, cx)
-                                });
-                                let result = match outcome {
-                                    Ok((result, redraw)) => {
-                                        for any in redraw {
-                                            let _ = any.update(cx, |_, window, cx| {
-                                                window.draw(cx).clear()
-                                            });
-                                        }
-                                        result
-                                    }
-                                    Err(_) => Err(tako_control::DispatchError::Operation(
-                                        "アプリが終了した".into(),
-                                    )),
-                                };
+                                // #1984: 先取りの答えが足りなければもう一巡 background へ出す
+                                let result = drive_offload(
+                                    weak,
+                                    tako_control::OffloadOutcome::OnUi(next),
+                                    origin,
+                                    cx,
+                                )
+                                .await;
                                 let _ = reply.send(result);
                             })
                             .detach();
@@ -6199,7 +6253,7 @@ impl TakoApp {
                 let tmux_result = if let Some(ctx) = tmux_ctx {
                     let task = cx
                         .background_executor()
-                        .spawn(async move { tako_control::fetch_tmux_sessions(&ctx) });
+                        .spawn(async move { tako_control::fetch_tmux_sessions(&ctx, None) });
                     Some(task.await)
                 } else {
                     None
@@ -6812,6 +6866,10 @@ impl TakoApp {
                 }
             }
         }
+        // #1984: dispatch の内側（パネルの切替）で頼まれた tmux 一覧の取り直し
+        if self.tmux_refresh_pending {
+            self.spawn_tmux_refresh(cx);
+        }
         // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
         for (pane, data) in std::mem::take(&mut self.pending_writes) {
             if let Some(session) = self.terminals.get(&pane) {
@@ -6884,6 +6942,65 @@ impl TakoApp {
         let mut result = tako_control::finish_offload(self, next, origin);
         let redraw = self.after_dispatch(&mut result, needs_frame, cx);
         (result, redraw)
+    }
+
+    /// [`Self::finish_offload_on_ui`] に「先取りの答えが足りなければもう一巡」を足した口（#1984）。
+    /// 着地は dispatch の [`tako_control::land_offload`] の 1 実装で、後処理は受信ループと同じ
+    fn land_offload_on_ui(
+        &mut self,
+        next: tako_control::OffloadContinuation,
+        origin: PaneOrigin,
+        cx: &mut Context<Self>,
+    ) -> OffloadLanded {
+        let _span = tako_control::diag::perf_span("ipc_turn");
+        let needs_frame = next.changes_layout() && !Self::ipc_redraw_legacy();
+        match tako_control::land_offload(self, next, origin) {
+            tako_control::OffloadLanding::Again(job) => OffloadLanded::Again(job),
+            tako_control::OffloadLanding::Done(mut result) => {
+                let redraw = self.after_dispatch(&mut result, needs_frame, cx);
+                OffloadLanded::Done(result, redraw)
+            }
+        }
+    }
+
+    /// GUI のボタンから dispatch する（#1984）。子プロセスを待つ要求（セッション再起動の計画）は
+    /// IPC の受け口と同じ `prepare_offload` → background → 着地を通し、UI スレッドで待たない。
+    /// background へ出さない要求（と A/B の `TAKO_1984_LEGACY=1`）は従来どおり同期で dispatch する。
+    /// `done` は結果が出たところ（UI スレッド）で 1 回だけ呼ばれる
+    fn dispatch_off_ui(
+        &mut self,
+        request: tako_control::protocol::Request,
+        origin: PaneOrigin,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(
+                &mut TakoApp,
+                Result<serde_json::Value, tako_control::DispatchError>,
+                &mut Context<TakoApp>,
+            ) + 'static,
+    ) {
+        let prepared = if tako_core::probe::issue1984_legacy() {
+            None
+        } else {
+            tako_control::prepare_offload(self, &request)
+        };
+        match prepared {
+            None => {
+                let result = tako_control::dispatch(self, request, origin);
+                done(self, result, cx);
+            }
+            Some(Err(e)) => done(self, Err(e), cx),
+            Some(Ok(job)) => {
+                let staged = cx
+                    .background_executor()
+                    .spawn(async move { job.run_staged() });
+                cx.spawn(async move |this, cx| {
+                    let outcome = staged.await;
+                    let result = drive_offload(this.clone(), outcome, origin, cx).await;
+                    let _ = this.update(cx, |app: &mut TakoApp, cx| done(app, result, cx));
+                })
+                .detach();
+            }
+        }
     }
 
     /// ⌃- / ⌃⇧-（Windows は Ctrl+Alt+← / →）の戻る / 進む（FR-3.29 / #1677）。
@@ -7359,15 +7476,57 @@ impl TakoApp {
         }
     }
 
-    /// tmux 一覧を更新する。UI も CLI / MCP と同じコマンド層（dispatch）を通す
+    /// tmux 一覧を更新する。UI も CLI / MCP と同じ組み立て（`fetch_tmux_sessions`）を通す。
+    /// tmux の問い合わせ（ソケットごとに数本）は background で待つ（#1984）
     fn refresh_tmux(&mut self, cx: &mut Context<Self>) {
-        self.refresh_tmux_data();
+        if tako_core::probe::issue1984_legacy() {
+            self.refresh_tmux_data_blocking();
+        } else {
+            self.spawn_tmux_refresh(cx);
+        }
         cx.notify();
     }
 
-    /// tmux 一覧の取得だけ（再描画通知なし。dispatch 内から呼べる形。
-    /// CLI / MCP 経由の同期更新と、パネルタブ切替時の即時更新に使う）
+    /// tmux 一覧の取り直しを頼む（再描画通知なし。dispatch 内 = Context が無い所から呼べる形。
+    /// パネルタブ切替時の即時更新に使う）。取り直しそのものは `after_dispatch` が background へ
+    /// 出す（#1984。UI スレッドで tmux を待たない）
     fn refresh_tmux_data(&mut self) {
+        if tako_core::probe::issue1984_legacy() {
+            self.refresh_tmux_data_blocking();
+        } else {
+            self.tmux_refresh_pending = true;
+        }
+    }
+
+    /// tmux 一覧を background で取り直し、着いたら UI スレッドで反映する（#1984）。
+    /// 対応表の収集（メモリ）だけ UI スレッドで行う。window キャプチャ（サブプロセス実行）は
+    /// 従来どおり次の 2 秒 tick が background で埋める
+    fn spawn_tmux_refresh(&mut self, cx: &mut Context<Self>) {
+        self.tmux_refresh_pending = false;
+        self.tmux_refresh_gen += 1;
+        let generation = self.tmux_refresh_gen;
+        let ctx = self.collect_tmux_context();
+        let fetch = cx
+            .background_executor()
+            .spawn(async move { tako_control::fetch_tmux_sessions(&ctx, None) });
+        cx.spawn(async move |this, cx| {
+            let sessions = fetch.await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                // 後から頼んだ取り直しが先に着いていたら、古い結果で上書きしない
+                if generation < app.tmux_refresh_applied {
+                    return;
+                }
+                app.tmux_refresh_applied = generation;
+                app.tmux_sessions = sessions;
+                let _ = app.sync_backend_windows();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A/B（`TAKO_1984_LEGACY=1`）の修正前の形: UI スレッドの同期の dispatch で tmux を待つ
+    fn refresh_tmux_data_blocking(&mut self) {
         let value = tako_control::dispatch(
             self,
             tako_control::protocol::Request::TmuxList { socket: None },
@@ -10191,23 +10350,26 @@ impl TakoApp {
     /// 会話を引き継いだ再起動のボタンハンドラ（#1067）。
     ///
     /// CLI / MCP と同じ dispatch を通す（3 経路で同じ判断・同じ手順）。
-    /// 断られたときは**理由をペインのバナーへ出す**（黙って何も起きない状態を作らない）
+    /// 断られたときは**理由をペインのバナーへ出す**（黙って何も起きない状態を作らない）。
+    /// 計画の走査（`claude agents --json` + 器の pid 祖先辿り）は UI スレッドで待たない（#1984）
     fn session_restart_button(&mut self, pane_id: PaneId, mode: &str, cx: &mut Context<Self>) {
-        let result = tako_control::dispatch(
-            self,
+        self.dispatch_off_ui(
             tako_control::protocol::Request::SessionRestart {
                 pane: Some(pane_id.as_u64()),
                 mode: Some(mode.to_string()),
             },
             tako_core::PaneOrigin::User,
+            cx,
+            move |app, result, cx| {
+                match result {
+                    // 押した手応えを必ず出す（数秒とはいえ黙って何も起きない状態を作らない）。
+                    // 建て直しが済んだら `drive_agent_relaunches` がこのバナーを片付ける
+                    Ok(_) => app.set_agent_restart_notice(pane_id, None),
+                    Err(e) => app.set_agent_restart_notice(pane_id, Some(format!("{e}"))),
+                }
+                cx.notify();
+            },
         );
-        match result {
-            // 押した手応えを必ず出す（数秒とはいえ黙って何も起きない状態を作らない）。
-            // 建て直しが済んだら `drive_agent_relaunches` がこのバナーを片付ける
-            Ok(_) => self.set_agent_restart_notice(pane_id, None),
-            Err(e) => self.set_agent_restart_notice(pane_id, Some(format!("{e}"))),
-        }
-        cx.notify();
     }
 
     /// stale claude バイナリの張り直しボタンハンドラ（Issue #498）
@@ -10217,26 +10379,29 @@ impl TakoApp {
             banner.error = None;
         }
         cx.notify();
-        let result = tako_control::dispatch(
-            self,
+        // 張り直しの中身はセッション再起動の計画（#1067）なので、走査は UI スレッドで待たない（#1984）
+        self.dispatch_off_ui(
             tako_control::protocol::Request::StaleBinary {
                 action: Some("restart".into()),
                 pane: Some(pane_id.as_u64()),
             },
             tako_core::PaneOrigin::User,
-        );
-        match result {
-            Ok(_) => {
-                self.stale_binary_banners.remove(&pane_id);
-            }
-            Err(e) => {
-                if let Some(banner) = self.stale_binary_banners.get_mut(&pane_id) {
-                    banner.restarting = false;
-                    banner.error = Some(format!("{e}"));
+            cx,
+            move |app, result, cx| {
+                match result {
+                    Ok(_) => {
+                        app.stale_binary_banners.remove(&pane_id);
+                    }
+                    Err(e) => {
+                        if let Some(banner) = app.stale_binary_banners.get_mut(&pane_id) {
+                            banner.restarting = false;
+                            banner.error = Some(format!("{e}"));
+                        }
+                    }
                 }
-            }
-        }
-        cx.notify();
+                cx.notify();
+            },
+        );
     }
 
     /// タブの × ボタン close の確認ダイアログ付きハンドラ（Issue #172）。
@@ -63287,8 +63452,9 @@ mod self_test {
                     text_wait_budget(20, 500, 25),
                     |cx| {
                         window
-                            .update(cx, |app, _, _| {
-                                app.refresh_tmux_data();
+                            .update(cx, |app, _, cx| {
+                                // 取り直しは background（#1984）。着いた結果は次の周期で読む
+                                app.refresh_tmux(cx);
                                 let groups = app.tmux_view_groups();
                                 // attach 先ペイン（backend_pane）が居るタブ枠に紐付く
                                 let in_group = groups.iter().any(|g| {

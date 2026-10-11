@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-10（#1979: 本番 GUI が `ps` の poll で 10 分固まった件 = UI スレッドから届く子プロセスの待ちに上限・`tako list` の採り直しを background へ・フォーカスの無いペインの再描画に上限）
-- 真因（stripped の sample を同じ日の main のシンボル付き release と命令列で突き合わせ）: IPC → `prepare_offload` → `collect_worker_status_ctx` → `has_running_children` → `process_parent_map` → `ps` の `output()` → `poll(-1)`（= #1976 が外した経路）。型を塞いだ: 親子表は libproc（`PROC_PIDT_SHORTBSDINFO` + `KERN_PROCARGS2`）・tmux / `claude agents` は `probe::command_output_with_timeout`・打ち切り後は同期に wait しない・`OffloadJob::List`。再描画は `tako redraw-limit` / MCP `tako_scrollback` の `unfocused_fps`（既定 30・フォーカス中 60）。A/B `TAKO_1979_LEGACY=1`・番犬 `issue1979_*`・カタログ +330 B
-- 実測: `scripts/test-ui-thread-wait-1979.sh` 修正後 15 PASS / 修正前は①②で UI が固まる（別の要求が 8 秒で返らない・メインスレッドに本番と同じ関数の並び）・GUI 無しの注入（修正後 0.03 / 2.4 秒・修正前 10 秒で返らず）・再描画の要求 55〜72 → 29.5 回/秒。CPU は蓋閉じでフレームが組まれず（`body_renders` 0）差が出ない = 蓋を開けた機では未測
-
 ## 2026-10-09（#1944: 未導入の言語サーバを開いた時点で data dir へ取って起こし、エディタに状態を出した）
 - 検出表の各行に `fetch`（pyright 1.1.414・ts-ls 5.1.3 + typescript 5.9.3 = npm の tarball、rust-analyzer 2026-09-21 = GitHub の単体、Node.js 24.21.0 は足りる node が PATH に無いときだけ。clangd は取らない）を配布元の公開ハッシュで検証して `<data_dir>/lsp-servers` へ。解決は env → PATH（`probe_args` で動くか確かめる）→ 置き場 → 取得。状態「取得中」・タイトルの 1 行と失敗の帯（入れる / もう一度取得）・`tako lsp install`（GUI 無しでも）・シェル統合の合図で引き直し（#1823 の 2）。A/B `TAKO_1944_LEGACY=1`・カタログ +235 B
 - 実測: まっさら（一時 HOME・最小 PATH）で .py を開くだけで Node.js 52.9 MB + pyright 4.2 MB を取り 11.6 秒で読み込み済み・診断 2 件・補完 34 件・常駐 155 MB（ts-ls 4.9 MB / 4.2 秒・RA 13.9 MB / 21 秒）。e2e 10 本・番犬（注入 10 通り）・`scripts/test-lsp-fetch-1944.sh` 25 PASS
@@ -63,3 +59,7 @@
 ## 2026-10-10（#1958: pane を省いた `tako_show_command` / `sessions link` を呼び出し元ペインで埋める）
 - 真因: MCP の変換（`mcp/request.rs`）と CLI が pane 省略時に呼び出し元（`TAKO_PANE_ID` / `X-Tako-Pane`）で埋めず、show は「対象ペインが未指定」・link はフォーカスペインの会話を返していた。show は `target_pane`、card 指定は埋めない。番犬 `issue1958_caller_pane_watchdog` がカタログで約束する 58 本 × 全 action を公開の入口で検査。`tako_open_remote` は説明を挙動（アクティブタブ）へ寄せ、「混ぜない」側として縛る
 - 実測: `scripts/test-show-command-caller-1958.sh`（隔離 GUI・呼び出し元とフォーカスを分ける・HTTP / stdio / CLI + visual `show-command-caller` の実ピクセル）新 22 PASS / 旧 9 PASS 13 FAIL・注入 7 通りで単体と番犬が名指し
+
+## 2026-10-11（#1984: UI スレッドの同期の dispatch の子プロセス待ちの残りを background へ = RemoteAgents・TmuxList・呼び出し元の pid 祖先辿り・spawn / handoff の CLI の所在確認・再起動の計画・check_qos の ps）
+- `RemoteAgents` / `TmuxList` は background のジョブ、残りは**先取り**（`OffloadJob::Probe` → `with_ui_probes` の内側で同じ dispatch。handoff は答えが足りなければもう一巡 = `land_offload`）。読む側は `caller_pane_by_pid` / `agent_preflight` / `tako_binary` / `restart_scan` だけ。右パネルの取り直し・再起動のボタンも background。A/B `TAKO_1984_LEGACY=1`・番犬 `issue1984_*`（注入 10 通り）・カタログ増分 0
+- 実測: `scripts/test-ui-thread-offload-1984.sh`（偽の SHELL / tmux が武装中は戻らない）修正後 17 PASS（別の要求 0.03〜0.05 秒）/ 修正前 6 FAIL（4.03 秒〜打ち切り・メインスレッドに `caller_pane_by_pid`・`preflight` → `locate` 等）。再描画上限の CPU は蓋閉じで `body_renders` 0 = 未実測のまま

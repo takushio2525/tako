@@ -379,6 +379,21 @@ pub fn issue1979_legacy() -> bool {
     })
 }
 
+/// #1984 の A/B（`TAKO_1984_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// スマホの一覧（`RemoteAgents`）・呼び出し元の pid 祖先辿り（`resolve_caller_pane`）・
+/// spawn / handoff の CLI の所在確認・セッション再起動の計画・tmux 一覧（`TmuxList`）を
+/// UI スレッドの同期の dispatch で待つ。**ゲートはこの 1 か所**で、tako-control / tako-app も
+/// ここを読む
+pub fn issue1984_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1984_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。

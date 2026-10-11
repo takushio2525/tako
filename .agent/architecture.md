@@ -1262,10 +1262,40 @@ lid-guard.json が使う）:
   GUI 無しの `crates/tako-control/tests/issue1979_unbounded_wait_injection.rs`（孫がパイプを握る
   偽の `ps` / tmux を本番ハングと同じ関数へ当て、修正前の腕は返らない・後は返る）、UI スレッドの
   経路そのものは隔離 GUI の `scripts/test-ui-thread-wait-1979.sh`。
-  **まだ同期のまま残る子プロセスの待ち**（上限つきにはなった）: `tako list` 以外の UI スレッドの
-  dispatch（`RemoteAgents` / `resolve_caller_pane` / spawn / セッション再起動の計画）と、
-  右パネルの切替時の `TmuxList`（`refresh_tmux_data`）。漏れた書き手では読み切りの猶予（2 秒）、
-  返らない子では上限（5 秒 / 15 秒）だけ止まりうる
+  このとき同期のまま残った子プロセスの待ち（`RemoteAgents` / `resolve_caller_pane` / spawn /
+  セッション再起動の計画 / `TmuxList`）は #1984 で background へ出した（次の項）
+- **UI スレッドの同期の dispatch の子プロセス待ちの残りは「先取り」で background へ**（#1984）:
+  #1979 で上限つきにはなったが、同期の dispatch のまま上限（器 5 秒・CLI 15 秒）まで止まりえた経路と、
+  上限の無い待ち（spawn / handoff の CLI の所在確認 = `agent_cli::preflight` → `exe::find` の
+  ログインシェル `command -v`。tako の実行ファイルの解決 `resolve_tako_binary` も安定版が無ければ同じ）を
+  外した。①スマホの一覧（`RemoteAgents`）は workspace に触らないので `OffloadJob::RemoteAgents` で
+  background から応答 ②tmux 一覧（`TmuxList`）は対応表（`collect_tmux_context` = メモリ）だけ UI
+  スレッドで写して `OffloadJob::TmuxList`（組み立ては `fetch_tmux_sessions(ctx, socket)` の 1 実装を
+  2 秒 tick と共有）。右パネルの切替時の取り直し（`refresh_tmux_data`）は dispatch の内側なので
+  依頼の印（`tmux_refresh_pending`）だけ立て、`after_dispatch` が `spawn_tmux_refresh` で background へ
+  出す（世代番号で古い結果の上書きを防ぐ）③呼び出し元の pid 祖先辿り（self / adopt / guide / handoff /
+  spawn）・CLI の所在確認・tako の実行ファイル・セッション再起動の計画の走査（`SessionRestart` /
+  `StaleBinary restart`）は**先取り**: `prepare_offload` が `probe_needs`（UI スレッド・メモリだけ）で
+  要る答え（`ProbeNeeds`）を決め、`OffloadJob::Probe` の background が `ProbeNeeds::fill` で埋め、
+  着地（`OffloadContinuation::Probed`）は `with_ui_probes` の内側で**同じ dispatch** を走らせる。
+  dispatch の中の子プロセスの口は読む側の関数（`caller_pane_by_pid` / `agent_preflight` / `tako_binary` /
+  `restart_scan`）だけが呼び、内側では先取りの答えだけを読む（答えが無ければ待たない側へ倒れる =
+  pid では解けない扱い・CLI の所在確認は断る・PATH の問い合わせを飛ばす・走査は空）。外側（テスト・直呼び）は
+  従来どおりその場で問い合わせる。handoff は「呼び出し元が決まる → 後任の agent が決まる」の 2 段なので、
+  着地（`land_offload`）が答えの不足を見たらもう一巡 background へ出す（`OffloadLanding::Again`。
+  最大 3 巡。受け口と GUI のボタンは `drive_offload` の 1 実装でこれを回す）。GUI の再起動のボタン 2 つ
+  （会話を引き継いだ再起動・stale の張り直し）も `dispatch_off_ui` で同じ経路を通る。
+  `sleep_guard::check_qos` の `ps` は `probe::output_with_timeout`（5 秒）へ（呼び出し元は自分のテストだけで
+  UI スレッドからは届かないが、上限なしの型を残さない）。番犬
+  `crates/tako-control/tests/issue1984_ui_thread_offload_watchdog.rs`（注入 10 通りを file:line で名指し）、
+  A/B は同一バイナリの `TAKO_1984_LEGACY=1`（全部を UI スレッドの同期の dispatch へ戻す）。
+  実経路は隔離 GUI の `scripts/test-ui-thread-offload-1984.sh`（武装中は戻らない偽の `SHELL` / tmux の
+  最中に別の要求 `tako theme` を測る。2026-10-11 の実測: 修正後は①〜⑥すべて 0.03〜0.05 秒・
+  メインスレッドに子プロセス待ちなし / 修正前は 4.03 秒〜8 秒で打ち切り・メインスレッドに
+  `resolve_caller_pane` → `caller_pane_by_pid`、`dispatch_orchestrator_spawn` → `preflight` → `locate` 等）。
+  **まだ UI スレッドの同期の dispatch に残る子プロセスの待ち**（Issue の範囲外）: `StaleBinary status` の
+  `find_claude_pid_for_backend`、`GitResolveAgent` の CLI の所在確認と tako の実行ファイルの解決、
+  `TmuxKill` / `TmuxResize` ほかの書き込み系の tmux（どれも上限つき）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

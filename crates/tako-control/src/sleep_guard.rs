@@ -1719,19 +1719,31 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
     }
 }
 
-/// プロセスの QoS を確認する（macOS のみ、診断用）
+/// [`check_qos`] の `ps` 1 回の上限（#1984）。自プロセス 1 行を引くだけなので桁で足りる
+#[cfg(target_os = "macos")]
+const QOS_PS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// プロセスの QoS を確認する（macOS のみ、診断用）。
+///
+/// `ps` は**上限つきで**待つ（#1984。`Command::output()` は子が終わらない・パイプの書き手が
+/// 長生きのプロセスへ漏れると永久に返らない = #1979 の本番ハングと同じ型）
 pub fn check_qos() -> Value {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("ps")
-            .args(["-p", &std::process::id().to_string(), "-o", "pri,nice"])
-            .output();
-        match output {
-            Ok(o) => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
+        let pid = std::process::id().to_string();
+        match tako_core::probe::output_with_timeout(
+            "ps",
+            &["-p", &pid, "-o", "pri,nice"],
+            QOS_PS_TIMEOUT,
+        ) {
+            tako_core::probe::Outcome::Done { stdout, .. } => {
+                let stdout = String::from_utf8_lossy(&stdout);
                 json!({ "qos_info": stdout.trim() })
             }
-            Err(e) => json!({ "error": format!("{e}") }),
+            tako_core::probe::Outcome::TimedOut { label, waited, .. } => {
+                json!({ "error": format!("{label} が {} 秒で返らなかった", waited.as_secs()) })
+            }
+            tako_core::probe::Outcome::Failed { reason, .. } => json!({ "error": reason }),
         }
     }
     #[cfg(not(target_os = "macos"))]
