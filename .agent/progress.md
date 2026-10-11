@@ -59,3 +59,7 @@
 ## 2026-10-10（#1946: たまり場を画面全体の縮小・由来タブ → 親 master の見出しで描き、器の無い幽霊を見分けて安全に外せるようにした）
 - 真因: ドロワーが開くたびに退避ペインをカード寸法（35×8）へ resize → claude は下端だけ描き直し入力欄と帯しか残らない。正本 `tako_core::background_groups`（器の判定・親 master・まとまり・閉じ方）を GUI と `tako backgrounded` / MCP `tako_background_list` の `groups` / `vessel` / `parent_master` が引く。`spawned_by` を layout.json へ（serde default）。A/B `TAKO_1946_LEGACY=1`
 - 実測: `scripts/test-background-drawer-1946.sh` 3 PASS（隔離 GUI・器あり・退避 19 本）: 寸法不変（旧 104×25 → 35×8）・出力起因の全体再描画 43.3 → 0.0 回/秒（間引き 3.2 回/秒）・CPU 101.8 → 14.9%・幽霊を実マウスで閉じても tmux 20 → 20 本。番犬 6 本（注入 6 通りを file:line で名指し）
+
+## 2026-10-10（#1958: pane を省いた `tako_show_command` / `sessions link` を呼び出し元ペインで埋める）
+- 真因: MCP の変換（`mcp/request.rs`）と CLI が pane 省略時に呼び出し元（`TAKO_PANE_ID` / `X-Tako-Pane`）で埋めず、show は「対象ペインが未指定」・link はフォーカスペインの会話を返していた。show は `target_pane`、card 指定は埋めない。番犬 `issue1958_caller_pane_watchdog` がカタログで約束する 58 本 × 全 action を公開の入口で検査。`tako_open_remote` は説明を挙動（アクティブタブ）へ寄せ、「混ぜない」側として縛る
+- 実測: `scripts/test-show-command-caller-1958.sh`（隔離 GUI・呼び出し元とフォーカスを分ける・HTTP / stdio / CLI + visual `show-command-caller` の実ピクセル）新 22 PASS / 旧 9 PASS 13 FAIL・注入 7 通りで単体と番犬が名指し
