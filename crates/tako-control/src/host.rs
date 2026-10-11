@@ -245,11 +245,20 @@ pub trait TmuxHost {
     /// tmux **サーバー（ソケット）単位**の回収（#1192）。既定は dry-run。
     /// 実装側が自分の backend ソケットと生きている別 tako-app を除外して判定する
     fn cleanup_tmux_servers(&self, apply: bool) -> tako_core::tmux_cleanup::ServerCleanupOutcome {
-        tako_core::tmux_cleanup::cleanup_servers(
-            &tako_core::tmux_backend::socket_name(),
-            &tako_core::tmux_cleanup::live_peers(),
-            apply,
-        )
+        cleanup_tmux_servers_default(apply)
+    }
+    /// tmux の回収（`TmuxCleanup`）の本体を background で走らせるための切り出し（#1989）。
+    ///
+    /// UI スレッドで要るもの（守るセッション = workspace の器・取り込みビュー）だけをここで集め、
+    /// 器への問い合わせと kill は [`TmuxCleanupJob::run`] が background で行う。
+    /// `None` = 切り出さない（既定 = テスト用のホスト）→ 同期の腕で `cleanup_*` を呼ぶ
+    fn tmux_cleanup_job(
+        &self,
+        _socket: Option<&str>,
+        _servers: bool,
+        _apply: bool,
+    ) -> Option<TmuxCleanupJob> {
+        None
     }
     /// サイドバー tmux ビューでタブ枠が折りたたまれているか（FR-2.16.14）
     fn tmux_tab_collapsed(&self, _tab: TabId) -> bool {
@@ -1458,4 +1467,47 @@ impl<
             + SystemHost,
     > ControlHost for T
 {
+}
+
+/// サーバー（ソケット）単位の回収の既定の本体（#1192）。自分の backend ソケットと
+/// 生きている別 tako-app を除外して判定する。器への問い合わせと kill を含むので
+/// **UI スレッドで待たない**（#1989。IPC 経由は [`TmuxCleanupJob::Servers`] で background へ）
+pub fn cleanup_tmux_servers_default(apply: bool) -> tako_core::tmux_cleanup::ServerCleanupOutcome {
+    tako_core::tmux_cleanup::cleanup_servers(
+        &tako_core::tmux_backend::socket_name(),
+        &tako_core::tmux_cleanup::live_peers(),
+        apply,
+    )
+}
+
+/// 1 つのサーバーの中の orphan セッションの回収の計画（#1989。UI スレッドで集める材料）
+#[derive(Debug, Clone)]
+pub struct OrphanCleanupPlan {
+    /// 対象のソケット
+    pub target: String,
+    /// 消してはいけないセッション（workspace の器・退避ペインの器・表示中の取り込みビュー）
+    pub protected: std::collections::HashSet<String>,
+    /// これより最近に動いたセッションは対象外（起動時の猶予。明示の回収は `None`）
+    pub min_idle_secs: Option<u64>,
+}
+
+impl OrphanCleanupPlan {
+    /// 回収の本体（器への問い合わせと kill）。**UI スレッドで呼ばないこと**
+    pub fn run(self) -> tako_core::tmux_cleanup::CleanupReport {
+        let killed = tako_core::tmux_backend::cleanup_orphans(
+            &self.target,
+            &self.protected,
+            self.min_idle_secs,
+        );
+        tako_core::tmux_cleanup::CleanupReport::killed(self.target, killed)
+    }
+}
+
+/// background で走らせる tmux の回収（#1989。[`ControlHost::tmux_cleanup_job`] が作る）
+#[derive(Debug, Clone)]
+pub enum TmuxCleanupJob {
+    /// 1 つのサーバーの中の orphan。`Err` = 判定の前に見送った（理由つきの報告）
+    Orphans(Result<OrphanCleanupPlan, tako_core::tmux_cleanup::CleanupReport>),
+    /// サーバー（ソケット）単位（[`cleanup_tmux_servers_default`]）
+    Servers { apply: bool },
 }

@@ -213,23 +213,28 @@ impl TakoApp {
         target_label: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Err(e) = tako_control::dispatch(
-            self,
+        // select-window（tmux）は UI スレッドで待たない（#1989）
+        let target_label = target_label.to_string();
+        self.dispatch_off_ui(
             tako_control::protocol::Request::TmuxSelectWindow {
                 pane: Some(pane.as_u64()),
                 window,
             },
             PaneOrigin::User,
-        ) {
-            self.notify_ui_dispatch_failed(
-                crate::sidebar::NoticeArea::RightPanel,
-                crate::sidebar::NoticeArm::Issue1417,
-                crate::ui_text::panel::op_select_window(),
-                Some(target_label),
-                &e,
-            );
-        }
-        cx.notify();
+            cx,
+            move |app, result, cx| {
+                if let Err(e) = result {
+                    app.notify_ui_dispatch_failed(
+                        crate::sidebar::NoticeArea::RightPanel,
+                        crate::sidebar::NoticeArm::Issue1417,
+                        crate::ui_text::panel::op_select_window(),
+                        Some(&target_label),
+                        &e,
+                    );
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// tmux セッションの「復元」ボタン（#183 / #1422）。
@@ -246,8 +251,9 @@ impl TakoApp {
         session: String,
         cx: &mut Context<Self>,
     ) {
-        let opened = tako_control::dispatch(
-            self,
+        // セッションの確かめ（tmux）は UI スレッドで待たない（#1989）。background を通った着地では
+        // 受け口と同じ後処理（`after_dispatch`）が PTY を立てるので、下の消化は空振りする
+        self.dispatch_off_ui(
             tako_control::protocol::Request::TmuxOpen {
                 socket,
                 session: session.clone(),
@@ -256,32 +262,35 @@ impl TakoApp {
                 direction: None,
             },
             PaneOrigin::User,
-        );
-        match opened {
-            Ok(_) => {
-                // #1023: 取り込みペインの PTY をこの場で立てる
-                // （dispatch は `pending_attach` へ積むだけ）
-                if !Self::attach_drain_legacy() {
-                    if let Err(e) = self.attach_pending_sessions(cx) {
-                        self.notify_ui_op_failed(
-                            crate::sidebar::NoticeArea::RightPanel,
-                            crate::sidebar::NoticeArm::Issue1422,
-                            crate::ui_text::panel::op_start_terminal(),
-                            Some(&session),
-                            &e,
-                        );
+            cx,
+            move |app, opened, cx| {
+                match opened {
+                    Ok(_) => {
+                        // #1023: 取り込みペインの PTY をこの場で立てる
+                        // （dispatch は `pending_attach` へ積むだけ）
+                        if !Self::attach_drain_legacy() {
+                            if let Err(e) = app.attach_pending_sessions(cx) {
+                                app.notify_ui_op_failed(
+                                    crate::sidebar::NoticeArea::RightPanel,
+                                    crate::sidebar::NoticeArm::Issue1422,
+                                    crate::ui_text::panel::op_start_terminal(),
+                                    Some(&session),
+                                    &e,
+                                );
+                            }
+                        }
                     }
+                    Err(e) => app.notify_ui_dispatch_failed(
+                        crate::sidebar::NoticeArea::RightPanel,
+                        crate::sidebar::NoticeArm::Issue1422,
+                        crate::ui_text::panel::op_restore_session(),
+                        Some(&session),
+                        &e,
+                    ),
                 }
-            }
-            Err(e) => self.notify_ui_dispatch_failed(
-                crate::sidebar::NoticeArea::RightPanel,
-                crate::sidebar::NoticeArm::Issue1422,
-                crate::ui_text::panel::op_restore_session(),
-                Some(&session),
-                &e,
-            ),
-        }
-        cx.notify();
+                cx.notify();
+            },
+        );
     }
 
     /// バックグラウンド（閉じたタブのターミナル）からの復帰ボタン（#1422）。
@@ -5358,8 +5367,9 @@ impl TakoApp {
 
     /// コンフリクト解消エージェントを起動する（#496 Part 2）。
     ///
-    /// **CLI / MCP と同じ dispatch を通す**（ペイン分割・セッション起動・プロンプト投入は
-    /// UI スレッドで完結する同期処理なので background へは出さない）
+    /// **CLI / MCP と同じ dispatch を通す**。リポジトリ・コンフリクトの確かめ（git）と CLI の
+    /// 所在確認は background で先取りし、ペイン分割・セッション起動・プロンプト投入は着地
+    /// （UI スレッド）で行う（#1989）
     pub(crate) fn git_do_resolve_agent(&mut self, agent: &str, cx: &mut Context<Self>) {
         self.git_agent_menu_open = false;
         if self.git_busy.is_some() {
@@ -5373,15 +5383,24 @@ impl TakoApp {
             agent: Some(agent.to_string()),
             tab: None,
         };
-        match tako_control::dispatch::dispatch(self, request, tako_core::PaneOrigin::User) {
-            Ok(v) => {
-                let pane_id = v["pane_id"].as_u64().unwrap_or(0);
-                let msg = crate::ui_text::panel::git_resolve_agent_started(agent, pane_id);
-                self.git_set_feedback(msg, false, cx);
-            }
-            Err(e) => self.git_set_feedback(e.to_string(), true, cx),
-        }
-        cx.notify();
+        // リポジトリ・コンフリクトの確かめ（git）と CLI の所在確認は UI スレッドで待たない（#1989）
+        let agent = agent.to_string();
+        self.dispatch_off_ui(
+            request,
+            tako_core::PaneOrigin::User,
+            cx,
+            move |app, result, cx| {
+                match result {
+                    Ok(v) => {
+                        let pane_id = v["pane_id"].as_u64().unwrap_or(0);
+                        let msg = crate::ui_text::panel::git_resolve_agent_started(&agent, pane_id);
+                        app.git_set_feedback(msg, false, cx);
+                    }
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// 新規ブランチ名入力欄へ文字列を挿入する（#496。キー入力・IME 確定・貼り付け共通）

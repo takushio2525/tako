@@ -399,6 +399,15 @@ pub fn resolve_binary_for(agent: AgentKind) -> Option<String> {
     if let Some(found) = tako_core::platform::exe::find(r.agent.as_str()) {
         return Some(found);
     }
+    installed_launcher_for(agent)
+}
+
+/// インストーラが置く場所だけを見る（**子プロセスを起こさない**。#1989）。
+///
+/// [`resolve_binary_for`] の後半。PATH の探索（unix はログインシェル）を上限つきで済ませた
+/// 呼び手（`agent_cli::locate`）が、打ち切ったあとにもう一度上限なしのシェルを起こさないための口
+pub fn installed_launcher_for(agent: AgentKind) -> Option<String> {
+    let r = recipe_for(agent);
     let home = home_dir().ok()?;
     let launcher = r.launcher_path_in(&home);
     is_executable(&launcher).then(|| launcher.display().to_string())

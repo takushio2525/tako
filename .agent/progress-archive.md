@@ -544,3 +544,4 @@
 - 2026-10-09 #1960: tako mod S7-2 = 画面の UI 設定 ui.json を CLI / MCP / setup の同じ口で選んで変える。既定ボタン /compact
 - 2026-10-10 #1959: tako mod S7-1 = setup が Claude Code の設定 dir ごとに skills/tako へ管理印つきの写しを入れる
 - 2026-10-10 #1979: 本番 GUI が `ps` の poll で 10 分固まった件 = UI スレッドから届く子プロセスの待ちに上限・`tako list` の採り直しを background へ・フォーカスの無いペインの再描画に上限
+- 2026-10-09 #1944: 未導入の言語サーバを開いた時点で data dir へ取って起こし、エディタに状態を出した

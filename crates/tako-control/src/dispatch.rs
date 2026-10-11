@@ -1954,6 +1954,19 @@ pub enum OffloadJob {
     /// 子プロセスを待つ問い合わせ（呼び出し元の pid 祖先辿り・CLI の所在確認・再起動の計画の
     /// 走査）を background で先取りしてから、UI スレッドで dispatch する要求（#1984）
     Probe(Box<ProbeJob>),
+    /// `StaleBinary status`（#1989）。UI スレッドではペインの role と器の名前だけを写し、
+    /// 器の走査・`claude` の所在・版の確認は background で行う
+    StaleStatus { ctx: StaleStatusCtx },
+    /// host に触らない tmux の書き込み（`TmuxKill` / `TmuxResize`。#1989）
+    TmuxWrite(Box<Request>),
+    /// `TmuxSelectWindow`（#1989）。対象の解決は UI スレッド、`select-window` は background
+    TmuxSelectWindow {
+        target: PaneId,
+        resolved: tako_core::tmux::WindowTarget,
+        window: u32,
+    },
+    /// `TmuxCleanup`（#1989）。守るセッションは UI スレッドで集め、器への問い合わせと kill は background
+    TmuxCleanup(crate::host::TmuxCleanupJob),
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -2370,6 +2383,44 @@ pub fn prepare_offload(
         // #1984: 以下は UI スレッドの同期の dispatch で子プロセスを待っていた残り
         // （#1979 で上限つきにはなったが、最大 2〜15 秒は止まりうる）。A/B の
         // `TAKO_1984_LEGACY=1` は修正前と同じ `None` = UI スレッドで同期実行
+        // #1989: 同じ型の残り（A/B は `TAKO_1989_LEGACY=1` = 修正前と同じ同期の腕）
+        Request::StaleBinary { action, pane }
+            if action.as_deref().unwrap_or("status") == "status"
+                && !tako_core::probe::issue1989_legacy() =>
+        {
+            Some(collect_stale_status_ctx(host, *pane).map(|ctx| OffloadJob::StaleStatus { ctx }))
+        }
+        Request::TmuxKill { .. } | Request::TmuxResize { .. }
+            if !tako_core::probe::issue1989_legacy() =>
+        {
+            Some(Ok(OffloadJob::TmuxWrite(Box::new(request.clone()))))
+        }
+        Request::TmuxSelectWindow { pane, window } if !tako_core::probe::issue1989_legacy() => {
+            Some(
+                tmux_select_window_target(host, *pane).map(|(target, resolved)| {
+                    OffloadJob::TmuxSelectWindow {
+                        target,
+                        resolved,
+                        window: *window,
+                    }
+                }),
+            )
+        }
+        // `--servers` と `--socket` の併用は子プロセスを起こす前に断る（同期の腕へ落とす）
+        Request::TmuxCleanup {
+            socket,
+            servers,
+            apply,
+        } if !(tako_core::probe::issue1989_legacy() || (*servers && socket.is_some())) => {
+            // A/B（#1187）: 修正前は引数をここで捨てていた
+            let requested = if tako_core::tmux_cleanup::legacy_1187() {
+                None
+            } else {
+                socket.as_deref()
+            };
+            host.tmux_cleanup_job(requested, *servers, *apply)
+                .map(|job| Ok(OffloadJob::TmuxCleanup(job)))
+        }
         Request::RemoteAgents if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::RemoteAgents))
         }
@@ -2489,6 +2540,39 @@ impl OffloadJob {
             } => lsp_server_action(Some(&manager), &action, name.as_deref()),
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
             OffloadJob::RemoteAgents => remote_agents_reply(),
+            OffloadJob::StaleStatus { ctx } => Ok(finish_stale_status(&ctx)),
+            OffloadJob::TmuxWrite(request) => match *request {
+                Request::TmuxKill {
+                    socket,
+                    session,
+                    window,
+                } => tmux_kill_reply(socket.as_deref(), &session, window),
+                Request::TmuxResize {
+                    socket,
+                    session,
+                    window,
+                    cols,
+                    rows,
+                    reset,
+                } => tmux_resize_reply(socket.as_deref(), &session, window, cols, rows, reset),
+                other => Err(DispatchError::Operation(format!(
+                    "tmux の書き込みでない要求: {}",
+                    other.kind_name()
+                ))),
+            },
+            OffloadJob::TmuxSelectWindow {
+                target,
+                resolved,
+                window,
+            } => tmux_select_window_reply(target, &resolved, window),
+            OffloadJob::TmuxCleanup(job) => Ok(match job {
+                crate::host::TmuxCleanupJob::Servers { apply } => {
+                    tmux_cleanup_servers_reply(crate::host::cleanup_tmux_servers_default(apply))
+                }
+                crate::host::TmuxCleanupJob::Orphans(plan) => {
+                    tmux_cleanup_orphans_reply(plan.map_or_else(|skipped| skipped, |p| p.run()))
+                }
+            }),
             OffloadJob::TmuxList { ctx, socket } => {
                 Ok(json!({ "sessions": fetch_tmux_sessions(&ctx, socket.as_deref()) }))
             }
@@ -2550,6 +2634,11 @@ pub struct UiProbes {
     tako_bin: Option<String>,
     /// セッション再起動の計画の走査
     restart_scan: Option<RestartScan>,
+    /// ペインの作業フォルダ → リポジトリとコンフリクト状態（#1989。`git rev-parse` /
+    /// `git status` / `git name-rev`。リポジトリでなければ `None`）
+    git_conflict: Option<(PathBuf, Option<(PathBuf, tako_core::ConflictState)>)>,
+    /// `TmuxOpen` の（socket の指定, セッション）→ 解決（#1989）
+    tmux_open: Option<(TmuxOpenKey, Result<TmuxOpenLookup, String>)>,
 }
 
 /// セッション再起動の計画が使う走査（#1984）
@@ -2572,11 +2661,20 @@ pub struct ProbeNeeds {
     tako_bin: bool,
     /// 走査する器のセッション名（外側の `Some` = 走査が要る）
     restart: Option<Option<String>>,
+    /// コンフリクトを調べる作業フォルダ（#1989）
+    git_conflict: Option<PathBuf>,
+    /// `TmuxOpen` の（socket の指定, セッション）（#1989）
+    tmux_open: Option<TmuxOpenKey>,
 }
 
 impl ProbeNeeds {
     fn is_empty(&self) -> bool {
-        self.caller.is_none() && self.agent.is_none() && !self.tako_bin && self.restart.is_none()
+        self.caller.is_none()
+            && self.agent.is_none()
+            && !self.tako_bin
+            && self.restart.is_none()
+            && self.git_conflict.is_none()
+            && self.tmux_open.is_none()
     }
 
     /// 子プロセスを待つ問い合わせの本体。**UI スレッドで呼ばないこと**（`run_staged` から）
@@ -2601,6 +2699,17 @@ impl ProbeNeeds {
                     live_session,
                     snapshot: crate::agents::ProcessSnapshot::capture(),
                 });
+            }
+            if let Some(cwd) = self.git_conflict {
+                let found = tako_core::git::repo_root(&cwd).map(|repo| {
+                    let state = tako_core::git::conflict_state(&repo);
+                    (repo, state)
+                });
+                probes.git_conflict = Some((cwd, found));
+            }
+            if let Some((socket, session)) = self.tmux_open {
+                let found = compute_tmux_open_lookup(socket.as_deref(), &session);
+                probes.tmux_open = Some(((socket, session), found));
             }
         });
     }
@@ -2744,6 +2853,31 @@ fn restart_scan(backend: Option<&str>) -> (Option<String>, crate::agents::Proces
     }
 }
 
+/// ペインの作業フォルダのリポジトリとコンフリクト状態（#1989。`git rev-parse` / `git status` /
+/// `git name-rev` = 上限なしの `Command::output()`）。
+///
+/// 先取りの内側では background が調べた答えだけを使う。答えが無ければ**ペインを作らずに**断る
+fn git_conflict_for(cwd: &Path) -> Result<(PathBuf, tako_core::ConflictState), DispatchError> {
+    let not_repo = || op_err("git リポジトリが見つかりません");
+    match probed(|p| {
+        p.git_conflict
+            .as_ref()
+            .filter(|(at, _)| at == cwd)
+            .map(|(_, found)| found.clone())
+    }) {
+        Probed::Answer(found) => found.ok_or_else(not_repo),
+        Probed::Missing => Err(op_err(
+            "コンフリクトの状態を確かめられなかった（UI スレッドでは git を待たない。\
+             もう一度呼ぶと確かめ直す）",
+        )),
+        Probed::Outside => {
+            let repo = tako_core::git::repo_root(cwd).ok_or_else(not_repo)?;
+            let state = tako_core::git::conflict_state(&repo);
+            Ok((repo, state))
+        }
+    }
+}
+
 /// 呼び出し元 pid の答えが要るか（要るなら材料の対応表）
 fn caller_need(
     host: &dyn ControlHost,
@@ -2837,7 +2971,7 @@ fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> 
                 caller: caller_need(host, *caller_pid),
                 agent: agent_need(profile.resolve_worker_agent(agent.as_deref()).ok()),
                 tako_bin: tako_bin_need(),
-                restart: None,
+                ..ProbeNeeds::default()
             })
         }
         Request::OrchestratorHandoff {
@@ -2865,7 +2999,51 @@ fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> 
                 caller,
                 agent: agent_need(master_agent),
                 tako_bin: tako_bin_need(),
-                restart: None,
+                ..ProbeNeeds::default()
+            })
+        }
+        // #1989: コンフリクト解消エージェント。リポジトリ・コンフリクトの走査（git）と
+        // CLI の所在確認・tako の実行ファイル。作業フォルダが解けなければ dispatch が先に断る
+        Request::GitResolveAgent { pane, agent, .. } if !tako_core::probe::issue1989_legacy() => {
+            let Ok(cwd) = git_pane_cwd(host, *pane) else {
+                return Some(ProbeNeeds::default());
+            };
+            let known = matches!(
+                probed(|p| p
+                    .git_conflict
+                    .as_ref()
+                    .filter(|(at, _)| *at == cwd)
+                    .map(|_| ())),
+                Probed::Answer(_)
+            );
+            let profile = resolve_caller_profile_with_role(
+                host.workspace(),
+                pane.map(PaneId::from_raw),
+                &None,
+            );
+            Some(ProbeNeeds {
+                git_conflict: (!known).then_some(cwd),
+                agent: agent_need(profile.resolve_worker_agent(agent.as_deref()).ok()),
+                tako_bin: tako_bin_need(),
+                ..ProbeNeeds::default()
+            })
+        }
+        // #1989: tmux セッションをペインで開く（socket の解決・存在確認・グループ）
+        Request::TmuxOpen {
+            socket, session, ..
+        } if !tako_core::probe::issue1989_legacy() => {
+            let key = (socket.clone(), session.clone());
+            let known = matches!(
+                probed(|p| p
+                    .tmux_open
+                    .as_ref()
+                    .filter(|(at, _)| *at == key)
+                    .map(|_| ())),
+                Probed::Answer(_)
+            );
+            Some(ProbeNeeds {
+                tmux_open: (!known).then_some(key),
+                ..ProbeNeeds::default()
             })
         }
         Request::SessionRestart { pane, .. } => Some(restart_needs(host, *pane)),
@@ -4078,31 +4256,12 @@ fn dispatch_inner(
             "sessions": fetch_tmux_sessions(&collect_tmux_context(host), socket.as_deref()),
         })),
 
+        // IPC / MCP 経由は prepare_offload が background へ出す（#1989。host に触らない）
         Request::TmuxKill {
             socket,
             session,
             window,
-        } => {
-            // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
-            let socket = tako_core::tmux::resolve_session_socket(socket.as_deref(), &session)
-                .map_err(DispatchError::Operation)?;
-            match window {
-                Some(index) => tako_core::tmux::kill_window(socket.as_deref(), &session, index),
-                None => tako_core::tmux::kill_session(socket.as_deref(), &session),
-            }
-            .map_err(|e| {
-                tmux_error(
-                    &match window {
-                        Some(index) => format!("window {index} の kill"),
-                        None => format!("セッション {session} の kill"),
-                    },
-                    socket.as_deref(),
-                    &session,
-                    &e,
-                )
-            })?;
-            Ok(json!({ "killed": session, "window": window, "socket": socket }))
-        }
+        } => tmux_kill_reply(socket.as_deref(), &session, window),
 
         Request::TmuxResize {
             socket,
@@ -4111,47 +4270,7 @@ fn dispatch_inner(
             cols,
             rows,
             reset,
-        } => {
-            // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
-            let socket = tako_core::tmux::resolve_session_socket(socket.as_deref(), &session)
-                .map_err(DispatchError::Operation)?;
-            if reset {
-                tako_core::tmux::reset_window_size(socket.as_deref(), &session, window).map_err(
-                    |e| {
-                        tmux_error(
-                            &format!("window {window} のサイズ解除"),
-                            socket.as_deref(),
-                            &session,
-                            &e,
-                        )
-                    },
-                )?;
-                return Ok(
-                    json!({ "session": session, "window": window, "reset": true, "socket": socket }),
-                );
-            }
-            let (Some(cols), Some(rows)) = (cols, rows) else {
-                return Err(DispatchError::InvalidParams(
-                    "cols と rows の両方を指定するか、reset を使うこと".into(),
-                ));
-            };
-            tako_core::tmux::resize_window(socket.as_deref(), &session, window, cols, rows)
-                .map_err(|e| {
-                    tmux_error(
-                        &format!("window {window} のリサイズ"),
-                        socket.as_deref(),
-                        &session,
-                        &e,
-                    )
-                })?;
-            Ok(json!({
-                "session": session,
-                "window": window,
-                "cols": cols,
-                "rows": rows,
-                "socket": socket,
-            }))
-        }
+        } => tmux_resize_reply(socket.as_deref(), &session, window, cols, rows, reset),
 
         Request::TmuxOpen {
             socket,
@@ -4160,21 +4279,9 @@ fn dispatch_inner(
             pane,
             direction,
         } => {
-            // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190。
-            // kill / resize / open で解決を揃える）。明示指定はそのまま尊重する
-            let explicit_socket = socket.is_some();
-            let socket = tako_core::tmux::resolve_session_socket(socket.as_deref(), &session)
-                .map_err(DispatchError::Operation)?;
-            // 存在しないセッション名は分割前に弾く（D&D 経路では起こらないが、
-            // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）。
-            // socket 省略時は上の解決が存在を証明しているので、明示指定のときだけ確認する
-            if explicit_socket && !tako_core::tmux::has_session(socket.as_deref(), &session) {
-                return Err(DispatchError::Operation(format!(
-                    "tmux セッション {session} が見つからない（{}）。\
-                     対象は `tako tmux list` で確認すること",
-                    tako_core::tmux::socket_label(socket.as_deref())
-                )));
-            }
+            // socket の解決・存在確認・元セッションのグループ（どれも tmux への問い合わせ）は
+            // 分割の前に 1 回で済ませ、UI スレッドの dispatch では先取りを読む（#1989）
+            let TmuxOpenLookup { socket, group } = tmux_open_lookup(socket.as_deref(), &session)?;
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
             let new_pane = Pane::new(origin);
             let new_id = new_pane.id();
@@ -4192,7 +4299,6 @@ fn dispatch_inner(
             // 「最初に作られた元セッション名」にするため、`tako-view-*` ラッパーや grouped
             // session を開こうとしても group を辿れば必ず元へ戻る。
             // 例: `tako-view-tako-view-master-tako-2-0`（group=master-tako）→ `master-tako`
-            let group = tako_core::tmux::session_group(socket.as_deref(), &session);
             let original = group.unwrap_or_else(|| session.clone());
             // tako 自身が作ったラッパーを開き直す場合（バックグラウンドからの復帰・再オープン等）は、
             // **新しいラッパーを作らず元セッションをそのまま直接 attach** する（ユーザー指示）。
@@ -4278,38 +4384,8 @@ fn dispatch_inner(
         }
 
         Request::TmuxSelectWindow { pane, window } => {
-            let (_, target) = resolve_pane(host.workspace(), pane)?;
-            // 取り込みビュー（内側）をバックエンド（外側）より優先する（#1185）。
-            // 素朴に backend_session だけを見ると、取り込みペインでは**別セッション**の
-            // window を切り替えて「成功」を返してしまう
-            let resolved = tako_core::tmux::window_target(
-                host.tmux_view(target).as_ref(),
-                host.backend_session(target).as_deref(),
-            )
-            .ok_or_else(|| {
-                DispatchError::Operation(format!(
-                    "ペイン {target} に tmux セッションがない\
-                     （tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）"
-                ))
-            })?;
-            tako_core::tmux::select_window(resolved.socket.as_deref(), &resolved.target, window)
-                .map_err(|e| {
-                    DispatchError::Operation(tako_core::tmux::friendly_error(
-                        &format!("window {window} の選択"),
-                        resolved.socket.as_deref(),
-                        &resolved.target,
-                        &e,
-                    ))
-                })?;
-            Ok(json!({
-                "pane": target.as_u64(),
-                // 論理的なセッション名（取り込みビューなら取り込んだ元セッション）
-                "session": resolved.session,
-                // 実際に select-window を打った相手（取り込みビューは表示用ラッパー）
-                "target": resolved.target,
-                "socket": resolved.socket,
-                "window": window,
-            }))
+            let (target, resolved) = tmux_select_window_target(host, pane)?;
+            tmux_select_window_reply(target, &resolved, window)
         }
 
         Request::TmuxCleanup {
@@ -4329,55 +4405,7 @@ fn dispatch_inner(
                      1 つのサーバーの中を掃除するなら --servers を外す"
                 )));
             }
-            let outcome = host.cleanup_tmux_servers(apply);
-            crate::diag::persist_log(&outcome.log_line());
-            let entries: Vec<Value> = outcome
-                .entries
-                .iter()
-                .map(|(entry, verdict)| {
-                    json!({
-                        "socket": entry.socket,
-                        "verdict": verdict.code(),
-                        "detail": verdict.detail(),
-                        "running": entry.running,
-                        "sessions": entry.sessions,
-                        "clients": entry.clients,
-                        "owner_pids": entry.owner_pids,
-                        "live_owner_pids": entry.live_owner_pids,
-                        "bytes": entry.bytes,
-                        "modified_secs_ago": entry.modified_secs_ago,
-                        // #1282: 名前で列挙した器（Windows / psmux）は
-                        // ソケットファイルが無いので、器そのものの pid と
-                        // 所有者の出どころを出す（回収は pid を名指しして行う）
-                        "kind": match entry.kind {
-                            tako_core::tmux_cleanup::ServerKind::SocketFile => "socket_file",
-                            tako_core::tmux_cleanup::ServerKind::Named => "named",
-                        },
-                        "server_pids": entry.server_pids,
-                        "owner_source": match entry.owner_source {
-                            tako_core::tmux_cleanup::OwnerSource::Unknown => "unknown",
-                            tako_core::tmux_cleanup::OwnerSource::SocketName => "socket_name",
-                            tako_core::tmux_cleanup::OwnerSource::CommandLine => "command_line",
-                        },
-                    })
-                })
-                .collect();
-            Ok(json!({
-                "mode": "servers",
-                "applied": outcome.applied,
-                "summary": {
-                    "total": outcome.entries.len(),
-                    "running": outcome.running(),
-                    "reclaimable": outcome.count("reclaimable"),
-                    "stale_sockets": outcome.count("stale_socket"),
-                    "protected": outcome.entries.len()
-                        - outcome.count("reclaimable")
-                        - outcome.count("stale_socket"),
-                },
-                "killed": outcome.killed,
-                "removed_sockets": outcome.removed_sockets,
-                "servers": entries,
-            }))
+            Ok(tmux_cleanup_servers_reply(host.cleanup_tmux_servers(apply)))
         }
 
         Request::TmuxCleanup { socket, .. } => {
@@ -4388,21 +4416,9 @@ fn dispatch_inner(
             if tako_core::tmux_cleanup::legacy_1187() {
                 requested = None; // A/B: 修正前は引数をここで捨てていた
             }
-            let report = host.cleanup_orphan_tmux(requested);
-            // #1187: 見送りは応答と persist.log の両方に理由を残す（空配列だけを返すと
-            // 呼び出し側が「掃除するものが無かった」と区別できない）
-            if let Some(line) = report.log_line(tako_core::tmux_cleanup::CleanupScope::Explicit) {
-                crate::diag::persist_log(&line);
-            }
-            if tako_core::tmux_cleanup::legacy_1187() {
-                return Ok(json!({ "killed": report.killed }));
-            }
-            Ok(json!({
-                "socket": report.socket,
-                "killed": report.killed,
-                "skipped": report.skipped.as_ref().map(|s| s.code()),
-                "detail": report.skipped.as_ref().map(|s| s.detail()),
-            }))
+            Ok(tmux_cleanup_orphans_reply(
+                host.cleanup_orphan_tmux(requested),
+            ))
         }
 
         Request::TabRename {
@@ -12703,8 +12719,8 @@ fn dispatch_git_resolve_agent(
 ) -> Result<Value, DispatchError> {
     use crate::orchestrator;
 
-    let repo = git_repo_for_pane(host, pane)?;
-    let state = tako_core::git::conflict_state(&repo);
+    // #1989: リポジトリとコンフリクトの走査（git）は UI スレッドの dispatch では先取りを読む
+    let (repo, state) = git_conflict_for(&git_pane_cwd(host, pane)?)?;
     if !state.is_active() {
         return Err(op_err(
             "コンフリクトが発生していません（解消エージェントを起動する状況ではありません）",
@@ -12720,9 +12736,9 @@ fn dispatch_git_resolve_agent(
         .resolve_worker_agent(agent)
         .map_err(DispatchError::InvalidParams)?;
     // #983: CLI が無ければ**ペインを作る前に**落とす（作ってから流すと
-    // ペインに `command not found` が出るだけで、tako は成功と報告してしまう）
-    let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
-        .map_err(|e| DispatchError::Operation(e.message()))?;
+    // ペインに `command not found` が出るだけで、tako は成功と報告してしまう）。
+    // 所在の確認は UI スレッドの dispatch では先取りを読む（#1989）
+    let agent_cli_path = agent_preflight(worker_agent)?;
     let launch = profile.resolve_agent_launch(worker_agent, None, None);
     // Remote Control（#1068）。判定は起動コマンドの組み立てと同じ 1 実装を通す
     let remote_control =
@@ -12763,7 +12779,7 @@ fn dispatch_git_resolve_agent(
 
     let role_value = "conflict-resolver";
     // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）
-    let tako_bin = resolve_tako_binary();
+    let tako_bin = tako_binary();
     let agent_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: role_value,
@@ -17918,6 +17934,260 @@ fn origin_str(origin: PaneOrigin) -> &'static str {
     }
 }
 
+/// `TmuxKill` の本体（tmux = 子プロセス。host に触らないので background で応答できる。#1989）
+fn tmux_kill_reply(
+    socket: Option<&str>,
+    session: &str,
+    window: Option<u32>,
+) -> Result<Value, DispatchError> {
+    // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
+    let socket = tako_core::tmux::resolve_session_socket(socket, session)
+        .map_err(DispatchError::Operation)?;
+    match window {
+        Some(index) => tako_core::tmux::kill_window(socket.as_deref(), session, index),
+        None => tako_core::tmux::kill_session(socket.as_deref(), session),
+    }
+    .map_err(|e| {
+        tmux_error(
+            &match window {
+                Some(index) => format!("window {index} の kill"),
+                None => format!("セッション {session} の kill"),
+            },
+            socket.as_deref(),
+            session,
+            &e,
+        )
+    })?;
+    Ok(json!({ "killed": session, "window": window, "socket": socket }))
+}
+
+/// `TmuxResize` の本体（tmux = 子プロセス。host に触らないので background で応答できる。#1989）
+fn tmux_resize_reply(
+    socket: Option<&str>,
+    session: &str,
+    window: u32,
+    cols: Option<u32>,
+    rows: Option<u32>,
+    reset: bool,
+) -> Result<Value, DispatchError> {
+    // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
+    let socket = tako_core::tmux::resolve_session_socket(socket, session)
+        .map_err(DispatchError::Operation)?;
+    if reset {
+        tako_core::tmux::reset_window_size(socket.as_deref(), session, window).map_err(|e| {
+            tmux_error(
+                &format!("window {window} のサイズ解除"),
+                socket.as_deref(),
+                session,
+                &e,
+            )
+        })?;
+        return Ok(
+            json!({ "session": session, "window": window, "reset": true, "socket": socket }),
+        );
+    }
+    let (Some(cols), Some(rows)) = (cols, rows) else {
+        return Err(DispatchError::InvalidParams(
+            "cols と rows の両方を指定するか、reset を使うこと".into(),
+        ));
+    };
+    tako_core::tmux::resize_window(socket.as_deref(), session, window, cols, rows).map_err(
+        |e| {
+            tmux_error(
+                &format!("window {window} のリサイズ"),
+                socket.as_deref(),
+                session,
+                &e,
+            )
+        },
+    )?;
+    Ok(json!({
+        "session": session,
+        "window": window,
+        "cols": cols,
+        "rows": rows,
+        "socket": socket,
+    }))
+}
+
+/// `TmuxSelectWindow` の対象の解決（UI スレッド部 = メモリだけ。#1989）
+fn tmux_select_window_target(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+) -> Result<(PaneId, tako_core::tmux::WindowTarget), DispatchError> {
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    // 取り込みビュー（内側）をバックエンド（外側）より優先する（#1185）。
+    // 素朴に backend_session だけを見ると、取り込みペインでは**別セッション**の
+    // window を切り替えて「成功」を返してしまう
+    let resolved = tako_core::tmux::window_target(
+        host.tmux_view(target).as_ref(),
+        host.backend_session(target).as_deref(),
+    )
+    .ok_or_else(|| {
+        DispatchError::Operation(format!(
+            "ペイン {target} に tmux セッションがない\
+             （tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）"
+        ))
+    })?;
+    Ok((target, resolved))
+}
+
+/// `TmuxSelectWindow` の本体（`tmux select-window`。background で呼ぶ。#1989）
+fn tmux_select_window_reply(
+    target: PaneId,
+    resolved: &tako_core::tmux::WindowTarget,
+    window: u32,
+) -> Result<Value, DispatchError> {
+    tako_core::tmux::select_window(resolved.socket.as_deref(), &resolved.target, window).map_err(
+        |e| {
+            DispatchError::Operation(tako_core::tmux::friendly_error(
+                &format!("window {window} の選択"),
+                resolved.socket.as_deref(),
+                &resolved.target,
+                &e,
+            ))
+        },
+    )?;
+    Ok(json!({
+        "pane": target.as_u64(),
+        // 論理的なセッション名（取り込みビューなら取り込んだ元セッション）
+        "session": resolved.session,
+        // 実際に select-window を打った相手（取り込みビューは表示用ラッパー）
+        "target": resolved.target,
+        "socket": resolved.socket,
+        "window": window,
+    }))
+}
+
+/// サーバー単位の回収の応答（同期の腕と #1989 の background の 1 実装）
+fn tmux_cleanup_servers_reply(outcome: tako_core::tmux_cleanup::ServerCleanupOutcome) -> Value {
+    crate::diag::persist_log(&outcome.log_line());
+    let entries: Vec<Value> = outcome
+        .entries
+        .iter()
+        .map(|(entry, verdict)| {
+            json!({
+                "socket": entry.socket,
+                "verdict": verdict.code(),
+                "detail": verdict.detail(),
+                "running": entry.running,
+                "sessions": entry.sessions,
+                "clients": entry.clients,
+                "owner_pids": entry.owner_pids,
+                "live_owner_pids": entry.live_owner_pids,
+                "bytes": entry.bytes,
+                "modified_secs_ago": entry.modified_secs_ago,
+                // #1282: 名前で列挙した器（Windows / psmux）は
+                // ソケットファイルが無いので、器そのものの pid と
+                // 所有者の出どころを出す（回収は pid を名指しして行う）
+                "kind": match entry.kind {
+                    tako_core::tmux_cleanup::ServerKind::SocketFile => "socket_file",
+                    tako_core::tmux_cleanup::ServerKind::Named => "named",
+                },
+                "server_pids": entry.server_pids,
+                "owner_source": match entry.owner_source {
+                    tako_core::tmux_cleanup::OwnerSource::Unknown => "unknown",
+                    tako_core::tmux_cleanup::OwnerSource::SocketName => "socket_name",
+                    tako_core::tmux_cleanup::OwnerSource::CommandLine => "command_line",
+                },
+            })
+        })
+        .collect();
+    json!({
+        "mode": "servers",
+        "applied": outcome.applied,
+        "summary": {
+            "total": outcome.entries.len(),
+            "running": outcome.running(),
+            "reclaimable": outcome.count("reclaimable"),
+            "stale_sockets": outcome.count("stale_socket"),
+            "protected": outcome.entries.len()
+                - outcome.count("reclaimable")
+                - outcome.count("stale_socket"),
+        },
+        "killed": outcome.killed,
+        "removed_sockets": outcome.removed_sockets,
+        "servers": entries,
+    })
+}
+
+/// orphan の回収の応答（同期の腕と #1989 の background の 1 実装）
+fn tmux_cleanup_orphans_reply(report: tako_core::tmux_cleanup::CleanupReport) -> Value {
+    // #1187: 見送りは応答と persist.log の両方に理由を残す（空配列だけを返すと
+    // 呼び出し側が「掃除するものが無かった」と区別できない）
+    if let Some(line) = report.log_line(tako_core::tmux_cleanup::CleanupScope::Explicit) {
+        crate::diag::persist_log(&line);
+    }
+    if tako_core::tmux_cleanup::legacy_1187() {
+        return json!({ "killed": report.killed });
+    }
+    json!({
+        "socket": report.socket,
+        "killed": report.killed,
+        "skipped": report.skipped.as_ref().map(|s| s.code()),
+        "detail": report.skipped.as_ref().map(|s| s.detail()),
+    })
+}
+
+/// `TmuxOpen` の先取りの鍵（socket の指定, セッション名。#1989）
+type TmuxOpenKey = (Option<String>, String);
+
+/// `TmuxOpen` が tmux に聞くこと（#1989）
+#[derive(Debug, Clone)]
+struct TmuxOpenLookup {
+    /// 解決した socket（省略時は「既定サーバー → tako バックエンド」で見つかった方）
+    socket: Option<String>,
+    /// 元セッション（グループ名）。ラッパーを開き直しても元へ戻るため（無限ネスト防止）
+    group: Option<String>,
+}
+
+/// [`TmuxOpenLookup`] を tmux に聞く（`has-session` / `display`。**UI スレッドで呼ばないこと**）
+fn compute_tmux_open_lookup(
+    socket_arg: Option<&str>,
+    session: &str,
+) -> Result<TmuxOpenLookup, String> {
+    // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190。
+    // kill / resize / open で解決を揃える）。明示指定はそのまま尊重する
+    let socket = tako_core::tmux::resolve_session_socket(socket_arg, session)?;
+    // 存在しないセッション名は分割前に弾く（D&D 経路では起こらないが、
+    // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）。
+    // socket 省略時は上の解決が存在を証明しているので、明示指定のときだけ確認する
+    if socket_arg.is_some() && !tako_core::tmux::has_session(socket.as_deref(), session) {
+        return Err(format!(
+            "tmux セッション {session} が見つからない（{}）。\
+             対象は `tako tmux list` で確認すること",
+            tako_core::tmux::socket_label(socket.as_deref())
+        ));
+    }
+    // 元セッションの解決（無限ネスト防止）。tmux はグループ名を「最初に作られた元セッション名」に
+    // するため、`tako-view-*` ラッパーや grouped session を開こうとしても group を辿れば元へ戻る
+    let group = tako_core::tmux::session_group(socket.as_deref(), session);
+    Ok(TmuxOpenLookup { socket, group })
+}
+
+/// `TmuxOpen` の対象（#1989）。先取りの内側では background が聞いた答えだけを使い、
+/// 答えが無ければ**ペインを作らずに**断る
+fn tmux_open_lookup(
+    socket_arg: Option<&str>,
+    session: &str,
+) -> Result<TmuxOpenLookup, DispatchError> {
+    match probed(|p| {
+        p.tmux_open
+            .as_ref()
+            .filter(|((socket, at), _)| socket.as_deref() == socket_arg && at == session)
+            .map(|(_, found)| found.clone())
+    }) {
+        Probed::Answer(found) => found.map_err(DispatchError::Operation),
+        Probed::Missing => Err(op_err(
+            "tmux セッションを確かめられなかった（UI スレッドでは tmux を待たない。\
+             もう一度呼ぶと確かめ直す）",
+        )),
+        Probed::Outside => {
+            compute_tmux_open_lookup(socket_arg, session).map_err(DispatchError::Operation)
+        }
+    }
+}
+
 /// UI スレッドで収集した pane/backend 対応表。`fetch_tmux_sessions` に渡す
 pub struct TmuxContext {
     pub pane_of_tty: Vec<(String, u64, u64)>,
@@ -19780,34 +20050,57 @@ fn dispatch_session_restart(
 // StaleBinary — stale claude バイナリの検知と張り直し（Issue #498）
 // ---------------------------------------------------------------------------
 
-/// status: 指定ペインの stale 判定情報を返す
+/// status: 指定ペインの stale 判定情報を返す（同期の腕。IPC 経由は prepare_offload が
+/// [`collect_stale_status_ctx`]（UI スレッド）と [`finish_stale_status`]（background）に分ける。#1989）
 fn dispatch_stale_binary_status(
     host: &dyn ControlHost,
     _origin: PaneOrigin,
     pane: Option<u64>,
 ) -> Result<Value, DispatchError> {
+    Ok(finish_stale_status(&collect_stale_status_ctx(host, pane)?))
+}
+
+/// stale 判定の UI スレッド部（ペインの role と器の名前をメモリから写すだけ。#1989）
+pub struct StaleStatusCtx {
+    pane: u64,
+    role: String,
+    backend: Option<String>,
+}
+
+fn collect_stale_status_ctx(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+) -> Result<StaleStatusCtx, DispatchError> {
     let (tab_id, pane_id) = resolve_pane(host.workspace(), pane)?;
     let pane_obj = host
         .workspace()
         .get_tab(tab_id)
         .and_then(|t| t.tree().get(pane_id))
         .ok_or(DispatchError::PaneNotFound(pane_id.as_u64()))?;
+    Ok(StaleStatusCtx {
+        pane: pane_id.as_u64(),
+        role: pane_obj.role().unwrap_or("").to_string(),
+        backend: host.backend_session(pane_id),
+    })
+}
 
-    let role = pane_obj.role().unwrap_or("");
+/// stale 判定の本体（器の走査・`claude` の所在・版の確認 = 子プロセス）。
+/// **UI スレッドで呼ばないこと**（#1989。同期の腕はテスト・直呼び用）
+fn finish_stale_status(ctx: &StaleStatusCtx) -> Value {
+    let role = ctx.role.as_str();
     let is_master =
         role.contains("orchestrator-master") || role == "master" || role.starts_with("master:");
     let is_worker = role.contains("orchestrator-worker") || role.starts_with("worker");
 
     // バックエンドセッション名を取得
-    let backend = host.backend_session(pane_id);
-    let backend_session = match backend.as_deref() {
+    let backend_session = match ctx.backend.as_deref() {
         Some(s) => s,
         None => {
-            return Ok(json!({
+            return json!({
                 "stale": false,
                 "reason": "バックエンドセッションなし（stale 検知対象外）",
-                "pane": pane_id.as_u64(),
-            }));
+                "pane": ctx.pane,
+            });
         }
     };
 
@@ -19832,9 +20125,9 @@ fn dispatch_stale_binary_status(
         _ => false,
     };
 
-    Ok(json!({
+    json!({
         "stale": stale,
-        "pane": pane_id.as_u64(),
+        "pane": ctx.pane,
         "role": role,
         "is_master": is_master,
         "is_worker": is_worker,
@@ -19843,7 +20136,7 @@ fn dispatch_stale_binary_status(
         "spawned_version": spawned_version,
         "current_version": current_version,
         "pid": pid,
-    }))
+    })
 }
 
 /// restart: stale ペインを張り直す（#498）。
@@ -39304,6 +39597,7 @@ mod tests {
                 live_session: Some("sess-1984".into()),
                 snapshot: crate::agents::ProcessSnapshot::default(),
             }),
+            ..UiProbes::default()
         };
         with_ui_probes(&answers, || {
             assert_eq!(caller_pane_by_pid(&host, 4_242_424), Some(7));
@@ -39416,6 +39710,158 @@ mod tests {
                 assert!(result["new_master_pane_id"].as_u64().is_some());
             },
         );
+    }
+
+    /// #1989: 同じ型の残り（`StaleBinary status`・tmux の書き込み系・コンフリクト解消エージェント）も
+    /// background のジョブ / 先取りになる。テスト用のホスト（回収を切り出さない）は同期の腕のまま
+    #[test]
+    fn issue1989_同じ型の残りもbackgroundへ出る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        for action in [None, Some("status".to_string())] {
+            assert!(matches!(
+                prepare_offload(
+                    &mut host,
+                    &Request::StaleBinary {
+                        action,
+                        pane: Some(pane)
+                    }
+                ),
+                Some(Ok(OffloadJob::StaleStatus { .. }))
+            ));
+        }
+        for req in [
+            Request::TmuxKill {
+                socket: Some("s1989".into()),
+                session: "x".into(),
+                window: None,
+            },
+            Request::TmuxResize {
+                socket: None,
+                session: "x".into(),
+                window: 0,
+                cols: Some(80),
+                rows: Some(24),
+                reset: false,
+            },
+        ] {
+            assert!(matches!(
+                prepare_offload(&mut host, &req),
+                Some(Ok(OffloadJob::TmuxWrite(_)))
+            ));
+        }
+        // tmux の無いペインの select-window は準備（メモリ）の段で同期の腕と同じエラーになる
+        let select = Request::TmuxSelectWindow {
+            pane: Some(pane),
+            window: 1,
+        };
+        let offloaded = match prepare_offload(&mut host, &select) {
+            Some(Err(e)) => e,
+            _ => panic!("tmux の無いペインは準備の段で断る"),
+        };
+        assert_eq!(
+            offloaded,
+            dispatch(&mut host, select, PaneOrigin::Cli).unwrap_err()
+        );
+        // TmuxOpen は socket の解決・存在確認・グループを先取りする
+        let Some(Ok(OffloadJob::Probe(job))) = prepare_offload(
+            &mut host,
+            &Request::TmuxOpen {
+                socket: Some("s1989".into()),
+                session: "x".into(),
+                window: None,
+                pane: Some(pane),
+                direction: None,
+            },
+        ) else {
+            panic!("TmuxOpen は先取りする");
+        };
+        assert_eq!(
+            job.needs.tmux_open,
+            Some((Some("s1989".to_string()), "x".to_string()))
+        );
+        // 回収は host が切り出すときだけ（テスト用のホストは同期の腕 = 上書きした cleanup_* を通る）
+        for servers in [false, true] {
+            assert!(prepare_offload(
+                &mut host,
+                &Request::TmuxCleanup {
+                    socket: None,
+                    servers,
+                    apply: false,
+                }
+            )
+            .is_none());
+        }
+        // コンフリクト解消エージェントは作業フォルダが解けたら git の走査と CLI の所在を先取りする
+        let cwd = std::env::temp_dir();
+        seed_session_cwd(&mut host, pane, &cwd);
+        let Some(Ok(OffloadJob::Probe(job))) = prepare_offload(
+            &mut host,
+            &Request::GitResolveAgent {
+                pane: Some(pane),
+                agent: Some("claude".into()),
+                tab: None,
+            },
+        ) else {
+            panic!("解消エージェントは先取りする");
+        };
+        assert_eq!(job.needs.git_conflict.as_deref(), Some(cwd.as_path()));
+        assert!(job.needs.agent.is_some() && job.needs.tako_bin);
+    }
+
+    /// #1989: 先取りの内側では git / tmux の答えだけを読み、無ければ待たずに断る
+    #[test]
+    fn issue1989_先取りの内側はgitとtmuxの答えだけを読む() {
+        let dir = PathBuf::from("/tmp/tako-1989-not-a-repo");
+        let answers = UiProbes {
+            git_conflict: Some((dir.clone(), None)),
+            tmux_open: Some((
+                (None, "gone".into()),
+                Err("tmux セッション gone が見つからない".into()),
+            )),
+            ..UiProbes::default()
+        };
+        with_ui_probes(&answers, || {
+            assert!(git_conflict_for(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("git リポジトリが見つかりません"));
+            assert!(tmux_open_lookup(None, "gone")
+                .unwrap_err()
+                .to_string()
+                .contains("gone が見つからない"));
+            // 違う鍵の答えは使わない
+            assert!(git_conflict_for(Path::new("/elsewhere"))
+                .unwrap_err()
+                .to_string()
+                .contains("確かめられなかった"));
+            assert!(tmux_open_lookup(Some("other"), "gone")
+                .unwrap_err()
+                .to_string()
+                .contains("確かめられなかった"));
+        });
+    }
+
+    /// #1989: 所在の確認を打ち切ったときは「見つからない」ではなく「確かめられなかった」と言い、
+    /// 次の一手（起動ファイルの確認・上限の延ばし方）を付ける
+    #[test]
+    fn issue1989_所在確認の打ち切りは見つからないと言わない() {
+        use crate::orchestrator::agent::WorkerAgent;
+        use crate::orchestrator::agent_cli::{AgentCliError, AgentCliProblem};
+        let err = AgentCliError {
+            agent: WorkerAgent::Claude,
+            problem: AgentCliProblem::LookupTimedOut,
+        };
+        let ja = err.message_in(tako_core::i18n::Lang::Ja);
+        assert!(ja.contains("上限時間内に確かめられませんでした"), "{ja}");
+        assert!(!ja.contains("見つかりません"), "{ja}");
+        let en = err.message_in(tako_core::i18n::Lang::En);
+        assert!(en.contains("could not be located in time"), "{en}");
+        assert!(!en.contains("was not found"), "{en}");
+        for msg in [&ja, &en] {
+            assert!(msg.contains("TAKO_SETUP_PROBE_TIMEOUT_SECS"), "{msg}");
+        }
+        assert_eq!(err.to_json()["kind"], "cli_lookup_timed_out");
     }
 
     /// #1191: `tako list` の `backend_windows` は**要求時点の実態**を返す。

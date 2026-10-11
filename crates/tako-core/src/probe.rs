@@ -394,6 +394,20 @@ pub fn issue1984_legacy() -> bool {
     })
 }
 
+/// #1989 の A/B（`TAKO_1989_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// コンフリクト解消エージェント（`GitResolveAgent`）・`StaleBinary status`・tmux の書き込み系
+/// （kill / resize / select-window / open / cleanup）を UI スレッドの同期の dispatch で待ち、
+/// agent CLI の所在確認（`agent_cli::locate`）を上限なしで待つ。**ゲートはこの 1 か所**
+pub fn issue1989_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1989_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。
