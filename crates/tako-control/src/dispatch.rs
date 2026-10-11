@@ -1942,6 +1942,18 @@ pub enum OffloadJob {
     /// UI スレッドで待たない。反映と応答の組み立て（`list_json`）は UI スレッドへ戻す
     /// （[`OffloadContinuation::List`]）
     List { socket: String },
+    /// スマホの一覧（#1984）。`claude agents --json`（上限 15 秒）と器の `list-panes` を
+    /// UI スレッドで待たない（workspace に触らないのでそのまま background から応答する）
+    RemoteAgents,
+    /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
+    /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
+    TmuxList {
+        ctx: TmuxContext,
+        socket: Option<String>,
+    },
+    /// 子プロセスを待つ問い合わせ（呼び出し元の pid 祖先辿り・CLI の所在確認・再起動の計画の
+    /// 走査）を background で先取りしてから、UI スレッドで dispatch する要求（#1984）
+    Probe(Box<ProbeJob>),
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -2028,6 +2040,9 @@ pub enum OffloadContinuation {
     /// `tako list` の応答（#1979）。background で採った器の window 一覧を反映してから組む。
     /// `None` = 採取できなかった（tmux 不在・サーバー未起動・上限で打ち切り）
     List(Option<std::collections::HashMap<String, Vec<tako_core::TmuxWindow>>>),
+    /// 先取りした答えで dispatch する（#1984）。答えがまだ足りなければ [`land_offload`] が
+    /// もう一巡 background へ出す
+    Probed(Box<ProbedRequest>),
 }
 
 impl OffloadContinuation {
@@ -2035,9 +2050,14 @@ impl OffloadContinuation {
     ///
     /// 真なら受け口は着地のあとに 1 フレーム強制描画する（#1370 / #1680 と同じ）。
     /// `tako list` の応答は読み取りなので描かない（リモートの監視は数秒ごとに `List` を
-    /// 打つので、ここで描くと読み取りのたびに #786 の描画の固定費を払う）
+    /// 打つので、ここで描くと読み取りのたびに #786 の描画の固定費を払う）。
+    /// 先取りした要求（#1984）は同期の腕と同じ判定（`protocol::changes_layout`）
     pub fn changes_layout(&self) -> bool {
-        !matches!(self, Self::List(_))
+        match self {
+            Self::List(_) => false,
+            Self::Probed(probed) => crate::protocol::changes_layout(&probed.request),
+            _ => true,
+        }
     }
 }
 
@@ -2075,6 +2095,13 @@ pub fn finish_offload(
         OffloadContinuation::List(by_session) => {
             host.apply_backend_windows_fetch(by_session);
             Ok(list_reply(host))
+        }
+        // #1984: 先取りした答えの内側で dispatch する（読む側の関数は子プロセスを待たない）
+        OffloadContinuation::Probed(probed) => {
+            let ProbedRequest {
+                request, probes, ..
+            } = *probed;
+            with_ui_probes(&probes, || dispatch(host, request, origin))
         }
     }
 }
@@ -2340,6 +2367,32 @@ pub fn prepare_offload(
             collect_run_resolve(host, path, *pane, *refresh)
                 .map(|ctx| OffloadJob::RunResolve { ctx }),
         ),
+        // #1984: 以下は UI スレッドの同期の dispatch で子プロセスを待っていた残り
+        // （#1979 で上限つきにはなったが、最大 2〜15 秒は止まりうる）。A/B の
+        // `TAKO_1984_LEGACY=1` は修正前と同じ `None` = UI スレッドで同期実行
+        Request::RemoteAgents if !tako_core::probe::issue1984_legacy() => {
+            Some(Ok(OffloadJob::RemoteAgents))
+        }
+        Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
+            Some(Ok(OffloadJob::TmuxList {
+                ctx: collect_tmux_context(host),
+                socket: socket.clone(),
+            }))
+        }
+        // 呼び出し元の pid 祖先辿り・CLI の所在確認・再起動の計画の走査を先取りする。
+        // 先取りが要らない（pid の無い self 等）ときは `None` = 同期の腕（子プロセスを起こさない）。
+        // 要るものの判断（`probe_needs`）も空の答えの内側で回す（判断の途中で待たない）
+        _ if !tako_core::probe::issue1984_legacy() => {
+            let needs = with_ui_probes(&UiProbes::default(), || probe_needs(host, request))?;
+            (!needs.is_empty()).then(|| {
+                Ok(OffloadJob::Probe(Box::new(ProbeJob {
+                    request: request.clone(),
+                    probes: UiProbes::default(),
+                    needs,
+                    round: 1,
+                })))
+            })
+        }
         _ => None,
     }
 }
@@ -2373,6 +2426,20 @@ impl OffloadJob {
             OffloadJob::List { socket } => OffloadOutcome::OnUi(OffloadContinuation::List(
                 tako_core::tmux::list_windows_by_session(Some(&socket)),
             )),
+            OffloadJob::Probe(job) => {
+                let ProbeJob {
+                    request,
+                    mut probes,
+                    needs,
+                    round,
+                } = *job;
+                needs.fill(&mut probes);
+                OffloadOutcome::OnUi(OffloadContinuation::Probed(Box::new(ProbedRequest {
+                    request,
+                    probes,
+                    round,
+                })))
+            }
             other => OffloadOutcome::Reply(other.run_reply()),
         }
     }
@@ -2421,6 +2488,10 @@ impl OffloadJob {
                 name,
             } => lsp_server_action(Some(&manager), &action, name.as_deref()),
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
+            OffloadJob::RemoteAgents => remote_agents_reply(),
+            OffloadJob::TmuxList { ctx, socket } => {
+                Ok(json!({ "sessions": fetch_tmux_sessions(&ctx, socket.as_deref()) }))
+            }
             OffloadJob::LspMenu(job) => Ok(job.run().to_json()),
             OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
                 "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
@@ -2442,8 +2513,421 @@ impl OffloadJob {
                 "一覧は run_staged で走らせる（反映と応答の組み立てに UI スレッドの続きが要る）"
                     .into(),
             )),
+            OffloadJob::Probe(_) => Err(DispatchError::Operation(
+                "先取りの要求は run_staged で走らせる（dispatch に UI スレッドの続きが要る）"
+                    .into(),
+            )),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// UI スレッドで待てない問い合わせの先取り（#1984）
+// ---------------------------------------------------------------------------
+
+/// 先取りを何巡まで繰り返すか（#1984）。handoff は「呼び出し元が決まる → 後任の agent が
+/// 決まる」の 2 段なので 2 巡で揃う。3 巡目は答えの最中に設定が変わったときの保険で、
+/// それでも揃わなければ揃ったぶんで dispatch する（読む側は待たない側へ倒れる）
+const MAX_PROBE_ROUNDS: u8 = 3;
+
+/// UI スレッドの dispatch が子プロセスを待たずに使う、先取りした答え（#1984）。
+///
+/// #1979 の本番ハングの型（UI スレッドの dispatch が子プロセスを待つ）の残りを塞ぐ。
+/// `prepare_offload` が要るもの（[`ProbeNeeds`]）を決め、background が埋め、UI スレッドの
+/// dispatch は [`with_ui_probes`] の内側で**ここだけを読む**。内側で答えが無ければ待たずに
+/// 「確かめられない」側へ倒れる（読む側の関数 [`caller_pane_by_pid`] / [`agent_preflight`] /
+/// [`tako_binary`] / [`restart_scan`] の doc）。外側（テスト・直呼び）は従来どおりその場で問い合わせる
+#[derive(Default, Clone)]
+pub struct UiProbes {
+    /// 呼び出し元 pid → ペイン（`agents::resolve_pane_by_pid` = 器の `list-panes -a` + 親子表）
+    caller_pane: Option<(u32, Option<u64>)>,
+    /// エージェント CLI の所在（`agent_cli::preflight` = unix はログインシェルの `command -v`）
+    agent_cli: Option<(
+        crate::orchestrator::agent::WorkerAgent,
+        Result<Option<String>, crate::orchestrator::agent_cli::AgentCliError>,
+    )>,
+    /// tako の実行ファイル（`resolve_tako_binary` = 安定版が無ければログインシェル）
+    tako_bin: Option<String>,
+    /// セッション再起動の計画の走査
+    restart_scan: Option<RestartScan>,
+}
+
+/// セッション再起動の計画が使う走査（#1984）
+#[derive(Clone)]
+struct RestartScan {
+    /// 走査した器のセッション名（`None` = 器を持たないペイン）
+    backend: Option<String>,
+    /// 生きたエージェントの会話 ID（`claude agents --json` + 器の pid 祖先辿り）
+    live_session: Option<String>,
+    /// 器の全ペインと親子表（終了させる相手を辿る）
+    snapshot: crate::agents::ProcessSnapshot,
+}
+
+/// background で埋めるもの（#1984）。UI スレッドで集めた材料だけを持つ
+#[derive(Default)]
+pub struct ProbeNeeds {
+    /// 呼び出し元 pid と、tako のペイン → 器のセッション名の対応表
+    caller: Option<(u32, Vec<(u64, String)>)>,
+    agent: Option<crate::orchestrator::agent::WorkerAgent>,
+    tako_bin: bool,
+    /// 走査する器のセッション名（外側の `Some` = 走査が要る）
+    restart: Option<Option<String>>,
+}
+
+impl ProbeNeeds {
+    fn is_empty(&self) -> bool {
+        self.caller.is_none() && self.agent.is_none() && !self.tako_bin && self.restart.is_none()
+    }
+
+    /// 子プロセスを待つ問い合わせの本体。**UI スレッドで呼ばないこと**（`run_staged` から）
+    fn fill(self, probes: &mut UiProbes) {
+        crate::agents::with_shared_scan(|| {
+            if let Some((pid, backends)) = self.caller {
+                probes.caller_pane =
+                    Some((pid, crate::agents::resolve_pane_by_pid(pid, &backends)));
+            }
+            if let Some(agent) = self.agent {
+                probes.agent_cli = Some((agent, crate::orchestrator::agent_cli::preflight(agent)));
+            }
+            if self.tako_bin {
+                probes.tako_bin = Some(resolve_tako_binary());
+            }
+            if let Some(backend) = self.restart {
+                let live_session = backend
+                    .as_deref()
+                    .and_then(crate::agents::resolve_session_id_for_backend);
+                probes.restart_scan = Some(RestartScan {
+                    backend,
+                    live_session,
+                    snapshot: crate::agents::ProcessSnapshot::capture(),
+                });
+            }
+        });
+    }
+}
+
+/// 先取りしてから dispatch する要求（#1984。[`OffloadJob::Probe`]）
+pub struct ProbeJob {
+    request: Request,
+    probes: UiProbes,
+    needs: ProbeNeeds,
+    round: u8,
+}
+
+/// 先取りした答えと、それで dispatch する要求（#1984。[`OffloadContinuation::Probed`]）
+pub struct ProbedRequest {
+    request: Request,
+    probes: UiProbes,
+    round: u8,
+}
+
+thread_local! {
+    /// UI スレッドの dispatch に渡す先取りの答え（[`with_ui_probes`] の内側だけ `Some`）
+    static UI_PROBES: std::cell::RefCell<Option<UiProbes>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `f` の間、同じスレッドの読む側の関数を `probes` の答えだけで済ませる（子プロセスを待たない）。
+/// 入れ子は内側の答えで上書きし、抜けたら外側へ戻す
+fn with_ui_probes<R>(probes: &UiProbes, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<UiProbes>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            UI_PROBES.with(|p| *p.borrow_mut() = prev);
+        }
+    }
+    let prev = UI_PROBES.with(|p| p.borrow_mut().replace(probes.clone()));
+    let _restore = Restore(prev);
+    f()
+}
+
+/// 読む側の関数の分かれ目（#1984）
+enum Probed<T> {
+    /// 先取りの内側ではない（UI スレッドの dispatch ではない = その場で問い合わせてよい）
+    Outside,
+    /// 先取りした答え
+    Answer(T),
+    /// 内側だが答えが無い（[`probe_needs`] と dispatch の食い違い）。**待たない側へ倒す**
+    Missing,
+}
+
+fn probed<T>(pick: impl FnOnce(&UiProbes) -> Option<T>) -> Probed<T> {
+    UI_PROBES.with(|p| match p.borrow().as_ref() {
+        None => Probed::Outside,
+        Some(probes) => pick(probes).map_or(Probed::Missing, Probed::Answer),
+    })
+}
+
+/// 呼び出し元 pid のペイン（#288 の pid 祖先辿り = 器の `list-panes -a` + 親子表）。
+///
+/// 先取りの内側（UI スレッドの dispatch）では background が辿った答えだけを使う（#1984）。
+/// 答えが無ければ「pid では解決できなかった」と同じ扱い（呼び出し元の解決は
+/// pane → stale → role の順へ落ちる = 従来の pid で解けなかったときと同じ道）
+fn caller_pane_by_pid(host: &dyn ControlHost, pid: u32) -> Option<u64> {
+    match probed(|p| {
+        p.caller_pane
+            .filter(|(at, _)| *at == pid)
+            .map(|(_, pane)| pane)
+    }) {
+        Probed::Answer(pane) => pane,
+        Probed::Missing => {
+            crate::diag::flow_log(&format!(
+                "呼び出し元 pid {pid}: 先取りが無いので UI スレッドでは辿らない（#1984）"
+            ));
+            None
+        }
+        Probed::Outside => crate::agents::resolve_pane_by_pid(pid, &collect_pane_backends(host)),
+    }
+}
+
+/// エージェント CLI の所在確認（#983 の preflight。unix はログインシェルの `command -v`）。
+///
+/// 先取りの内側では background が確かめた答えだけを使う（#1984）。答えが無ければ
+/// **ペインを作らずに**断る（確かめないまま起動して無言で死なせない = #983 の約束を保つ）
+fn agent_preflight(
+    agent: crate::orchestrator::agent::WorkerAgent,
+) -> Result<Option<String>, DispatchError> {
+    let found = match probed(|p| {
+        p.agent_cli
+            .as_ref()
+            .filter(|(at, _)| *at == agent)
+            .map(|(_, found)| found.clone())
+    }) {
+        Probed::Answer(found) => found,
+        Probed::Missing => {
+            return Err(DispatchError::Operation(format!(
+                "{} の CLI の所在を確かめられなかった（UI スレッドでは確かめない。\
+                 もう一度呼ぶと確かめ直す）",
+                agent.as_str()
+            )))
+        }
+        Probed::Outside => crate::orchestrator::agent_cli::preflight(agent),
+    };
+    found.map_err(|e| DispatchError::Operation(e.message()))
+}
+
+/// tako の実行ファイル（MCP の一時注入・起動コマンドに埋める）。
+///
+/// 先取りの内側では background が引いた答えだけを使う（#1984）。答えが無ければ
+/// PATH の問い合わせ（unix はログインシェル）を飛ばした解決で済ませる
+fn tako_binary() -> String {
+    match probed(|p| p.tako_bin.clone()) {
+        Probed::Answer(bin) => bin,
+        Probed::Missing => resolve_tako_binary_with(
+            &|p| std::path::Path::new(p).is_file(),
+            &|| None,
+            std::env::current_exe().ok().as_deref(),
+            &tako_cli_file_name(),
+        ),
+        Probed::Outside => resolve_tako_binary(),
+    }
+}
+
+/// セッション再起動の計画の走査（生きた会話 ID・器の全ペインと親子表）。
+///
+/// 先取りの内側では background の走査だけを使う（#1984）。答えが無ければ
+/// 「会話も相手のプロセスも見つからない」材料になる（計画は断る側へ倒れる）
+fn restart_scan(backend: Option<&str>) -> (Option<String>, crate::agents::ProcessSnapshot) {
+    match probed(|p| {
+        p.restart_scan
+            .as_ref()
+            .filter(|s| s.backend.as_deref() == backend)
+            .map(|s| (s.live_session.clone(), s.snapshot.clone()))
+    }) {
+        Probed::Answer(scan) => scan,
+        Probed::Missing => (None, crate::agents::ProcessSnapshot::default()),
+        Probed::Outside => (
+            backend.and_then(crate::agents::resolve_session_id_for_backend),
+            crate::agents::ProcessSnapshot::capture(),
+        ),
+    }
+}
+
+/// 呼び出し元 pid の答えが要るか（要るなら材料の対応表）
+fn caller_need(
+    host: &dyn ControlHost,
+    caller_pid: Option<u32>,
+) -> Option<(u32, Vec<(u64, String)>)> {
+    let pid = caller_pid?;
+    let known = matches!(
+        probed(|p| p.caller_pane.filter(|(at, _)| *at == pid)),
+        Probed::Answer(_)
+    );
+    (!known).then(|| (pid, collect_pane_backends(host)))
+}
+
+fn agent_need(
+    agent: Option<crate::orchestrator::agent::WorkerAgent>,
+) -> Option<crate::orchestrator::agent::WorkerAgent> {
+    let agent = agent?;
+    let known = matches!(
+        probed(|p| p
+            .agent_cli
+            .as_ref()
+            .filter(|(at, _)| *at == agent)
+            .map(|_| ())),
+        Probed::Answer(_)
+    );
+    (!known).then_some(agent)
+}
+
+fn tako_bin_need() -> bool {
+    !matches!(
+        probed(|p| p.tako_bin.as_ref().map(|_| ())),
+        Probed::Answer(_)
+    )
+}
+
+/// セッション再起動の計画（`SessionRestart` / `StaleBinary restart`）の先取り
+fn restart_needs(host: &dyn ControlHost, pane: Option<u64>) -> ProbeNeeds {
+    // ペインが解けなければ dispatch は計画を組む前に断る（先取りは要らない）
+    let Ok((_, pane_id)) = resolve_pane(host.workspace(), pane) else {
+        return ProbeNeeds::default();
+    };
+    let backend = host.backend_session(pane_id);
+    let known = matches!(
+        probed(|p| p
+            .restart_scan
+            .as_ref()
+            .filter(|s| s.backend == backend)
+            .map(|_| ())),
+        Probed::Answer(_)
+    );
+    ProbeNeeds {
+        restart: (!known).then_some(backend),
+        tako_bin: tako_bin_need(),
+        ..ProbeNeeds::default()
+    }
+}
+
+/// この要求を UI スレッドで dispatch する前に、background で先取りする答え（#1984）。
+///
+/// `None` = 先取りの対象外の要求（従来どおり同期で dispatch）。**読む側の関数を呼ぶ dispatch の
+/// 経路と同じ解決を通す**（spawn は [`spawn_caller_profile`]、handoff は [`resolve_handoff_target`]）。
+/// [`with_ui_probes`] の内側で呼ぶこと（判断の途中で子プロセスを待たない）。
+/// 多めに先取りするのは構わない（background の仕事が増えるだけ）が、少なすぎると
+/// 読む側が「確かめられない」へ倒れるので、dispatch が読む答えはすべてここで挙げる
+fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> {
+    match request {
+        Request::OrchestratorSelf { caller_pid, .. }
+        | Request::OrchestratorAdopt { caller_pid, .. }
+        | Request::OrchestratorGuide {
+            profile: None,
+            caller_pid,
+            ..
+        } => Some(ProbeNeeds {
+            caller: caller_need(host, *caller_pid),
+            ..ProbeNeeds::default()
+        }),
+        Request::OrchestratorSpawn {
+            pane,
+            tab,
+            caller_role,
+            agent,
+            caller_pid,
+            ..
+        } => {
+            // pane も tab も無い要求は CLI の所在確認より前に断られる
+            if pane.is_none() && tab.is_none() {
+                return Some(ProbeNeeds::default());
+            }
+            let (_, profile) = spawn_caller_profile(host, *pane, caller_role.as_deref());
+            Some(ProbeNeeds {
+                caller: caller_need(host, *caller_pid),
+                agent: agent_need(profile.resolve_worker_agent(agent.as_deref()).ok()),
+                tako_bin: tako_bin_need(),
+                restart: None,
+            })
+        }
+        Request::OrchestratorHandoff {
+            pane,
+            caller_role,
+            tab,
+            caller_pid,
+            ..
+        } => {
+            let caller = caller_need(host, *caller_pid);
+            // 後任の agent は呼び出し元が決まってから決まる（pid の答えが要るなら次の巡）
+            let master_agent = if caller.is_none() {
+                resolve_handoff_target(host, *pane, caller_role.as_deref(), *tab, *caller_pid)
+                    .ok()
+                    .and_then(|t| {
+                        crate::orchestrator::Profile::load(&t.profile_name)
+                            .unwrap_or_default()
+                            .resolve_master_agent()
+                            .ok()
+                    })
+            } else {
+                None
+            };
+            Some(ProbeNeeds {
+                caller,
+                agent: agent_need(master_agent),
+                tako_bin: tako_bin_need(),
+                restart: None,
+            })
+        }
+        Request::SessionRestart { pane, .. } => Some(restart_needs(host, *pane)),
+        Request::StaleBinary { action, pane } if action.as_deref() == Some("restart") => {
+            Some(restart_needs(host, *pane))
+        }
+        _ => None,
+    }
+}
+
+/// 着地の結末（#1984）
+pub enum OffloadLanding {
+    /// 応答する
+    Done(Result<Value, DispatchError>),
+    /// 先取りの答えがまだ足りない（handoff の後任の agent は呼び出し元が決まってから決まる）。
+    /// 受け口はこのジョブを background で走らせ、もう一度着地させる
+    Again(Box<OffloadJob>),
+}
+
+/// background の結果を受けて UI スレッドで続きを行う（#1984 で [`finish_offload`] に
+/// 「もう一巡」を足した口）。IPC の受け口と GUI のボタンが通る
+pub fn land_offload(
+    host: &mut dyn ControlHost,
+    continuation: OffloadContinuation,
+    origin: PaneOrigin,
+) -> OffloadLanding {
+    match continuation {
+        OffloadContinuation::Probed(probed) if probed.round < MAX_PROBE_ROUNDS => {
+            let needs = with_ui_probes(&probed.probes, || probe_needs(host, &probed.request))
+                .unwrap_or_default();
+            if needs.is_empty() {
+                return OffloadLanding::Done(finish_offload(
+                    host,
+                    OffloadContinuation::Probed(probed),
+                    origin,
+                ));
+            }
+            let ProbedRequest {
+                request,
+                probes,
+                round,
+            } = *probed;
+            OffloadLanding::Again(Box::new(OffloadJob::Probe(Box::new(ProbeJob {
+                request,
+                probes,
+                needs,
+                round: round + 1,
+            }))))
+        }
+        other => OffloadLanding::Done(finish_offload(host, other, origin)),
+    }
+}
+
+/// スマホの一覧（`RemoteAgents`）の応答（同期の腕と #1984 の background の 1 実装）。
+/// ControlHost 不要（エージェント一覧と会話ログはどのプロセスでも取得できる）
+fn remote_agents_reply() -> Result<Value, DispatchError> {
+    let mut result =
+        crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)?;
+    // #1069: 公式リンクは HTTP の /api/agents と同じ 1 実装で付ける
+    // （AI が見る値とスマホの一覧が食い違わない = 開発不変条件）
+    crate::claude_remote_link::attach_to_agents(&mut result);
+    Ok(result)
 }
 
 /// worker_status / report のクエリ正規化結果（#390）
@@ -3588,95 +4072,11 @@ fn dispatch_inner(
             Ok(Value::Null)
         }
 
-        Request::TmuxList { socket } => {
-            // tako ペインとの対応付け: attach クライアントの tty とペインの tty を
-            // 突き合わせる（FR-2.13.2。一致しないクライアントは tako 外 = 外部ターミナル由来。
-            // tmux バックエンドのペインは tty がバックエンド側ペイン tty に差し替わっており、
-            // その中でユーザーが開いたネスト tmux のクライアントもこの突き合わせで対応付く）
-            let ws = host.workspace();
-            let pane_of_tty: Vec<(String, u64, u64)> = ws
-                .tabs()
-                .iter()
-                .flat_map(|tab| {
-                    tab.tree().panes().into_iter().filter_map(|p| {
-                        let tty = host.session(p.id())?.tty_name()?;
-                        Some((tty.to_string(), p.id().as_u64(), tab.id().as_u64()))
-                    })
-                })
-                .collect();
-            // tako 自身のバックエンドセッション（Phase 5.5）の対応表: セッション名 → ペイン
-            let backend_of: Vec<(String, u64, u64)> = ws
-                .tabs()
-                .iter()
-                .flat_map(|tab| {
-                    tab.tree().panes().into_iter().filter_map(|p| {
-                        let name = host.backend_session(p.id())?;
-                        Some((name, p.id().as_u64(), tab.id().as_u64()))
-                    })
-                })
-                .collect();
-            let session_json = |s: &tako_core::TmuxSession, backend: bool, socket: &Value| {
-                let clients: Vec<Value> = s
-                    .client_ttys
-                    .iter()
-                    .map(|tty| {
-                        let hit = pane_of_tty.iter().find(|(t, _, _)| t == tty);
-                        json!({
-                            "tty": tty,
-                            // tako のどのペインで表示中か（null = tako 外のターミナル）
-                            "pane": hit.map(|(_, pane, _)| *pane),
-                            "tab": hit.map(|(_, _, tab)| *tab),
-                        })
-                    })
-                    .collect();
-                let owner = backend_of.iter().find(|(name, _, _)| *name == s.name);
-                json!({
-                    "name": s.name,
-                    "created": s.created,
-                    "attached": s.attached,
-                    // tako のバックエンド永続化セッションか（FR-5。kill すると
-                    // 対応ペインの中身が消えるため、UI / AI は区別して扱うこと）
-                    "backend": backend,
-                    "socket": socket,
-                    // backend セッションを保持している tako ペイン（orphan なら null）
-                    "backend_pane": owner.map(|(_, pane, _)| *pane),
-                    "backend_tab": owner.map(|(_, _, tab)| *tab),
-                    "pane_pid": s.pane_pid,
-                    "pane_command": s.pane_command,
-                    "pane_current_path": s.pane_current_path,
-                    "last_activity": s.last_activity,
-                    "windows": s.windows.iter().map(|w| json!({
-                        "index": w.index,
-                        "name": w.name,
-                        "active": w.active,
-                        "panes": w.panes,
-                    })).collect::<Vec<_>>(),
-                    "clients": clients,
-                })
-            };
-            let backend_socket = tako_core::tmux_backend::socket_name();
-            let explicit_backend = socket.as_deref() == Some(backend_socket.as_str());
-            let mut sessions: Vec<Value> = tako_core::tmux::list_sessions(socket.as_deref())
-                .iter()
-                .map(|s| {
-                    session_json(
-                        s,
-                        explicit_backend,
-                        &socket.as_deref().map(Into::into).unwrap_or(Value::Null),
-                    )
-                })
-                .collect();
-            // 既定サーバーの一覧には tako バックエンドのセッションも併記する
-            // （消し忘れの発見が FR-2.13 の目的。バックエンドの orphan も見えるべき）
-            if socket.is_none() {
-                sessions.extend(
-                    tako_core::tmux::list_sessions(Some(&backend_socket))
-                        .iter()
-                        .map(|s| session_json(s, true, &backend_socket.clone().into())),
-                );
-            }
-            Ok(json!({ "sessions": sessions }))
-        }
+        // IPC / MCP 経由は prepare_offload が background へ出す（#1984。UI スレッドでは
+        // 対応表の収集だけ）。ここはテスト・直呼びの同期の腕で、組み立ては同じ 1 実装
+        Request::TmuxList { socket } => Ok(json!({
+            "sessions": fetch_tmux_sessions(&collect_tmux_context(host), socket.as_deref()),
+        })),
 
         Request::TmuxKill {
             socket,
@@ -6096,15 +6496,9 @@ fn dispatch_inner(
         }
         Request::RemoteStatus => Ok(host.remote_status()),
 
-        // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）
-        Request::RemoteAgents => {
-            let mut result =
-                crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)?;
-            // #1069: 公式リンクは HTTP の /api/agents と同じ 1 実装で付ける
-            // （AI が見る値とスマホの一覧が食い違わない = 開発不変条件）
-            crate::claude_remote_link::attach_to_agents(&mut result);
-            Ok(result)
-        }
+        // エージェント一覧と会話ログはどのプロセスでも取得できる（ControlHost 不要）。
+        // IPC / MCP 経由は prepare_offload が background へ出す（#1984）
+        Request::RemoteAgents => remote_agents_reply(),
 
         Request::RemoteMessages { session_id, tail } => {
             crate::transcript::read_messages(&session_id, tail.unwrap_or(30))
@@ -11487,13 +11881,13 @@ fn resolve_caller_pane(
     caller_role: Option<&str>,
     caller_pid: Option<u32>,
 ) -> Result<(TabId, PaneId), DispatchError> {
-    if let Some(pid) = caller_pid {
-        let pane_backends = collect_pane_backends(host);
-        if let Some(resolved_pane) = crate::agents::resolve_pane_by_pid(pid, &pane_backends) {
-            if let Ok(resolved) = resolve_pane(host.workspace(), Some(resolved_pane)) {
-                return Ok(resolved);
-            }
-        }
+    // #1984: pid 祖先辿り（器の `list-panes -a` + 親子表）は UI スレッドの dispatch では
+    // background が先取りした答えを読む（`caller_pane_by_pid`）
+    if let Some(resolved) = caller_pid
+        .and_then(|pid| caller_pane_by_pid(host, pid))
+        .and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())
+    {
+        return Ok(resolved);
     }
     if let Some(resolved) = pane.and_then(|p| resolve_pane(host.workspace(), Some(p)).ok()) {
         return Ok(resolved);
@@ -11972,26 +12366,26 @@ fn handoff_cwd_legacy() -> bool {
     std::env::var_os("TAKO_1055_LEGACY").is_some()
 }
 
-/// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
-/// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
-/// handoff 内容を含むプロンプトを注入する。
+/// 引き継ぎの分割元・退役する master・後任のプロファイル（#1984 で切り出し）。
 ///
-/// #749: 旧 master のペインは **新 master が引き継ぎを確認したあとに新 master 自身が
-/// 閉じる**（初期プロンプトにその手順を埋め込む）。ここで旧ペインを閉じないのは、
-/// 新 master の起動が失敗したときに旧 master を失わないため（順序が安全側に倒れる）。
-/// spawn には既存の OrchestratorSpawn（project 経由）を使わず、直接 Split + attach
-/// を行う（handoff は「プロジェクト」ではないため projects.yaml に依存しない）
-fn dispatch_orchestrator_handoff(
-    host: &mut dyn ControlHost,
-    origin: PaneOrigin,
+/// dispatch と、background で先取りする答えを決める [`probe_needs`]（後任の agent の
+/// CLI の所在確認）が**同じ解決を通る**ためにある
+struct HandoffTarget {
+    caller: Option<(TabId, PaneId)>,
+    tab_id: TabId,
+    split_target: PaneId,
+    previous_pane: Option<PaneId>,
+    profile_name: String,
+    profile_source: tako_core::handoff::ProfileSource,
+}
+
+fn resolve_handoff_target(
+    host: &dyn ControlHost,
     pane: Option<u64>,
     caller_role: Option<&str>,
     tab: Option<u64>,
     caller_pid: Option<u32>,
-    projects: Option<Vec<String>>,
-) -> Result<Value, DispatchError> {
-    use crate::orchestrator;
-
+) -> Result<HandoffTarget, DispatchError> {
     // #288: 分割元ペインの解決。`tab` 指定時はそのタブのフォーカスペインを分割元にする
     // ので、呼び出し元（= 退役する master）とは別物になりうる
     let caller = resolve_caller_pane(host, pane, caller_role, caller_pid).ok();
@@ -12028,8 +12422,46 @@ fn dispatch_orchestrator_handoff(
             .and_then(|pane| pane.role())
             .map(str::to_string)
     });
-    let (profile_owned, profile_source) =
+    let (profile_name, profile_source) =
         tako_core::handoff::resolve_master_profile(caller_role, pane_role.as_deref());
+    Ok(HandoffTarget {
+        caller,
+        tab_id,
+        split_target,
+        previous_pane,
+        profile_name,
+        profile_source,
+    })
+}
+
+/// OrchestratorHandoff — master の引き継ぎ（#193 / #749）。
+/// handoff ファイルを読み、同プロファイルの新 master を同タブに spawn し、
+/// handoff 内容を含むプロンプトを注入する。
+///
+/// #749: 旧 master のペインは **新 master が引き継ぎを確認したあとに新 master 自身が
+/// 閉じる**（初期プロンプトにその手順を埋め込む）。ここで旧ペインを閉じないのは、
+/// 新 master の起動が失敗したときに旧 master を失わないため（順序が安全側に倒れる）。
+/// spawn には既存の OrchestratorSpawn（project 経由）を使わず、直接 Split + attach
+/// を行う（handoff は「プロジェクト」ではないため projects.yaml に依存しない）
+fn dispatch_orchestrator_handoff(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+    tab: Option<u64>,
+    caller_pid: Option<u32>,
+    projects: Option<Vec<String>>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+
+    let HandoffTarget {
+        caller,
+        tab_id,
+        split_target,
+        previous_pane,
+        profile_name: profile_owned,
+        profile_source,
+    } = resolve_handoff_target(host, pane, caller_role, tab, caller_pid)?;
     let profile_name = profile_owned.as_str();
 
     // #1055: 前任 master が実際に居るフォルダ。`pane_role` と同じ「前任 or 呼び出し元」から
@@ -12085,8 +12517,8 @@ fn dispatch_orchestrator_handoff(
         .map_err(DispatchError::InvalidParams)?;
     // #983: 後任 master の CLI が無ければ**ペインを分割する前に**落とす
     // （引き継ぎで後任が黙って死ぬと、前任を閉じる主体そのものが居なくなる）
-    orchestrator::agent_cli::preflight(master_agent)
-        .map_err(|e| DispatchError::Operation(e.message()))?;
+    // #1984: 所在の確認は UI スレッドの dispatch では先取りした答えを読む
+    agent_preflight(master_agent)?;
 
     // #761: role には語彙が 2 つある。ペインに貼る表示用ラベルと、起動コマンドが注入する
     // `TAKO_ORCHESTRATOR_ROLE`（`master:<profile>`）。以前は表示用を env にも入れていたため、
@@ -12107,7 +12539,7 @@ fn dispatch_orchestrator_handoff(
     }
     std::fs::write(&prompt_path, &prompt_content)
         .map_err(|e| op_err(format!("system prompt の書き出しに失敗: {e}")))?;
-    let tako_bin = resolve_tako_binary();
+    let tako_bin = tako_binary();
     // ペインを分割する**前**に組み立てる（失敗したときに空ペインだけ残さない）
     let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)
         .map_err(DispatchError::Operation)?;
@@ -12717,17 +13149,11 @@ fn dispatch_orchestrator_spawn(
         .resolve_cwd(project)
         .map_err(DispatchError::Operation)?;
 
-    // caller_role から master suffix を抽出する（#109: pane が stale でも正しい master を特定）
-    let role_suffix = caller_role
-        .and_then(|r| r.strip_prefix("master:"))
-        .map(str::to_string);
-
     // エージェント種別と model / effort を解決する（#120）。明示指定 → プロファイル。
     // agent=claude は従来の worker_model_policy 解決を維持し、model が None に解決された
     // 場合は --model を付けず CLI の既定に委ねる（Issue #27）。
     // 検証はペイン分割の**前**に行う（不正 agent でペインだけ生える事故を防ぐ）
-    let caller_pane = pane.map(PaneId::from_raw);
-    let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &role_suffix);
+    let (role_suffix, profile) = spawn_caller_profile(host, pane, caller_role);
 
     // Part 2: projects 制限の強制（Issue #500）。プロファイルに projects が設定されている場合、
     // 範囲外のプロジェクトへの spawn を拒否する
@@ -12763,8 +13189,9 @@ fn dispatch_orchestrator_spawn(
     // #983: agent CLI の実在検査。**ペイン分割・レジストリ登録より前**に落とすので、
     // 失敗しても空ペインも active エントリも残らない（不正 agent の検証と同じ位置）。
     // 無ければ「理由 + 次の一手」を返す（無言死を作らない）
-    let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)
-        .map_err(|e| DispatchError::Operation(e.message()))?;
+    // #1984: 所在の確認（unix はログインシェル）は UI スレッドの dispatch では background が
+    // 先取りした答えを読む
+    let agent_cli_path = agent_preflight(worker_agent)?;
     // アカウントの default_model / default_effort をフォールバックに使う（#504）。
     // **claude 語彙なので明示指定と同じ段に混ぜない**（#1013: 混ぜていたため
     // `codex --model claude-opus-5` が組み立てられていた）。継承の可否は
@@ -12789,20 +13216,14 @@ fn dispatch_orchestrator_spawn(
         None => format!("{project}-worker"),
     };
 
-    // #288: 分割元ペインの解決。pid 祖先辿り → pane → stale → tab → role（複数時エラー）
-    let (tab_id, target) = if let Some(pid) = caller_pid {
-        let pane_backends = collect_pane_backends(host);
-        if let Some(rp) = crate::agents::resolve_pane_by_pid(pid, &pane_backends) {
-            if let Ok(resolved) = resolve_pane(host.workspace(), Some(rp)) {
-                resolved
-            } else {
-                resolve_spawn_pane_fallback(host, pane, tab, caller_role, &role_suffix)?
-            }
-        } else {
-            resolve_spawn_pane_fallback(host, pane, tab, caller_role, &role_suffix)?
-        }
-    } else {
-        resolve_spawn_pane_fallback(host, pane, tab, caller_role, &role_suffix)?
+    // #288: 分割元ペインの解決。pid 祖先辿り → pane → stale → tab → role（複数時エラー）。
+    // pid 祖先辿りは UI スレッドの dispatch では先取りした答えを読む（#1984）
+    let (tab_id, target) = match caller_pid
+        .and_then(|pid| caller_pane_by_pid(host, pid))
+        .and_then(|rp| resolve_pane(host.workspace(), Some(rp)).ok())
+    {
+        Some(resolved) => resolved,
+        None => resolve_spawn_pane_fallback(host, pane, tab, caller_role, &role_suffix)?,
     };
     let new_pane = Pane::new(origin);
     let new_id = new_pane.id();
@@ -12853,7 +13274,7 @@ fn dispatch_orchestrator_spawn(
     };
     // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）。
     // master と同じ 1 実装（`agent::codex_mcp_args`）なので、worker だけ古い形になることが無い
-    let tako_bin = resolve_tako_binary();
+    let tako_bin = tako_binary();
     let worker_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: &role_value,
@@ -17503,10 +17924,44 @@ pub struct TmuxContext {
     pub backend_of: Vec<(String, u64, u64)>,
 }
 
-/// tmux セッション一覧を取得して JSON 配列を返す。
-/// tmux コマンド実行（重い）を含むため、**background thread で呼ぶこと**。
-/// dispatch の TmuxList と同じ JSON 構造を返す
-pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
+/// `TmuxList` の対応表を集める（メモリ操作だけ = UI スレッドで呼んでよい。#1984）
+pub fn collect_tmux_context(host: &dyn ControlHost) -> TmuxContext {
+    // tako ペインとの対応付け: attach クライアントの tty とペインの tty を
+    // 突き合わせる（FR-2.13.2。一致しないクライアントは tako 外 = 外部ターミナル由来。
+    // tmux バックエンドのペインは tty がバックエンド側ペイン tty に差し替わっており、
+    // その中でユーザーが開いたネスト tmux のクライアントもこの突き合わせで対応付く）
+    let ws = host.workspace();
+    let pane_of_tty: Vec<(String, u64, u64)> = ws
+        .tabs()
+        .iter()
+        .flat_map(|tab| {
+            tab.tree().panes().into_iter().filter_map(|p| {
+                let tty = host.session(p.id())?.tty_name()?;
+                Some((tty.to_string(), p.id().as_u64(), tab.id().as_u64()))
+            })
+        })
+        .collect();
+    // tako 自身のバックエンドセッション（Phase 5.5）の対応表: セッション名 → ペイン
+    let backend_of: Vec<(String, u64, u64)> = ws
+        .tabs()
+        .iter()
+        .flat_map(|tab| {
+            tab.tree().panes().into_iter().filter_map(|p| {
+                let name = host.backend_session(p.id())?;
+                Some((name, p.id().as_u64(), tab.id().as_u64()))
+            })
+        })
+        .collect();
+    TmuxContext {
+        pane_of_tty,
+        backend_of,
+    }
+}
+
+/// tmux セッション一覧を取得して JSON 配列を返す（`TmuxList` の応答・右パネルの一覧の 1 実装）。
+/// tmux コマンド実行（ソケットごとに数本。1 本の上限 5 秒）を含むため、**background thread で
+/// 呼ぶこと**（#1984）。`socket` 省略 = 既定サーバー + tako のバックエンド
+pub fn fetch_tmux_sessions(ctx: &TmuxContext, socket: Option<&str>) -> Vec<Value> {
     let session_json = |s: &tako_core::TmuxSession, backend: bool, socket: &Value| {
         let clients: Vec<Value> = s
             .client_ttys
@@ -17515,6 +17970,7 @@ pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
                 let hit = ctx.pane_of_tty.iter().find(|(t, _, _)| t == tty);
                 json!({
                     "tty": tty,
+                    // tako のどのペインで表示中か（null = tako 外のターミナル）
                     "pane": hit.map(|(_, pane, _)| *pane),
                     "tab": hit.map(|(_, _, tab)| *tab),
                 })
@@ -17525,8 +17981,11 @@ pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
             "name": s.name,
             "created": s.created,
             "attached": s.attached,
+            // tako のバックエンド永続化セッションか（FR-5。kill すると
+            // 対応ペインの中身が消えるため、UI / AI は区別して扱うこと）
             "backend": backend,
             "socket": socket,
+            // backend セッションを保持している tako ペイン（orphan なら null）
             "backend_pane": owner.map(|(_, pane, _)| *pane),
             "backend_tab": owner.map(|(_, _, tab)| *tab),
             "pane_pid": s.pane_pid,
@@ -17543,15 +18002,21 @@ pub fn fetch_tmux_sessions(ctx: &TmuxContext) -> Vec<Value> {
         })
     };
     let backend_socket = tako_core::tmux_backend::socket_name();
-    let mut sessions: Vec<Value> = tako_core::tmux::list_sessions(None)
+    let explicit_backend = socket == Some(backend_socket.as_str());
+    let socket_value = socket.map(Into::into).unwrap_or(Value::Null);
+    let mut sessions: Vec<Value> = tako_core::tmux::list_sessions(socket)
         .iter()
-        .map(|s| session_json(s, false, &Value::Null))
+        .map(|s| session_json(s, explicit_backend, &socket_value))
         .collect();
-    sessions.extend(
-        tako_core::tmux::list_sessions(Some(&backend_socket))
-            .iter()
-            .map(|s| session_json(s, true, &backend_socket.clone().into())),
-    );
+    // 既定サーバーの一覧には tako バックエンドのセッションも併記する
+    // （消し忘れの発見が FR-2.13 の目的。バックエンドの orphan も見えるべき）
+    if socket.is_none() {
+        sessions.extend(
+            tako_core::tmux::list_sessions(Some(&backend_socket))
+                .iter()
+                .map(|s| session_json(s, true, &backend_socket.clone().into())),
+        );
+    }
     sessions
 }
 
@@ -18094,6 +18559,27 @@ fn log_user_task_delivery(id: &str, outcome: &str, class: &str) {
 /// 見つからなければ default プロファイルにフォールバック。
 /// 呼び出し元 master のプロファイル解決。pane が stale でも role_suffix（TAKO_ORCHESTRATOR_ROLE
 /// 由来）があれば正しいプロファイルを読む（#109）
+/// spawn の呼び出し元 master の suffix とプロファイル（#1984 で切り出し）。
+///
+/// dispatch と、background で先取りする答えを決める [`probe_needs`]（worker の agent の
+/// CLI の所在確認）が**同じ解決を通る**ためにある
+fn spawn_caller_profile(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+) -> (Option<String>, crate::orchestrator::Profile) {
+    // caller_role から master suffix を抽出する（#109: pane が stale でも正しい master を特定）
+    let role_suffix = caller_role
+        .and_then(|r| r.strip_prefix("master:"))
+        .map(str::to_string);
+    let profile = resolve_caller_profile_with_role(
+        host.workspace(),
+        pane.map(PaneId::from_raw),
+        &role_suffix,
+    );
+    (role_suffix, profile)
+}
+
 fn resolve_caller_profile_with_role(
     workspace: &tako_core::Workspace,
     caller: Option<PaneId>,
@@ -18950,9 +19436,10 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
     // 生きた側を優先するのは、同一ペイン番号に世代が堆積する（#466 の実測）ため
     let backend = host.backend_session(pane_id);
     let catalog = crate::sessions::SessionCatalog::load().ok();
-    let (session_id, session_source) = backend
-        .as_deref()
-        .and_then(crate::agents::resolve_session_id_for_backend)
+    // #1984: 生きた会話 ID（`claude agents --json` + 器の pid 祖先辿り）と親子表は、
+    // UI スレッドの dispatch では background が先取りした走査を読む
+    let (live_session, snapshot) = restart_scan(backend.as_deref());
+    let (session_id, session_source) = live_session
         .map(|id| (Some(id), Some("agents-live")))
         .unwrap_or_else(|| {
             let from_catalog = catalog.as_ref().and_then(|c| {
@@ -19008,7 +19495,7 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
             &entry,
             &hints,
             location.as_ref(),
-            &resolve_tako_binary(),
+            &tako_binary(),
             crate::launch_cmd::launch_dialect(),
             tako_core::session_restart::legacy_1967(),
         ) {
@@ -19019,7 +19506,6 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
     };
 
     // 終了させる相手。器があればそのセッション配下、無ければ PTY 直下から辿る（#728 と同じ二段）
-    let snapshot = crate::agents::ProcessSnapshot::capture();
     let pids = match backend.as_deref() {
         Some(b) => snapshot.descendant_pids(b),
         None => host
@@ -38709,6 +39195,227 @@ mod tests {
         // 器のペインが無ければジョブにしない（同期の腕で組む = 子プロセスを起こさない）
         host.backend_sessions.clear();
         assert!(prepare_offload(&mut host, &Request::List).is_none());
+    }
+
+    /// #1984: UI スレッドの同期の dispatch で子プロセスを待っていた要求だけが background へ出る。
+    /// 先取りが要らない形（pid の無い self・解けないペインの再起動）は同期の腕のまま
+    #[test]
+    fn issue1984_子プロセスを待つ要求だけがbackgroundへ出る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let probe = |host: &mut MockHost, req: &Request| match prepare_offload(host, req) {
+            Some(Ok(OffloadJob::Probe(job))) => Some(job),
+            _ => None,
+        };
+        assert!(matches!(
+            prepare_offload(&mut host, &Request::RemoteAgents),
+            Some(Ok(OffloadJob::RemoteAgents))
+        ));
+        assert!(matches!(
+            prepare_offload(&mut host, &Request::TmuxList { socket: None }),
+            Some(Ok(OffloadJob::TmuxList { socket: None, .. }))
+        ));
+
+        // 呼び出し元の pid が載っていれば先取り（pid 祖先辿り = 器の list-panes + 親子表）
+        let job = probe(
+            &mut host,
+            &Request::OrchestratorSelf {
+                pane: None,
+                caller_role: None,
+                caller_pid: Some(4_242_424),
+            },
+        )
+        .expect("pid つきの self は先取りする");
+        assert_eq!(
+            job.needs.caller.as_ref().map(|(pid, _)| *pid),
+            Some(4_242_424)
+        );
+        assert!(job.needs.agent.is_none() && !job.needs.tako_bin);
+        // pid が無ければ子プロセスを待たないので同期の腕
+        assert!(prepare_offload(
+            &mut host,
+            &Request::OrchestratorSelf {
+                pane: Some(pane),
+                caller_role: None,
+                caller_pid: None,
+            }
+        )
+        .is_none());
+        // プロファイルを名指しした guide は呼び出し元を解かない
+        assert!(prepare_offload(
+            &mut host,
+            &Request::OrchestratorGuide {
+                topic: None,
+                profile: Some("default".into()),
+                caller_role: None,
+                pane: None,
+                caller_pid: Some(4_242_424),
+            }
+        )
+        .is_none());
+
+        // セッション再起動の計画は器の走査と tako の実行ファイルを先取りする（下見も実行も）
+        for mode in [None, Some("harness".to_string())] {
+            let job = probe(
+                &mut host,
+                &Request::SessionRestart {
+                    pane: Some(pane),
+                    mode,
+                },
+            )
+            .expect("再起動の計画は先取りする");
+            assert!(job.needs.restart.is_some() && job.needs.tako_bin);
+        }
+        assert!(probe(
+            &mut host,
+            &Request::StaleBinary {
+                action: Some("restart".into()),
+                pane: Some(pane),
+            }
+        )
+        .is_some());
+        // 解けないペインは計画を組む前に断られるので同期の腕（同じエラーを返す）
+        let gone = Request::SessionRestart {
+            pane: Some(999_999),
+            mode: None,
+        };
+        assert!(prepare_offload(&mut host, &gone).is_none());
+        assert_eq!(
+            dispatch(&mut host, gone, PaneOrigin::Cli).unwrap_err(),
+            DispatchError::PaneNotFound(999_999)
+        );
+        // 子プロセスに触れない要求は対象外
+        assert!(prepare_offload(&mut host, &Request::WindowList).is_none());
+    }
+
+    /// #1984: 先取りの内側（UI スレッドの dispatch）では読む側の関数は答えだけを読み、
+    /// 答えが無ければ待たない側へ倒れる
+    #[test]
+    fn issue1984_先取りの内側は答えだけを読む() {
+        use crate::orchestrator::agent::WorkerAgent;
+        let host = MockHost::new();
+        let answers = UiProbes {
+            // 実在しない pid → 実際に辿れば解けないペインが答えに入っている = 辿っていない
+            caller_pane: Some((4_242_424, Some(7))),
+            agent_cli: Some((WorkerAgent::Claude, Ok(Some("/stub/claude".into())))),
+            tako_bin: Some("/stub/tako".into()),
+            restart_scan: Some(RestartScan {
+                backend: Some("tako-1984".into()),
+                live_session: Some("sess-1984".into()),
+                snapshot: crate::agents::ProcessSnapshot::default(),
+            }),
+        };
+        with_ui_probes(&answers, || {
+            assert_eq!(caller_pane_by_pid(&host, 4_242_424), Some(7));
+            assert_eq!(
+                agent_preflight(WorkerAgent::Claude).unwrap(),
+                Some("/stub/claude".into())
+            );
+            assert_eq!(tako_binary(), "/stub/tako");
+            assert_eq!(
+                restart_scan(Some("tako-1984")).0.as_deref(),
+                Some("sess-1984")
+            );
+            // 違う鍵の答えは使わない（別の pid・別の agent・別の器）
+            assert_eq!(caller_pane_by_pid(&host, 1), None);
+            assert!(agent_preflight(WorkerAgent::Codex)
+                .unwrap_err()
+                .to_string()
+                .contains("確かめられなかった"));
+            assert_eq!(restart_scan(Some("other")).0, None);
+        });
+        // 答えが空の内側: どれも子プロセスを起こさず、待たない側の値を返す
+        with_ui_probes(&UiProbes::default(), || {
+            assert_eq!(caller_pane_by_pid(&host, 4_242_424), None);
+            assert!(agent_preflight(WorkerAgent::Claude).is_err());
+            assert!(!tako_binary().is_empty());
+            let (live, snapshot) = restart_scan(None);
+            assert!(live.is_none() && snapshot.argv(1).is_none());
+        });
+        // 抜けたら外側へ戻る（スレッドに答えを残さない）
+        assert!(matches!(probed(|p| p.tako_bin.clone()), Probed::Outside));
+    }
+
+    /// #1984: handoff は「呼び出し元が決まる → 後任の agent が決まる」の 2 段なので、
+    /// 着地が答えの不足を見たらもう一巡 background へ出し、揃ってから同じ dispatch を走らせる
+    #[test]
+    fn issue1984_handoffは呼び出し元が決まってから後任のagentを先取りする() {
+        let profile = "_tako_1984_ho_";
+        with_handoff_file(
+            profile,
+            "## 知識（マシン非依存）\n方針: 継続",
+            || {
+                let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));
+                let pid = 4_242_424;
+                let req = Request::OrchestratorHandoff {
+                    pane: None,
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: None,
+                    caller_pid: Some(pid),
+                    projects: None,
+                };
+                // 1 巡目: 呼び出し元と tako の実行ファイル。後任の agent はまだ決まらない
+                let Some(Ok(OffloadJob::Probe(job))) = prepare_offload(&mut host, &req) else {
+                    panic!("pid つきの handoff は先取りする");
+                };
+                assert!(job.needs.caller.is_some() && job.needs.tako_bin);
+                assert!(
+                    job.needs.agent.is_none(),
+                    "呼び出し元が決まる前に agent を決めない"
+                );
+
+                // background の答え（本物は `ProbeNeeds::fill`）: pid は master のペインに解けた
+                let mut probes = UiProbes {
+                    caller_pane: Some((pid, Some(pane))),
+                    tako_bin: Some("/stub/tako".into()),
+                    ..UiProbes::default()
+                };
+                let landed = land_offload(
+                    &mut host,
+                    OffloadContinuation::Probed(Box::new(ProbedRequest {
+                        request: req.clone(),
+                        probes: probes.clone(),
+                        round: 1,
+                    })),
+                    PaneOrigin::Mcp,
+                );
+                let OffloadLanding::Again(job) = landed else {
+                    panic!("後任の agent の所在確認が足りないのに着地した");
+                };
+                let OffloadJob::Probe(job) = *job else {
+                    panic!("もう一巡は先取りのジョブ");
+                };
+                assert_eq!(job.round, 2);
+                let agent = job.needs.agent.expect("2 巡目は後任の agent の所在確認");
+                assert!(job.needs.caller.is_none() && !job.needs.tako_bin);
+                assert_eq!(
+                    host.workspace().tabs()[0].tree().panes().len(),
+                    1,
+                    "足りないあいだはペインを作らない"
+                );
+
+                // 2 巡目の答えで揃う → 同じ dispatch が走り、後任が立つ
+                probes.agent_cli = Some((agent, Ok(Some("/stub/agent".into()))));
+                let OffloadLanding::Done(result) = land_offload(
+                    &mut host,
+                    OffloadContinuation::Probed(Box::new(ProbedRequest {
+                        request: req,
+                        probes,
+                        round: 2,
+                    })),
+                    PaneOrigin::Mcp,
+                ) else {
+                    panic!("答えが揃ったのにもう一巡へ出た");
+                };
+                let result = result.expect("handoff は成功する");
+                assert_eq!(
+                    result["previous_master_pane_id"].as_u64(),
+                    Some(pane),
+                    "pid の答え（master のペイン）が退役する前任として使われる: {result}"
+                );
+                assert!(result["new_master_pane_id"].as_u64().is_some());
+            },
+        );
     }
 
     /// #1191: `tako list` の `backend_windows` は**要求時点の実態**を返す。

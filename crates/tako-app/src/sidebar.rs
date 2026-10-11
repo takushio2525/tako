@@ -1671,8 +1671,8 @@ impl TakoApp {
                                     // 右パネルの git ビューを開く（diff への導線）
                                     this.panel_visible = true;
                                     this.panel_view = PanelView::Git;
-                                    this.refresh_tmux_data();
-                                    cx.notify();
+                                    // tmux の問い合わせは background で待つ（#1984）
+                                    this.refresh_tmux(cx);
                                 }))
                                 .child("diff \u{2192}"),
                         )

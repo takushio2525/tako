@@ -109,9 +109,9 @@ pub mod worker_font;
 
 pub use dispatch::{
     dispatch, dispatch_orchestrator_accounts, dispatch_orchestrator_layout, fetch_tmux_sessions,
-    finish_offload, prepare_offload, remote_open_file_fetched, ControlHost, DispatchError,
-    LspFormatLanding, LspGotoLanding, OffloadContinuation, OffloadJob, OffloadOutcome, PinnedView,
-    TmuxContext,
+    finish_offload, land_offload, prepare_offload, remote_open_file_fetched, ControlHost,
+    DispatchError, LspFormatLanding, LspGotoLanding, OffloadContinuation, OffloadJob,
+    OffloadLanding, OffloadOutcome, PinnedView, TmuxContext,
 };
 pub use host::{
     PreviewConflict, PreviewFormatSource, PreviewGotoSource, PreviewHost, PreviewLineTarget,
