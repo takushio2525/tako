@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1944: 未導入の言語サーバを開いた時点で data dir へ取って起こし、エディタに状態を出した）
-- 検出表の各行に `fetch`（pyright 1.1.414・ts-ls 5.1.3 + typescript 5.9.3 = npm の tarball、rust-analyzer 2026-09-21 = GitHub の単体、Node.js 24.21.0 は足りる node が PATH に無いときだけ。clangd は取らない）を配布元の公開ハッシュで検証して `<data_dir>/lsp-servers` へ。解決は env → PATH（`probe_args` で動くか確かめる）→ 置き場 → 取得。状態「取得中」・タイトルの 1 行と失敗の帯（入れる / もう一度取得）・`tako lsp install`（GUI 無しでも）・シェル統合の合図で引き直し（#1823 の 2）。A/B `TAKO_1944_LEGACY=1`・カタログ +235 B
-- 実測: まっさら（一時 HOME・最小 PATH）で .py を開くだけで Node.js 52.9 MB + pyright 4.2 MB を取り 11.6 秒で読み込み済み・診断 2 件・補完 34 件・常駐 155 MB（ts-ls 4.9 MB / 4.2 秒・RA 13.9 MB / 21 秒）。e2e 10 本・番犬（注入 10 通り）・`scripts/test-lsp-fetch-1944.sh` 25 PASS
-
 ## 2026-10-10（#1967: 再起動の後に会話が戻らない = 折り返した案内の途中までの ID・カタログだけの再開コマンド・送った後を見ない、を直した）
 - 真因は `parse_resume_hint` が細いペインで折り返した案内の 1 行目を権威として ID を壊したこと（本番の zsh 履歴に `…065b9` の resume の実行が残っていた）。再開は `resume_launch` の 1 実装（master / solo = `build_master_cmd`、worker = `build_worker_cmd` + `--resume`）へ。シェルの戻り待ち・送った後 10 秒の見張り・1 回の打ち直し・`last_restart`・persist.log・重ねた再起動の拒否・シェルだけのペインの harness。MATRIX `resume_launch_args`・カタログ +362 B
 - 実測: `scripts/test-session-restart-1967.sh`（隔離 GUI・偽 claude）で新旧 × 細く低い / 細く高いが緑。旧挙動は 2 行で #1940 型の化け（2 回起動）、34 行で本番と同じ途中までの ID の resume を再現。番犬 `issue1967_session_restart_watchdog`（注入 15 通りを file:line で名指し）
@@ -63,3 +59,7 @@
 ## 2026-10-11（#1984: UI スレッドの同期の dispatch の子プロセス待ちの残りを background へ = RemoteAgents・TmuxList・呼び出し元の pid 祖先辿り・spawn / handoff の CLI の所在確認・再起動の計画・check_qos の ps）
 - `RemoteAgents` / `TmuxList` は background のジョブ、残りは**先取り**（`OffloadJob::Probe` → `with_ui_probes` の内側で同じ dispatch。handoff は答えが足りなければもう一巡 = `land_offload`）。読む側は `caller_pane_by_pid` / `agent_preflight` / `tako_binary` / `restart_scan` だけ。右パネルの取り直し・再起動のボタンも background。A/B `TAKO_1984_LEGACY=1`・番犬 `issue1984_*`（注入 10 通り）・カタログ増分 0
 - 実測: `scripts/test-ui-thread-offload-1984.sh`（偽の SHELL / tmux が武装中は戻らない）修正後 17 PASS（別の要求 0.03〜0.05 秒）/ 修正前 6 FAIL（4.03 秒〜打ち切り・メインスレッドに `caller_pane_by_pid`・`preflight` → `locate` 等）。再描画上限の CPU は蓋閉じで `body_renders` 0 = 未実測のまま
+
+## 2026-10-11（#1989: GitResolveAgent・StaleBinary status・tmux の書き込み系を background へ・agent CLI の所在確認を上限つきへ）
+- 解消エージェントは git の走査と CLI の所在を先取り、`StaleBinary status` / `TmuxKill` / `TmuxResize` / `TmuxSelectWindow` は background のジョブ、`TmuxOpen` は socket・存在・グループを先取り、`TmuxCleanup` は host が守るセッションだけ集めて回収の本体は background。`locate` は `find_with_timeout` + 置き場所だけ（打ち切りは `LookupTimedOut`）。GUI のボタン 5 つも `dispatch_off_ui`。A/B `TAKO_1989_LEGACY=1`・番犬は #1984 のものへ注入 17 通り
+- 実測: `scripts/test-ui-thread-offload-1989.sh` 修正後 ⑦〜⑭・E5 通過（別の要求 0.03〜0.05 秒・spawn は上限 2 秒で 2.07 秒に理由つき）/ 修正前 8 FAIL（4.0 秒〜打ち切り・spawn は返らない）。再描画上限の CPU は蓋閉じのまま未実測

@@ -61,11 +61,16 @@ pub enum AgentCliProblem {
     /// **一時的で、時間を置いた再試行が有効**という性質が違うので分けてある
     /// （`not_authenticated` はログインし直さない限り解けない）
     ExecutionRefused,
+    /// 所在の確認（unix はログインシェルの `command -v`）が上限内に返らなかった（#1989）。
+    ///
+    /// 「無い」と分かったのではなく**確かめられなかった**。`NotFound` に潰すと
+    /// 「入れたのに見つからない」と読ませてしまう（rc ファイルの入力待ち等が原因）
+    LookupTimedOut,
 }
 
 impl AgentCliProblem {
     /// 全種別（テストが 4 系統 × 全種別を総当たりするための正本）
-    pub const ALL: [AgentCliProblem; 7] = [
+    pub const ALL: [AgentCliProblem; 8] = [
         Self::NotFound,
         Self::NotAuthenticated,
         Self::TrustWriteFailed,
@@ -73,6 +78,7 @@ impl AgentCliProblem {
         Self::LocalRuntimeDown,
         Self::LocalModelMissing,
         Self::ExecutionRefused,
+        Self::LookupTimedOut,
     ];
 
     /// 機械可読な種別（応答 JSON・ログ用）
@@ -85,6 +91,7 @@ impl AgentCliProblem {
             Self::LocalRuntimeDown => "local_runtime_down",
             Self::LocalModelMissing => "local_model_missing",
             Self::ExecutionRefused => "execution_refused",
+            Self::LookupTimedOut => "cli_lookup_timed_out",
         }
     }
 
@@ -96,7 +103,7 @@ impl AgentCliProblem {
     pub fn applies_to(self, agent: Agent) -> bool {
         match self {
             // 実行ファイルが要るのは 4 系統とも同じ（ローカルは runtime の実行ファイル）
-            Self::NotFound | Self::ExitedImmediately => true,
+            Self::NotFound | Self::ExitedImmediately | Self::LookupTimedOut => true,
             // ローカルで動かすモデルにログインという概念が無い
             Self::NotAuthenticated | Self::TrustWriteFailed => agent != Agent::Local,
             // runtime とモデルの取得はローカル固有
@@ -139,6 +146,10 @@ impl AgentCliProblem {
             Self::ExecutionRefused => Note::new(
                 "は起動して指示も届きましたが、アカウントの確認が終わっていないため実行を断られました（作業は 1 文字も進んでいません）",
                 " started and received the instruction, but refused to run because the account check has not finished (no work was done at all)",
+            ),
+            Self::LookupTimedOut => Note::new(
+                "の所在を上限時間内に確かめられませんでした（ログインシェルで場所を聞く問い合わせが返りませんでした。無いと分かったわけではありません）",
+                " could not be located in time (the login-shell lookup did not return; this does not mean it is missing)",
             ),
         };
         format!("{name} CLI{}", note.text_in(lang))
@@ -256,6 +267,24 @@ impl AgentCliProblem {
                     Note::new(
                         "この worker は作業を 1 文字も進めていないので、同じ指示をそのまま渡し直して構いません",
                         "This worker did no work at all, so the same instruction can simply be handed to it again",
+                    )
+                    .text_in(lang)
+                    .to_string(),
+                );
+            }
+            Self::LookupTimedOut => {
+                out.push(
+                    Note::new(
+                        "次の一手: シェルの起動ファイル（`~/.zprofile` / `~/.zshrc` など）が入力待ちや重い処理で止まっていないか確かめてから spawn し直す",
+                        "Next: check that your shell startup files (`~/.zprofile`, `~/.zshrc`, ...) are not waiting for input or doing slow work, then spawn again",
+                    )
+                    .text_in(lang)
+                    .to_string(),
+                );
+                out.push(
+                    Note::new(
+                        "起動ファイルが遅いだけなら上限を `TAKO_SETUP_PROBE_TIMEOUT_SECS`（秒）で延ばせる",
+                        "If the startup files are just slow, raise the limit with `TAKO_SETUP_PROBE_TIMEOUT_SECS` (seconds)",
                     )
                     .text_in(lang)
                     .to_string(),
@@ -714,22 +743,51 @@ pub fn locate(agent: WorkerAgent) -> Result<String, AgentCliError> {
     }
     #[cfg(not(test))]
     {
-        if let Some(found) = tako_core::platform::exe::find(agent.as_str()) {
+        // #1989: 探索は上限つき（unix はログインシェルを起こす = rc 次第でいくらでも待ちうる）。
+        // 打ち切ったら既知の設置先だけを見て、それでも無ければ「確かめられなかった」と返す
+        let bounded = if legacy_unbounded_locate() {
+            tako_core::platform::exe::BoundedFind {
+                path: tako_core::platform::exe::find(agent.as_str()),
+                timeout: None,
+            }
+        } else {
+            tako_core::platform::exe::find_with_timeout(
+                agent.as_str(),
+                tako_core::probe::probe_timeout(),
+            )
+        };
+        if let Some(found) = bounded.path {
             return Ok(found);
         }
         // **入れた直後は PATH 経由で引けない**ので、公式インストーラの置き場所を見る。
         // #989 までここは claude 専用だったため、codex / agy は「入れたのに
         // 見つかりません」で止まっていた（`AgentKind` が Claude 1 値だったのが原因）
         if let Ok(kind) = tako_core::platform::agent_install::AgentKind::try_from(agent_of(agent)) {
-            if let Some(found) = crate::setup_bootstrap::resolve_binary_for(kind) {
+            // 置き場所だけを見る（子プロセスなし）。上限なしの PATH 探索をもう一度起こさない（#1989）
+            let launcher = if legacy_unbounded_locate() {
+                crate::setup_bootstrap::resolve_binary_for(kind)
+            } else {
+                crate::setup_bootstrap::installed_launcher_for(kind)
+            };
+            if let Some(found) = launcher {
                 return Ok(found);
             }
         }
         Err(AgentCliError {
             agent,
-            problem: AgentCliProblem::NotFound,
+            problem: if bounded.timeout.is_some() {
+                AgentCliProblem::LookupTimedOut
+            } else {
+                AgentCliProblem::NotFound
+            },
         })
     }
+}
+
+/// #1989 の A/B（`TAKO_1989_LEGACY=1`）: 修正前の上限なしの探索（`exe::find`）へ戻す
+#[cfg(not(test))]
+fn legacy_unbounded_locate() -> bool {
+    tako_core::probe::issue1989_legacy()
 }
 
 /// ペインを作る**前**に呼ぶ実在検査。`TAKO_983_LEGACY=1` のときは素通しする

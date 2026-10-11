@@ -1293,9 +1293,28 @@ lid-guard.json が使う）:
   最中に別の要求 `tako theme` を測る。2026-10-11 の実測: 修正後は①〜⑥すべて 0.03〜0.05 秒・
   メインスレッドに子プロセス待ちなし / 修正前は 4.03 秒〜8 秒で打ち切り・メインスレッドに
   `resolve_caller_pane` → `caller_pane_by_pid`、`dispatch_orchestrator_spawn` → `preflight` → `locate` 等）。
-  **まだ UI スレッドの同期の dispatch に残る子プロセスの待ち**（Issue の範囲外）: `StaleBinary status` の
-  `find_claude_pid_for_backend`、`GitResolveAgent` の CLI の所在確認と tako の実行ファイルの解決、
-  `TmuxKill` / `TmuxResize` ほかの書き込み系の tmux（どれも上限つき）
+  同じ型の残り（`GitResolveAgent` / `StaleBinary status` / tmux の書き込み系）と所在確認の上限は #1989（次の項）
+- **同じ型の残りと agent CLI の所在確認の上限**（#1989）: ①コンフリクト解消エージェント（`GitResolveAgent`）は
+  `git rev-parse` / `git status` / `git name-rev`（`tako_core::git` の上限なしの `Command::output()`）と CLI の
+  所在確認を先取りへ（読む側 `git_conflict_for`）②`StaleBinary status` はペインの role と器の名前だけ UI スレッドで
+  写し（`collect_stale_status_ctx`）、器の走査・`claude` の所在と版の確認は `OffloadJob::StaleStatus` の background
+  ③tmux の書き込み系: `TmuxKill` / `TmuxResize` は host に触らないので `OffloadJob::TmuxWrite` でそのまま background
+  から応答、`TmuxSelectWindow` は対象の解決（メモリ）だけ UI スレッド、`TmuxOpen` は socket の解決・存在確認・
+  元セッションのグループを分割の前にまとめて先取り（読む側 `tmux_open_lookup`）、`TmuxCleanup` は host の
+  `TmuxHost::tmux_cleanup_job` が守るセッション（workspace の器・退避ペイン・取り込みビュー）だけを UI スレッドで集め、
+  器の一覧と kill は `OrphanCleanupPlan::run` / `cleanup_tmux_servers_default` を background で（テスト用ホストは
+  切り出さない = 上書きした `cleanup_*` を同期の腕で通る）④`agent_cli::locate` は上限つきの
+  `exe::find_with_timeout`（probe の既定 15 秒・`TAKO_SETUP_PROBE_TIMEOUT_SECS`）で、打ち切ったら置き場所だけを見て
+  （`setup_bootstrap::installed_launcher_for` = 子プロセスなし。`resolve_binary_for` は先頭で上限なしの
+  `exe::find` をもう一度起こすので使わない）無ければ `AgentCliProblem::LookupTimedOut`（「無い」ではなく
+  「確かめられなかった」+ 起動ファイルの確認・上限の延ばし方）⑤GUI のボタン（右パネルの window 行・復元・
+  git パネルの解消エージェント・tmux セッションの D&D・kill の確認）も `dispatch_off_ui`。番犬は #1984 と同じ
+  `issue1984_ui_thread_offload_watchdog.rs`（注入 17 通り）、A/B は `TAKO_1989_LEGACY=1`、実経路は
+  `scripts/test-ui-thread-offload-1989.sh`（2026-10-11: 修正後は ⑦〜⑬ の別の要求 0.03〜0.05 秒・⑭ の spawn は
+  上限 2 秒で 2.07 秒に理由つきで返る / 修正前は 4.0 秒〜打ち切り・⑭ は返らない）。
+  **まだ UI スレッドの同期の dispatch に残る子プロセスの待ち**（#1989 の範囲外）: `GitCheckout` / `GitCommit` /
+  `GitPull` / `GitPush` / `GitStage` / `GitMerge` ほかの git の書き込み系（`tako_core::git` は上限なしの
+  `Command::output()`。pull / push はネットワークを待つ）と、起動時の orphan の一括回収（起動の中で 1 回）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

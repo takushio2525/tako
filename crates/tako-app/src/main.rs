@@ -9210,23 +9210,26 @@ impl TakoApp {
         let Some((session, window, socket)) = self.tmux_pending_kill.take() else {
             return;
         };
-        let result = tako_control::dispatch(
-            self,
+        // kill（tmux）は UI スレッドで待たない（#1989）。後始末は結果が出たところで行う
+        self.dispatch_off_ui(
             tako_control::protocol::Request::TmuxKill {
                 socket: socket.clone(),
                 session: session.clone(),
                 window,
             },
             PaneOrigin::User,
+            cx,
+            move |app, result, cx| {
+                if let Err(e) = result {
+                    eprintln!("warning: tmux を kill できない: {e}");
+                }
+                // セッション kill 時、そのセッションを TmuxOpen で表示していたペインを閉じる
+                if window.is_none() {
+                    app.close_tmux_view_panes(&session, socket.as_deref(), cx);
+                }
+                app.refresh_tmux(cx);
+            },
         );
-        if let Err(e) = result {
-            eprintln!("warning: tmux を kill できない: {e}");
-        }
-        // セッション kill 時、そのセッションを TmuxOpen で表示していたペインを閉じる
-        if window.is_none() {
-            self.close_tmux_view_panes(&session, socket.as_deref(), cx);
-        }
-        self.refresh_tmux(cx);
     }
 
     /// 指定セッションを TmuxOpen で表示していたペインをすべて閉じる
@@ -11384,26 +11387,44 @@ impl TakoApp {
         scope: tako_core::tmux_cleanup::CleanupScope,
         min_idle_secs: Option<u64>,
     ) -> tako_core::tmux_cleanup::CleanupReport {
+        match self.orphan_cleanup_plan(socket, scope, min_idle_secs) {
+            Ok(plan) => plan.run(),
+            Err(skipped) => skipped,
+        }
+    }
+
+    /// orphan の回収の計画（守るセッションの収集 = メモリと sysctl だけ。#1989）。
+    /// 本体（器への問い合わせと kill）は [`tako_control::OrphanCleanupPlan::run`]。
+    /// IPC 経由はそれを background で走らせる（`tmux_cleanup_job`）。`Err` = 判定の前に見送った
+    fn orphan_cleanup_plan(
+        &self,
+        socket: Option<&str>,
+        scope: tako_core::tmux_cleanup::CleanupScope,
+        min_idle_secs: Option<u64>,
+    ) -> Result<tako_control::OrphanCleanupPlan, tako_core::tmux_cleanup::CleanupReport> {
         use tako_core::tmux_cleanup::{CleanupReport, CleanupSkip};
         let backend_socket = tako_core::tmux_backend::socket_name();
         let target = socket.unwrap_or(&backend_socket).to_string();
         // セカンダリモードは backend_sessions（= protected）が空でプライマリの
         // セッションを全部 orphan と誤認するため、判定自体を行わない（Issue #113）
         if self.secondary {
-            return CleanupReport::skipped(target, CleanupSkip::Secondary);
+            return Err(CleanupReport::skipped(target, CleanupSkip::Secondary));
         }
         if !self.tmux_persist {
-            return CleanupReport::skipped(target, CleanupSkip::PersistDisabled);
+            return Err(CleanupReport::skipped(target, CleanupSkip::PersistDisabled));
         }
         if !tako_core::backend::capabilities().survives_app_exit {
-            return CleanupReport::skipped(target, CleanupSkip::BackendNotPersistent);
+            return Err(CleanupReport::skipped(
+                target,
+                CleanupSkip::BackendNotPersistent,
+            ));
         }
         // #1187: 「別の tako-app が動いている」だけで止めない。止めるのは
         // **対象ソケットを共有する相手**が生きているとき（= 相手の detached セッションを
         // 巻き込みうるとき）と、相手のソケットを特定できないときだけ。理由は呼び出し側へ返す
         let peers = tako_core::tmux_cleanup::live_peers();
         if let Some(skip) = tako_core::tmux_cleanup::blocker(scope, &target, &peers) {
-            return CleanupReport::skipped(target, skip);
+            return Err(CleanupReport::skipped(target, skip));
         }
         let mut protected: std::collections::HashSet<String> = std::collections::HashSet::new();
         if target == backend_socket {
@@ -11433,8 +11454,11 @@ impl TakoApp {
                 protected.insert(wrapper.clone());
             }
         }
-        let killed = tako_core::tmux_backend::cleanup_orphans(&target, &protected, min_idle_secs);
-        CleanupReport::killed(target, killed)
+        Ok(tako_control::OrphanCleanupPlan {
+            target,
+            protected,
+            min_idle_secs,
+        })
     }
 
     /// レイアウトの保存（Phase 5.5 / FR-5）。構造が変わったときだけ書き込む。
@@ -17390,8 +17414,9 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         let zone = self.take_drop_zone(pane_id).unwrap_or(DropZone::Right);
-        let result = tako_control::dispatch(
-            self,
+        // セッションの確かめ（tmux）は UI スレッドで待たない（#1989）。background を通った
+        // 着地では受け口と同じ後処理（`after_dispatch`）が PTY を立てるので、下の消化は空振りする
+        self.dispatch_off_ui(
             tako_control::protocol::Request::TmuxOpen {
                 socket: drag.socket,
                 session: drag.name,
@@ -17400,7 +17425,17 @@ impl TakoApp {
                 direction: Some(zone_to_direction(zone)),
             },
             PaneOrigin::User,
+            cx,
+            move |app, result, cx| app.tmux_session_dropped(result, cx),
         );
+    }
+
+    /// [`Self::drop_tmux_session`] の結果の後始末（PTY の起動・遅延書き込み）
+    fn tmux_session_dropped(
+        &mut self,
+        result: Result<serde_json::Value, tako_control::DispatchError>,
+        cx: &mut Context<Self>,
+    ) {
         match result {
             Ok(_) => {
                 for (pane, options) in std::mem::take(&mut self.pending_attach) {
@@ -23720,6 +23755,28 @@ impl TmuxHost for TakoApp {
         };
         // 明示操作（tako tmux cleanup / MCP）は従来どおり猶予なし
         self.cleanup_orphan_tmux_with(if legacy { None } else { socket }, scope, None)
+    }
+
+    /// #1989: 回収の本体（器への問い合わせと kill）を background へ出す。UI スレッドで
+    /// 行うのは守るセッションの収集だけ（読み替えは同期の腕 `cleanup_orphan_tmux` と同じ）
+    fn tmux_cleanup_job(
+        &self,
+        socket: Option<&str>,
+        servers: bool,
+        apply: bool,
+    ) -> Option<tako_control::TmuxCleanupJob> {
+        if servers {
+            return Some(tako_control::TmuxCleanupJob::Servers { apply });
+        }
+        let legacy = tako_core::tmux_cleanup::legacy_1187();
+        let scope = if legacy {
+            tako_core::tmux_cleanup::CleanupScope::Startup
+        } else {
+            tako_core::tmux_cleanup::CleanupScope::Explicit
+        };
+        Some(tako_control::TmuxCleanupJob::Orphans(
+            self.orphan_cleanup_plan(if legacy { None } else { socket }, scope, None),
+        ))
     }
 
     fn tmux_tab_collapsed(&self, tab: TabId) -> bool {
@@ -71084,14 +71141,25 @@ mod self_test {
             // 82b. コンフリクト解消エージェントはコンフリクトが無ければ起動しない (#496)。
             // 「押しても何も起きない」を避け、理由をエラーで返すことを固定する
             {
-                let guarded = window
-                    .update(cx, |app, _, cx| {
-                        app.git_feedback = None;
-                        app.git_do_resolve_agent("claude", cx);
-                        // コンフリクトしていないリポ（or リポ外）ではエラーになる
-                        app.git_feedback.as_ref().is_some_and(|f| f.is_error)
-                    })
-                    .unwrap_or(false);
+                let _ = window.update(cx, |app, _, cx| {
+                    app.git_feedback = None;
+                    app.git_do_resolve_agent("claude", cx);
+                });
+                // #1989: リポジトリ・コンフリクトの確かめ（git）は background を通るので結果を待つ。
+                // コンフリクトしていないリポ（or リポ外）ではエラーになる
+                let guarded = wait_for_backend_state(
+                    cx,
+                    "82b-resolve-agent",
+                    text_wait_budget(20, 100, 10),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.git_feedback.as_ref().is_some_and(|f| f.is_error)
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 check(
                     guarded,
                     "解消エージェント: コンフリクトが無ければ理由つきで拒否する (#496)",
@@ -71359,11 +71427,27 @@ mod self_test {
                 let term_pane = window
                     .update(cx, |app, _, _| app.focused_pane())
                     .unwrap_or(PaneId::from_raw(1));
+                // ① 右パネルの tmux window 行（#1989: select-window は background を通りうるので
+                // 通知が出るまで待ってから②③へ進む）
+                let _ = window.update(cx, |app, _, cx| {
+                    app.remote_notice = None;
+                    app.tmux_window_row_clicked(term_pane, 9_999, "9999:gone", cx);
+                });
+                let _ = wait_for_backend_state(
+                    cx,
+                    "1417-window-row",
+                    text_wait_budget(20, 100, 10),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.remote_notice.as_ref().is_some_and(|n| n.is_error)
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 let (win_notice, outline_notice, page_notice, overwritten, after_dismiss) = window
                     .update(cx, |app, _, cx| {
-                        app.remote_notice = None;
-                        // ① 右パネルの tmux window 行
-                        app.tmux_window_row_clicked(term_pane, 9_999, "9999:gone", cx);
                         let win_notice = app
                             .remote_notice
                             .as_ref()
@@ -71533,16 +71617,32 @@ mod self_test {
                     .unwrap_or(0);
                 let gone_socket = std::env::temp_dir()
                     .join(format!("tako-st1422-{}-gone.sock", std::process::id()));
+                // ① tmux セッションの復元ボタン（死んだソケット = dispatch が Err）。
+                // #1989: セッションの確かめ（tmux）は background を通るので通知が出るまで待つ
+                let _ = window.update(cx, |app, _, cx| {
+                    app.remote_notice = None;
+                    app.tmux_restore_clicked(
+                        Some(gone_socket.display().to_string()),
+                        "tako-st1422-gone".into(),
+                        cx,
+                    );
+                });
+                let _ = wait_for_backend_state(
+                    cx,
+                    "1422-restore",
+                    text_wait_budget(20, 100, 10),
+                    |cx| {
+                        window
+                            .update(cx, |app, _, _| {
+                                app.remote_notice.as_ref().is_some_and(|n| n.is_error)
+                            })
+                            .unwrap_or(false)
+                    },
+                )
+                .await;
                 let (restore_notice, unshelve_notice, copy_notice, bg_silent, after_dismiss) =
                     window
                         .update(cx, |app, _, cx| {
-                            app.remote_notice = None;
-                            // ① tmux セッションの復元ボタン（死んだソケット = dispatch が Err）
-                            app.tmux_restore_clicked(
-                                Some(gone_socket.display().to_string()),
-                                "tako-st1422-gone".into(),
-                                cx,
-                            );
                             let restore_notice = app
                                 .remote_notice
                                 .as_ref()

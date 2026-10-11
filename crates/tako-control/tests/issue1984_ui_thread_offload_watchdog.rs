@@ -29,6 +29,11 @@
 //! 5. tako-app: 右パネルの tmux 一覧の取り直し・再起動のボタンが UI スレッドで同期の dispatch を
 //!    しない。IPC の受け口と GUI のボタンは「もう一巡」（`drive_offload`）を通る
 //! 6. `check_qos` の `ps` が上限つき
+//! 7. #1989: コンフリクト解消エージェント（`GitResolveAgent` = `git rev-parse` / `git status` /
+//!    `git name-rev` と CLI の所在確認）・`StaleBinary status`・tmux の書き込み系
+//!    （kill / resize / select-window / open / cleanup）も同じ形（background のジョブ / 先取り）。
+//!    agent CLI の所在確認（`agent_cli::locate`）は上限つき（修正前の上限なしは A/B のゲートの内側だけ）。
+//!    GUI のボタン（window 行・復元・解消エージェント・D&D の取り込み・kill の確認）も `dispatch_off_ui`
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -43,6 +48,8 @@ mod production_range;
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const MAIN: &str = "crates/tako-app/src/main.rs";
 const SLEEP_GUARD: &str = "crates/tako-control/src/sleep_guard.rs";
+const AGENT_CLI: &str = "crates/tako-control/src/orchestrator/agent_cli.rs";
+const RIGHT_PANEL: &str = "crates/tako-app/src/right_panel.rs";
 
 /// 子プロセスを待つ口（右は名指しの理由）
 const RAW: &[(&str, &str)] = &[
@@ -77,6 +84,29 @@ const RAW: &[(&str, &str)] = &[
     ("exe::find(", "ログインシェルの `command -v`"),
     ("Command::new(", "子プロセスを起こす"),
     (".output()", "子プロセスを上限なしで待つ"),
+    // #1989
+    ("git::repo_root(", "`git rev-parse`（上限なし）"),
+    (
+        "git::conflict_state(",
+        "`git status` / `git name-rev`（上限なし）",
+    ),
+    ("tmux::resolve_session_socket(", "`tmux has-session`"),
+    ("tmux::has_session(", "`tmux has-session`"),
+    ("tmux::session_group(", "`tmux display`"),
+    ("tmux::select_window(", "`tmux select-window`"),
+    ("tmux::kill_session(", "`tmux kill-session`"),
+    ("tmux::kill_window(", "`tmux kill-window`"),
+    ("tmux::resize_window(", "`tmux resize-window`"),
+    ("cleanup_orphans(", "器の一覧と kill"),
+    ("cleanup_servers(", "ソケットごとの器の一覧と kill"),
+    (
+        "find_claude_pid_for_backend(",
+        "器の `list-panes -a` + 親子表",
+    ),
+    (
+        "resolve_current_claude_binary(",
+        "`claude` の所在（ログインシェル）と版の確認",
+    ),
 ];
 
 /// UI スレッドで走る dispatch の経路（先取りの判断を含む）。窓の頭の綴り
@@ -97,6 +127,11 @@ const UI_PATHS: &[&str] = &[
     "pub fn collect_tmux_context(",
     "pub fn land_offload(",
     "OffloadContinuation::Probed(probed) => {",
+    // #1989
+    "fn dispatch_git_resolve_agent(",
+    "fn dispatch_stale_binary_status(",
+    "fn collect_stale_status_ctx(",
+    "fn tmux_select_window_target(",
 ];
 
 /// 読む側の関数（子プロセスの口は `Probed::Outside` の腕でだけ呼ぶ）
@@ -105,6 +140,8 @@ const READERS: &[&str] = &[
     "fn agent_preflight(",
     "fn tako_binary(",
     "fn restart_scan(",
+    "fn git_conflict_for(",
+    "fn tmux_open_lookup(",
 ];
 
 /// `probe_needs` が挙げるべき要求（先取りが要る要求）
@@ -116,6 +153,8 @@ const PROBED_REQUESTS: &[&str] = &[
     "Request::OrchestratorHandoff",
     "Request::SessionRestart",
     "Request::StaleBinary",
+    "Request::GitResolveAgent",
+    "Request::TmuxOpen",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -291,6 +330,23 @@ fn scan_prepare(dispatch: &str) -> Vec<Offender> {
                     "OffloadJob::Probe(",
                     "先取りのジョブ（`OffloadJob::Probe`）を作っていない",
                 ),
+                (
+                    "OffloadJob::StaleStatus { ctx }",
+                    "`StaleBinary status` を background のジョブにしていない（器の走査・`claude` の \
+                     所在と版の確認を UI スレッドで待つ）",
+                ),
+                (
+                    "OffloadJob::TmuxWrite(",
+                    "tmux の kill / resize を background のジョブにしていない",
+                ),
+                (
+                    "OffloadJob::TmuxSelectWindow {",
+                    "`TmuxSelectWindow` を background のジョブにしていない",
+                ),
+                (
+                    "OffloadJob::TmuxCleanup(job)",
+                    "`TmuxCleanup` の回収の本体を background のジョブにしていない",
+                ),
             ] {
                 if code_lines_with(&window, needle).is_empty() {
                     push(at, format!("`prepare_offload` が{what} = #1984"));
@@ -346,6 +402,8 @@ fn scan_background(dispatch: &str) -> Vec<Offender> {
                 "resolve_tako_binary()",
                 "resolve_session_id_for_backend",
                 "ProcessSnapshot::capture()",
+                "git::repo_root(",
+                "compute_tmux_open_lookup(",
             ] {
                 if code_lines_with(&window, needle).is_empty() {
                     out.push(Offender {
@@ -367,7 +425,15 @@ fn scan_background(dispatch: &str) -> Vec<Offender> {
             why: "`run_reply` が見つからない（走査が空振り）".into(),
         }),
         Some((at, window)) => {
-            for needle in ["remote_agents_reply()", "fetch_tmux_sessions("] {
+            for needle in [
+                "remote_agents_reply()",
+                "fetch_tmux_sessions(",
+                "finish_stale_status(",
+                "tmux_kill_reply(",
+                "tmux_resize_reply(",
+                "tmux_select_window_reply(",
+                "cleanup_tmux_servers_default(",
+            ] {
                 if code_lines_with(&window, needle).is_empty() {
                     out.push(Offender {
                         file: DISPATCH,
@@ -560,10 +626,167 @@ fn scan_sleep_guard(src: &str) -> Vec<Offender> {
     out
 }
 
+/// 7. #1989: `TmuxOpen` の腕（dispatch_inner の中）は tmux を直に聞かない
+fn scan_tmux_open_arm(dispatch: &str) -> Vec<Offender> {
+    let lines: Vec<&str> = dispatch.lines().collect();
+    // 先取りの判断（`probe_needs`）にも同じ綴りがあるので、`direction,` を持つ dispatch の腕を選ぶ
+    let start = lines.iter().enumerate().position(|(i, l)| {
+        *l == "        Request::TmuxOpen {"
+            && lines[i..(i + 8).min(lines.len())]
+                .iter()
+                .any(|x| x.trim() == "direction,")
+    });
+    let Some(start) = start else {
+        return vec![Offender {
+            file: DISPATCH,
+            line: 0,
+            why: "`TmuxOpen` の dispatch の腕が見つからない（走査が空振り）".into(),
+        }];
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, l)| l.starts_with("        Request::"))
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+    let window: Vec<String> = lines[start..end].iter().map(|l| l.to_string()).collect();
+    let mut out = Vec::new();
+    if code_lines_with(&window, "tmux_open_lookup(").is_empty() {
+        out.push(Offender {
+            file: DISPATCH,
+            line: start + 1,
+            why: "`TmuxOpen` の腕が読む側の関数（`tmux_open_lookup`）を通っていない".into(),
+        });
+    }
+    for (needle, why) in RAW {
+        for i in code_lines_with(&window, needle) {
+            out.push(Offender {
+                file: DISPATCH,
+                line: start + 1 + i,
+                why: format!(
+                    "UI スレッドで走る `TmuxOpen` の腕が `{needle}` を直に呼んでいる（{why}。\
+                     UI スレッドの dispatch で子プロセスを待つ = #1989。`tmux_open_lookup` を通す）"
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// 7. #1989: agent CLI の所在確認は上限つき（上限なしの `exe::find` は A/B のゲートの腕だけ）
+fn scan_locate(src: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    match fn_window(src, "pub fn locate(") {
+        None => out.push(Offender {
+            file: AGENT_CLI,
+            line: 0,
+            why: "`locate` が見つからない（走査が空振り）".into(),
+        }),
+        Some((at, window)) => {
+            if code_lines_with(&window, "find_with_timeout(").is_empty() {
+                out.push(Offender {
+                    file: AGENT_CLI,
+                    line: at,
+                    why: "`locate` が上限つきの探索（`exe::find_with_timeout`）を使っていない \
+                          （ログインシェルが返らないと spawn / handoff が永久に返らない = #1989）"
+                        .into(),
+                });
+            }
+            // 上限なしの口（`exe::find` と、中で `exe::find` を起こす `resolve_binary_for`）は
+            // 直前 2 行以内にゲートがある腕の中だけ
+            let gate = code_lines_with(&window, "legacy_unbounded_locate()");
+            for needle in ["exe::find(", "resolve_binary_for("] {
+                for i in code_lines_with(&window, needle) {
+                    if !gate.iter().any(|g| *g < i && i - *g <= 2) {
+                        out.push(Offender {
+                            file: AGENT_CLI,
+                            line: at + i,
+                            why: format!(
+                                "`locate` の上限なしの探索（`{needle}`）が A/B のゲート \
+                                 （`legacy_unbounded_locate()`）の腕の外にある（製品の既定で上限が消え、\
+                                 打ち切ったあとにログインシェルをもう一度上限なしで待つ = #1989）"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 7. #1989: GUI のボタンと回収の計画
+fn scan_gui_1989(main: &str, right: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    for (file, src, head) in [
+        (MAIN, main, "fn tmux_kill_confirmed("),
+        (MAIN, main, "fn drop_tmux_session("),
+        (RIGHT_PANEL, right, "fn tmux_window_row_clicked("),
+        (RIGHT_PANEL, right, "fn tmux_restore_clicked("),
+        (RIGHT_PANEL, right, "fn git_do_resolve_agent("),
+    ] {
+        match fn_window(src, head) {
+            None => out.push(Offender {
+                file,
+                line: 0,
+                why: format!("`{head}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) => {
+                for needle in ["tako_control::dispatch(", "dispatch::dispatch("] {
+                    for i in code_lines_with(&window, needle) {
+                        out.push(Offender {
+                            file,
+                            line: at + i,
+                            why: format!(
+                                "GUI のボタン `{head}` が同期の dispatch をしている（tmux / git / CLI の \
+                                 所在確認を UI スレッドで待つ = #1989。`dispatch_off_ui` を通す）"
+                            ),
+                        });
+                    }
+                }
+                if code_lines_with(&window, "dispatch_off_ui(").is_empty() {
+                    out.push(Offender {
+                        file,
+                        line: at,
+                        why: format!("GUI のボタン `{head}` が `dispatch_off_ui` を通っていない"),
+                    });
+                }
+            }
+        }
+    }
+    for head in ["fn orphan_cleanup_plan(", "fn tmux_cleanup_job("] {
+        match fn_window(main, head) {
+            None => out.push(Offender {
+                file: MAIN,
+                line: 0,
+                why: format!("`{head}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) => {
+                for needle in ["cleanup_orphans(", "cleanup_servers(", ".run()"] {
+                    for i in code_lines_with(&window, needle) {
+                        out.push(Offender {
+                            file: MAIN,
+                            line: at + i,
+                            why: format!(
+                                "回収の計画 `{head}`（UI スレッド）が `{needle}` を呼んでいる（器の一覧と kill を \
+                                 UI スレッドで待つ = #1989。本体は background の `OrphanCleanupPlan::run`）"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 struct Sources {
     dispatch: String,
     main: String,
     sleep_guard: String,
+    agent_cli: String,
+    right_panel: String,
 }
 
 impl Sources {
@@ -573,6 +796,8 @@ impl Sources {
             dispatch: read(&root, DISPATCH),
             main: read(&root, MAIN),
             sleep_guard: read(&root, SLEEP_GUARD),
+            agent_cli: read(&root, AGENT_CLI),
+            right_panel: read(&root, RIGHT_PANEL),
         }
     }
 
@@ -583,6 +808,9 @@ impl Sources {
         v.extend(scan_background(&self.dispatch));
         v.extend(scan_main(&self.main));
         v.extend(scan_sleep_guard(&self.sleep_guard));
+        v.extend(scan_tmux_open_arm(&self.dispatch));
+        v.extend(scan_locate(&self.agent_cli));
+        v.extend(scan_gui_1989(&self.main, &self.right_panel));
         v
     }
 }
@@ -651,6 +879,24 @@ fn 走査が空振りしていない() {
         (&s.main, "fn spawn_tmux_refresh(", "fetch_tmux_sessions("),
         (&s.main, "fn dispatch_off_ui(", "prepare_offload("),
         (&s.sleep_guard, "pub fn check_qos(", "output_with_timeout("),
+        (
+            &s.dispatch,
+            "fn dispatch_git_resolve_agent(",
+            "git_conflict_for(",
+        ),
+        (
+            &s.dispatch,
+            "fn dispatch_git_resolve_agent(",
+            "agent_preflight(",
+        ),
+        (&s.dispatch, "fn git_conflict_for(", "git::conflict_state("),
+        (
+            &s.dispatch,
+            "fn tmux_open_lookup(",
+            "compute_tmux_open_lookup(",
+        ),
+        (&s.agent_cli, "pub fn locate(", "find_with_timeout("),
+        (&s.main, "fn orphan_cleanup_plan(", "protected"),
     ] {
         let (_, w) = fn_window(src, head).unwrap_or_else(|| panic!("{head} の窓"));
         assert!(
@@ -706,8 +952,9 @@ fn 逆戻りを名指しできる() {
     // ② spawn の CLI の所在確認を修正前の preflight へ戻す
     let d = inject(
         &s.dispatch,
-        "    let agent_cli_path = agent_preflight(worker_agent)?;",
-        "    let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)\n        .map_err(|e| DispatchError::Operation(e.message()))?;",
+        // 置換元は spawn の行だけ（#1989 で同じ行が GitResolveAgent にも増えたので直前のコメントで絞る）
+        "    // 先取りした答えを読む\n    let agent_cli_path = agent_preflight(worker_agent)?;",
+        "    // 先取りした答えを読む\n    let agent_cli_path = orchestrator::agent_cli::preflight(worker_agent)\n        .map_err(|e| DispatchError::Operation(e.message()))?;",
         "②",
     );
     expect_named(
@@ -813,6 +1060,98 @@ fn 逆戻りを名指しできる() {
         scan_main(&m),
         MAIN,
         "fn session_restart_button(",
+    );
+
+    // ⑪ #1989: コンフリクト解消エージェントの git を修正前の同期へ戻す
+    let d = inject(
+        &s.dispatch,
+        "    let (repo, state) = git_conflict_for(&git_pane_cwd(host, pane)?)?;",
+        "    let repo = git_repo_for_pane(host, pane)?;\n    let state = tako_core::git::conflict_state(&repo);",
+        "⑪",
+    );
+    expect_named(
+        "解消エージェントの git を同期へ",
+        scan_ui_paths(&d),
+        DISPATCH,
+        "fn dispatch_git_resolve_agent(",
+    );
+
+    // ⑫ #1989: TmuxOpen の腕を修正前の同期の問い合わせへ戻す
+    let d = inject(
+        &s.dispatch,
+        "            let TmuxOpenLookup { socket, group } = tmux_open_lookup(socket.as_deref(), &session)?;",
+        "            let socket = tako_core::tmux::resolve_session_socket(socket.as_deref(), &session).map_err(DispatchError::Operation)?;\n            let group = tako_core::tmux::session_group(socket.as_deref(), &session);",
+        "⑫",
+    );
+    expect_named(
+        "TmuxOpen の問い合わせを同期へ",
+        scan_tmux_open_arm(&d),
+        DISPATCH,
+        "TmuxOpen",
+    );
+
+    // ⑬ #1989: StaleBinary status を background へ出さない
+    let d = inject(
+        &s.dispatch,
+        "            Some(collect_stale_status_ctx(host, *pane).map(|ctx| OffloadJob::StaleStatus { ctx }))",
+        "            None",
+        "⑬",
+    );
+    expect_named(
+        "StaleBinary status を同期のまま",
+        scan_prepare(&d),
+        DISPATCH,
+        "StaleBinary status",
+    );
+
+    // ⑭ #1989: agent CLI の所在確認をゲートの外の上限なしへ戻す
+    let a = inject(
+        &s.agent_cli,
+        "        let bounded = if legacy_unbounded_locate() {",
+        "        let bounded = if true {",
+        "⑭",
+    );
+    expect_named("locate を上限なしへ", scan_locate(&a), AGENT_CLI, "ゲート");
+    // ⑭' 打ち切ったあとの置き場所の確認を、PATH をもう一度探す口（上限なし）へ戻す
+    let a = inject(
+        &s.agent_cli,
+        "            let launcher = if legacy_unbounded_locate() {",
+        "            let launcher = if true {",
+        "⑭'",
+    );
+    expect_named(
+        "locate の打ち切り後に上限なしの探索",
+        scan_locate(&a),
+        AGENT_CLI,
+        "resolve_binary_for(",
+    );
+
+    // ⑮ #1989: GUI の window 行を修正前の同期の dispatch へ戻す
+    let r = inject(
+        &s.right_panel,
+        "        let target_label = target_label.to_string();\n        self.dispatch_off_ui(",
+        "        let _ = tako_control::dispatch(self, req, PaneOrigin::User);\n        let target_label = target_label.to_string();\n        self.dispatch_off_ui(",
+        "⑮",
+    );
+    expect_named(
+        "GUI の window 行を同期へ",
+        scan_gui_1989(&s.main, &r),
+        RIGHT_PANEL,
+        "fn tmux_window_row_clicked(",
+    );
+
+    // ⑯ #1989: 回収の計画（UI スレッド）で回収の本体を走らせる
+    let m = inject(
+        &s.main,
+        "        Ok(tako_control::OrphanCleanupPlan {\n            target,",
+        "        let _ = tako_core::tmux_backend::cleanup_orphans(&target, &protected, min_idle_secs);\n        Ok(tako_control::OrphanCleanupPlan {\n            target,",
+        "⑯",
+    );
+    expect_named(
+        "回収の計画で kill",
+        scan_gui_1989(&m, &s.right_panel),
+        MAIN,
+        "fn orphan_cleanup_plan(",
     );
 
     // ⑩ check_qos を修正前の上限なしの ps へ戻す

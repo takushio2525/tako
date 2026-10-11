@@ -126,13 +126,23 @@ fn cleanupは見送りの理由を応答とpersistlogへ出す() {
         &src,
         "Request::TmuxCleanup { socket, .. } =>",
     )));
+    // #1989: 応答の組み立ては同期の腕と background の 1 実装（`tmux_cleanup_orphans_reply`）へ出した。
+    // 腕がそれを通り、その本体が理由と persist.log を持つこと
     assert!(
-        arm.contains("\"skipped\""),
-        "応答に見送りの理由（skipped）が無い = 空配列と区別できない（#1187）:\n{arm}"
+        arm.contains("tmux_cleanup_orphans_reply("),
+        "TmuxCleanup の腕が応答の 1 実装（tmux_cleanup_orphans_reply）を通っていない:\n{arm}"
+    );
+    let reply = without_legacy(&code_only(&block_after(
+        &src,
+        "fn tmux_cleanup_orphans_reply(",
+    )));
+    assert!(
+        reply.contains("\"skipped\""),
+        "応答に見送りの理由（skipped）が無い = 空配列と区別できない（#1187）:\n{reply}"
     );
     assert!(
-        arm.contains("persist_log"),
-        "見送り / 実行を persist.log へ残していない（.app 起動では stderr はどこにも残らない）:\n{arm}"
+        reply.contains("persist_log"),
+        "見送り / 実行を persist.log へ残していない（.app 起動では stderr はどこにも残らない）:\n{reply}"
     );
 }
 
@@ -140,7 +150,14 @@ fn cleanupは見送りの理由を応答とpersistlogへ出す() {
 fn 掃除本体はプロセス名ではなくソケットの所有者で見送りを決める() {
     let root = workspace_root();
     let src = read(&root, "crates/tako-app/src/main.rs");
-    let body = code_only(&block_after(&src, "fn cleanup_orphan_tmux_with("));
+    // #1989: 見送りの判定は計画（`orphan_cleanup_plan` = UI スレッド部）へ出した。
+    // 掃除本体（`cleanup_orphan_tmux_with`）はその計画を通ること
+    let with = code_only(&block_after(&src, "fn cleanup_orphan_tmux_with("));
+    assert!(
+        with.contains("orphan_cleanup_plan("),
+        "掃除本体が計画（orphan_cleanup_plan）を通っていない:\n{with}"
+    );
+    let body = code_only(&block_after(&src, "fn orphan_cleanup_plan("));
     assert!(
         !body.contains("other_tako_running"),
         "掃除本体が「別の tako-app がいるか」だけで見送っている（#1187 の根因）。\
