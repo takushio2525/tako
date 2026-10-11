@@ -8,6 +8,19 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.31] - 2026-10-12
+
+Nightly patch release (automated). Changes since v0.8.30:
+夜間パッチリリース（自動）。v0.8.30 以降の変更:
+
+- [修正] GitResolveAgent・StaleBinary status・tmux の書き込み系を background へ出し、agent CLI の所在確認を上限つきにする (#1989) (#1990)
+- [修正] UI スレッドの同期の dispatch の子プロセス待ちの残りを background へ出す（RemoteAgents・TmuxList・呼び出し元の pid 祖先辿り・spawn / handoff の CLI の所在確認・再起動の計画・check_qos の ps）(#1984) (#1988)
+- [修正] pane を省いた tako_show_command / sessions link が呼び出し元ペインを使うようにした (#1958) (#1986)
+- [改善] たまり場を画面全体の縮小・由来タブ → 親 master の見出しで描き、器の無い幽霊を見分けて安全に外せるようにした (#1946) (#1985)
+- [修正] セルフテストの tmux の器にも -f を渡し、tk-coretest の残骸を製品の掃除で回収し、psmux の e2e も -f NUL で起こす (#1918) (#1939)
+- [改善] release-windows から rust-cache を外し、タグごとに一度も当たらないキャッシュの毎晩約 1.6 GB の保存を止める (#1921) (#1937)
+- [修正] 夜間の mod 検査のモックテストの間欠的な赤: 落ちた段の手掛かりを出し、assert の取りこぼしとスタブの初回起動の遅さを直す (#1933) (#1947)
+
 ## [0.8.30] - 2026-10-11
 
 Nightly patch release (automated). Changes since v0.8.29:
