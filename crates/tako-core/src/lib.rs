@@ -23,6 +23,7 @@ pub mod emoji;
 pub mod file_clipboard;
 pub mod file_copy;
 pub mod file_move;
+pub mod file_type;
 pub mod file_uri;
 pub mod fnv;
 pub mod git;

@@ -3373,9 +3373,9 @@ impl TakoApp {
                 // #1916: 塗りの間は App Nap に間引かせない（間引かれると E コアへ寄せられ、
                 // 10 MB で 12.0 秒 → 26.9〜33.4 秒になる）
                 let _work = UserWork::begin();
-                preview::highlight_text(&p, &text)
+                preview::highlight_text_with_syntax(&p, &text)
             });
-            let lines = task.await;
+            let (lines, syntax) = task.await;
             let _ = this.update(cx, |app, cx| {
                 if let Some(running) = app.view_highlights_running.get_mut(&pane) {
                     *running = running.saturating_sub(1);
@@ -3395,6 +3395,7 @@ impl TakoApp {
                 if let Some(state) = app.previews.get_mut(&pane) {
                     if state.path == path {
                         state.content = preview::PreviewContent::Code(lines);
+                        state.syntax = Some(syntax);
                         state.content_rev = preview::next_content_rev();
                         cx.notify();
                     }

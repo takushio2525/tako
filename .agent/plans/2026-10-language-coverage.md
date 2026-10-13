@@ -228,6 +228,30 @@ open_plan 7・インデント 5）。
 4. ついでに直す小さな食い違い: `preview.rs:2006` / `:2022` の「270+ 構文」を実数へ・
    `CMakeLists.txt` が拡張子 `txt` として Enter の規則を「継承」にされる件（ファイル名の行で直る）
 
+### 4.4 実装で決めたこと（#1948）
+
+- **表の列は §4.1 に 2 つ足した**: `image`（画像の形式。app の `image_format_from_path` の写しを消すため）と
+  `media_type`（HTTP の型。`open_plan::media_type_for_extension` も拡張子の `match` だったため）。
+  インデントの列は `text_edit::IndentUnit` をそのまま使う（並行する enum を作らない）
+- **ID は VS Code の言語 ID に揃えた**（`javascriptreact` / `shellscript` / `csharp` …）。言語でない形式は
+  形式の名前（`png` / `quicktime`）。`.h` は VS Code と同じく `cpp` の行に数える（色は two-face 任せの
+  まま = Objective-C。直すのは #1953）
+- **照合はファイル名 → 拡張子の順で、どちらも大文字小文字を問わない**（two-face のファイル名の照合と同じ）。
+  寄せる前は色の補い（`filename_to_syntax`）だけが綴りを区別し、インデント（`makefile` / `gnumakefile`）は
+  区別していなかったので、どちらに揃えても差分が出る。区別しない側に揃えた
+  （区別する側だと `MAKEFILE` のインデントがタブから 4 スペースへ退行する）
+- **寄せる前の補いのうち死んでいた行は持ってこなかった**: `Cargo.lock` / `Pipfile` / `poetry.lock` /
+  `Pipfile.lock` / `.editorconfig` と `mts` / `cts` は two-face が先に当たっていた（`Pipfile.lock` は
+  補いの TOML ではなく two-face の JSON で塗られていた）。全数一致の単体がこれを確かめている
+- **意図した差分は 2 つ**（`preview/file_type_parity_tests.rs` が名指す）: `CMakeLists.txt` の Enter が
+  「継承だけ」→「括弧で深く」・特殊なファイル名の色の補い（`.dockerignore` / `.npmrc` / `.yarnrc` /
+  `.eslintrc` / `.prettierrc` / `.babelrc` / `Justfile`）が大文字小文字違いの綴りにも当たる
+- **応答**: `tako open` の結果と `tako edit` の応答（`preview_edit_reply` の 1 実装）の最上位に
+  `file_type` と `syntax`。`syntax` は塗った時点で記録した構文名で、背景の塗りがまだ戻っていなければ
+  塗りと同じ解決（同じ関数・同じ 1 行目）をその場で引く。記録を先に見るので、塗った後の問い合わせは
+  構文セットを借りない（#815 の解放を問い合わせで延ばさない）
+- **アイコン**（表 8）は §4.1 のとおり寄せずに、拡張子を小文字にして引くだけを入れた（`Sketch.INO`）
+
 ## 5. `.ino`（Arduino）の設計
 
 ### 5.1 この PC での確認結果

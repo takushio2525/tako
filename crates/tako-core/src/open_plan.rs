@@ -2,9 +2,10 @@
 //!
 //! cmd+クリック（#147 / #153）・cmd+右クリックの「tako で開く」（#1182）・
 //! CLI `tako file open-in-tako` / MCP `tako_file_op` は**同じ振り分け**を通る。
-//! その「拡張子 → どのプレビューで開くか」の対応表がこのモジュールの正本で、
+//! その「拡張子 → どのプレビューで開くか」の振り分けがこのモジュールの入口で、
 //! `tako-control::dispatch` の `OpenFile` と、リンク検出の応答
-//! （`tako links` / `tako_links` の `open`）が同じ表を引く。
+//! （`tako links` / `tako_links` の `open`）が同じ表を引く。表そのものは言語の同定の正本
+//! [`crate::file_type`] の `preview` / `media_type` 列（#1948）。
 //!
 //! #1283 で「`.mp4` はプレビュー非対応だから無言で失敗しているのでは」という
 //! 見立てが立ったが、実測では **`.mp4` は動画プレビュー（`PreviewRoute::Video`）へ
@@ -12,6 +13,8 @@
 //! 1 箇所へ置いて機械で読める形にしてある。
 
 use std::path::Path;
+
+use crate::file_type;
 
 /// パスを tako の中で開いた結果どこへ行くか
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,27 +73,19 @@ impl OpenRoute {
 /// テキストとして読めないものは preview 側が「バイナリファイル」を出すので、
 /// **どの拡張子でも無言にはならない**
 pub fn preview_route_for_extension(ext: Option<&str>) -> PreviewRoute {
-    let Some(ext) = ext else {
-        return PreviewRoute::Code;
-    };
-    match ext.to_ascii_lowercase().as_str() {
-        "md" | "markdown" => PreviewRoute::Markdown,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => PreviewRoute::Image,
-        "pdf" => PreviewRoute::Pdf,
-        "mp4" | "webm" | "mov" | "avi" | "mkv" => PreviewRoute::Video,
-        _ => PreviewRoute::Code,
-    }
+    ext.and_then(file_type::by_extension)
+        .map_or(PreviewRoute::Code, |row| row.preview)
 }
 
-/// パスの拡張子からプレビューの種別を決める
+/// パスからプレビューの種別を決める（言語の同定の正本 = ファイル名 → 拡張子。#1948）
 pub fn preview_route(path: &Path) -> PreviewRoute {
-    preview_route_for_extension(path.extension().and_then(|e| e.to_str()))
+    file_type::identify_or_default(path).preview
 }
 
 /// 拡張子から HTTP の `Content-Type` を決める（純粋関数。I/O をしない）。
 ///
-/// **[`preview_route_for_extension`] と同じ表**（下のテストが「Image の拡張子は
-/// `image/` で始まる」等を機械で拘束する）。分けてあるのは粒度だけで、
+/// **[`preview_route_for_extension`] と同じ表**（[`crate::file_type::TABLE`] の `media_type` 列。
+/// 下のテストが「Image の拡張子は `image/` で始まる」等を機械で拘束する）。分けてあるのは粒度だけで、
 /// プレビューの振り分けは 5 種別・HTTP は `image/png` と `image/jpeg` を
 /// 区別する必要があるため。
 ///
@@ -99,31 +94,12 @@ pub fn preview_route(path: &Path) -> PreviewRoute {
 /// MIME を見る）ので、インライン配信ではここが返す型を載せる。
 /// 分からない拡張子は `None` = 呼び出し側が `application/octet-stream` へ倒す
 pub fn media_type_for_extension(ext: Option<&str>) -> Option<&'static str> {
-    let ext = ext?;
-    Some(match ext.to_ascii_lowercase().as_str() {
-        // 画像（`PreviewRoute::Image` と同じ集合）
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        // 動画（`PreviewRoute::Video` と同じ集合）
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        // QuickTime は `video/quicktime`。iOS / macOS の Safari はこれで鳴る
-        "mov" => "video/quicktime",
-        "avi" => "video/x-msvideo",
-        "mkv" => "video/x-matroska",
-        // 文書（`PreviewRoute::Pdf` / `Markdown`）
-        "pdf" => "application/pdf",
-        "md" | "markdown" => "text/markdown; charset=utf-8",
-        _ => return None,
-    })
+    file_type::by_extension(ext?)?.media_type
 }
 
-/// パスの拡張子から HTTP の `Content-Type` を決める
+/// パスから HTTP の `Content-Type` を決める（言語の同定の正本 = ファイル名 → 拡張子。#1948）
 pub fn media_type(path: &Path) -> Option<&'static str> {
-    media_type_for_extension(path.extension().and_then(|e| e.to_str()))
+    file_type::identify(path)?.media_type
 }
 
 /// 行番号が 1 始まりであることの説明（0 以下を弾いたときの文言の正本）。

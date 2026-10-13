@@ -192,15 +192,9 @@ pub struct ImageData {
     pub pixel_size: Option<(u32, u32)>,
 }
 
-/// 対応画像フォーマット（GPUI の ImageFormat と 1:1 だが GPUI 非依存にする）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageFileFormat {
-    Png,
-    Jpeg,
-    Gif,
-    WebP,
-    Svg,
-}
+/// 対応画像フォーマット（GPUI の ImageFormat と 1:1 だが GPUI 非依存にする）。
+/// 形式の正本は言語の同定の表（`tako_core::file_type`。#1948）
+pub use tako_core::file_type::ImageFormat as ImageFileFormat;
 
 /// PDF テキスト行 1 本分（ページ内で改行区切り）
 #[derive(Debug, Clone, PartialEq)]
@@ -380,6 +374,9 @@ pub struct PreviewState {
     /// 入れ替えるが `EditState` は残す）で、行数が偶然揃ったときに前回の編集を
     /// 取りこぼしたまま差分を重ねるのを防ぐ
     pub highlight_stamp: Option<u64>,
+    /// いまの表示行を塗った構文名（#1948。`tako open` / `tako edit` の `syntax`）。
+    /// 塗りが戻る前（平文の表示）とコード以外は `None`（[`painted_syntax`] がその場で引く）
+    pub syntax: Option<String>,
 }
 
 /// コードプレビューの軽量編集セッション（FR-3.5）。表示状態とは分離し、編集モードを
@@ -762,6 +759,7 @@ pub fn apply_editor_text(preview: &mut PreviewState, edit: &mut EditState) {
     preview.mode = PreviewMode::Code;
     preview.content = PreviewContent::Code(lines);
     preview.highlight_stamp = Some(edit.highlight.stamp);
+    adopt_painted_syntax(preview, &edit.highlight);
     preview.outline = Arc::new(PreviewOutline::default());
     preview.truncated = None;
     let from_rev = preview.content_rev;
@@ -1012,6 +1010,7 @@ pub fn adopt_editor_seed(
     preview.mode = PreviewMode::Code;
     preview.content = PreviewContent::Code(lines);
     preview.highlight_stamp = Some(edit.highlight.stamp);
+    adopt_painted_syntax(preview, &edit.highlight);
     preview.outline = Arc::new(PreviewOutline::default());
     preview.truncated = None;
     preview.content_rev = next_content_rev();
@@ -1137,6 +1136,7 @@ impl PreviewState {
             content_rev: next_content_rev(),
             file_stamp: None,
             highlight_stamp: None,
+            syntax: None,
         }
     }
 
@@ -1151,28 +1151,20 @@ impl PreviewState {
             content_rev: next_content_rev(),
             file_stamp: None,
             highlight_stamp: None,
+            syntax: None,
         }
     }
 }
 
+/// Markdown のプレビューへ行く形式か（言語の同定の正本 `tako_core::file_type`。#1948）
 pub fn is_markdown_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-    )
+    tako_core::file_type::identify_or_default(path).preview
+        == tako_core::open_plan::PreviewRoute::Markdown
 }
 
-/// 画像ファイルの拡張子判定 → フォーマット
+/// 画像の形式（言語の同定の正本 `tako_core::file_type` の `image` 列。#1948）
 pub fn image_format_from_path(path: &Path) -> Option<ImageFileFormat> {
-    let ext = path.extension()?.to_str()?;
-    match ext.to_ascii_lowercase().as_str() {
-        "png" => Some(ImageFileFormat::Png),
-        "jpg" | "jpeg" => Some(ImageFileFormat::Jpeg),
-        "gif" => Some(ImageFileFormat::Gif),
-        "webp" => Some(ImageFileFormat::WebP),
-        "svg" => Some(ImageFileFormat::Svg),
-        _ => None,
-    }
+    tako_core::file_type::identify(path)?.image
 }
 
 const MAX_IMAGE_BYTES: usize = 50_000_000; // 50 MB
@@ -1213,6 +1205,7 @@ pub fn load_image(path: &Path) -> PreviewState {
                 content_rev: next_content_rev(),
                 file_stamp: FileStamp::from_path(path),
                 highlight_stamp: None,
+                syntax: None,
             }
         }
         Err(e) => PreviewState::error(
@@ -1256,6 +1249,7 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
                 content_rev: next_content_rev(),
                 file_stamp: FileStamp::from_path(path),
                 highlight_stamp: None,
+                syntax: None,
             }
         }
         Err(e) => PreviewState::error(path, PreviewMode::Pdf, e),
@@ -1305,6 +1299,7 @@ pub fn load_video(path: &Path) -> PreviewState {
         content_rev: next_content_rev(),
         file_stamp: FileStamp::from_path(path),
         highlight_stamp: None,
+        syntax: None,
     }
 }
 
@@ -1478,15 +1473,19 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
         Ok(pair) => pair,
         Err(message) => return PreviewState::error(path, mode, message),
     };
-    let (content, outline) = match mode {
+    let (content, outline, syntax) = match mode {
         PreviewMode::Markdown => {
             let (blocks, outline) = markdown_document(&text);
-            (PreviewContent::Markdown(blocks), outline)
+            (PreviewContent::Markdown(blocks), outline, None)
         }
-        PreviewMode::Code => (
-            PreviewContent::Code(highlighter().highlight(path, &text)),
-            PreviewOutline::default(),
-        ),
+        PreviewMode::Code => {
+            let (lines, syntax) = highlight_text_with_syntax(path, &text);
+            (
+                PreviewContent::Code(lines),
+                PreviewOutline::default(),
+                Some(syntax),
+            )
+        }
         PreviewMode::Image | PreviewMode::Pdf | PreviewMode::Video => unreachable!(),
     };
     PreviewState {
@@ -1498,6 +1497,7 @@ pub fn load(path: &Path, mode: PreviewMode) -> PreviewState {
         content_rev: next_content_rev(),
         file_stamp: FileStamp::from_path(path),
         highlight_stamp: None,
+        syntax,
     }
 }
 
@@ -1545,6 +1545,7 @@ pub fn load_fast(path: &Path, mode: PreviewMode) -> (PreviewState, Option<String
             content_rev: next_content_rev(),
             file_stamp: FileStamp::from_path(path),
             highlight_stamp: None,
+            syntax: None,
         },
         raw,
     )
@@ -1578,14 +1579,18 @@ pub fn load_for_reload(
                     };
                 }
             };
-            let (content, outline) = match mode {
-                PreviewMode::Code => (
-                    PreviewContent::Code(highlighter().highlight(path, &text)),
-                    PreviewOutline::default(),
-                ),
+            let (content, outline, syntax) = match mode {
+                PreviewMode::Code => {
+                    let (lines, syntax) = highlight_text_with_syntax(path, &text);
+                    (
+                        PreviewContent::Code(lines),
+                        PreviewOutline::default(),
+                        Some(syntax),
+                    )
+                }
                 PreviewMode::Markdown => {
                     let (blocks, outline) = markdown_document(&text);
-                    (PreviewContent::Markdown(blocks), outline)
+                    (PreviewContent::Markdown(blocks), outline, None)
                 }
                 _ => unreachable!(),
             };
@@ -1599,6 +1604,7 @@ pub fn load_for_reload(
                     content_rev: next_content_rev(),
                     file_stamp: FileStamp::from_path(path),
                     highlight_stamp: None,
+                    syntax,
                 },
                 truncated.is_none().then_some(source),
             )
@@ -1617,9 +1623,17 @@ pub fn live_reload_supported(mode: PreviewMode) -> bool {
     )
 }
 
-/// background executor 上で呼ぶ: syntect ハイライトだけを実行して行列を返す
+/// background executor 上で呼ぶ: syntect ハイライトだけを実行して行列を返す。
+/// 本番の塗りは構文名つきの [`highlight_text_with_syntax`]（#1948）で、これは名前の要らない
+/// テスト・計測が使う
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn highlight_text(path: &Path, text: &str) -> Vec<Line> {
     highlighter().highlight(path, text)
+}
+
+/// [`highlight_text`] に塗った構文名を添える（#1948。[`PreviewState::syntax`] へ記録する）
+pub fn highlight_text_with_syntax(path: &Path, text: &str) -> (Vec<Line>, String) {
+    highlighter().0.highlight_named(path, text)
 }
 
 /// 上限超過の理由（#1660）。`None` なら全文を読んだ
@@ -1656,7 +1670,9 @@ fn read_text_source(path: &Path) -> Result<(String, Truncated, Vec<u8>), String>
 
 /// シンタックスハイライタの抽象（差し替え点。現実装は syntect、将来 tree-sitter）
 pub trait Highlighter: Send + Sync {
-    /// パス（拡張子・1 行目）から構文を推定して全行をハイライトする
+    /// パス（拡張子・1 行目）から構文を推定して全行をハイライトする。
+    /// 本番の塗りは構文名も要るので [`highlight_text_with_syntax`] を通る（#1948）
+    #[cfg_attr(not(test), allow(dead_code))]
     fn highlight(&self, path: &Path, text: &str) -> Vec<Line>;
     /// 言語トークン（``` の info 文字列）からのハイライト（Markdown のコードブロック用）
     fn highlight_lang(&self, lang: &str, text: &str) -> Vec<Line>;
@@ -1919,6 +1935,11 @@ impl HighlightCache {
     fn invalidate(&mut self) {
         self.checkpoints.clear();
     }
+
+    /// 表示行を塗った構文名（#1948）。全文をまだ塗っていない（平文で待っている）なら `None`
+    fn painted_syntax(&self) -> Option<&str> {
+        (!self.checkpoints.is_empty() && !self.syntax.is_empty()).then_some(self.syntax.as_str())
+    }
 }
 
 /// 表示行と行状態の対応を示す印（#1648）。0 は「まだ塗っていない」
@@ -1952,29 +1973,61 @@ pub(crate) fn ino_highlight_legacy() -> bool {
     *ON.get_or_init(|| std::env::var("TAKO_1949_LEGACY").is_ok_and(|v| v == "1"))
 }
 
-/// 構文セットに定義が無い拡張子（小文字）を、塗れる構文の拡張子へ寄せる。`legacy_1949` は A/B。
+/// 言語の同定の正本（`tako_core::file_type`）の行が名指す構文（two-face の構文名。#1948）。
 ///
-/// `.ino` は C++ として塗る（#1949）。two-face に Arduino の構文は無く、VS Code 同梱の
-/// cpp 言語定義も `.ino` を C++ に含める。寄せるのは**色だけ**で、言語サーバは別
-/// （clangd へ `.ino` を渡すと正しいスケッチに嘘のエラーが出る = #1951）。
-/// この表は #1948 で言語の同定の正本（`file_type`）へ移る
-fn extension_alias(ext: &str, legacy_1949: bool) -> Option<&'static str> {
-    Some(match ext {
-        "jsx" => "js",
-        "mjs" | "cjs" => "js",
-        "mts" | "cts" => "ts",
-        "ino" if !legacy_1949 => "cpp",
-        _ => return None,
-    })
+/// `legacy_1949` は A/B（`TAKO_1949_LEGACY=1`）: `.ino` の行（#1949）だけを外して
+/// #1949 以前の Plain Text へ戻す。ほかの行は変わらない
+fn table_syntax(row: &tako_core::file_type::FileType, legacy_1949: bool) -> Option<&'static str> {
+    if legacy_1949 && row.id == tako_core::file_type::ARDUINO {
+        return None;
+    }
+    row.syntax
 }
 
-/// Markdown のコードブロックの言語トークン（```` ```ino ````）のうち、構文セットが知らない
-/// 名前を塗れる構文のトークンへ寄せる（大文字小文字は問わない）。Arduino は C++（#1949）
-fn fence_alias(token: &str, legacy_1949: bool) -> Option<&'static str> {
-    let arduino = ["ino", "arduino"]
-        .iter()
-        .any(|alias| token.eq_ignore_ascii_case(alias));
-    (arduino && !legacy_1949).then_some("cpp")
+/// いまの表示行を塗った構文名（#1948。CLI / MCP の `syntax` = `ControlHost::preview_syntax`）。
+///
+/// 塗った時点で記録した名前（[`PreviewState::syntax`]）を先に見るので、塗った後の
+/// 問い合わせは構文セットを借りない（#815 の解放を問い合わせで延ばさない）。
+/// 塗りが戻る前（開いた直後の平文・大きい文書の全文の塗り待ち）は、**塗りと同じ解決**
+/// （同じ関数・同じ 1 行目）をその場で引く。コード表示でなければ `None`
+pub fn painted_syntax(preview: &PreviewState, edit: Option<&EditState>) -> Option<String> {
+    let PreviewContent::Code(lines) = &preview.content else {
+        return None;
+    };
+    if preview.mode != PreviewMode::Code {
+        return None;
+    }
+    if let Some(name) = &preview.syntax {
+        return Some(name.clone());
+    }
+    let first: String = match edit {
+        Some(edit) => edit
+            .buffer
+            .text()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        None => lines
+            .first()
+            .map(|line| line.iter().map(|span| span.text.as_str()).collect())
+            .unwrap_or_default(),
+    };
+    Some(
+        highlighter()
+            .0
+            .syntax_for_path(&preview.path, &first)
+            .name
+            .clone(),
+    )
+}
+
+/// 編集の塗りが使った構文名を表示へ写す（#1948。全文の塗り待ちの平文なら `None`）
+fn adopt_painted_syntax(preview: &mut PreviewState, cache: &HighlightCache) {
+    let painted = cache.painted_syntax();
+    if preview.syntax.as_deref() != painted {
+        preview.syntax = painted.map(str::to_owned);
+    }
 }
 
 /// 行の開始バイト（[`syntect::util::LinesWithEndings`] と同じ切り方）
@@ -2035,7 +2088,7 @@ pub struct SyntectHighlighter {
 
 impl SyntectHighlighter {
     fn new() -> Self {
-        // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 270+ 構文。#320）。
+        // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 213 構文。#320）。
         // TS / TSX の正規表現だけ「当たらない行で VM を起こさない」等価形へ書き換えたもの（#1917）
         let syntaxes = crate::syntax_prefilter::syntax_set();
         let mut themes = syntect::highlighting::ThemeSet::load_defaults().themes;
@@ -2050,8 +2103,9 @@ impl SyntectHighlighter {
         }
     }
 
-    /// 読み取り / 編集で共用する構文解決。ファイル名 → 拡張子 → shebang の優先順で
-    /// 構文を特定する。two-face（bat 由来）の 270+ 構文セットが基盤。
+    /// 読み取り / 編集で共用する構文解決。言語の同定の正本（`tako_core::file_type`）の行が
+    /// 構文を名指していればそれ（#1948）。無ければ two-face（bat 由来の 213 構文）の表を
+    /// ファイル名 → 拡張子 → shebang（1 行目）の優先順で引く。
     /// ファイル名を先に試すのは CMakeLists.txt 等の拡張子が汎用（.txt）でも
     /// ファイル名で特定できるケースを拾うため。
     fn syntax_for_path<'a>(
@@ -2059,13 +2113,15 @@ impl SyntectHighlighter {
         path: &Path,
         text: &str,
     ) -> &'a syntect::parsing::SyntaxReference {
+        if let Some(syn) = tako_core::file_type::identify(path)
+            .and_then(|row| table_syntax(row, ino_highlight_legacy()))
+            .and_then(|name| self.syntaxes.find_syntax_by_name(name))
+        {
+            return syn;
+        }
         let file_name = path.file_name().and_then(|v| v.to_str());
         // ファイル名での解決を先に試す（CMakeLists.txt・Dockerfile・Makefile 等）
-        if let Some(syn) = file_name.and_then(|name| {
-            self.syntaxes
-                .find_syntax_by_extension(name)
-                .or_else(|| self.filename_to_syntax(name))
-        }) {
+        if let Some(syn) = file_name.and_then(|name| self.syntaxes.find_syntax_by_extension(name)) {
             return syn;
         }
         let extension = path
@@ -2074,11 +2130,7 @@ impl SyntectHighlighter {
             .map(str::to_ascii_lowercase);
         extension
             .as_deref()
-            .and_then(|ext| {
-                self.syntaxes
-                    .find_syntax_by_extension(ext)
-                    .or_else(|| self.extension_fallback(ext))
-            })
+            .and_then(|ext| self.syntaxes.find_syntax_by_extension(ext))
             .or_else(|| {
                 text.lines()
                     .next()
@@ -2087,31 +2139,10 @@ impl SyntectHighlighter {
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
     }
 
-    /// ファイル名からの追加マッピング（拡張子が無い / 特殊なファイル名用）
-    fn filename_to_syntax<'a>(
-        &'a self,
-        name: &str,
-    ) -> Option<&'a syntect::parsing::SyntaxReference> {
-        let mapped = match name {
-            "Cargo.lock" | "Pipfile" | "Pipfile.lock" | "poetry.lock" => "toml",
-            ".dockerignore" => "gitignore",
-            ".editorconfig" | ".npmrc" | ".yarnrc" => "ini",
-            ".eslintrc" | ".prettierrc" | ".babelrc" => "json",
-            "Justfile" | "justfile" => "makefile",
-            _ => return None,
-        };
-        self.syntaxes
-            .find_syntax_by_extension(mapped)
-            .or_else(|| self.syntaxes.find_syntax_by_name(mapped))
-    }
-
-    /// 拡張子からの追加フォールバック（構文セットに定義が無い拡張子用）
-    fn extension_fallback<'a>(
-        &'a self,
-        ext: &str,
-    ) -> Option<&'a syntect::parsing::SyntaxReference> {
-        let mapped = extension_alias(ext, ino_highlight_legacy())?;
-        self.syntaxes.find_syntax_by_extension(mapped)
+    /// 全文を塗り、塗った構文名を添える（#1948。読み取り表示とライブリロードの塗り）
+    fn highlight_named(&self, path: &Path, text: &str) -> (Vec<Line>, String) {
+        let syntax = self.syntax_for_path(path, text);
+        (self.run(syntax, text), syntax.name.clone())
     }
 
     /// 1 行分の初期状態（まだ 1 行も読んでいない地点）
@@ -2403,15 +2434,19 @@ impl Highlighter for SyntectHighlighter {
     }
 
     fn highlight_lang(&self, lang: &str, text: &str) -> Vec<Line> {
-        let syntax = self
-            .syntaxes
-            .find_syntax_by_token(lang)
-            .or_else(|| {
-                fence_alias(lang, ino_highlight_legacy())
-                    .and_then(|token| self.syntaxes.find_syntax_by_token(token))
-            })
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-        self.run(syntax, text)
+        self.run(self.syntax_for_token(lang), text)
+    }
+}
+
+impl SyntectHighlighter {
+    /// Markdown のコードブロックの言語トークン（```` ```cpp ````）から構文を特定する。
+    /// 言語の同定の正本の別名（```` ```ino ```` = C++。#1949）→ two-face のトークンの順（#1948）
+    fn syntax_for_token(&self, lang: &str) -> &syntect::parsing::SyntaxReference {
+        tako_core::file_type::by_fence_token(lang)
+            .and_then(|row| table_syntax(row, ino_highlight_legacy()))
+            .and_then(|name| self.syntaxes.find_syntax_by_name(name))
+            .or_else(|| self.syntaxes.find_syntax_by_token(lang))
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
     }
 }
 
@@ -2932,6 +2967,7 @@ pub fn markdown_from_text(path: &Path, text: &str) -> PreviewState {
         content_rev: next_content_rev(),
         file_stamp: FileStamp::from_path(path),
         highlight_stamp: None,
+        syntax: None,
     }
 }
 
@@ -5090,6 +5126,10 @@ mod tests {
     }
 }
 
+/// 言語の同定を `tako_core::file_type` へ寄せる前後の全数一致（#1948）
+#[cfg(test)]
+mod file_type_parity_tests;
+
 #[cfg(test)]
 mod syntax_resolution_tests {
     use super::*;
@@ -5140,19 +5180,123 @@ mod syntax_resolution_tests {
     /// #1949: 寄せ先は A/B（`TAKO_1949_LEGACY=1`）で `.ino` だけが外れ、他の行は変わらない
     #[test]
     fn inoの寄せ先はabで外れる() {
-        assert_eq!(extension_alias("ino", false), Some("cpp"));
-        assert_eq!(extension_alias("ino", true), None);
+        use tako_core::file_type::{by_extension, by_fence_token, by_file_name};
+        let row = |ext: &str| by_extension(ext).unwrap_or_else(|| panic!("{ext} の行が無い"));
+        assert_eq!(table_syntax(row("ino"), false), Some("C++"));
+        assert_eq!(table_syntax(row("ino"), true), None);
         for legacy in [false, true] {
-            assert_eq!(extension_alias("jsx", legacy), Some("js"));
-            assert_eq!(extension_alias("mts", legacy), Some("ts"));
-            assert_eq!(extension_alias("pde", legacy), None);
+            assert_eq!(table_syntax(row("jsx"), legacy), Some("JavaScript"));
+            assert_eq!(table_syntax(row("mjs"), legacy), Some("JavaScript"));
+            // two-face が知っている拡張子は表で名指さない
+            assert_eq!(table_syntax(row("mts"), legacy), None);
+            let just = by_file_name("Justfile").expect("Justfile の行");
+            assert_eq!(table_syntax(just, legacy), Some("Makefile"));
         }
-        assert_eq!(fence_alias("ino", false), Some("cpp"));
-        assert_eq!(fence_alias("Arduino", false), Some("cpp"));
-        assert_eq!(fence_alias("INO", false), Some("cpp"));
-        assert_eq!(fence_alias("arduino", true), None);
-        // 構文セットが知っている名前は寄せない（`find_syntax_by_token` が先に当たる）
-        assert_eq!(fence_alias("cpp", false), None);
+        assert!(
+            by_extension("pde").is_none(),
+            "対応形式はこの Issue で増やさない"
+        );
+        for token in ["ino", "Arduino", "INO"] {
+            let row = by_fence_token(token).expect("コードブロックの別名");
+            assert_eq!(table_syntax(row, false), Some("C++"));
+            assert_eq!(table_syntax(row, true), None);
+        }
+        // 構文セットが知っている名前は別名に置かない（`find_syntax_by_token` が当たる）
+        assert!(by_fence_token("cpp").is_none());
+    }
+
+    /// #1948: 言語の同定の正本が名指す構文は、すべて構文セットに在る（綴りを違えると
+    /// 黙って two-face 任せへ落ちるので、ここで落とす）。構文の数は #815 の常駐の前提
+    #[test]
+    fn 表が名指す構文は構文セットに在る() {
+        let hl = SyntectHighlighter::new();
+        let mut named = 0usize;
+        for row in tako_core::file_type::TABLE {
+            if let Some(name) = row.syntax {
+                named += 1;
+                assert!(
+                    hl.syntaxes.find_syntax_by_name(name).is_some(),
+                    "{}: 構文 {name} が構文セットに無い",
+                    row.id
+                );
+            }
+        }
+        assert!(named >= 6, "表が名指す構文が縮退している: {named}");
+        assert_eq!(
+            hl.syntaxes.syntaxes().len(),
+            213,
+            "構文の数が変わった（#815 の常駐と #1948 の全数一致の前提）"
+        );
+    }
+
+    /// 検査用の一時 dir（`name` ごとに別）
+    fn painted_fixture(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tako-1948-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #1948: 応答の `syntax` は、塗った時点の記録を先に見て、記録が無い間（開いた直後の平文）は
+    /// 塗りと同じ解決をその場で引く。コード表示でなければ `None`
+    #[test]
+    fn 塗った構文名は記録を先に見て無ければ塗りと同じ解決を引く() {
+        let dir = painted_fixture("painted");
+        let sketch = dir.join("sketch.ino");
+        std::fs::write(&sketch, "void setup() {}\n").unwrap();
+        let script = dir.join("runme");
+        std::fs::write(&script, "#!/usr/bin/env python3\nprint(1)\n").unwrap();
+        // 開いた直後は平文で記録が無い → 塗りと同じ解決
+        let (mut preview, raw) = load_fast(&sketch, PreviewMode::Code);
+        assert_eq!(preview.syntax, None);
+        assert_eq!(painted_syntax(&preview, None).as_deref(), Some("C++"));
+        // 拡張子なしは表示行の 1 行目（shebang）で決まる = 塗りと同じ
+        let (plain, _) = load_fast(&script, PreviewMode::Code);
+        assert_eq!(painted_syntax(&plain, None).as_deref(), Some("Python"));
+        // 塗りは構文名を添える。記録があればそれを返す（引き直さない = 違う名前を置くとそれが出る）
+        let (lines, syntax) = highlight_text_with_syntax(&sketch, &raw.unwrap());
+        assert_eq!(syntax, "C++");
+        preview.content = PreviewContent::Code(lines);
+        preview.syntax = Some("Recorded".into());
+        assert_eq!(painted_syntax(&preview, None).as_deref(), Some("Recorded"));
+        // コード表示でなければ None
+        let rendered = markdown_from_text(&dir.join("doc.md"), "# 見出し\n");
+        assert_eq!(painted_syntax(&rendered, None), None);
+        let loading = PreviewState::loading(&sketch, PreviewMode::Code);
+        assert_eq!(painted_syntax(&loading, None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948: 編集の塗りが使った構文名が表示へ写る（1 行目を shebang にすると変わる）。
+    /// ライブリロードの塗りも構文名を記録する
+    #[test]
+    fn 編集とリロードの塗りの構文名が表示へ写る() {
+        let dir = painted_fixture("edit");
+        let path = dir.join("runme");
+        std::fs::write(&path, "echo hi\n").unwrap();
+        let mut preview = load(&path, PreviewMode::Code);
+        assert_eq!(preview.syntax.as_deref(), Some("Plain Text"));
+        let mut edit = EditState::open(&preview).unwrap();
+        apply_editor_text(&mut preview, &mut edit);
+        assert_eq!(
+            painted_syntax(&preview, Some(&edit)).as_deref(),
+            Some("Plain Text")
+        );
+        edit.buffer
+            .set_text("#!/usr/bin/env python3\nprint(1)\n".into());
+        apply_editor_text(&mut preview, &mut edit);
+        assert_eq!(preview.syntax.as_deref(), Some("Python"));
+        assert_eq!(
+            painted_syntax(&preview, Some(&edit)).as_deref(),
+            Some("Python")
+        );
+        let sketch = dir.join("sketch.ino");
+        let missing = load_for_reload(&sketch, PreviewMode::Code, None);
+        assert_eq!(missing.state.syntax, None, "読めないファイルは塗らない");
+        std::fs::write(&sketch, "void loop() {}\n").unwrap();
+        let reloaded = load_for_reload(&sketch, PreviewMode::Code, None);
+        assert_eq!(reloaded.state.syntax.as_deref(), Some("C++"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #1949: Markdown の ```ino / ```arduino が ```cpp と同じ塗りになる

@@ -2479,6 +2479,14 @@ beginActivityWithOptions:reason:`（`NSActivityUserInitiatedAllowingIdleSystemSl
 `platform::user_work` の単体、実経路の A/B は `bash scripts/test-highlight-app-nap-1916.sh`
 （間引かれたのを状態で待ってから塗り、P コアで走った比率で判定。旧挙動は `TAKO_1916_LEGACY=1`）。
 
+**どの構文で塗ったかも GUI の外から読める**（#1948）: `tako open` の結果と `tako edit` の応答は
+`file_type`（言語の同定の正本 `tako_core::file_type` の ID）と `syntax`（塗った構文名。
+`ControlHost::preview_syntax`）を載せる。構文名は塗った時点で `PreviewState::syntax` へ記録し
+（読み取り表示の塗り・ライブリロード・編集の塗りの 3 か所）、問い合わせは記録を先に見る =
+**塗った後の問い合わせは構文セットを借りない**（借りると #815 の解放が問い合わせのたびに 30 秒延びる）。
+記録が無い間（開いた直後の平文・大きい文書の全文の塗り待ち）だけ、塗りと同じ解決（同じ関数・同じ
+1 行目）をその場で引く。この間は背景の塗りもすぐ構文セットを借りるので、常駐は変わらない。
+
 ### App Nap はアプリ全体では止めない（#1926。2026-10-09）
 
 #173 の `disable_app_nap` は一度も効いていなかったので、「直してアプリの寿命の間止める」か

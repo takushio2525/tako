@@ -58,7 +58,7 @@ syntect = { version = "5", default-features = false, features = [
     "regex-fancy",
     "default-themes",
 ] }
-# bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 270+ 構文。#320）
+# bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 213 構文。#320）
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 # TS の塗りの正規表現へ前置きを足す（#1917。tako-app/src/syntax_prefilter.rs）。4 つとも
 # syntect が既に使っている版そのもの（新しいクレートは増えない。flate2 は文脈の詰め直し・

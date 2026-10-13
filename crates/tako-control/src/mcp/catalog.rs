@@ -739,7 +739,8 @@ pub fn tools() -> Vec<Value> {
                 ペインは再利用する: 対象がプレビューなら差し替え、同タブにプレビューがあればそこへ、\
                 無ければ pane を分割する（ターミナルは起動しない）。\
                 応答の line / column / item / total_lines / clamped は実際の着地点\
-                （clamped=true は要求が文書の外だったので丸めた）。",
+                （clamped=true は要求が文書の外だったので丸めた）。\
+                file_type は形式の ID、syntax は塗った構文名（コード表示以外は null）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -945,6 +946,7 @@ pub fn tools() -> Vec<Value> {
                 PDF・画像・動画・末尾省略された巨大ファイルは編集できない。状態は editing / dirty で返す。\
                 document は文書の版（version）とカーソル・選択・undo 履歴で、編集系ツールの応答すべてに載る。\
                 viewport はカーソル行が画面に入っているか（visible=false なら画面外）。\
+                file_type / syntax は形式の ID と塗った構文名。\
                 command は Tab / Shift+Tab / Enter と同じ編集（インデントは既存行から推定）。",
             "inputSchema": {
                 "type": "object",
