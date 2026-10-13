@@ -205,6 +205,7 @@ tako/
 | チャット本文のコピー（#725） | `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]` |
 | プラットフォーム対応マトリクス（#515 / #591） | `tako platform [--platform macos|windows] [--status pending] [--known-limitations] [--json]` |
 | **環境の健全性診断（IPC の受け口・CLI の PATH・tmux。#1441）** | `tako check-health [--json]` |
+| **PC のメモリ・CPU と重い処理（どのペインで何が食っているか）（#1993）** | `tako queue` |
 | **codex の利用制限データ（#357 / #985）** | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
 | **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude|codex|agy|local] [--status supported|degraded|pending|unsupported] [--json]` |
 | Windows 対応状況ページの生成（#591） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |

@@ -1,10 +1,10 @@
 ---
 title: MCP ツール一覧
 seoTitle: MCP ツール一覧 — AI エージェントがターミナルを操作するためのツール
-description: tako が AI エージェントに公開する 161 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 162 個の MCP ツールの全リスト
 ---
 
-tako は **161 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **162 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -242,6 +242,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_mod` | tako mod（Claude Code の mod）の状態と切替（ペインごとの ctx・使用制限・ターンの報告。Claude Code の画面の帯の表示切替 = `band-on` / `band-off`） |
 | `tako_migrate` | 設定・データファイルの形式の確認と自動マイグレーションの手動発火 |
 | `tako_check_health` | tako 環境の健全性を診断する |
+| `tako_queue` | PC のメモリ・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動いてどれだけ食っているか |
 | `tako_platform` | プラットフォーム対応マトリクスの参照（使える / 縮退 / 未実装） |
 | `tako_update` | アプリ内更新の診断・チェック・実行 |
 | `tako_stale_binary` | 稼働中セッションの claude バイナリの鮮度確認と張り直し |

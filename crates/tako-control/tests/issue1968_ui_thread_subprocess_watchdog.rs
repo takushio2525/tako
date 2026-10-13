@@ -76,6 +76,12 @@ const FORBIDDEN_ON_UI: &[(&str, &str)] = &[
     ("transcript::", "会話ログのファイル走査"),
     ("codex_session::", "codex の実況のファイル走査"),
     ("agy_session::", "agy の実況のファイル走査"),
+    // #1993: PC リソースの走査（libproc で 1 回 wall 11 ms。覚えは `cached_status` で読む）
+    ("resources::answer(", "PC リソースの走査を起こす（#1993）"),
+    (
+        "platform::resources::",
+        "PC リソースの OS への問い合わせ（#1993）",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -439,6 +445,13 @@ struct Injection {
 }
 
 const INJECTIONS: &[Injection] = &[
+    Injection {
+        name: "収集で PC リソースを走査する（#1993）",
+        file: DISPATCH,
+        from: "        has_running_children: false,\n        live_tail: lines.map(tail_join),",
+        to: "        has_running_children: crate::resources::answer(None).is_ok(),\n        live_tail: lines.map(tail_join),",
+        expect: "resources::answer(",
+    },
     Injection {
         name: "収集で子プロセスを数える（修正前の collect_worker_status_ctx）",
         file: DISPATCH,

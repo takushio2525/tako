@@ -7077,6 +7077,15 @@ fn dispatch_inner(
 
         Request::CheckHealth => Ok(check_health(host)),
 
+        // #1993: 通常は受け口（`ipc::submit`）が答えるのでここへは来ない。来たら（UI スレッドの
+        // 同期の dispatch）**採らずに**覚えだけを返す（走査は 1 回 11 ms = UI の 1 フレームを超える）
+        Request::Queue { action } => match action.as_deref().unwrap_or("status") {
+            "status" => Ok(crate::resources::cached_status()),
+            other => Err(DispatchError::InvalidParams(format!(
+                "未知の action: {other}（使えるのは status）"
+            ))),
+        },
+
         // #1678: 通常は prepare_offload が background へ出す。ここへ来るのは
         // `TAKO_OFFLOAD=0` か manager を持たない host（= 「使えない」と答える）
         Request::LspServer { action, name } => {

@@ -76,6 +76,11 @@ pub fn submit(
     if let Some(opts) = wait::RunOptions::from_start_request(&request) {
         return start_run(tx, &opts, origin);
     }
+    // #1993: PC リソースの状況は UI の受け口へ渡さずここで答える（採取は背景スレッドの覚え、
+    // 古ければこの接続のスレッドで採り直す）。UI が固まっていても答えられる
+    if let Request::Queue { action } = &request {
+        return crate::resources::answer(action.as_deref()).map_err(SubmitError::Rejected);
+    }
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
     tx.unbounded_send(IncomingRequest {
         request,

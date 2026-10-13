@@ -1668,6 +1668,21 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1993（PC リソース管理 #1992 の S1）
+        json!({
+            "name": "tako_queue",
+            "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・\
+                ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。\
+                panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・\
+                ビルドの前に空きを確かめる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["status"], "default": "status" },
+                },
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "tako_setup_mcp",
             "description": "エージェント CLI へ tako MCP サーバーの接続設定を追加する（初回セットアップ時に呼ぶ。設定済みなら\

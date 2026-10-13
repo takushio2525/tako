@@ -1785,6 +1785,23 @@ codex / agy は理由つき skip）。自動解決へ回った行は #1499（Z5�
 対応状況: claude は Supported（`agent_support` の `claude_mod_state` / `claude_mod_band` / `claude_mod_buttons` / `claude_mod_cards` / `claude_mod_ui` / `claude_mod_install`。ui.json のうちボタン・バー・帯の区切り・色の描画は #1962、カード（`cards.place`）は #1963 で効く。チャットの描画は #1964）、codex / agy は同等の拡張点を未調査で Pending（#1885）。
 Windows は Pending（#1886。区切り `;` の連結は単体テスト済み、実機の Claude Code で読むかは未実測）。
 
+### FR-2.43 PC リソース管理（エピック #1992。S1 = 計測の土台と読み取り口 ✅ #1993）
+
+> あちこちのペインで同時に走るビルド・テスト・隔離 GUI が PC を落とす（9/25 swap 6.8 / 8 GB・load 86 で
+> WindowServer ごと落ちた / 10/10 load 242・swap 8.4 / 9.2 GB で再起動）。PC 全体と「どのペイン / worker /
+> tako の外が何をしていて、どれだけ食っているか」を見せ、優先度つきの順番待ちで重い処理を回す。
+> 設計の正本は `.agent/plans/2026-10-resource-manager.md`（判断点 §11 は 10/12 にすべて推奨どおりで確定）。
+
+| ID | 要件 | 優先度 | 状況 |
+|---|---|---|---|
+| FR-2.43.1 | **PC 全体の計測**: メモリの内訳（Activity Monitor と同じ式 = 使用は app + wired + 圧縮、空きは全体 − 使用）・swap・メモリ圧（normal / warn / critical）・CPU%（全コアの差分）・load・論理 CPU 数。OS への問い合わせは**境界 B29**（`tako_core::platform::resources`。sysctl / mach / libproc だけで**子プロセスを起こさない**）、解釈は純関数（`tako_core::resources`）。Windows は `None`（対応マトリクス `tako_queue` = Pending、#2000） | M | ✅ #1993 |
+| FR-2.43.2 | **プロセス単位の計測と帰属**: 全プロセスの親・名前・物理フットプリント・CPU 時間（**mach tick を timebase で換算**。Apple Silicon は 125/3）・開始時刻（pid の再利用は開始時刻で見分ける）。argv と env（`TAKO_PANE_ID` / `TAKO_SOCKET` / `TAKO_ISOLATED`）は**新しいプロセスだけ**読む。帰属は ①ペインの根（器の無いペインは PTY 直下の子、器のペインは `pane_pid`）の子孫 → ②env の `TAKO_PANE_ID`（`TAKO_SOCKET` が自分の受け口と一致するときだけ = 隔離の tako のペイン番号と取り違えない）→ ③tako の外（launchd 直下の祖先の名前を添える）。分類は agent（claude は実行ファイル名が版数なので argv で見る）/ ビルド / ブラウザ / 隔離 GUI。**agent の補助プロセス**（祖先を辿ってシェルより先に agent に当たる = MCP サーバーとその子）は重い処理に数えず agent の常駐へ入れる。重い処理 1 件 = 重い祖先を持たない重いプロセスとその木 | M | ✅ #1993 |
+| FR-2.43.3 | **採取は背景スレッド**（`tako_control::resources::start`）: 機全体 2 秒・プロセスの走査は誰も見ていなければ 30 秒（status を受けてから 10 秒は 2 秒。設計書 §2.2 の 5 秒は隔離 GUI（debug・器あり・90 秒のアイドル × 2 回）の A/B で 1 コアの +0.57% と見込みを超えたので 30 秒へ落とした。30 秒では採取あり 0.71 / 0.99% 対 なし 0.85 / 0.90% = 差がばらつきの中。見ている間の 2 秒ごとは走査 1 回 22〜24 ms（debug）ぶん増える）。UI スレッドは 2 秒 tick でペインの一覧を写して渡す（`publish_resource_panes`）と覚えを読む（`cached_status`）だけ。番犬 `crates/tako-control/tests/issue1993_resources_ui_thread_watchdog.rs`（+ #1968 / #1984 の番犬の禁止リスト）。A/B（採取の費用の比較）は `TAKO_1993_NO_SAMPLER=1` | M | ✅ #1993 |
+| FR-2.43.4 | **読み取りの口**: CLI `tako queue [--json]` / MCP `tako_queue`（`action: status`）/ dispatch `Request::Queue`。**`ipc::submit` が UI の受け口へ渡す前に答える**（覚えが 2 秒より古ければその接続のスレッドで採り直す = UI が固まっていても答えられる）。応答は `machine`（`memory_mb` / `swap_mb` / `pressure` / `cpu_percent` / `load` / `cpus`）・`heavy`（誰 / 何 / メモリ / CPU% / 本数）・`panes`（メモリの多い順に上位 10。`agent_mb` は agent + MCP サーバー）・`external`・`scan`。表示用のコマンド行は第 1 語とパスを basename に畳み、鍵・トークンらしい値は伏せる | M | ✅ #1993 |
+| FR-2.43.5 | **GUI が居ないときも機の状態は答える**: CLI は自分で機の値を採り（CPU% は 250 ms 空けて 2 回）、「順番待ちは無効（tako が起動していない）」を添える | S | ✅ #1993 |
+| FR-2.43.6 | 順番待ち（`tako queue <cmd>`・同時数 / メモリ / メモリ圧 / swap の条件・再起動をまたぐ・tako 不在は待たずに走る）。順番待ちで走らせる操作は**CLI だけ**（待ち行列に入るのは呼び手のシェルの子で、MCP の呼び出しには包む対象が無い。UI にも「走らせる」操作は無い） | M | #1994 |
+| FR-2.43.7 | 右パネルの `resources` ビューとステータスバーの 1 区画 / 優先度と終わりの見込み / AI の運用（spawn の助言）/ cargo の共有 jobserver / スマホ / Windows | M | #1995〜#2000 |
+
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース
 
 | ID | 要件 | 優先度 |

@@ -16,9 +16,9 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 124 / 161（77%） | macOS と同じように使えます |
+| 対応 | 124 / 162（77%） | macOS と同じように使えます |
 | 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
-| 未実測 | 5 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
+| 未実測 | 6 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
 
@@ -203,7 +203,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 
 ## OS 連携
 
-対応 6・一部対応 2・未対応 / 未実測 1・対象外 1
+対応 6・一部対応 2・未対応 / 未実測 2・対象外 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -214,6 +214,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 | `tako_shell_integration` | 一部対応 | cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766） | 実機実測: #766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525） |
 | `tako_stale_binary` | 一部対応 | 古いバイナリの検知と警告は動くが、バナーの「張り直す」はプロセスの終了要求が Windows 未対応のため実行できない（#1067 / 境界 B5） | 実機実測: #936 の Windows 11 実測（隔離 GUI + 偽 claude）: 実行中プロセスのパスを境界 B5（`procinfo::image_path`）で解決し、`tako stale-binary status` が stale=true / spawned_version=1.0.0 / current_version=1.0.1 を返してバナー「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」が出る。claude の自己更新と同じ形（旧 exe を改名 → 新 exe を同じ名前で設置）でも stale=false → true へ変わる。張り直しは #1067 の terminate 未実装のため実行できない |
 | `tako_check_health` | 対応 | — | 実機実測: #937 の Windows 11 実測: MCP `tako_check_health` が HTTP 200 で healthy=true / tmux_available=true / persist_enabled=true / version_match=true / issues=[] を返す |
+| `tako_queue` | 未対応 / 未実測 | PC 全体のメモリ・CPU とプロセスごとの消費の計測（境界 B29）は macOS だけ。Windows は機の値を「まだ採れない」と返す（#2000） | 未実測 |
 | `tako_telemetry` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako telemetry status` → `on` → `status`（true）→ `off` → `status`（false）の往復 |
 | `tako_test_residue` | 対応 | — | 実機テスト: test_residue の単体 12 本 + tako-core の test_data_residue（子プロセスを起こして dir の有無を実測。TMP / TEMP を使い捨てへ向けるので Windows でも同じ経路を通る） |
 | `tako_mod` | 未対応 / 未実測 | 実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う） | 未実測 |

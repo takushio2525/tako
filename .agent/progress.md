@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-13（#2016: 右パネル tasks の返答欄 = IME が欄の中に出る・欄の幅で折り返し 8 行で止まる・押した次のフレームで欄が空・返答の履歴を古い順・時刻つきでフォームの上へ）
-- 真因（visual-test `tasks-input` の A/B）: IME は宛先が TaskComment なのに描画が未確定文字列もキャレット矩形も出さず候補窓がターミナルの原点へ / 行を縮まない横並びで描き 183 字でも 1 行・31 行で 566px / 送信が UI スレッドで積む → 運ぶ → 記録 → 一覧を回してから欄を空に。返答は dispatch と共有の 3 段（`user_task_respond_store` / `_deliver` / `_finish`）へ、時刻は `user_task::response_stamp` を画面と `tako todo show` で共有。A/B `TAKO_2016_LEGACY=1`・番犬 `issue2016_tasks_input_watchdog`（注入 14 通り）・MCP カタログ無変更
-- 実測: `scripts/test-tasks-input-2016.sh` 6 PASS（NSView へ NSTextInputClient を直接送る IME・折り返し 7 行・上限 136px・送信が押下に足す時間 1.1 ms ← 旧 67〜91 ms（debug・105 KB）・続けて 3 回押しても順に積む・履歴が show と同じ・積めなかったら欄へ戻る）/ 旧は同じ節で FAILED。実 IME（かなモードの打鍵）は未検証 = manual-checks
-
 ## 2026-10-13（#1961: マウス報告を要求する TUI へ左クリック / ドラッグを渡す = ⌥ / Shift + ドラッグで tako の選択・tako mouse / tako click）
 - 判断と符号化は `tako_core::mouse_forward` の 1 実装（route → decide → click_report_bytes）。器のペインは器のペイン側のフラグを background で問い合わせ、答えまでのイベントを溜めて send-keys -H で渡すか選択として再生。設定 `mouse_click_forward`（既定 ON・serde default）= `tako mouse` / MCP `tako_scrollback` の `mouse_forward` / 設定画面。AI は `tako click` / `tako_send_input` の `click`。A/B `TAKO_1961_LEGACY=1`・カタログ +861 B
 - 実測: `scripts/test-click-forward-1961.sh` 7 PASS（visual 直接 / 器 × 新旧 = 新は 9 場面 OK・旧は ① で FAILED、実物の claude 2.1.294 で Jump to bottom・帯の compact / split right・AI のカード（#1963）の Run / 閉じるをクリックで押せた）。器の e2e は 150 回で押す / 離すの欠け 0・断片 0。番犬は注入 11 通りを名指し。罠: claude は mount 後 300 ms のクリックを捨てる
@@ -59,3 +55,7 @@
 ## 2026-10-13（#2031: 右パネル tasks の 2 秒ごとの一覧更新を UI スレッドから外し、置き場の版が同じなら読まない）
 - dispatch の "list" と共有の 2 段: 配送の観測 `user_task_list_observe`（UI・I/O なし）→ 書き戻しと読み・解釈 `user_task_list_load` + `parse_list`（background。版 = 更新時刻・大きさ・inode を読む前に採り、同じなら前回の正本から組み直す・添付の実在は毎回）。2 秒ループ・タブ・「完了も表示」は `spawn_user_tasks_list`。A/B `TAKO_2031_LEGACY=1`・注入 `TAKO_2031_INJECT=slow:<ms>`・番犬 `issue1984_*` 9 節（注入 7 通り）
 - 実測（読み 1500 ms の注入）: visual-test `tasks-tick` の打鍵の間隔の最大 3049 → 56 ms・`scripts/test-tasks-tick-2031.sh` 5 PASS（IPC 最大 2849 → 26 ms・測定区間の UI スレッドの読み 8 → 0 回）
+
+## 2026-10-13（#1993: PC リソース管理 S1 = 機とプロセスの計測を背景で採り、`tako queue` / MCP `tako_queue` で読む）
+- 境界 B29 `platform::resources`（sysctl / mach / libproc。mach tick は timebase で換算・他ユーザーの rusage は呼ばない）+ 純関数 `tako_core::resources`（Activity Monitor の式・分類・帰属・重い処理 = 重い祖先を持たない木）+ `tako_control::resources`（背景スレッド・`ipc::submit` が UI を通さず答える）。GUI 不在の CLI は機の値だけ。番犬 `issue1993_*`（+ #1968 / #1984）・カタログ +574 B・Windows は Pending（#2000）
+- 実測: `scripts/test-resources-1993.sh` 10 項目緑（vm_stat の式と一致・器の子孫 / nohup の子の帰属）。Apple のプラットフォームバイナリは env を読めない（0 キー）。費用は走査 5 秒で +0.57% → 見ていない間 30 秒へ落として差がばらつきの中（0.85% 対 0.87%）

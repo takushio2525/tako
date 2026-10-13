@@ -2339,6 +2339,23 @@
     "name": "tako_check_health"
   },
   {
+    "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・ビルドの前に空きを確かめる。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "default": "status",
+          "enum": [
+            "status"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_queue"
+  },
+  {
     "description": "エージェント CLI へ tako MCP サーバーの接続設定を追加する（初回セットアップ時に呼ぶ。設定済みなら何もしない）。agent 省略で claude + 導入済みの codex / agy へまとめて登録し（未導入は理由つきで skip）、明示したときだけ未導入・非対応スコープを分類済みエラーで返す。書き込み先は claude = ~/.claude.json、codex = codex mcp add（~/.codex/config.toml。env_vars は変数名だけでトークンは残らない）、agy = agy mcp add（~/.gemini/config/mcp_config.json）。scope=project は呼び出し元ペインの cwd の .mcp.json（claude のみ）。旧版が ~/.claude/settings.json に書いた無効な設定は自動で掃除する。応答の agents 配列が各エージェントの結果（skipped / error_kind つき）。",
     "inputSchema": {
       "additionalProperties": false,

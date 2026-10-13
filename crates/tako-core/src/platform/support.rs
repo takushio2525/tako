@@ -214,6 +214,13 @@ pub mod notes {
 
     /// #1678。起動・同期の経路は OS 分岐を持たず偽サーバの e2e が Windows でも走るが、
     /// 実サーバとの握手は macOS の rust-analyzer でしか実測していない
+    /// PC リソースの計測（境界 B29。#1993）。Windows 側は未実装で、`tako queue` は機の値を
+    /// 「この OS ではまだ採れない」と返す（S8 = #2000 で実装と実機の実測）
+    pub const WIN_RESOURCES_UNIMPLEMENTED: Note = Note::new(
+        "PC 全体のメモリ・CPU とプロセスごとの消費の計測（境界 B29）は macOS だけ。Windows は機の値を「まだ採れない」と返す（#2000）",
+        "Measuring machine-wide memory / CPU and per-process usage (boundary B29) is macOS only. On Windows the machine values are reported as not available yet (#2000)",
+    );
+
     pub const WIN_LSP_REAL_SERVER_UNMEASURED: Note = Note::new(
         "言語サーバの起動・握手・文書同期と、未導入のサーバを data dir へ取って起こす経路（#1944）は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことも、配布元から実際に取ったこともまだ無い（#1007）",
         "Starting, handshaking, syncing documents and fetching a missing server into the data dir (#1944) are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken or downloaded from its real source on real Windows hardware yet (#1007)",
@@ -1294,6 +1301,17 @@ pub const MATRIX: &[Feature] = &[
         windows_evidence: Evidence::SelfTest(
             "項目 66b-2 / 70 / 112 / 114（コード・md・画像は緑。PDF はページ画像だけ通り文字座標の検査はスキップ）",
         ),
+    },
+    Feature {
+        // #1993: 計測は境界 B29 `platform::resources`。Windows 側は `None` を返すスタブで、
+        // 読み取りの口（IPC / MCP / CLI）は動くが機の値とプロセスの消費は空になる
+        key: "tako_queue",
+        macos: Support::Supported,
+        windows: Support::Pending {
+            note: notes::WIN_RESOURCES_UNIMPLEMENTED,
+            issue: 2000,
+        },
+        windows_evidence: Evidence::Unverified,
     },
     Feature {
         key: "tako_read_pane",
