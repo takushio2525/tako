@@ -19,6 +19,9 @@
 //! [`LspManager::hover`]。マウスの要求は補完と同じく前の 1 つを `$/cancelRequest` で捨てる）。
 //! #1944 の取得 = `tako lsp install`（未導入のサーバを data dir へ取る。ダウンロード・検証・確定は
 //! [`fetch`]、展開は [`archive`]、開いた時点で取るのと状態は [`LspManager`]）。
+//! S8（#1685）の参照検索・呼び出し階層・型階層 = `tako lsp references` 等（問い合わせの型と応答は
+//! [`xref`]、待つのは [`LspManager::xref`] / [`LspManager::xref_expand`]。結果の保持とツリーの
+//! 展開状態は `tako_core::lsp::xref`）。
 
 pub mod archive;
 pub mod completion;
@@ -32,6 +35,7 @@ pub mod menu;
 pub mod rpc;
 pub mod server;
 pub mod text;
+pub mod xref;
 
 pub use completion::{CompletionAnswer, CompletionError, CompletionRequest};
 pub use diagnostics::DocDiagnostics;
@@ -44,3 +48,4 @@ pub use manager::{
     LspManager, DIAGNOSTICS_EVENT_CAPACITY,
 };
 pub use menu::{MenuCapabilities, MenuRequest};
+pub use xref::{ExpandAnswer, ExpandRequest, XrefAnswer, XrefRequest};

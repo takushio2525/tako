@@ -88,6 +88,17 @@
 //! `hold_while_loading`（`loading` の読み込み中は null で即答せず、済むまで答えない。#1893）を持つ。
 //! 当たる規則が無ければ `null`（= 表示するものが無い）で答える。
 //!
+//! 参照検索・呼び出し階層・型階層（`textDocument/references` / `prepareCallHierarchy` /
+//! `callHierarchy/incomingCalls` / `outgoingCalls` / `prepareTypeHierarchy` / `typeHierarchy/supertypes` /
+//! `subtypes`。#1685）は `--xref <file>` か `TAKO_LSP_FAKE_XREF` の規則で答える。**渡したときだけ**
+//! `referencesProvider` / `callHierarchyProvider` / `typeHierarchyProvider` を申告する（渡さない既存の
+//! テストの能力の組は変わらない）。形は定義ジャンプの規則と同じく**上から順に最初に当たった 1 つ**で、
+//! `method` / `uri_suffix` / `line`（位置で問う要求の 0 起点の行）/ `item_name`（展開の要求の
+//! `item.name`）で絞り、`result`（そのまま返す）/ `silent` / `crash` / `generate`（参照の要求に
+//! 問われた文書の 0..N 行目の `Location` を N 件作って返す = 巨大な結果）を持つ。
+//! `loading` の読み込み中は参照と prepare に空（`[]`）で答える（定義ジャンプと同じ）。
+//! 当たる規則が無ければ `null` で答える。
+//!
 //! ## 本文の模型（#1769）
 //!
 //! 受けた本文（didOpen の全文・didChange の範囲 / 全文）を**自前で当てて**持つ。位置の数え方は
@@ -227,6 +238,43 @@ const GOTO_PROVIDERS: [&str; 4] = [
 
 /// 整形の 2 種の method（#1683）
 const FORMAT_METHODS: [&str; 2] = ["textDocument/formatting", "textDocument/rangeFormatting"];
+
+/// 参照検索・呼び出し階層・型階層の method（#1685）
+const XREF_METHODS: [&str; 7] = [
+    "textDocument/references",
+    "textDocument/prepareCallHierarchy",
+    "callHierarchy/incomingCalls",
+    "callHierarchy/outgoingCalls",
+    "textDocument/prepareTypeHierarchy",
+    "typeHierarchy/supertypes",
+    "typeHierarchy/subtypes",
+];
+
+/// 参照検索・階層の能力のキー（`--xref` を渡したときだけ申告する。#1685）
+const XREF_PROVIDERS: [&str; 3] = [
+    "referencesProvider",
+    "callHierarchyProvider",
+    "typeHierarchyProvider",
+];
+
+/// 規則のうち、この参照・階層の要求に最初に当たるもの（#1685）
+fn xref_rule<'a>(
+    rules: &'a [serde_json::Value],
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    let uri = params["textDocument"]["uri"].as_str();
+    let line = params["position"]["line"].as_u64();
+    let name = params["item"]["name"].as_str();
+    rules.iter().find(|rule| {
+        rule["method"].as_str().is_none_or(|m| m == method)
+            && rule["uri_suffix"]
+                .as_str()
+                .is_none_or(|s| uri.is_some_and(|u| u.ends_with(s)))
+            && rule["line"].as_u64().is_none_or(|l| Some(l) == line)
+            && rule["item_name"].as_str().is_none_or(|n| Some(n) == name)
+    })
+}
 
 /// 行の数え方（#1769。模型の説明は冒頭）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -612,6 +660,11 @@ fn main() {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
+    // #1685: 参照検索・階層の規則（渡したときだけ能力を申告する）
+    let xref_rules: Option<Vec<serde_json::Value>> =
+        arg_or_env(&args, "--xref", "TAKO_LSP_FAKE_XREF")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok());
     let doc_log = arg_or_env(&args, "--doc-log", "TAKO_LSP_FAKE_DOC_LOG");
     let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     append(&spawns, &std::process::id().to_string());
@@ -739,6 +792,11 @@ fn main() {
                 }
                 if scenario != "no-hover" {
                     capabilities["hoverProvider"] = serde_json::json!(true);
+                }
+                if xref_rules.is_some() {
+                    for key in XREF_PROVIDERS {
+                        capabilities[key] = serde_json::json!(true);
+                    }
                 }
                 if scenario != "no-completion" {
                     capabilities["completionProvider"] = serde_json::json!({
@@ -895,6 +953,48 @@ fn main() {
                     "id": id,
                     "result": rule.get("result").cloned().unwrap_or(serde_json::Value::Null),
                 }));
+            }
+            (method, Some(id)) if XREF_METHODS.contains(&method) => {
+                let params = &message["params"];
+                // 読み込み中は位置で問う要求（参照・prepare）に空で答える（定義ジャンプと同じ）
+                if !loaded.load(std::sync::atomic::Ordering::SeqCst)
+                    && params.get("position").is_some()
+                {
+                    early_empty(id, serde_json::json!([]));
+                    continue;
+                }
+                let rules = xref_rules.as_deref().unwrap_or_default();
+                let Some(rule) = xref_rule(rules, method, params) else {
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+                    continue;
+                };
+                if rule["crash"].as_bool() == Some(true) {
+                    std::process::exit(6);
+                }
+                if rule["silent"].as_bool() == Some(true) {
+                    continue;
+                }
+                let result = match rule["generate"].as_u64() {
+                    // 巨大な結果: 問われた文書の 0..N 行目を指す Location を N 件
+                    Some(n) => serde_json::Value::Array(
+                        (0..n)
+                            .map(|line| {
+                                serde_json::json!({
+                                    "uri": params["textDocument"]["uri"].clone(),
+                                    "range": {
+                                        "start": { "line": line, "character": 0 },
+                                        "end": { "line": line, "character": 1 },
+                                    },
+                                })
+                            })
+                            .collect(),
+                    ),
+                    None => rule
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                };
+                out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
             }
             (method, Some(id)) if FORMAT_METHODS.contains(&method) => {
                 let params = &message["params"];

@@ -685,6 +685,58 @@ pub fn diagnostics_pane(pane: u64) -> String {
     tr!(format!("ペイン {pane}"), format!("pane {pane}"))
 }
 
+// --- references ビュー（キー: panel.xref_*。#1685） ---
+
+/// 操作の名前（右クリックメニューの項目と、ビューの見出しの種類に同じ言葉を使う）
+pub fn xref_action(kind: tako_core::lsp::xref::XrefKind) -> &'static str {
+    use tako_core::lsp::xref::XrefKind;
+    match kind {
+        XrefKind::References => tr!("参照を検索", "Find All References"),
+        XrefKind::IncomingCalls => tr!("呼び出し元を表示", "Show Incoming Calls"),
+        XrefKind::OutgoingCalls => tr!("呼び出し先を表示", "Show Outgoing Calls"),
+        XrefKind::Supertypes => tr!("スーパータイプを表示", "Show Supertypes"),
+        XrefKind::Subtypes => tr!("サブタイプを表示", "Show Subtypes"),
+    }
+}
+/// 見出しの種類（短い呼び名）
+pub fn xref_kind(kind: tako_core::lsp::xref::XrefKind) -> &'static str {
+    use tako_core::lsp::xref::XrefKind;
+    match kind {
+        XrefKind::References => tr!("参照", "References"),
+        XrefKind::IncomingCalls => tr!("呼び出し元", "Incoming calls"),
+        XrefKind::OutgoingCalls => tr!("呼び出し先", "Outgoing calls"),
+        XrefKind::Supertypes => tr!("スーパータイプ", "Supertypes"),
+        XrefKind::Subtypes => tr!("サブタイプ", "Subtypes"),
+    }
+}
+pub fn xref_empty() -> &'static str {
+    tr!(
+        "コードの識別子を右クリックして「参照を検索」等を選ぶと、結果がここに並びます",
+        "Right-click an identifier in code and choose Find All References (or a hierarchy) to list results here"
+    )
+}
+pub fn xref_searching(symbol: &str) -> String {
+    tr!(
+        format!("{symbol} を言語サーバに問い合わせています…"),
+        format!("Asking the language server about {symbol}…")
+    )
+}
+pub fn xref_none() -> &'static str {
+    tr!("見つかりませんでした", "Nothing found")
+}
+pub fn xref_count(n: usize) -> String {
+    tr!(format!("{n} 件"), format!("{n} results"))
+}
+pub fn xref_more(n: usize) -> String {
+    tr!(
+        format!("ほか {n} 件（全件は tako lsp results --limit 0）"),
+        format!("{n} more (see tako lsp results --limit 0 for all)")
+    )
+}
+pub fn xref_close() -> &'static str {
+    tr!("この結果を閉じる", "Close this result")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -832,7 +884,21 @@ mod tests {
                 tasks_ago(7200),
                 tasks_ago(200_000),
                 tasks_load_failed("no data dir"),
+                // #1685: references ビュー
+                xref_empty().to_string(),
+                xref_searching("helper"),
+                xref_none().to_string(),
+                xref_count(3),
+                xref_more(5),
+                xref_close().to_string(),
             ]
+            .into_iter()
+            .chain(
+                tako_core::lsp::xref::XrefKind::ALL
+                    .into_iter()
+                    .flat_map(|k| [xref_action(k).to_string(), xref_kind(k).to_string()]),
+            )
+            .collect()
         });
     }
 }

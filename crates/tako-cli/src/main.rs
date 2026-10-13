@@ -1026,6 +1026,107 @@ enum LspCommand {
     /// Markdown / 平文のまま出す（既定は 16,000 字まで。`--full` で全文・`--limit N` で N 字まで）。
     /// `--show` で GUI のその位置にカードも出す。MCP は `tako_lsp` の action=hover（`limit`。0 = 全文）
     Hover(LspHoverArgs),
+    /// その位置の識別子の参照の一覧（GUI の右クリックの「参照を検索」と同じ。#1685）。
+    /// 結果はそのペインの結果として保持し（`tako lsp results` で読み直す）、行の `id` を
+    /// `tako lsp open-result --item N` へ渡すとその位置を開く。MCP は `tako_lsp` の action=references
+    References(LspXrefArgs),
+    /// その位置の関数の呼び出し元のツリー（根を 1 段開いた形。引数は references と同じ）
+    IncomingCalls(LspXrefArgs),
+    /// その位置の関数の呼び出し先のツリー（引数は references と同じ）
+    OutgoingCalls(LspXrefArgs),
+    /// その位置の型のスーパータイプのツリー（引数は references と同じ）
+    Supertypes(LspXrefArgs),
+    /// その位置の型のサブタイプのツリー（引数は references と同じ）
+    Subtypes(LspXrefArgs),
+    /// 保持している参照・階層の結果を読む（右パネルの references ビューと同じ中身。`retained` =
+    /// 保持件数）。`--pane` は結果を問い合わせたペイン（省略で右パネルの結果）
+    Results(LspResultsArgs),
+    /// ツリーのノードを開く（子を読んでいなければ言語サーバへ問い合わせる）
+    Expand(LspResultItemArgs),
+    /// ツリーのノードを閉じる
+    Collapse(LspResultItemArgs),
+    /// 一覧の行 / ツリーのノードの位置を開く（右パネルの行のクリックと同じ。着地は定義ジャンプと同じ）
+    OpenResult(LspOpenResultArgs),
+    /// 結果を消す（右パネルの見出しの × と同じ。`--pane` 省略で右パネルの結果）
+    ClearResults {
+        /// 結果を問い合わせたペイン ID（省略で右パネルの結果）
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+}
+
+/// `tako lsp references` 等の引数（#1685）。位置は `tako edit replace-range` と同じ
+/// （行 1 始まり・桁 0 始まりの行内 UTF-8 バイト。応答の位置もこの形）
+#[derive(clap::Args)]
+struct LspXrefArgs {
+    /// コードプレビューのペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 行（1 始まり）
+    #[arg(long)]
+    line: usize,
+    /// 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否）
+    #[arg(long)]
+    column: usize,
+    /// 右パネルの references ビューにも出す
+    #[arg(long)]
+    show: bool,
+    /// 出す行の数（既定 100。0 は保持しているもの全部）
+    #[arg(long)]
+    limit: Option<usize>,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
+}
+
+/// `tako lsp results` の引数（#1685）
+#[derive(clap::Args)]
+struct LspResultsArgs {
+    /// 結果を問い合わせたペイン ID（省略で右パネルの結果）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 出す行の数（既定 100。0 は全部）
+    #[arg(long)]
+    limit: Option<usize>,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
+}
+
+/// `tako lsp expand` / `collapse` の引数（#1685）
+#[derive(clap::Args)]
+struct LspResultItemArgs {
+    /// ノードの番号（応答の id）
+    #[arg(long)]
+    item: usize,
+    /// 結果を問い合わせたペイン ID（省略で右パネルの結果）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
+}
+
+/// `tako lsp open-result` の引数（#1685）
+#[derive(clap::Args)]
+struct LspOpenResultArgs {
+    /// 一覧の行 / ツリーのノードの番号（応答の id）
+    #[arg(long)]
+    item: usize,
+    /// 結果を問い合わせたペイン ID（省略で右パネルの結果）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 別のファイルを開く新しいペインの置き場所（省略で right。none は開かずに場所だけ返す）
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+        tako_core::lsp::goto::Placement::NAMES
+    ))]
+    open: Option<String>,
+    /// 着地したペインへフォーカスを移す
+    #[arg(long)]
+    focus: bool,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
 }
 
 /// `tako lsp menu` の引数（#1684）。位置は `tako edit replace-range` と同じ
@@ -1217,6 +1318,67 @@ impl LspCommand {
                 show: args.show.then_some(true),
                 limit: args.wire_limit(),
             },
+            Self::References(args)
+            | Self::IncomingCalls(args)
+            | Self::OutgoingCalls(args)
+            | Self::Supertypes(args)
+            | Self::Subtypes(args) => Request::LspXref {
+                action: self
+                    .xref_kind()
+                    .map(|k| k.slug())
+                    .unwrap_or_default()
+                    .to_string(),
+                pane: target_pane(args.pane)?,
+                line: args.line,
+                column: args.column,
+                show: args.show.then_some(true),
+                limit: args.limit,
+            },
+            Self::Results(args) => results(
+                tako_control::dispatch::LSP_RESULTS_ACTION,
+                args.pane,
+                None,
+                args.limit,
+            ),
+            Self::Expand(args) => results(
+                tako_control::dispatch::LSP_EXPAND_ACTION,
+                args.pane,
+                Some(args.item),
+                None,
+            ),
+            Self::Collapse(args) => results(
+                tako_control::dispatch::LSP_COLLAPSE_ACTION,
+                args.pane,
+                Some(args.item),
+                None,
+            ),
+            Self::OpenResult(args) => Request::LspResults {
+                action: tako_control::dispatch::LSP_OPEN_RESULT_ACTION.to_string(),
+                pane: args.pane,
+                item: Some(args.item),
+                open: args.open.clone(),
+                focus: args.focus.then_some(true),
+                limit: None,
+            },
+            Self::ClearResults { pane } => results(
+                tako_control::dispatch::LSP_CLEAR_RESULTS_ACTION,
+                *pane,
+                None,
+                None,
+            ),
+        })
+    }
+
+    /// 参照・階層なら種類（#1685）
+    fn xref_kind(&self) -> Option<tako_core::lsp::xref::XrefKind> {
+        use tako_core::lsp::xref::XrefKind;
+        Some(match self {
+            Self::References(_) => XrefKind::References,
+            Self::IncomingCalls(_) => XrefKind::IncomingCalls,
+            Self::OutgoingCalls(_) => XrefKind::OutgoingCalls,
+            Self::Supertypes(_) => XrefKind::Supertypes,
+            Self::Subtypes(_) => XrefKind::Subtypes,
+            _ => return None,
         })
     }
 
@@ -1246,6 +1408,14 @@ impl LspCommand {
             Self::Completion(args) => args.json,
             Self::Menu(args) => args.json,
             Self::Hover(args) => args.json,
+            Self::References(args)
+            | Self::IncomingCalls(args)
+            | Self::OutgoingCalls(args)
+            | Self::Supertypes(args)
+            | Self::Subtypes(args) => args.json,
+            Self::Results(args) => args.json,
+            Self::Expand(args) | Self::Collapse(args) => args.json,
+            Self::OpenResult(args) => args.json,
             _ => false,
         }
     }
@@ -10798,6 +10968,95 @@ fn print_jump(sub: &JumpCommand, result: &Value) {
 }
 
 /// `tako lsp` の表示（#1678）。中身の正本は dispatch の応答で、ここは体裁だけ
+/// `tako lsp results` 等の要求（#1685。`pane` は結果を問い合わせたペインで、省略は右パネルの結果 =
+/// 呼び出し元では埋めない）
+fn results(action: &str, pane: Option<u64>, item: Option<usize>, limit: Option<usize>) -> Request {
+    Request::LspResults {
+        action: action.to_string(),
+        pane,
+        item,
+        open: None,
+        focus: None,
+        limit,
+    }
+}
+
+/// 参照・階層の応答を人向けの行へ（#1685）。1 行目は status と件数、続いて一覧の行
+/// （`id  path:行:桁  抜粋`）かツリーの見えている行（字下げ + 開閉の印 `-` / `+` / `.`）。
+/// 印は ASCII（開いている `-` / 閉じていて子がある or 未読み込み `+` / 子が 0 件 `.`）
+fn lsp_xref_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let num = |v: &Value| v.as_u64().map_or("-".to_string(), |n| n.to_string());
+    let status = result["status"].as_str().unwrap_or("-");
+    let mut head = vec![status.to_string()];
+    for key in ["kind", "server"] {
+        if let Some(v) = result[key].as_str() {
+            head.push(format!("{key}={v}"));
+        }
+    }
+    if let Some(symbol) = result["from"]["symbol"].as_str().filter(|s| !s.is_empty()) {
+        head.push(format!("symbol={symbol}"));
+    }
+    for key in ["total", "node_count", "shown", "truncated", "retained"] {
+        if !result[key].is_null() {
+            head.push(format!("{key}={}", num(&result[key])));
+        }
+    }
+    if let Some(landing) = result["landing"].as_str() {
+        head.push(format!("landing={landing}"));
+    }
+    if let Some(cleared) = result["cleared"].as_bool() {
+        head.push(format!("cleared={cleared}"));
+    }
+    let mut lines = vec![head.join(" ")];
+    let place = |row: &Value| {
+        format!(
+            "{}:{}:{}",
+            text(&row["path"]),
+            num(&row["line"]),
+            num(&row["column"])
+        )
+    };
+    for row in result["items"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "{:>4}  {}  {}",
+            num(&row["id"]),
+            place(row),
+            text(&row["text"])
+        ));
+    }
+    for node in result["nodes"].as_array().into_iter().flatten() {
+        let depth = node["depth"].as_u64().unwrap_or(0) as usize;
+        let mark = match (node["expanded"].as_bool(), node["children"].as_u64()) {
+            (Some(true), _) => "-",
+            (_, Some(0)) => ".",
+            _ => "+",
+        };
+        lines.push(format!(
+            "{:>4}  {}{} {}  {}  {}",
+            num(&node["id"]),
+            "  ".repeat(depth),
+            mark,
+            text(&node["name"]),
+            text(&node["symbol_kind"]),
+            place(node)
+        ));
+    }
+    if let Some(location) = result.get("location").filter(|l| l.is_object()) {
+        lines.push(format!(
+            "  {}  {}",
+            place(location),
+            text(&location["text"])
+        ));
+    }
+    for key in ["reason", "next_step"] {
+        if let Some(v) = result[key].as_str() {
+            lines.push(format!("  {v}"));
+        }
+    }
+    lines
+}
+
 fn print_lsp(sub: &LspCommand, result: &Value) {
     if !sub.json() && sub.goto_kind().is_some() {
         for line in lsp_goto_lines(result) {
@@ -10837,6 +11096,22 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
     }
     if !sub.json() && matches!(sub, LspCommand::Hover(_)) {
         for line in lsp_hover_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
+    if !sub.json()
+        && (sub.xref_kind().is_some()
+            || matches!(
+                sub,
+                LspCommand::Results(_)
+                    | LspCommand::Expand(_)
+                    | LspCommand::Collapse(_)
+                    | LspCommand::OpenResult(_)
+                    | LspCommand::ClearResults { .. }
+            ))
+    {
+        for line in lsp_xref_lines(result) {
             println!("{line}");
         }
         return;
@@ -12560,6 +12835,124 @@ mod tests {
             "--limit", "9"
         ])
         .is_err());
+        // #1685: 参照・階層は位置つきの要求（MCP `tako_lsp` の同名の action と同じ要求になる）
+        for (sub, action) in [
+            ("references", "references"),
+            ("incoming-calls", "incoming-calls"),
+            ("outgoing-calls", "outgoing-calls"),
+            ("supertypes", "supertypes"),
+            ("subtypes", "subtypes"),
+        ] {
+            assert_eq!(
+                build_request(&parse(&[
+                    "tako", "lsp", sub, "--pane", "7", "--line", "3", "--column", "4", "--show",
+                    "--limit", "0"
+                ]))
+                .unwrap(),
+                Request::LspXref {
+                    action: action.into(),
+                    pane: Some(7),
+                    line: 3,
+                    column: 4,
+                    show: Some(true),
+                    limit: Some(0),
+                },
+                "{sub}"
+            );
+            assert!(Cli::try_parse_from(["tako", "lsp", sub, "--pane", "7"]).is_err());
+        }
+        // 結果の読み書きは pane を呼び出し元で埋めない（省略 = 右パネルの結果）
+        let results = |action: &str, pane: Option<u64>, item: Option<usize>| Request::LspResults {
+            action: action.into(),
+            pane,
+            item,
+            open: None,
+            focus: None,
+            limit: None,
+        };
+        assert_eq!(
+            build_request(&parse(&["tako", "lsp", "results"])).unwrap(),
+            results("results", None, None)
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "tako", "lsp", "expand", "--item", "2", "--pane", "5"
+            ]))
+            .unwrap(),
+            results("expand", Some(5), Some(2))
+        );
+        assert_eq!(
+            build_request(&parse(&["tako", "lsp", "collapse", "--item", "2"])).unwrap(),
+            results("collapse", None, Some(2))
+        );
+        assert_eq!(
+            build_request(&parse(&["tako", "lsp", "clear-results"])).unwrap(),
+            results("clear-results", None, None)
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "tako",
+                "lsp",
+                "open-result",
+                "--item",
+                "3",
+                "--open",
+                "down",
+                "--focus"
+            ]))
+            .unwrap(),
+            Request::LspResults {
+                action: "open-result".into(),
+                pane: None,
+                item: Some(3),
+                open: Some("down".into()),
+                focus: Some(true),
+                limit: None,
+            }
+        );
+        assert!(Cli::try_parse_from(["tako", "lsp", "expand"]).is_err());
+        // 人向けの表示: 一覧は `id  path:行:桁  抜粋`、ツリーは字下げ + 開閉の印（- / + / .）
+        let lines = lsp_xref_lines(&serde_json::json!({
+            "status": "found", "kind": "references", "server": "srv",
+            "from": {"symbol": "helper"}, "total": 2, "shown": 2, "truncated": 0, "retained": 1,
+            "items": [
+                {"id": 1, "path": "/w/a.rs", "line": 1, "column": 7, "text": "pub fn helper() {}"},
+                {"id": 2, "path": "/w/b.rs", "line": 9, "column": 4, "text": "helper();"},
+            ],
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "found kind=references server=srv symbol=helper total=2 shown=2 truncated=0 retained=1",
+                "   1  /w/a.rs:1:7  pub fn helper() {}",
+                "   2  /w/b.rs:9:4  helper();",
+            ]
+        );
+        let lines = lsp_xref_lines(&serde_json::json!({
+            "status": "found", "kind": "incoming-calls", "node_count": 3,
+            "nodes": [
+                {"id": 1, "depth": 0, "name": "helper", "symbol_kind": "function", "path": "/w/a.rs", "line": 1, "column": 7, "expanded": true, "children": 2},
+                {"id": 2, "depth": 1, "name": "main", "symbol_kind": "function", "path": "/w/m.rs", "line": 4, "column": 4, "expanded": false, "children": null},
+                {"id": 3, "depth": 1, "name": "leaf", "symbol_kind": "method", "path": "/w/l.rs", "line": 8, "column": 0, "expanded": false, "children": 0},
+            ],
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "found kind=incoming-calls node_count=3",
+                "   1  - helper  function  /w/a.rs:1:7",
+                "   2    + main  function  /w/m.rs:4:4",
+                "   3    . leaf  method  /w/l.rs:8:0",
+            ]
+        );
+        let lines = lsp_xref_lines(&serde_json::json!({
+            "status": "opened", "item": 2, "landing": "new-pane",
+            "location": {"path": "/w/b.rs", "line": 9, "column": 4, "text": "helper();"},
+        }));
+        assert_eq!(
+            lines,
+            vec!["opened landing=new-pane", "  /w/b.rs:9:4  helper();"]
+        );
         // 人向けの表示: 見出し（status・種類・範囲）→ 本文をそのまま（Markdown を解釈しない）
         let lines = lsp_hover_lines(&serde_json::json!({
             "status": "found", "kind": "markdown",

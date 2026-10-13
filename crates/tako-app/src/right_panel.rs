@@ -5579,7 +5579,11 @@ impl TakoApp {
         // 選んでいるとき）だけ出す。常設すると既定幅 320px でラベルが全員ぶん落ちる
         // （#1479 の段の選び方で 5 本目のぶんが入らない）ので、使っていない人の画面は変えない
         let diagnostics_tab = view == PanelView::Diagnostics || self.lsp_documents_open();
-        let tabs = PANEL_BASE_TABS + usize::from(diagnostics_tab);
+        // #1685: references タブも同じく条件つき（結果を持っているか、そのビューを選んでいるとき）
+        let references_tab = view == PanelView::References || !self.lsp_xref.is_empty();
+        // 幅の見積りは先頭から数える（diagnostics を出さずに references だけのときは diagnostics の
+        // ラベルで見積もる = 1 字長い側へ倒れる = 溢れない）
+        let tabs = PANEL_BASE_TABS + usize::from(diagnostics_tab) + usize::from(references_tab);
         let density = if legacy_tabs {
             // A/B: 幅を見ない（= 直す前）
             PanelTabDensity::Full
@@ -5801,6 +5805,22 @@ impl TakoApp {
                                 )),
                             )
                         })
+                        .when(references_tab, |row| {
+                            row.child(
+                                tab_button(
+                                    PANEL_TAB_LABELS[PANEL_BASE_TABS + 1],
+                                    crate::file_icons::ui_icon::SEARCH,
+                                    PanelView::References,
+                                    view == PanelView::References,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.panel_view = PanelView::References;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        })
                         .child(div().flex_grow(1.0).min_w(px(0.0)))
                         .child(
                             div()
@@ -5829,6 +5849,7 @@ impl TakoApp {
                     PanelView::Git => self.render_git_view(cx).into_any_element(),
                     PanelView::Tasks => self.render_tasks_view(cx).into_any_element(),
                     PanelView::Diagnostics => self.render_diagnostics_view(cx).into_any_element(),
+                    PanelView::References => self.render_references_view(cx).into_any_element(),
                 })
                 .child(
                     // 左端のリサイズハンドル（ドラッグで幅調整）
@@ -5883,8 +5904,9 @@ pub(crate) fn legacy_1479() -> bool {
 }
 
 /// タブ列に並ぶラベル（**並び順そのもの**。描画も幅の見積りもここを読む）。
-/// 末尾の `diagnostics`（#1679）だけは条件つきで、先頭の [`PANEL_BASE_TABS`] 本が常設
-pub(crate) const PANEL_TAB_LABELS: [&str; 5] = ["fleet", "orch", "git", "tasks", "diagnostics"];
+/// 末尾の `diagnostics`（#1679）と `references`（#1685）は条件つきで、先頭の [`PANEL_BASE_TABS`] 本が常設
+pub(crate) const PANEL_TAB_LABELS: [&str; 6] =
+    ["fleet", "orch", "git", "tasks", "diagnostics", "references"];
 /// 常設のタブの数（fleet / orch / git / tasks）
 pub(crate) const PANEL_BASE_TABS: usize = 4;
 /// バッジが付くタブの位置（[`PANEL_TAB_LABELS`] の添字）
@@ -6039,8 +6061,8 @@ mod tests {
     /// **全域で**含む
     #[test]
     fn 選んだ段はどの幅でも収まる() {
-        // #1679: diagnostics タブが出ている 5 本でも同じ
-        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1] {
+        // #1679: diagnostics タブが出ている 5 本でも同じ。#1685: references も出ている 6 本でも同じ
+        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1, PANEL_BASE_TABS + 2] {
             for w in 220..=900 {
                 let panel_width = w as f32;
                 for n in [0usize, 1, 9, 22, 99, 150, 4000] {

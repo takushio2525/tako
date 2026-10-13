@@ -14,8 +14,10 @@
 //!
 //! 1. 規則の正本は `tako_core::lsp::goto::plan_landing` の 1 つで、同じファイル → 使い回し →
 //!    新しいペインの順に決める
-//! 2. dispatch の `lsp_goto_land` はその答えを**そのまま**開き方へ写す（新しいペインは
-//!    向きつきの分割 / 新しいタブ、使い回しは答えのペイン、同じファイルは問い合わせたペイン）
+//! 2. dispatch の `land_on_place` はその答えを**そのまま**開き方へ写す（新しいペインは
+//!    向きつきの分割 / 新しいタブ、使い回しは答えのペイン、同じファイルは問い合わせたペイン）。
+//!    定義ジャンプの着地（`lsp_goto_land`）も参照・階層の行を開く口（`lsp_results` の
+//!    `open-result`。#1685）もこの 1 本を通る（着地の規則を 2 か所に書かない）
 //! 3. 開くのは `open_file`（行指定の open と同じ入口 = ジャンプ履歴へ積む）で、起点は
 //!    問い合わせたペイン（`JumpFrom::Pane`）
 //! 4. `open_file` は行を指定して同じファイルを開くときに読み直さない（編集セッションを捨てない）
@@ -161,12 +163,34 @@ fn scan_rules(dispatch: &str, goto: &str) -> Vec<Offender> {
         }
     }
 
-    // 2・3. dispatch の写し方と開く入口
-    let Some((at, window)) = fn_window(dispatch, "pub fn lsp_goto_land(") else {
+    // 2・3. dispatch の写し方と開く入口。定義ジャンプと参照の行（#1685）は同じ 1 本を通る
+    for (decl, name) in [
+        ("pub fn lsp_goto_land(", "定義ジャンプの着地"),
+        ("pub fn lsp_results(", "参照・階層の行を開く口（#1685）"),
+    ] {
+        match fn_window(dispatch, decl) {
+            None => out.push(Offender {
+                file: DISPATCH,
+                line: 0,
+                why: format!("`{decl}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) if !code_only(&window).contains("land_on_place(") => {
+                out.push(Offender {
+                    file: DISPATCH,
+                    line: at,
+                    why: format!(
+                        "{name}が着地の 1 本（`land_on_place`）を通っていない（規則を 2 か所に書いている）"
+                    ),
+                })
+            }
+            _ => {}
+        }
+    }
+    let Some((at, window)) = fn_window(dispatch, "fn land_on_place(") else {
         out.push(Offender {
             file: DISPATCH,
             line: 0,
-            why: "`lsp_goto_land` が見つからない（走査が空振り）".into(),
+            why: "`land_on_place` が見つからない（走査が空振り）".into(),
         });
         return out;
     };
@@ -181,7 +205,7 @@ fn scan_rules(dispatch: &str, goto: &str) -> Vec<Offender> {
     let expect = [
         (
             "Landing::SamePane",
-            "(landing.source_pane, None, false)",
+            "(at.source_pane, None, false)",
             "同じファイルを問い合わせたペインのまま開いていない",
         ),
         (
@@ -191,17 +215,17 @@ fn scan_rules(dispatch: &str, goto: &str) -> Vec<Offender> {
         ),
         (
             "Landing::New(NewPane::Right)",
-            "(landing.source_pane, Some(Direction::Right), false)",
+            "(at.source_pane, Some(Direction::Right), false)",
             "別のファイルを新しいペインで開いていない（右への分割が無い = 同じペインを差し替える）",
         ),
         (
             "Landing::New(NewPane::Down)",
-            "(landing.source_pane, Some(Direction::Down), false)",
+            "(at.source_pane, Some(Direction::Down), false)",
             "別のファイルを新しいペインで開いていない（下への分割が無い）",
         ),
         (
             "Landing::New(NewPane::Tab)",
-            "(landing.source_pane, None, true)",
+            "(at.source_pane, None, true)",
             "新しいタブで開いていない",
         ),
     ];
@@ -235,7 +259,7 @@ fn scan_rules(dispatch: &str, goto: &str) -> Vec<Offender> {
                     why: "ジャンプ履歴へ積んでいない（`JumpRecord::Record` が無い）".into(),
                 });
             }
-            if !code.contains("jump_from: JumpFrom::Pane(landing.source_pane)") {
+            if !code.contains("jump_from: JumpFrom::Pane(at.source_pane)") {
                 out.push(Offender {
                     file: DISPATCH,
                     line,
@@ -411,7 +435,9 @@ fn 定義ジャンプの着地は規則の正本どおりに開く() {
 fn 走査が空振りしていない() {
     let (dispatch, goto, gui, _) = current();
     assert!(fn_window(&goto, "pub fn plan_landing(").is_some());
-    let (at, window) = fn_window(&dispatch, "pub fn lsp_goto_land(").unwrap();
+    assert!(fn_window(&dispatch, "pub fn lsp_goto_land(").is_some());
+    assert!(fn_window(&dispatch, "pub fn lsp_results(").is_some());
+    let (at, window) = fn_window(&dispatch, "fn land_on_place(").unwrap();
     for pattern in [
         "Landing::SamePane",
         "Landing::Reuse(pane)",
@@ -483,8 +509,8 @@ fn 逆戻りを名指しできる() {
         &dispatch,
         DISPATCH,
         (
-            "Landing::New(NewPane::Right) => (landing.source_pane, Some(Direction::Right), false)",
-            "Landing::New(NewPane::Right) => (landing.source_pane, None, false)",
+            "Landing::New(NewPane::Right) => (at.source_pane, Some(Direction::Right), false)",
+            "Landing::New(NewPane::Right) => (at.source_pane, None, false)",
         ),
         "Landing::New(NewPane::Right) =>",
         rules_d,
@@ -496,7 +522,7 @@ fn 逆戻りを名指しできる() {
         DISPATCH,
         (
             "Landing::Reuse(pane) => (pane, None, false)",
-            "Landing::Reuse(pane) => (landing.source_pane, Some(Direction::Right), false)",
+            "Landing::Reuse(pane) => (at.source_pane, Some(Direction::Right), false)",
         ),
         "Landing::Reuse(pane) =>",
         rules_d,
@@ -531,10 +557,10 @@ fn 逆戻りを名指しできる() {
         &dispatch,
         DISPATCH,
         (
-            "jump_from: JumpFrom::Pane(landing.source_pane)",
+            "jump_from: JumpFrom::Pane(at.source_pane)",
             "jump_from: JumpFrom::Auto",
         ),
-        "pub fn lsp_goto_land(>>let opened = open_file(",
+        "fn land_on_place(>>let opened = open_file(",
         rules_d,
     );
     // F. GUI が自前で開く
@@ -560,5 +586,17 @@ fn 逆戻りを名指しできる() {
         ),
         "this.start_lsp_goto(pane_id, line, range.start, ev.position, cx);",
         render_s,
+    );
+    // H. 参照・階層の行を開く口（#1685）が着地の 1 本を通らない（自前で開く）
+    assert_named(
+        "H 参照の行が自前で開く",
+        &dispatch,
+        DISPATCH,
+        (
+            "let (plan, opened) = land_on_place(\n                    host,\n                    origin,\n                    PlaceLanding {\n                        source_pane: source,",
+            "let (plan, opened) = open_elsewhere(\n                    host,\n                    origin,\n                    PlaceLanding {\n                        source_pane: source,",
+        ),
+        "pub fn lsp_results(",
+        rules_d,
     );
 }

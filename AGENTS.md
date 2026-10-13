@@ -156,6 +156,7 @@ tako/
 | **補完の候補を読む・確定する（GUI は打鍵中に一覧が出る。#1682）** | `tako lsp completion --pane N --line L --column C` |
 | **右クリックメニューの言語サーバの項目を読む（GUI は本文の右クリック。#1684）** | `tako lsp menu --pane N --line L --column C` |
 | **その位置の型・doc を読む（GUI は識別子にマウスを乗せるとカード。#1681）** | `tako lsp hover --pane N --line L --column C` |
+| **参照・呼び出し階層・型階層（GUI は右クリック → 右パネル。結果は `tako lsp results`。#1685）** | `tako lsp references --pane N --line L --column C` |
 | **リモートからフォルダを開く（SSH 先のワークスペース化。#919 / #65 / #976 / #1041）** | `ssh <host>` |
 | **スマホからファイルを見る・直す（#1079 / #1084 / #1085）** | `#/files` |
 | **スマホから PC 全体を Finder 風に辿る（manage 以上。#1451）** | `#/files` の「このマシン」 |

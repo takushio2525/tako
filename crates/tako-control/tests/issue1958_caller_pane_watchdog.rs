@@ -261,16 +261,28 @@ fn scoped_cases(tools: &[Value]) -> Vec<Case> {
         |a| matches!(a, "open" | "show"),
         "約束は open / show だけ（他は対象を名指しする = 呼び出し元を混ぜると AI 自身のペインを対象と誤解する）",
     ));
-    // 説明: 「diagnostics は省略で全文書、それ以外は省略で呼び出し元」。format-on-save は設定でペインを取らない
+    // 説明: 「diagnostics は省略で全文書、results 系は結果を問い合わせたペインで省略は右パネルの結果、
+    // それ以外は省略で呼び出し元」。format-on-save は設定でペインを取らない
+    let results_kind = |a: &str| tako_control::dispatch::LSP_RESULT_ACTIONS.contains(&a);
     cases.extend(by_kind(
         tools,
         "tako_lsp",
         "action",
         // format は範囲を 4 つそろえないと断る（#1683）ので、位置の系統と同時に満たす値
         json!({ "line": 1, "column": 1, "end_line": 1, "end_column": 2 }),
-        |a| !matches!(a, "diagnostics" | "format-on-save"),
-        "diagnostics は全文書・format-on-save は設定（どちらもペインを取らない）",
+        |a| !matches!(a, "diagnostics" | "format-on-save") && !results_kind(a),
+        "diagnostics は全文書・format-on-save は設定（どちらもペインを取らない）・results 系は右パネルの結果",
     ));
+    // #1685: results 系の pane は「結果を問い合わせたペイン」で、省略は右パネルの結果。呼び出し元
+    // （AI 自身の会話ペイン）は結果を持たないので、埋めると「結果が無い」で必ず外れる
+    for action in tako_control::dispatch::LSP_RESULT_ACTIONS {
+        cases.push(Case {
+            tool: "tako_lsp",
+            args: json!({ "action": action, "item": 1 }),
+            fills: false,
+            why: "results 系は省略で右パネルの結果（呼び出し元のペインは結果を持たない）",
+        });
+    }
     // 説明: 「open_terminal の cd 先 / copy_relative_path の基準 / open_in_tako の分割元。省略時は呼び出し元」
     cases.extend(by_kind(
         tools,

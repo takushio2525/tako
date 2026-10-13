@@ -188,18 +188,19 @@ mod tests {
         assert_eq!(actions[0], "diagnostics");
         let goto = &actions[1..=tako_core::lsp::goto::GotoKind::NAMES.len()];
         assert_eq!(goto, &tako_core::lsp::goto::GotoKind::NAMES[..]);
-        // 定義ジャンプの後ろは整形の 2 つと補完と右クリックメニュー（#1684）とホバー（#1681）
+        // 定義ジャンプの後ろは整形の 2 つと補完と右クリックメニュー（#1684）とホバー（#1681）、
+        // 参照・階層の 5 種と結果の読み書きの 5 つ（#1685）
         // （残りはこれだけ = 足し忘れはここで落ちる）
-        assert_eq!(
-            &actions[goto.len() + 1..],
-            &[
-                crate::dispatch::LSP_FORMAT_ACTION,
-                crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION,
-                crate::dispatch::LSP_COMPLETION_ACTION,
-                crate::dispatch::LSP_MENU_ACTION,
-                crate::dispatch::LSP_HOVER_ACTION,
-            ]
-        );
+        let mut rest = vec![
+            crate::dispatch::LSP_FORMAT_ACTION,
+            crate::dispatch::LSP_FORMAT_ON_SAVE_ACTION,
+            crate::dispatch::LSP_COMPLETION_ACTION,
+            crate::dispatch::LSP_MENU_ACTION,
+            crate::dispatch::LSP_HOVER_ACTION,
+        ];
+        rest.extend(tako_core::lsp::xref::XrefKind::NAMES);
+        rest.extend(crate::dispatch::LSP_RESULT_ACTIONS);
+        assert_eq!(&actions[goto.len() + 1..], &rest[..]);
         for action in goto {
             assert_eq!(
                 build_request(
@@ -223,6 +224,68 @@ mod tests {
         }
         // 定義ジャンプは位置が要る（診断の既定へ黙って倒れない）
         assert!(build_request("tako_lsp", &json!({"action": "definition"}), Some(9), None).is_err());
+    }
+
+    /// #1685: 参照・階層は位置つき（pane の省略は呼び出し元）、結果の読み書きは pane を
+    /// 呼び出し元で埋めない（省略 = 右パネルの結果。AI 自身のペインは結果を持たない）
+    #[test]
+    fn tako_lsp_の参照と結果は_cli_と同じ要求になる() {
+        for action in tako_core::lsp::xref::XrefKind::NAMES {
+            assert_eq!(
+                build_request(
+                    "tako_lsp",
+                    &json!({"action": action, "line": 3, "column": 4, "show": true, "limit": 0}),
+                    Some(9),
+                    None
+                )
+                .unwrap(),
+                Request::LspXref {
+                    action: action.to_string(),
+                    pane: Some(9),
+                    line: 3,
+                    column: 4,
+                    show: Some(true),
+                    limit: Some(0),
+                },
+                "{action}"
+            );
+            assert!(
+                build_request("tako_lsp", &json!({"action": action}), Some(9), None).is_err(),
+                "{action} は位置が要る"
+            );
+        }
+        for action in crate::dispatch::LSP_RESULT_ACTIONS {
+            assert_eq!(
+                build_request("tako_lsp", &json!({"action": action, "item": 2}), Some(9), None)
+                    .unwrap(),
+                Request::LspResults {
+                    action: action.to_string(),
+                    pane: None,
+                    item: Some(2),
+                    open: None,
+                    focus: None,
+                    limit: None,
+                },
+                "{action}"
+            );
+        }
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "open-result", "pane": 5, "item": 1, "open": "down", "focus": true}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspResults {
+                action: "open-result".into(),
+                pane: Some(5),
+                item: Some(1),
+                open: Some("down".into()),
+                focus: Some(true),
+                limit: None,
+            }
+        );
     }
 
     /// #1683: 整形は CLI `tako lsp format [--pane N] [--range L1:C1-L2:C2]` と同じ要求になる。

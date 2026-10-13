@@ -1012,6 +1012,16 @@ pub trait PreviewHost {
     ) -> Result<bool, String> {
         Ok(false)
     }
+    /// 参照検索・呼び出し階層・型階層の結果の置き場（#1685。問い合わせたペインごとに 1 つ）。
+    /// GUI が 1 つ持ち、右パネルの references ビューもこれを読む。持たない実装（セカンダリ等）は
+    /// `None` で、`tako lsp references` は「使えない」と答える
+    fn lsp_xref(&self) -> Option<&tako_core::lsp::xref::XrefStore> {
+        None
+    }
+    /// 同上の書き込み口（結果を置く・ツリーを開閉する・消す）
+    fn lsp_xref_mut(&mut self) -> Option<&mut tako_core::lsp::xref::XrefStore> {
+        None
+    }
     /// 行・桁で指定した**複数の範囲**を 1 回の操作として置き換える（#1682。補完の確定 =
     /// 本文 + 自動 import）。undo 1 回で全部戻る。編集モードでなければ始める（範囲編集と同じ）。
     /// 解けない指定・範囲の重なり・版違いは本文を触らずに失敗する

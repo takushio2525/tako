@@ -1112,24 +1112,29 @@ pub fn tools() -> Vec<Value> {
                 action=menu はその位置の右クリックメニューの LSP 項目（サーバの能力に無いものは出ない。\
                 識別子でない位置は 0 件）を返し、items[].args をそのまま渡すと押したのと同じになる。\
                 action=hover はその位置の型・doc を contents（kind=markdown / plaintext のまま）で返す（show で GUI にカードも出す）。\
+                action=references / incoming-calls / outgoing-calls / supertypes / subtypes はその位置の参照の一覧 / \
+                呼び出し階層・型階層のツリー（根を 1 段開いた形）を返し、問い合わせたペインの結果として保持する（show で右パネルにも出す）。\
+                応答の items[] / nodes[] の id を item に渡し、action=open-result でその位置を開く（定義ジャンプと同じ着地）・\
+                expand / collapse でノードを開閉・results で読み直す（retained = 保持件数）・clear-results で消す。\
                 位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）。", link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": enum_schema(crate::dispatch::LSP_FEATURE_ACTIONS, "操作（既定 diagnostics）"),
-                    "pane": pane_schema("プレビューペイン ID（diagnostics は省略で全文書、それ以外は省略で呼び出し元）"),
+                    "pane": pane_schema("プレビューペイン ID（diagnostics は省略で全文書、results 系は結果を問い合わせたペインで省略は右パネルの結果、それ以外は省略で呼び出し元）"),
                     "severity": enum_schema(&tako_core::lsp::diagnostic::Severity::NAMES, "diagnostics: この重大度以上に絞る"),
-                    "line": { "type": "integer", "minimum": 1, "description": "定義ジャンプ / 補完 / menu / ホバー: 行（1 始まり。必須）/ format: 範囲の始まりの行" },
-                    "column": { "type": "integer", "minimum": 0, "description": "定義ジャンプ / 補完 / menu / ホバー: 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否。必須）/ format: 範囲の始まりの桁" },
+                    "line": { "type": "integer", "minimum": 1, "description": "定義ジャンプ / 補完 / menu / ホバー / 参照・階層: 行（1 始まり。必須）/ format: 範囲の始まりの行" },
+                    "column": { "type": "integer", "minimum": 0, "description": "定義ジャンプ / 補完 / menu / ホバー / 参照・階層: 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否。必須）/ format: 範囲の始まりの桁" },
                     "end_line": { "type": "integer", "minimum": 1, "description": "format: 範囲の終わりの行（4 つそろえて範囲の整形）" },
                     "end_column": { "type": "integer", "minimum": 0, "description": "format: 範囲の終わりの桁" },
                     "enabled": { "type": "boolean", "description": "format-on-save: 保存時整形の ON / OFF（省略で今の値）" },
-                    "open": enum_schema(&tako_core::lsp::goto::Placement::NAMES, "定義ジャンプ: 別のファイルを開く新しいペインの置き場所（省略で right）"),
+                    "open": enum_schema(&tako_core::lsp::goto::Placement::NAMES, "定義ジャンプ / open-result: 別のファイルを開く新しいペインの置き場所（省略で right）"),
                     "choice": { "type": "integer", "minimum": 1, "description": "定義ジャンプ / 補完: 選ぶ候補の番号（1 始まり。補完は確定する）" },
-                    "limit": { "type": "integer", "minimum": 0, "description": "補完: 返す件数（既定 50）/ ホバー: 本文の字数（既定 16000。0 で全文）" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "補完: 返す件数（既定 50）/ ホバー: 本文の字数（既定 16000。0 で全文）/ 参照・階層・results: 載せる行（既定 100。0 で全部）" },
+                    "item": { "type": "integer", "minimum": 1, "description": "open-result / expand / collapse: 応答の items[] / nodes[] の id" },
                     "resolve": { "type": "boolean", "description": "補完: 返す候補の説明を補う" },
-                    "show": { "type": "boolean", "description": "ホバー: GUI のその位置にカードも出す（既定 false）" },
-                    "focus": { "type": "boolean", "description": "定義ジャンプ: 着地したペインへフォーカスを移す（既定 false）" },
+                    "show": { "type": "boolean", "description": "ホバー: GUI のその位置にカードも出す / 参照・階層: 右パネルにも出す（既定 false）" },
+                    "focus": { "type": "boolean", "description": "定義ジャンプ / open-result: 着地したペインへフォーカスを移す（既定 false）" },
                 },
                 "additionalProperties": false,
             },

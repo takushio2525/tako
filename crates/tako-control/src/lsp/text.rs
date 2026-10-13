@@ -560,3 +560,69 @@ pub const HOVER_LOADING_NOTE: Note = Note::new(
 
 /// 機能の呼び名（「能力に無い」の文へ差し込む）
 pub const HOVER_LABEL: Note = Note::new("ホバー", "hover");
+
+// --- 参照検索・呼び出し階層・型階層（#1685）--------------------------------------
+// 起動・未導入・未応答・落ちた等は定義ジャンプと同じ文（言語サーバの状態として同じもの）
+
+/// 種類の呼び名（`tako_core::lsp::xref::XrefKind::ALL` と同じ順）
+pub const XREF_KIND_LABELS: [Note; 5] = [
+    Note::new("参照", "references"),
+    Note::new("呼び出し元", "incoming calls"),
+    Note::new("呼び出し先", "outgoing calls"),
+    Note::new("スーパータイプ", "supertypes"),
+    Note::new("サブタイプ", "subtypes"),
+];
+
+/// サーバがその種類に対応していない。`{server}` / `{kind}`
+pub const XREF_UNSUPPORTED_REASON: Note = Note::new(
+    "{server} は{kind}の検索に対応していない",
+    "{server} does not support finding {kind}",
+);
+
+/// 0 件（サーバは答えた）。`{kind}` = 種類の呼び名
+pub const XREF_NONE_REASON: Note = Note::new(
+    "{kind}は見つからなかった（言語サーバはこの位置に 0 件で答えた）",
+    "No {kind} found (the language server answered with none for this position)",
+);
+
+/// 0 件のときの次の一手
+pub const XREF_NONE_NEXT_STEP: Note = Note::new(
+    "関数・型の名前の上で試す（コメント・文字列の中の語や、読み込み中のプロジェクトでは 0 件のことがある）",
+    "Try on a function or type name (words in comments or strings, or a project still loading, may have none)",
+);
+
+/// 保持している結果が無い（`results` / `expand` / `open-result` の対象が無い）
+pub const XREF_NO_RESULT_REASON: Note = Note::new(
+    "参照・階層の結果を持っていない（そのペインで検索していないか、ペインを閉じた）",
+    "No reference or hierarchy result is held (nothing was searched in that pane, or it was closed)",
+);
+
+/// 結果が無いときの次の一手
+pub const XREF_NO_RESULT_NEXT_STEP: Note = Note::new(
+    "先に検索する: tako lsp references --pane N --line L --column C",
+    "Search first: tako lsp references --pane N --line L --column C",
+);
+
+/// 展開・折りたたみはツリーだけ（参照の一覧に対して頼んだ）
+pub const XREF_NOT_TREE_REASON: Note = Note::new(
+    "この結果は参照の一覧（展開・折りたたみは呼び出し階層・型階層のツリーだけ）",
+    "This result is a reference list (expand / collapse apply to call and type hierarchy trees only)",
+);
+
+/// 行 / ノードの番号が結果に無い。`{item}` / `{count}`
+pub const XREF_NO_ITEM_REASON: Note = Note::new(
+    "item {item} はこの結果に無い（1〜{count}）",
+    "item {item} is not in this result (1-{count})",
+);
+
+/// 展開の深さの上限。`{max}`
+pub const XREF_TOO_DEEP_REASON: Note = Note::new(
+    "これ以上は展開できない（深さの上限 {max}）",
+    "Cannot expand further (depth limit {max})",
+);
+
+/// 展開の答えが届く前に結果が置き換わった / 閉じられた
+pub const XREF_STALE_REASON: Note = Note::new(
+    "答えを待っているあいだに結果が置き換わったか、問い合わせたペインが閉じられた",
+    "The result was replaced, or the pane that asked was closed, while waiting for the answer",
+);

@@ -111,31 +111,8 @@ pub fn parse_locations(result: &Value) -> Vec<RawLocation> {
     };
     let mut out: Vec<RawLocation> = Vec::new();
     for item in items {
-        let (uri, range) = match (item.get("targetUri"), item.get("uri")) {
-            (Some(uri), _) => (
-                uri,
-                item.get("targetSelectionRange")
-                    .or_else(|| item.get("targetRange")),
-            ),
-            (None, Some(uri)) => (uri, item.get("range")),
-            (None, None) => continue,
-        };
-        let (Some(uri), Some(start)) = (uri.as_str(), range.and_then(|r| r.get("start"))) else {
+        let Some(location) = raw_location(item) else {
             continue;
-        };
-        let number = |key: &str| {
-            start
-                .get(key)
-                .and_then(Value::as_u64)
-                .and_then(|n| usize::try_from(n).ok())
-        };
-        let (Some(line), Some(character)) = (number("line"), number("character")) else {
-            continue;
-        };
-        let location = RawLocation {
-            uri: uri.to_string(),
-            line,
-            character,
         };
         if !out.contains(&location) {
             out.push(location);
@@ -145,6 +122,37 @@ pub fn parse_locations(result: &Value) -> Vec<RawLocation> {
         }
     }
     out
+}
+
+/// 応答の 1 要素（`Location` / `LocationLink`）を読む。形の崩れた要素は `None`
+/// （参照検索 = #1685 も同じ読み方を通る）
+pub fn raw_location(item: &Value) -> Option<RawLocation> {
+    let (uri, range) = match (item.get("targetUri"), item.get("uri")) {
+        (Some(uri), _) => (
+            uri,
+            item.get("targetSelectionRange")
+                .or_else(|| item.get("targetRange")),
+        ),
+        (None, Some(uri)) => (uri, item.get("range")),
+        (None, None) => return None,
+    };
+    let (line, character) = lsp_start(range?.get("start")?)?;
+    Some(RawLocation {
+        uri: uri.as_str()?.to_string(),
+        line,
+        character,
+    })
+}
+
+/// `Position`（`{ line, character }`）を数の組へ。欠けていれば `None`
+pub fn lsp_start(position: &Value) -> Option<(usize, usize)> {
+    let number = |key: &str| {
+        position
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+    };
+    Some((number("line")?, number("character")?))
 }
 
 /// `file://` URI → ローカルパス（ローカルのファイルでなければ `None`）。

@@ -40,7 +40,7 @@
 //!   スクリプトも書かない（答えは `hold_until` = `AnswerGate` で、次の操作が済んでから返させる）
 //! - [`ログを数える前に区切る`] — 「送った」直後に偽サーバのログを数えて落ちた 1684 の e2e は、
 //!   ログ書き込みの遅れ（テストの待ちの周期より長い）を常に渡し、`stop_and_settle` の後に数える
-//! - [`空の答えの判定は_1_実装`] — 定義ジャンプ・補完・ホバーの空の答えの後は `wait_after_empty`
+//! - [`空の答えの判定は_1_実装`] — 定義ジャンプ・補完・ホバー・参照と階層（#1685）の空の答えの後は `wait_after_empty`
 //!   （`EmptyAnswer`）だけを通る。偽サーバの `--settle-on-empty` は空の前後で読み込みを終える
 //!
 //! # 見逃す側へ倒れないための作り
@@ -95,7 +95,15 @@ fn report(file: &str, line: usize, why: &str) -> String {
 }
 
 /// 要求を送る呼び出し（manager の問い合わせ）
-const REQUESTS: [&str; 4] = [".completion(&", ".hover(&", ".goto(&", ".format(&"];
+/// #1685: 参照・階層（`.xref(&` / `.xref_expand(&`）も同じ前提の待ちを縛る
+const REQUESTS: [&str; 6] = [
+    ".completion(&",
+    ".hover(&",
+    ".goto(&",
+    ".format(&",
+    ".xref(&",
+    ".xref_expand(&",
+];
 
 /// 前提の種類
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -785,19 +793,19 @@ fn scan_fake_answers(view: &str) -> Vec<String> {
             out.push(report(FAKE, i + 1, WHY_DELAY));
         }
     }
-    // 前半の空の答えは 3 つ（定義ジャンプ・補完・ホバー）とも 1 実装を通り、`before` は送る前に、
-    // `after` は送った後に読み込みを終える
+    // 前半の空の答えは 4 つ（定義ジャンプ・補完・ホバー・参照と階層 = #1685）とも 1 実装を通り、
+    // `before` は送る前に、`after` は送った後に読み込みを終える
     let calls = lines
         .iter()
         .filter(|l| l.contains("early_empty(id,"))
         .count();
-    if calls != 3 {
+    if calls != 4 {
         out.push(report(
             FAKE,
             0,
             &format!(
-                "前半の空の答えが `early_empty` を通っていない（呼び出し {calls} 箇所 / 3 = 定義ジャンプ・\
-                 補完・ホバー）。`--settle-on-empty` / `--empty-delay-ms` が効かない口がある（#1930 の 6）"
+                "前半の空の答えが `early_empty` を通っていない（呼び出し {calls} 箇所 / 4 = 定義ジャンプ・\
+                 補完・ホバー・参照と階層）。`--settle-on-empty` / `--empty-delay-ms` が効かない口がある（#1930 の 6）"
             ),
         ));
     }
@@ -862,13 +870,13 @@ fn scan_empty_answer(manager_src: &str, goto_src: &str) -> Vec<String> {
         .collect();
     callers.sort();
     let names: Vec<&str> = callers.iter().map(|(n, _)| n.as_str()).collect();
-    if names != ["completion", "goto", "hover"] {
+    if names != ["completion", "goto", "hover", "xref"] {
         out.push(report(
             MANAGER,
             0,
             &format!(
-                "`wait_after_empty` の呼び手が定義ジャンプ・補完・ホバーの 3 つと一致しない（{names:?}。\
-                 #1930 の 6）"
+                "`wait_after_empty` の呼び手が定義ジャンプ・補完・ホバー・参照と階層（#1685）の 4 つと\
+                 一致しない（{names:?}。#1930 の 6）"
             ),
         ));
     }

@@ -53,6 +53,7 @@ mod platform;
 mod preview;
 mod preview_render;
 mod preview_watch;
+mod references_panel;
 mod remote_panel;
 mod right_panel;
 mod settings_sleep;
@@ -453,6 +454,8 @@ enum PanelView {
     Tasks,
     /// 言語サーバの診断（#1679）。タブは LSP につながった文書があるときだけ出す
     Diagnostics,
+    /// 参照検索・呼び出し階層・型階層の結果（#1685）。タブは結果があるときだけ出す
+    References,
 }
 
 /// プレビューヘッダから開くナビゲーションドロップダウン（Issue #232）。
@@ -2174,6 +2177,11 @@ struct TakoApp {
     lsp_completion: lsp_completion_ui::LspCompletionUi,
     /// ホバー（型・doc のカード）の GUI の状態（#1681）。問い合わせは manager、カードは 1 枚
     lsp_hover: lsp_hover_ui::LspHoverUi,
+    /// 参照検索・呼び出し階層・型階層の結果（#1685。問い合わせたペインごとに 1 つ・閉じたら消す）。
+    /// 右パネルの references ビューと CLI / MCP の `tako lsp results` 等が dispatch 経由でこの 1 つを読み書きする
+    lsp_xref: tako_core::lsp::xref::XrefStore,
+    /// 参照・階層の GUI の状態（問い合わせ中の印・子を問い合わせているノード）
+    lsp_xref_ui: references_panel::XrefUi,
     /// tako mod（FR-2.42 / #1879）: 展開先・claude の版の控え・ペインごとの注入と最終報告。
     /// **メモリだけ**（永続化しない）。報告は dispatch の `tako mod report` が書き込む
     claude_mod: tako_core::claude_mod::ModHub,
@@ -4534,6 +4542,8 @@ impl TakoApp {
             lsp_format_on_save: tako_control::settings::load().lsp_format_on_save,
             lsp_completion: lsp_completion_ui::LspCompletionUi::default(),
             lsp_hover: lsp_hover_ui::LspHoverUi::default(),
+            lsp_xref: Default::default(),
+            lsp_xref_ui: Default::default(),
             claude_mod: initial_claude_mod(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
@@ -11084,6 +11094,8 @@ impl TakoApp {
         self.terminals.remove(&pane_id);
         self.previews.remove(&pane_id);
         self.preview_edits.remove(&pane_id);
+        // #1685: そのペインで検索した参照・階層の結果も消す（保持件数を 0 へ戻す）
+        self.lsp_xref.remove(pane_id);
         self.remove_preview_image_cache(pane_id);
         self.preview_views.remove(&pane_id);
         self.preview_scroll_handles.remove(&pane_id);
@@ -24459,6 +24471,7 @@ impl UiStateHost for TakoApp {
             PanelView::Git => tako_control::protocol::PanelViewWire::Git,
             PanelView::Tasks => tako_control::protocol::PanelViewWire::Tasks,
             PanelView::Diagnostics => tako_control::protocol::PanelViewWire::Diagnostics,
+            PanelView::References => tako_control::protocol::PanelViewWire::References,
         };
         (self.panel_visible, self.panel_width, view)
     }
@@ -24514,6 +24527,7 @@ impl UiStateHost for TakoApp {
                 tako_control::protocol::PanelViewWire::Git => PanelView::Git,
                 tako_control::protocol::PanelViewWire::Tasks => PanelView::Tasks,
                 tako_control::protocol::PanelViewWire::Diagnostics => PanelView::Diagnostics,
+                tako_control::protocol::PanelViewWire::References => PanelView::References,
             };
         }
         // #503: パネルが非表示になったらテキスト入力フラグをクリア
@@ -25746,6 +25760,15 @@ impl PreviewHost for TakoApp {
         expected_version: Option<u64>,
     ) -> Result<(), String> {
         self.edit_preview_ranges_local(pane, edits, primary, expected_version)
+    }
+
+    /// #1685: 参照・階層の結果の置き場（右パネルの references ビューが読むのと同じ 1 つ）
+    fn lsp_xref(&self) -> Option<&tako_core::lsp::xref::XrefStore> {
+        Some(&self.lsp_xref)
+    }
+
+    fn lsp_xref_mut(&mut self) -> Option<&mut tako_core::lsp::xref::XrefStore> {
+        Some(&mut self.lsp_xref)
     }
 
     /// #1681: CLI `tako lsp hover --show` / MCP の `show`・編集メニューの「ホバー情報を表示」の
@@ -27146,15 +27169,22 @@ impl TakoApp {
             file_manager: fm,
             lsp: ctx.lsp.as_ref().map(|lsp| lsp.section.clone()),
         });
-        let (pctx_menu_width, pctx_menu_height) = pane_menu_size(&items);
+        let (pctx_menu_width, full_height) = pane_menu_size(&items);
+        // #1685: 言語サーバの項目が増えて窓より高くなるときは窓の高さに収め、中でスクロールする
+        // （収まる窓では高さもスクロールも付けない = 見た目は変わらない）
+        let pctx_menu_height =
+            fit_menu_height(full_height, f32::from(window.viewport_size().height));
+        let scrolls = pctx_menu_height < full_height;
         let adjusted = clamp_menu_position(pos, pctx_menu_width, pctx_menu_height, window);
         self.pane_menu_item_rects.borrow_mut().clear();
 
         let menu = div()
+            .id("pane-context-menu")
             .absolute()
             .left(adjusted.x)
             .top(adjusted.y)
             .w(px(pctx_menu_width))
+            .when(scrolls, |d| d.h(px(pctx_menu_height)).overflow_y_scroll())
             .py(px((PANE_MENU_CHROME_Y - 2.0) / 2.0))
             .bg(rgba(theme.tab_bar_background))
             .border_1()
@@ -27494,6 +27524,13 @@ fn compute_menu_position(
         y
     };
     (rx, ry)
+}
+
+/// メニューの高さを窓に収める（#1685）。窓より高いメニュー（言語サーバの項目が全部出たメニューを
+/// 小さな窓で開いた）は窓の高さにして中でスクロールさせる。[`compute_menu_position`] は収めた高さで
+/// 置くので、四隅のどこで開いても見切れない
+pub(crate) fn fit_menu_height(menu_height: f32, viewport_height: f32) -> f32 {
+    menu_height.min(viewport_height.max(PANE_MENU_ITEM_HEIGHT + PANE_MENU_CHROME_Y))
 }
 
 /// コンテキストメニューの位置をウインドウ内にクランプする。
@@ -30272,6 +30309,11 @@ mod self_test {
     mod hover_1893;
     #[cfg(feature = "visual-test")]
     use hover_1893::{hover_1893_visual, hover_loading_real_visual, hover_loading_visual};
+    /// #1685: 参照検索の結果の行の ⌘クリックで新しいペイン・閉じたら保持 0（visual-test `xref-1685`）
+    #[cfg(feature = "visual-test")]
+    mod xref_1685;
+    #[cfg(feature = "visual-test")]
+    use xref_1685::xref_1685_visual;
     /// #1944: 言語サーバを取って起こす・エディタの状態（visual-test `lsp-fetch`）
     #[cfg(feature = "visual-test")]
     mod lsp_fetch_1944;
@@ -44594,6 +44636,12 @@ mod self_test {
                 // #1681: 実の rust-analyzer の doc のカードが出るか（無ければ SKIPPED）
                 "hover-real" => {
                     hover_real_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1685: 参照検索の結果の行の ⌘クリックで新しいペインが 1 枚増え該当行が見える（偽サーバ）
+                "xref-1685" => {
+                    xref_1685_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
@@ -98973,9 +99021,23 @@ mod pane_menu_items_tests {
         use tako_core::lsp::menu::MenuItem;
         let items =
             pane_context_menu_items(lsp_facts(LspMenuSection::Items(MenuItem::ALL.to_vec())));
-        let (w, h) = super::pane_menu_size(&items);
-        assert!(h > 200.0, "LSP の 6 項目ぶん高くなっている（{h}）");
+        let (w, full) = super::pane_menu_size(&items);
+        assert!(full > 200.0, "LSP の 6 項目ぶん高くなっている（{full}）");
+        // #1685: 参照・階層の 5 項目で 640x400 の窓より高くなった。窓に収めて中でスクロールする
+        // （1200x800 では収まる = 高さもスクロールも付かない）
+        assert!(full > 400.0, "全項目のメニューは小さな窓より高い（{full}）");
+        assert_eq!(
+            super::fit_menu_height(full, 800.0),
+            full,
+            "大きな窓では切らない"
+        );
+        assert_eq!(
+            super::fit_menu_height(full, 400.0),
+            400.0,
+            "小さな窓では窓の高さ"
+        );
         for (vw, vh) in [(1200.0_f32, 800.0_f32), (640.0, 400.0)] {
+            let h = super::fit_menu_height(full, vh);
             for (x, y) in [
                 (1.0, 1.0),
                 (vw - 1.0, 1.0),
