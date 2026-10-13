@@ -917,6 +917,27 @@ pub(super) fn build_request(
                 show: bool_arg(args, "show")?,
                 limit: u64_arg(args, "limit")?.map(|n| n as usize),
             },
+            // #1685: 参照・階層（位置は定義ジャンプと同じ。show で右パネルにも出す）
+            action if tako_core::lsp::xref::XrefKind::parse(action).is_some() => Request::LspXref {
+                action: action.to_string(),
+                pane: Some(target_pane(args, caller)?),
+                line: required_u64(args, "line")? as usize,
+                column: required_u64(args, "column")? as usize,
+                show: bool_arg(args, "show")?,
+                limit: u64_arg(args, "limit")?.map(|n| n as usize),
+            },
+            // #1685: 保持している結果の読み書き。pane は結果を問い合わせたペインで、省略は
+            // 右パネルの結果（最後に出した結果）= 呼び出し元では埋めない（AI 自身のペインは結果を持たない）
+            action if crate::dispatch::LSP_RESULT_ACTIONS.contains(&action) => {
+                Request::LspResults {
+                    action: action.to_string(),
+                    pane: u64_arg(args, "pane")?,
+                    item: u64_arg(args, "item")?.map(|n| n as usize),
+                    open: str_arg(args, "open")?,
+                    focus: bool_arg(args, "focus")?,
+                    limit: u64_arg(args, "limit")?.map(|n| n as usize),
+                }
+            }
             action if tako_core::lsp::goto::GotoKind::parse(action).is_some() => Request::LspGoto {
                 action: action.to_string(),
                 pane: Some(target_pane(args, caller)?),

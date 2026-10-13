@@ -72,6 +72,8 @@ pub fn lsp_item(item: tako_core::lsp::menu::MenuItem) -> &'static str {
             tr!("型定義へ移動", "Go to Type Definition")
         }
         MenuItem::Goto(GotoKind::Implementation) => tr!("実装へ移動", "Go to Implementation"),
+        // #1685: 参照・階層（結果は右パネルの references ビューに出る）
+        MenuItem::Xref(kind) => super::panel::xref_action(kind),
         MenuItem::Hover => super::menu::show_hover(),
         MenuItem::Format => super::menu::format_document(),
         MenuItem::FormatSelection => super::menu::format_selection(),

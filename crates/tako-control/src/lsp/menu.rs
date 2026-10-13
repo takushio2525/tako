@@ -51,16 +51,22 @@ pub enum MenuCapabilities {
 pub fn action_of(item: MenuItem) -> &'static str {
     match item {
         MenuItem::Goto(kind) => kind.slug(),
+        MenuItem::Xref(kind) => kind.slug(),
         MenuItem::Hover => crate::dispatch::LSP_HOVER_ACTION,
         MenuItem::Format | MenuItem::FormatSelection => crate::dispatch::LSP_FORMAT_ACTION,
     }
 }
 
 /// この項目を出してよいか（A/B の旧腕 = `TAKO_1893_LEGACY=1` は #1893 前、`TAKO_1681_LEGACY=1` は
-/// ホバーそのものの前 = どちらもホバーの項目を出さない）。出し分けの正本 `tako_core::lsp::menu::items`
-/// の後で GUI と CLI / MCP の両方が通る
+/// ホバーそのものの前 = どちらもホバーの項目を出さない。`TAKO_1685_LEGACY=1` は参照・階層の項目を
+/// 出さない）。出し分けの正本 `tako_core::lsp::menu::items` の後で GUI と CLI / MCP の両方が通る
 pub fn shown(item: MenuItem) -> bool {
-    item != MenuItem::Hover || !(super::hover::legacy_1893() || super::hover::legacy())
+    match item {
+        MenuItem::Hover => !(super::hover::legacy_1893() || super::hover::legacy()),
+        // #1685: 参照・階層の項目（A/B の旧腕 = `TAKO_1685_LEGACY=1` は出さない）
+        MenuItem::Xref(_) => !super::xref::legacy(),
+        _ => true,
+    }
 }
 
 /// メニューに**載せない**言語機能の action と理由。
@@ -84,6 +90,27 @@ pub const NOT_IN_MENU: &[(&str, &str)] = &[
     (
         crate::dispatch::LSP_MENU_ACTION,
         "このメニューの中身そのものを読む口",
+    ),
+    // #1685: 検索した結果の読み書きは位置の操作ではない（入口は右パネルの references ビューの行と開閉）
+    (
+        crate::dispatch::LSP_RESULTS_ACTION,
+        "検索した結果を読む口（入口は右パネルの references ビュー）",
+    ),
+    (
+        crate::dispatch::LSP_EXPAND_ACTION,
+        "結果のツリーの開閉（入口は右パネルのノードの印）",
+    ),
+    (
+        crate::dispatch::LSP_COLLAPSE_ACTION,
+        "結果のツリーの開閉（入口は右パネルのノードの印）",
+    ),
+    (
+        crate::dispatch::LSP_OPEN_RESULT_ACTION,
+        "結果の行を開く（入口は右パネルの行のクリック）",
+    ),
+    (
+        crate::dispatch::LSP_CLEAR_RESULTS_ACTION,
+        "結果を消す（入口は右パネルの見出しの ×）",
     ),
 ];
 
@@ -114,6 +141,15 @@ pub fn item_request(item: MenuItem, target: &ItemTarget, focus: Option<bool>) ->
             choice: None,
             focus,
         },
+        // #1685: CLI の `tako lsp references --show` 等と同じ要求（右パネルにも出す）
+        MenuItem::Xref(kind) => Request::LspXref {
+            action: kind.slug().to_string(),
+            pane: Some(target.pane),
+            line: target.line,
+            column: target.column,
+            show: Some(true),
+            limit: None,
+        },
         // #1893: 編集メニューの「ホバー情報を表示」・CLI の `tako lsp hover --show` と同じ要求
         // （カードを出す。本文の上限はカードと同じ既定 = `limit` を付けない）
         MenuItem::Hover => Request::LspHover {
@@ -143,7 +179,7 @@ pub fn item_args(item: MenuItem, target: &ItemTarget) -> Option<Value> {
             "line": target.line,
             "column": target.column,
         }),
-        MenuItem::Hover => json!({
+        MenuItem::Hover | MenuItem::Xref(_) => json!({
             "action": action_of(item),
             "pane": target.pane,
             "line": target.line,
@@ -260,6 +296,31 @@ mod tests {
                 .iter()
                 .all(|(action, _)| *action != crate::dispatch::LSP_HOVER_ACTION),
             "項目にしたので載せない側から外す"
+        );
+    }
+
+    /// #1685: 参照・階層の項目は識別子の先頭で `show` つき（押すと右パネルに出る）
+    #[test]
+    fn 参照と階層の項目は右パネルへ出す要求になる() {
+        use tako_core::lsp::xref::XrefKind;
+        assert_eq!(
+            item_request(
+                MenuItem::Xref(XrefKind::IncomingCalls),
+                &target(None),
+                Some(true)
+            ),
+            Some(Request::LspXref {
+                action: "incoming-calls".into(),
+                pane: Some(7),
+                line: 3,
+                column: 4,
+                show: Some(true),
+                limit: None,
+            })
+        );
+        assert_eq!(
+            item_args(MenuItem::Xref(XrefKind::References), &target(None)),
+            Some(json!({"action": "references", "pane": 7, "line": 3, "column": 4, "show": true}))
         );
     }
 

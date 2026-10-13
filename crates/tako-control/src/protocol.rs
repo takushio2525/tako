@@ -181,11 +181,14 @@ pub enum PanelViewWire {
     Tasks,
     /// 言語サーバの診断（#1679。エラー・警告の一覧。行を押すとその位置へ）
     Diagnostics,
+    /// 参照検索・呼び出し階層・型階層の結果（#1685。一覧 / ツリー。行を押すとその位置へ）
+    References,
 }
 
 impl PanelViewWire {
     /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
-    pub const VALUES: [&'static str; 5] = ["fleet", "orch", "git", "tasks", "diagnostics"];
+    pub const VALUES: [&'static str; 6] =
+        ["fleet", "orch", "git", "tasks", "diagnostics", "references"];
     /// 後方互換のみで受理する旧称と現行値の対応（#553）
     pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
 
@@ -196,6 +199,7 @@ impl PanelViewWire {
             PanelViewWire::Git => "git",
             PanelViewWire::Tasks => "tasks",
             PanelViewWire::Diagnostics => "diagnostics",
+            PanelViewWire::References => "references",
         }
     }
 
@@ -207,6 +211,7 @@ impl PanelViewWire {
             "git" => Some(PanelViewWire::Git),
             "tasks" => Some(PanelViewWire::Tasks),
             "diagnostics" => Some(PanelViewWire::Diagnostics),
+            "references" => Some(PanelViewWire::References),
             _ => None,
         }
     }
@@ -225,6 +230,7 @@ impl PanelViewWire {
             PanelViewWire::Git => "git（差分・ステージ・コミット・ブランチ）",
             PanelViewWire::Tasks => "人がやること（承認待ち・レビュー・投稿）の一覧と返答",
             PanelViewWire::Diagnostics => "言語サーバの診断（エラー・警告）の一覧",
+            PanelViewWire::References => "参照・呼び出し階層・型階層の結果（一覧 / ツリー）",
         }
     }
 
@@ -985,6 +991,45 @@ pub enum Request {
         column: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         show: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    /// 参照検索・呼び出し階層・型階層（FR-3.42 / #1685。`tako lsp references` / `incoming-calls` /
+    /// `outgoing-calls` / `supertypes` / `subtypes` = MCP `tako_lsp` の同名の action）。
+    /// GUI の右クリックメニューの「参照を検索」等と同じ問い合わせの 1 本。
+    ///
+    /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
+    /// 行内 UTF-8 バイト）で、範囲外・文字の途中は丸めずに拒否する。答えは問い合わせたペインの
+    /// 結果として保持し（同じペインの次の問い合わせで置き換わる・ペインを閉じたら消える）、
+    /// `show` で右パネルの references ビューに出す。`limit` は応答に載せる行の数（既定 100・0 = 全部）
+    LspXref {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        line: usize,
+        column: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    /// 保持している参照・階層の結果の読み書き（FR-3.42 / #1685。`tako lsp results` / `expand` /
+    /// `collapse` / `open-result` / `clear-results` = MCP `tako_lsp` の同名の action）。
+    /// 右パネルの references ビューの行のクリック・ツリーの開閉と同じ口。
+    ///
+    /// `pane` は結果を問い合わせたペイン（省略で右パネルの結果 = 最後に出した結果）。`item` は
+    /// 一覧の行 / ツリーのノードの番号（応答の `id`。1 始まり）。`open` / `focus` は
+    /// `open-result` の置き場所と移動（定義ジャンプと同じ）。`limit` は応答に載せる行の数
+    LspResults {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
@@ -2621,6 +2666,10 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::Jump { .. }
         // 定義ジャンプ（#1680）は別のファイルなら新しいペインを生やす
         | Request::LspGoto { .. }
+        // 参照・階層（#1685）は `show` で右パネルを出し（ペインの面積が変わる）、
+        // `open-result` は別のファイルなら新しいペインを生やす
+        | Request::LspXref { .. }
+        | Request::LspResults { .. }
         | Request::OpenDir { .. }
         | Request::OpenRemote { .. }
         | Request::RemoteFolder { .. }
@@ -3095,10 +3144,11 @@ mod tests {
         assert_eq!(PanelViewWire::Git.as_str(), "git");
         assert_eq!(PanelViewWire::Tasks.as_str(), "tasks");
         assert_eq!(PanelViewWire::Diagnostics.as_str(), "diagnostics");
+        assert_eq!(PanelViewWire::References.as_str(), "references");
         // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
         assert_eq!(
             PanelViewWire::VALUES,
-            ["fleet", "orch", "git", "tasks", "diagnostics"]
+            ["fleet", "orch", "git", "tasks", "diagnostics", "references"]
         );
         assert!(!PanelViewWire::VALUES.contains(&"tmux"));
     }
@@ -3115,6 +3165,11 @@ mod tests {
         assert_eq!(
             PanelViewWire::parse("diagnostics"),
             Some(PanelViewWire::Diagnostics)
+        );
+        // #1685: 参照・階層の結果のビュー
+        assert_eq!(
+            PanelViewWire::parse("references"),
+            Some(PanelViewWire::References)
         );
         assert_eq!(PanelViewWire::parse("task"), None);
         assert_eq!(PanelViewWire::parse("fleets"), None);
@@ -3142,7 +3197,7 @@ mod tests {
         let hint = PanelViewWire::values_hint();
         assert_eq!(
             hint,
-            "fleet | orch | git | tasks | diagnostics。tmux は fleet の旧称"
+            "fleet | orch | git | tasks | diagnostics | references。tmux は fleet の旧称"
         );
     }
 
@@ -3162,7 +3217,15 @@ mod tests {
     fn accepted_valuesは正式値のあとに旧称を並べる() {
         assert_eq!(
             PanelViewWire::accepted_values(),
-            vec!["fleet", "orch", "git", "tasks", "diagnostics", "tmux"]
+            vec![
+                "fleet",
+                "orch",
+                "git",
+                "tasks",
+                "diagnostics",
+                "references",
+                "tmux"
+            ]
         );
     }
 

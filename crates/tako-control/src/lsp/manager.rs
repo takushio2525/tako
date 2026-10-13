@@ -77,6 +77,7 @@ use super::menu::{MenuCapabilities, MenuRequest};
 use super::rpc::RequestId;
 use super::server::{Handlers, RpcError, ServerProcess};
 use super::text;
+use super::xref::{ExpandAnswer, ExpandRequest, XrefAnswer, XrefRequest};
 use tako_core::lsp::completion as comp;
 
 /// 要求のタイムアウトの既定（Zed の実測値）
@@ -898,6 +899,28 @@ impl LspManager {
         match &self.shared {
             Some(shared) => shared.hover(request),
             None => Err(GotoError::Disabled.into()),
+        }
+    }
+
+    /// 参照検索・呼び出し階層・型階層の問い合わせ（#1685）。**背景スレッドから呼ぶ**（サーバの
+    /// 起動と応答を待つ。上限は `request.timeout`）。
+    ///
+    /// 起こし方は定義ジャンプと同じ（開いていなければ問い合わせのあいだだけ `didOpen`）。
+    /// 階層は prepare の根それぞれを 1 段だけ展開して返す（GUI のツリーが開いた形で出る）。
+    /// 読み込み中のサーバの空の答えは済むのを待って問い直す（定義ジャンプと同じ #1930 の判定）
+    pub fn xref(&self, request: &XrefRequest) -> Result<XrefAnswer, GotoError> {
+        match &self.shared {
+            Some(shared) => shared.xref(request),
+            None => Err(GotoError::Disabled),
+        }
+    }
+
+    /// 階層ツリーの 1 段の展開（#1685。**背景スレッドから呼ぶ**。上限は `request.timeout`）。
+    /// 結果を問い合わせた文書を受け持つサーバへ、受けた要素をそのまま送り返す
+    pub fn xref_expand(&self, request: &ExpandRequest) -> Result<ExpandAnswer, GotoError> {
+        match &self.shared {
+            Some(shared) => shared.xref_expand(request),
+            None => Err(GotoError::Disabled),
         }
     }
 
@@ -2530,6 +2553,213 @@ impl Shared {
     }
 }
 
+// --- 参照検索・呼び出し階層・型階層（#1685）---------------------------------
+
+/// 場所の本文の読み置き（1 回の答えの中で同じファイルを何度も読まない）。
+/// 開いている文書はサーバが見ている写し、それ以外はディスクの中身から抜粋と桁を取る
+struct PlaceSource<'a> {
+    shared: &'a Shared,
+    texts: std::collections::HashMap<String, Option<String>>,
+}
+
+impl PlaceSource<'_> {
+    fn place(
+        &mut self,
+        uri: &str,
+        line: usize,
+        character: usize,
+    ) -> Option<tako_core::lsp::xref::Place> {
+        let path = tako_core::lsp::goto::path_of_uri(uri, cfg!(windows))?;
+        let shared = self.shared;
+        let text = self.texts.entry(uri.to_string()).or_insert_with(|| {
+            shared.shadow_text(uri).or_else(|| {
+                std::fs::read(&path)
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            })
+        });
+        Some(super::xref::place_of(
+            uri.to_string(),
+            path,
+            line,
+            character,
+            text.as_deref(),
+        ))
+    }
+
+    fn seeds(
+        &mut self,
+        items: Vec<tako_core::lsp::xref::HierarchyItem>,
+    ) -> Vec<tako_core::lsp::xref::NodeSeed> {
+        items
+            .into_iter()
+            .filter_map(|item| {
+                Some(tako_core::lsp::xref::NodeSeed {
+                    place: self.place(&item.uri, item.line, item.character)?,
+                    name: item.name,
+                    kind: item.kind,
+                    detail: item.detail,
+                    raw: item.raw,
+                })
+            })
+            .collect()
+    }
+}
+
+impl Shared {
+    fn xref(&self, request: &XrefRequest) -> Result<XrefAnswer, GotoError> {
+        use tako_core::lsp::xref as core;
+        let deadline = Instant::now() + request.timeout;
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(GotoError::NoServer);
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        // 開いていなければ問い合わせのあいだだけ開く（定義ジャンプと同じ 1 本）
+        let _transient =
+            self.open_for_request(&request.path, &uri, spec, request.document.as_deref())?;
+        let (process, capabilities, key) =
+            self.wait_ready(&uri, spec, request.timeout, deadline, &|| false)?;
+        if !core::server_supports(&capabilities, request.kind) {
+            return Err(GotoError::Unsupported { server: spec.id });
+        }
+        // 問い合わせる位置は**サーバが見ている本文**で LSP の座標へ直す（#1769）
+        let at = {
+            let inner = self.lock();
+            let Some(doc) = inner.docs.get(&uri) else {
+                return Err(GotoError::Closed);
+            };
+            position::lsp_position_of_line_col(&doc.text, request.line, request.column)
+        };
+        let mut empty = super::goto::EmptyAnswer::default();
+        loop {
+            empty.sent(self.reported_loading(&key));
+            let answer = self.xref_once(&process, &uri, spec, request, at, deadline)?;
+            if !answer.is_empty() {
+                return Ok(answer);
+            }
+            // 空の答え: 読み込み中のサーバなら済むのを待って問い直す（定義ジャンプと同じ）
+            match self.wait_after_empty(&key, deadline, &|| false, &mut empty) {
+                super::goto::Loading::Retry => continue,
+                super::goto::Loading::Settled => return Ok(answer),
+                super::goto::Loading::TimedOut => {
+                    return Err(GotoError::Timeout {
+                        server: spec.id,
+                        secs: request.timeout.as_secs(),
+                        starting: true,
+                    })
+                }
+                super::goto::Loading::Abandoned => return Err(GotoError::Closed),
+            }
+        }
+    }
+
+    /// 要求を 1 回投げて、答えを tako の座標へ直す（階層は根ごとに 1 段の展開まで）
+    fn xref_once(
+        &self,
+        process: &ServerProcess,
+        uri: &str,
+        spec: &'static ServerSpec,
+        request: &XrefRequest,
+        (line, character): (usize, usize),
+        deadline: Instant,
+    ) -> Result<XrefAnswer, GotoError> {
+        use tako_core::lsp::xref as core;
+        let remaining = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+        };
+        let position = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        });
+        let mut source = PlaceSource {
+            shared: self,
+            texts: std::collections::HashMap::new(),
+        };
+        let Some(prepare) = request.kind.prepare_method() else {
+            let mut params = position;
+            // 宣言も参照に含める（一覧の先頭に定義が出る = VSCode の「すべての参照の検索」と同じ）
+            params["context"] = json!({ "includeDeclaration": true });
+            let answer = process
+                .request(request.kind.method(), params, remaining())
+                .map_err(|e| rpc_failure(spec, request.timeout, e))?;
+            let (locations, total) = core::parse_references(&answer);
+            let kept = locations.len();
+            let items: Vec<core::Place> = locations
+                .into_iter()
+                .filter_map(|l| source.place(&l.uri, l.line, l.character))
+                .collect();
+            return Ok(XrefAnswer::List {
+                server: spec.id,
+                // 場所へ直せなかったもの（ローカルでない URI）は数えない
+                total: total - (kept - items.len()),
+                items,
+            });
+        };
+        let answer = process
+            .request(prepare, position, remaining())
+            .map_err(|e| rpc_failure(spec, request.timeout, e))?;
+        let roots: Vec<core::HierarchyItem> = core::parse_items(&answer)
+            .into_iter()
+            .take(core::MAX_ROOTS)
+            .collect();
+        let mut out = Vec::with_capacity(roots.len());
+        for root in roots {
+            let expanded = process
+                .request(
+                    request.kind.method(),
+                    json!({ "item": root.raw }),
+                    remaining(),
+                )
+                .map_err(|e| rpc_failure(spec, request.timeout, e))?;
+            let children = source.seeds(core::parse_expand(&expanded, request.kind));
+            if let Some(seed) = source.seeds(vec![root]).pop() {
+                out.push((seed, Some(children)));
+            }
+        }
+        Ok(XrefAnswer::Tree {
+            server: spec.id,
+            roots: out,
+        })
+    }
+
+    fn xref_expand(&self, request: &ExpandRequest) -> Result<ExpandAnswer, GotoError> {
+        use tako_core::lsp::xref as core;
+        let deadline = Instant::now() + request.timeout;
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(GotoError::NoServer);
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        let _transient = self.open_for_request(&request.path, &uri, spec, None)?;
+        let (process, capabilities, _) =
+            self.wait_ready(&uri, spec, request.timeout, deadline, &|| false)?;
+        if !core::server_supports(&capabilities, request.kind) {
+            return Err(GotoError::Unsupported { server: spec.id });
+        }
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let answer = process
+            .request(
+                request.kind.method(),
+                json!({ "item": request.item }),
+                remaining,
+            )
+            .map_err(|e| rpc_failure(spec, request.timeout, e))?;
+        let mut source = PlaceSource {
+            shared: self,
+            texts: std::collections::HashMap::new(),
+        };
+        Ok(ExpandAnswer {
+            server: spec.id,
+            children: source.seeds(core::parse_expand(&answer, request.kind)),
+        })
+    }
+}
+
 // --- 定義ジャンプ（#1680）---------------------------------------------------
 
 impl Shared {
@@ -3792,13 +4022,27 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
 }
 
 /// initialize の応答から `ServerCapabilities` を取り出す。
-/// `lsp-types` で読めれば読み直した形（正規化）、読めなければ生の JSON を持つ
+/// `lsp-types` で読めれば読み直した形（正規化）、読めなければ生の JSON を持つ。
+///
+/// 読み直しで**型が知らないキーは落ちる**（`lsp-types` 0.97 は LSP 3.17 の
+/// `typeHierarchyProvider` を持たない）ので、型に無いキーは生の値のまま戻す（#1685。
+/// 落とすと型階層を申告したサーバを「未対応」と読み違える）
 fn parse_capabilities(result: &Value) -> Value {
     let raw = result.get("capabilities").cloned().unwrap_or(Value::Null);
-    serde_json::from_value::<lsp_types::ServerCapabilities>(raw.clone())
+    let Some(mut typed) = serde_json::from_value::<lsp_types::ServerCapabilities>(raw.clone())
         .ok()
         .and_then(|typed| serde_json::to_value(typed).ok())
-        .unwrap_or(raw)
+    else {
+        return raw;
+    };
+    if let (Some(typed), Value::Object(raw)) = (typed.as_object_mut(), &raw) {
+        for (key, value) in raw {
+            if !typed.contains_key(key) && !super::xref::legacy() {
+                typed.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    typed
 }
 
 /// `textDocumentSync` の種別（数値か `{ change: n }`。無ければ None = 送らない）
@@ -3818,6 +4062,27 @@ fn sync_kind_of(capabilities: &Value) -> SyncKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1685: 型（lsp-types 0.97）が知らない `typeHierarchyProvider` も握手の能力に残る
+    /// （落とすと型階層を申告したサーバを「未対応」と読み違える）。型が知るキーは正規化のまま
+    #[test]
+    fn 型の知らない能力のキーも残す() {
+        let caps = parse_capabilities(&json!({ "capabilities": {
+            "referencesProvider": true,
+            "callHierarchyProvider": true,
+            "typeHierarchyProvider": true,
+            "experimentalThing": { "x": 1 },
+        }}));
+        assert_eq!(caps["typeHierarchyProvider"], json!(true));
+        assert_eq!(caps["experimentalThing"], json!({ "x": 1 }));
+        assert_eq!(caps["referencesProvider"], json!(true));
+        assert_eq!(caps["callHierarchyProvider"], json!(true));
+        // 型が読めない形はそのまま
+        assert_eq!(
+            parse_capabilities(&json!({ "capabilities": { "hoverProvider": "x" } })),
+            json!({ "hoverProvider": "x" })
+        );
+    }
 
     #[test]
     fn 同期の種別は数値でも_options_でも読める() {

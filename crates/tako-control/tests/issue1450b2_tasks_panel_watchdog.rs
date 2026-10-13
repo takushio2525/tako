@@ -246,8 +246,20 @@ fn scan_view_vocabulary(sources: &Sources) -> Vec<Offender> {
     // CLI / MCP が案内する正式値に載っていないと `--view tasks` が弾かれる。
     // **`VALUES` の行そのもの**を見る（ファイル全体から `"tasks"` を探すと、
     // `parse` の腕が残っているだけで緑になり、注入を見逃す）
+    // 宣言の文を `;` まで読む（値が増えて rustfmt が配列を次の行へ折っても見失わない。#1685 で
+    // `references` を足したときに 1 行目だけを見て空振りした）
     let values_at = code_line_with(&protocol, "pub const VALUES");
-    let values_line = values_at.and_then(|i| protocol.lines().nth(i));
+    let values_line = values_at.map(|i| {
+        let mut statement = String::new();
+        for line in protocol.lines().skip(i) {
+            statement.push_str(line);
+            // 型の `[&'static str; 6]` にも `;` があるので、文の終わり = 行末の `;` で止める
+            if line.trim_end().ends_with(';') {
+                break;
+            }
+        }
+        statement
+    });
     if !values_line.is_some_and(|l| l.contains("\"tasks\"")) {
         out.push(Offender {
             file: PROTOCOL,
@@ -641,8 +653,8 @@ fn 逆戻りを名指しできる() {
     // (4) CLI / MCP の語彙から `tasks` が抜ける（GUI にしか無いビューになる）
     let mut s = Sources::load(&root);
     s.protocol = s.protocol.replace(
-        "[\"fleet\", \"orch\", \"git\", \"tasks\", \"diagnostics\"]",
-        "[\"fleet\", \"orch\", \"git\", \"diagnostics\"]",
+        "[\"fleet\", \"orch\", \"git\", \"tasks\", \"diagnostics\", \"references\"]",
+        "[\"fleet\", \"orch\", \"git\", \"diagnostics\", \"references\"]",
     );
     expect_hit(&s, PROTOCOL, "`PanelViewWire::VALUES` に `tasks` が無い");
 

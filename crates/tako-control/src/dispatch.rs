@@ -978,7 +978,7 @@ pub fn lsp_goto_land(
     origin: PaneOrigin,
     landing: &LspGotoLanding,
 ) -> Result<Value, DispatchError> {
-    use tako_core::lsp::goto::{plan_landing, Landing, NewPane, Placement};
+    use tako_core::lsp::goto::Placement;
     let kind = landing.kind;
     let from = json!({
         "pane": landing.source_pane.as_u64(),
@@ -1045,52 +1045,95 @@ pub fn lsp_goto_land(
     if !still_there {
         return Ok(source_gone_json(kind, out));
     }
+    let (plan, opened) = land_on_place(
+        host,
+        origin,
+        PlaceLanding {
+            source_pane: landing.source_pane,
+            source_path: &landing.source_path,
+            tab,
+            path: &target.path,
+            line: target.line,
+            char_column: target.char_column,
+            placement: landing.placement,
+            focus: landing.focus,
+        },
+    )?;
+    out["landing"] = json!(plan.slug());
+    out["open"] = opened;
+    Ok(out)
+}
+
+/// 開く場所と開き方（[`land_on_place`] の引数。定義ジャンプ #1680 と参照の行 #1685 の共通）
+struct PlaceLanding<'a> {
+    /// 起点のペイン（ジャンプ履歴の「飛ぶ前」・新しいペインの分割元）
+    source_pane: PaneId,
+    /// 起点のペインがいま表示しているファイル（同じファイルなら同じペインで飛ぶ）
+    source_path: &'a str,
+    /// 起点のペインのタブ（同じタブで開いているペインを使い回す範囲）
+    tab: TabId,
+    path: &'a Path,
+    /// 0 起点の行と、行内の文字数での桁（0 起点）
+    line: usize,
+    char_column: usize,
+    placement: tako_core::lsp::goto::Placement,
+    focus: Option<bool>,
+}
+
+/// 場所を開く（UI スレッド）。規則の正本は `tako_core::lsp::goto::plan_landing`（同じファイル =
+/// 同じペイン / 同じタブで開いている = そのペイン / それ以外 = 新しいペイン）で、[`open_file`] を通す
+/// （= ジャンプ履歴へ積む。起点は `source_pane`）。定義ジャンプの着地と参照の行を開く（#1685）が
+/// 同じ 1 本を通る
+fn land_on_place(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    at: PlaceLanding<'_>,
+) -> Result<(tako_core::lsp::goto::Landing, Value), DispatchError> {
+    use tako_core::lsp::goto::{plan_landing, Landing, NewPane};
     let open_in_tab: Vec<(PaneId, PathBuf)> = host
         .workspace()
-        .get_tab(tab)
+        .get_tab(at.tab)
         .map(|t| t.tree().panes().iter().map(|p| p.id()).collect::<Vec<_>>())
         .unwrap_or_default()
         .into_iter()
-        .filter(|id| *id != landing.source_pane)
+        .filter(|id| *id != at.source_pane)
         .filter_map(|id| {
             host.preview_state(id)
                 .map(|(path, _)| (id, PathBuf::from(path)))
         })
         .collect();
     let plan = plan_landing(
-        Path::new(&landing.source_path),
-        &target.path,
+        Path::new(at.source_path),
+        at.path,
         &open_in_tab,
-        landing.placement,
+        at.placement,
         same_file,
     );
     let (pane, direction, new_tab) = match plan {
-        Landing::SamePane => (landing.source_pane, None, false),
+        Landing::SamePane => (at.source_pane, None, false),
         Landing::Reuse(pane) => (pane, None, false),
-        Landing::New(NewPane::Right) => (landing.source_pane, Some(Direction::Right), false),
-        Landing::New(NewPane::Down) => (landing.source_pane, Some(Direction::Down), false),
-        Landing::New(NewPane::Tab) => (landing.source_pane, None, true),
+        Landing::New(NewPane::Right) => (at.source_pane, Some(Direction::Right), false),
+        Landing::New(NewPane::Down) => (at.source_pane, Some(Direction::Down), false),
+        Landing::New(NewPane::Tab) => (at.source_pane, None, true),
     };
     let opened = open_file(
         host,
         origin,
         OpenFileArgs {
             pane: Some(pane.as_u64()),
-            path: target.path.display().to_string(),
+            path: at.path.display().to_string(),
             mode: Some(PreviewModeWire::Code),
             direction,
-            focus: landing.focus,
+            focus: at.focus,
             new_tab,
-            line: Some(target.line + 1),
+            line: Some(at.line + 1),
             // `OpenFile` の桁は 1 始まりの文字数
-            column: Some(target.char_column + 1),
-            jump_from: JumpFrom::Pane(landing.source_pane),
+            column: Some(at.char_column + 1),
+            jump_from: JumpFrom::Pane(at.source_pane),
         },
         JumpRecord::Record,
     )?;
-    out["landing"] = json!(plan.slug());
-    out["open"] = opened;
-    Ok(out)
+    Ok((plan, opened))
 }
 
 fn source_gone_json(kind: tako_core::lsp::goto::GotoKind, mut out: Value) -> Value {
@@ -1843,6 +1886,504 @@ pub fn lsp_hover_land(
     Ok(out)
 }
 
+// --- 参照検索・呼び出し階層・型階層（#1685）--------------------------------------
+
+/// 保持している結果を読む action（CLI は `tako lsp results`）
+pub const LSP_RESULTS_ACTION: &str = "results";
+/// ツリーのノードを開く action（子を読んでいなければ言語サーバへ問い合わせる）
+pub const LSP_EXPAND_ACTION: &str = "expand";
+/// ツリーのノードを閉じる action
+pub const LSP_COLLAPSE_ACTION: &str = "collapse";
+/// 一覧の行 / ツリーのノードの位置を開く action（右パネルの行のクリックと同じ）
+pub const LSP_OPEN_RESULT_ACTION: &str = "open-result";
+/// 結果を消す action（右パネルの見出しの × と同じ）
+pub const LSP_CLEAR_RESULTS_ACTION: &str = "clear-results";
+/// 保持している結果の読み書きの action（[`Request::LspResults`]）
+pub const LSP_RESULT_ACTIONS: [&str; 5] = [
+    LSP_RESULTS_ACTION,
+    LSP_EXPAND_ACTION,
+    LSP_COLLAPSE_ACTION,
+    LSP_OPEN_RESULT_ACTION,
+    LSP_CLEAR_RESULTS_ACTION,
+];
+
+/// 結果の置き場を持たない host（セカンダリ等）の答え
+fn xref_unavailable() -> DispatchError {
+    DispatchError::Operation(crate::lsp::text::UNAVAILABLE.text().to_string())
+}
+
+/// 参照・階層の問い合わせ（#1685）。UI スレッドで [`lsp_xref_prepare`] が作り、
+/// [`LspXrefJob::run`] を背景で走らせ、答えを載せた [`LspXrefLanding`] を UI スレッドの
+/// [`lsp_xref_land`] へ戻す（GUI の右クリックメニューと CLI / MCP が同じ 3 段を通る）
+pub struct LspXrefJob {
+    manager: crate::lsp::LspManager,
+    request: crate::lsp::XrefRequest,
+    landing: LspXrefLanding,
+}
+
+impl LspXrefJob {
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。上限は `XrefRequest::timeout`）
+    pub fn run(self) -> LspXrefLanding {
+        let mut landing = self.landing;
+        landing.answer = Some(self.manager.xref(&self.request));
+        landing
+    }
+}
+
+/// 参照・階層の着地に要るもの（問い合わせたペインと引数）と、背景で得た答え（#1685）
+#[derive(Debug, Clone)]
+pub struct LspXrefLanding {
+    pub kind: tako_core::lsp::xref::XrefKind,
+    pub source_pane: PaneId,
+    pub source_path: String,
+    /// 問い合わせた位置（行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+    pub line: usize,
+    pub column: usize,
+    /// その位置の識別子（見出しに出す）
+    pub symbol: String,
+    /// 右パネルの references ビューに出すか
+    pub show: bool,
+    /// 応答に載せる行の数（`None` = 既定・0 = 全部）
+    pub limit: Option<usize>,
+    /// 背景で得た答え（[`LspXrefJob::run`] が入れる）
+    pub answer: Option<Result<crate::lsp::XrefAnswer, crate::lsp::GotoError>>,
+}
+
+/// 参照・階層の準備（UI スレッド。#1685）。引数を検査し、編集セッションの本文とその位置の
+/// 識別子を採る（言語サーバの座標へは manager がサーバの見ている本文で直す）。**1 プロセスも起こさない**
+pub fn lsp_xref_prepare(
+    host: &dyn ControlHost,
+    action: &str,
+    pane: Option<u64>,
+    line: usize,
+    column: usize,
+    show: bool,
+    limit: Option<usize>,
+) -> Result<LspXrefJob, DispatchError> {
+    use tako_core::lsp::xref::XrefKind;
+    let kind = XrefKind::parse(action).ok_or_else(|| {
+        DispatchError::InvalidParams(format!(
+            "action が不正: {action}（{}）",
+            XrefKind::NAMES.join(" / ")
+        ))
+    })?;
+    if line == 0 {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::LINE_ONE_BASED.into(),
+        ));
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let Some((path, _)) = host.preview_state(target) else {
+        return Err(DispatchError::InvalidParams(format!(
+            "プレビューペインではない: {}",
+            target.as_u64()
+        )));
+    };
+    let source = host
+        .preview_goto_source(target, line - 1)
+        .map_err(DispatchError::InvalidParams)?;
+    check_line_column(&source.line_text, line, column)?;
+    let (Some(manager), Some(_)) = (host.lsp(), host.lsp_xref()) else {
+        return Err(xref_unavailable());
+    };
+    let symbol = tako_core::lsp::goto::symbol_at(&source.line_text, column)
+        .map(|s| source.line_text[s.range].to_string())
+        .unwrap_or_default();
+    Ok(LspXrefJob {
+        manager: manager.clone(),
+        request: crate::lsp::XrefRequest {
+            kind,
+            path: PathBuf::from(&path),
+            line: line - 1,
+            column,
+            timeout: crate::lsp::xref::xref_timeout(),
+            document: source.document,
+        },
+        landing: LspXrefLanding {
+            kind,
+            source_pane: target,
+            source_path: path,
+            line,
+            column,
+            symbol,
+            show,
+            limit,
+            answer: None,
+        },
+    })
+}
+
+/// 参照・階層の着地（UI スレッド。#1685）。答えを問い合わせたペインの結果として置き、
+/// `show` なら右パネルの references ビューを出す。「0 件」「未導入」「未応答」等は `status` と
+/// 理由・次の一手で返す（失敗ではなく答え）。失敗の答えは置かない（前の結果を残す）
+pub fn lsp_xref_land(
+    host: &mut dyn ControlHost,
+    landing: &LspXrefLanding,
+) -> Result<Value, DispatchError> {
+    let from = json!({
+        "pane": landing.source_pane.as_u64(),
+        "path": landing.source_path,
+        "line": landing.line,
+        "column": landing.column,
+        "symbol": landing.symbol,
+    });
+    let answer = match &landing.answer {
+        Some(Ok(answer)) => answer.clone(),
+        Some(Err(error)) => {
+            let mut out = crate::lsp::xref::error_json(error, landing.kind);
+            out["from"] = from;
+            return Ok(out);
+        }
+        None => {
+            return Err(DispatchError::Operation(
+                "参照の答えがまだ無い（背景の問い合わせを経ずに着地しようとした）".into(),
+            ))
+        }
+    };
+    // 待っているあいだに問い合わせたペインが閉じられた / 差し替わったら置かない
+    // （閉じたペインの結果は残さない = 保持件数が 0 へ戻る）
+    let still_there = host
+        .preview_state(landing.source_pane)
+        .is_some_and(|(path, _)| path == landing.source_path);
+    if !still_there {
+        let mut out = json!({
+            "status": "source-gone",
+            "kind": landing.kind.slug(),
+            "reason": crate::lsp::text::GOTO_SOURCE_GONE_REASON.text(),
+            "next_step": crate::lsp::text::GOTO_RETRY_NEXT_STEP.text(),
+        });
+        out["from"] = from;
+        return Ok(out);
+    }
+    let server = answer.server().to_string();
+    let (body, total) = answer.into_body();
+    let Some(store) = host.lsp_xref_mut() else {
+        return Err(xref_unavailable());
+    };
+    store.put(tako_core::lsp::xref::XrefResult {
+        pane: landing.source_pane,
+        path: PathBuf::from(&landing.source_path),
+        line: landing.line,
+        column: landing.column,
+        symbol: landing.symbol.clone(),
+        kind: landing.kind,
+        server,
+        body,
+        total,
+        seq: 0,
+    });
+    let mut out = store
+        .get(landing.source_pane)
+        .map(|r| crate::lsp::xref::result_json(r, landing.limit))
+        .unwrap_or_else(crate::lsp::xref::no_result_json);
+    out["retained"] = json!(store.len());
+    if landing.show {
+        host.set_panel(
+            Some(true),
+            None,
+            Some(crate::protocol::PanelViewWire::References),
+        );
+        out["shown"] = json!(true);
+    }
+    Ok(out)
+}
+
+/// ツリーの 1 段の展開（#1685）。子を読んでいないノードの展開だけがこれを通り、
+/// [`lsp_expand_prepare`] → [`LspExpandJob::run`]（背景）→ [`lsp_expand_land`] の 3 段になる
+pub struct LspExpandJob {
+    manager: crate::lsp::LspManager,
+    request: crate::lsp::ExpandRequest,
+    landing: LspExpandLanding,
+}
+
+impl LspExpandJob {
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。上限は `ExpandRequest::timeout`）
+    pub fn run(self) -> LspExpandLanding {
+        let mut landing = self.landing;
+        landing.answer = Some(self.manager.xref_expand(&self.request));
+        landing
+    }
+}
+
+/// 展開の着地に要るもの（どの結果のどのノードか）と、背景で得た答え（#1685）
+#[derive(Debug, Clone)]
+pub struct LspExpandLanding {
+    pub kind: tako_core::lsp::xref::XrefKind,
+    /// 結果を問い合わせたペイン
+    pub pane: PaneId,
+    /// 頼んだときの結果の番号（待つあいだに置き換わったら当てない）
+    pub seq: u64,
+    pub item: usize,
+    pub limit: Option<usize>,
+    pub answer: Option<Result<crate::lsp::ExpandAnswer, crate::lsp::GotoError>>,
+}
+
+/// 展開の準備（UI スレッド。#1685）。**子をまだ読んでいないノードの展開だけ**ジョブを返す。
+/// それ以外（読み込み済みの開閉・結果が無い・番号の誤り）は `None` で、同期の口
+/// （[`lsp_results`]）が状態だけを変える / 理由を返す
+pub fn lsp_expand_prepare(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    item: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Option<LspExpandJob>, DispatchError> {
+    use tako_core::lsp::xref::{Body, MAX_DEPTH};
+    let Some(store) = host.lsp_xref() else {
+        return Err(xref_unavailable());
+    };
+    let (Some(target), Some(item)) = (store.resolve(pane.map(PaneId::from_raw)), item) else {
+        return Ok(None);
+    };
+    let Some(result) = store.get(target) else {
+        return Ok(None);
+    };
+    let Body::Tree(tree) = &result.body else {
+        return Ok(None);
+    };
+    let Some(node) = tree.node(item) else {
+        return Ok(None);
+    };
+    if node.children.is_some() || node.depth + 1 > MAX_DEPTH {
+        return Ok(None);
+    }
+    let Some(manager) = host.lsp() else {
+        return Err(xref_unavailable());
+    };
+    Ok(Some(LspExpandJob {
+        manager: manager.clone(),
+        request: crate::lsp::ExpandRequest {
+            kind: result.kind,
+            path: result.path.clone(),
+            item: node.raw.clone(),
+            timeout: crate::lsp::xref::xref_timeout(),
+        },
+        landing: LspExpandLanding {
+            kind: result.kind,
+            pane: target,
+            seq: result.seq,
+            item,
+            limit,
+            answer: None,
+        },
+    }))
+}
+
+/// 展開の着地（UI スレッド。#1685）。読んだ子をノードへ足して開く
+pub fn lsp_expand_land(
+    host: &mut dyn ControlHost,
+    landing: &LspExpandLanding,
+) -> Result<Value, DispatchError> {
+    use tako_core::lsp::xref::{Body, TreeError};
+    let children = match &landing.answer {
+        Some(Ok(answer)) => answer.children.clone(),
+        Some(Err(error)) => {
+            let mut out = crate::lsp::xref::error_json(error, landing.kind);
+            out["item"] = json!(landing.item);
+            return Ok(out);
+        }
+        None => {
+            return Err(DispatchError::Operation(
+                "展開の答えがまだ無い（背景の問い合わせを経ずに着地しようとした）".into(),
+            ))
+        }
+    };
+    let stale = || {
+        json!({
+            "status": "stale",
+            "item": landing.item,
+            "reason": crate::lsp::text::XREF_STALE_REASON.text(),
+            "next_step": crate::lsp::text::GOTO_RETRY_NEXT_STEP.text(),
+        })
+    };
+    let Some(store) = host.lsp_xref_mut() else {
+        return Err(xref_unavailable());
+    };
+    let Some(result) = store.get_mut(landing.pane).filter(|r| r.seq == landing.seq) else {
+        return Ok(stale());
+    };
+    let Body::Tree(tree) = &mut result.body else {
+        return Ok(stale());
+    };
+    let added = match tree.set_children(landing.item, children) {
+        Ok(added) => added,
+        Err(TreeError::TooDeep(item)) => return Ok(too_deep_json(item)),
+        Err(TreeError::NoNode(_)) => return Ok(stale()),
+    };
+    result.total = tree.len();
+    let mut out = crate::lsp::xref::result_json(result, landing.limit);
+    out["item"] = json!(landing.item);
+    out["changed"] = json!(true);
+    out["added"] = json!(added);
+    Ok(out)
+}
+
+fn too_deep_json(item: usize) -> Value {
+    json!({
+        "status": "too-deep",
+        "item": item,
+        "reason": crate::lsp::text::fill(
+            crate::lsp::text::XREF_TOO_DEEP_REASON,
+            &[("max", &tako_core::lsp::xref::MAX_DEPTH.to_string())],
+        ),
+    })
+}
+
+/// 保持している結果の要約（保持件数の口。どの action の応答にも載る）
+fn xref_retained(store: &tako_core::lsp::xref::XrefStore, out: &mut Value) {
+    let active = store.active().map(|r| r.pane);
+    out["retained"] = json!(store.len());
+    out["retained_rows"] = json!(store.rows());
+    out["results"] = store
+        .iter()
+        .map(|r| {
+            json!({
+                "pane": r.pane.as_u64(),
+                "kind": r.kind.slug(),
+                "symbol": r.symbol,
+                "rows": r.body.len(),
+                "active": Some(r.pane) == active,
+            })
+        })
+        .collect();
+}
+
+/// 保持している結果の読み書き（UI スレッド。#1685）。右パネルの行のクリック・ツリーの開閉・
+/// 見出しの × と CLI / MCP が同じここを通る。子を読んでいないノードの展開は通常
+/// `prepare_offload` が背景へ出す（ここへ来るのは `TAKO_OFFLOAD=0` か直呼び = 同じ 3 段を直列に）
+#[allow(clippy::too_many_arguments)]
+pub fn lsp_results(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    action: &str,
+    pane: Option<u64>,
+    item: Option<usize>,
+    open: Option<&str>,
+    focus: Option<bool>,
+    limit: Option<usize>,
+) -> Result<Value, DispatchError> {
+    use crate::lsp::{text, xref};
+    use tako_core::lsp::goto::Placement;
+    use tako_core::lsp::xref::{Body, Expand, TreeError};
+    if !LSP_RESULT_ACTIONS.contains(&action) {
+        return Err(DispatchError::InvalidParams(format!(
+            "action が不正: {action}（{}）",
+            LSP_RESULT_ACTIONS.join(" / ")
+        )));
+    }
+    // 閉じたペインの結果は残さない（閉じる経路の取りこぼしの保険。GUI は閉じた時点で消す）
+    let live = host.workspace().all_pane_ids();
+    let Some(store) = host.lsp_xref_mut() else {
+        return Err(xref_unavailable());
+    };
+    store.retain_panes(|p| live.contains(&p));
+    let target = store.resolve(pane.map(PaneId::from_raw));
+    let need_item =
+        || item.ok_or_else(|| DispatchError::InvalidParams("item を指定する（応答の id）".into()));
+    let no_item = |item: usize, count: usize| {
+        DispatchError::InvalidParams(text::fill(
+            text::XREF_NO_ITEM_REASON,
+            &[("item", &item.to_string()), ("count", &count.to_string())],
+        ))
+    };
+    let mut out = match action {
+        LSP_RESULTS_ACTION => target
+            .and_then(|p| store.get(p))
+            .map(|r| xref::result_json(r, limit))
+            .unwrap_or_else(xref::no_result_json),
+        LSP_CLEAR_RESULTS_ACTION => {
+            let cleared = target.is_some_and(|p| store.remove(p));
+            json!({ "cleared": cleared, "pane": target.map(PaneId::as_u64) })
+        }
+        LSP_EXPAND_ACTION | LSP_COLLAPSE_ACTION => {
+            let item = need_item()?;
+            let Some(result) = target.and_then(|p| store.get_mut(p)) else {
+                return Ok(xref::no_result_json());
+            };
+            let Body::Tree(tree) = &mut result.body else {
+                return Err(DispatchError::InvalidParams(
+                    text::XREF_NOT_TREE_REASON.text().to_string(),
+                ));
+            };
+            let count = tree.len();
+            match tree.set_expanded(item, action == LSP_EXPAND_ACTION) {
+                Ok(Expand::NeedsLoad) => {
+                    // 子をまだ読んでいない: 準備 → 問い合わせ → 着地を直列に通る
+                    // （通常は prepare_offload が背景へ出すのでここへは来ない）
+                    let Some(job) = lsp_expand_prepare(host, pane, Some(item), limit)? else {
+                        return Err(DispatchError::Operation("展開の準備ができなかった".into()));
+                    };
+                    return lsp_expand_land(host, &job.run());
+                }
+                Ok(state) => {
+                    let mut out = xref::result_json(result, limit);
+                    out["item"] = json!(item);
+                    out["changed"] = json!(state == Expand::Changed);
+                    out
+                }
+                Err(TreeError::NoNode(_)) => return Err(no_item(item, count)),
+                Err(TreeError::TooDeep(item)) => too_deep_json(item),
+            }
+        }
+        _ => {
+            // open-result: 一覧の行 / ツリーのノードの位置を、定義ジャンプと同じ規則で開く
+            let item = need_item()?;
+            let Some(result) = target.and_then(|p| store.get(p)) else {
+                return Ok(xref::no_result_json());
+            };
+            let source = result.pane;
+            let place = result
+                .body
+                .place(item)
+                .cloned()
+                .ok_or_else(|| no_item(item, result.body.len()))?;
+            let placement = match open {
+                None => Placement::Auto,
+                Some(name) => Placement::parse(name).ok_or_else(|| {
+                    DispatchError::InvalidParams(format!(
+                        "open が不正: {name}（{}）",
+                        Placement::NAMES.join(" / ")
+                    ))
+                })?,
+            };
+            let mut out = json!({
+                "status": "found",
+                "pane": source.as_u64(),
+                "item": item,
+                "location": xref::place_json(&place),
+            });
+            if placement != Placement::None {
+                let (tab, _) = resolve_pane(host.workspace(), Some(source.as_u64()))?;
+                let source_path = host
+                    .preview_state(source)
+                    .map(|(path, _)| path)
+                    .unwrap_or_default();
+                let (plan, opened) = land_on_place(
+                    host,
+                    origin,
+                    PlaceLanding {
+                        source_pane: source,
+                        source_path: &source_path,
+                        tab,
+                        path: &place.path,
+                        line: place.line,
+                        char_column: place.char_column,
+                        placement,
+                        focus,
+                    },
+                )?;
+                out["status"] = json!("opened");
+                out["landing"] = json!(plan.slug());
+                out["open"] = opened;
+            }
+            out
+        }
+    };
+    if let Some(store) = host.lsp_xref() {
+        xref_retained(store, &mut out);
+    }
+    Ok(out)
+}
+
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
 /// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
@@ -1934,6 +2475,11 @@ pub enum OffloadJob {
     /// ホバーの問い合わせ（#1681）。待つのは background、カードを出す（`show`）のは
     /// [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
     LspHover(Box<LspHoverJob>),
+    /// 参照・階層の問い合わせ（#1685）。待つのは background、結果を置く・右パネルを出すのは
+    /// [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
+    LspXref(Box<LspXrefJob>),
+    /// ツリーの 1 段の展開（#1685。子を読んでいないノードだけ）。子を足すのは UI スレッドの続き
+    LspXrefExpand(Box<LspExpandJob>),
     /// Code Runner の実行プロファイルと実行環境の一覧（#1730）。実行環境の Tier P
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
@@ -2065,6 +2611,10 @@ pub enum OffloadContinuation {
     LspCompletion(Box<LspCompletionLanding>),
     /// ホバーの着地（[`lsp_hover_land`]。#1681）
     LspHover(Box<LspHoverLanding>),
+    /// 参照・階層の着地（[`lsp_xref_land`]。#1685）
+    LspXref(Box<LspXrefLanding>),
+    /// ツリーの展開の着地（[`lsp_expand_land`]。#1685）
+    LspXrefExpand(Box<LspExpandLanding>),
     /// `tako list` の応答（#1979）。background で採った器の window 一覧を反映してから組む。
     /// `None` = 採取できなかった（tmux 不在・サーバー未起動・上限で打ち切り）
     List(Option<std::collections::HashMap<String, Vec<tako_core::TmuxWindow>>>),
@@ -2120,6 +2670,8 @@ pub fn finish_offload(
         }
         OffloadContinuation::LspCompletion(landing) => lsp_completion_land(host, &landing),
         OffloadContinuation::LspHover(landing) => lsp_hover_land(host, &landing),
+        OffloadContinuation::LspXref(landing) => lsp_xref_land(host, &landing),
+        OffloadContinuation::LspXrefExpand(landing) => lsp_expand_land(host, &landing),
         OffloadContinuation::List(by_session) => {
             host.apply_backend_windows_fetch(by_session);
             Ok(list_reply(host))
@@ -2386,6 +2938,36 @@ pub fn prepare_offload(
             lsp_hover_prepare(host, *pane, *line, *column, show.unwrap_or(false), *limit)
                 .map(|job| OffloadJob::LspHover(Box::new(job))),
         ),
+        // #1685: 準備（引数の検査・識別子を採る）は UI スレッド、問い合わせは background
+        Request::LspXref {
+            action,
+            pane,
+            line,
+            column,
+            show,
+            limit,
+        } => Some(
+            lsp_xref_prepare(
+                host,
+                action,
+                *pane,
+                *line,
+                *column,
+                show.unwrap_or(false),
+                *limit,
+            )
+            .map(|job| OffloadJob::LspXref(Box::new(job))),
+        ),
+        // #1685: 子を読んでいないノードの展開だけ background（読み込み済みの開閉は同期 = `None`）
+        Request::LspResults {
+            action,
+            pane,
+            item,
+            limit,
+            ..
+        } if action == LSP_EXPAND_ACTION => lsp_expand_prepare(host, *pane, *item, *limit)
+            .transpose()
+            .map(|job| job.map(|job| OffloadJob::LspXrefExpand(Box::new(job)))),
         // #1730: 実行環境の Tier P（子プロセス。1 回の上限 5 秒）を UI スレッドで待たない
         Request::RunResolve {
             path,
@@ -2521,6 +3103,12 @@ impl OffloadJob {
             OffloadJob::LspHover(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspHover(Box::new(job.run())))
             }
+            OffloadJob::LspXref(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::LspXref(Box::new(job.run())))
+            }
+            OffloadJob::LspXrefExpand(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::LspXrefExpand(Box::new(job.run())))
+            }
             OffloadJob::List { socket } => OffloadOutcome::OnUi(OffloadContinuation::List(
                 tako_core::tmux::list_windows_by_session(Some(&socket)),
             )),
@@ -2646,6 +3234,10 @@ impl OffloadJob {
             )),
             OffloadJob::LspHover(_) => Err(DispatchError::Operation(
                 "ホバーは run_staged で走らせる（カードを出すのに UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::LspXref(_) | OffloadJob::LspXrefExpand(_) => Err(DispatchError::Operation(
+                "参照・階層は run_staged で走らせる（結果を置くのに UI スレッドの続きが要る）"
+                    .into(),
             )),
             OffloadJob::List { .. } => Err(DispatchError::Operation(
                 "一覧は run_staged で走らせる（反映と応答の組み立てに UI スレッドの続きが要る）"
@@ -6190,6 +6782,47 @@ fn dispatch_inner(
             let job = lsp_hover_prepare(host, pane, line, column, show.unwrap_or(false), limit)?;
             lsp_hover_land(host, &job.run())
         }
+
+        // #1685: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 問い合わせ → 着地）を直列に通る
+        Request::LspXref {
+            action,
+            pane,
+            line,
+            column,
+            show,
+            limit,
+        } => {
+            let job = lsp_xref_prepare(
+                host,
+                &action,
+                pane,
+                line,
+                column,
+                show.unwrap_or(false),
+                limit,
+            )?;
+            lsp_xref_land(host, &job.run())
+        }
+
+        // #1685: 保持している結果の読み書き（ロックも子プロセスも無い = UI スレッドで同期）
+        Request::LspResults {
+            action,
+            pane,
+            item,
+            open,
+            focus,
+            limit,
+        } => lsp_results(
+            host,
+            origin,
+            &action,
+            pane,
+            item,
+            open.as_deref(),
+            focus,
+            limit,
+        ),
 
         Request::SetupMcp { scope, pane, agent } => {
             let scope_str = scope.as_deref().unwrap_or("global");
@@ -15879,6 +16512,16 @@ pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     LSP_COMPLETION_ACTION,
     LSP_MENU_ACTION,
     LSP_HOVER_ACTION,
+    tako_core::lsp::xref::XrefKind::NAMES[0],
+    tako_core::lsp::xref::XrefKind::NAMES[1],
+    tako_core::lsp::xref::XrefKind::NAMES[2],
+    tako_core::lsp::xref::XrefKind::NAMES[3],
+    tako_core::lsp::xref::XrefKind::NAMES[4],
+    LSP_RESULTS_ACTION,
+    LSP_EXPAND_ACTION,
+    LSP_COLLAPSE_ACTION,
+    LSP_OPEN_RESULT_ACTION,
+    LSP_CLEAR_RESULTS_ACTION,
 ];
 
 /// 整形の action（#1683。CLI は `tako lsp format`）
@@ -20758,6 +21401,8 @@ mod tests {
         backend_windows_refreshes: std::cell::Cell<usize>,
         /// #1683: 言語サーバの束ね（既定 None = 「使えない」。整形の準備を通すテストだけが入れる）
         lsp: Option<crate::lsp::LspManager>,
+        /// #1685: 参照・階層の結果の置き場（GUI の `TakoApp::lsp_xref` の代役）
+        xref: tako_core::lsp::xref::XrefStore,
         /// #1683: 保存時整形（GUI の `lsp_format_on_save` の代役）
         format_on_save: bool,
         /// #1684: プレビューの選択（GUI の `preview_selections` の代役）
@@ -20865,6 +21510,7 @@ mod tests {
                 backend_windows: std::collections::HashMap::new(),
                 backend_windows_refreshes: std::cell::Cell::new(0),
                 lsp: None,
+                xref: tako_core::lsp::xref::XrefStore::default(),
                 format_on_save: false,
                 selections: std::collections::HashMap::new(),
                 claude_mod: tako_core::claude_mod::ModHub::new(true),
@@ -21309,6 +21955,12 @@ mod tests {
     }
 
     impl PreviewHost for MockHost {
+        fn lsp_xref(&self) -> Option<&tako_core::lsp::xref::XrefStore> {
+            Some(&self.xref)
+        }
+        fn lsp_xref_mut(&mut self) -> Option<&mut tako_core::lsp::xref::XrefStore> {
+            Some(&mut self.xref)
+        }
         fn show_lsp_hover(
             &mut self,
             pane: PaneId,
@@ -24923,6 +25575,326 @@ mod tests {
                     .collect(),
             })),
         }
+    }
+
+    // --- #1685: 参照・階層の結果（置く・開閉・行を開く・閉じたら消える）-----------------
+
+    /// 場所 1 つ（tako の座標）
+    fn xref_place(path: &std::path::Path, line: usize) -> tako_core::lsp::xref::Place {
+        tako_core::lsp::xref::Place {
+            uri: tako_core::file_uri::from_path(path),
+            path: path.to_path_buf(),
+            line,
+            column: 3,
+            char_column: 3,
+            excerpt: format!("// {}", line + 1),
+        }
+    }
+
+    fn xref_seed(
+        name: &str,
+        path: &std::path::Path,
+        line: usize,
+    ) -> tako_core::lsp::xref::NodeSeed {
+        tako_core::lsp::xref::NodeSeed {
+            name: name.into(),
+            kind: 12,
+            detail: None,
+            place: xref_place(path, line),
+            raw: json!({ "name": name }),
+        }
+    }
+
+    /// 背景の問い合わせを経た答え（`LspXrefJob::run` の出力）を組む。着地はサーバ無しで測れる
+    fn xref_landing(
+        source: u64,
+        source_path: &std::path::Path,
+        kind: tako_core::lsp::xref::XrefKind,
+        answer: crate::lsp::XrefAnswer,
+    ) -> LspXrefLanding {
+        LspXrefLanding {
+            kind,
+            source_pane: PaneId::from_raw(source),
+            source_path: source_path.display().to_string(),
+            line: 3,
+            column: 4,
+            symbol: "helper".into(),
+            show: true,
+            limit: None,
+            answer: Some(Ok(answer)),
+        }
+    }
+
+    fn lsp_results_call(
+        host: &mut MockHost,
+        action: &str,
+        pane: Option<u64>,
+        item: Option<usize>,
+    ) -> Result<Value, DispatchError> {
+        dispatch(
+            host,
+            Request::LspResults {
+                action: action.into(),
+                pane,
+                item,
+                open: None,
+                focus: None,
+                limit: None,
+            },
+            PaneOrigin::Mcp,
+        )
+    }
+
+    fn node_ids(out: &Value) -> Vec<u64> {
+        out["nodes"]
+            .as_array()
+            .map(|nodes| nodes.iter().filter_map(|n| n["id"].as_u64()).collect())
+            .unwrap_or_default()
+    }
+
+    /// FR-3.42 / #1685: 答えは問い合わせたペインの結果として置かれ右パネルに出る。一覧の行を開くと
+    /// 定義ジャンプと同じ規則で着地する（別のファイル = 新しいペインが 1 枚増えてその行へ /
+    /// 同じファイル = 同じペイン）。番号の誤りは理由つきで断る
+    #[test]
+    fn 参照の結果は置かれ行を開くと定義ジャンプと同じ着地() {
+        use tako_core::lsp::xref::XrefKind;
+        let dir = jump_fixture("xref-open", &["main.rs", "other.rs"]);
+        let main = tako_core::platform::path::canonicalize(&dir.join("main.rs")).unwrap();
+        let other = tako_core::platform::path::canonicalize(&dir.join("other.rs")).unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let answer = crate::lsp::XrefAnswer::List {
+            server: "fake",
+            items: vec![xref_place(&main, 9), xref_place(&other, 41)],
+            total: 2,
+        };
+        let out = lsp_xref_land(
+            &mut host,
+            &xref_landing(source, &main, XrefKind::References, answer),
+        )
+        .unwrap();
+        assert_eq!(out["status"], json!("found"));
+        assert_eq!(out["retained"], json!(1));
+        assert_eq!(out["shown"], json!(true));
+        assert_eq!(
+            (host.panel.0, host.panel.2),
+            (true, crate::protocol::PanelViewWire::References),
+            "show で右パネルの references ビューが出る"
+        );
+        assert_eq!(out["items"][1]["line"], json!(42));
+        let before = pane_count(&host);
+        // 別のファイルの行 → 新しいペインが 1 枚増え、その行へ着地する（pane 省略 = 右パネルの結果）
+        let opened = lsp_results_call(&mut host, "open-result", None, Some(2)).unwrap();
+        assert_eq!(opened["status"], json!("opened"));
+        assert_eq!(opened["landing"], json!("new-pane"));
+        assert_eq!(pane_count(&host), before + 1);
+        let target = opened["open"]["pane"].as_u64().unwrap();
+        assert_eq!(host.preview_lines[&target], 42);
+        assert!(host.previews[&target].0.ends_with("other.rs"));
+        // 同じファイルの行 → 問い合わせたペインのまま
+        let same = lsp_results_call(&mut host, "open-result", Some(source), Some(1)).unwrap();
+        assert_eq!(same["landing"], json!("same-pane"));
+        assert_eq!(host.preview_lines[&source], 10);
+        assert_eq!(pane_count(&host), before + 1);
+        // 番号の誤り・番号なし・一覧への開閉は断る（黙って先頭へ倒れない）
+        assert!(lsp_results_call(&mut host, "open-result", None, Some(3)).is_err());
+        assert!(lsp_results_call(&mut host, "open-result", None, None).is_err());
+        assert!(lsp_results_call(&mut host, "expand", None, Some(1)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 受け入れ条件: 階層ツリーの展開・折りたたみ状態が dispatch から読み書きでき、往復で一致する。
+    /// 子を読んでいないノードの展開は background へ出す（`prepare_offload` が拾う）。読み込み済みの
+    /// 開閉は同期（`None`）で状態だけを変える
+    #[test]
+    fn 階層ツリーの開閉は_dispatch_から読み書きでき往復で一致する() {
+        use tako_core::lsp::xref::XrefKind;
+        let dir = jump_fixture("xref-tree", &["lib.rs"]);
+        let lib = tako_core::platform::path::canonicalize(&dir.join("lib.rs")).unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(&mut host, root, &lib, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let answer = crate::lsp::XrefAnswer::Tree {
+            server: "fake",
+            roots: vec![(
+                xref_seed("helper", &lib, 0),
+                Some(vec![xref_seed("a", &lib, 10), xref_seed("b", &lib, 20)]),
+            )],
+        };
+        lsp_xref_land(
+            &mut host,
+            &xref_landing(source, &lib, XrefKind::IncomingCalls, answer),
+        )
+        .unwrap();
+        let read = |host: &mut MockHost| lsp_results_call(host, "results", None, None).unwrap();
+        let first = read(&mut host);
+        assert_eq!(first["expanded"], json!([1]));
+        assert_eq!(node_ids(&first), vec![1, 2, 3]);
+        // 閉じる → 読み直すと閉じたまま（往復で一致）
+        let closed = lsp_results_call(&mut host, "collapse", None, Some(1)).unwrap();
+        assert_eq!(closed["changed"], json!(true));
+        let again = read(&mut host);
+        assert_eq!(again["expanded"], json!([]));
+        assert_eq!(node_ids(&again), vec![1]);
+        assert_eq!(closed["nodes"], again["nodes"]);
+        // 同じ状態への書き込みは変わらない
+        let same = lsp_results_call(&mut host, "collapse", None, Some(1)).unwrap();
+        assert_eq!(same["changed"], json!(false));
+        // 開く → 読み直すと開いたまま
+        let reopened = lsp_results_call(&mut host, "expand", Some(source), Some(1)).unwrap();
+        assert_eq!(reopened["changed"], json!(true));
+        assert_eq!(read(&mut host)["nodes"], reopened["nodes"]);
+        // 読み込み済みの開閉は同期（offload しない）。未読み込みのノードの展開は background へ出る
+        let expand_req = |item| Request::LspResults {
+            action: "expand".into(),
+            pane: None,
+            item: Some(item),
+            open: None,
+            focus: None,
+            limit: None,
+        };
+        assert!(prepare_offload(&mut host, &expand_req(1)).is_none());
+        host.lsp = Some(crate::lsp::LspManager::disabled());
+        assert!(matches!(
+            prepare_offload(&mut host, &expand_req(2)),
+            Some(Ok(OffloadJob::LspXrefExpand(_)))
+        ));
+        // 背景の答え（子 1 つ）を着地させる → ノード 2 が開き、往復で読める
+        let job = lsp_expand_prepare(&host, None, Some(2), None)
+            .unwrap()
+            .unwrap();
+        let mut landing = job.landing.clone();
+        landing.answer = Some(Ok(crate::lsp::ExpandAnswer {
+            server: "fake",
+            children: vec![xref_seed("top", &lib, 30)],
+        }));
+        let grown = lsp_expand_land(&mut host, &landing).unwrap();
+        assert_eq!(grown["added"], json!(1));
+        let after = read(&mut host);
+        assert_eq!(after["expanded"], json!([1, 2]));
+        assert_eq!(node_ids(&after), vec![1, 2, 4, 3]);
+        assert_eq!(after["nodes"][2]["depth"], json!(2));
+        // 2 を閉じて 1 を閉じ、1 を開くと 2 の開き具合は残っている（状態は消さない）
+        lsp_results_call(&mut host, "collapse", None, Some(2)).unwrap();
+        lsp_results_call(&mut host, "collapse", None, Some(1)).unwrap();
+        lsp_results_call(&mut host, "expand", None, Some(1)).unwrap();
+        assert_eq!(node_ids(&read(&mut host)), vec![1, 2, 3]);
+        // 待つあいだに結果が置き換わったら当てない（stale）
+        lsp_xref_land(
+            &mut host,
+            &xref_landing(
+                source,
+                &lib,
+                XrefKind::IncomingCalls,
+                crate::lsp::XrefAnswer::Tree {
+                    server: "fake",
+                    roots: vec![(xref_seed("helper", &lib, 0), None)],
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            lsp_expand_land(&mut host, &landing).unwrap()["status"],
+            json!("stale")
+        );
+        // 無いノード
+        assert!(lsp_results_call(&mut host, "collapse", None, Some(99)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 受け入れ条件（dispatch の側）: 結果を持つペインを閉じたら、保持件数の口は 0 を返す
+    /// （GUI は閉じた時点で消し、dispatch は読むたびに閉じたペインの結果を捨てる = 取りこぼしの保険）
+    #[test]
+    fn 結果を持つペインを閉じたら保持件数は_0() {
+        use tako_core::lsp::xref::XrefKind;
+        let dir = jump_fixture("xref-close", &["main.rs"]);
+        let main = tako_core::platform::path::canonicalize(&dir.join("main.rs")).unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let answer = crate::lsp::XrefAnswer::List {
+            server: "fake",
+            items: vec![xref_place(&main, 1)],
+            total: 1,
+        };
+        lsp_xref_land(
+            &mut host,
+            &xref_landing(source, &main, XrefKind::References, answer),
+        )
+        .unwrap();
+        assert_eq!(
+            lsp_results_call(&mut host, "results", None, None).unwrap()["retained"],
+            json!(1)
+        );
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(source),
+                force: true,
+                caller_role: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let after = lsp_results_call(&mut host, "results", None, None).unwrap();
+        assert_eq!(after["retained"], json!(0));
+        assert_eq!(after["retained_rows"], json!(0));
+        assert_eq!(after["status"], json!("no-result"));
+        // 消す口も 0 を返す（既に無い）
+        let cleared = lsp_results_call(&mut host, "clear-results", None, None).unwrap();
+        assert_eq!(
+            (cleared["cleared"].clone(), cleared["retained"].clone()),
+            (json!(false), json!(0))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 待つあいだに問い合わせたペインが閉じられたら結果を置かない（保持件数は増えない）。
+    /// 失敗の答えも置かない（前の結果を残す）
+    #[test]
+    fn 閉じたペインと失敗の答えは置かない() {
+        use tako_core::lsp::xref::XrefKind;
+        let dir = jump_fixture("xref-gone", &["main.rs"]);
+        let main = tako_core::platform::path::canonicalize(&dir.join("main.rs")).unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let source = jump_open(&mut host, root, &main, None, Some(Direction::Right))["pane"]
+            .as_u64()
+            .unwrap();
+        let mut failed = xref_landing(
+            source,
+            &main,
+            XrefKind::Supertypes,
+            crate::lsp::XrefAnswer::List {
+                server: "fake",
+                items: Vec::new(),
+                total: 0,
+            },
+        );
+        failed.answer = Some(Err(crate::lsp::GotoError::Unsupported { server: "fake" }));
+        let out = lsp_xref_land(&mut host, &failed).unwrap();
+        assert_eq!(out["status"], json!("unsupported"));
+        assert!(host.xref.is_empty());
+        let mut gone = failed.clone();
+        gone.source_pane = PaneId::from_raw(987_654);
+        gone.answer = Some(Ok(crate::lsp::XrefAnswer::List {
+            server: "fake",
+            items: vec![xref_place(&main, 1)],
+            total: 1,
+        }));
+        assert_eq!(
+            lsp_xref_land(&mut host, &gone).unwrap()["status"],
+            json!("source-gone")
+        );
+        assert!(host.xref.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- #1682: 補完の着地（絞り込み・件数の上限・確定）-----------------------------

@@ -768,6 +768,8 @@ pub(crate) enum NoticeArm {
     /// ホバーのカードのリンクを開けなかった（`TAKO_1681_LEGACY`）。旧挙動ではカードが出ないので、
     /// 通知だけ残っても意味がない
     Issue1681,
+    /// 右パネル references ビューの行・開閉・閉じるの失敗（`TAKO_1685_LEGACY`）
+    Issue1685,
     /// 自動復帰の一括ボタンの失敗・既定を保存できなかった（`TAKO_1945_LEGACY`）。
     /// 旧挙動ではボタンが無いので、通知だけ残っても意味がない
     Issue1945,
@@ -790,6 +792,7 @@ impl NoticeArm {
             NoticeArm::Issue1679 => tako_control::lsp::legacy(),
             NoticeArm::Issue1680 => tako_control::dispatch::lsp_goto_legacy(),
             NoticeArm::Issue1681 => tako_control::lsp::hover::legacy(),
+            NoticeArm::Issue1685 => tako_control::lsp::xref::legacy(),
             NoticeArm::Issue1945 => tako_core::limit_resume_all::legacy(),
         }
     }

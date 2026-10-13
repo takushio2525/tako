@@ -18,6 +18,7 @@
 use serde_json::Value;
 
 use super::goto::{self, GotoKind, SymbolKind};
+use super::xref::{self, XrefKind};
 use super::{format, hover};
 
 /// 右クリックメニューの LSP 項目
@@ -25,6 +26,8 @@ use super::{format, hover};
 pub enum MenuItem {
     /// 定義ジャンプの 4 種（⌘クリックと同じ問い合わせ。#1680）
     Goto(GotoKind),
+    /// 参照の検索・呼び出し階層・型階層の 5 種（右パネルの references ビューに出す。#1685）
+    Xref(XrefKind),
     /// その語の型・doc のカード（編集メニューの「ホバー情報を表示」と同じ。#1681 / #1893）
     Hover,
     /// 文書全体の整形（編集メニューの「コードを整形」と同じ。#1683）
@@ -34,12 +37,17 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    /// 全項目。**メニューに出る順**（VSCode / Zed の並びに合わせ、移動 → 情報 → 整形）
-    pub const ALL: [MenuItem; 7] = [
+    /// 全項目。**メニューに出る順**（VSCode / Zed の並びに合わせ、移動 → 参照・階層 → 情報 → 整形）
+    pub const ALL: [MenuItem; 12] = [
         MenuItem::Goto(GotoKind::Definition),
         MenuItem::Goto(GotoKind::Declaration),
         MenuItem::Goto(GotoKind::TypeDefinition),
         MenuItem::Goto(GotoKind::Implementation),
+        MenuItem::Xref(XrefKind::References),
+        MenuItem::Xref(XrefKind::IncomingCalls),
+        MenuItem::Xref(XrefKind::OutgoingCalls),
+        MenuItem::Xref(XrefKind::Supertypes),
+        MenuItem::Xref(XrefKind::Subtypes),
         MenuItem::Hover,
         MenuItem::Format,
         MenuItem::FormatSelection,
@@ -54,6 +62,11 @@ impl MenuItem {
             MenuItem::Goto(GotoKind::Declaration) => "lsp-declaration",
             MenuItem::Goto(GotoKind::TypeDefinition) => "lsp-type-definition",
             MenuItem::Goto(GotoKind::Implementation) => "lsp-implementation",
+            MenuItem::Xref(XrefKind::References) => "lsp-references",
+            MenuItem::Xref(XrefKind::IncomingCalls) => "lsp-incoming-calls",
+            MenuItem::Xref(XrefKind::OutgoingCalls) => "lsp-outgoing-calls",
+            MenuItem::Xref(XrefKind::Supertypes) => "lsp-supertypes",
+            MenuItem::Xref(XrefKind::Subtypes) => "lsp-subtypes",
             MenuItem::Hover => "lsp-hover",
             MenuItem::Format => "lsp-format",
             MenuItem::FormatSelection => "lsp-format-selection",
@@ -68,6 +81,7 @@ impl MenuItem {
     pub fn provider_key(self) -> &'static str {
         match self {
             MenuItem::Goto(kind) => kind.provider_key(),
+            MenuItem::Xref(kind) => kind.provider_key(),
             MenuItem::Hover => hover::PROVIDER_KEY,
             MenuItem::Format => format::provider_key(false),
             MenuItem::FormatSelection => format::provider_key(true),
@@ -79,6 +93,7 @@ impl MenuItem {
 pub fn server_supports(capabilities: &Value, item: MenuItem) -> bool {
     match item {
         MenuItem::Goto(kind) => goto::server_supports(capabilities, kind),
+        MenuItem::Xref(kind) => xref::server_supports(capabilities, kind),
         MenuItem::Hover => hover::server_supports(capabilities),
         MenuItem::Format => format::server_supports(capabilities, false),
         MenuItem::FormatSelection => format::server_supports(capabilities, true),
@@ -89,8 +104,8 @@ pub fn server_supports(capabilities: &Value, item: MenuItem) -> bool {
 ///
 /// - 識別子: すべて（「選択範囲を整形」は右クリックした位置が選択の中のときだけ）
 /// - `#include` のパス: 定義へ移動とホバー（⌘クリックと同じくヘッダを開く・マウスを乗せたときと
-///   同じくパスのカード = clangd は解決したヘッダのパスを返す。宣言・型定義・実装・整形はパスに
-///   対して意味を持たない）
+///   同じくパスのカード = clangd は解決したヘッダのパスを返す。宣言・型定義・実装・参照・階層・
+///   整形はパスに対して意味を持たない）
 fn fits(item: MenuItem, kind: SymbolKind, selection_at_click: bool) -> bool {
     match kind {
         SymbolKind::IncludePath => {
@@ -195,6 +210,39 @@ mod tests {
             )),
             ["lsp-hover"]
         );
+    }
+
+    /// #1685: 参照・階層は移動の後・ホバーの前に、申告した能力のぶんだけ出る（パスの上には出ない）
+    #[test]
+    fn 参照と階層は申告したぶんだけ移動の後に出る() {
+        let id = Some(SymbolKind::Identifier);
+        let caps = json!({
+            "implementationProvider": true,
+            "referencesProvider": true,
+            "callHierarchyProvider": {},
+            "typeHierarchyProvider": true,
+            "hoverProvider": true,
+        });
+        assert_eq!(
+            ids(&items(&caps, id, false)),
+            [
+                "lsp-implementation",
+                "lsp-references",
+                "lsp-incoming-calls",
+                "lsp-outgoing-calls",
+                "lsp-supertypes",
+                "lsp-subtypes",
+                "lsp-hover",
+            ]
+        );
+        // 参照だけ申告するサーバ（呼び出し階層・型階層を持たない）
+        assert_eq!(
+            ids(&items(&json!({ "referencesProvider": true }), id, false)),
+            ["lsp-references"]
+        );
+        // `#include` のパスの上には出ない
+        let path = goto::symbol_at("#include \"foo.h\"", 11).map(|s| s.kind);
+        assert!(items(&json!({ "referencesProvider": true }), path, false).is_empty());
     }
 
     /// 受け入れ条件: 識別子でない位置では能力が全部あっても 0 件

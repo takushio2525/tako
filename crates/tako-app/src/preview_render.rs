@@ -4355,6 +4355,8 @@ impl TakoApp {
     pub(crate) fn drop_preview_pane_state(&mut self, pane_id: PaneId) {
         self.previews.remove(&pane_id);
         self.preview_edits.remove(&pane_id);
+        // #1685: そのペインで検索した参照・階層の結果（閉じたら保持件数が 0 へ戻る）
+        self.lsp_xref.remove(pane_id);
         self.preview_views.remove(&pane_id);
         self.preview_scroll_handles.remove(&pane_id);
         self.preview_selections.remove(&pane_id);
