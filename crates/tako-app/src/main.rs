@@ -25639,6 +25639,10 @@ impl PreviewHost for TakoApp {
         Some(document)
     }
 
+    fn preview_syntax(&self, pane: PaneId) -> Option<String> {
+        preview::painted_syntax(self.previews.get(&pane)?, self.preview_edits.get(&pane))
+    }
+
     fn save_preview(&mut self, pane: PaneId, force: bool) -> Result<(), String> {
         self.save_preview_local(pane, force)?;
         // #966: リモート由来なら**リモートへ書けるまでが保存**。

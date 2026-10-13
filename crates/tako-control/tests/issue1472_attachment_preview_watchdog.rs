@@ -44,6 +44,8 @@ const FILES_REL: &str = "crates/tako-control/src/remote_files.rs";
 const TASKS_REL: &str = "crates/tako-control/src/remote_tasks.rs";
 const PWA_REL: &str = "web/tako-remote/src/pages/tasks.jsx";
 const OPEN_PLAN_REL: &str = "crates/tako-core/src/open_plan.rs";
+/// MIME の表そのもの（言語の同定の正本の `media_type` 列。#1948）
+const FILE_TYPE_REL: &str = "crates/tako-core/src/file_type.rs";
 
 fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("{rel} を読む: {e}"))
@@ -314,7 +316,7 @@ fn mimeの表はopen_planの1本だけ() {
             let found = hits(rel, &src, banned);
             assert!(
                 found.is_empty(),
-                "MIME の表が {rel} へ写っている（{OPEN_PLAN_REL} とずれる）:\n{}",
+                "MIME の表が {rel} へ写っている（正本 {FILE_TYPE_REL} とずれる）:\n{}",
                 found.join("\n")
             );
         }
@@ -322,8 +324,12 @@ fn mimeの表はopen_planの1本だけ() {
     // 正本には在る（走査対象が空になっていないことの裏返し）
     let plan = read(OPEN_PLAN_REL);
     assert!(
-        plan.contains("pub fn media_type_for_extension(") && plan.contains("\"video/mp4\""),
-        "{OPEN_PLAN_REL}: MIME の正本が消えている"
+        plan.contains("pub fn media_type_for_extension("),
+        "{OPEN_PLAN_REL}: MIME の入口が消えている"
+    );
+    assert!(
+        read(FILE_TYPE_REL).contains("\"video/mp4\""),
+        "{FILE_TYPE_REL}: MIME の正本が消えている"
     );
 }
 

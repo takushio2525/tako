@@ -240,25 +240,10 @@ impl IndentUnit {
 
     /// 本文に手掛かりが無いときの既定（#1654）。**タブが文法で決まっているもの**だけタブ
     /// （Makefile はレシピ行がタブ必須・Go は gofmt がタブ）。それ以外は 4 スペース
-    /// （VS Code / Zed の既定と同じ）
+    /// （VS Code / Zed の既定と同じ）。形式ごとの値は言語の同定の正本
+    /// （[`crate::file_type`] の `indent` 列。#1948）
     pub fn for_path(path: &Path) -> Self {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if matches!(name.as_str(), "makefile" | "gnumakefile")
-            || matches!(ext.as_str(), "mk" | "go")
-        {
-            Self::Tab
-        } else {
-            Self::Spaces(4)
-        }
+        crate::file_type::identify_or_default(path).indent
     }
 
     /// 1 段ぶんの文字列
@@ -278,7 +263,7 @@ impl IndentUnit {
     }
 }
 
-/// Enter で 1 段深くする規則（#1654）。拡張子で決める
+/// Enter で 1 段深くする規則（#1654）。言語の同定の正本（[`crate::file_type`] の `enter` 列）で決める
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndentRules {
     /// 行が `{` / `[` / `(` で終わっていたら深くする
@@ -290,26 +275,12 @@ struct IndentRules {
 impl IndentRules {
     /// Markdown・プレーンテキストは**継承だけ**（`[` はリンク、`(` は括弧書きで、
     /// 入れ子の始まりではない）。Python と YAML は `:` でも深くする。
-    /// それ以外（コード全般）は開き括弧で深くする
+    /// それ以外（コード全般）は開き括弧で深くする（形式ごとの値は [`crate::file_type::EnterRule`]）
     fn for_path(path: &Path) -> Self {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        match ext.as_str() {
-            "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc" => Self {
-                brackets: false,
-                colon: false,
-            },
-            "py" | "pyi" | "pyw" | "yml" | "yaml" => Self {
-                brackets: true,
-                colon: true,
-            },
-            _ => Self {
-                brackets: true,
-                colon: false,
-            },
+        let enter = crate::file_type::identify_or_default(path).enter;
+        Self {
+            brackets: enter.brackets(),
+            colon: enter.colon(),
         }
     }
 }

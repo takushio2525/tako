@@ -619,9 +619,14 @@ pub fn resolve_file_icon(path: &Path) -> FileIconKind {
         return FileIconKind::Settings;
     }
 
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    // 拡張子は大文字小文字を問わない（`Sketch.INO` / `Main.CPP`。#1948）
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    match_extension(ext)
+    match_extension(&ext)
 }
 
 /// フォルダアイコン（展開状態で切り替え）
@@ -719,6 +724,27 @@ mod tests {
         assert_eq!(
             resolve_file_icon(Path::new("photo.png")),
             FileIconKind::Image
+        );
+    }
+
+    /// #1948: 拡張子の大文字小文字を問わない（大文字の `Sketch.INO` が既定のアイコンだった）
+    #[test]
+    fn 大文字の拡張子も同じアイコン() {
+        for (upper, lower) in [
+            ("Sketch.INO", "sketch.ino"),
+            ("Main.CPP", "main.cpp"),
+            ("Photo.JPG", "photo.jpg"),
+            ("Build.RS", "build.rs"),
+        ] {
+            assert_eq!(
+                resolve_file_icon(Path::new(upper)),
+                resolve_file_icon(Path::new(lower)),
+                "{upper}"
+            );
+        }
+        assert_eq!(
+            resolve_file_icon(Path::new("Sketch.INO")),
+            FileIconKind::Cpp
         );
     }
 

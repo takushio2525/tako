@@ -112,7 +112,8 @@ fn body(view: &str, rel: &str, name: &str) -> (usize, String) {
 fn 塗りのbackgroundはuser_workを握って回す() {
     let view = production_view(SIDEBAR);
     for (name, work) in [
-        ("spawn_highlight", "preview::highlight_text("),
+        // #1948: 塗った構文名も記録する入口（中身は `highlight_text` と同じ塗り）
+        ("spawn_highlight", "preview::highlight_text_with_syntax("),
         ("spawn_editor_seed", "preview::seed_editor_highlight("),
     ] {
         let (at, f) = body(&view, SIDEBAR, name);

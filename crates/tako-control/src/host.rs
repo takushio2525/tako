@@ -959,6 +959,14 @@ pub trait PreviewHost {
     fn preview_highlighting(&self, _pane: PaneId) -> bool {
         false
     }
+    /// いまの表示を塗った構文名（two-face の構文名。#1948）。
+    ///
+    /// `tako open` の結果と `tako edit` の応答が `syntax` として載せるので、**どの構文で
+    /// 塗られたかを GUI の外から読める**（`file_type` は dispatch が言語の同定の正本から引く）。
+    /// 塗りが戻る前は塗りと同じ解決をその場で引く。コード表示でなければ `None`
+    fn preview_syntax(&self, _pane: PaneId) -> Option<String> {
+        None
+    }
     /// 編集モード切替。開始時のファイル読み込み・UTF-8 検査は実装側が core API で行う。
     fn set_preview_editing(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
         Err("プレビュー編集は未対応".into())

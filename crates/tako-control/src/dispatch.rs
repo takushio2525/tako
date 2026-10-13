@@ -379,6 +379,9 @@ fn open_file(
         "clamped": landing.is_some_and(|l| l.clamped),
         // #1680: 同じファイルを読み直さずに着地した
         "reloaded": !same_document,
+        // #1948: 形式の ID（言語の同定の正本）と塗った構文名（どの構文で塗られたかを読める）
+        "file_type": tako_core::file_type::id(&resolved),
+        "syntax": host.preview_syntax(view_pane),
     });
     // #1659: 未保存の変更があるので差し替えずに残したペイン（分割して開いた理由）
     if let Some(kept) = kept_unsaved {
@@ -3684,6 +3687,12 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
         "editing": editing,
         "dirty": dirty,
     });
+    // #1948: 形式の ID（言語の同定の正本）と、いまの表示を塗った構文名。
+    // 読み取り表示でも編集中でも同じ口（プレビューでなければキーごと無い）
+    if let Some((path, _)) = host.preview_state(target) {
+        out["file_type"] = json!(tako_core::file_type::id(Path::new(&path)));
+        out["syntax"] = json!(host.preview_syntax(target));
+    }
     if let Some(document) = host.preview_document(target) {
         out["document"] = document;
     }
@@ -21228,6 +21237,14 @@ mod tests {
         fn preview_highlighting(&self, pane: PaneId) -> bool {
             self.preview_highlighting.contains(&pane.as_u64())
         }
+        /// #1948: 構文セットを持たないモックは「コード表示なら構文名がある」だけを写す
+        /// （実際の解決と全数一致は tako-app の `preview/file_type_parity_tests.rs`）
+        fn preview_syntax(&self, pane: PaneId) -> Option<String> {
+            self.previews
+                .get(&pane.as_u64())
+                .filter(|(_, mode)| *mode == PreviewModeWire::Code)
+                .map(|_| "TestSyntax".to_string())
+        }
         fn preview_limit(&self, pane: PaneId) -> Option<serde_json::Value> {
             self.preview_limits
                 .get(&pane.as_u64())
@@ -24225,6 +24242,68 @@ mod tests {
         // 存在しないパス・ディレクトリはエラー
         assert!(open(&mut host, dir.join("no-such").display().to_string(), None).is_err());
         assert!(open(&mut host, dir.display().to_string(), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1948: `tako open` の結果と `tako edit` の応答（`preview_edit_reply` の 1 実装）に、
+    /// 形式の ID（言語の同定の正本）と塗った構文名（host の口）が載る。CLI と MCP は
+    /// 同じこの dispatch を通る
+    #[test]
+    fn 開いた結果と編集の応答にfile_typeとsyntaxが載る() {
+        let dir = jump_fixture(
+            "file-type-1948",
+            &[
+                "sketch.ino",
+                "CMakeLists.txt",
+                "notes.unknownext",
+                "photo.png",
+            ],
+        );
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let open =
+            |host: &mut MockHost, name: &str| jump_open(host, root, &dir.join(name), None, None);
+        let opened = open(&mut host, "sketch.ino");
+        assert_eq!(opened["file_type"], json!("arduino"));
+        assert_eq!(opened["syntax"], json!("TestSyntax"));
+        // ファイル名で決まる形式（拡張子だけなら plaintext）
+        assert_eq!(
+            open(&mut host, "CMakeLists.txt")["file_type"],
+            json!("cmake")
+        );
+        // 表に無い形式は null（コード表示なので構文はある）
+        let opened = open(&mut host, "notes.unknownext");
+        assert_eq!(opened["file_type"], Value::Null);
+        assert_eq!(opened["syntax"], json!("TestSyntax"));
+        // コード表示でなければ構文は null
+        let opened = open(&mut host, "photo.png");
+        assert_eq!(opened["file_type"], json!("png"));
+        assert_eq!(opened["syntax"], Value::Null);
+        // 編集の応答（状態取得・編集開始）にも同じ 2 つ
+        let pane = open(&mut host, "sketch.ino")["pane"].as_u64().unwrap();
+        for enabled in [None, Some(true)] {
+            let reply = dispatch(
+                &mut host,
+                Request::PreviewEdit {
+                    pane: Some(pane),
+                    enabled,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            assert_eq!(reply["file_type"], json!("arduino"), "{enabled:?}: {reply}");
+            assert_eq!(reply["syntax"], json!("TestSyntax"), "{enabled:?}: {reply}");
+        }
+        // プレビューでないペインは従来どおり断る（形式を答える相手が無い）
+        let refused = dispatch(
+            &mut host,
+            Request::PreviewEdit {
+                pane: Some(root),
+                enabled: None,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(refused.is_err(), "{refused:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
