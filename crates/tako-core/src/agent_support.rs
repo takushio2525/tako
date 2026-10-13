@@ -253,6 +253,8 @@ pub mod keys {
     pub const CLAUDE_MOD_BAND: &str = "claude_mod_band";
     /// エージェントの画面の中に定型のカスタムボタン（/compact・tako の操作等）を描き、押して実行する（#1962）
     pub const CLAUDE_MOD_BUTTONS: &str = "claude_mod_buttons";
+    /// AI が出したコマンドカードをエージェントの画面の中（会話の行と帯）に描き、キーでコピー / 実行する（#1963）
+    pub const CLAUDE_MOD_CARDS: &str = "claude_mod_cards";
     /// エージェント自身の設定 dir へ tako の拡張を入れる（setup。外せる・他の拡張と取り合わない。#1959）
     pub const CLAUDE_MOD_INSTALL: &str = "claude_mod_install";
     /// エージェントのプロセス内の拡張（Claude Code の mod）から状態を構造で受け取る（#1879）
@@ -797,6 +799,24 @@ pub const MATRIX: &[AgentFeature] = &[
              押すと会話が圧縮され、tako の操作（split right）のボタンで隔離 GUI のペインが増えた。押した結果（種類と\
              成否）は tako mod の行の report.last_press に出る（scripts/test-mod-band-buttons-1962.sh）。クリックで\
              押すのは tako がクリックを TUI へ渡す #1961 から",
+        ),
+    },
+    AgentFeature {
+        key: keys::CLAUDE_MOD_CARDS,
+        summary: Note::new(
+            "AI が出したコマンドカードをエージェントの画面の中（会話の行と入力欄の上の帯）に描き、キーでコピー / 新しいペインで実行する（描いたカードはペイン下のカード帯に出さない = 画面が縮まない）",
+            "Draws the AI's command cards inside the agent's own screen (the conversation row and the band above the prompt), copied or run in a new pane from the keyboard (cards drawn there stay out of the card band under the pane, so the screen does not shrink)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1885),
+        agy: pending(notes::NOT_INVESTIGATED, 1885),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1963: 一時の設定 dir の実 Claude Code 2.1.294 に偽 Messages API で tako の MCP の tako_show_command を\
+             呼ばせ、会話の行のカードと帯の card N / y: copy / r: run が出て、ペインの行数が 0.1 秒おきの採取（47 回）で一度も\
+             縮まない（GPUI のカード帯が出ない）こと・帯のキーで Run すると新しいペインと実行記録が付くこと（全画面と\
+             main screen）・Copy が 157 字の論理文字列を改行なしで渡すこと・報告が途切れると 45 秒、claude が\
+             終わると 0.2 秒（1 tick 以内）で GPUI の帯へ戻ることを確かめた（scripts/test-mod-command-cards-1963.sh）",
         ),
     },
     AgentFeature {

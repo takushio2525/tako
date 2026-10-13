@@ -7,7 +7,9 @@
 //
 // 答え: 最後の発話に「Reply with exactly one word: X」があれば X、要約の依頼（/compact）には
 // 要約の文、ほかは「ok」。usage の input_tokens は FAKE_INPUT_TOKENS（既定 60000 = ctx が数 % 出る）。
-// 受けた要求は 1 行ずつ FAKE_LOG へ（経路・stream・要約の依頼かだけ。本文は書かない）。
+// #1963: 最後の発話に「Show this card: {JSON}」があれば、要求の tools にある `…tako_show_command` を
+// その JSON（commands / label）で呼ぶ tool_use を返し、その結果（tool_result）が来たら「CARD-DONE」と答える。
+// 受けた要求は 1 行ずつ FAKE_LOG へ（経路・stream・要約の依頼か・ツールを呼んだかだけ。本文は書かない）。
 //
 // 使い方: node scripts/lib/fake-messages-api.mjs <port>   （127.0.0.1 だけで待つ）
 import http from 'node:http'
@@ -23,6 +25,26 @@ function textOf(content) {
   return content.map(part => (typeof part?.text === 'string' ? part.text : '')).join('\n')
 }
 
+// 最後の発話が tool_result（ツールの結果を返した番）か
+function isToolResult(content) {
+  return Array.isArray(content) && content.some(part => part?.type === 'tool_result')
+}
+
+// 「Show this card: {JSON}」の JSON と、呼ぶツールの名前（要求の tools から探す = MCP の登録名に依らない）
+function cardCall(body, text) {
+  const at = text.indexOf('Show this card: ')
+  if (at < 0) return null
+  let input
+  try {
+    input = JSON.parse(text.slice(at + 'Show this card: '.length).trim())
+  } catch {
+    return null
+  }
+  const tools = Array.isArray(body?.tools) ? body.tools : []
+  const tool = tools.find(t => typeof t?.name === 'string' && /tako_show_command$/.test(t.name))
+  return tool === undefined ? null : { name: tool.name, input }
+}
+
 function answer(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : []
   const last = [...messages].reverse().find(m => m?.role === 'user')
@@ -30,8 +52,15 @@ function answer(body) {
   const all = messages.map(m => textOf(m?.content)).join('\n') + textOf(body?.system)
   const summarize = /summar/i.test(text) && /conversation/i.test(all)
   const word = /Reply with exactly one word: ([A-Za-z0-9_-]+)/.exec(text)
-  const reply = summarize ? 'SUMMARY-1962: the conversation so far was a short check.' : word ? word[1] : 'ok'
-  return { reply, summarize }
+  const call = summarize ? null : cardCall(body, text)
+  const reply = summarize
+    ? 'SUMMARY-1962: the conversation so far was a short check.'
+    : isToolResult(last?.content)
+      ? 'CARD-DONE'
+      : word
+        ? word[1]
+        : 'ok'
+  return { reply, summarize, call }
 }
 
 const server = http.createServer((req, res) => {
@@ -57,23 +86,30 @@ const server = http.createServer((req, res) => {
       res.end('{}')
       return
     }
-    const { reply, summarize } = answer(body)
-    if (log) fs.appendFileSync(log, `${JSON.stringify({ path, stream: body.stream === true, summarize })}\n`)
+    const { reply, summarize, call } = answer(body)
+    if (log) fs.appendFileSync(log, `${JSON.stringify({ path, stream: body.stream === true, summarize, tool: call?.name ?? null })}\n`)
     const model = typeof body.model === 'string' ? body.model : 'claude-haiku-fake'
     const usage = { input_tokens: inputTokens, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     const message = { id: `msg_${Date.now()}`, type: 'message', role: 'assistant', model, stop_sequence: null }
+    const toolUse = call === null ? null : { type: 'tool_use', id: `toolu_fake_${Date.now()}`, name: call.name, input: call.input }
     if (body.stream !== true) {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ...message, content: [{ type: 'text', text: reply }], stop_reason: 'end_turn', usage }))
+      const content = toolUse === null ? [{ type: 'text', text: reply }] : [toolUse]
+      res.end(JSON.stringify({ ...message, content, stop_reason: toolUse === null ? 'end_turn' : 'tool_use', usage }))
       return
     }
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
     const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     send('message_start', { type: 'message_start', message: { ...message, content: [], stop_reason: null, usage: { ...usage, output_tokens: 1 } } })
-    send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
-    send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: reply } })
+    if (toolUse === null) {
+      send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+      send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: reply } })
+    } else {
+      send('content_block_start', { type: 'content_block_start', index: 0, content_block: { ...toolUse, input: {} } })
+      send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolUse.input) } })
+    }
     send('content_block_stop', { type: 'content_block_stop', index: 0 })
-    send('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 5 } })
+    send('message_delta', { type: 'message_delta', delta: { stop_reason: toolUse === null ? 'end_turn' : 'tool_use', stop_sequence: null }, usage: { output_tokens: 5 } })
     send('message_stop', { type: 'message_stop' })
     res.end()
   })

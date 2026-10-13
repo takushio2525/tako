@@ -7306,6 +7306,15 @@ fn print_mod(args: &ModArgs, result: &Value) {
             band["limit_percent"].as_f64().unwrap_or(0.0),
         );
     }
+    // #1963: コマンドカードを誰が描くか（カードごとの持ち主は `tako show-command --list` の owner）
+    let cards = &result["cards"];
+    if cards["legacy"].as_bool() == Some(true) {
+        println!("カード: ペイン下のカード帯（TAKO_1963_LEGACY）");
+    } else if let Some(place) = cards["place"].as_str() {
+        println!(
+            "カード: 置き場 {place}（mod が Claude Code の画面に描いたカードはペイン下のカード帯に出さない）"
+        );
+    }
     let percent = |v: &Value| v.as_f64().map_or("-".to_string(), |p| format!("{p:.0}%"));
     for row in result["panes"].as_array().into_iter().flatten() {
         let pane = row["pane"].as_u64().unwrap_or(0);
@@ -7337,8 +7346,16 @@ fn print_mod(args: &ModArgs, result: &Value) {
                 (_, Some(false)) => "  帯 描いていない".to_string(),
                 _ => String::new(),
             };
+            // #1963: 帯に押せる形で描いたコマンドカード（無い = カードを描かせていない / 描かない mod）
+            let drawn_cards = report["renders"]["cards"]
+                .as_array()
+                .map(|ids| {
+                    let ids: Vec<String> = ids.iter().map(Value::to_string).collect();
+                    format!("  カード [{}]", ids.join(", "))
+                })
+                .unwrap_or_default();
             println!(
-                "  pane {pane}  {state}  ctx {}  5h {}  7d {}  {}  {}  ({} 秒前){band}",
+                "  pane {pane}  {state}  ctx {}  5h {}  7d {}  {}  {}  ({} 秒前){band}{drawn_cards}",
                 percent(&report["context"]["percent"]),
                 limit("five_hour"),
                 limit("seven_day"),

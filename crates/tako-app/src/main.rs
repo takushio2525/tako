@@ -2880,6 +2880,8 @@ struct TakoApp {
     card_bands: HashMap<PaneId, command_card_ui::CardBandFrame>,
     /// カード帯に要る高さの実描画からの採取スロット（#703。詳細は `CardBandProbe`）
     card_band_probes: HashMap<PaneId, std::rc::Rc<command_card_ui::CardBandProbe>>,
+    /// mod が描くカード（GPUI の帯から外すもの。#1963）の集合の指紋。2 秒ポーリングで変わったら描き直す
+    mod_card_owner_sig: u64,
 }
 
 /// × ボタン / cmd+W close の確認ダイアログ対象（Issue #172）。
@@ -4752,6 +4754,7 @@ impl TakoApp {
             command_card_error: None,
             card_bands: HashMap::new(),
             card_band_probes: HashMap::new(),
+            mod_card_owner_sig: 0,
         };
         // #1441: 受け口が立たなかったら画面へ出す（見た目は正常なのに CLI / MCP から
         // 一切操作できない状態を無言で始めない）。立っているときは何も出さない
@@ -5807,6 +5810,11 @@ impl TakoApp {
                     // 判定は dispatch の 1 本（スマホ・CLI が読む `list` と同じ）で、
                     // 変わったときだけカードの表示を描き直す
                     if tako_control::dispatch::refresh_command_card_runs(app) {
+                        wcx.notify();
+                    }
+                    // #1963: mod が描くカードの集合が時間で変わった（拾う猶予の切れ・報告の失効・
+                    // claude の終了）なら描き直す = GPUI のカード帯は 1 tick で戻る / 引っ込む
+                    if app.refresh_mod_card_owners() {
                         wcx.notify();
                     }
                     // #1657: 実行ペインの終了を確定してバッジを切り替える（出力の無い終わり方・
@@ -30090,6 +30098,11 @@ mod self_test {
     mod mod_bar_1962;
     #[cfg(feature = "visual-test")]
     use mod_bar_1962::mod_bar_visual;
+    /// #1963: mod が描いたコマンドカードを GPUI のカード帯から外し、viewport を縮めないか（visual-test `mod-card`）
+    #[cfg(feature = "visual-test")]
+    mod mod_card_1963;
+    #[cfg(feature = "visual-test")]
+    use mod_card_1963::mod_card_visual;
     /// #1909: 補完の打鍵の取り消しの番号を UI スレッドで先に取る（visual-test `completion-cancel`）
     #[cfg(feature = "visual-test")]
     mod completion_cancel_1909;
@@ -44499,6 +44512,12 @@ mod self_test {
                 // #1962: mod がバーを描いているとき、ステータスバーの claude の 5h / 7d / ctx を外すか
                 "mod-bar" => {
                     mod_bar_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1963: mod が描いたコマンドカードは GPUI のカード帯へ出さず、viewport を縮めないか
+                "mod-card" => {
+                    mod_card_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

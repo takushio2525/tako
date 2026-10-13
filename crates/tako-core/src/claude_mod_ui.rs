@@ -169,10 +169,15 @@ impl Vocab for UsageItem {
     }
 }
 
-/// カード・チャットを誰が描くか（auto = mod が効いていれば mod、効いていなければ tako）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// カード・チャットを誰が描くか（auto = mod が効いていれば mod、効いていなければ tako）。
+///
+/// コマンドカード（#1963。判断は `claude_mod::card_owner`）: `auto` = mod が帯に描いたと言った
+/// カードだけ GPUI の帯から外す（拾われなければ GPUI へ戻す）・`mod` = mod が効いている間は GPUI の帯を
+/// 出さない（帯を隠している等で mod が描けなくても）・`tako` = mod は描かず GPUI の帯のまま（S7-4 前）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Place {
+    #[default]
     Auto,
     Mod,
     Tako,

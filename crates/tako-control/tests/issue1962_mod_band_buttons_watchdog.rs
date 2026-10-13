@@ -552,8 +552,8 @@ fn 逆戻りを名指しできる() {
     // 1. 帯のフックが next を包まずに tako の行だけを返す（S3 の形へ戻す）
     let found = mutate(&|s| {
         s.register = s.register.replacen(
-            "    return stackBand($, e, below, bandRow($, e, view, columns, bar))",
-            "    return bandRow($, e, view, columns, bar)",
+            "    return stackBand($, e, below, bandRow($, e, view, columns, bar, cursor))",
+            "    return bandRow($, e, view, columns, bar, cursor)",
             1,
         );
     });
@@ -620,8 +620,8 @@ fn 逆戻りを名指しできる() {
     // 4. 押した結果にラベルを載せる・A/B でも renders を送る・契約の片側だけ
     let found = mutate(&|s| {
         s.types = s.types.replacen(
-            "  kind: 'slash' | 'tako' | 'shell' | 'prompt'\n",
-            "  kind: 'slash' | 'tako' | 'shell' | 'prompt'\n  label: string\n",
+            "  kind: 'slash' | 'tako' | 'shell' | 'prompt' | 'card_copy' | 'card_copy_cli' | 'card_run' | 'card_dismiss'\n",
+            "  kind: 'slash' | 'tako' | 'shell' | 'prompt' | 'card_copy' | 'card_copy_cli' | 'card_run' | 'card_dismiss'\n  label: string\n",
             1,
         );
     });

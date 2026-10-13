@@ -1,5 +1,6 @@
 // tako mod が tako へ送る報告の契約（#1879。設計書 .agent/plans/2026-10-tako-mod.md §4.2）と、
-// tako が応答で返す帯・サイドバーの材料（#1881。§7 S3）・定型の UI 設定（#1960。§9.7）・描いたもの（#1962）、mod の $.state の契約。
+// tako が応答で返す帯・サイドバーの材料（#1881。§7 S3）・定型の UI 設定（#1960。§9.7）・描いたもの（#1962）・
+// コマンドカード（#1963。§9.3）、mod の $.state の契約。
 // 受け手 / 送り手の正本は tako_core::claude_mod::{ModReport, ModBand, ModRenders, BandView} と tako_core::claude_mod_ui::UiConfig。
 // キーを増やすときは両方を同じコミットで直す。
 //
@@ -86,11 +87,19 @@ export type TakoRenders = {
   band_hook: boolean
   /** 起きてから入力欄の下の行（PromptHint）のフックが呼ばれたか */
   hint_hook: boolean
+  /**
+   * 直近の帯の描画で押せる形（Copy / Run のボタンつき）で描いたコマンドカードの id（#1963）。
+   * 応答に view.cards が無い（tako が描かせない）ときは欠ける。tako は載った id を GPUI のカード帯から外す
+   */
+  cards?: number[]
 }
 
-/** ボタンを押した結果（tako_core::claude_mod::ModPress）。ラベル・コマンド・入力欄へ入れる文は載せない */
+/**
+ * ボタンを押した結果（tako_core::claude_mod::ModPress）。ラベル・コマンド・入力欄へ入れる文は載せない。
+ * card_* はコマンドカードの帯のボタン（#1963。card_copy_cli = $.ui.copy が拒まれて tako の CLI で写した）
+ */
 export type TakoPress = {
-  kind: 'slash' | 'tako' | 'shell' | 'prompt'
+  kind: 'slash' | 'tako' | 'shell' | 'prompt' | 'card_copy' | 'card_copy_cli' | 'card_run' | 'card_dismiss'
   ok: boolean
   /** 押した時刻（epoch ms） */
   at: number
@@ -156,6 +165,41 @@ export type TakoView = {
   button_args?: Record<string, string[]>
   /** 帯の描き方。's3' = #1962 前（next を包まない・ボタンとバーなし。A/B の TAKO_1877_S7_LEGACY） */
   band_style?: 's3'
+  /**
+   * このペインのコマンドカード（#1963。tako が描かせると決めたときだけ届く = ui.json の cards.place が
+   * tako・A/B の TAKO_1963_LEGACY / TAKO_1877_S7_LEGACY・古い tako の応答には無い）
+   */
+  cards?: TakoCards
+}
+
+/** コマンドカード（tako_core::claude_mod::CardsView）。正本は tako の store（`tako show-command --list`） */
+export type TakoCards = {
+  /** 帯のカードのボタンのホットキー（tako が ui.json のボタンと重ならない英小文字を選ぶ。数字は使わない） */
+  hotkeys: { copy: string; run: string; next: string; dismiss: string }
+  /** 古い順（store の並び）。帯は新しいものから選ぶ */
+  items: TakoCard[]
+}
+
+/** カード 1 枚（tako_core::claude_mod::CardView） */
+export type TakoCard = {
+  /** tako のカード id（`tako show-command --card N`。帯と会話の行の「カード N」） */
+  id: number
+  label?: string
+  commands: TakoCardCommand[]
+  /** 閉じるで叩く CLI の引数（tako の後ろの argv。tako が組む） */
+  dismiss_args: string[]
+}
+
+/** カードのコマンド 1 件（tako_core::claude_mod::CardCommandView） */
+export type TakoCardCommand = {
+  /** 論理文字列（AI が渡したまま。画面の折り返しは混ざらない = Copy に渡すのはこれ） */
+  text: string
+  /** $.ui.copy が拒まれたときに叩く CLI の引数（tako の show-command --copy） */
+  copy_args: string[]
+  /** Run で叩く CLI の引数（tako の show-command --run = 新しいペインで実行・スマホと同じ実行記録） */
+  run_args: string[]
+  /** 最後の実行の記録（#1724。未実行は欠ける） */
+  run?: { pane: number; state: 'running' | 'exited' | 'closed'; exit_code?: number; count: number }
 }
 
 /** 帯に並べる区切り（tako_core::claude_mod_ui::BandSegment） */
@@ -221,6 +265,8 @@ declare module 'claude-code' {
       bandHidden: boolean
       /** 使用制限の窓ごとの観測時刻（#1903。描画は読まない） */
       limitsSeen: TakoLimitsSeen
+      /** 帯で選んでいるカードのコマンド（#1963。null = いちばん新しいカードの 1 件目） */
+      cardCursor: { card: number; index: number } | null
     }
   }
 }

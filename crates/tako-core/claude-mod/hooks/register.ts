@@ -11,6 +11,12 @@
 // - 使用制限・ctx のバー（#1962）: 入力欄の下の行（PromptHint）の末尾に `5h ▁ 4% 7d ▂ 22% ctx ▁ 6%`。
 //   描くかは tako が決める（view.usage_bar。利用者の statusLine が既に出していれば描かない）。描いたら
 //   報告の renders.usage_bar で返し、tako は画面下のステータスバーの claude の区画を引っ込める
+// - コマンドカード（#1963）: AI の `tako_show_command` の行（会話の中で「Called tako」に畳まれる ToolGroup を
+//   展開した ToolUse）をカード（ラベル・コマンドを Code で・実行記録）に描き替え、押す口は帯の tako の行の
+//   `カード N` と `y: コピー` / `r: 実行`（ホットキー。会話の行のボタンはクリックでしか押せず、tako は
+//   クリックを渡さない = #1961）。正本は tako の store（応答の view.cards）。帯に押せる形で描いたカードの
+//   id を報告の renders.cards で返し、tako はそのカードを GPUI のカード帯から外す。Copy は $.ui.copy
+//   （他の mod に拒まれたら tako の CLI の show-command --copy へ落とす）、Run / 閉じるは tako が組んだ引数
 // - `/tako`: サイドバーのペイン（$.ui.open）に詳細。頼まれずには開かない（開くのはコマンドだけ）
 // - 帯を隠すトグル: 正本は tako の ui.json の band.hidden（#1960）。$.store の `band`（{ hidden, at }）は
 //   この読み込み元の写しで、`/tako band on|off`・ペインのボタンで変えたら報告の band.toggled_at で tako へ
@@ -30,11 +36,21 @@
 // - 失敗で騒がない: CLI の失敗は $.ui.log(…, { to: 'debug' }) だけ
 // - $ を渡す補助関数はファイル最上位の関数宣言（validate の規則）
 // - 会話の本文・プロンプト・ツールの引数は報告に載せない（ツール名だけ）
-import type { EngineInterface, Register, RenderElement, RenderInput, SessionRateLimit, Timer } from 'claude-code'
+import type {
+  EngineInterface,
+  Register,
+  RenderElement,
+  RenderInput,
+  SessionRateLimit,
+  Timer,
+  UiPressArgument,
+} from 'claude-code'
 
 import type {
   TakoBandSegment,
   TakoButton,
+  TakoCard,
+  TakoCardCommand,
   TakoLimitsSeen,
   TakoModReport,
   TakoPress,
@@ -81,6 +97,12 @@ const BUTTON_GAP = 1
 const PRESS_TIMEOUT_MS = 30_000
 /** ui.json が届く前（古い tako）の帯の並び（tako_core::claude_mod_ui::BandUi の既定と同じ） */
 const DEFAULT_SEGMENTS: readonly TakoBandSegment[] = ['pane', 'tab', 'workers', 'attention', 'card', 'buttons']
+/** tako の MCP の `tako_show_command`（`mcp__<登録名>__tako_show_command`。登録名は利用者の環境次第） */
+const SHOW_TOOL = /^mcp__.+__tako_show_command$/
+/** 帯のカードのコマンドの頭を切り詰める桁 */
+const CARD_HEAD_MAX = 32
+/** 帯のカードのボタン（plain = `y: コピー`）のホットキーと `: ` の桁 */
+const PLAIN_CHROME = 3
 /** ui.json が届く前の色（tako_core::claude_mod_ui::ColorsUi の既定と同じ） */
 const DEFAULT_COLORS: { accent: TakoThemeColor; warn: TakoThemeColor; dim: TakoThemeColor } = {
   accent: 'suggestion',
@@ -94,6 +116,8 @@ const HIDDEN = { plugin: 'tako', key: 'bandHidden' } as const
 // 使用制限の窓ごとの観測時刻（#1903）。$.state に置くのはホットリロード（tako の更新で mod が
 // 書き換わる）をまたいで残すため。モジュール変数だと読み込み直しのたびに全窓を「今」の観測にしてしまう
 const LIMITS_SEEN = { plugin: 'tako', key: 'limitsSeen' } as const
+// 帯で選んでいるカードのコマンド（#1963。n で次へ。描画が購読する）
+const CARD_CURSOR = { plugin: 'tako', key: 'cardCursor' } as const
 
 // モジュール変数。ホットリロードで消えるが、そのとき session.start が再発火して張り直す
 let cli: string | undefined
@@ -141,6 +165,12 @@ let bandHookSeen = false
 let hintHookSeen = false
 // 最後に押されたボタン（語彙の種類と成否だけ）
 let lastPress: TakoPress | undefined
+// コマンドカード（#1963）: 最後の応答に view.cards があったか（無い = tako が描かせない = renders.cards を
+// 送らない）・直近の帯で押せる形で描いたカードの id・最後に見たいちばん新しいカード（新しいカードが
+// 来たら帯の選択をそれへ移す）
+let cardsOffered = false
+let bandCards: number[] = []
+let newestCard: number | undefined
 
 // effort の値を読む。turn.step は文字列（2.1.294 の実測: "medium"）、classic 系は { level } で運ぶ
 function effortLevel(value: unknown): string | undefined {
@@ -266,6 +296,8 @@ function currentRenders(): TakoRenders | undefined {
     buttons: bandButtons,
     band_hook: bandHookSeen,
     hint_hook: hintHookSeen,
+    // #1963: tako が描かせたときだけ（描けなかったら空 = tako は猶予の後に GPUI の帯へ出す）
+    cards: cardsOffered ? bandCards : undefined,
   }
 }
 
@@ -389,6 +421,15 @@ type Words = {
   usage: string
   notPlaced: (reason: string) => string
   command: string
+  // コマンドカード（#1963）
+  card: (id: number) => string
+  copy: string
+  run: string
+  next: string
+  close: string
+  cardClosed: string
+  cardHint: (copy: string, run: string) => string
+  runState: (run: NonNullable<TakoCardCommand['run']>) => string
 }
 
 const WORDS: Record<'ja' | 'en', Words> = {
@@ -419,6 +460,15 @@ const WORDS: Record<'ja' | 'en', Words> = {
     usage: '使い方: /tako（サイドバー）・/tako band on|off（帯）',
     notPlaced: r => `サイドバーを置けない: ${r}`,
     command: 'このペインの tako の状況をサイドバーに出す（band on|off で帯を出す / 隠す）',
+    card: id => `カード ${id}`,
+    copy: 'コピー',
+    run: '実行',
+    next: '次',
+    close: '閉じる',
+    cardClosed: 'このカードは閉じた',
+    cardHint: (copy, run) => `帯（ctrl+x → Tab）の ${copy}: コピー / ${run}: 実行`,
+    runState: run =>
+      `→ ペイン ${run.pane} ${run.state === 'running' ? '実行中' : run.state === 'exited' ? `終了 ${run.exit_code ?? '?'}` : 'が閉じた'}`,
   },
   en: {
     tab: 'tab',
@@ -447,6 +497,15 @@ const WORDS: Record<'ja' | 'en', Words> = {
     usage: 'usage: /tako (sidebar), /tako band on|off (band)',
     notPlaced: r => `the sidebar cannot be placed: ${r}`,
     command: "Show this pane's tako status in a sidebar (band on|off shows / hides the band)",
+    card: id => `card ${id}`,
+    copy: 'copy',
+    run: 'run',
+    next: 'next',
+    close: 'close',
+    cardClosed: 'this card was closed',
+    cardHint: (copy, run) => `in the band (ctrl+x → Tab): ${copy}: copy / ${run}: run`,
+    runState: run =>
+      `→ pane ${run.pane} ${run.state === 'running' ? 'running' : run.state === 'exited' ? `exited ${run.exit_code ?? '?'}` : 'closed'}`,
   },
 }
 
@@ -504,12 +563,20 @@ type Press = { kind: 'slash'; command: string } | { kind: 'prompt'; text: string
 /** 帯のボタン 1 つ（#1962）。rank は区切りと同じ物差し（左のボタンほど最後まで残す） */
 type BandButton = { button: TakoButton; press: Press; rank: number }
 
+/** 帯のカードのボタンの操作（#1963） */
+type CardOp = 'copy' | 'run' | 'next' | 'dismiss'
+/** 帯のカードのボタン 1 つ（#1963）。`y: コピー` の形（plain = ホットキーを見せる）で描く */
+type CardButton = { op: CardOp; label: string; hotkey: string; rank: number }
+/** 帯で選んでいるカードのコマンド（#1963）。pairs は新しいカードから（カード, コマンド）の並び */
+type CardPair = { card: TakoCard; index: number; command: TakoCardCommand }
+type CardSel = CardPair & { pos: number; pairs: CardPair[] }
+
 // 帯の区切りを左から並べる（何を出すかは tako の view が決めている）。
 // s3 = #1881 の並び（A/B の S3 の描き方と、ui.json が届かない古い tako の応答）。S7 は ui.json の
 // band.segments の並びで、バーの置き場が帯なら bar（tako が描くと決めたバーの文字列）を ctx / limits の
 // 位置（無ければボタンの前）に 1 つ置く（バーを描くなら tako は警告を送ってこない = 同じ値を 2 か所で
 // 動かさない）
-function segmentsOf(view: TakoView, s3: boolean, bar: string | null): BandSegment[] {
+function segmentsOf(view: TakoView, s3: boolean, bar: string | null, card: CardSel | null = null): BandSegment[] {
   const w = words(view.lang)
   const name = view.pane_title ?? `pane ${view.pane}`
   const pane: BandSegment = { kind: 'pane', label: clipCells(name, NAME_MAX), rank: 1 }
@@ -547,7 +614,12 @@ function segmentsOf(view: TakoView, s3: boolean, bar: string | null): BandSegmen
     else if (seg === 'ctx') view.warnings.filter(warn => warn.kind === 'ctx').forEach((warn, i) => out.push(warning(warn, i, 4)))
     else if (seg === 'limits') view.warnings.filter(warn => warn.kind !== 'ctx').forEach((warn, i) => out.push(warning(warn, i, 4)))
     else if (seg === 'buttons') placeBar()
-    // card はコマンドカードを mod で描く #1963 から
+    else if (seg === 'card' && card !== null) {
+      // #1963: `カード N`（会話の行の見出しと同じ番号 = tako のカード id）と、選んでいるコマンドの頭
+      const of = card.card.commands.length
+      out.push({ kind: 'card', label: of > 1 ? `${w.card(card.card.id)} (${card.index}/${of})` : w.card(card.card.id), tone: 'accent', rank: 2.52 })
+      out.push({ kind: 'card_head', label: clipCells(card.command.text.split('\n')[0] ?? '', CARD_HEAD_MAX), rank: 3.9 })
+    }
   }
   placeBar()
   return out
@@ -579,9 +651,14 @@ function lineWidth(segments: readonly BandSegment[]): number {
   return segments.reduce((sum, seg, i) => sum + cellWidth(seg.label) + (i === 0 ? 0 : SEP.length), 0)
 }
 
-// tako の行の桁: 区切りの Text と、ボタン 1 つごとに間の 1 桁 + `[ ` ラベル ` ]`
-function rowWidth(segments: readonly BandSegment[], buttons: readonly BandButton[]): number {
-  return lineWidth(segments) + buttons.reduce((sum, b) => sum + BUTTON_GAP + BUTTON_CHROME + cellWidth(b.button.label), 0)
+// tako の行の桁: 区切りの Text と、ボタン 1 つごとに間の 1 桁 + `[ ` ラベル ` ]`（カードのボタンは
+// `y: ` ラベル）
+function rowWidth(segments: readonly BandSegment[], buttons: readonly BandButton[], cards: readonly CardButton[] = []): number {
+  return (
+    lineWidth(segments) +
+    buttons.reduce((sum, b) => sum + BUTTON_GAP + BUTTON_CHROME + cellWidth(b.button.label), 0) +
+    cards.reduce((sum, b) => sum + BUTTON_GAP + PLAIN_CHROME + cellWidth(b.label), 0)
+  )
 }
 
 // columns 桁に収まるまで、優先度の低いもの（区切りもボタンも同じ物差し）から落とす（並びは変えない）。
@@ -590,21 +667,69 @@ function fitBand(
   segments: BandSegment[],
   buttons: BandButton[],
   columns: number,
-): { segments: BandSegment[]; buttons: BandButton[] } {
+  cards: CardButton[] = [],
+): { segments: BandSegment[]; buttons: BandButton[]; cards: CardButton[] } {
   let keptSegments = segments
   let keptButtons = buttons
-  const order: Array<BandSegment | BandButton> = [...segments, ...buttons].sort((a, b) => b.rank - a.rank)
+  let keptCards = cards
+  const order: Array<BandSegment | BandButton | CardButton> = [...segments, ...buttons, ...cards].sort((a, b) => b.rank - a.rank)
   for (const drop of order) {
-    if (rowWidth(keptSegments, keptButtons) <= columns || drop.rank <= 1) break
+    if (rowWidth(keptSegments, keptButtons, keptCards) <= columns || drop.rank <= 1) break
     keptSegments = keptSegments.filter(seg => seg !== drop)
     keptButtons = keptButtons.filter(b => b !== drop)
+    keptCards = keptCards.filter(b => b !== drop)
   }
-  return { segments: keptSegments, buttons: keptButtons }
+  return { segments: keptSegments, buttons: keptButtons, cards: keptCards }
+}
+
+// --- コマンドカード（#1963）------------------------------------------------------------------
+
+// （カード, コマンド）の並び。新しいカードから、カードの中はコマンドの順
+function cardPairs(items: readonly TakoCard[]): CardPair[] {
+  const out: CardPair[] = []
+  for (const card of [...items].reverse()) {
+    card.commands.forEach((command, i) => out.push({ card, index: i + 1, command }))
+  }
+  return out
+}
+
+// 帯で選んでいるカードのコマンド。tako が描かせない（view.cards が無い）・カードが無い・band.segments に
+// card が無いなら null。選択が消えた（閉じた・押し出された）ら新しいカードの 1 件目
+function cardSelection(view: TakoView, cursor: { card: number; index: number } | null): CardSel | null {
+  const segments: readonly TakoBandSegment[] = view.ui?.band.segments ?? DEFAULT_SEGMENTS
+  if (view.cards === undefined || !segments.includes('card')) return null
+  const pairs = cardPairs(view.cards.items)
+  if (pairs.length === 0) return null
+  const found = cursor === null ? -1 : pairs.findIndex(p => p.card.id === cursor.card && p.index === cursor.index)
+  const pos = Math.max(0, found)
+  const pair = pairs[pos]
+  return pair === undefined ? null : { ...pair, pos, pairs }
+}
+
+// 帯のカードのボタン（Copy / Run を先に残し、閉じる・次はその後）。ホットキーは tako が選んだもの
+function cardButtonsOf(view: TakoView, card: CardSel | null): CardButton[] {
+  const keys = view.cards?.hotkeys
+  if (card === null || keys === undefined) return []
+  const w = words(view.lang)
+  const out: CardButton[] = [
+    { op: 'copy', label: w.copy, hotkey: keys.copy, rank: 2.5 },
+    { op: 'run', label: w.run, hotkey: keys.run, rank: 2.51 },
+  ]
+  if (card.pairs.length > 1) out.push({ op: 'next', label: w.next, hotkey: keys.next, rank: 2.9 })
+  out.push({ op: 'dismiss', label: w.close, hotkey: keys.dismiss, rank: 2.91 })
+  return out
+}
+
+// 帯のカードが押せる形で収まったか: Copy と Run があり、選べるコマンドが複数なら「次」もある
+// （「次」が無いと他のカードへ行けない = そのカードは帯からは押せない）
+function cardPressable(cards: readonly CardButton[], card: CardSel): boolean {
+  const has = (op: CardOp): boolean => cards.some(b => b.op === op)
+  return has('copy') && has('run') && (card.pairs.length === 1 || has('next'))
 }
 
 // 直近の描画を控え、変わったら次の報告で tako へ返す
-function noteBand(shown: boolean, columns: number | undefined, segments: string[], buttons = 0, bar = false): void {
-  const key = JSON.stringify([shown, columns, segments, buttons, bar])
+function noteBand(shown: boolean, columns: number | undefined, segments: string[], buttons = 0, bar = false, cards: number[] = []): void {
+  const key = JSON.stringify([shown, columns, segments, buttons, bar, cards])
   if (key === lastBandKey) return
   lastBandKey = key
   bandShown = shown
@@ -612,6 +737,7 @@ function noteBand(shown: boolean, columns: number | undefined, segments: string[
   bandSegments = segments
   bandButtons = buttons
   bandBar = bar
+  bandCards = cards
   dirty = true
 }
 
@@ -655,12 +781,28 @@ function drawBandS3($: EngineInterface, e: RenderInput<'AbovePrompt'>, view: Tak
 }
 
 // tako の行（#1962）: 区切りの Text とボタンを横に並べて 1 行。幅に合わせて優先度の低いものから落とす。
-// 色は ui.json の colors（Claude Code のテーマのキー）
-function bandRow($: EngineInterface, e: RenderInput<'AbovePrompt'>, view: TakoView, columns: number, bar: string | null): RenderElement {
-  const fitted = fitBand(segmentsOf(view, view.ui === undefined, bar), buttonsOf(view), columns)
+// 色は ui.json の colors（Claude Code のテーマのキー）。コマンドカード（#1963）は `カード N` の区切りと
+// `y: コピー` 等のボタン。押せる形で収まらなければカードは描かない（tako が GPUI の帯へ出す）
+function bandRow(
+  $: EngineInterface,
+  e: RenderInput<'AbovePrompt'>,
+  view: TakoView,
+  columns: number,
+  bar: string | null,
+  cursor: { card: number; index: number } | null = null,
+): RenderElement {
+  const s3 = view.ui === undefined
+  let card = cardSelection(view, cursor)
+  let fitted = fitBand(segmentsOf(view, s3, bar, card), buttonsOf(view), columns, cardButtonsOf(view, card))
+  if (card !== null && !cardPressable(fitted.cards, card)) {
+    card = null
+    fitted = fitBand(segmentsOf(view, s3, bar, null), buttonsOf(view), columns)
+  }
   const kinds = fitted.segments.map(seg => seg.kind)
   if (fitted.buttons.length > 0) kinds.push('buttons')
-  noteBand(true, columns, kinds, fitted.buttons.length, kinds.includes('usage'))
+  // 押せる形で描いたカード（「次」で全部へ行ける）= GPUI の帯から外してよいカード
+  const claimed = card === null ? [] : (view.cards?.items ?? []).map(c => c.id)
+  noteBand(true, columns, kinds, fitted.buttons.length, kinds.includes('usage'), claimed)
   const colors = view.ui?.colors ?? DEFAULT_COLORS
   const { Box, Button, Text } = $.ui.resolve(e)
   const parts: Array<ReturnType<typeof Text> | string> = []
@@ -671,11 +813,18 @@ function bandRow($: EngineInterface, e: RenderInput<'AbovePrompt'>, view: TakoVi
     else parts.push(seg.label)
   })
   const line = Text({ color: colors.dim, wrap: 'truncate-end', children: parts })
-  if (fitted.buttons.length === 0) return line
+  const selected = card
+  const cardButtons =
+    selected === null
+      ? []
+      : fitted.cards.map(b =>
+          Button({ key: `tako-card-${b.op}`, label: b.label, hotkey: b.hotkey, plain: true, onPress: press => pressCard($, b.op, selected, press) }),
+        )
+  if (fitted.buttons.length === 0 && cardButtons.length === 0) return line
   const buttons = fitted.buttons.map(b =>
     Button({ key: `tako-button-${b.button.id}`, label: b.button.label, hotkey: b.button.hotkey, onPress: () => pressButton($, b.press) }),
   )
-  return Box({ flexDirection: 'row', columnGap: BUTTON_GAP, children: [line, ...buttons] })
+  return Box({ flexDirection: 'row', columnGap: BUTTON_GAP, children: [line, ...cardButtons, ...buttons] })
 }
 
 // 他の mod の行（next(e) の答え）を上に、tako の行を下に並べる（#1962 / 設計書 §9.5）。下に誰も
@@ -706,6 +855,120 @@ async function pressButton($: EngineInterface, press: Press): Promise<void> {
   }
   lastPress = { kind: press.kind, ok, at: await $.clock.now() }
   dirty = true
+}
+
+// 帯のカードのボタンを押したとき（#1963）。Copy は Claude Code の $.ui.copy（論理文字列をそのまま）。
+// 他の mod の ui.copy フックに拒まれる等で写らなければ tako の CLI（show-command --copy = GUI が
+// クリップボードへ書く）へ落とす。Run / 閉じるは tako が組んだ引数をそのまま（実行記録はスマホ・GPUI の
+// カードと同じ dispatch が付ける）。「次」は帯の選択を進めるだけ（tako へは何も送らない）
+async function pressCard($: EngineInterface, op: CardOp, sel: CardSel, press: UiPressArgument): Promise<void> {
+  if (op === 'next') {
+    const next = sel.pairs[(sel.pos + 1) % sel.pairs.length] ?? sel
+    await $.state.set(CARD_CURSOR, { card: next.card.id, index: next.index })
+    return
+  }
+  let kind: TakoPress['kind'] = op === 'copy' ? 'card_copy' : op === 'run' ? 'card_run' : 'card_dismiss'
+  let ok = false
+  try {
+    if (op === 'copy') {
+      const copied = await $.ui.copy({ text: sel.command.text, surface: press.surface })
+      ok = copied.isCopied
+      if (!copied.isCopied && cli !== undefined) {
+        kind = 'card_copy_cli'
+        const done = await $.process.run([cli, ...sel.command.copy_args], { timeoutMs: PRESS_TIMEOUT_MS })
+        ok = done.exitCode === 0
+      }
+    } else if (cli !== undefined) {
+      const argv = op === 'run' ? sel.command.run_args : sel.card.dismiss_args
+      const done = await $.process.run([cli, ...argv], { timeoutMs: PRESS_TIMEOUT_MS })
+      ok = done.exitCode === 0
+    }
+    if (!ok) $.ui.log(`tako mod: card ${op} failed`, { to: 'debug' })
+  } catch (err) {
+    $.ui.log(`tako mod: card ${op} failed: ${String(err).slice(0, 200)}`, { to: 'debug' })
+  }
+  lastPress = { kind, ok, at: await $.clock.now() }
+  // 実行記録・閉じたことは次の応答（view.cards）で届く
+  dirty = true
+}
+
+// tako_show_command の show（action を省いた呼び出しを含む）か
+function isShowCall(tool: string, input: unknown): boolean {
+  if (!SHOW_TOOL.test(tool)) return false
+  const action = typeof input === 'object' && input !== null ? (input as { action?: unknown }).action : undefined
+  return action === undefined || action === 'show'
+}
+
+// 呼び出しの結果からカードの id を拾う（MCP の content の text に tako の応答の JSON =
+// `{"card":{"id":N,…}}`）。形は Claude Code の版で揺れうるので、文字列・配列・{ text } / { content } を辿る
+function cardIdOf(output: unknown, depth = 0): number | undefined {
+  if (depth > 4 || output === null || output === undefined) return undefined
+  if (typeof output === 'string') {
+    try {
+      return cardIdOf(JSON.parse(output) as unknown, depth + 1)
+    } catch {
+      return undefined
+    }
+  }
+  if (Array.isArray(output)) {
+    for (const item of output) {
+      const id = cardIdOf(item, depth + 1)
+      if (id !== undefined) return id
+    }
+    return undefined
+  }
+  if (typeof output !== 'object') return undefined
+  const o = output as { card?: unknown; text?: unknown; content?: unknown }
+  if (typeof o.card === 'object' && o.card !== null) {
+    const id = (o.card as { id?: unknown }).id
+    if (typeof id === 'number') return id
+  }
+  return cardIdOf(o.text, depth + 1) ?? cardIdOf(o.content, depth + 1)
+}
+
+// 呼び出しの引数（モデルが送った形）のコマンドとラベル。カードがもう store に無い（閉じた）ときの表示用
+function callCommands(input: unknown): { commands: string[]; label?: string } {
+  const o = typeof input === 'object' && input !== null ? (input as { commands?: unknown; label?: unknown }) : {}
+  const commands = Array.isArray(o.commands) ? o.commands.filter((c): c is string => typeof c === 'string') : []
+  return { commands, label: typeof o.label === 'string' && o.label !== '' ? o.label : undefined }
+}
+
+// 会話の行のカード（#1963）: 見出し（tako・カード N・ラベル）・コマンドを Code で（見た目だけ折り返す。
+// 写すのは帯のボタン = 論理文字列）・実行記録・帯で押す案内。カードが store に無い（閉じた・押し出された）
+// なら引数から描いて「閉じた」と添える。下の他の mod が描いていればその下に足す（next の答えを包む）
+function drawCardRow($: EngineInterface, e: RenderInput<'ToolUse'>, view: TakoView, below: RenderElement): RenderElement {
+  const w = words(view.lang)
+  const colors = view.ui?.colors ?? DEFAULT_COLORS
+  const id = cardIdOf(e.props.output)
+  const card = id === undefined ? undefined : view.cards?.items.find(c => c.id === id)
+  const call = callCommands(e.props.input)
+  const commands: Array<{ text: string; run?: TakoCardCommand['run'] }> =
+    card === undefined ? call.commands.map(text => ({ text })) : card.commands
+  const label = card === undefined ? call.label : card.label
+  const { Box, Code, Text } = $.ui.resolve(e)
+  const title: Array<ReturnType<typeof Text> | string> = [Text({ color: colors.accent, bold: true, children: 'tako' })]
+  if (id !== undefined) title.push('  ', Text({ bold: true, children: w.card(id) }))
+  if (label !== undefined) title.push(`  ${label}`)
+  if (id !== undefined && card === undefined && !e.props.isRunning) title.push(Text({ color: colors.dim, children: `  ${w.cardClosed}` }))
+  const rows: RenderElement[] = [Text({ wrap: 'wrap', children: title })]
+  commands.forEach((command, i) => {
+    const code = Code({ source: command.text, language: 'bash', wrap: 'wrap' })
+    rows.push(
+      commands.length > 1
+        ? Box({ flexDirection: 'row', children: [Text({ color: colors.dim, children: `${i + 1} ` }), Box({ flexGrow: 1, flexShrink: 1, children: [code] })] })
+        : code,
+    )
+    if (command.run !== undefined) {
+      const tone = command.run.state === 'running' ? colors.accent : command.run.exit_code === 0 ? 'success' : command.run.state === 'exited' ? 'error' : colors.dim
+      rows.push(Text({ color: tone, children: w.runState(command.run) }))
+    }
+  })
+  if (card !== undefined && view.cards !== undefined) {
+    rows.push(Text({ color: colors.dim, wrap: 'wrap', children: w.cardHint(view.cards.hotkeys.copy, view.cards.hotkeys.run) }))
+  }
+  const box = Box({ flexDirection: 'column', borderStyle: 'round', borderColor: colors.accent, paddingX: 1, children: rows })
+  if (below.type === 'engine') return box
+  return Box({ flexDirection: 'column', children: [below, box] })
 }
 
 // 残り時間（リセットまで）。端末の時刻帯に依らない書き方にする
@@ -801,7 +1064,26 @@ async function absorb($: EngineInterface, stdout: string): Promise<void> {
       await setHidden($, request.hidden, request.at)
     }
   }
+  await absorbCards($, view)
   await setView($, view)
+}
+
+// 応答のカードを取り込む（#1963）: tako が描かせるか（renders.cards を送るか）と、新しいカードが来たら
+// 帯の選択をその 1 件目へ移す（AI が出したばかりのカードをすぐ押せるように）
+async function absorbCards($: EngineInterface, view: TakoView | null): Promise<void> {
+  const offered = view?.cards !== undefined && view.band_style !== 's3'
+  if (offered !== cardsOffered) {
+    cardsOffered = offered
+    dirty = true
+  }
+  const newest = view?.cards?.items.at(-1)?.id
+  if (newest === undefined || newest === newestCard) return
+  newestCard = newest
+  try {
+    await $.state.set(CARD_CURSOR, { card: newest, index: 1 })
+  } catch (err) {
+    $.ui.log(`tako mod: card cursor unwritable: ${String(err).slice(0, 200)}`, { to: 'debug' })
+  }
 }
 
 export const register: Register = on => {
@@ -877,6 +1159,8 @@ export const register: Register = on => {
       pendingTool = undefined
       dirty = true
     }
+    // #1963: カードが増えた / 減った = すぐ報告して応答の view.cards を取りに行く（heartbeat の 15 秒を待たない）
+    if (SHOW_TOOL.test(e.tool)) dirty = true
     return result
   }).catch(($, e, next) => next(e))
 
@@ -934,7 +1218,27 @@ export const register: Register = on => {
     if (view.band_style === 's3') return drawBandS3($, e, view, columns)
     const below = await next(e)
     const bar = barPlace(view) === 'band' ? barText(view) : null
-    return stackBand($, e, below, bandRow($, e, view, columns, bar))
+    const cursor = (await $.state.get(CARD_CURSOR)).value ?? null
+    return stackBand($, e, below, bandRow($, e, view, columns, bar, cursor))
+  }).catch(($, e, next) => next(e))
+
+  // 会話の行（#1963）: tako_show_command の呼び出しを含むグループ（「Called tako」の 1 行）を展開する
+  // = その呼び出しが ToolUse の行になり、下のフックがカードに描き替える。展開は isExpanded を書き換えて
+  // next へ流すだけ（グループの描画はエンジン / 他の mod のまま）。tako が描かせないときは触らない
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
+    if (e.props.isExpanded || !e.props.calls.some(call => isShowCall(call.tool, call.input))) return next(e)
+    const view = (await $.state.get(VIEW)).value ?? null
+    if (cli === undefined || view?.cards === undefined) return next(e)
+    return next({ ...e, props: { ...e.props, isExpanded: true } })
+  }).catch(($, e, next) => next(e))
+
+  // tako_show_command の行をカードに描き替える（#1963）。他の mod が描いていればその下に足す
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    if (!isShowCall(e.props.tool, e.props.input) || e.props.isErrored || e.props.isInterrupted) return next(e)
+    const view = (await $.state.get(VIEW)).value ?? null
+    if (cli === undefined || view?.cards === undefined) return next(e)
+    const below = await next(e)
+    return drawCardRow($, e, view, below)
   }).catch(($, e, next) => next(e))
 
   // 入力欄の下の行（#1962）: 末尾（tail）に使用制限・ctx のバー。描くかは tako（view.usage_bar）。
