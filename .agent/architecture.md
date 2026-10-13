@@ -1312,9 +1312,31 @@ lid-guard.json が使う）:
   `issue1984_ui_thread_offload_watchdog.rs`（注入 17 通り）、A/B は `TAKO_1989_LEGACY=1`、実経路は
   `scripts/test-ui-thread-offload-1989.sh`（2026-10-11: 修正後は ⑦〜⑬ の別の要求 0.03〜0.05 秒・⑭ の spawn は
   上限 2 秒で 2.07 秒に理由つきで返る / 修正前は 4.0 秒〜打ち切り・⑭ は返らない）。
-  **まだ UI スレッドの同期の dispatch に残る子プロセスの待ち**（#1989 の範囲外）: `GitCheckout` / `GitCommit` /
-  `GitPull` / `GitPush` / `GitStage` / `GitMerge` ほかの git の書き込み系（`tako_core::git` は上限なしの
-  `Command::output()`。pull / push はネットワークを待つ）と、起動時の orphan の一括回収（起動の中で 1 回）
+  このとき残った git の書き込み系と起動時の orphan の一括回収は #1991（次の項）
+- **git の書き込み系と起動時の orphan の後片付け**（#1991）: ①`GitCommit` / `GitPull` / `GitPush` / `GitStage` /
+  `GitUnstage` / `GitCheckout` / `GitBranchCreate` / `GitMerge` / `GitMergeAbort` / `GitConflicts` は
+  `prepare_offload` が `OffloadJob::GitWrite` にする（GitLog / GitDiff と同じ形: UI スレッドで写すのはペインの cwd
+  = `git_pane_cwd` のキャッシュ済みの値だけ。`git rev-parse` と本体は background で、workspace に触らないので
+  そのまま応答する）。本体は同期の腕（テスト・直呼び・A/B）と同じ `git_write_reply` の 1 実装。`tako_core::git` の
+  待ちは上限なしのまま（pre-push フックや大きな push を途中で殺さない）で、UI スレッドから外すことで止まらなくした。
+  **同じリポジトリへの書き込みは background でも 1 本ずつ**（`git_write_turn`。修正前は UI スレッドの直列が担って
+  いた順序で、AI が並べて投げた `stage` 2 本が `index.lock` を取り合わない）。札はリポジトリごとなので応答しない
+  push が別のリポジトリの書き込みを止めることはない（conflicts は読むだけなので札を取らない）
+  ②起動時の orphan の一括回収（FR-2.16.11）は計画（守るセッションの収集 = `orphan_cleanup_plan`。メモリと
+  sysctl だけ）まで UI スレッドで、器の一覧と kill（孤児 1 つにつき上限 5 秒）は background。計画の後に立った
+  セッションは起動時の猶予（直近 1 時間のアクティビティ）で必ず外れるので巻き込まない。結果の 1 行は
+  background から persist.log へ（`log_startup_cleanup`）③起動時の自動復帰（#191）は workspace を変える（タブと
+  ペインを作って器へ繋ぐ）ので UI スレッドのまま残し、その中の tmux の 3 口（`session_cwd` / `session_env` /
+  `set_session_env`。修正前は素の `output()` / `status()` = 上限なし）を上限つきの `tmux::run_tmux` へ寄せた。
+  番犬は #1984 と同じ `issue1984_ui_thread_offload_watchdog.rs`（#1991 の注入 8 通り・計 25）、A/B は
+  `TAKO_1991_LEGACY=1`（git の書き込み系と起動時の回収を UI スレッドで待つ）、実経路は
+  `scripts/test-ui-thread-offload-1991.sh`（武装中は戻らない偽の git = `TAKO_GIT_BIN` / `show-environment` だけ
+  戻らない偽の tmux。2026-10-12 の実測: 修正後は G1〜G10 の最中の別の要求 0.03〜0.06 秒・メインスレッドに
+  子プロセス待ちなし・応答の形と実体（ステージ・コミット・ブランチ）は従来どおり、R は返らない
+  `show-environment` 2 本があっても 11.4 秒で起動 / 修正前は G1〜G10 すべて 8 秒で打ち切り・メインスレッドに
+  `git_write_reply` → `tako_core::git::repo_root`、R は武装を解くまで 600 秒起動しない）。
+  **起動時の回収は他の tako-app が 1 つでも生きていれば見送る**（#1187 の Startup の規則）ので、本番 GUI が動いている
+  機の隔離 GUI では器まで届かず、この経路の注入 A/B は実経路では打てない（番犬の注入でだけ縛る）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の
