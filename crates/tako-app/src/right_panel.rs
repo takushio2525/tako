@@ -5581,9 +5581,16 @@ impl TakoApp {
         let diagnostics_tab = view == PanelView::Diagnostics || self.lsp_documents_open();
         // #1685: references タブも同じく条件つき（結果を持っているか、そのビューを選んでいるとき）
         let references_tab = view == PanelView::References || !self.lsp_xref.is_empty();
-        // 幅の見積りは先頭から数える（diagnostics を出さずに references だけのときは diagnostics の
-        // ラベルで見積もる = 1 字長い側へ倒れる = 溢れない）
-        let tabs = PANEL_BASE_TABS + usize::from(diagnostics_tab) + usize::from(references_tab);
+        // #1694: search タブも同じく条件つき（結果・走っている検索・失敗の理由を持っているか、
+        // そのビューを選んでいるとき）。⇧⌘F でビューごと開くので、使っていない人の画面は変えない
+        let search_tab = view == PanelView::Search || !self.workspace_search.is_empty();
+        // 幅の見積りは先頭から数える（条件つきのタブは diagnostics → references → search の順に
+        // ラベルが短くなるので、間のタブを出さずに後ろだけ出すときは前のラベルで見積もる
+        // = 長い側へ倒れる = 溢れない）
+        let tabs = PANEL_BASE_TABS
+            + usize::from(diagnostics_tab)
+            + usize::from(references_tab)
+            + usize::from(search_tab);
         let density = if legacy_tabs {
             // A/B: 幅を見ない（= 直す前）
             PanelTabDensity::Full
@@ -5821,6 +5828,22 @@ impl TakoApp {
                                 )),
                             )
                         })
+                        .when(search_tab, |row| {
+                            row.child(
+                                tab_button(
+                                    PANEL_TAB_LABELS[PANEL_BASE_TABS + 2],
+                                    crate::file_icons::ui_icon::SEARCH,
+                                    PanelView::Search,
+                                    view == PanelView::Search,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.panel_view = PanelView::Search;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        })
                         .child(div().flex_grow(1.0).min_w(px(0.0)))
                         .child(
                             div()
@@ -5850,6 +5873,7 @@ impl TakoApp {
                     PanelView::Tasks => self.render_tasks_view(cx).into_any_element(),
                     PanelView::Diagnostics => self.render_diagnostics_view(cx).into_any_element(),
                     PanelView::References => self.render_references_view(cx).into_any_element(),
+                    PanelView::Search => self.render_search_view(cx).into_any_element(),
                 })
                 .child(
                     // 左端のリサイズハンドル（ドラッグで幅調整）
@@ -5904,9 +5928,17 @@ pub(crate) fn legacy_1479() -> bool {
 }
 
 /// タブ列に並ぶラベル（**並び順そのもの**。描画も幅の見積りもここを読む）。
-/// 末尾の `diagnostics`（#1679）と `references`（#1685）は条件つきで、先頭の [`PANEL_BASE_TABS`] 本が常設
-pub(crate) const PANEL_TAB_LABELS: [&str; 6] =
-    ["fleet", "orch", "git", "tasks", "diagnostics", "references"];
+/// 末尾の `diagnostics`（#1679）・`references`（#1685）・`search`（#1694）は条件つきで、
+/// 先頭の [`PANEL_BASE_TABS`] 本が常設
+pub(crate) const PANEL_TAB_LABELS: [&str; 7] = [
+    "fleet",
+    "orch",
+    "git",
+    "tasks",
+    "diagnostics",
+    "references",
+    "search",
+];
 /// 常設のタブの数（fleet / orch / git / tasks）
 pub(crate) const PANEL_BASE_TABS: usize = 4;
 /// バッジが付くタブの位置（[`PANEL_TAB_LABELS`] の添字）
@@ -6055,15 +6087,21 @@ mod tests {
 
     /// **選んだ段は必ず収まる**（= バッジが欠けない）。
     ///
-    /// `PANEL_MIN_WIDTH`（220px）から 900px まで 1px 刻み × 代表的な件数で、
+    /// `PANEL_MIN_WIDTH`（240px。#1694 で 220 から上げた）から 900px まで 1px 刻み × 代表的な件数で、
     /// [`panel_tab_density`] が返した段の要求幅が使える幅を超えないことを見る。
     /// #1479 の受け入れ条件（240 / 320 / 480 / 600 px × 0 / 9 / 22 / 150 件）を
     /// **全域で**含む
     #[test]
     fn 選んだ段はどの幅でも収まる() {
-        // #1679: diagnostics タブが出ている 5 本でも同じ。#1685: references も出ている 6 本でも同じ
-        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1, PANEL_BASE_TABS + 2] {
-            for w in 220..=900 {
+        // #1679: diagnostics タブが出ている 5 本でも同じ。#1685: references も出ている 6 本でも同じ。
+        // #1694: search も出ている 7 本でも同じ
+        for tabs in [
+            PANEL_BASE_TABS,
+            PANEL_BASE_TABS + 1,
+            PANEL_BASE_TABS + 2,
+            PANEL_BASE_TABS + 3,
+        ] {
+            for w in (crate::PANEL_MIN_WIDTH as u32)..=900 {
                 let panel_width = w as f32;
                 for n in [0usize, 1, 9, 22, 99, 150, 4000] {
                     let badge = panel_tab_badge(n);
@@ -6112,7 +6150,7 @@ mod tests {
                 .position(|x| *x == d)
                 .expect("ladder に居る")
         };
-        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1] {
+        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1, PANEL_BASE_TABS + 2] {
             for n in [0usize, 9, 22, 150] {
                 let badge = panel_tab_badge(n);
                 let mut prev = rank(panel_tab_density(220.0, badge.as_deref(), tabs));
@@ -6134,7 +6172,7 @@ mod tests {
                 .position(|x| *x == d)
                 .expect("ladder に居る")
         };
-        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1] {
+        for tabs in [PANEL_BASE_TABS, PANEL_BASE_TABS + 1, PANEL_BASE_TABS + 2] {
             for w in [220.0f32, 260.0, 320.0, 400.0, 480.0, 600.0] {
                 let mut prev = 0usize;
                 for n in [0usize, 9, 22, 150] {

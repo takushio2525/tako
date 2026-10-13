@@ -52,11 +52,20 @@ const TASKS_PANEL: &str = "crates/tako-app/src/tasks_panel.rs";
 const RIGHT_PANEL: &str = "crates/tako-app/src/right_panel.rs";
 const SIDEBAR: &str = "crates/tako-app/src/sidebar.rs";
 const OVERLAYS: &str = "crates/tako-app/src/overlays.rs";
+/// #1694: 横断検索の検索欄（`AppTextInput::WorkspaceSearch`）の描画
+const SEARCH_PANEL: &str = "crates/tako-app/src/search_panel.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const CLI: &str = "crates/tako-cli/src/main.rs";
 
 /// 入力欄の描画が載りうるファイル（IME の宛先ごとの描画を探す範囲）
-const RENDER_FILES: &[&str] = &[MAIN, TASKS_PANEL, RIGHT_PANEL, SIDEBAR, OVERLAYS];
+const RENDER_FILES: &[&str] = &[
+    MAIN,
+    TASKS_PANEL,
+    RIGHT_PANEL,
+    SIDEBAR,
+    OVERLAYS,
+    SEARCH_PANEL,
+];
 
 /// 未確定文字列を描いたしるし
 const MARKED_MARKS: &[&str] = &["text_input_marked", "ime_highlight_ranges"];
@@ -189,6 +198,7 @@ struct Sources {
     right_panel: String,
     sidebar: String,
     overlays: String,
+    search_panel: String,
     dispatch: String,
     cli: String,
 }
@@ -201,6 +211,7 @@ impl Sources {
             right_panel: prod(root, RIGHT_PANEL),
             sidebar: prod(root, SIDEBAR),
             overlays: prod(root, OVERLAYS),
+            search_panel: prod(root, SEARCH_PANEL),
             dispatch: prod(root, DISPATCH),
             cli: prod(root, CLI),
         }
@@ -213,6 +224,7 @@ impl Sources {
             RIGHT_PANEL => &self.right_panel,
             SIDEBAR => &self.sidebar,
             OVERLAYS => &self.overlays,
+            SEARCH_PANEL => &self.search_panel,
             DISPATCH => &self.dispatch,
             _ => &self.cli,
         }

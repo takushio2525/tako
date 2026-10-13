@@ -88,6 +88,9 @@ enum Command {
     /// ターミナル画面のリンク（修飾 + クリックで開けるもの）を列挙する（Issue #1283）
     #[command(about = format!("ターミナル画面のリンク（{}で開けるもの）を列挙する（Issue #1283）", link_click()))]
     Links(LinksArgs),
+    /// ワークスペース横断検索（Issue #1694。GUI の右パネルの search ビューと同じ）
+    #[command(about = format!("ワークスペース横断検索（Issue #1694。GUI の {} と同じ）", find_in_files_key()))]
+    Search(SearchArgs),
     /// 言語サーバ（LSP）の状態と起動・停止（Issue #1678。編集モードで自動的に起きる）
     #[command(subcommand)]
     Lsp(LspCommand),
@@ -3486,6 +3489,66 @@ struct LinksArgs {
     /// 相対パスの解決基準（省略時はペインの cwd）
     #[arg(long)]
     cwd: Option<String>,
+}
+
+/// ワークスペース横断検索の引数（Issue #1694）。
+/// 最簡形（#322）: `tako search <検索語>` でタブのファイルツリーのルートから探す
+#[derive(Args)]
+struct SearchArgs {
+    /// 検索語（--results / --open / --clear では要らない）
+    query: Option<String>,
+    /// 探すフォルダ（省略時はタブのファイルツリーのルート）
+    #[arg(long)]
+    path: Option<String>,
+    /// 検索語を正規表現として読む
+    #[arg(long)]
+    regex: bool,
+    /// 大文字小文字を区別する
+    #[arg(long)]
+    case_sensitive: bool,
+    /// 右パネルの search ビューにも出す
+    #[arg(long)]
+    show: bool,
+    /// 表示する行の数（既定 100。0 で全部）
+    #[arg(long)]
+    limit: Option<usize>,
+    /// 右パネルの結果を読む
+    #[arg(long, conflicts_with_all = ["query", "open", "clear", "show"])]
+    results: bool,
+    /// 右パネルの結果の N 番目を開く（行を押すのと同じ）
+    #[arg(long, value_name = "N", conflicts_with_all = ["query", "clear", "show"])]
+    open: Option<usize>,
+    /// 開いたペインへフォーカスを移す（--open と併用）
+    #[arg(long, requires = "open")]
+    focus: bool,
+    /// 右パネルの結果を閉じる（走っている検索も取り消す）
+    #[arg(long, conflicts_with_all = ["query", "show"])]
+    clear: bool,
+    /// 対象ペイン（探す範囲のタブ・--open の起点。省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 応答を JSON のまま出す
+    #[arg(long)]
+    json: bool,
+}
+
+impl SearchArgs {
+    fn action(&self) -> &'static str {
+        if self.results {
+            "results"
+        } else if self.open.is_some() {
+            "open"
+        } else if self.clear {
+            "clear"
+        } else {
+            "search"
+        }
+    }
+}
+
+/// 横断検索のキーの表記（help に出す。macOS = ⇧⌘F / Windows = Ctrl+Shift+G）
+fn find_in_files_key() -> &'static str {
+    tako_core::platform::keys::find_in_files(tako_core::platform::support::Platform::current())
 }
 
 /// スクロールバック保持上限の引数（Issue #818）。
@@ -8231,6 +8294,25 @@ fn build_request(command: &Command) -> Result<Request, String> {
             }
         }
         Command::Lsp(sub) => sub.request()?,
+        Command::Search(args) => {
+            let action = args.action();
+            if action == "search" && args.query.is_none() {
+                return Err("検索語を指定する（tako search <検索語>）".into());
+            }
+            Request::WorkspaceSearch {
+                action: action.into(),
+                query: args.query.clone(),
+                // 相対パスは自分の cwd 基準（GUI のペインの cwd ではない）
+                path: args.path.as_deref().map(absolutize),
+                pane: args.pane.or_else(caller_pane),
+                regex: args.regex.then_some(true),
+                case_sensitive: args.case_sensitive.then_some(true),
+                show: args.show.then_some(true),
+                limit: args.limit,
+                item: args.open,
+                focus: args.focus.then_some(true),
+            }
+        }
         Command::Links(args) => {
             // `--text -` は標準入力から読む（画面の写しをパイプで流せる形）
             let text = match args.text.as_deref() {
@@ -10906,6 +10988,118 @@ fn delivery_line(result: &Value) -> Option<String> {
 }
 
 /// `tako jump` の表示（#1677）。中身の正本は dispatch の応答で、ここは体裁だけ
+/// `tako search` の出力（#1694）。結果は grep と同じ `パス:行:桁: 抜粋`（パスは自分の cwd からの
+/// 相対 = ターミナルのリンクとして開ける）で、最後に件数と打ち切りの理由を 1 行
+fn print_search(args: &SearchArgs, result: &Value) {
+    if args.json {
+        println!("{}", pretty_json(result));
+        return;
+    }
+    match args.action() {
+        "open" => {
+            println!(
+                "開いた: {}:{}:{}（{}）",
+                result["path"].as_str().unwrap_or(""),
+                result["line"],
+                result["column"],
+                result["landing"].as_str().unwrap_or("")
+            );
+            return;
+        }
+        "clear" => {
+            if result["cleared"] == Value::Bool(true) {
+                println!("右パネルの検索結果を閉じた");
+            } else {
+                println!("閉じる検索結果は無かった");
+            }
+            return;
+        }
+        _ => {}
+    }
+    match result["status"].as_str() {
+        Some("empty") => {
+            println!("右パネルに検索結果は無い（tako search <検索語> --show で出す）");
+            return;
+        }
+        Some("searching") => {
+            println!(
+                "検索中: {}",
+                result["running"]["query"].as_str().unwrap_or("")
+            );
+            return;
+        }
+        Some("error") => {
+            println!(
+                "検索できなかった: {}",
+                result["reason"].as_str().unwrap_or("")
+            );
+            return;
+        }
+        _ => {}
+    }
+    let cwd = std::env::current_dir().ok();
+    let items = result["items"].as_array().cloned().unwrap_or_default();
+    for item in &items {
+        let path = std::path::PathBuf::from(item["path"].as_str().unwrap_or(""));
+        let shown = cwd
+            .as_deref()
+            .and_then(|c| path.strip_prefix(c).ok())
+            .unwrap_or(&path);
+        println!(
+            "{}:{}:{}: {}",
+            shown.display(),
+            item["line"],
+            item["column"],
+            item["excerpt"].as_str().unwrap_or("")
+        );
+    }
+    let total = result["total"].as_u64().unwrap_or(0);
+    let mut tail = vec![if total == 0 {
+        format!(
+            "見つからなかった（{} ファイルを探した）",
+            result["files_searched"]
+        )
+    } else {
+        format!(
+            "{total} 件（{} ファイル・{} ms）",
+            result["files_matched"], result["elapsed_ms"]
+        )
+    }];
+    match result["stopped"].as_str() {
+        Some("limit") => tail.push(format!(
+            "上限 {} 件で打ち切り（--path で範囲を狭めるか検索語を絞る）",
+            tako_core::workspace_search::MAX_RESULTS
+        )),
+        Some("time") => tail.push(format!(
+            "所要の上限（{} 秒）で打ち切り",
+            tako_core::workspace_search::DEFAULT_TIME_LIMIT.as_secs()
+        )),
+        Some("cancelled") => tail.push("取り消された（次の検索が始まった / 閉じられた）".into()),
+        _ => {}
+    }
+    let more = result["truncated"].as_u64().unwrap_or(0);
+    if more > 0 {
+        tail.push(format!("ほか {more} 件（--limit 0 で全部）"));
+    }
+    let skipped = &result["skipped"];
+    let skip = [
+        ("バイナリ", &skipped["binary"]),
+        ("大きすぎる", &skipped["too_large"]),
+        ("読めない", &skipped["unreadable"]),
+    ]
+    .iter()
+    .filter_map(|(label, n)| {
+        n.as_u64()
+            .filter(|n| *n > 0)
+            .map(|n| format!("{label} {n}"))
+    })
+    .collect::<Vec<_>>();
+    if !skip.is_empty() {
+        tail.push(format!("探していない: {}", skip.join("・")));
+    }
+    println!("{}", tail.join(" / "));
+}
+
 fn print_jump(sub: &JumpCommand, result: &Value) {
     let place = |v: &Value| -> String {
         let path = v["path"].as_str().unwrap_or("");
@@ -11587,6 +11781,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::PreviewLinkList(_) => println!("{}", pretty_json(result)),
         // #1283: 検出結果はスパンまで読みたいので整形して出す
         Command::Links(_) => println!("{}", pretty_json(result)),
+        Command::Search(args) => print_search(args, result),
         Command::Lsp(sub) => print_lsp(sub, result),
         Command::Jump(sub) => print_jump(sub, result),
         Command::PreviewFollowLink(_) => println!("{result}"),

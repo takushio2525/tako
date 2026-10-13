@@ -457,6 +457,20 @@ pub(super) fn build_request(
             whole_word: bool_arg(args, "whole_word")?,
             visible: bool_arg(args, "visible")?,
         },
+        // #1694: ワークスペース横断検索。pane は探す範囲（そのタブのツリーのルート）と open の起点で、
+        // 省略は呼び出し元（呼び出し元も無ければ dispatch がフォーカスへ倒す）
+        "tako_search" => Request::WorkspaceSearch {
+            action: str_arg(args, "action")?.unwrap_or_else(|| "search".into()),
+            query: str_arg(args, "query")?,
+            path: str_arg(args, "path")?,
+            pane: u64_arg(args, "pane")?.or(caller),
+            regex: bool_arg(args, "regex")?,
+            case_sensitive: bool_arg(args, "case_sensitive")?,
+            show: bool_arg(args, "show")?,
+            limit: u64_arg(args, "limit")?.map(|n| n as usize),
+            item: u64_arg(args, "item")?.map(|n| n as usize),
+            focus: bool_arg(args, "focus")?,
+        },
         "tako_preview_replace" => Request::PreviewReplace {
             pane: Some(target_pane(args, caller)?),
             query: str_arg(args, "query")?.ok_or("query を指定する")?,

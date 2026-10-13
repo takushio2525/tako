@@ -246,8 +246,8 @@ fn scan_view_vocabulary(sources: &Sources) -> Vec<Offender> {
     // CLI / MCP が案内する正式値に載っていないと `--view tasks` が弾かれる。
     // **`VALUES` の行そのもの**を見る（ファイル全体から `"tasks"` を探すと、
     // `parse` の腕が残っているだけで緑になり、注入を見逃す）
-    // 宣言の文を `;` まで読む（値が増えて rustfmt が配列を次の行へ折っても見失わない。#1685 で
-    // `references` を足したときに 1 行目だけを見て空振りした）
+    // 宣言の文を `;` まで読む（値が増えて rustfmt が配列を次の行へ折っても見失わない。#1685 / #1694 で
+    // ビューを足したときに 1 行目だけを見て空振りした）
     let values_at = code_line_with(&protocol, "pub const VALUES");
     let values_line = values_at.map(|i| {
         let mut statement = String::new();
@@ -653,8 +653,10 @@ fn 逆戻りを名指しできる() {
     // (4) CLI / MCP の語彙から `tasks` が抜ける（GUI にしか無いビューになる）
     let mut s = Sources::load(&root);
     s.protocol = s.protocol.replace(
-        "[\"fleet\", \"orch\", \"git\", \"tasks\", \"diagnostics\", \"references\"]",
-        "[\"fleet\", \"orch\", \"git\", \"diagnostics\", \"references\"]",
+        // 値が 7 つになって rustfmt が配列を 1 行 1 値へ折った（#1685 + #1694）。`VALUES` の
+        // 8 字下げの並びから `tasks` の行だけを抜く（テストの配列は 16 字下げなので当たらない）
+        "        \"git\",\n        \"tasks\",\n        \"diagnostics\",",
+        "        \"git\",\n        \"diagnostics\",",
     );
     expect_hit(&s, PROTOCOL, "`PanelViewWire::VALUES` に `tasks` が無い");
 

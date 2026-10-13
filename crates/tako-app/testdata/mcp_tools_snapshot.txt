@@ -115,6 +115,7 @@ tako_run_interactive_status
 tako_run_resolve
 tako_scroll_pane
 tako_scrollback
+tako_search
 tako_select_tab
 tako_send_input
 tako_session_restart

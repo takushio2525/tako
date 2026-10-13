@@ -737,6 +737,112 @@ pub fn xref_close() -> &'static str {
     tr!("この結果を閉じる", "Close this result")
 }
 
+// --- search ビュー（キー: panel.search_*。#1694） ---
+
+pub fn search_placeholder() -> &'static str {
+    tr!(
+        "ワークスペースを検索（Enter で探す）",
+        "Search the workspace (press Enter)"
+    )
+}
+pub fn search_case_toggle() -> &'static str {
+    tr!("大文字小文字を区別する", "Match case")
+}
+pub fn search_regex_toggle() -> &'static str {
+    tr!("正規表現として読む", "Use regular expression")
+}
+pub fn search_empty() -> &'static str {
+    tr!(
+        "検索語を入れて Enter を押すと、ワークスペースのファイルから行ごとに探します（.gitignore 対象・バイナリは探しません）",
+        "Type a query and press Enter to search the workspace files line by line (.gitignore'd and binary files are skipped)"
+    )
+}
+pub fn search_scope(roots: &[String]) -> String {
+    match roots {
+        [one] => tr!(format!("範囲: {one}"), format!("In: {one}")),
+        _ => tr!(
+            format!("範囲: {} フォルダ", roots.len()),
+            format!("In: {} folders", roots.len())
+        ),
+    }
+}
+pub fn search_searching(query: &str) -> String {
+    tr!(
+        format!("「{query}」を探しています…"),
+        format!("Searching for \"{query}\"…")
+    )
+}
+pub fn search_none() -> &'static str {
+    tr!("見つかりませんでした", "No results")
+}
+pub fn search_count(total: usize, files: usize) -> String {
+    tr!(
+        format!("{total} 件 · {files} ファイル"),
+        format!("{total} results in {files} files")
+    )
+}
+pub fn search_stopped_limit(max: usize) -> String {
+    tr!(
+        format!("上限 {max} 件で打ち切りました（検索語や範囲を絞ってください）"),
+        format!("Stopped at {max} results (narrow the query or the folder)")
+    )
+}
+pub fn search_stopped_time(secs: u64) -> String {
+    tr!(
+        format!("所要の上限（{secs} 秒）で打ち切りました"),
+        format!("Stopped after the {secs}s time limit")
+    )
+}
+pub fn search_stopped_cancelled() -> &'static str {
+    tr!("取り消しました", "Cancelled")
+}
+/// 探さなかったファイルの内訳（0 の種類は出さない。CLI の最後の行と同じ）
+pub fn search_skipped(binary: usize, too_large: usize, unreadable: usize) -> String {
+    let parts: Vec<String> = [
+        (binary, tr!("バイナリ", "binary")),
+        (too_large, tr!("大きすぎる", "too large")),
+        (unreadable, tr!("読めない", "unreadable")),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, label)| tr!(format!("{label} {n}"), format!("{n} {label}")))
+    .collect();
+    tr!(
+        format!("探していないファイル: {}", parts.join("・")),
+        format!("Skipped files: {}", parts.join(", "))
+    )
+}
+pub fn search_error_empty() -> &'static str {
+    tr!("検索語が空です", "The query is empty")
+}
+pub fn search_error_newline() -> &'static str {
+    tr!(
+        "検索語に改行は使えません（1 行ずつ探します）",
+        "The query cannot contain a line break (lines are searched one by one)"
+    )
+}
+pub fn search_error_regex(detail: &str) -> String {
+    tr!(
+        format!("正規表現として読めません: {detail}"),
+        format!("Invalid regular expression: {detail}")
+    )
+}
+pub fn search_failed(reason: &str) -> String {
+    tr!(
+        format!("検索できませんでした: {reason}"),
+        format!("Search failed: {reason}")
+    )
+}
+pub fn search_more(n: usize) -> String {
+    tr!(
+        format!("ほか {n} 件（全件は tako search --results --limit 0）"),
+        format!("{n} more (see tako search --results --limit 0 for all)")
+    )
+}
+pub fn search_close() -> &'static str {
+    tr!("この結果を閉じる", "Close these results")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -891,6 +997,26 @@ mod tests {
                 xref_count(3),
                 xref_more(5),
                 xref_close().to_string(),
+                // #1694: search ビュー
+                search_placeholder().to_string(),
+                search_case_toggle().to_string(),
+                search_regex_toggle().to_string(),
+                search_empty().to_string(),
+                search_scope(&["/w".into()]),
+                search_scope(&["/a".into(), "/b".into()]),
+                search_searching("needle"),
+                search_none().to_string(),
+                search_count(3, 2),
+                search_stopped_limit(2000),
+                search_stopped_time(30),
+                search_stopped_cancelled().to_string(),
+                search_skipped(1, 2, 3),
+                search_error_empty().to_string(),
+                search_error_newline().to_string(),
+                search_error_regex("unclosed group"),
+                search_failed("x"),
+                search_more(5),
+                search_close().to_string(),
             ]
             .into_iter()
             .chain(

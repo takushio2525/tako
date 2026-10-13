@@ -381,6 +381,16 @@ pub trait UiStateHost {
         _view: Option<crate::protocol::PanelViewWire>,
     ) {
     }
+    /// ワークスペース横断検索の結果の置き場（#1694。右パネルの search ビューもこれを読む）。
+    /// 持たない実装（セカンダリ等）は `None` で、`tako search --show` / `--results` / `--open` /
+    /// `--clear` は「使えない」と答える（出さない検索は置き場が無くても答える）
+    fn workspace_search(&self) -> Option<&tako_core::workspace_search::SearchStore> {
+        None
+    }
+    /// 同上の書き込み口（検索を始める・答えを置く・閉じる）
+    fn workspace_search_mut(&mut self) -> Option<&mut tako_core::workspace_search::SearchStore> {
+        None
+    }
     /// tasks ビューでその場に展開しているタスク id（Issue #1479。画面が無い host は `None`）
     fn user_task_expanded(&self) -> Option<String> {
         None

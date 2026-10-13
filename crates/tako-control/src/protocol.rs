@@ -183,12 +183,21 @@ pub enum PanelViewWire {
     Diagnostics,
     /// 参照検索・呼び出し階層・型階層の結果（#1685。一覧 / ツリー。行を押すとその位置へ）
     References,
+    /// ワークスペース横断検索（#1694。検索欄・結果の一覧。行を押すとその位置へ）
+    Search,
 }
 
 impl PanelViewWire {
     /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
-    pub const VALUES: [&'static str; 6] =
-        ["fleet", "orch", "git", "tasks", "diagnostics", "references"];
+    pub const VALUES: [&'static str; 7] = [
+        "fleet",
+        "orch",
+        "git",
+        "tasks",
+        "diagnostics",
+        "references",
+        "search",
+    ];
     /// 後方互換のみで受理する旧称と現行値の対応（#553）
     pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
 
@@ -200,6 +209,7 @@ impl PanelViewWire {
             PanelViewWire::Tasks => "tasks",
             PanelViewWire::Diagnostics => "diagnostics",
             PanelViewWire::References => "references",
+            PanelViewWire::Search => "search",
         }
     }
 
@@ -212,6 +222,7 @@ impl PanelViewWire {
             "tasks" => Some(PanelViewWire::Tasks),
             "diagnostics" => Some(PanelViewWire::Diagnostics),
             "references" => Some(PanelViewWire::References),
+            "search" => Some(PanelViewWire::Search),
             _ => None,
         }
     }
@@ -231,6 +242,7 @@ impl PanelViewWire {
             PanelViewWire::Tasks => "人がやること（承認待ち・レビュー・投稿）の一覧と返答",
             PanelViewWire::Diagnostics => "言語サーバの診断（エラー・警告）の一覧",
             PanelViewWire::References => "参照・呼び出し階層・型階層の結果（一覧 / ツリー）",
+            PanelViewWire::Search => "ワークスペース横断検索の検索欄と結果の一覧",
         }
     }
 
@@ -1072,6 +1084,41 @@ pub enum Request {
         case_sensitive: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         whole_word: Option<bool>,
+    },
+    /// ワークスペース横断検索（FR-3.43 / #1694。`tako search` = MCP `tako_search`）。
+    /// GUI の ⇧⌘F の検索欄・右パネルの search ビューの行のクリック・見出しの × と同じ口。
+    ///
+    /// `action`: `search`（探す。`query` 必須）/ `results`（右パネルの結果を読む）/
+    /// `open`（右パネルの結果の `item` 番目を開く = 行のクリック）/ `clear`（結果を閉じる・
+    /// 走っている検索を取り消す = 見出しの ×）。
+    ///
+    /// 探す範囲は `path`（CLI は自分の cwd 基準の絶対パスへ直して詰める）→ 省略なら `pane`
+    /// （省略は呼び出し元 → フォーカス）のタブのファイルツリーのルート（サイドバーと同じ 1 実装）。
+    /// 条件は `regex`（既定 false = 文字どおり）と `case_sensitive`（既定 false = 区別しない）。
+    /// `show` で右パネルの search ビューにも出す（出した結果だけが `results` / `open` の対象。
+    /// 出さない検索は応答を返すだけで画面の結果を上書きしない）。`limit` は応答に載せる行の数
+    /// （既定 100・0 = 全部。保持の上限は `tako_core::workspace_search::MAX_RESULTS`）。
+    /// `focus` は `open` で着地したペインへフォーカスを移すか
+    WorkspaceSearch {
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        regex: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        case_sensitive: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<bool>,
     },
     /// 自動保存設定の取得・変更（#195）。enabled 省略時は状態取得のみ
     PreviewAutosave {
@@ -2622,6 +2669,9 @@ pub fn changes_layout(request: &Request) -> bool {
         // ファイルツリーの選択（#1908）。読むだけ・行を選ぶだけは偽、キーは Enter でファイルを
         // 開く（ペインが生える）ので真（← / → の開閉は払うのが 1 フレームだけ）
         Request::TreeSelection { key, .. } => key.is_some(),
+        // ワークスペース横断検索（#1694）。`show` は右パネルを出し（ペインの面積が変わる）、
+        // `open` は別のファイルなら新しいペインを生やす。出さない検索・読むだけは偽
+        Request::WorkspaceSearch { action, show, .. } => action == "open" || *show == Some(true),
         // --- ペインの木・寸法そのもの ---
         Request::Split { .. }
         | Request::Close { .. }
@@ -3145,10 +3195,19 @@ mod tests {
         assert_eq!(PanelViewWire::Tasks.as_str(), "tasks");
         assert_eq!(PanelViewWire::Diagnostics.as_str(), "diagnostics");
         assert_eq!(PanelViewWire::References.as_str(), "references");
+        assert_eq!(PanelViewWire::Search.as_str(), "search");
         // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
         assert_eq!(
             PanelViewWire::VALUES,
-            ["fleet", "orch", "git", "tasks", "diagnostics", "references"]
+            [
+                "fleet",
+                "orch",
+                "git",
+                "tasks",
+                "diagnostics",
+                "references",
+                "search"
+            ]
         );
         assert!(!PanelViewWire::VALUES.contains(&"tmux"));
     }
@@ -3171,6 +3230,8 @@ mod tests {
             PanelViewWire::parse("references"),
             Some(PanelViewWire::References)
         );
+        // #1694: ワークスペース横断検索のビュー
+        assert_eq!(PanelViewWire::parse("search"), Some(PanelViewWire::Search));
         assert_eq!(PanelViewWire::parse("task"), None);
         assert_eq!(PanelViewWire::parse("fleets"), None);
         assert_eq!(PanelViewWire::parse(""), None);
@@ -3197,7 +3258,7 @@ mod tests {
         let hint = PanelViewWire::values_hint();
         assert_eq!(
             hint,
-            "fleet | orch | git | tasks | diagnostics | references。tmux は fleet の旧称"
+            "fleet | orch | git | tasks | diagnostics | references | search。tmux は fleet の旧称"
         );
     }
 
@@ -3224,6 +3285,7 @@ mod tests {
                 "tasks",
                 "diagnostics",
                 "references",
+                "search",
                 "tmux"
             ]
         );

@@ -56,6 +56,7 @@ mod preview_watch;
 mod references_panel;
 mod remote_panel;
 mod right_panel;
+mod search_panel;
 mod settings_sleep;
 mod settings_window;
 mod sidebar;
@@ -396,9 +397,10 @@ impl ScrollCtl {
 // （FR-3.23。既定幅は settings::default_sidebar_width() = 244）。#789: ドラッグ経路と
 // dispatch 経路で規則を食い違わせないため、tako-app 側に定数を持たない
 
-/// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）
+/// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）。最小幅は条件つきのタブが
+/// 3 本とも出た 7 本 + 3 桁のバッジがアイコンだけの段で収まる幅（#1694 で 220 → 240）
 const PANEL_DEFAULT_WIDTH: f32 = 320.0;
-const PANEL_MIN_WIDTH: f32 = 220.0;
+const PANEL_MIN_WIDTH: f32 = 240.0;
 
 /// ペイン上部タイトルバーの高さ（px。デザインスペック: 30px）
 const PANE_TITLE_BAR: f32 = 32.0;
@@ -456,6 +458,8 @@ enum PanelView {
     Diagnostics,
     /// 参照検索・呼び出し階層・型階層の結果（#1685）。タブは結果があるときだけ出す
     References,
+    /// ワークスペース横断検索（#1694）。タブは結果があるか、このビューを選んでいるときだけ出す
+    Search,
 }
 
 /// プレビューヘッダから開くナビゲーションドロップダウン（Issue #232）。
@@ -1435,6 +1439,9 @@ enum AppTextInput {
     /// Web dock の URL 欄（#207 / #1750）。確定だけは欄に入る一方、下線・候補窓は
     /// ターミナルに出て、未確定のまま確定（unmark）した文字列はターミナルの PTY へ流れていた
     WebDockUrl,
+    /// 右パネルの横断検索の検索欄（#1694）。#1725 / #1750 と同じ理由で最初から宛先に入れる
+    /// （入れないとかなモードの変換がターミナルへ出る）
+    WorkspaceSearch,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -2182,6 +2189,11 @@ struct TakoApp {
     lsp_xref: tako_core::lsp::xref::XrefStore,
     /// 参照・階層の GUI の状態（問い合わせ中の印・子を問い合わせているノード）
     lsp_xref_ui: references_panel::XrefUi,
+    /// ワークスペース横断検索の結果（#1694。最後に出した 1 回ぶん・閉じたら手放す）。
+    /// 右パネルの search ビューと CLI / MCP の `tako search --results` 等が dispatch 経由でこの 1 つを読み書きする
+    workspace_search: tako_core::workspace_search::SearchStore,
+    /// 横断検索の検索欄とトグル（#1694。画面の持ち物）
+    search_ui: search_panel::SearchUi,
     /// tako mod（FR-2.42 / #1879）: 展開先・claude の版の控え・ペインごとの注入と最終報告。
     /// **メモリだけ**（永続化しない）。報告は dispatch の `tako mod report` が書き込む
     claude_mod: tako_core::claude_mod::ModHub,
@@ -4544,6 +4556,8 @@ impl TakoApp {
             lsp_hover: lsp_hover_ui::LspHoverUi::default(),
             lsp_xref: Default::default(),
             lsp_xref_ui: Default::default(),
+            workspace_search: Default::default(),
+            search_ui: Default::default(),
             claude_mod: initial_claude_mod(),
             autorename: autorename::AutoRenamer::new(initial_auto_rename()),
             auto_title_hints: HashMap::new(),
@@ -10107,6 +10121,8 @@ impl TakoApp {
         self.git_branch_input = None;
         // #1450 B2: 返答コメント欄も同じ経路で落とす（IME の宛先を 1 つに保つ）
         self.user_tasks.comment_focused = false;
+        // #1694: 横断検索の検索欄も同じ
+        self.search_ui.focused = false;
         self.git_agent_menu_open = false;
         // #1750: Web の 2 つの URL 欄は閉じる出口を通す（その欄宛ての変換も捨てる）
         self.blur_web_dock_url();
@@ -12561,6 +12577,8 @@ impl TakoApp {
             "format-selection",
             // #1681: カーソル位置のホバー情報（編集メニューと同じ）
             "show-hover",
+            // #1694: ワークスペース横断検索（編集メニューと同じ）
+            "find-in-files",
         ];
         for id in COMMANDS {
             items.push(PaletteItem::Command(
@@ -12667,6 +12685,7 @@ impl TakoApp {
                 "format-document" => self.format_focused_preview(false, cx),
                 "format-selection" => self.format_focused_preview(true, cx),
                 "show-hover" => self.show_hover_at_cursor(cx),
+                "find-in-files" => self.open_find_in_files(cx),
                 _ => {}
             },
             PaletteItem::SshHost(host, into_pane) => {
@@ -15954,6 +15973,11 @@ impl TakoApp {
             self.task_comment_insert(&text, cx);
             return;
         }
+        // #1694: 横断検索の検索欄（⌘V はここへ来る）
+        if self.search_input_active() {
+            self.search_insert(&text, cx);
+            return;
+        }
         let pane_id = self.focused_pane();
         if self
             .preview_edits
@@ -16026,6 +16050,8 @@ impl TakoApp {
             || (self.user_tasks.comment_focused
                 && self.panel_visible
                 && self.panel_view == PanelView::Tasks)
+            // #1694: 横断検索の検索欄も同じ
+            || self.search_input_active()
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
@@ -16093,6 +16119,14 @@ impl TakoApp {
             self.user_tasks.comment_focused = false;
         }
         if self.user_tasks.comment_focused && self.handle_task_comment_key(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        // #1694: 横断検索の検索欄。**見えないのにフラグが残る**経路を同じ形で塞ぐ
+        if !self.panel_visible || self.panel_view != PanelView::Search {
+            self.search_ui.focused = false;
+        }
+        if self.search_ui.focused && self.handle_search_key(keystroke, cx) {
             cx.stop_propagation();
             return;
         }
@@ -16415,6 +16449,10 @@ impl TakoApp {
         {
             return Some(AppTextInput::TaskComment);
         }
+        // #1694: 横断検索の検索欄も「見えているときだけ」（打鍵の振り分けと同じ判定）
+        if self.search_input_active() {
+            return Some(AppTextInput::WorkspaceSearch);
+        }
         if legacy_1750 {
             return None;
         }
@@ -16442,6 +16480,7 @@ impl TakoApp {
             AppTextInput::Palette => self.palette_insert(text, cx),
             AppTextInput::WebAddress => self.web_address_insert(text, cx),
             AppTextInput::WebDockUrl => self.web_dock_url_insert(text, cx),
+            AppTextInput::WorkspaceSearch => self.search_insert(text, cx),
         }
     }
 
@@ -24472,8 +24511,18 @@ impl UiStateHost for TakoApp {
             PanelView::Tasks => tako_control::protocol::PanelViewWire::Tasks,
             PanelView::Diagnostics => tako_control::protocol::PanelViewWire::Diagnostics,
             PanelView::References => tako_control::protocol::PanelViewWire::References,
+            PanelView::Search => tako_control::protocol::PanelViewWire::Search,
         };
         (self.panel_visible, self.panel_width, view)
+    }
+
+    /// #1694: 横断検索の結果の置き場（右パネルの search ビューが読むのと同じ 1 つ）
+    fn workspace_search(&self) -> Option<&tako_core::workspace_search::SearchStore> {
+        Some(&self.workspace_search)
+    }
+
+    fn workspace_search_mut(&mut self) -> Option<&mut tako_core::workspace_search::SearchStore> {
+        Some(&mut self.workspace_search)
     }
 
     /// #1479: tasks ビューで展開中のタスク id（`tako todo list` の応答に載る）
@@ -24528,6 +24577,7 @@ impl UiStateHost for TakoApp {
                 tako_control::protocol::PanelViewWire::Tasks => PanelView::Tasks,
                 tako_control::protocol::PanelViewWire::Diagnostics => PanelView::Diagnostics,
                 tako_control::protocol::PanelViewWire::References => PanelView::References,
+                tako_control::protocol::PanelViewWire::Search => PanelView::Search,
             };
         }
         // #503: パネルが非表示になったらテキスト入力フラグをクリア
@@ -26761,6 +26811,15 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
+        // #1694: 横断検索の検索欄（同じ理由でここを通す）
+        if self.search_input_active() {
+            if !text.is_empty() {
+                self.search_insert(text, cx);
+            }
+            self.ime = None;
+            cx.notify();
+            return;
+        }
         // #1750: Web のアドレスバー / dock の URL 欄（変換を経ない直接の insertText もここ。
         // 宛先は打鍵・変換と同じ判定で決め、挿入は 4 経路で共有の 1 関数を通す）
         let web_input = if self.web_address_bar_editing().is_some() {
@@ -28249,6 +28308,7 @@ impl Render for TakoApp {
                     // #503: テキスト入力フラグの一括クリア
                     let had = this.git_commit_input_focused
                         || this.user_tasks.comment_focused
+                        || this.search_ui.focused
                         || this.git_branch_input.is_some()
                         || this.git_agent_menu_open
                         || this.webview_dock_url_focused
@@ -28332,6 +28392,8 @@ impl Render for TakoApp {
             }))
             .on_action(cx.listener(|this, _: &JumpBack, _, cx| this.jump_step("back", cx)))
             .on_action(cx.listener(|this, _: &JumpForward, _, cx| this.jump_step("forward", cx)))
+            // #1694: ワークスペース横断検索の検索欄を開く（⇧⌘F / Windows は Ctrl+Shift+G）
+            .on_action(cx.listener(|this, _: &FindInFiles, _, cx| this.open_find_in_files(cx)))
             .on_action(cx.listener(|this, _: &FindPreview, _, cx| {
                 let pane_id = this.focused_pane();
                 // #1873: 開閉は CLI / MCP（`PreviewSearch` の `visible`）と同じ 2 つの口を通る。
@@ -28916,6 +28978,8 @@ fn edit_menu() -> gpui::Menu {
         MenuItem::action(m::select_all(), SelectAll),
         MenuItem::separator(),
         MenuItem::action(m::find(), FindPreview),
+        // #1694: ワークスペース横断検索（右パネルの search ビュー）
+        MenuItem::action(m::find_in_files(), FindInFiles),
         // #1683: 言語サーバの整形（範囲は選択範囲。undo 1 回で戻る）
         MenuItem::separator(),
         MenuItem::action(m::format_document(), FormatDocument),
@@ -30370,6 +30434,12 @@ mod self_test {
     mod preview_memory_2009;
     #[cfg(feature = "visual-test")]
     use preview_memory_2009::preview_memory_visual;
+    /// #1694: ⇧⌘F → 打鍵 → Enter → 結果の行の ⌘クリックで新しいペイン・× で保持 0
+    /// （visual-test `workspace-search-1694`）
+    #[cfg(feature = "visual-test")]
+    mod workspace_search_1694;
+    #[cfg(feature = "visual-test")]
+    use workspace_search_1694::workspace_search_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -44821,6 +44891,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1694: 横断検索の ⇧⌘F → Enter → 行の ⌘クリックで新しいペインが 1 枚増え該当行が見える
+                "workspace-search-1694" => {
+                    workspace_search_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -44834,7 +44910,8 @@ mod self_test {
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
-                         background-drawer / show-command-caller / tasks-input / preview-memory）"
+                         background-drawer / show-command-caller / tasks-input / preview-memory / \
+                         workspace-search-1694）"
                     );
                     std::process::exit(1);
                 }

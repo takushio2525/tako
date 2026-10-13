@@ -1144,6 +1144,209 @@ fn source_gone_json(kind: tako_core::lsp::goto::GotoKind, mut out: Value) -> Val
     out
 }
 
+/// 横断検索の置き場を持たない host（セカンダリ等）の答え（#1694）
+fn workspace_search_unavailable() -> DispatchError {
+    DispatchError::Operation(
+        "この tako には右パネルの検索結果が無い（GUI のプライマリで使う。出さない検索は使える）"
+            .into(),
+    )
+}
+
+/// 横断検索の準備（UI スレッド。#1694）。探す範囲を決め、`show` なら置き場へ登録して右パネルを
+/// search ビューで開く（走っているあいだ「検索しています」を出す）。走査はしない
+#[allow(clippy::too_many_arguments)]
+fn workspace_search_prepare(
+    host: &mut dyn ControlHost,
+    query: Option<&str>,
+    path: Option<&str>,
+    pane: Option<u64>,
+    regex: Option<bool>,
+    case_sensitive: Option<bool>,
+    show: Option<bool>,
+    limit: Option<usize>,
+) -> Result<crate::workspace_search::WorkspaceSearchJob, DispatchError> {
+    use tako_core::workspace_search::{Options, Query};
+    let text = query
+        .ok_or_else(|| DispatchError::InvalidParams("search には query（検索語）が要る".into()))?;
+    let query = Query {
+        text: text.to_string(),
+        regex: regex.unwrap_or(false),
+        case_sensitive: case_sensitive.unwrap_or(false),
+    };
+    let roots = workspace_search_roots(host, path, pane)?;
+    let options = Options::new(roots);
+    let (show, cancel) = if show == Some(true) {
+        let store = host
+            .workspace_search_mut()
+            .ok_or_else(workspace_search_unavailable)?;
+        let (seq, cancel) = store.begin(query.clone(), options.roots.clone());
+        host.set_panel(
+            Some(true),
+            None,
+            Some(crate::protocol::PanelViewWire::Search),
+        );
+        (Some(seq), cancel)
+    } else {
+        (None, Default::default())
+    };
+    Ok(crate::workspace_search::WorkspaceSearchJob {
+        query,
+        options,
+        cancel,
+        show,
+        limit,
+    })
+}
+
+/// 横断検索の範囲（#1694）。`path` があればそれ（相対は対象ペインの cwd 基準）、無ければ
+/// 対象ペイン（省略は呼び出し元 → フォーカス）のタブのファイルツリーのルート
+/// （サイドバーと `tako tree git-status` と同じ [`tree_roots_of_tab`] の 1 実装）
+fn workspace_search_roots(
+    host: &dyn ControlHost,
+    path: Option<&str>,
+    pane: Option<u64>,
+) -> Result<Vec<PathBuf>, DispatchError> {
+    if let Some(p) = path {
+        let mut dir = PathBuf::from(p);
+        if dir.is_relative() {
+            let (_, target) = resolve_pane_or_active(host.workspace(), pane)?;
+            let base = host.session(target).and_then(|s| s.cwd()).ok_or_else(|| {
+                DispatchError::InvalidParams(format!(
+                    "相対パス {p} の基準（ペインの cwd）が分からない。絶対パスで渡す"
+                ))
+            })?;
+            dir = base.join(dir);
+        }
+        if !dir.is_dir() {
+            return Err(DispatchError::InvalidParams(format!(
+                "ディレクトリが存在しない: {}",
+                dir.display()
+            )));
+        }
+        return Ok(vec![dir]);
+    }
+    let (tab, _) = resolve_pane_or_active(host.workspace(), pane)?;
+    // ホーム・ファイルシステムのルートは暗黙の範囲にしない（新しいタブの cwd は既定でホーム =
+    // 何気ない ⇧⌘F + Enter がホーム全体を上限まで走査する）。明示の `path` なら探す
+    let home =
+        tako_core::paths::home_dir().map(|h| tako_core::platform::path::canonicalize_or_self(&h));
+    let roots: Vec<PathBuf> = tree_roots_of_tab(host, tab)
+        .into_iter()
+        .filter(|root| {
+            let canon = tako_core::platform::path::canonicalize_or_self(root);
+            canon.parent().is_some() && Some(&canon) != home.as_ref()
+        })
+        .collect();
+    if roots.is_empty() {
+        return Err(DispatchError::InvalidParams(
+            "探す範囲がホーム（またはルート）だけになる。フォルダへ cd するか、\
+             ファイルツリーにフォルダを足す（tako tree add <フォルダ>）か、path で範囲を渡す"
+                .into(),
+        ));
+    }
+    Ok(roots)
+}
+
+/// 横断検索の答えを返す（UI スレッド。#1694）。出す検索は置き場へ置き（追い越された答えは
+/// 置かない = 応答の `shown: false`）、照合器を組めなかったら理由を置き場に残す
+pub fn workspace_search_land(
+    host: &mut dyn ControlHost,
+    landing: crate::workspace_search::WorkspaceSearchLanding,
+) -> Result<Value, DispatchError> {
+    let Some(seq) = landing.show else {
+        return landing.reply();
+    };
+    let Some(store) = host.workspace_search_mut() else {
+        return landing.reply();
+    };
+    match landing.result {
+        Err(e) => {
+            let reason = e.reason();
+            store.fail(seq, e);
+            Err(DispatchError::InvalidParams(reason))
+        }
+        Ok(outcome) => {
+            let mut out = crate::workspace_search::outcome_json(
+                &landing.query,
+                &landing.roots,
+                &outcome,
+                landing.limit,
+            );
+            let placed = store.finish(seq, outcome);
+            if !placed {
+                // 待つあいだに次の検索が始まった / 閉じられた
+                out["stopped"] = json!(tako_core::workspace_search::Stop::Cancelled.slug());
+            }
+            out["shown"] = json!(placed);
+            out["retained"] = json!(store.retained());
+            Ok(out)
+        }
+    }
+}
+
+/// 右パネルの結果の `item` 番目を開く（UI スレッド。#1694 = 行のクリック）。
+/// 開き方は定義ジャンプ・参照の行と同じ [`land_on_place`] の 1 本（`plan_landing`: 起点のペインが
+/// 同じファイル = そのペイン / 同じタブで開いている = そのペイン / それ以外 = 新しいペインを右へ）で、
+/// [`open_file`] の行指定（= ジャンプ履歴へ積む。起点は `pane`、省略は呼び出し元 → フォーカス）を通す
+fn workspace_search_open(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    item: Option<usize>,
+    pane: Option<u64>,
+    focus: Option<bool>,
+) -> Result<Value, DispatchError> {
+    use tako_core::lsp::goto::Placement;
+    let item = item.ok_or_else(|| {
+        DispatchError::InvalidParams("open には item（結果の id。1 始まり）が要る".into())
+    })?;
+    let store = host
+        .workspace_search()
+        .ok_or_else(workspace_search_unavailable)?;
+    let shown = store.shown().ok_or_else(|| {
+        DispatchError::InvalidParams(
+            "右パネルに検索結果が無い（tako search <検索語> --show で出してから開く）".into(),
+        )
+    })?;
+    let total = shown.outcome.hits.len();
+    let hit = item
+        .checked_sub(1)
+        .and_then(|i| shown.outcome.hits.get(i))
+        .cloned()
+        .ok_or_else(|| {
+            DispatchError::InvalidParams(format!("item {item} は結果（{total} 件）の外"))
+        })?;
+    let (tab, source) = resolve_pane_or_active(host.workspace(), pane)?;
+    let source_path = host
+        .preview_state(source)
+        .map(|(path, _)| path)
+        .unwrap_or_default();
+    // 結果の行・桁は 1 始まり（桁は文字数）、`land_on_place` は 0 始まりを受けて `open_file` で
+    // 1 始まりへ戻す（= 渡る値は寄せる前と同じ）
+    let (plan, opened) = land_on_place(
+        host,
+        origin,
+        PlaceLanding {
+            source_pane: source,
+            source_path: &source_path,
+            tab,
+            path: &hit.path,
+            line: hit.line.saturating_sub(1),
+            char_column: hit.column.saturating_sub(1),
+            placement: Placement::Auto,
+            focus,
+        },
+    )?;
+    Ok(json!({
+        "status": "opened",
+        "item": item,
+        "path": hit.path.display().to_string(),
+        "line": hit.line,
+        "column": hit.column,
+        "landing": plan.slug(),
+        "open": opened,
+    }))
+}
+
 /// 整形（FR-3.33 / #1683）の問い合わせ。UI スレッドで [`lsp_format_prepare`] が作り、
 /// [`LspFormatJob::run`] を背景で走らせ、答えを載せた [`LspFormatLanding`] を UI スレッドの
 /// [`lsp_format_land`] へ戻す（GUI の ⇧⌘I / メニュー・CLI・MCP・保存時整形が同じ 3 段を通る）
@@ -2528,6 +2731,10 @@ pub enum OffloadJob {
         row: usize,
         col: usize,
     },
+    /// ワークスペース横断検索（#1694）。UI スレッドでは探す範囲（workspace を読む）と右パネルへ
+    /// 出す検索の登録だけを行い、走査と照合は background。出す検索の答えを置き場へ置くのは
+    /// [`OffloadContinuation::WorkspaceSearch`] で UI スレッドへ戻す
+    WorkspaceSearch(Box<crate::workspace_search::WorkspaceSearchJob>),
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -2621,6 +2828,8 @@ pub enum OffloadContinuation {
     /// 先取りした答えで dispatch する（#1984）。答えがまだ足りなければ [`land_offload`] が
     /// もう一巡 background へ出す
     Probed(Box<ProbedRequest>),
+    /// 右パネルへ出す横断検索の答えを置き場へ置く（[`workspace_search_land`]。#1694）
+    WorkspaceSearch(Box<crate::workspace_search::WorkspaceSearchLanding>),
 }
 
 impl OffloadContinuation {
@@ -2683,6 +2892,7 @@ pub fn finish_offload(
             } = *probed;
             with_ui_probes(&probes, || dispatch(host, request, origin))
         }
+        OffloadContinuation::WorkspaceSearch(landing) => workspace_search_land(host, *landing),
     }
 }
 
@@ -2856,6 +3066,31 @@ pub fn prepare_offload(
                 limit: *limit,
             }))
         }
+        // #1694: 横断検索の走査と照合は UI スレッドで走らせない。ここでは探す範囲の解決
+        // （workspace を読む）と右パネルへ出す検索の登録だけを行う
+        Request::WorkspaceSearch {
+            action,
+            query,
+            path,
+            pane,
+            regex,
+            case_sensitive,
+            show,
+            limit,
+            ..
+        } if action == "search" => Some(
+            workspace_search_prepare(
+                host,
+                query.as_deref(),
+                path.as_deref(),
+                *pane,
+                *regex,
+                *case_sensitive,
+                *show,
+                *limit,
+            )
+            .map(|job| OffloadJob::WorkspaceSearch(Box::new(job))),
+        ),
         // #1678: manager を持たない host は同期実行へ落として「使えない」を返す
         Request::LspServer { action, name } => host.lsp().map(|manager| {
             Ok(OffloadJob::Lsp {
@@ -3112,6 +3347,16 @@ impl OffloadJob {
             OffloadJob::List { socket } => OffloadOutcome::OnUi(OffloadContinuation::List(
                 tako_core::tmux::list_windows_by_session(Some(&socket)),
             )),
+            // #1694: 出さない検索は答えをそのまま返す（置き場に触らない）。出す検索は置き場へ
+            // 置くために UI スレッドへ戻す
+            OffloadJob::WorkspaceSearch(job) => {
+                let landing = job.run();
+                if landing.show.is_some() {
+                    OffloadOutcome::OnUi(OffloadContinuation::WorkspaceSearch(Box::new(landing)))
+                } else {
+                    OffloadOutcome::Reply(landing.reply())
+                }
+            }
             OffloadJob::Probe(job) => {
                 let ProbeJob {
                     request,
@@ -3221,6 +3466,9 @@ impl OffloadJob {
             OffloadJob::LspMenu(job) => Ok(job.run().to_json()),
             OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
                 "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::WorkspaceSearch(_) => Err(DispatchError::Operation(
+                "横断検索は run_staged で走らせる（出す検索は置き場へ置く続きが要る）".into(),
             )),
             OffloadJob::LspFormat(_) => Err(DispatchError::Operation(
                 "整形は run_staged で走らせる（当てるのに UI スレッドの続きが要る）".into(),
@@ -6708,6 +6956,53 @@ fn dispatch_inner(
             )?;
             lsp_goto_land(host, origin, &job.run())
         }
+
+        // #1694: 通常は prepare_offload が `search` を background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 走査 → 置く）を直列に通る。
+        // results / open / clear は置き場を読み書きするだけ（UI スレッドで足りる）
+        Request::WorkspaceSearch {
+            action,
+            query,
+            path,
+            pane,
+            regex,
+            case_sensitive,
+            show,
+            limit,
+            item,
+            focus,
+        } => match action.as_str() {
+            "search" => {
+                let job = workspace_search_prepare(
+                    host,
+                    query.as_deref(),
+                    path.as_deref(),
+                    pane,
+                    regex,
+                    case_sensitive,
+                    show,
+                    limit,
+                )?;
+                workspace_search_land(host, job.run())
+            }
+            "results" => Ok(crate::workspace_search::store_json(
+                host.workspace_search()
+                    .ok_or_else(workspace_search_unavailable)?,
+                limit,
+            )),
+            "open" => workspace_search_open(host, origin, item, pane, focus),
+            "clear" => {
+                let store = host
+                    .workspace_search_mut()
+                    .ok_or_else(workspace_search_unavailable)?;
+                let cleared = store.clear();
+                Ok(json!({ "cleared": cleared, "retained": store.retained() }))
+            }
+            other => Err(DispatchError::InvalidParams(format!(
+                "不明な action: {other:?}（{} のいずれか）",
+                crate::workspace_search::ACTIONS.join(" / ")
+            ))),
+        },
 
         // #1683: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
         // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 問い合わせ → 当てる）を直列に通る
@@ -21352,6 +21647,8 @@ mod tests {
         /// tasks ビューで展開中のタスク id
         panel: (bool, f32, crate::protocol::PanelViewWire),
         user_task_expanded: Option<String>,
+        /// #1694: 横断検索の結果の置き場（GUI の `TakoApp::workspace_search` の代役）
+        workspace_search: tako_core::workspace_search::SearchStore,
         /// #549: ウェルカムバナーの表示状態
         welcome_banner: bool,
         /// #600: 入力予測（既定 ON）
@@ -21434,6 +21731,7 @@ mod tests {
                 detached_markers: Vec::new(),
                 panel: (false, 0.0, crate::protocol::PanelViewWire::Fleet),
                 user_task_expanded: None,
+                workspace_search: Default::default(),
                 previews: std::collections::HashMap::new(),
                 preview_lines: std::collections::HashMap::new(),
                 jumps: tako_core::jump_history::JumpHistory::default(),
@@ -21791,6 +22089,16 @@ mod tests {
         /// #1479: tasks ビューの展開（GUI の `user_tasks.expanded` の代役）
         fn user_task_expanded(&self) -> Option<String> {
             self.user_task_expanded.clone()
+        }
+
+        fn workspace_search(&self) -> Option<&tako_core::workspace_search::SearchStore> {
+            Some(&self.workspace_search)
+        }
+
+        fn workspace_search_mut(
+            &mut self,
+        ) -> Option<&mut tako_core::workspace_search::SearchStore> {
+            Some(&mut self.workspace_search)
         }
 
         fn set_user_task_expanded(&mut self, id: Option<String>) {
@@ -26504,6 +26812,357 @@ mod tests {
         let back = jump_call(&mut host, "back", Some(root), None);
         assert_eq!(back["open"]["pane"].as_u64(), Some(source));
         assert_eq!(back["open"]["line"], json!(12));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1694: IPC の受け口と同じ 3 段（`prepare_offload` → `run_staged` → `finish_offload`）で
+    /// 要求を通す（UI スレッドで走査しない経路そのもの）。background へ出ない要求は同期の dispatch
+    fn offloaded(host: &mut MockHost, request: Request) -> Result<Value, DispatchError> {
+        match prepare_offload(host, &request) {
+            None => dispatch(host, request, PaneOrigin::Cli),
+            Some(Err(e)) => Err(e),
+            Some(Ok(job)) => match job.run_staged() {
+                OffloadOutcome::Reply(result) => result,
+                OffloadOutcome::OnUi(next) => finish_offload(host, next, PaneOrigin::Cli),
+            },
+        }
+    }
+
+    /// #1694 の横断検索の要求を組む（action と、変えたい引数だけを書く）
+    #[derive(Default)]
+    struct Ws {
+        action: &'static str,
+        query: Option<String>,
+        path: Option<String>,
+        pane: Option<u64>,
+        regex: Option<bool>,
+        case_sensitive: Option<bool>,
+        show: Option<bool>,
+        limit: Option<usize>,
+        item: Option<usize>,
+    }
+
+    impl Ws {
+        fn req(self) -> Request {
+            Request::WorkspaceSearch {
+                action: self.action.into(),
+                query: self.query,
+                path: self.path,
+                pane: self.pane,
+                regex: self.regex,
+                case_sensitive: self.case_sensitive,
+                show: self.show,
+                limit: self.limit,
+                item: self.item,
+                focus: None,
+            }
+        }
+    }
+
+    fn search_fixture(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-dispatch-search-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn main() {\n    // needle here\n    let needle = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.txt"), "Needle upper\n").unwrap();
+        std::fs::write(dir.join("bin.dat"), b"needle\0\x01").unwrap();
+        tako_core::platform::path::canonicalize(&dir).unwrap()
+    }
+
+    /// #1694: 出さない検索は答えだけ（右パネルの結果を上書きしない）→ `show` で置き場へ置き右パネルを
+    /// search ビューで開く → `results` で読む → `open` で新しいペインのその行へ（2 回目は使い回す）→
+    /// `clear` で保持 0。すべて IPC と同じ 3 段で通す
+    #[test]
+    fn 横断検索は出して読んで開いて閉じる() {
+        let dir = search_fixture("flow");
+        let mut host = MockHost::new();
+        let path = Some(dir.display().to_string());
+
+        // 1. 出さない検索（既定は大文字小文字を区別しない）: 3 件・バイナリ 1 つは探さない
+        let quiet = offloaded(
+            &mut host,
+            Ws {
+                query: Some("needle".into()),
+                path: path.clone(),
+                action: "search",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(quiet["status"], json!("found"));
+        assert_eq!(quiet["total"], json!(3));
+        assert_eq!(quiet["skipped"]["binary"], json!(1));
+        let rows: Vec<(String, u64, u64)> = quiet["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    std::path::Path::new(i["path"].as_str().unwrap())
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    i["line"].as_u64().unwrap(),
+                    i["column"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("a.rs".into(), 2, 8),
+                ("a.rs".into(), 3, 9),
+                ("b.txt".into(), 1, 1)
+            ]
+        );
+        assert!(
+            host.workspace_search.is_empty(),
+            "出さない検索は置き場に触らない"
+        );
+        assert!(!host.panel.0, "出さない検索は右パネルを開かない");
+
+        // 2. 区別する: Needle を落として 2 件
+        let sensitive = offloaded(
+            &mut host,
+            Ws {
+                query: Some("needle".into()),
+                path: path.clone(),
+                case_sensitive: Some(true),
+                action: "search",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(sensitive["total"], json!(2));
+
+        // 3. 出す検索: 置き場へ置き、右パネルを search ビューで開く。応答の行は limit で切る
+        let shown = offloaded(
+            &mut host,
+            Ws {
+                query: Some("needle".into()),
+                path: path.clone(),
+                show: Some(true),
+                limit: Some(1),
+                action: "search",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(shown["shown"], json!(true));
+        assert_eq!(shown["retained"], json!(3));
+        assert_eq!(shown["items"].as_array().unwrap().len(), 1);
+        assert_eq!(shown["truncated"], json!(2));
+        assert_eq!(
+            host.panel,
+            (true, 0.0, crate::protocol::PanelViewWire::Search)
+        );
+
+        // 4. results で読み直せる（全部 = limit 0）
+        let results = offloaded(
+            &mut host,
+            Ws {
+                limit: Some(0),
+                action: "results",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(results["total"], json!(3));
+        assert_eq!(results["query"], json!("needle"));
+        assert_eq!(results["retained"], json!(3));
+        assert_eq!(results["running"], Value::Null);
+        assert_eq!(results["items"][1]["id"], json!(2));
+
+        // 5. open: 別のファイルを見ているペインから 2 番目（a.rs:3）を開く = 新しいペインのその行
+        let before = pane_count(&host);
+        let root = host.root_pane();
+        let opened = offloaded(
+            &mut host,
+            Ws {
+                item: Some(2),
+                pane: Some(root),
+                action: "open",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(opened["status"], json!("opened"));
+        assert_eq!(opened["landing"], json!("new-pane"));
+        assert_eq!(pane_count(&host), before + 1, "ペインが 1 枚増える");
+        let target = opened["open"]["pane"].as_u64().unwrap();
+        assert!(host.previews[&target].0.ends_with("a.rs"));
+        assert_eq!(host.preview_lines[&target], 3, "その行へ着地する");
+
+        // 6. 同じファイルの別の行（1 番目 = a.rs:2）→ ペインは増えず使い回す
+        let again = offloaded(
+            &mut host,
+            Ws {
+                item: Some(1),
+                pane: Some(root),
+                action: "open",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(again["landing"], json!("reused"));
+        assert_eq!(again["open"]["pane"].as_u64(), Some(target));
+        assert_eq!(pane_count(&host), before + 1);
+        assert_eq!(host.preview_lines[&target], 2);
+
+        // 7. 範囲外の item は拒否（ペインは増えない）
+        let out_of_range = offloaded(
+            &mut host,
+            Ws {
+                item: Some(99),
+                action: "open",
+                ..Default::default()
+            }
+            .req(),
+        );
+        assert!(matches!(out_of_range, Err(DispatchError::InvalidParams(_))));
+        assert_eq!(pane_count(&host), before + 1);
+
+        // 8. clear で手放す（保持 0）。results は empty
+        let cleared = offloaded(
+            &mut host,
+            Ws {
+                action: "clear",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(cleared, json!({ "cleared": true, "retained": 0 }));
+        let empty = offloaded(
+            &mut host,
+            Ws {
+                action: "results",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(empty["status"], json!("empty"));
+        assert_eq!(empty["retained"], json!(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1694: 壊れた正規表現・検索語なし・存在しない範囲・不明な action は拒否する。出す検索の
+    /// 壊れた正規表現は置き場に理由を残す（右パネルに出す）。範囲を省けばタブのツリーのルート
+    #[test]
+    fn 横断検索の拒否と範囲の既定() {
+        let dir = search_fixture("refuse");
+        let mut host = MockHost::new();
+        let path = Some(dir.display().to_string());
+        let invalid =
+            |r: Result<Value, DispatchError>| matches!(r, Err(DispatchError::InvalidParams(_)));
+        assert!(
+            invalid(offloaded(
+                &mut host,
+                Ws {
+                    action: "search",
+                    ..Default::default()
+                }
+                .req()
+            )),
+            "検索語なし"
+        );
+        assert!(invalid(offloaded(
+            &mut host,
+            Ws {
+                action: "frobnicate",
+                ..Default::default()
+            }
+            .req()
+        )));
+        assert!(invalid(offloaded(
+            &mut host,
+            Ws {
+                query: Some("x".into()),
+                path: Some(dir.join("nope").display().to_string()),
+                action: "search",
+                ..Default::default()
+            }
+            .req(),
+        )));
+        // 右パネルに結果が無いのに open
+        assert!(invalid(offloaded(
+            &mut host,
+            Ws {
+                item: Some(1),
+                action: "open",
+                ..Default::default()
+            }
+            .req(),
+        )));
+        let broken = offloaded(
+            &mut host,
+            Ws {
+                query: Some("(unclosed".into()),
+                path: path.clone(),
+                regex: Some(true),
+                show: Some(true),
+                action: "search",
+                ..Default::default()
+            }
+            .req(),
+        );
+        assert!(invalid(broken));
+        let results = offloaded(
+            &mut host,
+            Ws {
+                action: "results",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(results["status"], json!("error"));
+        assert!(results["reason"].as_str().unwrap().contains("正規表現"));
+        assert_eq!(results["running"], Value::Null, "走っている印は残らない");
+
+        // 範囲を省いてもホームは探さない（ペインに cwd もピン留めも無い = ルートはホームだけ）
+        let home_only = offloaded(
+            &mut host,
+            Ws {
+                query: Some("needle".into()),
+                action: "search",
+                ..Default::default()
+            }
+            .req(),
+        );
+        assert!(
+            matches!(&home_only, Err(DispatchError::InvalidParams(m)) if m.contains("ホーム")),
+            "{home_only:?}"
+        );
+        // 範囲を省く = タブのファイルツリーのルート（ここではピン留めしたフォルダ）
+        host.ws.active_tab_mut().add_pinned_folder(dir.clone());
+        let default_scope = offloaded(
+            &mut host,
+            Ws {
+                query: Some("needle".into()),
+                action: "search",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(default_scope["roots"], json!([dir.display().to_string()]));
+        assert_eq!(default_scope["total"], json!(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

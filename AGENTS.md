@@ -154,6 +154,7 @@ tako/
 | **定義へ飛ぶ（GUI は ⌘クリック。別ファイルは新しいペイン。#1680）** | `tako lsp definition --pane N --line L --column C` |
 | **編集中のコードを整形する（GUI は ⇧⌘I。undo 1 回で戻る。保存時整形は既定 off。#1683）** | `tako lsp format` |
 | **補完の候補を読む・確定する（GUI は打鍵中に一覧が出る。#1682）** | `tako lsp completion --pane N --line L --column C` |
+| **ワークスペース横断検索（GUI は ⇧⌘F。結果の行を押すとその行を開く。#1694）** | `tako search <検索語>` |
 | **右クリックメニューの言語サーバの項目を読む（GUI は本文の右クリック。#1684）** | `tako lsp menu --pane N --line L --column C` |
 | **その位置の型・doc を読む（GUI は識別子にマウスを乗せるとカード。#1681）** | `tako lsp hover --pane N --line L --column C` |
 | **参照・呼び出し階層・型階層（GUI は右クリック → 右パネル。結果は `tako lsp results`。#1685）** | `tako lsp references --pane N --line L --column C` |

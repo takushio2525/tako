@@ -43,6 +43,11 @@ pub fn cmd_label(id: &str) -> &'static str {
             "ホバー情報を表示（カーソル位置の型・doc）",
             "Show hover (type and docs at the cursor)"
         ),
+        // #1694: ワークスペース横断検索（編集メニューと同じ）
+        "find-in-files" => tr!(
+            "ファイル横断検索（ワークスペース全体から探す）",
+            "Find in files (search the whole workspace)"
+        ),
         // 言語切替は両言語でネイティブ表記を併記（切替先を字面で探せるように）。
         // 英語側に「日本語」を含む意図的な例外のため、訳し漏れ検査の対象外
         "toggle-language" => tr!(
@@ -84,6 +89,7 @@ mod tests {
                 cmd_label("format-document").to_string(),
                 cmd_label("format-selection").to_string(),
                 cmd_label("show-hover").to_string(),
+                cmd_label("find-in-files").to_string(),
                 // toggle-language は意図的にネイティブ表記併記のため対象外（上記コメント）
             ]
         });

@@ -517,6 +517,77 @@ mod tests {
         }
     }
 
+    /// #1694: `tako_search` は action の省略が search・pane の省略が呼び出し元（範囲のタブ / open の
+    /// 起点）。条件と show / limit / item は指定したときだけ渡る（CLI `tako search` と同じ要求）
+    #[test]
+    fn issue1694_横断検索の引数はそのまま渡り省略は既定と呼び出し元() {
+        let (_, requests) = run(call("tako_search", json!({ "query": "needle" })), Some(7), true);
+        assert_eq!(
+            requests,
+            vec![Request::WorkspaceSearch {
+                action: "search".into(),
+                query: Some("needle".into()),
+                path: None,
+                pane: Some(7),
+                regex: None,
+                case_sensitive: None,
+                show: None,
+                limit: None,
+                item: None,
+                focus: None,
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_search",
+                json!({
+                    "query": "a.b", "path": "/w", "regex": true, "case_sensitive": true,
+                    "show": true, "limit": 0,
+                }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::WorkspaceSearch {
+                action: "search".into(),
+                query: Some("a.b".into()),
+                path: Some("/w".into()),
+                pane: None,
+                regex: Some(true),
+                case_sensitive: Some(true),
+                show: Some(true),
+                limit: Some(0),
+                item: None,
+                focus: None,
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_search",
+                json!({ "action": "open", "item": 3, "focus": true }),
+            ),
+            Some(4),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::WorkspaceSearch {
+                action: "open".into(),
+                query: None,
+                path: None,
+                pane: Some(4),
+                regex: None,
+                case_sensitive: None,
+                show: None,
+                limit: None,
+                item: Some(3),
+                focus: Some(true),
+            }]
+        );
+    }
+
     /// #1653: 検索・置換の条件は省略すると wire に載らない（= dispatch が既定で埋める）。
     /// 指定したときだけ CLI（`-i` / `-w`）と同じ値が 1:1 で渡る
     #[test]
@@ -1436,7 +1507,8 @@ mod tests {
         // #1677 の tako_jump（ジャンプ履歴の戻る / 進む / 一覧）を追加して 158
         // #1679 の tako_lsp（言語機能。診断の一覧）を追加して 159。#1680 の定義ジャンプは同じツールの action なので増えない
         // #1879 の tako_mod（Claude Code の mod 連携の状態と切替）を追加して 160
-        assert_eq!(tools.len(), 160);
+        // #1694 の tako_search（ワークスペース横断検索。results / open / clear は同じツールの action）を追加して 161
+        assert_eq!(tools.len(), 161);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");
