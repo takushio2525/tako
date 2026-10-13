@@ -911,7 +911,9 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_preview_cache",
             "description": "PDF・画像・動画サムネのデコード済み画像キャッシュをバイト予算つき LRU で管理する。\
-                max_mb 省略時は現在の上限・使用 bytes・entry 数を返す。変更値は settings.json に永続化する。",
+                max_mb は天井で、実効上限は見えているプレビューの量から決まる。見えていないプレビューは \
+                30 秒でデコード結果・ラスタを手放し、表に戻すと作り直す。max_mb 省略時は上限・使用 bytes・\
+                実効上限・見えている / 見えていないぶん・ペインごとの持ち分を返す。変更値は settings.json に永続化する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

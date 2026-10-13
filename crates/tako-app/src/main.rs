@@ -1919,6 +1919,17 @@ struct ShelfThumb {
     theme_key: (tako_core::Rgb, tako_core::Rgb),
 }
 
+/// 裏で手放した動画プレイヤーの再生状態（#2009）。表に戻したら同じ位置・設定で開き直す
+#[derive(Debug, Clone, Copy)]
+struct VideoResume {
+    position: f64,
+    rate: f32,
+    volume: f32,
+    muted: bool,
+    looping: bool,
+    ended: bool,
+}
+
 /// サムネイルにだけ映っているペインの出力で描き直す間隔（#1946。4 回/秒）
 const SHELF_THUMB_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -2577,6 +2588,17 @@ struct TakoApp {
     preview_image_lru: tako_core::ByteLru<PreviewImageCacheEntryKey>,
     /// LRU / close で外した GPUI asset。次の render 冒頭で atlas と一緒に解放する。
     pending_preview_image_evictions: Vec<std::sync::Arc<gpui::Image>>,
+    /// 設定のキャッシュ上限（天井。#2009）。LRU には見えている量から決めた実効上限を入れる
+    preview_cache_ceiling: u64,
+    /// プレビューのペインが見えなくなった時刻（#2009。見えている間は無い）
+    preview_hidden_since: HashMap<PaneId, std::time::Instant>,
+    /// 見えていない間にデコード結果・ラスタを手放したペイン（#2009。表に戻したら作り直す）
+    preview_released: std::collections::HashSet<PaneId>,
+    /// 手放した回数 / 表に戻して作り直した回数（#2009。単調増加）
+    preview_released_total: u64,
+    preview_restored_total: u64,
+    /// 裏で手放した動画プレイヤーの再生状態（#2009。表に戻したら同じ位置・設定で開き直す）
+    video_resume: HashMap<PaneId, VideoResume>,
     /// Code Runner のプロファイルドロップダウンが開いているペインとアンカー位置
     preview_run_menu: Option<(PaneId, gpui::Point<Pixels>)>,
     /// Code Runner: ペインごとのキャッシュ済みプロファイル一覧（プレビュー読込時に解決）
@@ -4653,6 +4675,12 @@ impl TakoApp {
             preview_image_cache: HashMap::new(),
             preview_image_lru: tako_core::ByteLru::new(initial_preview_cache_budget()),
             pending_preview_image_evictions: Vec::new(),
+            preview_cache_ceiling: initial_preview_cache_budget(),
+            preview_hidden_since: HashMap::new(),
+            preview_released: std::collections::HashSet::new(),
+            preview_released_total: 0,
+            preview_restored_total: 0,
+            video_resume: HashMap::new(),
             preview_run_menu: None,
             preview_run_profiles: HashMap::new(),
             preview_run_selected: HashMap::new(),
@@ -5820,6 +5848,15 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:limit_autoresume");
                         app.drive_limit_autoresume()
                     };
+                    // #2009: 見えていないプレビューを猶予つきで手放し、実効上限を見えている量へ
+                    // 合わせる。手放したら描き直して GPUI の asset / atlas からの解放を流す
+                    // （解放はアプリの render 冒頭 = drain_preview_image_evictions）
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:preview_memory");
+                        if app.sweep_preview_memory(std::time::Instant::now()) {
+                            wcx.notify();
+                        }
+                    }
                     // #1945: ステータスバーの一括ボタンの集計（role の付与・ペインの開閉・退避は
                     // ここで拾う）。変わったときだけ描き直す = 描画のたびに数えない
                     if app.refresh_limit_resume_summary() {
@@ -19280,6 +19317,9 @@ impl TakoApp {
 
     /// 動画プレイヤーを一時停止状態で用意する（GPUI の Context を必要としない
     /// ため CLI / MCP 経路からも呼べる。#484）
+    ///
+    /// #2009: 裏で手放したプレイヤーは控えた再生状態（位置・速度・音量・ミュート・ループ）で
+    /// 開き直す。表に戻した描画・CLI / MCP の操作のどちらから来ても同じ 1 本を通る
     fn ensure_video_player(&mut self, pane_id: PaneId) -> Result<(), String> {
         if self.video_players.contains_key(&pane_id) {
             return Ok(());
@@ -19288,7 +19328,22 @@ impl TakoApp {
             Some(state) => state.path.clone(),
             None => return Err("対象ペインにプレビューが無い".into()),
         };
-        let player = video_player::VideoPlayer::open(&path)?;
+        let resume = self.video_resume.get(&pane_id).copied();
+        let player = match resume {
+            Some(resume) => {
+                let mut player = video_player::VideoPlayer::open_at(&path, resume.position)?;
+                player.set_rate(resume.rate);
+                player.set_volume(resume.volume);
+                if resume.muted {
+                    player.toggle_mute();
+                }
+                player.looping = resume.looping;
+                player.ended = resume.ended;
+                player
+            }
+            None => video_player::VideoPlayer::open(&path)?,
+        };
+        self.video_resume.remove(&pane_id);
         self.video_players.insert(pane_id, player);
         Ok(())
     }
@@ -19328,12 +19383,24 @@ impl TakoApp {
                     .update(cx, |app, cx| {
                         let mut any_live = false;
                         let mut ticked = false;
-                        for player in app.video_players.values_mut() {
+                        // #2009: 画面に出ていない動画はフレームを写さない（裏で再生を続けても
+                        // 30fps × 1 フレームぶんの BGRA を作り続けない。音と再生位置は進む）。
+                        // A/B（TAKO_2009_LEGACY=1）は従来どおり常に写す
+                        let legacy = tako_core::preview_cache::issue2009_legacy();
+                        let hidden: std::collections::HashSet<PaneId> = app
+                            .video_players
+                            .keys()
+                            .copied()
+                            .filter(|p| {
+                                !legacy && app.pane_visibility(*p) == PaneVisibility::Hidden
+                            })
+                            .collect();
+                        for (pane, player) in app.video_players.iter_mut() {
                             // 再生中に加えてシーク直後（一時停止中でも絵の
                             // 差し替えが要る）も回す。#484
                             if player.needs_tick() {
                                 ticked = true;
-                                player.grab_frame();
+                                player.grab_frame_with(!hidden.contains(pane));
                                 // grab_frame 側で末尾停止・取り直し完了へ
                                 // 遷移しうるので、判定は取得後に取り直す
                                 any_live |= player.needs_tick();
@@ -24891,16 +24958,13 @@ impl PreviewHost for TakoApp {
     }
 
     fn preview_cache_stats(&self) -> tako_core::PreviewCacheStats {
-        tako_core::PreviewCacheStats {
-            max_bytes: self.preview_image_lru.budget_bytes(),
-            used_bytes: self.preview_image_lru.used_bytes(),
-            entries: self.preview_image_lru.len(),
-        }
+        self.preview_memory_stats(std::time::Instant::now())
     }
 
     fn set_preview_cache_budget(&mut self, max_bytes: u64) {
-        let evicted = self.preview_image_lru.set_budget_bytes(max_bytes);
-        self.evict_preview_image_keys(evicted);
+        // #2009: 設定は天井。LRU へは見えている量から決めた実効上限を入れ直す
+        self.preview_cache_ceiling = max_bytes;
+        self.refresh_preview_budget();
         // セルフテスト中はユーザー設定を汚さない。
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
@@ -25513,6 +25577,27 @@ impl PreviewHost for TakoApp {
     }
 
     fn video_status(&self, pane: PaneId) -> Result<tako_control::VideoStatus, String> {
+        // #2009: 裏で手放したプレイヤーは控えた再生状態を返す（表に戻すと同じ状態で開き直す。
+        // 見る側からは止まったまま居るのと変わらない）
+        if let (None, Some(resume)) = (self.video_players.get(&pane), self.video_resume.get(&pane))
+        {
+            let duration = match self.previews.get(&pane).map(|state| &state.content) {
+                Some(preview::PreviewContent::Video(data)) => {
+                    video_player::sanitize_duration(data.duration)
+                }
+                _ => 0.0,
+            };
+            return Ok(tako_control::VideoStatus {
+                position: resume.position,
+                duration,
+                state: "paused",
+                rate: resume.rate,
+                volume: resume.volume,
+                muted: resume.muted,
+                looping: resume.looping,
+                ended: resume.ended,
+            });
+        }
         let player = self
             .video_players
             .get(&pane)
@@ -25599,6 +25684,9 @@ impl PreviewHost for TakoApp {
         self.pending_pdf_rasters.remove(&pane);
         self.preview_views.remove(&pane);
         self.preview_scroll_handles.remove(&pane);
+        // #2009: 前のファイルを手放した印と控えた動画の再生状態を新しい中身へ持ち越さない
+        self.preview_released.remove(&pane);
+        self.video_resume.remove(&pane);
         if self
             .preview_navigation_panel
             .is_some_and(|(open_pane, _)| open_pane == pane)
@@ -30233,6 +30321,11 @@ mod self_test {
     mod tasks_input_2016;
     #[cfg(feature = "visual-test")]
     use tasks_input_2016::tasks_input_visual;
+    /// #2009: 見えていないプレビューを手放し、表に戻した見た目と操作が変わらない（visual-test `preview-memory`）
+    #[cfg(feature = "visual-test")]
+    mod preview_memory_2009;
+    #[cfg(feature = "visual-test")]
+    use preview_memory_2009::preview_memory_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -44672,6 +44765,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2009: 見えていないプレビューを手放し、表に戻した見た目と操作が変わらないか
+                "preview-memory" => {
+                    preview_memory_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -44685,7 +44784,7 @@ mod self_test {
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
-                         background-drawer / show-command-caller / tasks-input）"
+                         background-drawer / show-command-caller / tasks-input / preview-memory）"
                     );
                     std::process::exit(1);
                 }
@@ -60741,7 +60840,11 @@ mod self_test {
             .await
             .unwrap_or_else(|| fail("MCP preview cache 接続"));
             let preview_cache_256 = window
-                .update(cx, |app, _, _| app.preview_image_lru.budget_bytes() == 256 * 1024 * 1024)
+                // #2009: 設定は天井。LRU の実効上限は見えている量から決まり天井を超えない
+                .update(cx, |app, _, _| {
+                    app.preview_cache_ceiling == 256 * 1024 * 1024
+                        && app.preview_image_lru.budget_bytes() <= 256 * 1024 * 1024
+                })
                 .unwrap_or(false);
             check(
                 status == 200
@@ -65794,7 +65897,11 @@ mod self_test {
             .unwrap_or_else(|| fail("tako preview-cache 512 CLI 起動"));
             let stdout = String::from_utf8_lossy(&output.stdout);
             let cache_512 = window
-                .update(cx, |app, _, _| app.preview_image_lru.budget_bytes() == 512 * 1024 * 1024)
+                // #2009: 設定は天井。LRU の実効上限は見えている量から決まり天井を超えない
+                .update(cx, |app, _, _| {
+                    app.preview_cache_ceiling == 512 * 1024 * 1024
+                        && app.preview_image_lru.budget_bytes() <= 512 * 1024 * 1024
+                })
                 .unwrap_or(false);
             check(
                 output.status.success() && stdout.contains(r#""max_mb":512"#) && cache_512,

@@ -133,8 +133,8 @@ pub use pane_tree::{
 pub use pdf_links::{PdfLink, PdfLinkTarget, PdfLinks};
 pub use ports::ListenPort;
 pub use preview_cache::{
-    preview_cache_bytes, PreviewCacheStats, PREVIEW_CACHE_DEFAULT_MB, PREVIEW_CACHE_MAX_MB,
-    PREVIEW_CACHE_MIN_MB,
+    preview_cache_bytes, PreviewCacheStats, PreviewPaneMemory, PREVIEW_CACHE_DEFAULT_MB,
+    PREVIEW_CACHE_MAX_MB, PREVIEW_CACHE_MIN_MB,
 };
 pub use preview_outline::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget};
 pub use preview_reload::PreviewReloadState;

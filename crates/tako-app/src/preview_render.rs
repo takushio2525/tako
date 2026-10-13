@@ -741,7 +741,8 @@ impl TakoApp {
         let preview::PreviewContent::Pdf(data) = &state.content else {
             return;
         };
-        if data.raster_key == desired {
+        // #2009: 裏でページ PNG を手放していたら、同じ表示条件でも再ラスタする
+        if data.raster_key == desired && !data.has_released_pages() {
             return;
         }
         self.pending_pdf_rasters.insert(
@@ -798,6 +799,8 @@ impl TakoApp {
                                         data.page_sizes = rasterized.page_sizes;
                                         data.pixel_sizes = rasterized.pixel_sizes;
                                         data.raster_key = request.key;
+                                        // #2009: 全ページが戻った（手放した印を消す）
+                                        data.released = Vec::new();
                                         // キャッシュは除去しない。ensure_preview_image_cache が
                                         // 次フレームで raster_key の不一致を検出して再構築する。
                                         // 旧キャッシュは再構築開始まで表示に使い、差し替え時に
@@ -1305,6 +1308,305 @@ impl TakoApp {
         }
     }
 
+    /// PDF の表示中のページ（0 起点）。描画と同じ決め方: スクロールの先頭の項目、
+    /// まだ並べていなければ表示状態のページ（#2009 で描画と掃除が同じ値を使うよう括り出した）
+    fn pdf_current_index(&self, pane_id: PaneId, total_pages: usize) -> usize {
+        self.preview_scroll_handles
+            .get(&pane_id)
+            .filter(|handle| handle.bounds_for_item(0).is_some())
+            .map(gpui::ScrollHandle::top_item)
+            .unwrap_or_else(|| {
+                self.preview_views
+                    .get(&pane_id)
+                    .map(|view| view.page.saturating_sub(1))
+                    .unwrap_or(0)
+            })
+            .min(total_pages.saturating_sub(1))
+    }
+
+    /// 1 枚ぶんのデコード済み BGRA の推定 bytes（#258 の LRU の計上と同じ式。#2009 で括り出した）
+    fn preview_decoded_estimate(content: &preview::PreviewContent, index: usize) -> u64 {
+        match content {
+            preview::PreviewContent::Pdf(data) => data
+                .pixel_sizes
+                .get(index)
+                .map(|[w, h]| u64::from(*w) * u64::from(*h) * 4)
+                .unwrap_or_else(|| data.pages.get(index).map_or(0, |png| png.len() as u64)),
+            preview::PreviewContent::Image(data) => data
+                .pixel_size
+                .map(|(w, h)| u64::from(w) * u64::from(h) * 4)
+                .unwrap_or(data.bytes.len() as u64),
+            preview::PreviewContent::Video(data) if !data.thumbnail.is_empty() => data
+                .resolution
+                .map(|(w, h)| u64::from(w) * u64::from(h) * 4)
+                .unwrap_or(data.thumbnail.len() as u64),
+            _ => 0,
+        }
+    }
+
+    /// いま見えているプレビューが描くのに要るデコード済みの量（#2009）。
+    /// PDF は表示中のページと前後、画像・動画は 1 枚
+    fn preview_visible_need_bytes(&self) -> u64 {
+        self.previews
+            .iter()
+            .filter(|(pane, _)| self.pane_visibility(**pane) != PaneVisibility::Hidden)
+            .map(|(pane, state)| match &state.content {
+                preview::PreviewContent::Pdf(data) => {
+                    let current = self.pdf_current_index(*pane, data.total_pages);
+                    wanted_pdf_image_indices(current, data.total_pages)
+                        .into_iter()
+                        .map(|i| Self::preview_decoded_estimate(&state.content, i))
+                        .sum()
+                }
+                content => Self::preview_decoded_estimate(content, 0),
+            })
+            .sum()
+    }
+
+    /// LRU の実効上限を見えている量へ合わせる（#2009）。下げて追い出したら true。
+    /// A/B（TAKO_2009_LEGACY=1）は設定の上限そのまま = 修正前
+    pub(crate) fn refresh_preview_budget(&mut self) -> bool {
+        let ceiling = self.preview_cache_ceiling;
+        let effective = if tako_core::preview_cache::issue2009_legacy() {
+            ceiling
+        } else {
+            tako_core::preview_cache::effective_budget_bytes(
+                ceiling,
+                self.preview_visible_need_bytes(),
+            )
+        };
+        if self.preview_image_lru.budget_bytes() == effective {
+            return false;
+        }
+        let evicted = self.preview_image_lru.set_budget_bytes(effective);
+        let any = !evicted.is_empty();
+        self.evict_preview_image_keys(evicted);
+        any
+    }
+
+    /// 見えていないプレビューを猶予つきで手放す（#2009。2 秒ごとの定期更新から呼ぶ）。
+    ///
+    /// 「見えている」は描画の経路と同じ判定（[`Self::pane_visibility`] = いずれかの
+    /// ウィンドウの表示タブ・ピン・ホバー・開いているドロワー）。描いた時刻では決めない
+    /// （ペイン本体はキャッシュビューなので、見えていても描き直さない間がある）。
+    /// 手放したら true（呼び手が notify して GPUI の asset / atlas からの解放を流す）
+    pub(crate) fn sweep_preview_memory(&mut self, now: std::time::Instant) -> bool {
+        if tako_core::preview_cache::issue2009_legacy() {
+            return false;
+        }
+        let mut changed = false;
+        let panes: Vec<PaneId> = self.previews.keys().copied().collect();
+        for pane in panes {
+            if self.pane_visibility(pane) != PaneVisibility::Hidden {
+                self.preview_hidden_since.remove(&pane);
+                continue;
+            }
+            let since = *self.preview_hidden_since.entry(pane).or_insert(now);
+            if self.preview_released.contains(&pane) {
+                // 再生中のまま手放した動画が裏で止まったら、プレイヤーもここで返す
+                changed |= self.release_idle_video_player(pane);
+                // 裏へ回る直前に始まった再ラスタ（ズーム・リサイズ）が手放した後に戻ると
+                // 全ページの PNG が裏のまま戻る。もう一度表示中のページと前後だけにする
+                changed |= self.trim_hidden_pdf_pages(pane) > 0;
+                continue;
+            }
+            let hidden_secs = now.saturating_duration_since(since).as_secs();
+            if tako_core::preview_cache::release_due(hidden_secs)
+                && self.release_hidden_preview(pane)
+            {
+                changed = true;
+            }
+        }
+        // 閉じたペインの印を残さない
+        let previews = &self.previews;
+        self.preview_hidden_since
+            .retain(|pane, _| previews.contains_key(pane));
+        self.preview_released
+            .retain(|pane| previews.contains_key(pane));
+        self.video_resume
+            .retain(|pane, _| previews.contains_key(pane));
+        changed |= self.refresh_preview_budget();
+        changed
+    }
+
+    /// 見えていないプレビュー 1 枚のデコード結果・ラスタ・動画の資源を手放す（#2009）。
+    /// 手放すものが無ければ（コード / Markdown 等）何もしないで false
+    fn release_hidden_preview(&mut self, pane: PaneId) -> bool {
+        let Some(state) = self.previews.get(&pane) else {
+            return false;
+        };
+        if !matches!(
+            state.content,
+            preview::PreviewContent::Pdf(_)
+                | preview::PreviewContent::Image(_)
+                | preview::PreviewContent::Video(_)
+        ) {
+            return false;
+        }
+        // PDF: 表示中のページと前後の PNG だけ残す（表に戻した最初のフレームで
+        // 表示中のページを再ラスタ待ちにしない）。他は表に戻したら background で再ラスタ
+        self.trim_hidden_pdf_pages(pane);
+        // デコード済み画像（GPUI の asset と GPU テクスチャ）は次の render 冒頭で解放される
+        self.remove_preview_image_cache(pane);
+        // 動画: 描画用のフレームと CPU の BGRA を返す。止まっているならプレイヤーごと
+        self.remove_video_frame_cache(pane);
+        if let Some(player) = self.video_players.get_mut(&pane) {
+            player.current_bgra = Vec::new();
+        }
+        self.release_idle_video_player(pane);
+        self.preview_released.insert(pane);
+        self.preview_released_total = self.preview_released_total.saturating_add(1);
+        true
+    }
+
+    /// 見えていない PDF のページ PNG を、表示中のページと前後だけにする（#2009）。
+    /// 手放した bytes を返す（PDF でない・もう手放してあれば 0）
+    fn trim_hidden_pdf_pages(&mut self, pane: PaneId) -> u64 {
+        let keep = match self.previews.get(&pane).map(|state| &state.content) {
+            Some(preview::PreviewContent::Pdf(data)) => {
+                tako_core::preview_cache::pdf_pages_to_keep(
+                    self.pdf_current_index(pane, data.total_pages),
+                    data.total_pages,
+                )
+            }
+            _ => return 0,
+        };
+        match self.previews.get_mut(&pane).map(|state| &mut state.content) {
+            Some(preview::PreviewContent::Pdf(data)) => data.release_pages_outside(keep),
+            _ => 0,
+        }
+    }
+
+    /// 止まっている動画プレイヤーを返し、再生状態を控える（#2009）。
+    /// 再生中（音が鳴っている）なら残す。返したら true
+    fn release_idle_video_player(&mut self, pane: PaneId) -> bool {
+        if self
+            .video_players
+            .get(&pane)
+            .is_none_or(|player| player.needs_tick())
+        {
+            return false;
+        }
+        let Some(player) = self.video_players.remove(&pane) else {
+            return false;
+        };
+        self.video_resume.insert(
+            pane,
+            VideoResume {
+                position: player.current_time,
+                rate: player.rate,
+                volume: player.volume,
+                muted: player.muted,
+                looping: player.looping,
+                ended: player.ended,
+            },
+        );
+        true
+    }
+
+    /// 手放したプレビューを表に戻したときの作り直し（#2009。描画の冒頭で呼ぶ）。
+    /// 画像・PDF のデコードは `ensure_preview_image_cache`、PDF の再ラスタは
+    /// `ensure_pdf_raster_quality` がいつもの経路で行う。ここは動画プレイヤーだけ開き直す
+    fn restore_released_preview(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.preview_hidden_since.remove(&pane);
+        if !self.preview_released.remove(&pane) {
+            return;
+        }
+        self.preview_restored_total = self.preview_restored_total.saturating_add(1);
+        if !self.video_resume.contains_key(&pane) {
+            return;
+        }
+        // 開き直しは CLI / MCP の操作と同じ 1 本（控えた位置・設定で開く）
+        match self.ensure_video_player(pane) {
+            // シーク直後の絵の取り直しはティッカーが回す
+            Ok(()) => self.ensure_video_ticker(cx),
+            // ユーザーが押していない背景の作り直しなのでバナーは出さず、診断へ 1 行だけ残す
+            // （#1422 の PDF の再ラスタと同じ扱い。控えた再生状態は残るので、再生ボタンや
+            // `tako video play` で同じ位置から開き直せる）
+            Err(_) => Self::log_ui_failure(
+                crate::sidebar::NoticeArea::Preview,
+                crate::sidebar::NoticeArm::Issue1422,
+                "video-reopen",
+                "operation",
+            ),
+        }
+    }
+
+    /// `tako preview-cache` の状態（#258 → #2009。ペインごとの持ち分まで）
+    pub(crate) fn preview_memory_stats(
+        &self,
+        now: std::time::Instant,
+    ) -> tako_core::PreviewCacheStats {
+        let mut panes: Vec<tako_core::PreviewPaneMemory> = self
+            .previews
+            .iter()
+            .filter_map(|(pane, state)| {
+                let (kind, source_bytes) = match &state.content {
+                    preview::PreviewContent::Pdf(data) => ("pdf", data.source_bytes()),
+                    preview::PreviewContent::Image(data) => ("image", data.bytes.len() as u64),
+                    preview::PreviewContent::Video(data) => ("video", data.thumbnail.len() as u64),
+                    _ => return None,
+                };
+                let visible = self.pane_visibility(*pane) != PaneVisibility::Hidden;
+                let decoded_bytes = self
+                    .preview_image_cache
+                    .get(pane)
+                    .map(|cache| {
+                        cache
+                            .images
+                            .iter()
+                            .flatten()
+                            .map(|cached| cached.decoded_bytes)
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let player = self.video_players.get(pane);
+                let video_frame_bytes = player.map_or(0, |p| p.current_bgra.len() as u64)
+                    + self
+                        .video_frame_cache
+                        .get(pane)
+                        .and_then(|(_, frame)| frame.as_bytes(0))
+                        .map_or(0, |bytes| bytes.len() as u64);
+                Some(tako_core::PreviewPaneMemory {
+                    pane: pane.as_u64(),
+                    kind,
+                    visible,
+                    hidden_secs: self
+                        .preview_hidden_since
+                        .get(pane)
+                        .filter(|_| !visible)
+                        .map(|since| now.saturating_duration_since(*since).as_secs()),
+                    decoded_bytes,
+                    source_bytes,
+                    released: self.preview_released.contains(pane),
+                    video_player: player.is_some(),
+                    video_frame_bytes,
+                })
+            })
+            .collect();
+        panes.sort_by_key(|p| p.pane);
+        let visible_bytes = panes
+            .iter()
+            .filter(|p| p.visible)
+            .map(|p| p.decoded_bytes)
+            .sum();
+        let used_bytes = self.preview_image_lru.used_bytes();
+        tako_core::PreviewCacheStats {
+            max_bytes: self.preview_cache_ceiling,
+            used_bytes,
+            entries: self.preview_image_lru.len(),
+            effective_max_bytes: self.preview_image_lru.budget_bytes(),
+            visible_bytes,
+            hidden_bytes: used_bytes.saturating_sub(visible_bytes),
+            source_bytes: panes.iter().map(|p| p.source_bytes).sum(),
+            release_after_secs: tako_core::preview_cache::HIDDEN_RELEASE_AFTER_SECS,
+            released_total: self.preview_released_total,
+            restored_total: self.preview_restored_total,
+            legacy: tako_core::preview_cache::issue2009_legacy(),
+            panes,
+        }
+    }
+
     /// たまり場カードのサムネイルに使う画像（#1946）。画像そのもの・動画のサムネ・
     /// PDF の現在ページを、本体の描画と同じキャッシュ（LRU）から取り出す。
     /// 返すのは (画像, 横 / 縦)。画像を持たないプレビュー（コード / Markdown 等）は None
@@ -1428,20 +1730,18 @@ impl TakoApp {
             }
 
             let built = match self.previews.get(&pane_id).map(|state| &state.content) {
-                Some(preview::PreviewContent::Pdf(data)) => data.pages.get(index).and_then(|png| {
-                    (!png.is_empty()).then(|| CachedPreviewImage {
-                        image: std::sync::Arc::new(gpui::Image::from_bytes(
-                            gpui::ImageFormat::Png,
-                            png.clone(),
-                        )),
-                        decoded_bytes: data
-                            .pixel_sizes
-                            .get(index)
-                            .map(|[w, h]| u64::from(*w) * u64::from(*h) * 4)
-                            .unwrap_or(png.len() as u64),
+                Some(content @ preview::PreviewContent::Pdf(data)) => {
+                    data.pages.get(index).and_then(|png| {
+                        (!png.is_empty()).then(|| CachedPreviewImage {
+                            image: std::sync::Arc::new(gpui::Image::from_bytes(
+                                gpui::ImageFormat::Png,
+                                png.clone(),
+                            )),
+                            decoded_bytes: Self::preview_decoded_estimate(content, index),
+                        })
                     })
-                }),
-                Some(preview::PreviewContent::Image(data)) => {
+                }
+                Some(content @ preview::PreviewContent::Image(data)) => {
                     let gpui_format = match data.format {
                         preview::ImageFileFormat::Png => gpui::ImageFormat::Png,
                         preview::ImageFileFormat::Jpeg => gpui::ImageFormat::Jpeg,
@@ -1454,22 +1754,18 @@ impl TakoApp {
                             gpui_format,
                             data.bytes.clone(),
                         )),
-                        decoded_bytes: data
-                            .pixel_size
-                            .map(|(w, h)| u64::from(w) * u64::from(h) * 4)
-                            .unwrap_or(data.bytes.len() as u64),
+                        decoded_bytes: Self::preview_decoded_estimate(content, 0),
                     })
                 }
-                Some(preview::PreviewContent::Video(data)) if !data.thumbnail.is_empty() => {
+                Some(content @ preview::PreviewContent::Video(data))
+                    if !data.thumbnail.is_empty() =>
+                {
                     Some(CachedPreviewImage {
                         image: std::sync::Arc::new(gpui::Image::from_bytes(
                             gpui::ImageFormat::Png,
                             data.thumbnail.clone(),
                         )),
-                        decoded_bytes: data
-                            .resolution
-                            .map(|(w, h)| u64::from(w) * u64::from(h) * 4)
-                            .unwrap_or(data.thumbnail.len() as u64),
+                        decoded_bytes: Self::preview_decoded_estimate(content, 0),
                     })
                 }
                 _ => None,
@@ -1478,6 +1774,11 @@ impl TakoApp {
                 continue;
             };
             let decoded_bytes = cached.decoded_bytes;
+            // #2009: 新しく見えたものが入る前に実効上限を見えている量へ合わせる
+            // （古い小さな上限のまま入れると、表示中の画像が入った直後に追い出される）
+            if !tako_core::preview_cache::issue2009_legacy() {
+                self.refresh_preview_budget();
+            }
             if let Some(slot) = self
                 .preview_image_cache
                 .get_mut(&pane_id)
@@ -1499,21 +1800,12 @@ impl TakoApp {
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme.clone();
         let body_font_size = self.preview_body_font_size(pane_id);
+        // #2009: 描かれている = 見えている。裏で手放していたら作り直す
+        self.restore_released_preview(pane_id, cx);
         self.ensure_pdf_raster_quality(pane_id, area, cx);
         let wanted_images: Vec<usize> = match self.previews.get(&pane_id).map(|p| &p.content) {
             Some(preview::PreviewContent::Pdf(data)) => {
-                let current = self
-                    .preview_scroll_handles
-                    .get(&pane_id)
-                    .filter(|handle| handle.bounds_for_item(0).is_some())
-                    .map(gpui::ScrollHandle::top_item)
-                    .unwrap_or_else(|| {
-                        self.preview_views
-                            .get(&pane_id)
-                            .map(|view| view.page.saturating_sub(1))
-                            .unwrap_or(0)
-                    })
-                    .min(data.total_pages.saturating_sub(1));
+                let current = self.pdf_current_index(pane_id, data.total_pages);
                 wanted_pdf_image_indices(current, data.total_pages)
             }
             Some(preview::PreviewContent::Image(_)) | Some(preview::PreviewContent::Video(_)) => {
@@ -1997,7 +2289,9 @@ impl TakoApp {
                     data.pages
                         .iter()
                         .enumerate()
-                        .filter(|(_, png)| !png.is_empty())
+                        // 描画に失敗した空ページだけ外す。裏で手放したページ（#2009）は
+                        // 同じ寸法の空白で並びに残し、再ラスタが戻るまでの位置を保つ
+                        .filter(|(i, _)| data.page_in_layout(*i))
                         .map(|(i, _)| {
                             // ensure_preview_image_cache 直後なので None は起きない想定
                             // （防御: 欠損時は空要素を返し、次フレームの再構築に任せる）
@@ -4101,6 +4395,10 @@ impl TakoApp {
         self.video_players.remove(&pane_id);
         self.remove_video_frame_cache(pane_id);
         self.video_seek_bar_bounds.remove(&pane_id);
+        // #2009: 見えなくなった時刻・手放した印・控えた動画の再生状態
+        self.preview_hidden_since.remove(&pane_id);
+        self.preview_released.remove(&pane_id);
+        self.video_resume.remove(&pane_id);
         self.forget_md_links(pane_id);
         self.forget_lsp_goto(pane_id);
         // #1682: 閉じたペインの補完の一覧を残さない（待っている要求も捨てる）
