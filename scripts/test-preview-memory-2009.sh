@@ -450,11 +450,15 @@ run_visual() {
     TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=preview-memory TAKO_VISUAL_DUMP_DIR="$dump" ${1+"$@"} || exit $?
   APP_BIN="$saved_app"
   PID="$ISOLATED_GUI_PID"
+  local fixture="${TMPDIR:-/tmp}/tako-2009-$PID"
   for i in $(seq 1 3000); do
     kill -0 "$PID" 2>/dev/null || break
     sleep 0.1
   done
   stop_arm
+  # 節は素材を一時 dir（tako-2009-<GUI の pid>）へ置き、緑なら自分で消す。落ちた腕（旧は ② で
+  # 落ちるのが期待）は fail から抜けるので残る = 起こした GUI の pid の分だけ消す
+  rm -rf "$fixture"
   grep -E "TAKO_VISUAL_PIXEL: preview-memory|TAKO_VISUAL_DUMP_FILE|TAKO_APP_SELF_TEST_FAILED" "$log" | sed 's/^/    /' | tee "$OUT_DIR/visual-$arm.txt"
   if [ "$arm" = new ]; then
     if grep -q "TAKO_VISUAL_TEST_OK" "$log"; then
