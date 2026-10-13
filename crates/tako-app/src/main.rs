@@ -397,9 +397,10 @@ impl ScrollCtl {
 // （FR-3.23。既定幅は settings::default_sidebar_width() = 244）。#789: ドラッグ経路と
 // dispatch 経路で規則を食い違わせないため、tako-app 側に定数を持たない
 
-/// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）
+/// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）。最小幅は条件つきのタブが
+/// 3 本とも出た 7 本 + 3 桁のバッジがアイコンだけの段で収まる幅（#1694 で 220 → 240）
 const PANEL_DEFAULT_WIDTH: f32 = 320.0;
-const PANEL_MIN_WIDTH: f32 = 220.0;
+const PANEL_MIN_WIDTH: f32 = 240.0;
 
 /// ペイン上部タイトルバーの高さ（px。デザインスペック: 30px）
 const PANE_TITLE_BAR: f32 = 32.0;

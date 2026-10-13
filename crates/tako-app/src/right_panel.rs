@@ -6087,7 +6087,7 @@ mod tests {
 
     /// **選んだ段は必ず収まる**（= バッジが欠けない）。
     ///
-    /// `PANEL_MIN_WIDTH`（220px）から 900px まで 1px 刻み × 代表的な件数で、
+    /// `PANEL_MIN_WIDTH`（240px。#1694 で 220 から上げた）から 900px まで 1px 刻み × 代表的な件数で、
     /// [`panel_tab_density`] が返した段の要求幅が使える幅を超えないことを見る。
     /// #1479 の受け入れ条件（240 / 320 / 480 / 600 px × 0 / 9 / 22 / 150 件）を
     /// **全域で**含む
@@ -6101,7 +6101,7 @@ mod tests {
             PANEL_BASE_TABS + 2,
             PANEL_BASE_TABS + 3,
         ] {
-            for w in 220..=900 {
+            for w in (crate::PANEL_MIN_WIDTH as u32)..=900 {
                 let panel_width = w as f32;
                 for n in [0usize, 1, 9, 22, 99, 150, 4000] {
                     let badge = panel_tab_badge(n);
