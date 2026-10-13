@@ -2285,11 +2285,14 @@ mod tests {
     /// ここが重なると編集の入口へ打鍵が**届かない**（Windows の Alt+矢印 = ペインの
     /// フォーカス移動がまさにそれで、Windows の単語移動を Ctrl+矢印に置いた理由）。
     /// 表とバインドのどちらかへ足した打鍵が、もう片方の既存の打鍵を黙って食う形を止める。
-    /// shift 付きの打鍵（選択の拡張）も同じ理由で見る
+    /// shift 付きの打鍵（選択の拡張・行の複製）も同じ理由で見る。ただし shift を受けない行
+    /// （⌘] ⌘[ ⌘/ の行操作。#1692）は shift 付きを表が受理しないので見ない
+    /// （⇧⌘] / ⇧⌘[ = タブ切替はそのままキーバインドが持つ）
     #[test]
     fn エディタの打鍵表はキーバインドと衝突しない() {
         use tako_core::platform::editor_keys;
         let mut checked = 0usize;
+        let mut skipped_shift = 0usize;
         let mut collisions = Vec::new();
         for platform in [Platform::MacOs, Platform::Windows] {
             let bound: Vec<(String, Keystroke)> = bindings_for(platform)
@@ -2304,6 +2307,25 @@ mod tests {
                 .collect();
             for (action, chord) in editor_keys::all_chords(platform) {
                 for shift in [false, true] {
+                    if shift && !action.accepts_shift() {
+                        // 受理しないことは tako-core の単体（行操作の打鍵は両osの表に載っている）が固定する
+                        assert_eq!(
+                            editor_keys::resolve(
+                                platform,
+                                chord.key,
+                                editor_keys::KeyMods {
+                                    shift: true,
+                                    alt: chord.alt,
+                                    control: chord.control,
+                                    platform: chord.platform,
+                                },
+                            ),
+                            None,
+                            "{platform:?}: shift を受けない行（{action:?}）が shift 付きを受理している"
+                        );
+                        skipped_shift += 1;
+                        continue;
+                    }
                     let spec = if shift {
                         format!("shift-{}", chord.gpui_spec())
                     } else {
@@ -2327,6 +2349,11 @@ mod tests {
             "エディタの打鍵がキーバインドに食われる:\n{}\n\
              → crates/tako-core/src/platform/editor_keys.rs の列か keybindings.rs のバインドを動かす",
             collisions.join("\n")
+        );
+        // 飛ばすのは shift を受けない 3 行 × 両 OS だけ（飛ばしすぎて衝突を見逃さない）
+        assert_eq!(
+            skipped_shift, 6,
+            "shift 付きを見なかった打鍵の数が想定と違う"
         );
     }
 }

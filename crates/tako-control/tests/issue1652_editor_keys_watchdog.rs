@@ -406,7 +406,7 @@ fn 移動と削除の中身はtako_coreが持つ() {
 /// GUI の打鍵と**同じ口**（`run_editor_command_local`）へ届く
 #[test]
 fn 打鍵とcliとmcpは同じ口を通る() {
-    let wiring: [(&str, &str, &str); 19] = [
+    let wiring: [(&str, &str, &str); 20] = [
         // #1654: Tab / ⇧Tab / Enter（MCP はツールを増やさず tako_preview_edit の command）
         (PROTOCOL, "PreviewEditCommand {", "protocol の Request"),
         (
@@ -431,6 +431,8 @@ fn 打鍵とcliとmcpは同じ口を通る() {
         ),
         (CLI, "EditCommand::Indent {", "CLI サブコマンド"),
         (CLI, "EditCommand::Newline {", "CLI サブコマンド"),
+        // #1692: 行操作（MCP は同じ command の `line-<操作>`）
+        (CLI, "EditCommand::Line {", "CLI サブコマンド"),
         (PROTOCOL, "PreviewMove {", "protocol の Request"),
         (PROTOCOL, "PreviewDelete {", "protocol の Request"),
         (DISPATCH, "Request::PreviewMove {", "dispatch のアーム"),
@@ -691,7 +693,7 @@ fn enterはインデントを引き継ぐ口を通る() {
     buffer.set_cursor("fn main() {".len(), false);
     let enter = editor_keys::resolve(Platform::MacOs, "enter", KeyMods::default())
         .expect("Enter は表にある");
-    enter.apply(&mut buffer);
+    enter.apply(&mut buffer).expect("Enter は当てられる");
     assert_eq!(
         buffer.text(),
         "fn main() {\n    \n}\n",

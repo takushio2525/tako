@@ -964,7 +964,8 @@ pub fn tools() -> Vec<Value> {
                 document は文書の版（version）とカーソル・選択・undo 履歴で、編集系ツールの応答すべてに載る。\
                 viewport はカーソル行が画面に入っているか（visible=false なら画面外）。\
                 file_type / syntax は形式の ID と塗った構文名。\
-                command は Tab / Shift+Tab / Enter と同じ編集（インデントは既存行から推定）。",
+                command は Tab / Shift+Tab / Enter と同じ編集（インデントは既存行から推定）。\
+                line-* は選択行（無ければカーソル行）の複製・移動・行インデント・コメントの付け外しで undo 1 回で戻る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

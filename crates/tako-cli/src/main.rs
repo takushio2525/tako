@@ -2208,6 +2208,21 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// 選択した行（無ければカーソルの行）を行単位で操作する（#1692）
+    ///
+    /// 操作: duplicate-up / duplicate-down（行の複製）/ move-up / move-down（行の移動。
+    /// 文書の端では何もしない）/ indent / outdent（行ごと 1 段深く / 浅く）/ comment /
+    /// uncomment / toggle-comment（行コメントの付け外し。記号はファイルの形式で決まる）。
+    /// undo 1 回で戻る。例: `tako edit line move-up`
+    Line {
+        /// 操作
+        operation: String,
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// 編集バッファをファイルへ保存する（外で変わっていたら書かずに断る）
     Save {
         /// 外で変わっていても自分の変更で上書きする（消されていれば作り直す。#1659）
@@ -8189,6 +8204,26 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 command: "newline".into(),
                 expected_version: *expect_version,
             },
+            EditCommand::Line {
+                operation,
+                expect_version,
+                pane,
+            } => {
+                // 綴りは実行前に弾く。表は tako-core の 1 か所で、MCP の command
+                // （`line-<操作>`）へは editor_keys が頭を付ける（綴りを CLI で組まない）
+                use tako_core::text_edit::LineOperation;
+                let Some(op) = LineOperation::from_name(operation) else {
+                    return Err(format!(
+                        "行の操作は {} のどれか（{operation:?} は無い）",
+                        LineOperation::names().join(" / ")
+                    ));
+                };
+                Request::PreviewEditCommand {
+                    pane: target_pane(*pane)?,
+                    command: tako_core::platform::editor_keys::EditorCommand::line_edit_name(op),
+                    expected_version: *expect_version,
+                }
+            }
             EditCommand::Save { force, pane } => Request::PreviewSave {
                 pane: target_pane(*pane)?,
                 force: *force,
@@ -12285,6 +12320,38 @@ mod tests {
                 tako_core::platform::editor_keys::EditorCommand::from_edit_name(name).is_some()
             );
         }
+        // #1692: `tako edit line <操作>` は全操作が MCP の command（`line-<操作>`）へ写り、
+        // その綴りは dispatch が解く名前表にある
+        for op in tako_core::text_edit::LineOperation::ALL {
+            let command = parse(&[
+                "tako",
+                "edit",
+                "line",
+                op.name(),
+                "--expect-version",
+                "3",
+                "--pane",
+                "5",
+            ]);
+            let request = build_request(&command).unwrap();
+            let Request::PreviewEditCommand { command, .. } = &request else {
+                panic!("{op:?} が PreviewEditCommand にならない: {request:?}");
+            };
+            assert_eq!(
+                tako_core::platform::editor_keys::EditorCommand::from_edit_name(command),
+                Some(tako_core::platform::editor_keys::EditorCommand::Line(op))
+            );
+            assert_eq!(
+                request,
+                Request::PreviewEditCommand {
+                    pane: Some(5),
+                    command: format!("line-{}", op.name()),
+                    expected_version: Some(3),
+                }
+            );
+        }
+        let command = parse(&["tako", "edit", "line", "move_up", "--pane", "5"]);
+        assert!(build_request(&command).is_err());
         // 知らない単位は実行前に弾く
         let command = parse(&["tako", "edit", "move", "word_left", "--pane", "5"]);
         assert!(build_request(&command).is_err());
@@ -13671,6 +13738,8 @@ mod platform_matrix_parity {
         ("edit indent", "tako_preview_edit"),
         ("edit outdent", "tako_preview_edit"),
         ("edit newline", "tako_preview_edit"),
+        // #1692: 行操作も `tako_preview_edit` の `command`（`line-<操作>`）
+        ("edit line", "tako_preview_edit"),
         ("edit replace-range", "tako_preview_edit_range"),
         ("edit redo", "tako_preview_redo"),
         ("edit replace", "tako_preview_replace"),

@@ -122,6 +122,15 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | 行末まで消す（行末では改行を消して次の行とつなげる） | <kbd>Cmd</kbd>+<kbd>Delete</kbd> / <kbd>Ctrl</kbd>+<kbd>K</kbd> | （macOS のみ） |
 | 選択した行を 1 段深く（選択が無ければカーソル位置へ 1 段ぶん） | <kbd>Tab</kbd> | <kbd>Tab</kbd> |
 | 選択した行（無ければカーソルの行）を 1 段浅く | <kbd>Shift</kbd>+<kbd>Tab</kbd> | <kbd>Shift</kbd>+<kbd>Tab</kbd> |
+| 行を 1 段深く（選択が無くてもカーソルの行ごと） | <kbd>Cmd</kbd>+<kbd>]</kbd> | <kbd>Ctrl</kbd>+<kbd>]</kbd> |
+| 行を 1 段浅く | <kbd>Cmd</kbd>+<kbd>[</kbd> | <kbd>Ctrl</kbd>+<kbd>[</kbd> |
+| 行を上へ / 下へ移動 | <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>↓</kbd> | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd> |
+| 行を複製（カーソルは上の行に残る / 下の行へ移る） | <kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>↓</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↓</kbd> |
+| 行コメントを付ける / 外す | <kbd>Cmd</kbd>+<kbd>/</kbd> | <kbd>Ctrl</kbd>+<kbd>/</kbd> |
+
+:::note[行の操作]
+行の操作は、選択している行（選択が無ければカーソルのある行）が対象です。行を丸ごと選んだとき（選択の終わりが次の行の先頭にあるとき）は、その次の行は含めません。どの操作も取り消し 1 回で元に戻ります。先頭の行を上へ、最後の行を下へ動かそうとしても何も起きません。コメントの記号はファイルの種類で決まります（Rust や JavaScript は `//`、Python やシェルは `#`、SQL や Lua は `--`、HTML や Markdown は `<!-- -->` で 1 行ずつ囲みます）。選んだ行がすべてコメントなら外し、そうでなければ付けます。空の行には付けません。テキストなどコメントの記号が無いファイルでは、理由を画面の下に表示して何もしません。Windows の <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> はペインのフォーカス移動、<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> はペインの大きさの変更に使っているため、行の移動と複製は <kbd>Ctrl</kbd> 段です。
+:::
 
 :::note[語の区切りと行の境目]
 英数字と `_` の並び（`snake_case` は 1 語）、記号の並び、漢字・ひらがな・カタカナのそれぞれの並びが 1 語です。日本語は文字の種類が切り替わるところで止まります（`日本語のテキスト` は「日本語」「の」「テキスト」）。行の先頭で前の語へ、行の末尾で次の語へ動くと隣の行へ移ります。語や行単位で消すときは行の境目で止まり、行の先頭では改行だけを消して前の行とつなげます。上下に動くときは元の桁を覚えているので、短い行を通り過ぎても次の長い行では元の桁に戻ります。桁は見た目の幅で数えます（日本語などの全角文字は 2 桁、タブは次の 4 の倍数の桁まで）。Windows の <kbd>Alt</kbd>+矢印はペインのフォーカス移動に使っているため、語の移動は <kbd>Ctrl</kbd>+矢印です。MacBook のキーボードの <kbd>Delete</kbd> は <kbd>fn</kbd>+<kbd>delete</kbd> です。macOS の <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>E</kbd> / <kbd>K</kbd> は macOS の文字入力欄と同じ Emacs 風の操作です。Windows では <kbd>Ctrl</kbd>+<kbd>A</kbd> が「すべて選択」を意味するため割り当てていません。

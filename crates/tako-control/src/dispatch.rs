@@ -21639,7 +21639,7 @@ mod tests {
             if let Some(expected) = expected_version.filter(|v| *v != state.2.version()) {
                 return Err(format!("版が違う（指定 {expected}）"));
             }
-            command.apply(&mut state.2);
+            command.apply(&mut state.2)?;
             Ok(())
         }
         fn preview_document(&self, pane: PaneId) -> Option<serde_json::Value> {
@@ -27574,6 +27574,68 @@ mod tests {
         // 知らない綴りは候補つきで失敗する
         let err = run(&mut host, "tab").unwrap_err();
         assert!(format!("{err:?}").contains("indent"), "{err:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #1692: 行の操作（`line-<操作>`）が dispatch から GUI の打鍵と同じ口で効き、
+    /// 当てられない操作（記号の無い形式のコメント）は理由つきで失敗して本文も版も変えない
+    #[test]
+    fn preview行の操作はdispatchから効き理由を返す() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-line-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        let pane = preview_with_text(&mut host, &dir, "a\r\nb\r\n");
+        let run = |host: &mut MockHost, command: &str| {
+            dispatch(
+                host,
+                Request::PreviewEditCommand {
+                    pane: Some(pane),
+                    command: command.into(),
+                    expected_version: None,
+                },
+                PaneOrigin::Mcp,
+            )
+        };
+        let text = |host: &MockHost| host.preview_edits[&pane].2.text().to_string();
+        // 全文を当てた直後のカーソルは末尾（最後の空行）なので、1 行目へ置く
+        dispatch(
+            &mut host,
+            Request::PreviewCursor {
+                pane: Some(pane),
+                line: 1,
+                col: 0,
+                select_to_line: None,
+                select_to_col: None,
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let moved = run(&mut host, "line-move-down").unwrap();
+        assert_eq!(text(&host), "b\r\na\r\n", "CRLF のまま 1 行下へ");
+        assert_eq!(moved["document"]["cursor"]["line"].as_u64(), Some(2));
+        let version = moved["document"]["version"].as_u64();
+        run(&mut host, "line-duplicate-up").unwrap();
+        assert_eq!(text(&host), "b\r\na\r\na\r\n");
+        // MockHost のバッファは `mock.txt` = コメント記号の表に行が無い形式
+        let err = run(&mut host, "line-toggle-comment").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("コメント記号を知らない"),
+            "{err:?}"
+        );
+        assert_eq!(text(&host), "b\r\na\r\na\r\n", "断ったら本文は変えない");
+        let undone = dispatch(
+            &mut host,
+            Request::PreviewUndo { pane: Some(pane) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(text(&host), "b\r\na\r\n", "複製は undo 1 回で戻る");
+        assert!(undone["document"]["version"].as_u64() > version);
+        // 行の操作の綴りは名前表にあるものだけ（候補に line-* が並ぶ）
+        let err = run(&mut host, "line-move").unwrap_err();
+        assert!(format!("{err:?}").contains("line-move-up"), "{err:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
