@@ -104,6 +104,8 @@ enum Command {
     Mouse(MouseArgs),
     /// ペインの表示セルを左クリックする（内側アプリがマウス報告を要求しているときだけ。Issue #1961）
     Click(ClickArgs),
+    /// 貼り付けに API キー・パスワードらしきものがあれば送る前に確かめる機能の確認・切替・判定（Issue #2046）
+    PasteGuard(PasteGuardArgs),
     /// ペインを閉じる（タブ最後の 1 ペインならタブごと閉じる）
     Close(CloseArgs),
     /// ペインのタイトル・役割ラベルを設定する（空文字でクリア）
@@ -3575,6 +3577,36 @@ struct MouseArgs {
     /// on = 渡す（既定）/ off = 渡さない。省略時は現在状態と累計を表示
     #[arg(value_parser = ["on", "off"])]
     state: Option<String>,
+}
+
+/// 貼り付けの確認の引数（Issue #2046）。
+/// 最簡形（#322）: `tako paste-guard` で現在状態、`tako paste-guard off` で切る、
+/// `pbpaste | tako paste-guard check` で判定だけ試す（本文は標準入力から読む）
+#[derive(Args)]
+struct PasteGuardArgs {
+    /// on / off = 切替（既定 on）、check = 判定だけ試す、send / cancel = 確認待ちの貼り付けへ
+    /// 答える。省略時は現在状態と累計（確認待ちがあれば伏せ字の要約）を表示
+    #[arg(value_parser = ["on", "off", "check", "send", "cancel"])]
+    action: Option<String>,
+    /// check で判定する文字（省略か `-` で標準入力から読む。鍵をシェルの履歴へ残さないよう
+    /// 標準入力を勧める）
+    text: Option<String>,
+}
+
+/// `tako paste-guard check` の本文（引数が無いか `-` なら標準入力。読む上限は 8 MiB）
+fn paste_guard_check_text(arg: Option<&str>) -> Result<String, String> {
+    use std::io::Read;
+    match arg {
+        Some(text) if text != "-" => Ok(text.to_string()),
+        _ => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .take(8 << 20)
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("標準入力の読み取りに失敗: {e}"))?;
+            Ok(buf)
+        }
+    }
 }
 
 /// クリックの引数（Issue #1961）。座標は `tako read` の行・桁（0 始まり）
@@ -8278,6 +8310,27 @@ fn build_request(command: &Command) -> Result<Request, String> {
             row: args.row,
             col: args.col,
         },
+        // #2046: MCP は `tako_settings` の action=paste_guard（enabled / text / respond）
+        Command::PasteGuard(args) => {
+            let action = args.action.as_deref();
+            if args.text.is_some() && action != Some("check") {
+                return Err("判定する文字を渡せるのは `tako paste-guard check` だけ".into());
+            }
+            Request::PasteGuard {
+                enabled: match action {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => None,
+                },
+                check: match action {
+                    Some("check") => Some(paste_guard_check_text(args.text.as_deref())?),
+                    _ => None,
+                },
+                respond: action
+                    .filter(|a| matches!(*a, "send" | "cancel"))
+                    .map(str::to_string),
+            }
+        }
         // #1677: 基準ペインは閉じたペインの項目を開き直すときだけ使う。tako の外から
         // 叩いて呼び出し元が分からなくても失敗させない（dispatch がアクティブタブへ倒す）
         Command::Jump(sub) => {
@@ -11798,6 +11851,11 @@ fn print_result(command: &Command, result: &Value) {
         // #1961: クリックの転送の部分だけを出す
         Command::Mouse(_) => println!("{}", pretty_json(&result["mouse_forward"])),
         Command::Click(_) => println!("{result}"),
+        // #2046: check は判定の結果だけ、それ以外は状態の全体（どちらも伏せ字だけ）
+        Command::PasteGuard(args) if args.action.as_deref() == Some("check") => {
+            println!("{}", pretty_json(&result["check"]))
+        }
+        Command::PasteGuard(_) => println!("{}", pretty_json(result)),
         // #666: カードの内容（論理文字列）は改行込みで読みたいので整形して出す
         Command::ShowCommand(_) => println!("{}", pretty_json(result)),
         Command::Autorename(_)
@@ -13749,6 +13807,44 @@ mod tests {
         );
     }
 
+    /// #2046: 最簡形（引数なし = 現在状態 / on・off = 切替 / check = 判定 / send・cancel = 答え）が
+    /// `Request::PasteGuard` の 1 つへ写り、check 以外に文字を渡したら送らずに断る
+    #[test]
+    fn paste_guardは状態と切替と判定と答えを1つの操作へ写す() {
+        let pg = |enabled, check: Option<&str>, respond: Option<&str>| Request::PasteGuard {
+            enabled,
+            check: check.map(str::to_string),
+            respond: respond.map(str::to_string),
+        };
+        for (args, want) in [
+            (vec!["tako", "paste-guard"], pg(None, None, None)),
+            (
+                vec!["tako", "paste-guard", "off"],
+                pg(Some(false), None, None),
+            ),
+            (
+                vec!["tako", "paste-guard", "on"],
+                pg(Some(true), None, None),
+            ),
+            (
+                vec!["tako", "paste-guard", "check", "普通の文章"],
+                pg(None, Some("普通の文章"), None),
+            ),
+            (
+                vec!["tako", "paste-guard", "send"],
+                pg(None, None, Some("send")),
+            ),
+            (
+                vec!["tako", "paste-guard", "cancel"],
+                pg(None, None, Some("cancel")),
+            ),
+        ] {
+            assert_eq!(build_request(&parse(&args)).unwrap(), want, "{args:?}");
+        }
+        assert!(build_request(&parse(&["tako", "paste-guard", "off", "x"])).is_err());
+        assert!(Cli::try_parse_from(["tako", "paste-guard", "maybe"]).is_err());
+    }
+
     /// #1961: 最簡形（引数なし = 現在状態 / on・off = 切替）が MCP `tako_scrollback` の
     /// `mouse_forward` と同じ操作へ写り、`tako click` は `PaneClick` へ写る（ペイン必須）
     #[test]
@@ -14374,6 +14470,8 @@ mod platform_matrix_parity {
         ("redraw-limit", "tako_scrollback"),
         // #1961: MCP は `tako_scrollback` の `mouse_forward` / `tako_send_input` の `click`
         ("mouse", "tako_scrollback"),
+        // #2046: 貼り付けの確認は `tako_settings` の action=paste_guard（ツールを増やさない）
+        ("paste-guard", "tako_settings"),
         ("click", "tako_send_input"),
         ("resize", "tako_resize_pane"),
         ("run-default", "tako_run_defaults"),

@@ -65,6 +65,21 @@ pub trait SessionHost {
     }
     /// クリックの転送の on / off（#1961。次のクリックから効く・永続化は実装側）
     fn set_mouse_forward(&mut self, _enabled: bool) {}
+    /// 貼り付けの確認（#2046）の現在状態。確認待ちの要約（伏せ字だけ）と累計で、
+    /// **貼り付けの本文は持たない**
+    fn paste_guard_status(&self) -> tako_core::paste_guard::PasteGuardStatus {
+        tako_core::paste_guard::PasteGuardStatus::default()
+    }
+    /// 貼り付けの確認の on / off（#2046。次の貼り付けから効く・永続化は実装側）
+    fn set_paste_guard(&mut self, _enabled: bool) {}
+    /// 確認待ちの貼り付けへ答える（#2046）。GUI のボタンと同じ 1 実装を通す。
+    /// 確認待ちが無ければ `Err`（理由の本文）
+    fn answer_paste_guard(
+        &mut self,
+        _answer: tako_core::paste_guard::Answer,
+    ) -> Result<(), String> {
+        Err("確認待ちの貼り付けが無い".into())
+    }
     /// 直接ペインへ AI のクリック（押す + 離す）を渡す（#1961）。PTY への書き込みだけ
     /// （子プロセスなし）。器のペインはここへ来ない（dispatch が background の
     /// `mouse_forward::click_tmux` へ回す）。渡せない理由は `Err` の本文で返す

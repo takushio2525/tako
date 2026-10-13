@@ -110,6 +110,11 @@ pub struct Settings {
     /// **項目が無い旧ファイルは既定 ON で読める**（serde の default。移行は要らない）
     #[serde(default = "default_mouse_click_forward")]
     pub mouse_click_forward: bool,
+    /// 貼り付けの本文に API キー・パスワードらしきものがあれば、PTY へ流す前に確かめる
+    /// （Issue #2046。**既定 ON** = ユーザー確定）。**項目が無い旧ファイルも ON で読む**
+    /// （serde の default。古い版が書いた設定ファイルで off にならない = 移行は要らない）
+    #[serde(default = "default_paste_guard")]
+    pub paste_guard: bool,
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -205,6 +210,10 @@ fn default_mouse_click_forward() -> bool {
     tako_core::mouse_forward::DEFAULT_ENABLED
 }
 
+fn default_paste_guard() -> bool {
+    tako_core::paste_guard::DEFAULT_ENABLED
+}
+
 fn default_lid_battery_floor() -> u8 {
     crate::sleep_guard::DEFAULT_LID_BATTERY_FLOOR
 }
@@ -247,6 +256,7 @@ impl Default for Settings {
             scrollback_lines: default_scrollback_lines(),
             unfocused_redraw_fps: default_unfocused_redraw_fps(),
             mouse_click_forward: default_mouse_click_forward(),
+            paste_guard: default_paste_guard(),
             theme: default_theme(),
             ui_mode: default_ui_mode(),
             sidebar_width: default_sidebar_width(),
@@ -692,6 +702,7 @@ mod tests {
             scrollback_lines: 2_000,
             unfocused_redraw_fps: 12,
             mouse_click_forward: false,
+            paste_guard: false,
             theme: "light".into(),
             ui_mode: "gui".into(),
             sidebar_width: 300,
@@ -737,6 +748,19 @@ mod tests {
         // 指紋テストの更新理由がこれ）
         assert!(parsed.mouse_click_forward);
         assert!(Settings::default().mouse_click_forward);
+        // #2046: 貼り付けの確認は既定 ON。項目の無い旧ファイル（= 既存の利用者全員）も ON で読む
+        // （serde の default。指紋テストの更新理由がこれ・移行 Step は要らない）
+        assert!(parsed.paste_guard);
+        assert!(Settings::default().paste_guard);
+        // 古い版が書いた実ファイルの形（項目が並んでいて paste_guard だけが無い）でも ON
+        let old: Settings = serde_json::from_str(
+            r#"{"auto_rename":false,"mouse_click_forward":false,"theme":"light"}"#,
+        )
+        .unwrap();
+        assert!(old.paste_guard);
+        // 明示した off は off のまま
+        let off: Settings = serde_json::from_str(r#"{"paste_guard":false}"#).unwrap();
+        assert!(!off.paste_guard);
         // 手書きの 0 / 桁違いでも起動は成立する（0 = 書いていない扱い・上限超えは上限）
         let zero: Settings = serde_json::from_str(r#"{"unfocused_redraw_fps":0}"#).unwrap();
         assert_eq!(

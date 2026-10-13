@@ -2706,20 +2706,29 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-        // 出自: #459 / #721
+        // 出自: #459 / #721 / #2046
         json!({
             "name": "tako_settings",
             "description": "設定画面の操作。\
                 action=open（既定）: GUI 設定画面を開く（個別設定は tako_lang / tako_theme 等を使う）。\
-                action=status: 設定画面が開いているかを返す。",
+                action=status: 設定画面が開いているかを返す。\
+                action=paste_guard: 貼り付けに API キー・パスワードらしきものがあれば PTY へ流す前に確かめる機能\
+                （既定 on）。enabled で切替、text で判定だけ試す（応答は規則名と伏せ字のみ）、\
+                respond で確認待ちへ答える。pending が確認待ち。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "status"],
+                        "enum": ["open", "status", "paste_guard"],
                         "description": "操作種別（省略時は open）",
                     },
+                    "enabled": { "type": "boolean", "description": "paste_guard の on / off" },
+                    "text": { "type": "string", "description": "paste_guard の判定を試す文字" },
+                    "respond": enum_schema(
+                        &tako_core::paste_guard::Answer::VALUES,
+                        "確認待ちの貼り付けへの答え（send = 送る / cancel = やめる）",
+                    ),
                     "tab": {
                         "type": "string",
                         "enum": ["general", "appearance", "runner", "profiles", "setup", "sleep", "remote", "advanced"],

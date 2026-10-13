@@ -1148,10 +1148,27 @@ pub(super) fn build_request(
         "tako_telemetry" => Request::Telemetry {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
         },
-        "tako_settings" => Request::Settings {
-            action: str_arg(args, "action")?.map(|s| s.to_string()),
-            tab: str_arg(args, "tab")?.map(|s| s.to_string()),
-        },
+        // #2046: 貼り付けの確認はツールを増やさず action で載せる（カタログの予算 = #1139）
+        "tako_settings" if str_arg(args, "action")?.as_deref() == Some("paste_guard") => {
+            Request::PasteGuard {
+                enabled: bool_arg(args, "enabled")?,
+                check: str_arg(args, "text")?,
+                respond: str_arg(args, "respond")?,
+            }
+        }
+        "tako_settings" => {
+            // 貼り付けの確認の引数を他の action へ渡したら黙って捨てない
+            if let Some(key) = ["enabled", "text", "respond"]
+                .into_iter()
+                .find(|k| args.get(*k).is_some())
+            {
+                return Err(format!("{key} は action=paste_guard のときだけ使える"));
+            }
+            Request::Settings {
+                action: str_arg(args, "action")?.map(|s| s.to_string()),
+                tab: str_arg(args, "tab")?.map(|s| s.to_string()),
+            }
+        }
         "tako_setup_changes" => Request::SetupChanges,
         "tako_setup_bootstrap" => Request::SetupBootstrap {
             action: str_arg(args, "action")?.map(|s| s.to_string()),

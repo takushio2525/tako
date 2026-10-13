@@ -3642,7 +3642,7 @@
     "name": "tako_theme"
   },
   {
-    "description": "設定画面の操作。action=open（既定）: GUI 設定画面を開く（個別設定は tako_lang / tako_theme 等を使う）。action=status: 設定画面が開いているかを返す。",
+    "description": "設定画面の操作。action=open（既定）: GUI 設定画面を開く（個別設定は tako_lang / tako_theme 等を使う）。action=status: 設定画面が開いているかを返す。action=paste_guard: 貼り付けに API キー・パスワードらしきものがあれば PTY へ流す前に確かめる機能（既定 on）。enabled で切替、text で判定だけ試す（応答は規則名と伏せ字のみ）、respond で確認待ちへ答える。pending が確認待ち。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -3650,7 +3650,20 @@
           "description": "操作種別（省略時は open）",
           "enum": [
             "open",
-            "status"
+            "status",
+            "paste_guard"
+          ],
+          "type": "string"
+        },
+        "enabled": {
+          "description": "paste_guard の on / off",
+          "type": "boolean"
+        },
+        "respond": {
+          "description": "確認待ちの貼り付けへの答え（send = 送る / cancel = やめる）",
+          "enum": [
+            "send",
+            "cancel"
           ],
           "type": "string"
         },
@@ -3666,6 +3679,10 @@
             "remote",
             "advanced"
           ],
+          "type": "string"
+        },
+        "text": {
+          "description": "paste_guard の判定を試す文字",
           "type": "string"
         }
       },

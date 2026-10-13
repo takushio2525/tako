@@ -193,6 +193,18 @@ pub fn desc_mouse_click_forward() -> &'static str {
     )
 }
 
+/// 貼り付けの確認（FR-4.12 / #2046）
+pub fn label_paste_guard() -> &'static str {
+    tr!("貼り付けの確認", "Check pastes for secrets")
+}
+
+pub fn desc_paste_guard() -> &'static str {
+    tr!(
+        "貼り付けに API キー・パスワードらしきものがあれば、ペインへ送る前に確かめる",
+        "Ask before sending a paste that looks like an API key or password to the pane"
+    )
+}
+
 pub fn label_autosuggest_tab() -> &'static str {
     tr!("Tab キーでも確定", "Accept with Tab too")
 }
@@ -1559,6 +1571,8 @@ mod tests {
                 desc_autosuggest_tab().into(),
                 label_autosuggest_hint().into(),
                 desc_autosuggest_hint().into(),
+                label_paste_guard().into(),
+                desc_paste_guard().into(),
                 label_persist().into(),
                 desc_persist().into(),
                 desc_persist_no_tmux().into(),

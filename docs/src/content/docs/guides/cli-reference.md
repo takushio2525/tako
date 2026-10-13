@@ -1,12 +1,12 @@
 ---
 title: CLI リファレンス
 seoTitle: tako CLI リファレンス — コマンドの逆引き一覧
-description: tako コマンド全 93 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 94 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **93 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **94 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -23,7 +23,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 93 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 94 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -87,6 +87,7 @@ tako orchestrator spawn --help
 | [`scrollback`](#tako-scrollback) | スクロールバック保持行数の確認・変更 |
 | [`redraw-limit`](#tako-redraw-limit) | フォーカスの無いペインの再描画の上限（fps）の確認・変更 |
 | [`mouse`](#tako-mouse) | マウスを使う TUI へのクリックの転送の確認・切替 |
+| [`paste-guard`](#tako-paste-guard) | 貼り付けに API キー・パスワードらしきものがあれば送る前に確かめる機能の確認・切替・判定 |
 | [`sessions`](#tako-logs--sessions) | 会話セッションの発見と復元 |
 
 ### git
@@ -1007,6 +1008,31 @@ tako mouse on
 「クリックしても押せない」ときは `tako mouse` の `last.reason` を見ると理由が分かります。
 設定は `settings.json` に残り、設定画面の「一般」タブにも同じスイッチがあります。MCP では
 `tako_scrollback` の `mouse_forward` が同じ操作です。
+
+### tako paste-guard
+
+⌘V（Windows は Ctrl+V・Shift+Insert）やメニューの「貼り付け」で貼った文字に API キー・
+パスワード・秘密鍵らしきものがあると、ペインへ送る前に「送る / やめる」を確かめます。
+**既定は ON** で、claude・codex・素のシェル・SSH 先のどのペインでも同じように効きます。
+やめた貼り付けはペインへ 1 文字も届きません。Enter と Esc は「やめる」側なので、貼り付けの直後に
+送信のつもりで Enter を押しても鍵は送られません（送るときはボタンを押します）。
+
+```bash
+tako paste-guard                  # 現在状態・確認待ち（伏せ字の要約）・累計
+tako paste-guard off              # 確かめずに貼る（以前の挙動）
+tako paste-guard on
+pbpaste | tako paste-guard check  # 判定だけ試す（本文は標準入力から読む）
+tako paste-guard send             # 確認待ちの貼り付けを送る（cancel でやめる）
+```
+
+判定は「既知の形」（Anthropic・OpenAI・GitHub・AWS・Google・Slack などのキー、秘密鍵、JWT、
+URL に埋め込んだパスワード）と、`password=…` / `api_key: "…"` のような代入の値、形の分からない
+ランダムな文字列の 3 段です。空白で区切られた普通の文章、git の SHA・UUID・URL・ファイルパス・
+base64 の画像は当たりません。画面と応答に出すのは規則の名前と伏せ字（`sk-ant-…ABCD` のような
+先頭と末尾の数文字）だけで、本文はログにも残しません。巨大な貼り付けは先頭 64 KB だけを確かめます。
+`check` に鍵を引数で渡すとシェルの履歴に残るので、標準入力から渡してください。
+設定は `settings.json` に残り、設定画面の「一般」タブにも同じスイッチがあります。MCP では
+`tako_settings` の `action: "paste_guard"`（`enabled` / `text` / `respond`）が同じ操作です。
 
 ### tako recover
 

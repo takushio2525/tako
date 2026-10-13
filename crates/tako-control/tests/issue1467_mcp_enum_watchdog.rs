@@ -91,7 +91,8 @@ fn registry() -> Vec<Source> {
     let all_agents = agents(&Agent::ALL);
 
     let mut out = vec![
-        // --- 消費: 正本を呼んで生成する（#1467 で寄せた 5 か所 + #1679 の 2 か所 + #1680 の 1 か所 + #1694 の 1 か所） ---
+        // --- 消費: 正本を呼んで生成する（#1467 で寄せた 5 か所 + #1679 の 2 か所 + #1680 の 1 か所 +
+        // #1694 の 1 か所 + #2046 の 1 か所） ---
         Source {
             tool: "tako_panel",
             prop: "view",
@@ -157,6 +158,14 @@ fn registry() -> Vec<Source> {
             origin: "workspace_search::ACTIONS（tako-control/src/workspace_search.rs）",
             binding: Binding::Consumed,
             values: owned(&tako_control::workspace_search::ACTIONS),
+        },
+        // #2046: 貼り付けの確認待ちへの答え（tako_settings の action=paste_guard）
+        Source {
+            tool: "tako_settings",
+            prop: "respond",
+            origin: "paste_guard::Answer::VALUES（tako-core/src/paste_guard.rs）",
+            binding: Binding::Consumed,
+            values: owned(&tako_core::paste_guard::Answer::VALUES),
         },
         // --- 束縛: 手書きのまま値だけ縛る（正本へ値を足したら落ちる） ---
         Source {
@@ -497,8 +506,8 @@ fn 走査が空振りしていない() {
         "直書き enum の採取が {literals} 件しかない（走査が壊れている。#1467 時点で 97 件）"
     );
     assert_eq!(
-        generated, 9,
-        "生成 site が 9 件でない（{generated} 件）。正本を消費する site を増減したら\
+        generated, 10,
+        "生成 site が 10 件でない（{generated} 件）。正本を消費する site を増減したら\
          `registry()` の Consumed も合わせること"
     );
     assert!(
