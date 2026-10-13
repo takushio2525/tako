@@ -19750,7 +19750,7 @@ fn dispatch_user_task(
     origin: PaneOrigin,
     params: UserTaskParams,
 ) -> Result<Value, DispatchError> {
-    use tako_core::user_task::{NewTask, TaskFilter, TaskPatch, TaskStatus};
+    use tako_core::user_task::{NewTask, TaskPatch, TaskStatus};
 
     let path = crate::user_tasks::store_path()
         .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
@@ -19819,22 +19819,12 @@ fn dispatch_user_task(
             Ok(value)
         }
         "list" => {
-            let filter = TaskFilter {
-                status: params
-                    .status
-                    .as_deref()
-                    .map(crate::user_tasks::parse_status)
-                    .transpose()
-                    .map_err(DispatchError::InvalidParams)?,
-                kind: params
-                    .kind
-                    .as_deref()
-                    .map(crate::user_tasks::parse_kind)
-                    .transpose()
-                    .map_err(DispatchError::InvalidParams)?,
-                project: params.project.clone(),
-                any_status: params.all.unwrap_or(false),
-            };
+            let filter = user_task_filter(
+                params.status.as_deref(),
+                params.kind.as_deref(),
+                params.project.clone(),
+                params.all,
+            )?;
             let mut value = crate::user_tasks::list_at(&path, &filter).map_err(op_err)?;
             // #1479: 画面が**いまどれを開いているか**を同じ応答で読ませる
             // （AI から「見えている状態」を問える = 設計原則 5）。
@@ -20186,22 +20176,176 @@ fn reconcile_user_task_deliveries(host: &dyn ControlHost, path: &std::path::Path
     let Ok(store) = crate::user_tasks::load_from(path) else {
         return;
     };
-    let pending = store.pending_deliveries();
-    if pending.is_empty() {
+    let observed = observe_user_task_deliveries(host, &pending_delivery_panes(&store));
+    if observed.is_empty() {
         return;
     }
-    let observed: Vec<(String, Option<Value>)> = pending
-        .iter()
-        .map(|id| {
-            let flow = store
-                .find(id)
-                .and_then(|t| t.delivery.as_ref())
-                .and_then(|d| d.pane)
-                .and_then(|pane| host.prompt_delivery_state(PaneId::from_raw(pane)));
-            (id.clone(), flow)
-        })
-        .collect();
     let _ = crate::user_tasks::reconcile_at(path, &observed);
+}
+
+/// 決着していない配送（タスク id と配送先のペイン）。**正本を読んだ側**が 1 回だけ数える
+fn pending_delivery_panes(store: &tako_core::user_task::TaskStore) -> Vec<(String, Option<u64>)> {
+    store
+        .pending_deliveries()
+        .into_iter()
+        .map(|id| {
+            let pane = store
+                .find(&id)
+                .and_then(|t| t.delivery.as_ref())
+                .and_then(|d| d.pane);
+            (id, pane)
+        })
+        .collect()
+}
+
+/// 配送先ペインの送達フローを読み、**決着したものだけ**を返す（host の状態を読むだけ =
+/// I/O は無い）。決着していないもの・フローが見えないものは畳み込まない（#1259 と同じ規約）
+fn observe_user_task_deliveries(
+    host: &dyn ControlHost,
+    pending: &[(String, Option<u64>)],
+) -> Vec<(String, Option<Value>)> {
+    pending
+        .iter()
+        .filter_map(|(id, pane)| {
+            let flow = pane.and_then(|p| host.prompt_delivery_state(PaneId::from_raw(p)));
+            crate::user_tasks::settle_state(flow.as_ref())?;
+            Some((id.clone(), flow))
+        })
+        .collect()
+}
+
+/// `list` の取得条件（dispatch の "list" と画面の一覧更新が同じ 1 つを通る）
+fn user_task_filter(
+    status: Option<&str>,
+    kind: Option<&str>,
+    project: Option<String>,
+    all: Option<bool>,
+) -> Result<tako_core::user_task::TaskFilter, DispatchError> {
+    Ok(tako_core::user_task::TaskFilter {
+        status: status
+            .map(crate::user_tasks::parse_status)
+            .transpose()
+            .map_err(DispatchError::InvalidParams)?,
+        kind: kind
+            .map(crate::user_tasks::parse_kind)
+            .transpose()
+            .map_err(DispatchError::InvalidParams)?,
+        project,
+        any_status: all.unwrap_or(false),
+    })
+}
+
+// --- 一覧の 2 段（#2031） ---------------------------------------------------
+//
+// 右パネルの 2 秒ごとの一覧更新は dispatch の "list" を UI スレッドで呼んでいたので、
+// 1 回で置き場を 2 度（配送の畳み込み + 一覧）読み・解釈する間、打鍵ごと止まった
+// （本番の perf.log に 1 回 551 ms）。host に触るのは配送の観測（送達フローを読むだけ）
+// なので、①（観測 = UI スレッド）と ②（畳み込みの書き戻し + 読む = background）に分けてある。
+// ② は置き場の版（更新時刻・大きさ・inode）が前回と同じなら**読まずに**前回の正本を使い回す。
+// 取得条件の解釈・一覧の JSON・配送の観測は dispatch の "list" と**共有の 1 実装**。
+
+/// 前回読んだ正本（画面が次の ② へ持ち回る。中身は不透明 = 画面は正本に触らない）
+#[derive(Clone, Default)]
+pub struct UserTaskListCache {
+    /// 読んだ時点の置き場の版（`None` = 不在だった）
+    stamp: Option<crate::user_tasks::StoreStamp>,
+    /// 解釈済みの正本（`None` = まだ一度も読んでいない）
+    store: Option<std::sync::Arc<tako_core::user_task::TaskStore>>,
+    /// 決着していない配送（① が観測する相手）
+    pending: Vec<(String, Option<u64>)>,
+}
+
+/// ① で観測した配送の顛末（決着したものだけ）。② が永続へ書き戻す
+#[derive(Default)]
+pub struct UserTaskListObserved(Vec<(String, Option<Value>)>);
+
+impl UserTaskListObserved {
+    /// 書き戻すものが無い（② は置き場へ書かない）
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// ② の結果
+pub struct UserTaskListLoaded {
+    /// `list` の応答（dispatch の "list" と同じ形。画面の状態 `expanded` だけは載せない =
+    /// host の状態なので、要る側が UI スレッドで足す）
+    pub value: Value,
+    /// 次の ② へ渡す
+    pub cache: UserTaskListCache,
+    /// 今回 YAML を読んだか（版が前回と同じなら読まない）
+    pub read: bool,
+}
+
+/// ① 決着した配送を観測する（**UI スレッド**。送達フローを読むだけで I/O は無い）
+pub fn user_task_list_observe(
+    host: &dyn ControlHost,
+    cache: &UserTaskListCache,
+) -> UserTaskListObserved {
+    UserTaskListObserved(observe_user_task_deliveries(host, &cache.pending))
+}
+
+/// ② 決着した配送を書き戻し、置き場を読んで一覧を組む（**host に触らない** = background で呼べる）。
+///
+/// 受けるのは `Request::UserTask { action: "list", .. }`（画面も CLI / MCP と同じ要求を組む）。
+/// 添付の実在（`exists`）は読み直さなかった回も毎回見る（消えた添付を出せるのはそのため）
+pub fn user_task_list_load(
+    request: &Request,
+    cache: &UserTaskListCache,
+    observed: UserTaskListObserved,
+) -> Result<UserTaskListLoaded, DispatchError> {
+    let Request::UserTask {
+        action,
+        status,
+        kind,
+        project,
+        all,
+        ..
+    } = request
+    else {
+        return Err(DispatchError::InvalidParams(
+            "user_task_list_load が受けるのは UserTask だけ".into(),
+        ));
+    };
+    if action != "list" {
+        return Err(DispatchError::InvalidParams(format!(
+            "user_task_list_load が受けるのは list だけ（{action:?}）"
+        )));
+    }
+    let filter = user_task_filter(status.as_deref(), kind.as_deref(), project.clone(), *all)?;
+    let path = crate::user_tasks::store_path()
+        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    // 書き戻しは読む前（書けば版が変わるので、続く読みが確定後の中身を拾う）。
+    // 失敗しても一覧は出す（dispatch の畳み込みと同じく副次的な仕事）
+    if !observed.is_empty() {
+        let _ = crate::user_tasks::reconcile_at(&path, &observed.0);
+    }
+    // 版は**読む前に**採る（`store_stamp` の注記）
+    let stamp = crate::user_tasks::store_stamp(&path);
+    let (store, read) = match &cache.store {
+        Some(store) if cache.stamp == stamp => (store.clone(), false),
+        _ => (
+            std::sync::Arc::new(
+                crate::user_tasks::load_from(&path).map_err(DispatchError::Operation)?,
+            ),
+            true,
+        ),
+    };
+    let value = crate::user_tasks::list_json(&store, &filter);
+    let pending = if read {
+        pending_delivery_panes(&store)
+    } else {
+        cache.pending.clone()
+    };
+    Ok(UserTaskListLoaded {
+        value,
+        cache: UserTaskListCache {
+            stamp,
+            store: Some(store),
+            pending,
+        },
+        read,
+    })
 }
 
 /// 返答を起票 master へ運ぶ（#1450 の要件追加 ③）。
@@ -41799,6 +41943,184 @@ mod tests {
         // 開いている行を閉じたら畳む
         dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("done", Some(&a))).unwrap();
         assert_eq!(host.user_task_expanded, None);
+    }
+
+    // --- #2031: 一覧の 2 段（右パネルの 2 秒ごとの一覧更新を UI スレッドで読まない） ---
+
+    fn t2031_list_request(all: Option<bool>) -> Request {
+        Request::UserTask {
+            action: "list".into(),
+            id: None,
+            title: None,
+            body: None,
+            kind: None,
+            status: None,
+            all,
+            project: None,
+            attachments: None,
+            copy_texts: None,
+            links: None,
+            due: None,
+            decision: None,
+            comment: None,
+            via: None,
+            pane: None,
+            caller_role: None,
+        }
+    }
+
+    fn t2031_load(cache: &UserTaskListCache) -> UserTaskListLoaded {
+        user_task_list_load(&t2031_list_request(None), cache, Default::default())
+            .expect("一覧を組める")
+    }
+
+    /// 置き場の版が同じ間は読まず、書かれた・消えた直後だけ読む。中身は dispatch の "list" と同じ
+    #[test]
+    fn issue2031_版が同じ間は読まず書かれた直後だけ読む() {
+        let (dir, _guard) = t1479_env("t2031-stamp");
+        let path = dir.path().join("user-tasks.yaml");
+        let mut host = MockHost::new();
+        // 不在: 読む（空）→ 不在のまま: 読まない
+        let first = t2031_load(&UserTaskListCache::default());
+        assert!(first.read, "初回は読む");
+        assert_eq!(first.value["count"], 0);
+        let again = t2031_load(&first.cache);
+        assert!(!again.read, "不在のままなのに読み直した");
+        // CLI と同じ dispatch で起票（= 別の経路が書いた）→ 1 回だけ読む
+        let id = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap()
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let wrote = t2031_load(&again.cache);
+        assert!(wrote.read, "書かれたのに読まなかった");
+        assert_eq!(wrote.value["tasks"][0]["id"].as_str(), Some(id.as_str()));
+        let mut cache = wrote.cache;
+        for _ in 0..3 {
+            let idle = t2031_load(&cache);
+            assert!(!idle.read, "版が同じなのに読み直した");
+            cache = idle.cache;
+        }
+        // dispatch の "list" と同じ形（`expanded` は host の状態なので画面の側では載せない）
+        let mut via_dispatch =
+            dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("list", None)).unwrap();
+        via_dispatch.as_object_mut().unwrap().remove("expanded");
+        assert_eq!(t2031_load(&cache).value, via_dispatch);
+        // 状態遷移（書き込み）の直後は読む。取得条件を変えるだけなら読まずに組み直す
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("done", Some(&id))).unwrap();
+        let done = t2031_load(&cache);
+        assert!(done.read, "完了の書き込みを読まなかった");
+        assert_eq!(done.value["count"], 0);
+        let all = user_task_list_load(
+            &t2031_list_request(Some(true)),
+            &done.cache,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(!all.read, "取得条件を変えただけで読み直した");
+        assert_eq!(all.value["count"], 1);
+        // 消えた: 読み直して空（前回の眺めを残さない）
+        std::fs::remove_file(&path).unwrap();
+        let gone = t2031_load(&all.cache);
+        assert!(gone.read);
+        assert_eq!(gone.value["count"], 0);
+        assert_eq!(gone.value["open_count"], 0);
+    }
+
+    /// 壊れた置き場は 0 件へ丸めず Err（#169）。直れば読み直す
+    #[test]
+    fn issue2031_壊れた置き場はerrで直れば読み直す() {
+        let (dir, _guard) = t1479_env("t2031-broken");
+        let path = dir.path().join("user-tasks.yaml");
+        let mut host = MockHost::new();
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap();
+        let ok = t2031_load(&UserTaskListCache::default());
+        assert_eq!(ok.value["count"], 1);
+        std::fs::write(&path, "tasks: [ {{{ 壊れた").unwrap();
+        let broken = user_task_list_load(&t2031_list_request(None), &ok.cache, Default::default());
+        assert!(
+            broken
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("パースに失敗")),
+            "壊れた置き場を前回の正本でごまかした / 0 件へ丸めた"
+        );
+        std::fs::remove_file(&path).unwrap();
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap();
+        let fixed = t2031_load(&ok.cache);
+        assert!(fixed.read);
+        assert_eq!(fixed.value["count"], 1);
+    }
+
+    /// 配送の観測（UI スレッド）は host の送達フローを読むだけで、決着したものだけを
+    /// background の段が書き戻す（dispatch の畳み込みと同じ確定のしかた）
+    #[test]
+    fn issue2031_配送の観測と書き戻しが2段に分かれて確定する() {
+        use tako_core::user_task::DeliveryState;
+        let (dir, _guard) = t1479_env("t2031-deliver");
+        let path = dir.path().join("user-tasks.yaml");
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let id = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap()
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        crate::user_tasks::record_delivery_at(
+            &path,
+            &id,
+            crate::user_tasks::delivery_record(
+                DeliveryState::Sent,
+                "t2031",
+                Some(pane),
+                None,
+                None,
+                0,
+            ),
+        )
+        .unwrap();
+        let loaded = t2031_load(&UserTaskListCache::default());
+        assert_eq!(loaded.value["tasks"][0]["delivery"]["state"], "sent");
+        // フローがまだ見えない: 何も書き戻さない（版も変わらない = 次の読みも無い）
+        let none = user_task_list_observe(&host, &loaded.cache);
+        assert!(none.is_empty(), "決着していない配送を書き戻そうとした");
+        let idle = user_task_list_load(&t2031_list_request(None), &loaded.cache, none).unwrap();
+        assert!(!idle.read);
+        // 送達を確認した: 観測 1 件 → 書き戻して読み直す
+        host.prompt_delivery_states.insert(
+            pane,
+            tako_core::prompt_delivery::Status::delivered("pty", "submitted", 1).to_json(),
+        );
+        let observed = user_task_list_observe(&host, &idle.cache);
+        assert!(!observed.is_empty());
+        let settled =
+            user_task_list_load(&t2031_list_request(None), &idle.cache, observed).unwrap();
+        assert!(settled.read, "書き戻したのに読み直さなかった");
+        assert_eq!(settled.value["tasks"][0]["delivery"]["state"], "delivered");
+        // 確定した後は観測の相手が居ない
+        assert!(user_task_list_observe(&host, &settled.cache).is_empty());
+    }
+
+    /// 読み直さなかった回も添付の実在（`exists`）は今の状態を返す（消えた添付を出せるのはそのため）
+    #[test]
+    fn issue2031_読まない回も添付の実在は見直す() {
+        let (dir, _guard) = t1479_env("t2031-attach");
+        let att = dir.path().join("shot.png");
+        let mut host = MockHost::new();
+        dispatch_user_task(
+            &mut host,
+            PaneOrigin::Cli,
+            UserTaskParams {
+                attachments: Some(vec![att.display().to_string()]),
+                ..t1479_params("add", None)
+            },
+        )
+        .unwrap();
+        let before = t2031_load(&UserTaskListCache::default());
+        assert_eq!(before.value["tasks"][0]["attachments"][0]["exists"], false);
+        std::fs::write(&att, b"png").unwrap();
+        let after = t2031_load(&before.cache);
+        assert!(!after.read, "置き場は変わっていないのに読み直した");
+        assert_eq!(after.value["tasks"][0]["attachments"][0]["exists"], true);
     }
 
     // --- #1466: worker が起票したユーザータスクの戻り先 ---

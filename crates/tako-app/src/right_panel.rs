@@ -5791,8 +5791,8 @@ impl TakoApp {
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.panel_view = PanelView::Tasks;
-                                // 開いた瞬間に出す（2 秒ループを待たない）
-                                this.refresh_user_tasks();
+                                // 開いた瞬間に出す（2 秒ループを待たない。#2031: 読みは background）
+                                this.spawn_user_tasks_list(cx);
                                 cx.notify();
                             })),
                         )

@@ -6182,12 +6182,11 @@ impl TakoApp {
                     // #1450 B2: ユーザー向けタスクの一覧。**新しいタイマーを作らない**。
                     // 撃つかどうかの判断は `tick_user_tasks` が持つ（右パネルを閉じれば
                     // この tick から空振りになる = 「止める処理」がどこにも無い）。
-                    // background へ逃がさないのは、B1 が配送（sent → delivered / failed）を
-                    // **`UserTask` の dispatch が走るたびに** host から畳み込んで確定させる
-                    // ため（host に触れない background では永久に `sent` のまま残る）
+                    // #2031: ここ（UI スレッド）で行うのは配送の観測（host の送達フローを
+                    // 読むだけ）とジョブの発行まで。置き場の読みは background が持つ
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:user_tasks");
-                        app.tick_user_tasks();
+                        app.tick_user_tasks(wcx);
                     }
                     let git_selected = app.git_selected_commit.clone();
                     // サイドバー表示中はブランチ + 変更サマリの軽量 git 取得（#217）
@@ -30921,6 +30920,11 @@ mod self_test {
     mod ino_highlight_1949;
     #[cfg(feature = "visual-test")]
     use ino_highlight_1949::ino_highlight_visual;
+    /// #2031: tasks の 2 秒ごとの一覧更新の最中も返答欄への打鍵が止まらない（visual-test `tasks-tick`）
+    #[cfg(feature = "visual-test")]
+    mod tasks_tick_2031;
+    #[cfg(feature = "visual-test")]
+    use tasks_tick_2031::tasks_tick_visual;
     /// #1958: pane を省いた MCP のカードが呼び出し元ペインの実ピクセルに描かれる（visual-test `show-command-caller`）
     #[cfg(feature = "visual-test")]
     mod show_command_caller_1958;
@@ -34802,6 +34806,26 @@ mod self_test {
             .unwrap_or_default();
         let tail: String = joined.chars().rev().take(240).collect();
         tail.chars().rev().collect()
+    }
+
+    /// 右パネル tasks の一覧更新（background のジョブ。#2031）が着き切るまで待つ。
+    /// `tick_user_tasks` は読みを background へ出すので、直後に一覧を読む検査はこれを挟む。
+    /// 着けば真（上限 10 秒。置き場の読みは ms 単位なので、届かなければ着地の取りこぼし）
+    async fn settle_user_tasks(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> bool {
+        for _ in 0..1000 {
+            let idle = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    app.user_tasks.list_poll.inflight == 0
+                })
+                .unwrap_or(true);
+            if idle {
+                return true;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        false
     }
 
     /// **時間ではなく状態を待つ**（#796）。フォーカス中ペインの画面に `needle` が
@@ -45373,6 +45397,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2031: tasks の 2 秒ごとの一覧更新の最中も返答欄への打鍵が止まらないか
+                // （置き場の読みは `TAKO_2031_INJECT=slow:<ミリ秒>` で遅らせて測る）
+                "tasks-tick" => {
+                    tasks_tick_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1946: たまり場の縮小サムネイル・親 master の見出し・幽霊の後始末・間引き
                 "background-drawer" => {
                     background_drawer_visual(any, window, cx).await;
@@ -45417,7 +45448,7 @@ mod self_test {
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
-                         tasks-accordion / shelve-tab / no-emoji / editor-keys / \
+                         tasks-accordion / tasks-tick / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
@@ -47880,7 +47911,7 @@ mod self_test {
                 },
                 PaneOrigin::Cli,
             );
-            app.tick_user_tasks();
+            app.refresh_user_tasks();
             cx.notify();
         });
         wait(cx, 250).await;
@@ -47939,7 +47970,7 @@ mod self_test {
                     false,
                 );
                 let _ = add("PR #1459 のレビュー", "review", "", false);
-                app.tick_user_tasks();
+                app.refresh_user_tasks();
                 app.user_tasks.expanded = id.clone();
                 cx.notify();
                 id
@@ -47956,7 +47987,7 @@ mod self_test {
                 app.user_tasks.decision = Some("needs_change".to_string());
                 app.task_comment_insert("サムネの文字を大きくしてほしい", cx);
                 app.user_task_respond(id, cx);
-                app.tick_user_tasks();
+                app.refresh_user_tasks();
                 cx.notify();
             });
         }
@@ -48012,7 +48043,7 @@ mod self_test {
             app.panel_view = PanelView::Fleet;
             app.user_tasks.expanded = None;
             app.user_tasks.reset_form();
-            app.tick_user_tasks();
+            app.tick_user_tasks(cx);
             cx.notify();
         });
         let _ = std::fs::remove_file(&live1450);
@@ -48066,7 +48097,7 @@ mod self_test {
                     },
                     PaneOrigin::Cli,
                 );
-                app.tick_user_tasks();
+                app.refresh_user_tasks();
                 cx.notify();
             });
         };
@@ -48104,7 +48135,7 @@ mod self_test {
                     )
                     .ok()
                     .and_then(|v| v["id"].as_str().map(str::to_string));
-                    app.tick_user_tasks();
+                    app.refresh_user_tasks();
                     cx.notify();
                     out
                 })
@@ -48314,9 +48345,11 @@ mod self_test {
         );
         for _ in 0..3 {
             let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
-                app.tick_user_tasks();
+                app.tick_user_tasks(cx);
                 cx.notify();
             });
+            // #2031: 読みは background。着地（= 一覧の差し替え）まで待ってから次へ
+            settle_user_tasks(window, cx).await;
             wait(cx, 60).await;
         }
         redraw(cx);
@@ -48509,7 +48542,7 @@ mod self_test {
             app.user_tasks.snapshot.open_count = 0;
             app.panel_visible = false;
             app.panel_view = PanelView::Fleet;
-            app.tick_user_tasks();
+            app.tick_user_tasks(cx);
             cx.notify();
         });
         println!("TAKO_VISUAL_1479: badge={badge_ok}/{badge_cases} distinct={distinct1479}");
@@ -48614,7 +48647,7 @@ mod self_test {
                 )
                 .ok()
                 .and_then(|v| v["id"].as_str().map(str::to_string));
-                app.tick_user_tasks();
+                app.refresh_user_tasks();
                 app.user_tasks.expanded = id.clone();
                 app.panel_click_probe_bounds.borrow_mut().clear();
                 cx.notify();
@@ -48789,7 +48822,7 @@ mod self_test {
             app.panel_view = PanelView::Fleet;
             app.user_tasks.expanded = None;
             app.user_tasks.thumbs.clear();
-            app.tick_user_tasks();
+            app.tick_user_tasks(cx);
             cx.notify();
         });
         println!("TAKO_VISUAL_1472: thumb={thumb_ready}");
@@ -89409,16 +89442,24 @@ mod self_test {
                 );
 
                 // (b)(c) 起票 → ポーリングが一覧へ載せる。未完了件数も増える
-                let (id150, listed150, count150, missing150, body150) = window
-                    .update(cx, |app: &mut TakoApp, _, _| {
+                // #2031: 読みは background のジョブなので、tick の後は着地を待ってから読む
+                let (before150, id150) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
                         let before = app.user_tasks.snapshot.open_count;
                         let id = task150(app, "st1450b2 のレビュー", Some(gone150.display().to_string()));
-                        app.tick_user_tasks();
+                        app.tick_user_tasks(cx);
+                        (before, id)
+                    })
+                    .unwrap_or((0, None));
+                let settled150 = settle_user_tasks(window, cx).await;
+                let (listed150, count150, missing150, body150) = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        let before = before150;
+                        let id = id150.clone();
                         let row = id.as_ref().and_then(|id| {
                             app.user_tasks.snapshot.tasks.iter().find(|t| &t.id == id).cloned()
                         });
                         (
-                            id,
                             row.is_some(),
                             app.user_tasks.snapshot.open_count > before,
                             row.as_ref().is_some_and(|t| {
@@ -89427,10 +89468,10 @@ mod self_test {
                             row.as_ref().is_some_and(|t| t.body.contains("```sh")),
                         )
                     })
-                    .unwrap_or((None, false, false, false, false));
+                    .unwrap_or((false, false, false, false));
                 check(
-                    listed150 && count150,
-                    &format!("150: 起票が一覧に載り未完了件数が増える (#1450 B2。{id150:?} listed={listed150} count={count150})"),
+                    settled150 && listed150 && count150,
+                    &format!("150: 起票が一覧に載り未完了件数が増える (#1450 B2 / #2031。{id150:?} settled={settled150} listed={listed150} count={count150})"),
                 );
                 check(
                     missing150 && body150,
@@ -89439,6 +89480,30 @@ mod self_test {
                 let Some(id150) = id150 else {
                     fail("150: 起票の id を採れない (#1450 B2)");
                 };
+                // #2031: 置き場の版が変わらない間は読まない / 別経路（CLI と同じ dispatch）が
+                // 書いた直後の tick は 1 回だけ読む
+                let reads150 = |cx: &mut AsyncApp| {
+                    window
+                        .update(cx, |app: &mut TakoApp, _, _| app.user_tasks.list_poll.reads)
+                        .unwrap_or(0)
+                };
+                let r0 = reads150(cx);
+                for _ in 0..3 {
+                    let _ = window.update(cx, |app: &mut TakoApp, _, cx| app.tick_user_tasks(cx));
+                    settle_user_tasks(window, cx).await;
+                }
+                let r_idle = reads150(cx);
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    let _ = task150(app, "st2031 の書き込み", None);
+                    app.tick_user_tasks(cx);
+                });
+                settle_user_tasks(window, cx).await;
+                let r_wrote = reads150(cx);
+                println!("TAKO_SELF_TEST_2031: reads idle={} after_write={}", r_idle - r0, r_wrote - r_idle);
+                check(
+                    r_idle == r0 && r_wrote == r_idle + 1,
+                    &format!("150: 置き場の版が同じ 3 回は読まず、書いた直後の 1 回だけ読む (#2031。idle={} after_write={})", r_idle - r0, r_wrote - r_idle),
+                );
 
                 // (d) コピーは押した 1 件だけ（2 件目を押したら 2 件目が入る）
                 let copied150 = window
@@ -89485,7 +89550,7 @@ mod self_test {
                 }
                 let responded150 = window
                     .update(cx, |app: &mut TakoApp, _, _| {
-                        app.tick_user_tasks();
+                        app.refresh_user_tasks();
                         app.user_tasks
                             .snapshot
                             .tasks
@@ -89552,7 +89617,7 @@ mod self_test {
                 let long150 = window
                     .update(cx, |app: &mut TakoApp, _, _| {
                         app.user_tasks.expanded = Some(id150.clone());
-                        app.tick_user_tasks();
+                        app.refresh_user_tasks();
                         app.user_tasks
                             .snapshot
                             .tasks
@@ -89579,21 +89644,33 @@ mod self_test {
                 notify_and_draw(any, window, cx);
 
                 // (g) ポーリングが止まる: 右パネルを閉じているあいだは一覧が動かない
-                let (stopped150, resumed150) = window
-                    .update(cx, |app: &mut TakoApp, _, _| {
+                // （#2031: 閉じている間の tick はジョブを出さない = 着地を待っても動かない）
+                let (before150g, id2) = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
                         app.panel_visible = false;
                         let before = app.user_tasks.snapshot.tasks.len();
                         let id2 = task150(app, "閉じている間に増えたぶん", None);
-                        app.tick_user_tasks();
-                        let stopped = app.user_tasks.snapshot.tasks.len() == before;
-                        app.panel_visible = true;
-                        app.tick_user_tasks();
-                        let resumed = id2.as_ref().is_some_and(|id| {
-                            app.user_tasks.snapshot.tasks.iter().any(|t| &t.id == id)
-                        });
-                        (stopped, resumed)
+                        app.tick_user_tasks(cx);
+                        (before, id2)
                     })
-                    .unwrap_or((false, false));
+                    .unwrap_or((usize::MAX, None));
+                settle_user_tasks(window, cx).await;
+                let stopped150 = window
+                    .update(cx, |app: &mut TakoApp, _, cx| {
+                        let stopped = app.user_tasks.snapshot.tasks.len() == before150g;
+                        app.panel_visible = true;
+                        app.tick_user_tasks(cx);
+                        stopped
+                    })
+                    .unwrap_or(false);
+                settle_user_tasks(window, cx).await;
+                let resumed150 = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        id2.as_ref().is_some_and(|id| {
+                            app.user_tasks.snapshot.tasks.iter().any(|t| &t.id == id)
+                        })
+                    })
+                    .unwrap_or(false);
                 check(
                     stopped150 && resumed150,
                     &format!("150: 右パネルを閉じている間はポーリングが止まる (#1450 B2。stopped={stopped150} resumed={resumed150})"),

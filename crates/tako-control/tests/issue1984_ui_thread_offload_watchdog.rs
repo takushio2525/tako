@@ -42,6 +42,10 @@
 //!    自動復帰が UI スレッドで呼ぶ tmux の 3 口（`session_cwd` / `session_env` / `set_session_env`）は上限つき
 //! 9. #2017: `orchestrator self` の会話 ID と状態（`claude agents --json` + 器の pid 祖先辿り）は
 //!    先取り（`self_scan`）に載せ、UI スレッドの dispatch は読む側の関数（`self_agent_scan`）だけを通す
+//! 10. #2031: 右パネル tasks の一覧更新（2 秒ループ・タブを開いた瞬間・「完了も表示」）は
+//!     `spawn_user_tasks_list` を通り、置き場の読みと解釈（`user_task_list_load` / `parse_list`）は
+//!     background のブロックの中だけ。UI スレッドの観測（`user_task_list_observe`）は置き場に触らない。
+//!     読みは置き場の版の比較で省かれ（版は**読む前に**採る）、同期の引き直しは A/B のゲートの後ろだけ
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -58,6 +62,7 @@ const MAIN: &str = "crates/tako-app/src/main.rs";
 const SLEEP_GUARD: &str = "crates/tako-control/src/sleep_guard.rs";
 const AGENT_CLI: &str = "crates/tako-control/src/orchestrator/agent_cli.rs";
 const RIGHT_PANEL: &str = "crates/tako-app/src/right_panel.rs";
+const TASKS_PANEL: &str = "crates/tako-app/src/tasks_panel.rs";
 const TMUX_BACKEND: &str = "crates/tako-core/src/tmux_backend.rs";
 
 /// #1991: background のジョブ（`OffloadJob::GitWrite`）にする git の要求（`prepare_offload` の腕に
@@ -1049,6 +1054,242 @@ fn scan_tmux_backend(src: &str) -> Vec<Offender> {
     out
 }
 
+/// 9. #2031: 右パネル tasks の一覧更新は置き場を UI スレッドで読まない
+fn scan_user_tasks_list(tasks: &str, dispatch: &str, right: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let mut push =
+        |file: &'static str, line: usize, why: String| out.push(Offender { file, line, why });
+    // 2 秒ループの入口は background の入口だけを呼ぶ（同期の引き直し = 修正前の形へ戻さない）
+    match fn_window(tasks, "pub(crate) fn tick_user_tasks(") {
+        None => push(
+            TASKS_PANEL,
+            0,
+            "`tick_user_tasks` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if code_lines_with(&window, "spawn_user_tasks_list(").is_empty() {
+                push(
+                    TASKS_PANEL,
+                    at,
+                    "2 秒ごとの一覧更新（`tick_user_tasks`）が background の入口（`spawn_user_tasks_list`）を \
+                     通っていない = #2031"
+                        .into(),
+                );
+            }
+            for needle in [
+                "refresh_user_tasks(",
+                "tako_control::dispatch(",
+                "user_task_list_load(",
+            ] {
+                for i in code_lines_with(&window, needle) {
+                    push(
+                        TASKS_PANEL,
+                        at + i,
+                        format!(
+                            "2 秒ごとの一覧更新（`tick_user_tasks`）が `{needle}` を UI スレッドで呼んでいる \
+                             （置き場の読みと解釈を UI スレッドで待つ。本番で 1 回 551 ms = #2031）"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // background の入口: 読みと解釈は background のブロック（`background_executor()` から
+    // 着地の `cx.spawn(` まで）の中だけ。同期の引き直しは A/B のゲートの腕の中だけ
+    match fn_window(tasks, "pub(crate) fn spawn_user_tasks_list(") {
+        None => push(
+            TASKS_PANEL,
+            0,
+            "`spawn_user_tasks_list` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            let bg = code_lines_with(&window, "background_executor()");
+            let land = code_lines_with(&window, "cx.spawn(");
+            match (bg.first(), land.first()) {
+                (Some(&bg), Some(&land)) if bg < land => {
+                    for needle in ["user_task_list_load(", "parse_list("] {
+                        let hits = code_lines_with(&window, needle);
+                        if hits.is_empty() {
+                            push(
+                                TASKS_PANEL,
+                                at,
+                                format!("`spawn_user_tasks_list` が `{needle}` を呼んでいない（窓違い）"),
+                            );
+                        }
+                        for i in hits.into_iter().filter(|i| !(bg..land).contains(i)) {
+                            push(
+                                TASKS_PANEL,
+                                at + i,
+                                format!(
+                                    "`spawn_user_tasks_list` が `{needle}` を background のブロックの外 \
+                                     （= UI スレッド）で呼んでいる（置き場の読みと解釈を UI スレッドで待つ = #2031）"
+                                ),
+                            );
+                        }
+                    }
+                    if code_lines_with(&window, "user_task_list_observe(")
+                        .first()
+                        .is_none_or(|&i| i >= bg)
+                    {
+                        push(
+                            TASKS_PANEL,
+                            at,
+                            "`spawn_user_tasks_list` が配送の観測（`user_task_list_observe`）を UI スレッドで \
+                             済ませていない（host の送達フローを読まないと配送が `sent` のまま固まる）"
+                                .into(),
+                        );
+                    }
+                }
+                _ => push(
+                    TASKS_PANEL,
+                    at,
+                    "`spawn_user_tasks_list` に background のブロック（`background_executor()` → 着地の \
+                     `cx.spawn(`）が無い（置き場を UI スレッドで読む = #2031）"
+                        .into(),
+                ),
+            }
+            let gate = code_lines_with(&window, "legacy_2031()");
+            for needle in ["refresh_user_tasks(", "tako_control::dispatch("] {
+                for i in code_lines_with(&window, needle) {
+                    if !gate.iter().any(|g| *g < i && i - *g <= 2) {
+                        push(
+                            TASKS_PANEL,
+                            at + i,
+                            format!(
+                                "`spawn_user_tasks_list` の同期の引き直し（`{needle}`）が A/B のゲート \
+                                 （`legacy_2031()`）の腕の外にある（製品の既定で UI スレッドが置き場を読む = #2031）"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // 観測（UI スレッド）は置き場に触らない
+    match fn_window(dispatch, "pub fn user_task_list_observe(") {
+        None => push(
+            DISPATCH,
+            0,
+            "`user_task_list_observe` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            for needle in [
+                "load_from(",
+                "list_at(",
+                "reconcile_at(",
+                "store_stamp(",
+                "std::fs::",
+            ] {
+                for i in code_lines_with(&window, needle) {
+                    push(
+                        DISPATCH,
+                        at + i,
+                        format!(
+                            "UI スレッドで走る `user_task_list_observe` が `{needle}` で置き場に触っている \
+                             （観測は host の送達フローを読むだけ。読み書きは background の \
+                             `user_task_list_load` = #2031）"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // 読みは版の比較で省かれる。版は読む前に採る（読んだ後に採ると、その間の書き込みを取り逃がす）
+    match fn_window(dispatch, "pub fn user_task_list_load(") {
+        None => push(
+            DISPATCH,
+            0,
+            "`user_task_list_load` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            for needle in ["ControlHost", "host."] {
+                for i in code_lines_with(&window, needle) {
+                    push(
+                        DISPATCH,
+                        at + i,
+                        format!(
+                            "background で走る `user_task_list_load` が `{needle}` に触っている \
+                             （host は UI スレッドのもの。観測は `user_task_list_observe` へ）"
+                        ),
+                    );
+                }
+            }
+            if code_lines_with(&window, "cache.stamp == stamp").is_empty() {
+                push(
+                    DISPATCH,
+                    at,
+                    "`user_task_list_load` が置き場の版を前回と比べていない（版が同じでも 2 秒ごとに \
+                     YAML を読み直す = #2031）"
+                        .into(),
+                );
+            }
+            let stamp = code_lines_with(&window, "store_stamp(");
+            let load = code_lines_with(&window, "load_from(");
+            match (stamp.first(), load.first()) {
+                (Some(&s), Some(&l)) if s < l => {}
+                (_, Some(&l)) => push(
+                    DISPATCH,
+                    at + l,
+                    "`user_task_list_load` が置き場を版（`store_stamp`）より先に読んでいる（読んだ後に版を \
+                     採ると、その間の書き込みを新しい版のまま古い中身で覚えて取り逃がす = #2031）"
+                        .into(),
+                ),
+                _ => push(
+                    DISPATCH,
+                    at,
+                    "`user_task_list_load` に版の採取（`store_stamp`）と読み（`load_from`）が揃っていない".into(),
+                ),
+            }
+        }
+    }
+    // 画面を触った直後の引き直し（タブを開いた瞬間・「完了も表示」）も background の入口
+    for (file, src, anchor) in [
+        (RIGHT_PANEL, right, "this.panel_view = PanelView::Tasks;"),
+        (
+            TASKS_PANEL,
+            tasks,
+            "this.user_tasks.show_done = !this.user_tasks.show_done;",
+        ),
+    ] {
+        let lines: Vec<&str> = src.lines().collect();
+        let Some(start) = lines
+            .iter()
+            .position(|l| !is_comment(l) && l.contains(anchor))
+        else {
+            push(
+                file,
+                0,
+                format!("`{anchor}` が見つからない（走査が空振り）"),
+            );
+            continue;
+        };
+        let near: Vec<String> = lines[start..(start + 6).min(lines.len())]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        for i in code_lines_with(&near, "refresh_user_tasks(") {
+            push(
+                file,
+                start + 1 + i,
+                format!(
+                    "`{anchor}` の直後の引き直しが同期（`refresh_user_tasks`）に戻っている（置き場を UI \
+                     スレッドで読む = #2031。`spawn_user_tasks_list` を通す）"
+                ),
+            );
+        }
+        if code_lines_with(&near, "spawn_user_tasks_list(").is_empty() {
+            push(
+                file,
+                start + 1,
+                format!(
+                    "`{anchor}` の直後に background の引き直し（`spawn_user_tasks_list`）が無い"
+                ),
+            );
+        }
+    }
+    out
+}
+
 struct Sources {
     dispatch: String,
     main: String,
@@ -1056,6 +1297,7 @@ struct Sources {
     agent_cli: String,
     right_panel: String,
     tmux_backend: String,
+    tasks_panel: String,
 }
 
 impl Sources {
@@ -1068,6 +1310,7 @@ impl Sources {
             agent_cli: read(&root, AGENT_CLI),
             right_panel: read(&root, RIGHT_PANEL),
             tmux_backend: read(&root, TMUX_BACKEND),
+            tasks_panel: read(&root, TASKS_PANEL),
         }
     }
 
@@ -1084,6 +1327,11 @@ impl Sources {
         v.extend(scan_git_write(&self.dispatch));
         v.extend(scan_startup_cleanup(&self.main));
         v.extend(scan_tmux_backend(&self.tmux_backend));
+        v.extend(scan_user_tasks_list(
+            &self.tasks_panel,
+            &self.dispatch,
+            &self.right_panel,
+        ));
         v
     }
 }
@@ -1190,6 +1438,23 @@ fn 走査が空振りしていない() {
         ),
         (&s.tmux_backend, "pub fn session_cwd(", "run_tmux("),
         (&s.tmux_backend, "pub fn set_session_env(", "run_tmux("),
+        // #2031
+        (
+            &s.tasks_panel,
+            "pub(crate) fn tick_user_tasks(",
+            "spawn_user_tasks_list(",
+        ),
+        (
+            &s.tasks_panel,
+            "pub(crate) fn spawn_user_tasks_list(",
+            "user_task_list_load(",
+        ),
+        (
+            &s.dispatch,
+            "pub fn user_task_list_observe(",
+            "observe_user_task_deliveries(",
+        ),
+        (&s.dispatch, "pub fn user_task_list_load(", "load_from("),
     ] {
         let (_, w) = fn_window(src, head).unwrap_or_else(|| panic!("{head} の窓"));
         assert!(
@@ -1584,6 +1849,104 @@ fn 逆戻りを名指しできる() {
         scan_readers(&d),
         DISPATCH,
         "fn self_agent_scan(",
+    );
+
+    // ㉖ #2031: 2 秒ごとの一覧更新を修正前の同期の引き直しへ戻す（UI スレッドで YAML を読む）
+    let tp = inject(
+        &s.tasks_panel,
+        "        self.spawn_user_tasks_list(cx);\n    }\n\n    /// 一覧の要求",
+        "        self.refresh_user_tasks();\n    }\n\n    /// 一覧の要求",
+        "㉖",
+    );
+    expect_named(
+        "2 秒ごとの一覧更新を同期へ",
+        scan_user_tasks_list(&tp, &s.dispatch, &s.right_panel),
+        TASKS_PANEL,
+        "`refresh_user_tasks(` を UI スレッドで呼んでいる",
+    );
+
+    // ㉗ #2031: 置き場の読みを background のブロックの外（UI スレッド）で済ませる
+    let tp = inject(
+        &s.tasks_panel,
+        "        let job = cx.background_executor().spawn(async move {",
+        "        let _now = tako_control::dispatch::user_task_list_load(&request, &cache, Default::default());\n        let job = cx.background_executor().spawn(async move {",
+        "㉗",
+    );
+    expect_named(
+        "一覧の読みを UI スレッドで",
+        scan_user_tasks_list(&tp, &s.dispatch, &s.right_panel),
+        TASKS_PANEL,
+        "background のブロックの外",
+    );
+
+    // ㉘ #2031: A/B のゲートを外し、製品の既定で同期の引き直しをする
+    let tp = inject(
+        &s.tasks_panel,
+        "        if legacy_2031() {\n            self.refresh_user_tasks();",
+        "        if true {\n            self.refresh_user_tasks();",
+        "㉘",
+    );
+    expect_named(
+        "同期の引き直しをゲートの外へ",
+        scan_user_tasks_list(&tp, &s.dispatch, &s.right_panel),
+        TASKS_PANEL,
+        "ゲート",
+    );
+
+    // ㉙ #2031: 右パネルのタブを開いた瞬間の引き直しを修正前の同期へ戻す
+    let r = inject(
+        &s.right_panel,
+        "                                this.spawn_user_tasks_list(cx);",
+        "                                this.refresh_user_tasks();",
+        "㉙",
+    );
+    expect_named(
+        "タブを開いた瞬間を同期へ",
+        scan_user_tasks_list(&s.tasks_panel, &s.dispatch, &r),
+        RIGHT_PANEL,
+        "this.panel_view = PanelView::Tasks;",
+    );
+
+    // ㉚ #2031: UI スレッドの観測で置き場を読む
+    let d = inject(
+        &s.dispatch,
+        "    UserTaskListObserved(observe_user_task_deliveries(host, &cache.pending))",
+        "    let _ = crate::user_tasks::load_from(Path::new(\"user-tasks.yaml\"));\n    UserTaskListObserved(observe_user_task_deliveries(host, &cache.pending))",
+        "㉚",
+    );
+    expect_named(
+        "観測で置き場を読む",
+        scan_user_tasks_list(&s.tasks_panel, &d, &s.right_panel),
+        DISPATCH,
+        "`user_task_list_observe` が `load_from(`",
+    );
+
+    // ㉛ #2031: 版が同じでも読み直す（前回の正本を使い回さない）
+    let d = inject(
+        &s.dispatch,
+        "        Some(store) if cache.stamp == stamp => (store.clone(), false),",
+        "        Some(store) if false => (store.clone(), false),",
+        "㉛",
+    );
+    expect_named(
+        "版が同じでも読む",
+        scan_user_tasks_list(&s.tasks_panel, &d, &s.right_panel),
+        DISPATCH,
+        "版を前回と比べていない",
+    );
+
+    // ㉜ #2031: 版を読んだ後に採る（その間の書き込みを取り逃がす）
+    let d = inject(
+        &s.dispatch,
+        "    // 版は**読む前に**採る（`store_stamp` の注記）\n    let stamp = crate::user_tasks::store_stamp(&path);",
+        "    let _first = crate::user_tasks::load_from(&path);\n    let stamp = crate::user_tasks::store_stamp(&path);",
+        "㉜",
+    );
+    expect_named(
+        "版を読んだ後に採る",
+        scan_user_tasks_list(&s.tasks_panel, &d, &s.right_panel),
+        DISPATCH,
+        "版（`store_stamp`）より先に読んでいる",
     );
 
     // ⑩ check_qos を修正前の上限なしの ps へ戻す

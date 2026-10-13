@@ -18,6 +18,7 @@
 //!
 //! 1. **画面は正本を直読みしない** — `tasks_panel.rs` が `user_tasks::` /
 //!    `TaskStore` / `user-tasks.yaml` に触らず、操作は `Request::UserTask` を組む
+//!    （一覧は同期と background の 2 つの入口が要求の組み立て 1 つを通る = #2031）
 //! 2. **絵文字を使わない** — 画面に出る文字列（`tasks_panel.rs` / `text_field.rs` /
 //!    `ui_text/panel.rs`）に絵文字のコードポイントが 1 つも無い（#217 の全面禁止）
 //! 3. **ビュー切替が `tako panel` と同じ語彙を通る** — `PanelViewWire` に `tasks` が
@@ -177,11 +178,15 @@ fn scan_no_direct_store(src: &str) -> Vec<Offender> {
             });
         }
     }
-    // 操作の 3 本（一覧 / 状態遷移 / 返答）はすべて dispatch を組む
-    for needle in [
-        "fn refresh_user_tasks(",
-        "fn user_task_set_status(",
-        "fn user_task_respond(",
+    // 操作の 3 本（一覧 / 状態遷移 / 返答）はすべて dispatch を組む。
+    // 一覧は同期（`refresh_user_tasks`）と background（`spawn_user_tasks_list`。#2031）の
+    // 2 つの入口があり、どちらも要求の組み立て（`user_tasks_list_request`）の 1 つを通る
+    for (needle, builds) in [
+        ("fn user_tasks_list_request(", "Request::UserTask"),
+        ("fn refresh_user_tasks(", "user_tasks_list_request()"),
+        ("fn spawn_user_tasks_list(", "user_tasks_list_request()"),
+        ("fn user_task_set_status(", "Request::UserTask"),
+        ("fn user_task_respond(", "Request::UserTask"),
     ] {
         match fn_window(src, needle) {
             None => out.push(Offender {
@@ -191,15 +196,26 @@ fn scan_no_direct_store(src: &str) -> Vec<Offender> {
             }),
             Some((at, window)) => {
                 let body = code_only(&window);
-                if !body.contains("Request::UserTask") {
+                if !body.contains(builds) {
                     out.push(Offender {
                         file: TASKS_PANEL,
                         line: at,
-                        why: format!(
-                            "`{needle}` が `Request::UserTask` を組んでいない\
-                             （dispatch を通らない別経路になっている。#1450 B2）"
-                        ),
+                        why: if builds == "Request::UserTask" {
+                            format!(
+                                "`{needle}` が `Request::UserTask` を組んでいない\
+                                 （dispatch を通らない別経路になっている。#1450 B2）"
+                            )
+                        } else {
+                            format!(
+                                "`{needle}` が一覧の要求を `{builds}` で組んでいない\
+                                 （同期と background で要求が割れる。#1450 B2 / #2031）"
+                            )
+                        },
                     });
+                }
+                // 要求の組み立てそのものは dispatch を呼ばない（呼ぶのは 2 つの入口）
+                if needle == "fn user_tasks_list_request(" {
+                    continue;
                 }
                 if !body.contains("tako_control::dispatch") {
                     out.push(Offender {
@@ -347,7 +363,7 @@ fn scan_polling(sources: &Sources) -> Vec<Offender> {
     }
     // 2 秒ループは判断を持たない（持つと止め方が 2 か所に割れる）
     let main = code_only(&sources.main);
-    if !main.contains("app.tick_user_tasks();") {
+    if !main.contains("app.tick_user_tasks(wcx);") {
         out.push(Offender {
             file: MAIN,
             line: code_line_with(&main, "periodic_prep:user_tasks").map_or(0, |i| i + 1),
@@ -356,7 +372,17 @@ fn scan_polling(sources: &Sources) -> Vec<Offender> {
                 .into(),
         });
     }
-    if let Some(i) = code_line_with(&main, "app.refresh_user_tasks()") {
+    // セルフテスト（`mod self_test`）は同期の引き直しで状態を揃えてよい（#2031: tick は読みを
+    // background へ出すので、直後に一覧を読む検査は同期の形を使う）。見るのは本番の経路だけ
+    let self_test = fn_window(&sources.main, "mod self_test {")
+        .map(|(at, window)| (at, at + window.lines().count()));
+    for (i, line) in main.lines().enumerate() {
+        if !line.contains("app.refresh_user_tasks()") {
+            continue;
+        }
+        if self_test.is_some_and(|(start, end)| (start..end).contains(&(i + 1))) {
+            continue;
+        }
         out.push(Offender {
             file: MAIN,
             line: i + 1,
@@ -494,6 +520,17 @@ fn 走査が空振りしていない() {
     let sources = Sources::load(&root);
     for (label, src, needle) in [
         ("一覧の取得", &sources.tasks_panel, "fn refresh_user_tasks("),
+        // #2031: 一覧の要求の組み立てと background の入口
+        (
+            "一覧の要求",
+            &sources.tasks_panel,
+            "fn user_tasks_list_request(",
+        ),
+        (
+            "一覧の background",
+            &sources.tasks_panel,
+            "fn spawn_user_tasks_list(",
+        ),
         ("返答", &sources.tasks_panel, "fn user_task_respond("),
         ("ポーリング", &sources.tasks_panel, "fn tick_user_tasks("),
         ("ビューの語彙", &sources.protocol, "pub fn parse(s: &str)"),
@@ -621,19 +658,32 @@ fn 逆戻りを名指しできる() {
     // (1) 画面が正本（YAML / store）を直読みする
     let mut s = Sources::load(&root);
     s.tasks_panel = s.tasks_panel.replace(
-        "    pub(crate) fn tick_user_tasks(&mut self) {",
-        "    pub(crate) fn tick_user_tasks(&mut self) {\n        let _ = tako_control::user_tasks::load();",
+        "    pub(crate) fn tick_user_tasks(&mut self, cx: &mut Context<Self>) {",
+        "    pub(crate) fn tick_user_tasks(&mut self, cx: &mut Context<Self>) {\n        let _ = tako_control::user_tasks::load();",
     );
     expect_hit(&s, TASKS_PANEL, "`user_tasks::` に触っている");
 
     // (2) 一覧の取得が dispatch を通らない（画面専用の別経路になる）
     let mut s = Sources::load(&root);
-    let (_, window) = fn_window(&s.tasks_panel, "fn refresh_user_tasks(").expect("窓");
+    let (_, window) = fn_window(&s.tasks_panel, "fn user_tasks_list_request(").expect("窓");
     s.tasks_panel = s.tasks_panel.replace(
         &window,
         &window.replace("Request::UserTask", "Request::ListPanes"),
     );
     expect_hit(&s, TASKS_PANEL, "`Request::UserTask` を組んでいない");
+
+    // (2b) #2031: background の入口が要求を自前で組む（同期の入口と要求が割れる）
+    let mut s = Sources::load(&root);
+    let (_, window) = fn_window(&s.tasks_panel, "fn spawn_user_tasks_list(").expect("窓");
+    s.tasks_panel = s.tasks_panel.replace(
+        &window,
+        &window.replace("self.user_tasks_list_request()", "Request::ListPanes"),
+    );
+    expect_hit(
+        &s,
+        TASKS_PANEL,
+        "一覧の要求を `user_tasks_list_request()` で組んでいない",
+    );
 
     // (3) 絵文字が紛れ込む
     let mut s = Sources::load(&root);
@@ -681,14 +731,14 @@ fn 逆戻りを名指しできる() {
     let mut s = Sources::load(&root);
     s.main = s
         .main
-        .replace("app.tick_user_tasks();", "app.refresh_user_tasks();");
+        .replace("app.tick_user_tasks(wcx);", "app.refresh_user_tasks();");
     expect_hit(&s, MAIN, "`refresh_user_tasks` を直に呼んでいる");
 
     // (8) 返答コメント欄が手書きのカーソル操作へ戻る（3 本目の入力が生える）
     let mut s = Sources::load(&root);
     s.tasks_panel = s.tasks_panel.replace(
-        "    pub(crate) fn tick_user_tasks(&mut self) {",
-        "    pub(crate) fn tick_user_tasks(&mut self) {\n        let mut buf = String::new();\n        buf.drain(0..0);",
+        "    pub(crate) fn tick_user_tasks(&mut self, cx: &mut Context<Self>) {",
+        "    pub(crate) fn tick_user_tasks(&mut self, cx: &mut Context<Self>) {\n        let mut buf = String::new();\n        buf.drain(0..0);",
     );
     expect_hit(&s, TASKS_PANEL, "手書きのカーソル操作");
 
