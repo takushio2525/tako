@@ -22,7 +22,7 @@
 use std::path::Path;
 
 use crate::open_plan::PreviewRoute;
-use crate::text_edit::{CommentSyntax, IndentUnit};
+use crate::text_edit::{CommentSyntax, IndentUnit, Lexical, SingleQuote};
 
 /// 表の 1 行 = 1 つの形式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,8 @@ pub struct FileType {
     /// 行コメントの記号（#1692）。`None` = コメントの記号を持たない形式（プレーンテキスト・JSON・
     /// 表に無い形式）で、コメントの付け外しは本文を触らずに理由を返す
     pub comment: Option<CommentSyntax>,
+    /// 文字列とブロックコメントの書き方（#1691）。対応括弧の探索が中の括弧を数えない
+    pub lexical: Lexical,
 }
 
 /// 画像の形式（GPUI の `ImageFormat` と 1:1 だが GPUI 非依存にする）
@@ -103,6 +105,16 @@ pub const CODE: FileType = FileType {
     indent: IndentUnit::Spaces(4),
     enter: EnterRule::Brackets,
     comment: None,
+    lexical: LEX_CODE,
+};
+
+// 文字列とブロックコメントの書き方（#1691）。表の行がこのどれかを `lexical` に持つ
+/// 既定: `"…"` と 1 文字のリテラル `'x'`（表に無い形式もこれ）
+const LEX_CODE: Lexical = Lexical {
+    block_comment: None,
+    double_quote: true,
+    single_quote: SingleQuote::Char,
+    backtick: false,
 };
 
 /// Arduino のスケッチ（#1949）。`TAKO_1949_LEGACY=1` の A/B が名指す
@@ -144,6 +156,7 @@ const fn prose(id: &'static str, extensions: &'static [&'static str]) -> FileTyp
         id,
         extensions,
         enter: EnterRule::InheritOnly,
+        lexical: Lexical::PROSE,
         ..CODE
     }
 }

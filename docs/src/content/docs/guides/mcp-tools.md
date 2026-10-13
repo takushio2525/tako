@@ -75,7 +75,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_preview_edit` | コードプレビューの編集モードを開始・終了する（`command` で Tab / Shift+Tab / Enter と同じインデント編集） |
 | `tako_preview_apply` | 編集バッファの全文を差し替える |
 | `tako_preview_edit_range` | 行・桁で指定した範囲だけを置き換える（応答に文書の版が載る） |
-| `tako_preview_cursor` | 編集カーソルを行・桁で置く（`select_to_line` で選択） |
+| `tako_preview_cursor` | 編集カーソルを行・桁で置く（`select_to_line` で選択。応答の `document.bracket_match` で対応する括弧の位置を読める） |
 | `tako_lsp` | 言語サーバの言語機能（`action` = diagnostics（既定）で編集中のコードの診断。`pane` / `severity` で絞る。definition / declaration / type-definition / implementation で識別子の飛び先へ飛ぶ = GUI の修飾クリックと同じ。別のファイルは新しいペイン・開いているファイルはそのペイン・候補が複数なら `choice` で選ぶ。format で編集中のコードを整形する（undo 1 回で戻る。`line`・`column`〜`end_line`・`end_column` で範囲）。format-on-save で保存時整形の ON / OFF（既定 off・明示的な保存だけ）。completion でその位置の補完の候補（`choice` で入れる。言語サーバの読み込み中は済むまで待って答え、終わらなければ `status: loading`）。hover でその位置の型・doc（本文はそのまま。既定 16,000 字・`limit` で字数・0 で全文。`show` で画面にカードも出す）。references / incoming-calls / outgoing-calls / supertypes / subtypes でその位置の参照の一覧・呼び出しと型の木（`show` で右パネルにも出す。結果は検索したペインごとに持つ）。results で読み直し（`retained` = 持っている結果の数）、expand / collapse で木の段を開閉、open-result でその行を開く（`item` = 応答の `id`）、clear-results で消す） |
 | `tako_lsp_server` | 言語サーバ（LSP）の状態と起動・停止（`action` = status / list / restart / stop / logs / install。編集モードで自動的に起き、入っていなければ tako が取ってくる） |
 | `tako_preview_move` | 編集カーソルを単語・行・ページ・文書端の単位で動かす（`select` で選択を伸ばす） |

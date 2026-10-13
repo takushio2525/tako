@@ -30961,6 +30961,11 @@ mod self_test {
     mod workspace_search_1694;
     #[cfg(feature = "visual-test")]
     use workspace_search_1694::workspace_search_visual;
+    /// #1691: 対応する括弧の強調が実ピクセルで出て、対が無いと出ない（visual-test `bracket-match`）
+    #[cfg(feature = "visual-test")]
+    mod bracket_match_1691;
+    #[cfg(feature = "visual-test")]
+    use bracket_match_1691::bracket_match_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -45451,6 +45456,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1691: カーソルを括弧に置くと対の括弧が実ピクセルで強調され、対が無いと出ないか
+                "bracket-match" => {
+                    bracket_match_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -45465,7 +45476,7 @@ mod self_test {
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
-                         workspace-search-1694 / paste-guard）"
+                         workspace-search-1694 / paste-guard / bracket-match）"
                     );
                     std::process::exit(1);
                 }
@@ -45532,6 +45543,8 @@ mod self_test {
             // #1653: 検索欄のトグル（大文字小文字の区別 / 単語単位）を**実マウスで**押すと
             // 件数が変わり、既定（区別する）の置換が型名 `Value` を残すか
             search_case_visual(any, window, cx).await;
+            // #1691: カーソルを括弧に置くと対の括弧が実ピクセルで強調され、対が無いと出ないか
+            bracket_match_visual(any, window, cx).await;
             // #1659: 外部変更の帯（差分 / 上書き保存 / 読み直す）を実マウスで押して抜けられるか・
             // 競合中に打鍵を続けても知らせは 1 回のままか
             external_change_visual(any, window, cx).await;

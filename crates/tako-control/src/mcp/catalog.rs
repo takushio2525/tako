@@ -1023,7 +1023,8 @@ pub fn tools() -> Vec<Value> {
                 本文は変えないので version は増えない。\
                 行は 1 始まり、桁は 0 始まりの行内 UTF-8 バイト。select_to_line を渡すと line:col から\
                 そこまでを選択し、カーソルは select_to 側に来る（select_to_col 省略時は 0）。\
-                範囲外・文字の途中はエラー。結果は応答 document の cursor / selection で読む。\
+                範囲外・文字の途中はエラー。結果は応答 document の cursor / selection で読む\
+                （bracket_match = カーソルの隣の括弧とその対。無ければ null）。\
                 範囲編集は位置を自分で持つので、選択してから消す用途以外では tako_preview_edit_range だけで足りる。",
             "inputSchema": {
                 "type": "object",

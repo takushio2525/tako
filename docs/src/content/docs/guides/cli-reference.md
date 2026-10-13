@@ -760,6 +760,12 @@ tako edit search value      # 開いた欄で探す（ヒットが画面に出�
 tako edit search --close    # 閉じる（閲覧中の Markdown は描画へ戻る）
 ```
 
+カーソルの隣の括弧と、それと対になる括弧（画面で色が付く 2 文字）の位置は、編集系の応答の `document.bracket_match` で読めます。`bracket` がカーソルの隣の括弧、`match` がその対で、位置は `tako edit replace-range` と同じ（行は 1 始まり・桁は 0 始まりの行内バイト）です。対が無いとき・選択しているときは `null` です。
+
+```bash
+tako edit cursor 12:8   # 12 行目の 8 桁目へ置く → 応答の document.bracket_match を見る
+```
+
 ### tako file
 
 ファイルツリーの右クリックメニューに相当する操作群です。
