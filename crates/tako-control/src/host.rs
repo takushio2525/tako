@@ -59,6 +59,23 @@ pub trait SessionHost {
     }
     /// フォーカスの無いペインの再描画の上限を変える（#1979。値は検証済み・永続化は実装側）
     fn set_unfocused_redraw_fps(&mut self, _fps: u32) {}
+    /// マウス報告を要求する TUI への左クリックの転送の現在状態（#1961）
+    fn mouse_forward_status(&self) -> tako_core::mouse_forward::MouseForwardStatus {
+        tako_core::mouse_forward::MouseForwardStatus::default()
+    }
+    /// クリックの転送の on / off（#1961。次のクリックから効く・永続化は実装側）
+    fn set_mouse_forward(&mut self, _enabled: bool) {}
+    /// 直接ペインへ AI のクリック（押す + 離す）を渡す（#1961）。PTY への書き込みだけ
+    /// （子プロセスなし）。器のペインはここへ来ない（dispatch が background の
+    /// `mouse_forward::click_tmux` へ回す）。渡せない理由は `Err` の本文で返す
+    fn pane_click_direct(
+        &mut self,
+        _pane: PaneId,
+        _col: usize,
+        _row: usize,
+    ) -> Result<tako_core::mouse_forward::MouseReport, String> {
+        Err("このホストはクリックを渡せない".into())
+    }
     /// バックグラウンドから復帰させたペインのセッションを再接続する（FR-2.15.3）。
     /// セッション自体はバックグラウンド送り時に破棄していないため、UI 層で再描画するだけでよい場合が多い
     fn reattach_backgrounded(&mut self, _pane: PaneId) {}

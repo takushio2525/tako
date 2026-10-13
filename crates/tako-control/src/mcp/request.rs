@@ -31,6 +31,28 @@ pub(super) fn build_request(
                 focus: bool_arg(args, "focus")?,
             }
         }
+        // #1961: `click` を渡すと文字の代わりに左クリック（ツールは増やさない）
+        "tako_send_input" if args.get("click").is_some() => {
+            if args.get("text").is_some() {
+                return Err("click と text は同時に指定しない".into());
+            }
+            let click = args
+                .get("click")
+                .and_then(Value::as_object)
+                .ok_or("click は {\"row\": 行, \"col\": 桁}（0 始まりの表示セル）で指定する")?;
+            let cell = |key: &str| -> Result<usize, String> {
+                click
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+                    .ok_or_else(|| format!("click.{key} を 0 以上の整数で指定する"))
+            };
+            Request::PaneClick {
+                pane: Some(required_u64(args, "pane")?),
+                row: cell("row")?,
+                col: cell("col")?,
+            }
+        }
         "tako_send_input" => Request::Send {
             pane: Some(required_u64(args, "pane")?),
             text: str_arg(args, "text")?.ok_or("text を指定する")?,
@@ -352,6 +374,8 @@ pub(super) fn build_request(
             // #1979: フォーカスの無いペインの再描画の上限（ツールは増やさない）
             unfocused_fps: u64_arg(args, "unfocused_fps")?
                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+            // #1961: TUI への左クリックの転送（ツールは増やさない）
+            mouse_forward: bool_arg(args, "mouse_forward")?,
         },
         // #1654: `command` を渡すと Tab / Shift+Tab / Enter と同じ編集（ツールは増やさない）
         "tako_preview_edit" => match str_arg(args, "command")? {

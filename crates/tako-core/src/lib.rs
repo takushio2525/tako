@@ -40,6 +40,7 @@ pub mod lsp;
 pub mod md_links;
 pub mod migration;
 pub mod monotonic;
+pub mod mouse_forward;
 pub mod open_plan;
 pub mod osc_sink;
 pub mod osc_tap;

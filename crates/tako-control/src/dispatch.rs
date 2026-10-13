@@ -1974,6 +1974,14 @@ pub enum OffloadJob {
     /// 写し、リポジトリの解決（`git rev-parse`）と本体（pull / push はネットワークまで）は background。
     /// 本体は同期の腕と同じ [`git_write_reply`]（workspace に触らないのでそのまま応答する）
     GitWrite { cwd: PathBuf, request: Box<Request> },
+    /// 器のペインへの AI のクリック（#1961）。送り先の判定は UI スレッド（メモリだけ）、
+    /// ネスト tmux の解決・器への問い合わせ・`send-keys -H` は background
+    PaneClick {
+        target: PaneId,
+        source: tako_core::mouse_forward::TmuxClickSource,
+        row: usize,
+        col: usize,
+    },
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -2402,6 +2410,18 @@ pub fn prepare_offload(
         {
             Some(Ok(OffloadJob::TmuxWrite(Box::new(request.clone()))))
         }
+        // #1961: 器のペインへのクリックは器を起こすので background へ（直接ペインは PTY への
+        // 書き込みだけなので `None` = 同期の dispatch）
+        Request::PaneClick { pane, row, col } => match pane_click_plan(host, *pane) {
+            Err(e) => Some(Err(e)),
+            Ok((target, Some(source))) => Some(Ok(OffloadJob::PaneClick {
+                target,
+                source,
+                row: *row,
+                col: *col,
+            })),
+            Ok((_, None)) => None,
+        },
         Request::TmuxSelectWindow { pane, window } if !tako_core::probe::issue1989_legacy() => {
             Some(
                 tmux_select_window_target(host, *pane).map(|(target, resolved)| {
@@ -2592,6 +2612,12 @@ impl OffloadJob {
                 resolved,
                 window,
             } => tmux_select_window_reply(target, &resolved, window),
+            OffloadJob::PaneClick {
+                target,
+                source,
+                row,
+                col,
+            } => pane_click_tmux_reply(target, source, row, col),
             OffloadJob::TmuxCleanup(job) => Ok(match job {
                 crate::host::TmuxCleanupJob::Servers { apply } => {
                     tmux_cleanup_servers_reply(crate::host::cleanup_tmux_servers_default(apply))
@@ -5258,6 +5284,7 @@ fn dispatch_inner(
         Request::Scrollback {
             lines,
             unfocused_fps,
+            mouse_forward,
         } => {
             // 両方を検証してから当てる（片方だけ範囲外のとき、もう片方だけ効いた状態を作らない）
             let lines = lines
@@ -5273,6 +5300,9 @@ fn dispatch_inner(
             }
             if let Some(fps) = unfocused_fps {
                 host.set_unfocused_redraw_fps(fps);
+            }
+            if let Some(enabled) = mouse_forward {
+                host.set_mouse_forward(enabled);
             }
             let status = host.scrollback_status();
             let mut out = json!({
@@ -5291,7 +5321,22 @@ fn dispatch_inner(
                 ));
             }
             out["unfocused_redraw"] = redraw_limit_json(&host.redraw_limit_status());
+            out["mouse_forward"] = mouse_forward_json(&host.mouse_forward_status());
             Ok(out)
+        }
+        Request::PaneClick { pane, row, col } => {
+            let (target, source) = pane_click_plan(host, pane)?;
+            match source {
+                // 器のペイン: IPC は `prepare_offload` が background へ回す。ここへ来るのは
+                // offload を通らない同期の呼び手だけ（`TmuxSelectWindow` と同じ形。#1989）
+                Some(source) => pane_click_tmux_reply(target, source, row, col),
+                None => {
+                    let report = host
+                        .pane_click_direct(target, col, row)
+                        .map_err(DispatchError::Operation)?;
+                    Ok(pane_click_json(target, row, col, "pty", report))
+                }
+            }
         }
         Request::PreviewEdit { pane, enabled } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -18099,6 +18144,86 @@ fn tmux_select_window_target(
     Ok((target, resolved))
 }
 
+/// クリックの送り先（#1961。UI スレッド部 = メモリだけ）。`Some` = 器のペイン
+fn pane_click_plan(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+) -> Result<(PaneId, Option<tako_core::mouse_forward::TmuxClickSource>), DispatchError> {
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let source = tako_core::mouse_forward::TmuxClickSource::for_pane(
+        host.tmux_view(target).as_ref(),
+        host.backend_session(target).as_deref(),
+        &tako_core::tmux_backend::socket_name(),
+    );
+    Ok((target, source))
+}
+
+/// 器のペインへのクリックの本体（#1961。器を起こすので background で呼ぶ）
+fn pane_click_tmux_reply(
+    target: PaneId,
+    source: tako_core::mouse_forward::TmuxClickSource,
+    row: usize,
+    col: usize,
+) -> Result<Value, DispatchError> {
+    let resolved = source.resolve();
+    let report = tako_core::mouse_forward::click_tmux(&resolved, col, row)
+        .map_err(DispatchError::Operation)?;
+    Ok(pane_click_json(target, row, col, "tmux", report))
+}
+
+/// クリックの応答（#1961。CLI `tako click` / MCP `tako_send_input` の `click`）
+fn pane_click_json(
+    target: PaneId,
+    row: usize,
+    col: usize,
+    via: &str,
+    report: tako_core::mouse_forward::MouseReport,
+) -> Value {
+    json!({
+        "pane": target.as_u64(),
+        "row": row,
+        "col": col,
+        "forwarded": true,
+        // 届け方（pty = 直接ペインの PTY / tmux = 器への send-keys -H）
+        "via": via,
+        // 内側アプリが要求していた報告の形
+        "encoding": encoding_str(report.encoding),
+        "drag": report.drag,
+    })
+}
+
+fn encoding_str(encoding: tako_core::mouse_forward::Encoding) -> &'static str {
+    use tako_core::mouse_forward::Encoding;
+    match encoding {
+        Encoding::Sgr => "sgr",
+        Encoding::Utf8 => "utf8",
+        Encoding::X10 => "x10",
+    }
+}
+
+/// クリックの転送の応答（#1961。`tako mouse` / MCP `tako_scrollback` の `mouse_forward`）。
+/// `forwarded` は GUI のクリックを内側アプリへ渡した累計（2 回読んだ差で効いているかを
+/// 外から確かめる口）、`last` は最後に押したクリックの行き先と理由
+fn mouse_forward_json(status: &tako_core::mouse_forward::MouseForwardStatus) -> Value {
+    use tako_core::mouse_forward as mf;
+    json!({
+        "enabled": status.enabled,
+        "default": mf::DEFAULT_ENABLED,
+        "legacy": status.legacy,
+        "bypass_modifiers": mf::BYPASS_MODIFIERS,
+        "forwarded": {
+            "press": status.stats.press,
+            "drag": status.stats.drag,
+            "release": status.stats.release,
+        },
+        "last": status.stats.last.map(|(pane, forwarded, reason)| json!({
+            "pane": pane,
+            "forwarded": forwarded,
+            "reason": reason,
+        })),
+    })
+}
+
 /// `TmuxSelectWindow` の本体（`tmux select-window`。background で呼ぶ。#1989）
 fn tmux_select_window_reply(
     target: PaneId,
@@ -20526,6 +20651,10 @@ mod tests {
         scrollback: tako_core::scrollback::ScrollbackStatus,
         /// #1979: フォーカスの無いペインの再描画の上限
         redraw_limit: tako_core::redraw_limit::RedrawLimitStatus,
+        /// #1961: クリックの転送の設定と累計
+        mouse_forward: tako_core::mouse_forward::MouseForwardStatus,
+        /// #1961: 直接ペインへ渡した AI のクリック（ペイン, 桁, 行）
+        clicks: Vec<(u64, usize, usize)>,
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
         /// #1442: UI 層へ依頼した窓の位置・寸法（window ID, 矩形）
@@ -20666,6 +20795,8 @@ mod tests {
                     max_cols: 119,
                 },
                 redraw_limit: tako_core::redraw_limit::RedrawLimitStatus::default(),
+                mouse_forward: tako_core::mouse_forward::MouseForwardStatus::default(),
+                clicks: Vec::new(),
                 window_state_ops: Vec::new(),
                 window_geometry_ops: Vec::new(),
                 window_frames: std::collections::HashMap::new(),
@@ -20759,6 +20890,24 @@ mod tests {
         }
         fn set_unfocused_redraw_fps(&mut self, fps: u32) {
             self.redraw_limit.unfocused_fps = tako_core::redraw_limit::clamp_fps(fps);
+        }
+        fn mouse_forward_status(&self) -> tako_core::mouse_forward::MouseForwardStatus {
+            self.mouse_forward.clone()
+        }
+        fn set_mouse_forward(&mut self, enabled: bool) {
+            self.mouse_forward.enabled = enabled;
+        }
+        fn pane_click_direct(
+            &mut self,
+            pane: PaneId,
+            col: usize,
+            row: usize,
+        ) -> Result<tako_core::mouse_forward::MouseReport, String> {
+            self.clicks.push((pane.as_u64(), col, row));
+            Ok(tako_core::mouse_forward::MouseReport {
+                drag: true,
+                encoding: tako_core::mouse_forward::Encoding::Sgr,
+            })
         }
         fn session(&self, pane: PaneId) -> Option<&TerminalSession> {
             self.sessions.get(&pane.as_u64())
@@ -26128,6 +26277,7 @@ mod tests {
             Request::Scrollback {
                 lines: None,
                 unfocused_fps: None,
+                mouse_forward: None,
             },
             PaneOrigin::Cli,
         )
@@ -26146,6 +26296,7 @@ mod tests {
             Request::Scrollback {
                 lines: Some(1_000),
                 unfocused_fps: None,
+                mouse_forward: None,
             },
             PaneOrigin::Mcp,
         )
@@ -26160,6 +26311,7 @@ mod tests {
                 Request::Scrollback {
                     lines: Some(bad),
                     unfocused_fps: None,
+                    mouse_forward: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -26183,6 +26335,7 @@ mod tests {
             Request::Scrollback {
                 lines: None,
                 unfocused_fps: None,
+                mouse_forward: None,
             },
             PaneOrigin::Cli,
         )
@@ -26201,6 +26354,7 @@ mod tests {
             Request::Scrollback {
                 lines: None,
                 unfocused_fps: Some(12),
+                mouse_forward: None,
             },
             PaneOrigin::Mcp,
         )
@@ -26218,6 +26372,7 @@ mod tests {
                 Request::Scrollback {
                     lines: Some(1_000),
                     unfocused_fps: Some(bad),
+                    mouse_forward: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -26236,6 +26391,105 @@ mod tests {
             tako_core::scrollback::DEFAULT_LINES,
             "fps が範囲外のとき lines だけ効いた状態を作らない"
         );
+    }
+
+    /// #1961: 同じ口（CLI `tako mouse` / MCP `tako_scrollback` の `mouse_forward`）でクリックの
+    /// 転送を読み書きでき、ほかの値には触らない。応答に既定・修飾・累計が載る
+    #[test]
+    fn scrollbackの口でクリックの転送を切り替えられる() {
+        let mut host = MockHost::new();
+        let status = dispatch(
+            &mut host,
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None,
+                mouse_forward: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let mf = &status["mouse_forward"];
+        assert_eq!(mf["enabled"], true);
+        assert_eq!(mf["default"], true);
+        assert_eq!(mf["bypass_modifiers"], json!(["option", "shift"]));
+        assert_eq!(mf["forwarded"]["press"], 0);
+        assert!(mf["last"].is_null());
+
+        let off = dispatch(
+            &mut host,
+            Request::Scrollback {
+                lines: None,
+                unfocused_fps: None,
+                mouse_forward: Some(false),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(off["mouse_forward"]["enabled"], false);
+        assert!(!host.mouse_forward.enabled);
+        assert_eq!(
+            off["unfocused_redraw"]["fps"], 30,
+            "再描画の上限には触らない"
+        );
+        assert_eq!(off["lines"], tako_core::scrollback::DEFAULT_LINES);
+    }
+
+    /// #1961: AI のクリックは直接ペインなら同期の dispatch で PTY へ、器のペインなら
+    /// `prepare_offload` が background のジョブにする（UI スレッドで器を起こさない = #1979）
+    #[test]
+    fn クリックは直接ペインは同期_器のペインはoffloadへ回る() {
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let req = Request::PaneClick {
+            pane: Some(pane.as_u64()),
+            row: 3,
+            col: 7,
+        };
+        assert!(
+            prepare_offload(&mut host, &req).is_none(),
+            "直接ペインは PTY への書き込みだけ = offload しない"
+        );
+        let reply = dispatch(&mut host, req.clone(), PaneOrigin::Mcp).unwrap();
+        assert_eq!(reply["forwarded"], true);
+        assert_eq!(reply["via"], "pty");
+        assert_eq!(reply["encoding"], "sgr");
+        assert_eq!(
+            (reply["row"].clone(), reply["col"].clone()),
+            (json!(3), json!(7))
+        );
+        assert_eq!(host.clicks, vec![(pane.as_u64(), 7, 3)]);
+
+        host.backend_sessions
+            .insert(pane.as_u64(), "tako-mock-1961".into());
+        let job = prepare_offload(&mut host, &req)
+            .expect("器のペインは offload の対象")
+            .expect("送り先を採れる");
+        let OffloadJob::PaneClick {
+            target,
+            source,
+            row,
+            col,
+        } = job
+        else {
+            panic!("PaneClick のジョブではない");
+        };
+        assert_eq!((target, row, col), (pane, 3, 7));
+        assert!(
+            matches!(source, tako_core::mouse_forward::TmuxClickSource::Backend { ref session, .. } if session == "tako-mock-1961"),
+            "{source:?}"
+        );
+        assert_eq!(host.clicks.len(), 1, "器のペインは直接ペインの口を通らない");
+
+        let missing = dispatch(
+            &mut host,
+            Request::PaneClick {
+                pane: Some(9_999),
+                row: 0,
+                col: 0,
+            },
+            PaneOrigin::Cli,
+        );
+        assert!(missing.is_err(), "存在しないペインは押さない");
     }
 
     #[test]

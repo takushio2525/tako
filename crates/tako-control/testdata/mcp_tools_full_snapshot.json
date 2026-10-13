@@ -60,13 +60,32 @@
     "name": "tako_split_pane"
   },
   {
-    "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行 = 実行）。**誤指定はそのまま誤実行になるので、必ず tako_list_panes で確認したペイン ID を渡す**。tmux_session を指定するとペインが見つからなくても送れる。claude 等の全画面 TUI への改行つき送信は送達確認ループで配送され（マルチライン可）、応答は queued: true で即座に返る。顛末は応答と tako_read_pane の delivery で追う（読み方は tako_read_pane の説明）。応答の delivery には積む前に**未決着**（queued / waiting）だったフローだけが出る = この送達はその後ろに並ぶ（決着済みは出ない）。text を空にして newline: true で Enter 単独送信（入力欄が空へ戻るまで再送）。**選択肢ダイアログ表示中は送信を拒否してエラーを返す**（数字なら選択が確定してしまう）。エラー本文の選択肢を見て tako_orchestrator_respond で応答する。",
+    "description": "指定ペインの端末へテキストを書き込む（既定で末尾に改行 = 実行）。**誤指定はそのまま誤実行になるので、必ず tako_list_panes で確認したペイン ID を渡す**。tmux_session を指定するとペインが見つからなくても送れる。claude 等の全画面 TUI への改行つき送信は送達確認ループで配送され（マルチライン可）、応答は queued: true で即座に返る。顛末は応答と tako_read_pane の delivery で追う（読み方は tako_read_pane の説明）。応答の delivery には積む前に**未決着**（queued / waiting）だったフローだけが出る = この送達はその後ろに並ぶ（決着済みは出ない）。text を空にして newline: true で Enter 単独送信（入力欄が空へ戻るまで再送）。**選択肢ダイアログ表示中は送信を拒否してエラーを返す**（数字なら選択が確定してしまう）。エラー本文の選択肢を見て tako_orchestrator_respond で応答する。click を渡すと text の代わりにその表示セル（0 始まり）を左クリックする（押す + 離す。GUI のクリックと同じ経路）。内側アプリがマウス報告を要求していなければ渡さずエラー。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "await_prompt": {
           "description": "claude TUI の ❯ プロンプト表示を待ってから送信する（既定 false。子の Claude Code へ送るときに使う）",
           "type": "boolean"
+        },
+        "click": {
+          "additionalProperties": false,
+          "description": "左クリックするセル（tako_read_pane の行・桁）",
+          "properties": {
+            "col": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "row": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "row",
+            "col"
+          ],
+          "type": "object"
         },
         "newline": {
           "description": "末尾に改行を付けるか（省略時 true。プロンプトへの部分入力は false）",
@@ -78,7 +97,7 @@
           "type": "integer"
         },
         "text": {
-          "description": "送信するテキスト",
+          "description": "送信するテキスト（click と排他）",
           "type": "string"
         },
         "tmux_session": {
@@ -87,8 +106,7 @@
         }
       },
       "required": [
-        "pane",
-        "text"
+        "pane"
       ],
       "type": "object"
     },
@@ -1177,7 +1195,7 @@
     "name": "tako_preview_cache"
   },
   {
-    "description": "直接ペイン（tmux バックエンドを使わないペイン）のスクロールバック保持上限を確認・変更する。lines 省略時は現在値と既定・下限・上限・適用中のペイン数を返す。変更値は settings.json に永続化し、生存中のペインへもその場で適用する（下げれば履歴が切り詰められて RAM が戻る）。飽和時のフットプリントは 行 × 桁 × 24 バイトに比例するので、軽量運用では下げる。unfocused_fps はフォーカスの無いペインの出力による再描画の上限（フォーカス中は常に 60）。応答の unfocused_redraw に現在値と累計の再描画回数（flushes）が載る。",
+    "description": "直接ペイン（tmux バックエンドを使わないペイン）のスクロールバック保持上限を確認・変更する。lines 省略時は現在値と既定・下限・上限・適用中のペイン数を返す。変更値は settings.json に永続化し、生存中のペインへもその場で適用する（下げれば履歴が切り詰められて RAM が戻る）。飽和時のフットプリントは 行 × 桁 × 24 バイトに比例するので、軽量運用では下げる。unfocused_fps はフォーカスの無いペインの出力による再描画の上限（フォーカス中は常に 60）。応答の unfocused_redraw に現在値と累計の再描画回数（flushes）が載る。mouse_forward はマウス報告を要求する TUI（全画面の claude 等）へ左クリック / ドラッグを渡すか（既定 true。Option / Shift + ドラッグは常に tako の選択）。応答の mouse_forward に累計と最後の行き先。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1186,6 +1204,10 @@
           "maximum": 100000,
           "minimum": 100,
           "type": "integer"
+        },
+        "mouse_forward": {
+          "description": "TUI へのクリックの転送（既定 true）",
+          "type": "boolean"
         },
         "unfocused_fps": {
           "description": "再描画の上限 fps（既定 30）",

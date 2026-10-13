@@ -2745,6 +2745,179 @@ set -gq copy-mode-position-format ''
         );
     }
 
+    /// 器のペインへのクリックの e2e（#1961 = #167 の拡張）。押す・ドラッグ・離すの洪水を
+    /// GUI と同じ 1 実装（`mouse_forward::send_tmux` = `send-keys -H`）で注入しても、
+    /// ESC の欠けた断片が内側の入力へ平文で混ざらず、**押す・離すは 1 つも欠けない**。
+    /// 内側は claude と同じ raw mode + ボタンを押したままの移動の要求（1002 + SGR）+
+    /// kitty keyboard の要求（claude が出す `CSI > 1 u` = 拡張キーの器の経路を通す）
+    #[test]
+    #[cfg(unix)]
+    fn クリックのtmux直接注入は断片を混ぜず押す離すを欠かさない() {
+        use crate::mouse_forward::{self as mf, ClickPhase, Encoding};
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-click-{}", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let inner = r#"stty raw -echo; printf '\033[?1002h\033[?1006h\033[>1u'; exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#;
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), inner.into()],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+            scrollback_lines: None,
+        };
+        let session_name = "tako-e2e-click";
+        let (mut session, mut rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
+                .expect("tmux クライアントを spawn できる");
+        // rx（PtyWrite = tmux の端末クエリへの応答）は実運用の UI 層と同様に毎周期処理する
+        let mut drain = || {
+            while let Ok(event) = rx.try_recv() {
+                session.process_event(event);
+            }
+        };
+        // アンカーは器のペイン側の要求（#1252。外側は器の mouse on で常に真）
+        wait_pane_mouse_ready(&socket, session_name, &mut drain).unwrap_or_else(|e| {
+            panic!("内側アプリのマウス要求が器のペインへ届かない（#1252）。{e}")
+        });
+        let target = crate::scroll::ScrollTarget::Backend {
+            socket: socket.clone(),
+            session: session_name.into(),
+        };
+        // GUI と同じ問い合わせで「ドラッグも要求する SGR」と読める
+        let flags = mf::tmux_mouse_flags(&target).expect("器へ問い合わせられる");
+        let report = mf::decide(flags.report(), flags.in_mode)
+            .unwrap_or_else(|r| panic!("渡す判断にならない: {} {flags:?}", r.as_str()));
+        assert_eq!(report.encoding, Encoding::Sgr, "{flags:?}");
+        assert!(
+            report.drag,
+            "1002 を要求したのにドラッグを渡さない: {flags:?}"
+        );
+
+        // 洪水: 押す → 12 セルのドラッグ → 離すを 150 回。GUI の送信（`pump_click`）と同じく
+        // 送信中に溜まったぶんを 1 回の send-keys へまとめる（ここでは 1 往復ぶんずつ）
+        const ROUNDS: usize = 150;
+        let cell = |phase, col| mf::click_report_bytes(report, phase, col, 5, false).unwrap();
+        for _ in 0..ROUNDS {
+            let mut bytes = cell(ClickPhase::Press, 5);
+            for col in 6..18 {
+                bytes.extend(cell(ClickPhase::Drag, col));
+            }
+            bytes.extend(cell(ClickPhase::Release, 17));
+            mf::send_tmux(&target, &bytes).expect("send-keys -H が通る");
+            drain();
+        }
+
+        const PRESS: &str = "^[[<0;6;6M";
+        const RELEASE: &str = "^[[<0;18;6m";
+        let mut last_capture = PaneCapture::default();
+        let settled = wait_for_state(
+            "押す・離すが全部届く",
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(200),
+            || {
+                drain();
+                last_capture = capture_pane_text(&socket, session_name);
+                let text = last_capture.text.as_deref().unwrap_or("");
+                (text.matches(RELEASE).count() >= ROUNDS).then_some(())
+            },
+        );
+        let all = last_capture.text.clone().unwrap_or_default();
+        let (press, release) = (all.matches(PRESS).count(), all.matches(RELEASE).count());
+        // 無傷のレポートを全部取り除いた残りに座標の断片が残っていたら、ESC 欠落断片が
+        // 平文として内側へ届いている（= #167 の症状）
+        let mut stripped = all.replace(PRESS, "").replace(RELEASE, "");
+        for col in 7..=18 {
+            stripped = stripped.replace(&format!("^[[<32;{col};6M"), "");
+        }
+        assert!(
+            !stripped.contains(";6M") && !stripped.contains(";6m"),
+            "ESC 欠落断片が内側へテキストとして漏れている（#167 型）。残骸例: {:?}",
+            stripped
+                .lines()
+                .filter(|l| l.contains(";6M") || l.contains(";6m"))
+                .take(3)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (press, release),
+            (ROUNDS, ROUNDS),
+            "押す・離すが欠けた（離すが欠けると内側アプリが押しっぱなしだと思い込む）。{} {}",
+            settled
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "揃った".into()),
+            last_capture.note
+        );
+        eprintln!("クリック {ROUNDS} 回（ドラッグ各 12）→ 押す {press} / 離す {release}・断片ゼロ");
+    }
+
+    /// マウスを要求しないアプリ（シェル相当）の器のペインへは AI のクリックを渡さず、
+    /// 入力に制御列を 1 バイトも打たない（#1961 の受け入れ 3）。理由の語は `not_requested`
+    #[test]
+    #[cfg(unix)]
+    fn マウスを要求しない器のペインへはクリックを渡さない() {
+        use crate::mouse_forward as mf;
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-noclick-{}", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf 'READY\\n'; exec cat -v".into()],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+            scrollback_lines: None,
+        };
+        let session_name = "tako-e2e-noclick";
+        let (mut session, mut rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session_name))
+                .expect("tmux クライアントを spawn できる");
+        let mut capture_until = |what: &str, needle: &str| {
+            wait_for_state(
+                what,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(100),
+                || {
+                    while let Ok(event) = rx.try_recv() {
+                        session.process_event(event);
+                    }
+                    capture_pane_text(&socket, session_name)
+                        .text
+                        .filter(|t| t.contains(needle))
+                },
+            )
+            .unwrap_or_else(|e| panic!("{what} が見えない: {e}"))
+        };
+        capture_until("内側アプリの起動（READY）", "READY");
+        let target = crate::scroll::ScrollTarget::Backend {
+            socket: socket.clone(),
+            session: session_name.into(),
+        };
+        let err = mf::click_tmux(&target, 4, 4).expect_err("要求していないアプリへ渡した");
+        assert!(err.contains("not_requested"), "理由の語が無い: {err}");
+        // 打っていないことを、打った場合に必ず見える印（cat -v の `^[[<`）が無いことで見る。
+        // 後から打った END が見えた時点で、それより前の入力は届き切っている
+        crate::tmux::query(
+            Some(&socket),
+            &["send-keys", "-t", session_name, "-l", "END"],
+        )
+        .expect("END を打てる");
+        let text = capture_until("後から打った END のエコー", "END");
+        assert!(
+            !text.contains("^[[<") && !text.contains("^[[M"),
+            "マウスを要求しないアプリへ制御列が届いた: {text:?}"
+        );
+    }
+
     /// Esc 単押しが「kitty を要求していない」内側アプリ（素の zsh 相当）にも
     /// 素の \e のまま届き、「27u」が文字として漏れない e2e
     /// （2026-06-12 実機バグの再発防止）。
