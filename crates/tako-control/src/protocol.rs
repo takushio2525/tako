@@ -843,7 +843,10 @@ pub enum Request {
     ///
     /// `command` は `EditorCommand::edit_names` の綴り（`indent` = 選択行を深く /
     /// 選択が無ければカーソル位置へ 1 段、`outdent` = 浅く、`newline` = インデントを
-    /// 引き継ぐ改行）。インデントの単位は既存行から推定する
+    /// 引き継ぐ改行）。インデントの単位は既存行から推定する。
+    ///
+    /// `line-<操作>`（#1692）は行単位の操作で、GUI の ⌥↑↓ / ⇧⌥↑↓ / ⌘/ / ⌘] ⌘[ と同じ口を通る
+    /// （操作の綴りは `tako_core::text_edit::LineOperation::name`。CLI は `tako edit line <操作>`）
     PreviewEditCommand {
         pane: Option<u64>,
         command: String,

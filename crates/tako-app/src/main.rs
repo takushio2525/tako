@@ -15635,7 +15635,9 @@ impl TakoApp {
         if let Some(lines) = viewport_lines {
             edit.buffer.set_viewport_lines(lines);
         }
-        command.apply(&mut edit.buffer);
+        // 当てられない操作（コメント記号を知らない形式の ⌘/。#1692）は本文を触らずに
+        // 理由が返る。打鍵ならフッタへ、CLI / MCP ならエラーとして出る（呼び手が載せる）
+        command.apply(&mut edit.buffer)?;
         let changed = edit.buffer.version() != version;
         edit.message = None;
         self.refresh_preview_from_editor(pane_id);
@@ -51096,6 +51098,7 @@ mod self_test {
     ///
     /// 判定は新しい挙動を無条件に主張する。`TAKO_1652_LEGACY=1`（入口で修飾キー付きの
     /// 打鍵を捨てる旧経路）では最初の修飾キーの相で落ちる = A/B の検出力。
+    /// (15) の行の操作（#1692）は #1692 より前のバイナリでは打鍵が表に無く、何も起きずに落ちる。
     /// 単独実行は `TAKO_VISUAL_ONLY=editor-keys`
     #[cfg(feature = "visual-test")]
     async fn editor_keys_visual(
@@ -51603,7 +51606,101 @@ mod self_test {
             println!("TAKO_VISUAL_PIXEL: editor-keys ctrl-a-e-k skipped=windows（macOS の列だけ）");
         }
 
-        // (15) IME の変換中は本文にもカーソルにも触らない。確定は変換を始めた位置へ入る
+        // (15) 行の操作（#1692）。移動 ⌥↑↓ / Ctrl+↑↓・複製 ⇧⌥↓ / Ctrl+Shift+↓・
+        // コメント ⌘/ / Ctrl+/・行ごとのインデント ⌘] ⌘[ / Ctrl+] Ctrl+[ がキーバインドに
+        // 食われずに編集へ届き、戻すと元の本文へバイト一致で戻る。
+        // 行 1 = `    let value = 1;`・行 2 = `    println!("日本語のテキスト");`
+        let line_down = key("alt-down", "ctrl-down");
+        let line_up = key("alt-up", "ctrl-up");
+        let duplicate_down = key("alt-shift-down", "ctrl-shift-down");
+        let toggle_comment = key("cmd-/", "ctrl-/");
+        let indent_line = key("cmd-]", "ctrl-]");
+        let outdent_line = key("cmd-[", "ctrl-[");
+        let full_text = |cx: &mut AsyncApp| -> String {
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_edits
+                        .get(&pane)
+                        .map(|edit| edit.buffer.text().to_string())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        let original = full_text(cx);
+        place(cx, 1, 8);
+        press(any, cx, line_down);
+        let moved = observe(cx, 2);
+        report("line-move-down", line_down, &moved);
+        check(
+            moved.0 == "    let value = 1;"
+                && moved.1 == (2, 8)
+                && observe(cx, 1).0 == "    println!(\"日本語のテキスト\");",
+            &format!("visual-test editor-keys: {line_down} で行が 1 行下へ動く (#1692。{moved:?})"),
+        );
+        press(any, cx, line_up);
+        let back = observe(cx, 1);
+        report("line-move-up", line_up, &back);
+        check(
+            back.0 == "    let value = 1;" && back.1 == (1, 8) && full_text(cx) == original,
+            &format!("visual-test editor-keys: {line_up} で元の位置へ戻る (#1692。{back:?})"),
+        );
+        press(any, cx, duplicate_down);
+        let duplicated = observe(cx, 2);
+        report("line-duplicate-down", duplicate_down, &duplicated);
+        check(
+            duplicated.0 == "    let value = 1;"
+                && duplicated.1 == (2, 8)
+                && observe(cx, 1).0 == "    let value = 1;",
+            &format!(
+                "visual-test editor-keys: {duplicate_down} で行が複製されカーソルは下の写しへ \
+                 (#1692。{duplicated:?})"
+            ),
+        );
+        undo(cx);
+        check(
+            full_text(cx) == original,
+            "visual-test editor-keys: 行の複製は undo 1 回で元の本文へ戻る (#1692)",
+        );
+        place(cx, 1, 8);
+        press(any, cx, toggle_comment);
+        let commented = observe(cx, 1);
+        report("line-toggle-comment", toggle_comment, &commented);
+        check(
+            commented.0 == "    // let value = 1;" && commented.1 == (1, 11),
+            &format!(
+                "visual-test editor-keys: {toggle_comment} で行コメントが付く (#1692。{commented:?})"
+            ),
+        );
+        press(any, cx, toggle_comment);
+        let uncommented = observe(cx, 1);
+        check(
+            uncommented.0 == "    let value = 1;" && uncommented.1 == (1, 8),
+            &format!(
+                "visual-test editor-keys: もう一度 {toggle_comment} で外れる (#1692。{uncommented:?})"
+            ),
+        );
+        press(any, cx, indent_line);
+        let deeper = observe(cx, 1);
+        report("line-indent", indent_line, &deeper);
+        check(
+            deeper.0 == "        let value = 1;" && deeper.1 == (1, 12),
+            &format!(
+                "visual-test editor-keys: {indent_line} で選択が無くても行ごと深くなる (#1692。{deeper:?})"
+            ),
+        );
+        press(any, cx, outdent_line);
+        let shallower = observe(cx, 1);
+        report("line-outdent", outdent_line, &shallower);
+        check(
+            shallower.0 == "    let value = 1;"
+                && shallower.1 == (1, 8)
+                && full_text(cx) == original,
+            &format!(
+                "visual-test editor-keys: {outdent_line} で元の本文へ戻る (#1692。{shallower:?})"
+            ),
+        );
+
+        // (16) IME の変換中は本文にもカーソルにも触らない。確定は変換を始めた位置へ入る
         place(cx, 1, 13);
         let before = observe(cx, 1);
         window

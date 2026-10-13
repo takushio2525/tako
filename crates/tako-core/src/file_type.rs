@@ -6,6 +6,7 @@
 //! - 色分け（tako-app の構文の選び方。`syntax` → two-face の順）と Markdown のコードブロックの別名
 //! - プレビューの種別・HTTP の型（[`crate::open_plan`]。tako-app の画像の形式・Markdown 判定も同じ）
 //! - インデントの既定と Enter の規則（[`crate::text_edit`]）
+//! - 行コメントの記号（⌘/ と `tako edit line toggle-comment`。#1692）
 //! - CLI / MCP の応答の `file_type`（`tako open` の結果・`tako edit` の応答）
 //!
 //! **全 213 構文を並べない**。行を持つのは「既定（[`CODE`] = code・two-face 任せ・4 スペース・
@@ -21,7 +22,7 @@
 use std::path::Path;
 
 use crate::open_plan::PreviewRoute;
-use crate::text_edit::IndentUnit;
+use crate::text_edit::{CommentSyntax, IndentUnit};
 
 /// 表の 1 行 = 1 つの形式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,9 @@ pub struct FileType {
     pub indent: IndentUnit,
     /// Enter で 1 段深くする規則（#1654）
     pub enter: EnterRule,
+    /// 行コメントの記号（#1692）。`None` = コメントの記号を持たない形式（プレーンテキスト・JSON・
+    /// 表に無い形式）で、コメントの付け外しは本文を触らずに理由を返す
+    pub comment: Option<CommentSyntax>,
 }
 
 /// 画像の形式（GPUI の `ImageFormat` と 1:1 だが GPUI 非依存にする）
@@ -98,16 +102,38 @@ pub const CODE: FileType = FileType {
     media_type: None,
     indent: IndentUnit::Spaces(4),
     enter: EnterRule::Brackets,
+    comment: None,
 };
 
 /// Arduino のスケッチ（#1949）。`TAKO_1949_LEGACY=1` の A/B が名指す
 pub const ARDUINO: &str = "arduino";
 
-/// 挙動の表が名指すだけの言語（既定のまま。行があること自体が「tako が知っている形式」）
-const fn lang(id: &'static str, extensions: &'static [&'static str]) -> FileType {
+// 行コメントの記号（#1692）。表の行がこのどれかを `comment` に持つ
+const SLASHES: Option<CommentSyntax> = Some(CommentSyntax::Line("//"));
+const HASH: Option<CommentSyntax> = Some(CommentSyntax::Line("#"));
+const DASHES: Option<CommentSyntax> = Some(CommentSyntax::Line("--"));
+const SEMICOLON: Option<CommentSyntax> = Some(CommentSyntax::Line(";"));
+/// 行コメントを持たない形式は行ごとに囲む（HTML 系・CSS）
+const MARKUP: Option<CommentSyntax> = Some(CommentSyntax::Block {
+    open: "<!--",
+    close: "-->",
+});
+const C_BLOCK: Option<CommentSyntax> = Some(CommentSyntax::Block {
+    open: "/*",
+    close: "*/",
+});
+
+/// 色・インデント・Enter は既定のまま、行コメントの記号だけを持つ言語
+/// （挙動の表が名指す言語と、コメントの記号を言うために行を持つ言語）
+const fn lang(
+    id: &'static str,
+    extensions: &'static [&'static str],
+    comment: Option<CommentSyntax>,
+) -> FileType {
     FileType {
         id,
         extensions,
+        comment,
         ..CODE
     }
 }
@@ -157,11 +183,13 @@ const fn named(
     id: &'static str,
     file_names: &'static [&'static str],
     syntax: &'static str,
+    comment: Option<CommentSyntax>,
 ) -> FileType {
     FileType {
         id,
         file_names,
         syntax: Some(syntax),
+        comment,
         ..CODE
     }
 }
@@ -175,18 +203,26 @@ pub const TABLE: &[FileType] = &[
         preview: PreviewRoute::Markdown,
         media_type: Some("text/markdown; charset=utf-8"),
         enter: EnterRule::InheritOnly,
+        comment: MARKUP,
         ..CODE
     },
     prose("mdx", &["mdx"]),
     prose("plaintext", &["txt"]),
     prose("restructuredtext", &["rst"]),
-    prose("asciidoc", &["adoc"]),
+    FileType {
+        comment: SLASHES,
+        ..prose("asciidoc", &["adoc"])
+    },
     // ─── 画像・PDF・動画（プレビューの種別と HTTP の型） ────────────────
     image("png", &["png"], ImageFormat::Png, "image/png"),
     image("jpeg", &["jpg", "jpeg"], ImageFormat::Jpeg, "image/jpeg"),
     image("gif", &["gif"], ImageFormat::Gif, "image/gif"),
     image("webp", &["webp"], ImageFormat::WebP, "image/webp"),
-    image("svg", &["svg"], ImageFormat::Svg, "image/svg+xml"),
+    // SVG は XML なので、本文を編集するときのコメントは XML の囲み
+    FileType {
+        comment: MARKUP,
+        ..image("svg", &["svg"], ImageFormat::Svg, "image/svg+xml")
+    },
     FileType {
         id: "pdf",
         extensions: &["pdf"],
@@ -206,12 +242,14 @@ pub const TABLE: &[FileType] = &[
         extensions: &["mk"],
         file_names: &["Makefile", "GNUmakefile"],
         indent: IndentUnit::Tab,
+        comment: HASH,
         ..CODE
     },
     FileType {
         id: "go",
         extensions: &["go"],
         indent: IndentUnit::Tab,
+        comment: SLASHES,
         ..CODE
     },
     // ─── `:` でも深くするもの ───────────────────────────────────────
@@ -219,12 +257,14 @@ pub const TABLE: &[FileType] = &[
         id: "python",
         extensions: &["py", "pyi", "pyw"],
         enter: EnterRule::BracketsAndColon,
+        comment: HASH,
         ..CODE
     },
     FileType {
         id: "yaml",
         extensions: &["yml", "yaml"],
         enter: EnterRule::BracketsAndColon,
+        comment: HASH,
         ..CODE
     },
     // `CMakeLists.txt` は拡張子だけで見ると `txt`（継承だけ）になる。ファイル名の行で
@@ -232,6 +272,7 @@ pub const TABLE: &[FileType] = &[
     FileType {
         id: "cmake",
         file_names: &["CMakeLists.txt"],
+        comment: HASH,
         ..CODE
     },
     // ─── two-face に無い拡張子・ファイル名を塗れる構文へ寄せるもの ────────────
@@ -239,16 +280,18 @@ pub const TABLE: &[FileType] = &[
         id: "javascript",
         extensions: &["js", "mjs", "cjs"],
         syntax: Some("JavaScript"),
+        comment: SLASHES,
         ..CODE
     },
     FileType {
         id: "javascriptreact",
         extensions: &["jsx"],
         syntax: Some("JavaScript"),
+        comment: SLASHES,
         ..CODE
     },
-    lang("typescript", &["ts", "mts", "cts"]),
-    lang("typescriptreact", &["tsx"]),
+    lang("typescript", &["ts", "mts", "cts"], SLASHES),
+    lang("typescriptreact", &["tsx"], SLASHES),
     // `.ino` は C++ として塗る（#1949）。two-face に Arduino の構文は無く、VS Code 同梱の
     // cpp 言語定義も `.ino` を C++ に含める。寄せるのは**色だけ**で、言語サーバは別
     // （clangd へ `.ino` を渡すと正しいスケッチに嘘のエラーが出る = #1951）
@@ -257,65 +300,106 @@ pub const TABLE: &[FileType] = &[
         extensions: &["ino"],
         syntax: Some("C++"),
         fence_tokens: &["ino", "arduino"],
+        comment: SLASHES,
         ..CODE
     },
-    named("ignore", &[".dockerignore"], "Git Ignore"),
-    named("ini", &[".npmrc", ".yarnrc"], "INI"),
-    named("json", &[".eslintrc", ".prettierrc", ".babelrc"], "JSON"),
-    named("just", &["Justfile"], "Makefile"),
+    named("ignore", &[".dockerignore"], "Git Ignore", HASH),
+    named("ini", &[".npmrc", ".yarnrc"], "INI", SEMICOLON),
+    // JSON はコメントを持たない（表に無い `.json` も同じく記号なし）
+    named(
+        "json",
+        &[".eslintrc", ".prettierrc", ".babelrc"],
+        "JSON",
+        None,
+    ),
+    named("just", &["Justfile"], "Makefile", HASH),
     // ─── 挙動の表（言語サーバ・実行の既定・実行のプロジェクト）が名指す言語 ──────
-    lang("c", &["c"]),
+    lang("c", &["c"], SLASHES),
     // `.h` は VS Code と同じく C++ のヘッダとして数える（色は今は two-face 任せ = #1953）
-    lang("cpp", &["cpp", "cc", "cxx", "h", "hh", "hpp", "hxx"]),
-    lang("rust", &["rs"]),
-    lang("shellscript", &["sh", "bash", "zsh", "command"]),
-    lang("powershell", &["ps1"]),
-    lang("bat", &["bat", "cmd"]),
-    lang("ruby", &["rb"]),
-    lang("perl", &["pl"]),
-    lang("php", &["php"]),
-    lang("lua", &["lua"]),
-    lang("java", &["java"]),
-    lang("kotlin", &["kt"]),
-    lang("scala", &["scala"]),
-    lang("swift", &["swift"]),
-    lang("csharp", &["cs"]),
-    lang("fsharp", &["fs"]),
-    lang("vb", &["vb"]),
-    lang("dart", &["dart"]),
-    lang("r", &["r"]),
-    lang("julia", &["jl"]),
-    lang("haskell", &["hs"]),
-    lang("clojure", &["clj"]),
-    lang("elixir", &["ex"]),
-    lang("zig", &["zig"]),
-    lang("nim", &["nim"]),
-    lang("sql", &["sql"]),
-    lang("latex", &["tex"]),
-    lang("jupyter", &["ipynb"]),
+    lang(
+        "cpp",
+        &["cpp", "cc", "cxx", "h", "hh", "hpp", "hxx"],
+        SLASHES,
+    ),
+    lang("rust", &["rs"], SLASHES),
+    lang("shellscript", &["sh", "bash", "zsh", "command"], HASH),
+    lang("powershell", &["ps1"], HASH),
+    lang("bat", &["bat", "cmd"], Some(CommentSyntax::Line("REM"))),
+    lang("ruby", &["rb"], HASH),
+    lang("perl", &["pl"], HASH),
+    lang("php", &["php"], SLASHES),
+    lang("lua", &["lua"], DASHES),
+    lang("java", &["java"], SLASHES),
+    lang("kotlin", &["kt"], SLASHES),
+    lang("scala", &["scala"], SLASHES),
+    lang("swift", &["swift"], SLASHES),
+    lang("csharp", &["cs"], SLASHES),
+    lang("fsharp", &["fs"], SLASHES),
+    lang("vb", &["vb"], Some(CommentSyntax::Line("'"))),
+    lang("dart", &["dart"], SLASHES),
+    lang("r", &["r"], HASH),
+    lang("julia", &["jl"], HASH),
+    lang("haskell", &["hs"], DASHES),
+    lang("clojure", &["clj"], SEMICOLON),
+    lang("elixir", &["ex"], HASH),
+    lang("zig", &["zig"], SLASHES),
+    lang("nim", &["nim"], HASH),
+    lang("sql", &["sql"], DASHES),
+    lang("latex", &["tex"], Some(CommentSyntax::Line("%"))),
+    // ノートブックは JSON（セルの中のコメントはノートブックの編集の外）
+    lang("jupyter", &["ipynb"], None),
+    // ─── コメントの記号を言うために行を持つ言語（#1692。色・インデント・Enter は既定のまま） ─
+    lang("html", &["html", "htm"], MARKUP),
+    lang("xml", &["xml"], MARKUP),
+    lang("vue", &["vue"], MARKUP),
+    lang("css", &["css"], C_BLOCK),
+    lang("scss", &["scss"], SLASHES),
+    lang("less", &["less"], SLASHES),
+    lang("jsonc", &["jsonc"], SLASHES),
+    lang("toml", &["toml"], HASH),
+    FileType {
+        id: "dockerfile",
+        file_names: &["Dockerfile"],
+        comment: HASH,
+        ..CODE
+    },
 ];
 
 /// パスの形式（**ファイル名 → 拡張子**の順。どちらも大文字小文字を問わない）。
 /// 表に無ければ `None`（既定 = [`CODE`] の扱い）
 pub fn identify(path: &Path) -> Option<&'static FileType> {
+    identify_in(TABLE, path)
+}
+
+/// 渡した表からパスの形式を引く（[`identify`] の中身）。表を引数で受けるのは、単体が
+/// 「表に 1 行足すだけで結果が変わる」を表のコピーで確かめるため（#1692）
+pub fn identify_in<'a>(table: &'a [FileType], path: &Path) -> Option<&'a FileType> {
     path.file_name()
         .and_then(|name| name.to_str())
-        .and_then(by_file_name)
-        .or_else(|| by_extension(path.extension()?.to_str()?))
+        .and_then(|name| file_name_in(table, name))
+        .or_else(|| extension_in(table, path.extension()?.to_str()?))
 }
 
 /// ファイル名で決まる形式
 pub fn by_file_name(name: &str) -> Option<&'static FileType> {
-    TABLE.iter().find(|row| {
+    file_name_in(TABLE, name)
+}
+
+/// 拡張子（先頭の `.` を含まない）の形式
+pub fn by_extension(ext: &str) -> Option<&'static FileType> {
+    extension_in(TABLE, ext)
+}
+
+fn file_name_in<'a>(table: &'a [FileType], name: &str) -> Option<&'a FileType> {
+    table.iter().find(|row| {
         row.file_names
             .iter()
             .any(|known| known.eq_ignore_ascii_case(name))
     })
 }
 
-/// 拡張子（先頭の `.` を含まない）の形式
-pub fn by_extension(ext: &str) -> Option<&'static FileType> {
-    TABLE.iter().find(|row| {
+fn extension_in<'a>(table: &'a [FileType], ext: &str) -> Option<&'a FileType> {
+    table.iter().find(|row| {
         row.extensions
             .iter()
             .any(|known| known.eq_ignore_ascii_case(ext))

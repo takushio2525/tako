@@ -30,6 +30,12 @@ use thiserror::Error;
 
 use crate::platform::support::Platform;
 
+// 行単位の操作（複製・移動・行インデント・コメントの付け外し。#1692）
+mod line_ops;
+pub use line_ops::{
+    comment_syntax_for, comment_syntax_in, CommentSyntax, LineOpError, LineOperation,
+};
+
 /// undo 履歴に積む操作の数の上限（#195）
 const UNDO_LIMIT: usize = 1000;
 
@@ -1453,12 +1459,11 @@ impl TextBuffer {
     /// 深くするとき空行・空白だけの行は触らない（行末の空白を作らない）。
     /// カーソルと選択は同じ文字を指し続けるようにずらす
     fn shift_lines(&mut self, range: Range<usize>, deeper: bool) {
-        let first = self.line_start(range.start);
-        let mut last_point = range.end;
-        if range.end > range.start && self.line_start(range.end) == range.end {
-            last_point -= line_break_len_before(&self.text, range.end);
-        }
-        let block_end = self.line_end(last_point.max(first));
+        // 対象の行の決め方は行操作（#1692）と同じ 1 実装
+        let Range {
+            start: first,
+            end: block_end,
+        } = self.line_block(range);
         let unit = self.indent_unit();
         let unit_text = unit.text();
         // (元の行頭, 行頭で足した / 引いたバイト数)

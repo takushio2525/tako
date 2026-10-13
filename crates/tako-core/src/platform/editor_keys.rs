@@ -31,11 +31,15 @@
 //!   いくので、どちらも列に書かない
 //! - **shift は「選択を伸ばす」**。移動の行だけが shift を読み、削除・改行・
 //!   編集終了は shift の有無を問わない（従来どおり ⇧⌫ は ⌫ と同じ）。
-//!   **例外は Tab だけ**で、shift は「浅くする」（⇧Tab = アンインデント。#1654）
+//!   **例外は 2 つ**で、Tab の shift は「浅くする」（⇧Tab = アンインデント。#1654）、
+//!   行の移動の shift は「複製する」（⇧⌥↑↓ = 行の複製。#1692。VS Code と同じ）
+//! - **shift を受けない行**がある（⌘/ ⌘] ⌘[ の行操作。#1692）。⇧⌘] / ⇧⌘[ はタブ切替の
+//!   キーバインドが持つので、編集が受理すると「受理したのに届かない」打鍵が表に載る
+//!   （[`Action::accepts_shift`]。衝突の番犬は shift を受ける行だけ shift 付きも見る）
 //! - GPUI の `function` 修飾（macOS は矢印キーにも立つ）は**見ない**
 
 use super::support::Platform;
-use crate::text_edit::{CursorMovement, DeleteMotion, TextBuffer};
+use crate::text_edit::{CursorMovement, DeleteMotion, LineOperation, TextBuffer};
 
 /// 打鍵が編集バッファに対して意味するもの（shift を解いた後の最終形）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +57,8 @@ pub enum EditorCommand {
     Indent,
     /// 選択行（無ければカーソルの行）を 1 段浅く（⇧Tab。#1654）
     Outdent,
+    /// 行単位の操作（複製・移動・行ごとのインデント・コメントの付け外し。#1692）
+    Line(LineOperation),
     /// 編集モードを抜ける
     ExitEditing,
 }
@@ -68,34 +74,55 @@ const EDIT_COMMAND_NAMES: [(&str, EditorCommand); 3] = [
     ("newline", EditorCommand::Newline),
 ];
 
+/// 行操作（#1692）の綴りの頭。`line-move-up` = CLI `tako edit line move-up`
+/// （操作の名前は [`LineOperation::name`] の 1 か所。ここは頭を付けるだけ）
+const LINE_PREFIX: &str = "line-";
+
 impl EditorCommand {
-    /// CLI / MCP の綴りから引く（`indent` / `outdent` / `newline`）
+    /// CLI / MCP の綴りから引く（`indent` / `outdent` / `newline` / `line-<行操作>`）
     pub fn from_edit_name(name: &str) -> Option<Self> {
         EDIT_COMMAND_NAMES
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, c)| *c)
+            .or_else(|| {
+                name.strip_prefix(LINE_PREFIX)
+                    .and_then(LineOperation::from_name)
+                    .map(Self::Line)
+            })
     }
 
     /// 綴りの一覧（MCP の inputSchema の enum とエラー文の候補）
-    pub fn edit_names() -> Vec<&'static str> {
-        EDIT_COMMAND_NAMES.iter().map(|(n, _)| *n).collect()
+    pub fn edit_names() -> Vec<String> {
+        EDIT_COMMAND_NAMES
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .chain(LineOperation::ALL.into_iter().map(Self::line_edit_name))
+            .collect()
+    }
+
+    /// 行操作の CLI / MCP の綴り（`line-move-up`。#1692）
+    pub fn line_edit_name(op: LineOperation) -> String {
+        format!("{LINE_PREFIX}{}", op.name())
     }
 
     /// バッファへ当てる（#1652）。**GUI の打鍵と CLI / MCP が同じここを通る**。
     ///
     /// 編集モードを抜ける（[`Self::ExitEditing`]）はバッファの操作ではないので
-    /// 何もせず `false` を返す（編集モードを閉じるのは呼び手 = GUI の仕事）
-    pub fn apply(self, buffer: &mut TextBuffer) -> bool {
+    /// 何もせず `Ok(false)` を返す（編集モードを閉じるのは呼び手 = GUI の仕事）。
+    /// 当てられない操作（コメント記号を知らない形式のコメント。#1692）は本文を触らずに
+    /// 理由を `Err` で返す（GUI はフッタへ、CLI / MCP はエラーとして出す）
+    pub fn apply(self, buffer: &mut TextBuffer) -> Result<bool, String> {
         match self {
             Self::Move { movement, extend } => buffer.move_cursor(movement, extend),
             Self::Delete(motion) => buffer.delete(motion),
             Self::Newline => buffer.newline_and_indent(),
             Self::Indent => buffer.indent(),
             Self::Outdent => buffer.outdent(),
-            Self::ExitEditing => return false,
+            Self::Line(op) => buffer.apply_line_operation(op).map_err(|e| e.to_string())?,
+            Self::ExitEditing => return Ok(false),
         }
-        true
+        Ok(true)
     }
 }
 
@@ -107,12 +134,24 @@ pub enum Action {
     Newline,
     /// Tab。shift で向きが変わる（⇧Tab = 浅く。#1654）
     Indent,
+    /// 行の移動（⌥↑↓）。shift で行の複製に変わる（⇧⌥↑↓。#1692）
+    MoveLines {
+        down: bool,
+    },
+    /// shift を受けない行操作（⌘/ ⌘] ⌘[。#1692）
+    Line(LineOperation),
     ExitEditing,
 }
 
 impl Action {
-    fn with_shift(self, shift: bool) -> EditorCommand {
-        match self {
+    /// shift 付きでも受理するか（#1692）。受けない行は shift 付きを表の外にする
+    /// （⇧⌘] / ⇧⌘[ はタブ切替のキーバインドが持つ。受理すると「表にあるのに届かない」打鍵になる）
+    pub fn accepts_shift(self) -> bool {
+        !matches!(self, Self::Line(_))
+    }
+
+    fn with_shift(self, shift: bool) -> Option<EditorCommand> {
+        Some(match self {
             Self::Move(movement) => EditorCommand::Move {
                 movement,
                 extend: shift,
@@ -121,8 +160,16 @@ impl Action {
             Self::Newline => EditorCommand::Newline,
             Self::Indent if shift => EditorCommand::Outdent,
             Self::Indent => EditorCommand::Indent,
+            Self::MoveLines { down } => EditorCommand::Line(match (down, shift) {
+                (false, false) => LineOperation::MoveUp,
+                (true, false) => LineOperation::MoveDown,
+                (false, true) => LineOperation::DuplicateUp,
+                (true, true) => LineOperation::DuplicateDown,
+            }),
+            Self::Line(_) if shift => return None,
+            Self::Line(op) => EditorCommand::Line(op),
             Self::ExitEditing => EditorCommand::ExitEditing,
-        }
+        })
     }
 }
 
@@ -226,7 +273,7 @@ const fn row(action: Action, macos: &'static [Chord], windows: &'static [Chord])
     }
 }
 
-use Action::{Delete, ExitEditing, Indent, Move, Newline};
+use Action::{Delete, ExitEditing, Indent, Line, Move, MoveLines, Newline};
 use Chord as K;
 
 /// 打鍵表（**正本**）。GUI の入口はここだけを引く
@@ -340,18 +387,48 @@ pub const TABLE: &[Entry] = &[
     row(Newline, &[K::plain("enter")], &[K::plain("enter")]),
     // Tab = 深く / ⇧Tab = 浅く（#1654）。Windows の Ctrl+Tab はタブ切替に張ってあるので素の Tab だけ
     row(Indent, &[K::plain("tab")], &[K::plain("tab")]),
+    // --- 行操作（#1692）---
+    //
+    // 行の移動 = macOS ⌥↑↓（VS Code / Xcode）。⇧ を足すと行の複製（⇧⌥↑↓ = VS Code）。
+    // Windows の Alt+↑↓ はペインのフォーカス移動・Alt+Shift+↑↓ はペインのリサイズに
+    // 張ってある（keybindings.rs。#585）ので VS Code の Windows 既定は届かない。語の移動と
+    // 同じく ⌥ → Ctrl に読み替える（Ctrl+↑↓ / Ctrl+Shift+↑↓ は表にもキーバインドにも無い）
+    row(MoveLines { down: false }, &[K::alt("up")], &[K::ctrl("up")]),
+    row(
+        MoveLines { down: true },
+        &[K::alt("down")],
+        &[K::ctrl("down")],
+    ),
+    // コメントの切り替え = ⌘/（VS Code / Zed / Xcode）・行ごと深く / 浅く = ⌘] / ⌘[
+    // （VS Code / Xcode）。Windows は VS Code の Windows 既定と同じ Ctrl 段。
+    // shift は受けない（⇧⌘] / ⇧⌘[ はタブ切替が持つ = [`Action::accepts_shift`]）。
+    // コメントを「付ける」「外す」だけの操作は打鍵を持たず CLI / MCP の `line-comment` /
+    // `line-uncomment` で指す（VS Code の ⌘K ⌘C のような 2 打鍵の打鍵はこの表が持たない）
+    row(
+        Line(LineOperation::ToggleComment),
+        &[K::cmd("/")],
+        &[K::ctrl("/")],
+    ),
+    row(Line(LineOperation::Indent), &[K::cmd("]")], &[K::ctrl("]")]),
+    row(
+        Line(LineOperation::Outdent),
+        &[K::cmd("[")],
+        &[K::ctrl("[")],
+    ),
     row(ExitEditing, &[K::plain("escape")], &[K::plain("escape")]),
 ];
 
 /// 打鍵を操作へ解く。表に無い打鍵は `None`（入口はそのキーを編集に使わない）
 pub fn resolve(platform: Platform, key: &str, mods: KeyMods) -> Option<EditorCommand> {
-    TABLE.iter().find_map(|entry| {
-        entry
-            .chords(platform)
-            .iter()
-            .any(|chord| chord.matches(key, mods))
-            .then(|| entry.action.with_shift(mods.shift))
-    })
+    TABLE
+        .iter()
+        .find(|entry| {
+            entry
+                .chords(platform)
+                .iter()
+                .any(|chord| chord.matches(key, mods))
+        })
+        .and_then(|entry| entry.action.with_shift(mods.shift))
 }
 
 /// その OS で表に載っている打鍵すべて（キーバインドとの衝突検査・セルフテスト用）
@@ -602,7 +679,7 @@ mod tests {
         for (text, cursor, want, want_cursor) in cases {
             let mut buffer = TextBuffer::from_text(PathBuf::from("kill.txt"), text.to_string());
             buffer.set_cursor(*cursor, false);
-            assert!(kill.apply(&mut buffer));
+            assert_eq!(kill.apply(&mut buffer), Ok(true));
             assert_eq!(buffer.text(), *want, "{text:?} の {cursor} で ctrl-k");
             assert_eq!(
                 buffer.cursor(),
@@ -616,12 +693,12 @@ mod tests {
         let mut buffer = TextBuffer::from_text(PathBuf::from("kill.txt"), "abc".into());
         buffer.set_cursor(3, false);
         let version = buffer.version();
-        kill.apply(&mut buffer);
+        kill.apply(&mut buffer).unwrap();
         assert_eq!((buffer.text(), buffer.version()), ("abc", version));
         // 続けて押すと 1 回ずつ undo で戻る（語・行単位の削除はまとめない = #1652）
         let mut buffer = TextBuffer::from_text(PathBuf::from("kill.txt"), "ab\ncd\n".into());
-        kill.apply(&mut buffer);
-        kill.apply(&mut buffer);
+        kill.apply(&mut buffer).unwrap();
+        kill.apply(&mut buffer).unwrap();
         assert_eq!(buffer.text(), "cd\n");
         assert!(buffer.undo());
         assert_eq!(buffer.text(), "\ncd\n");
@@ -638,20 +715,85 @@ mod tests {
         let mut buffer =
             TextBuffer::from_text(PathBuf::from("ae.rs"), "    let x = 1;\r\nnext".into());
         buffer.set_cursor("    let".len(), false);
-        home.apply(&mut buffer);
+        home.apply(&mut buffer).unwrap();
         assert_eq!(buffer.cursor(), 0);
         // もう 1 回押しても桁 0 のまま（Home はインデントの直後へ戻る）
-        home.apply(&mut buffer);
+        home.apply(&mut buffer).unwrap();
         assert_eq!(buffer.cursor(), 0);
         buffer.set_cursor(4, false);
-        home.apply(&mut buffer);
+        home.apply(&mut buffer).unwrap();
         assert_eq!(buffer.cursor(), 0, "インデントの直後からも桁 0");
-        end.apply(&mut buffer);
+        end.apply(&mut buffer).unwrap();
         assert_eq!(buffer.cursor(), "    let x = 1;".len(), "行末は CR の手前");
         // ⇧ 付きは選択を伸ばす
         let select_home = resolve_spec(Platform::MacOs, "ctrl-shift-a").expect("ctrl-shift-a");
-        select_home.apply(&mut buffer);
+        select_home.apply(&mut buffer).unwrap();
         assert_eq!(buffer.selection(), Some(0.."    let x = 1;".len()));
+    }
+
+    /// #1692: 行操作の打鍵。macOS = ⌥↑↓（⇧ で複製）/ ⌘/ / ⌘] ⌘[、Windows は同じ並びの
+    /// Ctrl 段。shift を受けない行は shift 付きを受理しない
+    #[test]
+    fn 行操作の打鍵は両osの表に載っている() {
+        use LineOperation as L;
+        let line = |op| Some(EditorCommand::Line(op));
+        let cases: &[(Platform, &str, Option<EditorCommand>)] = &[
+            (Platform::MacOs, "alt-up", line(L::MoveUp)),
+            (Platform::MacOs, "alt-down", line(L::MoveDown)),
+            (Platform::MacOs, "alt-shift-up", line(L::DuplicateUp)),
+            (Platform::MacOs, "alt-shift-down", line(L::DuplicateDown)),
+            (Platform::MacOs, "cmd-/", line(L::ToggleComment)),
+            (Platform::MacOs, "cmd-]", line(L::Indent)),
+            (Platform::MacOs, "cmd-[", line(L::Outdent)),
+            (Platform::Windows, "ctrl-up", line(L::MoveUp)),
+            (Platform::Windows, "ctrl-down", line(L::MoveDown)),
+            (Platform::Windows, "ctrl-shift-up", line(L::DuplicateUp)),
+            (Platform::Windows, "ctrl-shift-down", line(L::DuplicateDown)),
+            (Platform::Windows, "ctrl-/", line(L::ToggleComment)),
+            (Platform::Windows, "ctrl-]", line(L::Indent)),
+            (Platform::Windows, "ctrl-[", line(L::Outdent)),
+            // shift を受けない（⇧⌘] / ⇧⌘[ はタブ切替のキーバインドが持つ）
+            (Platform::MacOs, "cmd-shift-]", None),
+            (Platform::MacOs, "cmd-shift-[", None),
+            (Platform::MacOs, "cmd-shift-/", None),
+            (Platform::Windows, "ctrl-shift-]", None),
+            (Platform::Windows, "ctrl-shift-/", None),
+            // Windows の Alt+↑↓ はペインのフォーカス移動・Alt+Shift+↑↓ はリサイズ
+            (Platform::Windows, "alt-up", None),
+            (Platform::Windows, "alt-shift-down", None),
+            // macOS の ⌃↑↓ は Mission Control（Windows 流を混ぜない）
+            (Platform::MacOs, "ctrl-up", None),
+            (Platform::MacOs, "ctrl-/", None),
+        ];
+        for (platform, spec, want) in cases {
+            assert_eq!(
+                resolve_spec(*platform, spec),
+                *want,
+                "{platform:?} の {spec} の解き方が表と違う"
+            );
+        }
+        // 打鍵で押せる行操作: 「付ける」「外す」だけの 2 つ以外は両 OS で押せる
+        // （その 2 つは CLI / MCP の line-comment / line-uncomment で指す）
+        for op in LineOperation::ALL {
+            let keyed = BOTH.iter().all(|platform| {
+                all_chords(*platform).any(|(action, _)| {
+                    action.with_shift(false) == Some(EditorCommand::Line(op))
+                        || (action.accepts_shift()
+                            && action.with_shift(true) == Some(EditorCommand::Line(op)))
+                })
+            });
+            let cli_only = matches!(op, L::Comment | L::Uncomment);
+            assert_eq!(keyed, !cli_only, "{op:?} が両 OS の表に（無い / ある）");
+        }
+        // 打鍵から当てても同じ口: コメント記号を知らない形式は理由を返して本文を触らない
+        let comment = resolve_spec(Platform::MacOs, "cmd-/").expect("cmd-/");
+        let mut buffer = TextBuffer::from_text(std::path::PathBuf::from("notes.txt"), "a\n".into());
+        assert!(comment.apply(&mut buffer).is_err());
+        assert_eq!(buffer.text(), "a\n");
+        let mut buffer = TextBuffer::from_text(std::path::PathBuf::from("a.rs"), "a\nb\n".into());
+        let down = resolve_spec(Platform::Windows, "ctrl-down").expect("ctrl-down");
+        assert_eq!(down.apply(&mut buffer), Ok(true));
+        assert_eq!(buffer.text(), "b\na\n");
     }
 
     /// `gpui_spec` の綴りが読み戻せる（キーバインドとの突き合わせはこの綴りで行う）
@@ -665,7 +807,7 @@ mod tests {
                 assert!(!mods.shift);
                 assert_eq!(
                     resolve(platform, key, mods),
-                    Some(action.with_shift(false)),
+                    action.with_shift(false),
                     "{platform:?} の {spec}"
                 );
             }
@@ -675,7 +817,7 @@ mod tests {
     /// #1654: CLI / MCP の編集コマンド名は一意に往復する
     #[test]
     fn 編集コマンドの名前は往復する() {
-        for name in EditorCommand::edit_names() {
+        for name in &EditorCommand::edit_names() {
             let command = EditorCommand::from_edit_name(name).expect("表にある名前");
             assert_ne!(command, EditorCommand::ExitEditing);
         }
@@ -684,9 +826,25 @@ mod tests {
             Some(EditorCommand::Indent)
         );
         assert_eq!(EditorCommand::from_edit_name("tab"), None);
+        // #1692: 行操作は `line-` + 行操作の名前（CLI の `tako edit line <名前>` と同じ綴り）
+        assert_eq!(
+            EditorCommand::from_edit_name("line-move-up"),
+            Some(EditorCommand::Line(LineOperation::MoveUp))
+        );
+        assert_eq!(EditorCommand::from_edit_name("line-"), None);
+        assert_eq!(EditorCommand::from_edit_name("move-up"), None);
+        for op in LineOperation::ALL {
+            assert_eq!(
+                EditorCommand::from_edit_name(&EditorCommand::line_edit_name(op)),
+                Some(EditorCommand::Line(op))
+            );
+        }
         let mut names = EditorCommand::edit_names();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), EDIT_COMMAND_NAMES.len());
+        assert_eq!(
+            names.len(),
+            EDIT_COMMAND_NAMES.len() + LineOperation::ALL.len()
+        );
     }
 }
