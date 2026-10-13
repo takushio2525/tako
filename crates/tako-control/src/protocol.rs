@@ -794,6 +794,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mouse_forward: Option<bool>,
     },
+    /// 貼り付けの確認（Issue #2046）: 貼り付けの本文に API キー・パスワードらしきものがあれば
+    /// PTY へ流す前に確かめる。`enabled` で on / off（永続化・次の貼り付けから効く）、
+    /// `check` で判定だけを試す（GUI の貼り付けと同じ `tako_core::paste_guard::scan`）、
+    /// `respond`（"send" / "cancel"）で確認待ちの貼り付けへ答える。どれも省略時は現在状態だけ。
+    /// **応答・ログに本文を載せない**（`check` の応答も伏せ字だけ）
+    PasteGuard {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        respond: Option<String>,
+    },
     /// ペインの表示セル（0 始まり）を左クリックする = 押す + 離すを内側アプリへ渡す（Issue #1961）。
     /// GUI のクリックと同じ判断・同じバイト列（`tako_core::mouse_forward`）を通る。
     /// 内側アプリがマウス報告を要求していなければ渡さずエラー（シェルへ制御列を打たない）
@@ -2839,6 +2852,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::PreviewCache { .. }
         | Request::PreviewAutosave { .. }
         | Request::Scrollback { .. }
+        // 貼り付けの確認（#2046）: 答えはペインの中身（PTY）へ書くだけで幾何に触らない
+        | Request::PasteGuard { .. }
         | Request::SleepGuard { .. }
         | Request::ShellIntegration { .. }
         | Request::Mod { .. }
@@ -3155,6 +3170,13 @@ mod tests {
             await_prompt: false,
         };
         assert_eq!(send.kind_name(), "Send");
+        // #2046: 判定を試す本文（鍵らしき文字）も種別名の外へ出ない
+        let check = Request::PasteGuard {
+            enabled: None,
+            check: Some("secret-paste-text".into()),
+            respond: None,
+        };
+        assert_eq!(check.kind_name(), "PasteGuard");
         // フィールド無し variant / struct variant の両形
         assert_eq!(Request::List.kind_name(), "List");
         assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");

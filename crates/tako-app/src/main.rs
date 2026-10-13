@@ -983,6 +983,23 @@ fn initial_mouse_click_forward() -> bool {
     tako_control::settings::load().mouse_click_forward
 }
 
+/// 貼り付けの確認（#2046）の起動時の値。セルフテストはユーザーの設定に左右されないよう既定で走る。
+/// 項目の無い旧い settings.json も既定 on で読む（serde の default）
+fn initial_paste_guard() -> bool {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return tako_core::paste_guard::DEFAULT_ENABLED;
+    }
+    tako_control::settings::load().paste_guard
+}
+
+/// 確認待ちの貼り付け（#2046）。**`Debug` を付けない**（本文がログへ出る道を作らない）
+struct PendingPaste {
+    /// 送り先（貼り付けた時点でフォーカスしていたペイン。確認の間にフォーカスが動いても変えない）
+    pane: PaneId,
+    text: String,
+    report: tako_core::paste_guard::ScanReport,
+}
+
 /// tako mod（FR-2.42 / #1879）の起動時の状態。
 ///
 /// 展開（小さなファイル 5 本の比較・差し替え）と、子プロセスを起こさない版の判定は
@@ -2527,6 +2544,16 @@ struct TakoApp {
     unfocused_redraw_fps: u32,
     /// マウス報告を要求する TUI へ左クリックを渡すか（#1961。`tako mouse`。即時に効く）
     mouse_click_forward: bool,
+    /// 貼り付けの確認（#2046。`tako paste-guard`。次の貼り付けから効く。既定 on）
+    paste_guard: bool,
+    /// 確認待ちの貼り付け（#2046。None = ダイアログ非表示）。**貼り付けの本文を持つのはここだけ**
+    pending_paste: Option<PendingPaste>,
+    /// 貼り付けの確認の累計（#2046。`tako paste-guard` の stats）
+    paste_guard_stats: tako_core::paste_guard::PasteGuardStats,
+    /// visual-test `paste-guard` の差し込み口（#2046）: 次の `paste()` がクリップボードの代わりに
+    /// これを読む（偽の鍵でも OS のクリップボードとその履歴に残さない）。visual-test のビルドだけに在る
+    #[cfg(feature = "visual-test")]
+    injected_paste: Option<String>,
     /// 押してから離すまでのクリックの転送の状態（#1961。`click_forward.rs`）
     click_forward: Option<click_forward::ClickForward>,
     /// 器のペインへのクリックの送信待ち（#1961。ペインごとに 1 本へ直列化）
@@ -4671,6 +4698,11 @@ impl TakoApp {
             term_redraw_requests: 0,
             unfocused_redraw_fps: initial_unfocused_redraw_fps(),
             mouse_click_forward: initial_mouse_click_forward(),
+            paste_guard: initial_paste_guard(),
+            pending_paste: None,
+            paste_guard_stats: tako_core::paste_guard::PasteGuardStats::default(),
+            #[cfg(feature = "visual-test")]
+            injected_paste: None,
             click_forward: None,
             click_pumps: HashMap::new(),
             click_stats: tako_core::mouse_forward::ForwardStats::default(),
@@ -16041,6 +16073,16 @@ impl TakoApp {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
+        // #2046: visual-test の差し込み（あれば）を最初に取る（どの return でも次の貼り付けへ残さない）
+        #[cfg(feature = "visual-test")]
+        let injected = self.injected_paste.take();
+        #[cfg(not(feature = "visual-test"))]
+        let injected: Option<String> = None;
+        // #2046: 確認待ちの間は次の貼り付けを受けない（メニューの「貼り付け」も含む。
+        // 答える前に別の本文が流れたり、確認が差し替わったりしない）
+        if self.pending_paste.is_some() {
+            return;
+        }
         // #1860: ツリーの行を選んでいる（最後に押したのがツリー）ならファイルの貼り付け。
         // 入力欄（パレット・インライン入力・コミット欄など）が開いている間は入力欄が勝つ
         if !self.text_input_swallows_keys() {
@@ -16049,7 +16091,10 @@ impl TakoApp {
                 return;
             }
         }
-        let item = cx.read_from_clipboard();
+        let item = match injected {
+            Some(text) => Some(ClipboardItem::new_string(text)),
+            None => cx.read_from_clipboard(),
+        };
         let Some(text) = item.as_ref().and_then(|item| item.text()) else {
             // #719 要件 1: 画像だけがクリップボードにあるときの ⌘V。
             // tako 側で画像を扱わず **Ctrl+V をそのまま TUI へ流す**（エージェント CLI は
@@ -16113,10 +16158,87 @@ impl TakoApp {
             }
             self.refresh_preview_from_editor(pane_id);
             self.drive_autosave(cx);
-        } else if let Some(session) = self.focused_session() {
-            session.paste(&text);
+        } else {
+            self.paste_to_terminal(pane_id, text, cx);
         }
         cx.notify();
+    }
+
+    /// 端末ペインへの貼り付けの関所（#2046）。⌘V / Ctrl+V / Shift+Insert / メニューの「貼り付け」は
+    /// すべて `paste()` の振り分けからここへ来る。本文に鍵らしきものがあれば **PTY へ 1 バイトも流さず**
+    /// 確認を出し、答え（[`Self::answer_pending_paste`]）を待つ。判定は
+    /// `tako_core::paste_guard::scan` の 1 実装（先頭 64 KB だけを見るので UI スレッドで数 ms 以内）
+    fn paste_to_terminal(&mut self, pane: PaneId, text: String, cx: &mut Context<Self>) {
+        if !self.terminals.contains_key(&pane) {
+            return;
+        }
+        if self.paste_guard && !tako_core::paste_guard::legacy() && !text.is_empty() {
+            let started = std::time::Instant::now();
+            let report = tako_core::paste_guard::scan(&text);
+            let stats = &mut self.paste_guard_stats;
+            stats.checked += 1;
+            stats.last_scan_us = started.elapsed().as_micros() as u64;
+            stats.last_scanned_bytes = report.scanned_bytes;
+            if report.hit() {
+                stats.prompted += 1;
+                // 診断ログへは規則名と件数だけ（本文・伏せ字を書かない = 絶対ルール）
+                tako_control::diag::persist_log(&tako_core::paste_guard::log_line(
+                    "prompted",
+                    pane.as_u64(),
+                    &report,
+                ));
+                self.pending_paste = Some(PendingPaste { pane, text, report });
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(session) = self.terminals.get(&pane) {
+            session.paste(&text);
+        }
+    }
+
+    /// 確認待ちの貼り付けへ答える（#2046）。ダイアログのボタン・Esc / Enter・CLI / MCP の
+    /// `respond` がすべてここを通る 1 実装。「送る」は貼った時点のペインへ、そのペインの
+    /// ブラケットペーストの要求に従って送る（`TerminalSession::paste`）。
+    /// 「やめる」は本文を捨てる（PTY へは何も書かない）
+    fn answer_pending_paste(
+        &mut self,
+        answer: tako_core::paste_guard::Answer,
+    ) -> Result<(), String> {
+        use tako_core::paste_guard::Answer;
+        let Some(pending) = self.pending_paste.take() else {
+            return Err("確認待ちの貼り付けが無い".into());
+        };
+        let pane = pending.pane.as_u64();
+        let outcome = match answer {
+            Answer::Send => match self.terminals.get(&pending.pane) {
+                Some(session) => {
+                    session.paste(&pending.text);
+                    self.paste_guard_stats.sent += 1;
+                    "send"
+                }
+                None => {
+                    tako_control::diag::persist_log(&tako_core::paste_guard::log_line(
+                        "dropped",
+                        pane,
+                        &pending.report,
+                    ));
+                    return Err(format!(
+                        "送り先のペイン {pane} が閉じている（貼り付けは捨てた）"
+                    ));
+                }
+            },
+            Answer::Cancel => {
+                self.paste_guard_stats.cancelled += 1;
+                "cancel"
+            }
+        };
+        tako_control::diag::persist_log(&tako_core::paste_guard::log_line(
+            outcome,
+            pane,
+            &pending.report,
+        ));
+        Ok(())
     }
 
     /// クリップボードに画像エントリがあるか（#719 要件 1）。
@@ -16179,6 +16301,16 @@ impl TakoApp {
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
         // Issue #168: キーストローク毎の処理コストを計測（入力レイテンシの内訳）
         let _span = tako_control::diag::perf_span("key_input");
+        // #2046: 貼り付けの確認中は全キーを握る。Esc と Enter はどちらも「やめる」
+        // （貼り付けの直後に送信のつもりで押した Enter で鍵を送らない）。送るのはボタンだけ
+        if self.pending_paste.is_some() {
+            if matches!(keystroke.key.as_str(), "escape" | "enter") {
+                let _ = self.answer_pending_paste(tako_core::paste_guard::Answer::Cancel);
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.pending_close_confirm.is_some() {
             match keystroke.key.as_str() {
                 "enter" => self.close_confirm_accepted(cx),
@@ -24007,6 +24139,40 @@ impl SessionHost for TakoApp {
         }
     }
 
+    fn paste_guard_status(&self) -> tako_core::paste_guard::PasteGuardStatus {
+        tako_core::paste_guard::PasteGuardStatus {
+            enabled: self.paste_guard,
+            legacy: tako_core::paste_guard::legacy(),
+            pending: self
+                .pending_paste
+                .as_ref()
+                .map(|p| tako_core::paste_guard::PendingSummary {
+                    pane: p.pane.as_u64(),
+                    findings: p.report.findings.clone(),
+                    total_bytes: p.report.total_bytes,
+                    truncated: p.report.truncated(),
+                }),
+            stats: self.paste_guard_stats.clone(),
+        }
+    }
+
+    fn set_paste_guard(&mut self, enabled: bool) {
+        // 次の貼り付けから効く（確認待ちの 1 件はそのまま答えを待つ）
+        self.paste_guard = enabled;
+        // セルフテスト中はユーザー設定を汚さない（scrollback と同じ規約）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.paste_guard = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
+    fn answer_paste_guard(&mut self, answer: tako_core::paste_guard::Answer) -> Result<(), String> {
+        self.answer_pending_paste(answer)
+    }
+
     fn set_mouse_forward(&mut self, enabled: bool) {
         // 次のクリックから効く（押している最中のクリックは離すまでそのまま渡す）
         self.mouse_click_forward = enabled;
@@ -28220,7 +28386,8 @@ impl Render for TakoApp {
         // 場面では全 Web ビューを隠す。D&D 中のドロップターゲット描画も同様（#155）
         let hide_webviews = (self.drag_kind.is_some() && cx.has_active_drag())
             || self.command_palette.is_some()
-            || self.pending_close_confirm.is_some();
+            || self.pending_close_confirm.is_some()
+            || self.pending_paste.is_some();
         if webview::root_sync_disabled() {
             self.sync_webview_visibility(hide_webviews);
         } else {
@@ -28735,6 +28902,8 @@ impl Render for TakoApp {
             .children(self.render_starter_profile_menu_overlay(window, cx))
             .children(self.render_sleep_guard_overlay(cx))
             .children(self.render_close_confirm_dialog(cx))
+            // #2046: 貼り付けの確認（閉じる確認と同時には出ない。出ても手前）
+            .children(self.render_paste_guard_dialog(cx))
             // #615: カードをインジケータ直上へ収めるためビューポート実寸を渡す
             .children(self.render_remote_overlay(window, cx))
             .children(self.render_command_palette(cx))
@@ -28872,6 +29041,217 @@ impl TakoApp {
                                     .text_color(hsla(theme.text_overlay))
                                     .child(crate::ui_text::dialog::close_skip_hint(m.symbol))
                             }),
+                        ),
+                ),
+        )
+    }
+}
+
+impl TakoApp {
+    /// 貼り付けの確認ダイアログ（#2046）。閉じる確認（#172）と同じ部品の形（全面の半透明 +
+    /// 中央のカード）。当たった規則と伏せ字を並べ、「やめる」を既定（Esc / Enter）にする。
+    /// 「送る」はボタンを押したときだけ（CLI / MCP は `tako paste-guard send` / respond=send）
+    fn render_paste_guard_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        use crate::ui_text::paste_guard as txt;
+        /// 表に並べる上限（超えたぶんは「ほか N 件」）
+        const MAX_ROWS: usize = 6;
+        let pending = self.pending_paste.as_ref()?;
+        let theme = &self.theme;
+        // 送り先はタイトルバーと同じ表記（タブ内の表示順の番号 + タイトル）。内部の PaneId は出さない
+        let (number, title) = self
+            .workspace
+            .tabs()
+            .iter()
+            .find_map(|t| {
+                let panes = t.tree().panes();
+                let i = panes.iter().position(|p| p.id() == pending.pane)?;
+                let title = panes[i]
+                    .title()
+                    .map(str::to_string)
+                    .filter(|t| !t.trim().is_empty());
+                Some((i as u64 + 1, title))
+            })
+            .unwrap_or((pending.pane.as_u64(), None));
+        let findings = &pending.report.findings;
+        let rows = findings.iter().take(MAX_ROWS).map(|f| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .items_baseline()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(12.0))
+                        .text_color(hsla(theme.tab_inactive_foreground))
+                        .child(SharedString::from(format!(
+                            "{} · {}",
+                            txt::rule_label(f.rule),
+                            txt::line(f.line)
+                        ))),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_size(px(12.0))
+                        .font_family(theme.font_family.clone())
+                        .text_color(hsla(theme.foreground))
+                        .child(SharedString::from(f.masked.clone())),
+                )
+        });
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x00000088))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        let _ = this.answer_pending_paste(tako_core::paste_guard::Answer::Cancel);
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("paste-guard-dialog")
+                        .relative()
+                        .w(px(440.0))
+                        .p_4()
+                        .rounded(px(12.0))
+                        .bg(rgba(theme.tab_bar_background))
+                        .border_1()
+                        .border_color(hsla(theme.border_subtle))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::rgba(0x00000066).into(),
+                            offset: point(px(0.), px(4.)),
+                            blur_radius: px(24.0),
+                            spread_radius: px(0.),
+                            inset: false,
+                        }])
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .when_some(
+                            self.input_rect_probe_canvas("paste-guard-dialog"),
+                            |d, c| d.child(c),
+                        )
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.foreground))
+                                .child(txt::title()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(txt::question()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .p_2()
+                                .rounded(px(6.0))
+                                .bg(rgba(theme.surface_highlight))
+                                .children(rows)
+                                .when(findings.len() > MAX_ROWS, |d| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(hsla(theme.text_overlay))
+                                            .child(SharedString::from(txt::more(
+                                                findings.len() - MAX_ROWS,
+                                            ))),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(hsla(theme.tab_inactive_foreground))
+                                .child(SharedString::from(txt::target(number, title.as_deref()))),
+                        )
+                        .when(pending.report.truncated(), |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(hsla(theme.text_overlay))
+                                    .child(SharedString::from(txt::truncated(
+                                        tako_core::paste_guard::MAX_SCAN_BYTES / 1024,
+                                    ))),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    div()
+                                        .id("paste-guard-cancel")
+                                        .relative()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .bg(rgba_alpha(theme.accent, 0.3))
+                                        .text_color(hsla(theme.foreground))
+                                        .text_size(px(12.5))
+                                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.5)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let _ = this.answer_pending_paste(
+                                                tako_core::paste_guard::Answer::Cancel,
+                                            );
+                                            cx.notify();
+                                        }))
+                                        .when_some(
+                                            self.input_rect_probe_canvas("paste-guard-cancel"),
+                                            |d, c| d.child(c),
+                                        )
+                                        .child(txt::cancel()),
+                                )
+                                .child(
+                                    div()
+                                        .id("paste-guard-send")
+                                        .relative()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .bg(rgba_alpha(theme.red, 0.3))
+                                        .text_color(hsla(theme.red))
+                                        .text_size(px(12.5))
+                                        .hover(|d| d.bg(rgba_alpha(theme.red, 0.5)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let _ = this.answer_pending_paste(
+                                                tako_core::paste_guard::Answer::Send,
+                                            );
+                                            cx.notify();
+                                        }))
+                                        .when_some(
+                                            self.input_rect_probe_canvas("paste-guard-send"),
+                                            |d, c| d.child(c),
+                                        )
+                                        .child(txt::send()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.text_overlay))
+                                .child(txt::keys_hint()),
                         ),
                 ),
         )
@@ -30546,6 +30926,11 @@ mod self_test {
     mod show_command_caller_1958;
     #[cfg(feature = "visual-test")]
     use show_command_caller_1958::show_command_caller_visual;
+    /// #2046: 鍵らしき文字の貼り付けの確認（visual-test `paste-guard`）
+    #[cfg(feature = "visual-test")]
+    mod paste_guard_2046;
+    #[cfg(feature = "visual-test")]
+    use paste_guard_2046::paste_guard_visual;
     /// #2016: tasks ビューの返答欄（IME・折り返し・送信の間）と返答の履歴（visual-test `tasks-input`）
     #[cfg(feature = "visual-test")]
     mod tasks_input_2016;
@@ -45019,6 +45404,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2046: 鍵らしき文字を貼ると確認が出て、やめると PTY へ 1 バイトも届かないか
+                "paste-guard" => {
+                    paste_guard_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -45033,7 +45424,7 @@ mod self_test {
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
-                         workspace-search-1694）"
+                         workspace-search-1694 / paste-guard）"
                     );
                     std::process::exit(1);
                 }

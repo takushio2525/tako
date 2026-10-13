@@ -1434,6 +1434,56 @@ mod tests {
         );
     }
 
+    /// #2046: 貼り付けの確認は `tako_settings` の action=paste_guard へ載せ（ツールは増やさない）、
+    /// enabled / text / respond が `Request::PasteGuard` へ 1:1 で写る。他の action に
+    /// paste_guard の引数を渡したら Request を作らずに断る
+    #[test]
+    fn settingsのpaste_guardは確認の操作へ写り他のactionでは断る() {
+        let pg = |enabled, check: Option<&str>, respond: Option<&str>| Request::PasteGuard {
+            enabled,
+            check: check.map(str::to_string),
+            respond: respond.map(str::to_string),
+        };
+        for (args, want) in [
+            (json!({ "action": "paste_guard" }), pg(None, None, None)),
+            (
+                json!({ "action": "paste_guard", "enabled": false }),
+                pg(Some(false), None, None),
+            ),
+            (
+                json!({ "action": "paste_guard", "text": "token: x" }),
+                pg(None, Some("token: x"), None),
+            ),
+            (
+                json!({ "action": "paste_guard", "respond": "cancel" }),
+                pg(None, None, Some("cancel")),
+            ),
+        ] {
+            let (_, requests) = run(call("tako_settings", args.clone()), None, true);
+            assert_eq!(requests, vec![want], "{args}");
+        }
+        // 既存の action はそのまま
+        let (_, requests) = run(call("tako_settings", json!({ "action": "status" })), None, true);
+        assert_eq!(
+            requests,
+            vec![Request::Settings {
+                action: Some("status".into()),
+                tab: None,
+            }]
+        );
+        for args in [
+            json!({ "action": "open", "enabled": true }),
+            json!({ "text": "x" }),
+        ] {
+            let (response, requests) = run(call("tako_settings", args.clone()), None, true);
+            assert!(requests.is_empty(), "{args}: {requests:?}");
+            assert!(
+                response.unwrap().to_string().contains("action=paste_guard"),
+                "{args}"
+            );
+        }
+    }
+
     /// #1961: `tako_send_input` の `click` は文字の代わりに左クリック（`PaneClick`）へ写る。
     /// text と同時・形の崩れた click・pane なしは Request を作らずに断る
     #[test]

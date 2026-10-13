@@ -47,6 +47,7 @@ pub mod osc_tap;
 pub mod pane;
 pub mod pane_log;
 pub mod pane_tree;
+pub mod paste_guard;
 pub mod path_menu;
 pub mod paths;
 pub mod pdf_links;

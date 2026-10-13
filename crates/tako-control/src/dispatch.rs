@@ -6271,6 +6271,50 @@ fn dispatch_inner(
             out["mouse_forward"] = mouse_forward_json(&host.mouse_forward_status());
             Ok(out)
         }
+        Request::PasteGuard {
+            enabled,
+            check,
+            respond,
+        } => {
+            // 答えの綴りを先に検証する（不正な綴りで on / off だけ効いた状態を作らない）
+            let answer = respond
+                .as_deref()
+                .map(|r| {
+                    tako_core::paste_guard::Answer::parse(r).ok_or_else(|| {
+                        DispatchError::InvalidParams(format!(
+                            "respond は {} のどれか（指定: {r}）",
+                            tako_core::paste_guard::Answer::VALUES.join(" / ")
+                        ))
+                    })
+                })
+                .transpose()?;
+            if let Some(enabled) = enabled {
+                host.set_paste_guard(enabled);
+            }
+            if let Some(answer) = answer {
+                host.answer_paste_guard(answer)
+                    .map_err(DispatchError::Operation)?;
+            }
+            let mut out = paste_guard_json(&host.paste_guard_status());
+            if let Some(answer) = answer {
+                out["responded"] = json!(answer.as_str());
+            }
+            // 判定だけを試す（GUI の貼り付けと同じ 1 実装。応答は伏せ字だけ）
+            if let Some(text) = check {
+                let started = std::time::Instant::now();
+                let report = tako_core::paste_guard::scan(&text);
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                out["check"] = json!({
+                    "hit": report.hit(),
+                    "findings": paste_guard_findings_json(&report.findings),
+                    "bytes": report.total_bytes,
+                    "scanned_bytes": report.scanned_bytes,
+                    "truncated": report.truncated(),
+                    "elapsed_us": elapsed_us,
+                });
+            }
+            Ok(out)
+        }
         Request::PaneClick { pane, row, col } => {
             let (target, source) = pane_click_plan(host, pane)?;
             match source {
@@ -19351,6 +19395,48 @@ fn encoding_str(encoding: tako_core::mouse_forward::Encoding) -> &'static str {
     }
 }
 
+/// 当たった箇所の一覧（#2046）。**伏せ字だけ**を載せる（生の値は `Finding` 自体が持たない）
+fn paste_guard_findings_json(findings: &[tako_core::paste_guard::Finding]) -> Value {
+    Value::Array(
+        findings
+            .iter()
+            .map(|f| {
+                json!({
+                    "rule": f.rule.as_str(),
+                    "line": f.line,
+                    "masked": f.masked,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 貼り付けの確認の応答（#2046。`tako paste-guard` / MCP `tako_settings` の action=paste_guard）。
+/// `stats` は起動からの累計（2 回読んだ差で効いているかを外から確かめる口）
+fn paste_guard_json(status: &tako_core::paste_guard::PasteGuardStatus) -> Value {
+    use tako_core::paste_guard as pg;
+    json!({
+        "enabled": status.enabled,
+        "default": pg::DEFAULT_ENABLED,
+        "legacy": status.legacy,
+        "max_scan_bytes": pg::MAX_SCAN_BYTES,
+        "pending": status.pending.as_ref().map(|p| json!({
+            "pane": p.pane,
+            "findings": paste_guard_findings_json(&p.findings),
+            "bytes": p.total_bytes,
+            "truncated": p.truncated,
+        })),
+        "stats": {
+            "checked": status.stats.checked,
+            "prompted": status.stats.prompted,
+            "sent": status.stats.sent,
+            "cancelled": status.stats.cancelled,
+            "last_scan_us": status.stats.last_scan_us,
+            "last_scanned_bytes": status.stats.last_scanned_bytes,
+        },
+    })
+}
+
 /// クリックの転送の応答（#1961。`tako mouse` / MCP `tako_scrollback` の `mouse_forward`）。
 /// `forwarded` は GUI のクリックを内側アプリへ渡した累計（2 回読んだ差で効いているかを
 /// 外から確かめる口）、`last` は最後に押したクリックの行き先と理由
@@ -21805,6 +21891,9 @@ mod tests {
         mouse_forward: tako_core::mouse_forward::MouseForwardStatus,
         /// #1961: 直接ペインへ渡した AI のクリック（ペイン, 桁, 行）
         clicks: Vec<(u64, usize, usize)>,
+        /// #2046: 貼り付けの確認の状態と、受け取った答え
+        paste_guard: tako_core::paste_guard::PasteGuardStatus,
+        paste_answers: Vec<tako_core::paste_guard::Answer>,
         /// #584: UI 層へ依頼したウィンドウ表示状態の操作（window ID, 操作）
         window_state_ops: Vec<(u64, crate::protocol::WindowStateOp)>,
         /// #1442: UI 層へ依頼した窓の位置・寸法（window ID, 矩形）
@@ -21952,6 +22041,8 @@ mod tests {
                 redraw_limit: tako_core::redraw_limit::RedrawLimitStatus::default(),
                 mouse_forward: tako_core::mouse_forward::MouseForwardStatus::default(),
                 clicks: Vec::new(),
+                paste_guard: tako_core::paste_guard::PasteGuardStatus::default(),
+                paste_answers: Vec::new(),
                 window_state_ops: Vec::new(),
                 window_geometry_ops: Vec::new(),
                 window_frames: std::collections::HashMap::new(),
@@ -22052,6 +22143,22 @@ mod tests {
         }
         fn set_mouse_forward(&mut self, enabled: bool) {
             self.mouse_forward.enabled = enabled;
+        }
+        fn paste_guard_status(&self) -> tako_core::paste_guard::PasteGuardStatus {
+            self.paste_guard.clone()
+        }
+        fn set_paste_guard(&mut self, enabled: bool) {
+            self.paste_guard.enabled = enabled;
+        }
+        fn answer_paste_guard(
+            &mut self,
+            answer: tako_core::paste_guard::Answer,
+        ) -> Result<(), String> {
+            if self.paste_guard.pending.take().is_none() {
+                return Err("確認待ちの貼り付けが無い".into());
+            }
+            self.paste_answers.push(answer);
+            Ok(())
         }
         fn pane_click_direct(
             &mut self,
@@ -28292,6 +28399,93 @@ mod tests {
             "再描画の上限には触らない"
         );
         assert_eq!(off["lines"], tako_core::scrollback::DEFAULT_LINES);
+    }
+
+    /// #2046: 貼り付けの確認は 1 つの口で状態・on / off・判定・答えを扱い、
+    /// 応答に本文（判定を試した文字・確認待ちの貼り付け）を載せない
+    #[test]
+    fn paste_guardの口で状態と切替と判定と答えを扱い本文を載せない() {
+        use tako_core::paste_guard as pg;
+        let mut host = MockHost::new();
+        let req = |enabled, check: Option<&str>, respond: Option<&str>| Request::PasteGuard {
+            enabled,
+            check: check.map(str::to_string),
+            respond: respond.map(str::to_string),
+        };
+        // 既定 on・確認待ちなし・判定なし
+        let status = dispatch(&mut host, req(None, None, None), PaneOrigin::Cli).unwrap();
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["default"], true);
+        assert_eq!(status["max_scan_bytes"], pg::MAX_SCAN_BYTES);
+        assert!(status["pending"].is_null());
+        assert!(status.get("check").is_none());
+
+        // off → on（永続化はホストの責務。ここでは状態が変わること）
+        let off = dispatch(&mut host, req(Some(false), None, None), PaneOrigin::Mcp).unwrap();
+        assert_eq!(off["enabled"], false);
+        assert!(!host.paste_guard.enabled);
+        dispatch(&mut host, req(Some(true), None, None), PaneOrigin::Cli).unwrap();
+        assert!(host.paste_guard.enabled);
+
+        // 判定だけを試す: 伏せ字・規則名・所要が載り、本文は載らない
+        let secret = format!("{}{}", "ghp_", "EXAMPLE0123456789abcdefghijklmnopqrst");
+        let text = format!("token は {secret} です");
+        let checked = dispatch(&mut host, req(None, Some(&text), None), PaneOrigin::Cli).unwrap();
+        let check = &checked["check"];
+        assert_eq!(check["hit"], true);
+        assert_eq!(check["findings"][0]["rule"], "github_token");
+        assert_eq!(check["findings"][0]["masked"], "ghp_…qrst");
+        assert_eq!(check["findings"][0]["line"], 1);
+        assert_eq!(check["truncated"], false);
+        assert!(check["elapsed_us"].is_u64());
+        let rendered = checked.to_string();
+        assert!(
+            !rendered.contains(&secret),
+            "応答に本文が載った: {rendered}"
+        );
+        assert!(!rendered.contains("EXAMPLE0123456789"), "{rendered}");
+        let plain = dispatch(
+            &mut host,
+            req(None, Some("普通の文章です"), None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(plain["check"]["hit"], false);
+
+        // 確認待ちが無いのに答える → 理由つきで断る / 綴りの誤りは状態を変えずに断る
+        let none = dispatch(&mut host, req(None, None, Some("send")), PaneOrigin::Cli);
+        assert!(matches!(none, Err(DispatchError::Operation(_))), "{none:?}");
+        let bad = dispatch(
+            &mut host,
+            req(Some(false), None, Some("ok")),
+            PaneOrigin::Cli,
+        );
+        assert!(
+            matches!(bad, Err(DispatchError::InvalidParams(_))),
+            "{bad:?}"
+        );
+        assert!(
+            host.paste_guard.enabled,
+            "不正な答えで on / off だけ効いた状態を作らない"
+        );
+
+        // 確認待ちへ答える: 要約は伏せ字だけ・答えはホストの 1 実装へ渡る
+        let finding = pg::scan(&text).findings.remove(0);
+        host.paste_guard.pending = Some(pg::PendingSummary {
+            pane: 4,
+            findings: vec![finding],
+            total_bytes: text.len(),
+            truncated: false,
+        });
+        let pending = dispatch(&mut host, req(None, None, None), PaneOrigin::Mcp).unwrap();
+        assert_eq!(pending["pending"]["pane"], 4);
+        assert_eq!(pending["pending"]["findings"][0]["masked"], "ghp_…qrst");
+        assert!(!pending.to_string().contains(&secret));
+        let answered =
+            dispatch(&mut host, req(None, None, Some("cancel")), PaneOrigin::Mcp).unwrap();
+        assert_eq!(answered["responded"], "cancel");
+        assert!(answered["pending"].is_null());
+        assert_eq!(host.paste_answers, vec![pg::Answer::Cancel]);
     }
 
     /// #1961: AI のクリックは直接ペインなら同期の dispatch で PTY へ、器のペインなら

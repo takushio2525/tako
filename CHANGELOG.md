@@ -10,6 +10,31 @@ change-type tag. Entries without a platform tag apply to every platform.
 
 ## [Unreleased]
 
+### Added
+
+- **tako now asks before pasting text that looks like an API key or password** (#2046).
+  When ⌘V (Ctrl+V / Shift+Insert on Windows) or Edit > Paste would send an API key
+  (Anthropic, OpenAI, GitHub, AWS, Google, Slack and more), a private key, a JWT, a password
+  in a URL, a `password=…` value or a random-looking string to a pane, a dialog shows the
+  matched rule and a masked preview (for example `sk-ant-…ABCD`) and nothing reaches the pane
+  until you choose **Send**. **Enter and Esc both cancel**, so an Enter pressed right after the
+  paste does not send the key. Ordinary prose, code, git SHAs, UUIDs, URLs, file paths and
+  base64 images do not trigger it, and the pasted text is never written to logs. It works
+  the same for claude, codex, plain shells and SSH sessions. **On by default for everyone,
+  including existing settings files.** Turn it off with `tako paste-guard off`, the MCP
+  `tako_settings` `action: "paste_guard"` or the "Check pastes for secrets" switch in
+  Settings > General; try the check with `pbpaste | tako paste-guard check`.
+- **API キー・パスワードらしき文字を貼り付けようとしたら、送る前に確かめるようにした**（#2046）。
+  ⌘V（Windows は Ctrl+V・Shift+Insert）やメニューの「貼り付け」で、API キー（Anthropic・OpenAI・
+  GitHub・AWS・Google・Slack など）・秘密鍵・JWT・URL に埋め込んだパスワード・`password=…` の値・
+  ランダムな文字列をペインへ送ろうとすると、当たった規則と伏せ字（`sk-ant-…ABCD` のような形）を
+  並べた確認が出て、**「送る」を押すまでペインへ 1 文字も届かない**。**Enter と Esc はどちらも
+  「やめる」**なので、貼り付けの直後に押した Enter で鍵は送られない。普通の文章・コード・git の
+  SHA・UUID・URL・ファイルパス・base64 の画像では出ず、貼った本文はログに残さない。claude・codex・
+  素のシェル・SSH 先のどれでも同じ。**既定は ON で、既存の設定ファイルの人も ON になる**。
+  `tako paste-guard off`・MCP `tako_settings` の `action: "paste_guard"`・設定画面「一般」の
+  「貼り付けの確認」で切れ、`pbpaste | tako paste-guard check` で判定だけ試せる。
+
 ### Changed
 
 - **Left clicks and drags now reach mouse-aware TUIs** (#1961). Full-screen apps that ask

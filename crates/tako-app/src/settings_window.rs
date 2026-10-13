@@ -685,6 +685,11 @@ impl SettingsWindow {
                 unfocused_fps: None,
                 mouse_forward: Some(s.mouse_click_forward),
             },
+            Request::PasteGuard {
+                enabled: Some(s.paste_guard),
+                check: None,
+                respond: None,
+            },
             Request::LimitService {
                 action: Some("set".into()),
                 service: Some(s.limit_service.clone()),
@@ -1388,6 +1393,7 @@ impl SettingsWindow {
         let autosuggest_hint = s.autosuggest_hint;
         let autosuggest_tab = s.autosuggest_tab;
         let mouse_click_forward = s.mouse_click_forward;
+        let paste_guard = s.paste_guard;
         let persist = s.tmux_persist;
         let telemetry = s.telemetry;
         let reload = s.preview_live_reload;
@@ -1500,6 +1506,25 @@ impl SettingsWindow {
                                 enabled: None,
                                 hint: Some(!autosuggest_hint),
                                 tab: None,
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            // 貼り付けの確認（Issue #2046。既定 ON）
+            .child(self.row(
+                txt::label_paste_guard(),
+                txt::desc_paste_guard(),
+                self.toggle(
+                    "paste_guard",
+                    paste_guard,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::PasteGuard {
+                                enabled: Some(!paste_guard),
+                                check: None,
+                                respond: None,
                             },
                             cx,
                         );

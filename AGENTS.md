@@ -195,6 +195,7 @@ tako/
 | **スクロールバック保持上限（直接ペインの RAM。#818）** | `tako scrollback [lines]` |
 | **フォーカスの無いペインの再描画の上限（CPU。#1979）** | `tako redraw-limit [fps]` |
 | **TUI（全画面の claude 等）へのクリックの転送（⌥ / Shift + ドラッグで tako の選択。#1961）** | `tako mouse [on|off]` |
+| **貼り付けに鍵らしき文字があれば送る前に確かめる（既定 ON。#2046）** | `tako paste-guard [on|off|check]` |
 | スリープ防止 | `tako sleep-guard status` |
 | **会話を引き継いだセッション再起動（ペインの右クリック。#1067）** | `tako session-restart [--mode harness|handoff] [--pane N]` |
 | **リミット後の自動復帰（ペイン単位 / 一括 = ステータスバーのボタン。#813 / #1945）** | `tako limit-resume [on|off] [--pane N] [--all]` |
