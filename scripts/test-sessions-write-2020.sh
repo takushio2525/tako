@@ -331,10 +331,13 @@ for arm in $ARMS; do
   printf '  %-6s 本体 %3d 回 / .bak.1 %3d 回 / 計 %d バイト（1 時間換算 %d バイト）\n' \
     "$arm" "$main_n" "$bak_n" $((main_b + bak_b)) $(((main_b + bak_b) * 3600 / DURATION))
 done
-if [ "$W_new" -gt 0 ] && [ "$W_legacy" -ge $((DURATION / 30 * 3 / 4)) ] && [ $((W_new * 5)) -le "$W_legacy" ]; then
-  pass "書き直しの回数が 1/5 以下（新 ${W_new} 回 / 旧 ${W_legacy} 回）"
+# 新が書いてよいのは「最初の検出（偽 claude の立ち上がりが走査をまたぐと 2 回）+ 出来事 4 回 +
+# 600 秒ごと + 終了 1 回」まで。比で縛ると、短い時間で回したとき（出来事が詰まる）に設計どおりでも落ちる
+MAX_NEW=$((2 + 4 + DURATION / 600 + 1))
+if [ "$W_new" -gt 0 ] && [ "$W_new" -le "$MAX_NEW" ] && [ "$W_legacy" -ge $((DURATION / 30 * 3 / 4)) ]; then
+  pass "新の書き直しは設計の上限以内（新 ${W_new} 回・上限 ${MAX_NEW} 回 / 旧 ${W_legacy} 回 = 走査ごと）"
 else
-  fail "書き直しが減っていない、または旧が走査ごとに書いていない（新 ${W_new} 回 / 旧 ${W_legacy} 回）"
+  fail "新が上限を超えて書いた、または旧が走査ごとに書いていない（新 ${W_new} 回・上限 ${MAX_NEW} 回 / 旧 ${W_legacy} 回）"
 fi
 if [ "$K_new" -le 6 ]; then
   pass ".bak は last_seen_at 以外が変わったときだけ回る（新 ${K_new} 回 / 旧 ${K_legacy} 回）"
