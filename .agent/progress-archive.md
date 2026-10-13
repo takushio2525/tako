@@ -535,3 +535,4 @@
 - 2026-10-10 #1958: pane を省いた `tako_show_command` / `sessions link` を呼び出し元ペインで埋める
 - 2026-10-11 #1984: UI スレッドの同期の dispatch の子プロセス待ちの残りを background へ = RemoteAgents・TmuxList・呼び出し元の pid 祖先辿り・spawn / handoff の CLI の所在確認・再起動の計画・check_qos の ps
 - 2026-10-11 #1989: GitResolveAgent・StaleBinary status・tmux の書き込み系を background へ・agent CLI の所在確認を上限つきへ
+- 2026-10-12 #1992 S0: PC リソース管理の設計 = 観測・順番待ち `tako queue`・優先度・ETA・見せ方・CLI / MCP・AI の運用・Windows と子 Issue 8 本

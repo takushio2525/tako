@@ -47,7 +47,9 @@ impl Scratch {
     }
 
     fn write(&self, rel: &str, body: &str) -> PathBuf {
-        let path = self.0.join(rel);
+        // 部品ごとに join する（`join("src/main.rs")` は Windows で `…\src/main.rs` と区切りが混ざり、
+        // 製品が返す OS の区切りのパスと文字列で比べると食い違う。CI の Windows で実際に落ちた）
+        let path = rel.split('/').fold(self.0.clone(), |p, part| p.join(part));
         std::fs::write(&path, body).unwrap();
         path
     }

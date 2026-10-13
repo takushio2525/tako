@@ -2633,7 +2633,7 @@ impl Shared {
         };
         let mut empty = super::goto::EmptyAnswer::default();
         loop {
-            empty.sent(self.reported_loading(&key));
+            empty.sent(self.sent_while_loading(&key));
             let answer = self.xref_once(&process, &uri, spec, request, at, deadline)?;
             if !answer.is_empty() {
                 return Ok(answer);
