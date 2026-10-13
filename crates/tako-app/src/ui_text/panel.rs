@@ -565,13 +565,9 @@ pub fn tasks_comment_limit(max: usize) -> String {
 pub fn tasks_thread() -> &'static str {
     tr!("やりとり", "Thread")
 }
-/// やりとりの見出し（#2016。件数つき = 0 件でも「履歴の置き場」があると分かる）
+/// やりとりの見出し（#2016。件数つき）
 pub fn tasks_thread_count(n: usize) -> String {
     tr!(format!("やりとり（{n}）"), format!("Thread ({n})"))
-}
-/// やりとりが 0 件のとき（#2016）
-pub fn tasks_thread_empty() -> &'static str {
-    tr!("まだ返答はありません", "No responses yet")
 }
 /// 送った直後で積み終わっていない返答の印（#2016）
 pub fn tasks_sending() -> &'static str {
@@ -819,7 +815,6 @@ mod tests {
                 tasks_thread().to_string(),
                 // #2016: やりとりの見出し・経路・送信中・送れなかったとき
                 tasks_thread_count(3),
-                tasks_thread_empty().to_string(),
                 tasks_sending().to_string(),
                 tasks_via("pwa"),
                 tasks_via("mcp"),

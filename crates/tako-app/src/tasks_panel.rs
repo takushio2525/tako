@@ -1844,15 +1844,17 @@ impl TakoApp {
         // 新しい順でフォームと配送の行の**さらに下**に出していたので、項目を開いても
         // 目に入らず「返答の履歴が無い」に見えていた。送った直後の返答は積み終わるまで
         // 「送信中」で末尾に出す（欄を先に空にしても返した中身が消えたように見せない）
+        // 0 件のときは出さない（詳細の背丈を修正前と同じに保つ。最初の 1 件は押した瞬間に
+        // 「送信中」で現れる）
         let legacy = legacy_2016();
-        if !legacy {
-            let sending: Vec<SendingReply> = self
-                .user_tasks
-                .sending
-                .iter()
-                .filter(|s| s.id == task.id)
-                .cloned()
-                .collect();
+        let sending: Vec<SendingReply> = self
+            .user_tasks
+            .sending
+            .iter()
+            .filter(|s| s.id == task.id)
+            .cloned()
+            .collect();
+        if !legacy && (!task.responses.is_empty() || !sending.is_empty()) {
             detail = detail.child(section(crate::ui_text::panel::tasks_thread_count(
                 task.responses.len() + sending.len(),
             )));
@@ -2458,14 +2460,6 @@ fn render_thread(
     now: i64,
 ) -> gpui::Div {
     let mut thread = div().flex_none().flex().flex_col().gap(px(4.0));
-    if responses.is_empty() && sending.is_empty() {
-        return thread.child(
-            div()
-                .text_size(px(10.5))
-                .text_color(hsla(theme.text_faint))
-                .child(crate::ui_text::panel::tasks_thread_empty()),
-        );
-    }
     let offset = tako_core::platform::clock::local_utc_offset();
     let entry = |head: String, comment: &str, pending: bool| {
         div()
