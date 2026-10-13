@@ -27,6 +27,10 @@
 //!   `wait_loading_known` は診断の数を見る・合図は `--loading-until`・組み込みの知らせの遅れは
 //!   `READY_POLL` より長い（待ちを抜けば**どの機でも必ず**落ちる）
 //!
+//! #1977: 状態を送らないサーバ（偽サーバの `quiet-loading` = pyright 型）の「猶予の後・最初の診断の前」は
+//! `wait_warming_known(` が待ちの印（`wait_loading_known` の診断の数は使えない = 診断が読み込みの終わり）。
+//! `quiet-loading` を起こす行も合図（`LoadingGate`）を通す。
+//!
 //! #1930 で同じ発想の残りを足した（真因と実測は `tests/common/lsp_fake_e2e.rs` の「答えの順序」）:
 //!
 //! - [`読み込みの終わりを実時間で決めていない`] を visual-test・セルフテスト（`crates/tako-app/src`）と
@@ -105,8 +109,13 @@ enum Needs {
 impl Needs {
     fn barriers(self) -> &'static [&'static str] {
         match self {
-            Needs::LoadingKnown => &["wait_loading_known("],
-            Needs::Running => &["wait_running(", "wait_loading_known("],
+            // #1977: 状態を送らないサーバ（`quiet-loading`）は「猶予の後・最初の診断の前」を待つ
+            Needs::LoadingKnown => &["wait_loading_known(", "wait_warming_known("],
+            Needs::Running => &[
+                "wait_running(",
+                "wait_loading_known(",
+                "wait_warming_known(",
+            ],
         }
     }
 }
@@ -197,9 +206,10 @@ fn scan_e2e(rel: &str, src: &str) -> (Vec<String>, usize) {
             ));
         }
     }
-    // `loading` を起こす行は、その行の関数か、その行が呼ぶ config の関数が合図の引数を足す
+    // `loading` / `quiet-loading`（#1977）を起こす行は、その行の関数か、その行が呼ぶ config の関数が
+    // 合図の引数を足す
     for (i, line) in lines.iter().enumerate() {
-        let launches = line.contains("\"loading\"")
+        let launches = (line.contains("\"loading\"") || line.contains("\"quiet-loading\""))
             && ["config(", "config_with(", ".to_string()"]
                 .iter()
                 .any(|call| line.contains(call));
@@ -209,7 +219,12 @@ fn scan_e2e(rel: &str, src: &str) -> (Vec<String>, usize) {
         let gated = |window: Option<(usize, usize)>| {
             window.is_some_and(|(from, to)| (from..=to).any(|j| lines[j].contains(GATE_ARGS)))
         };
-        let called = callee_before(line, "\"loading\"").and_then(|name| fn_named(&lines, &name));
+        let needle = if line.contains("\"quiet-loading\"") {
+            "\"quiet-loading\""
+        } else {
+            "\"loading\""
+        };
+        let called = callee_before(line, needle).and_then(|name| fn_named(&lines, &name));
         if !gated(enclosing_fn(&lines, i)) && !gated(called) {
             out.push(report(
                 rel,
@@ -442,6 +457,11 @@ fn 走査が空振りしていない() {
     // 未応答の `starting: false`
     assert!(count("issue1680_lsp_goto.rs") >= 1, "{anchors:?}");
     assert!(count("issue1683_lsp_format.rs") >= 1, "{anchors:?}");
+    // #1977: 状態を送らないサーバの「猶予の後・最初の診断の前」の `waited_for_loading`
+    assert!(
+        count("issue1977_lsp_install_followup.rs") >= 1,
+        "{anchors:?}"
+    );
 }
 
 /// 現行ソースへ注入して、名指しされる（file:line）ことを確かめる
@@ -556,6 +576,16 @@ fn 逆戻りを名指しできる() {
             "",
         ),
         "診断の数を見ていない",
+    );
+    // K. #1977: 状態を送らないサーバへ「猶予の後・最初の診断の前」を待たずに送る
+    assert_named(
+        "K 1977 の猶予の後",
+        "crates/tako-control/tests/issue1977_lsp_install_followup.rs",
+        (
+            "    let warming = lsp_fake_e2e::wait_warming_known(&manager);\n    assert_eq!(",
+            "    let warming = Value::Null;\n    assert_eq!(",
+        ),
+        "#1922 の 1",
     );
     // J. 組み込みの知らせの遅れを `READY_POLL` 以下へ縮める
     assert_named(
@@ -1118,7 +1148,7 @@ fn 答えの順序の逆戻りを名指しできる() {
         "S settle の順序",
         FAKE,
         (
-            "        if settle_before {\n            finish_loading(&out, &loaded);\n        }\n        out.send(",
+            "        if settle_before {\n            finish_loading(&out, &loaded, quiet, &pending);\n        }\n        out.send(",
             "        out.send(",
         ),
         "#1930 の 6",

@@ -13,6 +13,8 @@
 //!   自分で計算した値を置かない（どこから来た値かを説明できる形にする）
 //! - **置き場は `<data_dir>/lsp-servers/`**（`TAKO_DATA_DIR` の隔離に従う。PATH へは足さない）
 //! - **利用者のグローバルに入っている版があればそちらを使う**（取得は「見つからない」ときだけ）
+//! - **表の版を上げたら古い版の段を片付ける**（#1977。判定は [`sweep_plan`]。消すのは tako の印がある・
+//!   今の版より前に入った・生きている tako が使っていない段だけ）
 
 use std::path::{Path, PathBuf};
 
@@ -258,6 +260,103 @@ pub const ROOT_DIR_NAME: &str = "lsp-servers";
 /// 済んだ置き場に最後に書く印（中身は何を入れたかの JSON。これが無い段は使わない）
 pub const MARKER: &str = ".tako-installed";
 
+/// 使っている印の接頭辞（#1977）。サーバを版の段から起こした tako のプロセスが
+/// `<版の段>/.tako-lease-<pid>` を置く。片付けはその pid が生きている段を消さない
+/// （古い tako の GUI が古い版で動いているあいだに、新しい tako が消さない）
+pub const LEASE_PREFIX: &str = ".tako-lease-";
+
+/// 使っている印のファイル名
+pub fn lease_name(pid: u32) -> String {
+    format!("{LEASE_PREFIX}{pid}")
+}
+
+/// 使っている印のファイル名から pid を読む（印でなければ `None`）
+pub fn lease_pid(file_name: &str) -> Option<u32> {
+    file_name.strip_prefix(LEASE_PREFIX)?.parse().ok()
+}
+
+/// 片付けの対象の候補 1 つ（`<root>/<id>/` の直下の段 1 つ。#1977）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionDir {
+    /// 段の名前（版。`pyright-1.1.414` / `2026-09-21` / `24.21.0`）
+    pub name: String,
+    /// 済んだ印（[`MARKER`]）があるか = tako が置いたと言える
+    pub marked: bool,
+    /// 入れた時刻（印の `installed_at`。読めなければ印の mtime。秒）
+    pub installed_at: Option<u64>,
+    /// 生きている tako のプロセスが使っている印を置いている
+    pub leased: bool,
+    /// symlink（利用者が張ったもの。辿らず触らない）
+    pub symlink: bool,
+}
+
+/// 片付けで残す理由（`tako lsp status` の `fetch.cleanup.kept[].reason`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepReason {
+    /// 生きている tako が使っている（古い GUI が古い版で動いている）
+    InUse,
+    /// 今の版より後に入った（新しい tako が入れた = 古い tako が新しい版を消さない）
+    Newer,
+    /// 済んだ印が無い（tako が置いたと言えない = 利用者の物かもしれない）
+    Unmarked,
+    /// symlink（利用者が張った）
+    Symlink,
+}
+
+impl KeepReason {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::InUse => "in_use",
+            Self::Newer => "newer",
+            Self::Unmarked => "unmarked",
+            Self::Symlink => "symlink",
+        }
+    }
+}
+
+/// 古い版の段を消すかの判定（#1977。I/O を持たない純粋部分）。
+///
+/// 消すのは **今の版の段が済んでいて、それより前に入った、tako が置いた（印のある）段**だけ。
+/// 今の版より後に入った段は残す（同じ data dir を古い tako と新しい tako が共有していても、
+/// 古い側が新しい版を消さない = 互いに消し合って取り直し続けない）。使っている印が生きている段・
+/// 印の無い段・symlink も残す。今の版の段が済んでいなければ何も消さない（比べる基準が無い）。
+///
+/// 返すのは今の版以外の各段の `Ok(())`（消す）/ `Err(理由)`（残す）
+pub fn sweep_plan(
+    current: &str,
+    current_installed_at: Option<u64>,
+    dirs: &[VersionDir],
+) -> Vec<(String, Result<(), KeepReason>)> {
+    let Some(current_at) = current_installed_at else {
+        return Vec::new();
+    };
+    dirs.iter()
+        .filter(|d| d.name != current)
+        .map(|d| {
+            let verdict = if d.symlink {
+                Err(KeepReason::Symlink)
+            } else if !d.marked {
+                Err(KeepReason::Unmarked)
+            } else if d.leased {
+                Err(KeepReason::InUse)
+            } else if d.installed_at.is_none_or(|at| at > current_at) {
+                Err(KeepReason::Newer)
+            } else {
+                Ok(())
+            };
+            (d.name.clone(), verdict)
+        })
+        .collect()
+}
+
+/// 済んだ印の中身から入れた時刻（秒）を読む
+pub fn installed_at_of(marker: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(marker)
+        .ok()?
+        .get("installed_at")?
+        .as_u64()
+}
+
 /// サーバの置き場（`<root>/<id>/<版>`）
 pub fn install_dir(root: &Path, id: &str, fetch: &Fetch) -> PathBuf {
     root.join(id).join(fetch.version_key())
@@ -457,6 +556,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn dir(name: &str, at: Option<u64>) -> VersionDir {
+        VersionDir {
+            name: name.to_string(),
+            marked: true,
+            installed_at: at,
+            leased: false,
+            symlink: false,
+        }
+    }
+
+    #[test]
+    fn 片付けは今の版より前に入った印のある段だけを消す() {
+        let dirs = vec![
+            dir("v3", Some(300)),
+            dir("v1", Some(100)),
+            dir("v2-same-time", Some(300)),
+            dir("v9-newer", Some(900)),
+            VersionDir {
+                leased: true,
+                ..dir("v0-in-use", Some(50))
+            },
+            VersionDir {
+                marked: false,
+                ..dir("user-dir", None)
+            },
+            VersionDir {
+                symlink: true,
+                ..dir("link", Some(10))
+            },
+            dir("no-time", None),
+        ];
+        let plan = sweep_plan("v3", Some(300), &dirs);
+        let verdict = |name: &str| {
+            plan.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("{name} が判定に無い"))
+        };
+        assert!(
+            plan.iter().all(|(n, _)| n != "v3"),
+            "今の版は判定に載らない"
+        );
+        assert_eq!(verdict("v1"), Ok(()));
+        assert_eq!(verdict("v2-same-time"), Ok(()), "同じ時刻は前とみなす");
+        assert_eq!(verdict("v9-newer"), Err(KeepReason::Newer));
+        assert_eq!(verdict("v0-in-use"), Err(KeepReason::InUse));
+        assert_eq!(verdict("user-dir"), Err(KeepReason::Unmarked));
+        assert_eq!(verdict("link"), Err(KeepReason::Symlink));
+        assert_eq!(
+            verdict("no-time"),
+            Err(KeepReason::Newer),
+            "入れた時刻が分からない段は消さない側へ倒す"
+        );
+        assert!(
+            sweep_plan("v3", None, &dirs).is_empty(),
+            "今の版が済んでいなければ何も消さない"
+        );
+    }
+
+    #[test]
+    fn 使っている印と入れた時刻を読む() {
+        assert_eq!(lease_name(4242), ".tako-lease-4242");
+        assert_eq!(lease_pid(".tako-lease-4242"), Some(4242));
+        assert_eq!(lease_pid(".tako-lease-x"), None);
+        assert_eq!(lease_pid(MARKER), None);
+        assert_eq!(
+            installed_at_of(r#"{"label":"x","installed_at":1760000000}"#),
+            Some(1_760_000_000)
+        );
+        assert_eq!(installed_at_of("{壊れた"), None);
+        assert_eq!(installed_at_of(r#"{"label":"x"}"#), None);
     }
 
     #[test]

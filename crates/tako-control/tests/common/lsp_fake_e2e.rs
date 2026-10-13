@@ -207,6 +207,26 @@ pub fn wait_loading_known(manager: &LspManager) {
     );
 }
 
+/// 状態を送らないサーバ（偽サーバの `quiet-loading` = pyright 型。#1977）で、握手の直後の猶予
+/// （`STATUS_GRACE`）が明けた後の「最初の診断の前」にいることを確かめる。文書を編集モードで開いてから、
+/// 読み込みの合図（[`LoadingGate::finish`]）を作る前に呼ぶ。
+///
+/// 起動（`running`）を待ってから猶予ぶん眠る（握手の時刻は `running` が見える前 = 見えた時点から
+/// 数えれば必ず猶予の外）。偽サーバは合図まで診断を溜めるので、診断は 0 件のまま。
+/// 返すのはその時点の状態（`loading` は #1977 なら真・A/B の旧腕 `TAKO_1977_LEGACY=1` なら偽）
+#[track_caller]
+pub fn wait_warming_known(manager: &LspManager) -> Value {
+    wait_running(manager);
+    std::thread::sleep(tako_control::lsp::goto::STATUS_GRACE);
+    let status = server(manager);
+    assert_eq!(
+        status["diagnostics"],
+        json!(0),
+        "合図の前に診断が届いている（偽サーバが溜めていない）: {status}"
+    );
+    status
+}
+
 /// 偽サーバのログ（`--log`）に `method` の要求が `count` 件以上届くまで待つ
 #[track_caller]
 pub fn wait_received(log: &Path, method: &str, count: usize) {

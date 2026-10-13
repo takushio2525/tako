@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-09（#1921: release-windows の rust-cache を外し、タグごとに一度も当たらないキャッシュを毎晩約 1.6 GB 保存して main / PR のキャッシュを押し出すのを止めた）
-- 公式文書「タグの run は別のタグのキャッシュを読めない（読めるのは自分の ref と main）」と、v0.8.16〜v0.8.28 の 13 回すべての「No cache found.」+ 保存 1.60〜1.61 GB を実測。main は debug のキャッシュだけで release の target に効かない（依存の取得 約 60 秒 / その復元 約 55 秒）ので (a) save-if: false ではなく (b) 外す
-- `scripts/test-cargo-root-manifest-key-1915.sh` に「タグで起動しうる workflow の rust-cache は 0 本」（判定の自己検査 8 通り）。34 PASS・注入 2 通り（修正前の yml / ci.yml にタグ起動）で名指しの FAIL・actionlint 0 件。所要は rust-cache の前後ステップ平均 108 秒ぶん縮む見込み
-
 ## 2026-10-09（#1918: セルフテストの器にも -f・tk-coretest の残骸を製品の掃除で回収・psmux の e2e も -f NUL）
 - セルフテストの `-f` なし 6 か所（字面 48 / 68 / 73 / 103 + シェルへ打ち込む 1d / 61f。1d は固定名 `takoST` → pid 入り。103 / 61f は backend の conf）を直し、番犬を `mod self_test` とシェル文字列の `-L … new-session` へ広げた。`is_killable_socket_name` に `tk-coretest-` だけ足した（`tk*` は手書きなので据え置き）。psmux は CI で v3.3.7 / v3.3.8 を実測し `-f NUL` で既定の探索をしない → e2e を `Fixture::new_session` へ寄せた
 - 実測: 偽の HOME の `.tmux.conf` がセルフテストで 5 → 0 回・番犬は土台の main.rs で 6 か所を file:line で名指し・回収の注入で新テスト 3 本が落ちる・psmux の `-f /dev/null` は v3.3.8 で設定警告
@@ -59,3 +55,7 @@
 ## 2026-10-13（#1948: 言語の同定の正本 `tako_core::file_type` へ色分け・プレビュー種別・HTTP の型・インデント・Enter・コードブロックの別名を寄せ、`tako open` / `tako edit` の応答に `file_type` / `syntax`）
 - 表は 1 形式 = 1 行（58 行。全 213 構文は並べない）。preview / text_edit / open_plan の拡張子の分岐を表の列へ移し、`.ino` の補い（#1949）・画像の形式・MIME も表へ。番犬 `issue1948_file_type_watchdog`（寄せる前の 3 ファイルで分岐 70 件を file:line で名指す・実行の既定へ `erl` の注入で `runner_defaults.rs:135` を名指す）。アイコンは拡張子を小文字で引く。カタログ +153 B
 - 実測: 寄せる前の判定の写しと 2,324 パス × 7 列・1,430 トークンを比べる単体が寄せる前のコードでも緑、寄せた後の差分は名指した 2 種（`CMakeLists.txt` の Enter・特殊名の大文字違いの色）だけ。構文は 213 のまま。`scripts/test-file-type-1948.sh`（隔離 GUI）17 PASS = CLI と MCP の応答が字面まで一致・`TAKO_1949_LEGACY=1` で `.ino` だけ Plain Text
+
+## 2026-10-12（#1977: 状態を送らないサーバは最初の診断まで読み込み中・表の版を上げたら古い版の段を片付ける・引き直しの間隔を直前の 1 巡で伸ばす）
+- 実の pyright 1.1.414 は索引ができるまで補完に `{"isIncomplete":true,"items":[]}`・最初の診断が握手から 0.6 秒。`goto::loading_of` を「最初の診断まで（上限 10 秒）」へ。`fetch::sweep_old_versions`（印あり・今の版より前・生きた `.tako-lease-<pid>` 無しだけ消す）を `status.fetch.cleanup` / `install` の `cleanup` へ。間隔は 1 巡 × 50 を 15 秒〜5 分（`status.recheck`）。A/B `TAKO_1977_LEGACY=1`・カタログ +126 B
+- 実測: 実の pyright を猶予 0 の注入で旧 3/3 が 0 件・新 3/3 が 2 件（注入なしでも 2.0 → 0.54〜0.62 秒）。ログインシェル 1 本 = 普通の rc 0.28〜0.52 秒 / conda の hook 1.8〜2.5 秒。e2e 8 本（偽サーバ `quiet-loading`）・製品への注入 3 通りで名指し。Windows 実機（3）は Issue のコメントへ手順

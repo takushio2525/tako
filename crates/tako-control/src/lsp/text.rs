@@ -206,6 +206,27 @@ pub const MENU_NOT_SYMBOL_NEXT_STEP: Note = Note::new(
     "Point line / column at an identifier",
 );
 
+// --- 古い版の片付け・引き直し（#1977）----------------------------------------------
+
+/// 古い版の段を消した。`{items}` = `<id>/<版>` の並び・`{size}` = 空いた大きさ
+pub const CLEANUP_REMOVED_NOTE: Note = Note::new(
+    "古い版を片付けた: {items}（{size} 空いた）",
+    "Removed old versions: {items} ({size} freed)",
+);
+
+/// 古い版の段を残した。`{items}` = `<id>/<版> <理由>` の並び。理由は in_use（別の tako が使っている）/
+/// unmarked（tako の印が無い）/ symlink / failed（消せなかった）
+pub const CLEANUP_KEPT_NOTE: Note = Note::new(
+    "残した古い版: {items}（in_use = 動いている別の tako が使っている・failed = 消せなかった。次に起こすときにもう一度見る）",
+    "Kept old versions: {items} (in_use = another running tako uses it, failed = could not remove; checked again on the next start)",
+);
+
+/// 未導入のサーバの引き直し（シェル統合の合図）。`{targets}` / `{interval}` = 秒 / `{cost}` = 直前の 1 巡の ms
+pub const RECHECK_NOTE: Note = Note::new(
+    "未導入の引き直し: {targets}（コマンドの終わりと cwd の変化で {interval} 秒おき以上・直前の 1 巡 {cost} ms）",
+    "Re-checking missing servers: {targets} (on command end / cwd change, at most every {interval}s; last pass {cost} ms)",
+);
+
 /// `{…}` を差し込む
 pub fn fill(note: Note, values: &[(&str, &str)]) -> String {
     let mut text = note.text().to_string();
