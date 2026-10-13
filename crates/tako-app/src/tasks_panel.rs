@@ -54,6 +54,20 @@ pub(crate) fn legacy_1450_b2() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1450B2_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
+/// #2016 の A/B。`TAKO_2016_LEGACY=1` で**同一バイナリのまま**返答欄と履歴を修正前へ戻す
+/// （欄に未確定文字列とキャレット矩形を出さない = IME の下線も候補窓の位置も無い /
+/// 折り返さない / 送信の往復を UI スレッドで待ってから欄を空にする / やりとりを新しい順・
+/// 相対時刻でフォームの下に出す）
+pub(crate) fn legacy_2016() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2016_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// 返答欄の 1 行の高さ（#2016。欄の高さの上限をこの倍数で決める）
+pub(crate) const COMMENT_LINE_H: f32 = 16.0;
+/// 返答欄が行数ぶん伸びる上限（#2016）。超えたら欄の中でスクロールする
+pub(crate) const COMMENT_MAX_LINES: f32 = 8.0;
+
 /// 添付 1 件（パスと**今の**実在）。起票時に実在を問わない設計なので、
 /// 「消えた添付」を画面に出せるのは `exists` を毎回読み直しているから
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +339,33 @@ pub(crate) struct TasksPanel {
     /// 画像添付のサムネイル（#1472）。**いま開いている 1 件のぶんだけ**持ち、
     /// 別のタスクを選んだら捨てる（`ensure_task_thumbs` が毎フレーム揃える）
     pub thumbs: std::collections::HashMap<String, ThumbState>,
+    /// 送った直後でまだ積み終わっていない返答（#2016）。欄は押した瞬間に空にするので、
+    /// 返した中身はここに居る間「送信中」としてやりとりの末尾に出す（消えたように見せない）
+    pub sending: Vec<SendingReply>,
+    /// 送れなかった下書き（#2016）。押した後に別の項目へ移っていて欄へ戻せなかったものを、
+    /// その項目を開き直したときに戻す（**書いたものを黙って捨てない**）
+    pub unsent: Option<SendingReply>,
+    /// 送信の通し番号（`sending` の 1 件を取り違えずに片付けるため）
+    pub send_seq: u64,
+    /// まだ積みに出していない返答の要求（#2016）。**1 本ずつ順に**出す
+    /// （続けて押した 2 本を並行に積むと、YAML のロックを取る順が不定で返答の並びが入れ替わる）
+    pub send_queue: std::collections::VecDeque<(u64, Request)>,
+    /// いま 1 本を積みに出しているか（`pump_user_task_sends` の門）
+    pub send_running: bool,
+    /// 返答欄の中のスクロール（#2016。上限の行数を超えたら欄の中で送る）
+    pub comment_scroll: gpui::ScrollHandle,
+    /// 返答欄のキャレットを最後に見える範囲へ寄せたときの（本文の長さ, キャレット, 未確定の長さ）。
+    /// **変わったときだけ**寄せる（毎フレーム寄せるとホイールで遡って読めない）
+    pub comment_follow: std::rc::Rc<std::cell::Cell<Option<(usize, usize, usize)>>>,
+}
+
+/// 送信中（または送れなかった）返答 1 件（#2016）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SendingReply {
+    pub seq: u64,
+    pub id: String,
+    pub decision: String,
+    pub comment: String,
 }
 
 /// サムネイル 1 枚の状態（#1472）
@@ -377,8 +418,20 @@ impl TasksPanel {
         } else {
             self.collapse();
             self.expanded = Some(id.to_string());
+            // #2016: 送れなかった下書きはその項目を開き直したときに戻す
+            if self.unsent.as_ref().is_some_and(|d| d.id == id) {
+                if let Some(draft) = self.unsent.take() {
+                    self.restore_draft(draft);
+                }
+            }
             true
         }
+    }
+
+    /// 送れなかった返答をフォームへ戻す（#2016。判断も本文もキャレットも送る前の形へ）
+    pub(crate) fn restore_draft(&mut self, draft: SendingReply) {
+        self.decision = Some(draft.decision);
+        self.comment.set_text(draft.comment);
     }
 
     /// 返答フォームを初期状態へ（タスクを選び直した / 返し終えた）
@@ -586,7 +639,13 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// 返答を送る（`respond` = 積む + 起票 master へ配送。配送は B1 の 1 実装）
+    /// 返答を送る（`respond` = 積む + 起票 master へ配送。配送は B1 の 1 実装）。
+    ///
+    /// #2016: **押した瞬間に欄を空にして**（次のフレームで空が描かれる）、往復は UI スレッドで
+    /// 待たない。要求は待ち行列へ積み、[`Self::pump_user_task_sends`] が 1 本ずつ順に
+    /// dispatch の "respond" と共有の 3 段へ流す（host に触る ② だけが UI スレッド）。
+    /// 返した中身は積み終わるまで `sending` に居て、やりとりの末尾に「送信中」で出る。
+    /// 積めなかったら（タスクが消えた・置き場が読めない）欄へ戻して理由を出す
     pub(crate) fn user_task_respond(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(decision) = self.user_tasks.decision.clone() else {
             return;
@@ -605,27 +664,163 @@ impl TakoApp {
             copy_texts: None,
             links: None,
             due: None,
-            decision: Some(decision),
-            comment: Some(comment),
+            decision: Some(decision.clone()),
+            comment: Some(comment.clone()),
             // **どこから返したか**が残る（PWA = B3 は "pwa"）
             via: Some("pc".to_string()),
             pane: None,
             caller_role: None,
         };
-        match tako_control::dispatch(self, request, PaneOrigin::User) {
-            Ok(_) => {
-                self.user_tasks.reset_form();
-                // 返した直後の配送状態（多くは `sent`）をすぐ出す。確定はポーリングが行う
-                self.refresh_user_tasks();
+        // A/B（`TAKO_2016_LEGACY=1`）: 修正前 = 往復を UI スレッドで待ってから欄を空にする
+        if legacy_2016() {
+            match tako_control::dispatch(self, request, PaneOrigin::User) {
+                Ok(_) => {
+                    self.user_tasks.reset_form();
+                    // 返した直後の配送状態（多くは `sent`）をすぐ出す。確定はポーリングが行う
+                    self.refresh_user_tasks();
+                }
+                Err(e) => self.notify_ui_dispatch_failed(
+                    NoticeArea::UserTasks,
+                    NoticeArm::Issue1450B2,
+                    "user_task_respond",
+                    Some(id),
+                    &e,
+                ),
             }
-            Err(e) => self.notify_ui_dispatch_failed(
-                NoticeArea::UserTasks,
-                NoticeArm::Issue1450B2,
-                "user_task_respond",
-                Some(id),
-                &e,
-            ),
+            cx.notify();
+            return;
         }
+
+        self.user_tasks.send_seq += 1;
+        let seq = self.user_tasks.send_seq;
+        self.user_tasks.sending.push(SendingReply {
+            seq,
+            id: id.to_string(),
+            decision,
+            comment,
+        });
+        self.user_tasks.send_queue.push_back((seq, request));
+        // 欄はここで空にする（積み終わりを待たない = 押した次のフレームで空になる）。
+        // 欄のフォーカスを外すのは旧実装と同じ（返し終えた後の打鍵はターミナルへ戻る）
+        self.user_tasks.reset_form();
+        self.user_tasks.notice = None;
+        cx.notify();
+        self.pump_user_task_sends(cx);
+    }
+
+    /// 待っている返答を**1 本ずつ順に**積みに出す（#2016）。
+    ///
+    /// 1 本は dispatch の "respond" と共有の 3 段: ① 積む（`user_task_respond_store`。YAML の
+    /// 読み書き = background）→ ② 運ぶ（`_deliver`。workspace と送達フローに触る = UI スレッド）→
+    /// ③ 記録して読み直す（`_finish` = background）。着地したら次の 1 本を出す
+    /// （並行に出すと返答の並びが送った順とずれる）
+    pub(crate) fn pump_user_task_sends(&mut self, cx: &mut Context<Self>) {
+        if self.user_tasks.send_running {
+            return;
+        }
+        let Some((seq, request)) = self.user_tasks.send_queue.pop_front() else {
+            return;
+        };
+        self.user_tasks.send_running = true;
+        cx.spawn(async move |this, cx| {
+            // ① 積む（YAML の読み書き。background）
+            let stored = cx
+                .background_executor()
+                .spawn(async move {
+                    tako_control::dispatch::user_task_respond_store(&request, PaneOrigin::User)
+                })
+                .await;
+            let stored = match stored {
+                Ok(stored) => stored,
+                Err(e) => {
+                    let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                        app.user_task_send_failed(seq, &e, cx);
+                        app.user_tasks.send_running = false;
+                        app.pump_user_task_sends(cx);
+                    });
+                    return;
+                }
+            };
+            // ② 運ぶ（workspace と送達フローに触るので UI スレッド）
+            let Ok(delivered) = this.update(cx, |app: &mut TakoApp, cx| {
+                let delivered = tako_control::dispatch::user_task_respond_deliver(app, stored);
+                // master を起こして運んだときはペインの PTY をここで立てる（#1023 の不変条件。
+                // UI から dispatch を呼んだ経路は待ちを自分で消化する）
+                if let Err(reason) = app.attach_pending_sessions(cx) {
+                    app.notify_ui_op_failed(
+                        NoticeArea::UserTasks,
+                        NoticeArm::Issue1450B2,
+                        "user_task_respond",
+                        None,
+                        &reason,
+                    );
+                }
+                delivered
+            }) else {
+                return;
+            };
+            // ③ 配送を記録して読み直す（YAML の読み書き。background）
+            let finished = cx
+                .background_executor()
+                .spawn(async move { tako_control::dispatch::user_task_respond_finish(delivered) })
+                .await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.user_tasks.sending.retain(|s| s.seq != seq);
+                if let Err(e) = finished {
+                    // 返答は積めている（配送の記録だけが書けなかった）。欄へは戻さない
+                    // （戻すと同じ返答が二重に積まれる）。理由だけを出す
+                    app.notify_ui_dispatch_failed(
+                        NoticeArea::UserTasks,
+                        NoticeArm::Issue1450B2,
+                        "user_task_respond",
+                        None,
+                        &e,
+                    );
+                }
+                // 返した直後の配送状態（多くは `sent`）をすぐ出す。確定はポーリングが行う
+                app.refresh_user_tasks();
+                app.user_tasks.send_running = false;
+                app.pump_user_task_sends(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 積めなかった返答を戻す（#2016）。押した項目をまだ開いていて欄が空なら**その場で**戻し、
+    /// 別の項目へ移っていたら下書きとして持ち、開き直したときに戻す（別の項目の欄へは入れない =
+    /// 宛先を取り違えて送らせない）
+    pub(crate) fn user_task_send_failed(
+        &mut self,
+        seq: u64,
+        err: &tako_control::DispatchError,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(at) = self.user_tasks.sending.iter().position(|s| s.seq == seq) else {
+            return;
+        };
+        let draft = self.user_tasks.sending.remove(at);
+        let id = draft.id.clone();
+        let here = self.user_tasks.expanded.as_deref() == Some(id.as_str())
+            && self.user_tasks.decision.is_none()
+            && self.user_tasks.comment.text().is_empty();
+        if here {
+            self.user_tasks.restore_draft(draft);
+        } else {
+            self.user_tasks.unsent = Some(draft);
+        }
+        self.user_tasks.notice = Some(crate::ui_text::panel::tasks_send_failed(
+            &id,
+            &err.to_string(),
+            !here,
+        ));
+        self.notify_ui_dispatch_failed(
+            NoticeArea::UserTasks,
+            NoticeArm::Issue1450B2,
+            "user_task_respond",
+            Some(&id),
+            err,
+        );
         cx.notify();
     }
 
@@ -1306,7 +1501,6 @@ impl TakoApp {
         let theme = self.theme.clone();
         let decision = self.user_tasks.decision.clone();
         let comment = self.user_tasks.comment.text().to_string();
-        let comment_focused = self.user_tasks.comment_focused;
         let caret = self.user_tasks.comment.cursor();
         let now = tako_core::user_task::unix_now();
         let id = task.id.clone();
@@ -1644,6 +1838,29 @@ impl TakoApp {
             }
         }
 
+        // --- やりとり（#2016: 古い順・時刻・経路つきで**フォームの上**に置く） ---
+        //
+        // 会話と同じ並び（上が古く、下へ積まれ、その下に次に書く欄がある）。旧実装は
+        // 新しい順でフォームと配送の行の**さらに下**に出していたので、項目を開いても
+        // 目に入らず「返答の履歴が無い」に見えていた。送った直後の返答は積み終わるまで
+        // 「送信中」で末尾に出す（欄を先に空にしても返した中身が消えたように見せない）
+        // 0 件のときは出さない（詳細の背丈を修正前と同じに保つ。最初の 1 件は押した瞬間に
+        // 「送信中」で現れる）
+        let legacy = legacy_2016();
+        let sending: Vec<SendingReply> = self
+            .user_tasks
+            .sending
+            .iter()
+            .filter(|s| s.id == task.id)
+            .cloned()
+            .collect();
+        if !legacy && (!task.responses.is_empty() || !sending.is_empty()) {
+            detail = detail.child(section(crate::ui_text::panel::tasks_thread_count(
+                task.responses.len() + sending.len(),
+            )));
+            detail = detail.child(render_thread(&theme, &task.responses, &sending, now));
+        }
+
         // --- 返答フォーム（判断チップ + コメント + 返す） ---
         detail = detail.child(section(
             crate::ui_text::panel::tasks_respond_heading().to_string(),
@@ -1690,82 +1907,12 @@ impl TakoApp {
         }
         detail = detail.child(chips);
 
-        // コメント欄（クリックでフォーカス。打鍵は handle_task_comment_key が受ける）。
-        // キャレットは**行ごとに**描く（git のコミット欄は 1 行なので前後を split して
-        // 済むが、ここは改行を受けるので「キャレットが載っている行」だけを split する）
-        let mut box_ = div()
-            .id("tasks-comment")
-            .flex_none()
-            .flex()
-            .flex_col()
-            .mt(px(4.0))
-            .px(px(6.0))
-            .py(px(4.0))
-            .min_h(px(40.0))
-            .rounded(px(6.0))
-            .cursor(CursorStyle::IBeam)
-            .border_1()
-            .border_color(hsla(if comment_focused {
-                theme.accent_border_muted
-            } else {
-                theme.border_inner
-            }))
-            .bg(rgba(theme.surface_0))
-            .text_size(px(11.0))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    // #496: 押した瞬間にルートの dismiss で自分が消えないよう伝播を止める
-                    this.clear_text_input_focus();
-                    this.user_tasks.comment_focused = true;
-                    this.user_tasks.comment.move_end();
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            );
-        if comment.is_empty() && !comment_focused {
-            box_ = box_.child(
-                div()
-                    .text_color(hsla(theme.text_faint))
-                    .child(crate::ui_text::panel::tasks_comment_placeholder()),
-            );
+        // コメント欄（クリックでフォーカス。打鍵は handle_task_comment_key が受ける）
+        if legacy {
+            detail = detail.child(self.render_task_comment_legacy(&comment, caret, cx));
         } else {
-            for (i, (line, split)) in caret_lines(&comment, caret).into_iter().enumerate() {
-                let mut row = div().flex().flex_row().items_center().flex_none();
-                match split.filter(|_| comment_focused) {
-                    Some(at) => {
-                        let (before, after) = line.split_at(at);
-                        row = row
-                            .child(
-                                div()
-                                    .text_color(hsla(theme.foreground))
-                                    .child(SharedString::from(before.to_string())),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(1.5))
-                                    .h(px(13.0))
-                                    .bg(rgba(theme.accent)),
-                            )
-                            .child(
-                                div()
-                                    .text_color(hsla(theme.foreground))
-                                    .child(SharedString::from(after.to_string())),
-                            );
-                    }
-                    None => {
-                        row = row.child(
-                            div()
-                                .text_color(hsla(theme.foreground))
-                                .child(SharedString::from(line.to_string())),
-                        );
-                    }
-                }
-                box_ = box_.child(row.id(("tasks-comment-line", i)));
-            }
+            detail = detail.child(self.render_task_comment(cx));
         }
-        detail = detail.child(box_);
 
         // 送信ボタン（判断が未選択なら押せない = 誤爆防止。理由も出す）
         let can_send = decision.is_some();
@@ -1781,6 +1928,7 @@ impl TakoApp {
                 .child(
                     div()
                         .id("tasks-send")
+                        .relative()
                         .flex_none()
                         .px(px(9.0))
                         .py(px(3.0))
@@ -1799,6 +1947,20 @@ impl TakoApp {
                         })
                         .border_1()
                         .child(crate::ui_text::panel::tasks_send())
+                        // セルフテスト（visual-test）が**実マウスで**押すための実矩形（#2016）
+                        .child({
+                            let probe = self.panel_click_probe_bounds.clone();
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| {
+                                    probe.borrow_mut().insert("tasks-send".to_string(), bounds);
+                                },
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.user_tasks.decision.is_some() {
                                 this.user_task_respond(&send_id, cx);
@@ -1860,8 +2022,8 @@ impl TakoApp {
             );
         }
 
-        // --- やりとり（スレッド。新しい順） ---
-        if !task.responses.is_empty() {
+        // --- やりとり（A/B の旧実装 = 新しい順・相対時刻でフォームの下） ---
+        if legacy && !task.responses.is_empty() {
             detail = detail.child(section(crate::ui_text::panel::tasks_thread().to_string()));
             for (i, r) in task.responses.iter().enumerate().rev() {
                 detail = detail.child(
@@ -1926,6 +2088,311 @@ impl TakoApp {
                 ),
         )
     }
+
+    /// 返答コメント欄（#2016）。
+    ///
+    /// 本文と**未確定文字列**（IME の変換中の読み）を 1 本の `StyledText` にして描くので、
+    /// 欄の幅で折り返し（`whitespace_nowrap` を付けない）、未確定文字列はキャレット位置に
+    /// 下線つきで出る。キャレットは実描画のレイアウト（`TextLayout::position_for_index`）から
+    /// 位置を採って描き、その矩形を IME の候補窓の位置出し（`bounds_for_range` が読む
+    /// `text_input_caret_bounds`）へ書く。旧実装はどちらも無く、変換中の読みが欄のどこにも
+    /// 出ず、候補窓は前に使った別の入力欄やターミナルの位置へ出ていた（#2016 の症状 1）。
+    /// 欄は行数ぶん伸び、[`COMMENT_MAX_LINES`] を超えたら欄の中でスクロールする
+    fn render_task_comment(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme.clone();
+        let focused = self.user_tasks.comment_focused;
+        let ime_target = self.app_text_input() == Some(crate::AppTextInput::TaskComment);
+        let ime = self
+            .ime
+            .as_ref()
+            .filter(|ime| ime.app_input == Some(crate::AppTextInput::TaskComment));
+        let marked = ime.map(|ime| ime.text.clone());
+        let selected = ime.and_then(|ime| ime.selected_utf16.clone());
+        let view = comment_view(&self.user_tasks.comment, marked.as_deref());
+
+        let mut box_ = div()
+            .id("tasks-comment")
+            .relative()
+            .flex_none()
+            .mt(px(4.0))
+            .min_h(px(40.0))
+            .rounded(px(6.0))
+            .cursor(CursorStyle::IBeam)
+            .border_1()
+            .border_color(hsla(if focused {
+                theme.accent_border_muted
+            } else {
+                theme.border_inner
+            }))
+            .bg(rgba(theme.surface_0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    // #496: 押した瞬間にルートの dismiss で自分が消えないよう伝播を止める
+                    this.clear_text_input_focus();
+                    this.user_tasks.comment_focused = true;
+                    this.user_tasks.comment.move_end();
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+
+        // 欄の外形（visual-test が「押す場所 / 行数ぶん伸びる / 上限で止まる」を実フレームで読む）
+        box_ = box_.child({
+            let probe = self.panel_click_probe_bounds.clone();
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, _, _| {
+                    probe
+                        .borrow_mut()
+                        .insert("tasks-comment".to_string(), bounds);
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        });
+
+        // 空で握っていないときは案内だけ（打ち始めれば本文に置き換わる）
+        if view.text.is_empty() && !focused {
+            return box_.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .text_size(px(11.0))
+                    .line_height(px(COMMENT_LINE_H))
+                    .text_color(hsla(theme.text_faint))
+                    .child(crate::ui_text::panel::tasks_comment_placeholder()),
+            );
+        }
+
+        let style = gpui::TextStyle {
+            color: hsla(theme.foreground),
+            font_family: SharedString::from(theme.font_family.clone()),
+            font_size: px(11.0).into(),
+            line_height: px(COMMENT_LINE_H).into(),
+            ..gpui::TextStyle::default()
+        };
+        let highlights = view
+            .marked
+            .as_ref()
+            .map(|range| {
+                let marked_text = &view.text[range.clone()];
+                crate::ime_highlight_ranges(marked_text, selected.as_ref(), &theme)
+                    .into_iter()
+                    .map(|(r, style)| (r.start + range.start..r.end + range.start, style))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // 空の本文は高さ 0 の行になるので空白 1 つにする（キャレットは先頭 = 0 のまま）
+        let shown = if view.text.is_empty() {
+            " ".to_string()
+        } else {
+            view.text.clone()
+        };
+        let styled = gpui::StyledText::new(shown).with_default_highlights(&style, highlights);
+        let layout = styled.layout().clone();
+
+        // キャレットの描画・候補窓の位置・欄の中のスクロール追従は**実描画の後**に決める
+        // （折り返しの位置はレイアウトが済むまで分からない）
+        let caret_ix = view.caret;
+        let marked_range = view.marked.clone();
+        let slot = ime_target.then(|| self.text_input_caret_bounds.clone());
+        let probe = self.panel_click_probe_bounds.clone();
+        let scroll = self.user_tasks.comment_scroll.clone();
+        let follow = self.user_tasks.comment_follow.clone();
+        let follow_key = (
+            self.user_tasks.comment.text().len(),
+            caret_ix,
+            marked_range.as_ref().map(|r| r.len()).unwrap_or(0),
+        );
+        let caret_color = hsla(theme.accent);
+        let overlay = gpui::canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                let Some(at) = layout.position_for_index(caret_ix) else {
+                    return;
+                };
+                let caret = gpui::Bounds::new(at, gpui::size(px(1.5), layout.line_height()));
+                if focused {
+                    window.paint_quad(gpui::fill(caret, caret_color));
+                }
+                // IME の候補窓はこの矩形の下に出る（`bounds_for_range`）
+                if let Some(slot) = slot.as_ref() {
+                    slot.set(Some(caret));
+                }
+                {
+                    let mut probe = probe.borrow_mut();
+                    probe.insert("tasks-comment-caret".to_string(), caret);
+                    probe.insert("tasks-comment-text".to_string(), layout.bounds());
+                    match marked_range.as_ref().and_then(|r| {
+                        Some((
+                            layout.position_for_index(r.start)?,
+                            layout.position_for_index(r.end)?,
+                        ))
+                    }) {
+                        Some((a, b)) => {
+                            probe.insert(
+                                "tasks-comment-marked".to_string(),
+                                gpui::Bounds::from_corners(
+                                    a,
+                                    gpui::point(b.x.max(a.x), b.y + layout.line_height()),
+                                ),
+                            );
+                        }
+                        None => {
+                            probe.remove("tasks-comment-marked");
+                        }
+                    }
+                }
+                // 打った・動かしたときだけキャレットを見える範囲へ寄せる
+                // （毎フレーム寄せるとホイールで遡って読めない）
+                if follow.get() != Some(follow_key) {
+                    follow.set(Some(follow_key));
+                    let view = scroll.bounds();
+                    if view.size.height > px(0.0) {
+                        let offset = scroll.offset();
+                        let shift = if caret.bottom() > view.bottom() {
+                            Some(view.bottom() - caret.bottom())
+                        } else if caret.top() < view.top() {
+                            Some(view.top() - caret.top())
+                        } else {
+                            None
+                        };
+                        if let Some(dy) = shift {
+                            scroll.set_offset(gpui::point(offset.x, offset.y + dy));
+                            window.request_animation_frame();
+                        }
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
+        box_.child(
+            div()
+                .id("tasks-comment-scroll")
+                .max_h(px(COMMENT_LINE_H * COMMENT_MAX_LINES + 8.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.user_tasks.comment_scroll)
+                .px(px(6.0))
+                .py(px(4.0))
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .text_size(px(11.0))
+                        .line_height(px(COMMENT_LINE_H))
+                        .child(styled)
+                        .child(overlay),
+                ),
+        )
+    }
+
+    /// 返答コメント欄の旧実装（`TAKO_2016_LEGACY=1` の A/B 用。#2016 の修正前の形のまま）。
+    /// キャレットは**行ごとに**描く（行を縮まない子に割るので欄の幅で折り返さない）。
+    /// 未確定文字列もキャレット矩形も出さない
+    fn render_task_comment_legacy(
+        &mut self,
+        comment: &str,
+        caret: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme.clone();
+        let comment_focused = self.user_tasks.comment_focused;
+        let mut box_ = div()
+            .id("tasks-comment")
+            .flex_none()
+            .flex()
+            .flex_col()
+            .mt(px(4.0))
+            .px(px(6.0))
+            .py(px(4.0))
+            .min_h(px(40.0))
+            .rounded(px(6.0))
+            .cursor(CursorStyle::IBeam)
+            .border_1()
+            .border_color(hsla(if comment_focused {
+                theme.accent_border_muted
+            } else {
+                theme.border_inner
+            }))
+            .bg(rgba(theme.surface_0))
+            .text_size(px(11.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    // #496: 押した瞬間にルートの dismiss で自分が消えないよう伝播を止める
+                    this.clear_text_input_focus();
+                    this.user_tasks.comment_focused = true;
+                    this.user_tasks.comment.move_end();
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        if comment.is_empty() && !comment_focused {
+            box_ = box_.child(
+                div()
+                    .text_color(hsla(theme.text_faint))
+                    .child(crate::ui_text::panel::tasks_comment_placeholder()),
+            );
+        } else {
+            for (i, (line, split)) in caret_lines(comment, caret).into_iter().enumerate() {
+                let mut row = div().flex().flex_row().items_center().flex_none();
+                match split.filter(|_| comment_focused) {
+                    Some(at) => {
+                        let (before, after) = line.split_at(at);
+                        row = row
+                            .child(
+                                div()
+                                    .text_color(hsla(theme.foreground))
+                                    .child(SharedString::from(before.to_string())),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(1.5))
+                                    .h(px(13.0))
+                                    .bg(rgba(theme.accent)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(hsla(theme.foreground))
+                                    .child(SharedString::from(after.to_string())),
+                            );
+                    }
+                    None => {
+                        row = row.child(
+                            div()
+                                .text_color(hsla(theme.foreground))
+                                .child(SharedString::from(line.to_string())),
+                        );
+                    }
+                }
+                box_ = box_.child(row.id(("tasks-comment-line", i)));
+            }
+        }
+        // 欄の外形だけは A/B の計測のために採る（描き方には触らない）
+        box_.child({
+            let probe = self.panel_click_probe_bounds.clone();
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, _, _| {
+                    probe
+                        .borrow_mut()
+                        .insert("tasks-comment".to_string(), bounds);
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        })
+    }
 }
 
 /// 小さなボタン（右パネルのチップと同じ見た目。アイコンは使わず字だけ）
@@ -1947,6 +2414,109 @@ fn small_button(
         .bg(rgba(theme.chip_surface))
         .text_color(hsla(theme.text_secondary))
         .child(SharedString::from(label))
+}
+
+/// 返答欄に描く 1 本の文字列（#2016）。
+///
+/// 本文のキャレット位置へ**未確定文字列**（IME の変換中の読み）を差し込み、キャレットは
+/// その末尾に置く（変換中に読みが伸びると、候補窓もキャレットと一緒に右へ動く）。
+/// 範囲はすべて `text` の中のバイトオフセット
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommentView {
+    pub text: String,
+    pub caret: usize,
+    pub marked: Option<std::ops::Range<usize>>,
+}
+
+/// [`CommentView`] を組む（純関数。キャレットは `TextField` が文字境界へ丸めたものを使う）
+pub(crate) fn comment_view(field: &TextField, marked: Option<&str>) -> CommentView {
+    let (before, after) = field.split_at_caret();
+    match marked.filter(|m| !m.is_empty()) {
+        Some(m) => {
+            let start = before.len();
+            CommentView {
+                text: format!("{before}{m}{after}"),
+                caret: start + m.len(),
+                marked: Some(start..start + m.len()),
+            }
+        }
+        None => CommentView {
+            text: field.text().to_string(),
+            caret: before.len(),
+            marked: None,
+        },
+    }
+}
+
+/// やりとり（#2016。**古い順**に積み、送信中の返答を末尾に足す）。
+///
+/// 1 件は「時刻 · 経路 · 判断」の 1 行と本文。本文は折り返し、改行もそのまま出す
+/// （長い返答を 1 行に潰さない）。時刻は `tako todo show` と同じ 1 実装
+/// （`user_task::response_stamp`）で出す
+fn render_thread(
+    theme: &tako_core::theme::Theme,
+    responses: &[ResponseRow],
+    sending: &[SendingReply],
+    now: i64,
+) -> gpui::Div {
+    let mut thread = div().flex_none().flex().flex_col().gap(px(4.0));
+    let offset = tako_core::platform::clock::local_utc_offset();
+    let entry = |head: String, comment: &str, pending: bool| {
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .pl(px(6.0))
+            .border_l_2()
+            .border_color(hsla(if pending {
+                theme.border_inner
+            } else {
+                theme.accent_border_muted
+            }))
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(hsla(theme.text_faint))
+                    .child(SharedString::from(head)),
+            )
+            .when(!comment.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(hsla(if pending {
+                            theme.text_muted
+                        } else {
+                            theme.text_secondary
+                        }))
+                        .child(SharedString::from(comment.to_string())),
+                )
+            })
+    };
+    for r in responses {
+        thread = thread.child(entry(
+            format!(
+                "{} · {} · {}",
+                tako_core::user_task::response_stamp(r.at, now, offset),
+                crate::ui_text::panel::tasks_via(&r.via),
+                crate::ui_text::panel::tasks_decision(&r.decision),
+            ),
+            &r.comment,
+            false,
+        ));
+    }
+    for s in sending {
+        thread = thread.child(entry(
+            format!(
+                "{} · {} · {}",
+                crate::ui_text::panel::tasks_sending(),
+                crate::ui_text::panel::tasks_via("pc"),
+                crate::ui_text::panel::tasks_decision(&s.decision),
+            ),
+            &s.comment,
+            true,
+        ));
+    }
+    thread
 }
 
 /// 本文を行へ割り、**キャレットが載っている行**にだけ行内オフセットを付けて返す。
@@ -2277,6 +2847,63 @@ mod tests {
         // 範囲外でも 1 つだけ付く（行の末尾へ丸める）
         let lines = caret_lines("ab", 99);
         assert_eq!(lines, [("ab", Some(2))]);
+    }
+
+    /// #2016: 未確定文字列はキャレット位置へ差し込まれ、キャレットはその末尾に来る
+    #[test]
+    fn 未確定文字列はキャレット位置へ入りキャレットは末尾に来る() {
+        let mut field = TextField::default();
+        assert!(field.insert("前後", COMMENT_MAX_BYTES, true));
+        field.move_left(); // 「前|後」
+        let v = comment_view(&field, Some("にほんご"));
+        assert_eq!(v.text, "前にほんご後");
+        let start = "前".len();
+        assert_eq!(v.marked, Some(start..start + "にほんご".len()));
+        assert_eq!(v.caret, start + "にほんご".len());
+        // 変換していなければ本文そのまま・キャレットは本文の位置
+        let plain = comment_view(&field, None);
+        assert_eq!(plain.text, "前後");
+        assert_eq!(plain.caret, start);
+        assert_eq!(plain.marked, None);
+        // 空の未確定文字列（変換の取り消し）は変換していないのと同じ
+        assert_eq!(comment_view(&field, Some("")), plain);
+        // 空の欄・改行を含む本文の末尾でも壊れない
+        let empty = comment_view(&TextField::default(), Some("あ"));
+        assert_eq!((empty.text.as_str(), empty.caret), ("あ", "あ".len()));
+        let mut multi = TextField::default();
+        assert!(multi.insert("1 行目\n", COMMENT_MAX_BYTES, true));
+        let v = comment_view(&multi, Some("に"));
+        assert_eq!(v.text, "1 行目\nに");
+        assert_eq!(v.caret, v.text.len());
+    }
+
+    /// #2016: 送れなかった下書きは、その項目を開き直したときにフォームへ戻る
+    /// （別の項目を開いたときには戻さない = 宛先を取り違えて送らせない）
+    #[test]
+    fn 送れなかった下書きはその項目を開き直すと戻る() {
+        let mut panel = TasksPanel {
+            unsent: Some(SendingReply {
+                seq: 1,
+                id: "u-1".into(),
+                decision: "needs_change".into(),
+                comment: "サムネを大きく".into(),
+            }),
+            ..TasksPanel::default()
+        };
+        panel.toggle("u-2");
+        assert_eq!(panel.decision, None);
+        assert!(panel.comment.text().is_empty());
+        assert!(
+            panel.unsent.is_some(),
+            "別の項目を開いただけで下書きが消えた"
+        );
+        panel.toggle("u-1");
+        assert_eq!(panel.decision.as_deref(), Some("needs_change"));
+        assert_eq!(panel.comment.text(), "サムネを大きく");
+        assert!(
+            panel.unsent.is_none(),
+            "戻した下書きが残っている（二重に戻る）"
+        );
     }
 
     #[test]

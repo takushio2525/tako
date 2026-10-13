@@ -30137,6 +30137,11 @@ mod self_test {
     mod show_command_caller_1958;
     #[cfg(feature = "visual-test")]
     use show_command_caller_1958::show_command_caller_visual;
+    /// #2016: tasks ビューの返答欄（IME・折り返し・送信の間）と返答の履歴（visual-test `tasks-input`）
+    #[cfg(feature = "visual-test")]
+    mod tasks_input_2016;
+    #[cfg(feature = "visual-test")]
+    use tasks_input_2016::tasks_input_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -44558,6 +44563,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2016: 返答欄の IME（NSTextInputClient を NSView へ直接）・折り返し・上限・
+                // 送信の間と、返答の履歴が古い順で show と同じか
+                "tasks-input" => {
+                    tasks_input_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -44571,7 +44583,7 @@ mod self_test {
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
-                         background-drawer / show-command-caller）"
+                         background-drawer / show-command-caller / tasks-input）"
                     );
                     std::process::exit(1);
                 }
@@ -44614,6 +44626,10 @@ mod self_test {
             // #1479: 一覧の項目を押すとその場に展開されるか（押した行と詳細の上下関係を
             // 実矩形で読む）+ tasks のバッジがパネル幅で欠けないか
             tasks_accordion_visual(any, window, cx).await;
+
+            // #2016: 返答欄の IME（NSTextInputClient を NSView へ直接）・折り返し・上限・
+            // 送信の間と、返答の履歴（古い順・show と同じ）
+            tasks_input_visual(any, window, cx).await;
 
             // #1487: タブバーの ー を**実マウスで**押すとタブが 1 単位で退避し、
             // 「タブごと復帰」で分割ツリーのまま元の位置へ戻るか
@@ -88506,13 +88522,25 @@ mod self_test {
                 // 走ったことはここで押さえられる（描けなければ panic して落ちる）
                 notify_and_draw(any, window, cx);
 
-                // (e) 返答 → responses に積まれ、配送の顛末が読める
+                // (e) 返答 → responses に積まれ、配送の顛末が読める。
+                // #2016: 送信は欄を先に空にして往復を background で回すので、積み終わるまで待つ
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.user_tasks.expanded = Some(id150.clone());
+                    app.user_tasks.decision = Some("needs_change".to_string());
+                    app.task_comment_insert("サムネの字を大きく", cx);
+                    app.user_task_respond(&id150, cx);
+                });
+                for _ in 0..500 {
+                    let pending = window
+                        .update(cx, |app: &mut TakoApp, _, _| app.user_tasks.sending.len())
+                        .unwrap_or(0);
+                    if pending == 0 {
+                        break;
+                    }
+                    wait(cx, 10).await;
+                }
                 let responded150 = window
-                    .update(cx, |app: &mut TakoApp, _, cx| {
-                        app.user_tasks.expanded = Some(id150.clone());
-                        app.user_tasks.decision = Some("needs_change".to_string());
-                        app.task_comment_insert("サムネの字を大きく", cx);
-                        app.user_task_respond(&id150, cx);
+                    .update(cx, |app: &mut TakoApp, _, _| {
                         app.tick_user_tasks();
                         app.user_tasks
                             .snapshot
@@ -88559,14 +88587,26 @@ mod self_test {
                 notify_and_draw(any, window, cx);
 
                 // エッジ: やりとりが 10 件を超えても積み上がり、描画も通る
+                // （#2016: 続けて 11 回押しても取りこぼさない = 送信中の 11 件が全部積まれる）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    for i in 0..11 {
+                        app.user_tasks.expanded = Some(id150.clone());
+                        app.user_tasks.decision = Some("answered".to_string());
+                        app.task_comment_insert(&format!("{i} 件目の返答"), cx);
+                        app.user_task_respond(&id150, cx);
+                    }
+                });
+                for _ in 0..1000 {
+                    let pending = window
+                        .update(cx, |app: &mut TakoApp, _, _| app.user_tasks.sending.len())
+                        .unwrap_or(0);
+                    if pending == 0 {
+                        break;
+                    }
+                    wait(cx, 10).await;
+                }
                 let long150 = window
-                    .update(cx, |app: &mut TakoApp, _, cx| {
-                        for i in 0..11 {
-                            app.user_tasks.expanded = Some(id150.clone());
-                            app.user_tasks.decision = Some("answered".to_string());
-                            app.task_comment_insert(&format!("{i} 件目の返答"), cx);
-                            app.user_task_respond(&id150, cx);
-                        }
+                    .update(cx, |app: &mut TakoApp, _, _| {
                         app.user_tasks.expanded = Some(id150.clone());
                         app.tick_user_tasks();
                         app.user_tasks
@@ -88574,12 +88614,22 @@ mod self_test {
                             .tasks
                             .iter()
                             .find(|t| t.id == id150)
-                            .map(|t| t.responses.len())
+                            .map(|t| {
+                                (
+                                    t.responses.len(),
+                                    // #2016: 続けて押した順に積まれている（並行に積むと入れ替わる）
+                                    t.responses
+                                        .iter()
+                                        .skip(1)
+                                        .enumerate()
+                                        .all(|(i, r)| r.comment == format!("{i} 件目の返答")),
+                                )
+                            })
                     })
                     .unwrap_or(None);
                 check(
-                    long150 == Some(12),
-                    &format!("150: やりとりが 10 件を超えても積み上がる (#1450 B2。{long150:?})"),
+                    long150 == Some((12, true)),
+                    &format!("150: やりとりが 10 件を超えても押した順に積み上がる (#1450 B2 / #2016。{long150:?})"),
                 );
                 // 長いスレッドを載せたまま実描画（詰まる / 落ちるならここで出る）
                 notify_and_draw(any, window, cx);
