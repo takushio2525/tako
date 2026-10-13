@@ -832,7 +832,7 @@
     "name": "tako_auto_rename"
   },
   {
-    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答、view=diagnostics は言語サーバの診断（エラー・警告）の一覧、view=references は参照・呼び出し階層・型階層の結果（一覧 / ツリー）。状況を見せたいとき表示し、邪魔なら隠す。",
+    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答、view=diagnostics は言語サーバの診断（エラー・警告）の一覧、view=references は参照・呼び出し階層・型階層の結果（一覧 / ツリー）、view=search はワークスペース横断検索の検索欄と結果の一覧。状況を見せたいとき表示し、邪魔なら隠す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -850,7 +850,7 @@
           "type": "number"
         },
         "view": {
-          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks | diagnostics | references。tmux は fleet の旧称）",
+          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks | diagnostics | references | search。tmux は fleet の旧称）",
           "enum": [
             "fleet",
             "orch",
@@ -858,6 +858,7 @@
             "tasks",
             "diagnostics",
             "references",
+            "search",
             "tmux"
           ],
           "type": "string"
@@ -1684,7 +1685,7 @@
     "name": "tako_preview_search"
   },
   {
-    "description": "ワークスペース横断検索（GUI の ⇧⌘F）。action=search（既定）は query をタブのファイルツリーのルート（path で別のフォルダ）から行ごとに探し、items[]（id・path・line・column・excerpt）を返す。.gitignore 対象・バイナリ・.git の中は探さない。regex で正規表現・case_sensitive で大文字小文字を区別（どちらも既定 false）。上限で止めたら stopped（limit / time / cancelled）。show で右パネルにも出し、results で読み直す・open で item 番目を開く（行を押すのと同じ）・clear で閉じる。",
+    "description": "ワークスペース横断検索（GUI の右パネル search ビュー）。action=search（既定）は query をタブのファイルツリーのルート（path で別のフォルダ）から行ごとに探し、items[]（id・path・line・column・excerpt）を返す。.gitignore 対象・バイナリ・.git の中は探さない。regex で正規表現・case_sensitive で大文字小文字を区別（どちらも既定 false）。上限で止めたら stopped（limit / time / cancelled）。show で右パネルにも出し、results で読み直す・open で item 番目を開く（行を押すのと同じ）・clear で閉じる。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

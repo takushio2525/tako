@@ -3199,7 +3199,15 @@ mod tests {
         // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
         assert_eq!(
             PanelViewWire::VALUES,
-            ["fleet", "orch", "git", "tasks", "diagnostics", "references", "search"]
+            [
+                "fleet",
+                "orch",
+                "git",
+                "tasks",
+                "diagnostics",
+                "references",
+                "search"
+            ]
         );
         assert!(!PanelViewWire::VALUES.contains(&"tmux"));
     }

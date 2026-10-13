@@ -1285,9 +1285,9 @@ pub fn workspace_search_land(
 }
 
 /// 右パネルの結果の `item` 番目を開く（UI スレッド。#1694 = 行のクリック）。
-/// 開き方は定義ジャンプと同じ規則（`plan_landing`: 起点のペインが同じファイル = そのペイン /
-/// 同じタブで開いている = そのペイン / それ以外 = 新しいペインを右へ）で、[`open_file`] の
-/// 行指定（= ジャンプ履歴へ積む。起点は `pane`、省略は呼び出し元 → フォーカス）を通す
+/// 開き方は定義ジャンプ・参照の行と同じ [`land_on_place`] の 1 本（`plan_landing`: 起点のペインが
+/// 同じファイル = そのペイン / 同じタブで開いている = そのペイン / それ以外 = 新しいペインを右へ）で、
+/// [`open_file`] の行指定（= ジャンプ履歴へ積む。起点は `pane`、省略は呼び出し元 → フォーカス）を通す
 fn workspace_search_open(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
@@ -1295,7 +1295,7 @@ fn workspace_search_open(
     pane: Option<u64>,
     focus: Option<bool>,
 ) -> Result<Value, DispatchError> {
-    use tako_core::lsp::goto::{plan_landing, Landing, NewPane, Placement};
+    use tako_core::lsp::goto::Placement;
     let item = item.ok_or_else(|| {
         DispatchError::InvalidParams("open には item（結果の id。1 始まり）が要る".into())
     })?;
@@ -1320,47 +1320,21 @@ fn workspace_search_open(
         .preview_state(source)
         .map(|(path, _)| path)
         .unwrap_or_default();
-    let open_in_tab: Vec<(PaneId, PathBuf)> = host
-        .workspace()
-        .get_tab(tab)
-        .map(|t| t.tree().panes().iter().map(|p| p.id()).collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|id| *id != source)
-        .filter_map(|id| {
-            host.preview_state(id)
-                .map(|(path, _)| (id, PathBuf::from(path)))
-        })
-        .collect();
-    let plan = plan_landing(
-        Path::new(&source_path),
-        &hit.path,
-        &open_in_tab,
-        Placement::Auto,
-        same_file,
-    );
-    let (target, direction, new_tab) = match plan {
-        Landing::SamePane => (source, None, false),
-        Landing::Reuse(pane) => (pane, None, false),
-        Landing::New(NewPane::Right) => (source, Some(Direction::Right), false),
-        Landing::New(NewPane::Down) => (source, Some(Direction::Down), false),
-        Landing::New(NewPane::Tab) => (source, None, true),
-    };
-    let opened = open_file(
+    // 結果の行・桁は 1 始まり（桁は文字数）、`land_on_place` は 0 始まりを受けて `open_file` で
+    // 1 始まりへ戻す（= 渡る値は寄せる前と同じ）
+    let (plan, opened) = land_on_place(
         host,
         origin,
-        OpenFileArgs {
-            pane: Some(target.as_u64()),
-            path: hit.path.display().to_string(),
-            mode: Some(PreviewModeWire::Code),
-            direction,
+        PlaceLanding {
+            source_pane: source,
+            source_path: &source_path,
+            tab,
+            path: &hit.path,
+            line: hit.line.saturating_sub(1),
+            char_column: hit.column.saturating_sub(1),
+            placement: Placement::Auto,
             focus,
-            new_tab,
-            line: Some(hit.line),
-            column: Some(hit.column),
-            jump_from: JumpFrom::Pane(source),
         },
-        JumpRecord::Record,
     )?;
     Ok(json!({
         "status": "opened",
