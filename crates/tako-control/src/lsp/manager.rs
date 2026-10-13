@@ -97,6 +97,29 @@ pub const DIAGNOSTICS_EVENT_CAPACITY: usize = 128;
 /// （間隔の中に来た合図は、間隔が明けたときに 1 回だけ引き直す）
 pub const RECHECK_INTERVAL: Duration = Duration::from_secs(15);
 
+/// 引き直しの間隔を直前の 1 巡にかかった時間の何倍にするか（#1977）。コマンドを打ち続けても
+/// 引き直しが使う時間を 1 / 50（2%）に抑える。実測（この PR の macOS・zsh）: 普通の rc の
+/// ログインシェル 1 本は実時間 0.28〜0.52 秒・CPU 約 0.2 秒 = 間隔は下限の 15 秒のまま。
+/// conda の hook を読む重い rc は実時間 1.8〜2.5 秒・CPU 約 1.5 秒 = 間隔は約 100 秒
+/// （15 秒のままだと、打ち続けているあいだ未導入のサーバ 1 つにつき CPU 1 コアの約 10%）
+pub const RECHECK_COST_FACTOR: u32 = 50;
+
+/// 引き直しの間隔の上限（#1977。どれほど重い rc でも 5 分に 1 回は導入に気付く）
+pub const RECHECK_INTERVAL_MAX: Duration = Duration::from_secs(300);
+
+/// 次の引き直しまでの最小間隔（#1977）: 直前の 1 巡にかかった時間 × [`RECHECK_COST_FACTOR`] を
+/// [`RECHECK_INTERVAL`]〜[`RECHECK_INTERVAL_MAX`] に収める。まだ引き直していなければ下限。
+/// `TAKO_1977_LEGACY=1` は #1944 の固定の 15 秒
+pub fn recheck_interval(last_cost: Option<Duration>) -> Duration {
+    if super::goto::legacy_1977() {
+        return RECHECK_INTERVAL;
+    }
+    last_cost
+        .map(|cost| cost.saturating_mul(RECHECK_COST_FACTOR))
+        .unwrap_or(RECHECK_INTERVAL)
+        .clamp(RECHECK_INTERVAL, RECHECK_INTERVAL_MAX)
+}
+
 /// `TAKO_1007_LEGACY=1` で LSP を丸ごと止める（同一バイナリで旧挙動へ戻す A/B の入口）
 pub fn legacy() -> bool {
     matches!(
@@ -361,6 +384,11 @@ struct Inner {
     rechecking: bool,
     last_recheck: Option<Instant>,
     recheck_pending: bool,
+    /// 直前の引き直し 1 巡にかかった時間と、引き直した回数（#1977。次の間隔を決める）
+    recheck_cost: Option<Duration>,
+    rechecks: u64,
+    /// 直前の古い版の片付けの結果（#1977。`tako lsp status` の `fetch.cleanup`）
+    last_sweep: Option<(Instant, fetch::Sweep)>,
 }
 
 /// 取り消し合う要求の列（#1682）
@@ -469,6 +497,8 @@ struct Slot {
     quiescent: Option<bool>,
     /// 握手が済んだ時刻（状態を送るサーバかを起動直後の猶予のあいだだけ待って確かめる。#1680）
     running_since: Option<Instant>,
+    /// この起動で診断を 1 度でも受けたか（#1977。状態を送らないサーバの読み込みの終わりの合図）
+    diagnosed: bool,
     /// 起こした実行ファイルの出どころ（`path` / `override` / `managed`。#1944）と、そのパス・
     /// Node.js で起こしたならその Node.js
     source: Option<&'static str>,
@@ -1347,6 +1377,7 @@ impl Shared {
         slot.position_encoding = None;
         slot.quiescent = None;
         slot.running_since = None;
+        slot.diagnosed = false;
         let generation = slot.generation;
         let Some(shared) = self.arc() else {
             return;
@@ -1377,12 +1408,16 @@ impl Shared {
             }
             // 見つからない / 打ち切った / 動かない は同じ「未導入」の扱い（理由の文だけが違う。#1769）
             missing => match self.start_managed(key, generation, spec, missing) {
-                Some(managed) => (
-                    managed.plan,
-                    "managed",
-                    managed.program_path,
-                    managed.runtime,
-                ),
+                Some(managed) => {
+                    // #1977: 起こす前に使っている印を置く（別の tako の片付けがこの版を消さない）
+                    fetch::take_lease(&managed.lease_dirs);
+                    (
+                        managed.plan,
+                        "managed",
+                        managed.program_path,
+                        managed.runtime,
+                    )
+                }
                 None => return,
             },
         };
@@ -1495,6 +1530,8 @@ impl Shared {
         let record = NotInstalled::from_launch(spec, missing);
         if let Some(config) = &self.fetch {
             if let Some(managed) = fetch::installed(config, spec) {
+                // #1977: 今の版が済んでいる = 表の版を上げる前の段が残っていれば片付ける
+                self.sweep_old_versions(config, spec);
                 return Some(managed);
             }
             // 前に取りに行って失敗していれば自動では取り直さない（オフラインで開くたびに取りに行かない。
@@ -1565,6 +1602,10 @@ impl Shared {
                 notify_redraw(&mut shared.lock());
             }
         });
+        if result.is_ok() {
+            // #1977: 今の版を入れた = 前の版の段を片付ける（ロックの外で）
+            self.sweep_old_versions(config, spec);
+        }
         let mut guard = self.lock();
         let inner = &mut *guard;
         let has_docs = inner.docs.values().any(|d| d.key == *key);
@@ -1603,6 +1644,18 @@ impl Shared {
                 None
             }
         }
+    }
+
+    /// 表の版を上げる前の段を片付け、結果を `tako lsp status` の `fetch.cleanup` へ残す（#1977）。
+    /// **待ちうる**（ディスクの走査と削除）ので背景のスレッド（起動の流れ・install の offload）から呼ぶ。
+    /// ロックはディスクを触った後に短く取るだけ。`TAKO_1977_LEGACY=1` は片付けない
+    fn sweep_old_versions(&self, config: &FetchConfig, spec: &'static ServerSpec) -> fetch::Sweep {
+        if super::goto::legacy_1977() {
+            return fetch::Sweep::default();
+        }
+        let sweep = fetch::sweep_old_versions(config, spec);
+        self.lock().last_sweep = Some((Instant::now(), sweep.clone()));
+        sweep
     }
 
     /// 未導入だったサーバが使えるようになった（取れた・PATH に現れた）: 記録を消し、待っている
@@ -1696,6 +1749,8 @@ impl Shared {
         });
         match result {
             Ok(managed) => {
+                // #1977: 前の版の段を片付けて、何を消した・残したかを返す
+                let sweep = self.sweep_old_versions(config, spec);
                 self.on_installed(spec.id);
                 json!({
                     "id": spec.id,
@@ -1706,6 +1761,7 @@ impl Shared {
                     "dir": managed.dir.display().to_string(),
                     "disk_bytes": fetch::dir_size(&managed.dir),
                     "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "cleanup": sweep.to_json(),
                 })
             }
             Err(error) => {
@@ -1733,7 +1789,9 @@ impl Shared {
     }
 
     /// シェル統合の合図（cwd の変化・コマンドの終わり）: 未導入のサーバを引き直す（#1944 / #1823 の 2）。
-    /// **待たない**（合図を出したスレッドを止めない。引き直しは背景のスレッド 1 本）
+    /// **待たない**（合図は UI スレッドの OSC の処理 = `TerminalSession::process_osc_event` から来る。
+    /// ここはロックを短く取ってスレッドを出すだけで、ログインシェルは背景のスレッド 1 本が起こす）。
+    /// 間隔は直前の 1 巡にかかった時間で伸びる（[`recheck_interval`]。#1977）
     fn on_shell_activity(&self) {
         let mut inner = self.lock();
         if inner.not_installed.is_empty() || inner.rechecking {
@@ -1741,12 +1799,13 @@ impl Shared {
         }
         if let Some(last) = inner.last_recheck {
             let since = last.elapsed();
-            if since < RECHECK_INTERVAL {
+            let interval = recheck_interval(inner.recheck_cost);
+            if since < interval {
                 // 間隔の中: 明けたときに 1 回だけ引き直す
                 if !inner.recheck_pending {
                     inner.recheck_pending = true;
                     let weak = self.this.clone();
-                    let wait = RECHECK_INTERVAL - since;
+                    let wait = interval - since;
                     let _ = std::thread::Builder::new()
                         .name("lsp-recheck-wait".into())
                         .spawn(move || {
@@ -1770,6 +1829,7 @@ impl Shared {
         let _ = std::thread::Builder::new()
             .name("lsp-recheck".into())
             .spawn(move || {
+                let started = Instant::now();
                 for id in ids {
                     let Some(spec) = servers::find_in(shared.config.table, id) else {
                         continue;
@@ -1784,8 +1844,37 @@ impl Shared {
                         shared.on_installed(spec.id);
                     }
                 }
-                shared.lock().rechecking = false;
+                let cost = started.elapsed();
+                let mut inner = shared.lock();
+                let before = recheck_interval(inner.recheck_cost);
+                let after = recheck_interval(Some(cost));
+                inner.recheck_cost = Some(cost);
+                inner.rechecks = inner.rechecks.saturating_add(1);
+                inner.rechecking = false;
+                drop(inner);
+                // 間隔が変わったときだけ残す（打ち続けているあいだ 15 秒ごとに書かない）
+                if before.as_secs() != after.as_secs() {
+                    crate::diag::persist_log(&format!(
+                        "LSP 引き直しの間隔: {} → {} 秒（直前の 1 巡 {:.2} 秒）",
+                        before.as_secs(),
+                        after.as_secs(),
+                        cost.as_secs_f32()
+                    ));
+                }
             });
+    }
+
+    /// 引き直しの様子（#1977。`tako lsp status` の `recheck`。**待たない**）
+    fn recheck_summary(inner: &Inner) -> Value {
+        json!({
+            "targets": inner.not_installed.keys().collect::<Vec<_>>(),
+            "interval_secs": recheck_interval(inner.recheck_cost).as_secs(),
+            "last_cost_ms": inner.recheck_cost.map(|c| c.as_millis() as u64),
+            "last_secs_ago": inner.last_recheck.map(|t| t.elapsed().as_secs()),
+            "count": inner.rechecks,
+            "running": inner.rechecking,
+            "pending": inner.recheck_pending,
+        })
     }
 
     fn document_server(&self, path: &Path) -> Option<DocumentServer> {
@@ -1894,6 +1983,16 @@ impl Shared {
         }
         let mut guard = self.lock();
         let inner = &mut *guard;
+        // #1977: 状態を送らないサーバ（pyright）は最初の診断が読み込みの終わりの合図。
+        // 「読み込み中 → 動作中」を描き直す（診断の知らせとは別の口）
+        if let Some(slot) = inner.servers.get_mut(key) {
+            if !slot.diagnosed {
+                slot.diagnosed = true;
+                if slot.quiescent.is_none() {
+                    notify_redraw(inner);
+                }
+            }
+        }
         let docs = &inner.docs;
         // 桁は**サーバへ送った本文の写し**（= サーバが見ている本文）で UTF-8 へ写す
         let published = inner.diagnostics.publish(params, |uri| {
@@ -2187,8 +2286,11 @@ impl Shared {
             "documents": inner.docs.len(),
             "diagnostics_total": inner.diagnostics.total(),
             "inflight": inflight,
-            // #1944: 未導入のサーバを取るか・置き場（取っている最中のものは各サーバの `fetch`）
-            "fetch": fetch_summary(self.fetch.as_ref()),
+            // #1944: 未導入のサーバを取るか・置き場（取っている最中のものは各サーバの `fetch`）。
+            // #1977: 直前の古い版の片付け（`cleanup`）
+            "fetch": fetch_summary(self.fetch.as_ref(), inner.last_sweep.as_ref()),
+            // #1977: 未導入のサーバの引き直し（対象・間隔・直前の 1 巡にかかった時間）
+            "recheck": Self::recheck_summary(&inner),
         });
         if inner.servers.is_empty() {
             value["note"] = json!(text::IDLE_NOTE.text());
@@ -2457,7 +2559,7 @@ impl Shared {
         };
         let mut empty = super::goto::EmptyAnswer::default();
         loop {
-            empty.sent(self.reported_loading(&key));
+            empty.sent(self.sent_while_loading(&key));
             let targets = self.goto_once(&process, &uri, spec, request, at, deadline)?;
             if !targets.is_empty() {
                 return Ok(GotoAnswer {
@@ -2534,8 +2636,8 @@ impl Shared {
     /// 空の答えのあと、サーバの読み込みが済むのを待つ（上限つき）。
     ///
     /// 読み込み中と知らせていれば（`quiescent: false`）済むまで待って `Retry`。状態を
-    /// まだ 1 度も知らせていなければ、握手の直後の猶予（[`super::goto::STATUS_GRACE`]）の
-    /// あいだだけ知らせを待つ（送るサーバは握手の直後に送る）。済んでいる・送らないサーバは
+    /// まだ 1 度も知らせていなければ、最初の診断が届くまで（[`super::goto::WARMUP_LIMIT`] まで。
+    /// #1977）待つ（状態を送るサーバはその前に送る）。済んでいるサーバは
     /// 待たずに `Settled`（= 本当に見つからない）。待つあいだに `abandoned` が真になったら
     /// `Abandoned`（#1869: 補完の打鍵の要求は次の打鍵・閉じる・文書を閉じるで抜ける）
     fn wait_loaded(
@@ -2579,19 +2681,18 @@ impl Shared {
         empty.decide(self.wait_loaded(key, deadline, abandoned))
     }
 
-    /// サーバ自身が読み込み中と知らせているか（`quiescent: false`。**待たない**）。握手の直後の
-    /// 猶予は含まない（状態を送らないサーバでは常に偽 = #1930 の問い直しが効かない）
-    fn reported_loading(&self, key: &ServerKey) -> bool {
+    /// 要求を送る直前: その答えが空なら 1 回だけ問い直す対象か（[`slot_sent_while_loading`]。**待たない**）
+    fn sent_while_loading(&self, key: &ServerKey) -> bool {
         self.lock()
             .servers
             .get(key)
-            .is_some_and(slot_reported_loading)
+            .is_some_and(slot_sent_while_loading)
     }
 
     /// サーバがいま読み込み中か（**待たない**。ロックを短く取るだけ）。
     ///
-    /// `quiescent: false` を知らせている、または状態をまだ 1 度も知らせておらず握手の直後の
-    /// 猶予（[`super::goto::STATUS_GRACE`]）の中なら読み込み中。[`Self::wait_loaded`] と
+    /// `quiescent: false` を知らせている、または状態をまだ 1 度も知らせておらず最初の診断も
+    /// まだ届いていない（#1977）なら読み込み中。[`Self::wait_loaded`] と
     /// 補完の「読み込み中」の答え（#1869）・`tako lsp status` の `loading` が同じ判定を引く
     fn loading_now(&self, key: &ServerKey) -> bool {
         self.lock().servers.get(key).is_some_and(slot_loading)
@@ -2975,8 +3076,9 @@ impl Shared {
                 let Some(doc) = inner.docs.get(&uri) else {
                     return Err(GotoError::Closed.into());
                 };
-                let reported = inner.servers.get(&key).is_some_and(slot_reported_loading);
-                empty.sent(reported);
+                let slot = inner.servers.get(&key);
+                let reported = slot.is_some_and(slot_reported_loading);
+                empty.sent(slot.is_some_and(slot_sent_while_loading));
                 waited |= reported;
                 (
                     position::lsp_position_of_line_col(&doc.text, request.line, request.column),
@@ -3197,8 +3299,9 @@ impl Shared {
                 let Some(doc) = inner.docs.get(&uri) else {
                     return Err(GotoError::Closed.into());
                 };
-                let reported = inner.servers.get(&key).is_some_and(slot_reported_loading);
-                empty.sent(reported);
+                let slot = inner.servers.get(&key);
+                let reported = slot.is_some_and(slot_reported_loading);
+                empty.sent(slot.is_some_and(slot_sent_while_loading));
                 waited |= reported;
                 position::lsp_position_of_line_col(&doc.text, request.line, request.column)
             };
@@ -3301,6 +3404,7 @@ impl Slot {
             last_stderr: Vec::new(),
             quiescent: None,
             running_since: None,
+            diagnosed: false,
             source: None,
             program_path: None,
             runtime: None,
@@ -3314,15 +3418,25 @@ fn slot_reported_loading(slot: &Slot) -> bool {
     slot.quiescent == Some(false)
 }
 
-/// サーバがいま読み込み中か（#1680 / #1869）。`quiescent: false` を知らせている、または状態を
-/// まだ 1 度も知らせておらず握手の直後の猶予（[`super::goto::STATUS_GRACE`]）の中
+/// 要求を送るときに読み込み中だったか（[`super::goto::EmptyAnswer::sent`] へ渡す。#1930 / #1977）:
+/// サーバ自身が読み込み中と知らせている、または状態を送らないサーバがまだ読み込み中
+/// （最初の診断の前）。その空は、manager が状態を見る前に読み込みが済んで
+/// いても（最初の診断が同じ流れで直後に届く = pyright）1 回だけ問い直す。
+/// `TAKO_1977_LEGACY=1` は #1930 の判定（知らせだけ）
+fn slot_sent_while_loading(slot: &Slot) -> bool {
+    slot_reported_loading(slot)
+        || (slot.quiescent.is_none() && !super::goto::legacy_1977() && slot_loading(slot))
+}
+
+/// サーバがいま読み込み中か（#1680 / #1869 / #1977）。`quiescent: false` を知らせている、または状態を
+/// まだ 1 度も知らせておらず最初の診断も届いていない（[`super::goto::WARMUP_LIMIT`] まで）。
+/// 判定は [`super::goto::loading_of`] の 1 実装
 fn slot_loading(slot: &Slot) -> bool {
-    match slot.quiescent {
-        Some(ready) => !ready,
-        None => slot
-            .running_since
-            .is_some_and(|t| t.elapsed() < super::goto::STATUS_GRACE),
-    }
+    super::goto::loading_of(
+        slot.quiescent,
+        slot.running_since.map(|t| t.elapsed()),
+        slot.diagnosed,
+    )
 }
 
 fn slot_status(
@@ -3421,14 +3535,19 @@ fn stopped_guidance(slot: &Slot) -> (String, String) {
     }
 }
 
-/// `tako lsp status` の `fetch`（#1944）
-fn fetch_summary(config: Option<&FetchConfig>) -> Value {
+/// `tako lsp status` の `fetch`（#1944）。`cleanup` は直前の古い版の片付け（#1977。まだなら null）
+fn fetch_summary(config: Option<&FetchConfig>, sweep: Option<&(Instant, fetch::Sweep)>) -> Value {
     match config {
         Some(config) => json!({
             "enabled": true,
             "auto": config.auto,
             "root": config.root.display().to_string(),
             "base": config.base,
+            "cleanup": sweep.map(|(at, sweep)| {
+                let mut value = sweep.to_json();
+                value["secs_ago"] = json!(at.elapsed().as_secs());
+                value
+            }),
         }),
         None => json!({
             "enabled": false,

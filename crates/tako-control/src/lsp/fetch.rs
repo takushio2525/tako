@@ -15,6 +15,9 @@
 //!   1 本だけが取り、他は待って結果を共有する（別プロセス = GUI と CLI が重なったら rename の
 //!   勝った側を使う）
 //! - **UI スレッドで呼ばない**: どれも待ちうる。manager の起動のスレッドと dispatch の offload から呼ぶ
+//! - **古い版は tako が置いた・使われていない段だけを消す**（#1977。[`sweep_old_versions`]）: 印のある・
+//!   今の版より前に入った・生きている tako の使っている印（[`take_lease`]）の無い段だけ。今の版より後に
+//!   入った段・印の無い段・symlink は残す
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -356,6 +359,8 @@ pub struct Managed {
     pub runtime_source: Option<&'static str>,
     /// 版の段
     pub dir: PathBuf,
+    /// 起こすときに使っている印を置く段（#1977。サーバの版の段と、tako が取った Node.js の段）
+    pub lease_dirs: Vec<PathBuf>,
 }
 
 /// 置き場に済んでいるか（印を見るだけ。**ネットワークに出ない**。Npm は Node.js を探すので待ちうる）
@@ -411,6 +416,7 @@ fn launch_plan(
                 runtime: None,
                 runtime_source: None,
                 dir: dir.to_path_buf(),
+                lease_dirs: vec![dir.to_path_buf()],
             })
         }
         Fetch::Npm {
@@ -423,12 +429,17 @@ fn launch_plan(
             let entry = dir.join(entry).to_string_lossy().into_owned();
             let mut args: Vec<&str> = vec![entry.as_str()];
             args.extend(spec.args.iter().copied());
+            let mut lease_dirs = vec![dir.to_path_buf()];
+            if source == "managed" {
+                lease_dirs.push(table::node_dir(&config.root, &table::NODE));
+            }
             Some(Managed {
                 plan: plan_for(&node, &args)?,
                 program_path: entry.clone(),
                 runtime: Some(node),
                 runtime_source: Some(source),
                 dir: dir.to_path_buf(),
+                lease_dirs,
             })
         }
     }
@@ -719,6 +730,234 @@ fn sweep_stale_partials(parent: &Path) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// 片付けると決めた段を退けた跡の接頭辞（#1977）。`.partial-` で始まるので、消し損ねても
+/// 次の片付けと取得の掃除（[`sweep_stale_partials`]）が拾う
+const TRASH_PREFIX: &str = ".partial-old-";
+
+/// 消した段 1 つ（#1977）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptDir {
+    /// サーバの ID（Node.js は `node`）
+    pub id: String,
+    /// 段の名前（版）
+    pub version: String,
+    pub bytes: u64,
+}
+
+/// 残した段 1 つ（#1977）。`reason` は [`table::KeepReason::slug`] か `failed`（消せなかった）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptDir {
+    pub id: String,
+    pub version: String,
+    pub reason: &'static str,
+    /// `failed` の理由（権限・使用中。本文は含まない）
+    pub detail: Option<String>,
+}
+
+/// 古い版の片付けの結果（#1977。`tako lsp status` の `fetch.cleanup` と `tako lsp install` の各行の
+/// `cleanup`）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sweep {
+    pub removed: Vec<SweptDir>,
+    pub kept: Vec<KeptDir>,
+}
+
+impl Sweep {
+    pub fn freed_bytes(&self) -> u64 {
+        self.removed.iter().map(|d| d.bytes).sum()
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "removed": self.removed.iter().map(|d| json!({
+                "id": d.id,
+                "version": d.version,
+                "bytes": d.bytes,
+            })).collect::<Vec<_>>(),
+            "kept": self.kept.iter().map(|d| json!({
+                "id": d.id,
+                "version": d.version,
+                "reason": d.reason,
+                "detail": d.detail,
+            })).collect::<Vec<_>>(),
+            "freed_bytes": self.freed_bytes(),
+        })
+    }
+}
+
+/// 使っている印を置く（#1977。起こす直前に呼ぶ。書けなくても起こすのは止めない = 片付けが
+/// 消しうるだけで、読み取り専用の data dir では片付けも消せない）
+pub fn take_lease(dirs: &[PathBuf]) {
+    let name = table::lease_name(std::process::id());
+    for dir in dirs {
+        let _ = std::fs::write(dir.join(&name), b"");
+    }
+}
+
+/// 表の版を上げた後の古い版の段を片付ける（#1977）。そのサーバの `<root>/<id>/` と、npm のサーバなら
+/// Node.js の `<root>/node/` を見る。消すかの判定は [`table::sweep_plan`]（tako の印がある・今の版より
+/// 前に入った・生きている tako が使っていない段だけ）。**待ちうる**（ディスクの走査と削除）ので
+/// UI スレッドで呼ばない
+pub fn sweep_old_versions(config: &FetchConfig, spec: &ServerSpec) -> Sweep {
+    let mut sweep = Sweep::default();
+    let Some(fetch) = spec.fetch.as_ref() else {
+        return sweep;
+    };
+    let server = table::install_dir(&config.root, spec.id, fetch);
+    sweep_group(config, spec.id, &server, &mut sweep);
+    if matches!(fetch, Fetch::Npm { .. }) {
+        let node = table::node_dir(&config.root, &table::NODE);
+        sweep_group(config, "node", &node, &mut sweep);
+    }
+    if !sweep.removed.is_empty() {
+        let names: Vec<String> = sweep
+            .removed
+            .iter()
+            .map(|d| format!("{}/{}", d.id, d.version))
+            .collect();
+        crate::diag::persist_log(&format!(
+            "LSP 古い版の片付け: {} {} バイト",
+            names.join(" "),
+            sweep.freed_bytes()
+        ));
+    }
+    sweep
+}
+
+/// `current`（今の版の段）と同じ親にある段を片付ける
+fn sweep_group(config: &FetchConfig, id: &str, current: &Path, sweep: &mut Sweep) {
+    let (Some(parent), Some(current_name)) = (
+        current.parent(),
+        current.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+    // 置き場の外は触らない（表の版の名前に区切りは入らないが、念のため）
+    if !parent.starts_with(&config.root) {
+        return;
+    }
+    let current_at = marker_time(current);
+    if current_at.is_some() {
+        // 今の版の段にある、終わった tako の使っている印を外す（起動のたびに 1 つずつ増えないように）
+        let _ = leased(current);
+    }
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let path = entry.path();
+        if name.starts_with('.') {
+            // 前に片付けると決めて消し損ねた跡は消し直す（取得の途中の段 `.partial-<pid>-…` は触らない）
+            if name.starts_with(TRASH_PREFIX) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let symlink = meta.file_type().is_symlink();
+        if !symlink && !meta.is_dir() {
+            continue;
+        }
+        let marked = !symlink && path.join(table::MARKER).is_file();
+        dirs.push(table::VersionDir {
+            name,
+            marked,
+            installed_at: marked.then(|| marker_time(&path)).flatten(),
+            leased: marked && leased(&path),
+            symlink,
+        });
+    }
+    for (name, verdict) in table::sweep_plan(current_name, current_at, &dirs) {
+        let keep = |reason: &'static str, detail: Option<String>| KeptDir {
+            id: id.to_string(),
+            version: name.clone(),
+            reason,
+            detail,
+        };
+        if let Err(reason) = verdict {
+            // 新しい版を残すのは毎回のことなので数えない（古い tako が動いている間ずっと出る）
+            if reason != table::KeepReason::Newer {
+                sweep.kept.push(keep(reason.slug(), None));
+            }
+            continue;
+        }
+        let path = parent.join(&name);
+        let bytes = dir_size(&path);
+        // 先に名前を外す（版の名前から一度に消える。Windows で使用中の実行ファイルがあれば rename が
+        // 断るので、半端に消えた版を残さない）
+        let trash = parent.join(format!(
+            "{TRASH_PREFIX}{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        match std::fs::rename(&path, &trash) {
+            Ok(()) => {}
+            // 同時に片付けた別の tako が先に消した
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                sweep.kept.push(keep("failed", Some(e.to_string())));
+                continue;
+            }
+        }
+        match std::fs::remove_dir_all(&trash) {
+            Ok(()) => sweep.removed.push(SweptDir {
+                id: id.to_string(),
+                version: name.clone(),
+                bytes,
+            }),
+            // 版の名前からは消えた（もう使われない）。跡は次の片付けで消し直す
+            Err(e) => sweep.kept.push(keep("failed", Some(e.to_string()))),
+        }
+    }
+}
+
+/// 済んだ印の時刻（中身の `installed_at`。読めなければ印の mtime）。印が無ければ `None`
+fn marker_time(dir: &Path) -> Option<u64> {
+    let marker = dir.join(table::MARKER);
+    if let Some(at) = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| table::installed_at_of(&text))
+    {
+        return Some(at);
+    }
+    std::fs::metadata(&marker)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// 生きている tako のプロセスが使っている印を置いているか。終わったプロセスの印はついでに外す。
+/// 読めない段は「使われているかもしれない」側へ倒す（消さない）
+fn leased(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let mut live = false;
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(table::lease_pid) else {
+            continue;
+        };
+        if pid == std::process::id() || tako_core::platform::process::pid_alive(pid) {
+            live = true;
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    live
 }
 
 fn asset_label(label: &str, asset: &OwnedAsset, count: usize) -> String {

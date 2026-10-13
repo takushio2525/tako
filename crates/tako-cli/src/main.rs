@@ -10815,6 +10815,11 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
             }
         }
     }
+    if matches!(sub, LspCommand::Status { .. }) {
+        for line in lsp_status_tail_lines(result) {
+            println!("{line}");
+        }
+    }
 }
 
 /// `tako lsp install` の人向けの体裁（#1944）。1 サーバ 1 行（ID・結果・置き場か理由）+ 次の一手
@@ -10843,6 +10848,80 @@ fn lsp_install_lines(result: &Value) -> Vec<String> {
         if let Some(next) = server["next_step"].as_str() {
             out.push(format!("  {next}"));
         }
+        // #1977: 入れた後に前の版の段を片付けた / 残した
+        out.extend(lsp_cleanup_lines(&server["cleanup"], "  "));
+    }
+    out
+}
+
+/// 古い版の片付けの結果の人向けの行（#1977。消した・残したがあるときだけ。中身の正本は
+/// `LspManager` の `cleanup` = `fetch::Sweep::to_json`）
+fn lsp_cleanup_lines(cleanup: &Value, indent: &str) -> Vec<String> {
+    use tako_control::lsp::text;
+    let entries = |key: &str| -> Vec<String> {
+        cleanup[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|d| {
+                let name = format!(
+                    "{}/{}",
+                    d["id"].as_str().unwrap_or("-"),
+                    d["version"].as_str().unwrap_or("-")
+                );
+                match d["reason"].as_str() {
+                    Some(reason) => format!("{name} {reason}"),
+                    None => name,
+                }
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    let removed = entries("removed");
+    if !removed.is_empty() {
+        let size =
+            tako_control::lsp::fetch::format_mb(cleanup["freed_bytes"].as_u64().unwrap_or(0));
+        out.push(format!(
+            "{indent}{}",
+            text::fill(
+                text::CLEANUP_REMOVED_NOTE,
+                &[("items", &removed.join(", ")), ("size", &size)]
+            )
+        ));
+    }
+    let kept = entries("kept");
+    if !kept.is_empty() {
+        out.push(format!(
+            "{indent}{}",
+            text::fill(text::CLEANUP_KEPT_NOTE, &[("items", &kept.join(", "))])
+        ));
+    }
+    out
+}
+
+/// `tako lsp status` の末尾（#1977）: 直前の古い版の片付けと、未導入のサーバの引き直し
+fn lsp_status_tail_lines(result: &Value) -> Vec<String> {
+    use tako_control::lsp::text;
+    let mut out = lsp_cleanup_lines(&result["fetch"]["cleanup"], "");
+    let recheck = &result["recheck"];
+    let targets: Vec<&str> = recheck["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !targets.is_empty() {
+        let cost = recheck["last_cost_ms"]
+            .as_u64()
+            .map_or_else(|| "-".to_string(), |ms| ms.to_string());
+        out.push(text::fill(
+            text::RECHECK_NOTE,
+            &[
+                ("targets", &targets.join(", ")),
+                ("interval", &recheck["interval_secs"].to_string()),
+                ("cost", &cost),
+            ],
+        ));
     }
     out
 }
@@ -11873,6 +11952,59 @@ mod tests {
 
         // --column は --line とセット（clap が引数解析の時点で弾く）
         assert!(Cli::try_parse_from(["tako", "open", abs, "--column", "3"]).is_err());
+    }
+
+    /// #1977: `tako lsp install` / `status` の人向けの表示に、古い版の片付けと未導入の引き直しを
+    /// 出す（中身があるときだけ。文の正本は `lsp::text`）
+    #[test]
+    fn lsp_の片付けと引き直しを人向けに出す() {
+        use tako_control::lsp::text;
+        let cleanup = serde_json::json!({
+            "removed": [{"id": "pyright", "version": "pyright-1.1.400", "bytes": 19_457_431}],
+            "kept": [{"id": "node", "version": "22.0.0", "reason": "in_use", "detail": null}],
+            "freed_bytes": 19_457_431,
+        });
+        let lines = lsp_install_lines(&serde_json::json!({
+            "enabled": true,
+            "servers": [{"id": "pyright", "status": "installed", "path": "/d/x.js",
+                         "disk_bytes": 1_000_000, "elapsed_ms": 1500, "cleanup": cleanup}],
+        }));
+        assert_eq!(
+            lines[1..],
+            [
+                format!(
+                    "  {}",
+                    text::fill(
+                        text::CLEANUP_REMOVED_NOTE,
+                        &[("items", "pyright/pyright-1.1.400"), ("size", "19.5 MB")]
+                    )
+                ),
+                format!(
+                    "  {}",
+                    text::fill(text::CLEANUP_KEPT_NOTE, &[("items", "node/22.0.0 in_use")])
+                ),
+            ]
+        );
+        // 何も消さず残さなければ行を足さない
+        let quiet = serde_json::json!({"removed": [], "kept": [], "freed_bytes": 0});
+        assert!(lsp_cleanup_lines(&quiet, "  ").is_empty());
+        assert!(lsp_cleanup_lines(&Value::Null, "  ").is_empty());
+        let tail = lsp_status_tail_lines(&serde_json::json!({
+            "fetch": {"cleanup": quiet},
+            "recheck": {"targets": ["clangd"], "interval_secs": 100, "last_cost_ms": 2000},
+        }));
+        assert_eq!(
+            tail,
+            [text::fill(
+                text::RECHECK_NOTE,
+                &[("targets", "clangd"), ("interval", "100"), ("cost", "2000")]
+            )]
+        );
+        let none = lsp_status_tail_lines(&serde_json::json!({
+            "fetch": {"cleanup": null},
+            "recheck": {"targets": [], "interval_secs": 15, "last_cost_ms": null},
+        }));
+        assert!(none.is_empty(), "{none:?}");
     }
 
     /// #1684: `tako lsp menu` は MCP の action=menu と同じ要求になり、人向けの表示は 1 項目 1 行で

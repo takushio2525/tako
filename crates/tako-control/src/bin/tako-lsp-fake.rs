@@ -22,6 +22,7 @@
 //! | `die` | 起動直後に即死する（initialize を読まない） |
 //! | `no-goto` | 定義ジャンプの能力（`definitionProvider` 等）を申告しない（#1680） |
 //! | `loading` | initialized の後 `experimental/serverStatus`（`quiescent: false`）を送り、読み込み（既定 0.8 秒。`--loading-ms` / `TAKO_LSP_FAKE_LOADING_MS`。`--loading-until` を渡せばその合図まで = #1922）が済むまで定義ジャンプに空（`[]`）で、補完とホバーに `null` で答え（補完の規則・当たったホバーの規則が `hold_while_loading` なら答えずに済むまで待たせる）、済んだら `quiescent: true` を送る（rust-analyzer の振る舞い。#1680 / #1869 / #1893） |
+//! | `quiet-loading` | `loading` と同じ読み込み（`--loading-ms` / `--loading-until`）だが**状態を 1 度も送らず**、読み込み中は補完に `{"isIncomplete":true,"items":[]}`・定義ジャンプに `[]`・ホバーに `null` で答え、didOpen の診断を送らずに溜めて済んだ時点で送る（pyright 1.1.414 の実測の形 = 自動 import の索引ができるまで空、索引ができる頃に最初の診断。#1977）。`--diagnostics` / `--mark` とは併せない |
 //! | `full-sync` | `normal` と同じだが全文同期（`change: 1`）を申告する |
 //! | `no-format` | 整形の能力（`documentFormattingProvider` / `documentRangeFormattingProvider`）を申告しない（#1683） |
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
@@ -523,16 +524,53 @@ fn hold_answer(
     });
 }
 
-/// `loading` の読み込みを終える（済んだ印を立てて `quiescent: true` を送る。合図と
-/// `--settle-on-empty` のどちらが先でも 1 回だけ送る）
-fn finish_loading(out: &Out, loaded: &std::sync::atomic::AtomicBool) {
-    if !loaded.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        out.send(serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "experimental/serverStatus",
-            "params": { "health": "ok", "quiescent": true },
-        }));
+/// `quiet-loading` の読み込み中に開かれた文書（済んだら診断を送る。#1977）
+type Pending = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// didOpen へ返す既定の診断 1 件（#1678）
+fn fake_diagnostics(out: &Out, uri: serde_json::Value) {
+    out.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/publishDiagnostics",
+        "params": {
+            "uri": uri,
+            "diagnostics": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 },
+                },
+                "severity": 2,
+                "message": "fake",
+            }],
+        },
+    }));
+}
+
+/// `loading` / `quiet-loading` の読み込みを終える（合図と `--settle-on-empty` のどちらが先でも
+/// 1 回だけ）。`loading` は `quiescent: true` を送り、`quiet-loading`（pyright 型。#1977）は
+/// 状態を送らず、読み込み中に開かれた文書の診断を送る（pyright は索引ができた頃に最初の診断を送る）
+fn finish_loading(
+    out: &Out,
+    loaded: &std::sync::atomic::AtomicBool,
+    quiet: bool,
+    pending: &Pending,
+) {
+    // didOpen の取り込みとすれ違わない（済んだ印と溜めた文書を同じ錠の中で見る）
+    let mut held = pending.lock().unwrap();
+    if loaded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
+    if quiet {
+        for uri in held.drain(..) {
+            fake_diagnostics(out, uri);
+        }
+        return;
+    }
+    out.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "experimental/serverStatus",
+        "params": { "health": "ok", "quiescent": true },
+    }));
 }
 
 fn main() {
@@ -586,8 +624,13 @@ fn main() {
     let out = std::sync::Arc::new(Out {
         split: scenario == "split-header",
     });
-    // `loading`: 読み込みが済んだか（済むまでは定義ジャンプに空で答える）
-    let loaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(scenario != "loading"));
+    // `loading` / `quiet-loading`: 読み込みが済んだか（済むまでは定義ジャンプに空で答える）
+    let quiet = scenario == "quiet-loading";
+    let loaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        scenario != "loading" && !quiet,
+    ));
+    // #1977: `quiet-loading` の読み込み中に開かれた文書（済んだら診断を送る）
+    let pending: Pending = Default::default();
     let loading_ms: u64 = arg_or_env(&args, "--loading-ms", "TAKO_LSP_FAKE_LOADING_MS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(800);
@@ -621,11 +664,11 @@ fn main() {
     let early_empty = |id: serde_json::Value, empty: serde_json::Value| {
         pause(empty_delay);
         if settle_before {
-            finish_loading(&out, &loaded);
+            finish_loading(&out, &loaded, quiet, &pending);
         }
         out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": empty }));
         if settle_after {
-            finish_loading(&out, &loaded);
+            finish_loading(&out, &loaded, quiet, &pending);
         }
     };
     while let Some(message) = read_one(&mut input) {
@@ -727,7 +770,12 @@ fn main() {
                         "method": "experimental/serverStatus",
                         "params": { "health": "ok", "quiescent": false },
                     }));
-                    let (out, loaded, until) = (out.clone(), loaded.clone(), loading_until.clone());
+                    let (out, loaded, until, pending) = (
+                        out.clone(),
+                        loaded.clone(),
+                        loading_until.clone(),
+                        pending.clone(),
+                    );
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(loading_ms));
                         while until
@@ -736,7 +784,26 @@ fn main() {
                         {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                        finish_loading(&out, &loaded);
+                        finish_loading(&out, &loaded, quiet, &pending);
+                    });
+                }
+                // #1977: pyright 型。状態を 1 度も送らず、読み込み（合図まで）が済んだら溜めた診断を送る
+                "quiet-loading" => {
+                    let (out, loaded, until, pending) = (
+                        out.clone(),
+                        loaded.clone(),
+                        loading_until.clone(),
+                        pending.clone(),
+                    );
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(loading_ms));
+                        while until
+                            .as_deref()
+                            .is_some_and(|path| !std::path::Path::new(path).exists())
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        finish_loading(&out, &loaded, quiet, &pending);
                     });
                 }
                 "chatty" => {
@@ -770,21 +837,15 @@ fn main() {
             }
             ("textDocument/didOpen", None) => {
                 let uri = message["params"]["textDocument"]["uri"].clone();
-                out.send(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/publishDiagnostics",
-                    "params": {
-                        "uri": uri,
-                        "diagnostics": [{
-                            "range": {
-                                "start": { "line": 0, "character": 0 },
-                                "end": { "line": 0, "character": 1 },
-                            },
-                            "severity": 2,
-                            "message": "fake",
-                        }],
-                    },
-                }));
+                if quiet {
+                    // #1977: 読み込み中は診断を送らずに溜める（済んだら `finish_loading` が送る）
+                    let mut held = pending.lock().unwrap();
+                    if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+                        held.push(uri);
+                        continue;
+                    }
+                }
+                fake_diagnostics(&out, uri);
             }
             (method, Some(id)) if GOTO_METHODS.contains(&method) => {
                 if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
@@ -888,7 +949,13 @@ fn main() {
                 // `hold_while_loading` なら答えずに済むまで待たせ、済んだ直後に答える
                 if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
                     if completion["hold_while_loading"].as_bool() != Some(true) {
-                        early_empty(id, serde_json::Value::Null);
+                        // #1977: pyright 型は索引ができるまで空の一覧で答える（実測した 1.1.414 の形）
+                        let empty = if quiet {
+                            serde_json::json!({ "isIncomplete": true, "items": [] })
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        early_empty(id, empty);
                         continue;
                     }
                     let key = id.to_string();

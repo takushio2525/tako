@@ -31,8 +31,61 @@ pub const READY_POLL: Duration = Duration::from_millis(20);
 /// 含むので、それを待つと答えが遅れすぎる）
 pub const SERVER_STATUS_METHOD: &str = "experimental/serverStatus";
 
-/// 状態を 1 度も知らせないサーバを「送らないサーバ」とみなすまでの猶予（握手の直後から数える）
+/// 状態を 1 度も知らせないサーバを「送らないサーバ」とみなすまでの猶予（握手の直後から数える）。
+/// #1977 からは A/B の旧腕（`TAKO_1977_LEGACY=1`）だけが使う（今は最初の診断で決める = [`loading_of`]）
 pub const STATUS_GRACE: Duration = Duration::from_secs(2);
+
+/// 状態を送らないサーバ（pyright）の「最初の診断が届くまで」を読み込み中とみなす上限
+/// （握手の直後から数える。#1977）。診断を 1 度も送らないサーバでも、これを過ぎた空の答えは
+/// 今までどおり本当の空として返す（打鍵の要求を無限に待たせない）
+pub const WARMUP_LIMIT: Duration = Duration::from_secs(10);
+
+/// 握手の直後の猶予（[`STATUS_GRACE`]。#1977 からは A/B の旧腕だけが使う）。検証用の注入
+/// `TAKO_1977_INJECT_GRACE_MS=<ms>` で縮められる（速い機で「索引ができる前に猶予が明ける」遅い機の
+/// 順序を、CPU に負荷を掛けずに旧腕で演じる = 実の pyright の A/B）
+pub fn status_grace() -> Duration {
+    std::env::var("TAKO_1977_INJECT_GRACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(STATUS_GRACE, Duration::from_millis)
+}
+
+/// サーバがいま読み込み中か（#1680 / #1869 / #1977。manager の `slot_loading` が引く 1 実装）。
+///
+/// - 状態を知らせるサーバ（`quiescent` がある = rust-analyzer）: 知らせのとおり
+/// - まだ知らせていない: **最初の診断が届くまで**（[`WARMUP_LIMIT`] まで）読み込み中（#1977）。
+///   状態を送るサーバは握手の直後（最初の診断より前）に送るので、この間に知らせが来れば上の腕へ移る。
+///   状態を送らないサーバ（pyright）は握手の直後、自動 import の索引ができるまで補完に空
+///   （`{"isIncomplete":true,"items":[]}`）で答え、索引ができる頃に開いた文書の最初の診断を送る
+///   （実測: 両方とも握手から 0.5〜0.7 秒。遅い機・初回は #1680 の猶予の 2 秒を越える）。
+///   診断が届けば猶予を待たない（#1977 の前は届いても 2 秒待っていた）
+///
+/// `TAKO_1977_LEGACY=1` は #1977 の前（握手の直後の猶予 [`status_grace`] だけ）
+pub fn loading_of(
+    quiescent: Option<bool>,
+    since_handshake: Option<Duration>,
+    diagnosed: bool,
+) -> bool {
+    match quiescent {
+        Some(ready) => !ready,
+        None => since_handshake.is_some_and(|elapsed| {
+            if legacy_1977() {
+                elapsed < status_grace()
+            } else {
+                !diagnosed && elapsed < WARMUP_LIMIT
+            }
+        }),
+    }
+}
+
+/// `TAKO_1977_LEGACY=1` で **#1977 の前の形**へ戻す（同一バイナリで A/B を取る入口）: 状態を送らない
+/// サーバは握手の直後の猶予だけを読み込み中とみなす（最初の診断を待たない）
+pub fn legacy_1977() -> bool {
+    matches!(
+        std::env::var("TAKO_1977_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
 
 /// クライアントの `experimental` 能力（[`SERVER_STATUS_METHOD`] を送ってもらう）
 pub fn experimental_capabilities() -> Value {
@@ -65,7 +118,9 @@ pub enum Loading {
 /// 読み込みの途中に作った**古い答え**。manager がそれを受けて状態を見る前に読み込みが済んでいると
 /// [`Loading::Settled`] になり、#1930 の前はその空を「見つからない / 候補 0 件」として返していた
 /// （補完なら一覧が出ず、済んでも問い直さない）。この場合も**1 回だけ**問い直す。
-/// 状態を送らないサーバ（`quiescent` が無い）と、済んだ後に送った要求の空は今までどおり本当の空。
+/// #1977: 状態を送らないサーバが最初の診断を送る前（読み込み中 = [`loading_of`]）に送った要求も同じ
+/// （pyright は空の答えの直後に最初の診断を送るので、manager が見る前に済んでいることがある）。
+/// 済んだ後に送った要求の空は今までどおり本当の空。
 /// 問い直しの 2 回目の空は、送ったときの状態に関わらずそのまま返す（無限に繰り返さない）
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EmptyAnswer {
@@ -522,6 +577,29 @@ mod tests {
         assert_eq!(empty.decide(Loading::Settled), Loading::Settled);
         empty.sent(false);
         assert_eq!(empty.decide(Loading::Settled), Loading::Settled);
+    }
+
+    /// #1977: 状態を送らないサーバは、猶予が明けても最初の診断が届くまで（上限まで）読み込み中。
+    /// 状態を送るサーバは知らせのとおり（診断にも猶予にも依らない）
+    #[test]
+    fn 状態を送らないサーバは最初の診断まで読み込み中() {
+        let at = |ms: u64| Some(Duration::from_millis(ms));
+        // 状態を送るサーバ（#1680 / #1930 の判定のまま）
+        assert!(loading_of(Some(false), at(60_000), true));
+        assert!(!loading_of(Some(true), at(0), false));
+        // まだ握手していない
+        assert!(!loading_of(None, None, false));
+        // 状態をまだ知らせていない: 診断がまだなら読み込み中（猶予の中でも外でも）、届いたら済み
+        assert!(loading_of(None, at(100), false));
+        assert!(
+            !loading_of(None, at(100), true),
+            "診断が届けば猶予を待たない"
+        );
+        assert!(loading_of(None, at(3_000), false));
+        assert!(!loading_of(None, at(3_000), true));
+        // 上限を過ぎたら診断を送らないサーバでも済み（空を本当の空として返す）
+        assert!(!loading_of(None, Some(WARMUP_LIMIT), false));
+        assert!(WARMUP_LIMIT > STATUS_GRACE);
     }
 
     /// #1930: 待った結果が `Settled` 以外なら判定はそのまま（待って済んだ・上限・要らなくなった）

@@ -15,7 +15,8 @@
 //! - 起こすときはグローバル（差し替えの env / PATH）を先に見て、無いときだけ置き場 → 取得
 //! - 失敗の記録があるあいだは開き直しても取りに行かない（オフラインで開くたびに取りに行かない）
 //! - 画面の状態の口（`document_server`）はログインシェルもネットワークも待たない
-//! - シェル統合の合図で引き直すのは背景のスレッドで、間隔をあける
+//! - シェル統合の合図で引き直すのは背景のスレッドで、間隔をあける（#1977: 間隔は直前の 1 巡に
+//!   かかった時間 × 50 を 15 秒〜5 分に収めた `recheck_interval` の 1 実装）
 //! - 画面の「入れる」は背景で取る（UI スレッドで取得を待たない）
 //! - `TAKO_1944_LEGACY=1` で取得の設定が作られない（A/B）
 //! - UI への状態の知らせは診断の口とは別（診断の口は URI だけ = #1679）で、GUI はそれを受けて描き直す
@@ -187,10 +188,20 @@ const RULES: &[Rule] = &[
     Rule {
         file: MANAGER,
         decl: "    fn on_shell_activity(&self) {",
-        must: &["RECHECK_INTERVAL", "std::thread::Builder::new()"],
+        // #1977: 間隔は直前の 1 巡にかかった時間で伸びる 1 実装（`recheck_interval`）を通す
+        must: &["recheck_interval(", "std::thread::Builder::new()"],
         must_not: &["self.resolve("],
         order: &[],
         why: "シェル統合の合図を出したスレッドでログインシェルを待つ / 間隔をあけずにコマンドごと引き直す",
+    },
+    Rule {
+        file: MANAGER,
+        decl: "pub fn recheck_interval(",
+        must: &["RECHECK_INTERVAL", "RECHECK_INTERVAL_MAX", ".clamp("],
+        must_not: &[],
+        order: &[],
+        why: "引き直しの間隔が下限（15 秒）と上限（5 分）に収まっていない（#1977。コマンドごとに\
+              ログインシェルを起こす / 重い rc で導入に気付かなくなる）",
     },
     Rule {
         file: GUI,
