@@ -52,11 +52,13 @@ pub(crate) struct MdLineSel {
     hovered_link: Option<std::ops::Range<usize>>,
 }
 
-/// コード 1 行の操作の重ね物（選択の範囲・キャレットの桁・⌘ホバー中の識別子の範囲。#1680）
+/// コード 1 行の操作の重ね物（選択の範囲・キャレットの桁・⌘ホバー中の識別子の範囲・
+/// 対応括弧の桁。#1680 / #1691）
 type CodeLineInteraction = (
     Option<(usize, usize)>,
     Option<usize>,
     Option<std::ops::Range<usize>>,
+    [Option<usize>; 2],
 );
 
 /// コードブロックのコピー成功フィードバックを出しておく時間（#680。カードと同値）
@@ -4765,6 +4767,18 @@ impl TakoApp {
             .map(|e| e.buffer.line_byte_col(e.buffer.cursor()))
             .filter(|(l, _)| *l == ix)
             .map(|(_, c)| c);
+        // #1691: カーソルの隣の括弧とその対（編集中だけ。答えは版とカーソルが同じあいだ
+        // バッファが使い回すので、表示中の行ごとに呼んでも探すのは 1 回）
+        let bracket_cols = edit
+            .filter(|e| e.editing)
+            .and_then(|e| Some((e, e.buffer.bracket_match()?)))
+            .map(|(e, found)| {
+                found.ordered().map(|at| {
+                    let (line, col) = e.buffer.line_byte_col(at);
+                    (line == ix).then_some(col)
+                })
+            })
+            .unwrap_or_default();
         let hit_ranges = edit
             .filter(|e| e.search_visible && !e.search_hits.is_empty())
             .and_then(|e| {
@@ -4793,7 +4807,7 @@ impl TakoApp {
         let (element, _layout) = self.preview_code_line_sel(
             line,
             Some((ix + 1, number_width)),
-            (sel_range, cursor_col, hovered),
+            (sel_range, cursor_col, hovered, bracket_cols),
             &hit_ranges,
             diagnostics,
             Some((cx.entity().downgrade(), pane_id, ix)),
@@ -4942,7 +4956,7 @@ impl TakoApp {
         record: Option<(gpui::WeakEntity<Self>, PaneId, usize)>,
         _cx: &mut Context<Self>,
     ) -> (gpui::Div, TextLayout) {
-        let (sel_range, cursor_col, hovered) = interaction;
+        let (sel_range, cursor_col, hovered, bracket_cols) = interaction;
         let theme = &self.theme;
         let mut text = String::new();
         let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
@@ -4992,6 +5006,23 @@ impl TakoApp {
         // （merge_highlights は後の指定が勝つ = md の MdSelectionSink と同じ重ね順）
         if let Some(range) = hovered.as_ref() {
             crate::md_view::push_hovered_link_highlight(&mut highlights, &text, range, theme);
+        }
+        // #1691: 対応括弧の 2 文字（括弧は 1 バイト）。背景だけ塗るので、検索・選択が
+        // 重なればそちらが勝ち、構文色と波線は残る
+        for col in bracket_cols.into_iter().flatten() {
+            if text
+                .as_bytes()
+                .get(col)
+                .is_some_and(u8::is_ascii_punctuation)
+            {
+                highlights.push((
+                    col..col + 1,
+                    HighlightStyle {
+                        background_color: Some(bracket_match_background(theme)),
+                        ..HighlightStyle::default()
+                    },
+                ));
+            }
         }
         // 検索ヒットハイライト（選択より先に追加し、選択が上に重なるようにする）
         for &(start, end, is_current) in search_hit_ranges {
@@ -5881,6 +5912,11 @@ fn render_field_with_cursor(
     } else {
         format!("{before}|{after}")
     }
+}
+
+/// 対応括弧の強調の背景（#1691）。選択（accent）・検索（yellow）と見分けがつく色
+fn bracket_match_background(theme: &tako_core::Theme) -> gpui::Hsla {
+    hsla_alpha(theme.teal, 0.4)
 }
 
 /// 検索ヒットのうち行に重なる部分を行内バイト範囲のリストとして返す。

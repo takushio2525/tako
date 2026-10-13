@@ -58,6 +58,13 @@ const UNDO_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 /// 「保存が走るほど手が止まった」ところが塊の切れ目になる
 const COALESCE_WINDOW_MS: u64 = 500;
 
+// 対応する括弧の探索（#1691）
+mod brackets;
+pub use brackets::{
+    bracket_match_legacy, find_partner, match_at_cursor, BracketMatch, BracketSyntax, Lexical,
+    SingleQuote, SCAN_WINDOW,
+};
+
 /// 改行コード（#1650）。
 ///
 /// tako が行区切りとして扱うのは `\n` と `\r\n` の 2 つだけ。単独の `\r`
@@ -1013,6 +1020,8 @@ pub struct TextBuffer {
     viewport_lines: Option<usize>,
     /// 大文字小文字を区別しない検索のための小文字写し（#1653）
     fold: FoldCache,
+    /// カーソルの隣の括弧の対の控え（#1691）。(版, カーソル) が同じあいだ使い回す
+    brackets: brackets::BracketCache,
 }
 
 /// 大文字小文字を区別しない検索のための小文字写しの置き場（#1653）。
@@ -1070,6 +1079,7 @@ impl TextBuffer {
             goal_column: None,
             viewport_lines: None,
             fold: FoldCache::default(),
+            brackets: brackets::BracketCache::default(),
         })
     }
 
@@ -1092,6 +1102,7 @@ impl TextBuffer {
             goal_column: None,
             viewport_lines: None,
             fold: FoldCache::default(),
+            brackets: brackets::BracketCache::default(),
         }
     }
 
@@ -1112,6 +1123,8 @@ impl TextBuffer {
     /// （付け替えないと元の場所を見て `Deleted` = #1659 の「外で削除された」になる）
     pub fn retarget(&mut self, path: PathBuf) {
         self.path = path;
+        // 拡張子が変わると文字列・コメントの書き方も変わりうる（#1691）
+        self.brackets.clear();
     }
 
     pub fn text(&self) -> &str {
@@ -2147,7 +2160,9 @@ impl TextBuffer {
     ///
     /// `version` は編集のたびに増える版、`cursor` / `selection` は行・桁
     /// （行 1 始まり / 桁 0 始まりの UTF-8 バイト）、`undo_depth` /
-    /// `undo_history_bytes` は undo 履歴の状態。選択が無ければ `selection` は null
+    /// `undo_history_bytes` は undo 履歴の状態。選択が無ければ `selection` は null。
+    /// `bracket_match` はエディタが強調している対応括弧（#1691）で、`bracket` が
+    /// カーソルの隣の括弧・`match` がその対。無ければ null（[`Self::bracket_match`]）
     pub fn document_state(&self) -> serde_json::Value {
         let position = |p: TextPosition| serde_json::json!({ "line": p.line, "column": p.column });
         serde_json::json!({
@@ -2162,6 +2177,12 @@ impl TextBuffer {
             }),
             "undo_depth": self.undo_depth(),
             "undo_history_bytes": self.undo_history_bytes(),
+            "bracket_match": self.bracket_match().map(|found| {
+                serde_json::json!({
+                    "bracket": position(self.position_of(found.bracket)),
+                    "match": position(self.position_of(found.partner)),
+                })
+            }),
         })
     }
 

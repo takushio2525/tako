@@ -29877,6 +29877,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// #1691: 対応括弧の位置が編集系の応答の `document.bracket_match` で読める
+    /// （CLI `tako edit cursor` = dispatch / MCP `tako_preview_cursor` = 同じ dispatch）。
+    /// 文字列の中の括弧は数えず、括弧に接していない・対が無い・選択中は null
+    #[test]
+    fn preview応答のbracket_matchは対応括弧の行と桁_1691() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-1691-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        // `range.rs` を本物のファイルとして開く（書き方は Rust = `"…"` の中を飛ばす）
+        host.preview_real_files = true;
+        let text = "fn f() {\n    g(\")\", [1]);\n    (\n}\n";
+        let pane = preview_with_text(&mut host, &dir, text);
+        let place = |host: &mut MockHost, line: usize, col: usize, to: Option<(usize, usize)>| {
+            dispatch(
+                host,
+                Request::PreviewCursor {
+                    pane: Some(pane),
+                    line,
+                    col,
+                    select_to_line: to.map(|(l, _)| l),
+                    select_to_col: to.map(|(_, c)| c),
+                    expected_version: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap()["document"]["bracket_match"]
+                .clone()
+        };
+        let at = |line: usize, column: usize| serde_json::json!({ "line": line, "column": column });
+        // `g(` の `(` の直前 → 文字列の `")"` を飛ばした `)`
+        assert_eq!(
+            place(&mut host, 2, 5, None),
+            serde_json::json!({ "bracket": at(2, 5), "match": at(2, 14) })
+        );
+        // `{` の直後 → 最後の行の `}`
+        assert_eq!(
+            place(&mut host, 1, 8, None),
+            serde_json::json!({ "bracket": at(1, 7), "match": at(4, 0) })
+        );
+        // 括弧に接していない・対の無い `(`・選択中は null
+        assert!(place(&mut host, 2, 2, None).is_null());
+        assert!(place(&mut host, 3, 4, None).is_null());
+        assert!(place(&mut host, 2, 5, Some((2, 6))).is_null());
+
+        // MCP: tools/call tako_preview_cursor → 同じ dispatch・同じ document
+        let mut exec = |req: Request| -> Result<serde_json::Value, String> {
+            dispatch(&mut host, req, PaneOrigin::Mcp).map_err(|e| e.to_string())
+        };
+        let mut session = crate::mcp::McpSession {
+            caller_pane: None,
+            caller_role: None,
+            connected: true,
+            exec: &mut exec,
+        };
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "tako_preview_cursor",
+                "arguments": { "pane": pane, "line": 2, "col": 15 },
+            },
+        });
+        let response = crate::mcp::handle_message(&call, &mut session).expect("応答がある");
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let body: serde_json::Value = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("本文がある"),
+        )
+        .expect("本文は JSON");
+        // `)` の直後 → 直前の `)` を採り、対は `g(` の `(`
+        assert_eq!(
+            body["document"]["bracket_match"],
+            serde_json::json!({ "bracket": at(2, 14), "match": at(2, 5) })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// #1742: 表示幅の桁（全角 = 2・タブ = タブストップ）・選択中の left / right の畳み・
     /// line-start / line-end / to-line-end（macOS の ⌃A / ⌃E / ⌃K の中身）が dispatch から
     /// GUI の打鍵と同じ意味で効く（CLI `tako edit move` / `delete` と MCP の口）
