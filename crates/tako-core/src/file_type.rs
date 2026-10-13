@@ -7,6 +7,7 @@
 //! - プレビューの種別・HTTP の型（[`crate::open_plan`]。tako-app の画像の形式・Markdown 判定も同じ）
 //! - インデントの既定と Enter の規則（[`crate::text_edit`]）
 //! - 行コメントの記号（⌘/ と `tako edit line toggle-comment`。#1692）
+//! - 対応括弧の探索が中を飛ばす文字列とコメント（`lexical` 列 + `comment` 列。#1691）
 //! - CLI / MCP の応答の `file_type`（`tako open` の結果・`tako edit` の応答）
 //!
 //! **全 213 構文を並べない**。行を持つのは「既定（[`CODE`] = code・two-face 任せ・4 スペース・
@@ -116,6 +117,36 @@ const LEX_CODE: Lexical = Lexical {
     single_quote: SingleQuote::Char,
     backtick: false,
 };
+/// C の系譜: 既定 + `/* */`（`'` は 1 文字のリテラルだけ = Rust のライフタイム `'a` を文字列にしない）
+const LEX_C: Lexical = Lexical {
+    block_comment: Some(("/*", "*/")),
+    ..LEX_CODE
+};
+/// C の系譜 + `` `…` ``（Go の生文字列）
+const LEX_GO: Lexical = Lexical {
+    backtick: true,
+    ..LEX_C
+};
+/// `'…'` も文字列（Python / Ruby / YAML …。同じ行で閉じなければアポストロフィ）
+const LEX_SCRIPT: Lexical = Lexical {
+    single_quote: SingleQuote::String,
+    ..LEX_CODE
+};
+/// スクリプト + `` `…` ``（シェルのコマンド置換）
+const LEX_SHELL: Lexical = Lexical {
+    backtick: true,
+    ..LEX_SCRIPT
+};
+/// `/* */` と `'…'` の文字列（PHP / Dart / CSS / SQL）
+const LEX_WEB: Lexical = Lexical {
+    block_comment: Some(("/*", "*/")),
+    ..LEX_SCRIPT
+};
+/// `/* */`・`'…'`・`` `…` ``（JS / TS のテンプレート）
+const LEX_JS: Lexical = Lexical {
+    backtick: true,
+    ..LEX_WEB
+};
 
 /// Arduino のスケッチ（#1949）。`TAKO_1949_LEGACY=1` の A/B が名指す
 pub const ARDUINO: &str = "arduino";
@@ -147,6 +178,19 @@ const fn lang(
         extensions,
         comment,
         ..CODE
+    }
+}
+
+/// [`lang`] に文字列とブロックコメントの書き方（#1691）を足した行
+const fn lexed(
+    id: &'static str,
+    extensions: &'static [&'static str],
+    comment: Option<CommentSyntax>,
+    lexical: Lexical,
+) -> FileType {
+    FileType {
+        lexical,
+        ..lang(id, extensions, comment)
     }
 }
 
@@ -217,6 +261,7 @@ pub const TABLE: &[FileType] = &[
         media_type: Some("text/markdown; charset=utf-8"),
         enter: EnterRule::InheritOnly,
         comment: MARKUP,
+        lexical: Lexical::PROSE,
         ..CODE
     },
     prose("mdx", &["mdx"]),
@@ -256,6 +301,7 @@ pub const TABLE: &[FileType] = &[
         file_names: &["Makefile", "GNUmakefile"],
         indent: IndentUnit::Tab,
         comment: HASH,
+        lexical: LEX_SCRIPT,
         ..CODE
     },
     FileType {
@@ -263,6 +309,7 @@ pub const TABLE: &[FileType] = &[
         extensions: &["go"],
         indent: IndentUnit::Tab,
         comment: SLASHES,
+        lexical: LEX_GO,
         ..CODE
     },
     // ─── `:` でも深くするもの ───────────────────────────────────────
@@ -271,6 +318,7 @@ pub const TABLE: &[FileType] = &[
         extensions: &["py", "pyi", "pyw"],
         enter: EnterRule::BracketsAndColon,
         comment: HASH,
+        lexical: LEX_SCRIPT,
         ..CODE
     },
     FileType {
@@ -278,6 +326,7 @@ pub const TABLE: &[FileType] = &[
         extensions: &["yml", "yaml"],
         enter: EnterRule::BracketsAndColon,
         comment: HASH,
+        lexical: LEX_SCRIPT,
         ..CODE
     },
     // `CMakeLists.txt` は拡張子だけで見ると `txt`（継承だけ）になる。ファイル名の行で
@@ -294,6 +343,7 @@ pub const TABLE: &[FileType] = &[
         extensions: &["js", "mjs", "cjs"],
         syntax: Some("JavaScript"),
         comment: SLASHES,
+        lexical: LEX_JS,
         ..CODE
     },
     FileType {
@@ -301,10 +351,11 @@ pub const TABLE: &[FileType] = &[
         extensions: &["jsx"],
         syntax: Some("JavaScript"),
         comment: SLASHES,
+        lexical: LEX_JS,
         ..CODE
     },
-    lang("typescript", &["ts", "mts", "cts"], SLASHES),
-    lang("typescriptreact", &["tsx"], SLASHES),
+    lexed("typescript", &["ts", "mts", "cts"], SLASHES, LEX_JS),
+    lexed("typescriptreact", &["tsx"], SLASHES, LEX_JS),
     // `.ino` は C++ として塗る（#1949）。two-face に Arduino の構文は無く、VS Code 同梱の
     // cpp 言語定義も `.ino` を C++ に含める。寄せるのは**色だけ**で、言語サーバは別
     // （clangd へ `.ino` を渡すと正しいスケッチに嘘のエラーが出る = #1951）
@@ -314,6 +365,7 @@ pub const TABLE: &[FileType] = &[
         syntax: Some("C++"),
         fence_tokens: &["ino", "arduino"],
         comment: SLASHES,
+        lexical: LEX_C,
         ..CODE
     },
     named("ignore", &[".dockerignore"], "Git Ignore", HASH),
@@ -325,55 +377,71 @@ pub const TABLE: &[FileType] = &[
         "JSON",
         None,
     ),
-    named("just", &["Justfile"], "Makefile", HASH),
+    FileType {
+        lexical: LEX_SCRIPT,
+        ..named("just", &["Justfile"], "Makefile", HASH)
+    },
     // ─── 挙動の表（言語サーバ・実行の既定・実行のプロジェクト）が名指す言語 ──────
-    lang("c", &["c"], SLASHES),
+    lexed("c", &["c"], SLASHES, LEX_C),
     // `.h` は VS Code と同じく C++ のヘッダとして数える（色は今は two-face 任せ = #1953）
-    lang(
+    lexed(
         "cpp",
         &["cpp", "cc", "cxx", "h", "hh", "hpp", "hxx"],
         SLASHES,
+        LEX_C,
     ),
-    lang("rust", &["rs"], SLASHES),
-    lang("shellscript", &["sh", "bash", "zsh", "command"], HASH),
-    lang("powershell", &["ps1"], HASH),
+    lexed("rust", &["rs"], SLASHES, LEX_C),
+    lexed(
+        "shellscript",
+        &["sh", "bash", "zsh", "command"],
+        HASH,
+        LEX_SHELL,
+    ),
+    lexed("powershell", &["ps1"], HASH, LEX_SCRIPT),
     lang("bat", &["bat", "cmd"], Some(CommentSyntax::Line("REM"))),
-    lang("ruby", &["rb"], HASH),
-    lang("perl", &["pl"], HASH),
-    lang("php", &["php"], SLASHES),
-    lang("lua", &["lua"], DASHES),
-    lang("java", &["java"], SLASHES),
-    lang("kotlin", &["kt"], SLASHES),
-    lang("scala", &["scala"], SLASHES),
-    lang("swift", &["swift"], SLASHES),
-    lang("csharp", &["cs"], SLASHES),
-    lang("fsharp", &["fs"], SLASHES),
+    lexed("ruby", &["rb"], HASH, LEX_SCRIPT),
+    lexed("perl", &["pl"], HASH, LEX_SCRIPT),
+    lexed("php", &["php"], SLASHES, LEX_WEB),
+    lexed("lua", &["lua"], DASHES, LEX_SCRIPT),
+    lexed("java", &["java"], SLASHES, LEX_C),
+    lexed("kotlin", &["kt"], SLASHES, LEX_C),
+    lexed("scala", &["scala"], SLASHES, LEX_C),
+    lexed("swift", &["swift"], SLASHES, LEX_C),
+    lexed("csharp", &["cs"], SLASHES, LEX_C),
+    lexed("fsharp", &["fs"], SLASHES, LEX_C),
     lang("vb", &["vb"], Some(CommentSyntax::Line("'"))),
-    lang("dart", &["dart"], SLASHES),
-    lang("r", &["r"], HASH),
+    lexed("dart", &["dart"], SLASHES, LEX_WEB),
+    lexed("r", &["r"], HASH, LEX_SCRIPT),
     lang("julia", &["jl"], HASH),
     lang("haskell", &["hs"], DASHES),
     lang("clojure", &["clj"], SEMICOLON),
-    lang("elixir", &["ex"], HASH),
+    lexed("elixir", &["ex"], HASH, LEX_SCRIPT),
     lang("zig", &["zig"], SLASHES),
     lang("nim", &["nim"], HASH),
-    lang("sql", &["sql"], DASHES),
-    lang("latex", &["tex"], Some(CommentSyntax::Line("%"))),
+    lexed("sql", &["sql"], DASHES, LEX_WEB),
+    // LaTeX の `"` / `'` は引用符の組版で、文字列の区切りではない
+    lexed(
+        "latex",
+        &["tex"],
+        Some(CommentSyntax::Line("%")),
+        Lexical::PROSE,
+    ),
     // ノートブックは JSON（セルの中のコメントはノートブックの編集の外）
     lang("jupyter", &["ipynb"], None),
     // ─── コメントの記号を言うために行を持つ言語（#1692。色・インデント・Enter は既定のまま） ─
     lang("html", &["html", "htm"], MARKUP),
     lang("xml", &["xml"], MARKUP),
     lang("vue", &["vue"], MARKUP),
-    lang("css", &["css"], C_BLOCK),
-    lang("scss", &["scss"], SLASHES),
-    lang("less", &["less"], SLASHES),
-    lang("jsonc", &["jsonc"], SLASHES),
-    lang("toml", &["toml"], HASH),
+    lexed("css", &["css"], C_BLOCK, LEX_WEB),
+    lexed("scss", &["scss"], SLASHES, LEX_WEB),
+    lexed("less", &["less"], SLASHES, LEX_WEB),
+    lexed("jsonc", &["jsonc"], SLASHES, LEX_C),
+    lexed("toml", &["toml"], HASH, LEX_SCRIPT),
     FileType {
         id: "dockerfile",
         file_names: &["Dockerfile"],
         comment: HASH,
+        lexical: LEX_SCRIPT,
         ..CODE
     },
 ];
@@ -536,6 +604,36 @@ mod tests {
         // 二重拡張子は最後の拡張子で引く
         assert_eq!(id(Path::new("types.d.ts")), Some("typescript"));
         assert_eq!(id(Path::new("a.b.c.py")), Some("python"));
+    }
+
+    #[test]
+    fn 文字列とブロックコメントの書き方の内訳() {
+        // 文書（Enter が継承だけの形式）と LaTeX は何も飛ばさない（`"` `'` は文の中の記号）
+        for row in TABLE {
+            if row.enter == EnterRule::InheritOnly || row.id == "latex" {
+                assert_eq!(row.lexical, Lexical::PROSE, "{}", row.id);
+            }
+        }
+        // `//` の行コメントを持つコードは C の系譜で `/* */` も持つ。新しい行で `lexical` を
+        // 書き忘れると `/* ) */` の括弧を数える（#1691）。Zig にはブロックコメントが無い
+        for row in TABLE {
+            if row.comment == SLASHES && !matches!(row.id, "zig" | "asciidoc") {
+                assert!(
+                    row.lexical.block_comment.is_some(),
+                    "{}: `//` の言語なのに `/* */` を持たない",
+                    row.id
+                );
+            }
+        }
+        // Rust のライフタイム（`'a`）を文字列にしない
+        assert_eq!(
+            identify_or_default(Path::new("a.rs")).lexical.single_quote,
+            SingleQuote::Char
+        );
+        assert_eq!(
+            identify_or_default(Path::new("a.py")).lexical.single_quote,
+            SingleQuote::String
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::file_type::{self, FileType};
 
-use super::TextBuffer;
+use super::{CommentSyntax, TextBuffer};
 
 /// カーソルの前後それぞれ、この幅（バイト）より離れた所は読まない。
 ///
@@ -247,11 +247,17 @@ impl BracketSyntax {
         lexical: Lexical::PROSE,
     };
 
-    /// 形式の行から組む（行コメント = `comment` 列・文字列とブロックコメント = `lexical` 列）
+    /// 形式の行から組む（行コメント = `comment` 列・文字列とブロックコメント = `lexical` 列）。
+    /// `comment` 列が囲み（HTML の `<!-- -->`・CSS の `/* */`）なら、それもブロックコメントとして飛ばす
     pub fn for_row(row: &FileType) -> Self {
+        let (line_comment, comment_block) = match row.comment {
+            Some(CommentSyntax::Line(token)) => (Some(token), None),
+            Some(CommentSyntax::Block { open, close }) => (None, Some((open, close))),
+            None => (None, None),
+        };
         Self {
-            line_comment: None,
-            block_comments: [None, row.lexical.block_comment],
+            line_comment,
+            block_comments: [comment_block, row.lexical.block_comment],
             lexical: row.lexical,
         }
     }
@@ -891,6 +897,56 @@ mod tests {
         let text = format!("{}\n(a)", "y".repeat(SCAN_WINDOW + 5));
         let open = text.len() - 3;
         assert_eq!(find_partner(&text, open, &C_LIKE), Some(text.len() - 1));
+    }
+
+    // ─── 実ファイルの書き方（言語の同定の正本の `comment` 列 + `lexical` 列） ─────
+
+    /// パスの書き方で `open`（`text` の中の位置）の対を探す
+    fn partner_in(path: &str, text: &str, open: usize) -> Option<usize> {
+        find_partner(text, open, &BracketSyntax::for_path(Path::new(path)))
+    }
+
+    #[test]
+    fn 実ファイルの書き方は言語の同定の正本から引く() {
+        // Rust: `//` と `/* */` と `"…"` を飛ばし、ライフタイムは文字列にしない
+        let rs = "fn f<'a>(x: &'a str) { // )\n  /* } */ g(\")\"); }";
+        assert_eq!(partner_in("a.rs", rs, nth(rs, "{", 0)), Some(rs.len() - 1));
+        assert_eq!(
+            partner_in("a.rs", rs, nth(rs, "(", 0)),
+            Some(nth(rs, ")", 0))
+        );
+        // Python: `#` と `'…'`
+        let py = "f('(', x # )\n)";
+        assert_eq!(partner_in("a.py", py, 1), Some(py.len() - 1));
+        // シェル: `${#a[@]}` の `#` はコメントではなく、バッククォートの中は飛ばす
+        let sh = "echo ${#a[@]} `(` # (\n";
+        assert_eq!(
+            partner_in("a.sh", sh, nth(sh, "{", 0)),
+            Some(nth(sh, "}", 0))
+        );
+        assert_eq!(partner_in("a.sh", sh, nth(sh, "(", 1)), None);
+        // JS: テンプレート（バッククォート）と `'…'`
+        let js = "f(`)`, ')', /* ) */ x)";
+        assert_eq!(partner_in("a.ts", js, 1), Some(js.len() - 1));
+        // Markdown: 引用符は文字列ではない・`<!-- -->` は飛ばす
+        let md = "\"see (a\" <!-- ) --> b)";
+        assert_eq!(partner_in("a.md", md, nth(md, "(", 0)), Some(md.len() - 1));
+        // LaTeX: `%` は行コメント・`\%` は記号・`"` は文字列ではない
+        let tex = "\\frac{50\\%}{\"x} % }";
+        assert_eq!(partner_in("a.tex", tex, 5), Some(nth(tex, "}", 0)));
+        assert_eq!(
+            partner_in("a.tex", tex, nth(tex, "{", 1)),
+            Some(nth(tex, "}", 1))
+        );
+        // 表に無い形式（`.json`）は既定 = `"…"` だけを飛ばす
+        let json = r#"{"a": "}", "b": [1]}"#;
+        assert_eq!(partner_in("a.json", json, 0), Some(json.len() - 1));
+        // コメントの記号を持たない文書（`.txt`）は何も飛ばさない
+        let txt = "it's \"(\" b)";
+        assert_eq!(
+            partner_in("a.txt", txt, nth(txt, "(", 0)),
+            Some(txt.len() - 1)
+        );
     }
 
     // ─── TextBuffer の口 ─────────────────────────────────────────────
