@@ -947,6 +947,20 @@ mod tests {
         );
     }
 
+    /// #1993: `tako_queue` は `Request::Queue` へ写る（action 省略は status = dispatch / 受け口が既定を持つ）
+    #[test]
+    fn queueはactionをそのまま渡す() {
+        let (_, requests) = run(call("tako_queue", json!({})), Some(7), true);
+        assert_eq!(requests, vec![Request::Queue { action: None }]);
+        let (_, requests) = run(call("tako_queue", json!({ "action": "status" })), None, true);
+        assert_eq!(
+            requests,
+            vec![Request::Queue {
+                action: Some("status".into()),
+            }]
+        );
+    }
+
     /// #1654: `tako_preview_edit` の `command` は編集コマンドへ写る（ツールを増やさない）。
     /// `enabled` と同時に渡したら拒否する（どちらをしたいのか決まらない）
     #[test]
@@ -1558,7 +1572,8 @@ mod tests {
         // #1679 の tako_lsp（言語機能。診断の一覧）を追加して 159。#1680 の定義ジャンプは同じツールの action なので増えない
         // #1879 の tako_mod（Claude Code の mod 連携の状態と切替）を追加して 160
         // #1694 の tako_search（ワークスペース横断検索。results / open / clear は同じツールの action）を追加して 161
-        assert_eq!(tools.len(), 161);
+        // #1993 の tako_queue（PC のメモリ・CPU と重い処理の状況）を追加して 162
+        assert_eq!(tools.len(), 162);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

@@ -83,6 +83,9 @@ enum Command {
     /// アプリへ届かないときは IPC の受け口だけをローカルで診断する（Issue #1441）
     #[command(name = "check-health")]
     CheckHealth(CheckHealthArgs),
+    /// PC のメモリ・CPU と重い処理（ビルド・テスト等）の状況を出す（MCP `tako_queue` と 1:1。Issue #1993）。
+    /// アプリへ届かないときは機の状態だけをこのプロセスで採る
+    Queue(QueueArgs),
     /// ペインの画面内容をテキストで出力する
     Read(ReadArgs),
     /// ターミナル画面のリンク（修飾 + クリックで開けるもの）を列挙する（Issue #1283）
@@ -3760,6 +3763,14 @@ struct CheckHealthArgs {
     json: bool,
 }
 
+/// PC リソースの状況の引数（Issue #1993）
+#[derive(Args)]
+struct QueueArgs {
+    /// 生の JSON で出力する（既定は人が読む要約）
+    #[arg(long)]
+    json: bool,
+}
+
 /// プラットフォーム対応マトリクスの参照引数（Issue #515）
 #[derive(Args)]
 struct PlatformArgs {
@@ -4600,6 +4611,7 @@ fn cli_main() -> ExitCode {
         // #1441: **IPC が立っていないときこそ答えが要る**診断なので、届かなければ
         // ローカルの受け口診断へ落ちる（run() を通すと「接続情報が無い」で終わる）
         Command::CheckHealth(ref args) => check_health_cli(args.json),
+        Command::Queue(ref args) => queue_cli(args.json),
         // 残骸の掃除もローカル処理（IPC 不要）。**GUI が動いていなくても掃ける**ことが
         // 本質（掃除の対象は一時ディレクトリで、GUI の状態とは無関係）
         Command::TestResidue(ref args) => test_residue_local(args),
@@ -6829,6 +6841,171 @@ fn check_health_cli(json: bool) -> Result<(), String> {
             }
             Err("tako アプリへ届かない（上の ipc 節が受け口の実測）".into())
         }
+    }
+}
+
+/// GUI に届かないときに添える 1 行（#1993。順番待ち #1994 は GUI の中の調停役が持つ）
+const QUEUE_OFFLINE_NOTE: &str = "順番待ちは無効（tako が起動していない）";
+
+/// 機全体の CPU% を出すために、GUI が居ないとき 2 回採る間隔
+const QUEUE_OFFLINE_CPU_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `tako queue`: PC リソースの状況（#1993）。届かなければ機の状態だけをこのプロセスで採る
+fn queue_cli(json: bool) -> Result<(), String> {
+    let result = match send_request_classified(Request::Queue { action: None }, None) {
+        Ok(result) => result,
+        Err(SendFailure::Operation(message)) => return Err(message),
+        Err(SendFailure::Unreachable(reason)) => {
+            let mut local = tako_control::resources::machine_only(QUEUE_OFFLINE_CPU_WINDOW);
+            local["gui"] = serde_json::json!(false);
+            local["note"] = serde_json::json!(QUEUE_OFFLINE_NOTE);
+            local["reason"] = serde_json::json!(reason);
+            local
+        }
+    };
+    if json {
+        println!("{}", pretty_json(&result));
+    } else {
+        print_queue_status(&result);
+    }
+    Ok(())
+}
+
+/// MiB → 人が読む GB / MB
+fn human_mb(mb: u64) -> String {
+    if mb >= 1024 {
+        format!("{:.1} GB", mb as f64 / 1024.0)
+    } else {
+        format!("{mb} MB")
+    }
+}
+
+/// 誰の処理か（ペインなら番号・タブ・役割、外なら起点のアプリ）
+fn queue_owner_text(v: &Value) -> String {
+    if let Some(origin) = v["external"].as_str() {
+        return if origin.is_empty() {
+            "tako の外".to_string()
+        } else {
+            format!("tako の外（{origin}）")
+        };
+    }
+    let mut parts = vec![format!("ペイン {}", v["pane"].as_u64().unwrap_or(0))];
+    for key in ["tab", "role"] {
+        if let Some(t) = v[key].as_str().filter(|t| !t.is_empty()) {
+            parts.push(t.to_string());
+        }
+    }
+    parts.join(" · ")
+}
+
+/// `tako queue` の人間向け表示
+fn print_queue_status(v: &Value) {
+    if let Some(note) = v["note"].as_str() {
+        println!("{note}");
+    }
+    let m = &v["machine"];
+    if m.is_null() {
+        println!(
+            "機の状態: {}",
+            v["machine_unavailable"].as_str().unwrap_or("採れない")
+        );
+    } else {
+        let mem = &m["memory_mb"];
+        let n = |key: &str| mem[key].as_u64().unwrap_or(0);
+        let mut line = format!(
+            "メモリ {} / {}（app {}・wired {}・圧縮 {}・空き {}）",
+            human_mb(n("used")),
+            human_mb(n("total")),
+            human_mb(n("app")),
+            human_mb(n("wired")),
+            human_mb(n("compressed")),
+            human_mb(n("available")),
+        );
+        if let Some(swap) = m["swap_mb"].as_object() {
+            line.push_str(&format!(
+                "  swap {} / {}",
+                human_mb(swap["used"].as_u64().unwrap_or(0)),
+                human_mb(swap["total"].as_u64().unwrap_or(0))
+            ));
+        }
+        if let Some(p) = m["pressure"].as_str() {
+            line.push_str(&format!("  メモリ圧 {p}"));
+        }
+        println!("{line}");
+        let mut cpu = format!(
+            "CPU {}",
+            m["cpu_percent"]
+                .as_f64()
+                .map(|c| format!("{c:.0}%"))
+                .unwrap_or_else(|| "?".into())
+        );
+        cpu.push_str(&format!("（{} コア）", m["cpus"].as_u64().unwrap_or(0)));
+        if let Some(load) = m["load"].as_array() {
+            let l: Vec<String> = load
+                .iter()
+                .filter_map(|x| x.as_f64())
+                .map(|x| format!("{x:.1}"))
+                .collect();
+            cpu.push_str(&format!("  load {}", l.join(" / ")));
+        }
+        println!("{cpu}");
+    }
+    if v["gui"] == false {
+        return;
+    }
+    let heavy = v["heavy"].as_array().cloned().unwrap_or_default();
+    if heavy.is_empty() {
+        println!("重い処理: なし");
+    } else {
+        println!("重い処理 {} 件:", heavy.len());
+        for job in &heavy {
+            println!(
+                "  {}  {}  {}  {}",
+                job["label"].as_str().unwrap_or("?"),
+                human_mb(job["memory_mb"].as_u64().unwrap_or(0)),
+                job["cpu_percent"]
+                    .as_f64()
+                    .map(|c| format!("{c:.0}%"))
+                    .unwrap_or_else(|| "-".into()),
+                queue_owner_text(job)
+            );
+        }
+    }
+    let panes = v["panes"].as_array().cloned().unwrap_or_default();
+    if !panes.is_empty() {
+        println!("ペインの上位（メモリの多い順）:");
+        for p in &panes {
+            let agent = p["agent"]
+                .as_str()
+                .map(|a| format!("  {a}"))
+                .unwrap_or_default();
+            println!(
+                "  {}（agent {}・重い処理 {}）  {}{}",
+                human_mb(p["memory_mb"].as_u64().unwrap_or(0)),
+                human_mb(p["agent_mb"].as_u64().unwrap_or(0)),
+                human_mb(p["heavy_mb"].as_u64().unwrap_or(0)),
+                queue_owner_text(p),
+                agent
+            );
+        }
+    }
+    let ext = &v["external"];
+    if ext.is_object() {
+        println!(
+            "tako の外: {}・{} 本（重い処理 {} 件）",
+            human_mb(ext["memory_mb"].as_u64().unwrap_or(0)),
+            ext["processes"].as_u64().unwrap_or(0),
+            ext["heavy"].as_u64().unwrap_or(0)
+        );
+    }
+    let scan = &v["scan"];
+    if scan.is_object() {
+        println!(
+            "走査: {} 本（読めた {}）・{:.1} 秒前",
+            scan["processes"].as_u64().unwrap_or(0),
+            scan["readable"].as_u64().unwrap_or(0),
+            scan["age_ms"].as_u64().unwrap_or(0) as f64 / 1000.0
+        );
     }
 }
 
@@ -9865,6 +10042,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Platform(_) => unreachable!("platform は run() を通らない（ローカル処理）"),
         Command::CheckHealth(_) => {
             unreachable!("check-health は run() を通らない（ローカル処理）")
+        }
+        Command::Queue(_) => {
+            unreachable!("queue は run() を通らない（届かないときのローカル処理を持つ）")
         }
         Command::ContextBudget(_) => {
             unreachable!("context-budget は run() を通らない（ローカル処理）")

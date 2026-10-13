@@ -654,6 +654,39 @@ pub fn process_table() -> Option<(HashMap<u32, u32>, HashMap<u32, String>)> {
     None
 }
 
+/// 全プロセスの pid（境界 B29 `platform::resources` の走査が使う。#1993）
+#[cfg(target_os = "macos")]
+pub(crate) fn list_pids() -> Vec<i32> {
+    all_pids()
+}
+
+/// 親 pid・uid・短い名前（`PROC_PIDT_SHORTBSDINFO`。別ユーザーのプロセスでも取れる。#1993）
+#[cfg(target_os = "macos")]
+pub(crate) fn short_info(pid: i32) -> Option<(u32, u32, String)> {
+    let info = bsd_short_info(pid)?;
+    Some((info.pbsi_ppid, info.pbsi_uid, comm_of(&info.pbsi_comm)))
+}
+
+/// `kern.argmax`（`KERN_PROCARGS2` の読み取りバッファの長さ。#1993）
+#[cfg(target_os = "macos")]
+pub(crate) fn procargs_buffer_len() -> Option<usize> {
+    kern_argmax()
+}
+
+/// 1 回の `KERN_PROCARGS2` で argv（空白で繋いだもの）と env の指定キーを読む（#1993）。
+/// `buf` は [`procargs_buffer_len`] の長さで使い回す。読めなければ `None`
+/// （別ユーザーのプロセス・既に終わった pid）
+#[cfg(target_os = "macos")]
+pub(crate) fn argv_and_env(
+    pid: u32,
+    buf: &mut [u8],
+    names: &[&str],
+) -> Option<(Option<String>, HashMap<String, String>)> {
+    let len = procargs2_into(pid, buf)?;
+    let raw = &buf[..len];
+    Some((procargs2_argv(raw), pick_env(&parse_procargs2(raw), names)))
+}
+
 /// `struct proc_bsdshortinfo`（`sys/proc_info.h`）。tako が使う libc 0.2.186 には無いので
 /// 転記する（新しい libc には同じ形で入っている。ずれは下の大きさの assert と
 /// 「ps と同じ答え」の単体テストで捕まえる）

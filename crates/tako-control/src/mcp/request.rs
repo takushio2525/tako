@@ -673,6 +673,9 @@ pub(super) fn build_request(
             }
         }
         "tako_check_health" => Request::CheckHealth,
+        "tako_queue" => Request::Queue {
+            action: str_arg(args, "action")?,
+        },
         "tako_setup_mcp" => Request::SetupMcp {
             scope: str_arg(args, "scope")?,
             pane: u64_arg(args, "pane")?.or(caller),

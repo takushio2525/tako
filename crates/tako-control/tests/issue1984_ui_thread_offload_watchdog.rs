@@ -82,6 +82,12 @@ const GIT_WRITES: &[&str] = &[
 
 /// 子プロセスを待つ口（右は名指しの理由）
 const RAW: &[(&str, &str)] = &[
+    // #1993: PC リソースの走査（libproc で 1 回 wall 11 ms）。UI は `cached_status` で覚えを読む
+    ("resources::answer(", "PC リソースの走査（#1993）"),
+    (
+        "platform::resources::",
+        "PC リソースの OS への問い合わせ（#1993）",
+    ),
     (
         "agents::resolve_pane_by_pid(",
         "pid 祖先辿り（器の `list-panes -a` + 親子表）",
@@ -1505,6 +1511,20 @@ fn 逆戻りを名指しできる() {
         scan_ui_paths(&d),
         DISPATCH,
         "fn resolve_caller_pane(",
+    );
+
+    // ①' 呼び出し元の解決の途中で PC リソースを走査する（#1993）
+    let d = inject(
+        &s.dispatch,
+        "        .and_then(|pid| caller_pane_by_pid(host, pid))\n        .and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())",
+        "        .and_then(|pid| crate::resources::answer(None).ok().and(caller_pane_by_pid(host, pid)))\n        .and_then(|p| resolve_pane(host.workspace(), Some(p)).ok())",
+        "①'",
+    );
+    expect_named(
+        "呼び出し元の解決で PC リソースを走査",
+        scan_ui_paths(&d),
+        DISPATCH,
+        "resources::answer(",
     );
 
     // ② spawn の CLI の所在確認を修正前の preflight へ戻す

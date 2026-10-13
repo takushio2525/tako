@@ -709,6 +709,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<usize>,
     },
+    /// PC リソースの状況（FR-2.43 / #1993。エピック #1992）。`action`:
+    /// - "status"（既定）: 機全体（メモリの内訳・swap・メモリ圧・CPU%・load）と、
+    ///   重い処理（ビルド・テスト・ブラウザ・隔離 GUI）・ペインごとの消費・tako の外の消費
+    ///
+    /// **dispatch ではなく受け口（`ipc::submit`）が答える**（UI スレッドを通らない。
+    /// `resources::answer`）。順番待ちの操作（#1994）も同じ口へ足す
+    Queue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+    },
     /// ジャンプ履歴（戻る / 進む。FR-3.29 / #1677 / #1007 S0-d）。`action`:
     /// - "list"（既定）: 履歴の全項目と現在位置
     /// - "back": 1 つ戻る（行を指定した `OpenFile` が積んだ位置へ）
@@ -2760,6 +2770,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::Links { .. }
         | Request::ResolvePane { .. }
         | Request::CheckHealth
+        // 受け口が答えるので UI の loop へは来ないが、意味としては読み取り（#1993）
+        | Request::Queue { .. }
         | Request::WindowList
         | Request::MenuList
         | Request::BackgroundList
@@ -3396,6 +3408,7 @@ mod tests {
                 tmux_session: None,
             },
             Request::CheckHealth,
+            Request::Queue { action: None },
             Request::WindowList,
             Request::BackgroundList,
             Request::ResolvePane {

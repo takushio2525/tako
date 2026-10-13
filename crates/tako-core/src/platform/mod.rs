@@ -29,6 +29,8 @@ pub mod procinfo;
 pub mod program_path;
 pub mod quit_signal;
 pub mod release_assets;
+/// PC 全体と各プロセスの資源の計測（境界 B29。#1993）
+pub mod resources;
 pub mod runner_defaults;
 pub mod shell;
 pub mod shell_dialect;

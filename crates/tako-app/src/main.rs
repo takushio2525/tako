@@ -55,6 +55,7 @@ mod preview_render;
 mod preview_watch;
 mod references_panel;
 mod remote_panel;
+mod resource_panes;
 mod right_panel;
 mod search_panel;
 mod settings_sleep;
@@ -4311,6 +4312,10 @@ impl TakoApp {
             }
         });
 
+        // #1993: PC リソースの採取（機 2 秒・プロセス 5 秒）を背景スレッドで始める。
+        // 受け口（IPC / MCP）の `Request::Queue` はこの覚えから答える
+        tako_control::resources::start();
+
         // 接続情報をファイルへ永続化（FR-2.2.9）。アプリ再起動後も外部の長寿命プロセス
         // から `tako` CLI が繋ぎ直せるようにする（CLI 側のフォールバック先）。
         // セカンダリモードは current ポインタ（control.json）を奪わず instances/ のみに書く
@@ -6000,6 +6005,11 @@ impl TakoApp {
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:agent_metrics");
                         app.refresh_agent_metrics();
+                    }
+                    {
+                        // #1993: PC リソースの採取へペインの一覧を渡す（写すだけ。採取は背景）
+                        let _s = tako_control::diag::perf_span("periodic_prep:resource_panes");
+                        app.publish_resource_panes();
                     }
                     // #1959: mod の報告で新しく見えた設定 dir へ skills/tako（読み書きは背景）
                     app.drive_claude_mod_skills_sync(wcx);

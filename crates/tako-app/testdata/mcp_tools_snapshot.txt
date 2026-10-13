@@ -93,6 +93,7 @@ tako_preview_save
 tako_preview_search
 tako_preview_undo
 tako_preview_view
+tako_queue
 tako_read_pane
 tako_recent
 tako_remote_agents

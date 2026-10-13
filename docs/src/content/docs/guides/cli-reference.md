@@ -1,12 +1,12 @@
 ---
 title: CLI リファレンス
 seoTitle: tako CLI リファレンス — コマンドの逆引き一覧
-description: tako コマンド全 94 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 95 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **94 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **95 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -23,7 +23,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 94 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 95 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -153,6 +153,7 @@ tako orchestrator spawn --help
 | [`config`](#tako-config) | AI 系設定のデバイス間共有（git ベース） |
 | [`platform`](#tako-platform) | この環境で使える機能の一覧 |
 | [`check-health`](#その他) | 環境の健全性診断（`tako setup --check` と同じ項目を JSON でも返す） |
+| [`queue`](#その他) | PC のメモリ・CPU と、重い処理（ビルド・テスト等）がどのペインで動いてどれだけ食っているか |
 | [`agent-support`](#tako-agent-support) | エージェント系統ごとの能力差 |
 | [`shell-integration`](#その他) | シェル統合（cwd 追従・コマンド状態）の確認・配置（`tako setup` が自動で通る） |
 | [`mod`](#その他) | tako mod（Claude Code の mod 連携）の状態と切替。ペインの claude から ctx・使用制限・ターンの報告が届いているかを見る。Claude Code の画面の帯の表示切替（`band on` / `off`） |
@@ -1719,6 +1720,9 @@ tako stale-binary            # 稼働中セッションの claude バイナリ�
 
 tako check-health            # 環境の健全性診断（`tako setup --check` と同じ項目）
 tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・残り作業が入る）
+
+tako queue                   # PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理がどのペインで動いているか
+tako queue --json            # 生の JSON（tako が起動していなければ機の状態だけを返す）
 
 tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
 tako shell-integration install   # 配置する（tako setup が自分で通るので普段は不要）
