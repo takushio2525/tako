@@ -937,12 +937,9 @@ pub trait PreviewHost {
     /// ライブリロードの ON/OFF 切替。監視登録と永続化は実装側の責務。
     fn set_preview_reload(&mut self, _enabled: bool) {}
     /// デコード済みプレビュー画像キャッシュの上限と現在使用量（Issue #258）。
+    /// #2009: 実効上限・見えている / 見えていないぶん・ペインごとの持ち分も返す。
     fn preview_cache_stats(&self) -> tako_core::PreviewCacheStats {
-        tako_core::PreviewCacheStats {
-            max_bytes: tako_core::PREVIEW_CACHE_DEFAULT_MB * 1024 * 1024,
-            used_bytes: 0,
-            entries: 0,
-        }
+        tako_core::PreviewCacheStats::idle(tako_core::PREVIEW_CACHE_DEFAULT_MB * 1024 * 1024)
     }
     /// キャッシュ上限を変更する。実体の LRU eviction と永続化は実装側の責務。
     fn set_preview_cache_budget(&mut self, _max_bytes: u64) {}

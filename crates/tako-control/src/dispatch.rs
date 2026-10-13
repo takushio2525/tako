@@ -5275,11 +5275,7 @@ fn dispatch_inner(
                 host.set_preview_cache_budget(max_bytes);
             }
             let stats = host.preview_cache_stats();
-            Ok(json!({
-                "max_mb": stats.max_bytes / 1024 / 1024,
-                "used_bytes": stats.used_bytes,
-                "entries": stats.entries,
-            }))
+            Ok(preview_cache_json(&stats))
         }
         Request::Scrollback {
             lines,
@@ -9443,6 +9439,43 @@ fn read_file_head(path: &Path) -> Result<String, DispatchError> {
     })?;
     buf.truncate(n);
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// プレビュー画像キャッシュの状態ペイロード（#258 → #2009。取得 / 上限変更で共通）。
+/// 既存の 3 キー（max_mb / used_bytes / entries）はそのままに、実効上限と
+/// 見えている / 見えていないぶん・ペインごとの持ち分を足す
+fn preview_cache_json(stats: &tako_core::PreviewCacheStats) -> Value {
+    let panes: Vec<Value> = stats
+        .panes
+        .iter()
+        .map(|p| {
+            json!({
+                "pane": p.pane,
+                "kind": p.kind,
+                "visible": p.visible,
+                "hidden_secs": p.hidden_secs,
+                "decoded_bytes": p.decoded_bytes,
+                "source_bytes": p.source_bytes,
+                "released": p.released,
+                "video_player": p.video_player,
+                "video_frame_bytes": p.video_frame_bytes,
+            })
+        })
+        .collect();
+    json!({
+        "max_mb": stats.max_bytes / 1024 / 1024,
+        "used_bytes": stats.used_bytes,
+        "entries": stats.entries,
+        "effective_max_bytes": stats.effective_max_bytes,
+        "visible_bytes": stats.visible_bytes,
+        "hidden_bytes": stats.hidden_bytes,
+        "source_bytes": stats.source_bytes,
+        "release_after_secs": stats.release_after_secs,
+        "released_total": stats.released_total,
+        "restored_total": stats.restored_total,
+        "legacy": stats.legacy,
+        "panes": panes,
+    })
 }
 
 /// ペインログ設定の状態ペイロード（status / set 共通）
@@ -20785,9 +20818,9 @@ mod tests {
                 agents_detected: std::collections::HashSet::new(),
                 preview_reload: tako_core::PreviewReloadState::default(),
                 preview_cache: tako_core::PreviewCacheStats {
-                    max_bytes: 512 * 1024 * 1024,
                     used_bytes: 32 * 1024 * 1024,
                     entries: 2,
+                    ..tako_core::PreviewCacheStats::idle(512 * 1024 * 1024)
                 },
                 scrollback: tako_core::scrollback::ScrollbackStatus {
                     lines: tako_core::scrollback::DEFAULT_LINES,
@@ -21297,7 +21330,7 @@ mod tests {
             self.preview_reload.set_enabled(enabled);
         }
         fn preview_cache_stats(&self) -> tako_core::PreviewCacheStats {
-            self.preview_cache
+            self.preview_cache.clone()
         }
         fn set_preview_cache_budget(&mut self, max_bytes: u64) {
             self.preview_cache.max_bytes = max_bytes;
@@ -26142,6 +26175,23 @@ mod tests {
         assert_eq!(initial["max_mb"], 512);
         assert_eq!(initial["used_bytes"], 32 * 1024 * 1024);
         assert_eq!(initial["entries"], 2);
+        // #2009: 実効上限・見えている / 見えていないぶん・猶予・ペインごとの持ち分が読める
+        assert_eq!(initial["effective_max_bytes"], 512 * 1024 * 1024);
+        assert_eq!(
+            initial["release_after_secs"],
+            tako_core::preview_cache::HIDDEN_RELEASE_AFTER_SECS
+        );
+        for key in [
+            "visible_bytes",
+            "hidden_bytes",
+            "source_bytes",
+            "released_total",
+            "restored_total",
+        ] {
+            assert!(initial[key].is_u64(), "{key} が数で載らない: {initial}");
+        }
+        assert!(initial["legacy"].is_boolean());
+        assert!(initial["panes"].is_array());
 
         let changed = dispatch(
             &mut host,

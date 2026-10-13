@@ -532,3 +532,5 @@
 - 2026-10-09 #1921: release-windows の rust-cache を外し、タグごとに一度も当たらないキャッシュを毎晩約 1.6 GB 保存して main / PR のキャッシュを押し出すのを止めた
 - 2026-10-09 #1918: セルフテストの器にも -f・tk-coretest の残骸を製品の掃除で回収・psmux の e2e も -f NUL
 - 2026-10-10 #1946: たまり場を画面全体の縮小・由来タブ → 親 master の見出しで描き、器の無い幽霊を見分けて安全に外せるようにした
+- 2026-10-10 #1958: pane を省いた `tako_show_command` / `sessions link` を呼び出し元ペインで埋める
+- 2026-10-11 #1984: UI スレッドの同期の dispatch の子プロセス待ちの残りを background へ = RemoteAgents・TmuxList・呼び出し元の pid 祖先辿り・spawn / handoff の CLI の所在確認・再起動の計画・check_qos の ps

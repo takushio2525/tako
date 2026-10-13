@@ -669,8 +669,10 @@ tako preview-copy-code 2
 tako preview-reload          # 現在値
 tako preview-reload off
 
-# デコード済み画像キャッシュの上限（既定 512 MiB、256〜8192）
-tako preview-cache           # 上限・使用量・件数
+# デコード済み画像キャッシュの上限（既定 512 MiB、256〜8192）。上限は天井で、
+# 実際に効かせる上限は見えているプレビューの量から決まる。裏のタブ・退避中の
+# プレビューは 30 秒で画像を手放し、表に戻すと作り直す
+tako preview-cache           # 上限・使用量・件数・実効上限・ペインごとの持ち分
 tako preview-cache 1024
 
 # コード表示 ⇔ git 履歴（チェンジログ）表示の切替

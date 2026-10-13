@@ -263,6 +263,12 @@ unsafe impl Send for VideoPlayer {}
 impl VideoPlayer {
     /// 動画ファイルからプレイヤーを初期化する
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        Self::open_at(path, 0.0)
+    }
+
+    /// 動画ファイルからプレイヤーを初期化し、`start` 秒の絵を最初のフレームにする（#2009）。
+    /// 裏で手放したプレイヤーを表に戻したとき、先頭の絵を挟まずに止めた位置から見せる
+    pub fn open_at(path: &std::path::Path, start: f64) -> Result<Self, String> {
         let path_str = path
             .to_str()
             .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
@@ -373,7 +379,7 @@ impl VideoPlayer {
 
             // 最初のフレームを取得する。デコーダの準備が間に合わなければ
             // 空振りするので、しばらくティッカーで取り直せるようにしておく
-            player.seek(0.0);
+            player.seek(start);
             std::thread::sleep(std::time::Duration::from_millis(100));
             player.grab_frame();
             player.refresh_deadline =
@@ -511,7 +517,17 @@ impl VideoPlayer {
     /// 現在のフレームをキャプチャして current_bgra に格納する。
     /// 再生中は定期的に呼ぶ（タイマー駆動）
     pub fn grab_frame(&mut self) -> bool {
-        let grabbed = self.grab_frame_inner();
+        self.grab_frame_with(true)
+    }
+
+    /// `copy_pixels` = false は画面に出ていないとき（#2009）: 再生位置と末尾の判定だけ進め、
+    /// 届いたフレームは写さずに返す（裏で 30fps × 1 フレーム ぶんの BGRA を作り続けない）。
+    /// 写さないときは手元の絵も捨てる（表に戻した次のティックで新しい絵を写す）
+    pub fn grab_frame_with(&mut self, copy_pixels: bool) -> bool {
+        if !copy_pixels && !self.current_bgra.is_empty() {
+            self.current_bgra = Vec::new();
+        }
+        let grabbed = self.grab_frame_inner(copy_pixels);
         // 末尾判定は「新しいフレームが来たとき」ではなく毎回行う。
         // 末尾では新フレームが来なくなるため、ここに置かないとループも
         // 再生状態のリセットも永久に発火しない
@@ -543,7 +559,7 @@ impl VideoPlayer {
         }
     }
 
-    fn grab_frame_inner(&mut self) -> bool {
+    fn grab_frame_inner(&mut self, copy_pixels: bool) -> bool {
         unsafe {
             // 総尺が取れていなければ取り直す（ネットワーク越し等、開いた時点では
             // まだ読み込めていないケースの自己修復。#484）
@@ -602,6 +618,14 @@ impl VideoPlayer {
             );
             if pixel_buffer.is_null() {
                 return false;
+            }
+            if !copy_pixels {
+                // 画面に出ていない（#2009）: 受け取って返すだけ。出力の待ち行列は進む
+                CFRelease(pixel_buffer);
+                if self.seek_pending.is_none() {
+                    self.refresh_deadline = None;
+                }
+                return true;
             }
 
             // ピクセルバッファから BGRA データを取得
@@ -887,6 +911,9 @@ impl VideoPlayer {
     pub fn open(_path: &std::path::Path) -> Result<Self, String> {
         Err("動画再生は macOS でのみ対応".into())
     }
+    pub fn open_at(_path: &std::path::Path, _start: f64) -> Result<Self, String> {
+        Err("動画再生は macOS でのみ対応".into())
+    }
     pub fn play(&mut self) {}
     pub fn pause(&mut self) {}
     pub fn toggle(&mut self) {}
@@ -901,6 +928,9 @@ impl VideoPlayer {
     pub fn toggle_mute(&mut self) {}
     pub fn toggle_loop(&mut self) {}
     pub fn grab_frame(&mut self) -> bool {
+        false
+    }
+    pub fn grab_frame_with(&mut self, _copy_pixels: bool) -> bool {
         false
     }
 }

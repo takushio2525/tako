@@ -1223,7 +1223,32 @@ lid-guard.json が使う）:
   GPU sprite atlas の両方から除去する。動画の置換済み `RenderImage` も次フレーム冒頭で
   `drop_image` し、再生時間に比例して atlas texture を残さない。render 毎の処理は
   現在近傍 3 キーの HashMap 参照と
-  LRU touch のみで、PNG clone / hash / eviction 走査は新規ページまたは世代変更時に限定する
+  LRU touch のみで、PNG clone / hash / eviction 走査は新規ページまたは世代変更時に限定する。
+  **#2009**: 2 秒の定期更新（`periodic_prep:preview_memory`）が `sweep_preview_memory` を回し、
+  `pane_visibility` が Hidden のプレビューを 30 秒（`tako_core::preview_cache::HIDDEN_RELEASE_AFTER_SECS`）
+  で手放す（描いた時刻では決めない = ペイン本体はキャッシュビューで、見えていても描き直さない間がある）。
+  手放すのはデコード済み画像（上の解放経路）・PDF の表示中のページと前後以外のページ PNG
+  （`PdfData::released` で印を付け、`page_in_layout` で並びに残す）・動画のフレームと止まったプレイヤー
+  （`VideoResume` に控える）。表に戻した描画の冒頭（`restore_released_preview`）で作り直しを数え、
+  PDF は `has_released_pages` を見て同じ `raster_key` で再ラスタ、動画は `ensure_video_player`
+  （CLI / MCP と同じ 1 本）で控えた位置から開き直す。LRU の予算は設定値（天井 =
+  `preview_cache_ceiling`）ではなく `effective_budget_bytes(天井, 見えている量)` を入れ、
+  新しく入る直前と掃除のたびに合わせ直す。
+  実測（隔離 GUI・release・14 タブ / 器つき端末 28 / プレビュー 8。`scripts/test-preview-memory-2009.sh`）:
+  修正前は全タブを見た 40 秒後に 943 MB で、IOAccelerator 255 MB はほぼ全部がプレビュー画像の
+  GPU テクスチャ（閉じた差分: 60 ページの画像入り PDF 66 MB・資料 PDF 66 MB・書類 PDF 66 MB・
+  写真 47 MB・シート 15 MB・動画 12 MB）。修正後は同じ時点で IOAccelerator 4.1 MB・LRU 0・
+  PDF の元データ 70 → 8 MB。footprint の総量は 943 → 459〜664 MB と回ごとに揺れる:
+  **macOS の malloc（xzone）は解放した大きな塊を空の領域のまま汚れた状態で抱え**
+  （`vmmap -v` の `MALLOC_LARGE (empty)`。手放した後の生きた確保 33 MB に対し空の領域 264 MB）、
+  返す時刻が一定しないため。`malloc_zone_pressure_relief` は 0 を返して効かず、
+  `MallocLargeCache=0` で起こすと即座に返る（手放した後 325 → 65 MB）が、アロケータ全体の方針の
+  変更なので #2009 では入れていない。窓の面（IOSurface）は 3024×1890×4 = 22.9 MB × 3 枚で
+  ペイン数に依らない。所有の物理 unmapped (graphics) 約 147 MB は 1 ペインの起動直後から出て、
+  描画が続く間だけ載り、40 秒の無操作で 3.5 MB へ戻る（プレビュー・ペイン数に依らない）。
+  端末ペイン 1 本の tako 側の持ち分は器つき 0.23〜0.26 MB（tako 側の履歴 0 行 = tmux と二重に
+  持たない。tmux の attach が alt screen で動く。本番 27 本すべて `scroll.history` = 0）、
+  直接ペインは 3,041 行の履歴で 21.6 MB（alacritty が 1,000 行単位で先取りする）
 - **重量プレビューの background ロード**（`pending_preview_loads` →
   `spawn_preview_load`）: PDF / 動画は Loading プレースホルダを即表示して
   `preview::load_fast` を background で実行、完了時に path 一致 + Loading 継続を

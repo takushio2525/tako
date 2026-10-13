@@ -233,6 +233,52 @@ pub struct PdfData {
     pub pixel_sizes: Vec<[u32; 2]>,
     /// PDF アノテーションから抽出したリンク一覧（#271。ロード時に 1 回構築）。
     pub links: Arc<PdfLinks>,
+    /// 見えていない間にページ PNG を手放したページ（#2009。空 = 手放していない）。
+    ///
+    /// 手放したページは `pages[i]` が空になるが、**描画失敗の空ページと違って並びから
+    /// 外さない**（同じ寸法の空白で置き、スクロール位置とページ番号を保つ）。
+    /// 表に戻したら同じ `raster_key` で全ページを background で再ラスタし、戻ったら空にする
+    pub released: Vec<bool>,
+}
+
+impl PdfData {
+    /// このページを見えていない間に手放したか（#2009）
+    pub fn page_released(&self, index: usize) -> bool {
+        self.released.get(index).copied().unwrap_or(false)
+    }
+
+    /// 手放したページが 1 つでもあるか（#2009。表に戻したら再ラスタする合図）
+    pub fn has_released_pages(&self) -> bool {
+        self.released.iter().any(|r| *r)
+    }
+
+    /// ページを並びに出すか: PNG がある・または手放しただけ（#2009）。
+    /// 描画に失敗した空ページだけを外す（#168 からの扱い）
+    pub fn page_in_layout(&self, index: usize) -> bool {
+        self.pages.get(index).is_some_and(|png| !png.is_empty()) || self.page_released(index)
+    }
+
+    /// `keep` の外のページ PNG を手放す（#2009）。手放した bytes を返す
+    pub fn release_pages_outside(&mut self, keep: std::ops::Range<usize>) -> u64 {
+        let mut freed = 0u64;
+        if self.released.len() < self.pages.len() {
+            self.released.resize(self.pages.len(), false);
+        }
+        for (i, png) in self.pages.iter_mut().enumerate() {
+            if keep.contains(&i) || png.is_empty() {
+                continue;
+            }
+            freed += png.len() as u64;
+            *png = Vec::new();
+            self.released[i] = true;
+        }
+        freed
+    }
+
+    /// 抱えているページ PNG の合計 bytes（#2009。`tako preview-cache` の source_bytes）
+    pub fn source_bytes(&self) -> u64 {
+        self.pages.iter().map(|png| png.len() as u64).sum()
+    }
 }
 
 /// PDF 再ラスタライズのキャッシュキー（#231 / #234）。
@@ -1243,6 +1289,7 @@ pub fn load_pdf_with_key(path: &Path, raster_key: PdfRasterKey) -> PreviewState 
                     raster_key,
                     pixel_sizes: rasterized.pixel_sizes,
                     links: Arc::new(links),
+                    released: Vec::new(),
                 }),
                 outline: Arc::new(outline),
                 truncated: None,
@@ -4165,6 +4212,52 @@ mod tests {
                 .as_bytes(),
         );
         pdf
+    }
+
+    /// 手放しの単体（#2009）: 表示中のページと前後だけ PNG を残し、手放したページは
+    /// 並びに残る。描画に失敗した空ページは手放したことにならず、並びからも外れる
+    #[test]
+    fn pdfは手放したページを並びに残して元データを返す() {
+        let mut data = PdfData {
+            pages: vec![
+                vec![1; 10],
+                vec![2; 20],
+                Vec::new(),
+                vec![4; 40],
+                vec![5; 50],
+            ],
+            total_pages: 5,
+            text_layers: vec![Vec::new(); 5],
+            page_sizes: vec![[612.0, 792.0]; 5],
+            raster_key: PdfRasterKey::for_view(2.0, 1.0, 612.0),
+            pixel_sizes: vec![[100, 100]; 5],
+            links: Arc::new(PdfLinks::default()),
+            released: Vec::new(),
+        };
+        assert_eq!(data.source_bytes(), 120);
+        assert!(!data.has_released_pages());
+        // 描画に失敗した空ページ（2）は手放していない = 並びから外れる（#168 からの扱い）
+        assert!(!data.page_in_layout(2));
+
+        let freed = data.release_pages_outside(tako_core::preview_cache::pdf_pages_to_keep(3, 5));
+        assert_eq!(freed, 10 + 20, "表示中（3）と前後（2・4）以外の PNG を返す");
+        assert!(data.has_released_pages());
+        assert_eq!(data.source_bytes(), 90);
+        for i in [0, 1] {
+            assert!(data.page_released(i));
+            assert!(data.pages[i].is_empty());
+            assert!(data.page_in_layout(i), "手放したページ {i} は並びに残る");
+        }
+        for i in [3, 4] {
+            assert!(!data.page_released(i));
+            assert!(data.page_in_layout(i));
+        }
+        assert!(
+            !data.page_released(2) && !data.page_in_layout(2),
+            "失敗した空ページは手放しの印を付けない"
+        );
+        // もう一度手放しても返すものは無い（冪等）
+        assert_eq!(data.release_pages_outside(3..5), 0);
     }
 
     fn write_test_pdf(dir_name: &str, file: &str, contents: &[&str]) -> PathBuf {

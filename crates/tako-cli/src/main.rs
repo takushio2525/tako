@@ -3280,7 +3280,8 @@ struct LimitResumeArgs {
 
 #[derive(Args)]
 struct PreviewCacheArgs {
-    /// キャッシュ上限（MiB、256〜8192。省略時は利用状況を表示）
+    /// キャッシュ上限（MiB、256〜8192。天井。実効上限は見えている量から決まる。
+    /// 省略時は利用状況とペインごとの持ち分を表示）
     max_mb: Option<u64>,
 }
 
