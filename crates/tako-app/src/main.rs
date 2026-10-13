@@ -1125,6 +1125,18 @@ impl CloseReason {
     }
 }
 
+/// セッションカタログ（Issue #112 A）へ走査の結果を同期する。**background から呼ぶ**
+/// （ファイルロック + 読み直し + アトミック書き込み）。検出が空でも呼んでよい
+/// （溜めた `last_seen_at` が無ければ I/O しない。#2020）
+fn sync_session_catalog(
+    detected: &[tako_control::sessions::DetectedSession],
+    panes: &[tako_control::sessions::PaneMetaSnapshot],
+) {
+    if let Err(e) = tako_control::sessions::sync_detected(detected, panes) {
+        eprintln!("warning: セッションカタログの同期に失敗: {e}");
+    }
+}
+
 /// persist 診断ログ（Issue #30）: `<data_dir>/persist.log` へ追記 + stderr へも出す
 /// （ターミナル起動時に見える）。Dock 起動の .app では stderr が届かないため、
 /// 「再起動でタブが消えた」原因をファイルで追えるようにする。
@@ -4939,9 +4951,18 @@ impl TakoApp {
         // Dock 終了では操作ごと保存に救われているだけだった）。
         // 「全ペイン終了」経路（quitting=true）は layout.json の削除 / 保持を
         // close_pane 側で確定済みのため、ここでは触らない（#30 / #113 の挙動を維持）
-        cx.on_app_quit(|this: &mut TakoApp, _cx| {
+        cx.on_app_quit(|this: &mut TakoApp, cx| {
             // #777 の検証専用の注入: 終了処理に入ったまま返らないアプリを作る
             inject_777_hang("hang-quit");
+            // #2020: 走査が間引いて溜めた last_seen_at を書き出す。書くのは background で
+            // （UI スレッドで読み書きしない）、下の言語サーバの停止と並行に走らせ、
+            // 終わりは返す future で待つ（GPUI の SHUTDOWN_TIMEOUT の内）。
+            // 溜めた分が無ければ I/O しない
+            let flush_sessions = cx.background_executor().spawn(async {
+                if let Err(e) = tako_control::sessions::flush_last_seen() {
+                    eprintln!("warning: セッションカタログの書き出しに失敗: {e}");
+                }
+            });
             // #1678: 言語サーバへ shutdown → exit を送り、期限を過ぎたら kill する
             // （孤児を残さない。kill -9 で落ちたときはサーバが stdin の EOF で自分で終わる）
             this.lsp.shutdown_all(std::time::Duration::from_secs(2));
@@ -5022,7 +5043,7 @@ impl TakoApp {
                 }
                 println!("TAKO_APP_SELF_TEST_OK");
             }
-            async {}
+            flush_sessions
         })
         .detach();
         if restored.is_empty() {
@@ -5678,6 +5699,10 @@ impl TakoApp {
                     .unwrap_or_default();
                 if !should_scan {
                     last_scan = Some(std::time::Instant::now());
+                    // #2020: 走査しない間も、溜めた last_seen_at は書く（無ければ I/O しない）
+                    cx.background_executor()
+                        .spawn(async { sync_session_catalog(&[], &[]) })
+                        .await;
                     continue;
                 }
                 // 前段ガード: 走査対象に実行中の子プロセスがなければ claude も居ないので
@@ -5721,6 +5746,11 @@ impl TakoApp {
                         app.apply_agent_resume_sessions(&HashMap::new());
                         app.save_layout();
                     });
+                    // #2020: 会話がすべて終わった走査 = 検出集合の変化。溜めていた
+                    // 「最後に見えた時刻」をここで書く（無ければ I/O しない）
+                    cx.background_executor()
+                        .spawn(async { sync_session_catalog(&[], &[]) })
+                        .await;
                     continue;
                 }
                 // 1 回の `claude agents --json` 取得から resume マップ（従来）と
@@ -5774,11 +5804,7 @@ impl TakoApp {
                 if !detected.is_empty() {
                     cx.background_executor()
                         .spawn(async move {
-                            if let Err(e) =
-                                tako_control::sessions::sync_detected(&detected, &pane_meta)
-                            {
-                                eprintln!("warning: セッションカタログの同期に失敗: {e}");
-                            }
+                            sync_session_catalog(&detected, &pane_meta);
                             // #390: worker レジストリへも session_id を反映
                             // （prompt 到達の証跡。未変更ならファイル書き込みしない）
                             // #728: 器が無ければペイン ID キーで引く
@@ -5803,6 +5829,12 @@ impl TakoApp {
                                 }
                             }
                         })
+                        .await;
+                } else {
+                    // #2020: claude を 1 本も検出しなかった = 会話がすべて終わった。
+                    // 溜めていた「最後に見えた時刻」をここで書く（無ければ I/O しない）
+                    cx.background_executor()
+                        .spawn(async { sync_session_catalog(&[], &[]) })
                         .await;
                 }
             }

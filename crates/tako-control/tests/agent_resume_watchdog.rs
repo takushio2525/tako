@@ -94,7 +94,13 @@ fn 子プロセス不在の分岐は両系統の保持規則を通る() {
     let idx = source
         .find("if !has_children {")
         .expect("has_children の前段ガードが見つからない（#368 の構造が変わった）");
-    let block = &source[idx..idx + 1200];
+    // 1200 バイト目が多バイト文字（日本語のコメント）の途中に来ても落ちないよう、
+    // 文字境界まで戻して切る（#2020 で分岐の後ろにコメントが増えて踏んだ）
+    let mut end = (idx + 1200).min(source.len());
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    let block = &source[idx..end];
     for call in [
         "apply_claude_resume_sessions(&[])",
         "apply_agent_resume_sessions(",

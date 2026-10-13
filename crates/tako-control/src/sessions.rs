@@ -26,9 +26,29 @@
 //!
 //! ファイルは `<data_dir>/sessions.yaml`（`TAKO_SESSIONS_FILE` で上書き可。隔離検証用）。
 //! 書き込みは config_io（排他 flock + アトミック書き込み + 世代バックアップ。#169）。
+//!
+//! ## 走査ごとの書き込みの間引き（#2020）
+//!
+//! GUI の走査は 30 秒ごとに検出した会話の `last_seen_at` を今の時刻へ進める。修正前は
+//! それだけで毎回「全体を YAML 化 → 本体を `.bak.1` へ丸ごとコピー（3 世代の回転）→
+//! tmp へ書いて rename」をしていた（500 件・395 KB で約 0.8 MB × 2,880 回/日）。
+//! いまは [`LastSeenThrottle`] が `last_seen_at` だけの変化を溜め、次のどれかで書く:
+//!
+//! - `last_seen_at` 以外の変化（新しい会話・pane / tab / 器 / cwd / model 等・pending・GC）
+//!   = 即時に書き、`.bak` も回す（#169 の「消失時に直前へ戻せる」はこの変化のためにある）
+//! - **検出した会話の集合が変わった**（会話が始まった / 終わった / 戻ってきた）
+//!   = 即時に書く。溜めていた各会話の「最後に見えた時刻」をそのまま書くので、
+//!   書いた時点のファイルは修正前と同じ内容になり、並び順（`tako sessions list`）・
+//!   GC（古い順に落とす）・ペインからの逆引き（同じペインの最新の世代。#466）が変わらない
+//! - 最後に書いてから [`LAST_SEEN_FLUSH_SECS`] が過ぎた（時刻の値そのものの鮮度）
+//! - GUI の終了（[`flush_last_seen`]。`on_app_quit` から）
+//!
+//! `last_seen_at` だけの書き込みは `.bak` を回さない（中身の会話も項目も変わらないので
+//! 退避する意味が無い）。A/B は `TAKO_2020_LEGACY=1`（毎回 `.bak` つきで書く修正前）
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -43,6 +63,14 @@ const MAX_ENTRIES: usize = 500;
 /// （codex / agy worker は claude の session 検出に乗らないため、寿命付きで残す）
 const PENDING_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// `last_seen_at` だけの変化を溜めておける最長の時間（秒。#2020）。
+///
+/// 並び順・GC・ペインの逆引きは「検出集合が変わった時点で書く」ことで修正前と同じに
+/// 保たれるので、この窓が効くのは**時刻の値そのもの**だけ = `tako sessions list` の
+/// `last_seen_at` の表示と、異常終了（kill -9・電源断）で終了時の書き出しを通らなかった
+/// ときに残る値の古さ（最大でこの秒数）。30 秒の走査 20 回ぶん
+const LAST_SEEN_FLUSH_SECS: i64 = 600;
+
 /// カタログファイルのパス（`TAKO_SESSIONS_FILE` 上書き → `<data_dir>/sessions.yaml`）
 pub fn catalog_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("TAKO_SESSIONS_FILE") {
@@ -54,7 +82,7 @@ pub fn catalog_path() -> Option<PathBuf> {
 }
 
 /// カタログ本体（sessions.yaml のスキーマ）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionCatalog {
     /// session_id → エントリ
     #[serde(default)]
@@ -362,7 +390,9 @@ pub fn merge_detected(
 }
 
 /// 検出結果をカタログへ同期する（pending の昇格 + エントリ更新 + GC）。
-/// GUI の定期スキャン（background）から呼ばれる
+/// GUI の定期スキャン（background）から呼ばれる。**検出が空でも呼んでよい**
+/// （溜めた `last_seen_at` が無ければ I/O しない。会話がすべて終わった走査で
+/// 溜めた分を書くために呼ぶ。#2020）
 pub fn sync_detected(
     detected: &[DetectedSession],
     panes: &[PaneMetaSnapshot],
@@ -371,8 +401,242 @@ pub fn sync_detected(
     sync_detected_at(&path, detected, panes)
 }
 
-/// パス指定版 sync（テスト用に公開）
+/// パス指定版 sync（テスト用に公開）。間引きの状態はプロセスに 1 つ（パスごと）
 pub fn sync_detected_at(
+    path: &Path,
+    detected: &[DetectedSession],
+    panes: &[PaneMetaSnapshot],
+) -> Result<(), String> {
+    if legacy_2020() {
+        return sync_detected_legacy(path, detected, panes);
+    }
+    let mut throttles = throttles().lock().unwrap_or_else(|e| e.into_inner());
+    let throttle = throttles.entry(path.to_path_buf()).or_default();
+    sync_detected_throttled(path, detected, panes, unix_now(), throttle).map(|_| ())
+}
+
+/// 溜めた `last_seen_at` を書き出す（GUI の終了時。#2020）。溜めた分が無ければ I/O しない
+pub fn flush_last_seen() -> Result<(), String> {
+    if legacy_2020() {
+        return Ok(());
+    }
+    let mut throttles = throttles().lock().unwrap_or_else(|e| e.into_inner());
+    let now = unix_now();
+    let mut first_err = None;
+    for (path, throttle) in throttles.iter_mut() {
+        if let Err(e) = flush_last_seen_at(path, now, throttle) {
+            first_err.get_or_insert(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// #2020 の A/B。`TAKO_2020_LEGACY=1` で**同一バイナリのまま**修正前
+/// （検出のたびに全体を書き、毎回 `.bak` を回す）へ戻す
+pub fn legacy_2020() -> bool {
+    std::env::var_os("TAKO_2020_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// 1 回の同期で何を書いたか（#2020。単体テスト・計測が見る）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncWrite {
+    /// 書かなかった（変化なし / `last_seen_at` だけの変化を溜めた）
+    Skipped,
+    /// `last_seen_at` だけが変わった内容を書いた（`.bak` は回さない）
+    LastSeenOnly,
+    /// `last_seen_at` 以外も変わった内容を書いた（`.bak` を回してから書く）
+    Structural,
+}
+
+/// GUI の走査がまだ書いていない `last_seen_at`（#2020）。
+///
+/// 正本はファイルで、ここは**ファイルとの差分だけ**を持つ（毎回ロックを取って読み直すので、
+/// 他プロセスの書き込み = spawn の pending 記録・手で直した内容を潰さない）
+#[derive(Debug, Default)]
+pub struct LastSeenThrottle {
+    /// 直前の走査で検出した会話の集合（変わったら即時に書く）
+    detected: BTreeSet<String>,
+    /// まだ書いていない「最後に見えた時刻」（session_id → ISO）
+    unflushed: BTreeMap<String, String>,
+    /// このプロセスが最後に書いた時刻（unix 秒）。`None` = まだ書いていない
+    last_flush: Option<i64>,
+}
+
+impl LastSeenThrottle {
+    /// まだ書いていない `last_seen_at` があるか
+    pub fn has_unflushed(&self) -> bool {
+        !self.unflushed.is_empty()
+    }
+}
+
+/// 間引きの状態（プロセスに 1 つ。カタログのパスごと）
+fn throttles() -> &'static Mutex<BTreeMap<PathBuf, LastSeenThrottle>> {
+    static THROTTLES: OnceLock<Mutex<BTreeMap<PathBuf, LastSeenThrottle>>> = OnceLock::new();
+    THROTTLES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 間引きつきの同期の本体（時刻と状態を引数で受ける = 単体テストが時間を進められる。#2020）
+pub fn sync_detected_throttled(
+    path: &Path,
+    detected: &[DetectedSession],
+    panes: &[PaneMetaSnapshot],
+    now_secs: i64,
+    throttle: &mut LastSeenThrottle,
+) -> Result<SyncWrite, String> {
+    let ids: BTreeSet<String> = detected
+        .iter()
+        .filter(|d| crate::transcript::is_valid_session_id(&d.session_id))
+        .map(|d| d.session_id.clone())
+        .collect();
+    // 何も検出せず、溜めた分も無い = 修正前と同じく I/O しない
+    if detected.is_empty() && !throttle.has_unflushed() {
+        throttle.detected = ids;
+        return Ok(SyncWrite::Skipped);
+    }
+    let now = crate::diag::format_utc(now_secs);
+    let _lock = crate::config_io::lock_exclusive(path)?;
+    let base = SessionCatalog::load_from(path)?;
+    let mut next = base.clone();
+    // 溜めていた時刻（修正前ならもう書いてあった値）を先に当てる。GC が修正前と
+    // 同じ値で古い順を選び、書いたときの中身が修正前のファイルと一致する
+    apply_unflushed(&mut next, &throttle.unflushed);
+    // 修正前と同じく、検出が空の走査では昇格も GC もしない
+    if !detected.is_empty() {
+        apply_detected(&mut next, detected, panes, &now);
+    }
+    let structural = !same_except_last_seen(&base, &next);
+    let set_changed = ids != throttle.detected;
+    let due = throttle
+        .last_flush
+        .is_none_or(|t| now_secs - t >= LAST_SEEN_FLUSH_SECS);
+    // 書けなかったとき（Err）も、この走査で見えた時刻を失わないよう先に溜める
+    for id in &ids {
+        throttle.unflushed.insert(id.clone(), now.clone());
+    }
+    throttle.detected = ids;
+    if !(structural || set_changed || due) {
+        return Ok(SyncWrite::Skipped);
+    }
+    let written = write_catalog(path, &base, &next, structural)?;
+    throttle.unflushed.clear();
+    throttle.last_flush = Some(now_secs);
+    Ok(written)
+}
+
+/// 溜めた `last_seen_at` だけを書き出す（[`flush_last_seen`] の本体。#2020）
+pub fn flush_last_seen_at(
+    path: &Path,
+    now_secs: i64,
+    throttle: &mut LastSeenThrottle,
+) -> Result<SyncWrite, String> {
+    if !throttle.has_unflushed() {
+        return Ok(SyncWrite::Skipped);
+    }
+    let _lock = crate::config_io::lock_exclusive(path)?;
+    let base = SessionCatalog::load_from(path)?;
+    let mut next = base.clone();
+    apply_unflushed(&mut next, &throttle.unflushed);
+    let written = write_catalog(path, &base, &next, false)?;
+    throttle.unflushed.clear();
+    throttle.last_flush = Some(now_secs);
+    Ok(written)
+}
+
+/// 溜めていた「最後に見えた時刻」を当てる。修正前はその走査の時点で同じ値を
+/// 書いていたので、当てた後の内容は修正前のファイルと一致する
+/// （カタログから消えた会話 = GC・手で消した、には当てない）
+fn apply_unflushed(catalog: &mut SessionCatalog, unflushed: &BTreeMap<String, String>) {
+    for (id, seen) in unflushed {
+        if let Some(entry) = catalog.entries.get_mut(id) {
+            entry.last_seen_at.clone_from(seen);
+        }
+    }
+}
+
+/// 中身が同じなら書かない。`last_seen_at` 以外が変わったときだけ `.bak` を回す
+/// （#169 の世代バックアップは会話・項目の消失から戻すためのもの）
+fn write_catalog(
+    path: &Path,
+    base: &SessionCatalog,
+    next: &SessionCatalog,
+    structural: bool,
+) -> Result<SyncWrite, String> {
+    if next == base {
+        return Ok(SyncWrite::Skipped);
+    }
+    let content =
+        serde_yaml::to_string(next).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+    if structural {
+        crate::config_io::rotate_backups(path)?;
+    }
+    crate::config_io::atomic_write(path, &content)?;
+    Ok(if structural {
+        SyncWrite::Structural
+    } else {
+        SyncWrite::LastSeenOnly
+    })
+}
+
+/// `last_seen_at` を除いて同じ内容か（#2020）
+fn same_except_last_seen(a: &SessionCatalog, b: &SessionCatalog) -> bool {
+    a.pending == b.pending
+        && a.entries.len() == b.entries.len()
+        && a.entries
+            .iter()
+            .zip(&b.entries)
+            .all(|((id_a, a), (id_b, b))| id_a == id_b && entry_eq_except_last_seen(a, b))
+}
+
+/// エントリ 1 件を `last_seen_at` を除いて比べる。
+///
+/// **全フィールドを名指しで分解する**（`..` を使わない）: フィールドを足すとここが
+/// コンパイルエラーになり、新しいフィールドの変化を「`last_seen_at` だけの変化」と
+/// 取り違えて書き込みを遅らせる・`.bak` を回し損ねることが起きない
+fn entry_eq_except_last_seen(a: &SessionEntry, b: &SessionEntry) -> bool {
+    let SessionEntry {
+        kind,
+        label,
+        project,
+        profile,
+        agent,
+        model,
+        effort,
+        issues,
+        prompt_head,
+        cwd,
+        tab,
+        pane,
+        tmux_session,
+        log_file,
+        started_at,
+        last_seen_at: _,
+    } = a;
+    *kind == b.kind
+        && *label == b.label
+        && *project == b.project
+        && *profile == b.profile
+        && *agent == b.agent
+        && *model == b.model
+        && *effort == b.effort
+        && *issues == b.issues
+        && *prompt_head == b.prompt_head
+        && *cwd == b.cwd
+        && *tab == b.tab
+        && *pane == b.pane
+        && *tmux_session == b.tmux_session
+        && *log_file == b.log_file
+        && *started_at == b.started_at
+}
+
+/// 修正前の同期（#2020 の A/B）: 検出のたびに全体を書き、毎回 `.bak` を回す
+fn sync_detected_legacy(
     path: &Path,
     detected: &[DetectedSession],
     panes: &[PaneMetaSnapshot],
@@ -382,109 +646,120 @@ pub fn sync_detected_at(
     }
     let now = now_iso();
     SessionCatalog::mutate_at(path, |catalog| {
-        for d in detected {
-            if !crate::transcript::is_valid_session_id(&d.session_id) {
-                continue;
-            }
-            // 対応付けは器のセッション名優先、器が無ければペイン ID（#728）
-            let pane_meta = panes
-                .iter()
-                .find(|p| match (&p.tmux_session, &d.tmux_session) {
-                    (Some(mine), Some(theirs)) => mine == theirs,
-                    _ => d.pane.is_some_and(|pane| p.pane == pane),
-                });
-            let pending_idx = catalog
-                .pending
-                .iter()
-                .position(|p| p.matches(d.tmux_session.as_deref(), d.pane));
-            let pending = pending_idx.map(|i| catalog.pending.remove(i));
+        apply_detected(catalog, detected, panes, &now)
+    })
+}
 
-            let entry = catalog.entries.entry(d.session_id.clone()).or_default();
-            if entry.started_at.is_empty() {
-                entry.started_at = pending
-                    .as_ref()
-                    .map(|p| p.recorded_at.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| now.clone());
+/// 検出結果をカタログへ当てる（pending の昇格 + エントリ更新 + GC）
+fn apply_detected(
+    catalog: &mut SessionCatalog,
+    detected: &[DetectedSession],
+    panes: &[PaneMetaSnapshot],
+    now: &str,
+) {
+    let now = now.to_string();
+    for d in detected {
+        if !crate::transcript::is_valid_session_id(&d.session_id) {
+            continue;
+        }
+        // 対応付けは器のセッション名優先、器が無ければペイン ID（#728）
+        let pane_meta = panes
+            .iter()
+            .find(|p| match (&p.tmux_session, &d.tmux_session) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => d.pane.is_some_and(|pane| p.pane == pane),
+            });
+        let pending_idx = catalog
+            .pending
+            .iter()
+            .position(|p| p.matches(d.tmux_session.as_deref(), d.pane));
+        let pending = pending_idx.map(|i| catalog.pending.remove(i));
+
+        let entry = catalog.entries.entry(d.session_id.clone()).or_default();
+        if entry.started_at.is_empty() {
+            entry.started_at = pending
+                .as_ref()
+                .map(|p| p.recorded_at.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| now.clone());
+        }
+        entry.last_seen_at = now.clone();
+        // 器が無い構成では None のまま（「観測できていない」ではなく「器が無い」）
+        if d.tmux_session.is_some() {
+            entry.tmux_session = d.tmux_session.clone();
+        }
+        if let Some(pane) = d.pane {
+            entry.pane = Some(pane);
+        }
+        if d.agent_cwd.is_some() {
+            entry.cwd = d.agent_cwd.clone();
+        }
+        if d.model.is_some() {
+            entry.model = d.model.clone();
+        }
+        // spawn 時のメタ（プロンプト由来の情報）は pending が最も正確
+        if let Some(p) = pending {
+            entry.kind = p.kind;
+            entry.label = p.label.or(entry.label.take());
+            entry.project = p.project.or(entry.project.take());
+            entry.agent = p.agent.or(entry.agent.take());
+            if entry.model.is_none() {
+                entry.model = p.model;
             }
-            entry.last_seen_at = now.clone();
-            // 器が無い構成では None のまま（「観測できていない」ではなく「器が無い」）
-            if d.tmux_session.is_some() {
-                entry.tmux_session = d.tmux_session.clone();
+            entry.effort = p.effort.or(entry.effort.take());
+            if !p.issues.is_empty() {
+                entry.issues = p.issues;
             }
-            if let Some(pane) = d.pane {
-                entry.pane = Some(pane);
-            }
-            if d.agent_cwd.is_some() {
-                entry.cwd = d.agent_cwd.clone();
-            }
-            if d.model.is_some() {
-                entry.model = d.model.clone();
-            }
-            // spawn 時のメタ（プロンプト由来の情報）は pending が最も正確
-            if let Some(p) = pending {
-                entry.kind = p.kind;
-                entry.label = p.label.or(entry.label.take());
-                entry.project = p.project.or(entry.project.take());
-                entry.agent = p.agent.or(entry.agent.take());
-                if entry.model.is_none() {
-                    entry.model = p.model;
-                }
-                entry.effort = p.effort.or(entry.effort.take());
-                if !p.issues.is_empty() {
-                    entry.issues = p.issues;
-                }
-                entry.prompt_head = p.prompt_head.or(entry.prompt_head.take());
-                if entry.cwd.is_none() {
-                    entry.cwd = p.cwd;
-                }
-            }
-            // ペインの現在情報で補完・更新する
-            if let Some(meta) = pane_meta {
-                entry.pane = Some(meta.pane);
-                entry.tab = Some(meta.tab);
-                if let Some(role) = meta.role.as_deref() {
-                    let parsed = parse_role(role);
-                    if entry.kind.is_empty() {
-                        entry.kind = parsed.kind.to_string();
-                    }
-                    if entry.project.is_none() {
-                        entry.project = parsed.project;
-                    }
-                    if entry.label.is_none() {
-                        entry.label = parsed.label;
-                    }
-                    if entry.profile.is_none() {
-                        entry.profile = parsed.profile;
-                    }
-                }
-                if entry.label.is_none() {
-                    entry.label = meta.title.clone();
-                }
-                if entry.cwd.is_none() {
-                    entry.cwd = meta.cwd.clone();
-                }
-                if meta.log_file.is_some() {
-                    entry.log_file = meta.log_file.clone();
-                }
-            }
-            if entry.kind.is_empty() {
-                entry.kind = "pane".into();
-            }
-            if entry.agent.is_none() {
-                entry.agent = Some("claude".into());
-            }
-            if entry.issues.is_empty() {
-                let text = format!(
-                    "{} {}",
-                    entry.label.as_deref().unwrap_or(""),
-                    entry.prompt_head.as_deref().unwrap_or("")
-                );
-                entry.issues = extract_issues(&text);
+            entry.prompt_head = p.prompt_head.or(entry.prompt_head.take());
+            if entry.cwd.is_none() {
+                entry.cwd = p.cwd;
             }
         }
-        gc(catalog, &now);
-    })
+        // ペインの現在情報で補完・更新する
+        if let Some(meta) = pane_meta {
+            entry.pane = Some(meta.pane);
+            entry.tab = Some(meta.tab);
+            if let Some(role) = meta.role.as_deref() {
+                let parsed = parse_role(role);
+                if entry.kind.is_empty() {
+                    entry.kind = parsed.kind.to_string();
+                }
+                if entry.project.is_none() {
+                    entry.project = parsed.project;
+                }
+                if entry.label.is_none() {
+                    entry.label = parsed.label;
+                }
+                if entry.profile.is_none() {
+                    entry.profile = parsed.profile;
+                }
+            }
+            if entry.label.is_none() {
+                entry.label = meta.title.clone();
+            }
+            if entry.cwd.is_none() {
+                entry.cwd = meta.cwd.clone();
+            }
+            if meta.log_file.is_some() {
+                entry.log_file = meta.log_file.clone();
+            }
+        }
+        if entry.kind.is_empty() {
+            entry.kind = "pane".into();
+        }
+        if entry.agent.is_none() {
+            entry.agent = Some("claude".into());
+        }
+        if entry.issues.is_empty() {
+            let text = format!(
+                "{} {}",
+                entry.label.as_deref().unwrap_or(""),
+                entry.prompt_head.as_deref().unwrap_or("")
+            );
+            entry.issues = extract_issues(&text);
+        }
+    }
+    gc(catalog, &now);
 }
 
 /// pending の期限切れ掃除 + エントリ数の上限強制
@@ -1904,5 +2179,450 @@ mod tests {
         );
         assert_eq!(merged[2].tmux_session.as_deref(), Some("tako-s2"));
         assert_eq!(merged[3].pane, Some(9));
+    }
+
+    // ---------------------------------------------------------------------
+    // #2020: last_seen_at だけの更新の間引き
+    // ---------------------------------------------------------------------
+
+    /// 走査の基準時刻（2026-09 頃）。走査の間隔は本番と同じ 30 秒で進める
+    const T0: i64 = 1_790_000_000;
+    const SCAN: i64 = 30;
+    /// 並び順の比較でキーの順が効くように、先頭の文字で順を決めておく
+    const ID_A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    const ID_B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+    const ID_C: &str = "cccccccc-0000-4000-8000-000000000003";
+    const ID_D: &str = "dddddddd-0000-4000-8000-000000000004";
+    const ID_E: &str = "eeeeeeee-0000-4000-8000-000000000005";
+    const ID_F: &str = "ffffffff-0000-4000-8000-000000000006";
+
+    /// 器つきの検出 1 件（器の名前はペイン番号から作る）
+    fn det(id: &str, pane: u64) -> DetectedSession {
+        DetectedSession {
+            session_id: id.to_string(),
+            tmux_session: Some(format!("tako-{pane}")),
+            pane: Some(pane),
+            agent_cwd: Some(format!("/tmp/w{pane}")),
+            model: Some("claude-opus-5".into()),
+        }
+    }
+
+    fn iso(secs: i64) -> String {
+        crate::diag::format_utc(secs)
+    }
+
+    /// 書いたかどうかの目印。serde_yaml は書き出しでコメントを残さないので、
+    /// **ファイルを書き直すと消える**（inode や mtime に頼らず OS をまたいで同じ判定）
+    const MARK: &str = "# issue2020-mark\n";
+
+    fn mark(path: &Path) {
+        let content = std::fs::read_to_string(path).unwrap();
+        std::fs::write(path, format!("{MARK}{content}")).unwrap();
+    }
+
+    fn rewritten(path: &Path) -> bool {
+        !std::fs::read_to_string(path).unwrap().starts_with(MARK)
+    }
+
+    fn bak(path: &Path, generation: u32) -> Option<String> {
+        std::fs::read_to_string(crate::config_io::backup_path(path, generation)).ok()
+    }
+
+    #[test]
+    fn issue2020_last_seen_atだけの変化では書かずbakも回さない() {
+        let path = temp_path("2020-skip");
+        let mut th = LastSeenThrottle::default();
+        let ab = [det(ID_A, 1), det(ID_B, 2)];
+        assert_eq!(
+            sync_detected_throttled(&path, &ab, &[], T0, &mut th).unwrap(),
+            SyncWrite::Structural,
+            "最初の走査は新しい会話 = 即時に書く"
+        );
+        // `.bak` が 1 世代ある状態から始める（回したら中身が変わる / 2 世代目ができる）
+        let abc = [det(ID_A, 1), det(ID_B, 2), det(ID_C, 3)];
+        sync_detected_throttled(&path, &abc, &[], T0 + SCAN, &mut th).unwrap();
+        let bak1 = bak(&path, 1).expect("新しい会話の保存は .bak を回す");
+        mark(&path);
+        // 窓（600 秒）の中の走査はどれも last_seen_at だけの変化 = 書かない・.bak を回さない
+        for i in 2..=20 {
+            let now = T0 + SCAN * i;
+            assert_eq!(
+                sync_detected_throttled(&path, &abc, &[], now, &mut th).unwrap(),
+                SyncWrite::Skipped,
+                "{i} 回目の走査（last_seen_at だけの変化）で書いた"
+            );
+            assert!(!rewritten(&path), "{i} 回目の走査でファイルを書き直した");
+            assert_eq!(
+                bak(&path, 1).as_ref(),
+                Some(&bak1),
+                "{i} 回目で .bak を回した"
+            );
+            assert_eq!(bak(&path, 2), None, "{i} 回目で .bak を回した");
+        }
+        // 最後に書いてから 600 秒 = last_seen_at だけを書く。.bak は回さない
+        let due = T0 + SCAN + LAST_SEEN_FLUSH_SECS;
+        assert_eq!(
+            sync_detected_throttled(&path, &abc, &[], due, &mut th).unwrap(),
+            SyncWrite::LastSeenOnly
+        );
+        assert!(rewritten(&path), "窓が過ぎたのに書いていない");
+        assert_eq!(
+            bak(&path, 1).as_ref(),
+            Some(&bak1),
+            "last_seen_at だけの保存で .bak を回した"
+        );
+        assert_eq!(bak(&path, 2), None);
+        let catalog = SessionCatalog::load_from(&path).unwrap();
+        for id in [ID_A, ID_B, ID_C] {
+            assert_eq!(catalog.entries[id].last_seen_at, iso(due));
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn issue2020_last_seen_at以外の変化では即時に書きbakを回す() {
+        // (名前, 2 回目の走査の検出, 2 回目の走査のペインのメタ)
+        type Case = (&'static str, Vec<DetectedSession>, Vec<PaneMetaSnapshot>);
+        let moved = DetectedSession {
+            tmux_session: Some("tako-9".into()),
+            pane: Some(9),
+            ..det(ID_A, 1)
+        };
+        let cases: Vec<Case> = vec![
+            ("新しい会話", vec![det(ID_A, 1), det(ID_B, 2)], vec![]),
+            (
+                "model",
+                vec![DetectedSession {
+                    model: Some("claude-fable-5".into()),
+                    ..det(ID_A, 1)
+                }],
+                vec![],
+            ),
+            ("pane / 器", vec![moved], vec![]),
+            (
+                "cwd",
+                vec![DetectedSession {
+                    agent_cwd: Some("/tmp/other".into()),
+                    ..det(ID_A, 1)
+                }],
+                vec![],
+            ),
+            (
+                "tab / ペインログ",
+                vec![det(ID_A, 1)],
+                vec![PaneMetaSnapshot {
+                    pane: 1,
+                    tab: 4,
+                    tmux_session: Some("tako-1".into()),
+                    log_file: Some("/tmp/pane-1.log".into()),
+                    ..Default::default()
+                }],
+            ),
+            // pending の寿命切れ（GC）。検出集合は変わらない
+            ("pending の GC", vec![det(ID_A, 1)], vec![]),
+        ];
+        for (i, (name, second, panes)) in cases.into_iter().enumerate() {
+            let path = temp_path(&format!("2020-struct-{i}"));
+            // GC のケースだけ、7 日の寿命が 1 回目と 2 回目の走査の間で切れる pending を置く
+            // （他のケースに置くと、どのケースも pending の GC で緑になってしまう）
+            if name == "pending の GC" {
+                SessionCatalog::mutate_at(&path, |c| {
+                    c.upsert_pending(PendingSpawn {
+                        tmux_session: Some("tako-old".into()),
+                        recorded_at: iso(T0 - PENDING_TTL_SECS + 10),
+                        ..Default::default()
+                    })
+                })
+                .unwrap();
+            }
+            let mut th = LastSeenThrottle::default();
+            sync_detected_throttled(&path, &[det(ID_A, 1)], &[], T0, &mut th).unwrap();
+            let before = std::fs::read_to_string(&path).unwrap();
+            mark(&path);
+            let now = T0 + SCAN;
+            assert_eq!(
+                sync_detected_throttled(&path, &second, &panes, now, &mut th).unwrap(),
+                SyncWrite::Structural,
+                "{name} の変化を即時に書いていない"
+            );
+            assert!(rewritten(&path), "{name}: ファイルを書いていない");
+            assert_eq!(
+                bak(&path, 1),
+                Some(format!("{MARK}{before}")),
+                "{name}: 書く前の内容を .bak.1 へ退避していない"
+            );
+            let catalog = SessionCatalog::load_from(&path).unwrap();
+            assert_eq!(catalog.entries[ID_A].last_seen_at, iso(now), "{name}");
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    /// 修正前（走査のたびに全体を書く）の内容を手元で作り、間引いた側のファイルと突き合わせる。
+    /// **どの走査の後でも**並び順（`tako sessions list`）・GC で残る集合・ペインからの逆引き
+    /// （#466）・last_seen_at 以外の内容が一致し、**書いた時点では中身まで一致する**こと
+    #[test]
+    fn issue2020_検出集合の変化で溜めた時刻ごと書き_並び順とgcと逆引きが修正前と一致する() {
+        let path = temp_path("2020-equiv");
+        // GC（500 件の上限）が走るように、古い会話で上限の手前まで埋めておく
+        let mut seed = SessionCatalog::default();
+        for i in 0..(MAX_ENTRIES - 3) {
+            seed.entries.insert(
+                format!("00000000-0000-4000-8000-{i:012}"),
+                SessionEntry {
+                    kind: "worker".into(),
+                    pane: Some(100 + (i as u64 % 7)),
+                    started_at: iso(T0 - 90_000 + i as i64),
+                    last_seen_at: iso(T0 - 86_400 + i as i64),
+                    ..Default::default()
+                },
+            );
+        }
+        crate::config_io::atomic_write(&path, &serde_yaml::to_string(&seed).unwrap()).unwrap();
+        let mut reference = seed;
+        let mut th = LastSeenThrottle::default();
+        // (走査の回数, 検出): 始まる / 終わる / 同じペインで別の会話 / 戻ってくる /
+        // 全部終わる / 窓をまたいで続く / 上限を超えて GC
+        let phases: Vec<(i64, Vec<DetectedSession>)> = vec![
+            (6, vec![det(ID_A, 1), det(ID_B, 2)]),
+            (4, vec![det(ID_A, 1), det(ID_B, 2), det(ID_C, 3)]),
+            (5, vec![det(ID_B, 2), det(ID_C, 3)]),
+            (3, vec![det(ID_B, 2), det(ID_C, 3), det(ID_D, 1)]),
+            (3, vec![det(ID_A, 1), det(ID_B, 2), det(ID_C, 3)]),
+            (3, vec![]),
+            (25, vec![det(ID_E, 4)]),
+            (3, vec![det(ID_E, 4), det(ID_F, 5)]),
+        ];
+        let panes_of = |c: &SessionCatalog| -> Vec<Option<String>> {
+            (1..=5)
+                .chain(100..107)
+                .map(|p| resolve_session_for_pane_in(c, &p.to_string()))
+                .collect()
+        };
+        let order_of = |c: &SessionCatalog| -> Vec<String> {
+            c.sorted_entries()
+                .into_iter()
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut now = T0;
+        let mut writes = 0;
+        for (scans, detected) in phases {
+            for _ in 0..scans {
+                // 修正前: 検出が空でなければその走査で全体を書いていた
+                if !detected.is_empty() {
+                    apply_detected(&mut reference, &detected, &[], &iso(now));
+                }
+                let written = sync_detected_throttled(&path, &detected, &[], now, &mut th).unwrap();
+                let file = SessionCatalog::load_from(&path).unwrap();
+                let at = format!("{}（走査 {} 回目）", iso(now), (now - T0) / SCAN);
+                assert_eq!(order_of(&file), order_of(&reference), "並び順が違う: {at}");
+                assert_eq!(
+                    panes_of(&file),
+                    panes_of(&reference),
+                    "ペインの逆引きが違う: {at}"
+                );
+                assert!(
+                    same_except_last_seen(&file, &reference),
+                    "last_seen_at 以外の内容（GC の結果を含む）が違う: {at}"
+                );
+                if written != SyncWrite::Skipped {
+                    writes += 1;
+                    assert_eq!(file, reference, "書いた時点の中身が修正前と違う: {at}");
+                }
+                now += SCAN;
+            }
+        }
+        assert_eq!(
+            reference.entries.len(),
+            MAX_ENTRIES,
+            "GC が走る筋書きになっていない"
+        );
+        assert!(
+            writes < 52 / 2,
+            "間引けていない（52 回の走査で {writes} 回書いた）"
+        );
+        // 終了時の書き出しの後は中身まで修正前と一致する
+        flush_last_seen_at(&path, now, &mut th).unwrap();
+        assert_eq!(SessionCatalog::load_from(&path).unwrap(), reference);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn issue2020_溜めた分は終了時の書き出しで最後に見えた時刻まで残りbakは回さない() {
+        let path = temp_path("2020-flush");
+        let mut th = LastSeenThrottle::default();
+        let ab = [det(ID_A, 1), det(ID_B, 2)];
+        sync_detected_throttled(&path, &ab, &[], T0, &mut th).unwrap();
+        for i in 1..=3 {
+            sync_detected_throttled(&path, &ab, &[], T0 + SCAN * i, &mut th).unwrap();
+        }
+        assert!(th.has_unflushed());
+        mark(&path);
+        // 終了は走査の間（最後の走査の 15 秒後）に来る
+        assert_eq!(
+            flush_last_seen_at(&path, T0 + SCAN * 3 + 15, &mut th).unwrap(),
+            SyncWrite::LastSeenOnly
+        );
+        assert!(rewritten(&path), "終了時に溜めた分を書いていない");
+        assert_eq!(
+            bak(&path, 1),
+            None,
+            "last_seen_at だけの保存で .bak を回した"
+        );
+        let catalog = SessionCatalog::load_from(&path).unwrap();
+        for id in [ID_A, ID_B] {
+            // 書き出した時刻ではなく、最後に見えた走査の時刻
+            assert_eq!(catalog.entries[id].last_seen_at, iso(T0 + SCAN * 3));
+        }
+        // 2 回目は溜めた分が無い = I/O しない
+        mark(&path);
+        assert_eq!(
+            flush_last_seen_at(&path, T0 + SCAN * 4, &mut th).unwrap(),
+            SyncWrite::Skipped
+        );
+        assert!(!rewritten(&path));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn issue2020_会話がすべて終わった走査で溜めた分を書く() {
+        let path = temp_path("2020-empty");
+        let mut th = LastSeenThrottle::default();
+        let ab = [det(ID_A, 1), det(ID_B, 2)];
+        sync_detected_throttled(&path, &ab, &[], T0, &mut th).unwrap();
+        sync_detected_throttled(&path, &ab, &[], T0 + SCAN, &mut th).unwrap();
+        mark(&path);
+        assert_eq!(
+            sync_detected_throttled(&path, &[], &[], T0 + SCAN * 2, &mut th).unwrap(),
+            SyncWrite::LastSeenOnly
+        );
+        let catalog = SessionCatalog::load_from(&path).unwrap();
+        assert_eq!(catalog.entries[ID_A].last_seen_at, iso(T0 + SCAN));
+        // その後の空の走査は（修正前と同じく）I/O しない
+        mark(&path);
+        assert_eq!(
+            sync_detected_throttled(&path, &[], &[], T0 + SCAN * 3, &mut th).unwrap(),
+            SyncWrite::Skipped
+        );
+        assert!(!rewritten(&path));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn issue2020_同じ内容なら書かない() {
+        let path = temp_path("2020-same");
+        let mut th = LastSeenThrottle::default();
+        let ab = [det(ID_A, 1), det(ID_B, 2)];
+        sync_detected_throttled(&path, &ab, &[], T0, &mut th).unwrap();
+        mark(&path);
+        // 同じ秒の 2 回目の走査（イベント駆動の臨時走査）と、その直後の書き出しは
+        // どちらもファイルと同じ内容 = 書かない
+        assert_eq!(
+            sync_detected_throttled(&path, &ab, &[], T0, &mut th).unwrap(),
+            SyncWrite::Skipped
+        );
+        assert!(th.has_unflushed());
+        assert_eq!(
+            flush_last_seen_at(&path, T0, &mut th).unwrap(),
+            SyncWrite::Skipped
+        );
+        assert!(!rewritten(&path), "同じ内容を書き直した");
+        assert!(!th.has_unflushed());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn issue2020_外から書き換えられた内容を潰さない() {
+        let path = temp_path("2020-external");
+        let mut th = LastSeenThrottle::default();
+        let ab = [det(ID_A, 1), det(ID_B, 2)];
+        sync_detected_throttled(&path, &ab, &[], T0, &mut th).unwrap();
+        // 別プロセスの書き込み（spawn の pending 記録 + 手で直したラベル）
+        SessionCatalog::mutate_at(&path, |c| {
+            c.upsert_pending(PendingSpawn {
+                tmux_session: Some("tako-7".into()),
+                recorded_at: iso(T0 + 5),
+                ..Default::default()
+            });
+            c.entries.get_mut(ID_A).unwrap().label = Some("手で直した".into());
+        })
+        .unwrap();
+        mark(&path);
+        assert_eq!(
+            sync_detected_throttled(&path, &ab, &[], T0 + SCAN, &mut th).unwrap(),
+            SyncWrite::Skipped
+        );
+        assert!(!rewritten(&path));
+        // 窓が過ぎて書くときも、読み直した内容（外の書き込み）の上へ時刻だけを当てる
+        let due = T0 + LAST_SEEN_FLUSH_SECS;
+        assert_eq!(
+            sync_detected_throttled(&path, &ab, &[], due, &mut th).unwrap(),
+            SyncWrite::LastSeenOnly
+        );
+        let catalog = SessionCatalog::load_from(&path).unwrap();
+        assert_eq!(catalog.entries[ID_A].label.as_deref(), Some("手で直した"));
+        assert_eq!(catalog.pending.len(), 1);
+        assert_eq!(catalog.entries[ID_A].last_seen_at, iso(due));
+        // ファイルが消された = 次の走査で検出中の会話を即時に書き直す
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            sync_detected_throttled(&path, &ab, &[], due + SCAN, &mut th).unwrap(),
+            SyncWrite::Structural
+        );
+        let catalog = SessionCatalog::load_from(&path).unwrap();
+        assert!(catalog.entries.contains_key(ID_A) && catalog.entries.contains_key(ID_B));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn issue2020_last_seen_at以外のどの項目の変化も構造の変化と読む() {
+        let base = SessionEntry {
+            kind: "worker".into(),
+            label: Some("l".into()),
+            project: Some("p".into()),
+            profile: Some("pr".into()),
+            agent: Some("claude".into()),
+            model: Some("m".into()),
+            effort: Some("high".into()),
+            issues: vec![1],
+            prompt_head: Some("h".into()),
+            cwd: Some("/w".into()),
+            tab: Some(1),
+            pane: Some(2),
+            tmux_session: Some("t".into()),
+            log_file: Some("/l".into()),
+            started_at: iso(T0),
+            last_seen_at: iso(T0),
+        };
+        /// (項目名, その項目だけを変える)
+        type FieldEdit = (&'static str, fn(&mut SessionEntry));
+        let edits: Vec<FieldEdit> = vec![
+            ("kind", |e| e.kind = "master".into()),
+            ("label", |e| e.label = None),
+            ("project", |e| e.project = None),
+            ("profile", |e| e.profile = None),
+            ("agent", |e| e.agent = None),
+            ("model", |e| e.model = None),
+            ("effort", |e| e.effort = None),
+            ("issues", |e| e.issues.clear()),
+            ("prompt_head", |e| e.prompt_head = None),
+            ("cwd", |e| e.cwd = None),
+            ("tab", |e| e.tab = None),
+            ("pane", |e| e.pane = None),
+            ("tmux_session", |e| e.tmux_session = None),
+            ("log_file", |e| e.log_file = None),
+            ("started_at", |e| e.started_at.clear()),
+        ];
+        for (name, edit) in edits {
+            let mut changed = base.clone();
+            edit(&mut changed);
+            assert!(
+                !entry_eq_except_last_seen(&base, &changed),
+                "{name} の変化を last_seen_at だけの変化と読んだ"
+            );
+        }
+        let mut seen = base.clone();
+        seen.last_seen_at = iso(T0 + SCAN);
+        assert!(entry_eq_except_last_seen(&base, &seen));
     }
 }
