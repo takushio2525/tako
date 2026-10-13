@@ -38,6 +38,12 @@ pub fn load_from(path: &Path) -> Result<TaskStore, String> {
     if !path.is_file() {
         return Ok(TaskStore::default());
     }
+    // #2031: 読んだ回数と所要を `TAKO_PERF_VERBOSE=1` の分布に出す（UI スレッドで読めば
+    // `user_tasks:read`、background なら `bg:user_tasks:read`）
+    let _span = crate::diag::perf_span("user_tasks:read");
+    if let Some(delay) = read_delay_inject() {
+        std::thread::sleep(delay);
+    }
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("user-tasks.yaml の読み取りに失敗: {e}"))?;
     if content.trim().is_empty() {
@@ -49,6 +55,47 @@ pub fn load_from(path: &Path) -> Result<TaskStore, String> {
 pub fn load() -> Result<TaskStore, String> {
     let path = store_path().ok_or("データディレクトリを解決できない")?;
     load_from(&path)
+}
+
+/// 置き場の版（#2031）。前回と同じなら中身も同じとみなし、読み直さない。
+///
+/// 書き込みは一時ファイルからの rename（`config_io::atomic_write`）なので、同じ時刻の
+/// 書き直しでも inode が変わる（unix）。不在は `None`（作られた・消えたも差分になる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    ino: u64,
+}
+
+/// 置き場の版を採る。**読む前に**採ること（読んだ後に採ると、その間の書き込みを
+/// 新しい版のまま古い中身で覚え、次の変更まで取り逃がす）
+pub fn store_stamp(path: &Path) -> Option<StoreStamp> {
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some(StoreStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        ino,
+    })
+}
+
+/// 読みを遅らせる検証専用の注入（`TAKO_2031_INJECT=slow:<ミリ秒>`。#2031）。
+/// 置き場の読みが遅い（大きい・遅いディスク）ときに UI スレッドが止まらないかを、
+/// CPU を焼かずに確かめるための口。**未設定の通常起動は変わらない**（env の読みは 1 度だけ）
+fn read_delay_inject() -> Option<std::time::Duration> {
+    static INJECT: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *INJECT.get_or_init(|| {
+        std::env::var("TAKO_2031_INJECT")
+            .ok()
+            .as_deref()
+            .and_then(|v| v.trim().strip_prefix("slow:"))
+            .and_then(|ms| ms.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+    })
 }
 
 /// ロック付き read-modify-write（`config_io`。#169 と同パターン）。

@@ -405,7 +405,7 @@ pub(super) async fn tasks_input_visual(
                     .ok()
                     .and_then(|v| v["id"].as_str().map(str::to_string));
             }
-            app.tick_user_tasks();
+            app.refresh_user_tasks();
             cx.notify();
             last
         })
@@ -913,7 +913,7 @@ pub(super) async fn tasks_input_visual(
             },
             PaneOrigin::Cli,
         );
-        app.tick_user_tasks();
+        app.refresh_user_tasks();
         app.user_tasks.expanded = Some(target.clone());
         cx.notify();
     });

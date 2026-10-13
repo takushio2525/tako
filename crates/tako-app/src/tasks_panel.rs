@@ -18,8 +18,14 @@
 //! `list` を定期的に撃つことには**もう 1 つ役目**がある。B1 は
 //! `host.prompt_delivery_state`（#1259）を **`UserTask` の dispatch が走るたびに畳み込んで**
 //! 配送を `sent` → `delivered` / `failed` へ確定させるので、この画面のポーリングが
-//! そのまま「返答が master に届いたか」の確定器になる。だから `list` は
-//! background へ逃がさない（host に触れないと永久に `sent` のまま残る）。
+//! そのまま「返答が master に届いたか」の確定器になる。
+//!
+//! ## 置き場は UI スレッドで読まない（#2031）
+//!
+//! 定期更新は dispatch の "list" を 2 段に分けて呼ぶ: host に触る**配送の観測だけ**を
+//! UI スレッドで行い（送達フローを読むだけ = I/O なし）、畳み込みの書き戻しと置き場の
+//! 読み・解釈は background へ出す。置き場の版（更新時刻・大きさ・inode）が前回と同じなら
+//! 読まない。旧実装は 2 秒ごとに UI スレッドで YAML を 2 度読み、本番で 1 回 551 ms 止まった。
 //!
 //! ## 例外（設計原則 5 の但し書き）
 //!
@@ -312,6 +318,8 @@ pub(crate) fn project_choices(tasks: &[TaskRow]) -> Vec<String> {
 #[derive(Debug, Default)]
 pub(crate) struct TasksPanel {
     pub snapshot: TasksSnapshot,
+    /// 一覧更新の background ジョブの状態（#2031）
+    pub list_poll: ListPoll,
     /// **その場で展開している 1 件**の id（`None` = どれも開いていない。#1479）。
     ///
     /// 先頭へ落とさないのが要点。旧実装は「選択が無ければ一覧の先頭」へ落として
@@ -530,14 +538,51 @@ pub(crate) fn thumbable(att: &Attachment) -> bool {
             == tako_core::open_plan::PreviewRoute::Image
 }
 
+/// #2031 の A/B。`TAKO_2031_LEGACY=1` で**同一バイナリのまま**一覧更新を修正前へ戻す
+/// （2 秒ループ・タブを開いた瞬間・「完了も表示」が UI スレッドの同期の dispatch で
+/// 置き場を毎回読む）
+pub(crate) fn legacy_2031() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2031_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// 一覧更新の background ジョブの状態（#2031）
+#[derive(Default)]
+pub(crate) struct ListPoll {
+    /// 前回読んだ正本（次のジョブへ渡す。置き場の版が同じなら読まない）
+    pub cache: tako_control::dispatch::UserTaskListCache,
+    /// 走っているジョブの数。2 秒ループは 0 のときだけ撃つ（読みが 2 秒を超えても積み上げない）
+    pub inflight: usize,
+    /// 頼んだ通し番号（同期の引き直しも 1 つ進める）
+    pub requested: u64,
+    /// 反映した通し番号（後から頼んだ結果を、先に頼んだ遅い結果で潰さない）
+    pub applied: u64,
+    /// ジョブが置き場を読んだ回数（版が同じ回は数えない。セルフテストが読みの有無を見る）
+    pub reads: u64,
+}
+
+impl std::fmt::Debug for ListPoll {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListPoll")
+            .field("inflight", &self.inflight)
+            .field("requested", &self.requested)
+            .field("applied", &self.applied)
+            .field("reads", &self.reads)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TakoApp {
     /// 定期更新 1 回ぶん（**ポーリングの止め方はここ 1 か所**）。
     ///
     /// 既存の 2 秒ループから毎 tick 呼ばれる。撃つかどうかの判断をループ側に書かず
     /// ここへ置いてあるので、**「止める処理」がどこにも無いのに止まる**
     /// （右パネルを閉じた瞬間から空振りになる）。セルフテスト項目 150 も
-    /// この関数を叩くので、検証が通る経路と本番の経路が同じ 1 本になる
-    pub(crate) fn tick_user_tasks(&mut self) {
+    /// この関数を叩くので、検証が通る経路と本番の経路が同じ 1 本になる。
+    ///
+    /// #2031: 読みは background のジョブ（[`Self::spawn_user_tasks_list`]）。前のジョブが
+    /// まだ走っていれば撃たない（置き場が遅くてもジョブを積み上げない）
+    pub(crate) fn tick_user_tasks(&mut self, cx: &mut Context<Self>) {
         // 画面が無いときは数えない（起票に気づく道は B1 の通知欄が持っている）
         if !self.panel_visible {
             return;
@@ -546,23 +591,22 @@ impl TakoApp {
         if legacy_1450_b2() {
             return;
         }
-        self.refresh_user_tasks();
+        if self.user_tasks.list_poll.inflight > 0 {
+            return;
+        }
+        self.spawn_user_tasks_list(cx);
     }
 
-    /// 一覧を引き直す（**2 秒ループと、画面を触った直後の両方**から呼ばれる）。
-    ///
-    /// `Request::UserTask{list}` の 1 経路しか通らないので、CLI / MCP が返すものと
-    /// 画面が出すものは同じ。失敗は画面に理由を残す（`load_error`）
-    pub(crate) fn refresh_user_tasks(&mut self) {
-        let all = self.user_tasks.show_done.then_some(true);
-        let request = Request::UserTask {
+    /// 一覧の要求（`Request::UserTask{list}`。CLI `tako todo list` / MCP と同じ 1 つ）
+    fn user_tasks_list_request(&self) -> Request {
+        Request::UserTask {
             action: "list".to_string(),
             id: None,
             title: None,
             body: None,
             kind: None,
             status: None,
-            all,
+            all: self.user_tasks.show_done.then_some(true),
             project: None,
             attachments: None,
             copy_texts: None,
@@ -573,10 +617,93 @@ impl TakoApp {
             via: None,
             pane: None,
             caller_role: None,
-        };
+        }
+    }
+
+    /// 一覧をその場で引き直す（**UI スレッドで待つ**同期の形。Context の無い dispatch の内側
+    /// = AI からの展開と、返答・状態遷移の直後が使う）。
+    ///
+    /// `Request::UserTask{list}` の 1 経路しか通らないので、CLI / MCP が返すものと
+    /// 画面が出すものは同じ。失敗は画面に理由を残す（`load_error`）
+    pub(crate) fn refresh_user_tasks(&mut self) {
+        let request = self.user_tasks_list_request();
+        // 走っている background のジョブの結果（これより古い）で上書きさせない
+        self.user_tasks.list_poll.requested += 1;
+        self.user_tasks.list_poll.applied = self.user_tasks.list_poll.requested;
+        // 失敗は `apply_user_tasks_list` が通知欄へ出す（前回の眺めは消さない）
         match tako_control::dispatch(self, request, PaneOrigin::User) {
-            Ok(value) => {
-                self.user_tasks.snapshot = parse_list(&value);
+            Ok(value) => self.apply_user_tasks_list(Ok(parse_list(&value))),
+            Err(e) => self.apply_user_tasks_list(Err(e)),
+        }
+    }
+
+    /// 一覧を background で引き直す（#2031。2 秒ループ・タブを開いた瞬間・「完了も表示」）。
+    ///
+    /// dispatch の "list" と同じ 2 段: ① 配送の観測（host の送達フローを読むだけ）は UI
+    /// スレッド、② 畳み込みの書き戻しと置き場の読み・解釈（`parse_list` まで）は background。
+    /// UI スレッドは着いた結果を差し替えるだけ
+    pub(crate) fn spawn_user_tasks_list(&mut self, cx: &mut Context<Self>) {
+        // A/B（`TAKO_2031_LEGACY=1`）: 修正前 = UI スレッドの同期の dispatch で毎回読む
+        if legacy_2031() {
+            self.refresh_user_tasks();
+            return;
+        }
+        let request = self.user_tasks_list_request();
+        let observed =
+            tako_control::dispatch::user_task_list_observe(self, &self.user_tasks.list_poll.cache);
+        let cache = self.user_tasks.list_poll.cache.clone();
+        self.user_tasks.list_poll.requested += 1;
+        self.user_tasks.list_poll.inflight += 1;
+        let seq = self.user_tasks.list_poll.requested;
+        let job = cx.background_executor().spawn(async move {
+            tako_control::dispatch::user_task_list_load(&request, &cache, observed).map(|loaded| {
+                let snapshot = parse_list(&loaded.value);
+                (loaded.cache, loaded.read, snapshot)
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                let _s = tako_control::diag::perf_span("user_tasks:land");
+                let poll = &mut app.user_tasks.list_poll;
+                poll.inflight = poll.inflight.saturating_sub(1);
+                // 後から頼んだ引き直しが先に着いていたら、古い結果で上書きしない
+                if seq <= poll.applied {
+                    return;
+                }
+                poll.applied = seq;
+                // 変わったときだけ描き直す（2 秒ごとに無駄なフレームを組まない）
+                let changed = match &result {
+                    Ok((_, _, snapshot)) => {
+                        !app.user_tasks.loaded
+                            || app.user_tasks.load_error.is_some()
+                            || *snapshot != app.user_tasks.snapshot
+                    }
+                    Err(_) => true,
+                };
+                let result = result.map(|(cache, read, snapshot)| {
+                    let poll = &mut app.user_tasks.list_poll;
+                    poll.cache = cache;
+                    poll.reads += u64::from(read);
+                    snapshot
+                });
+                app.apply_user_tasks_list(result);
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 引き直した結果を画面の状態へ（同期の形と background の形で共有）
+    fn apply_user_tasks_list(
+        &mut self,
+        result: Result<TasksSnapshot, tako_control::DispatchError>,
+    ) {
+        match result {
+            Ok(snapshot) => {
+                self.user_tasks.snapshot = snapshot;
                 self.user_tasks.loaded = true;
                 self.user_tasks.load_error = None;
             }
@@ -1264,7 +1391,9 @@ impl TakoApp {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.user_tasks.show_done = !this.user_tasks.show_done;
                         this.user_tasks.collapse();
-                        this.refresh_user_tasks();
+                        // #2031: 引き直しは background（置き場の版が同じなら読まずに、
+                        // 前回の正本から新しい取得条件で組み直す）
+                        this.spawn_user_tasks_list(cx);
                         cx.notify();
                     })),
                 ),
