@@ -84,7 +84,13 @@ fn 子プロセス不在の分岐は保持規則を通る() {
     let idx = source
         .find("if !has_children {")
         .expect("has_children の前段ガードが見つからない（#368 の構造が変わった）");
-    let block = &source[idx..idx + 900];
+    // 900 バイト目が多バイト文字（日本語のコメント）の途中に来ても落ちないよう、
+    // 文字境界まで戻して切る（#2020 で同じ区間の agent_resume_watchdog が踏んだ）
+    let mut end = (idx + 900).min(source.len());
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    let block = &source[idx..end];
     assert!(
         block.contains("apply_claude_resume_sessions(&[])"),
         "has_children が false の分岐が保持規則を通っていない（#1076）。\n\
