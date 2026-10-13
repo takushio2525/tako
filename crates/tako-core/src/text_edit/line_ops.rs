@@ -16,13 +16,16 @@
 //! - 対象の行は「選択が触れる行（無ければカーソルの行）」。選択の終わりが行頭にあれば
 //!   その行は含めない（行を丸ごと選ぶと終わりが次の行頭に来る）。Tab の行インデントと同じ規則で、
 //!   決めるのは [`TextBuffer::line_block`] の 1 実装
-//! - コメント記号は**表の 1 行**で決まる（[`comment_syntax_in`]）。ここのロジックは記号の文字列を
-//!   1 つも持たない（番犬 `issue1692_line_ops_watchdog` が名指す）
+//! - コメント記号は言語の同定の正本 `file_type`（#1948）の**行の `comment` 列**で決まる
+//!   （[`comment_syntax_in`]。別の表は持たない）。ここのロジックは記号の文字列を 1 つも持たない
+//!   （番犬 `issue1692_line_ops_watchdog` が名指す）
 
 use std::ops::Range;
 use std::path::Path;
 
 use thiserror::Error;
+
+use crate::file_type::{self, FileType};
 
 use super::{
     byte_for_display_column, display_width, line_break_len_after, line_break_len_before, Edit,
@@ -95,11 +98,12 @@ impl LineOperation {
 /// 行操作を当てられない理由（#1692）。**本文は 1 バイトも変えずに**返す
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LineOpError {
-    #[error("{name} のコメント記号を知らない（コメント記号の表に行が無い形式）")]
+    #[error("{name} のコメント記号を知らない（コメントの記号を持たない形式）")]
     NoCommentSyntax { name: String },
 }
 
-/// コメントの書き方（#1692）。言語ごとの値は表（[`COMMENT_TABLE`]）の列が持つ
+/// コメントの書き方（#1692）。言語ごとの値は言語の同定の正本（[`file_type::TABLE`]）の
+/// `comment` 列が持つ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentSyntax {
     /// 行コメント。インデントの直後へ記号と空白 1 つを挿す
@@ -159,102 +163,17 @@ impl CommentSyntax {
     }
 }
 
-/// コメント記号の表の 1 行（#1692）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommentRow {
-    /// 拡張子（先頭の `.` を含まない小文字。照合は大文字小文字を問わない）
-    pub extensions: &'static [&'static str],
-    /// ファイル名で決まる形式（拡張子より先に引く）
-    pub file_names: &'static [&'static str],
-    pub syntax: CommentSyntax,
-}
-
-const fn by_ext(extensions: &'static [&'static str], syntax: CommentSyntax) -> CommentRow {
-    CommentRow {
-        extensions,
-        file_names: &[],
-        syntax,
-    }
-}
-
-const SLASHES: CommentSyntax = CommentSyntax::Line("//");
-const HASH: CommentSyntax = CommentSyntax::Line("#");
-const DASHES: CommentSyntax = CommentSyntax::Line("--");
-
-/// コメント記号の表（**正本**。1 形式 = 1 行で、行を足すだけで言語が増える）。
-///
-/// 表に無い形式（プレーンテキスト・JSON）はコメントの操作を断る（[`LineOpError`]）。
-/// 言語の同定の正本 `file_type`（#1948）が着地したら、その表の列へ移す
-pub const COMMENT_TABLE: &[CommentRow] = &[
-    by_ext(
-        &[
-            "c", "cpp", "cc", "cxx", "h", "hh", "hpp", "hxx", "ino", "rs", "go", "js", "mjs",
-            "cjs", "jsx", "ts", "mts", "cts", "tsx", "java", "kt", "scala", "swift", "cs", "fs",
-            "dart", "zig", "php", "jsonc", "scss", "less",
-        ],
-        SLASHES,
-    ),
-    CommentRow {
-        extensions: &[
-            "py", "pyi", "pyw", "sh", "bash", "zsh", "command", "rb", "pl", "yml", "yaml", "r",
-            "jl", "ex", "exs", "nim", "ps1", "mk", "toml", "cmake",
-        ],
-        file_names: &[
-            "Makefile",
-            "GNUmakefile",
-            "CMakeLists.txt",
-            "Dockerfile",
-            ".gitignore",
-            ".dockerignore",
-        ],
-        syntax: HASH,
-    },
-    by_ext(&["sql", "lua", "hs"], DASHES),
-    by_ext(&["clj", "ini"], CommentSyntax::Line(";")),
-    by_ext(&["tex"], CommentSyntax::Line("%")),
-    by_ext(&["vb"], CommentSyntax::Line("'")),
-    by_ext(&["bat", "cmd"], CommentSyntax::Line("REM")),
-    by_ext(
-        &["md", "markdown", "html", "htm", "xml", "svg", "vue"],
-        CommentSyntax::Block {
-            open: "<!--",
-            close: "-->",
-        },
-    ),
-    by_ext(
-        &["css"],
-        CommentSyntax::Block {
-            open: "/*",
-            close: "*/",
-        },
-    ),
-];
-
-/// パスのコメント記号（表 [`COMMENT_TABLE`] を引く）
+/// パスのコメント記号（言語の同定の正本 [`file_type::TABLE`] の `comment` 列を引く）。
+/// 表に無い形式・記号を持たない形式は `None`
 pub fn comment_syntax_for(path: &Path) -> Option<CommentSyntax> {
-    comment_syntax_in(COMMENT_TABLE, path)
+    comment_syntax_in(file_type::TABLE, path)
 }
 
-/// 渡した表からパスのコメント記号を引く（**ファイル名 → 拡張子**の順。大文字小文字を問わない）。
-/// 表を引数で受けるのは、単体が「表に 1 行足すだけで結果が変わる」を表のコピーで確かめるため
-pub fn comment_syntax_in(table: &[CommentRow], path: &Path) -> Option<CommentSyntax> {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
-    table
-        .iter()
-        .find(|row| row.file_names.iter().any(|n| n.eq_ignore_ascii_case(name)))
-        .or_else(|| {
-            table
-                .iter()
-                .find(|row| row.extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)))
-        })
-        .map(|row| row.syntax)
+/// 渡した形式の表からパスのコメント記号を引く（同定は [`file_type::identify_in`] の 1 実装 =
+/// ファイル名 → 拡張子の順・大文字小文字を問わない）。表を引数で受けるのは、単体が
+/// 「表に 1 行足すだけで結果が変わる」を表のコピーで確かめるため
+pub fn comment_syntax_in(table: &[FileType], path: &Path) -> Option<CommentSyntax> {
+    file_type::identify_in(table, path).and_then(|row| row.comment)
 }
 
 /// 行頭の空白（半角スペースとタブだけ。インデントとして数えるもの）
@@ -713,11 +632,12 @@ mod tests {
         }
     }
 
-    /// 受け入れ条件 3: 表に 1 行足すだけで結果が変わる（表以外は同じコードを通る）
+    /// 受け入れ条件 3: 言語の同定の表（file_type）に 1 行足すだけで結果が変わる
+    /// （表以外は同じコードを通る。足す行は `comment` 列だけを持ち、他は既定）
     #[test]
     fn 表に1行足すだけでコメントが効くようになる() {
         let path = Path::new("notes.zz");
-        let mut rows = COMMENT_TABLE.to_vec();
+        let mut rows = file_type::TABLE.to_vec();
         let mut b = buffer("notes.zz", "alpha\n");
         assert_eq!(comment_syntax_in(&rows, path), None);
         assert_eq!(
@@ -727,10 +647,11 @@ mod tests {
             })
         );
         assert_eq!(b.text(), "alpha\n", "断ったら本文は変えない");
-        rows.push(CommentRow {
+        rows.push(FileType {
+            id: "zz",
             extensions: &["zz"],
-            file_names: &[],
-            syntax: CommentSyntax::Line("%%"),
+            comment: Some(CommentSyntax::Line("%%")),
+            ..file_type::CODE
         });
         b.comment_lines(LineOperation::ToggleComment, comment_syntax_in(&rows, path))
             .unwrap();
@@ -914,28 +835,40 @@ mod tests {
         assert_eq!(LineOperation::from_name("move_up"), None);
     }
 
-    /// 表の拡張子・ファイル名は 2 行に重ならない（先に並んだ行が黙って勝つ）
+    /// 記号は file_type の行で引く（重複の検査は file_type の単体 `表の値は重複しない` が持つ）
     #[test]
-    fn 表の値は重複しない() {
-        let mut seen = std::collections::HashSet::new();
-        for row in COMMENT_TABLE {
-            for ext in row.extensions {
-                assert_eq!(*ext, ext.to_ascii_lowercase(), "拡張子は小文字で書く");
-                assert!(seen.insert(format!(".{ext}")), "拡張子 {ext} が 2 行にある");
-            }
-            for name in row.file_names {
-                assert!(
-                    seen.insert(name.to_ascii_lowercase()),
-                    "ファイル名 {name} が 2 行にある"
-                );
-            }
-        }
+    fn 記号はfile_typeの行で引く() {
+        let hash = Some(CommentSyntax::Line("#"));
+        let slashes = Some(CommentSyntax::Line("//"));
         // ファイル名は拡張子より先に引く（`CMakeLists.txt` は txt = 記号なしにならない）
-        assert_eq!(
-            comment_syntax_for(Path::new("proj/CMakeLists.txt")),
-            Some(HASH)
-        );
+        assert_eq!(comment_syntax_for(Path::new("proj/CMakeLists.txt")), hash);
         assert_eq!(comment_syntax_for(Path::new("notes.txt")), None);
-        assert_eq!(comment_syntax_for(Path::new("Main.RS")), Some(SLASHES));
+        assert_eq!(comment_syntax_for(Path::new("Main.RS")), slashes);
+        assert_eq!(comment_syntax_for(Path::new("Makefile")), hash);
+        assert_eq!(comment_syntax_for(Path::new("sketch.ino")), slashes);
+        assert_eq!(
+            comment_syntax_for(Path::new("q.sql")),
+            Some(CommentSyntax::Line("--"))
+        );
+        // 表に無い形式・記号を持たない形式（JSON）は記号なし
+        assert_eq!(comment_syntax_for(Path::new("data.json")), None);
+        assert_eq!(comment_syntax_for(Path::new("a.unknownext")), None);
+        // 行コメントを持たない形式は囲み
+        assert!(matches!(
+            comment_syntax_for(Path::new("index.html")),
+            Some(CommentSyntax::Block { .. })
+        ));
+        // コードとして編集する形式の行（言語）は、記号を持たない理由が無い限り記号を持つ
+        // （行を足すときに `comment` を書き忘れると、⌘/ が理由を返すだけになる）
+        let without: Vec<&str> = file_type::TABLE
+            .iter()
+            .filter(|row| {
+                row.preview == crate::open_plan::PreviewRoute::Code
+                    && row.enter != file_type::EnterRule::InheritOnly
+                    && row.comment.is_none()
+            })
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(without, ["json", "jupyter"], "記号を持たないコードの行");
     }
 }

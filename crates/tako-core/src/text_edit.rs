@@ -33,8 +33,7 @@ use crate::platform::support::Platform;
 // 行単位の操作（複製・移動・行インデント・コメントの付け外し。#1692）
 mod line_ops;
 pub use line_ops::{
-    comment_syntax_for, comment_syntax_in, CommentRow, CommentSyntax, LineOpError, LineOperation,
-    COMMENT_TABLE,
+    comment_syntax_for, comment_syntax_in, CommentSyntax, LineOpError, LineOperation,
 };
 
 /// undo 履歴に積む操作の数の上限（#195）

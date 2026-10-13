@@ -20,10 +20,6 @@
 
 ---
 
-## 2026-10-11（#1989: GitResolveAgent・StaleBinary status・tmux の書き込み系を background へ・agent CLI の所在確認を上限つきへ）
-- 解消エージェントは git の走査と CLI の所在を先取り、`StaleBinary status` / `TmuxKill` / `TmuxResize` / `TmuxSelectWindow` は background のジョブ、`TmuxOpen` は socket・存在・グループを先取り、`TmuxCleanup` は host が守るセッションだけ集めて回収の本体は background。`locate` は `find_with_timeout` + 置き場所だけ（打ち切りは `LookupTimedOut`）。GUI のボタン 5 つも `dispatch_off_ui`。A/B `TAKO_1989_LEGACY=1`・番犬は #1984 のものへ注入 17 通り
-- 実測: `scripts/test-ui-thread-offload-1989.sh` 修正後 ⑦〜⑭・E5 通過（別の要求 0.03〜0.05 秒・spawn は上限 2 秒で 2.07 秒に理由つき）/ 修正前 8 FAIL（4.0 秒〜打ち切り・spawn は返らない）。再描画上限の CPU は蓋閉じのまま未実測
-
 ## 2026-10-12（#1992 S0: PC リソース管理の設計 = 観測・順番待ち `tako queue`・優先度・ETA・見せ方・CLI / MCP・AI の運用・Windows と子 Issue 8 本）
 - `.agent/plans/2026-10-resource-manager.md`: 観測（全プロセス走査）+ 明示の入口 `tako queue <cmd>` + 透過の cargo jobserver（`CARGO_MAKEFLAGS` の fifo）の 3 層。調停役は `ipc::submit` の手前で答え UI スレッドを通らない・再起動をまたぐ・tako 不在は待たずに走る。メモリ圧 warn は 1 件ずつ・critical で止める。MCP は `tako_queue` 1 本（約 1.8 KB）。判断点 10 個（§11）
 - 実測（読み取りのみ）: 機全体 0.008 ms・全 1,320 プロセス走査 CPU 5.2 ms（5 秒間隔で 1 コアの 0.10%）・`ri_user_time` は mach tick・warn は普段の 42%・claude 1 本は子孫込み約 0.6 GB・cargo 1.95 は外の fifo jobserver に従う・tmux 3.6b は OSC 9;4 を通さない。子 Issue #1993〜#2000
@@ -55,6 +51,7 @@
 ## 2026-10-13（#2009: 見えていないプレビューを 30 秒で手放し、キャッシュの実効上限を見えている量に合わせた）
 - 内訳（隔離 GUI・release・14 タブ / 器つき端末 28 / プレビュー 8）: 修正前 943 MB のうち IOAccelerator 255 MB はほぼ全部が裏のプレビュー画像の GPU テクスチャ。`sweep_preview_memory`（`pane_visibility` が Hidden で 30 秒）がデコード結果・PDF の表示中と前後以外の PNG（並びは空白で保つ）・動画のフレームと止まったプレイヤー（`VideoResume`）を手放し、表に戻すと作り直す。実効上限 = 見えている量 × 2（下限 128 MiB・天井は設定）。`tako preview-cache` に `panes` ほか。A/B `TAKO_2009_LEGACY=1`・カタログ +281 B
 - 実測: `scripts/test-preview-memory-2009.sh` 8 PASS（IOAccelerator 255 → 4.1 MB・LRU 314 → 0・元データ 70 → 8 MB・総量 943 → 459〜664 MB・visual は戻した絵が画素一致・旧は ② で落ちる）。器のペイン 1 本 0.23〜0.26 MB（tmux と二重に持たない = (5) は入れない）。残る heap の大半は malloc が抱える解放済みの空き（`MallocLargeCache=0` で 325 → 65 MB = 提案）
+
 ## 2026-10-13（#1692: エディタの行の操作 = 複製・移動・行ごとのインデント・行コメントの付け外しを TextBuffer の 1 実装に入れ、打鍵・CLI・MCP を 1:1 にした）
-- 本体 `text_edit/line_ops.rs`（1 操作 = 1 回の編集 = undo 1 回・移動は既存の改行を並べ替えるだけ = CRLF に LF を混ぜない・対象行は `line_block` の 1 実装で ⇧Tab と共有・記号は表の 1 行・記号の無い形式は理由を返す = `EditorCommand::apply` が `Result`）。打鍵は macOS ⌥↑↓ / ⇧⌥↑↓ / ⌘/ / ⌘] ⌘[・Windows は Ctrl 段（Alt+↑↓ はペインのフォーカス移動）・⌘/ ⌘] ⌘[ は shift を受けない（⇧⌘] はタブ切替）。CLI `tako edit line <操作>` / MCP `tako_preview_edit` の `command`（`line-*`）・カタログ +304 B
-- 実測: `scripts/test-line-ops-1692.sh` 51 PASS（実打鍵 6 相・CLI / MCP 18 手順で保存後のファイルがバイト一致・応答が字面一致・空 / 改行なし / CRLF / 記号なし）。注入 6 通りで単体・番犬 `issue1692_line_ops_watchdog`・衝突の番犬が file:line で名指し。コメント記号の表は #2005（file_type）の着地後にその列へ移す
+- 本体 `text_edit/line_ops.rs`（1 操作 = 1 回の編集 = undo 1 回・移動は既存の改行を並べ替えるだけ = CRLF に LF を混ぜない・対象行は `line_block` の 1 実装で ⇧Tab と共有・記号は file_type（#1948）の行の `comment` 列・記号の無い形式は理由を返す = `EditorCommand::apply` が `Result`）。打鍵は macOS ⌥↑↓ / ⇧⌥↑↓ / ⌘/ / ⌘] ⌘[・Windows は Ctrl 段（Alt+↑↓ はペインのフォーカス移動）・⌘/ ⌘] ⌘[ は shift を受けない（⇧⌘] はタブ切替）。CLI `tako edit line <操作>` / MCP `tako_preview_edit` の `command`（`line-*`）・カタログ +304 B
+- 実測: `scripts/test-line-ops-1692.sh` 51 PASS（実打鍵 6 相・CLI / MCP 18 手順で保存後のファイルがバイト一致・応答が字面一致・空 / 改行なし / CRLF / 記号なし）。注入 6 通りで単体・番犬 `issue1692_line_ops_watchdog`・衝突の番犬が file:line で名指し

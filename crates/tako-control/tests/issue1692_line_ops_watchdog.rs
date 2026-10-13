@@ -6,7 +6,7 @@
 //! CLI / MCP の配線は `issue1652_editor_keys_watchdog` の `打鍵とcliとmcpは同じ口を通る` が見る。
 //! ここは**入れ方の形**だけを見る:
 //!
-//! 1. [`行操作のロジックはコメント記号を直書きしない`] — 言語ごとの記号は表の行が持つ。
+//! 1. [`行操作のロジックはコメント記号を直書きしない`] — 言語ごとの記号は file_type の行の `comment` 列が持つ。
 //!    ロジックへ `"#"` や `"//"` を書いた形（表の外で言語を足す = 受け入れ条件「表以外の
 //!    コード変更 0 行」が崩れる）
 //! 2. [`対象の行の決め方は1実装`] — Tab の行インデント（`shift_lines`）と行操作が別々に
@@ -20,8 +20,9 @@
 
 use std::path::{Path, PathBuf};
 
+use tako_core::file_type;
 use tako_core::source_scan::fn_head_name;
-use tako_core::text_edit::{CommentSyntax, COMMENT_TABLE};
+use tako_core::text_edit::CommentSyntax;
 
 // 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**
 #[path = "common/production_range.rs"]
@@ -168,11 +169,13 @@ fn string_literals(text: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// 表に載っている記号すべて（行コメントの記号・囲みの始まりと終わり）
+/// 言語の同定の表（file_type）の `comment` 列に載っている記号すべて
+/// （行コメントの記号・囲みの始まりと終わり）
 fn table_tokens() -> Vec<&'static str> {
-    let mut tokens: Vec<&str> = COMMENT_TABLE
+    let mut tokens: Vec<&str> = file_type::TABLE
         .iter()
-        .flat_map(|row| match row.syntax {
+        .filter_map(|row| row.comment)
+        .flat_map(|syntax| match syntax {
             CommentSyntax::Line(token) => vec![token],
             CommentSyntax::Block { open, close } => vec![open, close],
         })
@@ -182,7 +185,7 @@ fn table_tokens() -> Vec<&'static str> {
     tokens
 }
 
-// --- 1) 記号は表の行が持つ ------------------------------------------------------
+// --- 1) 記号は file_type の行が持つ ------------------------------------------------------
 
 /// 行操作のロジック（記号の判定・付け外し・表の引き方）は記号の文字列を 1 つも持たない。
 /// 記号を直書きした行を file:line で名指す（`if ext == "py" { "#" }` の形へ戻すと、
@@ -192,7 +195,7 @@ fn 行操作のロジックはコメント記号を直書きしない() {
     let tokens = table_tokens();
     assert!(
         tokens.len() >= 5,
-        "{LINE_OPS}:1 コメント記号の表を読めていない（{tokens:?}）"
+        "crates/tako-core/src/file_type.rs:1 comment 列を読めていない（{tokens:?}）"
     );
     let mut found = Vec::new();
     for name in [
@@ -218,7 +221,7 @@ fn 行操作のロジックはコメント記号を直書きしない() {
             {
                 found.push(format!(
                     "{} fn {name} が記号 {token:?} を直書きしている（\"{literal}\"）。\
-                     言語ごとの記号はコメント記号の表の行へ書く",
+                     言語ごとの記号は file_type の行の comment 列へ書く",
                     b.at(b.line_at(at))
                 ));
             }
