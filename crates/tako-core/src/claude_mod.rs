@@ -69,6 +69,17 @@ pub const VERSION_PLACEHOLDER: &str = "__TAKO_MOD_VERSION__";
 pub const FRESH_FOR: Duration = Duration::from_secs(45);
 /// mod が変化の無いときに送る間隔（`register.ts` の `HEARTBEAT_MS` と同じ値。単体テストが突き合わせる）
 pub const HEARTBEAT: Duration = Duration::from_secs(15);
+/// 監視（`worker_status` / `orchestrator self` / `report`）が mod の報告を答えにして
+/// `claude agents --json` を起こさない鮮度（#2017。[`monitor_plan`]）。
+///
+/// heartbeat（15 秒）+ 余裕 5 秒（flush は 1 秒刻み・`tako mod report` の往復）。生きている mod は
+/// 無変化でも 15 秒ごとに報告するので、これを過ぎた報告は「mod が止まった / claude が `ended` を
+/// 送れずに落ちた」の疑い = 走査へ落として gone を拾う。値を一次ソースに使う期限 [`FRESH_FOR`]
+/// （45 秒）より短くするのは、落ちた claude を走査が拾うまでの遅れを heartbeat 1 回ぶんに抑えるため
+pub const MONITOR_SKIP_FOR: Duration = Duration::from_secs(20);
+/// #2017 の A/B（同一バイナリで修正前 = 監視は mod の有無にかかわらず全アカウントを
+/// ログインシェル経由で走査する）
+pub const MONITOR_LEGACY_ENV: &str = "TAKO_2017_LEGACY";
 /// 報告の契約の版（`register.ts` / `types/index.d.ts` の `schema`）
 pub const SCHEMA: u32 = 1;
 /// 帯・サイドバーを描かない A/B の入口（S3 #1881）。報告の受け取りと一次ソース化（S1 / S2）は
@@ -434,6 +445,11 @@ pub fn cards_legacy() -> bool {
 /// #1903 の A/B（[`LIMITS_LEGACY_ENV`]）が立っているか
 pub fn limits_legacy() -> bool {
     std::env::var_os(LIMITS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// #2017 の A/B（[`MONITOR_LEGACY_ENV`]）が立っているか
+pub fn monitor_legacy() -> bool {
+    std::env::var_os(MONITOR_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
 /// 一覧の 1 項目が tako の mod の置き場か（どのインスタンスの data dir でも）。
@@ -861,6 +877,83 @@ pub fn ctx_input(
     match looked_up {
         Ok(stored) => crate::ctx_usage::ModCtxInput::Fresh(stored.report.ctx()),
         Err(why) => crate::ctx_usage::ModCtxInput::Unavailable(why.code()),
+    }
+}
+
+/// 監視がペインの会話 ID・状態をどこから採るか（#2017。[`monitor_plan`] の答え）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorPlan {
+    /// mod の報告が答え。`claude agents --json` を起こさない
+    Mod {
+        /// 報告が運んだ会話 ID（`register.ts` の `$.session.id()`）
+        session_id: String,
+    },
+    /// 走査へ落とす。`why` は応答の `agents_scan.reason`（[`ModUnavailable::code`] と同じ語彙 +
+    /// `mod_aging` / `mod_no_session` / `session_mismatch`）
+    Scan { why: &'static str },
+}
+
+impl MonitorPlan {
+    /// 走査を省いたか
+    pub fn skips_scan(&self) -> bool {
+        matches!(self, MonitorPlan::Mod { .. })
+    }
+
+    /// 応答の `agents_scan`（CLI / MCP の両方が同じ JSON を読む）
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            MonitorPlan::Mod { .. } => {
+                serde_json::json!({ "skipped": true, "reason": "mod_fresh" })
+            }
+            MonitorPlan::Scan { why } => serde_json::json!({ "skipped": false, "reason": why }),
+        }
+    }
+}
+
+/// 監視の状態を mod の報告で答えるか、`claude agents --json` の走査へ落とすか（#2017。純関数）。
+///
+/// mod の報告で答えるのは次がすべて揃うときだけ（どれか欠けたら従来どおり走査 = 判定は変えない）:
+///
+/// 1. 引き当てが成功（[`lookup`]。`FRESH_FOR` 以内・注入済み・A/B の S2 が立っていない）
+/// 2. 最後の報告が [`MONITOR_SKIP_FOR`] 以内（heartbeat が届き続けている = claude は生きている）
+/// 3. 報告が会話 ID を持つ（`claude agents --json` が返す答えの片方。無ければ答えにならない）
+/// 4. 呼び出し側が会話 ID を名指ししている（レジストリの記録）なら、報告の会話 ID と同じ
+///    （`/clear` 等で食い違うなら、名指しの会話について走査が答える = 修正前と同じ判定）
+///
+/// `legacy` は [`monitor_legacy`] の値（テストは env を触らずに両アームを検査できる）
+pub fn monitor_plan(
+    looked_up: &Result<&StoredReport, ModUnavailable>,
+    now: Instant,
+    expected_session: Option<&str>,
+    legacy: bool,
+) -> MonitorPlan {
+    if legacy {
+        return MonitorPlan::Scan { why: "legacy_env" };
+    }
+    let stored = match looked_up {
+        Ok(stored) => stored,
+        Err(why) => return MonitorPlan::Scan { why: why.code() },
+    };
+    if now.saturating_duration_since(stored.received) > MONITOR_SKIP_FOR {
+        return MonitorPlan::Scan { why: "mod_aging" };
+    }
+    let Some(session_id) = stored
+        .report
+        .session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    else {
+        return MonitorPlan::Scan {
+            why: "mod_no_session",
+        };
+    };
+    if expected_session.is_some_and(|expected| expected != session_id) {
+        return MonitorPlan::Scan {
+            why: "session_mismatch",
+        };
+    }
+    MonitorPlan::Mod {
+        session_id: session_id.to_string(),
     }
 }
 
@@ -3433,5 +3526,158 @@ mod tests {
             ..input(Default::default(), false, false)
         });
         assert_eq!(empty.cards.map(|c| c.items.len()), Some(0));
+    }
+
+    // --- #2017: 監視の走査を mod の報告で置き換える判断 ---------------------------
+
+    fn stored_2017(session_id: Option<&str>, received: Instant) -> StoredReport {
+        let mut v = report_json();
+        match session_id {
+            Some(sid) => v["session_id"] = serde_json::json!(sid),
+            None => {
+                v.as_object_mut().unwrap().remove("session_id");
+            }
+        }
+        stored(parse_report(v).unwrap(), received, None)
+    }
+
+    /// 閾値の関係: 生きている mod（heartbeat 15 秒）は走査へ落ちず、値を使う期限（45 秒）より先に落とす
+    #[test]
+    fn issue2017_走査を省く鮮度はheartbeatより長くfresh_forより短い() {
+        assert!(
+            MONITOR_SKIP_FOR > HEARTBEAT,
+            "生きている mod の報告の合間で走査へ落ちる"
+        );
+        assert!(
+            MONITOR_SKIP_FOR < FRESH_FOR,
+            "落ちた claude（ended を送れない）を走査が拾うのが FRESH_FOR まで遅れる"
+        );
+    }
+
+    /// 新しい報告に会話 ID があれば走査しない。閾値ちょうどは省き、1 ms 過ぎたら落とす
+    #[test]
+    fn issue2017_新しい報告があれば走査しない_閾値ちょうどの境界() {
+        let t0 = Instant::now();
+        let s = stored_2017(Some("s-1"), t0);
+        let plan = |now: Instant| monitor_plan(&Ok(&s), now, None, false);
+        assert_eq!(
+            plan(t0),
+            MonitorPlan::Mod {
+                session_id: "s-1".into()
+            }
+        );
+        assert_eq!(
+            plan(t0 + MONITOR_SKIP_FOR),
+            MonitorPlan::Mod {
+                session_id: "s-1".into()
+            },
+            "閾値ちょうどは省く（is_fresh と同じ <=）"
+        );
+        assert_eq!(
+            plan(t0 + MONITOR_SKIP_FOR + Duration::from_millis(1)),
+            MonitorPlan::Scan { why: "mod_aging" },
+            "heartbeat が途絶えた報告で走査を省くと、落ちた claude の gone を拾えない"
+        );
+    }
+
+    /// mod が使えない・答えにならないときは必ず走査へ落ちる（理由つき）
+    #[test]
+    fn issue2017_modが無い古い止まった報告は走査へ落ちる() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let cases: Vec<(Result<&StoredReport, ModUnavailable>, &str)> = vec![
+            (Err(ModUnavailable::Absent), "mod_absent"),
+            (Err(ModUnavailable::Stale { age_secs: 50 }), "mod_stale"),
+            (Err(ModUnavailable::Legacy), "legacy_env"),
+            (
+                Err(ModUnavailable::NotInjected(OffReason::Disabled)),
+                OffReason::Disabled.code(),
+            ),
+        ];
+        for (looked_up, why) in cases {
+            assert_eq!(
+                monitor_plan(&looked_up, now, None, false),
+                MonitorPlan::Scan { why },
+                "{why}"
+            );
+        }
+        let no_sid = stored_2017(None, t0);
+        assert_eq!(
+            monitor_plan(&Ok(&no_sid), now, None, false),
+            MonitorPlan::Scan {
+                why: "mod_no_session"
+            }
+        );
+        let empty_sid = stored_2017(Some(""), t0);
+        assert_eq!(
+            monitor_plan(&Ok(&empty_sid), now, None, false),
+            MonitorPlan::Scan {
+                why: "mod_no_session"
+            }
+        );
+    }
+
+    /// 名指しの会話 ID（レジストリ）と報告が食い違えば走査（修正前と同じ判定）。一致なら省く
+    #[test]
+    fn issue2017_名指しの会話と食い違えば走査へ落ちる() {
+        let t0 = Instant::now();
+        let s = stored_2017(Some("s-new"), t0);
+        assert_eq!(
+            monitor_plan(&Ok(&s), t0, Some("s-old"), false),
+            MonitorPlan::Scan {
+                why: "session_mismatch"
+            }
+        );
+        assert!(monitor_plan(&Ok(&s), t0, Some("s-new"), false).skips_scan());
+    }
+
+    /// A/B: 立っていれば新しい報告があっても走査（修正前）
+    #[test]
+    fn issue2017_legacyでは新しい報告があっても走査する() {
+        let t0 = Instant::now();
+        let s = stored_2017(Some("s-1"), t0);
+        assert_eq!(
+            monitor_plan(&Ok(&s), t0, None, true),
+            MonitorPlan::Scan { why: "legacy_env" }
+        );
+    }
+
+    /// 引き当て（ModHub::lookup）と通しで: 報告が止まると 20 秒で走査、45 秒で引き当て自体が失効
+    #[test]
+    fn issue2017_報告が止まると走査へ落ちる_hubを通す() {
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        hub.accept(7, parse_report(report_json()).unwrap(), t0);
+        let plan = |hub: &ModHub, now: Instant| monitor_plan(&hub.lookup(7, now), now, None, false);
+        assert!(plan(&hub, t0 + HEARTBEAT).skips_scan());
+        assert_eq!(
+            plan(&hub, t0 + Duration::from_secs(30)),
+            MonitorPlan::Scan { why: "mod_aging" }
+        );
+        assert_eq!(
+            plan(&hub, t0 + Duration::from_secs(50)),
+            MonitorPlan::Scan { why: "mod_stale" }
+        );
+        // ended（claude の正常終了）は報告ごと捨てる = 走査へ落ちて gone を拾う
+        let mut ended = parse_report(report_json()).unwrap();
+        ended.ended = true;
+        hub.accept(7, ended, t0 + Duration::from_secs(1));
+        assert_eq!(
+            plan(&hub, t0 + Duration::from_secs(2)),
+            MonitorPlan::Scan { why: "mod_absent" }
+        );
+    }
+
+    #[test]
+    fn issue2017_応答のagents_scanの形() {
+        let skipped = MonitorPlan::Mod {
+            session_id: "s".into(),
+        }
+        .to_json();
+        assert_eq!(skipped["skipped"], true);
+        assert_eq!(skipped["reason"], "mod_fresh");
+        let ran = MonitorPlan::Scan { why: "mod_absent" }.to_json();
+        assert_eq!(ran["skipped"], false);
+        assert_eq!(ran["reason"], "mod_absent");
     }
 }

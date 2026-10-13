@@ -3195,7 +3195,7 @@ pub fn ensure_defaults() -> Result<PathBuf, String> {
 /// `claude agents --json` が返すのは**その config ディレクトリに属するエージェントだけ**。
 /// tako はアカウント切替（#504 / #512）で複数の config ディレクトリのペインを
 /// 同時に抱えるため、1 つだけを見ると他アカウントの worker が「存在しない」ことになる。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AgentScanTarget {
     /// `CLAUDE_CONFIG_DIR` を明示 unset して既定（`~/.claude`）を見る
     Default,
@@ -3248,24 +3248,275 @@ pub fn agent_scan_targets(accounts: &AccountsConfig) -> Vec<AgentScanTarget> {
     targets
 }
 
-/// `claude agents --json` をログインシェル経由で、**登録済み config ディレクトリすべて**に
-/// 対して実行し、結果を 1 本の JSON 配列へマージして返す（Issue #571）。
+/// 走査で答えが要る claude（Issue #2017）。
 ///
-/// .app バンドル（Dock 起動）の PATH は最小構成で `claude` が見つからないため、
-/// `$SHELL -l -c "…"` でユーザーの PATH を使う。
+/// 監視が知りたいのは「このペインの claude」「この会話の claude」だけなのに、走査は登録アカウント
+/// すべて（本番 4 本）を起こしていた。台帳（[`claude_session`]）の行をこの範囲で絞ってから
+/// #1011 の前段ガード（[`agents_scan_plan`]）へ渡すので、**範囲に居る claude を持たない明示アカウント
+/// は起こさない**。既定 config dir は #1011 どおり必ず起こす（#571 の保証と台帳の取りこぼし検出）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanScope {
+    /// 全部（一覧・画面表示・カタログの旧挙動）
+    All,
+    /// この会話 ID の claude（`query_agent_status`）。台帳の会話 ID が古い（`/clear` 等）と
+    /// 外れるので、絞った走査で見つからなければ全部で引き直す
+    Session(String),
+    /// これらの pid（器のペインの `pane_pid` / 器なしの PTY 直下の子 pid）の子孫に居る claude
+    Under(Vec<u32>),
+}
+
+thread_local! {
+    /// このスレッドで走査（キャッシュを含む）に問い合わせた回数（#2017 の検証用。
+    /// 監視が mod の報告で答えたときに 0 のままかを単体テストが同じスレッドで読む）
+    static SCAN_CONSULTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// このスレッドで `claude agents --json`（キャッシュを含む）へ問い合わせた回数（#2017）
+pub fn agents_scan_consults_here() -> u64 {
+    SCAN_CONSULTS.with(|c| c.get())
+}
+
+/// `claude agents --json` を、答えが要る範囲（[`ScanScope`]）に居る claude の走査先
+/// （登録済み config ディレクトリ）へ起こし、結果を 1 本の JSON 配列へマージして返す（Issue #571）。
+///
 /// `CLAUDE_CONFIG_DIR` は**プロセス環境から継承せず**、走査先ごとに明示指定する
 /// （継承すると、tako を起動したペインのアカウントに観測範囲が縛られる = #571 の根因）。
 ///
-/// Issue #168: ログインシェル + Node CLI の起動は 1 回 500ms〜1s かかる。master の
-/// watch / worker_status が数秒間隔 × worker 数で呼ぶため、TTL 内は前回結果を返す。
-/// 走査先が複数あっても待ち時間を増やさないよう、各走査は並行に実行する。
+/// Issue #168: Node CLI の起動は重い。master の watch / worker_status が数秒間隔 × worker 数で
+/// 呼ぶため、鮮度の内は前回結果を返す。走査先が複数あっても待ち時間を増やさないよう、
+/// 各走査は並行に実行する。
 ///
 /// Issue #1011: 起動コストを 2 方向から削る。
 /// - **鮮度の用途分離** = [`AgentScanFreshness`]。UI 表示は 30 秒古くてよいので
 ///   master のペースに引きずられて再走査を起こさない
 /// - **前段ガード** = [`claude_session`] の台帳で「その走査先に live な claude が
 ///   居るか」を Node 無しで確かめ、居ない**明示アカウント**の起動を省く
-pub(crate) fn run_claude_agents_json(freshness: AgentScanFreshness) -> Option<Vec<u8>> {
+///
+/// Issue #2017:
+/// - **範囲**（[`ScanScope`]）: 台帳を範囲で絞ってから前段ガードへ渡す
+/// - **走査先ごとのキャッシュ**: 1 本のキャッシュを全走査先で共有すると、範囲を絞った走査が
+///   他の走査先の答えを古いまま残せない。走査先ごとに鮮度を持ち、要る走査先だけを起こし直す
+/// - **ログインシェルを外す**: 解決済みの `claude` を直接起こす（[`direct_agents_scan_command`]）
+///
+/// A/B の `TAKO_2017_LEGACY=1` は修正前（範囲を問わず全走査先・1 本のキャッシュ・ログインシェル）
+pub(crate) fn run_claude_agents_json_scoped(
+    freshness: AgentScanFreshness,
+    scope: &ScanScope,
+) -> Option<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    type TargetCache = HashMap<AgentScanTarget, (Instant, Option<Vec<u8>>)>;
+    static CACHE: Mutex<Option<TargetCache>> = Mutex::new(None);
+
+    SCAN_CONSULTS.with(|c| c.set(c.get() + 1));
+    if tako_core::claude_mod::monitor_legacy() {
+        return run_claude_agents_json_whole(freshness);
+    }
+    // legacy は #1011 前と同じ「用途を問わず 5 秒 TTL 固定」に戻す
+    let max_age = match scan_legacy() {
+        true => AgentScanFreshness::Monitoring.max_age(),
+        false => freshness.max_age(),
+    };
+    // 走査は 1 本ずつ（同じ走査先を同時に 2 本起こさない = #168 の型を保つ）
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    let targets = agent_scan_targets(&AccountsConfig::load().unwrap_or(AccountsConfig {
+        accounts: std::collections::BTreeMap::new(),
+    }));
+    let ledgers = read_scan_ledgers(&targets);
+    let scoped = scoped_scan_plan(&targets, &ledgers, scope);
+    let result = scan_with_plan(cache, &targets, &scoped, &ledgers, max_age);
+    let ScanScope::Session(sid) = scope else {
+        return result;
+    };
+    // 会話 ID で絞った走査に居なければ、台帳の会話 ID が古いだけかもしれない（`/clear` / `/resume`
+    // は同じ pid のまま会話 ID が替わる）。全部で引き直して「居ない」を確かめる = 修正前と同じ答え
+    if agents_json_has_session(result.as_deref(), sid)
+        || scoped.iter().all(|d| *d == ScanDecision::Launch)
+    {
+        return result;
+    }
+    let whole = scoped_scan_plan(&targets, &ledgers, &ScanScope::All);
+    scan_with_plan(cache, &targets, &whole, &ledgers, max_age)
+}
+
+/// 走査の答えにこの会話 ID が居るか（純関数）
+fn agents_json_has_session(stdout: Option<&[u8]>, sid: &str) -> bool {
+    stdout
+        .and_then(|s| serde_json::from_slice::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_array().cloned())
+        .is_some_and(|items| items.iter().any(|a| a["sessionId"].as_str() == Some(sid)))
+}
+
+/// 走査先ごとの台帳（`TAKO_1011_LEGACY` では読まない）
+fn read_scan_ledgers(targets: &[AgentScanTarget]) -> Vec<crate::claude_session::LedgerRead> {
+    if scan_legacy() {
+        return Vec::new();
+    }
+    let dirs: Vec<Option<PathBuf>> = targets.iter().map(|t| t.config_dir_path()).collect();
+    let mut ledgers = crate::claude_session::read_ledgers(&dirs);
+    // 検出力の実証専用の故障注入（#1011 と同じ。実運用では立たない）
+    if std::env::var_os("TAKO_1011_INJECT_LEDGER_GAP").is_some() {
+        for ledger in ledgers.iter_mut() {
+            if let crate::claude_session::LedgerRead::Live(entries) = ledger {
+                if !entries.is_empty() {
+                    entries.remove(0);
+                }
+            }
+        }
+    }
+    ledgers
+}
+
+/// 範囲で絞った走査計画（#2017）。台帳の行を範囲に居るものだけへ絞ってから #1011 の計画へ渡す
+fn scoped_scan_plan(
+    targets: &[AgentScanTarget],
+    ledgers: &[crate::claude_session::LedgerRead],
+    scope: &ScanScope,
+) -> Vec<ScanDecision> {
+    use std::sync::atomic::Ordering;
+    if scan_legacy() {
+        return vec![ScanDecision::Launch; targets.len()];
+    }
+    let trusted = LEDGER_TRUSTED.load(Ordering::Relaxed);
+    let plan = match scope {
+        ScanScope::All => agents_scan_plan(targets, ledgers, trusted),
+        ScanScope::Session(sid) => agents_scan_plan(
+            targets,
+            &scope_ledgers(ledgers, &|e| e.session_id == *sid),
+            trusted,
+        ),
+        ScanScope::Under(roots) => {
+            let roots: std::collections::HashSet<u32> = roots.iter().copied().collect();
+            let parents = crate::agents::process_parent_map();
+            agents_scan_plan(
+                targets,
+                &scope_ledgers(ledgers, &|e| {
+                    crate::agents::is_descendant_of(e.pid, &roots, &parents)
+                }),
+                trusted,
+            )
+        }
+    };
+    let skipped = plan
+        .iter()
+        .filter(|d| **d == ScanDecision::SkipProvablyEmpty)
+        .count();
+    if skipped > 0 {
+        SCAN_SKIPS.fetch_add(skipped as u64, Ordering::Relaxed);
+        crate::diag::flow_log(&format!(
+            "agents 走査: 前段ガードで {skipped}/{} 件の Node 起動を省いた（台帳に{}の live なし）",
+            targets.len(),
+            match scope {
+                ScanScope::All => "",
+                ScanScope::Session(_) => "その会話",
+                ScanScope::Under(_) => "そのペイン",
+            }
+        ));
+    }
+    plan
+}
+
+/// 台帳の生きている行を `keep` で絞る（純関数。`Missing` / `Unreadable` はそのまま =
+/// 「材料が無い」を「範囲に居ない」と読み替えない）
+pub fn scope_ledgers(
+    ledgers: &[crate::claude_session::LedgerRead],
+    keep: &dyn Fn(&crate::claude_session::SessionEntry) -> bool,
+) -> Vec<crate::claude_session::LedgerRead> {
+    use crate::claude_session::LedgerRead;
+    ledgers
+        .iter()
+        .map(|read| match read {
+            LedgerRead::Live(entries) => {
+                LedgerRead::Live(entries.iter().filter(|e| keep(e)).cloned().collect())
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// 計画どおりに走査する（新しいキャッシュは使い回し、古い走査先だけ並行に起こす）
+fn scan_with_plan(
+    cache: &mut std::collections::HashMap<AgentScanTarget, (std::time::Instant, Option<Vec<u8>>)>,
+    targets: &[AgentScanTarget],
+    plan: &[ScanDecision],
+    ledgers: &[crate::claude_session::LedgerRead],
+    max_age: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let mut outputs: Vec<Option<Option<Vec<u8>>>> = targets
+        .iter()
+        .zip(plan.iter())
+        .map(|(t, decision)| match decision {
+            // 省いた走査先は「観測できて 0 件だった」= 成功の空配列（#1011）
+            ScanDecision::SkipProvablyEmpty => Some(Some(b"[]".to_vec())),
+            ScanDecision::Launch => cache
+                .get(t)
+                .filter(|(at, _)| at.elapsed() < max_age)
+                .map(|(_, v)| v.clone()),
+        })
+        .collect();
+    let stale: Vec<usize> = (0..targets.len())
+        .filter(|i| outputs[*i].is_none())
+        .collect();
+    let launched = launch_scan_targets(stale.iter().map(|i| &targets[*i]));
+    let now = std::time::Instant::now();
+    for (i, out) in stale.iter().zip(launched) {
+        cache.insert(targets[*i].clone(), (now, out.clone()));
+        verify_ledger_against(ledgers.get(*i), out.as_deref());
+        outputs[*i] = Some(out);
+    }
+    let outputs: Vec<Option<Vec<u8>>> = outputs.into_iter().map(Option::flatten).collect();
+    merge_agents_json(&outputs)
+}
+
+/// 走査先を並行に起こす（数えるのは「起こそうとした本数」= #1011 の計測）
+fn launch_scan_targets<'a>(
+    targets: impl Iterator<Item = &'a AgentScanTarget>,
+) -> Vec<Option<Vec<u8>>> {
+    use std::sync::atomic::Ordering;
+    let targets: Vec<&AgentScanTarget> = targets.collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|t| {
+                scope.spawn(move || {
+                    SCAN_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+                    run_claude_agents_json_for(t)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    })
+}
+
+/// 自己検証（#1011）: 起こした走査先について、CLI が台帳の知らない pid を返していないか。
+/// 取りこぼしていたら以後ガードを止める（旧挙動へ自動復帰）。**絞る前の台帳**と突き合わせる
+fn verify_ledger_against(
+    ledger: Option<&crate::claude_session::LedgerRead>,
+    stdout: Option<&[u8]>,
+) {
+    use std::sync::atomic::Ordering;
+    let (Some(ledger), Some(stdout)) = (ledger, stdout) else {
+        return;
+    };
+    if scan_legacy() || !LEDGER_TRUSTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let pids = crate::claude_session::agents_json_pids(stdout);
+    if !crate::claude_session::agents_source_looks_complete(ledger, &pids) {
+        LEDGER_TRUSTED.store(false, Ordering::Relaxed);
+        crate::diag::flow_log(
+            "agents 走査: 台帳が CLI の結果を取りこぼした（以後は前段ガードを使わない）",
+        );
+    }
+}
+
+/// #2017 以前の形（範囲を問わず全走査先・1 本のキャッシュ）。A/B の `TAKO_2017_LEGACY=1` だけが通る
+fn run_claude_agents_json_whole(freshness: AgentScanFreshness) -> Option<Vec<u8>> {
     use std::sync::Mutex;
     use std::time::Instant;
     static CACHE: Mutex<Option<(Instant, Option<Vec<u8>>)>> = Mutex::new(None);
@@ -3524,6 +3775,28 @@ fn run_claude_agents_json_for(target: &AgentScanTarget) -> Option<Vec<u8>> {
 /// [`run_claude_agents_json_for`] の本体（実 CLI を起こす側）
 fn run_claude_agents_json_live(target: &AgentScanTarget) -> Option<Vec<u8>> {
     let (posix_prefix, config_dir) = agent_scan_config_dir_env(target);
+    let set_config_dir = |command: &mut std::process::Command| match config_dir {
+        None => {
+            command.env_remove(CLAUDE_CONFIG_DIR_ENV);
+        }
+        Some(path) => {
+            command.env(CLAUDE_CONFIG_DIR_ENV, path);
+        }
+    };
+    // #2017: 解決済みの実体を直接起こす（ログインシェルの起動と rc の読み込みを省く。1 本の実時間が
+    // 0.32 → 0.15 秒 = #2011 の実測）。起こせないと分かったら以後はログインシェルへ戻す
+    if let Some(mut command) = direct_agents_scan_command() {
+        set_config_dir(&mut command);
+        match run_agents_scan(&mut command) {
+            ScanRun::Ran(out) => return out,
+            ScanRun::NotRunnable(why) => {
+                DIRECT_SCAN_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::diag::flow_log(&format!(
+                    "agents 走査: claude を直接起こせない（{why}）。以後はログインシェル経由にする"
+                ));
+            }
+        }
+    }
     // 「ユーザーの環境で CLI を 1 回走らせる」形は OS で違う（#877。抽象境界 B21）。
     // unix はログインシェル経由（`.app` の痩せた PATH 対策）、Windows は PATH で解決した
     // 実体を直接起動する（`SHELL` も `-l -c` も無いので従来は必ず失敗していた）
@@ -3537,15 +3810,36 @@ fn run_claude_agents_json_live(target: &AgentScanTarget) -> Option<Vec<u8>> {
         return None;
     };
     let mut command = plan.command();
-    match config_dir {
-        None => command.env_remove(CLAUDE_CONFIG_DIR_ENV),
-        Some(path) => command.env(CLAUDE_CONFIG_DIR_ENV, path),
-    };
+    set_config_dir(&mut command);
+    match run_agents_scan(&mut command) {
+        ScanRun::Ran(out) => out,
+        ScanRun::NotRunnable(why) => {
+            crate::diag::flow_log(&format!("agents 走査: 子プロセスを起こせない（{why}）"));
+            None
+        }
+    }
+}
+
+/// 直接起動が使えないと分かったか（#2017。プロセス寿命。立ったら以後はログインシェル =
+/// 修正前の形へ自動で戻る。#1011 の `LEDGER_TRUSTED` と同じ逃げ道）
+static DIRECT_SCAN_BROKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 1 回の走査の結末
+enum ScanRun {
+    /// 起動できた（`None` = claude 側の異常終了・打ち切り）
+    Ran(Option<Vec<u8>>),
+    /// そもそも起こせない（起動失敗・126 / 127 = 実行できない / 見つからない）
+    NotRunnable(String),
+}
+
+/// 走査 1 回（待ちは上限つき）
+fn run_agents_scan(command: &mut std::process::Command) -> ScanRun {
     // #1979: 待ちには上限を付ける（`Command::output()` は claude が返らないと永久に待つ。
     // この走査はスマホの一覧（`RemoteAgents`）・セッション再起動の計画から UI スレッドの
     // 同期の dispatch でも届く）。上限は他のエージェント CLI の問い合わせと同じ probe の既定
-    let output = match tako_core::probe::command_output_with_timeout(
-        &mut command,
+    let (status, stdout, stderr) = match tako_core::probe::command_output_with_timeout(
+        command,
         "claude agents --json",
         tako_core::probe::probe_timeout(),
     ) {
@@ -3553,36 +3847,82 @@ fn run_claude_agents_json_live(target: &AgentScanTarget) -> Option<Vec<u8>> {
             status,
             stdout,
             stderr,
-        } => std::process::Output {
-            status,
-            stdout,
-            stderr,
-        },
+        } => (status, stdout, stderr),
         tako_core::probe::Outcome::TimedOut { waited, .. } => {
             crate::diag::flow_log(&format!(
                 "agents 走査: claude が {} 秒応答しないので打ち切った",
                 waited.as_secs()
             ));
-            return None;
+            return ScanRun::Ran(None);
         }
         tako_core::probe::Outcome::Failed { reason, .. } => {
-            crate::diag::flow_log(&format!("agents 走査: 子プロセスを起こせない（{reason}）"));
-            return None;
+            return ScanRun::NotRunnable(reason.to_string());
         }
     };
-    if output.status.success() {
-        Some(output.stdout)
-    } else {
-        // 認証切れなど claude 側の異常はここに来る。**出力そのものは診断ログへ出さない**
-        // （AGENTS.md の絶対ルール）。残すのは終了コードと長さだけ
-        crate::diag::flow_log(&format!(
-            "agents 走査: claude が異常終了（code={:?} stdout={}B stderr={}B）",
-            output.status.code(),
-            output.stdout.len(),
-            output.stderr.len()
-        ));
-        None
+    if status.success() {
+        return ScanRun::Ran(Some(stdout));
     }
+    // 126 / 127 = 実行できない / 見つからない（npm の claude の `env node` が node を引けない等）
+    if matches!(status.code(), Some(126 | 127)) {
+        return ScanRun::NotRunnable(format!("code={:?}", status.code()));
+    }
+    // 認証切れなど claude 側の異常はここに来る。**出力そのものは診断ログへ出さない**
+    // （AGENTS.md の絶対ルール）。残すのは終了コードと長さだけ
+    crate::diag::flow_log(&format!(
+        "agents 走査: claude が異常終了（code={:?} stdout={}B stderr={}B）",
+        status.code(),
+        stdout.len(),
+        stderr.len()
+    ));
+    ScanRun::Ran(None)
+}
+
+/// 解決済みの `claude` を直接起こす `claude agents --json`（#2017。unix だけ。
+/// Windows は抽象境界 B21 が元から直接起動）。
+///
+/// 解決は #1968 で stale binary 検知から外したのと同じ口（[`crate::stale_binary::launcher_path`] =
+/// PATH の走査 + ログインシェルの `command -v` の覚え。PATH の痩せた `.app` でもシェルは 10 分に
+/// 1 回まで）。A/B の `TAKO_2017_LEGACY=1` と、直接起こせないと分かった後はログインシェル
+#[cfg(unix)]
+fn direct_agents_scan_command() -> Option<std::process::Command> {
+    if tako_core::claude_mod::monitor_legacy()
+        || DIRECT_SCAN_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let claude = crate::stale_binary::launcher_path()?;
+    let mut command = tako_core::platform::child_cmd::ChildCmd {
+        program: claude.to_string_lossy().into_owned(),
+        args: AGENTS_SCAN_ARGV[1..]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+    }
+    .command();
+    if let Some(path) = direct_scan_path(&claude, std::env::var_os("PATH")) {
+        command.env("PATH", path);
+    }
+    Some(command)
+}
+
+#[cfg(not(unix))]
+fn direct_agents_scan_command() -> Option<std::process::Command> {
+    None
+}
+
+/// 直接起こす claude へ渡す PATH（純関数）。実体の置き場を先頭へ足す: npm で入れた claude は
+/// `#!/usr/bin/env node` で、node は同じ bin（nvm / Homebrew）に居る。`.app` の痩せた PATH には無い
+#[cfg_attr(not(unix), allow(dead_code))]
+fn direct_scan_path(
+    claude: &std::path::Path,
+    inherited: Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    let dir = claude.parent().filter(|d| !d.as_os_str().is_empty())?;
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Some(path) = inherited {
+        dirs.extend(std::env::split_paths(&path).filter(|d| d != dir));
+    }
+    std::env::join_paths(dirs).ok()
 }
 
 /// 走査結果のマージ（純関数。テスト可能）。
@@ -3621,9 +3961,15 @@ fn merge_agents_json(outputs: &[Option<Vec<u8>>]) -> Option<Vec<u8>> {
 /// `claude agents --json` から指定 session_id の status と ctx% を取得する。
 ///
 /// 呼び出し元は `worker_status` / `orchestrator self` = **master の worker 監視**なので
-/// 鮮度は [`AgentScanFreshness::Monitoring`]（5 秒）。完了検知が遅れると実害になる
+/// 鮮度は [`AgentScanFreshness::Monitoring`]（5 秒）。完了検知が遅れると実害になる。
+///
+/// #2017: 起こすのはその会話の claude が居る走査先だけ（[`ScanScope::Session`]）。mod の報告が
+/// 新しいペインはそもそもここへ来ない（`claude_mod::monitor_plan`）
 pub fn query_agent_status(session_id: &str) -> AgentStatus {
-    let Some(stdout) = run_claude_agents_json(AgentScanFreshness::Monitoring) else {
+    let Some(stdout) = run_claude_agents_json_scoped(
+        AgentScanFreshness::Monitoring,
+        &ScanScope::Session(session_id.to_string()),
+    ) else {
         return AgentStatus {
             status: "unknown".into(),
             ctx_percent: None,
@@ -6966,6 +7312,137 @@ worker_agents:
             agents_scan_plan(&targets, &[], true),
             vec![ScanDecision::Launch, ScanDecision::Launch]
         );
+    }
+
+    // --- #2017: 答えが要る範囲で台帳を絞ってから計画する -------------------------------
+
+    /// 本番の構成（既定 + 明示 3。2026-10-13 の実測で 4 本並行）
+    fn 本番相当の走査先_2017() -> Vec<AgentScanTarget> {
+        vec![
+            AgentScanTarget::Default,
+            AgentScanTarget::ConfigDir("/acct-a".into()),
+            AgentScanTarget::ConfigDir("/acct-b".into()),
+            AgentScanTarget::ConfigDir("/acct-c".into()),
+        ]
+    }
+
+    #[test]
+    fn issue2017_会話idで絞るとその会話の居る走査先と既定だけを起こす() {
+        let targets = 本番相当の走査先_2017();
+        let ledgers = vec![台帳(&[1, 2]), 台帳(&[10]), 台帳(&[20, 21]), 台帳(&[30])];
+        use ScanDecision::{Launch, SkipProvablyEmpty as Skip};
+        assert_eq!(
+            agents_scan_plan(
+                &targets,
+                &scope_ledgers(&ledgers, &|e| e.session_id == "s21"),
+                true
+            ),
+            vec![Launch, Skip, Launch, Skip],
+            "4 本 → 2 本（既定は #1011 どおり必ず起こす）"
+        );
+        // 範囲 = 全部は #1011 と同じ（全アカウントに live が居るので 4 本）
+        assert_eq!(
+            agents_scan_plan(&targets, &scope_ledgers(&ledgers, &|_| true), true),
+            vec![Launch; 4]
+        );
+    }
+
+    #[test]
+    fn issue2017_ペインで絞るとそのペインのclaudeが居る走査先と既定だけを起こす() {
+        let targets = 本番相当の走査先_2017();
+        let ledgers = vec![台帳(&[1, 2]), 台帳(&[10]), 台帳(&[20, 21]), 台帳(&[30])];
+        // 器のペイン 500 → zsh 501 → claude 21。別の器のペイン 600 → claude 30
+        let parents: std::collections::HashMap<u32, u32> =
+            [(501, 500), (21, 501), (30, 600), (10, 1), (20, 1)].into();
+        let roots: std::collections::HashSet<u32> = [500].into();
+        use ScanDecision::{Launch, SkipProvablyEmpty as Skip};
+        assert_eq!(
+            agents_scan_plan(
+                &targets,
+                &scope_ledgers(&ledgers, &|e| crate::agents::is_descendant_of(
+                    e.pid, &roots, &parents
+                )),
+                true
+            ),
+            vec![Launch, Skip, Launch, Skip]
+        );
+        // どのアカウントにも居ない（codex のペイン等）= 既定だけ
+        let roots: std::collections::HashSet<u32> = [999].into();
+        assert_eq!(
+            agents_scan_plan(
+                &targets,
+                &scope_ledgers(&ledgers, &|e| crate::agents::is_descendant_of(
+                    e.pid, &roots, &parents
+                )),
+                true
+            ),
+            vec![Launch, Skip, Skip, Skip]
+        );
+    }
+
+    /// 「材料が無い」を「範囲に居ない」と読み替えない（読めない台帳・信頼を失った台帳は起こす）
+    #[test]
+    fn issue2017_読めない台帳と信頼を失った台帳は絞らない() {
+        let targets = 本番相当の走査先_2017();
+        let ledgers = vec![
+            台帳(&[1]),
+            crate::claude_session::LedgerRead::Unreadable,
+            crate::claude_session::LedgerRead::Missing,
+            台帳(&[30]),
+        ];
+        let scoped = scope_ledgers(&ledgers, &|e| e.session_id == "s1");
+        assert_eq!(scoped[1], crate::claude_session::LedgerRead::Unreadable);
+        assert_eq!(scoped[2], crate::claude_session::LedgerRead::Missing);
+        use ScanDecision::{Launch, SkipProvablyEmpty as Skip};
+        assert_eq!(
+            agents_scan_plan(&targets, &scoped, true),
+            vec![Launch, Launch, Skip, Skip],
+            "Missing は他の走査先で台帳の仕組みが確かめられたときだけ空と読む（#1011）"
+        );
+        assert_eq!(agents_scan_plan(&targets, &scoped, false), vec![Launch; 4]);
+    }
+
+    #[test]
+    fn issue2017_走査の答えに会話idが居るか() {
+        let out = br#"[{"pid":1,"sessionId":"a"},{"pid":2,"sessionId":"b"}]"#;
+        assert!(agents_json_has_session(Some(out), "b"));
+        assert!(!agents_json_has_session(Some(out), "c"));
+        assert!(!agents_json_has_session(Some(b"not json"), "a"));
+        assert!(!agents_json_has_session(None, "a"));
+    }
+
+    /// 直接起こす claude の PATH: 置き場を先頭へ（npm の `#!/usr/bin/env node` が同じ bin の node を引く）
+    #[test]
+    fn issue2017_直接起こすclaudeのpathは置き場を先頭へ足す() {
+        let claude = std::path::Path::new("/opt/homebrew/bin/claude");
+        let joined = |p: Option<std::ffi::OsString>| {
+            p.map(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let thin = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        assert_eq!(
+            joined(direct_scan_path(claude, Some(thin))),
+            Some(vec![
+                "/opt/homebrew/bin".to_string(),
+                "/usr/bin".into(),
+                "/bin".into()
+            ])
+        );
+        // 既に PATH に居れば重ねない
+        let full = std::env::join_paths(["/usr/bin", "/opt/homebrew/bin"]).unwrap();
+        assert_eq!(
+            joined(direct_scan_path(claude, Some(full))),
+            Some(vec!["/opt/homebrew/bin".to_string(), "/usr/bin".into()])
+        );
+        assert_eq!(
+            joined(direct_scan_path(claude, None)),
+            Some(vec!["/opt/homebrew/bin".to_string()])
+        );
+        // 置き場の無い名前だけ（解決できていない）は PATH を触らない
+        assert_eq!(direct_scan_path(std::path::Path::new("claude"), None), None);
     }
 
     #[test]

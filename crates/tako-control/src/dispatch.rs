@@ -3533,6 +3533,17 @@ pub struct UiProbes {
     git_conflict: Option<(PathBuf, Option<(PathBuf, tako_core::ConflictState)>)>,
     /// `TmuxOpen` の（socket の指定, セッション）→ 解決（#1989）
     tmux_open: Option<(TmuxOpenKey, Result<TmuxOpenLookup, String>)>,
+    /// `orchestrator self` の会話 ID と状態（#2017。`claude agents --json` + 器の pid 祖先辿り）
+    self_scan: Option<SelfScan>,
+}
+
+/// `orchestrator self` が走査で採った答え（#2017。[`UiProbes::self_scan`]）
+#[derive(Clone)]
+struct SelfScan {
+    /// 走査した器のセッション名
+    backend: String,
+    /// `None` = 先取りの時点で mod の報告が答えていたので走査していない
+    found: Option<(Option<String>, String)>,
 }
 
 /// セッション再起動の計画が使う走査（#1984）
@@ -3559,6 +3570,9 @@ pub struct ProbeNeeds {
     git_conflict: Option<PathBuf>,
     /// `TmuxOpen` の（socket の指定, セッション）（#1989）
     tmux_open: Option<TmuxOpenKey>,
+    /// `orchestrator self` の器のセッション名と、走査が要るか（#2017。`false` = mod の報告が
+    /// 答えている = background は何もしない。UI スレッドの dispatch を必ず先取りの内側で回すため）
+    self_scan: Option<(String, bool)>,
 }
 
 impl ProbeNeeds {
@@ -3569,6 +3583,7 @@ impl ProbeNeeds {
             && self.restart.is_none()
             && self.git_conflict.is_none()
             && self.tmux_open.is_none()
+            && self.self_scan.is_none()
     }
 
     /// 子プロセスを待つ問い合わせの本体。**UI スレッドで呼ばないこと**（`run_staged` から）
@@ -3600,6 +3615,17 @@ impl ProbeNeeds {
                     (repo, state)
                 });
                 probes.git_conflict = Some((cwd, found));
+            }
+            if let Some((backend, scan)) = self.self_scan {
+                let found = scan.then(|| {
+                    let sid = crate::agents::resolve_session_id_for_backend(&backend);
+                    let status = match &sid {
+                        Some(sid) => crate::orchestrator::query_agent_status(sid).status,
+                        None => "unknown".to_string(),
+                    };
+                    (sid, status)
+                });
+                probes.self_scan = Some(SelfScan { backend, found });
             }
             if let Some((socket, session)) = self.tmux_open {
                 let found = compute_tmux_open_lookup(socket.as_deref(), &session);
@@ -3727,6 +3753,40 @@ fn tako_binary() -> String {
     }
 }
 
+/// `orchestrator self` の会話 ID と状態の走査（#2017。`claude agents --json` + 器の pid 祖先辿り）。
+///
+/// mod の報告が答えていないときだけ呼ぶ。先取りの内側では background が採った答えだけを使い、
+/// 答えが無い（先取りの時点では mod の報告が答えていた = 判断の後に古くなった）なら走査せず
+/// 「分からない」へ倒す。器が無ければ走査の材料が無い（修正前と同じ `unknown`）
+fn self_agent_scan(host: &dyn ControlHost, pane_id: PaneId) -> (Option<String>, String) {
+    let unknown = || (None, "unknown".to_string());
+    let Some(backend) = host.backend_session(pane_id) else {
+        return unknown();
+    };
+    match probed(|p| {
+        p.self_scan
+            .as_ref()
+            .filter(|s| s.backend == backend)
+            .and_then(|s| s.found.clone())
+    }) {
+        Probed::Answer(found) => found,
+        Probed::Missing => {
+            crate::diag::flow_log(
+                "orchestrator self: 先取りに走査の答えが無いので UI スレッドでは走査しない（#2017）",
+            );
+            unknown()
+        }
+        Probed::Outside => {
+            let sid = resolve_session_id_for_pane_via_host(host, pane_id);
+            let status = match &sid {
+                Some(sid) => crate::orchestrator::query_agent_status(sid).status,
+                None => "unknown".to_string(),
+            };
+            (sid, status)
+        }
+    }
+}
+
 /// セッション再起動の計画の走査（生きた会話 ID・器の全ペインと親子表）。
 ///
 /// 先取りの内側では background の走査だけを使う（#1984）。答えが無ければ
@@ -3829,6 +3889,40 @@ fn restart_needs(host: &dyn ControlHost, pane: Option<u64>) -> ProbeNeeds {
     }
 }
 
+/// `orchestrator self` の会話 ID と状態の先取り（#2017）。返すのは（器のセッション名, 走査が要るか）。
+///
+/// 器を持つペインは、mod の報告が答えていても `false` を載せて**先取りの内側で dispatch させる**:
+/// 先取りが空だと同期の腕（`Probed::Outside`）で dispatch され、判断から dispatch までの間に報告が
+/// 古くなると UI スレッドで走査を起こしうる。器が無ければ走査の材料が無い（dispatch も走査しない）
+fn self_scan_need(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    caller_role: Option<&str>,
+    caller_pid: Option<u32>,
+) -> Option<(String, bool)> {
+    let (_, pane_id) = resolve_caller_pane(host, pane, caller_role, caller_pid).ok()?;
+    let backend = host.backend_session(pane_id)?;
+    let known = matches!(
+        probed(|p| p
+            .self_scan
+            .as_ref()
+            .filter(|s| s.backend == backend)
+            .map(|_| ())),
+        Probed::Answer(_)
+    );
+    if known {
+        return None;
+    }
+    let probed_at = std::time::Instant::now();
+    let plan = tako_core::claude_mod::monitor_plan(
+        &crate::claude_mod::lookup_pane(host, pane_id, probed_at),
+        probed_at,
+        None,
+        tako_core::claude_mod::monitor_legacy(),
+    );
+    Some((backend, !plan.skips_scan()))
+}
+
 /// この要求を UI スレッドで dispatch する前に、background で先取りする答え（#1984）。
 ///
 /// `None` = 先取りの対象外の要求（従来どおり同期で dispatch）。**読む側の関数を呼ぶ dispatch の
@@ -3838,8 +3932,25 @@ fn restart_needs(host: &dyn ControlHost, pane: Option<u64>) -> ProbeNeeds {
 /// 読む側が「確かめられない」へ倒れるので、dispatch が読む答えはすべてここで挙げる
 fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> {
     match request {
-        Request::OrchestratorSelf { caller_pid, .. }
-        | Request::OrchestratorAdopt { caller_pid, .. }
+        // #2017: self は呼び出し元が決まってから、会話 ID と状態の走査（mod の報告が答えていれば
+        // 走査なし）を先取りする（pid の答えが要るなら次の巡）
+        Request::OrchestratorSelf {
+            pane,
+            caller_role,
+            caller_pid,
+        } => {
+            let caller = caller_need(host, *caller_pid);
+            let self_scan = match caller {
+                Some(_) => None,
+                None => self_scan_need(host, *pane, caller_role.as_deref(), *caller_pid),
+            };
+            Some(ProbeNeeds {
+                caller,
+                self_scan,
+                ..ProbeNeeds::default()
+            })
+        }
+        Request::OrchestratorAdopt { caller_pid, .. }
         | Request::OrchestratorGuide {
             profile: None,
             caller_pid,
@@ -12790,23 +12901,40 @@ fn dispatch_orchestrator_self(
     };
     let profile_name = profile_owned.as_str();
 
-    // session_id の自動解決（バックエンドセッション → pid 祖先辿り）
-    let session_id = resolve_session_id_for_pane_via_host(host, pane_id);
+    // #1880: tako mod の報告（新鮮なら ctx%・ターン状態・使用制限の一次ソース）
+    let now = std::time::Instant::now();
+    let mod_lookup = crate::claude_mod::lookup_pane(host, pane_id, now);
+    let lines = host.session(pane_id).map(|s| s.visible_lines());
 
-    let status = match &session_id {
-        Some(sid) => orchestrator::query_agent_status(sid).status,
-        None => "unknown".to_string(),
+    // 会話 ID と状態。#2017: mod の報告（会話 ID つき・新しい）があればそこから採り、
+    // `claude agents --json` を起こさない（判断は worker_status と同じ `claude_mod::monitor_plan`）。
+    // 無ければ従来どおり器 → pid 祖先辿りの走査（UI スレッドでは走査しない = 先取りの答えを読む）
+    let monitor = tako_core::claude_mod::monitor_plan(
+        &mod_lookup,
+        now,
+        None,
+        tako_core::claude_mod::monitor_legacy(),
+    );
+    let (session_id, status) = match (&monitor, &mod_lookup) {
+        (tako_core::claude_mod::MonitorPlan::Mod { session_id }, Ok(stored)) => {
+            let screen_busy = lines.as_ref().is_some_and(|l| {
+                crate::orchestrator::wait::screen_looks_busy(&tail_join(l.clone()))
+            });
+            (
+                Some(session_id.clone()),
+                stored.report.turn.status_word(screen_busy).to_string(),
+            )
+        }
+        _ => self_agent_scan(host, pane_id),
     };
 
     // #1021: ctx% は `agents --json` からは採れなくなった（2.1.258 で
     // `contextPercentUsed` が消えた）ので、画面 → transcript の順で解決する。
     // ペインが GUI に居れば画面（= claude 自身の答え）を、居なければ transcript を使う。
     // #1880: tako mod の報告が新鮮ならそれが先頭（statusLine が無くても取れる・窓も claude の答え）
-    let now = std::time::Instant::now();
-    let mod_lookup = crate::claude_mod::lookup_pane(host, pane_id, now);
-    let screen_ctx = host
-        .session(pane_id)
-        .and_then(|s| crate::claude_ctx::screen_ctx_from_lines(&s.visible_lines()));
+    let screen_ctx = lines
+        .as_deref()
+        .and_then(crate::claude_ctx::screen_ctx_from_lines);
     let ctx = crate::claude_ctx::resolve(
         session_id.as_deref(),
         screen_ctx.as_ref(),
@@ -12884,6 +13012,8 @@ fn dispatch_orchestrator_self(
         // #1880: tako mod の報告（ターン状態・モデル・effort。使えなければ null + mod_reason）
         "mod_turn": crate::claude_mod::turn_json(&mod_lookup, now),
         "mod_reason": crate::claude_mod::reason_code(&mod_lookup),
+        // #2017: `claude agents --json` の走査を省いたか（worker_status の `agents_scan` と同じ形）
+        "agents_scan": monitor.to_json(),
         // #1880: 使用制限（5h / 7d の % と解除時刻。アカウント単位で束ねた mod の値）
         "rate_limits": crate::claude_mod::rate_limits_json(&mod_limits),
         "auto_handoff": orchestrator::auto_handoff_enabled(&profile),
@@ -13136,6 +13266,9 @@ pub struct ReportCtx {
     tmux_session: Option<String>,
     /// レジストリ由来の session_id（ペインから解決できないときの継続。#390）
     session_id: Option<String>,
+    /// mod の報告が答えた会話 ID（#2017。新しい報告があれば `claude agents --json` を起こさない。
+    /// UI スレッドで写すのはメモリ上の報告だけ）
+    mod_session: Option<String>,
 }
 
 fn collect_report_ctx(host: &dyn ControlHost, query: WorkerQuery) -> ReportCtx {
@@ -13149,11 +13282,25 @@ fn collect_report_ctx(host: &dyn ControlHost, query: WorkerQuery) -> ReportCtx {
                 .as_deref()
                 .is_none_or(|expect| expect == b)
         });
+    // #2017: 同一性を確かめたペインの mod の報告だけを使う（別ペインの報告は別の worker のもの）
+    let now = std::time::Instant::now();
+    let mod_session = backend.as_ref().and_then(|_| {
+        match tako_core::claude_mod::monitor_plan(
+            &crate::claude_mod::lookup_pane(host, PaneId::from_raw(query.pane_id), now),
+            now,
+            None,
+            tako_core::claude_mod::monitor_legacy(),
+        ) {
+            tako_core::claude_mod::MonitorPlan::Mod { session_id } => Some(session_id),
+            tako_core::claude_mod::MonitorPlan::Scan { .. } => None,
+        }
+    });
     ReportCtx {
         pane_id: query.pane_id,
         backend,
         tmux_session: query.tmux_session,
         session_id: query.session_id,
+        mod_session,
     }
 }
 
@@ -13171,6 +13318,7 @@ fn finish_orchestrator_report(
         backend,
         tmux_session,
         session_id,
+        mod_session,
     } = ctx;
     let mut result = json!({ "pane_id": pane_id });
 
@@ -13199,9 +13347,12 @@ fn finish_orchestrator_report(
     let msg_count = messages.max(1);
     // 同一性を確かめた器 = `host.backend_session(pane)` そのもの（`collect_report_ctx`）
     let pane_sid = if pane_identity_ok {
-        backend
-            .as_deref()
-            .and_then(crate::agents::resolve_session_id_for_backend)
+        // #2017: mod の報告が答えていれば走査しない
+        mod_session.or_else(|| {
+            backend
+                .as_deref()
+                .and_then(crate::agents::resolve_session_id_for_backend)
+        })
     } else {
         None
     };
@@ -14903,6 +15054,15 @@ fn finish_worker_status(
     } = ctx;
     // #1880: tako mod の報告（新鮮なら ctx%・ターン状態・使用制限の一次ソース）
     let mod_view = mod_state.view();
+    // #2017: そのペインに新しい mod の報告（会話 ID つき）があれば、会話 ID も状態もそこから採り
+    // `claude agents --json` を起こさない（判断は `claude_mod::monitor_plan` の 1 実装。
+    // 鮮度は写し取った時刻で測る = 判断と状態の上書きが同じ報告を見る）
+    let monitor = tako_core::claude_mod::monitor_plan(
+        &mod_view,
+        mod_state.at(),
+        session_id,
+        tako_core::claude_mod::monitor_legacy(),
+    );
 
     // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
     // 読めなくても既存動作は変えない（フォールバック層）
@@ -14925,7 +15085,13 @@ fn finish_worker_status(
     // 棚卸しが「会話は SQLite だけ」と記録していたのは実態とズレていた（実物調査で訂正）
     let mut agy_conversation: Option<String> = None;
     let (resolved_sid, status_source);
-    if let Some(sid) = session_id {
+    if let tako_core::claude_mod::MonitorPlan::Mod {
+        session_id: ref sid,
+    } = monitor
+    {
+        resolved_sid = Some(sid.clone());
+        status_source = "mod";
+    } else if let Some(sid) = session_id {
         resolved_sid = Some(sid.to_string());
         status_source = "agents";
     } else if pane_exists {
@@ -14979,7 +15145,11 @@ fn finish_worker_status(
     // その判断は [`refusal_gate_open`] が持つ（claude の腕はここを代入しないので、
     // `None` を無条件に作業ゼロと数えるとゲートが claude で常に開く）
     let mut agent_work_started: Option<bool> = None;
-    let (status, mut ctx_percent) = if let Some(ref sid) = resolved_sid {
+    let (status, mut ctx_percent) = if let (true, Ok(stored)) = (monitor.skips_scan(), &mod_view) {
+        // #2017: 状態は mod のターン。画面の生成中での補正は後段の上書き（`status_word`）が
+        // 同じ報告でもう一度行う（ここで走査を起こすと、その答えは後段で捨てられていた）
+        (stored.report.turn.status_word(false).to_string(), None)
+    } else if let Some(ref sid) = resolved_sid {
         let agent = orchestrator::query_agent_status(sid);
         (
             normalize_agent_status(&agent.status).to_string(),
@@ -15190,6 +15360,7 @@ fn finish_worker_status(
         mod_turn_json,
         mod_reason,
         mod_rate_limits,
+        agents_scan: monitor.to_json(),
     })
 }
 
@@ -15257,6 +15428,9 @@ struct ResolvedWorkerStatus {
     mod_reason: Value,
     /// #1880: claude の使用制限（mod。codex は `codex_rate_limits` が先）
     mod_rate_limits: Value,
+    /// #2017: `claude agents --json` の走査を mod の報告で省いたか（応答の `agents_scan`。
+    /// `{skipped, reason}`。組み立ては `claude_mod::MonitorPlan::to_json`）
+    agents_scan: Value,
 }
 
 /// worker_status の初期状態に補正ロジックを適用し、最終的な JSON 応答を構築する。
@@ -15289,6 +15463,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         mod_turn_json,
         mod_reason,
         mod_rate_limits,
+        agents_scan,
     } = resolved;
     // #267: agents が "gone" を返しても pane が workspace にある場合は
     // セッション未発見なだけで worker は健在 → unknown に降格
@@ -15775,6 +15950,10 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         // 使えなければ null で、理由は `mod_reason`
         "mod_turn": mod_turn_json,
         "mod_reason": mod_reason,
+        // #2017: `claude agents --json` の走査を省いたか（`skipped` = mod の報告で答えた）と理由
+        // （`mod_fresh` / 走査へ落ちた理由 = `mod_reason` の語彙 + `mod_aging` / `mod_no_session` /
+        // `session_mismatch` / `legacy_env`）
+        "agents_scan": agents_scan,
         // #985: codex の**構造化された**利用制限（rollout の `rate_limits`）。
         // 画面スクレイピングと違い used_percent は数値、resets_at は epoch 秒なので、
         // AI が「いつ解けるか」を書式に依存せず読める。
@@ -30996,6 +31175,284 @@ mod tests {
         ctx.has_running_children = false;
         let v = finish_worker_status(ctx, None, None).unwrap();
         assert_eq!(v["status"], "idle");
+    }
+
+    // --- #2017: 監視の走査（`claude agents --json`）を mod の報告で置き換える ---------------
+
+    const SID_2017: &str = "2017aaaa-0000-4000-8000-000000000001";
+
+    /// 会話 ID つきの mod の報告（`age` だけ前に受け取った）
+    fn mod_report_2017(session: Option<&str>, turn: &str) -> tako_core::claude_mod::ModReport {
+        let mut v = json!({
+            "schema": 1, "mod_version": "t", "at": 1, "turn": turn,
+            "model": "claude-haiku-5-5", "effort": "medium",
+            "context": {"tokens": 59426, "window": 1000000, "percent": 6},
+        });
+        if let Some(sid) = session {
+            v["session_id"] = json!(sid);
+        }
+        tako_core::claude_mod::parse_report(v).unwrap()
+    }
+
+    fn mod_snapshot_2017(
+        session: Option<&str>,
+        turn: &str,
+        age: std::time::Duration,
+    ) -> crate::claude_mod::ModSnapshot {
+        crate::claude_mod::ModSnapshot::with_report(
+            tako_core::claude_mod::StoredReport {
+                report: mod_report_2017(session, turn),
+                received: std::time::Instant::now()
+                    .checked_sub(age)
+                    .expect("稼働時間が age より長い"),
+                count: 1,
+                prev_received: None,
+            },
+            Vec::new(),
+        )
+    }
+
+    /// `f` の間にこのスレッドで `claude agents --json`（キャッシュを含む）へ問い合わせた回数
+    fn scan_consults_2017<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        let before = crate::orchestrator::agents_scan_consults_here();
+        let out = f();
+        (
+            out,
+            crate::orchestrator::agents_scan_consults_here() - before,
+        )
+    }
+
+    /// 受け入れ条件 1 の核: 新しい mod の報告（会話 ID つき）があれば worker_status は走査を起こさず、
+    /// 会話 ID も状態も報告から採る（修正前は走査し、その状態を後段で mod の値に上書きして捨てていた）
+    #[test]
+    fn issue2017_新しいmodの報告があればworker_statusは走査しない() {
+        for (turn, screen, want) in [
+            ("idle", "done\n❯ ", "idle"),
+            ("busy", "done\n❯ ", "busy"),
+            // 承認の後もツールが返るまで permission が残る = 画面が生成中なら busy（#1880 と同じ判定）
+            ("permission", "✻ Running… (3s · esc to interrupt)", "busy"),
+            (
+                "permission",
+                "Do you want to proceed?\n❯ 1. Yes\n  2. No",
+                "waiting",
+            ),
+        ] {
+            let (v, consults) = scan_consults_2017(|| {
+                finish_worker_status(
+                    mod_ctx_1880(
+                        screen,
+                        mod_snapshot_2017(Some(SID_2017), turn, std::time::Duration::ZERO),
+                    ),
+                    None,
+                    None,
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                consults, 0,
+                "dispatch.rs の finish_worker_status が新しい mod の報告（turn={turn}）があるのに \
+                 `claude agents --json` へ問い合わせた（#2017）: {v}"
+            );
+            assert_eq!(
+                v["agents_scan"],
+                json!({"skipped": true, "reason": "mod_fresh"})
+            );
+            assert_eq!(v["status"], want, "turn={turn} screen={screen:?}: {v}");
+            assert_eq!(v["status_source"], "mod");
+            assert_eq!(v["resolved_session_id"], SID_2017);
+            assert_eq!(v["ctx_percent"], 6);
+        }
+    }
+
+    /// 名指しの会話 ID（レジストリ）と報告が同じなら省く。違えば（`/clear` 等）修正前と同じく走査
+    #[test]
+    fn issue2017_名指しの会話と同じなら走査しない_違えば走査する() {
+        let snap = || mod_snapshot_2017(Some(SID_2017), "idle", std::time::Duration::ZERO);
+        let (v, consults) = scan_consults_2017(|| {
+            finish_worker_status(mod_ctx_1880("done\n❯ ", snap()), Some(SID_2017), None).unwrap()
+        });
+        assert_eq!(consults, 0, "{v}");
+        assert_eq!(v["agents_scan"]["skipped"], true);
+        let (v, consults) = scan_consults_2017(|| {
+            finish_worker_status(
+                mod_ctx_1880("done\n❯ ", snap()),
+                Some("other-session"),
+                None,
+            )
+            .unwrap()
+        });
+        assert!(consults >= 1, "食い違いは走査が答える: {v}");
+        assert_eq!(
+            v["agents_scan"],
+            json!({"skipped": false, "reason": "session_mismatch"})
+        );
+    }
+
+    /// 受け入れ条件 2: mod の無い claude（報告が無い・古い・会話 ID が無い）は従来どおり走査へ落ちる
+    #[test]
+    fn issue2017_modが無い古い止まった報告ではworker_statusは走査へ落ちる() {
+        let cases = [
+            (crate::claude_mod::ModSnapshot::default(), "mod_absent"),
+            (
+                // heartbeat（15 秒）が途絶えた = mod が止まった / claude が ended を送れずに落ちた
+                mod_snapshot_2017(
+                    Some(SID_2017),
+                    "busy",
+                    tako_core::claude_mod::MONITOR_SKIP_FOR + std::time::Duration::from_secs(1),
+                ),
+                "mod_aging",
+            ),
+            (
+                mod_snapshot_2017(None, "busy", std::time::Duration::ZERO),
+                "mod_no_session",
+            ),
+        ];
+        for (snapshot, why) in cases {
+            let (v, consults) = scan_consults_2017(|| {
+                finish_worker_status(mod_ctx_1880("done\n❯ ", snapshot), Some(SID_2017), None)
+                    .unwrap()
+            });
+            assert!(
+                consults >= 1,
+                "{why}: mod で答えられないのに走査へ落ちていない（mod の無い claude を見失う）: {v}"
+            );
+            assert_eq!(
+                v["agents_scan"],
+                json!({"skipped": false, "reason": why}),
+                "{v}"
+            );
+        }
+        // 引き当てごと失効（FRESH_FOR を過ぎた）= ホストから写した報告で
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        let t0 = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(50))
+            .expect("稼働時間が 50 秒より長い");
+        host.claude_mod
+            .accept(pane, mod_report_2017(Some(SID_2017), "idle"), t0);
+        let ctx = collect_worker_status_ctx(&host, pane);
+        let (v, consults) =
+            scan_consults_2017(|| finish_worker_status(ctx, Some(SID_2017), None).unwrap());
+        assert!(consults >= 1, "{v}");
+        assert_eq!(v["agents_scan"]["reason"], "mod_stale");
+    }
+
+    /// orchestrator self も同じ判断（新しい報告があれば会話 ID と状態は報告から・走査なし）
+    #[test]
+    fn issue2017_selfは新しいmodの報告で答え走査しない() {
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        host.backend_sessions.insert(pane, "tako-s2017".into());
+        host.claude_mod.accept(
+            pane,
+            mod_report_2017(Some(SID_2017), "busy"),
+            std::time::Instant::now(),
+        );
+        let (v, consults) = scan_consults_2017(|| t1453_self(&mut host, pane));
+        assert_eq!(
+            consults, 0,
+            "dispatch.rs の dispatch_orchestrator_self が新しい mod の報告があるのに走査した: {v}"
+        );
+        assert_eq!(v["session_id"], SID_2017);
+        assert_eq!(v["status"], "busy");
+        assert_eq!(
+            v["agents_scan"],
+            json!({"skipped": true, "reason": "mod_fresh"})
+        );
+    }
+
+    /// 受け入れ条件 3: self の走査は先取り（background）だけ。UI スレッドの dispatch（先取りの内側）は
+    /// 答えが無ければ走査せず「分からない」へ倒す。先取りは器のあるペインで必ず立つ
+    /// （mod の報告が答えていても = 判断の後に報告が古くなっても同期の腕で走査しない）
+    #[test]
+    fn issue2017_selfの走査はuiスレッドで起こさず先取りへ載せる() {
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        host.backend_sessions.insert(pane, "tako-s2017".into());
+        let request = Request::OrchestratorSelf {
+            pane: Some(pane),
+            caller_role: Some("master".into()),
+            caller_pid: None,
+        };
+        // mod の報告が無い = 走査が要る
+        let needs = with_ui_probes(&UiProbes::default(), || probe_needs(&host, &request))
+            .expect("self は先取りの対象");
+        assert_eq!(needs.self_scan, Some(("tako-s2017".to_string(), true)));
+        let (v, consults) = scan_consults_2017(|| {
+            with_ui_probes(&UiProbes::default(), || {
+                dispatch(&mut host, request.clone(), PaneOrigin::Mcp).unwrap()
+            })
+        });
+        assert_eq!(
+            consults, 0,
+            "dispatch.rs の dispatch_orchestrator_self が UI スレッド（先取りの内側）で走査した: {v}"
+        );
+        assert_eq!(v["session_id"], Value::Null);
+        assert_eq!(v["status"], "unknown");
+        assert_eq!(
+            v["agents_scan"],
+            json!({"skipped": false, "reason": "mod_absent"})
+        );
+        // 先取りが採った答えはそのまま使う
+        let probes = UiProbes {
+            self_scan: Some(SelfScan {
+                backend: "tako-s2017".into(),
+                found: Some((Some(SID_2017.into()), "idle".into())),
+            }),
+            ..UiProbes::default()
+        };
+        let v = with_ui_probes(&probes, || {
+            dispatch(&mut host, request.clone(), PaneOrigin::Mcp).unwrap()
+        });
+        assert_eq!(
+            (v["session_id"].as_str(), v["status"].as_str()),
+            (Some(SID_2017), Some("idle"))
+        );
+        // mod の報告が答えていても先取りは立つ（走査は要らない = background は何もしない）
+        host.claude_mod.accept(
+            pane,
+            mod_report_2017(Some(SID_2017), "idle"),
+            std::time::Instant::now(),
+        );
+        let needs = with_ui_probes(&UiProbes::default(), || probe_needs(&host, &request))
+            .expect("self は先取りの対象");
+        assert_eq!(needs.self_scan, Some(("tako-s2017".to_string(), false)));
+        // 器が無ければ走査の材料が無い（先取りも走査も無し = 修正前と同じ unknown）
+        host.backend_sessions.clear();
+        host.claude_mod = tako_core::claude_mod::ModHub::new(true);
+        let needs = with_ui_probes(&UiProbes::default(), || probe_needs(&host, &request))
+            .expect("self は先取りの対象");
+        assert!(needs.is_empty());
+    }
+
+    /// report も同じ: 同一性を確かめたペインの新しい報告の会話 ID を UI スレッドで写す（走査なし）
+    #[test]
+    fn issue2017_reportは新しいmodの報告の会話idを写す() {
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        host.backend_sessions.insert(pane, "tako-s2017".into());
+        let query = |tmux: Option<&str>| WorkerQuery {
+            pane_id: pane,
+            session_id: None,
+            tmux_session: tmux.map(str::to_string),
+        };
+        assert_eq!(collect_report_ctx(&host, query(None)).mod_session, None);
+        host.claude_mod.accept(
+            pane,
+            mod_report_2017(Some(SID_2017), "idle"),
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            collect_report_ctx(&host, query(None))
+                .mod_session
+                .as_deref(),
+            Some(SID_2017)
+        );
+        // 別の worker の器（ペイン ID の再利用）なら報告も別物 = 使わない
+        assert_eq!(
+            collect_report_ctx(&host, query(Some("tako-other"))).mod_session,
+            None
+        );
     }
 
     /// #1903: ステータスバーの 5h / 7d は mod の報告を先に見る（フォーカス順で最初に引けたペインの

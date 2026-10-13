@@ -1825,7 +1825,10 @@ pub const MATRIX: &[AgentFeature] = &[
              4.3〜5.7s で増えておらず、watch の偽イベントは 6 ラウンドとも 0 件。\
              (Thinking) 型の誤爆（#120）は弱マーカーの agent 別分離で構造的に起こらない。\
              #1880（claude）: tako mod の報告があれば turn を一次ソースにする（status_source=mod）。\
-             無い・古い・止まったら claude agents --json → 画面へ落ちる",
+             無い・古い・止まったら claude agents --json → 画面へ落ちる。\
+             #2017: 報告が 20 秒以内（heartbeat 15 秒 + 余裕）で会話 ID を持てば claude agents --json \
+             を起こさない（応答の agents_scan.skipped）。完了・権限待ち・idle の判定は同じ報告の \
+             turn と画面の補正のままで変わらない",
         ),
     },
     AgentFeature {
@@ -1847,7 +1850,12 @@ pub const MATRIX: &[AgentFeature] = &[
              画面に答えが出た時刻と終端 PLANNER_RESPONSE が書かれた時刻が同一標本 \
              （0.2 秒ポーリングで差 0.00 秒）。tako は status_source=agy-session として読む。\
              ペイン → 会話は生きた agy が開いたままの brain/<id> を lsof で引く \
-             （codex の thread-writer-locks と同じ形）",
+             （codex の thread-writer-locks と同じ形）。\
+             claude の一次シグナルは #1880 / #2017 から **tako mod の報告**（会話 ID・turn・モデル・ctx）: \
+             新しい報告（20 秒以内）があるペインは claude agents --json を起こさない。走査は mod の \
+             無い・古い・止まった claude だけで、起こすのもその claude が居る config dir（台帳 \
+             <config dir>/sessions/<pid>.json で絞る）と既定だけ・ログインシェルを経由しない。\
+             本番 v0.8.31 の実測で走査は 1 分 60 本（4 アカウント × 15 回）・回収済みの子の CPU 24.4%",
         ),
     },
     AgentFeature {
