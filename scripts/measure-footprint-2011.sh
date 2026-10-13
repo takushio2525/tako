@@ -30,8 +30,8 @@
 #   TAKO_FOOTPRINT_ENV="TAKO_2009_LEGACY=1"  起こす GUI へ足す env（A/B 用。空白区切り）
 #   TAKO_FOOTPRINT_OUT=<file>                結果の TSV を追記する先（既定は表示だけ）
 #
-# **蓋を閉じた機ではフレームが組まれないことがある**（memory: lid-closed-no-frames）。出力の
-#   `描画` 欄が「なし」の行は描画の CPU と回数を含まない（未実測と読む）。
+# **蓋を閉じた機・画面ロック中はフレームが組まれない**（memory: lid-closed-no-frames）。出力の
+#   `描画` 欄が「なし」の行は描画の CPU・回数・描画の資源を含まない（未実測と読む）。
 #
 # 隔離 GUI・tako-vd・本番の tako / 設定 / tmux には触らない。落とすのは自分で起こした pid と
 # 自分の tmux ソケットだけ。CPU を焼く負荷生成はしない（出力させるのは 1 ペインだけ・1 行 10ms）。
@@ -95,10 +95,10 @@ f = ru.f
 print(f"{f[0]*k:.4f} {f[1]*k:.4f} {f[10]*k:.4f} {f[11]*k:.4f} {f[40]/1e9:.4f} {f[2]+f[3]}")
 PY
 cat > "$TMP/fp.py" <<'PY'
-# footprint -j の tako-app を「合計 / malloc / 描画の実質 / その他」へ、残り（tmux）は合計だけ出す（MB）。
-# 描画の区分（IOAccelerator・… (graphics)・IOSurface・CoreAnimation）は互いに重なって数えられ、
-# 和が合計を超えることがある（#2011 の実測で差し引きの「その他」が -74 MB になった）。
-# だから描画は「合計 − malloc − 描画以外の区分」の差し引きで出す
+# footprint -j の tako-app を「合計 / malloc / 描画 / その他」へ、残り（tmux）は合計だけ出す（MB）。
+# **各区分は `dirty` だけを足す**: `dirty` は圧縮・スワップされた分を既に含み、区分の `dirty` の和が
+# phys_footprint と一致する。`swapped` を足すと二重に数え、メモリ圧が高いと malloc が合計を超える
+# （#2011 の S0 で実際に踏んだ）
 import json, sys
 d = json.load(open(sys.argv[1]))
 procs = d.get("processes") or []
@@ -106,7 +106,7 @@ MB = 1024 * 1024
 def gfx(k):
     return k.startswith("IOAccelerator") or "(graphics)" in k or k == "IOSurface" or k == "CoreAnimation"
 def cat(p, pred):
-    return sum(v.get("dirty", 0) + v.get("swapped", 0) for k, v in (p.get("categories") or {}).items() if pred(k))
+    return sum(v.get("dirty", 0) for k, v in (p.get("categories") or {}).items() if pred(k))
 app = next((p for p in procs if str(p.get("pid")) == sys.argv[2]), None)
 if app is None:
     print("- - - - -"); sys.exit(0)
@@ -168,6 +168,8 @@ filled_count() {
   echo "$n"
 }
 lid_state() { ioreg -r -k AppleClamshellState -d 1 2>/dev/null | grep -q '"AppleClamshellState" = Yes' && echo "閉" || echo "開"; }
+# 画面がロックされている間はフレームが組まれない（描画の値が未実測になる）ので行に残す
+lock_state() { ioreg -n Root -d1 -a 2>/dev/null | grep -A1 CGSSessionScreenIsLocked | grep -q '<true/>' && echo "ロック" || echo "-"; }
 # footprint を 1 回で採る: 本体 + 器のときは tmux のクライアント（本体の子）とサーバー
 measure_fp() {
   local pid="$1" fp_args c srv
@@ -244,7 +246,7 @@ export TAKO_TMUX_SOCKET="$SOCK_NAME"
 mkdir -p "$HOME"
 make_assets
 
-HEADER="scenario	mode	panes	front	back_tab	bg	previews	startup_ms	footprint_mb	malloc_mb	gfx_mb	other_mb	tmux_mb	threads	children	cpu_pct	child_cpu_pct	energy_mw	wakeups_s	body_renders_s	flushes_s	busy_footprint_mb	busy_malloc_mb	busy_gfx_mb	busy_cpu_pct	busy_energy_mw	busy_body_renders_s	busy_flushes_s	filled	drawn	lid	env"
+HEADER="scenario	mode	panes	front	back_tab	bg	previews	startup_ms	footprint_mb	malloc_mb	gfx_mb	other_mb	tmux_mb	threads	children	cpu_pct	child_cpu_pct	energy_mw	wakeups_s	body_renders_s	flushes_s	busy_footprint_mb	busy_malloc_mb	busy_gfx_mb	busy_cpu_pct	busy_energy_mw	busy_body_renders_s	busy_flushes_s	filled	drawn	lid	locked	env"
 echo "$HEADER" > "$TMP/result.tsv"
 
 # 1 本ぶん: 起こす → 並べる → 放置して測る → 落とす
@@ -346,11 +348,11 @@ run_one() {
   kill "$CAFF_PID" 2>/dev/null; CAFF_PID=""
 
   python3 - "$spec" "$mode" "$n" "$front" "$back_tab" "$bg" "$previews" "$((t1 - t0))" "$fp_idle" "$threads" "$children" \
-    "$r0" "$r1" "$b0" "$b1" "$fp_busy" "$q0" "$q1" "$s0" "$s1" "$IDLE" "$filled/$n" "$(lid_state)" "${EXTRA_ENV:--}" \
+    "$r0" "$r1" "$b0" "$b1" "$fp_busy" "$q0" "$q1" "$s0" "$s1" "$IDLE" "$filled/$n" "$(lid_state)" "$(lock_state)" "${EXTRA_ENV:--}" \
     >> "$TMP/result.tsv" <<'PY'
 import sys
 (spec, mode, n, front, back, bg, prev, startup, fp_idle, threads, children,
- r0, r1, b0, b1, fp_busy, q0, q1, s0, s1, secs, filled, lid, env) = sys.argv[1:]
+ r0, r1, b0, b1, fp_busy, q0, q1, s0, s1, secs, filled, lid, locked, env) = sys.argv[1:]
 secs = float(secs)
 def f(s): return [float(x) for x in s.split()]
 def rates(a, b, c, d):
@@ -361,17 +363,17 @@ def rates(a, b, c, d):
 i = rates(r0, r1, b0, b1)
 k = rates(q0, q1, s0, s1)
 bt, bm, bg_, _, _ = (fp_busy.split() + ["-"] * 5)[:5]
-# 出力中に本体の描画が 1 回も起きていなければ、この機ではフレームが組まれていない（描画の値は未実測）
+# 出力中に本体の描画が 1 回も起きていなければ、フレームが組まれていない（蓋閉じ・画面ロック = 描画の値は未実測）
 drawn = "あり" if k["body"] > 0 else "なし"
 print("\t".join([spec, mode, n, front, back, bg, prev, startup] + fp_idle.split() + [threads, children,
       "%.2f" % i["cpu"], "%.2f" % i["child"], "%.1f" % i["energy"], "%.1f" % i["wake"], "%.2f" % i["body"], "%.2f" % i["flush"],
       bt, bm, bg_, "%.2f" % k["cpu"], "%.1f" % k["energy"], "%.1f" % k["body"], "%.1f" % k["flush"],
-      filled, drawn, lid, env]))
+      filled, drawn, lid, locked, env]))
 PY
   stop_isolated_gui "$ISOLATED_GUI_PID"; ISOLATED_GUI_PID=""
   tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
   unset TAKO_SOCKET TAKO_TOKEN
-  tail -1 "$TMP/result.tsv" | awk -F'\t' '{printf "  %-14s 放置 %6s MB（malloc %s・描画 %s・tmux %s）CPU %s%%・子 %s%%・描画 %s 回/秒 ｜ 出力中 %s MB（描画 %s）CPU %s%%・描画 %s 回/秒 ｜ 起動 %s ms・スレッド %s・中身 %s・描画 %s・蓋 %s\n", $1, $9, $10, $11, $13, $16, $17, $20, $22, $24, $25, $28, $8, $14, $29, $30, $31}'
+  tail -1 "$TMP/result.tsv" | awk -F'\t' '{printf "  %-14s 放置 %6s MB（malloc %s・描画 %s・tmux %s）CPU %s%%・子 %s%%・描画 %s 回/秒 ｜ 出力中 %s MB（描画 %s）CPU %s%%・描画 %s 回/秒 ｜ 起動 %s ms・スレッド %s・中身 %s・描画 %s・蓋 %s\n", $1, $9, $10, $11, $13, $16, $17, $20, $22, $24, $25, $27, $8, $14, $29, $30, $31 ($32 == "ロック" ? "・画面ロック中" : "")}'
   sleep 3
 }
 
