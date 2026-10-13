@@ -5587,20 +5587,70 @@ impl TakoApp {
                 // #728: 走査対象は「器のセッション」と「器を持たないペインの PTY 子 pid」の
                 // 両方。以前は前者が空なら丸ごとスキップしていたので、psmux 未導入の
                 // Windows（と tmux 不在の macOS）ではカタログも resume マップも永久に空だった
-                let (should_scan, backends, pane_pids, probes) = this
-                    .update(cx, |app: &mut TakoApp, _| {
+                // #2017: mod の報告に会話 ID が新しく載っているペインは `claude agents --json` に
+                // 問わない（`from_mod`。判断は監視と同じ `claude_mod::monitor_plan`）。走査が要るのは
+                // 残りのペイン（`scan_backends` / `scan_pids`）に居る claude だけ
+                let (should_scan, backends, pane_pids, probes, scan_backends, scan_pids, from_mod) =
+                    this.update(cx, |app: &mut TakoApp, _| {
                         let mut backends: Vec<String> = Vec::new();
                         // 器を持たないペインの (tako ペイン ID, PTY 直下の子 pid)
                         let mut pane_pids: Vec<(u64, u32)> = Vec::new();
                         // codex / agy の会話 ID を引くための材料（#1238）。
                         // 器の有無で辿り方が変わるので、ペイン ID と一緒に持つ
                         let mut probes: Vec<tako_control::agent_resume::PaneProbe> = Vec::new();
+                        let mut scan_backends: Vec<String> = Vec::new();
+                        let mut scan_pids: Vec<(u64, u32)> = Vec::new();
+                        let mut from_mod: Vec<tako_control::sessions::DetectedSession> = Vec::new();
+                        let now = std::time::Instant::now();
                         for (pane, session) in &app.terminals {
                             let backend = app.backend_sessions.get(pane).cloned();
                             let pty_pid = session.child_pid();
+                            let looked_up = tako_core::claude_mod::lookup(
+                                Some(&app.claude_mod),
+                                pane.as_u64(),
+                                now,
+                                tako_core::claude_mod::s2_legacy(),
+                            );
+                            let answered = match tako_core::claude_mod::monitor_plan(
+                                &looked_up,
+                                now,
+                                None,
+                                tako_core::claude_mod::monitor_legacy(),
+                            ) {
+                                tako_core::claude_mod::MonitorPlan::Mod { session_id } => {
+                                    tako_control::sessions::detected_from_mod(
+                                        pane.as_u64(),
+                                        backend.as_deref(),
+                                        &session_id,
+                                        looked_up
+                                            .as_ref()
+                                            .ok()
+                                            .and_then(|s| s.report.model.as_deref()),
+                                    )
+                                }
+                                tako_core::claude_mod::MonitorPlan::Scan { .. } => None,
+                            };
+                            let answered = match answered {
+                                Some(detected) => {
+                                    from_mod.push(detected);
+                                    true
+                                }
+                                None => false,
+                            };
                             match &backend {
-                                Some(b) => backends.push(b.clone()),
-                                None => pane_pids.extend(pty_pid.map(|pid| (pane.as_u64(), pid))),
+                                Some(b) => {
+                                    backends.push(b.clone());
+                                    if !answered {
+                                        scan_backends.push(b.clone());
+                                    }
+                                }
+                                None => {
+                                    let direct = pty_pid.map(|pid| (pane.as_u64(), pid));
+                                    pane_pids.extend(direct);
+                                    if !answered {
+                                        scan_pids.extend(direct);
+                                    }
+                                }
                             }
                             probes.push(tako_control::agent_resume::PaneProbe {
                                 pane: pane.as_u64(),
@@ -5613,25 +5663,51 @@ impl TakoApp {
                             && !(backends.is_empty() && pane_pids.is_empty())
                             && std::env::var_os("TAKO_SELF_TEST").is_none();
                         match should {
-                            true => (true, backends, pane_pids, probes),
-                            false => (false, Vec::new(), Vec::new(), Vec::new()),
+                            true => (
+                                true,
+                                backends,
+                                pane_pids,
+                                probes,
+                                scan_backends,
+                                scan_pids,
+                                from_mod,
+                            ),
+                            false => Default::default(),
                         }
                     })
-                    .unwrap_or((false, Vec::new(), Vec::new(), Vec::new()));
+                    .unwrap_or_default();
                 if !should_scan {
                     last_scan = Some(std::time::Instant::now());
                     continue;
                 }
                 // 前段ガード: 走査対象に実行中の子プロセスがなければ claude も居ないので
-                // Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）
+                // Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）。
+                // #2017: mod の報告が答えていないペインだけでも同じ判定をする（1 回の採取で両方）
                 let guard_pids: Vec<u32> = pane_pids.iter().map(|(_, pid)| *pid).collect();
-                let has_children = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let refs: Vec<&str> = backends.iter().map(|s| s.as_str()).collect();
-                        tako_control::agents::any_target_has_running_children(&refs, &guard_pids)
-                    })
-                    .await;
+                let (has_children, scan_needed) = {
+                    let scan_backends = scan_backends.clone();
+                    let scan_guard: Vec<u32> = scan_pids.iter().map(|(_, pid)| *pid).collect();
+                    cx.background_executor()
+                        .spawn(async move {
+                            tako_control::agents::with_shared_scan(|| {
+                                let refs: Vec<&str> = backends.iter().map(|s| s.as_str()).collect();
+                                let any = tako_control::agents::any_target_has_running_children(
+                                    &refs,
+                                    &guard_pids,
+                                );
+                                let refs: Vec<&str> =
+                                    scan_backends.iter().map(|s| s.as_str()).collect();
+                                let scan = any
+                                    && !(refs.is_empty() && scan_guard.is_empty())
+                                    && tako_control::agents::any_target_has_running_children(
+                                        &refs,
+                                        &scan_guard,
+                                    );
+                                (any, scan)
+                            })
+                        })
+                        .await
+                };
                 if !has_children {
                     last_scan = Some(std::time::Instant::now());
                     let _ = this.update(cx, |app: &mut TakoApp, _| {
@@ -5648,16 +5724,30 @@ impl TakoApp {
                     continue;
                 }
                 // 1 回の `claude agents --json` 取得から resume マップ（従来）と
-                // セッションカタログの検出（Issue #112 A）の両方を導出する
-                let agents_value = cx
-                    .background_executor()
-                    .spawn(async move { tako_control::agents::list_agents_for_scan(&pane_pids) })
-                    .await;
-                last_scan = Some(std::time::Instant::now());
-                let Ok(agents_value) = agents_value else {
-                    continue;
+                // セッションカタログの検出（Issue #112 A）の両方を導出する。
+                // #2017: 走査は mod の報告が答えていないペインに子プロセスがあるときだけで、
+                // 起こすのもそこに claude が居るアカウントだけ（台帳で絞る）
+                let scanned = match scan_needed {
+                    true => {
+                        let agents_value = cx
+                            .background_executor()
+                            .spawn(async move {
+                                tako_control::agents::list_agents_for_scan_scoped(
+                                    &scan_backends,
+                                    &scan_pids,
+                                )
+                            })
+                            .await;
+                        let Ok(agents_value) = agents_value else {
+                            last_scan = Some(std::time::Instant::now());
+                            continue;
+                        };
+                        tako_control::sessions::detect_from_agents_value(&agents_value)
+                    }
+                    false => Vec::new(),
                 };
-                let detected = tako_control::sessions::detect_from_agents_value(&agents_value);
+                last_scan = Some(std::time::Instant::now());
+                let detected = tako_control::sessions::merge_detected(scanned, from_mod);
                 // codex / agy の会話 ID（#1238）。**プロセス表 1 枚 + agent ペインぶんの
                 // `lsof`** で済み、claude の検出（Node 起動）に比べれば桁が小さい。
                 // background で採るのは `lsof` を UI スレッドで起こさないため

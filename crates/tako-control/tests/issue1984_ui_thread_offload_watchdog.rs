@@ -40,6 +40,8 @@
 //!    同期の腕と background は同じ本体（`git_write_reply`）。起動時の orphan の一括回収は計画だけ
 //!    UI スレッドで、器の一覧と kill は background（同期は A/B のゲートの後ろだけ）。起動時の
 //!    自動復帰が UI スレッドで呼ぶ tmux の 3 口（`session_cwd` / `session_env` / `set_session_env`）は上限つき
+//! 9. #2017: `orchestrator self` の会話 ID と状態（`claude agents --json` + 器の pid 祖先辿り）は
+//!    先取り（`self_scan`）に載せ、UI スレッドの dispatch は読む側の関数（`self_agent_scan`）だけを通す
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -129,6 +131,13 @@ const RAW: &[(&str, &str)] = &[
         "resolve_current_claude_binary(",
         "`claude` の所在（ログインシェル）と版の確認",
     ),
+    // #2017: `orchestrator self` は会話 ID の解決と状態の照会を UI スレッドで直に呼んでいた
+    // （`resolve_session_id_for_backend` を包んだ口なので上の綴りでは拾えなかった）
+    (
+        "resolve_session_id_for_pane_via_host(",
+        "`claude agents --json` + 器の pid 祖先辿り",
+    ),
+    ("query_agent_status(", "`claude agents --json`"),
 ];
 
 /// UI スレッドで走る dispatch の経路（先取りの判断を含む）。窓の頭の綴り
@@ -166,6 +175,8 @@ const READERS: &[&str] = &[
     "fn restart_scan(",
     "fn git_conflict_for(",
     "fn tmux_open_lookup(",
+    // #2017
+    "fn self_agent_scan(",
 ];
 
 /// `probe_needs` が挙げるべき要求（先取りが要る要求）
@@ -1545,6 +1556,34 @@ fn 逆戻りを名指しできる() {
         scan_tmux_backend(&t),
         TMUX_BACKEND,
         "pub fn session_env(",
+    );
+
+    // ㉔ #2017: self の会話 ID と状態を修正前の UI スレッドの走査へ戻す
+    let d = inject(
+        &s.dispatch,
+        "        _ => self_agent_scan(host, pane_id),",
+        "        _ => {\n            let sid = resolve_session_id_for_pane_via_host(host, pane_id);\n            let status = sid\n                .as_deref()\n                .map(|s| orchestrator::query_agent_status(s).status)\n                .unwrap_or_default();\n            (sid, status)\n        }",
+        "㉔",
+    );
+    expect_named(
+        "self の走査を UI スレッドへ",
+        scan_ui_paths(&d),
+        DISPATCH,
+        "fn dispatch_orchestrator_self(",
+    );
+
+    // ㉕ #2017: self の読み口が先取りを読む前に走査する
+    let d = inject(
+        &s.dispatch,
+        "    let Some(backend) = host.backend_session(pane_id) else {\n        return unknown();",
+        "    let _ = resolve_session_id_for_pane_via_host(host, pane_id);\n    let Some(backend) = host.backend_session(pane_id) else {\n        return unknown();",
+        "㉕",
+    );
+    expect_named(
+        "self の読み口が Outside の外で走査",
+        scan_readers(&d),
+        DISPATCH,
+        "fn self_agent_scan(",
     );
 
     // ⑩ check_qos を修正前の上限なしの ps へ戻す

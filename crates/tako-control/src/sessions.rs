@@ -312,6 +312,55 @@ pub fn detect_from_agents_value(value: &Value) -> Vec<DetectedSession> {
         .collect()
 }
 
+/// mod の報告が答えたペインの検出（#2017。GUI の定期スキャンは、mod の報告に会話 ID が
+/// 新しく載っているペインを `claude agents --json` に問わない）。
+///
+/// 対応キーは走査の検出（[`detect_from_agents_value`]）と同じ: 器があれば器のセッション名、
+/// 無ければ tako のペイン ID。`agent_cwd` は報告に無いので `None`（同期は前回値かペインの cwd を使う）
+pub fn detected_from_mod(
+    pane: u64,
+    backend: Option<&str>,
+    session_id: &str,
+    model: Option<&str>,
+) -> Option<DetectedSession> {
+    if !crate::transcript::is_valid_session_id(session_id) {
+        return None;
+    }
+    Some(DetectedSession {
+        session_id: session_id.to_string(),
+        tmux_session: backend.map(str::to_string),
+        pane: backend.is_none().then_some(pane),
+        agent_cwd: None,
+        model: model.map(str::to_string),
+    })
+}
+
+/// 走査の検出と mod の報告の検出を 1 本にする（#2017。純関数）。
+///
+/// 同じペイン（器のセッション名 / ペイン ID）で会話 ID も同じなら走査の検出を採る（`cwd` を持つ）。
+/// 会話 ID が食い違えば mod の報告を採る（走査は最大 30 秒古い = UI の鮮度。mod は 20 秒以内で、
+/// `/clear` / `/resume` の後の会話 ID を先に運ぶ）。走査が拾わなかったペインは mod の側を足す
+pub fn merge_detected(
+    scanned: Vec<DetectedSession>,
+    from_mod: Vec<DetectedSession>,
+) -> Vec<DetectedSession> {
+    let same_pane =
+        |a: &DetectedSession, b: &DetectedSession| match (&a.tmux_session, &b.tmux_session) {
+            (Some(x), Some(y)) => x == y,
+            (None, None) => a.pane.is_some() && a.pane == b.pane,
+            _ => false,
+        };
+    let mut merged = scanned;
+    for d in from_mod {
+        match merged.iter_mut().find(|s| same_pane(s, &d)) {
+            Some(s) if s.session_id == d.session_id => {}
+            Some(s) => *s = d,
+            None => merged.push(d),
+        }
+    }
+    merged
+}
+
 /// 検出結果をカタログへ同期する（pending の昇格 + エントリ更新 + GC）。
 /// GUI の定期スキャン（background）から呼ばれる
 pub fn sync_detected(
@@ -1792,5 +1841,68 @@ mod tests {
             resolve_session_for_pane_in(&catalog, "7").as_deref(),
             Some("session-started-only")
         );
+    }
+
+    // --- #2017: mod の報告からの検出と走査の検出の合成 ---------------------------------
+
+    const SID_2017_A: &str = "2017aaaa-0000-4000-8000-00000000000a";
+    const SID_2017_B: &str = "2017aaaa-0000-4000-8000-00000000000b";
+
+    #[test]
+    fn issue2017_modの報告からの検出は器があれば器名_無ければペインidで対応付ける() {
+        let d =
+            detected_from_mod(3, Some("tako-s3"), SID_2017_A, Some("claude-haiku-5-5")).unwrap();
+        assert_eq!(d.tmux_session.as_deref(), Some("tako-s3"));
+        assert_eq!(
+            d.pane, None,
+            "器があれば走査の検出（detect_from_agents_value）と同じ器名のキー"
+        );
+        assert_eq!(d.agent_cwd, None);
+        assert_eq!(d.model.as_deref(), Some("claude-haiku-5-5"));
+        let d = detected_from_mod(4, None, SID_2017_A, None).unwrap();
+        assert_eq!((d.tmux_session, d.pane), (None, Some(4)));
+        assert!(
+            detected_from_mod(4, None, "../../etc", None).is_none(),
+            "会話 ID として使えない値は載せない（transcript の参照キー）"
+        );
+    }
+
+    #[test]
+    fn issue2017_同じペイン同じ会話は走査の検出を採り食い違えばmodを採る() {
+        let scan = |backend: &str, sid: &str| DetectedSession {
+            session_id: sid.into(),
+            tmux_session: Some(backend.into()),
+            pane: None,
+            agent_cwd: Some("/w".into()),
+            model: None,
+        };
+        let scanned = vec![scan("tako-s1", SID_2017_A), scan("tako-s3", SID_2017_A)];
+        let from_mod = vec![
+            // 同じ会話 = 走査の検出（cwd つき）のまま
+            detected_from_mod(1, Some("tako-s1"), SID_2017_A, None).unwrap(),
+            // 食い違い（/clear の後）= mod の会話 ID を採る
+            detected_from_mod(3, Some("tako-s3"), SID_2017_B, None).unwrap(),
+            // 走査が拾わなかったペイン = 足す
+            detected_from_mod(2, Some("tako-s2"), SID_2017_B, None).unwrap(),
+            detected_from_mod(9, None, SID_2017_B, None).unwrap(),
+        ];
+        let merged = merge_detected(scanned, from_mod);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(
+            (
+                merged[0].session_id.as_str(),
+                merged[0].agent_cwd.as_deref()
+            ),
+            (SID_2017_A, Some("/w"))
+        );
+        assert_eq!(
+            (
+                merged[1].session_id.as_str(),
+                merged[1].tmux_session.as_deref()
+            ),
+            (SID_2017_B, Some("tako-s3"))
+        );
+        assert_eq!(merged[2].tmux_session.as_deref(), Some("tako-s2"));
+        assert_eq!(merged[3].pane, Some(9));
     }
 }

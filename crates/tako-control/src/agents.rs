@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::orchestrator::AgentScanFreshness;
+use crate::orchestrator::{AgentScanFreshness, ScanScope};
 
 /// プロセス祖先辿りの最大段数（暴走防止。シェル → claude は通常 1〜3 段）
 const MAX_ANCESTOR_HOPS: usize = 20;
@@ -28,7 +28,16 @@ pub fn list_agents() -> Result<Vec<Value>, String> {
 
 /// [`list_agents`] の鮮度を明示する版（Issue #1011）
 pub fn list_agents_with_freshness(freshness: AgentScanFreshness) -> Result<Vec<Value>, String> {
-    let stdout = crate::orchestrator::run_claude_agents_json(freshness)
+    list_agents_scoped(freshness, &ScanScope::All)
+}
+
+/// 答えが要る範囲を絞る版（Issue #2017）。範囲の外の claude は返らないことがある
+/// （その claude しか居ない明示アカウントは起こさない）ので、範囲の中だけを読むこと
+pub fn list_agents_scoped(
+    freshness: AgentScanFreshness,
+    scope: &ScanScope,
+) -> Result<Vec<Value>, String> {
+    let stdout = crate::orchestrator::run_claude_agents_json_scoped(freshness, scope)
         .ok_or("claude agents --json の実行に失敗（claude CLI が見つからないか異常終了）")?;
     let text = String::from_utf8(stdout).map_err(|e| format!("出力が UTF-8 でない: {e}"))?;
     let parsed: Value =
@@ -635,8 +644,11 @@ pub fn resolve_session_id_for_backend(backend_session: &str) -> Option<String> {
     }
 
     // #1011: `worker_status` の `agents-auto` 経路から呼ばれる = worker 監視なので
-    // 既定（Monitoring / 5 秒）のまま
-    let agents = list_agents().ok()?;
+    // 既定（Monitoring / 5 秒）のまま。
+    // #2017: 起こすのはこの器のペインの子孫に claude が居る走査先だけ（台帳で絞る）
+    let roots: Vec<u32> = target_panes.iter().map(|(_, pid)| *pid).collect();
+    let agents =
+        list_agents_scoped(AgentScanFreshness::Monitoring, &ScanScope::Under(roots)).ok()?;
     if agents.is_empty() {
         return None;
     }
@@ -755,7 +767,7 @@ fn live_claude_sessions_in(
     use std::sync::Mutex;
     // 最後に live 解決できた backend → セッションの記憶（#466）。
     // `claude agents --json` は一時失敗・実行中エージェントの列挙漏れが現実に起きる
-    // （run_claude_agents_json は鮮度窓のあいだ失敗もキャッシュする）。素通しで空を返すと
+    // （run_claude_agents_json_scoped は鮮度窓のあいだ失敗もキャッシュする）。素通しで空を返すと
     // 呼び出し側（remote の v2 panes）が sessions カタログの stale な旧世代セッションへ
     // フォールバックし、リモートのチャットビューが凍結した古い transcript を
     // 読み続ける。失敗・欠落時は直近の成功結果で補い、ペインごと消えた backend
@@ -982,7 +994,7 @@ fn has_running_descendants_inner(roots: &[u32], parents: &HashMap<u32, u32>) -> 
 }
 
 /// pid が target_pids のいずれかの子孫（自身を含む）かどうか
-fn is_descendant_of(
+pub(crate) fn is_descendant_of(
     pid: u32,
     target_pids: &std::collections::HashSet<u32>,
     parents: &HashMap<u32, u32>,
@@ -1041,6 +1053,34 @@ pub fn list_agents_for_scan(pane_pids: &[(u64, u32)]) -> Result<Value, String> {
         attach_tako_pane_ids(&mut agents, pane_pids, &parents);
     }
     Ok(json!({ "agents": agents }))
+}
+
+/// [`list_agents_for_scan`] の範囲を絞る版（Issue #2017。GUI のセッションカタログの走査）。
+///
+/// `backends` / `pane_pids` は **mod の報告で会話 ID が出ていない**ペインだけ（器のセッション名 /
+/// 器なしの `(tako ペイン ID, PTY 子 pid)`）。答えが要るのはそこに居る claude だけなので、
+/// 台帳でそこに claude が居ない明示アカウントは起こさない（mod の報告があるペインは呼び出し側が
+/// 報告から埋める）。返す一覧は範囲の外の claude を含みうる（既定 config dir は必ず起こす = #1011）
+pub fn list_agents_for_scan_scoped(
+    backends: &[String],
+    pane_pids: &[(u64, u32)],
+) -> Result<Value, String> {
+    with_shared_scan(|| {
+        let backend_panes = backend_pane_pids();
+        let mut roots: Vec<u32> = backend_panes
+            .iter()
+            .filter(|(id, _)| backends.iter().any(|b| id.starts_with(&format!("{b}:"))))
+            .map(|(_, pid)| *pid)
+            .collect();
+        roots.extend(pane_pids.iter().map(|(_, pid)| *pid));
+        let mut agents = list_agents_scoped(AgentScanFreshness::Ui, &ScanScope::Under(roots))?;
+        if !backend_panes.is_empty() || !pane_pids.is_empty() {
+            let parents = process_parent_map();
+            attach_pane_ids(&mut agents, &backend_panes, &parents);
+            attach_tako_pane_ids(&mut agents, pane_pids, &parents);
+        }
+        Ok(json!({ "agents": agents }))
+    })
 }
 
 /// 器を持たないペインへ `tako_pane` フィールド（tako のペイン ID）を付与する（#728）。

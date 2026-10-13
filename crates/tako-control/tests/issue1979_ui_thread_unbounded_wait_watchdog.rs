@@ -534,9 +534,10 @@ fn 走査が空振りしていない() {
             "ports::process_table()",
         ),
         (&s.probe, "pub fn wait_with_timeout(", "try_wait()"),
+        // #2017: 走査の待ちの 1 実装は `run_agents_scan`（直接起動とログインシェルの両方が通る）
         (
             &s.orch,
-            "fn run_claude_agents_json_live(",
+            "fn run_agents_scan(",
             "command_output_with_timeout(",
         ),
         (&s.dispatch, "pub fn prepare_offload(", "Request::List if"),
@@ -635,10 +636,10 @@ fn 逆戻りを名指しできる() {
         "同期に `wait`",
     );
 
-    // ④' `claude agents --json` の走査を修正前の `output()` へ戻す
+    // ④' `claude agents --json` の走査を修正前の `output()` へ戻す（#2017 で待ちは `run_agents_scan` の 1 本）
     let injected = s.orch.replacen(
-        "    let output = match tako_core::probe::command_output_with_timeout(\n        &mut command,",
-        "    let output = match command.output() {\n        Ok(o) => o, _ => return None };\n    let _ = (\n        &mut command,",
+        "    let (status, stdout, stderr) = match tako_core::probe::command_output_with_timeout(",
+        "    let _ = command.output();\n    let (status, stdout, stderr) = match tako_core::probe::command_output_with_timeout(",
         1,
     );
     assert_ne!(injected, s.orch, "注入④'の置換元がある");
@@ -646,7 +647,7 @@ fn 逆戻りを名指しできる() {
         "claude agents の走査を output() へ",
         scan_primitive(ORCH, &injected),
         ORCH,
-        "fn run_claude_agents_json_live",
+        "fn run_agents_scan",
     );
 
     // ⑤ `tako list` を background へ出さない（修正前の prepare_offload）
