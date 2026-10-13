@@ -565,6 +565,46 @@ pub fn tasks_comment_limit(max: usize) -> String {
 pub fn tasks_thread() -> &'static str {
     tr!("やりとり", "Thread")
 }
+/// やりとりの見出し（#2016。件数つき = 0 件でも「履歴の置き場」があると分かる）
+pub fn tasks_thread_count(n: usize) -> String {
+    tr!(format!("やりとり（{n}）"), format!("Thread ({n})"))
+}
+/// やりとりが 0 件のとき（#2016）
+pub fn tasks_thread_empty() -> &'static str {
+    tr!("まだ返答はありません", "No responses yet")
+}
+/// 送った直後で積み終わっていない返答の印（#2016）
+pub fn tasks_sending() -> &'static str {
+    tr!("送信中", "Sending")
+}
+/// 返答をどこから返したか（#2016。綴りの正本は `tako_core::user_task::Via::as_str`）
+pub fn tasks_via(via: &str) -> String {
+    match via {
+        "pc" => tr!("PC", "PC"),
+        "pwa" => tr!("スマホ", "Phone"),
+        "cli" => tr!("CLI", "CLI"),
+        "mcp" => tr!("AI（MCP）", "AI (MCP)"),
+        other => other,
+    }
+    .to_string()
+}
+/// 返答を積めなかったとき（#2016）。書いたものは欄へ戻すか、別の項目へ移っていたら
+/// その項目を開き直したときに戻す（どちらかを言う = 黙って捨てたように見せない）
+pub fn tasks_send_failed(id: &str, reason: &str, kept_as_draft: bool) -> String {
+    if kept_as_draft {
+        tr!(
+            format!("{id} へ返せませんでした: {reason}（書いた返答は {id} を開き直すと戻ります）"),
+            format!(
+                "Could not send to {id}: {reason} (your reply comes back when you reopen {id})"
+            )
+        )
+    } else {
+        tr!(
+            format!("{id} へ返せませんでした: {reason}（書いた返答は欄へ戻しました）"),
+            format!("Could not send to {id}: {reason} (your reply is back in the box)")
+        )
+    }
+}
 pub fn tasks_done() -> &'static str {
     tr!("完了", "Done")
 }
@@ -777,6 +817,14 @@ mod tests {
                 tasks_pick_decision().to_string(),
                 tasks_comment_limit(4000),
                 tasks_thread().to_string(),
+                // #2016: やりとりの見出し・経路・送信中・送れなかったとき
+                tasks_thread_count(3),
+                tasks_thread_empty().to_string(),
+                tasks_sending().to_string(),
+                tasks_via("pwa"),
+                tasks_via("mcp"),
+                tasks_send_failed("u-3", "not found", false),
+                tasks_send_failed("u-3", "not found", true),
                 tasks_done().to_string(),
                 tasks_dismiss().to_string(),
                 tasks_delivery("sent"),

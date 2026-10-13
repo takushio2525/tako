@@ -10479,13 +10479,12 @@ fn print_todo_detail(result: &Value) {
     for l in result["links"].as_array().unwrap_or(&Vec::new()) {
         println!("  リンク: {}", l.as_str().unwrap_or("-"));
     }
+    // #2016: やりとりは古い順（積んだ順）に、時刻つきで出す。時刻の表記は右パネルと同じ
+    // 1 実装（`user_task::response_stamp`）。複数行の本文は 2 行目以降を字下げして続ける
+    let now = tako_core::user_task::unix_now();
+    let offset = tako_core::platform::clock::local_utc_offset();
     for r in result["responses"].as_array().unwrap_or(&Vec::new()) {
-        println!(
-            "  返答[{}] {}: {}",
-            r["via"].as_str().unwrap_or("-"),
-            r["decision"].as_str().unwrap_or("-"),
-            r["comment"].as_str().unwrap_or(""),
-        );
+        print!("{}", todo_response_text(r, now, offset));
     }
     if let Some(d) = result["delivery"].as_object() {
         let reason = d
@@ -10502,6 +10501,27 @@ fn print_todo_detail(result: &Value) {
                 .unwrap_or_else(|| "-".into()),
         );
     }
+}
+
+/// やりとり 1 件の行（`tako todo show` の既定出力。#2016。機械検証できるよう印字と分けてある）。
+/// `  返答 11:02 [pc] needs_change: 本文` の形で、本文の 2 行目以降は字下げして続ける
+fn todo_response_text(r: &Value, now: i64, utc_offset: i32) -> String {
+    let stamp = r["at"]
+        .as_i64()
+        .map(|at| tako_core::user_task::response_stamp(at, now, utc_offset))
+        .unwrap_or_else(|| "-".to_string());
+    let comment = r["comment"].as_str().unwrap_or("");
+    let mut lines = comment.lines();
+    let mut out = format!(
+        "  返答 {stamp} [{}] {}: {}\n",
+        r["via"].as_str().unwrap_or("-"),
+        r["decision"].as_str().unwrap_or("-"),
+        lines.next().unwrap_or(""),
+    );
+    for rest in lines {
+        out.push_str(&format!("      {rest}\n"));
+    }
+    out
 }
 
 fn print_task_list(result: &Value) {
@@ -13414,6 +13434,34 @@ mod tests {
                 "  [      ] custom_1: 手動確認",
             ],
             "{text}"
+        );
+    }
+
+    /// #2016: `tako todo show` のやりとりは時刻つきで、複数行の本文は字下げして続く
+    #[test]
+    fn todo_showのやりとりは時刻つきで複数行を字下げする() {
+        // 2026-10-13 02:02:00 UTC
+        let at = 1_791_856_920;
+        let r = serde_json::json!({
+            "decision": "needs_change", "via": "pc", "at": at,
+            "comment": "サムネを大きく\n文字も太く",
+        });
+        assert_eq!(
+            todo_response_text(&r, at + 60, 9 * 3_600),
+            "  返答 11:02 [pc] needs_change: サムネを大きく\n      文字も太く\n"
+        );
+        // 本文が空でも 1 行出る（判断だけの返答）
+        let bare =
+            serde_json::json!({"decision": "approve", "via": "pwa", "at": at, "comment": ""});
+        assert_eq!(
+            todo_response_text(&bare, at + 86_400, 0),
+            "  返答 10/13 02:02 [pwa] approve: \n"
+        );
+        // `at` が読めない応答でも落ちない
+        let broken = serde_json::json!({"decision": "answered"});
+        assert_eq!(
+            todo_response_text(&broken, at, 0),
+            "  返答 - [-] answered: \n"
         );
     }
 

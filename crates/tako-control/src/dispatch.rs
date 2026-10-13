@@ -18526,26 +18526,13 @@ fn dispatch_user_task(
             }
             Ok(value)
         }
+        // #2016: 積む → 運ぶ → 記録する の 3 段を**同じスレッドで順に**通す。
+        // 画面（右パネル）は同じ 3 つを ① ③ = background / ② = UI スレッドに分けて呼ぶ
+        // （送った直後に欄を空にできる）。段の中身はここにしか無い
         "respond" => {
-            let id = user_task_id(&params)?;
-            let decision =
-                crate::user_tasks::parse_decision(params.decision.as_deref().ok_or_else(|| {
-                    DispatchError::InvalidParams("respond には decision が必要".into())
-                })?)
-                .map_err(DispatchError::InvalidParams)?;
-            let via = match params.via.as_deref() {
-                Some(v) => crate::user_tasks::parse_via(v).map_err(DispatchError::InvalidParams)?,
-                None => match origin {
-                    PaneOrigin::Mcp => tako_core::user_task::Via::Mcp,
-                    _ => tako_core::user_task::Via::Cli,
-                },
-            };
-            let comment = params.comment.clone().unwrap_or_default();
-            let (task, index) = crate::user_tasks::respond_at(&path, &id, decision, &comment, via)
-                .map_err(op_err)?;
-            let delivery = deliver_user_task_response(host, &task, index);
-            crate::user_tasks::record_delivery_at(&path, &id, delivery).map_err(op_err)?;
-            crate::user_tasks::show_at(&path, &id).map_err(op_err)
+            let stored = respond_store_at(path, &params, origin)?;
+            let delivered = user_task_respond_deliver(host, stored);
+            user_task_respond_finish(delivered)
         }
         // #1479: 右パネル tasks ビューの「その場で展開」を AI からも操作する
         // （UI でできることは MCP / CLI からもできる = 開発不変条件）。
@@ -18583,6 +18570,129 @@ fn dispatch_user_task(
              respond / expand / collapse のいずれか）"
         ))),
     }
+}
+
+// --- 返答の 3 段（#2016） ---------------------------------------------------
+//
+// 旧実装は「積む（YAML の読み書き）→ 運ぶ（host）→ 記録する（YAML の読み書き）→ 読み直す」を
+// 1 本で UI スレッドに載せていた。右パネルの「返す」はその全部が終わってから欄を空にするので、
+// 送ってから欄が消えるまでに目に見える間があった（#2016 の症状 3）。
+// host に触るのは ② だけなので、①（積む）と ③（記録して読み直す）は任意のスレッドで呼べる形に
+// 切り出してある。**中身は dispatch の "respond" と共有の 1 実装**（CLI / MCP は 3 つを同じ
+// スレッドで順に呼ぶ）なので、画面だけ別の書き方になることは無い。
+
+/// ① の結果（返答を積んだところ）。② へ渡す
+pub struct UserTaskRespondStored {
+    path: std::path::PathBuf,
+    task: tako_core::user_task::UserTask,
+    index: usize,
+}
+
+/// ② の結果（どこへ運んだか）。③ で永続へ書き戻す
+pub struct UserTaskRespondDelivered {
+    path: std::path::PathBuf,
+    id: String,
+    delivery: tako_core::user_task::Delivery,
+}
+
+/// ① 返答を積む（**host に触らない** = background スレッドで呼べる）。
+///
+/// 受けるのは `Request::UserTask { action: "respond", .. }`（画面も CLI / MCP と同じ要求を組む）。
+/// 経路（`via`）を省いたときの既定は `origin` から決める（dispatch と同じ）
+pub fn user_task_respond_store(
+    request: &Request,
+    origin: PaneOrigin,
+) -> Result<UserTaskRespondStored, DispatchError> {
+    let Request::UserTask {
+        action,
+        id,
+        decision,
+        comment,
+        via,
+        ..
+    } = request
+    else {
+        return Err(DispatchError::InvalidParams(
+            "user_task_respond_store が受けるのは UserTask だけ".into(),
+        ));
+    };
+    if action != "respond" {
+        return Err(DispatchError::InvalidParams(format!(
+            "user_task_respond_store が受けるのは respond だけ（{action:?}）"
+        )));
+    }
+    let path = crate::user_tasks::store_path()
+        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let params = UserTaskParams {
+        action: action.clone(),
+        id: id.clone(),
+        title: None,
+        body: None,
+        kind: None,
+        status: None,
+        all: None,
+        project: None,
+        attachments: None,
+        copy_texts: None,
+        links: None,
+        due: None,
+        decision: decision.clone(),
+        comment: comment.clone(),
+        via: via.clone(),
+        pane: None,
+        caller_role: None,
+    };
+    respond_store_at(path, &params, origin)
+}
+
+fn respond_store_at(
+    path: std::path::PathBuf,
+    params: &UserTaskParams,
+    origin: PaneOrigin,
+) -> Result<UserTaskRespondStored, DispatchError> {
+    let id = user_task_id(params)?;
+    let decision = crate::user_tasks::parse_decision(
+        params
+            .decision
+            .as_deref()
+            .ok_or_else(|| DispatchError::InvalidParams("respond には decision が必要".into()))?,
+    )
+    .map_err(DispatchError::InvalidParams)?;
+    let via = match params.via.as_deref() {
+        Some(v) => crate::user_tasks::parse_via(v).map_err(DispatchError::InvalidParams)?,
+        None => match origin {
+            PaneOrigin::Mcp => tako_core::user_task::Via::Mcp,
+            _ => tako_core::user_task::Via::Cli,
+        },
+    };
+    let comment = params.comment.clone().unwrap_or_default();
+    let (task, index) = crate::user_tasks::respond_at(&path, &id, decision, &comment, via)
+        .map_err(DispatchError::Operation)?;
+    Ok(UserTaskRespondStored { path, task, index })
+}
+
+/// ② 起票 master へ運ぶ（**UI スレッド**。workspace と送達フローに触る）
+pub fn user_task_respond_deliver(
+    host: &mut dyn ControlHost,
+    stored: UserTaskRespondStored,
+) -> UserTaskRespondDelivered {
+    let delivery = deliver_user_task_response(host, &stored.task, stored.index);
+    UserTaskRespondDelivered {
+        path: stored.path,
+        id: stored.task.id,
+        delivery,
+    }
+}
+
+/// ③ 配送を記録して 1 件を読み直す（host に触らない = background スレッドで呼べる）。
+/// 応答は `tako todo respond` / MCP の `respond` と同じ形（`show` の 1 件）
+pub fn user_task_respond_finish(
+    delivered: UserTaskRespondDelivered,
+) -> Result<Value, DispatchError> {
+    let UserTaskRespondDelivered { path, id, delivery } = delivered;
+    crate::user_tasks::record_delivery_at(&path, &id, delivery)
+        .map_err(DispatchError::Operation)?;
+    crate::user_tasks::show_at(&path, &id).map_err(DispatchError::Operation)
 }
 
 fn user_task_id(params: &UserTaskParams) -> Result<String, DispatchError> {

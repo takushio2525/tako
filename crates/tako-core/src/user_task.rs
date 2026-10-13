@@ -631,9 +631,61 @@ impl TaskStore {
     }
 }
 
+/// 返答の履歴に出す時刻（#2016。**PC の右パネルと `tako todo show` が同じ 1 実装を引く**）。
+///
+/// 相対（「3 分前」）だけでは「いつ返したか」を後から辿れないので、壁時計の時刻で出す。
+/// 桁は近さで変える: 今日 = `HH:MM` / 今年 = `MM/DD HH:MM` / それより前 = `YYYY/MM/DD HH:MM`。
+/// タイムゾーンは引数（`utc_offset` 秒）で受けるので、テストは実機のタイムゾーンに依存しない
+/// （OS に聞くのは呼び出し側 = `platform::clock::local_utc_offset`）
+pub fn response_stamp(at: i64, now: i64, utc_offset: i32) -> String {
+    let local = at + i64::from(utc_offset);
+    let (y, m, d) = crate::limit_resume::civil_from_days(local.div_euclid(86_400));
+    let secs = local.rem_euclid(86_400);
+    let (hh, mm) = (secs / 3_600, (secs % 3_600) / 60);
+    let (ny, nm, nd) =
+        crate::limit_resume::civil_from_days((now + i64::from(utc_offset)).div_euclid(86_400));
+    if (y, m, d) == (ny, nm, nd) {
+        format!("{hh:02}:{mm:02}")
+    } else if y == ny {
+        format!("{m:02}/{d:02} {hh:02}:{mm:02}")
+    } else {
+        format!("{y}/{m:02}/{d:02} {hh:02}:{mm:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2016: 履歴の時刻は近さで桁を変え、タイムゾーンは引数に従う
+    #[test]
+    fn 返答の時刻は近さで桁を変える() {
+        const JST: i32 = 9 * 3_600;
+        // 2026-10-13 02:02:00 UTC = JST 11:02
+        let at = 1_791_856_920;
+        assert_eq!(response_stamp(at, at + 60, JST), "11:02");
+        // 同じ JST の日付の終わりまでは時刻だけ
+        assert_eq!(response_stamp(at, at + 12 * 3_600, JST), "11:02");
+        // JST の翌日になったら月日を付ける（UTC ではまだ同じ日でも JST で判定する）
+        assert_eq!(response_stamp(at, at + 13 * 3_600, JST), "10/13 11:02");
+        // 年が変わったら年も付ける
+        assert_eq!(
+            response_stamp(at, at + 120 * 86_400, JST),
+            "2026/10/13 11:02"
+        );
+        // UTC で読めば UTC の時刻
+        assert_eq!(response_stamp(at, at + 60, 0), "02:02");
+        // 日付をまたぐずれ（UTC 23:30 は JST の翌日 08:30）
+        let late = 1_791_847_800; // 2026-10-12 23:30 UTC
+        assert_eq!(response_stamp(late, late + 60, JST), "08:30");
+        assert_eq!(response_stamp(late, late + 60, 0), "23:30");
+        // 負のオフセット（西半球）と 0 時ちょうど
+        assert_eq!(
+            response_stamp(1_791_849_600, 1_791_849_600, -5 * 3_600),
+            "19:00"
+        );
+        assert_eq!(response_stamp(1_791_849_600, 1_791_849_600, 0), "00:00");
+    }
 
     fn store_with(n: usize) -> TaskStore {
         let mut store = TaskStore::default();
