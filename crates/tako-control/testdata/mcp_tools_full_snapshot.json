@@ -1684,6 +1684,63 @@
     "name": "tako_preview_search"
   },
   {
+    "description": "ワークスペース横断検索（GUI の ⇧⌘F）。action=search（既定）は query をタブのファイルツリーのルート（path で別のフォルダ）から行ごとに探し、items[]（id・path・line・column・excerpt）を返す。.gitignore 対象・バイナリ・.git の中は探さない。regex で正規表現・case_sensitive で大文字小文字を区別（どちらも既定 false）。上限で止めたら stopped（limit / time / cancelled）。show で右パネルにも出し、results で読み直す・open で item 番目を開く（行を押すのと同じ）・clear で閉じる。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "操作（既定 search）",
+          "enum": [
+            "search",
+            "results",
+            "open",
+            "clear"
+          ],
+          "type": "string"
+        },
+        "case_sensitive": {
+          "type": "boolean"
+        },
+        "focus": {
+          "description": "open: 着地したペインへフォーカスを移す",
+          "type": "boolean"
+        },
+        "item": {
+          "description": "open: items[] の id",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "limit": {
+          "description": "載せる行（既定 100。0 で全部）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pane": {
+          "description": "範囲を決めるタブ・open の起点のペイン（省略は呼び出し元）",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "search: 探すフォルダ（省略でタブのツリーのルート）",
+          "type": "string"
+        },
+        "query": {
+          "description": "search: 検索語",
+          "type": "string"
+        },
+        "regex": {
+          "type": "boolean"
+        },
+        "show": {
+          "description": "search: 右パネルにも出す",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_search"
+  },
+  {
     "description": "コードプレビューのテキスト置換。query に一致する箇所を replacement で置換する。all=true で全置換。",
     "inputSchema": {
       "additionalProperties": false,

@@ -77,7 +77,10 @@ actions!(
         FormatSelection,
         // #1681: カーソル位置のホバー情報（型・doc のカード）。#1893 でキーを張った
         // （割当と理由は `hover_bindings`）。編集メニュー・パレット・右クリックメニューからも
-        ShowHover
+        ShowHover,
+        // #1694: ワークスペース横断検索の検索欄を開く（割当と理由は `find_in_files_bindings`）。
+        // 編集メニュー・パレットからも
+        FindInFiles
     ]
 );
 
@@ -100,7 +103,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
 ///
 /// 実際に GPUI へ登録するのは `Platform::current()` の分だけ。
 /// #585 / #517 当時の集合へ足したのは #1677 の [`jump_bindings`]・#1683 の [`format_bindings`]・
-/// #1893 の [`hover_bindings`] だけ
+/// #1893 の [`hover_bindings`]・#1694 の [`find_in_files_bindings`] だけ
 fn bindings_for(platform: Platform) -> Vec<KeyBinding> {
     let mut bindings = base_bindings();
     match platform {
@@ -110,7 +113,29 @@ fn bindings_for(platform: Platform) -> Vec<KeyBinding> {
     bindings.extend(jump_bindings(platform));
     bindings.extend(format_bindings(platform));
     bindings.extend(hover_bindings(platform));
+    bindings.extend(find_in_files_bindings(platform));
     bindings
+}
+
+/// ワークスペース横断検索の検索欄を開く（FR-3.43 / #1694）。案内の表記は
+/// `tako_core::platform::keys::find_in_files`（番犬が突き合わせる）
+///
+/// ## macOS = ⇧⌘F（VS Code / Zed / JetBrains と同じ）
+///
+/// ⌘F（FindPreview）の shift 段。cmd の付く打鍵は PTY へ何も送らないので端末の入力手段は減らない。
+/// macOS の全画面は ⌃⌘F（ToggleFullScreen）で重ならない
+///
+/// ## Windows = Ctrl+Shift+G
+///
+/// VS Code の Ctrl+Shift+F は、tako では ⌘F に当たるファイル内の検索（FindPreview）が先に取っている
+/// （Ctrl+F は readline の 1 字進む = #585 で shift 段へ逃がした）。空いている shift 段のうち G（grep）を
+/// 採る。`keystroke_to_bytes` は Ctrl+Shift+G を Ctrl+G と同じ C0 バイト（0x07 = BEL）へ潰すので、
+/// 奪っても端末の Ctrl+G は無傷（`ctrl_shift_gを奪ってもctrl_gのbelは残る` テストが実変換で固定）
+fn find_in_files_bindings(platform: Platform) -> Vec<KeyBinding> {
+    match platform {
+        Platform::MacOs => vec![KeyBinding::new("cmd-shift-f", FindInFiles, None)],
+        Platform::Windows => vec![KeyBinding::new("ctrl-shift-g", FindInFiles, None)],
+    }
 }
 
 /// カーソル位置のホバー情報（型・doc のカード。FR-3.37 / #1893）。案内の表記は
@@ -297,6 +322,8 @@ fn action_for_palette_command(command_id: &str) -> Option<&'static str> {
         "format-document" => Some("tako::FormatDocument"),
         // #1893: ホバー情報
         "show-hover" => Some("tako::ShowHover"),
+        // #1694: ワークスペース横断検索
+        "find-in-files" => Some("tako::FindInFiles"),
         _ => None,
     }
 }
@@ -1402,6 +1429,8 @@ mod tests {
             ("ctrl-shift-i", "tako::FormatDocument"),
             // ホバー情報（#1893。整形と同じ shift 段・H = Hover）
             ("ctrl-shift-h", "tako::ShowHover"),
+            // 横断検索（#1694。Ctrl+Shift+F はファイル内の検索なので G = grep）
+            ("ctrl-shift-g", "tako::FindInFiles"),
         ]
     }
 
@@ -1739,6 +1768,8 @@ mod tests {
         let 追加 = format_bindings(Platform::current())
             .into_iter()
             .chain(hover_bindings(Platform::current()))
+            // #1694: 横断検索の ⇧⌘F も macOS では platform 修飾で 1 本
+            .chain(find_in_files_bindings(Platform::current()))
             .filter(|b| b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
             .count();
         let 期待 = if cfg!(target_os = "macos") {
@@ -1949,6 +1980,80 @@ mod tests {
         );
     }
 
+    /// #1694: 横断検索の打鍵が**両 OS で**既存の割当と衝突しない（ホバーと同じ検査。同じキーに
+    /// 2 つのアクションを張らない・2 打鍵にしない・ツリーが取る打鍵とも重ならない）。
+    /// macOS の ⇧⌘F はファイル内の検索 ⌘F・全画面 ⌃⌘F と別のキー
+    #[test]
+    fn 横断検索の打鍵は両osで既存の割当と衝突しない() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let all = bindings_for(platform);
+            let find = find_in_files_bindings(platform);
+            assert_eq!(find.len(), 1, "{platform:?}: 横断検索の打鍵は 1 本");
+            assert_eq!(
+                find[0].keystrokes().len(),
+                1,
+                "{platform:?}: 2 打鍵にしない"
+            );
+            let mine = find[0].keystrokes()[0].inner().clone();
+            let others: Vec<&str> = all
+                .iter()
+                .filter(|o| {
+                    o.keystrokes().iter().any(|k| {
+                        let k = k.inner();
+                        k.key == mine.key && k.modifiers == mine.modifiers
+                    }) && o.action().name() != "tako::FindInFiles"
+                })
+                .map(|o| o.action().name())
+                .collect();
+            assert!(
+                others.is_empty(),
+                "{platform:?}: 横断検索の打鍵が {others:?} と衝突している"
+            );
+            let m = mine.modifiers;
+            assert_eq!(
+                tako_core::platform::keys::tree_select_key(
+                    platform, &mine.key, m.platform, m.control, m.alt, m.shift
+                ),
+                None,
+                "{platform:?}: 横断検索の打鍵がツリーの範囲選択 / ごみ箱の打鍵と重なる"
+            );
+            assert_eq!(
+                tako_core::platform::keys::tree_clip_key(
+                    platform, &mine.key, m.platform, m.control, m.alt, m.shift, false
+                ),
+                None,
+                "{platform:?}: 横断検索の打鍵がツリーのコピー / 切り取り / 貼り付けの打鍵と重なる"
+            );
+            // パレットに併記される（Windows はメニューバーが無く、パレットが打鍵を知る唯一の手段）
+            assert_eq!(
+                shortcut_hint_for("tako::FindInFiles", platform).as_deref(),
+                Some(tako_core::platform::keys::find_in_files(platform))
+            );
+        }
+        assert_eq!(
+            action_for_palette_command("find-in-files"),
+            Some("tako::FindInFiles")
+        );
+    }
+
+    /// #1694: Windows の Ctrl+Shift+G は Ctrl+G と同じ 0x07（BEL）へ潰れる = 奪っても
+    /// 端末の Ctrl+G は残る（#585 の「shift 段へ逃がす」原則の前提を実変換で固定する）
+    #[test]
+    fn ctrl_shift_gを奪ってもctrl_gのbelは残る() {
+        let mut shifted = ks_ctrl("g");
+        shifted.modifiers.shift = true;
+        assert_eq!(
+            keystroke_to_bytes_default(&ks_ctrl("g")),
+            Some(vec![0x07]),
+            "Ctrl+G が BEL（0x07）を送っていない（前提が変わったら判断をやり直すこと）"
+        );
+        assert_eq!(
+            keystroke_to_bytes_default(&shifted),
+            keystroke_to_bytes_default(&ks_ctrl("g")),
+            "Ctrl+Shift+G が Ctrl+G と同じバイトへ潰れていない"
+        );
+    }
+
     /// #1893: Windows の Ctrl+Shift+H は Ctrl+H と同じ 0x08（Backspace）へ潰れる = 奪っても
     /// 端末の Ctrl+H は残る（#585 の「shift 段へ逃がす」原則の前提を実変換で固定する）
     #[test]
@@ -2082,6 +2187,10 @@ mod tests {
                 (
                     "tako::ShowHover",
                     tako_core::platform::keys::show_hover(platform),
+                ),
+                (
+                    "tako::FindInFiles",
+                    tako_core::platform::keys::find_in_files(platform),
                 ),
             ] {
                 let from_bindings = shortcut_hint_for(action, platform).unwrap_or_else(|| {

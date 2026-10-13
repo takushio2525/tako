@@ -83,6 +83,20 @@ pub fn show_hover(platform: Platform) -> &'static str {
     }
 }
 
+/// ワークスペース横断検索（右パネルの search ビューの検索欄）を開く打鍵（FR-3.43 / #1694）。
+///
+/// macOS は `⇧⌘F`（VS Code / Zed / JetBrains と同じ）。Windows は `Ctrl+Shift+F` がファイル内の
+/// 検索（⌘F に当たる FindPreview。`Ctrl+F` は readline の 1 字進むなので shift 段へ逃がした）で
+/// 埋まっているので、空いている `Ctrl+Shift+G`（grep の G）に置く。`Ctrl+Shift+G` は
+/// `Ctrl+G`（BEL）と同じ C0 バイトへ潰れるので端末の `Ctrl+G` は奪わない
+/// （理由の全文は tako-app の `keybindings::find_in_files_bindings`）
+pub fn find_in_files(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{21e7}\u{2318}F",
+        Platform::Windows => "Ctrl+Shift+G",
+    }
+}
+
 /// tako を終了する打鍵。
 pub fn quit(platform: Platform) -> &'static str {
     match platform {

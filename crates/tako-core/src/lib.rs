@@ -109,6 +109,7 @@ pub mod url_guard;
 pub mod user_task;
 pub mod wait_budget;
 pub mod workspace;
+pub mod workspace_search;
 
 pub use byte_lru::ByteLru;
 pub use command_card::{

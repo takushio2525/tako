@@ -1506,6 +1506,18 @@ pub const MATRIX: &[Feature] = &[
         windows_evidence: Evidence::Unverified,
     },
     Feature {
+        // #1694: ワークスペース横断検索。走査（`ignore` の walker）・照合（`regex`）・バイナリ判定・
+        // CRLF・行の抜粋は OS 分岐を持たない純粋部分で、結果の行を開く着地は定義ジャンプと同じ
+        // `plan_landing` + 行指定の open。GUI のキー（Ctrl+Shift+G）は keybindings の単体が
+        // Platform::Windows の表を macOS 上でも検査する
+        key: "tako_search",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "workspace_search の単体（既知のツリーの結果の固定値・.gitignore とバイナリの除外・大文字小文字 × 正規表現の 4 通り・CRLF と多バイトの桁・上限 / 所要 / 取り消しでの停止・入れ子のルート）と dispatch の横断検索（MockHost で search → results → open で新しいペイン → clear で保持 0）が CI の Windows ジョブで緑。キーの Ctrl+Shift+G が既存の割当と衝突せず Ctrl+G（0x07）を奪わないことは keybindings の単体（Platform::Windows の表を macOS 上でも検査）",
+        ),
+    },
+    Feature {
         key: "tako_select_tab",
         macos: Support::Supported,
         windows: Support::Supported,

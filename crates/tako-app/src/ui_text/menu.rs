@@ -136,6 +136,10 @@ pub fn format_selection() -> &'static str {
 pub fn show_hover() -> &'static str {
     tr!("ホバー情報を表示", "Show Hover")
 }
+/// #1694: ワークスペース横断検索（右パネルの search ビューの検索欄）
+pub fn find_in_files() -> &'static str {
+    tr!("ファイル横断検索…", "Find in Files…")
+}
 
 // --- 表示 -------------------------------------------------------------------
 
@@ -275,6 +279,7 @@ mod tests {
                 paste().to_string(),
                 select_all().to_string(),
                 find().to_string(),
+                find_in_files().to_string(),
                 format_document().to_string(),
                 format_selection().to_string(),
                 show_hover().to_string(),

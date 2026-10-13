@@ -47,7 +47,7 @@ const CATEGORIES = [
     'tako_preview_apply', 'tako_preview_edit_range', 'tako_preview_cursor',
     'tako_preview_move', 'tako_preview_delete', 'tako_lsp', 'tako_lsp_server',
     'tako_preview_save', 'tako_preview_undo',
-    'tako_preview_redo', 'tako_preview_search', 'tako_preview_replace',
+    'tako_preview_redo', 'tako_preview_search', 'tako_preview_replace', 'tako_search',
     'tako_preview_autosave', 'tako_preview_changelog', 'tako_pin_preview',
     'tako_video_playback', 'tako_video_seek', 'tako_video_volume', 'tako_web',
     'tako_theme', 'tako_lang', 'tako_ui_mode', 'tako_chat_copy', 'tako_panel',

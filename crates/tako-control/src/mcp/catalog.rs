@@ -1201,6 +1201,32 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // 出自: #1694（⇧⌘F / Windows は Ctrl+Shift+G）。results / open / clear も action で足す（ツールは増やさない）
+        json!({
+            "name": "tako_search",
+            "description": format!("ワークスペース横断検索（GUI の {}）。action=search（既定）は query をタブのファイルツリーのルート\
+                （path で別のフォルダ）から行ごとに探し、items[]（id・path・line・column・excerpt）を返す。\
+                .gitignore 対象・バイナリ・.git の中は探さない。regex で正規表現・case_sensitive で大文字小文字を区別\
+                （どちらも既定 false）。上限で止めたら stopped（limit / time / cancelled）。show で右パネルにも出し、\
+                results で読み直す・open で item 番目を開く（行を押すのと同じ）・clear で閉じる。",
+                tako_core::platform::keys::find_in_files(tako_core::platform::support::Platform::current())),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": enum_schema(&crate::workspace_search::ACTIONS, "操作（既定 search）"),
+                    "query": { "type": "string", "description": "search: 検索語" },
+                    "path": { "type": "string", "description": "search: 探すフォルダ（省略でタブのツリーのルート）" },
+                    "pane": pane_schema("範囲を決めるタブ・open の起点のペイン（省略は呼び出し元）"),
+                    "regex": { "type": "boolean" },
+                    "case_sensitive": { "type": "boolean" },
+                    "show": { "type": "boolean", "description": "search: 右パネルにも出す" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "載せる行（既定 100。0 で全部）" },
+                    "item": { "type": "integer", "minimum": 1, "description": "open: items[] の id" },
+                    "focus": { "type": "boolean", "description": "open: 着地したペインへフォーカスを移す" },
+                },
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "tako_preview_replace",
             "description": "コードプレビューのテキスト置換。query に一致する箇所を replacement で置換する。all=true で全置換。",

@@ -16,7 +16,7 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 123 / 160（77%） | macOS と同じように使えます |
+| 対応 | 124 / 161（77%） | macOS と同じように使えます |
 | 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 5 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
@@ -84,7 +84,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 
 ## 表示とプレビュー
 
-対応 28・一部対応 4・未対応 / 未実測 6
+対応 29・一部対応 4・未対応 / 未実測 6
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -111,6 +111,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 | `tako_preview_redo` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako edit redo --pane <p>` が redone=true を返す（undo と対で実測） |
 | `tako_preview_search` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako edit search <語>` が index=2 / total=2 を返し、`--direction next/prev` で index が 1 ↔ 2 と動く |
 | `tako_preview_replace` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako edit replace <前> <後>` と `--all` が replaced を返し、`tako edit save` 後の実ファイルが置換後の内容になる |
+| `tako_search` | 対応 | — | 実機テスト: workspace_search の単体（既知のツリーの結果の固定値・.gitignore とバイナリの除外・大文字小文字 × 正規表現の 4 通り・CRLF と多バイトの桁・上限 / 所要 / 取り消しでの停止・入れ子のルート）と dispatch の横断検索（MockHost で search → results → open で新しいペイン → clear で保持 0）が CI の Windows ジョブで緑。キーの Ctrl+Shift+G が既存の割当と衝突せず Ctrl+G（0x07）を奪わないことは keybindings の単体（Platform::Windows の表を macOS 上でも検査） |
 | `tako_preview_autosave` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako edit autosave true/false` が状態を往復する。有効化後の CLI / MCP 編集で自動保存が発火しないのは実装が共通なので macOS でも同じ（タイマーを始めるのが GUI 入力経路だけ。#973） |
 | `tako_preview_changelog` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako preview-changelog on --pane <p>` が changelog=true / commits=2 を返し `off` で戻る |
 | `tako_pin_preview` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako pin --pane N on` が pinned へ矩形つきで載り、`off` で消える |

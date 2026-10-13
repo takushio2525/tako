@@ -106,6 +106,7 @@ pub mod user_tasks;
 pub mod welcome;
 /// worker ペインのフォント自動縮小（#1439）
 pub mod worker_font;
+pub mod workspace_search;
 
 pub use dispatch::{
     dispatch, dispatch_orchestrator_accounts, dispatch_orchestrator_layout, fetch_tmux_sessions,
