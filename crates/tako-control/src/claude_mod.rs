@@ -16,12 +16,14 @@
 //! AI にとっての等価物（読む側の `tako_mod` / `tako_orchestrator_self`）は別にあるから
 //! （FR-2.42 に例外の理由として書いた）。
 
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use serde_json::{json, Value};
 use tako_core::claude_mod::{
     self as core, Accepted, ModHub, ModRateLimit, ModUnavailable, OffReason, StoredReport,
 };
+use tako_core::claude_mod_ui::Vocab;
 use tako_core::PaneId;
 
 use crate::dispatch::DispatchError;
@@ -353,10 +355,17 @@ fn accept_report(
     ) {
         crate::claude_mod_ui::import_band(&path, band);
     }
-    let accepted = host
+    // #1963: GPUI のカード帯の判断（描画のたびに引く）が ui.json を読まずに済むよう、
+    // cards.place は報告を受けるたびにここで写す
+    let cards_place = host
+        .claude_mod_ui_path()
+        .map(|p| crate::claude_mod_ui::view(&p).cards.place)
+        .unwrap_or_default();
+    let hub = host
         .claude_mod_mut()
-        .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?
-        .accept(pane_id.as_u64(), parsed, Instant::now());
+        .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?;
+    hub.cards_place = cards_place;
+    let accepted = hub.accept(pane_id.as_u64(), parsed, Instant::now());
     Ok(json!({
         "accepted": accepted.as_str(),
         "pane": pane_id.as_u64(),
@@ -433,7 +442,57 @@ fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandVi
             .and_then(|s| s.cwd())
             .map(|p| p.display().to_string()),
         s7_legacy: core::s7_legacy(),
+        // #1963: このペインのコマンドカード（mod が会話の行と帯に描く。正本は tako の store）
+        cards: host
+            .command_cards()
+            .map(|c| c.list(Some(pane)).into_iter().cloned().collect())
+            .unwrap_or_default(),
+        cards_legacy: core::cards_legacy(),
     })
+}
+
+/// GPUI のカード帯にそのカードを出すのは誰か（#1963。判断は `tako_core::claude_mod::card_owner`
+/// の 1 本）。報告は一次ソースと同じ [`lookup_pane`]（45 秒）で引き、置き場は報告のたびに写した
+/// ui.json の `cards.place`（[`core::ModHub::cards_place`]）。A/B は `TAKO_1963_LEGACY` と
+/// `TAKO_1877_S7_LEGACY`（S3 の描き方はカードを描かない）
+pub fn card_owner(
+    host: &dyn ControlHost,
+    card: &tako_core::CommandCard,
+    now: Instant,
+) -> core::CardOwner {
+    core::card_owner(core::CardOwnerInput {
+        place: host.claude_mod().map(|h| h.cards_place).unwrap_or_default(),
+        stored: lookup_pane(host, card.pane(), now).ok(),
+        legacy: core::cards_legacy() || core::s7_legacy(),
+        card: card.id().as_u64(),
+        shown_at: card.shown_at(),
+        now,
+    })
+}
+
+/// そのペインのカードのうち、GPUI のカード帯から外すもの（#1963。mod が Claude Code の画面に描く）。
+/// GPUI はカード帯を組むたびにこれを引く（ペイン × フレーム。カードが無いペインは呼ばれない）
+pub fn cards_drawn_by_mod(host: &dyn ControlHost, pane: PaneId, now: Instant) -> BTreeSet<u64> {
+    host.command_cards()
+        .map(|cards| {
+            cards
+                .list(Some(pane))
+                .into_iter()
+                .filter(|card| card_owner(host, card, now).yields())
+                .map(|card| card.id().as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// カードの持ち主の JSON（`tako show-command --list` / `show` の各カードの `drawn_by`。#1963）
+pub fn card_owner_json(
+    host: &dyn ControlHost,
+    card: &tako_core::CommandCard,
+    now: Instant,
+) -> Value {
+    let owner = card_owner(host, card, now);
+    json!({ "drawn_by": owner.as_str(), "reason": owner.reason() })
 }
 
 /// 画面下のステータスバーの claude の区画（5h / 7d / ctx）を誰が出すか（#1962。判断は
@@ -663,6 +722,12 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
         // #1962: 画面下のステータスバーの claude の区画（5h / 7d / ctx）を誰が出しているか
         // （フォーカス中のペインの mod がバーを描いていれば mod = ステータスバーからは外す）
         "status_bar": status_bar_json(host, now),
+        // #1963: コマンドカードを誰が描くか（カードごとの持ち主は `tako show-command --list` の drawn_by）
+        "cards": {
+            "place": hub.cards_place.as_str(),
+            "legacy": core::cards_legacy(),
+            "pickup_grace_ms": core::CARD_PICKUP_GRACE.as_millis() as u64,
+        },
         "reason": injection.off_reason().map(reason_json),
         "plugin_dir": hub.plugin_dir.as_ref().map(|p| p.display().to_string()),
         "install": match &hub.install_result {

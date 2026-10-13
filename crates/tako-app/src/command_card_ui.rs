@@ -162,14 +162,21 @@ impl TakoApp {
         )
     }
 
-    /// 描画に必要な情報だけ取り出す（描画中に保管庫を借り続けない）
+    /// 描画に必要な情報だけ取り出す（描画中に保管庫を借り続けない）。
+    ///
+    /// tako mod が Claude Code の画面に描いているカード（#1963。判断は
+    /// `tako_control::claude_mod::cards_drawn_by_mod` の 1 本）は帯に出さない = 同じカードを
+    /// 二重に出さず、帯のぶん claude の viewport を縮めない。保管庫には残る（CLI / スマホは今と同じ）
     pub(crate) fn command_card_rows(
         &self,
         pane_id: PaneId,
     ) -> Vec<(u64, Option<String>, Vec<String>)> {
+        let by_mod =
+            tako_control::claude_mod::cards_drawn_by_mod(self, pane_id, std::time::Instant::now());
         self.command_cards
             .list(Some(pane_id))
             .into_iter()
+            .filter(|c| !by_mod.contains(&c.id().as_u64()))
             .map(|c| {
                 (
                     c.id().as_u64(),
@@ -650,6 +657,35 @@ impl TakoApp {
         for text in std::mem::take(&mut self.pending_clipboard) {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         }
+    }
+
+    /// mod が描くカードの集合が時間で変わったか（#1963。2 秒ポーリングから呼ぶ）。
+    ///
+    /// 帯から外す判断は描画のたびに引くが、mod が拾う猶予の切れ・報告の失効（45 秒）・claude の終了
+    /// （最後の報告で即座に消える）は描画が起きないと帯へ反映されない。ここで集合の指紋を取り、
+    /// 変わったときだけ描き直させる = 1 tick（2 秒）で GPUI の帯へ戻る
+    pub(crate) fn refresh_mod_card_owners(&mut self) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if !self.command_cards.is_empty() {
+            let now = std::time::Instant::now();
+            let mut panes: Vec<PaneId> = self
+                .command_cards
+                .list(None)
+                .into_iter()
+                .map(|c| c.pane())
+                .collect();
+            panes.sort();
+            panes.dedup();
+            for pane in panes {
+                pane.as_u64().hash(&mut hasher);
+                tako_control::claude_mod::cards_drawn_by_mod(self, pane, now).hash(&mut hasher);
+            }
+        }
+        let sig = hasher.finish();
+        let changed = sig != self.mod_card_owner_sig;
+        self.mod_card_owner_sig = sig;
+        changed
     }
 
     /// 閉じたペインのカードを掃除する（2 秒ポーリングから呼ぶ）。

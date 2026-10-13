@@ -14,6 +14,7 @@
 //! カードは揮発（セッション内使い捨て）で、レイアウト永続化の対象外。
 
 use std::fmt;
+use std::time::Instant;
 
 use crate::PaneId;
 
@@ -145,6 +146,9 @@ pub struct CommandCard {
     label: Option<String>,
     /// コマンドごとの実行記録（`commands` と同じ長さ。未実行は `None`。#1724）
     runs: Vec<Option<CardRun>>,
+    /// 出した時刻（#1963。tako mod がまだこのカードを拾っていないかの判断 =
+    /// `claude_mod::card_owner` に使う。表示・永続化には出さない）
+    shown_at: Instant,
 }
 
 impl CommandCard {
@@ -185,6 +189,11 @@ impl CommandCard {
         self.command(index)?;
         Ok(self.runs[index - 1].as_ref())
     }
+
+    /// 出した時刻（#1963）
+    pub fn shown_at(&self) -> Instant {
+        self.shown_at
+    }
 }
 
 /// ペイン単位のカード保管庫。GUI（tako-app）が 1 個だけ持ち、dispatch から操作する
@@ -222,6 +231,7 @@ impl CommandCards {
             commands,
             label,
             runs,
+            shown_at: Instant::now(),
         });
 
         // 同一ペインの古いカードから溢れさせる（追加順 = Vec の順序）

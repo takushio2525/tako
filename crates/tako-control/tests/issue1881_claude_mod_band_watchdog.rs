@@ -623,8 +623,8 @@ fn 逆戻りを名指しできる() {
     // 1a. tako の行（S7-3）を縦に並べる（ボタンを 2 行目へ）
     let found = mutate(&|s| {
         s.register = s.register.replacen(
-            "  return Box({ flexDirection: 'row', columnGap: BUTTON_GAP, children: [line, ...buttons] })",
-            "  return Box({ flexDirection: 'column', children: [line, ...buttons] })",
+            "  return Box({ flexDirection: 'row', columnGap: BUTTON_GAP, children: [line, ...cardButtons, ...buttons] })",
+            "  return Box({ flexDirection: 'column', children: [line, ...cardButtons, ...buttons] })",
             1,
         );
     });

@@ -26,6 +26,10 @@
 //!   バーは入力欄の下の行の末尾。描くか（[`usage_bar_decision`]）とボタンの CLI の引数は tako が決めて
 //!   `view` に載せ、mod は描いたものを報告の `renders`（[`ModRenders`]）で返す。フォーカス中のペインの
 //!   mod がバーを描いていれば、ステータスバーの claude の区画を引っ込める（[`claude_bar_owner`]）
+//! - **コマンドカード（S7-4 #1963）**: 応答の `view.cards` にこのペインのカード（論理文字列と、押したときに
+//!   叩く CLI の引数・帯のホットキー）を載せ、mod が会話の行（`tako_show_command` の行）と帯の 1 行に描く。
+//!   mod が帯に描いたカードの id は報告の `renders.cards` で返り、GPUI のカード帯はそのカードを出さない
+//!   （[`card_owner`]。store には残る = スマホ・CLI は今と同じ）
 //!
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
@@ -74,6 +78,9 @@ pub const S3_LEGACY_ENV: &str = "TAKO_1877_S3_LEGACY";
 /// 載せ、バーの判断（`usage_bar`）とボタンの引数（`button_args`）を載せない = mod は `next(e)` を
 /// 包まず、ボタンとバーを描かず、`renders` を報告しない。ステータスバーの claude の区画も止めない
 pub const S7_LEGACY_ENV: &str = "TAKO_1877_S7_LEGACY";
+/// コマンドカードを mod で描く前（S7-4 #1963）へ戻す A/B の入口。応答の `view` に `cards` を載せない
+/// （mod はカードを描かない）・GPUI のカード帯は mod の報告を見ずに今のまま出す
+pub const CARDS_LEGACY_ENV: &str = "TAKO_1963_LEGACY";
 
 /// env の一覧の区切り（PATH と同じ。macOS / Linux は `:`、Windows は `;`）
 pub const LIST_SEP: char = if cfg!(windows) { ';' } else { ':' };
@@ -419,6 +426,11 @@ pub fn s7_legacy() -> bool {
     std::env::var_os(S7_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
+/// S7-4 の A/B（[`CARDS_LEGACY_ENV`]）が立っているか
+pub fn cards_legacy() -> bool {
+    std::env::var_os(CARDS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
 /// #1903 の A/B（[`LIMITS_LEGACY_ENV`]）が立っているか
 pub fn limits_legacy() -> bool {
     std::env::var_os(LIMITS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
@@ -621,6 +633,11 @@ pub struct ModRenders {
     /// （[`band_hidden_by_other_mod`]）
     #[serde(default)]
     pub hint_hook: bool,
+    /// 直近の帯の描画で**押せる形**（Copy / Run のボタンつき）で描いたコマンドカードの id
+    /// （S7-4 #1963）。無い = カードを描かない mod（S7-4 前・応答に `view.cards` が無かった）。
+    /// GPUI のカード帯はここに載った id を出さない（[`card_owner`]）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cards: Option<Vec<u64>>,
 }
 
 /// ボタンを押した結果（S7-3 #1962。報告の `last_press`）。**語彙の種類と成否だけ**を載せる
@@ -713,6 +730,8 @@ const MAX_TEXT: usize = 256;
 const MAX_RATE_LIMITS: usize = 16;
 /// 帯の区切りの数の上限
 const MAX_BAND_SEGMENTS: usize = 16;
+/// 報告の `renders.cards` の上限（1 ペインに置けるカードは [`crate::command_card::MAX_CARDS_PER_PANE`]）
+const MAX_RENDERED_CARDS: usize = 16;
 
 /// 報告を読む。`schema` が違えば断る（mod と tako の版がずれたとき、黙って誤読しない）
 pub fn parse_report(value: serde_json::Value) -> Result<ModReport, String> {
@@ -752,6 +771,9 @@ pub fn parse_report(value: serde_json::Value) -> Result<ModReport, String> {
     }
     if let Some(place) = report.renders.as_mut().and_then(|r| r.usage_bar.as_mut()) {
         clip(place);
+    }
+    if let Some(cards) = report.renders.as_mut().and_then(|r| r.cards.as_mut()) {
+        cards.truncate(MAX_RENDERED_CARDS);
     }
     if let Some(press) = &mut report.last_press {
         clip(&mut press.kind);
@@ -982,6 +1004,9 @@ pub struct StoredReport {
     pub received: Instant,
     /// このペインから受け取った報告の数（heartbeat も数える）
     pub count: u64,
+    /// 1 つ前の報告を受け取った時刻（S7-4 #1963。[`card_owner`] が「mod がカードを載せた応答を
+    /// 受けてから 1 周報告したか」を見る。初めての報告では `None`）
+    pub prev_received: Option<Instant>,
 }
 
 /// 新しく作ったペインの注入の記録（status の行の材料）
@@ -1017,6 +1042,9 @@ pub struct ModHub {
     /// [`Self::reported_config_dirs`] のうち、まだ `skills/tako` を置きに行っていないもの
     /// （GUI が背景で片付ける = 起動時の差分検出の 2 段目）
     pub pending_config_dirs: Vec<String>,
+    /// ui.json の `cards.place`（S7-4 #1963）。報告の応答を組むたびに ui.json から写す
+    /// （GPUI の描画のたびにファイルを読まない。`tako mod ui` の変更は次の報告 = 最大 15 秒で効く）
+    pub cards_place: crate::claude_mod_ui::Place,
 }
 
 /// [`ModHub::accept`] の結果
@@ -1085,13 +1113,16 @@ impl ModHub {
             return Accepted::Dormant;
         }
         self.dormant.remove(&pane);
-        let count = self.reports.get(&pane).map_or(0, |s| s.count) + 1;
+        let prev = self.reports.get(&pane);
+        let count = prev.map_or(0, |s| s.count) + 1;
+        let prev_received = prev.map(|s| s.received);
         self.reports.insert(
             pane,
             StoredReport {
                 report,
                 received: now,
                 count,
+                prev_received,
             },
         );
         Accepted::Stored
@@ -1422,6 +1453,10 @@ pub struct BandView {
     /// `TAKO_1877_S7_LEGACY`）。無い = S7-3 の描き方
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band_style: Option<&'static str>,
+    /// このペインのコマンドカード（S7-4 #1963。[`cards_view`]）。無い = mod はカードを描かない
+    /// （ui.json の `cards.place` が `tako`・A/B の `TAKO_1963_LEGACY` / `TAKO_1877_S7_LEGACY`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cards: Option<CardsView>,
 }
 
 /// [`band_view`] の入力
@@ -1448,6 +1483,10 @@ pub struct BandInput {
     pub cwd: Option<String>,
     /// A/B の `TAKO_1877_S7_LEGACY`（[`s7_legacy`]）
     pub s7_legacy: bool,
+    /// このペインのコマンドカード（古い順。S7-4 #1963）
+    pub cards: Vec<crate::CommandCard>,
+    /// A/B の `TAKO_1963_LEGACY`（[`cards_legacy`]）
+    pub cards_legacy: bool,
 }
 
 impl Default for BandThresholds {
@@ -1497,6 +1536,11 @@ pub fn band_view(input: BandInput) -> BandView {
             None,
         )
     };
+    let cards = cards_view(
+        &input.cards,
+        &input.ui,
+        input.s7_legacy || input.cards_legacy,
+    );
     // バーを描くなら帯の ctx / 使用制限の警告は出さない（同じ値を 2 か所で動かさない。§9.3）
     let warnings = if usage_bar.as_ref().is_some_and(|b| b.draw) {
         Vec::new()
@@ -1528,6 +1572,7 @@ pub fn band_view(input: BandInput) -> BandView {
         usage_bar,
         button_args,
         band_style,
+        cards,
     }
 }
 
@@ -1692,6 +1737,256 @@ pub fn band_hidden_by_other_mod(report: &ModReport) -> bool {
         .renders
         .as_ref()
         .is_some_and(|r| r.hint_hook && !r.band_hook)
+}
+
+// --- S7-4（#1963）: コマンドカードを mod で描く -------------------------------------------
+//
+// カードの正本は tako の store（`command_card`）。tako は応答の `view.cards` にこのペインのカードと、
+// 押したときに叩く CLI の引数・帯のホットキーを載せる（mod の中でシェルの文字列も CLI の引数も
+// 組まない = カスタムボタンと同じ規則）。mod は会話の行（`tako_show_command` の行）にカードを、
+// 帯の tako の行に `Copy` / `Run` を描き、帯に押せる形で描いたカードの id を `renders.cards` で返す。
+// GPUI のカード帯は [`card_owner`] が `Mod` と言ったカードを出さない
+
+/// mod がカードを拾うまで GPUI の帯へ出さずに待つ上限（S7-4 #1963）。
+///
+/// AI が自分のペインへ出したカードは、mod が `tako_show_command` の呼び出しを見てすぐ報告し
+/// （1 秒の flush）、その応答で描いて次の報告（さらに 1 秒）で `renders.cards` に載せる = 実測で
+/// 1〜2.5 秒。その間に GPUI の帯を出すと viewport が一瞬縮んで戻る（claude が画面を組み直す）。
+/// 上限を過ぎても拾われなければ GPUI の帯へ出す（別のペインから出したカードは mod が次の heartbeat
+/// = 最大 15 秒まで知らないので、待たせすぎない）
+pub const CARD_PICKUP_GRACE: Duration = Duration::from_secs(5);
+
+/// 帯のカードのボタンのホットキー（tako が ui.json のボタンと重ならない英小文字を選ぶ）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardHotkeys {
+    pub copy: String,
+    pub run: String,
+    pub next: String,
+    pub dismiss: String,
+}
+
+/// コマンドの実行記録（`tako show-command --list` の `runs[]` と同じ語彙。#1724）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardRunView {
+    pub pane: u64,
+    /// `running` / `exited` / `closed`
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub count: u32,
+}
+
+/// カードのコマンド 1 件
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardCommandView {
+    /// **論理文字列**（AI が渡したまま。画面の折り返しは混ざらない = Copy に渡すのはこれ）
+    pub text: String,
+    /// Copy の代わりの経路（`$.ui.copy` が拒まれたとき）で叩く CLI の引数（tako の後ろの argv）
+    pub copy_args: Vec<String>,
+    /// Run で叩く CLI の引数（新しいペインで実行 = スマホ・GPUI のカードと同じ dispatch の `run`）
+    pub run_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<CardRunView>,
+}
+
+/// カード 1 枚
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardView {
+    pub id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub commands: Vec<CardCommandView>,
+    /// 閉じるで叩く CLI の引数
+    pub dismiss_args: Vec<String>,
+}
+
+/// 応答の `view.cards`（mod の契約は `types/index.d.ts` の `TakoCards`）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardsView {
+    pub hotkeys: CardHotkeys,
+    /// 古い順（store の並び）。帯は新しいものから選ぶ
+    pub items: Vec<CardView>,
+}
+
+/// カードの操作で叩く CLI の引数（tako の後ろの argv。`tako show-command` のフラグそのまま）
+pub fn card_cli_args(op: &str, card: u64, index: Option<usize>) -> Vec<String> {
+    let mut argv = vec!["show-command".to_string(), format!("--{op}")];
+    argv.push("--card".into());
+    argv.push(card.to_string());
+    if let Some(index) = index {
+        argv.push("--index".into());
+        argv.push(index.to_string());
+    }
+    argv
+}
+
+/// 帯のカードのボタンのホットキーを選ぶ（純関数）。ui.json のボタンの hotkey と重ならず、互いにも
+/// 重ならない英小文字。数字は使わない（エンジンの仕様で、空の入力欄で打った数字が帯のボタンを押す =
+/// 打鍵の弾みで Run が走る）。好みの字（copy = y / run = r / next = n / dismiss = x）が埋まっていれば
+/// 次の候補、それも埋まっていれば a〜z の空き
+pub fn card_hotkeys(buttons: &[crate::claude_mod_ui::Button]) -> CardHotkeys {
+    let mut taken: BTreeSet<char> = buttons
+        .iter()
+        .filter_map(|b| {
+            let mut chars = b.hotkey.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        })
+        .collect();
+    let mut pick = |prefer: &[char]| -> String {
+        let c = prefer
+            .iter()
+            .copied()
+            .chain('a'..='z')
+            .find(|c| !taken.contains(c))
+            .unwrap_or('z');
+        taken.insert(c);
+        c.to_string()
+    };
+    CardHotkeys {
+        copy: pick(&['y', 'o', 'p']),
+        run: pick(&['r', 'u', 'e']),
+        next: pick(&['n', 'j', 't']),
+        dismiss: pick(&['x', 'd', 'q']),
+    }
+}
+
+/// 応答の `view.cards` を組む（純関数）。`off` は描かせない理由（ui.json の `cards.place` が `tako`・
+/// A/B）で、そのときは載せない = mod はカードを描かない
+pub fn cards_view(
+    cards: &[crate::CommandCard],
+    ui: &crate::claude_mod_ui::UiConfig,
+    legacy: bool,
+) -> Option<CardsView> {
+    if legacy || ui.cards.place == crate::claude_mod_ui::Place::Tako {
+        return None;
+    }
+    let items = cards
+        .iter()
+        .map(|card| {
+            let id = card.id().as_u64();
+            CardView {
+                id,
+                label: card.label().map(str::to_string),
+                commands: card
+                    .commands()
+                    .iter()
+                    .zip(card.runs())
+                    .enumerate()
+                    .map(|(i, (text, run))| CardCommandView {
+                        text: text.clone(),
+                        copy_args: card_cli_args("copy", id, Some(i + 1)),
+                        run_args: card_cli_args("run", id, Some(i + 1)),
+                        run: run.map(|r| CardRunView {
+                            pane: r.pane.as_u64(),
+                            state: r.state.as_str(),
+                            exit_code: r.state.exit_code(),
+                            count: r.count,
+                        }),
+                    })
+                    .collect(),
+                dismiss_args: card_cli_args("dismiss", id, None),
+            }
+        })
+        .collect();
+    Some(CardsView {
+        hotkeys: card_hotkeys(&ui.buttons),
+        items,
+    })
+}
+
+/// GPUI のカード帯にそのカードを出すのは誰か（§9.6。**判断はこの 1 本**）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardOwner {
+    /// GPUI のカード帯が今のまま出す（理由のコード）
+    Tako(&'static str),
+    /// mod が Claude Code の画面に描く（`drawn` = 報告の `renders.cards` に載った /
+    /// `pending` = mod がまだ拾っていない（[`CARD_PICKUP_GRACE`] の間）/ `place_mod` = ui.json が mod）
+    Mod(&'static str),
+}
+
+impl CardOwner {
+    /// GPUI のカード帯から外すか
+    pub fn yields(self) -> bool {
+        matches!(self, Self::Mod(_))
+    }
+
+    /// `drawn_by` の語（`mod` / `tako`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tako(_) => "tako",
+            Self::Mod(_) => "mod",
+        }
+    }
+
+    /// 理由のコード
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Tako(r) | Self::Mod(r) => r,
+        }
+    }
+}
+
+/// [`card_owner`] の入力
+#[derive(Debug, Clone, Copy)]
+pub struct CardOwnerInput<'a> {
+    /// ui.json の `cards.place`（[`ModHub::cards_place`]）
+    pub place: crate::claude_mod_ui::Place,
+    /// カードのペインの**新鮮な**報告（45 秒以内。無い = mod なし・古い・終わった・休眠）
+    pub stored: Option<&'a StoredReport>,
+    /// A/B（[`cards_legacy`] か [`s7_legacy`]）
+    pub legacy: bool,
+    pub card: u64,
+    /// カードを出した時刻（[`crate::CommandCard::shown_at`]）
+    pub shown_at: Instant,
+    pub now: Instant,
+}
+
+/// GPUI のカード帯からそのカードを外すか（§9.6「新鮮な報告 ∧ `renders.cards` ∧ 置き場が mod 側」）。
+///
+/// - A/B・`cards.place = tako`・新鮮な報告が無い（mod なし・止まった・45 秒途切れた）・カードを描かない
+///   mod（`renders.cards` が無い）→ `Tako`（今の表示）
+/// - 報告の `renders.cards` に載っている → `Mod("drawn")`
+/// - `cards.place = mod` → `Mod("place_mod")`（mod が効いている間は帯を出さない。帯を隠している等で
+///   mod が描けなくても出さない = 利用者がそう選んだ）
+/// - mod がまだ拾っていない（カードを載せた応答を受けてから 1 周報告していない）かつ
+///   [`CARD_PICKUP_GRACE`] 以内 → `Mod("pending")`（viewport を一瞬縮めない）
+/// - それ以外（拾ったのに描いていない = 帯を隠している・区切りに card が無い・幅が足りない・他の mod に
+///   帯を隠された）→ `Tako("mod_not_drawn")`
+pub fn card_owner(input: CardOwnerInput<'_>) -> CardOwner {
+    use crate::claude_mod_ui::Place;
+    if input.legacy {
+        return CardOwner::Tako("legacy_env");
+    }
+    if input.place == Place::Tako {
+        return CardOwner::Tako("place_tako");
+    }
+    let Some(stored) = input.stored else {
+        return CardOwner::Tako("no_fresh_report");
+    };
+    let Some(drawn) = stored
+        .report
+        .renders
+        .as_ref()
+        .and_then(|r| r.cards.as_ref())
+    else {
+        return CardOwner::Tako("mod_not_drawing_cards");
+    };
+    if drawn.contains(&input.card) {
+        return CardOwner::Mod("drawn");
+    }
+    if input.place == Place::Mod {
+        return CardOwner::Mod("place_mod");
+    }
+    // カードを載せた応答は「カードの後に届いた最初の報告」への応答。mod がそれを描いて返すのは
+    // その次の報告 = 1 つ前の報告がカードより後なら、mod は 1 周見たうえで描かなかった
+    let seen = stored.prev_received.is_some_and(|p| p > input.shown_at);
+    if !seen && input.now.saturating_duration_since(input.shown_at) < CARD_PICKUP_GRACE {
+        return CardOwner::Mod("pending");
+    }
+    CardOwner::Tako("mod_not_drawn")
 }
 
 #[cfg(test)]
@@ -2862,5 +3157,281 @@ mod tests {
         let v = serde_json::to_value(&view).unwrap();
         assert!(v.get("usage_bar").is_none() && v.get("button_args").is_none());
         assert_eq!(v["band_style"], "s3");
+    }
+
+    // --- S7-4（#1963）-----------------------------------------------------------------
+
+    /// renders.cards を持つ報告（`cards` が None ならカードを描かない mod）
+    fn card_report(cards: Option<Vec<u64>>) -> ModReport {
+        let mut v = report_json();
+        v["renders"] = serde_json::json!({
+            "band": true, "buttons": 1, "band_hook": true, "hint_hook": true, "cards": cards,
+        });
+        parse_report(v).unwrap()
+    }
+
+    fn stored(report: ModReport, received: Instant, prev: Option<Instant>) -> StoredReport {
+        StoredReport {
+            report,
+            received,
+            count: 2,
+            prev_received: prev,
+        }
+    }
+
+    /// #1963: renders.cards は後方互換で読め（無い = カードを描かない mod）、上限で切られる
+    #[test]
+    fn issue1963_報告のrenders_cardsは後方互換で読める() {
+        let r = card_report(Some(vec![4, 5]));
+        assert_eq!(r.renders.unwrap().cards, Some(vec![4, 5]));
+        assert_eq!(renders(None, true, true).renders.unwrap().cards, None);
+        let r = card_report(Some((0..40).collect()));
+        assert_eq!(
+            r.renders.unwrap().cards.unwrap().len(),
+            MAX_RENDERED_CARDS,
+            "おかしな数の id でメモリを食わせない"
+        );
+    }
+
+    /// #1963: GPUI のカード帯から外すのは「新鮮な報告 ∧ renders.cards ∧ 置き場が mod 側」と、
+    /// mod がまだ拾っていない新しいカードの猶予の間だけ
+    #[test]
+    fn issue1963_カードの持ち主は報告と置き場と猶予で決まる() {
+        use crate::claude_mod_ui::Place;
+        let now = Instant::now();
+        let shown = now - Duration::from_secs(1);
+        let before = shown - Duration::from_secs(1);
+        let after = shown + Duration::from_millis(500);
+        fn input(
+            stored: Option<&StoredReport>,
+            shown: Instant,
+            now: Instant,
+        ) -> CardOwnerInput<'_> {
+            CardOwnerInput {
+                place: crate::claude_mod_ui::Place::Auto,
+                stored,
+                legacy: false,
+                card: 5,
+                shown_at: shown,
+                now,
+            }
+        }
+        let base = |stored| input(stored, shown, now);
+        // 描いた
+        let drawn = stored(card_report(Some(vec![4, 5])), now, Some(after));
+        assert_eq!(card_owner(base(Some(&drawn))), CardOwner::Mod("drawn"));
+        assert!(card_owner(base(Some(&drawn))).yields());
+        // A/B・置き場 tako は描いていても GPUI の帯のまま
+        assert_eq!(
+            card_owner(CardOwnerInput {
+                legacy: true,
+                ..base(Some(&drawn))
+            }),
+            CardOwner::Tako("legacy_env")
+        );
+        assert_eq!(
+            card_owner(CardOwnerInput {
+                place: Place::Tako,
+                ..base(Some(&drawn))
+            }),
+            CardOwner::Tako("place_tako")
+        );
+        // 新鮮な報告が無い（mod なし・止まった・45 秒途切れた・終わった）
+        assert_eq!(card_owner(base(None)), CardOwner::Tako("no_fresh_report"));
+        // カードを描かない mod（S7-4 前・応答に view.cards が無かった）
+        let old = stored(renders(None, true, true), now, Some(after));
+        assert_eq!(
+            card_owner(base(Some(&old))),
+            CardOwner::Tako("mod_not_drawing_cards")
+        );
+        // mod がまだ拾っていない: カードの後の報告が 1 つだけ（その応答でカードを受け取ったところ）
+        let first = stored(card_report(Some(vec![4])), after, Some(before));
+        assert_eq!(card_owner(base(Some(&first))), CardOwner::Mod("pending"));
+        // 猶予を過ぎたら GPUI の帯へ出す（別のペインから出して mod が heartbeat まで知らない等）
+        assert_eq!(
+            card_owner(CardOwnerInput {
+                now: shown + CARD_PICKUP_GRACE,
+                ..base(Some(&first))
+            }),
+            CardOwner::Tako("mod_not_drawn")
+        );
+        // 拾ったのに描かなかった（帯を隠している・幅が足りない）= 猶予の中でも GPUI の帯へ
+        let seen = stored(card_report(Some(vec![4])), now, Some(after));
+        assert_eq!(
+            card_owner(base(Some(&seen))),
+            CardOwner::Tako("mod_not_drawn")
+        );
+        // 置き場 mod は拾ったのに描かなくても外す（mod が効いている間は GPUI の帯を出さない）
+        assert_eq!(
+            card_owner(CardOwnerInput {
+                place: Place::Mod,
+                ..base(Some(&seen))
+            }),
+            CardOwner::Mod("place_mod")
+        );
+        // 置き場 mod でも mod が居なければ GPUI の帯（カードを見失わない）
+        assert_eq!(
+            card_owner(CardOwnerInput {
+                place: Place::Mod,
+                ..base(None)
+            }),
+            CardOwner::Tako("no_fresh_report")
+        );
+        // 初めての報告（1 つ前が無い）は拾っていない扱い
+        let fresh = stored(card_report(Some(vec![])), after, None);
+        assert_eq!(card_owner(base(Some(&fresh))), CardOwner::Mod("pending"));
+        assert_eq!(CardOwner::Mod("drawn").as_str(), "mod");
+        assert_eq!(CardOwner::Tako("x").reason(), "x");
+    }
+
+    /// #1963: 報告を受けるたびに 1 つ前の受信時刻を控える（拾ったかの判断の材料）
+    #[test]
+    fn issue1963_報告は1つ前の受信時刻を持つ() {
+        let mut hub = ModHub::new(true);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        hub.accept(3, card_report(Some(vec![])), t0);
+        assert_eq!(hub.reports[&3].prev_received, None);
+        hub.accept(3, card_report(Some(vec![])), t1);
+        assert_eq!(hub.reports[&3].prev_received, Some(t0));
+        assert_eq!(hub.reports[&3].received, t1);
+    }
+
+    /// #1963: 帯のカードのホットキーは ui.json のボタンと重ならない英小文字（数字は使わない）
+    #[test]
+    fn issue1963_カードのホットキーはボタンと重ならない英字() {
+        use crate::claude_mod_ui::{Button, ButtonAction, SlashCommand};
+        let button = |hotkey: &str| Button {
+            id: format!("b-{hotkey}"),
+            label: "b".into(),
+            hotkey: hotkey.into(),
+            action: ButtonAction::Slash {
+                command: SlashCommand::Compact,
+            },
+        };
+        let keys = card_hotkeys(&[button("c")]);
+        assert_eq!(
+            (
+                keys.copy.as_str(),
+                keys.run.as_str(),
+                keys.next.as_str(),
+                keys.dismiss.as_str()
+            ),
+            ("y", "r", "n", "x")
+        );
+        // 好みの字が埋まっていれば次の候補、それも埋まっていれば a〜z の空き
+        let taken: Vec<Button> = ["y", "o", "p", "r", "u", "e", "n", "j", "t", "x"]
+            .iter()
+            .map(|k| button(k))
+            .collect();
+        let keys = card_hotkeys(&taken);
+        let got = [&keys.copy, &keys.run, &keys.next, &keys.dismiss];
+        assert_eq!(keys.dismiss, "d");
+        for key in got {
+            assert!(
+                key.len() == 1 && key.chars().all(|c| c.is_ascii_lowercase()),
+                "{key}"
+            );
+            assert!(
+                !taken.iter().any(|b| &b.hotkey == key),
+                "{key} がボタンと重なる"
+            );
+        }
+        let mut uniq: Vec<&String> = vec![&keys.copy, &keys.run, &keys.next, &keys.dismiss];
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 4, "互いにも重ならない");
+    }
+
+    /// #1963: 応答の view.cards は store の論理文字列と tako が組んだ CLI の引数。置き場 tako・A/B では載せない
+    #[test]
+    fn issue1963_view_cardsは置き場とabで出し分ける() {
+        let pane = crate::Pane::new(crate::PaneOrigin::User).id();
+        let run_pane = crate::Pane::new(crate::PaneOrigin::User).id();
+        let long = format!("cargo build -p tako-cli && {}", "x".repeat(140));
+        let mut store = crate::CommandCards::new();
+        let id = store
+            .show(pane, &[long.clone(), "a \\\n  && b".into()], Some("ビルド"))
+            .unwrap();
+        store.record_run(id, 1, run_pane).unwrap();
+        let cards: Vec<crate::CommandCard> = store.list(Some(pane)).into_iter().cloned().collect();
+        let input =
+            |ui: crate::claude_mod_ui::UiConfig, cards_legacy: bool, s7_legacy: bool| BandInput {
+                pane: pane.as_u64(),
+                lang: "ja",
+                ui,
+                cards: cards.clone(),
+                cards_legacy,
+                s7_legacy,
+                ..BandInput::default()
+            };
+        let view = band_view(input(Default::default(), false, false));
+        let got = view.cards.expect("auto は載せる");
+        let card = &got.items[0];
+        assert_eq!(card.id, id.as_u64());
+        assert_eq!(card.label.as_deref(), Some("ビルド"));
+        assert_eq!(
+            card.commands[0].text, long,
+            "論理文字列のまま（折り返しの改行が無い）"
+        );
+        assert!(!card.commands[0].text.contains('\n'));
+        assert_eq!(
+            card.commands[1].text, "a \\\n  && b",
+            "複数行は本物の改行を保つ"
+        );
+        let n = id.as_u64().to_string();
+        assert_eq!(
+            card.commands[1].run_args,
+            [
+                "show-command",
+                "--run",
+                "--card",
+                n.as_str(),
+                "--index",
+                "2"
+            ]
+        );
+        assert_eq!(
+            card.commands[0].copy_args,
+            [
+                "show-command",
+                "--copy",
+                "--card",
+                n.as_str(),
+                "--index",
+                "1"
+            ]
+        );
+        assert_eq!(
+            card.dismiss_args,
+            ["show-command", "--dismiss", "--card", n.as_str()]
+        );
+        let run = card.commands[0].run.as_ref().expect("実行記録");
+        assert_eq!(
+            (run.pane, run.state, run.count),
+            (run_pane.as_u64(), "running", 1)
+        );
+        assert!(card.commands[1].run.is_none());
+        // JSON の形（mod の契約 = TakoCards）
+        let v = serde_json::to_value(&got).unwrap();
+        assert_eq!(v["hotkeys"]["copy"], "y");
+        assert!(v["items"][0]["commands"][1].get("run").is_none());
+        // 置き場 tako・A/B（#1963 / S7-3）では載せない = mod はカードを描かない
+        let mut tako = crate::claude_mod_ui::UiConfig::default();
+        tako.cards.place = crate::claude_mod_ui::Place::Tako;
+        for (ui, legacy, s7) in [
+            (tako, false, false),
+            (Default::default(), true, false),
+            (Default::default(), false, true),
+        ] {
+            let v = serde_json::to_value(band_view(input(ui, legacy, s7))).unwrap();
+            assert!(v.get("cards").is_none(), "{v}");
+        }
+        // カードが 0 枚でも載せる（mod は「描かせる」と分かる = renders.cards を空で返す）
+        let empty = band_view(BandInput {
+            cards: Vec::new(),
+            ..input(Default::default(), false, false)
+        });
+        assert_eq!(empty.cards.map(|c| c.items.len()), Some(0));
     }
 }

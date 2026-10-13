@@ -8733,8 +8733,12 @@ fn dispatch_show_command(
             let shown = store
                 .get(id)
                 .ok_or_else(|| DispatchError::Operation("カードの登録直後に見失った".into()))?;
+            let mut card = command_card_json(shown);
+            // #1963: どこに出るか（mod が Claude Code の画面に描く / GPUI のカード帯）
+            card["owner"] =
+                crate::claude_mod::card_owner_json(host, shown, std::time::Instant::now());
             let value = json!({
-                "card": command_card_json(shown),
+                "card": card,
                 "pane_cards": store.list(Some(shown.pane())).len(),
                 "max_cards_per_pane": tako_core::command_card::MAX_CARDS_PER_PANE,
             });
@@ -8746,12 +8750,18 @@ fn dispatch_show_command(
             // 読む直前に実行記録を実態へ寄せる（#1724。スマホは GUI の 2 秒ポーリングを待たない）
             refresh_command_card_runs(host);
             let store = host.command_cards().ok_or_else(cards_unsupported)?;
+            let now = std::time::Instant::now();
             Ok(json!({
                 "pane": target.as_u64(),
                 "cards": store
                     .list(Some(target))
                     .into_iter()
-                    .map(command_card_json)
+                    .map(|c| {
+                        let mut card = command_card_json(c);
+                        // #1963: どこに出ているか（判断は GPUI のカード帯と同じ 1 本）
+                        card["owner"] = crate::claude_mod::card_owner_json(host, c, now);
+                        card
+                    })
                     .collect::<Vec<_>>(),
                 "total": store.len(),
             }))
@@ -28669,6 +28679,7 @@ mod tests {
                 report,
                 received: std::time::Instant::now(),
                 count: 1,
+                prev_received: None,
             },
             limits,
         )
