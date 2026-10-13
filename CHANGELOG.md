@@ -8,6 +8,29 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
+### Changed
+
+- **Left clicks and drags now reach mouse-aware TUIs** (#1961). Full-screen apps that ask
+  for mouse reports — Claude Code in its default full-screen mode, vim, htop — receive the
+  click instead of tako starting its own text selection, so the tako mod buttons, Markdown
+  links and "Jump to bottom (click)" can be pressed with the mouse. **Hold Option (⌥) or
+  Shift while dragging to select text in tako as before**; cmd-click (Ctrl-click on
+  Windows) still opens links. A click that only moves focus to another pane is not passed
+  on. Shells and other apps that do not ask for the mouse behave exactly as before. Turn
+  it off with `tako mouse off`, the MCP `tako_scrollback` `mouse_forward` argument or the
+  "Send clicks to TUIs" switch in Settings; the change applies from the next click.
+  AI agents can click a cell with `tako click --pane N --row R --col C`.
+- **マウスを使う TUI へ左クリック・ドラッグを渡すようにした**（#1961）。マウス報告を要求する
+  全画面のアプリ（既定の全画面の Claude Code・vim・htop 等）では、クリックが tako の選択ではなく
+  アプリへ届くので、tako mod のボタン・Markdown のリンク・「Jump to bottom (click)」をマウスで
+  押せる。**tako で文字を選ぶときは Option（⌥）か Shift を押しながらドラッグする**。
+  cmd + クリック（Windows は Ctrl + クリック）のリンクは今までどおり。ペインのフォーカスを移すだけの
+  クリックはアプリへ渡さない。マウスを要求しないシェル等の挙動は変わらない。
+  `tako mouse off`・MCP `tako_scrollback` の `mouse_forward`・設定画面の「TUI へクリックを渡す」で
+  元に戻せ、次のクリックから効く。AI からは `tako click --pane N --row R --col C` で押せる。
+
 ## [0.8.32] - 2026-10-13
 
 Nightly patch release (automated). Changes since v0.8.31:

@@ -735,6 +735,39 @@ e2e: `tmux_backend::マウスレポート洪水でも断片がテキスト化し
 `scroll_mirror::ホイールレポートのtmux直接注入が内側に生で届く`（注入経路）。
 断片判定の capture は `-J`（折り返し結合）必須 — 80 桁折り返しで intact な
 レポートが行を跨ぎ、断片と誤判定する（実装中に踏んだ罠）
+
+### クリックの転送（#1961。FR-2.5.15）
+
+#167 の経路はホイールだけだった。マウス報告を要求する TUI（全画面の claude 等）へ左クリック /
+ドラッグも渡す。**判断と符号化は `tako_core::mouse_forward` の 1 実装**で、GUI（`tako-app` の
+`click_forward.rs`）と AI のクリック（`Request::PaneClick` = `tako click` / MCP `tako_send_input` の
+`click`）が同じ `route` → `decide` → `click_report_bytes` を通る。
+
+- **tako が取る条件**（`route`。優先順 = A/B → 設定 → cmd → Option / Shift → 窓の活性化 →
+  フォーカス移動 → 遡り中）。フォーカスを移すクリックを渡さないのは、作業ペインを選ぶつもりの
+  クリックで TUI のボタンを誤って押さないため。cmd + クリックは #763 の 1 実装でリンクへ
+- **直接ペイン**: `TerminalSession::click_report`（端末モード）でその場で分かるので PTY へ書く。
+  ドラッグの移動は #167 と同じトークンバケット（`MotionBudget`）、押す・離すは捨てない
+- **器のペイン**: 外側の端末モードは器の `set -g mouse on` で常に要求ありに見える（#1252）ので
+  使えない。押した時点で器のペイン側のフラグ（`#{mouse_any_flag}` / `sgr` / `utf8` / `button` /
+  `all` / `pane_in_mode`）を **background で**問い合わせ、答えが来るまでの押す・移動・離すは
+  `ClickForward::Resolving` に溜める（素早いダブルクリックも同じ列へ積む）。答えが「要求あり」なら
+  溜めた列を渡し、「無し」なら tako の選択として再生する（押す → 移動 → 離すと同じ結果）。
+  渡すのは `send-keys -H`（#167 と同じ = 断片化が構造的に起きない）を**ペインごとに 1 本へ直列化**
+  （`pump_click`。送信中の移動は最新 1 つへ畳む）。copy mode 中は渡さない（注入が copy-mode のキーに
+  なる）。問い合わせの答えはホイールの判定（`ScrollCtl::wants_mouse`）にも入れる
+- **離すを取りこぼさない**: `on_mouse_up` はほかの状態より先に `end_click_forward` を通し、
+  窓の外で離して MouseUp が届かない（ボタンなしの移動で戻ってくる）ときも TUI へ離すを渡す
+- **UI スレッドで器を起こさない**（#1979 の型）: 器への問い合わせ・解決・注入は GUI では
+  `background_executor`、AI のクリックは `prepare_offload` の `OffloadJob::PaneClick`
+- 番犬: `crates/tako-control/tests/issue1961_click_forward_watchdog.rs`（上の配線順と background の
+  縛り）。e2e: `tmux_backend::クリックのtmux直接注入は断片を混ぜず押す離すを欠かさない`
+  （押す・ドラッグ・離すの洪水 150 回で欠け 0・断片 0）/ `マウスを要求しない器のペインへはクリックを渡さない`。
+  実クリックは visual-test `click-forward` / `click-forward-claude`（`scripts/test-click-forward-1961.sh`）
+- **Claude Code 側の前提**（2.1.294 で実測）: マウスは 1003（ボタンなしの移動も）+ SGR を要求する。
+  押せる部品は描かれて（mount されて）から 300 ms 以内のクリックを迷いクリックとして捨てる
+  （`mount_settle`。帯のように描き直されうる場所では、出た瞬間に押す自動化が空振りする = 人の手では起きない）。
+  ボタンなしの移動（hover）は渡していない（左クリック / ドラッグだけ = #1961 の範囲）
 - **UI 側**（`ScrollCtl`）: ホイールは pending に積んで 1 つの tmux 操作へ
   コアレッシング（洪水対策）。キー入力・IME 確定の前に `cancel` を同期実行して
   iTerm2 流「打ったら最下部へ戻って入力」。copy-mode 中はカーソル強調を抑止
@@ -798,7 +831,8 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   e2e: `ロケール無し環境でもタブ区切り出力が壊れない`（C ロケールで `_` 化する
   カナリア + 注入後の TAB 保持）
 - **マウスレポートの保証**（tako の存在意義。Zed の同症状が自作の動機）:
-  「内側アプリがマウスを要求したら必ず生の SGR イベントが届く」「alt-screen 非マウス
+  「内側アプリがマウスを要求したら必ず生の SGR イベントが届く」（ホイールは #167、左クリック /
+  ドラッグは #1961 から。Option / Shift + ドラッグは tako の選択）「alt-screen 非マウス
   ペインへのホイールが矢印キーに化けない」を core e2e で常時検証する。
   バックエンド `mouse on` で claude（マウス非要求・通常画面）へのホイールは tmux
   copy-mode = チャットが遡れる

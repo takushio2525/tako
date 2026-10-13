@@ -987,6 +987,18 @@ impl TerminalSession {
         self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
     }
 
+    /// 内側アプリが要求しているクリックの報告の形（#1961）。**直接ペインでだけ**意味がある
+    /// （器のペインの外側は器の `set -g mouse on` で常に要求ありに見える = #1252。
+    /// 器のペインは `mouse_forward::tmux_mouse_flags` で器のペイン側を見る）
+    pub fn click_report(&self) -> Option<crate::mouse_forward::MouseReport> {
+        crate::mouse_forward::MouseReport::from_term_mode(*self.term.lock().mode())
+    }
+
+    /// クリックの報告を PTY へ書く（#1961）。ホイールの転送と同じく表示位置は動かさない
+    pub fn write_click_report(&self, bytes: Vec<u8>) {
+        self.notifier.notify(bytes);
+    }
+
     pub fn scroll_to_bottom(&self) {
         let mut fract = self.fract_lock();
         *fract = 0.0;
@@ -1884,12 +1896,13 @@ enum WheelAction {
 /// 下流が詰まった際の部分 write がシーケンス途中で切れて escape-time を
 /// 跨ぐ（= tmux が ESC を単独キー確定して残りが平文化する）事故を防ぐ
 const WHEEL_FORWARD_RATE: f32 = 150.0;
-const WHEEL_FORWARD_BURST: f32 = 8.0;
+/// クリックのドラッグの移動（#1961 の `mouse_forward::MotionBudget`）も同じ値を使う
+pub(crate) const WHEEL_FORWARD_BURST: f32 = 8.0;
 
 /// ホイール転送レート制限のトークン計算（純関数）。
 /// tokens へ経過時間ぶんを補充（上限 `WHEEL_FORWARD_BURST`）し、
 /// requested のうち通せるイベント数を返す。戻り値は（許可イベント数, 残トークン）
-fn wheel_rate_take(tokens: f32, elapsed_secs: f32, requested: u32) -> (u32, f32) {
+pub(crate) fn wheel_rate_take(tokens: f32, elapsed_secs: f32, requested: u32) -> (u32, f32) {
     let filled = (tokens + elapsed_secs.max(0.0) * WHEEL_FORWARD_RATE).min(WHEEL_FORWARD_BURST);
     let allowed = requested.min(filled as u32);
     (allowed, filled - allowed as f32)

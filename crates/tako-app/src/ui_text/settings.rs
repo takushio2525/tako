@@ -182,6 +182,17 @@ pub fn desc_autosuggest() -> &'static str {
     )
 }
 
+pub fn label_mouse_click_forward() -> &'static str {
+    tr!("TUI へクリックを渡す", "Send clicks to TUIs")
+}
+
+pub fn desc_mouse_click_forward() -> &'static str {
+    tr!(
+        "全画面の claude などマウスを使うアプリへ左クリック・ドラッグを渡す（Option / Shift + ドラッグで tako の選択）",
+        "Pass left clicks and drags to mouse-aware apps such as full-screen claude (Option / Shift + drag selects in tako)"
+    )
+}
+
 pub fn label_autosuggest_tab() -> &'static str {
     tr!("Tab キーでも確定", "Accept with Tab too")
 }

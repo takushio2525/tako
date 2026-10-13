@@ -1257,7 +1257,7 @@ mod tests {
     #[test]
     fn scrollbackは状態取得と上限変更をrequestへ写す() {
         let (_, requests) = run(call("tako_scrollback", json!({})), None, true);
-        assert_eq!(requests, vec![Request::Scrollback { lines: None, unfocused_fps: None }]);
+        assert_eq!(requests, vec![Request::Scrollback { lines: None, unfocused_fps: None , mouse_forward: None}]);
 
         let (_, requests) = run(call("tako_scrollback", json!({ "lines": 2000 })), None, true);
         assert_eq!(
@@ -1265,6 +1265,7 @@ mod tests {
             vec![Request::Scrollback {
                 lines: Some(2_000),
                 unfocused_fps: None,
+                mouse_forward: None,
             }]
         );
 
@@ -1279,8 +1280,62 @@ mod tests {
             vec![Request::Scrollback {
                 lines: None,
                 unfocused_fps: Some(20),
+                mouse_forward: None,
             }]
         );
+
+        // #1961: クリックの転送も同じツールの引数（ツールは増やさない）
+        let (_, requests) = run(
+            call("tako_scrollback", json!({ "mouse_forward": false })),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Scrollback {
+                lines: None,
+                unfocused_fps: None,
+                mouse_forward: Some(false),
+            }]
+        );
+    }
+
+    /// #1961: `tako_send_input` の `click` は文字の代わりに左クリック（`PaneClick`）へ写る。
+    /// text と同時・形の崩れた click・pane なしは Request を作らずに断る
+    #[test]
+    fn send_inputのclickはクリックへ写り_textと排他() {
+        let (_, requests) = run(
+            call(
+                "tako_send_input",
+                json!({ "pane": 4, "click": { "row": 2, "col": 9 } }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PaneClick {
+                pane: Some(4),
+                row: 2,
+                col: 9
+            }]
+        );
+        for bad in [
+            json!({ "pane": 4, "text": "x", "click": { "row": 2, "col": 9 } }),
+            json!({ "pane": 4, "click": { "row": 2 } }),
+            json!({ "pane": 4, "click": [2, 9] }),
+            json!({ "click": { "row": 2, "col": 9 } }),
+        ] {
+            let (_, requests) = run(call("tako_send_input", bad.clone()), None, true);
+            assert!(requests.is_empty(), "断らずに要求を作った: {bad}");
+        }
+        // 文字の送信は今までどおり
+        let (_, requests) = run(
+            call("tako_send_input", json!({ "pane": 4, "text": "ls" })),
+            None,
+            true,
+        );
+        assert!(matches!(requests.as_slice(), [Request::Send { .. }]));
     }
 
     #[test]

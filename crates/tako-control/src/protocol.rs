@@ -765,13 +765,24 @@ pub enum Request {
     /// `max_mb` 省略時は現在状態の取得のみ。設定は永続化される。
     PreviewCache { max_mb: Option<u64> },
     /// ペインの重さの上限: 直接ペインのスクロールバック保持上限（Issue #818）と
-    /// フォーカスの無いペインの出力による再描画の上限（`unfocused_fps`。Issue #1979）。
-    /// どちらも省略時は現在状態の取得のみ。設定は永続化され、
+    /// フォーカスの無いペインの出力による再描画の上限（`unfocused_fps`。Issue #1979）、
+    /// マウス報告を要求する TUI への左クリックの転送（`mouse_forward`。Issue #1961）。
+    /// どれも省略時は現在状態の取得のみ。設定は永続化され、
     /// **生存中のペインにもその場で効く**（下げれば履歴が切り詰められて RAM が戻る）。
     Scrollback {
         lines: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unfocused_fps: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mouse_forward: Option<bool>,
+    },
+    /// ペインの表示セル（0 始まり）を左クリックする = 押す + 離すを内側アプリへ渡す（Issue #1961）。
+    /// GUI のクリックと同じ判断・同じバイト列（`tako_core::mouse_forward`）を通る。
+    /// 内側アプリがマウス報告を要求していなければ渡さずエラー（シェルへ制御列を打たない）
+    PaneClick {
+        pane: Option<u64>,
+        row: usize,
+        col: usize,
     },
     /// コードプレビューの編集モードを切り替える（FR-3.5）。`enabled` 省略時は状態取得。
     PreviewEdit {
@@ -2678,6 +2689,8 @@ pub fn changes_layout(request: &Request) -> bool {
         // ホバー（#1681）は答えを返すか、`show` でカード（重ね物）を出すだけ（ペインの寸法は不変）
         | Request::LspHover { .. }
         | Request::Send { .. }
+        // クリック（#1961）は内側アプリへ報告のバイト列を渡すだけ（ペインの寸法は不変）
+        | Request::PaneClick { .. }
         | Request::Scroll { .. }
         | Request::Focus { .. }
         | Request::Title { .. }

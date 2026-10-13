@@ -26,6 +26,7 @@
 mod about_window;
 mod autorename;
 mod chat_view;
+mod click_forward;
 mod command_card_ui;
 mod diagnostics_panel;
 mod drawer;
@@ -965,6 +966,14 @@ fn initial_unfocused_redraw_fps() -> u32 {
         return tako_core::redraw_limit::DEFAULT_UNFOCUSED_FPS;
     }
     tako_control::settings::load().resolved_unfocused_redraw_fps()
+}
+
+/// クリックの転送（#1961）の起動時の値。セルフテストはユーザーの設定に左右されないよう既定で走る
+fn initial_mouse_click_forward() -> bool {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return tako_core::mouse_forward::DEFAULT_ENABLED;
+    }
+    tako_control::settings::load().mouse_click_forward
 }
 
 /// tako mod（FR-2.42 / #1879）の起動時の状態。
@@ -2473,6 +2482,14 @@ struct TakoApp {
     term_redraw_requests: u64,
     /// フォーカスの無いペインの出力による再描画の上限（fps。#1979。`tako redraw-limit`）
     unfocused_redraw_fps: u32,
+    /// マウス報告を要求する TUI へ左クリックを渡すか（#1961。`tako mouse`。即時に効く）
+    mouse_click_forward: bool,
+    /// 押してから離すまでのクリックの転送の状態（#1961。`click_forward.rs`）
+    click_forward: Option<click_forward::ClickForward>,
+    /// 器のペインへのクリックの送信待ち（#1961。ペインごとに 1 本へ直列化）
+    click_pumps: HashMap<PaneId, click_forward::ClickPump>,
+    /// GUI のクリックを渡した累計と最後の行き先（#1961。`tako mouse` の応答）
+    click_stats: tako_core::mouse_forward::ForwardStats,
     /// フォーカスの無いペインの再描画: 最後に流した時刻（#1979。`last_term_notify` の対）
     last_unfocused_flush: std::time::Instant,
     /// 同: 遅延フラッシュのタイマーが稼働中か（`term_notify_pending` の対）
@@ -4595,6 +4612,10 @@ impl TakoApp {
             term_notify_pending: false,
             term_redraw_requests: 0,
             unfocused_redraw_fps: initial_unfocused_redraw_fps(),
+            mouse_click_forward: initial_mouse_click_forward(),
+            click_forward: None,
+            click_pumps: HashMap::new(),
+            click_stats: tako_core::mouse_forward::ForwardStats::default(),
             last_unfocused_flush: std::time::Instant::now(),
             unfocused_notify_pending: false,
             unfocused_pending_panes: Vec::new(),
@@ -11034,6 +11055,7 @@ impl TakoApp {
         self.sync_preview_watches();
         self.scroll_accum.remove(&pane_id);
         self.scroll_ctls.remove(&pane_id);
+        self.forget_click_forward(pane_id);
         self.drop_tmux_view_session(pane_id);
         // たまり場カードの kill も GUI のボタン操作（#770 の監査記録）。
         // #1946: 幽霊は器を持たない（= 登録が無い）ので、ここで kill する相手は居ない。
@@ -11109,6 +11131,7 @@ impl TakoApp {
                 self.known_failed.remove(&pane_id);
                 self.scroll_accum.remove(&pane_id);
                 self.scroll_ctls.remove(&pane_id);
+                self.forget_click_forward(pane_id);
                 self.worker_font_refit_pending |= reflow_refit;
                 self.pane_font_sizes.remove(&pane_id);
                 self.auto_font_panes.remove(&pane_id);
@@ -11216,6 +11239,7 @@ impl TakoApp {
                     self.known_failed.remove(&id);
                     self.scroll_accum.remove(&id);
                     self.scroll_ctls.remove(&id);
+                    self.forget_click_forward(id);
                     self.dock_webview_of(id);
                     self.drop_tmux_view_session(id);
                     self.drop_backend_session_with(id, reason);
@@ -16813,6 +16837,16 @@ impl TakoApp {
         position: Point<Pixels>,
         _window: &mut Window,
     ) -> Option<(usize, usize, bool)> {
+        self.cell_clamped(pane_id, position)
+    }
+
+    /// `cell_at_clamped` の本体（window を使わない。#1961: window を受け取らない
+    /// `on_mouse_up` からも離した位置のセルを出すため）
+    fn cell_clamped(
+        &self,
+        pane_id: PaneId,
+        position: Point<Pixels>,
+    ) -> Option<(usize, usize, bool)> {
         let (_, area) = self.pane_text_areas.iter().find(|(id, _)| *id == pane_id)?;
         let cell = self.cell_size_for_pane(pane_id)?;
         let session = self.terminals.get(&pane_id)?;
@@ -17997,6 +18031,9 @@ impl TakoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // #1961: フォーカスを移すだけのクリックは TUI へ渡さない（作業ペインを選ぶつもりの
+        // クリックで TUI のボタンを誤って押さない）。移す前に見ておく
+        let focus_change = self.workspace.active_tab().tree().focused() != pane_id;
         let _ = self.workspace.active_tab_mut().tree_mut().focus(pane_id);
         // #503 / #1481: ペインを触ったら入力対象の切り替えをここで通す。
         // ルート div の一括 dismiss（伝播）にも同じ呼び出しが在るが、**明示に呼ぶ**。
@@ -18034,6 +18071,12 @@ impl TakoApp {
                         return;
                     }
                 }
+            }
+            // #1961: マウス報告を要求する TUI（全画面の claude 等）へは左クリックを渡す。
+            // 修飾（Option / Shift）・cmd・フォーカス移動・遡り中・設定 off は今までどおり tako の選択
+            if self.begin_click_forward(pane_id, event, (col, row, _right), focus_change, cx) {
+                cx.notify();
+                return;
             }
             // バックエンドのミラースクロール表示中は選択を開始しない: 選択は
             // alacritty の viewport（ライブ画面）に対して働くため、ミラー行が
@@ -18342,6 +18385,9 @@ impl TakoApp {
         self.update_lsp_hover(event.position, event.pressed_button.is_some(), cx);
 
         if event.pressed_button != Some(MouseButton::Left) {
+            // #1961: 離すが届かないまま戻ってきた。TUI へも離すを渡して畳む
+            // （渡さないと内側アプリが押しっぱなしだと思い込む）
+            self.end_click_forward(None, cx);
             // ウィンドウ外でボタンが離されると MouseUp が届かないことがある。
             // 取り残したドラッグ・選択状態はここで畳む（残留すると以後どこを
             // 左ドラッグしてもリサイズが発火し「当たり判定が広がった」ように見える）
@@ -18437,6 +18483,10 @@ impl TakoApp {
             }
             // ドラッグ選択中のオートスクロール判定（#309）
             self.update_preview_drag_scroll(pid, event.position, cx);
+            return;
+        }
+        // #1961: TUI へ渡しているドラッグ（ペインの外へ出ても最寄りのセルで渡し続ける）
+        if self.drag_click_forward(event.position, cx) {
             return;
         }
         let Some(pane_id) = self.selecting else {
@@ -18750,6 +18800,10 @@ impl TakoApp {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        // #1961: TUI へ渡していたクリックの離す（ほかの状態より先に見る = 離すを取りこぼさない）
+        if self.end_click_forward(Some(event.position), cx) {
+            return;
+        }
         // 動画シークバーのドラッグ終了。離した位置へ正確にシークし直してから
         // 畳む（ドラッグ中は粗いシークで追従している。#484）
         if self.video_seek_end_drag(Some(event.position), cx) {
@@ -23675,6 +23729,7 @@ impl SessionHost for TakoApp {
         self.dock_webview_of(pane);
         self.scroll_accum.remove(&pane);
         self.scroll_ctls.remove(&pane);
+        self.forget_click_forward(pane);
         self.drop_tmux_view_session(pane);
         self.drop_backend_session(pane, origin, caller);
     }
@@ -23700,6 +23755,36 @@ impl SessionHost for TakoApp {
             body_renders: self.pane_body_renders,
             legacy: tako_core::probe::issue1979_legacy(),
         }
+    }
+
+    fn mouse_forward_status(&self) -> tako_core::mouse_forward::MouseForwardStatus {
+        tako_core::mouse_forward::MouseForwardStatus {
+            enabled: self.mouse_click_forward,
+            legacy: tako_core::mouse_forward::legacy(),
+            stats: self.click_stats.clone(),
+        }
+    }
+
+    fn set_mouse_forward(&mut self, enabled: bool) {
+        // 次のクリックから効く（押している最中のクリックは離すまでそのまま渡す）
+        self.mouse_click_forward = enabled;
+        // セルフテスト中はユーザー設定を汚さない（scrollback と同じ規約）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.mouse_click_forward = enabled;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
+        }
+    }
+
+    fn pane_click_direct(
+        &mut self,
+        pane: PaneId,
+        col: usize,
+        row: usize,
+    ) -> Result<tako_core::mouse_forward::MouseReport, String> {
+        self.click_direct_pane(pane, col, row)
     }
 
     fn set_unfocused_redraw_fps(&mut self, fps: u32) {
@@ -30112,6 +30197,12 @@ mod self_test {
     mod mod_limits;
     #[cfg(feature = "visual-test")]
     use mod_limits::mod_limits_visual;
+    /// #1961: マウス報告を要求する TUI へ GUI の左クリック / ドラッグが届くか（visual-test `click-forward` /
+    /// `click-forward-claude`）
+    #[cfg(feature = "visual-test")]
+    mod click_forward_1961;
+    #[cfg(feature = "visual-test")]
+    use click_forward_1961::{click_forward_claude_visual, click_forward_visual};
     /// #1962: mod がバーを描いているとき、ステータスバーの claude の区画を外すか（visual-test `mod-bar`）
     #[cfg(feature = "visual-test")]
     mod mod_bar_1962;
@@ -44534,6 +44625,17 @@ mod self_test {
                     std::process::exit(0);
                 }
                 // #1962: mod がバーを描いているとき、ステータスバーの claude の 5h / 7d / ctx を外すか
+                // #1961: TUI へのクリックの転送（合成のアプリ / 実物の claude）
+                "click-forward" => {
+                    click_forward_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                "click-forward-claude" => {
+                    click_forward_claude_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 "mod-bar" => {
                     mod_bar_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");

@@ -97,6 +97,10 @@ enum Command {
     Scrollback(ScrollbackArgs),
     /// フォーカスの無いペインの出力による再描画の上限（fps）の確認・変更（Issue #1979）
     RedrawLimit(RedrawLimitArgs),
+    /// マウス報告を要求する TUI（全画面の claude 等）へのクリックの転送の確認・切替（Issue #1961）
+    Mouse(MouseArgs),
+    /// ペインの表示セルを左クリックする（内側アプリがマウス報告を要求しているときだけ。Issue #1961）
+    Click(ClickArgs),
     /// ペインを閉じる（タブ最後の 1 ペインならタブごと閉じる）
     Close(CloseArgs),
     /// ペインのタイトル・役割ラベルを設定する（空文字でクリア）
@@ -3313,6 +3317,29 @@ struct RedrawLimitArgs {
     /// 上限（1〜60 fps。既定 30。フォーカス中のペインは常に 60。省略時は現在値と
     /// 起動からの再描画回数を表示）
     fps: Option<u32>,
+}
+
+/// クリックの転送の引数（Issue #1961）。
+/// 最簡形（#322）: `tako mouse` で現在状態、`tako mouse off` で #1961 前（常に tako の選択）へ
+#[derive(Args)]
+struct MouseArgs {
+    /// on = 渡す（既定）/ off = 渡さない。省略時は現在状態と累計を表示
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+}
+
+/// クリックの引数（Issue #1961）。座標は `tako read` の行・桁（0 始まり）
+#[derive(Args)]
+struct ClickArgs {
+    /// 対象ペイン ID（誤ったペインを押さないよう必須）
+    #[arg(long)]
+    pane: u64,
+    /// 行（0 始まり。画面の上端が 0）
+    #[arg(long)]
+    row: usize,
+    /// 桁（0 始まり）
+    #[arg(long)]
+    col: usize,
 }
 
 /// チェンジログビューの引数（Issue #338）
@@ -7982,11 +8009,25 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Scrollback(args) => Request::Scrollback {
             lines: args.lines,
             unfocused_fps: None,
+            mouse_forward: None,
         },
         // #1979: 再描画の上限は MCP `tako_scrollback` の `unfocused_fps` と同じ操作
         Command::RedrawLimit(args) => Request::Scrollback {
             lines: None,
             unfocused_fps: args.fps,
+            mouse_forward: None,
+        },
+        // #1961: クリックの転送は MCP `tako_scrollback` の `mouse_forward` と同じ操作
+        Command::Mouse(args) => Request::Scrollback {
+            lines: None,
+            unfocused_fps: None,
+            mouse_forward: args.state.as_deref().map(|s| s == "on"),
+        },
+        // #1961: MCP は `tako_send_input` の `click`
+        Command::Click(args) => Request::PaneClick {
+            pane: Some(args.pane),
+            row: args.row,
+            col: args.col,
         },
         // #1677: 基準ペインは閉じたペインの項目を開き直すときだけ使う。tako の外から
         // 叩いて呼び出し元が分からなくても失敗させない（dispatch がアクティブタブへ倒す）
@@ -11248,6 +11289,9 @@ fn print_result(command: &Command, result: &Value) {
         }
         // #1979: 再描画の上限の部分だけを出す（スクロールバックは `tako scrollback`）
         Command::RedrawLimit(_) => println!("{}", pretty_json(&result["unfocused_redraw"])),
+        // #1961: クリックの転送の部分だけを出す
+        Command::Mouse(_) => println!("{}", pretty_json(&result["mouse_forward"])),
+        Command::Click(_) => println!("{result}"),
         // #666: カードの内容（論理文字列）は改行込みで読みたいので整形して出す
         Command::ShowCommand(_) => println!("{}", pretty_json(result)),
         Command::Autorename(_)
@@ -13010,7 +13054,8 @@ mod tests {
             build_request(&status).unwrap(),
             Request::Scrollback {
                 lines: None,
-                unfocused_fps: None
+                unfocused_fps: None,
+                mouse_forward: None
             }
         );
         let changed = parse(&["tako", "scrollback", "2000"]);
@@ -13018,7 +13063,8 @@ mod tests {
             build_request(&changed).unwrap(),
             Request::Scrollback {
                 lines: Some(2_000),
-                unfocused_fps: None
+                unfocused_fps: None,
+                mouse_forward: None
             }
         );
     }
@@ -13032,7 +13078,8 @@ mod tests {
             build_request(&status).unwrap(),
             Request::Scrollback {
                 lines: None,
-                unfocused_fps: None
+                unfocused_fps: None,
+                mouse_forward: None
             }
         );
         let changed = parse(&["tako", "redraw-limit", "20"]);
@@ -13040,8 +13087,45 @@ mod tests {
             build_request(&changed).unwrap(),
             Request::Scrollback {
                 lines: None,
-                unfocused_fps: Some(20)
+                unfocused_fps: Some(20),
+                mouse_forward: None
             }
+        );
+    }
+
+    /// #1961: 最簡形（引数なし = 現在状態 / on・off = 切替）が MCP `tako_scrollback` の
+    /// `mouse_forward` と同じ操作へ写り、`tako click` は `PaneClick` へ写る（ペイン必須）
+    #[test]
+    fn mouseとclickは転送の切替とクリックを操作へ写す() {
+        for (args, want) in [
+            (vec!["tako", "mouse"], None),
+            (vec!["tako", "mouse", "off"], Some(false)),
+            (vec!["tako", "mouse", "on"], Some(true)),
+        ] {
+            assert_eq!(
+                build_request(&parse(&args)).unwrap(),
+                Request::Scrollback {
+                    lines: None,
+                    unfocused_fps: None,
+                    mouse_forward: want
+                },
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            build_request(&parse(&[
+                "tako", "click", "--pane", "3", "--row", "5", "--col", "10"
+            ]))
+            .unwrap(),
+            Request::PaneClick {
+                pane: Some(3),
+                row: 5,
+                col: 10
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["tako", "click", "--row", "5", "--col", "10"]).is_err(),
+            "誤ったペインを押さないよう --pane は必須"
         );
     }
 
@@ -13630,6 +13714,9 @@ mod platform_matrix_parity {
         ("read", "tako_read_pane"),
         // #1979: MCP は `tako_scrollback` の `unfocused_fps` 引数（ツールを増やさない）
         ("redraw-limit", "tako_scrollback"),
+        // #1961: MCP は `tako_scrollback` の `mouse_forward` / `tako_send_input` の `click`
+        ("mouse", "tako_scrollback"),
+        ("click", "tako_send_input"),
         ("resize", "tako_resize_pane"),
         ("run-default", "tako_run_defaults"),
         ("scroll", "tako_scroll_pane"),

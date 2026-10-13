@@ -5,8 +5,9 @@
 // そこで一時の CLAUDE_CONFIG_DIR + ANTHROPIC_BASE_URL=この偽 API + ダミーの ANTHROPIC_API_KEY で動かす
 // （設計書 §9.1 の試作と同じ構成。API キー経由なので $.session.usage().rateLimits は空）。
 //
-// 答え: 最後の発話に「Reply with exactly one word: X」があれば X、要約の依頼（/compact）には
-// 要約の文、ほかは「ok」。usage の input_tokens は FAKE_INPUT_TOKENS（既定 60000 = ctx が数 % 出る）。
+// 答え: 最後の発話に「Reply with exactly one word: X」があれば X、「Reply with N numbered lines」なら
+// LINE-1〜LINE-N の N 行（#1961: 会話を画面より長くして遡れるようにする。N は 1〜500）、
+// 要約の依頼（/compact）には要約の文、ほかは「ok」。usage の input_tokens は FAKE_INPUT_TOKENS（既定 60000 = ctx が数 % 出る）。
 // #1963: 最後の発話に「Show this card: {JSON}」があれば、要求の tools にある `…tako_show_command` を
 // その JSON（commands / label）で呼ぶ tool_use を返し、その結果（tool_result）が来たら「CARD-DONE」と答える。
 // 受けた要求は 1 行ずつ FAKE_LOG へ（経路・stream・要約の依頼か・ツールを呼んだかだけ。本文は書かない）。
@@ -52,6 +53,8 @@ function answer(body) {
   const all = messages.map(m => textOf(m?.content)).join('\n') + textOf(body?.system)
   const summarize = /summar/i.test(text) && /conversation/i.test(all)
   const word = /Reply with exactly one word: ([A-Za-z0-9_-]+)/.exec(text)
+  const lines = /Reply with (\d+) numbered lines/.exec(text)
+  const count = lines ? Math.min(500, Math.max(1, Number(lines[1]))) : 0
   const call = summarize ? null : cardCall(body, text)
   const reply = summarize
     ? 'SUMMARY-1962: the conversation so far was a short check.'
@@ -59,7 +62,9 @@ function answer(body) {
       ? 'CARD-DONE'
       : word
         ? word[1]
-        : 'ok'
+        : count > 0
+          ? Array.from({ length: count }, (_, i) => `LINE-${i + 1}`).join('\n')
+          : 'ok'
   return { reply, summarize, call }
 }
 

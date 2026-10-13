@@ -491,6 +491,7 @@ impl SettingsWindow {
                     Request::Scrollback {
                         lines: Some(lines),
                         unfocused_fps: None,
+                        mouse_forward: None,
                     },
                     cx,
                 ),
@@ -682,6 +683,7 @@ impl SettingsWindow {
             Request::Scrollback {
                 lines: Some(s.resolved_scrollback_lines()),
                 unfocused_fps: None,
+                mouse_forward: Some(s.mouse_click_forward),
             },
             Request::LimitService {
                 action: Some("set".into()),
@@ -1385,6 +1387,7 @@ impl SettingsWindow {
         let autosuggest = s.autosuggest;
         let autosuggest_hint = s.autosuggest_hint;
         let autosuggest_tab = s.autosuggest_tab;
+        let mouse_click_forward = s.mouse_click_forward;
         let persist = s.tmux_persist;
         let telemetry = s.telemetry;
         let reload = s.preview_live_reload;
@@ -1497,6 +1500,25 @@ impl SettingsWindow {
                                 enabled: None,
                                 hint: Some(!autosuggest_hint),
                                 tab: None,
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            // TUI へのクリックの転送（Issue #1961）
+            .child(self.row(
+                txt::label_mouse_click_forward(),
+                txt::desc_mouse_click_forward(),
+                self.toggle(
+                    "mouse_click_forward",
+                    mouse_click_forward,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::Scrollback {
+                                lines: None,
+                                unfocused_fps: None,
+                                mouse_forward: Some(!mouse_click_forward),
                             },
                             cx,
                         );

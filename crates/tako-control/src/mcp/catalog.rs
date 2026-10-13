@@ -139,12 +139,24 @@ pub fn tools() -> Vec<Value> {
                 この送達はその後ろに並ぶ（決着済みは出ない）。text を空にして newline: true で \
                 Enter 単独送信（入力欄が空へ戻るまで再送）。**選択肢ダイアログ表示中は送信を拒否して\
                 エラーを返す**（数字なら選択が確定してしまう）。エラー本文の選択肢を見て \
-                tako_orchestrator_respond で応答する。",
+                tako_orchestrator_respond で応答する。\
+                click を渡すと text の代わりにその表示セル（0 始まり）を左クリックする（押す + 離す。\
+                GUI のクリックと同じ経路）。内側アプリがマウス報告を要求していなければ渡さずエラー。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "integer", "minimum": 0, "description": "送信先ペイン ID（必須）" },
-                    "text": { "type": "string", "description": "送信するテキスト" },
+                    "text": { "type": "string", "description": "送信するテキスト（click と排他）" },
+                    "click": {
+                        "type": "object",
+                        "properties": {
+                            "row": { "type": "integer", "minimum": 0 },
+                            "col": { "type": "integer", "minimum": 0 },
+                        },
+                        "required": ["row", "col"],
+                        "additionalProperties": false,
+                        "description": "左クリックするセル（tako_read_pane の行・桁）",
+                    },
                     "newline": {
                         "type": "boolean",
                         "description": "末尾に改行を付けるか（省略時 true。プロンプトへの部分入力は false）",
@@ -158,7 +170,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "claude TUI の ❯ プロンプト表示を待ってから送信する（既定 false。子の Claude Code へ送るときに使う）",
                     },
                 },
-                "required": ["pane", "text"],
+                "required": ["pane"],
                 "additionalProperties": false,
             },
         }),
@@ -920,7 +932,9 @@ pub fn tools() -> Vec<Value> {
                 生存中のペインへもその場で適用する（下げれば履歴が切り詰められて RAM が戻る）。\
                 飽和時のフットプリントは 行 × 桁 × 24 バイトに比例するので、軽量運用では下げる。\
                 unfocused_fps はフォーカスの無いペインの出力による再描画の上限（フォーカス中は常に 60）。\
-                応答の unfocused_redraw に現在値と累計の再描画回数（flushes）が載る。",
+                応答の unfocused_redraw に現在値と累計の再描画回数（flushes）が載る。\
+                mouse_forward はマウス報告を要求する TUI（全画面の claude 等）へ左クリック / ドラッグを渡すか\
+                （既定 true。Option / Shift + ドラッグは常に tako の選択）。応答の mouse_forward に累計と最後の行き先。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -936,6 +950,7 @@ pub fn tools() -> Vec<Value> {
                         "maximum": 60,
                         "description": "再描画の上限 fps（既定 30）"
                     },
+                    "mouse_forward": { "type": "boolean", "description": "TUI へのクリックの転送（既定 true）" },
                 },
                 "additionalProperties": false,
             },
