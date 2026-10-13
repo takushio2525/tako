@@ -1967,6 +1967,10 @@ pub enum OffloadJob {
     },
     /// `TmuxCleanup`（#1989）。守るセッションは UI スレッドで集め、器への問い合わせと kill は background
     TmuxCleanup(crate::host::TmuxCleanupJob),
+    /// git の書き込み系と conflicts（#1991）。UI スレッドではペインの cwd（キャッシュ済みの値）だけを
+    /// 写し、リポジトリの解決（`git rev-parse`）と本体（pull / push はネットワークまで）は background。
+    /// 本体は同期の腕と同じ [`git_write_reply`]（workspace に触らないのでそのまま応答する）
+    GitWrite { cwd: PathBuf, request: Box<Request> },
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -2421,6 +2425,26 @@ pub fn prepare_offload(
             host.tmux_cleanup_job(requested, *servers, *apply)
                 .map(|job| Ok(OffloadJob::TmuxCleanup(job)))
         }
+        // #1991: git の書き込み系（と conflicts）は上限なしの `Command::output()` で git を待つ
+        // （pull / push はネットワーク・認証まで）。GitLog / GitDiff と同じく cwd の解決だけ UI スレッド、
+        // `git rev-parse` と本体は background（A/B の `TAKO_1991_LEGACY=1` は修正前と同じ同期の腕）
+        Request::GitCommit { pane, .. }
+        | Request::GitPull { pane }
+        | Request::GitPush { pane }
+        | Request::GitStage { pane, .. }
+        | Request::GitUnstage { pane, .. }
+        | Request::GitCheckout { pane, .. }
+        | Request::GitBranchCreate { pane, .. }
+        | Request::GitMerge { pane, .. }
+        | Request::GitMergeAbort { pane }
+        | Request::GitConflicts { pane }
+            if !tako_core::probe::issue1991_legacy() =>
+        {
+            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitWrite {
+                cwd,
+                request: Box::new(request.clone()),
+            }))
+        }
         Request::RemoteAgents if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::RemoteAgents))
         }
@@ -2576,6 +2600,7 @@ impl OffloadJob {
             OffloadJob::TmuxList { ctx, socket } => {
                 Ok(json!({ "sessions": fetch_tmux_sessions(&ctx, socket.as_deref()) }))
             }
+            OffloadJob::GitWrite { cwd, request } => git_write_reply(&cwd, *request),
             OffloadJob::LspMenu(job) => Ok(job.run().to_json()),
             OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
                 "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
@@ -3309,19 +3334,14 @@ fn finish_workers_list(
     ))
 }
 
-/// GitLog / GitDiff の UI スレッド必須部分: ペインの cwd 解決（キャッシュ済み値の読み取り）
+/// git 系の要求の UI スレッド必須部分: ペインの cwd 解決（キャッシュ済み値の読み取り）。
+/// リポジトリの解決（`git rev-parse`）はここでしない = background の本体が行う（#1991）
 fn git_pane_cwd(host: &dyn ControlHost, pane: Option<u64>) -> Result<PathBuf, DispatchError> {
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     host.session(target)
         .and_then(|s| s.cwd())
         .map(Path::to_path_buf)
         .ok_or(DispatchError::Operation("cwd が取得できない".into()))
-}
-
-/// ペインの cwd から git リポジトリのルートを解決する（#496）
-fn git_repo_for_pane(host: &dyn ControlHost, pane: Option<u64>) -> Result<PathBuf, DispatchError> {
-    let cwd = git_pane_cwd(host, pane)?;
-    tako_core::git::repo_root(&cwd).ok_or_else(|| op_err("git リポジトリが見つかりません"))
 }
 
 /// コンフリクト状態の JSON 表現（#496。CLI / MCP / UI で同じ形を使う）
@@ -3335,6 +3355,116 @@ fn conflict_state_json(repo: &Path, state: &tako_core::ConflictState) -> Value {
         "theirs": state.theirs,
         "abort_command": state.operation.abort_args().map(|a| format!("git {} {}", a[0], a[1])),
     })
+}
+
+/// git の書き込み系と conflicts の本体（#1991。同期の腕と background のジョブの 1 実装）。
+///
+/// リポジトリの解決（`git rev-parse`）から git を上限なしで待つ（pull / push はネットワーク・
+/// 認証まで）ので **UI スレッドで呼ばない**。IPC / MCP は [`OffloadJob::GitWrite`] が background で
+/// 呼び、同期の腕（dispatch_inner）はテスト・直呼び・A/B（`TAKO_1991_LEGACY=1`）だけが通る
+fn git_write_reply(cwd: &Path, request: Request) -> Result<Value, DispatchError> {
+    let repo =
+        tako_core::git::repo_root(cwd).ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
+    // 同じリポジトリへの書き込みは 1 本ずつ（conflicts は読むだけなので並べてよい）
+    let _turn = (!matches!(request, Request::GitConflicts { .. })).then(|| git_write_turn(&repo));
+    match request {
+        Request::GitCommit { message, all, .. } => tako_core::git::commit(&repo, &message, all)
+            .map(|out| json!({ "committed": true, "output": out.trim() }))
+            .map_err(op_err),
+        Request::GitPull { .. } => tako_core::git::pull(&repo)
+            .map(|out| json!({ "pulled": true, "output": out.trim() }))
+            .map_err(op_err),
+        Request::GitPush { .. } => tako_core::git::push(&repo)
+            .map(|out| json!({ "pushed": true, "output": out.trim() }))
+            .map_err(op_err),
+        Request::GitStage { paths, .. } => {
+            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            tako_core::git::stage(&repo, &path_refs)
+                .map(|_| json!({ "staged": true, "paths": paths }))
+                .map_err(op_err)
+        }
+        Request::GitUnstage { paths, .. } => {
+            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            tako_core::git::unstage(&repo, &path_refs)
+                .map(|_| json!({ "unstaged": true, "paths": paths }))
+                .map_err(op_err)
+        }
+        Request::GitCheckout {
+            branch, confirm, ..
+        } => run_git_checkout(&repo, &branch, confirm),
+        Request::GitBranchCreate {
+            name,
+            start_point,
+            checkout,
+            ..
+        } => {
+            // 既定は「作って切り替える」（#322: 既定動作を賢くする）
+            let switch = checkout.unwrap_or(true);
+            tako_core::git::create_branch(&repo, &name, start_point.as_deref(), switch)
+                .map(|out| {
+                    json!({
+                        "created": name,
+                        "start_point": start_point,
+                        "checked_out": switch,
+                        "branch": tako_core::git::status(&repo).branch,
+                        "output": out,
+                    })
+                })
+                .map_err(op_err)
+        }
+        Request::GitMerge {
+            branch,
+            confirm,
+            no_ff,
+            ..
+        } => run_git_merge(&repo, &branch, confirm, no_ff),
+        Request::GitMergeAbort { .. } => tako_core::git::abort_operation(&repo)
+            .map(|(op, out)| {
+                json!({
+                    "aborted": op.as_str(),
+                    "branch": tako_core::git::status(&repo).branch,
+                    "output": out,
+                })
+            })
+            .map_err(op_err),
+        Request::GitConflicts { .. } => {
+            let state = tako_core::git::conflict_state(&repo);
+            Ok(conflict_state_json(&repo, &state))
+        }
+        other => Err(DispatchError::Operation(format!(
+            "git の書き込みでない要求: {}",
+            other.kind_name()
+        ))),
+    }
+}
+
+/// 同じリポジトリへの git の書き込みを 1 本ずつ通す順番札（#1991）。
+///
+/// 修正前は UI スレッドの直列がこの順序を担っていた（IPC は 1 件ずつ dispatch）。background へ
+/// 出したあとも、AI が並べて投げた `stage` 2 本が `index.lock` を取り合って片方が落ちる・
+/// commit が stage を追い越す、を起こさないために残す。札はリポジトリごとなので、
+/// 応答しない push が**別のリポジトリ**の書き込みを止めることはない（同じリポジトリの後続は
+/// 修正前と同じく push の終わりを待つが、待つのは background で UI は止まらない）
+fn git_write_turn(repo: &Path) -> std::sync::MutexGuard<'static, ()> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static TURNS: OnceLock<Mutex<HashMap<PathBuf, &'static Mutex<()>>>> = OnceLock::new();
+    // 札はリポジトリごとに 1 回だけ作って二度と外さない（触ったリポジトリの数 = 数十本で頭打ち）
+    let turn: &'static Mutex<()> = {
+        let mut turns = TURNS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match turns.get(repo).copied() {
+            Some(turn) => turn,
+            None => {
+                let turn: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+                turns.insert(repo.to_path_buf(), turn);
+                turn
+            }
+        }
+    };
+    turn.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// GitCheckout（#496）。`confirm` = false のときは破壊的になり得る場合に実行せず提示を返す
@@ -5688,102 +5818,20 @@ fn dispatch_inner(
             let cwd = git_pane_cwd(host, pane)?;
             run_git_show(&cwd, &hash, file.as_deref())
         }
-        Request::GitCommit { pane, message, all } => {
+        // 同期の腕（テスト・直呼び・A/B の `TAKO_1991_LEGACY=1`）。IPC / MCP 経由は prepare_offload が
+        // cwd の解決（UI）と本体（background）に分ける（#1991。本体は同じ `git_write_reply`）
+        request @ (Request::GitCommit { pane, .. }
+        | Request::GitPull { pane }
+        | Request::GitPush { pane }
+        | Request::GitStage { pane, .. }
+        | Request::GitUnstage { pane, .. }
+        | Request::GitCheckout { pane, .. }
+        | Request::GitBranchCreate { pane, .. }
+        | Request::GitMerge { pane, .. }
+        | Request::GitMergeAbort { pane }
+        | Request::GitConflicts { pane }) => {
             let cwd = git_pane_cwd(host, pane)?;
-            let repo = tako_core::git::repo_root(&cwd)
-                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
-            tako_core::git::commit(&repo, &message, all)
-                .map(|out| json!({ "committed": true, "output": out.trim() }))
-                .map_err(op_err)
-        }
-        Request::GitPull { pane } => {
-            let cwd = git_pane_cwd(host, pane)?;
-            let repo = tako_core::git::repo_root(&cwd)
-                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
-            tako_core::git::pull(&repo)
-                .map(|out| json!({ "pulled": true, "output": out.trim() }))
-                .map_err(op_err)
-        }
-        Request::GitPush { pane } => {
-            let cwd = git_pane_cwd(host, pane)?;
-            let repo = tako_core::git::repo_root(&cwd)
-                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
-            tako_core::git::push(&repo)
-                .map(|out| json!({ "pushed": true, "output": out.trim() }))
-                .map_err(op_err)
-        }
-        Request::GitStage { pane, paths } => {
-            let cwd = git_pane_cwd(host, pane)?;
-            let repo = tako_core::git::repo_root(&cwd)
-                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
-            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-            tako_core::git::stage(&repo, &path_refs)
-                .map(|_| json!({ "staged": true, "paths": paths }))
-                .map_err(op_err)
-        }
-        Request::GitUnstage { pane, paths } => {
-            let cwd = git_pane_cwd(host, pane)?;
-            let repo = tako_core::git::repo_root(&cwd)
-                .ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
-            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-            tako_core::git::unstage(&repo, &path_refs)
-                .map(|_| json!({ "unstaged": true, "paths": paths }))
-                .map_err(op_err)
-        }
-        Request::GitCheckout {
-            pane,
-            branch,
-            confirm,
-        } => {
-            let repo = git_repo_for_pane(host, pane)?;
-            run_git_checkout(&repo, &branch, confirm)
-        }
-        Request::GitBranchCreate {
-            pane,
-            name,
-            start_point,
-            checkout,
-        } => {
-            let repo = git_repo_for_pane(host, pane)?;
-            // 既定は「作って切り替える」（#322: 既定動作を賢くする）
-            let switch = checkout.unwrap_or(true);
-            tako_core::git::create_branch(&repo, &name, start_point.as_deref(), switch)
-                .map(|out| {
-                    json!({
-                        "created": name,
-                        "start_point": start_point,
-                        "checked_out": switch,
-                        "branch": tako_core::git::status(&repo).branch,
-                        "output": out,
-                    })
-                })
-                .map_err(op_err)
-        }
-        Request::GitMerge {
-            pane,
-            branch,
-            confirm,
-            no_ff,
-        } => {
-            let repo = git_repo_for_pane(host, pane)?;
-            run_git_merge(&repo, &branch, confirm, no_ff)
-        }
-        Request::GitMergeAbort { pane } => {
-            let repo = git_repo_for_pane(host, pane)?;
-            tako_core::git::abort_operation(&repo)
-                .map(|(op, out)| {
-                    json!({
-                        "aborted": op.as_str(),
-                        "branch": tako_core::git::status(&repo).branch,
-                        "output": out,
-                    })
-                })
-                .map_err(op_err)
-        }
-        Request::GitConflicts { pane } => {
-            let repo = git_repo_for_pane(host, pane)?;
-            let state = tako_core::git::conflict_state(&repo);
-            Ok(conflict_state_json(&repo, &state))
+            git_write_reply(&cwd, request)
         }
         Request::GitResolveAgent { pane, agent, tab } => {
             dispatch_git_resolve_agent(host, origin, pane, agent.as_deref(), tab)
@@ -39818,6 +39866,189 @@ mod tests {
         };
         assert_eq!(job.needs.git_conflict.as_deref(), Some(cwd.as_path()));
         assert!(job.needs.agent.is_some() && job.needs.tako_bin);
+    }
+
+    /// #1991 のテスト用の一時リポジトリ（`git init` + 1 コミット）。消すのは一時 dir の下だけ
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("tako-1991-{tag}-{}", std::process::id()));
+            assert!(dir.starts_with(std::env::temp_dir()), "一時 dir の下");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("一時リポジトリを作れる");
+            let git = |args: &[&str]| {
+                let ok = tako_core::platform::process::no_console_window(
+                    &mut std::process::Command::new(tako_core::git::git_bin()),
+                )
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+                assert!(ok, "git {args:?} が通る");
+            };
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.email", "test@example.invalid"]);
+            git(&["config", "user.name", "testuser"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            std::fs::write(dir.join("a.txt"), "a\n").expect("書ける");
+            git(&["add", "a.txt"]);
+            git(&["commit", "-q", "-m", "init"]);
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            if self.0.starts_with(std::env::temp_dir()) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    /// #1991: git の書き込み系（と conflicts）は cwd だけ写した background のジョブになり、
+    /// 応答は同期の腕（修正前の形）と同じ
+    #[test]
+    fn issue1991_gitの書き込み系はbackgroundのジョブになり応答は同期の腕と同じ() {
+        let repo = TempRepo::new("job");
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        seed_session_cwd(&mut host, pane, &repo.0);
+        let p = Some(pane);
+        let all = [
+            Request::GitCommit {
+                pane: p,
+                message: "m".into(),
+                all: false,
+            },
+            Request::GitPull { pane: p },
+            Request::GitPush { pane: p },
+            Request::GitStage {
+                pane: p,
+                paths: vec![],
+            },
+            Request::GitUnstage {
+                pane: p,
+                paths: vec![],
+            },
+            Request::GitCheckout {
+                pane: p,
+                branch: "main".into(),
+                confirm: false,
+            },
+            Request::GitBranchCreate {
+                pane: p,
+                name: "x".into(),
+                start_point: None,
+                checkout: None,
+            },
+            Request::GitMerge {
+                pane: p,
+                branch: "main".into(),
+                confirm: false,
+                no_ff: false,
+            },
+            Request::GitMergeAbort { pane: p },
+            Request::GitConflicts { pane: p },
+        ];
+        for req in &all {
+            match prepare_offload(&mut host, req) {
+                Some(Ok(OffloadJob::GitWrite { cwd, request })) => {
+                    assert_eq!(
+                        cwd,
+                        repo.0,
+                        "{}: UI スレッドでは cwd だけを写す",
+                        req.kind_name()
+                    );
+                    assert_eq!(request.kind_name(), req.kind_name());
+                }
+                _ => panic!("{} が background のジョブにならない", req.kind_name()),
+            }
+        }
+        // 居ないペインは準備（メモリ）の段で同期の腕と同じエラー
+        let gone = Request::GitPush { pane: Some(9_999) };
+        let Some(Err(e)) = prepare_offload(&mut host, &gone) else {
+            panic!("居ないペインは準備の段で断る");
+        };
+        assert_eq!(e, dispatch(&mut host, gone, PaneOrigin::Cli).unwrap_err());
+
+        // 応答の形は同期の腕と同じ（変更を作って stage → conflicts → commit の順に両経路で比べる）
+        let run = |req: Request, host: &mut MockHost| -> Value {
+            let Some(Ok(job)) = prepare_offload(host, &req) else {
+                panic!("ジョブになる");
+            };
+            match job.run_staged() {
+                OffloadOutcome::Reply(r) => r.expect("background の本体が通る"),
+                OffloadOutcome::OnUi(_) => panic!("git の書き込みは UI スレッドの続きを持たない"),
+            }
+        };
+        std::fs::write(repo.0.join("b.txt"), "b\n").expect("書ける");
+        let stage = Request::GitStage {
+            pane: p,
+            paths: vec!["b.txt".into()],
+        };
+        let off = run(stage.clone(), &mut host);
+        let sync = dispatch(&mut host, stage, PaneOrigin::Cli).expect("同期の腕も通る");
+        assert_eq!(off, sync);
+        assert_eq!(off["staged"], true);
+        let conflicts = Request::GitConflicts { pane: p };
+        assert_eq!(
+            run(conflicts.clone(), &mut host),
+            dispatch(&mut host, conflicts, PaneOrigin::Cli).expect("同期の腕も通る")
+        );
+        let commit = run(
+            Request::GitCommit {
+                pane: p,
+                message: "b".into(),
+                all: false,
+            },
+            &mut host,
+        );
+        assert_eq!(commit["committed"], true, "{commit}");
+        // リポジトリの外は background の本体で同期の腕と同じエラー（UI スレッドで git を起こさない）
+        let outside = std::env::temp_dir().join(format!("tako-1991-out-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("作れる");
+        let off = git_write_reply(&outside, Request::GitPull { pane: p }).unwrap_err();
+        assert_eq!(off, op_err("git リポジトリが見つかりません"));
+        let _ = std::fs::remove_dir(&outside);
+    }
+
+    /// #1991: 同じリポジトリへの書き込みは background でも 1 本ずつ（修正前の UI スレッドの直列と
+    /// 同じ順序）。別のリポジトリは止めない（応答しない push が他のリポジトリを巻き込まない）
+    #[test]
+    fn issue1991_同じリポジトリの書き込みは1本ずつで別のリポジトリは止めない() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let a = PathBuf::from("/tako-1991-turn/a");
+        let b = PathBuf::from("/tako-1991-turn/b");
+        let held = git_write_turn(&a);
+        let (tx, rx) = mpsc::channel();
+        let same = {
+            let (a, tx) = (a.clone(), tx.clone());
+            std::thread::spawn(move || {
+                let _t = git_write_turn(&a);
+                let _ = tx.send("a");
+            })
+        };
+        let other = std::thread::spawn(move || {
+            let _t = git_write_turn(&b);
+            let _ = tx.send("b");
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok("b"),
+            "別のリポジトリは待たない"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "同じリポジトリは前の書き込みが終わるまで待つ"
+        );
+        drop(held);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok("a"));
+        same.join().expect("終わる");
+        other.join().expect("終わる");
     }
 
     /// #1989: 先取りの内側では git / tmux の答えだけを読み、無ければ待たずに断る

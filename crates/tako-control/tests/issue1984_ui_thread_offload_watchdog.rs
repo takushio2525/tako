@@ -34,6 +34,12 @@
 //!    （kill / resize / select-window / open / cleanup）も同じ形（background のジョブ / 先取り）。
 //!    agent CLI の所在確認（`agent_cli::locate`）は上限つき（修正前の上限なしは A/B のゲートの内側だけ）。
 //!    GUI のボタン（window 行・復元・解消エージェント・D&D の取り込み・kill の確認）も `dispatch_off_ui`
+//! 8. #1991: git の書き込み系（commit / pull / push / stage / unstage / checkout / branch / merge /
+//!    merge-abort）と conflicts を `prepare_offload` が background のジョブ（`OffloadJob::GitWrite`）にする。
+//!    UI スレッドで写すのはペインの cwd だけ（`git_pane_cwd` は `git rev-parse` を起こさない）、
+//!    同期の腕と background は同じ本体（`git_write_reply`）。起動時の orphan の一括回収は計画だけ
+//!    UI スレッドで、器の一覧と kill は background（同期は A/B のゲートの後ろだけ）。起動時の
+//!    自動復帰が UI スレッドで呼ぶ tmux の 3 口（`session_cwd` / `session_env` / `set_session_env`）は上限つき
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -50,6 +56,22 @@ const MAIN: &str = "crates/tako-app/src/main.rs";
 const SLEEP_GUARD: &str = "crates/tako-control/src/sleep_guard.rs";
 const AGENT_CLI: &str = "crates/tako-control/src/orchestrator/agent_cli.rs";
 const RIGHT_PANEL: &str = "crates/tako-app/src/right_panel.rs";
+const TMUX_BACKEND: &str = "crates/tako-core/src/tmux_backend.rs";
+
+/// #1991: background のジョブ（`OffloadJob::GitWrite`）にする git の要求（`prepare_offload` の腕に
+/// 全部並んでいること。1 つでも漏れると、その要求は同期の腕 = UI スレッドで git を待つ）
+const GIT_WRITES: &[&str] = &[
+    "Request::GitCommit",
+    "Request::GitPull",
+    "Request::GitPush",
+    "Request::GitStage",
+    "Request::GitUnstage",
+    "Request::GitCheckout",
+    "Request::GitBranchCreate",
+    "Request::GitMerge",
+    "Request::GitMergeAbort",
+    "Request::GitConflicts",
+];
 
 /// 子プロセスを待つ口（右は名指しの理由）
 const RAW: &[(&str, &str)] = &[
@@ -132,6 +154,8 @@ const UI_PATHS: &[&str] = &[
     "fn dispatch_stale_binary_status(",
     "fn collect_stale_status_ctx(",
     "fn tmux_select_window_target(",
+    // #1991
+    "fn git_pane_cwd(",
 ];
 
 /// 読む側の関数（子プロセスの口は `Probed::Outside` の腕でだけ呼ぶ）
@@ -781,12 +805,246 @@ fn scan_gui_1989(main: &str, right: &str) -> Vec<Offender> {
     out
 }
 
+/// 8. #1991: git の書き込み系は background のジョブで、同期の腕と同じ本体を通る
+fn scan_git_write(dispatch: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let mut push = |line: usize, why: String| {
+        out.push(Offender {
+            file: DISPATCH,
+            line,
+            why,
+        })
+    };
+    match fn_window(dispatch, "pub fn prepare_offload(") {
+        None => push(0, "`prepare_offload` が見つからない（走査が空振り）".into()),
+        Some((at, window)) => {
+            let job = code_lines_with(&window, "OffloadJob::GitWrite {");
+            if job.is_empty() {
+                push(
+                    at,
+                    "`prepare_offload` が git の書き込み系を background のジョブ（`OffloadJob::GitWrite`）に \
+                     していない（commit / pull / push を UI スレッドで待つ = #1991）"
+                        .into(),
+                );
+            }
+            // 腕の頭（`Request::GitCommit` の行）から job の行までが git の腕
+            let head = window
+                .iter()
+                .position(|l| !is_comment(l) && l.trim_start().starts_with("Request::GitCommit {"));
+            match (head, job.first()) {
+                (Some(head), Some(&job)) if head < job => {
+                    let arm = &window[head..job];
+                    for req in GIT_WRITES {
+                        // 変種名の後ろの ` {` まで照合する（`GitMerge` で `GitMergeAbort` を拾わない）
+                        if code_lines_with(arm, &format!("{req} {{")).is_empty() {
+                            push(
+                                at + head,
+                                format!(
+                                    "`prepare_offload` の git の腕に `{req}` が無い（その要求は同期の腕へ落ちて \
+                                     UI スレッドで git を待つ = #1991）"
+                                ),
+                            );
+                        }
+                    }
+                    if code_lines_with(arm, "issue1991_legacy()").is_empty() {
+                        push(
+                            at + head,
+                            "`prepare_offload` の git の腕に A/B のゲート（`issue1991_legacy()`）が無い".into(),
+                        );
+                    }
+                    // UI スレッドで写すのは cwd だけ（`git rev-parse` を起こさない）
+                    if !window[job.saturating_sub(1)..=job]
+                        .iter()
+                        .any(|l| l.contains("git_pane_cwd("))
+                    {
+                        push(
+                            at + job,
+                            "git の腕が cwd を `git_pane_cwd` で写していない（UI スレッドでリポジトリを \
+                             解決する形へ戻る = #1991）"
+                                .into(),
+                        );
+                    }
+                }
+                _ => push(
+                    at,
+                    "`prepare_offload` の git の腕（`Request::GitCommit { … } … OffloadJob::GitWrite`）が \
+                     見つからない"
+                        .into(),
+                ),
+            }
+        }
+    }
+    match fn_window(dispatch, "fn run_reply(self)") {
+        None => push(0, "`run_reply` が見つからない（走査が空振り）".into()),
+        Some((at, window)) => {
+            if code_lines_with(&window, "git_write_reply(").is_empty() {
+                push(
+                    at,
+                    "background の `run_reply` が `git_write_reply` を呼んでいない（ジョブにしたのに応答を組めない）"
+                        .into(),
+                );
+            }
+        }
+    }
+    // 同期の腕（テスト・直呼び・A/B）は同じ本体を通る。git を直に起こす 2 本目の実装を作らない
+    let lines: Vec<&str> = dispatch.lines().collect();
+    match lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("request @ (Request::GitCommit {"))
+    {
+        None => push(
+            0,
+            "dispatch_inner の git の同期の腕（`request @ (Request::GitCommit { … }`）が見つからない".into(),
+        ),
+        Some(start) => {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, l)| l.starts_with("        Request::"))
+                .map(|(i, _)| i)
+                .unwrap_or(lines.len());
+            let arm: Vec<String> = lines[start..end].iter().map(|l| l.to_string()).collect();
+            if code_lines_with(&arm, "git_write_reply(").is_empty() {
+                push(
+                    start + 1,
+                    "git の同期の腕が本体の 1 実装（`git_write_reply`）を通っていない".into(),
+                );
+            }
+            for (needle, why) in RAW {
+                for i in code_lines_with(&arm, needle) {
+                    push(
+                        start + 1 + i,
+                        format!(
+                            "git の同期の腕が `{needle}` を直に呼んでいる（{why}。本体を 2 本にしない = \
+                             `git_write_reply` を通す。#1991）"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 8. #1991: 起動時の orphan の一括回収は計画だけ UI スレッド、本体は background
+fn scan_startup_cleanup(main: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let mut push = |line: usize, why: String| {
+        out.push(Offender {
+            file: MAIN,
+            line,
+            why,
+        })
+    };
+    // 修正前の形（掃除本体を起動の中で同期に呼ぶ）は、明示の回収の同期の腕の外では呼ばない
+    let explicit = fn_window(main, "fn cleanup_orphan_tmux(");
+    for (i, l) in main.lines().enumerate() {
+        if is_comment(l) || !l.contains("cleanup_orphan_tmux_with(") || l.contains("fn ") {
+            continue;
+        }
+        let inside_explicit = explicit
+            .as_ref()
+            .is_some_and(|(at, w)| i + 1 >= *at && i + 1 < *at + w.len());
+        if !inside_explicit {
+            push(
+                i + 1,
+                "`cleanup_orphan_tmux_with`（器の一覧と kill を同期に待つ）を明示の回収の同期の腕の外で \
+                 呼んでいる（起動時の回収を UI スレッドで待つ形へ戻る = #1991。計画 `orphan_cleanup_plan` + \
+                 background の `run`）"
+                    .into(),
+            );
+        }
+    }
+    match fn_window(main, "match app.orphan_cleanup_plan(") {
+        None => push(
+            0,
+            "起動時の回収（`match app.orphan_cleanup_plan(`）が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if code_lines_with(&window, "CleanupScope::Startup").is_empty() {
+                push(
+                    at,
+                    "起動時の回収の窓に `CleanupScope::Startup` が無い（窓違い）".into(),
+                );
+            }
+            let gate = code_lines_with(&window, "issue1991_legacy()");
+            let runs = code_lines_with(&window, ".run()");
+            let off_ui: Vec<usize> = runs
+                .iter()
+                .copied()
+                .filter(|&i| window[i].contains("async move"))
+                .collect();
+            if off_ui.is_empty() {
+                push(
+                    at,
+                    "起動時の回収の本体（`plan.run()`）を background（`spawn(async move …)`）で走らせていない \
+                     （器の一覧と kill を UI スレッドで待つ = #1991）"
+                        .into(),
+                );
+            }
+            for i in runs.iter().copied().filter(|i| !off_ui.contains(i)) {
+                if gate.first().is_none_or(|g| *g >= i) {
+                    push(
+                        at + i,
+                        "起動時の回収の同期の `run()` が A/B のゲート（`issue1991_legacy()`）の後ろに無い \
+                         （製品の既定で UI スレッドが器の一覧と kill を待つ = #1991）"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 8. #1991: 起動時の自動復帰が UI スレッドで呼ぶ tmux の 3 口は上限つき
+fn scan_tmux_backend(src: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    for head in [
+        "pub fn session_cwd(",
+        "pub fn session_env(",
+        "pub fn set_session_env(",
+    ] {
+        match fn_window(src, head) {
+            None => out.push(Offender {
+                file: TMUX_BACKEND,
+                line: 0,
+                why: format!("`{head}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) => {
+                for needle in [".output()", ".status()", "Command::new("] {
+                    for i in code_lines_with(&window, needle) {
+                        out.push(Offender {
+                            file: TMUX_BACKEND,
+                            line: at + i,
+                            why: format!(
+                                "`{head}` が `{needle}` で器を待っている（上限なし。起動時の自動復帰が \
+                                 UI スレッドで呼ぶ = #1991。上限つきの `tmux::run_tmux` を通す）"
+                            ),
+                        });
+                    }
+                }
+                if code_lines_with(&window, "run_tmux(").is_empty() {
+                    out.push(Offender {
+                        file: TMUX_BACKEND,
+                        line: at,
+                        why: format!("`{head}` が上限つきの `tmux::run_tmux` を通っていない"),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 struct Sources {
     dispatch: String,
     main: String,
     sleep_guard: String,
     agent_cli: String,
     right_panel: String,
+    tmux_backend: String,
 }
 
 impl Sources {
@@ -798,6 +1056,7 @@ impl Sources {
             sleep_guard: read(&root, SLEEP_GUARD),
             agent_cli: read(&root, AGENT_CLI),
             right_panel: read(&root, RIGHT_PANEL),
+            tmux_backend: read(&root, TMUX_BACKEND),
         }
     }
 
@@ -811,6 +1070,9 @@ impl Sources {
         v.extend(scan_tmux_open_arm(&self.dispatch));
         v.extend(scan_locate(&self.agent_cli));
         v.extend(scan_gui_1989(&self.main, &self.right_panel));
+        v.extend(scan_git_write(&self.dispatch));
+        v.extend(scan_startup_cleanup(&self.main));
+        v.extend(scan_tmux_backend(&self.tmux_backend));
         v
     }
 }
@@ -897,6 +1159,26 @@ fn 走査が空振りしていない() {
         ),
         (&s.agent_cli, "pub fn locate(", "find_with_timeout("),
         (&s.main, "fn orphan_cleanup_plan(", "protected"),
+        // #1991
+        (
+            &s.dispatch,
+            "pub fn prepare_offload(",
+            "OffloadJob::GitWrite {",
+        ),
+        (&s.dispatch, "fn run_reply(self)", "git_write_reply("),
+        (&s.dispatch, "fn git_write_reply(", "git::push("),
+        (
+            &s.main,
+            "match app.orphan_cleanup_plan(",
+            "CleanupScope::Startup",
+        ),
+        (
+            &s.main,
+            "fn cleanup_orphan_tmux(",
+            "cleanup_orphan_tmux_with(",
+        ),
+        (&s.tmux_backend, "pub fn session_cwd(", "run_tmux("),
+        (&s.tmux_backend, "pub fn set_session_env(", "run_tmux("),
     ] {
         let (_, w) = fn_window(src, head).unwrap_or_else(|| panic!("{head} の窓"));
         assert!(
@@ -1152,6 +1434,117 @@ fn 逆戻りを名指しできる() {
         scan_gui_1989(&m, &s.right_panel),
         MAIN,
         "fn orphan_cleanup_plan(",
+    );
+
+    // ⑰ #1991: git の書き込み系を background のジョブにしない（修正前の prepare_offload = 腕が無い）
+    let d = inject(
+        &s.dispatch,
+        "            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitWrite {",
+        "            Some(git_pane_cwd(host, *pane).map(|cwd| OffloadJob::GitLog {",
+        "⑰",
+    );
+    expect_named(
+        "git の書き込み系を同期のまま",
+        scan_git_write(&d),
+        DISPATCH,
+        "OffloadJob::GitWrite",
+    );
+
+    // ⑱ #1991: push だけ git の腕から漏れる（その要求は同期の腕 = UI スレッドでネットワークを待つ）
+    let d = inject(
+        &s.dispatch,
+        "        Request::GitCommit { pane, .. }\n        | Request::GitPull { pane }\n        | Request::GitPush { pane }\n",
+        "        Request::GitCommit { pane, .. }\n        | Request::GitPull { pane }\n",
+        "⑱",
+    );
+    expect_named(
+        "push を git の腕から落とす",
+        scan_git_write(&d),
+        DISPATCH,
+        "Request::GitPush",
+    );
+
+    // ⑲ #1991: UI スレッドの cwd の写しでリポジトリまで解決する（`git rev-parse` を UI で待つ）
+    let d = inject(
+        &s.dispatch,
+        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    host.session(target)\n        .and_then(|s| s.cwd())",
+        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    let _ = tako_core::git::repo_root(Path::new(\".\"));\n    host.session(target)\n        .and_then(|s| s.cwd())",
+        "⑲",
+    );
+    expect_named(
+        "cwd の写しで git rev-parse",
+        scan_ui_paths(&d),
+        DISPATCH,
+        "fn git_pane_cwd(",
+    );
+
+    // ⑳ #1991: 同期の腕に修正前の本体（git を直に起こす 2 本目の実装）を戻す
+    let d = inject(
+        &s.dispatch,
+        "            let cwd = git_pane_cwd(host, pane)?;\n            git_write_reply(&cwd, request)",
+        "            let cwd = git_pane_cwd(host, pane)?;\n            let repo = tako_core::git::repo_root(&cwd).unwrap();\n            git_write_reply(&cwd, request)",
+        "⑳",
+    );
+    expect_named(
+        "git の同期の腕に本体の 2 本目",
+        scan_git_write(&d),
+        DISPATCH,
+        "git の同期の腕",
+    );
+
+    // ㉑ #1991: 起動時の回収の本体を UI スレッドで走らせる（background の腕を外す）
+    let m = inject(
+        &s.main,
+        "                .spawn(async move { log_startup_cleanup(&plan.run()) })",
+        "                .spawn(async move { log_startup_cleanup(&skipped_now()) })",
+        "㉑",
+    );
+    expect_named(
+        "起動時の回収を UI スレッドで",
+        scan_startup_cleanup(&m),
+        MAIN,
+        "background",
+    );
+    // ㉑' 同期の run を A/B のゲートより前（= 製品の既定で必ず通る腕）へ置く
+    let m = inject(
+        &s.main,
+        "            Ok(plan) if !tako_core::probe::issue1991_legacy() => cx",
+        "            Ok(plan) if plan.min_idle_secs.is_some() => log_startup_cleanup(&plan.run()),\n            Ok(plan) if !tako_core::probe::issue1991_legacy() => cx",
+        "㉑'",
+    );
+    expect_named(
+        "起動時の回収の同期の run をゲートの前へ",
+        scan_startup_cleanup(&m),
+        MAIN,
+        "ゲート",
+    );
+
+    // ㉒ #1991: 起動時の回収を修正前の形（掃除本体の同期の呼び出し）へ戻す
+    let m = inject(
+        &s.main,
+        "        match app.orphan_cleanup_plan(\n            None,\n            tako_core::tmux_cleanup::CleanupScope::Startup,",
+        "        let _ = app.cleanup_orphan_tmux_with(None, tako_core::tmux_cleanup::CleanupScope::Startup, None);\n        match app.orphan_cleanup_plan(\n            None,\n            tako_core::tmux_cleanup::CleanupScope::Startup,",
+        "㉒",
+    );
+    expect_named(
+        "起動時に掃除本体を同期で",
+        scan_startup_cleanup(&m),
+        MAIN,
+        "cleanup_orphan_tmux_with",
+    );
+
+    // ㉓ #1991: 自動復帰の tmux の口を修正前の上限なしの output() へ戻す
+    let t = inject(
+        &s.tmux_backend,
+        "    let stdout = crate::tmux::run_tmux(\n        Some(socket),\n        &[\n            \"show-environment\",",
+        "    let _ = crate::tmux::tmux_command(Some(socket)).output();\n    let stdout = crate::tmux::run_tmux(\n        Some(socket),\n        &[\n            \"show-environment\",",
+        "㉓",
+    );
+    expect_named(
+        "自動復帰の session_env を上限なしへ",
+        scan_tmux_backend(&t),
+        TMUX_BACKEND,
+        "pub fn session_env(",
     );
 
     // ⑩ check_qos を修正前の上限なしの ps へ戻す

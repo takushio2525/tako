@@ -441,62 +441,59 @@ pub fn pane_tty(socket: &str, session: &str) -> Option<String> {
     pane_facts(socket, session).tty
 }
 
-/// セッションの現在の作業ディレクトリを取得する（orphan 復帰時のタブ名推定用）
+/// セッションの現在の作業ディレクトリを取得する（orphan 復帰時のタブ名推定用）。
+///
+/// 起動時の orphan 自動復帰（#191）が UI スレッドで呼ぶので、器への問い合わせは
+/// 上限つきの [`crate::tmux::run_tmux`] を通す（#1991。修正前は上限なしの `output()`）
 pub fn session_cwd(socket: &str, session: &str) -> Option<String> {
-    let output = crate::tmux::tmux_command(Some(socket))
-        .args([
+    let stdout = crate::tmux::run_tmux(
+        Some(socket),
+        &[
             "list-panes",
             "-t",
             &crate::tmux::exact_target(session),
             "-F",
             "#{pane_current_path}",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        ],
+    )
+    .ok()?;
+    let path = stdout.lines().next().unwrap_or("").trim().to_string();
     (!path.is_empty()).then_some(path)
 }
 
 /// セッション環境変数を読む（`tmux show-environment -t <session> <name>`）。
-/// orphan 復元時に `TAKO_ORCHESTRATOR_ROLE` / `TAKO_PANE_ID` を取り出す用途（#210）
+/// orphan 復元時に `TAKO_ORCHESTRATOR_ROLE` / `TAKO_PANE_ID` を取り出す用途（#210）。
+/// 上限つき（#1991。[`session_cwd`] と同じ理由）
 pub fn session_env(socket: &str, session: &str, name: &str) -> Option<String> {
-    let output = crate::tmux::tmux_command(Some(socket))
-        .args([
+    let stdout = crate::tmux::run_tmux(
+        Some(socket),
+        &[
             "show-environment",
             "-t",
             &crate::tmux::exact_target(session),
             name,
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        ],
+    )
+    .ok()?;
+    let line = stdout.trim().to_string();
     // "NAME=value" 形式。`-NAME` は unset を意味する
     line.strip_prefix(&format!("{name}=")).map(str::to_string)
 }
 
 /// セッション環境変数を設定する（`tmux set-environment -t <session> <name> <value>`）。
-/// orphan 復元後に TAKO_PANE_ID を新 pane ID に更新する用途（#210）
+/// orphan 復元後に TAKO_PANE_ID を新 pane ID に更新する用途（#210）。
+/// 上限つき（#1991。[`session_cwd`] と同じ理由）
 pub fn set_session_env(socket: &str, session: &str, name: &str, value: &str) {
-    let _ = crate::tmux::tmux_command(Some(socket))
-        .args([
+    let _ = crate::tmux::run_tmux(
+        Some(socket),
+        &[
             "set-environment",
             "-t",
             &crate::tmux::exact_target(session),
             name,
             value,
-        ])
-        .status();
+        ],
+    );
 }
 
 /// セッションを破棄する（ペインの明示 close 時。tako 終了時は呼ばない = 永続化）。

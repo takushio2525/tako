@@ -1124,6 +1124,15 @@ fn persist_diag(msg: &str) {
     tako_control::diag::persist_log(&msg);
 }
 
+/// 起動時の orphan 一括回収（FR-2.16.11）の結果を persist.log へ残す（#1187: 見送った理由も
+/// 残す = stderr だけだと .app 起動ではどこにも残らず「対象が無かった」と区別できない）。
+/// background の回収（#1991）からも呼ぶ（`persist_diag` はどのスレッドからでも書ける）
+fn log_startup_cleanup(report: &tako_core::tmux_cleanup::CleanupReport) {
+    if let Some(line) = report.log_line(tako_core::tmux_cleanup::CleanupScope::Startup) {
+        persist_diag(&line);
+    }
+}
+
 /// settings.json からテーマを解決し、読めない色の警告を persist.log へ残す（#1756 / #1763）。
 ///
 /// **起動時と実行中の読み直し（`reload_theme` / タブバーのトグル）がこの 1 本を通る**。
@@ -5292,15 +5301,21 @@ impl TakoApp {
         // 直近 1 時間にアクティビティのあるセッションは対象外（Issue #113: layout.json が
         // 多重起動で巻き戻った場合に protected から漏れる実行中 worker を巻き込まない猶予。
         // 真の残骸はクラッシュから時間が経っており、次回以降の起動で掃除される）
-        let report = app.cleanup_orphan_tmux_with(
+        // #1991: UI スレッドでは守るセッションの収集（計画 = メモリと sysctl だけ）までにして、
+        // 器の一覧と kill（孤児 1 つにつき上限 5 秒）は background で走らせる。計画の後に
+        // 立ったセッションは猶予（直近 1 時間のアクティビティ）で必ず外れるので巻き込まない。
+        // A/B の `TAKO_1991_LEGACY=1` は修正前と同じく UI スレッドで待つ
+        match app.orphan_cleanup_plan(
             None,
             tako_core::tmux_cleanup::CleanupScope::Startup,
             Some(CLEANUP_STARTUP_GRACE_SECS),
-        );
-        // #1187: 見送った理由も persist.log へ残す（stderr だけだと .app 起動では
-        // どこにも残らず、呼び出し側は「対象が無かった」と区別できない）
-        if let Some(line) = report.log_line(tako_core::tmux_cleanup::CleanupScope::Startup) {
-            persist_diag(&line);
+        ) {
+            Ok(plan) if !tako_core::probe::issue1991_legacy() => cx
+                .background_executor()
+                .spawn(async move { log_startup_cleanup(&plan.run()) })
+                .detach(),
+            Ok(plan) => log_startup_cleanup(&plan.run()),
+            Err(skipped) => log_startup_cleanup(&skipped),
         }
 
         // #1485: 前回 `tako remote start` していたなら remote daemon を立て直す。

@@ -408,6 +408,21 @@ pub fn issue1989_legacy() -> bool {
     })
 }
 
+/// #1991 の A/B（`TAKO_1991_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// git の書き込み系（commit / pull / push / stage / unstage / checkout / branch / merge /
+/// merge-abort）と conflicts を UI スレッドの同期の dispatch で待ち、起動時の orphan の
+/// 一括回収（器の一覧と kill）を UI スレッドで待つ。**ゲートはこの 1 か所**で、
+/// tako-control / tako-app もここを読む
+pub fn issue1991_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1991_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。
