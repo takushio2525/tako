@@ -59,3 +59,7 @@
 ## 2026-10-13（#1691: エディタで対応する括弧を強調 = 文字列・コメントを飛ばす探索・VS Code の採り方・応答の `document.bracket_match`）
 - `text_edit::brackets`（記号は `file_type` の `comment` 列 + 新しい `lexical` 列）・直後 → 直前・選択中と括弧に接しないときは採らない・種類ごとに数える。GUI は対の 2 文字に背景、CLI / MCP は編集系の応答（ツール増なし・カタログ +81 B）。A/B `TAKO_1691_LEGACY=1`
 - 実測: release 5,000 行で 1 打鍵中央値 0.156 ms・最大 0.268 ms。単体 22 本 + dispatch / MCP・注入 3 通り・visual `bracket-match` 新 OK / 旧 FAILED・実 CLI / MCP stdio の e2e
+
+## 2026-10-14（#2053 S1: docs サイトのスクロール連動モーションの土台・トップとインストールの作り直し）
+- `docs/src/components/motion/`（Scrolly / Autoplay と tako の画面の再現部品 24 個）+ `src/scripts/motion.ts`（IntersectionObserver + rAF・gzip 1.9KB・依存なし）。reduce では手順ごとの静止図。トップ（splash・場面 5 + ヒーロー）とインストール（macOS 5 手順 / Windows 7 手順・既知の制限は対応表と突き合わせてビルドで拘束）。全ページのヘッダーに「ダウンロード」
+- 手引きと S2 の構成案は `.agent/plans/2026-10-docs-motion.md`。Windows の数字は windows-support.md をビルド時に読む。Lighthouse（gzip 配信）トップ 60→57・インストール 57→57、実測 FCP は前後とも約 2.3 秒

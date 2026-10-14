@@ -109,7 +109,7 @@ export default defineConfig({
 					label: 'はじめに',
 					items: [
 						{ label: 'tako とは', slug: 'index' },
-						{ label: 'セットアップ', slug: 'getting-started' },
+						{ label: 'インストールとセットアップ', slug: 'getting-started' },
 						{ label: 'クイックスタート', slug: 'getting-started/quickstart' },
 						{ label: 'リリースノート', slug: 'releases' },
 						{ label: 'Windows 対応状況', slug: 'windows-support' },

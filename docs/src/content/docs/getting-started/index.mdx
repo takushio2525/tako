@@ -1,33 +1,146 @@
 ---
-title: セットアップ
+title: インストールとセットアップ
 seoTitle: tako のインストールとセットアップ（macOS・Windows）
-description: tako のダウンロード（macOS は Homebrew か zip、Windows はインストーラーかポータブル zip）から起動、tako setup による環境構築と動作確認まで、初心者向けに順を追って解説します
+description: tako の入れ方を macOS と Windows それぞれについて、入手からインストール・初回起動・tako setup による環境構築まで順に解説します。Windows 版はインストーラーを実行するだけで、管理者権限は要りません
 ---
 
-tako を使い始めるまでの手順を、前提知識がない方でも上から順に読めば動かせるように説明します。所要時間は 10 分程度です。
+import InstallMac from '../../../components/scenes/InstallMac.astro';
+import InstallWindows from '../../../components/scenes/InstallWindows.astro';
+import WindowsStatus from '../../../components/motion/WindowsStatus.astro';
+import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
 
-## 全体の流れ
+tako を入れて、AI と作業を始めるまでの手順です。macOS も Windows も流れは同じ 4 段（**入手 → インストール → 初回起動 → セットアップ**）で、10 分ほどで終わります。下のどちらかを選んでください。
 
-1. **tako 本体をインストールする**（Homebrew または ZIP）
-2. **tako を起動する**
-3. **`tako setup` を実行する** — AI 連携に必要な設定をまとめて行うコマンド（必要なものが揃っていれば質問は出ません）
-4. **動作確認**
+<div class="tako-os-grid tako-os-pick not-content">
+<a class="tako-os-card" href="#macos">
+<span class="tako-os-name">macOS</span>
+<span class="tako-os-req">Apple Silicon の Mac</span>
+<span class="tako-os-note">Homebrew で 1 行、または GitHub Releases の zip</span>
+<span class="tako-os-link">macOS の入れ方 →</span>
+</a>
+<a class="tako-os-card is-windows" href="#windows">
+<span class="tako-os-name">Windows <span class="tako-os-badge">もう使えます</span></span>
+<span class="tako-os-req">Windows 10（1809 以降）/ 11・x64</span>
+<span class="tako-os-note">インストーラー（.exe）を実行するだけ。管理者権限は不要</span>
+<span class="tako-os-link">Windows の入れ方 →</span>
+</a>
+</div>
 
-AI 連携を使わず「ただのターミナル」として使う場合は、手順 1〜2 だけで完了です。
+AI 連携を使わず「ただのターミナル」として使う場合は、入手から初回起動までで完了です。
 
-<figure class="tako-shot">
-<img src="/img/welcome-banner.webp" alt="tako の初回起動時に表示されるバナー。1. tako setup、2. tako master の 2 ステップと、それぞれの実行ボタンが並んでいる" />
-<figcaption>初回起動時のバナー。ここのボタンからそのまま `tako setup` と `tako master` を実行できる</figcaption>
-</figure>
+<div id="macos" class="tako-anchor"></div>
+
+## macOS に入れる
+
+スクロールすると、画面がその手順の状態に変わります。
+
+<InstallMac />
+
+macOS でつまずきやすいのは次の 2 つです。
+
+- **「開発元を確認できないため開けません」と出た**: `tako.app` を右クリックして「開く」を選びます（詳しくは [Gatekeeper の警告](#つまずきポイント-gatekeeper-の警告)）
+- **tako の外のターミナルで `tako` が見つからない**: Homebrew で入れた場合は不要ですが、ZIP で入れた場合は `tako setup` が設置します（[ZIP ダウンロード](#方法-b-zip-ダウンロード)）
+
+<div id="windows" class="tako-anchor"></div>
+
+## Windows に入れる
+
+<WindowsStatus />
+
+<InstallWindows />
+
+### Windows でつまずきやすいところ
+
+- **SmartScreen の警告**: 署名していない配布物なので、初回は「Windows によって PC が保護されました」と出ることがあります。**「詳細情報」→「実行」**で進めます
+- **`tako` が見つからない**: インストーラーが足した PATH は、**新しく開いたターミナルから**効きます。インストール前から開いていたターミナルは開き直してください
+- **ポータブル版（zip）**: `tako-app.exe`（本体）と `tako.exe`（CLI）を**必ず同じフォルダに置いたまま**使います。離すと AI からの CLI 操作が動きません。外のターミナルからも打ちたいなら、PATH への登録まで済むインストーラー版が確実です
+- **PowerShell のプロファイル**: `tako setup` は、ペインの作業フォルダを追うために `$PROFILE` へ tako の管理ブロックを 1 つ足します。他の行には触れず、`tako shell-integration uninstall` で外せます
+- **再起動しても画面を残したい**: Windows では tmux の代わりに **psmux** を使います。無くても tako は動きますが、そのときは再起動でプロセスは戻らず、タブの構成と作業フォルダの復元までです
+
+<Cmd prompt="PS>">winget install marlocarlo.psmux</Cmd>
+
+- **AI エージェント CLI の導入**: どれも入っていなければ、`tako setup` が claude の公式インストーラーを実行するところまで代わりに行います。codex と agy は打つコマンドを案内します。ログインはどれもご自身で行います
+- **キー操作**: 分割は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd>、新しいタブは <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> のように、<kbd>Ctrl</kbd>+<kbd>Shift</kbd> 系です（<kbd>Ctrl</kbd>+<kbd>C</kbd> などはターミナルへそのまま渡します）。一覧は [キーボードショートカット](/guides/keyboard-shortcuts/)
+- **Arm 版の Windows**: 配布物は x64 用だけです
+
+### Windows でまだのもの
+
+tako は Windows 実機で動かして確かめたものだけを「対応」と書いています。次のものは、まだ使えないか、一部の機能が落ちます。最新の状況は [Windows 対応状況](/windows-support/) の表にあります（tako 本体からは `tako platform` で引けます）。
+
+<WindowsLimits
+	items={[
+		{
+			kind: 'pending',
+			title: 'スマホからの接続（tako remote）',
+			text: '止まる原因は取り除きましたが、Windows 実機で「セットアップ → 公開 → スマホから接続」を通しで確かめていません。',
+			tools: ['tako_remote_setup', 'tako_remote_start', 'tako_remote_status'],
+		},
+		{
+			kind: 'pending',
+			title: '人がやること（ユーザータスク）',
+			text: '実装は macOS と共通ですが、Windows 実機での確認がまだです。',
+			tools: ['tako_todo'],
+		},
+		{
+			kind: 'pending',
+			title: '言語サーバ（LSP）の診断・補完・定義ジャンプ',
+			text: '試験用のサーバでは確かめていますが、実際の言語サーバでの確認がまだです。',
+			tools: ['tako_lsp', 'tako_lsp_server'],
+		},
+		{
+			kind: 'pending',
+			title: '動画の再生と Web ビューのペイン',
+			text: '動画のデコーダの Windows 版が無く、Web ビューは WebView2 側の問題で開けません。',
+			tools: ['tako_video_playback', 'tako_web'],
+		},
+		{
+			kind: 'pending',
+			title: '既存の tmux セッションの取り込み',
+			text: 'psmux では attach を前提にする操作ができません。',
+			tools: ['tako_tmux_open', 'tako_tmux_resize'],
+		},
+		{
+			kind: 'degraded',
+			title: 'PDF',
+			text: '表示はできますが、文字の選択・目次・PDF 内のリンクは使えません。',
+			tools: ['tako_preview_outline', 'tako_preview_follow_link'],
+		},
+		{
+			kind: 'degraded',
+			title: 'アプリ内の更新',
+			text: '更新の確認とリリースノートの表示までは確かめています。適用（インストーラーの実行と再起動）は実機で未確認なので、うまくいかないときは新しい版のインストーラーを実行してください。',
+			tools: ['tako_update'],
+		},
+		{
+			kind: 'degraded',
+			title: '依存ツールと AI エージェント CLI の自動導入',
+			text: 'psmux・git・Tailscale は winget のコマンドを案内するだけで、代わりに入れるのは claude だけです。',
+			tools: ['tako_setup_deps', 'tako_setup_bootstrap'],
+		},
+		{
+			kind: 'degraded',
+			title: 'SSH 先のペインとフォルダ',
+			text: 'Windows の OpenSSH は接続を使い回せないので、パスワード認証の相手には操作のたびに認証が要ります。',
+			tools: ['tako_open_remote', 'tako_remote_folder'],
+		},
+		{
+			kind: 'degraded',
+			title: '会話を保ったままの再起動',
+			text: '引き継ぎを書かせての再起動は使えますが、同じ会話のまま CLI だけを建て直す方式は使えません。',
+			tools: ['tako_session_restart'],
+		},
+	]}
+/>
 
 ## 事前に必要なもの
 
 | もの | 必須？ | 説明 |
 |---|---|---|
-| macOS（Apple Silicon）または Windows | 必須 | 主な配布は Apple Silicon Mac（M1 以降）向けです。Windows 版は移植を進めており、どの機能が使えるかは [Windows 対応状況](/windows-support/) にまとめています |
-| [Homebrew](https://brew.sh/ja/) | 推奨 | macOS 用のアプリ管理ツール。インストールとアップデートが 1 コマンドで済みます |
-| AI エージェント CLI | AI 連携に1つ以上必要 | `claude`（Claude Code）/ `codex`（OpenAI Codex CLI）/ `agy`（Antigravity CLI）のいずれか。**入っていなくても大丈夫です** — `tako setup` が公式インストーラで導入まで案内します（ログインだけは、ブラウザ操作が必要なのでご自身で行います） |
-| tmux | あると便利 | ターミナルのセッション（作業状態）を保持するツール。入っていると **tako を再起動しても実行中のプロセスと画面が丸ごと復元**されるほか、**スマホからのリモート接続（`tako remote`）とオーケストレーターの worker 管理にはこれが必須**です。`brew install tmux` で導入。**Windows では psmux が同じ役割を担います**（`winget install marlocarlo.psmux`。attach を前提にする一部の tmux 操作は使えません → [Windows 対応状況](/windows-support/)） |
+| macOS（Apple Silicon）または Windows 10 / 11（x64） | 必須 | Windows は 10 バージョン 1809（ビルド 17763）以降。どの機能が使えるかは [Windows 対応状況](/windows-support/) にまとめています |
+| [Homebrew](https://brew.sh/ja/) | macOS で推奨 | macOS 用のアプリ管理ツール。インストールとアップデートが 1 コマンドで済みます |
+| AI エージェント CLI | AI 連携に1つ以上必要 | `claude`（Claude Code）/ `codex`（OpenAI Codex CLI）/ `agy`（Antigravity CLI）のいずれか。**入っていなくても大丈夫です** — `tako setup` が導入まで案内します（ログインだけは、ブラウザ操作が必要なのでご自身で行います） |
+| tmux（Windows は psmux） | あると便利 | ターミナルのセッション（作業状態）を保持するツール。入っていると **tako を再起動しても実行中のプロセスと画面が丸ごと復元**されるほか、**スマホからのリモート接続（`tako remote`）とオーケストレーターの worker 管理にはこれが必須**です。macOS は `brew install tmux`、Windows は `winget install marlocarlo.psmux` で導入します（attach を前提にする一部の tmux 操作は Windows では使えません → [Windows 対応状況](/windows-support/)） |
 | [Tailscale](https://tailscale.com/) | リモート接続に必須 | `tako remote`（スマホからの接続）の transport。Mac とスマホの両方にアプリを入れて同一アカウントでログインすると、tailnet 内限定の固定 URL で安全に接続できます |
 | git | あると便利 | git パネル（ブランチ・コミットグラフ・diff 表示）で使います。macOS では `xcode-select --install` で入っていることが多いです |
 
@@ -111,13 +224,11 @@ tako setup bootstrap path
 **以前の版のこのページでは、`~/.zshrc` に `tako.app` のパスを含む `export PATH=...` の行を足す手順を案内していました。** その行が残っている場合は削除してかまいません（`tako setup bootstrap path` で設置し直せます）。
 :::
 
-Windows のインストーラー版は、インストール先（`%LOCALAPPDATA%\Programs\tako`）を `HKCU\Environment\Path` に登録します（シンボリックリンクは権限が要るため使いません）。
-
 ### 方法 C: Windows（インストーラー / ポータブル zip）
 
-Windows 版の配布物は **v0.7.9 から macOS 版と同じリリースに載ります**。
+Windows 版の配布物は、macOS 版と**同じリリース**に載ります（v0.7.9 から）。
 [GitHub Releases](https://github.com/takushio2525/tako/releases/latest) の
-ダウンロード表から、次のどちらかを選んでください。
+ダウンロード表から、次のどちらかを選んでください。流れは上の「[Windows に入れる](#windows)」で動きつきで見られます。
 
 | ファイル | 向いている人 |
 |---|---|
@@ -125,19 +236,19 @@ Windows 版の配布物は **v0.7.9 から macOS 版と同じリリースに載�
 | `tako-vX.X.X-windows-x86_64.zip` | 展開して置くだけのポータブル版。インストールしたくないとき |
 
 - 動作要件は **Windows 10 バージョン 1809（ビルド 10.0.17763）以降 / x64**
-- インストーラーは**管理者権限を要求しません**（`%LOCALAPPDATA%\Programs\tako` に入ります）
+- インストーラーは**管理者権限を要求しません**（自分のユーザーの `%LOCALAPPDATA%\Programs\tako` に入り、インストール先を `HKCU\Environment\Path` に登録します）
 - ポータブル版は `tako-app.exe`（本体）と `tako.exe`（CLI）を**必ず同じフォルダに置いたまま**使ってください（離すと AI 経由の CLI 操作が動きません）
+- 配布は GitHub Releases の exe / zip だけです（winget や Microsoft Store には出していません）
 
 :::caution[SmartScreen の警告が出たら]
-署名していない配布物なので、初回実行時に「WindowsによってPCが保護されました」と出ることがあります。**詳細情報 → 実行** で進めてください。
+署名していない配布物なので、初回実行時に「Windows によって PC が保護されました」と出ることがあります。**詳細情報 → 実行** で進めてください。
 :::
 
-Windows 版はまだ移植の途中です。どの機能が使えて、どれが縮退・未実装かは
-[Windows 対応状況](/windows-support/)にまとめてあります（リリースノートにも要約が載ります）。
+Windows 版で何が使えて、何がまだかは、上の「[Windows でまだのもの](#windows-でまだのもの)」と [Windows 対応状況](/windows-support/) にまとめてあります（リリースノートにも要約が載ります）。
 
 ### つまずきポイント: Gatekeeper の警告
 
-初回起動時に「開発元を確認できないため開けません」という警告が出ることがあります。これは macOS のセキュリティ機能（Gatekeeper）によるもので、以下のいずれかで解除できます。
+macOS で初回起動時に「開発元を確認できないため開けません」という警告が出ることがあります。これは macOS のセキュリティ機能（Gatekeeper）によるもので、以下のいずれかで解除できます。
 
 1. `tako.app` を**右クリック → 「開く」** を選択（いちばん簡単）
 2. 「システム設定 → プライバシーとセキュリティ」を開き、「このまま開く」をクリック
@@ -151,24 +262,27 @@ xattr -dr com.apple.quarantine /Applications/tako.app
 
 ## 2. 起動
 
-`/Applications/tako.app` をダブルクリック、または Dock / Launchpad から起動します。通常のターミナルと同じように、シェルが 1 ペイン開きます。
+macOS は `/Applications/tako.app` をダブルクリック、または Dock / Launchpad から起動します。Windows はスタートメニューの「tako」から起動します。通常のターミナルと同じように、シェル（macOS は zsh など、Windows は PowerShell）が 1 ペイン開きます。
 
-**初回起動時は、タブバーの下に案内バナーが出ます。** `tako setup` と `tako master` をその場のボタンから実行できるので、次の手順はバナーからそのまま進められます。バナーは一度閉じると再表示されません（`tako welcome show` でいつでも呼び戻せます）。同じ項目は <kbd>Cmd</kbd>+<kbd>K</kbd> のコマンドパレットにも常設されています。
+**初回起動時は、タブバーの下に案内バナーが出ます。** 「セットアップを実行」を押すと新しいタブで `tako setup` が走り、「master を起動」を押すと新しいタブで `tako master` が起動します。バナーは一度閉じると再表示されません（`tako welcome show` でいつでも呼び戻せます）。同じ項目は <kbd>Cmd</kbd>+<kbd>K</kbd>（Windows は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>）のコマンドパレットにも常設されています。
 
-まずは普段どおりコマンドを打ってみてください。`ls` や `cd` など、通常のターミナルと同じ操作がそのまま使えます。コマンドを打ち始めると、履歴から続きが薄い文字で予測表示されます（<kbd>→</kbd> または <kbd>Tab</kbd> で確定）。最初の 10 回だけ確定キーの案内が薄く表示され、慣れた頃に自然と消えます。
+<figure class="tako-shot">
+<img src="/img/welcome-banner.webp" alt="tako の初回起動時に表示されるバナー。1. tako setup、2. tako master の 2 ステップと、それぞれの実行ボタンが並んでいる" />
+<figcaption>初回起動時のバナー。ここのボタンからそのまま `tako setup` と `tako master` を実行できる</figcaption>
+</figure>
 
-この入力予測は **tako が開いたシェルの中だけ**で効き、`~/.zshrc` は書き換えないので tako の外のターミナルは何も変わりません。挙動は `tako autosuggest off`（予測そのもの）/ `tako autosuggest tab off`（Tab 確定だけ無効化）/ `tako autosuggest hint off`（案内を今すぐ止める）で個別に切り替えられます。
+まずは普段どおりコマンドを打ってみてください。`ls` や `cd` など、通常のターミナルと同じ操作がそのまま使えます。macOS では、コマンドを打ち始めると履歴から続きが薄い文字で予測表示されます（<kbd>→</kbd> または <kbd>Tab</kbd> で確定）。最初の 10 回だけ確定キーの案内が薄く表示され、慣れた頃に自然と消えます。
+
+この入力予測は **tako が開いたシェルの中だけ**で効き、`~/.zshrc` は書き換えないので tako の外のターミナルは何も変わりません。挙動は `tako autosuggest off`（予測そのもの）/ `tako autosuggest tab off`（Tab 確定だけ無効化）/ `tako autosuggest hint off`（案内を今すぐ止める）で個別に切り替えられます。Windows の PowerShell は同じ予測入力（PSReadLine）を標準で持っているので、tako 側では何も足しません。
 
 ## 3. `tako setup` — 質問ゼロの自動セットアップ
 
-AI 連携に必要な設定を、**1 コマンドで自動的に**行います。tako 内のターミナルで次を実行してください。
+AI 連携に必要な設定を、**1 コマンドで自動的に**行います。tako 内のターミナルで次を実行してください（初回起動のバナーの「セットアップを実行」と同じです）。
 
-```bash
-tako setup
-```
+<Cmd>tako setup</Cmd>
 
 :::tip[エージェント CLI が 1 つも入っていなくても始められます]
-`claude` / `codex` / `agy` が 1 つも見つからないときは、`tako setup` が **インストール → PATH 通し → ログイン案内** の 3 段をそのまま案内します。実行する前に「何をどこに入れるか」（公式コマンド・取得元・置き場所・以後の更新のされ方）を必ず表示して確認を取り、**管理者権限は使いません**（ホームディレクトリの中だけで完結します）。
+`claude` / `codex` / `agy` が 1 つも見つからないときは、`tako setup` が **インストール → PATH 通し → ログイン案内** の 3 段をそのまま案内します。実行する前に「何をどこに入れるか」（公式コマンド・取得元・置き場所・以後の更新のされ方）を必ず表示して確認を取り、**管理者権限は使いません**（ホームディレクトリの中だけで完結します）。Windows で代わりに導入まで行うのは claude だけで、codex と agy は打つコマンドを案内します。
 
 **すでに 1 つでも使える状態なら、この案内は出ません**（余計な導入を勧めません）。たとえば `codex` だけが入っている環境では codex をそのまま使い、claude を入れるよう促したりはしません。あとから系統を増やしたくなったら `tako setup bootstrap install --agent codex` のように 1 コマンドで足せます。
 
@@ -180,7 +294,7 @@ tako setup
 実行すると、次の処理が自動で順に行われます。
 
 1. **シェル統合の配置** — ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測が効くように、シェル統合を配置します。**macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効く**ので、設定ファイルは 1 バイトも書き換えません（`[OK] シェル統合: 環境変数の注入で有効です` と 1 行出るだけです）。**Windows は PowerShell のプロファイル（`$PROFILE`）へ追記が必要**なので、どのファイルへ何を書くか（置くのは tako の管理ブロック 1 個だけで、既存の行はそのまま残ること・`tako shell-integration uninstall` で元に戻せること）を表示してから配置します。2 回目以降は差分がなければ何も書きません。配置できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します
-2. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git / Tailscale などの任意依存は、見つからなければ「何をどのコマンドで入れるか」を表示したうえで `tmux をインストールしますか？ [y/N]:` と **1 回だけ確認し、`y` ならその場で導入して再検出します**（`--yes` は確認を省いて導入、パイプ越しなど端末のない実行では導入せず案内だけを出します）
+2. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git / Tailscale などの任意依存は、見つからなければ「何をどのコマンドで入れるか」を表示したうえで `tmux をインストールしますか？ [y/N]:` と **1 回だけ確認し、`y` ならその場で導入して再検出します**（`--yes` は確認を省いて導入、パイプ越しなど端末のない実行では導入せず案内だけを出します）。Windows では導入を代わりに行わず、打つ `winget` のコマンドを案内します
 3. **認証・プラン確認** — Claude は認証と Pro / Max 等、Codex は認証と ChatGPT プランを取得できる範囲で自動判定します。検出不能でも安全に未指定にできる情報は `unknown` を採用します。token やアカウント情報は保存・表示しません
 4. **MCP 接続の準備** — 検出したエージェント CLI すべてへ tako の MCP サーバーを登録します。書き込み先は claude が `~/.claude.json`、codex が `~/.codex/config.toml` の `[mcp_servers.tako]`、agy が `~/.gemini/config/mcp_config.json` です（claude だけは `tako setup-mcp --project` で `<cwd>/.mcp.json` にも入れられます）。**書き先が `~/.claude/settings.json` だったのは古い tako で、いまはそこに残った設定を掃除する側です。** codex はこれに加えて、master / worker として起動するときに起動コマンドへその場でも MCP 設定を渡します（tako の外で立ち上げた codex にツールを出さないための経路です）
 5. **推奨 profile の生成** — プラン規模に応じて master / worker、effort、worker ポリシーを `profiles/default.yaml` へ生成します。モデル名は固定せず、各 CLI の最新の既定モデルを使います。既存 profile はそのまま維持します
@@ -376,9 +490,7 @@ codex には、tako と通信するための環境変数を MCP サーバーへ�
 
 tako 内のターミナルで master を起動します。setup が生成した profile に応じて claude または codex が立ち上がります。
 
-```bash
-tako master
-```
+<Cmd>tako master</Cmd>
 
 master は**今いるペインでそのまま起動**します（新しいタブは作りません）。専用のタブを立てたい場合は `tako master --tab` を使ってください。
 
@@ -408,7 +520,7 @@ tako update check
 tako update apply
 ```
 
-Homebrew 経由なら `brew upgrade --cask takushio2525/tako/tako` でも更新できます。各バージョンの変更内容は[リリースノート](/releases/)をご覧ください。
+Homebrew 経由なら `brew upgrade --cask takushio2525/tako/tako` でも更新できます。Windows では更新の確認とリリースノートの表示までは確かめていますが、適用は実機で未確認です。うまくいかないときは、新しい版のインストーラーをそのまま実行してください。各バージョンの変更内容は[リリースノート](/releases/)をご覧ください。
 
 ## トラブルシューティング
 
@@ -416,7 +528,7 @@ Homebrew 経由なら `brew upgrade --cask takushio2525/tako/tako` でも更新�
 
 **tako の中のターミナル**で出た場合は、tako を再起動してみてください（`tako` の置き場所は tako の起動時に解決されます）。
 
-**tako の外**のターミナルで出た場合は PATH が通っていません。`tako setup bootstrap path` を実行してから、**ターミナルを開き直して**もう一度試してください（PATH の設置は次に開くターミナルから効きます）。`tako setup --check` の `tako CLI の PATH` の行で、設置済みかどうかを確認できます。
+**tako の外**のターミナルで出た場合は PATH が通っていません。macOS では `tako setup bootstrap path` を実行してから、**ターミナルを開き直して**もう一度試してください（PATH の設置は次に開くターミナルから効きます）。`tako setup --check` の `tako CLI の PATH` の行で、設置済みかどうかを確認できます。Windows のインストーラー版は PATH を登録済みなので、ターミナルを開き直せば使えます。
 
 ### `tako setup` が「エージェント CLI が見つかりません」と言う
 
@@ -433,7 +545,7 @@ claude / codex / agy のいずれも PATH にありません。**この状態で
 
 ### tako 起動時にクラッシュする / 開けない
 
-quarantine 属性（ダウンロードしたアプリに付く隔離マーク）が原因のことがあります。解除してから再度起動してください:
+macOS では、quarantine 属性（ダウンロードしたアプリに付く隔離マーク）が原因のことがあります。解除してから再度起動してください:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/tako.app
@@ -441,7 +553,7 @@ xattr -dr com.apple.quarantine /Applications/tako.app
 
 ### 再起動したらタブが消えていた
 
-tmux バックエンドが無効になっている可能性があります。`tako persist` で状態を確認し、`tako persist on` で有効化してください。tmux 自体が未インストールの場合は `brew install tmux` で導入すると、実行中プロセスごと完全復元されるようになります。
+tmux バックエンドが無効になっている可能性があります。`tako persist` で状態を確認し、`tako persist on` で有効化してください。tmux 自体が未インストールの場合は `brew install tmux`（Windows は `winget install marlocarlo.psmux`）で導入すると、実行中プロセスごと完全復元されるようになります。
 
 ## 次のステップ
 
