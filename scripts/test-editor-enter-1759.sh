@@ -46,7 +46,13 @@ cleanup() {
   stop_isolated_gui "${ISOLATED_GUI_PID:-}"
   stop_isolated_gui "${CLI_GUI_PID:-}"
   tmux -L "${TAKO_TMUX_SOCKET:-tako-1759-$$}" kill-server >/dev/null 2>&1 || true
-  rm -rf "$TMP"
+  # 止めた直後の GUI の子（ペインのシェル・ログの書き出し）がまだ書いていることがあるので、
+  # 消し切れなければ少し待って消し直す（実測: 1 回目の rm -rf が Directory not empty で残った）
+  local _
+  for _ in 1 2 3 4 5; do
+    rm -rf "$TMP" 2>/dev/null && break
+    sleep 0.5
+  done
 }
 trap cleanup EXIT
 
