@@ -20,18 +20,6 @@
 
 ---
 
-## 2026-10-13（#1685: LSP の参照検索・呼び出し階層・型階層 = 右クリック → 右パネルの一覧 / ツリー・行の ⌘クリックで定義ジャンプと同じ着地・CLI / MCP は `tako_lsp` の 10 action）
-- 正本 `tako_core::lsp::xref`（応答の読み取り・ツリーの展開状態・ペインごとの保持 = 閉じたら消す）を dispatch `LspXref` / `LspResults` → `tako lsp references` 等 / MCP が 1:1 で通り、着地は `land_on_place` で定義ジャンプと共有。lsp-types 0.97 が `typeHierarchyProvider` を落とす穴・項目が増えて小窓で見切れるメニュー（窓に収めてスクロール）も直した。A/B `TAKO_1685_LEGACY=1`・カタログ +1.2 KB
-- 実測: `scripts/test-lsp-xref-1685.sh` 32 PASS（visual-test `xref-1685` = ⌘クリックでペイン 2 → 3・90 行目が先頭・閉じたら保持 0、旧腕は ① で名指し）・実の rust-analyzer で tako の `symbol_kind_name` の参照 8 件が grep と一致・e2e 9 本・番犬（注入 10 通り）
-
-## 2026-10-13（#1694: ワークスペース横断検索 = ⇧⌘F の右パネル search ビュー・結果の行でその行を開く・tako search / MCP tako_search）
-- `tako_core::workspace_search`（`ignore` の walker + `regex`。.gitignore はリポジトリ内だけ・`.git` / バイナリ / 8 MB 超は数だけ・ディレクトリのリンクは辿らない・保持 2000 行 / 30 秒）を `prepare_offload` → background → 出す検索だけ置き場へ。着地は #1685 の `land_on_place`（`plan_landing` + 行指定の open）。右パネルの最小幅を 220 → 240px（条件つきのタブ 3 本 = 7 本 + バッジが収まる幅）。暗黙の範囲からホーム / ルートを外す。Windows は Ctrl+Shift+G。カタログ +1,674 B・番犬 `issue1694_*`
-- 実測 `scripts/test-workspace-search-1694.sh` 16 PASS: 10,001 ファイルを 0.17 秒・4.7 秒の走査中に別の要求 83 回で最大 0.040 秒（`TAKO_OFFLOAD=0` の腕は 4.57 秒で NG）・メインスレッドの sample に走査 0・visual-test で ⌘クリック → ペイン 1→2・90 行目が見える
-
-## 2026-10-13（#2017: 監視の走査（`claude agents --json`）を mod の報告で置き換えた = 新しい報告のあるペインは走査せず、走査は mod の無い claude のアカウント + 既定だけ・ログインシェルなし）
-- `claude_mod::monitor_plan`（報告 20 秒以内・会話 ID つき・名指しと一致）で worker_status / self / report が走査を省く（応答の `agents_scan`）。走査は台帳で範囲（会話 ID / ペインの子孫）に絞る `ScanScope`・走査先ごとのキャッシュ・実体の直接起動。self の走査を UI スレッドから先取りへ（#1984 の番犬の穴 = ㉔㉕）。GUI のカタログも報告の会話 ID で埋める。A/B `TAKO_2017_LEGACY=1`
-- 実測: `scripts/test-agent-scan-mod-2017.sh`（隔離 GUI・4 アカウント × mod 入りの実 claude 4 本・監視相当）で走査 44 → 0 本/60 秒・回収済みの子の CPU 6.68 → 0.29 秒。15 回/分は 1 本のキャッシュの上限（60 / (5 + 所要)）を超えない = 行で数えた二重計上（本番の同じ窓で pid 40 / 行 80）。本番の修正後は着地後に計測
-
 ## 2026-10-13（#2020: sessions.yaml を走査ごとに全体書き直ししていたのを、last_seen_at だけの変化は溜めて検出集合の変化・他の項目の変化・600 秒・GUI の終了で書く形へ）
 - `sessions::LastSeenThrottle`: 書く時は溜めた「最後に見えた時刻」ごと書くので、その時点の中身は修正前と同一（並び順・GC・#466 の逆引きは書かない間も不変）。`.bak` は last_seen_at 以外が変わったときだけ・同じ内容は書かない・GUI は会話 0 本の走査と `on_app_quit` でも書く。形式は不変・A/B `TAKO_2020_LEGACY=1`
 - 実測: 本番（読むだけ）54 分で書き直し 121 回のうち、集合か last_seen_at 以外が変わったのは 10 回。`scripts/test-sessions-write-2020.sh`（隔離 GUI 2 本・偽 claude 24 本・500 件）の 30 分で新 7 回（`.bak` 3）/ 旧 58 回（`.bak` 58）・3.9 / 45.0 MB。注入 5 通りで新しい単体が file:line で落ちる
@@ -63,3 +51,19 @@
 ## 2026-10-14（#2032: issue1944_lsp_fetch の取得中の検査のフレーク = 状態と進捗は別々に変わるので、揃った 1 回の読みを状態待ちで捕まえる）
 - 真因: 製品は状態（取得中）と進捗（fetch のレジストリ）を別々に変えるので、進捗を置く前と、取り終えて進捗を消してから稼働へ移るまで（#1977 の片付けが走る）は「取得中なのに進捗が無い」。旧テストは各時点で両方を求めていた。配布元に最後の 4 KiB を止める `Serve::Held` を足し、status と画面の口をそれぞれ 1 回の読みで確かめる。注入 `TAKO_2032_INJECT_OLD_FILES=<n>`
 - 実測: 旧 + 前の版の段 500 ファイル 5/5 FAILED・旧 + 進捗を置く前に 200 ms 3/3 FAILED（どちらも CI と同じ assert）・新は同じ注入で 5/5 / 3/3 ok・画面に進捗を出さない壊し方で新が名指しで落ちる・新 20/20 ok
+
+## 2026-10-15（#2053 S2: ドキュメントサイトの機能ページをスクロール連動のモーションで作り直した = クイックスタート #2056 / かんたん表示 #2060 / 人がやること #2058 / エディタ #2062 / リモート #2061 / オーケストレーション #2059）
+- 各ページの場面は `docs/src/components/scenes/`、再現部品は新しいファイルで足し共有部品は無変更（PR #2068 / #2066 / #2074 / #2076 / #2069 / #2067）。Windows で pending の機能は `WindowsLimits` で対応表と突き合わせ（対応へ上がるとビルドが落ちる）。各ページ 1440 / 375 × 明暗 × reduced-motion で横はみ出し 0
+- 罠: Astro 6.4 + @astrojs/mdx 5.0.6 で `.mdx` の GFM の表が描かれない（#2082 で直す）。ページをまたぐ直しと共有部品の提案は #2077（S3）に集約。S2 の PR は progress を触らず、master がこの 1 件にまとめた
+
+## 2026-10-15（#1994: 重い処理の順番待ち `tako queue <コマンド>` = 調停役・割り当ての条件・再起動をまたぐ・この repo の入口で採用）
+- 判断は純関数 `tako_core::queue::admit`、調停役 `tako_control::queue` は本番 GUI の 1 つだけで `ipc::submit` の手前で答える。`settings.json` の `resources` 節（serde default）・`tako queue limits / cancel`・MCP `tako_queue` の action（+395 B）。`run_heavy` を build-app / isolated-gui / 検証スクリプトが通す（PR #2071）
+- 実測: e2e `scripts/test-queue-1992.sh` 46 PASS。見込みは build 3.5 GB / test 7 GB。swap 10 GB の機では既定の警戒線で 1 件ずつになる（`tako queue limits --swap-guard-gb`）
+
+## 2026-10-15（#2018: 器のペインログの取り込みを出力の合図で間引き、probe と capture を 1 回の tmux へ）
+- 出力が続く器だけ 10 秒ごと・止まったら次の tick・30 秒の保険は相乗り、probe + capture を 1 回へ、閉じる直前に増分と画面を 1 回で読む。A/B `TAKO_2018_LEGACY=1`（PR #2080）
+- 実測: 出力中 60 秒の tmux 68 → 10 本、子の CPU 約 1/6。欠け・重複 0（修正前は欠け 72 行）。出力中に器が自ら消えると最後の最大 10 秒が抜ける = #2085 で直す
+
+## 2026-10-15（#1953: 既存の構文への別名で色の穴を埋めた = `.h` を C++・`.m` を本文で MATLAB / Objective-C・`.pde` を Java・`.jsonc` を JSON・`.json5` を JavaScript）
+- `file_type` の行 + 純粋関数 `syntax_by_content`（先頭 200 行）。`.json5` は JSON だと JSON5 だけの書き方が `invalid` でダークで字が消える（144 字句中 113）ので JavaScript、`.S` / `.s` は ARM の `@` が消えるので寄せない。A/B `TAKO_1953_LEGACY=1`・構文 213 のまま（PR #2072）
+- 実測: `scripts/test-syntax-alias-1953.sh` 38 PASS（CLI / MCP の `syntax` 新旧・visual `syntax-alias`）
