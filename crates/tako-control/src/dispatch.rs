@@ -4156,7 +4156,7 @@ pub fn land_offload(
         // 変わっている（master を起こした = PTY の起動待ち）ので、受け口に後処理をさせてから出す
         OffloadContinuation::UserTaskStored(landing) => match *landing {
             UserTaskLanding::Responded { stored, turn } => {
-                let delivered = user_task_respond_deliver(host, stored);
+                let delivered = user_task_respond_deliver(host, *stored);
                 OffloadLanding::Settled(Box::new(OffloadJob::UserTaskRespondRecord(Box::new(
                     UserTaskRespondRecordJob {
                         delivered,
@@ -20917,7 +20917,7 @@ pub enum UserTaskLanding {
     Added(UserTaskAdded),
     /// 返答を積んだ（起票 master へ運び、④ で記録する。札は ④ の終わりまで持ち回る）
     Responded {
-        stored: UserTaskRespondStored,
+        stored: Box<UserTaskRespondStored>,
         turn: RespondTurn,
     },
     /// 在ることを確かめた（開く / 畳む。`None` = 畳む）
@@ -20953,8 +20953,12 @@ fn user_task_store_staged(job: UserTaskStoreJob) -> OffloadOutcome {
         UserTaskStoreOp::Respond(params, turn) => {
             turn.wait();
             // 経路は準備の段で埋まっている（`origin` は効かない）
-            respond_store_at(path, &params, PaneOrigin::Cli)
-                .map(|stored| UserTaskLanding::Responded { stored, turn })
+            respond_store_at(path, &params, PaneOrigin::Cli).map(|stored| {
+                UserTaskLanding::Responded {
+                    stored: Box::new(stored),
+                    turn,
+                }
+            })
         }
         UserTaskStoreOp::Expand(target) => user_task_expand_check(&path, target.as_deref())
             .map(|()| UserTaskLanding::Expand(target)),
@@ -20977,7 +20981,7 @@ fn user_task_land(
         UserTaskLanding::Added(added) => Ok(user_task_add_finish(host, added)),
         UserTaskLanding::Expand(target) => Ok(user_task_expand_finish(host, target)),
         UserTaskLanding::Responded { stored, turn } => {
-            let delivered = user_task_respond_deliver(host, stored);
+            let delivered = user_task_respond_deliver(host, *stored);
             user_task_respond_record(UserTaskRespondRecordJob {
                 delivered,
                 _turn: turn,

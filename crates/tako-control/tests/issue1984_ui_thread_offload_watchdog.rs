@@ -2845,8 +2845,8 @@ fn 逆戻りを名指しできる() {
     // ㊼ #2086: 返答の配送の記録を着地（UI スレッド）で書く
     let d = inject(
         &s.dispatch,
-        "                let delivered = user_task_respond_deliver(host, stored);",
-        "                let delivered = user_task_respond_deliver(host, stored);\n                let _ = user_task_respond_finish(todo!());",
+        "                let delivered = user_task_respond_deliver(host, *stored);",
+        "                let delivered = user_task_respond_deliver(host, *stored);\n                let _ = user_task_respond_finish(todo!());",
         "㊼",
     );
     expect_named(
