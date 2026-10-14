@@ -1,0 +1,102 @@
+---
+/**
+ * 場面: git パネル（右パネルの git ビュー）。3 手順。features/more の小さな場面（#2064）。
+ * 事実の出どころ: .agent/requirements.md FR-3.25 / FR-3.26 と docs/src/content/docs/features/git-integration.md
+ * （ステージ済み / 未ステージの 2 区分・切り替えとマージは先に「何が起きるか」を出す・予測は作業ツリーに触れない・
+ * コンフリクトカードから同じタブに解消エージェント）。
+ * 画面の文言: crates/tako-app/src/ui_text/panel.rs の git_*（変更 (N) / ステージ済みの変更 (N) / コミット /
+ * ブランチ (N) / マージ / '…' を現在のブランチへ取り込みます / 取り込むコミット: N 件 /
+ * 変更されるファイル: N 件 / コンフリクトの予測: N 件 / マージ中にコンフリクトが発生しています / 未解決ファイル (N) /
+ * 解消エージェントを起動 / マージを中止 / {agent} をペイン {pane} で起動しました（プロンプト投入中））。
+ * 解消エージェントへの依頼の書き出し: crates/tako-control/src/orchestrator/conflict_resolver_prompt.md
+ * （commit / push はせず、ステージまでで止めて報告する）。
+ * 書かない: rebase の対話編集や stash の管理まで GUI でできる。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import RightPanel from '../motion/RightPanel.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/tako-more.css';
+---
+
+<div class="tkm tkm-gitscene">
+	<Scrolly label="git パネルの流れ" flip>
+		<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+			<Split dir="col">
+				<Pane n={1} title="claude" state="running" focus="!3">
+					<span class="tk-l tk-tui-msg">ログイン画面を追加しました</span>
+					<span class="tk-l tk-tui-msg is-tool">npm test を実行（12 件成功）</span>
+				</Pane>
+				<Pane n={2} title="claude" state="running" at="3" fx="split" focus="3" style="--d: 1s">
+					<span class="tk-l tk-tui-user" data-at="3" style="--d: 1.6s">あなたは git のコンフリクト解消を担当するエージェントです。</span>
+					<span class="tk-l tk-tui-msg" data-at="3" style="--d: 2.2s">src/login.ts の両側の変更を読んでから解消します</span>
+				</Pane>
+			</Split>
+			<RightPanel slot="right" active="git" width="56%">
+				<div class="tk-stack tkm-git-stack">
+					<div class="tkm-git" data-at="1" data-fx="fade">
+						<span class="tkm-git-sec">ステージ済みの変更 (1)</span>
+						<span class="tkm-git-row"><span class="tkm-git-st is-add">A</span><span class="tkm-path">src/login.ts</span></span>
+						<span class="tkm-git-sec">変更 (1)</span>
+						<span class="tkm-git-row"><span class="tkm-git-st">M</span><span class="tkm-path">README.md</span></span>
+						<span class="tkm-git-input">ログイン画面を追加</span>
+						<div class="tkm-git-actions">
+							<span class="tkm-btn is-primary tkm-press" data-at="1" data-fx="mark">コミット</span>
+						</div>
+						<span class="tk-dim">ステージ済み 1 件をコミット</span>
+					</div>
+					<div class="tkm-git" data-at="2" data-fx="fade">
+						<span class="tkm-git-sec">ブランチ (2)</span>
+						<span class="tkm-git-row is-current"><Icon name="branch" /><span class="tkm-path">main</span></span>
+						<span class="tkm-git-row">
+							<Icon name="branch" /><span class="tkm-path">feature/login</span>
+							<span class="tkm-btn tkm-press" data-at="2" data-fx="mark" style="--d: .35s">マージ</span>
+						</span>
+						<div data-at="2" data-fx="unfold" style="--d: .9s">
+							<div>
+								<div class="tkm-git-card">
+									<b>'feature/login' を現在のブランチへ取り込みます</b>
+									<span class="tk-l">取り込むコミット: 3 件</span>
+									<span class="tk-l">変更されるファイル: 4 件</span>
+									<span class="tk-l tk-warn">コンフリクトの予測: 1 件</span>
+									<div class="tkm-git-actions">
+										<span class="tkm-btn is-primary">実行</span>
+										<span class="tkm-btn">キャンセル</span>
+									</div>
+								</div>
+							</div>
+						</div>
+					</div>
+					<div class="tkm-git" data-at="3" data-fx="fade">
+						<div class="tkm-git-card is-conflict">
+							<b>マージ中にコンフリクトが発生しています</b>
+							<span class="tk-l tk-dim">main ← feature/login</span>
+							<span class="tk-l">未解決ファイル (1)</span>
+							<span class="tkm-git-row"><span class="tkm-git-st is-conflict">U</span><span class="tkm-path">src/login.ts</span></span>
+							<div class="tkm-git-actions">
+								<span class="tkm-btn is-primary tkm-press" data-at="3" data-fx="mark" style="--d: .5s">解消エージェントを起動</span>
+								<span class="tkm-btn">マージを中止</span>
+							</div>
+						</div>
+						<span class="tk-l tk-dim" data-at="3" style="--d: 1.2s">claude をペイン 2 で起動しました（プロンプト投入中）</span>
+					</div>
+				</div>
+			</RightPanel>
+		</TakoWindow>
+
+		<Step title="変更を見て、そのままコミット">
+			<p>右パネルの git に、ステージ済みの変更と、まだステージしていない変更が分かれて並びます。メッセージを書いて「コミット」を押せば、ステージ済みのものだけがコミットされます。</p>
+		</Step>
+		<Step title="マージは、先に結果を見せる">
+			<p>ブランチの「マージ」を押しても、すぐには実行しません。取り込むコミットの数・変わるファイル・<strong>コンフリクトの予測</strong>を先に出し、「実行」を押したときだけ動きます。予測は作業ツリーに触れずに行います。</p>
+			<p>ブランチの切り替えも同じで、入れ替わるファイルと持ち越す変更を先に見せます。</p>
+		</Step>
+		<Step title="コンフリクトは、AI に解かせる">
+			<p>コンフリクトが起きると、未解決のファイルとマージの向きがカードに出ます。「解消エージェントを起動」で同じタブに AI のペインが立ち、それらを書いた依頼が自動で入ります。</p>
+			<p>AI は解消してステージするところまでで止まり、コミットは人に任せます。claude・codex・agy のどれでも選べます。</p>
+		</Step>
+	</Scrolly>
+</div>

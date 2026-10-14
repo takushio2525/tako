@@ -1,0 +1,109 @@
+---
+title: ほかにもできること
+seoTitle: Code Runner・自動復帰・tako mod・テーマ・たまり場・git パネル
+description: 再生ボタン 1 つで走らせる Code Runner、使用制限が解けたら続きから再開する自動復帰、Claude Code の画面に tako を出す tako mod、テーマ、処理を止めずに片付けるたまり場、先に結果を見せる git パネルを、動く図で紹介します
+---
+
+import MoreCodeRunner from '../../../components/scenes/MoreCodeRunner.astro';
+import MoreLimitResume from '../../../components/scenes/MoreLimitResume.astro';
+import MoreMod from '../../../components/scenes/MoreMod.astro';
+import MoreTheme from '../../../components/scenes/MoreTheme.astro';
+import MoreShelving from '../../../components/scenes/MoreShelving.astro';
+import MoreGit from '../../../components/scenes/MoreGit.astro';
+import WindowsChip from '../../../components/motion/WindowsChip.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+
+毎日の作業を少しずつ軽くする機能を 6 つ、それぞれ 3 手順の動く図で紹介します。どれも、同じ操作を AI に頼むこともできます。
+
+<nav class="tkm-index not-content" aria-label="このページの機能">
+<a href="#code-runner"><b>Code Runner</b><span>再生ボタンで、すぐ実行</span></a>
+<a href="#limit-resume"><b>自動復帰</b><span>使用制限が解けたら続きから</span></a>
+<a href="#tako-mod"><b>tako mod</b><span>Claude Code の中に tako</span></a>
+<a href="#theme"><b>テーマ</b><span>ライトへ 1 クリック、色は言葉で</span></a>
+<a href="#shelving"><b>たまり場</b><span>止めずに画面から片付ける</span></a>
+<a href="#git"><b>git パネル</b><span>マージの前に結果を見る</span></a>
+</nav>
+
+<div id="code-runner" class="tako-anchor"></div>
+
+## 再生ボタンで、すぐ実行（Code Runner）
+
+<WindowsChip tools={['tako_run', 'tako_run_resolve']} expect="supported" />
+
+<MoreCodeRunner />
+
+AI からも同じように走らせられます。
+
+<Cmd>tako run hello.py</Cmd>
+
+<p class="tako-guide-link"><a href="/features/file-preview/#ファイルを実行するcode-runner">宣言の書き方と、実行コマンドの決まり方 →</a></p>
+
+<div id="limit-resume" class="tako-anchor"></div>
+
+## 使用制限が解けたら、続きから（自動復帰）
+
+<WindowsChip tools={['tako_limit_resume']} expect="supported" />
+
+<MoreLimitResume />
+
+ステータスバーのボタンと同じく、全エージェントのペインをまとめて ON にします。
+
+<Cmd>{'tako limit-resume on --all'}</Cmd>
+
+<p class="tako-guide-link"><a href="/guides/cli-reference/#tako-limit-resume">発動の条件とペインごとの指定（tako limit-resume）→</a></p>
+
+<div id="tako-mod" class="tako-anchor"></div>
+
+## Claude Code の画面に、tako を出す（tako mod）
+
+<WindowsChip tools={['tako_mod']} expect="pending" pending="実機での確認待ちです" />
+
+<MoreMod />
+
+claude の版と、mod が読み込まれているかを確かめます。
+
+<Cmd>tako mod</Cmd>
+
+<p class="tako-guide-link"><a href="/agent-support/">エージェントごとに使える機能 →</a></p>
+
+<div id="theme" class="tako-anchor"></div>
+
+## ダークとライト、色は言葉で（テーマ）
+
+<WindowsChip tools={['tako_theme']} expect="supported" />
+
+<MoreTheme />
+
+ボタンと同じ切り替えです。
+
+<Cmd>tako theme toggle</Cmd>
+
+<p class="tako-guide-link"><a href="/guides/settings/#テーマ">色・フォント・表示言語の設定 →</a></p>
+
+<div id="shelving" class="tako-anchor"></div>
+
+## 止めずに、画面から片付ける（たまり場）
+
+<WindowsChip tools={['tako_background_pane', 'tako_foreground_pane']} expect="supported" />
+
+<MoreShelving />
+
+AI に頼むときは、ペインの番号を指定して退避させます。
+
+<Cmd>{'tako background --pane 2'}</Cmd>
+
+<p class="tako-guide-link"><a href="/features/shelving/">タブごとの退避・器の無いカードの扱い →</a></p>
+
+<div id="git" class="tako-anchor"></div>
+
+## マージの前に、結果を見る（git パネル）
+
+<WindowsChip tools={['tako_git_commit', 'tako_git_checkout', 'tako_git_merge', 'tako_git_resolve_agent']} expect="supported" />
+
+<MoreGit />
+
+コンフリクトの解消役は、コマンドからも立てられます。
+
+<Cmd>tako git resolve</Cmd>
+
+<p class="tako-guide-link"><a href="/features/git-integration/">ブランチ・履歴・diff と CLI / MCP の操作 →</a></p>

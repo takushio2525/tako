@@ -150,6 +150,7 @@ export default defineConfig({
 						{ label: 'たまり場', slug: 'features/shelving' },
 						{ label: 'ポート検知', slug: 'features/port-detection' },
 						{ label: 'エラーテレメトリ', slug: 'features/telemetry' },
+						{ label: 'ほかにもできること', slug: 'features/more' },
 					],
 				},
 				{

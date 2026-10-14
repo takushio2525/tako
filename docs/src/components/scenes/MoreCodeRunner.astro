@@ -1,0 +1,74 @@
+---
+/**
+ * 場面: Code Runner（プレビューのヘッダの再生ボタン）。3 手順。features/more の小さな場面（#2064）。
+ * 事実の出どころ: .agent/requirements.md FR-3.18 / FR-3.18.1（下に分割・同じ実行ペインを使い回す・
+ * 終わると淡色の 1 行とバッジ）/ FR-3.18.3（.venv などを設定なしで使う）。
+ * 画面の文言: crates/tako-app/src/ui_text/preview.rs の run_button（「実行」。緑の再生アイコン）、
+ * ui_text/pane_menu.rs の run_badge_*（実行中 / 完了）、crates/tako-core/src/platform/shell.rs の
+ * 終了の 1 行（「[tako] 終了コード N / Enter でこのペインを閉じます」）。
+ * 書かない: Windows でプロジェクトの流儀（cargo / npm …）まで実機で確かめた、すべての拡張子で動く。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/tako-more.css';
+---
+
+<div class="tkm">
+	<Scrolly label="Code Runner の流れ">
+		<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={27}>
+			<Split dir="col">
+				<div class="tk-pane" style="--grow: 6">
+					<span class="tk-pane-focus" data-at="1" data-fx="fade"></span>
+					<div class="tk-pane-head tkm-pv-head">
+						<span class="tk-pane-n">1</span>
+						<Icon name="file" />
+						<span class="tk-pane-title">hello.py</span>
+						<span class="tkm-run tkm-press" data-at="1-2" data-fx="mark"><Icon name="play" />実行</span>
+						<span class="tk-pane-ctl"><Icon name="columns" /><Icon name="minus" /><Icon name="x" /></span>
+					</div>
+					<div class="tk-pane-body tkm-code">
+						<span class="tkm-ln">1</span><span class="tk-l"><span class="tkm-kw">def</span> <span class="tkm-fn">greet</span>(name):</span>
+						<span class="tkm-ln">2</span><span class="tk-l">{'    '}<span class="tkm-kw">return</span> <span class="tkm-str">f"こんにちは、{'{name}'}"</span></span>
+						<span class="tkm-ln">3</span><span class="tk-l"> </span>
+						<span class="tkm-ln">4</span><span class="tk-l">total = <span class="tkm-fn">sum</span>([<span class="tkm-num">1</span>, <span class="tkm-num">2</span>, <span class="tkm-num">3</span>])</span>
+						<span class="tkm-ln">5</span><span class="tk-l"><span class="tkm-fn">print</span>(greet(<span class="tkm-str">"tako"</span>))</span>
+						<span class="tkm-ln">6</span><span class="tk-l"><span class="tkm-fn">print</span>(<span class="tkm-str">"合計:"</span>, total)</span>
+					</div>
+				</div>
+				<Pane
+					n={2}
+					title="python hello.py"
+					state={[
+						{ at: '2', state: 'running', text: '実行中' },
+						{ at: '3+', state: 'idle', text: '完了' },
+					]}
+					at="2+"
+					fx="split"
+					grow={4}
+					focus="2+"
+					style="--d: .35s"
+				>
+					<span class="tk-l" data-at="2+" style="--d: .7s">こんにちは、tako</span>
+					<span class="tk-l" data-at="3+">合計: 6</span>
+					<span class="tk-l tk-dim" data-at="3+" style="--d: .35s">[tako] 終了コード 0 / Enter でこのペインを閉じます</span>
+				</Pane>
+			</Split>
+		</TakoWindow>
+
+		<Step title="開いたファイルに、再生ボタン">
+			<p>ファイルツリーから開いたスクリプトのヘッダに、緑の「実行」が出ます。コマンドを打たなくても、押すだけで走ります。</p>
+			<p>何で走らせるかは tako が決めます。ファイルの先頭に <code>tako:run:</code> の宣言があればそれ、無ければプロジェクトの流儀（<code>cargo</code> / <code>npm</code> など）か拡張子の既定です。Python はプロジェクトの <code>.venv</code> を設定なしで使います。</p>
+		</Step>
+		<Step title="押すと、すぐ下のペインで走る">
+			<p>同じタブの下に実行用のペインが開き、出力が流れます。ヘッダの「実行中」で、まだ終わっていないと分かります。</p>
+		</Step>
+		<Step title="終わると、終了コードが残る">
+			<p>終わるとヘッダが「完了」（失敗なら「失敗」と終了コード）に変わり、最後の 1 行に終了コードが出ます。Enter でこのペインを閉じられます。</p>
+			<p>直してもう一度押すと、<strong>同じ場所の実行ペインで走り直し</strong>ます。押すたびにペインが増えることはありません。</p>
+		</Step>
+	</Scrolly>
+</div>
