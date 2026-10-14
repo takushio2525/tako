@@ -91,7 +91,7 @@ const hintAt = warnAt.some((c) => !c.at) ? undefined : warnAt.map((c) => c.at).j
 		<span class="tk-ghead-spacer"></span>
 		{
 			warnAt.length > 0 && (
-				<span class="tk-gctx-hint" data-at={hintAt} data-fx={hintAt ? 'pop' : undefined}>
+				<span class="tk-gctx-hint" data-at={hintAt}>
 					/compact で会話を軽くする
 				</span>
 			)

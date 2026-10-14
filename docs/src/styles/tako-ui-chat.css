@@ -172,6 +172,24 @@
 .tk-gctx .is-warn .tk-gctx-bar i {
   background: var(--ui-red);
 }
+/* 出ていない手順では幅も取らない（隠れたまま場所を取ると、状態の文字が押し縮められる） */
+[data-motion] .tk-gctx-hint[data-at]:not(.is-on) {
+  display: none;
+}
+[data-motion]:not(.is-static) .tk-gctx-hint[data-at].is-on {
+  animation: tk-gpop 0.4s var(--tako-ease, ease) both;
+}
+@keyframes tk-gpop {
+  from {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tk-gctx-hint {
+    animation: none !important;
+  }
+}
 .tk-gctx-hint {
   flex: none;
   padding: 0 0.6em;
@@ -257,6 +275,9 @@
   padding: 0.2em 0.6em 0.5em 0.8em;
   overflow: hidden;
   font-family: var(--ui-sys);
+  /* 上へ流れて消える古い発話は、硬い線で切らずにぼかす */
+  -webkit-mask-image: linear-gradient(transparent, #000 1.4em);
+  mask-image: linear-gradient(transparent, #000 1.4em);
 }
 /* 会話がまだ無いときの案内は、実物と同じく本文の上端に左寄せで出る */
 .tk-gchat-empty-wrap {
@@ -365,6 +386,7 @@
 }
 .tk-gmsg-bubble .tk-tool {
   margin-top: 0;
+  overflow-wrap: anywhere;
 }
 /* 生成中に送った指示の「送信待ち」（届いたら消える） */
 .tk-gmsg-queued {
