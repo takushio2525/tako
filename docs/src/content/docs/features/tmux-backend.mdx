@@ -1,0 +1,130 @@
+---
+title: 閉じても消えない（tmux バックエンド）
+seoTitle: tmux バックエンド — tako を閉じても、PC を再起動しても AI の作業が戻る
+description: 全ペインを tmux（Windows は psmux）の上で動かすので、tako を閉じても実行中のプロセスと画面がそのまま戻ります。PC を再起動したあとは AI との会話を続きから再開し、うっかり閉じた構成も tako recover で戻せます
+---
+
+import SceneRelaunch from '../../../components/scenes/SceneRelaunch.astro';
+import SceneReboot from '../../../components/scenes/SceneReboot.astro';
+import SceneRecover from '../../../components/scenes/SceneRecover.astro';
+import SceneCliUpdate from '../../../components/scenes/SceneCliUpdate.astro';
+import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+
+tako を閉じても、PC を再起動しても、うっかり閉じてしまっても、作業は戻ってきます。AI に一晩かかる仕事を任せて寝る、が現実的にできます。設定は要りません（tmux が入っていれば最初から有効です）。
+
+## 閉じても、同じ画面に戻る
+
+スクロールすると、画面がその手順の状態に変わります。
+
+<SceneRelaunch />
+
+## PC を再起動しても、会話は戻る
+
+再起動で消えるのはプロセスです。AI との会話は、tako が覚えておいて続きから再開します。
+
+<SceneReboot />
+
+## 消してしまった構成を戻す
+
+タブやペインを閉じすぎたときは、`tako recover` で直前の構成へ戻せます。
+
+<SceneRecover />
+
+## CLI を更新しても、会話は保つ
+
+claude が新しくなっても、会話を捨てて起動し直す必要はありません。
+
+<SceneCliUpdate />
+
+## 仕組み
+
+```
+tako（GUI）─── attach ──→ tmux session（バックエンド）─── PTY ──→ シェル
+```
+
+各ペインは tako 専用の tmux サーバーの上にセッションとして作られ、tako はそこへ attach して画面を描きます。tako を閉じると attach が外れるだけで、セッション（= シェルとプロセス）は生き続けます。次に起動したときは、保存しておいた構成（タブ・分割・ペイン番号・作業フォルダ）をもとに同じ形で attach し直します。
+
+PC の再起動などでセッションが消えていたペインは、保存しておいた作業フォルダの新しいシェルで開き直し、AI の会話を覚えていれば再開コマンドを打ち込みます。戻し方の内訳は毎回 `persist.log` に 1 行で残ります。
+
+## tmux がない場合
+
+tmux（Windows では psmux）が無い環境では、ペインを直接起動します。このとき tako を閉じるとプロセスも終わり、次の起動で戻るのは**タブの構成と作業フォルダだけ**です。
+
+tmux の導入は必須ではありませんが、**[リモートアクセス](/features/remote/)とオーケストレーターの worker 管理には tmux が必要**です。これらは tako 本体とは別のプロセスからペインへ届く必要があるためです。
+
+<Cmd>brew install tmux</Cmd>
+
+<Cmd prompt="PS>">winget install marlocarlo.psmux</Cmd>
+
+## 永続化の ON/OFF
+
+既定で有効です。止めたいときだけ切り替えます。
+
+```bash
+tako persist        # 今の状態と、直近の復元の内訳
+tako persist off    # 無効にする
+tako persist on     # 有効に戻す
+```
+
+MCP ツール `tako_persist` からも同じ操作ができます。
+
+## 過去の会話とペインの出力をさかのぼる
+
+閉じてしまったペインの会話も、あとから呼び戻せます。`tako sessions list` で一覧を出し、ID（先頭だけでよい）を渡すと、記録された作業フォルダで新しいペインに開き直します（一覧に出るのは claude の会話です）。
+
+```bash
+tako sessions list
+tako sessions resume 3f9c
+```
+
+ペインが消えたあとでも、そのペインの出力は平文のログに残っています。`tako logs list` で一覧、`tako logs show 3` でペイン 3 の末尾を読めます。
+
+## 自分で作った tmux セッションを取り込む
+
+tako の外で `tmux new` して作ったセッション（たとえば AI エージェントを動かしているもの）も、tako のペインとして開けます。
+
+```bash
+tako tmux list       # 既定の tmux サーバーと tako のセッションの一覧
+tako tmux open api   # 「api」セッションを今のタブの右側のペインへ取り込む
+```
+
+tmux で AI エージェントを動かすときの基本（外から画面を読む・指示を送るときの注意）は [tmux で AI エージェントを動かす](/guides/tmux-agents/)にまとめています。
+
+## サイドバーの fleet ビュー
+
+右パネルの **fleet ビュー**（`tako panel --view fleet`）では、tako が管理しているセッションと、その中のペインをまとめて確認できます。
+
+- **タブ枠ごと**にペインを入れ子表示
+- 前面表示中 / バックグラウンドの**状態バッジ**
+- バックグラウンドのペインを**ホバーでプレビュー**
+- **orphan セッション**（tako から切り離されて残った tmux）の検出と一括の片付け
+
+```bash
+tako tmux cleanup   # 取り残された tako のセッションを片付ける（使用中のものには触れない）
+```
+
+## Windows では
+
+Windows では tmux の代わりに **psmux** が同じ役をします。psmux を入れておけば、tako を閉じて開き直してもプロセスと画面が戻り、PC を再起動したあとは **claude の会話**が続きから戻ります。過去の会話の呼び戻し（`tako sessions`）とペインのログ（`tako logs`）も使えます。
+
+次のものは、まだ使えないか、一部が落ちます。最新の状況は [Windows 対応状況](/windows-support/) にあります。
+
+<WindowsLimits
+	items={[
+		{
+			kind: 'degraded',
+			title: 'CLI の更新のあとの張り直し',
+			text: '会話を保ったまま CLI を建て直す「張り直す」は使えません（プロセスを終わらせる仕組みがまだ Windows に無いため）。引き継ぎを書かせて再起動する方は使えます。',
+			tools: ['tako_session_restart'],
+		},
+		{
+			kind: 'pending',
+			title: '自分で作った tmux セッションの取り込み',
+			text: 'psmux では attach と寸法の指定を前提にする操作ができません。',
+			tools: ['tako_tmux_open', 'tako_tmux_resize'],
+		},
+	]}
+/>
+
+PC を再起動したあとに会話ごと戻るのは claude だけです。codex と agy のペインは、同じ作業フォルダの新しいシェルで開き直します（Windows では会話の ID を取り出せないため）。

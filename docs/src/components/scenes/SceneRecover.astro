@@ -1,0 +1,96 @@
+---
+/**
+ * 場面: 消してしまったタブ・ペインの構成を、世代のバックアップから戻す（tako recover。#2063）。5 手順。
+ * 事実の出どころ: .agent/requirements.md FR-5.11（tmux のセッションを持つペインが消える保存の前に
+ * layout.json を .bak.1〜.bak.3 へ退避。10 分以内は回さない）/ crates/tako-cli/src/main.rs の
+ * recover_list・recover_apply（一覧と書き戻しの文言。稼働中は拒否・今のファイルは .pre-recover へ退避）/
+ * main.rs の drop_backend_session（明示 close はセッションを kill する）+ FR-5.2（消えていたセッションは
+ * 保存した cwd の新しいシェルで開き直す）。経過時間・件数は架空。退避先のパスは途中を省いた。
+ */
+import '../../styles/scene-restore.css';
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import OsTerminal from '../motion/OsTerminal.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Cmd from '../motion/Cmd.astro';
+---
+
+<Scrolly label="消した構成を tako recover で戻す流れ" flip>
+	<div slot="stage" class="tk-stack">
+		<div data-at="1-2 5" data-fx="pop">
+			<TakoWindow
+				tabs={[
+					{ label: 'my-app', state: 'running', active: true },
+					{ label: 'docs', at: '1 5' },
+				]}
+				height={25}
+			>
+				<Split>
+					<Pane n={1} title="my-app" state="running" focus grow={1.15}>
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> claude</span>
+						<span class="tk-l tk-tui-user">ログイン画面を直して</span>
+						<span class="tk-l tk-tui-msg">修正しました。テストを流します</span>
+					</Pane>
+					<Split dir="col" at="1 5" fx="split">
+						<Pane n={2} title="npm run dev" state={[{ at: '1', state: 'running' }, { at: '!1', state: 'idle' }]}>
+							<div class="tk-rs-swap">
+								<div data-at="1" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">my-app ❯</span> npm run dev</span>
+									<span class="tk-l tk-dim">ready on http://localhost:3000</span>
+								</div>
+								<div data-at="5" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+								</div>
+							</div>
+						</Pane>
+						<Pane n={3} title="npm test" state={[{ at: '1', state: 'running' }, { at: '!1', state: 'idle' }]}>
+							<div class="tk-rs-swap">
+								<div data-at="1" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">my-app ❯</span> npm test -- --watch</span>
+									<span class="tk-l tk-ok">3 passed</span>
+								</div>
+								<div data-at="5" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">my-app ❯</span></span>
+								</div>
+							</div>
+						</Pane>
+					</Split>
+				</Split>
+			</TakoWindow>
+		</div>
+		<div data-at="3-4" data-fx="fade">
+			<OsTerminal height={25}>
+				<span class="tk-l"><span class="tk-p">~ %</span> <span class="tk-c" data-at="3+" data-fx="type">tako recover</span></span>
+				<span class="tk-l" data-at="3+" style="--d: .7s">layout.json         : 1 タブ / 1 ペイン（1 分前 更新）</span>
+				<span class="tk-l" data-at="3+" style="--d: .8s"><span class="tk-rs-hit" data-at="3+" data-fx="state" style="--d: 1.6s">layout.json.bak.1   : 2 タブ / 4 ペイン（4 分前 更新）</span></span>
+				<span class="tk-l" data-at="3+" style="--d: .9s">layout.json.bak.2   : 2 タブ / 3 ペイン（2 時間前 更新）</span>
+				<span class="tk-l tk-dim" data-at="3+" style="--d: 1s">layout.json.bak.3   : （無し）</span>
+				<span class="tk-l" data-at="3+" style="--d: 1.1s">layout.json.good    : 2 タブ / 4 ペイン（3 時間前 更新）</span>
+				<span class="tk-l" data-at="4"><span class="tk-p">~ %</span> <span class="tk-c" data-at="4" data-fx="type">tako recover --apply 1</span></span>
+				<span class="tk-l tk-dim" data-at="4" style="--d: 1.1s">現在の layout.json → …/layout.json.pre-recover へ退避</span>
+				<span class="tk-l" data-at="4" style="--d: 1.3s">layout.json.bak.1（2 タブ / 4 ペイン）→ layout.json へ復元しました。</span>
+				<span class="tk-l" data-at="4" style="--d: 1.5s">tako を起動すると、このレイアウトで復元されます。</span>
+			</OsTerminal>
+		</div>
+	</div>
+
+	<Step title="いつもの構成">
+		<p>AI と話すペインの右に、dev サーバーとテスト。別のタブにはドキュメントの作業があります。</p>
+	</Step>
+	<Step title="まとめて閉じてしまった">
+		<p>うっかりタブやペインを閉じてしまっても、tako は閉じる前の構成を<strong>世代</strong>として残しています（最大 3 世代）。</p>
+	</Step>
+	<Step title="tako を終了して、世代の一覧を見る">
+		<p>tako を終了してから、外のターミナルでこう打つと、今の構成と残っている世代が並びます。</p>
+		<Cmd>tako recover</Cmd>
+	</Step>
+	<Step title="世代を選んで書き戻す">
+		<p>戻したい世代の番号を渡します。今の構成のファイルは別名で取っておくので、やり直しもできます。</p>
+		<Cmd>tako recover --apply 1</Cmd>
+	</Step>
+	<Step title="起動すると、元の構成">
+		<p>tako を起動すると、戻した構成で開きます。閉じたときに終わったプロセスは、同じ作業フォルダの新しいシェルで開き直します。</p>
+	</Step>
+</Scrolly>

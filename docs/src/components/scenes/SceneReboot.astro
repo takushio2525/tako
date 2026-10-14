@@ -1,0 +1,112 @@
+---
+/**
+ * 場面: PC を再起動しても、AI の会話は続きから戻る（#2063）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-5.9（tmux が消えていたら保存した会話 ID で resume）/
+ * FR-5.9.2（役割・モデルごと戻す）/ FR-5.9.3（codex = `codex resume <id>`・agy = `agy --conversation <id>`。
+ * 書式の正本は crates/tako-core/src/agent_resume.rs の resume_spec）/ FR-5.2（消えていたセッションは
+ * 保存した cwd の新しいシェル）/ FR-5.7.1（persist.log の「復元成功: …」は合計がペイン数と一致。
+ * 行の形は crates/tako-control/src/restore_report.rs の summary）。
+ * Windows で会話ごと戻るのは claude だけ（agent_resume.rs の restore_support。lsof が無い）。
+ * 会話 ID は架空（先頭だけ見せる）。
+ */
+import '../../styles/scene-restore.css';
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Blackout from '../motion/Blackout.astro';
+import Icon from '../motion/Icon.astro';
+---
+
+<Scrolly label="PC を再起動したあと、会話が戻る流れ">
+	<div slot="stage" class="tk-stack">
+		<div data-at="!2" data-fx="pop">
+			<TakoWindow tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={25}>
+				<Split>
+					<Pane n={1} title="マスター" badge="ORCH" state="running" focus grow={1.15}>
+						<div class="tk-rs-swap">
+							<div data-at="1" data-fx="fade">
+								<span class="tk-l"><span class="tk-p">❯</span> tako master</span>
+								<span class="tk-l tk-tui-user">ログイン画面にテストを足して</span>
+								<span class="tk-l tk-tui-msg">worker に任せました。終わったら確かめます</span>
+							</div>
+							<div data-at="3+" data-fx="fade">
+								<span class="tk-l"><span class="tk-p">❯</span> <span data-at="3+" data-fx="type">claude --resume 3f9c…</span></span>
+								<span class="tk-l tk-tui-user" data-at="3+" style="--d: .9s">ログイン画面にテストを足して</span>
+								<span class="tk-l tk-tui-msg" data-at="3+" style="--d: 1.1s">worker に任せました。終わったら確かめます</span>
+							</div>
+						</div>
+					</Pane>
+					<Split dir="col">
+						<Pane n={2} title="codex" state="running">
+							<div class="tk-rs-swap">
+								<div data-at="1" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">❯</span> codex</span>
+									<span class="tk-l tk-tui-user">README の英語版を作って</span>
+									<span class="tk-l tk-tui-msg">下書きができました</span>
+								</div>
+								<div data-at="3+" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">❯</span> <span data-at="3+" data-fx="type" style="--d: .3s">codex resume 81b2…</span></span>
+									<span class="tk-l tk-tui-user" data-at="3+" style="--d: 1.2s">README の英語版を作って</span>
+									<span class="tk-l tk-tui-msg" data-at="3+" style="--d: 1.4s">下書きができました</span>
+								</div>
+							</div>
+						</Pane>
+						<Pane
+							n={3}
+							title="my-app"
+							state={[
+								{ at: '1', state: 'running' },
+								{ at: '!1', state: 'idle' },
+							]}
+						>
+							<div class="tk-rs-swap">
+								<div data-at="1" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">❯</span> npm run dev</span>
+									<span class="tk-l tk-dim">ready localhost:3000</span>
+								</div>
+								<div data-at="3+" data-fx="fade">
+									<span class="tk-l"><span class="tk-p">❯</span> <span class="tk-cur"></span></span>
+								</div>
+							</div>
+						</Pane>
+					</Split>
+				</Split>
+				<div slot="overlay" class="tk-rs-log" data-at="4" data-fx="pop">
+					<div class="tk-rs-log-head">
+						<Icon name="file" />
+						persist.log
+						<span class="tk-rs-log-sum">合計 3 = 3 ペイン</span>
+					</div>
+					<span class="tk-rs-log-line">復元成功: 1 タブ / 3 ペイン（tmux 再 attach 0 / <b>Claude resume 1</b> / <b>codex resume 1</b> / <b>新規シェル 1</b> / プレビュー 0 / Web ビュー 0 / たまり場・退避 0 / 復元失敗 0）</span>
+				</div>
+			</TakoWindow>
+		</div>
+		<div data-at="2" data-fx="fade">
+			<Blackout kind="reboot" title="PC を再起動しています" note="消えるのはプロセス。tmux のセッションもいっしょに消えます" height={25}>
+				<ul class="tk-bo-list">
+					<li class="tk-bo-list-head">tmux（tako 専用のサーバー）</li>
+					<li class="is-gone"><i class="tk-dot" /><span class="tk-bo-label">1 マスター · claude</span><span class="tk-bo-state">消えた</span></li>
+					<li class="is-gone"><i class="tk-dot" /><span class="tk-bo-label">2 codex</span><span class="tk-bo-state">消えた</span></li>
+					<li class="is-gone"><i class="tk-dot" /><span class="tk-bo-label">3 npm run dev</span><span class="tk-bo-state">消えた</span></li>
+				</ul>
+			</Blackout>
+		</div>
+	</div>
+
+	<Step title="AI と話している途中で">
+		<p>ペイン 1 で司令塔の AI（claude）、ペイン 2 で codex と話しながら、ペイン 3 で dev サーバーを動かしています。</p>
+	</Step>
+	<Step title="PC を再起動すると、プロセスは消える">
+		<p>PC を再起動すると、tmux ごと全部のプロセスが終わります。それでも tako は、各ペインで<strong>どの会話をしていたか</strong>を覚えています。</p>
+	</Step>
+	<Step title="tako が会話を打ち直して、続きから">
+		<p>tako を起動すると、覚えていた会話を指定して <code>claude --resume</code> や <code>codex resume</code> を各ペインのシェルに打ち込みます（agy は <code>agy --conversation</code>）。司令塔は司令塔のまま、会話の続きから戻ります。</p>
+		<p>dev サーバーのようなふつうのプロセスは戻らず、同じフォルダの新しいシェルになります。</p>
+		<p class="tk-step-note">Windows で会話ごと戻るのは claude だけです。codex と agy のペインは、同じフォルダの新しいシェルで開き直します。</p>
+	</Step>
+	<Step title="何をどう戻したかが、1 行で残る">
+		<p>戻し方の内訳は <code>persist.log</code> に 1 行で残り、合計は必ずペインの数と一致します。戻らなかったペインがあっても、理由をあとから確かめられます（<code>tako persist</code> でも読めます）。</p>
+	</Step>
+</Scrolly>

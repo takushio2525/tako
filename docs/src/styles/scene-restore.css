@@ -1,0 +1,117 @@
+/*
+ * 「閉じても消えない」のページ（features/tmux-backend。#2063）の場面だけで使う見た目。
+ * 共有の部品（tako-ui.css / motion.css）は変えず、ここで足す。
+ */
+
+/* 閉じている間に進んだ出力（開き直した後に「増えている」ことを見せる） */
+.tk-rs-new {
+  border-radius: 3px;
+  background: rgb(137 180 250 / 0.1);
+  box-shadow: inset 2px 0 0 var(--ui-accent-muted);
+  padding-left: 0.35em;
+}
+
+/* ペインの中を重ねて入れ替える器（前 / 後） */
+.tk-rs-swap {
+  display: grid;
+}
+.tk-rs-swap > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+/* persist.log の 1 行を見せるカード（窓の下端に重ねる） */
+.tk-rs-log {
+  position: absolute;
+  left: 4%;
+  right: 4%;
+  bottom: 7%;
+  z-index: 3;
+  padding: 0.65em 0.8em 0.75em;
+  border-radius: 9px;
+  background: var(--ui-crust);
+  border: 1px solid var(--ui-accent-line);
+  box-shadow: 0 18px 40px -12px rgb(0 0 0 / 0.7);
+  font-size: var(--ui-fs);
+}
+@container tkframe (min-width: 34rem) {
+  .tk-rs-log {
+    font-size: 12px;
+  }
+}
+@container tkframe (max-width: 25rem) {
+  .tk-rs-log {
+    font-size: 10px;
+  }
+}
+.tk-rs-log-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  margin-bottom: 0.4em;
+  color: var(--ui-muted);
+  font-weight: 700;
+}
+.tk-rs-log-head .tk-rs-log-sum {
+  margin-left: auto;
+  font-weight: 600;
+  color: var(--ui-green);
+}
+.tk-rs-log-line {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ui-fg2);
+  line-height: 1.6;
+}
+.tk-rs-log-line b {
+  color: var(--ui-accent);
+  font-weight: 700;
+}
+
+/* tako recover の一覧で、戻す世代の行 */
+.tk-rs-hit {
+  display: block;
+  border-radius: 3px;
+}
+/* data-fx="state" で付け外す（隠さない）。JS が無いときは強調したまま */
+.tk-rs-hit.is-on,
+.tk-scrolly:not([data-motion]) .tk-rs-hit {
+  background: rgb(108 195 255 / 0.16);
+  box-shadow: inset 2px 0 0 #6cc3ff;
+}
+
+/* 古い claude を知らせる帯（実物: crates/tako-app/src/main.rs の stale-banner。黄色の薄い地）。
+ * 実物は 1 行で末尾を省略するが、再現の窓は狭く「利用可能です」まで切れて意味が消えるので、2 行まで折り返す */
+.tk-rs-stale {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  min-height: 2.2em;
+  padding: 0.3em 0.7em;
+  background: rgb(249 226 175 / 0.12);
+  border-bottom: 1px solid rgb(249 226 175 / 0.25);
+  color: var(--ui-fg);
+  font-size: 0.95em;
+  white-space: nowrap;
+}
+.tk-rs-stale-msg {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.tk-rs-stale-btn {
+  flex: none;
+  padding: 0.1em 0.65em;
+  border-radius: 4px;
+  background: var(--ui-chip);
+  color: var(--ui-accent);
+  font-weight: 600;
+  font-size: 0.92em;
+}
+.tk-rs-stale-x {
+  flex: none;
+  color: var(--ui-muted);
+}
