@@ -1169,8 +1169,8 @@ a:hover {
   text-decoration: none;
 }
 
-/* インラインコード */
-.sl-markdown-content code:not(pre code) {
+/* インラインコード（再現した画面 .tk-ui の中の code は部品が描くので、本文の装飾を効かせない） */
+.sl-markdown-content code:not(pre code):not(:where(.tk-ui *)) {
   font-family: var(--sl-font-mono);
   background: var(--tako-accent-soft);
   color: var(--tako-accent-strong);
@@ -1181,7 +1181,7 @@ a:hover {
   overflow-wrap: anywhere;
 }
 
-:root[data-theme='dark'] .sl-markdown-content code:not(pre code) {
+:root[data-theme='dark'] .sl-markdown-content code:not(pre code):not(:where(.tk-ui *)) {
   color: var(--tako-accent);
 }
 
