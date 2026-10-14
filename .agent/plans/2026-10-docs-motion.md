@@ -152,8 +152,7 @@ cd docs && npm ci && npm run build && npm run og:verify && node scripts/verify-l
 | `Sidebar` | slot sidebar | `project`・`branch`・`path`・`items` | `sidebar.rs` |
 | `RightPanel` | slot right | `active`（fleet / orch / git / tasks）・`count` / `countAt`・`width`（既定 40%）・`narrow`（幅 30rem 以下の窓での幅。既定 58%）。引き出しで開くなら `data-fx="drawer"` の器で包む | `right_panel.rs` |
 | `TaskCard` | RightPanel の中 | `kind`・`title`・`openAt`・`body`・`attachment`・`pick` / `pickAt`・`comment` / `commentAt`・`delivered` | `tasks_panel.rs` / `ui_text/panel.rs` |
-| `CommandCard` | ペインの帯（`.tk-cardband`） | `title`・`command`・`at`・`running`・`ran` | `command_card_ui.rs` / `ui_text/command_card.rs` |
-| `CommandCardFull` | ペインの帯（`.tk-cardband`） | `title`・`commands`（各 `text`（改行可）/ `copied` / `running` / `ran` + `code`（0 以外は赤）/ `closed` / `copyMark` / `runMark` / `boxMark`）・`at`。実物どおり番号・実行記録をボタン行の左に出す（#2057） | `command_card_ui.rs` の render_command_card / `ui_text/command_card.rs` |
+| `CommandCard` | ペインの帯（`.tk-cardband`） | `title`・`commands`（各 `text`（改行可）/ `copied` / `running` / `ran` + `code`（0 以外は赤）/ `closed` / `copyMark` / `runMark` / `boxMark`）・`at`。実物どおり番号・実行記録をボタン行の左に出す（#2057。#2077 で簡略版と 1 本にまとめた） | `command_card_ui.rs` の render_command_card / `ui_text/command_card.rs` |
 | `PhoneCommandCards` | Phone の中 | `label`・`command`・`pressAt`・`confirmAt` / `confirmPressAt`（全文の確認シート）・`startedAt`・`runningAt` / `ranAt` / `code`・`pane`・`host`（#2057） | `web/tako-remote/src/components/command-cards.jsx` |
 | `WelcomeBanner` | slot banner | `at`・`pressAt` | `overlays.rs` / `ui_text/welcome.rs` |
 | `Chat` | Pane の中 | `typed` / `typedAt`・`chips`。吹き出しは子に `.tk-bubble`（`.is-user`） | `chat_view.rs` / `ui_text/ui_mode.rs` |

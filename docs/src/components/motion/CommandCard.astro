@@ -1,56 +1,110 @@
 ---
 /**
- * コマンドカード（AI が `tako show-command` / MCP `tako_show_command` で出すカード）の再現。
- * 文言は crates/tako-app/src/ui_text/command_card.rs。
+ * コマンドカード（AI が `tako show-command` / MCP `tako_show_command` で出すカード）の再現（#2057。#2077 で 1 本にまとめた）。
+ * 複数コマンド（N/M 件目）・改行を含むコマンド・「コピーしました」・
+ * 実行記録（実行中 / 実行済み（終了コード N）/ 実行済み（ペインは閉じた））を手順で出し入れできる。
+ * 実物はペインの下端の帯（.tk-cardband）に出る（ターミナルが下から縮み、会話や入力欄に重ならない）。
  *
- *   <CommandCard title="テストを実行する" command="npm run test" at="2+" ran="3+" />
+ *   <CommandCard
+ *     title="開発環境を用意する"
+ *     commands={[
+ *       { text: 'npm ci', ran: '3+' },
+ *       { text: "cat > .env.local <<'EOF'\nPORT=3000\nEOF", copied: '2' },
+ *       { text: 'npm run db:migrate', ran: '3+', code: 1 },
+ *     ]}
+ *   />
  *
- * running / ran を渡すと、その手順でボタンの下に実行記録（実行中 → 実行済み（終了コード 0））が出る。
- * 実物はペインの下端の帯に出る（ターミナルが下から縮み、会話や入力欄に重ならない）。
+ * 並びは crates/tako-app/src/command_card_ui.rs の render_command_card と同じ:
+ * 見出し（ラベル + ×）→ コマンドごとの箱（本文 → 番号・実行記録・余白・コピー・新規ペインで実行）。
+ * 狭くて折り返すときは、コピーと実行を 1 組のまま右寄せで次の行へ送る（実物はボタンが 1 つずつ折り返す）。
+ * 終了コード 0 は緑、0 以外は赤（run_status_text）。文言は crates/tako-app/src/ui_text/command_card.rs。
+ * 見た目は tako-ui.css の「コマンドカード」の節。
  */
 import Icon from './Icon.astro';
 
-interface Props {
-	title?: string;
-	command: string;
-	at?: string;
-	fx?: string;
+interface Command {
+	/** コマンド（改行を含めてよい。カードは改行を保ったまま見せる） */
+	text: string;
+	/** 「コピーしました」になる手順（data-at の書き方） */
+	copied?: string;
 	/** 実行記録「実行中」を出す手順 */
 	running?: string;
-	/** 実行記録「実行済み（終了コード 0）」を出す手順 */
+	/** 実行記録「実行済み（終了コード N）」を出す手順 */
 	ran?: string;
+	/** ran の終了コード（既定 0。0 以外は赤） */
+	code?: number;
+	/** 実行記録「実行済み（ペインは閉じた）」を出す手順 */
+	closed?: string;
+	/** コピー / 新規ペインで実行 / 箱そのものに押された印を付ける手順 */
+	copyMark?: string;
+	runMark?: string;
+	boxMark?: string;
+}
+
+interface Props {
+	title?: string;
+	commands: Command[];
+	at?: string;
+	fx?: string;
 	class?: string;
 }
 
-const { title = '実行するコマンド', command, at, fx = 'pop', running, ran, class: className } = Astro.props;
+const { title = '実行するコマンド', commands, at, fx = 'pop', class: className } = Astro.props;
+const total = commands.length;
 ---
 
-<div class:list={['tk-cmdcard', className]} data-at={at} data-fx={at ? fx : undefined}>
+<div class:list={['tk-cmdcard', 'tk-cc', className]} data-at={at} data-fx={at ? fx : undefined}>
 	<div class="tk-cmdcard-head">
-		<span>{title}</span>
+		<span class="tk-cc-title">{title}</span>
 		<Icon name="x" />
 	</div>
-	<div class="tk-cmdcard-box">
-		<span class="tk-cmdcard-cmd">{command}</span>
-		<div class="tk-cmdcard-actions">
-			<span class="tk-ubtn"><Icon name="copy" />コピー</span>
-			<span class="tk-ubtn"><Icon name="play" />新規ペインで実行</span>
-		</div>
+	<div class="tk-cc-boxes">
+		{
+			commands.map((c, i) => (
+				<div class="tk-cmdcard-box" data-at={c.boxMark} data-fx={c.boxMark ? 'mark' : undefined}>
+					<span class="tk-cmdcard-cmd">{c.text}</span>
+					<div class="tk-cc-row">
+						{total > 1 && <span class="tk-cc-idx">{i + 1}/{total} 件目</span>}
+						{(c.running || c.ran || c.closed) && (
+							<span class="tk-cc-state tk-stack">
+								{c.running && (
+									<span class="is-running" data-at={c.running} data-fx="fade">
+										実行中
+									</span>
+								)}
+								{c.ran && (
+									<span class={(c.code ?? 0) === 0 ? 'is-ok' : 'is-bad'} data-at={c.ran} data-fx="fade">
+										実行済み（終了コード {c.code ?? 0}）
+									</span>
+								)}
+								{c.closed && (
+									<span class="is-closed" data-at={c.closed} data-fx="fade">
+										実行済み（ペインは閉じた）
+									</span>
+								)}
+							</span>
+						)}
+						<span class="tk-cc-btns">
+							<span class="tk-cc-copy" data-at={c.copyMark} data-fx={c.copyMark ? 'mark' : undefined}>
+								<span class="tk-ubtn" data-at={c.copied ? `!${c.copied}` : undefined} data-fx="fade">
+									<Icon name="copy" />
+									コピー
+								</span>
+								{c.copied && (
+									<span class="tk-ubtn is-copied" data-at={c.copied} data-fx="fade">
+										<Icon name="check" />
+										コピーしました
+									</span>
+								)}
+							</span>
+							<span class="tk-ubtn" data-at={c.runMark} data-fx={c.runMark ? 'mark' : undefined}>
+								<Icon name="play" />
+								新規ペインで実行
+							</span>
+						</span>
+					</div>
+				</div>
+			))
+		}
 	</div>
-	{
-		(running || ran) && (
-			<div class="tk-cmdcard-run tk-stack">
-				{running && (
-					<span data-at={running} data-fx="fade">
-						<i class="tk-dot is-running" /> 実行中
-					</span>
-				)}
-				{ran && (
-					<span class="tk-ok" data-at={ran} data-fx="fade">
-						実行済み（終了コード 0）
-					</span>
-				)}
-			</div>
-		)
-	}
 </div>

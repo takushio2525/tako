@@ -785,10 +785,89 @@
   gap: 0.45em;
   flex-wrap: wrap;
 }
-.tk-cmdcard-run {
-  margin-top: 0.4em;
-  font-size: 0.9em;
+/* ============================================================
+ * コマンドカードの並び（CommandCard.astro。正本: crates/tako-app/src/command_card_ui.rs の render_command_card）
+ * ============================================================ */
+.tk-cc .tk-cmdcard-head {
+  justify-content: flex-start;
+  gap: 0.5em;
+  margin-bottom: 0.4em;
+}
+.tk-cc-title {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tk-cc-boxes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+}
+.tk-cc .tk-cmdcard-cmd {
+  margin-bottom: 0.45em;
+}
+/* 番号・実行記録・余白・コピー・新規ペインで実行（実物は 1 行に並び、狭いと折り返す） */
+.tk-cc-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35em 0.45em;
+}
+.tk-cc-idx,
+.tk-cc-state {
+  font-size: 0.87em;
+  white-space: nowrap;
+}
+.tk-cc-idx {
   color: var(--ui-muted);
+}
+.tk-cc-state .is-running {
+  color: var(--ui-accent);
+}
+.tk-cc-state .is-ok {
+  color: var(--ui-green);
+}
+.tk-cc-state .is-bad {
+  color: var(--ui-red);
+}
+.tk-cc-state .is-closed {
+  color: var(--ui-muted);
+}
+/* コピーと実行の 1 組。折り返すときも 1 組のまま右寄せ */
+.tk-cc-btns {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35em 0.45em;
+  margin-left: auto;
+}
+/* 重ねた器（実行記録・コピー）の中で隠れている側は幅を取らない。実物も、出たときに行が伸びる
+ * （隠れた文言が幅を取ると、まだ何も出ていない行のボタンが先に折り返してしまう） */
+.tk-cc-state,
+.tk-cc-copy {
+  position: relative;
+}
+[data-motion] .tk-cc-state > [data-at]:not(.is-on),
+[data-motion] .tk-cc-copy > [data-at]:not(.is-on) {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+/* 「コピー」と「コピーしました」を重ねる器。幅は広いほうに揃い、切り替わっても行が動かない */
+.tk-cc-copy {
+  display: inline-grid;
+  border-radius: 5px;
+}
+.tk-cc-copy > * {
+  grid-area: 1 / 1;
+}
+.tk-cc .tk-ubtn.is-copied {
+  color: var(--ui-green);
+  border-color: var(--ui-green);
+}
+/* 箱ごとの強調（data-fx="mark" の輪を箱に付けるとき、角の丸みを合わせる） */
+.tk-cc .tk-cmdcard-box[data-fx~='mark'] {
+  border-radius: 6px;
 }
 
 /* ============================================================
