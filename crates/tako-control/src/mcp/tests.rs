@@ -2,6 +2,29 @@
 mod tests {
     use super::*;
 
+    /// #2086: `tako_todo` の返答で経路を省いたら `mcp` と明示して送る（修正前の既定と同じ値。
+    /// 省いたままだと受け口の準備の段が呼び出し元を知らず、返答が UI スレッドの同期の腕に残る）
+    #[test]
+    fn tako_todo_の返答は経路を省くと_mcp_と明示する() {
+        let via = |args: Value| match build_request("tako_todo", &args, None, None).unwrap() {
+            Request::UserTask { via, .. } => via,
+            other => panic!("UserTask でない: {other:?}"),
+        };
+        assert_eq!(
+            via(json!({"action": "respond", "id": "u-1", "decision": "approve"})).as_deref(),
+            Some("mcp")
+        );
+        // 明示した経路はそのまま
+        assert_eq!(
+            via(json!({"action": "respond", "id": "u-1", "decision": "approve", "via": "pwa"}))
+                .as_deref(),
+            Some("pwa")
+        );
+        // 返答以外は省いたまま（経路を使わない）
+        assert_eq!(via(json!({"action": "list"})), None);
+        assert_eq!(via(json!({})), None);
+    }
+
     /// #1945: `tako_limit_resume` の `all` + `enabled` は一括（呼び出し元ペインを解かない =
     /// tako の外の MCP クライアントからも押せる）。`pane` は退避中でも素通しして dispatch が引く
     #[test]
