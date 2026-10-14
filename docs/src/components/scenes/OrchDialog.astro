@@ -17,40 +17,34 @@ import '../../styles/tako-orch.css';
 ---
 
 <Scrolly label="worker の確認待ちに、master が答える流れ" flip>
-	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25} masterAt="1+">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25} masterAt="1+" workers={1}>
 		<Split>
 			<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
-				<span class="tk-l tk-tui-msg">2 体が作業中です</span>
+				<span class="tk-l tk-tui-msg">worker 1 体が作業中です</span>
 				<span class="tk-l tk-tui-msg is-tool tk-warn" data-at="2+">WORKER_PERMISSION · pane 2</span>
 				<span class="tk-l tk-dim" data-at="2+" style="--d: .25s">  npm test の実行の許可待ち</span>
 				<span class="tk-l tk-tui-msg" data-at="2+" style="--d: .5s">テストの実行は依頼の範囲内。許可します</span>
 				<span class="tk-l tk-tui-msg is-tool" data-at="3+">tako_orchestrator_respond</span>
 				<span class="tk-l tk-dim" data-at="3+" style="--d: .2s">  pane 2 · choice 1 → 解消</span>
 			</Pane>
-			<Split dir="col">
-				<Pane n={2} title="my-app: test" badge="WORKER" parent="master" state="running">
-					<span class="tko-alert" data-at="2" data-fx="fade"></span>
-					<span class="tk-l tk-tui-msg is-tool">tests/login.test.ts を作成</span>
-					<div data-at="1-2" data-fx="unfold">
-						<div>
-							<div class="tko-dlg-box">
-								<span class="tk-l tk-b">Bash command</span>
-								<span class="tk-l tk-c">  npm test</span>
-								<span class="tk-l">Do you want to proceed?</span>
-								<span class="tk-l tk-acc">❯ 1. Yes</span>
-								<span class="tk-l tk-dim">  2. Yes, and don't ask again</span>
-								<span class="tk-l tk-dim">  3. No</span>
-							</div>
+			<Pane n={2} title="my-app: test" badge="WORKER" parent="master" state="running">
+				<span class="tko-alert" data-at="2" data-fx="fade"></span>
+				<span class="tk-l tk-tui-msg is-tool">tests/login.test.ts を作成</span>
+				<div data-at="1-2" data-fx="unfold">
+					<div>
+						<div class="tko-dlg-box">
+							<span class="tk-l tk-b">Bash command</span>
+							<span class="tk-l tk-c">  npm test</span>
+							<span class="tk-l">Do you want to proceed?</span>
+							<span class="tk-l tk-acc">❯ 1. Yes</span>
+							<span class="tk-l tk-dim">  2. Yes, and don't ask again</span>
+							<span class="tk-l tk-dim">  3. No</span>
 						</div>
 					</div>
-					<span class="tk-l tk-tui-msg is-tool" data-at="3+" style="--d: .5s">npm test</span>
-					<span class="tk-l tk-ok" data-at="3+" style="--d: .9s">  12 passed</span>
-				</Pane>
-				<Pane n={3} title="docs: typo" badge="WORKER" parent="master" state="running">
-					<span class="tk-l tk-tui-msg is-tool">guide.md を読む</span>
-					<span class="tk-l tk-tui-msg" data-at="2+">誤字を 4 か所直しました</span>
-				</Pane>
-			</Split>
+				</div>
+				<span class="tk-l tk-tui-msg is-tool" data-at="3+" style="--d: .5s">npm test</span>
+				<span class="tk-l tk-ok" data-at="3+" style="--d: .9s">  12 passed</span>
+			</Pane>
 		</Split>
 	</TakoWindow>
 
