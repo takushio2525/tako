@@ -160,4 +160,4 @@ tako の側に体数の上限の設定はありません。実際の上限は、
 
 - [tmux で AI エージェントを動かす](/guides/tmux-agents/) — 閉じても止まらない実行と、外から様子を見る方法
 - [オーケストレーションとは](/features/orchestration/) — master と worker の考え方
-- [クイックスタート](/getting-started/quickstart/) — 最短 3 ステップで試す
+- [クイックスタート](/getting-started/quickstart/) — 入れたあとの 10 分で、AI に画面を任せるまで
