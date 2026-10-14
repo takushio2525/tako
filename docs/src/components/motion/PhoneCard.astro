@@ -1,0 +1,28 @@
+---
+/**
+ * スマホ版のペイン一覧のカード 1 枚。中身（子）は画面の末尾数行の写し（.tk-pcard-preview に入る）。
+ */
+interface Props {
+	title: string;
+	/** master / worker / solo など（左端の色と札） */
+	role?: 'master' | 'worker' | 'solo';
+	state?: 'running' | 'idle' | 'wait';
+	stateText?: string;
+	at?: string;
+	fx?: string;
+}
+
+const { title, role = 'worker', state = 'running', stateText, at, fx } = Astro.props;
+---
+
+<div class:list={['tk-pcard', `is-${role}`]} data-at={at} data-fx={fx}>
+	<div class="tk-pcard-head">
+		<span class="tk-pcard-title">{title}</span>
+		<span class:list={['tk-pill', { 'is-wait': state === 'wait' }]}><i></i>{stateText ?? state}</span>
+	</div>
+	<div class="tk-pchips">
+		<span class:list={['tk-pchip', { 'is-master': role === 'master' }]}>{role}</span>
+		<span class="tk-pchip">claude</span>
+	</div>
+	<div class="tk-pcard-preview"><slot /></div>
+</div>

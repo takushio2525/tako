@@ -1,0 +1,224 @@
+---
+/**
+ * 「Windows でどこまで使えるか」を一目で見せるパネル（#2053）。
+ * 数字は生成ページ windows-support.md からビルド時に読む（windowsSupport.ts）。手書きしない。
+ *
+ *   <WindowsStatus />                 … 見出しの数字 + 分野ごとの棒
+ *   <WindowsStatus variant="compact" /> … 1 行の要約（OS を選ぶカードの中など）
+ */
+import { windowsSupport as ws } from './windowsSupport';
+
+interface Props {
+	variant?: 'full' | 'compact';
+}
+
+const { variant = 'full' } = Astro.props;
+const usable = ws.supported + ws.degraded;
+// 見出しの言い換え（生成ページの節名は技術寄りなので、読み手向けに短くする）
+const label: Record<string, string> = {
+	'ターミナルの基本': 'ターミナル・タブ・分割',
+	'表示とプレビュー': 'プレビュー・エディタ',
+	'AI 連携（オーケストレーション）': 'AI 連携・オーケストレーション',
+	'git 連携': 'git パネル',
+	'永続化とセッション': '再起動後の復元',
+	'OS 連携': 'OS 連携',
+	'セットアップと設定': 'セットアップ・設定',
+	'リモートアクセス': 'リモート（スマホ・SSH）',
+	'アップデート': 'アップデート',
+};
+---
+
+{
+	variant === 'compact' ? (
+		<p class="tk-ws-compact not-content">
+			<b>{ws.total} 機能のうち {ws.supported}</b> が macOS と同じように動きます（一部機能が落ちるものを含めると {usable}）
+		</p>
+	) : (
+		<div class="tk-ws not-content">
+			<div class="tk-ws-head">
+				<div class="tk-ws-num">
+					<span class="tk-ws-big">{ws.supported}</span>
+					<span class="tk-ws-of">/ {ws.total} 機能</span>
+				</div>
+				<p class="tk-ws-lead">
+					<b>Windows 版はもう使えます。</b>
+					{ws.total} の機能のうち {ws.supported} が macOS と同じように動き、{ws.degraded} は一部の機能が落ちる形で使えます。
+					「対応」は Windows 実機で動かして確かめたものだけを数えています。
+				</p>
+			</div>
+			<ul class="tk-ws-areas">
+				{ws.areas.map((a) => (
+					<li class="tk-ws-area">
+						<span class="tk-ws-name">{label[a.name] ?? a.name}</span>
+						<span class="tk-ws-bar" role="img" aria-label={`${a.total} 機能中 対応 ${a.counts['対応']}・一部対応 ${a.counts['一部対応']}`}>
+							<i class="is-ok" style={`flex-grow:${a.counts['対応']}`} />
+							<i class="is-part" style={`flex-grow:${a.counts['一部対応']}`} />
+							<i class="is-not" style={`flex-grow:${a.counts['未対応 / 未実測']}`} />
+							<i class="is-na" style={`flex-grow:${a.counts['対象外']}`} />
+						</span>
+						<span class="tk-ws-count">
+							{a.counts['対応']}
+							<small>/ {a.total}</small>
+						</span>
+					</li>
+				))}
+			</ul>
+			<p class="tk-ws-legend">
+				<span><i class="is-ok" />対応</span>
+				<span><i class="is-part" />一部対応</span>
+				<span><i class="is-not" />未対応・未実測</span>
+				<span><i class="is-na" />対象外</span>
+				<a href="/windows-support/">機能ごとの表を見る</a>
+			</p>
+		</div>
+	)
+}
+
+<style>
+	.tk-ws {
+		border: 1px solid var(--tako-border);
+		border-radius: var(--tako-radius-lg);
+		background: var(--tako-card);
+		box-shadow: var(--tako-shadow-sm), var(--tako-card-sheen);
+		padding: var(--tako-space-6);
+		margin: var(--tako-space-6) 0;
+	}
+	.tk-ws-head {
+		display: flex;
+		gap: var(--tako-space-6);
+		align-items: center;
+		margin-bottom: var(--tako-space-4);
+	}
+	.tk-ws-num {
+		flex: none;
+		display: flex;
+		align-items: baseline;
+		gap: 0.3em;
+		font-family: var(--sl-font);
+	}
+	.tk-ws-big {
+		font-size: 2.6rem;
+		font-weight: 800;
+		letter-spacing: -0.03em;
+		line-height: 1;
+		color: var(--tako-green);
+	}
+	.tk-ws-of {
+		color: var(--tako-ink-muted);
+		font-size: 0.95rem;
+		font-weight: 600;
+	}
+	.tk-ws-lead {
+		margin: 0;
+		font-size: 0.93rem;
+		line-height: 1.8;
+		color: var(--tako-ink-muted);
+	}
+	.tk-ws-lead b {
+		color: var(--tako-ink);
+	}
+	.tk-ws-areas {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: grid;
+		gap: 0.45rem;
+	}
+	.tk-ws-area {
+		display: grid;
+		grid-template-columns: minmax(0, 11.5rem) minmax(0, 1fr) 3.4rem;
+		gap: 0.75rem;
+		align-items: center;
+		margin: 0;
+		font-size: 0.86rem;
+	}
+	.tk-ws-name {
+		color: var(--tako-ink);
+		overflow-wrap: anywhere;
+	}
+	.tk-ws-bar {
+		display: flex;
+		height: 0.6rem;
+		border-radius: 99px;
+		overflow: hidden;
+		background: var(--tako-surface-2);
+		gap: 2px;
+	}
+	.tk-ws-bar i {
+		display: block;
+		min-width: 0;
+	}
+	.is-ok {
+		background: var(--tako-green);
+	}
+	.is-part {
+		background: #e0a526;
+	}
+	.is-not {
+		background: var(--tako-border-strong);
+	}
+	.is-na {
+		background: var(--tako-surface-2);
+	}
+	.tk-ws-count {
+		text-align: right;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
+		color: var(--tako-ink);
+	}
+	.tk-ws-count small {
+		color: var(--tako-ink-subtle);
+		font-weight: 500;
+	}
+	.tk-ws-legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem 1rem;
+		margin: var(--tako-space-4) 0 0;
+		font-size: 0.8rem;
+		color: var(--tako-ink-muted);
+		align-items: center;
+	}
+	.tk-ws-legend i {
+		display: inline-block;
+		width: 0.7rem;
+		height: 0.7rem;
+		border-radius: 3px;
+		margin-right: 0.35rem;
+		vertical-align: -0.05rem;
+	}
+	.tk-ws-legend a {
+		margin-left: auto;
+		font-weight: 600;
+	}
+	.tk-ws-compact {
+		margin: 0;
+		font-size: 0.86rem;
+		color: var(--tako-ink-muted);
+		line-height: 1.7;
+	}
+	.tk-ws-compact b {
+		color: var(--tako-green);
+	}
+	@media (max-width: 40rem) {
+		.tk-ws {
+			padding: var(--tako-space-4);
+		}
+		.tk-ws-head {
+			flex-direction: column;
+			align-items: flex-start;
+			gap: var(--tako-space-2);
+		}
+		.tk-ws-area {
+			grid-template-columns: minmax(0, 1fr) 3rem;
+			gap: 0.2rem 0.6rem;
+		}
+		.tk-ws-bar {
+			grid-column: 1 / -1;
+			grid-row: 2;
+		}
+		.tk-ws-legend a {
+			margin-left: 0;
+		}
+	}
+</style>

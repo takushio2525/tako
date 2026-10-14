@@ -1,0 +1,377 @@
+/*
+ * スクロール連動のモーション解説（#2053）の骨組み: 場面の配置・手順・出し入れの効果。
+ * 画面の再現そのもの（窓・ペイン・カード）は tako-ui.css。制御は src/scripts/motion.ts。
+ *
+ * 不変条件:
+ *  - 横にはみ出さない（幅 375px でも横スクロールを出さない）。画面の再現は inline-size の
+ *    コンテナ問い合わせで部品を間引いて縮める
+ *  - 出し入れは opacity / transform / flex-grow / grid-template-rows だけで行う（重い再計算を避ける）
+ *  - prefers-reduced-motion: reduce では一切動かさない（.is-static = 手順ごとの静止した図）
+ */
+
+/* ============================================================
+ * 場面（Scrolly）
+ * ============================================================ */
+.tk-scrolly-wrap {
+  container: tkscrolly / inline-size;
+  margin: var(--tako-space-8) 0 var(--tako-space-12);
+}
+
+.tk-scrolly {
+  --tk-stacked: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  gap: var(--tako-space-8);
+  align-items: start;
+}
+
+/* 図を左に置く場面（左右を交互にしてリズムを付けたいとき） */
+.tk-scrolly.is-flip {
+  grid-template-columns: minmax(0, 1.18fr) minmax(0, 0.82fr);
+}
+.tk-scrolly.is-flip > .tk-scrolly-stage {
+  grid-column: 1;
+}
+.tk-scrolly.is-flip > .tk-scrolly-steps {
+  grid-column: 2;
+}
+
+.tk-scrolly-stage {
+  grid-column: 2;
+  grid-row: 1;
+  position: sticky;
+  /* 狭い画面のドキュメントページでは、ヘッダーの下に「目次」バーも貼り付く（Starlight の変数。無ければ 0） */
+  top: calc(var(--sl-nav-height, 3.5rem) + var(--sl-mobile-toc-height, 0rem) + var(--tako-space-8));
+  z-index: 1;
+}
+
+.tk-scrolly-steps {
+  grid-column: 1;
+  grid-row: 1;
+  list-style: none;
+  margin: 0 !important;
+  padding: 0 !important;
+  counter-reset: tkstep;
+}
+
+/* 手順。高さを持たせて「読んでいる間は図がその状態で止まる」ようにする */
+.tk-step {
+  counter-increment: tkstep;
+  min-height: min(55vh, 27rem);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  margin: 0 !important;
+  padding: var(--tako-space-6) 0;
+  opacity: 0.38;
+  transition: opacity 0.35s var(--tako-ease-soft);
+}
+.tk-step:first-child {
+  min-height: min(48vh, 24rem);
+  justify-content: flex-start;
+  padding-top: var(--tako-space-12);
+}
+.tk-step:last-child {
+  min-height: min(70vh, 34rem);
+}
+.tk-step.is-active,
+.tk-scrolly:not([data-motion]) .tk-step,
+.tk-scrolly.is-static .tk-step {
+  opacity: 1;
+}
+
+.tk-step-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6em;
+  margin: 0 0 var(--tako-space-2) !important;
+}
+.tk-step-head::before {
+  content: counter(tkstep);
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 1.7em;
+  height: 1.7em;
+  border-radius: 50%;
+  font-size: 0.78rem;
+  font-weight: 700;
+  font-family: var(--sl-font);
+  color: var(--tako-accent);
+  background: var(--tako-accent-soft);
+  border: 1px solid var(--tako-accent-line);
+  transform: translateY(-0.12em);
+}
+.tk-step.is-active .tk-step-head::before {
+  color: #fff;
+  background: var(--tako-accent);
+  border-color: var(--tako-accent);
+}
+.tk-step-title {
+  font-family: var(--sl-font);
+  font-size: 1.08rem;
+  font-weight: 700;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+  color: var(--tako-ink);
+}
+.tk-step-body {
+  color: var(--tako-ink-muted);
+  font-size: 0.93rem;
+  line-height: 1.85;
+}
+.tk-step-body > * + * {
+  margin-top: 0.6em !important;
+}
+.tk-step-body p {
+  margin: 0;
+  color: inherit !important;
+  line-break: strict;
+  overflow-wrap: anywhere;
+}
+.tk-step-body strong {
+  color: var(--tako-ink);
+}
+/* 手順の補足（OS の違いなど）。本文より一段控えめに */
+.tk-step-body .tk-step-note {
+  font-size: 0.82rem;
+  line-height: 1.7;
+  padding-left: 0.75em;
+  border-left: 2px solid var(--tako-border-strong);
+  color: var(--tako-ink-muted) !important;
+}
+
+/* 縦積み: 画面が狭いときは図を上に貼り付け、手順がその下をくぐる */
+@container tkscrolly (max-width: 44rem) {
+  .tk-scrolly,
+  .tk-scrolly.is-flip {
+    --tk-stacked: 1;
+    display: block;
+  }
+  .tk-scrolly-stage {
+    top: calc(var(--sl-nav-height, 3.5rem) + var(--sl-mobile-toc-height, 0rem) + var(--tako-space-2));
+    padding: var(--tako-space-2) 0 var(--tako-space-3);
+    background: var(--sl-color-bg);
+    /* 下端をぼかし、くぐる手順の文字と図が硬い線で切れないようにする */
+    -webkit-mask-image: linear-gradient(#000 calc(100% - 10px), transparent);
+    mask-image: linear-gradient(#000 calc(100% - 10px), transparent);
+  }
+  .tk-step {
+    min-height: 62vh;
+    justify-content: flex-start;
+    padding: var(--tako-space-8) 0 var(--tako-space-4);
+  }
+  .tk-step:first-child {
+    min-height: 50vh;
+    padding-top: var(--tako-space-6);
+  }
+  .tk-step:last-child {
+    min-height: 58vh;
+  }
+}
+
+/* ============================================================
+ * 静止した図の並び（prefers-reduced-motion: reduce）
+ * ============================================================ */
+.tk-scrolly.is-static {
+  display: block;
+}
+.tk-scrolly.is-static > .tk-scrolly-stage {
+  display: none;
+}
+.tk-scrolly.is-static .tk-step {
+  min-height: 0;
+  padding: var(--tako-space-4) 0 var(--tako-space-6);
+  display: grid;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  grid-template-rows: auto 1fr;
+  column-gap: var(--tako-space-8);
+  align-items: start;
+}
+.tk-scrolly.is-static .tk-step-figure {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+@container tkscrolly (max-width: 44rem) {
+  .tk-scrolly.is-static .tk-step {
+    display: block;
+  }
+  .tk-scrolly.is-static .tk-step-figure {
+    margin-top: var(--tako-space-3);
+  }
+}
+.tk-scrolly.is-static *,
+.tk-scrolly.is-static *::before,
+.tk-scrolly.is-static *::after {
+  transition: none !important;
+  animation: none !important;
+}
+
+/* ============================================================
+ * 出し入れ（[data-at] / [data-fx]）
+ *
+ * data-motion が付いた場面（= JS が動いた）でだけ隠す。JS が無ければ全部見える。
+ * 遅れは style="--d: .4s" で付ける（入るときだけ効く）。
+ * ============================================================ */
+[data-motion] [data-at] {
+  transition:
+    opacity 0.4s var(--tako-ease),
+    transform 0.5s var(--tako-ease),
+    flex-grow 0.55s var(--tako-ease),
+    grid-template-rows 0.45s var(--tako-ease),
+    margin 0.55s var(--tako-ease),
+    border-width 0.55s var(--tako-ease),
+    background-color 0.3s var(--tako-ease-soft),
+    border-color 0.3s var(--tako-ease-soft),
+    color 0.3s var(--tako-ease-soft);
+}
+[data-motion] [data-at]:not(.is-on) {
+  opacity: 0;
+  transform: translateY(6px);
+}
+[data-motion] [data-at].is-on {
+  transition-delay: var(--d, 0s);
+}
+
+/* 位置を変えない出し入れ */
+[data-motion] [data-at][data-fx~='fade']:not(.is-on) {
+  transform: none;
+}
+[data-motion] [data-at][data-fx~='pop']:not(.is-on) {
+  transform: scale(0.94);
+}
+[data-motion] [data-at][data-fx~='left']:not(.is-on) {
+  transform: translateX(-14px);
+}
+[data-motion] [data-at][data-fx~='right']:not(.is-on) {
+  transform: translateX(14px);
+}
+[data-motion] [data-at][data-fx~='down']:not(.is-on) {
+  transform: translateY(-10px);
+}
+
+/* 状態の切り替え（隠さない）。.is-on の間の見た目は部品側が決める。
+ * mark = 押された / 選ばれた輪（tako-ui.css）、state = 部品ごとの「選択中」などの姿 */
+[data-motion] [data-at][data-fx~='mark']:not(.is-on),
+[data-motion] [data-at][data-fx~='state']:not(.is-on) {
+  opacity: 1;
+  transform: none;
+}
+
+/* 打鍵: 文字数（--n）の段で左から開く。隠れているときは幅を保ったまま切り取る */
+[data-motion] [data-at][data-fx~='type'] {
+  display: inline-block;
+  white-space: pre;
+  opacity: 1;
+  transform: none;
+  clip-path: inset(0 100% 0 0);
+}
+[data-motion] [data-at][data-fx~='type'].is-on {
+  animation: tk-type calc(var(--n, 16) * 38ms + 120ms) steps(var(--n, 16), end) var(--d, 0s) forwards;
+}
+@keyframes tk-type {
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+/* 動かさないときは打ち終わった姿で見せる（アニメーションを止めると切り取りが残るため） */
+.tk-scrolly.is-static [data-at][data-fx~='type'].is-on {
+  clip-path: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-motion] [data-at][data-fx~='type'].is-on {
+    animation: none;
+    clip-path: none;
+  }
+}
+
+/* 縦に開く（隠れている間は高さを取らない）。中身は子要素 1 つに包む */
+[data-motion] [data-at][data-fx~='unfold'] {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+[data-motion] [data-at][data-fx~='unfold']:not(.is-on) {
+  grid-template-rows: 0fr;
+  transform: none;
+}
+[data-fx~='unfold'] > * {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ペインの分割: 隠れている間は幅（縦分割なら高さ）0 で、出ると伸びる */
+[data-motion] .tk-split > [data-at][data-fx~='split']:not(.is-on) {
+  flex-grow: 0;
+  flex-basis: 0;
+  border-width: 0;
+  margin-inline-start: calc(var(--tk-gap, 4px) * -1);
+  transform: none;
+  overflow: hidden;
+}
+[data-motion] .tk-split.is-col > [data-at][data-fx~='split']:not(.is-on) {
+  margin-inline-start: 0;
+  margin-block-start: calc(var(--tk-gap, 4px) * -1);
+}
+
+/* ============================================================
+ * 打つコマンド 1 行（Cmd.astro）
+ * ============================================================ */
+.tk-cmd {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: 100%;
+  margin: 0.6rem 0;
+  padding: 0.35rem 0.4rem 0.35rem 0.85rem;
+  border-radius: var(--tako-radius-md);
+  background: var(--tako-term-bg);
+  border: 1px solid rgb(0 0 0 / 0.3);
+}
+.tk-cmd-text {
+  font-variant-ligatures: none;
+  flex: 1;
+  min-width: 0;
+  font-family: var(--sl-font-mono);
+  font-size: 0.86rem;
+  line-height: 1.6;
+  color: var(--tako-term-cmd) !important;
+  background: none !important;
+  padding: 0 !important;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tk-cmd-prompt {
+  color: var(--tako-term-prompt);
+  margin-right: 0.6em;
+  user-select: none;
+}
+.tk-cmd-copy {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 2rem;
+  padding: 0 0.65rem;
+  border-radius: var(--tako-radius-sm);
+  border: 1px solid rgb(255 255 255 / 0.14);
+  background: rgb(255 255 255 / 0.06);
+  color: var(--tako-term-fg);
+  font: 600 0.78rem var(--sl-font);
+  cursor: pointer;
+  transition: background-color 0.15s var(--tako-ease-soft), border-color 0.15s var(--tako-ease-soft);
+}
+.tk-cmd-copy:hover {
+  background: rgb(255 255 255 / 0.12);
+  border-color: rgb(255 255 255 / 0.28);
+}
+.tk-cmd-copy svg {
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+/* ============================================================
+ * 自動再生の器（ヒーロー）
+ * ============================================================ */
+.tk-autoplay {
+  position: relative;
+}

@@ -1,0 +1,34 @@
+---
+/**
+ * Windows の SmartScreen（「Windows によって PC が保護されました」）の再現。
+ * 署名していない配布物を初めて開いたときに出ることがある。detailAt の手順で
+ * 「詳細情報」を押した後の姿（アプリ名と「実行」ボタン）に切り替わる。
+ */
+interface Props {
+	detailAt?: string;
+	/** ファイル名（版は伏せる） */
+	file?: string;
+	height?: number;
+	class?: string;
+}
+
+const { detailAt = '2+', file = 'tako-vX.Y.Z-windows-x86_64.exe', height = 20, class: className } = Astro.props;
+---
+
+<div class:list={['tk-ui', 'tk-frame', className]}>
+	<div class="tk-dialog-host" style={`--h: ${height}em`}>
+		<div class="tk-smartscreen">
+			<div class="tk-smartscreen-title">Windows によって PC が保護されました</div>
+			<p>Microsoft Defender SmartScreen は認識されないアプリの起動を停止しました。このアプリを実行すると、PC に問題が起こる可能性があります。</p>
+			<div class="tk-stack">
+				<span class="tk-ss-link" data-at={`!${detailAt}`} data-fx="fade">詳細情報</span>
+				<span class="tk-ss-detail" data-at={detailAt} data-fx="fade">アプリ: {file}<br />発行元: 不明な発行元</span>
+			</div>
+			<div class="tk-ss-btns">
+				<span class="tk-ss-btn is-run" data-at={detailAt} data-fx="pop">実行</span>
+				<span class="tk-ss-btn">実行しない</span>
+			</div>
+		</div>
+	</div>
+	<slot name="overlay" />
+</div>

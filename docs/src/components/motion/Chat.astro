@@ -1,0 +1,51 @@
+---
+/**
+ * かんたん表示（GUI モード）のチャットビューの再現。Pane の中に置く。
+ * 吹き出しは子に書く: <div class="tk-bubble is-user">…</div> / <div class="tk-bubble">…</div>
+ * 入力欄に文字を打ち込む演出は typed と typedAt（data-at の書き方）。
+ */
+import Icon from './Icon.astro';
+
+interface Props {
+	typed?: string;
+	typedAt?: string;
+	/** 下のショートカット（会話を軽くする / 新しい会話 / ヘルプ）を出すか */
+	chips?: boolean;
+}
+
+const { typed, typedAt, chips = true } = Astro.props;
+const placeholder = 'やってほしいことを書いてください';
+---
+
+<div class="tk-chat">
+	<div class="tk-chat-log"><slot /></div>
+	<div class="tk-chat-input">
+		<span class="tk-acc">❯</span>
+		<span class="tk-grow">
+			{
+				typed ? (
+					<span class="tk-stack">
+						<span data-at={typedAt ? `!${typedAt}` : undefined} data-fx="fade">
+							{placeholder}
+						</span>
+						<span class="tk-typed" data-at={typedAt} data-fx="type">
+							{typed}
+						</span>
+					</span>
+				) : (
+					placeholder
+				)
+			}
+		</span>
+		<Icon name="arrowUp" />
+	</div>
+	{
+		chips && (
+			<div class="tk-chat-chips">
+				<span>会話を軽くする /compact</span>
+				<span>新しい会話 /clear</span>
+				<span>ヘルプ /help</span>
+			</div>
+		)
+	}
+</div>

@@ -1,0 +1,64 @@
+---
+/**
+ * 左サイドバー（ファイルツリー）の再現。TakoWindow の slot="sidebar" に置く。
+ * 窓の幅が狭いときは自動で隠れる。
+ */
+import Icon from './Icon.astro';
+
+interface Item {
+	name: string;
+	dir?: boolean;
+	depth?: number;
+	/** 強調（選択中の行） */
+	hit?: boolean;
+}
+
+interface Props {
+	project?: string;
+	branch?: string;
+	path?: string;
+	items?: Item[];
+	/** 下端の git の要約（空文字で出さない） */
+	foot?: string;
+}
+
+const {
+	project = 'my-app',
+	branch = 'main',
+	path = '~/my-app',
+	items = [
+		{ name: 'docs', dir: true },
+		{ name: 'src', dir: true },
+		{ name: 'package.json' },
+		{ name: 'README.md' },
+	],
+	foot = '1 modified',
+} = Astro.props;
+---
+
+<div class="tk-side">
+	<div class="tk-side-head">
+		<Icon name="folder" />
+		{project}
+		<span class="tk-branch"><Icon name="branch" />{branch}</span>
+	</div>
+	<div class="tk-side-path">{path}</div>
+	<div class="tk-tree">
+		<div class="tk-tree-row"><Icon name="chevronDown" /><Icon name="folder" />{project}</div>
+		{
+			items.map((it) => (
+				<div class:list={['tk-tree-row', { 'is-file': !it.dir, 'is-hit': it.hit }]} style={`--depth: ${(it.depth ?? 0) + 1}`}>
+					<Icon name={it.dir ? 'folder' : 'file'} />
+					{it.name}
+				</div>
+			))
+		}
+	</div>
+	{
+		foot && (
+			<div class="tk-side-foot">
+				<b>{foot}</b> <span class="tk-ok">+3</span> <span class="tk-err">-0</span>
+			</div>
+		)
+	}
+</div>

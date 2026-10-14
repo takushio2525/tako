@@ -1,0 +1,27 @@
+---
+/**
+ * かんたん表示（GUI モード）で空のペインに出るスターターの再現。
+ * 文言は crates/tako-app/src/ui_text/ui_mode.rs。Pane の中に置く。
+ */
+import Icon from './Icon.astro';
+---
+
+<div class="tk-starter">
+	<span class="tk-starter-q">何をしますか？</span>
+	<span class="tk-starter-sub">ボタンを押すと、この画面で AI が動き始めます</span>
+	<span class="tk-starter-card is-lead">
+		<span class="tk-starter-ic"><Icon name="orch" /></span>
+		<span><b>AI チームに任せる</b><small>tako master</small></span>
+		<span>司令塔の AI が話を聞いて、必要なだけ担当 AI を集めて進めます</span>
+	</span>
+	<span class="tk-starter-card">
+		<span class="tk-starter-ic"><Icon name="chat" /></span>
+		<span><b>AI と 1 対 1 で話す</b><small>tako solo</small></span>
+		<span>1 体の AI とじっくり相談したいときはこちら</span>
+	</span>
+	<span class="tk-starter-card">
+		<span class="tk-starter-ic"><Icon name="terminal" /></span>
+		<span><b>コマンド入力へ</b></span>
+		<span>この画面をターミナル表示に戻します（何も止まりません）</span>
+	</span>
+</div>

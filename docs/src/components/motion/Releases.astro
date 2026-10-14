@@ -1,0 +1,53 @@
+---
+/**
+ * ブラウザで開いた GitHub Releases のダウンロード表の再現（入手の場面用）。
+ * 配布物の名前は .agent/conventions.md「リリース配布物の命名規約」の形（版は X.Y.Z で伏せる）。
+ * highlight で強調する行と、その手順（data-at の書き方）を選ぶ。
+ */
+import Icon from './Icon.astro';
+
+type Asset = 'mac' | 'win-exe' | 'win-zip';
+interface Props {
+	highlight?: Asset;
+	highlightAt?: string;
+	height?: number;
+	class?: string;
+}
+
+const { highlight, highlightAt, height = 20, class: className } = Astro.props;
+const assets: { id: Asset; name: string }[] = [
+	{ id: 'mac', name: 'tako-vX.Y.Z-macos-arm64.zip' },
+	{ id: 'win-exe', name: 'tako-vX.Y.Z-windows-x86_64.exe' },
+	{ id: 'win-zip', name: 'tako-vX.Y.Z-windows-x86_64.zip' },
+];
+---
+
+<div class:list={['tk-ui', 'tk-frame', className]}>
+	<div class="tk-browser" style={`--h: ${height}em`}>
+		<div class="tk-browser-bar">
+			<span class="tk-lights">
+				<i />
+				<i />
+				<i />
+			</span>
+			<span class="tk-url"><Icon name="lock" />github.com/takushio2525/tako/releases</span>
+		</div>
+		<div class="tk-browser-body">
+			<div class="tk-rel-title">tako vX.Y.Z <span class="tk-rel-latest">Latest</span></div>
+			<div class="tk-rel-sub">macOS と Windows の配布物が同じリリースに並びます</div>
+			<div class="tk-assets">
+				<div class="tk-assets-head">Assets</div>
+				{
+					assets.map((a) => (
+						<div class="tk-asset">
+							{a.id === highlight && <span class="tk-asset-hl" data-at={highlightAt} data-fx="fade" />}
+							<Icon name="package" />
+							<span style="position:relative">{a.name}</span>
+						</div>
+					))
+				}
+			</div>
+		</div>
+	</div>
+	<slot name="overlay" />
+</div>
