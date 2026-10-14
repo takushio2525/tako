@@ -2922,6 +2922,10 @@ struct TakoApp {
     recovered_count: usize,
     /// ペインの平文ログ管理（Issue #112 B）
     pane_logs: std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    /// 器のペインの取り込みの間合い（#2018。どの tick で tmux を起こすかを決める）
+    pane_log_pace: HashMap<PaneId, tako_core::pane_log::BackendPace>,
+    /// 器の kill を待っているクローズフラッシュ（#2018。`drop_backend_session` が消費する）
+    pane_log_close_pending: HashMap<PaneId, PendingPaneLogClose>,
     /// 自動保存が必要なプレビューペイン（デバウンスタイマーで消費。#195）
     autosave_pending: std::collections::HashSet<PaneId>,
     /// タブバーの横スクロール（Issue #208。GPUI ScrollHandle で位置を制御）
@@ -3008,8 +3012,10 @@ struct PaneLogJob {
     pane: PaneId,
     session: String,
     meta: tako_core::pane_log::PaneLogMeta,
-    last_history: usize,
-    last_bytes: u64,
+    /// 1 回に読む行数の上限（#2018。前回の取り込みからの経過で伸びる）
+    budget: usize,
+    /// 前回の取り込みの後に出力があった（#2018。probe と同じ tmux の起動で履歴の末尾も読む）
+    output: bool,
 }
 
 /// ペインログのクローズフラッシュ素材（close 前に UI で採取する）
@@ -3018,6 +3024,124 @@ struct PaneLogCloseData {
     visible: Vec<String>,
     /// 直接ペインの最終履歴増分（取り込み行, delta, 現在履歴行数）
     catch_up: Option<(Vec<String>, usize, usize)>,
+    /// 器のペインの最後の増分の取り込み（#2018。器のセッション名と読む行数の上限）。
+    /// 器を kill する直前に background で取り込んでから可視画面とマーカーを書く
+    backend_catch_up: Option<(String, usize)>,
+}
+
+/// 器の kill を待っているクローズフラッシュ（#2018）。`drop_backend_session` が
+/// kill のスレッドへ持ち込み、最後の増分 → 可視画面 → マーカーの順に書いてから kill する
+struct PendingPaneLogClose {
+    data: PaneLogCloseData,
+    origin: CloseOrigin,
+    caller: Option<String>,
+}
+
+/// 器のペインの取り込み（probe → capture → 反映）を 1 本ずつに並べる錠（#2018）。
+///
+/// 2 秒ポーリングの取り込みと、閉じる直前の取り込み（kill のスレッド）が同じペインの
+/// 同じ増分を同時に読むと、両方が反映して行が重複する。**UI スレッドはこの錠を取らない**
+/// （取るのは background とスレッドだけ。マネージャーの錠とは別なので UI の追記を待たせない）
+static PANE_LOG_BACKEND_INGEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_pane_log(
+    manager: &std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+) -> std::sync::MutexGuard<'_, tako_core::pane_log::PaneLogManager> {
+    manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 取り込みの基準（前回の行数・バイト数・取り込み済みの末尾）。閉じたペインは None。
+/// 基準はここでマネージャーから読む = 閉じる直前の取り込みや前の tick が進めた基準を使う
+/// （[`PANE_LOG_BACKEND_INGEST`] の内側で呼ぶこと）
+fn backend_baseline(
+    manager: &std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    pane: PaneId,
+) -> Option<(usize, u64, Vec<String>)> {
+    let mgr = lock_pane_log(manager);
+    if mgr.is_closed(pane.as_u64()) {
+        return None;
+    }
+    let (history, bytes) = mgr.scan_baseline(pane.as_u64()).unwrap_or((0, 0));
+    Some((history, bytes, mgr.anchor_of(pane.as_u64())))
+}
+
+/// 器のペイン 1 枚の観測を取り込む（probe の値から増分を capture して反映）。
+/// 読む範囲と観測の作り方は tako-core（`plan_backend_capture` / `backend_observation`）の
+/// 1 実装で、ここは tmux を起こすだけ。`read` は probe と同じ tmux の起動で読んだ履歴の末尾
+/// （足りていればそれを使い、足りなければ読み直す）
+fn ingest_backend_probe(
+    manager: &std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    socket: &str,
+    job: &PaneLogJob,
+    probe: tako_core::tmux::PaneLogProbe,
+    read: Option<Vec<String>>,
+) {
+    use tako_core::pane_log::{backend_observation, issue2018_legacy, plan_backend_capture};
+    let Some((last_history, last_bytes, anchor)) = backend_baseline(manager, job.pane) else {
+        return;
+    };
+    let plan = plan_backend_capture(
+        &probe,
+        last_history,
+        last_bytes,
+        job.budget,
+        issue2018_legacy(),
+    );
+    let want = plan.lines_to_read();
+    // 先読みは `budget + ALIGN_MARGIN` 行。履歴がそれより短ければ全部が返っている
+    let enough = |lines: &Vec<String>| lines.len() >= want.min(probe.history);
+    let hist = match read.filter(enough) {
+        Some(lines) => lines,
+        None => match tako_core::tmux::capture_history_plain(Some(socket), &job.session, want) {
+            Some(lines) => lines,
+            None => return,
+        },
+    };
+    lock_pane_log(manager).apply(
+        job.pane.as_u64(),
+        &job.meta,
+        backend_observation(&probe, plan, &anchor, hist),
+    );
+}
+
+/// 閉じる直前の器のペインから、最後の増分を取り込み、画面の行を返す（#2018）。
+///
+/// 「履歴の増分 + 画面」を `capture-pane` の 1 回で読むので、UI で採った画面と後から読んだ
+/// 履歴が時間差で重ならない。器がもう居ない・読めないなら None（呼び手は UI の画面で書く）
+fn catch_up_backend_close(
+    manager: &std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    socket: &str,
+    pane: PaneId,
+    session: &str,
+    meta: &tako_core::pane_log::PaneLogMeta,
+    budget: usize,
+) -> Option<Vec<String>> {
+    use tako_core::pane_log::{
+        backend_observation, plan_backend_capture, BackendCapture, ALIGN_MARGIN,
+    };
+    let (probe, height) = tako_core::tmux::pane_log_probe_screen(Some(socket), session)?;
+    let (last_history, last_bytes, anchor) = backend_baseline(manager, pane)?;
+    let plan = match plan_backend_capture(&probe, last_history, last_bytes, budget, false) {
+        // 増分が無くても、probe の後に伸びた行を揃えで拾う
+        BackendCapture::Skip if probe.history >= last_history => BackendCapture::Counted {
+            delta: 0,
+            take: 0,
+            margin: ALIGN_MARGIN,
+        },
+        plan => plan,
+    };
+    let mut lines =
+        tako_core::tmux::capture_scrollback_plain(Some(socket), session, plan.lines_to_read())
+            .ok()?;
+    let screen = lines.split_off(lines.len().checked_sub(height)?);
+    lock_pane_log(manager).apply(
+        pane.as_u64(),
+        meta,
+        backend_observation(&probe, plan, &anchor, lines),
+    );
+    Some(screen)
 }
 
 /// バックエンドペインのペインログ取り込み本体（Issue #112 B。background で実行）。
@@ -3027,56 +3151,71 @@ fn process_pane_log_jobs(
     socket: &str,
     jobs: Vec<PaneLogJob>,
 ) {
-    use tako_core::pane_log::{ChunkKind, PaneObservation, CAPTURE_CHUNK};
+    let _serial = PANE_LOG_BACKEND_INGEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // #2018: 出力のあったペインの履歴を probe と同じ 1 回の tmux で読む（本物の tmux だけ。
+    // psmux は複合コマンドの後半を捨てる）。セッションが消えていた等で失敗したら別々に読む
+    if cfg!(unix) && !tako_core::pane_log::issue2018_legacy() {
+        let reads: Vec<(&str, usize)> = jobs
+            .iter()
+            .filter(|job| job.output)
+            .map(|job| {
+                (
+                    job.session.as_str(),
+                    job.budget + tako_core::pane_log::ALIGN_MARGIN,
+                )
+            })
+            .collect();
+        if let Ok(mut read) = tako_core::tmux::pane_log_probe_and_capture(Some(socket), &reads) {
+            read.captures.reverse();
+            for job in jobs {
+                let captured = job.output.then(|| read.captures.pop()).flatten();
+                let Some(probe) = read.probes.get(&job.session).copied() else {
+                    continue;
+                };
+                ingest_backend_probe(manager, socket, &job, probe, captured);
+            }
+            return;
+        }
+    }
     // #369: ペイン毎の display-message N 回を list-panes -a 1 回に削減
     let probes = tako_core::tmux::pane_log_probe_batch(Some(socket));
     for job in jobs {
         let Some(probe) = probes.get(&job.session).copied() else {
             continue;
         };
-        let chunk = if probe.history < job.last_history {
-            ChunkKind::None
-        } else {
-            let delta = probe.history - job.last_history;
-            if delta > 0 {
-                let take = delta.min(CAPTURE_CHUNK);
-                match tako_core::tmux::capture_history_plain(Some(socket), &job.session, take) {
-                    Some(lines) => ChunkKind::Counted { lines, delta },
-                    None => continue,
-                }
-            } else if probe.history >= probe.limit
-                && !probe.alternate
-                && probe.bytes != job.last_bytes
-            {
-                // 履歴が history-limit で飽和するとカウンタが増えない。バイト数の変化を
-                // 合図に末尾チャンクを取り、取り込み済み tail と照合して新規行だけ追記する
-                match tako_core::tmux::capture_history_plain(
-                    Some(socket),
-                    &job.session,
-                    CAPTURE_CHUNK,
-                ) {
-                    Some(captured) => ChunkKind::Overlap { captured },
-                    None => continue,
-                }
-            } else {
-                ChunkKind::None
-            }
-        };
-        let mut mgr = manager
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        mgr.apply(
-            job.pane.as_u64(),
-            &job.meta,
-            PaneObservation {
-                history: probe.history,
-                history_limit: probe.limit,
-                bytes: probe.bytes,
-                alt_screen: probe.alternate,
-                chunk,
-            },
-        );
+        ingest_backend_probe(manager, socket, &job, probe, None);
     }
+}
+
+/// 器のペインのクローズフラッシュ（#2018。kill のスレッドで kill の直前に呼ぶ）。
+///
+/// 最後の取り込みから閉じるまでに履歴へ落ちた行を取り込み、器の画面とマーカーを書く。
+/// 器がもう居ない（probe が空振り）なら修正前と同じく UI で採った画面とマーカーだけ
+fn finish_backend_pane_log_close(
+    manager: &std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    socket: &str,
+    pane: PaneId,
+    close: PendingPaneLogClose,
+) {
+    let _serial = PANE_LOG_BACKEND_INGEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let data = close.data;
+    let screen = data
+        .backend_catch_up
+        .as_ref()
+        .and_then(|(session, budget)| {
+            catch_up_backend_close(manager, socket, pane, session, &data.meta, *budget)
+        });
+    lock_pane_log(manager).flush_close(
+        pane.as_u64(),
+        &data.meta,
+        screen.as_deref().unwrap_or(&data.visible),
+        close.origin,
+        close.caller.as_deref(),
+    );
 }
 
 /// Markdown プレビュー内リンク 1 件の当たり判定（#680）。
@@ -4883,6 +5022,8 @@ impl TakoApp {
                     tako_control::settings::load().pane_log_config(),
                 ),
             )),
+            pane_log_pace: HashMap::new(),
+            pane_log_close_pending: HashMap::new(),
             autosave_pending: std::collections::HashSet::new(),
             tab_scroll_handle: gpui::ScrollHandle::new(),
             last_active_tab: None,
@@ -5776,9 +5917,15 @@ impl TakoApp {
                 // Node 起動をスキップする（~10ms で判定、Node 起動 200ms を回避）。
                 // #2017: mod の報告が答えていないペインだけでも同じ判定をする（1 回の採取で両方）
                 let guard_pids: Vec<u32> = pane_pids.iter().map(|(_, pid)| *pid).collect();
-                let (has_children, scan_needed) = {
+                // #2018: ガード・`claude agents` の走査・codex / agy の会話 ID の採取を
+                // **1 回の採取**（器の一覧 `tmux list-panes -a` + 親子表）で済ませる。
+                // 3 つの background に分かれていた頃は、器の一覧を 1 回の走査につき 3 回
+                // 起こしていた（器に動いている子が居る間は 30 秒ごと）。A/B は分けたまま
+                let shared = !tako_core::pane_log::issue2018_legacy();
+                let (has_children, scan_needed, prefetched) = {
                     let scan_backends = scan_backends.clone();
-                    let scan_guard: Vec<u32> = scan_pids.iter().map(|(_, pid)| *pid).collect();
+                    let scan_pids = scan_pids.clone();
+                    let probes = probes.clone();
                     cx.background_executor()
                         .spawn(async move {
                             tako_control::agents::with_shared_scan(|| {
@@ -5787,6 +5934,8 @@ impl TakoApp {
                                     &refs,
                                     &guard_pids,
                                 );
+                                let scan_guard: Vec<u32> =
+                                    scan_pids.iter().map(|(_, pid)| *pid).collect();
                                 let refs: Vec<&str> =
                                     scan_backends.iter().map(|s| s.as_str()).collect();
                                 let scan = any
@@ -5795,10 +5944,29 @@ impl TakoApp {
                                         &refs,
                                         &scan_guard,
                                     );
-                                (any, scan)
+                                let prefetched = (shared && any).then(|| {
+                                    let agents = scan.then(|| {
+                                        tako_control::agents::list_agents_for_scan_scoped(
+                                            &scan_backends,
+                                            &scan_pids,
+                                        )
+                                    });
+                                    let snap = tako_control::agents::ProcessSnapshot::capture();
+                                    (
+                                        agents,
+                                        tako_control::agent_resume::detect_resume_ids(
+                                            &probes, &snap,
+                                        ),
+                                    )
+                                });
+                                (any, scan, prefetched)
                             })
                         })
                         .await
+                };
+                let (prefetched_agents, prefetched_ids) = match prefetched {
+                    Some((agents, ids)) => (agents, Some(ids)),
+                    None => (None, None),
                 };
                 if !has_children {
                     last_scan = Some(std::time::Instant::now());
@@ -5826,15 +5994,19 @@ impl TakoApp {
                 // 起こすのもそこに claude が居るアカウントだけ（台帳で絞る）
                 let scanned = match scan_needed {
                     true => {
-                        let agents_value = cx
-                            .background_executor()
-                            .spawn(async move {
-                                tako_control::agents::list_agents_for_scan_scoped(
-                                    &scan_backends,
-                                    &scan_pids,
-                                )
-                            })
-                            .await;
+                        let agents_value = match prefetched_agents {
+                            Some(agents_value) => agents_value,
+                            None => {
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        tako_control::agents::list_agents_for_scan_scoped(
+                                            &scan_backends,
+                                            &scan_pids,
+                                        )
+                                    })
+                                    .await
+                            }
+                        };
                         let Ok(agents_value) = agents_value else {
                             last_scan = Some(std::time::Instant::now());
                             continue;
@@ -5848,13 +6020,17 @@ impl TakoApp {
                 // codex / agy の会話 ID（#1238）。**プロセス表 1 枚 + agent ペインぶんの
                 // `lsof`** で済み、claude の検出（Node 起動）に比べれば桁が小さい。
                 // background で採るのは `lsof` を UI スレッドで起こさないため
-                let detected_agents = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let snap = tako_control::agents::ProcessSnapshot::capture();
-                        tako_control::agent_resume::detect_resume_ids(&probes, &snap)
-                    })
-                    .await;
+                let detected_agents = match prefetched_ids {
+                    Some(ids) => ids,
+                    None => {
+                        cx.background_executor()
+                            .spawn(async move {
+                                let snap = tako_control::agents::ProcessSnapshot::capture();
+                                tako_control::agent_resume::detect_resume_ids(&probes, &snap)
+                            })
+                            .await
+                    }
+                };
                 let pane_meta = this.update(cx, |app: &mut TakoApp, _| {
                     app.apply_claude_resume_sessions(&detected);
                     app.apply_agent_resume_sessions(&detected_agents);
@@ -6353,24 +6529,32 @@ impl TakoApp {
                             // （プロセスは起こさないので ProcessSnapshot は要らない）
                             let transcript_ctx =
                                 transcript_ctx_scan.as_deref().map(crate::handoff_ctx::scan);
+                            // #2018: スナップショットを採った tick は、間引いていた側の走査も
+                            // それで済ませる（追加の子プロセスは無い）。こうすると両方の保険の
+                            // 60 秒が揃い、器の一覧（`tmux list-panes -a`）を別々の tick で
+                            // 2 回起こさなくなる。A/B は修正前どおり要る側だけ
+                            let share =
+                                snapshot.is_some() && !tako_core::pane_log::issue2018_legacy();
+                            let ssh_share = share && !ssh_targets.is_empty();
                             let ssh_state = tako_control::ssh_detect::scan(
                                 &ssh_prev,
                                 ssh_targets,
-                                snapshot.as_ref().filter(|_| rescan_ssh),
+                                snapshot.as_ref().filter(|_| rescan_ssh || ssh_share),
                                 now,
                             );
-                            let running_state = if rescan_running {
-                                tako_control::agents::scan_running_children(
-                                    running_targets,
-                                    sleep_guard_active,
-                                    now,
-                                    snapshot.as_ref(),
-                                )
-                            } else {
-                                let mut state = running_prev;
-                                state.sleep_guard_active = sleep_guard_active;
-                                state
-                            };
+                            let running_state =
+                                if rescan_running || (share && !running_targets.is_empty()) {
+                                    tako_control::agents::scan_running_children(
+                                        running_targets,
+                                        sleep_guard_active,
+                                        now,
+                                        snapshot.as_ref(),
+                                    )
+                                } else {
+                                    let mut state = running_prev;
+                                    state.sleep_guard_active = sleep_guard_active;
+                                    state
+                                };
                             let stale_outcome = stale_binary_scan.map(|(targets, prev)| {
                                 tako_control::stale_binary::poll_with_snapshot(
                                     targets,
@@ -10925,6 +11109,9 @@ impl TakoApp {
     /// 明示 close が消したのか」を事後に切り分ける材料が一切残らなかった
     fn drop_backend_session(&mut self, pane_id: PaneId, origin: CloseOrigin, caller: Option<&str>) {
         self.drop_backend_reattach(pane_id);
+        // #2018: 預かったクローズフラッシュは kill のスレッドへ持ち込み、kill の直前に
+        // 最後の増分を取り込んでから書く（器が消えた後では履歴を読めない）
+        let pending_log = self.pane_log_close_pending.remove(&pane_id);
         if let Some(name) = self.backend_sessions.remove(&pane_id) {
             if !self.secondary {
                 persist_diag(&format!(
@@ -10934,7 +11121,15 @@ impl TakoApp {
                 ));
             }
             let socket = tako_core::tmux_backend::socket_name();
-            std::thread::spawn(move || tako_core::tmux_backend::kill_session(&socket, &name));
+            let logs = self.pane_logs.clone();
+            std::thread::spawn(move || {
+                if let Some(close) = pending_log {
+                    finish_backend_pane_log_close(&logs, &socket, pane_id, close);
+                }
+                tako_core::tmux_backend::kill_session(&socket, &name)
+            });
+        } else if let Some(close) = pending_log {
+            self.flush_pane_log_close_now(pane_id, close);
         }
     }
 
@@ -12015,31 +12210,27 @@ impl TakoApp {
     /// ペインログの 1 tick 分の走査（Issue #112 B。2 秒ポーリングから呼ばれる）。
     /// 直接ペインは Term のメモリ読みでここで取り込み、tmux バックエンドペインは
     /// capture（サブプロセス）が要るため background 用のジョブとして返す
-    fn collect_pane_log_work(&self) -> Vec<PaneLogJob> {
+    fn collect_pane_log_work(&mut self) -> Vec<PaneLogJob> {
         if self.secondary {
             return Vec::new();
         }
+        // #2018: 器の kill を通らずに取り残されたクローズフラッシュ（起こり得ないはず）は
+        // ここで書く（マーカーが永久に書かれないより、最後の増分を諦めて書くほうがよい）
+        for (pane, close) in std::mem::take(&mut self.pane_log_close_pending) {
+            self.flush_pane_log_close_now(pane, close);
+        }
+        let jobs = self.backend_pane_log_jobs();
         use tako_core::pane_log::{ChunkKind, PaneObservation, CAPTURE_CHUNK};
-        let mut jobs = Vec::new();
         let mut mgr = self.pane_logs_lock();
         for (pane_id, session) in &self.terminals {
-            // TmuxOpen ビューペイン（外部セッションの attach クライアント）は対象外
-            if self.tmux_view_panes.contains_key(pane_id) {
+            // TmuxOpen ビューペイン（外部セッションの attach クライアント）は対象外。
+            // 器のペインは上の `backend_pane_log_jobs` が background のジョブにした
+            if self.tmux_view_panes.contains_key(pane_id)
+                || self.backend_sessions.contains_key(pane_id)
+            {
                 continue;
             }
             let meta = self.pane_log_meta(*pane_id);
-            if let Some(backend) = self.backend_sessions.get(pane_id) {
-                let (last_history, last_bytes) =
-                    mgr.scan_baseline(pane_id.as_u64()).unwrap_or((0, 0));
-                jobs.push(PaneLogJob {
-                    pane: *pane_id,
-                    session: backend.clone(),
-                    meta,
-                    last_history,
-                    last_bytes,
-                });
-                continue;
-            }
             // 直接ペイン: alacritty history の増分をメモリ読みで取り込む
             let history = session.history_size();
             let limit = session.scrollback_limit();
@@ -12079,6 +12270,66 @@ impl TakoApp {
         jobs
     }
 
+    /// 器のペインのうち、この tick で取り込むものをジョブにする（#2018。メモリ操作だけ）。
+    ///
+    /// 器の取り込みは tmux の子プロセスを起こすので、毎 tick ではなく
+    /// [`tako_core::pane_log::BackendPace`] が決めた tick だけ行う。出力の合図は
+    /// ペインの PTY（= 器の attach クライアント）から届いた Wakeup の回数で、
+    /// 画面に出ていないペインの分（`skipped`）も数える
+    fn backend_pane_log_jobs(&mut self) -> Vec<PaneLogJob> {
+        let legacy = tako_core::pane_log::issue2018_legacy();
+        let now = std::time::Instant::now();
+        let backend_sessions = &self.backend_sessions;
+        self.pane_log_pace
+            .retain(|pane, _| backend_sessions.contains_key(pane));
+        let mut jobs = Vec::new();
+        // 出力の無い器（この tick は見送り）。他の器の取り込みがあれば相乗りで確かめる
+        let mut riders: Vec<(PaneId, &String)> = Vec::new();
+        for (pane_id, backend) in &self.backend_sessions {
+            // TmuxOpen ビューペイン（外部セッションの attach クライアント）は対象外
+            if !self.terminals.contains_key(pane_id) || self.tmux_view_panes.contains_key(pane_id) {
+                continue;
+            }
+            // 配送の記録が無いペイン（起こり得ないはず）は合図なし = 保険の間隔で見る
+            let activity = self.pane_delivery.get(pane_id).map_or(u64::MAX, |d| {
+                d.hops
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(d.skipped.load(std::sync::atomic::Ordering::Relaxed))
+            });
+            let pace = self.pane_log_pace.entry(*pane_id).or_default();
+            let Some(due) = pace.decide(activity, now, legacy) else {
+                riders.push((*pane_id, backend));
+                continue;
+            };
+            jobs.push(PaneLogJob {
+                pane: *pane_id,
+                session: backend.clone(),
+                meta: self.pane_log_meta(*pane_id),
+                budget: due.budget,
+                output: due.output,
+            });
+        }
+        if !jobs.is_empty() {
+            for (pane_id, backend) in riders {
+                let Some(due) = self
+                    .pane_log_pace
+                    .get_mut(&pane_id)
+                    .and_then(|pace| pace.ride_along(now, legacy))
+                else {
+                    continue;
+                };
+                jobs.push(PaneLogJob {
+                    pane: pane_id,
+                    session: backend.clone(),
+                    meta: self.pane_log_meta(pane_id),
+                    budget: due.budget,
+                    output: due.output,
+                });
+            }
+        }
+        jobs
+    }
+
     /// クローズ前のペインログフラッシュ素材（メタ + 直接ペインの履歴取りこぼし + 可視画面）。
     /// ペイン内容が空でログ状態も無い場合は None（空ログファイルを作らない）
     fn pane_log_close_data(&self, pane: PaneId) -> Option<PaneLogCloseData> {
@@ -12106,21 +12357,75 @@ impl TakoApp {
                 (session.history_plain_lines(0, take), delta, history)
             })
         };
+        // #2018: 器のペインは最後の取り込みから閉じるまでの増分を、器を kill する直前に
+        // background で拾う（取り込みを間引いたぶん、ここで拾わないと最大 BUSY_INTERVAL
+        // ぶんの行が抜ける）。A/B の旧挙動は拾わない
+        let backend_catch_up = self
+            .backend_sessions
+            .get(&pane)
+            .filter(|_| !tako_core::pane_log::issue2018_legacy())
+            .map(|session| {
+                let budget = self
+                    .pane_log_pace
+                    .get(&pane)
+                    .map_or(tako_core::pane_log::CAPTURE_CHUNK, |pace| {
+                        pace.catch_up_budget(std::time::Instant::now())
+                    });
+                (session.clone(), budget)
+            });
         Some(PaneLogCloseData {
             meta: self.pane_log_meta(pane),
             visible,
             catch_up,
+            backend_catch_up,
         })
     }
 
     /// ペインログのクローズフラッシュ本体（`pane_log_close_data` と対）。
     /// 発生源つきで書くのは Issue #566（GUI × / cmd+W / CLI・MCP / プロセス終了の事後区別）
-    fn apply_pane_log_close(&self, pane: PaneId, data: PaneLogCloseData, reason: CloseReason) {
+    fn apply_pane_log_close(&mut self, pane: PaneId, data: PaneLogCloseData, reason: CloseReason) {
         self.apply_pane_log_close_from(pane, data, reason.origin(), None);
     }
 
-    /// 発生源（+ dispatch の呼び出し元 role）を明示するクローズフラッシュ（Issue #566）
+    /// 発生源（+ dispatch の呼び出し元 role）を明示するクローズフラッシュ（Issue #566）。
+    ///
+    /// #2018: 器を kill する閉じ方なら、ここでは書かずに `drop_backend_session` へ預ける
+    /// （kill のスレッドが最後の増分 → 可視画面 → マーカーの順に書いてから kill する）。
+    /// 器がもう居ない閉じ方（PTY 死亡）・器を残す閉じ方（アプリ終了）・終了処理中は
+    /// 修正前と同じくその場で書く
     fn apply_pane_log_close_from(
+        &mut self,
+        pane: PaneId,
+        data: PaneLogCloseData,
+        origin: CloseOrigin,
+        caller: Option<&str>,
+    ) {
+        let kills_vessel = !matches!(origin, CloseOrigin::ProcessExit | CloseOrigin::AppQuit)
+            && !self.quitting
+            && data.backend_catch_up.as_ref().map(|(s, _)| s.as_str())
+                == self.backend_sessions.get(&pane).map(String::as_str);
+        if data.backend_catch_up.is_some() && kills_vessel {
+            self.pane_log_close_pending.insert(
+                pane,
+                PendingPaneLogClose {
+                    data,
+                    origin,
+                    caller: caller.map(str::to_string),
+                },
+            );
+            return;
+        }
+        self.write_pane_log_close(pane, data, origin, caller);
+    }
+
+    /// 預けたクローズフラッシュを、最後の増分を取り込まずにその場で書く（#2018。
+    /// 器の登録が先に消えていた等、kill のスレッドへ持ち込めなかったとき）
+    fn flush_pane_log_close_now(&self, pane: PaneId, close: PendingPaneLogClose) {
+        self.write_pane_log_close(pane, close.data, close.origin, close.caller.as_deref());
+    }
+
+    /// クローズフラッシュをその場で書く（直接ペインの最終増分 → 可視画面 → マーカー）
+    fn write_pane_log_close(
         &self,
         pane: PaneId,
         data: PaneLogCloseData,

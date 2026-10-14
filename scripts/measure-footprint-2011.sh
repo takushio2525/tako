@@ -9,7 +9,9 @@
 #   - footprint（`footprint -j`）: 合計と、malloc / 描画（IOAccelerator・unmapped graphics・IOSurface）/
 #     その他の内訳。器のときは tmux のクライアント（tako-app の子）とサーバーも別に足す
 #   - アイドル CPU（`proc_pid_rusage` v6）: 本体と、回収済みの子プロセス（tako が起こした ps・tmux・
-#     ログインシェル等。`ps -o time` には出ない）・電力（ri_energy_nj）・wakeup
+#     ログインシェル等。`ps -o time` には出ない）・電力（ri_energy_nj）・wakeup。
+#     回収済みの子は出力中の区間も出す（`busy_child_cpu_pct`。器のペインログの取り込みの
+#     `tmux list-panes` / `capture-pane` はここに出る = #2018）
 #   - 描画回数（`tako redraw-limit`）: ペイン本体の描画 `body_renders` と出力起因の再描画の要求 `flushes`
 #   - 起動時間（起こしてから `tako list` が通るまで）・常駐スレッド数・子プロセス数
 #
@@ -29,6 +31,10 @@
 # 使い方: bash scripts/measure-footprint-2011.sh [シナリオ（既定 std）] [放置の秒（既定 60）]
 #   TAKO_FOOTPRINT_ENV="TAKO_2009_LEGACY=1"  起こす GUI へ足す env（A/B 用。空白区切り）
 #   TAKO_FOOTPRINT_OUT=<file>                結果の TSV を追記する先（既定は表示だけ）
+#   TAKO_FOOTPRINT_STUB_CLAUDE=1             GUI の PATH の先頭へ「即座に [] を返す claude」を置く（#2018）。
+#                                            隔離 HOME には claude の台帳が無く #2017 の絞り込みが効かないので、
+#                                            器に子が居ると 30 秒ごとに `claude agents --json`（Node）が起き、
+#                                            回収済みの子の CPU の大半を占める。tmux の取り込みだけを比べるときに使う
 #
 # **蓋を閉じた機・画面ロック中はフレームが組まれない**（memory: lid-closed-no-frames）。出力の
 #   `描画` 欄が「なし」の行は描画の CPU・回数・描画の資源を含まない（未実測と読む）。
@@ -42,6 +48,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCEN="${1:-std}"
 IDLE="${2:-60}"
 EXTRA_ENV="${TAKO_FOOTPRINT_ENV:-}"
+STUB_CLAUDE="${TAKO_FOOTPRINT_STUB_CLAUDE:-0}"
 OUT="${TAKO_FOOTPRINT_OUT:-}"
 # 窓の寸法は固定する（描画面は窓の画素数に比例するので、寸法が揃わないと比べられない）
 BOUNDS="${TAKO_FOOTPRINT_BOUNDS:-0,0,1600,1000}"
@@ -245,8 +252,18 @@ export TAKO_WORKERS_FILE="$TMP/workers.yaml"
 export TAKO_TMUX_SOCKET="$SOCK_NAME"
 mkdir -p "$HOME"
 make_assets
+# 偽の claude（TAKO_FOOTPRINT_STUB_CLAUDE=1）。HOME を差し替えた後なので本物の設定には触れない
+STUB_PATH=""
+ENV_LABEL="${EXTRA_ENV:--}"
+if [ "$STUB_CLAUDE" = 1 ]; then
+  mkdir -p "$TMP/stub-bin"
+  printf '#!/bin/sh\nprintf "[]\\n"\n' > "$TMP/stub-bin/claude"
+  chmod +x "$TMP/stub-bin/claude"
+  STUB_PATH="$TMP/stub-bin:$PATH"
+  ENV_LABEL="$ENV_LABEL stub-claude"
+fi
 
-HEADER="scenario	mode	panes	front	back_tab	bg	previews	startup_ms	footprint_mb	malloc_mb	gfx_mb	other_mb	tmux_mb	threads	children	cpu_pct	child_cpu_pct	energy_mw	wakeups_s	body_renders_s	flushes_s	busy_footprint_mb	busy_malloc_mb	busy_gfx_mb	busy_cpu_pct	busy_energy_mw	busy_body_renders_s	busy_flushes_s	filled	drawn	lid	locked	env"
+HEADER="scenario	mode	panes	front	back_tab	bg	previews	startup_ms	footprint_mb	malloc_mb	gfx_mb	other_mb	tmux_mb	threads	children	cpu_pct	child_cpu_pct	energy_mw	wakeups_s	body_renders_s	flushes_s	busy_footprint_mb	busy_malloc_mb	busy_gfx_mb	busy_cpu_pct	busy_child_cpu_pct	busy_energy_mw	busy_body_renders_s	busy_flushes_s	filled	drawn	lid	locked	env"
 echo "$HEADER" > "$TMP/result.tsv"
 
 # 1 本ぶん: 起こす → 並べる → 放置して測る → 落とす
@@ -262,7 +279,7 @@ run_one() {
 
   local t0 t1
   # shellcheck disable=SC2086
-  launch_isolated_gui "$TMP/app.log" TAKO_PERSIST=$persist $EXTRA_ENV || exit $?
+  launch_isolated_gui "$TMP/app.log" TAKO_PERSIST=$persist $EXTRA_ENV ${STUB_PATH:+"PATH=$STUB_PATH"} || exit $?
   # 起動時間は「プロセスが生まれた時刻 → `tako list` が通った時刻」（仮想ディスプレイの用意の時間を含めない）
   t0="$(python3 "$TMP/pstart.py" "$ISOLATED_GUI_PID" 2>/dev/null || now_ms)"
   local sock_try
@@ -348,7 +365,7 @@ run_one() {
   kill "$CAFF_PID" 2>/dev/null; CAFF_PID=""
 
   python3 - "$spec" "$mode" "$n" "$front" "$back_tab" "$bg" "$previews" "$((t1 - t0))" "$fp_idle" "$threads" "$children" \
-    "$r0" "$r1" "$b0" "$b1" "$fp_busy" "$q0" "$q1" "$s0" "$s1" "$IDLE" "$filled/$n" "$(lid_state)" "$(lock_state)" "${EXTRA_ENV:--}" \
+    "$r0" "$r1" "$b0" "$b1" "$fp_busy" "$q0" "$q1" "$s0" "$s1" "$IDLE" "$filled/$n" "$(lid_state)" "$(lock_state)" "$ENV_LABEL" \
     >> "$TMP/result.tsv" <<'PY'
 import sys
 (spec, mode, n, front, back, bg, prev, startup, fp_idle, threads, children,
@@ -367,13 +384,13 @@ bt, bm, bg_, _, _ = (fp_busy.split() + ["-"] * 5)[:5]
 drawn = "あり" if k["body"] > 0 else "なし"
 print("\t".join([spec, mode, n, front, back, bg, prev, startup] + fp_idle.split() + [threads, children,
       "%.2f" % i["cpu"], "%.2f" % i["child"], "%.1f" % i["energy"], "%.1f" % i["wake"], "%.2f" % i["body"], "%.2f" % i["flush"],
-      bt, bm, bg_, "%.2f" % k["cpu"], "%.1f" % k["energy"], "%.1f" % k["body"], "%.1f" % k["flush"],
+      bt, bm, bg_, "%.2f" % k["cpu"], "%.2f" % k["child"], "%.1f" % k["energy"], "%.1f" % k["body"], "%.1f" % k["flush"],
       filled, drawn, lid, locked, env]))
 PY
   stop_isolated_gui "$ISOLATED_GUI_PID"; ISOLATED_GUI_PID=""
   tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
   unset TAKO_SOCKET TAKO_TOKEN
-  tail -1 "$TMP/result.tsv" | awk -F'\t' '{printf "  %-14s 放置 %6s MB（malloc %s・描画 %s・tmux %s）CPU %s%%・子 %s%%・描画 %s 回/秒 ｜ 出力中 %s MB（描画 %s）CPU %s%%・描画 %s 回/秒 ｜ 起動 %s ms・スレッド %s・中身 %s・描画 %s・蓋 %s\n", $1, $9, $10, $11, $13, $16, $17, $20, $22, $24, $25, $27, $8, $14, $29, $30, $31 ($32 == "ロック" ? "・画面ロック中" : "")}'
+  tail -1 "$TMP/result.tsv" | awk -F'\t' '{printf "  %-14s 放置 %6s MB（malloc %s・描画 %s・tmux %s）CPU %s%%・子 %s%%・描画 %s 回/秒 ｜ 出力中 %s MB（描画 %s）CPU %s%%・子 %s%%・描画 %s 回/秒 ｜ 起動 %s ms・スレッド %s・中身 %s・描画 %s・蓋 %s\n", $1, $9, $10, $11, $13, $16, $17, $20, $22, $24, $25, $26, $28, $8, $14, $30, $31, $32 ($33 == "ロック" ? "・画面ロック中" : "")}'
   sleep 3
 }
 

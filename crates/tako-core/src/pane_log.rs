@@ -10,6 +10,10 @@
 //! history が増えないため、TUI 区間は「TUI 実行中」マーカーだけが残る（Issue 記載の要件）。
 //! 会話ログ自体はセッションカタログ（Issue #112 A）が claude の transcript を参照する。
 //!
+//! tmux バックエンドペインの取り込みは子プロセスを起こすので、毎 tick ではなく
+//! [`BackendPace`] が決めた tick だけ行う（Issue #2018）。閉じるときは器を kill する直前に
+//! 最後の増分を取り込んでから可視画面とクローズマーカーを書く（tako-app 側）。
+//!
 //! サイズ管理（target 44GB 肥大の教訓）:
 //! - ペインあたり上限（既定 5MB）超過で `.1` へ 1 世代ローテーション
 //! - ログディレクトリ全体の上限（既定 200MB）超過で古いファイルから削除
@@ -18,9 +22,11 @@
 //! 保存先はユーザーローカルのデータディレクトリ限定（`<data_dir>/pane-logs/`）。
 //! リポジトリ・同期対象に置かないこと。`TAKO_PANE_LOG_DIR` で隔離検証用に上書き可能。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// 1 tick で取り込む最大行数（洪水時の上限。超過分は省略マーカーを残す）
 pub const CAPTURE_CHUNK: usize = 400;
@@ -196,6 +202,10 @@ pub struct PaneLogManager {
     dir: PathBuf,
     config: PaneLogConfig,
     states: HashMap<u64, PaneState>,
+    /// クローズフラッシュ済みのペイン（#2018）。器のペインの取り込みは background で
+    /// 走るので、閉じた後に届いた観測が状態を作り直し、新しいログファイルへ同じ行を
+    /// 書き始めないようにする（ペイン ID はプロセスの中で使い回されない）
+    closed: HashSet<u64>,
 }
 
 /// ペイン 1 回分の走査結果（呼び出し側が Term / tmux から観測して詰める）
@@ -232,6 +242,7 @@ impl PaneLogManager {
             dir,
             config,
             states: HashMap::new(),
+            closed: HashSet::new(),
         }
     }
 
@@ -277,6 +288,9 @@ impl PaneLogManager {
     /// `enabled` が false なら状態だけ更新して書き込まない（OFF 中の再 ON で
     /// 巨大な差分を一気に取り込まないため、基準値は追従させ続ける）
     pub fn apply(&mut self, pane: u64, meta: &PaneLogMeta, obs: PaneObservation) {
+        if self.closed.contains(&pane) {
+            return;
+        }
         let enabled = self.config.enabled;
         let max_bytes = self.config.max_bytes_per_pane;
         let state = self.ensure_state(pane, meta);
@@ -341,6 +355,10 @@ impl PaneLogManager {
         origin: CloseOrigin,
         caller: Option<&str>,
     ) {
+        // 閉じたペインを 2 回閉じない（2 回目は新しいファイルを作ってマーカーだけを書く）
+        if !self.closed.insert(pane) {
+            return;
+        }
         let reason = origin.marker_with_caller(caller);
         let enabled = self.config.enabled;
         let max_bytes = self.config.max_bytes_per_pane;
@@ -361,6 +379,19 @@ impl PaneLogManager {
             append_lines_to(state, std::slice::from_ref(&marker), max_bytes);
         }
         self.states.remove(&pane);
+    }
+
+    /// クローズフラッシュ済みか（#2018。background の取り込みが閉じたペインの器を読まない）
+    pub fn is_closed(&self, pane: u64) -> bool {
+        self.closed.contains(&pane)
+    }
+
+    /// 取り込み済みの末尾（最大 [`TAIL_ANCHOR`] 行。#2018 の揃えの印）。状態が無ければ空
+    pub fn anchor_of(&self, pane: u64) -> Vec<String> {
+        self.states
+            .get(&pane)
+            .map(|s| s.tail.clone())
+            .unwrap_or_default()
     }
 
     /// 現在ログを開いているペインのファイルパス（`tako logs` の対応付け・削除除外用）
@@ -393,6 +424,277 @@ impl PaneLogManager {
             }
         })
     }
+}
+
+/// ペインログの定期走査の周期（tako-app の 2 秒ポーリング）。[`capture_budget`] の単位
+pub const POLL_TICK: Duration = Duration::from_secs(2);
+
+/// 出力が続いている器のペインを取り込む間隔（#2018）。
+///
+/// 器のペインの取り込みは `tmux list-panes -a`（増分の有無）+ `tmux capture-pane`
+/// （増えた履歴）の子プロセスで、毎 tick（2 秒）回すと出力中の器 1 枚につき
+/// tako の回収済みの子プロセスの CPU が約 1% になった（#2011 S0 の実測）。
+/// 出力が止まれば次の tick で取り込む（[`BackendPace::decide`]）ので、
+/// 遅れるのは出力が続いている間だけ
+pub const BUSY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 出力の合図が無い器のペインを念のため見る間隔（#2018）。
+///
+/// 合図は tako のペインへ届いた tmux クライアントの出力なので、クライアントが
+/// 描き直さない間の増分（コピーモードで止めている間・クライアントが繋がっていない間）は
+/// 合図に出ない。それを取りこぼさないための保険（`list-panes -a` 1 本で全ペインぶん）
+pub const IDLE_INSURANCE: Duration = Duration::from_secs(30);
+
+/// 1 回に読む行数の上限の tick 数の上限（[`CAPTURE_CHUNK`] × 25 = 器の
+/// `history-limit` の 10000 行。それより前の行は器にもう無い）
+const MAX_BUDGET_TICKS: u128 = 25;
+
+/// #2018 の A/B（`TAKO_2018_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// 器のペインを毎 tick・1 tick 分の上限で取り込み、閉じるときは最後の増分を
+/// 取り込まずに可視画面とマーカーだけを書く。**ゲートはこの 1 か所**（tako-app もここを読む）
+pub fn issue2018_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2018_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 前回の取り込みから `elapsed` 経った器のペインで 1 回に読む行数の上限（#2018）。
+///
+/// 洪水の上限（1 tick あたり [`CAPTURE_CHUNK`] 行・超えた分は省略マーカー）は
+/// **時間あたり**で保つ。間隔を延ばしたのに上限を据え置くと、100 行/秒の出力を
+/// 10 秒ごとに読むだけで 1000 行のうち 600 行が省略になる。
+/// `None`（初回・再起動の直後）は 1 tick 分（修正前と同じ）
+pub fn capture_budget(elapsed: Option<Duration>) -> usize {
+    let ticks = elapsed
+        .map(|e| e.as_millis().div_ceil(POLL_TICK.as_millis()))
+        .unwrap_or(1)
+        .clamp(1, MAX_BUDGET_TICKS);
+    CAPTURE_CHUNK * ticks as usize
+}
+
+/// [`BackendPace::decide`] の答え（この tick で取り込む）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestDue {
+    /// 1 回に読む行数の上限（[`capture_budget`]）
+    pub budget: usize,
+    /// 前回の取り込みの後に出力があった（初回を含む）。増分がある見込みなので、
+    /// probe と同じ tmux の起動で履歴の末尾も読んでおく（#2018）。保険の取り込みは false
+    pub output: bool,
+}
+
+/// 器のペイン 1 枚の取り込みの間合い（#2018）。tako-app がペインごとに持ち、
+/// 2 秒ポーリングのたびに [`Self::decide`] へ「出力の合図」を渡す
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackendPace {
+    /// 最後に取り込んだ時刻と、そのときの合図の値
+    last: Option<(Instant, u64)>,
+    /// 直前の tick で見た合図の値（出力が止まったかの判定）
+    seen: Option<u64>,
+}
+
+impl BackendPace {
+    /// この tick で取り込むなら `Some`、見送るなら `None`。
+    ///
+    /// `activity` は出力があるたびに変わる値（tako-app ではペインの PTY から届いた
+    /// Wakeup の回数）。前の値と等しいかしか見ないので、増え方は問わない。
+    ///
+    /// - 初回（tako の起動・復元の直後を含む）: 取り込む（止まっている間に積もった分）
+    /// - 前回の取り込みの後に出力があった: 直前の tick から合図が動いていない
+    ///   （= 出力が止まった）なら取り込む。続いているなら [`BUSY_INTERVAL`] ごと
+    /// - 出力が無い: [`IDLE_INSURANCE`] ごとに念のため
+    /// - `legacy`（[`issue2018_legacy`]）: 毎 tick・1 tick 分（修正前）
+    pub fn decide(&mut self, activity: u64, now: Instant, legacy: bool) -> Option<IngestDue> {
+        let prev_seen = self.seen.replace(activity);
+        let output = self.last.is_none_or(|(_, mark)| activity != mark);
+        if legacy {
+            self.last = Some((now, activity));
+            return Some(IngestDue {
+                budget: CAPTURE_CHUNK,
+                output,
+            });
+        }
+        let elapsed = self.last.map(|(at, _)| now.saturating_duration_since(at));
+        let due = match elapsed {
+            None => true,
+            Some(elapsed) if output => prev_seen == Some(activity) || elapsed >= BUSY_INTERVAL,
+            Some(elapsed) => elapsed >= IDLE_INSURANCE,
+        };
+        if !due {
+            return None;
+        }
+        self.last = Some((now, activity));
+        Some(IngestDue {
+            budget: capture_budget(elapsed),
+            output,
+        })
+    }
+
+    /// 同じ tick に別の器の取り込みがある（= 全ペインぶんの probe を起こす）とき、出力の合図が
+    /// 無い器も相乗りで確かめるか（#2018）。probe は 1 本で全ペインぶん出るので子プロセスは
+    /// 増えない。保険の間隔の半分を過ぎた器だけで、相乗りが続く限り単独の保険は起きない。
+    /// [`Self::decide`] がこの tick に `None` を返した後に呼ぶ
+    pub fn ride_along(&mut self, now: Instant, legacy: bool) -> Option<IngestDue> {
+        let (at, mark) = self.last?;
+        let elapsed = now.saturating_duration_since(at);
+        if legacy || self.seen != Some(mark) || elapsed < IDLE_INSURANCE / 2 {
+            return None;
+        }
+        self.last = Some((now, mark));
+        Some(IngestDue {
+            budget: capture_budget(Some(elapsed)),
+            output: false,
+        })
+    }
+
+    /// 閉じる直前の取り込み（最後の増分）で読む行数の上限。前回の取り込みからの経過で決める
+    pub fn catch_up_budget(&self, now: Instant) -> usize {
+        capture_budget(self.last.map(|(at, _)| now.saturating_duration_since(at)))
+    }
+}
+
+/// 揃えの余白（#2018）。器の増分は「probe（`list-panes`）で行数を知る → capture で読む」の
+/// 2 つの子プロセスに分かれていて、その数 ms の間に伸びた行のぶん capture の範囲がずれる
+/// （修正前はそのまま境目ごとに 0〜数行の欠け・重複になっていた）。増分よりこの行数だけ多く読み、
+/// 取り込み済みの末尾（[`TAIL_ANCHOR`] 行）を探してずれを突き止める。
+/// 揃えられるずれは `ALIGN_MARGIN - TAIL_ANCHOR` 行まで
+pub const ALIGN_MARGIN: usize = 40;
+
+/// 器の 1 回の取り込みで tmux から読む範囲（#2018。[`plan_backend_capture`] が決める）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCapture {
+    /// 読まない（増分なし・履歴の巻き戻り）
+    Skip,
+    /// 増分 `delta` のうち末尾 `take` 行を、揃えの余白 `margin` 行つきで読む
+    Counted {
+        delta: usize,
+        take: usize,
+        margin: usize,
+    },
+    /// 履歴が保持上限で飽和して行数が増えない: 末尾 `take` 行を読み、取り込み済みの末尾と照合する
+    Overlap { take: usize },
+}
+
+impl BackendCapture {
+    /// 履歴の末尾から読む行数（`capture-pane -S -<この値>`）
+    pub fn lines_to_read(self) -> usize {
+        match self {
+            Self::Skip => 0,
+            Self::Counted { take, margin, .. } => take + margin,
+            Self::Overlap { take } => take,
+        }
+    }
+}
+
+/// 器の probe と基準から、tmux のどこを読むかを決める（#2018。純関数）。
+/// `legacy`（[`issue2018_legacy`]）は余白なし = 修正前と同じ範囲
+pub fn plan_backend_capture(
+    probe: &crate::tmux::PaneLogProbe,
+    last_history: usize,
+    last_bytes: u64,
+    budget: usize,
+    legacy: bool,
+) -> BackendCapture {
+    if probe.history < last_history {
+        return BackendCapture::Skip;
+    }
+    let delta = probe.history - last_history;
+    if delta > 0 {
+        let take = delta.min(budget);
+        // 省略が出る（読み切れない）ときは揃えても欠けが残るので、修正前と同じ範囲
+        let margin = if legacy || take < delta {
+            0
+        } else {
+            ALIGN_MARGIN
+        };
+        return BackendCapture::Counted {
+            delta,
+            take,
+            margin,
+        };
+    }
+    // 履歴が history-limit で飽和するとカウンタが増えない。バイト数の変化を
+    // 合図に末尾チャンクを取り、取り込み済み tail と照合して新規行だけ追記する
+    if probe.history >= probe.limit && !probe.alternate && probe.bytes != last_bytes {
+        return BackendCapture::Overlap { take: budget };
+    }
+    BackendCapture::Skip
+}
+
+/// 読んだ履歴（`hist` = 末尾 [`BackendCapture::lines_to_read`] 行）から観測を作る（#2018。純関数）。
+///
+/// `Counted` は余白の中から取り込み済みの末尾（`anchor`）を探し、probe の後に伸びた行まで
+/// 含めて新しい行を切り出す。見つからない（初回・末尾が空行だけ・ずれが余白を超えた）なら
+/// 修正前と同じく末尾 `take` 行
+pub fn backend_observation(
+    probe: &crate::tmux::PaneLogProbe,
+    plan: BackendCapture,
+    anchor: &[String],
+    mut hist: Vec<String>,
+) -> PaneObservation {
+    let mut obs = PaneObservation {
+        history: probe.history,
+        history_limit: probe.limit,
+        bytes: probe.bytes,
+        alt_screen: probe.alternate,
+        chunk: ChunkKind::None,
+    };
+    match plan {
+        BackendCapture::Skip => {}
+        BackendCapture::Counted {
+            delta,
+            take,
+            margin,
+        } => {
+            // 余白なし（A/B・読み切れない増分）は末尾 `take` 行 = 修正前と同じ範囲。
+            // probe と同じ tmux で多めに読んだ履歴（`hist` が `take` より長い）でも同じ
+            let (lines, shift) = match margin {
+                0 => {
+                    let start = hist.len().saturating_sub(take);
+                    (hist.split_off(start), 0)
+                }
+                _ => slice_counted(anchor, hist, take),
+            };
+            obs.history = (probe.history + shift).min(probe.limit.max(probe.history));
+            obs.chunk = ChunkKind::Counted {
+                lines,
+                delta: delta + shift,
+            };
+        }
+        BackendCapture::Overlap { .. } => obs.chunk = ChunkKind::Overlap { captured: hist },
+    }
+    obs
+}
+
+/// 余白つきで読んだ履歴から、取り込み済みの末尾（`anchor`）の直後を新しい行として切り出す。
+/// 戻り値は (新しい行, probe の後に伸びた行数)。ずれの小さい側を優先する（同じ行の繰り返しで
+/// 複数の位置が合うときは、修正前と同じ範囲 = ずれ 0 に倒れる）
+fn slice_counted(anchor: &[String], mut hist: Vec<String>, take: usize) -> (Vec<String>, usize) {
+    let n = hist.len();
+    let alen = anchor.len().min(TAIL_ANCHOR);
+    let anchor = &anchor[anchor.len() - alen..];
+    if anchor.iter().any(|l| !l.trim().is_empty()) {
+        for shift in 0..=ALIGN_MARGIN - TAIL_ANCHOR {
+            let Some(start) = n.checked_sub(take + shift) else {
+                break;
+            };
+            if start < alen {
+                break;
+            }
+            if hist[start - alen..start]
+                .iter()
+                .map(|l| l.trim_end())
+                .eq(anchor.iter().map(|l| l.trim_end()))
+            {
+                return (hist.split_off(start), shift);
+            }
+        }
+    }
+    let start = n.saturating_sub(take);
+    (hist.split_off(start), 0)
 }
 
 /// 行群をファイルへ追記する（ヘッダ・ローテーション込み。失敗は握りつぶす =
@@ -1146,5 +1448,274 @@ mod tests {
         mgr.seed_history(8, &meta(1, "s"), 123);
         assert_eq!(mgr.scan_baseline(8), Some((123, 0)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn counted(history: usize, raw: &[&str], delta: usize) -> PaneObservation {
+        PaneObservation {
+            history,
+            history_limit: 10_000,
+            bytes: 0,
+            alt_screen: false,
+            chunk: ChunkKind::Counted {
+                lines: lines(raw),
+                delta,
+            },
+        }
+    }
+
+    /// #2018: 器の取り込みは background で走るので、閉じた後に届いた観測が状態を作り直して
+    /// 新しいファイルへ同じ行を書かない。2 回目の close もファイルを増やさない
+    #[test]
+    fn 閉じたペインには後から届いた観測も二度目のクローズも書かない() {
+        let dir = temp_dir("closed");
+        let mut mgr = PaneLogManager::new(dir.clone(), PaneLogConfig::default());
+        let m = meta(2, "w");
+        mgr.apply(21, &m, counted(1, &["a"], 1));
+        mgr.flush_close(21, &m, &lines(&["v"]), CloseOrigin::Cli, None);
+        mgr.apply(21, &m, counted(3, &["a", "b"], 2));
+        mgr.flush_close(21, &m, &lines(&["v"]), CloseOrigin::ProcessExit, None);
+        let files = list_files(&dir);
+        assert_eq!(files.len(), 1, "閉じた後にファイルが増えた: {files:?}");
+        let content = std::fs::read_to_string(&files[0].path).unwrap();
+        assert_eq!(content.matches("--- [クローズ: ").count(), 1, "{content}");
+        assert!(
+            !content.contains("\nb\n"),
+            "閉じた後の観測が書かれた: {content}"
+        );
+        assert!(mgr.path_of(21).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 読む行数の上限は経過時間に比例し器の保持上限で頭打ち() {
+        assert_eq!(capture_budget(None), CAPTURE_CHUNK, "初回は 1 tick 分");
+        assert_eq!(capture_budget(Some(Duration::ZERO)), CAPTURE_CHUNK);
+        assert_eq!(capture_budget(Some(POLL_TICK)), CAPTURE_CHUNK);
+        assert_eq!(
+            capture_budget(Some(Duration::from_millis(2_100))),
+            CAPTURE_CHUNK * 2
+        );
+        // 10 秒ごとに読むなら 100 行/秒を 1 行も省略しない（1000 行 < 2000 行）
+        assert_eq!(capture_budget(Some(BUSY_INTERVAL)), CAPTURE_CHUNK * 5);
+        assert_eq!(capture_budget(Some(Duration::from_secs(3_600))), 10_000);
+    }
+
+    /// #2018: 出力が続く間は BUSY_INTERVAL ごと、止まったら次の tick、無ければ保険の間隔
+    #[test]
+    fn 器の取り込みの間合い() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut pace = BackendPace::default();
+        let due = |budget, output| Some(IngestDue { budget, output });
+        // 初回は必ず取り込む（再起動の間に積もった分）
+        assert_eq!(pace.decide(0, at(0), false), due(CAPTURE_CHUNK, true));
+        // 出力が無い間は保険の間隔まで見送る（保険は出力なし = 履歴を先読みしない）
+        assert_eq!(pace.decide(0, at(2), false), None);
+        assert_eq!(pace.decide(0, at(28), false), None);
+        assert_eq!(
+            pace.decide(0, at(30), false),
+            due(capture_budget(Some(IDLE_INSURANCE)), false)
+        );
+        // 出力が続く間（合図が tick ごとに動く）は BUSY_INTERVAL ごと
+        let mut a = 0;
+        let mut taken = Vec::new();
+        for s in (32..=70).step_by(2) {
+            a += 7;
+            if let Some(d) = pace.decide(a, at(s), false) {
+                taken.push((s, d.budget, d.output));
+            }
+        }
+        let busy = (CAPTURE_CHUNK * 5, true);
+        assert_eq!(
+            taken,
+            vec![
+                (40, busy.0, busy.1),
+                (50, busy.0, busy.1),
+                (60, busy.0, busy.1),
+                (70, busy.0, busy.1)
+            ],
+            "出力中は 10 秒ごと"
+        );
+        // 出力が止まった: 合図が動かなくなった最初の tick で取り込む
+        a += 3;
+        assert_eq!(pace.decide(a, at(72), false), None, "まだ出力中に見える");
+        assert_eq!(
+            pace.decide(a, at(74), false),
+            due(capture_budget(Some(Duration::from_secs(4))), true),
+            "止まったら次の tick"
+        );
+        assert_eq!(pace.decide(a, at(76), false), None, "取り込んだ後は静か");
+    }
+
+    /// #2018: 出力の無い器は、他の器の取り込みに相乗りして確かめる（単独の保険を起こさない）
+    #[test]
+    fn 出力の無い器は他の取り込みに相乗りする() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut pace = BackendPace::default();
+        assert_eq!(
+            pace.ride_along(at(0), false),
+            None,
+            "一度も取り込んでいない"
+        );
+        assert!(pace.decide(5, at(0), false).is_some());
+        assert_eq!(pace.decide(5, at(10), false), None);
+        assert_eq!(
+            pace.ride_along(at(10), false),
+            None,
+            "保険の半分に届いていない"
+        );
+        assert_eq!(pace.decide(5, at(16), false), None);
+        assert_eq!(
+            pace.ride_along(at(16), false),
+            Some(IngestDue {
+                budget: capture_budget(Some(Duration::from_secs(16))),
+                output: false
+            })
+        );
+        // 相乗りした時刻から数え直す = 単独の保険（30 秒）はまだ来ない
+        assert_eq!(pace.decide(5, at(30), false), None);
+        // 出力があった器は相乗りしない（出力の側の間合い = decide が決める）
+        let mut busy = pace;
+        assert_eq!(busy.decide(9, at(18), false), None);
+        assert_eq!(busy.ride_along(at(18), false), None);
+        // A/B は相乗りしない（毎 tick 取り込む）
+        assert_eq!(pace.ride_along(at(60), true), None);
+    }
+
+    #[test]
+    fn 旧挙動は毎_tick_1_tick_分() {
+        let t0 = Instant::now();
+        let mut pace = BackendPace::default();
+        for s in 0..5u64 {
+            let d = pace.decide(0, t0 + Duration::from_secs(s * 2), true);
+            assert_eq!(d.map(|d| d.budget), Some(CAPTURE_CHUNK));
+        }
+    }
+
+    fn probe(history: usize, bytes: u64, alternate: bool) -> crate::tmux::PaneLogProbe {
+        crate::tmux::PaneLogProbe {
+            history,
+            limit: 10_000,
+            bytes,
+            alternate,
+        }
+    }
+
+    fn numbered(from: usize, to: usize) -> Vec<String> {
+        (from..to).map(|i| format!("L{i:05}")).collect()
+    }
+
+    #[test]
+    fn 読む範囲は増分と余白で決まり旧挙動は余白なし() {
+        let p = probe(120, 0, false);
+        assert_eq!(
+            plan_backend_capture(&p, 100, 0, 400, false),
+            BackendCapture::Counted {
+                delta: 20,
+                take: 20,
+                margin: ALIGN_MARGIN
+            }
+        );
+        assert_eq!(
+            plan_backend_capture(&p, 100, 0, 400, true),
+            BackendCapture::Counted {
+                delta: 20,
+                take: 20,
+                margin: 0
+            },
+            "A/B は修正前と同じ範囲"
+        );
+        // 読み切れない（省略が出る）ときは揃えない
+        assert_eq!(
+            plan_backend_capture(&p, 0, 0, 100, false),
+            BackendCapture::Counted {
+                delta: 120,
+                take: 100,
+                margin: 0
+            }
+        );
+        assert_eq!(
+            plan_backend_capture(&p, 120, 0, 400, false),
+            BackendCapture::Skip
+        );
+        assert_eq!(
+            plan_backend_capture(&p, 130, 0, 400, false),
+            BackendCapture::Skip,
+            "巻き戻り"
+        );
+        // 飽和: 行数が増えずバイト数だけ動く
+        let full = probe(10_000, 9, false);
+        assert_eq!(
+            plan_backend_capture(&full, 10_000, 8, 2_000, false),
+            BackendCapture::Overlap { take: 2_000 }
+        );
+        assert_eq!(
+            plan_backend_capture(&full, 10_000, 9, 2_000, false),
+            BackendCapture::Skip
+        );
+        assert_eq!(
+            plan_backend_capture(&probe(10_000, 9, true), 10_000, 8, 2_000, false),
+            BackendCapture::Skip,
+            "TUI 中は照合しない"
+        );
+    }
+
+    /// #2018: probe と capture の間に伸びた行を、取り込み済みの末尾で揃えて欠け・重複なく切り出す
+    #[test]
+    fn probeの後に伸びた行を末尾の印で揃える() {
+        let anchor = numbered(92, 100); // 取り込み済みの末尾 = L00092..L00099
+        let p = probe(120, 0, false); // probe の時点で 100 → 120
+        let plan = plan_backend_capture(&p, 100, 0, 400, false);
+        // capture の時点ではさらに 3 行伸びていた（L00120..L00122）
+        let hist = numbered(123 - plan.lines_to_read(), 123);
+        let obs = backend_observation(&p, plan, &anchor, hist);
+        assert_eq!(obs.history, 123, "伸びた分まで基準を進める");
+        match obs.chunk {
+            ChunkKind::Counted { lines, delta } => {
+                assert_eq!(lines, numbered(100, 123), "L00100 から欠け・重複なし");
+                assert_eq!(delta, 23);
+            }
+            other => panic!("Counted でない: {other:?}"),
+        }
+        // 1 回の tmux で多めに読んだ（増分より長い）履歴でも同じ
+        let hist = numbered(0, 120);
+        match backend_observation(&p, plan, &anchor, hist).chunk {
+            ChunkKind::Counted { lines, .. } => assert_eq!(lines, numbered(100, 120)),
+            other => panic!("Counted でない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 揃えられないときは修正前と同じ末尾の範囲() {
+        let p = probe(120, 0, false);
+        let plan = plan_backend_capture(&p, 100, 0, 400, false);
+        let hist = numbered(123 - plan.lines_to_read(), 123);
+        // 印が無い（初回）・空行だけ・見つからない
+        for anchor in [
+            vec![],
+            vec![String::new(), " ".into()],
+            numbered(5000, 5008),
+        ] {
+            match backend_observation(&p, plan, &anchor, hist.clone()).chunk {
+                ChunkKind::Counted { lines, delta } => {
+                    assert_eq!(lines, numbered(103, 123), "末尾 take 行");
+                    assert_eq!(delta, 20);
+                }
+                other => panic!("Counted でない: {other:?}"),
+            }
+        }
+        // 余白なし（A/B）は渡された履歴の末尾 take 行
+        let legacy = plan_backend_capture(&p, 100, 0, 400, true);
+        match backend_observation(&p, legacy, &numbered(92, 100), numbered(0, 120)).chunk {
+            ChunkKind::Counted { lines, .. } => assert_eq!(lines, numbered(100, 120)),
+            other => panic!("Counted でない: {other:?}"),
+        }
+        // 同じ行の繰り返しで複数の位置が合うときは、ずれ 0（修正前と同じ範囲）に倒れる
+        let same = vec!["x".to_string(); 60];
+        match backend_observation(&p, plan, &vec!["x".to_string(); 8], same).chunk {
+            ChunkKind::Counted { lines, delta } => assert_eq!((lines.len(), delta), (20, 20)),
+            other => panic!("Counted でない: {other:?}"),
+        }
     }
 }
