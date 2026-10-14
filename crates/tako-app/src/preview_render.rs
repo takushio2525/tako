@@ -1906,6 +1906,8 @@ impl TakoApp {
         let lsp_badge = self.lsp_status_badge(pane_id);
         let lsp_badge_shown = lsp_badge.is_some();
         let lsp_bar = self.render_lsp_status_bar(pane_id, &theme, cx);
+        // #1686: 名前の変更の欄（右クリックメニューの「名前の変更…」で開く）
+        let rename_bar = self.render_lsp_rename_bar(pane_id, &theme, cx);
         // キャレット位置はコード行を組むときに `render_preview_code_line` が
         // その場で引き直す（#821 の仮想リストは TakoApp の描画を伴わずに
         // item を組み直すので、ここでキャプチャすると古い位置が焼き付く）
@@ -3735,6 +3737,7 @@ impl TakoApp {
             })
             .children(conflict_bar)
             .children(lsp_bar)
+            .children(rename_bar)
             .children(navigation_panel.map(|panel| {
                 let (label, rows): (&str, Vec<gpui::AnyElement>) = match panel {
                     PreviewNavigationPanel::Outline => {

@@ -44,6 +44,7 @@ mod lsp_format_ui;
 mod lsp_goto_ui;
 mod lsp_hover_ui;
 mod lsp_menu_ui;
+mod lsp_rename_ui;
 mod lsp_status_ui;
 mod md_view;
 mod menu_bar;
@@ -1472,6 +1473,8 @@ enum AppTextInput {
     /// 右パネルの横断検索の検索欄（#1694）。#1725 / #1750 と同じ理由で最初から宛先に入れる
     /// （入れないとかなモードの変換がターミナルへ出る）
     WorkspaceSearch,
+    /// コードプレビューの名前の変更の欄（#1686）。同じ理由で最初から宛先に入れる
+    LspRename,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -2210,6 +2213,8 @@ struct TakoApp {
     lsp_goto: LspGotoUi,
     /// 整形の問い合わせ中の印（#1683）
     lsp_format: crate::lsp_format_ui::LspFormatUi,
+    /// 名前の変更の欄（#1686。右クリックメニューの「名前の変更…」で開く）
+    lsp_rename: crate::lsp_rename_ui::LspRenameUi,
     /// 保存時整形（#1683。settings.json の `lsp_format_on_save` を起動時に読む。既定 OFF）
     lsp_format_on_save: bool,
     /// 括弧の自動閉じ（#1759。settings.json の `editor_auto_close` を起動時に読む。既定 ON）。
@@ -4784,6 +4789,7 @@ impl TakoApp {
             jump_history: tako_core::jump_history::JumpHistory::default(),
             lsp_goto: LspGotoUi::default(),
             lsp_format: crate::lsp_format_ui::LspFormatUi::default(),
+            lsp_rename: crate::lsp_rename_ui::LspRenameUi::default(),
             lsp_format_on_save: tako_control::settings::load().lsp_format_on_save,
             editor_auto_close: tako_control::settings::load().editor_auto_close,
             lsp_completion: lsp_completion_ui::LspCompletionUi::default(),
@@ -10532,6 +10538,8 @@ impl TakoApp {
         self.user_tasks.comment_focused = false;
         // #1694: 横断検索の検索欄も同じ
         self.search_ui.focused = false;
+        // #1686: 名前の変更の欄は閉じる出口を通す（欄宛ての変換も捨てる）
+        self.close_lsp_rename();
         self.git_agent_menu_open = false;
         // #1750: Web の 2 つの URL 欄は閉じる出口を通す（その欄宛ての変換も捨てる）
         self.blur_web_dock_url();
@@ -16498,6 +16506,11 @@ impl TakoApp {
             self.insert_app_text_input(AppTextInput::TreeName, &text, cx);
             return;
         }
+        // #1686: 名前の変更の欄
+        if self.lsp_rename_input_active() {
+            self.insert_app_text_input(AppTextInput::LspRename, &text, cx);
+            return;
+        }
         if self.web_address_bar_editing().is_some() {
             self.insert_app_text_input(AppTextInput::WebAddress, &text, cx);
             return;
@@ -16676,6 +16689,8 @@ impl TakoApp {
                 && self.panel_view == PanelView::Tasks)
             // #1694: 横断検索の検索欄も同じ
             || self.search_input_active()
+            // #1686: 名前の変更の欄も同じ
+            || self.lsp_rename_input_active()
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
@@ -16721,6 +16736,16 @@ impl TakoApp {
         }
         if self.inline_edit.is_some() {
             self.handle_inline_edit_key(keystroke, cx);
+            cx.stop_propagation();
+            return;
+        }
+        // #1686: 名前の変更の欄。見えていない欄（タブを切り替えた・ペインを閉じた）は畳んでから
+        // 下のチェーンへ流す（#1725 と同じ規則）
+        if self.lsp_rename.input.is_some() && !self.lsp_rename_input_active() {
+            self.close_lsp_rename();
+        }
+        if self.lsp_rename.input.is_some() {
+            self.handle_lsp_rename_key(keystroke, cx);
             cx.stop_propagation();
             return;
         }
@@ -17063,6 +17088,10 @@ impl TakoApp {
             }
             return Some(AppTextInput::TreeName);
         }
+        // #1686: 名前の変更の欄も「見えているときだけ」（打鍵の振り分けと同じ判定）
+        if self.lsp_rename_input_active() {
+            return Some(AppTextInput::LspRename);
+        }
         if legacy_1750 && self.webview_dock_url_focused {
             return None;
         }
@@ -17115,6 +17144,7 @@ impl TakoApp {
             AppTextInput::WebAddress => self.web_address_insert(text, cx),
             AppTextInput::WebDockUrl => self.web_dock_url_insert(text, cx),
             AppTextInput::WorkspaceSearch => self.search_insert(text, cx),
+            AppTextInput::LspRename => self.lsp_rename_insert(text, cx),
         }
     }
 
@@ -27483,6 +27513,14 @@ impl EntityInputHandler for TakoApp {
             cx.notify();
             return;
         }
+        // #1686: 名前の変更の欄（変換を経ない直接の insertText もここ。挿入は打鍵・⌘V と同じ 1 関数）
+        if self.lsp_rename_input_active() {
+            self.ime = None;
+            self.insert_app_text_input(AppTextInput::LspRename, text, cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+            return;
+        }
         // #496: 新規ブランチ名入力中（IME 確定文字列もここで受ける）
         if self.git_branch_input.is_some() {
             if !text.is_empty() {
@@ -31305,6 +31343,12 @@ mod self_test {
     mod xref_1685;
     #[cfg(feature = "visual-test")]
     use xref_1685::xref_1685_visual;
+    /// #1686: 右クリックの「名前の変更…」の欄で書き換え、undo 1 回で戻る（visual-test `rename-1686` /
+    /// `rename-1686-real`）
+    #[cfg(feature = "visual-test")]
+    mod rename_1686;
+    #[cfg(feature = "visual-test")]
+    use rename_1686::{rename_1686_real_visual, rename_1686_visual};
     /// #1944: 言語サーバを取って起こす・エディタの状態（visual-test `lsp-fetch`）
     #[cfg(feature = "visual-test")]
     mod lsp_fetch_1944;
@@ -45696,6 +45740,18 @@ mod self_test {
                 // #1685: 参照検索の結果の行の ⌘クリックで新しいペインが 1 枚増え該当行が見える（偽サーバ）
                 "xref-1685" => {
                     xref_1685_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1686: 右クリックの「名前の変更…」→ 欄に実キーで打って Enter → undo 1 回で戻る（偽サーバ）
+                "rename-1686" => {
+                    rename_1686_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1686: 同じ手順を実の rust-analyzer で（無ければ SKIPPED）
+                "rename-1686-real" => {
+                    rename_1686_real_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

@@ -75,6 +75,8 @@ pub fn lsp_item(item: tako_core::lsp::menu::MenuItem) -> &'static str {
         // #1685: 参照・階層（結果は右パネルの references ビューに出る）
         MenuItem::Xref(kind) => super::panel::xref_action(kind),
         MenuItem::Hover => super::menu::show_hover(),
+        // #1686: 押すと新しい名前を打つ欄が開く（「…」= 続きの入力がある）
+        MenuItem::Rename => tr!("名前の変更…", "Rename Symbol…"),
         MenuItem::Format => super::menu::format_document(),
         MenuItem::FormatSelection => super::menu::format_selection(),
     }

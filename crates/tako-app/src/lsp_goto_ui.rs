@@ -228,6 +228,8 @@ impl TakoApp {
                     OffloadContinuation::LspHover(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#1685 の参照・階層は別の続き）
                     OffloadContinuation::LspXref(_) | OffloadContinuation::LspXrefExpand(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#1686 の名前の変更は別の続き）
+                    OffloadContinuation::LspRename(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#1979 の `tako list` の続き）
                     OffloadContinuation::List(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#1984 の先取りの続き）
