@@ -1,0 +1,124 @@
+---
+/**
+ * プレビューペイン（コード / Markdown を開いたペイン）の再現（#2062）。Split の子に置く。
+ * 中身（.tk-code の行・.tk-md のレンダリング表示）は子に書く。
+ *
+ *   <PreviewPane n={2} name={[{ at: '!3+', text: 'README.md' }, { at: '3+', text: 'app.py' }]}
+ *     edit="2+" lsp={[{ at: '1', text: 'pyright を取得中', busy: true }]} at="2+" fx="split">
+ *     <div class="tk-code">…</div>
+ *   </PreviewPane>
+ *
+ * ヘッダの並びは実物（crates/tako-app/src/preview_render.rs）どおり:
+ * 番号 · ファイル名（「 ●」= 未保存 / 「 · 保存済」）· パス · 言語サーバの状態 … 履歴 · 編集。
+ * 名前・状態は配列で渡すと手順で入れ替わる（data-at の書き方）。
+ */
+import '../../styles/tako-editor.css';
+import Icon from './Icon.astro';
+
+interface Label {
+	at?: string;
+	text: string;
+}
+interface LspBadge {
+	at: string;
+	text: string;
+	/** 取得中・起動中・読み込み中（accent）。false = 動作中（控えめ） */
+	busy?: boolean;
+}
+
+interface Props {
+	n?: number;
+	/** ファイル名（「 ●」「 · 保存済」も含めて書く）。配列なら手順で入れ替わる */
+	name: string | Label[];
+	/** ファイル名の左のアイコン */
+	icon?: 'file' | 'image';
+	/** ワークスペースからのパス（広い窓だけ出る） */
+	path?: string;
+	lsp?: LspBadge[];
+	/** 編集モード（「編集中」）になる手順（data-at の書き方）。true なら常に編集中 */
+	edit?: boolean | string;
+	/** Markdown のレンダリング表示の目のアイコンを出す手順 */
+	eyeAt?: string;
+	focus?: boolean | string;
+	at?: string;
+	fx?: string;
+	grow?: number;
+	class?: string;
+}
+
+const { n, name, icon = 'file', path, lsp = [], edit = false, eyeAt, focus = false, at, fx, grow, class: className } = Astro.props;
+const names: Label[] = typeof name === 'string' ? [{ text: name }] : name;
+const editAt = typeof edit === 'string' ? edit : undefined;
+---
+
+<div class:list={['tk-pane', 'tk-pv', className]} data-at={at} data-fx={fx} style={grow ? `--grow: ${grow}` : undefined}>
+	{focus && <span class="tk-pane-focus" data-at={typeof focus === 'string' ? focus : undefined} data-fx="fade" />}
+	<div class="tk-pane-head tk-pv-head">
+		{n !== undefined && <span class="tk-pane-n">{n}</span>}
+		<span class="tk-pv-file">
+			<Icon name={icon} />
+			<span class="tk-pv-name tk-stack">
+				{
+					names.map((l) => (
+						<span data-at={l.at} data-fx={l.at ? 'fade' : undefined}>
+							{l.text}
+						</span>
+					))
+				}
+			</span>
+		</span>
+		{path && <span class="tk-pv-path">{path}</span>}
+		{
+			lsp.length > 0 && (
+				<span class="tk-pv-lsp tk-stack">
+					{lsp.map((b) => (
+						<span class:list={{ 'is-quiet': !b.busy }} data-at={b.at} data-fx="fade">
+							{b.text}
+						</span>
+					))}
+				</span>
+			)
+		}
+		<span class="tk-pv-btns">
+			{
+				eyeAt && (
+					<span class="tk-pv-btn" data-at={eyeAt} data-fx="fade">
+						<svg class="tk-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+							<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" />
+							<circle cx="12" cy="12" r="3" />
+						</svg>
+					</span>
+				)
+			}
+			<span class="tk-pv-btn is-wide">
+				<Icon name="branch" />
+				履歴
+			</span>
+			{
+				edit === true ? (
+					<span class="tk-pv-btn is-editing">
+						<Icon name="pencil" />
+						編集中
+					</span>
+				) : (
+					<span class="tk-pv-edit">
+						<span class="tk-pv-btn" data-at={editAt ? `!${editAt}` : undefined} data-fx={editAt ? 'fade' : undefined}>
+							<Icon name="pencil" />
+							編集
+						</span>
+						{editAt && (
+							<span class="tk-pv-btn is-editing" data-at={editAt} data-fx="fade">
+								<Icon name="pencil" />
+								編集中
+							</span>
+						)}
+					</span>
+				)
+			}
+		</span>
+	</div>
+	<slot name="bar" />
+	<div class="tk-pane-body tk-pv-body">
+		<slot />
+	</div>
+</div>

@@ -1,0 +1,60 @@
+---
+/**
+ * 場面: プレビューのまま直して、自動で保存される（#2062）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-3.5（タイトルバーで編集モード・dirty 表示・完全自動保存は
+ * 既定 ON で 500ms のデバウンス・外部変更は上書きしない）。ヘッダの文言は
+ * crates/tako-app/src/ui_text/preview.rs（編集 / 編集中 / 「 · 保存済」、未保存は「 ●」）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pointer from '../motion/Pointer.astro';
+import PreviewPane from '../motion/PreviewPane.astro';
+---
+
+<Scrolly label="プレビューのまま直して、自動で保存される流れ" flip>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} height={22}>
+		<Split>
+			<PreviewPane
+				n={2}
+				focus
+				edit="2+"
+				name={[
+					{ at: '!3+', text: 'config.py' },
+					{ at: '3', text: 'config.py ●' },
+					{ at: '4', text: 'config.py · 保存済' },
+				]}
+				path="~/my-app"
+			>
+				<div class="tk-code">
+					<span class="tk-cl"><i>1</i><b><span class="sx-k">from</span> dataclasses <span class="sx-k">import</span> dataclass</b></span>
+					<span class="tk-cl"><i>2</i><b></b></span>
+					<span class="tk-cl"><i>3</i><b><span class="sx-f">@dataclass</span></b></span>
+					<span class="tk-cl"><i>4</i><b><span class="sx-k">class</span> <span class="sx-t">Config</span>:</b></span>
+					<span class="tk-cl"><i>5</i><b class="i1">name: <span class="sx-t">str</span> = <span class="sx-s">"my-app"</span></b></span>
+					<span class="tk-cl"><i>6</i><b class="i1">port: <span class="sx-t">int</span> = <span class="sx-n">8000</span></b></span>
+					<span class="tk-cl">
+						<i>7</i>
+						<b class="i1"><span class="tk-caret" data-at="2" data-fx="fade"></span><span data-at="3+" data-fx="type">debug: bool = True</span><span class="tk-caret" data-at="3+" data-fx="fade" style="--d: .8s"></span></b>
+					</span>
+				</div>
+			</PreviewPane>
+		</Split>
+		<Pointer slot="overlay" path="1:84,30 2:91,21 3:62,82" click="2" />
+	</TakoWindow>
+
+	<Step title="開いたファイルは、その場で直せる">
+		<p>プレビューは読むだけの画面ではありません。ちょっとした直しのために、別のエディタを開く必要はありません。</p>
+	</Step>
+	<Step title="「編集」を押すと、書ける状態に">
+		<p>ペインの上の「編集」を押すと「編集中」に変わり、カーソルが出ます。取り消しや、ファイルの中の検索・置換もそのまま使えます。</p>
+	</Step>
+	<Step title="打つと、未保存の印が付く">
+		<p>書き換えるとファイル名の横に <code>●</code> が付き、まだ保存していないことが分かります。</p>
+	</Step>
+	<Step title="手を止めると、自動で保存">
+		<p>打つのをやめて半秒ほどで「保存済」に変わります。自動保存は最初から有効です。</p>
+		<p>編集中に外でファイルが書き換わっても、黙って上書きはしません。保存していない変更があるときは、差分を見てどちらを採るか選べます。</p>
+	</Step>
+</Scrolly>

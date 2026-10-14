@@ -1,0 +1,72 @@
+---
+/**
+ * 場面: 補完・型のカード・定義へ移動（#2062）。3 手順。
+ * 事実の出どころ: .agent/requirements.md FR-3.35（打つと語の頭の真下に候補。↑↓ で選び Enter / Tab で確定）・
+ * FR-3.37（識別子にマウスを乗せると 300ms 後に型と説明のカード）・FR-3.31（⌘クリック = Windows は
+ * Ctrl+クリックで定義へ。別のファイルは新しいペインを右に開く。⌘ を押して乗せると下線 + accent）。
+ * 補完の印は crates/tako-app/src/lsp_completion_ui.rs の kind_badge。Windows の LSP は pending（#1007）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pointer from '../motion/Pointer.astro';
+import PreviewPane from '../motion/PreviewPane.astro';
+import Completion from '../motion/Completion.astro';
+---
+
+<Scrolly label="補完・型のカード・定義へ移動する流れ" flip>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} height={25}>
+		<Split>
+			<PreviewPane n={2} focus edit name="app.py" lsp={[{ at: '1+', text: 'pyright 動作中' }]}>
+				<div class="tk-code">
+					<span class="tk-cl"><i>1</i><b><span class="sx-k">import</span> config</b></span>
+					<span class="tk-cl"><i>2</i><b></b></span>
+					<span class="tk-cl"><i>3</i><b><span class="sx-k">def</span> <span class="sx-f">main</span>():</b></span>
+					<span class="tk-cl"><i>4</i><b class="i1">cfg = config.<span class="tk-golink" data-at="3+" data-fx="state">load</span>()</b></span>
+					<span class="tk-cl">
+						<i>5</i>
+						<b class="i1"><span class="sx-f">print</span>(cfg.<span class="tk-stack" style="display: inline-grid"><span data-at="1" data-fx="fade"><span class="tk-caret is-on"></span></span><span data-at="2+" data-fx="fade">port)</span></span></b>
+					</span>
+					<span class="tk-cl"><i>6</i><b class="i1"><span class="sx-f">serve</span>(cfg)</b></span>
+					<Completion
+						at="1"
+						style="left: clamp(0.4em, 11em, calc(100% - min(17em, 88%) - 0.4em)); top: 8.45em"
+						items={[
+							{ kind: 'v', label: 'debug', detail: 'bool' },
+							{ kind: 'v', label: 'name', detail: 'str' },
+							{ kind: 'v', label: 'port', detail: 'int' },
+							{ kind: 'f', label: 'reload', detail: '() -> None' },
+						]}
+						selected={2}
+					/>
+					<span class="tk-hover" data-at="2" data-fx="pop" style="left: clamp(0.4em, 12.8em, calc(100% - min(19em, 90%) - 0.4em)); top: 6.85em">
+						<span class="tk-hover-sig"><span class="sx-k">def</span> <span class="sx-f">load</span>(path: <span class="sx-t">str</span> = <span class="sx-v">PATH</span>) -&gt; <span class="sx-t">Config</span></span>
+						<span class="tk-hover-doc">設定を読む</span>
+					</span>
+				</div>
+			</PreviewPane>
+			<PreviewPane n={3} at="3+" fx="split" name="config.py">
+				<div class="tk-code">
+					<span class="tk-cl"><i>7</i><b></b></span>
+					<span class="tk-cl tk-hl" data-at="3+" data-fx="state"><i>8</i><b><span class="sx-k">def</span> <span class="sx-f">load</span>(path=<span class="sx-v">PATH</span>):</b></span>
+					<span class="tk-cl"><i>9</i><b class="i1"><span class="sx-c">"""設定を読む"""</span></b></span>
+					<span class="tk-cl"><i>10</i><b class="i1">s = <span class="sx-f">read</span>(path)</b></span>
+					<span class="tk-cl"><i>11</i><b class="i1"><span class="sx-k">return</span> <span class="sx-f">parse</span>(s)</b></span>
+				</div>
+			</PreviewPane>
+		</Split>
+		<Pointer slot="overlay" path="2:37,47 3:37,47" click="3" />
+	</TakoWindow>
+
+	<Step title="打つと、候補が出る">
+		<p><code>cfg.</code> と打つと、語の頭の真下に候補が並びます。左の印は種類（<code>v</code> は変数、<code>f</code> は関数）で、右に型が出ます。<kbd>↑</kbd> <kbd>↓</kbd> で選んで <kbd>Enter</kbd> か <kbd>Tab</kbd> で確定します。</p>
+	</Step>
+	<Step title="乗せると、型と説明のカード">
+		<p>関数や変数にマウスを乗せると、少し置いて型と説明のカードが出ます。定義を開かなくても、何を渡せば何が返るかが分かります。</p>
+	</Step>
+	<Step title="⌘クリックで、定義へ">
+		<p><kbd>⌘</kbd> を押しながら乗せると下線が付き、そのまま押すと定義へ飛びます。別のファイルなら、右に新しいペインで開きます。右クリックからは参照の検索や呼び出し元の一覧も出せます。</p>
+		<p class="tk-step-note">言語サーバの機能は macOS 版で使えます。Windows 版（Ctrl+クリック）は実際の言語サーバでの確認がまだです。</p>
+	</Step>
+</Scrolly>

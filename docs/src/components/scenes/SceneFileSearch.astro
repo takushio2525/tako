@@ -1,0 +1,77 @@
+---
+/**
+ * 場面: ワークスペース横断検索（#2062）。3 手順。
+ * 事実の出どころ: .agent/requirements.md FR-3.43（⇧⌘F / Windows は Ctrl+Shift+G で右パネルの search ビューを
+ * 開いて検索欄へ。Enter で探す。範囲はタブのファイルツリーのルート。大文字小文字は区別しないのが既定・
+ * Aa / .* で切り替え。結果は 1 行 1 件をファイルごとに。行を押すと、そのファイルを開いているペインなら
+ * そのペインのその行へ・無ければ右に新しいペイン）。文言は crates/tako-app/src/ui_text/panel.rs の
+ * search_placeholder / search_count / search_scope。Windows でも使える（tako_search = 対応）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+import PreviewPane from '../motion/PreviewPane.astro';
+import EditorPanel from '../motion/EditorPanel.astro';
+---
+
+<Scrolly label="ワークスペースを横断して探し、その行を開く流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} height={25}>
+		<Split>
+			<PreviewPane n={2} focus name="app.py">
+				<div class="tk-stack tk-fill">
+					<div class="tk-code" data-at="!3+" data-fx="fade">
+						<span class="tk-cl"><i>1</i><b><span class="sx-k">import</span> config</b></span>
+						<span class="tk-cl"><i>2</i><b></b></span>
+						<span class="tk-cl"><i>3</i><b><span class="sx-k">def</span> <span class="sx-f">main</span>():</b></span>
+						<span class="tk-cl"><i>4</i><b class="i1">cfg = config.<span class="sx-f">load</span>()</b></span>
+						<span class="tk-cl"><i>5</i><b class="i1"><span class="sx-f">print</span>(cfg.port)</b></span>
+						<span class="tk-cl"><i>6</i><b class="i1"><span class="sx-f">serve</span>(cfg)</b></span>
+					</div>
+					<div class="tk-code" data-at="3+" data-fx="fade">
+						<span class="tk-cl"><i>39</i><b></b></span>
+						<span class="tk-cl"><i>40</i><b><span class="sx-k">def</span> <span class="sx-f">resolve</span>(args):</b></span>
+						<span class="tk-cl"><i>41</i><b class="i1"><span class="sx-k">if</span> args.port:</b></span>
+						<span class="tk-cl tk-hl" data-at="3+" data-fx="state"><i>42</i><b class="i2"><span class="sx-k">return</span> args.port</b></span>
+						<span class="tk-cl"><i>43</i><b class="i1"><span class="sx-k">return</span> <span class="sx-n">8000</span></b></span>
+					</div>
+				</div>
+			</PreviewPane>
+		</Split>
+		<EditorPanel slot="right" active="search" width="45%">
+			<span class="tk-ep-input">
+				<Icon name="search" />
+				<span class="tk-ep-q tk-stack">
+					<span class="tk-dim" data-at="1" data-fx="fade">ワークスペースを検索（Enter で探す）</span>
+					<span data-at="2+" data-fx="type">.port</span>
+				</span>
+				<span class="tk-ep-toggle">Aa .*</span>
+			</span>
+			<span class="tk-stack">
+				<span class="tk-ep-note" data-at="1" data-fx="fade" style="white-space: normal">検索語を入れて Enter を押すと、ワークスペースのファイルから行ごとに探します</span>
+				<span data-at="2+" data-fx="fade" style="--d: .5s; display: flex; flex-direction: column; gap: 0.2em; min-width: 0">
+					<span class="tk-ep-note"><b class="tk-c">4 件 · 2 ファイル</b>　範囲: my-app</span>
+					<span class="tk-ep-file">app.py <small>3</small></span>
+					<span class="tk-ep-row"><span class="tk-ep-pos">5</span><span class="tk-ep-msg">print(cfg<mark>.port</mark>)</span></span>
+					<span class="tk-ep-row"><span class="tk-ep-pos">41</span><span class="tk-ep-msg">if args<mark>.port</mark>:</span></span>
+					<span class="tk-ep-row" data-at="3+" data-fx="state"><span class="tk-ep-pos">42</span><span class="tk-ep-msg">return args<mark>.port</mark></span></span>
+					<span class="tk-ep-file">tests/test_app.py <small>1</small></span>
+					<span class="tk-ep-row"><span class="tk-ep-pos">7</span><span class="tk-ep-msg">assert cfg<mark>.port</mark> == 8000</span></span>
+				</span>
+			</span>
+		</EditorPanel>
+		<Pointer slot="overlay" path="3:72,66" click="3" />
+	</TakoWindow>
+
+	<Step title="⇧⌘F で、右に検索欄">
+		<p><kbd>⇧⌘F</kbd>（Windows は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd>）で右パネルに検索欄が開きます。探す範囲は、そのタブのファイルツリーのフォルダです。</p>
+	</Step>
+	<Step title="Enter で、全部のファイルから">
+		<p>語を入れて <kbd>Enter</kbd> を押すと、ファイルごとに一致した行が並びます。<code>.gitignore</code> の対象とバイナリは探しません。大文字と小文字は区別せず、<code>Aa</code> と <code>.*</code> で区別・正規表現に切り替えられます。</p>
+	</Step>
+	<Step title="押すと、その行が開く">
+		<p>結果の行を押すと、そのファイルのその行が開きます。開いているペインがあればそこへ、無ければ右に新しいペインで開きます。AI も <code>tako search</code> で同じように探せます。</p>
+	</Step>
+</Scrolly>

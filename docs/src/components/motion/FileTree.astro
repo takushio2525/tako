@@ -1,0 +1,70 @@
+---
+/**
+ * 左のファイルツリーの再現（#2062）。TakoWindow の slot="sidebar" に置く。
+ * 共有の Sidebar と違い、**狭い窓でも隠さない**（ツリーそのものが主役の場面用）。
+ *
+ *   <FileTree slot="sidebar" root="my-app" items={[
+ *     { name: 'tests', dir: true },
+ *     { name: 'README.md', hitAt: '2' },          … 手順 2 で選ばれた帯が付く
+ *     { name: 'config.py', git: 'M' },            … git の状態（黄 + M = 変更あり）
+ *   ]} />
+ *
+ * 見た目の正本は crates/tako-app/src/sidebar.rs（ルート見出し + インデント + git の色とバッジ）。
+ * 実物はタブ内の全ペインの cwd をルートとして並べる（FR-3.1）。
+ */
+import '../../styles/tako-editor.css';
+import Icon from './Icon.astro';
+
+interface Item {
+	name: string;
+	dir?: boolean;
+	/** 開いたフォルダ（▾） */
+	open?: boolean;
+	depth?: number;
+	/** git の状態のバッジ（M = 変更あり。色も黄になる） */
+	git?: 'M';
+	/** 行そのものを手順で出し入れする（data-at の書き方） */
+	at?: string;
+	/** 選ばれた帯が付く手順（data-at の書き方） */
+	hitAt?: string;
+}
+
+interface Props {
+	/** ワークスペースのフォルダ（タブ内のペインの cwd） */
+	root?: string;
+	branch?: string;
+	items: Item[];
+	/** ルートの行を出す手順（省略時は常に） */
+	rootAt?: string;
+}
+
+const { root = 'my-app', branch = 'main', items, rootAt } = Astro.props;
+---
+
+<div class="tk-side tk-ftree">
+	<div class="tk-side-head">
+		<Icon name="folder" />
+		<span class="tk-ft-name">{root}</span>
+		<span class="tk-branch"><Icon name="branch" />{branch}</span>
+	</div>
+	<div class="tk-tree">
+		<div class="tk-tree-row" data-at={rootAt} data-fx={rootAt ? 'fade' : undefined}>
+			<Icon name="chevronDown" /><Icon name="folder" /><span class="tk-ft-name">{root}</span>
+		</div>
+		{
+			items.map((it, i) => (
+				<span
+					class:list={['tk-tree-row', { 'is-file': !it.dir, 'is-mod': it.git === 'M' }]}
+					style={`--depth: ${(it.depth ?? 0) + 1}${it.at ? `; --d: ${0.08 * i}s` : ''}`}
+					data-at={it.at ?? it.hitAt}
+					data-fx={it.at ? 'left' : it.hitAt ? 'state' : undefined}
+				>
+					{it.dir && <Icon name={it.open ? 'chevronDown' : 'chevronRight'} />}
+					<Icon name={it.dir ? 'folder' : 'file'} />
+					<span class="tk-ft-name">{it.name}</span>
+					{it.git && <span class="tk-ft-badge">{it.git}</span>}
+				</span>
+			))
+		}
+	</div>
+</div>
