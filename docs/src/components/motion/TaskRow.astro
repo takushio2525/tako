@@ -1,0 +1,90 @@
+---
+/**
+ * tasks ビューの 1 行と、その直下に開く詳細（アコーディオン。#2058）。TasksPanel の .tk-ut-list に並べる。
+ * 行の並びは実物どおり: 開閉の矢印・種類の丸・id・タイトル・配送の丸（crates/tako-app/src/tasks_panel.rs）。
+ * 種類と配送は色の丸で出す（実物も絵文字を使わない）。詳細の中身は子に書く（TaskAttachment など）。
+ *
+ *   <TaskRow id="u-6" kind="review" title="ログイン画面の見た目を確認" at="2+" />
+ *   <TaskRow id="u-5" kind="post" title="…" openAt="2+">…詳細…</TaskRow>
+ */
+import Icon from './Icon.astro';
+
+type Kind = 'review' | 'confirm' | 'permission' | 'post' | 'other';
+type Delivery = 'sent' | 'launched' | 'delivered' | 'failed';
+
+interface Props {
+	id: string;
+	title: string;
+	kind?: Kind;
+	/** 完了・却下したもの（「完了も見る」のときだけ並ぶ） */
+	done?: boolean;
+	/** 詳細を開いている（常に） */
+	open?: boolean;
+	/** 詳細を開く手順（data-at の書き方） */
+	openAt?: string;
+	/** 配送の丸。手順で変えるときは at を付けて並べる */
+	delivery?: { state: Delivery; at?: string }[];
+	/** 行ごとの出し入れ（隠れている間は高さを取らない） */
+	at?: string;
+}
+
+const { id, title, kind = 'other', done = false, open = false, openAt, delivery = [], at } = Astro.props;
+const hasDetail = Astro.slots.has('default');
+---
+
+<div class="tk-ut-item" data-at={at} data-fx={at ? 'unfold' : undefined}>
+	<div>
+		<div
+			class:list={['tk-ut-row', { 'is-open': open, 'is-done': done }]}
+			data-at={openAt}
+			data-fx={openAt ? 'state' : undefined}
+		>
+			<span class="tk-ut-chev tk-stack">
+				{
+					open ? (
+						<Icon name="chevronDown" />
+					) : (
+						<>
+							<span data-at={openAt ? `!${openAt}` : undefined} data-fx="fade">
+								<Icon name="chevronRight" />
+							</span>
+							{openAt && (
+								<span data-at={openAt} data-fx="fade">
+									<Icon name="chevronDown" />
+								</span>
+							)}
+						</>
+					)
+				}
+			</span>
+			<i class:list={['tk-ut-dot', done ? 'is-done' : `is-${kind}`]}></i>
+			<span class="tk-ut-id">{id}</span>
+			<span class="tk-ut-title">{title}</span>
+			{
+				delivery.length > 0 && (
+					<span class="tk-ut-stackdot">
+						{delivery.map((d) => (
+							<i class:list={['tk-ut-dot', `is-${d.state}`]} data-at={d.at} data-fx={d.at ? 'fade' : undefined} />
+						))}
+					</span>
+				)
+			}
+		</div>
+		{
+			hasDetail &&
+				(open ? (
+					<div class="tk-ut-detail">
+						<slot />
+					</div>
+				) : (
+					<div data-at={openAt} data-fx="unfold">
+						<div>
+							<div class="tk-ut-detail">
+								<slot />
+							</div>
+						</div>
+					</div>
+				))
+		}
+	</div>
+</div>

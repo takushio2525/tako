@@ -1,0 +1,103 @@
+---
+/**
+ * 場面: スマホ（PWA の #/tasks）で片付ける（件数のバッジ → 一覧 → 添付をその場で再生・端末に保存 → コピーして返す）。4 手順。#2058
+ * 事実の出どころ: .agent/requirements.md FR-2.40.16（一覧・詳細・返答・バッジ）/ 2.40.18（添付の保存は端末の権限の範囲）/
+ * 2.40.19（コピーと共有。共有シートは 64 MB 以下）/ 2.40.21（画像と動画はその場で見られる）。
+ * 文言: web/tako-remote/src/pages/tasks.jsx。スマホの「やりとり」は新しい順・相対時刻（PC とは違う）。
+ * Windows の tako remote は未実測（pending）なので本文に書く。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import Phone from '../motion/Phone.astro';
+import PhoneCard from '../motion/PhoneCard.astro';
+import PhoneTaskRow from '../motion/PhoneTaskRow.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/tako-tasks.css';
+---
+
+<div class="tk-ut">
+	<Scrolly label="スマホからタスクを片付ける流れ" flip>
+		<Phone slot="stage" tasks={4} height={33}>
+			<div class="tk-phone-layer" data-at="1" data-fx="fade">
+				<PhoneCard title="マスター" role="master" state="running">u-6 の返答を待つ間、テストを進めています</PhoneCard>
+				<PhoneCard title="my-app" role="worker" state="running">src/login.tsx を編集中</PhoneCard>
+				<PhoneCard title="my-app" role="worker" state="wait" stateText="承認待ち">npm test を実行しますか？</PhoneCard>
+			</div>
+			<div class="tk-phone-layer" data-at="2" data-fx="fade">
+				<div class="tk-ut-ptop">
+					<span class="tk-ut-pback"><Icon name="chevronRight" />ペイン</span>
+					<span class="tk-ut-pcount">4 件待ち</span>
+				</div>
+				<div class="tk-ut-pfilters">
+					<span class="tk-ut-pchip is-active">すべて</span>
+					<span class="tk-ut-pchip">レビュー 2</span>
+					<span class="tk-ut-pchip">許可 1</span>
+					<span class="tk-ut-pchip">投稿 1</span>
+					<span class="tk-ut-pchip">完了も見る</span>
+				</div>
+				<PhoneTaskRow id="u-6" kind="review" title="ログイン画面の見た目を確認" />
+				<PhoneTaskRow id="u-5" kind="post" title="リリースのお知らせを X へ投稿" pressAt="2" />
+				<PhoneTaskRow id="u-4" kind="review" title="API の設計メモを確認" thread={1} delivery={{ text: 'master に届きました', tone: 'ok' }} />
+			</div>
+			<div class="tk-phone-layer" data-at="3" data-fx="fade">
+				<div class="tk-ut-ptop">
+					<span class="tk-ut-pback"><Icon name="chevronRight" />一覧</span>
+					<span class="tk-ut-pkind is-post">投稿</span>
+				</div>
+				<div class="tk-ut-ph1">リリースのお知らせを X へ投稿</div>
+				<div class="tk-ut-pmeta"><span class="tk-ut-pid">u-5</span><span>my-app</span><span style="color: var(--ph-amber)">期限 10/20</span></div>
+				<div class="tk-ut-pbody">動画を見て問題なければ投稿してください。</div>
+				<div class="tk-ut-ph2">添付</div>
+				<div class="tk-ut-pcard">
+					<div class="tk-ut-pvideo">
+						<Icon name="play" />
+						<span class="tk-ut-pseek"><i data-at="3" data-fx="state"></i></span>
+					</div>
+					<div class="tk-ut-pname">release.mp4 <small>18.2 MB</small></div>
+					<div class="tk-ut-pbtns">
+						<span class="tk-pbtn"><Icon name="download" />端末に保存</span>
+						<span class="tk-pbtn">アプリへ共有</span>
+					</div>
+				</div>
+			</div>
+			<div class="tk-phone-layer" data-at="4" data-fx="fade">
+				<div class="tk-ut-ph2">コピー用のテキスト</div>
+				<div class="tk-ut-pcard">
+					<div class="tk-ut-ptop">
+						<b>投稿文</b>
+						<span class="tk-pbtn" style="margin-left: auto" data-at="4" data-fx="mark"><Icon name="copy" />コピー</span>
+					</div>
+					<pre class="tk-ut-ppre">v1.2 を出しました。ログイン画面を新しくしています。</pre>
+					<span class="tk-ut-pok" data-at="4" style="--d: .9s">コピーしました</span>
+				</div>
+				<div class="tk-ut-ph2">返答</div>
+				<div class="tk-ut-pfilters">
+					<span class="tk-ut-pchip" data-at="4" data-fx="state" style="--d: 1.4s">承認</span>
+					<span class="tk-ut-pchip">却下</span>
+					<span class="tk-ut-pchip">直してほしい</span>
+					<span class="tk-ut-pchip">回答</span>
+				</div>
+				<div class="tk-ut-pfield">コメント（任意）</div>
+				<div class="tk-ut-pactions">
+					<span class="tk-pbtn is-primary">返す</span>
+				</div>
+			</div>
+			<Pointer slot="overlay" path="1:83,10 2:50,60 4:76,32" click="1 2 4" />
+		</Phone>
+
+		<Step title="スマホの右上に、待っている件数">
+			<p>スマホの tako（PWA）でも、同じタスクが見えます。ペイン一覧の右上のアイコンに<strong>未完了の件数</strong>が出ていて、押すと <code>#/tasks</code> が開きます。</p>
+		</Step>
+		<Step title="一覧から、片付けるものを選ぶ">
+			<p>種類での絞り込みと「完了も見る」は PC と同じです。行には、やりとりの件数と配送の状態も出ます。</p>
+		</Step>
+		<Step title="添付は、その場で見て保存できる">
+			<p>画像と動画はその場で表示・再生できるので、PC を開かずに中身を確かめられます。「端末に保存」で写真やファイルのアプリへ、「アプリへ共有」で投稿するアプリへ直接渡せます（共有は 64 MB まで）。</p>
+		</Step>
+		<Step title="コピーして貼り、そのまま返す">
+			<p>投稿文はボタン 1 つでクリップボードへ。貼り付けて投稿したら、判断を選んで返します。返答は PC から返したときと同じように master の入力欄へ届きます。</p>
+			<p class="tk-step-note">スマホからの操作（tako remote）は macOS で使えます。Windows は、実機での通しの確認がまだです。</p>
+		</Step>
+	</Scrolly>
+</div>

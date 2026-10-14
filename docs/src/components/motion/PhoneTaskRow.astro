@@ -1,0 +1,40 @@
+---
+/**
+ * スマホ版（PWA）の #/tasks の一覧の 1 行（#2058）。Phone の中に置く。
+ * 実物（web/tako-remote/src/pages/tasks.jsx の TaskRow）は種類の札とタイトル、その下に id・プロジェクト・
+ * やりとりの件数・配送の状態。配送は届いたら緑・届かなければ赤で、送信済みは色を付けない。
+ */
+type Kind = 'review' | 'confirm' | 'permission' | 'post' | 'other';
+
+interface Props {
+	id: string;
+	title: string;
+	kind?: Kind;
+	project?: string;
+	/** やりとりの件数（0 なら出さない） */
+	thread?: number;
+	delivery?: { text: string; tone?: 'ok' | 'error' };
+	at?: string;
+	fx?: string;
+	/** 押される手順（押された輪） */
+	pressAt?: string;
+}
+
+const LABEL: Record<Kind, string> = { review: 'レビュー', confirm: '確認', permission: '許可', post: '投稿', other: 'その他' };
+const { id, title, kind = 'other', project = 'my-app', thread = 0, delivery, at, fx, pressAt } = Astro.props;
+---
+
+<div data-at={at} data-fx={fx}>
+	<div class="tk-ut-prow" data-at={pressAt} data-fx={pressAt ? 'mark' : undefined}>
+		<div class="tk-ut-prow-head">
+			<span class:list={['tk-ut-pkind', `is-${kind}`]}>{LABEL[kind]}</span>
+			<span class="tk-ut-ptitle">{title}</span>
+		</div>
+		<div class="tk-ut-pmeta">
+			<span class="tk-ut-pid">{id}</span>
+			{project && <span>{project}</span>}
+			{thread > 0 && <span>やりとり {thread}</span>}
+			{delivery && <span class:list={{ [`is-${delivery.tone}`]: !!delivery.tone }}>{delivery.text}</span>}
+		</div>
+	</div>
+</div>

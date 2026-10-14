@@ -1,0 +1,42 @@
+---
+/**
+ * タスクの詳細の添付 1 件（#2058）。TaskRow の子に置く。
+ * 実物（tasks_panel.rs）は行そのものが「プレビューで開く」で、左に何が開くか（画像 / 動画 / PDF …）、
+ * 右に「Finder で表示」。画像には縮小（サムネイル）が付く。消えた添付は「見つかりません」で押せない。
+ *
+ *   <TaskAttachment route="画像" name="shots/login.png" thumb pressAt="2" />
+ */
+interface Props {
+	/** 何で開くか（実物の文言: 画像 / 動画 / PDF / Markdown / テキスト） */
+	route: string;
+	/** 表示名（実物はパスの末尾 2 要素） */
+	name: string;
+	/** 画像の縮小を出す */
+	thumb?: boolean;
+	/** 起票のあとで消えた添付 */
+	missing?: boolean;
+	/** 行を押す手順（押された輪） */
+	pressAt?: string;
+}
+
+const { route, name, thumb = false, missing = false, pressAt } = Astro.props;
+---
+
+<div class="tk-ut-att" data-at={pressAt} data-fx={pressAt ? 'mark' : undefined}>
+	{
+		thumb && !missing && (
+			<div class="tk-ut-thumb">
+				<span class="tk-ut-shot">
+					<i />
+					<i />
+					<i />
+				</span>
+			</div>
+		)
+	}
+	<div class="tk-ut-att-line">
+		{!missing && <span class="tk-ut-route">{route}</span>}
+		<span class:list={['tk-ut-name', { 'is-missing': missing }]}>{name}</span>
+		{missing ? <span class="tk-ut-missing">見つかりません</span> : <span class="tk-ut-sbtn">Finder で表示</span>}
+	</div>
+</div>

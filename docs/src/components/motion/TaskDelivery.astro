@@ -1,0 +1,47 @@
+---
+/**
+ * タスクの詳細の配送の 1 行（#2058）。TaskRow の子に置く。
+ * 実物は丸と「配送: 状態 (pane N) - 理由」。送信済み・起動しただけは黄、届いたら緑、届かなければ赤
+ * （tasks_panel.rs の delivery_color）。**送信済みを「届いた」と書かない・緑にしない**のが実物の約束。
+ *
+ *   <TaskDelivery states={[{ state: 'sent', at: '1' }, { state: 'delivered', pane: 1, at: '2+' }]} />
+ */
+type State = 'sent' | 'launched' | 'delivered' | 'failed';
+interface Line {
+	state: State;
+	at?: string;
+	pane?: number;
+	reason?: string;
+}
+
+interface Props {
+	states: Line[];
+	/** 行ごとの出し入れ（返す前は配送の記録が無いので出さない） */
+	at?: string;
+}
+
+const { states, at } = Astro.props;
+const LABEL: Record<State, string> = {
+	sent: '送信済み（確認待ち）',
+	launched: 'master を起動しました',
+	delivered: 'master に届きました',
+	failed: '届きませんでした',
+};
+---
+
+<div data-at={at} data-fx={at ? 'unfold' : undefined}>
+	<div class="tk-ut-swap">
+		{
+			states.map((s) => (
+				<div class="tk-ut-delivery" data-at={s.at} data-fx={s.at ? 'fade' : undefined}>
+					<i class:list={['tk-ut-dot', `is-${s.state}`]} />
+					<span class="tk-ut-delivery-text">
+						配送: {LABEL[s.state]}
+						{s.pane !== undefined && ` (pane ${s.pane})`}
+						{s.reason && ` - ${s.reason}`}
+					</span>
+				</div>
+			))
+		}
+	</div>
+</div>

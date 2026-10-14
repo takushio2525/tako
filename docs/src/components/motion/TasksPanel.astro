@@ -1,0 +1,62 @@
+---
+/**
+ * 右パネルの tasks ビュー（人がやること）の器（#2058）。TakoWindow の slot="right" に置く。
+ * 見た目は共有の RightPanel（.tk-right）と同じで、違いは 2 つ:
+ *  - tasks の件数を手順で入れ替えられる（counts）
+ *  - 幅の上限が無い（詳細を読める幅にする場面がある）
+ * 中身（子）は TasksHead と、TaskRow を並べた .tk-ut-list。正本は crates/tako-app/src/tasks_panel.rs
+ *
+ *   <TasksPanel slot="right" counts={[{ n: 3, at: '1' }, { n: 4, at: '2+' }]} width="56%">…</TasksPanel>
+ */
+import Icon from './Icon.astro';
+import '../../styles/tako-tasks.css';
+
+interface Count {
+	n: number;
+	/** その数を出す手順（data-at の書き方）。省略で常に */
+	at?: string;
+}
+
+interface Props {
+	counts?: Count[];
+	/** 窓に対する幅（既定 60%） */
+	width?: string;
+	/** 窓が狭いとき（26rem 未満 = スマホ幅）の幅（既定 62%） */
+	narrow?: string;
+	at?: string;
+	fx?: string;
+}
+
+const { counts = [], width = '60%', narrow = '62%', at, fx } = Astro.props;
+const views: { id: string; icon: 'fleet' | 'orch' | 'branch' | 'tasks' }[] = [
+	{ id: 'fleet', icon: 'fleet' },
+	{ id: 'orch', icon: 'orch' },
+	{ id: 'git', icon: 'branch' },
+	{ id: 'tasks', icon: 'tasks' },
+];
+---
+
+<div class="tk-right tk-ut-panel" data-at={at} data-fx={fx} style={`--rw: ${width}; --rw-narrow: ${narrow}`}>
+	<div class="tk-right-tabs">
+		{
+			views.map((v) => (
+				<span class:list={['tk-right-tab', { 'is-active': v.id === 'tasks' }]}>
+					<Icon name={v.icon} />
+					<span class="tk-right-label">{v.id}</span>
+					{v.id === 'tasks' && counts.length > 0 && (
+						<span class="tk-ut-counts">
+							{counts.map((c) => (
+								<span class="tk-count" style="grid-area: 1 / 1" data-at={c.at} data-fx={c.at ? 'pop' : undefined}>
+									{c.n}
+								</span>
+							))}
+						</span>
+					)}
+				</span>
+			))
+		}
+	</div>
+	<div class="tk-right-body tk-ut-body">
+		<slot />
+	</div>
+</div>

@@ -1,0 +1,100 @@
+---
+/**
+ * 場面: master が居ない・届かないときの配送（master を起動して渡す → 届いたと確かめる → 届かなければ理由）。4 手順。#2058
+ * 事実の出どころ: .agent/requirements.md FR-2.40.5（同じプロファイルの master が居なければ新しいタブに起動し、
+ * タスク本文 + 返答を初回メッセージとして渡す）/ 2.40.6（launched も決着するまで黄・失敗は理由つき）。
+ * 初回メッセージは crates/tako-control/src/user_tasks.rs の launch_message（返答 + 「--- タスク本文 ---」）。
+ * 失敗の理由の文言は同ファイルの UNRESOLVED_ORIGIN_REASON。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import TasksPanel from '../motion/TasksPanel.astro';
+import TasksHead from '../motion/TasksHead.astro';
+import TaskRow from '../motion/TaskRow.astro';
+import TaskReply from '../motion/TaskReply.astro';
+import TaskThread from '../motion/TaskThread.astro';
+import TaskDelivery from '../motion/TaskDelivery.astro';
+---
+
+<div class="tk-ut">
+	<Scrolly label="master が居ないときの配送の流れ">
+		<TakoWindow
+			slot="stage"
+			tabs={[
+				{ label: 'my-app', state: 'idle', active: true, activeAt: '!2+' },
+				{ label: 'my-app (AI チーム)', state: 'running', at: '2+', activeAt: '2+' },
+			]}
+			height={27}
+			status={false}
+		>
+			<Split>
+				<div class="tk-stack" style="flex: 1 1 0; min-width: 0">
+					<Pane n={1} title="my-app" state="idle" at="!2+" fx="fade">
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+					</Pane>
+					<Pane n={2} title="マスター" badge="ORCH" state="running" at="2+" fx="fade" focus>
+						<span class="tk-l tk-tui-user" data-at="2+" style="--d: .5s">【ユーザー返答】todo u-8「リリースは今日でよいか」
+decision=answered via=pc kind=confirm status=open
+コメント: 明日の朝にしてください
+--- タスク本文 ---
+変更は揃いました。今日リリースしてよいですか</span>
+						<span class="tk-l tk-tui-msg" data-at="3+" style="--d: .3s">了解です。明日の朝にリリースします</span>
+					</Pane>
+				</div>
+			</Split>
+			<TasksPanel slot="right" width="60%" narrow="64%" counts={[{ n: 2 }]}>
+				<TasksHead waiting={[{ n: 2 }]} kinds={['確認', '投稿']} />
+				<div class="tk-ut-list">
+					<TaskRow
+						id="u-8"
+						kind="confirm"
+						title="リリースは今日でよいか"
+						openAt="!4"
+						delivery={[{ state: 'launched', at: '2' }, { state: 'delivered', at: '3+' }]}
+					>
+						<div class="tk-ut-meta"><span class="tk-ut-kind">確認</span></div>
+						<TaskThread
+							at="2+"
+							counts={[{ n: 1 }]}
+							entries={[{ head: '10:52 · PC · 回答', text: '明日の朝にしてください' }]}
+						/>
+						<TaskReply pick={{ label: '回答', at: '1' }} comment={{ text: '明日の朝にしてください', at: '1' }} pressAt="2" />
+						<TaskDelivery at="2+" states={[{ state: 'launched', pane: 2, at: '2' }, { state: 'delivered', pane: 2, at: '3+' }]} />
+					</TaskRow>
+					<TaskRow id="u-7" kind="post" title="ブログの下書きを投稿" openAt="4" delivery={[{ state: 'failed' }]}>
+						<div class="tk-ut-meta"><span class="tk-ut-kind">投稿</span></div>
+						<TaskThread counts={[{ n: 1 }]} entries={[{ head: '10/12 18:20 · スマホ · 回答', text: '来週に回してください' }]} />
+						<TaskDelivery
+							states={[
+								{
+									state: 'failed',
+									reason: '宛先不明: 起票元の master プロファイルを解決できない（呼び出し元の role も spawn 元の master も残っていない）',
+								},
+							]}
+						/>
+					</TaskRow>
+				</div>
+			</TasksPanel>
+			<Pointer slot="overlay" path="1:56,68 2:48,72 4:62,46" click="2 4" />
+		</TakoWindow>
+
+		<Step title="master を閉じていても、返せる">
+			<p>返答の宛先は、そのタスクを起票した master です。その master をもう閉じていても、気にせず「返す」を押せます。</p>
+		</Step>
+		<Step title="居なければ、tako が master を起動して渡す">
+			<p>同じプロファイルの master が見つからなければ、tako が新しいタブに master を起動します。起動を待ってから、<strong>タスクの本文と返答</strong>を最初のメッセージとして渡すので、何の話か分からないまま始まることはありません。</p>
+			<p>配送は「master を起動しました」の黄色です。</p>
+		</Step>
+		<Step title="受け取ったと確かめてから「届きました」">
+			<p>起動した master の入力欄へ入ったことを確かめると、「master に届きました」の緑に変わります。確かめられないうちは、届いたことにしません。</p>
+		</Step>
+		<Step title="届かなければ、理由つきで残る">
+			<p>宛先が分からない・起動に失敗したなど、届けられなかったときは「届きませんでした」の赤と理由が残ります。黙って消えることはありません。</p>
+			<p>行の右の丸でも、配送の状態が一覧のまま分かります。</p>
+		</Step>
+	</Scrolly>
+</div>

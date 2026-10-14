@@ -1,0 +1,36 @@
+---
+/**
+ * 左のファイルツリーの上端に出る通知の 1 行（#2058）。TakoWindow の slot="sidebar" に置く。
+ * 起票されると「新しいユーザータスク u-N: タイトル」が 1 行出る（本文・添付は出さない）。
+ * 正本は crates/tako-app/src/sidebar.rs（notify_user_task_added → remote_notice の帯）と
+ * ui_text/sidebar.rs の notice_user_task_added。
+ * 共有の Sidebar より細く、窓が狭いとき（26rem 未満）は隠れる。
+ */
+import Icon from './Icon.astro';
+import '../../styles/tako-tasks.css';
+
+interface Props {
+	project?: string;
+	notice: { text: string; at: string };
+	items?: string[];
+}
+
+const { project = 'my-app', notice, items = ['docs', 'src', 'README.md'] } = Astro.props;
+---
+
+<div class="tk-ut-side">
+	<div class="tk-ut-side-head"><Icon name="folder" />{project}</div>
+	<div data-at={notice.at} data-fx="unfold">
+		<div class="tk-ut-side-notice">{notice.text}</div>
+	</div>
+	<div class="tk-ut-side-tree">
+		{
+			items.map((it) => (
+				<span>
+					<Icon name={it.includes('.') ? 'file' : 'folder'} />
+					{it}
+				</span>
+			))
+		}
+	</div>
+</div>
