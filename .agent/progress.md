@@ -63,6 +63,3 @@
 ## 2026-10-14（#2032: issue1944_lsp_fetch の取得中の検査のフレーク = 状態と進捗は別々に変わるので、揃った 1 回の読みを状態待ちで捕まえる）
 - 真因: 製品は状態（取得中）と進捗（fetch のレジストリ）を別々に変えるので、進捗を置く前と、取り終えて進捗を消してから稼働へ移るまで（#1977 の片付けが走る）は「取得中なのに進捗が無い」。旧テストは各時点で両方を求めていた。配布元に最後の 4 KiB を止める `Serve::Held` を足し、status と画面の口をそれぞれ 1 回の読みで確かめる。注入 `TAKO_2032_INJECT_OLD_FILES=<n>`
 - 実測: 旧 + 前の版の段 500 ファイル 5/5 FAILED・旧 + 進捗を置く前に 200 ms 3/3 FAILED（どちらも CI と同じ assert）・新は同じ注入で 5/5 / 3/3 ok・画面に進捗を出さない壊し方で新が名指しで落ちる・新 20/20 ok
-## 2026-10-15（#2056: クイックスタートをスクロール連動のモーションで作り直した = setup・タブとペイン・隣で dev サーバー・fleet）
-- 4 場面: setup のバナー → [OK] → 残り N 件 → 再実行で素通り / 分割・移動・リサイズのキーを macOS と Windows で併記 / AI が同じタブに dev サーバー → ポートのチップ → 承諾で Web ビュー / fleet で全タブ → 行でジャンプ → AI に直させる。部品 Fleet・FleetTab・FleetRow・PortChip・KeyHint・Keys・KeyTable を新設、TakoWindow に panelAt・tabs[].states を足すだけ
-- 検証: build・og:verify・verify-links・verify-seo ほか緑、Playwright で 1440 / 375 × 明暗 × 動き / reduce の 44 手順を撮って横はみ出し 0
