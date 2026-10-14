@@ -1,0 +1,70 @@
+# 一時（#2092 の検証用。最終の差分からは戻す）
+name: tmp-2092
+
+on:
+  push:
+    branches: [fix/2092-win-codepage-pin-hold]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  win:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/tako-remote/package-lock.json
+      - name: PWA
+        shell: bash
+        working-directory: web/tako-remote
+        run: npm ci --no-audit --no-fund && npm run build
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tmp-2092
+      - name: psmux を入れる
+        shell: pwsh
+        run: |
+          $url = "https://github.com/marlocarlo/psmux/releases/download/v3.4.0/psmux-v3.4.0-windows-x64.zip"
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\psmux.zip"
+          Expand-Archive "$env:RUNNER_TEMP\psmux.zip" -DestinationPath "$env:RUNNER_TEMP\psmux"
+          $exe = Get-ChildItem -Recurse "$env:RUNNER_TEMP\psmux" -Filter psmux.exe | Select-Object -First 1
+          Write-Host "psmux: $($exe.FullName)"
+          & $exe.FullName -V
+          "TAKO_PSMUX_BIN=$($exe.FullName)" >> $env:GITHUB_ENV
+          $exe.DirectoryName >> $env:GITHUB_PATH
+      - name: ビルド（テスト）
+        run: cargo test -p tako-core -p tako-control --no-run
+      - name: encoding_pin の単体
+        run: cargo test -p tako-core --lib encoding_pin -- --nocapture
+      - name: 窓の実測（10 回）
+        env:
+          TAKO_2092_MEASURE: "10"
+        run: cargo test -p tako-core --test issue2092_pin_hold 固定までの窓を測る -- --nocapture --test-threads=1
+      - name: issue2092_pin_hold（5 巡）
+        shell: bash
+        run: |
+          fail=0
+          for i in 1 2 3 4 5; do
+            echo "=== round $i"
+            cargo test -p tako-core --test issue2092_pin_hold -- --nocapture --test-threads=1 || fail=$((fail+1))
+          done
+          echo "failed rounds: $fail"
+          test "$fail" -eq 0
+      - name: encoding_conpty（回帰）
+        if: always()
+        run: cargo test -p tako-core --test encoding_conpty -- --nocapture
+      - name: check-health と persist.log（tako-control）
+        if: always()
+        run: cargo test -p tako-control --test issue2092_encoding_pin_health -- --nocapture
+      - name: dispatch の単体
+        if: always()
+        run: cargo test -p tako-control --lib issue2092 -- --nocapture
