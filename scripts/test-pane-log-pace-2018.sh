@@ -10,12 +10,17 @@
 #      （出力が止まった次の tick で取り込む）
 #   ④ 器の履歴が保持上限（10000 行）で飽和した後も出し続けてから閉じる → 飽和後の行が
 #      欠け・重複なく入る（飽和すると行数が増えないので、末尾の照合で新しい行を探す経路）
-#   ③ 出力し続けている最中に器が自ら消える → 判定はせず、最後に何行抜けたかを出す
-#      （tmux 側の履歴は器と一緒に消えるので、最後の取り込みの後の行は修正前も今も拾えない。
-#      修正前は最大 2 秒ぶん、今は最大 10 秒ぶん = 間引きの代償。#2018 の報告と設計書 §10）
+#   ③ 出力し続けている最中に器が自ら消える（`tako split -- <cmd>` の成功 = FR-2.5.14）→
+#      0〜1499 が欠け・重複なく入り、最後の行まで届く（#2085: 器の `pane-died` フックが
+#      消える前に全履歴と画面を書き出し、tako が閉じるときに読む）。#2085 の前は tmux の履歴が
+#      器と一緒に消えるので最後の取り込みの後の行（#2018 で最大 10 秒）が入らなかった
+#   ⑤ 成功したコマンドのペインは終わった直後に閉じる（FR-2.5.14。#2085 は remain-on-exit を
+#      立てるので、閉じるのが遅れていないかを終わった時刻からの経過で測る）
+#   ⑥ 失敗したコマンドのペインは閉じずに終了コードを伝える（FR-2.5.14 ②。#1031 / #1778）
 #
-# 新しい挙動で ①② が通ること、旧挙動（A/B）で ① の最後の増分が抜けることを出す。
-# 使い方: bash scripts/test-pane-log-pace-2018.sh [new|legacy|both（既定）]
+# 新しい挙動で ①〜⑥ が通ること、旧挙動（A/B）で ① の最後の増分（TAKO_2018_LEGACY=1）・
+# ③ の末尾（TAKO_2085_LEGACY=1）が抜けることを出す。
+# 使い方: bash scripts/test-pane-log-pace-2018.sh [new|legacy|legacy2085|both（既定 = 3 つとも）]
 #
 # 隔離 GUI・tako-vd・自分の tmux ソケットだけ。落とすのは自分で起こした pid と自分のソケットだけ。
 set -uo pipefail
@@ -187,14 +192,53 @@ run_arm() { # <名前> [VAR=VAL...]
     fail "${arm} ④: first ${1}・欠け ${5} 行（${4} か所）・重複 ${6}・最後 ${2}（画面 ${vis:-?}）・マーカー ${8}"
   fi
 
-  # ③（判定しない）出力し続けている最中に器が自ら消える
+  # ③ 出力し続けている最中に器が自ら消える（#2085）
   p="$("$TAKO_BIN" split --pane "$first" --right -- python3 -u -c "$(gen R 1500)" | tr -d '[:space:]')"
   "$TAKO_BIN" focus "$first" >/dev/null 2>&1
   wait_gone "$p" || echo "  （③ のペインが 30 秒で閉じなかった）"
   wait_closed "$p" R || true
   r="$(seq_of "$p" R)"
+  echo "  ③ ペインログ = $r"
   set -- $r
-  echo "  ③ 計測: 出力 1500 行のうち最後に入ったのは ${2}（抜けた末尾 $((1499 - ${2})) 行・途中の欠け ${5}）"
+  if [ "$1" = 0 ] && [ "$2" = 1499 ] && [ "$3" = 1500 ] && [ "$4" = 0 ] && [ "$6" = 0 ] && [ "$7" = 0 ] && [ "$8" = yes ]; then
+    pass "${arm} ③: 器が自ら消えても 0〜1499 の 1500 行が 1 回ずつ入り、最後の行まで届いた"
+  elif [ "$arm" != new ]; then
+    echo "  旧挙動の再現: 最後に入ったのは ${2}（抜けた末尾 $((1499 - ${2})) 行・途中の欠け ${5}・重複 ${6}）"
+  else
+    fail "${arm} ③: first ${1}・last ${2}・n ${3}・欠け ${5} 行（${4} か所）・重複 ${6}・省略 ${7}・マーカー ${8}"
+  fi
+
+  # ⑤ 成功したコマンドのペインは終わった直後に閉じる（FR-2.5.14）
+  local done_at gone_at ms
+  p="$("$TAKO_BIN" split --pane "$first" --right -- python3 -u -c "import time; print('S'); open('$TMP/s5-$arm', 'w').write(repr(time.time()))" | tr -d '[:space:]')"
+  "$TAKO_BIN" focus "$first" >/dev/null 2>&1
+  for i in $(seq 1 300); do
+    pane_alive "$p" || break
+    sleep 0.02
+  done
+  gone_at="$(python3 -c 'import time; print(repr(time.time()))')"
+  done_at="$(cat "$TMP/s5-$arm" 2>/dev/null || echo "$gone_at")"
+  ms="$(python3 -c "print(int((float('$gone_at') - float('$done_at')) * 1000))")"
+  echo "  ⑤ 終わってから閉じるまで ${ms} ms"
+  if pane_alive "$p"; then
+    fail "${arm} ⑤: 成功したコマンドのペインが 6 秒で閉じない"
+  elif [ "$ms" -lt 2000 ]; then
+    pass "${arm} ⑤: 成功したコマンドのペインは終わってから ${ms} ms で閉じた"
+  else
+    fail "${arm} ⑤: 成功したコマンドのペインが閉じるまで ${ms} ms かかった"
+  fi
+
+  # ⑥ 失敗したコマンドのペインは閉じずに終了コードを伝える（FR-2.5.14 ②）
+  p="$("$TAKO_BIN" split --pane "$first" --right -- /bin/sh -c 'echo F; exit 3' | tr -d '[:space:]')"
+  "$TAKO_BIN" focus "$first" >/dev/null 2>&1
+  sleep 3
+  r="$("$TAKO_BIN" run-interactive-status "$p" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("exit_code"))' 2>/dev/null)"
+  if pane_alive "$p" && [ "$r" = 3 ]; then
+    pass "${arm} ⑥: 失敗したコマンドのペインは閉じずに終了コード 3 を伝えた"
+  else
+    fail "${arm} ⑥: 失敗したコマンドのペイン（生存 $(pane_alive "$p" && echo yes || echo no)・終了コード ${r:-?}）"
+  fi
+  "$TAKO_BIN" close --pane "$p" >/dev/null 2>&1
 
   stop_isolated_gui "$ISOLATED_GUI_PID"
   ISOLATED_GUI_PID=""
@@ -205,11 +249,13 @@ run_arm() { # <名前> [VAR=VAL...]
 case "$ARMS" in
   new) run_arm new ;;
   legacy) run_arm legacy TAKO_2018_LEGACY=1 ;;
+  legacy2085) run_arm legacy2085 TAKO_2085_LEGACY=1 ;;
   both)
     run_arm new
     run_arm legacy TAKO_2018_LEGACY=1
+    run_arm legacy2085 TAKO_2085_LEGACY=1
     ;;
-  *) echo "不明: ${ARMS}（new / legacy / both）" >&2; exit 2 ;;
+  *) echo "不明: ${ARMS}（new / legacy / legacy2085 / both）" >&2; exit 2 ;;
 esac
 echo
 echo "PASS ${PASS} / FAIL ${FAIL}"

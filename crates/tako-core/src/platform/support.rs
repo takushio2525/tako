@@ -151,6 +151,14 @@ pub mod notes {
         "Folders open with the bundled OpenSSH client, but without connection multiplexing (ControlMaster) every operation authenticates on its own (a password-only host asks on every expansion, and liveness cannot be determined, #1090). Auto-adding folders by detecting ssh in a pane (#976) does not work because process command lines are unavailable; only the explicit open path is usable",
     );
 
+    /// #2085。器（tmux）は `pane-died` フックで自ら閉じるペインの最後の出力を書き出すが、
+    /// psmux では同じ形（`pane-died`・入れ子のコマンド列・`save-buffer` のパスの書式）を
+    /// 実機で確かめていないので立てていない（`BackendCapabilities::keeps_exit_output`）
+    pub const WIN_PANE_LOG_EXIT_TAIL: Note = Note::new(
+        "ペインログは動くが、器（psmux）の中のコマンドが出力し続けている最中に自ら終わると、最後の取り込みの後の行（最大 10 秒ぶん）が入らない。psmux で終わる前の出力を書き出す手段（pane-died フック）を実機で確かめていないため（#2085）。手で閉じる・CLI / MCP で閉じる・出力が止まってから終わる場合は最後まで入る",
+        "Pane logs work, but when a command inside the psmux container exits while still producing output, the lines after the last capture (up to 10 seconds) are not recorded, because writing out the final output before exit (the pane-died hook) has not been verified on psmux (#2085). Closing by hand, via the CLI / MCP, or after output has stopped records everything",
+    );
+
     /// #519。器は psmux。一覧と kill は通るが attach 系は通らない
     pub const WIN_TMUX_ATTACH: Note = Note::new(
         "永続化の器は psmux で、attach と send-keys を前提にする tmux 操作は動かない",
@@ -798,9 +806,11 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_logs",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_PANE_LOG_EXIT_TAIL,
+        },
         windows_evidence: Evidence::SelfTest(
-            "項目 87 / 104（ペインログのクローズマーカーと発生源）",
+            "項目 87 / 104（ペインログのクローズマーカーと発生源）。#2085 の縮退（自ら終わったコマンドの最後の出力）は、psmux の能力 keeps_exit_output = false で器の設定へ 1 行も足さないことを tmux_backend の単体（能力の無い器へは1行も書かない）が固定",
         ),
     },
     Feature {

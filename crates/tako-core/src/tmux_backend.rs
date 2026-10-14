@@ -197,10 +197,247 @@ pub fn backend_conf(caps: &BackendCapabilities) -> String {
 
 /// いまの器へ書く設定の中身。
 ///
-/// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）
+/// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）と
+/// `TAKO_2085_LEGACY=1`（自ら閉じたペインの最後の出力を書き出さない = #2085 前の挙動）
 fn conf_body() -> String {
     let legacy = std::env::var("TAKO_974_LEGACY").is_ok_and(|v| v == "1");
-    backend_conf(&apply_legacy(crate::backend::capabilities(), legacy))
+    let caps = crate::backend::capabilities();
+    let mut body = backend_conf(&apply_legacy(caps, legacy));
+    body.push_str(&pane_died_conf(
+        &caps,
+        pane_died_dir().as_deref(),
+        issue2085_legacy(),
+    ));
+    body
+}
+
+/// 自ら閉じたペインの最後の出力の置き場（#2085。`<data_dir>/pane-died/`）
+pub const PANE_DIED_DIR: &str = "pane-died";
+
+/// 書き出しの拡張子。名前は `<セッション名>.<history_size>.<history_limit>.<history_bytes>.<alternate_on>.dump`
+const PANE_DIED_EXT: &str = "dump";
+
+/// 読まれずに残った書き出しを消すまでの猶予（#2085）。
+///
+/// 書き出しは器が消えた直後（数 ms〜数百 ms）に tako が読んで消す。残るのは tako が居ない間に
+/// 消えた器（次に同じセッション名で器を作るときにも消す）・ペインログを書かない副インスタンスの器・
+/// 器の外の `tako-` セッションくらいで、どれも読む人が居ない
+pub const PANE_DIED_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// #2085 の A/B（`TAKO_2085_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// 器に `remain-on-exit` / `pane-died` フックを立てず（立っていれば外す）、閉じるときに
+/// 書き出しを読まない。**ゲートはこの 1 か所**（tako-app もここを読む）
+pub fn issue2085_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2085_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 自ら閉じたペインの最後の出力の置き場（[`PANE_DIED_DIR`]）。データディレクトリが無ければ None
+pub fn pane_died_dir() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join(PANE_DIED_DIR))
+}
+
+/// 器が自ら閉じるペインの最後の出力を書き出させる設定（#2085。**純関数**）。
+///
+/// 器の履歴はセッションと一緒に消えるので、出力し続けている最中に中のコマンドが終わると
+/// ペインログの最後の取り込みの後の行（#2018 で最大 10 秒ぶん）が入らなかった。
+/// `remain-on-exit on` でペインを死んだまま残し、`pane-died` フックで
+/// 「全履歴 + 画面」を `capture-pane` → `save-buffer` で書かせてから `kill-pane` する。
+/// 書くのは tmux サーバー自身なので**子プロセスは 1 本も増えない**。tako は器が消えて
+/// attach クライアントが終わったとき（`CloseOrigin::ProcessExit`）にそれを読む。
+///
+/// tmux 3.6b の実測で決めた形（`.agent/plans/2026-10-lightweight.md` §11）:
+///
+/// - **フックの中の失敗は後ろのコマンドを全部捨てる**（同じ行 = 同じグループ）。
+///   `save-buffer` の失敗（置き場が無い等）で `kill-pane` まで捨てられると、死んだペインが
+///   残り続けて**ペインが永久に閉じなくなる**。失敗しうるコマンドは `if -F` の入れ子
+///   （別グループ）へ隔離し、`kill-pane` は外側に置く
+/// - **`set-hook` が通らなかったら `remain-on-exit` も立てない**。同じ行に `;` でつなぎ、
+///   `set-hook` の失敗で後ろが捨てられるようにする（逆順だと死んだペインが残り続ける）
+/// - **`save-buffer` のパスの書式はフックのペインの文脈で展開されない**（複数のペインが
+///   同時に死ぬと別のセッションの名前・行数になった）。ターゲットを持つ `set -gF` で
+///   フックのペインの文脈のまま名前を作り、`save-buffer` はそのユーザーオプションを読むだけにする
+/// - `-t '#{hook_pane}'` は展開されない（`can't find pane`）ので、対象は既定（フックのペイン）に任せる
+/// - `remain-on-exit-format ''` が無いと、死んだときに画面を 1 行送って
+///   `Pane is dead (…)` を書き込む（履歴が 1 行増え、画面の最後の行が化ける）
+/// - 書き出すのは**器の最後のペインが死んだとき**（= セッションが消えるとき）だけ。
+///   分割したペインや `tako-` 以外のセッションは書かずに `kill-pane` だけ（`remain-on-exit` off と同じ）
+///
+/// 能力の無い器（psmux）へは**1 行も書かない**。A/B（`legacy`）と置き場が無いときは、
+/// 生きているサーバーに立っていたものを外す行を書く
+pub fn pane_died_conf(caps: &BackendCapabilities, dir: Option<&Path>, legacy: bool) -> String {
+    if !caps.keeps_exit_output {
+        return String::new();
+    }
+    let Some(dir) = dir.filter(|_| !legacy) else {
+        return "set -g remain-on-exit off\nset-hook -gu pane-died\n".to_string();
+    };
+    format!(
+        "set -g @tako-pane-died-dir {dir}
+set-hook -g pane-died {{
+  if -F '#{{&&:#{{m:{prefix}*,#{{session_name}}}},#{{&&:#{{==:#{{window_panes}},1}},#{{==:#{{session_windows}},1}}}}}}' {{
+    set -gF @tako-pane-died-name '#{{session_name}}.#{{history_size}}.#{{history_limit}}.#{{history_bytes}}.#{{alternate_on}}'
+    capture-pane -b tako-pane-died -S - -E -
+    save-buffer -b tako-pane-died '#{{@tako-pane-died-dir}}/#{{@tako-pane-died-name}}.{PANE_DIED_EXT}'
+    delete-buffer -b tako-pane-died
+  }}
+  kill-pane
+}} ; set -g remain-on-exit on ; set -gq remain-on-exit-format ''
+",
+        dir = conf_quote(&dir.display().to_string()),
+        prefix = SESSION_PREFIX,
+    )
+}
+
+/// tmux の設定ファイルの 1 語として引用する（#2085。データディレクトリのパス用）。
+/// 単引用符の中は何も解釈されないので、単引用符を含まなければそれで括る。含むときは
+/// 二重引用符で括り、その中で意味を持つ `\` `"` `$` を逃がす
+fn conf_quote(word: &str) -> String {
+    if !word.contains('\'') {
+        return format!("'{word}'");
+    }
+    let mut out = String::from("\"");
+    for c in word.chars() {
+        if matches!(c, '\\' | '"' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// 器が自ら閉じたペインの最後の出力（#2085。`pane-died` フックが書いた全履歴 + 画面）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneDiedDump {
+    /// 死んだ瞬間の probe（行数・上限・バイト数・alt screen）
+    pub probe: crate::tmux::PaneLogProbe,
+    /// 履歴（`probe.history` 行。古い順）
+    pub history: Vec<String>,
+    /// 死んだ瞬間の画面の行
+    pub screen: Vec<String>,
+}
+
+/// 書き出しのファイル名から probe を読む（純関数）。`session` のものでなければ None。
+/// セッション名に `.` が入っても読めるよう、数値の 4 つは右から切る
+pub fn parse_pane_died_name(file_name: &str, session: &str) -> Option<crate::tmux::PaneLogProbe> {
+    let rest = file_name
+        .strip_prefix(session)?
+        .strip_prefix('.')?
+        .strip_suffix(PANE_DIED_EXT)?
+        .strip_suffix('.')?;
+    let mut f = rest.split('.');
+    let probe = crate::tmux::PaneLogProbe {
+        history: f.next()?.parse().ok()?,
+        limit: f.next()?.parse().ok()?,
+        bytes: f.next()?.parse().ok()?,
+        alternate: match f.next()? {
+            "1" => true,
+            "0" => false,
+            _ => return None,
+        },
+    };
+    f.next().is_none().then_some(probe)
+}
+
+/// 書き出しの中身を履歴と画面に分ける（純関数）。`capture-pane -S - -E -` は履歴
+/// （`#{history_size}` 行）の後ろに画面の行を出す。履歴に足りなければ壊れた書き出しとして None
+pub fn split_pane_died_dump(probe: crate::tmux::PaneLogProbe, text: &str) -> Option<PaneDiedDump> {
+    let mut history: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    if history.len() < probe.history {
+        return None;
+    }
+    let screen = history.split_off(probe.history);
+    Some(PaneDiedDump {
+        probe,
+        history,
+        screen,
+    })
+}
+
+/// `session` の書き出しを読んで消す（#2085）。無ければ None。
+///
+/// 1 つのセッションが消えるのは 1 回なので普通は 1 つしか無い。複数あれば
+/// 新しいものを読み、残りも消す（読まれない書き出しを溜めない）
+pub fn take_pane_died_dump(dir: &Path, session: &str) -> Option<PaneDiedDump> {
+    let mut found: Vec<(std::time::SystemTime, PathBuf, crate::tmux::PaneLogProbe)> =
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let probe = parse_pane_died_name(entry.file_name().to_str()?, session)?;
+                let modified = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                Some((modified, entry.path(), probe))
+            })
+            .collect();
+    found.sort_by_key(|(modified, _, _)| *modified);
+    let (_, newest, probe) = found.pop()?;
+    let text = std::fs::read(&newest).ok();
+    for path in found.iter().map(|(_, path, _)| path).chain([&newest]) {
+        let _ = std::fs::remove_file(path);
+    }
+    split_pane_died_dump(probe, &String::from_utf8_lossy(&text?))
+}
+
+/// `session` の書き出しを読まずに消す（#2085）。器を作る・繋ぎ直すときに呼ぶ:
+/// tako が居ない間に消えた器の書き出しを、同じ名前で作り直した器の死と取り違えない
+pub fn discard_pane_died_dumps(dir: &Path, session: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let named = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| parse_pane_died_name(name, session).is_some());
+        if named {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 読まれずに `max_age` を過ぎた書き出しを消す（#2085。[`PANE_DIED_STALE_AFTER`]）。
+/// 消した数を返す
+pub fn sweep_pane_died_dumps(dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let is_dump = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(&format!(".{PANE_DIED_EXT}")));
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| now.duration_since(modified).unwrap_or_default() >= max_age);
+        if is_dump && stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 置き場を作る（#2085）。ペインの中身が入るので本人だけが読める形にする
+fn ensure_pane_died_dir(dir: &Path) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
 }
 
 /// A/B の適用（**純関数**）。`TAKO_974_LEGACY=1` は器の能力を無視して全部書く
@@ -250,6 +487,13 @@ set -gq copy-mode-position-format ''
 /// そこでサーバーが初めて起きると、後続のペインは同じサーバーを使う（`-f` は起動時にしか
 /// 読まれない）ので、製品と同じ conf で起こす（#1918）
 pub fn ensure_conf() -> PathBuf {
+    // #2085: `pane-died` フックが書く置き場を先に作る（無いと書き出しが失敗する。
+    // その場合も `kill-pane` は走るので、ペインが閉じないことにはならない）
+    if crate::backend::capabilities().keeps_exit_output && !issue2085_legacy() {
+        if let Some(dir) = pane_died_dir() {
+            ensure_pane_died_dir(&dir);
+        }
+    }
     let body = conf_body();
     data_dir()
         .and_then(|dir| write_conf_in(&dir, &body).ok())
@@ -284,19 +528,29 @@ fn write_conf_in(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
 /// conf は `-f` でサーバー**起動時**にしか読まれず、サーバーは tako の再起動を
 /// 生き残る（FR-5 の永続化）ため、tako のバージョン更新で変えた設定が
 /// 既存サーバーへ届かない（2026-06-12 実機バグ (2) の温床）。
-/// アプリ起動時・persist 有効化時に呼ぶ。サーバー不在なら何もしない（起動もしない）
+/// アプリ起動時・persist 有効化時に呼ぶ。サーバー不在なら何もしない（起動もしない）。
+///
+/// 読まれずに残った自ら閉じたペインの書き出し（#2085）もここで片付ける
 pub fn sync_conf(socket: &str) {
     let conf = ensure_conf();
     let _ = crate::tmux::tmux_command(Some(socket))
         .arg("source-file")
         .arg(&conf)
         .output();
+    if let Some(dir) = pane_died_dir() {
+        sweep_pane_died_dumps(&dir, PANE_DIED_STALE_AFTER);
+    }
 }
 
 /// SpawnOptions を tmux セッション経由に書き換える。
 /// `options.env`（TAKO_* 注入を含む）はクライアント経由でセッション作成時の環境になる。
 /// `options.cwd` は `-c` で渡す（既存セッションへの attach では tmux が無視する）
 pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> SpawnOptions {
+    // #2085: 同じ名前の器の前の死の書き出し（tako が居ない間に消えた器）を、
+    // これから作る / 繋ぐ器の死と取り違えないよう先に消す
+    if let Some(dir) = pane_died_dir() {
+        discard_pane_died_dumps(&dir, session);
+    }
     let mut args = vec![
         // UTF-8 を強制する。Finder 起動の .app は LANG / LC_CTYPE が無く、tmux が
         // 非 UTF-8 クライアント扱いで CJK を `_` に置換してしまう（2026-06-12 P0:
@@ -3437,5 +3691,443 @@ set -gq copy-mode-position-format ''
         assert_eq!(super::parse_pane_facts(""), super::PaneFacts::default());
         // pid 0 は「取れなかった」と同じ扱い（張ると誰も書かないファイルを読む）
         assert_eq!(super::parse_pane_facts("/dev/ttys012\t0").pid, None);
+    }
+}
+
+/// #2085: 器が自ら閉じたペインの最後の出力の書き出し（`pane-died` フック）
+#[cfg(test)]
+mod pane_died_tests {
+    use super::*;
+    use crate::backend::SessionBackend;
+
+    fn tmux_caps() -> BackendCapabilities {
+        crate::backend::TmuxBackend::new().capabilities()
+    }
+
+    fn psmux_caps() -> BackendCapabilities {
+        crate::backend::PsmuxBackend::new("psmux".into(), "3.3.7".into()).capabilities()
+    }
+
+    /// テストの一時ディレクトリ（Drop で消す）
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("tako-coretest-2085-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn 能力の無い器へは1行も書かない() {
+        // psmux は `pane-died` の形を実測していない。1 行でも書くと未知の設定の警告が
+        // ペインへ出る形（#974）を作りうるので、何も書かない
+        assert_eq!(
+            pane_died_conf(&psmux_caps(), Some(Path::new("/tmp/d")), false),
+            ""
+        );
+        assert_eq!(pane_died_conf(&psmux_caps(), None, true), "");
+    }
+
+    #[test]
+    fn ab_と置き場が無いときは立っていたものを外す() {
+        let off = "set -g remain-on-exit off\nset-hook -gu pane-died\n";
+        assert_eq!(
+            pane_died_conf(&tmux_caps(), Some(Path::new("/tmp/d")), true),
+            off
+        );
+        assert_eq!(pane_died_conf(&tmux_caps(), None, false), off);
+    }
+
+    /// 実測で決めた形を崩さない（崩れると死んだペインが残り続けて**閉じなくなる**）
+    #[test]
+    fn フックはkill_paneを入れ子の外に置きremain_on_exitはset_hookと同じ行() {
+        let conf = pane_died_conf(&tmux_caps(), Some(Path::new("/tmp/x")), false);
+        let lines: Vec<&str> = conf.lines().collect();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| *l == needle)
+                .unwrap_or_else(|| panic!("{needle:?} が無い:\n{conf}"))
+        };
+        let inner_end = at("  }");
+        let kill = at("  kill-pane");
+        let hook_end = lines
+            .iter()
+            .position(|l| l.starts_with("} ;"))
+            .expect("set-hook の閉じ");
+        assert!(
+            inner_end < kill && kill < hook_end,
+            "kill-pane は入れ子の外・フックの中:\n{conf}"
+        );
+        // 失敗しうるコマンドは入れ子の中だけ
+        for risky in ["capture-pane", "save-buffer", "delete-buffer", "set -gF"] {
+            let line = lines
+                .iter()
+                .position(|l| l.contains(risky))
+                .unwrap_or_else(|| panic!("{risky} が無い"));
+            assert!(
+                line < inner_end && lines[line].starts_with("    "),
+                "{risky} が入れ子の外にある:\n{conf}"
+            );
+        }
+        // `remain-on-exit on` は set-hook と同じ行（set-hook が通らなければ立たない）
+        let on: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("remain-on-exit on"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(on, vec![hook_end], "remain-on-exit on の置き場:\n{conf}");
+        assert!(lines[hook_end].contains("remain-on-exit-format ''"));
+        // save-buffer のパスはフックのペインの書式を直接読まない（同時死で別のペインになる）
+        let save = lines.iter().find(|l| l.contains("save-buffer")).unwrap();
+        assert!(
+            !save.contains("#{session_name}") && save.contains("#{@tako-pane-died-name}"),
+            "{save}"
+        );
+    }
+
+    #[test]
+    fn 置き場のパスは設定の1語として引用される() {
+        assert_eq!(conf_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(conf_quote("/it's/$x"), "\"/it's/\\$x\"");
+        assert_eq!(conf_quote("/q\"\\"), "'/q\"\\'");
+        let conf = pane_died_conf(&tmux_caps(), Some(Path::new("/d d")), false);
+        assert!(
+            conf.starts_with("set -g @tako-pane-died-dir '/d d'\n"),
+            "{conf}"
+        );
+    }
+
+    #[test]
+    fn 書き出しの名前を読む() {
+        let p = parse_pane_died_name("tako-ab.281.10000.42040.0.dump", "tako-ab").unwrap();
+        assert_eq!(
+            (p.history, p.limit, p.bytes, p.alternate),
+            (281, 10000, 42040, false)
+        );
+        assert!(
+            parse_pane_died_name("tako-ab.0.10000.80.1.dump", "tako-ab")
+                .unwrap()
+                .alternate
+        );
+        // 前方一致の別のセッション・形の崩れたものは読まない
+        assert_eq!(
+            parse_pane_died_name("tako-abc.1.2.3.0.dump", "tako-ab"),
+            None
+        );
+        assert_eq!(parse_pane_died_name("tako-ab.1.2.3.0.txt", "tako-ab"), None);
+        assert_eq!(parse_pane_died_name("tako-ab.1.2.0.dump", "tako-ab"), None);
+        assert_eq!(
+            parse_pane_died_name("tako-ab.1.2.3.4.0.dump", "tako-ab"),
+            None
+        );
+        assert_eq!(
+            parse_pane_died_name("tako-ab.x.2.3.0.dump", "tako-ab"),
+            None
+        );
+        assert_eq!(
+            parse_pane_died_name("tako-ab.1.2.3.2.dump", "tako-ab"),
+            None
+        );
+        // セッション名に `.` が入っても数値は右から読む
+        assert_eq!(
+            parse_pane_died_name("a.b.5.6.7.0.dump", "a.b").map(|p| p.history),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn 書き出しを履歴と画面に分ける() {
+        let probe = parse_pane_died_name("s.2.10.0.0.dump", "s").unwrap();
+        let dump = split_pane_died_dump(probe, "h1\nh2  \ns1\n\n").unwrap();
+        assert_eq!(dump.history, vec!["h1", "h2"]);
+        assert_eq!(dump.screen, vec!["s1", ""]);
+        // 履歴に足りない書き出しは壊れている
+        assert_eq!(split_pane_died_dump(probe, "h1\n"), None);
+    }
+
+    #[test]
+    fn 書き出しを読んで消し古いものを掃除する() {
+        let tmp = TempDir::new("files");
+        let dir = &tmp.0;
+        std::fs::write(dir.join("tako-a.1.10.0.0.dump"), "old\nscr\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("tako-a.2.10.0.0.dump"), "h1\nh2\nscr\n").unwrap();
+        std::fs::write(dir.join("tako-b.0.10.0.0.dump"), "b\n").unwrap();
+        std::fs::write(dir.join("note.txt"), "x").unwrap();
+        let dump = take_pane_died_dump(dir, "tako-a").expect("新しい方を読む");
+        assert_eq!(dump.history, vec!["h1", "h2"]);
+        assert_eq!(dump.screen, vec!["scr"]);
+        assert!(
+            take_pane_died_dump(dir, "tako-a").is_none(),
+            "読んだら同じセッションの書き出しは全部消える"
+        );
+        discard_pane_died_dumps(dir, "tako-b");
+        assert!(!dir.join("tako-b.0.10.0.0.dump").exists());
+        std::fs::write(dir.join("tako-c.0.10.0.0.dump"), "c\n").unwrap();
+        assert_eq!(
+            sweep_pane_died_dumps(dir, std::time::Duration::from_secs(3600)),
+            0,
+            "新しい書き出しは掃除しない"
+        );
+        assert_eq!(sweep_pane_died_dumps(dir, std::time::Duration::ZERO), 1);
+        assert!(dir.join("note.txt").exists(), "書き出し以外は触らない");
+        assert!(take_pane_died_dump(&dir.join("none"), "tako-a").is_none());
+    }
+
+    /// tmux の器をテストの conf（製品と同じ 2 つの生成物）で起こす
+    #[cfg(unix)]
+    fn start_server(socket: &str, conf: &Path) {
+        let r = crate::tmux::tmux_command(Some(socket))
+            .args(["-f"])
+            .arg(conf)
+            .args(["new-session", "-d", "-s", "keep", "sleep", "300"])
+            .output()
+            .expect("tmux new-session");
+        assert!(r.status.success(), "{r:?}");
+    }
+
+    #[cfg(unix)]
+    fn write_conf(tmp: &TempDir, dump_dir: &Path) -> PathBuf {
+        let conf = tmp.0.join("tmux.conf");
+        let caps = tmux_caps();
+        std::fs::write(
+            &conf,
+            backend_conf(&caps) + &pane_died_conf(&caps, Some(dump_dir), false),
+        )
+        .unwrap();
+        conf
+    }
+
+    /// 器を 1 つ起こす（サーバーは [`start_server`] が起こし済み。`-f` は起動時にしか
+    /// 読まれないが、器を起こす文には必ず付ける = #1874 / #1918 の番犬の規則）
+    #[cfg(unix)]
+    fn new_vessel(socket: &str, conf: &Path, name: &str, script: &str) {
+        let r = crate::tmux::tmux_command(Some(socket))
+            .args(["-f"])
+            .arg(conf)
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "80",
+                "-y",
+                "20",
+                "/bin/sh",
+                "-c",
+                script,
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(r.status.success(), "{r:?}");
+    }
+
+    #[cfg(unix)]
+    fn wait_gone(socket: &str, name: &str) -> bool {
+        for _ in 0..100 {
+            if !crate::tmux::has_session(Some(socket), name) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// 番号つきの行の並び（`<接頭辞><番号>` の行だけを拾う）
+    #[cfg(unix)]
+    fn numbers(lines: &[String], prefix: &str) -> Vec<usize> {
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix(prefix)?.parse().ok())
+            .collect()
+    }
+
+    /// 製品の経路（`wrap_options` = 製品の conf で起きる attach クライアント）で、
+    /// 出力し続けている最中に中のコマンドが終わっても最後の行まで書き出される
+    #[test]
+    #[cfg(unix)]
+    fn 実tmux_出力中に器が自ら消えても最後の行まで書き出される() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-2085wrap", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let session = "tako-2085-wrap";
+        let options = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "i=0; while [ $i -lt 3000 ]; do echo W$i; i=$((i+1)); done".into(),
+                ],
+            }),
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+            scrollback_lines: None,
+        };
+        let (client, _rx) =
+            crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session))
+                .expect("tmux クライアントを spawn できる");
+        assert!(wait_gone(&socket, session), "器が自ら消えない");
+        drop(client);
+        let dir = pane_died_dir().expect("テストのデータディレクトリ");
+        let dump = take_pane_died_dump(&dir, session).expect("書き出しがある");
+        let mut all = dump.history.clone();
+        all.extend(dump.screen.iter().cloned());
+        assert_eq!(
+            numbers(&all, "W"),
+            (0..3000).collect::<Vec<_>>(),
+            "0〜2999 が欠けず・重ならずに入る"
+        );
+        assert_eq!(dump.history.len(), dump.probe.history);
+        assert_eq!(
+            dump.screen.len(),
+            24,
+            "画面の行（attach クライアントの寸法）"
+        );
+        assert!(
+            dump.screen.iter().all(|l| !l.contains("Pane is dead")),
+            "remain-on-exit の既定の案内は書き込まない: {:?}",
+            dump.screen
+        );
+    }
+
+    /// 明示の kill（tako がペインを閉じる経路）はフックを起こさない = 書き出さない
+    #[test]
+    #[cfg(unix)]
+    fn 実tmux_明示のkillでは書き出さない() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-2085kill", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let tmp = TempDir::new("kill");
+        let conf = write_conf(&tmp, &tmp.0);
+        start_server(&socket, &conf);
+        new_vessel(&socket, &conf, "tako-live", "seq 1 50; sleep 300");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        kill_session(&socket, "tako-live");
+        assert!(wait_gone(&socket, "tako-live"));
+        assert!(take_pane_died_dump(&tmp.0, "tako-live").is_none());
+    }
+
+    /// 置き場が無い（書き出しが失敗する）ときも `kill-pane` は走る = ペインは閉じる。
+    /// 失敗したコマンドの後ろは同じグループごと捨てられるので、入れ子に隔離していないと
+    /// 死んだペインが残り続ける（修正の過程で実測した形）
+    #[test]
+    #[cfg(unix)]
+    fn 実tmux_書き出しに失敗してもペインは閉じる() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-2085fail", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let tmp = TempDir::new("fail");
+        let conf = write_conf(&tmp, &tmp.0.join("no-such-dir"));
+        start_server(&socket, &conf);
+        new_vessel(&socket, &conf, "tako-fail", "seq 1 50");
+        assert!(
+            wait_gone(&socket, "tako-fail"),
+            "書き出しの失敗で kill-pane まで捨てられた（死んだペインが残っている）"
+        );
+    }
+
+    /// 同時に死んだ器でも、書き出しの名前（セッション名・行数）と中身が食い違わない。
+    /// `save-buffer` のパスへ書式を直接書くと、別のペインの文脈で展開された（実測）
+    #[test]
+    #[cfg(unix)]
+    fn 実tmux_同時に死んでも名前と中身が食い違わない() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-2085many", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let tmp = TempDir::new("many");
+        let conf = write_conf(&tmp, &tmp.0);
+        start_server(&socket, &conf);
+        for i in 1..=5 {
+            new_vessel(
+                &socket,
+                &conf,
+                &format!("tako-m{i}"),
+                &format!("seq -f 'M{i}-%g' 1 {}", i * 100),
+            );
+        }
+        // 器の外のセッション（`tako-` で始まらない）は書き出さない（kill-pane だけ）
+        new_vessel(&socket, &conf, "other", "seq 1 5");
+        for i in 1..=5 {
+            assert!(wait_gone(&socket, &format!("tako-m{i}")));
+        }
+        assert!(wait_gone(&socket, "other"));
+        for i in 1..=5 {
+            let dump = take_pane_died_dump(&tmp.0, &format!("tako-m{i}"))
+                .unwrap_or_else(|| panic!("tako-m{i} の書き出しが無い"));
+            let mut all = dump.history.clone();
+            all.extend(dump.screen.iter().cloned());
+            assert_eq!(
+                numbers(&all, &format!("M{i}-")),
+                (1..=i * 100).collect::<Vec<_>>(),
+                "tako-m{i} の書き出しに別の器の中身が入った"
+            );
+            assert_eq!(dump.history.len(), i * 100 + 1 - 20, "tako-m{i} の行数");
+        }
+        let left: Vec<_> = std::fs::read_dir(&tmp.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".dump"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "器の外のセッションまで書き出した: {left:?}"
+        );
+    }
+
+    /// `set-hook` が通らない tmux では `remain-on-exit` も立たない（同じ行 = 同じグループ）。
+    /// 逆だと、死んだペインを片付ける人が居ないまま残し続ける
+    #[test]
+    #[cfg(unix)]
+    fn 実tmux_set_hookが通らなければremain_on_exitも立たない() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-2085hook", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let tmp = TempDir::new("hook");
+        let conf = tmp.0.join("tmux.conf");
+        let caps = tmux_caps();
+        // 知らないフック名 = `set-hook` だけが失敗する tmux を模す
+        let broken = pane_died_conf(&caps, Some(&tmp.0), false)
+            .replace("set-hook -g pane-died", "set-hook -g pane-died-unknown");
+        std::fs::write(&conf, backend_conf(&caps) + &broken).unwrap();
+        start_server(&socket, &conf);
+        let out = crate::tmux::tmux_command(Some(&socket))
+            .args(["show-options", "-g", "remain-on-exit"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "remain-on-exit off"
+        );
+        new_vessel(&socket, &conf, "tako-nohook", "seq 1 5");
+        assert!(wait_gone(&socket, "tako-nohook"));
     }
 }

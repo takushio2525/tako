@@ -3121,20 +3121,11 @@ fn catch_up_backend_close(
     meta: &tako_core::pane_log::PaneLogMeta,
     budget: usize,
 ) -> Option<Vec<String>> {
-    use tako_core::pane_log::{
-        backend_observation, plan_backend_capture, BackendCapture, ALIGN_MARGIN,
-    };
+    use tako_core::pane_log::{backend_close_plan, backend_observation};
     let (probe, height) = tako_core::tmux::pane_log_probe_screen(Some(socket), session)?;
     let (last_history, last_bytes, anchor) = backend_baseline(manager, pane)?;
-    let plan = match plan_backend_capture(&probe, last_history, last_bytes, budget, false) {
-        // 増分が無くても、probe の後に伸びた行を揃えで拾う
-        BackendCapture::Skip if probe.history >= last_history => BackendCapture::Counted {
-            delta: 0,
-            take: 0,
-            margin: ALIGN_MARGIN,
-        },
-        plan => plan,
-    };
+    // 増分が無くても、probe の後に伸びた行を揃えで拾う
+    let plan = backend_close_plan(&probe, last_history, last_bytes, budget);
     let mut lines =
         tako_core::tmux::capture_scrollback_plain(Some(socket), session, plan.lines_to_read())
             .ok()?;
@@ -3211,6 +3202,46 @@ fn finish_backend_pane_log_close(
         .as_ref()
         .and_then(|(session, budget)| {
             catch_up_backend_close(manager, socket, pane, session, &data.meta, *budget)
+        });
+    lock_pane_log(manager).flush_close(
+        pane.as_u64(),
+        &data.meta,
+        screen.as_deref().unwrap_or(&data.visible),
+        close.origin,
+        close.caller.as_deref(),
+    );
+}
+
+/// 器が自ら閉じたペインのクローズフラッシュ（#2085。器が消えた後に別スレッドで呼ぶ）。
+///
+/// 器の `pane-died` フックが閉じる前に書いた「全履歴 + 画面」から、最後の取り込みの後の行を
+/// 取り込み、死んだ瞬間の画面とマーカーを書く。書き出しが無い（器が psmux・A/B・
+/// 器が別の理由で消えた）なら修正前と同じく UI で採った画面とマーカーだけ
+fn finish_backend_pane_log_exit(
+    manager: &std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    pane: PaneId,
+    close: PendingPaneLogClose,
+) {
+    let _serial = PANE_LOG_BACKEND_INGEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let data = close.data;
+    let screen = data
+        .backend_catch_up
+        .as_ref()
+        .and_then(|(session, budget)| {
+            let dir = tako_core::tmux_backend::pane_died_dir()?;
+            let dump = tako_core::tmux_backend::take_pane_died_dump(&dir, session)?;
+            let (last_history, last_bytes, anchor) = backend_baseline(manager, pane)?;
+            let (obs, screen) = tako_core::pane_log::pane_died_observation(
+                dump,
+                last_history,
+                last_bytes,
+                &anchor,
+                *budget,
+            );
+            lock_pane_log(manager).apply(pane.as_u64(), &data.meta, obs);
+            Some(screen)
         });
     lock_pane_log(manager).flush_close(
         pane.as_u64(),
@@ -12423,8 +12454,9 @@ impl TakoApp {
     ///
     /// #2018: 器を kill する閉じ方なら、ここでは書かずに `drop_backend_session` へ預ける
     /// （kill のスレッドが最後の増分 → 可視画面 → マーカーの順に書いてから kill する）。
-    /// 器がもう居ない閉じ方（PTY 死亡）・器を残す閉じ方（アプリ終了）・終了処理中は
-    /// 修正前と同じくその場で書く
+    /// #2085: 器がもう居ない閉じ方（PTY 死亡）は、器が消える前に書き出した全履歴 + 画面を
+    /// 別スレッドで読む（書き出しが無ければ修正前と同じ）。器を残す閉じ方（アプリ終了）・
+    /// 終了処理中は修正前と同じくその場で書く
     fn apply_pane_log_close_from(
         &mut self,
         pane: PaneId,
@@ -12432,10 +12464,28 @@ impl TakoApp {
         origin: CloseOrigin,
         caller: Option<&str>,
     ) {
+        let own_vessel = data.backend_catch_up.as_ref().map(|(s, _)| s.as_str())
+            == self.backend_sessions.get(&pane).map(String::as_str);
+        // #2085: 器が自ら消えた閉じ方は、器が消える前に `pane-died` フックが書いた
+        // 「全履歴 + 画面」を別スレッドで読んで最後の増分を取り込む（器はもう読めない）
+        if data.backend_catch_up.is_some()
+            && own_vessel
+            && origin == CloseOrigin::ProcessExit
+            && !self.quitting
+            && !tako_core::tmux_backend::issue2085_legacy()
+        {
+            let logs = self.pane_logs.clone();
+            let close = PendingPaneLogClose {
+                data,
+                origin,
+                caller: caller.map(str::to_string),
+            };
+            std::thread::spawn(move || finish_backend_pane_log_exit(&logs, pane, close));
+            return;
+        }
         let kills_vessel = !matches!(origin, CloseOrigin::ProcessExit | CloseOrigin::AppQuit)
             && !self.quitting
-            && data.backend_catch_up.as_ref().map(|(s, _)| s.as_str())
-                == self.backend_sessions.get(&pane).map(String::as_str);
+            && own_vessel;
         if data.backend_catch_up.is_some() && kills_vessel {
             self.pane_log_close_pending.insert(
                 pane,
