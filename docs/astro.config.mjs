@@ -182,9 +182,10 @@ export default defineConfig({
 		// `markdown.processor` へ移すと mdx 5.0.x は読まないので再び壊れる。ここで mdx に直接渡す。
 		// mdx をここに置くと Starlight は自分では足さない（optimize は Starlight が渡す値と同じ）。
 		// smartypants（`--` → 全角ダッシュ・引用符の置き換え）は .mdx では止める（#2088）。
-		// <Cmd> など JSX の子の文字列はコードとして守られないので、`brew install --cask …` が
-		// `—cask` になって公開され、コピーしても動かなかった。止めて変わるのはその 2 か所のコマンドだけで、
-		// 日本語の本文は 1 文字も変わらないことを前後のビルド出力の比較で確かめてある。
+		// <Cmd> など JSX の子の文字列はコードとして守られないので、`brew install --cask …` が `—cask`、
+		// `tako show-command "npm install"` が `“npm install”` になって公開され、コピーしても動かなかった。
+		// 止めて変わるのはそうしたコマンドとコードだけで、日本語の本文は 1 文字も変わらないことを
+		// 前後のビルド出力の比較で確かめてある。
 		// Starlight / mdx を上げるときは、この行を外しても scripts/verify-markdown.mjs が通るかを見る（通れば不要）
 		mdx({ optimize: true, gfm: true, smartypants: false }),
 	],

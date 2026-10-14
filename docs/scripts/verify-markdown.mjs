@@ -3,19 +3,24 @@
  *
  *   node scripts/verify-markdown.mjs        # src/content/docs と dist/ を突き合わせる
  *
+ * `npm run build` の直後に postbuild として自動で走る（package.json）。CI の docs ジョブと
+ * Cloudflare Pages の配備も `npm run build` を通るので、壊れた出力はビルドの失敗として止まる。
+ *
  * 見るもの:
  *   - 本文（.md / .mdx）に書いた Markdown の表が、ビルド出力で `<table>` として描かれている
  *     （ページごとに「本文の表の数 ≦ 出力の `<table>` の数」）
  *   - 出力の本文に、描かれなかった表の区切り行（`|---|`）が文字のまま残っていない
- *   - コマンド（<Cmd> = `.tk-cmd-text`）に全角ダッシュ（U+2014 / U+2013）が 1 つも無い（#2088）
- *   - コード（`<code>` / `<pre>`）に、フラグのように英字が続く全角ダッシュ（`—pane` など）が無い（#2088）。
- *     数の範囲（`0.0–1.0`）のように意図して書いたものは英字が続かないので対象外
+ *   - コマンド（<Cmd> = `.tk-cmd-text`）に、自動整形（smartypants）が作る文字 = 全角ダッシュ
+ *     （U+2014 / U+2013）・曲がった引用符（‘ ’ “ ”）・三点リーダー（…）が 1 つも無い（#2088）
+ *   - コード（`<code>` / `<pre>`）に、フラグのように英字が続く全角ダッシュ（`—pane` など）と
+ *     曲がった引用符が無い（#2088）。数の範囲（`0.0–1.0`）と省略の「…」は意図して書かれるので対象外
  *
  * 2026-10 に、Astro 6.4 で `markdown.gfm` の既定が未設定になり、Starlight が足す
  * @astrojs/mdx 5.0.x がそれを「無効」と読んだため、.mdx のページだけ表が `| a | b |` の
  * まま公開されていた（.md は Astro 本体の処理系が既定で GFM を有効にするので無事だった）。
- * 同じ時期に、.mdx の自動整形（smartypants）が <Cmd> の子の `--` を全角ダッシュに置き換え、
- * `brew install --cask …` が `—cask` のまま公開されてコピーしても動かなかった（#2088）。
+ * 同じ時期に、.mdx の自動整形（smartypants）が <Cmd> の子の `--` を全角ダッシュに、`"` を曲がった
+ * 引用符に置き換え、`brew install --cask …` が `—cask`、`tako show-command "npm install"` が
+ * `“npm install”` のまま公開されてコピーしても動かなかった（#2088）。
  * どちらもビルドも他の検査も通ってしまう壊れ方なので、ここで落とす。
  * 直し方は astro.config.mjs の mdx({ gfm: true, smartypants: false })。
  */
@@ -109,8 +114,10 @@ for (const file of walk(CONTENT, ['.md', '.mdx'])) {
 }
 
 // コマンドとコードの中の全角ダッシュ（#2088）。本文に対応するページに限らず、出力の全ページを見る
-const DASH = /[\u2014\u2013]/;
+// smartypants が作る文字（全角ダッシュ・曲がった引用符・三点リーダー）
+const SMART = /[\u2014\u2013\u2018\u2019\u201c\u201d\u2026]/;
 const FLAG_DASH = /[\u2014\u2013][A-Za-z]/;
+const CURLY = /[\u2018\u2019\u201c\u201d]/;
 const textOf = (fragment) =>
 	fragment
 		.replace(/<[^>]+>/g, '')
@@ -126,14 +133,18 @@ for (const out of walk(DIST, ['.html'])) {
 	for (const m of html.matchAll(/<code class="tk-cmd-text[^"]*"[^>]*>([\s\S]*?)<\/code>/g)) {
 		commands++;
 		const text = textOf(m[1]).trim();
-		if (DASH.test(text)) problems.push(`${rel}: コマンドに全角ダッシュが入っている（コピーしても動かない）: ${text.slice(0, 80)}`);
+		if (SMART.test(text)) problems.push(`${rel}: コマンドに自動整形の文字（全角ダッシュ・曲がった引用符・…）が入っている（コピーしても動かない）: ${text.slice(0, 80)}`);
 	}
 	for (const m of html.matchAll(/<(code|pre)\b(?![^>]*tk-cmd-text)[^>]*>([\s\S]*?)<\/\1>/g)) {
 		const text = textOf(m[2]);
-		const hit = text.match(FLAG_DASH);
-		if (hit) {
+		for (const [re, what] of [
+			[FLAG_DASH, '`--` が全角ダッシュに'],
+			[CURLY, '引用符が曲がった引用符に'],
+		]) {
+			const hit = text.match(re);
+			if (!hit) continue;
 			const at = text.indexOf(hit[0]);
-			problems.push(`${rel}: コードの中で \`--\` が全角ダッシュに化けている: …${text.slice(Math.max(0, at - 20), at + 20).trim()}…`);
+			problems.push(`${rel}: コードの中で、${what}化けている: …${text.slice(Math.max(0, at - 20), at + 20).trim()}…`);
 		}
 	}
 }
@@ -141,7 +152,7 @@ for (const out of walk(DIST, ['.html'])) {
 console.log(`対象: dist（本文 ${pages} ページ / Markdown の表 ${tables} 個 / コマンド ${commands} 個）`);
 if (problems.length > 0) {
 	for (const p of problems) console.error(`NG: ${p}`);
-	console.error('直し方: .mdx の表なら astro.config.mjs の mdx({ gfm: true })（#2082）、全角ダッシュなら同じ所の smartypants: false（#2088）が効いているかを見る');
+	console.error('直し方: .mdx の表なら astro.config.mjs の mdx({ gfm: true })（#2082）、全角ダッシュや曲がった引用符なら同じ所の smartypants: false（#2088）が効いているかを見る');
 	process.exit(1);
 }
-console.log('OK: 本文の Markdown の表はすべて <table> として描かれ、区切り行が文字のまま残っておらず、コマンドとコードに全角ダッシュが無い');
+console.log('OK: 本文の Markdown の表はすべて <table> として描かれ、区切り行が文字のまま残っておらず、コマンドとコードに自動整形の文字が無い');
