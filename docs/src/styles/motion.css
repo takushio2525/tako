@@ -6,7 +6,8 @@
  *  - 横にはみ出さない（幅 375px でも横スクロールを出さない）。画面の再現は inline-size の
  *    コンテナ問い合わせで部品を間引いて縮める
  *  - 出し入れは opacity / transform / flex-grow / grid-template-rows で行う（重い再計算を避ける）。
- *    高さ・幅そのものを動かすのは「下から積むログ」（max-height）と「引き出し」（width）の 2 つだけ
+ *    高さ・幅そのものを動かすのは「下から積むログ」（max-height）・「引き出し」（width）・
+ *    手順で開くタブ（max-width）の 3 つだけ
  *  - prefers-reduced-motion: reduce では一切動かさない（.is-static = 手順ごとの静止した図）
  */
 
@@ -222,6 +223,7 @@
     grid-template-rows 0.45s var(--tako-ease),
     max-height 0.45s var(--tako-ease),
     min-height 0.45s var(--tako-ease),
+    max-width 0.5s var(--tako-ease),
     width 0.6s var(--tako-ease),
     margin 0.55s var(--tako-ease),
     border-width 0.55s var(--tako-ease),

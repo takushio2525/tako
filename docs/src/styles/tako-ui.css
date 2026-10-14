@@ -185,6 +185,16 @@
   display: inline-flex;
   min-width: 0;
 }
+/* 手順で出し入れするタブ（tabs[].at）は、隠れている間は場所を取らない（開くと右のタブを押して伸びる）。
+ * 負の余白はタブバーの gap（0.35em）を打ち消すため */
+[data-motion] .tk-tab-slot[data-at] {
+  max-width: 20em;
+  overflow: hidden;
+}
+[data-motion] .tk-tab-slot[data-at]:not(.is-on) {
+  max-width: 0;
+  margin-inline-end: -0.35em;
+}
 .tk-tab.is-active,
 .tk-tab[data-fx~='state'].is-on {
   background: var(--ui-tab);

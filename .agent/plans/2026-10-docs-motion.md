@@ -146,7 +146,7 @@ cd docs && npm ci && npm run build && npm run og:verify && node scripts/verify-l
 | `Scrolly` | ページ | `label`・`flip`（図を左へ）。slot `stage` + 子に `Step` | — |
 | `Step` | Scrolly の子 | `title`。本文は子 | — |
 | `Autoplay` | ページ | `steps`・`interval`（ms） | — |
-| `TakoWindow` | stage | `os`（mac / windows）・`tabs`（`label` / `state` / `active` / `at` / `activeAt`）・`guiAt`（表示モードの印）・`masterAt` / `workers`（ステータスバーの master 表示）・`cwd`・`branch`・`height`。slot: 既定（本体）/ `sidebar` / `banner` / `right` / `overlay` | `tab_bar.rs` / `menu_bar.rs` / `status_bar.rs` / `theme.rs` |
+| `TakoWindow` | stage | `os`（mac / windows）・`tabs`（`label` / `state` / `active` / `at`（隠れている間は場所を取らない）/ `activeAt`）・`guiAt`（表示モードの印）・`masterAt` / `workers`（ステータスバーの master 表示）・`cwd`・`branch`・`height`。slot: 既定（本体）/ `sidebar` / `banner` / `right` / `overlay` | `tab_bar.rs` / `menu_bar.rs` / `status_bar.rs` / `theme.rs` |
 | `Split` | 本体 | `dir`（row / col）・`grow`・`at` / `fx` | — |
 | `Pane` | Split の子 | `n`・`title`・`badge`（ORCH / WORKER）・`parent`（↳ master）・`state`（idle / running か `[{at, state, text}]`）・`focus`（true か data-at）・`at` / `fx`・`grow`・`body`（flush で余白なし） | `main.rs` の render_pane_header（状態の表記は running / idle の 2 つ） |
 | `Sidebar` | slot sidebar | `project`・`branch`・`path`・`items` | `sidebar.rs` |
