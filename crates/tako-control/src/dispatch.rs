@@ -15202,6 +15202,43 @@ fn finish_worker_status(
     } = ctx;
     // #1880: tako mod の報告（新鮮なら ctx%・ターン状態・使用制限の一次ソース）
     let mod_view = mod_state.view();
+
+    // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
+    // 読めなくても既存動作は変えない（フォールバック層）
+    let mut registry_worker: Option<(String, orchestrator::registry::WorkerEntry)> =
+        orchestrator::registry::WorkerRegistry::load()
+            .ok()
+            .and_then(|reg| {
+                reg.find_active_by_pane(pane_id)
+                    .map(|(id, e)| (id.clone(), e.clone()))
+            });
+
+    // #2041: 名指しがレジストリの記録そのもので、新しい mod の報告が別の会話 ID を運んでいれば
+    // `/clear`・`/resume` で同じ claude の会話が移った = 報告の会話 ID を名指しにして、レジストリへも
+    // 書き戻す（判断は `claude_mod::follow_session` の 1 実装）。書き戻さないと名指しが古いまま
+    // `session_mismatch` で 5 秒ごとに走査し続け、答える会話 ID（`resolved_session_id`）も `/clear` 前のまま
+    let followed = tako_core::claude_mod::follow_session(
+        &mod_view,
+        mod_state.at(),
+        session_id,
+        registry_worker
+            .as_ref()
+            .and_then(|(_, e)| e.session_id.as_deref()),
+        tako_core::claude_mod::session_legacy(),
+    );
+    if let (Some(new_sid), Some((_, entry))) = (followed.as_deref(), registry_worker.as_mut()) {
+        // best-effort（失敗しても応答は報告の会話 ID で返す。次の照会でもう一度書く）
+        let written = match entry.tmux_session.as_deref() {
+            Some(ts) => orchestrator::registry::record_session_detected(ts, new_sid),
+            None => orchestrator::registry::record_session_detected_by_pane(pane_id, new_sid),
+        };
+        if let Err(e) = written {
+            eprintln!("warning: worker レジストリの会話 ID を mod の報告へ追従できない: {e}");
+        }
+        entry.session_id = Some(new_sid.to_string());
+    }
+    let session_id = followed.as_deref().or(session_id);
+
     // #2017: そのペインに新しい mod の報告（会話 ID つき）があれば、会話 ID も状態もそこから採り
     // `claude agents --json` を起こさない（判断は `claude_mod::monitor_plan` の 1 実装。
     // 鮮度は写し取った時刻で測る = 判断と状態の上書きが同じ報告を見る）
@@ -15211,16 +15248,6 @@ fn finish_worker_status(
         session_id,
         tako_core::claude_mod::monitor_legacy(),
     );
-
-    // #390: レジストリの active エントリ（prompt 未達判定 + lazy 昇格用）。
-    // 読めなくても既存動作は変えない（フォールバック層）
-    let registry_worker: Option<(String, orchestrator::registry::WorkerEntry)> =
-        orchestrator::registry::WorkerRegistry::load()
-            .ok()
-            .and_then(|reg| {
-                reg.find_active_by_pane(pane_id)
-                    .map(|(id, e)| (id.clone(), e.clone()))
-            });
 
     // session_id の解決: 明示指定 > pane→session 自動解決 > codex の実況 > フォールバック
     //
@@ -15508,7 +15535,15 @@ fn finish_worker_status(
         mod_turn_json,
         mod_reason,
         mod_rate_limits,
-        agents_scan: monitor.to_json(),
+        // #2041: レジストリの会話 ID を報告へ追従させたら `registry_followed: true` を添える
+        agents_scan: match followed {
+            Some(_) => {
+                let mut scan = monitor.to_json();
+                scan["registry_followed"] = json!(true);
+                scan
+            }
+            None => monitor.to_json(),
+        },
     })
 }
 
@@ -16100,7 +16135,8 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         "mod_reason": mod_reason,
         // #2017: `claude agents --json` の走査を省いたか（`skipped` = mod の報告で答えた）と理由
         // （`mod_fresh` / 走査へ落ちた理由 = `mod_reason` の語彙 + `mod_aging` / `mod_no_session` /
-        // `session_mismatch` / `legacy_env`）
+        // `session_mismatch` / `legacy_env`）。#2041: `/clear` 等でレジストリの会話 ID を報告の会話 ID へ
+        // 追従させた照会は `registry_followed: true`
         "agents_scan": agents_scan,
         // #985: codex の**構造化された**利用制限（rollout の `rate_limits`）。
         // 画面スクレイピングと違い used_percent は数値、resets_at は epoch 秒なので、
@@ -32537,6 +32573,136 @@ mod tests {
             scan_consults_2017(|| finish_worker_status(ctx, Some(SID_2017), None).unwrap());
         assert!(consults >= 1, "{v}");
         assert_eq!(v["agents_scan"]["reason"], "mod_stale");
+    }
+
+    // --- #2041: `/clear` の後のレジストリの会話 ID を mod の報告へ追従させる -----------------
+
+    /// `/clear` した worker（レジストリ = spawn 直後の会話・mod の報告 = 新しい会話）を注入で作り、
+    /// 1 回目の照会で報告の会話 ID がレジストリへ書き戻され、以後は名指しと報告が一致して走査しない
+    /// （修正前は名指しが古いまま `session_mismatch` で毎回走査し、答える会話 ID も `/clear` 前のまま）
+    #[test]
+    fn issue2041_clearの後はレジストリの会話idが報告で更新され以後は走査しない() {
+        use crate::orchestrator::registry::{self, RegisterSpawn, WorkerRegistry};
+        // 共有の一時レジストリ（`#[cfg(test)]` ではプロセス固有）。他のテストと混ざらないペイン番号
+        const PANE: u64 = 20_411;
+        const BACKEND: &str = "tako-s20411";
+        const OLD: &str = "2041aaaa-0000-4000-8000-0000000000a1";
+        const NEW: &str = "2041bbbb-0000-4000-8000-0000000000b2";
+        let id = registry::record_spawn(RegisterSpawn {
+            agent: "claude".into(),
+            pane: PANE,
+            tmux_session: Some(BACKEND.into()),
+            ..Default::default()
+        })
+        .expect("共有レジストリへ登録できる");
+        registry::record_session_detected(BACKEND, OLD).unwrap();
+        let recorded = || {
+            WorkerRegistry::load().unwrap().workers[&id]
+                .session_id
+                .clone()
+                .unwrap_or_default()
+        };
+        assert_eq!(recorded(), OLD, "前提: レジストリは spawn 直後の会話");
+        let ctx = || WorkerStatusCtx {
+            pane_id: PANE,
+            backend_session: Some(BACKEND.into()),
+            // 注入: `/clear` の後の mod の報告（同じ claude が新しい会話 ID を運ぶ）
+            ..mod_ctx_1880(
+                "done\n❯ ",
+                mod_snapshot_2017(Some(NEW), "idle", std::time::Duration::ZERO),
+            )
+        };
+        // 監視の入口と同じく、名指しはレジストリから補う
+        let query = || resolve_worker_query(Some(PANE), None, None, None).unwrap();
+
+        let q = query();
+        assert_eq!(q.session_id.as_deref(), Some(OLD));
+        let (v, consults) = scan_consults_2017(|| {
+            finish_worker_status(ctx(), q.session_id.as_deref(), q.tmux_session.as_deref()).unwrap()
+        });
+        assert_eq!(
+            consults, 0,
+            "dispatch.rs の finish_worker_status が `/clear` 後の古い会話 ID を名指しして走査した（#2041）: {v}"
+        );
+        assert_eq!(
+            v["agents_scan"],
+            json!({"skipped": true, "reason": "mod_fresh", "registry_followed": true})
+        );
+        assert_eq!(v["resolved_session_id"], NEW);
+        assert_eq!(v["status"], "idle", "{v}");
+        assert_eq!(recorded(), NEW, "レジストリが報告の会話 ID へ更新される");
+
+        // 以後: レジストリから補った名指しが報告と一致 = 追従なしで走査しない
+        let q = query();
+        assert_eq!(q.session_id.as_deref(), Some(NEW));
+        let (v, consults) = scan_consults_2017(|| {
+            finish_worker_status(ctx(), q.session_id.as_deref(), q.tmux_session.as_deref()).unwrap()
+        });
+        assert_eq!(consults, 0, "{v}");
+        assert_eq!(
+            v["agents_scan"],
+            json!({"skipped": true, "reason": "mod_fresh"})
+        );
+
+        // 呼び出し側が記録と違う会話を明示したら、その会話について走査が答える（#2017 のまま）
+        let (v, consults) =
+            scan_consults_2017(|| finish_worker_status(ctx(), Some(OLD), Some(BACKEND)).unwrap());
+        assert!(consults >= 1, "{v}");
+        assert_eq!(
+            v["agents_scan"],
+            json!({"skipped": false, "reason": "session_mismatch"})
+        );
+        assert_eq!(recorded(), NEW, "明示の名指しではレジストリを書き換えない");
+
+        // 後始末（共有ファイルなので自分のエントリだけ消す）
+        let _ = WorkerRegistry::mutate(|reg| {
+            reg.workers.remove(&id);
+        });
+    }
+
+    /// 報告が答えにならない（heartbeat が途絶えた）なら追従しない = レジストリを書き換えず走査へ落ちる
+    #[test]
+    fn issue2041_古い報告ではレジストリを書き換えない() {
+        use crate::orchestrator::registry::{self, RegisterSpawn, WorkerRegistry};
+        const PANE: u64 = 20_412;
+        const BACKEND: &str = "tako-s20412";
+        const OLD: &str = "2041cccc-0000-4000-8000-0000000000c3";
+        let id = registry::record_spawn(RegisterSpawn {
+            agent: "claude".into(),
+            pane: PANE,
+            tmux_session: Some(BACKEND.into()),
+            ..Default::default()
+        })
+        .expect("共有レジストリへ登録できる");
+        registry::record_session_detected(BACKEND, OLD).unwrap();
+        let ctx = WorkerStatusCtx {
+            pane_id: PANE,
+            backend_session: Some(BACKEND.into()),
+            ..mod_ctx_1880(
+                "done\n❯ ",
+                mod_snapshot_2017(
+                    Some("2041dddd-0000-4000-8000-0000000000d4"),
+                    "idle",
+                    tako_core::claude_mod::MONITOR_SKIP_FOR + std::time::Duration::from_secs(1),
+                ),
+            )
+        };
+        let (v, consults) =
+            scan_consults_2017(|| finish_worker_status(ctx, Some(OLD), Some(BACKEND)).unwrap());
+        assert!(consults >= 1, "{v}");
+        assert_eq!(
+            v["agents_scan"],
+            json!({"skipped": false, "reason": "mod_aging"})
+        );
+        assert_eq!(
+            WorkerRegistry::load().unwrap().workers[&id]
+                .session_id
+                .as_deref(),
+            Some(OLD)
+        );
+        let _ = WorkerRegistry::mutate(|reg| {
+            reg.workers.remove(&id);
+        });
     }
 
     /// orchestrator self も同じ判断（新しい報告があれば会話 ID と状態は報告から・走査なし）

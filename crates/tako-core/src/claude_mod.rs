@@ -80,6 +80,9 @@ pub const MONITOR_SKIP_FOR: Duration = Duration::from_secs(20);
 /// #2017 の A/B（同一バイナリで修正前 = 監視は mod の有無にかかわらず全アカウントを
 /// ログインシェル経由で走査する）
 pub const MONITOR_LEGACY_ENV: &str = "TAKO_2017_LEGACY";
+/// #2041 の A/B（同一バイナリで修正前 = GUI モードのチャット表示は mod の報告の有無にかかわらず
+/// 全アカウントを走査し、worker_status はレジストリの古い会話 ID を名指しして走査し続ける）
+pub const SESSION_LEGACY_ENV: &str = "TAKO_2041_LEGACY";
 /// 報告の契約の版（`register.ts` / `types/index.d.ts` の `schema`）
 pub const SCHEMA: u32 = 1;
 /// 帯・サイドバーを描かない A/B の入口（S3 #1881）。報告の受け取りと一次ソース化（S1 / S2）は
@@ -450,6 +453,11 @@ pub fn limits_legacy() -> bool {
 /// #2017 の A/B（[`MONITOR_LEGACY_ENV`]）が立っているか
 pub fn monitor_legacy() -> bool {
     std::env::var_os(MONITOR_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// #2041 の A/B（[`SESSION_LEGACY_ENV`]）が立っているか
+pub fn session_legacy() -> bool {
+    std::env::var_os(SESSION_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
 /// 一覧の 1 項目が tako の mod の置き場か（どのインスタンスの data dir でも）。
@@ -954,6 +962,43 @@ pub fn monitor_plan(
     }
     MonitorPlan::Mod {
         session_id: session_id.to_string(),
+    }
+}
+
+/// レジストリが記録した worker の会話 ID を、mod の報告が運ぶ今の会話 ID へ追従させるか（#2041。純関数）。
+///
+/// `/clear` と `/resume` は**同じ claude のプロセスで別の会話が続く**（mod は次の報告で新しい会話 ID を
+/// 運ぶ = `register.ts` の `session.end`）。レジストリは spawn 直後の会話 ID のままなので、名指しが
+/// 食い違って [`monitor_plan`] が `session_mismatch` へ落ち、監視が 5 秒ごとに走査し続けていた
+/// （走査は古い会話 ID について答え、応答の `resolved_session_id` も `/clear` 前の会話を指したまま。
+/// 器のあるペインはセッションカタログの 30 秒走査が書き戻すまで、器の無いペインはずっと）。
+///
+/// 追従する（= 報告の会話 ID を返す）のは次がすべて揃うときだけ:
+///
+/// 1. 名指し（`expected`）が**レジストリの記録（`recorded`）そのもの**。呼び出し側が別の会話 ID を
+///    明示したなら、その会話について走査が答える（#2017 の判定のまま）
+/// 2. 報告が監視の答えになる（[`monitor_plan`] が名指しなしで `Mod`。20 秒以内・会話 ID つき）
+/// 3. 報告の会話 ID が記録と違う
+///
+/// ペインの取り違え（再利用されたペイン ID）は呼び出し側が先に弾く（器の名前が食い違えば報告ごと
+/// 捨てる = `verify_ctx_pane_identity`）。`legacy` は [`session_legacy`] の値
+pub fn follow_session(
+    looked_up: &Result<&StoredReport, ModUnavailable>,
+    now: Instant,
+    expected: Option<&str>,
+    recorded: Option<&str>,
+    legacy: bool,
+) -> Option<String> {
+    if legacy {
+        return None;
+    }
+    let recorded = recorded.filter(|r| !r.is_empty())?;
+    if expected != Some(recorded) {
+        return None;
+    }
+    match monitor_plan(looked_up, now, None, false) {
+        MonitorPlan::Mod { session_id } if session_id != recorded => Some(session_id),
+        _ => None,
     }
 }
 
@@ -3679,5 +3724,77 @@ mod tests {
         let ran = MonitorPlan::Scan { why: "mod_absent" }.to_json();
         assert_eq!(ran["skipped"], false);
         assert_eq!(ran["reason"], "mod_absent");
+    }
+
+    // --- #2041: レジストリの会話 ID を mod の報告へ追従させる判断 ---------------------
+
+    /// `/clear` の後（報告 = 新しい会話・名指し = レジストリの古い記録）は報告の会話 ID へ追従する
+    #[test]
+    fn issue2041_clearの後はレジストリの記録を報告の会話へ追従させる() {
+        let t0 = Instant::now();
+        let s = stored_2017(Some("s-new"), t0);
+        assert_eq!(
+            follow_session(&Ok(&s), t0, Some("s-old"), Some("s-old"), false),
+            Some("s-new".to_string())
+        );
+        // 追従した後は名指しと報告が一致する = 監視は走査しない
+        assert!(monitor_plan(&Ok(&s), t0, Some("s-new"), false).skips_scan());
+    }
+
+    /// 追従しない: 一致している / 明示の名指し / 記録が無い / 報告が答えにならない / A/B
+    #[test]
+    fn issue2041_追従しない条件() {
+        let t0 = Instant::now();
+        let s = stored_2017(Some("s-new"), t0);
+        let follow = |looked_up: &Result<&StoredReport, ModUnavailable>,
+                      now: Instant,
+                      expected: Option<&str>,
+                      recorded: Option<&str>| {
+            follow_session(looked_up, now, expected, recorded, false)
+        };
+        assert_eq!(
+            follow(&Ok(&s), t0, Some("s-new"), Some("s-new")),
+            None,
+            "一致"
+        );
+        assert_eq!(
+            follow(&Ok(&s), t0, Some("s-asked"), Some("s-old")),
+            None,
+            "呼び出し側が記録と違う会話を明示した = その会話について走査が答える（#2017 のまま）"
+        );
+        assert_eq!(follow(&Ok(&s), t0, None, Some("s-old")), None, "名指しなし");
+        assert_eq!(follow(&Ok(&s), t0, Some(""), Some("")), None, "空の記録");
+        assert_eq!(follow(&Ok(&s), t0, Some("s-old"), None), None, "記録なし");
+        assert_eq!(
+            follow(
+                &Ok(&s),
+                t0 + MONITOR_SKIP_FOR + Duration::from_millis(1),
+                Some("s-old"),
+                Some("s-old")
+            ),
+            None,
+            "heartbeat が途絶えた報告で記録を書き換えない（mod_aging）"
+        );
+        let no_sid = stored_2017(None, t0);
+        assert_eq!(
+            follow(&Ok(&no_sid), t0, Some("s-old"), Some("s-old")),
+            None,
+            "会話 ID の無い報告"
+        );
+        assert_eq!(
+            follow(
+                &Err(ModUnavailable::Absent),
+                t0,
+                Some("s-old"),
+                Some("s-old")
+            ),
+            None,
+            "報告なし"
+        );
+        assert_eq!(
+            follow_session(&Ok(&s), t0, Some("s-old"), Some("s-old"), true),
+            None,
+            "A/B（TAKO_2041_LEGACY）は追従しない = 修正前"
+        );
     }
 }
