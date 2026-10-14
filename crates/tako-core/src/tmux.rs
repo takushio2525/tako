@@ -779,6 +779,38 @@ pub fn pane_log_probe(socket: Option<&str>, session: &str) -> Option<PaneLogProb
     })
 }
 
+/// [`pane_log_probe`] + 画面の行数（`#{pane_height}`。#2018）。
+///
+/// ペインを閉じる直前の取り込みは「履歴の増分 + 画面」を [`capture_scrollback_plain`] の
+/// 1 回で読む（UI で採った画面と後から読んだ履歴が時間差で重ならないように）。
+/// その末尾の画面の行を切り分けるのに使う。セッション消滅では None
+pub fn pane_log_probe_screen(socket: Option<&str>, session: &str) -> Option<(PaneLogProbe, usize)> {
+    let output = run_tmux(
+        socket,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &session_pane_target(session),
+            "#{history_size} #{history_limit} #{history_bytes} #{alternate_on} #{pane_height}",
+        ],
+    )
+    .ok()?;
+    parse_pane_log_probe_screen(output.lines().next()?)
+}
+
+/// [`pane_log_probe_screen`] の 1 行のパース（純関数）
+fn parse_pane_log_probe_screen(line: &str) -> Option<(PaneLogProbe, usize)> {
+    let mut f = line.split_whitespace();
+    let probe = PaneLogProbe {
+        history: f.next()?.parse().ok()?,
+        limit: f.next()?.parse().ok()?,
+        bytes: f.next()?.parse().ok()?,
+        alternate: f.next()? == "1",
+    };
+    Some((probe, f.next()?.parse().ok()?))
+}
+
 /// 全バックエンドセッションの probe 値を `list-panes -a` 1 回で一括取得する（#369）。
 /// ペイン毎に `display-message` を実行する `pane_log_probe` の N 回起動を 1 回に削減する。
 /// 各セッションのアクティブペイン（`#{pane_active}==1`）のみ返す（`display-message -p` と同等）。
@@ -786,21 +818,26 @@ pub fn pane_log_probe(socket: Option<&str>, session: &str) -> Option<PaneLogProb
 pub fn pane_log_probe_batch(
     socket: Option<&str>,
 ) -> std::collections::HashMap<String, PaneLogProbe> {
-    use std::collections::HashMap;
-    let output = run_tmux(
-        socket,
-        &[
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{pane_active}\t#{history_size}\t#{history_limit}\t#{history_bytes}\t#{alternate_on}",
-        ],
-    );
-    let mut map = HashMap::new();
-    let Ok(text) = output else {
-        return map;
-    };
-    for line in text.lines() {
+    match run_tmux(socket, &PANE_LOG_PROBE_BATCH_ARGS) {
+        Ok(text) => parse_pane_log_probe_batch(text.lines()),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// [`pane_log_probe_batch`] の argv（[`pane_log_probe_and_capture`] の先頭にも同じものを置く）
+const PANE_LOG_PROBE_BATCH_ARGS: [&str; 4] = [
+    "list-panes",
+    "-a",
+    "-F",
+    "#{session_name}\t#{pane_active}\t#{history_size}\t#{history_limit}\t#{history_bytes}\t#{alternate_on}",
+];
+
+/// [`PANE_LOG_PROBE_BATCH_ARGS`] の出力のパース（純関数）
+fn parse_pane_log_probe_batch<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> std::collections::HashMap<String, PaneLogProbe> {
+    let mut map = std::collections::HashMap::new();
+    for line in lines {
         let mut f = line.split('\t');
         let Some(session_name) = f.next() else {
             continue;
@@ -822,6 +859,107 @@ pub fn pane_log_probe_batch(
         }
     }
     map
+}
+
+/// 器のペインログの probe（全セッション）と、`captures` の各セッションの履歴の末尾
+/// （`(セッション名, 行数)`）を **1 回の tmux 起動**で読む（#2018）。
+///
+/// [`pane_log_probe_batch`] + セッションごとの [`capture_history_plain`] を `;` でつないだ
+/// コマンド列にする。子プロセスが「1 + 出力のあったペインの数」本から 1 本になるうえ、
+/// tmux はコマンド列を処理し終えるまでペインの出力を読まないので、probe の行数と
+/// capture の行が同じ瞬間のものになる（別々に起こすと間に伸びた行のぶん範囲がずれる）。
+///
+/// **本物の tmux だけ**で使う: psmux は複合コマンドの後半を捨てる（Windows 実機の実測。
+/// `backend/psmux.rs` の `pane_pids_all` の注記）。どれかのセッションが消えていると tmux は
+/// 残りを捨てて失敗するので Err（呼び手は別々に読み直す）
+pub fn pane_log_probe_and_capture(
+    socket: Option<&str>,
+    captures: &[(&str, usize)],
+) -> Result<PaneLogRead, String> {
+    let marker = pane_log_capture_marker();
+    let args = pane_log_probe_and_capture_args(&marker, captures);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let text = run_tmux(socket, &arg_refs)?;
+    parse_pane_log_probe_and_capture(&text, &marker, captures.len())
+}
+
+/// [`pane_log_probe_and_capture`] の答え
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLogRead {
+    /// セッション名 → probe（[`pane_log_probe_batch`] と同じ）
+    pub probes: std::collections::HashMap<String, PaneLogProbe>,
+    /// 頼んだ capture の履歴の末尾（頼んだのと同じ順）
+    pub captures: Vec<Vec<String>>,
+}
+
+/// 区切りの行（ペインの中身と取り違えないよう、プロセスと時刻を混ぜる）
+fn pane_log_capture_marker() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("tako-pane-log-{}-{nanos}", std::process::id())
+}
+
+/// [`pane_log_probe_and_capture`] の argv（純関数）。区切りは `display-message -p` で出す
+fn pane_log_probe_and_capture_args(marker: &str, captures: &[(&str, usize)]) -> Vec<String> {
+    let mut args: Vec<String> = PANE_LOG_PROBE_BATCH_ARGS
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    for (i, (session, count)) in captures.iter().enumerate() {
+        args.extend([
+            ";".into(),
+            "display-message".into(),
+            "-p".into(),
+            format!("{marker}-{i}"),
+            ";".into(),
+            "capture-pane".into(),
+            "-p".into(),
+            "-t".into(),
+            session_pane_target(session),
+            "-S".into(),
+            format!("-{count}"),
+            "-E".into(),
+            "-1".into(),
+        ]);
+    }
+    args
+}
+
+/// [`pane_log_probe_and_capture`] の出力のパース（純関数）。区切りが揃っていなければ Err
+fn parse_pane_log_probe_and_capture(
+    text: &str,
+    marker: &str,
+    captures: usize,
+) -> Result<PaneLogRead, String> {
+    let mut lines = text.lines();
+    let mut probe_lines = Vec::new();
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    for line in lines.by_ref() {
+        if line == format!("{marker}-0") {
+            blocks.push(Vec::new());
+            break;
+        }
+        probe_lines.push(line);
+    }
+    for line in lines {
+        if line == format!("{marker}-{}", blocks.len()) {
+            blocks.push(Vec::new());
+        } else if let Some(block) = blocks.last_mut() {
+            block.push(line.trim_end().to_string());
+        }
+    }
+    if blocks.len() != captures {
+        return Err(format!(
+            "区切りが {} / {captures} しか無い（コマンド列が途中で止まった）",
+            blocks.len()
+        ));
+    }
+    Ok(PaneLogRead {
+        probes: parse_pane_log_probe_batch(probe_lines.into_iter()),
+        captures: blocks,
+    })
 }
 
 /// 履歴末尾の `count` 行を平文で取得する（Issue #112 ペインログ用）。
@@ -1045,6 +1183,96 @@ mod tests {
             wrapper: wrapper.map(Into::into),
             socket: socket.map(Into::into),
         }
+    }
+
+    /// #2018: probe と capture を 1 回の tmux へつなぐ argv（区切りは display-message）
+    #[test]
+    fn probeとcaptureを1回のtmuxへつなぐ() {
+        let args = pane_log_probe_and_capture_args("MK", &[("tako-a", 3), ("tako-b", 40)]);
+        assert_eq!(&args[..4], &PANE_LOG_PROBE_BATCH_ARGS.map(String::from));
+        let rest: Vec<&str> = args[4..].iter().map(String::as_str).collect();
+        let (ta, tb) = (session_pane_target("tako-a"), session_pane_target("tako-b"));
+        assert_eq!(
+            rest,
+            [
+                ";",
+                "display-message",
+                "-p",
+                "MK-0",
+                ";",
+                "capture-pane",
+                "-p",
+                "-t",
+                &ta,
+                "-S",
+                "-3",
+                "-E",
+                "-1",
+                ";",
+                "display-message",
+                "-p",
+                "MK-1",
+                ";",
+                "capture-pane",
+                "-p",
+                "-t",
+                &tb,
+                "-S",
+                "-40",
+                "-E",
+                "-1",
+            ]
+        );
+        // capture が無ければ probe だけ
+        assert_eq!(
+            pane_log_probe_and_capture_args("MK", &[]),
+            PANE_LOG_PROBE_BATCH_ARGS.map(String::from).to_vec()
+        );
+    }
+
+    #[test]
+    fn probeとcaptureの出力を区切りで分ける() {
+        let text = "tako-a\t1\t26\t10000\t300\t0\ntako-a\t0\t9\t10000\t1\t0\n\
+                    tako-b\t1\t8\t10000\t90\t1\nMK-0\n24 \n\n26\nMK-1\n107\n";
+        let read = parse_pane_log_probe_and_capture(text, "MK", 2).unwrap();
+        assert_eq!(read.probes.len(), 2, "アクティブなペインだけ");
+        assert_eq!(read.probes["tako-a"].history, 26);
+        assert!(read.probes["tako-b"].alternate);
+        assert_eq!(read.captures, vec![vec!["24", "", "26"], vec!["107"]]);
+        // 区切りが足りない = コマンド列が途中で止まった
+        assert!(
+            parse_pane_log_probe_and_capture("tako-a\t1\t1\t1\t1\t0\nMK-0\nx\n", "MK", 2).is_err()
+        );
+        // capture なし
+        let read =
+            parse_pane_log_probe_and_capture("tako-a\t1\t5\t10000\t1\t0\n", "MK", 0).unwrap();
+        assert_eq!((read.probes.len(), read.captures.len()), (1, 0));
+    }
+
+    /// #2018: 閉じる直前の取り込みの probe は 5 つ目に画面の行数を持つ
+    #[test]
+    fn 閉じる直前のprobeは画面の行数まで読む() {
+        let (probe, height) = parse_pane_log_probe_screen("120 10000 4096 0 37").unwrap();
+        assert_eq!(
+            probe,
+            PaneLogProbe {
+                history: 120,
+                limit: 10000,
+                bytes: 4096,
+                alternate: false
+            }
+        );
+        assert_eq!(height, 37);
+        assert!(
+            parse_pane_log_probe_screen("120 10000 4096 1 9")
+                .unwrap()
+                .0
+                .alternate
+        );
+        // 欠け・壊れは None（取り込まずに UI の画面で書く側へ倒れる）
+        assert!(parse_pane_log_probe_screen("120 10000 4096 0").is_none());
+        assert!(parse_pane_log_probe_screen("x 10000 4096 0 9").is_none());
+        assert!(parse_pane_log_probe_screen("").is_none());
     }
 
     /// #1185: 取り込みビューの window 操作は**内側**（表示用ラッパー）へ向く。

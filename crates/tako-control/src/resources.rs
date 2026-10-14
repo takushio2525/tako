@@ -43,8 +43,10 @@ pub const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 pub const SCAN_INTERVAL_WANTED: Duration = Duration::from_secs(2);
 /// status を受けてから「見ている」とみなす長さ
 pub const WANTED_FOR: Duration = Duration::from_secs(10);
-/// 器のペインの pid（`tmux list-panes -a` = 子プロセス）を採り直す間隔
+/// 器のペインの pid（`tmux list-panes -a` = 子プロセス）を採り直す間隔（A/B の旧挙動。#2018）
 pub const BACKEND_INTERVAL: Duration = Duration::from_secs(10);
+/// 器の顔ぶれが変わらなくても pid を採り直す保険の間隔（#2018）
+pub const BACKEND_INSURANCE: Duration = Duration::from_secs(60);
 /// status の `panes` に載せる件数（メモリの多い順）
 pub const PANES_SHOWN: usize = 10;
 
@@ -349,7 +351,7 @@ fn refresh_processes(scan: &mut ScanState, now: Instant, interval: Duration) {
 }
 
 /// ペインの根（pid → ペイン）。器のペインは `tmux list-panes -a` の `pane_pid`
-/// （子プロセス。上限つき。[`BACKEND_INTERVAL`] ごとにだけ採る）
+/// （子プロセス。上限つき。採り直すのは [`backend_pids_stale`] のときだけ）
 fn pane_roots(scan: &mut ScanState, panes: &[PaneEntry], now: Instant) -> HashMap<u32, u64> {
     let mut roots = HashMap::new();
     for p in panes {
@@ -360,10 +362,12 @@ fn pane_roots(scan: &mut ScanState, panes: &[PaneEntry], now: Instant) -> HashMa
         }
     }
     if panes.iter().any(|p| p.backend_session.is_some()) {
-        let stale = scan
-            .backend
-            .as_ref()
-            .is_none_or(|(at, _)| now.duration_since(*at) >= BACKEND_INTERVAL);
+        let stale = backend_pids_stale(
+            scan.backend.as_ref(),
+            panes,
+            now,
+            tako_core::pane_log::issue2018_legacy(),
+        );
         if stale {
             scan.backend = Some((now, crate::agents::backend_pane_pids()));
         }
@@ -372,6 +376,35 @@ fn pane_roots(scan: &mut ScanState, panes: &[PaneEntry], now: Instant) -> HashMa
         }
     }
     roots
+}
+
+/// 覚えている器の pid（`pane_pid`）を採り直すか（#2018。純関数）。
+///
+/// `pane_pid` は器のペインのシェルの pid で、セッションが生きている間は変わらない。
+/// なので「覚えに無いセッションがある（作った直後・顔ぶれが変わった）」ときと
+/// [`BACKEND_INSURANCE`] の保険だけで採り直す。修正前（`legacy`）は 30 秒ごとの走査のたびに
+/// [`BACKEND_INTERVAL`] を過ぎていれば採り直していた（= 走査ごとに `tmux list-panes -a` 1 本）
+fn backend_pids_stale(
+    cached: Option<&(Instant, Vec<(String, u32)>)>,
+    panes: &[PaneEntry],
+    now: Instant,
+    legacy: bool,
+) -> bool {
+    let Some((at, all)) = cached else {
+        return true;
+    };
+    let age = now.duration_since(*at);
+    if legacy {
+        return age >= BACKEND_INTERVAL;
+    }
+    let missing = panes
+        .iter()
+        .filter_map(|p| p.backend_session.as_deref())
+        .any(|session| {
+            let prefix = format!("{session}:");
+            !all.iter().any(|(id, _)| id.starts_with(&prefix))
+        });
+    missing || age >= BACKEND_INSURANCE
 }
 
 /// 器のセッション名 → そのセッションの全ペインの `pane_pid` をペインへ対応させる（純関数）。
@@ -618,6 +651,47 @@ mod tests {
         assert_eq!(roots.get(&101), Some(&7), "window が増えても同じペイン");
         assert_eq!(roots.get(&102), None, "前方一致で別セッションを拾わない");
         assert_eq!(roots.get(&500), None, "器の無いペインはここでは扱わない");
+    }
+
+    /// #2018: 器の pid は顔ぶれが変わったときと 60 秒の保険でだけ採り直す（A/B は 10 秒ごと）
+    #[test]
+    fn 器のpidは顔ぶれが変わったときと保険でだけ採り直す() {
+        let now = Instant::now();
+        let pane = |session: &str| PaneEntry {
+            backend_session: Some(session.into()),
+            ..PaneEntry::default()
+        };
+        let cached = (
+            now,
+            vec![
+                ("tako-7:0.0".to_string(), 100),
+                ("tako-8:0.0".to_string(), 200),
+            ],
+        );
+        let panes = vec![pane("tako-7"), pane("tako-8")];
+        let at = |secs: u64| now + Duration::from_secs(secs);
+        assert!(backend_pids_stale(None, &panes, now, false), "初回");
+        assert!(!backend_pids_stale(Some(&cached), &panes, at(30), false));
+        assert!(!backend_pids_stale(Some(&cached), &panes, at(59), false));
+        assert!(
+            backend_pids_stale(Some(&cached), &panes, at(60), false),
+            "保険"
+        );
+        // 覚えに無いセッション（作った直後）。前方一致で別のセッションを数えない
+        let more = vec![pane("tako-7"), pane("tako-9")];
+        assert!(backend_pids_stale(Some(&cached), &more, at(1), false));
+        let prefix = vec![pane("tako-")];
+        assert!(backend_pids_stale(Some(&cached), &prefix, at(1), false));
+        // 減っただけなら覚えで足りる
+        assert!(!backend_pids_stale(
+            Some(&cached),
+            &[pane("tako-7")],
+            at(1),
+            false
+        ));
+        // A/B: 修正前は 10 秒ごと
+        assert!(!backend_pids_stale(Some(&cached), &panes, at(9), true));
+        assert!(backend_pids_stale(Some(&cached), &panes, at(10), true));
     }
 
     #[test]
