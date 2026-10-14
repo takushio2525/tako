@@ -20,11 +20,6 @@
 use std::time::{Duration, Instant};
 
 use tako_core::platform::console::{force_pin_pane_to_utf8, read_pane_code_pages, PinOutcome};
-
-// ---- 一時（#1696 の繰り返し検証。CI で確かめたら revert する） ----
-const REPEAT_1696: usize = 12;
-/// UTF-8 のバイト列を CP437 として描いた化け（CI で実測した並び）
-const MOJIBAKE_437: &str = "µùÑµ£¼";
 use tako_core::terminal::{SessionEvent, SpawnCommand, SpawnOptions, TerminalSession};
 
 /// 化けの判定に使う文字列。CP932 にも UTF-8 にも存在する常用漢字を選ぶ
@@ -173,30 +168,21 @@ fn ペイン起動時にコードページがutf8へ固定される() {
 fn utf8バイトを吐く子の出力が化けずに描画される() {
     detach_own_console();
     let fixture = write_utf8_fixture("render", JP);
-    for i in 0..REPEAT_1696 {
-        let mut pane = Pane::new_cmd();
-        pane.wait_prompt();
-        let at_prompt = read_pane_code_pages(pane.session.child_pid().unwrap());
-        pane.wait_utf8_code_page();
+    let mut pane = Pane::new_cmd();
+    pane.wait_prompt();
+    pane.wait_utf8_code_page();
 
-        pane.send_line(&format!("type {}", fixture.display()));
-        assert!(
-            pane.wait_for(JP, Duration::from_secs(15)),
-            "UTF-8 の日本語が正しく描画されない: {}",
-            pane.screen_text()
-        );
-        assert!(
-            !pane.screen_text().contains(MOJIBAKE),
-            "CP932 誤解釈の化け方が残っている: {}",
-            pane.screen_text()
-        );
-        assert!(
-            !pane.screen_text().contains(MOJIBAKE_437),
-            "CP437: {}",
-            pane.screen_text()
-        );
-        eprintln!("[1696] render iter={i} ok cp_at_prompt={at_prompt:?}");
-    }
+    pane.send_line(&format!("type {}", fixture.display()));
+    assert!(
+        pane.wait_for(JP, Duration::from_secs(15)),
+        "UTF-8 の日本語が正しく描画されない: {}",
+        pane.screen_text()
+    );
+    assert!(
+        !pane.screen_text().contains(MOJIBAKE),
+        "CP932 誤解釈の化け方が残っている: {}",
+        pane.screen_text()
+    );
     let _ = std::fs::remove_file(&fixture);
 }
 
@@ -214,31 +200,22 @@ fn 日本語ファイル名と絵文字と長文でも化けない() {
     ));
     std::fs::write(&path, format!("{body}\r\n").as_bytes()).expect("fixture を書けること");
 
-    for i in 0..REPEAT_1696 {
-        let mut pane = Pane::new_cmd();
-        pane.wait_prompt();
-        let at_prompt = read_pane_code_pages(pane.session.child_pid().unwrap());
-        pane.wait_utf8_code_page();
-        pane.send_line(&format!("type {}", path.display()));
+    let mut pane = Pane::new_cmd();
+    pane.wait_prompt();
+    pane.wait_utf8_code_page();
+    pane.send_line(&format!("type {}", path.display()));
 
-        // 末尾（= 分割を何度も跨いだ後）まで化けずに届いていること
-        assert!(
-            pane.wait_for(&JP.repeat(3), Duration::from_secs(20)),
-            "長文の日本語が化けている: {}",
-            pane.screen_text()
-        );
-        assert!(
-            !pane.screen_text().contains(MOJIBAKE),
-            "CP932 誤解釈の化け方が残っている: {}",
-            pane.screen_text()
-        );
-        assert!(
-            !pane.screen_text().contains(MOJIBAKE_437),
-            "CP437: {}",
-            pane.screen_text()
-        );
-        eprintln!("[1696] long iter={i} ok cp_at_prompt={at_prompt:?}");
-    }
+    // 末尾（= 分割を何度も跨いだ後）まで化けずに届いていること
+    assert!(
+        pane.wait_for(&JP.repeat(3), Duration::from_secs(20)),
+        "長文の日本語が化けている: {}",
+        pane.screen_text()
+    );
+    assert!(
+        !pane.screen_text().contains(MOJIBAKE),
+        "CP932 誤解釈の化け方が残っている: {}",
+        pane.screen_text()
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -305,104 +282,4 @@ fn powershell51のペインでもコードページがutf8になる() {
         "PowerShell 5.1 ペインが UTF-8 に固定されていない: {}",
         pane.screen_text()
     );
-}
-
-/// 一時（#1696）: 固定とプロンプトのどちらが先か。製品側で差し止めが要るかの材料
-#[test]
-fn 一時_1696_固定とプロンプトの前後() {
-    detach_own_console();
-    let mut late = 0;
-    let n = 20;
-    for i in 0..n {
-        let t0 = Instant::now();
-        let mut pane = Pane::new_cmd();
-        let pid = pane.session.child_pid().unwrap();
-        let mut t_prompt = None;
-        let mut t_utf8 = None;
-        let mut first_cp = None;
-        let deadline = t0 + Duration::from_secs(15);
-        while (t_prompt.is_none() || t_utf8.is_none()) && Instant::now() < deadline {
-            pane.pump();
-            if t_prompt.is_none() && pane.screen_text().contains('>') {
-                t_prompt = Some(t0.elapsed());
-            }
-            if t_utf8.is_none() {
-                if let Ok(cp) = read_pane_code_pages(pid) {
-                    first_cp.get_or_insert(cp);
-                    if cp.is_utf8() {
-                        t_utf8 = Some(t0.elapsed());
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        let is_late = match (t_prompt, t_utf8) {
-            (Some(p), Some(u)) => u > p,
-            _ => true,
-        };
-        if is_late {
-            late += 1;
-        }
-        eprintln!(
-            "[1696] order iter={i} prompt={t_prompt:?} utf8={t_utf8:?} first_cp={first_cp:?} pin_after_prompt={is_late}"
-        );
-    }
-    eprintln!("[1696] order summary: pin_after_prompt={late}/{n}");
-}
-
-/// 一時（#1696）: 固定が遅れた状態を注入すると、旧形（プロンプト直後に type）は CI と同じ
-/// CP437 の化けで落ち、新形（コードページの状態を待つ）は通る
-#[test]
-fn 一時_1696_固定が遅れると旧形は化け新形は通る() {
-    detach_own_console();
-    let fixture = write_utf8_fixture("inject", JP);
-    for i in 0..3 {
-        for new_shape in [false, true] {
-            let mut pane = Pane::new_cmd();
-            pane.wait_prompt();
-            pane.wait_utf8_code_page();
-            let pid = pane.session.child_pid().unwrap();
-            // 固定が済む前の状態（英語版 Windows の OEM = 437）を作り、状態で確かめる
-            pane.send_line("chcp 437");
-            let deadline = Instant::now() + Duration::from_secs(15);
-            loop {
-                if matches!(read_pane_code_pages(pid), Ok(cp) if cp.output == 437) {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "chcp 437 が効かない");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            // 固定は 2 秒遅れて届く
-            let repin = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(2));
-                force_pin_pane_to_utf8(pid)
-            });
-            if new_shape {
-                pane.wait_utf8_code_page();
-            }
-            pane.send_line(&format!("type {}", fixture.display()));
-            let (saw_bad, saw_jp) = if new_shape {
-                let jp = pane.wait_for(JP, Duration::from_secs(15));
-                (pane.screen_text().contains(MOJIBAKE_437), jp)
-            } else {
-                let bad = pane.wait_for(MOJIBAKE_437, Duration::from_secs(15));
-                (bad, pane.screen_text().contains(JP))
-            };
-            assert_eq!(repin.join().unwrap(), PinOutcome::Pinned);
-            let shape = if new_shape { "new" } else { "old" };
-            eprintln!(
-                "[1696] inject iter={i} shape={shape} saw_cp437_mojibake={saw_bad} saw_jp={saw_jp}"
-            );
-            if new_shape {
-                assert!(saw_jp && !saw_bad, "新形が化けた: {}", pane.screen_text());
-            } else {
-                assert!(
-                    saw_bad && !saw_jp,
-                    "注入が効いていない（旧形が化けない）: {}",
-                    pane.screen_text()
-                );
-            }
-        }
-    }
-    let _ = std::fs::remove_file(&fixture);
 }

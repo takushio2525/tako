@@ -349,7 +349,5 @@ jobs:
       # 1 件目の失敗の先にあるクレートが 1 件も走らない（実測 2026-09-22 の main:
       # tako-app の 1 件で止まり、tako-control / tako-core は 0 件実行）。
       # これでは「直したら次が出る」を 1 PR 1 往復でしか進められない
-      - name: 一時（#1696 の繰り返し検証。確認後に revert する）
-        run: cargo test -p tako-core --test encoding_conpty -- --nocapture
       - name: テスト（#1278 で blocking 化。全数を採るため --no-fail-fast）
         run: cargo test --workspace --no-fail-fast
