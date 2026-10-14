@@ -30930,6 +30930,12 @@ mod self_test {
     mod ino_highlight_1949;
     #[cfg(feature = "visual-test")]
     use ino_highlight_1949::ino_highlight_visual;
+    /// #1953: 既存の構文への別名（`.h` / `.m` / `.pde` / `.jsonc` / `.json5`）で塗り、応答の
+    /// `syntax` で読める（visual-test `syntax-alias`）
+    #[cfg(feature = "visual-test")]
+    mod syntax_alias_1953;
+    #[cfg(feature = "visual-test")]
+    use syntax_alias_1953::syntax_alias_visual;
     /// #2031: tasks の 2 秒ごとの一覧更新の最中も返答欄への打鍵が止まらない（visual-test `tasks-tick`）
     #[cfg(feature = "visual-test")]
     mod tasks_tick_2031;
@@ -45412,6 +45418,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1953: 既存の構文への別名で塗り、応答の `syntax` で読めるか
+                // （`TAKO_1953_LEGACY=1` で #1953 以前へ戻す A/B）
+                "syntax-alias" => {
+                    syntax_alias_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #2031: tasks の 2 秒ごとの一覧更新の最中も返答欄への打鍵が止まらないか
                 // （置き場の読みは `TAKO_2031_INJECT=slow:<ミリ秒>` で遅らせて測る）
                 "tasks-tick" => {
@@ -45475,6 +45488,7 @@ mod self_test {
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
+                         syntax-alias / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match）"
                     );

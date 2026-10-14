@@ -10,7 +10,8 @@
 //! Markdown のコードブロックの構文。
 //!
 //! この単体は**寄せる前のコードでも緑**だった（写しが寄せる前の判定と一致することの確認）。
-//! 寄せた後の差分は [`intended`] の 2 種だけで、それ以外の 1 件でも食い違えば落ちる。
+//! 寄せた後の差分は [`intended`] の 3 種（#1948 の 2 種 + #1953 の別名）だけで、それ以外の
+//! 1 件でも食い違えば落ちる。
 
 use super::*;
 use std::path::PathBuf;
@@ -414,7 +415,19 @@ enum Intended {
     /// 特殊なファイル名の色の補いを、大文字小文字違いの綴りにも当てる（two-face のファイル名の
     /// 照合と同じ）。寄せる前は綴りが一致したときだけ当たっていた
     NamedSyntaxAnyCase,
+    /// #1953: 既存の構文への別名（[`ALIASES_1953`]）。寄せる前は `.h` が Objective-C、
+    /// ほかは Plain Text（1 行目に shebang があればその構文）だった
+    Alias1953,
 }
+
+/// #1953 で別名を足した拡張子と、その構文（`tako_core::file_type` の行と同じ。`.m` は本文で
+/// 決めるので、本文に手掛かりの無いこの検査では変わらない）
+const ALIASES_1953: &[(&str, &str)] = &[
+    ("h", "C++"),
+    ("pde", "Java"),
+    ("jsonc", "JSON"),
+    ("json5", "JavaScript"),
+];
 
 /// 寄せる前の補い（`filename_to_syntax`）が当たっていた綴りと、その構文
 const NAMED_SYNTAX: &[(&str, &str)] = &[
@@ -439,6 +452,18 @@ fn intended(path: &Path, diff: &str) -> Option<Intended> {
     {
         return Some(Intended::CmakeEnter);
     }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let alias = ALIASES_1953.iter().any(|(alias, syntax)| {
+        ext.eq_ignore_ascii_case(alias)
+            && diff.starts_with("構文")
+            && diff.ends_with(&format!(" → {syntax}"))
+    });
+    if alias {
+        return Some(Intended::Alias1953);
+    }
     let any_case = NAMED_SYNTAX.iter().any(|(spelled, syntax)| {
         name.eq_ignore_ascii_case(spelled)
             && !NAMED_SYNTAX.iter().any(|(exact, _)| *exact == name)
@@ -448,7 +473,7 @@ fn intended(path: &Path, diff: &str) -> Option<Intended> {
     any_case.then_some(Intended::NamedSyntaxAnyCase)
 }
 
-/// 受け入れ条件: 寄せる前後で全数一致する（意図した差分 2 種を除く）
+/// 受け入れ条件: 寄せる前後で全数一致する（意図した差分 3 種を除く）
 #[test]
 fn 言語の同定を寄せる前後で挙動が全数一致する() {
     let hl = SyntectHighlighter::new();
@@ -500,6 +525,22 @@ fn 言語の同定を寄せる前後で挙動が全数一致する() {
             "JUSTFILE",
         ]
     );
+    assert_eq!(
+        names(Intended::Alias1953),
+        vec![
+            "config.json5",
+            "lib.h",
+            "sample.H",
+            "sample.JSON5",
+            "sample.JSONC",
+            "sample.PDE",
+            "sample.h",
+            "sample.json5",
+            "sample.jsonc",
+            "sample.pde",
+            "sketch.pde",
+        ]
+    );
 }
 
 /// 受け入れ条件: Markdown のコードブロックの言語トークンも全数一致する
@@ -516,23 +557,52 @@ fn コードブロックの言語トークンが寄せる前後で全数一致�
         }
     }
     for token in [
-        "ino", "arduino", "INO", "Arduino", "jsx", "mjs", "pde", "", "unknown",
+        "ino",
+        "arduino",
+        "INO",
+        "Arduino",
+        "jsx",
+        "mjs",
+        "pde",
+        "processing",
+        "jsonc",
+        "JSON5",
+        "",
+        "unknown",
     ] {
         tokens.push(token.to_string());
     }
     tokens.sort();
     tokens.dedup();
     let mut found: Vec<String> = Vec::new();
+    let mut aliased: Vec<String> = Vec::new();
     for token in &tokens {
         let before = pre_1948::token_syntax(&hl.syntaxes, token);
         let after = hl.syntax_for_token(token);
-        if !std::ptr::eq(before, after) {
-            found.push(format!("```{token}: {} → {}", before.name, after.name));
+        if std::ptr::eq(before, after) {
+            continue;
+        }
+        let diff = format!("```{token}: {} → {}", before.name, after.name);
+        // #1953 の別名（表の行のコードブロックの別名）は意図した差分
+        let row = tako_core::file_type::by_fence_token(token);
+        if row.is_some_and(|row| tako_core::file_type::ALIASES_1953.contains(&row.id)) {
+            aliased.push(diff);
+        } else {
+            found.push(diff);
         }
     }
     assert!(
         found.is_empty(),
         "コードブロックの構文が食い違った:\n{}",
         found.join("\n")
+    );
+    assert_eq!(
+        aliased,
+        vec![
+            "```JSON5: Plain Text → JavaScript",
+            "```jsonc: Plain Text → JSON",
+            "```pde: Plain Text → Java",
+            "```processing: Plain Text → Java",
+        ]
     );
 }

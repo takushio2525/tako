@@ -55,12 +55,12 @@ open_plan 7・インデント 5）。
 | 形式 | プレビュー | 色分け | 言語サーバ | Code Runner（macOS / Windows） | 言語ごとの設定 | Finder |
 |---|---|---|---|---|---|---|
 | `.ino` | code | ✗ Plain Text | ✗ なし | ✗ なし / ✗ なし（`Makefile` の中でも拾われない） | 4 / 括弧 | ✗ 動的 UTI |
-| `.pde` | code | ✗ Plain Text | ✗ なし | ✗ / ✗ | 4 / 括弧 | ✗ 動的 UTI |
-| `.h` | code | △ Objective-C（C / C++ のヘッダ） | ✓ clangd（`c`） | ✗ / ✗（`Makefile` があれば `make`） | 4 / 括弧 | ✓ `public.c-header` |
+| `.pde` | code | ✗ Plain Text（→ #1953 で Java） | ✗ なし | ✗ / ✗ | 4 / 括弧 | ✗ 動的 UTI |
+| `.h` | code | △ Objective-C（C / C++ のヘッダ。→ #1953 で C++、Objective-C のヘッダは本文で Objective-C のまま） | ✓ clangd（`c`） | ✗ / ✗（`Makefile` があれば `make`） | 4 / 括弧 | ✓ `public.c-header` |
 | `.hpp` | code | ✓ C++ | ✓ clangd（`cpp`） | ✗ / ✗（`Makefile` → `make`） | 4 / 括弧 | ✓ `public.c-plus-plus-header` |
 | `.c` | code | ✓ C | ✓ clangd（`c`） | ✓ `cc main.c -o main && ./main` / ✓ `gcc … -o main.exe; if ($?) { .\main.exe }` | 4 / 括弧 | ✓ `public.c-source` |
 | `.cpp` | code | ✓ C++ | ✓ clangd（`cpp`） | ✓ `c++ …` / ✓ `g++ … .exe` | 4 / 括弧 | ✓ `public.c-plus-plus-source` |
-| `.S` | code | ✗ Plain Text（`x86_64 Assembly` は `asm` / `nasm` 等だけ） | ✗ | ✗ / ✗（案内が小文字の `s` を名指す） | 4 / 括弧 | ✓ `public.assembly-source` |
+| `.S` | code | ✗ Plain Text（`x86_64 Assembly` は `asm` / `nasm` 等だけ。#1953 で寄せないと決めた = §6.1） | ✗ | ✗ / ✗（案内が小文字の `s` を名指す） | 4 / 括弧 | ✓ `public.assembly-source` |
 
 ### 2.2 授業でよく使う系
 
@@ -68,7 +68,7 @@ open_plan 7・インデント 5）。
 |---|---|---|---|---|---|---|
 | `.java` | code | ✓ Java | ✗ | ✓ `java Main.java`（両 OS） | 4 / 括弧 | ✓ `com.sun.java-source` |
 | `.py` | code | ✓ Python | ✓ pyright（`python`） | ✓ `python3 main.py` / ✓ `python main.py`（`${python}` = 実行環境 #1730） | 4 / 括弧 + `:` | ✓ `public.python-script` |
-| `.m` | code | △ Objective-C（MATLAB の構文は拡張子 `matlab` だけ） | ✗ | ✗ / ✗ | 4 / 括弧 | ✓ `public.objective-c-source` |
+| `.m` | code | △ Objective-C（MATLAB の構文は拡張子 `matlab` だけ。→ #1953 で本文の手掛かりで MATLAB / Objective-C） | ✗ | ✗ / ✗ | 4 / 括弧 | ✓ `public.objective-c-source` |
 | `.r` / `.R` | code | ✓ R | ✗ | ✓ `Rscript stats.r`（両 OS） | 4 / 括弧 | ✓ `com.apple.rez-source`（Rez として適合） |
 | `.jl` | code | ✓ Julia | ✗ | ✓ `julia model.jl` | 4 / 括弧 | ✗ 動的 UTI |
 | `.tex` | code | ✓ LaTeX | ✗ | ✓ `latexmk -pdf -interaction=nonstopmode report.tex` | 4 / 括弧 | ✓ `org.tug.tex` |
@@ -91,7 +91,7 @@ open_plan 7・インデント 5）。
 |---|---|---|---|---|---|---|
 | `.toml` | code | ✓ TOML | ✗ | ✗ / ✗ | 4 / 括弧 | ✗ 動的 UTI |
 | `.yaml` | code | ✓ YAML | ✗ | ✗ / ✗ | 4 / 括弧 + `:` | ✓ `public.yaml` |
-| `.json5` | code | ✗ Plain Text | ✗ | ✗ / ✗ | 4 / 括弧 | ✗ 動的 UTI |
+| `.json5` | code | ✗ Plain Text（→ #1953 で JavaScript = §6.1） | ✗ | ✗ / ✗ | 4 / 括弧 | ✗ 動的 UTI |
 | `.ini` | code | ✓ INI | ✗ | ✗ / ✗ | 4 / 括弧 | ✗ 動的 UTI |
 | `.env` | code | ✓ DotENV（ファイル名で） | ✗ | ✗ / ✗ | 4 / 括弧 | ✗ `public.data` |
 | `Dockerfile` | code | ✓ Dockerfile（ファイル名で） | ✗ | ✗ / ✗ | 4 / 括弧 | ✗ `public.data` |
@@ -130,7 +130,7 @@ open_plan 7・インデント 5）。
 | 列 | 効く形式（45 中） | 根拠 |
 |---|---|---|
 | プレビュー | 45（すべて code。`.ipynb` は JSON の原文） | `crates/tako-core/src/open_plan.rs:72` は md / 画像 / pdf / 動画以外を code へ倒す |
-| 色分け | ✓ 36・△ 3（誤り `.h` `.m`・近似 `.zsh`）・✗ 6 | two-face の構文は **213**（`preview.rs:2006` のコメントの「270+」は実数と食い違う） |
+| 色分け | ✓ 36・△ 3（誤り `.h` `.m`・近似 `.zsh`）・✗ 6（S0 時点。#1949 / #1953 の後は ✓ 40・△ 2（`.m` の手掛かりの無い本文・`.zsh`）・✗ 3（`.S` `.astro` `.ps1`）） | two-face の構文は **213**（`preview.rs:2006` のコメントの「270+」は実数と食い違う） |
 | 言語サーバ | 8（`.h` `.hpp` `.c` `.cpp` `.py` `.jsx` `.tsx` `.rs`） | `crates/tako-core/src/lsp/servers.rs:85`（4 行） |
 | Code Runner | macOS 23・Windows 23（`Makefile` のプロジェクト既定を含む） | `crates/tako-core/src/platform/runner_defaults.rs:127` + `crates/tako-core/src/runner_project.rs:92` |
 | 言語ごとの設定 | 例外はタブ 2（`Makefile` `.go`）・`:` 2（`.py` `.yaml`）・継承 1（`CMakeLists.txt`） | `text_edit.rs:244` / `:294` |
@@ -397,15 +397,52 @@ open_plan 7・インデント 5）。
 
 | 穴 | 方針 | 子 Issue |
 |---|---|---|
-| `.h` → Objective-C | C++ へ（VS Code と同じ。C のヘッダとしても致命的に崩れない） | 色の補い |
-| `.m` → Objective-C | 授業の MATLAB と衝突。本文の手掛かり（`%` コメント・`function … end` / `#import`・`@interface`）で判定し、MATLAB の構文（two-face に `MATLAB` がある）へ | 色の補い |
-| `.pde` → 色なし | Processing（Java 系）として Java で塗る。旧 Arduino のスケッチ（`.pde`）は今では少数 | 色の補い |
-| `.json5` / `.jsonc` → 色なし | JSON で塗る（コメント・末尾カンマの扱いを確認） | 色の補い |
-| `.S` / `.s` → 色なし | 既存の `x86_64 Assembly` へ寄せてよいか（AVR / ARM の命令は x86 ではない）を見て判断 | 色の補い |
+| `.h` → Objective-C | C++ へ（VS Code と同じ。C のヘッダとしても致命的に崩れない）。✅ #1953 | 色の補い |
+| `.m` → Objective-C | 授業の MATLAB と衝突。本文の手掛かり（`%` コメント・`function … end` / `#import`・`@interface`）で判定し、MATLAB の構文（two-face に `MATLAB` がある）へ。✅ #1953 | 色の補い |
+| `.pde` → 色なし | Processing（Java 系）として Java で塗る。旧 Arduino のスケッチ（`.pde`）は今では少数。✅ #1953 | 色の補い |
+| `.json5` / `.jsonc` → 色なし | JSON で塗る（コメント・末尾カンマの扱いを確認）。✅ #1953（`.jsonc` は JSON、`.json5` は実測で JavaScript へ変えた = §6.1） | 色の補い |
+| `.S` / `.s` → 色なし | 既存の `x86_64 Assembly` へ寄せてよいか（AVR / ARM の命令は x86 ではない）を見て判断。#1953 で**寄せない**と決めた（§6.1） | 色の補い |
 | `.ps1` / `.astro` → 色なし | two-face に構文が無い。構文を足すと構文セット（#815）とビルドに効くので、足す方法と実測を別に | 構文の追加 |
 | 言語サーバ 37 形式 | #1007 の「第 2 波」（Java / Go / …）。#1944 の自動取得と合わせて優先順を決める | 言語サーバ第 2 波 |
 | Finder 24 形式・Windows 0 | #708 の「既定を奪わない」を守ったまま広げられるか（UTI の輸入宣言の可否）を lsregister で実測 | Finder / 関連付け |
 | Code Runner の空き（`.vue` `.svelte` `.astro` `.scss` `.toml` `.yaml` `.json5` `.ini` `.env` `Dockerfile` `.proto` `.graphql` `.h` `.hpp`） | **単体では走らせるものではない**ので今のまま（`.vue` 等は `package.json` の `npm run` を `tako:run:` で書く）。`.m` / `.pde` / `.S` は需要が出たら行を足す | なし |
+
+### 6.1 実装で決めたこと（#1953）
+
+測り方: 同じ版の syntect 5.3.0 / two-face 0.5.1・同じ feature の使い捨てクレート（scratchpad）で、
+本文をその構文で解析して `invalid` のスコープが付く字句と、`base16-eighties.dark` で塗った前景色を数えた。
+`invalid.illegal` はこのテーマだと前景が地の色（`#2d2d2d`）で、tako は前景色だけを描く
+（`preview.rs` の `step`）ので、**ダーク（面 `#1e1e2e`）では字が消える**（コントラスト 1.2:1）。
+
+- **`.h` は `cpp` の行の `syntax` = C++**。ほかの C++ の拡張子（`cpp` `cc` `cxx` `hh` `hpp` `hxx`）は
+  two-face でも C++ なので変わらない。C++ のヘッダ（`namespace` / `template`）は Objective-C の構文だと
+  色の付く字句が 4、C++ だと 35。**Objective-C のヘッダ**（`#import` / `@interface`）は C++ で塗ると
+  19 → 7 に減る（`invalid` は 0）ので、本文の手掛かりで Objective-C のまま残した（#1953 以前と同じ）
+- **`.m` は表の行を持たない**。パスだけでは言語が決まらないので `file_type` は null のまま
+  （行コメントの記号・括弧の書き方も今のまま）。色だけを `file_type::syntax_by_content`（純粋関数）が
+  本文の先頭 200 行（`SNIFF_LINES`）の手掛かりで決める: `#import` / `@interface` / `@implementation` /
+  `@protocol` / `@class` / `@property` / `@end` → Objective-C（先に取る = GitHub の Linguist と同じ順）、
+  行頭の `%`（`%%` / `%{` も）/ `function` / `classdef` → MATLAB、どちらも無ければ two-face の
+  Objective-C（今のまま）。編集中は 1 打鍵ごとの塗り直しで引き直すので、空の `.m` に `%` を打てば
+  MATLAB へ切り替わる。MATLAB の関数ファイルは Objective-C だと 9 字句、MATLAB だと 20 字句に色
+- **`.pde` は `java` の行にしない**（`processing` の行。`.ino` と同じく寄せるのは色だけ）。
+  クラスで包まないスケッチは Java として正しくないので、Java の言語サーバ（#1956）へ渡すと嘘のエラーになる。
+  Java の構文で `invalid` は 0
+- **`.json5` は JSON ではなく JavaScript**（GitHub の Linguist も JSON5 を `source.js` で塗る）。
+  JSON の構文はコメントと末尾カンマは通すが、JSON5 にしか無い書き方（クォートの無いキー・`'…'`・16 進・
+  `+Infinity`・`.5`）を `invalid.illegal` にする。renovate.json5 の形で 144 字句中 113 が消える。
+  JavaScript なら 0（クォートの無いキーの色は揃わないが、字は全部見える）。**`.jsonc` は JSON**
+  （コメント・末尾カンマで `invalid` 0、キーが文字列の色で揃う）
+- **`.S` / `.s` は寄せない**。`x86_64 Assembly` で塗ると、ARM32 の `@` コメントの `@` が `invalid` = 消え、
+  後ろのコメント文も地の文の色、Apple Silicon の ARM64 の `//` コメントはコメントとして塗られない。
+  x86 の本文でも命令（`mov` / `pushq`）は色が付かず、得るのは `#` / `;` のコメント・数値・文字列・
+  ディレクティブだけ。AVR（`;` コメント）・MIPS / RISC-V（`#` コメント）は崩れないが、
+  命令セットを拡張子で区別できないので、1 つでも字が消える形式があるなら寄せない。
+  対応するなら S7（#1954）で GAS の構文を足す側
+- **コードブロックの別名**も同じ行に置いた（```` ```pde ```` / ```` ```processing ```` = Java・
+  ```` ```jsonc ```` = JSON・```` ```json5 ```` = JavaScript）
+- **A/B** は `TAKO_1953_LEGACY=1`（別名の行の `syntax` と本文の判定を外す）。実測は
+  `scripts/test-syntax-alias-1953.sh`（CLI / MCP の応答の `syntax` と visual-test `syntax-alias` を新旧で）
 
 ## 7. 子 Issue（依存つき）
 

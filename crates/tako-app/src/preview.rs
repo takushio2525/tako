@@ -2020,15 +2020,48 @@ pub(crate) fn ino_highlight_legacy() -> bool {
     *ON.get_or_init(|| std::env::var("TAKO_1949_LEGACY").is_ok_and(|v| v == "1"))
 }
 
+/// 既存の構文への別名（`.h` = C++・`.pde` = Java・`.jsonc` = JSON・`.json5` = JavaScript）と
+/// `.m` / `.h` の本文の判定をやめ、#1953 以前へ戻す逃げ道（`TAKO_1953_LEGACY=1`）。
+/// 同じバイナリで A/B するためのもの（#1949 と同じ流儀）
+pub(crate) fn syntax_alias_legacy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TAKO_1953_LEGACY").is_ok_and(|v| v == "1"))
+}
+
 /// 言語の同定の正本（`tako_core::file_type`）の行が名指す構文（two-face の構文名。#1948）。
 ///
-/// `legacy_1949` は A/B（`TAKO_1949_LEGACY=1`）: `.ino` の行（#1949）だけを外して
-/// #1949 以前の Plain Text へ戻す。ほかの行は変わらない
-fn table_syntax(row: &tako_core::file_type::FileType, legacy_1949: bool) -> Option<&'static str> {
+/// A/B: `legacy_1949`（`TAKO_1949_LEGACY=1`）は `.ino` の行（#1949）だけを外して Plain Text へ、
+/// `legacy_1953`（`TAKO_1953_LEGACY=1`）は別名の行（[`tako_core::file_type::ALIASES_1953`]）を
+/// 外して #1953 以前へ戻す。ほかの行は変わらない
+fn table_syntax(
+    row: &tako_core::file_type::FileType,
+    legacy_1949: bool,
+    legacy_1953: bool,
+) -> Option<&'static str> {
     if legacy_1949 && row.id == tako_core::file_type::ARDUINO {
         return None;
     }
+    if legacy_1953 && tako_core::file_type::ALIASES_1953.contains(&row.id) {
+        return None;
+    }
     row.syntax
+}
+
+/// パスと本文から名指される構文（two-face の構文名）。本文の手掛かり（`.m` / `.h`。#1953）→
+/// 言語の同定の正本の行（#1948）の順。`None` = two-face の表に任せる
+fn named_syntax(
+    path: &Path,
+    text: &str,
+    legacy_1949: bool,
+    legacy_1953: bool,
+) -> Option<&'static str> {
+    (!legacy_1953)
+        .then(|| tako_core::file_type::syntax_by_content(path, text))
+        .flatten()
+        .or_else(|| {
+            tako_core::file_type::identify(path)
+                .and_then(|row| table_syntax(row, legacy_1949, legacy_1953))
+        })
 }
 
 /// いまの表示行を塗った構文名（#1948。CLI / MCP の `syntax` = `ControlHost::preview_syntax`）。
@@ -2036,7 +2069,8 @@ fn table_syntax(row: &tako_core::file_type::FileType, legacy_1949: bool) -> Opti
 /// 塗った時点で記録した名前（[`PreviewState::syntax`]）を先に見るので、塗った後の
 /// 問い合わせは構文セットを借りない（#815 の解放を問い合わせで延ばさない）。
 /// 塗りが戻る前（開いた直後の平文・大きい文書の全文の塗り待ち）は、**塗りと同じ解決**
-/// （同じ関数・同じ 1 行目）をその場で引く。コード表示でなければ `None`
+/// （同じ関数・同じ本文の頭 = 1 行目と、本文の手掛かりを探す
+/// [`tako_core::file_type::SNIFF_LINES`] 行。#1953）をその場で引く。コード表示でなければ `None`
 pub fn painted_syntax(preview: &PreviewState, edit: Option<&EditState>) -> Option<String> {
     let PreviewContent::Code(lines) = &preview.content else {
         return None;
@@ -2047,23 +2081,27 @@ pub fn painted_syntax(preview: &PreviewState, edit: Option<&EditState>) -> Optio
     if let Some(name) = &preview.syntax {
         return Some(name.clone());
     }
-    let first: String = match edit {
-        Some(edit) => edit
-            .buffer
-            .text()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        None => lines
-            .first()
-            .map(|line| line.iter().map(|span| span.text.as_str()).collect())
-            .unwrap_or_default(),
+    let joined: String;
+    let head: &str = match edit {
+        Some(edit) => edit.buffer.text(),
+        None => {
+            joined = lines
+                .iter()
+                .take(tako_core::file_type::SNIFF_LINES)
+                .map(|line| {
+                    line.iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            &joined
+        }
     };
     Some(
         highlighter()
             .0
-            .syntax_for_path(&preview.path, &first)
+            .syntax_for_path(&preview.path, head)
             .name
             .clone(),
     )
@@ -2150,8 +2188,9 @@ impl SyntectHighlighter {
         }
     }
 
-    /// 読み取り / 編集で共用する構文解決。言語の同定の正本（`tako_core::file_type`）の行が
-    /// 構文を名指していればそれ（#1948）。無ければ two-face（bat 由来の 213 構文）の表を
+    /// 読み取り / 編集で共用する構文解決。本文の手掛かり（`.m` = MATLAB / Objective-C。#1953）→
+    /// 言語の同定の正本（`tako_core::file_type`）の行が構文を名指していればそれ（#1948）。
+    /// 無ければ two-face（bat 由来の 213 構文）の表を
     /// ファイル名 → 拡張子 → shebang（1 行目）の優先順で引く。
     /// ファイル名を先に試すのは CMakeLists.txt 等の拡張子が汎用（.txt）でも
     /// ファイル名で特定できるケースを拾うため。
@@ -2160,8 +2199,7 @@ impl SyntectHighlighter {
         path: &Path,
         text: &str,
     ) -> &'a syntect::parsing::SyntaxReference {
-        if let Some(syn) = tako_core::file_type::identify(path)
-            .and_then(|row| table_syntax(row, ino_highlight_legacy()))
+        if let Some(syn) = named_syntax(path, text, ino_highlight_legacy(), syntax_alias_legacy())
             .and_then(|name| self.syntaxes.find_syntax_by_name(name))
         {
             return syn;
@@ -2487,10 +2525,11 @@ impl Highlighter for SyntectHighlighter {
 
 impl SyntectHighlighter {
     /// Markdown のコードブロックの言語トークン（```` ```cpp ````）から構文を特定する。
-    /// 言語の同定の正本の別名（```` ```ino ```` = C++。#1949）→ two-face のトークンの順（#1948）
+    /// 言語の同定の正本の別名（```` ```ino ```` = C++。#1949 / ```` ```jsonc ```` = JSON。#1953）→
+    /// two-face のトークンの順（#1948）
     fn syntax_for_token(&self, lang: &str) -> &syntect::parsing::SyntaxReference {
         tako_core::file_type::by_fence_token(lang)
-            .and_then(|row| table_syntax(row, ino_highlight_legacy()))
+            .and_then(|row| table_syntax(row, ino_highlight_legacy(), syntax_alias_legacy()))
             .and_then(|name| self.syntaxes.find_syntax_by_name(name))
             .or_else(|| self.syntaxes.find_syntax_by_token(lang))
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text())
@@ -5223,6 +5262,10 @@ mod tests {
 #[cfg(test)]
 mod file_type_parity_tests;
 
+/// #1953 の検査用の本文（単体と visual-test `syntax-alias` で共用）
+#[cfg(any(test, feature = "visual-test"))]
+pub(crate) mod alias_samples_1953;
+
 #[cfg(test)]
 mod syntax_resolution_tests {
     use super::*;
@@ -5275,24 +5318,23 @@ mod syntax_resolution_tests {
     fn inoの寄せ先はabで外れる() {
         use tako_core::file_type::{by_extension, by_fence_token, by_file_name};
         let row = |ext: &str| by_extension(ext).unwrap_or_else(|| panic!("{ext} の行が無い"));
-        assert_eq!(table_syntax(row("ino"), false), Some("C++"));
-        assert_eq!(table_syntax(row("ino"), true), None);
-        for legacy in [false, true] {
-            assert_eq!(table_syntax(row("jsx"), legacy), Some("JavaScript"));
-            assert_eq!(table_syntax(row("mjs"), legacy), Some("JavaScript"));
-            // two-face が知っている拡張子は表で名指さない
-            assert_eq!(table_syntax(row("mts"), legacy), None);
-            let just = by_file_name("Justfile").expect("Justfile の行");
-            assert_eq!(table_syntax(just, legacy), Some("Makefile"));
+        // #1953 の A/B（第 3 引数）は `.ino` に効かない
+        for legacy_1953 in [false, true] {
+            assert_eq!(table_syntax(row("ino"), false, legacy_1953), Some("C++"));
+            assert_eq!(table_syntax(row("ino"), true, legacy_1953), None);
         }
-        assert!(
-            by_extension("pde").is_none(),
-            "対応形式はこの Issue で増やさない"
-        );
+        for legacy in [false, true] {
+            assert_eq!(table_syntax(row("jsx"), legacy, false), Some("JavaScript"));
+            assert_eq!(table_syntax(row("mjs"), legacy, false), Some("JavaScript"));
+            // two-face が知っている拡張子は表で名指さない
+            assert_eq!(table_syntax(row("mts"), legacy, false), None);
+            let just = by_file_name("Justfile").expect("Justfile の行");
+            assert_eq!(table_syntax(just, legacy, false), Some("Makefile"));
+        }
         for token in ["ino", "Arduino", "INO"] {
             let row = by_fence_token(token).expect("コードブロックの別名");
-            assert_eq!(table_syntax(row, false), Some("C++"));
-            assert_eq!(table_syntax(row, true), None);
+            assert_eq!(table_syntax(row, false, false), Some("C++"));
+            assert_eq!(table_syntax(row, true, false), None);
         }
         // 構文セットが知っている名前は別名に置かない（`find_syntax_by_token` が当たる）
         assert!(by_fence_token("cpp").is_none());
@@ -5315,11 +5357,149 @@ mod syntax_resolution_tests {
             }
         }
         assert!(named >= 6, "表が名指す構文が縮退している: {named}");
+        // 本文の手掛かりが名指す構文も（#1953）
+        for name in tako_core::file_type::CONTENT_SYNTAXES {
+            assert!(
+                hl.syntaxes.find_syntax_by_name(name).is_some(),
+                "本文の判定の構文 {name} が構文セットに無い"
+            );
+        }
         assert_eq!(
             hl.syntaxes.syntaxes().len(),
             213,
             "構文の数が変わった（#815 の常駐と #1948 の全数一致の前提）"
         );
+    }
+
+    /// #1953: 既存の構文への別名と `.m` / `.h` の本文の判定で塗る構文
+    #[test]
+    fn 別名と本文の判定で塗る構文() {
+        use super::alias_samples_1953::*;
+        let hl = SyntectHighlighter::new();
+        let resolve =
+            |path: &str, text: &str| hl.syntax_for_path(Path::new(path), text).name.clone();
+        for (path, text, expected) in [
+            ("geo.h", C_HEADER, "C++"),
+            ("GEO.H", C_HEADER, "C++"),
+            ("empty.h", "", "C++"),
+            ("Counter.h", OBJC_HEADER, "Objective-C"),
+            ("solve.m", MATLAB_SOURCE, "MATLAB"),
+            ("SOLVE.M", MATLAB_SOURCE, "MATLAB"),
+            ("Counter.m", OBJC_SOURCE, "Objective-C"),
+            // 手掛かりが無ければ今のまま（two-face の Objective-C）
+            (
+                "plot.m",
+                "x = linspace(0, 1, 10);\nplot(x, x.^2)\n",
+                "Objective-C",
+            ),
+            ("empty.m", "", "Objective-C"),
+            ("sketch.pde", PROCESSING_SKETCH, "Java"),
+            ("settings.jsonc", JSONC_SETTINGS, "JSON"),
+            ("renovate.json5", JSON5_CONFIG, "JavaScript"),
+            // `.S` / `.s` は寄せない（x86_64 Assembly は ARM の `@` コメントを invalid にする = #1953）
+            (
+                "boot.S",
+                "    .text\n_start:\n    mov r0, #1  @ ARM\n",
+                "Plain Text",
+            ),
+            ("start.s", "    mov x0, #1  // ARM64\n", "Plain Text"),
+            // `.hpp` 等の C++ の拡張子は two-face でも C++（変わらない）
+            ("geo.hpp", OBJC_HEADER, "C++"),
+        ] {
+            assert_eq!(resolve(path, text), expected, "{path}");
+        }
+        // Markdown のコードブロックの別名
+        for (token, expected) in [
+            ("pde", "Java"),
+            ("processing", "Java"),
+            ("jsonc", "JSON"),
+            ("json5", "JavaScript"),
+        ] {
+            assert_eq!(hl.syntax_for_token(token).name, expected, "```{token}");
+        }
+    }
+
+    /// #1953: A/B（`TAKO_1953_LEGACY=1`）は別名の行と本文の判定だけを外し、#1953 以前へ戻す
+    #[test]
+    fn 別名の寄せ先はabで外れる() {
+        use super::alias_samples_1953::*;
+        let named = |path: &str, text: &str, legacy: bool| {
+            named_syntax(Path::new(path), text, false, legacy)
+        };
+        for (path, text, new) in [
+            ("geo.h", C_HEADER, "C++"),
+            ("Counter.h", OBJC_HEADER, "Objective-C"),
+            ("solve.m", MATLAB_SOURCE, "MATLAB"),
+            ("Counter.m", OBJC_SOURCE, "Objective-C"),
+            ("sketch.pde", PROCESSING_SKETCH, "Java"),
+            ("settings.jsonc", JSONC_SETTINGS, "JSON"),
+            ("renovate.json5", JSON5_CONFIG, "JavaScript"),
+        ] {
+            assert_eq!(named(path, text, false), Some(new), "{path}");
+            assert_eq!(named(path, text, true), None, "{path}: 旧は two-face 任せ");
+        }
+        // 旧（two-face 任せ）の行き先 = #1953 以前の色
+        let hl = SyntectHighlighter::new();
+        let two_face = |ext: &str| {
+            hl.syntaxes
+                .find_syntax_by_extension(ext)
+                .map(|s| s.name.as_str())
+        };
+        assert_eq!(two_face("h"), Some("Objective-C"));
+        assert_eq!(two_face("m"), Some("Objective-C"));
+        for ext in ["pde", "json5", "jsonc", "s"] {
+            assert_eq!(two_face(ext), None, "{ext}");
+        }
+        // ほかの行（#1949 の `.ino`・#1948 の `.jsx`）は #1953 の A/B で変わらない
+        for (path, expected) in [("sketch.ino", "C++"), ("App.jsx", "JavaScript")] {
+            assert_eq!(named(path, "", true), Some(expected), "{path}");
+        }
+        for token in ["pde", "jsonc", "json5"] {
+            let row = tako_core::file_type::by_fence_token(token).expect("別名");
+            assert!(table_syntax(row, false, false).is_some(), "```{token}");
+            assert_eq!(table_syntax(row, false, true), None, "```{token}");
+        }
+    }
+
+    /// #1953: JSON5 を JSON の構文で塗ると JSON5 にしか無い書き方が `invalid` になり、テーマが
+    /// 地の色で描くのでダークで字が消える。JavaScript で塗った今は 1 字句も消えない
+    #[test]
+    fn json5の字がダークで消えない() {
+        use super::alias_samples_1953::{JSON5_CONFIG, JSONC_SETTINGS};
+        let hl = SyntectHighlighter::new();
+        let dark = tako_core::theme::Theme::for_mode(tako_core::theme::ThemeMode::Dark);
+        let faint = |lines: &[Line]| -> Vec<String> {
+            lines
+                .iter()
+                .flatten()
+                .filter(|span| !span.text.trim().is_empty())
+                .filter(|span| {
+                    span.color
+                        .is_some_and(|c| c.contrast_ratio(dark.background) < 1.5)
+                })
+                .map(|span| span.text.clone())
+                .collect()
+        };
+        let painted = hl.highlight(Path::new("renovate.json5"), JSON5_CONFIG);
+        assert_eq!(faint(&painted), Vec::<String>::new());
+        let colors: std::collections::HashSet<(u8, u8, u8)> = painted
+            .iter()
+            .flatten()
+            .filter_map(|span| span.color)
+            .map(|c| (c.r, c.g, c.b))
+            .collect();
+        assert!(colors.len() > 3, "JSON5 が複数の色で塗られる: {colors:?}");
+        // JSON の構文（Issue の当初案）なら消える字句がある = JavaScript へ寄せた理由
+        let json = hl.syntaxes.find_syntax_by_name("JSON").expect("JSON");
+        let as_json = hl.run(json, JSON5_CONFIG);
+        assert!(
+            faint(&as_json).len() > 10,
+            "JSON の構文で消える字句: {:?}",
+            faint(&as_json)
+        );
+        // JSONC は JSON の構文で消える字句が無い（コメント・末尾カンマ）
+        let jsonc = hl.highlight(Path::new("settings.jsonc"), JSONC_SETTINGS);
+        assert_eq!(faint(&jsonc), Vec::<String>::new());
     }
 
     /// 検査用の一時 dir（`name` ごとに別）
