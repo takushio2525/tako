@@ -341,13 +341,16 @@ fn production_sources(root: &Path) -> Vec<(String, String)> {
                 if name != "target" && name != "tests" && !name.starts_with('.') {
                     stack.push(path);
                 }
-            } else if name.ends_with(".rs") && path.to_string_lossy().contains("/src/") {
+            } else if name.ends_with(".rs") {
+                // 区切りは `/` へ揃えてから見る（Windows の区切りは `\` = 揃えずに見ると 1 件も拾わない）
                 let rel = path
                     .strip_prefix(root)
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
-                out.push((rel.clone(), read(root, &rel)));
+                if rel.contains("/src/") {
+                    out.push((rel.clone(), read(root, &rel)));
+                }
             }
         }
     }
