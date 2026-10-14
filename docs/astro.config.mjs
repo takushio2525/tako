@@ -101,6 +101,8 @@ export default defineConfig({
 			components: {
 				Sidebar: './src/components/SidebarHelp.astro',
 				Footer: './src/components/FooterLegal.astro',
+				// ヘッダー右側に「ダウンロード」の導線を常設する（#2053）
+				SocialIcons: './src/components/HeaderLinks.astro',
 			},
 			sidebar: [
 				{

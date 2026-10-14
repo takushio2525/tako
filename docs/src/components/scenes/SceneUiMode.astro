@@ -1,0 +1,65 @@
+---
+/**
+ * 場面: 表示の切り替え（かんたん表示 = GUI モード）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.23 / docs features/gui-mode.md。チャットになるのは claude の
+ * 対話ペインだけ、空のシェルはスターター、切り替わるのは見せ方だけ（裏のターミナルは止まらない）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Chat from '../motion/Chat.astro';
+import Starter from '../motion/Starter.astro';
+import Pointer from '../motion/Pointer.astro';
+---
+
+<Scrolly label="表示の切り替えの流れ" flip>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} guiAt="2-3" height={26}>
+		<Split>
+			<Pane n={1} title="Claude" state="idle" focus body="flush" grow={1.15}>
+				<div class="tk-stack tk-fill">
+					<div class="tk-pane-term" data-at="!2-3" data-fx="fade">
+						<span class="tk-l tk-tui-user">README を読んで、3 行で説明して</span>
+						<span class="tk-l tk-tui-msg is-tool">Read README.md</span>
+						<span class="tk-l tk-tui-msg">タスク管理の小さな Web アプリです。src/ に本体、docs/ に仕様があり、npm run dev で起動します。</span>
+						<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+					</div>
+					<div class="tk-pane-term" data-at="2-3" data-fx="fade">
+						<Chat chips={false}>
+							<div class="tk-bubble is-user">README を読んで、3 行で説明して</div>
+							<div class="tk-bubble">
+								タスク管理の小さな Web アプリです。<code>src/</code> に本体、<code>docs/</code> に仕様があり、<code>npm run dev</code> で起動します。
+								<div class="tk-tool"><b>Read</b> README.md</div>
+							</div>
+						</Chat>
+					</div>
+				</div>
+			</Pane>
+			<Pane n={2} title="シェル" state="idle" body="flush">
+				<div class="tk-stack tk-fill">
+					<div class="tk-pane-term" data-at="!2-3" data-fx="fade">
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+					</div>
+					<div class="tk-pane-term" data-at="2-3" data-fx="fade">
+						<Starter />
+					</div>
+				</div>
+			</Pane>
+		</Split>
+		<Pointer slot="overlay" path="2:93,6 3:72,48 4:93,6" click="2 4" />
+	</TakoWindow>
+
+	<Step title="いつもは、ふつうのターミナル">
+		<p>tako の既定は<strong>ターミナル表示</strong>です。Claude と話しているペインも、コマンドを打つペインも、見慣れた端末の画面のままです。</p>
+	</Step>
+	<Step title="ボタン 1 つで、会話は吹き出しに">
+		<p>タブバー右端のボタンで「かんたん表示」に切り替えると、Claude との会話が<strong>チャットの吹き出し</strong>になります。入力欄に書いて送るだけで続けられます。</p>
+	</Step>
+	<Step title="空のペインは、3 つのボタンに">
+		<p>何も動いていないペインには「AI チームに任せる」「AI と 1 対 1 で話す」「コマンド入力へ」が並びます。黒い画面を直視しなくても、ボタンから AI を始められます。</p>
+	</Step>
+	<Step title="変わるのは、見せ方だけ">
+		<p>裏ではターミナルが動き続けています。もう一度押せばターミナル表示に戻り、同じ画面がそのままあります。チャットになるのは Claude と話しているペインだけで、実行中のコマンドや vim などはターミナルのまま見せます。</p>
+	</Step>
+</Scrolly>

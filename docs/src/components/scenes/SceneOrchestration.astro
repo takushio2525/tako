@@ -1,0 +1,66 @@
+---
+/**
+ * 場面: オーケストレーション（tako master）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.20（master-reserved の配置）/ FR-2.25（ダイアログ応答）/
+ * docs features/orchestration.md。worker は同じタブに並び、終わったら閉じて詰め直す（別タブへ逃がさない）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+---
+
+<Scrolly label="オーケストレーションの流れ">
+	<TakoWindow
+		slot="stage"
+		tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]}
+		height={25}
+		masterAt="2-3"
+	>
+		<Split>
+			<Pane
+				n={1}
+				title="マスター"
+				badge="ORCH"
+				state={[
+					{ at: '!2-3', state: 'idle' },
+					{ at: '2-3', state: 'running' },
+				]}
+				focus
+			>
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> <span data-at="1+" data-fx="type">tako master</span></span>
+				<span class="tk-l tk-tui-user" data-at="1+" style="--d: .7s">ログイン画面にテストを足して。docs の誤字も直して</span>
+				<span class="tk-l tk-tui-msg" data-at="2+">分担: worker 1 = テスト / worker 2 = 誤字</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="2+" style="--d: .3s">worker を 2 体起動しました</span>
+				<span class="tk-l tk-tui-msg" data-at="3+">worker 1 の確認に答えました（テストの実行を許可）</span>
+				<span class="tk-l tk-tui-msg" data-at="4">完了: テスト 3 件追加（全部緑）/ 誤字 4 件を修正</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="4" style="--d: .3s">証拠を確かめて、worker のペインを片付けました</span>
+			</Pane>
+			<Split dir="col" at="2-3" fx="split">
+				<Pane n={2} title="my-app" badge="WORKER" parent="master" state="running">
+					<span class="tk-l tk-tui-msg is-tool">tests/login.test.ts を作成</span>
+					<span class="tk-l" data-at="3"><span class="tk-warn">npm test を実行しますか？</span></span>
+					<span class="tk-l" data-at="3" style="--d: .3s"><span class="tk-acc">❯ 1. Yes</span></span>
+				</Pane>
+				<Pane n={3} title="my-app" badge="WORKER" parent="master" state="running">
+					<span class="tk-l tk-tui-msg is-tool">docs/guide.md を読む</span>
+					<span class="tk-l tk-tui-msg" data-at="3">誤字を 4 か所直しました</span>
+				</Pane>
+			</Split>
+		</Split>
+	</TakoWindow>
+
+	<Step title="司令塔の AI に頼む">
+		<p>ペインで <code>tako master</code> と打つと、そのペインで司令塔の AI（master）が起動します。あとは、やってほしいことを日本語で 1 回伝えるだけです。</p>
+	</Step>
+	<Step title="担当の AI が同じタブに並ぶ">
+		<p>master が依頼を分け、担当の AI（worker）を<strong>同じタブのペイン</strong>に立ち上げます。master は左半分に残り、worker は右側に積まれます。どこで何が動いているかは、このタブを見れば全部分かります。</p>
+	</Step>
+	<Step title="止まった worker に、master が答える">
+		<p>worker が確認待ち（ツールの承認など）で止まると、tako がそれを検知し、master が答えて先へ進めます。気になる worker はクリックして直接話しかけることもできます。</p>
+	</Step>
+	<Step title="確かめて、片付ける">
+		<p>master は worker の結果を受け入れ条件ごとの証拠で確かめてから報告し、役目を終えた worker のペインを閉じます。頼んだあなたは、最後の報告を読むだけです。</p>
+	</Step>
+</Scrolly>

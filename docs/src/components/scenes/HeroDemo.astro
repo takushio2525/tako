@@ -1,0 +1,62 @@
+---
+/**
+ * トップのヒーローの再現（自動再生 4 手順）: master に頼む → worker が右に並ぶ → 進む → 検収。
+ * 既定のレイアウト（master-reserved）どおり、master は左半分、worker は右で上下に積む。
+ */
+import Autoplay from '../motion/Autoplay.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+---
+
+<Autoplay steps={4} interval={1900}>
+	<TakoWindow
+		tabs={[
+			{ label: 'my-app', state: 'idle' },
+			{ label: 'my-app (AI チーム)', state: 'running', active: true },
+		]}
+		height={23}
+		masterAt="2+"
+	>
+		<Split>
+			<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> tako master</span>
+				<span class="tk-l tk-tui-user">ログイン画面を作って。テストも書いて</span>
+				<span class="tk-l tk-tui-msg" data-at="2+">2 つに分けて担当を呼びます</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="2+" style="--d: .25s">worker 1: 画面 / worker 2: テスト</span>
+				<span class="tk-l tk-tui-msg" data-at="3+">worker 2 のテストが緑になりました</span>
+				<span class="tk-l tk-tui-msg" data-at="4">2 件とも検収しました。まとめを報告します</span>
+			</Pane>
+			<Split dir="col" at="2+" fx="split">
+				<Pane
+					n={2}
+					title="my-app"
+					badge="WORKER"
+					parent="master"
+					state={[
+						{ at: '!4', state: 'running' },
+						{ at: '4', state: 'idle' },
+					]}
+				>
+					<span class="tk-l tk-tui-msg is-tool" data-at="2+" style="--d: .5s">src/login.tsx を作成</span>
+					<span class="tk-l tk-tui-msg" data-at="3+">フォームと入力チェックを実装</span>
+					<span class="tk-l tk-ok" data-at="4">完了しました</span>
+				</Pane>
+				<Pane
+					n={3}
+					title="my-app"
+					badge="WORKER"
+					parent="master"
+					state={[
+						{ at: '!4', state: 'running' },
+						{ at: '4', state: 'idle' },
+					]}
+				>
+					<span class="tk-l tk-tui-msg is-tool" data-at="2+" style="--d: .7s">tests/login.test.ts を作成</span>
+					<span class="tk-l" data-at="3+"><span class="tk-p">$</span> npm test</span>
+					<span class="tk-l tk-ok" data-at="3+" style="--d: .4s">Tests  12 passed</span>
+				</Pane>
+			</Split>
+		</Split>
+	</TakoWindow>
+</Autoplay>

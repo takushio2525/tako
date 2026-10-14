@@ -1,0 +1,58 @@
+---
+/**
+ * 場面: 人がやること（ユーザータスク。tako todo / 右パネルの tasks）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.40（起票・アコーディオン・判断 4 つ・返答の配送）。
+ * Windows は tako_todo が未実測（pending）なので、本文で macOS 前提だと分かるように書く。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import RightPanel from '../motion/RightPanel.astro';
+import TaskCard from '../motion/TaskCard.astro';
+---
+
+<Scrolly label="ユーザータスクの流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={26}>
+		<Split>
+			<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+				<span class="tk-l tk-tui-msg">ログイン画面ができました</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="1+">見た目の確認をタスクにしました（u-3）</span>
+				<span class="tk-l tk-dim" data-at="1+" style="--d: .3s">返答を待つ間に、テストを進めます</span>
+				<span class="tk-l tk-tui-user" data-at="4" style="--d: .6s">【ユーザー返答】todo u-3「ログイン画面の見た目を確認」 decision=needs_change コメント: ボタンを少し大きく</span>
+				<span class="tk-l tk-tui-msg" data-at="4" style="--d: 1s">了解です。ボタンを大きくして、もう一度見てもらいます</span>
+			</Pane>
+		</Split>
+		<RightPanel slot="right" active="tasks" count={1} countAt="1+" width="48%">
+			<span class="tk-dim" data-at="1+" data-fx="fade">1 件待ち</span>
+			<TaskCard
+				at="1+"
+				kind="レビュー"
+				title="ログイン画面の見た目を確認"
+				openAt="2+"
+				body="ボタンの大きさと配置を見てください"
+				attachment="login.png"
+				pick="直してほしい"
+				pickAt="3+"
+				comment="ボタンを少し大きく"
+				commentAt="3+"
+				delivered="4"
+			/>
+		</RightPanel>
+	</TakoWindow>
+
+	<Step title="人にしかできない用事を、AI が起票する">
+		<p>レビュー・確認・許可・投稿のように、人の判断が要るものを master が見つけると、<strong>タスク</strong>として起票します。右パネルの tasks に件数が出るので、会話の 1 行で流れて見失うことがありません。</p>
+	</Step>
+	<Step title="押すと、その場で中身が開く">
+		<p>行を押すと、その下に本文と添付が開きます。画像にはサムネイルが付き、押せば tako の中でプレビューできます。</p>
+	</Step>
+	<Step title="判断を選んで、返す">
+		<p>「承認」「却下」「直してほしい」「回答」から選び、必要ならコメントを書いて「返す」を押します。判断を選ぶまでは送れないので、押し間違いで承認が飛ぶことはありません。</p>
+	</Step>
+	<Step title="返答は、起票した master に届く">
+		<p>返答は起票した master の入力欄へそのまま届き、AI が続きを進めます。届いたかどうかも表示されます。</p>
+		<p class="tk-step-note">タスクは macOS 版で使えます。Windows 版は実装は共通ですが、実機での確認がまだです。</p>
+	</Step>
+</Scrolly>

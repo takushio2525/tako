@@ -1,0 +1,33 @@
+---
+/**
+ * Starlight の SocialIcons を拡張して、全ページのヘッダーに「ダウンロード」の導線を常設する（#2053）。
+ * 広い画面ではヘッダーの右側、狭い画面ではメニューの下（MobileMenuFooter）に出る。
+ * 行き先はインストールのページ（macOS / Windows の入れ方）。GitHub のアイコンは既定の部品のまま。
+ */
+import StarlightSocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
+---
+
+<a class="tako-header-cta" href="/getting-started/">ダウンロード</a>
+<StarlightSocialIcons />
+
+<style>
+	.tako-header-cta {
+		display: inline-flex;
+		align-items: center;
+		min-height: 2rem;
+		padding: 0 0.85rem;
+		border-radius: var(--tako-radius-pill);
+		font-size: 0.82rem;
+		font-weight: 700;
+		white-space: nowrap;
+		text-decoration: none !important;
+		color: #ffffff !important;
+		background: linear-gradient(135deg, var(--tako-accent) 0%, var(--tako-accent-strong) 100%);
+		box-shadow: var(--tako-shadow-accent);
+		transition: transform 0.2s var(--tako-ease), box-shadow 0.2s var(--tako-ease);
+	}
+	.tako-header-cta:hover {
+		transform: translateY(-1px);
+		color: #ffffff !important;
+	}
+</style>
