@@ -1,0 +1,114 @@
+---
+/**
+ * ユーザータスク（人がやること）1 件の再現。RightPanel active="tasks" の中に置く。
+ * 文言は crates/tako-app/src/ui_text/panel.rs（種類 / 判断 / 返す / 配送の状態）。
+ *
+ *   <TaskCard kind="レビュー" title="ログイン画面の見た目を確認" openAt="2+" pick="直してほしい" pickAt="3+"
+ *             comment="ボタンを少し大きく" commentAt="3+" delivered="4+" />
+ */
+import Icon from './Icon.astro';
+
+interface Props {
+	/** 種類: レビュー / 確認 / 許可 / 投稿 / その他 */
+	kind?: string;
+	title: string;
+	/** 中身（アコーディオン）を開く手順 */
+	openAt?: string;
+	body?: string;
+	/** 添付（画像）の名前。空なら出さない */
+	attachment?: string;
+	/** 選ぶ判断（承認 / 却下 / 直してほしい / 回答）と、選ばれる手順 */
+	pick?: string;
+	pickAt?: string;
+	comment?: string;
+	commentAt?: string;
+	/** 「master に届きました」が出る手順 */
+	delivered?: string;
+	at?: string;
+	fx?: string;
+}
+
+const {
+	kind = 'レビュー',
+	title,
+	openAt,
+	body = '',
+	attachment,
+	pick,
+	pickAt,
+	comment,
+	commentAt,
+	delivered,
+	at,
+	fx,
+} = Astro.props;
+const decisions = ['承認', '却下', '直してほしい', '回答'];
+---
+
+<div class="tk-task" data-at={at} data-fx={fx}>
+	<div class="tk-task-row">
+		<span class="tk-stack" style="color: var(--ui-faint)">
+			<span data-at={openAt ? `!${openAt}` : undefined} data-fx="fade"><Icon name="chevronRight" /></span>
+			{openAt && <span data-at={openAt} data-fx="fade"><Icon name="chevronDown" /></span>}
+		</span>
+		<span class="tk-task-kind">{kind}</span>
+		<span class="tk-task-title">{title}</span>
+	</div>
+	{
+		openAt && (
+			<div data-at={openAt} data-fx="unfold">
+				<div>
+					<div class="tk-task-detail">
+						{body && <span>{body}</span>}
+						{attachment && (
+							<span class="tk-attach">
+								<span class="tk-thumb" />
+								<small>画像</small>
+								{attachment}
+							</span>
+						)}
+						<span class="tk-decisions">
+							{decisions.map((d) =>
+								d === pick && pickAt ? (
+									<span class="tk-stack">
+										<span class="tk-decision">{d}</span>
+										<span class="tk-decision is-picked" data-at={pickAt} data-fx="fade">
+											{d}
+										</span>
+									</span>
+								) : (
+									<span class="tk-decision">{d}</span>
+								)
+							)}
+						</span>
+						<span class="tk-reply">
+							<span class="tk-comment">
+								{comment ? (
+									<span class="tk-stack">
+										<span data-at={commentAt ? `!${commentAt}` : undefined} data-fx="fade">
+											コメント（任意）
+										</span>
+										<span class="tk-typed" data-at={commentAt} data-fx="type" style="--d: .3s">
+											{comment}
+										</span>
+									</span>
+								) : (
+									'コメント（任意）'
+								)}
+							</span>
+							<span class="tk-ubtn is-primary" data-at={delivered} data-fx={delivered ? 'mark' : undefined}>
+								返す
+							</span>
+						</span>
+						{delivered && (
+							<span class="tk-delivery" data-at={delivered} data-fx="fade">
+								<Icon name="check" />
+								<span class="tk-ok">master に届きました</span>
+							</span>
+						)}
+					</div>
+				</div>
+			</div>
+		)
+	}
+</div>

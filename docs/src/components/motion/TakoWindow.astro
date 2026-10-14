@@ -1,0 +1,196 @@
+---
+/**
+ * tako の窓の再現（#2053）。タブバー・本体・ステータスバーまで。
+ *
+ *   <TakoWindow tabs={[{ label: 'my-app', active: true }]}>
+ *     <Sidebar slot="sidebar" />          … 左のファイルツリー（任意）
+ *     <WelcomeBanner slot="banner" />     … タブバー直下の帯（任意）
+ *     <Split>…<Pane>…</Pane>…</Split>      … 本体（ペイン）
+ *     <RightPanel slot="right" …>…         … 右パネル（任意）
+ *     <Pointer slot="overlay" … />         … 窓の上に重ねるもの（任意）
+ *   </TakoWindow>
+ *
+ * 見た目の正本は tako 本体（タブバー = crates/tako-app/src/tab_bar.rs、Windows のメニュー行 =
+ * menu_bar.rs、配色 = crates/tako-core/src/theme.rs）。狭い幅では検索欄・サイドバー・
+ * ステータスバーの項目を間引く（tako-ui.css のコンテナ問い合わせ）。
+ */
+import Icon from './Icon.astro';
+
+type TabState = 'idle' | 'running' | 'wait' | 'fail' | 'off';
+interface Tab {
+	label: string;
+	state?: TabState;
+	active?: boolean;
+	/** タブ自体を手順で出し入れする（data-at の書き方） */
+	at?: string;
+	fx?: string;
+	/** 選択中（active）になる手順。active より優先 */
+	activeAt?: string;
+}
+
+interface Props {
+	/** mac = 信号機ボタン / windows = メニュー行と右端の窓操作 */
+	os?: 'mac' | 'windows';
+	tabs?: Tab[];
+	/** 右上の表示モードの印。guiAt を渡すとその手順だけチャット（かんたん表示）の印になる */
+	mode?: 'terminal' | 'gui';
+	guiAt?: string;
+	/** ステータスバー（false で出さない） */
+	status?: boolean;
+	branch?: string;
+	/** ステータスバーの作業フォルダ（最後の要素が太字になる） */
+	cwd?: string;
+	agent?: string;
+	/** ステータスバーに「master · N workers」を出す手順（data-at の書き方） */
+	masterAt?: string;
+	workers?: number;
+	/** 窓の高さ（em）。手順で高さが変わらないよう場面ごとに固定する */
+	height?: number;
+	class?: string;
+}
+
+const {
+	os = 'mac',
+	tabs = [{ label: 'my-app', active: true }],
+	mode = 'terminal',
+	guiAt,
+	status = true,
+	branch = 'main',
+	cwd = '~/my-app',
+	agent = 'claude',
+	masterAt,
+	workers = 2,
+	height = 25,
+	class: className,
+} = Astro.props;
+
+const cwdParts = cwd.split(/[\\/]/);
+const cwdLast = cwdParts.pop() ?? cwd;
+const cwdHead = cwdParts.join(os === 'windows' ? '\\' : '/') + (os === 'windows' ? '\\' : '/');
+const hasSidebar = Astro.slots.has('sidebar');
+---
+
+<div class:list={['tk-ui', 'tk-frame', className]} style={`--h: ${height}em`}>
+	<div class="tk-win" data-os={os}>
+		{
+			os === 'windows' && (
+				<div class="tk-win-menu">
+					<span class="tk-menu-item">ファイル</span>
+					<span class="tk-menu-item">編集</span>
+					<span class="tk-menu-item">表示</span>
+					<span class="tk-menu-item is-wide">ウインドウ</span>
+					<span class="tk-menu-item is-wide">ヘルプ</span>
+					<span class="tk-wctl">
+						<span><Icon name="minus" /></span>
+						<span><Icon name="square" /></span>
+						<span><Icon name="x" /></span>
+					</span>
+				</div>
+			)
+		}
+		<div class="tk-win-tabs">
+			{
+				os === 'mac' && (
+					<span class="tk-lights">
+						<i />
+						<i />
+						<i />
+					</span>
+				)
+			}
+			{
+				tabs.map((t) => (
+					<span class="tk-tab-slot" data-at={t.at} data-fx={t.at ? (t.fx ?? 'pop') : undefined}>
+						<span
+							class:list={['tk-tab', { 'is-active': t.active && !t.activeAt }]}
+							data-at={t.activeAt}
+							data-fx={t.activeAt ? 'state' : undefined}
+						>
+							<i class:list={['tk-dot', t.state && t.state !== 'idle' && `is-${t.state}`]} />
+							{t.label}
+						</span>
+					</span>
+				))
+			}
+			<span class="tk-tab-add"><Icon name="plus" /></span>
+			<span class="tk-tab-spacer" />
+			<span class="tk-search">
+				<Icon name="search" />
+				<span class="tk-search-text">ペイン・コマンド検索</span>
+				<span class="tk-kbd">{os === 'windows' ? 'Ctrl+Shift+P' : '⌘K'}</span>
+			</span>
+			<span class="tk-tbtn is-wide"><Icon name="bell" /></span>
+			{
+				guiAt ? (
+					<span class="tk-tbtn tk-tbtn-stack">
+						<span data-at={`!${guiAt}`} data-fx="fade">
+							<Icon name="terminal" />
+						</span>
+						<span data-at={guiAt} data-fx="fade" class="tk-acc">
+							<Icon name="chat" />
+						</span>
+					</span>
+				) : (
+					<span class="tk-tbtn">
+						<Icon name={mode === 'gui' ? 'chat' : 'terminal'} />
+					</span>
+				)
+			}
+			<span class="tk-tbtn is-wide"><Icon name="sun" /></span>
+		</div>
+		<slot name="banner" />
+		<div class="tk-win-main">
+			{hasSidebar && <slot name="sidebar" />}
+			<div class="tk-win-body">
+				<slot />
+			</div>
+			<slot name="right" />
+		</div>
+		{
+			status && (
+				<div class="tk-win-status">
+					<span class="tk-sb tk-sb-files">
+						<Icon name="folder" />
+						Files
+					</span>
+					<span class="tk-sb is-mid">BG</span>
+					<span class="tk-sb is-wide">
+						<Icon name="globe" />
+					</span>
+					<span class="tk-sb is-wide">
+						<Icon name="phone" />
+						リモート オフ
+					</span>
+					<span class="tk-sb is-mid">
+						<Icon name="folder" />
+						{cwdHead}
+						<b>{cwdLast}</b>
+					</span>
+					{masterAt && (
+						<span class="tk-sb" data-at={masterAt} data-fx="fade">
+							<Icon name="orch" />
+							<b>master</b>· {workers} workers
+						</span>
+					)}
+					<span class="tk-sb-spacer" />
+					<span class="tk-sb is-end">
+						<i class="tk-dot is-running" />
+						<b>{agent}</b>
+					</span>
+					<span class="tk-sb is-end is-wide">
+						ctx
+						<span class="tk-sb-bar" style="--v: 18%">
+							<i />
+						</span>
+					</span>
+					<span class="tk-sb is-end is-mid">tmux</span>
+					<span class="tk-sb is-end">
+						<Icon name="branch" />
+						{branch}
+					</span>
+				</div>
+			)
+		}
+	</div>
+	<slot name="overlay" />
+</div>

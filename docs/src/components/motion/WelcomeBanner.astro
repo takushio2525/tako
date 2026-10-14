@@ -1,0 +1,22 @@
+---
+/**
+ * 初回起動のバナー「tako へようこそ」の再現（文言は crates/tako-app/src/ui_text/welcome.rs）。
+ * TakoWindow の slot="banner" に置く。pressAt を渡すとその手順で「セットアップを実行」が押された姿になる。
+ */
+interface Props {
+	at?: string;
+	fx?: string;
+	pressAt?: string;
+}
+
+const { at, fx, pressAt } = Astro.props;
+---
+
+<div class="tk-welcome" data-at={at} data-fx={fx}>
+	<span class="tk-welcome-title">tako へようこそ</span>
+	<span class="tk-welcome-links"><span>設定を開く</span><span>閉じる（次回から表示しない）</span></span>
+	<span class="tk-welcome-line">1. tako setup — 初期設定と AI 連携の登録を自動で済ませる</span>
+	<span class="tk-ubtn is-primary" data-at={pressAt} data-fx={pressAt ? 'mark' : undefined}>セットアップを実行</span>
+	<span class="tk-welcome-line">2. tako master — AI 司令塔を起動して、あとは日本語で頼む</span>
+	<span class="tk-ubtn is-sub">master を起動</span>
+</div>

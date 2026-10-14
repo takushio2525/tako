@@ -1,0 +1,45 @@
+---
+/**
+ * スクロール連動の場面 1 つ（#2053）。
+ *
+ *   <Scrolly label="オーケストレーションの流れ">
+ *     <TakoWindow slot="stage" …>…再現した画面（[data-at] で手順ごとに出し入れ）…</TakoWindow>
+ *     <Step title="司令塔に話しかける">本文</Step>
+ *     <Step title="担当を集める">本文</Step>
+ *   </Scrolly>
+ *
+ * - 手順（Step）を読む位置まで送ると、ステージに data-step=N が写る（N は 1 始まり）
+ * - ステージは飾り（aria-hidden）。意味は手順の文章で必ず伝える
+ * - prefers-reduced-motion: reduce では、手順ごとに静止した図を置いた並びになる
+ *
+ * 手引き（部品一覧・data-at の書き方）は `.agent/plans/2026-10-docs-motion.md`。
+ */
+import '../../styles/motion.css';
+import '../../styles/tako-ui.css';
+
+interface Props {
+	/** 場面の名前（読み上げ用。見出しとは別に、何の流れかを短く） */
+	label: string;
+	/** 図を左に置く */
+	flip?: boolean;
+}
+
+const { label, flip = false } = Astro.props;
+---
+
+<div class="tk-scrolly-wrap not-content">
+	<section class:list={['tk-scrolly', { 'is-flip': flip }]} data-scrolly aria-label={label}>
+		<div class="tk-scrolly-stage">
+			<div class="tk-stage" data-stage aria-hidden="true" inert>
+				<slot name="stage" />
+			</div>
+		</div>
+		<ol class="tk-scrolly-steps">
+			<slot />
+		</ol>
+	</section>
+</div>
+
+<script>
+	import '../../scripts/motion.ts';
+</script>

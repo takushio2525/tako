@@ -1,0 +1,68 @@
+---
+/**
+ * Windows のインストーラー（Inno Setup のウィザード。定義は installer/windows/tako.iss）の再現。
+ * 画面を手順で切り替える: 追加タスクの選択 →（インストール状況）→ 完了。installAt を省くと途中の画面は出さない。
+ * 「tako を PATH に追加する（推奨）」は既定でオン、管理者権限は要求しない（PrivilegesRequired=lowest）。
+ */
+import Icon from './Icon.astro';
+
+interface Props {
+	tasksAt: string;
+	installAt?: string;
+	doneAt: string;
+	height?: number;
+	class?: string;
+}
+
+const { tasksAt, installAt, doneAt, height = 20, class: className } = Astro.props;
+---
+
+<div class:list={['tk-ui', 'tk-frame', className]}>
+	<div class="tk-wizard" style={`--h: ${height}em`}>
+		<div class="tk-wizard-bar">
+			<span>セットアップ - tako</span>
+			<span class="tk-wctl">
+				<span><Icon name="minus" /></span>
+				<span><Icon name="x" /></span>
+			</span>
+		</div>
+		<div class="tk-stack" style="flex:1; min-height:0">
+			<div class="tk-wizard-page" data-at={tasksAt} data-fx="fade">
+				<span class="tk-wizard-h">追加タスクの選択</span>
+				<span class="tk-wizard-sub">実行する追加タスクを選択して、「次へ」をクリックしてください。</span>
+				<span class="tk-wizard-sub">コマンドライン:</span>
+				<span class="tk-check is-on"><i><Icon name="check" /></i>tako を PATH に追加する（推奨）</span>
+				<span class="tk-wizard-sub">追加のアイコン:</span>
+				<span class="tk-check"><i></i>デスクトップ上にアイコンを作成する</span>
+			</div>
+			{
+				installAt && (
+					<div class="tk-wizard-page" data-at={installAt} data-fx="fade">
+						<span class="tk-wizard-h">インストール状況</span>
+						<span class="tk-wizard-sub">お使いのコンピューターに tako をインストールしています。</span>
+						<span class="tk-wizard-sub">ファイルを展開しています…</span>
+						<span class="tk-progress" data-at={installAt}>
+							<i />
+						</span>
+						<span class="tk-wizard-sub">インストール先: %LOCALAPPDATA%\Programs\tako</span>
+					</div>
+				)
+			}
+			<div class="tk-wizard-page" data-at={doneAt} data-fx="fade">
+				<span class="tk-wizard-h">tako セットアップウィザードの完了</span>
+				<span class="tk-wizard-sub">お使いのコンピューターへの tako のインストールが完了しました。</span>
+				<span class="tk-check is-on"><i><Icon name="check" /></i>tako を実行する</span>
+			</div>
+		</div>
+		<div class="tk-wizard-foot">
+			<span class="tk-wbtn">戻る</span>
+			<span class="tk-stack">
+				<span class="tk-wbtn is-primary" data-at={tasksAt} data-fx="fade">次へ</span>
+				{installAt && <span class="tk-wbtn is-disabled" data-at={installAt} data-fx="fade">次へ</span>}
+				<span class="tk-wbtn is-primary" data-at={doneAt} data-fx="fade">完了</span>
+			</span>
+			<span class="tk-wbtn">キャンセル</span>
+		</div>
+	</div>
+	<slot name="overlay" />
+</div>

@@ -1,0 +1,104 @@
+---
+/**
+ * ペイン 1 つの再現（ヘッダ + 中身）。中身はターミナルの行（.tk-l ほか）・チャット・
+ * スターターなど何でも入る。
+ *
+ *   <Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+ *     <span class="tk-l"><span class="tk-p">my-app ❯</span> tako master</span>
+ *   </Pane>
+ *
+ * - state に配列を渡すと手順で切り替わる: [{ at: '!3+', state: 'running' }, { at: '3+', state: 'idle' }]
+ * - at / fx を渡すとペイン自体を出し入れできる（分割で現れるペインは fx="split"）
+ * - focus: true で常に青枠、文字列なら data-at の書き方でその手順だけ青枠
+ */
+import Icon from './Icon.astro';
+
+type State = 'idle' | 'running' | 'wait' | 'fail' | 'none';
+interface StateAt {
+	at: string;
+	state: State;
+	/** 既定は state 名（running / idle …） */
+	text?: string;
+}
+
+interface Props {
+	n?: number;
+	title?: string;
+	/** ORCH / WORKER などの小さな札 */
+	badge?: string;
+	/** worker の親（ヘッダに「↳ 親」と出る。実物は親 master へのリンク） */
+	parent?: string;
+	state?: State | StateAt[];
+	/** 経過時間などの補足（running · 6m34s の後ろ側） */
+	elapsed?: string;
+	cwd?: string;
+	/** シェルと寸法など（zsh · 73×19） */
+	meta?: string;
+	focus?: boolean | string;
+	at?: string;
+	fx?: string;
+	/** 横（縦）の取り分。既定 1 */
+	grow?: number;
+	/** 中身の種類。term = ターミナル（既定）/ flush = 余白なし */
+	body?: 'term' | 'flush';
+	class?: string;
+	style?: string;
+}
+
+const {
+	n,
+	title,
+	badge,
+	parent,
+	state = 'idle',
+	elapsed,
+	cwd,
+	meta,
+	focus = false,
+	at,
+	fx,
+	grow,
+	body = 'term',
+	class: className,
+	style,
+} = Astro.props;
+
+const states: StateAt[] = Array.isArray(state) ? state : state === 'none' ? [] : [{ at: '', state }];
+const dotClass = (s: State) => ['tk-dot', s !== 'idle' && `is-${s}`];
+const styleAttr = [grow ? `--grow: ${grow}` : '', style ?? ''].filter(Boolean).join('; ') || undefined;
+---
+
+<div class:list={['tk-pane', className]} data-at={at} data-fx={fx} style={styleAttr}>
+	{focus && <span class="tk-pane-focus" data-at={typeof focus === 'string' ? focus : undefined} data-fx="fade" />}
+	{
+		(n !== undefined || title) && (
+			<div class="tk-pane-head">
+				{n !== undefined && <span class="tk-pane-n">{n}</span>}
+				{title && <span class="tk-pane-title">{title}</span>}
+				{badge && <span class="tk-pane-badge">{badge}</span>}
+				{parent && <span class="tk-pane-parent">↳ {parent}</span>}
+				{states.length > 0 && (
+					<span class="tk-pane-state">
+						{states.map((s) => (
+							<span data-at={s.at || undefined} data-fx={s.at ? 'fade' : undefined}>
+								<i class:list={dotClass(s.state)} />
+								{s.text ?? s.state}
+								{elapsed && <span class="tk-dim">· {elapsed}</span>}
+							</span>
+						))}
+					</span>
+				)}
+				{cwd && <span class="tk-pane-chip">{cwd}</span>}
+				{meta && <span class="tk-pane-meta">{meta}</span>}
+				<span class="tk-pane-ctl">
+					<Icon name="columns" />
+					<Icon name="minus" />
+					<Icon name="x" />
+				</span>
+			</div>
+		)
+	}
+	<div class="tk-pane-body" style={body === 'flush' ? 'padding:0' : undefined}>
+		<slot />
+	</div>
+</div>

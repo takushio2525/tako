@@ -11,6 +11,10 @@
  *      4. 動きに ease-out-quart 系のイージングを与える
  *      5. 日本語の折り返し（line-break / overflow-wrap）を明示制御
  *      6. モバイル: 横溢れの根絶とタップ領域の確保
+ *  - v4（#2053）: トップを splash（サイドバー無し）にし、スクロール連動のモーション解説
+ *    （src/styles/motion.css・tako-ui.css）を足した。全ページのヘッダーに「ダウンロード」を常設
+ *    （src/components/HeaderLinks.astro）。本文 Markdown の装飾は .not-content の中へ効かせない
+ *    （部品の中のリストや段落が本文の余白・行頭記号を拾って崩れないように）
  *  - 修正した実バグ:
  *      a. ランディングのターミナルブロックが横に溢れ、はみ出した部分に
  *         スクロールで到達できない（親の overflow:hidden で切られていた）。
@@ -257,8 +261,19 @@ main:has(.tako-landing) ~ aside {
   max-width: 100%;
 }
 .tako-landing {
-  max-width: 62rem;
+  max-width: 66rem;
   margin-inline: auto;
+}
+
+/* トップは splash（サイドバー無し）。Starlight はそのとき本文幅を 67.5rem に広げるが、
+ * 上の :root の 48rem（customCss は @layer の外なので必ず勝つ）が上書きしてしまうので戻す */
+:root:has(.tako-landing) {
+  --sl-content-width: 68rem;
+}
+
+/* 並べる箱の子へ Starlight の「兄弟の間に上余白」が掛かると 1 つ目だけ高さがずれる */
+.tako-landing :is(.tako-stats, .tako-card-grid, .tako-next-grid, .tako-os-grid, .tako-start-steps, .tako-hero-actions) > * {
+  margin-top: 0;
 }
 
 .tako-landing h1,
@@ -312,9 +327,10 @@ main:has(.tako-landing) ~ aside {
 .tako-hero-inner {
   position: relative;
   z-index: 1;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
   align-items: center;
-  gap: var(--tako-space-8);
+  gap: var(--tako-space-12);
 }
 
 .tako-hero-content {
@@ -371,7 +387,7 @@ main:has(.tako-landing) ~ aside {
   font-size: 1.02rem;
   line-height: 1.85;
   color: var(--tako-ink-muted);
-  margin: 0 0 var(--tako-space-8);
+  margin: 0 0 var(--tako-space-6);
   max-width: 34em;
 }
 
@@ -430,16 +446,33 @@ main:has(.tako-landing) ~ aside {
   background: var(--tako-surface);
 }
 
+/* ヒーローの右: 再現した tako の窓（自動再生）と、その角に乗るマスコット */
 .tako-hero-visual {
-  flex-shrink: 0;
-  width: 210px;
+  position: relative;
+  min-width: 0;
 }
 
 .tako-mascot {
-  width: 100%;
+  position: absolute;
+  z-index: 3;
+  top: -3.6rem;
+  right: -3.2rem;
+  width: 96px;
   height: auto;
   animation: tako-float 5s ease-in-out infinite;
-  filter: drop-shadow(0 14px 28px rgba(225, 90, 134, 0.18));
+  filter: drop-shadow(0 14px 28px rgba(225, 90, 134, 0.22));
+  pointer-events: none;
+}
+
+.tako-hero-meta span {
+  white-space: nowrap;
+}
+
+.tako-hero-meta {
+  margin: var(--tako-space-4) 0 0 !important;
+  font-size: 0.8rem;
+  line-height: 1.7;
+  color: var(--tako-ink-subtle);
 }
 
 @keyframes tako-float {
@@ -476,6 +509,154 @@ main:has(.tako-landing) ~ aside {
   font-size: 0.95rem;
   margin: 0 0 var(--tako-space-6);
   max-width: 42em;
+}
+
+/* 場面の見出しの上の小さなラベル */
+.tako-kicker {
+  margin: 0 0 var(--tako-space-2) !important;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--tako-accent);
+}
+
+.tako-scene {
+  padding-top: var(--tako-space-16);
+}
+
+/* --- OS ごとの入れ方（トップの「入れて、すぐ始める」） --- */
+.tako-os-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+  gap: var(--tako-space-4);
+}
+
+.tako-os-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tako-space-2);
+  min-width: 0;
+  padding: var(--tako-space-6);
+  border-radius: var(--tako-radius-lg);
+  border: 1px solid var(--tako-border);
+  background: var(--tako-card);
+  box-shadow: var(--tako-shadow-sm), var(--tako-card-sheen);
+}
+
+.tako-os-card > * {
+  margin: 0 !important;
+}
+
+.tako-os-card.is-windows {
+  border-color: rgba(47, 156, 99, 0.35);
+  background:
+    linear-gradient(160deg, var(--tako-green-soft), transparent 55%),
+    var(--tako-card);
+}
+
+.tako-os-name {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  font-size: 1.15rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--tako-ink);
+}
+
+.tako-os-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.15em 0.7em;
+  border-radius: var(--tako-radius-pill);
+  color: var(--tako-green);
+  background: var(--tako-green-soft);
+  border: 1px solid rgba(47, 156, 99, 0.3);
+}
+
+.tako-os-req {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--tako-ink-muted);
+}
+
+.tako-os-note {
+  font-size: 0.86rem;
+  line-height: 1.75;
+  color: var(--tako-ink-muted);
+}
+
+.tako-os-link {
+  margin-top: auto !important;
+  padding-top: var(--tako-space-2);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+/* インストールのページの冒頭: OS を選ぶカード（カード全体がリンク） */
+.tako-os-pick {
+  margin: var(--tako-space-6) 0 var(--tako-space-8);
+}
+
+a.tako-os-card {
+  text-decoration: none !important;
+  color: inherit;
+  transition: transform 0.25s var(--tako-ease), box-shadow 0.25s var(--tako-ease),
+    border-color 0.2s var(--tako-ease-soft);
+}
+
+a.tako-os-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--tako-accent);
+  box-shadow: var(--tako-shadow-md);
+}
+
+a.tako-os-card .tako-os-link {
+  color: var(--tako-accent);
+}
+
+/* 見出しの前に置く短い id（#macos / #windows）。固定ヘッダーの下に隠れないように */
+.tako-anchor {
+  scroll-margin-top: calc(var(--sl-nav-height, 3.5rem) + var(--sl-mobile-toc-height, 0rem) + 1rem);
+}
+
+.tako-start-steps {
+  display: grid;
+  gap: var(--tako-space-3);
+  margin-top: var(--tako-space-6);
+}
+
+.tako-start-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 15rem);
+  align-items: center;
+  gap: var(--tako-space-4);
+  padding: var(--tako-space-3) var(--tako-space-4);
+  border-radius: var(--tako-radius-md);
+  border: 1px solid var(--tako-border);
+  background: var(--tako-bg-warm);
+}
+
+.tako-start-step .tk-cmd {
+  margin: 0;
+}
+
+.tako-start-n {
+  display: inline-grid;
+  place-items: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 50%;
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: #ffffff;
+  background: var(--tako-accent);
+}
+
+.tako-start-text {
+  font-size: 0.92rem;
+  color: var(--tako-ink);
+  line-height: 1.6;
 }
 
 /* --- 数字ストリップ --- */
@@ -703,15 +884,36 @@ main:has(.tako-landing) ~ aside {
   }
 }
 
+@media (max-width: 900px) {
+  .tako-hero-inner {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--tako-space-12);
+  }
+}
+
 @media (max-width: 768px) {
   .tako-hero {
     padding: var(--tako-space-6) 0 var(--tako-space-8);
   }
 
   .tako-hero-inner {
-    flex-direction: column;
     text-align: center;
-    gap: var(--tako-space-4);
+  }
+
+  .tako-hero-tagline {
+    margin-inline: auto;
+  }
+
+  .tako-start-step {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .tako-start-step .tk-cmd {
+    grid-column: 1 / -1;
+  }
+
+  .tako-scene {
+    padding-top: var(--tako-space-8);
   }
 
   .tako-hero-tagline {
@@ -727,9 +929,10 @@ main:has(.tako-landing) ~ aside {
     min-width: 12rem;
   }
 
-  .tako-hero-visual {
-    width: 132px;
-    order: -1;
+  .tako-mascot {
+    width: 64px;
+    top: -2.2rem;
+    right: -0.25rem;
   }
 
   .tako-section {
@@ -895,8 +1098,8 @@ nav[class*='sidebar'] a[aria-current='page']::before {
   color: var(--tako-ink);
 }
 
-.sl-markdown-content p,
-.sl-markdown-content li {
+.sl-markdown-content p:not(:where(.not-content *)),
+.sl-markdown-content li:not(:where(.not-content *)) {
   color: var(--tako-ink);
 }
 
@@ -926,7 +1129,7 @@ nav[class*='sidebar'] a[aria-current='page']::before {
 }
 
 /* tako らしさの継承: h2 の前に置くアクセントのダッシュ */
-.sl-markdown-content h2::before {
+.sl-markdown-content h2:not(:where(.not-content *))::before {
   content: '—';
   color: var(--tako-accent);
   margin-right: 0.4em;
@@ -1068,15 +1271,15 @@ a:hover {
 }
 
 /* リスト */
-.sl-markdown-content :is(ul, ol) {
+.sl-markdown-content :is(ul, ol):not(:where(.not-content *)) {
   padding-left: 1.5em;
 }
 
-.sl-markdown-content li {
+.sl-markdown-content li:not(:where(.not-content *)) {
   margin: 0.35em 0;
 }
 
-.sl-markdown-content li::marker {
+.sl-markdown-content li:not(:where(.not-content *))::marker {
   color: var(--tako-accent);
 }
 
@@ -1385,7 +1588,7 @@ kbd,
   }
 
   /* モバイルのリンクはタップしやすく */
-  .sl-markdown-content li {
+  .sl-markdown-content li:not(:where(.not-content *)) {
     margin: 0.5em 0;
   }
 }

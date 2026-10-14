@@ -1,0 +1,58 @@
+---
+/**
+ * OS 標準のターミナル（tako を入れる前の画面）の再現。
+ * os="mac" = ターミナル.app / os="windows" = Windows Terminal（PowerShell）。中身は .tk-l の行。
+ */
+import Icon from './Icon.astro';
+
+interface Props {
+	os?: 'mac' | 'windows';
+	title?: string;
+	height?: number;
+	class?: string;
+}
+
+const { os = 'mac', title, height = 18, class: className } = Astro.props;
+const label = title ?? (os === 'windows' ? 'Windows PowerShell' : 'ターミナル — zsh');
+---
+
+<div class:list={['tk-ui', 'tk-frame', className]}>
+	<div class:list={['tk-term-win', { 'is-windows': os === 'windows' }]} style={`--h: ${height}em`}>
+		<div class="tk-term-bar">
+			{
+				os === 'mac' ? (
+					<>
+						<span class="tk-lights">
+							<i />
+							<i />
+							<i />
+						</span>
+						<span class="tk-term-title">{label}</span>
+					</>
+				) : (
+					<>
+						<span class="tk-term-tab">
+							<Icon name="terminal" />
+							{label}
+						</span>
+						<span class="tk-wctl">
+							<span>
+								<Icon name="minus" />
+							</span>
+							<span>
+								<Icon name="square" />
+							</span>
+							<span>
+								<Icon name="x" />
+							</span>
+						</span>
+					</>
+				)
+			}
+		</div>
+		<div class="tk-term-body">
+			<slot />
+		</div>
+	</div>
+	<slot name="overlay" />
+</div>

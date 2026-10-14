@@ -1,0 +1,23 @@
+---
+/**
+ * 押す場所を示すポインター。部品の slot="overlay"（窓の上）に置く。
+ *
+ *   <Pointer slot="overlay" path="2:70,62 3:82,40" click="2 3" />
+ *
+ * path は「手順:横%,縦%」を空白区切りで並べる（その手順から次の指定までその位置。
+ * どの指定より前の手順では出ない）。click の手順では押した輪が広がる。
+ * 座標は部品の左上が 0,0・右下が 100,100。
+ */
+interface Props {
+	path: string;
+	click?: string;
+}
+
+const { path, click } = Astro.props;
+---
+
+<span class="tk-pointer" data-pos={path} data-click={click}>
+	<svg viewBox="0 0 24 24" aria-hidden="true">
+		<path d="M5 2.5v17.2l4.3-4.1 2.9 6.6 2.8-1.2-2.9-6.5h6z" fill="#ffffff" stroke="#11111b" stroke-width="1.4" stroke-linejoin="round" />
+	</svg>
+</span>

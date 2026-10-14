@@ -101,13 +101,15 @@ export default defineConfig({
 			components: {
 				Sidebar: './src/components/SidebarHelp.astro',
 				Footer: './src/components/FooterLegal.astro',
+				// ヘッダー右側に「ダウンロード」の導線を常設する（#2053）
+				SocialIcons: './src/components/HeaderLinks.astro',
 			},
 			sidebar: [
 				{
 					label: 'はじめに',
 					items: [
 						{ label: 'tako とは', slug: 'index' },
-						{ label: 'セットアップ', slug: 'getting-started' },
+						{ label: 'インストールとセットアップ', slug: 'getting-started' },
 						{ label: 'クイックスタート', slug: 'getting-started/quickstart' },
 						{ label: 'リリースノート', slug: 'releases' },
 						{ label: 'Windows 対応状況', slug: 'windows-support' },

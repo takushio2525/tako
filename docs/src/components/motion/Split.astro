@@ -1,0 +1,19 @@
+---
+/**
+ * ペインの並べ方。dir="row"（左右）/ "col"（上下）。入れ子にできる。
+ * 分割で現れるペインは子に fx="split" と at を付ける（隠れている間は幅 0 で、出ると伸びる）。
+ */
+interface Props {
+	dir?: 'row' | 'col';
+	/** この並び自体の取り分（入れ子のとき） */
+	grow?: number;
+	at?: string;
+	fx?: string;
+}
+
+const { dir = 'row', grow, at, fx } = Astro.props;
+---
+
+<div class:list={['tk-split', { 'is-col': dir === 'col' }]} style={grow ? `flex-grow: ${grow}` : undefined} data-at={at} data-fx={fx}>
+	<slot />
+</div>

@@ -1,0 +1,48 @@
+---
+/**
+ * 右パネル（fleet / orch / git / tasks）の再現。TakoWindow の slot="right" に置く。
+ * tasks の件数を手順で出すには countAt（data-at の書き方）を渡す。
+ */
+import Icon from './Icon.astro';
+
+type View = 'fleet' | 'orch' | 'git' | 'tasks';
+interface Props {
+	active?: View;
+	/** tasks タブの未完了件数 */
+	count?: number;
+	countAt?: string;
+	at?: string;
+	fx?: string;
+	/** 窓に対する幅（既定 40%） */
+	width?: string;
+}
+
+const { active = 'fleet', count, countAt, at, fx, width } = Astro.props;
+const views: { id: View; icon: 'fleet' | 'orch' | 'branch' | 'tasks' }[] = [
+	{ id: 'fleet', icon: 'fleet' },
+	{ id: 'orch', icon: 'orch' },
+	{ id: 'git', icon: 'branch' },
+	{ id: 'tasks', icon: 'tasks' },
+];
+---
+
+<div class="tk-right" data-at={at} data-fx={fx} style={width ? `--rw: ${width}` : undefined}>
+	<div class="tk-right-tabs">
+		{
+			views.map((v) => (
+				<span class:list={['tk-right-tab', { 'is-active': v.id === active }]}>
+					<Icon name={v.icon} />
+					<span class="tk-right-label">{v.id}</span>
+					{v.id === 'tasks' && count !== undefined && (
+						<span class="tk-count" data-at={countAt} data-fx={countAt ? 'pop' : undefined}>
+							{count}
+						</span>
+					)}
+				</span>
+			))
+		}
+	</div>
+	<div class="tk-right-body">
+		<slot />
+	</div>
+</div>

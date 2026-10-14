@@ -147,7 +147,7 @@ const SHARED_CSS = `
  */
 const HERO_BADGE = 'AI エージェント時代のターミナル';
 const HERO_CATCH = 'AI エージェントのための次世代ターミナル';
-const HERO_SUB = '設定ゼロで AI が画面を組み立てる macOS 向け GUI ターミナル';
+const HERO_SUB = '設定ゼロ。macOS と Windows で使えます';
 
 function heroHtml() {
   return `<!doctype html><html lang="ja"><meta charset="utf-8"><style>${SHARED_CSS}

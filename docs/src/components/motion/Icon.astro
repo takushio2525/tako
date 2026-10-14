@@ -1,0 +1,28 @@
+---
+/**
+ * 線画アイコン 1 つ（形は icons.ts）。色は currentColor、大きさは 1em。
+ * 画面の再現の中では飾りなので常に aria-hidden。
+ */
+import { ICONS, type IconName } from './icons';
+
+interface Props {
+	name: IconName;
+	class?: string;
+}
+
+const { name, class: className } = Astro.props;
+const body = ICONS[name];
+if (!body) throw new Error(`Icon: 未知のアイコン名 "${name}"（docs/src/components/motion/icons.ts を見る）`);
+---
+
+<svg
+	class:list={['tk-ic', className]}
+	viewBox="0 0 24 24"
+	fill="none"
+	stroke="currentColor"
+	stroke-width="2"
+	stroke-linecap="round"
+	stroke-linejoin="round"
+	aria-hidden="true"
+	set:html={body}
+/>

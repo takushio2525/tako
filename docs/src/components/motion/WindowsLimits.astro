@@ -1,0 +1,90 @@
+---
+/**
+ * Windows でまだのもの・機能が落ちるものの一覧（#2053）。
+ *
+ * 各項目に対応表の機能名（tools）を持たせ、ビルド時に windows-support.md と突き合わせる。
+ * どれかが「対応」に上がったらビルドを落とす（「まだ使えない」と書き続けるのを止める）。
+ * 文面は台帳 `tako platform --platform windows --known-limitations` の要約で、読み手向けに書き直したもの。
+ */
+import { assertNotSupported } from './windowsSupport';
+
+interface Item {
+	title: string;
+	text: string;
+	tools: string[];
+	/** pending = まだ使えない / degraded = 使えるが一部が落ちる */
+	kind: 'pending' | 'degraded';
+}
+
+interface Props {
+	items: Item[];
+}
+
+const { items } = Astro.props;
+for (const it of items) assertNotSupported(it.tools, `WindowsLimits「${it.title}」`);
+---
+
+<ul class="tk-wl not-content">
+	{
+		items.map((it) => (
+			<li class:list={['tk-wl-item', `is-${it.kind}`]}>
+				<span class="tk-wl-tag">{it.kind === 'pending' ? 'まだ' : '一部'}</span>
+				<span class="tk-wl-body">
+					<b>{it.title}</b>
+					<span>{it.text}</span>
+				</span>
+			</li>
+		))
+	}
+</ul>
+
+<style>
+	.tk-wl {
+		list-style: none;
+		margin: var(--tako-space-4) 0;
+		padding: 0;
+		display: grid;
+		gap: 0.5rem;
+	}
+	.tk-wl-item {
+		display: flex;
+		gap: 0.75rem;
+		align-items: flex-start;
+		margin: 0;
+		padding: 0.7rem 0.9rem;
+		border: 1px solid var(--tako-border);
+		border-radius: var(--tako-radius-md);
+		background: var(--tako-card);
+	}
+	.tk-wl-tag {
+		flex: none;
+		font-size: 0.72rem;
+		font-weight: 700;
+		padding: 0.1rem 0.5rem;
+		border-radius: 99px;
+		margin-top: 0.2rem;
+		color: var(--tako-ink-muted);
+		background: var(--tako-surface-2);
+	}
+	.is-degraded .tk-wl-tag {
+		color: #9a6b00;
+		background: rgba(224, 165, 38, 0.16);
+	}
+	:global(:root[data-theme='dark']) .is-degraded .tk-wl-tag {
+		color: #f0c05a;
+	}
+	.tk-wl-body {
+		display: flex;
+		flex-direction: column;
+		gap: 0.1rem;
+		font-size: 0.88rem;
+		line-height: 1.7;
+		color: var(--tako-ink-muted);
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+	.tk-wl-body b {
+		color: var(--tako-ink);
+		font-size: 0.93rem;
+	}
+</style>

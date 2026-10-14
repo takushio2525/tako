@@ -1,0 +1,1823 @@
+/*
+ * tako の画面を HTML/CSS で再現する部品の見た目（#2053）。
+ *
+ * 配色は tako 本体の既定ダークテーマ（crates/tako-core/src/theme.rs の default_dark()。
+ * Catppuccin Mocha ベース）の写し。サイトが明るいテーマでも、再現した画面は実物と同じく暗い。
+ * スマホ版（PWA）の配色は web/tako-remote/src/styles/main.css の写し（.tk-phone の中だけ）。
+ *
+ * 大きさ: 部品の根（.tk-frame）が inline-size のコンテナになり、幅に応じて
+ * サイドバー・ステータスバーの項目・検索欄を間引く。文字は 1 か所（--ui-fs）で縮む。
+ */
+
+.tk-ui {
+  --ui-crust: #11111b;
+  --ui-mantle: #181825;
+  --ui-base: #1e1e2e;
+  --ui-s1: #1c1d2b;
+  --ui-s2: #20212f;
+  --ui-hover: #232434;
+  --ui-hl: #313244;
+  --ui-tab: #26273a;
+  --ui-chip: #1a1b27;
+  --ui-line-in: #21222f;
+  --ui-line: #2a2b3c;
+  --ui-line-heavy: #34354a;
+  --ui-fg: #cdd6f4;
+  --ui-fg2: #bac2de;
+  --ui-fg3: #a6adc8;
+  --ui-muted: #6c7086;
+  --ui-faint: #585b70;
+  --ui-accent: #89b4fa;
+  --ui-accent-muted: #7f9ccc;
+  --ui-accent-line: #5a6a9e;
+  --ui-idle: #4a5572;
+  --ui-green: #a6e3a1;
+  --ui-red: #f38ba8;
+  --ui-yellow: #f9e2af;
+  --ui-teal: #94e2d5;
+  --ui-mauve: #cba6f7;
+  --ui-peach: #fab387;
+  /* 日本語は OS のフォントで描く（実物の tako も等幅フォントに無い字は OS の代替で描く）。
+   * Noto Sans JP（Web フォント）を先に置くと、再現画面の字のために分割フォントを余分に取りに行く */
+  --ui-font: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic UI', Meiryo, 'Noto Sans JP', monospace;
+  --ui-sys: system-ui, -apple-system, 'Segoe UI', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic UI', Meiryo, 'Noto Sans JP', sans-serif;
+  --ui-fs: 11.5px;
+
+  font-family: var(--ui-font);
+  font-size: var(--ui-fs);
+  line-height: 1.55;
+  color: var(--ui-fg);
+  text-align: left;
+  letter-spacing: 0;
+  font-feature-settings: normal;
+  /* 端末は合字を描かない（JetBrains Mono の合字で ==> や != が記号に化ける） */
+  font-variant-ligatures: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.tk-ui *,
+.tk-ui *::before,
+.tk-ui *::after {
+  box-sizing: border-box;
+}
+
+.tk-frame {
+  container: tkframe / inline-size;
+  position: relative;
+  width: 100%;
+}
+
+.tk-ic {
+  width: 1.1em;
+  height: 1.1em;
+  flex: none;
+  display: inline-block;
+  vertical-align: -0.18em;
+}
+
+/* 広い枠では一段大きく、狭い枠では一段小さくする（部品の中の em はすべてこれに追従する） */
+@container tkframe (min-width: 34rem) {
+  .tk-win,
+  .tk-term-win,
+  .tk-browser,
+  .tk-dialog-host,
+  .tk-wizard {
+    font-size: 12px;
+  }
+}
+@container tkframe (max-width: 25rem) {
+  .tk-win,
+  .tk-term-win,
+  .tk-browser,
+  .tk-dialog-host,
+  .tk-wizard {
+    font-size: 10px;
+  }
+}
+
+/* ============================================================
+ * tako の窓
+ * ============================================================ */
+.tk-win {
+  display: flex;
+  flex-direction: column;
+  height: var(--h, 25em);
+  background: var(--ui-base);
+  border: 1px solid var(--ui-line-heavy);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow:
+    0 1px 2px rgb(17 17 27 / 0.25),
+    0 22px 48px -18px rgb(17 17 27 / 0.6);
+}
+
+/* Windows はタブバーの一段上に自前のメニュー行（#657）。右端に窓の操作ボタン */
+.tk-win-menu {
+  display: flex;
+  align-items: center;
+  gap: 0.2em;
+  height: 2.4em;
+  padding: 0 0.3em 0 0.6em;
+  background: var(--ui-crust);
+  color: var(--ui-muted);
+  flex: none;
+}
+.tk-win-menu .tk-menu-item {
+  padding: 0.15em 0.55em;
+  border-radius: 6px;
+}
+.tk-wctl {
+  margin-left: auto;
+  display: flex;
+  gap: 0.15em;
+}
+.tk-wctl span {
+  display: inline-grid;
+  place-items: center;
+  width: 2.3em;
+  height: 1.9em;
+  border-radius: 6px;
+  color: var(--ui-muted);
+}
+
+.tk-win-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  height: 2.9em;
+  padding: 0 0.6em;
+  background: var(--ui-mantle);
+  border-bottom: 1px solid var(--ui-line);
+  flex: none;
+  min-width: 0;
+  white-space: nowrap;
+}
+.tk-lights {
+  display: flex;
+  gap: 0.5em;
+  margin-right: 0.5em;
+  flex: none;
+}
+.tk-lights i {
+  width: 0.85em;
+  height: 0.85em;
+  border-radius: 50%;
+  background: #ff5f57;
+}
+.tk-lights i:nth-child(2) {
+  background: #febc2e;
+}
+.tk-lights i:nth-child(3) {
+  background: #28c840;
+}
+.tk-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.3em 0.75em;
+  border-radius: 7px;
+  color: var(--ui-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-tab-slot {
+  display: inline-flex;
+  min-width: 0;
+}
+.tk-tab.is-active,
+.tk-tab[data-fx~='state'].is-on {
+  background: var(--ui-tab);
+  color: var(--ui-fg);
+  font-weight: 700;
+}
+.tk-tab-add {
+  color: var(--ui-muted);
+  display: inline-flex;
+  padding: 0 0.3em;
+}
+.tk-tab-spacer {
+  flex: 1;
+  min-width: 0.5em;
+}
+.tk-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.25em 0.6em;
+  border: 1px solid var(--ui-line);
+  border-radius: 7px;
+  background: var(--ui-s1);
+  color: var(--ui-muted);
+  flex: none;
+}
+.tk-kbd {
+  font-size: 0.8em;
+  padding: 0.05em 0.4em;
+  border: 1px solid var(--ui-line-heavy);
+  border-radius: 4px;
+  color: var(--ui-faint);
+}
+.tk-tbtn {
+  display: inline-grid;
+  place-items: center;
+  width: 2em;
+  height: 2em;
+  border-radius: 7px;
+  color: var(--ui-muted);
+  flex: none;
+}
+.tk-tbtn-stack {
+  display: inline-grid;
+}
+.tk-tbtn-stack > * {
+  grid-area: 1 / 1;
+}
+.tk-tbtn.is-lit {
+  color: var(--ui-accent);
+  background: var(--ui-tab);
+}
+
+/* 状態の丸（idle = 緑 / running = 青 / 注意 = 黄 / 失敗 = 赤） */
+.tk-dot {
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  background: var(--ui-green);
+  flex: none;
+}
+.tk-dot.is-running {
+  background: var(--ui-accent);
+}
+.tk-dot.is-wait {
+  background: var(--ui-yellow);
+}
+.tk-dot.is-fail {
+  background: var(--ui-red);
+}
+.tk-dot.is-off {
+  background: var(--ui-faint);
+}
+
+/* 本体（サイドバー / ペイン / 右パネル） */
+.tk-win-main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+.tk-win-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  padding: 0.35em;
+  background: var(--ui-mantle);
+}
+
+/* ステータスバー */
+.tk-win-status {
+  display: flex;
+  align-items: stretch;
+  height: 2.2em;
+  background: var(--ui-mantle);
+  border-top: 1px solid var(--ui-line);
+  color: var(--ui-muted);
+  font-size: 0.92em;
+  white-space: nowrap;
+  overflow: hidden;
+  flex: none;
+}
+.tk-sb {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  padding: 0 0.7em;
+  border-right: 1px solid var(--ui-line-in);
+  min-width: 0;
+}
+.tk-sb.is-end {
+  border-right: none;
+  border-left: 1px solid var(--ui-line-in);
+}
+.tk-sb-files {
+  color: var(--ui-accent);
+  background: var(--ui-tab);
+}
+.tk-sb-spacer {
+  flex: 1;
+}
+.tk-sb b {
+  color: var(--ui-fg2);
+  font-weight: 700;
+}
+.tk-sb-bar {
+  display: inline-block;
+  width: 3.4em;
+  height: 0.35em;
+  border-radius: 99px;
+  background: var(--ui-hl);
+  overflow: hidden;
+}
+.tk-sb-bar i {
+  display: block;
+  height: 100%;
+  width: var(--v, 10%);
+  background: var(--ui-accent);
+}
+
+@container tkframe (max-width: 40rem) {
+  .tk-search-text,
+  .tk-menu-item.is-wide,
+  .tk-sb.is-wide {
+    display: none;
+  }
+}
+@container tkframe (max-width: 30rem) {
+  .tk-search,
+  .tk-tbtn.is-wide,
+  .tk-sb.is-mid {
+    display: none;
+  }
+}
+
+/* ============================================================
+ * サイドバー（ファイルツリー）
+ * ============================================================ */
+.tk-side {
+  width: 30%;
+  max-width: 13em;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  background: var(--ui-mantle);
+  border-right: 1px solid var(--ui-line);
+  padding: 0.6em 0.5em;
+  gap: 0.4em;
+  color: var(--ui-fg2);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tk-side-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  font-weight: 700;
+  color: var(--ui-fg);
+}
+.tk-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  font-size: 0.86em;
+  font-weight: 600;
+  color: var(--ui-green);
+  background: rgb(166 227 161 / 0.1);
+  border-radius: 5px;
+  padding: 0.05em 0.45em;
+}
+.tk-side-path {
+  font-size: 0.88em;
+  color: var(--ui-muted);
+  border: 1px solid var(--ui-line);
+  border-radius: 6px;
+  padding: 0.2em 0.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+}
+.tk-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  padding-left: calc(var(--depth, 0) * 1.1em);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-tree-row .tk-ic {
+  color: var(--ui-accent-muted);
+}
+.tk-tree-row.is-file .tk-ic {
+  color: var(--ui-muted);
+}
+.tk-tree-row.is-hit {
+  background: var(--ui-tab);
+  border-radius: 5px;
+  color: var(--ui-fg);
+}
+.tk-side-foot {
+  margin-top: auto;
+  font-size: 0.88em;
+  color: var(--ui-muted);
+}
+.tk-side-foot b {
+  color: var(--ui-yellow);
+  font-weight: 600;
+}
+@container tkframe (max-width: 36rem) {
+  .tk-side {
+    display: none;
+  }
+}
+
+/* ============================================================
+ * ペインと分割
+ * ============================================================ */
+.tk-split {
+  --tk-gap: 0.35em;
+  display: flex;
+  gap: var(--tk-gap);
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.tk-split.is-col {
+  flex-direction: column;
+}
+
+.tk-pane {
+  position: relative;
+  flex: var(--grow, 1) 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ui-base);
+  border: 1px solid var(--ui-line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+/* フォーカス中のペインの青い枠（手順で付け外しできるように別の層で描く） */
+.tk-pane-focus {
+  position: absolute;
+  inset: -1px;
+  border: 1.5px solid var(--ui-accent-muted);
+  border-radius: 7px;
+  pointer-events: none;
+  z-index: 2;
+}
+.tk-pane-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  height: 2.2em;
+  padding: 0 0.6em;
+  border-bottom: 1px solid var(--ui-line-in);
+  color: var(--ui-muted);
+  font-size: 0.92em;
+  white-space: nowrap;
+  overflow: hidden;
+  flex: none;
+}
+.tk-pane-n {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.5em;
+  height: 1.5em;
+  padding: 0 0.3em;
+  border-radius: 4px;
+  background: var(--ui-hl);
+  color: var(--ui-fg3);
+  font-size: 0.9em;
+  font-weight: 700;
+}
+.tk-pane-title {
+  color: var(--ui-fg);
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.tk-pane-badge {
+  font-size: 0.82em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--ui-fg2);
+}
+.tk-pane-parent {
+  color: var(--ui-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.tk-pane-state {
+  display: inline-grid;
+}
+.tk-pane-state > span {
+  grid-area: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+}
+.tk-pane-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.05em 0.45em;
+  border-radius: 5px;
+  background: var(--ui-chip);
+  border: 1px solid var(--ui-line-in);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.tk-pane-ctl {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 0.5em;
+  color: var(--ui-faint);
+  flex: none;
+  padding-left: 0.4em;
+}
+@container tkframe (max-width: 40rem) {
+  .tk-pane-chip,
+  .tk-pane-meta {
+    display: none;
+  }
+}
+@container tkframe (max-width: 30rem) {
+  .tk-pane-ctl {
+    display: none;
+  }
+}
+.tk-pane-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 0.5em 0.75em;
+  overflow: hidden;
+}
+
+/* 中身を「ターミナル部分 + 下端の帯」に分けるとき（body="flush" のペインの中で使う） */
+.tk-pane-col {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.tk-pane-term {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0.5em 0.75em;
+}
+
+/* ============================================================
+ * ターミナルの行
+ * ============================================================ */
+.tk-l {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  min-height: 1.55em;
+}
+.tk-p {
+  color: var(--ui-accent);
+  font-weight: 600;
+}
+.tk-c {
+  color: var(--ui-fg);
+}
+.tk-o {
+  color: var(--ui-fg2);
+}
+.tk-dim {
+  color: var(--ui-muted);
+}
+.tk-ok {
+  color: var(--ui-green);
+}
+.tk-warn {
+  color: var(--ui-yellow);
+}
+.tk-err {
+  color: var(--ui-red);
+}
+.tk-acc {
+  color: var(--ui-accent);
+}
+.tk-b {
+  font-weight: 700;
+}
+/* 入力カーソル（点滅は動かしてよいときだけ） */
+.tk-cur {
+  display: inline-block;
+  width: 0.6em;
+  height: 1.15em;
+  vertical-align: -0.22em;
+  background: #f5e0dc;
+}
+[data-motion]:not(.is-static) .tk-cur {
+  animation: tk-blink 1.1s steps(1, end) infinite;
+}
+@keyframes tk-blink {
+  50% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tk-cur {
+    animation: none !important;
+  }
+}
+
+/* AI エージェントの TUI（claude / codex の入力欄など） */
+.tk-tui-msg {
+  display: flex;
+  gap: 0.5em;
+}
+.tk-tui-msg::before {
+  content: '●';
+  color: var(--ui-fg3);
+  flex: none;
+}
+.tk-tui-msg.is-tool::before {
+  color: var(--ui-green);
+}
+.tk-tui-user {
+  color: var(--ui-fg3);
+  background: var(--ui-s2);
+  border-radius: 4px;
+  padding: 0.1em 0.5em;
+  display: block;
+}
+.tk-tui-input {
+  margin-top: 0.5em;
+  padding: 0.3em 0.2em;
+  border-top: 1px solid var(--ui-line-heavy);
+  border-bottom: 1px solid var(--ui-line-heavy);
+  color: var(--ui-fg);
+}
+
+/* ============================================================
+ * 初回起動のバナー（tako へようこそ）
+ * ============================================================ */
+.tk-welcome {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35em 1em;
+  align-items: center;
+  padding: 0.7em 0.9em;
+  /* 本体はアクセント 10% の塗り + 28% の下線（crates/tako-app/src/overlays.rs） */
+  background: linear-gradient(rgb(137 180 250 / 0.1), rgb(137 180 250 / 0.1)), var(--ui-base);
+  border-bottom: 1px solid rgb(137 180 250 / 0.28);
+  flex: none;
+}
+.tk-welcome-title {
+  font-weight: 700;
+  color: var(--ui-fg);
+}
+.tk-welcome-links {
+  display: flex;
+  gap: 1em;
+  justify-content: flex-end;
+  color: var(--ui-muted);
+  font-size: 0.9em;
+}
+.tk-welcome-line {
+  color: var(--ui-fg2);
+  overflow-wrap: anywhere;
+}
+.tk-ubtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  padding: 0.35em 0.8em;
+  border-radius: 6px;
+  font-weight: 700;
+  white-space: nowrap;
+  border: 1px solid var(--ui-line-heavy);
+  color: var(--ui-fg2);
+  background: var(--ui-s2);
+}
+.tk-ubtn.is-primary {
+  background: var(--ui-accent);
+  border-color: var(--ui-accent);
+  color: var(--ui-crust);
+}
+.tk-ubtn.is-sub {
+  background: var(--ui-chip);
+  border-color: var(--ui-line);
+  color: var(--ui-accent);
+}
+@container tkframe (max-width: 30rem) {
+  .tk-welcome-links {
+    display: none;
+  }
+}
+
+/* ============================================================
+ * コマンドカード（tako show-command）
+ * ============================================================ */
+/* 実物はペインの下端の帯（上辺に 1px の区切り）に出る。帯の中にカード */
+.tk-cardband {
+  border-top: 1px solid #26273a;
+  background: var(--ui-base);
+  padding: 0.5em 0.55em;
+  flex: none;
+}
+.tk-cmdcard {
+  border: 1px solid var(--ui-accent-line);
+  border-radius: 9px;
+  background: var(--ui-s1);
+  padding: 0.6em 0.7em 0.7em;
+  box-shadow: 0 10px 24px -12px rgb(0 0 0 / 0.6);
+}
+.tk-cmdcard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--ui-fg2);
+  margin-bottom: 0.45em;
+}
+.tk-cmdcard-head .tk-ic {
+  color: var(--ui-faint);
+}
+.tk-cmdcard-box {
+  background: var(--ui-crust);
+  border: 1px solid #26273a;
+  border-radius: 6px;
+  padding: 0.55em 0.7em;
+}
+.tk-cmdcard-cmd {
+  display: block;
+  color: var(--ui-fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 0.5em;
+}
+.tk-cmdcard .tk-ubtn {
+  background: var(--ui-chip);
+  border-color: var(--ui-line);
+  font-weight: 500;
+  padding: 0.2em 0.6em;
+  border-radius: 5px;
+}
+.tk-cmdcard-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45em;
+  flex-wrap: wrap;
+}
+.tk-cmdcard-run {
+  margin-top: 0.4em;
+  font-size: 0.9em;
+  color: var(--ui-muted);
+}
+
+/* ============================================================
+ * チャット表示（かんたん表示）とスターター
+ * ============================================================ */
+.tk-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55em;
+  height: 100%;
+}
+.tk-chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.tk-bubble {
+  border: 1px solid var(--ui-line);
+  background: var(--ui-s1);
+  border-radius: 8px;
+  padding: 0.5em 0.7em;
+  color: var(--ui-fg);
+  overflow-wrap: anywhere;
+}
+.tk-bubble.is-user {
+  align-self: flex-end;
+  max-width: 82%;
+  background: var(--ui-s2);
+}
+.tk-bubble code {
+  color: var(--ui-peach);
+  background: var(--ui-crust);
+  border-radius: 3px;
+  padding: 0 0.3em;
+  font-family: inherit;
+  font-size: 1em;
+}
+.tk-tool {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  margin-top: 0.4em;
+  border: 1px solid var(--ui-line-in);
+  border-radius: 6px;
+  padding: 0.2em 0.5em;
+  color: var(--ui-muted);
+  font-size: 0.92em;
+}
+.tk-tool b {
+  color: var(--ui-fg2);
+}
+.tk-chat-input {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  border: 1px solid var(--ui-accent-muted);
+  border-radius: 8px;
+  padding: 0.45em 0.6em;
+  color: var(--ui-faint);
+  flex: none;
+}
+.tk-chat-input .tk-grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.tk-chat-input .tk-typed {
+  color: var(--ui-fg);
+}
+.tk-chat-chips {
+  display: flex;
+  gap: 0.4em;
+  flex-wrap: wrap;
+  font-size: 0.88em;
+  color: var(--ui-muted);
+  flex: none;
+}
+.tk-chat-chips span {
+  border: 1px solid var(--ui-line);
+  border-radius: 99px;
+  padding: 0.05em 0.6em;
+}
+
+.tk-starter {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.45em;
+  height: 100%;
+  max-width: 30em;
+  margin: 0 auto;
+}
+.tk-starter-q {
+  font-weight: 700;
+  font-size: 1.1em;
+}
+.tk-starter-sub {
+  color: var(--ui-muted);
+  font-size: 0.9em;
+  margin-bottom: 0.2em;
+}
+.tk-starter-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.1em 0.7em;
+  align-items: center;
+  border: 1px solid var(--ui-line);
+  border-radius: 8px;
+  padding: 0.55em 0.7em;
+  background: var(--ui-s1);
+}
+.tk-starter-card.is-lead {
+  border-color: var(--ui-accent-line);
+  background: #2a2e45;
+}
+.tk-starter-ic {
+  grid-row: 1 / span 2;
+  display: grid;
+  place-items: center;
+  width: 2.2em;
+  height: 2.2em;
+  border-radius: 7px;
+  background: var(--ui-crust);
+  color: var(--ui-accent);
+}
+.tk-starter-card b {
+  color: var(--ui-fg);
+}
+.tk-starter-card small {
+  color: var(--ui-faint);
+  font-size: 0.85em;
+  margin-left: 0.4em;
+}
+.tk-starter-card span:last-child {
+  color: var(--ui-fg3);
+  font-size: 0.9em;
+}
+
+/* ============================================================
+ * 右パネル（fleet / orch / git / tasks）とユーザータスク
+ * ============================================================ */
+.tk-right {
+  container: tkright / inline-size;
+  width: var(--rw, 40%);
+  max-width: 21em;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  background: var(--ui-mantle);
+  border-left: 1px solid var(--ui-line);
+  min-width: 0;
+}
+.tk-right-tabs {
+  display: flex;
+  gap: 0.1em;
+  padding: 0 0.4em;
+  border-bottom: 1px solid var(--ui-line);
+  color: var(--ui-muted);
+  white-space: nowrap;
+  flex: none;
+}
+.tk-right-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.55em 0.45em;
+  border-bottom: 2px solid transparent;
+}
+.tk-right-tab.is-active {
+  color: var(--ui-fg);
+  font-weight: 700;
+  border-bottom-color: var(--ui-accent);
+}
+.tk-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.45em;
+  height: 1.45em;
+  padding: 0 0.35em;
+  border-radius: 99px;
+  font-size: 0.82em;
+  font-weight: 700;
+  color: var(--ui-crust);
+  background: var(--ui-accent);
+}
+.tk-right-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0.55em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45em;
+  overflow: hidden;
+}
+/* 右パネルが細いときは、選んでいないビューの名前を落としてアイコンだけにする（実物と同じ） */
+@container tkright (max-width: 26em) {
+  .tk-right-tab:not(.is-active) .tk-right-label {
+    display: none;
+  }
+}
+@container tkframe (max-width: 30rem) {
+  .tk-right {
+    width: 58%;
+  }
+}
+
+.tk-task {
+  border: 1px solid var(--ui-line);
+  border-radius: 7px;
+  background: var(--ui-base);
+  overflow: hidden;
+}
+.tk-task-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  padding: 0.4em 0.55em;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tk-task-row .tk-ic {
+  color: var(--ui-faint);
+}
+.tk-task-kind {
+  font-size: 0.82em;
+  font-weight: 700;
+  color: var(--ui-peach);
+  background: rgb(250 179 135 / 0.12);
+  border-radius: 4px;
+  padding: 0 0.4em;
+  flex: none;
+}
+.tk-task-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ui-fg);
+  min-width: 0;
+}
+.tk-task-detail {
+  padding: 0 0.55em 0.55em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  color: var(--ui-fg3);
+  border-top: 1px solid var(--ui-line-in);
+}
+.tk-task-detail > :first-child {
+  margin-top: 0.45em;
+}
+.tk-attach {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  border: 1px solid var(--ui-line-in);
+  border-radius: 6px;
+  padding: 0.25em 0.45em;
+  color: var(--ui-fg2);
+}
+.tk-attach small {
+  font-size: 0.82em;
+  color: var(--ui-muted);
+  border: 1px solid var(--ui-line);
+  border-radius: 4px;
+  padding: 0 0.3em;
+}
+.tk-thumb {
+  width: 2.6em;
+  height: 1.8em;
+  border-radius: 3px;
+  background:
+    linear-gradient(135deg, rgb(137 180 250 / 0.5), rgb(203 166 247 / 0.45)),
+    var(--ui-hl);
+  flex: none;
+}
+.tk-decisions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3em;
+}
+.tk-decision {
+  border: 1px solid var(--ui-line-heavy);
+  border-radius: 99px;
+  padding: 0 0.5em;
+  color: var(--ui-fg3);
+  font-size: 0.92em;
+}
+.tk-decision.is-picked {
+  border-color: var(--ui-accent);
+  color: var(--ui-crust);
+  background: var(--ui-accent);
+  font-weight: 700;
+}
+.tk-reply {
+  display: flex;
+  gap: 0.4em;
+  align-items: stretch;
+}
+.tk-comment {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--ui-line);
+  border-radius: 6px;
+  padding: 0.2em 0.5em;
+  color: var(--ui-faint);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.tk-comment .tk-typed {
+  color: var(--ui-fg);
+}
+.tk-delivery {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  font-size: 0.92em;
+  color: var(--ui-muted);
+}
+
+/* ============================================================
+ * スマホ版（PWA）。配色は web/tako-remote/src/styles/main.css
+ * ============================================================ */
+.tk-phone {
+  --ph-bg: #0b0d10;
+  --ph-panel: #121519;
+  --ph-panel2: #171c21;
+  --ph-line: #23282e;
+  --ph-line2: #2f353d;
+  --ph-fg: #e9ecef;
+  --ph-fg2: #969ca4;
+  --ph-fg3: #5c636b;
+  --ph-green: #5ee3a0;
+  --ph-amber: #e8b23e;
+  --ph-claude: #d6795c;
+  --ph-blue: #74b6ff;
+
+  width: min(100%, 17.5em);
+  margin: 0 auto;
+  font-size: 11px;
+  border-radius: 2.2em;
+  padding: 0.55em;
+  background: #2a2b33;
+  box-shadow:
+    inset 0 0 0 1px #3d3f49,
+    0 22px 48px -18px rgb(17 17 27 / 0.6);
+}
+@container tkframe (max-width: 30rem) {
+  .tk-phone {
+    font-size: 10px;
+  }
+}
+.tk-phone-screen {
+  position: relative;
+  height: var(--h, 31em);
+  border-radius: 1.75em;
+  overflow: hidden;
+  background: var(--ph-bg);
+  color: var(--ph-fg);
+  display: flex;
+  flex-direction: column;
+}
+.tk-phone-notch {
+  height: 1.9em;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1.4em;
+  font-size: 0.85em;
+  font-weight: 700;
+  color: var(--ph-fg);
+  flex: none;
+}
+.tk-phone-island {
+  width: 5.5em;
+  height: 1.25em;
+  border-radius: 99px;
+  background: #000;
+}
+.tk-phone-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5em;
+  padding: 0.3em 0.9em 0.6em;
+  border-bottom: 1px solid var(--ph-line);
+  flex: none;
+}
+.tk-machine {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  background: var(--ph-panel2);
+  border: 1px solid var(--ph-line2);
+  border-radius: 0.75em;
+  padding: 0.35em 0.7em;
+  font-weight: 700;
+}
+.tk-machine i {
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  background: var(--ph-green);
+}
+.tk-phone-actions {
+  display: inline-flex;
+  gap: 0.35em;
+}
+.tk-phone-btn {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  min-width: 2.3em;
+  height: 2.3em;
+  padding: 0 0.5em;
+  border-radius: 0.7em;
+  border: 1px solid var(--ph-line2);
+  background: var(--ph-panel2);
+  color: var(--ph-fg2);
+}
+.tk-phone-badge {
+  position: absolute;
+  top: -0.45em;
+  right: -0.45em;
+  min-width: 1.4em;
+  height: 1.4em;
+  border-radius: 99px;
+  display: grid;
+  place-items: center;
+  font-size: 0.8em;
+  font-weight: 700;
+  color: #0b0d10;
+  background: var(--ph-amber);
+}
+.tk-phone-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0.7em 0.8em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+  overflow: hidden;
+  position: relative;
+}
+.tk-phone-layer {
+  position: absolute;
+  inset: 0;
+  padding: 0.7em 0.8em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+  background: var(--ph-bg);
+}
+.tk-pcard {
+  position: relative;
+  background: var(--ph-panel);
+  border: 1px solid var(--ph-line);
+  border-radius: 1.1em;
+  padding: 0.65em 0.75em 0.6em 0.95em;
+  overflow: hidden;
+}
+.tk-pcard::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--edge, var(--ph-fg3));
+}
+.tk-pcard.is-master {
+  --edge: var(--ph-claude);
+}
+.tk-pcard.is-worker {
+  --edge: var(--ph-blue);
+}
+.tk-pcard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4em;
+  margin-bottom: 0.4em;
+}
+.tk-pcard-title {
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tk-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-size: 0.85em;
+  font-weight: 700;
+  padding: 0.15em 0.6em;
+  border-radius: 99px;
+  color: var(--ph-green);
+  background: rgb(94 227 160 / 0.12);
+  border: 1px solid rgb(94 227 160 / 0.35);
+  flex: none;
+}
+.tk-pill i {
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  background: currentColor;
+}
+.tk-pill.is-wait {
+  color: var(--ph-amber);
+  background: rgb(232 178 62 / 0.14);
+  border-color: rgb(232 178 62 / 0.4);
+}
+.tk-pchips {
+  display: flex;
+  gap: 0.3em;
+  margin-bottom: 0.45em;
+}
+.tk-pchip {
+  font-size: 0.8em;
+  color: var(--ph-fg3);
+  background: var(--ph-panel2);
+  border: 1px solid var(--ph-line);
+  border-radius: 0.4em;
+  padding: 0.05em 0.45em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.tk-pchip.is-master {
+  color: var(--ph-claude);
+  background: rgb(214 121 92 / 0.15);
+  border-color: rgb(214 121 92 / 0.3);
+}
+.tk-pcard-preview {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.9em;
+  line-height: 1.5;
+  color: var(--ph-fg2);
+  background: var(--ph-bg);
+  border: 1px solid var(--ph-line);
+  border-radius: 0.7em;
+  padding: 0.45em 0.6em;
+  overflow-wrap: anywhere;
+}
+.tk-pmsg {
+  border-radius: 0.9em;
+  padding: 0.5em 0.7em;
+  background: var(--ph-panel);
+  border: 1px solid var(--ph-line);
+  overflow-wrap: anywhere;
+}
+.tk-pmsg.is-user {
+  align-self: flex-end;
+  max-width: 85%;
+  background: var(--ph-panel2);
+  border-color: var(--ph-line2);
+}
+.tk-pinput {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  border: 1px solid var(--ph-line2);
+  border-radius: 1em;
+  padding: 0.5em 0.7em;
+  color: var(--ph-fg3);
+  background: var(--ph-panel);
+}
+.tk-pinput .tk-grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.tk-pinput .tk-typed {
+  color: var(--ph-fg);
+}
+.tk-psend {
+  display: grid;
+  place-items: center;
+  width: 2em;
+  height: 2em;
+  border-radius: 50%;
+  background: var(--ph-green);
+  color: #0b0d10;
+  flex: none;
+}
+.tk-pbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35em;
+  border-radius: 0.8em;
+  padding: 0.5em 0.8em;
+  font-weight: 700;
+  border: 1px solid var(--ph-line2);
+  background: var(--ph-panel2);
+  color: var(--ph-fg);
+}
+.tk-pbtn.is-primary {
+  background: var(--ph-green);
+  border-color: var(--ph-green);
+  color: #0b0d10;
+}
+
+/* ============================================================
+ * OS のターミナル（Terminal.app / Windows Terminal）
+ * ============================================================ */
+.tk-term-win {
+  display: flex;
+  flex-direction: column;
+  height: var(--h, 18em);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #1c1c1e;
+  border: 1px solid #3a3a3c;
+  box-shadow: 0 22px 48px -18px rgb(0 0 0 / 0.55);
+  color: #e5e5e7;
+}
+.tk-term-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  height: 2.5em;
+  padding: 0 0.7em;
+  background: #2c2c2e;
+  color: #a1a1a6;
+  flex: none;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tk-term-bar .tk-term-title {
+  flex: 1;
+  text-align: center;
+  margin-right: 3em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-term-win.is-windows {
+  background: #0c0c0c;
+  border-color: #3b3b3b;
+  border-radius: 8px;
+  color: #cccccc;
+}
+.tk-term-win.is-windows .tk-term-bar {
+  background: #202020;
+  color: #e6e6e6;
+}
+.tk-term-win.is-windows .tk-term-title {
+  text-align: left;
+  margin-right: 0;
+}
+.tk-term-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  padding: 0.25em 0.8em;
+  border-radius: 6px 6px 0 0;
+  background: #0c0c0c;
+  color: #e6e6e6;
+  align-self: flex-end;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-term-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0.6em 0.8em;
+  overflow: hidden;
+}
+.tk-term-win .tk-p {
+  color: #6cc3ff;
+}
+.tk-term-win.is-windows .tk-p {
+  color: #cccccc;
+  font-weight: 400;
+}
+.tk-term-win .tk-c {
+  color: #ffffff;
+}
+.tk-term-win .tk-dim {
+  color: #8e8e93;
+}
+
+/* ============================================================
+ * ブラウザ（GitHub Releases のダウンロード表）
+ * ============================================================ */
+.tk-browser {
+  display: flex;
+  flex-direction: column;
+  height: var(--h, 20em);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  color: #e6edf3;
+  box-shadow: 0 22px 48px -18px rgb(0 0 0 / 0.55);
+}
+.tk-browser-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  padding: 0.45em 0.7em;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  flex: none;
+}
+.tk-url {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 99px;
+  padding: 0.25em 0.8em;
+  color: #8b949e;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-browser-body {
+  flex: 1;
+  min-height: 0;
+  padding: 0.8em 1em;
+  overflow: hidden;
+  font-family: var(--ui-sys);
+}
+.tk-rel-title {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  font-size: 1.25em;
+  font-weight: 700;
+  margin-bottom: 0.2em;
+}
+.tk-rel-latest {
+  font-size: 0.65em;
+  font-weight: 600;
+  color: #3fb950;
+  border: 1px solid #238636;
+  border-radius: 99px;
+  padding: 0.05em 0.6em;
+}
+.tk-rel-sub {
+  color: #8b949e;
+  margin-bottom: 0.7em;
+}
+.tk-assets {
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.tk-assets-head {
+  padding: 0.4em 0.7em;
+  background: #161b22;
+  font-weight: 600;
+  border-bottom: 1px solid #30363d;
+}
+.tk-asset {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.45em 0.7em;
+  border-bottom: 1px solid #21262d;
+  color: #4493f8;
+  font-family: var(--ui-font);
+  overflow-wrap: anywhere;
+}
+.tk-asset:last-child {
+  border-bottom: none;
+}
+.tk-asset .tk-ic {
+  color: #8b949e;
+}
+.tk-asset-hl {
+  position: absolute;
+  inset: 0;
+  background: rgb(68 147 248 / 0.12);
+  box-shadow: inset 3px 0 0 #4493f8;
+}
+
+/* ============================================================
+ * OS のダイアログ（SmartScreen）と Windows のインストーラー
+ * ============================================================ */
+.tk-dialog-host {
+  position: relative;
+  height: var(--h, 20em);
+  border-radius: 10px;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 20% 10%, #2b5a9e 0%, transparent 60%),
+    radial-gradient(90% 80% at 90% 90%, #1d3c6e 0%, transparent 60%),
+    #102341;
+  box-shadow: 0 22px 48px -18px rgb(0 0 0 / 0.55);
+}
+.tk-smartscreen {
+  position: absolute;
+  inset: 8% 7%;
+  background: #1f6fbd;
+  color: #fff;
+  padding: 1.1em 1.3em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+  font-family: var(--ui-sys);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 0.4);
+}
+.tk-smartscreen-title {
+  font-size: 1.45em;
+  font-weight: 300;
+  line-height: 1.3;
+}
+.tk-smartscreen p {
+  margin: 0;
+  font-size: 0.95em;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.tk-ss-link {
+  text-decoration: underline;
+  font-size: 0.95em;
+}
+.tk-ss-detail {
+  font-size: 0.92em;
+  line-height: 1.7;
+}
+.tk-ss-btns {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6em;
+}
+.tk-ss-btn {
+  border: 2px solid #fff;
+  padding: 0.3em 1.3em;
+  font-weight: 600;
+}
+.tk-ss-btn.is-run {
+  background: #fff;
+  color: #1f6fbd;
+}
+/* 重ねて切り替えるもの（手順ごとに入れ替わる画面）。子は同じ場所に重なる */
+.tk-stack {
+  display: grid;
+}
+.tk-stack > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+  min-height: 0;
+}
+.tk-fill {
+  height: 100%;
+}
+
+.tk-wizard {
+  display: flex;
+  flex-direction: column;
+  height: var(--h, 20em);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f3f3f3;
+  color: #1b1b1b;
+  border: 1px solid #c8c8c8;
+  font-family: var(--ui-sys);
+  box-shadow: 0 22px 48px -18px rgb(0 0 0 / 0.45);
+}
+.tk-wizard-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  height: 2.4em;
+  padding: 0 0 0 0.8em;
+  background: #ffffff;
+  border-bottom: 1px solid #e1e1e1;
+  font-size: 0.92em;
+  flex: none;
+}
+.tk-wizard-bar .tk-wctl {
+  color: #444;
+}
+.tk-wizard-bar .tk-wctl span {
+  color: #444;
+}
+.tk-wizard-page {
+  flex: 1;
+  min-height: 0;
+  padding: 0.9em 1.1em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55em;
+  background: #ffffff;
+}
+.tk-wizard-h {
+  font-weight: 700;
+  font-size: 1.05em;
+}
+.tk-wizard-sub {
+  color: #5d5d5d;
+  font-size: 0.92em;
+}
+.tk-check {
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+  overflow-wrap: anywhere;
+}
+.tk-check i {
+  width: 1.15em;
+  height: 1.15em;
+  border: 1.5px solid #8a8a8a;
+  border-radius: 3px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: #fff;
+}
+.tk-check.is-on i {
+  background: #005fb8;
+  border-color: #005fb8;
+  color: #fff;
+}
+.tk-check.is-on i .tk-ic {
+  width: 0.85em;
+  height: 0.85em;
+}
+.tk-progress {
+  height: 0.7em;
+  border-radius: 99px;
+  background: #e0e0e0;
+  overflow: hidden;
+}
+.tk-progress i {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: #005fb8;
+  transform-origin: left;
+}
+[data-motion] .tk-progress i {
+  transform: scaleX(0);
+  transition: transform 1.6s var(--tako-ease-soft);
+}
+[data-motion] .is-on .tk-progress i,
+[data-motion] .tk-progress.is-on i {
+  transform: scaleX(1);
+}
+.tk-wizard-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5em;
+  padding: 0.6em 1em;
+  border-top: 1px solid #e1e1e1;
+  background: #f3f3f3;
+  flex: none;
+}
+.tk-wbtn {
+  border: 1px solid #c2c2c2;
+  border-radius: 4px;
+  background: #fbfbfb;
+  padding: 0.25em 1.1em;
+  font-size: 0.92em;
+}
+.tk-wbtn.is-primary {
+  background: #005fb8;
+  border-color: #005fb8;
+  color: #fff;
+}
+.tk-wbtn.is-disabled {
+  color: #a0a0a0;
+  background: #f0f0f0;
+}
+
+/* ============================================================
+ * ポインター（押す場所を示す矢印と、押した輪）
+ * ============================================================ */
+.tk-pointer {
+  visibility: hidden;
+  position: absolute;
+  z-index: 5;
+  width: 1.5em;
+  height: 1.5em;
+  margin: -0.15em 0 0 -0.2em;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 3px rgb(0 0 0 / 0.5));
+}
+[data-motion] .tk-pointer {
+  visibility: visible;
+  transition:
+    left 0.7s var(--tako-ease),
+    top 0.7s var(--tako-ease),
+    opacity 0.3s var(--tako-ease-soft);
+}
+[data-motion] .tk-pointer:not(.is-on) {
+  opacity: 0;
+}
+.tk-pointer svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.tk-pointer::after {
+  content: '';
+  position: absolute;
+  left: 0.1em;
+  top: 0.05em;
+  width: 1.8em;
+  height: 1.8em;
+  margin: -0.9em 0 0 -0.9em;
+  border-radius: 50%;
+  border: 2px solid rgb(137 180 250 / 0.85);
+  opacity: 0;
+}
+.tk-pointer.is-click::after {
+  opacity: 0.9;
+}
+[data-motion]:not(.is-static) .tk-pointer.is-click::after {
+  animation: tk-click 0.9s 0.65s var(--tako-ease) both;
+}
+@keyframes tk-click {
+  from {
+    transform: scale(0.3);
+    opacity: 0.95;
+  }
+  to {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tk-pointer.is-click::after {
+    animation: none !important;
+    opacity: 0.9;
+  }
+}
+
+/* 押された / 選ばれた印（data-fx="mark" の .is-on の間だけ輪を付ける） */
+.tk-ui [data-fx~='mark'].is-on {
+  box-shadow:
+    0 0 0 2px var(--ui-crust),
+    0 0 0 3.5px var(--ui-accent);
+}

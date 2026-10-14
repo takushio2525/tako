@@ -1,0 +1,61 @@
+---
+/**
+ * 場面: スマホから（tako remote + PWA）。3 手順。
+ * 事実の出どころ: .agent/requirements.md FR-6（Tailscale の tailnet 内だけに公開・機器ペアリングは Mac で承認）/
+ * web/tako-remote。Windows の remote 系は pending（実機での通しが未了）なので本文で macOS と書く。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import Phone from '../motion/Phone.astro';
+import PhoneCard from '../motion/PhoneCard.astro';
+import Icon from '../motion/Icon.astro';
+---
+
+<Scrolly label="スマホから使う流れ">
+	<Phone slot="stage" tasks={1} tasksAt="1+">
+		<div class="tk-phone-layer" data-at="1" data-fx="fade">
+			<PhoneCard title="マスター" role="master" state="running">
+				worker 2 体で作業中。テストは 9 / 12 件まで緑
+			</PhoneCard>
+			<PhoneCard title="my-app" role="worker" state="wait" stateText="承認待ち">
+				npm test を実行しますか？
+			</PhoneCard>
+			<PhoneCard title="my-app" role="worker" state="running">
+				docs/guide.md の誤字を修正中
+			</PhoneCard>
+		</div>
+		<div class="tk-phone-layer" data-at="2" data-fx="fade">
+			<span class="tk-dim" style="color: var(--ph-fg3)">マスター</span>
+			<div class="tk-pmsg">worker 1 がテストの実行を待っています。許可してよければ進めます。</div>
+			<div class="tk-pmsg is-user" data-at="2" style="--d: 1.2s">進めて。通ったら PR まで出して</div>
+			<div class="tk-pinput">
+				<span class="tk-grow"><span class="tk-typed" data-at="2" data-fx="type">進めて。通ったら PR まで出して</span></span>
+				<span class="tk-psend"><Icon name="arrowUp" /></span>
+			</div>
+		</div>
+		<div class="tk-phone-layer" data-at="3" data-fx="fade">
+			<span class="tk-dim" style="color: var(--ph-fg3)">人がやること · 1 件</span>
+			<div class="tk-pcard">
+				<div class="tk-pcard-head"><span class="tk-pcard-title">PR の説明文を確認</span><span class="tk-pill is-wait"><i></i>レビュー</span></div>
+				<div class="tk-pcard-preview">ログイン画面とテスト 3 件を足した PR です。説明文を見てください。</div>
+			</div>
+			<div style="display:flex; gap:.5em; flex-wrap:wrap">
+				<span class="tk-pbtn is-primary" data-at="3" data-fx="mark" style="--d: .8s">承認</span>
+				<span class="tk-pbtn">直してほしい</span>
+				<span class="tk-pbtn">却下</span>
+			</div>
+		</div>
+	</Phone>
+
+	<Step title="スマホのブラウザで、同じ tako を開く">
+		<p>Mac で一度 <code>tako remote setup</code>、あとは <code>tako remote start</code> で出る QR を読むだけ。ペインがカードで並び、誰が何をしているか・止まっていないかが分かります。</p>
+		<p>公開先は Tailscale の tailnet の中だけで、初めての端末は Mac の画面で承認します。</p>
+	</Step>
+	<Step title="会話を開いて、続きを頼む">
+		<p>カードを押すとそのペインの画面になり、入力欄から master に指示を送れます。外出先から確認待ちに答えて、作業を止めずに進められます。</p>
+	</Step>
+	<Step title="人がやることも、スマホで片付く">
+		<p>AI から届いたタスクもスマホで開いて返答できます。投稿文などはコピーのボタン 1 つで貼り付け先へ。</p>
+		<p class="tk-step-note">スマホからの接続は macOS 版で使えます。Windows 版は実機での通しの確認がまだです。</p>
+	</Step>
+</Scrolly>

@@ -1,0 +1,28 @@
+---
+/**
+ * 時間で進む再現（ヒーローなど、スクロールの手順を持たない場所用。#2053）。
+ * 画面に入ると 1 → steps まで interval ごとに 1 回だけ進み、最後の状態で止まる。
+ * 中の書き方は Scrolly のステージと同じ（[data-at] / [data-pos]）。
+ * prefers-reduced-motion: reduce では最初から最後の状態で止まっている。
+ */
+import '../../styles/motion.css';
+import '../../styles/tako-ui.css';
+
+interface Props {
+	/** 最後の手順番号 */
+	steps: number;
+	/** 1 手順の長さ（ミリ秒） */
+	interval?: number;
+	class?: string;
+}
+
+const { steps, interval = 1800, class: className } = Astro.props;
+---
+
+<div class:list={['tk-autoplay', 'not-content', className]} data-autoplay={steps} data-interval={interval} aria-hidden="true" inert>
+	<slot />
+</div>
+
+<script>
+	import '../../scripts/motion.ts';
+</script>

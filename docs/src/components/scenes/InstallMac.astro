@@ -1,0 +1,97 @@
+---
+/**
+ * 場面: macOS に入れる（入手 → インストール → 初回起動 → セットアップ → 使い始める）。5 手順。
+ * 事実の出どころ: docs getting-started の旧版 / 台帳 1 節（バナーの「セットアップを実行」は新しいタブ
+ * 「setup」で tako setup を走らせる）/ crates/tako-cli/src/setup.rs の出力の形。パスは架空（~ 起点）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import OsTerminal from '../motion/OsTerminal.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import WelcomeBanner from '../motion/WelcomeBanner.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import Cmd from '../motion/Cmd.astro';
+---
+
+<Scrolly label="macOS に入れる流れ">
+	<div slot="stage" class="tk-stack">
+		<div data-at="1-2" data-fx="fade">
+			<OsTerminal os="mac" height={25}>
+				<span class="tk-l"><span class="tk-p">~ %</span> <span data-at="1+" data-fx="type">brew install --cask takushio2525/tako/tako</span></span>
+				<span class="tk-l tk-dim" data-at="2">==&gt; Downloading tako-vX.Y.Z-macos-arm64.zip</span>
+				<span class="tk-l tk-dim" data-at="2" style="--d: .3s">==&gt; Installing Cask tako</span>
+				<span class="tk-l" data-at="2" style="--d: .6s">==&gt; Moving App 'tako.app' to '/Applications/tako.app'</span>
+				<span class="tk-l" data-at="2" style="--d: .9s">==&gt; Linking Binary 'tako' to '/opt/homebrew/bin/tako'</span>
+				<span class="tk-l tk-ok" data-at="2" style="--d: 1.2s">tako was successfully installed!</span>
+				<span class="tk-l" data-at="2" style="--d: 1.4s"><span class="tk-p">~ %</span> <span class="tk-cur"></span></span>
+			</OsTerminal>
+		</div>
+		<div data-at="3+" data-fx="pop">
+			<TakoWindow
+				tabs={[
+					{ label: '~', activeAt: '3' },
+					{ label: 'setup', at: '4+', activeAt: '4', state: 'running' },
+					{ label: 'my-app', at: '5', activeAt: '5', state: 'running' },
+				]}
+				height={25}
+				cwd="~"
+			>
+				<div slot="banner" data-at="3" data-fx="unfold">
+					<div><WelcomeBanner pressAt="3" /></div>
+				</div>
+				<div class="tk-stack tk-fill" style="flex: 1">
+					<div data-at="3" data-fx="fade" class="tk-split">
+						<Pane n={1} title="~" state="idle" focus>
+							<span class="tk-l"><span class="tk-p">~ ❯</span> <span class="tk-cur"></span></span>
+						</Pane>
+					</div>
+					<div data-at="4" data-fx="fade" class="tk-split">
+						<Pane n={2} title="setup" state="running" focus>
+							<span class="tk-l tk-b">tako セットアップ</span>
+							<span class="tk-l tk-dim">═════════════════</span>
+							<span class="tk-l" data-at="4" style="--d: .2s"><span class="tk-ok">[OK]</span> tako CLI: どのターミナルからも使えます</span>
+							<span class="tk-l" data-at="4" style="--d: .4s"><span class="tk-ok">[OK]</span> シェル統合: 環境変数の注入で有効です</span>
+							<span class="tk-l" data-at="4" style="--d: .6s"><span class="tk-acc">[検出]</span> claude: ~/.local/bin/claude（認証済み）</span>
+							<span class="tk-l" data-at="4" style="--d: .8s"><span class="tk-ok">[OK]</span> tmux: /opt/homebrew/bin/tmux</span>
+							<span class="tk-l" data-at="4" style="--d: 1s"><span class="tk-ok">[OK]</span> Claude MCP: tako が登録済み</span>
+							<span class="tk-l tk-ok tk-b" data-at="4" style="--d: 1.3s">セットアップが完了しました。</span>
+							<span class="tk-l" data-at="4" style="--d: 1.5s">次の一歩:  <span class="tk-acc">tako master</span></span>
+						</Pane>
+					</div>
+					<div data-at="5" data-fx="fade" class="tk-split">
+						<Pane n={3} title="マスター" badge="ORCH" state="running" focus>
+							<span class="tk-l"><span class="tk-p">my-app ❯</span> tako master</span>
+							<span class="tk-l tk-tui-user" data-at="5" style="--d: .3s">隣のペインで ls を実行して</span>
+							<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: .9s">tako_split_pane → ls</span>
+						</Pane>
+						<Pane n={4} title="ls" state="idle" at="5" fx="split" style="--d: 1.1s">
+							<span class="tk-l"><span class="tk-p">my-app ❯</span> ls</span>
+							<span class="tk-l tk-acc">README.md  docs  package.json  src</span>
+						</Pane>
+					</div>
+				</div>
+				<Pointer slot="overlay" path="3:88,26" click="3" />
+			</TakoWindow>
+		</div>
+	</div>
+
+	<Step title="入手する">
+		<p>ターミナル（ターミナル.app で十分です）に 1 行打ちます。Homebrew を使わない場合は、下の「<a href="#方法-b-zip-ダウンロード">ZIP ダウンロード</a>」を見てください。</p>
+		<Cmd>brew install --cask takushio2525/tako/tako</Cmd>
+	</Step>
+	<Step title="インストールされる">
+		<p><code>/Applications/tako.app</code> にアプリが入り、<code>tako</code> コマンドもそのまま使えるようになります。対象は Apple Silicon の Mac です。</p>
+	</Step>
+	<Step title="初回起動">
+		<p>tako を開くと、タブバーの下に「tako へようこそ」が出ます。<strong>「セットアップを実行」</strong>を押します（ターミナルで <code>tako setup</code> と打っても同じです）。</p>
+	</Step>
+	<Step title="セットアップ">
+		<p>新しいタブで <code>tako setup</code> が走り、AI エージェントの検出・MCP の登録・設定ファイルの用意までを自動で済ませます。揃っていれば質問は出ません。ログインだけは人の操作が要るので、残っていれば打つコマンドが最後に並びます。</p>
+	</Step>
+	<Step title="使い始める">
+		<p><code>tako master</code> で司令塔の AI を起動し、「隣のペインで ls を実行して」のように頼んでみます。画面が分割されて隣で動けば、つながっています。</p>
+		<Cmd>tako master</Cmd>
+	</Step>
+</Scrolly>

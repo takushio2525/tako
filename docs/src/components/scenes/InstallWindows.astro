@@ -1,0 +1,99 @@
+---
+/**
+ * 場面: Windows に入れる（入手 → 警告 → インストーラー → 初回起動 → セットアップ）。7 手順。
+ * 事実の出どころ: installer/windows/tako.iss（per-user・PATH 追加は既定オン・Windows 10 1809 以降 x64）/
+ * 台帳 W 節（未署名なので SmartScreen が出ることがある・Windows のメニュー行）/
+ * crates/tako-control/src/shell_integration.rs・setup_deps.rs の出力の形（$PROFILE への管理ブロック・
+ * psmux は winget のコマンドを案内するだけで代行しない）。パスは架空。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import Releases from '../motion/Releases.astro';
+import SmartScreen from '../motion/SmartScreen.astro';
+import Installer from '../motion/Installer.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import WelcomeBanner from '../motion/WelcomeBanner.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import Cmd from '../motion/Cmd.astro';
+---
+
+<Scrolly label="Windows に入れる流れ">
+	<div slot="stage" class="tk-stack">
+		<div data-at="1" data-fx="fade">
+			<Releases highlight="win-exe" highlightAt="1" height={25}>
+				<Pointer slot="overlay" path="1:58,61" click="1" />
+			</Releases>
+		</div>
+		<div data-at="2-3" data-fx="fade">
+			<SmartScreen detailAt="3" height={25}>
+				<Pointer slot="overlay" path="2:15,40 3:65,82" click="2 3" />
+			</SmartScreen>
+		</div>
+		<div data-at="4-5" data-fx="fade">
+			<Installer tasksAt="4" doneAt="5" height={25}>
+				<Pointer slot="overlay" path="4:75,93 5:75,93" click="4 5" />
+			</Installer>
+		</div>
+		<div data-at="6+" data-fx="pop">
+			<TakoWindow
+				os="windows"
+				tabs={[
+					{ label: 'my-app', activeAt: '6' },
+					{ label: 'setup', at: '7', activeAt: '7', state: 'running' },
+				]}
+				height={25}
+				cwd="~\my-app"
+			>
+				<div slot="banner" data-at="6" data-fx="unfold">
+					<div><WelcomeBanner pressAt="6" /></div>
+				</div>
+				<div class="tk-stack tk-fill" style="flex: 1">
+					<div data-at="6" data-fx="fade" class="tk-split">
+						<Pane n={1} title="my-app" state="idle" focus>
+							<span class="tk-l"><span class="tk-p">PS C:\Users\winuser\my-app&gt;</span> <span class="tk-cur"></span></span>
+						</Pane>
+					</div>
+					<div data-at="7" data-fx="fade" class="tk-split">
+						<Pane n={2} title="setup" state="running" focus>
+							<span class="tk-l tk-b">tako セットアップ</span>
+							<span class="tk-l tk-dim">═════════════════</span>
+							<span class="tk-l" data-at="7" style="--d: .2s"><span class="tk-acc">[設定]</span> シェル統合: PowerShell のプロファイルへ tako の管理ブロックを置きます</span>
+							<span class="tk-l" data-at="7" style="--d: .5s"><span class="tk-ok">[OK]</span> シェル統合: 配置しました</span>
+							<span class="tk-l" data-at="7" style="--d: .7s"><span class="tk-acc">[検出]</span> claude（認証済み）</span>
+							<span class="tk-l" data-at="7" style="--d: .9s"><span class="tk-warn">[任意]</span> psmux: 見つかりません（任意）</span>
+							<span class="tk-l tk-dim" data-at="7" style="--d: 1s">    導入方法: winget install --id marlocarlo.psmux …</span>
+							<span class="tk-l" data-at="7" style="--d: 1.2s"><span class="tk-ok">[OK]</span> Claude MCP: tako が登録済み</span>
+							<span class="tk-l tk-ok tk-b" data-at="7" style="--d: 1.5s">セットアップが完了しました。</span>
+						</Pane>
+					</div>
+				</div>
+				<Pointer slot="overlay" path="6:88,30" click="6" />
+			</TakoWindow>
+		</div>
+	</div>
+
+	<Step title="インストーラーを入手する">
+		<p><a href="https://github.com/takushio2525/tako/releases/latest">GitHub Releases の最新版</a>から <code>tako-vX.Y.Z-windows-x86_64.exe</code> を選んで実行します。インストールせずに使いたいなら、同じ場所の <code>.zip</code>（ポータブル版）でもかまいません。</p>
+	</Step>
+	<Step title="警告が出たら「詳細情報」">
+		<p>署名していない配布物なので、初回は「Windows によって PC が保護されました」と止められることがあります。<strong>「詳細情報」</strong>を押します。</p>
+	</Step>
+	<Step title="「実行」で進む">
+		<p>アプリ名の下に<strong>「実行」</strong>ボタンが出るので、それを押せばインストーラーが始まります。</p>
+	</Step>
+	<Step title="PATH への追加は、そのままオン">
+		<p>「tako を PATH に追加する（推奨）」は最初からオンです。そのまま進めば、どのターミナルからも <code>tako</code> と打てるようになります。<strong>管理者権限は求められません</strong>（自分のユーザーの <code>%LOCALAPPDATA%\Programs\tako</code> に入ります）。</p>
+	</Step>
+	<Step title="完了して、起動">
+		<p>最後の画面の「tako を実行する」がオンのまま「完了」を押すと、tako が起動します。スタートメニューにも「tako」が入ります。</p>
+	</Step>
+	<Step title="初回起動">
+		<p>Windows 版は窓の上端にメニュー（ファイル・編集・表示…）が並び、その下は macOS 版と同じタブとペインです。シェルは PowerShell です。「tako へようこそ」の<strong>「セットアップを実行」</strong>を押します。</p>
+	</Step>
+	<Step title="セットアップ">
+		<p>新しいタブで <code>tako setup</code> が走ります。Windows では、ペインの作業フォルダを追うために <strong>PowerShell のプロファイルへ tako の管理ブロックを 1 つ足します</strong>（何をどこへ書くかを先に表示します。<code>tako shell-integration uninstall</code> で外せます）。</p>
+		<p>再起動しても画面を残す psmux など、入っていない道具は打つコマンドを案内します。あとは macOS と同じく <code>tako master</code> で始められます。</p>
+		<Cmd prompt="PS>">winget install marlocarlo.psmux</Cmd>
+	</Step>
+</Scrolly>

@@ -1,0 +1,17 @@
+---
+/**
+ * 場面（Scrolly）の手順 1 つ。番号は並び順で自動（CSS カウンタ）。
+ * 本文は Markdown のまま書いてよい（段落・`コード`・リンク・<Cmd />）。
+ */
+interface Props {
+	/** 手順の見出し（短く。何が起きるか） */
+	title: string;
+}
+
+const { title } = Astro.props;
+---
+
+<li class="tk-step">
+	<p class="tk-step-head"><span class="tk-step-title">{title}</span></p>
+	<div class="tk-step-body"><slot /></div>
+</li>

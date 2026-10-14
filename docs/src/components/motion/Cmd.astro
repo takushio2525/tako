@@ -1,0 +1,45 @@
+---
+/**
+ * 打つコマンド 1 行（コピーのボタン付き）。手順の本文やページ本文に置く。
+ * 案内するコマンドは最も簡単な形にする（AGENTS.md の #322: 既定値で済む引数を付けない）。
+ *
+ *   <Cmd>tako setup</Cmd>
+ *   <Cmd prompt="PS>">winget install --id marlocarlo.psmux</Cmd>
+ */
+import '../../styles/motion.css';
+
+interface Props {
+	/** 行頭の記号（既定 $。PowerShell なら PS>） */
+	prompt?: string;
+}
+
+const { prompt = '$' } = Astro.props;
+const text = (await Astro.slots.render('default')).trim();
+---
+
+<div class="tk-cmd not-content">
+	<code class="tk-cmd-text"><span class="tk-cmd-prompt" aria-hidden="true">{prompt}</span><span data-cmd set:html={text} /></code>
+	<button type="button" class="tk-cmd-copy" data-copy aria-label="コマンドをコピー">
+		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+		<span class="tk-cmd-copy-label">コピー</span>
+	</button>
+</div>
+
+<script>
+	// コピーのボタン（ページに何個あっても 1 回だけ登録される）
+	document.addEventListener('click', async (e) => {
+		const btn = (e.target as Element | null)?.closest<HTMLButtonElement>('.tk-cmd-copy');
+		if (!btn) return;
+		const text = btn.parentElement?.querySelector('[data-cmd]')?.textContent ?? '';
+		const label = btn.querySelector('.tk-cmd-copy-label');
+		try {
+			await navigator.clipboard.writeText(text);
+			if (label) label.textContent = 'コピーしました';
+		} catch {
+			if (label) label.textContent = '選択してコピーしてください';
+		}
+		window.setTimeout(() => {
+			if (label) label.textContent = 'コピー';
+		}, 1600);
+	});
+</script>
