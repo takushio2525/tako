@@ -5053,131 +5053,26 @@ fn dispatch_inner(
             newline,
             tmux_session,
             await_prompt,
+            paste_guard,
         } => {
-            // await_prompt: claude TUI の起動（❯ 表示）を待ってから送達確認つきで送信する。
-            // pane が解決できず tmux_session がある場合はバックグラウンドの tmux 経路で同等を行う
-            if await_prompt {
-                return match resolve_pane(host.workspace(), pane) {
-                    Ok((_, target)) => {
-                        // #1259: 既に未決着のフローがあるなら、この送達はその後ろに並ぶ。
-                        // 「いま何を待っているのか」を queued の応答からそのまま読めるように
-                        // 積む**前**の状態を採る（無ければ queued）。
-                        // #1292: この値は決着済みの前任かもしれないので、未決着だけを
-                        // 通す絞り込みは `queued_json` が行う
-                        let predecessor = host.prompt_delivery_state(target);
-                        host.queue_prompt_flow(target, text.clone());
-                        Ok(queued_json(Some(target), predecessor))
-                    }
-                    Err(e) => match tmux_session {
-                        Some(ref ts) => {
-                            spawn_tmux_delivery(ts.clone(), text.clone(), true);
-                            Ok(queued_json(None, None))
-                        }
-                        None => Err(e),
-                    },
+            // #2050: 鍵らしき文字の判定（AI の送信は警告だけ・人の中継は段に従う）。
+            // 送る前に止めるときは送達の経路へ入らない
+            let (warning, ack) =
+                match send_paste_gate(host, pane, &text, paste_guard.as_deref(), origin)? {
+                    SendGate::Blocked(reply) => return Ok(reply),
+                    SendGate::Pass => (None, None),
+                    SendGate::Deliver { warning, ack } => (warning, ack),
                 };
+            let acked = ack.map(|pane| (pane, text.clone()));
+            let out = send_to_pane(host, pane, text, newline, tmux_session, await_prompt)?;
+            // 届けた値はそのペインの確認済み（mod の送信時の確認で二度確かめない）
+            if let Some((pane, text)) = acked {
+                crate::paste_guard::note_delivered(pane, &text);
             }
-
-            // #748: 選択肢ダイアログ表示中の送信を**入口で断る**。
-            // ダイアログは入力欄を奪っているので、テキストを書けば 1 文字ずつが
-            // ダイアログのキー操作として食われ（数字なら選択が確定してしまう）、
-            // Enter は「今ハイライトされている選択肢の確定」になる。
-            // 実際に観測されたのは limit ダイアログの選択肢テキストが入力欄に
-            // 残ったまま混線する状態（#748 の観測 1 / 4）。
-            // 正しい操作は respond（番号 / ラベル指定 + 実在再検証）なので、
-            // 選択肢一覧つきの明示エラーでそちらへ誘導する
-            if let Some(err) = dialog_blocks_send(host, pane, tmux_session.as_deref(), &text) {
-                return Err(err);
-            }
-
-            // pane ID で解決を試み、失敗時に tmux session フォールバック
-            match resolve_pane(host.workspace(), pane) {
-                Ok((_, target)) => {
-                    let session = host
-                        .session(target)
-                        .ok_or(DispatchError::NoSession(target.as_u64()))?;
-                    if session.is_alt_screen() {
-                        // Enter 単独送信（text が空 / 改行のみ）は送達確認つき Enter フローへ
-                        // （Issue #95: 素の CR 1 発は claude TUI に取りこぼされることがあり、
-                        // LF は「改行挿入」と解釈され送信にならない）
-                        if send_is_enter_only(&text, newline) {
-                            let predecessor = host.prompt_delivery_state(target);
-                            host.queue_enter_flow(target);
-                            return Ok(queued_json(Some(target), predecessor));
-                        }
-                        // 全画面 TUI（claude 等）への改行つき送信は送達確認フローへ（Issue #32:
-                        // 一括書き込みは改行が「送信」と解釈されず入力欄に残留する）
-                        if newline {
-                            let predecessor = host.prompt_delivery_state(target);
-                            host.queue_send_flow(target, text.clone());
-                            return Ok(queued_json(Some(target), predecessor));
-                        }
-                    }
-                    // シェルへの送信は従来どおり即時書き込み（挙動・レイテンシ据え置き）。
-                    // キーボード入力の意味論で書くため LF は Enter（CR）へ正規化する
-                    // （Issue #95: 端末の Enter は CR。LF のままだと claude 等の TUI で
-                    // 送信にならない）
-                    let normalized = normalize_newlines_for_keys(&text);
-                    // #907: 器の client が ASCII しか運べない（psmux）なら、本文は
-                    // 打鍵ではなく**器の注入口**へ入れる。実機実測で打鍵経路は
-                    // cp932 に無い文字（`─` / `❯` 等）を黙って落とす。Enter は ASCII なので
-                    // 従来どおり「貼り付けと分離した単独キー」として打鍵で送る（#95 / #32）
-                    let injected = crate::delivery::inject_non_ascii(
-                        host.backend_session(target).as_deref(),
-                        &normalized,
-                    );
-                    let payload = match (&injected, newline) {
-                        // 注入に成功したら本文は打鍵しない（Enter だけ送る）
-                        (Ok(true), true) => "\r".to_string(),
-                        (Ok(true), false) => String::new(),
-                        (_, true) => format!("{normalized}\r"),
-                        (_, false) => normalized.clone(),
-                    };
-                    if !payload.is_empty() {
-                        session.write(payload.into_bytes());
-                    }
-                    Ok(Value::Null)
-                }
-                Err(e) => {
-                    if let Some(ref ts) = tmux_session {
-                        if newline {
-                            // 改行つき送信は送達確認つき配送（対象が claude TUI なら
-                            // 貼り付け + 分離 Enter + 検証、シェルなら即時に無害劣化。
-                            // text が空 / 改行のみなら Enter 単独送達 = Issue #95）。
-                            // 到達手段の有無は先に境界へ問う: 無いまま投げると
-                            // バックグラウンドスレッドの中で黙って失敗する（縮退が見えない）
-                            if crate::reach::detached_session(ts).is_none() {
-                                return Err(DispatchError::Operation(
-                                    crate::reach::UnreachableReason::NoDetachedAccess {
-                                        session: ts.clone(),
-                                        note: crate::reach::no_detached_access_note(),
-                                    }
-                                    .note(),
-                                ));
-                            }
-                            spawn_tmux_delivery(ts.clone(), text.clone(), false);
-                            Ok(queued_json(None, None))
-                        } else {
-                            let (session, access) =
-                                crate::reach::detached_session(ts).ok_or_else(|| {
-                                    DispatchError::Operation(
-                                        crate::reach::UnreachableReason::NoDetachedAccess {
-                                            session: ts.clone(),
-                                            note: crate::reach::no_detached_access_note(),
-                                        }
-                                        .note(),
-                                    )
-                                })?;
-                            access
-                                .send_text(&session, &normalize_newlines_for_keys(&text))
-                                .map_err(|e| DispatchError::Operation(e.to_string()))?;
-                            Ok(Value::Null)
-                        }
-                    } else {
-                        Err(e)
-                    }
-                }
-            }
+            Ok(match warning {
+                Some(warning) => with_paste_guard(out, warning),
+                None => out,
+            })
         }
 
         Request::Read {
@@ -6343,43 +6238,89 @@ fn dispatch_inner(
             enabled,
             check,
             respond,
+            mode,
+            allow,
+            unallow,
+            rules,
+            pane,
         } => {
+            use tako_core::paste_guard as pg;
             // 答えの綴りを先に検証する（不正な綴りで on / off だけ効いた状態を作らない）
             let answer = respond
                 .as_deref()
                 .map(|r| {
-                    tako_core::paste_guard::Answer::parse(r).ok_or_else(|| {
+                    pg::Answer::parse(r).ok_or_else(|| {
                         DispatchError::InvalidParams(format!(
                             "respond は {} のどれか（指定: {r}）",
-                            tako_core::paste_guard::Answer::VALUES.join(" / ")
+                            pg::Answer::VALUES.join(" / ")
                         ))
                     })
                 })
                 .transpose()?;
+            if pane.is_some() && check.is_none() {
+                return Err(DispatchError::InvalidParams(
+                    "pane は判定する文字（check / text）と一緒に渡す".into(),
+                ));
+            }
+            // #2050: 段・許可リスト・規則は写しの上で全部当ててから 1 回で反映する
+            // （途中の綴りの誤りで半端に変わった状態を作らない）
+            let mut added: Option<Vec<pg::AllowEntry>> = None;
+            let mut removed: Option<usize> = None;
+            let policy_change =
+                if mode.is_some() || allow.is_some() || unallow.is_some() || rules.is_some() {
+                    let mut policy = host.paste_guard_policy_base();
+                    if let Some(m) = mode.as_deref() {
+                        policy.mode = pg::Mode::parse(m).ok_or_else(|| {
+                            DispatchError::InvalidParams(format!(
+                                "mode は {} のどれか（指定: {m}）",
+                                pg::Mode::VALUES.join(" / ")
+                            ))
+                        })?;
+                    }
+                    for (name, on) in rules.iter().flatten() {
+                        policy
+                            .set_rule(name, *on)
+                            .map_err(DispatchError::InvalidParams)?;
+                    }
+                    if let Some(id) = unallow.as_deref() {
+                        removed = Some(policy.unallow(id).map_err(DispatchError::InvalidParams)?);
+                    }
+                    if let Some(text) = allow.as_deref() {
+                        added = Some(
+                            policy
+                                .allow_text(text)
+                                .map_err(DispatchError::InvalidParams)?,
+                        );
+                    }
+                    Some(policy)
+                } else {
+                    None
+                };
             if let Some(enabled) = enabled {
                 host.set_paste_guard(enabled);
+            }
+            if let Some(policy) = policy_change {
+                host.set_paste_guard_policy(policy);
             }
             if let Some(answer) = answer {
                 host.answer_paste_guard(answer)
                     .map_err(DispatchError::Operation)?;
             }
-            let mut out = paste_guard_json(&host.paste_guard_status());
+            let status = host.paste_guard_status();
+            let mut out = paste_guard_json(&status);
             if let Some(answer) = answer {
                 out["responded"] = json!(answer.as_str());
             }
+            if let Some(added) = &added {
+                // 足した行（伏せ字と ID だけ。0 件 = 当たる箇所が無い・もう許可済み）
+                out["allowed"] = Value::Array(added.iter().map(allow_entry_json).collect());
+            }
+            if let Some(n) = removed {
+                out["unallowed"] = json!(n);
+            }
             // 判定だけを試す（GUI の貼り付けと同じ 1 実装。応答は伏せ字だけ）
             if let Some(text) = check {
-                let started = std::time::Instant::now();
-                let report = tako_core::paste_guard::scan(&text);
-                let elapsed_us = started.elapsed().as_micros() as u64;
-                out["check"] = json!({
-                    "hit": report.hit(),
-                    "findings": paste_guard_findings_json(&report.findings),
-                    "bytes": report.total_bytes,
-                    "scanned_bytes": report.scanned_bytes,
-                    "truncated": report.truncated(),
-                    "elapsed_us": elapsed_us,
-                });
+                out["check"] = paste_guard_check_json(&status, &text, pane);
             }
             Ok(out)
         }
@@ -19572,6 +19513,258 @@ fn encoding_str(encoding: tako_core::mouse_forward::Encoding) -> &'static str {
     }
 }
 
+/// `Request::Send` の貼り付けの確認の結果（#2050）
+enum SendGate {
+    /// 判定しない・当たらない
+    Pass,
+    /// 送らずにこの応答を返す（人の中継で確認の段）
+    Blocked(Value),
+    /// 送る。`warning` は応答に足す警告、`ack` は届けたら確認済みとして覚えるペイン
+    Deliver {
+        warning: Option<Value>,
+        ack: Option<u64>,
+    },
+}
+
+/// `tako send` / MCP `tako_send_input`・スマホの入力の貼り付けの確認（#2050。判定は
+/// `tako_core::paste_guard::scan_with` の 1 実装）。
+///
+/// - 印なし（AI・スクリプトの送信）: **止めずに送り**、応答に規則名と伏せ字を付ける。AI は確認に
+///   答えられず、止めると正当な自動化（トークンを渡すセットアップ等）が壊れる。値は送り手の文脈に
+///   既にあるので、止めても守れるものが無い
+/// - `human`（スマホの入力の中継）: 段に従う = 確認の段なら送らずに `sent: false` と伏せ字を返し、
+///   PWA が「送る / やめる」を出す。警告だけの段なら送って警告を返す
+/// - `confirmed`（人が確かめた）: 送る
+///
+/// 届けた値はそのペインの確認済みとして覚える（呼び手が送達の成功後に。mod の送信時の確認で
+/// 二度確かめない）。GUI 自身の送信（スラッシュのボタン・ファイルのドロップ = tako が組んだ文字）は見ない
+fn send_paste_gate(
+    host: &mut dyn ControlHost,
+    pane: Option<u64>,
+    text: &str,
+    relay: Option<&str>,
+    origin: PaneOrigin,
+) -> Result<SendGate, DispatchError> {
+    use crate::paste_guard::{self as state, Route};
+    use tako_core::paste_guard as pg;
+    let relay = relay
+        .map(|r| {
+            pg::Relay::parse(r).ok_or_else(|| {
+                DispatchError::InvalidParams(format!(
+                    "paste_guard は {} のどれか（指定: {r}）",
+                    pg::Relay::VALUES.join(" / ")
+                ))
+            })
+        })
+        .transpose()?;
+    if relay.is_none() && origin == PaneOrigin::User {
+        return Ok(SendGate::Pass);
+    }
+    let status = host.paste_guard_status();
+    if !status.enabled || pg::legacy_2050() || text.is_empty() {
+        return Ok(SendGate::Pass);
+    }
+    let target = resolve_pane(host.workspace(), pane)
+        .ok()
+        .map(|(_, t)| t.as_u64());
+    let route = if relay.is_some() {
+        Route::Remote
+    } else {
+        Route::Send
+    };
+    let report = pg::scan_with(text, &status.policy);
+    state::count(route, |c| c.checked += 1);
+    if !report.hit() {
+        return Ok(SendGate::Pass);
+    }
+    let log_pane = target.unwrap_or(0);
+    if relay == Some(pg::Relay::Confirmed) {
+        crate::diag::persist_log(&pg::log_line("remote:confirmed", log_pane, &report));
+        return Ok(SendGate::Deliver {
+            warning: None,
+            ack: target,
+        });
+    }
+    let verdict = pg::Verdict::of(true, status.policy.mode, relay.is_some());
+    let warning = json!({
+        "verdict": verdict.as_str(),
+        "rules": report.rules().iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+        "findings": paste_guard_findings_json(&report.findings),
+        "truncated": report.truncated(),
+    });
+    if verdict == pg::Verdict::Confirm {
+        state::count(route, |c| c.prompted += 1);
+        crate::diag::persist_log(&pg::log_line("remote:confirm", log_pane, &report));
+        return Ok(SendGate::Blocked(json!({
+            "sent": false,
+            "paste_guard": warning,
+        })));
+    }
+    state::count(route, |c| c.warned += 1);
+    crate::diag::persist_log(&pg::log_line(
+        if relay.is_some() {
+            "remote:warn"
+        } else {
+            "send:warn"
+        },
+        log_pane,
+        &report,
+    ));
+    Ok(SendGate::Deliver {
+        warning: Some(warning),
+        ack: target,
+    })
+}
+
+/// 送信の応答に貼り付けの確認の警告を足す（#2050。シェルへの即時書き込みの応答は `null` なので
+/// そのときは警告だけのオブジェクトにする）
+fn with_paste_guard(out: Value, warning: Value) -> Value {
+    match out {
+        Value::Object(mut map) => {
+            map.insert("paste_guard".into(), warning);
+            Value::Object(map)
+        }
+        Value::Null => json!({ "paste_guard": warning }),
+        other => json!({ "result": other, "paste_guard": warning }),
+    }
+}
+
+/// ペインへのテキスト送信の本体（FR-2.2.2。`Request::Send` の腕から #2050 で関数へ出した。
+/// 中身は変えていない = 送達の経路・応答の形は #2050 前と同じ）
+fn send_to_pane(
+    host: &mut dyn ControlHost,
+    pane: Option<u64>,
+    text: String,
+    newline: bool,
+    tmux_session: Option<String>,
+    await_prompt: bool,
+) -> Result<Value, DispatchError> {
+    // await_prompt: claude TUI の起動（❯ 表示）を待ってから送達確認つきで送信する。
+    // pane が解決できず tmux_session がある場合はバックグラウンドの tmux 経路で同等を行う
+    if await_prompt {
+        return match resolve_pane(host.workspace(), pane) {
+            Ok((_, target)) => {
+                // #1259: 既に未決着のフローがあるなら、この送達はその後ろに並ぶ。
+                // 「いま何を待っているのか」を queued の応答からそのまま読めるように
+                // 積む**前**の状態を採る（無ければ queued）。
+                // #1292: この値は決着済みの前任かもしれないので、未決着だけを
+                // 通す絞り込みは `queued_json` が行う
+                let predecessor = host.prompt_delivery_state(target);
+                host.queue_prompt_flow(target, text.clone());
+                Ok(queued_json(Some(target), predecessor))
+            }
+            Err(e) => match tmux_session {
+                Some(ref ts) => {
+                    spawn_tmux_delivery(ts.clone(), text.clone(), true);
+                    Ok(queued_json(None, None))
+                }
+                None => Err(e),
+            },
+        };
+    }
+
+    // #748: 選択肢ダイアログ表示中の送信を**入口で断る**。
+    // ダイアログは入力欄を奪っているので、テキストを書けば 1 文字ずつが
+    // ダイアログのキー操作として食われ（数字なら選択が確定してしまう）、
+    // Enter は「今ハイライトされている選択肢の確定」になる。
+    // 実際に観測されたのは limit ダイアログの選択肢テキストが入力欄に
+    // 残ったまま混線する状態（#748 の観測 1 / 4）。
+    // 正しい操作は respond（番号 / ラベル指定 + 実在再検証）なので、
+    // 選択肢一覧つきの明示エラーでそちらへ誘導する
+    if let Some(err) = dialog_blocks_send(host, pane, tmux_session.as_deref(), &text) {
+        return Err(err);
+    }
+
+    // pane ID で解決を試み、失敗時に tmux session フォールバック
+    match resolve_pane(host.workspace(), pane) {
+        Ok((_, target)) => {
+            let session = host
+                .session(target)
+                .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            if session.is_alt_screen() {
+                // Enter 単独送信（text が空 / 改行のみ）は送達確認つき Enter フローへ
+                // （Issue #95: 素の CR 1 発は claude TUI に取りこぼされることがあり、
+                // LF は「改行挿入」と解釈され送信にならない）
+                if send_is_enter_only(&text, newline) {
+                    let predecessor = host.prompt_delivery_state(target);
+                    host.queue_enter_flow(target);
+                    return Ok(queued_json(Some(target), predecessor));
+                }
+                // 全画面 TUI（claude 等）への改行つき送信は送達確認フローへ（Issue #32:
+                // 一括書き込みは改行が「送信」と解釈されず入力欄に残留する）
+                if newline {
+                    let predecessor = host.prompt_delivery_state(target);
+                    host.queue_send_flow(target, text.clone());
+                    return Ok(queued_json(Some(target), predecessor));
+                }
+            }
+            // シェルへの送信は従来どおり即時書き込み（挙動・レイテンシ据え置き）。
+            // キーボード入力の意味論で書くため LF は Enter（CR）へ正規化する
+            // （Issue #95: 端末の Enter は CR。LF のままだと claude 等の TUI で
+            // 送信にならない）
+            let normalized = normalize_newlines_for_keys(&text);
+            // #907: 器の client が ASCII しか運べない（psmux）なら、本文は
+            // 打鍵ではなく**器の注入口**へ入れる。実機実測で打鍵経路は
+            // cp932 に無い文字（`─` / `❯` 等）を黙って落とす。Enter は ASCII なので
+            // 従来どおり「貼り付けと分離した単独キー」として打鍵で送る（#95 / #32）
+            let injected = crate::delivery::inject_non_ascii(
+                host.backend_session(target).as_deref(),
+                &normalized,
+            );
+            let payload = match (&injected, newline) {
+                // 注入に成功したら本文は打鍵しない（Enter だけ送る）
+                (Ok(true), true) => "\r".to_string(),
+                (Ok(true), false) => String::new(),
+                (_, true) => format!("{normalized}\r"),
+                (_, false) => normalized.clone(),
+            };
+            if !payload.is_empty() {
+                session.write(payload.into_bytes());
+            }
+            Ok(Value::Null)
+        }
+        Err(e) => {
+            if let Some(ref ts) = tmux_session {
+                if newline {
+                    // 改行つき送信は送達確認つき配送（対象が claude TUI なら
+                    // 貼り付け + 分離 Enter + 検証、シェルなら即時に無害劣化。
+                    // text が空 / 改行のみなら Enter 単独送達 = Issue #95）。
+                    // 到達手段の有無は先に境界へ問う: 無いまま投げると
+                    // バックグラウンドスレッドの中で黙って失敗する（縮退が見えない）
+                    if crate::reach::detached_session(ts).is_none() {
+                        return Err(DispatchError::Operation(
+                            crate::reach::UnreachableReason::NoDetachedAccess {
+                                session: ts.clone(),
+                                note: crate::reach::no_detached_access_note(),
+                            }
+                            .note(),
+                        ));
+                    }
+                    spawn_tmux_delivery(ts.clone(), text.clone(), false);
+                    Ok(queued_json(None, None))
+                } else {
+                    let (session, access) =
+                        crate::reach::detached_session(ts).ok_or_else(|| {
+                            DispatchError::Operation(
+                                crate::reach::UnreachableReason::NoDetachedAccess {
+                                    session: ts.clone(),
+                                    note: crate::reach::no_detached_access_note(),
+                                }
+                                .note(),
+                            )
+                        })?;
+                    access
+                        .send_text(&session, &normalize_newlines_for_keys(&text))
+                        .map_err(|e| DispatchError::Operation(e.to_string()))?;
+                    Ok(Value::Null)
+                }
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// 当たった箇所の一覧（#2046）。**伏せ字だけ**を載せる（生の値は `Finding` 自体が持たない）
 fn paste_guard_findings_json(findings: &[tako_core::paste_guard::Finding]) -> Value {
     Value::Array(
@@ -19588,14 +19781,104 @@ fn paste_guard_findings_json(findings: &[tako_core::paste_guard::Finding]) -> Va
     )
 }
 
+/// 許可リストの 1 行の応答（#2050。ID・規則名・伏せ字だけ。指紋の全体は出さない）
+fn allow_entry_json(entry: &tako_core::paste_guard::AllowEntry) -> Value {
+    json!({
+        "id": entry.id(),
+        "rule": entry.rule,
+        "masked": entry.masked,
+    })
+}
+
+/// `check` の応答（#2046 / #2050）。段・許可リスト・無効にした規則を当てた判定で、
+/// `pane` があれば mod の送信時の確認（2 段目）= そのペインへ tako が流した値・人が確かめた値を
+/// 外した上の `verdict` を返し、経路の累計と persist.log の 1 行（規則名と件数だけ）を残す
+fn paste_guard_check_json(
+    status: &tako_core::paste_guard::PasteGuardStatus,
+    text: &str,
+    pane: Option<u64>,
+) -> Value {
+    use crate::paste_guard::{self as state, Route};
+    use tako_core::paste_guard as pg;
+    let legacy = pg::legacy_2050();
+    let policy = if legacy {
+        pg::Policy::default()
+    } else {
+        status.policy.clone()
+    };
+    let started = std::time::Instant::now();
+    let report = pg::scan_with(text, &policy);
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    let send_check = pane.filter(|_| !legacy);
+    let findings: Vec<pg::Finding> = match send_check {
+        Some(p) => {
+            let acked = state::acknowledged(p, &pg::fingerprints(text, &report));
+            report
+                .findings
+                .iter()
+                .zip(acked)
+                .filter(|(_, acked)| !acked)
+                .map(|(f, _)| f.clone())
+                .collect()
+        }
+        None => report.findings.clone(),
+    };
+    let acknowledged = report.findings.len() - findings.len();
+    // A/B の旧挙動では mod の送信時の確認は無い（常に通す）
+    let verdict = if !status.enabled || (pane.is_some() && legacy) {
+        pg::Verdict::Pass
+    } else {
+        pg::Verdict::of(!findings.is_empty(), policy.mode, true)
+    };
+    if let (Some(p), true) = (send_check, status.enabled) {
+        state::count(Route::Mod, |c| {
+            c.checked += 1;
+            match verdict {
+                pg::Verdict::Warn => c.warned += 1,
+                pg::Verdict::Confirm => c.prompted += 1,
+                pg::Verdict::Pass if acknowledged > 0 => c.acknowledged += 1,
+                pg::Verdict::Pass => {}
+            }
+        });
+        if report.hit() {
+            crate::diag::persist_log(&pg::log_line(
+                &format!("mod:{}", verdict.as_str()),
+                p,
+                &report,
+            ));
+        }
+    }
+    json!({
+        "hit": !findings.is_empty(),
+        "verdict": verdict.as_str(),
+        "findings": paste_guard_findings_json(&findings),
+        "allowed": report.allowed,
+        "disabled": report.disabled,
+        "acknowledged": acknowledged,
+        "bytes": report.total_bytes,
+        "scanned_bytes": report.scanned_bytes,
+        "truncated": report.truncated(),
+        "elapsed_us": elapsed_us,
+    })
+}
+
 /// 貼り付けの確認の応答（#2046。`tako paste-guard` / MCP `tako_settings` の action=paste_guard）。
-/// `stats` は起動からの累計（2 回読んだ差で効いているかを外から確かめる口）
+/// `stats` は起動からの累計（2 回読んだ差で効いているかを外から確かめる口）。
+/// #2050: 段・許可リスト（ID と伏せ字だけ）・無効にした規則・経路ごとの累計
 fn paste_guard_json(status: &tako_core::paste_guard::PasteGuardStatus) -> Value {
     use tako_core::paste_guard as pg;
+    let shared = crate::paste_guard::status_json();
     json!({
         "enabled": status.enabled,
         "default": pg::DEFAULT_ENABLED,
         "legacy": status.legacy,
+        "legacy_2050": pg::legacy_2050(),
+        "mode": status.policy.mode.as_str(),
+        "allow": status.policy.allow.iter().map(allow_entry_json).collect::<Vec<_>>(),
+        "disabled_rules": status.policy.disabled_rules,
+        "rule_names": pg::Rule::ALL.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+        "routes": shared["routes"],
+        "acknowledged_values": shared["acknowledged_values"],
         "max_scan_bytes": pg::MAX_SCAN_BYTES,
         "pending": status.pending.as_ref().map(|p| json!({
             "pane": p.pane,
@@ -19608,6 +19891,7 @@ fn paste_guard_json(status: &tako_core::paste_guard::PasteGuardStatus) -> Value 
             "prompted": status.stats.prompted,
             "sent": status.stats.sent,
             "cancelled": status.stats.cancelled,
+            "warned": status.stats.warned,
             "last_scan_us": status.stats.last_scan_us,
             "last_scanned_bytes": status.stats.last_scanned_bytes,
         },
@@ -21132,6 +21416,7 @@ fn deliver_user_task_response(
                     newline: true,
                     tmux_session: None,
                     await_prompt: true,
+                    paste_guard: None,
                 },
                 PaneOrigin::User,
             ) {
@@ -23051,6 +23336,9 @@ mod tests {
         fn set_paste_guard(&mut self, enabled: bool) {
             self.paste_guard.enabled = enabled;
         }
+        fn set_paste_guard_policy(&mut self, policy: tako_core::paste_guard::Policy) {
+            self.paste_guard.policy = policy;
+        }
         fn answer_paste_guard(
             &mut self,
             answer: tako_core::paste_guard::Answer,
@@ -24147,6 +24435,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: true,
+                paste_guard: None,
             },
             PaneOrigin::Mcp,
         )
@@ -24191,6 +24480,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: true,
+                paste_guard: None,
             },
             PaneOrigin::Mcp,
         )
@@ -24281,6 +24571,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: true,
+                paste_guard: None,
             },
             PaneOrigin::Mcp,
         )
@@ -24319,6 +24610,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: true,
+                paste_guard: None,
             },
             PaneOrigin::Mcp,
         )
@@ -24340,6 +24632,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: true,
+                paste_guard: None,
             },
             PaneOrigin::Mcp,
         )
@@ -26196,6 +26489,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: false,
+                paste_guard: None,
             },
             PaneOrigin::Cli,
         )
@@ -29329,6 +29623,11 @@ mod tests {
             enabled,
             check: check.map(str::to_string),
             respond: respond.map(str::to_string),
+            mode: None,
+            allow: None,
+            unallow: None,
+            rules: None,
+            pane: None,
         };
         // 既定 on・確認待ちなし・判定なし
         let status = dispatch(&mut host, req(None, None, None), PaneOrigin::Cli).unwrap();
@@ -29404,6 +29703,225 @@ mod tests {
         assert_eq!(answered["responded"], "cancel");
         assert!(answered["pending"].is_null());
         assert_eq!(host.paste_answers, vec![pg::Answer::Cancel]);
+    }
+
+    /// #2050 のテスト用: JSON の params から `Request::PasteGuard` / `Request::Send` を組む
+    fn req_of(method: &str, params: Value) -> Request {
+        serde_json::from_value(json!({ "method": method, "params": params })).unwrap()
+    }
+
+    fn fake_github() -> String {
+        format!("{}{}", "ghp_", "EXAMPLE0123456789abcdefghijklmnopqrst")
+    }
+
+    fn fake_google() -> String {
+        format!("{}{}", "AIza", "EXAMPLE-abcdefghijklmnopqrstuvwxyz0")
+    }
+
+    /// #2050: 段・許可リスト・規則は 1 つの口で変わり、綴りの誤りは何も変えずに断る。
+    /// 応答に生の値を載せない（許可リストは ID・規則名・伏せ字だけ）
+    #[test]
+    fn issue2050_段と許可リストと規則を1つの口で変え本文を載せない() {
+        use tako_core::paste_guard as pg;
+        let mut host = MockHost::new();
+        let status =
+            dispatch(&mut host, req_of("paste_guard", json!({})), PaneOrigin::Cli).unwrap();
+        assert_eq!(status["mode"], "confirm");
+        assert_eq!(status["allow"], json!([]));
+        assert_eq!(
+            status["rule_names"].as_array().unwrap().len(),
+            pg::Rule::ALL.len()
+        );
+        assert!(status["routes"]["send"]["checked"].is_u64());
+
+        // 段・規則・許可を 1 回で当てる
+        let google = fake_google();
+        let changed = dispatch(
+            &mut host,
+            req_of(
+                "paste_guard",
+                json!({ "mode": "warn", "rules": { "high_entropy": false }, "allow": format!("key={google}") }),
+            ),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(changed["mode"], "warn");
+        assert_eq!(changed["disabled_rules"], json!(["high_entropy"]));
+        assert_eq!(changed["allowed"][0]["rule"], "google_api_key");
+        let id = changed["allowed"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(id.len(), 12);
+        assert_eq!(changed["allow"][0]["id"], id.as_str());
+        assert_eq!(host.paste_guard.policy.mode, pg::Mode::Warn);
+        let rendered = changed.to_string();
+        assert!(!rendered.contains(&google[4..]), "応答に生の値: {rendered}");
+        assert!(
+            !rendered.contains(&host.paste_guard.policy.allow[0].fingerprint),
+            "指紋の全体も出さない"
+        );
+
+        // 許可した値は check で当たらず、混ぜた秘密だけが当たる
+        let mixed = format!("{google}\n{}", fake_github());
+        let checked = dispatch(
+            &mut host,
+            req_of("paste_guard", json!({ "check": mixed })),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(checked["check"]["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(checked["check"]["findings"][0]["rule"], "github_token");
+        assert_eq!(checked["check"]["allowed"], 1);
+        assert_eq!(checked["check"]["verdict"], "warn", "警告だけの段");
+
+        // 綴りの誤りは何も変えない（段の誤り・規則名の誤り・外す ID の誤り）
+        let before = host.paste_guard.policy.clone();
+        for bad in [
+            json!({ "mode": "silent", "rules": { "jwt": false } }),
+            json!({ "mode": "confirm", "rules": { "nope": false } }),
+            json!({ "enabled": false, "unallow": "zz" }),
+            json!({ "pane": 3 }),
+        ] {
+            let r = dispatch(
+                &mut host,
+                req_of("paste_guard", bad.clone()),
+                PaneOrigin::Cli,
+            );
+            assert!(
+                matches!(r, Err(DispatchError::InvalidParams(_))),
+                "{bad}: {r:?}"
+            );
+            assert_eq!(host.paste_guard.policy, before, "{bad}");
+            assert!(host.paste_guard.enabled, "{bad}");
+        }
+
+        // 外す・戻す
+        let un = dispatch(
+            &mut host,
+            req_of(
+                "paste_guard",
+                json!({ "unallow": id, "mode": "confirm", "rules": { "high_entropy": true } }),
+            ),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(un["unallowed"], 1);
+        assert!(host.paste_guard.policy.is_default());
+    }
+
+    /// #2050: mod の送信時の確認（check + pane）は、そのペインへ tako が流した値・人が確かめた値を
+    /// 外し、段に従った verdict を返す。off なら pass
+    #[test]
+    fn issue2050_modの送信時の確認はペインごとの確認済みを外す() {
+        let mut host = MockHost::new();
+        // 静的な確認済みの表を他のテストと分け合うので、固有のペイン番号を使う
+        let (mine, other) = (9_205_001_u64, 9_205_002_u64);
+        let secret = fake_github();
+        let text = format!("これ使って {secret}");
+        let check = |host: &mut MockHost, pane: u64| {
+            dispatch(
+                host,
+                req_of("paste_guard", json!({ "check": text, "pane": pane })),
+                PaneOrigin::Cli,
+            )
+            .unwrap()["check"]
+                .clone()
+        };
+        let first = check(&mut host, mine);
+        assert_eq!(first["verdict"], "confirm");
+        assert_eq!(first["acknowledged"], 0);
+        crate::paste_guard::note_delivered(mine, &format!("worker への指示: {secret}"));
+        let again = check(&mut host, mine);
+        assert_eq!(again["verdict"], "pass", "確認済みの値は二度確かめない");
+        assert_eq!(again["acknowledged"], 1);
+        assert_eq!(again["hit"], false);
+        assert_eq!(
+            check(&mut host, other)["verdict"],
+            "confirm",
+            "別のペインは別"
+        );
+        host.paste_guard.policy.mode = tako_core::paste_guard::Mode::Warn;
+        assert_eq!(check(&mut host, other)["verdict"], "warn");
+        host.paste_guard.enabled = false;
+        let off = check(&mut host, other);
+        assert_eq!(off["verdict"], "pass", "off なら通す");
+        assert_eq!(
+            off["findings"][0]["rule"], "github_token",
+            "判定の中身は見られる"
+        );
+    }
+
+    /// #2050: `tako send` / MCP `tako_send_input` は止めずに送って応答で警告し、スマホの中継
+    /// （paste_guard=human）は確認の段なら送らずに伏せ字を返す。届けた値は確認済みになる
+    #[test]
+    fn issue2050_sendはaiなら警告だけ_人の中継は段に従う() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let secret = fake_github();
+        let send = |relay: Option<&str>| {
+            let mut params = json!({ "pane": pane, "text": format!("export TOKEN={secret}"), "await_prompt": true });
+            if let Some(r) = relay {
+                params["paste_guard"] = json!(r);
+            }
+            req_of("send", params)
+        };
+        // AI（MCP）: 送る + 警告
+        let before = crate::paste_guard::counts(crate::paste_guard::Route::Send);
+        let ai = dispatch(&mut host, send(None), PaneOrigin::Mcp).unwrap();
+        assert_eq!(ai["queued"], true, "送達の応答はそのまま: {ai}");
+        assert_eq!(ai["paste_guard"]["verdict"], "warn");
+        assert_eq!(ai["paste_guard"]["rules"], json!(["github_token"]));
+        assert_eq!(ai["paste_guard"]["findings"][0]["masked"], "ghp_…qrst");
+        assert!(!ai.to_string().contains(&secret[4..]), "{ai}");
+        assert_eq!(host.prompt_flows.len(), 1);
+        let after = crate::paste_guard::counts(crate::paste_guard::Route::Send);
+        assert_eq!(after.warned, before.warned + 1);
+        // 届けた値はそのペインの確認済み（mod は二度確かめない）
+        let fp = tako_core::paste_guard::fingerprint(&secret);
+        assert_eq!(crate::paste_guard::acknowledged(pane, &[fp]), [true]);
+
+        // スマホの中継・確認の段: 送らない
+        let blocked = dispatch(&mut host, send(Some("human")), PaneOrigin::Cli).unwrap();
+        assert_eq!(blocked["sent"], false);
+        assert_eq!(blocked["paste_guard"]["verdict"], "confirm");
+        assert_eq!(
+            host.prompt_flows.len(),
+            1,
+            "確認の段では送達の経路へ入らない"
+        );
+        // 人が確かめた: 送る（警告は付けない）
+        let confirmed = dispatch(&mut host, send(Some("confirmed")), PaneOrigin::Cli).unwrap();
+        assert!(confirmed.get("paste_guard").is_none(), "{confirmed}");
+        assert_eq!(host.prompt_flows.len(), 2);
+        // スマホの中継・警告だけの段: 送って警告
+        host.paste_guard.policy.mode = tako_core::paste_guard::Mode::Warn;
+        let warned = dispatch(&mut host, send(Some("human")), PaneOrigin::Cli).unwrap();
+        assert_eq!(warned["paste_guard"]["verdict"], "warn");
+        assert_eq!(host.prompt_flows.len(), 3);
+        // 綴りの誤り
+        let bad = dispatch(&mut host, send(Some("maybe")), PaneOrigin::Cli);
+        assert!(
+            matches!(bad, Err(DispatchError::InvalidParams(_))),
+            "{bad:?}"
+        );
+        assert_eq!(host.prompt_flows.len(), 3);
+        // GUI 自身の送信（ボタン・ドロップ）は見ない / off なら付けない
+        let gui = dispatch(&mut host, send(None), PaneOrigin::User).unwrap();
+        assert!(gui.get("paste_guard").is_none(), "{gui}");
+        host.paste_guard.enabled = false;
+        let off = dispatch(&mut host, send(Some("human")), PaneOrigin::Cli).unwrap();
+        assert!(off.get("paste_guard").is_none(), "{off}");
+        assert_eq!(host.prompt_flows.len(), 5);
+        // 当たらない普通の文は応答の形を変えない
+        host.paste_guard.enabled = true;
+        let plain = dispatch(
+            &mut host,
+            req_of(
+                "send",
+                json!({ "pane": pane, "text": "cargo test", "await_prompt": true }),
+            ),
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert!(plain.get("paste_guard").is_none(), "{plain}");
     }
 
     /// #1961: AI のクリックは直接ペインなら同期の dispatch で PTY へ、器のペインなら

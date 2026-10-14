@@ -2733,7 +2733,7 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-        // 出自: #459 / #721 / #2046
+        // 出自: #459 / #721 / #2046 / #2050
         json!({
             "name": "tako_settings",
             "description": "設定画面の操作。\
@@ -2741,7 +2741,8 @@ pub fn tools() -> Vec<Value> {
                 action=status: 設定画面が開いているかを返す。\
                 action=paste_guard: 貼り付けに API キー・パスワードらしきものがあれば PTY へ流す前に確かめる機能\
                 （既定 on）。enabled で切替、text で判定だけ試す（応答は規則名と伏せ字のみ）、\
-                respond で確認待ちへ答える。pending が確認待ち。",
+                respond で確認待ちへ答える。pending が確認待ち。mode=warn で止めずに警告だけ、\
+                allow の文字の当たりを許可リストへ（指紋と伏せ字だけ持つ）、unallow で外す、rules で規則ごとに切る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2756,6 +2757,15 @@ pub fn tools() -> Vec<Value> {
                         &tako_core::paste_guard::Answer::VALUES,
                         "確認待ちの貼り付けへの答え（send = 送る / cancel = やめる）",
                     ),
+                    "mode": enum_schema(&tako_core::paste_guard::Mode::VALUES, "当たったとき（既定 confirm）"),
+                    "allow": { "type": "string", "description": "当たりを許可リストへ足す文字" },
+                    "unallow": { "type": "string", "description": "外す許可の ID か all" },
+                    "rules": {
+                        "type": "object",
+                        "additionalProperties": { "type": "boolean" },
+                        "description": "規則名 → 有効か（rule_names）",
+                    },
+                    "pane": { "type": "integer", "minimum": 0, "description": "text をそのペインの送信時の確認として判定" },
                     "tab": {
                         "type": "string",
                         "enum": ["general", "appearance", "runner", "profiles", "setup", "sleep", "remote", "advanced"],

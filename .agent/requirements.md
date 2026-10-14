@@ -2514,12 +2514,43 @@ settings.json を読み直した値ではない（監視は無いので、手で
 | FR-4.12.3 | 判定の正本は `tako_core::paste_guard::scan` の 1 実装（GUI・CLI・MCP が同じ関数）。三段: ①既知の形の表 `SHAPES`（前置詞 + 本体の文字集合 + 長さ。Anthropic / OpenAI / GitHub / GitLab / Slack / Discord の Webhook / AWS / Google / Stripe / npm / Hugging Face / SendGrid）+ 秘密鍵の PEM・JWT・URL に埋め込んだパスワード ②鍵らしい名前への代入の値（`password=…` / `"api_key": "…"`。引用符の無い値は設定・コマンドの書き方 = 詰めた代入か行頭の名前だけ・ASCII・数字か大小混在・置き物の語と式を外す）③空白を含まない 20〜512 文字の塊のうち、英大文字・小文字・数字が混ざり、camelCase で分けた 2 文字以下の語が 3 割以上で、エントロピー 3.3 以上のもの。除外表 `EXCLUSIONS`（URL・data: URI・ファイルパス・UUID・16 進・integrity・SSH の公開鍵・公開の PEM・折り返した base64・ハッシュの見出し・base64 の JSON・区切りの多い名前・base64 のファイルの頭）は行を足すだけで増える。regex は足さない（tako-core の依存に無い） | M |
 | FR-4.12.4 | 画面と応答に出すのは規則名と伏せ字（前置詞 + 末尾 4 文字まで・前置詞が無ければ先頭 3 文字も・本体の 1/3 未満）だけ。`Finding` は生の値を持たない。**本文・伏せ字を診断ログへ出さない**（persist.log へは `paste_guard::log_line` = 規則名・件数・バイト数の 1 行だけ）。番犬 `crates/tako-control/tests/issue2046_paste_guard_watchdog.rs`（関所の迂回・ログ・`PendingPaste` の `Debug`） | M |
 | FR-4.12.5 | 所要: 先頭 64 KB（`MAX_SCAN_BYTES`）だけを見て、採る件数は 100 件（`MAX_FINDINGS`）で打ち切る。最適化ビルドの実測（2026-10-13）: 鍵 1 行 3 µs・普通の 4 KB 44 µs・64 KB のソースコード 0.8 ms・1 MiB 0.5 ms・塊だらけの最悪寄り 0.5 ms（上限を入れる前は代入だらけの 64 KB で 6.6 ms）。打ち切ったことは確認ダイアログに出す | M |
-| FR-4.12.6 | 設定は `settings.json` の `paste_guard`（serde の default = true。**項目の無い旧ファイルも ON で読む** = 古い版が書いた設定で off にならない・移行 Step 不要 = #916）。CLI `tako paste-guard [on\|off\|check\|send\|cancel]` / MCP `tako_settings` の action=paste_guard（`enabled` / `text` / `respond`。ツールは増やさない）/ 設定画面「一般」のトグルが同じ dispatch（`Request::PasteGuard`）を通る。次の貼り付けから効く。A/B は同一バイナリの `TAKO_2046_LEGACY=1`（確認なしで貼る）。実 GUI の検証は `scripts/test-paste-guard-2046.sh`（visual-test `paste-guard`。本物のクリップボードに書かず、visual-test だけの差し込み口から `paste()` を通す） | M |
+| FR-4.12.6 | 設定は `settings.json` の `paste_guard`（serde の default = true。**項目の無い旧ファイルも ON で読む** = 古い版が書いた設定で off にならない・移行 Step 不要 = #916）。CLI `tako paste-guard [on\|off\|warn\|check\|send\|cancel\|allow\|unallow\|rule]` / MCP `tako_settings` の action=paste_guard（`enabled` / `text` / `respond`、#2050 で `mode` / `allow` / `unallow` / `rules` / `pane`。ツールは増やさない）/ 設定画面「一般」のトグルが同じ dispatch（`Request::PasteGuard`）を通る。次の貼り付けから効く。A/B は同一バイナリの `TAKO_2046_LEGACY=1`（確認なしで貼る）。実 GUI の検証は `scripts/test-paste-guard-2046.sh`（visual-test `paste-guard`。本物のクリップボードに書かず、visual-test だけの差し込み口から `paste()` を通す） | M |
 
 実装メモ（2026-10-13、#2046）: 実データ（このリポジトリのソース・docs・git log を 4 KB ずつ 9378 片）で
 当たるのは 7 片で、すべてテストコードの偽の鍵・`token=` を含む URL の断片・PowerShell の base64
 コマンドだった。ランダムな英数 32 文字の検出率は 97.6%（1 万本）。すべて小文字の合言葉・16 進だけの鍵・
 引用符の無いコードの代入は見逃す側に倒している。mod の送信時の 2 段目（Issue 本文の案）と許可リストは範囲外
+（→ #2050 = FR-4.12.7〜）
+
+#### 入力の経路ごとの扱い（Issue #2050 の判断）
+
+判定はどの経路も `tako_core::paste_guard::scan_with` の 1 実装。経路によって変えるのは**当たったときの振る舞い**だけで、
+軸は「送り手が人か（確認に答えられるか）」と「tako 自身が組んだ文字か」。
+
+| 経路 | 送り手 | 当たったとき | 理由 |
+|---|---|---|---|
+| GUI の貼り付け（#2046） | 人 | 段に従う（確認 = ダイアログ / 警告だけ = 送って通知） | 既存 |
+| mod の送信時（`prompt.submit`。出どころ `composer` = その端末での Enter・`bridge` = Remote Control） | 人（打ち込み・tako を通らない貼り付け） | 段に従う（確認 = Claude Code の選択ダイアログで「やめる / 送る」・やめたら送信を落とす / 警告だけ = トースト） | tako を通らない入力の最後の関所。claude の中でしか見えない |
+| mod の送信時・出どころがそれ以外（peer・plugin・通知・予定のトリガー等） | AI・仕組み | **見ない** | 人の入力ではない。止めると自動化が詰まる |
+| スマホ（PWA）の入力（`/api/panes/<id>/input`） | 人 | 段に従う（確認 = **送らずに** 409 と伏せ字 → PWA の確認シート →「送る」で `confirm_secret` を付けて送り直す / 警告だけ = 送って通知） | 人が画面を持っている経路。PC の貼り付けと同じ扱い |
+| `tako send` / MCP `tako_send_input` | AI・スクリプト | **止めずに送り**、応答に `paste_guard`（規則名と伏せ字）を付けるだけ（段に関係なく警告） | AI は確認ダイアログに答えられない。拒否すると正当な自動化（トークンを渡すセットアップ等）が壊れる。値は送り手の AI の文脈に既にあり、止めても守れるものが無い。応答に出せば AI と人の目に入る |
+| GUI 自身の送信（スラッシュのボタン・ファイルのドロップ）・tako が流すプロンプト（worker の初回・引き継ぎ・送達確認つきの送信） | tako | **見ない** | tako が組んだ文字 |
+
+tako がペインへ流した値（AI の送信・worker の初回プロンプト）と人が確かめて送った値は、そのペインの**確認済み**として
+指紋だけをメモリに 10 分覚え、mod の送信時の確認は二度確かめない（GUI で「送る」を選んだ直後の Enter・worker の claude が
+初回プロンプトを送るときに止めない）。
+
+| ID | 要件 | 優先度 |
+|---|---|---|
+| FR-4.12.7 | **段**: settings.json の `paste_guard_policy.mode` = `confirm`（既定・確認）/ `warn`（止めずに警告だけ）。on / off（`paste_guard`）と合わせて「off / 警告だけ / 確認」の 3 段。CLI `tako paste-guard on` = 確認・`warn` = 警告だけ・`off` = 切る。GUI の貼り付けは警告だけの段なら PTY へ流した上で画面の上に小さな通知（規則と伏せ字・数秒で消える・押すと消える）を出す | M |
+| FR-4.12.8 | **許可リスト**: `tako paste-guard allow`（標準入力）/ MCP `allow` に渡した文字の当たりを許可リストへ足す。持つのは**指紋（区切りの語つきの SHA-256）と伏せ字と規則名だけ**（settings.json が `tako config` で他の機器へ渡っても値は渡らない）。外すのは `unallow <ID|all>`（ID = 指紋の先頭 12 文字。一覧は `tako paste-guard` の `allow`）。上限 200 件。許可した値は範囲だけ取って報告しない（同じ文字を後ろの段が拾い直さない）ので、許可した値と秘密が 1 回の貼り付けに混ざっても秘密だけが当たる | M |
+| FR-4.12.9 | **規則ごとの無効化**: `tako paste-guard rule <規則名> on|off` / MCP `rules`（規則名 → 有効か）。名前は `rule_names`（応答）の綴り。無効にした規則の当たりも範囲だけ取って報告しない（無効にした `openai_api_key` の鍵を `high_entropy` が拾い直さない）。知らない名前は断る（綴りの一覧を返す） | M |
+| FR-4.12.10 | **mod の送信時の確認（2 段目）**: tako mod の `prompt.submit` フックが、人の出どころ（`composer` / `bridge`）の送信を `tako paste-guard check --pane <TAKO_PANE_ID>` へ**標準入力で**渡して判定させ（argv・ログに本文を残さない）、`verdict` に従う。`check` に `pane` を添えると、そのペインの確認済みの値を外した上の `verdict`（`pass` / `warn` / `confirm`）と `acknowledged`（外した数）を返す。CLI の失敗・時間切れ（3 秒）・mod の例外では**送信を通す**（壊れた mod が送信を止めない）。mod のデバッグログへは終了コードだけ | M |
+| FR-4.12.11 | **AI の送信**: `Request::Send` は印（`paste_guard`）が無ければ AI・スクリプトの送信として判定し、当たれば送った上で応答に `paste_guard`（`verdict: warn`・規則名・伏せ字）を足す。スマホの中継は印 `human`（段に従う。確認の段なら `sent: false` と伏せ字で返し、送達の経路へ入らない）/ `confirmed`（人が確かめた = 送る）を付ける。GUI 自身の送信（出どころ `User`）は見ない。届けた値はそのペインの確認済みにする（送達に失敗したら覚えない） | M |
+| FR-4.12.12 | 経路ごとの累計は `tako paste-guard` の `routes`（`send` / `remote` / `mod` ごとの `checked` / `warned` / `prompted` / `acknowledged`）と `stats.warned`（GUI の警告だけ）。persist.log へは `paste_guard::log_line` の 1 行（`send:warn` / `remote:confirm` / `remote:confirmed` / `mod:<verdict>` / `warned`）だけ。番犬 `crates/tako-control/tests/issue2050_paste_guard_routes_watchdog.rs`（新しい経路の診断ログ・判定の 1 実装・mod の標準入力）。A/B は同一バイナリの `TAKO_2050_LEGACY=1`（段・許可・無効化を当てず、send / スマホ / mod は判定しない）。実経路テストは `scripts/test-paste-guard-2050.sh` | M |
+
+設定のファイル形式: `paste_guard_policy` 節（`mode` / `allow` / `disabled_rules`）は節ごと `#[serde(default)]` で、
+**節の無い旧ファイルも既定（確認・許可なし・全規則）で読める**ので移行 Step は足していない（#916。既定のままなら書き出さない）。
 
 ## FR-5 セッション永続性（tmux バックエンド。Phase 5.5 で再設計・実装済み）
 

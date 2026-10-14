@@ -30,8 +30,23 @@
 //!   絶対ルール）。ログへ書くのは [`log_line`] の 1 本だけで、そこは規則名と件数しか持たない
 //! - 先頭 [`MAX_SCAN_BYTES`] だけを見る（巨大な貼り付けでも UI スレッドで数 ms に収める）
 //! - regex を足さない（tako-core の依存に無い。表で書ける形だけを持つ）
+//!
+//! # 段・許可リスト・規則の無効化（Issue #2050）
+//!
+//! - [`Policy`]（settings.json の `paste_guard_policy` 節）を [`scan_with`] へ渡す。
+//!   許可リスト（[`AllowEntry`]）に載せた値・無効にした規則の当たりは**範囲だけ取って報告しない**
+//!   （後ろの段が同じ文字を拾い直さない = 無効にした `openai_api_key` の鍵を `high_entropy` が
+//!   拾い直して出し直すことはない）
+//! - 許可リストは**生の値を持たない**（[`fingerprint`] = 区切りの語つきの SHA-256 と伏せ字だけ。
+//!   settings.json が `tako config` で他の機器へ渡っても値は渡らない）
+//! - 当たったときの振る舞いは [`Mode`]（確認 / 警告だけ）。経路ごとの最終判断は [`Verdict`]
+//! - [`Acks`]: tako が自分で流した値・人が確かめた値の指紋をペインごとにメモリだけで覚え、
+//!   mod の送信時の確認（2 段目）で同じ値を二度確かめない
 
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 /// 既定は on（Issue #2046 のユーザー確定。`settings.json` に項目が無い人も on で読む）
 pub const DEFAULT_ENABLED: bool = true;
@@ -61,6 +76,20 @@ const ASSIGNED_VALUE_MIN_CHARS: usize = 6;
 /// 実測で 64 KB の代入だらけが 6.6 ms → 上限で数百 µs）
 pub const MAX_FINDINGS: usize = 100;
 
+/// 1 回の判定で範囲として取る件数の上限（報告しない許可・無効の分も含む）。
+/// 許可リストの値だらけの貼り付けでも重なり判定を件数の 2 乗にしない
+const MAX_SPANS: usize = MAX_FINDINGS * 4;
+
+/// 許可リストの上限（件）。settings.json を際限なく太らせない
+pub const MAX_ALLOW: usize = 200;
+
+/// 確認済みの値を覚えておく時間（[`Acks`]）。tako が流したプロンプトが入力欄に入ってから
+/// 送信されるまで・人が確かめてから Enter を押すまでの余裕
+pub const ACK_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// 確認済みの値の上限（件。古いものから捨てる）
+pub const MAX_ACKS: usize = 512;
+
 /// A/B（`TAKO_2046_LEGACY=1`）: #2046 前（確認なしで貼る）へ戻す。
 /// **ゲートはこの 1 か所**で、tako-control / tako-app もここを読む
 pub fn legacy() -> bool {
@@ -68,6 +97,19 @@ pub fn legacy() -> bool {
     *LEGACY.get_or_init(|| {
         matches!(
             std::env::var("TAKO_2046_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// A/B（`TAKO_2050_LEGACY=1`）: #2050 前へ戻す = 段・許可リスト・規則の無効化を当てず
+/// （常に確認・全規則）、`tako send` / MCP `tako_send_input`・スマホの入力・mod の送信時は
+/// 判定しない（GUI の貼り付けだけを #2046 のまま確かめる）。**ゲートはこの 1 か所**
+pub fn legacy_2050() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2050_LEGACY").ok().as_deref(),
             Some("1" | "true" | "on")
         )
     })
@@ -144,6 +186,11 @@ impl Rule {
             Rule::HighEntropy => "high_entropy",
         }
     }
+
+    /// 公開の名前（[`Rule::as_str`]）から引く（規則の無効化の入口が綴りを検証する）
+    pub fn parse(name: &str) -> Option<Rule> {
+        Rule::ALL.into_iter().find(|r| r.as_str() == name)
+    }
 }
 
 /// 当たった 1 か所。**生の値は持たない**（伏せ字と位置だけ）
@@ -167,6 +214,10 @@ pub struct ScanReport {
     pub total_bytes: usize,
     /// 実際に見たバイト数（[`MAX_SCAN_BYTES`] で打ち切る）
     pub scanned_bytes: usize,
+    /// 許可リストの値なので報告しなかった当たりの数（#2050）
+    pub allowed: usize,
+    /// 無効にした規則なので報告しなかった当たりの数（#2050）
+    pub disabled: usize,
 }
 
 impl ScanReport {
@@ -241,6 +292,8 @@ pub struct PasteGuardStats {
     pub sent: u64,
     /// 確認で「やめる」を選んだ数（その貼り付けは PTY へ届いていない）
     pub cancelled: u64,
+    /// 「警告だけ」の段で止めずに送った数（#2050）
+    pub warned: u64,
     /// 最後の判定の所要（マイクロ秒）
     pub last_scan_us: u64,
     /// 最後の判定で見たバイト数
@@ -254,6 +307,8 @@ pub struct PasteGuardStatus {
     pub legacy: bool,
     pub pending: Option<PendingSummary>,
     pub stats: PasteGuardStats,
+    /// 段・許可リスト・無効にした規則（#2050。settings.json の `paste_guard_policy`）
+    pub policy: Policy,
 }
 
 impl Default for PasteGuardStatus {
@@ -263,23 +318,339 @@ impl Default for PasteGuardStatus {
             legacy: false,
             pending: None,
             stats: PasteGuardStats::default(),
+            policy: Policy::default(),
         }
     }
 }
 
-/// 貼り付けの本文を判定する（**本文は先頭 [`MAX_SCAN_BYTES`] だけを見る**）
+/// 当たったときの振る舞い（#2050）。既定は確認（#2046 のまま）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// 送る前に「送る / やめる」を確かめる（人が答えられる経路だけ。AI の送信は警告だけ）
+    #[default]
+    Confirm,
+    /// 止めずに送り、警告だけを出す
+    Warn,
+}
+
+impl Mode {
+    pub const VALUES: [&'static str; 2] = ["confirm", "warn"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "confirm" => Some(Mode::Confirm),
+            "warn" => Some(Mode::Warn),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Confirm => "confirm",
+            Mode::Warn => "warn",
+        }
+    }
+
+    fn is_confirm(&self) -> bool {
+        *self == Mode::Confirm
+    }
+}
+
+/// 許可リストの 1 行（#2050）。**生の値は持たない**（[`fingerprint`] と伏せ字と規則名だけ）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowEntry {
+    /// [`fingerprint`] の 16 進 64 文字
+    pub fingerprint: String,
+    /// 足したときに当たっていた規則（表示用）
+    pub rule: String,
+    /// 足したときの伏せ字（表示用。どの値かを人が見分ける）
+    pub masked: String,
+}
+
+impl AllowEntry {
+    /// 一覧・削除で使う短い ID（指紋の先頭 12 文字）
+    pub fn id(&self) -> &str {
+        self.fingerprint.get(..12).unwrap_or(&self.fingerprint)
+    }
+}
+
+/// settings.json の `paste_guard_policy` 節（#2050）。
+/// **旧ファイルは節ごと無くても既定（確認・許可なし・全規則）で読める**（各キーも default）
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    #[serde(default, skip_serializing_if = "Mode::is_confirm")]
+    pub mode: Mode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<AllowEntry>,
+    /// 無効にした規則の名前（[`Rule::as_str`]）。知らない名前（新しい版が書いた規則）も残す
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_rules: Vec<String>,
+}
+
+impl Policy {
+    pub fn is_default(&self) -> bool {
+        *self == Policy::default()
+    }
+
+    /// その規則を無効にしているか
+    pub fn rule_disabled(&self, rule: Rule) -> bool {
+        self.disabled_rules.iter().any(|r| r == rule.as_str())
+    }
+
+    /// その値（当たった範囲の文字）を許可リストに載せているか
+    pub fn allows(&self, value: &str) -> bool {
+        if self.allow.is_empty() {
+            return false;
+        }
+        let fp = fingerprint(value);
+        self.allow.iter().any(|a| a.fingerprint == fp)
+    }
+
+    /// `text` の当たり（今の規則の無効化を当てた上で、まだ許可していないもの）を許可リストへ足す。
+    /// 足した行を返す（同じ値は 2 回足さない・[`MAX_ALLOW`] を超えたら `Err`）
+    pub fn allow_text(&mut self, text: &str) -> Result<Vec<AllowEntry>, String> {
+        let report = scan_with(text, self);
+        let mut added: Vec<AllowEntry> = Vec::new();
+        for (f, fp) in report.findings.iter().zip(fingerprints(text, &report)) {
+            if added.iter().any(|a| a.fingerprint == fp) {
+                continue;
+            }
+            added.push(AllowEntry {
+                fingerprint: fp,
+                rule: f.rule.as_str().to_string(),
+                masked: f.masked.clone(),
+            });
+        }
+        if self.allow.len() + added.len() > MAX_ALLOW {
+            return Err(format!(
+                "許可リストは {MAX_ALLOW} 件まで（今 {} 件・足す {} 件）",
+                self.allow.len(),
+                added.len()
+            ));
+        }
+        self.allow.extend(added.iter().cloned());
+        Ok(added)
+    }
+
+    /// 許可リストから外す。`id` は [`AllowEntry::id`] か指紋の先頭（4 文字以上）、`all` で全部。
+    /// 外した件数を返す（当たる行が無ければ `Err`）
+    pub fn unallow(&mut self, id: &str) -> Result<usize, String> {
+        let before = self.allow.len();
+        if id == "all" {
+            self.allow.clear();
+            return Ok(before);
+        }
+        if id.len() < 4 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "外す行は ID（16 進 4 文字以上）か all で指定する（指定: {id}）"
+            ));
+        }
+        let id = id.to_ascii_lowercase();
+        let hits = self
+            .allow
+            .iter()
+            .filter(|a| a.fingerprint.starts_with(&id))
+            .count();
+        match hits {
+            0 => Err(format!("許可リストに ID {id} の行が無い")),
+            1 => {
+                self.allow.retain(|a| !a.fingerprint.starts_with(&id));
+                Ok(1)
+            }
+            n => Err(format!("ID {id} に {n} 行が当たる（もっと長く指定する）")),
+        }
+    }
+
+    /// 規則の有効 / 無効を切り替える（名前は [`Rule::as_str`]。知らない名前は `Err`）
+    pub fn set_rule(&mut self, name: &str, enabled: bool) -> Result<(), String> {
+        let rule = Rule::parse(name).ok_or_else(|| {
+            let names: Vec<&str> = Rule::ALL.iter().map(|r| r.as_str()).collect();
+            format!("規則 {name} は無い（{}）", names.join(" / "))
+        })?;
+        self.disabled_rules.retain(|r| r != rule.as_str());
+        if !enabled {
+            self.disabled_rules.push(rule.as_str().to_string());
+            // 表示と比較を安定させる（ALL の並び順）
+            self.disabled_rules.sort_by_key(|r| {
+                Rule::parse(r)
+                    .and_then(|r| Rule::ALL.iter().position(|x| *x == r))
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        Ok(())
+    }
+}
+
+/// 人の入力を中継する送信の印（#2050。`Request::Send` の `paste_guard`。付けるのはスマホの PWA の
+/// 中継だけで、無い送信は AI・スクリプトの送信 = 止めずに警告だけ）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relay {
+    /// 人の入力: 段に従う（確認の段なら送らずに伏せ字を返し、人に確かめてもらう）
+    Human,
+    /// 人が確かめた: 送る（そのペインの確認済みとして覚える）
+    Confirmed,
+}
+
+impl Relay {
+    pub const VALUES: [&'static str; 2] = ["human", "confirmed"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "human" => Some(Relay::Human),
+            "confirmed" => Some(Relay::Confirmed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Relay::Human => "human",
+            Relay::Confirmed => "confirmed",
+        }
+    }
+}
+
+/// 経路ごとの最終判断（#2050）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// 当たりが無い（か、すべて確認済み）= そのまま通す
+    Pass,
+    /// 通して警告だけ出す
+    Warn,
+    /// 送る前に確かめる
+    Confirm,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Warn => "warn",
+            Verdict::Confirm => "confirm",
+        }
+    }
+
+    /// 当たりの有無と段から決める。`can_confirm` = 人が答えられる経路か
+    /// （AI・スクリプトの送信は答えられないので確認の段でも警告だけ）
+    pub fn of(hit: bool, mode: Mode, can_confirm: bool) -> Verdict {
+        match (hit, mode) {
+            (false, _) => Verdict::Pass,
+            (true, Mode::Confirm) if can_confirm => Verdict::Confirm,
+            (true, _) => Verdict::Warn,
+        }
+    }
+}
+
+/// 許可リスト・確認済みの値の指紋（#2050）: 区切りの語つきの SHA-256 の 16 進 64 文字。
+/// 生の値の代わりに覚える（区切りの語は他の用途の SHA-256 と突き合わせられないようにするため）
+pub fn fingerprint(value: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"tako.paste_guard.v1\n");
+    h.update(value.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 判定の当たりごとの指紋（`report` は `text` の判定であること）
+pub fn fingerprints(text: &str, report: &ScanReport) -> Vec<String> {
+    report
+        .findings
+        .iter()
+        .map(|f| fingerprint(text.get(f.start..f.end).unwrap_or("")))
+        .collect()
+}
+
+/// tako が自分で流した値・人が確かめた値（#2050）。ペインごとの指紋を [`ACK_TTL`] だけ
+/// **メモリにだけ**覚える。mod の送信時の確認（2 段目）は、ここに載った値を二度確かめない
+/// （GUI の確認で「送る」を選んだ鍵・worker へ流した初回プロンプトで、Enter のたびに止めない）。
+/// `Debug` を付けない（指紋も診断ログへ出す理由が無い）
+#[derive(Default)]
+pub struct Acks {
+    entries: Vec<(u64, String, Instant)>,
+}
+
+impl Acks {
+    /// `text` の当たり（規則・許可リストを当てない全部）をそのペインの確認済みとして覚える
+    pub fn note_text(&mut self, pane: u64, text: &str, now: Instant) {
+        if text.is_empty() {
+            return;
+        }
+        let report = scan(text);
+        if !report.hit() {
+            return;
+        }
+        self.note(pane, fingerprints(text, &report), now);
+    }
+
+    /// 指紋をそのペインの確認済みとして覚える
+    pub fn note(&mut self, pane: u64, fingerprints: Vec<String>, now: Instant) {
+        self.entries
+            .retain(|(_, _, at)| now.saturating_duration_since(*at) < ACK_TTL);
+        for fp in fingerprints {
+            self.entries.retain(|(p, f, _)| !(*p == pane && *f == fp));
+            self.entries.push((pane, fp, now));
+        }
+        if self.entries.len() > MAX_ACKS {
+            let over = self.entries.len() - MAX_ACKS;
+            self.entries.drain(..over);
+        }
+    }
+
+    /// その指紋がそのペインの確認済みか
+    pub fn covers(&self, pane: u64, fingerprint: &str, now: Instant) -> bool {
+        self.entries.iter().any(|(p, f, at)| {
+            *p == pane && f == fingerprint && now.saturating_duration_since(*at) < ACK_TTL
+        })
+    }
+
+    /// 覚えている件数（期限切れを含まない。状態の応答用）
+    pub fn len(&self, now: Instant) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, _, at)| now.saturating_duration_since(*at) < ACK_TTL)
+            .count()
+    }
+
+    pub fn is_empty(&self, now: Instant) -> bool {
+        self.len(now) == 0
+    }
+}
+
+/// 貼り付けの本文を判定する（**本文は先頭 [`MAX_SCAN_BYTES`] だけを見る**）。
+/// 許可リスト・規則の無効化を当てない全部（[`scan_with`] の既定の [`Policy`]）
 pub fn scan(text: &str) -> ScanReport {
+    scan_with(text, &Policy::default())
+}
+
+/// [`scan`] に許可リストと規則の無効化（#2050）を当てる。段（[`Mode`]）は判定に関係しない
+/// （当たったときの振る舞いは呼び手が [`Verdict::of`] で決める）
+pub fn scan_with(text: &str, policy: &Policy) -> ScanReport {
     let total_bytes = text.len();
     let cut = text.floor_char_boundary(MAX_SCAN_BYTES.min(total_bytes));
     // 切り出し安全: floor_char_boundary で文字境界へ丸めた位置
     let body = &text[..cut];
-    let mut spans = Vec::new();
+    let mut spans = Spans {
+        body,
+        policy,
+        list: Vec::new(),
+        kept: 0,
+        allowed: 0,
+        disabled: 0,
+    };
     known_shapes(body, &mut spans);
     private_keys(body, &mut spans);
     jwts(body, &mut spans);
     url_credentials(body, &mut spans);
     assignments(body, &mut spans);
     high_entropy(body, &mut spans);
+    let (allowed, disabled) = (spans.allowed, spans.disabled);
+    // 許可・無効の範囲は後ろの段に拾い直させないためだけに取った（報告しない）
+    let mut spans: Vec<Span> = spans
+        .list
+        .into_iter()
+        .filter_map(|(s, kept)| kept.then_some(s))
+        .collect();
     spans.sort_by_key(|s| s.start);
     let mut findings = Vec::with_capacity(spans.len());
     let mut line = 1;
@@ -302,6 +673,8 @@ pub fn scan(text: &str) -> ScanReport {
         findings,
         total_bytes,
         scanned_bytes: cut,
+        allowed,
+        disabled,
     }
 }
 
@@ -345,22 +718,49 @@ struct Span {
     masked: String,
 }
 
+/// 1 回の判定で取った範囲（#2050: 許可・無効の当たりも範囲としては取り、報告しない印を付ける）
+struct Spans<'a> {
+    body: &'a str,
+    policy: &'a Policy,
+    /// 取った範囲と、報告するか
+    list: Vec<(Span, bool)>,
+    /// 報告する数
+    kept: usize,
+    allowed: usize,
+    disabled: usize,
+}
+
 /// 既に採った範囲と重ならなければ採る（先に呼ばれた段 = より確かな形が勝つ）。
-/// 上限（[`MAX_FINDINGS`]）に達していたら採らない
-fn push(spans: &mut Vec<Span>, span: Span) {
+/// 上限（[`MAX_FINDINGS`] / [`MAX_SPANS`]）に達していたら採らない。
+/// 無効にした規則・許可リストの値は範囲だけ取って報告しない（後ろの段に拾い直させない）
+fn push(spans: &mut Spans, span: Span) {
     if full(spans)
         || spans
+            .list
             .iter()
-            .any(|s| span.start < s.end && s.start < span.end)
+            .any(|(s, _)| span.start < s.end && s.start < span.end)
     {
         return;
     }
-    spans.push(span);
+    let kept = if spans.policy.rule_disabled(span.rule) {
+        spans.disabled += 1;
+        false
+    } else if spans
+        .policy
+        .allows(spans.body.get(span.start..span.end).unwrap_or(""))
+    {
+        spans.allowed += 1;
+        false
+    } else {
+        spans.kept += 1;
+        true
+    };
+    spans.list.push((span, kept));
 }
 
 /// 上限に達したか（各段のループはこれで打ち切る）
-fn full(spans: &[Span]) -> bool {
-    spans.len() >= MAX_FINDINGS
+fn full(spans: &Spans) -> bool {
+    spans.kept >= MAX_FINDINGS || spans.list.len() >= MAX_SPANS
 }
 
 fn is_b64url(b: u8) -> bool {
@@ -538,7 +938,7 @@ fn has_upper_lower_digit(bytes: &[u8]) -> bool {
 }
 
 /// 第 1 段: 既知の形の表
-fn known_shapes(body: &str, spans: &mut Vec<Span>) {
+fn known_shapes(body: &str, spans: &mut Spans) {
     let bytes = body.as_bytes();
     for shape in SHAPES {
         for prefix in shape.prefixes {
@@ -579,7 +979,7 @@ fn known_shapes(body: &str, spans: &mut Vec<Span>) {
 }
 
 /// 第 1 段: `-----BEGIN … PRIVATE KEY-----` の塊（PGP の `PRIVATE KEY BLOCK` も）
-fn private_keys(body: &str, spans: &mut Vec<Span>) {
+fn private_keys(body: &str, spans: &mut Spans) {
     const BEGIN: &str = "-----BEGIN ";
     const DASHES: &str = "-----";
     for (start, _) in body.match_indices(BEGIN) {
@@ -622,7 +1022,7 @@ fn private_keys(body: &str, spans: &mut Vec<Span>) {
 }
 
 /// 第 1 段: JWT（`eyJ…`.`eyJ…`.`…`）
-fn jwts(body: &str, spans: &mut Vec<Span>) {
+fn jwts(body: &str, spans: &mut Spans) {
     const SEG_MIN: usize = 10;
     let bytes = body.as_bytes();
     for (start, _) in body.match_indices("eyJ") {
@@ -663,7 +1063,7 @@ fn jwts(body: &str, spans: &mut Vec<Span>) {
 }
 
 /// 第 1 段: URL に埋め込んだパスワード（`scheme://user:password@host`）
-fn url_credentials(body: &str, spans: &mut Vec<Span>) {
+fn url_credentials(body: &str, spans: &mut Spans) {
     for (sep, _) in body.match_indices("://") {
         if full(spans) {
             return;
@@ -846,7 +1246,7 @@ fn literal_value(value: &str, quoted: bool) -> bool {
 
 /// 第 2 段: 鍵らしい名前への代入（`KEY=value` / `key: value` / `"key": "value"` / `key := "v"` /
 /// `key => 'v'` / `--password=value` / `?token=value`）
-fn assignments(body: &str, spans: &mut Vec<Span>) {
+fn assignments(body: &str, spans: &mut Spans) {
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() && !full(spans) {
@@ -1201,7 +1601,7 @@ fn sole_run_len(line: &str) -> Option<usize> {
 }
 
 /// 第 3 段: 形の分からない塊
-fn high_entropy(body: &str, spans: &mut Vec<Span>) {
+fn high_entropy(body: &str, spans: &mut Spans) {
     let pem = public_pem_ranges(body);
     let lines: Vec<(usize, &str)> = {
         let mut v = Vec::new();
@@ -1811,5 +2211,242 @@ mod tests {
         assert_eq!(Answer::parse("cancel"), Some(Answer::Cancel));
         assert_eq!(Answer::parse("ok"), None);
         assert!(PasteGuardStatus::default().enabled);
+    }
+
+    // ---- #2050: 許可リスト・規則の無効化・段・確認済みの値 ----
+
+    fn anthropic() -> String {
+        fake("sk-ant-", "api03-EXAMPLEaaaaBBBBccccDDDDeeee1234ABCD")
+    }
+
+    fn github() -> String {
+        fake("ghp_", "EXAMPLE0123456789abcdefghijklmnopqrst")
+    }
+
+    /// 受け入れ条件 2: 許可リストに載せた値は当たらない（ほかの値は今までどおり当たる）
+    #[test]
+    fn allowlisted_values_do_not_hit() {
+        let public = fake("AIza", "EXAMPLE-abcdefghijklmnopqrstuvwxyz0");
+        let mut policy = Policy::default();
+        let added = policy.allow_text(&public).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].rule, "google_api_key");
+        assert_eq!(added[0].fingerprint.len(), 64);
+        assert!(
+            policy.allow_text(&public).unwrap().is_empty(),
+            "同じ値は 2 回足さない"
+        );
+        assert_eq!(policy.allow.len(), 1);
+        // 単独・文の中・代入の右辺のどれでも当たらない（範囲が同じなら指紋が同じ）
+        for text in [
+            public.clone(),
+            format!("Firebase の公開キーは {public} です"),
+            format!("GOOGLE_API_KEY={public}"),
+        ] {
+            let r = scan_with(&text, &policy);
+            assert!(!r.hit(), "{:?}", r.findings);
+            assert_eq!(r.allowed, 1);
+            assert!(scan(&text).hit(), "許可リストを当てない判定では当たる");
+        }
+    }
+
+    /// 境界: 許可リストの値と秘密が 1 回の貼り付けに混在 → 秘密だけが当たる
+    #[test]
+    fn allowlisted_value_mixed_with_a_secret() {
+        let public = fake("AIza", "EXAMPLE-abcdefghijklmnopqrstuvwxyz0");
+        let mut policy = Policy::default();
+        policy.allow_text(&public).unwrap();
+        let text = format!("public={public}\nsecret {}\n{public}", anthropic());
+        let r = scan_with(&text, &policy);
+        assert_eq!(r.rules(), vec![Rule::AnthropicApiKey]);
+        assert_eq!(r.findings[0].line, 2);
+        assert_eq!(r.allowed, 2);
+        // 混ぜた貼り付けを丸ごと許可へ足すと、まだ許可していない方（秘密）だけが足される
+        let mut p2 = policy.clone();
+        let added = p2.allow_text(&text).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].rule, "anthropic_api_key");
+        assert!(!scan_with(&text, &p2).hit());
+    }
+
+    /// 受け入れ条件 2: 規則を無効にすると当たらない。後ろの段が同じ文字を拾い直さない
+    #[test]
+    fn disabled_rules_do_not_hit() {
+        let key = fake("sk-", "proj-EXAMPLE1234abcdEFGHijklMNOP5678wxyz");
+        let mut policy = Policy::default();
+        policy.set_rule("openai_api_key", false).unwrap();
+        let r = scan_with(&key, &policy);
+        assert!(!r.hit(), "{:?}", r.findings);
+        assert_eq!(r.disabled, 1);
+        // 範囲を取らずに報告だけ落とすと、無効にした鍵を後ろの段が拾い直す。ランダムな本体の鍵
+        // （実行時に作る）で確かめる: 前置詞を外した同じ本体は high_entropy が拾うが、無効にした
+        // openai_api_key の鍵としては拾い直さない
+        let mut seed = 2050u64;
+        let random = fake("sk-", &random_alnum(&mut seed, 40));
+        assert_eq!(scan(&random).rules(), vec![Rule::OpenAiApiKey]);
+        assert_eq!(scan(&random["sk-".len()..]).rules(), vec![Rule::HighEntropy]);
+        let r = scan_with(&random, &policy);
+        assert!(!r.hit(), "拾い直した: {:?}", r.findings);
+        assert_eq!(r.disabled, 1);
+        // 代入の右辺に置いても同じ（既知の形の段が先に範囲を取る）
+        assert!(!scan_with(&format!("OPENAI_API_KEY={key}"), &policy).hit());
+        // ほかの規則は今までどおり
+        assert_eq!(
+            scan_with(&format!("{key} {}", github()), &policy).rules(),
+            vec![Rule::GithubToken]
+        );
+        // 戻すと当たる
+        policy.set_rule("openai_api_key", true).unwrap();
+        assert!(policy.disabled_rules.is_empty());
+        assert!(scan_with(&key, &policy).hit());
+        // 知らない名前は断る（綴りを一覧で返す）
+        let err = policy.set_rule("openai", false).unwrap_err();
+        assert!(err.contains("openai_api_key"), "{err}");
+    }
+
+    /// 境界: 規則を全部無効にした状態では何も当たらない（件数の上限にも掛からない）
+    #[test]
+    fn all_rules_disabled_hits_nothing() {
+        let mut policy = Policy::default();
+        for r in Rule::ALL {
+            policy.set_rule(r.as_str(), false).unwrap();
+        }
+        assert_eq!(policy.disabled_rules.len(), Rule::ALL.len());
+        let jwt = fake(
+            "eyJhbGciOiJIUzI1NiJ9.",
+            "eyJzdWIiOiJFWEFNUExFIn0.EXAMPLEsignatureAbCdEf0123456789",
+        );
+        let text = format!(
+            "{}\n{}\npassword=Zq9-EXAMPLE-pw\n{jwt}\n{}",
+            anthropic(),
+            github(),
+            "password=abc123; ".repeat(500)
+        );
+        assert!(scan(&text).hit());
+        let r = scan_with(&text, &policy);
+        assert!(!r.hit(), "{:?}", r.rules());
+        assert!(r.disabled > 0);
+        // 並びは ALL の順で安定（表示・比較用）
+        let names: Vec<&str> = Rule::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(policy.disabled_rules, names);
+    }
+
+    /// 受け入れ条件 2: 「警告だけ」の段では止めずに警告。AI の送信は確認の段でも警告だけ
+    #[test]
+    fn verdict_by_mode_and_route() {
+        assert_eq!(Verdict::of(false, Mode::Confirm, true), Verdict::Pass);
+        assert_eq!(Verdict::of(true, Mode::Confirm, true), Verdict::Confirm);
+        assert_eq!(Verdict::of(true, Mode::Warn, true), Verdict::Warn);
+        assert_eq!(Verdict::of(true, Mode::Confirm, false), Verdict::Warn);
+        assert_eq!(Verdict::of(true, Mode::Warn, false), Verdict::Warn);
+        assert_eq!(Mode::parse("warn"), Some(Mode::Warn));
+        assert_eq!(Mode::parse("confirm"), Some(Mode::Confirm));
+        assert_eq!(Mode::parse("off"), None);
+        for v in Mode::VALUES {
+            assert_eq!(Mode::parse(v).unwrap().as_str(), v);
+        }
+    }
+
+    /// 設定の節は旧ファイル（節が無い・キーが欠ける）でも既定で読め、既定は書き出さない（#916）
+    #[test]
+    fn policy_reads_old_files_and_round_trips() {
+        let old: Policy = serde_json::from_str("{}").unwrap();
+        assert!(old.is_default());
+        assert_eq!(serde_json::to_string(&Policy::default()).unwrap(), "{}");
+        let mut p = Policy {
+            mode: Mode::Warn,
+            ..Policy::default()
+        };
+        p.allow_text(&github()).unwrap();
+        p.set_rule("high_entropy", false).unwrap();
+        // 新しい版が足した知らない規則の名前は消さずに残す
+        p.disabled_rules.push("future_rule".into());
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"mode\":\"warn\""), "{json}");
+        let back: Policy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+        // 設定ファイルにも Debug にも生の値を書かない（指紋と伏せ字だけ）
+        let body = &github()["ghp_".len()..];
+        assert!(!json.contains(body), "{json}");
+        assert!(!format!("{p:?}").contains(body));
+    }
+
+    #[test]
+    fn unallow_by_id_prefix_or_all() {
+        let mut p = Policy::default();
+        p.allow_text(&github()).unwrap();
+        p.allow_text(&anthropic()).unwrap();
+        assert_eq!(p.allow.len(), 2);
+        let id = p.allow[0].id().to_string();
+        assert_eq!(id.len(), 12);
+        assert!(p.unallow("xyz!").is_err());
+        assert!(p.unallow("ab").is_err(), "短すぎる ID は断る");
+        assert!(
+            p.unallow("ffffffffffff").is_err(),
+            "当たる行が無い ID は断る"
+        );
+        assert_eq!(p.unallow(&id.to_ascii_uppercase()).unwrap(), 1);
+        assert_eq!(p.allow.len(), 1);
+        assert!(scan_with(&github(), &p).hit(), "外した値はまた当たる");
+        assert_eq!(p.unallow("all").unwrap(), 1);
+        assert!(p.allow.is_empty());
+    }
+
+    #[test]
+    fn allowlist_is_capped() {
+        let mut p = Policy::default();
+        let mut seed = 5u64;
+        for _ in 0..MAX_ALLOW {
+            p.allow.push(AllowEntry {
+                fingerprint: fingerprint(&random_alnum(&mut seed, 30)),
+                rule: "high_entropy".into(),
+                masked: "…".into(),
+            });
+        }
+        let err = p.allow_text(&github()).unwrap_err();
+        assert!(err.contains(&MAX_ALLOW.to_string()), "{err}");
+        assert_eq!(p.allow.len(), MAX_ALLOW);
+    }
+
+    /// 確認済みの値（tako が流した・人が確かめた）はペインごと・期限つきで覚える
+    #[test]
+    fn acks_cover_per_pane_until_ttl() {
+        let t0 = Instant::now();
+        let mut acks = Acks::default();
+        let text = format!("worker への指示: {} を使う", github());
+        acks.note_text(7, &text, t0);
+        acks.note_text(7, "普通の文章だけ", t0);
+        assert_eq!(acks.len(t0), 1);
+        let fp = fingerprint(&github());
+        assert!(acks.covers(7, &fp, t0));
+        assert!(!acks.covers(8, &fp, t0), "別のペインは確認済みでない");
+        let later = t0 + ACK_TTL;
+        assert!(!acks.covers(7, &fp, later), "期限を過ぎたら忘れる");
+        assert!(acks.is_empty(later));
+        // 規則の無効化・許可リストに関係なく、当たる値をすべて覚える
+        let mut many = Acks::default();
+        for i in 0..(MAX_ACKS + 10) {
+            many.note(1, vec![format!("{i:064x}")], t0);
+        }
+        assert_eq!(many.len(t0), MAX_ACKS);
+        assert!(
+            !many.covers(1, &format!("{:064x}", 0), t0),
+            "古いものから捨てる"
+        );
+    }
+
+    /// 指紋は区切りの語つき（ただの SHA-256 と一致しない）・生の値を含まない
+    #[test]
+    fn fingerprints_follow_findings() {
+        let text = format!("a {} b {}", github(), anthropic());
+        let r = scan(&text);
+        let fps = fingerprints(&text, &r);
+        assert_eq!(fps.len(), 2);
+        assert_eq!(fps[0], fingerprint(&github()));
+        assert_ne!(fps[0], fps[1]);
+        assert!(fps
+            .iter()
+            .all(|f| f.len() == 64 && f.bytes().all(|b| b.is_ascii_hexdigit())));
+        assert!(!fps[0].contains("EXAMPLE"));
     }
 }

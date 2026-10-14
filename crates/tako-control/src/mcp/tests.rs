@@ -1583,6 +1583,11 @@ mod tests {
             enabled,
             check: check.map(str::to_string),
             respond: respond.map(str::to_string),
+            mode: None,
+            allow: None,
+            unallow: None,
+            rules: None,
+            pane: None,
         };
         for (args, want) in [
             (json!({ "action": "paste_guard" }), pg(None, None, None)),
@@ -1621,6 +1626,49 @@ mod tests {
                 response.unwrap().to_string().contains("action=paste_guard"),
                 "{args}"
             );
+        }
+    }
+
+    /// #2050: 段・許可リスト・規則・送信時の確認も action=paste_guard の引数で 1:1 に写り、
+    /// 形の崩れた rules・他の action への引数は Request を作らずに断る
+    #[test]
+    fn settingsのpaste_guardは段と許可と規則と送信時の確認へ写る() {
+        let (_, requests) = run(
+            call(
+                "tako_settings",
+                json!({
+                    "action": "paste_guard", "mode": "warn", "allow": "AIzaEXAMPLE",
+                    "unallow": "0a1b2c3d", "rules": { "high_entropy": false, "jwt": true },
+                    "text": "x", "pane": 7,
+                }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PasteGuard {
+                enabled: None,
+                check: Some("x".into()),
+                respond: None,
+                mode: Some("warn".into()),
+                allow: Some("AIzaEXAMPLE".into()),
+                unallow: Some("0a1b2c3d".into()),
+                rules: Some(std::collections::BTreeMap::from([
+                    ("high_entropy".to_string(), false),
+                    ("jwt".to_string(), true),
+                ])),
+                pane: Some(7),
+            }]
+        );
+        for args in [
+            json!({ "action": "paste_guard", "rules": { "jwt": "off" } }),
+            json!({ "action": "paste_guard", "rules": ["jwt"] }),
+            json!({ "action": "open", "mode": "warn" }),
+            json!({ "action": "status", "pane": 3 }),
+        ] {
+            let (_, requests) = run(call("tako_settings", args.clone()), None, true);
+            assert!(requests.is_empty(), "{args}: {requests:?}");
         }
     }
 

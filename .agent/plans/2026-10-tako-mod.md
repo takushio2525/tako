@@ -427,6 +427,10 @@ S1〜S6 には入れない。
   イベントのフックは、必ず `next(e)` へ流し、`.catch(($, e, next) => next(e))` を付ける
   （mod が壊れても tool call と権限ダイアログを止めない）。`tool.check` に答えない・権限を
   勝手に許可しない
+  - **例外（#2050）**: `prompt.submit` だけは人の出どころ（`composer` / `bridge`）の送信を tako の
+    `paste-guard check --pane`（本文は標準入力）で判定させ、`confirm` なら `$.ui.ask` で「やめる / 送る」を聞き、
+    やめたら `{ drop }` で落とす。判定は tako 側の 1 実装、CLI の失敗・時間切れ（3 秒）・例外では送信を通す
+    （`.catch(($, e, next) => next(e))`）。tako が流した値・人が確かめた値は tako が外して答える（要件は FR-4.12.10）
 - **フックの中で CLI を待たない**: フックは `$.state` とモジュール変数を更新して dirty を立てる
   だけにし、`session.start` で張った `$.clock.every(1000)` の flush が CLI を叩く
   （変化が無ければ 15 秒ごとの heartbeat だけ）。報告が詰まってもターンが遅れない

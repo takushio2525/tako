@@ -62,6 +62,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod migrations;
 pub mod orchestrator;
+pub mod paste_guard;
 pub mod peer_messaging;
 pub mod platform;
 pub mod protocol;

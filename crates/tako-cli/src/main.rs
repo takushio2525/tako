@@ -3605,18 +3605,28 @@ struct MouseArgs {
     state: Option<String>,
 }
 
-/// 貼り付けの確認の引数（Issue #2046）。
+/// 貼り付けの確認の引数（Issue #2046 / #2050）。
 /// 最簡形（#322）: `tako paste-guard` で現在状態、`tako paste-guard off` で切る、
-/// `pbpaste | tako paste-guard check` で判定だけ試す（本文は標準入力から読む）
+/// `tako paste-guard warn` で止めずに警告だけ、`pbpaste | tako paste-guard check` で判定だけ試す、
+/// `pbpaste | tako paste-guard allow` でその値を許可リストへ（本文は標準入力から読む）
 #[derive(Args)]
 struct PasteGuardArgs {
-    /// on / off = 切替（既定 on）、check = 判定だけ試す、send / cancel = 確認待ちの貼り付けへ
-    /// 答える。省略時は現在状態と累計（確認待ちがあれば伏せ字の要約）を表示
-    #[arg(value_parser = ["on", "off", "check", "send", "cancel"])]
+    /// on = 確かめる（既定）/ warn = 止めずに警告だけ / off = 切る、check = 判定だけ試す、
+    /// send / cancel = 確認待ちの貼り付けへ答える、allow / unallow = 許可リストへ足す / 外す、
+    /// rule = 規則ごとの有効 / 無効。省略時は現在状態と累計（確認待ちがあれば伏せ字の要約）を表示
+    #[arg(value_parser = [
+        "on", "off", "warn", "check", "send", "cancel", "allow", "unallow", "rule",
+    ])]
     action: Option<String>,
-    /// check で判定する文字（省略か `-` で標準入力から読む。鍵をシェルの履歴へ残さないよう
-    /// 標準入力を勧める）
+    /// check / allow の文字（省略か `-` で標準入力から読む。鍵をシェルの履歴へ残さないよう
+    /// 標準入力を勧める）・unallow の ID（`tako paste-guard` の allow[].id）か all・rule の規則名
     text: Option<String>,
+    /// rule の on / off
+    #[arg(value_parser = ["on", "off"])]
+    value: Option<String>,
+    /// check をそのペインの送信時の確認（tako mod の 2 段目）として判定する
+    #[arg(long)]
+    pane: Option<u64>,
 }
 
 /// `tako paste-guard check` の本文（引数が無いか `-` なら標準入力。読む上限は 8 MiB）
@@ -5046,6 +5056,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         newline: true,
         tmux_session: None,
         await_prompt: false,
+        paste_guard: None,
     })?;
 
     eprintln!(
@@ -5234,6 +5245,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         newline: true,
         tmux_session: None,
         await_prompt: false,
+        paste_guard: None,
     })?;
 
     eprintln!(
@@ -8516,6 +8528,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             newline: !args.no_newline,
             tmux_session: args.tmux_session.clone(),
             await_prompt: args.await_prompt,
+            paste_guard: None,
         },
         Command::Focus(args) => {
             let direction = match (args.left, args.right, args.up, args.down) {
@@ -8682,15 +8695,36 @@ fn build_request(command: &Command) -> Result<Request, String> {
             row: args.row,
             col: args.col,
         },
-        // #2046: MCP は `tako_settings` の action=paste_guard（enabled / text / respond）
+        // #2046 / #2050: MCP は `tako_settings` の action=paste_guard（enabled / text / respond /
+        // mode / allow / unallow / rules / pane）
         Command::PasteGuard(args) => {
             let action = args.action.as_deref();
-            if args.text.is_some() && action != Some("check") {
-                return Err("判定する文字を渡せるのは `tako paste-guard check` だけ".into());
+            if args.text.is_some()
+                && !matches!(action, Some("check" | "allow" | "unallow" | "rule"))
+            {
+                return Err(
+                    "文字を渡せるのは `tako paste-guard check|allow|unallow|rule` だけ".into(),
+                );
             }
+            if args.value.is_some() != (action == Some("rule")) {
+                return Err("規則の切替は `tako paste-guard rule <規則名> on|off`".into());
+            }
+            if args.pane.is_some() && action != Some("check") {
+                return Err("--pane は `tako paste-guard check` だけ".into());
+            }
+            let rules = match (action, args.text.as_deref(), args.value.as_deref()) {
+                (Some("rule"), Some(name), Some(on)) => Some(std::collections::BTreeMap::from([(
+                    name.to_string(),
+                    on == "on",
+                )])),
+                (Some("rule"), ..) => {
+                    return Err("規則の切替は `tako paste-guard rule <規則名> on|off`".into());
+                }
+                _ => None,
+            };
             Request::PasteGuard {
                 enabled: match action {
-                    Some("on") => Some(true),
+                    Some("on" | "warn") => Some(true),
                     Some("off") => Some(false),
                     _ => None,
                 },
@@ -8701,6 +8735,26 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 respond: action
                     .filter(|a| matches!(*a, "send" | "cancel"))
                     .map(str::to_string),
+                // on = 確かめる段・warn = 警告だけの段（off は段を変えない）
+                mode: match action {
+                    Some("on") => Some("confirm".into()),
+                    Some("warn") => Some("warn".into()),
+                    _ => None,
+                },
+                allow: match action {
+                    Some("allow") => Some(paste_guard_check_text(args.text.as_deref())?),
+                    _ => None,
+                },
+                unallow: match action {
+                    Some("unallow") => {
+                        Some(args.text.clone().ok_or(
+                            "外す許可の ID（`tako paste-guard` の allow[].id）か all を渡す",
+                        )?)
+                    }
+                    _ => None,
+                },
+                rules,
+                pane: args.pane,
             }
         }
         // #1677: 基準ペインは閉じたペインの項目を開き直すときだけ使う。tako の外から
@@ -11346,6 +11400,33 @@ fn print_delivery(result: &Value) {
     if let Some(line) = delivery_line(result) {
         eprintln!("{line}");
     }
+    if let Some(line) = paste_guard_line(result) {
+        eprintln!("{line}");
+    }
+}
+
+/// `tako send` の鍵らしき文字の警告（#2050）の 1 行。載せるのは規則名と伏せ字だけ（応答と同じ）
+fn paste_guard_line(result: &Value) -> Option<String> {
+    let g = result.get("paste_guard").filter(|v| !v.is_null())?;
+    let found: Vec<String> = g["findings"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        f["rule"].as_str().unwrap_or("?"),
+                        f["masked"].as_str().unwrap_or("")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "[paste-guard] verdict={} {}（鍵らしき文字を含むまま送った。設定は tako paste-guard）",
+        g["verdict"].as_str().unwrap_or("?"),
+        found.join(", ")
+    ))
 }
 
 /// `[delivery] …` の 1 行を組む（機械検証できるよう印字と分けてある）
@@ -12611,6 +12692,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: false,
+                paste_guard: None,
             }
         );
     }
@@ -14136,6 +14218,29 @@ mod tests {
             enabled,
             check: check.map(str::to_string),
             respond: respond.map(str::to_string),
+            mode: None,
+            allow: None,
+            unallow: None,
+            rules: None,
+            pane: None,
+        };
+        let with_mode = |req: Request, m: &str| match req {
+            Request::PasteGuard {
+                enabled,
+                check,
+                respond,
+                ..
+            } => Request::PasteGuard {
+                enabled,
+                check,
+                respond,
+                mode: Some(m.to_string()),
+                allow: None,
+                unallow: None,
+                rules: None,
+                pane: None,
+            },
+            other => other,
         };
         for (args, want) in [
             (vec!["tako", "paste-guard"], pg(None, None, None)),
@@ -14145,7 +14250,12 @@ mod tests {
             ),
             (
                 vec!["tako", "paste-guard", "on"],
-                pg(Some(true), None, None),
+                with_mode(pg(Some(true), None, None), "confirm"),
+            ),
+            // #2050: 警告だけの段
+            (
+                vec!["tako", "paste-guard", "warn"],
+                with_mode(pg(Some(true), None, None), "warn"),
             ),
             (
                 vec!["tako", "paste-guard", "check", "普通の文章"],
@@ -14164,6 +14274,73 @@ mod tests {
         }
         assert!(build_request(&parse(&["tako", "paste-guard", "off", "x"])).is_err());
         assert!(Cli::try_parse_from(["tako", "paste-guard", "maybe"]).is_err());
+    }
+
+    /// #2050: `tako send` の応答の鍵らしき文字の警告は規則名と伏せ字の 1 行（無ければ出さない）
+    #[test]
+    fn sendの鍵らしき文字の警告は伏せ字の1行() {
+        let warned = serde_json::json!({
+            "queued": true,
+            "paste_guard": {
+                "verdict": "warn",
+                "rules": ["github_token"],
+                "findings": [{ "rule": "github_token", "line": 1, "masked": "ghp_…qrst" }],
+            },
+        });
+        let line = paste_guard_line(&warned).unwrap();
+        assert!(
+            line.starts_with("[paste-guard] verdict=warn github_token ghp_…qrst"),
+            "{line}"
+        );
+        assert!(paste_guard_line(&serde_json::json!({ "queued": true })).is_none());
+        assert!(paste_guard_line(&Value::Null).is_none());
+    }
+
+    /// #2050: 許可リスト・規則・送信時の確認（--pane）も `Request::PasteGuard` の 1 つへ写り、
+    /// 組み合わせの誤りは送らずに断る
+    #[test]
+    fn paste_guardの許可と規則と送信時の確認を写す() {
+        let req = |args: &[&str]| build_request(&parse(args));
+        match req(&["tako", "paste-guard", "allow", "AIzaEXAMPLE"]).unwrap() {
+            Request::PasteGuard { allow, check, .. } => {
+                assert_eq!(allow.as_deref(), Some("AIzaEXAMPLE"));
+                assert!(check.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        match req(&["tako", "paste-guard", "unallow", "0a1b2c3d4e5f"]).unwrap() {
+            Request::PasteGuard { unallow, .. } => {
+                assert_eq!(unallow.as_deref(), Some("0a1b2c3d4e5f"))
+            }
+            other => panic!("{other:?}"),
+        }
+        match req(&["tako", "paste-guard", "rule", "high_entropy", "off"]).unwrap() {
+            Request::PasteGuard { rules, .. } => assert_eq!(
+                rules,
+                Some(std::collections::BTreeMap::from([(
+                    "high_entropy".to_string(),
+                    false
+                )]))
+            ),
+            other => panic!("{other:?}"),
+        }
+        match req(&["tako", "paste-guard", "check", "x", "--pane", "7"]).unwrap() {
+            Request::PasteGuard { check, pane, .. } => {
+                assert_eq!(check.as_deref(), Some("x"));
+                assert_eq!(pane, Some(7));
+            }
+            other => panic!("{other:?}"),
+        }
+        for bad in [
+            &["tako", "paste-guard", "unallow"][..],
+            &["tako", "paste-guard", "rule", "high_entropy"],
+            &["tako", "paste-guard", "rule"],
+            &["tako", "paste-guard", "on", "--pane", "3"],
+            &["tako", "paste-guard", "warn", "x"],
+        ] {
+            assert!(req(bad).is_err(), "{bad:?}");
+        }
+        assert!(Cli::try_parse_from(["tako", "paste-guard", "rule", "jwt", "maybe"]).is_err());
     }
 
     /// #1961: 最簡形（引数なし = 現在状態 / on・off = 切替）が MCP `tako_scrollback` の

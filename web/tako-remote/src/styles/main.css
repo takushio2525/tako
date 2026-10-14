@@ -229,6 +229,26 @@ body {
   width: 32px; height: 32px; font-size: 20px; line-height: 1;
   color: var(--fg2); background: none; border: none; cursor: pointer;
 }
+/* 鍵らしき文字の確認（#2050） */
+.pg-note { margin: 0 0 10px; font-size: 12px; line-height: 1.6; color: var(--fg2); overflow-wrap: anywhere; }
+.pg-findings {
+  list-style: none; margin: 0 0 12px; padding: 8px 10px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.pg-findings li { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pg-rule { font-size: 11.5px; color: var(--fg3); }
+.pg-masked { font-family: var(--mono); font-size: 12.5px; color: var(--fg); overflow-wrap: anywhere; }
+.pg-more { font-size: 11px; color: var(--fg3); }
+.pg-notice {
+  position: fixed; z-index: 70; left: 12px; right: 12px;
+  top: calc(10px + env(safe-area-inset-top, 0px));
+  padding: 10px 12px; background: var(--panel); border: 1px solid var(--line2);
+  border-radius: var(--radius-sm); box-shadow: 0 6px 20px rgba(0, 0, 0, .35); cursor: pointer;
+}
+.pg-notice-title { font-size: 12.5px; font-weight: 600; color: var(--fg); margin-bottom: 6px; }
+.pg-notice .pg-findings { margin: 0; }
+
 /* 「+」の 3 択（#1449） */
 .launch-kind-list { display: flex; flex-direction: column; gap: 8px; }
 .launch-kind {

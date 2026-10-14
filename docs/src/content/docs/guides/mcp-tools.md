@@ -215,7 +215,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_chat_copy` | かんたん表示の会話本文・コードブロックをコピーする |
 | `tako_theme` | UI テーマの確認・切替・色設定・プリセット・フォント |
 | `tako_lang` | UI 表示言語（日本語 / 英語）の確認・切替 |
-| `tako_settings` | 設定画面を開く・貼り付けの確認（`action: "paste_guard"`）の切替と判定 |
+| `tako_settings` | 設定画面を開く・貼り付けの確認（`action: "paste_guard"`）の切替・段（`mode`）・判定・許可リスト・規則ごとの無効化 |
 | `tako_panel` | 右サイドバーの表示 / ビュー切替 / 幅、ファイルツリーの表示 |
 | `tako_welcome` | 初回起動バナーの状態確認・再表示・非表示 |
 | `tako_autosuggest` | 入力予測（ゴーストテキスト）の ON/OFF・確定キーの設定 |

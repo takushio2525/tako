@@ -36,6 +36,14 @@
 // - 失敗で騒がない: CLI の失敗は $.ui.log(…, { to: 'debug' }) だけ
 // - $ を渡す補助関数はファイル最上位の関数宣言（validate の規則）
 // - 会話の本文・プロンプト・ツールの引数は報告に載せない（ツール名だけ）
+//
+// 例外（#2050 の送信時の確認 = 鍵らしき文字の 2 段目）: prompt.submit だけは、人の入力（composer = その
+// 端末での Enter・bridge = Remote Control）を送る前に tako へ判定させ、答えが confirm なら Claude Code の
+// 選択ダイアログで「やめる / 送る」を確かめ、やめたら送信を落とす（{ drop }）。判定は tako の 1 実装
+// （`tako paste-guard check --pane N`。**本文は標準入力で渡す** = argv にもログにも残さない）で、ここは
+// 答えに従うだけ。tako が流した値・人が確かめた値は tako が外して答える（worker の初回プロンプトで
+// 止めない）。CLI が失敗・時間切れ・mod が投げたら**送信を通す**（.catch で next(e)。壊れた mod が
+// 送信を止めない）。デバッグログへは終了コードだけ（本文・伏せ字を書かない）
 import type {
   EngineInterface,
   Register,
@@ -72,6 +80,15 @@ const HEARTBEAT_MS = 15_000
 const REPORT_TIMEOUT_MS = 5_000
 /** session.end の最後の報告だけは待つので、上限は短く */
 const FINAL_TIMEOUT_MS = 2_000
+/**
+ * 送信時の確認（#2050）で叩く CLI 1 回の上限。tako が詰まっていたら待たずに送信を通す
+ * （実測の所要は数十 ms。利用者の Enter を数秒より長く止めない）
+ */
+const GUARD_TIMEOUT_MS = 3_000
+/** 送信時の確認で見る出どころ（人の入力だけ。AI・仕組みの送信 = peer / plugin / 通知 等は止めない） */
+const GUARD_ORIGINS: readonly string[] = ['composer', 'bridge']
+/** 送信時の確認の伏せ字を並べる上限 */
+const GUARD_SHOW_MAX = 3
 /** tako の応答（帯の材料）がこれより古くなったら帯を消す（tako の鮮度 FRESH_FOR と同じ 45 秒） */
 const VIEW_FRESH_MS = 45_000
 /** 帯の区切りの区切り文字（幅 1 の ASCII だけ。曖昧幅の文字は端末の設定で 2 桁になりうる） */
@@ -121,6 +138,8 @@ const CARD_CURSOR = { plugin: 'tako', key: 'cardCursor' } as const
 
 // モジュール変数。ホットリロードで消えるが、そのとき session.start が再発火して張り直す
 let cli: string | undefined
+// このペインの tako の ID（TAKO_PANE_ID。送信時の確認 = #2050 で tako に渡す）
+let paneId: string | undefined
 let timer: Timer | undefined
 let dirty = false
 let sending = false
@@ -356,9 +375,11 @@ async function wake($: EngineInterface): Promise<void> {
   const path = await $.env.get('TAKO_CLI')
   if (pane === undefined || pane === '' || path === undefined || path === '') {
     cli = undefined
+    paneId = undefined
     return
   }
   cli = path
+  paneId = pane
   // 利用者が /plugin で止めていれば、理由を 1 回だけ伝えて休眠する（#1959）
   lastDisabledCheck = await $.clock.now()
   if (await userDisabled($)) {
@@ -430,6 +451,13 @@ type Words = {
   cardClosed: string
   cardHint: (copy: string, run: string) => string
   runState: (run: NonNullable<TakoCardCommand['run']>) => string
+  // 送信時の確認（#2050）
+  guardHeader: string
+  guardQuestion: (found: string) => string
+  guardSend: string
+  guardCancel: string
+  guardDropped: string
+  guardWarned: (found: string) => string
 }
 
 const WORDS: Record<'ja' | 'en', Words> = {
@@ -469,6 +497,12 @@ const WORDS: Record<'ja' | 'en', Words> = {
     cardHint: (copy, run) => `帯（ctrl+x → Tab）の ${copy}: コピー / ${run}: 実行`,
     runState: run =>
       `→ ペイン ${run.pane} ${run.state === 'running' ? '実行中' : run.state === 'exited' ? `終了 ${run.exit_code ?? '?'}` : 'が閉じた'}`,
+    guardHeader: 'tako',
+    guardQuestion: found => `鍵らしき文字が入っています（${found}）。このまま送りますか？`,
+    guardSend: '送る',
+    guardCancel: 'やめる',
+    guardDropped: 'tako: 鍵らしき文字が入っているので送りませんでした',
+    guardWarned: found => `tako: 鍵らしき文字を含むまま送りました（${found}）`,
   },
   en: {
     tab: 'tab',
@@ -506,11 +540,67 @@ const WORDS: Record<'ja' | 'en', Words> = {
     cardHint: (copy, run) => `in the band (ctrl+x → Tab): ${copy}: copy / ${run}: run`,
     runState: run =>
       `→ pane ${run.pane} ${run.state === 'running' ? 'running' : run.state === 'exited' ? `exited ${run.exit_code ?? '?'}` : 'closed'}`,
+    guardHeader: 'tako',
+    guardQuestion: found => `This prompt looks like it contains a secret (${found}). Send it anyway?`,
+    guardSend: 'Send',
+    guardCancel: "Don't send",
+    guardDropped: 'tako: not sent because it looks like it contains a secret',
+    guardWarned: found => `tako: sent a prompt that looks like it contains a secret (${found})`,
   },
 }
 
 function words(code: string): Words {
   return code === 'ja' ? WORDS.ja : WORDS.en
+}
+
+// --- 送信時の確認（#2050）-------------------------------------------------------------
+
+type GuardFinding = { rule: string; line: number; masked: string }
+type GuardCheck = { verdict?: string; findings?: GuardFinding[] }
+
+// 当たりの要約（規則名と伏せ字だけ。tako の応答に生の値は無い）
+function guardFound(findings: readonly GuardFinding[]): string {
+  const shown = findings.slice(0, GUARD_SHOW_MAX).map(f => `${f.rule} ${f.masked}`)
+  const rest = findings.length - shown.length
+  return rest > 0 ? `${shown.join(', ')} +${rest}` : shown.join(', ')
+}
+
+// 送る前に tako へ判定させ、答えに従う。'drop' = 送らない。CLI の失敗・時間切れは送信を通す
+async function guardPrompt($: EngineInterface, text: string): Promise<'pass' | 'drop'> {
+  const path = cli
+  const pane = paneId
+  if (path === undefined || pane === undefined || text.trim() === '') return 'pass'
+  let check: GuardCheck
+  try {
+    const done = await $.process.run([path, 'paste-guard', 'check', '--pane', pane], {
+      stdin: text,
+      timeoutMs: GUARD_TIMEOUT_MS,
+    })
+    if (done.exitCode !== 0) {
+      $.ui.log(`tako mod: paste-guard exit ${done.exitCode}`, { to: 'debug' })
+      return 'pass'
+    }
+    check = JSON.parse(done.stdout) as GuardCheck
+  } catch {
+    $.ui.log('tako mod: paste-guard check failed', { to: 'debug' })
+    return 'pass'
+  }
+  const w = words(lang)
+  const found = guardFound(check.findings ?? [])
+  if (check.verdict === 'warn') {
+    $.ui.toast(w.guardWarned(found), { timeoutMs: 8_000 })
+    return 'pass'
+  }
+  if (check.verdict !== 'confirm') return 'pass'
+  // 「やめる」を先頭（既定の選択）に置く: 送信のつもりで押した Enter で送らない（#2046 と同じ考え）
+  let answer: string
+  try {
+    answer = await $.ui.ask(w.guardQuestion(found), { options: [w.guardCancel, w.guardSend], header: w.guardHeader })
+  } catch {
+    // 閉じた（Esc）= やめる
+    return 'drop'
+  }
+  return answer === w.guardSend ? 'pass' : 'drop'
 }
 
 // 端末の桁数（全角・CJK は 2 桁。Claude Code の配置と同じ数え方の近似）
@@ -1087,6 +1177,14 @@ async function absorbCards($: EngineInterface, view: TakoView | null): Promise<v
 }
 
 export const register: Register = on => {
+  // 送信時の確認（#2050）: 人の入力だけを送る前に tako へ判定させる。壊れても送信を止めない
+  on('prompt.submit', async ($, e, next) => {
+    if (GUARD_ORIGINS.includes(e.origin.kind) && (await guardPrompt($, e.text)) === 'drop') {
+      return { drop: words(lang).guardDropped }
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await wake($)

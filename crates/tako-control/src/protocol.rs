@@ -391,6 +391,11 @@ pub enum Request {
     /// `await_prompt` が true の場合、claude TUI の ❯ プロンプト表示を待ってから送信する。
     /// 全画面 TUI（claude 等）への newline つき送信は送達確認ループ（貼り付け →
     /// 分離 Enter → 入力欄の空検証 + 再送）で配送される（Issue #32。応答は queued）
+    ///
+    /// `paste_guard`（Issue #2050）は人の入力を中継する呼び手（スマホの PWA）だけが付ける:
+    /// `"human"` = 貼り付けの確認の段に従う（確認の段なら送らずに `sent: false` と伏せ字を返す）、
+    /// `"confirmed"` = 人が確かめた（送る）。無ければ AI・スクリプトの送信として扱い、
+    /// 止めずに送って応答に `paste_guard`（規則名と伏せ字）を付けるだけ
     Send {
         pane: Option<u64>,
         text: String,
@@ -400,6 +405,8 @@ pub enum Request {
         tmux_session: Option<String>,
         #[serde(default)]
         await_prompt: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paste_guard: Option<String>,
     },
     /// ペインの画面内容取得（FR-2.2.5）。`lines` は末尾からの行数制限。
     /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で読む
@@ -819,7 +826,12 @@ pub enum Request {
     /// PTY へ流す前に確かめる。`enabled` で on / off（永続化・次の貼り付けから効く）、
     /// `check` で判定だけを試す（GUI の貼り付けと同じ `tako_core::paste_guard::scan`）、
     /// `respond`（"send" / "cancel"）で確認待ちの貼り付けへ答える。どれも省略時は現在状態だけ。
-    /// **応答・ログに本文を載せない**（`check` の応答も伏せ字だけ）
+    /// **応答・ログに本文を載せない**（`check` の応答も伏せ字だけ）。
+    ///
+    /// Issue #2050: `mode`（"confirm" / "warn" = 警告だけ）、`allow`（その文字の当たりを
+    /// 許可リストへ足す。持つのは指紋と伏せ字だけ）、`unallow`（ID か "all"）、`rules`
+    /// （規則名 → 有効か）。`check` に `pane` を添えると mod の送信時の確認（2 段目）になり、
+    /// そのペインへ tako が流した値・人が確かめた値を外した上の `verdict` を返す
     PasteGuard {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enabled: Option<bool>,
@@ -827,6 +839,16 @@ pub enum Request {
         check: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         respond: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unallow: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rules: Option<std::collections::BTreeMap<String, bool>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
     },
     /// ペインの表示セル（0 始まり）を左クリックする = 押す + 離すを内側アプリへ渡す（Issue #1961）。
     /// GUI のクリックと同じ判断・同じバイト列（`tako_core::mouse_forward`）を通る。
@@ -3178,6 +3200,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: false,
+                paste_guard: None,
             }
         );
     }
@@ -3202,6 +3225,7 @@ mod tests {
             newline: true,
             tmux_session: None,
             await_prompt: false,
+            paste_guard: None,
         };
         assert_eq!(send.kind_name(), "Send");
         // #2046: 判定を試す本文（鍵らしき文字）も種別名の外へ出ない
@@ -3209,6 +3233,11 @@ mod tests {
             enabled: None,
             check: Some("secret-paste-text".into()),
             respond: None,
+            mode: None,
+            allow: Some("secret-allow-text".into()),
+            unallow: None,
+            rules: None,
+            pane: Some(3),
         };
         assert_eq!(check.kind_name(), "PasteGuard");
         // フィールド無し variant / struct variant の両形
@@ -3462,6 +3491,7 @@ mod tests {
                 newline: true,
                 tmux_session: None,
                 await_prompt: false,
+                paste_guard: None,
             },
             Request::Scroll {
                 pane: None,

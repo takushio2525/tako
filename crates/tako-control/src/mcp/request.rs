@@ -59,6 +59,8 @@ pub(super) fn build_request(
             newline: bool_arg(args, "newline")?.unwrap_or(true),
             tmux_session: str_arg(args, "tmux_session")?,
             await_prompt: bool_arg(args, "await_prompt")?.unwrap_or(false),
+            // #2050: MCP は AI の送信 = 止めずに送って応答で警告するだけ（人の中継の印は付けない）
+            paste_guard: None,
         },
         "tako_read_pane" => Request::Read {
             pane: Some(required_u64(args, "pane")?),
@@ -1178,17 +1180,38 @@ pub(super) fn build_request(
         },
         // #2046: 貼り付けの確認はツールを増やさず action で載せる（カタログの予算 = #1139）
         "tako_settings" if str_arg(args, "action")?.as_deref() == Some("paste_guard") => {
+            // #2050: 規則名 → 有効か（例 {"high_entropy": false}）
+            let rules = match args.get("rules") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(map)) => Some(
+                    map.iter()
+                        .map(|(name, on)| {
+                            on.as_bool()
+                                .map(|on| (name.clone(), on))
+                                .ok_or_else(|| format!("rules.{name} は true / false で指定する"))
+                        })
+                        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
+                ),
+                Some(_) => return Err("rules は {\"規則名\": true / false} で指定する".into()),
+            };
             Request::PasteGuard {
                 enabled: bool_arg(args, "enabled")?,
                 check: str_arg(args, "text")?,
                 respond: str_arg(args, "respond")?,
+                mode: str_arg(args, "mode")?,
+                allow: str_arg(args, "allow")?,
+                unallow: str_arg(args, "unallow")?,
+                rules,
+                pane: u64_arg(args, "pane")?,
             }
         }
         "tako_settings" => {
             // 貼り付けの確認の引数を他の action へ渡したら黙って捨てない
-            if let Some(key) = ["enabled", "text", "respond"]
-                .into_iter()
-                .find(|k| args.get(*k).is_some())
+            if let Some(key) = [
+                "enabled", "text", "respond", "mode", "allow", "unallow", "rules", "pane",
+            ]
+            .into_iter()
+            .find(|k| args.get(*k).is_some())
             {
                 return Err(format!("{key} は action=paste_guard のときだけ使える"));
             }

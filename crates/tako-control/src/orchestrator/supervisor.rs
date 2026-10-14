@@ -918,6 +918,7 @@ fn send_request(pane: u64, text: String) -> Request {
         newline: false,
         tmux_session: None,
         await_prompt: false,
+        paste_guard: None,
     }
 }
 

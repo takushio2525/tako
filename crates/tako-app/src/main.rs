@@ -993,6 +993,22 @@ fn initial_paste_guard() -> bool {
     tako_control::settings::load().paste_guard
 }
 
+/// 貼り付けの確認の段・許可リスト・無効にした規則（#2050）の起動時の値。セルフテストは既定で走る。
+/// 節の無い旧い settings.json も既定（確認・許可なし・全規則）で読む（serde の default）
+fn initial_paste_guard_policy() -> tako_core::paste_guard::Policy {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        return tako_core::paste_guard::Policy::default();
+    }
+    tako_control::settings::load().paste_guard_policy
+}
+
+/// 「警告だけ」の段で送った貼り付けの通知（#2050）。持つのは規則と伏せ字だけ（本文は持たない）
+struct PasteWarning {
+    findings: Vec<tako_core::paste_guard::Finding>,
+    /// 自動で消すときに、後から出た通知を消さないための通し番号
+    seq: u64,
+}
+
 /// 確認待ちの貼り付け（#2046）。**`Debug` を付けない**（本文がログへ出る道を作らない）
 struct PendingPaste {
     /// 送り先（貼り付けた時点でフォーカスしていたペイン。確認の間にフォーカスが動いても変えない）
@@ -2556,6 +2572,10 @@ struct TakoApp {
     pending_paste: Option<PendingPaste>,
     /// 貼り付けの確認の累計（#2046。`tako paste-guard` の stats）
     paste_guard_stats: tako_core::paste_guard::PasteGuardStats,
+    /// 貼り付けの確認の段・許可リスト・無効にした規則（#2050。`tako paste-guard warn|allow|rule`）
+    paste_guard_policy: tako_core::paste_guard::Policy,
+    /// 「警告だけ」の段で送った貼り付けの通知（#2050。None = 出ていない。数秒で消える）
+    paste_warning: Option<PasteWarning>,
     /// visual-test `paste-guard` の差し込み口（#2046）: 次の `paste()` がクリップボードの代わりに
     /// これを読む（偽の鍵でも OS のクリップボードとその履歴に残さない）。visual-test のビルドだけに在る
     #[cfg(feature = "visual-test")]
@@ -4896,6 +4916,8 @@ impl TakoApp {
             paste_guard: initial_paste_guard(),
             pending_paste: None,
             paste_guard_stats: tako_core::paste_guard::PasteGuardStats::default(),
+            paste_guard_policy: initial_paste_guard_policy(),
+            paste_warning: None,
             #[cfg(feature = "visual-test")]
             injected_paste: None,
             click_forward: None,
@@ -16547,33 +16569,84 @@ impl TakoApp {
     /// 端末ペインへの貼り付けの関所（#2046）。⌘V / Ctrl+V / Shift+Insert / メニューの「貼り付け」は
     /// すべて `paste()` の振り分けからここへ来る。本文に鍵らしきものがあれば **PTY へ 1 バイトも流さず**
     /// 確認を出し、答え（[`Self::answer_pending_paste`]）を待つ。判定は
-    /// `tako_core::paste_guard::scan` の 1 実装（先頭 64 KB だけを見るので UI スレッドで数 ms 以内）
+    /// `tako_core::paste_guard::scan_with` の 1 実装（先頭 64 KB だけを見るので UI スレッドで数 ms 以内）。
+    /// #2050: 許可リスト・無効にした規則を当て、「警告だけ」の段なら止めずに送って通知だけ出す
     fn paste_to_terminal(&mut self, pane: PaneId, text: String, cx: &mut Context<Self>) {
         if !self.terminals.contains_key(&pane) {
             return;
         }
         if self.paste_guard && !tako_core::paste_guard::legacy() && !text.is_empty() {
+            use tako_core::paste_guard as pg;
+            let legacy_2050 = pg::legacy_2050();
             let started = std::time::Instant::now();
-            let report = tako_core::paste_guard::scan(&text);
+            let report = if legacy_2050 {
+                pg::scan_with(&text, &pg::Policy::default())
+            } else {
+                pg::scan_with(&text, &self.paste_guard_policy)
+            };
             let stats = &mut self.paste_guard_stats;
             stats.checked += 1;
             stats.last_scan_us = started.elapsed().as_micros() as u64;
             stats.last_scanned_bytes = report.scanned_bytes;
             if report.hit() {
-                stats.prompted += 1;
-                // 診断ログへは規則名と件数だけ（本文・伏せ字を書かない = 絶対ルール）
+                let warn_only = !legacy_2050 && self.paste_guard_policy.mode == pg::Mode::Warn;
+                if !warn_only {
+                    stats.prompted += 1;
+                    // 診断ログへは規則名と件数だけ（本文・伏せ字を書かない = 絶対ルール）
+                    tako_control::diag::persist_log(&tako_core::paste_guard::log_line(
+                        "prompted",
+                        pane.as_u64(),
+                        &report,
+                    ));
+                    self.pending_paste = Some(PendingPaste { pane, text, report });
+                    cx.notify();
+                    return;
+                }
+                // 警告だけ: 送って通知を出す。送った値はこのペインの確認済み（mod の送信時の
+                // 確認で二度聞かない）
+                stats.warned += 1;
                 tako_control::diag::persist_log(&tako_core::paste_guard::log_line(
-                    "prompted",
+                    "warned",
                     pane.as_u64(),
                     &report,
                 ));
-                self.pending_paste = Some(PendingPaste { pane, text, report });
-                cx.notify();
-                return;
+                tako_control::paste_guard::note_delivered(pane.as_u64(), &text);
+                self.show_paste_warning(report.findings, cx);
             }
         }
         if let Some(session) = self.terminals.get(&pane) {
             session.paste(&text);
+        }
+    }
+
+    /// 「警告だけ」の段で送った貼り付けの通知を出し、数秒で消す（#2050。クリックでも消える）
+    fn show_paste_warning(
+        &mut self,
+        findings: Vec<tako_core::paste_guard::Finding>,
+        cx: &mut Context<Self>,
+    ) {
+        /// 通知が消えるまで（読む時間を奪わない長さ）
+        const SHOWN_FOR: Duration = Duration::from_secs(8);
+        let seq = self.paste_warning.as_ref().map_or(0, |w| w.seq) + 1;
+        self.paste_warning = Some(PasteWarning { findings, seq });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SHOWN_FOR).await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                if app.paste_warning.as_ref().is_some_and(|w| w.seq == seq) {
+                    app.paste_warning = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// tako が自分でペインへ流すプロンプト（worker の初回・引き継ぎ・送達確認つきの送信）の値を、
+    /// そのペインの確認済みとして覚える（#2050。mod の送信時の確認で worker の claude を止めない）
+    fn note_flow_delivered(&self, pane: PaneId, text: &str) {
+        if self.paste_guard {
+            tako_control::paste_guard::note_delivered(pane.as_u64(), text);
         }
     }
 
@@ -16595,6 +16668,9 @@ impl TakoApp {
                 Some(session) => {
                     session.paste(&pending.text);
                     self.paste_guard_stats.sent += 1;
+                    // 人が確かめた値はこのペインの確認済み（#2050。直後の Enter で mod がもう一度
+                    // 聞かない）
+                    tako_control::paste_guard::note_delivered(pane, &pending.text);
                     "send"
                 }
                 None => {
@@ -18402,6 +18478,7 @@ impl TakoApp {
                     newline: cmd_held,
                     tmux_session: None,
                     await_prompt: false,
+                    paste_guard: None,
                 },
                 PaneOrigin::User,
             );
@@ -18497,6 +18574,7 @@ impl TakoApp {
                     newline: false,
                     tmux_session: None,
                     await_prompt: false,
+                    paste_guard: None,
                 },
                 PaneOrigin::User,
             );
@@ -24362,6 +24440,7 @@ impl SessionHost for TakoApp {
     }
 
     fn queue_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+        self.note_flow_delivered(pane, &prompt);
         self.prompt_flows.push(PromptFlow::new(
             pane,
             prompt,
@@ -24371,6 +24450,7 @@ impl SessionHost for TakoApp {
     }
 
     fn queue_spawn_prompt_flow(&mut self, pane: PaneId, prompt: String) {
+        self.note_flow_delivered(pane, &prompt);
         self.prompt_flows.push(PromptFlow::new(
             pane,
             prompt,
@@ -24380,6 +24460,7 @@ impl SessionHost for TakoApp {
     }
 
     fn queue_send_flow(&mut self, pane: PaneId, text: String) {
+        self.note_flow_delivered(pane, &text);
         self.prompt_flows.push(PromptFlow::new(
             pane,
             text,
@@ -24533,6 +24614,29 @@ impl SessionHost for TakoApp {
                     truncated: p.report.truncated(),
                 }),
             stats: self.paste_guard_stats.clone(),
+            policy: self.paste_guard_policy.clone(),
+        }
+    }
+
+    fn paste_guard_policy_base(&self) -> tako_core::paste_guard::Policy {
+        // 保存済みの設定を土台にする（settings.json を手で直した後の変更で、古いメモリの許可リストを
+        // 書き戻さない）。セルフテスト中はユーザー設定を読まない
+        if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            return self.paste_guard_policy.clone();
+        }
+        tako_control::settings::load().paste_guard_policy
+    }
+
+    fn set_paste_guard_policy(&mut self, policy: tako_core::paste_guard::Policy) {
+        // 次の貼り付け・次の送信から効く
+        self.paste_guard_policy = policy.clone();
+        // セルフテスト中はユーザー設定を汚さない（scrollback と同じ規約）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.paste_guard_policy = policy;
+            if let Err(e) = tako_control::settings::save(&settings) {
+                eprintln!("warning: 設定を保存できない: {e}");
+            }
         }
     }
 
@@ -29329,6 +29433,8 @@ impl Render for TakoApp {
             .children(self.render_close_confirm_dialog(cx))
             // #2046: 貼り付けの確認（閉じる確認と同時には出ない。出ても手前）
             .children(self.render_paste_guard_dialog(cx))
+            // #2050: 「警告だけ」の段で送った貼り付けの通知（操作を止めない・数秒で消える）
+            .children(self.render_paste_warning(cx))
             // #615: カードをインジケータ直上へ収めるためビューポート実寸を渡す
             .children(self.render_remote_overlay(window, cx))
             .children(self.render_command_palette(cx))
@@ -29473,6 +29579,91 @@ impl TakoApp {
 }
 
 impl TakoApp {
+    /// 「警告だけ」の段で送った貼り付けの通知（#2050）。画面の上の中央に小さなカードを出すだけで
+    /// 操作は止めない（全面の半透明を敷かない）。規則と伏せ字だけを並べ、押すと消える
+    fn render_paste_warning(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        use crate::ui_text::paste_guard as txt;
+        /// 並べる上限（超えたぶんは「ほか N 件」）
+        const MAX_ROWS: usize = 3;
+        let warning = self.paste_warning.as_ref()?;
+        let theme = &self.theme;
+        let findings = &warning.findings;
+        let rows = findings.iter().take(MAX_ROWS).map(|f| {
+            div()
+                .text_size(px(11.5))
+                .text_color(hsla(theme.tab_inactive_foreground))
+                .child(SharedString::from(format!(
+                    "{} · {}",
+                    txt::rule_label(f.rule),
+                    f.masked
+                )))
+        });
+        Some(
+            div()
+                .absolute()
+                .top(px(44.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("paste-guard-warning")
+                        .relative()
+                        .max_w(px(460.0))
+                        .px_3()
+                        .py_2()
+                        .rounded(px(10.0))
+                        .cursor_pointer()
+                        .bg(rgba(theme.tab_bar_background))
+                        .border_1()
+                        .border_color(hsla(theme.border_subtle))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::rgba(0x00000055).into(),
+                            offset: point(px(0.), px(3.)),
+                            blur_radius: px(16.0),
+                            spread_radius: px(0.),
+                            inset: false,
+                        }])
+                        .when_some(
+                            self.input_rect_probe_canvas("paste-guard-warning"),
+                            |d, c| d.child(c),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.paste_warning = None;
+                            cx.notify();
+                        }))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(theme.foreground))
+                                .child(txt::warned_title()),
+                        )
+                        .children(rows)
+                        .when(findings.len() > MAX_ROWS, |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(hsla(theme.text_overlay))
+                                    .child(SharedString::from(txt::more(
+                                        findings.len() - MAX_ROWS,
+                                    ))),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.text_overlay))
+                                .child(txt::warned_hint()),
+                        ),
+                ),
+        )
+    }
+
     /// 貼り付けの確認ダイアログ（#2046）。閉じる確認（#172）と同じ部品の形（全面の半透明 +
     /// 中央のカード）。当たった規則と伏せ字を並べ、「やめる」を既定（Esc / Enter）にする。
     /// 「送る」はボタンを押したときだけ（CLI / MCP は `tako paste-guard send` / respond=send）
@@ -47731,6 +47922,7 @@ mod self_test {
                             newline: true,
                             tmux_session: None,
                             await_prompt: false,
+                            paste_guard: None,
                         },
                         PaneOrigin::User,
                     );
@@ -47780,6 +47972,7 @@ mod self_test {
                                 newline: true,
                                 tmux_session: None,
                                 await_prompt: false,
+                                paste_guard: None,
                             },
                             PaneOrigin::User,
                         );
@@ -68496,6 +68689,7 @@ mod self_test {
                             newline: true,
                             tmux_session: None,
                             await_prompt: false,
+                            paste_guard: None,
                         },
                         PaneOrigin::Cli,
                     )
@@ -77115,6 +77309,7 @@ mod self_test {
                                 newline: false,
                                 tmux_session: None,
                                 await_prompt: false,
+                                paste_guard: None,
                             },
                             PaneOrigin::User,
                         )
@@ -77244,6 +77439,7 @@ mod self_test {
                                 newline: false,
                                 tmux_session: None,
                                 await_prompt: false,
+                                paste_guard: None,
                             },
                             PaneOrigin::User,
                         )
@@ -79494,6 +79690,7 @@ mod self_test {
                             newline: true,
                             tmux_session: None,
                             await_prompt: false,
+                            paste_guard: None,
                         },
                         PaneOrigin::User,
                     );
@@ -81440,6 +81637,7 @@ mod self_test {
                         newline: true,
                         tmux_session: None,
                         await_prompt: false,
+                        paste_guard: None,
                     },
                     cx,
                 )

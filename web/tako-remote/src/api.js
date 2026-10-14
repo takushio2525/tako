@@ -23,6 +23,8 @@ export function createClient() {
       const err = await resp.json().catch(() => ({}));
       const e = new Error(err.error || `HTTP ${resp.status}`);
       e.status = resp.status;
+      // 応答の中身（#2050: 鍵らしき文字の 409 は伏せ字の `paste_guard` を持つ）
+      e.body = err;
       throw e;
     }
     return resp.json();
@@ -59,8 +61,11 @@ export function createClient() {
     scrollback(id, lines = 1000) {
       return request('GET', `/api/panes/${encodeURIComponent(id)}/scrollback?lines=${lines}`);
     },
-    input(id, text, newline = true) {
-      return request('POST', `/api/panes/${encodeURIComponent(id)}/input`, { text, newline });
+    // #2050: 鍵らしき文字で 409 が返ったら確認して `confirmSecret` で送り直す（components/paste-guard.jsx）
+    input(id, text, newline = true, opts = {}) {
+      const body = { text, newline };
+      if (opts.confirmSecret) body.confirm_secret = true;
+      return request('POST', `/api/panes/${encodeURIComponent(id)}/input`, body);
     },
     sendKeys(id, keys) {
       return request('POST', `/api/panes/${encodeURIComponent(id)}/input`, { keys });
