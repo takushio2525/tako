@@ -725,6 +725,37 @@ impl LiveClaudeSession {
             status: agent["status"].as_str().map(|s| s.to_string()),
         })
     }
+
+    /// tako mod の報告から作る（#2041。`claude agents --json` を起こさずにチャット表示の材料を埋める）。
+    ///
+    /// `session_id` は [`tako_core::claude_mod::monitor_plan`] が答えた会話 ID（20 秒以内・会話 ID つき）。
+    /// 報告を送るのはペインの env で mod を読んだ claude（tako が app から起こす `claude -p` には注入しない
+    /// = 設計書 §3.3）なので対話型として扱う（#2017 のセッションカタログの `detected_from_mod` と同じ前提）。
+    /// 状態は監視と同じ `ModTurn::status_word`、ctx% は持たない（チャットは mod → 画面 → transcript の
+    /// 解決 `ctx_usage::resolve_full` で報告の値を使う）
+    pub fn from_mod(
+        session_id: String,
+        report: &tako_core::claude_mod::ModReport,
+        screen_busy: bool,
+    ) -> Self {
+        Self {
+            session_id,
+            interactive: true,
+            model: report.model.clone(),
+            ctx_percent: None,
+            status: Some(report.turn.status_word(screen_busy).to_string()),
+        }
+    }
+}
+
+/// live 解決で答えが要るペイン（#2041）。GUI モードのチャット表示が、mod の報告が答えなかったペインだけを
+/// [`live_claude_sessions_asking`] へ渡す
+#[derive(Debug, Clone, Copy)]
+pub struct LiveAsk<'a> {
+    /// 器あり: 器のセッション名
+    pub backends: &'a [String],
+    /// 器なし: (tako のペイン ID, PTY 直下の子 pid)
+    pub direct: &'a [(u64, u32)],
 }
 
 /// 全バックエンドセッションの live claude セッションを一括解決する
@@ -737,7 +768,7 @@ impl LiveClaudeSession {
 /// 器の有無を問わず解決したい経路は [`live_claude_sessions`] を使う
 pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
     // 器なしの生存情報を持たない呼び出し（= 器なしの記憶は判断しないで保持する）
-    live_claude_sessions_in(None)
+    live_claude_sessions_in(None, None)
         .into_iter()
         .filter_map(|(key, session)| match key {
             LiveSessionKey::Backend(backend) => Some((backend, session)),
@@ -755,14 +786,29 @@ pub fn live_claude_sessions_by_backend() -> HashMap<String, LiveClaudeSession> {
 pub fn live_claude_sessions(
     direct_panes: &[(u64, u32)],
 ) -> HashMap<LiveSessionKey, LiveClaudeSession> {
-    live_claude_sessions_in(Some(direct_panes))
+    live_claude_sessions_in(Some(direct_panes), None)
+}
+
+/// [`live_claude_sessions`] の走査を答えが要るペインへ絞る版（#2041）。
+///
+/// 起こすのは `ask` のペインの子孫に claude が居る走査先と既定だけ（台帳で絞る = #2017 の
+/// [`ScanScope::Under`]）。範囲の外の claude は返らないことがあるので、`ask` のペインの答えだけを読むこと
+/// （範囲の外のキーは #466 の sticky が前回の答えを保つ）。`direct_panes` は器なしペインの全部
+/// （sticky の生存判定に使う。[`live_claude_sessions`] と同じ）
+pub fn live_claude_sessions_asking(
+    direct_panes: &[(u64, u32)],
+    ask: LiveAsk<'_>,
+) -> HashMap<LiveSessionKey, LiveClaudeSession> {
+    live_claude_sessions_in(Some(direct_panes), Some(ask))
 }
 
 /// live 解決の本体。`direct_panes` が `None` のときは「器なしの生存情報を持たない
 /// 呼び出し」= 器なしの sticky を**判断せず保持する**（器ありだけを問う
-/// [`live_claude_sessions_by_backend`] が器なしの記憶を消さないため）
+/// [`live_claude_sessions_by_backend`] が器なしの記憶を消さないため）。
+/// `ask` が `Some` なら走査をそのペインの範囲へ絞る（#2041）
 fn live_claude_sessions_in(
     direct_panes: Option<&[(u64, u32)]>,
+    ask: Option<LiveAsk<'_>>,
 ) -> HashMap<LiveSessionKey, LiveClaudeSession> {
     use std::sync::Mutex;
     // 最後に live 解決できた backend → セッションの記憶（#466）。
@@ -790,7 +836,25 @@ fn live_claude_sessions_in(
     // 5 秒窓では 5 秒ごとに必ず再走査が起きる（実測 1 スキャン CPU 0.89 秒 = 1 コアの約 18%）。
     // 30 秒にすると約 3% になる。新しく起動した claude の認識は最悪 30 秒遅れるが、
     // 既に解決済みのペインは #466 の sticky が保つ
-    let fresh = match list_agents_with_freshness(AgentScanFreshness::Ui) {
+    let listed = match ask {
+        None => list_agents_with_freshness(AgentScanFreshness::Ui),
+        // #2041: 答えが要るペインの子孫に claude が居る走査先だけを起こす（mod の報告が答えたペインの
+        // claude しか居ないアカウントは起こさない）
+        Some(ask) => {
+            let mut roots: Vec<u32> = panes
+                .iter()
+                .filter(|(id, _)| {
+                    ask.backends
+                        .iter()
+                        .any(|b| id.starts_with(&format!("{b}:")))
+                })
+                .map(|(_, pid)| *pid)
+                .collect();
+            roots.extend(ask.direct.iter().map(|(_, pid)| *pid));
+            list_agents_scoped(AgentScanFreshness::Ui, &ScanScope::Under(roots))
+        }
+    };
+    let fresh = match listed {
         Ok(agents) if !agents.is_empty() => {
             let parents = process_parent_map();
             Some(live_sessions_inner(&panes, direct, &agents, &parents))

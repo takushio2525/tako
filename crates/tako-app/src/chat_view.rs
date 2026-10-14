@@ -3824,6 +3824,9 @@ pub(crate) struct ChatRefreshTarget {
     screen_ctx_percent: Option<f64>,
     /// tako mod の報告（#1880。UI スレッドで引き当てて写す。新鮮なら ctx% の先頭）
     mod_ctx: tako_core::ctx_usage::ModCtxInput,
+    /// mod の報告が答えた live 解決（#2041。20 秒以内・会話 ID つき = 監視と同じ
+    /// `claude_mod::monitor_plan`）。`Some` のペインは `claude agents --json` に問わない
+    mod_live: Option<tako_control::agents::LiveClaudeSession>,
     /// 前回の読み取り結果（mtime ゲートに使う）
     prev_session: Option<String>,
     prev_path: Option<std::path::PathBuf>,
@@ -3923,6 +3926,30 @@ impl TakoApp {
                 let lines = session.visible_lines();
                 let metrics = session.agent_metrics();
                 let previous = self.chat_panes.get(pane);
+                let screen_busy = tako_control::claude_tui::is_busy(&lines);
+                let looked_up = tako_core::claude_mod::lookup(
+                    Some(&self.claude_mod),
+                    pane.as_u64(),
+                    mod_now,
+                    mod_legacy,
+                );
+                // #2041: 新しい報告（会話 ID つき）があれば live 解決もそこから採る（判断は監視と同じ
+                // `monitor_plan`。メモリ上の報告を写すだけ = UI スレッドで子プロセスを起こさない）。
+                // A/B（`TAKO_2041_LEGACY`）は読み取り側（`chat_live_sessions`）が使わない
+                let mod_live = match tako_core::claude_mod::monitor_plan(
+                    &looked_up, mod_now, None, false,
+                ) {
+                    tako_core::claude_mod::MonitorPlan::Mod { session_id } => {
+                        looked_up.as_ref().ok().map(|stored| {
+                            tako_control::agents::LiveClaudeSession::from_mod(
+                                session_id,
+                                &stored.report,
+                                screen_busy,
+                            )
+                        })
+                    }
+                    tako_core::claude_mod::MonitorPlan::Scan { .. } => None,
+                };
                 Some(ChatRefreshTarget {
                     pane: *pane,
                     key,
@@ -3930,19 +3957,15 @@ impl TakoApp {
                     read_only: role
                         .as_deref()
                         .is_some_and(tako_core::ui_mode::is_read_only_role),
-                    screen_busy: tako_control::claude_tui::is_busy(&lines),
+                    screen_busy,
                     queued: tako_control::claude_tui::queued_messages_pending(&lines),
                     // #716: 承認カードの表示条件は「画面にダイアログが実在する」こと
                     // （PWA #425 / #577 と同じ。transcript からの推定は使わない）
                     permission: tako_control::claude_tui::detect_permission_dialog(&lines),
                     screen_model: metrics.as_ref().and_then(|m| m.model.clone()),
                     screen_ctx_percent: metrics.and_then(|m| m.ctx_percent).map(f64::from),
-                    mod_ctx: tako_core::claude_mod::ctx_input(&tako_core::claude_mod::lookup(
-                        Some(&self.claude_mod),
-                        pane.as_u64(),
-                        mod_now,
-                        mod_legacy,
-                    )),
+                    mod_ctx: tako_core::claude_mod::ctx_input(&looked_up),
+                    mod_live,
                     prev_session: previous.map(|p| p.session_id.clone()),
                     prev_path: previous.and_then(|p| p.transcript.clone()),
                     prev_stamp: previous.and_then(|p| p.stamp),
@@ -4081,8 +4104,8 @@ impl TakoApp {
 
 /// 背景スレッドでの読み取り（tmux / ps / claude agents / transcript のファイル I/O）。
 ///
-/// `claude agents --json` は TTL キャッシュ + sticky 解決（#466）の
-/// `live_claude_sessions_by_backend` を 1 回だけ呼ぶ。transcript は
+/// `claude agents --json` は TTL キャッシュ + sticky 解決（#466）の live 解決を 1 回だけ呼ぶ。
+/// #2041: mod の報告が答えたペインは問わない（[`chat_live_sessions`]）。transcript は
 /// **mtime とサイズが変わったときだけ**読み直す
 pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefreshResult> {
     if targets.is_empty() {
@@ -4121,7 +4144,7 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
                 )
             })
             .collect(),
-        false => tako_control::agents::live_claude_sessions(&direct),
+        false => chat_live_sessions(&targets, &direct),
     };
     targets
         .into_iter()
@@ -4203,6 +4226,59 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
             }
         })
         .collect()
+}
+
+/// チャット表示の live 解決（#2041）。mod の報告が答えたペインは報告から埋め、`claude agents --json` は
+/// **答えの要るペイン**（[`chat_scan_ask`]）が残るときだけ、その範囲に絞って起こす。
+///
+/// 修正前は 2 秒 tick のたびに全アカウントを問い（鮮度 30 秒 = 30 秒ごとにアカウント数ぶん起こす）、
+/// mod の報告が会話 ID を運んでいても走査していた。A/B の `TAKO_2041_LEGACY=1` は修正前の呼び方そのもの
+fn chat_live_sessions(
+    targets: &[ChatRefreshTarget],
+    direct: &[(u64, u32)],
+) -> std::collections::HashMap<
+    tako_control::agents::LiveSessionKey,
+    tako_control::agents::LiveClaudeSession,
+> {
+    if tako_core::claude_mod::session_legacy() {
+        return tako_control::agents::live_claude_sessions(direct);
+    }
+    let (backends, ask_direct) = chat_scan_ask(targets);
+    let mut live = match backends.is_empty() && ask_direct.is_empty() {
+        true => std::collections::HashMap::new(),
+        false => tako_control::agents::live_claude_sessions_asking(
+            direct,
+            tako_control::agents::LiveAsk {
+                backends: &backends,
+                direct: &ask_direct,
+            },
+        ),
+    };
+    // 報告の答えが勝つ（走査の答えや sticky の記憶は 30 秒古くてよい材料。報告は 20 秒以内）
+    for target in targets {
+        if let Some(session) = &target.mod_live {
+            live.insert(target.key.clone(), session.clone());
+        }
+    }
+    live
+}
+
+/// `claude agents --json` に問う必要があるペイン（#2041。純関数）: 子プロセスが動いていて
+/// （= claude が居うる）mod の報告が答えなかったペインだけ。返り値は（器のセッション名, 器なしの
+/// (ペイン ID, PTY 直下の子 pid)）
+fn chat_scan_ask(targets: &[ChatRefreshTarget]) -> (Vec<String>, Vec<(u64, u32)>) {
+    let mut backends = Vec::new();
+    let mut direct = Vec::new();
+    for target in targets
+        .iter()
+        .filter(|t| t.agent_running && t.mod_live.is_none())
+    {
+        match &target.key {
+            tako_control::agents::LiveSessionKey::Backend(b) => backends.push(b.clone()),
+            tako_control::agents::LiveSessionKey::Pane { pane, pid } => direct.push((*pane, *pid)),
+        }
+    }
+    (backends, direct)
 }
 
 /// transcript の (更新時刻, サイズ)。どちらか変われば読み直す
@@ -4631,5 +4707,116 @@ mod tests {
         let mut empty = ChatTextIndex::default();
         let _ = empty.push(&theme, String::new(), Vec::new(), theme.foreground, None);
         assert_eq!(empty.texts, vec![""]);
+    }
+
+    // --- #2041: チャット表示の live 解決を mod の報告の後ろへ -------------------------------
+
+    const SID_2041: &str = "2041eeee-0000-4000-8000-0000000000e5";
+
+    fn mod_live_2041(turn: &str) -> tako_control::agents::LiveClaudeSession {
+        let report = tako_core::claude_mod::parse_report(json!({
+            "schema": 1, "mod_version": "t", "at": 1, "turn": turn,
+            "session_id": SID_2041, "model": "claude-haiku-5-5",
+        }))
+        .unwrap();
+        tako_control::agents::LiveClaudeSession::from_mod(SID_2041.into(), &report, false)
+    }
+
+    fn target_2041(
+        key: tako_control::agents::LiveSessionKey,
+        agent_running: bool,
+        mod_live: Option<tako_control::agents::LiveClaudeSession>,
+        prev_path: Option<std::path::PathBuf>,
+    ) -> ChatRefreshTarget {
+        ChatRefreshTarget {
+            pane: PaneId::from_raw(1),
+            key,
+            agent_running,
+            read_only: false,
+            screen_busy: false,
+            queued: false,
+            permission: None,
+            screen_model: None,
+            // 画面が ctx% を出している = transcript の ctx を読みに行かない
+            screen_ctx_percent: Some(12.0),
+            mod_ctx: tako_core::ctx_usage::ModCtxInput::Unavailable("mod_absent"),
+            mod_live,
+            prev_session: Some(SID_2041.into()),
+            prev_path,
+            prev_stamp: None,
+        }
+    }
+
+    /// 受け入れ条件 1 の核: claude のペインが mod の報告を出している間、チャットの更新は
+    /// `claude agents --json` に問わず、会話 ID・モデル・状態を報告から採る
+    /// （修正前は 2 秒 tick のたびに全アカウントの走査へ問い合わせていた）
+    #[test]
+    fn issue2041_modの報告が答えたペインはチャットの更新で走査しない() {
+        let dir = tako_core::test_residue::process_scratch("chat-2041");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 同じ会話の解決済みの transcript（実在するので所在の探索もしない）
+        let transcript = dir.join(format!("{SID_2041}.jsonl"));
+        std::fs::write(&transcript, "").unwrap();
+        let targets = vec![
+            target_2041(
+                tako_control::agents::LiveSessionKey::Backend("tako-s2041".into()),
+                true,
+                Some(mod_live_2041("busy")),
+                Some(transcript.clone()),
+            ),
+            // 子プロセスの無いペイン（シェルだけ）は報告が無くても問わない
+            target_2041(
+                tako_control::agents::LiveSessionKey::pane(9, 4242),
+                false,
+                None,
+                None,
+            ),
+        ];
+        let before = tako_control::orchestrator::agents_scan_consults_here();
+        let results = load_chat_refresh(targets);
+        assert_eq!(
+            tako_control::orchestrator::agents_scan_consults_here() - before,
+            0,
+            "chat_view.rs の load_chat_refresh が mod の報告が答えたペインのために              `claude agents --json` へ問い合わせた（#2041）"
+        );
+        let chat = results[0].chat.as_ref().expect("報告の会話でチャットが立つ");
+        assert_eq!(chat.session_id, SID_2041);
+        assert_eq!(chat.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(chat.agent_status.as_deref(), Some("busy"));
+        assert!(results[1].chat.is_none());
+    }
+
+    /// 走査が要るのは「子プロセスが動いていて mod の報告が答えなかった」ペインだけ（範囲もそこへ絞る）
+    #[test]
+    fn issue2041_走査を問うのは報告の無いclaudeのペインだけ() {
+        use tako_control::agents::LiveSessionKey;
+        let targets = vec![
+            target_2041(
+                LiveSessionKey::Backend("tako-mod".into()),
+                true,
+                Some(mod_live_2041("idle")),
+                None,
+            ),
+            target_2041(LiveSessionKey::Backend("tako-nomod".into()), true, None, None),
+            target_2041(LiveSessionKey::pane(3, 333), true, None, None),
+            target_2041(LiveSessionKey::pane(4, 444), true, Some(mod_live_2041("idle")), None),
+            target_2041(LiveSessionKey::Backend("tako-shell".into()), false, None, None),
+        ];
+        assert_eq!(
+            chat_scan_ask(&targets),
+            (vec!["tako-nomod".to_string()], vec![(3, 333)])
+        );
+        // 全部が報告で答えたら問う先は無い = 走査を起こさない
+        assert_eq!(chat_scan_ask(&targets[..1]), (Vec::new(), Vec::new()));
+    }
+
+    /// 報告の状態は監視と同じ語彙（permission / question は waiting = チャットは busy にしない）
+    #[test]
+    fn issue2041_報告から組むlive解決は対話型で状態は監視と同じ語彙() {
+        let live = mod_live_2041("permission");
+        assert!(live.interactive);
+        assert_eq!(live.status.as_deref(), Some("waiting"));
+        assert_eq!(live.ctx_percent, None, "ctx% は mod → 画面 → transcript の段が採る");
+        assert_eq!(mod_live_2041("idle").status.as_deref(), Some("idle"));
     }
 }
