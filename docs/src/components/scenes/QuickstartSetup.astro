@@ -55,7 +55,7 @@ import '../../styles/quickstart.css';
 					]}
 					focus
 				>
-					<div class="tk-qs-log">
+					<div data-fx="log">
 						<span class="tk-l"><span class="tk-p">~ ❯</span> tako setup</span>
 						<span class="tk-l tk-b">tako セットアップ</span>
 						<span class="tk-l tk-dim">═════════════════</span>
@@ -87,7 +87,7 @@ import '../../styles/quickstart.css';
 				</Pane>
 			</div>
 		</div>
-		<span slot="overlay" data-at="1" data-fx="fade"><Pointer path="1:83,28" click="1" /></span>
+		<Pointer slot="overlay" path="1:83,28 2:-" click="1" />
 	</TakoWindow>
 
 	<Step title="バナーの「セットアップを実行」を押す">

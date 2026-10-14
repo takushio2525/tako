@@ -174,32 +174,32 @@ v6 のタイムラインは事故を避けるため、guimode の 2 区間だけ
 | 章 | 主張 | 裏取り |
 |---|---|---|
 | 1 | AI エージェント利用で 1 作業が「本体 + 子エージェント + dev サーバー + ログ」に分裂しタブ / ウインドウに散らばる | `README.md`「なぜ tako?」 |
-| 1 | AI に操作させるには tmux / スクリプト / MCP 設定を自前で繋ぎ込む必要があった | `docs/src/content/docs/features/orchestration.md`「なぜターミナルに組み込むのか」 |
+| 1 | AI に操作させるには tmux / スクリプト / MCP 設定を自前で繋ぎ込む必要があった | `docs/src/content/docs/features/orchestration.mdx`「なぜターミナルに組み込むのか」 |
 | 1, 2 | 1 グループ = 1 タブ。AI が起こした子プロセスのペインは同じタブに生える | `README.md`「なぜ tako?」/ `docs/.../features/tabs-and-panes.md`「AI からの操作」（呼び出し元と同じタブに生成） |
 | 2 | 内蔵 MCP サーバー。初回登録だけで以後どのプロジェクトでも設定不要 | `docs/.../features/mcp-server.md`「仕組み」/ `README.md`「Claude Code 連携」 |
 | 2 | 公開ツールは 140 個以上 | `crates/tako-control/testdata/mcp_tools_full_snapshot.json`（2026-09-03 時点で 144 ツール。docs の「128 個」は古い） |
 | 2 | UI でできることはすべて CLI / MCP からもできる（不変条件） | `AGENTS.md`「機能実装時の必須ルール」設計原則 5 / `docs/.../features/mcp-server.md`「設計思想: AI フルコントロール」 |
 | 2 | テーマ / 表示モード / パネルがコマンドで切り替わる | `tako theme` / `tako ui-mode` / `tako panel`（`tako --help`。収録で実演） |
-| 3 | Homebrew 1 行でアプリと CLI が入る。zip 手動も可 | `README.md`「インストール」/ `docs/.../getting-started/index.md`「1. インストール」 |
+| 3 | Homebrew 1 行でアプリと CLI が入る。zip 手動も可 | `README.md`「インストール」/ `docs/.../getting-started/index.mdx`「1. インストール」 |
 | 3 | Claude 未導入でも `tako setup` から始められる（インストール → PATH → ログインの 3 段。実行前に計画を表示） | `AGENTS.md` コマンド表「自動セットアップ」（#868 / #1057）/ `tako setup bootstrap install --dry-run`（収録で実演） |
 | 3 | 認証済み CLI が 1 つなら質問ゼロ。claude / codex / agy を検出、プラン別プロファイル生成、MCP 登録 | `docs/.../getting-started/index.mdx`「3. tako setup」/ `docs/.../getting-started/quickstart.mdx` |
 | 3 | 検出後に対話アシスタントが自動起動。現状を読んでから答え、反映は同意した項目だけ | `crates/tako-cli/src/setup.rs`（`launch_setup_agent`）/ `resources/setup/system-prompt.md`（#470 台本の「③ setup」節に精査記録） |
 | 4 | Cmd+D / Cmd+Shift+D の分割、境界ドラッグ、ペイン並べ替え | `docs/.../features/tabs-and-panes.md` |
-| 4 | Cmd+B でファイルツリー。タブ内の cwd を自動でワークスペース表示 | `docs/.../features/file-preview.md`「ファイルツリー」 |
-| 4 | md レンダリング / ライブリロード / PDF（選択・目次・ズーム）/ 画像 / 210+ 形式のハイライト / 軽い編集 / Code Runner | `docs/.../features/file-preview.md` / `AGENTS.md` コマンド表（#233 / #453 / #124 / #126） |
+| 4 | Cmd+B でファイルツリー。タブ内の cwd を自動でワークスペース表示 | `docs/.../features/file-preview.mdx`「ファイルツリー」 |
+| 4 | md レンダリング / ライブリロード / PDF（選択・目次・ズーム）/ 画像 / 210+ 形式のハイライト / 軽い編集 / Code Runner | `docs/.../features/file-preview.mdx` / `AGENTS.md` コマンド表（#233 / #453 / #124 / #126） |
 | 5 | `tako master` で今いるペインが司令塔になる。日本語で話しかけるだけ | `docs/.../features/orchestrator.md`「tako master で何が起きるか」 |
-| 5 | 依頼を成果物ごとに分解（1 worker = 1 成果物）。指示は型で、送達確認つき | `docs/.../features/orchestration.md`「品質は仕組みで作り込まれる」/「監視と回収まで自動で起きる」 |
-| 5 | worker は同じタブにグリッド配置。master の取り分を保つ | `AGENTS.md` コマンド表「worker spawn のレイアウト設定」（#165）/ `docs/.../features/orchestration.md` |
-| 5 | 右パネル orch ビューで親子関係・稼働時間・ctx 使用率を俯瞰 | `docs/.../features/orchestration.md`（orch-panel-detail の説明）/ `tako panel --view orch` |
-| 5 | かんたん表示: Claude 対話ペインがチャット画面、空ペインがボタン。表示だけの切替 | `docs/.../features/gui-mode.md` |
-| 5 | 完了・入力待ち・消滅を自動検知。証拠を検査してから報告。片付けも master | `docs/.../features/orchestration.md` / `docs/.../features/orchestrator.md`「仕組みの補足」 |
-| 5 | `tako solo` は worker を立てず 1 対 1 | `docs/.../features/orchestration.md`「1 対 1 で十分なら tako solo」 |
-| 6 | 全ペインを tmux セッション経由で動かし、再起動で実行中プロセス・画面内容・タブ構成を復元。ペイン ID も維持 | `docs/.../features/tmux-backend.md` / `README.md`「セッション永続化」 |
-| 7 | `tako remote` は tailnet 内だけの固定 URL。WireGuard で端から端まで暗号化。公開インターネットに存在しない | `docs/.../features/remote.md`「一言でいうと」「層① Tailscale identity」 |
-| 7 | Mac 画面で承認するまで端末は何も見られない（機器ペアリング） | `docs/.../features/remote.md`「層② 機器ペアリング」 |
-| 7 | エージェントの会話を読める。承認カードにその場で答えられる（Interact 以上） | `docs/.../features/remote.md`「スマホでの見え方」 |
+| 5 | 依頼を成果物ごとに分解（1 worker = 1 成果物）。指示は型で、送達確認つき | `docs/.../features/orchestration.mdx`「品質は仕組みで作り込まれる」/「監視と回収まで自動で起きる」 |
+| 5 | worker は同じタブにグリッド配置。master の取り分を保つ | `AGENTS.md` コマンド表「worker spawn のレイアウト設定」（#165）/ `docs/.../features/orchestration.mdx` |
+| 5 | 右パネル orch ビューで親子関係・稼働時間・ctx 使用率を俯瞰 | `docs/.../features/orchestration.mdx`「orch ビューで全体を見渡す」/ `tako panel --view orch` |
+| 5 | かんたん表示: Claude 対話ペインがチャット画面、空ペインがボタン。表示だけの切替 | `docs/.../features/gui-mode.mdx` |
+| 5 | 完了・入力待ち・消滅を自動検知。証拠を検査してから報告。片付けも master | `docs/.../features/orchestration.mdx` / `docs/.../features/orchestrator.md`「仕組みの補足」 |
+| 5 | `tako solo` は worker を立てず 1 対 1 | `docs/.../features/orchestration.mdx`「1 対 1 で十分なら tako solo」 |
+| 6 | 全ペインを tmux セッション経由で動かし、再起動で実行中プロセス・画面内容・タブ構成を復元。ペイン ID も維持 | `docs/.../features/tmux-backend.mdx` / `README.md`「セッション永続化」 |
+| 7 | `tako remote` は tailnet 内だけの固定 URL。WireGuard で端から端まで暗号化。公開インターネットに存在しない | `docs/.../features/remote.mdx`「安全性の作り」の「層① Tailscale のノード確認」 |
+| 7 | Mac 画面で承認するまで端末は何も見られない（機器ペアリング） | `docs/.../features/remote.mdx`「層② 機器ペアリング」 |
+| 7 | エージェントの会話を読める。承認カードにその場で答えられる（Interact 以上） | `docs/.../features/remote.mdx`「スマホで続きを頼む」 |
 | 7 | プロファイルの opt-in で `--remote-control` を付け、claude.ai / モバイルアプリから会話を操作できる。既定 OFF（transcript が Anthropic のサーバーにも保存） | `AGENTS.md` コマンド表「スマホから会話を操作する（Claude 公式 Remote Control。#1068 / #1069）」/ `tako orchestrator profiles set --help` |
-| 8 | Windows 版はインストーラー + ポータブル zip を同じリリースに同梱（v0.7.9 以降） | `docs/.../getting-started/index.md`「方法 C: Windows」/ `AGENTS.md`「両 OS 同時リリース（#965）」 |
+| 8 | Windows 版はインストーラー + ポータブル zip を同じリリースに同梱（v0.7.9 以降） | `docs/.../getting-started/index.mdx`「方法 C: Windows」/ `AGENTS.md`「両 OS 同時リリース（#965）」 |
 | 8 | 対応状況は実機で確かめたものだけを「対応」と書く。docs の表は自動生成 | `docs/.../windows-support.md`（生成物）/ `AGENTS.md`「プラットフォーム対応マトリクス（#515 / #591）」 |
 | 8 | GPL-3.0-or-later のオープンソース。GitHub で公開 | `LICENSE` / `Cargo.toml` の `license` / `README.md` |
 | 8 | ドキュメントサイト tako.takushio2525.com | `README.md` 冒頭のリンク |

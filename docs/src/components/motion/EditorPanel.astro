@@ -7,7 +7,8 @@
  *
  * 実物（crates/tako-app/src/right_panel.rs）のタブは fleet / orch / git / tasks の 4 つに、
  * 条件つきで diagnostics（言語サーバにつながった文書があるとき）・references・search（結果があるとき）が
- * 足される。ここでは選んでいるビューのタブだけを足す。at を渡すと幅 0 から開いて現れる（ペインはその分だけ縮む）。
+ * 足される。ここでは選んでいるビューのタブだけを足す。at を渡すと幅 0 から開いて現れる（ペインはその分だけ縮む。
+ * 共通の引き出し = motion.css の data-fx="drawer"）。
  */
 import '../../styles/tako-editor.css';
 import Icon from './Icon.astro';
@@ -16,11 +17,14 @@ type View = 'diagnostics' | 'search';
 interface Props {
 	active: View;
 	at?: string;
-	/** 窓に対する幅（既定 42%） */
+	/** 窓に対する幅（既定 42%。狭い窓でも同じ割合で、ペインを残す） */
 	width?: string;
 }
 
 const { active, at, width = '42%' } = Astro.props;
+// 引き出しの幅は器と中身で同じ基準にしたいので、窓に対する % を窓の cqi に読み替える
+// （窓の本体 = 部品の根の幅から左右の枠線 1px ずつを引いた幅。% のときと 1px もずれないように）
+const dw = width.endsWith('%') ? `calc((100cqi - 2px) * ${parseFloat(width) / 100})` : width;
 const base: { id: string; icon: 'fleet' | 'orch' | 'branch' | 'tasks' }[] = [
 	{ id: 'fleet', icon: 'fleet' },
 	{ id: 'orch', icon: 'orch' },
@@ -29,37 +33,39 @@ const base: { id: string; icon: 'fleet' | 'orch' | 'branch' | 'tasks' }[] = [
 ];
 ---
 
-<div class="tk-right tk-edpanel" data-at={at} data-fx={at ? 'fade' : undefined} style={`--rw: ${width}`}>
-	<div class="tk-right-tabs">
-		{
-			base.map((v) => (
-				<span class="tk-right-tab">
-					<Icon name={v.icon} />
-					<span class="tk-right-label">{v.id}</span>
-				</span>
-			))
-		}
-		{
-			active === 'diagnostics' && (
-				<span class="tk-right-tab is-active">
-					<svg class="tk-ic is-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-						<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
-						<path d="M12 9v4M12 17h.01" />
-					</svg>
-					<span class="tk-right-label">diagnostics</span>
-				</span>
-			)
-		}
-		{
-			active === 'search' && (
-				<span class="tk-right-tab is-active">
-					<Icon name="search" />
-					<span class="tk-right-label">search</span>
-				</span>
-			)
-		}
-	</div>
-	<div class="tk-right-body">
-		<slot />
+<div data-at={at} data-fx="drawer" style={`--dw: ${dw}`}>
+	<div class="tk-right tk-edpanel">
+		<div class="tk-right-tabs">
+			{
+				base.map((v) => (
+					<span class="tk-right-tab">
+						<Icon name={v.icon} />
+						<span class="tk-right-label">{v.id}</span>
+					</span>
+				))
+			}
+			{
+				active === 'diagnostics' && (
+					<span class="tk-right-tab is-active">
+						<svg class="tk-ic is-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+							<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+							<path d="M12 9v4M12 17h.01" />
+						</svg>
+						<span class="tk-right-label">diagnostics</span>
+					</span>
+				)
+			}
+			{
+				active === 'search' && (
+					<span class="tk-right-tab is-active">
+						<Icon name="search" />
+						<span class="tk-right-label">search</span>
+					</span>
+				)
+			}
+		</div>
+		<div class="tk-right-body">
+			<slot />
+		</div>
 	</div>
 </div>

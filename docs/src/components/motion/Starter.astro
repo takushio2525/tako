@@ -1,27 +1,59 @@
 ---
 /**
- * かんたん表示（GUI モード）で空のペインに出るスターターの再現。
- * 文言は crates/tako-app/src/ui_text/ui_mode.rs。Pane の中に置く。
+ * かんたん表示（GUI モード）で空のペインに出るスターターの再現。Pane か GuiFrame の中に置く。
+ * 3 枚のカード・下部の「初期設定をやり直す」・脚注まで（#2060 の GuiStarter をここへまとめた。#2077）。
+ * 正本: crates/tako-app/src/starter.rs の render_starter_pane / 文言は ui_text/ui_mode.rs。
+ *
+ *   <GuiFrame><Starter pressAt="2" /></GuiFrame>
+ *
+ * size（実物の間引きと同じ順。実物はペインの寸法で決める）:
+ *   auto    = 置いた場所の幅で決める（既定。幅 32em 未満で compact、23em 未満で tiny）
+ *   full    = 全部
+ *   compact = 実コマンドの併記と脚注を落とす（実物はペインの幅 420px 未満 / 高さ 260px 未満）
+ *   tiny    = さらに見出しの補足・カードの説明・setup の行を落とす（幅 300px 未満 / 高さ 190px 未満）
  */
 import Icon from './Icon.astro';
+
+interface Props {
+	size?: 'auto' | 'full' | 'compact' | 'tiny';
+	/** 「AI チームに任せる」が押された印を出す手順（data-at の書き方） */
+	pressAt?: string;
+}
+
+const { size = 'auto', pressAt } = Astro.props;
+const cards = [
+	{ icon: 'orch', title: 'AI チームに任せる', cmd: 'tako master', desc: '司令塔の AI が話を聞いて、必要なだけ担当 AI を集めて進めます', lead: true },
+	{ icon: 'chat', title: 'AI と 1 対 1 で話す', cmd: 'tako solo', desc: '1 体の AI とじっくり相談したいときはこちら' },
+	{ icon: 'terminal', title: 'コマンド入力へ', desc: 'この画面をターミナル表示に戻します（何も止まりません）' },
+] as const;
 ---
 
-<div class="tk-starter">
-	<span class="tk-starter-q">何をしますか？</span>
-	<span class="tk-starter-sub">ボタンを押すと、この画面で AI が動き始めます</span>
-	<span class="tk-starter-card is-lead">
-		<span class="tk-starter-ic"><Icon name="orch" /></span>
-		<span><b>AI チームに任せる</b><small>tako master</small></span>
-		<span>司令塔の AI が話を聞いて、必要なだけ担当 AI を集めて進めます</span>
-	</span>
-	<span class="tk-starter-card">
-		<span class="tk-starter-ic"><Icon name="chat" /></span>
-		<span><b>AI と 1 対 1 で話す</b><small>tako solo</small></span>
-		<span>1 体の AI とじっくり相談したいときはこちら</span>
-	</span>
-	<span class="tk-starter-card">
-		<span class="tk-starter-ic"><Icon name="terminal" /></span>
-		<span><b>コマンド入力へ</b></span>
-		<span>この画面をターミナル表示に戻します（何も止まりません）</span>
-	</span>
+<div class:list={['tk-starter', `is-${size}`]}>
+	<div class="tk-starter-in">
+		<span class="tk-starter-q">何をしますか？</span>
+		<span class="tk-starter-sub">ボタンを押すと、この画面で AI が動き始めます</span>
+		{
+			cards.map((c) => (
+				<span
+					class:list={['tk-starter-card', { 'is-lead': 'lead' in c && c.lead }]}
+					data-at={'lead' in c && c.lead ? pressAt : undefined}
+					data-fx={'lead' in c && c.lead && pressAt ? 'mark' : undefined}
+				>
+					<span class="tk-starter-ic">
+						<Icon name={c.icon} />
+					</span>
+					<span>
+						<b>{c.title}</b>
+						{'cmd' in c && <small class="tk-starter-cmd">{c.cmd}</small>}
+					</span>
+					<span class="tk-starter-desc">{c.desc}</span>
+				</span>
+			))
+		}
+		<span class="tk-starter-link">
+			<Icon name="refresh" />
+			初期設定をやり直す<small class="tk-starter-cmd">tako setup</small>
+		</span>
+		<span class="tk-starter-foot">これは表示の切り替えだけです。ターミナルはいつでも使えます</span>
+	</div>
 </div>

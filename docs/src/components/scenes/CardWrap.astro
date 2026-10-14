@@ -13,7 +13,7 @@ import Step from '../motion/Step.astro';
 import TakoWindow from '../motion/TakoWindow.astro';
 import Split from '../motion/Split.astro';
 import Pane from '../motion/Pane.astro';
-import CommandCardFull from '../motion/CommandCardFull.astro';
+import CommandCard from '../motion/CommandCard.astro';
 import Pointer from '../motion/Pointer.astro';
 import '../../styles/command-card.css';
 ---
@@ -33,7 +33,7 @@ import '../../styles/command-card.css';
 					<div data-at="4+" data-fx="unfold">
 						<div>
 							<div class="tk-cardband">
-								<CommandCardFull class="tk-cw-card" title="テストの道具を入れる" commands={[{ text: 'npm i -D vitest jsdom', copied: '4', copyMark: '4' }]} />
+								<CommandCard class="tk-cw-card" title="テストの道具を入れる" commands={[{ text: 'npm i -D vitest jsdom', copied: '4', copyMark: '4' }]} />
 							</div>
 						</div>
 					</div>

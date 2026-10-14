@@ -11,7 +11,7 @@ import Step from '../motion/Step.astro';
 import TakoWindow from '../motion/TakoWindow.astro';
 import Split from '../motion/Split.astro';
 import Pane from '../motion/Pane.astro';
-import CommandCardFull from '../motion/CommandCardFull.astro';
+import CommandCard from '../motion/CommandCard.astro';
 import '../../styles/command-card.css';
 
 const envFile = "cat > .env.local <<'EOF'\nPORT=3000\nEOF";
@@ -33,7 +33,7 @@ const envFile = "cat > .env.local <<'EOF'\nPORT=3000\nEOF";
 					<div data-at="!4" data-fx="unfold">
 						<div>
 							<div class="tk-cardband">
-								<CommandCardFull
+								<CommandCard
 									title="開発環境を用意する"
 									commands={[
 										{ text: envFile, boxMark: '2', copied: '2', copyMark: '2', ran: '3+' },

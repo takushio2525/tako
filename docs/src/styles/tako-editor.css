@@ -451,23 +451,10 @@
 }
 
 /* ============================================================
- * 右パネル（diagnostics / search のビュー）。現れるときは幅 0 から開く
+ * 右パネル（diagnostics / search のビュー）。幅と開き方は共通の引き出し（motion.css の data-fx="drawer"）
  * ============================================================ */
-.tk-ui .tk-right.tk-edpanel {
-  /* 幅は場面ごとに決める（共有の .tk-right は狭い窓で 58% に広がる。ここではペインを残したい） */
-  width: var(--rw, 42%);
+.tk-edpanel {
   overflow: hidden;
-}
-[data-motion] .tk-right.tk-edpanel[data-at] {
-  transition:
-    width 0.55s var(--tako-ease),
-    opacity 0.4s var(--tako-ease),
-    border-width 0.55s var(--tako-ease);
-}
-[data-motion] .tk-right.tk-edpanel[data-at]:not(.is-on) {
-  width: 0;
-  border-left-width: 0;
-  transform: none;
 }
 .tk-edpanel .tk-right-body {
   gap: 0.3em;

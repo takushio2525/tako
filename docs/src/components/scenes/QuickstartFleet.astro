@@ -56,7 +56,7 @@ const half = (n: number, y: number) => ({ x: 0, y, w: 100, h: 50, n });
 			</div>
 			<div data-at="4+" data-fx="fade" class="tk-split is-col">
 				<Pane n={1} title="claude" state="idle" focus="5">
-					<div class="tk-qs-log">
+					<div data-fx="log">
 						<span class="tk-l tk-tui-msg">tests/test_users.py を更新しました</span>
 						<span class="tk-l tk-tui-user" data-at="5">隣のテストが落ちた理由を見て、直して</span>
 						<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: .4s">tako_read_pane → ペイン 2</span>
@@ -74,7 +74,7 @@ const half = (n: number, y: number) => ({ x: 0, y, w: 100, h: 50, n });
 					]}
 					focus="4"
 				>
-					<div class="tk-qs-log">
+					<div data-fx="log">
 						<span class="tk-l"><span class="tk-p">api ❯</span> pytest</span>
 						<span class="tk-l">tests/test_users.py <span class="tk-ok">...</span><span class="tk-err">F</span><span class="tk-ok">.</span></span>
 						<span class="tk-l tk-err">FAILED test_create - assert 201 == 200</span>
@@ -86,7 +86,7 @@ const half = (n: number, y: number) => ({ x: 0, y, w: 100, h: 50, n });
 				</Pane>
 			</div>
 		</div>
-		<div slot="right" class="tk-qs-drawer" data-at="1+" style="--d: .6s">
+		<div slot="right" data-at="1+" data-fx="drawer" style="--d: .6s">
 			<RightPanel active="fleet">
 				<Fleet
 					summary={[

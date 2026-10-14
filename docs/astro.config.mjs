@@ -148,7 +148,7 @@ export default defineConfig({
 						{ label: 'ファイルツリー＆プレビュー', slug: 'features/file-preview' },
 						{ label: 'git 連携', slug: 'features/git-integration' },
 						{ label: 'リモートアクセス', slug: 'features/remote' },
-						{ label: 'tmux バックエンド', slug: 'features/tmux-backend' },
+						{ label: '閉じても消えない', slug: 'features/tmux-backend' },
 						{ label: 'たまり場', slug: 'features/shelving' },
 						{ label: 'ポート検知', slug: 'features/port-detection' },
 						{ label: 'エラーテレメトリ', slug: 'features/telemetry' },

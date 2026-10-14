@@ -10,7 +10,7 @@
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
-import PhoneBare from '../motion/PhoneBare.astro';
+import Phone from '../motion/Phone.astro';
 import PhoneHead from '../motion/PhoneHead.astro';
 import PhoneCard from '../motion/PhoneCard.astro';
 import Pointer from '../motion/Pointer.astro';
@@ -18,7 +18,7 @@ import Icon from '../motion/Icon.astro';
 ---
 
 <Scrolly label="スマホから会話の続きを頼む流れ" flip>
-	<PhoneBare slot="stage" height={31}>
+	<Phone slot="stage" head={false} height={31}>
 		<!-- 手順 1: ペイン一覧 -->
 		<div class="tk-phone-layer" data-at="1" data-fx="fade">
 			<PhoneHead tasks={1} />
@@ -91,7 +91,7 @@ import Icon from '../motion/Icon.astro';
 			</div>
 			<Pointer path="2:86,93 3:70,91 4:72,50" click="2 3" />
 		</div>
-	</PhoneBare>
+	</Phone>
 
 	<Step title="承認されると、ペインが並ぶ">
 		<p>タブごとにまとまったカードで、誰が（master / worker）何をしていて、どれが<strong>承認待ち</strong>かが一目で分かります。右上には AI から届いた「人がやること」の件数。</p>

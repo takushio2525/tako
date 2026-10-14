@@ -7,7 +7,7 @@
  * crates/tako-control/src/dispatch.rs（後任は前任 master のペインを右へ分割して立ち、前任が閉じると
  * その矩形を継ぐ。後任のタイトルは master-<プロファイル名>）/
  * `tako agent-support` の master_auto_handoff（claude = ok / codex = todo）。
- * タブバーの右に重ねた ctx の札は図の説明（tako の画面の一部ではない）。
+ * 使用率はステータスバーの ctx メーター（crates/tako-app/src/status_bar.rs。70% 未満は青）に出す。
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
@@ -18,7 +18,18 @@ import '../../styles/tako-orch.css';
 ---
 
 <Scrolly label="master のコンテキストが埋まったら、後任へ引き継ぐ流れ">
-	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25} masterAt="1+" class="tko-ho">
+	<TakoWindow
+		slot="stage"
+		tabs={[{ label: 'my-app', state: 'running', active: true }]}
+		height={25}
+		masterAt="1+"
+		ctx={[
+			{ at: '1', v: 58 },
+			{ at: '2-3', v: 61 },
+			{ at: '4+', v: 8 },
+		]}
+		ctxMarkAt="1-2"
+	>
 		<Split>
 			<Split>
 				<Pane n={1} title="マスター" badge="ORCH" state="running" focus="1-3" at="1-3" fx="split">
@@ -48,15 +59,6 @@ import '../../styles/tako-orch.css';
 				</Pane>
 			</Split>
 		</Split>
-		<span slot="overlay" class="tko-ctx">
-			master の ctx
-			<span class="tko-ctx-bar"><i></i></span>
-			<span class="tko-swap">
-				<b data-at="1" data-fx="fade">58%</b>
-				<b class="is-warn" data-at="2-3" data-fx="fade">61%</b>
-				<b data-at="4+" data-fx="fade">8%</b>
-			</span>
-		</span>
 	</TakoWindow>
 
 	<Step title="長い仕事で、コンテキストが埋まっていく">

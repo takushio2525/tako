@@ -11,7 +11,7 @@ import Step from '../motion/Step.astro';
 import TakoWindow from '../motion/TakoWindow.astro';
 import Split from '../motion/Split.astro';
 import GuiFrame from '../motion/GuiFrame.astro';
-import GuiStarter from '../motion/GuiStarter.astro';
+import Starter from '../motion/Starter.astro';
 import Preparing from '../motion/Preparing.astro';
 import ChatPane from '../motion/ChatPane.astro';
 import Pointer from '../motion/Pointer.astro';
@@ -25,7 +25,7 @@ const cwd = '~\\my-app';
 			<div class="tk-gpane">
 				<div class="tk-gpane-layer" data-at="!3+" data-fx="fade">
 					<GuiFrame cwd={cwd} focus>
-						<GuiStarter size="compact" pressAt="2" />
+						<Starter size="compact" pressAt="2" />
 					</GuiFrame>
 				</div>
 				<div class="tk-gpane-layer" data-at="3" data-fx="fade">

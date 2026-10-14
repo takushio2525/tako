@@ -17,6 +17,17 @@
 import Icon from './Icon.astro';
 
 type TabState = 'idle' | 'running' | 'wait' | 'fail' | 'off';
+/** ステータスバーのリモートの表示（crates/tako-app/src/remote_panel.rs の render_remote_indicator） */
+type RemoteState = 'off' | 'starting' | 'idle' | 'connected';
+interface Remote {
+	/** この表示になる手順（data-at の書き方）。1 つだけなら省略 */
+	at?: string;
+	state: RemoteState;
+	/** connected の接続数 */
+	n?: number;
+	/** 承認待ちの件数（黄色のチップ） */
+	pending?: number;
+}
 interface Tab {
 	label: string;
 	state?: TabState;
@@ -37,6 +48,8 @@ interface Props {
 	/** 右上の表示モードの印。guiAt を渡すとその手順だけチャット（かんたん表示）の印になる */
 	mode?: 'terminal' | 'gui';
 	guiAt?: string;
+	/** 表示モードのボタンに押された印（data-fx="mark" の輪）を出す手順 */
+	modePressAt?: string;
 	/** ステータスバー（false で出さない） */
 	status?: boolean;
 	branch?: string;
@@ -48,6 +61,14 @@ interface Props {
 	workers?: number;
 	/** 右パネル（fleet）が開いている手順。ステータスバーの「tmux」（fleet の入口）が点き、狭い幅でも残る */
 	panelAt?: string;
+	/** ステータスバーのリモートの表示（既定は「リモート オフ」を広い窓だけ）。渡すと狭い窓でも出す。
+	 *  手順で変えるときは [{ at: '1', state: 'off' }, { at: '2+', state: 'idle' }] */
+	remote?: Remote | Remote[];
+	/** ステータスバーの ctx メーター（使用率 %）。渡すと狭い窓でも数字を出す（バーとタブ名は広い窓だけ）。
+	 *  手順で変えるときは [{ at: '1', v: 58 }, { at: '2+', v: 61 }]。色は実物の閾値（70% で黄・90% で赤） */
+	ctx?: number | { at: string; v: number }[];
+	/** ctx メーターに注目の輪（data-fx="mark"）を出す手順 */
+	ctxMarkAt?: string;
 	/** 窓の高さ（em）。手順で高さが変わらないよう場面ごとに固定する */
 	height?: number;
 	class?: string;
@@ -65,6 +86,10 @@ const {
 	masterAt,
 	workers = 2,
 	panelAt,
+	modePressAt,
+	remote,
+	ctx,
+	ctxMarkAt,
 	height = 25,
 	class: className,
 } = Astro.props;
@@ -73,6 +98,13 @@ const cwdParts = cwd.split(/[\\/]/);
 const cwdLast = cwdParts.pop() ?? cwd;
 const cwdHead = cwdParts.join(os === 'windows' ? '\\' : '/') + (os === 'windows' ? '\\' : '/');
 const hasSidebar = Astro.slots.has('sidebar');
+const remotes = remote === undefined ? undefined : Array.isArray(remote) ? remote : [remote];
+const remoteLabel = (r: Remote) =>
+	r.state === 'off' ? 'リモート オフ' : r.state === 'starting' ? 'リモート 起動中' : r.state === 'connected' ? `${r.n ?? 1} 接続` : 'リモート';
+const ctxs = ctx === undefined ? undefined : typeof ctx === 'number' ? [{ at: undefined, v: ctx }] : ctx;
+const ctxTone = (v: number) => (v >= 90 ? 'is-red' : v >= 70 ? 'is-yellow' : undefined);
+// 既定より多く出すとき（リモート・ctx を渡したとき）は、狭い窓でブランチを落として収める
+const dense = remotes !== undefined || ctxs !== undefined;
 ---
 
 <div class:list={['tk-ui', 'tk-frame', className]} style={`--h: ${height}em`}>
@@ -135,7 +167,7 @@ const hasSidebar = Astro.slots.has('sidebar');
 			<span class="tk-tbtn is-wide"><Icon name="bell" /></span>
 			{
 				guiAt ? (
-					<span class="tk-tbtn tk-tbtn-stack">
+					<span class="tk-tbtn tk-tbtn-stack" data-at={modePressAt} data-fx={modePressAt ? 'mark' : undefined}>
 						<span data-at={`!${guiAt}`} data-fx="fade">
 							<Icon name="terminal" />
 						</span>
@@ -144,7 +176,7 @@ const hasSidebar = Astro.slots.has('sidebar');
 						</span>
 					</span>
 				) : (
-					<span class="tk-tbtn">
+					<span class="tk-tbtn" data-at={modePressAt} data-fx={modePressAt ? 'mark' : undefined}>
 						<Icon name={mode === 'gui' ? 'chat' : 'terminal'} />
 					</span>
 				)
@@ -161,7 +193,7 @@ const hasSidebar = Astro.slots.has('sidebar');
 		</div>
 		{
 			status && (
-				<div class="tk-win-status">
+				<div class:list={['tk-win-status', { 'is-dense': dense }]}>
 					<span class="tk-sb tk-sb-files">
 						<Icon name="folder" />
 						Files
@@ -170,10 +202,25 @@ const hasSidebar = Astro.slots.has('sidebar');
 					<span class="tk-sb is-wide">
 						<Icon name="globe" />
 					</span>
-					<span class="tk-sb is-wide">
-						<Icon name="phone" />
-						リモート オフ
-					</span>
+					{remotes ? (
+						<span class="tk-sb tk-sb-remote">
+							<span class="tk-sb-swap">
+								{remotes.map((r) => (
+									<span class:list={['tk-sb-rm', `is-${r.state}`]} data-at={r.at} data-fx={r.at ? 'fade' : undefined}>
+										<i class="tk-sb-rm-dot" />
+										<Icon name="phone" />
+										{remoteLabel(r)}
+										{r.pending ? <span class="tk-sb-rm-pending">承認待ち {r.pending}</span> : null}
+									</span>
+								))}
+							</span>
+						</span>
+					) : (
+						<span class="tk-sb is-wide">
+							<Icon name="phone" />
+							リモート オフ
+						</span>
+					)}
 					<span class="tk-sb is-mid">
 						<Icon name="folder" />
 						{cwdHead}
@@ -190,12 +237,31 @@ const hasSidebar = Astro.slots.has('sidebar');
 						<i class="tk-dot is-running" />
 						<b>{agent}</b>
 					</span>
-					<span class="tk-sb is-end is-wide">
-						ctx
-						<span class="tk-sb-bar" style="--v: 18%">
-							<i />
+					{ctxs ? (
+						<span class="tk-sb is-end tk-sb-ctx" data-at={ctxMarkAt} data-fx={ctxMarkAt ? 'mark' : undefined}>
+							ctx
+							<span class="tk-sb-ctx-tab">{tabs.find((t) => t.active)?.label ?? tabs[0]?.label}</span>
+							<span class="tk-sb-bar is-ticks">
+								{ctxs.map((c) => (
+									<i class={ctxTone(c.v)} style={`--v: ${c.v}%`} data-at={c.at} data-fx={c.at ? 'fade' : undefined} />
+								))}
+							</span>
+							<span class="tk-sb-swap">
+								{ctxs.map((c) => (
+									<b class:list={['tk-sb-ctx-v', ctxTone(c.v)]} data-at={c.at} data-fx={c.at ? 'fade' : undefined}>
+										{c.v}%
+									</b>
+								))}
+							</span>
 						</span>
-					</span>
+					) : (
+						<span class="tk-sb is-end is-wide">
+							ctx
+							<span class="tk-sb-bar" style="--v: 18%">
+								<i />
+							</span>
+						</span>
+					)}
 					{panelAt ? (
 						<span class="tk-sb is-end tk-sb-panel" data-at={panelAt} data-fx="state">
 							<Icon name="fleet" />
@@ -204,7 +270,7 @@ const hasSidebar = Astro.slots.has('sidebar');
 					) : (
 						<span class="tk-sb is-end is-mid">tmux</span>
 					)}
-					<span class="tk-sb is-end">
+					<span class="tk-sb is-end tk-sb-branch">
 						<Icon name="branch" />
 						{branch}
 					</span>
@@ -223,6 +289,101 @@ const hasSidebar = Astro.slots.has('sidebar');
 	}
 	.tk-dot-stack > .tk-dot {
 		grid-area: 1 / 1;
+	}
+	/* 手順で入れ替わる表示（リモート・ctx の数字）を同じ場所に重ねる。幅は一番広いものに揃う */
+	.tk-sb-swap {
+		display: inline-grid;
+	}
+	.tk-sb-swap > * {
+		grid-area: 1 / 1;
+		display: inline-flex;
+		align-items: center;
+		gap: 0.45em;
+	}
+	/* リモート（remote）。停止中は中空の輪、起動中は黄、稼働中は塗りの点、接続中は青い点 */
+	.tk-sb-rm {
+		color: var(--ui-fg3);
+	}
+	.tk-sb-rm.is-off {
+		color: var(--ui-faint);
+	}
+	.tk-sb-rm.is-starting {
+		color: var(--ui-muted);
+	}
+	.tk-sb-rm-dot {
+		width: 0.6em;
+		height: 0.6em;
+		border-radius: 50%;
+		background: currentColor;
+		flex: none;
+	}
+	.tk-sb-rm.is-off .tk-sb-rm-dot {
+		background: none;
+		border: 1px solid currentColor;
+	}
+	.tk-sb-rm.is-starting .tk-sb-rm-dot {
+		background: var(--ui-yellow);
+	}
+	.tk-sb-rm.is-connected .tk-sb-rm-dot {
+		background: var(--ui-accent);
+	}
+	.tk-sb-rm-pending {
+		padding: 0 0.45em;
+		border-radius: 6px;
+		background: rgb(249 226 175 / 0.25);
+		color: var(--ui-yellow);
+		font-size: 0.92em;
+	}
+	/* ctx メーター（ctx）。実物と同じく 70% / 90% に目盛り、数字は閾値で色が変わる */
+	.tk-sb-ctx-tab {
+		max-width: 8em;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		color: var(--ui-accent);
+		font-size: 0.92em;
+	}
+	.tk-sb-bar.is-ticks {
+		position: relative;
+		display: inline-grid;
+		width: 5.8em;
+		background:
+			linear-gradient(90deg, transparent calc(70% - 0.5px), rgb(205 214 244 / 0.25) 0 calc(70% + 0.5px), transparent 0),
+			linear-gradient(90deg, transparent calc(90% - 0.5px), rgb(205 214 244 / 0.25) 0 calc(90% + 0.5px), transparent 0),
+			var(--ui-hl);
+	}
+	.tk-sb-bar.is-ticks > i {
+		grid-area: 1 / 1;
+		border-radius: 99px;
+	}
+	.tk-sb b.tk-sb-ctx-v {
+		color: var(--ui-accent);
+		font-weight: 600;
+	}
+	.tk-sb-bar > i.is-yellow,
+	.tk-sb b.tk-sb-ctx-v.is-yellow {
+		--ui-accent: var(--ui-yellow);
+		color: var(--ui-yellow);
+	}
+	.tk-sb-bar > i.is-red,
+	.tk-sb b.tk-sb-ctx-v.is-red {
+		--ui-accent: var(--ui-red);
+		color: var(--ui-red);
+	}
+	@container tkframe (max-width: 40rem) {
+		.tk-sb-ctx-tab,
+		.tk-sb-bar.is-ticks {
+			display: none;
+		}
+	}
+	@container tkframe (max-width: 30rem) {
+		.tk-win-status.is-dense .tk-sb-branch {
+			display: none;
+		}
+	}
+	/* ステータスバーの中の注目の輪（ctxMarkAt）。バーの外へ出る輪は切れるので内側に描く */
+	.tk-ui .tk-win-status [data-fx~='mark'].is-on {
+		box-shadow: inset 0 0 0 1.5px var(--ui-accent);
+		background: var(--ui-tab);
 	}
 	/* ステータスバーの fleet の入口（panelAt）。開いている手順で点く */
 	.tk-sb-panel[data-fx~='state'].is-on {

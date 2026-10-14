@@ -14,7 +14,7 @@ import Step from '../motion/Step.astro';
 import TakoWindow from '../motion/TakoWindow.astro';
 import Split from '../motion/Split.astro';
 import Pane from '../motion/Pane.astro';
-import CommandCardFull from '../motion/CommandCardFull.astro';
+import CommandCard from '../motion/CommandCard.astro';
 import Pointer from '../motion/Pointer.astro';
 import '../../styles/command-card.css';
 ---
@@ -34,7 +34,7 @@ import '../../styles/command-card.css';
 					<div data-at="2+" data-fx="unfold">
 						<div>
 							<div class="tk-cardband">
-								<CommandCardFull
+								<CommandCard
 									title="テストを実行する"
 									commands={[{ text: 'npm test', copied: '3', copyMark: '3', running: '4', ran: '5+', runMark: '4' }]}
 								/>

@@ -64,10 +64,19 @@
 | `type` | 文字数ぶんの段で左から開く（打鍵） | コマンド・入力欄（**1 行の短い文に限る**） |
 | `unfold` | 高さ 0 から開く（**子要素 1 つで包む**） | 帯・アコーディオン・バナー |
 | `split` | 幅（縦分割なら高さ）0 から伸びる | 分割で現れるペイン（`Split` の直下の子） |
+| `drawer` | 幅 0 から開き、中身は開き切った幅のまま右から滑り込む。幅は `style="--dw: 42cqi"`（cqi か em。% は使わない）。`data-at` が無ければ開いたまま | 右パネル・引き出し（`EditorPanel` もこれ） |
+| `log`（**器に付ける**） | 器の中の `data-at` の行が高さ 0 から開き、下から積んで古い行を上へ押し出す（1 行は 3 行ぶんまで） | ターミナルの出力・チャットのログ |
 | `mark` | 隠さない。`.is-on` の間だけ押された輪 | 押されたボタン・選ばれた項目 |
 | `state` | 隠さない。`.is-on` の間の姿は部品が決める | タブの選択中など |
 
 遅れは `style="--d: .4s"`（入るときだけ効く）。手順の中で順に出したい行に付ける。
+
+### 手順 1 の前の姿（`<Scrolly intro>`）
+
+既定では、どの手順もまだ読む位置を越えていない間（場面が画面に入ってくる間）も図は手順 1 の状態なので、
+手順 1 の打鍵や「押す前 → 押した後」は読者が着く前に終わっている。`intro` を付けた場面だけは、
+手順 1 を読む位置に来るまで図を**手順 0** にする（`data-at` は 0 に当たるものだけ出る。手順 0 だけの姿は `!1+`）。
+手順 0 でも図が空にならないこと（層ごと `data-at="1"` で出し入れしている場面には付けない）。動かさないとき（reduce）の静止図は手順 1 からで変わらない。
 
 ### 動かさない（`prefers-reduced-motion: reduce`）と JS が無いとき
 
@@ -119,6 +128,7 @@ import Pointer from '../motion/Pointer.astro';
 - **ステージの高さは手順で変えない**（`height` を固定。中身は `.tk-stack` で重ねて入れ替える）。高さが変わると貼り付いた図が跳ねる
 - 1 場面の手順は 3〜5（多くても 7）。1 手順 = 画面の変化 1 つ
 - 行は 1 行 1 要素（`<span class="tk-l">`）。**MDX に長い JSX を直書きしない**（行の間の文字が Markdown として解釈される）。場面は必ず `.astro` に閉じ込める
+- コードの字下げは空白で書かない（Astro がテンプレートの行頭の空白を詰める）。`style="padding-left: 2ch"` のように `ch` で付ける
 - 絵文字を使わない（`✓` などの文字記号は可。印は `Icon` で描く）。案内するコマンドは最も簡単な形（`tako master` に既定の引数を付けない）
 - 実在の名前・パス・ホスト名を書かない。プレースホルダは `my-app` / `my-mac` / `winuser` / `~`、版は `vX.Y.Z`
 - Windows で pending のものを見せる場面は、手順の本文の末尾に `<p class="tk-step-note">…</p>` で正直に書く
@@ -141,32 +151,60 @@ cd docs && npm ci && npm run build && npm run og:verify && node scripts/verify-l
 
 | 部品 | 置き場 | 主な props | 見た目の正本 |
 |---|---|---|---|
-| `Scrolly` | ページ | `label`・`flip`（図を左へ）。slot `stage` + 子に `Step` | — |
+| `Scrolly` | ページ | `label`・`flip`（図を左へ）・`intro`（手順 1 を読む位置に来るまで図を手順 0 で待たせる。下の 3 節）。slot `stage` + 子に `Step` | — |
 | `Step` | Scrolly の子 | `title`。本文は子 | — |
 | `Autoplay` | ページ | `steps`・`interval`（ms） | — |
-| `TakoWindow` | stage | `os`（mac / windows）・`tabs`（`label` / `state` / `active` / `at` / `activeAt`）・`guiAt`（表示モードの印）・`masterAt` / `workers`（ステータスバーの master 表示）・`cwd`・`branch`・`height`。slot: 既定（本体）/ `sidebar` / `banner` / `right` / `overlay` | `tab_bar.rs` / `menu_bar.rs` / `status_bar.rs` / `theme.rs` |
+| `TakoWindow` | stage | `os`（mac / windows）・`tabs`（`label` / `state` / `active` / `at`（隠れている間は場所を取らない）/ `activeAt`）・`guiAt`（表示モードの印）・`modePressAt`（表示モードのボタンが押された輪）・`masterAt` / `workers`（ステータスバーの master 表示）・`remote`（リモートの表示。`off` / `starting` / `idle` / `connected` と承認待ちの件数を手順で）・`ctx` / `ctxMarkAt`（ctx メーターの使用率と注目の輪）・`panelAt`・`cwd`・`branch`・`height`。slot: 既定（本体）/ `sidebar` / `banner` / `right` / `overlay` | `tab_bar.rs` / `menu_bar.rs` / `status_bar.rs` / `theme.rs` |
 | `Split` | 本体 | `dir`（row / col）・`grow`・`at` / `fx` | — |
 | `Pane` | Split の子 | `n`・`title`・`badge`（ORCH / WORKER）・`parent`（↳ master）・`state`（idle / running か `[{at, state, text}]`）・`focus`（true か data-at）・`at` / `fx`・`grow`・`body`（flush で余白なし） | `main.rs` の render_pane_header（状態の表記は running / idle の 2 つ） |
 | `Sidebar` | slot sidebar | `project`・`branch`・`path`・`items` | `sidebar.rs` |
-| `RightPanel` | slot right | `active`（fleet / orch / git / tasks）・`count` / `countAt`・`width` | `right_panel.rs` |
+| `RightPanel` | slot right | `active`（fleet / orch / git / tasks）・`count` / `countAt`・`width`（既定 40%）・`narrow`（幅 30rem 以下の窓での幅。既定 58%）。引き出しで開くなら `data-fx="drawer"` の器で包む | `right_panel.rs` |
 | `TaskCard` | RightPanel の中 | `kind`・`title`・`openAt`・`body`・`attachment`・`pick` / `pickAt`・`comment` / `commentAt`・`delivered` | `tasks_panel.rs` / `ui_text/panel.rs` |
-| `CommandCard` | ペインの帯（`.tk-cardband`） | `title`・`command`・`at`・`running`・`ran` | `command_card_ui.rs` / `ui_text/command_card.rs` |
-| `CommandCardFull` | ペインの帯（`.tk-cardband`） | `title`・`commands`（各 `text`（改行可）/ `copied` / `running` / `ran` + `code`（0 以外は赤）/ `closed` / `copyMark` / `runMark` / `boxMark`）・`at`。実物どおり番号・実行記録をボタン行の左に出す（#2057） | `command_card_ui.rs` の render_command_card / `ui_text/command_card.rs` |
+| `CommandCard` | ペインの帯（`.tk-cardband`） | `title`・`commands`（各 `text`（改行可）/ `copied` / `running` / `ran` + `code`（0 以外は赤）/ `closed` / `copyMark` / `runMark` / `boxMark`）・`at`。実物どおり番号・実行記録をボタン行の左に出す（#2057。#2077 で簡略版と 1 本にまとめた） | `command_card_ui.rs` の render_command_card / `ui_text/command_card.rs` |
 | `PhoneCommandCards` | Phone の中 | `label`・`command`・`pressAt`・`confirmAt` / `confirmPressAt`（全文の確認シート）・`startedAt`・`runningAt` / `ranAt` / `code`・`pane`・`host`（#2057） | `web/tako-remote/src/components/command-cards.jsx` |
 | `WelcomeBanner` | slot banner | `at`・`pressAt` | `overlays.rs` / `ui_text/welcome.rs` |
 | `Chat` | Pane の中 | `typed` / `typedAt`・`chips`。吹き出しは子に `.tk-bubble`（`.is-user`） | `chat_view.rs` / `ui_text/ui_mode.rs` |
-| `Starter` | Pane の中 | — | `starter.rs` / `ui_text/ui_mode.rs` |
-| `Phone` | stage | `machine`・`tasks` / `tasksAt`・`height`。画面の入れ替えは子を `.tk-phone-layer` で重ねる | `web/tako-remote/src/styles/main.css` |
+| `Starter` | Pane / GuiFrame の中 | `size`（auto = 置いた場所の幅で間引く（既定）/ full / compact / tiny）・`pressAt`（「AI チームに任せる」の押した印）。3 枚のカード・「初期設定をやり直す」・脚注まで | `starter.rs` の render_starter_pane / `ui_text/ui_mode.rs` |
+| `Phone` | stage | `head`（上部の帯。`false` で出さず、帯は層の中に `PhoneHead` で描く）・`machine`・`tasks` / `tasksAt`・`height`。画面の入れ替えは子を `.tk-phone-layer` で重ねる。slot `overlay` の座標はスマホの外枠が基準 | `web/tako-remote/src/styles/main.css` |
 | `PhoneCard` | Phone の中 | `title`・`role`・`state` / `stateText`。子 = スニペット 1 行 | `web/tako-remote/src/pages/panes.jsx` |
 | `OsTerminal` | stage | `os`・`title`・`height` | — |
 | `Releases` | stage | `highlight`（mac / win-exe / win-zip）・`highlightAt` | 配布物の命名規約 |
 | `SmartScreen` | stage | `detailAt`（「詳細情報」を押した後の手順） | — |
 | `Installer` | stage | `tasksAt`・`installAt`（省略可）・`doneAt` | `installer/windows/tako.iss` |
-| `Pointer` | slot overlay | `path`（`手順:横%,縦%` を空白区切り）・`click` | — |
+| `Pointer` | slot overlay | `path`（`手順:横%,縦%` を空白区切り。`手順:-` でその手順から隠す）・`click` | — |
 | `Cmd` | 手順の本文・ページ本文 | `prompt`（既定 `$`）。子 = コマンド 1 行。コピーのボタン付き | — |
 | `WindowsStatus` | ページ | `variant`（full / compact） | `windows-support.md`（生成物） |
 | `WindowsLimits` | ページ | `items`（`kind` / `title` / `text` / `tools`）。挙げた機能が「対応」になるとビルドが落ちる | 同上 |
 | `Icon` | どこでも | `name`（`icons.ts` の一覧） | `file_icons.rs` |
+
+S2（#2056〜#2064）で足した部品。どれも `docs/src/components/motion/` にあり、使い方の例はファイルの先頭のコメント。
+ページ固有の見た目は `docs/src/styles/` のページ別の CSS（`quickstart.css` / `command-card.css` / `tako-tasks.css` /
+`tako-orch.css` / `tako-ui-chat.css` / `tako-ui-remote.css` / `tako-editor.css` / `scene-restore.css` / `blackout.css` / `tako-more.css`）。
+
+| 部品 | 置き場 | 主な props | 見た目の正本 |
+|---|---|---|---|
+| `Fleet` / `FleetTab` / `FleetRow` | RightPanel（fleet）の中 | Fleet: `summary`（件数を手順で）。FleetTab: `title`・`count`・`state`・`collapsed` / `open` / `active`・`chips` / `chipsAt`・`map`（ペインの配置図）・`markAt`。FleetRow: `n`・`label`・`state`・`focus`・`markAt` | `right_panel.rs` の render_tmux_view |
+| `PortChip` | Pane の本文の直下 | `port`・`process`・`at`・`pressAt` | `ui_text/ports.rs` |
+| `Keys` / `KeyHint` / `KeyTable` | 本文 / slot overlay / ページ | `mac`・`win`（KeyHint は `label`・`at`、KeyTable は `rows`） | `keybindings.rs` |
+| `TasksPanel` / `TasksHead` / `TaskRow` | slot right / その中 | TasksPanel: `counts`・`width` / `narrow`。TasksHead: `waiting`・`kinds` / `picks`・`doneAt`・`notice`。TaskRow: `id`・`title`・`kind`・`open` / `openAt`・`delivery`・`done` | `tasks_panel.rs` |
+| `TaskAttachment` / `TaskCopyTexts` / `TaskReply` / `TaskDelivery` / `TaskThread` | TaskRow の子 | 添付（`route`・`name`・`thumb`・`pressAt`）/ コピー用テキスト（`labels`・`press`）/ 返答（`pick`・`comment`・`pressAt`）/ 配送の 4 状態（`states`）/ やりとり（`entries`・`counts`） | `tasks_panel.rs` / `ui_text/panel.rs` |
+| `TaskSideNotice` | slot sidebar | `project`・`notice`・`items` | `sidebar.rs` の通知の帯 |
+| `PhoneTaskRow` | Phone の中 | `id`・`title`・`kind`・`project`・`thread`・`delivery`・`pressAt` | `web/tako-remote/src/pages/tasks.jsx` |
+| `OrchTree` | RightPanel（orch）の中 | `masters`（タブ・稼働時間・ctx・worker の行）・`summary` | `right_panel.rs` の render_orch_view |
+| `GuiPane` / `GuiFrame` / `Preparing` | Split の子 / GuiPane の中 | GuiPane: `guiAt`（その手順だけ GUI 側を見せる）+ Pane と同じ props。GuiFrame: `cwd`・`focus`・`terminalAt`。Preparing: `kind` | `starter.rs` の render_gui_pane_frame / render_preparing_pane |
+| `ChatPane` / `ChatMsg` / `ChatBusy` | GuiPane の GUI 側 / その中 | ChatPane: `model`・`status`・`ctx`・`input`・`compact`。ChatMsg: `role`・`copy`・`hoverAt` / `copiedAt`・`queuedAt`。ChatBusy: `label`・`queuedAt` | `chat_view.rs` |
+| `PhoneHead` | Phone（`head={false}`）の層の中 | `machine`・`tasks`・`plusAt`・`filesAt` | `web/tako-remote/src/pages/panes.jsx` |
+| `QrCode` | どこでも | `seed`（図案だけ。読めない） | — |
+| `MacDialog` | slot overlay | `device`・`user`・`node`・`role`・`allowAt` | `remote_panel.rs` / `ui_text/remote.rs` |
+| `Palette` | slot overlay | `label`・`placeholder`・`items`・`selAt` | `overlays.rs` の render_command_palette |
+| `RemoteSafety` | ページ | —（通り道と 2 つの関門の静止図。サイトの明暗に乗る） | `.agent/requirements.md` FR-6 |
+| `PreviewPane` | Split の子 | `n`・`name`・`icon`・`path`・`lsp`（言語サーバの札を手順で）・`edit`・`eyeAt`・`focus`。中身は `.tk-code` / `.tk-md` | `preview_render.rs` |
+| `FileTree` | slot sidebar | `root`・`branch`・`items`（`name` / `dir` / `open` / `depth` / `git` / `at` / `hitAt`）。狭い窓でも隠さない | `sidebar.rs` |
+| `EditorPanel` | slot right | `active`（diagnostics / search）・`at`（引き出しで開く）・`width` | `right_panel.rs` |
+| `Completion` | `.tk-code` の行の中 | `items`（`kind` / `label` / `detail`）・`selected`・`doc`・`at` | `lsp_completion_ui.rs` |
+| `Blackout` | stage の層 | `kind`（終了直後 / 再起動中）・`title`・`note`・`height` | — |
+| `StatusBody` | TakoWindow（`status={false}`）の本体 | slot `drawer`（ペインとステータスバーの間）・`status`（場面ごとのステータスバー） | `main.rs` の render_drawer の位置 |
+| `WindowsChip` | 見出しの直下 | `tools`・`expect`（windows-support.md と食い違えばビルドが落ちる）・`pending` | `windows-support.md`（生成物） |
 
 行の色のクラス（`.tk-l` の中）: `tk-p`（プロンプト）/ `tk-c` / `tk-o` / `tk-dim` / `tk-ok` / `tk-warn` / `tk-err` / `tk-acc` / `tk-b`（太字）/
 `tk-cur`（カーソル）。AI の TUI: `tk-tui-msg`（● 付きの発話。`is-tool` で緑）/ `tk-tui-user`（自分の発言）/ `tk-tui-input`（入力欄）。

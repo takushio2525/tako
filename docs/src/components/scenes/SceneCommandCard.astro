@@ -3,6 +3,8 @@
  * 場面: コマンドカード（AI が tako_show_command で渡す）。3 手順。
  * 事実の出どころ: .agent/requirements.md FR-2.22（帯に出る・論理文字列をコピー・同じタブに新規ペインで実行・
  * 実行記録）。カードはペインの下端の帯に出て、ターミナルは下から縮む（会話や入力欄に重ならない）。
+ * 実行のペインは呼び出し元の下へ 0.35 で分割（crates/tako-control/src/dispatch.rs の Direction::Down, 0.35）。
+ * 詳しい流れは features/command-card のページ（CardFlow ほか）。
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
@@ -14,11 +16,11 @@ import Pointer from '../motion/Pointer.astro';
 ---
 
 <Scrolly label="コマンドカードの流れ" flip>
-	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25}>
-		<Split>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+		<Split dir="col">
 			<Pane n={1} title="my-app" state="running" focus body="flush">
 				<div class="tk-pane-col">
-					<div class="tk-pane-term">
+					<div class="tk-pane-term" data-fx="log">
 						<span class="tk-l tk-tui-user">テストを流したい</span>
 						<span class="tk-l tk-tui-msg">テストはこのコマンドで実行できます。カードを出したので、押せばそのまま走ります。</span>
 						<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
@@ -26,22 +28,24 @@ import Pointer from '../motion/Pointer.astro';
 					<div data-at="1+" data-fx="unfold">
 						<div>
 							<div class="tk-cardband">
-								<CommandCard title="テストを実行する" command="npm test" running="2" ran="3" />
+								<CommandCard title="テストを実行する" commands={[{ text: 'npm test', running: '2', ran: '3', runMark: '2' }]} />
 							</div>
 						</div>
 					</div>
 				</div>
 			</Pane>
-			<Pane n={2} title="npm test" state={[{ at: '2', state: 'running' }, { at: '3', state: 'idle' }]} at="2+" fx="split">
-				<span class="tk-l"><span class="tk-p">my-app ❯</span> npm test</span>
-				<span class="tk-l tk-dim" data-at="2+" style="--d: .5s">RUN  v1.6.0  ~/my-app</span>
-				<span class="tk-l" data-at="2+" style="--d: .8s"><span class="tk-ok">✓</span> tests/login.test.ts (3)</span>
-				<span class="tk-l" data-at="3"><span class="tk-ok">✓</span> tests/store.test.ts (9)</span>
-				<span class="tk-l tk-ok tk-b" data-at="3" style="--d: .3s">Tests  12 passed (12)</span>
-				<span class="tk-l" data-at="3" style="--d: .5s"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+			<Pane n={2} title="npm test" state={[{ at: '2', state: 'running' }, { at: '3', state: 'idle' }]} at="2+" fx="split" grow={0.54}>
+				<div data-fx="log">
+					<span class="tk-l"><span class="tk-p">my-app ❯</span> npm test</span>
+					<span class="tk-l tk-dim" data-at="2+" style="--d: .5s">RUN  v1.6.0  ~/my-app</span>
+					<span class="tk-l" data-at="2+" style="--d: .8s"><span class="tk-ok">✓</span> tests/login.test.ts (3)</span>
+					<span class="tk-l" data-at="3"><span class="tk-ok">✓</span> tests/store.test.ts (9)</span>
+					<span class="tk-l tk-ok tk-b" data-at="3" style="--d: .3s">Tests  12 passed (12)</span>
+					<span class="tk-l" data-at="3" style="--d: .5s"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+				</div>
 			</Pane>
 		</Split>
-		<Pointer slot="overlay" path="1:62,46 2:35,70" click="2" />
+		<Pointer slot="overlay" path="1:80,80 2:80,52 3:-" click="2" />
 	</TakoWindow>
 
 	<Step title="打ってほしいコマンドは、カードで届く">
@@ -49,7 +53,7 @@ import Pointer from '../motion/Pointer.astro';
 		<p>画面から選んでコピーすると混ざりがちな折り返しの改行も、カードのコピーなら入りません。</p>
 	</Step>
 	<Step title="押すだけで、隣のペインで実行">
-		<p>「新規ペインで実行」を押すと、同じタブに新しいペインが開いてコマンドが走ります。AI と話している入力欄には何も書き込みません。</p>
+		<p>「新規ペインで実行」を押すと、同じタブの下側に新しいペインが開いてコマンドが走ります。AI と話している入力欄には何も書き込みません。</p>
 	</Step>
 	<Step title="結果もカードに残る">
 		<p>終わるとカードに「実行済み（終了コード 0）」と出ます。走っている間にもう一度押しても、2 本目は走りません。</p>

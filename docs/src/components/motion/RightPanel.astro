@@ -15,9 +15,12 @@ interface Props {
 	fx?: string;
 	/** 窓に対する幅（既定 40%） */
 	width?: string;
+	/** 狭い窓（幅 30rem 以下）での幅（既定 58%。ペインを多く残したい場面で狭める） */
+	narrow?: string;
 }
 
-const { active = 'fleet', count, countAt, at, fx, width } = Astro.props;
+const { active = 'fleet', count, countAt, at, fx, width, narrow } = Astro.props;
+const style = [width && `--rw: ${width}`, narrow && `--rw-narrow: ${narrow}`].filter(Boolean).join('; ') || undefined;
 const views: { id: View; icon: 'fleet' | 'orch' | 'branch' | 'tasks' }[] = [
 	{ id: 'fleet', icon: 'fleet' },
 	{ id: 'orch', icon: 'orch' },
@@ -26,7 +29,7 @@ const views: { id: View; icon: 'fleet' | 'orch' | 'branch' | 'tasks' }[] = [
 ];
 ---
 
-<div class="tk-right" data-at={at} data-fx={fx} style={width ? `--rw: ${width}` : undefined}>
+<div class="tk-right" data-at={at} data-fx={fx} style={style}>
 	<div class="tk-right-tabs">
 		{
 			views.map((v) => (

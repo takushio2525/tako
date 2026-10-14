@@ -16,7 +16,7 @@ import Pane from '../motion/Pane.astro';
 import '../../styles/tako-orch.css';
 ---
 
-<Scrolly label="tako master に頼んでから、worker が 4 体並ぶまで">
+<Scrolly label="tako master に頼んでから、worker が 4 体並ぶまで" intro>
 	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={27} class="tko-launch">
 		<Split>
 			<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
