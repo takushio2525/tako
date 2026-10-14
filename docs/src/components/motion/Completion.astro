@@ -1,0 +1,47 @@
+---
+/**
+ * 補完（予測変換）の一覧の再現（#2062）。コードの行の中（.tk-code）に置き、打っている語の頭の
+ * 真下へ style の left / top で寄せる。
+ *
+ *   <Completion at="1" style="left: 6.2em; top: 6.4em" doc="サーバのポート番号"
+ *     items={[{ kind: 'v', label: 'port', detail: 'int' }, …]} />
+ *
+ * 見た目の正本は crates/tako-app/src/lsp_completion_ui.rs: 種類の印は色つきの角丸に 1 字
+ * （f = 関数・メソッド / v = 変数・フィールド / T = 型 / m = モジュール / k = キーワード）、
+ * 名前の右に説明の 1 行、選んでいる行の説明は一覧の下の帯。
+ */
+import '../../styles/tako-editor.css';
+
+interface Item {
+	kind: 'f' | 'v' | 'T' | 'm' | 'k';
+	label: string;
+	detail?: string;
+}
+
+interface Props {
+	items: Item[];
+	/** 選んでいる行（0 始まり） */
+	selected?: number;
+	/** 選んでいる候補の説明（一覧の下の帯） */
+	doc?: string;
+	at?: string;
+	fx?: string;
+	style?: string;
+}
+
+const { items, selected = 0, doc, at, fx = 'pop', style } = Astro.props;
+---
+
+<span class="tk-comp" data-at={at} data-fx={at ? fx : undefined} style={style}>
+	{
+		items.map((it, i) => (
+			<span class:list={['tk-comp-row', { 'is-sel': i === selected }]}>
+				<span class:list={['tk-comp-k', `is-${it.kind === 'T' ? 't' : it.kind}`]}>{it.kind}</span>
+				<span class="tk-comp-label">{it.label}</span>
+				{it.detail && <span class="tk-comp-detail">{it.detail}</span>}
+			</span>
+		))
+	}
+	{doc && <span class="tk-comp-doc">{doc}</span>}
+</span>
+

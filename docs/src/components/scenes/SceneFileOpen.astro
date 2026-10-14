@@ -1,0 +1,90 @@
+---
+/**
+ * 場面: ファイルツリーから開いて、隣のペインで読む（#2062）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-3.1（タブ内のペインの cwd がツリーのルート）・
+ * FR-3.2（ファイルを押すと右に分割してプレビュー。タブ内で 1 枚を再利用。行番号つきの色分け）・
+ * FR-3.3（.md は既定でレンダリング表示・目のアイコンで切り替え）・FR-3.15（表示中のファイルが
+ * 外で変わったら読み直す）。分割の向きは crates/tako-control/src/dispatch.rs の open_file（右へ新設）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+import FileTree from '../motion/FileTree.astro';
+import PreviewPane from '../motion/PreviewPane.astro';
+---
+
+<Scrolly label="ファイルツリーから開いて、隣のペインで読む流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25}>
+		<FileTree
+			slot="sidebar"
+			items={[
+				{ name: 'tests', dir: true },
+				{ name: 'README.md', hitAt: '2' },
+				{ name: 'app.py', hitAt: '3+' },
+				{ name: 'config.py', git: 'M' },
+				{ name: 'pyproject.toml' },
+			]}
+		/>
+		<Split>
+			<Pane n={1} title="claude" state="none" focus>
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> claude</span>
+				<span class="tk-l tk-tui-user" data-at="4">ポート番号も出して</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="4" style="--d: .3s">Update(app.py)</span>
+				<span class="tk-l tk-tui-msg" data-at="4" style="--d: .6s">5 行目に足しました</span>
+			</Pane>
+			<PreviewPane
+				n={2}
+				at="2+"
+				fx="split"
+				grow={1.8}
+				name={[
+					{ at: '!3+', text: 'README.md' },
+					{ at: '3+', text: 'app.py' },
+				]}
+				path="~/my-app"
+				eyeAt="!3+"
+			>
+				<div class="tk-stack tk-fill">
+					<div class="tk-md" data-at="!3+" data-fx="fade">
+						<span class="tk-md-h1">my-app</span>
+						<span class="tk-md-p">小さな Web サーバーです。</span>
+						<span class="tk-md-li">設定は <span class="tk-md-code">config.py</span></span>
+						<span class="tk-md-li">テストは <span class="tk-md-code">pytest</span></span>
+						<span class="tk-md-pre">python app.py<span class="tk-md-copy"><Icon name="copy" /></span></span>
+					</div>
+					<div class="tk-code" data-at="3+" data-fx="fade">
+						<span class="tk-cl"><i>1</i><b><span class="sx-k">import</span> config</b></span>
+						<span class="tk-cl"><i>2</i><b></b></span>
+						<span class="tk-cl"><i>3</i><b><span class="sx-k">def</span> <span class="sx-f">main</span>():</b></span>
+						<span class="tk-cl"><i>4</i><b class="i1">cfg = config.<span class="sx-f">load</span>()</b></span>
+						<span data-at="4" data-fx="unfold" style="--d: .9s">
+							<span class="tk-cl is-new"><i>5</i><b class="i1"><span class="sx-f">print</span>(cfg.port)</b></span>
+						</span>
+						<span class="tk-cl">
+							<i class="tk-stack"><span data-at="!4" data-fx="fade">5</span><span data-at="4" data-fx="fade" style="--d: .9s">6</span></i>
+							<b class="i1"><span class="sx-f">serve</span>(cfg)</b>
+						</span>
+					</div>
+				</div>
+			</PreviewPane>
+		</Split>
+		<Pointer slot="overlay" path="2:12,37 3:10,43" click="2 3" />
+	</TakoWindow>
+
+	<Step title="ペインのいるフォルダが、そのままツリーに">
+		<p>左のファイルツリーには、そのタブのペインがいる作業フォルダが自動で並びます。フォルダを選び直す手間はありません。</p>
+	</Step>
+	<Step title="押すと、右にプレビューが開く">
+		<p>ファイルを押すと、ペインが右に分かれて中身が開きます。<code>.md</code> は見出しや表を描いた姿で開き、目のアイコンでコードとしての表示に切り替えられます。</p>
+	</Step>
+	<Step title="次のファイルも、同じペインで">
+		<p>別のファイルを押すと、さっきのプレビューがそのファイルに替わります。コードは行番号つきで色分けされ、ペインが積み上がりません。</p>
+	</Step>
+	<Step title="AI が書き換えたら、すぐ反映">
+		<p>表示中のファイルが外で書き換わると、tako が読み直します。AI が直したコードを、開き直さずにその場で確かめられます。</p>
+	</Step>
+</Scrolly>

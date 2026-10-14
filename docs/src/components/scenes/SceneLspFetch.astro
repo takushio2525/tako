@@ -1,0 +1,67 @@
+---
+/**
+ * 場面: 言語サーバを tako が取ってきて、間違いに波線が引かれる（#2062）。3 手順。
+ * 事実の出どころ: .agent/requirements.md FR-3.28（編集モードにしたときだけ拡張子に合うサーバを起こす）・
+ * FR-3.41（グローバルに無ければ版を固定して data dir へ取る。npm の包みは Node.js で起こし、足りる node が
+ * PATH に無ければ Node.js 24.21.0 も取る。配布元のハッシュで検証）・FR-3.30（波線と右パネルの
+ * diagnostics の一覧。行を押すとその位置へ）。状態の文言は crates/tako-app/src/ui_text/preview.rs の
+ * lsp_fetching / lsp_running、一覧の見出しは ui_text/panel.rs の diagnostics_title。
+ * 診断の文面は pyright の実際の書式（reportAttributeAccessIssue / reportUndefinedVariable）。Windows の LSP は pending（#1007）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pointer from '../motion/Pointer.astro';
+import PreviewPane from '../motion/PreviewPane.astro';
+import EditorPanel from '../motion/EditorPanel.astro';
+---
+
+<Scrolly label="言語サーバを取ってきて、間違いに波線が引かれる流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} height={22}>
+		<Split>
+			<PreviewPane
+				n={2}
+				focus
+				edit
+				name="app.py"
+				lsp={[
+					{ at: '1', text: 'pyright を取得中（Node.js 24.21.0 31.4 / 52.9 MB）', busy: true },
+					{ at: '2+', text: 'pyright 動作中' },
+				]}
+			>
+				<div class="tk-code">
+					<span class="tk-cl"><i>1</i><b><span class="sx-k">import</span> config</b></span>
+					<span class="tk-cl"><i>2</i><b></b></span>
+					<span class="tk-cl"><i>3</i><b><span class="sx-k">def</span> <span class="sx-f">main</span>():</b></span>
+					<span class="tk-cl"><i>4</i><b class="i1">cfg = config.<span class="sx-f">load</span>()</b></span>
+					<span class="tk-cl tk-hl" data-at="3" data-fx="state"><i>5</i><b class="i1"><span class="sx-f">print</span>(cfg.<span class="tk-sq" data-at="2+" data-fx="state">prot</span>)</b></span>
+					<span class="tk-cl"><i>6</i><b class="i1"><span class="sx-f">serve</span>(cfg, debug=<span class="tk-sq" data-at="2+" data-fx="state">Ture</span>)</b></span>
+				</div>
+			</PreviewPane>
+		</Split>
+		<EditorPanel slot="right" active="diagnostics" at="2+" width="42%">
+			<span class="tk-ep-head">診断<span class="tk-ep-sum"><i class="tk-dot is-fail"></i>2</span></span>
+			<span class="tk-ep-file">app.py <small>ペイン 2</small></span>
+			<span class="tk-ep-row" data-at="3" data-fx="state">
+				<i class="tk-dot is-err"></i><span class="tk-ep-pos">5:14</span><span class="tk-ep-msg">Cannot access attribute "prot" for class "Config"</span>
+			</span>
+			<span class="tk-ep-row">
+				<i class="tk-dot is-err"></i><span class="tk-ep-pos">6:21</span><span class="tk-ep-msg">"Ture" is not defined</span>
+			</span>
+		</EditorPanel>
+		<Pointer slot="overlay" path="3:62,50" click="3" />
+	</TakoWindow>
+
+	<Step title="編集を始めると、言語サーバを取りに行く">
+		<p>コードを編集モードにすると、そのファイルに合う言語サーバ（<code>.py</code> なら pyright）を起こします。入っていなければ tako が取ってきます。進み具合はペインの上に出ます。</p>
+		<p>版を固定して、配布元が公開しているハッシュで確かめてから置きます。npm や Homebrew は使わず、PATH も書き換えません。</p>
+	</Step>
+	<Step title="動き出したら、間違いに波線">
+		<p>言語サーバが動き出すと、間違いに波線が引かれます（エラーは赤、警告は黄）。右パネルの diagnostics に、同じ一覧が並びます。</p>
+	</Step>
+	<Step title="一覧から、その場所へ">
+		<p>一覧の行を押すと、そのペインのその位置へ移ります。AI も <code>tako lsp diagnostics</code> で同じ一覧を読めるので、エラーを見ながら直してもらえます。</p>
+		<p class="tk-step-note">言語サーバの機能は macOS 版で使えます。Windows 版は試験用のサーバでは確かめていますが、実際の言語サーバでの確認がまだです。</p>
+	</Step>
+</Scrolly>

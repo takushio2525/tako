@@ -1,10 +1,68 @@
 ---
 title: ファイルツリー＆プレビュー
-seoTitle: ファイルツリーとプレビュー — コード・Markdown・画像・PDF をペインで開く
-description: サイドバーのファイルツリーと、シンタックスハイライト付きのコード・Markdown・画像・PDF・動画のプレビュー。ペインの中での編集と自動反映、ファイルの実行（Code Runner）まで扱います
+seoTitle: ファイルツリー・プレビュー・エディタ — 開く・読む・直すをペインの中で
+description: ファイルツリーから開いたコード・Markdown・画像・PDF を隣のペインで読み、その場で編集できます。自動保存、言語サーバ（LSP）の診断・補完・定義へ移動、ワークスペース横断検索、ファイルの実行（Code Runner）まで扱います
 ---
 
-tako はターミナルでありながら、エディタのようなファイルブラウジング機能を備えています。
+import SceneFileOpen from '../../../components/scenes/SceneFileOpen.astro';
+import SceneFileEdit from '../../../components/scenes/SceneFileEdit.astro';
+import SceneLspFetch from '../../../components/scenes/SceneLspFetch.astro';
+import SceneLspCode from '../../../components/scenes/SceneLspCode.astro';
+import SceneFileSearch from '../../../components/scenes/SceneFileSearch.astro';
+import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
+
+ファイルを開く・読む・直すが、ターミナルの隣のペインで済みます。言語サーバ（LSP）も tako が取ってくるので、入れたその日から補完とエラーの波線が出ます。スクロールすると、画面がその手順の状態に変わります。
+
+## 開いて読む
+
+<SceneFileOpen />
+
+## その場で直す
+
+<SceneFileEdit />
+
+## 言語サーバは tako が用意する
+
+<SceneLspFetch />
+
+## 補完・型・定義へ
+
+<SceneLspCode />
+
+## プロジェクト全体から探す
+
+<SceneFileSearch />
+
+## Windows では
+
+ファイルツリー・プレビュー・編集と自動保存・横断検索・ファイルの実行（Code Runner）は、Windows 版でも使えます。次のものはまだです。最新の状況は [Windows 対応状況](/windows-support/) にあります。
+
+<WindowsLimits
+	items={[
+		{
+			kind: 'pending',
+			title: '言語サーバ（LSP）の診断・補完・定義へ移動',
+			text: '試験用のサーバでは確かめていますが、Windows 実機で実際の言語サーバと動かした確認がまだです。',
+			tools: ['tako_lsp', 'tako_lsp_server'],
+		},
+		{
+			kind: 'pending',
+			title: '動画の再生',
+			text: '動画のデコーダの Windows 版が無く、動画ファイルは開けません。',
+			tools: ['tako_video_playback', 'tako_video_seek'],
+		},
+		{
+			kind: 'degraded',
+			title: 'PDF',
+			text: '表示はできますが、文字の選択・目次・PDF 内のリンクは使えません。',
+			tools: ['tako_preview_outline', 'tako_preview_follow_link'],
+		},
+	]}
+/>
+
+---
+
+ここから先は、操作ごとの詳しい説明です。
 
 ## ファイルツリー（左サイドバー）
 
@@ -143,11 +201,6 @@ tako tree selection                  # ツリーで選んでいる行を見る
 tako tree selection --key down       # ↓ を押したのと同じ（up / left / right / enter / extend_* も）
 ```
 
-<figure class="tako-shot">
-<img src="/img/preview-code.webp" alt="左のファイルツリーでファイルを選び、右のペインに TypeScript がシンタックスハイライト付きで表示されている画面" />
-<figcaption>ファイルツリーから選ぶと、隣のペインにシンタックスハイライト付きで開く</figcaption>
-</figure>
-
 ## コードプレビュー
 
 ファイルをクリックまたは `tako open <ファイルパス>` で、ペイン内にファイル内容を表示します。
@@ -179,18 +232,13 @@ tako tree selection --key down       # ↓ を押したのと同じ（up / left 
 - タイトルバーの目アイコンで **コード表示 ⇔ Markdown 表示**を切替可能
 - 切替モードは CLI / MCP からも操作可
 
-<figure class="tako-shot">
-<img src="/img/preview-markdown.webp" alt="README.md が見出し・コードブロック・表つきでレンダリング表示されている画面" />
-<figcaption>`.md` は既定でレンダリング表示。コードブロックにはコピーボタンが付く</figcaption>
-</figure>
-
 ## 画像・PDF・動画プレビュー
 
 コードと Markdown 以外のファイルも開けます。表示モードは拡張子から自動判定されます。
 
 - **画像**: PNG / JPEG / SVG / GIF / WebP など。25〜400% のズームとパンに対応
-- **PDF**: ペイン内でそのまま表示。テキストの選択・コピー、目次からのジャンプ、内部リンクや外部 URL の <kbd>Cmd</kbd>+クリック（Windows は <kbd>Ctrl</kbd>+クリック）にも対応します
-- **動画**: mp4 の再生・一時停止・シーク（矢印キーやクリックで操作。CLI `tako video` / MCP からも制御可）
+- **PDF**: ペイン内でそのまま表示。テキストの選択・コピー、目次からのジャンプ、内部リンクや外部 URL の <kbd>Cmd</kbd>+クリックにも対応します（Windows 版は表示だけで、文字の選択・目次・PDF 内のリンクはまだ使えません）
+- **動画**: mp4 の再生・一時停止・シーク（矢印キーやクリックで操作。CLI `tako video` / MCP からも制御可）。macOS 版のみで、Windows 版はまだ再生できません
 
 ```bash
 tako preview                  # 現在のズーム・ページ状態
@@ -198,20 +246,66 @@ tako preview-outline          # Markdown 見出し / PDF 目次の一覧
 tako preview-outline --item 4 # 4 番目の項目へジャンプ
 ```
 
-<figure class="tako-shot">
-<img src="/img/preview-markdown-table.webp" alt="Markdown の表が罫線つきの表として描画されている画面" />
-<figcaption>GFM の表は罫線・ヘッダ帯つきで描画され、列幅も内容に合わせて配分される</figcaption>
-</figure>
-
 ## 編集と自動反映
 
-コードプレビューはその場で軽く編集できます。<kbd>Cmd</kbd>+<kbd>S</kbd> で保存、<kbd>Cmd</kbd>+<kbd>F</kbd> で検索、<kbd>Cmd</kbd>+<kbd>Z</kbd> で取り消しです。検索は大文字小文字を区別するのが既定で、検索欄の右のトグルで「区別しない」「単語単位」に切り替えられます（`value` を置換しても型名の `Value` は変わりません）。カーソルを括弧の隣に置くと、対になる括弧に色が付きます（文字列とコメントの中の括弧は数えません）。開いている間にファイルが外部から書き換わった場合、保存は拒否されるので、うっかり他人の変更を潰すことはありません。
+コードプレビューはその場で軽く編集できます。ペインの上の「編集」で編集モードに入り、打つのをやめて約 0.5 秒で自動保存されます（既定で有効）。キーは次のとおりです（Windows は <kbd>Ctrl</kbd>+<kbd>Z</kbd> や <kbd>Ctrl</kbd>+<kbd>C</kbd> を端末へそのまま渡すため、<kbd>Ctrl</kbd>+<kbd>Shift</kbd> の組み合わせです）。
+
+| 操作 | macOS | Windows |
+|---|---|---|
+| 保存 | ⌘S | Ctrl+Shift+S |
+| ファイル内の検索・置換 | ⌘F | Ctrl+Shift+F |
+| 取り消し / やり直し | ⌘Z / ⇧⌘Z | Ctrl+Shift+Z / Ctrl+Shift+Y |
+
+検索は大文字小文字を区別するのが既定で、検索欄の右のトグルで「区別しない」「単語単位」に切り替えられます（`value` を置換しても型名の `Value` は変わりません）。カーソルを括弧の隣に置くと、対になる括弧に色が付きます（文字列とコメントの中の括弧は数えません）。保存していない変更があるときにファイルが外で書き換わると、自動保存を止めて帯で知らせ、「差分」「上書き保存」「ディスクから読み直す」から選べます。黙って他人の変更を潰すことはありません。
 
 表示中のファイルが変わると**自動で再読み込み**されます（既定 ON）。AI がファイルを書き換えたとき、手動で開き直す必要はありません。
 
 ```bash
 tako preview-reload          # 現在値
 tako preview-reload off
+```
+
+## 言語サーバ（LSP）
+
+コードを**編集モード**で開くと、拡張子に合う言語サーバを起こします（読むだけのときは起こしません）。動いている間は、診断の波線・補完・型と説明のカード・定義へ移動・参照の検索・整形が使えます。
+
+| 言語（拡張子） | 言語サーバ | 入っていないとき |
+|---|---|---|
+| Python（`.py` `.pyi`） | pyright | tako が取ってくる（1.1.414） |
+| TypeScript / JavaScript（`.ts` `.tsx` `.js` `.jsx` ほか） | typescript-language-server | tako が取ってくる（5.1.3 + typescript 5.9.3） |
+| Rust（`.rs`） | rust-analyzer | tako が取ってくる（2026-09-21） |
+| C / C++（`.c` `.cpp` `.h` ほか） | clangd | 取ってこない（ご自身で入れてください） |
+
+- **グローバルに入っていればそちらを使います**。無いときだけ、版を固定したものを tako のデータフォルダへ取り、配布元が公開しているハッシュで確かめてから使います。npm や Homebrew は起こさず、PATH も書き換えません。pyright と typescript-language-server は Node.js で動くので、足りる版の node が PATH に無ければ Node.js 24.21.0 も一緒に取ります
+- 状態は編集中のペインの上に「取得中（取っているものと n / m MB）→ 起動中 → 読み込み中 → 動作中」と出ます。取れなかった・止まったときはその下に帯が出て、理由と「入れる」「もう一度取得」「起こし直す」のボタンが並びます
+- 前もって入れておく・取り直すときは `tako lsp install`、状態を見るときは `tako lsp status` です
+
+| 操作 | macOS | Windows |
+|---|---|---|
+| 補完の候補を選ぶ / 確定 / 閉じる | ↑↓ / Enter か Tab / Esc | 同じ |
+| 型と説明のカード | マウスを乗せる / ⇧⌘H | マウスを乗せる / Ctrl+Shift+H |
+| 定義へ移動 | ⌘+クリック | Ctrl+クリック |
+| ジャンプする前の場所へ戻る / 進む | ⌃- / ⌃⇧- | Ctrl+Alt+← / Ctrl+Alt+→ |
+| コードを整形 | ⇧⌘I | Ctrl+Shift+I |
+
+- 識別子を右クリックすると、「定義へ移動」「宣言へ移動」「型定義へ移動」「実装へ移動」と、「参照を検索」「呼び出し元を表示」などが出ます（言語サーバが対応している項目だけ）。参照の結果は右パネルの references に並びます
+- エラーと警告の一覧は右パネルの diagnostics に並び、押すとその位置へ移ります。AI からは `tako lsp diagnostics` で同じ一覧を読めます
+- 保存時の整形は既定で off です。`tako lsp format-on-save on` で、⌘S などの明示的な保存のときだけ整形するようになります（自動保存では整形しません）
+
+## ワークスペース横断検索
+
+<kbd>⇧⌘F</kbd>（Windows は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd>）で右パネルの search に検索欄が開き、<kbd>Enter</kbd> で探します。開いているファイルの中だけを探すのは <kbd>⌘F</kbd> の方です。
+
+- 範囲は、そのタブのファイルツリーのフォルダです。ホームフォルダ全体を気付かずに探すことはありません
+- git のリポジトリの中では `.gitignore` の対象を探しません。バイナリと大きすぎるファイルも探さず、件数だけ知らせます
+- 大文字小文字は区別しないのが既定で、検索欄の右の `Aa` で区別、`.*` で正規表現になります
+- 結果の行を押すと、そのファイルのその行が開きます（開いているペインがあればそこへ、無ければ右に新しいペインで）
+- 置換と、シンボル名での検索はまだありません
+
+```bash
+tako search port                  # タブのファイルツリーのフォルダから探す
+tako search 'def \w+' --regex     # 正規表現
+tako search port --show           # 右パネルの search にも出す
 ```
 
 ## 履歴（チェンジログ）ビュー
@@ -279,8 +373,19 @@ tako open src/main.rs
 # 表示モードを明示指定して開く
 tako open design.pdf --mode pdf
 
+# 行を指定して開く
+tako open app.py --line 42
+
+# 編集中のコードのエラー・警告を読む（右パネルの diagnostics と同じ一覧）
+tako lsp diagnostics
+
+# ワークスペースを横断して探す
+tako search port
+
 # MCP 経由（AI エージェントが使用）
 # tako_open_file ツールで AI が自動的にプレビューを開く
 ```
 
 AI が「このファイルを見て」と言ったとき、tako は自動的にプレビューペインを開いて該当ファイルを表示します。エディタを別途開く必要はありません。
+
+編集・言語サーバ・検索のコマンドの全部は [CLI リファレンス](/guides/cli-reference/#tako-lsp) に、キー操作は [キーボードショートカット](/guides/keyboard-shortcuts/#プレビューの操作) にあります。
