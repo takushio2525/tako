@@ -58,6 +58,13 @@ pub fn persist_log(msg: &str) {
     append_log(persist_log_path(), msg);
 }
 
+/// ペインの文字コード固定の異常（諦めた / 入力の保留を上限で解いた）を残す（#2092）。
+/// どちらも Windows の異常系でしか起きない（正常な固定は書かない = 高頻度にならない）。
+/// 1 行の正本は `PinLogEvent::log_line`（ペイン ID・対象・pid・経過・理由だけ。送った文字は載せない）
+pub fn encoding_pin_log(pane: u64, event: &tako_core::encoding_pin::PinLogEvent) {
+    persist_log(&event.log_line(pane));
+}
+
 /// 送達経路の分岐を記録する（`TAKO_FLOW_DIAG=1` のときだけ。#640）。
 ///
 /// 起動コマンドの送達は「シェル準備待ち → エコー確認 → 分離 Enter → 実行確認」を

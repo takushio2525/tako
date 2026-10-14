@@ -37,6 +37,8 @@ pub enum SessionEvent {
     Term(TermEvent),
     /// OSC 7 / 133 タップの検知（`osc_tap`。FR-2.4.1）
     Osc(OscEvent),
+    /// 文字コード固定の異常（諦めた / 保留を上限で解いた。#2092。Windows でしか起きない）
+    EncodingPin(crate::encoding_pin::PinLogEvent),
 }
 
 /// OSC 133 マークから導出するコマンド実行状態（FR-2.1.4 の表示・list の公開元）。
@@ -264,6 +266,9 @@ pub enum SessionNotice {
     TitleChanged,
     /// OSC 52 によるクリップボード書き込み要求
     ClipboardStore(String),
+    /// 文字コード固定の異常（#2092）。UI 層はペイン ID を添えて persist.log へ書く
+    /// （`PinLogEvent::log_line`。tako-core はペイン ID を知らない）
+    EncodingPin(crate::encoding_pin::PinLogEvent),
 }
 
 /// シェルの代わりに起動するコマンド（`tako split -- <command>` 等で使う）
@@ -397,6 +402,9 @@ pub struct TerminalSession {
     serial: u64,
     /// PTY 直下の子プロセスの終了ステータス（`ChildExit` を処理した後だけ Some。#1857）
     exit_status: Option<std::process::ExitStatus>,
+    /// 文字コード固定の決着まで入力を預かる門（#2092）。固定が要らない unix と
+    /// A/B の legacy では None = 素通し
+    pin_gate: Option<crate::encoding_pin::PinGate>,
 }
 
 /// [`TerminalSession::serial`] の払い出し元（0 は使わない）
@@ -470,6 +478,19 @@ impl TerminalSession {
         cols: usize,
         rows: usize,
         options: SpawnOptions,
+    ) -> Result<(Self, UnboundedReceiver<SessionEvent>), SessionError> {
+        Self::spawn_in(cols, rows, options, None)
+    }
+
+    /// [`Self::spawn`] の器のペイン版（#2092）。`container` を渡すと、器（psmux）の中の
+    /// シェルの文字コード固定（#659）も PTY 直下の子の固定と**同じ門**に載せ、両方が
+    /// 決着するまで入力を預かる。`options` は器の中で起動する形へ書き換え済みのもの
+    /// （`tmux_backend::wrap_options` 等）を渡す
+    pub fn spawn_in(
+        cols: usize,
+        rows: usize,
+        options: SpawnOptions,
+        container: Option<crate::encoding_pin::ContainerPin>,
     ) -> Result<(Self, UnboundedReceiver<SessionEvent>), SessionError> {
         let (tx, rx) = unbounded::<SessionEvent>();
         let proxy = EventProxy(tx.clone());
@@ -553,11 +574,14 @@ impl TerminalSession {
         // 放っておくと子が吐いた UTF-8 バイトを conhost が CP932 として解釈し、
         // **tako が受け取る前に**文字が壊れる（描画経路は入口から出口まで UTF-8 専用）。
         // 子が疑似コンソールへ接続し終えるまで数十 ms かかるので、待ちは別スレッドへ
-        // 逃がす（UI スレッドは止めない）。失敗してもペインは起動する
+        // 逃がす（UI スレッドは止めない）。失敗してもペインは起動する。
+        // 固定はシェルと同期していないので、**入力は固定の決着まで門が預かる**（#2092）。
+        // 諦めた・上限で流したことはイベントで UI 層へ渡す（persist.log はペイン ID を知る側が書く）
         let child_pid = pty_child_pid(&pty);
-        if let Some(pid) = child_pid {
-            crate::platform::console::pin_pane_to_utf8_when_ready(pid);
-        }
+        let pin_events = tx.clone();
+        let pin_gate = crate::encoding_pin::begin(child_pid, container, move |event| {
+            let _ = pin_events.unbounded_send(SessionEvent::EncodingPin(event));
+        });
         // PTY 読み取りを OSC 7 / 133 タップで観測する（バイト列は変更しない。`osc_tap`）
         let pty = TapPty::new(
             pty,
@@ -572,6 +596,11 @@ impl TerminalSession {
         let event_loop = PtyLoop::new(term.clone(), proxy, pty, wakeup_pending.clone())
             .map_err(SessionError::EventLoop)?;
         let notifier = Notifier(event_loop.channel());
+        if let Some(gate) = &pin_gate {
+            // 門が預かった入力は、開いたときにこの書き込みキューへ預かった順に流れる
+            let flush = Notifier(notifier.0.clone());
+            gate.attach_flush(move |bytes| flush.notify(bytes));
+        }
         let _io_thread = event_loop.spawn();
 
         Ok((
@@ -601,6 +630,7 @@ impl TerminalSession {
                     last: std::time::Instant::now(),
                 }),
                 wakeup_pending,
+                pin_gate,
             },
             rx,
         ))
@@ -679,7 +709,21 @@ impl TerminalSession {
             }
             None => bytes,
         };
-        self.notifier.notify(bytes);
+        self.send_input(bytes);
+    }
+
+    /// 入力を PTY へ送る（**入力の送り口はすべてここ**を通る。#2092）。
+    /// 文字コード固定の決着前は門が預かり、決着（または上限）で預かった順に流れる。
+    /// 端末からの応答（`PtyWrite`）は通さない（子がそれを待っていると固定が決着しない）
+    fn send_input(&self, bytes: Vec<u8>) {
+        send_gated(self.pin_gate.as_ref(), &self.notifier, bytes);
+    }
+
+    /// 文字コード固定の記録（#2092。診断用）。固定が要らない unix と A/B の legacy では None
+    pub fn encoding_pin(&self) -> Option<crate::encoding_pin::PinReport> {
+        self.pin_gate
+            .as_ref()
+            .map(crate::encoding_pin::PinGate::report)
     }
 
     /// PTY 直下の子プロセス（シェル / 明示コマンド）の pid（取得できない環境では None）。
@@ -825,7 +869,7 @@ impl TerminalSession {
             // 転送はスクロールバック表示を動かさない（write() の bottom 戻しも不要）
             WheelAction::Write(bytes) => {
                 self.note_mouse_report(mode, delta_lines);
-                self.notifier.notify(bytes);
+                self.send_input(bytes);
             }
             WheelAction::ScrollDisplay(lines) => self.scroll_display(lines),
             WheelAction::None => {}
@@ -853,7 +897,7 @@ impl TerminalSession {
                 match wheel_action(mode, lines, col, row) {
                     WheelAction::Write(bytes) => {
                         self.note_mouse_report(mode, lines);
-                        self.notifier.notify(bytes);
+                        self.send_input(bytes);
                     }
                     // ALT_SCREEN + alternate scroll OFF は何もしない（履歴が無い）
                     WheelAction::ScrollDisplay(_) | WheelAction::None => {}
@@ -996,7 +1040,7 @@ impl TerminalSession {
 
     /// クリックの報告を PTY へ書く（#1961）。ホイールの転送と同じく表示位置は動かさない
     pub fn write_click_report(&self, bytes: Vec<u8>) {
-        self.notifier.notify(bytes);
+        self.send_input(bytes);
     }
 
     pub fn scroll_to_bottom(&self) {
@@ -1046,11 +1090,14 @@ impl TerminalSession {
                 self.process_osc_event(event);
                 None
             }
+            SessionEvent::EncodingPin(event) => Some(SessionNotice::EncodingPin(event)),
         }
     }
 
     fn process_term_event(&mut self, event: TermEvent) -> Option<SessionNotice> {
         match event {
+            // 端末の応答は入力の門（#2092）を通さない: 疑似コンソールや子がこの返事を
+            // 待っていると子の起動が進まず、文字コード固定も決着しない
             TermEvent::PtyWrite(text) => {
                 self.notifier.notify(text.into_bytes());
                 None
@@ -1167,6 +1214,7 @@ impl TerminalSession {
         PaneAccess {
             term: self.term.clone(),
             notifier: Notifier(self.notifier.0.clone()),
+            pin_gate: self.pin_gate.clone(),
         }
     }
 
@@ -1838,6 +1886,10 @@ fn extract_usage_text(line: &str) -> Option<String> {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        // 預かっている入力は捨てる（閉じたペインへ後から流さない。#2092）
+        if let Some(gate) = &self.pin_gate {
+            gate.close();
+        }
         // IO スレッドへ終了を通知する（PTY が drop されシェルにも HUP が届く）
         let _ = self.notifier.0.send(Msg::Shutdown);
     }
@@ -2112,6 +2164,8 @@ fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
 pub struct PaneAccess {
     term: std::sync::Arc<FairMutex<Term<EventProxy>>>,
     notifier: Notifier,
+    /// 持ち主の端末と同じ門（#2092。ダイアログ応答も入力なので同じ順序で預かる）
+    pin_gate: Option<crate::encoding_pin::PinGate>,
 }
 
 impl std::fmt::Debug for PaneAccess {
@@ -2134,14 +2188,83 @@ impl PaneAccess {
     /// （`TerminalSession::write` は最下部へ戻すが、ここは「いま画面に見えている
     /// ダイアログへ 1 キー送る」用途なので、読んだ画面と送る先をずらさない）
     pub fn write(&self, bytes: Vec<u8>) {
-        use alacritty_terminal::event::Notify;
-        self.notifier.notify(bytes);
+        send_gated(self.pin_gate.as_ref(), &self.notifier, bytes);
     }
+
+    /// 持ち主の端末の文字コード固定の記録（#2092）。端末が閉じた後も読める
+    /// （閉じたときに預かりを捨てたことが `hold.release = closed` で分かる）
+    pub fn encoding_pin(&self) -> Option<crate::encoding_pin::PinReport> {
+        self.pin_gate
+            .as_ref()
+            .map(crate::encoding_pin::PinGate::report)
+    }
+}
+
+/// 入力を門（#2092）へ通してから PTY へ送る。`TerminalSession` と [`PaneAccess`] の
+/// 入力の送り口が共有する 1 実装（門が無ければ素通し）
+fn send_gated(gate: Option<&crate::encoding_pin::PinGate>, notifier: &Notifier, bytes: Vec<u8>) {
+    if bytes.is_empty() {
+        return;
+    }
+    let bytes = match gate {
+        Some(gate) => match gate.submit(bytes) {
+            Some(bytes) => bytes,
+            None => return,
+        },
+        None => bytes,
+    };
+    notifier.notify(bytes);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2092 の番犬: PTY へ書く口（`.notify(`）は「入力の門（`send_gated`）」
+    /// 「門が預かりを流す先（`spawn_in` の flush）」「端末の応答（`process_term_event` の
+    /// `PtyWrite`）」の 3 か所だけ。新しい入力の口が門を迂回すると、Windows で固定の
+    /// 決着より先に入力が届いて出力が化ける（テストでは再現しにくい = ここで止める）
+    #[test]
+    fn issue2092_ptyへ書く口は門と応答だけ() {
+        let src = include_str!("terminal.rs");
+        let body = &src[..src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("テストモジュールの開始")];
+        let allowed = ["send_gated", "spawn_in", "process_term_event"];
+        let mut current = String::new();
+        let mut offenders = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, line) in body.lines().enumerate() {
+            let t = line.trim_start();
+            let decl = t
+                .strip_prefix("pub fn ")
+                .or_else(|| t.strip_prefix("pub(crate) fn "))
+                .or_else(|| t.strip_prefix("fn "));
+            if let Some(rest) = decl {
+                current = rest
+                    .split(|c: char| c == '(' || c == '<')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+            if line.contains(".notify(") {
+                seen.insert(current.clone());
+                if !allowed.contains(&current.as_str()) {
+                    offenders.push(format!("{}: fn {current}: {}", i + 1, t));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "入力の門（send_gated）を迂回して PTY へ書いている:\n{}",
+            offenders.join("\n")
+        );
+        // 走査が空振りしていないこと（3 か所とも見つかる）
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            vec!["process_term_event", "send_gated", "spawn_in"]
+        );
+    }
 
     fn map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs

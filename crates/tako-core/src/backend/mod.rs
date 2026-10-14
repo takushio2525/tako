@@ -755,58 +755,17 @@ pub fn wrap_spawn_for_pane(
             let wrapped = backend.wrap_spawn(options, &session);
             // 器の中のシェルは tako の ConPTY の子ではないので、
             // `TerminalSession::spawn` のコードページ固定（B19）が届かない。
-            // **器を配るこの 1 箇所**から器の内側にも同じ固定を届ける（#659）
-            pin_container_encoding(backend, session.clone());
+            // 器の内側にも同じ固定を届ける（#659）。ここは端末を起こす前なので
+            // 入力の保留（#2092）は持てない。**本番の GUI は `TerminalSession::spawn_in` へ
+            // [`crate::encoding_pin::ContainerPin`] を渡す経路**で、固定と保留を 1 つの門に載せる
+            crate::encoding_pin::start_container_ungated(crate::encoding_pin::ContainerPin::new(
+                backend,
+                session.clone(),
+            ));
             (wrapped, Some(session))
         }
         None => (options, None),
     }
-}
-
-/// 器の中のペインの pid が見えるようになるまでの上限。
-/// `new-session` の完了待ちで、実測（この Windows 機・psmux 3.3.7）は 1 秒未満
-const CONTAINER_PID_TIMEOUT: Duration = Duration::from_secs(15);
-/// 器への問い合わせ間隔。1 回がサブプロセス起動（実測 30〜50ms）なので細かくしない
-const CONTAINER_PID_INTERVAL: Duration = Duration::from_millis(120);
-
-/// 器の中のシェルの疑似コンソールを UTF-8 へ固定する（#659。Windows のみ実体を持つ）。
-///
-/// `backend=psmux` のとき、tako の ConPTY 直下の子は **psmux クライアント**であって
-/// シェルではない。シェルは psmux サーバーが自前に作った別の疑似コンソールの中で動くので、
-/// [`crate::platform::console`] の固定を PTY 直下の子へ当てても器の内側には届かない
-/// （#655 の対処が psmux ペインに効かなかった理由そのもの）。
-///
-/// **呼び出しは即座に返る**。器へ pid を尋ねるのはサブプロセス起動なので、
-/// 待ちも問い合わせも別スレッドへ逃がす（UI スレッドは止めない）。
-/// 固定できなくてもペインは起動する（描画が化けるだけで、動かなくなるよりはよい）
-fn pin_container_encoding(backend: &'static dyn SessionBackend, session: SessionRef) {
-    // unix は `LC_CTYPE` 注入側で担保済み。ここで器へ問い合わせる意味が無いので
-    // **スレッドもサブプロセスも作らない**
-    if !crate::platform::console::pin_needed() {
-        return;
-    }
-    std::thread::Builder::new()
-        .name("tako-pin-container-cp".into())
-        .spawn(move || {
-            let deadline = std::time::Instant::now() + CONTAINER_PID_TIMEOUT;
-            loop {
-                // 新規作成なら器のセッションが出来るまで空。再 attach（復元）なら即座に返る
-                // （既に走っているシェルでも固定は効く = 実測。#659）
-                let pids = backend.pane_pids(&session);
-                if !pids.is_empty() {
-                    for pid in pids {
-                        crate::platform::console::pin_pane_to_utf8_when_ready(pid);
-                    }
-                    return;
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::debug!("器の中のペイン pid を取得できず: {session}");
-                    return;
-                }
-                std::thread::sleep(CONTAINER_PID_INTERVAL);
-            }
-        })
-        .ok();
 }
 
 // --- 実装の選択 -----------------------------------------------------------

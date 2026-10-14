@@ -65,20 +65,23 @@ pub fn pin_pane_to_utf8(pid: u32) -> PinOutcome {
     imp::pin_pane_to_utf8(pid)
 }
 
-/// 子が疑似コンソールへ接続し終えるのを待ってから固定する（**呼び出しは即座に返る**）。
+/// 子が疑似コンソールへ接続し終えるまで試し続けて固定する（**呼び出し元のスレッドで待つ**）。
+/// 上限（3 秒）まで接続が成立しなければ、最後の失敗理由つきの [`PinOutcome::Failed`]
+/// を返す（= 諦めた）。
 ///
 /// `CreateProcess` の直後はまだ接続が済んでおらず `AttachConsole` が
 /// `ERROR_GEN_FAILURE`（31）で失敗する。接続が成立するまでの実測は
 /// **cmd.exe で 43〜61ms、PowerShell 5.1 で 97ms**（`tests/encoding_conpty.rs` の計測）。
 ///
-/// ペインの起動は UI スレッドから走るのでここでは待てない。別スレッドで短間隔に
-/// 試し、成立したら固定して終わる。PowerShell 5.1 はプロンプトまで実測 500ms 超あるので
-/// 余裕があるが、**cmd.exe ではシェルの最初の 1 行との差が小さく、同期もしていない**
-/// （Windows CI で 20 回測り、tako の画面にプロンプトが出る 7〜34ms 前に固定が済んだ。
-/// 負荷で逆転した回にプロンプト直後の `type` の出力が化けた = #1696）。
+/// ペインの起動は UI スレッドから走るので、呼ぶのは別スレッド（[`crate::encoding_pin`]）。
+/// PowerShell 5.1 はプロンプトまで実測 500ms 超あるので余裕があるが、**cmd.exe では
+/// シェルの最初の 1 行との差が小さく、同期もしていない**（Windows CI で 20 回測り、
+/// tako の画面にプロンプトが出る 7〜34ms 前に固定が済んだ。負荷で逆転した回に
+/// プロンプト直後の `type` の出力が化けた = #1696）。だから入力は固定の決着まで
+/// 保留する（#2092 = [`crate::encoding_pin::PinGate`]）。
 /// 固定が済んだことを確かめたい検証は [`read_pane_code_pages`] で状態を待つ
-pub fn pin_pane_to_utf8_when_ready(pid: u32) {
-    imp::pin_pane_to_utf8_when_ready(pid);
+pub fn pin_pane_to_utf8_blocking(pid: u32) -> PinOutcome {
+    imp::pin_pane_to_utf8_blocking(pid)
 }
 
 /// 自分のコンソールの有無を問わず固定を試みる（**テスト・診断用**）。
@@ -106,7 +109,7 @@ impl PaneCodePages {
 
 /// ペインの疑似コンソールのいまのコードページを読む（**テスト・診断用**。#1696）。
 ///
-/// 固定（[`pin_pane_to_utf8_when_ready`]）は別スレッドで**非同期に**終わるので、
+/// 固定（[`crate::encoding_pin`]）は別スレッドで**非同期に**終わるので、
 /// 「固定が済んだ」ことを状態で待ちたい検証が使う。読むために一瞬相乗りするので
 /// 固定と同じロックの内側で行う（ロックの外で相乗りすると、固定側がその一瞬を
 /// 「tako 自身がコンソールを持っている」と誤読して固定を諦める）。
@@ -140,7 +143,9 @@ mod imp {
         PinOutcome::NotNeeded
     }
 
-    pub fn pin_pane_to_utf8_when_ready(_pid: u32) {}
+    pub fn pin_pane_to_utf8_blocking(_pid: u32) -> PinOutcome {
+        PinOutcome::NotNeeded
+    }
 
     pub fn read_pane_code_pages(_pid: u32) -> Result<super::PaneCodePages, String> {
         Err("このプラットフォームの端末はコードページを持たない".into())
@@ -205,32 +210,23 @@ mod imp {
         attach_and_pin(pid)
     }
 
-    pub fn pin_pane_to_utf8_when_ready(pid: u32) {
-        // UI スレッドを止めないために別スレッドへ逃がす。ロックは 1 回の試行ごとに
-        // 取り直すので、複数ペインを同時に開いても互いを待たせ続けない
-        std::thread::Builder::new()
-            .name("tako-pin-console-cp".into())
-            .spawn(move || {
-                let deadline = std::time::Instant::now() + READY_TIMEOUT;
-                loop {
-                    match pin_pane_to_utf8(pid) {
-                        // 成功、または「このプロセスでは触らない」と決まった場合は終わり
-                        PinOutcome::Pinned => return,
-                        PinOutcome::NotNeeded | PinOutcome::SkippedHasOwnConsole => return,
-                        // 子がまだ疑似コンソールへ接続していないだけのことが多い
-                        PinOutcome::Failed(reason) => {
-                            if std::time::Instant::now() >= deadline {
-                                tracing::debug!(
-                                    "ペインのコードページを UTF-8 に固定できず: {reason}"
-                                );
-                                return;
-                            }
-                        }
+    pub fn pin_pane_to_utf8_blocking(pid: u32) -> PinOutcome {
+        // ロックは 1 回の試行ごとに取り直すので、複数ペインを同時に開いても
+        // 互いを待たせ続けない
+        let deadline = std::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match pin_pane_to_utf8(pid) {
+                // 子がまだ疑似コンソールへ接続していないだけのことが多い
+                PinOutcome::Failed(reason) => {
+                    if std::time::Instant::now() >= deadline {
+                        return PinOutcome::Failed(reason);
                     }
-                    std::thread::sleep(RETRY_INTERVAL);
                 }
-            })
-            .ok();
+                // 成功、または「このプロセスでは触らない」と決まった場合は終わり
+                done => return done,
+            }
+            std::thread::sleep(RETRY_INTERVAL);
+        }
     }
 
     pub fn read_pane_code_pages(pid: u32) -> Result<PaneCodePages, String> {

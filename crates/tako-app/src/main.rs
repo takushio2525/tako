@@ -9984,7 +9984,14 @@ impl TakoApp {
         options
             .scrollback_lines
             .get_or_insert(self.scrollback_lines);
-        let (session, mut rx) = TerminalSession::spawn(INITIAL_COLS, INITIAL_ROWS, options)?;
+        // #2092: 器（psmux）の中のシェルの文字コード固定（#659）も、PTY 直下の子の固定と
+        // 同じ門に載せて入力を預からせる（#2092 前はこの経路で器の内側が固定されていなかった）。
+        // unix は固定が要らないので None（器への問い合わせもスレッドも作らない）
+        let container_pin = backend_session
+            .as_deref()
+            .and_then(tako_core::encoding_pin::ContainerPin::for_session);
+        let (session, mut rx) =
+            TerminalSession::spawn_in(INITIAL_COLS, INITIAL_ROWS, options, container_pin)?;
         // #1657: 実行ペインは終了コードが届くまで出力のたびに側路を見る（バッジをすぐ出す）
         let running_run_pane = self
             .workspace
@@ -10205,6 +10212,10 @@ impl TakoApp {
             }
             // タイトル（OSC 0/2）はタブ名・ペインヘッダに出る = ペイン外の UI
             Some(SessionNotice::TitleChanged) => ui_outside_pane = true,
+            // #2092: 文字コード固定を諦めた / 入力の保留を上限で解いた。画面は変わらない
+            Some(SessionNotice::EncodingPin(event)) => {
+                tako_control::diag::encoding_pin_log(pane_id.as_u64(), &event);
+            }
             None => {}
         }
         // #1657: 実行ペインが終わったら（スクリプトは側路を書いてから案内を出すので、
