@@ -11,7 +11,9 @@
 //!   接続先 URL を `TAKO_MCP_URL` として各ペインへ注入する。呼び出し元ペインは
 //!   `X-Tako-Pane` ヘッダで申告する（FR-2.3.3）
 //! - **stdio ブリッジ**（`tako mcp serve`、tako-cli 側）: Claude Code 等の stdio
-//!   クライアント向け。このエンジンを共有し、実行だけ IPC へ中継する
+//!   クライアント向け。このエンジンを共有し、実行だけ IPC へ中継する。
+//!   常駐する側ではカタログ（[`tools`]）を組まず、使い捨ての子プロセスに tools/list の応答と
+//!   [`ParamsTable`] を組ませる（#2021。`tako-cli` の `mcp_bridge`）
 //!
 //! ツール説明文と initialize の `instructions` には FR-2.7.5 の行動規範
 //! （レビューを求めるときは見せろ / 読んでほしければ開け / 方針相談は例を作って並べろ /
@@ -24,6 +26,7 @@ mod request;
 
 pub use catalog::tools;
 pub use http::McpServer;
+pub use request::{set_params_table_source, ParamsTable};
 
 use serde_json::{json, Value};
 

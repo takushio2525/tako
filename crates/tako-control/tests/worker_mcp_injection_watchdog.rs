@@ -134,10 +134,11 @@ fn mcp一時注入の組み立ては1実装しかない() {
 /// 3: MCP ブリッジは env 単独で諦めない（pid 祖先辿りへ落ちる）
 #[test]
 fn caller_paneをtako_pane_idだけで決めていない() {
-    let body = read_production("crates/tako-cli/src/main.rs");
+    // ブリッジ本体は #2021 で `tako` / `tako-mcp` が共有する lib へ移った
+    let body = read_production("crates/tako-cli/src/mcp_bridge.rs");
     let start = body
-        .find("fn mcp_serve()")
-        .expect("mcp_serve が見つからない（改名したら番犬も直す）");
+        .find("pub fn serve(")
+        .expect("ブリッジ本体の serve が見つからない（改名したら番犬も直す）");
     let block = &body[start..];
     let end = block.find("\nfn ").map(|i| i + 1).unwrap_or(block.len());
     let block = &block[..end];

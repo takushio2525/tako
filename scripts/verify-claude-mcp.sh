@@ -5,6 +5,7 @@
 # 立ち上げて TAKO_* 環境変数を注入した状態でこのスクリプト自身を再実行し、その中で
 # 実物の `claude -p` を 2 経路で走らせる:
 #   1/2 stdio ブリッジ（`tako mcp serve`）— Claude Code への登録形態と同じ
+#       （`TAKO_VERIFY_BIN=<…/tako.app/Contents/MacOS/tako>` で配布物の形 = `tako-mcp` への引き渡しを通す。#2021）
 #   2/2 Streamable HTTP（TAKO_MCP_URL + Bearer トークン）
 #
 # ユーザーのグローバル claude 設定は変更しない（--mcp-config + --strict-mcp-config を使用）。
@@ -22,7 +23,9 @@ if [ -z "${TAKO_SOCKET:-}" ]; then
   exec cargo run -p tako-control --example mcp_host --quiet -- bash "$0"
 fi
 
-TAKO="$PWD/target/debug/tako"
+# 叩くブリッジ（既定は dev の置き場 = 同じプロセスで続ける形）。.app の中の `Contents/MacOS/tako` を
+# 渡すと、隣の `tako-mcp` へ exec で引き渡される配布物の形を通す（#2021）
+TAKO="${TAKO_VERIFY_BIN:-$PWD/target/debug/tako}"
 fail() { echo "NG: $1" >&2; exit 1; }
 
 echo "== 1/2 stdio ブリッジ（tako mcp serve）経由で tako_list_panes =="

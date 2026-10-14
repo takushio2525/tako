@@ -6,9 +6,23 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# `cargo run -p tako-cli` は `tako` を走らせる（実行ファイルが 2 つあるため明示する。#2021）
+default-run = "tako"
+
+# `tako` と MCP の stdio ブリッジ専用の `tako-mcp` が共有する部品（IPC クライアント・ブリッジ本体。#2021）
+[lib]
+name = "tako_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tako"
 path = "src/main.rs"
+
+# MCP の stdio ブリッジ専用の小さな実行ファイル（#2021）。macOS の .app では `tako mcp serve` が
+# これへ exec で引き渡す（登録のコマンドは変わらない）。libSystem だけをリンクする（build.rs）
+[[bin]]
+name = "tako-mcp"
+path = "src/bin/tako-mcp.rs"
 
 [dependencies]
 tako-control.workspace = true

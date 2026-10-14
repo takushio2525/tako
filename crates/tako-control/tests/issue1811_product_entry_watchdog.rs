@@ -35,8 +35,12 @@ const MARK_CALL: &str = "mark_product_process(";
 const MARK_STMT: &str = "tako_core::paths::mark_product_process();";
 
 /// 製品の入口（配布物に入るバイナリの `main`）。`scripts/build-app.sh` と Windows
-/// インストーラが名指しで同梱するのはこの 2 つだけ
-const PRODUCT_ENTRIES: &[&str] = &["crates/tako-app/src/main.rs", "crates/tako-cli/src/main.rs"];
+/// インストーラが名指しで同梱するもの（`tako-mcp` は macOS の .app だけ。#2021）
+const PRODUCT_ENTRIES: &[&str] = &[
+    "crates/tako-app/src/main.rs",
+    "crates/tako-cli/src/main.rs",
+    "crates/tako-cli/src/bin/tako-mcp.rs",
+];
 
 /// 製品ではない実行ファイルの入口（**宣言しない = テスト扱いのまま**）と、その理由
 const NOT_PRODUCT: &[(&str, &str)] = &[

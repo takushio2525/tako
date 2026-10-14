@@ -881,6 +881,13 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
              Windows の GUI からは到達しない",
         ),
         (
+            "crates/tako-cli/src/mcp_bridge.rs",
+            1,
+            "MCP の stdio ブリッジが .app の隣の `tako-mcp` へ引き渡す exec（#2021。`#[cfg(unix)]`）。\
+             プロセスの像を入れ替えるだけで子プロセスも窓も作らない。カタログ係の起動（子）は \
+             `no_console_window` を通している",
+        ),
+        (
             "crates/tako-cli/src/setup.rs",
             1,
             "対話起動 1 箇所（setup アシスタント本体 = 引き継ぎ先エージェントの起動と共用）。\

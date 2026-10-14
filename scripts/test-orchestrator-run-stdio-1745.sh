@@ -197,7 +197,8 @@ if scenario == "docs":
     })
     out("description_checks", {
         "async_default": "即座に run_id を返す" in desc,
-        "sync_blocks": "sync=true で完了までブロッキング" in desc,
+        # 説明文は #1896 で「完了までブロッキング」→「完了まで待つ」へ短くなった
+        "sync_blocks": "sync=true で完了まで待つ" in desc,
         "no_http_only_caveat": "HTTP MCP 経由でのみ" not in desc,
     })
     sys.exit(0)

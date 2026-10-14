@@ -461,6 +461,20 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   読む（エージェントの子プロセスとして起動されるため、ペインのシェル → エージェント →
   ブリッジと環境が継承される = 呼び出し元ペインの特定が自動で成立する）。
   tako の外で起動された場合は **0 ツール**を返して無害化する
+  - **常駐の軽さ（#2021）**: claude 1 本に 1 本、claude が終わるまで常駐するので、常駐する側を
+    小さく保つ（実測と比べた案は `.agent/plans/2026-10-lightweight.md` §5 の L6 と §11）。
+    本体は `crates/tako-cli/src/mcp_bridge.rs`（IPC クライアント `ipc.rs` と一緒に `tako` / `tako-mcp`
+    の 2 つの実行ファイルが共有する lib）。① `tako` は引数がちょうど `mcp serve` なら clap を通らない。
+    ② tools/list の応答（約 200 KB）と未知パラメータの検出の表（`mcp::ParamsTable`）は、同じ実行ファイルを
+    使い捨ての子プロセス（カタログ係 = env `TAKO_MCP_CATALOG_HELPER`）として起こして組ませ、出力を
+    そのまま流す（同じ `handle_message` で作るので**応答のバイト列は変わらない**。子を起こせなければ
+    同じプロセスで組む）。③ macOS の .app では `tako` が隣の `tako-mcp`（`build.rs` の
+    `-dead_strip_dylibs` で libSystem だけをリンク）へ **exec で引き渡す**（pid は同じ。malloc を
+    `MallocSpaceEfficient=1` で起こし、`tako-mcp` は起動直後にそれを env から消して子へ渡さない）。
+    **登録のコマンドは `tako mcp serve` のまま**なので、既存の登録（user スコープ・`.mcp.json`・
+    codex / agy）は移行なしで軽くなる。引き渡しは .app の中だけ（dev の `target/` は古い `tako-mcp` が
+    残り得る）で、Windows は exec が無いので ①② だけが効く。`TAKO_2021_LEGACY=1` で 3 つとも止まる。
+    前後の計測は `scripts/measure-mcp-bridge-2021.sh`
 - **受け口へ渡すのは `ipc::submit` の 1 実装**（#1745）: IPC の接続スレッド・HTTP MCP の
   ハンドラスレッド・非同期 run の完了待ちスレッドがここを通る。**非同期 run の開始
   （`Request::OrchestratorRunStart`）だけは dispatch ではなくここで受ける**唯一の例外で、

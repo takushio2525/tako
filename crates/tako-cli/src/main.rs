@@ -26,13 +26,14 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
+// IPC クライアントと MCP の stdio ブリッジは `tako-mcp`（#2021）と共有する 1 実装
+use tako_cli::ipc::{
+    caller_pane, resolve_caller_pane_via_app, send_request, send_request_classified, transport,
+    SendFailure, TransportError,
+};
+use tako_cli::mcp_bridge;
 use tako_control::orchestrator::wait;
 use tako_control::protocol::{Axis, Direction, Request};
-
-/// tako の外で実行されたときのエラー（FR-2.2.8）。
-/// 接続情報は環境変数 → 発見ファイル（FR-2.2.9）の順で解決した上での不在を意味する
-const OUTSIDE_TAKO: &str = "tako アプリへの接続情報が無い（TAKO_SOCKET / TAKO_TOKEN 未設定・\
-    接続情報ファイルも無し）。tako アプリを起動するか、tako 内のターミナルで実行してください";
 
 /// ヘルプへ埋める「修飾 + クリック」の表記（実行プラットフォーム。Issue #763）。
 ///
@@ -4334,6 +4335,17 @@ fn main() -> ExitCode {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**。`cli_main` のスレッドより前）。
     // これが無いプロセスは置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
     tako_core::paths::mark_product_process();
+    // #2021: MCP の stdio ブリッジ（claude 1 本に 1 本常駐）は clap を通さない。
+    // コマンド定義の木を組むだけで malloc が約 2 MB の山を作り、解放しても OS へ返らず
+    // 常駐の間ずっと footprint に残るため。`TAKO_2021_LEGACY=1` は clap を通る旧経路
+    let bridge =
+        !mcp_bridge::legacy() && mcp_bridge::is_mcp_serve_invocation(std::env::args_os().skip(1));
+    if bridge {
+        // macOS の .app なら専用の小さな `tako-mcp` へ exec で引き渡す（スレッドを起こす前）。
+        // 戻ってきたら引き渡さなかったので、このプロセスでブリッジを続ける
+        mcp_bridge::handoff_to_small_bridge();
+    }
+    let body: fn() -> ExitCode = if bridge { mcp_bridge::run } else { cli_main };
     // Windows のメインスレッドは既定 1MB スタックで、コマンド定義（clap の巨大ツリー）の
     // 構築だけで debug ビルドが溢れる（macOS / Linux は 8MB）。**main 由来の既存バグ**で、
     // `origin/main` の `tako.exe list` も実機で `has overflowed its stack` で落ちる
@@ -4342,7 +4354,7 @@ fn main() -> ExitCode {
     let joined = std::thread::Builder::new()
         .name("tako-main".into())
         .stack_size(16 * 1024 * 1024)
-        .spawn(cli_main)
+        .spawn(body)
         .expect("メインスレッドを起動できない")
         .join();
     // 標準出力の読み手が先に閉じた（`tako … | head -1`）のは失敗ではないので静かに 0（#1758）
@@ -4355,7 +4367,9 @@ fn main() -> ExitCode {
 fn cli_main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Mcp(McpCommand::Serve) => mcp_serve(),
+        // ここへ来るのは `TAKO_2021_LEGACY=1`（#2021 の前の形 = カタログを常駐プロセスで組む）だけ。
+        // 普段の `tako mcp serve` は main の早い分岐で `mcp_bridge::run` へ入る
+        Command::Mcp(McpCommand::Serve) => mcp_bridge::serve(mcp_bridge::Catalog::InProcess),
         Command::Setup(ref args) => {
             // setup も表示言語を settings.json から解決する（#435。移行の説明文など
             // Note ベースの文言がここを通るので、設定が ja なら日本語で出る）
@@ -4737,94 +4751,6 @@ fn cli_main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// MCP stdio ブリッジ（FR-2.3.2 のゼロコンフィグ接続を成立させる実体）。
-/// 1 行 1 JSON の MCP メッセージを stdin から読み、プロトコル処理は
-/// `tako_control::mcp`（HTTP トランスポートと共有）に任せ、操作の実行だけ
-/// IPC へ origin="mcp" で中継する。呼び出し元ペインは環境変数から特定する
-fn mcp_serve() -> Result<(), String> {
-    use std::io::{BufRead, Write};
-
-    // ツール公開の判定は**環境変数のみ**で行う（発見ファイルは見ない）。
-    // tako の外で起動された Claude セッションへツールを公開しない方針（FR-2.3.2 の
-    // 「tako 外で 0 ツール」）を保つため。tako 内で起動された長寿命ブリッジが
-    // アプリ再起動で stale になった場合のみ、exec 時にファイルへフォールバックする
-    let connected = matches!(
-        (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")),
-        (Ok(s), Ok(t)) if !s.is_empty() && !t.is_empty()
-    );
-    // 呼び出し元ペインの決め方は純粋関数で決めてから実行する（#986）
-    let plan = caller_pane_plan(caller_pane(), connected, legacy_no_pid_fallback());
-    let caller = match plan {
-        CallerPanePlan::FromEnv(pane) => Some(pane),
-        CallerPanePlan::ResolveByPid => {
-            // env が届かない系統（agy / 親 env を渡さない MCP クライアント）向けの
-            // pid 祖先辿り。アプリ側の `Request::ResolvePane` = #288 / #567 と同じ 1 実装
-            let resolved = resolve_caller_pane_via_app(None)
-                .ok()
-                .flatten()
-                .map(|c| (c.pane, c.method.unwrap_or_else(|| "unknown".into())));
-            match resolved {
-                Some((pane, method)) => {
-                    tako_control::diag::persist_log(&format!(
-                        "mcp serve: caller_pane を pid 祖先辿りで解決（pane={pane} method={method} pid={}）",
-                        std::process::id()
-                    ));
-                    Some(pane)
-                }
-                None => {
-                    tako_control::diag::persist_log(&format!(
-                        "mcp serve: caller_pane を解決できない（TAKO_PANE_ID 無し + pid 祖先辿りも不一致。pid={}）",
-                        std::process::id()
-                    ));
-                    None
-                }
-            }
-        }
-        CallerPanePlan::Unresolved => None,
-    };
-    let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
-
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| format!("stdin の読み取りに失敗: {e}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(message) => {
-                let mut exec = |request: Request| -> Result<Value, String> {
-                    if connected {
-                        send_request_via(request, Some("mcp"))
-                    } else {
-                        Err(OUTSIDE_TAKO.into())
-                    }
-                };
-                let mut session = tako_control::mcp::McpSession {
-                    caller_pane: caller,
-                    caller_role: caller_role.clone(),
-                    connected,
-                    exec: &mut exec,
-                };
-                tako_control::mcp::handle_message(&message, &mut session)
-            }
-            Err(e) => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32700, "message": format!("JSON として解釈できない: {e}") },
-            })),
-        };
-        if let Some(response) = response {
-            writeln!(stdout, "{response}")
-                .map_err(|e| format!("stdout への書き込みに失敗: {e}"))?;
-            stdout
-                .flush()
-                .map_err(|e| format!("stdout の flush に失敗: {e}"))?;
-        }
-    }
-    Ok(())
 }
 
 /// MCP セットアップ（アプリ未起動でも動作）。書き先の正本は `dispatch::mcp_target_path`
@@ -7966,11 +7892,6 @@ fn lsp_install_local(name: Option<&str>) -> Result<Value, String> {
     .map_err(|e| e.to_string())
 }
 
-/// `TAKO_PANE_ID`（呼び出し元ペイン）。tako 内のシェルなら必ず入っている（FR-2.1.1）
-fn caller_pane() -> Option<u64> {
-    std::env::var("TAKO_PANE_ID").ok()?.parse().ok()
-}
-
 /// `tako mod report` の stdin（mod が組んだ報告の JSON。#1879）
 fn read_mod_report() -> Result<Value, String> {
     use std::io::Read;
@@ -8209,40 +8130,6 @@ fn print_mod(args: &ModArgs, result: &Value) {
     }
 }
 
-/// MCP stdio ブリッジが呼び出し元ペインをどう決めるか（Issue #986）。
-///
-/// **判断を純粋関数に置く**ので、env とアプリを触らずに新旧どちらの形も検査できる
-/// （env グローバルを触るテストは並列で競合する。#608 / #807）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CallerPanePlan {
-    /// `TAKO_PANE_ID` が届いている（claude / codex の `env_vars` 経路）
-    FromEnv(u64),
-    /// env が届かないので pid 祖先辿りでアプリに問う（agy / 親 env を渡さない
-    /// クライアント。#987 の agy master もここで解ける）
-    ResolveByPid,
-    /// tako の外（接続情報が無い = tools/list が 0 件になるので問う相手も居ない）
-    Unresolved,
-}
-
-/// 解決順を決める。**env が在れば 1 バイトも変えない**（claude 経路への回帰ゼロ）。
-/// `legacy` は #986 の A/B（`TAKO_986_LEGACY=1` で pid 祖先辿りを止める）
-fn caller_pane_plan(env_pane: Option<u64>, connected: bool, legacy: bool) -> CallerPanePlan {
-    match env_pane {
-        Some(pane) => CallerPanePlan::FromEnv(pane),
-        // 接続情報が無ければ tako の外なので、IPC を張らない（FR-2.3.2）
-        None if !connected || legacy => CallerPanePlan::Unresolved,
-        None => CallerPanePlan::ResolveByPid,
-    }
-}
-
-/// #986 の A/B 用の env。`TAKO_986_LEGACY=1` で**同一バイナリのまま**
-/// 「caller_pane は `TAKO_PANE_ID` だけで決める」旧挙動へ戻す
-fn legacy_no_pid_fallback() -> bool {
-    std::env::var("TAKO_986_LEGACY")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
 /// master / solo の起動先ペイン（Issue #567）
 struct LaunchTarget {
     pane: u64,
@@ -8378,51 +8265,6 @@ fn launch_failure_message(cause: &str, cmd_hint: &str, requested: Option<u64>) -
         ));
     }
     message
-}
-
-/// 呼び出し元ペインの解決結果（Issue #567）
-struct ResolvedCaller {
-    pane: u64,
-    /// 解決手段（`pid` / `pane` / `stale`。縮退経路では `None`）。案内文の出し分けに使う
-    method: Option<String>,
-}
-
-/// アプリへ現世代の呼び出し元ペインを問い合わせる（Issue #567）。
-/// 解決できなければ `Ok(None)`（エラーではない）。アプリへ届かないときだけ `Err`。
-///
-/// 新旧バイナリ混在（`resolve_pane` を知らない古い GUI が動いている）でも止まらないよう、
-/// 問い合わせに失敗したら `list` でのペイン実在確認へ縮退する（stale map / pid 解決は
-/// 効かないが、少なくとも「古い ID のまま起動して失敗する」ことは無くなる）
-fn resolve_caller_pane_via_app(requested: Option<u64>) -> Result<Option<ResolvedCaller>, String> {
-    let request = Request::ResolvePane {
-        pane: requested,
-        caller_pid: Some(std::process::id()),
-    };
-    match send_request(request) {
-        Ok(value) => Ok(value["pane"].as_u64().map(|pane| ResolvedCaller {
-            pane,
-            method: value["method"].as_str().map(str::to_string),
-        })),
-        Err(e) => match send_request(Request::List) {
-            Ok(list) => Ok(requested
-                .filter(|p| list_contains_pane(&list, *p))
-                .map(|pane| ResolvedCaller { pane, method: None })),
-            Err(_) => Err(e),
-        },
-    }
-}
-
-/// `list` 応答に該当ペインが居るか（Issue #567 の縮退経路）
-fn list_contains_pane(list: &Value, pane: u64) -> bool {
-    list["tabs"]
-        .as_array()
-        .is_some_and(|tabs| tabs.iter().any(|t| tab_contains_pane(t, pane)))
-}
-
-fn tab_contains_pane(tab: &Value, pane: u64) -> bool {
-    tab["panes"]
-        .as_array()
-        .is_some_and(|panes| panes.iter().any(|p| p["id"].as_u64() == Some(pane)))
 }
 
 /// 相対パスを CLI 実行時の cwd で絶対化する。`--pane` で別ペインを指定しても
@@ -11203,74 +11045,6 @@ fn find_git_root_cli(dir: &std::path::Path) -> Option<String> {
     tako_core::git::repo_root(dir).map(|p| p.to_string_lossy().into_owned())
 }
 
-/// 環境変数から接続情報を読み、1 リクエストを往復させる
-fn send_request(request: Request) -> Result<Value, String> {
-    send_request_via(request, None)
-}
-
-/// 送れなかった理由（#1944: GUI が居ないときだけ CLI のプロセスで代わりに走らせる口のため）
-enum SendFailure {
-    /// tako アプリへ届かない（接続情報が無い・どの候補にも接続できない / 認証できない）
-    Unreachable(String),
-    /// 繋がったが応答の途中で切れた（送れない・応答が返らない・応答を読めない）。
-    /// 順番待ち（#1994）だけが「届かない」と同じに扱い、他の呼び手は操作の失敗と同じに扱う
-    Broken(String),
-    /// 届いたが操作が失敗した
-    Operation(String),
-}
-
-/// 接続情報の解決とフォールバック（FR-2.2.9）。
-/// ①環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で試行し、接続不可・認証失敗
-/// （= アプリ再起動で env が古い）なら ②発見ファイルの候補列（current →
-/// 生きているインスタンス。`discovery::read_candidates`）を順に再試行する。
-/// 一時インスタンス（セルフテスト・二重起動）が current を上書きして exit しても、
-/// 生きているメインへ自動で届く（2026-06-12 バグ (8) の恒久対策）。
-/// 操作エラーはフォールバックせずそのまま返す。どの情報源も無ければ「tako の外」
-fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, String> {
-    send_request_classified(request, origin).map_err(|e| match e {
-        SendFailure::Unreachable(m) | SendFailure::Broken(m) | SendFailure::Operation(m) => m,
-    })
-}
-
-/// [`send_request_via`] の本体。届かなかったのか、届いて操作が失敗したのかを分けて返す
-fn send_request_classified(request: Request, origin: Option<&str>) -> Result<Value, SendFailure> {
-    let env_pair = match (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")) {
-        (Ok(socket), Ok(token)) if !socket.is_empty() && !token.is_empty() => Some((socket, token)),
-        _ => None,
-    };
-    let mut last_failure = None;
-    if let Some((socket, token)) = &env_pair {
-        match transport::roundtrip(socket, token, request.clone(), origin) {
-            Ok(value) => return Ok(value),
-            Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
-            Err(TransportError::Broken(message)) => return Err(SendFailure::Broken(message)),
-            Err(stale) => last_failure = Some(stale),
-        }
-    }
-    // 試行済みと同一内容の候補へ再試行しても無意味なので除外する。
-    // 除外キーは (socket, token) ペア（socket だけで除外すると「正しいソケット +
-    // 古いトークン」の認証失敗から正トークンで再試行できなくなる）
-    let mut tried: Vec<(String, String)> = env_pair.iter().cloned().collect();
-    for info in tako_control::discovery::read_candidates() {
-        let key = (info.socket.clone(), info.token.clone());
-        if tried.contains(&key) {
-            continue;
-        }
-        tried.push(key);
-        match transport::roundtrip(&info.socket, &info.token, request.clone(), origin) {
-            Ok(value) => return Ok(value),
-            Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
-            Err(TransportError::Broken(message)) => return Err(SendFailure::Broken(message)),
-            // 死んだ残骸・別インスタンスのトークン → 次の候補へ
-            Err(stale) => last_failure = Some(stale),
-        }
-    }
-    Err(SendFailure::Unreachable(match last_failure {
-        Some(stale) => stale.message(),
-        None => OUTSIDE_TAKO.to_string(),
-    }))
-}
-
 fn pretty_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
@@ -12634,116 +12408,10 @@ fn print_result(command: &Command, result: &Value) {
     }
 }
 
-/// 接続試行の失敗種別。Connect / Auth は「環境変数が古い」可能性があり、
-/// 発見ファイルへのフォールバック対象になる（FR-2.2.9）
-enum TransportError {
-    /// 接続できない（ソケット不在・アプリ停止）
-    Connect(String),
-    /// 認証失敗（トークンが古い = 別インスタンスのもの）
-    Auth(String),
-    /// 繋がった後の送受信の失敗（応答の途中で相手が落ちた等。フォールバックしない。#1994）
-    Broken(String),
-    /// その他（操作エラー・プロトコルエラー。フォールバックしない）
-    Other(String),
-}
-
-impl TransportError {
-    fn message(self) -> String {
-        match self {
-            TransportError::Connect(m)
-            | TransportError::Auth(m)
-            | TransportError::Broken(m)
-            | TransportError::Other(m) => m,
-        }
-    }
-}
-
-mod transport {
-    //! Layer 1 IPC のクライアント側。ワイヤ処理（1 行 1 JSON）はトランスポート
-    //! 非依存（`roundtrip_on`）で、接続の確立だけがプラットフォームで異なる
-    //! （unix: Unix domain socket / windows: named pipe = 抽象境界 B3）
-
-    use std::io::{BufRead, BufReader, Read, Write};
-
-    use serde_json::Value;
-    use tako_control::protocol::{error_code, Request, RequestEnvelope, ResponseEnvelope};
-
-    use super::TransportError;
-
-    /// `origin` は生成主体の自己申告（MCP ブリッジは `Some("mcp")`、CLI 直は `None`）
-    pub fn roundtrip(
-        socket: &str,
-        token: &str,
-        request: Request,
-        origin: Option<&str>,
-    ) -> Result<Value, TransportError> {
-        let (read_half, write_half) = connect(socket)?;
-        roundtrip_on(read_half, write_half, token, request, origin)
-    }
-
-    #[cfg(unix)]
-    fn connect(socket: &str) -> Result<(impl Read, impl Write), TransportError> {
-        use std::os::unix::net::UnixStream;
-        let stream = UnixStream::connect(socket).map_err(|e| {
-            TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
-        })?;
-        let read_half = stream
-            .try_clone()
-            .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
-        Ok((read_half, stream))
-    }
-
-    #[cfg(windows)]
-    fn connect(socket: &str) -> Result<(impl Read, impl Write), TransportError> {
-        let stream =
-            tako_control::platform::named_pipe::connect_client(socket, 3_000).map_err(|e| {
-                TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
-            })?;
-        let read_half = stream
-            .try_clone()
-            .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
-        Ok((read_half, stream))
-    }
-
-    fn roundtrip_on<R: Read, W: Write>(
-        read_half: R,
-        mut write_half: W,
-        token: &str,
-        request: Request,
-        origin: Option<&str>,
-    ) -> Result<Value, TransportError> {
-        let mut envelope = RequestEnvelope::new(1, token, request);
-        envelope.origin = origin.map(Into::into);
-        let json = serde_json::to_string(&envelope)
-            .map_err(|e| TransportError::Other(format!("送信の構築に失敗: {e}")))?;
-        writeln!(write_half, "{json}")
-            .map_err(|e| TransportError::Broken(format!("送信に失敗: {e}")))?;
-
-        let mut line = String::new();
-        BufReader::new(read_half)
-            .read_line(&mut line)
-            .map_err(|e| TransportError::Broken(format!("応答の受信に失敗: {e}")))?;
-        if line.is_empty() {
-            return Err(TransportError::Broken(
-                "tako アプリから応答が返らなかった".into(),
-            ));
-        }
-        let response: ResponseEnvelope = serde_json::from_str(&line)
-            .map_err(|e| TransportError::Broken(format!("応答を解釈できない: {e}")))?;
-        if let Some(error) = response.error {
-            return Err(if error.code == error_code::AUTH {
-                TransportError::Auth(error.message)
-            } else {
-                TransportError::Other(error.message)
-            });
-        }
-        Ok(response.result.unwrap_or(Value::Null))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tako_cli::ipc::OUTSIDE_TAKO;
 
     /// CLI 引数 → Request の対応（接続せずに検証できる範囲）
     fn parse(args: &[&str]) -> Command {
@@ -14743,27 +14411,7 @@ mod tests {
     }
 
     // ---- Issue #567: stale な TAKO_PANE_ID からの master / solo 起動 ----
-
-    fn list_with_panes(ids: &[u64]) -> Value {
-        serde_json::json!({
-            "tabs": [{
-                "id": 1,
-                "panes": ids.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
-            }],
-        })
-    }
-
-    #[test]
-    fn list_contains_paneは現存判定に使える() {
-        let list = list_with_panes(&[780, 781]);
-        assert!(list_contains_pane(&list, 780));
-        assert!(
-            !list_contains_pane(&list, 305),
-            "旧世代の ID は現存しないと判定される（#567 の実事象）"
-        );
-        // 応答が壊れていても panic せず「居ない」に倒す
-        assert!(!list_contains_pane(&serde_json::json!({}), 780));
-    }
+    // （`list_contains_pane` の検査は 1 実装と一緒に `ipc.rs` へ移った = #2021）
 
     #[test]
     fn launch_locationはフォールバック時にタブ表記になる() {
@@ -14991,55 +14639,6 @@ mod tests {
         assert!(
             empty.contains(&format!("\n{GATE_EVIDENCE_INDENT}\n")),
             "{empty}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod issue986_caller_pane {
-    use super::*;
-
-    /// 受け入れ条件 3: `TAKO_PANE_ID` が在るときは 1 バイトも変わらない
-    /// （claude / codex の `env_vars` 経路は IPC を 1 往復も増やさない）
-    #[test]
-    fn env_が在れば_env_をそのまま使う() {
-        assert_eq!(
-            caller_pane_plan(Some(42), true, false),
-            CallerPanePlan::FromEnv(42)
-        );
-        // 接続情報の有無・A/B にも影響されない（env が最優先）
-        assert_eq!(
-            caller_pane_plan(Some(42), false, true),
-            CallerPanePlan::FromEnv(42)
-        );
-    }
-
-    /// 受け入れ条件 2: env が無いときは pid 祖先辿りへ落ちる（agy / #987 の経路）
-    #[test]
-    fn env_が無ければ_pid_祖先辿りへ落ちる() {
-        assert_eq!(
-            caller_pane_plan(None, true, false),
-            CallerPanePlan::ResolveByPid
-        );
-    }
-
-    /// 受け入れ条件 4（FR-2.3.2 の回帰）: tako の外では IPC を張らない。
-    /// `connected` が false = `TAKO_SOCKET` / `TAKO_TOKEN` が無い状態で、
-    /// ここで問い合わせに行くと tako 外の Claude セッションから見える挙動が変わる
-    #[test]
-    fn tako_の外では問い合わせに行かない() {
-        assert_eq!(
-            caller_pane_plan(None, false, false),
-            CallerPanePlan::Unresolved
-        );
-    }
-
-    /// A/B: `TAKO_986_LEGACY=1` 相当で pid 祖先辿りが止まる（旧挙動 = env だけ）
-    #[test]
-    fn legacy_なら_pid_祖先辿りをしない() {
-        assert_eq!(
-            caller_pane_plan(None, true, true),
-            CallerPanePlan::Unresolved
         );
     }
 }

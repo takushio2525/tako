@@ -8,7 +8,18 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     // ホストではなく「これから作るバイナリ」の OS を見る
-    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // #2021: MCP の stdio ブリッジ専用の `tako-mcp` は、依存の crate が宣言するフレームワーク
+    // （CoreFoundation / IOKit / CoreServices / libobjc）のうち、ブリッジの到達するコードが
+    // 使わないものをリンクしない。ld64 は既定で使わない dylib も読み込み命令に残すので、
+    // 起動するだけで約 350 個の像と約 0.5 MB の dirty なページを抱えていた（claude 1 本に
+    // 1 本常駐する）。libSystem だけになることは tests/issue2021_mcp_bridge.rs が見張る
+    if target_os == "macos" {
+        println!("cargo:rustc-link-arg-bin=tako-mcp=-Wl,-dead_strip_dylibs");
+    }
+
+    if target_os != "windows" {
         return;
     }
 

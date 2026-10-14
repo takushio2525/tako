@@ -129,6 +129,10 @@ cp "$DIST_TARGET_DIR/release/tako-app" "$APP/Contents/MacOS/tako-app"
 # `claude mcp add --scope user tako -- <パス> mcp serve` の登録先パスを
 # /Applications 配下で安定させるため（target/debug はビルドで消え得る）
 cp "$DIST_TARGET_DIR/release/tako" "$APP/Contents/MacOS/tako"
+# MCP の stdio ブリッジ専用の小さな実行ファイル（#2021）。登録のコマンドは `tako mcp serve` のまま、
+# この .app の中の `tako` が隣の `tako-mcp`（libSystem だけをリンク）へ exec で引き渡す。
+# claude 1 本に 1 本常駐するので、像の少ない方で常駐させる（footprint 1 本 約 7 MB → 約 1.1 MB）
+cp "$DIST_TARGET_DIR/release/tako-mcp" "$APP/Contents/MacOS/tako-mcp"
 mv "$DIST/tako.icns" "$APP/Contents/Resources/tako.icns"
 # ライセンス本文と第三者の告知を同梱する（Issue #1709）。GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・
 # MIT / BSD の表示義務は、バイナリの受け取り手へ本文と著作権表示を渡すことを求める。
@@ -253,21 +257,35 @@ PLIST
 # 明示する。名義に個人名が入れば check_bundle_privacy が落とす
 REQ_APP='designated => identifier "dev.takushio.tako"'
 REQ_CLI='designated => identifier "dev.takushio.tako.cli"'
+REQ_MCP='designated => identifier "dev.takushio.tako.mcp"'
 IDENTITY="${TAKO_CODESIGN_IDENTITY:-}"
 if [[ -n "$IDENTITY" ]]; then
   # 名義はログへ出さない（夜間リリースのログに個人名を残さない。#1848）
   echo "==> 署名（identity: TAKO_CODESIGN_IDENTITY の指定 / DR: identifier 固定）"
   codesign --force -s "$IDENTITY" -i dev.takushio.tako.cli -r="$REQ_CLI" "$APP/Contents/MacOS/tako"
+  codesign --force -s "$IDENTITY" -i dev.takushio.tako.mcp -r="$REQ_MCP" "$APP/Contents/MacOS/tako-mcp"
   codesign --force -s "$IDENTITY" -r="$REQ_APP" "$APP"
 else
   echo "==> ad-hoc 署名（DR は identifier 固定のため、TCC の権限承認はビルド・更新をまたいで保持される）"
   codesign --force -s - -i dev.takushio.tako.cli -r="$REQ_CLI" "$APP/Contents/MacOS/tako"
+  codesign --force -s - -i dev.takushio.tako.mcp -r="$REQ_MCP" "$APP/Contents/MacOS/tako-mcp"
   codesign --force -s - -r="$REQ_APP" "$APP"
 fi
 
 echo "==> 署名検証（designated requirement の固定を機械確認）"
 codesign --verify -R='identifier "dev.takushio.tako"' "$APP"
 codesign --verify -R='identifier "dev.takushio.tako.cli"' "$APP/Contents/MacOS/tako"
+codesign --verify -R='identifier "dev.takushio.tako.mcp"' "$APP/Contents/MacOS/tako-mcp"
+
+echo "==> tako-mcp のリンク先（libSystem だけ = 常駐の像を小さく保つ。#2021）"
+# 依存の crate が宣言するフレームワークは build.rs の -dead_strip_dylibs で外している。
+# ブリッジの到達するコードがフレームワークを使い始めると黙って戻る（1 本 +0.5 MB）ので、ここで止める
+mcp_libs=$(otool -L "$APP/Contents/MacOS/tako-mcp" | tail -n +2 | awk '{print $1}')
+if [[ "$mcp_libs" != "/usr/lib/libSystem.B.dylib" ]]; then
+  echo "エラー: tako-mcp が libSystem 以外をリンクしている（#2021）:" >&2
+  printf '  %s\n' $mcp_libs >&2
+  exit 1
+fi
 
 echo "==> 配布物の個人情報チェック（ビルド機のパス・署名の名義。#1848）"
 check_bundle_privacy "$APP" || exit 1
