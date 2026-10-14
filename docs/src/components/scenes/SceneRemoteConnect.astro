@@ -15,7 +15,7 @@ import TakoWindow from '../motion/TakoWindow.astro';
 import Split from '../motion/Split.astro';
 import Pane from '../motion/Pane.astro';
 import Pointer from '../motion/Pointer.astro';
-import PhoneBare from '../motion/PhoneBare.astro';
+import Phone from '../motion/Phone.astro';
 import MacDialog from '../motion/MacDialog.astro';
 import QrCode from '../motion/QrCode.astro';
 import Cmd from '../motion/Cmd.astro';
@@ -75,7 +75,7 @@ const ROLES = [
 
 		<!-- 手順 3〜4: スマホ。ペアリングの画面 → 承認待ち -->
 		<div data-at="3-4" data-fx="fade" style="align-self: center">
-			<PhoneBare height={34}>
+			<Phone head={false} height={34}>
 				<div class="tk-phone-layer" data-at="3" data-fx="fade">
 					<div class="tk-pconnect">
 						<h4>この端末をペアリング</h4>
@@ -113,7 +113,7 @@ const ROLES = [
 						<span class="tk-pbtn">やり直す</span>
 					</div>
 				</div>
-			</PhoneBare>
+			</Phone>
 		</div>
 
 		<!-- 手順 5: Mac の画面に承認ダイアログ → 許可 -->

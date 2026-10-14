@@ -10,7 +10,7 @@
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
-import PhoneBare from '../motion/PhoneBare.astro';
+import Phone from '../motion/Phone.astro';
 import PhoneHead from '../motion/PhoneHead.astro';
 import PhoneCard from '../motion/PhoneCard.astro';
 import Pointer from '../motion/Pointer.astro';
@@ -24,7 +24,7 @@ const KINDS = [
 ---
 
 <Scrolly label="スマホから新しく立ち上げ、ファイルを直す流れ">
-	<PhoneBare slot="stage" height={31}>
+	<Phone slot="stage" head={false} height={31}>
 		<!-- 手順 1: 一覧の「+ 新規」→ 起動シート -->
 		<div class="tk-phone-layer" data-at="1" data-fx="fade">
 			<PhoneHead tasks={1} plusAt="1" />
@@ -99,7 +99,7 @@ const KINDS = [
 			</div>
 			<Pointer path="3:82,85" click="3" />
 		</div>
-	</PhoneBare>
+	</Phone>
 
 	<Step title="「+ 新規」で、新しいタブを立てる">
 		<p>一覧の右上から、<strong>master を起動 / ターミナル / SSH ターミナル</strong>の 3 つを選べます。選んだものは Mac の tako に新しいタブとして立ちます。</p>

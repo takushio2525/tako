@@ -3,10 +3,19 @@
  * スマホ版 tako（PWA。web/tako-remote）の再現。中身は子に書く（PhoneCard / .tk-pmsg / .tk-pinput）。
  * 画面ごと切り替えるときは子を <div class="tk-phone-layer" data-at="…" data-fx="fade"> で包んで重ねる。
  * 見た目の正本は web/tako-remote/src/styles/main.css と src/pages/panes.jsx。
+ *
+ *   <Phone tasks={1} tasksAt="1+">…</Phone>          … 上部の帯（マシン名・＋・タスク）つき
+ *   <Phone head={false}>                              … 帯なし。画面ごとにヘッダーが違う場面で、
+ *     <div class="tk-phone-layer" …><PhoneHead …/>…      帯を子の中に描く（ペアリング・ペイン画面・ファイル）
+ *   </Phone>
+ *
+ * slot="overlay"（Pointer）の座標はスマホの外枠が基準（0,0 = 左上・100,100 = 右下。中央寄せの余白を含めない）。
  */
 import Icon from './Icon.astro';
 
 interface Props {
+	/** 上部の帯（マシン名・＋・タスク）を出す（既定 true） */
+	head?: boolean;
 	/** 上部のマシン名（実在のホスト名を書かない。既定は架空の名前） */
 	machine?: string;
 	/** 右上のタスクのバッジ（人がやることの未完了件数）と、それが出る手順 */
@@ -16,27 +25,40 @@ interface Props {
 	class?: string;
 }
 
-const { machine = 'my-mac', tasks, tasksAt, height = 31, class: className } = Astro.props;
+const { head = true, machine = 'my-mac', tasks, tasksAt, height = 31, class: className } = Astro.props;
 ---
 
 <div class:list={['tk-ui', 'tk-frame', className]}>
-	<div class="tk-phone">
+	<div class:list={['tk-phone', { 'tk-phone-bare': !head }]}>
 		<div class="tk-phone-screen" style={`--h: ${height}em`}>
 			<div class="tk-phone-notch"><span>9:41</span><span class="tk-phone-island"></span><span>100%</span></div>
-			<div class="tk-phone-head">
-				<span class="tk-machine"><i></i>{machine}</span>
-				<span class="tk-phone-actions">
-					<span class="tk-phone-btn"><Icon name="plus" /></span>
-					<span class="tk-phone-btn">
-						<Icon name="tasks" />
-						{tasks !== undefined && <span class="tk-phone-badge" data-at={tasksAt} data-fx={tasksAt ? 'pop' : undefined}>{tasks}</span>}
-					</span>
-				</span>
-			</div>
+			{
+				head && (
+					<div class="tk-phone-head">
+						<span class="tk-machine">
+							<i />
+							{machine}
+						</span>
+						<span class="tk-phone-actions">
+							<span class="tk-phone-btn">
+								<Icon name="plus" />
+							</span>
+							<span class="tk-phone-btn">
+								<Icon name="tasks" />
+								{tasks !== undefined && (
+									<span class="tk-phone-badge" data-at={tasksAt} data-fx={tasksAt ? 'pop' : undefined}>
+										{tasks}
+									</span>
+								)}
+							</span>
+						</span>
+					</div>
+				)
+			}
 			<div class="tk-phone-body">
 				<slot />
 			</div>
 		</div>
+		<slot name="overlay" />
 	</div>
-	<slot name="overlay" />
 </div>

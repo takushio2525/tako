@@ -1216,6 +1216,8 @@
   --ph-claude: #d6795c;
   --ph-blue: #74b6ff;
 
+  /* slot="overlay"（Pointer）の座標の基準 */
+  position: relative;
   width: min(100%, 17.5em);
   margin: 0 auto;
   font-size: 11px;
@@ -1230,6 +1232,24 @@
   .tk-phone {
     font-size: 10px;
   }
+}
+/* 上部の帯を持たない版（Phone の head={false}）。帯は場面が子の中に描く */
+.tk-phone.tk-phone-bare {
+  font-size: 11px;
+}
+/* 幅に余裕がある枠では一段大きく描く（再現した画面の文字を読める大きさにする） */
+@container tkframe (min-width: 26rem) {
+  .tk-phone.tk-phone-bare {
+    font-size: 12px;
+  }
+}
+.tk-phone-bare .tk-phone-body {
+  padding: 0;
+  gap: 0;
+}
+.tk-phone-bare .tk-phone-layer {
+  padding: 0;
+  gap: 0;
 }
 .tk-phone-screen {
   position: relative;

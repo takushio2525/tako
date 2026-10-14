@@ -259,27 +259,6 @@
   background: #fff;
 }
 
-/* ============================================================
- * スマホ（ヘッダーを場面ごとに描く版。PhoneBare.astro）
- * ============================================================ */
-.tk-phone.tk-phone-bare {
-  position: relative;
-  font-size: 11px;
-}
-/* 幅に余裕がある枠では一段大きく描く（再現した画面の文字を読める大きさにする） */
-@container tkframe (min-width: 26rem) {
-  .tk-phone.tk-phone-bare {
-    font-size: 12px;
-  }
-}
-.tk-phone-bare .tk-phone-body {
-  padding: 0;
-  gap: 0;
-}
-.tk-phone-bare .tk-phone-layer {
-  padding: 0;
-  gap: 0;
-}
 /* 一覧の上部（PhoneHead.astro）。ボタンが 3 つ並ぶので一段詰める */
 .tk-phone-head-list .tk-phone-btn {
   min-width: 2em;
