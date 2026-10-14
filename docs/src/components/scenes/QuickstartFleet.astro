@@ -20,7 +20,7 @@ import FleetRow from '../motion/FleetRow.astro';
 import Pointer from '../motion/Pointer.astro';
 import '../../styles/quickstart.css';
 
-const half = (n: number, x: number) => ({ x, y: 0, w: 50, h: 100, n });
+const half = (n: number, y: number) => ({ x: 0, y, w: 100, h: 50, n });
 ---
 
 <Scrolly label="fleet で全タブを見渡す流れ" flip>
@@ -40,9 +40,10 @@ const half = (n: number, x: number) => ({ x, y: 0, w: 50, h: 100, n });
 		]}
 		height={27}
 		panelAt="1+"
+		class="tk-qs-fleet"
 	>
 		<div class="tk-stack tk-fill" style="flex: 1">
-			<div data-at="1-3" data-fx="fade" class="tk-split">
+			<div data-at="1-3" data-fx="fade" class="tk-split is-col">
 				<Pane n={1} title="claude" state="running" focus>
 					<span class="tk-l tk-tui-user">ログイン画面を作って</span>
 					<span class="tk-l tk-tui-msg is-tool">src/login.tsx を作成</span>
@@ -53,20 +54,16 @@ const half = (n: number, x: number) => ({ x, y: 0, w: 50, h: 100, n });
 					<span class="tk-l tk-dim">hmr update /src/login.tsx</span>
 				</Pane>
 			</div>
-			<div data-at="4+" data-fx="fade" class="tk-split">
-				<Pane
-					n={1}
-					title="claude"
-					state={[
-						{ at: '4', state: 'idle' },
-						{ at: '5', state: 'running' },
-					]}
-					focus="5"
-				>
-					<span class="tk-l tk-tui-user" data-at="5">隣のテストが落ちた理由を見て、直して</span>
-					<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: .4s">tako_read_pane → ペイン 2</span>
-					<span class="tk-l tk-tui-msg" data-at="5" style="--d: .8s">期待値が 200 のままでした。201 に直します</span>
-					<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: 1.2s">tako_send_input → pytest</span>
+			<div data-at="4+" data-fx="fade" class="tk-split is-col">
+				<Pane n={1} title="claude" state="idle" focus="5">
+					<div class="tk-qs-log">
+						<span class="tk-l tk-tui-msg">tests/test_users.py を更新しました</span>
+						<span class="tk-l tk-tui-user" data-at="5">隣のテストが落ちた理由を見て、直して</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: .4s">tako_read_pane → ペイン 2</span>
+						<span class="tk-l tk-tui-msg" data-at="5" style="--d: .8s">期待値を 201 に直しました</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: 1.2s">tako_send_input → pytest</span>
+						<span class="tk-l tk-tui-msg" data-at="5" style="--d: 2.1s">5 件とも通りました</span>
+					</div>
 				</Pane>
 				<Pane
 					n={2}
@@ -124,7 +121,7 @@ const half = (n: number, x: number) => ({ x, y: 0, w: 50, h: 100, n });
 						chips={['idle', 'fail']}
 						chipsAt="1-2"
 						fail={1}
-						markAt="3"
+						markAt="2-3"
 						map={[
 							{ ...half(1, 0), focus: '3 5' },
 							{ ...half(2, 50), focus: '4', fail: '!5' },
@@ -146,7 +143,7 @@ const half = (n: number, x: number) => ({ x, y: 0, w: 50, h: 100, n });
 				</Fleet>
 			</RightPanel>
 		</div>
-		<Pointer slot="overlay" path="1:80,97 3:70,40 4:70,52 5:30,60" click="1 3 4" />
+		<Pointer slot="overlay" path="1:79,96 3:64,50 4:64,88 5:30,40" click="1 3 4 5" />
 	</TakoWindow>
 
 	<Step title="右パネルの fleet を開く">

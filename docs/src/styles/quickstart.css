@@ -11,6 +11,10 @@
 	height: 100%;
 	overflow: hidden;
 }
+/* 行は縮ませない（縮むと折り返した行が次の行に重なる）。はみ出した古い行は上から切れる */
+.tk-qs-log > * {
+	flex-shrink: 0;
+}
 [data-motion] .tk-qs-log > [data-at] {
 	max-height: 4.8em;
 	overflow: hidden;
@@ -195,4 +199,23 @@
 		grid-template-columns: minmax(0, 1fr);
 		gap: var(--tako-space-2);
 	}
+}
+
+/* 初回バナー: 幅が狭くリンクの行が隠れても、説明は左・ボタンは右の列に置く
+ * （共有の WelcomeBanner は自動配置なので、リンクが消えると説明とボタンの列が入れ替わる） */
+.tk-qs-setup .tk-welcome > .tk-welcome-title,
+.tk-qs-setup .tk-welcome > .tk-welcome-line {
+	grid-column: 1;
+}
+.tk-qs-setup .tk-welcome > .tk-welcome-links,
+.tk-qs-setup .tk-welcome > .tk-ubtn {
+	grid-column: 2;
+}
+
+/* fleet: 手順 3 で開いた枠が見えるところまで、パネルの中身を送る（実物の右パネルは縦に送れる） */
+.tk-qs-fleet .tk-fleet {
+	transition: transform 0.6s var(--tako-ease);
+}
+[data-step='3'] .tk-qs-fleet .tk-fleet {
+	transform: translateY(calc(-1 * var(--qs-fleet-scroll, 10em)));
 }

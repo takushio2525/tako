@@ -34,6 +34,7 @@ import '../../styles/quickstart.css';
 		]}
 		height={26}
 		cwd="~"
+		class="tk-qs-setup"
 	>
 		<div slot="banner" data-at="1" data-fx="unfold">
 			<div><WelcomeBanner pressAt="1" /></div>
@@ -86,7 +87,7 @@ import '../../styles/quickstart.css';
 				</Pane>
 			</div>
 		</div>
-		<Pointer slot="overlay" path="1:88,25" click="1" />
+		<span slot="overlay" data-at="1" data-fx="fade"><Pointer path="1:83,28" click="1" /></span>
 	</TakoWindow>
 
 	<Step title="バナーの「セットアップを実行」を押す">
@@ -102,6 +103,6 @@ import '../../styles/quickstart.css';
 	</Step>
 	<Step title="済ませたら、もう一度打つだけ">
 		<p>ログインしたら、もう一度 <code>tako setup</code>。済んだところは <code>[OK]</code> で素通りして、残りから再開します。何度打っても壊れません。変えるものが無ければ「変更なし」で終わります。</p>
-		<p class="tk-step-note">Windows でも同じバナー・同じ流れです。違いは 2 つ: シェル統合のために PowerShell の <code>$PROFILE</code> へ管理ブロックを 1 つ書き足すこと（書く前に表示し、<code>tako shell-integration uninstall</code> で戻せます）と、psmux などの導入は winget のコマンドを案内するだけで代行しないことです。</p>
+		<p class="tk-step-note">Windows でも同じバナー・同じ流れです。おもに違うのは、シェル統合のために PowerShell の <code>$PROFILE</code> へ管理ブロックを 1 つ書き足すこと（書く前に表示し、<code>tako shell-integration uninstall</code> で戻せます）と、psmux などの導入は winget のコマンドを案内するだけで代行しないことです。</p>
 	</Step>
 </Scrolly>
