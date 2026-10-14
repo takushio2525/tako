@@ -1,0 +1,194 @@
+/*
+ * tako の窓が無い間の画面（Blackout.astro。#2063）。
+ *
+ * 配色は再現画面の暗い色（tako-ui.css の .tk-ui の変数）に合わせる。サイトが明るいテーマでも暗いまま
+ * （実物の窓が閉じた後の「何も映っていない画面」を表すため）。
+ * 動きは印の脈動・輪の回転・実行中の点の点滅だけで、reduced-motion と静止図（.is-static）では止める。
+ */
+
+.tk-bo {
+  position: relative;
+  display: grid;
+  place-items: center;
+  height: var(--h, 25em);
+  padding: 1.4em 1.2em;
+  border-radius: 12px;
+  overflow: hidden;
+  color: var(--ui-fg);
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgb(137 180 250 / 0.07), transparent 60%),
+    linear-gradient(180deg, #12131c, #0b0b11);
+  border: 1px solid var(--ui-line-in);
+  box-shadow:
+    0 1px 2px rgb(17 17 27 / 0.25),
+    0 22px 48px -18px rgb(17 17 27 / 0.6);
+}
+.tk-bo[data-kind='reboot'] {
+  background: #050507;
+  border-color: #16161c;
+}
+
+/* 窓と同じく、広い枠では一段大きく、狭い枠では一段小さくする */
+@container tkframe (min-width: 34rem) {
+  .tk-bo {
+    font-size: 12px;
+  }
+}
+@container tkframe (max-width: 25rem) {
+  .tk-bo {
+    font-size: 10px;
+  }
+}
+
+.tk-bo-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.55em;
+  width: 100%;
+  max-width: 30em;
+  text-align: center;
+}
+
+.tk-bo-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 3em;
+  height: 3em;
+  border-radius: 50%;
+  color: var(--ui-muted);
+  border: 1px solid var(--ui-line-heavy);
+  background: rgb(255 255 255 / 0.02);
+}
+.tk-bo-mark .tk-ic {
+  width: 1.45em;
+  height: 1.45em;
+}
+.tk-bo[data-kind='reboot'] .tk-bo-mark {
+  border: 0;
+  background: none;
+}
+
+/* 再起動中の輪（4 分の 3 だけ描いて回す） */
+.tk-bo-spin {
+  width: 2.3em;
+  height: 2.3em;
+  border-radius: 50%;
+  border: 0.22em solid rgb(255 255 255 / 0.14);
+  border-top-color: rgb(255 255 255 / 0.75);
+}
+
+.tk-bo-title {
+  margin: 0.2em 0 0 !important;
+  font-family: var(--ui-sys);
+  font-size: 1.22em;
+  font-weight: 700;
+  line-height: 1.4;
+  color: var(--ui-fg) !important;
+}
+.tk-bo-note {
+  margin: 0 !important;
+  font-family: var(--ui-sys);
+  font-size: 0.98em;
+  line-height: 1.55;
+  color: var(--ui-fg3) !important;
+}
+.tk-bo-body {
+  width: 100%;
+  margin-top: 0.6em;
+}
+
+/* 裏に残っているもの / 消えたものの一覧 */
+.tk-bo-list {
+  list-style: none;
+  margin: 0 !important;
+  padding: 0.45em 0.55em !important;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.03);
+  border: 1px solid var(--ui-line);
+  text-align: left;
+}
+.tk-bo-list-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  margin: 0 0 0.3em !important;
+  padding: 0 0.35em 0.35em;
+  border-bottom: 1px solid var(--ui-line-in);
+  font-size: 0.92em;
+  font-weight: 700;
+  color: var(--ui-fg3);
+}
+.tk-bo-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+  margin: 0 !important;
+  padding: 0.25em 0.35em;
+  white-space: nowrap;
+  overflow: hidden;
+  color: var(--ui-fg2);
+}
+.tk-bo-list li > .tk-bo-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-bo-state {
+  margin-left: auto;
+  padding-left: 0.6em;
+  flex: none;
+  font-size: 0.92em;
+  color: var(--ui-accent);
+}
+/* 消えたもの: 取り消し線と ✕ */
+.tk-bo-list li.is-gone {
+  color: var(--ui-faint);
+}
+.tk-bo-list li.is-gone > .tk-bo-label {
+  text-decoration: line-through;
+  text-decoration-color: rgb(243 139 168 / 0.6);
+}
+.tk-bo-list li.is-gone .tk-bo-state {
+  color: var(--ui-red);
+}
+.tk-bo-list li.is-gone .tk-dot {
+  background: var(--ui-faint);
+  box-shadow: none;
+}
+
+/* ---- 動き（動かしてよいときだけ） ---- */
+@media (prefers-reduced-motion: no-preference) {
+  [data-motion]:not(.is-static) .tk-bo-spin {
+    animation: tk-bo-spin 0.9s linear infinite;
+  }
+  [data-motion]:not(.is-static) .tk-bo[data-kind='quit'] .tk-bo-mark {
+    animation: tk-bo-breathe 2.4s ease-in-out infinite;
+  }
+  /* 裏で動き続けていることを、実行中の点の明滅で見せる */
+  [data-motion]:not(.is-static) .tk-bo-list li:not(.is-gone) .tk-dot {
+    animation: tk-bo-pulse 1.6s ease-in-out infinite;
+  }
+  [data-motion]:not(.is-static) .tk-bo-list li:nth-child(3n + 2) .tk-dot {
+    animation-delay: 0.4s;
+  }
+  [data-motion]:not(.is-static) .tk-bo-list li:nth-child(3n) .tk-dot {
+    animation-delay: 0.8s;
+  }
+}
+@keyframes tk-bo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes tk-bo-breathe {
+  50% {
+    color: var(--ui-fg3);
+    border-color: var(--ui-accent-line);
+  }
+}
+@keyframes tk-bo-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}

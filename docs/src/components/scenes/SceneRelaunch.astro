@@ -1,0 +1,88 @@
+---
+/**
+ * 場面: tako を閉じても、開き直すと同じ画面に戻る（#2063）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-5.1（終了は detach だけでセッションを残す）/
+ * FR-5.2（タブ・分割・ID を layout.json へ保存し、同じ ID で再 attach）/ FR-5.3（TAKO_PANE_ID が
+ * 再起動をまたいで有効）。Windows の器は psmux（台帳 12 節 ⑤・windows-support.md の tako_persist = 対応）。
+ */
+import '../../styles/scene-restore.css';
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Blackout from '../motion/Blackout.astro';
+import { windowsSupport } from '../motion/windowsSupport';
+
+// 「Windows でも psmux で戻る」（手順 2 の補足とページの「Windows では」）と書く根拠。
+// 対応表から外れたらビルドを落とす
+for (const tool of ['tako_persist', 'tako_sessions', 'tako_logs']) {
+	if (windowsSupport.rows.get(tool) !== '対応') {
+		throw new Error(`SceneRelaunch: Windows の ${tool} が「対応」ではなくなった。手順 2 の補足とページの「Windows では」を直すこと`);
+	}
+}
+---
+
+<Scrolly label="tako を閉じて開き直す流れ">
+	<div slot="stage" class="tk-stack">
+		<div data-at="!2" data-fx="pop">
+			<TakoWindow
+				tabs={[
+					{ label: 'my-app (AI チーム)', state: 'running', active: true },
+					{ label: 'api', state: 'running' },
+					{ label: 'docs' },
+				]}
+				height={25}
+			>
+				<Split>
+					<Pane n={1} title="マスター" badge="ORCH" state="running" focus grow={1.15}>
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> tako master</span>
+						<span class="tk-l tk-tui-user">ログイン画面にテストを足して</span>
+						<span class="tk-l tk-tui-msg">worker に任せました（ペイン 2）</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="4">ペイン 2 の報告を読みました</span>
+						<span class="tk-l tk-tui-msg" data-at="4" style="--d: .35s">テストを 3 件追加。全部緑です</span>
+					</Pane>
+					<Split dir="col">
+						<Pane n={2} title="my-app" badge="WORKER" parent="master" state="running">
+							<span class="tk-l tk-tui-msg is-tool">tests/login.test.ts を作成</span>
+							<span class="tk-l tk-tui-msg is-tool tk-rs-new" data-at="3+" style="--d: .35s">npm test（3 passed）</span>
+							<span class="tk-l tk-tui-msg tk-rs-new" data-at="3+" style="--d: .55s">テストを 3 件追加しました</span>
+						</Pane>
+						<Pane n={3} title="npm run dev" state="running">
+							<span class="tk-l"><span class="tk-p">my-app ❯</span> npm run dev</span>
+							<span class="tk-l tk-dim">ready on http://localhost:3000</span>
+							<span class="tk-l">GET / <span class="tk-ok">200</span></span>
+							<span class="tk-l tk-rs-new" data-at="3+" style="--d: .35s">GET /login <span class="tk-ok">200</span></span>
+							<span class="tk-l tk-rs-new" data-at="3+" style="--d: .55s">GET /api/me <span class="tk-ok">200</span></span>
+						</Pane>
+					</Split>
+				</Split>
+			</TakoWindow>
+		</div>
+		<div data-at="2" data-fx="fade">
+			<Blackout kind="quit" title="tako を終了しました" note="画面は閉じても、tmux がプロセスを持ち続けています" height={25}>
+				<ul class="tk-bo-list">
+					<li class="tk-bo-list-head">tmux（tako 専用のサーバー）</li>
+					<li><i class="tk-dot is-running" /><span class="tk-bo-label">1 マスター · claude</span><span class="tk-bo-state">動いている</span></li>
+					<li><i class="tk-dot is-running" /><span class="tk-bo-label">2 worker · claude</span><span class="tk-bo-state">動いている</span></li>
+					<li><i class="tk-dot is-running" /><span class="tk-bo-label">3 npm run dev</span><span class="tk-bo-state">動いている</span></li>
+					<li><i class="tk-dot is-running" /><span class="tk-bo-label">api タブの 2 ペイン</span><span class="tk-bo-state">動いている</span></li>
+				</ul>
+			</Blackout>
+		</div>
+	</div>
+
+	<Step title="いつもの作業の途中">
+		<p>司令塔の AI（ペイン 1）が担当の AI（ペイン 2）に仕事を任せ、隣のペイン 3 では dev サーバーが動いています。</p>
+	</Step>
+	<Step title="閉じても、裏で動き続ける">
+		<p><kbd>⌘</kbd>+<kbd>Q</kbd> で tako を終了しても、AI も dev サーバーも止まりません。各ペインは tako 専用の tmux の上で動いているので、閉じるのは<strong>画面だけ</strong>です。</p>
+		<p class="tk-step-note">Windows では tmux の代わりに psmux が同じ役をします（終了は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd>）。</p>
+	</Step>
+	<Step title="開き直すと、同じタブ・同じ分割">
+		<p>もう一度起動すると、タブも分割もペイン番号も閉じる前のまま、各ペインのプロセスにつなぎ直します。閉じている間に進んだ出力も、そのまま画面に出ています。</p>
+	</Step>
+	<Step title="AI も、同じペイン番号で続ける">
+		<p>ペイン番号が変わらないので、AI が覚えていた番号での操作もそのまま通ります。司令塔の AI は、再起動をはさんでも担当の報告を読みに行けます。</p>
+	</Step>
+</Scrolly>

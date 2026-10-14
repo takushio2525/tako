@@ -1,0 +1,65 @@
+---
+/**
+ * tako の窓が無い間の画面（#2063）。終了した直後の暗い画面と、PC の再起動中の黒い画面。
+ *
+ *   <div slot="stage" class="tk-stack">
+ *     <div data-at="!2" data-fx="pop"><TakoWindow …>…</TakoWindow></div>
+ *     <div data-at="2" data-fx="fade">
+ *       <Blackout kind="quit" title="tako を終了しました" note="…">
+ *         <ul class="tk-bo-list">
+ *           <li><i class="tk-dot is-running" />ペイン 1 · claude<span class="tk-bo-state">実行中</span></li>
+ *           <li class="is-gone">…</li>   … 消えたもの（取り消し線）
+ *         </ul>
+ *       </Blackout>
+ *     </div>
+ *   </div>
+ *
+ * - 窓（TakoWindow）と同じ height を渡し、.tk-stack で重ねて入れ替える（貼り付いた図が跳ねない）
+ * - kind="quit" = 終了の印 + 暗い背景 / kind="reboot" = 回る輪 + 黒い背景
+ * - 子（slot）は「裏で何が残っているか / 何が消えたか」の一覧。.tk-bo-list の行で書く
+ * - 動きは印の脈動と輪の回転だけ。reduced-motion と静止図では止める（見た目は blackout.css）
+ */
+import '../../styles/blackout.css';
+
+interface Props {
+	kind?: 'quit' | 'reboot';
+	/** 大きな 1 行（何が起きたか） */
+	title: string;
+	/** その下の補足 1 行 */
+	note?: string;
+	/** 窓（TakoWindow）と同じ高さ（em） */
+	height?: number;
+	class?: string;
+}
+
+const { kind = 'quit', title, note, height = 25, class: className } = Astro.props;
+---
+
+<div class:list={['tk-ui', 'tk-frame', className]}>
+	<div class="tk-bo" data-kind={kind} style={`--h: ${height}em`}>
+		<div class="tk-bo-center">
+			<span class="tk-bo-mark">
+				{
+					kind === 'reboot' ? (
+						<span class="tk-bo-spin" />
+					) : (
+						<svg class="tk-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+							<path d="M12 3v8" />
+							<path d="M6.4 6.6a8 8 0 1 0 11.2 0" />
+						</svg>
+					)
+				}
+			</span>
+			<p class="tk-bo-title">{title}</p>
+			{note && <p class="tk-bo-note">{note}</p>}
+			{
+				Astro.slots.has('default') && (
+					<div class="tk-bo-body">
+						<slot />
+					</div>
+				)
+			}
+		</div>
+	</div>
+	<slot name="overlay" />
+</div>

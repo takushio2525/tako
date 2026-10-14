@@ -1,0 +1,78 @@
+---
+/**
+ * 場面: claude の CLI が新しくなったら、会話を保ったままプロセスだけ建て直す（#2063）。3 手順。
+ * 事実の出どころ: 帯の文言 = crates/tako-app/src/ui_text/stale.rs（banner_message / restart_button =
+ * 「張り直す」/ handoff_button = master では「引き継ぐ」/ restarting）、置き場と色 = main.rs の stale-banner
+ * （ペインのヘッダの下・黄色の薄い地）/ 右クリックの項目名 = ui_text/pane_menu.rs / 張り直しは会話を保つ
+ * harness を優先する（.agent/requirements.md FR-2.38.9）/ worker は役割ごと --resume で起こし直す（#1967）。
+ * Windows は harness が使えず引き継ぎ再起動だけ（windows-support.md の tako_session_restart = 一部対応）。
+ * 版と会話 ID は架空。
+ */
+import '../../styles/scene-restore.css';
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+import { windowsSupport } from '../motion/windowsSupport';
+
+// 「Windows では会話を保った建て直しはまだ」と書く根拠。対応に上がったらビルドを落として書き直させる
+if (windowsSupport.rows.get('tako_session_restart') !== '一部対応') {
+	throw new Error('SceneCliUpdate: Windows の tako_session_restart が「一部対応」ではなくなった。手順 3 の補足を直すこと');
+}
+---
+
+<Scrolly label="CLI の更新のあと、会話を保って張り直す流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={25}>
+		<Split>
+			<Pane n={1} title="マスター" badge="ORCH" state="running">
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> tako master</span>
+				<span class="tk-l tk-tui-user">ログイン画面にテストを足して</span>
+				<span class="tk-l tk-tui-msg">worker に任せました（ペイン 2）</span>
+			</Pane>
+			<Pane n={2} title="my-app" badge="WORKER" parent="master" state="running" focus body="flush" grow={1.15}>
+				<div class="tk-pane-col">
+					<div data-at="1-2" data-fx="unfold">
+						<div>
+							<div class="tk-rs-stale">
+								<span class="tk-rs-swap tk-rs-stale-msg">
+									<span data-at="1" data-fx="fade">claude 2.1.y が利用可能です（このセッションは 2.1.x）</span>
+									<span data-at="2" data-fx="fade">張り直し中...</span>
+								</span>
+								<span class="tk-rs-stale-btn" data-at="1" data-fx="fade">張り直す</span>
+								<span class="tk-rs-stale-x"><Icon name="x" /></span>
+							</div>
+						</div>
+					</div>
+					<div class="tk-pane-term">
+						<div class="tk-rs-swap">
+							<div data-at="!2" data-fx="fade">
+								<span class="tk-l tk-tui-msg is-tool">tests/login.test.ts を作成</span>
+								<span class="tk-l tk-tui-msg">テストを 2 件書きました。次は失敗時の表示です</span>
+								<span class="tk-l tk-tui-msg is-tool tk-rs-new" data-at="3" style="--d: .4s">tests/login.test.ts を更新</span>
+								<span class="tk-l tk-tui-msg tk-rs-new" data-at="3" style="--d: .6s">3 件目を足しました</span>
+							</div>
+							<div data-at="2" data-fx="fade">
+								<span class="tk-l"><span class="tk-p">my-app ❯</span> <span data-at="2" data-fx="type" style="--d: .3s">claude --resume 3f9c0b1e…</span></span>
+							</div>
+						</div>
+					</div>
+				</div>
+			</Pane>
+		</Split>
+		<Pointer slot="overlay" path="1:86,26 2:86,26" click="2" />
+	</TakoWindow>
+
+	<Step title="新しい版が出ると、ペインに知らせが出る">
+		<p>動いている claude より新しい版が入ると、そのペインの上に黄色い帯が出ます。古い版のまま作業を続けることもできます。</p>
+	</Step>
+	<Step title="「張り直す」で、プロセスだけ建て直す">
+		<p>押すと tako が古い claude を終わらせ、<strong>同じ会話</strong>を指定して新しい版を起こします。ペインの右クリックの「会話を保って再起動（CLI 更新）」も同じ操作です。</p>
+	</Step>
+	<Step title="会話はそのまま、新しい版で続きから">
+		<p>担当の AI は役割も会話も保ったまま、続きから進めます。司令塔のペインでは代わりに「引き継ぐ」が出て、引き継ぎを書かせてから後任へ交代します。</p>
+		<p class="tk-step-note">Windows では、会話を保ったままの張り直しはまだ使えません。引き継ぎを書かせて再起動する方は使えます。</p>
+	</Step>
+</Scrolly>
