@@ -20874,6 +20874,13 @@ impl RespondTurn {
     }
 }
 
+/// 札の状態（次に配る札, いま通している札）。テストが機構の観測値で順番を確かめるための口
+#[cfg(test)]
+fn respond_turn_state() -> (u64, u64) {
+    let turns = respond_turns().0.lock().unwrap_or_else(|e| e.into_inner());
+    (turns.next, turns.serving)
+}
+
 impl Drop for RespondTurn {
     fn drop(&mut self) {
         let (lock, cvar) = respond_turns();
@@ -43313,7 +43320,8 @@ mod tests {
         assert_eq!(value["delivery"]["state"], "sent");
         assert_eq!(value["responses"].as_array().map(Vec::len), Some(1));
         // 先の札を手放した → 後の返答が積まれる
-        rx.recv_timeout(std::time::Duration::from_secs(5))
+        // 手放しの後は番がすぐ回る（手放さなければ番待ちの上限 60 秒まで積まれない）
+        rx.recv_timeout(std::time::Duration::from_secs(30))
             .expect("先の返答を終えても後の返答が積まれない");
         let value = t2086_settle(&mut host, waiter.join().unwrap()).unwrap();
         let comments: Vec<&str> = value["responses"]
@@ -43342,20 +43350,33 @@ mod tests {
     fn issue2086_失敗した返答と捨てた返答は後ろを待たせない() {
         let (_dir, _guard) = t1479_env("t2086-respond-missing");
         let (mut host, _master, id) = t2086_master_task();
+        // 待たされるかは実時間ではなく札の状態で見る（`.agent/conventions.md`
+        // 「効果を測る単体テストは実時間で比べない」）
+        let (first, serving) = respond_turn_state();
+        assert_eq!(first, serving, "前の返答の札が手放されていない");
         let missing = t2086_prepare(&mut host, &t2086_respond("u-無い", "届かない"));
         let dropped = t2086_prepare(&mut host, &t2086_respond(&id, "捨てる"));
         let ok = t2086_prepare(&mut host, &t2086_respond(&id, "通る"));
+        assert_eq!(
+            respond_turn_state(),
+            (first + 3, first),
+            "札を届いた順に配っていない"
+        );
         assert!(matches!(
             missing.run_staged(),
             OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if e.contains("見つからない")
         ));
         drop(dropped);
-        let started = std::time::Instant::now();
+        assert_eq!(
+            respond_turn_state().1,
+            first + 2,
+            "失敗した返答・捨てた返答の札が手放されていない（後ろの返答が番を待たされる）"
+        );
         let value = t2086_settle(&mut host, ok.run_staged()).unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "手放された札の後ろで待たされた（{:?}）",
-            started.elapsed()
+        assert_eq!(
+            respond_turn_state(),
+            (first + 3, first + 3),
+            "記録の後に札を手放していない"
         );
         assert_eq!(
             host.prompt_flows.len(),

@@ -20,7 +20,9 @@
 //! 1. **解決は 1 実装を通る** — `user_task_origin` が
 //!    `user_tasks::resolve_origin_profile` へ判断を渡し、材料として
 //!    spawn 元（`spawn_chain_master_profile`）と管轄（`profile_governing_project`）を
-//!    集める。dispatch の中で条件分岐を書き直さない
+//!    集める。dispatch の中で条件分岐を書き直さない。spawn 元は workspace を読むので
+//!    UI スレッドの段 `user_task_origin_facts` が採り、`user_task_origin` は
+//!    `facts.spawn_chain` を判断へ渡す（#2086 で background の段と分けた）
 //! 2. **既定へ落とさない** — `origin_profile` は `Option` を返し、`default` を
 //!    名乗れるのは A/B の legacy アームだけ
 //! 3. **宛先不明は失敗として残る** — `deliver_user_task_response` が
@@ -157,7 +159,7 @@ fn scan_origin(src: &str) -> Vec<Offender> {
              （dispatch の中で解き直すと、順序と「解けない」の扱いが 2 か所に割れる。#1466）",
         ),
         (
-            "spawn_chain_master_profile(",
+            "facts.spawn_chain",
             "spawn 元（`spawned_by` の枝）を材料に集めていない。worker の起票が\
              master を名乗る role だけで解かれ、無関係な `default` の master へ返答が届く（#1466）",
         ),
@@ -190,6 +192,26 @@ fn scan_origin(src: &str) -> Vec<Offender> {
                   （解けなかった起票が `default` へ落ちる = #1466 の症状そのもの）"
                 .into(),
         });
+    }
+    // spawn 元を workspace から採るのは UI スレッドの段（#2086）。ここで採らないと
+    // `facts.spawn_chain` が空のまま判断へ渡る
+    match fn_window(src, "fn user_task_origin_facts(") {
+        None => out.push(Offender {
+            file: DISPATCH,
+            line: 0,
+            why: "`user_task_origin_facts` が見つからない（走査が空振り）".into(),
+        }),
+        Some((at, window)) => {
+            if !code_only(&window).contains("spawn_chain_master_profile(") {
+                out.push(Offender {
+                    file: DISPATCH,
+                    line: at,
+                    why: "spawn 元（`spawned_by` の枝）を材料に集めていない。worker の起票が\
+                          master を名乗る role だけで解かれ、無関係な `default` の master へ返答が届く（#1466）"
+                        .into(),
+                });
+            }
+        }
     }
     // spawn 元の綴りを揃える 1 実装が在る（空 suffix と「解けない」を混ぜない）
     match fn_window(src, "fn spawn_chain_master_profile(") {
@@ -494,6 +516,11 @@ fn 走査が空振りしていない() {
     for (label, src, needle) in [
         ("起票元の解決", &sources.dispatch, "fn user_task_origin("),
         (
+            "起票元の材料",
+            &sources.dispatch,
+            "fn user_task_origin_facts(",
+        ),
+        (
             "spawn 元の綴り",
             &sources.dispatch,
             "fn spawn_chain_master_profile(",
@@ -542,17 +569,25 @@ fn 逆戻りを名指しできる() {
         "注入前が既に汚れている"
     );
 
-    // (1) spawn 元を見ない旧経路へ戻す（= #1466 の真因そのもの）
-    let mut s = Sources::load(&root);
-    s.dispatch = s.dispatch.replace(
-        "    let spawn_chain = caller.and_then(|pane| spawn_chain_master_profile(host.workspace(), pane));",
-        "    let spawn_chain: Option<String> = None;",
-    );
-    expect_hit(
-        &s,
-        DISPATCH,
-        "spawn 元（`spawned_by` の枝）を材料に集めていない",
-    );
+    // (1) spawn 元を見ない旧経路へ戻す（= #1466 の真因そのもの）。材料を採らない形と、
+    // 採っても判断へ渡さない形の両方（#2086 で材料の採り方と判断を段に分けた）
+    for (from, to) in [
+        (
+            "        spawn_chain: caller.and_then(|pane| spawn_chain_master_profile(host.workspace(), pane)),",
+            "        spawn_chain: None,",
+        ),
+        ("        facts.spawn_chain.as_deref(),", "        None,"),
+    ] {
+        let mut s = Sources::load(&root);
+        let injected = s.dispatch.replace(from, to);
+        assert_ne!(injected, s.dispatch, "注入 (1) の置換元がある: {from}");
+        s.dispatch = injected;
+        expect_hit(
+            &s,
+            DISPATCH,
+            "spawn 元（`spawned_by` の枝）を材料に集めていない",
+        );
+    }
 
     // (2) 管轄の保険が消える
     let mut s = Sources::load(&root);
