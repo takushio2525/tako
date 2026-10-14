@@ -20,26 +20,6 @@
 
 ---
 
-## 2026-10-13（#1993: PC リソース管理 S1 = 機とプロセスの計測を背景で採り、`tako queue` / MCP `tako_queue` で読む）
-- 境界 B29 `platform::resources`（sysctl / mach / libproc。mach tick は timebase で換算・他ユーザーの rusage は呼ばない）+ 純関数 `tako_core::resources`（Activity Monitor の式・分類・帰属・重い処理 = 重い祖先を持たない木）+ `tako_control::resources`（背景スレッド・`ipc::submit` が UI を通さず答える）。GUI 不在の CLI は機の値だけ。番犬 `issue1993_*`（+ #1968 / #1984）・カタログ +574 B・Windows は Pending（#2000）
-- 実測: `scripts/test-resources-1993.sh` 10 項目緑（vm_stat の式と一致・器の子孫 / nohup の子の帰属）。Apple のプラットフォームバイナリは env を読めない（0 キー）。費用は走査 5 秒で +0.57% → 見ていない間 30 秒へ落として差がばらつきの中（0.85% 対 0.87%）
-
-## 2026-10-13（#2011 S0: 描画と RAM の徹底的な軽量化の計測と計画 = 設計書 `.agent/plans/2026-10-lightweight.md` と計測スクリプト・子 Issue 7 本）
-- 本番 835 MB はプレビュー（キャッシュ 173 MB + GPU のアトラス 約 150 MB）と描画（drawable 3 面 + 窓に依らない固定 約 150 MB）で過半。器のグリッドは 26 枚で 1.6 MB（履歴は tmux 側）。CPU の最大は監視の `claude agents --json` 60 本/分 = 子プロセス 24%（本体 18.7%）
-- `scripts/measure-footprint-2011.sh`（同条件の footprint・アイドル CPU・描画回数・起動時間・電力）。#2009 と重なる分は実測を渡し、重ならない #2017〜#2023 を起票（S2 監視スキャン・S3 ペインログ・S4 malloc・S5 sessions.yaml・S6 MCP ブリッジ・S7 display link 提案・S8 番犬）
-
-## 2026-10-13（#1691: エディタで対応する括弧を強調 = 文字列・コメントを飛ばす探索・VS Code の採り方・応答の `document.bracket_match`）
-- `text_edit::brackets`（記号は `file_type` の `comment` 列 + 新しい `lexical` 列）・直後 → 直前・選択中と括弧に接しないときは採らない・種類ごとに数える。GUI は対の 2 文字に背景、CLI / MCP は編集系の応答（ツール増なし・カタログ +81 B）。A/B `TAKO_1691_LEGACY=1`
-- 実測: release 5,000 行で 1 打鍵中央値 0.156 ms・最大 0.268 ms。単体 22 本 + dispatch / MCP・注入 3 通り・visual `bracket-match` 新 OK / 旧 FAILED・実 CLI / MCP stdio の e2e
-
-## 2026-10-14（#2053 S1: docs サイトのスクロール連動モーションの土台・トップとインストールの作り直し）
-- `docs/src/components/motion/`（Scrolly / Autoplay と tako の画面の再現部品 24 個）+ `src/scripts/motion.ts`（IntersectionObserver + rAF・gzip 1.9KB・依存なし）。reduce では手順ごとの静止図。トップ（splash・場面 5 + ヒーロー）とインストール（macOS 5 手順 / Windows 7 手順・既知の制限は対応表と突き合わせてビルドで拘束）。全ページのヘッダーに「ダウンロード」
-- 手引きと S2 の構成案は `.agent/plans/2026-10-docs-motion.md`。Windows の数字は windows-support.md をビルド時に読む。Lighthouse（gzip 配信）トップ 60→57・インストール 57→57、実測 FCP は前後とも約 2.3 秒
-
-## 2026-10-14（#2032: issue1944_lsp_fetch の取得中の検査のフレーク = 状態と進捗は別々に変わるので、揃った 1 回の読みを状態待ちで捕まえる）
-- 真因: 製品は状態（取得中）と進捗（fetch のレジストリ）を別々に変えるので、進捗を置く前と、取り終えて進捗を消してから稼働へ移るまで（#1977 の片付けが走る）は「取得中なのに進捗が無い」。旧テストは各時点で両方を求めていた。配布元に最後の 4 KiB を止める `Serve::Held` を足し、status と画面の口をそれぞれ 1 回の読みで確かめる。注入 `TAKO_2032_INJECT_OLD_FILES=<n>`
-- 実測: 旧 + 前の版の段 500 ファイル 5/5 FAILED・旧 + 進捗を置く前に 200 ms 3/3 FAILED（どちらも CI と同じ assert）・新は同じ注入で 5/5 / 3/3 ok・画面に進捗を出さない壊し方で新が名指しで落ちる・新 20/20 ok
-
 ## 2026-10-15（#2053 S2: ドキュメントサイトの機能ページをスクロール連動のモーションで作り直した = クイックスタート #2056 / かんたん表示 #2060 / 人がやること #2058 / エディタ #2062 / リモート #2061 / オーケストレーション #2059）
 - 各ページの場面は `docs/src/components/scenes/`、再現部品は新しいファイルで足し共有部品は無変更（PR #2068 / #2066 / #2074 / #2076 / #2069 / #2067）。Windows で pending の機能は `WindowsLimits` で対応表と突き合わせ（対応へ上がるとビルドが落ちる）。各ページ 1440 / 375 × 明暗 × reduced-motion で横はみ出し 0
 - 罠: Astro 6.4 + @astrojs/mdx 5.0.6 で `.mdx` の GFM の表が描かれない（#2082 で直す）。ページをまたぐ直しと共有部品の提案は #2077（S3）に集約。S2 の PR は progress を触らず、master がこの 1 件にまとめた
@@ -73,3 +53,30 @@
 
 ## 2026-10-15（#2084: docs だけの PR と main への push で CI の macOS / Windows の Rust ジョブを skip する）
 - 判定ジョブ `changes`（`scripts/ci-change-scope.sh`・テスト 92 項目）+ docs の検査を `docs`（ubuntu）へ移設 + docs / .agent を読む番犬 27 本を `docs-watchdogs`（ubuntu・毎回）で。検証用 PR #2090 で 4 分 43 秒で緑（Rust 2 本は skip）。PR #2089
+
+## 2026-10-15（#1759: エディタの Enter の続き = Python の抜ける文の後ろを 1 段浅く・Markdown のリストの印を引き継ぐ / 括弧の自動閉じ = 入れた閉じ括弧の飛び越しと対・設定で切れる）
+- 規則は `file_type` の列 `dedent_after` / `list_continuation` / `auto_close`。打鍵 1 文字は `EditorCommand::Type` → `TextBuffer::type_char` の 1 実装で GUI の文字入力と `tako edit type` / MCP `tako_preview_edit` の `command: "type"` が同じ口。設定 `editor_auto_close`（既定 ON・serde default）+ `tako edit auto-close` + MCP `auto_close`。カタログ +299 B・A/B `TAKO_1759_LEGACY=1`
+- 実測: `scripts/test-editor-enter-1759.sh` 28 PASS（visual `enter-1759` 新 OK / 旧は ① で FAILED・CLI / MCP の同じ手順が GUI の打鍵とバイト一致）・番犬 `issue1759_enter_auto_close_watchdog`（注入 6 通り）
+
+## 2026-10-15（#2082 / #2088: docs の .mdx で表が描かれない・コマンドの -- や "" が化けるのを直した）
+- 真因: Astro 6.4 で `markdown.gfm` の既定が未設定 → Starlight が足す @astrojs/mdx 5.0.6 が GFM を外す / mdx の smartypants が JSX の子（<Cmd>）の `--` `"` を置き換える。`astro.config.mjs` で `mdx({ optimize: true, gfm: true, smartypants: false })`
+- 表 15 個（5 ページ）・コマンド 3・コード 2 が直り、他 29 ページは出力が 1 バイトも変わらない。番犬 `docs/scripts/verify-markdown.mjs` を postbuild に（注入 3 通りで npm run build が落ちる）
+
+## 2026-10-15（#2077: ドキュメントサイト刷新の仕上げ S3 = 共有部品の提案を反映しページをまたぐ直し）
+- 共有部品の提案 20 件を反映（Starter / Phone / CommandCard を 1 本化、TakoWindow に remote・ctx・押した印、data-fx の log / drawer、ポインターの「手順:-」、Scrolly の intro）・初回バナーの列ずれ / WindowsLimits の字下げ / 隠したタブの空きを直した
+- 見送り: ページ名「ファイルツリー＆プレビュー」（据え置き）・mdx の表と全角ダッシュ（#2083 で着地済み。more の <Cmd> の回避は外した）・progress（master）
+
+## 2026-10-15（#2086: UserTask の起票・詳細・更新・返答（PWA を含む）・展開も IPC から UI スレッドで置き場を読み書きしない）
+- #2052 の腕を門 `user_task_offloads` で全 action へ（A/B `TAKO_2086_LEGACY=1`）。add は workspace 由来の材料だけ UI で写し起票元の解決（プロファイル・セッションカタログ）と書き込みは background、respond は届いた順の札 → 積む（bg）→ 運ぶ（UI）→ 記録（bg。`OffloadLanding::Settled` で後処理の後）、expand の同期の引き直しは `list_poll.pending` へ。via を省いた返答だけ同期（MCP は `mcp` を埋める）。番犬 12 節（注入 10 通り）・カタログ増 0 B
+- 実測（読み 1500 ms の注入・`scripts/test-user-task-offload-2086.sh` 16 PASS）: 最中の IPC 最大 新 17〜32 ms・旧 1402〜4421 ms、UI スレッドの読み 新 0・旧 10 回。PWA 実経路 69 PASS・配送 45 PASS
+
+## 2026-10-15（#2021: MCP の stdio ブリッジ 1 本 約 7 MB → 1.09 MB）
+-clap を通らない・カタログを使い捨ての子プロセスで組む・.app では libSystem だけの `tako-mcp` へ exec で引き渡す。登録は `tako mcp serve` のまま（移行なし）、応答はバイト単位で同じ。計測は `scripts/measure-mcp-bridge-2021.sh`、番犬は `issue2021_mcp_bridge`
+
+## 2026-10-15（#2041: 残りの `claude agents --json` 走査を mod の報告で埋めた = GUI モードのチャット表示と /clear 後のレジストリの会話 ID）
+- チャット表示は報告のあるペインを問わず、残りだけ絞って走査。`/clear` 後はレジストリの会話 ID を報告へ追従（`agents_scan.registry_followed`）。A/B `TAKO_2041_LEGACY=1`・番犬 `issue2041_*`。PR #2091
+- 実測 `scripts/test-session-scan-mod-2041.sh`: chat 60 秒 8 → 0 本・/clear 後 25 秒 器あり 2 → 0 本 / 器なし 12 → 0 本
+
+## 2026-10-15（#1950: `.ino` を再生ボタン / `tako run` で走らせる arduino 種別）
+- `arduino-cli compile` / プロファイル `upload`。arduino-cli は PATH → Arduino IDE 同梱（`app_bundle`）で探し、基板未選択・名前の不一致・arduino-cli なしを実行ペインと `project.notes` で案内。PR #2093
+- 実測: `scripts/test-runner-arduino-1950.sh` 25 PASS（IDE 同梱 1.2.0 で compile exit 0・A/B `TAKO_1950_LEGACY=1`）。upload は基板なしで未検証
