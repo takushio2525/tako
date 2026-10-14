@@ -390,11 +390,6 @@ impl PinGate {
         self.0.wake.notify_all();
     }
 
-    /// 開いたか（決着・上限・閉じたのどれかで解けた）
-    pub fn is_released(&self) -> bool {
-        self.lock().release.is_some()
-    }
-
     /// 診断用の記録
     pub fn report(&self) -> PinReport {
         let st = self.lock();
