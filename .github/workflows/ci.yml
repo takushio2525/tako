@@ -85,6 +85,11 @@ jobs:
       - name: docs の内部リンクを検査（#1547）
         working-directory: docs
         run: node scripts/verify-links.mjs
+      # 本文の Markdown の表が <table> として描かれているか。Astro 6.4 で `markdown.gfm` の既定が
+      # 未設定になり、.mdx だけ表が `| a | b |` のまま公開されていた（ビルドも他の検査も通る壊れ方。#2082）
+      - name: docs の Markdown の表が描かれていることを検査（#2082）
+        working-directory: docs
+        run: node scripts/verify-markdown.mjs
       # 検索向けの head と sitemap（title / description の重複・canonical・noindex・
       # 構造化データ・FAQ が本文と一致するか・sitemap が全ページを載せ robots から辿れるか）。
       # どれも壊れても表示は変わらないので、ここで落とさないと検索結果で気づく（#1843）
