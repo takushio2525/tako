@@ -984,9 +984,10 @@
     display: none;
   }
 }
+/* 狭い窓では一覧が読める幅まで広げる。場面ごとに変えるときは --rw-narrow（RightPanel の narrow） */
 @container tkframe (max-width: 30rem) {
   .tk-right {
-    width: 58%;
+    width: var(--rw-narrow, 58%);
   }
 }
 

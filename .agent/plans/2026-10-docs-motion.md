@@ -150,7 +150,7 @@ cd docs && npm ci && npm run build && npm run og:verify && node scripts/verify-l
 | `Split` | 本体 | `dir`（row / col）・`grow`・`at` / `fx` | — |
 | `Pane` | Split の子 | `n`・`title`・`badge`（ORCH / WORKER）・`parent`（↳ master）・`state`（idle / running か `[{at, state, text}]`）・`focus`（true か data-at）・`at` / `fx`・`grow`・`body`（flush で余白なし） | `main.rs` の render_pane_header（状態の表記は running / idle の 2 つ） |
 | `Sidebar` | slot sidebar | `project`・`branch`・`path`・`items` | `sidebar.rs` |
-| `RightPanel` | slot right | `active`（fleet / orch / git / tasks）・`count` / `countAt`・`width` | `right_panel.rs` |
+| `RightPanel` | slot right | `active`（fleet / orch / git / tasks）・`count` / `countAt`・`width`（既定 40%）・`narrow`（幅 30rem 以下の窓での幅。既定 58%）。引き出しで開くなら `data-fx="drawer"` の器で包む | `right_panel.rs` |
 | `TaskCard` | RightPanel の中 | `kind`・`title`・`openAt`・`body`・`attachment`・`pick` / `pickAt`・`comment` / `commentAt`・`delivered` | `tasks_panel.rs` / `ui_text/panel.rs` |
 | `CommandCard` | ペインの帯（`.tk-cardband`） | `title`・`command`・`at`・`running`・`ran` | `command_card_ui.rs` / `ui_text/command_card.rs` |
 | `CommandCardFull` | ペインの帯（`.tk-cardband`） | `title`・`commands`（各 `text`（改行可）/ `copied` / `running` / `ran` + `code`（0 以外は赤）/ `closed` / `copyMark` / `runMark` / `boxMark`）・`at`。実物どおり番号・実行記録をボタン行の左に出す（#2057） | `command_card_ui.rs` の render_command_card / `ui_text/command_card.rs` |
