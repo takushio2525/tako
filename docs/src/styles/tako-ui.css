@@ -877,7 +877,13 @@
   padding: 0.05em 0.6em;
 }
 
+/* スターター（Starter.astro）。器はペインの幅を測るコンテナ、中身の列は 30em まで */
 .tk-starter {
+  container: tkstarter / inline-size;
+  height: 100%;
+  font-family: var(--ui-sys);
+}
+.tk-starter-in {
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -896,6 +902,7 @@
   margin-bottom: 0.2em;
 }
 .tk-starter-card {
+  flex: none;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 0.1em 0.7em;
@@ -930,6 +937,84 @@
 .tk-starter-card span:last-child {
   color: var(--ui-fg3);
   font-size: 0.9em;
+}
+/* 実コマンドの併記は等幅（実物は font_family + 10px） */
+.tk-starter-cmd {
+  font-family: var(--ui-font);
+}
+.tk-starter-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  margin-top: 0.15em;
+  padding: 0.1em 0.3em;
+  color: var(--ui-muted);
+  font-size: 0.92em;
+}
+.tk-starter-link .tk-ic {
+  width: 1em;
+  height: 1em;
+}
+.tk-starter-link small {
+  margin-left: 0.2em;
+  color: var(--ui-faint);
+  font-size: 0.88em;
+}
+.tk-starter-foot {
+  color: var(--ui-faint);
+  font-size: 0.85em;
+}
+/* 間引き（実物と同じ順）。compact = 実コマンドと脚注を落とす / tiny = さらに補足・説明・setup の行 */
+.tk-starter:is(.is-compact, .is-tiny) :is(.tk-starter-cmd, .tk-starter-foot),
+.tk-starter.is-tiny :is(.tk-starter-sub, .tk-starter-desc, .tk-starter-link) {
+  display: none;
+}
+.tk-starter.is-tiny .tk-starter-in {
+  gap: 0.35em;
+}
+.tk-starter.is-tiny .tk-starter-q {
+  font-size: 1em;
+}
+.tk-starter.is-tiny .tk-starter-card {
+  padding: 0.3em 0.5em;
+  gap: 0 0.5em;
+}
+.tk-starter.is-tiny .tk-starter-ic {
+  grid-row: auto;
+  width: 1.7em;
+  height: 1.7em;
+}
+/* size="auto": ペインの幅で決める（実物の 420px / 300px を 13px の文字に対する em で写した） */
+@container tkstarter (max-width: 32em) {
+  .tk-starter.is-auto :is(.tk-starter-cmd, .tk-starter-foot) {
+    display: none;
+  }
+}
+@container tkstarter (max-width: 23em) {
+  .tk-starter.is-auto :is(.tk-starter-sub, .tk-starter-desc, .tk-starter-link) {
+    display: none;
+  }
+  .tk-starter.is-auto .tk-starter-in {
+    gap: 0.35em;
+  }
+  .tk-starter.is-auto .tk-starter-q {
+    font-size: 1em;
+  }
+  .tk-starter.is-auto .tk-starter-card {
+    padding: 0.3em 0.5em;
+    gap: 0 0.5em;
+  }
+  .tk-starter.is-auto .tk-starter-ic {
+    grid-row: auto;
+    width: 1.7em;
+    height: 1.7em;
+  }
+}
+/* スマホ幅の窓では、見出しの補足を落としてカード 3 枚と setup の行を収める */
+@container tkframe (max-width: 25rem) {
+  .tk-starter.is-compact .tk-starter-sub {
+    display: none;
+  }
 }
 
 /* ============================================================

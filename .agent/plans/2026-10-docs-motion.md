@@ -157,7 +157,7 @@ cd docs && npm ci && npm run build && npm run og:verify && node scripts/verify-l
 | `PhoneCommandCards` | Phone の中 | `label`・`command`・`pressAt`・`confirmAt` / `confirmPressAt`（全文の確認シート）・`startedAt`・`runningAt` / `ranAt` / `code`・`pane`・`host`（#2057） | `web/tako-remote/src/components/command-cards.jsx` |
 | `WelcomeBanner` | slot banner | `at`・`pressAt` | `overlays.rs` / `ui_text/welcome.rs` |
 | `Chat` | Pane の中 | `typed` / `typedAt`・`chips`。吹き出しは子に `.tk-bubble`（`.is-user`） | `chat_view.rs` / `ui_text/ui_mode.rs` |
-| `Starter` | Pane の中 | — | `starter.rs` / `ui_text/ui_mode.rs` |
+| `Starter` | Pane / GuiFrame の中 | `size`（auto = 置いた場所の幅で間引く（既定）/ full / compact / tiny）・`pressAt`（「AI チームに任せる」の押した印）。3 枚のカード・「初期設定をやり直す」・脚注まで | `starter.rs` の render_starter_pane / `ui_text/ui_mode.rs` |
 | `Phone` | stage | `machine`・`tasks` / `tasksAt`・`height`。画面の入れ替えは子を `.tk-phone-layer` で重ねる | `web/tako-remote/src/styles/main.css` |
 | `PhoneCard` | Phone の中 | `title`・`role`・`state` / `stateText`。子 = スニペット 1 行 | `web/tako-remote/src/pages/panes.jsx` |
 | `OsTerminal` | stage | `os`・`title`・`height` | — |
