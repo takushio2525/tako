@@ -1,0 +1,38 @@
+---
+/**
+ * かんたん表示（GUI モード）のペインの枠（#2060）。スターター・準備中を中に入れる。
+ * ヘッダは実物と同じく「吹き出しの印・作業フォルダ・×」で、準備中だけ
+ * 「ターミナルを表示」（起動が固まったときの逃げ道）が付く。
+ * 正本: crates/tako-app/src/starter.rs の render_gui_pane_frame / ui_text/ui_mode.rs。
+ *
+ *   <GuiFrame cwd="~/my-app" focus><Starter /></GuiFrame>
+ */
+import Icon from './Icon.astro';
+import '../../styles/tako-ui-chat.css';
+
+interface Props {
+	/** ヘッダの作業フォルダ（ホームは ~ に縮めて書く。Windows は ~\my-app） */
+	cwd?: string;
+	focus?: boolean;
+	/** 「ターミナルを表示」を出す手順（data-at の書き方）。準備中の間だけ出す */
+	terminalAt?: string;
+}
+
+const { cwd = '~/my-app', focus = false, terminalAt } = Astro.props;
+---
+
+<div class:list={['tk-gframe', { 'is-focus': focus }]}>
+	<div class="tk-ghead">
+		<Icon name="chat" />
+		<span class="tk-ghead-cwd">{cwd}</span>
+		{
+			terminalAt && (
+				<span class="tk-ghead-btn" data-at={terminalAt} data-fx="fade">
+					ターミナルを表示
+				</span>
+			)
+		}
+		<span class="tk-ghead-x"><Icon name="x" /></span>
+	</div>
+	<div class="tk-gframe-body"><slot /></div>
+</div>

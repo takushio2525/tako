@@ -1,0 +1,89 @@
+---
+/**
+ * 場面（features/gui-mode）: 表示モードのボタン。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.23.1〜2.23.6 / .agent/plans/2026-07-gui-mode.md §1.2・§2.1（判定表）/
+ * crates/tako-app/src/ui_text/ui_mode.rs（ツールチップ）・ui_text/palette.rs（パレットの項目）。
+ * チャットになるのは claude の対話ペインだけ・空のシェルはスターター・codex / agy・実行中のコマンド・
+ * 全画面アプリはターミナルのまま。既定はターミナル表示で、モードはアプリ全体で 1 つ。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import GuiPane from '../motion/GuiPane.astro';
+import GuiFrame from '../motion/GuiFrame.astro';
+import GuiStarter from '../motion/GuiStarter.astro';
+import ChatPane from '../motion/ChatPane.astro';
+import ChatMsg from '../motion/ChatMsg.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/page-gui-mode.css';
+---
+
+<Scrolly label="表示モードを切り替える流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} guiAt="2+" height={30}>
+		<Split dir="col">
+			<Split>
+				<GuiPane n={1} title="claude" state="idle" guiAt="2+" focus grow={1.1}>
+					<Fragment slot="term">
+						<span class="tk-l tk-tui-user">ボタンの文言を直して</span>
+						<span class="tk-l tk-tui-msg is-tool">Edit src/login.tsx</span>
+						<span class="tk-l tk-tui-msg">「ログイン」に直しました。</span>
+						<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+					</Fragment>
+					<ChatPane focus compact ctx={[{ left: 71 }]}>
+						<ChatMsg role="user" copy={false}>ボタンの文言を直して</ChatMsg>
+						<ChatMsg role="ai">「ログイン」に直しました。</ChatMsg>
+					</ChatPane>
+				</GuiPane>
+				<Pane n={2} title="codex" state="running">
+					<span class="tk-l tk-tui-user">テストを足して</span>
+					<span class="tk-l tk-tui-msg">tests/login.test.ts を書いています</span>
+					<span class="tk-l tk-dim">esc to interrupt</span>
+					<span class="tk-gm-keep" data-at="3+" data-fx="pop"><Icon name="terminal" />ターミナルのまま</span>
+				</Pane>
+			</Split>
+			<Split>
+				<GuiPane n={3} title="シェル" state="idle" guiAt="2+" grow={1.1}>
+					<Fragment slot="term">
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+					</Fragment>
+					<GuiFrame>
+						<GuiStarter size="tiny" />
+					</GuiFrame>
+				</GuiPane>
+				<Pane n={4} title="npm run dev" state="running">
+					<span class="tk-l tk-ok">VITE v5.4.0 ready</span>
+					<span class="tk-l">➜ Local: <span class="tk-acc">localhost:5173</span></span>
+					<span class="tk-l tk-dim">hmr update /src/login.tsx</span>
+					<span class="tk-gm-keep" data-at="3+" data-fx="pop" style="--d: .15s"><Icon name="terminal" />ターミナルのまま</span>
+				</Pane>
+			</Split>
+		</Split>
+		<div slot="overlay" class="tk-gm-ov">
+			<span class="tk-gm-tip" data-at="1" style="--d: .5s">かんたん表示に切り替え</span>
+			<div class="tk-gm-palette" data-at="4" data-fx="pop">
+				<div class="tk-gm-palette-q"><Icon name="search" /><span>表示</span><span class="tk-cur"></span></div>
+				<span class="tk-gm-palette-item is-sel">表示モードを切り替え（かんたん / ターミナル）</span>
+				<span class="tk-gm-palette-item">表示言語を切替（日本語 / English）</span>
+				<span class="tk-gm-palette-item">ホバー情報を表示（カーソル位置の型・doc）</span>
+			</div>
+		</div>
+		<Pointer slot="overlay" path="1:95.3,5.3 3:80,40 4:50,28" click="2 4" />
+	</TakoWindow>
+
+	<Step title="いつもは、ふつうのターミナル">
+		<p>tako の既定は<strong>ターミナル表示</strong>です。切り替えのボタンは、タブバーの右端、テーマ（月 / 太陽）のボタンの左隣にあります。</p>
+	</Step>
+	<Step title="押すと、会話は吹き出しに、空の画面はボタンに">
+		<p>Claude と話しているペインは<strong>チャット</strong>に、何も動いていないペインは「何をしますか？」の<strong> 3 つのボタン</strong>に変わります。ボタンの印も、ターミナルからチャットの吹き出しに変わります。</p>
+	</Step>
+	<Step title="チャットになるのは Claude だけ">
+		<p>codex や agy、dev サーバーのような実行中のコマンド、vim などの全画面のアプリは、<strong>ターミナルのまま</strong>見せます。Claude だとはっきり分かるペインだけをチャットにするので、知らないプログラムの画面を勝手に隠しません。</p>
+	</Step>
+	<Step title="⌘K からも、コマンドからも">
+		<p>コマンドパレット（⌘K）の「表示モードを切り替え」や、表示メニューからも同じように切り替えられます。モードはアプリ全体で 1 つで、次に起動したときも同じモードで開きます。</p>
+		<p class="tk-step-note">Windows のコマンドパレットは Ctrl+Shift+P です。</p>
+	</Step>
+</Scrolly>

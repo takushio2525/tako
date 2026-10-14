@@ -1,0 +1,127 @@
+/*
+ * かんたん表示（GUI モード）のページ（features/gui-mode）の場面だけで使う見た目（#2060）。
+ * 窓の上に重ねる注記（ツールチップ・コマンドパレット・「ターミナルのまま」の札）。
+ * 部品の見た目は tako-ui.css / tako-ui-chat.css。ここは場面ごとの置き場所だけを決める。
+ */
+
+/* 窓の上に重ねるもの（TakoWindow の slot="overlay"）。文字の大きさを窓（.tk-win）と同じ段で縮める */
+.tk-gm-ov {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  font-size: 11.5px;
+  font-family: var(--ui-sys);
+}
+@container tkframe (min-width: 34rem) {
+  .tk-gm-ov {
+    font-size: 12px;
+  }
+}
+@container tkframe (max-width: 25rem) {
+  .tk-gm-ov {
+    font-size: 10px;
+  }
+}
+
+/* タブバー右端の表示モードのボタンの下に出るツールチップ。
+ * ボタンの右端 = 窓の右端から「余白 0.6em + テーマのボタン 2em + 間 0.35em」（幅 30rem 以下はテーマが隠れて 0.6em） */
+.tk-gm-tip {
+  position: absolute;
+  top: calc(2.9em + 0.5em);
+  right: calc(2.95em + 1px);
+  padding: 0.3em 0.65em;
+  border-radius: 6px;
+  border: 1px solid var(--ui-line-heavy);
+  background: var(--ui-crust);
+  color: var(--ui-fg);
+  white-space: nowrap;
+  box-shadow: 0 6px 16px -6px rgb(0 0 0 / 0.6);
+}
+.tk-gm-tip::before {
+  content: '';
+  position: absolute;
+  top: -0.35em;
+  right: 0.7em;
+  width: 0.6em;
+  height: 0.6em;
+  background: var(--ui-crust);
+  border-left: 1px solid var(--ui-line-heavy);
+  border-top: 1px solid var(--ui-line-heavy);
+  transform: rotate(45deg);
+}
+.tk-gm-ov.is-win .tk-gm-tip {
+  top: calc(2.4em + 2.9em + 0.5em);
+}
+@container tkframe (max-width: 30rem) {
+  .tk-gm-tip {
+    right: calc(0.6em + 1px);
+  }
+}
+
+/* ⌘K（Windows は Ctrl+Shift+P）のコマンドパレット */
+.tk-gm-palette {
+  position: absolute;
+  top: 4.2em;
+  left: 0;
+  right: 0;
+  margin: 0 auto;
+  width: min(25em, 90%);
+  border-radius: 9px;
+  border: 1px solid var(--ui-line-heavy);
+  background: var(--ui-mantle);
+  box-shadow: 0 18px 40px -12px rgb(0 0 0 / 0.75);
+  overflow: hidden;
+}
+.tk-gm-palette-q {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.6em 0.8em;
+  border-bottom: 1px solid var(--ui-line);
+  color: var(--ui-fg);
+}
+.tk-gm-palette-q .tk-ic {
+  color: var(--ui-muted);
+}
+.tk-gm-palette-item {
+  display: block;
+  padding: 0.45em 0.8em;
+  color: var(--ui-fg3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-gm-palette-item.is-sel {
+  background: var(--ui-hl);
+  color: var(--ui-fg);
+}
+
+/* 「ターミナルのまま」の札（ペインの本文の右下） */
+.tk-gm-keep {
+  position: absolute;
+  bottom: 0.45em;
+  right: 0.45em;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.15em 0.55em;
+  border-radius: 99px;
+  border: 1px solid var(--ui-accent-line);
+  background: #2a2e45;
+  color: var(--ui-fg);
+  font-family: var(--ui-sys);
+  font-size: 0.88em;
+  white-space: nowrap;
+}
+.tk-gm-keep .tk-ic {
+  color: var(--ui-accent);
+}
+
+/* 目を向けてほしい行の輪（押された印と同じ色） */
+.tk-gm-hl {
+  border-radius: 4px;
+}
+[data-motion] .tk-gm-hl[data-fx~='mark'] {
+  transition: box-shadow 0.35s var(--tako-ease-soft, ease);
+}

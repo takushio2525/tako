@@ -1,0 +1,53 @@
+---
+/**
+ * かんたん表示（GUI モード）で「同じペインの見せ方だけ」が切り替わるペイン（#2060）。
+ * ターミナル表示（Pane そのもの）と GUI 表示（GuiFrame / ChatPane）を同じ場所に重ね、
+ * guiAt の手順だけ GUI 側を見せる。裏のターミナルは止まらない、という実物の作り
+ * （FR-2.23.2 = 表示レイヤだけを切り替える）をそのまま絵にしたもの。
+ *
+ *   <GuiPane n={1} title="claude" state="idle" guiAt="2+">
+ *     <Fragment slot="term"><span class="tk-l">…ターミナル表示の行…</span></Fragment>
+ *     <ChatPane …>…GUI 表示…</ChatPane>
+ *   </GuiPane>
+ *
+ * - Split の直下に置く（取り分は grow、分割で現れるなら at と fx="split"）
+ * - term 側の props（n / title / badge / state / focus / body）は Pane にそのまま渡す
+ */
+import Pane from './Pane.astro';
+import '../../styles/tako-ui-chat.css';
+
+type State = 'idle' | 'running' | 'wait' | 'fail' | 'none';
+interface StateAt {
+	at: string;
+	state: State;
+	text?: string;
+}
+
+interface Props {
+	/** GUI 表示を見せる手順（data-at の書き方）。それ以外の手順はターミナル表示 */
+	guiAt: string;
+	n?: number;
+	title?: string;
+	badge?: string;
+	parent?: string;
+	state?: State | StateAt[];
+	focus?: boolean | string;
+	body?: 'term' | 'flush';
+	grow?: number;
+	at?: string;
+	fx?: string;
+}
+
+const { guiAt, n, title, badge, parent, state, focus, body, grow, at, fx } = Astro.props;
+---
+
+<div class="tk-gpane" data-at={at} data-fx={fx} style={grow ? `--grow: ${grow}` : undefined}>
+	<div class="tk-gpane-layer" data-at={`!${guiAt}`} data-fx="fade">
+		<Pane n={n} title={title} badge={badge} parent={parent} state={state} focus={focus} body={body}>
+			<slot name="term" />
+		</Pane>
+	</div>
+	<div class="tk-gpane-layer" data-at={guiAt} data-fx="fade">
+		<slot />
+	</div>
+</div>

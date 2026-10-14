@@ -1,0 +1,69 @@
+---
+/**
+ * 場面（features/gui-mode）: チャットで頼む・生成中・送信待ち・残量。5 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.23.11（入力欄は claude の入力行の写し）/ 2.23.13（作業中の表示は
+ * 会話の末尾の AI 側）/ 2.23.15（生成中に送った指示は「送信待ち」で出て、届いたら印が消える）/
+ * .agent/plans/2026-07-gui-mode.md §2.3（ヘッダの状態・残量・/compact）/ crates/tako-app/src/ui_text/ui_mode.rs。
+ * 作業中の表示の中身は claude の画面のスピナー行そのもの（取れないときは「考え中…」）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import ChatPane from '../motion/ChatPane.astro';
+import ChatMsg from '../motion/ChatMsg.astro';
+import ChatBusy from '../motion/ChatBusy.astro';
+import '../../styles/page-gui-mode.css';
+---
+
+<Scrolly label="チャットで頼む流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'master', state: 'running', active: true }]} mode="gui" height={29}>
+		<Split>
+			<ChatPane
+				focus
+				status={[
+					{ at: '1 5', kind: 'idle' },
+					{ at: '2 4', kind: 'busy' },
+					{ at: '3', kind: 'queued' },
+				]}
+				ctx={[
+					{ at: '!5', left: 64 },
+					{ at: '5', left: 18 },
+				]}
+				input={[
+					{ at: '1', kind: 'typed', text: 'パスワードの表示ボタンを付けて' },
+					{ at: '2-4', kind: 'placeholder', text: 'いま考え中です。続けて書くと、終わったら届きます' },
+					{ at: '5', kind: 'placeholder', text: 'やってほしいことを書いてください' },
+				]}
+			>
+				<ChatMsg role="user">ログイン画面のコードはどこ？</ChatMsg>
+				<ChatMsg role="ai"><span><code>src/login.tsx</code> です。入力欄とボタンが入っています。</span></ChatMsg>
+				<ChatMsg role="user" at="2+">パスワードの表示ボタンを付けて</ChatMsg>
+				<ChatMsg role="ai" at="4+">
+					<span>表示 / 非表示を切り替えるボタンを付けました。</span>
+					<span class="tk-tool"><b>Edit</b> src/login.tsx</span>
+				</ChatMsg>
+				<ChatMsg role="user" at="3+" queuedAt="3">終わったらテストも足して</ChatMsg>
+				<ChatMsg role="ai" at="5"><span>テストを足しました。12 件すべて通っています。</span></ChatMsg>
+				<ChatBusy at="2-3" label="Pondering… (12s · ↓ 1.4k tokens)" queuedAt="3" />
+				<ChatBusy at="4" label="Pondering… (4s · ↓ 310 tokens)" />
+			</ChatPane>
+		</Split>
+	</TakoWindow>
+
+	<Step title="書いて、Enter で送る">
+		<p>入力欄にやってほしいことを書いて <kbd>Enter</kbd> で送ります。改行は <kbd>Shift</kbd>+<kbd>Enter</kbd>。日本語入力も画像の貼り付けも、ターミナルのときと同じように使えます。</p>
+	</Step>
+	<Step title="生成中は「考え中…」">
+		<p>送った言葉は右側の吹き出しに。AI が考えている間は、ヘッダに「考え中…」、会話の最後に<strong>いま何をしているかと経過時間</strong>が出ます。</p>
+	</Step>
+	<Step title="待たずに、次を頼める">
+		<p>考え中に書いて送っても大丈夫です。吹き出しに「<strong>送信待ち</strong>」が付き、いまの返事が終わったら届きます。</p>
+	</Step>
+	<Step title="届いたら、印が消える">
+		<p>返事が出ると「送信待ち」の印が消えます。届いた合図です。AI はそのまま次の頼みごとに取りかかります。</p>
+	</Step>
+	<Step title="会話が長くなったら、ボタンで軽く">
+		<p>ヘッダの「残り N%」は、AI が覚えていられる会話の残りです。少なくなると赤くなり、「<strong>/compact で会話を軽くする</strong>」が出ます。押すと会話が要約されて、続きを話せます。</p>
+	</Step>
+</Scrolly>

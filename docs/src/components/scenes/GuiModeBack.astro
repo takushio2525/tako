@@ -1,0 +1,68 @@
+---
+/**
+ * 場面（features/gui-mode）: ターミナル表示へ戻す。3 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.23.2（表示レイヤだけを切り替え、PTY・tmux・レイアウトに触らない =
+ * ターミナルへ戻せば同じ画面がある）/ .agent/plans/2026-07-gui-mode.md §2.4（claude の worker もチャットになり、
+ * 入力欄から直接頼める。説明行は ui_text/ui_mode.rs の chat_worker_note）・§2.2（スターターのボタンはシェルへ
+ * コマンドを書き込むので、ターミナル表示では履歴に残る）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import GuiPane from '../motion/GuiPane.astro';
+import ChatPane from '../motion/ChatPane.astro';
+import ChatMsg from '../motion/ChatMsg.astro';
+import ChatBusy from '../motion/ChatBusy.astro';
+import Pointer from '../motion/Pointer.astro';
+import '../../styles/page-gui-mode.css';
+---
+
+<Scrolly label="ターミナル表示へ戻す流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'master', state: 'running', active: true }]} guiAt="1" height={28}>
+		<Split>
+			<GuiPane n={1} title="master" badge="ORCH" state="idle" guiAt="1" focus>
+				<Fragment slot="term">
+					<span class="tk-l tk-gm-hl" data-at="3" data-fx="mark"><span class="tk-p">my-app ❯</span> tako master</span>
+					<span class="tk-l tk-tui-user">ログイン画面を作り直して</span>
+					<span class="tk-l tk-tui-msg">担当を 1 体立てて進めます。</span>
+					<span class="tk-l tk-tui-msg is-tool">tako_orchestrator_spawn</span>
+					<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+				</Fragment>
+				<ChatPane focus compact ctx={[{ left: 70 }]}>
+					<ChatMsg role="user">ログイン画面を作り直して</ChatMsg>
+					<ChatMsg role="ai">
+						<span>担当を 1 体立てて進めます。</span>
+						<span class="tk-tool"><b>tako_orchestrator_spawn</b></span>
+					</ChatMsg>
+				</ChatPane>
+			</GuiPane>
+			<GuiPane n={2} title="worker" badge="WORKER" state="running" guiAt="1">
+				<Fragment slot="term">
+					<span class="tk-l tk-tui-msg is-tool">Edit src/login.tsx</span>
+					<span class="tk-l tk-tui-msg">入力欄とボタンを並べ直しています。</span>
+					<span class="tk-l tk-tui-msg is-tool" data-at="3" style="--d: .4s">Bash npm test</span>
+					<span class="tk-l tk-dim">✻ Pondering… (1m 12s)</span>
+				</Fragment>
+				<ChatPane compact worker status={[{ kind: 'busy' }]} ctx={[{ left: 81 }]}>
+					<ChatMsg role="ai">
+						<span>入力欄とボタンを並べ直しています。</span>
+						<span class="tk-tool"><b>Edit</b> src/login.tsx</span>
+					</ChatMsg>
+					<ChatBusy label="Pondering… (1m 12s)" />
+				</ChatPane>
+			</GuiPane>
+		</Split>
+		<Pointer slot="overlay" path="1:95.3,5.3" click="2" />
+	</TakoWindow>
+
+	<Step title="担当の AI も、同じチャットで">
+		<p>司令塔の AI が立てた担当の AI（worker）のペインも、Claude ならチャットになります。進み具合をそのまま読めて、必要なら入力欄から直接頼むこともできます（ふだんは司令塔が指示します）。</p>
+	</Step>
+	<Step title="もう一度押すと、ターミナル表示へ">
+		<p>同じボタンを押すと、ターミナル表示に戻ります。チャットで話していた会話は、Claude の画面にそのまま並んでいます。</p>
+	</Step>
+	<Step title="裏では、ずっと動いていた">
+		<p>変えていたのは見せ方だけなので、担当の AI もコマンドも止まっていません。スターターのボタンが打った <code>tako master</code> も、ターミナルの履歴に残っています。</p>
+	</Step>
+</Scrolly>
