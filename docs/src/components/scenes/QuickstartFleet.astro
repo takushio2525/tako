@@ -1,0 +1,165 @@
+---
+/**
+ * 場面: 右パネルの fleet で全タブを見渡す（開く → 色で分かる → 畳んだ枠を開く → 行を押してそのペインへ →
+ * 落ちたテストを AI に任せる）。5 手順。
+ * 事実の出どころ: 台帳 3 節 / .agent/requirements.md FR-2.16.6（タブ名ラベル付きの枠に全ペイン）・
+ * FR-2.16.14（畳んだタブは非アクティブなら行を隠し、アクティブなら残す）/ crates/tako-app/src/right_panel.rs
+ * の render_tmux_view（サマリ・WORKSPACE・ミニマップ・行のクリックでそのペインへ）/ status_bar.rs
+ * （ステータスバーの「tmux」= fleet の入口）。AI がほかのペインを読む・打つのは MCP の tako_read_pane /
+ * tako_send_input。Windows: tako_panel・tako_read_pane・tako_send_input は対応（docs windows-support）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import RightPanel from '../motion/RightPanel.astro';
+import Fleet from '../motion/Fleet.astro';
+import FleetTab from '../motion/FleetTab.astro';
+import FleetRow from '../motion/FleetRow.astro';
+import Pointer from '../motion/Pointer.astro';
+import '../../styles/quickstart.css';
+
+const half = (n: number, y: number) => ({ x: 0, y, w: 100, h: 50, n });
+---
+
+<Scrolly label="fleet で全タブを見渡す流れ" flip>
+	<TakoWindow
+		slot="stage"
+		tabs={[
+			{ label: 'my-app', state: 'running', activeAt: '1-3' },
+			{
+				label: 'api',
+				activeAt: '4+',
+				states: [
+					{ at: '!5', state: 'fail' },
+					{ at: '5', state: 'idle' },
+				],
+			},
+			{ label: 'docs', state: 'idle' },
+		]}
+		height={27}
+		panelAt="1+"
+		class="tk-qs-fleet"
+	>
+		<div class="tk-stack tk-fill" style="flex: 1">
+			<div data-at="1-3" data-fx="fade" class="tk-split is-col">
+				<Pane n={1} title="claude" state="running" focus>
+					<span class="tk-l tk-tui-user">ログイン画面を作って</span>
+					<span class="tk-l tk-tui-msg is-tool">src/login.tsx を作成</span>
+					<span class="tk-l tk-tui-msg">フォームを実装しています…</span>
+				</Pane>
+				<Pane n={2} title="npm run dev" state="running">
+					<span class="tk-l"><span class="tk-ok tk-b">VITE</span> ready</span>
+					<span class="tk-l tk-dim">hmr update /src/login.tsx</span>
+				</Pane>
+			</div>
+			<div data-at="4+" data-fx="fade" class="tk-split is-col">
+				<Pane n={1} title="claude" state="idle" focus="5">
+					<div class="tk-qs-log">
+						<span class="tk-l tk-tui-msg">tests/test_users.py を更新しました</span>
+						<span class="tk-l tk-tui-user" data-at="5">隣のテストが落ちた理由を見て、直して</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: .4s">tako_read_pane → ペイン 2</span>
+						<span class="tk-l tk-tui-msg" data-at="5" style="--d: .8s">期待値を 201 に直しました</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="5" style="--d: 1.2s">tako_send_input → pytest</span>
+						<span class="tk-l tk-tui-msg" data-at="5" style="--d: 2.1s">5 件とも通りました</span>
+					</div>
+				</Pane>
+				<Pane
+					n={2}
+					title="pytest"
+					state={[
+						{ at: '4', state: 'fail', text: 'failed' },
+						{ at: '5', state: 'idle' },
+					]}
+					focus="4"
+				>
+					<div class="tk-qs-log">
+						<span class="tk-l"><span class="tk-p">api ❯</span> pytest</span>
+						<span class="tk-l">tests/test_users.py <span class="tk-ok">...</span><span class="tk-err">F</span><span class="tk-ok">.</span></span>
+						<span class="tk-l tk-err">FAILED test_create - assert 201 == 200</span>
+						<span class="tk-l"><span class="tk-err">1 failed</span>, <span class="tk-ok">4 passed</span> in 0.42s</span>
+						<span class="tk-l" data-at="5" style="--d: 1.4s"><span class="tk-p">api ❯</span> pytest</span>
+						<span class="tk-l" data-at="5" style="--d: 1.7s">tests/test_users.py <span class="tk-ok">.....</span></span>
+						<span class="tk-l tk-ok" data-at="5" style="--d: 1.9s">5 passed in 0.39s</span>
+					</div>
+				</Pane>
+			</div>
+		</div>
+		<div slot="right" class="tk-qs-drawer" data-at="1+" style="--d: .6s">
+			<RightPanel active="fleet">
+				<Fleet
+					summary={[
+						{ at: '!5', running: 2, failed: 1, idle: 2 },
+						{ at: '5', running: 2, failed: 0, idle: 3 },
+					]}
+				>
+					<FleetTab
+						title="my-app"
+						count={2}
+						state="running"
+						collapsed
+						open="1-3"
+						active="1-3"
+						chips={['running', 'running']}
+						chipsAt="4+"
+						map={[{ ...half(1, 0), focus: true }, half(2, 50)]}
+					>
+						<FleetRow n={1} label="claude" state="running" focus />
+						<FleetRow n={2} label="npm run dev" state="running" />
+					</FleetTab>
+					<FleetTab
+						title="api"
+						count={2}
+						state={[
+							{ at: '!5', state: 'fail' },
+							{ at: '5', state: 'idle' },
+						]}
+						collapsed="1-2"
+						open="3+"
+						active="4+"
+						chips={['idle', 'fail']}
+						chipsAt="1-2"
+						fail={1}
+						markAt="2-3"
+						map={[
+							{ ...half(1, 0), focus: '3 5' },
+							{ ...half(2, 50), focus: '4', fail: '!5' },
+						]}
+					>
+						<FleetRow n={1} label="claude" state="idle" focus="3 5" />
+						<FleetRow
+							n={2}
+							label="pytest"
+							state={[
+								{ at: '!5', state: 'fail' },
+								{ at: '5', state: 'idle' },
+							]}
+							focus="4"
+							markAt="4"
+						/>
+					</FleetTab>
+					<FleetTab title="docs" count={1} state="idle" collapsed open={false} chips={['idle']} />
+				</Fleet>
+			</RightPanel>
+		</div>
+		<Pointer slot="overlay" path="1:79,96 3:64,50 4:64,88 5:30,40" click="1 3 4 5" />
+	</TakoWindow>
+
+	<Step title="右パネルの fleet を開く">
+		<p>ステータスバーの「tmux」を押すと、右に <strong>fleet</strong> が開きます。いま開いているタブだけでなく、<strong>全部のタブのペイン</strong>がここに並びます。</p>
+	</Step>
+	<Step title="どこが止まっているか、色で分かる">
+		<p>タブごとに枠があり、上に「実行中・失敗・待機」の数。畳んだ枠でも、ペインごとの状態が小さな色の帯で見え、失敗があれば「1 fail」と赤で出ます。</p>
+	</Step>
+	<Step title="枠を開くと、中のペインが見える">
+		<p>枠の見出しを押すと開きます。小さな配置図と、ペインの一覧（番号・名前・状態）が出ます。</p>
+	</Step>
+	<Step title="行を押すと、そのペインへ飛ぶ">
+		<p>失敗している行を押すと、そのタブに切り替わり、そのペインにフォーカスが移ります。どのタブに隠れていても、ここから 1 回で着きます。</p>
+	</Step>
+	<Step title="あとは AI に任せる">
+		<p>隣の AI に「テストが落ちた理由を見て、直して」と頼むだけです。AI は tako のツールで<strong>隣のペインの出力を読み</strong>、直してからテストを打ち直します。fleet の赤も、緑に変わります。</p>
+		<p class="tk-step-note">Windows でも、fleet・ペインの読み取り・入力の送信は同じように使えます。</p>
+	</Step>
+</Scrolly>

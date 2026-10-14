@@ -1,0 +1,67 @@
+---
+/**
+ * 場面: AI に「隣で dev サーバー」と頼む → 同じタブに分割 → ポート検知のチップ → 押したときだけ開く。4 手順。
+ * 事実の出どころ: 台帳 3 節 / .agent/requirements.md FR-2.1.2（AI が分割したペインは呼び出し元と同じタブに
+ * 生える）・FR-2.4.3（チップは承諾したときだけ開く。強制分割しない）と同節の実装メモ（承諾 = 検知元ペインの
+ * 右に Web ビューのペイン）/ crates/tako-app/src/ui_text/ports.rs（チップの文言）。
+ * Windows: ポート検知（tako_port_detect）は対応・Web ビュー（tako_web）は未対応（docs windows-support）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import PortChip from '../motion/PortChip.astro';
+import Pointer from '../motion/Pointer.astro';
+import '../../styles/quickstart.css';
+---
+
+<Scrolly label="AI に dev サーバーを頼む流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25}>
+		<Split>
+			<Pane n={1} title="claude" state="running" focus="1-3">
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> claude</span>
+				<span class="tk-l tk-tui-user">隣のペインで dev サーバーを起動して</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="2+">tako_split_pane → npm run dev</span>
+				<span class="tk-l tk-tui-msg" data-at="2+" style="--d: .9s">右で npm run dev を起動しました</span>
+				<span class="tk-l tk-tui-msg" data-at="3+" style="--d: .5s">localhost:5173 で動いています</span>
+			</Pane>
+			<Pane n={2} title="npm run dev" state="running" at="2+" fx="split" style="--d: .3s" body="flush">
+				<div class="tk-pane-term tk-fill">
+					<span class="tk-l"><span class="tk-p">my-app ❯</span> npm run dev</span>
+					<span class="tk-l tk-dim" data-at="2+" style="--d: .7s">&gt; vite</span>
+					<span class="tk-l" data-at="3+"><span class="tk-ok tk-b">VITE</span> ready in 312 ms</span>
+					<span class="tk-l" data-at="3+" style="--d: .15s"><span class="tk-ok">➜</span>  Local:   <span class="tk-acc">http://localhost:5173/</span></span>
+					<PortChip port={5173} process="node" at="3+" pressAt="4" />
+				</div>
+			</Pane>
+			<Pane n={3} title="localhost:5173" state="none" at="4" fx="split" style="--d: .8s" focus="4" body="flush">
+				<div class="tk-qs-web">
+					<span class="tk-qs-web-bar">http://localhost:5173/</span>
+					<span class="tk-qs-web-page">
+						<span class="tk-qs-web-h">my-app</span>
+						<span class="tk-qs-web-line"></span>
+						<span class="tk-qs-web-line is-short"></span>
+						<span class="tk-qs-web-btn">ログイン</span>
+					</span>
+				</div>
+			</Pane>
+		</Split>
+		<Pointer slot="overlay" path="4:46,85" click="4" />
+	</TakoWindow>
+
+	<Step title="AI に日本語で頼む">
+		<p>tako の中で claude や codex を起動して、「隣のペインで dev サーバーを起動して」と頼みます。MCP の設定ファイルを書く必要はありません（<code>tako setup</code> が登録済みで、tako の中なら自動でつながります）。</p>
+	</Step>
+	<Step title="同じタブの隣に並ぶ">
+		<p>AI は tako のツールで画面を分割し、<strong>頼まれたタブの中</strong>にペインを足して <code>npm run dev</code> を走らせます。別のウインドウや別のタブに散らばらないので、このタブを見れば作業が全部見えます。</p>
+		<p class="tk-step-note">ペインが増えるのは、AI に頼んだときか、次のチップに同意したときだけです。</p>
+	</Step>
+	<Step title="ポートを見つけると、チップが出る">
+		<p>dev サーバーがポートで待ち受けを始めると、そのペインの下に「<strong>localhost:5173（node）が listen 中</strong>」のチップが出ます。</p>
+	</Step>
+	<Step title="押したときだけ開く">
+		<p>「ブラウザで開く」を押すと、隣に Web ビューのペインが開いて、その場で画面を確かめられます。押さなければ何も開きません（× で閉じると、そのポートが閉じるまでは勧めません）。</p>
+		<p class="tk-step-note">Windows でも、AI による分割とポートの検知は同じように動きます。チップから開く Web ビューのペインは、Windows ではまだ使えません（未対応）。</p>
+	</Step>
+</Scrolly>

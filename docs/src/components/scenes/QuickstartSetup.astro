@@ -1,0 +1,108 @@
+---
+/**
+ * 場面: 初回のセットアップ（バナー →「setup」タブ → [OK] が積まれる →「残り N 件」→ 再実行で素通り）。4 手順。
+ * 事実の出どころ: 台帳 1 節 / crates/tako-app/src/main.rs の run_setup_command（バナーを閉じて新しいタブ
+ * 「setup」で tako setup を打つ）/ crates/tako-cli/src/setup.rs の出力（run_setup・run_dependency_check・
+ * configure_agent_mcp・print_setup_summary の後の 1 行）/ crates/tako-control/src/setup_remaining.rs の render
+ * （残りの一覧の文面）/ setup_bootstrap.rs の tako CLI の段 / shell_integration.rs の result_lines。
+ * 出力は実物の行の一部を抜き出したもの（段の順は実物どおり）。パスは架空。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import WelcomeBanner from '../motion/WelcomeBanner.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import Cmd from '../motion/Cmd.astro';
+import '../../styles/quickstart.css';
+---
+
+<Scrolly label="初回のセットアップの流れ">
+	<TakoWindow
+		slot="stage"
+		tabs={[
+			{ label: '~', activeAt: '1' },
+			{
+				label: 'setup',
+				at: '2+',
+				activeAt: '2+',
+				states: [
+					{ at: '2 4', state: 'running' },
+					{ at: '3', state: 'idle' },
+				],
+			},
+		]}
+		height={26}
+		cwd="~"
+		class="tk-qs-setup"
+	>
+		<div slot="banner" data-at="1" data-fx="unfold">
+			<div><WelcomeBanner pressAt="1" /></div>
+		</div>
+		<div class="tk-stack tk-fill" style="flex: 1">
+			<div data-at="1" data-fx="fade" class="tk-split">
+				<Pane n={1} title="~" state="idle" focus>
+					<span class="tk-l"><span class="tk-p">~ ❯</span> <span class="tk-cur"></span></span>
+				</Pane>
+			</div>
+			<div data-at="2+" data-fx="fade" class="tk-split">
+				<Pane
+					n={1}
+					title="setup"
+					state={[
+						{ at: '!3', state: 'running' },
+						{ at: '3', state: 'idle' },
+					]}
+					focus
+				>
+					<div class="tk-qs-log">
+						<span class="tk-l"><span class="tk-p">~ ❯</span> tako setup</span>
+						<span class="tk-l tk-b">tako セットアップ</span>
+						<span class="tk-l tk-dim">═════════════════</span>
+						<span class="tk-l" data-at="2+" style="--d: .25s">  <span class="tk-ok">[OK]</span> tako CLI: どのターミナルからも使えます（/opt/homebrew/bin）</span>
+						<span class="tk-l" data-at="2+" style="--d: .5s">  <span class="tk-ok">[OK]</span> シェル統合: 環境変数の注入で有効です（zsh / bash / fish。設定ファイルは書き換えません）</span>
+						<span class="tk-l" data-at="2+" style="--d: .75s">  エージェント CLI:</span>
+						<span class="tk-l" data-at="2+" style="--d: .9s">    <span class="tk-acc">[検出]</span> claude: ~/.local/bin/claude（未認証 / プラン不明）</span>
+						<span class="tk-l" data-at="2+" style="--d: 1.15s">  <span class="tk-ok">[OK]</span> tmux: /opt/homebrew/bin/tmux</span>
+						<span class="tk-l" data-at="2+" style="--d: 1.35s">  <span class="tk-ok">[OK]</span> git: /usr/bin/git</span>
+						<span class="tk-l" data-at="3+">  <span class="tk-warn">[残り]</span> claude は未認証です（この後の設定は先に進めます）</span>
+						<span class="tk-l" data-at="3+" style="--d: .25s">  <span class="tk-acc">[設定]</span> Claude MCP を自動登録します</span>
+						<span class="tk-l" data-at="3+" style="--d: .5s">セットアップはここまで完了しました（人の操作が残り 1 件）。</span>
+						<span class="tk-l tk-qs-hl tk-b" data-at="3+" style="--d: .8s">残り 1 件（ここから先は人の操作が必要です）:</span>
+						<span class="tk-l tk-qs-hl" data-at="3+" style="--d: .95s">  1. Claude アカウントへのログイン</span>
+						<span class="tk-l tk-qs-hl" data-at="3+" style="--d: 1.1s">     <span class="tk-acc">claude auth login</span></span>
+						<span class="tk-l tk-dim" data-at="3+" style="--d: 1.3s">済んだら tako setup をもう一度実行してください（残りはここから再開します）</span>
+						<span class="tk-l" data-at="3"><span class="tk-p">~ ❯</span> <span class="tk-cur"></span></span>
+						<span class="tk-l" data-at="4+"><span class="tk-p">~ ❯</span> tako setup</span>
+						<span class="tk-l tk-b" data-at="4+" style="--d: .2s">tako セットアップ</span>
+						<span class="tk-l tk-dim" data-at="4+" style="--d: .2s">═════════════════</span>
+						<span class="tk-l" data-at="4+" style="--d: .4s">  <span class="tk-ok">[OK]</span> tako CLI: どのターミナルからも使えます（/opt/homebrew/bin）</span>
+						<span class="tk-l" data-at="4+" style="--d: .55s">  <span class="tk-ok">[OK]</span> シェル統合: 環境変数の注入で有効です（zsh / bash / fish。設定ファイルは書き換えません）</span>
+						<span class="tk-l" data-at="4+" style="--d: .7s">    <span class="tk-acc">[検出]</span> claude: ~/.local/bin/claude（認証済み / pro）</span>
+						<span class="tk-l" data-at="4+" style="--d: .85s">  <span class="tk-ok">[OK]</span> tmux: /opt/homebrew/bin/tmux</span>
+						<span class="tk-l" data-at="4+" style="--d: 1s">  <span class="tk-ok">[OK]</span> Claude MCP: tako が登録済み</span>
+						<span class="tk-l tk-ok tk-b" data-at="4+" style="--d: 1.25s">セットアップが完了しました。</span>
+						<span class="tk-l" data-at="4+" style="--d: 1.5s">対話アシスタントを起動します。設定の変更・解説・次の一歩の相談ができます。</span>
+					</div>
+				</Pane>
+			</div>
+		</div>
+		<span slot="overlay" data-at="1" data-fx="fade"><Pointer path="1:83,28" click="1" /></span>
+	</TakoWindow>
+
+	<Step title="バナーの「セットアップを実行」を押す">
+		<p>はじめて開くと、タブバーの下に「tako へようこそ」が出ます。<strong>「セットアップを実行」</strong>を押すだけです。ターミナルで打つなら 1 行です。</p>
+		<Cmd>tako setup</Cmd>
+	</Step>
+	<Step title="新しいタブで、[OK] が積まれていく">
+		<p>「setup」というタブが開き、tako 自身がセットアップを進めます。<code>tako</code> コマンドの置き場所、AI エージェント（claude / codex / agy）の検出、tmux などの確認まで、揃っているものは <code>[OK]</code> で流れていきます。揃っていれば質問は出ません。</p>
+	</Step>
+	<Step title="人にしかできないことだけ「残り」に">
+		<p>途中で止まりません。ログインのように人の操作が要るものは脇に置いて、AI 連携の登録（MCP）まで先に済ませ、最後に<strong>「残り N 件」と、次に打つ 1 行</strong>を並べます。</p>
+		<p class="tk-step-note">tmux などが足りないときだけ、何をどのコマンドで入れるかを見せて <code>[y/N]</code> を 1 回聞きます。</p>
+	</Step>
+	<Step title="済ませたら、もう一度打つだけ">
+		<p>ログインしたら、もう一度 <code>tako setup</code>。済んだところは <code>[OK]</code> で素通りして、残りから再開します。何度打っても壊れません。変えるものが無ければ「変更なし」で終わります。</p>
+		<p class="tk-step-note">Windows でも同じバナー・同じ流れです。おもに違うのは、シェル統合のために PowerShell の <code>$PROFILE</code> へ管理ブロックを 1 つ書き足すこと（書く前に表示し、<code>tako shell-integration uninstall</code> で戻せます）と、psmux などの導入は winget のコマンドを案内するだけで代行しないことです。</p>
+	</Step>
+</Scrolly>

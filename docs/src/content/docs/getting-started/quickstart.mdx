@@ -1,0 +1,77 @@
+---
+title: クイックスタート
+seoTitle: クイックスタート — セットアップから AI に画面を任せるまで（macOS・Windows）
+description: tako を入れたあとの 10 分。tako setup で AI 連携を整え、タブとペインの基本を覚え、AI に隣のペインで dev サーバーを起こさせ、右パネルで全部のタブを見渡すまでを、動く画面で見せます
+---
+
+import QuickstartRoute from '../../../components/scenes/QuickstartRoute.astro';
+import QuickstartSetup from '../../../components/scenes/QuickstartSetup.astro';
+import QuickstartPanes from '../../../components/scenes/QuickstartPanes.astro';
+import QuickstartDevServer from '../../../components/scenes/QuickstartDevServer.astro';
+import QuickstartFleet from '../../../components/scenes/QuickstartFleet.astro';
+import KeyTable from '../../../components/motion/KeyTable.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+
+入れたあとの 10 分で、**AI に画面を任せる**ところまで進みます。スクロールすると、画面がその手順の状態に変わります。macOS でも Windows でも同じ流れです（違うところは各場面の終わりに書いています）。
+
+まだ入れていなければ、先に[インストール](/getting-started/)を済ませてください。
+
+<QuickstartRoute />
+
+<div id="setup" class="tako-anchor"></div>
+
+## セットアップは、ボタン 1 つ
+
+<QuickstartSetup />
+
+何がどこに設定されるかの一覧は[インストールとセットアップ](/getting-started/#3-tako-setup--質問ゼロの自動セットアップ)にあります。好みがあれば、AI に「codex を使ってセットアップして」のように日本語で頼むこともできます。
+
+<div id="panes" class="tako-anchor"></div>
+
+## 1 タブ = 1 つの作業
+
+<QuickstartPanes />
+
+よく使うキーはこれだけです。全部は[キーボードショートカット](/guides/keyboard-shortcuts/)にあります。
+
+<KeyTable
+	rows={[
+		{ label: '右に分割', mac: '⌘ D', win: 'Ctrl Shift D' },
+		{ label: '下に分割', mac: '⌘ ⇧ D', win: 'Ctrl Shift E' },
+		{ label: 'ペインを閉じる', mac: '⌘ W', win: 'Ctrl Shift W' },
+		{ label: 'ペインを移る', mac: '⌘ ⌥ ←↑↓→', win: 'Alt ←↑↓→' },
+		{ label: '大きさを変える', mac: '⌃ ⌘ ←↑↓→', win: 'Alt Shift ←↑↓→' },
+		{ label: '新しいタブ', mac: '⌘ T', win: 'Ctrl Shift T' },
+		{ label: 'タブを切り替える', mac: '⌘ 1〜9', win: 'Ctrl 1〜9' },
+		{ label: 'コマンドパレット', mac: '⌘ K', win: 'Ctrl Shift P' },
+		{ label: '新しいウインドウ', mac: '⌘ ⇧ N', win: 'Ctrl Shift N' },
+	]}
+/>
+
+<div id="ask-ai" class="tako-anchor"></div>
+
+## AI に頼むと、隣に並ぶ
+
+<QuickstartDevServer />
+
+<div id="fleet" class="tako-anchor"></div>
+
+## 全部のタブを見渡して、任せる
+
+<QuickstartFleet />
+
+## 次は、AI チームに任せる
+
+ここまでできたら、司令塔の AI（master）を起動してみてください。やってほしいことを日本語で 1 回伝えると、master が担当の AI（worker）を同じタブに並べ、確かめてから報告します。
+
+<Cmd>tako master</Cmd>
+
+流れは[オーケストレーションとは](/features/orchestration/)、話しかけ方の実例は[tako master 実践ガイド](/features/orchestrator/)で見られます。
+
+## 次に読む
+
+- [タブ＆ペイン管理](/features/tabs-and-panes/) — 並べ替え・複数ウインドウ・AI からの操作
+- [ポート検知](/features/port-detection/) — チップの出し方と止め方
+- [Windows 対応状況](/windows-support/) — Windows で使える機能と、まだのもの
+- [スマホからのリモート接続](/features/remote/) — 同じ画面に外出先から続きを頼む
+- [インストールとセットアップ](/getting-started/) — `tako setup` で設定される項目の一覧

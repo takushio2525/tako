@@ -1,0 +1,69 @@
+---
+/**
+ * キーの組み合わせを macOS と Windows で並べて書く（#2056）。手順の本文・ページ本文に置く。
+ *
+ *   <Keys mac="⌘ D" win="Ctrl Shift D" />
+ *
+ * 窓の上に浮かべる版は KeyHint.astro。キーの正本は crates/tako-app/src/keybindings.rs。
+ */
+interface Props {
+	/** macOS のキー（空白区切り） */
+	mac: string;
+	/** Windows のキー（空白区切り） */
+	win: string;
+}
+
+const { mac, win } = Astro.props;
+const keys = (s: string) => s.trim().split(/\s+/);
+---
+
+<span class="tk-keys">
+	<span class="tk-keys-row">
+		<span class="tk-keys-os">macOS</span>
+		{keys(mac).map((k) => <kbd>{k}</kbd>)}
+	</span>
+	<span class="tk-keys-row">
+		<span class="tk-keys-os">Windows</span>
+		{keys(win).map((k, i) => (i > 0 ? [<span class="tk-keys-plus">+</span>, <kbd>{k}</kbd>] : <kbd>{k}</kbd>))}
+	</span>
+</span>
+
+<style is:global>
+	.tk-keys {
+		display: inline-flex;
+		flex-wrap: wrap;
+		gap: 0.3em 1em;
+		vertical-align: middle;
+	}
+	.tk-keys-row {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.2em;
+		white-space: nowrap;
+	}
+	.tk-keys-os {
+		margin-right: 0.25em;
+		font-size: 0.78em;
+		color: var(--tako-ink-muted);
+	}
+	.tk-keys-plus {
+		font-size: 0.8em;
+		color: var(--tako-ink-subtle);
+	}
+	.tk-keys kbd {
+		display: inline-grid;
+		place-items: center;
+		min-width: 1.75em;
+		height: 1.75em;
+		padding: 0 0.42em;
+		border-radius: 6px;
+		border: 1px solid var(--tako-border-strong);
+		border-bottom-width: 2px;
+		background: var(--tako-card);
+		color: var(--tako-ink);
+		font-family: var(--sl-font-mono);
+		font-size: 0.8em;
+		font-weight: 700;
+		line-height: 1;
+	}
+</style>

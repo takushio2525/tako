@@ -1,0 +1,75 @@
+---
+/**
+ * 場面: タブとペイン（1 タブ = 1 つの作業 → 右に分割 → 下に分割 → フォーカス移動 → 大きさを変える）。5 手順。
+ * キーは macOS と Windows を併記する（正本: crates/tako-app/src/keybindings.rs の base_bindings /
+ * non_macos_bindings。Windows は ⌘ → Ctrl の置き換えではない）。分割すると新しいペインにフォーカスが移る
+ * （crates/tako-core/src/pane_tree.rs の split_with_ratio）。タブの点の色は tab_shape.rs（実行中 = 青 /
+ * 待機 = 緑 / 失敗 = 赤）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import KeyHint from '../motion/KeyHint.astro';
+import Keys from '../motion/Keys.astro';
+import '../../styles/quickstart.css';
+---
+
+<Scrolly label="タブとペインの基本操作" flip>
+	<TakoWindow
+		slot="stage"
+		tabs={[
+			{ label: 'my-app', state: 'running', active: true },
+			{ label: 'api', state: 'fail' },
+			{ label: 'docs', state: 'idle' },
+		]}
+		height={25}
+	>
+		<Split>
+			<Pane n={1} title="my-app" state="running" focus="1 4+" class="tk-qs-widen">
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> npm test -- --watch</span>
+				<span class="tk-l tk-ok">✓ src/login.test.ts (4)</span>
+				<span class="tk-l tk-ok">✓ src/api.test.ts (6)</span>
+				<span class="tk-l tk-dim">Waiting for file changes...</span>
+			</Pane>
+			<Split dir="col" at="2+" fx="split">
+				<Pane n={2} title="my-app" state="idle" focus="2">
+					<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur" data-at="2" data-fx="fade"></span></span>
+				</Pane>
+				<Pane n={3} title="my-app" state="idle" focus="3" at="3+" fx="split">
+					<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur" data-at="3" data-fx="fade"></span></span>
+				</Pane>
+			</Split>
+		</Split>
+		<KeyHint slot="overlay" at="1" label="新しいタブ" mac="⌘ T" win="Ctrl Shift T" />
+		<KeyHint slot="overlay" at="2" label="右に分割" mac="⌘ D" win="Ctrl Shift D" />
+		<KeyHint slot="overlay" at="3" label="下に分割" mac="⌘ ⇧ D" win="Ctrl Shift E" />
+		<KeyHint slot="overlay" at="4" label="左のペインへ" mac="⌘ ⌥ ←" win="Alt ←" />
+		<KeyHint slot="overlay" at="5" label="右へ広げる" mac="⌃ ⌘ →" win="Alt Shift →" />
+	</TakoWindow>
+
+	<Step title="タブは、作業のまとまり">
+		<p>タブは「1 つの作業のまとまり」です。プロジェクトや作業ごとに 1 タブ。タブの点の色で、中で何が起きているかが分かります（<strong>青 = 実行中</strong>、<strong>緑 = 待機</strong>、<strong>赤 = 失敗</strong>）。</p>
+		<p><Keys mac="⌘ T" win="Ctrl Shift T" /></p>
+		<p class="tk-step-note">タブの切り替えは <Keys mac="⌘ 1〜9" win="Ctrl 1〜9" /></p>
+	</Step>
+	<Step title="右に分割">
+		<p>タブの中をペインに分けて、エージェント・dev サーバー・ログを並べます。新しいペインは同じフォルダで開き、そのままフォーカスが移ります。</p>
+		<p><Keys mac="⌘ D" win="Ctrl Shift D" /></p>
+	</Step>
+	<Step title="下に分割">
+		<p>分割は入れ子にできます。右に分けたペインを、さらに上下に分けます。</p>
+		<p><Keys mac="⌘ ⇧ D" win="Ctrl Shift E" /></p>
+		<p class="tk-step-note">Windows で Ctrl+D を使わないのは、端末の「入力の終わり（EOF）」として AI エージェントや REPL へ渡すためです。</p>
+	</Step>
+	<Step title="ペインを移る">
+		<p>矢印の向きにあるペインへフォーカスを移します。クリックしても移れます。</p>
+		<p><Keys mac="⌘ ⌥ ←" win="Alt ←" /></p>
+	</Step>
+	<Step title="大きさを変える">
+		<p>フォーカス中のペインを広げたり狭めたりします。ペインの境目をドラッグしても変えられます。</p>
+		<p><Keys mac="⌃ ⌘ →" win="Alt Shift →" /></p>
+		<p class="tk-step-note">ペインを閉じるのは <Keys mac="⌘ W" win="Ctrl Shift W" /></p>
+	</Step>
+</Scrolly>
