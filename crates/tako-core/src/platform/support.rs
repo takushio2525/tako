@@ -526,7 +526,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: MCP `tako_check_health` が HTTP 200 で healthy=true / tmux_available=true / persist_enabled=true / version_match=true / issues=[] を返す",
+            "#937 の Windows 11 実測: MCP `tako_check_health` が HTTP 200 で healthy=true / tmux_available=true / persist_enabled=true / version_match=true / issues=[] を返す。#2092 の `encoding_pin` 節（ペインの文字コード固定）は Windows CI の実 ConPTY で、注入で諦めさせたペインを `gave_up`・いまのコードページ 437 で名指しし、issues に `check=encoding_pin` を出す（issue2092_encoding_pin_health）",
         ),
     },
     Feature {

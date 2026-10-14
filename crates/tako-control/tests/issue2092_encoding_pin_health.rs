@@ -113,6 +113,10 @@ fn 固定を諦めたペインはpersist_logと診断から分かる() {
 
     #[cfg(windows)]
     windows::諦めたペインが2経路で名指しされる(&dir);
+
+    // 一時 data dir を残さない（`tako test-residue` の掃除に頼らない）
+    std::env::remove_var("TAKO_DATA_DIR");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(windows)]
