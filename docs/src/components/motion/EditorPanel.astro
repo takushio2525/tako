@@ -23,7 +23,8 @@ interface Props {
 
 const { active, at, width = '42%' } = Astro.props;
 // 引き出しの幅は器と中身で同じ基準にしたいので、窓に対する % を窓の cqi に読み替える
-const dw = width.endsWith('%') ? `${parseFloat(width)}cqi` : width;
+// （窓の本体 = 部品の根の幅から左右の枠線 1px ずつを引いた幅。% のときと 1px もずれないように）
+const dw = width.endsWith('%') ? `calc((100cqi - 2px) * ${parseFloat(width) / 100})` : width;
 const base: { id: string; icon: 'fleet' | 'orch' | 'branch' | 'tasks' }[] = [
 	{ id: 'fleet', icon: 'fleet' },
 	{ id: 'orch', icon: 'orch' },
