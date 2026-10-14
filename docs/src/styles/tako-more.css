@@ -243,7 +243,7 @@
 .tkm-band .is-warn {
   color: var(--ui-yellow);
 }
-/* 実物も幅に収まらなければ優先度の低いもの（タブ → worker）から落とす */
+/* 実物も幅に収まらなければ優先度の低いもの（タブ名）から落とす */
 @container tkframe (max-width: 30rem) {
   .tkm-band .is-drop {
     display: none;
