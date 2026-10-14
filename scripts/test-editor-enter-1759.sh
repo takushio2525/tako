@@ -90,7 +90,7 @@ run_visual() {
   local log="$1" dump="$2"
   shift 2
   launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=enter-1759 \
-    TAKO_VISUAL_DUMP_DIR="$dump" "$@" || return $?
+    TAKO_VISUAL_DUMP_DIR="$dump" "$@" || exit $?
   local pid="$ISOLATED_GUI_PID"
   for _ in $(seq 1 1800); do
     kill -0 "$pid" 2>/dev/null || break
