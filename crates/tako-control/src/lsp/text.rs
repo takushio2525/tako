@@ -638,3 +638,109 @@ pub const XREF_STALE_REASON: Note = Note::new(
     "答えを待っているあいだに結果が置き換わったか、問い合わせたペインが閉じられた",
     "The result was replaced, or the pane that asked was closed, while waiting for the answer",
 );
+
+// --- リネーム（#1686）-----------------------------------------------------------
+// 起動・未導入・未応答・落ちた等は定義ジャンプと同じ文（言語サーバの状態として同じもの）。
+// 既定は dry-run（#496 の git 操作と同じ作法 = 当てるのは --yes / MCP の confirm=true のときだけ）
+
+/// サーバが名前の変更に対応していない。`{server}`
+pub const RENAME_UNSUPPORTED_REASON: Note = Note::new(
+    "{server} は名前の変更に対応していない",
+    "{server} does not support renaming",
+);
+
+/// 新しい名前が空
+pub const RENAME_EMPTY_NAME: Note = Note::new(
+    "新しい名前（new_name）が空",
+    "The new name (new_name) is empty",
+);
+
+/// 新しい名前に改行・タブなどの制御文字がある
+pub const RENAME_CONTROL_NAME: Note = Note::new(
+    "新しい名前（new_name）に改行・タブなどの制御文字がある",
+    "The new name (new_name) contains a control character such as a newline or tab",
+);
+
+/// `prepareRename` が断った（`null`）。`{server}`
+pub const RENAME_REJECTED_REASON: Note = Note::new(
+    "{server} はこの位置の名前を変えられないと答えた",
+    "{server} answered that the name at this position cannot be renamed",
+);
+
+/// `prepareRename` がエラーで断った。`{server}` / `{detail}` = サーバの文
+pub const RENAME_REJECTED_DETAIL_REASON: Note = Note::new(
+    "{server} はこの位置の名前を変えられないと答えた: {detail}",
+    "{server} answered that the name at this position cannot be renamed: {detail}",
+);
+
+/// 断られたときの次の一手
+pub const RENAME_REJECTED_NEXT_STEP: Note = Note::new(
+    "変数・関数・型の名前の上で頼む（キーワード・コメント・文字列の中・標準ライブラリの名前は変えられない）",
+    "Ask on a variable, function or type name (keywords, comments, strings and standard library names cannot be renamed)",
+);
+
+/// `rename` がエラーで断った（不正な名前など）。`{server}` / `{detail}`
+pub const RENAME_REFUSED_REASON: Note = Note::new(
+    "{server} が名前の変更を断った: {detail}",
+    "{server} refused the rename: {detail}",
+);
+
+/// `rename` に断られたときの次の一手
+pub const RENAME_REFUSED_NEXT_STEP: Note = Note::new(
+    "新しい名前がその言語の識別子として正しいかを確かめて頼み直す",
+    "Check that the new name is a valid identifier in that language, then try again",
+);
+
+/// 待つあいだに本文が変わった
+pub const RENAME_STALE_REASON: Note = Note::new(
+    "名前の変更の答えを待つあいだに本文が変わったので当てなかった（古い本文への答えは位置がずれる）",
+    "The document changed while waiting for the rename, so nothing was applied",
+);
+
+/// 答えを読めない・当てられない。`{server}` / `{detail}`
+pub const RENAME_INVALID_REASON: Note = Note::new(
+    "{server} の名前の変更の答えを当てられない（{detail}）ので何も変えなかった",
+    "Could not apply the rename from {server} ({detail}), so nothing changed",
+);
+
+/// dry-run の要約。`{files}` / `{edits}`
+pub const RENAME_DRY_RUN_NOTE: Note = Note::new(
+    "{files} ファイル・{edits} 箇所を書き換えます（まだ何も書き換えていない）",
+    "This rewrites {edits} place(s) in {files} file(s) (nothing has been changed yet)",
+);
+
+/// dry-run で当てられるときの次の一手
+pub const RENAME_DRY_RUN_NEXT_STEP: Note = Note::new(
+    "当てるなら同じ指定に --yes（MCP は confirm=true）を付ける",
+    "To apply it, repeat with --yes (MCP: confirm=true)",
+);
+
+/// 段階 1 の制限: 頼んだペインのファイル以外へ及ぶ。`{files}` / `{edits}`
+pub const RENAME_OTHER_FILES_REASON: Note = Note::new(
+    "書き換えが別のファイル {files} 個（{edits} 箇所）に及ぶので当てない（段階 1 で当てるのは頼んだペインのファイルだけ）",
+    "The rename reaches {files} other file(s) ({edits} place(s)), so it is not applied (stage 1 applies only to the file in the requesting pane)",
+);
+
+/// 段階 1 の制限: ファイルの作成・名前の変更・削除を含む。`{count}`
+pub const RENAME_RESOURCE_OPS_REASON: Note = Note::new(
+    "ファイルの作成・名前の変更・削除（{count} 件）を含むので当てない（段階 1 は本文の書き換えだけ）",
+    "The rename creates, renames or deletes {count} file(s), so it is not applied (stage 1 only rewrites text)",
+);
+
+/// 段階 1 の制限で当てなかったときの次の一手
+pub const RENAME_LIMITED_NEXT_STEP: Note = Note::new(
+    "書き換える場所は応答の files に並ぶ（--yes なしで読める）。開いていないファイルへの適用は今後の段階で入る",
+    "The places are listed under files (readable without --yes). Applying to files that are not open comes in a later stage",
+);
+
+/// 当てた。`{edits}`
+pub const RENAME_DONE_NOTE: Note = Note::new(
+    "{edits} 箇所を書き換えた（undo 1 回で戻る・保存はまだ）",
+    "Rewrote {edits} place(s) (one undo reverts it; not saved yet)",
+);
+
+/// 書き換える所が無かった（サーバが空の答えを返した・同じ名前）
+pub const RENAME_UNCHANGED_NOTE: Note = Note::new(
+    "書き換える所が無かった（同じ名前か、サーバが空の答えを返した）",
+    "Nothing to rewrite (the same name, or the server returned no edits)",
+);

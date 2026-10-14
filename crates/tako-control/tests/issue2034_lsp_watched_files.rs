@@ -481,7 +481,12 @@ fn 旧腕では外で整形した後も古い位置のまま() {
         Some(value) => std::env::set_var("TAKO_2034_LEGACY", value),
         None => std::env::remove_var("TAKO_2034_LEGACY"),
     }
-    assert_eq!(declared, Value::Null, "旧腕は workspace の能力を申告しない");
+    // workspace には #1686 の名前の変更の答えの受け方（workspaceEdit）が載るので、監視の申告だけを見る
+    assert_eq!(
+        declared["didChangeWatchedFiles"],
+        Value::Null,
+        "旧腕はファイル監視の能力を申告しない: {declared}"
+    );
     assert_eq!(watch["active"], json!(false), "{watch}");
     assert_eq!(registrations, json!(0));
     assert_eq!(

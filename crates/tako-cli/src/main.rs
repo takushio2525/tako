@@ -1063,6 +1063,35 @@ enum LspCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// その位置の識別子の名前を変える（GUI の右クリックの「名前の変更…」と同じ。#1686）。
+    /// 既定は書き換えずに「N ファイル・M 箇所」と場所を出す。`--yes` で頼んだペインの編集バッファへ
+    /// 当てる（undo 1 回で戻る・保存はしない）。別のファイルに及ぶときは当てない（段階 1）。
+    /// MCP は `tako_lsp` の action=rename（`confirm` = `--yes`）
+    Rename(LspRenameArgs),
+}
+
+/// `tako lsp rename` の引数（#1686）。位置は `tako edit replace-range` と同じ
+/// （行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+#[derive(clap::Args)]
+struct LspRenameArgs {
+    /// コードプレビューのペイン ID（省略時は呼び出し元）
+    #[arg(long)]
+    pane: Option<u64>,
+    /// 行（1 始まり）
+    #[arg(long)]
+    line: usize,
+    /// 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否）
+    #[arg(long)]
+    column: usize,
+    /// 新しい名前
+    #[arg(long)]
+    new_name: String,
+    /// 書き換える（省略時は何も書き換えずに件数と場所だけ出す）
+    #[arg(long)]
+    yes: bool,
+    /// JSON のまま出す
+    #[arg(long)]
+    json: bool,
 }
 
 /// `tako lsp references` 等の引数（#1685）。位置は `tako edit replace-range` と同じ
@@ -1376,6 +1405,13 @@ impl LspCommand {
                 None,
                 None,
             ),
+            Self::Rename(args) => Request::LspRename {
+                pane: target_pane(args.pane)?,
+                line: args.line,
+                column: args.column,
+                new_name: args.new_name.clone(),
+                confirm: args.yes,
+            },
         })
     }
 
@@ -1426,6 +1462,7 @@ impl LspCommand {
             Self::Results(args) => args.json,
             Self::Expand(args) | Self::Collapse(args) => args.json,
             Self::OpenResult(args) => args.json,
+            Self::Rename(args) => args.json,
             _ => false,
         }
     }
@@ -11647,6 +11684,12 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
         }
         return;
     }
+    if !sub.json() && matches!(sub, LspCommand::Rename(_)) {
+        for line in lsp_rename_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
     if let LspCommand::FormatOnSave { .. } = sub {
         let state = if result["enabled"] == Value::Bool(true) {
             "on"
@@ -11956,6 +11999,15 @@ fn lsp_menu_command(args: &Value) -> String {
         (Some(l), Some(c), None, None) => cmd.push_str(&format!(" --line {l} --column {c}")),
         _ => {}
     }
+    // #1686: 名前の変更は今の名前が入る（書き換えて打つ）。識別子の字でなければ引用する
+    if let Some(name) = args["new_name"].as_str() {
+        let plain = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+        if plain {
+            cmd.push_str(&format!(" --new-name {name}"));
+        } else {
+            cmd.push_str(&format!(" --new-name '{}'", name.replace('\'', "'\\''")));
+        }
+    }
     cmd
 }
 
@@ -12032,6 +12084,52 @@ fn lsp_format_lines(result: &Value) -> Vec<String> {
         }
     }
     lines
+}
+
+/// `tako lsp rename` の人向けの体裁（#1686）。中身の正本は dispatch の応答。
+///
+/// 1 行目は `status`（dry-run / renamed / not-applied / rejected …）と今の名前 → 新しい名前。
+/// ファイルごとに `パス  N 箇所`（頼んだペインのファイルに `*`）と、その下に `行:桁  前 → 後`。
+/// 要約・理由・次の一手は字下げして続ける
+fn lsp_rename_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let mut out = vec![format!(
+        "{} {} -> {}",
+        text(&result["status"]),
+        result["placeholder"].as_str().unwrap_or("?"),
+        text(&result["new_name"])
+    )];
+    for file in result["files"].as_array().into_iter().flatten() {
+        let mark = if file["source"] == Value::Bool(true) {
+            "*"
+        } else {
+            " "
+        };
+        let path = file["path"]
+            .as_str()
+            .unwrap_or_else(|| file["uri"].as_str().unwrap_or(""));
+        let mut line = format!("{mark} {path}  {}", file["edits"]);
+        if let Some(panes) = file["open_in"].as_array() {
+            let panes: Vec<String> = panes.iter().map(Value::to_string).collect();
+            line.push_str(&format!("  (pane {})", panes.join(", ")));
+        }
+        out.push(line);
+        for place in file["places"].as_array().into_iter().flatten() {
+            out.push(format!(
+                "    {}:{}  {} -> {}",
+                place["line"],
+                place["column"],
+                text(&place["old"]),
+                text(&place["new"])
+            ));
+        }
+    }
+    for key in ["note", "reason", "next_step", "install_command"] {
+        if let Some(line) = result[key].as_str() {
+            out.push(format!("  {line}"));
+        }
+    }
+    out
 }
 
 /// `tako lsp definition` 等の人向けの体裁（#1680）。中身の正本は dispatch の応答。
@@ -12964,6 +13062,98 @@ mod tests {
         assert_eq!(
             lines,
             vec!["not-symbol", "  識別子ではない", "  識別子を指す"]
+        );
+    }
+
+    /// #1686: `tako lsp rename` は MCP の action=rename と同じ要求になる（`--yes` = `confirm`。省略は
+    /// dry-run）。人向けの表示はファイルごとの箇所数と場所、要約・理由・次の一手
+    #[test]
+    fn lsp_renameを操作へ写しファイルと場所を出す() {
+        let command = parse(&[
+            "tako",
+            "lsp",
+            "rename",
+            "--pane",
+            "7",
+            "--line",
+            "3",
+            "--column",
+            "4",
+            "--new-name",
+            "item",
+        ]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::LspRename {
+                pane: Some(7),
+                line: 3,
+                column: 4,
+                new_name: "item".into(),
+                confirm: false,
+            }
+        );
+        let command = parse(&[
+            "tako",
+            "lsp",
+            "rename",
+            "--pane",
+            "7",
+            "--line",
+            "3",
+            "--column",
+            "4",
+            "--new-name",
+            "item",
+            "--yes",
+        ]);
+        assert!(matches!(
+            build_request(&command).unwrap(),
+            Request::LspRename { confirm: true, .. }
+        ));
+        // 新しい名前は必須
+        assert!(Cli::try_parse_from([
+            "tako", "lsp", "rename", "--pane", "7", "--line", "3", "--column", "4"
+        ])
+        .is_err());
+        let lines = lsp_rename_lines(&serde_json::json!({
+            "status": "dry-run", "placeholder": "value", "new_name": "item",
+            "files": [
+                {"path": "/w/a.rs", "source": true, "edits": 2, "places": [
+                    {"line": 1, "column": 4, "old": "value", "new": "item"},
+                    {"line": 3, "column": 8, "old": "value", "new": "item"},
+                ]},
+                {"path": "/w/b.rs", "source": false, "edits": 1, "open_in": [9], "places": [
+                    {"line": 5, "column": 0, "old": "value", "new": "item"},
+                ]},
+            ],
+            "note": "2 ファイル・3 箇所", "reason": "別のファイル", "next_step": "files を見る",
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "dry-run value -> item",
+                "* /w/a.rs  2",
+                "    1:4  value -> item",
+                "    3:8  value -> item",
+                "  /w/b.rs  1  (pane 9)",
+                "    5:0  value -> item",
+                "  2 ファイル・3 箇所",
+                "  別のファイル",
+                "  files を見る",
+            ]
+        );
+        // メニューの項目の args（今の名前入り）は同じ操作の CLI へ写る
+        assert_eq!(
+            lsp_menu_command(&serde_json::json!({
+                "action": "rename", "pane": 7, "line": 3, "column": 4, "new_name": "value"
+            })),
+            "tako lsp rename --pane 7 --line 3 --column 4 --new-name value"
+        );
+        assert_eq!(
+            lsp_menu_command(&serde_json::json!({
+                "action": "rename", "pane": 7, "line": 3, "column": 4, "new_name": "a b"
+            })),
+            "tako lsp rename --pane 7 --line 3 --column 4 --new-name 'a b'"
         );
     }
 

@@ -22,6 +22,9 @@
 //! S8（#1685）の参照検索・呼び出し階層・型階層 = `tako lsp references` 等（問い合わせの型と応答は
 //! [`xref`]、待つのは [`LspManager::xref`] / [`LspManager::xref_expand`]。結果の保持とツリーの
 //! 展開状態は `tako_core::lsp::xref`）。
+//! S9（#1686）のリネーム = `tako lsp rename`（問い合わせの型と応答は [`rename`]、待つのは
+//! [`LspManager::rename`]。`WorkspaceEdit` の読み取りと段階 1 の当てる範囲は `tako_core::lsp::rename`。
+//! 既定は dry-run で、当てるのは頼んだペインの編集バッファだけ）。
 //! #2034 の外の変化の通知 = サーバが登録したグロブの根を OS のファイル監視で見て
 //! `workspace/didChangeWatchedFiles` を送る（登録の読み取りと照合は `tako_core::lsp::watch`、監視の実体は
 //! [`watch`]、サーバへの振り分けは [`LspManager`]。様子は `tako lsp status` の `file_watch` /
@@ -36,6 +39,7 @@ pub mod goto;
 pub mod hover;
 pub mod manager;
 pub mod menu;
+pub mod rename;
 pub mod rpc;
 pub mod server;
 pub mod text;
@@ -53,4 +57,5 @@ pub use manager::{
     LspManager, DIAGNOSTICS_EVENT_CAPACITY,
 };
 pub use menu::{MenuCapabilities, MenuRequest};
+pub use rename::{RenameAnswer, RenameError, RenameRequest};
 pub use xref::{ExpandAnswer, ExpandRequest, XrefAnswer, XrefRequest};

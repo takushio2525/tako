@@ -986,6 +986,23 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         range: Option<LineColRange>,
     },
+    /// 名前の変更（FR-3.45 / #1686。`tako lsp rename` / MCP `tako_lsp` の action=rename）。
+    /// GUI の右クリックメニューの「名前の変更…」と同じ 1 本（`prepareRename` → `rename`）。
+    ///
+    /// 位置は `tako edit replace-range` と同じ（`line` は 1 始まり・`column` は 0 始まりの
+    /// 行内 UTF-8 バイト）で、範囲外・文字の途中は丸めずに拒否する。**既定は dry-run**
+    /// （#496 の git 操作と同じ作法）: `confirm` が偽なら何も書き換えず、ファイル数・箇所数と
+    /// 場所を返す。`confirm` が真なら頼んだペインの編集バッファへ当てる（undo 1 回で戻る・保存はしない）。
+    /// 段階 1 は**頼んだペインのファイルだけ**: 別のファイルやファイルの操作に及ぶなら当てずに件数と理由を返す
+    LspRename {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        line: usize,
+        column: usize,
+        new_name: String,
+        #[serde(default)]
+        confirm: bool,
+    },
     /// 保存時整形の設定（FR-3.33 / #1683。`tako lsp format-on-save [on|off]` / MCP `tako_lsp` の
     /// action=format-on-save）。**既定 OFF**。ON でも整形するのは明示的な保存だけ（自動保存では
     /// しない）。`enabled` を省けば今の値を返す
@@ -2854,8 +2871,9 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::PreviewEdit { .. }
         | Request::PreviewApply { .. }
         | Request::PreviewEditRange { .. }
-        // 整形（#1683）は編集バッファの本文だけを変える（開くペインは無い）
+        // 整形（#1683）・名前の変更（#1686。段階 1）は編集バッファの本文だけを変える（開くペインは無い）
         | Request::LspFormat { .. }
+        | Request::LspRename { .. }
         | Request::PreviewCursor { .. }
         | Request::PreviewMove { .. }
         | Request::PreviewDelete { .. }

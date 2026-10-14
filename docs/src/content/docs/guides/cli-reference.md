@@ -543,6 +543,17 @@ tako lsp open-result --item 3                            # 3 番の行を開く�
 
 一覧と木の各行には番号（`id`）が付き、`--item` へそのまま渡せます。参照は既定で 100 行まで出し（`--limit 0` で全部）、持つのは 2,000 件までです（それより多いときは全件数を添えます）。見つからない・言語サーバが対応していない・入っていない・応答しないときは、それぞれ別の理由と次の一手を返します。MCP では `tako_lsp`（`action` = references / incoming-calls / outgoing-calls / supertypes / subtypes / results / expand / collapse / open-result / clear-results）が同じ操作です。
 
+#### 名前を変える（tako lsp rename）
+
+コードの語を右クリックしたメニューの「名前の変更…」で、変数・関数・型の名前を変えられます。タイトルの下に今の名前が入った欄が出るので、新しい名前を打って Enter で書き換えます（Esc でやめる）。言語サーバが構文を見て書き換えるので、`value` を `item` に変えても `Value::new()` や `values` は変わりません。書き換えは編集の 1 回として入るので、**undo 1 回で戻せます**（保存はしません）。
+
+```bash
+tako lsp rename --pane 3 --line 12 --column 8 --new-name item          # 書き換えずに「N ファイル・M 箇所」と場所を出す
+tako lsp rename --pane 3 --line 12 --column 8 --new-name item --yes    # そのペインのコードへ当てる（undo 1 回で戻る）
+```
+
+既定では何も書き換えず、書き換える場所の一覧だけを返します（確かめてから `--yes`）。今は**そのペインで開いているファイルの中だけ**を書き換えます。別のファイルにも及ぶ名前（ほかのファイルから使われている関数など）は、`--yes` を付けても書き換えず、どのファイルの何箇所に及ぶかと理由を返します。キーワードやコメントの中など変えられない位置、その言語で使えない名前のときも理由を返します。MCP では `tako_lsp`（`action=rename`。当てるのは `confirm=true`）が同じ操作です。
+
 ## レイアウト操作
 
 ### tako resize

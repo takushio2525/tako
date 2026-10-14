@@ -53,18 +53,21 @@ pub fn action_of(item: MenuItem) -> &'static str {
         MenuItem::Goto(kind) => kind.slug(),
         MenuItem::Xref(kind) => kind.slug(),
         MenuItem::Hover => crate::dispatch::LSP_HOVER_ACTION,
+        MenuItem::Rename => crate::dispatch::LSP_RENAME_ACTION,
         MenuItem::Format | MenuItem::FormatSelection => crate::dispatch::LSP_FORMAT_ACTION,
     }
 }
 
 /// この項目を出してよいか（A/B の旧腕 = `TAKO_1893_LEGACY=1` は #1893 前、`TAKO_1681_LEGACY=1` は
 /// ホバーそのものの前 = どちらもホバーの項目を出さない。`TAKO_1685_LEGACY=1` は参照・階層の項目を
-/// 出さない）。出し分けの正本 `tako_core::lsp::menu::items` の後で GUI と CLI / MCP の両方が通る
+/// 出さない。`TAKO_1686_LEGACY=1` は名前の変更の項目を出さない）。出し分けの正本
+/// `tako_core::lsp::menu::items` の後で GUI と CLI / MCP の両方が通る
 pub fn shown(item: MenuItem) -> bool {
     match item {
         MenuItem::Hover => !(super::hover::legacy_1893() || super::hover::legacy()),
         // #1685: 参照・階層の項目（A/B の旧腕 = `TAKO_1685_LEGACY=1` は出さない）
         MenuItem::Xref(_) => !super::xref::legacy(),
+        MenuItem::Rename => !super::rename::legacy(),
         _ => true,
     }
 }
@@ -126,6 +129,9 @@ pub struct ItemTarget {
 }
 
 /// 項目を押したときの dispatch の要求。GUI のクリックはこれを `prepare_offload` へ渡す
+/// （「名前の変更」だけは GUI が新しい名前を打つ欄を開き、Enter で `new_name` と `confirm` を入れて渡す。
+/// ここの `new_name` は空 = そのまま dispatch すると「名前が空」で断られる。CLI / MCP の応答の
+/// `items[].args` には今の名前が入る = `LspMenuAnswer::to_json`）
 /// （CLI `tako lsp <action>` / MCP `tako_lsp` が組む要求と同じ = 番犬が [`item_args`] を MCP の
 /// 入口へ通して突き合わせる）。`focus` は GUI だけが `Some(true)`（利用者の操作は着地へ移る）。
 ///
@@ -159,6 +165,14 @@ pub fn item_request(item: MenuItem, target: &ItemTarget, focus: Option<bool>) ->
             show: Some(true),
             limit: None,
         },
+        // #1686: 位置は識別子の先頭（⌘クリックと同じ）。既定は dry-run（当てるのは GUI の Enter / --yes）
+        MenuItem::Rename => Request::LspRename {
+            pane: Some(target.pane),
+            line: target.line,
+            column: target.column,
+            new_name: String::new(),
+            confirm: false,
+        },
         MenuItem::Format => Request::LspFormat {
             pane: Some(target.pane),
             range: None,
@@ -185,6 +199,13 @@ pub fn item_args(item: MenuItem, target: &ItemTarget) -> Option<Value> {
             "line": target.line,
             "column": target.column,
             "show": true,
+        }),
+        MenuItem::Rename => json!({
+            "action": action_of(item),
+            "pane": target.pane,
+            "line": target.line,
+            "column": target.column,
+            "new_name": "",
         }),
         MenuItem::Format => json!({
             "action": action_of(item),

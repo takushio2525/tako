@@ -203,7 +203,7 @@ mod tests {
 
     /// #1679 と #1680 の合流: `tako_lsp` は 1 本で、action の先頭が既定の diagnostics、
     /// 続いて定義ジャンプの綴りの正本（`GotoKind::NAMES`）そのもの、整形の 2 つ（#1683）、補完（#1682）、
-    /// 右クリックメニュー（#1684）、最後にホバー（#1681）。
+    /// 右クリックメニュー（#1684）、ホバー（#1681）、参照・階層と結果（#1685）、最後に名前の変更（#1686）。
     /// 種類を足したのに action の表へ載せ忘れる・振り分けが受けない、のどちらもここで落ちる
     #[test]
     fn tako_lsp_の_action_は診断と定義ジャンプの全種を振り分ける() {
@@ -223,6 +223,8 @@ mod tests {
         ];
         rest.extend(tako_core::lsp::xref::XrefKind::NAMES);
         rest.extend(crate::dispatch::LSP_RESULT_ACTIONS);
+        // 名前の変更（#1686）
+        rest.push(crate::dispatch::LSP_RENAME_ACTION);
         assert_eq!(&actions[goto.len() + 1..], &rest[..]);
         for action in goto {
             assert_eq!(
@@ -456,6 +458,53 @@ mod tests {
                 build_request("tako_lsp", &args, Some(99), None).unwrap(),
                 item_request(item, &target, None).unwrap(),
                 "{item:?}: MCP の args と GUI のクリックの要求が違う"
+            );
+        }
+    }
+
+    /// #1686: `tako_lsp` の action=rename は CLI `tako lsp rename` と同じ要求になる（pane の省略は
+    /// 呼び出し元・`confirm` の省略は dry-run = CLI の `--yes` なし・位置と new_name は必須）
+    #[test]
+    fn tako_lsp_の名前の変更は_cli_と同じ要求になる() {
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "rename", "line": 3, "column": 4, "new_name": "item"}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspRename {
+                pane: Some(9),
+                line: 3,
+                column: 4,
+                new_name: "item".into(),
+                confirm: false,
+            }
+        );
+        assert_eq!(
+            build_request(
+                "tako_lsp",
+                &json!({"action": "rename", "pane": 7, "line": 3, "column": 4, "new_name": "item", "confirm": true}),
+                Some(9),
+                None
+            )
+            .unwrap(),
+            Request::LspRename {
+                pane: Some(7),
+                line: 3,
+                column: 4,
+                new_name: "item".into(),
+                confirm: true,
+            }
+        );
+        for missing in [
+            json!({"action": "rename", "line": 3, "column": 4}),
+            json!({"action": "rename", "line": 3, "new_name": "item"}),
+        ] {
+            assert!(
+                build_request("tako_lsp", &missing, Some(9), None).is_err(),
+                "{missing}"
             );
         }
     }

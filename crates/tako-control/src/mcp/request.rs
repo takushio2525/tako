@@ -917,7 +917,7 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.unwrap_or_else(|| "status".to_string()),
             name: str_arg(args, "name")?,
         },
-        // #1679 / #1680 / #1683 / #1682 / #1681: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
+        // #1679 / #1680 / #1683 / #1682 / #1681 / #1686: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
         // （省略は LSP_FEATURE_ACTIONS の先頭 = diagnostics）
         "tako_lsp" => match str_arg(args, "action")?
             .as_deref()
@@ -958,6 +958,14 @@ pub(super) fn build_request(
                 column: required_u64(args, "column")? as usize,
                 show: bool_arg(args, "show")?,
                 limit: u64_arg(args, "limit")?.map(|n| n as usize),
+            },
+            // #1686: 名前の変更（位置は定義ジャンプと同じ。既定は dry-run・confirm で当てる = #496 の作法）
+            crate::dispatch::LSP_RENAME_ACTION => Request::LspRename {
+                pane: Some(target_pane(args, caller)?),
+                line: required_u64(args, "line")? as usize,
+                column: required_u64(args, "column")? as usize,
+                new_name: str_arg(args, "new_name")?.ok_or("rename は new_name を指定する")?,
+                confirm: bool_arg(args, "confirm")?.unwrap_or(false),
             },
             // #1685: 参照・階層（位置は定義ジャンプと同じ。show で右パネルにも出す）
             action if tako_core::lsp::xref::XrefKind::parse(action).is_some() => Request::LspXref {
