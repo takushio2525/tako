@@ -8,7 +8,8 @@
 #      `.pde` = Java・`.jsonc` = JSON・`.json5` = JavaScript。`.S` / `.s` は寄せない（Plain Text のまま）
 #   ② A/B: `TAKO_1953_LEGACY=1`（#1953 以前）では同じ応答が `.h` = Objective-C・`.m` = 常に
 #      Objective-C・`.pde` / `.jsonc` / `.json5` = Plain Text に戻る（= ① の変化が応答で読める）
-#   ③ visual-test 節 syntax-alias が緑（応答の syntax・複数の構文色・JSON5 の字がダークで消えない）。
+#   ③ visual-test 節 syntax-alias が緑（応答の syntax・複数の構文色・JSON5 の字がダークで消えない・
+#      手掛かりの無い `.m` を編集で `%` の行つきにすると MATLAB へ切り替わる）。
 #      旧では ① の syntax で落ちる。画像は 置き場/new と 置き場/legacy へ分けて落とす
 #
 # 使い方: bash scripts/test-syntax-alias-1953.sh [画像の置き場]
@@ -97,9 +98,17 @@ import json, os, subprocess, sys
 tako, fx = sys.argv[1], sys.argv[2]
 files = sys.argv[3:]
 
+# 呼び出し元 = 隔離 GUI の最初のペイン（tako のペインの中の AI が叩く形。pane を省いた
+# open は呼び出し元ペインで埋まる = #1958）
+# `tako mcp serve` は接続情報を env で受ける（隔離 GUI の control.json から。#1958 の検査と同じ）
+listing = json.loads(subprocess.run([tako, "list"], capture_output=True, text=True).stdout)
+info = json.load(open(os.path.join(os.environ["TAKO_DISCOVERY_DIR"], "control.json")))
+env = dict(os.environ, TAKO_PANE_ID=str(listing["tabs"][0]["panes"][0]["id"]),
+           TAKO_SOCKET=info["socket"], TAKO_TOKEN=info["token"])
+
 
 def cli(path):
-    p = subprocess.run([tako, "open", path], capture_output=True, text=True)
+    p = subprocess.run([tako, "open", path], capture_output=True, text=True, env=env)
     try:
         return json.loads(p.stdout)
     except ValueError:
@@ -109,7 +118,7 @@ def cli(path):
 class Stdio:
     def __init__(self):
         self.p = subprocess.Popen([tako, "mcp", "serve"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, text=True, bufsize=1)
+                                  stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
         self.n = 0
         self.rpc("initialize", {"protocolVersion": "2025-06-18"})
         self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
@@ -158,7 +167,7 @@ probe_responses() {
   shift 2
   launch_isolated_gui "$log" ${1+"$@"} || exit $?
   if ! wait_isolated_gui "$log"; then
-    echo "隔離 GUI が立たない（ログ: $log）"
+    echo "隔離 GUI が立たない（ログ: ${log}）"
     exit 1
   fi
   "$TAKO_BIN" autorename off >/dev/null 2>&1 || true
@@ -179,7 +188,7 @@ judge_responses() {
     if [ "$syn" = "$want" ] && { [ "$col" != 2 ] || [ "$ft" = "$ft_want" ]; } && [ -z "$rest" ]; then
       pass "$label $name ($route): syntax=$syn file_type=$ft"
     else
-      fail "$label $name ($route): syntax=$syn（期待 $want）file_type=$ft（期待 $ft_want）$rest"
+      fail "$label $name ($route): syntax=${syn}（期待 ${want}）file_type=${ft}（期待 ${ft_want}）${rest}"
     fi
   done < "$out"
 }

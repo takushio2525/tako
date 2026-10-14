@@ -63,3 +63,6 @@
 ## 2026-10-14（#2032: issue1944_lsp_fetch の取得中の検査のフレーク = 状態と進捗は別々に変わるので、揃った 1 回の読みを状態待ちで捕まえる）
 - 真因: 製品は状態（取得中）と進捗（fetch のレジストリ）を別々に変えるので、進捗を置く前と、取り終えて進捗を消してから稼働へ移るまで（#1977 の片付けが走る）は「取得中なのに進捗が無い」。旧テストは各時点で両方を求めていた。配布元に最後の 4 KiB を止める `Serve::Held` を足し、status と画面の口をそれぞれ 1 回の読みで確かめる。注入 `TAKO_2032_INJECT_OLD_FILES=<n>`
 - 実測: 旧 + 前の版の段 500 ファイル 5/5 FAILED・旧 + 進捗を置く前に 200 ms 3/3 FAILED（どちらも CI と同じ assert）・新は同じ注入で 5/5 / 3/3 ok・画面に進捗を出さない壊し方で新が名指しで落ちる・新 20/20 ok
+## 2026-10-15（#1953: 既存の構文への別名で色の穴を埋めた = `.h` を C++・`.m` を本文で MATLAB / Objective-C・`.pde` を Java・`.jsonc` を JSON・`.json5` を JavaScript）
+- `file_type` の行（`cpp` の `syntax`・`processing`・`json5`・`jsonc`）+ 純粋関数 `syntax_by_content`（先頭 200 行。Objective-C の印を先に・行頭の `%` / `function` / `classdef` → MATLAB・`.h` も Objective-C の印なら Objective-C）。`.json5` は JSON だと JSON5 だけの書き方が `invalid` = ダークで字が消える（144 字句中 113）ので JavaScript、`.S` / `.s` は ARM の `@` が消えるので寄せない（設計書 §6.1）。A/B `TAKO_1953_LEGACY=1`・構文 213 のまま・カタログ +0 B
+- 実測: `scripts/test-syntax-alias-1953.sh` 38 PASS（CLI / MCP の応答の `syntax` 新旧 36・visual `syntax-alias` 新は緑で編集中の `%` で MATLAB へ切り替わる / 旧は ① で FAILED）・単体 core 11 / app 102（全数一致の意図した差分を名指し）
