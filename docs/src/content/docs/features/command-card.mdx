@@ -1,0 +1,91 @@
+---
+title: コマンドカード
+seoTitle: コマンドカード：AI が打ってほしいコマンドを、壊れない形で受け取る
+description: AI が「このコマンドを実行してください」と判断すると、tako はコマンドを会話に書く代わりにカードで渡します。コピーしても折り返しの改行が混ざらず、ボタン 1 つで隣のペインで実行でき、スマホからも実行できます
+---
+
+import CardWrap from '../../../components/scenes/CardWrap.astro';
+import CardFlow from '../../../components/scenes/CardFlow.astro';
+import CardMulti from '../../../components/scenes/CardMulti.astro';
+import CardPhone from '../../../components/scenes/CardPhone.astro';
+import CardMod from '../../../components/scenes/CardMod.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
+
+AI に「このコマンドを実行してください」と言われて、画面からコピーして貼ったら動かなかった。tako の**コマンドカード**は、その原因ごと取り除きます。AI はコマンドを会話に書く代わりに**カード**で渡し、あなたは「コピー」か「新規ペインで実行」を押すだけです。
+
+スクロールすると、画面がその手順の状態に変わります。
+
+## 画面からのコピーは、なぜ壊れるのか
+
+<CardWrap />
+
+## カードで受け取る
+
+<CardFlow />
+
+## 何本でも、何行でも
+
+<CardMulti />
+
+## スマホから実行する
+
+外出先でも、AI が出したカードをスマホから押せます。スマホから tako を開く準備は [リモートアクセス](/features/remote/) にあります。
+
+<CardPhone />
+
+## Claude Code の画面の中に出るとき
+
+<CardMod />
+
+## AI に出してもらうには
+
+`tako master` / `tako solo` で立てた AI と、その worker は、何も言わなくてもカードで渡します。tako の MCP を繋いだほかの AI でも、「カードで出して」と頼めば出せます。
+
+自分で出すこともできます。打ったペインの下にカードが出ます。
+
+<Cmd>tako show-command "npm install"</Cmd>
+
+## CLI と MCP から同じ操作
+
+カードのボタンは、CLI と MCP（`tako_show_command`）と同じ処理を通ります。人が押しても AI が押しても、結果は同じです。
+
+| やりたいこと | CLI | MCP の `action` |
+|---|---|---|
+| カードを出す | `tako show-command "npm test"` | `show`（省略時） |
+| 出ているカードと実行の記録を見る | `tako show-command --list` | `list` |
+| コピーする | `tako show-command --copy` | `copy` |
+| 新しいペインで実行する | `tako show-command --run` | `run` |
+| 閉じる | `tako show-command --dismiss` | `dismiss` |
+
+対象は省略すると最新のカードの 1 件目で、`--card` と `--index` で選べます。オプションの一覧は [CLI リファレンス](/guides/cli-reference/#tako-show-command) にあります。
+
+## Windows で使う
+
+コマンドカードは **Windows 版でも使えます**。カードの表示と「新規ペインで実行」は Windows 実機で確かめていて、実行は PowerShell で行います。まだのものは次の 2 つです。
+
+<WindowsLimits
+	items={[
+		{
+			kind: 'pending',
+			title: 'スマホからの実行',
+			text: 'スマホからの接続（tako remote）そのものが、Windows 実機での通しの確認がまだです。',
+			tools: ['tako_remote_setup', 'tako_remote_start'],
+		},
+		{
+			kind: 'pending',
+			title: 'Claude Code の画面の中に出るカード（tako mod）',
+			text: '実装は macOS と共通ですが、Windows 実機での確認がまだです。',
+			tools: ['tako_mod'],
+		},
+	]}
+/>
+
+## 知っておくこと
+
+- カードが出るのは、AI がツールで渡したときだけです。会話に書かれたコマンドを tako が見つけてカードにすることはしません（画面の文字からは、折り返しと本物の改行を見分けられないため）
+- カードはその場かぎりです。tako を終了すると消え、再起動しても戻りません
+- 1 枚に 10 件まで、1 つのペインに 3 枚までです。超えると古いカードから消えます
+- 改行とタブ以外の制御文字を含むコマンドは受け付けません（クリップボードやシェルに、見えないエスケープシーケンスが紛れ込まないように）。1 コマンドは 4096 バイトまでです
+
+関連: [MCP ツール一覧](/guides/mcp-tools/) / [エージェント別の対応状況](/agent-support/) / [Windows 対応状況](/windows-support/)

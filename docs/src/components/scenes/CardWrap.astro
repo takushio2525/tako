@@ -1,0 +1,69 @@
+---
+/**
+ * 場面: 画面から選んでコピーすると、折り返しの改行が混ざる（比較）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.22 冒頭（TUI は会話をペイン幅で物理改行して描くので、
+ * 画面から選択コピーすると改行が混入して壊れる。画面からは折り返しと本物の改行を区別できない）/
+ * FR-2.22.2（コピーは保管した論理文字列。ペイン幅の影響を受けない）。
+ * 右のペインの zsh は、貼り付けた 2 行を Enter で 1 行ずつ実行する（2 行目はコマンドとして扱われる）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import CommandCardFull from '../motion/CommandCardFull.astro';
+import Pointer from '../motion/Pointer.astro';
+import '../../styles/command-card.css';
+---
+
+<Scrolly label="画面からのコピーとカードのコピーの比較">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} height={25}>
+		<Split>
+			<Pane n={1} title="my-app" focus="1" body="flush">
+				<div class="tk-pane-col">
+					<div class="tk-pane-term tk-cw-end">
+						<span class="tk-l tk-tui-user">テストの道具も入れたい</span>
+						<span class="tk-l tk-tui-msg">vitest と UI を入れます。次を実行してください:</span>
+						<span class="tk-l tk-cw-wrapped">  <span class="tk-cw-sel" data-at="2-3" data-fx="state">npm i -D vitest</span></span>
+						<span class="tk-l tk-cw-wrapped"><span class="tk-cw-sel" data-at="2-3" data-fx="state">  @vitest/ui</span></span>
+						<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+					</div>
+					<div data-at="4+" data-fx="unfold">
+						<div>
+							<div class="tk-cardband">
+								<CommandCardFull title="テストの道具を入れる" commands={[{ text: 'npm i -D vitest @vitest/ui', copied: '4', copyMark: '4' }]} />
+							</div>
+						</div>
+					</div>
+				</div>
+			</Pane>
+			<Pane n={2} title="zsh" focus="2+">
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> <span data-at="2+" data-fx="fade">npm i -D vitest</span><span class="tk-cur" data-at="1" data-fx="fade"></span></span>
+				<span class="tk-l" data-at="2+" data-fx="fade">  @vitest/ui</span>
+				<span class="tk-l tk-dim" data-at="3+">added 41 packages in 3s</span>
+				<span class="tk-l tk-err" data-at="3+" style="--d: .4s">zsh: command not found: @vitest/ui</span>
+				<div class="tk-stack">
+					<span class="tk-l" data-at="3" data-fx="fade" style="--d: .6s"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+					<span data-at="4+" data-fx="fade" style="--d: .9s">
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> npm i -D vitest @vitest/ui</span>
+						<span class="tk-l tk-ok" data-at="4+" style="--d: 1.4s">added 42 packages in 3s</span>
+					</span>
+				</div>
+			</Pane>
+		</Split>
+		<Pointer slot="overlay" path="2:26,46 4:30,76" click="4" />
+	</TakoWindow>
+
+	<Step title="会話に書いたコマンドは、ペインの幅で折り返される">
+		<p>Claude Code などの AI は、会話をペインの幅に合わせて<strong>改行して</strong>描きます。長いコマンドは、画面の上では 2 行になります。</p>
+	</Step>
+	<Step title="選んでコピーすると、折り返しが改行として入る">
+		<p>画面から選んでコピーすると、その改行も一緒に入ります。隣のシェルに貼り付けると、コマンドが 2 行に分かれます。</p>
+	</Step>
+	<Step title="実行すると、途中で切れたまま動く">
+		<p>1 行目だけが実行され、2 行目は別のコマンドとして扱われてエラーになります。画面の文字からは「折り返し」と「本物の改行」を見分けられないので、コピーする側では直せません。</p>
+	</Step>
+	<Step title="カードなら、AI が渡した 1 行のまま">
+		<p>tako では、AI がコマンドの文字列そのものを渡し、ペインの下に<strong>カード</strong>として出します。「コピー」で入るのは渡された 1 行そのもので、ペインの幅には左右されません。</p>
+	</Step>
+</Scrolly>
