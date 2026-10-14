@@ -32,6 +32,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"
 PTY="$ROOT/scripts/lib/pty-answer.py"
 PASS=0; FAIL=0
@@ -271,7 +272,7 @@ for t in "-p tako-control --lib shell_integration::" \
          "-p tako-control --test issue1504_setup_shell_integration_watchdog" \
          "-p tako-control --lib setup_remaining::"; do
   # shellcheck disable=SC2086
-  if ( cd "$ROOT" && cargo test $t -- --quiet ) > "$SANDBOX/h.log" 2>&1; then
+  if ( cd "$ROOT" && run_heavy cargo test $t -- --quiet ) > "$SANDBOX/h.log" 2>&1; then
     ok "cargo test ${t}（$(grep -oE '[0-9]+ passed' "$SANDBOX/h.log" | head -1)）"
   else
     ng "cargo test ${t} が落ちた: $(tail -3 "$SANDBOX/h.log" | tr '\n' ' ')"

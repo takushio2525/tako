@@ -133,9 +133,9 @@ tako/
 | worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved|legacy] [--master-ratio 0.5] [--algorithm grid|spiral]` |
 | **PWA を単独でビルドする（新規 worktree で dist が無いとき。#1309）** | `scripts/build-pwa.sh` |
 | **PWA の e2e（Playwright。書き出しは outputDir の中だけ。#1357 / #1449 / #1749）** | `cd web/tako-remote && npm run e2e` |
-| build | `cargo build --workspace` |
-| lint（**3 つの feature 宇宙**を見る。#1383 / #1072） | `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p tako-app --features visual-test --all-targets -- -D warnings && cargo clippy -p tako-core -p tako-control -p tako-cli --all-targets -- -D warnings` |
-| test | `cargo test --workspace` |
+| build | `tako queue cargo build --workspace` |
+| lint（**3 つの feature 宇宙**を見る。#1383 / #1072） | `cargo fmt --all --check && tako queue cargo clippy --workspace --all-targets -- -D warnings && tako queue cargo clippy -p tako-app --features visual-test --all-targets -- -D warnings && tako queue cargo clippy -p tako-core -p tako-control -p tako-cli --all-targets -- -D warnings` |
+| test | `tako queue cargo test --workspace` |
 | **PR の CI 完了を待つ（判定はこの 1 実装。#1333）** | `scripts/wait-pr-checks.sh <PR>` |
 | **CI が緑で揃ってから PR を merge する（#1333）** | `scripts/merge-pr.sh <PR>` |
 | リリース経路のモックテスト（#256 / #965） | `bash scripts/test-release-retry.sh` |
@@ -206,6 +206,7 @@ tako/
 | プラットフォーム対応マトリクス（#515 / #591） | `tako platform [--platform macos|windows] [--status pending] [--known-limitations] [--json]` |
 | **環境の健全性診断（IPC の受け口・CLI の PATH・tmux。#1441）** | `tako check-health [--json]` |
 | **PC のメモリ・CPU と重い処理（どのペインで何が食っているか）（#1993）** | `tako queue` |
+| **重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。#1994）** | `tako queue <コマンド>` |
 | **codex の利用制限データ（#357 / #985）** | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
 | **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude|codex|agy|local] [--status supported|degraded|pending|unsupported] [--json]` |
 | Windows 対応状況ページの生成（#591） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |

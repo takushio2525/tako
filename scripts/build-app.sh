@@ -28,6 +28,9 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 source "$REPO_ROOT/scripts/lib/launch-services.sh"
 # shellcheck source=lib/bundle-install.sh
 source "$REPO_ROOT/scripts/lib/bundle-install.sh"
+# 重い処理（リリースビルド）を順番待ちへ通す入口 = run_heavy（#1994）
+# shellcheck source=lib/queue.sh
+source "$REPO_ROOT/scripts/lib/queue.sh"
 # 配布物の個人情報チェック（#1848）。release.sh も zip の直前に同じものを呼ぶ
 # shellcheck source=lib/bundle-privacy.sh
 source "$REPO_ROOT/scripts/lib/bundle-privacy.sh"
@@ -87,7 +90,7 @@ echo "==> リリースビルド（tako-app + tako-cli, profile.release。ビル�
 CARGO_ENCODED_RUSTFLAGS="$DIST_RUSTFLAGS" \
   PATH="$REPO_ROOT/scripts/lib/xcrun-remap:$PATH" \
   TAKO_REMAP_FROM="$HOME" TAKO_REMAP_TO="~" \
-  cargo build --release --target-dir "$DIST_TARGET_DIR" -p tako-app -p tako-cli
+  run_heavy cargo build --release --target-dir "$DIST_TARGET_DIR" -p tako-app -p tako-cli
 
 echo "==> アイコン生成（icon-a.svg → tako.icns）"
 ICONSET="$DIST/tako.iconset"

@@ -48,7 +48,7 @@ trap cleanup EXIT
 
 # ビルドは HOME を差し替える前に（後で呼ぶとツールチェーンとレジストリを一時 HOME へ取り直す）
 echo "visual-test 版の tako-app をビルドします…"
-(cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
 isolated_gui_bins || exit 1
 
 export HOME="$TMP/home"

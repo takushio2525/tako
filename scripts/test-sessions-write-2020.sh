@@ -62,7 +62,7 @@ trap cleanup EXIT
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 
 # ビルドは HOME を差し替える前に（後で呼ぶとツールチェーンとレジストリを一時 HOME へ取り直す）
-(cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --quiet) || exit 1
 isolated_gui_bins || exit 1
 command -v jq >/dev/null || { echo "jq が要る"; exit 1; }
 

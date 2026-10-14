@@ -10,6 +10,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 PASS=0
 FAIL=0
 
@@ -92,7 +93,7 @@ chmod +x "$FAKE_TS"
 TAKO_BIN="${TAKO_BIN:-$REPO_ROOT/target/debug/tako}"
 if [ ! -x "$TAKO_BIN" ]; then
   echo "tako CLI をビルドします（${TAKO_BIN}）…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli --quiet)
+  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli --quiet)
 fi
 [ -x "$TAKO_BIN" ] || { echo "tako CLI が見つからない: $TAKO_BIN"; exit 1; }
 

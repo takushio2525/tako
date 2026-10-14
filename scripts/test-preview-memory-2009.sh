@@ -63,7 +63,7 @@ isolated_gui_bins || exit 1
 VISUAL_APP="$REPO_ROOT/$(TAKO_ISO_PROFILE=debug TAKO_ISO_APP_REL='' /bin/bash -c '. "$1/scripts/lib/isolated-gui.sh"; printf %s "$ISOLATED_GUI_APP_REL"' _ "$REPO_ROOT")"
 if has_stage visual; then
   echo "visual-test 版の tako-app をビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-app --features visual-test --quiet) || exit 1
+  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-app --features visual-test --quiet) || exit 1
 fi
 
 # --- 素材（本番の 8 本に寄せる: 講義スライド風 60 ページ・資料 15 ページ・書類 3 ページ・

@@ -70,7 +70,7 @@ trap cleanup EXIT
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 if [ "$CUSTOM_BINS" -eq 0 ]; then
   echo "visual-test 入りの tako-app / tako をビルドします…"
-  (cd "$REPO_ROOT" && cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
+  (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
 fi
 isolated_gui_bins || exit 1
 

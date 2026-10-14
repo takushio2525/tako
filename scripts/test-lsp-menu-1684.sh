@@ -27,6 +27,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
@@ -51,8 +52,8 @@ REAL_RA="$(command -v rust-analyzer 2>/dev/null || true)"
 REAL_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 REAL_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 
-cargo build -q -p tako-app --features visual-test || exit 1
-cargo build -q -p tako-cli -p tako-control --bin tako --bin tako-lsp-fake || exit 1
+run_heavy cargo build -q -p tako-app --features visual-test || exit 1
+run_heavy cargo build -q -p tako-cli -p tako-control --bin tako --bin tako-lsp-fake || exit 1
 FAKE="$REPO_ROOT/target/debug/tako-lsp-fake"
 
 # shellcheck source=lib/isolated-gui.sh

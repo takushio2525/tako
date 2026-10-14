@@ -32,7 +32,7 @@ check() { if [ "$1" = "1" ]; then pass "$2"; else bad "$2"; fi; }
 # HOME を差し替える前に済ませる（ツールチェーンを取り直さない）
 if [ -z "${APP_BIN:-}" ]; then
   echo "visual-test 版の tako / tako-app をビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
+  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
 fi
 isolated_gui_bins || exit 1
 

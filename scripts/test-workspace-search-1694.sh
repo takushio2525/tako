@@ -48,7 +48,7 @@ trap cleanup EXIT
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 # HOME を差し替える前にビルドする（後だとツールチェーンを一時 HOME へ取り直す）
 echo "visual-test 版の tako / tako-app をビルドします…"
-(cd "$REPO_ROOT" && cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
 isolated_gui_bins || exit 1
 
 export HOME="$TMP/home"

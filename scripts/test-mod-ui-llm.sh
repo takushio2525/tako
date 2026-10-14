@@ -19,6 +19,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 WITH_CLAUDE=0
 [ "${1:-}" = "--claude" ] && WITH_CLAUDE=1
 MODELS="${MODELS:-sonnet haiku}"
@@ -32,7 +33,7 @@ cleanup() { rm -rf "$TMP"; }
 . "$REPO_ROOT/scripts/lib/exit-guard.sh"
 tako_exit_trap cleanup "test-mod-ui-llm"
 
-cargo build -q -p tako-cli || exit 1
+run_heavy cargo build -q -p tako-cli || exit 1
 TAKO_BIN="$REPO_ROOT/target/debug/tako"
 mkdir -p "$TMP/bin" "$TMP/h" "$TMP/cc"
 ln -s "$TAKO_BIN" "$TMP/bin/tako"

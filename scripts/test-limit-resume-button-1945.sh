@@ -19,6 +19,7 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL
 
 ARM=new
@@ -28,7 +29,7 @@ OUT=${TAKO_1945_OUT:-$TMP/shots}/$ARM
 mkdir -p "$OUT" "$TMP/home" "$TMP/zdot"
 
 # visual-test の節は feature 付きビルドにしか無い（素のビルドだと「未知の節」で exit 1）
-cargo build -p tako-app --features visual-test --quiet || exit 1
+run_heavy cargo build -p tako-app --features visual-test --quiet || exit 1
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
