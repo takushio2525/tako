@@ -4007,6 +4007,59 @@ mod pane_died_tests {
         );
     }
 
+    /// tako が居ない間に消えた器の書き出しは、同じ名前の器を作り直す / 繋ぎ直すとき
+    /// （`wrap_options`）に消える = 作り直した器の死と取り違えない
+    #[test]
+    fn 同じ名前の器を作るときは前の書き出しを消す() {
+        let dir = pane_died_dir().expect("テストのデータディレクトリ");
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = format!("tako-2085-stale-{}", std::process::id());
+        let stale = dir.join(format!("{session}.3.10000.0.0.dump"));
+        std::fs::write(&stale, "a\nb\nc\nscreen\n").unwrap();
+        let other = dir.join(format!("{session}x.3.10000.0.0.dump"));
+        std::fs::write(&other, "x\n").unwrap();
+        let _ = wrap_options(SpawnOptions::default(), "tako-test", &session);
+        assert!(!stale.exists(), "前の死の書き出しが残っている");
+        assert!(other.exists(), "別の器の書き出しまで消した");
+        let _ = std::fs::remove_file(other);
+    }
+
+    /// alt screen（TUI）のまま死んでも書き出され、ペインは閉じる（名前の alternate_on が 1）
+    #[test]
+    #[cfg(unix)]
+    fn 実tmux_altscreenのまま死んでも書き出して閉じる() {
+        if !crate::backend::capabilities().survives_app_exit {
+            eprintln!("skip: tmux が無い環境");
+            return;
+        }
+        let socket = format!("tako-coretest-{}-2085alt", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let tmp = TempDir::new("alt");
+        let conf = write_conf(&tmp, &tmp.0);
+        start_server(&socket, &conf);
+        new_vessel(
+            &socket,
+            &conf,
+            "tako-alt",
+            "printf '\\033[?1049h'; seq 1 30",
+        );
+        assert!(
+            wait_gone(&socket, "tako-alt"),
+            "alt screen のまま死んだペインが残る"
+        );
+        let dump = take_pane_died_dump(&tmp.0, "tako-alt").expect("書き出しがある");
+        assert!(dump.probe.alternate, "alt screen の印: {:?}", dump.probe);
+        // alt screen の画面（履歴の無い面）の最後の行まで、番号が続いて入る
+        let shown = numbers(&dump.screen, "");
+        assert_eq!(
+            shown.last(),
+            Some(&30),
+            "alt screen の画面: {:?}",
+            dump.screen
+        );
+        assert!(shown.windows(2).all(|w| w[1] == w[0] + 1), "{shown:?}");
+    }
+
     /// 明示の kill（tako がペインを閉じる経路）はフックを起こさない = 書き出さない
     #[test]
     #[cfg(unix)]
