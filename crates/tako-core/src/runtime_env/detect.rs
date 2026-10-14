@@ -5,9 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    join, Applied, Candidate, DetectEnv, Detection, Detector, EnvLayout, EnvSwitchSpec, EnvValue,
-    FsProbe, InProjectEnv, Marker, MarkerDirSpec, NamedEnvListSpec, PathLookupSpec, RuntimeKind,
-    Unresolved, VersionFileSpec, VersionSource, WrapperSpec, SCAN_CHILDREN_MAX,
+    join, Applied, BundledSpec, Candidate, DetectEnv, Detection, Detector, EnvLayout,
+    EnvSwitchSpec, EnvValue, FsProbe, InProjectEnv, Marker, MarkerDirSpec, NamedEnvListSpec,
+    PathLookupSpec, RuntimeKind, Unresolved, VersionFileSpec, VersionSource, WrapperSpec,
+    SCAN_CHILDREN_MAX,
 };
 use crate::i18n::Lang;
 use crate::platform::support::Platform;
@@ -48,6 +49,7 @@ pub fn detect(
                 detect_path_lookup(kind, s, platform, fs, env, &mut out.warnings)
             }
             Detector::EnvSwitch(s) => detect_env_switch(kind, s, platform, dirs, fs),
+            Detector::Bundled(s) => detect_bundled(kind, s, platform, fs, env),
         };
         out.candidates.extend(found);
     }
@@ -151,6 +153,15 @@ pub fn resolve_ref(
         // 解くのは実行ペインのシェル。鍵（プログラム名）をそのまま使う
         Detector::PathLookup(s) => Ok(path_lookup_candidate(kind, s, &r.key, None)),
         Detector::EnvSwitch(s) => Ok(env_switch_candidate(kind, s, platform, &r.key, None)),
+        // 鍵は見つけた実行ファイルのフルパス（アプリを消した・動かしたら解けない）
+        Detector::Bundled(s) => {
+            let path = absolute(&r.key);
+            if fs.is_file(&path) {
+                Ok(bundled_candidate(kind, s, &path))
+            } else {
+                Err(fail(msg_missing(&path)))
+            }
+        }
     }
     .map(|mut c| {
         // 保存した鍵のまま返す（相対の鍵を絶対へ書き換えて保存し直さない）
@@ -686,12 +697,47 @@ fn path_lookup_candidate(
         label: program.to_string(),
         version: None,
         needs_probe: location.is_none(),
+        // 何も見つからなければこれが走る（今までと同じ = 名前のまま、解くのはシェル）。
+        // 後ろの検出器へ譲る行（`eligible_when_missing: false`）は見つかったときだけ
+        auto_eligible: location.is_some() || s.eligible_when_missing,
         location,
         found_in: None,
-        // 何も見つからなければこれが走る（今までと同じ = 名前のまま、解くのはシェル）
-        auto_eligible: true,
         applied: Applied {
             program: vec![program.to_string()],
+            path_prepend: Vec::new(),
+            env: Vec::new(),
+        },
+    }
+}
+
+/// アプリ同梱の実行ファイル（#1950）。置き場の知識は `app_bundle` の表が持ち、ここは探すだけ
+fn detect_bundled(
+    kind: &RuntimeKind,
+    s: &BundledSpec,
+    platform: Platform,
+    fs: &dyn FsProbe,
+    env: &DetectEnv,
+) -> Vec<Candidate> {
+    crate::app_bundle::find(s.bundle, platform, s.file_name.get(platform), env, fs)
+        .map(|path| bundled_candidate(kind, s, &path))
+        .into_iter()
+        .collect()
+}
+
+fn bundled_candidate(kind: &RuntimeKind, s: &BundledSpec, path: &Path) -> Candidate {
+    let program = path.to_string_lossy().into_owned();
+    Candidate {
+        kind: kind.id,
+        manager: s.id,
+        key: program.clone(),
+        label: s.bundle.label.to_string(),
+        version: None,
+        location: Some(path.to_path_buf()),
+        found_in: None,
+        auto_eligible: true,
+        needs_probe: false,
+        applied: Applied {
+            program: vec![program],
             path_prepend: Vec::new(),
             env: Vec::new(),
         },

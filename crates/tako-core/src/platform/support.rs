@@ -194,6 +194,13 @@ pub mod notes {
         "Checking for updates and rendering the release notes work, but applying an update (running the installer and restarting) has not been measured on Windows (#937)",
     );
 
+    /// #1950。Code Runner の解決と実行は実測済みだが、Arduino のスケッチが使う arduino-cli の
+    /// Arduino IDE 同梱の置き場（`app_bundle::ARDUINO_IDE` の Windows の列）は実機で見ていない
+    pub const WIN_RUN_ARDUINO_UNVERIFIED: Note = Note::new(
+        "宣言・拡張子既定・プロジェクト既定の解決と実行は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）は Windows 実機で未確認（#1950）",
+        "Resolving and running declarations, extension defaults and project defaults works, but for Arduino sketches (.ino) the lookup of the arduino-cli bundled with Arduino IDE (%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…) and upload ports (COM3 etc.) have not been verified on real Windows (#1950)",
+    );
+
     /// #1057。検出は両 OS で動くが、パッケージ導入の代行は brew（macOS）だけ
     /// #989。3 系統とも `install.ps1` は実在するが、実機で通したのは claude だけ（#1057）
     pub const WIN_SETUP_BOOTSTRAP_AGENTS: Note = Note::new(
@@ -1467,9 +1474,12 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_run",
         macos: Support::Supported,
-        windows: Support::Supported,
+        // #1950: Arduino のスケッチの arduino-cli の探索（IDE 同梱の置き場）は Windows 実機で未確認
+        windows: Support::Degraded {
+            note: notes::WIN_RUN_ARDUINO_UNVERIFIED,
+        },
         windows_evidence: Evidence::Measured(
-            "#875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true。拡張子既定も #1655 で Windows 用の列を持つ（`python` / `.exe` / `cmd /c` / `pwsh -File`。`&&` と `./` は PowerShell 5.1 で通らないので使わない）",
+            "#875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true。拡張子既定も #1655 で Windows 用の列を持つ（`python` / `.exe` / `cmd /c` / `pwsh -File`。`&&` と `./` は PowerShell 5.1 で通らないので使わない）。#1950 の Arduino（IDE 同梱の `arduino-cli.exe` の置き場・案内の PowerShell の形）は macOS の単体から固定しただけ",
         ),
     },
     Feature {
@@ -1499,9 +1509,11 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_run_resolve",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_RUN_ARDUINO_UNVERIFIED,
+        },
         windows_evidence: Evidence::Measured(
-            "#875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）。#1656 のプロジェクト既定（cargo / npm / python / go / dotnet / make）は Windows の列を macOS の単体から固定したが実機は未検証",
+            "#875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）。#1656 のプロジェクト既定（cargo / npm / python / go / dotnet / make）と #1950 の arduino は Windows の列を macOS の単体から固定したが実機は未検証",
         ),
     },
     Feature {

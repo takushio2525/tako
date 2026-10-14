@@ -968,3 +968,100 @@ fn 素の名前の候補は実在を確かめない() {
     assert_eq!(c.manager, "system");
     assert_eq!(prog(c), ["python"]);
 }
+
+// ─── arduino（#1950）: PATH → Arduino IDE 同梱 → 名前のまま ──────────────
+
+fn arduino() -> &'static RuntimeKind {
+    kind_by_id("arduino").expect("arduino の行がある")
+}
+
+const IDE_MAC: &str =
+    "/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli";
+
+#[test]
+fn arduino_cliはpathに無くide同梱だけならそのフルパスを選ぶ() {
+    let fs = FakeFs::new().file(IDE_MAC, "");
+    let env = DetectEnv {
+        path_dirs: dirs(&["/usr/bin", "/bin"]),
+        ..home("/Users/testuser")
+    };
+    let d = detect(arduino(), MAC, &[], &fs, &env);
+    let c = auto(&d);
+    assert_eq!(c.manager, "arduino-ide");
+    assert_eq!(c.label, "Arduino IDE");
+    assert_eq!(prog(c), vec![IDE_MAC.to_string()]);
+    assert!(!c.needs_probe);
+    // PATH の候補は残す（見つからなかったので自動では選ばない）
+    let sys = d.candidates.iter().find(|c| c.manager == "system").unwrap();
+    assert!(!sys.auto_eligible && sys.needs_probe);
+}
+
+#[test]
+fn arduino_cliはpathにあればide同梱より先に名前のまま選ぶ() {
+    let fs = FakeFs::new()
+        .file(IDE_MAC, "")
+        .file("/opt/homebrew/bin/arduino-cli", "");
+    let env = DetectEnv {
+        path_dirs: dirs(&["/opt/homebrew/bin", "/usr/bin"]),
+        ..home("/Users/testuser")
+    };
+    let d = detect(arduino(), MAC, &[], &fs, &env);
+    let c = auto(&d);
+    assert_eq!(c.manager, "system");
+    // 名前のまま（解くのは実行ペインのシェル = 利用者の PATH）
+    assert_eq!(prog(c), vec!["arduino-cli".to_string()]);
+    assert_eq!(loc(c).as_deref(), Some("/opt/homebrew/bin/arduino-cli"));
+}
+
+#[test]
+fn arduino_cliがどこにも無ければ自動で選ばずfallbackの名前になる() {
+    let d = detect(
+        arduino(),
+        MAC,
+        &[],
+        &FakeFs::new(),
+        &home("/Users/testuser"),
+    );
+    assert!(d.auto_candidate().is_none(), "{d:?}");
+    assert_eq!(fallback_value(arduino(), MAC), "arduino-cli");
+    assert_eq!(fallback_value(arduino(), WIN), "arduino-cli");
+    // Tier P はログインシェルに名前を聞く（Dock 起動の痩せた PATH の取りこぼしを拾う）
+    let plan = tier_p::plan(arduino(), MAC, &d, &FakeFs::new(), &home("/h"));
+    assert_eq!(plan.lookups, vec!["arduino-cli".to_string()]);
+}
+
+/// Windows の列（未実機）: `%LOCALAPPDATA%\Programs\Arduino IDE\…\arduino-cli.exe`
+#[test]
+fn arduino_cliのwindowsの同梱はlocalappdataから組む() {
+    let local = "/Users/winuser/AppData/Local";
+    let exe =
+        format!("{local}/Programs/Arduino IDE/resources/app/lib/backend/resources/arduino-cli.exe");
+    let fs = FakeFs::new().file(&exe, "");
+    let env = DetectEnv {
+        vars: [("LOCALAPPDATA".to_string(), local.to_string())].into(),
+        ..home("/Users/winuser")
+    };
+    let d = detect(arduino(), WIN, &[], &fs, &env);
+    assert_eq!(prog(auto(&d)), vec![exe.clone()]);
+    // macOS の列では同じ置き場を見ない
+    assert!(detect(arduino(), MAC, &[], &fs, &env)
+        .auto_candidate()
+        .is_none());
+    // 表が名指す環境変数として集められる（`DetectEnv::from_process` が読む）
+    let names = table_env_names();
+    assert!(
+        names.contains(&"LOCALAPPDATA") && names.contains(&"ProgramFiles"),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn 保存したide同梱の参照はファイルが消えたら解けない() {
+    let fs = FakeFs::new().file(IDE_MAC, "");
+    let r = RuntimeRef::new("arduino-ide", IDE_MAC);
+    let c = resolve_ref(arduino(), MAC, &r, None, &fs, &home("/h")).expect("解ける");
+    assert_eq!(prog(&c), vec![IDE_MAC.to_string()]);
+    let err = resolve_ref(arduino(), MAC, &r, None, &FakeFs::new(), &home("/h"))
+        .expect_err("消えた置き場を既定へ落とさない");
+    assert_eq!(err.manager, "arduino-ide");
+}

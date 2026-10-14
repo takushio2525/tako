@@ -116,6 +116,7 @@ static TOY: RuntimeKind = RuntimeKind {
                 macos: &[],
                 windows: &[],
             },
+            eligible_when_missing: true,
         }),
     ],
 };
@@ -683,4 +684,88 @@ fn テストプロセスでは実物の道具を起こさない() {
         p.output("sh", &["-c", "true"], None, BUDGET),
         Outcome::Failed { .. }
     ));
+}
+
+// ─── #1950: プロジェクトの案内を子プロセスの答えで詰める ──────────────────
+
+/// 本物の表の `arduino` 行を使う。道具は箱の PATH に置く（PATH が先に勝つので、この PC の
+/// Arduino IDE の同梱物があっても結果は変わらない）
+#[test]
+fn 基板の案内は見つけた実体へ聞いて詰める() {
+    let s = Sandbox::new("rp-1950-followup");
+    let exe = if cfg!(windows) {
+        "arduino-cli.exe"
+    } else {
+        "arduino-cli"
+    };
+    let cli = s.write(&format!("bin/{exe}"), "");
+    let ino = s.write("Blink/Blink.ino", "void setup() {}\nvoid loop() {}\n");
+    let kind = runtime_env::kind_by_id("arduino").expect("arduino の行");
+    let env = s.env(&["bin"]);
+    let snap = detect_with(
+        kind,
+        Platform::current(),
+        &s.dirs("Blink/Blink.ino"),
+        &RealFs,
+        &env,
+        &mut Facts::default(),
+        None,
+    );
+    assert_eq!(snap.selected().map(|c| c.manager), Some("system"));
+    let bounds = SearchBounds::with_ceilings([s.root.clone()]);
+    let detect = || {
+        tako_core::runner_project::detect(Platform::current(), &ino, "", &bounds, &snap.words())
+            .expect("スケッチとして検出")
+    };
+    let board = |m: &tako_core::runner_project::ProjectMatch| {
+        m.notes
+            .iter()
+            .find(|n| n.id == "board_not_selected")
+            .map(|n| n.commands[0].clone())
+            .expect("基板の案内")
+    };
+
+    let prober = FakeProber {
+        outputs: [(
+            (
+                cli.to_string_lossy().into_owned(),
+                "board list --format json".to_string(),
+            ),
+            r#"{"detected_ports":[{"matching_boards":[{"name":"Arduino Uno","fqbn":"arduino:avr:uno"}],"port":{"address":"COM3"}}]}"#.to_string(),
+        )]
+        .into(),
+        ..FakeProber::default()
+    };
+    let mut m = detect();
+    apply_project_followup_with(&mut m, Some(&snap), &prober, BUDGET);
+    assert_eq!(
+        prober.calls(),
+        vec![format!("run {exe} board list --format json")]
+    );
+    assert!(
+        board(&m).contains("-p COM3 -b arduino:avr:uno"),
+        "{}",
+        board(&m)
+    );
+
+    // 実体が分からない（実行環境の層を通っていない）なら聞かない
+    let silent = FakeProber::default();
+    let mut m = detect();
+    let before = board(&m);
+    apply_project_followup_with(&mut m, None, &silent, BUDGET);
+    assert!(silent.calls().is_empty());
+    assert_eq!(board(&m), before);
+
+    // 答えが無い・失敗したら案内はそのまま（推測で埋めない）
+    let failing = FakeProber::default();
+    apply_project_followup_with(&mut m, Some(&snap), &failing, BUDGET);
+    assert_eq!(failing.calls().len(), 1);
+    assert_eq!(board(&m), before);
+
+    // 基板を選んであれば聞かない
+    s.write("Blink/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+    let quiet = FakeProber::default();
+    let mut m = detect();
+    apply_project_followup_with(&mut m, Some(&snap), &quiet, BUDGET);
+    assert!(quiet.calls().is_empty());
 }

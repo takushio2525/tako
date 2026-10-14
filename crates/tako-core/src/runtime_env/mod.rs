@@ -245,6 +245,22 @@ pub struct PathLookupSpec {
     pub file_names: PerOs<&'static [&'static str]>,
     /// 実体ではない置き場（Windows の App Execution Alias = ストアを開くだけ）
     pub exclude_dirs: PerOs<&'static [KnownDir]>,
+    /// PATH に見つからなくても自動で選ぶか。`true` = 最後の砦（名前のまま走らせ、解くのは
+    /// シェル）。`false` = 見つかったときだけ選び、後ろの検出器（アプリ同梱 = [`BundledSpec`]）へ
+    /// 譲る（#1950。PATH → 同梱 → 名前のまま、の順にするため）
+    pub eligible_when_missing: bool,
+}
+
+/// アプリに同梱された実行ファイル（置き場は [`crate::app_bundle`] の表。#1950）。
+///
+/// 授業で Arduino IDE を入れた人は PATH に `arduino-cli` が無く、IDE の中にだけある。
+/// 見つけたフルパスをそのまま `${<variable>}` に入れる
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundledSpec {
+    pub id: &'static str,
+    pub bundle: &'static crate::app_bundle::AppBundle,
+    /// 同梱ディレクトリで探すファイル名
+    pub file_name: PerOs<&'static str>,
 }
 
 /// 環境変数で切り替える toolchain（ファイルの値をそのまま変数へ入れる）
@@ -267,6 +283,7 @@ pub enum Detector {
     VersionFile(VersionFileSpec),
     PathLookup(PathLookupSpec),
     EnvSwitch(EnvSwitchSpec),
+    Bundled(BundledSpec),
 }
 
 impl Detector {
@@ -278,6 +295,7 @@ impl Detector {
             Self::VersionFile(s) => s.id,
             Self::PathLookup(s) => s.id,
             Self::EnvSwitch(s) => s.id,
+            Self::Bundled(s) => s.id,
         }
     }
 }
@@ -426,6 +444,11 @@ pub fn table_env_names() -> Vec<&'static str> {
                 }
                 Detector::PathLookup(s) => {
                     for d in s.exclude_dirs.macos.iter().chain(s.exclude_dirs.windows) {
+                        known(d, &mut out);
+                    }
+                }
+                Detector::Bundled(s) => {
+                    for d in s.bundle.dirs.macos.iter().chain(s.bundle.dirs.windows) {
                         known(d, &mut out);
                     }
                 }

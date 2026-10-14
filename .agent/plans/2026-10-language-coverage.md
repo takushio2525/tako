@@ -365,6 +365,22 @@ open_plan 7・インデント 5）。
 5. 書き込み（upload）は基板とポートの実機が要るので **未検証**。実装スライスの受け入れ条件で
    実機（授業の基板）を 1 回通す
 
+**実装で決めたこと（#1950）**（正本は `.agent/requirements.md` FR-3.18.4）:
+
+- **置き場**: arduino-cli の探索は実行環境の表（`runtime_env::KINDS` の `arduino` 行・`${arduino_cli}`）に載せた。
+  PATH の行は `eligible_when_missing: false`（見つかったときだけ選ぶ）で、後ろに新しい戦略 `Detector::Bundled`
+  を置く。IDE 同梱の置き場は中立の表 `tako_core::app_bundle::ARDUINO_IDE` 1 枚 + 純粋関数 `find` / `dirs`
+  （`Platform` と `FsProbe` を引数で受ける）で、**#1951 の伴走の探索もこれを使う**（`dirs` はファイル名を決めずに
+  ディレクトリだけを返すので「見つけた ALS と同じディレクトリを先に」が組める）
+- **3 つの失敗の出し方**: 実行ペインで**コマンドの前**に案内の行を出す（`RunNotice`）。arduino-cli が無い案内だけは
+  実行ペインのシェルでも見つからないときにだけ出す（`unless_found`）。Dock 起動の GUI は PATH が痩せていて、
+  `Run`（子プロセスを起こさない経路）では brew の arduino-cli を取りこぼしうるため
+- **名前の一致は大文字小文字まで**（実測: `blinkc/Blinkc.ino` は大小を区別しない APFS でも
+  `missing …/blinkc/blinkc.ino`）。旧形式の `<フォルダ名>.pde` も本体と認める
+- **`board list` で候補を入れるのは `RunResolve` だけ**（background。1.7 秒かかる = 実測）。`Run` では聞かない
+- `upload` には 4 つ目の案内（`default_port` が無い → `board attach -p <ポート>`）を付けた。
+  書き込みそのものは基板を繋いでいないので**未検証**
+
 ### 5.5 無い環境のフォールバックと導入の案内
 
 - **arduino-cli も ALS も無い**: 色分けだけ効く（§5.2）。言語サーバは `not_installed`、実行は

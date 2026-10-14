@@ -4056,10 +4056,11 @@ pub fn tools() -> Vec<Value> {
                 \n変数（コマンド・cwd 内。自動でシングルクオート）: `${file}` = 絶対パス / \
                 `${fileDir}` = ディレクトリ / `${fileBase}` = 拡張子付きの名前 / `${fileNoExt}` = 拡張子なし / \
                 `${ext}` = 拡張子（小文字・ドットなし）/ `${workspaceRoot}` = プロジェクトのルート\
-                （無ければ git → ファイルのディレクトリ）/ `${python}` = 実行環境の python\n\
-                \n.py はプロジェクトの .venv / uv / poetry / conda / pyenv を自動で使う（応答の runtime）。\n\
+                （無ければ git → ファイルのディレクトリ）/ `${python}` = 実行環境の python / `${arduino_cli}` = arduino-cli\n\
+                \n.py はプロジェクトの .venv / uv / poetry / conda / pyenv を、.ino は PATH か Arduino IDE 同梱の arduino-cli を\
+                自動で使う（応答の runtime）。\n\
                 \n解決順: command 引数 → ファイル内宣言 → ユーザーの拡張子既定 → プロジェクト既定\
-                （Cargo.toml / package.json / pyproject.toml / go.mod / *.csproj / Makefile を上へ辿る）→ \
+                （Cargo.toml / package.json / pyproject.toml / go.mod / *.csproj / Makefile / *.ino を上へ辿る）→ \
                 組み込みの拡張子既定 → エラー。",
             "inputSchema": {
                 "type": "object",
@@ -4114,7 +4115,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_run_resolve",
             "description": "ファイルの実行プロファイルを解決して返す（実行しない。tako_run の事前確認に使う）。\
-                プロファイル一覧・コマンド・cwd・source・属するプロジェクト（project）・\
+                プロファイル一覧・コマンド・cwd・source・属するプロジェクト（project。notes = 走らせる前の案内）・\
                 実行環境の候補（runtimes: id / manager / label / version / auto / tier）・\
                 走らせるもの（runtime）・項目ごとの実効値と出典（config）を返す。",
             "inputSchema": {

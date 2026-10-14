@@ -9584,11 +9584,15 @@ fn dispatch_inner(
                 .as_ref()
                 .map(|r| r.path_prepend())
                 .unwrap_or_default();
+            // #1950: 走らせても失敗するのが分かっている形（基板が未選択・スケッチの名前の不一致・
+            // 道具が見つからない）は、コマンドの前に人の言葉の案内を出す（英語の 1 行で終わらせない）
+            let notices = run_notices(resolution.project.as_ref(), plan);
             let final_command = tako_core::platform::shell::compose_run_script(
                 tako_core::platform::shell::run_pane_dialect(),
                 &tako_core::platform::shell::RunScript {
                     env: &env,
                     path_prepend: &path_prepend,
+                    notices: &notices,
                     command: &wrapped,
                 },
             );
@@ -10164,7 +10168,7 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
     // 実行環境の候補（Tier F + 足りない Tier P を聞いて覚える。`refresh` で聞き直す）
     let runtime = crate::runtime_probe::for_resolve(&resolved, ctx.refresh);
 
-    let resolution = tako_core::resolve_file(
+    let mut resolution = tako_core::resolve_file(
         &resolved,
         &head,
         &settings.runner_defaults,
@@ -10173,6 +10177,11 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
         &runtime.as_ref().map(|r| r.words()).unwrap_or_default(),
     )
     .map_err(|e| DispatchError::Operation(e.to_string()))?;
+    // #1950: 子プロセスに聞けば詰められる案内（繋がっている基板の FQBN）を、実行環境の層が
+    // 見つけた実行ファイルで聞く（ここは background。`Run` では聞かない）
+    if let Some(project) = resolution.project.as_mut() {
+        crate::runtime_probe::apply_project_followup(project, runtime.as_ref());
+    }
 
     let profiles: Vec<Value> = resolution
         .all_profiles
@@ -10223,9 +10232,37 @@ fn run_project_json(project: Option<&tako_core::runner_project::ProjectMatch>) -
             "root": p.root.display().to_string(),
             "marker": p.marker.display().to_string(),
             "command": p.command,
+            // #1950: 走らせる前に知らせること（基板が未選択など）。`unless_found` があるものは、
+            // その名前が実行ペインのシェルでも見つからないときだけ画面に出る
+            "notes": p.notes.iter().map(|n| json!({
+                "id": n.id,
+                "message": n.message,
+                "commands": n.commands,
+                "profile": n.profile,
+                "unless_found": n.unless_found,
+            })).collect::<Vec<_>>(),
         }),
         None => Value::Null,
     }
+}
+
+/// 実行ペインでコマンドの前に出す案内（#1950）。出すのは**プロジェクト既定で走るとき**だけ
+/// （宣言・上書きのコマンドが勝ったなら、プロジェクトの案内はその実行に当てはまらない）
+fn run_notices(
+    project: Option<&tako_core::runner_project::ProjectMatch>,
+    plan: &tako_core::RunPlan,
+) -> Vec<tako_core::platform::shell::RunNotice> {
+    let Some(p) = project.filter(|_| plan.source == tako_core::RunSource::ProjectDefault) else {
+        return Vec::new();
+    };
+    p.notes
+        .iter()
+        .filter(|n| n.applies_to(&plan.profile))
+        .map(|n| tako_core::platform::shell::RunNotice {
+            lines: n.lines(),
+            unless_found: n.unless_found.clone(),
+        })
+        .collect()
 }
 
 /// RunInteractive / Run / ShowCommand 共通: 分割（または差し替え）→ コマンド付き
@@ -38535,6 +38572,184 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1950: 一時 dir に Arduino のスケッチを組む（根に `.git` を置いて探索を閉じ込める）。
+    /// 戻り値は（実体パスの根, スケッチのフォルダ, 本体の .ino）
+    fn arduino_sketch_1950(tag: &str, sketch_yaml: Option<&str>) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "tako-1950-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("Blink")).unwrap();
+        std::fs::write(
+            base.join("Blink/Blink.ino"),
+            "void setup() {}\nvoid loop() {}\n",
+        )
+        .unwrap();
+        if let Some(y) = sketch_yaml {
+            std::fs::write(base.join("Blink/sketch.yaml"), y).unwrap();
+        }
+        let base = tako_core::platform::path::canonicalize(&base).unwrap();
+        let sketch = base.join("Blink");
+        let ino = sketch.join("Blink.ino");
+        (base, sketch, ino)
+    }
+
+    fn run_1950(host: &mut MockHost, path: &Path, profile: Option<&str>) -> Value {
+        let pane = host.ws.active_tab().tree().focused();
+        dispatch(
+            host,
+            Request::Run {
+                path: path.display().to_string(),
+                pane: Some(pane.as_u64()),
+                tab: None,
+                profile: profile.map(str::to_string),
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+                new_pane: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap()
+    }
+
+    /// 実行ペインへ渡したスクリプトの本文（境界の `/bin/sh -c` / `-EncodedCommand` の中身）
+    fn spawned_script_1950(host: &MockHost, result: &Value) -> String {
+        let pane = result["pane"].as_u64().unwrap();
+        let cmd = host.attached_options[&pane]
+            .command
+            .as_ref()
+            .expect("command");
+        cmd.args.join(" ")
+    }
+
+    /// #1950 受け入れ条件 1: `tako run <sketch>.ino --dry-run` / MCP `tako_run_resolve` が
+    /// プロジェクト既定の `arduino-cli compile`（cwd = スケッチ）と `upload` を返す。
+    /// 実行ファイルの語は機械で変わる（この PC は Arduino IDE 同梱のフルパス・CI は名前のまま）
+    #[test]
+    fn run_resolveはスケッチをarduino_cli_compileへ解決する() {
+        let (base, sketch, ino) =
+            arduino_sketch_1950("resolve", Some("default_fqbn: arduino:avr:uno\n"));
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let result = dispatch(
+            &mut host,
+            Request::RunResolve {
+                path: ino.display().to_string(),
+                pane: Some(pane.as_u64()),
+                refresh: false,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let sketch_str = sketch.display().to_string();
+        let p = &result["profiles"];
+        assert_eq!(p[0]["profile"], "default", "{result}");
+        assert_eq!(p[0]["source"], "project_default", "{result}");
+        let compile = p[0]["command"].as_str().unwrap();
+        assert!(
+            compile.contains("arduino-cli") && compile.ends_with(" compile"),
+            "{result}"
+        );
+        assert_eq!(p[0]["cwd"], sketch_str.as_str(), "{result}");
+        assert_eq!(p[1]["profile"], "upload", "{result}");
+        assert!(
+            p[1]["command"].as_str().unwrap().contains("arduino-cli")
+                && p[1]["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" compile --upload"),
+            "{result}"
+        );
+        assert_eq!(p[1]["cwd"], sketch_str.as_str(), "{result}");
+        assert_eq!(result["project"]["kind"], "arduino", "{result}");
+        assert_eq!(
+            result["project"]["marker"],
+            sketch.join("sketch.yaml").display().to_string().as_str()
+        );
+        assert_eq!(result["runtime"]["kind"], "arduino", "{result}");
+        // 基板は選んであるので compile の案内は無い（ポートの案内は upload にだけ付く）
+        let notes = result["project"]["notes"].as_array().unwrap();
+        assert!(
+            notes.iter().all(|n| n["id"] != "board_not_selected"),
+            "{result}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #1950 受け入れ条件 3: 基板が未選択のスケッチは、実行ペインでコマンドの前に
+    /// 人の言葉の案内（選ぶコマンドつき）が出る。応答の `project.notes` にも載る
+    #[test]
+    fn runは基板が未選択なら実行ペインに選び方を出す() {
+        let (base, sketch, ino) = arduino_sketch_1950("run-board", None);
+        let mut host = MockHost::new();
+        let result = run_1950(&mut host, &ino, None);
+        assert_eq!(result["source"], "project_default", "{result}");
+        assert_eq!(result["cwd"], sketch.display().to_string().as_str());
+        let notes = result["project"]["notes"].as_array().unwrap();
+        let board = notes
+            .iter()
+            .find(|n| n["id"] == "board_not_selected")
+            .unwrap_or_else(|| panic!("基板の案内が無い: {result}"));
+        let attach = board["commands"][0].as_str().unwrap();
+        assert!(attach.contains("board attach -b <"), "{attach}");
+        let script = spawned_script_1950(&host, &result);
+        let command = result["command"].as_str().unwrap();
+        // 案内（`[tako] ` で始まる行と選ぶコマンド）がコマンドより前にある
+        let at_note = script.find("[tako] ").expect("案内の行");
+        let at_attach = script.find("board attach -b").expect("選ぶコマンド");
+        let at_command = script.rfind(command).expect("コマンド本体");
+        assert!(at_note < at_command && at_attach < at_command, "{script}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 宣言（`tako:run:`）が勝ったら、プロジェクトの案内はその実行に当てはまらないので出さない
+    #[test]
+    fn runは宣言が勝ったらプロジェクトの案内を出さない() {
+        let (base, _sketch, ino) = arduino_sketch_1950("run-decl", None);
+        std::fs::write(&ino, "// tako:run: echo declared\nvoid setup() {}\n").unwrap();
+        let mut host = MockHost::new();
+        let result = run_1950(&mut host, &ino, None);
+        assert_eq!(result["source"], "declaration", "{result}");
+        let script = spawned_script_1950(&host, &result);
+        assert!(!script.contains("board attach"), "{script}");
+        assert!(result["project"]["notes"]
+            .as_array()
+            .is_some_and(|n| !n.is_empty()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `upload` プロファイルは `--upload` で走り、ポートが無ければその案内だけが加わる
+    #[test]
+    fn runのuploadはポートの案内を出す() {
+        let (base, _sketch, ino) =
+            arduino_sketch_1950("run-upload", Some("default_fqbn: arduino:avr:uno\n"));
+        let mut host = MockHost::new();
+        let result = run_1950(&mut host, &ino, Some("upload"));
+        assert_eq!(result["profile"], "upload", "{result}");
+        assert!(
+            result["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" compile --upload"),
+            "{result}"
+        );
+        let script = spawned_script_1950(&host, &result);
+        assert!(script.contains("board attach -p <"), "{script}");
+        assert!(!script.contains("board attach -b"), "{script}");
+        // 既定（compile）にはポートの案内を出さない
+        let mut host = MockHost::new();
+        let result = run_1950(&mut host, &ino, None);
+        let script = spawned_script_1950(&host, &result);
+        assert!(!script.contains("board attach"), "{script}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 一時 dir に cargo プロジェクトを組む（根に `.git` を置き、探索をその中へ閉じ込める。
     /// 実 HOME の中は読まない）。戻り値は（実体パスの根, 実行対象の main.rs）
     fn cargo_project_1656(tag: &str) -> (PathBuf, PathBuf) {
@@ -38805,6 +39020,7 @@ mod tests {
                 env: &env,
                 path_prepend: &path_prepend,
                 command: result["command"].as_str().unwrap(),
+                ..Default::default()
             },
         );
         let opts = host.attached_options.get(&pane).expect("options 記録");
