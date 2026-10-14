@@ -333,6 +333,9 @@ pub(crate) struct TasksPanel {
     /// `scroll_to_item` は**直接の子の添字**で動くので、積む順（= 行の並び）と
     /// 添字が一致していることが前提になる
     pub scroll: gpui::ScrollHandle,
+    /// AI から開いたのにまだ一覧に居ない行（#2086）。引き直しは background なので、
+    /// その行が載った一覧が着いたところで見える位置へ運ぶ（畳む・別の行を開くと捨てる）
+    pub reveal: Option<String>,
     pub kind_filter: Option<String>,
     pub project_filter: Option<String>,
     /// 完了・却下も一覧に出す（`list` の `all` に載る = 絞り込みではなく取得条件）
@@ -416,8 +419,22 @@ impl TasksPanel {
     /// **返答フォームも一緒に初期化する**（開いていない詳細の入力を持ち越さない）
     pub(crate) fn collapse(&mut self) {
         self.expanded = None;
+        self.reveal = None;
         self.reset_form();
         self.notice = None;
+    }
+
+    /// 行を見える位置へ運ぶ（#1479。一覧の並びは画面と同じ 1 実装 `visible_tasks` で解く）。
+    /// 並び（絞り込み後）に居なければ何もしない
+    pub(crate) fn scroll_to_task(&self, id: &str) {
+        let visible = visible_tasks(
+            &self.snapshot.tasks,
+            self.kind_filter.as_deref(),
+            self.project_filter.as_deref(),
+        );
+        if let Some(index) = visible.iter().position(|t| t.id == id) {
+            self.scroll.scroll_to_item(index);
+        }
     }
 
     /// 押した行を展開する / 同じ行なら畳む（#1479。**同時に開くのは 1 件**）。
@@ -712,6 +729,14 @@ impl TakoApp {
                 self.user_tasks.snapshot = snapshot;
                 self.user_tasks.loaded = true;
                 self.user_tasks.load_error = None;
+                // #2086: AI から開いた行が載った一覧が着いたら、見える位置へ運ぶ
+                // （載っていない = 展開より前に頼んだ古い一覧。次の着地まで持つ）
+                if let Some(id) = self.user_tasks.reveal.clone() {
+                    if self.user_tasks.snapshot.tasks.iter().any(|t| t.id == id) {
+                        self.user_tasks.reveal = None;
+                        self.user_tasks.scroll_to_task(&id);
+                    }
+                }
             }
             Err(e) => {
                 // 読めなかったときは**前回の眺めを消さない**（一覧が一瞬で空になると

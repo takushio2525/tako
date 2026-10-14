@@ -1341,7 +1341,7 @@ pub(super) fn build_request(
             due: str_arg(args, "due")?,
             decision: str_arg(args, "decision")?,
             comment: str_arg(args, "comment")?,
-            via: str_arg(args, "via")?,
+            via: todo_via(args)?,
             pane: caller,
             caller_role: caller_role.map(String::from),
         },
@@ -1502,6 +1502,15 @@ fn lsp_format_range(args: &Value) -> Result<Option<crate::protocol::LineColRange
             keys.join(" / ")
         )),
     }
+}
+
+/// `tako_todo` の返答の経路（#2086）。省いたら `mcp` と明示して送る（値は修正前の既定 =
+/// 呼び出し元が MCP なら `mcp` と同じなので、記録は変わらない）。受け口の準備の段は呼び出し元を
+/// 知らないので、省いたままの返答は UI スレッドの同期の腕に残る（置き場の読み書きを待つ）
+fn todo_via(args: &Value) -> Result<Option<String>, String> {
+    let via = str_arg(args, "via")?;
+    let respond = str_arg(args, "action")?.as_deref() == Some("respond");
+    Ok(via.or_else(|| respond.then(|| "mcp".to_string())))
 }
 
 /// `pane` 引数（省略時は呼び出し元へフォールバック。FR-2.3.3 のデフォルトスコープ）

@@ -438,6 +438,22 @@ pub fn issue2052_legacy() -> bool {
     })
 }
 
+/// #2086 の A/B（`TAKO_2086_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// ユーザータスクの起票・詳細・更新・返答・展開 / 折りたたみ（IPC = CLI / MCP / PWA）を
+/// UI スレッドの同期の dispatch で待ち、そのたびに置き場を読み書きする。AI からの展開で
+/// 一覧に居ない行を開いたら、UI スレッドで一覧を引き直す。#2052 の一覧・完了・却下とは
+/// **別の軸**（片方のアームがもう片方の回帰を隠さない）。**ゲートはこの 1 か所**で、
+/// tako-control / tako-app もここを読む
+pub fn issue2086_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2086_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。

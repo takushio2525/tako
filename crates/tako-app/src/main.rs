@@ -3460,9 +3460,14 @@ async fn drive_offload(
     origin: PaneOrigin,
     cx: &mut gpui::AsyncApp,
 ) -> Result<serde_json::Value, tako_control::DispatchError> {
+    // #2086: 途中の着地の後処理が失敗させた応答（master を起こしたペインの PTY を立てられない）。
+    // 同期の腕と同じく、続き（配送の記録）を済ませたうえで最後の応答にする
+    let mut settled_err: Option<tako_control::DispatchError> = None;
     loop {
         let next = match outcome {
-            tako_control::OffloadOutcome::Reply(result) => return result,
+            tako_control::OffloadOutcome::Reply(result) => {
+                return settled_err.map_or(result, Err);
+            }
             tako_control::OffloadOutcome::OnUi(next) => next,
         };
         let landed = this.update(cx, |app: &mut TakoApp, cx| {
@@ -3478,9 +3483,15 @@ async fn drive_offload(
                 for any in redraw {
                     let _ = any.update(cx, |_, window, cx| window.draw(cx).clear());
                 }
-                return result;
+                return settled_err.map_or(result, Err);
             }
-            Ok(OffloadLanded::Again(job)) => {
+            Ok(OffloadLanded::Again(job, failed, redraw)) => {
+                for any in redraw {
+                    let _ = any.update(cx, |_, window, cx| window.draw(cx).clear());
+                }
+                if settled_err.is_none() {
+                    settled_err = failed;
+                }
                 outcome = cx
                     .background_executor()
                     .spawn(async move { job.run_staged() })
@@ -3497,8 +3508,14 @@ enum OffloadLanded {
         Result<serde_json::Value, tako_control::DispatchError>,
         Vec<AnyWindowHandle>,
     ),
-    /// 先取りの答えがまだ足りない（もう一巡 background で走らせる）
-    Again(Box<tako_control::OffloadJob>),
+    /// もう一巡 background で走らせる（先取りの答えがまだ足りない #1984 / 着地で host を変えた
+    /// 続きがある #2086）。後ろの 2 つは、着地の後処理が失敗させた応答と強制描画する窓
+    /// （先取りの一巡では後処理をしないので空）
+    Again(
+        Box<tako_control::OffloadJob>,
+        Option<tako_control::DispatchError>,
+        Vec<AnyWindowHandle>,
+    ),
 }
 
 /// 端末イベントを 4ms 窓でまとめて 1 回にする（Issue #782。zed の
@@ -7445,7 +7462,14 @@ impl TakoApp {
         let _span = tako_control::diag::perf_span("ipc_turn");
         let needs_frame = next.changes_layout() && !Self::ipc_redraw_legacy();
         match tako_control::land_offload(self, next, origin) {
-            tako_control::OffloadLanding::Again(job) => OffloadLanded::Again(job),
+            tako_control::OffloadLanding::Again(job) => OffloadLanded::Again(job, None, Vec::new()),
+            // #2086: 着地で host を変えた（返答を運んだ = master を起こしたかもしれない）。
+            // 受信ループの同期の腕と同じ後処理をここで済ませてから、続きを background へ出す
+            tako_control::OffloadLanding::Settled(job) => {
+                let mut settled = Ok(serde_json::Value::Null);
+                let redraw = self.after_dispatch(&mut settled, needs_frame, cx);
+                OffloadLanded::Again(job, settled.err(), redraw)
+            }
             tako_control::OffloadLanding::Done(mut result) => {
                 let redraw = self.after_dispatch(&mut result, needs_frame, cx);
                 OffloadLanded::Done(result, redraw)
@@ -25185,17 +25209,19 @@ impl UiStateHost for TakoApp {
                 // 右パネルを畳んでいたあいだはポーリングが空振りしているので一覧が古い。
                 // **その 1 件が並びに居ないときだけ**引き直す（居るなら 2 秒ループに任せる）
                 if !self.user_tasks.snapshot.tasks.iter().any(|t| t.id == id) {
-                    self.refresh_user_tasks();
+                    if tako_core::probe::issue2086_legacy() {
+                        // A/B（`TAKO_2086_LEGACY=1`）: 修正前 = UI スレッドの同期の引き直し
+                        self.refresh_user_tasks();
+                    } else {
+                        // #2086: 引き直しは background（dispatch の後処理 `after_dispatch` が
+                        // `spawn_user_tasks_list` へ渡す = `tako panel` で開いたときと同じ口）。
+                        // 見える位置へ運ぶのは一覧が着いたとき（`apply_user_tasks_list`）
+                        self.user_tasks.list_poll.pending = true;
+                        self.user_tasks.reveal = Some(id.clone());
+                    }
                 }
                 // 開いた行を見える位置へ（一覧の並びは画面と同じ 1 実装で解く）
-                let visible = crate::tasks_panel::visible_tasks(
-                    &self.user_tasks.snapshot.tasks,
-                    self.user_tasks.kind_filter.as_deref(),
-                    self.user_tasks.project_filter.as_deref(),
-                );
-                if let Some(index) = visible.iter().position(|t| t.id == id) {
-                    self.user_tasks.scroll.scroll_to_item(index);
-                }
+                self.user_tasks.scroll_to_task(&id);
             }
             None => self.user_tasks.collapse(),
         }

@@ -236,6 +236,8 @@ impl TakoApp {
                     OffloadContinuation::WorkspaceSearch(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2052 の完了・却下の続き）
                     OffloadContinuation::UserTaskStatus(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2086 のユーザータスクの続き）
+                    OffloadContinuation::UserTaskStored(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }
