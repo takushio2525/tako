@@ -72,8 +72,11 @@ pub fn pin_pane_to_utf8(pid: u32) -> PinOutcome {
 /// **cmd.exe で 43〜61ms、PowerShell 5.1 で 97ms**（`tests/encoding_conpty.rs` の計測）。
 ///
 /// ペインの起動は UI スレッドから走るのでここでは待てない。別スレッドで短間隔に
-/// 試し、成立したら固定して終わる。シェルが最初の 1 行を描くより十分早く決着する
-/// （PowerShell 5.1 のプロンプトは実測 500ms 超）
+/// 試し、成立したら固定して終わる。PowerShell 5.1 はプロンプトまで実測 500ms 超あるので
+/// 余裕があるが、**cmd.exe ではシェルの最初の 1 行との差が小さく、同期もしていない**
+/// （Windows CI で 20 回測り、tako の画面にプロンプトが出る 7〜34ms 前に固定が済んだ。
+/// 負荷で逆転した回にプロンプト直後の `type` の出力が化けた = #1696）。
+/// 固定が済んだことを確かめたい検証は [`read_pane_code_pages`] で状態を待つ
 pub fn pin_pane_to_utf8_when_ready(pid: u32) {
     imp::pin_pane_to_utf8_when_ready(pid);
 }
