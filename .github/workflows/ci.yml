@@ -419,6 +419,32 @@ jobs:
       # そのまま使う（実機実測: `--no-run` の後の `cargo test --workspace` は再コンパイル 0）
       - name: テストのコンパイル検査（#1264。結果ではなくビルドを守る）
         run: cargo test --workspace --no-run
+      # TEMP2098: conf 差し替えテストの繰り返し（一時。最終差分に残さない）
+      - name: TEMP2098 conf 差し替えテストを繰り返す
+        shell: bash
+        run: |
+          set +e
+          new_ok=0; new_fail=0; old_ok=0; old_fail=0
+          tally() {
+            local out="$1" tag="$2"
+            echo "$out" | grep -aE "TEMP2098|^test tmux_backend::tests::(conf|temp2098_old)|test result: .*passed" | sed "s/^/[$tag] /"
+            new_ok=$((new_ok + $(echo "$out" | grep -acE '^test tmux_backend::tests::conf.* \.\.\. ok')))
+            new_fail=$((new_fail + $(echo "$out" | grep -acE '^test tmux_backend::tests::conf.* \.\.\. FAILED')))
+            old_ok=$((old_ok + $(echo "$out" | grep -acE '^test tmux_backend::tests::temp2098_old_conf_swap \.\.\. ok')))
+            old_fail=$((old_fail + $(echo "$out" | grep -acE '^test tmux_backend::tests::temp2098_old_conf_swap \.\.\. FAILED')))
+          }
+          # 元の失敗と同じ負荷の形 = tako-core の lib 全体を並列で回す（旧テストの写しも同時に走らせる）
+          for i in $(seq 1 15); do
+            out=$(TAKO_2098_RUN_OLD=1 cargo test -p tako-core --lib -- --show-output 2>&1)
+            tally "$out" "full $i"
+          done
+          # 単独
+          for i in $(seq 1 20); do
+            out=$(cargo test -p tako-core --lib tmux_backend::tests::conf -- --show-output 2>&1)
+            tally "$out" "single $i"
+          done
+          echo "TEMP2098 集計: 新 ok=$new_ok FAILED=$new_fail / 旧 ok=$old_ok FAILED=$old_fail"
+          test "$new_fail" -eq 0 && test "$new_ok" -ge 35
       # #1282: 器の列挙が使う Win32 FFI（`NtQueryInformationProcess` でのコマンドライン /
       # `GetProcessTimes` での起動時刻）は **macOS では 1 行も実行できない**。
       # 全数（下のステップ）より**手前に名指しで置く**のは、そこが赤いと
