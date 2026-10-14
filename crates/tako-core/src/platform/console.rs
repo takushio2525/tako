@@ -72,8 +72,11 @@ pub fn pin_pane_to_utf8(pid: u32) -> PinOutcome {
 /// **cmd.exe で 43〜61ms、PowerShell 5.1 で 97ms**（`tests/encoding_conpty.rs` の計測）。
 ///
 /// ペインの起動は UI スレッドから走るのでここでは待てない。別スレッドで短間隔に
-/// 試し、成立したら固定して終わる。シェルが最初の 1 行を描くより十分早く決着する
-/// （PowerShell 5.1 のプロンプトは実測 500ms 超）
+/// 試し、成立したら固定して終わる。PowerShell 5.1 はプロンプトまで実測 500ms 超あるので
+/// 余裕があるが、**cmd.exe ではシェルの最初の 1 行との差が小さく、同期もしていない**
+/// （Windows CI で 20 回測り、tako の画面にプロンプトが出る 7〜34ms 前に固定が済んだ。
+/// 負荷で逆転した回にプロンプト直後の `type` の出力が化けた = #1696）。
+/// 固定が済んだことを確かめたい検証は [`read_pane_code_pages`] で状態を待つ
 pub fn pin_pane_to_utf8_when_ready(pid: u32) {
     imp::pin_pane_to_utf8_when_ready(pid);
 }
@@ -84,6 +87,36 @@ pub fn pin_pane_to_utf8_when_ready(pid: u32) {
 pub fn force_pin_pane_to_utf8(pid: u32) -> PinOutcome {
     imp::force_pin_pane_to_utf8(pid)
 }
+
+/// ペインの疑似コンソールのいまのコードページ（#1696）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneCodePages {
+    /// 入力（`GetConsoleCP`）
+    pub input: u32,
+    /// 出力（`GetConsoleOutputCP`）。子が `WriteFile` で吐いたバイト列はこちらで解釈される
+    pub output: u32,
+}
+
+impl PaneCodePages {
+    /// 入出力とも UTF-8 か（= 固定が効いている）
+    pub fn is_utf8(self) -> bool {
+        self.input == CP_UTF8 && self.output == CP_UTF8
+    }
+}
+
+/// ペインの疑似コンソールのいまのコードページを読む（**テスト・診断用**。#1696）。
+///
+/// 固定（[`pin_pane_to_utf8_when_ready`]）は別スレッドで**非同期に**終わるので、
+/// 「固定が済んだ」ことを状態で待ちたい検証が使う。読むために一瞬相乗りするので
+/// 固定と同じロックの内側で行う（ロックの外で相乗りすると、固定側がその一瞬を
+/// 「tako 自身がコンソールを持っている」と誤読して固定を諦める）。
+/// tako 自身がコンソールを持っているときは読まずに `Err` を返す
+pub fn read_pane_code_pages(pid: u32) -> Result<PaneCodePages, String> {
+    imp::read_pane_code_pages(pid)
+}
+
+/// UTF-8 のコードページ番号（`winnls.h` の `CP_UTF8`）
+const CP_UTF8: u32 = 65001;
 
 /// このプラットフォームで固定が要るか（Windows だけ `true`）。
 ///
@@ -108,21 +141,23 @@ mod imp {
     }
 
     pub fn pin_pane_to_utf8_when_ready(_pid: u32) {}
+
+    pub fn read_pane_code_pages(_pid: u32) -> Result<super::PaneCodePages, String> {
+        Err("このプラットフォームの端末はコードページを持たない".into())
+    }
 }
 
 #[cfg(windows)]
 mod imp {
-    use super::PinOutcome;
+    use super::{PaneCodePages, PinOutcome, CP_UTF8};
     use std::sync::Mutex;
-
-    /// UTF-8 のコードページ番号（`winnls.h` の `CP_UTF8`）
-    const CP_UTF8: u32 = 65001;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn AttachConsole(dwProcessId: u32) -> i32;
         fn FreeConsole() -> i32;
         fn GetConsoleCP() -> u32;
+        fn GetConsoleOutputCP() -> u32;
         fn SetConsoleCP(wCodePageID: u32) -> i32;
         fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
         fn GetLastError() -> u32;
@@ -198,6 +233,22 @@ mod imp {
             .ok();
     }
 
+    pub fn read_pane_code_pages(pid: u32) -> Result<PaneCodePages, String> {
+        let _guard = ATTACH_LOCK.lock();
+        if has_own_console() {
+            return Err("tako 自身がコンソールを持っているので相乗りしない".into());
+        }
+        unsafe {
+            if AttachConsole(pid) == 0 {
+                return Err(format!("AttachConsole err={}", GetLastError()));
+            }
+            let input = GetConsoleCP();
+            let output = GetConsoleOutputCP();
+            FreeConsole();
+            Ok(PaneCodePages { input, output })
+        }
+    }
+
     /// `AttachConsole` している時間は**最短**にする。接続中は自分の標準出力が
     /// ペインへ向くため、この間に何かを書くとユーザーの画面へ漏れる
     fn attach_and_pin(pid: u32) -> PinOutcome {
@@ -232,6 +283,21 @@ mod tests {
             ),
             "想定外の結果: {got:?}"
         );
+    }
+
+    #[test]
+    fn 存在しないプロセスのコードページは読めずにerrを返す() {
+        // u32::MAX は `AttachConsole` では ATTACH_PARENT_PROCESS（親のコンソールへの
+        // 相乗り）を意味するので使わない。割り当てられることのない pid を渡す
+        assert!(read_pane_code_pages(u32::MAX - 1).is_err());
+    }
+
+    #[test]
+    fn 入出力の片方でもutf8でなければ固定は効いていない() {
+        let cp = |input, output| PaneCodePages { input, output };
+        assert!(cp(65001, 65001).is_utf8());
+        assert!(!cp(437, 65001).is_utf8());
+        assert!(!cp(65001, 932).is_utf8());
     }
 
     #[cfg(not(windows))]

@@ -19,7 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use tako_core::platform::console::{force_pin_pane_to_utf8, PinOutcome};
+use tako_core::platform::console::{force_pin_pane_to_utf8, read_pane_code_pages, PinOutcome};
 use tako_core::terminal::{SessionEvent, SpawnCommand, SpawnOptions, TerminalSession};
 
 /// 化けの判定に使う文字列。CP932 にも UTF-8 にも存在する常用漢字を選ぶ
@@ -77,13 +77,18 @@ impl Pane {
         self.session.write(format!("{line}\r\n").into_bytes());
     }
 
+    /// 届いている出力を画面へ反映する
+    fn pump(&mut self) {
+        while let Ok(ev) = self.rx.try_recv() {
+            let _ = self.session.process_event(ev);
+        }
+    }
+
     /// `needle` を含む行が現れるまで待つ。出なければ false
     fn wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            while let Ok(ev) = self.rx.try_recv() {
-                let _ = self.session.process_event(ev);
-            }
+            self.pump();
             if self.screen_text().contains(needle) {
                 return true;
             }
@@ -104,6 +109,32 @@ impl Pane {
             "プロンプトが出ない: {}",
             self.screen_text()
         );
+    }
+
+    /// 疑似コンソールが入出力とも UTF-8 へ固定されるまで待つ（#1696）。
+    ///
+    /// 固定はペイン起動時に**別スレッドで非同期に**走る（`pin_pane_to_utf8_when_ready`）
+    /// ので、プロンプトが見えた時点で済んでいるとは限らない。済む前に `type` が届くと
+    /// UTF-8 のバイト列が OEM コードページ（CI の英語版 Windows なら 437）で解釈され、
+    /// `µùÑµ£¼…` に化けて間欠的に落ちていた。描画の検査はコードページの状態が揃って
+    /// から始める。固定そのものが起きない回は上限で落ちる（検出力は残る）
+    fn wait_utf8_code_page(&mut self) {
+        let pid = self.session.child_pid().expect("child_pid が取れること");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let got = read_pane_code_pages(pid);
+            if matches!(got, Ok(cp) if cp.is_utf8()) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                self.pump();
+                panic!(
+                    "コードページが UTF-8 に固定されない（最後の読み: {got:?}）: {}",
+                    self.screen_text()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -139,6 +170,7 @@ fn utf8バイトを吐く子の出力が化けずに描画される() {
     let fixture = write_utf8_fixture("render", JP);
     let mut pane = Pane::new_cmd();
     pane.wait_prompt();
+    pane.wait_utf8_code_page();
 
     pane.send_line(&format!("type {}", fixture.display()));
     assert!(
@@ -170,6 +202,7 @@ fn 日本語ファイル名と絵文字と長文でも化けない() {
 
     let mut pane = Pane::new_cmd();
     pane.wait_prompt();
+    pane.wait_utf8_code_page();
     pane.send_line(&format!("type {}", path.display()));
 
     // 末尾（= 分割を何度も跨いだ後）まで化けずに届いていること
