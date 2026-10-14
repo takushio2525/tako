@@ -2236,16 +2236,9 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for (i, line) in body.lines().enumerate() {
             let t = line.trim_start();
-            let decl = t
-                .strip_prefix("pub fn ")
-                .or_else(|| t.strip_prefix("pub(crate) fn "))
-                .or_else(|| t.strip_prefix("fn "));
-            if let Some(rest) = decl {
-                current = rest
-                    .split(|c: char| c == '(' || c == '<')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+            // 関数の頭の判定は共有の 1 実装（#1496: 可視性・async の前置で名指しがずれない）
+            if let Some(name) = crate::source_scan::fn_head_name(line) {
+                current = name.to_string();
             }
             if line.contains(".notify(") {
                 seen.insert(current.clone());
@@ -2409,9 +2402,9 @@ mod tests {
     fn 端末申告の注入はoptions_envより後にある() {
         let src = include_str!("terminal.rs");
         let body = src
-            .split("    pub fn spawn(")
+            .split("    pub fn spawn_in(")
             .nth(1)
-            .expect("TerminalSession::spawn の定義");
+            .expect("TerminalSession::spawn_in の定義（spawn の本体。#2092）");
         let body = &body[..body.find("\n    pub fn ").unwrap_or(body.len())];
         let options_env = body
             .find("env.extend(options.env)")

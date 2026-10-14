@@ -293,11 +293,10 @@ fn 固定が上限まで決着しなければ上限で流して通知する() {
         "pending",
         "決着より先に上限が来たはず: {report:?}"
     );
+    // 解けた時刻は証拠として出すだけ（所要は assert にしない = `.agent/conventions.md`
+    // 「効果を測る単体テストは実時間で比べない」）。上限の経路で解けたことは
+    // `release=limit`・`state=pending`・`HoldLimit` の出来事の 3 つで見る
     let limit = DIRECT_HOLD_LIMIT.as_millis();
-    assert!(
-        released_ms + 20 >= limit,
-        "上限（{limit}ms）より前に解けた: {released_ms}ms"
-    );
     // 入力は流れた（cmd.exe が `type` を実行し、遅らせた固定より先に書くので化ける）
     assert!(
         pane.wait_type_result(),

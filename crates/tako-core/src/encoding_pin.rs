@@ -313,6 +313,9 @@ struct State {
     released_at: Option<Instant>,
     flush: Option<Flush>,
     watching: bool,
+    /// 見張りが上限まで眠った回数（テストが実時間ではなく機構で「上限をどこから数えたか」を
+    /// 観るための口。`.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）
+    watch_waits: u32,
 }
 
 impl PinGate {
@@ -508,6 +511,7 @@ impl PinGate {
                 });
                 return;
             }
+            st.watch_waits += 1;
             st = self
                 .0
                 .wake
@@ -515,6 +519,12 @@ impl PinGate {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    /// 見張りが上限まで眠った回数（テスト用の観測口）
+    #[cfg(test)]
+    fn watch_waits(&self) -> u32 {
+        self.lock().watch_waits
     }
 }
 
@@ -849,19 +859,22 @@ mod tests {
 
     #[test]
     fn 決着しないまま上限が来たら流して記録する() {
-        let sink = Sink::default();
-        let limit = Duration::from_millis(80);
-        let gate = sink.gate(limit);
-        let ticket = gate.register(PinTarget::Direct, Some(1));
-        let started = Instant::now();
-        assert_eq!(gate.submit(b"late".to_vec()), None);
+        // 上限の前は勝手に解けない（見張りは上限まで眠っている）。上限が十分遠い門で見る
+        let far = Sink::default();
+        let gate = far.gate(LONG);
+        let _ticket = gate.register(PinTarget::Direct, Some(1));
+        assert_eq!(gate.submit(b"early".to_vec()), None);
+        assert!(wait_until(|| gate.watch_waits() >= 1), "見張りが眠らない");
+        assert!(far.flushed().is_empty(), "上限の前に流れた");
+        assert_eq!(gate.report().hold.release, None);
+        gate.close();
 
+        // 上限が来たら見張りが流し、出来事を通知する
+        let sink = Sink::default();
+        let gate = sink.gate(Duration::from_millis(80));
+        let ticket = gate.register(PinTarget::Direct, Some(1));
+        assert_eq!(gate.submit(b"late".to_vec()), None);
         assert!(wait_until(|| !sink.flushed().is_empty()), "上限で流れない");
-        assert!(
-            started.elapsed() >= limit - Duration::from_millis(5),
-            "上限より前に流れた: {:?}",
-            started.elapsed()
-        );
         assert_eq!(sink.flushed(), vec![b"late".to_vec()]);
         let report = gate.report();
         assert_eq!(report.hold.release, Some(Release::Limit));
@@ -887,12 +900,14 @@ mod tests {
         let sink = Sink::default();
         let gate = sink.gate(Duration::from_millis(30));
         let _ticket = gate.register(PinTarget::Direct, Some(1));
+        // 起動から上限を過ぎてから最初の入力を預ける
         std::thread::sleep(Duration::from_millis(60));
-        // 起動から上限を過ぎてから来た入力はほぼ待たずに流れる
-        let started = Instant::now();
         assert_eq!(gate.submit(b"x".to_vec()), None);
-        assert!(wait_until(|| !sink.flushed().is_empty()));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(wait_until(|| !sink.flushed().is_empty()), "上限で流れない");
+        // 見張りは一度も眠らずに流した = 上限を「預けた時刻」ではなく起動から数えている
+        // （預けた時刻から数えるなら 30 ms 眠ってから流す）
+        assert_eq!(gate.watch_waits(), 0);
+        assert_eq!(gate.report().hold.release, Some(Release::Limit));
     }
 
     #[test]
