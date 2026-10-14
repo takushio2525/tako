@@ -1,0 +1,134 @@
+---
+/**
+ * 場面: SSH 先で作業する（ホスト一覧 → いまのタブに SSH ペイン → つながる → フォルダがツリーに → 開いて直す）。5 手順。#2061
+ * 事実の出どころ:
+ *  - ホストの選択 = ファイルメニュー「リモート接続…」（ui_text/menu.rs）→ パレットの SshHost モード
+ *    （overlays.rs の placeholder「SSH ホストを選ぶ（~/.ssh/config）」・行は「名前 (HostName) @User」= main.rs）。
+ *    開き先は「いま開いているタブへ新ペイン」（tako open-in remote --help）
+ *  - 接続待ちの表示 = ui_text/remote_folder.rs の pane_connecting（「<host> へ接続中…」。失敗したら理由に置き換わり消えない）
+ *  - ツリーの SSH バッジ = sidebar.rs の render_ssh_badge。ssh の検知による自動追加は macOS だけ（#976）
+ *  - リモートの保存 = ui_text/remote_folder.rs の preview_pushed / preview_origin。切断中の保存は押し出し待ちに残る（#966）
+ * ホスト名・ユーザー・パスは架空（example.com）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import Palette from '../motion/Palette.astro';
+import Icon from '../motion/Icon.astro';
+import Cmd from '../motion/Cmd.astro';
+import '../../styles/tako-ui-remote.css';
+
+const TREE = [
+	{ name: 'src', dir: true },
+	{ name: 'config', dir: true },
+	{ name: 'README.md', hit: '5' },
+	{ name: 'compose.yml' },
+];
+---
+
+<Scrolly label="SSH 先で作業する流れ" flip>
+	<div slot="stage" class="tk-stack">
+		<!-- 手順 1〜3: ホストを選ぶ → いまのタブに SSH ペイン → つながる -->
+		<div data-at="1-3" data-fx="fade">
+			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+				<Split>
+					<Pane n={1} title="my-app" state="idle" focus="!2+">
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+					</Pane>
+					<Pane
+						n={2}
+						title="dev-server"
+						at="2+"
+						fx="split"
+						focus="2+"
+						state={[
+							{ at: '2', state: 'wait', text: 'dev-server へ接続中…' },
+							{ at: '3+', state: 'running', text: 'ssh' },
+						]}
+					>
+						<span class="tk-l" data-at="3+"><span class="tk-ok">dev@dev-server</span>:<span class="tk-acc">~</span>$ <span data-at="3" data-fx="type" style="--d: .4s">cd /srv/app &amp;&amp; ls</span></span>
+						<span class="tk-l tk-o" data-at="3+" style="--d: 1.4s">README.md  compose.yml  config  src</span>
+						<span class="tk-l" data-at="3+" style="--d: 1.6s"><span class="tk-ok">dev@dev-server</span>:<span class="tk-acc">/srv/app</span>$ <span class="tk-cur"></span></span>
+					</Pane>
+				</Split>
+				<Palette
+					slot="overlay"
+					at="1"
+					placeholder="SSH ホストを選ぶ（~/.ssh/config）"
+					items={[
+						{ label: 'dev-server (dev.example.com) @dev', selAt: '1' },
+						{ label: 'build-box (build.example.com)' },
+						{ label: 'raspi (pi.example.com) @pi' },
+					]}
+				>
+					<Pointer path="1:46,35" click="1" />
+				</Palette>
+			</TakoWindow>
+		</div>
+
+		<!-- 手順 4〜5: SSH 先のフォルダがツリーに並ぶ → 開いて直す -->
+		<div data-at="4+" data-fx="fade">
+			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+				<div class="tk-rside">
+					<div class="tk-tree">
+						<div class="tk-tree-row"><Icon name="chevronRight" /><Icon name="folder" /><span>my-app</span></div>
+						<div class="tk-tree-row">
+							<Icon name="chevronDown" /><Icon name="folder" /><span>app</span>
+							<span class="tk-ssh-badge"><Icon name="globe" />SSH dev-server</span>
+						</div>
+						{
+							TREE.map((it) => (
+								<div
+									class:list={['tk-tree-row', { 'is-file': !it.dir }]}
+									style="--depth: 1.4"
+									data-at={it.hit}
+									data-fx={it.hit ? 'state' : undefined}
+								>
+									<Icon name={it.dir ? 'folder' : 'file'} />
+									<span>{it.name}</span>
+								</div>
+							))
+						}
+					</div>
+				</div>
+				<Split dir="col">
+					<Pane n={2} title="dev-server" state="running" focus="4">
+						<span class="tk-l"><span class="tk-ok">dev@dev-server</span>:<span class="tk-acc">/srv/app</span>$ <span class="tk-cur"></span></span>
+					</Pane>
+					<Pane n={3} title="README.md" state="none" at="5" fx="split" focus="5" body="flush" cwd="リモート: dev-server:/srv/app/README.md">
+						<div class="tk-pane-col">
+							<div class="tk-pane-term">
+								<span class="tk-l tk-b"># app</span>
+								<span class="tk-l tk-o">本番の設定は config/ にあります。</span>
+								<span class="tk-l tk-ok" data-at="5" data-fx="type" style="--d: .9s">起動は docker compose up です。</span>
+							</div>
+							<div class="tk-pushbar" data-at="5" data-fx="fade" style="--d: 2.2s">リモートへ保存しました: dev-server:/srv/app/README.md</div>
+						</div>
+					</Pane>
+				</Split>
+				<Pointer slot="overlay" path="5:20,40" click="5" />
+			</TakoWindow>
+		</div>
+	</div>
+
+	<Step title="「リモート接続…」で、ホストを選ぶ">
+		<p>ファイルメニューの「リモート接続…」を開くと、<code>~/.ssh/config</code> のホストが並びます。新しく覚える設定はありません。</p>
+	</Step>
+	<Step title="いまのタブに、SSH のペイン">
+		<p>選んだ相手へのペインが、いま開いているタブに増えます。つながるまではペインの上に「接続中…」、失敗したら理由がそのまま残ります（黙って消えません）。</p>
+	</Step>
+	<Step title="つながれば、いつものシェル">
+		<p>あとは普通の SSH です。コマンドなら下の 1 行で同じことができ、AI も同じ操作でペインを開けます。</p>
+		<Cmd>tako open-in remote dev-server</Cmd>
+	</Step>
+	<Step title="SSH 先のフォルダが、ツリーに並ぶ">
+		<p>ファイルメニューの「リモートからフォルダを開く…」で、相手のフォルダがファイルツリーに <strong>SSH の札付き</strong>で並びます。鍵で入れる相手なら、ペインで ssh しただけでも tako が見つけて足します。</p>
+	</Step>
+	<Step title="開いて直す。保存はそのままリモートへ">
+		<p>ツリーから開いたファイルは、手元のファイルと同じようにプレビューして編集できます。保存はリモートへ書き戻されます。つながっていない間の保存は消さずに手元に残し、あとから送り直せます。</p>
+		<p class="tk-step-note">Windows でも使えます。ただし接続の使い回しが無いため操作ごとにつなぎ直し、パスワードでしか入れない相手は毎回聞かれます。ssh の検知による自動追加と、切れたあとの自動の再接続はまだです。</p>
+	</Step>
+</Scrolly>

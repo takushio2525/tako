@@ -1,0 +1,115 @@
+---
+/**
+ * 場面: スマホから立ち上げる・ファイルを直す（「+ 新規」の 3 択 → ファイルの 3 節 → 開いて直して保存）。3 手順。#2061
+ * 事実の出どころ:
+ *  - 起動シート = web/tako-remote/src/components/launch-sheet.jsx（見出し「新しく起動」・案内文・
+ *    master を起動 / ターミナル / SSH ターミナル。どれも新しいタブに立つ。Manage 以上。FR-6.19）
+ *  - ファイル = pages/files.jsx（ショートカット / tako のツリー / このマシン。編集・保存。FR-6.15 / 6.16 / 6.20）。
+ *    ツリーの中は Interact 以上、「このマシン」とショートカットは Manage 以上
+ * フォルダ名・ファイルの中身は架空。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import PhoneBare from '../motion/PhoneBare.astro';
+import PhoneHead from '../motion/PhoneHead.astro';
+import PhoneCard from '../motion/PhoneCard.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+
+const KINDS = [
+	{ label: 'master を起動', desc: 'オーケストレーターの会話を新しいタブで始める' },
+	{ label: 'ターミナル', desc: '新しいタブにシェルを 1 枚開く' },
+	{ label: 'SSH ターミナル', desc: '~/.ssh/config のホストへ新しいタブで接続する' },
+];
+---
+
+<Scrolly label="スマホから新しく立ち上げ、ファイルを直す流れ">
+	<PhoneBare slot="stage" height={31}>
+		<!-- 手順 1: 一覧の「+ 新規」→ 起動シート -->
+		<div class="tk-phone-layer" data-at="1" data-fx="fade">
+			<PhoneHead tasks={1} plusAt="1" />
+			<div class="tk-pscroll">
+				<div class="tk-pgroup"><b>my-app</b><span class="tk-pgroup-n">2</span></div>
+				<PhoneCard title="マスター" role="master" state="running" stateText="実行中">PR を出しました。CI を待っています</PhoneCard>
+				<PhoneCard title="my-app" role="worker" state="running" stateText="実行中">npm test · 12 件すべて緑</PhoneCard>
+			</div>
+			<div class="tk-psheet" data-at="1" data-fx="fade" style="--d: .5s">
+				<div class="tk-psheet-card" data-at="1" style="--d: .65s">
+					<span class="tk-psheet-head"><span>新しく起動</span><span class="tk-psheet-x">×</span></span>
+					<span class="tk-pnote">新しいタブを作って、何を立てるか選びます。</span>
+					{
+						KINDS.map((k) => (
+							<span class="tk-pkind">
+								<b>{k.label}</b>
+								<span>{k.desc}</span>
+							</span>
+						))
+					}
+				</div>
+			</div>
+			<Pointer path="1:55,7" click="1" />
+		</div>
+
+		<!-- 手順 2: ファイル（3 つの節） -->
+		<div class="tk-phone-layer" data-at="2" data-fx="fade">
+			<div class="tk-phdr">
+				<span class="tk-phdr-back">‹</span>
+				<span class="tk-machine" style="flex: 1; min-width: 0">ファイル</span>
+				<span class="tk-phone-btn"><Icon name="refresh" /></span>
+			</div>
+			<span class="tk-pcrumb">my-mac のファイルツリー</span>
+			<div class="tk-pscroll">
+				<span class="tk-psec">ショートカット</span>
+				<span class="tk-pfile"><svg class="tk-ic" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 2.8 2.8 5.8 6.3.9-4.6 4.4 1.1 6.3L12 17.2l-5.6 3 1.1-6.3-4.6-4.4 6.3-.9z"></path></svg><span class="tk-pfile-main"><b>ホーム</b><span>~</span></span><span class="tk-pfile-chev">›</span></span>
+				<span class="tk-psec">tako のツリー</span>
+				<span class="tk-pfile" data-at="2" data-fx="mark" style="--d: 1.1s"><Icon name="folder" /><span class="tk-pfile-main"><b>my-app</b><span>my-app</span></span><span class="tk-pfile-chev">›</span></span>
+				<span class="tk-pfile"><Icon name="folder" /><span class="tk-pfile-main"><b>app</b><span>my-app <span class="tk-pbadge">SSH dev-server</span></span></span><span class="tk-pfile-chev">›</span></span>
+				<span class="tk-psec">このマシン</span>
+				<span class="tk-pfile"><Icon name="laptop" /><span class="tk-pfile-main"><b>/</b><span>ルートから全部たどる</span></span><span class="tk-pfile-chev">›</span></span>
+			</div>
+			<Pointer path="2:60,53" click="2" />
+		</div>
+
+		<!-- 手順 3: 開いて、直して、保存 -->
+		<div class="tk-phone-layer" data-at="3" data-fx="fade">
+			<div class="tk-phdr">
+				<span class="tk-phdr-back">‹</span>
+				<span class="tk-machine" style="flex: 1; min-width: 0">README.md</span>
+				<span class="tk-phone-btn"><Icon name="refresh" /></span>
+			</div>
+			<span class="tk-pcrumb">my-app/README.md</span>
+			<div class="tk-pscroll">
+				<span class="tk-pfile">
+					<Icon name="file" />
+					<span class="tk-pfile-main"><b>README.md</b><span>1.2 KB</span></span>
+					<span class="tk-pbtn">端末に保存</span>
+				</span>
+				<div class="tk-pedit">
+					<span class="tk-l"># my-app</span>
+					<span class="tk-l"></span>
+					<span class="tk-l">## はじめかた</span>
+					<span class="tk-l">npm install</span>
+					<span class="tk-l tk-pedit-new" data-at="3" data-fx="type">npm run dev で起動します</span>
+				</div>
+				<span class="tk-pbtns">
+					<span class="tk-pbtn">取り消す</span>
+					<span class="tk-pbtn is-primary" data-at="3" data-fx="mark" style="--d: 1.6s">保存</span>
+				</span>
+				<span class="tk-pok" data-at="3" style="--d: 2.1s">保存しました</span>
+			</div>
+			<Pointer path="3:82,85" click="3" />
+		</div>
+	</PhoneBare>
+
+	<Step title="「+ 新規」で、新しいタブを立てる">
+		<p>一覧の右上から、<strong>master を起動 / ターミナル / SSH ターミナル</strong>の 3 つを選べます。選んだものは Mac の tako に新しいタブとして立ちます。</p>
+		<p class="tk-step-note">新しいタブとプロセスを作るので、Manage 以上の権限が要ります。足りない端末には、選択肢の代わりに理由が出ます。</p>
+	</Step>
+	<Step title="PC のファイルを見る">
+		<p>ファイルのボタンから、Mac の tako のツリーに出ているフォルダ（SSH 先も含む）をたどれます。Manage 以上の端末には、よく行くフォルダのショートカットと、<strong>ルートから全部たどる「このマシン」</strong>も並びます。</p>
+		<p class="tk-step-note">ファイルを読むのも Interact 以上です。画面を見るだけ（Observe）の端末からは、ファイルの中身を持ち出せません。</p>
+	</Step>
+	<Step title="開いて、直して、保存">
+		<p>開いたファイルはその場で編集して保存できます。書き戻しは Mac の tako の編集と同じ経路を通るので、外で書き換えられていたら上書きせずに止まります。手元に落としたいときは「端末に保存」。</p>
+	</Step>
+</Scrolly>

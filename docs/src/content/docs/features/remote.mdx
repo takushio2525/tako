@@ -1,0 +1,165 @@
+---
+title: リモートアクセス
+seoTitle: スマホから AI エージェントを監視・操作する — Tailscale でのリモートアクセスと SSH
+description: 外出先のスマホから Mac の tako を開いて、AI の作業の続きを頼む。SSH 先のサーバーも、手元と同じペインとファイルツリーで扱える。公開は Tailscale の tailnet の中だけで、端末は Mac の画面で承認します
+---
+
+import SceneRemoteConnect from '../../../components/scenes/SceneRemoteConnect.astro';
+import SceneRemotePhone from '../../../components/scenes/SceneRemotePhone.astro';
+import SceneRemoteLaunch from '../../../components/scenes/SceneRemoteLaunch.astro';
+import SceneRemoteSsh from '../../../components/scenes/SceneRemoteSsh.astro';
+import RemoteSafety from '../../../components/motion/RemoteSafety.astro';
+import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+
+AI に長い作業を任せて席を離れても、スマホから進み具合を見て、確認待ちに答え、続きを頼めます。サーバーで作業するときは、SSH 先のフォルダを手元と同じツリーとペインで開けます。
+
+<div class="tako-os-grid tako-os-pick not-content">
+<a class="tako-os-card" href="#phone">
+<span class="tako-os-name">外出先から、スマホで <span class="tako-os-badge">macOS</span></span>
+<span class="tako-os-req">Tailscale の tailnet の中だけで開く固定 URL</span>
+<span class="tako-os-note">ペインを見る・返事をする・コマンドを実行する・新しく立ち上げる・ファイルを直す</span>
+<span class="tako-os-link">スマホとつなぐ →</span>
+</a>
+<a class="tako-os-card is-windows" href="#ssh">
+<span class="tako-os-name">SSH 先で作業する <span class="tako-os-badge">Windows でも使えます</span></span>
+<span class="tako-os-req">~/.ssh/config のホストをそのまま使う</span>
+<span class="tako-os-note">いまのタブに SSH のペイン・SSH 先のフォルダをツリーへ・開いて直して保存</span>
+<span class="tako-os-link">SSH の使い方 →</span>
+</a>
+</div>
+
+<div id="phone" class="tako-anchor"></div>
+
+## 外出先から、スマホで続きを
+
+用意するのは、Mac とスマホの両方の [Tailscale](https://tailscale.com/)（同じアカウントでログイン。個人なら無料プランで足ります）と、Mac の tmux（`brew install tmux`）です。スクロールすると、画面がその手順の状態に変わります。
+
+### つなぐ（最初の 1 回だけ）
+
+<SceneRemoteConnect />
+
+### スマホで続きを頼む
+
+<SceneRemotePhone />
+
+### スマホから新しく立ち上げる・ファイルを直す
+
+<SceneRemoteLaunch />
+
+スマホの画面はブラウザの「ホーム画面に追加」でアプリのように置けて、次からはアイコンを開くだけでつながります。AI から届いた「人がやること」も、一覧の右上のチェックリストから開いて返答・完了まで済ませられます（[人がやること](/features/user-tasks/)）。
+
+<div id="ssh" class="tako-anchor"></div>
+
+## SSH 先で作業する
+
+<SceneRemoteSsh />
+
+同じことはコマンドでもできます。`tako remote-folder open` は、フォルダをツリーに開くのと一緒に、そのフォルダへ `cd` 済みの SSH ペインも用意します（フォルダを省くと相手のホーム）。
+
+<Cmd>tako remote-folder open dev-server</Cmd>
+
+切断中に保存した内容は手元に残り、`tako remote-folder pending` で一覧、`tako remote-folder push` で送り直せます。
+
+## Windows では
+
+スマホからの接続は **macOS 版で使えます。Windows 版はまだです**。SSH 先での作業は Windows でも使えますが、一部の動きが macOS と違います。最新の状況は [Windows 対応状況](/windows-support/) にあります（tako からは `tako platform` で引けます）。
+
+<WindowsLimits
+	items={[
+		{
+			kind: 'pending',
+			title: 'スマホからの接続（tako remote）',
+			text: '止まる原因は取り除きましたが、Windows 実機で「セットアップ → 起動 → スマホから接続」を通しで確かめていません。確かめるまでは「使える」とは書きません。',
+			tools: ['tako_remote_setup', 'tako_remote_start', 'tako_remote_status', 'tako_remote_devices', 'tako_remote_shortcuts'],
+		},
+		{
+			kind: 'degraded',
+			title: 'SSH のペインとリモートのフォルダ',
+			text: 'Windows の OpenSSH には接続の使い回し（ControlMaster）が無いので、操作ごとにつなぎ直します。鍵や ssh-agent で入れる相手は変わりませんが、パスワードでしか入れない相手はそのたびに聞かれます。切れたあとの自動の再接続と、ペインの ssh を見つけてツリーに足す動きもまだです（メニューやコマンドから明示的に開けば使えます）。',
+			tools: ['tako_open_remote', 'tako_remote_folder'],
+		},
+	]}
+/>
+
+## 安全性の作り
+
+公開インターネットには出しません。通り道と、2 つの関門は次のとおりです。
+
+<RemoteSafety />
+
+- **層① Tailscale のノード確認**: tailnet にログインした端末だけが届き、tako 側でも Tailscale が保証する身元を確かめます。tako 自身は `127.0.0.1` だけで待ち受け、LAN や外からは直接つながりません
+- **層② 機器ペアリング**: tailnet の中の端末でも、**Mac の画面で承認するまで画面のデータを 1 つも受け取れません**。QR と URL は恒久固定で、合言葉やトークンを含みません
+- **記録は中身を持たない**: 接続・ペアリング・入力のバイト数は監査ログに残りますが、画面の中身と入力した文字は残しません
+
+権限（role）は 4 段です。
+
+<table>
+<thead><tr><th>role</th><th>できること</th></tr></thead>
+<tbody>
+<tr><td><strong>Observe</strong>（既定）</td><td>画面を見るだけ</td></tr>
+<tr><td><strong>Interact</strong></td><td>+ テキスト入力・承認応答・コマンドの実行・tako のツリーにあるファイル</td></tr>
+<tr><td><strong>Manage</strong></td><td>+ ペインを閉じる・リサイズ・新しく立ち上げる・PC 全体のファイル（このマシン）とショートカット</td></tr>
+<tr><td><strong>Admin</strong></td><td>+ 端末管理（一覧・失効）</td></tr>
+</tbody>
+</table>
+
+**権限を上げられるのは Mac の画面だけです。** AI・CLI・スマホからは「お願い」までです。スマホで権限が足りない画面には「権限の更新をリクエスト」が出て、送ると Mac に承認ダイアログが出ます。許可されれば、スマホは読み込み直さずに続きができます。**下げる・消すのは CLI / MCP からもできます**（置き忘れた権限をその場で畳めるほうが安全側なので）。端末ごとの権限は **設定 → リモート** で選び直せ、ステータスバーの「リモート」からは全端末をまとめて切る停止もできます。
+
+<Cmd>tako remote devices list</Cmd>
+
+:::caution[これは正規の遠隔操作ツールです]
+Interact 以上を許可した端末は、ブラウザから**あなたのターミナルへ任意のコマンドを送れます**（実質的にシェルへのフルアクセス）。自分の端末を自分で操作する目的でだけ使ってください。
+
+- **知らない端末の承認ダイアログが出たら「拒否」してください**
+- 共有の tailnet などで、**その中の全端末を信頼できるとは限らないなら、この機能は使わないでください**
+- Tailscale アカウントの 2 要素認証と tailnet lock も有効にしておくと安心です
+:::
+
+## 起動していれば、再起動しても戻る
+
+一度 `tako remote start`（またはステータスバーの「リモート」の起動ボタン）で起動すれば、**tako や Mac を再起動しても自動で立ち上がり直します**。止めるのは `tako remote stop` を 1 回。そのときは「起動していた」という記録も消えるので、以後は勝手に戻りません。戻せなかったときは、理由がステータスバーのリモートの表示と `tako remote status` に出ます。
+
+<Cmd>tako remote status</Cmd>
+
+## コマンド
+
+<table>
+<thead><tr><th>やりたいこと</th><th>コマンド</th></tr></thead>
+<tbody>
+<tr><td>最初のセットアップ（対話）</td><td><code>tako remote setup</code></td></tr>
+<tr><td>起動して QR を出す / 止める</td><td><code>tako remote start</code> / <code>tako remote stop</code></td></tr>
+<tr><td>固定 URL・登録端末・前回の自動起動の結果</td><td><code>tako remote status</code></td></tr>
+<tr><td>端末の一覧・権限を下げる・失効</td><td><code>tako remote devices list</code> / <code>role &lt;id&gt; &lt;role&gt;</code> / <code>revoke &lt;id&gt;</code></td></tr>
+<tr><td>スマホのファイルのショートカット</td><td><code>tako remote shortcuts</code>（<code>add &lt;path&gt;</code> / <code>remove &lt;path&gt;</code>）</td></tr>
+<tr><td>SSH 先へのペイン</td><td><code>tako open-in remote &lt;host&gt;</code></td></tr>
+<tr><td>SSH 先のフォルダをツリーに開く</td><td><code>tako remote-folder open &lt;host&gt;</code></td></tr>
+</tbody>
+</table>
+
+どれも MCP からも同じ操作ができます（承認と権限の引き上げだけは Mac の画面に限ります）。全オプションは [CLI リファレンス](/guides/cli-reference/#リモートアクセス) にあります。
+
+## よくある質問
+
+**Q: スマホで開くと 502 になる**
+
+Tailscale の `serve` が tako の待ち受けへつながっていない状態です。`tako remote start` はこれを起動の時点で見つけ、理由と次の一手を出して止まります。アプリ版の Tailscale はサンドボックスの制約で Unix ドメインソケットへつなげないため、tako は既定でループバックの TCP を使います。`TAKO_REMOTE_ENDPOINT=unix` を自分で設定しているなら、それを外して `tako remote stop && tako remote start` をやり直してください。
+
+**Q: Mac に Tailscale が 2 つ入っている（アプリ版と `tailscaled`）**
+
+2 つは別々の端末として tailnet に登録されます（名前の末尾に `-1` が付くのはこのため）。どちらを使うかは `tako remote setup` で選べます。選び直すなら `tako remote setup --tailscale auto`（アプリ版があればそれ）か `--tailscale standalone`（自分で動かしている `tailscaled`）。いまどちらかは `tako remote status` の `tailscale_variant` に出ます。
+
+**Q: 証明書の公開ログにホスト名が載るのが気になる**
+
+Tailscale が HTTPS の証明書を取るとき、`<マシン名>.<tailnet>.ts.net` が公開ログに載ります（Tailscale の仕様）。マシン名に知られたくない情報を入れないでください。
+
+**Q: v0.5 以前の URL（trycloudflare.com / tako-remote.pages.dev）は使える？**
+
+いいえ。v0.6.0 で削除しました。移行手順は [リモート接続の移行ガイド](/guides/remote-migration/) にあります。
+
+## 関連ページ
+
+- [人がやること（ユーザータスク）](/features/user-tasks/) — スマホの `#/tasks` から片付ける
+- [リモート接続の移行ガイド](/guides/remote-migration/) — v0.5 以前からの移行
+- [CLI リファレンス](/guides/cli-reference/#リモートアクセス) — `tako remote` の全コマンド
+- [Windows 対応状況](/windows-support/) — 機能ごとの対応表

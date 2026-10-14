@@ -1,0 +1,57 @@
+---
+/**
+ * Mac の tako に出るリモート端末の承認ダイアログ（#2061）。TakoWindow の slot="overlay" に置く。
+ *
+ *   <MacDialog slot="overlay" at="5" device="iPhone" role="interact" allowAt="5" />
+ *
+ * 文言と並びの正本は crates/tako-app/src/remote_panel.rs と ui_text/remote.rs
+ * （題名・端末名 / ユーザー / ノード・「許可する権限を選択:」・4 つの権限・拒否 / 許可）。
+ * 承認と権限の昇格は **この Mac の画面でだけ**できる（AI・CLI・スマホからは上げられない。FR-6.5）。
+ */
+import '../../styles/tako-ui-remote.css';
+
+type Role = 'observe' | 'interact' | 'manage' | 'admin';
+
+interface Props {
+	/** ダイアログが出る手順（data-at の書き方） */
+	at?: string;
+	/** 端末が名乗った名前 */
+	device?: string;
+	/** Tailscale のユーザーとノード（架空の値を渡す） */
+	user?: string;
+	node?: string;
+	/** 端末が要求した権限（選ばれた状態で出る） */
+	role?: Role;
+	/** 「許可」を押す手順 */
+	allowAt?: string;
+}
+
+const { at, device = 'iPhone', user = 'you@example.com', node = 'my-iphone', role = 'observe', allowAt } = Astro.props;
+
+// ui_text/remote.rs の role_label と同じ並び・同じ文言
+const ROLES: { value: Role; label: string }[] = [
+	{ value: 'observe', label: 'Observe（画面閲覧のみ）' },
+	{ value: 'interact', label: 'Interact（+ 入力）' },
+	{ value: 'manage', label: 'Manage（+ 閉じる・リサイズ）' },
+	{ value: 'admin', label: 'Admin（+ 端末管理）' },
+];
+---
+
+<div class="tk-mdlg" data-at={at} data-fx={at ? 'fade' : undefined}>
+	<div class="tk-mdlg-card" data-at={at} data-fx={at ? 'pop' : undefined}>
+		<div class="tk-mdlg-title">この端末を接続許可しますか？</div>
+		<div class="tk-mdlg-info">
+			<span>端末名: {device}</span>
+			<span>ユーザー: {user}</span>
+			<span>ノード: {node}</span>
+		</div>
+		<div class="tk-mdlg-hint">許可する権限を選択:</div>
+		<div class="tk-mdlg-roles">
+			{ROLES.map((r) => <span class:list={['tk-mdlg-role', { 'is-sel': r.value === role }]}>{r.label}</span>)}
+		</div>
+		<div class="tk-mdlg-actions">
+			<span class="tk-mdlg-btn is-deny">拒否</span>
+			<span class="tk-mdlg-btn is-allow" data-at={allowAt} data-fx={allowAt ? 'mark' : undefined}>許可</span>
+		</div>
+	</div>
+</div>
