@@ -28,7 +28,7 @@ if (windowsSupport.rows.get('tako_session_restart') !== '一部対応') {
 	<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={25}>
 		<Split>
 			<Pane n={1} title="マスター" badge="ORCH" state="running">
-				<span class="tk-l"><span class="tk-p">my-app ❯</span> tako master</span>
+				<span class="tk-l"><span class="tk-p">❯</span> tako master</span>
 				<span class="tk-l tk-tui-user">ログイン画面にテストを足して</span>
 				<span class="tk-l tk-tui-msg">worker に任せました（ペイン 2）</span>
 			</Pane>
@@ -55,14 +55,16 @@ if (windowsSupport.rows.get('tako_session_restart') !== '一部対応') {
 								<span class="tk-l tk-tui-msg tk-rs-new" data-at="3" style="--d: .6s">3 件目を足しました</span>
 							</div>
 							<div data-at="2" data-fx="fade">
-								<span class="tk-l"><span class="tk-p">my-app ❯</span> <span data-at="2" data-fx="type" style="--d: .3s">claude --resume 3f9c0b1e…</span></span>
+								<span class="tk-l"><span class="tk-p">❯</span> <span data-at="2" data-fx="type" style="--d: .3s">claude --resume 3f9c…</span></span>
 							</div>
 						</div>
 					</div>
 				</div>
 			</Pane>
 		</Split>
-		<Pointer slot="overlay" path="1:86,26 2:86,26" click="2" />
+		<div slot="overlay" data-at="1-2" data-fx="fade">
+			<Pointer path="1:86,26 2:86,26" click="2" />
+		</div>
 	</TakoWindow>
 
 	<Step title="新しい版が出ると、ペインに知らせが出る">

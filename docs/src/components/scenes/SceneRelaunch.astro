@@ -44,14 +44,13 @@ for (const tool of ['tako_persist', 'tako_sessions', 'tako_logs']) {
 					</Pane>
 					<Split dir="col">
 						<Pane n={2} title="my-app" badge="WORKER" parent="master" state="running">
-							<span class="tk-l tk-tui-msg is-tool">tests/login.test.ts を作成</span>
+							<span class="tk-l tk-tui-msg is-tool">login.test.ts を作成</span>
 							<span class="tk-l tk-tui-msg is-tool tk-rs-new" data-at="3+" style="--d: .35s">npm test（3 passed）</span>
-							<span class="tk-l tk-tui-msg tk-rs-new" data-at="3+" style="--d: .55s">テストを 3 件追加しました</span>
+							<span class="tk-l tk-tui-msg tk-rs-new" data-at="3+" style="--d: .55s">3 件追加しました</span>
 						</Pane>
 						<Pane n={3} title="npm run dev" state="running">
 							<span class="tk-l"><span class="tk-p">my-app ❯</span> npm run dev</span>
-							<span class="tk-l tk-dim">ready on http://localhost:3000</span>
-							<span class="tk-l">GET / <span class="tk-ok">200</span></span>
+							<span class="tk-l tk-dim">ready localhost:3000</span>
 							<span class="tk-l tk-rs-new" data-at="3+" style="--d: .35s">GET /login <span class="tk-ok">200</span></span>
 							<span class="tk-l tk-rs-new" data-at="3+" style="--d: .55s">GET /api/me <span class="tk-ok">200</span></span>
 						</Pane>

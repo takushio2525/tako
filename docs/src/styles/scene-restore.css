@@ -81,13 +81,14 @@
   box-shadow: inset 2px 0 0 #6cc3ff;
 }
 
-/* 古い claude を知らせる帯（実物: crates/tako-app/src/main.rs の stale-banner。黄色の薄い地） */
+/* 古い claude を知らせる帯（実物: crates/tako-app/src/main.rs の stale-banner。黄色の薄い地）。
+ * 実物は 1 行で末尾を省略するが、再現の窓は狭く「利用可能です」まで切れて意味が消えるので、2 行まで折り返す */
 .tk-rs-stale {
   display: flex;
   align-items: center;
   gap: 0.6em;
   min-height: 2.2em;
-  padding: 0.25em 0.7em;
+  padding: 0.3em 0.7em;
   background: rgb(249 226 175 / 0.12);
   border-bottom: 1px solid rgb(249 226 175 / 0.25);
   color: var(--ui-fg);
@@ -97,8 +98,9 @@
 .tk-rs-stale-msg {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
 }
 .tk-rs-stale-btn {
   flex: none;
