@@ -160,22 +160,17 @@ pub fn build_wire(argv: &[String], opts: &Options, cwd: &Path) -> JobWire {
                 .find_map(|a| a.strip_prefix("--target-dir=").map(str::to_string))
         });
     let env_target = flag_target.or_else(|| std::env::var("CARGO_TARGET_DIR").ok());
-    let target_dir = (kind == JobKind::Build)
+    let target_dir = matches!(kind, JobKind::Build | JobKind::Test)
         .then(|| {
-            q::cargo_target_dir(
-                cwd,
-                env_target.as_deref(),
-                |dir| {
-                    std::fs::read_to_string(dir.join("Cargo.toml"))
-                        .ok()
-                        .map(|t| t.contains("[workspace]"))
-                },
-            )
+            q::cargo_target_dir(cwd, env_target.as_deref(), |dir| {
+                std::fs::read_to_string(dir.join("Cargo.toml"))
+                    .ok()
+                    .map(|t| t.contains("[workspace]"))
+            })
         })
         .flatten()
         .map(|p| {
-            std::fs::canonicalize(&p)
-                .unwrap_or(p)
+            tako_core::platform::path::canonicalize_or_self(&p)
                 .to_string_lossy()
                 .into_owned()
         });
@@ -340,7 +335,9 @@ fn run_with(
             return run_direct(argv);
         }
         Err(SendError::Rejected(m)) => {
-            note(&format!("順番待ちを受けていない（{m}）ので、そのまま走らせる"));
+            note(&format!(
+                "順番待ちを受けていない（{m}）ので、そのまま走らせる"
+            ));
             return run_direct(argv);
         }
     };
@@ -409,7 +406,9 @@ fn run_with(
             }
             Err(SendError::Rejected(m)) => {
                 display.finish(None);
-                note(&format!("順番待ちを受けていない（{m}）ので、そのまま走らせる"));
+                note(&format!(
+                    "順番待ちを受けていない（{m}）ので、そのまま走らせる"
+                ));
                 return run_direct(argv);
             }
         }
@@ -490,7 +489,8 @@ mod signals {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         static PENDING: AtomicU32 = AtomicU32::new(0);
-        const WATCHED: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+        const WATCHED: [libc::c_int; 4] =
+            [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
         extern "C" fn on_signal(sig: libc::c_int) {
             // async-signal-safe: アトミックへ立てるだけ
@@ -589,7 +589,11 @@ mod tests {
         assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
         assert_eq!(parse_duration("10m").unwrap(), Duration::from_secs(600));
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
-        assert_eq!(parse_duration("5").unwrap(), Duration::from_secs(300), "単位なしは分");
+        assert_eq!(
+            parse_duration("5").unwrap(),
+            Duration::from_secs(300),
+            "単位なしは分"
+        );
         assert!(parse_duration("0s").is_err());
         assert!(parse_duration("x").is_err());
         assert!(parse_duration("3d").is_err());
@@ -627,7 +631,10 @@ mod tests {
             .collect();
         let w = build_wire(&argv, &Options::default(), Path::new("/"));
         assert_eq!(w.id, u64::from(std::process::id()));
-        assert_eq!(w.label, "cargo build --release", "絶対パスは basename へ畳む");
+        assert_eq!(
+            w.label, "cargo build --release",
+            "絶対パスは basename へ畳む"
+        );
         assert_eq!(w.kind, JobKind::Build);
         assert_eq!(w.priority, Priority::Normal);
         assert!(w.enqueued_at_ms > 0);
@@ -672,19 +679,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 届かなければ待たずに走る() {
-        let argv: Vec<String> = ["sh", "-c", "exit 9"].iter().map(|s| s.to_string()).collect();
+        let argv: Vec<String> = ["sh", "-c", "exit 9"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut calls = 0;
         let mut send = |_req: Request| -> Result<Value, SendError> {
             calls += 1;
             Err(SendError::Unreachable("no".into()))
         };
-        let started = Instant::now();
         assert_eq!(
             run_with(&argv, &Options::default(), &mut send, false, &|_| false),
             9
         );
+        // 待たなかったことは「受付の 1 回で諦めた」= 再試行も poll もしていないことで見る
         assert_eq!(calls, 1, "受付の 1 回だけ");
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -707,7 +716,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 入れ子は待たない() {
-        let argv: Vec<String> = ["sh", "-c", "exit 5"].iter().map(|s| s.to_string()).collect();
+        let argv: Vec<String> = ["sh", "-c", "exit 5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut calls = 0;
         let mut send = |_req: Request| -> Result<Value, SendError> {
             calls += 1;
@@ -766,7 +778,9 @@ mod tests {
             if action.as_deref() == Some("done") {
                 done = true;
             }
-            Ok(json!({ "state": "waiting", "position": 1, "waiting": 1, "running": 1, "max_jobs": 1 }))
+            Ok(
+                json!({ "state": "waiting", "position": 1, "waiting": 1, "running": 1, "max_jobs": 1 }),
+            )
         };
         let opts = Options {
             max_wait: Some(Duration::from_secs(1)),

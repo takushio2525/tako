@@ -58,8 +58,10 @@ pub const EXIT_SPAWN_FAILED: i32 = 127;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
-    /// cargo などのビルド・テスト（シェルスクリプトもここ = 順番待ちへ通すのはビルドや検証の入口）
+    /// cargo などのビルド（シェルスクリプトもここ = 順番待ちへ通すのはビルドや検証の入口）
     Build,
+    /// cargo のテスト（`cargo test` / `nextest` / `bench`。テストの実行体の並走でビルドの約 2 倍食う）
+    Test,
     /// playwright（Chromium を起こす）
     Browser,
     /// node のビルド系（npm / npx / pnpm / vite …）
@@ -74,6 +76,7 @@ impl JobKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Build => "build",
+            Self::Test => "test",
             Self::Browser => "browser",
             Self::Node => "node",
             Self::Gui => "gui",
@@ -83,19 +86,30 @@ impl JobKind {
 
     /// 1 件の見込みメモリ（MiB）。過去の記録（#1996）が無いときの既定。
     ///
-    /// build は tako 自身の `cargo build` / `cargo test --workspace` の木の最大メモリの実測
-    /// （取り分 6 = 18 コアで 3 件並走のとき）で決めた。根拠の数値は設計書 §4.3 の注
+    /// build / test は tako 自身の `cargo build --workspace` / `cargo test --workspace` の木の
+    /// 最大メモリの実測（取り分 6 = 18 コアで 3 件並走のとき）で決めた。根拠は設計書 §4.7
     pub fn default_estimate_mb(self) -> u64 {
         match self {
             Self::Build => BUILD_ESTIMATE_MB,
+            Self::Test => TEST_ESTIMATE_MB,
             Self::Browser => 2 * GIB_MB,
             Self::Node | Self::Gui | Self::Other => GIB_MB,
         }
     }
 }
 
-/// build の見込みメモリ（MiB）。設計書 §4.3 の注の実測から
-pub const BUILD_ESTIMATE_MB: u64 = 3 * GIB_MB;
+/// build の見込みメモリ（MiB）。tako-core を触った後の `cargo build --workspace`（取り分 6）の
+/// 木の最大 3,430 MB（2026-10-15 の実測。設計書 §4.7）を 0.5 GB 単位へ切り上げた
+pub const BUILD_ESTIMATE_MB: u64 = 3 * GIB_MB + GIB_MB / 2;
+/// test の見込みメモリ（MiB）。`cargo test --workspace -- --test-threads=4`（取り分 6）の
+/// 木の最大 6,834 MB（2026-10-15 の実測。設計書 §4.7）を切り上げた
+pub const TEST_ESTIMATE_MB: u64 = 7 * GIB_MB;
+
+// テストはビルドより食う（実測）。見込みを入れ替えて逆転させたらコンパイルで落とす
+const _: () = assert!(TEST_ESTIMATE_MB > BUILD_ESTIMATE_MB);
+
+/// cargo のサブコマンドのうちテストの実行体を走らせるもの
+const CARGO_TEST_SUBCOMMANDS: &[&str] = &["test", "t", "nextest", "bench"];
 
 /// argv の第 1 語の basename
 fn base(word: &str) -> &str {
@@ -159,6 +173,20 @@ pub fn classify(argv: &[String]) -> JobKind {
         return JobKind::Other;
     };
     let b = base(first);
+    if b == "cargo" {
+        // サブコマンド = `+toolchain` とオプションの後の最初の語
+        let sub = rest[1..]
+            .iter()
+            .find(|w| !w.starts_with('-') && !w.starts_with('+'))
+            .map(String::as_str);
+        if sub.is_some_and(|s| CARGO_TEST_SUBCOMMANDS.contains(&s)) {
+            return JobKind::Test;
+        }
+        return JobKind::Build;
+    }
+    if b == "cargo-nextest" {
+        return JobKind::Test;
+    }
     if BUILD_PROGRAMS.contains(&b) || b.starts_with("cargo-") {
         return JobKind::Build;
     }
@@ -352,7 +380,11 @@ impl LimitSettings {
         }
         for (name, value, slot) in [
             ("reserve_gb", patch.reserve_gb, &mut next.reserve_gb),
-            ("swap_guard_gb", patch.swap_guard_gb, &mut next.swap_guard_gb),
+            (
+                "swap_guard_gb",
+                patch.swap_guard_gb,
+                &mut next.swap_guard_gb,
+            ),
         ] {
             if let Some(v) = value {
                 if !v.is_finite() || !(GB_RANGE.0..=GB_RANGE.1).contains(&v) {
@@ -473,7 +505,9 @@ pub enum WaitReason {
     PressureCritical,
     PressureWarn,
     /// swap の使用が警戒線以上（warn 扱い）
-    Swap { used_mb: u64 },
+    Swap {
+        used_mb: u64,
+    },
     /// 同時数の上限（tako の外の重い処理も 1 件 = 1 枠）
     MaxJobs {
         running: u32,
@@ -511,12 +545,17 @@ impl WaitReason {
     /// 人が読む 1 文
     pub fn text(&self) -> String {
         match self {
-            Self::Regather => "調停役の立ち上げ直後（走っている処理の登録し直しを待っている）".into(),
+            Self::Regather => {
+                "調停役の立ち上げ直後（走っている処理の登録し直しを待っている）".into()
+            }
             Self::TargetDir => "同じ target dir を使う処理が走っている".into(),
             Self::PressureCritical => "メモリ圧 critical（新しい処理を止めている）".into(),
             Self::PressureWarn => "メモリ圧 warn（実行中が終わってから 1 件ずつ）".into(),
             Self::Swap { used_mb } => {
-                format!("swap 使用 {}（実行中が終わってから 1 件ずつ）", gb(*used_mb))
+                format!(
+                    "swap 使用 {}（実行中が終わってから 1 件ずつ）",
+                    gb(*used_mb)
+                )
             }
             Self::MaxJobs {
                 running,
@@ -524,9 +563,7 @@ impl WaitReason {
                 max,
             } => {
                 if *unmanaged > 0 {
-                    format!(
-                        "同時数の上限（実行 {running} + tako の外 {unmanaged} / 上限 {max}）"
-                    )
+                    format!("同時数の上限（実行 {running} + tako の外 {unmanaged} / 上限 {max}）")
                 } else {
                     format!("同時数の上限（実行 {running} / 上限 {max}）")
                 }
@@ -794,6 +831,14 @@ mod tests {
     #[test]
     fn 区分はコマンドの本体で決める() {
         assert_eq!(classify(&argv("cargo build --release")), JobKind::Build);
+        assert_eq!(classify(&argv("cargo test --workspace")), JobKind::Test);
+        assert_eq!(classify(&argv("cargo +nightly -q t -p a")), JobKind::Test);
+        assert_eq!(classify(&argv("cargo nextest run")), JobKind::Test);
+        assert_eq!(
+            classify(&argv("cargo clippy --all-targets")),
+            JobKind::Build
+        );
+        assert_eq!(classify(&argv("cargo")), JobKind::Build, "サブコマンドなし");
         assert_eq!(classify(&argv("/x/y/cargo-clippy")), JobKind::Build);
         assert_eq!(
             classify(&argv("env CARGO_BUILD_JOBS=2 cargo test")),
@@ -817,6 +862,7 @@ mod tests {
     #[test]
     fn 区分の見込みメモリ() {
         assert_eq!(JobKind::Build.default_estimate_mb(), BUILD_ESTIMATE_MB);
+        assert_eq!(JobKind::Test.default_estimate_mb(), TEST_ESTIMATE_MB);
         assert_eq!(JobKind::Browser.default_estimate_mb(), 2 * GIB_MB);
         assert_eq!(JobKind::Other.default_estimate_mb(), GIB_MB);
     }
@@ -866,7 +912,11 @@ mod tests {
         assert_eq!(default_max_jobs(Some(128 * GIB_MB)), 4, "上限 4");
         assert_eq!(default_max_jobs(None), 2);
         assert_eq!(default_reserve_mb(Some(36 * GIB_MB)), 36 * GIB_MB / 10);
-        assert_eq!(default_reserve_mb(Some(8 * GIB_MB)), 2 * GIB_MB, "下限 2 GB");
+        assert_eq!(
+            default_reserve_mb(Some(8 * GIB_MB)),
+            2 * GIB_MB,
+            "下限 2 GB"
+        );
         let l = effective_limits(&LimitSettings::default(), Some(36 * GIB_MB));
         assert_eq!(l.max_jobs, 3);
         assert_eq!(l.swap_guard_mb, 2 * GIB_MB);
@@ -1027,13 +1077,7 @@ mod tests {
         assert_eq!(a.grants, vec![10]);
         assert_eq!(a.blocked, Some(WaitReason::PressureWarn));
         // critical: 0 件でも入れない
-        let a = admit(&input(
-            Some(machine(30, Pressure::Critical)),
-            l,
-            &[],
-            &w,
-            0,
-        ));
+        let a = admit(&input(Some(machine(30, Pressure::Critical)), l, &[], &w, 0));
         assert!(a.grants.is_empty());
     }
 
@@ -1132,7 +1176,10 @@ mod tests {
             },
         ];
         let a = admit(&input(m, l, &busy, &ws, 0));
-        assert!(a.grants.is_empty(), "先頭が待てば後ろも待つ（追い越し無し）");
+        assert!(
+            a.grants.is_empty(),
+            "先頭が待てば後ろも待つ（追い越し無し）"
+        );
         assert_eq!(a.blocked, Some(WaitReason::TargetDir));
         // 停滞中でもロックを持っているので同じ dir は入れない
         let stalled = [RunningJob {

@@ -6940,10 +6940,11 @@ fn queue_run_cli(args: &QueueArgs) -> ExitCode {
     let Some(QueueCommand::Run(argv)) = &args.command else {
         return ExitCode::FAILURE;
     };
-    let priority_text = args
-        .priority
-        .clone()
-        .or_else(|| std::env::var("TAKO_QUEUE_PRIORITY").ok().filter(|v| !v.is_empty()));
+    let priority_text = args.priority.clone().or_else(|| {
+        std::env::var("TAKO_QUEUE_PRIORITY")
+            .ok()
+            .filter(|v| !v.is_empty())
+    });
     let priority = match priority_text.as_deref() {
         None => tako_core::queue::Priority::default(),
         Some(p) => match tako_core::queue::Priority::parse(p) {
@@ -6954,10 +6955,11 @@ fn queue_run_cli(args: &QueueArgs) -> ExitCode {
             }
         },
     };
-    let max_wait_text = args
-        .max_wait
-        .clone()
-        .or_else(|| std::env::var("TAKO_QUEUE_MAX_WAIT").ok().filter(|v| !v.is_empty()));
+    let max_wait_text = args.max_wait.clone().or_else(|| {
+        std::env::var("TAKO_QUEUE_MAX_WAIT")
+            .ok()
+            .filter(|v| !v.is_empty())
+    });
     let max_wait = match max_wait_text.as_deref().map(w::parse_duration) {
         None => None,
         Some(Ok(d)) => Some(d),

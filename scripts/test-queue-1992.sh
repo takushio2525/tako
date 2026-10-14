@@ -333,7 +333,7 @@ wait_until 5 started A
 enqueue_bg B 1; PB=$LAST_BG
 sleep 1.5
 reason="$(status_json | json_get 'v["queue"]["blocked"]["reason"]')"
-if ! started B && [ "$reason" = "memory" ]; then pass "空き 5.9 GB − 見込み 3 GB × 2 < 予約 3.6 GB で待つ（理由 = memory）"; else fail "空きメモリ: started B? reason=$reason"; fi
+if ! started B && [ "$reason" = "memory" ]; then pass "空き 5.9 GB − 見込み 3.5 GB × 2 < 予約 3.6 GB で待つ（理由 = memory）"; else fail "空きメモリ: started B? reason=$reason"; fi
 wait "$PA" "$PB"
 started B && pass "1 件目が終われば入る" || fail "B が走らなかった"
 q limits --max-jobs 1 >/dev/null

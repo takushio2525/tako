@@ -53,7 +53,10 @@ const SCANS: &[(&str, &str)] = &[
     ("platform::resources::", "OS への問い合わせ（境界 B29）"),
     ("refresh_processes(", "全プロセスの走査"),
     ("refresh_machine(", "機の値の採取"),
-    ("refresh_machine_if_stale(", "機の値の採取（#1994。接続のスレッドだけが呼ぶ）"),
+    (
+        "refresh_machine_if_stale(",
+        "機の値の採取（#1994。接続のスレッドだけが呼ぶ）",
+    ),
     ("backend_pane_pids(", "`tmux list-panes -a`（子プロセス）"),
     ("process_parent_map(", "親子表の採取"),
     ("Command::new(", "子プロセスを起こす"),
@@ -327,9 +330,7 @@ fn scan_ipc(src: &str) -> Vec<Offender> {
             why: "`ipc::submit` が見つからない（走査が空振り）".into(),
         }];
     };
-    let answer = code_lines_with(&window, "queue::answer(")
-        .first()
-        .copied();
+    let answer = code_lines_with(&window, "queue::answer(").first().copied();
     let queue = code_lines_with(&window, "Request::Queue").first().copied();
     let send = code_lines_with(&window, "tx.unbounded_send(")
         .first()
@@ -529,8 +530,8 @@ fn 逆戻りを名指しできる() {
     // ② dispatch の腕で採り直す
     let d = inject(
         &s.dispatch,
-        "                crate::resources::cached_status(),",
-        "                crate::resources::answer(Some(\"status\"))?,",
+        "            \"status\" => Ok(crate::queue::with_section(crate::resources::cached_status())),",
+        "            \"status\" => Ok(crate::queue::with_section(crate::resources::answer(Some(\"status\"))?)),",
         "②",
     );
     expect_named(

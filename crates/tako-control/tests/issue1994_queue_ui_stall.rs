@@ -108,8 +108,14 @@ fn uiの受け口が固まっても割り当ては進む() {
     );
 
     // 生きた pid（wrapper の代役）を 2 本
-    let mut a = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-    let mut b = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let mut a = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut b = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
 
     // 2. 1 件目は割り当て、2 件目は同時数で待つ
     let first = roundtrip(&socket, queue("enqueue", Some(wire(a.id(), 100)))).unwrap();

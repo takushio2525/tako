@@ -691,7 +691,10 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"auto_rename": false}"#).unwrap();
         assert_eq!(old.resources, tako_core::queue::LimitSettings::default());
         let json = serde_json::to_value(&old).unwrap();
-        assert!(json.get("resources").is_none(), "既定のままなら節を書かない: {json}");
+        assert!(
+            json.get("resources").is_none(),
+            "既定のままなら節を書かない: {json}"
+        );
         let set: Settings =
             serde_json::from_str(r#"{"resources": {"max_jobs": 2, "max_wait_min": 10}}"#).unwrap();
         assert_eq!(set.resources.max_jobs, Some(2));

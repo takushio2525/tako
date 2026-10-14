@@ -1061,13 +1061,19 @@ mod tests {
         assert_eq!(job.processes, 5);
         assert_eq!(job.cpu_percent, Some(85.0));
         assert!(!view.jobs.contains_key(&99), "走査に居ない件は入らない");
-        assert_eq!(view.unmanaged, vec![None], "直に打った cargo だけ（CPU の差分はまだ無い）");
+        assert_eq!(
+            view.unmanaged,
+            vec![None],
+            "直に打った cargo だけ（CPU の差分はまだ無い）"
+        );
         // CPU の差分が無ければ None（停滞の判定を進めない）
         let view = managed_view(&procs, &HashMap::new(), &report.heavy, &[(30, 30)]);
         assert_eq!(view.jobs[&30].cpu_percent, None);
         // 順番待ちが 1 件も無ければ重い処理は全部「通っていない」
         assert_eq!(
-            managed_view(&procs, &cpu, &report.heavy, &[]).unmanaged.len(),
+            managed_view(&procs, &cpu, &report.heavy, &[])
+                .unmanaged
+                .len(),
             3
         );
     }

@@ -7086,9 +7086,7 @@ fn dispatch_inner(
             id,
             limits,
         } => match action.as_deref().unwrap_or("status") {
-            "status" => Ok(crate::queue::with_section(
-                crate::resources::cached_status(),
-            )),
+            "status" => Ok(crate::queue::with_section(crate::resources::cached_status())),
             other => crate::queue::handle(other, job.as_ref(), id, limits.as_ref()),
         },
 

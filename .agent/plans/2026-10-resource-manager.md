@@ -326,7 +326,20 @@ tako-control の調停役（シングルトン。tako-app の起動時に立つ�
 | 取り分 | 割り当てた時点の「実行中（停滞を除く）+ 今回の分」で割る。走り出した後は変えない | 設計どおり。走っている cargo の並列は外から変えられない（S6 の jobserver で全体を絞る） |
 | 待ちの表示 | 即座に入れたときは**何も出さない**。待ったときだけ開始の 1 行（待ち時間・取り分） | AI の出力に余計な行を混ぜない |
 | 夜間リリース | env `TAKO_QUEUE_PRIORITY=low` と `TAKO_QUEUE_MAX_WAIT=3h`（中の build-app の run_heavy が拾う） | 夜は worker が走っていて 30 分を超えて待ちうる。超えると夜間リリースが 75 で落ちる |
+| 区分の見込みメモリ | **build 3.5 GB・test 7 GB**（test を区分に足した）・browser 2 GB・その他 1 GB | 下の実測。テストは実行体の並走でビルドの約 2 倍食う |
 | 旧版の tako | 順番待ちを知らない GUI は poll を「未知の action」で断る → wrapper は**待たずに走る**。`run_heavy` は `tako queue --help` に `--max-wait` が無ければ素の実行 | 着地から本番の入れ替えまでの間も、新しい CLI / scripts が壊れない |
+
+**区分の見込みメモリの実測**（2026-10-15。§4.3 の仮置き build 3 GB の決め直し）: GUI 無しの隔離の調停役
+（`TAKO_QUEUE_SOCKET`。機の値は実機・注入はコア数 6 だけ = 取り分 6 は 18 コアで 3 件並走のときと同じ）越しに走らせ、
+調停役の走査（2 秒ごと）が採った木の物理フットプリントの最大（`recent[].peak_mb`）を読んだ。
+
+```
+tako-core を touch した後の cargo build --workspace         236 s  peak 3,430 MB  → build 3.5 GB
+cargo test --workspace --no-fail-fast -- --test-threads=4    862 s  peak 6,834 MB  → test 7 GB
+```
+
+2 秒ごとの採取なので、それより短い山は取りこぼす（見込みは 0.5 GB 単位へ切り上げた）。冷えた target からの
+フルビルドは測っていない（取り分 6 で rustc の同時数は抑えられるので、山を決めるのは tako-app の本体と link）。
 
 ## 5. 優先度（論点 4）
 

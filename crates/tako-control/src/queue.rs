@@ -176,9 +176,9 @@ struct Arbiter {
     blocked: Option<WaitReason>,
     /// GUI 無しで立てた（`tako queue serve`）
     headless: bool,
-    /// テストだけ: 機の値と論理 CPU 数を固定し、走査の覚えを読まない（機の実際の状態で揺れない）
-    #[cfg(test)]
-    test_machine: Option<(Option<MachineView>, u32)>,
+    /// 機の値と論理 CPU 数を固定し、走査の覚えを読まない（**単体テストだけが立てる**。本番は常に
+    /// `None`。機の実際の状態で判断が揺れないように）
+    fixed_machine: Option<(Option<MachineView>, u32)>,
 }
 
 fn arbiter() -> &'static Mutex<Arbiter> {
@@ -294,12 +294,9 @@ impl Inject {
 
 /// 機の値（MiB）と論理 CPU 数。採れなければ機の値は `None`
 fn machine(a: &Arbiter, inj: Option<&Inject>) -> (Option<MachineView>, u32) {
-    #[cfg(test)]
-    if let Some(fixed) = a.test_machine {
+    if let Some(fixed) = a.fixed_machine {
         return fixed;
     }
-    #[cfg(not(test))]
-    let _ = a;
     let fallback_cpus = || {
         std::thread::available_parallelism()
             .map(|n| n.get() as u32)
@@ -372,13 +369,13 @@ pub fn handle(
             cancel(id)
         }
         "enqueue" | "poll" | "started" => {
-            let job = job.ok_or_else(|| {
-                DispatchError::InvalidParams(format!("{action} には job が要る"))
-            })?;
+            let job = job
+                .ok_or_else(|| DispatchError::InvalidParams(format!("{action} には job が要る")))?;
             poll(job, Instant::now())
         }
         "done" => {
-            let job = job.ok_or_else(|| DispatchError::InvalidParams("done には job が要る".into()))?;
+            let job =
+                job.ok_or_else(|| DispatchError::InvalidParams("done には job が要る".into()))?;
             done(job, Instant::now())
         }
         other => Err(DispatchError::InvalidParams(format!(
@@ -444,8 +441,7 @@ fn push_recent(a: &mut Arbiter, job: &Job, exit_code: Option<i32>, lost: bool) {
 
 /// 走査の覚えから実行中の木の消費・停滞・tako の外の件数を取り込む（新しい走査が来たときだけ）
 fn refresh_usage(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
-    #[cfg(test)]
-    if a.test_machine.is_some() {
+    if a.fixed_machine.is_some() {
         return;
     }
     if !a.jobs.is_empty() {
@@ -745,7 +741,11 @@ pub fn serve_headless(socket: &str, token: String) -> std::io::Result<()> {
     let stall = std::env::var(ENV_INJECT_UI).is_ok_and(|v| v == "ui-stall");
     eprintln!(
         "tako queue serve: 隔離の調停役を立てた（GUI 無し{}）",
-        if stall { "・UI の代役は答えない" } else { "" }
+        if stall {
+            "・UI の代役は答えない"
+        } else {
+            ""
+        }
     );
     let mut held = Vec::new();
     while let Some(incoming) = futures::executor::block_on(rx.next()) {
@@ -841,22 +841,21 @@ pub fn status_section() -> Value {
     })
 }
 
-/// テスト用: 状態を空へ戻す
-#[cfg(test)]
-fn reset_for_test(role: Option<Role>) {
-    let mut a = lock();
-    *a = Arbiter::default();
-    a.role = role;
-    // 立ち上げ直後の待ちを飛ばす（テストは別に確かめる）
-    a.enabled_at = None;
-    // 機の値は「採れない」（同時数だけで決める）・論理 CPU は 8 に固定
-    a.test_machine = Some((None, 8));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tako_core::queue::JobKind;
+
+    /// 状態を空へ戻す
+    fn reset_for_test(role: Option<Role>) {
+        let mut a = lock();
+        *a = Arbiter::default();
+        a.role = role;
+        // 立ち上げ直後の待ちを飛ばす（テストは別に確かめる）
+        a.enabled_at = None;
+        // 機の値は「採れない」（同時数だけで決める）・論理 CPU は 8 に固定
+        a.fixed_machine = Some((None, 8));
+    }
 
     /// 調停役はプロセスに 1 つの状態なので、テストは直列に回す
     fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -909,7 +908,10 @@ mod tests {
             Some(Role::Explicit)
         );
         assert_eq!(role_for(None, false, false, false), Some(Role::Production));
-        assert_eq!(role_for(Some(""), false, false, false), Some(Role::Production));
+        assert_eq!(
+            role_for(Some(""), false, false, false),
+            Some(Role::Production)
+        );
         assert_eq!(role_for(None, true, false, false), None, "隔離");
         assert_eq!(role_for(None, false, true, false), None, "セルフテスト");
         assert_eq!(role_for(None, false, false, true), None, "セカンダリ");
@@ -983,7 +985,10 @@ mod tests {
         // 窓が明けた後: 走っている 1 件で上限。先に受け付けた 200 が先頭
         lock().enabled_at = None;
         let b = poll(&wire(pids[1], 200), now).unwrap();
-        assert_eq!((b["position"].as_u64(), b["reason"].as_str()), (Some(1), Some("max_jobs")));
+        assert_eq!(
+            (b["position"].as_u64(), b["reason"].as_str()),
+            (Some(1), Some("max_jobs"))
+        );
         running.exit_code = Some(0);
         done(&running, now).unwrap();
         assert_eq!(poll(&wire(pids[2], 300), now).unwrap()["state"], "waiting");
