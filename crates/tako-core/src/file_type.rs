@@ -12,6 +12,8 @@
 //!
 //! **全 213 構文を並べない**。行を持つのは「既定（[`CODE`] = code・two-face 任せ・4 スペース・
 //! 括弧で深く）から外れる形式」と「挙動の表が名指す形式」だけで、表に無い形式は既定のまま。
+//! 拡張子だけでは塗る構文が決まらない形式（`.m` = MATLAB / Objective-C）は、本文の手掛かりで
+//! 構文を決める純粋関数 [`syntax_by_content`] を色分けが行の `syntax` より先に引く（#1953）。
 //!
 //! 挙動の表（`lsp::servers` / `platform::runner_defaults` / `runner_project`）は**分けたまま**
 //! （#1726 設計 §9.2。1 枚にすると疎な表になる）。代わりに番犬
@@ -150,6 +152,11 @@ const LEX_JS: Lexical = Lexical {
 
 /// Arduino のスケッチ（#1949）。`TAKO_1949_LEGACY=1` の A/B が名指す
 pub const ARDUINO: &str = "arduino";
+
+/// 既存の構文への別名で色の穴を埋めた行（#1953）。`TAKO_1953_LEGACY=1` の A/B がこの行の
+/// `syntax` と本文の判定（[`syntax_by_content`]）を外し、#1953 以前（`.h` = Objective-C・
+/// `.pde` / `.json5` / `.jsonc` = Plain Text）へ戻す
+pub const ALIASES_1953: &[&str] = &["cpp", "processing", "jsonc", "json5"];
 
 // 行コメントの記号（#1692）。表の行がこのどれかを `comment` に持つ
 const SLASHES: Option<CommentSyntax> = Some(CommentSyntax::Line("//"));
@@ -368,6 +375,38 @@ pub const TABLE: &[FileType] = &[
         lexical: LEX_C,
         ..CODE
     },
+    // `.pde`（Processing のスケッチ）は Java として塗る（#1953）。two-face に Processing の構文は
+    // 無い。`.ino` と同じく寄せるのは**色だけ**で、`java` の行にはしない（クラスで包まないスケッチは
+    // Java として正しくないので、Java の言語サーバ（#1956）へ渡すと嘘のエラーになる）
+    FileType {
+        id: "processing",
+        extensions: &["pde"],
+        syntax: Some("Java"),
+        fence_tokens: &["pde", "processing"],
+        comment: SLASHES,
+        lexical: LEX_C,
+        ..CODE
+    },
+    // JSON5 は JavaScript として塗る（#1953。GitHub の Linguist も `source.js`）。JSON の構文は
+    // コメントと末尾カンマは通すが、JSON5 にしか無い書き方（クォートの無いキー・`'…'`・16 進・
+    // `Infinity`・`.5`）を `invalid.illegal` にし、テーマがそれを地の色（#2d2d2d）で描くので
+    // ダークでは字が消える（renovate.json5 の形で 144 字句中 113）。JavaScript なら 0
+    FileType {
+        id: "json5",
+        extensions: &["json5"],
+        syntax: Some("JavaScript"),
+        fence_tokens: &["json5"],
+        comment: SLASHES,
+        lexical: LEX_WEB,
+        ..CODE
+    },
+    // JSONC（コメントと末尾カンマを許す JSON）は JSON の構文で塗る（#1953）。JSON の構文は
+    // `//` / `/* */` をコメントとして塗り、末尾カンマを `invalid` にしない（実測で 0 字句）
+    FileType {
+        syntax: Some("JSON"),
+        fence_tokens: &["jsonc"],
+        ..lexed("jsonc", &["jsonc"], SLASHES, LEX_C)
+    },
     named("ignore", &[".dockerignore"], "Git Ignore", HASH),
     named("ini", &[".npmrc", ".yarnrc"], "INI", SEMICOLON),
     // JSON はコメントを持たない（表に無い `.json` も同じく記号なし）
@@ -383,13 +422,19 @@ pub const TABLE: &[FileType] = &[
     },
     // ─── 挙動の表（言語サーバ・実行の既定・実行のプロジェクト）が名指す言語 ──────
     lexed("c", &["c"], SLASHES, LEX_C),
-    // `.h` は VS Code と同じく C++ のヘッダとして数える（色は今は two-face 任せ = #1953）
-    lexed(
-        "cpp",
-        &["cpp", "cc", "cxx", "h", "hh", "hpp", "hxx"],
-        SLASHES,
-        LEX_C,
-    ),
+    // `.h` は VS Code と同じく C++ のヘッダとして数え、C++ で塗る（#1953）。two-face は `.h` を
+    // C / C++ / Objective-C / Objective-C++ が取り合い、最後の Objective-C が勝つ。C のヘッダも
+    // C++ の構文で崩れない。Objective-C のヘッダだけは本文の手掛かりで今までどおり Objective-C
+    // （[`syntax_by_content`]）。ほかの拡張子は two-face でも C++ なので変わらない
+    FileType {
+        syntax: Some("C++"),
+        ..lexed(
+            "cpp",
+            &["cpp", "cc", "cxx", "h", "hh", "hpp", "hxx"],
+            SLASHES,
+            LEX_C,
+        )
+    },
     lexed("rust", &["rs"], SLASHES, LEX_C),
     lexed(
         "shellscript",
@@ -435,7 +480,6 @@ pub const TABLE: &[FileType] = &[
     lexed("css", &["css"], C_BLOCK, LEX_WEB),
     lexed("scss", &["scss"], SLASHES, LEX_WEB),
     lexed("less", &["less"], SLASHES, LEX_WEB),
-    lexed("jsonc", &["jsonc"], SLASHES, LEX_C),
     lexed("toml", &["toml"], HASH, LEX_SCRIPT),
     FileType {
         id: "dockerfile",
@@ -505,6 +549,87 @@ pub fn identify_or_default(path: &Path) -> &'static FileType {
 pub fn id(path: &Path) -> Option<&'static str> {
     identify(path).map(|row| row.id)
 }
+
+// ─── 本文の手掛かりで塗る構文（#1953） ──────────────────────────────────────
+
+/// 本文の手掛かりを探す行数（先頭から）。手掛かりは頭に出るので足り、編集中は 1 打鍵ごとの
+/// 塗り直しでも走るので全文を舐めない
+pub const SNIFF_LINES: usize = 200;
+
+/// 本文の手掛かりが示す言語
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cue {
+    /// `#import` / `@interface` / `@implementation` / `@protocol` / `@class` / `@property` / `@end`
+    ObjectiveC,
+    /// `%` のコメント（`%%` のセル・`%{` も）/ `function` / `classdef`
+    Matlab,
+}
+
+/// 先頭 [`SNIFF_LINES`] 行の手掛かり。Objective-C の印が 1 つでもあれば Objective-C を先に取る
+/// （GitHub の Linguist の `.m` の判定と同じ順。MATLAB の印は Objective-C の本文には出ない）
+pub fn cue(text: &str) -> Option<Cue> {
+    let mut matlab = false;
+    for line in text.lines().take(SNIFF_LINES) {
+        let line = line.trim_start_matches('\u{feff}').trim_start();
+        if OBJECTIVE_C_WORDS
+            .iter()
+            .any(|word| starts_with_word(line, word))
+            || line
+                .strip_prefix("#import")
+                .is_some_and(|rest| rest.starts_with([' ', '\t', '<', '"']))
+        {
+            return Some(Cue::ObjectiveC);
+        }
+        matlab |= line.starts_with('%') || MATLAB_WORDS.iter().any(|w| starts_with_word(line, w));
+    }
+    matlab.then_some(Cue::Matlab)
+}
+
+const OBJECTIVE_C_WORDS: &[&str] = &[
+    "@interface",
+    "@implementation",
+    "@protocol",
+    "@class",
+    "@property",
+    "@end",
+];
+const MATLAB_WORDS: &[&str] = &["function", "classdef"];
+
+/// `line` が `word` で始まり、その後ろが識別子の続きではない（`functional` を `function` にしない）
+fn starts_with_word(line: &str, word: &str) -> bool {
+    line.strip_prefix(word).is_some_and(|rest| {
+        !rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// 拡張子だけでは塗る構文が決まらない形式の、本文の手掛かりによる構文（two-face の構文名）。
+/// 表の行の `syntax` より先に引く。手掛かりが無ければ `None` = 行の `syntax` → two-face の表の順のまま
+///
+/// - `.m`: MATLAB と Objective-C が取り合う（two-face は `.m` を Objective-C に、MATLAB の構文を
+///   拡張子 `matlab` だけに当てる）。表の行は持たない（パスだけでは決まらないので `file_type` は null。
+///   コメントの記号・括弧の書き方も今のまま）
+/// - `.h`: 表では C++ の行。Objective-C のヘッダだけは #1953 以前と同じ Objective-C
+pub fn syntax_by_content(path: &Path, text: &str) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("m") {
+        Some(match cue(text)? {
+            Cue::ObjectiveC => OBJECTIVE_C,
+            Cue::Matlab => MATLAB,
+        })
+    } else if ext.eq_ignore_ascii_case("h") {
+        (cue(text) == Some(Cue::ObjectiveC)).then_some(OBJECTIVE_C)
+    } else {
+        None
+    }
+}
+
+/// [`syntax_by_content`] が返す構文名（tako-app の単体が構文セットに在ることを縛る）
+pub const CONTENT_SYNTAXES: &[&str] = &[OBJECTIVE_C, MATLAB];
+const OBJECTIVE_C: &str = "Objective-C";
+const MATLAB: &str = "MATLAB";
 
 #[cfg(test)]
 mod tests {
@@ -634,6 +759,123 @@ mod tests {
             identify_or_default(Path::new("a.py")).lexical.single_quote,
             SingleQuote::String
         );
+    }
+
+    /// #1953: 既存の構文への別名（行の `syntax`）
+    #[test]
+    fn 別名で塗る形式の行() {
+        let syntax = |path: &str| identify(Path::new(path)).and_then(|row| row.syntax);
+        assert_eq!(syntax("lib.h"), Some("C++"));
+        assert_eq!(syntax("LIB.H"), Some("C++"));
+        assert_eq!(syntax("sketch.pde"), Some("Java"));
+        assert_eq!(syntax("settings.jsonc"), Some("JSON"));
+        assert_eq!(syntax("renovate.json5"), Some("JavaScript"));
+        assert_eq!(id(Path::new("sketch.pde")), Some("processing"));
+        assert_eq!(id(Path::new("config.json5")), Some("json5"));
+        // `.pde` は `java` の行にしない（言語サーバの表が `java` を名指しても渡らない）
+        assert_ne!(id(Path::new("sketch.pde")), id(Path::new("Main.java")));
+        // `.m` と `.S` / `.s` は行を持たない（`.m` は本文で決める・`.S` は寄せない = #1953）
+        for path in ["solve.m", "boot.S", "start.s"] {
+            assert_eq!(id(Path::new(path)), None, "{path}");
+        }
+        for token in ["pde", "Processing", "json5", "JSONC"] {
+            assert!(by_fence_token(token).is_some(), "```{token}");
+        }
+        // A/B が名指す行はすべて表に在り、構文を名指している
+        for id in ALIASES_1953 {
+            let row = TABLE.iter().find(|row| row.id == *id);
+            assert!(row.and_then(|row| row.syntax).is_some(), "{id}");
+        }
+    }
+
+    const MATLAB_SCRIPT: &str =
+        "% 二次方程式を解く\nfunction x = solve(a, b, c)\n    x = -b / (2*a);\nend\n";
+    const OBJC_SOURCE: &str =
+        "#import \"Foo.h\"\n\n@implementation Foo\n- (int)one { return 1; }\n@end\n";
+
+    /// #1953: `.m` は本文の手掛かりで MATLAB / Objective-C を決め、無ければ今のまま（two-face 任せ）
+    #[test]
+    fn mは本文の手掛かりで決める() {
+        let m = Path::new("solve.m");
+        assert_eq!(syntax_by_content(m, MATLAB_SCRIPT), Some("MATLAB"));
+        assert_eq!(syntax_by_content(m, OBJC_SOURCE), Some("Objective-C"));
+        assert_eq!(
+            syntax_by_content(Path::new("Foo.M"), OBJC_SOURCE),
+            Some("Objective-C")
+        );
+        // MATLAB の印は 1 つずつでも効く（コメントだけ・function だけ・classdef だけ）
+        for text in [
+            "%% セル\nx = 1;\n",
+            "  %{\n  ブロックコメント\n  %}\n",
+            "function [a, b] = f(x)\n",
+            "function f\n",
+            "classdef Point < handle\nend\n",
+            "\u{feff}% BOM 付き\n",
+            "x = 1;\r\n% CRLF\r\n",
+        ] {
+            assert_eq!(syntax_by_content(m, text), Some("MATLAB"), "{text:?}");
+        }
+        // Objective-C の印は MATLAB の印より強い（両方あれば Objective-C）
+        for text in [
+            "@interface Foo : NSObject\n@end\n",
+            "#import <Foundation/Foundation.h>\n",
+            "% 先に MATLAB 風の行\n@implementation Foo\n@end\n",
+            "@protocol P\n@end\n",
+        ] {
+            assert_eq!(syntax_by_content(m, text), Some("Objective-C"), "{text:?}");
+        }
+        // 手掛かりが無い本文は今のまま（`None` = two-face の Objective-C）
+        for text in [
+            "",
+            "x = linspace(0, 1, 10);\nplot(x, x.^2)\n",
+            "#include <stdio.h>\nint main(void) { return 0; }\n",
+            "functional = 1;\n",
+            "#importx\n",
+            "@endpoint = 1\n",
+            "  x = 1; % 行末のコメントは数えない\n",
+        ] {
+            assert_eq!(syntax_by_content(m, text), None, "{text:?}");
+        }
+        // 先頭 SNIFF_LINES 行より後ろの手掛かりは見ない（全文を舐めない）
+        let late = format!("{}% 遅い手掛かり\n", "x = 1;\n".repeat(SNIFF_LINES));
+        assert_eq!(syntax_by_content(m, &late), None);
+        let edge = format!("{}% 最後の行\n", "x = 1;\n".repeat(SNIFF_LINES - 1));
+        assert_eq!(syntax_by_content(m, &edge), Some("MATLAB"));
+    }
+
+    /// #1953: `.h` は Objective-C のヘッダだけ本文で Objective-C、ほかは行の C++ のまま
+    #[test]
+    fn hはobjective_cのヘッダだけ本文で決める() {
+        let h = Path::new("lib.h");
+        assert_eq!(
+            syntax_by_content(
+                h,
+                "#import <Foundation/Foundation.h>\n@interface Foo : NSObject\n@end\n"
+            ),
+            Some("Objective-C")
+        );
+        // C / C++ のヘッダと MATLAB 風の本文は `None` = 行の C++
+        for text in [
+            "#ifndef LIB_H\n#define LIB_H\nint add(int a, int b);\n#endif\n",
+            "#pragma once\nnamespace geo { template <typename T> struct P { T x; }; }\n",
+            "% 何かの断片\n",
+            "",
+        ] {
+            assert_eq!(syntax_by_content(h, text), None, "{text:?}");
+        }
+        // ほかの拡張子・拡張子の無いパスは本文を見ない
+        for path in ["a.hpp", "a.cpp", "a.matlab", "Makefile", "m", "h", ""] {
+            assert_eq!(
+                syntax_by_content(Path::new(path), OBJC_SOURCE),
+                None,
+                "{path}"
+            );
+            assert_eq!(
+                syntax_by_content(Path::new(path), MATLAB_SCRIPT),
+                None,
+                "{path}"
+            );
+        }
     }
 
     #[test]
