@@ -38684,7 +38684,10 @@ mod tests {
             result["project"]["marker"],
             sketch.join("sketch.yaml").display().to_string().as_str()
         );
-        assert_eq!(result["runtime"]["kind"], "arduino", "{result}");
+        // 実行環境の層（`${arduino_cli}`）を通っている。自動で選ぶ候補は機械で変わる
+        // （arduino-cli の無い CI では選ばれず `runtime` は null）ので、候補の一覧の側で見る
+        assert_eq!(result["runtimes"][0]["kind"], "arduino", "{result}");
+        assert_eq!(result["runtimes"][0]["manager"], "system", "{result}");
         // 基板は選んであるので compile の案内は無い（ポートの案内は upload にだけ付く）
         let notes = result["project"]["notes"].as_array().unwrap();
         assert!(
