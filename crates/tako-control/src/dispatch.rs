@@ -38625,6 +38625,18 @@ mod tests {
             .command
             .as_ref()
             .expect("command");
+        // Windows の実行ペインは PowerShell へ `-EncodedCommand`（base64 / UTF-16LE）で渡る
+        if let Some(i) = cmd.args.iter().position(|a| a == "-EncodedCommand") {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&cmd.args[i + 1])
+                .expect("base64");
+            let units: Vec<u16> = bytes
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
+                .collect();
+            return String::from_utf16_lossy(&units);
+        }
         cmd.args.join(" ")
     }
 
