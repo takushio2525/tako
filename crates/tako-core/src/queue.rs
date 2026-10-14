@@ -842,7 +842,8 @@ mod tests {
         assert_eq!(classify(&argv("/x/y/cargo-clippy")), JobKind::Build);
         assert_eq!(
             classify(&argv("env CARGO_BUILD_JOBS=2 cargo test")),
-            JobKind::Build
+            JobKind::Test,
+            "env の前置きを飛ばして本体（cargo test）で決める"
         );
         assert_eq!(classify(&argv("nice -n 5 cargo build")), JobKind::Build);
         assert_eq!(
