@@ -53,16 +53,19 @@ export function parseAt(spec: string): Match {
 	return (n) => parts.some((p) => p(n));
 }
 
-/** `data-pos="1:30,40 3:70,80"` → 手順 N で使う座標（N 以下で最も新しいもの）。無ければ null */
+/**
+ * `data-pos="1:30,40 3:70,80 5:-"` → 手順 N で使う座標（N 以下で最も新しいもの）。
+ * `5:-` は「手順 5 から隠す」（その前の位置のまま消える）。指定より前の手順と隠す手順は null
+ */
 function posAt(spec: string, n: number): [string, string] | null {
-	let best: [number, string, string] | null = null;
+	let best: [number, string, string] | [number, null, null] | null = null;
 	for (const tok of spec.trim().split(/\s+/)) {
-		const m = tok.match(/^(\d+):(-?[\d.]+),(-?[\d.]+)$/);
+		const m = tok.match(/^(\d+):(?:(-?[\d.]+),(-?[\d.]+)|(-))$/);
 		if (!m) continue;
 		const k = Number(m[1]);
-		if (k <= n && (!best || k > best[0])) best = [k, m[2], m[3]];
+		if (k <= n && (!best || k > best[0])) best = m[4] ? [k, null, null] : [k, m[2], m[3]];
 	}
-	return best ? [`${best[1]}%`, `${best[2]}%`] : null;
+	return best && best[1] !== null ? [`${best[1]}%`, `${best[2]}%`] : null;
 }
 
 /** ステージ（またはその写し）を手順 n の状態にする */

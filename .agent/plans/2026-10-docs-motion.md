@@ -162,7 +162,7 @@ cd docs && npm ci && npm run build && npm run og:verify && node scripts/verify-l
 | `Releases` | stage | `highlight`（mac / win-exe / win-zip）・`highlightAt` | 配布物の命名規約 |
 | `SmartScreen` | stage | `detailAt`（「詳細情報」を押した後の手順） | — |
 | `Installer` | stage | `tasksAt`・`installAt`（省略可）・`doneAt` | `installer/windows/tako.iss` |
-| `Pointer` | slot overlay | `path`（`手順:横%,縦%` を空白区切り）・`click` | — |
+| `Pointer` | slot overlay | `path`（`手順:横%,縦%` を空白区切り。`手順:-` でその手順から隠す）・`click` | — |
 | `Cmd` | 手順の本文・ページ本文 | `prompt`（既定 `$`）。子 = コマンド 1 行。コピーのボタン付き | — |
 | `WindowsStatus` | ページ | `variant`（full / compact） | `windows-support.md`（生成物） |
 | `WindowsLimits` | ページ | `items`（`kind` / `title` / `text` / `tools`）。挙げた機能が「対応」になるとビルドが落ちる | 同上 |
