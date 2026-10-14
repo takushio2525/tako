@@ -59,6 +59,9 @@ pub enum EditorCommand {
     Outdent,
     /// 行単位の操作（複製・移動・行ごとのインデント・コメントの付け外し。#1692）
     Line(LineOperation),
+    /// 文字の打鍵 1 つ（#1759）。括弧の自動閉じと、自分で入れた閉じ括弧の飛び越しが効く
+    /// （[`TextBuffer::type_char`]）。GUI の文字入力と CLI `tako edit type` が同じここを通る
+    Type(char),
     /// 編集モードを抜ける
     ExitEditing,
 }
@@ -78,6 +81,15 @@ const EDIT_COMMAND_NAMES: [(&str, EditorCommand); 3] = [
 /// （操作の名前は [`LineOperation::name`] の 1 か所。ここは頭を付けるだけ）
 const LINE_PREFIX: &str = "line-";
 
+/// 文字を 1 つずつ打鍵として入れる綴り（#1759）。打つ文字は `text` で渡す
+/// （CLI `tako edit type <文字>` / MCP `tako_preview_edit` の `command: "type"` + `text`）。
+/// 名前だけでは操作にならないので [`EditorCommand::from_edit_name`] は引かない
+pub const TYPE_COMMAND: &str = "type";
+
+/// `type` 1 回で打てる文字数の上限（#1759）。打鍵の再現なので 1 文字ずつ当てて画面を作り直す。
+/// 長い本文は範囲編集（`tako edit replace-range` / `tako_preview_edit_range`）で 1 回に入れる
+pub const TYPE_MAX_CHARS: usize = 1000;
+
 impl EditorCommand {
     /// CLI / MCP の綴りから引く（`indent` / `outdent` / `newline` / `line-<行操作>`）
     pub fn from_edit_name(name: &str) -> Option<Self> {
@@ -92,13 +104,31 @@ impl EditorCommand {
             })
     }
 
-    /// 綴りの一覧（MCP の inputSchema の enum とエラー文の候補）
+    /// 綴りの一覧（MCP の inputSchema の enum とエラー文の候補）。`type`（#1759）は `text` と組で使う
     pub fn edit_names() -> Vec<String> {
         EDIT_COMMAND_NAMES
             .iter()
             .map(|(n, _)| n.to_string())
             .chain(LineOperation::ALL.into_iter().map(Self::line_edit_name))
+            .chain(std::iter::once(TYPE_COMMAND.to_string()))
             .collect()
+    }
+
+    /// `type` の中身（#1759）: `text` を 1 文字ずつの打鍵に並べる。空と上限超えは断る
+    /// （1 文字ずつ GUI の打鍵と同じ口を通るので、括弧の自動閉じと飛び越しが効く）
+    pub fn typed(text: &str) -> Result<Vec<Self>, String> {
+        let commands: Vec<Self> = text.chars().map(Self::Type).collect();
+        if commands.is_empty() {
+            return Err(format!("command={TYPE_COMMAND} には打つ文字（text）が要る"));
+        }
+        if commands.len() > TYPE_MAX_CHARS {
+            return Err(format!(
+                "command={TYPE_COMMAND} は 1 回 {TYPE_MAX_CHARS} 文字まで（{} 文字）。\
+                 長い本文は tako edit replace-range（MCP は tako_preview_edit_range）で入れる",
+                commands.len()
+            ));
+        }
+        Ok(commands)
     }
 
     /// 行操作の CLI / MCP の綴り（`line-move-up`。#1692）
@@ -120,6 +150,7 @@ impl EditorCommand {
             Self::Indent => buffer.indent(),
             Self::Outdent => buffer.outdent(),
             Self::Line(op) => buffer.apply_line_operation(op).map_err(|e| e.to_string())?,
+            Self::Type(c) => buffer.type_char(c),
             Self::ExitEditing => return Ok(false),
         }
         Ok(true)
@@ -818,6 +849,11 @@ mod tests {
     #[test]
     fn 編集コマンドの名前は往復する() {
         for name in &EditorCommand::edit_names() {
+            // `type`（#1759）は打つ文字と組で使うので名前だけでは引けない
+            if name == TYPE_COMMAND {
+                assert_eq!(EditorCommand::from_edit_name(name), None);
+                continue;
+            }
             let command = EditorCommand::from_edit_name(name).expect("表にある名前");
             assert_ne!(command, EditorCommand::ExitEditing);
         }
@@ -844,7 +880,36 @@ mod tests {
         names.dedup();
         assert_eq!(
             names.len(),
-            EDIT_COMMAND_NAMES.len() + LineOperation::ALL.len()
+            EDIT_COMMAND_NAMES.len() + LineOperation::ALL.len() + 1
         );
+    }
+
+    /// #1759: `type` は 1 文字ずつの打鍵に並び、空と上限超えは断る
+    #[test]
+    fn typeは1文字ずつの打鍵に並ぶ() {
+        assert_eq!(
+            EditorCommand::typed("f(あ").unwrap(),
+            vec![
+                EditorCommand::Type('f'),
+                EditorCommand::Type('('),
+                EditorCommand::Type('あ')
+            ]
+        );
+        assert!(EditorCommand::typed("").is_err());
+        assert_eq!(
+            EditorCommand::typed(&"x".repeat(TYPE_MAX_CHARS))
+                .unwrap()
+                .len(),
+            TYPE_MAX_CHARS
+        );
+        let err = EditorCommand::typed(&"x".repeat(TYPE_MAX_CHARS + 1)).unwrap_err();
+        assert!(err.contains("replace-range"), "{err}");
+        // 打鍵として当てると自動閉じと飛び越しが効く（GUI の文字入力と同じ口）
+        let mut buffer = TextBuffer::from_text(std::path::PathBuf::from("t.rs"), String::new());
+        for command in EditorCommand::typed("f(x)").unwrap() {
+            assert_eq!(command.apply(&mut buffer), Ok(true));
+        }
+        assert_eq!(buffer.text(), "f(x)");
+        assert_eq!(buffer.cursor(), 4);
     }
 }

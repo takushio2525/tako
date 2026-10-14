@@ -965,13 +965,17 @@ pub fn tools() -> Vec<Value> {
                 viewport はカーソル行が画面に入っているか（visible=false なら画面外）。\
                 file_type / syntax は形式の ID と塗った構文名。\
                 command は Tab / Shift+Tab / Enter と同じ編集（インデントは既存行から推定）。\
-                line-* は選択行（無ければカーソル行）の複製・移動・行インデント・コメントの付け外しで undo 1 回で戻る。",
+                line-* は選択行（無ければカーソル行）の複製・移動・行インデント・コメントの付け外しで undo 1 回で戻る。\
+                type は text を 1 文字ずつ打鍵として入れる（括弧の自動閉じ・入れた閉じ括弧の飛び越し）。\
+                auto_close は括弧の自動閉じの設定（全ペイン）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象プレビューペイン ID（省略時は呼び出し元）"),
                     "enabled": { "type": "boolean", "description": "true = 編集開始、false = 編集終了（省略時は状態取得）" },
                     "command": { "type": "string", "enum": tako_core::platform::editor_keys::EditorCommand::edit_names() },
+                    "text": { "type": "string", "description": "command=type で打つ文字" },
+                    "auto_close": { "type": "boolean" },
                     "expected_version": { "type": "integer", "minimum": 0 },
                 },
                 "additionalProperties": false,

@@ -677,6 +677,9 @@ impl SettingsWindow {
             Request::LspFormatOnSave {
                 enabled: Some(s.lsp_format_on_save),
             },
+            Request::PreviewAutoClose {
+                enabled: Some(s.editor_auto_close),
+            },
             Request::PreviewCache {
                 max_mb: Some(s.preview_cache_max_mb),
             },
@@ -1398,6 +1401,7 @@ impl SettingsWindow {
         let telemetry = s.telemetry;
         let reload = s.preview_live_reload;
         let format_on_save = s.lsp_format_on_save;
+        let auto_close = s.editor_auto_close;
         let pane_logs = s.pane_logs;
         let confirm_close = tako_control::setup::confirm_close_enabled();
 
@@ -1670,6 +1674,23 @@ impl SettingsWindow {
                         this.run(
                             Request::LspFormatOnSave {
                                 enabled: Some(!format_on_save),
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            // #1759: 括弧の自動閉じ（既定 ON。文書は ON でも閉じない）
+            .child(self.row(
+                txt::label_auto_close(),
+                txt::desc_auto_close(),
+                self.toggle(
+                    "auto-close",
+                    auto_close,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::PreviewAutoClose {
+                                enabled: Some(!auto_close),
                             },
                             cx,
                         );

@@ -899,9 +899,15 @@ pub enum Request {
     ///
     /// `line-<操作>`（#1692）は行単位の操作で、GUI の ⌥↑↓ / ⇧⌥↑↓ / ⌘/ / ⌘] ⌘[ と同じ口を通る
     /// （操作の綴りは `tako_core::text_edit::LineOperation::name`。CLI は `tako edit line <操作>`）
+    ///
+    /// `type`（#1759）は `text` を 1 文字ずつ GUI の文字の打鍵と同じ口へ通す（括弧の自動閉じと
+    /// 飛び越しが効く。CLI は `tako edit type <文字>`）。`text` は `type` のときだけ渡し、
+    /// 省略時は wire に現れない（引数が生える前の JSON とバイト一致）
     PreviewEditCommand {
         pane: Option<u64>,
         command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
         expected_version: Option<u64>,
     },
     /// 編集バッファをファイルへ保存する。外部変更を検知した場合は上書きしない。
@@ -1159,6 +1165,10 @@ pub enum Request {
         pane: Option<u64>,
         enabled: Option<bool>,
     },
+    /// 括弧の自動閉じの設定の取得・変更（#1759。settings.json の `editor_auto_close`。既定 ON）。
+    /// `enabled` 省略時は状態取得のみ。全ペインの編集に効く（形式ごとの既定は `file_type` の
+    /// `auto_close` 列で、文書は ON でも閉じない）
+    PreviewAutoClose { enabled: Option<bool> },
     /// プレビューのチェンジログビュー切替（Issue #338）。
     /// `enabled` 省略時は現在の状態取得のみ。`max_count` はコミット取得上限（省略時 50）。
     /// `expand` はコミットハッシュ指定でそのコミットの diff を展開/折りたたみ。
@@ -2874,6 +2884,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::LspFormatOnSave { .. }
         | Request::PreviewCache { .. }
         | Request::PreviewAutosave { .. }
+        | Request::PreviewAutoClose { .. }
         | Request::Scrollback { .. }
         // 貼り付けの確認（#2046）: 答えはペインの中身（PTY）へ書くだけで幾何に触らない
         | Request::PasteGuard { .. }

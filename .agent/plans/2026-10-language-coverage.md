@@ -144,7 +144,8 @@ open_plan 7・インデント 5）。
 - **コメントの切り替え（⌘/）は機能として存在しない**ので、「コメント記号」の列は今は空
   （→ #1692 で ⌘/ と `tako edit line toggle-comment` を入れ、`file_type` の行の `comment` 列として埋めた）。
   文字列とブロックコメントの書き方は #1691（対応括弧の強調）で `lexical` 列として足し、括弧の探索が
-  `comment` 列と合わせて引く（別の表は持たない）。
+  `comment` 列と合わせて引く（別の表は持たない）。#1759 で Enter の続きと括弧の自動閉じの列
+  （`dedent_after` / `list_continuation` / `auto_close`）を同じ表へ足した。
   `tako:run:` 宣言の検出（`runner.rs:241` `find_marker`）はコメント記号を問わないので、
   `.ino` でも先頭に `// tako:run: arduino-cli compile …` と書けば今の tako で両 OS とも
   `Declaration` として解決する（実測）。今すぐ使える回避策

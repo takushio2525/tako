@@ -61,9 +61,14 @@ const COALESCE_WINDOW_MS: u64 = 500;
 // 対応する括弧の探索（#1691）
 mod brackets;
 pub use brackets::{
-    bracket_match_legacy, find_partner, match_at_cursor, BracketMatch, BracketSyntax, Lexical,
-    SingleQuote, SCAN_WINDOW,
+    bracket_match_legacy, find_partner, has_unclosed_open, match_at_cursor, opens_in_code,
+    BracketMatch, BracketSyntax, Lexical, SingleQuote, SCAN_WINDOW,
 };
+
+// Enter の続き（字下げを戻すキーワード・リストの印の引き継ぎ）と括弧の自動閉じ（#1759）
+mod auto_close;
+mod enter;
+pub use enter::legacy_1759;
 
 /// 改行コード（#1650）。
 ///
@@ -276,24 +281,32 @@ impl IndentUnit {
     }
 }
 
-/// Enter で 1 段深くする規則（#1654）。言語の同定の正本（[`crate::file_type`] の `enter` 列）で決める
+/// Enter の規則（#1654 / #1759）。言語の同定の正本（[`crate::file_type`] の行）で決める
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndentRules {
     /// 行が `{` / `[` / `(` で終わっていたら深くする
     brackets: bool,
     /// 行が `:` で終わっていたら深くする（Python のブロック・YAML の入れ子）
     colon: bool,
+    /// この語で始まる文の行なら 1 段浅くする（#1759。`dedent_after` 列）
+    dedent_after: &'static [&'static str],
+    /// リストの行なら印を引き継ぐ（#1759。`list_continuation` 列）
+    list_continuation: bool,
 }
 
 impl IndentRules {
     /// Markdown・プレーンテキストは**継承だけ**（`[` はリンク、`(` は括弧書きで、
     /// 入れ子の始まりではない）。Python と YAML は `:` でも深くする。
-    /// それ以外（コード全般）は開き括弧で深くする（形式ごとの値は [`crate::file_type::EnterRule`]）
+    /// それ以外（コード全般）は開き括弧で深くする（形式ごとの値は [`crate::file_type::EnterRule`]）。
+    /// 字下げを戻す語とリストの引き継ぎ（#1759）は `TAKO_1759_LEGACY=1` で切れる
     fn for_path(path: &Path) -> Self {
-        let enter = crate::file_type::identify_or_default(path).enter;
+        let row = crate::file_type::identify_or_default(path);
+        let legacy = legacy_1759();
         Self {
-            brackets: enter.brackets(),
-            colon: enter.colon(),
+            brackets: row.enter.brackets(),
+            colon: row.enter.colon(),
+            dedent_after: if legacy { &[] } else { row.dedent_after },
+            list_continuation: row.list_continuation && !legacy,
         }
     }
 }
@@ -1022,6 +1035,11 @@ pub struct TextBuffer {
     fold: FoldCache,
     /// カーソルの隣の括弧の対の控え（#1691）。(版, カーソル) が同じあいだ使い回す
     brackets: brackets::BracketCache,
+    /// 括弧の自動閉じの設定（#1759。settings.json の `editor_auto_close`。既定 ON）。
+    /// GUI が編集を始めるときと設定を切り替えたときに渡す（[`Self::set_auto_close`]）
+    auto_close: bool,
+    /// 自動で入れた閉じ括弧（#1759）。飛び越し（type-over）と `(|)` の ⌫ の対象
+    auto_pairs: auto_close::AutoPairs,
 }
 
 /// 大文字小文字を区別しない検索のための小文字写しの置き場（#1653）。
@@ -1080,6 +1098,8 @@ impl TextBuffer {
             viewport_lines: None,
             fold: FoldCache::default(),
             brackets: brackets::BracketCache::default(),
+            auto_close: true,
+            auto_pairs: auto_close::AutoPairs::default(),
         })
     }
 
@@ -1103,6 +1123,8 @@ impl TextBuffer {
             viewport_lines: None,
             fold: FoldCache::default(),
             brackets: brackets::BracketCache::default(),
+            auto_close: true,
+            auto_pairs: auto_close::AutoPairs::default(),
         }
     }
 
@@ -1125,6 +1147,8 @@ impl TextBuffer {
         self.path = path;
         // 拡張子が変わると文字列・コメントの書き方も変わりうる（#1691）
         self.brackets.clear();
+        // 自動閉じをする形式かも変わりうる（#1759）
+        self.auto_pairs.clear();
     }
 
     pub fn text(&self) -> &str {
@@ -1186,6 +1210,8 @@ impl TextBuffer {
             // 上下以外で動いたら、狙っていた桁も捨てる（#1652。上下の移動は
             // `move_cursor` がこのあと置き直す）
             self.goal_column = None;
+            // 自動で入れた閉じ括弧は、カーソルが対の外へ出たら追わない（#1759）
+            self.auto_pairs.retain_around(offset);
         }
         self.anchor = anchor;
         self.cursor = offset;
@@ -1205,6 +1231,7 @@ impl TextBuffer {
         if head != self.cursor || selection_range(anchor, head) != self.selection() {
             self.seal_undo_group();
             self.goal_column = None;
+            self.auto_pairs.retain_around(head);
         }
         self.anchor = anchor;
         self.cursor = head;
@@ -1213,6 +1240,7 @@ impl TextBuffer {
     pub fn select_all(&mut self) {
         self.seal_undo_group();
         self.goal_column = None;
+        self.auto_pairs.clear();
         self.anchor = Some(0);
         self.cursor = self.text.len();
     }
@@ -1264,6 +1292,18 @@ impl TextBuffer {
         }
         if self.cursor == 0 {
             self.anchor = None;
+            return;
+        }
+        // 自動で入れた対の間（`(|)`）なら閉じ括弧ごと消す（#1759。入れた閉じ括弧を残骸にしない）
+        if let Some(pair) = self.auto_pairs.pair_around(self.cursor) {
+            let start = pair.start;
+            self.apply_edit(Edit {
+                splices: &[Splice::new(pair, "")],
+                cursor: start,
+                anchor: None,
+                kind: EditKind::DeleteBackward,
+                line_ending: None,
+            });
             return;
         }
         // `\r\n` は 1 つの行区切り。片方だけ消すと裸の CR が残る（#1650）
@@ -1390,30 +1430,49 @@ impl TextBuffer {
         self.shift_lines(range, false);
     }
 
-    /// Enter（#1654）。改行を入れ、**カーソルより前にあるこの行のインデントを引き継ぐ**。
+    /// Enter（#1654 / #1759）。改行を入れ、**カーソルより前にあるこの行のインデントを引き継ぐ**。
     ///
     /// - 行が開き括弧（Python / YAML は `:` も）で終わっていたら 1 段深くする
     ///   （規則は拡張子で決まる。Markdown とプレーンテキストは継承だけ = [`IndentRules`]）
     /// - `{|}` のように対応する閉じ括弧の手前で押したら、閉じ括弧を次の行へ送って
     ///   あいだに 1 段深い空行を作る
     /// - 空白だけの行で押したら、その行の空白は残さない（行末の空白を作らない）
+    /// - ブロックを抜ける文（Python の `return` など。形式の `dedent_after` 列）の行なら
+    ///   1 段浅くする（#1759。文が続いている行 = `\` で終わる・閉じていない括弧がある行は戻さない）
+    /// - リストの行（Markdown の `- ` / `1. ` / `- [ ] `。形式の `list_continuation` 列）なら
+    ///   次の行へ印を引き継ぎ、中身が空の項目なら印を消して抜ける（#1759。[`Self::continue_list`]）
     ///
     /// 挿す改行はこのファイルの改行コード（#1650）。選択があれば選択を差し替える。
-    /// **括弧の自動閉じはしない**（理由は `.agent/requirements.md` FR-3.5 の #1654）
+    /// 括弧の自動閉じは打鍵 1 文字の口（[`Self::type_char`]）の仕事で、ここでは入れない
     pub fn newline_and_indent(&mut self) {
         let eol = self.line_ending.as_str();
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         let line_start = self.line_start(range.start);
+        let rules = IndentRules::for_path(&self.path);
+        if rules.list_continuation && self.continue_list(range.clone(), line_start) {
+            return;
+        }
         let before = &self.text[line_start..range.start];
         let indent = &before[..before.len() - before.trim_start_matches([' ', '\t']).len()];
         let line_end = self.line_end(range.end);
         let after = &self.text[range.end..line_end];
-        let rules = IndentRules::for_path(&self.path);
         let last = before.trim_end_matches([' ', '\t']).chars().last();
         let deeper = match last {
             Some(c) if rules.brackets && closing_bracket(c).is_some() => true,
             Some(':') => rules.colon,
             _ => false,
+        };
+        // ブロックを抜ける文の後ろは 1 段浅く（#1759）。深くする行（`return f(` の続き）では見ない
+        let indent = if !deeper
+            && enter::dedents_after(before, rules.dedent_after)
+            && !has_unclosed_open(
+                &self.text,
+                line_start..range.start,
+                &BracketSyntax::for_path(&self.path),
+            ) {
+            &indent[outdent_width(indent, self.indent_unit())..]
+        } else {
+            indent
         };
         let unit = if deeper {
             self.indent_unit().text()
@@ -1450,6 +1509,118 @@ impl TextBuffer {
             kind,
             line_ending: None,
         });
+    }
+
+    /// リストの行の Enter（#1759）。リストの項目でなければ何もせず `false`（呼び手が素の Enter をする）。
+    ///
+    /// - 中身がある: 改行 + 字下げ + 次の印（番号は 1 つ進め、チェックボックスは空）。カーソルより
+    ///   後ろの中身は新しい項目へ移す（手前の空白は捨てる）
+    /// - 中身が空（印だけ）: 印と字下げを消して行を空にし、改行は入れない = リストを抜ける
+    ///
+    /// コードブロックの中・区切り線（`---` / `* * *`）は項目にしない。
+    /// 範囲の決め方（選択を差し替える）は素の Enter と同じ。どちらも 1 回の編集 = undo 1 回で戻る
+    fn continue_list(&mut self, range: Range<usize>, line_start: usize) -> bool {
+        let before = &self.text[line_start..range.start];
+        let Some(item) = enter::list_item(before) else {
+            return false;
+        };
+        let line_end = self.line_end(range.end);
+        let after = &self.text[range.end..line_end];
+        let whole_line = format!("{before}{after}");
+        if enter::is_thematic_break(&whole_line) {
+            return false;
+        }
+        let from = enter::fence_scan_start(&self.text, line_start);
+        if enter::in_fenced_code(&self.text, from, line_start) {
+            return false;
+        }
+        let content_before = &before[item.content_start..];
+        let after_trimmed = after.trim_start_matches([' ', '\t']);
+        let (splice, cursor) =
+            if content_before.trim().is_empty() && after_trimmed.trim().is_empty() {
+                // 印だけの項目: 行を空にして抜ける（行末の空白も作らない）
+                ((line_start..line_end, String::new()), line_start)
+            } else {
+                let eol = self.line_ending.as_str();
+                let replacement = format!("{eol}{}{}", item.indent, item.next_marker);
+                let cursor = range.start + replacement.len();
+                let end = range.end + (after.len() - after_trimmed.len());
+                ((range.start..end, replacement), cursor)
+            };
+        let (span, text) = splice;
+        let kind = if span.is_empty() {
+            EditKind::Insert
+        } else {
+            EditKind::Replace
+        };
+        self.apply_edit(Edit {
+            splices: &[Splice::new(span, &text)],
+            cursor,
+            anchor: None,
+            kind,
+            line_ending: None,
+        });
+        true
+    }
+
+    // --- 括弧の自動閉じ（#1759） -------------------------------------------
+
+    /// 括弧の自動閉じの設定を渡す（#1759。settings.json の `editor_auto_close`）。**本文は変えない**。
+    /// OFF にしたら追っている閉じ括弧も手放す（OFF の間は #1654 と同じ 1 文字の挿入）
+    pub fn set_auto_close(&mut self, enabled: bool) {
+        self.auto_close = enabled;
+        if !enabled {
+            self.auto_pairs.clear();
+        }
+    }
+
+    /// このバッファで括弧を自動で閉じるか（#1759）。設定 × 形式（`file_type` の `auto_close` 列）。
+    /// `TAKO_1759_LEGACY=1` なら常に `false`
+    pub fn auto_close_active(&self) -> bool {
+        self.auto_close
+            && !legacy_1759()
+            && crate::file_type::identify_or_default(&self.path).auto_close
+    }
+
+    /// 打鍵 1 文字（#1759）。GUI の文字入力と CLI `tako edit type` / MCP `tako_preview_edit` の
+    /// `command: "type"` が**同じここ**を通る（貼り付け・IME の長い確定は [`Self::insert`]）。
+    ///
+    /// 自動閉じが効く（[`Self::auto_close_active`]）とき、選択が無ければ:
+    /// - 自分で入れた閉じ括弧の手前で同じ閉じ括弧を打ったら、入れずに飛び越す（本文も版も変えない）
+    /// - 開き括弧を打ち、カーソルの直後が空白・行末・閉じ記号で、文字列・コメントの外なら
+    ///   閉じ括弧も入れてカーソルを間に置く（1 回の編集 = undo 1 回で両方消える）
+    ///
+    /// それ以外は 1 文字を入れるだけ（[`Self::insert`] と同じ）。規則の理由は `auto_close` の説明
+    pub fn type_char(&mut self, c: char) {
+        if self.selection().is_none() && self.auto_close_active() {
+            let cursor = self.cursor;
+            self.auto_pairs.retain_around(cursor);
+            if auto_close::is_closing(c)
+                && self.text[cursor..].starts_with(c)
+                && self.auto_pairs.take_closing_at(cursor)
+            {
+                self.set_cursor(cursor + c.len_utf8(), false);
+                return;
+            }
+            if let Some(close) = auto_close::closing_for(c) {
+                let next = self.text[cursor..].chars().next();
+                if auto_close::closes_before(next)
+                    && opens_in_code(&self.text, cursor, c, &BracketSyntax::for_path(&self.path))
+                {
+                    let pair = format!("{c}{close}");
+                    self.apply_edit(Edit {
+                        splices: &[Splice::new(cursor..cursor, &pair)],
+                        cursor: cursor + c.len_utf8(),
+                        anchor: None,
+                        kind: EditKind::Insert,
+                        line_ending: None,
+                    });
+                    self.auto_pairs.push(cursor, cursor + c.len_utf8());
+                    return;
+                }
+            }
+        }
+        self.insert(c.encode_utf8(&mut [0; 4]));
     }
 
     /// 行頭からその位置までの見た目の桁（タブは次の `tab` の倍数まで進む。#1654）
@@ -1617,6 +1788,8 @@ impl TextBuffer {
         let cursor_before = self.cursor;
         let anchor_before = self.anchor;
         let at_millis = self.now_millis();
+        // 自動で入れた閉じ括弧の位置を本文の置き換えに追従させる（#1759）
+        self.auto_pairs.follow(splices);
         self.splice_text(splices);
         // 編集後の本文で丸める。丸めずに持つと、その位置が差分へ記録されて
         // **undo / redo のたびに再現される**（`replace_all` は編集前のカーソルを
@@ -1809,6 +1982,8 @@ impl TextBuffer {
         self.bump_version();
         // 置換後の本文を置換前へ（離れた複数の箇所も 1 回で戻る = #1869）
         self.splice_text(&delta.splices(true));
+        // 戻した本文と自動で入れた閉じ括弧の対応は取れない（#1759）
+        self.auto_pairs.clear();
         self.cursor = delta.cursor_before;
         self.anchor = delta.anchor_before;
         self.line_ending = delta.line_ending_before;
@@ -1825,6 +2000,7 @@ impl TextBuffer {
         self.bump_version();
         // 置換前の本文を置換後へ（離れた複数の箇所も 1 回でやり直す = #1869）
         self.splice_text(&delta.splices(false));
+        self.auto_pairs.clear();
         self.cursor = delta.cursor_after;
         self.anchor = delta.anchor_after;
         self.line_ending = delta.line_ending_after;
@@ -2171,6 +2347,8 @@ impl TextBuffer {
             "bytes": self.text.len(),
             "line_ending": self.line_ending.label(),
             "indent": self.indent_unit().label(),
+            // #1759: このバッファで括弧を自動で閉じるか（設定 × 形式。打鍵と `tako edit type` が従う）
+            "auto_close": self.auto_close_active(),
             "cursor": position(self.cursor_position()),
             "selection": self.selection_positions().map(|(start, end)| {
                 serde_json::json!({ "start": position(start), "end": position(end) })
@@ -5889,18 +6067,15 @@ mod tests {
         b.insert("if x:");
         b.newline_and_indent();
         assert_eq!(show_sel(&b), "def f(x):\n    if x:\n        |\n");
-        b.insert("return 1");
+        b.insert("y = 1");
         b.newline_and_indent();
         assert_eq!(
             show_sel(&b),
-            "def f(x):\n    if x:\n        return 1\n        |\n"
+            "def f(x):\n    if x:\n        y = 1\n        |\n"
         );
         // ⇧Tab で 1 段戻る
         b.outdent();
-        assert_eq!(
-            show_sel(&b),
-            "def f(x):\n    if x:\n        return 1\n    |\n"
-        );
+        assert_eq!(show_sel(&b), "def f(x):\n    if x:\n        y = 1\n    |\n");
         // 2 スペースのファイルは 2 桁で
         let mut b = indent_buffer("j.py", "if a:\n  b()\n  if c:|\n");
         b.newline_and_indent();
@@ -5914,9 +6089,13 @@ mod tests {
     /// Markdown: 継承だけ（`[` や `(` で深くしない）・リストの入れ子は 2 桁
     #[test]
     fn markdownのインデント() {
+        // リストの行は印も引き継ぐ（#1759。継承する字下げは #1654 と同じ）
         let mut b = indent_buffer("i.md", "- a\n  - b|\n");
         b.newline_and_indent();
-        assert_eq!(show_sel(&b), "- a\n  - b\n  |\n");
+        assert_eq!(show_sel(&b), "- a\n  - b\n  - |\n");
+        let mut b = indent_buffer("h.md", "- a\n  text|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "- a\n  text\n  |\n");
         let mut b = indent_buffer("j.md", "see [link](|\n");
         b.newline_and_indent();
         assert_eq!(show_sel(&b), "see [link](\n|\n");
@@ -5924,6 +6103,345 @@ mod tests {
         let mut b = indent_buffer("k.md", "- a\n  - b\n^- c|\n");
         b.indent();
         assert_eq!(show_sel(&b), "- a\n  - b\n^  - c|\n");
+    }
+
+    /// #1759 ①: ブロックを抜ける文（Python の return / pass / break / continue / raise）の
+    /// 行で Enter を押すと 1 段浅く。文が続いている行では戻さない
+    #[test]
+    fn ブロックを抜ける文の後ろは1段浅い() {
+        for word in [
+            "return 1",
+            "return",
+            "pass",
+            "break",
+            "continue",
+            "raise ValueError(x)",
+        ] {
+            let mut b = indent_buffer("d.py", &format!("def f(x):\n    if x:\n        {word}|\n"));
+            b.newline_and_indent();
+            assert_eq!(
+                show_sel(&b),
+                format!("def f(x):\n    if x:\n        {word}\n    |\n"),
+                "{word}"
+            );
+        }
+        // 後ろにコメントがあっても文は終わっている
+        let mut b = indent_buffer("d1.py", "for a in b:\n    continue  # 次|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "for a in b:\n    continue  # 次\n|\n");
+        // 2 スペース・タブのファイルはその単位で浅く
+        let mut b = indent_buffer("d2.py", "if a:\n  if b:\n    pass|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "if a:\n  if b:\n    pass\n  |\n");
+        let mut b = indent_buffer("d3.py", "if a:\n\tif b:\n\t\treturn|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "if a:\n\tif b:\n\t\treturn\n\t|\n");
+        // 字下げの無い行では戻すものが無い
+        let mut b = indent_buffer("d4.py", "return|\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "return\n|\n");
+        // CRLF のファイルでも挿す改行は CRLF
+        let mut b = indent_buffer("d5.py", "def f():\r\n    return 1|\r\n");
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "def f():\r\n    return 1\r\n|\r\n");
+        // undo 1 回で Enter の前へ戻る
+        assert!(b.undo());
+        assert_eq!(b.text(), "def f():\r\n    return 1\r\n");
+    }
+
+    /// #1759 ①の境界: 文が続いている・語が違う・形式が違うなら戻さない
+    #[test]
+    fn 抜ける文でも続いている行では戻さない() {
+        let keep = |name: &str, src: &str, want: &str| {
+            let mut b = indent_buffer(name, src);
+            b.newline_and_indent();
+            assert_eq!(show_sel(&b), want, "{src:?}");
+        };
+        // 閉じていない括弧 = 文は次の行へ続く（`,` で終わっても深くはしない = #1654 のまま）
+        keep(
+            "k1.py",
+            "def f():\n    return g(a,|\n",
+            "def f():\n    return g(a,\n    |\n",
+        );
+        // 開き括弧で終わる行は #1654 どおり 1 段深く
+        keep(
+            "k2.py",
+            "def f():\n    return g(|\n",
+            "def f():\n    return g(\n        |\n",
+        );
+        // 文字列の中の括弧は数えない = 文は終わっている
+        keep(
+            "k3.py",
+            "def f():\n    return \"(\"|\n",
+            "def f():\n    return \"(\"\n|\n",
+        );
+        // `\` で終わる行は続く
+        keep(
+            "k4.py",
+            "def f():\n    return a + \\|\n",
+            "def f():\n    return a + \\\n    |\n",
+        );
+        // 語の単位（`returned` / `pass_count` は別の語）・コメントの中の語
+        keep(
+            "k5.py",
+            "def f():\n    returned = 1|\n",
+            "def f():\n    returned = 1\n    |\n",
+        );
+        keep(
+            "k6.py",
+            "def f():\n    # return|\n",
+            "def f():\n    # return\n    |\n",
+        );
+        // 形式の行に語が無い言語（Rust / Ruby）は戻さない
+        keep(
+            "k7.rs",
+            "fn f() {\n    return 1;|\n}\n",
+            "fn f() {\n    return 1;\n    |\n}\n",
+        );
+        keep(
+            "k8.rb",
+            "def f\n  return 1|\nend\n",
+            "def f\n  return 1\n  |\nend\n",
+        );
+    }
+
+    /// #1759 ②: Markdown のリストの行で Enter を押すと印を引き継ぐ（番号は 1 つ進める）
+    #[test]
+    fn markdownのリストの印を引き継ぐ() {
+        let enter = |src: &str| {
+            let mut b = indent_buffer("l.md", src);
+            b.newline_and_indent();
+            show_sel(&b)
+        };
+        assert_eq!(enter("- a|\n"), "- a\n- |\n");
+        assert_eq!(enter("* a|\n"), "* a\n* |\n");
+        assert_eq!(enter("+ a|\n"), "+ a\n+ |\n");
+        assert_eq!(enter("1. a|\n"), "1. a\n2. |\n");
+        assert_eq!(enter("3) a|\n"), "3) a\n4) |\n");
+        // 番号の繰り上がり（桁が増える）
+        assert_eq!(enter("9. a|\n"), "9. a\n10. |\n");
+        assert_eq!(enter("99. a|\n"), "99. a\n100. |\n");
+        // 入れ子の字下げも引き継ぐ
+        assert_eq!(enter("- a\n    - b|\n"), "- a\n    - b\n    - |\n");
+        // チェックボックスは空の箱で引き継ぐ
+        assert_eq!(enter("- [ ] a|\n"), "- [ ] a\n- [ ] |\n");
+        assert_eq!(enter("- [x] done|\n"), "- [x] done\n- [ ] |\n");
+        // 中身の途中で押したら後ろを新しい項目へ（手前の空白は捨てる）
+        assert_eq!(enter("- foo|bar\n"), "- foo\n- |bar\n");
+        assert_eq!(enter("1. foo| bar\n"), "1. foo\n2. |bar\n");
+        // CRLF のファイルでも挿す改行は CRLF
+        assert_eq!(enter("- a|\r\n"), "- a\r\n- |\r\n");
+        // 選択を差し替える
+        assert_eq!(enter("- a^bc|d\n"), "- a\n- |d\n");
+        // undo 1 回で戻る
+        let mut b = indent_buffer("u.md", "1. a|\n");
+        b.newline_and_indent();
+        assert!(b.undo());
+        assert_eq!(show_sel(&b), "1. a|\n");
+    }
+
+    /// #1759 ②の境界: 中身が空の項目は印を消して抜ける・項目でない行は素の Enter
+    #[test]
+    fn 空のリスト項目では印を消して抜ける() {
+        let enter = |src: &str| {
+            let mut b = indent_buffer("e.md", src);
+            b.newline_and_indent();
+            show_sel(&b)
+        };
+        assert_eq!(enter("- a\n- |\n"), "- a\n|\n");
+        assert_eq!(enter("- a\n-   |\n"), "- a\n|\n");
+        assert_eq!(enter("1. a\n2. |\n"), "1. a\n|\n");
+        assert_eq!(enter("- [ ] a\n- [ ] |\n"), "- [ ] a\n|\n");
+        assert_eq!(enter("- a\n  - |\n"), "- a\n|\n");
+        assert_eq!(enter("- |"), "|");
+        assert_eq!(enter("- a\r\n- |\r\n"), "- a\r\n|\r\n");
+        // 抜けるのも 1 回の編集 = undo 1 回で印が戻る
+        let mut b = indent_buffer("eu.md", "- a\n- |\n");
+        b.newline_and_indent();
+        assert!(b.undo());
+        assert_eq!(b.text(), "- a\n- \n");
+        // 項目でない行・印より前のカーソル・区切り線・コードブロックの中は素の Enter
+        assert_eq!(enter("|- a\n"), "\n|- a\n");
+        assert_eq!(enter("-|\n"), "-\n|\n");
+        assert_eq!(enter("text|\n"), "text\n|\n");
+        assert_eq!(enter("---|\n"), "---\n|\n");
+        assert_eq!(enter("* * *|\n"), "* * *\n|\n");
+        assert_eq!(enter("```yaml\n- a|\n```\n"), "```yaml\n- a\n|\n```\n");
+        assert_eq!(enter("```\nx\n```\n- a|\n"), "```\nx\n```\n- a\n- |\n");
+        // 引き継ぐのは列を持つ形式だけ（YAML の `- ` / プレーンテキスト）
+        for name in ["l.yaml", "l.txt", "l.rs"] {
+            let mut b = indent_buffer(name, "- a|\n");
+            b.newline_and_indent();
+            assert_eq!(show_sel(&b), "- a\n|\n", "{name}");
+        }
+    }
+
+    fn type_str(b: &mut TextBuffer, s: &str) {
+        for c in s.chars() {
+            b.type_char(c);
+        }
+    }
+
+    /// #1759 ③: 開き括弧で閉じ括弧も入れ、入れた閉じ括弧の手前の閉じ括弧は飛び越す
+    #[test]
+    fn 括弧の自動閉じと飛び越し() {
+        let mut b = indent_buffer("a.rs", "let v = |;\n");
+        assert!(b.auto_close_active());
+        b.type_char('(');
+        assert_eq!(show_sel(&b), "let v = (|);\n");
+        type_str(&mut b, "x");
+        let version = b.version();
+        b.type_char(')');
+        // 二重にならずに飛び越す（本文も版も変えない）
+        assert_eq!(show_sel(&b), "let v = (x)|;\n");
+        assert_eq!(b.version(), version);
+        // 入れ子は 3 種類とも
+        let mut b = indent_buffer("b.rs", "|\n");
+        type_str(&mut b, "f([{");
+        assert_eq!(show_sel(&b), "f([{|}])\n");
+        type_str(&mut b, "1}])");
+        assert_eq!(show_sel(&b), "f([{1}])|\n");
+        // 開き括弧と閉じ括弧は 1 回の編集 = undo 1 回で両方消える
+        let mut b = indent_buffer("c.rs", "a |\n");
+        b.type_char('[');
+        assert!(b.undo());
+        assert_eq!(b.text(), "a \n");
+        // `(|)` の間の ⌫ は対で消す
+        let mut b = indent_buffer("d.rs", "f|\n");
+        b.type_char('(');
+        b.delete_backward();
+        assert_eq!(show_sel(&b), "f|\n");
+        // 空白・行末・閉じ記号の手前では閉じ、識別子・開き括弧の手前では閉じない
+        for (src, want) in [
+            ("|", "(|)"),
+            ("| x", "(|) x"),
+            ("|;", "(|);"),
+            ("|,", "(|),"),
+            ("|]", "(|)]"),
+            ("|foo", "(|foo"),
+            ("|(a)", "(|(a)"),
+            ("|\"s\"", "(|\"s\""),
+        ] {
+            let mut b = indent_buffer("e.rs", src);
+            b.type_char('(');
+            assert_eq!(show_sel(&b), want, "{src:?}");
+        }
+    }
+
+    /// #1759 ③の境界: 既に閉じ括弧がある・文字列 / コメントの中・選択中・形式 / 設定が OFF
+    #[test]
+    fn 括弧の自動閉じの境界() {
+        // 手で書いた閉じ括弧の手前: 新しく閉じた対は飛び越すが、元からある `)` は飛び越さない
+        let mut b = indent_buffer("a.rs", "f(|)\n");
+        b.type_char('(');
+        assert_eq!(show_sel(&b), "f((|))\n");
+        b.type_char(')');
+        assert_eq!(show_sel(&b), "f(()|)\n");
+        b.type_char(')');
+        assert_eq!(show_sel(&b), "f(())|)\n");
+        // 元からある閉じ括弧の手前で閉じ括弧を打てば普通に入る（数が狂わない）
+        let mut b = indent_buffer("b.rs", "g(x|)\n");
+        b.type_char(')');
+        assert_eq!(show_sel(&b), "g(x)|)\n");
+        // 文字列・コメントの中では閉じない（直後は空白 = 「次の文字」の規則では閉じてよい位置）
+        for (name, src, want) in [
+            ("s.rs", "let s = \"a | b\";\n", "let s = \"a (| b\";\n"),
+            ("s2.rs", "let s = \"a |\n", "let s = \"a (|\n"),
+            ("c.rs", "// note |\n", "// note (|\n"),
+            ("c2.rs", "/* |\n */\n", "/* (|\n */\n"),
+            ("p.py", "x = 'a | b'\n", "x = 'a (| b'\n"),
+            ("p2.py", "# |\n", "# (|\n"),
+            (
+                "p3.py",
+                "\"\"\"\nfoo |\n\"\"\"\n",
+                "\"\"\"\nfoo (|\n\"\"\"\n",
+            ),
+            ("j.js", "let t = `a | b`;\n", "let t = `a (| b`;\n"),
+            ("sh.sh", "echo 'a | b'\n", "echo 'a (| b'\n"),
+        ] {
+            let mut b = indent_buffer(name, src);
+            b.type_char('(');
+            assert_eq!(show_sel(&b), want, "{name}");
+        }
+        // 1 文字のリテラル・引用符の手前は「次の文字」の規則で閉じない
+        for (name, src, want) in [
+            ("ch.rs", "let c = '|';\n", "let c = '(|';\n"),
+            ("q.py", "x = '|'\n", "x = '(|'\n"),
+        ] {
+            let mut b = indent_buffer(name, src);
+            b.type_char('(');
+            assert_eq!(show_sel(&b), want, "{name}");
+        }
+        // 文字列が閉じた後ろ・Rust のライフタイムの後ろ・前の行のコメントの `'` の後ろはコード
+        let mut b = indent_buffer("l.rs", "fn f<'a>|\n");
+        b.type_char('(');
+        assert_eq!(show_sel(&b), "fn f<'a>(|)\n");
+        let mut b = indent_buffer("q.rs", "let s = \"x\" |\n");
+        b.type_char('(');
+        assert_eq!(show_sel(&b), "let s = \"x\" (|)\n");
+        let mut b = indent_buffer("ap.py", "x = 1  # it's\nf|\n");
+        b.type_char('(');
+        assert_eq!(show_sel(&b), "x = 1  # it's\nf(|)\n");
+        // 選択中は選択を 1 文字で差し替えるだけ
+        let mut b = indent_buffer("sel.rs", "^abc|\n");
+        b.type_char('(');
+        assert_eq!(show_sel(&b), "(|\n");
+        // 文書（Markdown・プレーンテキスト）は閉じない
+        for name in ["m.md", "t.txt"] {
+            let mut b = indent_buffer(name, "see |\n");
+            assert!(!b.auto_close_active(), "{name}");
+            b.type_char('(');
+            assert_eq!(show_sel(&b), "see (|\n", "{name}");
+        }
+        // 設定を OFF にすると 1 文字を入れるだけ（追っていた対も手放す = 飛び越さない）
+        let mut b = indent_buffer("off.rs", "|\n");
+        b.type_char('(');
+        b.set_auto_close(false);
+        assert!(!b.auto_close_active());
+        b.type_char(')');
+        assert_eq!(show_sel(&b), "()|)\n");
+        b.type_char('[');
+        assert_eq!(show_sel(&b), "()[|)\n");
+        // ON へ戻せばまた閉じる
+        b.set_auto_close(true);
+        b.type_char('{');
+        assert_eq!(show_sel(&b), "()[{|})\n");
+    }
+
+    /// #1759 ③: 入れた閉じ括弧の追跡は、カーソルが対の外へ出たら・undo したらやめる
+    #[test]
+    fn 対の外へ出たら飛び越さない() {
+        let mut b = indent_buffer("a.rs", "|\n");
+        b.type_char('(');
+        // 外（閉じ括弧の後ろ）へ出て戻る
+        b.move_cursor(CursorMovement::Right, false);
+        b.move_cursor(CursorMovement::Left, false);
+        b.type_char(')');
+        assert_eq!(show_sel(&b), "()|)\n");
+        // 外へ出て戻ったら ⌫ も 1 文字だけ
+        let mut b = indent_buffer("b.rs", "x |\n");
+        b.type_char('(');
+        b.move_cursor(CursorMovement::LineStart, false);
+        b.move_cursor(CursorMovement::LineEnd, false);
+        b.move_cursor(CursorMovement::Left, false);
+        b.delete_backward();
+        assert_eq!(show_sel(&b), "x |)\n");
+        // 間で打った文字・Enter に閉じ括弧の位置が追従する
+        let mut b = indent_buffer("c.rs", "fn f() |\n");
+        b.type_char('{');
+        b.newline_and_indent();
+        assert_eq!(show_sel(&b), "fn f() {\n    |\n}\n");
+        type_str(&mut b, "g(1");
+        b.type_char(')');
+        assert_eq!(show_sel(&b), "fn f() {\n    g(1)|\n}\n");
+        // undo / redo の後は追わない
+        let mut b = indent_buffer("d.rs", "|\n");
+        type_str(&mut b, "a(");
+        b.type_char('b');
+        assert!(b.undo());
+        assert!(b.redo());
+        b.type_char(')');
+        assert_eq!(show_sel(&b), "a(b)|)\n");
     }
 
     /// タブでインデントするファイル: Tab はタブ 1 文字・⇧Tab はタブ 1 文字を外す

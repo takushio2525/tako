@@ -2379,13 +2379,34 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// インデントを引き継いで改行する（Enter と同じ。開き括弧の直後は 1 段深く）
+    /// インデントを引き継いで改行する（Enter と同じ。開き括弧の直後は 1 段深く・
+    /// Python の return / pass などの後ろは 1 段浅く・Markdown のリストは印を引き継ぐ）
     Newline {
         /// 文書の版。指定すると版が違うときは何もせず失敗する
         #[arg(long)]
         expect_version: Option<u64>,
         #[arg(long)]
         pane: Option<u64>,
+    },
+    /// 文字を 1 つずつ打鍵として入れる（キーボードで打つのと同じ。#1759）
+    ///
+    /// 開き括弧は閉じ括弧も入れ、自分で入れた閉じ括弧の手前の閉じ括弧は飛び越す
+    /// （`tako edit auto-close off` で 1 文字ずつ入れるだけ）。1 回 1000 文字まで。
+    /// 例: `tako edit type "f(x)"`
+    Type {
+        /// 打つ文字
+        text: String,
+        /// 文書の版。指定すると版が違うときは何もせず失敗する
+        #[arg(long)]
+        expect_version: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// 括弧の自動閉じの設定（既定 on。Markdown・プレーンテキストは on でも閉じない。#1759）。
+    /// 省略で今の値。MCP は `tako_preview_edit` の auto_close
+    AutoClose {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
     },
     /// 選択した行（無ければカーソルの行）を行単位で操作する（#1692）
     ///
@@ -9000,6 +9021,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             } => Request::PreviewEditCommand {
                 pane: target_pane(*pane)?,
                 command: "indent".into(),
+                text: None,
                 expected_version: *expect_version,
             },
             EditCommand::Outdent {
@@ -9008,6 +9030,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             } => Request::PreviewEditCommand {
                 pane: target_pane(*pane)?,
                 command: "outdent".into(),
+                text: None,
                 expected_version: *expect_version,
             },
             EditCommand::Newline {
@@ -9016,7 +9039,22 @@ fn build_request(command: &Command) -> Result<Request, String> {
             } => Request::PreviewEditCommand {
                 pane: target_pane(*pane)?,
                 command: "newline".into(),
+                text: None,
                 expected_version: *expect_version,
+            },
+            // #1759: 打鍵。綴りは tako-core の名前表（MCP の command と同じ）
+            EditCommand::Type {
+                text,
+                expect_version,
+                pane,
+            } => Request::PreviewEditCommand {
+                pane: target_pane(*pane)?,
+                command: tako_core::platform::editor_keys::TYPE_COMMAND.into(),
+                text: Some(text.clone()),
+                expected_version: *expect_version,
+            },
+            EditCommand::AutoClose { state } => Request::PreviewAutoClose {
+                enabled: state.as_deref().map(|s| s == "on"),
             },
             EditCommand::Line {
                 operation,
@@ -9035,6 +9073,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 Request::PreviewEditCommand {
                     pane: target_pane(*pane)?,
                     command: tako_core::platform::editor_keys::EditorCommand::line_edit_name(op),
+                    text: None,
                     expected_version: *expect_version,
                 }
             }
@@ -13416,6 +13455,7 @@ mod tests {
                 Request::PreviewEditCommand {
                     pane: Some(5),
                     command: name.into(),
+                    text: None,
                     expected_version: None,
                 }
             );
@@ -13450,10 +13490,47 @@ mod tests {
                 Request::PreviewEditCommand {
                     pane: Some(5),
                     command: format!("line-{}", op.name()),
+                    text: None,
                     expected_version: Some(3),
                 }
             );
         }
+        // #1759: `tako edit type <文字>` は MCP の command=type + text と同じ Request
+        assert_eq!(
+            build_request(&parse(&[
+                "tako",
+                "edit",
+                "type",
+                "f(x)",
+                "--expect-version",
+                "4",
+                "--pane",
+                "5"
+            ]))
+            .unwrap(),
+            Request::PreviewEditCommand {
+                pane: Some(5),
+                command: "type".into(),
+                text: Some("f(x)".into()),
+                expected_version: Some(4),
+            }
+        );
+        assert_eq!(
+            tako_core::platform::editor_keys::TYPE_COMMAND,
+            "type",
+            "CLI の綴りと MCP の enum は tako-core の名前表 1 か所"
+        );
+        assert_eq!(
+            build_request(&parse(&["tako", "edit", "auto-close"])).unwrap(),
+            Request::PreviewAutoClose { enabled: None }
+        );
+        assert_eq!(
+            build_request(&parse(&["tako", "edit", "auto-close", "off"])).unwrap(),
+            Request::PreviewAutoClose {
+                enabled: Some(false)
+            }
+        );
+        assert!(Cli::try_parse_from(["tako", "edit", "auto-close", "no"]).is_err());
         let command = parse(&["tako", "edit", "line", "move_up", "--pane", "5"]);
         assert!(build_request(&command).is_err());
         // 知らない単位は実行前に弾く
@@ -15000,6 +15077,9 @@ mod platform_matrix_parity {
         ("edit newline", "tako_preview_edit"),
         // #1692: 行操作も `tako_preview_edit` の `command`（`line-<操作>`）
         ("edit line", "tako_preview_edit"),
+        // #1759: 打鍵は `command: "type"` + `text`、括弧の自動閉じの設定は `auto_close`
+        ("edit type", "tako_preview_edit"),
+        ("edit auto-close", "tako_preview_edit"),
         ("edit replace-range", "tako_preview_edit_range"),
         ("edit redo", "tako_preview_redo"),
         ("edit replace", "tako_preview_replace"),

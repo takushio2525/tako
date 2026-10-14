@@ -377,22 +377,38 @@ pub(super) fn build_request(
             // #1961: TUI への左クリックの転送（ツールは増やさない）
             mouse_forward: bool_arg(args, "mouse_forward")?,
         },
-        // #1654: `command` を渡すと Tab / Shift+Tab / Enter と同じ編集（ツールは増やさない）
-        "tako_preview_edit" => match str_arg(args, "command")? {
-            Some(command) => {
+        // #1654: `command` を渡すと Tab / Shift+Tab / Enter と同じ編集（ツールは増やさない）。
+        // #1759: `command: "type"` + `text` は文字の打鍵、`auto_close` は括弧の自動閉じの設定
+        "tako_preview_edit" => match (str_arg(args, "command")?, bool_arg(args, "auto_close")?) {
+            (Some(_), Some(_)) => return Err("command と auto_close は同時に指定しない".into()),
+            (Some(command), None) => {
                 if bool_arg(args, "enabled")?.is_some() {
                     return Err("command と enabled は同時に指定しない".into());
                 }
                 Request::PreviewEditCommand {
                     pane: Some(target_pane(args, caller)?),
                     command,
+                    text: str_arg(args, "text")?,
                     expected_version: u64_arg(args, "expected_version")?,
                 }
             }
-            None => Request::PreviewEdit {
-                pane: Some(target_pane(args, caller)?),
-                enabled: bool_arg(args, "enabled")?,
-            },
+            (None, Some(enabled)) => {
+                if bool_arg(args, "enabled")?.is_some() {
+                    return Err("auto_close と enabled は同時に指定しない".into());
+                }
+                Request::PreviewAutoClose {
+                    enabled: Some(enabled),
+                }
+            }
+            (None, None) => {
+                if str_arg(args, "text")?.is_some() {
+                    return Err("text は command=type と組で渡す".into());
+                }
+                Request::PreviewEdit {
+                    pane: Some(target_pane(args, caller)?),
+                    enabled: bool_arg(args, "enabled")?,
+                }
+            }
         },
         "tako_preview_apply" => Request::PreviewApply {
             pane: Some(target_pane(args, caller)?),

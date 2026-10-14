@@ -540,6 +540,50 @@ pub fn match_at_cursor(text: &str, cursor: usize, syntax: &BracketSyntax) -> Opt
         .map(|(bracket, partner)| BracketMatch { bracket, partner })
 }
 
+/// `at` へ開き括弧 `open` を打ったら、それが**文字列・コメントの外の括弧**として数えられるか（#1759）。
+///
+/// 括弧の自動閉じが「文字列・コメントの中では閉じない」を決める口。対応括弧の強調（#1691）と
+/// 同じ走査に、`open` を差し込んだ写し（窓の頭から `at` の行の終わりまで）を読ませて、
+/// 差し込んだ位置で括弧が返るかを見る。差し込むのは、`'(|'` のような「打つと閉じる形」
+/// （Rust の 1 文字のリテラル・Python の同じ行で閉じる `'…'`）を打つ前の本文では見分けられないため。
+/// 写すのは窓の頭からなので、1 回の判定は高々 [`SCAN_WINDOW`] 余り（開き括弧の打鍵のときだけ呼ぶ）
+pub fn opens_in_code(text: &str, at: usize, open: char, syntax: &BracketSyntax) -> bool {
+    let window = scan_window(text, at);
+    let line_end = text[at..].find('\n').map_or(text.len(), |p| at + p);
+    let mut probe = String::with_capacity(line_end - window.start + open.len_utf8());
+    probe.push_str(&text[window.start..at]);
+    probe.push(open);
+    probe.push_str(&text[at..line_end]);
+    let target = at - window.start;
+    let mut scanner = Scanner::new(&probe, 0..target + open.len_utf8(), syntax);
+    while let Some((pos, _)) = scanner.next_bracket() {
+        if pos >= target {
+            return pos == target;
+        }
+    }
+    false
+}
+
+/// `range`（行頭から始まる範囲）の中で開いたまま閉じていない括弧があるか（#1759）。
+///
+/// 字下げを戻すキーワード（Python の `return foo(a,` の続き）を「文が続いている」と見て
+/// 戻さないための判定。文字列・コメントの中の括弧は数えない（#1691 と同じ走査）。
+/// 範囲より前で開いた括弧を閉じる閉じ括弧は数えない
+pub fn has_unclosed_open(text: &str, range: Range<usize>, syntax: &BracketSyntax) -> bool {
+    let mut depth = [0usize; 3];
+    let mut scanner = Scanner::new(text, range, syntax);
+    while let Some((_, b)) = scanner.next_bracket() {
+        if let Some((kind, open)) = bracket_kind(b) {
+            if open {
+                depth[kind] += 1;
+            } else {
+                depth[kind] = depth[kind].saturating_sub(1);
+            }
+        }
+    }
+    depth.iter().any(|d| *d > 0)
+}
+
 /// 控えた答え: (版, カーソル) と、そのときの答え
 type CachedMatch = ((u64, usize), Option<BracketMatch>);
 

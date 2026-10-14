@@ -313,6 +313,18 @@ pub fn desc_format_on_save() -> &'static str {
     )
 }
 
+/// #1759: 括弧の自動閉じ（既定 ON）
+pub fn label_auto_close() -> &'static str {
+    tr!("括弧の自動閉じ", "Auto-close brackets")
+}
+
+pub fn desc_auto_close() -> &'static str {
+    tr!(
+        "開き括弧を打つと閉じ括弧も入れ、入れた閉じ括弧は打てば飛び越す。文字列・コメントの中と Markdown・プレーンテキストでは閉じない",
+        "Insert the closing bracket when typing an opening one and type over it later. Never inside strings or comments, nor in Markdown or plain text"
+    )
+}
+
 pub fn label_preview_cache() -> &'static str {
     tr!("画像キャッシュ上限 (MiB)", "Image cache limit (MiB)")
 }
@@ -1588,6 +1600,8 @@ mod tests {
                 desc_preview_reload().into(),
                 label_format_on_save().into(),
                 desc_format_on_save().into(),
+                label_auto_close().into(),
+                desc_auto_close().into(),
                 label_preview_cache().into(),
                 desc_preview_cache().into(),
                 section_logs().into(),

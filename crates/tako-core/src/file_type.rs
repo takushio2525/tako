@@ -5,7 +5,9 @@
 //!
 //! - 色分け（tako-app の構文の選び方。`syntax` → two-face の順）と Markdown のコードブロックの別名
 //! - プレビューの種別・HTTP の型（[`crate::open_plan`]。tako-app の画像の形式・Markdown 判定も同じ）
-//! - インデントの既定と Enter の規則（[`crate::text_edit`]）
+//! - インデントの既定と Enter の規則（[`crate::text_edit`]。字下げを戻すキーワード・リストの印の
+//!   引き継ぎ = #1759 の `dedent_after` 列と `list_continuation` 列も）
+//! - 括弧の自動閉じをする形式か（`auto_close` 列。#1759）
 //! - 行コメントの記号（⌘/ と `tako edit line toggle-comment`。#1692）
 //! - 対応括弧の探索が中を飛ばす文字列とコメント（`lexical` 列 + `comment` 列。#1691）
 //! - CLI / MCP の応答の `file_type`（`tako open` の結果・`tako edit` の応答）
@@ -54,6 +56,15 @@ pub struct FileType {
     pub indent: IndentUnit,
     /// Enter で 1 段深くする規則（#1654）
     pub enter: EnterRule,
+    /// この語で始まる文の行で Enter を押すと 1 段浅くする（#1759。Python の `return` / `pass` …）。
+    /// ブロックを抜ける文の後ろは同じ深さに続きを書かない言語だけが持つ。照合は語の単位で、
+    /// ロジックは語の文字列を持たない（行を足すだけで言語が増える）
+    pub dedent_after: &'static [&'static str],
+    /// リストの行（`- ` / `* ` / `1. ` / `- [ ] `）で Enter を押すと次の行へ印を引き継ぐ（#1759。Markdown）
+    pub list_continuation: bool,
+    /// 開き括弧を打つと閉じ括弧も入れる（#1759。設定 `editor_auto_close` が ON のとき）。
+    /// 文書（`[` はリンク・`(` は括弧書き）は入れない
+    pub auto_close: bool,
     /// 行コメントの記号（#1692）。`None` = コメントの記号を持たない形式（プレーンテキスト・JSON・
     /// 表に無い形式）で、コメントの付け外しは本文を触らずに理由を返す
     pub comment: Option<CommentSyntax>,
@@ -107,9 +118,15 @@ pub const CODE: FileType = FileType {
     media_type: None,
     indent: IndentUnit::Spaces(4),
     enter: EnterRule::Brackets,
+    dedent_after: &[],
+    list_continuation: false,
+    auto_close: true,
     comment: None,
     lexical: LEX_CODE,
 };
+
+/// ブロックを抜ける文（#1759）。この後ろへ同じ深さで書いても届かない（Python）
+const BLOCK_EXITS: &[&str] = &["return", "pass", "break", "continue", "raise"];
 
 // 文字列とブロックコメントの書き方（#1691）。表の行がこのどれかを `lexical` に持つ
 /// 既定: `"…"` と 1 文字のリテラル `'x'`（表に無い形式もこれ）
@@ -201,12 +218,13 @@ const fn lexed(
     }
 }
 
-/// Enter で深くしない文書
+/// Enter で深くしない文書（括弧も自動で閉じない）
 const fn prose(id: &'static str, extensions: &'static [&'static str]) -> FileType {
     FileType {
         id,
         extensions,
         enter: EnterRule::InheritOnly,
+        auto_close: false,
         lexical: Lexical::PROSE,
         ..CODE
     }
@@ -267,11 +285,16 @@ pub const TABLE: &[FileType] = &[
         preview: PreviewRoute::Markdown,
         media_type: Some("text/markdown; charset=utf-8"),
         enter: EnterRule::InheritOnly,
+        list_continuation: true,
+        auto_close: false,
         comment: MARKUP,
         lexical: Lexical::PROSE,
         ..CODE
     },
-    prose("mdx", &["mdx"]),
+    FileType {
+        list_continuation: true,
+        ..prose("mdx", &["mdx"])
+    },
     prose("plaintext", &["txt"]),
     prose("restructuredtext", &["rst"]),
     FileType {
@@ -324,6 +347,7 @@ pub const TABLE: &[FileType] = &[
         id: "python",
         extensions: &["py", "pyi", "pyw"],
         enter: EnterRule::BracketsAndColon,
+        dedent_after: BLOCK_EXITS,
         comment: HASH,
         lexical: LEX_SCRIPT,
         ..CODE
@@ -876,6 +900,39 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// #1759: 字下げを戻すキーワード・リストの印の引き継ぎ・括弧の自動閉じの内訳
+    #[test]
+    fn enterの続きと自動閉じの内訳() {
+        for row in TABLE {
+            // 文書（Enter が継承だけ）は括弧を閉じない（`[` はリンク・`(` は括弧書き）
+            if row.enter == EnterRule::InheritOnly {
+                assert!(!row.auto_close, "{}: 文書なのに括弧を自動で閉じる", row.id);
+            }
+            // リストの印を引き継ぐのは文書だけ（YAML の `- ` を継がない）
+            if row.list_continuation {
+                assert_eq!(row.enter, EnterRule::InheritOnly, "{}", row.id);
+            }
+            // 戻すキーワードは語（空白・記号を含まない）
+            for word in row.dedent_after {
+                assert!(
+                    !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "{}: 戻すキーワード {word:?} は語ではない",
+                    row.id
+                );
+            }
+        }
+        let py = identify_or_default(Path::new("a.py"));
+        assert_eq!(py.dedent_after, BLOCK_EXITS);
+        assert!(py.auto_close);
+        assert!(identify_or_default(Path::new("README.md")).list_continuation);
+        assert!(identify_or_default(Path::new("a.mdx")).list_continuation);
+        assert!(!identify_or_default(Path::new("a.yaml")).list_continuation);
+        assert!(!identify_or_default(Path::new("notes.txt")).list_continuation);
+        assert!(!identify_or_default(Path::new("README.md")).auto_close);
+        // 表に無い形式（コードの既定）は閉じ、戻すキーワードもリストの引き継ぎも無い
+        assert!(CODE.auto_close && CODE.dedent_after.is_empty() && !CODE.list_continuation);
     }
 
     #[test]

@@ -1025,6 +1025,7 @@ mod tests {
             vec![Request::PreviewEditCommand {
                 pane: Some(7),
                 command: "indent".into(),
+                text: None,
                 expected_version: Some(3),
             }]
         );
@@ -1038,6 +1039,61 @@ mod tests {
         );
         assert!(requests.is_empty(), "{requests:?}");
         assert!(format!("{response:?}").contains("同時に"), "{response:?}");
+    }
+
+    /// #1759: `command: "type"` + `text` は文字の打鍵、`auto_close` は括弧の自動閉じの設定へ写す
+    /// （ツールを増やさない）。組み合わせられない引数は Request を作らずに断る
+    #[test]
+    fn preview_editのtypeとauto_closeを写す() {
+        let (_, requests) = run(
+            call(
+                "tako_preview_edit",
+                json!({ "command": "type", "text": "f(", "expected_version": 2 }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewEditCommand {
+                pane: Some(7),
+                command: "type".into(),
+                text: Some("f(".into()),
+                expected_version: Some(2),
+            }]
+        );
+        let (_, requests) = run(
+            call("tako_preview_edit", json!({ "auto_close": false })),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::PreviewAutoClose {
+                enabled: Some(false)
+            }]
+        );
+        for (args, reason) in [
+            (json!({ "command": "type", "auto_close": true }), "同時に"),
+            (json!({ "auto_close": true, "enabled": true }), "同時に"),
+            (json!({ "text": "x" }), "command=type"),
+        ] {
+            let (response, requests) = run(call("tako_preview_edit", args.clone()), Some(7), true);
+            assert!(requests.is_empty(), "{args}: {requests:?}");
+            assert!(format!("{response:?}").contains(reason), "{args}: {response:?}");
+        }
+        // command の enum に type が載る（綴りは tako-core の名前表）
+        let tools = crate::mcp::catalog::tools();
+        let schema = tools
+            .iter()
+            .find(|t| t["name"] == "tako_preview_edit")
+            .map(|t| t["inputSchema"].clone())
+            .unwrap();
+        assert!(schema["properties"]["command"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "type"));
     }
 
     #[test]
