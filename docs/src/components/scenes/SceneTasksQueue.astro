@@ -20,7 +20,7 @@ import TaskSideNotice from '../motion/TaskSideNotice.astro';
 
 <div class="tk-ut">
 	<Scrolly label="人がやることが一覧に溜まる流れ">
-		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={25} status={false}>
+		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={24} status={false}>
 			<TaskSideNotice slot="sidebar" notice={{ text: '新しいユーザータスク u-6: ログイン画面の見た目を確認', at: '2+' }} />
 			<Split>
 				<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
@@ -30,7 +30,7 @@ import TaskSideNotice from '../motion/TaskSideNotice.astro';
 					<span class="tk-l tk-tui-msg" data-at="2+" style="--d: .4s">返答を待つ間に、テストを進めます</span>
 				</Pane>
 			</Split>
-			<TasksPanel slot="right" width="50%" counts={[{ n: 3, at: '1' }, { n: 4, at: '2+' }]}>
+			<TasksPanel slot="right" width="46%" counts={[{ n: 3, at: '1' }, { n: 4, at: '2+' }]}>
 				<TasksHead
 					waiting={[{ n: 3, at: '1' }, { n: 4, at: '2+' }]}
 					kinds={['レビュー', '許可', '投稿']}
@@ -44,8 +44,8 @@ import TaskSideNotice from '../motion/TaskSideNotice.astro';
 					<TaskRow id="u-3" kind="permission" title="本番 DB のマイグレーションを許可" at="!3+" />
 					<TaskRow id="u-2" kind="review" title="README の書き直しを確認" done at="4" />
 				</div>
+				<Pointer path="3:38,20 4:19,32" click="3 4" />
 			</TasksPanel>
-			<Pointer slot="overlay" path="3:73,30 4:68,40" click="3 4" />
 		</TakoWindow>
 
 		<Step title="人にしかできない用事は、右パネルに並ぶ">

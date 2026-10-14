@@ -20,13 +20,13 @@ import TaskCopyTexts from '../motion/TaskCopyTexts.astro';
 
 <div class="tk-ut">
 	<Scrolly label="タスクの中身を開いて見る流れ">
-		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={27} status={false}>
+		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={30} status={false}>
 			<Split>
 				<Pane n={1} title="マスター" badge="ORCH" state="running">
 					<span class="tk-l tk-tui-msg">返答を待つ間に、テストを進めます</span>
 					<span class="tk-l tk-dim">テスト 12 件中 9 件が通過</span>
 				</Pane>
-				<Pane n={2} title="login.png" at="2+" fx="split" body="flush">
+				<Pane n={2} title="login.png" state="none" at="2+" fx="split" body="flush">
 					<div class="tk-ut-preview">
 						<span class="tk-ut-shot"><i></i><i></i><i></i></span>
 					</div>
@@ -39,36 +39,37 @@ import TaskCopyTexts from '../motion/TaskCopyTexts.astro';
 					notice={{ text: '「投稿文」をコピーしました', at: '4' }}
 				/>
 				<div class="tk-ut-list">
-					<TaskRow id="u-6" kind="review" title="ログイン画面の見た目を確認" openAt="!3+">
-						<div class="tk-ut-meta"><span class="tk-ut-kind">レビュー</span></div>
-						<div class="tk-ut-md">ボタンの大きさと配置を見てください。</div>
-						<div class="tk-ut-sec">添付</div>
-						<TaskAttachment route="画像" name="shots/login.png" thumb pressAt="2" />
-					</TaskRow>
-					<TaskRow id="u-5" kind="post" title="リリースのお知らせを X へ投稿" openAt="3+">
-						<div class="tk-ut-meta"><span class="tk-ut-kind">投稿</span><span class="tk-ut-due">期限 10/20</span></div>
-						<div class="tk-ut-md">動画を見て問題なければ投稿してください。</div>
-						<div class="tk-ut-sec">添付</div>
-						<TaskAttachment route="動画" name="out/release.mp4" />
-						<TaskCopyTexts labels={['投稿文', 'タグ']} press={{ label: '投稿文', at: '4' }} />
-					</TaskRow>
-					<TaskRow id="u-4" kind="review" title="API の設計メモを確認" />
-					<TaskRow id="u-3" kind="permission" title="本番 DB のマイグレーションを許可" />
+					<div class="tk-ut-scroller" data-at="4" data-fx="state" style="--to: -5em">
+						<TaskRow id="u-6" kind="review" title="ログイン画面の見た目を確認" openAt="!3+">
+							<div class="tk-ut-meta"><span class="tk-ut-kind">レビュー</span></div>
+							<div class="tk-ut-md">ボタンの大きさと配置を見てください。</div>
+							<div class="tk-ut-sec">添付</div>
+							<TaskAttachment route="画像" name="shots/login.png" thumb pressAt="2" />
+						</TaskRow>
+						<TaskRow id="u-5" kind="post" title="リリースのお知らせを X へ投稿" openAt="3+">
+							<div class="tk-ut-meta"><span class="tk-ut-kind">投稿</span><span class="tk-ut-due">期限 10/20</span></div>
+							<div class="tk-ut-md">動画を見て問題なければ投稿してください。</div>
+							<div class="tk-ut-sec">添付</div>
+							<TaskAttachment route="動画" name="out/release.mp4" />
+							<TaskCopyTexts labels={['投稿文', 'タグ']} press={{ label: '投稿文', at: '4' }} />
+						</TaskRow>
+						<TaskRow id="u-4" kind="review" title="API の設計メモを確認" />
+						<TaskRow id="u-3" kind="permission" title="本番 DB のマイグレーションを許可" />
+					</div>
 				</div>
 			</TasksPanel>
-			<Pointer slot="overlay" path="2:70,64 3:66,33 4:58,66" click="2 3 4" />
+			<Pointer slot="overlay" path="2:70,85 3:70,58 4:49,88" click="2 3 4" />
 		</TakoWindow>
 
 		<Step title="押した行の、すぐ下に開く">
 			<p>行を押すと、その行のすぐ下に中身が開きます。本文は Markdown のまま読めて、画像の添付には縮小が付きます。</p>
-			<p>開いている間も、ほかの行は一覧に残ります。</p>
 		</Step>
 		<Step title="添付は、押すとプレビューで開く">
 			<p>添付の行を押すと、tako のプレビューで開きます。行の左の「画像」「動画」などが、何で開くかの目印です。</p>
 			<p>同じ添付を何度押しても、プレビューのペインは増えません。</p>
 		</Step>
 		<Step title="別の行を押すと、そちらへ移る">
-			<p>開くのは常に 1 件だけです。別の行を押すと前の行は閉じ、押した行が開きます。</p>
+			<p>開くのは常に 1 件だけです。別の行を押すと前の行は閉じ、押した行が開きます。開いている間も、ほかの行は一覧に残ります。</p>
 		</Step>
 		<Step title="コピー用のテキストは、貼り先ごとに">
 			<p>投稿文・タイトル・タグのように貼り先が別々のものは、ボタンが 1 つずつ分かれています。押せばその 1 つだけがクリップボードに入ります。</p>

@@ -23,41 +23,49 @@ import TaskDelivery from '../motion/TaskDelivery.astro';
 
 <div class="tk-ut">
 	<Scrolly label="タスクに返答する流れ">
-		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={27} status={false}>
+		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={30} status={false}>
 			<Split>
 				<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
-					<span class="tk-l tk-tui-msg">設計メモの確認を u-4 で頼んでいます</span>
-					<span class="tk-l tk-dim">テストを進めています…</span>
-					<span class="tk-l tk-tui-user" data-at="5" style="--d: .2s">【ユーザー返答】todo u-4「API の設計メモを確認」
+					<div class="tk-ut-scroller is-narrow-only" data-at="5" data-fx="state" style="--to: -5em">
+						<span class="tk-l tk-tui-msg">設計メモの確認を u-4 で頼んでいます</span>
+						<span class="tk-l tk-dim">テストを進めています…</span>
+						<div data-at="5" data-fx="unfold">
+							<div>
+								<span class="tk-l tk-tui-user">【ユーザー返答】todo u-4「API の設計メモを確認」
 decision=needs_change via=pc kind=review status=open
 コメント: エラー時の応答も書いてほしい</span>
-					<span class="tk-l tk-tui-msg" data-at="5" style="--d: .9s">エラー時の応答を書き足します</span>
-					<span class="tk-l tk-tui-input" data-at="4"><span data-at="4" data-fx="type">【ユーザー返答】todo u-4</span></span>
+								<span class="tk-l tk-tui-msg" data-at="5" style="--d: .8s">エラー時の応答を書き足します</span>
+							</div>
+						</div>
+						<span class="tk-l tk-tui-input" data-at="4"><span data-at="4" data-fx="type">【ユーザー返答】todo u-4</span></span>
+					</div>
 				</Pane>
 			</Split>
 			<TasksPanel slot="right" width="62%" narrow="64%" counts={[{ n: 4 }]}>
 				<TasksHead waiting={[{ n: 4 }]} kinds={['レビュー', '許可', '投稿']} />
 				<div class="tk-ut-list">
 					<div class="tk-ut-scroller" data-at="3+" data-fx="state" style="--to: -4.6em">
-						<TaskRow id="u-4" kind="review" title="API の設計メモを確認" open delivery={[{ state: 'sent', at: '4' }, { state: 'delivered', at: '5' }]}>
-							<div class="tk-ut-meta"><span class="tk-ut-kind">レビュー</span></div>
-							<div class="tk-ut-md">抜けている観点がないか見てください。</div>
-							<TaskThread
-								at="3+"
-								counts={[{ n: 1 }]}
-								entries={[
-									{ head: '送信中 · PC · 直してほしい', text: 'エラー時の応答も書いてほしい', pending: true, at: '3' },
-									{ head: '10:41 · PC · 直してほしい', text: 'エラー時の応答も書いてほしい', at: '4+', swap: true },
-								]}
-							/>
-							<TaskReply pick={{ label: '直してほしい', at: '2' }} comment={{ text: 'エラー時の応答も書いてほしい', at: '2' }} pressAt="3" />
-							<TaskDelivery at="4+" states={[{ state: 'sent', pane: 1, at: '4' }, { state: 'delivered', pane: 1, at: '5' }]} />
-						</TaskRow>
-						<TaskRow id="u-3" kind="permission" title="本番 DB のマイグレーションを許可" />
+						<div class="tk-ut-scroller" data-at="4+" data-fx="state" style="--to: -2.4em">
+							<TaskRow id="u-4" kind="review" title="API の設計メモを確認" open delivery={[{ state: 'sent', at: '4' }, { state: 'delivered', at: '5' }]}>
+								<div class="tk-ut-meta"><span class="tk-ut-kind">レビュー</span></div>
+								<div class="tk-ut-md">抜けている観点がないか見てください。</div>
+								<TaskThread
+									at="3+"
+									counts={[{ n: 1 }]}
+									entries={[
+										{ head: '送信中 · PC · 直してほしい', text: 'エラー時の応答も書いてほしい', pending: true, at: '3' },
+										{ head: '10:41 · PC · 直してほしい', text: 'エラー時の応答も書いてほしい', at: '4+', swap: true },
+									]}
+								/>
+								<TaskReply pick={{ label: '直してほしい', at: '2' }} comment={{ text: 'エラー時の応答も書いてほしい', at: '2' }} pressAt="3" />
+								<TaskDelivery at="4+" states={[{ state: 'sent', pane: 1, at: '4' }, { state: 'delivered', pane: 1, at: '5' }]} />
+							</TaskRow>
+							<TaskRow id="u-3" kind="permission" title="本番 DB のマイグレーションを許可" />
+						</div>
 					</div>
 				</div>
 			</TasksPanel>
-			<Pointer slot="overlay" path="2:74,52 3:47,77" click="2 3" />
+			<Pointer slot="overlay" path="2:67,75 3:46,92" click="2 3" />
 		</TakoWindow>
 
 		<Step title="判断を選ぶまで、「返す」は押せない">

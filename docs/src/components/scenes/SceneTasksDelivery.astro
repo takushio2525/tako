@@ -28,7 +28,7 @@ import TaskDelivery from '../motion/TaskDelivery.astro';
 				{ label: 'my-app', state: 'idle', active: true, activeAt: '!2+' },
 				{ label: 'my-app (AI チーム)', state: 'running', at: '2+', activeAt: '2+' },
 			]}
-			height={27}
+			height={30}
 			status={false}
 		>
 			<Split>
@@ -37,49 +37,53 @@ import TaskDelivery from '../motion/TaskDelivery.astro';
 						<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
 					</Pane>
 					<Pane n={2} title="マスター" badge="ORCH" state="running" at="2+" fx="fade" focus>
-						<span class="tk-l tk-tui-user" data-at="2+" style="--d: .5s">【ユーザー返答】todo u-8「リリースは今日でよいか」
+						<div class="tk-ut-scroller is-narrow-only" data-at="3+" data-fx="state" style="--to: -4.5em">
+							<span class="tk-l tk-tui-user" data-at="2+" style="--d: .5s">【ユーザー返答】todo u-8「リリースは今日でよいか」
 decision=answered via=pc kind=confirm status=open
 コメント: 明日の朝にしてください
 --- タスク本文 ---
 変更は揃いました。今日リリースしてよいですか</span>
-						<span class="tk-l tk-tui-msg" data-at="3+" style="--d: .3s">了解です。明日の朝にリリースします</span>
+							<span class="tk-l tk-tui-msg" data-at="3+" style="--d: .3s">了解です。明日の朝にリリースします</span>
+						</div>
 					</Pane>
 				</div>
 			</Split>
 			<TasksPanel slot="right" width="60%" narrow="64%" counts={[{ n: 2 }]}>
 				<TasksHead waiting={[{ n: 2 }]} kinds={['確認', '投稿']} />
 				<div class="tk-ut-list">
-					<TaskRow
-						id="u-8"
-						kind="confirm"
-						title="リリースは今日でよいか"
-						openAt="!4"
-						delivery={[{ state: 'launched', at: '2' }, { state: 'delivered', at: '3+' }]}
-					>
-						<div class="tk-ut-meta"><span class="tk-ut-kind">確認</span></div>
-						<TaskThread
-							at="2+"
-							counts={[{ n: 1 }]}
-							entries={[{ head: '10:52 · PC · 回答', text: '明日の朝にしてください' }]}
-						/>
-						<TaskReply pick={{ label: '回答', at: '1' }} comment={{ text: '明日の朝にしてください', at: '1' }} pressAt="2" />
-						<TaskDelivery at="2+" states={[{ state: 'launched', pane: 2, at: '2' }, { state: 'delivered', pane: 2, at: '3+' }]} />
-					</TaskRow>
-					<TaskRow id="u-7" kind="post" title="ブログの下書きを投稿" openAt="4" delivery={[{ state: 'failed' }]}>
-						<div class="tk-ut-meta"><span class="tk-ut-kind">投稿</span></div>
-						<TaskThread counts={[{ n: 1 }]} entries={[{ head: '10/12 18:20 · スマホ · 回答', text: '来週に回してください' }]} />
-						<TaskDelivery
-							states={[
-								{
-									state: 'failed',
-									reason: '宛先不明: 起票元の master プロファイルを解決できない（呼び出し元の role も spawn 元の master も残っていない）',
-								},
-							]}
-						/>
-					</TaskRow>
+					<div class="tk-ut-scroller" data-at="2-3" data-fx="state" style="--to: -5em">
+						<TaskRow
+							id="u-8"
+							kind="confirm"
+							title="リリースは今日でよいか"
+							openAt="!4"
+							delivery={[{ state: 'launched', at: '2' }, { state: 'delivered', at: '3+' }]}
+						>
+							<div class="tk-ut-meta"><span class="tk-ut-kind">確認</span></div>
+							<TaskThread
+								at="2+"
+								counts={[{ n: 1 }]}
+								entries={[{ head: '10:52 · PC · 回答', text: '明日の朝にしてください' }]}
+							/>
+							<TaskReply pick={{ label: '回答', at: '1' }} comment={{ text: '明日の朝にしてください', at: '1' }} pressAt="2" />
+							<TaskDelivery at="2+" states={[{ state: 'launched', pane: 2, at: '2' }, { state: 'delivered', pane: 2, at: '3+' }]} />
+						</TaskRow>
+						<TaskRow id="u-7" kind="post" title="ブログの下書きを投稿" openAt="4" delivery={[{ state: 'failed' }]}>
+							<div class="tk-ut-meta"><span class="tk-ut-kind">投稿</span></div>
+							<TaskThread counts={[{ n: 1 }]} entries={[{ head: '10/12 18:20 · スマホ · 回答', text: '来週に回してください' }]} />
+							<TaskDelivery
+								states={[
+									{
+										state: 'failed',
+										reason: '宛先不明: 起票元の master プロファイルを解決できない（呼び出し元の role も spawn 元の master も残っていない）',
+									},
+								]}
+							/>
+						</TaskRow>
+					</div>
 				</div>
 			</TasksPanel>
-			<Pointer slot="overlay" path="1:56,68 2:48,72 4:62,46" click="2 4" />
+			<Pointer slot="overlay" path="2:46,83 4:69,57" click="2 4" />
 		</TakoWindow>
 
 		<Step title="master を閉じていても、返せる">

@@ -42,6 +42,7 @@
   }
 }
 .tk-right-body.tk-ut-body {
+  position: relative;
   padding: 0;
   gap: 0;
 }
@@ -54,7 +55,7 @@
   display: flex;
   align-items: center;
   gap: 0.5em;
-  padding: 0.95em 1.1em 0.5em;
+  padding: 0.8em 1.1em 0.45em;
   flex: none;
 }
 .tk-ut-label {
@@ -97,14 +98,6 @@
   background: var(--ui-accent-muted);
   color: var(--ui-fg);
 }
-/* 選ばれていない姿と選ばれた姿を重ねて入れ替える器（手順で選択が移るチップ） */
-.tk-ut-chip-slot {
-  display: inline-grid;
-}
-.tk-ut-chip-slot > * {
-  grid-area: 1 / 1;
-}
-
 /* 一覧の上の 1 行（「投稿文」をコピーしました など） */
 .tk-ut-notice {
   padding: 0 1.2em 0.35em;
@@ -202,7 +195,8 @@
   color: var(--ui-muted);
 }
 /* 開いている行はタイトルを折り返して全文を出す（詳細はタイトルを繰り返さない） */
-.tk-ut-row.is-open .tk-ut-title {
+.tk-ut-row.is-open .tk-ut-title,
+.tk-ut-row[data-fx~='state'].is-on .tk-ut-title {
   white-space: normal;
 }
 .tk-ut-stackdot {
@@ -218,7 +212,7 @@
   display: flex;
   flex-direction: column;
   margin: 0.15em 0 0.4em;
-  padding: 0.65em 0.7em 0.7em;
+  padding: 0.55em 0.7em 0.6em;
   border-radius: 8px;
   border: 1px solid var(--ut-border-strong);
   background: var(--ut-surface1);
@@ -256,7 +250,7 @@
   padding: 0 0.3em;
 }
 .tk-ut-sec {
-  padding: 0.7em 0 0.25em;
+  padding: 0.5em 0 0.2em;
   font-size: 0.9em;
   font-weight: 700;
   color: var(--ui-faint);
@@ -304,15 +298,15 @@
 /* 画像の縮小（実物は 320x180 の枠に収めた縮小。ここではログイン画面の絵を CSS で描く） */
 .tk-ut-thumb {
   margin: 0.25em 0;
-  height: 6.2em;
+  height: 4.8em;
   border-radius: 4px;
   background: var(--ut-surface0);
   display: grid;
   place-items: center;
 }
 .tk-ut-shot {
-  width: 9.6em;
-  height: 5.4em;
+  width: 7.6em;
+  height: 4.2em;
   border-radius: 3px;
   background: linear-gradient(160deg, #2a2f4a, #241f38);
   border: 1px solid #3a3f5c;
@@ -387,7 +381,7 @@
 /* 返答フォーム */
 .tk-ut-field {
   margin-top: 0.35em;
-  min-height: 3.5em;
+  min-height: 2.8em;
   padding: 0.35em 0.5em;
   border-radius: 6px;
   border: 1px solid var(--ui-line-in);
@@ -453,19 +447,9 @@
   min-width: 0;
 }
 
-/* 注目させたい区画（その手順で話している所）を淡く縁取る */
-.tk-ut-focus {
-  border-radius: 6px;
-  transition: box-shadow 0.3s var(--tako-ease-soft), background-color 0.3s var(--tako-ease-soft);
-}
-.tk-ut-focus[data-fx~='state'].is-on {
-  box-shadow: 0 0 0 1.5px var(--ut-accent-border);
-  background: rgb(137 180 250 / 0.06);
-}
-
 /* 通知欄の 1 行（ファイルツリーの上端。成功は緑を 12% 敷く） */
 .tk-ut-side {
-  width: 27%;
+  width: 22%;
   max-width: 11em;
   flex: none;
   display: flex;
@@ -564,7 +548,7 @@
 .tk-ut-pchip {
   display: inline-flex;
   align-items: center;
-  padding: 0.3em 0.6em;
+  padding: 0.3em 0.5em;
   border-radius: 0.5em;
   font-size: 0.9em;
   white-space: nowrap;
@@ -633,12 +617,10 @@
 .tk-ut-pmeta .tk-ut-pid {
   color: var(--ph-fg3);
 }
-.tk-ut-pmeta .is-ok,
-.tk-ut-pline.is-ok {
+.tk-ut-pmeta .is-ok {
   color: var(--ph-green);
 }
-.tk-ut-pmeta .is-error,
-.tk-ut-pline.is-error {
+.tk-ut-pmeta .is-error {
   color: var(--ph-red);
 }
 .tk-ut-ph1 {
@@ -718,6 +700,7 @@
 }
 .tk-ut-ppre {
   margin: 0;
+  display: block;
   padding: 0.45em 0.55em;
   border-radius: 0.5em;
   background: var(--ph-bg);
@@ -751,37 +734,6 @@
 .tk-ut-pactions .tk-pbtn {
   margin-left: auto;
 }
-.tk-ut-pline {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5em;
-  font-size: 0.9em;
-  color: var(--ph-fg2);
-}
-.tk-ut-presp {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2em;
-  padding: 0.45em 0.6em;
-  border-left: 2px solid var(--ph-line2);
-  border-radius: 0.5em;
-  background: var(--ph-panel2);
-}
-.tk-ut-presp-head {
-  display: flex;
-  gap: 0.5em;
-  font-size: 0.9em;
-}
-.tk-ut-presp-head b {
-  font-weight: 700;
-}
-.tk-ut-presp-head span {
-  color: var(--ph-fg3);
-}
-/* 押せない「返す」（判断を選ぶまで） */
-.tk-pbtn.tk-ut-off {
-  opacity: 0.45;
-}
 
 /* 一覧を手順でスクロールした姿にする（返答の欄が下へ伸びたぶん、読む位置を下げる）。
  * 実物の一覧もスクロールする。どこまで下げるかは --to（負の em） */
@@ -794,9 +746,6 @@
 }
 .tk-ut-pseek i[data-at] {
   transition: width 2.6s linear 0.3s;
-}
-.tk-ut-focus[data-at] {
-  transition: box-shadow 0.3s var(--tako-ease-soft), background-color 0.3s var(--tako-ease-soft);
 }
 .tk-ut-pback .tk-ic {
   transform: scaleX(-1);
@@ -838,4 +787,30 @@
 }
 .tk-ut-os a {
   color: var(--tako-accent);
+}
+
+/* このページのスマホは一段大きく描く（手順の文字と並べて読める大きさにする） */
+.tk-ut .tk-phone {
+  font-size: 12.5px;
+}
+@container tkframe (max-width: 30rem) {
+  .tk-ut .tk-phone {
+    font-size: 11px;
+  }
+}
+
+/* 窓が狭いときだけ読む位置を下げる（ペインが細いと会話が折り返して長くなり、最後の行が下に隠れる） */
+@container tkframe (min-width: 26rem) {
+  .tk-ut-scroller.is-narrow-only[data-fx~='state'].is-on {
+    transform: none;
+  }
+}
+
+/* スマホ版の添付の動画は横長に詰め、ボタンを 1 行に収める */
+.tk-ut .tk-ut-pvideo {
+  aspect-ratio: 2 / 1;
+}
+.tk-ut-pbtns .tk-pbtn {
+  padding: 0.35em 0.5em;
+  font-size: 0.85em;
 }
