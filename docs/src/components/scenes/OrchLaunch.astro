@@ -1,0 +1,75 @@
+---
+/**
+ * 場面（オーケストレーションのページ #2059）: tako master → 依頼 → 分担 → worker 1 体 → 2 体 → 4 体。
+ * 事実の出どころ: `tako master --help`（今のペインで起動。--tab で新しいタブ）/
+ * .agent/requirements.md FR-2.20（master-reserved: master は左半分、worker は右の領域に grid で
+ * 1 体 = 全面 → 2 体 = 上下 → 3〜4 体 = 列が 2 つ → 5 体以上は列を増やす。
+ * crates/tako-core/src/spawn_layout.rs の build_grid: 4 体は左列 = 1・2 体目、右列 = 3・4 体目）/
+ * FR-2.20.7（1 枚が 60 桁を割るなら worker 領域の文字を縮める。別タブへは逃がさない）。
+ * worker のタイトルは「プロジェクト: ラベル」（dispatch.rs の spawn）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import '../../styles/tako-orch.css';
+---
+
+<Scrolly label="tako master に頼んでから、worker が 4 体並ぶまで">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={27} class="tko-launch">
+		<Split>
+			<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+				<span class="tk-l"><span class="tk-p">my-app ❯</span> <span data-at="1+" data-fx="type">tako master</span></span>
+				<span class="tk-l tk-tui-user" data-at="1+" style="--d: .8s">テスト・誤字・型エラー・CI の警告を直して</span>
+				<span class="tk-l tk-tui-msg" data-at="2+">4 つに分けます（1 体 = 1 成果物）</span>
+				<span class="tk-l tk-dim" data-at="2+" style="--d: .2s">  1 テスト → my-app</span>
+				<span class="tk-l tk-dim" data-at="2+" style="--d: .35s">  2 誤字 → docs</span>
+				<span class="tk-l tk-dim" data-at="2+" style="--d: .5s">  3 型エラー → api</span>
+				<span class="tk-l tk-dim" data-at="2+" style="--d: .65s">  4 CI の警告 → my-app</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="3+">
+					<span>worker を起動 <span class="tko-swap"><span data-at="3" data-fx="fade">1 体目</span><span data-at="4" data-fx="fade">2 体目</span><span data-at="5+" data-fx="fade">3・4 体目</span></span></span>
+				</span>
+			</Pane>
+			<Split at="3+" fx="split">
+				<Split dir="col">
+					<Pane n={2} title="my-app: test" badge="WORKER" parent="master" state="running">
+						<span class="tk-l tk-tui-user">ログイン画面のテストを足す</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="3+" style="--d: .9s">tests/login.test.ts を作成</span>
+					</Pane>
+					<Pane n={3} title="docs: typo" badge="WORKER" parent="master" state="running" at="4+" fx="split">
+						<span class="tk-l tk-tui-user">docs の誤字を直す</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="4+" style="--d: .9s">guide.md を読む</span>
+					</Pane>
+				</Split>
+				<Split dir="col" at="5+" fx="split">
+					<Pane n={4} title="api: types" badge="WORKER" parent="master" state="running">
+						<span class="tk-l tk-tui-user">型エラーを直す</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="5+" style="--d: .9s">tsc --noEmit</span>
+					</Pane>
+					<Pane n={5} title="my-app: ci" badge="WORKER" parent="master" state="running" at="5+" fx="split" style="--d: .55s">
+						<span class="tk-l tk-tui-user">CI の警告を消す</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="5+" style="--d: 1.3s">ci.yml を読む</span>
+					</Pane>
+				</Split>
+			</Split>
+		</Split>
+	</TakoWindow>
+
+	<Step title="tako master と打って、1 回頼む">
+		<p>ペインで <code>tako master</code> と打つと、<strong>そのペイン</strong>で司令塔の AI（master）が起動します。やってほしいことを、日本語でまとめて伝えます。</p>
+		<p class="tk-step-note">専用のタブで立てたいときは <code>tako master --tab</code>。</p>
+	</Step>
+	<Step title="成果物ごとに分けて、先に見せる">
+		<p>master は依頼を独立した成果物に分け、<strong>1 つの成果物に worker を 1 体</strong>割り当てる計画を先に示します。意図と違えば、ここで止められます。</p>
+	</Step>
+	<Step title="1 体目は右半分いっぱい">
+		<p>worker は<strong>同じタブ</strong>の、master の右側に立ち上がります。master は左半分に残るので、司令塔の画面は狭くなりません。指示は、入力欄に届いたことを確かめてから送られます。</p>
+	</Step>
+	<Step title="2 体目で上下に分かれる">
+		<p>2 体目が来ると、右側が上下に分かれます。worker ごとに別のプロジェクト（ここでは <code>docs</code>）のフォルダで動けます。</p>
+	</Step>
+	<Step title="4 体で十字に並ぶ">
+		<p>3 体目から右側が 2 列になり、4 体で十字の 4 分割です。5 体目からは列が増えます。1 枚が 60 桁を割りそうになると worker 側の文字を自動で小さくし、<strong>別のタブへは逃がしません</strong>。</p>
+	</Step>
+</Scrolly>
