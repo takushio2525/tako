@@ -1270,8 +1270,8 @@ a:hover {
   -webkit-overflow-scrolling: touch;
 }
 
-/* リスト */
-.sl-markdown-content :is(ul, ol):not(:where(.not-content *)) {
+/* リスト（.not-content を付けたリスト自身にも効かせない。部品のリストが右へずれるため） */
+.sl-markdown-content :is(ul, ol):not(:where(.not-content, .not-content *)) {
   padding-left: 1.5em;
 }
 
