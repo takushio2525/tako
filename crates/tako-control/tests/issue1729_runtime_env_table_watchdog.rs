@@ -134,6 +134,11 @@ fn 表の語彙() -> Vec<&'static str> {
                     words.extend(s.files.iter().copied());
                     words.push(s.var);
                 }
+                // #1950: アプリ同梱（置き場の知識は `app_bundle` の表）
+                Detector::Bundled(s) => {
+                    words.extend([s.bundle.id, s.bundle.label]);
+                    words.extend([s.file_name.macos, s.file_name.windows]);
+                }
             }
         }
     }

@@ -25,6 +25,7 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+use crate::i18n::Lang;
 use crate::platform::support::Platform;
 use crate::project_root::{self, SearchBounds};
 use crate::runner::RuntimeWords;
@@ -42,11 +43,39 @@ pub struct ProjectKind {
     pub file_names: &'static [&'static str],
     /// 印が見つかったときの計画。`None` = この印では決められない（上の段・次の種別を探す）
     plan: fn(&Probe<'_>) -> Option<Planned>,
+    /// 子プロセスに聞いて案内を詰める（Tier P。`RunResolve` の background でだけ走る。#1950）
+    pub followup: Option<Followup>,
+    /// A/B: この環境変数が `1` なら行を無いものとして扱う（その種別を足す前の解決へ戻す）
+    pub legacy_env: Option<&'static str>,
+}
+
+/// 案内（[`ProjectNote`]）を子プロセスの答えで詰める問い合わせ（#1950）。
+///
+/// 起こすのは実行環境の層（#1730）が見つけた実行ファイル（`${<variable>}` の実体）で、
+/// 待ちは `probe::output_with_timeout` の 1 実装（呼ぶのは tako-control の `runtime_probe`）。
+/// `Run`（UI スレッドから同期で呼ばれる）では起こさない
+pub struct Followup {
+    /// この ID の案内が出ているときだけ聞く
+    pub note: &'static str,
+    /// 実行ファイルへ渡す引数
+    pub args: &'static [&'static str],
+    /// 出力（stdout）で案内を詰め直す。読めない出力なら何も変えない
+    pub refine: fn(&mut ProjectNote, &str),
 }
 
 impl ProjectKind {
     pub fn claims(&self, ext: &str, file_name: &str) -> bool {
         (!ext.is_empty() && self.exts.contains(&ext)) || self.file_names.contains(&file_name)
+    }
+
+    /// A/B（[`Self::legacy_env`]）で外されている
+    fn disabled(&self) -> bool {
+        self.disabled_with(|k| std::env::var(k).ok())
+    }
+
+    fn disabled_with(&self, get: impl Fn(&str) -> Option<String>) -> bool {
+        self.legacy_env
+            .is_some_and(|k| get(k).is_some_and(|v| v == "1"))
     }
 }
 
@@ -73,6 +102,57 @@ struct Planned {
     /// 実行する cwd（= `${workspaceRoot}`）
     root: PathBuf,
     command: String,
+    /// 既定（`default`）の他に選べるプロファイル（名前, コマンド）。cwd は `root`
+    profiles: Vec<(&'static str, String)>,
+    /// 走らせる前に知らせること
+    notes: Vec<ProjectNote>,
+    /// 決め手になった印の上書き（`None` = 探索で見つかった印）
+    marker: Option<PathBuf>,
+}
+
+impl Planned {
+    fn new(root: PathBuf, command: String) -> Self {
+        Self {
+            root,
+            command,
+            profiles: Vec::new(),
+            notes: Vec::new(),
+            marker: None,
+        }
+    }
+}
+
+/// 走らせる前に知らせること（#1950）。走らせても失敗するのが分かっている形
+/// （`arduino-cli` が英語の 1 行で落ちる）を、何をすれば直るかの人の言葉にする。
+///
+/// 実行ペインではコマンドの前に [`ProjectNote::lines`] を出し、CLI / MCP の応答には
+/// `project.notes` として載る
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectNote {
+    /// 安定 ID（`board_not_selected` / `sketch_name_mismatch` / `cli_not_found` / `port_not_selected`）
+    pub id: &'static str,
+    /// 人の言葉（日英は作った時点の `i18n::lang()`）
+    pub message: String,
+    /// 打てば直るコマンド（最簡形。#322）
+    pub commands: Vec<String>,
+    /// この名前の実行ファイルが実行ペインのシェルで見つかるなら出さない
+    /// （GUI の PATH は Dock 起動だと痩せているので、tako が見つけられなかっただけかもしれない）
+    pub unless_found: Option<String>,
+    /// このプロファイルにだけ効く（`None` = すべて）
+    pub profile: Option<&'static str>,
+}
+
+impl ProjectNote {
+    pub fn applies_to(&self, profile: &str) -> bool {
+        self.profile.is_none_or(|p| p == profile)
+    }
+
+    /// 実行ペインに出す行（`[tako] ` + 本文、コマンドは 2 字下げ）
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = vec![format!("[tako] {}", self.message)];
+        out.extend(self.commands.iter().map(|c| format!("  {c}")));
+        out
+    }
 }
 
 /// 検出結果（`runner::Resolution::project` に載って CLI / MCP へ出る）
@@ -86,6 +166,33 @@ pub struct ProjectMatch {
     pub marker: PathBuf,
     /// 組み立て済みのコマンド（変数展開は不要な完成形）
     pub command: String,
+    /// 既定の他に選べるプロファイル（名前, コマンド。cwd は `root`）
+    pub profiles: Vec<(String, String)>,
+    /// 走らせる前に知らせること（[`ProjectNote`]）
+    pub notes: Vec<ProjectNote>,
+}
+
+impl ProjectMatch {
+    /// この種別の行
+    pub fn kind_row(&self) -> Option<&'static ProjectKind> {
+        KINDS.iter().find(|k| k.id == self.kind)
+    }
+
+    /// 子プロセスに聞けば詰められる案内があれば、その問い合わせ
+    pub fn followup(&self) -> Option<&'static Followup> {
+        let f = self.kind_row()?.followup.as_ref()?;
+        self.notes.iter().any(|n| n.id == f.note).then_some(f)
+    }
+
+    /// [`Self::followup`] の答えで案内を詰める
+    pub fn apply_followup(&mut self, stdout: &str) {
+        let Some(f) = self.followup() else {
+            return;
+        };
+        for note in self.notes.iter_mut().filter(|n| n.id == f.note) {
+            (f.refine)(note, stdout);
+        }
+    }
 }
 
 /// 種別の表（**近い段の印が勝ち、同じ段なら表の上の行が勝つ**）
@@ -96,6 +203,8 @@ pub const KINDS: &[ProjectKind] = &[
         exts: &["rs"],
         file_names: &[],
         plan: plan_cargo,
+        followup: None,
+        legacy_env: None,
     },
     ProjectKind {
         id: "go",
@@ -103,6 +212,8 @@ pub const KINDS: &[ProjectKind] = &[
         exts: &["go"],
         file_names: &[],
         plan: plan_go,
+        followup: None,
+        legacy_env: None,
     },
     ProjectKind {
         id: "npm",
@@ -110,6 +221,8 @@ pub const KINDS: &[ProjectKind] = &[
         exts: &["js", "mjs", "cjs", "ts", "mts", "cts", "tsx", "jsx"],
         file_names: &[],
         plan: plan_npm,
+        followup: None,
+        legacy_env: None,
     },
     ProjectKind {
         id: "python",
@@ -117,6 +230,8 @@ pub const KINDS: &[ProjectKind] = &[
         exts: &["py"],
         file_names: &[],
         plan: plan_python,
+        followup: None,
+        legacy_env: None,
     },
     ProjectKind {
         id: "dotnet",
@@ -124,6 +239,8 @@ pub const KINDS: &[ProjectKind] = &[
         exts: &["cs", "fs", "vb"],
         file_names: &[],
         plan: plan_dotnet,
+        followup: None,
+        legacy_env: None,
     },
     // C / C++ は複数ファイルをリンクして初めて動くので、単体の `cc a.c` より
     // プロジェクトの Makefile が正しい。`Makefile` 自身も印かつ実行対象になる
@@ -133,6 +250,24 @@ pub const KINDS: &[ProjectKind] = &[
         exts: &["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx"],
         file_names: &MAKEFILES,
         plan: plan_make,
+        followup: None,
+        legacy_env: None,
+    },
+    // Arduino のスケッチ（#1950）。スケッチ = フォルダで、本体はフォルダと同じ名前の `.ino`。
+    // 基板の正本は `sketch.yaml`（Arduino IDE / arduino-cli と同じファイル）。`.ino` 自身が
+    // 必ず `*.ino` に当たるので、スケッチのフォルダで計画が走る（名前の不一致も案内できる）
+    ProjectKind {
+        id: "arduino",
+        markers: &[SKETCH_YAML, "*.ino"],
+        exts: &["ino"],
+        file_names: &[],
+        plan: plan_arduino,
+        followup: Some(Followup {
+            note: NOTE_BOARD,
+            args: &["board", "list", "--format", "json"],
+            refine: refine_board_note,
+        }),
+        legacy_env: Some("TAKO_1950_LEGACY"),
     },
 ];
 
@@ -156,7 +291,10 @@ pub fn detect(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let claiming: Vec<&ProjectKind> = KINDS.iter().filter(|k| k.claims(&ext, &name)).collect();
+    let claiming: Vec<&ProjectKind> = KINDS
+        .iter()
+        .filter(|k| k.claims(&ext, &name) && !k.disabled())
+        .collect();
     if claiming.is_empty() {
         return None;
     }
@@ -179,8 +317,14 @@ pub fn detect(
                 return Some(ProjectMatch {
                     kind: kind.id,
                     root: planned.root,
-                    marker: dir.join(&marker),
+                    marker: planned.marker.unwrap_or_else(|| dir.join(&marker)),
                     command: planned.command,
+                    profiles: planned
+                        .profiles
+                        .into_iter()
+                        .map(|(name, cmd)| (name.to_string(), cmd))
+                        .collect(),
+                    notes: planned.notes,
                 });
             }
         }
@@ -586,7 +730,7 @@ fn plan_cargo(p: &Probe<'_>) -> Option<Planned> {
             }
         }
     };
-    Some(Planned { root, command })
+    Some(Planned::new(root, command))
 }
 
 // ─── go ────────────────────────────────────────────────────────────────
@@ -655,10 +799,10 @@ fn plan_go(p: &Probe<'_>) -> Option<Planned> {
     let not_main = go_package_clause(p.head).is_some_and(|c| c != "main");
     // main でないパッケージは `go run` が「not a main package」で落ちる
     let verb = if is_test || not_main { "test" } else { "run" };
-    Some(Planned {
-        root: root.to_path_buf(),
-        command: format!("go {verb} {}", quote_for_shell(&pkg)),
-    })
+    Some(Planned::new(
+        root.to_path_buf(),
+        format!("go {verb} {}", quote_for_shell(&pkg)),
+    ))
 }
 
 // ─── npm ───────────────────────────────────────────────────────────────
@@ -731,10 +875,7 @@ fn plan_npm(p: &Probe<'_>) -> Option<Planned> {
             _ => format!("npx tsx {}", quote_for_shell(&rel)),
         }
     };
-    Some(Planned {
-        root: root.to_path_buf(),
-        command,
-    })
+    Some(Planned::new(root.to_path_buf(), command))
 }
 
 // ─── python ────────────────────────────────────────────────────────────
@@ -746,16 +887,17 @@ fn plan_npm(p: &Probe<'_>) -> Option<Planned> {
 /// 層を通っていないとき（`TAKO_1730_LEGACY=1` / 再生ボタンの一覧）は #1656 の推定
 /// （[`python_command_1656`]）のまま
 fn interpreter(p: &Probe<'_>) -> String {
-    let ext = file_ext(p.file);
-    let words = crate::runtime_env::kind_for_ext(&ext)
+    runtime_value(p)
+        .unwrap_or_else(|| python_command_1656(p.marker_dir, p.platform, &file_ext(p.file)))
+}
+
+/// 実行環境の層（#1730）が決めた、このファイルの kind の `${<variable>}` の値
+/// （実行ペインのシェルの方言で囲んだもの）。層が決めていなければ `None`
+fn runtime_value(p: &Probe<'_>) -> Option<String> {
+    let words = crate::runtime_env::kind_for_ext(&file_ext(p.file))
         .and_then(|k| p.runtime.get(k.variable))
-        .filter(|w| !w.is_empty());
-    match words {
-        Some(words) => {
-            crate::platform::shell::run_pane_dialect_for(p.platform).command_words(words)
-        }
-        None => python_command_1656(p.marker_dir, p.platform, &ext),
-    }
+        .filter(|w| !w.is_empty())?;
+    Some(crate::platform::shell::run_pane_dialect_for(p.platform).command_words(words))
 }
 
 /// #1656 の解釈系の推定（`uv.lock` → `uv run python` / `poetry.lock` → `poetry run python` /
@@ -836,10 +978,7 @@ fn plan_python(p: &Probe<'_>) -> Option<Planned> {
             None => format!("{py} {}", quote_for_shell(&rel_slash)),
         }
     };
-    Some(Planned {
-        root: root.to_path_buf(),
-        command,
-    })
+    Some(Planned::new(root.to_path_buf(), command))
 }
 
 // ─── dotnet ────────────────────────────────────────────────────────────
@@ -872,10 +1011,7 @@ fn plan_dotnet(p: &Probe<'_>) -> Option<Planned> {
         Some(f) => format!("dotnet {verb} --project {}", quote_for_shell(&f)),
         None => format!("dotnet {verb}"),
     };
-    Some(Planned {
-        root: root.to_path_buf(),
-        command,
-    })
+    Some(Planned::new(root.to_path_buf(), command))
 }
 
 // ─── make ──────────────────────────────────────────────────────────────
@@ -904,10 +1040,333 @@ fn plan_make(p: &Probe<'_>) -> Option<Planned> {
     } else {
         "make"
     };
-    Some(Planned {
-        root: p.marker_dir.to_path_buf(),
-        command: command.to_string(),
-    })
+    Some(Planned::new(
+        p.marker_dir.to_path_buf(),
+        command.to_string(),
+    ))
+}
+
+// ─── arduino ───────────────────────────────────────────────────────────
+//
+// 実測（Arduino IDE 2.3.5 同梱の arduino-cli 1.2.0。設計 §5.4）:
+//
+// | 呼び方 | 結果 |
+// |---|---|
+// | `sketch.yaml`（`default_fqbn`）のあるフォルダで引数なしの `arduino-cli compile` | exit 0 |
+// | 基板なし | `Missing FQBN (Fully Qualified Board Name)` で exit 1 |
+// | フォルダ名と `.ino` の名前が違う | `main file missing from sketch: <dir>/<フォルダ名>.ino` |
+// | 大文字小文字だけ違う（`blinkc/Blinkc.ino`。大小を区別しない APFS でも） | `missing <dir>/blinkc.ino` |
+
+/// スケッチの設定。**基板とポートの正本はこのファイル**（Arduino IDE / arduino-cli と同じものを
+/// 見るので食い違わない。tako の保存先には持たない）。書くのは `arduino-cli board attach`
+const SKETCH_YAML: &str = "sketch.yaml";
+
+const NOTE_BOARD: &str = "board_not_selected";
+const NOTE_NAME: &str = "sketch_name_mismatch";
+const NOTE_CLI: &str = "cli_not_found";
+const NOTE_PORT: &str = "port_not_selected";
+
+/// 書き込みのプロファイル（`arduino-cli compile --upload`。ポートは `sketch.yaml` の `default_port`）
+const PROFILE_UPLOAD: &str = "upload";
+
+/// 案内のコマンドで基板の名前を入れてもらう場所（[`refine_board_note`] が実の名前に差し替える）
+fn board_placeholder(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ja => "<基板>",
+        Lang::En => "<board>",
+    }
+}
+
+fn port_placeholder(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ja => "<ポート>",
+        Lang::En => "<port>",
+    }
+}
+
+/// `sketch.yaml` の最上段の鍵（tako-core は YAML クレートに依存しないので、使う 3 つだけを
+/// 拾う最小の読み手。`profiles:` の下のような字下げした行は読まない）
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SketchYaml {
+    default_fqbn: Option<String>,
+    default_port: Option<String>,
+    /// `profiles:` の中から既定に選んだもの（基板もポートもそちらが持つ）
+    default_profile: Option<String>,
+}
+
+impl SketchYaml {
+    fn read(dir: &Path) -> Option<Self> {
+        std::fs::read_to_string(dir.join(SKETCH_YAML))
+            .ok()
+            .map(|t| Self::parse(&t))
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for line in text.lines() {
+            if line.starts_with([' ', '\t', '#', '-']) {
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = yaml_scalar(value);
+            let slot = match key.trim() {
+                "default_fqbn" => &mut out.default_fqbn,
+                "default_port" => &mut out.default_port,
+                "default_profile" => &mut out.default_profile,
+                _ => continue,
+            };
+            *slot = value;
+        }
+        out
+    }
+
+    fn board_selected(&self) -> bool {
+        self.default_fqbn.is_some() || self.default_profile.is_some()
+    }
+
+    fn port_selected(&self) -> bool {
+        self.default_port.is_some() || self.default_profile.is_some()
+    }
+}
+
+/// YAML の 1 行の値（引用符を外し、行末のコメントを落とす）。空なら `None`
+fn yaml_scalar(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    let v = match v.chars().next() {
+        Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or_default(),
+        _ => v.split(" #").next().unwrap_or_default().trim(),
+    };
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// スケッチの本体（フォルダと同じ名前の `.ino` / 旧形式の `.pde`）。**大文字小文字まで一致**を
+/// 求める（arduino-cli は大小を区別しないディスクでも名前の違いを「missing」で落とす = 実測）
+fn sketch_main_file(dir: &Path) -> Option<String> {
+    let folder = dir.file_name()?.to_str()?;
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    [".ino", ".pde"]
+        .iter()
+        .map(|ext| format!("{folder}{ext}"))
+        .find(|main| names.contains(main))
+}
+
+fn plan_arduino(p: &Probe<'_>) -> Option<Planned> {
+    let sketch = p.file.parent()?;
+    // スケッチはフォルダ単位。上の段の `.ino` / `sketch.yaml` を自分のスケッチと読まない
+    if sketch != p.marker_dir {
+        return None;
+    }
+    let lang = crate::i18n::lang();
+    let dialect = crate::platform::shell::run_pane_dialect_for(p.platform);
+    // `${arduino_cli}`（PATH → Arduino IDE 同梱 → 名前のまま）。層が見つけていなければ名前のまま
+    let found = runtime_value(p);
+    let cli = found.clone().unwrap_or_else(|| {
+        crate::runtime_env::kind_for_ext(&file_ext(p.file))
+            .map(|k| crate::runtime_env::fallback_value(k, p.platform))
+            .unwrap_or("arduino-cli")
+            .to_string()
+    });
+    let yaml = SketchYaml::read(sketch).unwrap_or_default();
+    let main = sketch_main_file(sketch);
+    let sketch_arg = dialect.quote_arg(&sketch.to_string_lossy());
+
+    let mut planned = Planned::new(sketch.to_path_buf(), format!("{cli} compile"));
+    planned
+        .profiles
+        .push((PROFILE_UPLOAD, format!("{cli} compile --upload")));
+    planned.marker = Some(if sketch.join(SKETCH_YAML).is_file() {
+        sketch.join(SKETCH_YAML)
+    } else {
+        sketch.join(main.as_deref().unwrap_or_else(|| {
+            p.file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+        }))
+    });
+
+    if found.is_none() {
+        planned.notes.push(ProjectNote {
+            id: NOTE_CLI,
+            message: msg_cli_not_found(lang),
+            commands: arduino_install_commands(p.platform),
+            unless_found: Some(cli.clone()),
+            profile: None,
+        });
+    }
+    if main.is_none() {
+        let folder = sketch
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stem = p
+            .file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        planned.notes.push(ProjectNote {
+            id: NOTE_NAME,
+            message: msg_name_mismatch(lang, &folder, &stem),
+            commands: Vec::new(),
+            unless_found: None,
+            profile: None,
+        });
+    }
+    if !yaml.board_selected() {
+        planned.notes.push(ProjectNote {
+            id: NOTE_BOARD,
+            message: msg_board_not_selected(lang),
+            commands: vec![format!(
+                "{cli} board attach -b {} {sketch_arg}",
+                board_placeholder(lang)
+            )],
+            unless_found: None,
+            profile: None,
+        });
+    } else if !yaml.port_selected() {
+        planned.notes.push(ProjectNote {
+            id: NOTE_PORT,
+            message: msg_port_not_selected(lang),
+            commands: vec![format!(
+                "{cli} board attach -p {} {sketch_arg}",
+                port_placeholder(lang)
+            )],
+            unless_found: None,
+            profile: Some(PROFILE_UPLOAD),
+        });
+    }
+    Some(planned)
+}
+
+/// arduino-cli を入れるコマンド（#322 の最簡形。言語サーバまで揃う IDE を先に = 設計 §5.5）
+fn arduino_install_commands(platform: Platform) -> Vec<String> {
+    match platform {
+        Platform::MacOs => vec![
+            "brew install --cask arduino-ide".to_string(),
+            "brew install arduino-cli".to_string(),
+        ],
+        Platform::Windows => vec![
+            "winget install --id ArduinoSA.IDE.stable".to_string(),
+            "winget install --id ArduinoSA.CLI".to_string(),
+        ],
+    }
+}
+
+fn msg_cli_not_found(lang: Lang) -> String {
+    match lang {
+        Lang::Ja => "arduino-cli が見つかりません（PATH と Arduino IDE の同梱を探しました）。\
+             Arduino IDE ごと入れる（言語サーバまで揃う）か、arduino-cli だけを入れてください:"
+            .to_string(),
+        Lang::En => {
+            "arduino-cli was not found (searched PATH and the copy bundled with Arduino IDE). \
+             Install Arduino IDE (also brings the language server) or arduino-cli alone:"
+                .to_string()
+        }
+    }
+}
+
+fn msg_name_mismatch(lang: Lang, folder: &str, stem: &str) -> String {
+    match lang {
+        Lang::Ja => format!(
+            "スケッチのフォルダ名と .ino の名前が違います。arduino-cli はフォルダと同じ名前の \
+             {folder}.ino を本体として探します（大文字小文字も区別）。\
+             フォルダを {stem} に改名するか、{stem}.ino を {folder}.ino に改名してください"
+        ),
+        Lang::En => format!(
+            "The sketch folder name does not match the .ino name. arduino-cli looks for \
+             {folder}.ino (same name as the folder, case-sensitive) as the main file. \
+             Rename the folder to {stem}, or rename {stem}.ino to {folder}.ino"
+        ),
+    }
+}
+
+fn msg_board_not_selected(lang: Lang) -> String {
+    match lang {
+        Lang::Ja => "基板が選ばれていません（スケッチのフォルダの sketch.yaml に default_fqbn がありません）。\
+             次のコマンドで選ぶと sketch.yaml に書かれ、Arduino IDE とも共有されます\
+             （基板の名前の一覧は board listall・繋いだ基板は board list。例: arduino:avr:uno）:"
+            .to_string(),
+        Lang::En => "No board is selected (sketch.yaml in the sketch folder has no default_fqbn). \
+             Select one with the command below; it is written to sketch.yaml and shared with \
+             Arduino IDE (list names with board listall, the connected board with board list; \
+             e.g. arduino:avr:uno):"
+            .to_string(),
+    }
+}
+
+fn msg_port_not_selected(lang: Lang) -> String {
+    match lang {
+        Lang::Ja => {
+            "書き込み先のポートが選ばれていません（sketch.yaml に default_port がありません）。\
+             繋いだ基板のポートは board list で分かります:"
+                .to_string()
+        }
+        Lang::En => "No upload port is selected (sketch.yaml has no default_port). \
+             Find the connected board's port with board list:"
+            .to_string(),
+    }
+}
+
+/// `arduino-cli board list --format json` の答えで基板の案内を詰める（#1950）。
+///
+/// 繋がっている基板が**ちょうど 1 台**で FQBN が 1 つに決まるときだけ、コマンドの基板の場所を
+/// その FQBN（とポート）に差し替える。複数なら候補を本文に並べるだけ（どれかは人が決める）。
+/// 形（実測 1.2.0 + 公式の JSON 出力）: `{"detected_ports":[{"matching_boards":[{"name","fqbn"}],
+/// "port":{"address", …}}]}`。基板が繋がっていなければ `matching_boards` が無い
+fn refine_board_note(note: &mut ProjectNote, stdout: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return;
+    };
+    let mut boards: Vec<(String, String, String)> = Vec::new();
+    for port in v["detected_ports"].as_array().into_iter().flatten() {
+        let address = port["port"]["address"].as_str().unwrap_or_default();
+        for b in port["matching_boards"].as_array().into_iter().flatten() {
+            if let Some(fqbn) = b["fqbn"].as_str().filter(|f| !f.is_empty()) {
+                let name = b["name"].as_str().unwrap_or(fqbn);
+                boards.push((name.to_string(), fqbn.to_string(), address.to_string()));
+            }
+        }
+    }
+    let lang = crate::i18n::lang();
+    match boards.as_slice() {
+        [] => {}
+        [(name, fqbn, address)] => {
+            let port = if address.is_empty() {
+                String::new()
+            } else {
+                format!("-p {} ", quote_for_shell(address))
+            };
+            // 案内を作った時点の言語の綴りで入っている（どちらでも差し替える）
+            for c in &mut note.commands {
+                for l in [Lang::Ja, Lang::En] {
+                    let placeholder = format!("-b {}", board_placeholder(l));
+                    *c = c.replace(&placeholder, &format!("{port}-b {fqbn}"));
+                }
+            }
+            note.message.push_str(&match lang {
+                Lang::Ja => format!("（繋がっている基板: {name} = {fqbn}）"),
+                Lang::En => format!(" (connected board: {name} = {fqbn})"),
+            });
+        }
+        many => {
+            let list = many
+                .iter()
+                .take(4)
+                .map(|(name, fqbn, _)| format!("{name} = {fqbn}"))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            note.message.push_str(&match lang {
+                Lang::Ja => format!("（繋がっている基板の候補: {list}）"),
+                Lang::En => format!(" (connected board candidates: {list})"),
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -949,9 +1408,18 @@ mod tests {
         }
 
         fn detect(&self, platform: Platform, rel: &str) -> Option<ProjectMatch> {
+            self.detect_with(platform, rel, &RuntimeWords::new())
+        }
+
+        fn detect_with(
+            &self,
+            platform: Platform,
+            rel: &str,
+            runtime: &RuntimeWords,
+        ) -> Option<ProjectMatch> {
             let file = self.base.join(rel);
             let head = std::fs::read_to_string(&file).unwrap_or_default();
-            detect(platform, &file, &head, &self.bounds, &RuntimeWords::new())
+            detect(platform, &file, &head, &self.bounds, runtime)
         }
 
         /// 両 OS で同じ結果になることを確かめ、(kind, root の相対, command) を返す
@@ -1513,7 +1981,387 @@ mod tests {
         }
         assert_eq!(
             ids.into_iter().collect::<Vec<_>>(),
-            vec!["cargo", "dotnet", "go", "make", "npm", "python"]
+            vec!["arduino", "cargo", "dotnet", "go", "make", "npm", "python"]
         );
+    }
+
+    // ─── arduino（#1950）───
+
+    const BLINK: &str = "void setup() {}\nvoid loop() {}\n";
+
+    /// 既定（compile）の実行に出る案内の ID（書き込みのポートの案内は `upload` にだけ出る）
+    fn ids(m: &ProjectMatch) -> Vec<&'static str> {
+        m.notes
+            .iter()
+            .filter(|n| n.applies_to("default"))
+            .map(|n| n.id)
+            .collect()
+    }
+
+    fn note<'a>(m: &'a ProjectMatch, id: &str) -> &'a ProjectNote {
+        m.notes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap_or_else(|| panic!("案内 {id} が無い: {:?}", ids(m)))
+    }
+
+    /// `${arduino_cli}` の値（実行環境の層が見つけたもの）を渡す
+    fn cli_words(path: &str) -> RuntimeWords {
+        [("arduino_cli".to_string(), vec![path.to_string()])].into()
+    }
+
+    /// 受け入れ条件 1: `sketch.yaml` のあるスケッチは、両 OS で `arduino-cli compile`（cwd = スケッチ）
+    #[test]
+    fn arduinoはsketch_yamlのあるスケッチをそのフォルダでcompileする() {
+        let s = Sandbox::new("arduino-ok");
+        s.write("Blink/Blink.ino", BLINK);
+        s.write("Blink/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        s.write("Blink/helpers.ino", "");
+        // スケッチの別タブ（本体でない .ino）からでもスケッチ全体を compile する。
+        // 案内の導入コマンドは OS で違うので、種別・cwd・コマンドを OS ごとに見る
+        for rel in ["Blink/Blink.ino", "Blink/helpers.ino"] {
+            for platform in [Platform::MacOs, Platform::Windows] {
+                let m = s
+                    .detect(platform, rel)
+                    .unwrap_or_else(|| panic!("{rel} / {platform:?}: 検出できない"));
+                assert_eq!(
+                    (m.kind, s.rel(&m.root), m.command.as_str()),
+                    ("arduino", "Blink".to_string(), "arduino-cli compile"),
+                    "{rel} / {platform:?}"
+                );
+            }
+        }
+        let m = s.detect(Platform::MacOs, "Blink/Blink.ino").unwrap();
+        assert_eq!(m.marker, s.base.join("Blink/sketch.yaml"));
+        assert_eq!(
+            m.profiles,
+            vec![(
+                "upload".to_string(),
+                "arduino-cli compile --upload".to_string()
+            )]
+        );
+        // 実行環境の層を通っていない（語が空）ので、道具の案内だけが条件つきで付く
+        assert_eq!(ids(&m), vec!["cli_not_found"]);
+        assert_eq!(
+            note(&m, "cli_not_found").unless_found.as_deref(),
+            Some("arduino-cli")
+        );
+        // 層が名前のまま（PATH で見つけた）を返せば案内は付かない
+        let found = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        assert!(ids(&found).is_empty(), "{:?}", found.notes);
+        assert_eq!(found.command, "arduino-cli compile");
+    }
+
+    /// 受け入れ条件 2（コマンドの側）: 層が IDE 同梱のフルパスを決めたら、それを方言の形で使う
+    #[test]
+    fn arduinoはide同梱のフルパスを実行ペインの方言で囲む() {
+        let s = Sandbox::new("arduino-ide");
+        s.write("Blink/Blink.ino", BLINK);
+        s.write("Blink/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        let mac = "/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli";
+        let m = s
+            .detect_with(Platform::MacOs, "Blink/Blink.ino", &cli_words(mac))
+            .unwrap();
+        assert_eq!(m.command, format!("'{mac}' compile"));
+        assert_eq!(m.profiles[0].1, format!("'{mac}' compile --upload"));
+        assert!(ids(&m).is_empty(), "{:?}", m.notes);
+        // 案内のコマンドも同じ実体を使う（PATH に無い道具の名前を案内しない）
+        assert!(
+            note(&m, "port_not_selected").commands[0].starts_with(&format!("'{mac}' board attach")),
+            "{:?}",
+            m.notes
+        );
+        let win = r"C:\Users\winuser\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe";
+        let m = s
+            .detect_with(Platform::Windows, "Blink/Blink.ino", &cli_words(win))
+            .unwrap();
+        assert_eq!(m.command, format!("& '{win}' compile"));
+    }
+
+    /// 受け入れ条件 3: 基板なし・名前の不一致・道具なしで、それぞれの案内が出る
+    #[test]
+    fn arduinoの3つの失敗はそれぞれ案内になる() {
+        let s = Sandbox::new("arduino-fail");
+        // 基板なし（`sketch.yaml` が無い = 授業のスケッチの形）
+        s.write("Blink/Blink.ino", BLINK);
+        let m = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        assert_eq!(ids(&m), vec!["board_not_selected"]);
+        let board = note(&m, "board_not_selected");
+        assert!(board.unless_found.is_none() && board.profile.is_none());
+        // スケッチのフォルダを名指す（利用者の端末の cwd はスケッチとは限らない）
+        let sketch = quote_for_shell(&s.base.join("Blink").to_string_lossy());
+        assert_eq!(board.commands.len(), 1);
+        let cmd = &board.commands[0];
+        assert!(
+            cmd.starts_with("arduino-cli board attach -b <") && cmd.ends_with(&sketch),
+            "{cmd}"
+        );
+        assert!(
+            board.lines()[0].starts_with("[tako] "),
+            "{:?}",
+            board.lines()
+        );
+        assert!(board.lines()[1].starts_with("  arduino-cli board attach"));
+        // `sketch.yaml` はあるが基板の鍵が無い形も同じ
+        s.write("Blink/sketch.yaml", "default_port: /dev/cu.usbmodem1101\n");
+        let m = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        assert_eq!(ids(&m), vec!["board_not_selected"]);
+
+        // 名前の不一致（大文字小文字だけの違いも arduino-cli は落とす = 実測）
+        s.write("Blink2/Blink.ino", BLINK);
+        s.write("Blink2/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        s.write("blinkc/Blinkc.ino", BLINK);
+        s.write("blinkc/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        for rel in ["Blink2/Blink.ino", "blinkc/Blinkc.ino"] {
+            let m = s
+                .detect_with(Platform::MacOs, rel, &cli_words("arduino-cli"))
+                .unwrap();
+            assert_eq!(ids(&m), vec!["sketch_name_mismatch"], "{rel}");
+            assert_eq!(m.command, "arduino-cli compile", "{rel}");
+        }
+        let mismatch = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink2/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        let msg = &note(&mismatch, "sketch_name_mismatch").message;
+        assert!(msg.contains("Blink2.ino") && msg.contains("Blink"), "{msg}");
+        // 旧形式の本体（`.pde`）でもスケッチとして成り立つ
+        s.write("Old/Old.pde", BLINK);
+        s.write("Old/extra.ino", "");
+        s.write("Old/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        let old = s
+            .detect_with(Platform::MacOs, "Old/extra.ino", &cli_words("arduino-cli"))
+            .unwrap();
+        assert!(ids(&old).is_empty(), "{:?}", old.notes);
+
+        // 道具なし: OS ごとの導入コマンド（IDE ごと → CLI だけ）
+        let mac = s.detect(Platform::MacOs, "Old/extra.ino").unwrap();
+        assert_eq!(
+            note(&mac, "cli_not_found").commands,
+            vec![
+                "brew install --cask arduino-ide",
+                "brew install arduino-cli"
+            ]
+        );
+        let win = s.detect(Platform::Windows, "Old/extra.ino").unwrap();
+        assert_eq!(
+            note(&win, "cli_not_found").commands,
+            vec![
+                "winget install --id ArduinoSA.IDE.stable",
+                "winget install --id ArduinoSA.CLI"
+            ]
+        );
+    }
+
+    #[test]
+    fn 書き込みのポートが無ければuploadにだけ案内を付ける() {
+        let s = Sandbox::new("arduino-port");
+        s.write("Blink/Blink.ino", BLINK);
+        s.write("Blink/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        let m = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        let port = note(&m, "port_not_selected");
+        assert_eq!(port.profile, Some("upload"));
+        assert!(port.applies_to("upload") && !port.applies_to("default"));
+        assert!(port.commands[0].starts_with("arduino-cli board attach -p <"));
+        // ポートまで選んであれば案内は無い
+        s.write(
+            "Blink/sketch.yaml",
+            "default_fqbn: arduino:avr:uno\ndefault_port: /dev/cu.usbmodem1101\n",
+        );
+        let m = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        assert!(m.notes.is_empty(), "{:?}", ids(&m));
+    }
+
+    /// スケッチはフォルダ単位: 上の段の `sketch.yaml` を自分の基板と読まない
+    #[test]
+    fn 上の段のsketch_yamlは自分のスケッチと読まない() {
+        let s = Sandbox::new("arduino-nested");
+        s.write("Outer/Outer.ino", BLINK);
+        s.write("Outer/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        s.write("Outer/inner/inner.ino", BLINK);
+        let m = s.detect(Platform::MacOs, "Outer/inner/inner.ino").unwrap();
+        assert_eq!(s.rel(&m.root), "Outer/inner");
+        assert!(ids(&m).contains(&"board_not_selected"), "{:?}", ids(&m));
+    }
+
+    #[test]
+    fn sketch_yamlの最上段の鍵だけを読む() {
+        let y = SketchYaml::parse(
+            "# 基板\ndefault_fqbn: \"arduino:renesas_uno:unor4wifi\" # IDE と同じ\n\
+             default_port: '/dev/cu.usbmodem 1'\nprofiles:\n  uno:\n    fqbn: arduino:avr:uno\n\
+             default_profile:\n",
+        );
+        assert_eq!(
+            y.default_fqbn.as_deref(),
+            Some("arduino:renesas_uno:unor4wifi")
+        );
+        assert_eq!(y.default_port.as_deref(), Some("/dev/cu.usbmodem 1"));
+        // 値の無い鍵・字下げした行（プロファイルの中）は選んだことにしない
+        assert_eq!(y.default_profile, None);
+        let p = SketchYaml::parse("default_profile: uno\n");
+        assert!(p.board_selected() && p.port_selected());
+        assert!(!SketchYaml::parse("  default_fqbn: arduino:avr:uno\n").board_selected());
+    }
+
+    fn board_note() -> ProjectNote {
+        ProjectNote {
+            id: "board_not_selected",
+            message: "m".to_string(),
+            commands: vec!["arduino-cli board attach -b <基板> /s/Blink".to_string()],
+            unless_found: None,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn 繋がった基板が1台ならその基板とポートを案内のコマンドへ入れる() {
+        let one = r#"{"detected_ports":[
+            {"port":{"address":"/dev/cu.debug-console","protocol":"serial"}},
+            {"matching_boards":[{"name":"Arduino Uno","fqbn":"arduino:avr:uno"}],
+             "port":{"address":"/dev/cu.usbmodem1101","protocol":"serial"}}]}"#;
+        let mut n = board_note();
+        refine_board_note(&mut n, one);
+        assert_eq!(
+            n.commands,
+            vec!["arduino-cli board attach -p /dev/cu.usbmodem1101 -b arduino:avr:uno /s/Blink"]
+        );
+        assert!(n.message.contains("Arduino Uno") && n.message.contains("arduino:avr:uno"));
+        // 英語の綴りの案内でも差し替わる
+        let mut en = board_note();
+        en.commands = vec!["arduino-cli board attach -b <board> /s/Blink".to_string()];
+        refine_board_note(&mut en, one);
+        assert!(
+            en.commands[0].contains("-b arduino:avr:uno"),
+            "{:?}",
+            en.commands
+        );
+    }
+
+    #[test]
+    fn 基板が決まらない答えではコマンドを変えない() {
+        // 実測（1.2.0・基板を繋いでいない）: ポートだけで matching_boards が無い
+        let none = r#"{"detected_ports":[{"port":{"address":"/dev/cu.Bluetooth-Incoming-Port","label":"x","protocol":"serial","protocol_label":"Serial Port","properties":{}}}]}"#;
+        let two = r#"{"detected_ports":[
+            {"matching_boards":[{"name":"A","fqbn":"v:a:a"},{"name":"B","fqbn":"v:b:b"}],
+             "port":{"address":"COM3"}}]}"#;
+        for (stdout, lists) in [
+            (none, false),
+            (two, true),
+            ("not json", false),
+            ("{}", false),
+        ] {
+            let mut n = board_note();
+            refine_board_note(&mut n, stdout);
+            assert_eq!(n.commands, board_note().commands, "{stdout}");
+            assert_eq!(
+                n.message.contains("v:a:a / B = v:b:b"),
+                lists,
+                "{}",
+                n.message
+            );
+        }
+    }
+
+    /// 子プロセスに聞くのは、聞いて詰められる案内が出ているときだけ
+    #[test]
+    fn 追いの問い合わせは基板の案内があるときだけ() {
+        let s = Sandbox::new("arduino-followup");
+        s.write("Blink/Blink.ino", BLINK);
+        let mut m = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        let f = m.followup().expect("基板の案内がある");
+        assert_eq!(f.args, &["board", "list", "--format", "json"]);
+        m.apply_followup(
+            r#"{"detected_ports":[{"matching_boards":[{"name":"U","fqbn":"arduino:avr:uno"}],"port":{"address":"COM3"}}]}"#,
+        );
+        assert!(
+            note(&m, "board_not_selected").commands[0].contains("-p COM3 -b arduino:avr:uno"),
+            "{:?}",
+            m.notes
+        );
+        s.write("Blink/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        let m = s
+            .detect_with(
+                Platform::MacOs,
+                "Blink/Blink.ino",
+                &cli_words("arduino-cli"),
+            )
+            .unwrap();
+        assert!(m.followup().is_none());
+        // 他の種別は持たない
+        s.write("c/Makefile", "all:\n");
+        s.write("c/a.c", "");
+        assert!(s
+            .detect(Platform::MacOs, "c/a.c")
+            .unwrap()
+            .followup()
+            .is_none());
+    }
+
+    /// A/B の口は arduino の行だけが持ち、`1` のときだけ効く（#1950 以前 = 行が無い解決）
+    #[test]
+    fn arduinoの行だけがab_の口を持つ() {
+        for k in KINDS {
+            let on = k.disabled_with(|name| (name == "TAKO_1950_LEGACY").then(|| "1".into()));
+            assert_eq!(on, k.id == "arduino", "{}", k.id);
+            assert!(!k.disabled_with(|_| Some("0".into())), "{}", k.id);
+            assert!(!k.disabled_with(|_| None), "{}", k.id);
+        }
+    }
+
+    #[test]
+    fn 案内の文面は日英で揃う() {
+        for lang in [Lang::Ja, Lang::En] {
+            let msgs = [
+                msg_cli_not_found(lang),
+                msg_name_mismatch(lang, "Blink2", "Blink"),
+                msg_board_not_selected(lang),
+                msg_port_not_selected(lang),
+            ];
+            for m in &msgs {
+                assert!(!m.is_empty());
+                let ascii = m.is_ascii();
+                assert_eq!(ascii, lang == Lang::En, "{lang:?}: {m}");
+            }
+            assert!(msgs[2].contains("default_fqbn") && msgs[3].contains("default_port"));
+        }
     }
 }

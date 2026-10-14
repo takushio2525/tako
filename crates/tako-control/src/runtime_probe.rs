@@ -576,6 +576,51 @@ pub fn runtimes_json(snap: Option<&Snapshot>) -> Value {
     )
 }
 
+/// プロジェクトの案内を子プロセスの答えで詰める（#1950。`RunResolve` の background からだけ呼ぶ）。
+///
+/// 何を聞き、答えをどう読むかはプロジェクト種別の表（`runner_project::KINDS` の `followup`）が
+/// 持ち、ここは**実行環境の層が見つけた実行ファイル**（自動で選んだ候補の実体）を起こすだけ。
+/// 実体の分からない名前のまま（見つからなかった）なら聞かない。待ちは Tier P と同じ上限
+/// （`probe::runtime_probe_timeout`）で、打ち切ったら案内は詰めずにそのまま返す
+pub fn apply_project_followup(
+    project: &mut tako_core::runner_project::ProjectMatch,
+    snap: Option<&Snapshot>,
+) {
+    apply_project_followup_with(
+        project,
+        snap,
+        default_prober(),
+        tako_core::probe::runtime_probe_timeout(),
+    );
+}
+
+fn apply_project_followup_with(
+    project: &mut tako_core::runner_project::ProjectMatch,
+    snap: Option<&Snapshot>,
+    prober: &dyn Prober,
+    budget: Duration,
+) {
+    let Some(followup) = project.followup() else {
+        return;
+    };
+    let Some(program) = snap
+        .and_then(Snapshot::selected)
+        .and_then(|c| c.location.clone())
+        .filter(|l| l.is_file())
+    else {
+        return;
+    };
+    let out = prober.output(
+        &program.to_string_lossy(),
+        followup.args,
+        Some(&project.root),
+        budget,
+    );
+    if let Some(o) = out.into_output().filter(|o| o.status.success()) {
+        project.apply_followup(&String::from_utf8_lossy(&o.stdout));
+    }
+}
+
 /// `Run` / `RunResolve` の `runtime`（走らせる 1 つ + 実行ペインへ前置するもの）
 pub fn runtime_json(snap: Option<&Snapshot>) -> Value {
     let Some(snap) = snap else {

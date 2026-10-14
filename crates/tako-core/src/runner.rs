@@ -695,14 +695,22 @@ fn resolve_core(
         // 空文字列は「組み込みを無効化」の意味（設計 §2.1）で、プロジェクト既定は止めない
         let user_set = user_defaults.get(&ext).is_some_and(|c| !c.is_empty());
         match &project {
-            Some(p) if !user_set => all_profiles.push(RunPlan {
-                profile: "default".to_string(),
-                command: p.command.clone(),
-                template: p.command.clone(),
-                cwd: p.root.clone(),
-                shell: None,
-                source: RunSource::ProjectDefault,
-            }),
+            Some(p) if !user_set => {
+                // 既定の後ろに種別が持つプロファイル（arduino の `upload`。#1950）。cwd はどれも
+                // プロジェクトのルート
+                let named = std::iter::once(("default", &p.command))
+                    .chain(p.profiles.iter().map(|(n, c)| (n.as_str(), c)));
+                for (name, command) in named {
+                    all_profiles.push(RunPlan {
+                        profile: name.to_string(),
+                        command: command.clone(),
+                        template: command.clone(),
+                        cwd: p.root.clone(),
+                        shell: None,
+                        source: RunSource::ProjectDefault,
+                    });
+                }
+            }
             _ => {
                 if let Some(default_cmd) = ext_defaults.get(&ext).filter(|_| !ext.is_empty()) {
                     all_profiles.push(RunPlan {
@@ -1106,6 +1114,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1950: `${arduino_cli}` も同じ口で展開される（宣言から IDE 同梱の実体を使える）
+    #[test]
+    fn arduino_cliの変数は見つけた実体へ無ければ名前のままへ展開される() {
+        let path = PathBuf::from("/tmp/Blink/Blink.ino");
+        let tpl = "${arduino_cli} compile --fqbn arduino:avr:uno";
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let vars = RunVars::for_file(&path).on(platform);
+            assert_eq!(
+                expand_variables(tpl, &vars),
+                "arduino-cli compile --fqbn arduino:avr:uno",
+                "{platform:?}"
+            );
+        }
+        let ide = "/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli";
+        let words = BTreeMap::from([("arduino_cli".to_string(), vec![ide.to_string()])]);
+        let vars = RunVars::for_file(&path)
+            .on(Platform::MacOs)
+            .with_runtime(&words);
+        assert_eq!(
+            expand_variables(tpl, &vars),
+            format!("'{ide}' compile --fqbn arduino:avr:uno")
+        );
+    }
+
+    /// #1950: プロジェクト既定の追加プロファイル（arduino の `upload`）が一覧に並び、名指しで選べる
+    #[test]
+    fn プロジェクト既定の追加プロファイルを名指しで選べる() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-1950-runner-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("Blink")).unwrap();
+        let dir = crate::platform::path::canonicalize(&dir).unwrap();
+        let ino = dir.join("Blink/Blink.ino");
+        std::fs::write(&ino, "void setup() {}\n").unwrap();
+        let bounds = SearchBounds::with_ceilings([dir.clone()]);
+        let resolve = |profile: Option<&str>| {
+            resolve_file_in(
+                Platform::MacOs,
+                &ino,
+                "",
+                &BTreeMap::new(),
+                profile,
+                None,
+                Some(&bounds),
+                &RuntimeWords::new(),
+            )
+        };
+        let r = resolve(None).unwrap();
+        let names: Vec<&str> = r.all_profiles.iter().map(|p| p.profile.as_str()).collect();
+        assert_eq!(names, vec!["default", "upload"]);
+        assert_eq!(r.plan.command, "arduino-cli compile");
+        assert!(r
+            .all_profiles
+            .iter()
+            .all(|p| p.source == RunSource::ProjectDefault && p.cwd == dir.join("Blink")));
+        let up = resolve(Some("upload")).unwrap();
+        assert_eq!(up.plan.command, "arduino-cli compile --upload");
+        assert!(matches!(
+            resolve(Some("nope")),
+            Err(RunnerError::ProfileNotFound(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

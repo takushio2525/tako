@@ -9,9 +9,9 @@
 //! Windows 実測で食い違えばここを直す（`platform::support::MATRIX` には実測分だけを書く = #591）。
 
 use super::{
-    Detector, EnvLayout, EnvValue, InProjectEnv, KnownDir, ListProbe, Marker, MarkerDirSpec,
-    NamedEnvListSpec, PathLookupSpec, PerOs, ProbeCmd, RuntimeKind, VersionFileSpec, VersionSource,
-    WrapperSpec,
+    BundledSpec, Detector, EnvLayout, EnvValue, InProjectEnv, KnownDir, ListProbe, Marker,
+    MarkerDirSpec, NamedEnvListSpec, PathLookupSpec, PerOs, ProbeCmd, RuntimeKind, VersionFileSpec,
+    VersionSource, WrapperSpec,
 };
 
 /// venv（PEP 405。`pyvenv.cfg` を持つディレクトリ）の中の置き場
@@ -205,25 +205,67 @@ const PYTHON_DETECTORS: &[Detector] = &[
             macos: &[],
             windows: &[KnownDir::Var("LOCALAPPDATA", &["Microsoft", "WindowsApps"])],
         },
+        eligible_when_missing: true,
+    }),
+];
+
+/// Arduino のスケッチ（`.ino`）を compile / 書き込みする `arduino-cli` の探し方（#1950）。
+/// 順は PATH → Arduino IDE 同梱 → 名前のまま（`fallback`。見つからないときの案内が自然になる）
+const ARDUINO_DETECTORS: &[Detector] = &[
+    // 1. PATH（`brew install arduino-cli` / 公式の導入スクリプト）。利用者が自分で入れた版を優先し、
+    //    見つからなければ 2 へ譲る（Dock 起動の痩せた PATH でも、Tier P のログインシェルで見える）
+    Detector::PathLookup(PathLookupSpec {
+        id: "system",
+        file_names: PerOs {
+            macos: &["arduino-cli"],
+            windows: &["arduino-cli.exe"],
+        },
+        exclude_dirs: PerOs::same(&[]),
+        eligible_when_missing: false,
+    }),
+    // 2. Arduino IDE の同梱（PATH には出ない。授業で IDE を入れた人は追加の導入ゼロ）
+    Detector::Bundled(BundledSpec {
+        id: "arduino-ide",
+        bundle: &crate::app_bundle::ARDUINO_IDE,
+        file_name: PerOs {
+            macos: "arduino-cli",
+            windows: "arduino-cli.exe",
+        },
     }),
 ];
 
 /// 実行環境の表の正本
-pub const KINDS: &[RuntimeKind] = &[RuntimeKind {
-    id: "python",
-    extensions: &["py"],
-    variable: "python",
-    // 組み込み既定表（`platform::runner_defaults` の `py` 行）と同じ名前。
-    // 実行環境が見つからないときの展開が今と 1 バイトも変わらないための前提（テストで縛る）
-    fallback: PerOs {
-        macos: "python3",
-        windows: "python",
+pub const KINDS: &[RuntimeKind] = &[
+    RuntimeKind {
+        id: "python",
+        extensions: &["py"],
+        variable: "python",
+        // 組み込み既定表（`platform::runner_defaults` の `py` 行）と同じ名前。
+        // 実行環境が見つからないときの展開が今と 1 バイトも変わらないための前提（テストで縛る）
+        fallback: PerOs {
+            macos: "python3",
+            windows: "python",
+        },
+        wrapped_program: "python",
+        // Tier P: `Python 3.12.4` の形で返る（2 系は stderr へ出すので、呼び手は両方を見る）
+        version_args: &["--version"],
+        detectors: PYTHON_DETECTORS,
     },
-    wrapped_program: "python",
-    // Tier P: `Python 3.12.4` の形で返る（2 系は stderr へ出すので、呼び手は両方を見る）
-    version_args: &["--version"],
-    detectors: PYTHON_DETECTORS,
-}];
+    // Arduino のスケッチ（#1950）。走らせるのはプロジェクト種別 `arduino`（`runner_project` の
+    // `KINDS`）で、拡張子既定の表には行を持たない（スケッチはフォルダ単位でしか走らない）。
+    // 宣言（`tako:run: ${arduino_cli} compile --fqbn …`）からも同じ値を使える
+    RuntimeKind {
+        id: "arduino",
+        extensions: &["ino"],
+        variable: "arduino_cli",
+        fallback: PerOs::same("arduino-cli"),
+        // 包む形の検出器を持たないので使われない（表の語として持つだけ）
+        wrapped_program: "arduino-cli",
+        // Tier P: `arduino-cli  Version: 1.2.0 Commit: … Date: …` の形（実測 1.2.0）
+        version_args: &["version"],
+        detectors: ARDUINO_DETECTORS,
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -267,13 +309,24 @@ mod tests {
     }
 
     /// 組み込み既定表のこの kind の行は interpreter を `${<variable>}` で受け（#1730）、
-    /// 実行環境が見つからないときは fallback（#1730 以前の既定表の先頭の語）へ展開される
+    /// 実行環境が見つからないときは fallback（#1730 以前の既定表の先頭の語）へ展開される。
+    ///
+    /// 既定表に行を持たない拡張子（`.ino` = スケッチはフォルダ単位でしか走らない。#1950）は、
+    /// プロジェクト種別が受け持っていること（でないと変数を使う既定がどこにも無い）
     #[test]
     fn 既定表の行は変数で受け実行環境が無ければfallbackへ展開される() {
         for kind in KINDS {
             for ext in kind.extensions {
-                let entry = crate::platform::runner_defaults::entry(ext)
-                    .unwrap_or_else(|| panic!("{ext} が既定表に無い"));
+                let Some(entry) = crate::platform::runner_defaults::entry(ext) else {
+                    assert!(
+                        crate::runner_project::KINDS
+                            .iter()
+                            .any(|k| k.claims(ext, "")),
+                        "{ext} は既定表にもプロジェクト種別にも無い（{} の変数を使う既定が無い）",
+                        kind.id
+                    );
+                    continue;
+                };
                 for p in BOTH {
                     let Some(cmd) = entry.get(p).command() else {
                         continue;
@@ -305,7 +358,7 @@ mod tests {
                     Detector::NamedEnvList(s) => Some(s.layout),
                     Detector::VersionFile(s) => Some(s.layout),
                     Detector::Wrapper(s) => s.in_project_env.map(|e| e.layout),
-                    Detector::PathLookup(_) | Detector::EnvSwitch(_) => None,
+                    Detector::PathLookup(_) | Detector::EnvSwitch(_) | Detector::Bundled(_) => None,
                 };
                 if let Some(l) = layout {
                     out.push((format!("{}/{}", kind.id, det.id()), l));
@@ -349,6 +402,10 @@ mod tests {
                             "{}",
                             s.id
                         );
+                    }
+                    Detector::Bundled(s) => {
+                        assert!(s.file_name.windows.ends_with(".exe"), "{}", s.id);
+                        assert!(!s.file_name.macos.ends_with(".exe"), "{}", s.id);
                     }
                     _ => {}
                 }

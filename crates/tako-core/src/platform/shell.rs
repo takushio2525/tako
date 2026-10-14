@@ -199,8 +199,22 @@ pub struct RunScript<'a> {
     pub env: &'a [(String, String)],
     /// PATH の先頭へ足すディレクトリ（並びがそのまま PATH の順）
     pub path_prepend: &'a [String],
+    /// コマンドの前に画面へ出す案内（#1950。env / PATH の後 = コマンドと同じ PATH で判定する）
+    pub notices: &'a [RunNotice],
     /// コマンド本体（`tako:shell` の包みまで済んだもの）
     pub command: &'a str,
+}
+
+/// 実行ペインでコマンドの前に出す案内 1 件（#1950。走らせても失敗するのが分かっている形を、
+/// 何をすれば直るかの人の言葉で先に出す）
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunNotice {
+    /// 画面に出す行（そのまま。引用は方言の `quote_arg` が担う）
+    pub lines: Vec<String>,
+    /// この名前のコマンドが実行ペインのシェルで見つかるなら出さない
+    /// （`None` = 必ず出す）。GUI の PATH は Dock 起動だと痩せているので、tako が見つけられ
+    /// なかっただけのものを「無い」と言わないための条件
+    pub unless_found: Option<String>,
 }
 
 /// 実行環境の env と PATH の前置をコマンド本体の前に付ける（境界 B1 の 1 実装。#1730）。
@@ -222,7 +236,7 @@ pub struct RunScript<'a> {
 /// （`VIRTUAL_ENV` / `CONDA_PREFIX` …）だけで、利用者が書く env（#1726 S4）を載せるときは
 /// 呼び出し側で名前を検める
 pub fn compose_run_script(dialect: ShellDialect, s: &RunScript<'_>) -> String {
-    if s.env.is_empty() && s.path_prepend.is_empty() {
+    if s.env.is_empty() && s.path_prepend.is_empty() && s.notices.is_empty() {
         return s.command.to_string();
     }
     let mut parts: Vec<String> = Vec::with_capacity(s.env.len() + 2);
@@ -245,8 +259,46 @@ pub fn compose_run_script(dialect: ShellDialect, s: &RunScript<'_>) -> String {
             ),
         });
     }
+    parts.extend(
+        s.notices
+            .iter()
+            .filter(|n| !n.lines.is_empty())
+            .map(|n| notice_script(dialect, n)),
+    );
     parts.push(s.command.to_string());
     parts.join("; ")
+}
+
+/// 案内 1 件を出す片（POSIX は `printf '%s\n'`、PowerShell は `Write-Host`）。
+/// 条件つきの案内は、その名前のコマンドが見つからないときだけ出す
+fn notice_script(dialect: ShellDialect, n: &RunNotice) -> String {
+    let lines: Vec<String> = n.lines.iter().map(|l| dialect.quote_arg(l)).collect();
+    match dialect {
+        ShellDialect::Posix => {
+            let print = format!("printf '%s\\n' {}", lines.join(" "));
+            match &n.unless_found {
+                Some(name) => format!(
+                    "{{ command -v {} >/dev/null 2>&1 || {print}; }}",
+                    dialect.quote_arg(name)
+                ),
+                None => print,
+            }
+        }
+        ShellDialect::PowerShell => {
+            let print = lines
+                .iter()
+                .map(|l| format!("Write-Host {l}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            match &n.unless_found {
+                Some(name) => format!(
+                    "if (-not (Get-Command {} -ErrorAction SilentlyContinue)) {{ {print} }}",
+                    dialect.quote_arg(name)
+                ),
+                None => print,
+            }
+        }
+    }
 }
 
 /// PTY の子へ argv を「1 語 = 1 引数」で届ける（#884）。
@@ -1888,6 +1940,7 @@ mod tests_1730 {
             env: &env,
             path_prepend: &path,
             command: "python a.py",
+            ..RunScript::default()
         };
         assert_eq!(
             compose_run_script(ShellDialect::Posix, &script),
@@ -1903,9 +1956,101 @@ mod tests_1730 {
                     env: &win_env,
                     path_prepend: &win_path,
                     command: "python a.py",
+                    ..RunScript::default()
                 }
             ),
             r"$env:VIRTUAL_ENV = 'C:\it''s\.venv'; $env:PATH = 'C:\it''s\.venv\Scripts;' + $env:PATH; python a.py"
+        );
+    }
+
+    /// #1950: 案内はコマンドの前（env / PATH の後）。条件つきは見つからないときだけ出す
+    #[test]
+    fn 案内はコマンドの前に両方言で出す() {
+        let notices = vec![
+            RunNotice {
+                lines: s(&[
+                    "[tako] 基板が選ばれていません:",
+                    "  arduino-cli board attach -b <基板> '/a b'",
+                ]),
+                unless_found: None,
+            },
+            RunNotice {
+                lines: s(&["[tako] not found"]),
+                unless_found: Some("arduino-cli".into()),
+            },
+        ];
+        let script = RunScript {
+            notices: &notices,
+            command: "arduino-cli compile",
+            ..RunScript::default()
+        };
+        assert_eq!(
+            compose_run_script(ShellDialect::Posix, &script),
+            "printf '%s\\n' '[tako] 基板が選ばれていません:' \
+             '  arduino-cli board attach -b <基板> '\\''/a b'\\'''; \
+             { command -v arduino-cli >/dev/null 2>&1 || printf '%s\\n' '[tako] not found'; }; \
+             arduino-cli compile"
+        );
+        assert_eq!(
+            compose_run_script(ShellDialect::PowerShell, &script),
+            "Write-Host '[tako] 基板が選ばれていません:'; \
+             Write-Host '  arduino-cli board attach -b <基板> ''/a b'''; \
+             if (-not (Get-Command 'arduino-cli' -ErrorAction SilentlyContinue)) \
+             { Write-Host '[tako] not found' }; arduino-cli compile"
+        );
+        // 行の無い案内は何も足さない（前に付けるものが無いのと同じ = コマンドそのまま）
+        let empty = vec![RunNotice::default()];
+        assert_eq!(
+            compose_run_script(
+                ShellDialect::Posix,
+                &RunScript {
+                    notices: &empty,
+                    command: "make",
+                    ..RunScript::default()
+                }
+            ),
+            "make"
+        );
+    }
+
+    /// 組み立てた案内を実際の `/bin/sh` へ通す: 条件つきの行は、名前が見つかれば出ない。
+    /// 終了コードはコマンド本体のもの（案内の `||` が混ざらない）
+    #[cfg(unix)]
+    #[test]
+    fn posixの案内はshで条件どおりに出て終了コードを変えない() {
+        let run = |name: &str| {
+            let notices = vec![
+                RunNotice {
+                    lines: s(&["[tako] always", "  it's 'quoted'"]),
+                    unless_found: None,
+                },
+                RunNotice {
+                    lines: s(&["[tako] missing"]),
+                    unless_found: Some(name.to_string()),
+                },
+            ];
+            let line = compose_run_script(
+                ShellDialect::Posix,
+                &RunScript {
+                    notices: &notices,
+                    command: "exit 7",
+                    ..RunScript::default()
+                },
+            );
+            // unix の `output_command` は `sh -c <片>`（実行ペインの本体と同じ POSIX シェル）
+            output_command(&line).output().unwrap()
+        };
+        let present = run("sh");
+        assert_eq!(present.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8_lossy(&present.stdout),
+            "[tako] always\n  it's 'quoted'\n"
+        );
+        let absent = run("tako-1950-no-such-tool");
+        assert_eq!(absent.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8_lossy(&absent.stdout),
+            "[tako] always\n  it's 'quoted'\n[tako] missing\n"
         );
     }
 
@@ -1940,6 +2085,7 @@ mod tests_1730 {
                 env: &env,
                 path_prepend: &path,
                 command: "printf '%s|' \"$TAKO_1730_V\"; tako1730tool",
+                ..RunScript::default()
             },
         );
         // unix の `output_command` は `sh -c <片>`（実行ペインの本体と同じ POSIX シェル）

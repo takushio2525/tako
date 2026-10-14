@@ -865,7 +865,7 @@ tako web close
 
 ### tako run / run-default
 
-**Code Runner**。ファイル内の `tako:run` 宣言、プロジェクト既定（`Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` などを上へ辿り、そのルートで `cargo run` / `npm run` 等を走らせる）、または拡張子ごとの既定コマンドで、新しいペインを分割して実行します。プレビューヘッダの再生ボタンと同じ経路です。`--list`（`--dry-run`）はどのプロジェクトとして解決したか（`project`）も返します。`.py` はプロジェクトの `.venv` / uv / poetry / conda / pyenv を設定なしで使い、`--list` の `runtime`（選ばれた環境）と `runtimes`（候補）で確認できます。`--list --refresh` は uv などの場所や Python の版を調べ直します。
+**Code Runner**。ファイル内の `tako:run` 宣言、プロジェクト既定（`Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` などを上へ辿り、そのルートで `cargo run` / `npm run` 等を走らせる）、または拡張子ごとの既定コマンドで、新しいペインを分割して実行します。プレビューヘッダの再生ボタンと同じ経路です。`--list`（`--dry-run`）はどのプロジェクトとして解決したか（`project`）も返します。`.py` はプロジェクトの `.venv` / uv / poetry / conda / pyenv を設定なしで使い、`--list` の `runtime`（選ばれた環境）と `runtimes`（候補）で確認できます。`--list --refresh` は uv などの場所や Python の版を調べ直します。Arduino のスケッチ（`.ino`）はスケッチのフォルダで `arduino-cli compile` を走らせ（`--profile upload` で書き込み）、arduino-cli は PATH に無ければ Arduino IDE に同梱のものを使います。基板が選ばれていない・フォルダ名と `.ino` の名前が違う・arduino-cli が無いときは、直し方の案内が実行ペインと `--list` の `project.notes` に出ます。
 
 同じタブに**同じファイル・同じプロファイルの実行ペイン**があれば、分割せずに**その位置で差し替えて**走らせ直します（何度押してもペインは 1 枚のまま。前の実行がまだ走っていれば止めてから走らせ直し、応答の `stopped_running` が `true` になります）。別々に並べたいときだけ `--new-pane` を付けます。終わると画面に「`[tako] 終了コード N / Enter でこのペインを閉じます`」が出て、ペインのタイトルバーに「完了」「失敗 (N)」のバッジが付きます（実行中は「実行中」）。同じ状態は `tako list` の各ペインの `run`（`status` / `exit_code` / `outcome`）でも読めます。
 

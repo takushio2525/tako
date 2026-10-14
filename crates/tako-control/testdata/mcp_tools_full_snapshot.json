@@ -5179,7 +5179,7 @@
     "name": "tako_run_interactive_status"
   },
   {
-    "description": "ファイルを実行する（Code Runner）。tako:run 宣言・プロジェクト既定・拡張子既定のコマンドで新ペインを分割して実行する（cwd 既定はファイルのディレクトリ、プロジェクト既定はそのルート。完了確認は tako_run_interactive_status）。プレビューの未保存の編集は先に保存する（応答の saved_panes。保存できなければ走らせない）。\n\ntako:run 宣言（ファイル先頭 64 行 / 16 KiB 以内のコメント。接頭辞は任意）:\n- `tako:run: <コマンド>` — 既定の実行コマンド\n- `tako:run[name]: <コマンド>` — 名前付きプロファイル（複数可）\n- `tako:cwd: <dir>` / `tako:cwd[name]: <dir>` — 作業ディレクトリ（相対はファイル基準）\n- `tako:shell: <シェル>` — コマンドを解釈するシェル\n\n変数（コマンド・cwd 内。自動でシングルクオート）: `${file}` = 絶対パス / `${fileDir}` = ディレクトリ / `${fileBase}` = 拡張子付きの名前 / `${fileNoExt}` = 拡張子なし / `${ext}` = 拡張子（小文字・ドットなし）/ `${workspaceRoot}` = プロジェクトのルート（無ければ git → ファイルのディレクトリ）/ `${python}` = 実行環境の python\n\n.py はプロジェクトの .venv / uv / poetry / conda / pyenv を自動で使う（応答の runtime）。\n\n解決順: command 引数 → ファイル内宣言 → ユーザーの拡張子既定 → プロジェクト既定（Cargo.toml / package.json / pyproject.toml / go.mod / *.csproj / Makefile を上へ辿る）→ 組み込みの拡張子既定 → エラー。",
+    "description": "ファイルを実行する（Code Runner）。tako:run 宣言・プロジェクト既定・拡張子既定のコマンドで新ペインを分割して実行する（cwd 既定はファイルのディレクトリ、プロジェクト既定はそのルート。完了確認は tako_run_interactive_status）。プレビューの未保存の編集は先に保存する（応答の saved_panes。保存できなければ走らせない）。\n\ntako:run 宣言（ファイル先頭 64 行 / 16 KiB 以内のコメント。接頭辞は任意）:\n- `tako:run: <コマンド>` — 既定の実行コマンド\n- `tako:run[name]: <コマンド>` — 名前付きプロファイル（複数可）\n- `tako:cwd: <dir>` / `tako:cwd[name]: <dir>` — 作業ディレクトリ（相対はファイル基準）\n- `tako:shell: <シェル>` — コマンドを解釈するシェル\n\n変数（コマンド・cwd 内。自動でシングルクオート）: `${file}` = 絶対パス / `${fileDir}` = ディレクトリ / `${fileBase}` = 拡張子付きの名前 / `${fileNoExt}` = 拡張子なし / `${ext}` = 拡張子（小文字・ドットなし）/ `${workspaceRoot}` = プロジェクトのルート（無ければ git → ファイルのディレクトリ）/ `${python}` = 実行環境の python / `${arduino_cli}` = arduino-cli\n\n.py はプロジェクトの .venv / uv / poetry / conda / pyenv を、.ino は PATH か Arduino IDE 同梱の arduino-cli を自動で使う（応答の runtime）。\n\n解決順: command 引数 → ファイル内宣言 → ユーザーの拡張子既定 → プロジェクト既定（Cargo.toml / package.json / pyproject.toml / go.mod / *.csproj / Makefile / *.ino を上へ辿る）→ 組み込みの拡張子既定 → エラー。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -5247,7 +5247,7 @@
     "name": "tako_run"
   },
   {
-    "description": "ファイルの実行プロファイルを解決して返す（実行しない。tako_run の事前確認に使う）。プロファイル一覧・コマンド・cwd・source・属するプロジェクト（project）・実行環境の候補（runtimes: id / manager / label / version / auto / tier）・走らせるもの（runtime）・項目ごとの実効値と出典（config）を返す。",
+    "description": "ファイルの実行プロファイルを解決して返す（実行しない。tako_run の事前確認に使う）。プロファイル一覧・コマンド・cwd・source・属するプロジェクト（project。notes = 走らせる前の案内）・実行環境の候補（runtimes: id / manager / label / version / auto / tier）・走らせるもの（runtime）・項目ごとの実効値と出典（config）を返す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
