@@ -16,8 +16,8 @@ tako platform --status pending      # まだ使えないものだけ
 
 | 状態 | 件数 | 意味 |
 | --- | --- | --- |
-| 対応 | 124 / 162（77%） | macOS と同じように使えます |
-| 一部対応 | 15 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
+| 対応 | 122 / 162（75%） | macOS と同じように使えます |
+| 一部対応 | 17 | 使えますが機能が落ちます。落ち方は各表の「差分」列 |
 | 未実測 | 6 | 実装はあり macOS と同じ経路を通るが、Windows 実機でまだ動かしていないもの |
 | 未対応 | 15 | Windows 側の実装が無い、または動かないことが分かっているもの |
 | 対象外 | 2 | Windows にその概念が無い、または OS が同等機能を標準で持つ |
@@ -43,7 +43,7 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 
 ## ターミナルの基本
 
-対応 30・一部対応 2・未対応 / 未実測 1・対象外 1
+対応 28・一部対応 4・未対応 / 未実測 1・対象外 1
 
 | 機能 | 状態 | 差分 | 根拠 |
 | --- | --- | --- | --- |
@@ -76,8 +76,8 @@ AI エージェント（tako は縮退の件数と引き方を system prompt へ
 | `tako_background_kill` | 対応 | — | 実機実測: #937 の Windows 11 実測: MCP `tako_background_kill` が killed=2 を返し、`tako backgrounded` が 1 件から空になる |
 | `tako_foreground_pane` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako background --pane N` で外したペインが `tako foreground N` で由来タブへ戻る（list の panes が 1 → 1,2） |
 | `tako_show_command` | 対応 | — | 実機セルフテスト: 項目 91 / 91b（カードとカード帯）+ #875 で新規ペイン実行を実機実測 |
-| `tako_run` | 対応 | — | 実機実測: #875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true。拡張子既定も #1655 で Windows 用の列を持つ（`python` / `.exe` / `cmd /c` / `pwsh -File`。`&&` と `./` は PowerShell 5.1 で通らないので使わない） |
-| `tako_run_resolve` | 対応 | — | 実機実測: #875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）。#1656 のプロジェクト既定（cargo / npm / python / go / dotnet / make）は Windows の列を macOS の単体から固定したが実機は未検証 |
+| `tako_run` | 一部対応 | 宣言・拡張子既定・プロジェクト既定の解決と実行は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\Programs\Arduino IDE\… / %ProgramFiles%\Arduino IDE\…）の探索と、書き込み先のポート（COM3 等）は Windows 実機で未確認（#1950） | 実機実測: #875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true。拡張子既定も #1655 で Windows 用の列を持つ（`python` / `.exe` / `cmd /c` / `pwsh -File`。`&&` と `./` は PowerShell 5.1 で通らないので使わない）。#1950 の Arduino（IDE 同梱の `arduino-cli.exe` の置き場・案内の PowerShell の形）は macOS の単体から固定しただけ |
+| `tako_run_resolve` | 一部対応 | 宣言・拡張子既定・プロジェクト既定の解決と実行は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\Programs\Arduino IDE\… / %ProgramFiles%\Arduino IDE\…）の探索と、書き込み先のポート（COM3 等）は Windows 実機で未確認（#1950） | 実機実測: #875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）。#1656 のプロジェクト既定（cargo / npm / python / go / dotnet / make）と #1950 の arduino は Windows の列を macOS の単体から固定したが実機は未検証 |
 | `tako_run_defaults` | 対応 | — | 実機テスト: 拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑。組み込み既定は #1655 で OS 別の表になり、Windows の列（41 拡張子中 36 件）を macOS の単体から解決結果ごと固定している |
 | `tako_run_interactive` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako run-interactive --pane <p> <コマンド>` が新ペインで実行し、`--wait` が exit_code=0 / status=exited を返す（ペインが極端に狭いとマーカーが折り返して検出できない = #651。macOS も同様） |
 | `tako_run_interactive_status` | 対応 | — | 実機実測: #937 の Windows 11 実測: `tako run-interactive-status <pane>` が exit_code=0 / status=exited を返す（狭いペインの折り返しは #651） |
