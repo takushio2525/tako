@@ -94,12 +94,15 @@ AI に長い作業を任せて席を離れても、スマホから進み具合�
 
 権限（role）は 4 段です。
 
-| role | できること |
-|---|---|
-| **Observe**（既定） | 画面を見るだけ |
-| **Interact** | + テキスト入力・承認応答・コマンドの実行・tako のツリーにあるファイル |
-| **Manage** | + ペインを閉じる・リサイズ・新しく立ち上げる・PC 全体のファイル（このマシン）とショートカット |
-| **Admin** | + 端末管理（一覧・失効） |
+<table>
+<thead><tr><th>role</th><th>できること</th></tr></thead>
+<tbody>
+<tr><td><strong>Observe</strong>（既定）</td><td>画面を見るだけ</td></tr>
+<tr><td><strong>Interact</strong></td><td>+ テキスト入力・承認応答・コマンドの実行・tako のツリーにあるファイル</td></tr>
+<tr><td><strong>Manage</strong></td><td>+ ペインを閉じる・リサイズ・新しく立ち上げる・PC 全体のファイル（このマシン）とショートカット</td></tr>
+<tr><td><strong>Admin</strong></td><td>+ 端末管理（一覧・失効）</td></tr>
+</tbody>
+</table>
 
 **権限を上げられるのは Mac の画面だけです。** AI・CLI・スマホからは「お願い」までです。スマホで権限が足りない画面には「権限の更新をリクエスト」が出て、送ると Mac に承認ダイアログが出ます。許可されれば、スマホは読み込み直さずに続きができます。**下げる・消すのは CLI / MCP からもできます**（置き忘れた権限をその場で畳めるほうが安全側なので）。端末ごとの権限は **設定 → リモート** で選び直せ、ステータスバーの「リモート」からは全端末をまとめて切る停止もできます。
 
@@ -121,31 +124,38 @@ Interact 以上を許可した端末は、ブラウザから**あなたのター
 
 ## コマンド
 
-| やりたいこと | コマンド |
-|---|---|
-| 最初のセットアップ（対話） | `tako remote setup` |
-| 起動して QR を出す / 止める | `tako remote start` / `tako remote stop` |
-| 固定 URL・登録端末・前回の自動起動の結果 | `tako remote status` |
-| 端末の一覧・権限を下げる・失効 | `tako remote devices list` / `role <id> <role>` / `revoke <id>` |
-| スマホのファイルのショートカット | `tako remote shortcuts`（`add <path>` / `remove <path>`） |
-| SSH 先へのペイン | `tako open-in remote <host>` |
-| SSH 先のフォルダをツリーに開く | `tako remote-folder open <host>` |
+<table>
+<thead><tr><th>やりたいこと</th><th>コマンド</th></tr></thead>
+<tbody>
+<tr><td>最初のセットアップ（対話）</td><td><code>tako remote setup</code></td></tr>
+<tr><td>起動して QR を出す / 止める</td><td><code>tako remote start</code> / <code>tako remote stop</code></td></tr>
+<tr><td>固定 URL・登録端末・前回の自動起動の結果</td><td><code>tako remote status</code></td></tr>
+<tr><td>端末の一覧・権限を下げる・失効</td><td><code>tako remote devices list</code> / <code>role &lt;id&gt; &lt;role&gt;</code> / <code>revoke &lt;id&gt;</code></td></tr>
+<tr><td>スマホのファイルのショートカット</td><td><code>tako remote shortcuts</code>（<code>add &lt;path&gt;</code> / <code>remove &lt;path&gt;</code>）</td></tr>
+<tr><td>SSH 先へのペイン</td><td><code>tako open-in remote &lt;host&gt;</code></td></tr>
+<tr><td>SSH 先のフォルダをツリーに開く</td><td><code>tako remote-folder open &lt;host&gt;</code></td></tr>
+</tbody>
+</table>
 
 どれも MCP からも同じ操作ができます（承認と権限の引き上げだけは Mac の画面に限ります）。全オプションは [CLI リファレンス](/guides/cli-reference/#リモートアクセス) にあります。
 
 ## よくある質問
 
 **Q: スマホで開くと 502 になる**
-A: Tailscale の `serve` が tako の待ち受けへつながっていない状態です。`tako remote start` はこれを起動の時点で見つけ、理由と次の一手を出して止まります。アプリ版の Tailscale はサンドボックスの制約で Unix ドメインソケットへつなげないため、tako は既定でループバックの TCP を使います。`TAKO_REMOTE_ENDPOINT=unix` を自分で設定しているなら、それを外して `tako remote stop && tako remote start` をやり直してください。
+
+Tailscale の `serve` が tako の待ち受けへつながっていない状態です。`tako remote start` はこれを起動の時点で見つけ、理由と次の一手を出して止まります。アプリ版の Tailscale はサンドボックスの制約で Unix ドメインソケットへつなげないため、tako は既定でループバックの TCP を使います。`TAKO_REMOTE_ENDPOINT=unix` を自分で設定しているなら、それを外して `tako remote stop && tako remote start` をやり直してください。
 
 **Q: Mac に Tailscale が 2 つ入っている（アプリ版と `tailscaled`）**
-A: 2 つは別々の端末として tailnet に登録されます（名前の末尾に `-1` が付くのはこのため）。どちらを使うかは `tako remote setup` で選べます。選び直すなら `tako remote setup --tailscale auto`（アプリ版があればそれ）か `--tailscale standalone`（自分で動かしている `tailscaled`）。いまどちらかは `tako remote status` の `tailscale_variant` に出ます。
+
+2 つは別々の端末として tailnet に登録されます（名前の末尾に `-1` が付くのはこのため）。どちらを使うかは `tako remote setup` で選べます。選び直すなら `tako remote setup --tailscale auto`（アプリ版があればそれ）か `--tailscale standalone`（自分で動かしている `tailscaled`）。いまどちらかは `tako remote status` の `tailscale_variant` に出ます。
 
 **Q: 証明書の公開ログにホスト名が載るのが気になる**
-A: Tailscale が HTTPS の証明書を取るとき、`<マシン名>.<tailnet>.ts.net` が公開ログに載ります（Tailscale の仕様）。マシン名に知られたくない情報を入れないでください。
+
+Tailscale が HTTPS の証明書を取るとき、`<マシン名>.<tailnet>.ts.net` が公開ログに載ります（Tailscale の仕様）。マシン名に知られたくない情報を入れないでください。
 
 **Q: v0.5 以前の URL（trycloudflare.com / tako-remote.pages.dev）は使える？**
-A: いいえ。v0.6.0 で削除しました。移行手順は [リモート接続の移行ガイド](/guides/remote-migration/) にあります。
+
+いいえ。v0.6.0 で削除しました。移行手順は [リモート接続の移行ガイド](/guides/remote-migration/) にあります。
 
 ## 関連ページ
 

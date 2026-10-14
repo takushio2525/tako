@@ -4,7 +4,9 @@
  * ファイルメニューの「リモート接続…」は、この器で ~/.ssh/config の Host を並べる。
  *
  *   <Palette slot="overlay" at="1" placeholder="SSH ホストを選ぶ（~/.ssh/config）"
- *     items={[{ label: 'dev-server (dev.example.com)', selAt: '1' }]} />
+ *     items={[{ label: 'dev-server (dev.example.com)', selAt: '1' }]}>
+ *     <Pointer path="1:46,35" click="1" />   … 子はパレットと一緒に出入りする（座標は窓が基準）
+ *   </Palette>
  *
  * 寸法と行の見た目の正本は crates/tako-app/src/overlays.rs の render_command_palette
  * （行頭の矢印 = assets/icons/ui/jump_arrow.svg・選択行はアクセント 12% の地）と、
@@ -47,4 +49,6 @@ const { at, placeholder, items } = Astro.props;
 			}
 		</div>
 	</div>
+	<!-- 押す場所（Pointer）。パレットと一緒に消える -->
+	<slot />
 </div>
