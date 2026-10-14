@@ -1,0 +1,99 @@
+---
+/**
+ * 場面: たまり場（処理は止めずに画面から片付ける）。3 手順。features/more の小さな場面（#2064）。
+ * 事実の出どころ: .agent/requirements.md FR-2.15 と docs/src/content/docs/features/shelving.md
+ * （「ー」= 退避・「×」= 終了、ドロワーは画面全体の縮小をライブで映す、「復帰」で由来タブへ戻る）。
+ * 画面の文言: crates/tako-app/src/status_bar.rs（ステータスバーの入口は「BG」+ 件数）、
+ * ui_text/drawer.rs（header / tab_group）、ui_text/common.rs（「復帰」）。ドロワーはペインとステータスバーの間
+ * （main.rs の render_drawer の位置）。
+ * 書かない: 退避したペインは再起動後も必ず戻る（器の無いカードは「器なし」として残るだけ）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import StatusBody from '../motion/StatusBody.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/tako-more.css';
+---
+
+<div class="tkm tkm-shelf">
+	<Scrolly label="たまり場の流れ">
+		<TakoWindow
+			slot="stage"
+			tabs={[{ label: 'my-app', state: 'running', active: true }]}
+			status={false}
+			height={24}
+		>
+			<StatusBody>
+				<Split>
+					<Pane n={1} title="claude" state="running" focus>
+						<span class="tk-l tk-tui-msg">dev サーバーは隣で動かしています</span>
+						<span class="tk-l tk-tui-msg is-tool">src/App.tsx を編集</span>
+						<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+					</Pane>
+					<div class="tk-pane" data-at="1 3+" data-fx="split" style="--d: 1.1s">
+						<div class="tk-pane-head">
+							<span class="tk-pane-n">2</span>
+							<span class="tk-pane-title">npm run dev</span>
+							<span class="tk-pane-state"><span><i class="tk-dot is-running"></i>running</span></span>
+							<span class="tk-pane-ctl tkm-ctl">
+								<Icon name="columns" />
+								<span class="tkm-press" data-at="1" data-fx="mark"><Icon name="minus" /></span>
+								<Icon name="x" />
+							</span>
+						</div>
+						<div class="tk-pane-body">
+							<span class="tk-l"><span class="tk-p">my-app ❯</span> npm run dev</span>
+							<span class="tk-l tk-ok">VITE ready in 312 ms</span>
+							<span class="tk-l"><span class="tk-dim">Local:</span> <span class="tk-acc">http://localhost:5173/</span></span>
+							<span class="tk-l tk-dim" data-at="3+">[vite] page reload src/App.tsx</span>
+						</div>
+					</div>
+				</Split>
+				<div slot="drawer" class="tkm-drawer" data-at="2" data-fx="unfold" style="--d: 1.1s">
+					<div>
+						<div class="tkm-drawer-in">
+							<div class="tkm-drawer-head">バックグラウンドのターミナル（1）<span>タブ my-app（1）</span></div>
+							<div class="tkm-shelf-card">
+								<div class="tkm-shelf-bar">
+									<i class="tk-dot is-running"></i>npm run dev
+									<span class="tkm-btn tkm-press" data-at="3" data-fx="mark">復帰</span>
+									<Icon name="x" />
+								</div>
+								<div class="tkm-shelf-screen">
+									<span class="tk-l"><span class="tk-p">my-app ❯</span> npm run dev</span>
+									<span class="tk-l tk-ok">VITE ready in 312 ms</span>
+									<span class="tk-l"><span class="tk-dim">Local:</span> <span class="tk-acc">http://localhost:5173/</span></span>
+									<span class="tk-l tk-dim" data-at="2+" style="--d: 2.2s">[vite] page reload src/App.tsx</span>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+				<Fragment slot="status">
+					<span class="tk-sb tk-sb-files"><Icon name="folder" />Files</span>
+					<span class="tk-sb tkm-press" data-at="2" data-fx="mark" style="--d: .6s">
+						BG<span class="tk-dim" data-at="2" data-fx="pop" style="--d: .3s">1</span>
+					</span>
+					<span class="tk-sb is-wide"><Icon name="folder" />~/<b>my-app</b></span>
+					<span class="tk-sb-spacer"></span>
+					<span class="tk-sb is-end is-mid"><i class="tk-dot is-running"></i><b>claude</b></span>
+					<span class="tk-sb is-end"><Icon name="branch" />main</span>
+				</Fragment>
+			</StatusBody>
+		</TakoWindow>
+
+		<Step title="「ー」で、画面からだけ外す">
+			<p>dev サーバーのように、動かしておきたいけれど今は見なくていいペインは、タイトルバーの「ー」を押します。「×」は終了、「ー」は退避です。</p>
+		</Step>
+		<Step title="消えても、裏で動き続ける">
+			<p>ペインは画面から消えますが、プロセスは止まりません。ステータスバーの「BG」に件数が付き、押すとドロワーが開きます。カードには画面全体の縮小が<strong>ライブで</strong>映ります。</p>
+		</Step>
+		<Step title="「復帰」で、元の場所へ">
+			<p>カードの「復帰」で元のタブに戻ります。隠れている間に出た行も、そのまま残っています。</p>
+			<p>タブバーの「ー」ならタブごと退避でき、分割のしかたと比率を保ったまま戻せます。</p>
+		</Step>
+	</Scrolly>
+</div>

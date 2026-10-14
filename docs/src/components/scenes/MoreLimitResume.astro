@@ -1,0 +1,98 @@
+---
+/**
+ * 場面: 使用制限の後の自動復帰（tako limit-resume）。3 手順。features/more の小さな場面（#2064）。
+ * 事実の出どころ: .agent/requirements.md FR-2.27.1（既定 OFF）/ 2.27.3（発動条件・試行 3 回まで・人の下書きに
+ * 触れない）/ 2.27.4（ダイアログはラベル一致で「解除まで待つ」相当・止まっているだけなら続行の 1 行）/
+ * 2.27.5（課金・プラン変更・モデル切替は選ばない）/ 2.27.10（ヘッダの控えめな印・待機中は色を強める）/
+ * 2.27.12（上限中もメーターを -- にしない）/ 2.27.16（ステータスバーの一括ボタン）。
+ * 画面の文言: ui_text/pane_menu.rs の limit_resume_all_chip（自動復帰 ON / OFF）、ui_text/sleep_guard.rs の
+ * chip_active（スリープ防止中）、tako_core::limit_resume::nudge_prompt（続行の 1 行）。
+ * アイコンは assets/icons/ui/loop_repeat.svg の写し。
+ * 書かない: 既定で ON、どんな停止からも戻る、agy でも戻る、上限を回避できる。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import StatusBody from '../motion/StatusBody.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/tako-more.css';
+
+const loop =
+	'<path d="M3 6.5a5 5 0 0 1 9-1.6M13 9.5a5 5 0 0 1-9 1.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/><path d="M12.4 2.3v2.7H9.7M3.6 13.7v-2.7h2.7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>';
+---
+
+<div class="tkm">
+	<Scrolly label="使用制限の後の自動復帰の流れ" flip>
+		<TakoWindow
+			slot="stage"
+			tabs={[{ label: 'my-app', state: 'running', active: true }]}
+			status={false}
+			height={23}
+		>
+			<StatusBody>
+				<div class="tk-split">
+					<div class="tk-pane">
+						<span class="tk-pane-focus"></span>
+						<div class="tk-pane-head">
+							<span class="tk-pane-n">1</span>
+							<span class="tk-pane-title">テストの修正</span>
+							<span class="tkm-swap">
+								<span data-at="!2" data-fx="fade" class="tk-dim">
+									<svg class="tk-ic" viewBox="0 0 16 16" aria-hidden="true" set:html={loop} />
+								</span>
+								<span data-at="2" data-fx="fade" class="tk-acc">
+									<svg class="tk-ic" viewBox="0 0 16 16" aria-hidden="true" set:html={loop} />
+								</span>
+							</span>
+							<span class="tk-pane-state">
+								<span data-at="!2" data-fx="fade"><i class="tk-dot is-running"></i>running</span>
+								<span data-at="2" data-fx="fade"><i class="tk-dot"></i>idle</span>
+							</span>
+							<span class="tk-pane-ctl"><Icon name="columns" /><Icon name="minus" /><Icon name="x" /></span>
+						</div>
+						<div class="tk-pane-body">
+							<span class="tk-l tk-tui-msg">失敗しているテストを 1 件ずつ直しています</span>
+							<span class="tk-l tk-tui-msg is-tool">tests/store.test.ts を修正</span>
+							<span class="tk-l tk-warn" data-at="2+">You've hit your session limit · resets 7:50pm (Asia/Tokyo)</span>
+							<span class="tk-l tk-tui-user" data-at="3" style="--d: .3s">【tako 自動通知】利用上限が解除されました。中断していた作業をそのまま続けてください。</span>
+							<span class="tk-l tk-tui-msg" data-at="3" style="--d: 1s">続きから再開します。tests/store.test.ts の修正に戻ります</span>
+							<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+						</div>
+					</div>
+				</div>
+				<Fragment slot="status">
+					<span class="tk-sb tk-sb-files"><Icon name="folder" />Files</span>
+					<span class="tk-sb is-mid">BG</span>
+					<span class="tk-sb is-wide"><Icon name="folder" />~/<b>my-app</b></span>
+					<span class="tk-sb is-mid">スリープ防止中</span>
+					<span class="tk-sb tkm-press" data-at="1" data-fx="mark">
+						<svg class="tk-ic tk-acc" viewBox="0 0 16 16" aria-hidden="true" set:html={loop} />自動復帰 ON
+					</span>
+					<span class="tk-sb-spacer"></span>
+					<span class="tk-sb is-end is-wide"><i class="tk-dot is-running"></i><b>claude</b></span>
+					<span class="tk-sb is-end">
+						5h
+						<span class="tkm-meter">
+							<i class="is-warn" style="--v: 86%" data-at="1" data-fx="fade"></i>
+							<i class="is-full" style="--v: 100%" data-at="2" data-fx="fade"></i>
+							<i style="--v: 3%" data-at="3" data-fx="fade"></i>
+						</span>
+					</span>
+				</Fragment>
+			</StatusBody>
+		</TakoWindow>
+
+		<Step title="ステータスバーで、まとめて ON にする">
+			<p>自動復帰は<strong>既定では OFF</strong> です。ステータスバーの「自動復帰 OFF」を押すと、退避中も含めたすべてのエージェントのペインが ON になり、このあと立つペインも ON で始まります。</p>
+			<p>ペインごとに決めたいときは、ペインを右クリックして「リミット後の自動復帰を有効にする」を選びます。有効なペインのヘッダには小さな印が付きます。</p>
+		</Step>
+		<Step title="使用制限で止まると、解除時刻を読む">
+			<p>5 時間や週の上限に当たって AI が止まると、tako は画面の見出しから<strong>解除時刻</strong>を読み取り、ヘッダの印の色を強めて待ちます。</p>
+		</Step>
+		<Step title="解除されたら、続きから">
+			<p>解除時刻を少し過ぎても画面が止まったままで、入力欄に人の書きかけが無ければ、tako が続きを促す 1 行を送ります。上限のダイアログが出ていれば「解除まで待つ」に当たる選択肢を選びます。</p>
+			<p>課金・プラン変更・モデル切り替えの選択肢は選ばず、安全な選択肢が無ければ何もしません。試すのは 1 回の停止につき 3 回までです。</p>
+			<p class="tk-step-note">claude で使えます。codex は 5 時間・週の枠なら待って再開しますが、クレジットを使い切ったときは止まったままです。agy は対象外です。</p>
+		</Step>
+	</Scrolly>
+</div>

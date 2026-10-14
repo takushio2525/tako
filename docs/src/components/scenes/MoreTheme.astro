@@ -1,0 +1,51 @@
+---
+/**
+ * 場面: テーマ（ダーク / ライトの切り替えと、AI に頼む色の微調整）。3 手順。features/more の小さな場面（#2064）。
+ * 事実の出どころ: .agent/requirements.md FR-4 冒頭（「差し色を青に」のような頼み方）/ FR-4.1・4.2 / FR-4.5・4.6
+ * （MCP / CLI から変えられ、再起動なしで反映）。テーマボタンはタブバーの右端（crates/tako-app/src/tab_bar.rs の
+ * theme-toggle。ダークでは太陽・ライトでは月）。配色は crates/tako-core/src/theme.rs の default_dark / default_light
+ * （tako-more.css に写した）。
+ * 書かない: テーマのストアや配布の仕組み、UI に絵文字のアイコン。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import '../../styles/tako-more.css';
+---
+
+<div class="tkm">
+	<Scrolly label="テーマの切り替えの流れ" flip>
+		<div slot="stage" class="tkm-theme">
+			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }, { label: 'docs' }]} height={23}>
+				<Split>
+					<Pane n={1} title="claude" state="running" focus grow={3}>
+						<span class="tk-l tk-tui-msg">ログイン画面ができました</span>
+						<span class="tk-l tk-tui-msg is-tool">npm test を実行（12 件成功）</span>
+						<span class="tk-l tk-tui-user" data-at="3" style="--d: .2s">差し色を緑にして</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="3" style="--d: .6s">tako_theme（accent を #40a02b に）</span>
+						<span class="tk-l tk-tui-msg" data-at="3" style="--d: 1.1s">差し色を緑にしました。再起動はいりません</span>
+						<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+					</Pane>
+					<Pane n={2} title="npm run dev" state="idle" grow={2}>
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> npm run dev</span>
+						<span class="tk-l tk-ok">ready in 312 ms</span>
+						<span class="tk-l"><span class="tk-dim">Local:</span> <span class="tk-acc">localhost:5173</span></span>
+					</Pane>
+				</Split>
+			</TakoWindow>
+		</div>
+
+		<Step title="既定は、落ち着いたダーク">
+			<p>tako の既定の配色はダークです。タブバーの右端にあるのが、テーマを切り替えるボタンです。</p>
+		</Step>
+		<Step title="押すと、その場でライトへ">
+			<p>押すと、開いている窓がすべてその場で明るい配色に変わります。もう一度押せばダークに戻ります。コマンドなら <code>tako theme toggle</code> です。</p>
+		</Step>
+		<Step title="細かい色は、AI に言葉で">
+			<p>「差し色を緑に」「もう少し暗く」と頼めば、AI が色を 1 つずつ変えます。ANSI の 16 色からタブバーの色まで変えられ、再起動はいりません。</p>
+			<p>気に入った配色は <code>tako theme preset save 名前</code> でプリセットとして残せます。</p>
+		</Step>
+	</Scrolly>
+</div>

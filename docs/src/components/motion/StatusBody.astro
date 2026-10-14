@@ -1,0 +1,27 @@
+---
+/**
+ * 窓の本体を「ペイン + （ドロワー）+ 場面ごとのステータスバー」に分ける（#2064）。
+ *
+ * TakoWindow のステータスバーは項目が決まっているので、自動復帰の一括ボタン・たまり場の BG の件数・
+ * mod が描いている間に引っ込む claude の区画のように、**ステータスバーそのものが場面の主役**のときに使う。
+ * TakoWindow に status={false} を渡し、本体（既定の slot）にこれを 1 つ置く。
+ *
+ *   <TakoWindow status={false} …>
+ *     <StatusBody>
+ *       <Split>…</Split>
+ *       <div slot="drawer">…</div>                          … ペインとステータスバーの間（任意）
+ *       <Fragment slot="status"><span class="tk-sb">…</span></Fragment>
+ *     </StatusBody>
+ *   </TakoWindow>
+ *
+ * 右パネル・サイドバーとは組まない（ステータスバーが本体の幅にしか伸びないため）。
+ * 項目は TakoWindow と同じ .tk-sb（.is-end / .is-mid / .is-wide で狭い幅のときに間引く）。
+ */
+import '../../styles/tako-more.css';
+---
+
+<div class="tk-sbody">
+	<div class="tk-sbody-main"><slot /></div>
+	<slot name="drawer" />
+	<div class="tk-win-status tk-sbody-status"><slot name="status" /></div>
+</div>

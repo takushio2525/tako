@@ -1,0 +1,644 @@
+/*
+ * 「ほかにもできること」（features/more。#2064）の場面の見た目。
+ *
+ * 共有の部品（tako-ui.css / motion.css）の既存の見た目は変えない。ここに置くのは
+ *  - 新しい部品 StatusBody / WindowsChip の見た目
+ *  - 6 つの場面（scenes/More*.astro）だけが使う画面の再現（.tkm の中に閉じる）
+ * 色は tako-ui.css の --ui-* を使う（テーマの場面はそれを手順で差し替える）。
+ */
+
+/* ============================================================
+ * StatusBody: 本体を「ペイン + ドロワー + 場面ごとのステータスバー」に分ける
+ * ============================================================ */
+.tk-sbody {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  /* .tk-win-body の余白を打ち消し、ステータスバーを窓の幅いっぱいに出す */
+  margin: -0.35em;
+}
+.tk-sbody-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0.35em;
+}
+
+/* ============================================================
+ * WindowsChip: どの OS で使えるかの札
+ * ============================================================ */
+.tk-oschip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.5rem;
+  margin: 0.4rem 0 0 !important;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--tako-ink-muted);
+}
+.tk-oschip-os {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.1rem 0.6rem;
+  border-radius: var(--tako-radius-pill);
+  border: 1px dashed var(--tako-border-strong);
+  color: var(--tako-ink-subtle);
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+.tk-oschip-os::before {
+  content: '';
+  width: 0.45em;
+  height: 0.45em;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+}
+.tk-oschip-os.is-on {
+  border-style: solid;
+  border-color: var(--tako-green);
+  color: var(--tako-ink);
+  background: var(--tako-green-soft);
+}
+.tk-oschip-os.is-on::before {
+  background: var(--tako-green);
+  border-color: var(--tako-green);
+}
+
+/* ============================================================
+ * 場面の共通（.tkm の中だけ）
+ * ============================================================ */
+/* 押されたボタンの輪（data-fx="mark"）を、手順の中で遅らせて出せるようにする（--d が効く） */
+.tkm [data-motion] [data-at][data-fx~='mark'] {
+  transition:
+    box-shadow 0.3s var(--tako-ease),
+    background-color 0.3s var(--tako-ease-soft),
+    color 0.3s var(--tako-ease-soft);
+}
+[data-motion]:not(.is-static) .tkm-press.is-on {
+  animation: tkm-press 0.45s var(--tako-ease) var(--d, 0s) both;
+}
+@keyframes tkm-press {
+  0% {
+    transform: scale(1);
+  }
+  45% {
+    transform: scale(0.9);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* 小さなボタン（パネルの中・カードの中） */
+.tkm-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.2em 0.65em;
+  border-radius: 5px;
+  border: 1px solid var(--ui-line-heavy);
+  background: var(--ui-s2);
+  color: var(--ui-fg2);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.tkm-btn.is-primary {
+  background: var(--ui-accent);
+  border-color: var(--ui-accent);
+  color: var(--ui-crust);
+}
+.tkm-btn.is-ghost {
+  background: transparent;
+  color: var(--ui-muted);
+}
+
+/* ペインのヘッダの小さな印（自動復帰のループなど）を重ねて入れ替える器 */
+.tkm-swap {
+  display: inline-grid;
+  flex: none;
+}
+.tkm-swap > * {
+  grid-area: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+}
+
+/* ステータスバーのメーター（値を手順で入れ替える） */
+.tkm-meter {
+  position: relative;
+  display: inline-block;
+  width: 3.4em;
+  height: 0.35em;
+  border-radius: 99px;
+  background: var(--ui-hl);
+  overflow: hidden;
+}
+.tkm-meter > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--v, 10%);
+  background: var(--ui-fg3);
+  border-radius: 99px;
+}
+.tkm-meter > i.is-warn {
+  background: var(--ui-yellow);
+}
+.tkm-meter > i.is-full {
+  background: var(--ui-red);
+}
+
+/* ============================================================
+ * Code Runner: プレビューのヘッダの再生ボタンとコード
+ * ============================================================ */
+.tkm-pv-head .tk-pane-ctl {
+  margin-left: 0.2em;
+}
+.tkm-run {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.1em 0.45em;
+  border-radius: 5px;
+  color: var(--ui-green);
+  font-weight: 700;
+  flex: none;
+}
+.tkm-run .tk-ic {
+  width: 0.95em;
+  height: 0.95em;
+}
+.tkm-code {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 0.9em;
+  align-content: start;
+}
+.tkm-code .tkm-ln {
+  color: var(--ui-faint);
+  text-align: right;
+  user-select: none;
+}
+.tkm-code .tk-l {
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tkm-kw {
+  color: var(--ui-mauve);
+}
+.tkm-fn {
+  color: var(--ui-accent);
+}
+.tkm-str {
+  color: var(--ui-green);
+}
+.tkm-num {
+  color: var(--ui-peach);
+}
+.tkm-cm {
+  color: var(--ui-muted);
+  font-style: italic;
+}
+
+/* ============================================================
+ * tako mod: Claude Code の画面の中の帯・入力欄の下の行
+ * ============================================================ */
+.tkm-tui {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0.5em 0.75em 0.35em;
+}
+.tkm-tui-log {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.tkm-band {
+  display: flex;
+  align-items: center;
+  gap: 0.15em 0;
+  flex-wrap: nowrap;
+  overflow: hidden;
+  white-space: nowrap;
+  padding: 0.1em 0.3em;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  color: var(--ui-fg3);
+}
+.tkm-band > span + span::before {
+  content: ' | ';
+  white-space: pre;
+  color: var(--ui-faint);
+}
+.tkm-band .is-tako {
+  color: var(--ui-accent);
+  font-weight: 700;
+}
+.tkm-band .is-warn {
+  color: var(--ui-yellow);
+}
+/* 実物も幅に収まらなければ優先度の低いもの（タブ → worker）から落とす */
+@container tkframe (max-width: 30rem) {
+  .tkm-band .is-drop {
+    display: none;
+  }
+}
+@container tkframe (max-width: 40rem) {
+  .tkm .tk-sb .is-wide {
+    display: none;
+  }
+}
+/* 帯にフォーカスが移った姿（ctrl+x → Tab） */
+.tkm-band-focus {
+  position: relative;
+}
+.tkm-band-focus > .tkm-band-ring {
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--ui-accent-muted);
+  border-radius: 4px;
+  pointer-events: none;
+}
+.tkm-hotkey {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0 0.4em;
+  border-radius: 4px;
+  background: var(--ui-s2);
+  color: var(--ui-fg);
+}
+.tkm-hotkey b {
+  color: var(--ui-accent);
+}
+.tkm-hint {
+  display: flex;
+  justify-content: flex-end;
+  gap: 1.1em;
+  min-height: 1.55em;
+  white-space: nowrap;
+  overflow: hidden;
+  color: var(--ui-muted);
+}
+.tkm-hint b {
+  color: var(--ui-fg3);
+  font-weight: 400;
+}
+.tkm-keys {
+  position: absolute;
+  top: 0.5em;
+  right: 0.6em;
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  z-index: 3;
+  color: var(--ui-muted);
+}
+.tkm-key {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.9em;
+  padding: 0.1em 0.45em;
+  border-radius: 5px;
+  border: 1px solid var(--ui-line-heavy);
+  border-bottom-width: 2px;
+  background: var(--ui-s2);
+  color: var(--ui-fg);
+  font-weight: 700;
+}
+
+/* ============================================================
+ * テーマ: 手順 2 から明るい配色（Catppuccin Latte 系 = tako の default_light）。
+ * 手順 3 で差し色だけ緑へ。値の正本は crates/tako-core/src/theme.rs
+ * ============================================================ */
+.tkm-theme .tk-win-tabs > .tk-tbtn:last-child {
+  /* 狭い幅でも切り替えのボタンは消さない（この場面の主役） */
+  display: inline-grid;
+  position: relative;
+}
+.tkm-theme .tk-win-tabs > .tk-tbtn:last-child::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 1.1em;
+  height: 1.1em;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z' fill='black'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z' fill='black'/%3E%3C/svg%3E") center / contain no-repeat;
+  opacity: 0;
+}
+/* 色の切り替えをなめらかに（手順で出し入れする要素の動きには触れない） */
+.tkm-theme :is(.tk-win, .tk-win-tabs, .tk-tab, .tk-search, .tk-tbtn, .tk-win-body, .tk-pane, .tk-pane-head, .tk-pane-n, .tk-pane-title, .tk-pane-focus, .tk-pane-body, .tk-l, .tk-p, .tk-acc, .tk-ok, .tk-dim, .tk-win-status, .tk-sb, .tk-dot, .tk-sb-bar i):not([data-at]) {
+  transition:
+    background-color 0.6s var(--tako-ease-soft),
+    color 0.6s var(--tako-ease-soft),
+    border-color 0.6s var(--tako-ease-soft);
+}
+/* 手順 3 は AI が色を変えた後（会話の 1 行が出てから）に差し色が変わる */
+.tk-stage[data-step='3'] .tkm-theme :is(.tk-win, .tk-win-tabs, .tk-tab, .tk-search, .tk-tbtn, .tk-win-body, .tk-pane, .tk-pane-head, .tk-pane-n, .tk-pane-title, .tk-pane-focus, .tk-pane-body, .tk-l, .tk-p, .tk-acc, .tk-ok, .tk-dim, .tk-win-status, .tk-sb, .tk-dot, .tk-sb-bar i):not([data-at]) {
+  transition-delay: 0.9s;
+}
+
+/* 手順 1: 押す場所（右端のボタン）を示す */
+.tk-stage[data-step='1'] .tkm-theme .tk-win-tabs > .tk-tbtn:last-child {
+  color: var(--ui-accent);
+  background: var(--ui-tab);
+}
+/* 手順 2: 押した輪 */
+.tk-stage[data-step='2'] .tkm-theme .tk-win-tabs > .tk-tbtn:last-child {
+  color: var(--ui-accent);
+  box-shadow:
+    0 0 0 2px var(--ui-crust),
+    0 0 0 3.5px var(--ui-accent);
+}
+/* 明るい配色のあいだは太陽を月に描き替える（実物も同じ = ダークでは太陽、ライトでは月） */
+.tk-stage:is([data-step='2'], [data-step='3']) .tkm-theme .tk-win-tabs > .tk-tbtn:last-child > svg {
+  opacity: 0;
+}
+.tk-stage:is([data-step='2'], [data-step='3']) .tkm-theme .tk-win-tabs > .tk-tbtn:last-child::after {
+  opacity: 1;
+}
+.tk-stage:is([data-step='2'], [data-step='3']) .tkm-theme .tk-ui {
+  --ui-crust: #dce0e8;
+  --ui-mantle: #e6e9ef;
+  --ui-base: #eff1f5;
+  --ui-s1: #e4e7ee;
+  --ui-s2: #dde1e9;
+  --ui-hover: #dce0e8;
+  --ui-hl: #ccd0da;
+  --ui-tab: #d5d9e2;
+  --ui-chip: #e8ebf1;
+  --ui-line-in: #dfe3ea;
+  --ui-line: #cfd4de;
+  --ui-line-heavy: #bfc4d1;
+  --ui-fg: #4c4f69;
+  --ui-fg2: #5c5f77;
+  --ui-fg3: #6c6f85;
+  --ui-muted: #8c8fa1;
+  --ui-faint: #9ca0b0;
+  --ui-accent: #1e66f5;
+  --ui-accent-muted: #5a86e0;
+  --ui-accent-line: #8fa6d9;
+  --ui-idle: #aab3c7;
+  --ui-green: #40a02b;
+  --ui-red: #d20f39;
+  --ui-yellow: #df8e1d;
+  --ui-teal: #179299;
+  --ui-mauve: #8839ef;
+  --ui-peach: #fe640b;
+}
+.tk-stage[data-step='3'] .tkm-theme .tk-ui {
+  --ui-accent: #40a02b;
+  --ui-accent-muted: #40a02b;
+  --ui-accent-line: #8cc47e;
+}
+.tk-stage:is([data-step='2'], [data-step='3']) .tkm-theme .tk-win {
+  box-shadow:
+    0 1px 2px rgb(76 79 105 / 0.12),
+    0 22px 48px -18px rgb(76 79 105 / 0.35);
+}
+.tk-stage:is([data-step='2'], [data-step='3']) .tkm-theme .tk-cur {
+  background: #dc8a78;
+}
+
+/* ============================================================
+ * たまり場: ドロワーとカード
+ * ============================================================ */
+.tkm-drawer {
+  border-top: 1px solid var(--ui-line);
+  background: var(--ui-mantle);
+}
+/* 「復帰」を押した輪が見えてから閉じる */
+.tkm [data-motion] .tkm-drawer[data-at]:not(.is-on) {
+  transition-delay: 0.9s;
+}
+/* 「ー」はこの場面の主役なので、狭い幅でもペインの操作ボタンを残す */
+.tkm-shelf .tk-pane-ctl.tkm-ctl {
+  display: inline-flex;
+  align-items: center;
+}
+.tkm-ctl > span {
+  display: inline-grid;
+  place-items: center;
+  border-radius: 4px;
+}
+.tkm-drawer-in {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  padding: 0.45em 0.6em 0.55em;
+}
+.tkm-drawer-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.8em;
+  color: var(--ui-fg2);
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tkm-drawer-head span {
+  color: var(--ui-muted);
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tkm-shelf-card {
+  width: min(17em, 100%);
+  border: 1px solid var(--ui-line-heavy);
+  border-radius: 6px;
+  background: var(--ui-base);
+  overflow: hidden;
+}
+.tkm-shelf-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  height: 1.9em;
+  padding: 0 0.3em 0 0.55em;
+  border-bottom: 1px solid var(--ui-line-in);
+  color: var(--ui-fg);
+  font-weight: 700;
+  font-size: 0.92em;
+  white-space: nowrap;
+}
+.tkm-shelf-bar .tkm-btn {
+  margin-left: auto;
+  padding: 0.05em 0.5em;
+  font-size: 0.92em;
+}
+.tkm-shelf-bar .tk-ic {
+  color: var(--ui-faint);
+}
+/* カードの中は画面全体の縮小（文字を縮めるだけで行は折り返さない） */
+.tkm-shelf-screen {
+  padding: 0.35em 0.5em 0.45em;
+  font-size: 0.68em;
+  line-height: 1.45;
+  height: 6.4em;
+  overflow: hidden;
+}
+.tkm-shelf-screen .tk-l {
+  white-space: pre;
+  overflow: hidden;
+  min-height: 1.45em;
+}
+
+/* ============================================================
+ * git パネル（右パネルの git ビューの中身）
+ * ============================================================ */
+.tkm-git {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+  min-width: 0;
+}
+.tkm-git-sec {
+  color: var(--ui-fg2);
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tkm-git-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.05em 0.3em 0.05em 0.6em;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tkm-git-row > .tkm-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+.tkm-git-st {
+  flex: none;
+  width: 1em;
+  font-weight: 700;
+  color: var(--ui-yellow);
+}
+.tkm-git-st.is-add {
+  color: var(--ui-green);
+}
+.tkm-git-st.is-conflict {
+  color: var(--ui-red);
+}
+.tkm-git-row.is-current {
+  color: var(--ui-fg);
+  font-weight: 700;
+}
+.tkm-git-row .tkm-btn {
+  margin-left: auto;
+  padding: 0 0.5em;
+  font-size: 0.9em;
+}
+.tkm-git-input {
+  display: block;
+  padding: 0.3em 0.5em;
+  border-radius: 5px;
+  border: 1px solid var(--ui-line-heavy);
+  background: var(--ui-base);
+  color: var(--ui-fg);
+  white-space: nowrap;
+  overflow: hidden;
+  min-height: 2em;
+}
+.tkm-git-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+}
+.tkm-git-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+  padding: 0.5em 0.6em;
+  border-radius: 6px;
+  border: 1px solid var(--ui-accent-line);
+  background: var(--ui-base);
+  min-width: 0;
+}
+.tkm-git-card.is-conflict {
+  border-color: var(--ui-red);
+}
+.tkm-git-card > b {
+  color: var(--ui-fg);
+}
+.tkm-git-card.is-conflict > b {
+  color: var(--ui-red);
+}
+.tkm-git-card .tk-l {
+  min-height: 1.45em;
+  line-height: 1.45;
+}
+.tkm-git-card .tkm-git-actions {
+  margin-top: 0.35em;
+}
+.tkm-git-stack {
+  flex: 1;
+  min-height: 0;
+}
+
+/* ============================================================
+ * ページ冒頭の目次（6 つの機能へ飛ぶカード）
+ * ============================================================ */
+.tkm-index {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.6rem;
+  margin: 1.5rem 0 0.5rem;
+}
+/* 狭い画面では 2 列（1 列に 6 枚積むと最初の場面まで遠い） */
+@media (max-width: 50rem) {
+  .tkm-index {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.tkm-index a {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.7rem 0.9rem;
+  border-radius: var(--tako-radius-md);
+  border: 1px solid var(--tako-border);
+  background: var(--tako-card);
+  text-decoration: none;
+  color: var(--tako-ink-muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  transition:
+    border-color 0.2s var(--tako-ease-soft),
+    transform 0.2s var(--tako-ease-soft);
+}
+.tkm-index a:hover {
+  border-color: var(--tako-accent);
+  transform: translateY(-1px);
+}
+.tkm-index b {
+  color: var(--tako-ink);
+  font-size: 0.98rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tkm-index a,
+  .tkm-index a:hover {
+    transition: none;
+    transform: none;
+  }
+}
+
+/* ステータスバーの項目の「押した」印は内側の輪にする（バーは高さが低く、外側の輪は上下が切れる） */
+.tkm .tk-win-status [data-fx~='mark'].is-on {
+  box-shadow: inset 0 0 0 1.5px var(--ui-accent);
+  background: var(--ui-tab);
+  color: var(--ui-accent);
+}
