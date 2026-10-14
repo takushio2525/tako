@@ -322,11 +322,15 @@ if has_stage order; then
     esac
     sleep 0.2
   done
+  printf '%s\n' "$screen" > "$TMP/order-screen.txt"
+  grep -E 'ひとつめ|ふたつめ' "$TMP/order-screen.txt" | sed 's/^/    画面: /'
   flat=$(squash "$screen")
   first_at=$(perl -e 'print index($ARGV[0], "ひとつめ")' "$flat")
   second_at=$(perl -e 'print index($ARGV[0], "ふたつめ")' "$flat")
-  n1=$(printf '%s' "$flat" | perl -ne 'my $n = () = /コメント:ひとつめ/g; print $n')
-  n2=$(printf '%s' "$flat" | perl -ne 'my $n = () = /コメント:ふたつめ/g; print $n')
+  # スタブは打たれた文字をその場で表示し、Enter で受け取った行を `[STUB_SUBMITTED]` として
+  # もう一度出す（1 回の配送で 2 回見える）。数えるのは受け取った行（= 送信された回数）だけ
+  n1=$(grep -c '\[STUB_SUBMITTED\].*コメント: ひとつめ' "$TMP/order-screen.txt")
+  n2=$(grep -c '\[STUB_SUBMITTED\].*コメント: ふたつめ' "$TMP/order-screen.txt")
   if [ "$first_at" -ge 0 ] && [ "$second_at" -gt "$first_at" ]; then
     pass "master の入力欄へ届く順が送った順（ひとつめ @${first_at} → ふたつめ @${second_at}）"
   else
