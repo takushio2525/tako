@@ -2465,7 +2465,7 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   消すかどうかはユーザーが決める。判定は「一時ディレクトリの下 **かつ** tako のテスト名」の
   両方を満たすものだけで、名前が一致しないものは「要確認」として消さずに並べる
   （モックテスト `scripts/test-clean-trust-residue.sh` が偽の HOME で実プロジェクトの
-  巻き添えを落とす。CI の macOS ジョブで毎 PR 走る）
+  巻き添えを落とす。CI の macOS ジョブで走る。docs だけの PR では skip = #2084）
 - **PWA の e2e（Playwright）も同じ**（#1749）。スクショは `web/tako-remote/e2e/support.js` の
   `evidencePath('<名前>.png')` を通し、既定は Playwright の outputDir（`test-results/`）。
   spec の側で `process.env.HOME` / `homedir()` / `Desktop` を組み立てない（修正前は
@@ -2747,6 +2747,10 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   から導く（ハードコードしない。`name:` が無い job は job id）。外部連携の
   `Cloudflare Pages` だけは導出できないので `wait-pr-checks.sh` の `EXTERNAL_CHECKS` が正。
   job を増やす・改名する・matrix を入れるときはここが追従するかを見る
+- **`if:` で skip されたチェック（bucket = `skipping`）は完了・緑として数える**（#2084）。
+  docs だけの PR では macOS / Windows の Rust ジョブが skip されるが、チェック名は登録されるので
+  期待名の判定はそのまま揃う。結果には skip の本数を 1 行添える（仕組みは
+  「docs だけの変更で Rust の重いジョブを skip する」節）
 - merge は `scripts/merge-pr.sh <PR>`（待ち → 揃わなければ merge しない → squash +
   `--delete-branch`）。CONFLICTING / BEHIND / BLOCKED は待たずに理由を出して止まる。
   **worker も master もこの 1 実装を呼ぶ**（手順の記憶ではなく構造で守る）
@@ -2764,7 +2768,7 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   `scripts/lib/pr-conflict.sh` の 1 実装で、**待ち側と `merge-pr.sh` の門が同じ言い方をする**。
   A/B は `TAKO_1365_LEGACY=1`（衝突を見ずにタイムアウトまで待つ腕）
 - 検証は `bash scripts/test-wait-pr-checks.sh`（偽 gh + 偽リポジトリ。**CI の macOS ジョブで
-  毎 PR 走る**）。A/B は `TAKO_1333_LEGACY=1` = 修正前の判定をそのまま再現する腕で、
+  走る**。docs だけの PR では skip = #2084）。A/B は `TAKO_1333_LEGACY=1` = 修正前の判定をそのまま再現する腕で、
   Test 13 / 14 が「1 本だけで完了と返る」「揺れの 1 回目で確定する」を固定している。
   衝突（#1365）は Test 20〜23 が「待たずに 4」「legacy はタイムアウトまで待つ」
   「`UNKNOWN` は待ち続けて緑まで進む」「判定材料が無いときは従来どおり」を固定する
@@ -2884,6 +2888,60 @@ release / create）の rust-cache は 0 本」を見る。
 - 設定の置き場で効き方が違う: `.cargo/config.toml` はキーの末尾に入る（変えると部分復元 + 保存）、
   ルートの Cargo.toml は指紋経由で接頭辞に入る（変えるとコールド 1 回 + 保存）。
   どちらも「変えたのにキャッシュが古いまま」にはならない
+
+## docs だけの変更で Rust の重いジョブを skip する（Issue #2084）
+
+2026-10-15 未明、docs だけの PR が 9 本並び、どれも `ci.yml` の macOS（約 35〜40 分）と
+Windows（約 30 分）を回した。macOS のランナーは同時に数本しか取れないので約 10 本が
+順番待ちになり、コードの PR もその後ろに並んだ（1 本で最大 100 分）。そこで先頭の
+判定ジョブ `changes` が差分を見て、**docs だけなら macOS / Windows のジョブを `if:` で skip する**。
+
+- **docs だけ = 変更パスが全部 `docs/` 配下か `.agent/` 配下の `.md` で、生成ページ
+  （`docs/src/content/docs/windows-support.md` / `agent-support.md`）を含まない**。
+  型は `scripts/ci-change-scope.sh` の `DOCS_ONLY` / `RUST_REQUIRED` が正。ルートの md
+  （`AGENTS.md` / `CHANGELOG.md` / `README.md`）・`scripts/`・`.github/`・`Cargo.*`・`web/` は
+  1 つでも触れば全部走る。**迷うものは走らせる側**（差分が空・取れない・HEAD が merge
+  コミットでない・push の before が取れない・想定外のイベント）
+- 生成ページを例外にするのは、macOS ジョブが tako バイナリの出力と突き合わせる
+  （`gen-*-docs.mjs --check`）ため。手で直した生成ページを docs だけとして通すと、
+  main で初めて食い違いが見つかる
+- 差分は **CI が組み合わせた merge コミットの第 1 親から**取る（`pull_request` の checkout は
+  `refs/pull/<PR>/merge`。base 側で進んだ変更を混ぜない）。push は `github.event.before` から
+  （浅い clone に無ければ取りに行く）。**`--no-renames`** で名前の変更を「旧パスの削除 +
+  新パスの追加」として数える（既定の `--name-only` は新しいパスしか出さないので、
+  `crates/x.rs → docs/x.rs` の移動が docs だけに見える）
+- **`paths-ignore` にしない**。ジョブそのものが「無い」扱いになり、`scripts/wait-pr-checks.sh` の
+  「期待するチェック名が全部そろう」判定と噛み合わない。`if:` で飛ばしたジョブはチェック名が
+  `skipping` で登録されるので、待ち側は完了・緑として数える
+- **Rust を丸ごと止めない**。`no_personal_data`（#927。リポジトリの全ファイルを走査）・
+  `context_budget`・`docs_tool_inventory`・`fr_number_watchdog` などは docs / .agent の md を
+  **読んで検査する**ので、`docs-watchdogs` ジョブ（ubuntu・判定に関係なく毎回）が
+  `scripts/ci-docs-watchdogs.sh` でそれらだけを `cargo test --workspace --test …` する
+  （`--workspace` は full の macOS ジョブと同じ feature の宇宙で組むため = #1383 の型）。
+  一覧は手で持たず、毎回 `crates/*/tests/*.rs` を走査して拾う: コメント行を除いた本文に
+  ①docs / .agent を指す文字列リテラル ②`target` か `node_modules` を除外して歩く `read_dir`
+  ③`"ls-files"` のどれかがあるもの（2026-10-15 時点で 27 本 / 185 テスト。手元で
+  ビルド済みなら 46 秒）。**docs や .agent を読む番犬を新しく書くときは、パスを文字列
+  リテラルで書く**（関数で組み立てると拾えない）。錨（`no_personal_data` / `context_budget` /
+  `docs_tool_inventory`）が拾えなければスクリプトが止まる = 走査の型が変わったら黙って外れない
+- `docs-watchdogs` を **ubuntu で毎回**回す理由: macOS に置くと docs の PR もコードの PR / main の
+  macOS ジョブの列に並ぶ（#2089 の検証で実測: macOS は実行中 5 本・待ち 15 本で、docs だけの
+  PR の番犬が 42 分 queued のまま 1 秒も走らなかった）。docs だけのときにしか走らせないと、
+  コードの PR が Linux 向けのビルドを壊しても気づけず、次の docs の PR が身に覚えの無い理由で
+  赤くなるので毎回走らせる。**結果として tako-control / tako-core（とその依存）は Linux でも
+  コンパイルできることが CI の条件になる**（Linux 対応そのものは引き続き「将来検討」。
+  macOS 専用の API は `cfg(target_os = "macos")` の内側に置き、`cfg(unix)` で包まない）。
+  rust-cache は main でだけ保存する（PR のスコープは他から読めず容量だけ食う = #1921 と同じ型）
+- **docs の検査（astro build・OG・内部リンク・SEO・転送と配信ヘッダ・追跡先の Issue・
+  リリースノートのページ）は毎回走る `docs` ジョブ（ubuntu）にだけ置く**。macOS ジョブへ
+  戻すと docs だけの PR で一緒に skip される
+- push（main）も同じ判定で skip する。docs だけのコミットは直前の main と Rust の入力が同じ
+  なので、full を回しても新しく見るものが無い（docs の検査と番犬は main でも走る）
+- 検証は `bash scripts/test-ci-change-scope-2084.sh`（`changes` ジョブの最初のステップ。
+  パスの境界・本物の git で作った merge コミット / 浅い clone / push の before・番犬の拾い方・
+  ci.yml の配線・待ち側が本物の ci.yml から導く期待名。`--no-renames` を外した写し・
+  配線を壊した写しで同じ検査が落ちることも見る）。判定だけ試すなら
+  `git diff --name-only --no-renames origin/main... | bash scripts/ci-change-scope.sh classify`
 
 ## 設定・データファイルのスキーマ変更（Issue #916）
 
@@ -3424,16 +3482,19 @@ docs の Issue 参照 17 件のうち 10 件が closed だった。
 
 - 元の Issue が閉じてもマスが `Pending` のまま残るなら、**残りを持つ open な Issue
   （無ければ親エピック）へ付け替える**。済んだ調査は `Note` 本文へ「#N で確認」の形で残す
-- 検査は `scripts/check-docs-issue-refs.sh`（CI の macOS ジョブ）。`gh` が無い / 未認証の
+- 検査は `scripts/check-docs-issue-refs.sh`（CI の `docs` ジョブ = docs だけの PR でも毎回走る。#2084）。`gh` が無い / 未認証の
   環境では検査せず抜ける（open かは GitHub に問う以外に知る方法が無く、ローカル作業を
   止める理由にならない）
 
 ### docs のビルドと検査は CI で通す
 
 `astro build` は Cloudflare Pages が代行しているが、**代行はリポジトリの CI ではない**
-（壊れたまま merge できてしまう）。macOS ジョブで `npm run build` +
-`npm run og:verify` + `node docs/scripts/verify-links.mjs` を通す。Rust より**前**に
-置いてあるのは、docs の壊れがビルド 40 分の後ろに隠れないようにするため。
+（壊れたまま merge できてしまう）。CI の `docs` ジョブ（ubuntu・判定に関係なく毎回走る）で
+`npm run build` + `npm run og:verify` + `node docs/scripts/verify-links.mjs` を通す。
+以前は macOS ジョブの Rust より**前**に置いて、docs の壊れがビルド 40 分の後ろに隠れない
+ようにしていたが、docs だけの PR で macOS ジョブを skip する（#2084）ので別ジョブへ出した
+（並走するので隠れない性質も保たれる）。**docs の検査を macOS ジョブへ戻さない**
+（docs だけの PR で一緒に skip される。`scripts/test-ci-change-scope-2084.sh` が落とす）。
 
 内部リンクは**断片（`#見出し`）まで見る**。生成ページの見出しは件数で変わる
 （`agent-support.md` の系統別の節は「対応が 1 件でもあるか」で文言が分かれる）ので、

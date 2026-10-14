@@ -26,7 +26,7 @@
   公開済みリリースは `scripts/release.sh --check-assets [tag]` でいつでも検査できる。
   判定の正は `tako-core::platform::release_assets`（`missing_platforms` / `is_complete`）で、
   シェル側の写しは同期テストが拘束する。モックテスト `scripts/test-release-retry.sh` は
-  **CI の macOS ジョブで毎 PR 走る**（片肺の検出が壊れたらそこで落ちる）
+  **CI の macOS ジョブで走る**（片肺の検出が壊れたらそこで落ちる。docs だけの PR では skip = #2084）
 - 動作要件の数値（macOS 11.0 / Windows 10.0.17763）も `release_assets` が正で、
   `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion` との一致を
   テストが検証する（ノートの要件と配布物の実際の下限がズレない）

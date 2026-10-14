@@ -2,7 +2,8 @@
 # tako:run: bash scripts/merge-pr.sh --help
 # merge-pr.sh — CI が全部緑で揃ってから PR を squash merge する（#1333）
 #
-# 「CI 3 本緑を待って merge」を手順の記憶ではなく**構造**で守るための包み。
+# 「CI が全部緑で揃うのを待って merge」を手順の記憶ではなく**構造**で守るための包み。
+# docs だけの PR で skip された Rust のジョブは成功扱いで数える（#2084。判定は待ち側）。
 # 判定は scripts/wait-pr-checks.sh の 1 実装（期待するチェックが全部そろって全部完了 +
 # 同じ結論を 2 回連続で観測）に任せ、ここは merge してよい状態かだけを見る。
 #

@@ -13,6 +13,7 @@
 #   4. タイムアウトで 2
 #   5. 揺れ（1 回 completed → 次 in_progress）で確定しない
 #   6. base と衝突していて **run が作られない**状態は待たずに 4 で終わる（#1365）
+#   7. skip されたチェック（docs だけの PR の macOS / Windows）は完了・緑として数える（#2084）
 # 併せて期待名の導出（pull_request で起動する job のみ / name 無しは job id）と、
 # merge-pr.sh が「揃っていないときに merge を呼ばない」ことも見る。
 set -uo pipefail
@@ -788,6 +789,56 @@ out="$(TAKO_1430_LEGACY=1 run_merge_at "${CASE_DIR}/wt" 1431 --timeout 20 --inte
 rc=$?
 assert_eq "修正前は merge 済みへの再実行が 1" "${rc}" "1"
 assert_has "修正前は「OPEN ではない」で拒む" "OPEN ではない（MERGED）" "${out}"
+
+echo "== Test 30: skip（docs だけの PR の macOS / Windows）は完了・緑として数える（#2084）=="
+new_case t30
+checks_json "${CF}|pass|2026-10-15T01:02:00Z" "${MAC}|skipping|2026-10-15T01:00:30Z" "${WIN}|skipping|2026-10-15T01:00:30Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2084 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "skip が混ざっても全部そろえば 0" "${rc}" "0"
+assert_has "skip の結論をそのまま出す（macOS）" "[skipping] ${MAC}" "${out}"
+assert_has "揃ったことを言う" "CI が全部緑で揃った（期待 3 本 / 報告 3 本）" "${out}"
+assert_has "skip の本数を言う" "うち 2 本は skip（成功扱い" "${out}"
+assert_eq "skip でも確定には 2 回連続の観測が要る" "$(calls_of 'pr checks')" "2"
+
+new_case t30b
+checks_json "${CF}|pass|2026-10-15T01:02:00Z" "${MAC}|pass|2026-10-15T01:40:00Z" "${WIN}|pass|2026-10-15T01:35:00Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2084 --timeout 20 --interval 1)"
+assert_hasnt "skip が無ければ skip の行を出さない" "は skip（成功扱い" "${out}"
+
+echo "== Test 31: 判定ジョブが落ちて Rust のジョブが skip になった形は 1（#2084）=="
+new_case t31 "  changes:
+    name: 変更範囲の判定（#2084）
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi"
+CHG="変更範囲の判定（#2084）"
+checks_json "${CF}|pass|2026-10-15T01:02:00Z" "${CHG}|fail|2026-10-15T01:00:20Z" \
+  "${MAC}|skipping|2026-10-15T01:00:30Z" "${WIN}|skipping|2026-10-15T01:00:30Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2084 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "判定が落ちていれば skip が緑でも 1" "${rc}" "1"
+assert_has "期待に判定ジョブが入る" "期待: ${CHG}" "${out}"
+assert_has "失敗の本数を出す" "失敗しているチェックが 1 本ある" "${out}"
+
+echo "== Test 32: Rust のジョブが判定待ち（未登録）のあいだは skip を待つ（#2084）=="
+new_case t32 "  changes:
+    name: 変更範囲の判定（#2084）
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi"
+checks_json "${CF}|pass|2026-10-15T01:02:00Z" "${CHG}|pending|" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+checks_json "${CF}|pass|2026-10-15T01:02:00Z" "${CHG}|pass|2026-10-15T01:00:20Z" > "${TAKO_GH_MOCK_DIR}/checks.2.json"
+checks_json "${CF}|pass|2026-10-15T01:02:00Z" "${CHG}|pass|2026-10-15T01:00:20Z" \
+  "${MAC}|skipping|2026-10-15T01:00:30Z" "${WIN}|skipping|2026-10-15T01:00:30Z" > "${TAKO_GH_MOCK_DIR}/checks.3.json"
+printf '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","baseRefName":"main"}\n' > "${TAKO_GH_MOCK_DIR}/view.json"
+out="$(run_wait 2084 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "判定の後に skip が登録されて 0" "${rc}" "0"
+assert_hasnt "判定だけ緑の時点では揃ったと言わない（1 回目の観測は 3 本目以降）" "全 2 本が完了" "${out}"
+assert_has "skip の本数を言う" "うち 2 本は skip（成功扱い" "${out}"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="
