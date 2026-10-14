@@ -119,6 +119,12 @@ Windows では tmux の代わりに **psmux** が同じ役をします。psmux �
 			tools: ['tako_session_restart'],
 		},
 		{
+			kind: 'degraded',
+			title: '自分で終わったコマンドの最後の出力',
+			text: 'psmux の中のコマンドが出力し続けている最中に自分で終わると、最後の最大 10 秒ぶんの行がペインのログに入りません。手で閉じたときと、出力が止まってから終わったときは最後まで入ります。',
+			tools: ['tako_logs'],
+		},
+		{
 			kind: 'pending',
 			title: '自分で作った tmux セッションの取り込み',
 			text: 'psmux では attach と寸法の指定を前提にする操作ができません。',
