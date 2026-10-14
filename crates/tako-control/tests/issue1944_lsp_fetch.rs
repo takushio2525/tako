@@ -28,7 +28,7 @@ use tako_control::lsp::manager::DEFAULT_IDLE_GRACE;
 use tako_control::lsp::{text, DocLink, Launch, LspConfig, LspManager};
 use tako_core::lsp::fetch::{Archive, Asset, Digest, Fetch, PlatformAsset};
 use tako_core::lsp::servers::{DocumentKind, InstallHint, ServerSpec};
-use tako_core::lsp::state::RestartPolicy;
+use tako_core::lsp::state::{RestartPolicy, ServerState};
 use tako_core::platform::child_cmd::ChildCmd;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
@@ -97,6 +97,13 @@ enum Serve {
         bytes: Vec<u8>,
         pause: Duration,
     },
+    /// `Slow` と同じに送り、最後の 4 KiB だけは `release` が立つまで止める（取っている途中 = 取得中と
+    /// 進捗が揃った状態を、テストが状態待ちで捕まえられる。#2032）
+    Held {
+        bytes: Vec<u8>,
+        pause: Duration,
+        release: Arc<AtomicBool>,
+    },
     /// 中身は送らず、この大きさを申告する
     Declare(u64),
     Status(u16),
@@ -139,19 +146,13 @@ impl Origin {
                             request.respond(tiny_http::Response::from_data(bytes))
                         }
                         Some(Serve::Slow { bytes, pause }) => {
-                            let len = bytes.len();
-                            request.respond(tiny_http::Response::new(
-                                200.into(),
-                                Vec::new(),
-                                SlowReader {
-                                    bytes,
-                                    at: 0,
-                                    pause,
-                                },
-                                Some(len),
-                                None,
-                            ))
+                            request.respond(SlowReader::response(bytes, pause, None))
                         }
+                        Some(Serve::Held {
+                            bytes,
+                            pause,
+                            release,
+                        }) => request.respond(SlowReader::response(bytes, pause, Some(release))),
                         // tiny_http は大きい応答を chunked で送る（Content-Length を付けない）ので閾値を外す
                         Some(Serve::Declare(len)) => request.respond(
                             tiny_http::Response::new(
@@ -198,12 +199,45 @@ struct SlowReader {
     bytes: Vec<u8>,
     at: usize,
     pause: Duration,
+    /// 最後の 4 KiB を送る前に立つのを待つ（`Serve::Held`）
+    release: Option<Arc<AtomicBool>>,
+}
+
+impl SlowReader {
+    fn response(
+        bytes: Vec<u8>,
+        pause: Duration,
+        release: Option<Arc<AtomicBool>>,
+    ) -> tiny_http::Response<Self> {
+        let len = bytes.len();
+        tiny_http::Response::new(
+            200.into(),
+            Vec::new(),
+            Self {
+                bytes,
+                at: 0,
+                pause,
+                release,
+            },
+            Some(len),
+            None,
+        )
+    }
 }
 
 impl Read for SlowReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.at >= self.bytes.len() {
             return Ok(0);
+        }
+        if let Some(release) = self.release.as_ref() {
+            if self.bytes.len() - self.at <= 4096 {
+                // 開け忘れたまま落ちたテストでも送り手を居残らせない上限
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
         }
         std::thread::sleep(self.pause);
         let n = buf.len().min(4096).min(self.bytes.len() - self.at);
@@ -374,6 +408,34 @@ fn wait_state(manager: &LspManager, state: &str) -> Value {
     panic!("状態が {state} にならない: {last:#}");
 }
 
+/// 1 回の `status` の読みが `cond` を満たすまで待ち、その読みを返す（2 つの欄を別の時点で読まない。#2032）
+fn wait_status(manager: &LspManager, what: &str, cond: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        last = server_status(manager);
+        if cond(&last) {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("待ちが上限を超えた: {what}: {last:#}");
+}
+
+/// 前の版の段（済んだ印あり・今の版より前に入った・誰も使っていない = #1977 の片付けの対象）を
+/// `files` 個のファイルで置く
+fn old_version(dir: &Path, files: usize) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join(tako_core::lsp::fetch::MARKER),
+        r#"{"installed_at":1}"#,
+    )
+    .unwrap();
+    for i in 0..files {
+        std::fs::write(dir.join(format!("old-{i}.bin")), b"x").unwrap();
+    }
+}
+
 fn partials(root: &Path) -> Vec<String> {
     let dir = root.join(ID);
     std::fs::read_dir(&dir)
@@ -393,36 +455,51 @@ fn partials(root: &Path) -> Vec<String> {
 fn 見つからなければ取って起こし取得中が見える() {
     let scratch = Scratch::new("fetch");
     let origin = Origin::start();
-    let spec = good_spec(&scratch, &origin, |bytes| Serve::Slow {
+    let release = Arc::new(AtomicBool::new(false));
+    let spec = good_spec(&scratch, &origin, |bytes| Serve::Held {
         bytes,
         pause: Duration::from_millis(2),
+        release: Arc::clone(&release),
     });
+    // 状態の「取得中」と進捗は別々に変わる: 進捗を置く前と、取り終えて進捗を消してから稼働へ移るまで
+    // （片付け = #1977 が走る）は、取得中なのに進捗が無い。各時点で両方を求める読み方はこの窓で落ちる
+    // ので（#2032）、下は状態と進捗が揃った 1 回の読みを状態待ちで捕まえる。
+    // 注入 `TAKO_2032_INJECT_OLD_FILES=<n>`: n 個のファイルを持つ前の版の段を置き、片付けの窓を広げる
+    // （既定では置かない = Windows で書いた直後のファイルの片付けが別の揺れを持ち込まない）
+    let old = scratch.root().join(ID).join("t0");
+    let injected: Option<usize> = std::env::var("TAKO_2032_INJECT_OLD_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(files) = injected {
+        old_version(&old, files);
+    }
     let m = manager(&scratch, spec, Arc::default(), &origin.base, true);
     // UI への状態の知らせは診断の口とは別（#1679 の「診断の口は URI だけ」を崩さない）
     let mut diagnostics = m.diagnostics_events().expect("診断の口");
     let mut state = m.state_events().expect("状態の口");
     let _link = open(&m, &scratch.file(1));
-    // 取っているあいだは「取得中」と進捗（UI の 1 行と同じ口）
-    let fetching = wait_state(&m, "fetching");
-    let mut saw_progress = fetching["fetch"].is_object();
-    let started = Instant::now();
-    while server_status(&m)["state"] == "fetching" && started.elapsed() < Duration::from_secs(60) {
-        let status = server_status(&m);
-        if status["fetch"]["bytes"].as_u64().unwrap_or(0) > 0 {
-            saw_progress = true;
-        }
-        let doc = m.document_server(&scratch.file(1)).expect("画面の状態");
-        assert!(
-            doc.fetch.is_some() || server_status(&m)["state"] != "fetching",
-            "取得中なら画面にも進捗"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        saw_progress,
-        "取っている最中の進捗が status に出る: {fetching:#}"
+    // 取っているあいだは「取得中」と進捗（UI の 1 行と同じ口）。配布元が最後の 4 KiB を止めている
+    // あいだは両方とも動かないので、どちらの口も 1 回の読みから状態と進捗を取って確かめる
+    let fetching = wait_status(&m, "status に取得中と進捗", |s| {
+        s["state"] == "fetching" && s["fetch"].is_object()
+    });
+    wait_for(
+        "画面に取得中と進捗",
+        Duration::from_secs(60),
+        || {
+            m.document_server(&scratch.file(1))
+                .is_some_and(|doc| doc.state == ServerState::Fetching && doc.fetch.is_some())
+        },
     );
+    assert_eq!(fetching["fetch"]["phase"], "downloading", "{fetching:#}");
+    release.store(true, Ordering::SeqCst);
     let running = wait_state(&m, "running");
+    if injected.is_some() {
+        assert!(
+            !old.exists(),
+            "注入が効いた（前の版の段を片付けた = 進捗が消えてから稼働までの窓を通った）"
+        );
+    }
     assert_eq!(running["source"], "managed", "{running:#}");
     let program = running["program_path"].as_str().unwrap();
     assert!(
