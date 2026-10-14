@@ -59,10 +59,16 @@ pub enum RpcError {
 /// サーバからの通知を受ける関数（method, params）
 pub type NotificationHandler = Box<dyn Fn(&str, Value) + Send + Sync>;
 
+/// サーバからの要求を、既定の応答を返す**前に**見せる関数（method, params。#2034）
+pub type RequestHandler = Box<dyn Fn(&str, &Value) + Send + Sync>;
+
 /// reader スレッドから呼び手へ渡すもの
 pub struct Handlers {
     /// サーバからの通知（`textDocument/publishDiagnostics` 等）
     pub on_notification: NotificationHandler,
+    /// サーバからの要求（`client/registerCapability` 等。#2034）。応答は [`default_reply`] が返すので、
+    /// ここは中身を取り込むだけ（ファイル監視の登録を受ける）
+    pub on_request: RequestHandler,
     /// stdout が閉じた（= プロセスが終わった）。1 度だけ呼ばれる
     pub on_exit: Box<dyn FnOnce() + Send>,
 }
@@ -181,6 +187,7 @@ impl ServerProcess {
             let label = label.to_string();
             let Handlers {
                 on_notification,
+                on_request,
                 on_exit,
             } = handlers;
             std::thread::Builder::new()
@@ -194,7 +201,13 @@ impl ServerProcess {
                                 if raw_log.is_some() {
                                     raw_log_line(&raw_log, "<--", &message.to_string());
                                 }
-                                handle_incoming(message, &pending, &outbox, &*on_notification);
+                                handle_incoming(
+                                    message,
+                                    &pending,
+                                    &outbox,
+                                    &*on_notification,
+                                    &*on_request,
+                                );
                             }
                             Ok(None) => break,
                             Err(rpc::ReadError::InvalidJson(_)) => {
@@ -443,6 +456,7 @@ fn handle_incoming(
     pending: &Mutex<PendingTable<Waiter>>,
     outbox: &SyncSender<Vec<u8>>,
     on_notification: &(dyn Fn(&str, Value) + Send + Sync),
+    on_request: &(dyn Fn(&str, &Value) + Send + Sync),
 ) {
     match rpc::classify(message) {
         Incoming::Response { id, result } => {
@@ -452,7 +466,9 @@ fn handle_incoming(
             }
         }
         Incoming::Request { id, method, params } => {
-            // 無視して黙らない（サーバが応答を待ち続ける）。S1 は既定の応答だけを返す
+            // 中身を取り込んでから（#2034: ファイル監視の登録）、既定の応答を返す。
+            // 無視して黙らない（サーバが応答を待ち続ける）
+            on_request(&method, &params);
             let reply = default_reply(&id, &method, &params);
             let _ = outbox.try_send(rpc::frame(&reply));
         }

@@ -99,6 +99,21 @@
 //! `loading` の読み込み中は参照と prepare に空（`[]`）で答える（定義ジャンプと同じ）。
 //! 当たる規則が無ければ `null` で答える。
 //!
+//! ## tako の外で変わったファイル（#2034）
+//!
+//! `--watchers <file>`（`TAKO_LSP_FAKE_WATCHERS`。`FileSystemWatcher` の JSON 配列。字面の `{root}` は
+//! initialize の `rootUri` に置き換える）を渡すと、`initialized` を受けた後に `client/registerCapability`
+//! （id `tako-fake-watch`）でその監視を登録する。`--unwatch-on <接尾辞>`（`TAKO_LSP_FAKE_UNWATCH_ON`）を
+//! 渡すと、`workspace/didChangeWatchedFiles` の URI がその接尾辞で終わったら `client/unregisterCapability`
+//! で外す（解除の後に知らせが来ないことを見る）。
+//!
+//! `--disk-model`（`TAKO_LSP_FAKE_DISK_MODEL=1`）を渡すと、**実の rust-analyzer と同じ持ち方**をする:
+//! `initialized` の時点で根の配下のファイル（500 個・1 つ 1 MB まで）を読み、その後は
+//! `workspace/didChangeWatchedFiles` を受けたファイルだけを読み直す（種別 3 は捨てる）。開いている文書は
+//! 本文の模型（下記）が勝つ。参照（`--xref` の規則の `find: <語>`）はこの模型の全ファイルでその語
+//! （前後が英数字と `_` でない所）が現れる所を、定義（`--goto` の規則の `find: <字面>`）は URI 順で最初に
+//! 現れる所を返す = 知らせが届かなければ、外で書き換えた後も古い行番号で答える（#2034 の症状）。
+//!
 //! ## 本文の模型（#1769）
 //!
 //! 受けた本文（didOpen の全文・didChange の範囲 / 全文）を**自前で当てて**持つ。位置の数え方は
@@ -410,6 +425,147 @@ fn word_at(text: &str, offset: usize) -> Option<(usize, usize)> {
     (end > start).then_some((start, end))
 }
 
+/// ディスクの模型（#2034。冒頭の説明）: 根の URI からの相対パス → 中身
+struct Disk {
+    root_uri: String,
+    root: std::path::PathBuf,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+/// `file://` URI → パス（tako の実装を使わずにここで組む。Windows の `/C:/` の先頭の `/` は落とす）
+fn path_of_file_uri(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let text = String::from_utf8(out).ok()?;
+    let b = text.as_bytes();
+    let text = if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        text[1..].to_string()
+    } else {
+        text
+    };
+    Some(std::path::PathBuf::from(text))
+}
+
+impl Disk {
+    const MAX_FILES: usize = 500;
+    const MAX_BYTES: u64 = 1 << 20;
+
+    /// 根の配下を読む（`initialized` の時点 = 実サーバのワークスペースの読み込み）
+    fn load(root_uri: &str) -> Option<Self> {
+        let root = path_of_file_uri(root_uri)?;
+        let mut disk = Self {
+            root_uri: root_uri.trim_end_matches('/').to_string(),
+            root: root.clone(),
+            files: Default::default(),
+        };
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if disk.files.len() < Self::MAX_FILES {
+                    if let Some(rel) = disk.rel_of_path(&path) {
+                        disk.read(&rel);
+                    }
+                }
+            }
+        }
+        Some(disk)
+    }
+
+    fn rel_of_path(&self, path: &std::path::Path) -> Option<String> {
+        let rel = path.strip_prefix(&self.root).ok()?;
+        Some(rel.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn read(&mut self, rel: &str) {
+        let path = rel
+            .split('/')
+            .fold(self.root.clone(), |p, part| p.join(part));
+        let small =
+            std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= Self::MAX_BYTES);
+        match std::fs::read_to_string(&path) {
+            Ok(text) if small => {
+                self.files.insert(rel.to_string(), text);
+            }
+            _ => {
+                self.files.remove(rel);
+            }
+        }
+    }
+
+    /// 知らせ 1 件を当てる（根の外・読めない URI は捨てる）
+    fn apply(&mut self, uri: &str, kind: u64) {
+        let Some(rel) = uri
+            .strip_prefix(self.root_uri.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            return;
+        };
+        if kind == 3 {
+            self.files.remove(rel);
+        } else {
+            self.read(rel);
+        }
+    }
+
+    /// 模型の全ファイル（URI → 中身）。開いている文書は本文の模型が勝つ
+    fn texts(
+        &self,
+        docs: &std::collections::HashMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut all: std::collections::BTreeMap<String, String> = self
+            .files
+            .iter()
+            .map(|(rel, text)| (format!("{}/{rel}", self.root_uri), text.clone()))
+            .collect();
+        for (uri, text) in docs {
+            all.insert(uri.clone(), text.clone());
+        }
+        all
+    }
+}
+
+/// `find` の語が現れる所（前後が英数字と `_` でない所）を `Location` で（#2034）
+fn find_locations(
+    texts: &std::collections::BTreeMap<String, String>,
+    breaks: Breaks,
+    word: &str,
+    whole_word: bool,
+) -> Vec<serde_json::Value> {
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let mut out = Vec::new();
+    for (uri, text) in texts {
+        for (at, _) in text.match_indices(word) {
+            let end = at + word.len();
+            if whole_word
+                && (is_word(text[..at].chars().next_back()) || is_word(text[end..].chars().next()))
+            {
+                continue;
+            }
+            out.push(serde_json::json!({ "uri": uri, "range": range_json(text, breaks, at, end) }));
+        }
+    }
+    out
+}
+
 /// 規則のうち、この要求に最初に当たるもの
 fn goto_rule<'a>(
     rules: &'a [serde_json::Value],
@@ -666,6 +822,17 @@ fn main() {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| serde_json::from_str(&text).ok());
     let doc_log = arg_or_env(&args, "--doc-log", "TAKO_LSP_FAKE_DOC_LOG");
+    // #2034: 監視の登録・解除の合図・ディスクの模型（冒頭の説明）
+    let watchers_text: Option<String> = arg_or_env(&args, "--watchers", "TAKO_LSP_FAKE_WATCHERS")
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    let unwatch_on = arg_or_env(&args, "--unwatch-on", "TAKO_LSP_FAKE_UNWATCH_ON");
+    let disk_model = args.iter().any(|a| a == "--disk-model")
+        || matches!(
+            std::env::var("TAKO_LSP_FAKE_DISK_MODEL").ok().as_deref(),
+            Some("1")
+        );
+    let mut root_uri = String::new();
+    let mut disk: Option<Disk> = None;
     let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     append(&spawns, &std::process::id().to_string());
     eprintln!("tako-lsp-fake: scenario={scenario}");
@@ -762,6 +929,59 @@ fn main() {
                     continue;
                 }
             }
+        }
+        if method == "initialize" {
+            root_uri = message["params"]["rootUri"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+        }
+        if method == "initialized" {
+            if disk_model {
+                disk = Disk::load(&root_uri);
+            }
+            if let Some(text) = &watchers_text {
+                let watchers: serde_json::Value =
+                    serde_json::from_str(&text.replace("{root}", &root_uri))
+                        .unwrap_or(serde_json::Value::Null);
+                out.send(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "watch-register",
+                    "method": "client/registerCapability",
+                    "params": { "registrations": [{
+                        "id": "tako-fake-watch",
+                        "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": { "watchers": watchers },
+                    }]},
+                }));
+            }
+        }
+        if method == "workspace/didChangeWatchedFiles" {
+            let changes = message["params"]["changes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for change in &changes {
+                let uri = change["uri"].as_str().unwrap_or("");
+                if let Some(disk) = disk.as_mut() {
+                    disk.apply(uri, change["type"].as_u64().unwrap_or(2));
+                }
+                if unwatch_on
+                    .as_deref()
+                    .is_some_and(|suffix| uri.ends_with(suffix))
+                {
+                    out.send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": "watch-unregister",
+                        "method": "client/unregisterCapability",
+                        "params": { "unregisterations": [{
+                            "id": "tako-fake-watch",
+                            "method": "workspace/didChangeWatchedFiles",
+                        }]},
+                    }));
+                }
+            }
+            continue;
         }
         match (method, id) {
             ("initialize", Some(id)) => {
@@ -920,6 +1140,16 @@ fn main() {
                 if rule["silent"].as_bool() == Some(true) {
                     continue;
                 }
+                if let Some(needle) = rule["find"].as_str() {
+                    // #2034: ディスクの模型 + 開いている文書で URI 順に最初に現れる所
+                    let texts = disk.as_ref().map(|d| d.texts(&docs)).unwrap_or_default();
+                    let result = find_locations(&texts, breaks, needle, false)
+                        .into_iter()
+                        .next()
+                        .unwrap_or(serde_json::Value::Null);
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                    continue;
+                }
                 if rule["echo"].as_bool() == Some(true) {
                     // 問われた位置の語を自分の本文で引き、その範囲を返す（#1769）
                     let params = &message["params"];
@@ -972,6 +1202,14 @@ fn main() {
                     std::process::exit(6);
                 }
                 if rule["silent"].as_bool() == Some(true) {
+                    continue;
+                }
+                if let Some(word) = rule["find"].as_str() {
+                    // #2034: ディスクの模型 + 開いている文書でその語が現れる所すべて
+                    let texts = disk.as_ref().map(|d| d.texts(&docs)).unwrap_or_default();
+                    let result =
+                        serde_json::Value::Array(find_locations(&texts, breaks, word, true));
+                    out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
                     continue;
                 }
                 let result = match rule["generate"].as_u64() {

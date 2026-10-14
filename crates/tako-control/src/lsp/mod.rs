@@ -22,6 +22,10 @@
 //! S8（#1685）の参照検索・呼び出し階層・型階層 = `tako lsp references` 等（問い合わせの型と応答は
 //! [`xref`]、待つのは [`LspManager::xref`] / [`LspManager::xref_expand`]。結果の保持とツリーの
 //! 展開状態は `tako_core::lsp::xref`）。
+//! #2034 の外の変化の通知 = サーバが登録したグロブの根を OS のファイル監視で見て
+//! `workspace/didChangeWatchedFiles` を送る（登録の読み取りと照合は `tako_core::lsp::watch`、監視の実体は
+//! [`watch`]、サーバへの振り分けは [`LspManager`]。様子は `tako lsp status` の `file_watch` /
+//! 各サーバの `watched_files`）。
 
 pub mod archive;
 pub mod completion;
@@ -35,6 +39,7 @@ pub mod menu;
 pub mod rpc;
 pub mod server;
 pub mod text;
+pub mod watch;
 pub mod xref;
 
 pub use completion::{CompletionAnswer, CompletionError, CompletionRequest};

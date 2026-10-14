@@ -45,6 +45,14 @@
 //! **サーバが無くても編集経路は何も変わらない**（ゼロコンフィグ原則）。対象外の拡張子・
 //! 未導入のサーバは [`DocLink::Declined`] で覚え、打鍵のたびに探し直さない。
 //!
+//! ## tako の外で変わったファイル（#2034）
+//!
+//! `initialize` で `workspace.didChangeWatchedFiles`（動的登録・相対パターン）を申告し、サーバが
+//! `client/registerCapability` で登録したグロブをサーバ（[`Slot`]）ごとに覚える。監視の実体は
+//! manager に 1 つ（[`super::watch::WatchHub`]。全サーバの根の和を見る）で、まとめた変化を
+//! 登録が当たるサーバへだけ `workspace/didChangeWatchedFiles` で送る。登録はプロセスのもの
+//! なので、落ちた・止めた・起こし直したら捨てる（新しいプロセスが登録し直す）。
+//!
 //! ## 同じファイルを複数のペインで開く（#1769）
 //!
 //! **1 URI = 1 文書**を持ち手（[`DocLease`]。編集セッション 1 つにつき 1 つ）で共有する
@@ -77,8 +85,10 @@ use super::menu::{MenuCapabilities, MenuRequest};
 use super::rpc::RequestId;
 use super::server::{Handlers, RpcError, ServerProcess};
 use super::text;
+use super::watch::{self as file_watch, WatchHub};
 use super::xref::{ExpandAnswer, ExpandRequest, XrefAnswer, XrefRequest};
 use tako_core::lsp::completion as comp;
+use tako_core::lsp::watch::{ChangeType, Registrations};
 
 /// 要求のタイムアウトの既定（Zed の実測値）
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -349,6 +359,9 @@ struct Shared {
     /// 未導入のサーバを取る設定（#1944）。`None` は取らない（`TAKO_1944_LEGACY=1`・テストの既定）
     fetch: Option<FetchConfig>,
     inner: Mutex<Inner>,
+    /// tako の外で変わったファイルの監視（#2034。全サーバで 1 つ）。
+    /// **ロックの順は `watch` → `inner`**（`inner` を持ったまま `watch` を取らない）
+    watch: Mutex<WatchHub>,
     /// 自分自身への弱参照（スレッドへ渡す）
     this: Weak<Shared>,
 }
@@ -505,6 +518,10 @@ struct Slot {
     source: Option<&'static str>,
     program_path: Option<String>,
     runtime: Option<String>,
+    /// サーバが登録したファイル監視（#2034。プロセスが変わったら捨てる）
+    watch: Registrations,
+    /// 監視の知らせを送った回数・変化の数・送れなかった変化の数（#2034。起動をまたいで数える）
+    watch_sent: (u64, u64, u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,11 +667,21 @@ impl LspManager {
         if legacy() {
             return Self::disabled();
         }
-        let shared = Arc::new_cyclic(|this| Shared {
-            config,
-            fetch,
-            inner: Mutex::new(Inner::default()),
-            this: this.clone(),
+        let shared = Arc::new_cyclic(|this: &Weak<Shared>| {
+            // #2034: まとめた変化をサーバへ振り分ける（manager が消えたら何もしない）
+            let weak = this.clone();
+            let on_batch: file_watch::BatchHandler = Arc::new(move |batch| {
+                if let Some(shared) = weak.upgrade() {
+                    shared.on_watched_files(batch);
+                }
+            });
+            Shared {
+                config,
+                fetch,
+                inner: Mutex::new(Inner::default()),
+                watch: Mutex::new(WatchHub::new(on_batch)),
+                this: this.clone(),
+            }
         });
         // #1944 / #1823 の 2: シェル統合の合図で、未導入のサーバを引き直す（manager が消えたら外れる）
         let weak = Arc::downgrade(&shared);
@@ -1401,6 +1428,8 @@ impl Shared {
         slot.quiescent = None;
         slot.running_since = None;
         slot.diagnosed = false;
+        // #2034: 登録は前のプロセスのもの（監視の根は前のプロセスの on_exit の後で揃え直す）
+        slot.watch.clear();
         let generation = slot.generation;
         let Some(shared) = self.arc() else {
             return;
@@ -1968,19 +1997,133 @@ impl Shared {
     }
 
     fn handlers(&self, key: &ServerKey, generation: u64) -> Handlers {
-        let (weak_n, weak_e) = (self.this.clone(), self.this.clone());
-        let (key_n, key_e) = (key.clone(), key.clone());
+        let (weak_n, weak_r, weak_e) = (self.this.clone(), self.this.clone(), self.this.clone());
+        let (key_n, key_r, key_e) = (key.clone(), key.clone(), key.clone());
         Handlers {
             on_notification: Box::new(move |method, params| {
                 if let Some(shared) = weak_n.upgrade() {
                     shared.on_notification(&key_n, method, params);
                 }
             }),
+            on_request: Box::new(move |method, params| {
+                if let Some(shared) = weak_r.upgrade() {
+                    shared.on_server_request(&key_r, generation, method, params);
+                }
+            }),
             on_exit: Box::new(move || {
                 if let Some(shared) = weak_e.upgrade() {
                     shared.on_exit(&key_e, generation);
+                    // #2034: 落ちた・止めた・起こし直したプロセスの登録を外したので、見る根を揃え直す
+                    // （どのサーバも登録していなければ監視ごと落とす）。`inner` を放してから
+                    shared.refresh_watch();
                 }
             }),
+        }
+    }
+
+    /// サーバからの要求の中身を取り込む（#2034: ファイル監視の登録と解除）。応答は reader が返す
+    fn on_server_request(&self, key: &ServerKey, generation: u64, method: &str, params: &Value) {
+        if file_watch::legacy() {
+            return;
+        }
+        let changed = {
+            let mut inner = self.lock();
+            let Some(slot) = inner.servers.get_mut(key) else {
+                return;
+            };
+            if slot.generation != generation {
+                return;
+            }
+            match method {
+                "client/registerCapability" => {
+                    slot.watch.register(params, &key.root, cfg!(windows)) > 0
+                }
+                "client/unregisterCapability" => slot.watch.unregister(params) > 0,
+                _ => false,
+            }
+        };
+        if changed {
+            self.refresh_watch();
+        }
+    }
+
+    /// 監視する根を全サーバの登録へ揃える（#2034）。**`inner` を持ったまま呼ばない**（`watch` → `inner` の順）
+    fn refresh_watch(&self) {
+        let mut hub = self.watch.lock().unwrap_or_else(|e| e.into_inner());
+        let roots = {
+            let inner = self.lock();
+            inner
+                .servers
+                .values()
+                .flat_map(|slot| slot.watch.roots())
+                .collect::<Vec<_>>()
+        };
+        hub.apply(roots);
+    }
+
+    /// まとめた変化を、登録が当たるサーバへ `workspace/didChangeWatchedFiles` で送る（#2034。
+    /// まとめ送りのスレッドから呼ばれる）。
+    ///
+    /// 種別は**今あるか**で決める（stat はロックの外で、どれかのサーバの登録に当たりうるパスだけ）
+    fn on_watched_files(&self, batch: file_watch::Batch) {
+        let windows = cfg!(windows);
+        // 1 段目: どれかのサーバの登録に当たりうるパスだけへ絞る（ビルドの成果物などの大半はここで落ちる）
+        let candidates: Vec<(PathBuf, bool)> = {
+            let inner = self.lock();
+            batch
+                .into_iter()
+                .filter(|(path, _)| {
+                    inner
+                        .servers
+                        .values()
+                        .any(|slot| slot.watch.matched_kinds(path, windows) != 0)
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let classified: Vec<(PathBuf, ChangeType)> = candidates
+            .into_iter()
+            .map(|(path, created)| {
+                let change = ChangeType::classify(created, file_watch::exists(&path));
+                (path, change)
+            })
+            .collect();
+        let mut inner = self.lock();
+        for (key, slot) in inner.servers.iter_mut() {
+            if slot.watch.is_empty() || slot.lifecycle.state != ServerState::Running {
+                continue;
+            }
+            let Some(process) = slot.process.clone() else {
+                continue;
+            };
+            let changes: Vec<Value> = classified
+                .iter()
+                .filter(|(path, change)| slot.watch.wants(path, *change, windows))
+                .map(|(path, change)| {
+                    json!({
+                        "uri": tako_core::file_uri::from_path(path),
+                        "type": change.code(),
+                    })
+                })
+                .collect();
+            if changes.is_empty() {
+                continue;
+            }
+            let count = changes.len() as u64;
+            match process.notify(tako_core::lsp::watch::METHOD, json!({ "changes": changes })) {
+                Ok(()) => {
+                    slot.watch_sent.0 += 1;
+                    slot.watch_sent.1 += count;
+                }
+                // 送信キューが満杯 = サーバが読んでいない。取り直しはしない（次の変化で読み直す）
+                Err(_) => slot.watch_sent.2 += count,
+            }
+            crate::diag::perf_log(&format!(
+                "lsp watched files: server={} paths={count}",
+                key.id
+            ));
         }
     }
 
@@ -2041,6 +2184,8 @@ impl Shared {
         if let Some(process) = slot.process.take() {
             slot.last_stderr = process.stderr_tail();
         }
+        // #2034: 登録はこのプロセスのもの（根は handlers の on_exit が揃え直す）
+        slot.watch.clear();
         for doc in inner.docs.values_mut() {
             if doc.key == *key {
                 doc.opened = None;
@@ -2262,12 +2407,15 @@ impl Shared {
     }
 
     fn shutdown_all(&self, deadline: Duration) {
+        // #2034: 監視も落とす（`watch` → `inner` の順）
+        self.watch.lock().unwrap_or_else(|e| e.into_inner()).stop();
         let processes: Vec<Arc<ServerProcess>> = {
             let mut inner = self.lock();
             inner
                 .servers
                 .values_mut()
                 .filter_map(|slot| {
+                    slot.watch.clear();
                     slot.generation = slot.generation.wrapping_add(1);
                     slot.lifecycle = Lifecycle {
                         state: ServerState::Stopped,
@@ -2290,6 +2438,12 @@ impl Shared {
     // --- 読み取り -----------------------------------------------------------
 
     fn status(&self, name: Option<&str>) -> Value {
+        // #2034: 監視の様子（`watch` → `inner` の順に取る）
+        let file_watch = self
+            .watch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status();
         let mut inner = self.lock();
         // 取り消し合う要求（打鍵の補完・説明の補い・マウスのホバー）のうち、まだ答えを返していない数
         // （#1909。取り消した古い要求が読み込み待ちに残っていれば 0 に戻らない）
@@ -2314,6 +2468,8 @@ impl Shared {
             "fetch": fetch_summary(self.fetch.as_ref(), inner.last_sweep.as_ref()),
             // #1977: 未導入のサーバの引き直し（対象・間隔・直前の 1 巡にかかった時間）
             "recheck": Self::recheck_summary(&inner),
+            // #2034: tako の外で変わったファイルの監視（全サーバで 1 つ。登録は各サーバの `watched_files`）
+            "file_watch": file_watch,
         });
         if inner.servers.is_empty() {
             value["note"] = json!(text::IDLE_NOTE.text());
@@ -3638,6 +3794,8 @@ impl Slot {
             source: None,
             program_path: None,
             runtime: None,
+            watch: Registrations::default(),
+            watch_sent: (0, 0, 0),
         }
     }
 }
@@ -3720,6 +3878,16 @@ fn slot_status(
         "fetch": fetch_config
             .and_then(|config| fetch::progress_of(config, slot.spec))
             .map(|p| p.to_json()),
+        // #2034: サーバが登録したファイル監視と、送った知らせの数
+        "watched_files": {
+            "registrations": slot.watch.len(),
+            "watchers": slot.watch.watcher_count(),
+            "rejected": slot.watch.rejected(),
+            "patterns": slot.watch.patterns(),
+            "notifications": slot.watch_sent.0,
+            "changes": slot.watch_sent.1,
+            "dropped": slot.watch_sent.2,
+        },
     });
     match slot.lifecycle.state {
         ServerState::NotInstalled => {
@@ -3910,15 +4078,16 @@ fn stop_process(process: &ServerProcess, timeout: Duration) {
 
 /// クライアントの能力。**実際に使うものだけ**を申告する（使わない能力を申告すると
 /// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種、
-/// #1683 が整形、#1682 が補完、#1681 がホバーを足した
+/// #1683 が整形、#1682 が補完、#1681 がホバー、#2034 がファイル監視の動的登録を足した
 fn initialize_params(root_uri: &str, root_name: &str) -> Value {
     use lsp_types::{
         ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
         CompletionItemCapabilityResolveSupport, CompletionItemTag, CompletionListCapability,
-        DocumentFormattingClientCapabilities, DocumentRangeFormattingClientCapabilities,
-        GeneralClientCapabilities, GotoCapability, HoverClientCapabilities, InitializeParams,
-        MarkupKind, PositionEncodingKind, PublishDiagnosticsClientCapabilities, TagSupport,
-        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Uri, WorkspaceFolder,
+        DidChangeWatchedFilesClientCapabilities, DocumentFormattingClientCapabilities,
+        DocumentRangeFormattingClientCapabilities, GeneralClientCapabilities, GotoCapability,
+        HoverClientCapabilities, InitializeParams, MarkupKind, PositionEncodingKind,
+        PublishDiagnosticsClientCapabilities, TagSupport, TextDocumentClientCapabilities,
+        TextDocumentSyncClientCapabilities, Uri, WorkspaceClientCapabilities, WorkspaceFolder,
     };
     // #1680: 定義ジャンプの 4 種。`LocationLink` を受けられる（識別子の範囲へ正確に着地する）
     let goto = || {
@@ -3928,6 +4097,15 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
         })
     };
     let uri: Option<Uri> = root_uri.parse().ok();
+    // #2034: tako の外で変わったファイルを知らせる（サーバがグロブを登録してくる）。申告しないと
+    // サーバ自前の監視次第になる（rust-analyzer 1.95 は根がシンボリックリンクを通ると拾わない = 実測）
+    let workspace = (!super::watch::legacy()).then(|| WorkspaceClientCapabilities {
+        did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+            dynamic_registration: Some(true),
+            relative_pattern_support: Some(true),
+        }),
+        ..Default::default()
+    });
     #[allow(deprecated)]
     let params = InitializeParams {
         process_id: Some(std::process::id()),
@@ -3946,6 +4124,7 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
                 position_encodings: Some(vec![PositionEncodingKind::UTF16]),
                 ..Default::default()
             }),
+            workspace,
             text_document: Some(TextDocumentClientCapabilities {
                 synchronization: Some(TextDocumentSyncClientCapabilities {
                     dynamic_registration: Some(false),
@@ -4158,6 +4337,14 @@ mod tests {
         assert_eq!(params["rootUri"], json!("file:///w"));
         assert_eq!(params["workspaceFolders"][0]["name"], json!("w"));
         assert_eq!(params["clientInfo"]["name"], json!("tako"));
+        // #2034: workspace はファイル監視の動的登録（相対パターンつき）だけ
+        assert_eq!(
+            params["capabilities"]["workspace"],
+            json!({ "didChangeWatchedFiles": {
+                "dynamicRegistration": true,
+                "relativePatternSupport": true,
+            }})
+        );
     }
 
     #[test]

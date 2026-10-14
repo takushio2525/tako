@@ -227,6 +227,18 @@ pub const RECHECK_NOTE: Note = Note::new(
     "Re-checking missing servers: {targets} (on command end / cwd change, at most every {interval}s; last pass {cost} ms)",
 );
 
+/// tako の外で変わったファイルの監視（#2034）。`{roots}` = 見ている根 / `{batches}` = 振り分けた回数
+pub const WATCH_NOTE: Note = Note::new(
+    "ファイルの監視: {roots}（tako の外の変化を言語サーバへ知らせる・振り分け {batches} 回）",
+    "Watching files: {roots} (external changes are sent to language servers; {batches} batches)",
+);
+
+/// 監視しない根（#2034）。`{items}` = `<パス> <理由>` の並び
+pub const WATCH_SKIPPED_NOTE: Note = Note::new(
+    "監視しない根: {items}（broad = HOME とその祖先は広すぎる・missing = 無い・その他 = OS が断った）",
+    "Not watched: {items} (broad = HOME or its ancestors are too wide, missing = does not exist, other = refused by the OS)",
+);
+
 /// `{…}` を差し込む
 pub fn fill(note: Note, values: &[(&str, &str)]) -> String {
     let mut text = note.text().to_string();

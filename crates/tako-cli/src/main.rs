@@ -12059,6 +12059,38 @@ fn lsp_status_tail_lines(result: &Value) -> Vec<String> {
             ],
         ));
     }
+    // #2034: tako の外で変わったファイルの監視（動いていれば根、監視しない根があれば理由）
+    let watch = &result["file_watch"];
+    let paths = |key: &str, with_reason: bool| -> Vec<String> {
+        watch[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let path = item["path"].as_str()?;
+                Some(match (with_reason, item["reason"].as_str()) {
+                    (true, Some(reason)) => format!("{path} {reason}"),
+                    _ => path.to_string(),
+                })
+            })
+            .collect()
+    };
+    if watch["active"] == Value::Bool(true) {
+        out.push(text::fill(
+            text::WATCH_NOTE,
+            &[
+                ("roots", &paths("roots", false).join(", ")),
+                ("batches", &watch["batches"].to_string()),
+            ],
+        ));
+    }
+    let skipped = paths("skipped", true);
+    if !skipped.is_empty() {
+        out.push(text::fill(
+            text::WATCH_SKIPPED_NOTE,
+            &[("items", &skipped.join(", "))],
+        ));
+    }
     out
 }
 
@@ -13153,8 +13185,30 @@ mod tests {
         let none = lsp_status_tail_lines(&serde_json::json!({
             "fetch": {"cleanup": null},
             "recheck": {"targets": [], "interval_secs": 15, "last_cost_ms": null},
+            "file_watch": {"active": false, "roots": [], "skipped": [], "batches": 0},
         }));
         assert!(none.is_empty(), "{none:?}");
+        // #2034: 監視が動いていれば根を、監視しない根があれば理由を 1 行ずつ
+        let watching = lsp_status_tail_lines(&serde_json::json!({
+            "fetch": {"cleanup": null},
+            "recheck": {"targets": []},
+            "file_watch": {
+                "active": true,
+                "roots": [{"path": "/w/p", "recursive": true}, {"path": "/w/q", "recursive": false}],
+                "skipped": [{"path": "/h", "reason": "broad"}],
+                "batches": 4,
+            },
+        }));
+        assert_eq!(
+            watching,
+            [
+                text::fill(
+                    text::WATCH_NOTE,
+                    &[("roots", "/w/p, /w/q"), ("batches", "4")]
+                ),
+                text::fill(text::WATCH_SKIPPED_NOTE, &[("items", "/h broad")]),
+            ]
+        );
     }
 
     /// #1684: `tako lsp menu` は MCP の action=menu と同じ要求になり、人向けの表示は 1 項目 1 行で

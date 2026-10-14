@@ -6832,6 +6832,7 @@ dependencies = [
  "image",
  "libc",
  "lsp-types",
+ "notify",
  "pathdiff",
  "qrcode",
  "rust-embed",
@@ -6853,6 +6854,7 @@ version = "0.8.33"
 dependencies = [
  "alacritty_terminal",
  "futures",
+ "globset",
  "ignore",
  "libc",
  "polling",

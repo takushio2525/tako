@@ -16,6 +16,7 @@
 //! - [`menu`] — 右クリックメニューの LSP 項目（S7 / #1684）の出し分け（能力・位置の種類・選択）
 //! - [`hover`] — ホバー（S4 / #1681）の応答の読み取り（3 形）・本文の上限・範囲・能力
 //! - [`xref`] — 参照検索・呼び出し階層・型階層（S8 / #1685）の応答の読み取り・ツリーの展開状態・ペインごとの保持
+//! - [`watch`] — tako の外で変わったファイルの通知（`workspace/didChangeWatchedFiles`。#2034）の登録・照合・根
 
 pub mod completion;
 pub mod diagnostic;
@@ -29,4 +30,5 @@ pub mod root;
 pub mod servers;
 pub mod state;
 pub mod sync;
+pub mod watch;
 pub mod xref;
