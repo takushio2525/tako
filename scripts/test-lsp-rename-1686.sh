@@ -185,6 +185,7 @@ rename_steps() {
   check_eq "status / applicable / applied" "dry-run True False" \
     "$(printf '%s' "$D1" | json 'd["status"]+" "+str(d["applicable"])+" "+str(d["applied"])')"
   check_eq "ファイル数・箇所数" "1 2" "$(printf '%s' "$D1" | json 'str(d["file_count"])+" "+str(d["edits"])')"
+  check_eq "今の名前（placeholder。範囲だけを返すサーバは範囲の字面）" "value" "$(printf '%s' "$D1" | json 'd["placeholder"]')"
   check_eq "場所（行:桁:前）= Value::new と values を含まない" "9:8:value 11:10:value" \
     "$(printf '%s' "$D1" | json '" ".join(str(x["line"])+":"+str(x["column"])+":"+x["old"] for x in d["files"][0]["places"])')"
   after="$(sha "$p/src/main.rs")"
@@ -201,7 +202,7 @@ rename_steps() {
     "$(printf '%s' "$Y" | json 'd["status"]+" "+str(d["applied"])+" "+str(d["changes"])+" "+str(d["document"]["undo_depth"])')"
   check_eq "ディスクは書き換えない" "$before" "$(sha "$p/src/main.rs")"
   DIFF="$("$TAKO_BIN" edit diff --pane "$SRC" 2>/dev/null)"
-  check_eq "編集バッファの差分（- / + の行）" "-    let value = Value::new();|-    drop((value, values));|+    let item = Value::new();|+    drop((item, values));" \
+  check_eq "編集バッファの差分（- / + の行）" "-    let value = Value::new();|+    let item = Value::new();|-    drop((value, values));|+    drop((item, values));" \
     "$(printf '%s' "$DIFF" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("|".join(l for l in d["diff"]["unified"].splitlines() if l[:1] in "+-" and l[:3] not in ("+++","---")))' 2>/dev/null)"
   "$TAKO_BIN" edit undo --pane "$SRC" >/dev/null 2>&1
   check_eq "undo 1 回で差分 0（編集バッファがディスクとバイト一致）" "True 0" \
@@ -266,7 +267,7 @@ if [ -z "$REAL_RA" ]; then
 else
   R4="$TMP/real"
   make_project "$R4"
-  echo "== ④ 実の rust-analyzer（$("$REAL_RA" --version 2>/dev/null | head -1)） =="
+  echo "== ④ 実の rust-analyzer（$(RUSTUP_HOME="$REAL_RUSTUP_HOME" CARGO_HOME="$REAL_CARGO_HOME" "$REAL_RA" --version 2>/dev/null | head -1)） =="
   open_project "$TMP/real.log" "$R4" \
     TAKO_LSP_BIN_RUST_ANALYZER="$REAL_RA" \
     RUSTUP_HOME="$REAL_RUSTUP_HOME" CARGO_HOME="$REAL_CARGO_HOME" CARGO_BUILD_JOBS=2 \

@@ -3390,7 +3390,14 @@ impl Shared {
                 let detail = match process.request(core::PREPARE_METHOD, at.clone(), remaining()) {
                     Ok(answer) => match core::parse_prepare(&answer) {
                         core::Prepared::Accepted { placeholder: shown } => {
-                            placeholder = shown;
+                            // 範囲だけの答え（rust-analyzer）は、その範囲の字面を今の名前にする
+                            placeholder = shown.or_else(|| {
+                                let (start, end) = core::prepare_range(&answer)?;
+                                let index = position::LineIndex::new(&base);
+                                let from = index.byte_offset(start.0, start.1);
+                                let to = index.byte_offset(end.0, end.1);
+                                base.get(from..to).map(str::to_string)
+                            });
                             break;
                         }
                         core::Prepared::Rejected => None,

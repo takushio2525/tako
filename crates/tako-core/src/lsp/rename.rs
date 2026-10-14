@@ -86,6 +86,20 @@ pub fn parse_prepare(result: &Value) -> Prepared {
     }
 }
 
+/// `prepareRename` の答えの範囲（`Range` そのもの か `{ range, placeholder }`）の LSP の座標。
+/// `placeholder` を付けないサーバ（rust-analyzer は範囲だけを返す）の今の名前は、この範囲の字面で補う
+pub fn prepare_range(result: &Value) -> Option<((usize, usize), (usize, usize))> {
+    let range = result.get("range").unwrap_or(result);
+    let at = |key: &str| -> Option<(usize, usize)> {
+        let p = range.get(key)?;
+        Some((
+            usize::try_from(p.get("line")?.as_u64()?).ok()?,
+            usize::try_from(p.get("character")?.as_u64()?).ok()?,
+        ))
+    };
+    Some((at("start")?, at("end")?))
+}
+
 /// ファイル 1 つぶんの書き換え（`WorkspaceEdit` の 1 項目）
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileEdits {
@@ -306,6 +320,19 @@ mod tests {
         for ok in ["item", "1abc", "a-b", "名前", "_"] {
             assert_eq!(check_new_name(ok), Ok(()), "{ok}");
         }
+    }
+
+    #[test]
+    fn prepare_の範囲は2形とも読み_既定の振る舞いは範囲を持たない() {
+        let range =
+            json!({ "start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 9} });
+        assert_eq!(prepare_range(&range), Some(((2, 4), (2, 9))));
+        assert_eq!(
+            prepare_range(&json!({ "range": range, "placeholder": "x" })),
+            Some(((2, 4), (2, 9)))
+        );
+        assert_eq!(prepare_range(&json!({ "defaultBehavior": true })), None);
+        assert_eq!(prepare_range(&Value::Null), None);
     }
 
     #[test]

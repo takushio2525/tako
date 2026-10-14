@@ -379,3 +379,24 @@ fn 握手で名前の変更の受け方を申告する() {
         json!({ "documentChanges": true, "resourceOperations": [] })
     );
 }
+
+/// `placeholder` を付けずに範囲だけを返すサーバ（rust-analyzer の形）は、その範囲の字面を今の名前にする
+#[test]
+fn 範囲だけの_prepare_は字面を今の名前にする() {
+    let scratch = Scratch::new("range-only");
+    let path = scratch.write("src/main.rs", MAIN);
+    let rules = json!([{
+        "method": "textDocument/prepareRename",
+        "result": {
+            "start": { "line": 3, "character": 8 },
+            "end": { "line": 3, "character": 13 },
+        },
+    }]);
+    let manager = LspManager::new(config(&scratch, Some(&rules), &[]));
+    let answer = manager
+        .rename(&request(&path, MAIN, "value", 0, "item"))
+        .expect("答えが来る");
+    assert_eq!(answer.placeholder.as_deref(), Some("value"));
+    assert_eq!(answer.edit_count(), 3);
+    manager.shutdown_all(Duration::from_secs(2));
+}
