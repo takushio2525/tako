@@ -7,12 +7,17 @@
  *   - 本文（.md / .mdx）に書いた Markdown の表が、ビルド出力で `<table>` として描かれている
  *     （ページごとに「本文の表の数 ≦ 出力の `<table>` の数」）
  *   - 出力の本文に、描かれなかった表の区切り行（`|---|`）が文字のまま残っていない
+ *   - コマンド（<Cmd> = `.tk-cmd-text`）に全角ダッシュ（U+2014 / U+2013）が 1 つも無い（#2088）
+ *   - コード（`<code>` / `<pre>`）に、フラグのように英字が続く全角ダッシュ（`—pane` など）が無い（#2088）。
+ *     数の範囲（`0.0–1.0`）のように意図して書いたものは英字が続かないので対象外
  *
  * 2026-10 に、Astro 6.4 で `markdown.gfm` の既定が未設定になり、Starlight が足す
  * @astrojs/mdx 5.0.x がそれを「無効」と読んだため、.mdx のページだけ表が `| a | b |` の
  * まま公開されていた（.md は Astro 本体の処理系が既定で GFM を有効にするので無事だった）。
- * ビルドも他の検査も通ってしまう壊れ方なので、ここで表の数を数えて落とす。
- * 直し方は astro.config.mjs の mdx({ gfm: true })。
+ * 同じ時期に、.mdx の自動整形（smartypants）が <Cmd> の子の `--` を全角ダッシュに置き換え、
+ * `brew install --cask …` が `—cask` のまま公開されてコピーしても動かなかった（#2088）。
+ * どちらもビルドも他の検査も通ってしまう壊れ方なので、ここで落とす。
+ * 直し方は astro.config.mjs の mdx({ gfm: true, smartypants: false })。
  */
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -103,10 +108,40 @@ for (const file of walk(CONTENT, ['.md', '.mdx'])) {
 	}
 }
 
-console.log(`対象: dist（本文 ${pages} ページ / Markdown の表 ${tables} 個）`);
+// コマンドとコードの中の全角ダッシュ（#2088）。本文に対応するページに限らず、出力の全ページを見る
+const DASH = /[\u2014\u2013]/;
+const FLAG_DASH = /[\u2014\u2013][A-Za-z]/;
+const textOf = (fragment) =>
+	fragment
+		.replace(/<[^>]+>/g, '')
+		.replace(/&amp;/g, '&')
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&#x2014;|&mdash;/g, '\u2014')
+		.replace(/&#x2013;|&ndash;/g, '\u2013');
+let commands = 0;
+for (const out of walk(DIST, ['.html'])) {
+	const html = readFileSync(out, 'utf8');
+	const rel = relative(DOCS, out);
+	for (const m of html.matchAll(/<code class="tk-cmd-text[^"]*"[^>]*>([\s\S]*?)<\/code>/g)) {
+		commands++;
+		const text = textOf(m[1]).trim();
+		if (DASH.test(text)) problems.push(`${rel}: コマンドに全角ダッシュが入っている（コピーしても動かない）: ${text.slice(0, 80)}`);
+	}
+	for (const m of html.matchAll(/<(code|pre)\b(?![^>]*tk-cmd-text)[^>]*>([\s\S]*?)<\/\1>/g)) {
+		const text = textOf(m[2]);
+		const hit = text.match(FLAG_DASH);
+		if (hit) {
+			const at = text.indexOf(hit[0]);
+			problems.push(`${rel}: コードの中で \`--\` が全角ダッシュに化けている: …${text.slice(Math.max(0, at - 20), at + 20).trim()}…`);
+		}
+	}
+}
+
+console.log(`対象: dist（本文 ${pages} ページ / Markdown の表 ${tables} 個 / コマンド ${commands} 個）`);
 if (problems.length > 0) {
 	for (const p of problems) console.error(`NG: ${p}`);
-	console.error('直し方: .mdx の表なら astro.config.mjs の mdx({ gfm: true }) が効いているかを見る（#2082）');
+	console.error('直し方: .mdx の表なら astro.config.mjs の mdx({ gfm: true })（#2082）、全角ダッシュなら同じ所の smartypants: false（#2088）が効いているかを見る');
 	process.exit(1);
 }
-console.log('OK: 本文の Markdown の表はすべて <table> として描かれ、区切り行が文字のまま残っていない');
+console.log('OK: 本文の Markdown の表はすべて <table> として描かれ、区切り行が文字のまま残っておらず、コマンドとコードに全角ダッシュが無い');
