@@ -86,7 +86,12 @@ cleanup() {
   [ -n "$APP_PID" ] && stop_isolated_gui "$APP_PID"
   tmx kill-server >/dev/null 2>&1 || true
   tmux -L "$TMUX_SOCKET-gui" kill-server >/dev/null 2>&1 || true
-  [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
+  # ソケット名を明示した起動は自分で畳む（#1192。サーバーを止めてもファイルが残る）
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET" "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET-gui"
+  if [ -n "$FAKE_PID" ]; then
+    kill "$FAKE_PID" 2>/dev/null
+    wait "$FAKE_PID" 2>/dev/null
+  fi
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: $TMP を残した）"; else rm -rf "$TMP"; fi
 }
 trap cleanup EXIT
