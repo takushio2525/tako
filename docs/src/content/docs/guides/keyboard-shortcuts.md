@@ -182,3 +182,5 @@ Windows では Command キーにあたる修飾が Win キーになり、多く�
 | ファイルツリーの行を <kbd>Cmd</kbd>+クリック（Windows は <kbd>Ctrl</kbd>+クリック）/ <kbd>Shift</kbd>+クリック | 行を足す・外す / 範囲を選ぶ（まとめてコピー・切り取り・ゴミ箱・ドラッグ） |
 
 Windows は Win キーを OS が使うため、リンクを開く修飾キーだけ <kbd>Ctrl</kbd> になります（ほかのマウス操作は両 OS 共通です）。クリックを使わずに開きたいときは `tako file open-in-tako <path>`、リンクとして認識されている範囲を確認したいときは `tako links` が使えます。
+
+<!-- #2084 の検証用（docs だけの PR で Rust のジョブが skip されるか）。merge しない -->
