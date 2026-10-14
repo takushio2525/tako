@@ -3,29 +3,6 @@
  * 共有の部品（tako-ui.css / motion.css）は変えず、ここで足す。
  */
 
-/* ターミナルの出力が下から積まれて、古い行が上へ流れて消える（手順で増える行は高さ 0 から開く） */
-.tk-qs-log {
-	display: flex;
-	flex-direction: column;
-	justify-content: flex-end;
-	height: 100%;
-	overflow: hidden;
-}
-/* 行は縮ませない（縮むと折り返した行が次の行に重なる）。はみ出した古い行は上から切れる */
-.tk-qs-log > * {
-	flex-shrink: 0;
-}
-[data-motion] .tk-qs-log > [data-at] {
-	max-height: 4.8em;
-	overflow: hidden;
-	transition-property: opacity, transform, max-height, min-height;
-	transition-duration: 0.4s, 0.5s, 0.45s, 0.45s;
-	transition-timing-function: var(--tako-ease);
-}
-[data-motion] .tk-qs-log > [data-at]:not(.is-on) {
-	max-height: 0;
-	min-height: 0;
-}
 /* 「残り」の行（人が次にやること）を薄い黄色で目立たせる */
 .tk-qs-hl {
 	background: rgb(249 226 175 / 0.08);
@@ -85,35 +62,6 @@
 	background: #1e66f5;
 	color: #fff;
 	font-weight: 700;
-}
-
-/* 右パネルを引き出しのように右から開く（開くまでは幅 0 で、本体が全幅を使う） */
-.tk-qs-drawer {
-	flex: none;
-	display: flex;
-	justify-content: flex-end;
-	width: min(42cqi, 21em);
-	overflow: hidden;
-}
-.tk-qs-drawer > .tk-right {
-	flex: none;
-	width: min(42cqi, 21em);
-	max-width: none;
-}
-@container tkframe (max-width: 30rem) {
-	.tk-qs-drawer,
-	.tk-qs-drawer > .tk-right {
-		width: 58cqi;
-	}
-}
-[data-motion] .tk-qs-drawer[data-at] {
-	transition-property: opacity, width;
-	transition-duration: 0.3s, 0.65s;
-	transition-timing-function: var(--tako-ease);
-}
-[data-motion] .tk-qs-drawer[data-at]:not(.is-on) {
-	width: 0;
-	transform: none;
 }
 
 /* 冒頭の道のり（4 つの場面への入口） */
