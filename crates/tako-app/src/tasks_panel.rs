@@ -320,6 +320,9 @@ pub(crate) struct TasksPanel {
     pub snapshot: TasksSnapshot,
     /// 一覧更新の background ジョブの状態（#2031）
     pub list_poll: ListPoll,
+    /// 走っている完了・却下の書き換えの数（#2052。background で書くので、直後に一覧を読む
+    /// 検査はこれが 0 になるまで待つ）
+    pub status_inflight: usize,
     /// **その場で展開している 1 件**の id（`None` = どれも開いていない。#1479）。
     ///
     /// 先頭へ落とさないのが要点。旧実装は「選択が無ければ一覧の先頭」へ落として
@@ -559,6 +562,9 @@ pub(crate) struct ListPoll {
     pub applied: u64,
     /// ジョブが置き場を読んだ回数（版が同じ回は数えない。セルフテストが読みの有無を見る）
     pub reads: u64,
+    /// Context の無い dispatch の内側（`tako panel` で tasks を開いた）で頼まれた引き直し
+    /// （#2052。dispatch の後処理が [`TakoApp::spawn_user_tasks_list`] へ渡す）
+    pub pending: bool,
 }
 
 impl std::fmt::Debug for ListPoll {
@@ -722,7 +728,12 @@ impl TakoApp {
         }
     }
 
-    /// タスクの状態を変える（完了 / 却下）。成功したらその場で一覧を引き直す
+    /// タスクの状態を変える（完了 / 却下）。成功したらその場で一覧を引き直す。
+    ///
+    /// #2052: 書き換え（YAML の読み書き）は UI スレッドで待たない。IPC の `tako todo done` と
+    /// 同じ `prepare_offload` → background → 着地（開いていた行を畳む）を通す
+    /// （`dispatch_off_ui`）。A/B の `TAKO_2052_LEGACY=1` は `prepare_offload` が `None` を返し、
+    /// 修正前と同じ同期の dispatch になる
     pub(crate) fn user_task_set_status(&mut self, id: &str, action: &str, cx: &mut Context<Self>) {
         let request = Request::UserTask {
             action: action.to_string(),
@@ -743,27 +754,46 @@ impl TakoApp {
             pane: None,
             caller_role: None,
         };
-        match tako_control::dispatch(self, request, PaneOrigin::User) {
-            Ok(_) => {
-                // 畳むのは dispatch 側（#1479。CLI / MCP から閉じたときも同じ 1 実装が
-                // 通る）。ここでは返答フォームだけを初期化する
-                self.user_tasks.reset_form();
-                self.user_tasks.notice = None;
-                self.refresh_user_tasks();
+        let id = id.to_string();
+        let op = if action == "done" {
+            "user_task_done"
+        } else {
+            "user_task_dismiss"
+        };
+        self.user_tasks.status_inflight += 1;
+        self.dispatch_off_ui(request, PaneOrigin::User, cx, move |app, result, cx| {
+            app.user_tasks.status_inflight = app.user_tasks.status_inflight.saturating_sub(1);
+            match result {
+                Ok(_) => {
+                    // 畳むのは dispatch 側（#1479。CLI / MCP から閉じたときも同じ 1 実装が
+                    // 通る）。ここでは返答フォームだけを初期化する。#2052: 書き換えを待つ間に
+                    // 別の行を開いていたら、その行のフォームには触らない（打ちかけを消さない）
+                    if app
+                        .user_tasks
+                        .expanded
+                        .as_deref()
+                        .is_none_or(|open| open == id)
+                    {
+                        app.user_tasks.reset_form();
+                        app.user_tasks.notice = None;
+                    }
+                    // 書いた直後の一覧（#2052: 引き直しも background。A/B は修正前の同期）
+                    if tako_core::probe::issue2052_legacy() {
+                        app.refresh_user_tasks();
+                    } else {
+                        app.spawn_user_tasks_list(cx);
+                    }
+                }
+                Err(e) => app.notify_ui_dispatch_failed(
+                    NoticeArea::UserTasks,
+                    NoticeArm::Issue1450B2,
+                    op,
+                    Some(&id),
+                    &e,
+                ),
             }
-            Err(e) => self.notify_ui_dispatch_failed(
-                NoticeArea::UserTasks,
-                NoticeArm::Issue1450B2,
-                if action == "done" {
-                    "user_task_done"
-                } else {
-                    "user_task_dismiss"
-                },
-                Some(id),
-                &e,
-            ),
-        }
-        cx.notify();
+            cx.notify();
+        });
     }
 
     /// 返答を送る（`respond` = 積む + 起票 master へ配送。配送は B1 の 1 実装）。

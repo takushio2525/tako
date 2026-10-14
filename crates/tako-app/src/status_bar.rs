@@ -1281,6 +1281,11 @@ impl TakoApp {
             if view == PanelView::Git {
                 self.refresh_git(cx);
             }
+            // #2052: tasks は開いた瞬間に一覧を出す（タブのクリックと同じ。2 秒ループを待たない。
+            // 読みは background）。A/B の `TAKO_2052_LEGACY=1` は修正前と同じ引き直さない形
+            if view == PanelView::Tasks && !tako_core::probe::issue2052_legacy() {
+                self.spawn_user_tasks_list(cx);
+            }
         }
         cx.notify();
     }

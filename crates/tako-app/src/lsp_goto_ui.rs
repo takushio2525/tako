@@ -234,6 +234,8 @@ impl TakoApp {
                     OffloadContinuation::Probed(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#1694 の横断検索の続き）
                     OffloadContinuation::WorkspaceSearch(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2052 の完了・却下の続き）
+                    OffloadContinuation::UserTaskStatus(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

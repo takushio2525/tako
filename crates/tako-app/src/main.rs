@@ -7352,6 +7352,10 @@ impl TakoApp {
         if self.tmux_refresh_pending {
             self.spawn_tmux_refresh(cx);
         }
+        // #2052: dispatch の内側（`tako panel` で tasks を開いた）で頼まれた一覧の引き直し
+        if std::mem::take(&mut self.user_tasks.list_poll.pending) {
+            self.spawn_user_tasks_list(cx);
+        }
         // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
         for (pane, data) in std::mem::take(&mut self.pending_writes) {
             if let Some(session) = self.terminals.get(&pane) {
@@ -25195,6 +25199,7 @@ impl UiStateHost for TakoApp {
         width: Option<f32>,
         view: Option<tako_control::protocol::PanelViewWire>,
     ) {
+        let tasks_was_open = self.panel_visible && self.panel_view == PanelView::Tasks;
         if let Some(visible) = visible {
             self.panel_visible = visible;
         }
@@ -25219,6 +25224,15 @@ impl UiStateHost for TakoApp {
         // tmux ビューを開いたら一覧を即時更新する（描画通知は dispatch ループが行う）
         if self.panel_visible && self.panel_view == PanelView::Fleet {
             self.refresh_tmux_data();
+        }
+        // #2052: tasks を開いたら一覧を引き直す（パレット・タブのクリックと同じ）。background の
+        // ジョブには Context が要るので、dispatch の後処理（`after_dispatch`）が消化する
+        if !tasks_was_open
+            && self.panel_visible
+            && self.panel_view == PanelView::Tasks
+            && !tako_core::probe::issue2052_legacy()
+        {
+            self.user_tasks.list_poll.pending = true;
         }
     }
 
@@ -31276,6 +31290,11 @@ mod self_test {
     mod tasks_tick_2031;
     #[cfg(feature = "visual-test")]
     use tasks_tick_2031::tasks_tick_visual;
+    /// #2052: パレット / `tako panel` で開いた瞬間の一覧・完了のボタンが UI スレッドで待たない（visual-test `tasks-offload`）
+    #[cfg(feature = "visual-test")]
+    mod tasks_offload_2052;
+    #[cfg(feature = "visual-test")]
+    use tasks_offload_2052::tasks_offload_visual;
     /// #1958: pane を省いた MCP のカードが呼び出し元ペインの実ピクセルに描かれる（visual-test `show-command-caller`）
     #[cfg(feature = "visual-test")]
     mod show_command_caller_1958;
@@ -35164,14 +35183,14 @@ mod self_test {
         tail.chars().rev().collect()
     }
 
-    /// 右パネル tasks の一覧更新（background のジョブ。#2031）が着き切るまで待つ。
-    /// `tick_user_tasks` は読みを background へ出すので、直後に一覧を読む検査はこれを挟む。
-    /// 着けば真（上限 10 秒。置き場の読みは ms 単位なので、届かなければ着地の取りこぼし）
+    /// 右パネル tasks の一覧更新（background のジョブ。#2031）と完了・却下の書き換え
+    /// （#2052）が着き切るまで待つ。どちらも background へ出すので、直後に一覧を読む検査は
+    /// これを挟む。着けば真（上限 10 秒。置き場の読みは ms 単位なので、届かなければ着地の取りこぼし）
     async fn settle_user_tasks(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> bool {
         for _ in 0..1000 {
             let idle = window
                 .update(cx, |app: &mut TakoApp, _, _| {
-                    app.user_tasks.list_poll.inflight == 0
+                    app.user_tasks.list_poll.inflight == 0 && app.user_tasks.status_inflight == 0
                 })
                 .unwrap_or(true);
             if idle {
@@ -45767,6 +45786,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2052: パレット / `tako panel` で開いた瞬間に一覧を引き直し、完了のボタンが
+                // UI スレッドで書き換えを待たないか（`TAKO_2031_INJECT=slow:<ミリ秒>` で遅らせて測る）
+                "tasks-offload" => {
+                    tasks_offload_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1946: たまり場の縮小サムネイル・親 master の見出し・幽霊の後始末・間引き
                 "background-drawer" => {
                     background_drawer_visual(any, window, cx).await;
@@ -45817,7 +45843,7 @@ mod self_test {
                          grid-bench / preview-leak / chat-leak / preview-code / \
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
-                         tasks-accordion / tasks-tick / shelve-tab / no-emoji / editor-keys / \
+                         tasks-accordion / tasks-tick / tasks-offload / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
@@ -90049,9 +90075,13 @@ mod self_test {
                 );
 
                 // (f) 完了すると一覧から消え、`tako todo list` と一致する
+                // （#2052: 書き換えと引き直しは background なので、着き切ってから読む）
+                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                    app.user_task_set_status(&id150, "done", cx);
+                });
+                settle_user_tasks(window, cx).await;
                 let done150 = window
                     .update(cx, |app: &mut TakoApp, _, cx| {
-                        app.user_task_set_status(&id150, "done", cx);
                         let gone_from_panel = !app
                             .user_tasks
                             .snapshot

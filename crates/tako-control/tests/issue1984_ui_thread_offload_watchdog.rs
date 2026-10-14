@@ -46,6 +46,11 @@
 //!     `spawn_user_tasks_list` を通り、置き場の読みと解釈（`user_task_list_load` / `parse_list`）は
 //!     background のブロックの中だけ。UI スレッドの観測（`user_task_list_observe`）は置き場に触らない。
 //!     読みは置き場の版の比較で省かれ（版は**読む前に**採る）、同期の引き直しは A/B のゲートの後ろだけ
+//! 11. #2052: IPC（CLI / MCP / PWA）の `tako todo list` と完了・却下（IPC と右パネルのボタン）は
+//!     `prepare_offload` の腕（`user_task_offload_prepare`）で background のジョブになる。UI スレッドの段
+//!     （準備・送達フローの観測・畳む着地）は置き場に触らず、読み書きは background の段だけ。
+//!     右パネルのボタンは `dispatch_off_ui` を通り、コマンドパレット（`toggle_panel_view`）と
+//!     `tako panel`（`set_panel` → `after_dispatch`）は tasks を開いた瞬間に一覧を background で引き直す
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -64,6 +69,7 @@ const AGENT_CLI: &str = "crates/tako-control/src/orchestrator/agent_cli.rs";
 const RIGHT_PANEL: &str = "crates/tako-app/src/right_panel.rs";
 const TASKS_PANEL: &str = "crates/tako-app/src/tasks_panel.rs";
 const TMUX_BACKEND: &str = "crates/tako-core/src/tmux_backend.rs";
+const STATUS_BAR: &str = "crates/tako-app/src/status_bar.rs";
 
 /// #1991: background のジョブ（`OffloadJob::GitWrite`）にする git の要求（`prepare_offload` の腕に
 /// 全部並んでいること。1 つでも漏れると、その要求は同期の腕 = UI スレッドで git を待つ）
@@ -1296,6 +1302,232 @@ fn scan_user_tasks_list(tasks: &str, dispatch: &str, right: &str) -> Vec<Offende
     out
 }
 
+/// 置き場（`user-tasks.yaml`）に触る口。UI スレッドの段がこれを呼ぶと置き場の読み書きを待つ（#2052）
+const USER_TASK_STORE: &[&str] = &[
+    "load_from(",
+    "list_at(",
+    "show_at(",
+    "set_status_at(",
+    "mutate_at(",
+    "reconcile_at(",
+    "reconcile_user_task_flows(",
+    "user_task_list_reply(",
+    "user_task_status_store(",
+    "store_stamp(",
+    "std::fs::",
+];
+
+/// 11. #2052: IPC の一覧と完了・却下は置き場を UI スレッドで読み書きしない
+fn scan_user_tasks_ipc(dispatch: &str, tasks: &str, status_bar: &str, main: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let mut push =
+        |file: &'static str, line: usize, why: String| out.push(Offender { file, line, why });
+    // `prepare_offload` の腕: list / done / dismiss を background の準備へ渡し、A/B のゲートを持ち、
+    // 最後の先取りの腕（`_ if …`）より前にある（後ろだと先取りの腕が拾って同期の dispatch になる）
+    match fn_window(dispatch, "pub fn prepare_offload(") {
+        None => push(
+            DISPATCH,
+            0,
+            "`prepare_offload` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            let arm = code_lines_with(&window, "Request::UserTask {");
+            let call = code_lines_with(&window, "user_task_offload_prepare(");
+            let catch_all = code_lines_with(&window, "_ if !tako_core::probe::issue1984_legacy()");
+            match (arm.first(), call.first()) {
+                (Some(&a), Some(&c)) if a < c && c - a <= 6 => {
+                    let guard = window[a..c].join("\n");
+                    for action in ["\"list\"", "\"done\"", "\"dismiss\""] {
+                        if !guard.contains(action) {
+                            push(
+                                DISPATCH,
+                                at + a,
+                                format!(
+                                    "`prepare_offload` の UserTask の腕が {action} を background へ出していない \
+                                     （その要求は UI スレッドの同期の dispatch で置き場を読み書きする = #2052）"
+                                ),
+                            );
+                        }
+                    }
+                    if !guard.contains("issue2052_legacy()") {
+                        push(
+                            DISPATCH,
+                            at + a,
+                            "`prepare_offload` の UserTask の腕に A/B のゲート（`issue2052_legacy()`）が無い"
+                                .into(),
+                        );
+                    }
+                    if catch_all.first().is_some_and(|&k| k < a) {
+                        push(
+                            DISPATCH,
+                            at + a,
+                            "`prepare_offload` の UserTask の腕が先取りの腕（`_ if …`）より後ろにある \
+                             （先取りの腕が拾って同期の dispatch になる = #2052）"
+                                .into(),
+                        );
+                    }
+                }
+                _ => push(
+                    DISPATCH,
+                    at,
+                    "`prepare_offload` が `tako todo list` / 完了・却下を background の準備 \
+                     （`user_task_offload_prepare`）へ渡していない（UI スレッドの同期の dispatch で \
+                     置き場を読み書きする = #2052）"
+                        .into(),
+                ),
+            }
+        }
+    }
+    // UI スレッドの段（準備・観測・畳む着地）は置き場に触らない
+    for head in [
+        "fn user_task_offload_prepare(",
+        "pub fn user_task_flows_observe(",
+        "fn user_task_status_finish(",
+    ] {
+        let Some((at, window)) = fn_window(dispatch, head) else {
+            push(
+                DISPATCH,
+                0,
+                format!("`{head}` が見つからない（走査が空振り）"),
+            );
+            continue;
+        };
+        for needle in USER_TASK_STORE {
+            for i in code_lines_with(&window, needle) {
+                push(
+                    DISPATCH,
+                    at + i,
+                    format!(
+                        "UI スレッドで走る `{head}` が `{needle}` で置き場に触っている（読み書きは \
+                         background の段 = `user_task_list_offload` / `user_task_status_store` へ。#2052）"
+                    ),
+                );
+            }
+        }
+    }
+    // background の段は host に触らず、置き場の読み書きを実際に行う
+    for (head, must) in [
+        ("fn user_task_list_offload(", "user_task_list_reply("),
+        ("fn user_task_status_store(", "set_status_at("),
+    ] {
+        let Some((at, window)) = fn_window(dispatch, head) else {
+            push(
+                DISPATCH,
+                0,
+                format!("`{head}` が見つからない（走査が空振り）"),
+            );
+            continue;
+        };
+        for needle in ["ControlHost", "host."] {
+            for i in code_lines_with(&window, needle) {
+                push(
+                    DISPATCH,
+                    at + i,
+                    format!(
+                        "background で走る `{head}` が `{needle}` に触っている（host は UI スレッドのもの。\
+                         観測は `user_task_flows_observe`、畳むのは `user_task_status_finish` へ）"
+                    ),
+                );
+            }
+        }
+        for needle in ["reconcile_user_task_flows(", must] {
+            if code_lines_with(&window, needle).is_empty() {
+                push(
+                    DISPATCH,
+                    at,
+                    format!(
+                        "background の `{head}` が `{needle}` を呼んでいない（配送が `sent` のまま固まるか、\
+                         読み書きが UI スレッドへ戻った = #2052）"
+                    ),
+                );
+            }
+        }
+    }
+    // 右パネルのボタン: IPC と同じ `dispatch_off_ui` を通り、同期の引き直しは A/B のゲートの後ろだけ
+    match fn_window(tasks, "pub(crate) fn user_task_set_status(") {
+        None => push(
+            TASKS_PANEL,
+            0,
+            "`user_task_set_status` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if code_lines_with(&window, "dispatch_off_ui(").is_empty() {
+                push(
+                    TASKS_PANEL,
+                    at,
+                    "完了・却下のボタン（`user_task_set_status`）が `dispatch_off_ui` を通っていない \
+                     （書き換えを UI スレッドで待つ = #2052）"
+                        .into(),
+                );
+            }
+            for i in code_lines_with(&window, "tako_control::dispatch(") {
+                push(
+                    TASKS_PANEL,
+                    at + i,
+                    "完了・却下のボタン（`user_task_set_status`）が `tako_control::dispatch(` を UI スレッドで \
+                     呼んでいる（YAML の書き換えを待つ = #2052）"
+                        .into(),
+                );
+            }
+            let gate = code_lines_with(&window, "issue2052_legacy()");
+            for i in code_lines_with(&window, "refresh_user_tasks(") {
+                if !gate.iter().any(|g| *g < i && i - *g <= 2) {
+                    push(
+                        TASKS_PANEL,
+                        at + i,
+                        "完了・却下の後の引き直し（`refresh_user_tasks`）が A/B のゲート（`issue2052_legacy()`）の \
+                         腕の外にある（置き場を UI スレッドで読む = #2052。`spawn_user_tasks_list` を通す）"
+                            .into(),
+                    );
+                }
+            }
+            if code_lines_with(&window, "spawn_user_tasks_list(").is_empty() {
+                push(
+                    TASKS_PANEL,
+                    at,
+                    "完了・却下の後に background の引き直し（`spawn_user_tasks_list`）が無い"
+                        .into(),
+                );
+            }
+        }
+    }
+    // コマンドパレット（`panel-tasks`）と `tako panel` は tasks を開いた瞬間に background で引き直す
+    for (file, src, head, must) in [
+        (
+            STATUS_BAR,
+            status_bar,
+            "pub(crate) fn toggle_panel_view(",
+            "spawn_user_tasks_list(",
+        ),
+        (MAIN, main, "fn set_panel(", "list_poll.pending = true"),
+        (MAIN, main, "fn after_dispatch(", "spawn_user_tasks_list("),
+    ] {
+        let Some((at, window)) = fn_window(src, head) else {
+            push(file, 0, format!("`{head}` が見つからない（走査が空振り）"));
+            continue;
+        };
+        if code_lines_with(&window, must).is_empty() {
+            push(
+                file,
+                at,
+                format!(
+                    "`{head}` に `{must}` が無い（tasks を開いても一覧を引き直さず、最大 2 秒古い一覧が出る = #2052）"
+                ),
+            );
+        }
+        for i in code_lines_with(&window, "refresh_user_tasks(") {
+            push(
+                file,
+                at + i,
+                format!(
+                    "`{head}` が同期の引き直し（`refresh_user_tasks`）を呼んでいる（置き場を UI スレッドで読む = #2052）"
+                ),
+            );
+        }
+    }
+    out
+}
+
 struct Sources {
     dispatch: String,
     main: String,
@@ -1304,6 +1536,7 @@ struct Sources {
     right_panel: String,
     tmux_backend: String,
     tasks_panel: String,
+    status_bar: String,
 }
 
 impl Sources {
@@ -1317,6 +1550,7 @@ impl Sources {
             right_panel: read(&root, RIGHT_PANEL),
             tmux_backend: read(&root, TMUX_BACKEND),
             tasks_panel: read(&root, TASKS_PANEL),
+            status_bar: read(&root, STATUS_BAR),
         }
     }
 
@@ -1337,6 +1571,12 @@ impl Sources {
             &self.tasks_panel,
             &self.dispatch,
             &self.right_panel,
+        ));
+        v.extend(scan_user_tasks_ipc(
+            &self.dispatch,
+            &self.tasks_panel,
+            &self.status_bar,
+            &self.main,
         ));
         v
     }
@@ -1461,6 +1701,45 @@ fn 走査が空振りしていない() {
             "observe_user_task_deliveries(",
         ),
         (&s.dispatch, "pub fn user_task_list_load(", "load_from("),
+        // #2052
+        (
+            &s.dispatch,
+            "pub fn prepare_offload(",
+            "user_task_offload_prepare(",
+        ),
+        (
+            &s.dispatch,
+            "fn user_task_offload_prepare(",
+            "user_task_flows_observe(",
+        ),
+        (
+            &s.dispatch,
+            "pub fn user_task_flows_observe(",
+            "prompt_delivery_state(",
+        ),
+        (
+            &s.dispatch,
+            "fn user_task_status_finish(",
+            "set_user_task_expanded(",
+        ),
+        (
+            &s.dispatch,
+            "fn user_task_list_offload(",
+            "user_task_list_reply(",
+        ),
+        (&s.dispatch, "fn user_task_status_store(", "set_status_at("),
+        (
+            &s.tasks_panel,
+            "pub(crate) fn user_task_set_status(",
+            "dispatch_off_ui(",
+        ),
+        (
+            &s.status_bar,
+            "pub(crate) fn toggle_panel_view(",
+            "PanelView::Git",
+        ),
+        (&s.main, "fn set_panel(", "PanelView::Fleet"),
+        (&s.main, "fn after_dispatch(", "spawn_tmux_refresh("),
     ] {
         let (_, w) = fn_window(src, head).unwrap_or_else(|| panic!("{head} の窓"));
         assert!(
@@ -1967,6 +2246,146 @@ fn 逆戻りを名指しできる() {
         scan_user_tasks_list(&s.tasks_panel, &d, &s.right_panel),
         DISPATCH,
         "版（`store_stamp`）より先に読んでいる",
+    );
+
+    // ㉝ #2052: `tako todo list` / 完了・却下を修正前の同期の dispatch へ戻す（腕が None を返す）
+    let d = inject(
+        &s.dispatch,
+        "            Some(user_task_offload_prepare(host, request))",
+        "            None",
+        "㉝",
+    );
+    expect_named(
+        "一覧と完了・却下を同期の dispatch へ",
+        scan_user_tasks_ipc(&d, &s.tasks_panel, &s.status_bar, &s.main),
+        DISPATCH,
+        "`user_task_offload_prepare`）へ渡していない",
+    );
+
+    // ㉞ #2052: 完了・却下だけ同期の dispatch へ戻す（腕が list しか拾わない）
+    let d = inject(
+        &s.dispatch,
+        "            if matches!(action.as_str(), \"list\" | \"done\" | \"dismiss\")",
+        "            if matches!(action.as_str(), \"list\")",
+        "㉞",
+    );
+    expect_named(
+        "完了・却下を同期の dispatch へ",
+        scan_user_tasks_ipc(&d, &s.tasks_panel, &s.status_bar, &s.main),
+        DISPATCH,
+        "\"done\" を background へ出していない",
+    );
+
+    // ㉟ #2052: 準備（UI スレッド）で一覧を組む（置き場を UI スレッドで読む）
+    let d = inject(
+        &s.dispatch,
+        "            let filter =\n                user_task_filter(status.as_deref(), kind.as_deref(), project.clone(), *all)?;\n            Ok(OffloadJob::UserTaskList(",
+        "            let filter =\n                user_task_filter(status.as_deref(), kind.as_deref(), project.clone(), *all)?;\n            let _now = user_task_list_reply(&path, &filter, None);\n            Ok(OffloadJob::UserTaskList(",
+        "㉟",
+    );
+    expect_named(
+        "準備で一覧を組む",
+        scan_user_tasks_ipc(&d, &s.tasks_panel, &s.status_bar, &s.main),
+        DISPATCH,
+        "`fn user_task_offload_prepare(` が `user_task_list_reply(`",
+    );
+
+    // ㊱ #2052: 送達フローの観測（UI スレッド）で置き場を読む（修正前の決着待ちの宛先を知る形）
+    let d = inject(
+        &s.dispatch,
+        "    UserTaskFlows(\n        host.workspace()",
+        "    let _ = crate::user_tasks::load_from(Path::new(\"user-tasks.yaml\"));\n    UserTaskFlows(\n        host.workspace()",
+        "㊱",
+    );
+    expect_named(
+        "観測で置き場を読む",
+        scan_user_tasks_ipc(&d, &s.tasks_panel, &s.status_bar, &s.main),
+        DISPATCH,
+        "`pub fn user_task_flows_observe(` が `load_from(`",
+    );
+
+    // ㊲ #2052: 書き換えを着地（UI スレッド）へ移す
+    let d = inject(
+        &s.dispatch,
+        "    let UserTaskStatusLanding { id, value } = landing;",
+        "    let UserTaskStatusLanding { id, value } = landing;\n    let _ = crate::user_tasks::set_status_at(Path::new(\"user-tasks.yaml\"), &id, Default::default());",
+        "㊲",
+    );
+    expect_named(
+        "書き換えを着地へ",
+        scan_user_tasks_ipc(&d, &s.tasks_panel, &s.status_bar, &s.main),
+        DISPATCH,
+        "`fn user_task_status_finish(` が `set_status_at(`",
+    );
+
+    // ㊳ #2052: 右パネルの完了・却下のボタンを修正前の同期の dispatch へ戻す
+    let tp = inject(
+        &s.tasks_panel,
+        "        self.user_tasks.status_inflight += 1;\n        self.dispatch_off_ui(",
+        "        let _ = tako_control::dispatch(self, request.clone(), PaneOrigin::User);\n        self.user_tasks.status_inflight += 1;\n        self.dispatch_off_ui(",
+        "㊳",
+    );
+    expect_named(
+        "完了・却下のボタンを同期へ",
+        scan_user_tasks_ipc(&s.dispatch, &tp, &s.status_bar, &s.main),
+        TASKS_PANEL,
+        "`tako_control::dispatch(` を UI スレッドで",
+    );
+
+    // ㊴ #2052: 完了・却下の後の引き直しを A/B のゲートの外で同期にする
+    let tp = inject(
+        &s.tasks_panel,
+        "                    if tako_core::probe::issue2052_legacy() {\n                        app.refresh_user_tasks();",
+        "                    let _ = 0;\n                    {\n                        app.refresh_user_tasks();",
+        "㊴",
+    );
+    expect_named(
+        "完了・却下の後の引き直しを同期へ",
+        scan_user_tasks_ipc(&s.dispatch, &tp, &s.status_bar, &s.main),
+        TASKS_PANEL,
+        "ゲート（`issue2052_legacy()`）の 腕の外",
+    );
+
+    // ㊵ #2052: コマンドパレットで tasks を開いても引き直さない（修正前の形）
+    let sb = inject(
+        &s.status_bar,
+        "            if view == PanelView::Tasks && !tako_core::probe::issue2052_legacy() {\n                self.spawn_user_tasks_list(cx);\n            }",
+        "",
+        "㊵",
+    );
+    expect_named(
+        "パレットで開いても引き直さない",
+        scan_user_tasks_ipc(&s.dispatch, &s.tasks_panel, &sb, &s.main),
+        STATUS_BAR,
+        "`pub(crate) fn toggle_panel_view(` に `spawn_user_tasks_list(` が無い",
+    );
+
+    // ㊶ #2052: パレットの引き直しを同期（UI スレッドで置き場を読む）にする
+    let sb = inject(
+        &s.status_bar,
+        "                self.spawn_user_tasks_list(cx);\n            }\n        }\n        cx.notify();",
+        "                self.spawn_user_tasks_list(cx);\n                self.refresh_user_tasks();\n            }\n        }\n        cx.notify();",
+        "㊶",
+    );
+    expect_named(
+        "パレットの引き直しを同期へ",
+        scan_user_tasks_ipc(&s.dispatch, &s.tasks_panel, &sb, &s.main),
+        STATUS_BAR,
+        "同期の引き直し（`refresh_user_tasks`）を呼んでいる",
+    );
+
+    // ㊷ #2052: `tako panel` で tasks を開いても引き直さない
+    let m = inject(
+        &s.main,
+        "            self.user_tasks.list_poll.pending = true;",
+        "            let _ = ();",
+        "㊷",
+    );
+    expect_named(
+        "tako panel で開いても引き直さない",
+        scan_user_tasks_ipc(&s.dispatch, &s.tasks_panel, &s.status_bar, &m),
+        MAIN,
+        "`fn set_panel(` に `list_poll.pending = true` が無い",
     );
 
     // ⑩ check_qos を修正前の上限なしの ps へ戻す

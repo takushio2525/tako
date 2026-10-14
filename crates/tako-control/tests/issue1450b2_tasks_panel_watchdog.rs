@@ -180,7 +180,9 @@ fn scan_no_direct_store(src: &str) -> Vec<Offender> {
     }
     // 操作の 3 本（一覧 / 状態遷移 / 返答）はすべて dispatch を組む。
     // 一覧は同期（`refresh_user_tasks`）と background（`spawn_user_tasks_list`。#2031）の
-    // 2 つの入口があり、どちらも要求の組み立て（`user_tasks_list_request`）の 1 つを通る
+    // 2 つの入口があり、どちらも要求の組み立て（`user_tasks_list_request`）の 1 つを通る。
+    // 状態遷移は `dispatch_off_ui`（#2052）= IPC と同じ `prepare_offload` → 段の中身が
+    // dispatch と共有の 1 実装（A/B と background へ出さない要求は `tako_control::dispatch` そのもの）
     for (needle, builds) in [
         ("fn user_tasks_list_request(", "Request::UserTask"),
         ("fn refresh_user_tasks(", "user_tasks_list_request()"),
@@ -217,7 +219,7 @@ fn scan_no_direct_store(src: &str) -> Vec<Offender> {
                 if needle == "fn user_tasks_list_request(" {
                     continue;
                 }
-                if !body.contains("tako_control::dispatch") {
+                if !body.contains("tako_control::dispatch") && !body.contains("dispatch_off_ui(") {
                     out.push(Offender {
                         file: TASKS_PANEL,
                         line: at,
