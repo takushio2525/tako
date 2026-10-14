@@ -1,0 +1,50 @@
+---
+/**
+ * tako のパレット（⌘K と同じ器）の再現（#2061）。TakoWindow の slot="overlay" に置く。
+ * ファイルメニューの「リモート接続…」は、この器で ~/.ssh/config の Host を並べる。
+ *
+ *   <Palette slot="overlay" at="1" placeholder="SSH ホストを選ぶ（~/.ssh/config）"
+ *     items={[{ label: 'dev-server (dev.example.com)', selAt: '1' }]} />
+ *
+ * 寸法と行の見た目の正本は crates/tako-app/src/overlays.rs の render_command_palette
+ * （行頭の矢印 = assets/icons/ui/jump_arrow.svg・選択行はアクセント 12% の地）と、
+ * 行の書式 main.rs の PaletteItem::label（「名前 (HostName) @User」）。
+ */
+import '../../styles/tako-ui-remote.css';
+import Icon from './Icon.astro';
+
+interface Item {
+	label: string;
+	/** 選ばれている手順（data-at の書き方）。省略で常に選ばれていない */
+	selAt?: string;
+}
+
+interface Props {
+	at?: string;
+	placeholder: string;
+	items: Item[];
+}
+
+const { at, placeholder, items } = Astro.props;
+---
+
+<div class="tk-pal" data-at={at} data-fx={at ? 'fade' : undefined}>
+	<div class="tk-pal-panel" data-at={at} data-fx={at ? 'down' : undefined}>
+		<div class="tk-pal-input">
+			<Icon name="search" />
+			<span>{placeholder}</span>
+		</div>
+		<div class="tk-pal-list">
+			{
+				items.map((it) => (
+					<span class="tk-pal-item" data-at={it.selAt} data-fx={it.selAt ? 'state' : undefined}>
+						<svg class="tk-ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+							<path d="M3 8h10M9 4l4 4-4 4" />
+						</svg>
+						<span class="tk-pal-label">{it.label}</span>
+					</span>
+				))
+			}
+		</div>
+	</div>
+</div>

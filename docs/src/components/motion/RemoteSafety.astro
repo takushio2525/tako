@@ -1,0 +1,37 @@
+---
+/**
+ * リモートの通り道と 2 つの関門の図（#2061）。サイトの配色（明暗）に乗る静止した図。
+ * 正本は .agent/requirements.md の FR-6 冒頭 / FR-6.1（127.0.0.1 だけで待ち、tailscale serve が tailnet 内へ HTTPS で出す）/
+ * FR-6.3（層① Tailscale のノード確認）/ FR-6.4〜6.5（層② 機器ペアリング。承認は Mac の画面だけ）。
+ */
+import '../../styles/tako-ui-remote.css';
+import Icon from './Icon.astro';
+---
+
+<figure class="tk-safety not-content" aria-label="スマホから Mac の tako までの通り道">
+	<div class="tk-safety-row">
+		<div class="tk-safety-node">
+			<Icon name="phone" class="tk-safety-ic" />
+			<b>あなたのスマホ</b>
+			<span>同じ Tailscale のアカウントでログインした端末だけが届く（層①）</span>
+		</div>
+		<div class="tk-safety-link" aria-hidden="true">
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+			<span>WireGuard で暗号化</span>
+		</div>
+		<div class="tk-safety-node is-tailnet">
+			<Icon name="lock" class="tk-safety-ic" />
+			<b>tailnet の中だけの固定 URL</b>
+			<span>Tailscale Serve が HTTPS で中継。インターネットには出ない</span>
+		</div>
+		<div class="tk-safety-link" aria-hidden="true">
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+			<span>Mac の中だけ</span>
+		</div>
+		<div class="tk-safety-node">
+			<Icon name="laptop" class="tk-safety-ic" />
+			<b>Mac の tako</b>
+			<span>127.0.0.1 だけで待つ。Mac の画面で承認した端末にだけ画面を渡す（層②）</span>
+		</div>
+	</div>
+</figure>

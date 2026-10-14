@@ -1,0 +1,34 @@
+---
+/**
+ * スマホ版 tako（PWA）の枠だけ（#2061）。Phone.astro と違い、上部の帯（マシン名・＋・タスク）を持たない。
+ * 画面ごとにヘッダーが違う場面（ペアリング・ペイン画面・ファイル）で、帯を子の中に描く。
+ *
+ *   <PhoneBare>
+ *     <div class="tk-phone-layer" data-at="1" data-fx="fade">…</div>
+ *   </PhoneBare>
+ *
+ * 見た目の正本は web/tako-remote/src/styles/main.css（配色は tako-ui.css の .tk-phone をそのまま使う）。
+ * slot="overlay"（Pointer）の座標はスマホの外枠が基準（0,0 = 左上・100,100 = 右下）。
+ */
+import '../../styles/tako-ui-remote.css';
+
+interface Props {
+	height?: number;
+	class?: string;
+}
+
+const { height = 31, class: className } = Astro.props;
+---
+
+<div class:list={['tk-ui', 'tk-frame', className]}>
+	<div class="tk-phone tk-phone-bare">
+		<div class="tk-phone-screen" style={`--h: ${height}em`}>
+			<div class="tk-phone-notch"><span>9:41</span><span class="tk-phone-island"></span><span>100%</span></div>
+			<div class="tk-phone-body">
+				<slot />
+			</div>
+		</div>
+		<!-- ポインターなどの座標はスマホの外枠が基準（中央寄せの余白を含めない） -->
+		<slot name="overlay" />
+	</div>
+</div>

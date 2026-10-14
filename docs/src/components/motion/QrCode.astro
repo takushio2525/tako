@@ -1,0 +1,66 @@
+---
+/**
+ * QR コードの「図案」（#2061）。tako remote start が出す QR の見た目だけを写す。
+ *
+ * **読めるコードではない**: 3 隅の位置検出の模様と、固定の種から作った点を並べただけで、
+ * 形式情報・誤り訂正を持たない（実在の URL もトークンも入っていない）。
+ * 実物の QR は恒久固定の URL だけを入れ、秘密を含まない（.agent/requirements.md FR-6.6）。
+ */
+interface Props {
+	/** 点の並びを変える種（同じ種なら同じ図案） */
+	seed?: number;
+	class?: string;
+}
+
+const { seed = 2061, class: className } = Astro.props;
+
+const N = 25;
+const Q = 2; // 余白（モジュール数）
+let s = seed >>> 0 || 1;
+const rand = () => {
+	// xorshift32（毎回同じ図案にするための固定の擬似乱数）
+	s ^= s << 13;
+	s >>>= 0;
+	s ^= s >>> 17;
+	s ^= s << 5;
+	s >>>= 0;
+	return s / 0xffffffff;
+};
+
+const inFinder = (x: number, y: number) =>
+	(x < 8 && y < 8) || (x >= N - 8 && y < 8) || (x < 8 && y >= N - 8);
+const inMark = (x: number, y: number) => x >= 9 && x <= 15 && y >= 9 && y <= 15;
+
+let d = '';
+const dot = (x: number, y: number, w = 1, h = 1) => {
+	d += `M${x + Q} ${y + Q}h${w}v${h}h${-w}z`;
+};
+// 位置検出の模様（外枠 7 × 7・内側 3 × 3）
+for (const [ox, oy] of [
+	[0, 0],
+	[N - 7, 0],
+	[0, N - 7],
+]) {
+	dot(ox, oy, 7, 1);
+	dot(ox, oy + 6, 7, 1);
+	dot(ox, oy + 1, 1, 5);
+	dot(ox + 6, oy + 1, 1, 5);
+	dot(ox + 2, oy + 2, 3, 3);
+}
+for (let y = 0; y < N; y++) {
+	for (let x = 0; x < N; x++) {
+		if (inFinder(x, y) || inMark(x, y)) continue;
+		if (rand() < 0.47) dot(x, y);
+	}
+}
+const size = N + Q * 2;
+---
+
+<svg class:list={['tk-qr', className]} viewBox={`0 0 ${size} ${size}`} aria-hidden="true" shape-rendering="crispEdges">
+	<path d={d} fill="#11111b"></path>
+	<rect x={9 + Q + 0.5} y={9 + Q + 0.5} width="6" height="6" rx="1.4" fill="#89b4fa"></rect>
+	<path
+		d={`M${12.5 + Q} ${10.8 + Q}a2 2 0 0 1 2 2v1.6h-4v-1.6a2 2 0 0 1 2-2z`}
+		fill="#11111b"
+		shape-rendering="geometricPrecision"></path>
+</svg>

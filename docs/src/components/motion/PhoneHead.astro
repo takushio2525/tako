@@ -1,0 +1,36 @@
+---
+/**
+ * スマホ版 tako のペイン一覧の上部（マシン名・「+ 新規」・人がやること・ファイル）（#2061）。
+ * PhoneBare の層の中で使う。並びと文言の正本は web/tako-remote/src/pages/panes.jsx の panes-header
+ * （更新のボタンは幅の都合で省く）。
+ */
+import Icon from './Icon.astro';
+
+interface Props {
+	machine?: string;
+	/** 人がやることの未完了件数 */
+	tasks?: number;
+	/** 「+ 新規」が押される手順（data-at の書き方） */
+	plusAt?: string;
+	/** ファイルのボタンが押される手順 */
+	filesAt?: string;
+}
+
+const { machine = 'my-mac', tasks, plusAt, filesAt } = Astro.props;
+---
+
+<div class="tk-phone-head tk-phone-head-list">
+	<span class="tk-machine"><i></i>{machine}</span>
+	<span class="tk-phone-actions">
+		<span class="tk-phone-btn tk-phone-new" data-at={plusAt} data-fx={plusAt ? 'mark' : undefined}>
+			<Icon name="plus" />新規
+		</span>
+		<span class="tk-phone-btn">
+			<Icon name="tasks" />
+			{tasks !== undefined && <span class="tk-phone-badge">{tasks}</span>}
+		</span>
+		<span class="tk-phone-btn" data-at={filesAt} data-fx={filesAt ? 'mark' : undefined}>
+			<Icon name="folder" />
+		</span>
+	</span>
+</div>

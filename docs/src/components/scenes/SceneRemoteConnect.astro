@@ -1,0 +1,144 @@
+---
+/**
+ * 場面: スマホとつなぐ（remote setup → remote start の QR → ペアリング → Mac で承認）。5 手順。#2061
+ * 事実の出どころ:
+ *  - 5 段の文言 = crates/tako-control/src/remote_setup.rs の run_interactive（[1/5]〜[5/5]・固定 URL・最後の案内）
+ *  - start の出力 = crates/tako-cli/src/main.rs の remote_start（JSON の running / url・QR を tako のペインに開く・
+ *    「スマホでスキャンしてください。」）。QR は恒久固定 URL だけで秘密を含まない（FR-6.6）
+ *  - ペアリング画面 = web/tako-remote/src/pages/pairing.jsx（4 つの権限・「ペアリングを要求」・「Mac で承認してください」）
+ *  - 承認ダイアログ = crates/tako-app/src/remote_panel.rs（Mac の画面でだけ承認できる。FR-6.5）
+ * URL・端末名・ユーザーは架空（my-mac.<tailnet>.ts.net / you@example.com）。QR は図案で読めない。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import PhoneBare from '../motion/PhoneBare.astro';
+import MacDialog from '../motion/MacDialog.astro';
+import QrCode from '../motion/QrCode.astro';
+import Cmd from '../motion/Cmd.astro';
+
+const URL = 'https://my-mac.<tailnet>.ts.net';
+const ROLES = [
+	{ value: 'observe', label: 'Observe', desc: '画面を見るだけ（推奨）' },
+	{ value: 'interact', label: 'Interact', desc: '+ テキスト入力・承認応答' },
+	{ value: 'manage', label: 'Manage', desc: '+ ペインの管理' },
+	{ value: 'admin', label: 'Admin', desc: '+ 端末管理' },
+];
+---
+
+<Scrolly label="スマホを tako につなぐ流れ">
+	<div slot="stage" class="tk-stack">
+		<!-- 手順 1〜2: Mac の tako。setup の 5 段 → start で QR が隣のペインに開く -->
+		<div data-at="1-2" data-fx="fade" style="align-self: center">
+			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+				<Split>
+					<Pane n={1} title="my-app" state="idle" focus>
+						<div data-at="1" data-fx="unfold">
+							<div>
+								<span class="tk-l"><span class="tk-p">my-app ❯</span> <span data-at="1" data-fx="type">tako remote setup</span></span>
+								<span class="tk-l" data-at="1" style="--d: .9s">[1/5] Tailscale を検出中... <span class="tk-ok">OK</span></span>
+								<span class="tk-l" data-at="1" style="--d: 1.2s">[2/5] ログイン状態を確認中... <span class="tk-ok">OK</span></span>
+								<span class="tk-l" data-at="1" style="--d: 1.5s">[3/5] HTTPS 証明書を確認中... <span class="tk-ok">OK</span></span>
+								<span class="tk-l" data-at="1" style="--d: 1.8s">[4/5] serve を設定中... <span class="tk-ok">起動時に設定</span></span>
+								<span class="tk-l tk-b" data-at="1" style="--d: 2.1s">[5/5] セットアップ完了</span>
+								<span class="tk-l" data-at="1" style="--d: 2.3s">固定 URL: <span class="tk-acc">{URL}</span></span>
+							</div>
+						</div>
+						<div data-at="2+" data-fx="fade">
+							<span class="tk-l"><span class="tk-p">my-app ❯</span> <span data-at="2" data-fx="type">tako remote start</span></span>
+							<span class="tk-l tk-o" data-at="2" style="--d: .8s">{'{'}</span>
+							<span class="tk-l tk-o" data-at="2" style="--d: .8s">  "running": <span class="tk-ok">true</span>,</span>
+							<span class="tk-l tk-o" data-at="2" style="--d: .8s">  "url": "{URL}",</span>
+							<span class="tk-l tk-o" data-at="2" style="--d: .8s">  …</span>
+							<span class="tk-l tk-o" data-at="2" style="--d: .8s">{'}'}</span>
+							<span class="tk-l tk-b" data-at="2" style="--d: 1.4s">スマホでスキャンしてください。</span>
+						</div>
+					</Pane>
+					<Pane n={2} title="qr-….png" state="none" at="2+" fx="split" body="flush">
+						<div class="tk-imgview">
+							<QrCode />
+						</div>
+					</Pane>
+				</Split>
+			</TakoWindow>
+		</div>
+
+		<!-- 手順 3〜4: スマホ。ペアリングの画面 → 承認待ち -->
+		<div data-at="3-4" data-fx="fade" style="align-self: center">
+			<PhoneBare height={30}>
+				<div class="tk-phone-layer" data-at="3" data-fx="fade">
+					<div class="tk-pconnect">
+						<h4>この端末をペアリング</h4>
+						<p class="tk-pnote">Mac にこの端末の登録を要求します。Mac の画面で承認されるまで画面データは表示されません。</p>
+						<span class="tk-plabel">端末の名前</span>
+						<span class="tk-pfield">iPhone</span>
+						<span class="tk-plabel">希望する権限</span>
+						<div class="tk-proles">
+							{
+								ROLES.map((r) => (
+									<span
+										class="tk-prole"
+										data-at={r.value === 'observe' ? '!3' : r.value === 'interact' ? '3' : undefined}
+										data-fx={r.value === 'observe' || r.value === 'interact' ? 'state' : undefined}
+										style={r.value === 'interact' ? '--d: .6s' : r.value === 'observe' ? 'transition-delay: .6s' : undefined}
+									>
+										<span class="tk-prole-text">
+											<b>{r.label}</b>
+											<span>{r.desc}</span>
+										</span>
+										<span class="tk-prole-check">✓</span>
+									</span>
+								))
+							}
+						</div>
+						<span class="tk-pbtn is-claude">ペアリングを要求</span>
+					</div>
+					<Pointer path="3:70,62" click="3" />
+				</div>
+				<div class="tk-phone-layer" data-at="4" data-fx="fade">
+					<div class="tk-pwait">
+						<span class="tk-pspin"></span>
+						<h4>Mac で承認してください</h4>
+						<p class="tk-pnote">Mac の画面にペアリングの承認ダイアログが表示されています。「許可」を押すとこの端末が登録されます。</p>
+						<span class="tk-pbtn">やり直す</span>
+					</div>
+				</div>
+			</PhoneBare>
+		</div>
+
+		<!-- 手順 5: Mac の画面に承認ダイアログ → 許可 -->
+		<div data-at="5" data-fx="fade" style="align-self: center">
+			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+				<Split>
+					<Pane n={1} title="my-app" state="idle" focus>
+						<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>
+					</Pane>
+				</Split>
+				<MacDialog slot="overlay" at="5" device="iPhone" node="my-iphone" role="interact" allowAt="5" />
+				<Pointer slot="overlay" path="5:80,82" click="5" />
+			</TakoWindow>
+		</div>
+	</div>
+
+	<Step title="最初に 1 回だけ、tako remote setup">
+		<p>Mac とスマホの両方に Tailscale を入れ、同じアカウントでログインしておきます。あとは Mac の tako で 1 行打つだけで、確認が 5 段で進みます。Tailscale が入っていなければ、その場で入れるかを聞きます。</p>
+		<Cmd>tako remote setup</Cmd>
+	</Step>
+	<Step title="tako remote start で、QR が出る">
+		<p>起動すると、隣のペインに QR コードが開きます。中身は <strong>tailnet の中だけで開ける固定の URL</strong> で、合言葉やトークンは入っていません。ステータスバーの「リモート」を押しても起動できます。</p>
+		<Cmd>tako remote start</Cmd>
+	</Step>
+	<Step title="スマホで読んで、権限を選ぶ">
+		<p>スマホのカメラで QR を読むと「この端末をペアリング」が開きます。画面を見るだけなら <strong>Observe</strong>、返事やコマンドの実行もするなら <strong>Interact</strong> を選んで要求します。</p>
+	</Step>
+	<Step title="スマホは、Mac の承認を待つ">
+		<p>Mac で承認されるまで、スマホには画面のデータが 1 つも届きません。QR を他人に見られても、それだけでは何も見えません。</p>
+	</Step>
+	<Step title="Mac の画面で「許可」">
+		<p>Mac の tako に、端末名・ユーザー・ノードと権限の選択が出ます。<strong>承認と権限の引き上げは、この Mac の画面でしかできません</strong>（AI やスマホからは上げられません）。許可すれば、次からはホーム画面に追加したアイコンを開くだけです。</p>
+		<p class="tk-step-note">スマホからの接続は macOS 版で使えます。Windows 版はまだです（実機での通しの確認が済んでいません）。</p>
+	</Step>
+</Scrolly>

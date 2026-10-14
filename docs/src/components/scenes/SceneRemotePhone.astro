@@ -1,0 +1,109 @@
+---
+/**
+ * 場面: スマホで続きを頼む（ペイン一覧 → 会話 → PC に出ているコマンドを実行 → 実行済み）。4 手順。#2061
+ * 事実の出どころ:
+ *  - 一覧 = web/tako-remote/src/pages/panes.jsx（タブごとのまとまり・役割・状態「承認待ち / 実行中」。FR-6.12）
+ *  - ペイン画面 = pages/terminal.jsx（‹ · 印 · 題名 · chat / term。チャットは claude のペイン）
+ *  - コマンド = components/command-cards.jsx（「PC に出ているコマンド」・実行・確認シート
+ *    「PC でこのコマンドを実行しますか」「PC で実行する」・「実行済み（終了コード N）」。Interact 以上。FR-6.24）
+ * 会話の中身・ホスト名は架空。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import PhoneBare from '../motion/PhoneBare.astro';
+import PhoneHead from '../motion/PhoneHead.astro';
+import PhoneCard from '../motion/PhoneCard.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+---
+
+<Scrolly label="スマホから会話の続きを頼む流れ" flip>
+	<PhoneBare slot="stage" height={31}>
+		<!-- 手順 1: ペイン一覧 -->
+		<div class="tk-phone-layer" data-at="1" data-fx="fade">
+			<PhoneHead tasks={1} />
+			<div class="tk-pscroll">
+				<div class="tk-pgroup"><b>my-app</b><span class="tk-pgroup-n">3</span></div>
+				<PhoneCard title="マスター" role="master" state="running" stateText="実行中">
+					worker 2 体で作業中。テストを足しています
+				</PhoneCard>
+				<PhoneCard title="my-app" role="worker" state="wait" stateText="承認待ち">
+					npm install を実行しますか？
+				</PhoneCard>
+				<PhoneCard title="my-app" role="worker" state="running" stateText="実行中">
+					docs/guide.md の誤字を修正中
+				</PhoneCard>
+			</div>
+			<Pointer path="1:55,24" click="1" />
+		</div>
+
+		<!-- 手順 2〜4: master のペイン画面（チャット）。上に PC に出ているコマンド -->
+		<div class="tk-phone-layer" data-at="2+" data-fx="fade">
+			<div class="tk-phdr">
+				<span class="tk-phdr-back">‹</span>
+				<span class="tk-phdr-av">
+					<svg class="tk-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1L9.2 6.1L14 4.5L10.5 8L14 11.5L9.2 9.9L8 15L6.8 9.9L2 11.5L5.5 8L2 4.5L6.8 6.1Z" fill="currentColor"></path></svg>
+				</span>
+				<span class="tk-phdr-info">
+					<span class="tk-phdr-title">マスター</span>
+					<span class="tk-phdr-sub">my-mac</span>
+				</span>
+				<span class="tk-ptoggle"><span class="is-on">chat</span><span>term</span></span>
+			</div>
+			<div class="tk-pcmds">
+				<span class="tk-pcmds-head">PC に出ているコマンド <span class="tk-pcmds-n">1</span></span>
+				<div class="tk-pcmd">
+					<span class="tk-pcmd-label">テストを実行</span>
+					<span class="tk-pcmd-text">npm test</span>
+					<span class="tk-pcmd-row">
+						<span class="tk-pcmd-state" data-at="4+" style="--d: .5s">実行済み（終了コード 0）</span>
+						<span class="tk-grow"></span>
+						<span class="tk-prun" data-at="3" data-fx="mark"><Icon name="play" />実行</span>
+					</span>
+				</div>
+			</div>
+			<div class="tk-pscroll">
+				<div class="tk-pagent">
+					<span class="tk-phdr-av">
+						<svg class="tk-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1L9.2 6.1L14 4.5L10.5 8L14 11.5L9.2 9.9L8 15L6.8 9.9L2 11.5L5.5 8L2 4.5L6.8 6.1Z" fill="currentColor"></path></svg>
+					</span>
+					<div class="tk-pmsg">ログイン画面とテスト 3 件を足しました。PC で npm test を流して確かめてください。</div>
+				</div>
+				<div class="tk-pmsg is-user" data-at="2+" style="--d: 1.3s">通ったら PR まで出して</div>
+				<div class="tk-pinput">
+					<span class="tk-grow"><span class="tk-typed" data-at="2" data-fx="type">通ったら PR まで出して</span></span>
+					<span class="tk-psend"><Icon name="arrowUp" /></span>
+				</div>
+			</div>
+
+			<!-- 手順 3: 実行の確認（下から出るシート） -->
+			<div class="tk-psheet" data-at="3" data-fx="fade">
+				<div class="tk-psheet-card" data-at="3" style="--d: .15s">
+					<span class="tk-psheet-head"><span>PC でこのコマンドを実行しますか</span><span class="tk-psheet-x">×</span></span>
+					<span class="tk-pnote">テストを実行</span>
+					<span class="tk-pcmd-text">npm test</span>
+					<span class="tk-pnote">my-mac の同じタブに新しいペインを開いて実行します。いま見ているペインには書き込みません。</span>
+					<span class="tk-pbtns">
+						<span class="tk-pbtn">やめる</span>
+						<span class="tk-pbtn is-primary" data-at="3" data-fx="mark" style="--d: 1.3s">PC で実行する</span>
+					</span>
+				</div>
+			</div>
+			<Pointer path="2:78,92 3:80,90 4:40,28" click="3" />
+		</div>
+	</PhoneBare>
+
+	<Step title="承認されると、ペインが並ぶ">
+		<p>タブごとにまとまったカードで、誰が（master / worker）何をしていて、どれが<strong>承認待ち</strong>かが一目で分かります。右上には AI から届いた「人がやること」の件数。</p>
+	</Step>
+	<Step title="会話を開いて、続きを頼む">
+		<p>カードを押すとそのペインの画面です。claude のペインはチャットで読めて、入力欄からそのまま指示を送れます。スマホから見ても、PC 側のペインの大きさは変わりません。</p>
+	</Step>
+	<Step title="AI が出したコマンドを、スマホから実行">
+		<p>AI がカードで渡したコマンドは、スマホにも「PC に出ているコマンド」として出ます。「実行」→「PC で実行する」で、<strong>PC の同じタブに新しいペインを開いて</strong>走らせます。今の会話には書き込みません。</p>
+	</Step>
+	<Step title="結果は PC とスマホで揃う">
+		<p>終わると「実行済み（終了コード 0）」。PC のカードにも同じ記録が出るので、どちらで押したかを気にしなくて済みます。</p>
+		<p class="tk-step-note">返事とコマンドの実行には Interact 以上の権限が要ります。足りないときは、その場から Mac へ「権限の更新」をリクエストできます。</p>
+	</Step>
+</Scrolly>
