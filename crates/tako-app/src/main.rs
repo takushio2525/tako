@@ -31310,6 +31310,11 @@ mod self_test {
     mod lsp_fetch_1944;
     #[cfg(feature = "visual-test")]
     use lsp_fetch_1944::lsp_fetch_visual;
+    /// #1956: 検出表の第 2 波を実のサーバで起こし、波線とホバーのカードを撮る（visual-test `lsp-servers`）
+    #[cfg(feature = "visual-test")]
+    mod lsp_servers_1956;
+    #[cfg(feature = "visual-test")]
+    use lsp_servers_1956::lsp_servers_visual;
     /// #1908: ↑ / ↓ / ← / → / Enter / ⇧⌘↑ / ⇧⌘↓・残り時間の数え下ろし（visual-test `tree-keys`）
     #[cfg(feature = "visual-test")]
     mod tree_keys;
@@ -45721,6 +45726,12 @@ mod self_test {
                 // #1944: まっさらで .py を開くと取って起こし、状態が出て、押せば入るか（ミラー）
                 "lsp-fetch" => {
                     lsp_fetch_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1956: 第 2 波の言語サーバ（実物）で波線とホバーのカードが出るか（素材はスクリプト）
+                "lsp-servers" => {
+                    lsp_servers_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

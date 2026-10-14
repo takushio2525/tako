@@ -87,6 +87,11 @@ const fn doc(extension: &'static str, language_id: &'static str) -> DocumentKind
 
 /// 段階 1 の 4 行（ユーザー確定の順。#1007）:
 /// Rust → C/C++（「ヘッダ」= `#include` のヘッダ）→ TypeScript / JavaScript → Python
+///
+/// 第 2 波の 6 行（#1956。候補の比較と採った順の理由は `.agent/plans/2026-10-language-coverage.md` §8）:
+/// LaTeX（texlab）→ TOML（tombi）→ Swift（sourcekit-lsp）→ Dart（dart）→ CSS / SCSS / Less と HTML
+/// （vscode-langservers-extracted）。前の 2 つは tako が取れる単体バイナリ、Swift と Dart は言語の道具に同梱
+/// （入っていれば言語サーバも在る）、CSS と HTML は利用者の npm で入れる（依存 32 包みを取る口がまだ無い）
 pub const SERVERS: &[ServerSpec] = &[
     ServerSpec {
         id: "rust-analyzer",
@@ -175,8 +180,10 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[],
         root_markers: &["compile_commands.json", "compile_flags.txt", ".clangd"],
         workspace_root: None,
+        // macOS は Command Line Tools の clangd（#1956。#1944 の提案: 取らない代わりに Apple 公式の 1 行を案内する。
+        // CLT を入れると `/usr/bin/clangd` とコンパイラのヘッダが一緒に入る = LLVM 一式は要らない）
         install: InstallHint {
-            macos: "brew install llvm",
+            macos: "xcode-select --install",
             windows: "winget install LLVM.LLVM",
         },
         // 取らない（#1944）: 配布の zip が macOS で 100 MB（ヘッダ込み）あり、C / C++ の解析には
@@ -255,6 +262,218 @@ pub const SERVERS: &[ServerSpec] = &[
             node_major: 14,
         }),
     },
+    // ─── 第 2 波（#1956）────────────────────────────────────────────
+    ServerSpec {
+        id: "texlab",
+        // `.bib` / `.sty` / `.cls` は `file_type` に行が無いので今は足さない（#1948 の番犬）
+        documents: &[doc("tex", "latex")],
+        program: "texlab",
+        args: &[],
+        // texlab 自身がルートの印に使う名前（無ければ `.git` → ファイルの場所）
+        root_markers: &[
+            ".latexmkrc",
+            "latexmkrc",
+            ".texlabroot",
+            "texlabroot",
+            "Tectonic.toml",
+        ],
+        workspace_root: None,
+        install: InstallHint {
+            macos: "brew install texlab",
+            // winget に包みが無い（tako が取れないときだけ出る案内）
+            windows: "scoop install texlab",
+        },
+        // v5.26.0（2026-06-25 公開）。ハッシュは GitHub Releases の asset の digest。
+        // macOS は tar.gz の中の 1 つ、Windows は zip の中の 1 つ（どちらも 10 MB 前後）
+        fetch: Some(Fetch::Binary {
+            version: "5.26.0",
+            assets: &[
+                PlatformAsset {
+                    os: "macos",
+                    arch: "aarch64",
+                    asset: Asset {
+                        url: "https://github.com/latex-lsp/texlab/releases/download/v5.26.0/texlab-aarch64-macos.tar.gz",
+                        digest: Digest::Sha256(
+                            "af7972ffd230711ba04ada9b69cc32ce9111d9196ba69538062872faefdbee56",
+                        ),
+                        archive: Archive::TarGzMember("texlab"),
+                        size: 10_154_621,
+                    },
+                },
+                PlatformAsset {
+                    os: "macos",
+                    arch: "x86_64",
+                    asset: Asset {
+                        url: "https://github.com/latex-lsp/texlab/releases/download/v5.26.0/texlab-x86_64-macos.tar.gz",
+                        digest: Digest::Sha256(
+                            "6091611f756b28e1a57612b130c196df4b0bb6e22dde5cf5d890578513397daf",
+                        ),
+                        archive: Archive::TarGzMember("texlab"),
+                        size: 10_253_264,
+                    },
+                },
+                PlatformAsset {
+                    os: "windows",
+                    arch: "x86_64",
+                    asset: Asset {
+                        url: "https://github.com/latex-lsp/texlab/releases/download/v5.26.0/texlab-x86_64-windows.zip",
+                        digest: Digest::Sha256(
+                            "cb028d44c3d2b85d36a2ed52d41a0ff43a341b1f04c500c56c4524c4eb72b316",
+                        ),
+                        archive: Archive::ZipMember("texlab.exe"),
+                        size: 9_997_967,
+                    },
+                },
+                PlatformAsset {
+                    os: "windows",
+                    arch: "aarch64",
+                    asset: Asset {
+                        url: "https://github.com/latex-lsp/texlab/releases/download/v5.26.0/texlab-aarch64-windows.zip",
+                        digest: Digest::Sha256(
+                            "99b215e9a44169eb8d786c33484b963055e1c3dd40f68e14fcc47ae1c84e92c1",
+                        ),
+                        archive: Archive::ZipMember("texlab.exe"),
+                        size: 9_853_223,
+                    },
+                },
+            ],
+            probe_args: &["--version"],
+        }),
+    },
+    ServerSpec {
+        id: "tombi",
+        documents: &[doc("toml", "toml")],
+        program: "tombi",
+        args: &["lsp"],
+        // 設定ファイルだけを印にする（Cargo.toml / pyproject.toml を印にすると workspace の crate ごとに
+        // 器が分かれる）。無ければ `.git` → ファイルの場所
+        root_markers: &["tombi.toml"],
+        workspace_root: None,
+        install: InstallHint {
+            macos: "brew install tombi",
+            windows: "winget install tombi-toml.tombi",
+        },
+        // v1.7.0（2026-10-01 公開）。taplo ではなく tombi を採った理由は §8（taplo 0.10.0 は配布元の
+        // ハッシュが無く、今の SchemaStore の目録を読めずホバーが出ない）。Cargo.toml / pyproject.toml の
+        // スキーマを内蔵していて、オフラインでもホバーが出る（実測）
+        fetch: Some(Fetch::Binary {
+            version: "1.7.0",
+            assets: &[
+                PlatformAsset {
+                    os: "macos",
+                    arch: "aarch64",
+                    asset: Asset {
+                        url: "https://github.com/tombi-toml/tombi/releases/download/v1.7.0/tombi-cli-1.7.0-aarch64-apple-darwin.tar.gz",
+                        digest: Digest::Sha256(
+                            "ff18e589f45780ebf77637d88f51d3e075b2500cc0bff99f477a79cf49d5ef95",
+                        ),
+                        archive: Archive::TarGzMember("tombi-cli-1.7.0-aarch64-apple-darwin/tombi"),
+                        size: 7_594_215,
+                    },
+                },
+                PlatformAsset {
+                    os: "macos",
+                    arch: "x86_64",
+                    asset: Asset {
+                        url: "https://github.com/tombi-toml/tombi/releases/download/v1.7.0/tombi-cli-1.7.0-x86_64-apple-darwin.tar.gz",
+                        digest: Digest::Sha256(
+                            "6d0f37f27282fa5f1551256f1d00c58cb0e61c443d89b5813c8be6223b73ce37",
+                        ),
+                        archive: Archive::TarGzMember("tombi-cli-1.7.0-x86_64-apple-darwin/tombi"),
+                        size: 8_153_823,
+                    },
+                },
+                PlatformAsset {
+                    os: "windows",
+                    arch: "x86_64",
+                    asset: Asset {
+                        url: "https://github.com/tombi-toml/tombi/releases/download/v1.7.0/tombi-cli-1.7.0-x86_64-pc-windows-msvc.zip",
+                        digest: Digest::Sha256(
+                            "13822150c15d37a76c989bb7b8f1e6433625b4e72a21dcab10b03d5d46386950",
+                        ),
+                        archive: Archive::ZipMember("tombi.exe"),
+                        size: 10_395_001,
+                    },
+                },
+                PlatformAsset {
+                    os: "windows",
+                    arch: "aarch64",
+                    asset: Asset {
+                        url: "https://github.com/tombi-toml/tombi/releases/download/v1.7.0/tombi-cli-1.7.0-aarch64-pc-windows-msvc.zip",
+                        digest: Digest::Sha256(
+                            "d1883c1d1167f823cc7c91bde2e41df3da24016f5e9c4ba37ca6e96798eba01f",
+                        ),
+                        archive: Archive::ZipMember("tombi.exe"),
+                        size: 9_479_552,
+                    },
+                },
+            ],
+            probe_args: &["--version"],
+        }),
+    },
+    ServerSpec {
+        id: "sourcekit-lsp",
+        documents: &[doc("swift", "swift")],
+        program: "sourcekit-lsp",
+        args: &[],
+        root_markers: &["Package.swift", "buildServer.json"],
+        workspace_root: None,
+        install: InstallHint {
+            macos: "xcode-select --install",
+            windows: "winget install Swift.Toolchain",
+        },
+        // 取らない: Swift の道具（Xcode / Command Line Tools / Windows の Swift toolchain）に同梱で、
+        // 単体では動かない（コンパイラと SDK が要る）。Swift を書ける環境ならもう入っている
+        fetch: None,
+    },
+    ServerSpec {
+        id: "dart",
+        documents: &[doc("dart", "dart")],
+        program: "dart",
+        args: &["language-server", "--protocol=lsp"],
+        root_markers: &["pubspec.yaml"],
+        workspace_root: None,
+        install: InstallHint {
+            macos: "brew install dart-sdk",
+            windows: "winget install Google.DartSDK",
+        },
+        // 取らない: Dart SDK（Flutter も同梱）の `dart language-server` そのもの。SDK ごとで 200 MB を超え、
+        // Dart を書ける環境ならもう入っている
+        fetch: None,
+    },
+    ServerSpec {
+        id: "vscode-css-language-server",
+        documents: &[doc("css", "css"), doc("scss", "scss"), doc("less", "less")],
+        program: "vscode-css-language-server",
+        args: &["--stdio"],
+        root_markers: &["package.json"],
+        workspace_root: None,
+        install: InstallHint {
+            macos: "npm install -g vscode-langservers-extracted",
+            windows: "npm install -g vscode-langservers-extracted",
+        },
+        // 取らない（まだ）: vscode-langservers-extracted 4.10.0 は依存が 32 包み（展開 93 MB。TypeScript 4 系と
+        // scoped の `@vscode/l10n` を含む）。[`Fetch::Npm`] は依存を持たない包みと scoped でない名前だけを取れる
+        // 形（#1944）なので、取るには取得の口を広げる別の作業が要る。
+        // **罠**（実測）: クライアントが `workspace.configuration` を申告して `null` で答えると、検証の途中で
+        // 例外になり診断を 1 件も送らない。tako は申告しないので既定の設定で検証する
+        fetch: None,
+    },
+    ServerSpec {
+        id: "vscode-html-language-server",
+        documents: &[doc("html", "html"), doc("htm", "html")],
+        program: "vscode-html-language-server",
+        args: &["--stdio"],
+        root_markers: &["package.json"],
+        workspace_root: None,
+        install: InstallHint {
+            macos: "npm install -g vscode-langservers-extracted",
+            windows: "npm install -g vscode-langservers-extracted",
+        },
+        // 取らない（まだ）: CSS の行と同じ包み・同じ理由。診断は埋め込みの `<style>` / `<script>` の誤り
+        // （HTML の構造そのものは検証しない）、ホバーは要素と属性の説明
+        fetch: None,
+    },
 ];
 
 /// 解決結果（どのサーバが・どの `languageId` で受け持つか）
@@ -308,10 +527,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 段階1は4行() {
+    fn 第2波までで10行() {
         assert_eq!(
             SERVERS.len(),
-            4,
+            10,
             "表の行数が変わったら番犬とドキュメントも直す"
         );
     }
@@ -351,6 +570,54 @@ mod tests {
         }
     }
 
+    /// 第 2 波（#1956）: 拡張子 → 行・languageId と、tako が取れる行（この表の答えを e2e と docs が引く）
+    #[test]
+    fn 第2波の行と取得の有無() {
+        let cases = [
+            ("report.tex", "texlab", "latex", true),
+            ("Cargo.toml", "tombi", "toml", true),
+            ("main.swift", "sourcekit-lsp", "swift", false),
+            ("lib/main.dart", "dart", "dart", false),
+            ("site/style.css", "vscode-css-language-server", "css", false),
+            ("app.scss", "vscode-css-language-server", "scss", false),
+            ("theme.less", "vscode-css-language-server", "less", false),
+            ("index.html", "vscode-html-language-server", "html", false),
+            ("old/page.htm", "vscode-html-language-server", "html", false),
+        ];
+        for (path, id, language_id, fetchable) in cases {
+            let got =
+                resolve(Path::new(path)).unwrap_or_else(|| panic!("{path} を受け持つ行が無い"));
+            assert_eq!((got.spec.id, got.language_id), (id, language_id), "{path}");
+            assert_eq!(got.spec.fetch.is_some(), fetchable, "{id} の取得の有無");
+            if let Some(fetch) = got.spec.fetch {
+                for (os, arch) in [
+                    ("macos", "aarch64"),
+                    ("macos", "x86_64"),
+                    ("windows", "x86_64"),
+                    ("windows", "aarch64"),
+                ] {
+                    assert!(fetch.available_for(os, arch), "{id} {os} {arch}");
+                }
+            }
+        }
+        // 見送った形式（§8）は誰も受け持たない = 今の表示（言語サーバなし）のまま
+        for path in [
+            "Main.java",
+            "main.go",
+            "config.yaml",
+            "ci.yml",
+            "data.json",
+            "App.vue",
+        ] {
+            assert!(resolve(Path::new(path)).is_none(), "{path}");
+        }
+        // clangd は取らない代わりに、macOS では Command Line Tools を案内する（#1944 の提案）
+        assert_eq!(
+            find_in(SERVERS, "clangd").map(|s| s.install.macos),
+            Some("xcode-select --install")
+        );
+    }
+
     #[test]
     fn 表に無い拡張子と拡張子の無いファイルは引けない() {
         assert!(resolve(Path::new("notes.md")).is_none());
@@ -363,20 +630,21 @@ mod tests {
     /// [`override_env_name`] も 1 文字も触っていない
     #[test]
     fn 表に1行足すだけで解決結果が変わる() {
+        // 足すのは第 2 波で見送った Java（#1956 の §8。JDK 21 が要る）
         const 追加: ServerSpec = ServerSpec {
-            id: "vscode-html-language-server",
-            documents: &[doc("html", "html"), doc("htm", "html")],
-            program: "vscode-html-language-server",
-            args: &["--stdio"],
-            root_markers: &["package.json"],
+            id: "jdtls",
+            documents: &[doc("java", "java")],
+            program: "jdtls",
+            args: &[],
+            root_markers: &["pom.xml", "build.gradle"],
             workspace_root: None,
             install: InstallHint {
-                macos: "npm install -g vscode-langservers-extracted",
-                windows: "npm install -g vscode-langservers-extracted",
+                macos: "brew install jdtls",
+                windows: "scoop install jdtls",
             },
             fetch: None,
         };
-        let path = Path::new("site/index.html");
+        let path = Path::new("src/Main.java");
         assert!(
             resolve_in(SERVERS, path).is_none(),
             "足す前は誰も受け持たない"
@@ -384,15 +652,16 @@ mod tests {
         let mut extended = SERVERS.to_vec();
         extended.push(追加);
         let got = resolve_in(&extended, path).expect("足した行が受け持つ");
-        assert_eq!(got.spec.id, "vscode-html-language-server");
-        assert_eq!(got.language_id, "html");
+        assert_eq!(got.spec.id, "jdtls");
+        assert_eq!(got.language_id, "java");
         assert_eq!(
-            find_in(&extended, "vscode-html-language-server").map(|s| s.program),
-            Some("vscode-html-language-server")
+            find_in(&extended, "jdtls").map(|s| s.program),
+            Some("jdtls")
         );
+        assert_eq!(override_env_name(got.spec.id), "TAKO_LSP_BIN_JDTLS");
         assert_eq!(
-            override_env_name(got.spec.id),
-            "TAKO_LSP_BIN_VSCODE_HTML_LANGUAGE_SERVER"
+            override_env_name("vscode-css-language-server"),
+            "TAKO_LSP_BIN_VSCODE_CSS_LANGUAGE_SERVER"
         );
         // 既存の行の答えは変わらない
         assert_eq!(
