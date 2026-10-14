@@ -7077,13 +7077,19 @@ fn dispatch_inner(
 
         Request::CheckHealth => Ok(check_health(host)),
 
-        // #1993: 通常は受け口（`ipc::submit`）が答えるのでここへは来ない。来たら（UI スレッドの
-        // 同期の dispatch）**採らずに**覚えだけを返す（走査は 1 回 11 ms = UI の 1 フレームを超える）
-        Request::Queue { action } => match action.as_deref().unwrap_or("status") {
-            "status" => Ok(crate::resources::cached_status()),
-            other => Err(DispatchError::InvalidParams(format!(
-                "未知の action: {other}（使えるのは status）"
-            ))),
+        // #1993 / #1994: 通常は受け口（`ipc::submit`）が答えるのでここへは来ない。来たら（UI スレッドの
+        // 同期の dispatch）**採らずに**覚えだけを返す（走査は 1 回 11 ms = UI の 1 フレームを超える）。
+        // 順番待ちの操作も走査の覚えを読むだけ
+        Request::Queue {
+            action,
+            job,
+            id,
+            limits,
+        } => match action.as_deref().unwrap_or("status") {
+            "status" => Ok(crate::queue::with_section(
+                crate::resources::cached_status(),
+            )),
+            other => crate::queue::handle(other, job.as_ref(), id, limits.as_ref()),
         },
 
         // #1678: 通常は prepare_offload が background へ出す。ここへ来るのは

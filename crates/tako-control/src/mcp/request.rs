@@ -675,6 +675,15 @@ pub(super) fn build_request(
         "tako_check_health" => Request::CheckHealth,
         "tako_queue" => Request::Queue {
             action: str_arg(args, "action")?,
+            job: None,
+            id: u64_arg(args, "id")?,
+            limits: match args.get("limits") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| format!("limits を解釈できない: {e}"))?,
+                ),
+            },
         },
         "tako_setup_mcp" => Request::SetupMcp {
             scope: str_arg(args, "scope")?,

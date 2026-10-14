@@ -947,16 +947,63 @@ mod tests {
         );
     }
 
-    /// #1993: `tako_queue` は `Request::Queue` へ写る（action 省略は status = dispatch / 受け口が既定を持つ）
+    /// #1993 / #1994: `tako_queue` は `Request::Queue` へ写る（action 省略は status = dispatch /
+    /// 受け口が既定を持つ）。cancel の id と limits の変更もそのまま渡す。wrapper 専用の job は渡せない
     #[test]
     fn queueはactionをそのまま渡す() {
         let (_, requests) = run(call("tako_queue", json!({})), Some(7), true);
-        assert_eq!(requests, vec![Request::Queue { action: None }]);
+        assert_eq!(
+            requests,
+            vec![Request::Queue {
+                action: None,
+                job: None,
+                id: None,
+                limits: None,
+            }]
+        );
         let (_, requests) = run(call("tako_queue", json!({ "action": "status" })), None, true);
         assert_eq!(
             requests,
             vec![Request::Queue {
                 action: Some("status".into()),
+                job: None,
+                id: None,
+                limits: None,
+            }]
+        );
+        let (_, requests) = run(
+            call("tako_queue", json!({ "action": "cancel", "id": 4242 })),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Queue {
+                action: Some("cancel".into()),
+                job: None,
+                id: Some(4242),
+                limits: None,
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_queue",
+                json!({ "action": "limits", "limits": { "max_jobs": 2, "reset": true } }),
+            ),
+            None,
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Queue {
+                action: Some("limits".into()),
+                job: None,
+                id: None,
+                limits: Some(tako_core::queue::LimitsPatch {
+                    max_jobs: Some(2),
+                    reset: true,
+                    ..Default::default()
+                }),
             }]
         );
     }

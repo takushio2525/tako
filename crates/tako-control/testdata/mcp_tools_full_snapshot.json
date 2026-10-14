@@ -2339,16 +2339,25 @@
     "name": "tako_check_health"
   },
   {
-    "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・ビルドの前に空きを確かめる。",
+    "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・ビルドの前に空きを確かめる。queue 節は `tako queue <コマンド>` の順番待ち（実行中・待ち・上限）。cancel は id（受付番号）を取り消す。limits は上限の読み書き（省略で読むだけ）。順番待ちで走らせるのは CLI だけ。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "action": {
           "default": "status",
           "enum": [
-            "status"
+            "status",
+            "cancel",
+            "limits"
           ],
           "type": "string"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "limits": {
+          "description": "max_jobs / reserve_gb / swap_guard_gb / max_wait_min / reset",
+          "type": "object"
         }
       },
       "type": "object"

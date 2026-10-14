@@ -2066,6 +2066,8 @@ struct TakoApp {
     pane_text_area_drift_logged: HashMap<PaneId, i32>,
     /// Layer 1 IPC サーバー（FR-2.2 の受け口。起動失敗時は None で IPC なし動作）
     ipc: Option<IpcServer>,
+    /// 順番待ちの隔離の調停役の受け口（`TAKO_QUEUE_SOCKET` を明示したときだけ。#1994）
+    _queue_ipc: Option<IpcServer>,
     /// Layer 2 内蔵 MCP サーバー（FR-2.3 の受け口。起動失敗時は None で MCP なし動作）
     mcp: Option<McpServer>,
     /// IPC / MCP 共有のセッション認証トークン（FR-2.3.4。ログに出さない）
@@ -4316,6 +4318,33 @@ impl TakoApp {
         // 受け口（IPC / MCP）の `Request::Queue` はこの覚えから答える
         tako_control::resources::start();
 
+        // #1994: 重い処理の順番待ちの調停役。本番の 1 インスタンスだけが調停する（隔離・セルフテスト・
+        // セカンダリは調停しない = 隔離ごとに別の待ち行列ができると全体で絞れない）。
+        // `TAKO_QUEUE_SOCKET` を明示したときだけ、そのパスにも受け口を張って隔離の調停役になる。
+        // 受け答えは `ipc::submit` の手前（UI スレッドを通らない）
+        let queue_explicit = tako_control::queue::explicit_socket();
+        let queue_role = tako_control::queue::role_for(
+            queue_explicit.as_deref(),
+            tako_core::paths::is_verification_process(),
+            std::env::var_os("TAKO_SELF_TEST").is_some(),
+            secondary,
+        );
+        if let Some(role) = queue_role {
+            tako_control::queue::enable(role);
+        }
+        let queue_ipc = match (queue_role, queue_explicit.as_deref(), &token) {
+            (Some(tako_control::queue::Role::Explicit), Some(path), Some(token)) => {
+                match IpcServer::start_at(control_tx.clone(), token.clone(), path) {
+                    Ok(server) => Some(server),
+                    Err(e) => {
+                        eprintln!("warning: 順番待ちの受け口（TAKO_QUEUE_SOCKET）を張れない: {e}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // 接続情報をファイルへ永続化（FR-2.2.9）。アプリ再起動後も外部の長寿命プロセス
         // から `tako` CLI が繋ぎ直せるようにする（CLI 側のフォールバック先）。
         // セカンダリモードは current ポインタ（control.json）を奪わず instances/ のみに書く
@@ -4490,6 +4519,7 @@ impl TakoApp {
             pane_text_area_drift_logged: HashMap::new(),
             pane_content_probes: HashMap::new(),
             ipc,
+            _queue_ipc: queue_ipc,
             mcp,
             token,
             pending_attach: Vec::new(),

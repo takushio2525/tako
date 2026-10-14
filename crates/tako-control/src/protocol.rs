@@ -709,15 +709,26 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<usize>,
     },
-    /// PC リソースの状況（FR-2.43 / #1993。エピック #1992）。`action`:
+    /// PC リソースの状況と重い処理の順番待ち（FR-2.43 / #1993・#1994。エピック #1992）。`action`:
     /// - "status"（既定）: 機全体（メモリの内訳・swap・メモリ圧・CPU%・load）と、
-    ///   重い処理（ビルド・テスト・ブラウザ・隔離 GUI）・ペインごとの消費・tako の外の消費
+    ///   重い処理（ビルド・テスト・ブラウザ・隔離 GUI）・ペインごとの消費・tako の外の消費、
+    ///   順番待ちの節（`queue`: 実行中・待ち・上限・直近に終わった件）
+    /// - "cancel": 受付番号 `id` の処理を取り消す（待ち = 外れる / 実行中 = wrapper が子を止める）
+    /// - "limits": 上限の読み書き（`limits` が空なら読むだけ。`settings.json` の `resources` 節）
+    /// - "enqueue" / "poll" / "started" / "done": `tako queue <コマンド>`（wrapper）専用
+    ///   （`job` に 1 件の全体を載せる upsert。MCP のカタログには出さない）
     ///
     /// **dispatch ではなく受け口（`ipc::submit`）が答える**（UI スレッドを通らない。
-    /// `resources::answer`）。順番待ちの操作（#1994）も同じ口へ足す
+    /// `queue::answer`）
     Queue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         action: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<tako_core::queue::JobWire>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limits: Option<tako_core::queue::LimitsPatch>,
     },
     /// ジャンプ履歴（戻る / 進む。FR-3.29 / #1677 / #1007 S0-d）。`action`:
     /// - "list"（既定）: 履歴の全項目と現在位置
@@ -3408,7 +3419,12 @@ mod tests {
                 tmux_session: None,
             },
             Request::CheckHealth,
-            Request::Queue { action: None },
+            Request::Queue {
+                action: None,
+                job: None,
+                id: None,
+                limits: None,
+            },
             Request::WindowList,
             Request::BackgroundList,
             Request::ResolvePane {

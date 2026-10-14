@@ -195,6 +195,9 @@ pub struct ProcSample {
     pub env_pane: Option<u64>,
     /// env に `TAKO_ISOLATED=1`（隔離の tako-app）
     pub isolated: bool,
+    /// env の `TAKO_QUEUE_JOB`（順番待ちを通った処理の受付番号。#1994）。
+    /// プラットフォームバイナリは env が読めないので、木は wrapper の子孫でも辿る（[`managed_view`]）
+    pub queue_job: Option<u64>,
 }
 
 impl ProcSample {
@@ -703,6 +706,85 @@ pub fn summarize(
     }
 }
 
+// ===== 順番待ち（#1994）=====
+
+/// 順番待ちの 1 件の木の消費
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TreeUsage {
+    /// 物理フットプリントの合計（バイト）
+    pub memory: u64,
+    /// CPU% の合計（差分がまだ 1 本も採れていなければ `None`）
+    pub cpu_percent: Option<f64>,
+    pub processes: u32,
+}
+
+/// 管理下（順番待ちを通った処理）の見え方
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ManagedView {
+    /// 受付番号 → 木の消費（走査に 1 本も載っていない件は入らない）
+    pub jobs: HashMap<u64, TreeUsage>,
+    /// 順番待ちを通っていない重い処理（tako の外・ペインで直に打った cargo 等）の木の CPU%。
+    /// 枠に数えるかは `tako_core::queue::count_unmanaged` が決める（設計書 §4.3「tako の外の重い処理も 1 枠」）
+    pub unmanaged: Vec<Option<f64>>,
+}
+
+/// 管理下の木と、通っていない重い処理の件数を出す（純関数。設計書 §4.3）。
+///
+/// `jobs` は（受付番号, wrapper の pid）。1 件の木 = wrapper とその子孫 + env の
+/// `TAKO_QUEUE_JOB` がその番号のプロセスとその子孫（launchd へ付け替わった子も拾う。
+/// ただし `/bin/sleep` などのプラットフォームバイナリは env が読めないので子孫の側で拾う）
+pub fn managed_view(
+    procs: &[ProcSample],
+    cpu: &HashMap<ProcKey, f64>,
+    heavy: &[HeavyJob],
+    jobs: &[(u64, u32)],
+) -> ManagedView {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for p in procs {
+        if p.ppid != p.pid {
+            children.entry(p.ppid).or_default().push(p.pid);
+        }
+    }
+    let by_pid: HashMap<u32, &ProcSample> = procs.iter().map(|p| (p.pid, p)).collect();
+    let mut managed: HashSet<u32> = HashSet::new();
+    let mut out = ManagedView::default();
+    for &(id, wrapper) in jobs {
+        let mut stack: Vec<u32> = vec![wrapper];
+        stack.extend(
+            procs
+                .iter()
+                .filter(|p| p.queue_job == Some(id))
+                .map(|p| p.pid),
+        );
+        let mut seen = HashSet::new();
+        let mut usage = TreeUsage::default();
+        while let Some(pid) = stack.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(kids) = children.get(&pid) {
+                stack.extend(kids.iter().copied());
+            }
+            let Some(p) = by_pid.get(&pid) else { continue };
+            managed.insert(pid);
+            usage.memory += p.footprint.unwrap_or(0);
+            usage.processes += 1;
+            if let Some(c) = cpu.get(&p.key()) {
+                *usage.cpu_percent.get_or_insert(0.0) += c;
+            }
+        }
+        if usage.processes > 0 {
+            out.jobs.insert(id, usage);
+        }
+    }
+    out.unmanaged = heavy
+        .iter()
+        .filter(|h| !managed.contains(&h.root.pid))
+        .map(|h| h.cpu_percent)
+        .collect();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +800,7 @@ mod tests {
             argv: (!argv.is_empty()).then(|| argv.to_string()),
             env_pane: None,
             isolated: false,
+            queue_job: None,
         }
     }
 
@@ -951,6 +1034,42 @@ mod tests {
         assert_eq!(env_pane_of(Some("3"), None, own), None);
         assert_eq!(env_pane_of(Some("3"), Some("/tmp/tako.sock"), None), None);
         assert_eq!(env_pane_of(Some("x"), Some("/tmp/tako.sock"), own), None);
+    }
+
+    #[test]
+    fn 順番待ちの木と通っていない重い処理を分ける() {
+        // 30 = tako queue（wrapper）→ 31 cargo → 32 rustc
+        // 40 = 付け替わった子（親 1）だが env に TAKO_QUEUE_JOB=30
+        // 50 = 直に打った cargo（順番待ちを通っていない）
+        let mut procs = vec![
+            sample(30, 10, "tako", "tako queue cargo build", 10),
+            sample(31, 30, "cargo", "cargo build", 200),
+            sample(32, 31, "rustc", "rustc --crate-name a", 1000),
+            sample(40, 1, "cargo", "cargo build", 300),
+            sample(41, 40, "rustc", "rustc", 100),
+            sample(50, 10, "cargo", "cargo test", 500),
+        ];
+        procs[3].queue_job = Some(30);
+        let cpu: HashMap<ProcKey, f64> = [(procs[2].key(), 80.0), (procs[4].key(), 5.0)]
+            .into_iter()
+            .collect();
+        let report = summarize(&procs, &cpu, &HashMap::new());
+        assert_eq!(report.heavy.len(), 3, "31 / 40 / 50 が重い処理の根");
+        let view = managed_view(&procs, &cpu, &report.heavy, &[(30, 30), (99, 99)]);
+        let job = view.jobs.get(&30).expect("30 の木");
+        assert_eq!(job.memory, (10 + 200 + 1000 + 300 + 100) * MIB);
+        assert_eq!(job.processes, 5);
+        assert_eq!(job.cpu_percent, Some(85.0));
+        assert!(!view.jobs.contains_key(&99), "走査に居ない件は入らない");
+        assert_eq!(view.unmanaged, vec![None], "直に打った cargo だけ（CPU の差分はまだ無い）");
+        // CPU の差分が無ければ None（停滞の判定を進めない）
+        let view = managed_view(&procs, &HashMap::new(), &report.heavy, &[(30, 30)]);
+        assert_eq!(view.jobs[&30].cpu_percent, None);
+        // 順番待ちが 1 件も無ければ重い処理は全部「通っていない」
+        assert_eq!(
+            managed_view(&procs, &cpu, &report.heavy, &[]).unmanaged.len(),
+            3
+        );
     }
 
     #[test]

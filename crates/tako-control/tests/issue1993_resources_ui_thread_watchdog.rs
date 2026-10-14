@@ -15,8 +15,12 @@
 //! 2. GUI（`main.rs`）は 2 秒 tick で受け渡しを計測区間つきで呼び、起動時に採取スレッドを立てる。
 //!    走査の口（`answer` / `machine_only` / B29）は GUI のどこからも呼ばない
 //! 3. dispatch の `Request::Queue` の腕（UI スレッドの同期の dispatch）は覚え（`cached_status`）を読むだけ
-//! 4. `ipc::submit` は `Request::Queue` を UI の受け口へ渡す**前に** `resources::answer` で答える
+//! 4. `ipc::submit` は `Request::Queue` を UI の受け口へ渡す**前に** `queue::answer` で答える
+//!    （#1994: 状況も順番待ちの割り当ても。UI が固まってもビルドの割り当ては止まらない）
 //! 5. `resources` の UI 向けの口（`cached_status` / `publish_panes`）は採らない。採取スレッドは別スレッド
+//! 6. 順番待ちの調停役（`queue.rs`）のうち dispatch の腕から届く口（`handle` と、そこから呼ぶ
+//!    `poll` / `done` / `cancel` / `set_limits` / `status_section` / `decide` / `refresh_usage` /
+//!    `machine`）は採らない（覚えを読むだけ。#1994）
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -33,10 +37,15 @@ const MAIN: &str = "crates/tako-app/src/main.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const IPC: &str = "crates/tako-control/src/ipc.rs";
 const RESOURCES: &str = "crates/tako-control/src/resources.rs";
+const QUEUE: &str = "crates/tako-control/src/queue.rs";
 
 /// UI スレッドで呼んではいけない口（右は名指しの理由）
 const SCANS: &[(&str, &str)] = &[
     ("resources::answer(", "走査を起こす（1 回 wall 11 ms）"),
+    (
+        "queue::answer(",
+        "status で走査を起こす（#1994。`ipc::submit` の手前の接続のスレッドだけが呼ぶ）",
+    ),
     (
         "resources::machine_only(",
         "機の値を間を空けて 2 回採る（250 ms 眠る）",
@@ -44,6 +53,7 @@ const SCANS: &[(&str, &str)] = &[
     ("platform::resources::", "OS への問い合わせ（境界 B29）"),
     ("refresh_processes(", "全プロセスの走査"),
     ("refresh_machine(", "機の値の採取"),
+    ("refresh_machine_if_stale(", "機の値の採取（#1994。接続のスレッドだけが呼ぶ）"),
     ("backend_pane_pids(", "`tmux list-panes -a`（子プロセス）"),
     ("process_parent_map(", "親子表の採取"),
     ("Command::new(", "子プロセスを起こす"),
@@ -137,6 +147,7 @@ struct Sources {
     dispatch: String,
     ipc: String,
     resources: String,
+    queue: String,
 }
 
 impl Sources {
@@ -148,6 +159,7 @@ impl Sources {
             dispatch: read(&root, DISPATCH),
             ipc: read(&root, IPC),
             resources: read(&root, RESOURCES),
+            queue: read(&root, QUEUE),
         }
     }
 
@@ -157,6 +169,7 @@ impl Sources {
         out.extend(scan_dispatch(&self.dispatch));
         out.extend(scan_ipc(&self.ipc));
         out.extend(scan_resources(&self.resources));
+        out.extend(scan_queue(&self.queue));
         out
     }
 }
@@ -271,7 +284,7 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
     let lines: Vec<&str> = src.lines().collect();
     let Some(start) = lines
         .iter()
-        .position(|l| !is_comment(l) && l.contains("Request::Queue { action } =>"))
+        .position(|l| !is_comment(l) && l.trim_start().starts_with("Request::Queue {"))
     else {
         return vec![Offender {
             file: DISPATCH,
@@ -314,7 +327,7 @@ fn scan_ipc(src: &str) -> Vec<Offender> {
             why: "`ipc::submit` が見つからない（走査が空振り）".into(),
         }];
     };
-    let answer = code_lines_with(&window, "resources::answer(")
+    let answer = code_lines_with(&window, "queue::answer(")
         .first()
         .copied();
     let queue = code_lines_with(&window, "Request::Queue").first().copied();
@@ -331,8 +344,9 @@ fn scan_ipc(src: &str) -> Vec<Offender> {
         (_, _, Some(s)) => vec![Offender {
             file: IPC,
             line: at + s,
-            why: "`submit` が `Request::Queue` を `resources::answer` で答える前に UI の受け口へ \
-                  渡している（UI が固まると status も返らない。走査が UI スレッドの dispatch に乗る）"
+            why: "`submit` が `Request::Queue` を `queue::answer` で答える前に UI の受け口へ \
+                  渡している（UI が固まると status も順番待ちの割り当ても返らない。走査が UI スレッドの \
+                  dispatch に乗る）"
                 .into(),
         }],
     }
@@ -388,6 +402,44 @@ fn scan_resources(src: &str) -> Vec<Offender> {
     out
 }
 
+/// 6. 調停役の UI から届く口は採らない（#1994）
+const QUEUE_UI_REACHABLE: &[&str] = &[
+    "pub fn handle(",
+    "fn poll(",
+    "fn done(",
+    "fn cancel(",
+    "fn set_limits(",
+    "pub fn status_section(",
+    "fn decide(",
+    "fn refresh_usage(",
+    "fn machine(a: &Arbiter",
+];
+
+fn scan_queue(src: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    for head in QUEUE_UI_REACHABLE {
+        match fn_window(src, head) {
+            None => out.push(Offender {
+                file: QUEUE,
+                line: 0,
+                why: format!("`{head}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) => {
+                let place = format!(
+                    "調停役の `{}`",
+                    head.trim_start_matches("pub fn ")
+                        .trim_start_matches("fn ")
+                        .split('(')
+                        .next()
+                        .unwrap_or(head)
+                );
+                scans_in(QUEUE, at, &window, &place, &mut out);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn ui_スレッドはpcリソースを採らない() {
     let s = Sources::load();
@@ -426,6 +478,12 @@ fn 走査が空振りしていない() {
     assert!(
         !code_lines_with(&w, "sampler_tick(").is_empty(),
         "start の本体が窓に入っている"
+    );
+    let (_, w) = fn_window(&s.queue, "fn poll(").unwrap();
+    assert!(
+        !code_lines_with(&w, "decide(").is_empty() && w.len() >= 30,
+        "調停役の poll の本体が窓に入っている（{} 行）",
+        w.len()
     );
 }
 
@@ -471,8 +529,8 @@ fn 逆戻りを名指しできる() {
     // ② dispatch の腕で採り直す
     let d = inject(
         &s.dispatch,
-        "            \"status\" => Ok(crate::resources::cached_status()),",
-        "            \"status\" => crate::resources::answer(Some(\"status\")),",
+        "                crate::resources::cached_status(),",
+        "                crate::resources::answer(Some(\"status\"))?,",
         "②",
     );
     expect_named(
@@ -485,13 +543,13 @@ fn 逆戻りを名指しできる() {
     // ③ submit の手前の分岐を外す（UI の受け口へ流れる）
     let i = inject(
         &s.ipc,
-        "    if let Request::Queue { action } = &request {",
-        "    if let Some(Request::Queue { action }) = None::<Request> {",
+        "    if let Request::Queue { .. } = &request {",
+        "    if let Some(Request::Queue { .. }) = None::<Request> {",
         "③",
     );
     // 分岐の形が崩れても「答える前に UI へ渡す」順序の違反として名指しされること
     let i = i.replacen(
-        "        return crate::resources::answer(action.as_deref()).map_err(SubmitError::Rejected);",
+        "        return crate::queue::answer(&request).map_err(SubmitError::Rejected);",
         "",
         1,
     );
@@ -551,5 +609,19 @@ fn 逆戻りを名指しできる() {
         scan_main(&m),
         MAIN,
         "resources::machine_only(",
+    );
+
+    // ⑧ 調停役の UI から届く口（poll）で走査する（#1994）
+    let q = inject(
+        &s.queue,
+        "    refresh_usage(&mut a, inj.as_ref(), now);\n    let job = a.jobs.get(&id).cloned().expect(\"直前に入れた\");",
+        "    crate::resources::refresh_machine_if_stale();\n    refresh_usage(&mut a, inj.as_ref(), now);\n    let job = a.jobs.get(&id).cloned().expect(\"直前に入れた\");",
+        "⑧",
+    );
+    expect_named(
+        "調停役の poll で採る",
+        scan_queue(&q),
+        QUEUE,
+        "refresh_machine_if_stale(",
     );
 }

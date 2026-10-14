@@ -84,7 +84,8 @@ enum Command {
     #[command(name = "check-health")]
     CheckHealth(CheckHealthArgs),
     /// PC のメモリ・CPU と重い処理（ビルド・テスト等）の状況を出す（MCP `tako_queue` と 1:1。Issue #1993）。
-    /// アプリへ届かないときは機の状態だけをこのプロセスで採る
+    /// コマンドを付けると重い処理を順番待ちで走らせる（`tako queue cargo build`。Issue #1994）。
+    /// アプリへ届かないときは状況は機の状態だけをこのプロセスで採り、コマンドは待たずに走らせる
     Queue(QueueArgs),
     /// ペインの画面内容をテキストで出力する
     Read(ReadArgs),
@@ -3763,12 +3764,62 @@ struct CheckHealthArgs {
     json: bool,
 }
 
-/// PC リソースの状況の引数（Issue #1993）
+/// PC リソースの状況と順番待ちの引数（Issue #1993 / #1994）
 #[derive(Args)]
 struct QueueArgs {
     /// 生の JSON で出力する（既定は人が読む要約）
     #[arg(long)]
     json: bool,
+    /// 順番待ちの優先度（top / high / normal / low。普段は付けない。env `TAKO_QUEUE_PRIORITY` でも渡せる）
+    #[arg(long)]
+    priority: Option<String>,
+    /// 待ちの上限（例: 90s / 10m / 1h。単位なしは分。既定は設定値 = 30 分。env `TAKO_QUEUE_MAX_WAIT` でも
+    /// 渡せる）。切れたら終了コード 75
+    #[arg(long)]
+    max_wait: Option<String>,
+    /// 状況に出す表示名（既定はコマンド行を短くしたもの）
+    #[arg(long)]
+    label: Option<String>,
+    #[command(subcommand)]
+    command: Option<QueueCommand>,
+}
+
+/// `tako queue` の操作（Issue #1994）。どれにも当たらない語は「順番待ちで走らせるコマンド」
+#[derive(Subcommand)]
+enum QueueCommand {
+    /// 受付番号の処理を取り消す（待ち = 外れて 125 で終わる / 実行中 = 子を止める）
+    Cancel {
+        /// 受付番号（`tako queue` の一覧の番号 = 待っている `tako queue` の pid）
+        id: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 上限を読む / 変える（引数なしで今の値。`settings.json` の `resources` 節）
+    Limits {
+        /// 同時に走らせる重い処理の数（既定 = RAM 12 GB あたり 1・1〜4）
+        #[arg(long)]
+        max_jobs: Option<u32>,
+        /// 空けておくメモリ（GB。既定 = max(2, RAM の 10%)）
+        #[arg(long)]
+        reserve_gb: Option<f64>,
+        /// swap の使用がこれ以上なら 1 件ずつに絞る（GB。既定 2）
+        #[arg(long)]
+        swap_guard_gb: Option<f64>,
+        /// 待ちの上限（分。既定 30）
+        #[arg(long)]
+        max_wait_min: Option<u32>,
+        /// すべて既定へ戻す
+        #[arg(long)]
+        reset: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 隔離の調停役を GUI 無しで立てる（検証用。`TAKO_QUEUE_SOCKET` と `TAKO_TOKEN` が要る）
+    #[command(hide = true)]
+    Serve,
+    /// 順番待ちで走らせるコマンド（例: `tako queue cargo build --release`）
+    #[command(external_subcommand)]
+    Run(Vec<String>),
 }
 
 /// プラットフォーム対応マトリクスの参照引数（Issue #515）
@@ -4611,7 +4662,11 @@ fn cli_main() -> ExitCode {
         // #1441: **IPC が立っていないときこそ答えが要る**診断なので、届かなければ
         // ローカルの受け口診断へ落ちる（run() を通すと「接続情報が無い」で終わる）
         Command::CheckHealth(ref args) => check_health_cli(args.json),
-        Command::Queue(ref args) => queue_cli(args.json),
+        // #1994: コマンド付きは順番待ちで走らせる（終了コードは子と同じ）
+        Command::Queue(ref args) if matches!(args.command, Some(QueueCommand::Run(_))) => {
+            return queue_run_cli(args);
+        }
+        Command::Queue(ref args) => queue_cli(args),
         // 残骸の掃除もローカル処理（IPC 不要）。**GUI が動いていなくても掃ける**ことが
         // 本質（掃除の対象は一時ディレクトリで、GUI の状態とは無関係）
         Command::TestResidue(ref args) => test_residue_local(args),
@@ -6850,12 +6905,165 @@ const QUEUE_OFFLINE_NOTE: &str = "順番待ちは無効（tako が起動して�
 /// 機全体の CPU% を出すために、GUI が居ないとき 2 回採る間隔
 const QUEUE_OFFLINE_CPU_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// `tako queue`: PC リソースの状況（#1993）。届かなければ機の状態だけをこのプロセスで採る
-fn queue_cli(json: bool) -> Result<(), String> {
-    let result = match send_request_classified(Request::Queue { action: None }, None) {
+/// 順番待ちの要求を調停役へ送る（#1994）。`TAKO_QUEUE_SOCKET` を明示していればそこだけ
+/// （隔離の調停役。本番へ漏れない）、無ければいつもの解決（env → 発見ファイル）。
+/// 接続できない・応答の途中で切れた = 届かない、届いて断られた = 断られた
+fn queue_send(request: Request) -> Result<Value, tako_control::queue_wrapper::SendError> {
+    use tako_control::queue_wrapper::SendError;
+    if let Some(socket) = tako_control::queue::explicit_socket() {
+        let token = std::env::var("TAKO_TOKEN").unwrap_or_default();
+        return match transport::roundtrip(&socket, &token, request, None) {
+            Ok(v) => Ok(v),
+            Err(TransportError::Other(m)) => Err(SendError::Rejected(m)),
+            Err(e) => Err(SendError::Unreachable(e.message())),
+        };
+    }
+    match send_request_classified(request, None) {
+        Ok(v) => Ok(v),
+        Err(SendFailure::Unreachable(m) | SendFailure::Broken(m)) => Err(SendError::Unreachable(m)),
+        Err(SendFailure::Operation(m)) => Err(SendError::Rejected(m)),
+    }
+}
+
+fn queue_request(action: &str) -> Request {
+    Request::Queue {
+        action: Some(action.into()),
+        job: None,
+        id: None,
+        limits: None,
+    }
+}
+
+/// `tako queue <コマンド>`: 順番待ちで走らせる（#1994）。終了コードは子と同じ
+fn queue_run_cli(args: &QueueArgs) -> ExitCode {
+    use tako_control::queue_wrapper as w;
+    let Some(QueueCommand::Run(argv)) = &args.command else {
+        return ExitCode::FAILURE;
+    };
+    let priority_text = args
+        .priority
+        .clone()
+        .or_else(|| std::env::var("TAKO_QUEUE_PRIORITY").ok().filter(|v| !v.is_empty()));
+    let priority = match priority_text.as_deref() {
+        None => tako_core::queue::Priority::default(),
+        Some(p) => match tako_core::queue::Priority::parse(p) {
+            Some(p) => p,
+            None => {
+                eprintln!("error: 優先度は top / high / normal / low（受け取った値: {p}）");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let max_wait_text = args
+        .max_wait
+        .clone()
+        .or_else(|| std::env::var("TAKO_QUEUE_MAX_WAIT").ok().filter(|v| !v.is_empty()));
+    let max_wait = match max_wait_text.as_deref().map(w::parse_duration) {
+        None => None,
+        Some(Ok(d)) => Some(d),
+        Some(Err(e)) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let opts = w::Options {
+        priority,
+        max_wait,
+        label: args.label.clone(),
+    };
+    let code = w::run(argv, &opts, &mut queue_send);
+    ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1))
+}
+
+/// `tako queue`（状況）/ `cancel` / `limits` / `serve`（#1993 / #1994）
+fn queue_cli(args: &QueueArgs) -> Result<(), String> {
+    use tako_control::queue_wrapper::SendError;
+    match &args.command {
+        None => queue_status_cli(args.json),
+        Some(QueueCommand::Cancel { id, json }) => {
+            let request = Request::Queue {
+                action: Some("cancel".into()),
+                job: None,
+                id: Some(*id),
+                limits: None,
+            };
+            let result = queue_send(request).map_err(|e| match e {
+                SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
+                SendError::Rejected(m) => m,
+            })?;
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else {
+                let what = if result["phase"] == "waiting" {
+                    "待ちから外した（その tako queue は 125 で終わる）"
+                } else {
+                    "子を止める（SIGTERM → 10 秒で SIGKILL）"
+                };
+                println!(
+                    "取り消した: {} {} — {what}",
+                    result["id"],
+                    result["label"].as_str().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        Some(QueueCommand::Limits {
+            max_jobs,
+            reserve_gb,
+            swap_guard_gb,
+            max_wait_min,
+            reset,
+            json,
+        }) => {
+            let patch = tako_core::queue::LimitsPatch {
+                max_jobs: *max_jobs,
+                reserve_gb: *reserve_gb,
+                swap_guard_gb: *swap_guard_gb,
+                max_wait_min: *max_wait_min,
+                reset: *reset,
+            };
+            let request = Request::Queue {
+                action: Some("limits".into()),
+                job: None,
+                id: None,
+                limits: Some(patch.clone()),
+            };
+            // GUI が居なくても設定ファイルは変えられる（調停役は次に mtime を見て読み直す）
+            let result = match queue_send(request) {
+                Ok(v) => v,
+                Err(SendError::Unreachable(_)) => {
+                    tako_control::queue::limits_offline(patch).map_err(|e| e.to_string())?
+                }
+                Err(SendError::Rejected(m)) => return Err(m),
+            };
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else {
+                print_queue_limits(&result);
+            }
+            Ok(())
+        }
+        Some(QueueCommand::Serve) => {
+            let socket = tako_control::queue::explicit_socket().ok_or(
+                "TAKO_QUEUE_SOCKET が要る（本番の調停役と取り合わないよう、隔離の調停役は明示したときだけ立てる）",
+            )?;
+            let token = std::env::var("TAKO_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .ok_or("TAKO_TOKEN が要る（繋ぐ側の tako queue も同じ値を持つ）")?;
+            tako_control::queue::serve_headless(&socket, token).map_err(|e| e.to_string())
+        }
+        Some(QueueCommand::Run(_)) => unreachable!("cli_main が queue_run_cli へ回す"),
+    }
+}
+
+/// `tako queue`（状況）: PC リソースと順番待ち（#1993 / #1994）。届かなければ機の状態だけをこのプロセスで採る
+fn queue_status_cli(json: bool) -> Result<(), String> {
+    use tako_control::queue_wrapper::SendError;
+    let result = match queue_send(queue_request("status")) {
         Ok(result) => result,
-        Err(SendFailure::Operation(message)) => return Err(message),
-        Err(SendFailure::Unreachable(reason)) => {
+        Err(SendError::Rejected(message)) => return Err(message),
+        Err(SendError::Unreachable(reason)) => {
             let mut local = tako_control::resources::machine_only(QUEUE_OFFLINE_CPU_WINDOW);
             local["gui"] = serde_json::json!(false);
             local["note"] = serde_json::json!(QUEUE_OFFLINE_NOTE);
@@ -6869,6 +7077,125 @@ fn queue_cli(json: bool) -> Result<(), String> {
         print_queue_status(&result);
     }
     Ok(())
+}
+
+/// 上限の 1 行
+fn print_queue_limits(v: &Value) {
+    let configured = &v["configured"];
+    let set: Vec<String> = ["max_jobs", "reserve_gb", "swap_guard_gb", "max_wait_min"]
+        .iter()
+        .filter(|k| !configured[**k].is_null())
+        .map(|k| format!("{k}={}", configured[*k]))
+        .collect();
+    println!(
+        "同時 {} 件・予約 {} GB・swap の警戒線 {} GB・待ちの上限 {} 分（{}）",
+        v["max_jobs"],
+        v["reserve_gb"],
+        v["swap_guard_gb"],
+        v["max_wait_min"],
+        if set.is_empty() {
+            "すべて機に合わせた既定".to_string()
+        } else {
+            format!("設定: {}", set.join(" "))
+        }
+    );
+}
+
+/// 順番待ちの節の表示（#1994）
+fn print_queue_section(q: &Value) {
+    if q.is_null() {
+        return;
+    }
+    if q["arbiter"] != true {
+        println!(
+            "順番待ち: {}",
+            q["reason"].as_str().unwrap_or("この tako は調停役ではない")
+        );
+        return;
+    }
+    let running = q["running"].as_array().cloned().unwrap_or_default();
+    let waiting = q["waiting"].as_array().cloned().unwrap_or_default();
+    let limits = &q["limits"];
+    let mut head = format!(
+        "順番待ち: 実行 {} / 上限 {}・待ち {}（予約 {} GB）",
+        running.len(),
+        limits["max_jobs"],
+        waiting.len(),
+        limits["reserve_gb"]
+    );
+    if q["unmanaged"].as_u64().unwrap_or(0) > 0 {
+        head.push_str(&format!(
+            "・順番待ちを通っていない重い処理 {}",
+            q["unmanaged"]
+        ));
+    }
+    println!("{head}");
+    let pane = |r: &Value| {
+        r["pane"]
+            .as_u64()
+            .map(|p| format!("  ペイン {p}"))
+            .unwrap_or_default()
+    };
+    for r in &running {
+        let mem = match (r["memory_mb"].as_u64(), r["peak_mb"].as_u64()) {
+            (Some(m), Some(p)) => format!("  {}（最大 {}）", human_mb(m), human_mb(p)),
+            (Some(m), None) => format!("  {}", human_mb(m)),
+            _ => String::new(),
+        };
+        let mut flags = Vec::new();
+        if r["stalled"] == true {
+            flags.push("停滞（枠を返した）");
+        }
+        if r["cancel"] == true {
+            flags.push("取り消し中");
+        }
+        println!(
+            "  実行  {}  {}{}  {}{}  取り分 {}{}",
+            r["id"],
+            r["label"].as_str().unwrap_or("?"),
+            pane(r),
+            tako_control::queue_wrapper::human_secs(r["ran_s"].as_u64().unwrap_or(0)),
+            mem,
+            r["share"],
+            if flags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", flags.join("・"))
+            }
+        );
+    }
+    for w in &waiting {
+        println!(
+            "  待ち {}  {}  {}{}  {}  待ち {}",
+            w["position"],
+            w["id"],
+            w["label"].as_str().unwrap_or("?"),
+            pane(w),
+            w["priority"].as_str().unwrap_or("normal"),
+            tako_control::queue_wrapper::human_secs(w["waited_s"].as_u64().unwrap_or(0))
+        );
+    }
+    if let Some(text) = q["blocked"]["text"].as_str() {
+        println!("  先頭が待つ理由: {text}");
+    }
+    if let Some(r) = q["recent"].as_array().and_then(|a| a.first()) {
+        let end = if r["lost"] == true {
+            "wrapper が消えた".to_string()
+        } else {
+            format!("終了 {}", r["exit_code"])
+        };
+        println!(
+            "  直近: {}  {}  {}（{}{}）",
+            r["id"],
+            r["label"].as_str().unwrap_or("?"),
+            end,
+            tako_control::queue_wrapper::human_secs(r["ran_s"].as_u64().unwrap_or(0)),
+            r["peak_mb"]
+                .as_u64()
+                .map(|p| format!("・最大 {}", human_mb(p)))
+                .unwrap_or_default()
+        );
+    }
 }
 
 /// MiB → 人が読む GB / MB
@@ -7007,6 +7334,7 @@ fn print_queue_status(v: &Value) {
             scan["age_ms"].as_u64().unwrap_or(0) as f64 / 1000.0
         );
     }
+    print_queue_section(&v["queue"]);
 }
 
 /// 繋ぐ側からの受け口の診断（#1441）。置き場の決め方は
@@ -7588,7 +7916,9 @@ fn run(command: Command) -> Result<(), String> {
         let result = match send_request_classified(request, None) {
             Ok(value) => value,
             Err(SendFailure::Unreachable(_)) => lsp_install_local(name.as_deref())?,
-            Err(SendFailure::Operation(message)) => return Err(message),
+            Err(SendFailure::Broken(message) | SendFailure::Operation(message)) => {
+                return Err(message)
+            }
         };
         print_result(&command, &result);
         return Ok(());
@@ -10841,6 +11171,9 @@ fn send_request(request: Request) -> Result<Value, String> {
 enum SendFailure {
     /// tako アプリへ届かない（接続情報が無い・どの候補にも接続できない / 認証できない）
     Unreachable(String),
+    /// 繋がったが応答の途中で切れた（送れない・応答が返らない・応答を読めない）。
+    /// 順番待ち（#1994）だけが「届かない」と同じに扱い、他の呼び手は操作の失敗と同じに扱う
+    Broken(String),
     /// 届いたが操作が失敗した
     Operation(String),
 }
@@ -10854,7 +11187,7 @@ enum SendFailure {
 /// 操作エラーはフォールバックせずそのまま返す。どの情報源も無ければ「tako の外」
 fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, String> {
     send_request_classified(request, origin).map_err(|e| match e {
-        SendFailure::Unreachable(m) | SendFailure::Operation(m) => m,
+        SendFailure::Unreachable(m) | SendFailure::Broken(m) | SendFailure::Operation(m) => m,
     })
 }
 
@@ -10869,6 +11202,7 @@ fn send_request_classified(request: Request, origin: Option<&str>) -> Result<Val
         match transport::roundtrip(socket, token, request.clone(), origin) {
             Ok(value) => return Ok(value),
             Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
+            Err(TransportError::Broken(message)) => return Err(SendFailure::Broken(message)),
             Err(stale) => last_failure = Some(stale),
         }
     }
@@ -10885,6 +11219,7 @@ fn send_request_classified(request: Request, origin: Option<&str>) -> Result<Val
         match transport::roundtrip(&info.socket, &info.token, request.clone(), origin) {
             Ok(value) => return Ok(value),
             Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
+            Err(TransportError::Broken(message)) => return Err(SendFailure::Broken(message)),
             // 死んだ残骸・別インスタンスのトークン → 次の候補へ
             Err(stale) => last_failure = Some(stale),
         }
@@ -12233,6 +12568,8 @@ enum TransportError {
     Connect(String),
     /// 認証失敗（トークンが古い = 別インスタンスのもの）
     Auth(String),
+    /// 繋がった後の送受信の失敗（応答の途中で相手が落ちた等。フォールバックしない。#1994）
+    Broken(String),
     /// その他（操作エラー・プロトコルエラー。フォールバックしない）
     Other(String),
 }
@@ -12240,7 +12577,10 @@ enum TransportError {
 impl TransportError {
     fn message(self) -> String {
         match self {
-            TransportError::Connect(m) | TransportError::Auth(m) | TransportError::Other(m) => m,
+            TransportError::Connect(m)
+            | TransportError::Auth(m)
+            | TransportError::Broken(m)
+            | TransportError::Other(m) => m,
         }
     }
 }
@@ -12304,19 +12644,19 @@ mod transport {
         let json = serde_json::to_string(&envelope)
             .map_err(|e| TransportError::Other(format!("送信の構築に失敗: {e}")))?;
         writeln!(write_half, "{json}")
-            .map_err(|e| TransportError::Other(format!("送信に失敗: {e}")))?;
+            .map_err(|e| TransportError::Broken(format!("送信に失敗: {e}")))?;
 
         let mut line = String::new();
         BufReader::new(read_half)
             .read_line(&mut line)
-            .map_err(|e| TransportError::Other(format!("応答の受信に失敗: {e}")))?;
+            .map_err(|e| TransportError::Broken(format!("応答の受信に失敗: {e}")))?;
         if line.is_empty() {
-            return Err(TransportError::Other(
+            return Err(TransportError::Broken(
                 "tako アプリから応答が返らなかった".into(),
             ));
         }
         let response: ResponseEnvelope = serde_json::from_str(&line)
-            .map_err(|e| TransportError::Other(format!("応答を解釈できない: {e}")))?;
+            .map_err(|e| TransportError::Broken(format!("応答を解釈できない: {e}")))?;
         if let Some(error) = response.error {
             return Err(if error.code == error_code::AUTH {
                 TransportError::Auth(error.message)

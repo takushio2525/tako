@@ -1728,7 +1728,13 @@ tako check-health            # 環境の健全性診断（`tako setup --check` �
 tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・残り作業が入る）
 
 tako queue                   # PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理がどのペインで動いているか
+                             # （順番待ちの実行中・待ち・上限・先頭が待つ理由も）
 tako queue --json            # 生の JSON（tako が起動していなければ機の状態だけを返す）
+tako queue cargo build       # 重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。
+                             # 終了コードはコマンドのまま。tako が起動していなければ待たずに走る）
+tako queue cancel 12345      # 受付番号（= 待っている tako queue の pid）の処理を取り消す
+tako queue limits            # 上限（同時数・空けておくメモリ・swap の警戒線・待ちの上限）を読む
+tako queue limits --max-jobs 2   # 同時に走らせる数を変える（--reset で機に合わせた既定へ）
 
 tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
 tako shell-integration install   # 配置する（tako setup が自分で通るので普段は不要）

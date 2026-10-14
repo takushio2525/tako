@@ -63,6 +63,7 @@ pub mod project_root;
 pub mod prompt_append;
 pub mod prompt_delivery;
 pub mod pty_loop;
+pub mod queue;
 pub mod recent;
 pub mod redraw_limit;
 pub mod remote_fs;
