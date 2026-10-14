@@ -80,7 +80,7 @@ check_bundle_privacy() {
 
   # --- 2. 署名の名義 ---
   local target sig line label
-  for target in "$app" "$app/Contents/MacOS/tako"; do
+  for target in "$app" "$app/Contents/MacOS/tako" "$app/Contents/MacOS/tako-mcp"; do
     [[ -e "$target" ]] || continue
     label=${target#"$app"}
     label=${label#/}

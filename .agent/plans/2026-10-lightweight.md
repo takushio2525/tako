@@ -324,7 +324,7 @@ dirty + swap で見た。
 | 4 | **L3 解放済みの malloc の抱え込みを OS へ返す**（起動時の env `MallocLargeCache=0` 等。`malloc_zone_pressure_relief` は 0 を返して効かない = #2009 の実測） | 本番の再起動後で約 50 MB（malloc の区分 136〜139 MB と生きている割り付け 約 90 MB の差）。**#2009 の手放しの後は抱え込みが 264 MB で、env を入れると 325 → 65 MB**（#2009 の実測） | 中（CPU が同程度〜+3 割。起動経路ごとに env を効かせる） | S〜M | #2009 の後に測る | **S4 = #2019（提案）** |
 | 5 | L8 描画の固定 約 150 MB の正体 | 最大 150 MB（描いている間） | 不明 | 調査 S〜 | — | **#2009 (3)** へ実測を渡す |
 | 6 | **L4 `sessions.yaml` の 30 秒ごとの全体書き直し** | 書き込み 約 2.3 GB/日 → 変化時だけ・YAML 全体の parse の CPU と一時メモリ | 低 | S | なし | **S5 = #2020** |
-| 7 | **L6 MCP ブリッジ `tako mcp serve` を軽く** | 1 本 約 5 MB → 2 MB 以下（26 本で約 80 MB・PC 全体） | 中（登録を変えるなら自動移行） | M | なし | **S6 = #2021** |
+| 7 | **L6 MCP ブリッジ `tako mcp serve` を軽く** | 1 本 約 5 MB → 2 MB 以下（26 本で約 80 MB・PC 全体） | 中（登録を変えるなら自動移行） | M | なし | **S6 = #2021**（済。1 本 約 7 MB → 1.09 MB。登録は変えない = 移行なし。§11） |
 | 8 | **L5 見えている窓のアイドル時に display link を止める** | アイドル CPU 0.5〜0.9% → 推定 0.1% 台・wakeup 約 95 回/秒 → 数回/秒（120 Hz の画面では 2 倍効く） | 中〜高（GPUI の patch の運用・最初のフレームの遅れ） | M〜L | GPUI を patch で持つかの判断 | **S7 = #2022（提案）** |
 | 9 | L10 器の裏のペインの tako 側の資源 | 1 枚 0.4 MB（tmux のクライアントまで外せば +1.8 MB） | 中 | — | — | **#2009 (5)** |
 | 10 | L7 直接のペインの履歴を「使った幅」で持つ | 直接の裏 1 枚 15〜48 MB。**本番は器が既定でほぼ 0**（器なし構成・Windows で psmux が無いときに効く） | 高（alacritty の格子の改造） | L | — | 見送り（器なし構成で問題になったら起こす） |
@@ -527,3 +527,65 @@ TAKO_FOOTPRINT_STUB_CLAUDE=1 bash scripts/measure-footprint-2011.sh persist:1   
 - 閉じた直後に tako を終了させると、kill のスレッドが書き終わる前にプロセスが終わることがある（閉じる直前の取り込みは
   kill のスレッドで行う。最後のタブを閉じてアプリが終わる経路は従来どおりその場で書く）
 - psmux（Windows）は 1 回の tmux を使わない（別々に読む）。間引き・揃え・閉じる直前の取り込みは同じ。Windows 実機は未実測
+
+## 11. S6（#2021）MCP の stdio ブリッジを軽くした結果
+
+### 11.1 5 MB の内訳（土台 `5ec2f8f`・release・`footprint <pid>` と `heap <pid>`・GUI の無い `mcp_host` の IPC で中継）
+
+ブリッジの寿命の段ごとに測った。**増えた分のほとんどは「解放したのに OS へ返らない malloc の山」**で、
+生きている割り付けは段を通じて数十 KB（`heap` の `All zones`: 初期化後 887〜908 個・tools/call の後 1,830 個）。
+
+| 段 | footprint | MALLOC_SMALL（dirty） | 何が作ったか |
+|---|---|---|---|
+| initialize の後 | 4.1〜4.3 MB | 1.9〜2.0 MB | clap のコマンド定義の木（`Cli::parse()` が全サブコマンドの説明文ごと組む） |
+| tools/list の後 | 6.5〜6.6 MB | 4.1〜4.3 MB | カタログ（約 200 KB の JSON）を `serde_json::Value` の木で組む |
+| 最初の tools/call の後 | +0.3〜1.5 MB | +0.3〜1.3 MB | 未知パラメータの検出の表（#227）を組むためにカタログをもう 1 度組む（tools/list の前に呼ぶと +1.5 MB） |
+| 像 | 約 0.5 MB | — | CoreFoundation / IOKit / CoreServices / libobjc をリンクしているので像 353 個（libSystem だけなら 51 個）。最小の Rust（標準入力を待つだけ）1.07 MB → 同じものにこの 4 つをリンクすると 1.57 MB |
+| CLI 本体の `__DATA_CONST` | 0.48 MB | — | 19 MB の実行ファイルの定数表が起動時の再配置で全部 dirty になる |
+
+`malloc_zone_pressure_relief(NULL, 0)` は 0 を返して山を返さない（#2009 と同じ。小さな試作でも 2.96 MB の山が残った）。
+
+### 11.2 比べた案（同じ手順 = `scripts/measure-mcp-bridge-2021.sh`。fp は MB）
+
+| 案 | 初期化後 | tools/list 後 | tools/call 後 | 長居（+600 本） | 判断 |
+|---|---|---|---|---|---|
+| 修正前（`TAKO_2021_LEGACY=1` = 同じバイナリの旧経路） | 4.25 | 6.56 | 6.89 | 7.02 | — |
+| (a) 同じ `tako` のまま clap を通らない早い分岐だけ | 2.13 | 4.86 | — | — | 単独では足りない（カタログの山が残る） |
+| (a) + カタログを使い捨ての子プロセス（カタログ係）で組む | 2.09 | 2.28 | 2.45 | 2.94 | **2 MB を割らない**（像 0.5 MB と本体の `__DATA_CONST` 0.48 MB が下限に残る）。Windows と dev の置き場ではこの形 |
+| (b) 専用の小さな実行ファイル（フレームワークをリンクしたまま） | 1.57 | — | — | — | 試作。ld64 は使わない dylib も読み込み命令に残す |
+| (b) + `-dead_strip_dylibs`（libSystem だけ）+ カタログ係 | 1.08 | 1.25 | 1.50 | 1.84〜1.97 | 頭打ちするが 2 MB に近い（9,000 本で 1.83 MB） |
+| **(b) + 引き渡しのときだけ `MallocSpaceEfficient=1`（採用 = .app の形）** | **0.97** | **1.09** | **1.09** | **1.09** | 採用 |
+
+- 長居で伸びる分は、応答（数 KB〜数十 KB）を組んでは捨てる割り付けが CPU ごとの malloc の区画へ散って dirty のまま残るもの
+  （MALLOC_SMALL 816 KB のうち生きているのは 69 KB）。`MallocMaxMagazines=1` は 528 KB、`MallocSpaceEfficient=1` は
+  dirty 128 KB（残りは reclaimable = footprint に数えない）。代わりの CPU は 2,000 本で 0.19 → 0.23 秒（1 本 約 20 µs）
+- (b) の登録の扱いは 2 案を比べた:
+  - **採用: 登録は `tako mcp serve` のまま、.app の `tako` が隣の `tako-mcp` へ exec で引き渡す**。pid は変わらない
+    （#986 の pid 祖先辿りがそのまま効く）。user スコープ・プロジェクトの `.mcp.json`・codex / agy・手で登録したものの
+    **全部が移行なしで軽くなる**。版を戻しても登録が壊れない。代わりに起動が 1 回の exec ぶん遅い（下）
+  - 不採用: 登録を `tako-mcp` へ変えて #916 の自動移行で寄せる。プロジェクトの `.mcp.json` は tako が所在を知らないので
+    寄せきれず（= 旧い登録が残る）、版を戻すと登録先が消える。`check_mcp_health_warning` / setup の修復 / docs の
+    登録コマンドもすべて変わる
+- 引き渡すのは **.app の `Contents/MacOS` の中だけ**: .app は 2 つを同じビルドから組んで置く。dev の `target/` は
+  `cargo build --bin tako` だけで古い `tako-mcp` が残り得て、引き渡すと古い版のブリッジが黙って動く
+- **Windows** は exec が無いので (a) + カタログ係の形（`tako.exe mcp serve` のまま同じプロセスで続ける）。`tako-mcp.exe` は
+  ビルドされるが配らない（使う経路が無い）。Windows の footprint は未実測（この PC で測れない）
+- HTTP 直結（`TAKO_MCP_URL` を登録）は採らない: tako の外で 0 ツールに倒す「設定ゼロ接続」の性質を失う（§2.4 の前提どおり）
+
+### 11.3 実測（配布物の形 = `scripts/build-app.sh` の .app・release・`TAKO_BRIDGE_RUNS=15`）
+
+| | 初期化後 | tools/list 後 | tools/call 後 | 長居（+600 本） | 起動 → initialize（中央 / 最小 / 最大 ms） | tools/list（ms） | 像 | dylib |
+|---|---|---|---|---|---|---|---|---|
+| 修正後（.app の `tako mcp serve` → `tako-mcp`） | 0.97 | 1.09 | 1.09 | 1.09 | 9.2 / 8.6 / 10.2 | 5.2 | tako-mcp | 1 |
+| 同じバイナリの旧経路（`TAKO_2021_LEGACY=1`） | 4.25 | 6.56 | 6.89 | 7.02 | 7.3 / 6.8 / 1,487.5 | 2.2 | tako | 6 |
+| （参考）本番 v0.8.33（10/14 の main・build-app） | 4.08 | 6.47 | 6.72 | 6.78 | 7.2 / 6.7 / 498.3 | 2.3 | tako | 5 |
+
+- **応答のバイト列は旧経路と同じ**（tools/list 198,973 B + tools/call 5 本 = list_panes・platform・set_title・未知パラメータの拒否・
+  端末の無い read_pane を mcp_host が中継。sha256 の先頭 `6cee432e451d` が一致）。番犬 `crates/tako-cli/tests/issue2021_mcp_bridge.rs`
+  が tako の中（GUI が落ちている間の中継・ping・未対応のメソッド・壊れた JSON を含む）/ tako の外（0 ツール）/ カタログ係を
+  起こせないとき / .app の引き渡しの有無をバイト単位で突き合わせる
+- 起動は exec の 1 回ぶん約 2 ms、tools/list はカタログ係を起こすぶん約 3 ms 遅い（どちらも claude の起動に 1 回だけ）。
+  最大の 1,487 / 498 ms は作りたての実行ファイルの初回（署名の検査と読み込み）
+- 本番の 10/13 の 26 本に当てると、footprint の計は約 180 MB（1 本 6.8〜7.0 MB）→ 約 28 MB の見込み（1 本の値 × 26。RSS は未実測）
+- 回帰の見張り: `tako-mcp` が libSystem 以外をリンクし始めたら `scripts/build-app.sh` が止まる（release の `otool -L`）。
+  debug は使わない関数が LLVM で消えずに残るのでフレームワークが外れない（番犬の otool の項目は release だけで走る）

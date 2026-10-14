@@ -231,6 +231,11 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
   `claude mcp add --scope user tako -- <tako のパス> mcp serve` を登録すれば、以後は
   どのプロジェクト・どのペインでも設定なしで使える（ブリッジが起動毎に TAKO_* を読むため、
   セッション毎に変わる URL / トークンに依存しない）。tako の外では 0 ツールを返し無害
+- FR-2.3.2 のブリッジの常駐コスト（#2021）: ブリッジは claude 1 本につき 1 本常駐するので、
+  **登録のコマンド（`tako mcp serve`）を変えずに**常駐する側を軽くする（clap を通らない・カタログを
+  使い捨ての子プロセスで組む・macOS の .app では libSystem だけをリンクする `tako-mcp` へ exec で
+  引き渡す）。応答のバイト列は変えない（番犬 `crates/tako-cli/tests/issue2021_mcp_bridge.rs`）。
+  登録を変えないので移行は要らない。仕組みは `architecture.md`「Layer 2」の stdio ブリッジ
 - FR-2.3.2 の worker への適用（#986）: **master だけでなく worker / git resolve でも
   ゼロコンフィグで繋がる**。codex は MCP 子プロセスへ親環境を渡さない
   （実測 0.153.0: `env_vars` に挙げた名前だけが届く）ので、起動コマンドへ

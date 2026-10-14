@@ -1497,38 +1497,71 @@ fn target_pane(args: &Value, caller: Option<u64>) -> Result<u64, String> {
     })
 }
 
-/// ツール名 → 許可パラメータ名セットのキャッシュ（#227）。
-/// `tools()` のスキーマから `inputSchema.properties` のキーを抽出して構築する。
-/// 全ツールの `additionalProperties: false` を実行時に強制する
-fn allowed_params_map(
-) -> &'static std::collections::HashMap<String, std::collections::HashSet<String>> {
-    use std::collections::{HashMap, HashSet};
-    use std::sync::OnceLock;
-    static MAP: OnceLock<HashMap<String, HashSet<String>>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut map = HashMap::new();
-        for tool in tools() {
+/// ツール名 → 許可パラメータ名（`inputSchema.properties` のキー）の表（#227）。
+/// 全ツールの `additionalProperties: false` を実行時に強制する。
+///
+/// #2021 で型にした: MCP の stdio ブリッジは常駐プロセスでカタログ（[`tools`]）を組むと
+/// malloc の山が約 1.5 MB 残る（解放しても OS へ返らない）ので、使い捨ての子プロセスに
+/// この表を組ませて JSON で受け取る（[`set_params_table_source`]）。GUI の HTTP 経路は
+/// 今までどおりプロセスの中で組む
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ParamsTable(Vec<(String, Vec<String>)>);
+
+impl ParamsTable {
+    /// カタログから組む。`inputSchema` の無いツールは載せない（= 検証しない）。
+    /// 同じ名前が 2 度あれば後ろが勝つ（#2021 までの `HashMap::insert` と同じ）
+    pub fn from_catalog(tools: &[Value]) -> Self {
+        let mut entries: Vec<(String, Vec<String>)> = Vec::new();
+        for tool in tools {
             if let (Some(name), Some(schema)) = (
                 tool.get("name").and_then(Value::as_str),
                 tool.get("inputSchema"),
             ) {
-                let keys: HashSet<String> = schema
+                let keys: Vec<String> = schema
                     .get("properties")
                     .and_then(Value::as_object)
                     .map(|props| props.keys().cloned().collect())
                     .unwrap_or_default();
-                map.insert(name.to_string(), keys);
+                match entries.iter_mut().find(|(n, _)| n == name) {
+                    Some(entry) => entry.1 = keys,
+                    None => entries.push((name.to_string(), keys)),
+                }
             }
         }
-        map
-    })
+        Self(entries)
+    }
+
+    /// そのツールが受け付ける引数名（表に無いツールは `None` = 検証しない）
+    fn allowed(&self, tool_name: &str) -> Option<&[String]> {
+        self.0
+            .iter()
+            .find(|(name, _)| name == tool_name)
+            .map(|(_, keys)| keys.as_slice())
+    }
+}
+
+/// 表の出どころ（[`set_params_table_source`]）
+static PARAMS_TABLE_SOURCE: std::sync::OnceLock<fn() -> Option<&'static ParamsTable>> =
+    std::sync::OnceLock::new();
+
+/// 許可パラメータの表をプロセスの外から取るよう差し替える（MCP の stdio ブリッジ専用。#2021）。
+/// `source` が `None` を返したら（子プロセスが使えない等）プロセスの中で組む側へ倒す
+pub fn set_params_table_source(source: fn() -> Option<&'static ParamsTable>) {
+    let _ = PARAMS_TABLE_SOURCE.set(source);
+}
+
+fn params_table() -> &'static ParamsTable {
+    if let Some(table) = PARAMS_TABLE_SOURCE.get().and_then(|source| source()) {
+        return table;
+    }
+    static IN_PROCESS: std::sync::OnceLock<ParamsTable> = std::sync::OnceLock::new();
+    IN_PROCESS.get_or_init(|| ParamsTable::from_catalog(&tools()))
 }
 
 /// 引数の全キーがツールスキーマの `properties` に含まれるか検証する。
 /// 未知キーがあれば JSON-RPC InvalidParams エラーを返す
 pub(super) fn validate_known_params(tool_name: &str, args: &Value) -> Result<(), (i64, String)> {
-    let map = allowed_params_map();
-    let Some(allowed) = map.get(tool_name) else {
+    let Some(allowed) = params_table().allowed(tool_name) else {
         return Ok(());
     };
     if let Some(obj) = args.as_object() {
