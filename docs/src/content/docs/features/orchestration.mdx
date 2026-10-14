@@ -1,0 +1,127 @@
+---
+title: オーケストレーションとは
+seoTitle: AI エージェントのオーケストレーションとは — 複数の Claude Code を並列で動かす
+description: 司令塔の AI（master）が依頼を分解し、担当の AI（worker）を同じタブのペインに立ち上げて並列に働かせる。tako のオーケストレーションの考え方と、スクリプトや tmux で自作する場合との違いを説明します
+---
+
+import OrchLaunch from '../../../components/scenes/OrchLaunch.astro';
+import OrchDialog from '../../../components/scenes/OrchDialog.astro';
+import OrchReview from '../../../components/scenes/OrchReview.astro';
+import OrchView from '../../../components/scenes/OrchView.astro';
+import OrchHandoff from '../../../components/scenes/OrchHandoff.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
+import { windowsSupport } from '../../../components/motion/windowsSupport';
+
+export const orchRows = [...windowsSupport.rows].filter(([name]) => name.startsWith('tako_orchestrator_'));
+export const orchSupported = orchRows.filter(([, status]) => status === '対応').length;
+
+<div id="そもそもオーケストレーションとは" class="tako-anchor"></div>
+
+司令塔の AI（**master**）に日本語で 1 回頼むと、master が仕事を分け、担当の AI（**worker**）を同じタブに並べて同時に進めます。見張り・確認待ちへの返事・結果の確かめ・片付けまで master が引き受けるので、あなたは最初の依頼と最後の報告を読むだけです。
+
+<Cmd>tako master</Cmd>
+
+スクロールすると、tako の画面が実際の流れで動きます。使い方の実例やつまずきやすい点は [tako master 実践ガイド](/features/orchestrator/) にあります。
+
+<div id="tako-のオーケストレーション体験" class="tako-anchor"></div>
+<div id="作業が目の前で見える" class="tako-anchor"></div>
+
+## 頼むのは 1 回
+
+worker は別の窓や見えない場所ではなく、**頼んだ master と同じタブ**に並びます。何体いても、誰が何をしているかはこのタブを見れば分かります。
+
+<OrchLaunch />
+
+<div id="監視と回収まで自動で起きる" class="tako-anchor"></div>
+
+## 止まった worker には、master が答える
+
+<OrchDialog />
+
+<div id="品質は仕組みで作り込まれる" class="tako-anchor"></div>
+
+## 確かめてから、片付ける
+
+<OrchReview />
+
+## orch ビューで全体を見渡す
+
+<OrchView />
+
+## 長い仕事は、後任の master へ引き継ぐ
+
+会話が長くなりすぎる前に、master は自分で後任を立てて交代します。一晩かかる仕事を任せても、途中で司令塔が息切れしません。
+
+<OrchHandoff />
+
+## なぜターミナルに組み込むのか
+
+オーケストレーションは、スクリプトや tmux を組み合わせれば自作もできます。ただ、実際にやるとこんな壁に当たります。
+
+| 自作でつまずくところ | tako では |
+|---|---|
+| worker がどこで動いているか見えない | 同じタブのペインに並び、画面がそのまま見える |
+| 確認待ちで止まっていても気づけない | tako が形で見つけ、master が答える |
+| tmux・スクリプト・MCP の設定を自分でつなぐ | `tako master` の 1 コマンド。設定ファイルは書かない |
+
+ターミナル自身がオーケストレーションの舞台なので、外部のスクリプトは要りません。
+
+## Windows でも使えます
+
+Windows でも同じ流れで動きます。master と worker の操作（`tako_orchestrator_` で始まる {orchRows.length} 機能）のうち <strong>{orchSupported} 機能が、Windows の実機で確かめた「対応」</strong>です。一部だけ違うのは次の 1 つです（全体は [Windows 対応状況](/windows-support/)）。
+
+<WindowsLimits
+	items={[
+		{
+			kind: 'degraded',
+			title: 'tako を閉じている間のダイアログへの返事',
+			text: 'tako の画面が持っていないペイン（tako を閉じている間や、消えたペイン）の確認ダイアログには答えられません。tako を開いていれば、master は答えられます。',
+			tools: ['tako_orchestrator_respond'],
+		},
+	]}
+/>
+
+master を起動できるのは claude と codex です。worker は claude・codex・agy のどれでも動きます。自動ハンドオフは claude の master だけです（詳しくは [エージェントごとの対応](/agent-support/)）。
+
+## ほかにも
+
+### 設定ファイルを触らなくていい
+
+管理するプロジェクトやモデルの設定も、master に日本語で頼めば登録まで済ませます。
+
+> 「`~/Documents/api-server` のリポジトリも管理対象に追加して」
+
+### 再起動しても壊れない
+
+worker は [tmux バックエンド](/features/tmux-backend/)（Windows では psmux）の上で動きます。tako を閉じても worker のプロセスは裏で動き続け、次に開いたときに画面ごと戻ります。
+
+### プロジェクトをまたげる
+
+worker はそれぞれ別のプロジェクトのフォルダで動けます。フロントエンド・API・ドキュメントのリポジトリを、1 つの master に任せられます。
+
+## 1 対 1 で十分なら `tako solo`
+
+worker に分ける必要がなく、AI と 1 対 1 で作業したいだけなら `tako solo` を使います。worker を起動せず、その AI 自身がファイルを読み、コードを書き、テストを走らせ、コミットまで進めます。
+
+<Cmd>tako solo</Cmd>
+
+master と同じく管理対象のプロジェクトを知っているので、`cd` しなくても「demo の README を直して」のように名前で頼めます。**まず 1 つのことを任せるなら solo、いくつも並べて進めるなら master** と覚えておけば十分です。
+
+## 3 分で始める
+
+<div class="tako-start-steps not-content">
+<div class="tako-start-step"><span class="tako-start-n">1</span><span class="tako-start-text">AI 連携の準備（揃っていれば質問は出ません）</span><Cmd>tako setup</Cmd></div>
+<div class="tako-start-step"><span class="tako-start-n">2</span><span class="tako-start-text">今のペインで master を起動して、話しかける</span><Cmd>tako master</Cmd></div>
+</div>
+
+master は、プロファイルで選んだ AI（claude か codex）で立ち上がります。あとは、やってほしいことを伝えるだけです。
+
+## 次に読む
+
+<div class="tako-next-grid not-content">
+<a class="tako-next-card" href="/features/orchestrator/"><strong>tako master 実践ガイド</strong><span>話しかけ方の実例・つまずきやすい点・仕組みの補足</span></a>
+<a class="tako-next-card" href="/getting-started/quickstart/"><strong>クイックスタート</strong><span>入れたあと、最短で AI に画面を任せるまで</span></a>
+<a class="tako-next-card" href="/features/mcp-server/"><strong>内蔵 MCP サーバー</strong><span>オーケストレーションを支える、AI から tako を操作する仕組み</span></a>
+<a class="tako-next-card" href="/guides/parallel-agents/"><strong>Claude Code を複数同時に動かす</strong><span>tako を使わない方法も含めた 3 通りのやり方と、並列の落とし穴</span></a>
+</div>

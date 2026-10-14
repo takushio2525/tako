@@ -1,0 +1,69 @@
+---
+/**
+ * 場面（オーケストレーションのページ #2059）: worker の確認待ちのダイアログに master が答える。
+ * 事実の出どころ: .agent/requirements.md FR-2.25（ダイアログは文言でなく構造で検知 / watch が
+ * WORKER_PERMISSION・WORKER_DIALOG を出す / respond は番号かラベルで答え、--choice を省くと送らずに
+ * 選択肢だけ返す / 応答後に解消を確かめる / trust・bypass は tako 自身が承諾する）/
+ * `tako orchestrator respond --help` / Windows は `tako platform --platform windows` で
+ * tako_orchestrator_respond = 一部対応（tako が保持していないペインへは答えられない）。
+ * ダイアログの中の英文は AI の CLI（claude）が出すもの。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import '../../styles/tako-orch.css';
+---
+
+<Scrolly label="worker の確認待ちに、master が答える流れ" flip>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25} masterAt="1+">
+		<Split>
+			<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+				<span class="tk-l tk-tui-msg">2 体が作業中です</span>
+				<span class="tk-l tk-tui-msg is-tool tk-warn" data-at="2+">WORKER_PERMISSION · pane 2</span>
+				<span class="tk-l tk-dim" data-at="2+" style="--d: .25s">  npm test の実行の許可待ち</span>
+				<span class="tk-l tk-tui-msg" data-at="2+" style="--d: .5s">テストの実行は依頼の範囲内。許可します</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="3+">tako_orchestrator_respond</span>
+				<span class="tk-l tk-dim" data-at="3+" style="--d: .2s">  pane 2 · choice 1 → 解消</span>
+			</Pane>
+			<Split dir="col">
+				<Pane n={2} title="my-app: test" badge="WORKER" parent="master" state="running">
+					<span class="tko-alert" data-at="2" data-fx="fade"></span>
+					<span class="tk-l tk-tui-msg is-tool">tests/login.test.ts を作成</span>
+					<div data-at="1-2" data-fx="unfold">
+						<div>
+							<div class="tko-dlg-box">
+								<span class="tk-l tk-b">Bash command</span>
+								<span class="tk-l tk-c">  npm test</span>
+								<span class="tk-l">Do you want to proceed?</span>
+								<span class="tk-l tk-acc">❯ 1. Yes</span>
+								<span class="tk-l tk-dim">  2. Yes, and don't ask again</span>
+								<span class="tk-l tk-dim">  3. No</span>
+							</div>
+						</div>
+					</div>
+					<span class="tk-l tk-tui-msg is-tool" data-at="3+" style="--d: .5s">npm test</span>
+					<span class="tk-l tk-ok" data-at="3+" style="--d: .9s">  12 passed</span>
+				</Pane>
+				<Pane n={3} title="docs: typo" badge="WORKER" parent="master" state="running">
+					<span class="tk-l tk-tui-msg is-tool">guide.md を読む</span>
+					<span class="tk-l tk-tui-msg" data-at="2+">誤字を 4 か所直しました</span>
+				</Pane>
+			</Split>
+		</Split>
+	</TakoWindow>
+
+	<Step title="worker が確認待ちで止まる">
+		<p>worker は、コマンドの実行などで AI の CLI が出す<strong>確認のダイアログ</strong>で止まることがあります。放っておくと、そこで作業が止まったままです。</p>
+	</Step>
+	<Step title="tako が見つけて、master に知らせる">
+		<p>tako は画面の<strong>形</strong>から選択肢のダイアログを見つけ、種類（許可・選択など）と選択肢を master に渡します。どの worker が何を待っているかが、master にすぐ届きます。</p>
+		<p class="tk-step-note">フォルダの信頼の確認のように tako 自身が承諾するものは、master へは回しません。</p>
+	</Step>
+	<Step title="master が選んで答える">
+		<p>master は依頼の範囲かを判断し、番号かラベルで答えます。答えたあとはダイアログが消えたことまで確かめ、worker は先へ進みます。課金やモデルの変更しか選べないものは、勝手に選ばずあなたに回します。</p>
+		<p>同じ操作は <code>tako orchestrator respond --pane 2</code> で人もできます（<code>--choice</code> を付けなければ、送らずに選択肢だけを表示）。</p>
+		<p class="tk-step-note">Windows では、tako の画面が持っていないペイン（tako を閉じている間など）のダイアログには答えられません。</p>
+	</Step>
+</Scrolly>

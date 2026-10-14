@@ -1,0 +1,71 @@
+---
+/**
+ * 場面（オーケストレーションのページ #2059）: master の自動ハンドオフ（claude の master だけ）。
+ * 事実の出どころ: .agent/requirements.md FR-2.24（閾値は 50〜60%・既定 60 / tako が
+ * 【tako 自動通知】で始まる指示を送る / 前任のペインは後任が閉じる / 後任の role・プロファイル・タブは
+ * 前任と同じ）/ crates/tako-core/src/handoff.rs の nudge_prompt_in（通知の文面）/
+ * crates/tako-control/src/dispatch.rs（後任は前任 master のペインを右へ分割して立ち、前任が閉じると
+ * その矩形を継ぐ。後任のタイトルは master-<プロファイル名>）/
+ * `tako agent-support` の master_auto_handoff（claude = ok / codex = todo）。
+ * 左下の ctx の札は図の説明（tako の画面の一部ではない）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import '../../styles/tako-orch.css';
+---
+
+<Scrolly label="master のコンテキストが埋まったら、後任へ引き継ぐ流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={25} masterAt="1+" class="tko-ho">
+		<Split>
+			<Split>
+				<Pane n={1} title="マスター" badge="ORCH" state="running" focus="1-3" at="1-3" fx="split">
+					<span class="tk-l tk-tui-msg">2 体が作業中です</span>
+					<span class="tk-l tk-tui-user" data-at="2+">【tako 自動通知】コンテキスト使用率が 61%（閾値 60%）に達しました。</span>
+					<span class="tk-l tk-tui-user" data-at="2+" style="--d: .3s">引き継ぎを開始してください。ユーザーの許可を求める必要はありません。</span>
+					<span class="tk-l tk-tui-msg is-tool" data-at="3+">引き継ぎファイルを更新</span>
+					<span class="tk-l tk-tui-msg is-tool" data-at="3+" style="--d: .3s">tako_orchestrator_handoff</span>
+				</Pane>
+				<Pane n={4} title="master-default" badge="ORCH" state="running" focus="4+" at="3+" fx="split" style="--d: .5s">
+					<span class="tk-l tk-tui-msg" data-at="3+" style="--d: 1.1s">引き継ぎを読みました</span>
+					<span class="tk-l tk-tui-msg is-tool" data-at="4+">tako_orchestrator_workers</span>
+					<span class="tk-l tk-dim" data-at="4+" style="--d: .2s">  実態と食い違い 0 件</span>
+					<span class="tk-l tk-tui-msg is-tool" data-at="4+" style="--d: .4s">前任のペインを閉じました</span>
+				</Pane>
+			</Split>
+			<Split dir="col">
+				<Pane n={2} title="my-app: test" badge="WORKER" parent="master" state="running">
+					<span class="tk-l tk-tui-msg is-tool">npm test</span>
+				</Pane>
+				<Pane n={3} title="docs: typo" badge="WORKER" parent="master" state="running">
+					<span class="tk-l tk-tui-msg is-tool">guide.md を直す</span>
+				</Pane>
+			</Split>
+		</Split>
+		<span slot="overlay" class="tko-ctx">
+			master の ctx
+			<span class="tko-ctx-bar"><i></i></span>
+			<span class="tko-swap">
+				<b data-at="1" data-fx="fade">58%</b>
+				<b class="is-warn" data-at="2-3" data-fx="fade">61%</b>
+				<b data-at="4+" data-fx="fade">8%</b>
+			</span>
+		</span>
+	</TakoWindow>
+
+	<Step title="長い仕事で、コンテキストが埋まっていく">
+		<p>master は worker の報告を読むたびに、会話の量（コンテキスト）が増えていきます。tako は master の画面から、その使用率を見張っています。</p>
+	</Step>
+	<Step title="閾値を超えると、tako が知らせる">
+		<p>使用率が閾値（既定 60%）を超えると、tako が <code>【tako 自動通知】</code> で始まる指示を master へ送ります。あなたの許可を待たずに、引き継ぎが始まります。</p>
+		<p class="tk-step-note">自動ハンドオフは claude の master だけです（codex の master はまだ）。閾値は 50〜60% の範囲で変えられます。</p>
+	</Step>
+	<Step title="引き継ぎを書いて、後任を立てる">
+		<p>master は進行中の仕事・worker の居場所・次の一手を引き継ぎファイルに書き、<strong>同じタブ</strong>に後任の master を立てます。後任は前任と同じプロファイルで起動します。</p>
+	</Step>
+	<Step title="後任が確かめて、前任を閉じる">
+		<p>後任は引き継ぎと実際の worker を突き合わせてから、前任のペインを閉じ、同じ場所に収まります。worker は止まらずに動き続けます。</p>
+	</Step>
+</Scrolly>

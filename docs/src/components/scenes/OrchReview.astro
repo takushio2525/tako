@@ -1,0 +1,93 @@
+---
+/**
+ * 場面（オーケストレーションのページ #2059）: 終わった worker の検収 → 片付け → 詰め直し。
+ * 事実の出どころ: `tako orchestrator watch --help`（WORKER_IDLE / WORKER_ERROR / WORKER_GONE）/
+ * `tako orchestrator report --help` / .agent/requirements.md FR-2.20.5（worker を閉じると空いた場所を
+ * 残りの worker で詰め直す。master とユーザーのペインの矩形は変えない）/ spawn_layout.rs の build_grid
+ * （4 体 = 左列 1・2 体目 + 右列 3・4 体目 → 3 体目を閉じると右列は 4 体目だけ → それも閉じると上下 2 枚）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import '../../styles/tako-orch.css';
+---
+
+<Scrolly label="worker の結果を確かめて、片付けて、詰め直す流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={27}>
+		<Split>
+			<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+				<div data-at="1-4" data-fx="unfold">
+					<div>
+						<span class="tk-l tk-tui-msg">4 体が作業中です</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="1+">WORKER_IDLE · pane 4</span>
+						<span class="tk-l tk-tui-msg is-tool" data-at="2+">tako_orchestrator_report</span>
+						<span class="tk-l" data-at="2+" style="--d: .25s"><span class="tk-dim">  条件 1 型エラー 0 件 </span><span class="tk-ok">✓</span></span>
+						<span class="tk-l" data-at="2+" style="--d: .45s"><span class="tk-dim">  条件 2 テストが緑 </span><span class="tk-ok">✓</span></span>
+						<span class="tk-l tk-tui-msg" data-at="3+">pane 4 を閉じました</span>
+						<span class="tk-l tk-tui-msg" data-at="4+">pane 5 も確かめて閉じました</span>
+					</div>
+				</div>
+				<span class="tk-l tk-tui-msg" data-at="5">4 件とも終わりました</span>
+				<span class="tk-l tk-dim" data-at="5" style="--d: .2s">  テスト 3 件追加（12 passed）</span>
+				<span class="tk-l tk-dim" data-at="5" style="--d: .35s">  誤字 4 か所 / 型エラー 0 件</span>
+				<span class="tk-l tk-dim" data-at="5" style="--d: .5s">  CI の警告 0 件</span>
+				<span class="tk-l tk-dim" data-at="5" style="--d: .65s">  未検証: 画面の見た目</span>
+			</Pane>
+			<Split at="1-4" fx="split">
+				<Split dir="col">
+					<Pane n={2} title="my-app: test" badge="WORKER" parent="master" state="running">
+						<span class="tk-l tk-tui-msg is-tool">npm test</span>
+					</Pane>
+					<Pane n={3} title="docs: typo" badge="WORKER" parent="master" state="running">
+						<span class="tk-l tk-tui-msg is-tool">guide.md を直す</span>
+					</Pane>
+				</Split>
+				<Split dir="col" at="1-3" fx="split">
+					<Pane
+						n={4}
+						title="api: types"
+						badge="WORKER"
+						parent="master"
+						state="idle"
+						at="1-2"
+						fx="split"
+					>
+						<span class="tko-alert is-ok" data-at="1" data-fx="fade"></span>
+						<span class="tk-l tk-tui-msg">型エラー 0 件。完了</span>
+					</Pane>
+					<Pane
+						n={5}
+						title="my-app: ci"
+						badge="WORKER"
+						parent="master"
+						state={[
+							{ at: '!4+', state: 'running' },
+							{ at: '4+', state: 'idle' },
+						]}
+					>
+						<span class="tk-l tk-tui-msg is-tool">ci.yml を直す</span>
+						<span class="tk-l tk-tui-msg" data-at="4+">警告 0 件。完了</span>
+					</Pane>
+				</Split>
+			</Split>
+		</Split>
+	</TakoWindow>
+
+	<Step title="終わった worker を見つける">
+		<p>master は worker を見張り、<strong>完了（idle）・異常停止・消滅</strong>のどれかになったところで知らせを受けます。ここでは 4 番のペインが終わりました。</p>
+	</Step>
+	<Step title="証拠で確かめてから受け取る">
+		<p>worker の「終わりました」をうのみにせず、master は報告を読み、<strong>受け入れ条件ごとの証拠</strong>（実行したコマンドと出力・差分）を確かめます。</p>
+	</Step>
+	<Step title="閉じたら、残りで詰める">
+		<p>確かめ終えた worker のペインは master が閉じます。空いた場所は残りの worker が埋め、<strong>master の場所と大きさは変わりません</strong>。</p>
+	</Step>
+	<Step title="列が空けば、上下 2 枚に戻る">
+		<p>右の列の worker も終わって閉じると、残る 2 体が右側を上下に分け直します。何体いても、配置は master が整えます。</p>
+	</Step>
+	<Step title="最後に、まとめてあなたへ">
+		<p>全部が終わると worker のペインは片付き、master が結果をまとめて報告します。確かめられなかったこと（画面の見た目など）は「未検証」と正直に書かれます。</p>
+	</Step>
+</Scrolly>

@@ -1,0 +1,105 @@
+---
+/**
+ * 場面（オーケストレーションのページ #2059）: 右パネルの orch ビューでチームを見渡す。
+ * 事実の出どころ: crates/tako-app/src/right_panel.rs の render_orch_view（全タブから master を集める /
+ * 行を押すとそのペインへ移る jump_to_pane / 状態の色）/ ui_text/panel.rs /
+ * `tako panel --show --view orch`（AGENTS.md のコマンド表）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import RightPanel from '../motion/RightPanel.astro';
+import OrchTree from '../motion/OrchTree.astro';
+import Pointer from '../motion/Pointer.astro';
+---
+
+<Scrolly label="右パネルの orch ビューで、チームを見渡す流れ" flip>
+	<TakoWindow
+		slot="stage"
+		tabs={[
+			{ label: 'my-app (AI チーム)', state: 'running', active: true },
+			{ label: 'docs-site', state: 'running', at: '4+' },
+		]}
+		height={25}
+		masterAt="1+"
+	>
+		<Split>
+			<Pane n={1} title="マスター" badge="ORCH" state="running" focus="!3+">
+				<span class="tk-l tk-tui-msg">2 体が作業中です</span>
+				<span class="tk-l tk-tui-msg is-tool" data-at="2+">WORKER_IDLE · pane 3</span>
+			</Pane>
+			<Split dir="col">
+				<Pane n={2} title="my-app: test" badge="WORKER" parent="master" state="running">
+					<span class="tk-l tk-tui-msg is-tool">npm test</span>
+				</Pane>
+				<Pane
+					n={3}
+					title="docs: typo"
+					badge="WORKER"
+					parent="master"
+					state={[
+						{ at: '!2+', state: 'running' },
+						{ at: '2+', state: 'idle' },
+					]}
+					focus="3+"
+				>
+					<span class="tk-l tk-tui-msg">誤字を 4 か所直しました</span>
+					<span class="tk-l tk-tui-input" data-at="3+" style="--d: .6s">❯ <span class="tk-cur"></span></span>
+				</Pane>
+			</Split>
+		</Split>
+		<RightPanel slot="right" active="orch" width="44%">
+			<OrchTree
+				summary={[
+					{ at: '!4+', text: '1 orch · 2 workers' },
+					{ at: '4+', text: '2 orch · 3 workers' },
+				]}
+				masters={[
+					{
+						name: 'マスター',
+						tab: 'my-app (AI チーム)',
+						uptime: '12m04s',
+						ctx: '23%',
+						workers: [
+							{ name: 'orchestrator-worker:my-app:test', sub: 'my-app: test' },
+							{
+								name: 'orchestrator-worker:docs:typo',
+								sub: 'docs: typo',
+								state: [
+									{ at: '!2+', state: 'running' },
+									{ at: '2+', state: 'idle' },
+								],
+								markAt: '3',
+							},
+						],
+					},
+					{
+						name: 'マスター',
+						tab: 'docs-site',
+						uptime: '3m10s',
+						ctx: '9%',
+						at: '4+',
+						workers: [{ name: 'orchestrator-worker:docs-site:build', sub: 'docs-site: build' }],
+					},
+				]}
+			/>
+		</RightPanel>
+		<Pointer slot="overlay" path="1:66,14 3:80,58" click="1 3" />
+	</TakoWindow>
+
+	<Step title="orch ビューで、チームを一覧する">
+		<p>右パネルの <strong>orch</strong> に、master と配下の worker がツリーで並びます。master には稼働時間とコンテキストの使用率も出ます。</p>
+		<p class="tk-step-note">コマンドで開くなら <code>tako panel --show --view orch</code>。</p>
+	</Step>
+	<Step title="状態は色で分かる">
+		<p>動いている worker は青、終わって待っている worker は緑。落ちた worker は赤い × と <code>failed</code> で目立ちます。</p>
+	</Step>
+	<Step title="行を押すと、そのペインへ">
+		<p>ツリーの行を押すと、その worker のペインへ移ります。気になる worker には、そのまま話しかけて方針を直せます。</p>
+	</Step>
+	<Step title="ほかのタブの master も並ぶ">
+		<p>orch ビューは<strong>すべてのタブ</strong>から master を集めます。別のプロジェクトを別のタブの master に任せても、ここで全部を見渡せます。</p>
+	</Step>
+</Scrolly>

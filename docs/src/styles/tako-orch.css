@@ -1,0 +1,319 @@
+/*
+ * オーケストレーションのページ（#2059）の見た目: orch ビューの再現（OrchTree.astro）と、
+ * そのページの場面だけで使う小物（選択肢ダイアログ・注意の枠・ctx の注記・worker 領域の文字の縮み）。
+ *
+ * 共有の部品（tako-ui.css / motion.css）の既存の見た目は変えない。クラスはすべて tko- で始める。
+ * 配色は tako-ui.css の --ui-*（tako 本体の既定ダークテーマの写し）を使う。
+ */
+
+/* ============================================================
+ * 重ねて入れ替える値（状態の点・件数・ctx など）
+ * ============================================================ */
+.tko-swap {
+  display: inline-grid;
+  vertical-align: baseline;
+}
+.tko-swap > * {
+  grid-area: 1 / 1;
+}
+
+/* ============================================================
+ * orch ビュー（crates/tako-app/src/right_panel.rs の render_orch_view）
+ * ============================================================ */
+.tko-orch {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.tko-orch-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6em;
+  padding: 0.35em 0.35em 0.55em;
+  white-space: nowrap;
+}
+.tko-orch-title {
+  font-size: 0.875em;
+  font-weight: 700;
+  color: var(--ui-muted);
+  letter-spacing: 0.02em;
+}
+.tko-orch-sum {
+  margin-left: auto;
+  font-size: 0.83em;
+  color: var(--ui-faint);
+}
+
+.tko-card-slot > div > div {
+  padding-bottom: 0.6em;
+}
+.tko-card {
+  border: 1px solid #2b2c3e;
+  border-radius: 9px;
+  background: var(--ui-s1);
+  overflow: hidden;
+}
+.tko-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+  padding: 0.65em 0.75em;
+  border-bottom: 1px solid var(--ui-tab);
+  white-space: nowrap;
+  min-width: 0;
+}
+.tko-mic {
+  width: 1.15em;
+  height: 1.15em;
+  flex: none;
+  color: var(--ui-accent);
+}
+.tko-mname {
+  font-size: 1.04em;
+  font-weight: 700;
+  color: var(--ui-fg);
+  flex: none;
+}
+.tko-orch-badge {
+  font-size: 0.79em;
+  font-weight: 600;
+  color: var(--ui-accent);
+  flex: none;
+}
+.tko-tabname {
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.83em;
+  color: var(--ui-muted);
+}
+.tko-dot {
+  display: inline-block;
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  flex: none;
+  background: var(--ui-accent);
+  align-self: center;
+}
+.tko-dot.is-idle {
+  background: var(--ui-green);
+}
+.tko-dot.is-failed {
+  background: var(--ui-red);
+}
+.tko-card-head > .tko-swap {
+  align-self: center;
+}
+
+.tko-metrics {
+  display: flex;
+  gap: 1.2em;
+  padding: 0.55em 0.8em;
+  border-bottom: 1px solid var(--ui-line-in);
+  font-size: 0.875em;
+  color: var(--ui-muted);
+  white-space: nowrap;
+}
+.tko-metrics b {
+  color: var(--ui-fg);
+  font-weight: 600;
+}
+.tko-metrics b.is-warn {
+  color: var(--ui-yellow);
+}
+
+/* worker のツリー（罫線 = 縦線 + 横枝。最後の行だけ縦線を半分で止める） */
+.tko-tree {
+  padding: 0.45em 0.7em 0.7em 1.3em;
+  display: flex;
+  flex-direction: column;
+}
+.tko-none {
+  font-size: 0.875em;
+  color: var(--ui-faint);
+}
+.tko-row {
+  position: relative;
+}
+.tko-row > div {
+  position: relative;
+  padding-left: 1.1em;
+}
+.tko-row > div::before,
+.tko-row > div::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  background: var(--ui-line-heavy);
+}
+.tko-row > div::before {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+.tko-row:last-child > div::before {
+  bottom: 50%;
+}
+.tko-row > div::after {
+  top: 50%;
+  width: 0.85em;
+  height: 1px;
+}
+.tko-row-in {
+  border-radius: 6px;
+  padding: 0.4em 0.45em;
+  min-width: 0;
+}
+.tko-row-swap {
+  display: grid;
+  min-width: 0;
+}
+.tko-row-line {
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+  min-width: 0;
+  white-space: nowrap;
+}
+.tko-fail {
+  width: 0.8em;
+  height: 0.8em;
+  flex: none;
+  color: var(--ui-red);
+}
+.tko-wname {
+  flex: 0 1 auto;
+  max-width: 22ch;
+  min-width: 2.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.96em;
+  font-weight: 600;
+  color: var(--ui-fg2);
+}
+.tko-wsub {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.875em;
+  color: var(--ui-muted);
+}
+.tko-wsub.is-failed {
+  color: var(--ui-red);
+}
+
+/* ============================================================
+ * 場面の小物（オーケストレーションのページだけで使う）
+ * ============================================================ */
+
+/* worker の選択肢ダイアログ（claude のツール承認など。中の文言は AI の CLI のもの） */
+.tko-dlg-box {
+  margin-top: 0.35em;
+  padding: 0.35em 0.6em 0.45em;
+  border: 1px solid var(--ui-accent-line);
+  border-radius: 6px;
+}
+.tko-dlg-box .tk-l {
+  min-height: 0;
+}
+
+/* master に知らせが届いたペインの注意の枠（ペインの中身を囲む） */
+.tko-alert {
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid var(--ui-yellow);
+  border-radius: 0 0 6px 6px;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* 古い行が上へ流れて消える（高さごと畳む）ブロック */
+.tko-fold > div > .tk-l:last-child {
+  margin-bottom: 0;
+}
+
+/* 1 枚が狭くなると worker 領域の文字が縮む（FR-2.20.7。床は既定サイズの 60%） */
+/* worker 領域の Split は出し入れの transition（motion.css）を持つので、ここでは transition を足さない */
+[data-step='5'] .tko-launch .tk-win-body > .tk-split > .tk-split {
+  font-size: 0.86em;
+}
+
+/* master のコンテキスト使用率の注記（図の上に重ねる説明。tako の画面の一部ではない） */
+.tko-ctx {
+  position: absolute;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+  padding: 0.4em 0.65em;
+  border-radius: 8px;
+  border: 1px solid var(--ui-line-heavy);
+  background: rgb(17 17 27 / 0.94);
+  box-shadow: 0 6px 18px -6px rgb(0 0 0 / 0.6);
+  font-family: var(--ui-font);
+  font-size: 11px;
+  color: var(--ui-muted);
+  white-space: nowrap;
+}
+@container tkframe (max-width: 25rem) {
+  .tko-ctx {
+    font-size: 9.5px;
+  }
+}
+.tko-ctx-bar {
+  position: relative;
+  width: 5.2em;
+  height: 0.45em;
+  border-radius: 99px;
+  background: var(--ui-hl);
+  overflow: hidden;
+}
+.tko-ctx-bar > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 99px;
+  transition:
+    width 0.6s var(--tako-ease, ease),
+    background-color 0.3s ease;
+}
+/* 閾値（既定 60%）の目盛り */
+.tko-ctx-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 60%;
+  width: 1px;
+  background: rgb(205 214 244 / 0.55);
+}
+.tko-ctx b {
+  color: var(--ui-fg);
+  font-weight: 700;
+}
+.tko-ctx b.is-warn {
+  color: var(--ui-yellow);
+}
+.tko-alert.is-ok {
+  border-color: var(--ui-green);
+}
+
+/* 自動ハンドオフの場面（OrchHandoff.astro）: 手順ごとの使用率。位置は master のペインの左下 */
+.tko-ho .tko-ctx {
+  left: 2.5%;
+  bottom: 13%;
+}
+.tko-ho .tko-ctx-bar > i {
+  width: 58%;
+  background: var(--ui-accent);
+}
+[data-step='2'] .tko-ho .tko-ctx-bar > i,
+[data-step='3'] .tko-ho .tko-ctx-bar > i {
+  width: 61%;
+  background: var(--ui-yellow);
+}
+[data-step='4'] .tko-ho .tko-ctx-bar > i {
+  width: 8%;
+}

@@ -1,0 +1,163 @@
+---
+/**
+ * 右パネルの orch ビューの再現（#2059）。RightPanel（active="orch"）の中に置く。
+ *
+ *   <RightPanel slot="right" active="orch">
+ *     <OrchTree
+ *       summary="1 orch · 2 workers"
+ *       masters={[{
+ *         name: 'マスター', tab: 'my-app (AI チーム)', uptime: '12m04s', ctx: '23%',
+ *         workers: [{ name: 'orchestrator-worker:my-app:test', sub: 'my-app: test' }],
+ *       }]}
+ *     />
+ *   </RightPanel>
+ *
+ * 見た目の正本は crates/tako-app/src/right_panel.rs の render_orch_view:
+ * 見出し「ORCHESTRATORS」と「N orch · N workers」/ master のカード（名前・ORCH・タブ名・状態の点）/
+ * 「稼働」と ctx の行 / worker のツリー（罫線・状態の点・名前 = role・概要 = ペインのタイトル）。
+ * 状態の色は running = accent / idle = green / failed = 赤い × と「failed」。
+ * 文言は crates/tako-app/src/ui_text/panel.rs（稼働・ワーカーなし）。
+ *
+ * 手順で変わる値（状態・件数・稼働・ctx）は [{ at, … }] の配列で渡す（at は data-at の書き方）。
+ * 行やカードを手順で出し入れするには at を渡す（高さ 0 から開く）。
+ */
+import '../../styles/tako-orch.css';
+
+type State = 'running' | 'idle' | 'failed';
+interface StateAt {
+	at: string;
+	state: State;
+}
+interface TextAt {
+	at: string;
+	text: string;
+	/** 閾値を超えたなどの注意色 */
+	warn?: boolean;
+}
+type Text = string | TextAt[];
+
+interface Worker {
+	/** 名前（実物はペインの role。例: orchestrator-worker:my-app:test。長いと … で切れる） */
+	name: string;
+	/** 概要（実物はペインのタイトル。例: my-app: test） */
+	sub?: string;
+	state?: State | StateAt[];
+	at?: string;
+	/** 押された印（data-at の書き方） */
+	markAt?: string;
+}
+
+interface Master {
+	name: string;
+	tab: string;
+	state?: State | StateAt[];
+	uptime?: Text;
+	ctx?: Text;
+	workers?: Worker[];
+	at?: string;
+}
+
+interface Props {
+	masters: Master[];
+	/** 見出しの右の「N orch · N workers」 */
+	summary: Text;
+}
+
+const { masters, summary } = Astro.props;
+
+const texts = (t: Text): TextAt[] => (typeof t === 'string' ? [{ at: '', text: t }] : t);
+const states = (s: State | StateAt[] | undefined): StateAt[] =>
+	Array.isArray(s) ? s : [{ at: '', state: s ?? 'running' }];
+const swapAttrs = (at: string) => (at ? { 'data-at': at, 'data-fx': 'fade' } : {});
+---
+
+<div class="tko-orch">
+	<div class="tko-orch-head">
+		<span class="tko-orch-title">ORCHESTRATORS</span>
+		<span class="tko-swap tko-orch-sum">
+			{texts(summary).map((t) => <span {...swapAttrs(t.at)}>{t.text}</span>)}
+		</span>
+	</div>
+	{
+		masters.map((m) => (
+			<div class="tko-card-slot" data-at={m.at} data-fx={m.at ? 'unfold' : undefined}>
+				<div>
+					<div class="tko-card">
+						<div class="tko-card-head">
+							<svg class="tko-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+								<circle cx="18" cy="5" r="3" />
+								<circle cx="6" cy="12" r="3" />
+								<circle cx="18" cy="19" r="3" />
+								<path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4" />
+							</svg>
+							<b class="tko-mname">{m.name}</b>
+							<span class="tko-orch-badge">ORCH</span>
+							<span class="tko-tabname">{m.tab}</span>
+							<span class="tko-swap">
+								{states(m.state).map((s) => (
+									<i class:list={['tko-dot', `is-${s.state}`]} {...swapAttrs(s.at)} />
+								))}
+							</span>
+						</div>
+						{(m.uptime || m.ctx) && (
+							<div class="tko-metrics">
+								{m.uptime && (
+									<span>
+										稼働{' '}
+										<span class="tko-swap">
+											{texts(m.uptime).map((t) => (
+												<b class:list={{ 'is-warn': t.warn }} {...swapAttrs(t.at)}>
+													{t.text}
+												</b>
+											))}
+										</span>
+									</span>
+								)}
+								{m.ctx && (
+									<span>
+										ctx{' '}
+										<span class="tko-swap">
+											{texts(m.ctx).map((t) => (
+												<b class:list={{ 'is-warn': t.warn }} {...swapAttrs(t.at)}>
+													{t.text}
+												</b>
+											))}
+										</span>
+									</span>
+								)}
+							</div>
+						)}
+						<div class="tko-tree">
+							{(m.workers ?? []).length === 0 && <span class="tko-none">ワーカーなし</span>}
+							{(m.workers ?? []).map((w) => (
+								<div class="tko-row" data-at={w.at} data-fx={w.at ? 'unfold' : undefined}>
+									<div>
+										<div class="tko-row-in" data-at={w.markAt} data-fx={w.markAt ? 'mark' : undefined}>
+											<span class="tko-swap tko-row-swap">
+												{states(w.state).map((s) => (
+													<span class="tko-row-line" {...swapAttrs(s.at)}>
+														{s.state === 'failed' ? (
+															<svg class="tko-fail" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" aria-hidden="true">
+																<path d="M18 6 6 18M6 6l12 12" />
+															</svg>
+														) : (
+															<i class:list={['tko-dot', `is-${s.state}`]} />
+														)}
+														<span class="tko-wname">{w.name}</span>
+														<span class:list={['tko-wsub', { 'is-failed': s.state === 'failed' }]}>
+															{s.state === 'failed' ? 'failed' : (w.sub ?? '')}
+														</span>
+													</span>
+												))}
+											</span>
+										</div>
+									</div>
+								</div>
+							))}
+						</div>
+					</div>
+				</div>
+			</div>
+		))
+	}
+</div>
