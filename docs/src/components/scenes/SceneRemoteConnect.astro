@@ -33,7 +33,14 @@ const ROLES = [
 	<div slot="stage" class="tk-stack">
 		<!-- 手順 1〜2: Mac の tako。setup の 5 段 → start で QR が隣のペインに開く -->
 		<div data-at="1-2" data-fx="fade" style="align-self: center">
-			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+			<TakoWindow
+				tabs={[{ label: 'my-app', state: 'running', active: true }]}
+				remote={[
+					{ at: '1', state: 'off' },
+					{ at: '2', state: 'idle' },
+				]}
+				height={28}
+			>
 				<Split>
 					<Pane n={1} title="my-app" state="idle" focus>
 						<div data-at="1" data-fx="unfold">
@@ -111,7 +118,7 @@ const ROLES = [
 
 		<!-- 手順 5: Mac の画面に承認ダイアログ → 許可 -->
 		<div data-at="5" data-fx="fade" style="align-self: center">
-			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }]} height={28}>
+			<TakoWindow tabs={[{ label: 'my-app', state: 'running', active: true }]} remote={{ state: 'idle', pending: 1 }} height={28}>
 				<Split>
 					<Pane n={1} title="my-app" state="idle" focus>
 						<span class="tk-l"><span class="tk-p">my-app ❯</span> <span class="tk-cur"></span></span>

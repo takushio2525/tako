@@ -15,7 +15,7 @@ import Pointer from '../motion/Pointer.astro';
 ---
 
 <Scrolly label="表示の切り替えの流れ" flip>
-	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} guiAt="2-3" height={26}>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} guiAt="2-3" modePressAt="2 4" height={26}>
 		<Split>
 			<Pane n={1} title="Claude" state="idle" focus body="flush" grow={1.15}>
 				<div class="tk-stack tk-fill">

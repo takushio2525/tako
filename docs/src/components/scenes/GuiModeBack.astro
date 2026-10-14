@@ -19,7 +19,7 @@ import '../../styles/page-gui-mode.css';
 ---
 
 <Scrolly label="ターミナル表示へ戻す流れ">
-	<TakoWindow slot="stage" tabs={[{ label: 'master', state: 'running', active: true }]} guiAt="1" height={28}>
+	<TakoWindow slot="stage" tabs={[{ label: 'master', state: 'running', active: true }]} guiAt="1" modePressAt="2" height={28}>
 		<Split>
 			<GuiPane n={1} title="master" badge="ORCH" state="idle" guiAt="1" focus>
 				<Fragment slot="term">

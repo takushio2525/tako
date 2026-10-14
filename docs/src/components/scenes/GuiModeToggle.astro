@@ -22,7 +22,7 @@ import '../../styles/page-gui-mode.css';
 ---
 
 <Scrolly label="表示モードを切り替える流れ">
-	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} guiAt="2+" height={30}>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} guiAt="2+" modePressAt="2" height={30}>
 		<Split dir="col">
 			<Split>
 				<GuiPane n={1} title="claude" state="idle" guiAt="2+" focus grow={1.1}>
