@@ -369,11 +369,6 @@
 .tk-ui .tk-cw-sel.is-on {
   background: #45475a;
 }
-/* 改行が入った位置の印（貼り付けた側） */
-.tk-cw-break {
-  color: var(--ui-red);
-  font-weight: 700;
-}
 
 /* tako mod が Claude Code の画面の中に描くカード（正本: crates/tako-core/claude-mod/hooks/register.ts の drawCardRow） */
 .tk-mc-card {
