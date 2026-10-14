@@ -71,6 +71,13 @@
 
 遅れは `style="--d: .4s"`（入るときだけ効く）。手順の中で順に出したい行に付ける。
 
+### 手順 1 の前の姿（`<Scrolly intro>`）
+
+既定では、どの手順もまだ読む位置を越えていない間（場面が画面に入ってくる間）も図は手順 1 の状態なので、
+手順 1 の打鍵や「押す前 → 押した後」は読者が着く前に終わっている。`intro` を付けた場面だけは、
+手順 1 を読む位置に来るまで図を**手順 0** にする（`data-at` は 0 に当たるものだけ出る。手順 0 だけの姿は `!1+`）。
+手順 0 でも図が空にならないこと（層ごと `data-at="1"` で出し入れしている場面には付けない）。動かさないとき（reduce）の静止図は手順 1 からで変わらない。
+
 ### 動かさない（`prefers-reduced-motion: reduce`）と JS が無いとき
 
 - reduce: 手順ごとにステージを写して、その手順の状態で止めた図を手順の中に置く（**静止した図の並び**）。
@@ -143,7 +150,7 @@ cd docs && npm ci && npm run build && npm run og:verify && node scripts/verify-l
 
 | 部品 | 置き場 | 主な props | 見た目の正本 |
 |---|---|---|---|
-| `Scrolly` | ページ | `label`・`flip`（図を左へ）。slot `stage` + 子に `Step` | — |
+| `Scrolly` | ページ | `label`・`flip`（図を左へ）・`intro`（手順 1 を読む位置に来るまで図を手順 0 で待たせる。下の 3 節）。slot `stage` + 子に `Step` | — |
 | `Step` | Scrolly の子 | `title`。本文は子 | — |
 | `Autoplay` | ページ | `steps`・`interval`（ms） | — |
 | `TakoWindow` | stage | `os`（mac / windows）・`tabs`（`label` / `state` / `active` / `at`（隠れている間は場所を取らない）/ `activeAt`）・`guiAt`（表示モードの印）・`modePressAt`（表示モードのボタンが押された輪）・`masterAt` / `workers`（ステータスバーの master 表示）・`remote`（リモートの表示。`off` / `starting` / `idle` / `connected` と承認待ちの件数を手順で）・`ctx` / `ctxMarkAt`（ctx メーターの使用率と注目の輪）・`panelAt`・`cwd`・`branch`・`height`。slot: 既定（本体）/ `sidebar` / `banner` / `right` / `overlay` | `tab_bar.rs` / `menu_bar.rs` / `status_bar.rs` / `theme.rs` |

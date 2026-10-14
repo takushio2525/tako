@@ -7,7 +7,9 @@
  *   - `[data-pos]`（ポインター）は N に応じた座標へ動く
  *
  * N の決め方は 2 通り:
- *   - `[data-scrolly]`: 手順（`.tk-step`）のうち「読む位置」を越えた最後の 1 つ（スクロール連動）
+ *   - `[data-scrolly]`: 手順（`.tk-step`）のうち「読む位置」を越えた最後の 1 つ（スクロール連動）。
+ *     まだどれも越えていなければ手順 1。`[data-scrolly-intro]` の場面だけは 0（手順 1 の前の姿）にして、
+ *     読者が場面に着いてから手順 1 を当てる（手順 1 の打鍵や「押す前 → 押した後」を見せたい場面）
  *   - `[data-autoplay]`: 画面に入ったら時間で 1 → 最後まで 1 回だけ進める（ヒーロー用）
  *
  * `prefers-reduced-motion: reduce` のときは動かさない。スクロール連動の場面は、手順ごとに
@@ -108,7 +110,9 @@ class Scrolly {
 	readonly stage: HTMLElement;
 	readonly wrap: HTMLElement;
 	readonly steps: HTMLElement[];
-	private active = 0;
+	/** 手順 1 の前の姿（手順 0）を持つ場面か。持たない場面は、どの手順も読む位置を越える前から手順 1 */
+	private readonly intro: boolean;
+	private active = -1;
 	private figures: HTMLElement[] = [];
 
 	constructor(root: HTMLElement) {
@@ -116,6 +120,7 @@ class Scrolly {
 		this.stage = root.querySelector<HTMLElement>('[data-stage]')!;
 		this.wrap = root.querySelector<HTMLElement>('.tk-scrolly-stage')!;
 		this.steps = [...root.querySelectorAll<HTMLElement>(':scope > .tk-scrolly-steps > .tk-step')];
+		this.intro = root.hasAttribute('data-scrolly-intro');
 		measureTyping(this.stage);
 		root.dataset.motion = '';
 		this.setMode();
@@ -144,7 +149,7 @@ class Scrolly {
 		this.root.classList.remove('is-static');
 		for (const fig of this.figures) fig.remove();
 		this.figures = [];
-		this.active = 0;
+		this.active = -1;
 		this.update();
 	}
 
@@ -159,11 +164,11 @@ class Scrolly {
 			const bottom = this.wrap.getBoundingClientRect().bottom;
 			probe = Math.min(vh * 0.85, bottom + (vh - bottom) * 0.4);
 		}
-		let idx = 0;
+		let n = this.intro ? 0 : 1;
 		this.steps.forEach((step, i) => {
-			if (step.getBoundingClientRect().top <= probe) idx = i;
+			if (step.getBoundingClientRect().top <= probe) n = i + 1;
 		});
-		this.set(idx + 1);
+		this.set(n);
 	}
 
 	private set(n: number): void {

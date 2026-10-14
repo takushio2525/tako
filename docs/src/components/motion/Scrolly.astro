@@ -11,6 +11,9 @@
  * - 手順（Step）を読む位置まで送ると、ステージに data-step=N が写る（N は 1 始まり）
  * - ステージは飾り（aria-hidden）。意味は手順の文章で必ず伝える
  * - prefers-reduced-motion: reduce では、手順ごとに静止した図を置いた並びになる
+ * - intro を付けると、手順 1 を読む位置に来るまで図は「手順 0」（data-at が 0 に当たるものだけ。
+ *   `!1+` で書く）のまま待つ。手順 1 の打鍵や「押す前 → 押した後」を読者の目の前で起こしたい場面に使う。
+ *   手順 0 でも図が空にならないよう、層ごと data-at で出し入れしている場面には付けない
  *
  * 手引き（部品一覧・data-at の書き方）は `.agent/plans/2026-10-docs-motion.md`。
  */
@@ -22,13 +25,15 @@ interface Props {
 	label: string;
 	/** 図を左に置く */
 	flip?: boolean;
+	/** 手順 1 を読む位置に来るまで、図を手順 0（手順 1 の前の姿）で待たせる */
+	intro?: boolean;
 }
 
-const { label, flip = false } = Astro.props;
+const { label, flip = false, intro = false } = Astro.props;
 ---
 
 <div class="tk-scrolly-wrap not-content">
-	<section class:list={['tk-scrolly', { 'is-flip': flip }]} data-scrolly aria-label={label}>
+	<section class:list={['tk-scrolly', { 'is-flip': flip }]} data-scrolly data-scrolly-intro={intro || undefined} aria-label={label}>
 		<div class="tk-scrolly-stage">
 			<div class="tk-stage" data-stage aria-hidden="true" inert>
 				<slot name="stage" />
