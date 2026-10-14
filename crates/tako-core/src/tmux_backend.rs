@@ -2071,12 +2071,14 @@ set -gq copy-mode-position-format ''
             }
             false
         }
-        /// 端末のイベントを流し、子の終わり（ChildExit）が届いたら true
+        /// 端末のイベントを流し、子の終わり（ChildExit）が届いたら true。
+        /// 上限は 600 回 × 100 ms（#2098: 10 秒では並列の負荷の下で届かない回があった）。
+        /// 状態で待つので、届く回は上限に依らずすぐ抜ける
         fn wait_child_exit(
             session: &mut crate::TerminalSession,
             rx: &mut futures::channel::mpsc::UnboundedReceiver<crate::SessionEvent>,
         ) -> bool {
-            for _ in 0..100 {
+            for _ in 0..600 {
                 while let Ok(event) = rx.try_recv() {
                     let child_exit = matches!(
                         event,
@@ -2090,6 +2092,25 @@ set -gq copy-mode-position-format ''
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             false
+        }
+        /// 子の終わりが届かなかったときの切り分け（#2098）。`ps` の状態が実行中なら
+        /// tmux がクライアントをまだ終わらせていない（器の側の遅れ）、`Z` なら終わったのに
+        /// ChildExit が届いていない（イベントの側の遅れ）、載らなければ既に回収済み
+        fn client_state(pid: Option<u32>) -> String {
+            let Some(pid) = pid else {
+                return "pid 不明".into();
+            };
+            match std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+            {
+                Ok(out) if out.status.success() => format!(
+                    "pid {pid} の状態={:?}",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                ),
+                Ok(_) => format!("pid {pid} は居ない"),
+                Err(e) => format!("ps を起動できない: {e}"),
+            }
         }
         let client_of = |name: &str| {
             for _ in 0..50 {
@@ -2134,7 +2155,8 @@ set -gq copy-mode-position-format ''
         }
         assert!(
             wait_child_exit(&mut first, &mut rx1),
-            "attach クライアントの終わりが届く"
+            "attach クライアントの終わりが届く。クライアント: {}",
+            client_state(first.child_pid())
         );
         // tmux のクライアントは SIGTERM を受けると後始末をして exit 1 で終わる
         assert_eq!(
@@ -2183,10 +2205,10 @@ set -gq copy-mode-position-format ''
         assert!(
             exited,
             "セッションの終わりでクライアントも終わる。kill-session={killed:?} 生死={:?} \
-             ソケットファイル={} クライアント pid={:?}",
+             ソケットファイル={} クライアント: {}",
             probe_session(&socket, session),
             socket_file_present(&socket),
-            second.child_pid(),
+            client_state(second.child_pid()),
         );
         assert_eq!(probe_session(&socket, session), SessionProbe::SessionGone);
 
@@ -2196,7 +2218,8 @@ set -gq copy-mode-position-format ''
                 .expect("spawn 自体はできる");
         assert!(
             wait_child_exit(&mut third, &mut rx3),
-            "無いセッションへの attach はすぐ終わる"
+            "無いセッションへの attach は作らずに終わる。クライアント: {}",
+            client_state(third.child_pid())
         );
         assert!(
             !crate::tmux::has_session(Some(&socket), session),
