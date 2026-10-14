@@ -143,6 +143,7 @@ export default defineConfig({
 					items: [
 						{ label: 'かんたん表示（GUI モード）', slug: 'features/gui-mode' },
 						{ label: 'タブ＆ペイン管理', slug: 'features/tabs-and-panes' },
+						{ label: 'コマンドカード', slug: 'features/command-card' },
 						{ label: 'ファイルツリー＆プレビュー', slug: 'features/file-preview' },
 						{ label: 'git 連携', slug: 'features/git-integration' },
 						{ label: 'リモートアクセス', slug: 'features/remote' },

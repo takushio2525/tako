@@ -1,0 +1,56 @@
+---
+/**
+ * 場面: スマホから実行する（tako remote の PWA）。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-6.24（ペイン画面にカード・実行は PC の「新規ペインで実行」と同じ dispatch・
+ * 全文を見せる確認 1 回・送信中は止める・Interact 以上・observe には実行を出さない）/ FR-2.22.11（記録は PC と同じ）/
+ * web/tako-remote/src/components/command-cards.jsx（文言）。
+ * Windows の remote 系は pending（実機での通しが未了）なので、手順の注記で正直に書く。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import Phone from '../motion/Phone.astro';
+import PhoneCommandCards from '../motion/PhoneCommandCards.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/command-card.css';
+---
+
+<Scrolly label="スマホからコマンドカードを実行する流れ" flip>
+	<Phone slot="stage" height={33}>
+		<div class="tk-ppane-head">
+			<span style="display:inline-flex; transform: scaleX(-1)"><Icon name="chevronRight" /></span>
+			<span>my-app</span>
+			<span class="tk-ppane-toggle"><span class="is-active">chat</span><span>term</span></span>
+		</div>
+		<PhoneCommandCards
+			label="テストを実行する"
+			command="npm test"
+			pressAt="2"
+			confirmAt="2"
+			confirmPressAt="2"
+			startedAt="3+"
+			runningAt="3"
+			ranAt="4+"
+			pane={2}
+		/>
+		<div class="tk-pmsg">テストはこのコマンドで流せます。カードを出したので、押せばそのまま走ります。</div>
+		<div class="tk-pinput">
+			<span class="tk-grow">claude に返信...</span>
+			<span class="tk-psend"><Icon name="arrowUp" /></span>
+		</div>
+	</Phone>
+
+	<Step title="スマホのペイン画面にも、同じカード">
+		<p>外出先でスマホから tako を開くと、AI がそのペインに出したカードが画面の上に並びます。</p>
+	</Step>
+	<Step title="全文を確かめてから、実行する">
+		<p>「実行」を押すとコマンドの全文が出て、「PC で実行する」を押したときだけ走ります。誤タップでいきなり走ることはありません。</p>
+	</Step>
+	<Step title="PC の同じタブで走り出す">
+		<p>実行先は PC のカードの「新規ペインで実行」と同じで、同じタブに新しいペインが開きます。走っている間、ボタンは「実行中」になって押せません。</p>
+	</Step>
+	<Step title="記録は、PC とスマホで揃う">
+		<p>終わると「実行済み（終了コード 0）」。PC のカードにも同じ記録が出るので、どちらで押しても状態は 1 つです。</p>
+		<p>実行には、ペアリングのときに Interact 以上の権限を選んだ端末が要ります。見るだけ（Observe）の端末には「実行」が出ません。</p>
+		<p class="tk-step-note">スマホからの接続は macOS 版で使えます。Windows 版は実機での通しの確認がまだです。</p>
+	</Step>
+</Scrolly>

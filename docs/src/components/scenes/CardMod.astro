@@ -1,0 +1,74 @@
+---
+/**
+ * 場面: Claude Code + tako mod のとき、カードは Claude Code の画面の中に出る。3 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.22.1 の #1963 追記 / FR-2.42.41〜44（会話の行に枠つきのカード・
+ * 入力欄の上の帯に `カード N` と y: コピー / r: 実行 / x: 閉じる・ctrl+x → Tab で帯へ・Run は PC のカードと同じ
+ * dispatch の run・描いたカードはペイン下の帯に出さない = 画面が縮まない）/
+ * 実行は show-command --run と同じ dispatch なので、実行ペインは下に 35%（dispatch.rs の Direction::Down, 0.35）。
+ * crates/tako-core/claude-mod/hooks/register.ts（日本語の文言: カード N・帯（ctrl+x → Tab）の y: コピー / r: 実行・
+ * → ペイン N 実行中 / 終了 N）。帯のボタンはクリックでは押せない（#1961）のでポインターは出さない。
+ * 画面の中に描くのは claude だけ（codex / agy は pending #1885）。Windows の tako_mod は pending（#1886）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import '../../styles/command-card.css';
+---
+
+<Scrolly label="Claude Code の画面の中に出るコマンドカード">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={29}>
+		<Split dir="col">
+			<Pane n={1} title="my-app" state="running" focus>
+				<div class="tk-fill tk-cw-end">
+					<span class="tk-l tk-tui-user">テストを流したい</span>
+					<span class="tk-l tk-tui-msg">テストはこのコマンドで流せます。カードで出します。</span>
+					<div class="tk-mc-card">
+						<span class="tk-l"><span class="tk-acc tk-b">tako</span>  <span class="tk-b">カード 1</span>  テストを実行する</span>
+						<span class="tk-l">npm test</span>
+						<div data-at="2+" data-fx="unfold">
+							<div class="tk-stack">
+								<span class="tk-l tk-acc" data-at="2" data-fx="fade">→ ペイン 2 実行中</span>
+								<span class="tk-l tk-ok" data-at="3+" data-fx="fade">→ ペイン 2 終了 0</span>
+							</div>
+						</div>
+						<span class="tk-l tk-dim">帯（ctrl+x → Tab）の y: コピー / r: 実行</span>
+					</div>
+					<span class="tk-l tk-mc-band" data-at="2" data-fx="state">
+						<span class="tk-acc tk-b">tako</span><span class="tk-mc-sep">|</span>my-app<span class="tk-mc-sep">|</span><span class="tk-acc">カード 1</span><span class="tk-mc-sep">|</span>npm test
+						<span class="tk-mc-key"><b>y</b>: コピー</span>
+						<span class="tk-mc-key"><b>r</b>: 実行</span>
+						<span class="tk-mc-key tk-mc-opt"><b>x</b>: 閉じる</span>
+					</span>
+					<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+				</div>
+			</Pane>
+			<Pane n={2} title="npm test" state={[{ at: '2', state: 'running' }, { at: '3+', state: 'idle' }]} at="2+" fx="split" grow={0.54}>
+				<div class="tk-fill tk-cw-end">
+					<span class="tk-l"><span class="tk-p">my-app ❯</span> npm test</span>
+					<span class="tk-l tk-dim" data-at="2+" style="--d: .5s">RUN  v1.6.0  ~/my-app</span>
+					<span class="tk-l" data-at="2+" style="--d: .8s"><span class="tk-ok">✓</span> tests/login.test.ts (3)</span>
+					<div data-at="3+" data-fx="unfold">
+						<div>
+							<span class="tk-l"><span class="tk-ok">✓</span> tests/store.test.ts (9)</span>
+							<span class="tk-l tk-ok tk-b">Tests  12 passed (12)</span>
+							<span class="tk-l tk-dim">[tako] 終了コード 0 / Enter でこのペインを閉じます</span>
+						</div>
+					</div>
+				</div>
+			</Pane>
+		</Split>
+	</TakoWindow>
+
+	<Step title="会話の中にカードが描かれる">
+		<p>Claude Code のペインでは、tako が同梱する <strong>tako mod</strong> が、カードを Claude Code の画面の中（会話の行と、入力欄の上の帯）に描きます。ペインの下に帯は開かず、画面も縮みません。</p>
+	</Step>
+	<Step title="帯に移って、キーで押す">
+		<p><kbd>ctrl</kbd>+<kbd>x</kbd> → <kbd>Tab</kbd> で帯に移り、<kbd>y</kbd> でコピー、<kbd>r</kbd> で新しいペインで実行します。帯のボタンはクリックではなくキーで押します。</p>
+	</Step>
+	<Step title="記録は、ほかのカードと同じ">
+		<p>実行の記録はカードの行に出ます。ペインの下のカードやスマホと同じ記録なので、どこで押しても揃います。</p>
+		<p class="tk-step-note">画面の中に描くのは Claude Code（2.1.294 以降）だけです。codex / agy ではペインの下の帯に出ます。Windows 版の tako mod は、実機での確認がまだです。</p>
+	</Step>
+</Scrolly>

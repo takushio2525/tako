@@ -1,0 +1,129 @@
+---
+/**
+ * スマホ版（PWA）のペイン画面に出るコマンドカード（#2057）。Phone の中に置く。
+ * 「実行」→ 全文を見せる確認シート →「PC で実行する」→ 結果の一言 → 実行記録、を手順で出し入れできる。
+ *
+ *   <PhoneCommandCards
+ *     label="テストを実行する" command="npm test"
+ *     pressAt="2" confirmAt="2" confirmPressAt="2"
+ *     startedAt="3+" runningAt="3" ranAt="4+" pane={3} host="my-mac"
+ *   />
+ *
+ * 正本は web/tako-remote/src/components/command-cards.jsx（文言・並び）と styles/main.css の .cmd-*。
+ * 実行は PC のカードの「新規ペインで実行」と同じ経路で、記録（実行中 / 実行済み）も PC と同じものを読む。
+ * 確認シートは Phone の本体いっぱいに重なる（.tk-phone-body が基準）。
+ */
+import '../../styles/command-card.css';
+import Icon from './Icon.astro';
+
+interface Props {
+	label?: string;
+	command: string;
+	/** 「実行」に押された印を付ける手順 */
+	pressAt?: string;
+	/** 確認シートを出す手順と、「PC で実行する」に押された印を付ける手順 */
+	confirmAt?: string;
+	confirmPressAt?: string;
+	/** 「PC のペイン N で実行を始めました」を出す手順 */
+	startedAt?: string;
+	/** 実行記録「実行中」（ボタンも「実行中」で押せなくなる）/「実行済み（終了コード N）」を出す手順 */
+	runningAt?: string;
+	ranAt?: string;
+	code?: number;
+	/** 実行先のペイン番号（結果の一言に出る） */
+	pane?: number;
+	/** 確認シートの「〇〇 の同じタブに…」（実在のホスト名を書かない） */
+	host?: string;
+}
+
+const {
+	label = '実行するコマンド',
+	command,
+	pressAt,
+	confirmAt,
+	confirmPressAt,
+	startedAt,
+	runningAt,
+	ranAt,
+	code = 0,
+	pane = 3,
+	host = 'my-mac',
+} = Astro.props;
+---
+
+<section class="tk-pcc">
+	<div class="tk-pcc-head">
+		<span class="tk-pcc-title">PC に出ているコマンド</span>
+		<span class="tk-pcc-count">1</span>
+		<i class="tk-pcc-chev"></i>
+	</div>
+	<div class="tk-pcc-body">
+		<div class="tk-pcc-card">
+			<div class="tk-pcc-label">{label}</div>
+			<div class="tk-pcc-block">
+				<div class="tk-pcc-text">{command}</div>
+				<div class="tk-pcc-row">
+					{
+						(runningAt || ranAt) && (
+							<span class="tk-pcc-state">
+								{runningAt && (
+									<span class="tk-pcc-wait" data-at={runningAt} data-fx="fade">
+										実行中
+									</span>
+								)}
+								{ranAt && (
+									<span class={code === 0 ? 'tk-pcc-ok' : 'tk-pcc-bad'} data-at={ranAt} data-fx="fade">
+										実行済み（終了コード {code}）
+									</span>
+								)}
+							</span>
+						)
+					}
+					<span class="tk-pcc-spacer"></span>
+					<span class="tk-pcc-run" data-at={pressAt} data-fx={pressAt ? 'mark' : undefined}>
+						<span class="tk-pcc-btn" data-at={runningAt ? `!${runningAt}` : undefined} data-fx="fade">
+							<Icon name="play" />
+							実行
+						</span>
+						{
+							runningAt && (
+								<span class="tk-pcc-btn is-off" data-at={runningAt} data-fx="fade">
+									<Icon name="play" />
+									実行中
+								</span>
+							)
+						}
+					</span>
+				</div>
+				{
+					startedAt && (
+						<div class="tk-pcc-notice tk-pcc-ok" data-at={startedAt}>
+							PC のペイン {pane} で実行を始めました
+						</div>
+					)
+				}
+			</div>
+		</div>
+	</div>
+</section>
+{
+	confirmAt && (
+		<div class="tk-psheet" data-at={confirmAt} data-fx="fade">
+			<div class="tk-psheet-panel">
+				<div class="tk-psheet-head">
+					<span>PC でこのコマンドを実行しますか</span>
+					<span>×</span>
+				</div>
+				<p class="tk-psheet-label">{label}</p>
+				<div class="tk-psheet-text">{command}</div>
+				<p class="tk-psheet-note">{host} の同じタブに新しいペインを開いて実行します。いま見ているペインには書き込みません。</p>
+				<div class="tk-psheet-actions">
+					<span class="tk-pbtn">やめる</span>
+					<span class="tk-pbtn is-primary" data-at={confirmPressAt} data-fx={confirmPressAt ? 'mark' : undefined} style="--d: .9s">
+						PC で実行する
+					</span>
+				</div>
+			</div>
+		</div>
+	)
+}

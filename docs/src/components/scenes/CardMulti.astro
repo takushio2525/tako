@@ -1,0 +1,63 @@
+---
+/**
+ * 場面: 複数コマンド（N/M 件目）・改行を含むコマンド・失敗の表示・閉じる。4 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.22.2（改行を含むコマンドは改行を保持）/
+ * FR-2.22.5（1 カード 10 件まで・番号ラベル・個別のボタン・× で閉じる・1 ペイン 3 枚まで）/
+ * FR-2.22.11（コマンドごとの実行記録・終わった実行は再実行できる）/ command_card_ui.rs の run_status_text
+ * （終了コード 0 は緑・0 以外は赤）/ 台帳 4 節の ②-7（× で閉じると帯が消え、ターミナルが元の行数に戻る）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import CommandCardFull from '../motion/CommandCardFull.astro';
+import '../../styles/command-card.css';
+
+const envFile = "cat > .env.local <<'EOF'\nPORT=3000\nEOF";
+---
+
+<Scrolly label="複数のコマンドを 1 枚のカードで受け取る流れ">
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'idle', active: true }]} height={35}>
+		<Split>
+			<Pane n={1} title="my-app" focus body="flush">
+				<div class="tk-pane-col">
+					<div class="tk-pane-term tk-cw-end">
+						<span class="tk-l tk-tui-user">このリポジトリの構成を教えて</span>
+						<span class="tk-l tk-tui-msg">Next.js のアプリで、DB は PostgreSQL です。テストは vitest、起動は npm run dev です。</span>
+						<span class="tk-l tk-tui-user">開発環境を用意して</span>
+						<span class="tk-l tk-tui-msg">手順は 2 つです。上から順に実行してください。</span>
+						<span class="tk-l tk-tui-msg is-tool">tako_show_command</span>
+						<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
+					</div>
+					<div data-at="!4" data-fx="unfold">
+						<div>
+							<div class="tk-cardband">
+								<CommandCardFull
+									title="開発環境を用意する"
+									commands={[
+										{ text: envFile, boxMark: '2', copied: '2', copyMark: '2', ran: '3+' },
+										{ text: 'npm run db:migrate', ran: '3+', code: 1 },
+									]}
+								/>
+							</div>
+						</div>
+					</div>
+				</div>
+			</Pane>
+		</Split>
+	</TakoWindow>
+
+	<Step title="1 枚に、手順ぶんのコマンドを並べる">
+		<p>コマンドが複数あるときは、1 枚のカードに並びます（10 件まで）。それぞれに「1/2 件目」のような番号と、自分のコピー・実行のボタンが付きます。</p>
+	</Step>
+	<Step title="改行を含むコマンドも、そのまま">
+		<p>ヒアドキュメントのように改行が要るコマンドは、改行を保ったまま渡されます。カードの中で見た目が折り返されても、コピーや実行で使うのは渡された文字列そのものです。</p>
+	</Step>
+	<Step title="どれが失敗したかは、色で分かる">
+		<p>実行の記録はコマンドごとに残ります。終了コード 0 は緑、それ以外は赤。終わったコマンドは、直してからもう一度押せます。</p>
+	</Step>
+	<Step title="閉じると、画面が元に戻る">
+		<p>カードの右上の × で閉じると帯が消え、ターミナルは元の高さに戻ります。1 つのペインに出せるカードは 3 枚までで、それを超えると古いものから消えます。</p>
+	</Step>
+</Scrolly>

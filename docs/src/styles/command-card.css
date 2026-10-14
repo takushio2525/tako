@@ -1,0 +1,415 @@
+/*
+ * コマンドカードのページ（#2057）で足した部品と場面の見た目。
+ *
+ * - CommandCardFull: 実物どおりの並びのカード（複数コマンド・複数行・コピー済み・実行記録・失敗）
+ * - PhoneCommandCards: スマホ版（PWA）のペイン画面に出るカードと、実行前の確認シート
+ * - 場面用の小物: 画面の選択の色・下から詰まるターミナル・tako mod が描くカードと帯
+ *
+ * 既存のクラス（tako-ui.css の .tk-cmdcard / .tk-ubtn ほか）は土台として使うだけで、見た目は変えない。
+ * ここで書くセレクタは必ず新しいクラス（.tk-cc / .tk-pcc / .tk-cw / .tk-mc）の下に置く。
+ */
+
+/* ============================================================
+ * CommandCardFull（正本: crates/tako-app/src/command_card_ui.rs の render_command_card）
+ * ============================================================ */
+.tk-cc .tk-cmdcard-head {
+  justify-content: flex-start;
+  gap: 0.5em;
+  margin-bottom: 0.4em;
+}
+.tk-cc-title {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tk-cc-boxes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+}
+.tk-cc .tk-cmdcard-cmd {
+  margin-bottom: 0.45em;
+}
+/* 番号・実行記録・余白・コピー・新規ペインで実行（実物は 1 行に並び、狭いと折り返す） */
+.tk-cc-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35em 0.45em;
+}
+.tk-cc-idx,
+.tk-cc-state {
+  font-size: 0.87em;
+  white-space: nowrap;
+}
+.tk-cc-idx {
+  color: var(--ui-muted);
+}
+.tk-cc-state .is-running {
+  color: var(--ui-accent);
+}
+.tk-cc-state .is-ok {
+  color: var(--ui-green);
+}
+.tk-cc-state .is-bad {
+  color: var(--ui-red);
+}
+.tk-cc-state .is-closed {
+  color: var(--ui-muted);
+}
+/* コピーと実行の 1 組。折り返すときも 1 組のまま右寄せ */
+.tk-cc-btns {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35em 0.45em;
+  margin-left: auto;
+}
+/* 重ねた器（実行記録・コピー）の中で隠れている側は幅を取らない。実物も、出たときに行が伸びる
+ * （隠れた文言が幅を取ると、まだ何も出ていない行のボタンが先に折り返してしまう） */
+.tk-cc-state,
+.tk-cc-copy,
+.tk-pcc-state,
+.tk-pcc-run {
+  position: relative;
+}
+[data-motion] .tk-cc-state > [data-at]:not(.is-on),
+[data-motion] .tk-cc-copy > [data-at]:not(.is-on),
+[data-motion] .tk-pcc-state > [data-at]:not(.is-on),
+[data-motion] .tk-pcc-run > [data-at]:not(.is-on) {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+/* 「コピー」と「コピーしました」を重ねる器。幅は広いほうに揃い、切り替わっても行が動かない */
+.tk-cc-copy {
+  display: inline-grid;
+  border-radius: 5px;
+}
+.tk-cc-copy > * {
+  grid-area: 1 / 1;
+}
+.tk-cc .tk-ubtn.is-copied {
+  color: var(--ui-green);
+  border-color: var(--ui-green);
+}
+/* 箱ごとの強調（data-fx="mark" の輪を箱に付けるとき、角の丸みを合わせる） */
+.tk-cc .tk-cmdcard-box[data-fx~='mark'] {
+  border-radius: 6px;
+}
+
+/* ============================================================
+ * スマホ版のカード（正本: web/tako-remote/src/components/command-cards.jsx と styles/main.css の .cmd-*）
+ * ============================================================ */
+.tk-pcc {
+  flex: none;
+  background: var(--ph-panel);
+  border: 1px solid var(--ph-line);
+  border-radius: 0.75em;
+  overflow: hidden;
+}
+.tk-pcc-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  padding: 0.55em 0.65em;
+  color: var(--ph-fg);
+}
+.tk-pcc-title {
+  font-weight: 700;
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+.tk-pcc-count {
+  min-width: 1.6em;
+  padding: 0 0.45em;
+  border-radius: 99px;
+  text-align: center;
+  font-size: 0.85em;
+  line-height: 1.6em;
+  background: #1d232a;
+  color: var(--ph-fg2);
+}
+.tk-pcc-chev {
+  margin-left: auto;
+  width: 0.55em;
+  height: 0.55em;
+  border-right: 1.5px solid var(--ph-fg3);
+  border-bottom: 1.5px solid var(--ph-fg3);
+  transform: rotate(45deg);
+}
+.tk-pcc-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+  padding: 0 0.65em 0.65em;
+}
+.tk-pcc-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45em;
+  padding: 0.6em 0.65em;
+  background: var(--ph-panel2);
+  border: 1px solid var(--ph-line);
+  border-radius: 0.6em;
+}
+.tk-pcc-label {
+  font-size: 0.9em;
+  color: var(--ph-fg2);
+  overflow-wrap: anywhere;
+}
+.tk-pcc-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45em;
+  padding: 0.55em;
+  background: #07080a;
+  border: 1px solid var(--ph-line);
+  border-radius: 0.45em;
+}
+.tk-pcc-text {
+  margin: 0;
+  font-family: var(--ui-font);
+  font-size: 1em;
+  line-height: 1.45;
+  color: #c7ccd1;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tk-pcc-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5em;
+}
+.tk-pcc-state {
+  display: inline-grid;
+  font-size: 0.95em;
+}
+.tk-pcc-state > * {
+  grid-area: 1 / 1;
+  white-space: nowrap;
+}
+.tk-pcc-ok {
+  color: var(--ph-green);
+}
+.tk-pcc-bad {
+  color: #f0655a;
+}
+.tk-pcc-wait {
+  color: var(--ph-amber);
+}
+.tk-pcc-spacer {
+  flex: 1;
+}
+.tk-pcc-run {
+  display: inline-grid;
+  border-radius: 0.6em;
+}
+.tk-pcc-run > * {
+  grid-area: 1 / 1;
+}
+.tk-pcc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  min-height: 2.6em;
+  padding: 0 1em;
+  border-radius: 0.6em;
+  font-weight: 700;
+  color: var(--ph-green);
+  background: rgb(94 227 160 / 0.1);
+  border: 1px solid rgb(94 227 160 / 0.35);
+}
+.tk-pcc-btn.is-off {
+  color: var(--ph-fg3);
+  background: none;
+  border-color: var(--ph-line2);
+}
+.tk-pcc-btn .tk-ic {
+  width: 0.95em;
+  height: 0.95em;
+}
+.tk-pcc-notice {
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+/* 実行前の確認シート（下からせり上がる） */
+.tk-psheet {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: flex-end;
+  background: rgb(0 0 0 / 0.55);
+}
+.tk-psheet-panel {
+  width: 100%;
+  padding: 0.9em 0.9em 1.1em;
+  background: var(--ph-panel);
+  border-top: 1px solid var(--ph-line2);
+  border-radius: 1.1em 1.1em 0 0;
+}
+[data-motion] .tk-psheet:not(.is-on) .tk-psheet-panel {
+  transform: translateY(40%);
+}
+[data-motion] .tk-psheet .tk-psheet-panel {
+  transition: transform 0.45s var(--tako-ease);
+}
+.tk-psheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5em;
+  margin-bottom: 0.6em;
+  font-weight: 700;
+  font-size: 1.05em;
+}
+.tk-psheet-head span:last-child {
+  color: var(--ph-fg2);
+  font-weight: 400;
+  font-size: 1.2em;
+  line-height: 1;
+}
+.tk-psheet-label {
+  margin: 0 0 0.4em;
+  font-size: 0.92em;
+  color: var(--ph-fg2);
+}
+.tk-psheet-text {
+  margin: 0 0 0.6em;
+  padding: 0.6em;
+  border-radius: 0.55em;
+  background: #07080a;
+  border: 1px solid var(--ph-line2);
+  font-family: var(--ui-font);
+  font-size: 1em;
+  line-height: 1.5;
+  color: #c7ccd1;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tk-psheet-note {
+  margin: 0 0 0.75em;
+  font-size: 0.88em;
+  color: var(--ph-fg3);
+  overflow-wrap: anywhere;
+}
+.tk-psheet-actions {
+  display: flex;
+  gap: 0.6em;
+}
+.tk-psheet-actions .tk-pbtn {
+  flex: 1;
+  min-height: 2.9em;
+  padding: 0.5em 0.4em;
+  font-size: 0.92em;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* スマホのペイン画面の上端（戻る・ペイン名・chat / term の切り替え） */
+.tk-ppane-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  flex: none;
+  font-weight: 700;
+}
+.tk-ppane-head .tk-ic {
+  color: var(--ph-fg2);
+}
+.tk-ppane-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  border: 1px solid var(--ph-line2);
+  border-radius: 0.6em;
+  overflow: hidden;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+.tk-ppane-toggle span {
+  padding: 0.2em 0.6em;
+  color: var(--ph-fg3);
+}
+.tk-ppane-toggle span.is-active {
+  color: var(--ph-claude);
+  background: var(--ph-panel2);
+}
+
+/* ============================================================
+ * 場面の小物
+ * ============================================================ */
+/* ターミナルの中身を下に寄せる。帯が開いて縮むと、古い行から上へ押し出される
+ * （AI の TUI は入力欄が常に下端にある。上寄せのままだと縮んだときに入力欄が隠れる） */
+.tk-cw-end {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+.tk-cw-end > * {
+  flex: none;
+}
+/* 折り返された 1 行（TUI が物理的に改行して描いた行）。再現の中で二重に折り返さない */
+.tk-cw-wrapped {
+  white-space: pre;
+  overflow: hidden;
+  min-height: 1.55em;
+}
+/* ① の場面の細いペインのカード（字数で固定した幅に、ボタンが収まる大きさ） */
+.tk-cw-card {
+  font-size: 0.9em;
+}
+/* 画面の選択（selection_background） */
+.tk-cw-sel {
+  border-radius: 2px;
+}
+.tk-ui .tk-cw-sel.is-on {
+  background: #45475a;
+}
+
+/* tako mod が Claude Code の画面の中に描くカード（正本: crates/tako-core/claude-mod/hooks/register.ts の drawCardRow） */
+.tk-mc-card {
+  display: block;
+  margin: 0.25em 0 0.35em 1.1em;
+  padding: 0.2em 0.6em 0.25em;
+  border: 1px solid var(--ui-accent);
+  border-radius: 6px;
+}
+.tk-mc-card .tk-l {
+  min-height: 1.45em;
+}
+/* 帯（入力欄の上の 1 行。区切りは「 | 」） */
+.tk-ui .tk-mc-band {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  white-space: nowrap;
+  overflow: hidden;
+  min-height: 1.55em;
+  padding: 0 0.15em;
+  border-radius: 3px;
+}
+.tk-ui .tk-mc-band .tk-mc-sep {
+  color: var(--ui-faint);
+}
+.tk-mc-key {
+  color: var(--ui-fg);
+}
+.tk-mc-key b {
+  color: var(--ui-accent);
+  font-weight: 700;
+}
+/* 帯にフォーカスしたとき（ctrl+x → Tab） */
+.tk-ui .tk-mc-band.is-on {
+  background: rgb(137 180 250 / 0.14);
+  box-shadow: inset 0 0 0 1px rgb(137 180 250 / 0.45);
+}
+/* 狭い画面では優先度の低いボタン（閉じる）から落とす（実物も幅に収まらないものから落とす） */
+@container tkframe (max-width: 34rem) {
+  .tk-mc-opt {
+    display: none;
+  }
+}
