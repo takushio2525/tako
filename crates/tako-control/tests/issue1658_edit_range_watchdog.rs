@@ -308,7 +308,7 @@ fn 行桁の解決は丸めない() {
 
 /// 本文を変える公開 API（版が進むべきもの）。[`本文を変える公開apiはすべて版を進める`] が
 /// 挙動で確かめ、[`textbufferの書き換え口は棚卸し済み`] が取りこぼしを見る
-const MUTATES_TEXT: [&str; 19] = [
+const MUTATES_TEXT: [&str; 20] = [
     "set_text",
     // 整形の答え（書き換えの組）をまとめて 1 回で当てる（#1683。版は 1 つだけ進む）
     "apply_changes",
@@ -334,13 +334,15 @@ const MUTATES_TEXT: [&str; 19] = [
     "replace_position_range",
     // 複数の範囲を 1 回の操作で置き換える（#1682。補完の確定 = 本文 + 自動 import）
     "replace_position_ranges",
+    // 文字の打鍵 1 つ（#1759。GUI の文字入力と `tako edit type`。括弧の自動閉じ）
+    "type_char",
 ];
 
 /// 本文を変えない `&mut self` の公開 API（版は進まないのが正しい）。
 ///
 /// カーソル・選択は「どこを見ているか」で文書の中身ではない。`save` はディスクへ
 /// 書くだけで本文を変えない（変えると保存のたびに版が飛び、楽観ロックが使えなくなる）
-const KEEPS_TEXT: [&str; 12] = [
+const KEEPS_TEXT: [&str; 13] = [
     "set_cursor",
     "select_all",
     "move_cursor",
@@ -359,6 +361,8 @@ const KEEPS_TEXT: [&str; 12] = [
     "release_search_cache",
     // ファイルの移動に付き添ってパスだけを差し替える（#1834。本文も基準も動かさない = 版は進めない）
     "retarget",
+    // 括弧の自動閉じの設定を渡す（#1759。設定であって本文ではない）
+    "set_auto_close",
 ];
 
 /// 検査する操作 1 つ（名前 + バッファへ当てる手）
@@ -490,6 +494,7 @@ fn 本文を変える公開apiはすべて版を進める() {
                     .expect("書き換えたディスクから読み直せる");
             }),
         ),
+        ("type_char", Box::new(|b: &mut TextBuffer| b.type_char('('))),
         (
             "undo",
             Box::new(|b: &mut TextBuffer| {

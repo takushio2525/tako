@@ -6441,18 +6441,33 @@ fn dispatch_inner(
         Request::PreviewEditCommand {
             pane,
             command,
+            text,
             expected_version,
         } => {
-            use tako_core::platform::editor_keys::EditorCommand;
+            use tako_core::platform::editor_keys::{EditorCommand, TYPE_COMMAND};
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let command = EditorCommand::from_edit_name(&command).ok_or_else(|| {
-                DispatchError::Operation(format!(
-                    "command は {} のどれか（{command:?} は無い）",
-                    EditorCommand::edit_names().join(" / ")
-                ))
-            })?;
-            host.run_preview_command(target, command, expected_version)
-                .map_err(DispatchError::Operation)?;
+            // #1759: `type` は打つ文字を 1 文字ずつ GUI の文字の打鍵と同じ口へ通す
+            let commands = if command == TYPE_COMMAND {
+                EditorCommand::typed(text.as_deref().unwrap_or_default())
+                    .map_err(DispatchError::Operation)?
+            } else if text.is_some() {
+                return Err(DispatchError::Operation(format!(
+                    "text は command={TYPE_COMMAND} のときだけ渡す（{command:?} は打つ文字を取らない）"
+                )));
+            } else {
+                vec![EditorCommand::from_edit_name(&command).ok_or_else(|| {
+                    DispatchError::Operation(format!(
+                        "command は {} のどれか（{command:?} は無い）",
+                        EditorCommand::edit_names().join(" / ")
+                    ))
+                })?]
+            };
+            // 版の照合は最初の 1 打鍵の前だけ（2 打鍵目からは自分の打鍵で版が進んでいる）
+            for (i, command) in commands.into_iter().enumerate() {
+                let expected = if i == 0 { expected_version } else { None };
+                host.run_preview_command(target, command, expected)
+                    .map_err(DispatchError::Operation)?;
+            }
             Ok(preview_edit_reply(host, target))
         }
         Request::PreviewSave { pane, force } => {
@@ -6502,6 +6517,14 @@ fn dispatch_inner(
             let mut out = preview_edit_reply(host, target);
             out["redone"] = json!(redone);
             Ok(out)
+        }
+        // #1759: 括弧の自動閉じ（既定 ON。形式ごとの既定は file_type の auto_close 列）
+        Request::PreviewAutoClose { enabled } => {
+            if let Some(enabled) = enabled {
+                host.set_editor_auto_close(enabled)
+                    .map_err(DispatchError::Operation)?;
+            }
+            Ok(json!({ "auto_close": host.editor_auto_close() }))
         }
         Request::PreviewAutosave { pane, enabled } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -22127,6 +22150,8 @@ mod tests {
         xref: tako_core::lsp::xref::XrefStore,
         /// #1683: 保存時整形（GUI の `lsp_format_on_save` の代役）
         format_on_save: bool,
+        /// #1759: 括弧の自動閉じ（GUI の `editor_auto_close` の代役。既定 ON）
+        auto_close: bool,
         /// #1684: プレビューの選択（GUI の `preview_selections` の代役）
         selections: std::collections::HashMap<u64, crate::protocol::LineColRange>,
         /// #1879: tako mod の状態（GUI の `claude_mod` の代役）
@@ -22237,6 +22262,7 @@ mod tests {
                 lsp: None,
                 xref: tako_core::lsp::xref::XrefStore::default(),
                 format_on_save: false,
+                auto_close: true,
                 selections: std::collections::HashMap::new(),
                 claude_mod: tako_core::claude_mod::ModHub::new(true),
                 mod_ui_path: {
@@ -22974,6 +23000,8 @@ mod tests {
                         String::new(),
                     ),
                 };
+                let mut buffer = buffer;
+                buffer.set_auto_close(self.auto_close);
                 self.preview_edits
                     .insert(pane.as_u64(), (false, false, buffer));
             }
@@ -23284,6 +23312,17 @@ mod tests {
         }
         fn set_lsp_format_on_save(&mut self, enabled: bool) -> Result<(), String> {
             self.format_on_save = enabled;
+            Ok(())
+        }
+        fn editor_auto_close(&self) -> bool {
+            self.auto_close
+        }
+        /// GUI と同じく開いている編集バッファへも渡す
+        fn set_editor_auto_close(&mut self, enabled: bool) -> Result<(), String> {
+            self.auto_close = enabled;
+            for (_, _, buffer) in self.preview_edits.values_mut() {
+                buffer.set_auto_close(enabled);
+            }
             Ok(())
         }
         fn claude_mod(&self) -> Option<&tako_core::claude_mod::ModHub> {
@@ -29704,6 +29743,7 @@ mod tests {
                 Request::PreviewEditCommand {
                     pane: Some(pane),
                     command: command.into(),
+                    text: None,
                     expected_version: None,
                 },
                 PaneOrigin::Mcp,
@@ -29738,6 +29778,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// #1759: `type` は打つ文字を 1 文字ずつ GUI の文字の打鍵と同じ口へ通し（括弧の自動閉じと
+    /// 飛び越し）、設定 `PreviewAutoClose` を OFF にすると 1 文字を入れるだけになる。
+    /// Enter（`newline`）は字下げを戻すキーワード・リストの印の引き継ぎが効く
+    #[test]
+    fn preview打鍵のtypeは自動閉じと飛び越しが効く() {
+        let dir = std::env::temp_dir().join(format!("tako-dispatch-type-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let pane = preview_with_text(&mut host, &dir, "let v = ;\n");
+        let req = |command: &str, text: Option<&str>, expected_version: Option<u64>| {
+            Request::PreviewEditCommand {
+                pane: Some(pane),
+                command: command.into(),
+                text: text.map(String::from),
+                expected_version,
+            }
+        };
+        let body = |host: &MockHost| host.preview_edits[&pane].2.text().to_string();
+        dispatch(
+            &mut host,
+            Request::PreviewCursor {
+                pane: Some(pane),
+                line: 1,
+                col: 8,
+                select_to_line: None,
+                select_to_col: None,
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let typed = dispatch(&mut host, req("type", Some("f(x"), None), PaneOrigin::Mcp).unwrap();
+        assert_eq!(body(&host), "let v = f(x);\n");
+        assert_eq!(typed["document"]["auto_close"].as_bool(), Some(true));
+        assert_eq!(typed["document"]["cursor"]["column"].as_u64(), Some(11));
+        let version = typed["document"]["version"].as_u64().unwrap();
+        // 自分で入れた閉じ括弧は飛び越す（本文も版も変えない）
+        let over = dispatch(
+            &mut host,
+            req("type", Some(")"), Some(version)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(body(&host), "let v = f(x);\n");
+        assert_eq!(over["document"]["version"].as_u64(), Some(version));
+        assert_eq!(over["document"]["cursor"]["column"].as_u64(), Some(12));
+        // 版違いは最初の打鍵の前に断る（何も入らない）
+        let err =
+            dispatch(&mut host, req("type", Some("(("), Some(0)), PaneOrigin::Cli).unwrap_err();
+        assert!(format!("{err:?}").contains("版が違う"), "{err:?}");
+        assert_eq!(body(&host), "let v = f(x);\n");
+        // text の無い type・text を取らない command は断る
+        assert!(dispatch(&mut host, req("type", None, None), PaneOrigin::Cli).is_err());
+        let err =
+            dispatch(&mut host, req("newline", Some("x"), None), PaneOrigin::Cli).unwrap_err();
+        assert!(format!("{err:?}").contains("command=type"), "{err:?}");
+        // 設定を OFF: 応答と開いている編集の両方へ効き、1 文字を入れるだけになる
+        let off = dispatch(
+            &mut host,
+            Request::PreviewAutoClose {
+                enabled: Some(false),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(off["auto_close"].as_bool(), Some(false));
+        let typed = dispatch(&mut host, req("type", Some("["), None), PaneOrigin::Cli).unwrap();
+        assert_eq!(body(&host), "let v = f(x)[;\n");
+        assert_eq!(typed["document"]["auto_close"].as_bool(), Some(false));
+        let state = dispatch(
+            &mut host,
+            Request::PreviewAutoClose { enabled: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(state["auto_close"].as_bool(), Some(false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// #1692: 行の操作（`line-<操作>`）が dispatch から GUI の打鍵と同じ口で効き、
     /// 当てられない操作（記号の無い形式のコメント）は理由つきで失敗して本文も版も変えない
     #[test]
@@ -29753,6 +29874,7 @@ mod tests {
                 Request::PreviewEditCommand {
                     pane: Some(pane),
                     command: command.into(),
+                    text: None,
                     expected_version: None,
                 },
                 PaneOrigin::Mcp,

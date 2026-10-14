@@ -45,6 +45,12 @@ pub struct Settings {
     /// 要らない（`Settings` の指紋は動くが、読み書きは後方互換）
     #[serde(default)]
     pub lsp_format_on_save: bool,
+    /// 括弧の自動閉じ（FR-3.5 / Issue #1759。**既定 ON**。形式ごとの既定は `file_type` の
+    /// `auto_close` 列で、Markdown・プレーンテキストは ON でも閉じない）。
+    /// **旧ファイルはキーが無くても true で読める**（`default_true`）ので移行 Step は要らない
+    /// （`Settings` の指紋は動くが、読み書きは後方互換）
+    #[serde(default = "default_true")]
+    pub editor_auto_close: bool,
     /// tako mod（FR-2.42 / Issue #1879。既定 ON）: 新しく作るペインへ Claude Code の mod を
     /// 読ませる（env `CLAUDE_CODE_PLUGIN_DIRS`）。OFF にしても動いている claude には効かない。
     /// **旧ファイルはキーが無くても true で読める**（`default_true`）ので移行 Step は要らない
@@ -251,6 +257,7 @@ impl Default for Settings {
             autosuggest_tab: true,
             preview_live_reload: true,
             lsp_format_on_save: false,
+            editor_auto_close: true,
             claude_mod: true,
             limit_resume_all: false,
             resources: tako_core::queue::LimitSettings::default(),
@@ -715,6 +722,7 @@ mod tests {
             autosuggest_tab: false,
             preview_live_reload: false,
             lsp_format_on_save: true,
+            editor_auto_close: false,
             claude_mod: false,
             limit_resume_all: true,
             resources: tako_core::queue::LimitSettings {
@@ -823,6 +831,10 @@ mod tests {
         // 移行 Step 不要。指紋テストの更新理由がこれ）
         assert!(!parsed.lsp_format_on_save);
         assert!(!Settings::default().lsp_format_on_save);
+        // #1759: 括弧の自動閉じは既定 ON（旧ファイル = キー無しでも true = 移行 Step 不要。
+        // 指紋テストの更新理由がこれ）
+        assert!(parsed.editor_auto_close);
+        assert!(Settings::default().editor_auto_close);
         // #1945: 自動復帰の全体の既定は OFF（旧ファイル = キー無しでも false =
         // 移行 Step 不要。指紋テストの更新理由がこれ）
         assert!(!parsed.limit_resume_all);

@@ -2212,6 +2212,9 @@ struct TakoApp {
     lsp_format: crate::lsp_format_ui::LspFormatUi,
     /// 保存時整形（#1683。settings.json の `lsp_format_on_save` を起動時に読む。既定 OFF）
     lsp_format_on_save: bool,
+    /// 括弧の自動閉じ（#1759。settings.json の `editor_auto_close` を起動時に読む。既定 ON）。
+    /// 編集セッションを作るたびにバッファへ渡し、切り替えたら開いている全セッションへ渡す
+    editor_auto_close: bool,
     /// 補完（予測変換）の GUI の状態（#1682）。問い合わせは manager、確定は dispatch の 1 本
     lsp_completion: lsp_completion_ui::LspCompletionUi,
     /// ホバー（型・doc のカード）の GUI の状態（#1681）。問い合わせは manager、カードは 1 枚
@@ -4765,6 +4768,7 @@ impl TakoApp {
             lsp_goto: LspGotoUi::default(),
             lsp_format: crate::lsp_format_ui::LspFormatUi::default(),
             lsp_format_on_save: tako_control::settings::load().lsp_format_on_save,
+            editor_auto_close: tako_control::settings::load().editor_auto_close,
             lsp_completion: lsp_completion_ui::LspCompletionUi::default(),
             lsp_hover: lsp_hover_ui::LspHoverUi::default(),
             lsp_xref: Default::default(),
@@ -15322,6 +15326,8 @@ impl TakoApp {
         if enabled && !self.preview_edits.contains_key(&pane_id) {
             let state = self.previews.get(&pane_id).expect("上で確認済み");
             let mut edit = preview::EditState::open(state)?;
+            // #1759: 括弧の自動閉じの設定（設定の切替は `set_editor_auto_close` が開いている全部へ渡す）
+            edit.buffer.set_auto_close(self.editor_auto_close);
             // #1649: 編集を始めた瞬間からキャレットは可視範囲に居なければならない。
             // `EditState::open` はオフセット 0 から始めるので、3,000 行目を見ている
             // 状態で編集を始めると追従が先頭へ引き戻す（打つ場所と見ている場所が
@@ -15761,6 +15767,7 @@ impl TakoApp {
         let mut edit = preview::EditState::open(state)?;
         edit.editing = false;
         edit.search_visible = true;
+        edit.buffer.set_auto_close(self.editor_auto_close);
         self.preview_edits.insert(pane_id, edit);
         Ok(())
     }
@@ -15809,6 +15816,7 @@ impl TakoApp {
             let state = self.previews.get(&pane_id).unwrap();
             if let Ok(mut new_edit) = preview::EditState::open(state) {
                 new_edit.editing = false;
+                new_edit.buffer.set_auto_close(self.editor_auto_close);
                 self.preview_edits.insert(pane_id, new_edit);
             }
         }
@@ -27058,6 +27066,26 @@ impl SystemHost for TakoApp {
         Ok(())
     }
 
+    fn editor_auto_close(&self) -> bool {
+        self.editor_auto_close
+    }
+
+    /// #1759: 括弧の自動閉じの切替。開いている編集セッションへもその場で渡す
+    fn set_editor_auto_close(&mut self, enabled: bool) -> Result<(), String> {
+        // セルフテスト中はユーザー設定を汚さない（`set_lsp_format_on_save` と同じ）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            let mut settings = tako_control::settings::load();
+            settings.editor_auto_close = enabled;
+            tako_control::settings::save(&settings)
+                .map_err(|e| format!("設定を保存できない: {e}"))?;
+        }
+        self.editor_auto_close = enabled;
+        for edit in self.preview_edits.values_mut() {
+            edit.buffer.set_auto_close(enabled);
+        }
+        Ok(())
+    }
+
     fn lsp_documents(&self) -> Vec<tako_control::lsp::LspDocument> {
         let mut out: Vec<_> = self
             .preview_edits
@@ -27487,13 +27515,26 @@ impl EntityInputHandler for TakoApp {
             .get_mut(&pane)
             .filter(|edit| edit.editing)
         {
+            // #1759: 打鍵 1 文字は CLI `tako edit type` / MCP の `command: "type"` と同じ打鍵の口
+            // （括弧の自動閉じと入れた閉じ括弧の飛び越し）。範囲を指した差し替え・IME の長い確定は挿入
+            let mut chars = text.chars();
+            let typed = match (chars.next(), chars.next()) {
+                (Some(c), None) if _range_utf16.is_none() => Some(c),
+                _ => None,
+            };
             if let Some(range_utf16) = _range_utf16 {
                 let start = utf16_to_byte_offset(edit.buffer.text(), range_utf16.start);
                 let end = utf16_to_byte_offset(edit.buffer.text(), range_utf16.end);
                 edit.buffer.set_cursor(start, false);
                 edit.buffer.set_cursor(end, true);
             }
-            edit.buffer.insert(text);
+            match typed {
+                Some(c) => {
+                    let _ = tako_core::platform::editor_keys::EditorCommand::Type(c)
+                        .apply(&mut edit.buffer);
+                }
+                None => edit.buffer.insert(text),
+            }
             edit.message = None;
             self.ime = None;
             self.refresh_preview_from_editor(pane);
@@ -31307,6 +31348,12 @@ mod self_test {
     mod bracket_match_1691;
     #[cfg(feature = "visual-test")]
     use bracket_match_1691::bracket_match_visual;
+    /// #1759: Enter の続き（抜ける文の後ろ・リストの印）と括弧の自動閉じを実キーで打つ
+    /// （visual-test `enter-1759`）
+    #[cfg(feature = "visual-test")]
+    mod enter_1759;
+    #[cfg(feature = "visual-test")]
+    use enter_1759::enter_1759_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -45810,6 +45857,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1759: Enter の続き 2 つと括弧の自動閉じを実キーで 1 回ずつ打ち、前後を撮る
+                "enter-1759" => {
+                    enter_1759_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -45825,7 +45878,7 @@ mod self_test {
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          syntax-alias / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
-                         workspace-search-1694 / paste-guard / bracket-match）"
+                         workspace-search-1694 / paste-guard / bracket-match / enter-1759）"
                     );
                     std::process::exit(1);
                 }
@@ -45894,6 +45947,8 @@ mod self_test {
             search_case_visual(any, window, cx).await;
             // #1691: カーソルを括弧に置くと対の括弧が実ピクセルで強調され、対が無いと出ないか
             bracket_match_visual(any, window, cx).await;
+            // #1759: 抜ける文の後ろの Enter・リストの印の引き継ぎ・括弧の自動閉じを実キーで
+            enter_1759_visual(any, window, cx).await;
             // #1659: 外部変更の帯（差分 / 上書き保存 / 読み直す）を実マウスで押して抜けられるか・
             // 競合中に打鍵を続けても知らせは 1 回のままか
             external_change_visual(any, window, cx).await;

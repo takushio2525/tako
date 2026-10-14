@@ -1457,6 +1457,16 @@ pub trait SystemHost {
     fn set_lsp_format_on_save(&mut self, _enabled: bool) -> Result<(), String> {
         Err("保存時整形の設定は未対応".into())
     }
+    /// 括弧の自動閉じの設定（#1759）の今の値。**既定 true**（GUI は settings.json の
+    /// `editor_auto_close` を起動時に読んだ値を持ち、編集を始めるバッファへ渡す）
+    fn editor_auto_close(&self) -> bool {
+        true
+    }
+    /// 括弧の自動閉じの切替（`tako edit auto-close on|off`・設定画面）。開いている編集バッファへの
+    /// 反映と settings.json への永続化は実装側の責務
+    fn set_editor_auto_close(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("括弧の自動閉じの設定は未対応".into())
+    }
     /// tako mod（FR-2.42 / #1879）の状態。GUI のメモリだけに置く（永続化しない）。
     /// `None` = mod を扱わない（2 つ目のインスタンス・テストのホスト）
     fn claude_mod(&self) -> Option<&tako_core::claude_mod::ModHub> {

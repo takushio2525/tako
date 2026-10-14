@@ -766,6 +766,16 @@ tako edit search --close    # 閉じる（閲覧中の Markdown は描画へ戻�
 tako edit cursor 12:8   # 12 行目の 8 桁目へ置く → 応答の document.bracket_match を見る
 ```
 
+文字をキーボードで打つのと同じ形で入れるときは `tako edit type` です。1 文字ずつ打鍵として入るので、開き括弧は閉じ括弧も入れ、自動で入った閉じ括弧の手前の閉じ括弧は飛び越します（1 回 1000 文字まで。長い本文は `tako edit replace-range`）。括弧を自動で閉じるかは `tako edit auto-close` で切り替えます（既定 on。Markdown とテキストは on でも閉じません）。効いているかは応答の `document.auto_close` で読めます。
+
+```bash
+tako edit type "f(x"      # → f(x) の ) の手前にカーソル
+tako edit type ")"        # → ) を飛び越す（二重にならない）
+tako edit auto-close off  # 括弧を自動で閉じない
+```
+
+`tako edit newline` は <kbd>Enter</kbd> と同じで、Python の `return` などの行の後ろは 1 段浅く、Markdown のリストの行は印を引き継ぎます（印だけの行では印を消して抜けます）。
+
 ### tako file
 
 ファイルツリーの右クリックメニューに相当する操作群です。
