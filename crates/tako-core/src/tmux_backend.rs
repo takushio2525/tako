@@ -3947,6 +3947,23 @@ mod pane_died_tests {
         false
     }
 
+    /// 書き出しが現れるまで待って読む（最大 20 秒）。
+    ///
+    /// 書き出しは器のペインが死んだときにしか作られないので、これが「死んだ」の合図。
+    /// `has_session` の偽は合図にしない: `TerminalSession::spawn` は器を非同期に起こすので
+    /// 起きる前の問い合わせも偽になり、`has_session` は打ち切り・起動失敗でも偽を返す
+    /// （全体の並列実行で、書き出しの前に読みに行って落ちたのを実測）
+    #[cfg(unix)]
+    fn wait_dump(dir: &Path, session: &str) -> Option<PaneDiedDump> {
+        for _ in 0..200 {
+            if let Some(dump) = take_pane_died_dump(dir, session) {
+                return Some(dump);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        None
+    }
+
     /// 番号つきの行の並び（`<接頭辞><番号>` の行だけを拾う）
     #[cfg(unix)]
     fn numbers(lines: &[String], prefix: &str) -> Vec<usize> {
@@ -3983,10 +4000,10 @@ mod pane_died_tests {
         let (client, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session))
                 .expect("tmux クライアントを spawn できる");
-        assert!(wait_gone(&socket, session), "器が自ら消えない");
-        drop(client);
         let dir = pane_died_dir().expect("テストのデータディレクトリ");
-        let dump = take_pane_died_dump(&dir, session).expect("書き出しがある");
+        let dump = wait_dump(&dir, session).expect("書き出しがある");
+        assert!(wait_gone(&socket, session), "書き出した後に器が消えない");
+        drop(client);
         let mut all = dump.history.clone();
         all.extend(dump.screen.iter().cloned());
         assert_eq!(
@@ -4043,11 +4060,11 @@ mod pane_died_tests {
             "tako-alt",
             "printf '\\033[?1049h'; seq 1 30",
         );
+        let dump = wait_dump(&tmp.0, "tako-alt").expect("書き出しがある");
         assert!(
             wait_gone(&socket, "tako-alt"),
             "alt screen のまま死んだペインが残る"
         );
-        let dump = take_pane_died_dump(&tmp.0, "tako-alt").expect("書き出しがある");
         assert!(dump.probe.alternate, "alt screen の印: {:?}", dump.probe);
         // alt screen の画面（履歴の無い面）の最後の行まで、番号が続いて入る
         let shown = numbers(&dump.screen, "");
@@ -4148,13 +4165,17 @@ mod pane_died_tests {
         }
         // 器の外のセッション（`tako-` で始まらない）は書き出さない（kill-pane だけ）
         new_vessel(&socket, &conf, "other", "seq 1 5");
+        let dumps: Vec<PaneDiedDump> = (1..=5)
+            .map(|i| {
+                wait_dump(&tmp.0, &format!("tako-m{i}"))
+                    .unwrap_or_else(|| panic!("tako-m{i} の書き出しが無い"))
+            })
+            .collect();
         for i in 1..=5 {
             assert!(wait_gone(&socket, &format!("tako-m{i}")));
         }
         assert!(wait_gone(&socket, "other"));
-        for i in 1..=5 {
-            let dump = take_pane_died_dump(&tmp.0, &format!("tako-m{i}"))
-                .unwrap_or_else(|| panic!("tako-m{i} の書き出しが無い"));
+        for (i, dump) in (1..=5).zip(dumps) {
             let mut all = dump.history.clone();
             all.extend(dump.screen.iter().cloned());
             assert_eq!(
