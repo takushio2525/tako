@@ -6626,6 +6626,27 @@ mod urlencoding {
 mod tests {
     use super::*;
 
+    /// #2050: スマホの入力の応答。確認の段で送らなかったら 409 と伏せ字、警告だけの段は 200 に
+    /// 伏せ字を添え、当たらない入力は今までどおり 200 だけ
+    #[test]
+    fn issue2050_入力の応答は送らなかったら409と伏せ字_警告は200に添える() {
+        let guard = json!({
+            "verdict": "confirm",
+            "findings": [{ "rule": "github_token", "line": 1, "masked": "ghp_…qrst" }],
+        });
+        let (status, body) = input_reply(&json!({ "sent": false, "paste_guard": guard }));
+        assert_eq!(status, 409);
+        assert_eq!(body["paste_guard"]["findings"][0]["masked"], "ghp_…qrst");
+        assert!(body["error"].as_str().unwrap().contains("送っていない"));
+        let warned = json!({ "queued": true, "paste_guard": { "verdict": "warn" } });
+        let (status, body) = input_reply(&warned);
+        assert_eq!((status, body["ok"].clone()), (200, json!(true)));
+        assert_eq!(body["paste_guard"]["verdict"], "warn");
+        for plain in [Value::Null, json!({ "queued": true })] {
+            assert_eq!(input_reply(&plain), (200, json!({ "ok": true })));
+        }
+    }
+
     /// env var（TAKO_REMOTE_STATE_DIR / PATH）はプロセス全域のため、これを set/remove する
     /// テスト同士が並列実行でレースする。特に PATH を空にする窓では verify_pid_identity の
     /// ps 起動が失敗して検証素通り → daemon_stop_impl が自プロセスへ SIGTERM を送り
