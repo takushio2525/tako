@@ -591,7 +591,6 @@ TAKO_FOOTPRINT_STUB_CLAUDE=1 bash scripts/measure-footprint-2011.sh persist:1   
 - 本番の 10/13 の 26 本に当てると、footprint の計は約 180 MB（1 本 6.8〜7.0 MB）→ 約 28 MB の見込み（1 本の値 × 26。RSS は未実測）
 - 回帰の見張り: `tako-mcp` が libSystem 以外をリンクし始めたら `scripts/build-app.sh` が止まる（release の `otool -L`）。
   debug は使わない関数が LLVM で消えずに残るのでフレームワークが外れない（番犬の otool の項目は release だけで走る）
-||||||| parent of fa5db4a ([改善] pane-died の番犬にその場で失敗する形の注入を足し、設計書に #2085 の実測をまとめる (#2085))
 
 ## 12. #2085 器が自ら消えても最後の行までペインログに入れる
 
@@ -641,7 +640,7 @@ Windows 実機で確かめていない（この PC では測れない）。`rema
 設定を 1 行も変えない。挙動は #2085 の前と同じ（出力中に自ら終わると最後の取り込みの後の行・最大 10 秒が入らない）。
 `tako platform` の `tako_logs` を Windows で degraded にし、理由を 1 文で申告した（`WIN_PANE_LOG_EXIT_TAIL`）
 
-### 11.4 実測（2026-10-15・同じ release バイナリの A/B・隔離 GUI・tako-vd。蓋閉じ・画面ロック中 = 描画の値は未実測）
+### 12.4 実測（2026-10-15・同じ release バイナリの A/B・隔離 GUI・tako-vd。蓋閉じ・画面ロック中 = 描画の値は未実測）
 
 **ペインログの中身**（`scripts/test-pane-log-pace-2018.sh both`。PASS 13 / FAIL 0）
 

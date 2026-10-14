@@ -251,7 +251,7 @@ pub fn pane_died_dir() -> Option<PathBuf> {
 /// 書くのは tmux サーバー自身なので**子プロセスは 1 本も増えない**。tako は器が消えて
 /// attach クライアントが終わったとき（`CloseOrigin::ProcessExit`）にそれを読む。
 ///
-/// tmux 3.6b の実測で決めた形（`.agent/plans/2026-10-lightweight.md` §11）:
+/// tmux 3.6b の実測で決めた形（`.agent/plans/2026-10-lightweight.md` §12）:
 ///
 /// - **フックの中でコマンドがその場で失敗すると、同じリストの後ろを全部捨てる**
 ///   （実測: 存在しないバッファの `save-buffer` で `kill-pane` まで捨てられ、死んだペインが
