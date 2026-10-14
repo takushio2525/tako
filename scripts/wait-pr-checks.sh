@@ -19,6 +19,11 @@
 #   - 外部連携のチェック（Cloudflare Pages）はワークフローから導出できないので EXTERNAL_CHECKS に持つ
 #   - 一時的に別の集合で待ちたいときだけ TAKO_WAIT_PR_CHECKS_EXPECT="A,B" で上書きできる
 #
+# skip されたチェック（bucket = skipping）は「完了・緑」として数える（#2084）:
+#   docs だけの PR では ci.yml が macOS / Windows の Rust ジョブを `if:` で skip する。
+#   skip されたジョブもチェック名は登録される（`paths-ignore` と違って「無い」にはならない）ので、
+#   期待名の判定はそのまま揃う。結果には skip の本数を 1 行添える。
+#
 # 「待っても絶対に揃わない」状態は待たない（#1365）:
 #   base が進んで衝突すると GitHub は merge コミットを作れず **pull_request の run を作らない**。
 #   期待名は永久に未登録のままなので、未登録が残っている間は `mergeable` も見て、
@@ -232,6 +237,7 @@ at_of() { # 完了時刻（未完了は gh が 0001-01-01T00:00:00Z を返す）
 MISSING=()
 PENDING_N=0
 FAILED_N=0
+SKIPPED_N=0
 DONE_N=0
 REPORTED_N=0
 evaluate() {
@@ -239,6 +245,7 @@ evaluate() {
   MISSING=()
   PENDING_N=0
   FAILED_N=0
+  SKIPPED_N=0
   DONE_N=0
   REPORTED_N=0
   for name in ${EXPECTED[@]+"${EXPECTED[@]}"}; do
@@ -253,6 +260,11 @@ evaluate() {
         pending) PENDING_N=$((PENDING_N + 1)) ;;
         fail | cancel)
           FAILED_N=$((FAILED_N + 1))
+          DONE_N=$((DONE_N + 1))
+          ;;
+        # if: で飛ばしたジョブ = 成功扱い（#2084）。数えるのは結果の 1 行のため
+        skipping)
+          SKIPPED_N=$((SKIPPED_N + 1))
           DONE_N=$((DONE_N + 1))
           ;;
         *) DONE_N=$((DONE_N + 1)) ;;
@@ -420,4 +432,7 @@ if [[ ${FAILED_N} -gt 0 ]]; then
   exit 1
 fi
 echo "CI が全部緑で揃った（期待 ${#EXPECTED[@]} 本 / 報告 ${REPORTED_N} 本）"
+if [[ ${SKIPPED_N} -gt 0 ]]; then
+  echo "  うち ${SKIPPED_N} 本は skip（成功扱い。docs だけの変更で Rust の重いジョブを飛ばした等 = #2084）"
+fi
 exit 0

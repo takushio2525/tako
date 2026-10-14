@@ -3,6 +3,13 @@
 # Windows ジョブは Phase 0 残タスク「windows ランナーでの PoC 相当ビルド・スモーク」を兼ねる
 # （実機が無いため CI が唯一の Windows 検証手段。.agent/roadmap.md Phase 1）。
 # gpui の Windows ビルド前提（Spectre-mitigated libs 等）は .agent/architecture.md を参照。
+#
+# docs だけの変更（docs/ と .agent/ の md）では macOS / Windows の Rust ジョブを skip する（#2084）。
+# 判定は先頭の `changes`（scripts/ci-change-scope.sh）。`paths-ignore` だとジョブそのものが
+# 「無い」扱いになり、scripts/wait-pr-checks.sh の「期待するチェック名が全部そろう」判定と
+# 噛み合わないので、`if:` で skip を「成功」として残す。docs の検査は `docs`（毎回）、
+# docs / .agent を読む Rust の番犬は `docs-watchdogs`（docs だけのときだけ）が受け持つ。
+# 仕組みと判定の境界は .agent/conventions.md「docs だけの変更で Rust の重いジョブを skip する」
 name: CI
 
 on:
@@ -16,31 +23,52 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  macos:
-    name: macOS（build + lint + test）
-    runs-on: macos-latest
-    timeout-minutes: 60
+  # 変更範囲の判定（#2084）。docs だけ（docs/ と .agent/ の md）なら rust=false を出し、
+  # macOS / Windows の Rust ジョブを skip させる。差分が取れない・想定外のときは rust=true
+  # （走らせる側へ倒す）。判定の型は scripts/ci-change-scope.sh の DOCS_ONLY / RUST_REQUIRED
+  changes:
+    name: 変更範囲の判定（#2084）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # pull_request は merge コミットとその第 1 親（= CI が組み合わせた base の先頭）、
+          # push は直前の 1 本までの差分を見る。before が手元に無ければスクリプトが取りに行く
+          fetch-depth: 2
+      # 判定そのもののテスト（パスの境界・merge コミットからの差分・名前の変更・取れないときは
+      # 走らせる側・docs を読む番犬の拾い方・ci.yml の配線）。git と bash だけで数秒
+      - name: 変更範囲の判定のテスト（#2084）
+        run: bash scripts/test-ci-change-scope-2084.sh
+      - name: 変更範囲を判定（docs だけなら Rust の重いジョブを skip。#2084）
+        id: scope
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_PUSH_BEFORE: ${{ github.event.before }}
+        run: bash scripts/ci-change-scope.sh github
+
+  # docs サイトのビルドと検査。**docs だけの PR でも必ず走る**ように、判定に関係なく毎回走らせる
+  # （macOS ジョブの中にあると、docs だけの PR で macOS ごと skip されて止まる。#2084）。
+  # node と gh しか使わないので ubuntu で足りる（macOS ランナーの取り合いに加わらない）
+  docs:
+    name: docs（ビルド + 検査）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: |
-            web/tako-remote/package-lock.json
-            docs/package-lock.json
-      # rust_embed が web/tako-remote/dist/ をコンパイル時に埋め込むため、
-      # cargo の全ステップ（clippy 含む）より前に PWA をビルドする必要がある。
-      # dist/ は .gitignore 対象なのでクリーンチェックアウトには存在しない（Issue #574）。
-      # 手順は scripts/build-app.sh の「PWA ビルド」節と同じ
-      - name: PWA をビルド（rust_embed が dist/ を要求する）
-        working-directory: web/tako-remote
-        run: npm ci --no-audit --no-fund && npm run build
+          cache-dependency-path: docs/package-lock.json
       # docs サイトは **Cloudflare Pages がビルドを代行**していたので、CI では
       # 1 度も astro build を通していなかった（`og:verify` と内部リンク検査に
       # 至ってはどこからも走っていない）。npm ci 2 秒 + build 3.5 秒なので
-      # ここで通す。**Rust より前に置く**のは、docs の壊れがビルド 40 分の
-      # 後ろに隠れないようにするため（#1547）
+      # ここで通す（#1547）。以前は macOS ジョブの Rust より前に置いていたが、
+      # docs だけの PR で macOS ジョブを skip する（#2084）ので、毎回走るこのジョブへ移した
+      # （Rust のビルド 40 分の後ろに隠れないことも、別ジョブで並走するので保たれる）
       - name: docs をビルド（robots.txt の同梱まで見る。#1547）
         working-directory: docs
         run: |
@@ -78,6 +106,74 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/check-docs-issue-refs.sh
+      # リリースノートのページが現行の版から取り残されるのを止める。v0.8.0 が出てから
+      # 25 日間、ページの見出しは「v0.7.0（2026-08-15）— 最新の安定版」のままだった
+      # （#1546）。「最新の安定版」= GitHub Releases で Latest が付く版なので、夜間の
+      # テスト版（prerelease）が進んでもラベルは動かさない。現行の版は Cargo.toml /
+      # CHANGELOG / git tag の最大値から採る（checkout はタグを持たないので Cargo.toml が主）
+      - name: リリースノートのページが現行の版に追いついている
+        run: node docs/scripts/check-releases-page.mjs
+
+  # docs / .agent を読む Rust の番犬（#2084）。docs だけの PR では macOS / Windows の Rust ジョブを
+  # skip するが、`no_personal_data`（#927 = 個人情報の番犬。リポジトリの全ファイルを走査）・
+  # `context_budget`・`docs_tool_inventory` などは docs / .agent の md を**読んで検査する**ので、
+  # それらだけをここで走らせる。一覧は手で持たず scripts/ci-docs-watchdogs.sh が毎回拾う。
+  # macOS で走らせるのは full の macOS ジョブと同じ環境で回すため（Linux は CI で一度も
+  # 組んでいない = ここだけ Linux にすると、コードの PR で壊れても気づけず docs の PR が赤くなる）
+  docs-watchdogs:
+    name: docs を読む Rust の番犬（docs だけの変更のとき。#2084）
+    needs: changes
+    if: needs.changes.outputs.rust == 'false'
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/tako-remote/package-lock.json
+      # macOS ジョブと同じ理由（rust_embed が dist/ を要求する。Issue #574）
+      - name: PWA をビルド（rust_embed が dist/ を要求する）
+        working-directory: web/tako-remote
+        run: npm ci --no-audit --no-fund && npm run build
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      # macOS ジョブと同じ理由（#1915）
+      - name: ルートの Cargo.toml の指紋（rust-cache のキー。#1915）
+        id: cargo-root
+        shell: bash
+        run: key=$(bash scripts/lib/cargo-root-manifest-key.sh) && echo "key=$key" >> "$GITHUB_OUTPUT"
+      # PR ごとのキャッシュは保存しない（PR のスコープは他から読めず、容量だけ食う = #1921 と同じ型）。
+      # main の docs だけの push で保存したものを PR が復元する
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: manifest-${{ steps.cargo-root.outputs.key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: docs / .agent を読む Rust の番犬（#2084）
+        run: bash scripts/ci-docs-watchdogs.sh
+
+  macos:
+    name: macOS（build + lint + test）
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/tako-remote/package-lock.json
+      # rust_embed が web/tako-remote/dist/ をコンパイル時に埋め込むため、
+      # cargo の全ステップ（clippy 含む）より前に PWA をビルドする必要がある。
+      # dist/ は .gitignore 対象なのでクリーンチェックアウトには存在しない（Issue #574）。
+      # 手順は scripts/build-app.sh の「PWA ビルド」節と同じ
+      - name: PWA をビルド（rust_embed が dist/ を要求する）
+        working-directory: web/tako-remote
+        run: npm ci --no-audit --no-fund && npm run build
       # rust-toolchain.toml と同じバージョンをピン（git 版 gpui が新しめの stable を要求）
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -139,13 +235,6 @@ jobs:
       # 版の突き合わせ・TAKO_BIN・実装 1 か所が壊れたらここで落ちる
       - name: docs 生成が選ぶ tako バイナリのテスト
         run: bash scripts/test-gen-docs-bin-1548.sh
-      # リリースノートのページが現行の版から取り残されるのを止める。v0.8.0 が出てから
-      # 25 日間、ページの見出しは「v0.7.0（2026-08-15）— 最新の安定版」のままだった
-      # （#1546）。「最新の安定版」= GitHub Releases で Latest が付く版なので、夜間の
-      # テスト版（prerelease）が進んでもラベルは動かさない。現行の版は Cargo.toml /
-      # CHANGELOG / git tag の最大値から採る（checkout はタグを持たないので Cargo.toml が主）
-      - name: リリースノートのページが現行の版に追いついている
-        run: node docs/scripts/check-releases-page.mjs
       # リリース経路（gh release create のリトライ / 両 OS の待ち合わせ / 片肺の検出）の
       # モックテスト。ダミー gh を PATH に挿すので本番の Release には触らない。
       # **片肺リリースの検出が壊れたらここで落ちる**（#256 / #965）
@@ -271,6 +360,8 @@ jobs:
 
   windows:
     name: Windows（build + test スモーク）
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
