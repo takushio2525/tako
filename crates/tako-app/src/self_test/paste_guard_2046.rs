@@ -802,7 +802,9 @@ pub(super) async fn paste_guard_visual(
         ),
     );
 
-    // ⑫ #2050: 警告だけの段・許可リスト・規則の無効化（判定の 1 実装 = scan_with を GUI の関所で）
+    // ⑫ #2050: 警告だけの段・許可リスト・規則の無効化（判定の 1 実装 = scan_with を GUI の関所で）。
+    // ⑨ / ⑩ はブラケットペーストの受け手へフォーカスを移したままなので、素の受け手へ戻す
+    focus(window, cx, plain);
     let warned_before = stats(window, cx).warned;
     let warn = dispatch_req(window, cx, policy_req(Some("warn"), None, None, &[]));
     notify_and_draw(any, window, cx);

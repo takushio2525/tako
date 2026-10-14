@@ -39,7 +39,7 @@
 //
 // 例外（#2050 の送信時の確認 = 鍵らしき文字の 2 段目）: prompt.submit だけは、人の入力（composer = その
 // 端末での Enter・bridge = Remote Control）を送る前に tako へ判定させ、答えが confirm なら Claude Code の
-// 選択ダイアログで「やめる / 送る」を確かめ、やめたら送信を落とす（{ drop }）。判定は tako の 1 実装
+// 選択ダイアログで「やめる / 送る」を確かめ、やめたら送信を落として（{ drop }）文を入力欄へ戻す。判定は tako の 1 実装
 // （`tako paste-guard check --pane N`。**本文は標準入力で渡す** = argv にもログにも残さない）で、ここは
 // 答えに従うだけ。tako が流した値・人が確かめた値は tako が外して答える（worker の初回プロンプトで
 // 止めない）。CLI が失敗・時間切れ・mod が投げたら**送信を通す**（.catch で next(e)。壊れた mod が
@@ -598,9 +598,21 @@ async function guardPrompt($: EngineInterface, text: string): Promise<'pass' | '
     answer = await $.ui.ask(w.guardQuestion(found), { options: [w.guardCancel, w.guardSend], header: w.guardHeader })
   } catch {
     // 閉じた（Esc）= やめる
-    return 'drop'
+    answer = w.guardCancel
   }
-  return answer === w.guardSend ? 'pass' : 'drop'
+  if (answer === w.guardSend) return 'pass'
+  await restoreDraft($, text)
+  return 'drop'
+}
+
+// やめた送信の文を入力欄へ戻す（鍵を消して送り直せるように。スマホの PWA と同じ）。
+// 戻せなくても送らないことは変えない
+async function restoreDraft($: EngineInterface, text: string): Promise<void> {
+  try {
+    await $.prompt.fill({ text, mode: 'replace' })
+  } catch {
+    $.ui.log('tako mod: paste-guard draft restore failed', { to: 'debug' })
+  }
 }
 
 // 端末の桁数（全角・CJK は 2 桁。Claude Code の配置と同じ数え方の近似）

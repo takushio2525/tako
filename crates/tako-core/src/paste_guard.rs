@@ -2284,7 +2284,10 @@ mod tests {
         let mut seed = 2050u64;
         let random = fake("sk-", &random_alnum(&mut seed, 40));
         assert_eq!(scan(&random).rules(), vec![Rule::OpenAiApiKey]);
-        assert_eq!(scan(&random["sk-".len()..]).rules(), vec![Rule::HighEntropy]);
+        assert_eq!(
+            scan(&random["sk-".len()..]).rules(),
+            vec![Rule::HighEntropy]
+        );
         let r = scan_with(&random, &policy);
         assert!(!r.hit(), "拾い直した: {:?}", r.findings);
         assert_eq!(r.disabled, 1);

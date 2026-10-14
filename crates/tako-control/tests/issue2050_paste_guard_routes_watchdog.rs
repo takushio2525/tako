@@ -397,12 +397,19 @@ fn guiの警告だけの通知は本文を持たずログへ書かない() {
 fn modの送信時の確認は本文を標準入力で渡しデバッグログへ書かない() {
     let src = read(MOD_REL);
     let mut bad = Vec::new();
-    let body = window(
+    let mut body = window(
         MOD_REL,
         &src,
         "async function guardPrompt($: EngineInterface, text: string): Promise<'pass' | 'drop'> {",
         None,
     );
+    // やめた文を入力欄へ戻す補助も本文を持つので同じ規則で見る
+    body.extend(window(
+        MOD_REL,
+        &src,
+        "async function restoreDraft($: EngineInterface, text: string): Promise<void> {",
+        None,
+    ));
     let body = &body[..];
     let joined: String = body
         .iter()

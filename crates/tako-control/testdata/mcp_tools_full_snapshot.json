@@ -3676,7 +3676,7 @@
     "name": "tako_theme"
   },
   {
-    "description": "設定画面の操作。action=open（既定）: GUI 設定画面を開く（個別設定は tako_lang / tako_theme 等を使う）。action=status: 設定画面が開いているかを返す。action=paste_guard: 貼り付けに API キー・パスワードらしきものがあれば PTY へ流す前に確かめる機能（既定 on）。enabled で切替、text で判定だけ試す（応答は規則名と伏せ字のみ）、respond で確認待ちへ答える。pending が確認待ち。",
+    "description": "設定画面の操作。action=open（既定）: GUI 設定画面を開く（個別設定は tako_lang / tako_theme 等を使う）。action=status: 設定画面が開いているかを返す。action=paste_guard: 貼り付けに API キー・パスワードらしきものがあれば PTY へ流す前に確かめる機能（既定 on）。enabled で切替、text で判定だけ試す（応答は規則名と伏せ字のみ）、respond で確認待ちへ答える。pending が確認待ち。mode=warn で止めずに警告だけ、allow の文字の当たりを許可リストへ（指紋と伏せ字だけ持つ）、unallow で外す、rules で規則ごとに切る。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -3689,9 +3689,26 @@
           ],
           "type": "string"
         },
+        "allow": {
+          "description": "当たりを許可リストへ足す文字",
+          "type": "string"
+        },
         "enabled": {
           "description": "paste_guard の on / off",
           "type": "boolean"
+        },
+        "mode": {
+          "description": "当たったとき（既定 confirm）",
+          "enum": [
+            "confirm",
+            "warn"
+          ],
+          "type": "string"
+        },
+        "pane": {
+          "description": "text をそのペインの送信時の確認として判定",
+          "minimum": 0,
+          "type": "integer"
         },
         "respond": {
           "description": "確認待ちの貼り付けへの答え（send = 送る / cancel = やめる）",
@@ -3700,6 +3717,13 @@
             "cancel"
           ],
           "type": "string"
+        },
+        "rules": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "description": "規則名 → 有効か（rule_names）",
+          "type": "object"
         },
         "tab": {
           "description": "開くタブ指定（省略時は現在タブ維持）。profiles = master / solo の起動プロファイル編集",
@@ -3717,6 +3741,10 @@
         },
         "text": {
           "description": "paste_guard の判定を試す文字",
+          "type": "string"
+        },
+        "unallow": {
+          "description": "外す許可の ID か all",
           "type": "string"
         }
       },

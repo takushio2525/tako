@@ -10,6 +10,9 @@
 #   mod     3. 実物の claude の入力欄に入れた鍵で、送信時に確認が出る（やめる → API へ届かない / 送る → 届く）・
 #              警告だけの段はトースト・tako が流した値は二度聞かない
 #   ab      4. 同じバイナリの `TAKO_2050_LEGACY=1` では send / remote / mod が素通し（旧挙動）
+#   visual  2. GUI の貼り付け（visual-test `paste-guard` の ⑫）: 警告だけの段は確認なしで届き通知が描かれる・
+#              許可した値は確認なし・混在は鍵だけで確認・無効にした規則は確認なし。旧挙動は ⑫ で FAILED。
+#              画像は新旧で書き出し先を分ける（$TMP/visual-new / visual-legacy）
 #   logs    5. GUI の標準出力・標準エラー・persist.log・daemon の状態 dir・偽 API のログに偽の鍵の本文が無い
 #
 # **本物の設定 dir（~/.claude*）・クリップボード・本番の tako / tailscale / remote には触らない**:
@@ -17,7 +20,7 @@
 # 一時 dir と専用ソケット。前後で本物の ~/.claude*/skills・plugins の一覧とハッシュを比べる。
 # 偽の鍵は前置詞と本体を分けて書き、実行時に連結する（GitHub の secret scanning に当てない）。
 #
-# 使い方: bash scripts/test-paste-guard-2050.sh   （ONLY=policy|send|remote|mod|ab で 1 段だけ）
+# 使い方: bash scripts/test-paste-guard-2050.sh   （ONLY=policy|send|remote|mod|ab|visual で 1 段だけ）
 # **CI には登録しない**（実物の claude と仮想ディスプレイが要る）。CI 側の担保は Rust の単体・番犬
 # （issue2050_paste_guard_routes_watchdog）・mod の `claude plugin test`・PWA の e2e。
 set -uo pipefail
@@ -59,7 +62,8 @@ snap_real() {
 REAL_BEFORE="$(snap_real)"
 
 # --- ビルド -------------------------------------------------------------------------------
-(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app && run_heavy cargo build -q -p tako-cli) || exit 1
+# visual 段のために visual-test 版の GUI を作る（ほかの段もこの版で走る = #1962 と同じ）
+(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app --features visual-test && run_heavy cargo build -q -p tako-cli) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins || exit 1
@@ -148,6 +152,15 @@ stop_app() {
   APP_PID=""
 }
 root_pane() { tk list 2>/dev/null | jq -r '.tabs[0].panes[0].id'; }
+pane_ids() { tk list 2>/dev/null | jq -r '.tabs[].panes[].id' | sort; }
+# 新しいペインを割って ID を出す（確認済みの値はペインごとなので、前の段が届けた鍵を持ち越さない）
+fresh_pane() {
+  local before after
+  before="$(pane_ids)"
+  tk split --pane "$(root_pane)" --right >/dev/null 2>&1
+  after="$(pane_ids)"
+  comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1
+}
 pane_has() { tk read --pane "$1" 2>/dev/null | grep -q -- "$2"; }
 wait_for() {
   local limit="$1" i
@@ -432,7 +445,10 @@ mkdir -p "$CAP_DIR"
 
 phase_mod() {
   local legacy="${1:-}" p dirs s before
-  p="$(root_pane)"
+  # 前の段（send / remote）が root のペインへ同じ偽の鍵を届けている = そのペインでは確認済み。
+  # mod 段は新しいペインを名乗る
+  p="$(fresh_pane)"
+  [ -n "$p" ] || { fail "mod 段のペインを割れない"; return 1; }
   dirs="$(tk mod --json | jq -r '.plugin_dir')"
   s="m2050${legacy}"
   start_claude "$s" "$p" "$dirs"
@@ -467,7 +483,11 @@ phase_mod() {
   check_eq "やめると偽 API へ 1 回も届かない（marked の数が増えない）" "$before" "$(marked_count)"
   screen_has "$s" '⏺ DROPPED' && fail "やめたのに答えが出た" || pass "やめた送信の答えは出ない"
   check "$(cap "$s" | grep -Eq 'not sent because|送りませんでした' && echo 1)" "やめた理由が画面に出る"
-  # 入力欄に残った下書きを消す（Ctrl+U）
+  # やめた文は入力欄へ戻る（落とした文は会話に残らないので、画面に残っていれば入力欄。
+  # 入力欄の ❯ の後ろは普通の空白ではないので、文の頭から見る）
+  check "$(cap "$s" | grep -q 'Reply with exactly one word: DROPPED key' && echo 1)" \
+    "やめた文が入力欄へ戻る（鍵を消して送り直せる）"
+  # 戻った下書きを消す（Ctrl+U）
   key "$s" C-u
   sleep 1
   # 2) 送る → 届く
@@ -499,6 +519,40 @@ phase_mod() {
   tmx kill-session -t "=$s" >/dev/null 2>&1
 }
 
+# --- visual: GUI の貼り付けの ⑫（visual-test paste-guard）------------------------------------
+run_visual() {
+  local label="$1" dump="$2" log="$3"
+  shift 3
+  mkdir -p "$dump" "$TMP/home" "$TMP/zdot"
+  # 画像にユーザー名・ホスト名を写さない（#927）: 隔離 HOME + 固定プロンプト
+  printf "PROMPT='tako %%1~ %%%% '\nRPROMPT=''\n" > "$TMP/zdot/.zshrc"
+  launch_isolated_gui "$log" TAKO_PERSIST=0 TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=paste-guard \
+    TAKO_VISUAL_DUMP_DIR="$dump" HOME="$TMP/home" ZDOTDIR="$TMP/zdot" ${@+"$@"} || exit $?
+  APP_PID="$ISOLATED_GUI_PID"
+  for _ in $(seq 1 1800); do
+    kill -0 "$APP_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  stop_isolated_gui "$APP_PID"
+  APP_PID=""
+  echo "    [$label]"
+  grep -E "TAKO_VISUAL_PIXEL: paste-guard warning|⑫|TAKO_APP_SELF_TEST_FAILED|TAKO_VISUAL_TEST_OK" "$log" \
+    | sed 's/^/      /' | mask | head -12
+}
+
+phase_visual() {
+  echo "== 2 の実画面: GUI の貼り付け（visual-test paste-guard ⑫）"
+  run_visual new "$TMP/visual-new" "$TMP/visual-new.log"
+  check "$(grep -q 'TAKO_VISUAL_TEST_OK' "$TMP/visual-new.log" && echo 1)" \
+    "visual: ①〜⑫ が通る（警告だけの段は確認なしで届き通知が描かれる・許可・混在・規則の無効化）"
+  check "$([ -s "$TMP/visual-new/paste-guard-warning.png" ] && echo 1)" "visual: 通知の画像（paste-guard-warning.png）を書き出した"
+  echo "== 2 の実画面の A/B: TAKO_2050_LEGACY=1 は ⑫ で FAILED"
+  run_visual legacy "$TMP/visual-legacy" "$TMP/visual-legacy.log" TAKO_2050_LEGACY=1
+  check "$(grep -q 'TAKO_APP_SELF_TEST_FAILED: visual-test paste-guard ⑫' "$TMP/visual-legacy.log" && echo 1)" \
+    "visual 旧挙動: ⑫（警告だけの段）で FAILED になる"
+  check "$(grep -q 'TAKO_VISUAL_TEST_OK' "$TMP/visual-legacy.log" || echo 1)" "visual 旧挙動: 通らない"
+}
+
 # --- 実行 -----------------------------------------------------------------------------------
 REAL_CLAUDE="$(command -v claude 2>/dev/null || true)"
 echo "claude: $( [ -n "$REAL_CLAUDE" ] && claude --version 2>/dev/null | head -1) / 作業 dir: $(printf '%s' "$TMP" | mask)"
@@ -525,12 +579,15 @@ if want ab; then
   [ -n "$REAL_CLAUDE" ] && phase_mod L
   stop_app
 fi
+want visual && phase_visual
 
 echo "== 5. 診断ログに偽の鍵の本文が無い"
-check_eq "GUI の標準出力・標準エラー（app-*.log）" "0" "$(leaks_in "$TMP"/app-*.log)"
+check_eq "GUI の標準出力・標準エラー（app-*.log・visual-*.log）" "0" "$(leaks_in "$TMP"/app-*.log "$TMP"/visual-*.log)"
 check_eq "persist.log" "0" "$(leaks_in "$TAKO_DATA_DIR/persist.log")"
-check "$(grep -q '貼り付けの確認: send:warn' "$TAKO_DATA_DIR/persist.log" 2>/dev/null && echo 1)" \
-  "persist.log には規則名と件数の 1 行（send:warn）だけが残る"
+if want send; then
+  check "$(grep -q '貼り付けの確認: send:warn' "$TAKO_DATA_DIR/persist.log" 2>/dev/null && echo 1)" \
+    "persist.log には規則名と件数の 1 行（send:warn）が残る"
+fi
 check_eq "daemon の状態 dir・ログ" "0" "$(leaks_in "$TMP/daemon.log" $(find "$TAKO_REMOTE_STATE_DIR" -type f 2>/dev/null))"
 check_eq "偽 API のログ（真偽だけ）" "0" "$(leaks_in "$FAKE_LOG")"
 grep '貼り付けの確認' "$TAKO_DATA_DIR/persist.log" 2>/dev/null | sed 's/^[^]]*\] *//' | sort | uniq -c | sed 's/^/    /' | head -12
