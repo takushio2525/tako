@@ -1517,7 +1517,6 @@ set -gq copy-mode-position-format ''
         let writes = Arc::new(AtomicUsize::new(0));
         // 全員が揃ってから回し始める = 数える読み取りはすべて書き手が回っている間のもの
         let start = Arc::new(Barrier::new(WRITERS + READERS));
-        let temp2098_t0 = std::time::Instant::now(); // TEMP2098
         let mut writers = Vec::new();
         for _ in 0..WRITERS {
             let (d, s, b, w, g) = (
@@ -1584,11 +1583,6 @@ set -gq copy-mode-position-format ''
             partial.load(Ordering::Relaxed),
         );
         let _ = std::fs::remove_dir_all(&dir);
-        // TEMP2098
-        eprintln!(
-            "TEMP2098 new reads={n} failed={failed} writes={w} bad={bad} elapsed_ms={}",
-            temp2098_t0.elapsed().as_millis()
-        );
         // 途中状態を 1 回でも見たら、回数が足りていなくても確定で落ちる
         assert_eq!(bad, 0, "{n} 回中 {bad} 回、不完全な conf を観測した");
         assert!(
@@ -1597,67 +1591,6 @@ set -gq copy-mode-position-format ''
              （失敗 {failed} 回）・書き換え {w} / {WRITES} 回（上限 {LIMIT:?} で打ち切り）"
         );
     }
-
-    // TEMP2098 開始
-    #[test]
-    fn temp2098_old_conf_swap() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        if std::env::var_os("TAKO_2098_RUN_OLD").is_none() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("tako-conf-625-old-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let body = Arc::new(backend_conf(&tmux_caps()));
-        let path = write_conf_in(&dir, &body).expect("conf を置ける");
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let partial = Arc::new(AtomicUsize::new(0));
-        let reads = Arc::new(AtomicUsize::new(0));
-        let mut threads = Vec::new();
-        for _ in 0..4 {
-            let (d, s, b) = (dir.clone(), stop.clone(), body.clone());
-            threads.push(std::thread::spawn(move || {
-                while !s.load(Ordering::Relaxed) {
-                    let _ = write_conf_in(&d, &b);
-                }
-            }));
-        }
-        for _ in 0..2 {
-            let (p, s, bad, n, b) = (
-                path.clone(),
-                stop.clone(),
-                partial.clone(),
-                reads.clone(),
-                body.clone(),
-            );
-            threads.push(std::thread::spawn(move || {
-                while !s.load(Ordering::Relaxed) {
-                    if let Ok(read) = std::fs::read_to_string(&p) {
-                        n.fetch_add(1, Ordering::Relaxed);
-                        if read != *b {
-                            bad.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        stop.store(true, Ordering::Relaxed);
-        for t in threads {
-            t.join().expect("スレッドが panic しない");
-        }
-        let (n, bad) = (
-            reads.load(Ordering::Relaxed),
-            partial.load(Ordering::Relaxed),
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        eprintln!("TEMP2098 old reads={n} bad={bad}");
-        assert!(n > 100, "読み取り回数が少なすぎて検出力が無い: {n}");
-        assert_eq!(bad, 0, "{n} 回中 {bad} 回、不完全な conf を観測した");
-    }
-    // TEMP2098 終了
 
     /// 残骸ソケットの判定（#625）。
     /// 「自分の pid を含まない = 残骸」だと、別 worker の `cargo test` が同時に走ったとき
