@@ -1,0 +1,36 @@
+---
+/**
+ * チャットビューの作業中の表示（#2060）。生成中だけ、会話の末尾の AI 側に 1 つ出る。
+ * 中身は claude の画面のスピナー行そのもの（作業内容 + 経過時間 + 受け取ったトークン数）で、
+ * 取れないときは「考え中…」。生成中に送った指示があれば「送信済み・生成後に届きます」も添える。
+ * 正本: crates/tako-app/src/chat_view.rs の render_chat_activity（FR-2.23.13）。ChatPane の中に置く。
+ *
+ *   <ChatBusy at="2-3" label="Pondering… (12s · ↓ 1.4k tokens)" queuedAt="3" />
+ */
+import '../../styles/tako-ui-chat.css';
+
+interface Props {
+	at?: string;
+	label?: string;
+	queuedAt?: string;
+}
+
+const { at, label = '考え中…', queuedAt } = Astro.props;
+---
+
+<div class="tk-gmsg-wrap" data-at={at} data-fx={at ? 'unfold' : undefined}>
+	<div class="tk-gmsg is-busy">
+		<span class="tk-gbusy">
+			<i class="tk-gbusy-dot"></i>
+			<span class="tk-gbusy-label">{label}</span>
+			{
+				queuedAt && (
+					<span class="tk-gbusy-q" data-at={queuedAt} data-fx="fade">
+						送信済み・生成後に届きます
+					</span>
+				)
+			}
+		</span>
+		<span class="tk-gmsg-gutter"></span>
+	</div>
+</div>

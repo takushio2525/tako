@@ -1,0 +1,613 @@
+/*
+ * かんたん表示（GUI モード）の画面を再現する部品の見た目（#2060 で足した）。
+ * 部品: GuiPane（見せ方だけ切り替わるペイン）/ GuiFrame（スターター・準備中の枠）/
+ * Preparing（準備中）/ ChatPane（チャットビュー 1 枚）/ ChatMsg（発話 + コピー列）/ ChatBusy（作業中の表示）。
+ *
+ * 配色と寸法の正本は tako 本体: 枠とヘッダ = crates/tako-app/src/starter.rs の render_gui_pane_frame、
+ * チャット = crates/tako-app/src/chat_view.rs（render_chat_header / render_chat_activity /
+ * render_chat_copy_button / render_chat_slash_button）、色 = crates/tako-core/src/theme.rs の default_dark()。
+ * 既存の tako-ui.css の変数（--ui-*）をそのまま使い、既存のクラスの見た目は変えない。
+ */
+
+.tk-ui {
+  --ui-s0: #1b1c28;
+  --ui-line-subtle: #26273a;
+}
+
+/* ============================================================
+ * 見せ方だけ切り替わるペイン（GuiPane）
+ * ターミナル表示の層と GUI 表示の層を同じ場所に重ねる
+ * ============================================================ */
+.tk-gpane {
+  flex: var(--grow, 1) 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+}
+.tk-gpane > .tk-gpane-layer {
+  grid-area: 1 / 1;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.tk-gpane-layer > * {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* ============================================================
+ * GUI 表示の枠（スターター・準備中・チャットで共通）
+ * ============================================================ */
+.tk-gframe {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--ui-base);
+  border: 1px solid var(--ui-line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.tk-gframe.is-focus {
+  border-color: var(--ui-accent);
+  box-shadow: 0 0 0 1px rgb(137 180 250 / 0.25);
+}
+.tk-ghead {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  height: 2.2em;
+  padding: 0 0.65em;
+  flex: none;
+  min-width: 0;
+  font-family: var(--ui-sys);
+  font-size: 0.95em;
+  color: var(--ui-muted);
+  background: var(--ui-s0);
+  border-bottom: 1px solid var(--ui-line-subtle);
+  white-space: nowrap;
+}
+.tk-gframe.is-focus > .tk-ghead {
+  background: var(--ui-s2);
+  border-bottom-color: var(--ui-line);
+}
+.tk-ghead > .tk-ic:first-child {
+  color: var(--ui-accent);
+}
+.tk-ghead-cwd {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-ghead-model {
+  flex: none;
+  font-weight: 600;
+  color: var(--ui-fg);
+}
+.tk-ghead-spacer {
+  flex: 1;
+  min-width: 0.4em;
+}
+.tk-ghead-btn {
+  flex: none;
+  padding: 0.05em 0.55em;
+  border: 1px solid var(--ui-line);
+  border-radius: 5px;
+  color: var(--ui-fg3);
+  font-size: 0.92em;
+}
+.tk-ghead-x {
+  flex: none;
+  color: var(--ui-muted);
+}
+.tk-gframe-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 0.6em 0.8em;
+  overflow: hidden;
+}
+
+/* 状態（待機中 = 緑 / 考え中 = 黄）。手順で入れ替えるので重ねて置く */
+.tk-gstatus {
+  display: inline-grid;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+.tk-gstatus > span {
+  grid-area: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-gstatus i {
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 50%;
+  background: var(--ui-green);
+  flex: none;
+}
+.tk-gstatus .is-busy i {
+  background: var(--ui-yellow);
+}
+
+/* コンテキスト残量（残り N% + バー）と、少ないときの /compact ボタン */
+.tk-gctx {
+  display: inline-grid;
+  flex: none;
+}
+.tk-gctx > span {
+  grid-area: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.45em;
+}
+.tk-gctx-label {
+  font-size: 0.9em;
+}
+.tk-gctx-bar {
+  display: inline-block;
+  width: 4.4em;
+  height: 0.42em;
+  border-radius: 3px;
+  background: var(--ui-s1);
+  overflow: hidden;
+}
+.tk-gctx-bar i {
+  display: block;
+  height: 100%;
+  width: var(--v, 50%);
+  background: var(--ui-accent);
+}
+.tk-gctx .is-warn {
+  color: var(--ui-red);
+}
+.tk-gctx .is-warn .tk-gctx-bar i {
+  background: var(--ui-red);
+}
+.tk-gctx-hint {
+  flex: none;
+  padding: 0 0.6em;
+  border-radius: 99px;
+  border: 1px solid rgb(243 139 168 / 0.45);
+  background: rgb(243 139 168 / 0.14);
+  color: var(--ui-red);
+  font-size: 0.86em;
+  line-height: 1.55;
+}
+
+/* ============================================================
+ * 準備中（Preparing）
+ * ============================================================ */
+.tk-prep {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6em;
+  font-family: var(--ui-sys);
+  text-align: center;
+}
+.tk-prep-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7em;
+  font-size: 1.3em;
+  font-weight: 600;
+  color: var(--ui-fg);
+}
+.tk-prep-sub {
+  font-size: 0.95em;
+  color: var(--ui-muted);
+}
+.tk-prep-dot {
+  width: 0.62em;
+  height: 0.62em;
+  border-radius: 50%;
+  background: var(--ui-accent);
+  flex: none;
+}
+/* 明滅（実物も同じ点が 2 秒周期で明滅する）。動かしてよいときだけ */
+[data-motion]:not(.is-static) .tk-prep-dot,
+[data-motion]:not(.is-static) .tk-gbusy-dot {
+  animation: tk-gpulse 2s ease-in-out infinite;
+}
+@keyframes tk-gpulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tk-prep-dot,
+  .tk-gbusy-dot {
+    animation: none !important;
+  }
+}
+
+/* ============================================================
+ * チャットビュー（ChatPane）
+ * ============================================================ */
+.tk-gchat-note {
+  flex: none;
+  padding: 0.3em 0.9em;
+  font-family: var(--ui-sys);
+  font-size: 0.88em;
+  color: var(--ui-fg3);
+  background: rgb(137 180 250 / 0.1);
+  border-bottom: 1px solid var(--ui-line-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-gchat-log {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  /* 新しい発話が下に積まれ、溢れたら古い方が上へ消える（実物の下端追従と同じ見え方） */
+  justify-content: flex-end;
+  padding: 0.2em 0.6em 0.5em 0.8em;
+  overflow: hidden;
+  font-family: var(--ui-sys);
+}
+/* 会話がまだ無いときの案内は、実物と同じく本文の上端に左寄せで出る */
+.tk-gchat-empty-wrap {
+  margin-bottom: auto;
+}
+/* 隠れている間は高さ 0 で、余白も取らない（あとから積まれる発話を中央へ押し上げない） */
+[data-motion] .tk-gchat-empty-wrap:not(.is-on) {
+  margin: 0;
+}
+.tk-gchat-empty {
+  padding: 0.6em 0.1em 0;
+  color: var(--ui-muted);
+  font-size: 0.95em;
+}
+.tk-gchat-foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45em;
+  padding: 0.5em 0.8em 0.6em;
+  border-top: 1px solid var(--ui-line-in);
+}
+.tk-gchat-foot .tk-chat-input {
+  font-family: var(--ui-sys);
+}
+.tk-gchat-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  min-width: 0;
+  font-family: var(--ui-sys);
+}
+.tk-gslash {
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35em;
+  padding: 0.05em 0.6em;
+  border-radius: 99px;
+  border: 1px solid var(--ui-line-subtle);
+  background: var(--ui-chip);
+  color: var(--ui-fg2);
+  font-size: 0.88em;
+  white-space: nowrap;
+}
+.tk-gslash small {
+  font-family: var(--ui-font);
+  font-size: 0.9em;
+  color: var(--ui-faint);
+}
+.tk-gslash.is-hot {
+  border-color: var(--ui-red);
+}
+.tk-gchat-send {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  font-size: 0.82em;
+  color: var(--ui-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 発話 1 つ（ChatMsg）: 吹き出し + 右のコピー列（列は固定幅で、本文に被せない） */
+.tk-gmsg-wrap {
+  min-width: 0;
+}
+.tk-gmsg {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35em;
+  padding-top: 0.5em;
+  min-width: 0;
+}
+.tk-gmsg.is-user {
+  justify-content: flex-end;
+}
+.tk-gmsg-bubble {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  padding: 0.5em 0.8em;
+  border-radius: 10px;
+  border: 1px solid var(--ui-line-subtle);
+  background: var(--ui-s0);
+  color: var(--ui-fg);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.tk-gmsg.is-ai .tk-gmsg-bubble {
+  flex: 1;
+}
+.tk-gmsg.is-user .tk-gmsg-bubble {
+  max-width: 82%;
+  background: var(--ui-s1);
+}
+.tk-gmsg-bubble code {
+  font-family: var(--ui-font);
+  font-size: 0.95em;
+  color: var(--ui-peach);
+  background: var(--ui-crust);
+  border-radius: 3px;
+  padding: 0 0.3em;
+}
+.tk-gmsg-bubble .tk-tool {
+  margin-top: 0;
+}
+/* 生成中に送った指示の「送信待ち」（届いたら消える） */
+.tk-gmsg-queued {
+  font-size: 0.8em;
+  color: var(--ui-faint);
+}
+.tk-gmsg-queued > * {
+  display: block;
+}
+/* ドラッグで選んだ範囲（実物の selection_background） */
+.tk-gsel {
+  border-radius: 2px;
+}
+[data-motion] .tk-gsel {
+  transition: background-color 0.35s var(--tako-ease-soft, ease);
+}
+.tk-gsel.is-on {
+  background: #45475a;
+}
+
+.tk-gmsg-gutter {
+  position: relative;
+  flex: none;
+  width: 1.9em;
+  min-height: 1.6em;
+  align-self: stretch;
+}
+.tk-gcopy {
+  position: absolute;
+  top: 0.15em;
+  right: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  border: 1px solid rgb(42 43 60 / 0.7);
+  background: rgb(49 50 68 / 0.8);
+  color: var(--ui-fg2);
+  font-size: 0.82em;
+  line-height: 1.2;
+  white-space: nowrap;
+  opacity: 0.55;
+}
+.tk-gcopy .tk-ic {
+  width: 0.95em;
+  height: 0.95em;
+}
+/* ホバーで濃くなった姿（手順で重ねて出す） */
+.tk-gcopy.is-hover {
+  opacity: 1;
+  background: #232434;
+  border-color: var(--ui-line-heavy);
+}
+.tk-gcopy.is-done {
+  opacity: 1;
+  border-color: var(--ui-green);
+  background: var(--ui-hl);
+  color: var(--ui-green);
+}
+
+/* 作業中の表示（ChatBusy）: 会話の末尾の AI 側に 1 つ */
+.tk-gbusy {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6em;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.45em 0.9em;
+  border-radius: 10px;
+  border: 1px solid var(--ui-line-subtle);
+  background: var(--ui-s0);
+  font-size: 0.95em;
+  color: var(--ui-fg2);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.tk-gbusy-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tk-gbusy-dot {
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 50%;
+  background: var(--ui-accent);
+  flex: none;
+}
+.tk-gbusy-q {
+  flex: none;
+  font-size: 0.88em;
+  color: var(--ui-faint);
+}
+.tk-gmsg.is-busy {
+  justify-content: flex-start;
+}
+.tk-gmsg.is-busy > .tk-gbusy {
+  flex: 0 1 auto;
+}
+
+/* 狭いペイン（compact）: 実物も幅 420px 未満・高さ 260px 未満のペインでは、状態の文字・残量・
+ * /compact の案内・ボタンのコマンド併記・送信の案内を落とす（chat_view.rs の compact） */
+.tk-gchat.is-compact .tk-gstatus-text,
+.tk-gchat.is-compact .tk-gctx,
+.tk-gchat.is-compact .tk-gctx-hint,
+.tk-gchat.is-compact .tk-gchat-send,
+.tk-gchat.is-compact .tk-gslash small {
+  display: none;
+}
+.tk-gchat.is-compact .tk-gmsg.is-user .tk-gmsg-bubble {
+  max-width: 95%;
+}
+/* 4 分割ほどの小さなペインでは、入力欄の下のボタン列も畳む（場面の主役は吹き出し） */
+.tk-gchat.is-compact .tk-gchat-row {
+  display: none;
+}
+.tk-gchat.is-compact .tk-gchat-foot {
+  padding: 0.4em 0.5em 0.45em;
+}
+.tk-gchat.is-compact .tk-gchat-log {
+  padding: 0 0.4em 0.4em 0.5em;
+}
+/* スマホ幅の窓では、場面の主役でない併記（ボタンのコマンド・送信の案内）だけ落とす */
+@container tkframe (max-width: 25rem) {
+  .tk-gchat-send,
+  .tk-gslash small {
+    display: none;
+  }
+}
+
+/* ============================================================
+ * スターターの全体（GuiStarter）。カードの見た目は tako-ui.css の .tk-starter-* を使う
+ * ============================================================ */
+.tk-gstarter {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.45em;
+  height: 100%;
+  max-width: 30em;
+  margin: 0 auto;
+  font-family: var(--ui-sys);
+}
+.tk-gstarter .tk-starter-card {
+  flex: none;
+}
+.tk-gstarter-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  margin-top: 0.15em;
+  padding: 0.1em 0.3em;
+  color: var(--ui-muted);
+  font-size: 0.92em;
+}
+.tk-gstarter-link .tk-ic {
+  width: 1em;
+  height: 1em;
+}
+.tk-gstarter-link small {
+  margin-left: 0.2em;
+  color: var(--ui-faint);
+  font-family: var(--ui-font);
+  font-size: 0.88em;
+}
+.tk-gstarter-foot {
+  color: var(--ui-faint);
+  font-size: 0.85em;
+}
+.tk-gstarter.is-compact .tk-gstarter-cmd,
+.tk-gstarter.is-compact .tk-gstarter-foot,
+.tk-gstarter.is-tiny .tk-gstarter-cmd,
+.tk-gstarter.is-tiny .tk-gstarter-foot,
+.tk-gstarter.is-tiny .tk-gstarter-sub,
+.tk-gstarter.is-tiny .tk-gstarter-desc,
+.tk-gstarter.is-tiny .tk-gstarter-link {
+  display: none;
+}
+.tk-gstarter.is-tiny {
+  gap: 0.35em;
+}
+.tk-gstarter.is-tiny .tk-starter-q {
+  font-size: 1em;
+}
+.tk-gstarter.is-tiny .tk-starter-card {
+  padding: 0.3em 0.5em;
+  gap: 0 0.5em;
+}
+.tk-gstarter.is-tiny .tk-starter-ic {
+  grid-row: auto;
+  width: 1.7em;
+  height: 1.7em;
+}
+/* スマホ幅の窓では、見出しの補足を落としてカード 3 枚と setup の行を収める */
+@container tkframe (max-width: 25rem) {
+  .tk-gstarter.is-compact .tk-gstarter-sub {
+    display: none;
+  }
+}
+
+/* 発話の中のコードブロック（実物はプレビューと同じ描画で、右上にそのブロックだけのコピー） */
+.tk-gcode {
+  position: relative;
+  display: block;
+  padding: 0.45em 2.4em 0.45em 0.7em;
+  border-radius: 6px;
+  background: var(--ui-mantle);
+  border: 1px solid var(--ui-line-in);
+  font-family: var(--ui-font);
+  font-size: 0.95em;
+  line-height: 1.55;
+  color: var(--ui-fg);
+}
+.tk-gcode-l {
+  display: block;
+  white-space: pre-wrap;
+}
+.tk-gcode-copy {
+  position: absolute;
+  top: 0.35em;
+  right: 0.35em;
+  display: inline-grid;
+  place-items: center;
+  width: 1.6em;
+  height: 1.6em;
+  border-radius: 4px;
+  border: 1px solid rgb(42 43 60 / 0.7);
+  background: rgb(49 50 68 / 0.8);
+  color: var(--ui-fg2);
+  opacity: 0.55;
+}
+.tk-gcode-copy .tk-ic {
+  width: 0.9em;
+  height: 0.9em;
+}
+/* コピーのボタンと同じ位置・大きさの見えない箱。ボタンを指す Pointer をこの中に置くと、
+ * 発話の高さや窓の幅が変わってもボタンの上を指す（座標の基準がこの箱になる） */
+.tk-gcopy-at {
+  position: absolute;
+  top: 0.15em;
+  right: 0;
+  width: 1.9em;
+  height: 1.5em;
+  z-index: 2;
+}

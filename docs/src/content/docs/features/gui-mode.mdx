@@ -1,0 +1,102 @@
+---
+title: かんたん表示（GUI モード）
+description: 黒い画面が苦手でも、ボタンとチャットで AI と作業を始められる表示モード。変わるのは見せ方だけで、裏のターミナルは止まりません
+---
+
+import GuiModeToggle from '../../../components/scenes/GuiModeToggle.astro';
+import GuiModeStart from '../../../components/scenes/GuiModeStart.astro';
+import GuiModeChat from '../../../components/scenes/GuiModeChat.astro';
+import GuiModeCopy from '../../../components/scenes/GuiModeCopy.astro';
+import GuiModeBack from '../../../components/scenes/GuiModeBack.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+
+ボタン 1 つで、何も動いていないペインは「何をしますか？」の **3 つのボタン**に、Claude と話しているペインは**チャットの吹き出し**に変わります。変わるのは見せ方だけで、裏ではいつものターミナルが動き続けています。macOS と Windows のどちらでも使えます。
+
+スクロールすると、画面がその手順の状態に変わります。
+
+## 切り替える
+
+<GuiModeToggle />
+
+AI やスクリプトからは、同じ切り替えをコマンドで行えます（引数なしの `tako ui-mode` は、いまのモードを表示するだけです）。
+
+<Cmd>tako ui-mode toggle</Cmd>
+
+## 何がどう見えるか
+
+かんたん表示にしても、全部のペインが変わるわけではありません。ペインの状態ごとに、上から順に当てはめて決まります。迷うものは**ターミナル表示のまま**にします。
+
+| ペインの状態 | 表示 |
+|---|---|
+| スターターの「コマンド入力へ」で戻したペイン | ターミナル表示 |
+| Claude と話している | **チャット** |
+| vim などの全画面のアプリ | ターミナル表示のまま |
+| 何も動いていないシェル | **スターター**（3 つのボタン） |
+| ペインを作った直後・AI の起動中 | 「準備中…」（数秒で次の表示へ） |
+| コマンドの実行中・codex や agy・直前のコマンドが失敗した | ターミナル表示のまま |
+
+## スターター（空のペイン）
+
+<GuiModeStart />
+
+「コマンド入力へ」を押すと、**そのペインだけ**がターミナル表示に戻ります（ほかのペインはかんたん表示のまま）。この解除は一時的なもので、tako を起動し直すとまたスターターに戻ります。
+
+### プロファイルを選んで起動する
+
+プロファイル（[`tako orchestrator profiles`](/guides/cli-reference/#tako-orchestrator-profiles) や設定画面の「プロファイル」タブで作る、AI の設定のひとまとまり）が 2 つ以上あるときは、上 2 つのカードの右端に **▾** が出ます。押すと一覧が開き、選んだプロファイルで起動します（シェルには `tako master -<プロファイル名>` が入ります）。カードの本体を押したときは、いつもどおり既定のプロファイルで起動します。
+
+## チャットビュー（Claude と対話中）
+
+<GuiModeChat />
+
+入力欄の下には「会話を軽くする（/compact）」「新しい会話（/clear）」「ヘルプ（/help）」のボタンがあります。「新しい会話」は、押すと AI がいまの会話を忘れることを確かめてから始めます（ファイルや実行中の作業は消えません）。AI がコマンドの実行の許可を求めているときは、確認のカードが出て、ボタンで答えられます。
+
+### 本文のコピー
+
+<GuiModeCopy />
+
+AI からは、最後の AI の発話をそのままコピーできます。どの発話があるかは `tako chat copy --list` で一覧できます。
+
+<Cmd>tako chat copy</Cmd>
+
+## ターミナル表示に戻す
+
+<GuiModeBack />
+
+## スターターやチャットが出ないとき
+
+- **どのペインが、なぜその表示なのか**は `tako ui-mode` で分かります。ペインごとの表示と、ターミナル表示のままになった理由・次の一手が返ってきます
+- **空のペインがスターターにならない**: tako は、シェルがいまコマンドを待っているかどうかを「シェル統合」から知ります。これが効いていないと判断できないので、ターミナル表示のままにします。`tako shell-integration` で確かめてください（`tako setup` が自動で入れます。Windows で入っていないときは `tako shell-integration install`）
+- **AI のペインがチャットにならない**: チャットになるのは Claude だけです。codex や agy で動かしている司令塔・担当はターミナル表示のままです
+- 直前のコマンドが失敗したペインは、エラーを隠さないようにターミナル表示のままにします
+
+<Cmd>tako ui-mode</Cmd>
+
+## Windows でも使えます
+
+スターター・チャット・本文のコピーは Windows でも使えます。Windows 11 の実機で、スターターの「AI チームに任せる」から司令塔の AI が立ち上がるところまで確かめています。キーだけが違います。
+
+| 操作 | macOS | Windows |
+|---|---|---|
+| コマンドパレット（「表示モードを切り替え」） | <kbd>⌘</kbd>+<kbd>K</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
+| 選んだ本文のコピー | <kbd>⌘</kbd>+<kbd>C</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
+
+ほかの機能の Windows での状況は [Windows 対応状況](/windows-support/) にまとめています。
+
+## AI から操作する
+
+かんたん表示の操作は、すべて CLI と MCP からも行えます（UI でできることは AI からもできる、が tako の決まりです）。
+
+| 操作 | CLI | MCP |
+|---|---|---|
+| モードの確認・切り替え | `tako ui-mode [gui\|terminal\|toggle]` | `tako_ui_mode` |
+| 1 つのペインだけターミナル表示へ | `tako ui-mode release --pane N` | `tako_ui_mode`（`release`） |
+| それを戻す | `tako ui-mode restore --pane N` | `tako_ui_mode`（`restore`） |
+| いま各ペインに何が出ているか | `tako ui-mode`（応答の `pane_display`） | `tako_ui_mode` |
+| チャットの本文のコピー | `tako chat copy` | `tako_chat_copy` |
+
+`pane_display` は各ペインの表示（`terminal` / `starter` / `chat` / `preparing`）を返すので、AI は「いまユーザーの画面に何が出ているか」を確かめてから案内できます。
+
+:::tip[打ってほしいコマンドは、カードで]
+チャットの中にコマンドを書くと、コピーしたときに折り返しの改行が混ざることがあります。AI にコマンドを渡してもらうときは、[`tako show-command`](/guides/cli-reference/#tako-show-command) のカードで出してもらうと、コピーと実行のボタンがついた形で届きます。
+:::

@@ -1,0 +1,47 @@
+---
+/**
+ * 場面（features/gui-mode）: 発話のコピー。3 手順。
+ * 事実の出どころ: .agent/requirements.md FR-2.23.8（ドラッグで選んで ⌘C。発話をまたいだ選択もできる）/
+ * FR-2.23.9（発話の右の固定幅の列にコピーのボタン。ふだんは淡く、ホバーとコピー直後だけ濃い。渡すのは画面と
+ * 同じ文字で、折りたたみを無視した全文。コードブロックには右上にそのブロックだけのボタン）/
+ * FR-2.23.10（tako chat copy）/ crates/tako-app/src/ui_text/ui_mode.rs（「コピーしました」）。
+ * Windows のコピーの打鍵は Ctrl+Shift+C（crates/tako-app/src/keybindings.rs）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import ChatPane from '../motion/ChatPane.astro';
+import ChatMsg from '../motion/ChatMsg.astro';
+import Pointer from '../motion/Pointer.astro';
+import Icon from '../motion/Icon.astro';
+import '../../styles/page-gui-mode.css';
+---
+
+<Scrolly label="発話をコピーする流れ" flip>
+	<TakoWindow slot="stage" tabs={[{ label: 'master', state: 'idle', active: true }]} mode="gui" height={28}>
+		<Split>
+			<ChatPane focus ctx={[{ left: 57 }]}>
+				<ChatMsg role="user">README に「はじめに」を書いて</ChatMsg>
+				<ChatMsg role="ai" hoverAt="1" copiedAt="2">
+					<span>「はじめに」の節を足しました。次の 2 行で起動できます。</span>
+					<span class="tk-gcode"><span class="tk-gcode-l">npm install</span><span class="tk-gcode-l">npm run dev</span><span class="tk-gcode-copy"><Icon name="copy" /></span></span>
+					<span>開いたら <span class="tk-gsel" data-at="3" data-fx="state">localhost:5173 を見てください。</span></span>
+					<span slot="gutter" class="tk-gcopy-at"><Pointer path="1:60,70 2:60,70" click="2" /></span>
+				</ChatMsg>
+				<ChatMsg role="user"><span><span class="tk-gsel" data-at="3" data-fx="state">ありがとう。</span>英語版も作って</span></ChatMsg>
+			</ChatPane>
+		</Split>
+	</TakoWindow>
+
+	<Step title="発話の右に、コピーのボタン">
+		<p>吹き出しの右の列に、いつも小さなコピーのボタンがあります。ふだんは控えめな色で、マウスを乗せると濃くなります。本文には重なりません。</p>
+	</Step>
+	<Step title="押せば、1 つの発話をまるごと">
+		<p>押すと「<strong>コピーしました</strong>」。画面に見えているとおりの文字が、長くて畳まれている部分も含めて全文コピーされます。コードブロックだけが欲しいときは、ブロックの右上のボタンを押します。</p>
+	</Step>
+	<Step title="一部だけなら、なぞって ⌘C">
+		<p>本文はドラッグで選べます。<strong>発話をまたいで</strong>選ぶこともでき、<kbd>⌘</kbd>+<kbd>C</kbd> でコピーします。</p>
+		<p class="tk-step-note">Windows では Ctrl+Shift+C でコピーします（Ctrl+C はターミナルへ渡すため）。</p>
+	</Step>
+</Scrolly>

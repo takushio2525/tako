@@ -1,0 +1,20 @@
+---
+/**
+ * かんたん表示（GUI モード）の「準備中…」（#2060）。ペインを作った直後や AI の起動中に、
+ * 生のターミナルを見せずに数秒だけ出る待ちの表示。GuiFrame の中に置く。
+ * 正本: crates/tako-app/src/starter.rs の render_preparing_pane / ui_text/ui_mode.rs。
+ */
+import '../../styles/tako-ui-chat.css';
+
+interface Props {
+	/** agent = AI の起動待ち（「AI を起動しています」）/ shell = 新しいペインの用意 */
+	kind?: 'agent' | 'shell';
+}
+
+const { kind = 'agent' } = Astro.props;
+---
+
+<div class="tk-prep">
+	<span class="tk-prep-title"><i class="tk-prep-dot"></i>準備中…</span>
+	<span class="tk-prep-sub">{kind === 'agent' ? 'AI を起動しています' : 'この画面を用意しています'}</span>
+</div>

@@ -1,0 +1,161 @@
+---
+/**
+ * かんたん表示（GUI モード）のチャットビュー 1 枚（#2060）。Claude と話しているペインがこれになる。
+ * 既存の Chat 部品（Pane の中に置く簡易版）と違い、ヘッダ（モデル名・状態・残量）から
+ * 入力欄の下のボタン列まで実物の並びで描く。GuiPane の GUI 側か Split の直下に置く。
+ * 正本: crates/tako-app/src/chat_view.rs（render_chat_header / 入力欄 / render_chat_slash_button）、
+ * 文言は crates/tako-app/src/ui_text/ui_mode.rs。
+ *
+ *   <ChatPane focus status={[{ kind: 'idle' }, { at: '2-3', kind: 'busy' }]} ctx={[{ left: 62 }]}
+ *     input={[{ at: '!2+', kind: 'placeholder', text: 'やってほしいことを書いてください' }]}>
+ *     <ChatMsg role="user" at="2+">…</ChatMsg>
+ *     <ChatBusy at="2-3" />
+ *   </ChatPane>
+ *
+ * - status / ctx / input は「手順ごとの姿」を並べる（at は data-at の書き方。省略 = いつも）。
+ *   同じ手順に 2 つ当たらないように書く
+ * - ctx の left が 20 以下だと赤くなり、ヘッダに「/compact で会話を軽くする」が出る（実物は使用率 80% 以上）
+ */
+import Icon from './Icon.astro';
+import '../../styles/tako-ui-chat.css';
+
+type Kind = 'idle' | 'busy' | 'queued';
+interface StatusAt {
+	at?: string;
+	kind: Kind;
+}
+interface CtxAt {
+	at?: string;
+	/** 残り（%） */
+	left: number;
+}
+interface InputAt {
+	at?: string;
+	/** placeholder = 薄い案内文 / typed = 打ち込まれる文字（左から打鍵で開く） */
+	kind: 'placeholder' | 'typed';
+	text: string;
+}
+
+interface Props {
+	/** ヘッダのモデル名（実物はモデル ID の短い名前。分からないときは Claude） */
+	model?: string;
+	focus?: boolean;
+	status?: StatusAt[];
+	ctx?: CtxAt[];
+	input?: InputAt[];
+	/** 担当 AI（worker）のペイン。ヘッダの下に説明行が出る */
+	worker?: boolean;
+	/** 会話がまだ無いときの案内を出す手順（data-at の書き方） */
+	emptyAt?: string;
+	/** 入力欄の下（ボタン列と送信の案内）を出すか */
+	foot?: boolean;
+	/** 狭いペインの姿（状態の文字・残量・併記を落とす。実物は幅 420px 未満のペイン） */
+	compact?: boolean;
+}
+
+const {
+	model = 'Claude',
+	focus = false,
+	status = [{ kind: 'idle' }],
+	ctx = [{ left: 62 }],
+	input = [{ kind: 'placeholder', text: 'やってほしいことを書いてください' }],
+	worker = false,
+	emptyAt,
+	foot = true,
+	compact = false,
+} = Astro.props;
+
+const statusText: Record<Kind, string> = {
+	idle: '待機中',
+	busy: '考え中…',
+	queued: '送信済み・生成後に届きます',
+};
+const warnAt = ctx.filter((c) => c.left <= 20);
+const hintAt = warnAt.some((c) => !c.at) ? undefined : warnAt.map((c) => c.at).join(' ');
+---
+
+<div class:list={['tk-gframe', 'tk-gchat', { 'is-focus': focus, 'is-compact': compact }]}>
+	<div class="tk-ghead">
+		<Icon name="chat" />
+		<span class="tk-ghead-model">{model}</span>
+		<span class="tk-gstatus">
+			{
+				status.map((s) => (
+					<span class:list={[{ 'is-busy': s.kind !== 'idle' }]} data-at={s.at} data-fx={s.at ? 'fade' : undefined}>
+						<i />
+						<span class="tk-gstatus-text">{statusText[s.kind]}</span>
+					</span>
+				))
+			}
+		</span>
+		<span class="tk-ghead-spacer"></span>
+		{
+			warnAt.length > 0 && (
+				<span class="tk-gctx-hint" data-at={hintAt} data-fx={hintAt ? 'pop' : undefined}>
+					/compact で会話を軽くする
+				</span>
+			)
+		}
+		<span class="tk-gctx">
+			{
+				ctx.map((c) => (
+					<span class:list={[{ 'is-warn': c.left <= 20 }]} data-at={c.at} data-fx={c.at ? 'fade' : undefined}>
+						<span class="tk-gctx-label">残り {c.left}%</span>
+						<span class="tk-gctx-bar" style={`--v: ${c.left}%`}>
+							<i />
+						</span>
+					</span>
+				))
+			}
+		</span>
+		<span class="tk-ghead-x"><Icon name="x" /></span>
+	</div>
+	{worker && <div class="tk-gchat-note">通常は司令塔の AI が指示します（ここから直接お願いすることもできます）</div>}
+	<div class="tk-gchat-log">
+		{
+			emptyAt && (
+				<div class="tk-gchat-empty-wrap" data-at={emptyAt} data-fx="unfold">
+					<div class="tk-gchat-empty">まだ会話はありません。話しかけると、ここにやり取りが並びます</div>
+				</div>
+			)
+		}
+		<slot />
+	</div>
+	{
+		foot && (
+			<div class="tk-gchat-foot">
+				<div class="tk-chat-input">
+					<span class="tk-acc">❯</span>
+					<span class="tk-grow">
+						<span class="tk-stack">
+							{input.map((it) =>
+								it.kind === 'typed' ? (
+									<span class="tk-typed" data-at={it.at} data-fx={it.at ? 'type' : undefined}>
+										{it.text}
+									</span>
+								) : (
+									<span data-at={it.at} data-fx={it.at ? 'fade' : undefined}>
+										{it.text}
+									</span>
+								)
+							)}
+						</span>
+					</span>
+					<Icon name="arrowUp" />
+				</div>
+				<div class="tk-gchat-row">
+					<span class="tk-gslash">
+						会話を軽くする<small>/compact</small>
+					</span>
+					<span class="tk-gslash">
+						新しい会話<small>/clear</small>
+					</span>
+					<span class="tk-gslash">
+						ヘルプ<small>/help</small>
+					</span>
+					<span class="tk-gchat-send">Enter で送信・Shift+Enter で改行</span>
+				</div>
+			</div>
+		)
+	}
+</div>

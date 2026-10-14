@@ -1,0 +1,58 @@
+---
+/**
+ * 場面（features/gui-mode）: スターターから AI チームを始める。4 手順。図は Windows の窓。
+ * 事実の出どころ: .agent/requirements.md FR-2.23.4 / .agent/plans/2026-07-gui-mode.md §2.2・G3.5（準備中）/
+ * crates/tako-app/src/starter.rs・ui_text/ui_mode.rs（文言）/ crates/tako-core/src/platform/support.rs の
+ * tako_ui_mode（Windows 11 実機でスターター「AI チームに任せる」から tako master が走り、master まで到達）。
+ * ボタンはシェルへ `tako master` を書き込んで実行する方式（ターミナル表示に戻すと履歴に残る）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import GuiFrame from '../motion/GuiFrame.astro';
+import GuiStarter from '../motion/GuiStarter.astro';
+import Preparing from '../motion/Preparing.astro';
+import ChatPane from '../motion/ChatPane.astro';
+import Pointer from '../motion/Pointer.astro';
+
+const cwd = '~\\my-app';
+---
+
+<Scrolly label="スターターから AI チームを始める流れ" flip>
+	<TakoWindow slot="stage" os="windows" tabs={[{ label: 'my-app', state: 'idle', active: true }]} mode="gui" cwd={cwd} height={35}>
+		<Split>
+			<div class="tk-gpane">
+				<div class="tk-gpane-layer" data-at="!3+" data-fx="fade">
+					<GuiFrame cwd={cwd} focus>
+						<GuiStarter size="compact" pressAt="2" />
+					</GuiFrame>
+				</div>
+				<div class="tk-gpane-layer" data-at="3" data-fx="fade">
+					<GuiFrame cwd={cwd} focus terminalAt="3">
+						<Preparing />
+					</GuiFrame>
+				</div>
+				<div class="tk-gpane-layer" data-at="4+" data-fx="fade">
+					<ChatPane focus emptyAt="4+" ctx={[{ left: 92 }]} input={[{ kind: 'placeholder', text: 'やってほしいことを書いてください' }]} />
+				</div>
+			</div>
+		</Split>
+		<Pointer slot="overlay" path="1:58,46 2:42,44 3:42,44 4:30,83" click="2" />
+	</TakoWindow>
+
+	<Step title="何をしますか？">
+		<p>何も動いていないペインには、大きなボタンが 3 つ並びます。司令塔の AI に任せる、AI と 1 対 1 で話す、コマンド入力（ターミナル表示）に戻す、のどれかを押すだけです。</p>
+		<p>下の「初期設定をやり直す」からは、セットアップ（<code>tako setup</code>）をもう一度流せます。</p>
+	</Step>
+	<Step title="「AI チームに任せる」を押す">
+		<p>ボタンは、裏のシェルに <code>tako master</code> を書き込んで実行します。あとでターミナル表示に戻すと、いま打たれたコマンドが履歴に残っているので、覚えたくなったときの手がかりになります。</p>
+	</Step>
+	<Step title="準備中…">
+		<p>AI が起動するまでの数秒は「準備中…」が出て、生のターミナルの画面は見せません。起動が止まったように見えるときは、ヘッダの「ターミナルを表示」で中身を確かめられます。</p>
+	</Step>
+	<Step title="準備ができたら、そのままチャットに">
+		<p>Claude が立ち上がると、自動でチャットに切り替わります。入力欄に、やってほしいことを日本語で書くだけです。</p>
+		<p class="tk-step-note">図は Windows の画面です。Windows 11 の実機で、このボタンから司令塔の AI が立ち上がるところまで確かめています。macOS も同じ流れです。</p>
+	</Step>
+</Scrolly>
