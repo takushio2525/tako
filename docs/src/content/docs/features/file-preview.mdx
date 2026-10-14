@@ -332,6 +332,9 @@ tako preview-changelog
 | Go（`go.mod`） | `go run ./<パッケージ>`（main でないパッケージとテストファイルは `go test`） |
 | .NET（`*.csproj` 等） | `dotnet run`（テストプロジェクトは `dotnet test`） |
 | C / C++（`Makefile`） | `run` 規則があれば `make run`、無ければ `make` |
+| Arduino（スケッチのフォルダ = `.ino` のあるフォルダ） | `arduino-cli compile`（ドロップダウンの `upload` で `arduino-cli compile --upload` = 書き込み）。arduino-cli は PATH に無ければ Arduino IDE に同梱のものを使う |
+
+Arduino の基板とポートはスケッチのフォルダの `sketch.yaml`（Arduino IDE と同じファイル）から読みます。基板が選ばれていない・フォルダ名と `.ino` の名前が違う・arduino-cli が無いときは、実行ペインの先頭に直し方（`arduino-cli board attach -b <基板>` / 改名のしかた / 導入のコマンド）が出ます。
 
 探索は git リポジトリのルートより上へは出ず、ホームフォルダ（`~`）直下にある `package.json` などの置き忘れもプロジェクトとはみなしません。ファイルに `tako:run` を書けばそちらが優先され、`tako run-default` で拡張子の既定を設定した場合もそちらが優先されます。`${workspaceRoot}` と書くとプロジェクトのルートに置き換わります（例: `tako:cwd: ${workspaceRoot}`）。
 
