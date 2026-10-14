@@ -672,6 +672,16 @@
   font-weight: 700;
   color: var(--ui-fg);
 }
+/* 列は明示する。自動配置のままだと、狭い枠でリンクの行が隠れたときに
+ * 説明とボタンの列が入れ替わる（#2077） */
+.tk-welcome > .tk-welcome-title,
+.tk-welcome > .tk-welcome-line {
+  grid-column: 1;
+}
+.tk-welcome > .tk-welcome-links,
+.tk-welcome > .tk-ubtn {
+  grid-column: 2;
+}
 .tk-welcome-links {
   display: flex;
   gap: 1em;
