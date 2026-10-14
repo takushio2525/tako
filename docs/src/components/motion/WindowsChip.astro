@@ -3,6 +3,7 @@
  * 機能 1 つ分の「どの OS で使えるか」の札（#2064）。見出しの直下に置く。
  *
  *   <WindowsChip tools={['tako_run']} expect="supported" />
+ *   <WindowsChip tools={['tako_run']} expect="degraded" partial="Arduino の…が未確認です" />
  *   <WindowsChip tools={['tako_mod']} expect="pending" pending="実機での確認待ちです" />
  *
  * 状態は windows-support.md（生成ページ）からビルド時に読み、expect と食い違えばビルドを落とす。
@@ -14,30 +15,40 @@ import '../../styles/tako-more.css';
 interface Props {
 	/** 対応表の機能名（MCP ツール名）。どれか 1 つでも expect と違えばビルドを落とす */
 	tools: string[];
-	expect: 'supported' | 'pending';
+	/** supported = どちらでも / degraded = どちらでも使えるが Windows で一部が落ちる（対応表の「一部対応」）/ pending = まだ */
+	expect: 'supported' | 'degraded' | 'pending';
 	/** expect="pending" のときの Windows の一言（「Windows は」に続く） */
 	pending?: string;
+	/** expect="degraded" のときの、Windows で落ちる部分の一言（「Windows は」に続く） */
+	partial?: string;
 }
 
-const { tools, expect, pending = 'まだ使えません' } = Astro.props;
+const { tools, expect, pending = 'まだ使えません', partial = '一部が使えません' } = Astro.props;
 const where = `WindowsChip（${tools.join(' / ')}）`;
-if (expect === 'supported') {
+if (expect === 'pending') {
+	assertNotSupported(tools, where);
+} else {
+	const want = expect === 'supported' ? '対応' : '一部対応';
 	for (const tool of tools) {
 		const status = windowsSupport.rows.get(tool);
 		if (!status) throw new Error(`${where}: ${tool} は Windows 対応表に無い機能名です`);
-		if (status !== '対応') {
-			throw new Error(`${where}: ${tool} は Windows で「${status}」です。札と本文を「まだ」の書き方に直してください`);
+		if (status !== want) {
+			throw new Error(
+				`${where}: ${tool} は Windows で「${status}」です（札は「${want}」）。札と本文をその状態の書き方に直してください`
+			);
 		}
 	}
-} else {
-	assertNotSupported(tools, where);
 }
+const text =
+	expect === 'supported'
+		? 'どちらでも使えます'
+		: expect === 'degraded'
+			? `どちらでも使えます。Windows は${partial}`
+			: `macOS で使えます。Windows は${pending}`;
 ---
 
 <p class:list={['tk-oschip', 'not-content', { 'is-pending': expect === 'pending' }]}>
 	<span class="tk-oschip-os is-on">macOS</span>
-	<span class:list={['tk-oschip-os', { 'is-on': expect === 'supported' }]}>Windows</span>
-	<span class="tk-oschip-text">
-		{expect === 'supported' ? 'どちらでも使えます' : `macOS で使えます。Windows は${pending}`}
-	</span>
+	<span class:list={['tk-oschip-os', { 'is-on': expect !== 'pending' }]}>Windows</span>
+	<span class="tk-oschip-text">{text}</span>
 </p>
