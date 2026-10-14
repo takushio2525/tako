@@ -61,7 +61,7 @@ const {
 		<div class="tk-pcc-card">
 			<div class="tk-pcc-label">{label}</div>
 			<div class="tk-pcc-block">
-				<pre class="tk-pcc-text">{command}</pre>
+				<div class="tk-pcc-text">{command}</div>
 				<div class="tk-pcc-row">
 					{
 						(runningAt || ranAt) && (
@@ -115,7 +115,7 @@ const {
 					<span>×</span>
 				</div>
 				<p class="tk-psheet-label">{label}</p>
-				<pre class="tk-psheet-text">{command}</pre>
+				<div class="tk-psheet-text">{command}</div>
 				<p class="tk-psheet-note">{host} の同じタブに新しいペインを開いて実行します。いま見ているペインには書き込みません。</p>
 				<div class="tk-psheet-actions">
 					<span class="tk-pbtn">やめる</span>

@@ -4,6 +4,7 @@
  * 事実の出どころ: .agent/requirements.md FR-2.22.1 の #1963 追記 / FR-2.42.41〜44（会話の行に枠つきのカード・
  * 入力欄の上の帯に `カード N` と y: コピー / r: 実行 / x: 閉じる・ctrl+x → Tab で帯へ・Run は PC のカードと同じ
  * dispatch の run・描いたカードはペイン下の帯に出さない = 画面が縮まない）/
+ * 実行は show-command --run と同じ dispatch なので、実行ペインは下に 35%（dispatch.rs の Direction::Down, 0.35）。
  * crates/tako-core/claude-mod/hooks/register.ts（日本語の文言: カード N・帯（ctrl+x → Tab）の y: コピー / r: 実行・
  * → ペイン N 実行中 / 終了 N）。帯のボタンはクリックでは押せない（#1961）のでポインターは出さない。
  * 画面の中に描くのは claude だけ（codex / agy は pending #1885）。Windows の tako_mod は pending（#1886）。
@@ -17,8 +18,8 @@ import '../../styles/command-card.css';
 ---
 
 <Scrolly label="Claude Code の画面の中に出るコマンドカード">
-	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={24}>
-		<Split>
+	<TakoWindow slot="stage" tabs={[{ label: 'my-app', state: 'running', active: true }]} height={29}>
+		<Split dir="col">
 			<Pane n={1} title="my-app" state="running" focus>
 				<div class="tk-fill tk-cw-end">
 					<span class="tk-l tk-tui-user">テストを流したい</span>
@@ -43,12 +44,19 @@ import '../../styles/command-card.css';
 					<span class="tk-l tk-tui-input"><span class="tk-acc">❯</span> <span class="tk-cur"></span></span>
 				</div>
 			</Pane>
-			<Pane n={2} title="npm test" state={[{ at: '2', state: 'running' }, { at: '3+', state: 'idle' }]} at="2+" fx="split">
-				<span class="tk-l"><span class="tk-p">my-app ❯</span> npm test</span>
-				<span class="tk-l tk-dim" data-at="2+" style="--d: .5s">RUN  v1.6.0  ~/my-app</span>
-				<span class="tk-l" data-at="2+" style="--d: .8s"><span class="tk-ok">✓</span> tests/login.test.ts (3)</span>
-				<span class="tk-l" data-at="3+"><span class="tk-ok">✓</span> tests/store.test.ts (9)</span>
-				<span class="tk-l tk-ok tk-b" data-at="3+" style="--d: .3s">Tests  12 passed (12)</span>
+			<Pane n={2} title="npm test" state={[{ at: '2', state: 'running' }, { at: '3+', state: 'idle' }]} at="2+" fx="split" grow={0.54}>
+				<div class="tk-fill tk-cw-end">
+					<span class="tk-l"><span class="tk-p">my-app ❯</span> npm test</span>
+					<span class="tk-l tk-dim" data-at="2+" style="--d: .5s">RUN  v1.6.0  ~/my-app</span>
+					<span class="tk-l" data-at="2+" style="--d: .8s"><span class="tk-ok">✓</span> tests/login.test.ts (3)</span>
+					<div data-at="3+" data-fx="unfold">
+						<div>
+							<span class="tk-l"><span class="tk-ok">✓</span> tests/store.test.ts (9)</span>
+							<span class="tk-l tk-ok tk-b">Tests  12 passed (12)</span>
+							<span class="tk-l tk-dim">[tako] 終了コード 0 / Enter でこのペインを閉じます</span>
+						</div>
+					</div>
+				</div>
 			</Pane>
 		</Split>
 	</TakoWindow>

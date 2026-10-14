@@ -14,6 +14,7 @@
  *
  * 並びは crates/tako-app/src/command_card_ui.rs の render_command_card と同じ:
  * 見出し（ラベル + ×）→ コマンドごとの箱（本文 → 番号・実行記録・余白・コピー・新規ペインで実行）。
+ * 狭くて折り返すときは、コピーと実行を 1 組のまま右寄せで次の行へ送る（実物はボタンが 1 つずつ折り返す）。
  * 終了コード 0 は緑、0 以外は赤（run_status_text）。文言は crates/tako-app/src/ui_text/command_card.rs。
  * トップの場面が使う CommandCard（1 コマンドの簡略版。実行記録はカードの下）とは別の部品。
  */
@@ -82,22 +83,23 @@ const total = commands.length;
 								)}
 							</span>
 						)}
-						<span class="tk-cc-spacer" />
-						<span class="tk-cc-copy" data-at={c.copyMark} data-fx={c.copyMark ? 'mark' : undefined}>
-							<span class="tk-ubtn" data-at={c.copied ? `!${c.copied}` : undefined} data-fx="fade">
-								<Icon name="copy" />
-								コピー
-							</span>
-							{c.copied && (
-								<span class="tk-ubtn is-copied" data-at={c.copied} data-fx="fade">
-									<Icon name="check" />
-									コピーしました
+						<span class="tk-cc-btns">
+							<span class="tk-cc-copy" data-at={c.copyMark} data-fx={c.copyMark ? 'mark' : undefined}>
+								<span class="tk-ubtn" data-at={c.copied ? `!${c.copied}` : undefined} data-fx="fade">
+									<Icon name="copy" />
+									コピー
 								</span>
-							)}
-						</span>
-						<span class="tk-ubtn" data-at={c.runMark} data-fx={c.runMark ? 'mark' : undefined}>
-							<Icon name="play" />
-							新規ペインで実行
+								{c.copied && (
+									<span class="tk-ubtn is-copied" data-at={c.copied} data-fx="fade">
+										<Icon name="check" />
+										コピーしました
+									</span>
+								)}
+							</span>
+							<span class="tk-ubtn" data-at={c.runMark} data-fx={c.runMark ? 'mark' : undefined}>
+								<Icon name="play" />
+								新規ペインで実行
+							</span>
 						</span>
 					</div>
 				</div>
