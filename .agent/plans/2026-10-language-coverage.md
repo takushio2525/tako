@@ -404,7 +404,7 @@ open_plan 7・インデント 5）。
 | `.json5` / `.jsonc` → 色なし | JSON で塗る（コメント・末尾カンマの扱いを確認）。✅ #1953（`.jsonc` は JSON、`.json5` は実測で JavaScript へ変えた = §6.1） | 色の補い |
 | `.S` / `.s` → 色なし | 既存の `x86_64 Assembly` へ寄せてよいか（AVR / ARM の命令は x86 ではない）を見て判断。#1953 で**寄せない**と決めた（§6.1） | 色の補い |
 | `.ps1` / `.astro` → 色なし | two-face に構文が無い。構文を足すと構文セット（#815）とビルドに効くので、足す方法と実測を別に | 構文の追加 |
-| 言語サーバ 37 形式 | #1007 の「第 2 波」（Java / Go / …）。#1944 の自動取得と合わせて優先順を決める | 言語サーバ第 2 波 |
+| 言語サーバ 37 形式 | #1007 の「第 2 波」（Java / Go / …）。#1944 の自動取得と合わせて優先順を決める。✅ #1956 で 5 行（`.tex` `.toml` `.swift` `.dart` `.yaml` `.yml`）。比較・採った順・見送りの理由は §8 | 言語サーバ第 2 波 |
 | Finder 24 形式・Windows 0 | #708 の「既定を奪わない」を守ったまま広げられるか（UTI の輸入宣言の可否）を lsregister で実測 | Finder / 関連付け |
 | Code Runner の空き（`.vue` `.svelte` `.astro` `.scss` `.toml` `.yaml` `.json5` `.ini` `.env` `Dockerfile` `.proto` `.graphql` `.h` `.hpp`） | **単体では走らせるものではない**ので今のまま（`.vue` 等は `package.json` の `npm run` を `tako:run:` で書く）。`.m` / `.pde` / `.S` は需要が出たら行を足す | なし |
 
@@ -463,3 +463,79 @@ open_plan 7・インデント 5）。
 
 `.ino` を急ぐなら、#1949 の中身（`.ino` → C++）は #1948 を待たずに `preview.rs:2077` の補い 1 行でも
 入る。その場合は #1948 で `file_type` の行へ移す（#1943 の方針「寄せるのが先」とどちらを採るかは master の判断）。
+
+## 8. 言語サーバの第 2 波（#1956）
+
+### 8.1 測り方
+
+候補ごとに、この PC（macOS 26.4・Apple Silicon）で実のサーバを 1 回ずつ起こした。使い捨ての LSP
+クライアント（node 標準ライブラリだけ。scratchpad に置き、リポジトリへは入れていない）で
+`initialize` → `didOpen` → 最初の診断を待つ → `textDocument/hover` → サーバの RSS を測り、
+`workspace/configuration` には tako と同じく **項目数ぶんの `null`** で答えた（`tako_control::lsp::server::default_reply`）。
+素材は誤りを 1 つ含むファイル（LaTeX は `\begin{itemize}` を `\end{enumerate}` で閉じる・TOML は値の無いキー・
+Swift / Dart は型の誤り・YAML は字下げの崩れ・CSS は閉じない括弧と綴りの誤った性質）。採った 5 行は
+tako 経由でも測った（§8.4。`scripts/test-lsp-servers-1956.sh`）。
+
+### 8.2 比較表
+
+「取得」は #1944 の口（`tako_core::lsp::fetch`）に載るか = 配布元が公開しているハッシュがあり、
+単体バイナリ（gzip / tar.gz / zip の中の 1 つ）か依存の無い npm の包みか。
+
+| 形式 | 候補（版） | 入手経路 | 取得 | 常駐（RSS） | 初回（initialize / 最初の診断） | 誤りの波線 / ホバー（この PC） | Windows | 判断 |
+|---|---|---|---|---|---|---|---|---|
+| `.tex` | texlab 5.26.0 | brew `texlab` / scoop `texlab`（winget なし）/ GitHub Releases 10 MB | ○ digest あり・tar.gz / zip の中の 1 つ | 104.6 MB | 14 ms / 327 ms | ✓ `Mismatched environment` / ✓ `amsmath` の説明（CTAN） | ○ zip（README: VC++ 再頒布可能パッケージが要る場合あり） | **採る（1）** |
+| `.toml` | tombi 1.7.0 | brew `tombi` / winget `tombi-toml.tombi` / GitHub Releases 8 MB | ○ digest あり・tar.gz / zip の中の 1 つ | 19〜25 MB | 5 ms / 140〜223 ms | ✓ `expected value` / ✓ `edition` の説明（Cargo.toml。オフラインでも出る = 内蔵のスキーマ） | ○ zip | **採る（2）** |
+| `.toml` | taplo 0.10.0 | brew `taplo` / winget `tamasfe.taplo` / GitHub Releases 5 MB | ✗ asset の digest が null・チェックサムの添付も無い | 17.5 MB | 163 ms / 165 ms | ✓ / ✗ SchemaStore の目録を読めない（`data did not match any variant of untagged enum SchemaCatalog`）のでスキーマのホバーが出ない | ○ | 見送る（tombi を採る） |
+| `.swift` | sourcekit-lsp（Xcode 同梱） | `xcode-select --install` / winget `Swift.Toolchain` | —（道具に同梱。単体では動かない） | 23.0 MB | 110 ms / 1,483 ms | ✓ `Cannot convert value of type 'String' to specified type 'Int'` / ✓ `print` の宣言と doc | ○ Swift toolchain に同梱 | **採る（3）** |
+| `.dart` | `dart language-server`（Dart SDK 3.11.5。Flutter 同梱） | brew `dart-sdk` / winget `Google.DartSDK` | —（SDK ごとで 200 MB 超） | 171.1 MB | 218 ms / 679 ms | ✓ `A value of type 'String' can't be assigned …` / ✓ `print` の宣言と doc | ○ | **採る（4）** |
+| `.yaml` `.yml` | yaml-language-server 1.24.0 | npm `-g` | ✗ 依存 20 包み（展開 24 MB）・scoped の `@vscode/l10n` | 81.8〜112.8 MB | 220〜534 ms / 427〜961 ms | ✓ `All mapping items must start at the same column` / ✓ GitHub Workflow のスキーマの説明（SchemaStore から。届かなければホバーは出ず、波線は出る） | ○ npm | **採る（5）。取得は後** |
+| `.css` `.scss` `.less` | vscode-css-language-server（vscode-langservers-extracted 4.10.0） | npm `-g` | ✗ 依存 32 包み（展開 93 MB）・scoped を含む | 53〜85 MB | 132〜321 ms / — | ✗ **0 件**（`null` の設定で検証が例外 `Cannot read properties of null (reading 'validProperties')`。`{}` で答えると 3 件）/ ✓ | ○ | 見送る（tako の client 側の直しが先 = §8.5） |
+| `.html` `.htm` | vscode-html-language-server（同） | npm `-g` | ✗ 同 | 142〜156 MB | 236〜477 ms / — | ✗ **0 件**（同じ例外。`{}` なら埋め込みの CSS の誤り 1 件）/ ✓ `div` の説明 | ○ | 見送る（同） |
+| `.json` | vscode-json-language-server（同） | npm `-g` | ✗ 同 | 未実測 | — | — | — | 見送る（`file_type` に `.json` の行が無い = #1948 の番犬・スキーマの対応付けはクライアントが送る形） |
+| `.java` | jdtls | brew `jdtls`（winget なし） | ✗ Eclipse の配布 約 50 MB + JDK 21 が別に要る | 未実測 | — | この PC は JDK 11 だけ = 起こせない | △ | 見送る（実機で確かめられない・重い） |
+| `.go` | gopls | brew `gopls` / `go install golang.org/x/tools/gopls@latest` | ✗ 配布物が無い（`go install` だけ）。Go の道具が要る | 未実測 | — | この PC に Go が無い | ○ | 見送る（実機で確かめられない） |
+| `.kt` | kotlin-lsp（JetBrains・プレリリース）/ kotlin-language-server（非推奨） | 単体の zip（JVM） | ✗ JVM が要る | 未実測 | — | — | ○ | 見送る（重い・版が固まっていない） |
+| `.cs` | csharp-ls / Roslyn の LS | `dotnet tool install -g csharp-ls` | ✗ .NET SDK が要る | 未実測 | — | プロジェクト（`.csproj`）が無いと答えない | ○ | 見送る |
+| `.zig` | zls | brew `zls` | ✗ tar.xz（展開の口が無い）・zig の版と対で決まる | 未実測 | — | この PC に zig が無い | ○ | 見送る |
+| `.r` | languageserver（R の包み） | `install.packages("languageserver")` | ✗ | 未実測 | — | この PC に R が無い | ○ | 見送る（`R` が在っても包みが無ければ即死 = 取れない行の確かめの口が要る） |
+| `.jl` | LanguageServer.jl | Julia の `Pkg` | ✗ | 未実測 | — | この PC に Julia が無い | ○ | 見送る（初回の precompile が分単位） |
+| `.m` | MATLAB の LS | MATLAB 本体が要る | ✗ | — | — | — | — | 見送る（`.m` は MATLAB / Objective-C で割れる = §6.1） |
+| `.vue` `.svelte` `.astro` | @vue/language-server ほか | npm | ✗ 依存が多い（Vue は TypeScript の plugin と組で動く） | 未実測 | — | — | ○ | 見送る（行の追加では済まない） |
+
+### 8.3 採った順の理由
+
+**需要（授業・上位）を、「入れたその日に波線とホバーの両方が出るか」で並べ替えた**。どの候補も行を足すこと
+自体は同じ手間なので、差は利用者側の手間と、この PC で受け入れ条件（波線とホバー）まで確かめられたかで決まる。
+
+1. **tako が取れる単体バイナリ**（texlab / tombi）: 未導入でも開いた時点で tako が取る = 何も入れずに出る。
+   texlab はレポート（`.tex`）で授業の需要が大きい。TOML は taplo が最も使われているが、0.10.0 は
+   配布元のハッシュが無く（取れない）、今の SchemaStore の目録を読めずホバーが出ないので、
+   ハッシュがあり・内蔵のスキーマでオフラインでもホバーが出る tombi を採った
+2. **言語の道具に同梱**（sourcekit-lsp / dart）: Swift / Dart を書ける環境ならもう入っている = 行を足すだけで出る
+3. **利用者の npm で入れる**（yaml-language-server）: 導入コマンドが 1 行で、波線とホバーが出た。
+   取るには #1944 の npm の口を広げる別の作業が要る（§8.5）
+
+見送ったものは「この PC で確かめられない」（Java / Go / Kotlin / C# / Zig / R / Julia / MATLAB）か
+「受け入れ条件を満たさない」（CSS / HTML = 波線が出ない・taplo = ホバーが出ない）か「行の追加では済まない」
+（JSON / Vue / Svelte / Astro）。
+
+### 8.4 tako 経由の実測（採った 5 行）
+
+`scripts/test-lsp-servers-1956.sh`（隔離 GUI。texlab / tombi は実の配布元から取る）の結果は PR #<未定> に貼る。
+TBD
+
+### 8.5 次に足すための作業（別 Issue）
+
+- **`workspace/configuration` に `null` ではなく `{}` で答える**（tako の client 側）: CSS / SCSS / Less / HTML の
+  サーバ（vscode-langservers-extracted）は `null` の設定で検証の途中で例外を投げ、診断を 1 件も送らない。
+  使い捨てのクライアントで `{}` に替えると CSS 3 件・HTML 1 件が出た。直せばこの 2 行は行の追加だけで入る
+  （他のサーバへの影響を測る必要がある）
+- **#1944 の npm の口を scoped の名前と依存の閉包へ広げる**: yaml-language-server（依存 20 包み・24 MB）を
+  tako が取れるようにする。vscode-langservers-extracted は依存 32 包み・展開 93 MB（TypeScript 4 系を含む）で、
+  100 MB の目安に近い
+- **取れない行の確かめの口**（今の `probe_args` は `Fetch::Binary` の中だけ）: macOS の `/usr/bin/clangd` と
+  `/usr/bin/sourcekit-lsp` は Xcode の代理（`xcrun` の shim）で、Command Line Tools の無い Mac で起こすと
+  導入のダイアログが出る。起こす前に `xcode-select -p` 相当で確かめれば「未導入 + `xcode-select --install`」へ落とせる。
+  R（包みの有無）も同じ口で確かめられる
+- **Java（jdtls + JDK 21）・Go（gopls）**: 需要は大きいが、この PC に JDK 21 / Go が無く実機で確かめられない。
+  jdtls は取るなら Eclipse の配布 約 50 MB + JRE が要る
