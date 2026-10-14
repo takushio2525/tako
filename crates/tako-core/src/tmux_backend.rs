@@ -1484,11 +1484,25 @@ set -gq copy-mode-position-format ''
     /// `wrap_options` はペイン spawn のたびに conf を書き直すので、複数ペインを同時に
     /// 立てると別ペインが起動する tmux サーバーの `-f` 読み取りと重なる。途中状態を
     /// 読ませると既定設定のサーバーが立ち、ステータスバー表示・ホイール素通し不可・
-    /// Shift+Enter 劣化を起こす
+    /// Shift+Enter 劣化を起こす。
+    ///
+    /// 検出力は**回数**で区切る（#2098）。以前は 700 ms の実時間の窓で読み取り回数を
+    /// 数えて `n > 100` を求めていたので、置き換え中の読み取りが共有違反で `Err` に
+    /// なりやすい Windows の負荷の下では 24 回しか読めずに落ちた。いまは成功した
+    /// 読み取りと書き換えがそれぞれ規定回数に達するまで回し、`LIMIT` は打ち切りの
+    /// 上限としてだけ使う（届かなければ「検出力が無い」で落とす = 意味は以前と同じ）
     #[test]
     fn conf差し替え中も読み手は完全な内容しか見ない() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
+
+        // 書き換えも数えるのは、速い機で書き手が 1 度も回らないうちに読み終え、
+        // 重なりの無い読み取りだけで通ってしまわないため
+        const READS: usize = 200;
+        const WRITES: usize = 200;
+        const WRITERS: usize = 4;
+        const READERS: usize = 2;
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
         let dir = std::env::temp_dir().join(format!("tako-conf-625-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1499,46 +1513,83 @@ set -gq copy-mode-position-format ''
         let stop = Arc::new(AtomicBool::new(false));
         let partial = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
-        let mut threads = Vec::new();
-        for _ in 0..4 {
-            let (d, s, b) = (dir.clone(), stop.clone(), body.clone());
-            threads.push(std::thread::spawn(move || {
+        let failed_reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        // 全員が揃ってから回し始める = 数える読み取りはすべて書き手が回っている間のもの
+        let start = Arc::new(Barrier::new(WRITERS + READERS));
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let (d, s, b, w, g) = (
+                dir.clone(),
+                stop.clone(),
+                body.clone(),
+                writes.clone(),
+                start.clone(),
+            );
+            writers.push(std::thread::spawn(move || {
+                g.wait();
                 while !s.load(Ordering::Relaxed) {
-                    let _ = write_conf_in(&d, &b);
+                    if write_conf_in(&d, &b).is_ok() {
+                        w.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }));
         }
-        for _ in 0..2 {
-            let (p, s, bad, n, b) = (
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let (p, bad, n, e, w, b, g) = (
                 path.clone(),
-                stop.clone(),
                 partial.clone(),
                 reads.clone(),
+                failed_reads.clone(),
+                writes.clone(),
                 body.clone(),
+                start.clone(),
             );
-            threads.push(std::thread::spawn(move || {
-                while !s.load(Ordering::Relaxed) {
-                    if let Ok(read) = std::fs::read_to_string(&p) {
-                        n.fetch_add(1, Ordering::Relaxed);
-                        if read != *b {
-                            bad.fetch_add(1, Ordering::Relaxed);
+            readers.push(std::thread::spawn(move || {
+                g.wait();
+                let deadline = std::time::Instant::now() + LIMIT;
+                while (n.load(Ordering::Relaxed) < READS || w.load(Ordering::Relaxed) < WRITES)
+                    && std::time::Instant::now() < deadline
+                {
+                    match std::fs::read_to_string(&p) {
+                        Ok(read) => {
+                            n.fetch_add(1, Ordering::Relaxed);
+                            if read != *b {
+                                bad.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        // Windows では置き換え中の open が共有違反で失敗する。
+                        // 途中状態を読んだわけではないので数から外す
+                        Err(_) => {
+                            e.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
             }));
         }
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        stop.store(true, Ordering::Relaxed);
-        for t in threads {
-            t.join().expect("スレッドが panic しない");
+        for t in readers {
+            t.join().expect("読み手が panic しない");
         }
-        let (n, bad) = (
+        // 書き手は読み手が抜けてから止める = 読み取りの全区間で書き換えが走っている
+        stop.store(true, Ordering::Relaxed);
+        for t in writers {
+            t.join().expect("書き手が panic しない");
+        }
+        let (n, failed, w, bad) = (
             reads.load(Ordering::Relaxed),
+            failed_reads.load(Ordering::Relaxed),
+            writes.load(Ordering::Relaxed),
             partial.load(Ordering::Relaxed),
         );
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(n > 100, "読み取り回数が少なすぎて検出力が無い: {n}");
+        // 途中状態を 1 回でも見たら、回数が足りていなくても確定で落ちる
         assert_eq!(bad, 0, "{n} 回中 {bad} 回、不完全な conf を観測した");
+        assert!(
+            n >= READS && w >= WRITES,
+            "読み取り回数が少なすぎて検出力が無い: 読み取り {n} / {READS} 回\
+             （失敗 {failed} 回）・書き換え {w} / {WRITES} 回（上限 {LIMIT:?} で打ち切り）"
+        );
     }
 
     /// 残骸ソケットの判定（#625）。
