@@ -63,6 +63,3 @@
 ## 2026-10-14（#2032: issue1944_lsp_fetch の取得中の検査のフレーク = 状態と進捗は別々に変わるので、揃った 1 回の読みを状態待ちで捕まえる）
 - 真因: 製品は状態（取得中）と進捗（fetch のレジストリ）を別々に変えるので、進捗を置く前と、取り終えて進捗を消してから稼働へ移るまで（#1977 の片付けが走る）は「取得中なのに進捗が無い」。旧テストは各時点で両方を求めていた。配布元に最後の 4 KiB を止める `Serve::Held` を足し、status と画面の口をそれぞれ 1 回の読みで確かめる。注入 `TAKO_2032_INJECT_OLD_FILES=<n>`
 - 実測: 旧 + 前の版の段 500 ファイル 5/5 FAILED・旧 + 進捗を置く前に 200 ms 3/3 FAILED（どちらも CI と同じ assert）・新は同じ注入で 5/5 / 3/3 ok・画面に進捗を出さない壊し方で新が名指しで落ちる・新 20/20 ok
-## 2026-10-15（#1759: エディタの Enter の続き = Python の抜ける文の後ろを 1 段浅く・Markdown のリストの印を引き継ぐ / 括弧の自動閉じ = 入れた閉じ括弧の飛び越しと対・設定で切れる）
-- 規則は `file_type` の列 `dedent_after` / `list_continuation` / `auto_close`。打鍵 1 文字は `EditorCommand::Type` → `TextBuffer::type_char` の 1 実装で GUI の文字入力と `tako edit type` / MCP `tako_preview_edit` の `command: "type"` が同じ口。設定 `editor_auto_close`（既定 ON・serde default）+ `tako edit auto-close` + MCP `auto_close`。カタログ +299 B・A/B `TAKO_1759_LEGACY=1`
-- 実測: `scripts/test-editor-enter-1759.sh` 28 PASS（visual `enter-1759` 新 OK / 旧は ① で FAILED・CLI / MCP の同じ手順が GUI の打鍵とバイト一致）・番犬 `issue1759_enter_auto_close_watchdog`（注入 6 通り）
