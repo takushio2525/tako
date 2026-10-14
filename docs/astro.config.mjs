@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import mdx from '@astrojs/mdx';
 
 // Google アナリティクス 4 の測定 ID。takushio2525.com とその全サブドメインで 1 つの
 // プロパティを共有している（gtag は既定で cookie_domain: 'auto' なので `_ga` は書ける
@@ -173,5 +174,19 @@ export default defineConfig({
 				},
 			],
 		}),
+		// .mdx の GFM（表・取り消し線・URL の自動リンク）を明示的に有効にする（#2082）。
+		// Astro 6.4 で `markdown.gfm` の既定が「未設定」になり、Starlight が足す @astrojs/mdx 5.0.x は
+		// それを無効と読むので、.mdx だけ Markdown の表が `| a | b |` のまま描かれていた
+		// （.md は Astro 本体の処理系が既定で GFM を有効にするので影響が無かった）。
+		// `markdown.gfm: true` でも直るが Astro 6.4 では非推奨の警告が毎回出て、その案内どおり
+		// `markdown.processor` へ移すと mdx 5.0.x は読まないので再び壊れる。ここで mdx に直接渡す。
+		// mdx をここに置くと Starlight は自分では足さない（optimize は Starlight が渡す値と同じ）。
+		// smartypants（`--` → 全角ダッシュ・引用符の置き換え）は .mdx では止める（#2088）。
+		// <Cmd> など JSX の子の文字列はコードとして守られないので、`brew install --cask …` が `—cask`、
+		// `tako show-command "npm install"` が `“npm install”` になって公開され、コピーしても動かなかった。
+		// 止めて変わるのはそうしたコマンドとコードだけで、日本語の本文は 1 文字も変わらないことを
+		// 前後のビルド出力の比較で確かめてある。
+		// Starlight / mdx を上げるときは、この行を外しても scripts/verify-markdown.mjs が通るかを見る（通れば不要）
+		mdx({ optimize: true, gfm: true, smartypants: false }),
 	],
 });

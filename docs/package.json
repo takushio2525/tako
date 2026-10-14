@@ -8,12 +8,14 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
+    "postbuild": "node scripts/verify-markdown.mjs",
     "og": "node scripts/generate-og.mjs",
     "og:verify": "node scripts/verify-og.mjs",
     "preview": "astro preview",
     "astro": "astro"
   },
   "dependencies": {
+    "@astrojs/mdx": "^5.0.6",
     "@astrojs/starlight": "^0.39.0",
     "astro": "^6.3.0",
     "sharp": "^0.34.0"
