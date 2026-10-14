@@ -253,10 +253,11 @@ pub fn pane_died_dir() -> Option<PathBuf> {
 ///
 /// tmux 3.6b の実測で決めた形（`.agent/plans/2026-10-lightweight.md` §11）:
 ///
-/// - **フックの中の失敗は後ろのコマンドを全部捨てる**（同じ行 = 同じグループ）。
-///   `save-buffer` の失敗（置き場が無い等）で `kill-pane` まで捨てられると、死んだペインが
-///   残り続けて**ペインが永久に閉じなくなる**。失敗しうるコマンドは `if -F` の入れ子
-///   （別グループ）へ隔離し、`kill-pane` は外側に置く
+/// - **フックの中でコマンドがその場で失敗すると、同じリストの後ろを全部捨てる**
+///   （実測: 存在しないバッファの `save-buffer` で `kill-pane` まで捨てられ、死んだペインが
+///   残り続けた = **ペインが永久に閉じなくなる**）。失敗しうるコマンドは `if -F` の入れ子
+///   （別のリスト）へ隔離し、`kill-pane` は外側に置く。置き場が無いときの書き込みの失敗は
+///   後から報告されるだけで後ろを捨てない
 /// - **`set-hook` が通らなかったら `remain-on-exit` も立てない**。同じ行に `;` でつなぎ、
 ///   `set-hook` の失敗で後ろが捨てられるようにする（逆順だと死んだペインが残り続ける）
 /// - **`save-buffer` のパスの書式はフックのペインの文脈で展開されない**（複数のペインが
@@ -4026,9 +4027,11 @@ mod pane_died_tests {
         assert!(take_pane_died_dump(&tmp.0, "tako-live").is_none());
     }
 
-    /// 置き場が無い（書き出しが失敗する）ときも `kill-pane` は走る = ペインは閉じる。
-    /// 失敗したコマンドの後ろは同じグループごと捨てられるので、入れ子に隔離していないと
-    /// 死んだペインが残り続ける（修正の過程で実測した形）
+    /// 書き出しが失敗しても `kill-pane` は走る = ペインは閉じる。
+    ///
+    /// その場で失敗するコマンド（存在しないバッファの `save-buffer`）は同じリストの後ろを
+    /// 全部捨てるので、入れ子に隔離していないと死んだペインが残り続ける（修正の過程で実測した形）。
+    /// 置き場が無いときの書き込みの失敗は後から報告されるだけ（こちらも閉じることを見る）
     #[test]
     #[cfg(unix)]
     fn 実tmux_書き出しに失敗してもペインは閉じる() {
@@ -4039,12 +4042,32 @@ mod pane_died_tests {
         let socket = format!("tako-coretest-{}-2085fail", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
         let tmp = TempDir::new("fail");
-        let conf = write_conf(&tmp, &tmp.0.join("no-such-dir"));
+        let caps = tmux_caps();
+        // その場で失敗する: 製品の conf の `save-buffer` だけを無いバッファへ向ける
+        let conf = tmp.0.join("tmux.conf");
+        let failing = pane_died_conf(&caps, Some(&tmp.0), false).replace(
+            "save-buffer -b tako-pane-died ",
+            "save-buffer -b tako-pane-died-missing ",
+        );
+        assert!(failing.contains("tako-pane-died-missing"));
+        std::fs::write(&conf, backend_conf(&caps) + &failing).unwrap();
         start_server(&socket, &conf);
         new_vessel(&socket, &conf, "tako-fail", "seq 1 50");
         assert!(
             wait_gone(&socket, "tako-fail"),
             "書き出しの失敗で kill-pane まで捨てられた（死んだペインが残っている）"
+        );
+        // 置き場が無い（書き込みが後から失敗する）
+        let missing_dir = write_conf(&tmp, &tmp.0.join("no-such-dir"));
+        crate::tmux::tmux_command(Some(&socket))
+            .arg("source-file")
+            .arg(&missing_dir)
+            .output()
+            .expect("tmux source-file");
+        new_vessel(&socket, &missing_dir, "tako-fail2", "seq 1 50");
+        assert!(
+            wait_gone(&socket, "tako-fail2"),
+            "置き場が無いと死んだペインが残る"
         );
     }
 

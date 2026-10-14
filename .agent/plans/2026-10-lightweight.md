@@ -521,6 +521,7 @@ TAKO_FOOTPRINT_STUB_CLAUDE=1 bash scripts/measure-footprint-2011.sh persist:1   
   修正前より良い（修正前は最後の tick から画面の上端までが抜けた）
   - 当たるのは主に `tako split -- <cmd>` の成功終了（FR-2.5.14 = 成功したら即座に閉じる）。ビルドやテストの最後の
     出力（まとめの行）は画面に居るので、**修正前から入っていなかった**（③ の修正前も末尾 77 行が抜けた）
+  - **#2085 で ① を採用して塞いだ（§12）**。tmux の器では最後の行まで入る。psmux は未実測なので残る
   - 根本の直し方（別 Issue の候補）: ① 器に `remain-on-exit on` + `pane-died` フックで、死んだペインの履歴を
     tmux 自身にファイルへ書かせてから `kill-pane` する（子プロセスは増えない。器の作り・psmux・後片付けの設計が要る）
     ② コマンドペインのラッパーが成功時に自分のペインを明示 close する（閉じる直前の取り込みの経路に乗る。
@@ -590,3 +591,53 @@ TAKO_FOOTPRINT_STUB_CLAUDE=1 bash scripts/measure-footprint-2011.sh persist:1   
 - 本番の 10/13 の 26 本に当てると、footprint の計は約 180 MB（1 本 6.8〜7.0 MB）→ 約 28 MB の見込み（1 本の値 × 26。RSS は未実測）
 - 回帰の見張り: `tako-mcp` が libSystem 以外をリンクし始めたら `scripts/build-app.sh` が止まる（release の `otool -L`）。
   debug は使わない関数が LLVM で消えずに残るのでフレームワークが外れない（番犬の otool の項目は release だけで走る）
+||||||| parent of fa5db4a ([改善] pane-died の番犬にその場で失敗する形の注入を足し、設計書に #2085 の実測をまとめる (#2085))
+
+## 12. #2085 器が自ら消えても最後の行までペインログに入れる
+
+### 12.1 やったこと
+
+§10.5 の ①。器の設定（`tmux_backend::pane_died_conf`。`backend_conf` の後ろに足す）:
+
+```
+set -g @tako-pane-died-dir '<data_dir>/pane-died'
+set-hook -g pane-died {
+  if -F '#{&&:#{m:tako-*,#{session_name}},#{&&:#{==:#{window_panes},1},#{==:#{session_windows},1}}}' {
+    set -gF @tako-pane-died-name '#{session_name}.#{history_size}.#{history_limit}.#{history_bytes}.#{alternate_on}'
+    capture-pane -b tako-pane-died -S - -E -
+    save-buffer -b tako-pane-died '#{@tako-pane-died-dir}/#{@tako-pane-died-name}.dump'
+    delete-buffer -b tako-pane-died
+  }
+  kill-pane
+} ; set -g remain-on-exit on ; set -gq remain-on-exit-format ''
+```
+
+- 書くのは tmux サーバー自身（`save-buffer` が書き終わってから `kill-pane` が走るので、器が消えた時点で
+  書き出しは揃っている）。**子プロセスは 1 本も増えない**。tako は attach クライアントの終了で閉じるとき（`CloseOrigin::ProcessExit`）に
+  別スレッドで読み、閉じる直前の取り込みと同じ揃え（`pane_log::backend_close_plan` + `backend_observation`）で
+  最後の増分を足し、死んだ瞬間の画面をクローズフラッシュに使う（修正前の ProcessExit は tako 側の画面 =
+  tmux クライアントが終わった後の `[exited]` を書いていた）
+- 書き出しは読んだら消す。同じ名前の器を作る / 繋ぎ直すとき（`wrap_options`）にも消し、読まれずに
+  10 分を過ぎたものは `sync_conf`（起動時）が消す。置き場は 0700
+- psmux は `BackendCapabilities::keeps_exit_output = false` で 1 行も足さない（§12.3）
+
+### 12.2 tmux 3.6b の実測で決めた形（形を変えるときはここを読む）
+
+| 観察 | 対処 |
+|---|---|
+| フックの中のコマンドが**その場で**失敗すると、**同じリストの後ろが全部捨てられる**（存在しないバッファの `save-buffer` で `kill-pane` まで消え、死んだペインが残り続けた = ペインが閉じない）。置き場が無いときの書き込みの失敗は後から報告されるだけで後ろを捨てない | 失敗しうるコマンドは `if -F` の入れ子（別のリスト）へ隔離し、`kill-pane` は外側。番犬 `実tmux_書き出しに失敗してもペインは閉じる`（両方の失敗を注入） |
+| `set-hook` が通らずに `remain-on-exit on` だけ効くと、片付ける人が居ないまま死んだペインが残る | 同じ行に `;` でつなぐ（`set-hook` の失敗で後ろが捨てられる）。番犬 `実tmux_set_hookが通らなければremain_on_exitも立たない` |
+| `save-buffer` のパスの書式は**フックのペインの文脈で展開されない**（5 枚を同時に死なせると、別のセッションの名前と行数で書かれた） | ターゲットを持つ `set -gF` でフックのペインの文脈のまま名前を作り、`save-buffer` はユーザーオプションを読むだけ。番犬 `実tmux_同時に死んでも名前と中身が食い違わない` |
+| `-t '#{hook_pane}'` は展開されない（`can't find pane`） | 対象は既定（フックのペイン）に任せる |
+| `remain-on-exit-format` の既定は、死んだときに画面を 1 行送って `Pane is dead (status 0, …)` を書き込む（履歴が 1 行増え、画面の最後の行が化ける） | `''` にする（送りも書き込みも無くなる）。tmux 3.2 には無いので `-q` |
+| 明示の `kill-session`（tako が閉じる経路）では `pane-died` は起きない | 閉じる直前の取り込み（#2018）はそのまま |
+| 同じ conf を 3 回 `source-file` してもフックは `pane-died[0]` の 1 本 | `sync_conf` の再適用で二重にならない |
+
+### 12.3 psmux（Windows）
+
+`set-hook` は持つ（psmux の docs）が、`pane-died`・入れ子のコマンド列・`save-buffer` のパスの書式展開を
+Windows 実機で確かめていない（この PC では測れない）。`remain-on-exit` は #881 / #884 の調査で使えている。
+**未実測の形を立てると、`kill-pane` が走らない構成でペインが永久に閉じなくなる危険がある**ので能力を false にして
+設定を 1 行も変えない。挙動は #2085 の前と同じ（出力中に自ら終わると最後の取り込みの後の行・最大 10 秒が入らない）。
+`tako platform` の `tako_logs` を Windows で degraded にし、理由を 1 文で申告した（`WIN_PANE_LOG_EXIT_TAIL`）
+
