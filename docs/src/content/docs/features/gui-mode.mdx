@@ -26,18 +26,14 @@ AI やスクリプトからは、同じ切り替えをコマンドで行えま�
 
 かんたん表示にしても、全部のペインが変わるわけではありません。ペインの状態ごとに、上から順に当てはめて決まります。迷うものは**ターミナル表示のまま**にします。
 
-{/* 表は HTML で書く（.mdx では Markdown の表が描かれない。Astro 6 の markdown.gfm の既定が未設定のため） */}
-<table>
-<thead><tr><th>ペインの状態</th><th>表示</th></tr></thead>
-<tbody>
-<tr><td>スターターの「コマンド入力へ」で戻したペイン</td><td>ターミナル表示</td></tr>
-<tr><td>Claude と話している</td><td><strong>チャット</strong></td></tr>
-<tr><td>vim などの全画面のアプリ</td><td>ターミナル表示のまま</td></tr>
-<tr><td>何も動いていないシェル</td><td><strong>スターター</strong>（3 つのボタン）</td></tr>
-<tr><td>ペインを作った直後・AI の起動中</td><td>「準備中…」（数秒で次の表示へ）</td></tr>
-<tr><td>コマンドの実行中・codex や agy・直前のコマンドが失敗した</td><td>ターミナル表示のまま</td></tr>
-</tbody>
-</table>
+| ペインの状態 | 表示 |
+|---|---|
+| スターターの「コマンド入力へ」で戻したペイン | ターミナル表示 |
+| Claude と話している | **チャット** |
+| vim などの全画面のアプリ | ターミナル表示のまま |
+| 何も動いていないシェル | **スターター**（3 つのボタン） |
+| ペインを作った直後・AI の起動中 | 「準備中…」（数秒で次の表示へ） |
+| コマンドの実行中・codex や agy・直前のコマンドが失敗した | ターミナル表示のまま |
 
 ## スターター（空のペイン）
 
@@ -80,13 +76,10 @@ AI からは、最後の AI の発話をそのままコピーできます。ど�
 
 スターター・チャット・本文のコピーは Windows でも使えます。Windows 11 の実機で、スターターの「AI チームに任せる」から司令塔の AI が立ち上がるところまで確かめています。キーだけが違います。
 
-<table>
-<thead><tr><th>操作</th><th>macOS</th><th>Windows</th></tr></thead>
-<tbody>
-<tr><td>コマンドパレット（「表示モードを切り替え」）</td><td><kbd>⌘</kbd>+<kbd>K</kbd></td><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd></td></tr>
-<tr><td>選んだ本文のコピー</td><td><kbd>⌘</kbd>+<kbd>C</kbd></td><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd></td></tr>
-</tbody>
-</table>
+| 操作 | macOS | Windows |
+|---|---|---|
+| コマンドパレット（「表示モードを切り替え」） | <kbd>⌘</kbd>+<kbd>K</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
+| 選んだ本文のコピー | <kbd>⌘</kbd>+<kbd>C</kbd> | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
 
 ほかの機能の Windows での状況は [Windows 対応状況](/windows-support/) にまとめています。
 
@@ -94,16 +87,13 @@ AI からは、最後の AI の発話をそのままコピーできます。ど�
 
 かんたん表示の操作は、すべて CLI と MCP からも行えます（UI でできることは AI からもできる、が tako の決まりです）。
 
-<table>
-<thead><tr><th>操作</th><th>CLI</th><th>MCP</th></tr></thead>
-<tbody>
-<tr><td>モードの確認・切り替え</td><td><code>tako ui-mode [gui|terminal|toggle]</code></td><td><code>tako_ui_mode</code></td></tr>
-<tr><td>1 つのペインだけターミナル表示へ</td><td><code>tako ui-mode release --pane N</code></td><td><code>tako_ui_mode</code>（<code>release</code>）</td></tr>
-<tr><td>それを戻す</td><td><code>tako ui-mode restore --pane N</code></td><td><code>tako_ui_mode</code>（<code>restore</code>）</td></tr>
-<tr><td>いま各ペインに何が出ているか</td><td><code>tako ui-mode</code>（応答の <code>pane_display</code>）</td><td><code>tako_ui_mode</code></td></tr>
-<tr><td>チャットの本文のコピー</td><td><code>tako chat copy</code></td><td><code>tako_chat_copy</code></td></tr>
-</tbody>
-</table>
+| 操作 | CLI | MCP |
+|---|---|---|
+| モードの確認・切り替え | `tako ui-mode [gui\|terminal\|toggle]` | `tako_ui_mode` |
+| 1 つのペインだけターミナル表示へ | `tako ui-mode release --pane N` | `tako_ui_mode`（`release`） |
+| それを戻す | `tako ui-mode restore --pane N` | `tako_ui_mode`（`restore`） |
+| いま各ペインに何が出ているか | `tako ui-mode`（応答の `pane_display`） | `tako_ui_mode` |
+| チャットの本文のコピー | `tako chat copy` | `tako_chat_copy` |
 
 `pane_display` は各ペインの表示（`terminal` / `starter` / `chat` / `preparing`）を返すので、AI は「いまユーザーの画面に何が出ているか」を確かめてから案内できます。
 
