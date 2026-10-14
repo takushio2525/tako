@@ -352,6 +352,7 @@ fn タイムアウトした要求は取り消しを送り待ちの表から消�
     };
     let handlers = Handlers {
         on_notification: Box::new(|_, _| {}),
+        on_request: Box::new(|_, _| {}),
         on_exit: Box::new(|| {}),
     };
     let process = ServerProcess::spawn(&plan, "fake", handlers, None).unwrap();

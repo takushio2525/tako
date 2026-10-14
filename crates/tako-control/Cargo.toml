@@ -24,6 +24,9 @@ rust-embed.workspace = true
 libc.workspace = true
 ureq.workspace = true
 lsp-types.workspace = true
+# 言語サーバが登録したグロブの根の監視（#2034。lsp::watch）。tako-app の表示中プレビューの監視（#233）と
+# 同じ依存（新しいクレートは増えない）。macOS = FSEvents・Windows = ReadDirectoryChangesW で走査しない
+notify.workspace = true
 # 言語サーバの取得（#1944）: ハッシュの検証と gzip / deflate の展開
 sha2.workspace = true
 base64.workspace = true

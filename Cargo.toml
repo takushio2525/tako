@@ -56,6 +56,10 @@ lsp-types = "0.97"
 ignore = "0.4.26"
 # 同上の照合。gpui 経由で既にツリーにある 1.x（新しいクレートは増えない）
 regex = "1"
+# 言語サーバが登録する監視のグロブ（`workspace/didChangeWatchedFiles`。#2034。tako-core::lsp::watch）。
+# ripgrep のグロブ照合で、上の ignore が既に使っている版（新しいクレートは増えない）。LSP のグロブ
+# （`**` / `{a,b}` / `[!x]`・`*` は区切りを越えない）をそのまま読める。regex へ自前で訳す案は採らない
+globset = "0.4.18"
 # リモートアクセスの QR コード生成（ターミナル表示用。pure Rust・軽量）
 qrcode = "0.14"
 # マシン ID 生成（Phase 3 remote。UUID v4、CSPRNG ベース）
