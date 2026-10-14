@@ -137,16 +137,38 @@ fn alt_screenの除外は稼働中ペインに効かない() {
 }
 
 /// 4: live 解決は器のキーだけにならない
+///
+/// #2041 から live 解決は `chat_live_sessions` を通る（mod の報告が答えたペインは問わない）。
+/// 器なしの起点は同じく渡す: 全部（sticky の生存判定）は両方の腕へ、答えの要るペインは
+/// `chat_scan_ask` が器なしキーから組み直して `live_claude_sessions_asking` へ
 #[test]
 fn live解決は器なしの起点も渡す() {
     let body = fn_body(CHAT, "pub(crate) fn load_chat_refresh(");
     let code = compact(&body);
     assert!(
-        code.contains("agents::live_claude_sessions(&direct)"),
-        "{CHAT}: load_chat_refresh が器なしの起点を渡していない。\n\
+        code.contains("chat_live_sessions(&targets,&direct)"),
+        "{CHAT}: load_chat_refresh が器なしの起点を live 解決へ渡していない。\n\
          `live_claude_sessions_by_backend` は器のセッション名しかキーに持たないので、\n\
          器を持たないペインは必ず解決から外れる（#1397 の根因）:\n  {}",
         hits_in(CHAT, &body, "live_claude_sessions").join("\n  ")
+    );
+    let live_body = fn_body(CHAT, "fn chat_live_sessions(");
+    let live = compact(&live_body);
+    for needle in [
+        "agents::live_claude_sessions(direct)",
+        "agents::live_claude_sessions_asking(direct,",
+    ] {
+        assert!(
+            live.contains(needle),
+            "{CHAT}: chat_live_sessions が器なしの起点（`direct`）を `{needle}` へ渡していない（#1397）:\n  {}",
+            hits_in(CHAT, &live_body, "live_claude_sessions").join("\n  ")
+        );
+    }
+    assert!(
+        compact(&fn_body(CHAT, "fn chat_scan_ask("))
+            .contains("LiveSessionKey::Pane{pane,pid}=>direct.push((*pane,*pid))"),
+        "{CHAT}: chat_scan_ask が器なしキーから答えの要る起点 (ペイン ID, pid) を\n\
+         組み直していない（器なしの claude が走査から外れる = #1397）"
     );
     assert!(
         code.contains("LiveSessionKey::Pane{pane,pid}=>Some((*pane,*pid))"),
