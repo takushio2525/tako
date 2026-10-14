@@ -235,7 +235,7 @@ pub(super) async fn rename_1686_visual(
     inject_section_failure(LABEL);
     // 置き場は `completion_scene` が作り直す（同じ名前）。偽サーバは規則を起動のときに読むので、
     // ④ の答えに載せる URI は場面の前に組む（tako は開いたファイルを実パスへ直す = /private/var）
-    let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
     let dir = tmp.join(format!("tako-visual-{LABEL}-{}", std::process::id()));
     let main_uri = tako_core::file_uri::from_path(&dir.join("src").join("main.rs"));
     let lib_uri = tako_core::file_uri::from_path(&dir.join("src").join("lib.rs"));

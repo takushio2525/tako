@@ -278,7 +278,7 @@ else
     [ "$W" = "dry-run" ] && break
     sleep 1
   done
-  echo "    暖機: $(($(date +%s) - T0)) 秒（最後の status=$W）"
+  echo "    暖機: $(($(date +%s) - T0)) 秒（最後の status=${W}）"
   rename_steps "④" "$R4"
   "$TAKO_BIN" lsp stop >/dev/null 2>&1
   stop_isolated_gui "$APP_PID"; APP_PID=""
@@ -299,6 +299,6 @@ else
 fi
 
 echo
-echo "画像: $DUMP（after = 新しい挙動 / before = TAKO_1686_LEGACY=1）"
+echo "画像: ${DUMP}（after = 新しい挙動 / before = TAKO_1686_LEGACY=1）"
 echo "結果: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
