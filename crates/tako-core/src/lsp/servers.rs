@@ -88,10 +88,10 @@ const fn doc(extension: &'static str, language_id: &'static str) -> DocumentKind
 /// 段階 1 の 4 行（ユーザー確定の順。#1007）:
 /// Rust → C/C++（「ヘッダ」= `#include` のヘッダ）→ TypeScript / JavaScript → Python
 ///
-/// 第 2 波の 5 行（#1956。候補の比較と採った順の理由は `.agent/plans/2026-10-language-coverage.md` §8）:
-/// LaTeX（texlab）→ TOML（tombi）→ Swift（sourcekit-lsp）→ Dart（dart）→ YAML（yaml-language-server）。
-/// 前の 2 つは tako が取れる単体バイナリ、Swift と Dart は言語の道具に同梱（入っていれば言語サーバも在る）、
-/// YAML は利用者の npm で入れる（依存 20 包みを取る口がまだ無い）
+/// 第 2 波の 6 行（#1956。候補の比較と採った順の理由は `.agent/plans/2026-10-language-coverage.md` §8）:
+/// LaTeX（texlab）→ TOML（tombi）→ Swift（sourcekit-lsp）→ Dart（dart）→ CSS / SCSS / Less と HTML
+/// （vscode-langservers-extracted）。前の 2 つは tako が取れる単体バイナリ、Swift と Dart は言語の道具に同梱
+/// （入っていれば言語サーバも在る）、CSS と HTML は利用者の npm で入れる（依存 32 包みを取る口がまだ無い）
 pub const SERVERS: &[ServerSpec] = &[
     ServerSpec {
         id: "rust-analyzer",
@@ -442,19 +442,36 @@ pub const SERVERS: &[ServerSpec] = &[
         fetch: None,
     },
     ServerSpec {
-        id: "yaml-language-server",
-        documents: &[doc("yaml", "yaml"), doc("yml", "yaml")],
-        program: "yaml-language-server",
+        id: "vscode-css-language-server",
+        documents: &[doc("css", "css"), doc("scss", "scss"), doc("less", "less")],
+        program: "vscode-css-language-server",
         args: &["--stdio"],
-        root_markers: &[],
+        root_markers: &["package.json"],
         workspace_root: None,
         install: InstallHint {
-            macos: "npm install -g yaml-language-server",
-            windows: "npm install -g yaml-language-server",
+            macos: "npm install -g vscode-langservers-extracted",
+            windows: "npm install -g vscode-langservers-extracted",
         },
-        // 取らない（まだ）: 依存が 20 包み（展開 24 MB）あり、scoped の `@vscode/l10n` を含む。
-        // [`Fetch::Npm`] は依存を持たない包みと scoped でない名前だけを取れる形（#1944）なので、
-        // 取るには取得の口を広げる別の作業が要る
+        // 取らない（まだ）: vscode-langservers-extracted 4.10.0 は依存が 32 包み（展開 93 MB。TypeScript 4 系と
+        // scoped の `@vscode/l10n` を含む）。[`Fetch::Npm`] は依存を持たない包みと scoped でない名前だけを取れる
+        // 形（#1944）なので、取るには取得の口を広げる別の作業が要る。
+        // **罠**（実測）: クライアントが `workspace.configuration` を申告して `null` で答えると、検証の途中で
+        // 例外になり診断を 1 件も送らない。tako は申告しないので既定の設定で検証する
+        fetch: None,
+    },
+    ServerSpec {
+        id: "vscode-html-language-server",
+        documents: &[doc("html", "html"), doc("htm", "html")],
+        program: "vscode-html-language-server",
+        args: &["--stdio"],
+        root_markers: &["package.json"],
+        workspace_root: None,
+        install: InstallHint {
+            macos: "npm install -g vscode-langservers-extracted",
+            windows: "npm install -g vscode-langservers-extracted",
+        },
+        // 取らない（まだ）: CSS の行と同じ包み・同じ理由。診断は埋め込みの `<style>` / `<script>` の誤り
+        // （HTML の構造そのものは検証しない）、ホバーは要素と属性の説明
         fetch: None,
     },
 ];
@@ -510,10 +527,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 第2波までで9行() {
+    fn 第2波までで10行() {
         assert_eq!(
             SERVERS.len(),
-            9,
+            10,
             "表の行数が変わったら番犬とドキュメントも直す"
         );
     }
@@ -561,13 +578,11 @@ mod tests {
             ("Cargo.toml", "tombi", "toml", true),
             ("main.swift", "sourcekit-lsp", "swift", false),
             ("lib/main.dart", "dart", "dart", false),
-            ("config.yaml", "yaml-language-server", "yaml", false),
-            (
-                ".github/workflows/ci.yml",
-                "yaml-language-server",
-                "yaml",
-                false,
-            ),
+            ("site/style.css", "vscode-css-language-server", "css", false),
+            ("app.scss", "vscode-css-language-server", "scss", false),
+            ("theme.less", "vscode-css-language-server", "less", false),
+            ("index.html", "vscode-html-language-server", "html", false),
+            ("old/page.htm", "vscode-html-language-server", "html", false),
         ];
         for (path, id, language_id, fetchable) in cases {
             let got =
@@ -589,8 +604,8 @@ mod tests {
         for path in [
             "Main.java",
             "main.go",
-            "index.html",
-            "style.css",
+            "config.yaml",
+            "ci.yml",
             "data.json",
             "App.vue",
         ] {
@@ -645,8 +660,8 @@ mod tests {
         );
         assert_eq!(override_env_name(got.spec.id), "TAKO_LSP_BIN_JDTLS");
         assert_eq!(
-            override_env_name("yaml-language-server"),
-            "TAKO_LSP_BIN_YAML_LANGUAGE_SERVER"
+            override_env_name("vscode-css-language-server"),
+            "TAKO_LSP_BIN_VSCODE_CSS_LANGUAGE_SERVER"
         );
         // 既存の行の答えは変わらない
         assert_eq!(

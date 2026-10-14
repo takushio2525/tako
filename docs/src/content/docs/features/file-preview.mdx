@@ -281,13 +281,14 @@ tako preview-reload off
 | TOML（`.toml`） | tombi | tako が取ってくる（1.7.0） |
 | Swift（`.swift`） | sourcekit-lsp | 取ってこない（Xcode / Command Line Tools に入っています） |
 | Dart（`.dart`） | dart（`dart language-server`） | 取ってこない（Dart SDK・Flutter に入っています） |
-| YAML（`.yaml` `.yml`） | yaml-language-server | 取ってこない（`npm install -g yaml-language-server`） |
+| CSS / SCSS / Less（`.css` `.scss` `.less`） | vscode-css-language-server | 取ってこない（`npm install -g vscode-langservers-extracted`） |
+| HTML（`.html` `.htm`） | vscode-html-language-server | 取ってこない（同上。誤りの波線は `<style>` / `<script>` の中だけ） |
 
 - **グローバルに入っていればそちらを使います**。無いときだけ、版を固定したものを tako のデータフォルダへ取り、配布元が公開しているハッシュで確かめてから使います。npm や Homebrew は起こさず、PATH も書き換えません。pyright と typescript-language-server は Node.js で動くので、足りる版の node が PATH に無ければ Node.js 24.21.0 も一緒に取ります
 - 状態は編集中のペインの上に「取得中（取っているものと n / m MB）→ 起動中 → 読み込み中 → 動作中」と出ます。取れなかった・止まったときはその下に帯が出て、理由と「入れる」「もう一度取得」「起こし直す」のボタンが並びます
 - 前もって入れておく・取り直すときは `tako lsp install`、状態を見るときは `tako lsp status` です
-- 表に無い言語（Java・Go・HTML・CSS・JSON など）は、今は言語サーバを起こしません（色分けと編集はそのまま使えます）
-- YAML と TOML の説明のカードは、ファイルに合うスキーマがあるときに出ます（GitHub Actions のワークフロー・`Cargo.toml`・`pyproject.toml` など）。どちらの言語サーバもスキーマの一覧を SchemaStore（schemastore.org）へ問い合わせます。オフラインでは、YAML はカードが出ず（誤りの波線は出ます）、TOML は `Cargo.toml` と `pyproject.toml` なら内蔵のスキーマで出ます
+- 表に無い言語（Java・Go・YAML・JSON など）は、今は言語サーバを起こしません（色分けと編集はそのまま使えます）
+- TOML の説明のカードは、ファイルに合うスキーマがあるときに出ます（`Cargo.toml`・`pyproject.toml` など）。tombi はスキーマの一覧を SchemaStore（schemastore.org）へ問い合わせますが、`Cargo.toml` と `pyproject.toml` は内蔵のスキーマでオフラインでも出ます
 
 | 操作 | macOS | Windows |
 |---|---|---|

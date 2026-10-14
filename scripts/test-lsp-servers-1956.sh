@@ -2,11 +2,11 @@
 # test-lsp-servers-1956.sh — 言語サーバの検出表の第 2 波（#1956）を実のサーバで確かめる（隔離 GUI）
 #
 # 何を確かめるか（Issue #1956 の受け入れ条件のうち、実機で言えるもの）:
-#   ① 実のサーバ 5 つ（texlab / tombi は実の配布元から取る・sourcekit-lsp / dart / yaml-language-server は
-#      ログインシェルの PATH）: 誤りを含むファイルを**編集モードで開くだけ**で 起動 → 読み込み済み →
+#   ① 実のサーバ 6 つ（texlab / tombi は実の配布元から取る・sourcekit-lsp / dart /
+#      vscode-css-language-server / vscode-html-language-server はログインシェルの PATH）: 誤りを含むファイルを**編集モードで開くだけ**で 起動 → 読み込み済み →
 #      診断（誤りの波線）→ ホバー（`tako lsp hover`）。開いてから稼働・最初の診断までの時間と、
-#      読み込み後のサーバの常駐メモリ（RSS）を測る。`tako lsp servers` が 9 行を返し、CLI と MCP が同じ
-#   ② visual-test `lsp-servers`: 同じ 5 つで、波線の画面とホバーのカードの画面を 1 枚ずつ落とす
+#      読み込み後のサーバの常駐メモリ（RSS）を測る。`tako lsp servers` が 10 行を返し、CLI と MCP が同じ
+#   ② visual-test `lsp-servers`: 同じ 6 つで、波線の画面とホバーのカードの画面を 1 枚ずつ落とす
 #   ③ 境界「取得が失敗する」（配布元に届かない注入 = 閉じたポートのミラー）: GUI 無しの `tako lsp install` は
 #      network で失敗して途中の物を残さない。GUI で開くと未導入へ落ちて理由と導入コマンドが読め、
 #      編集はそのまま続けられる（壊れない）
@@ -40,6 +40,8 @@ check_eq() {
 REAL_HOME="$HOME"
 # 受け口のソケットのパス長に余裕を持たせるため短い置き場にする
 TMP="$(mktemp -d /tmp/tk1956.XXXXXX)"
+# symlink を解いた形にそろえる（エディタと言語サーバは /private/tmp/… で文書を持つ）
+TMP="$(cd "$TMP" && pwd -P)"
 DUMP="${TAKO_1956_DUMP_DIR:-$TMP/dump}"
 APP_PID=""
 TMUX_SOCKET="tako-1956-$$"
@@ -67,7 +69,7 @@ dir_mb() { [ -d "$1" ] && du -sk "$1" | awk '{printf "%.1f", $1/1024}' || echo "
 mkdir -p "$TMP/home" "$TMP/zdot" "$TMP/disc" "$TMP/orch" "$TMP/rbin" "$TMP/stale" "$DUMP"
 # 証拠ログに実ユーザー名・実ホスト名を写さない（#927）
 printf "PROMPT='tako %%1~ %%%% '\nRPROMPT=''\n" > "$TMP/zdot/.zshrc"
-# ログインシェルの PATH = rbin（node / dart / yaml-language-server だけを置く）+ /etc/paths
+# ログインシェルの PATH = rbin（node / dart / CSS と HTML の言語サーバだけを置く）+ /etc/paths
 set_login_path() { printf 'export PATH="%s:$PATH"\n' "$1" > "$TMP/zdot/.zprofile"; }
 set_login_path "$TMP/rbin"
 # GUI の PATH は最小にする（呼び出し元の PATH を継ぐと、利用者の texlab 等が見えて「まっさら」にならない）
@@ -78,14 +80,16 @@ for tool in tmux node; do
 done
 DART_REAL="$(command -v dart 2>/dev/null)"
 [ -n "$DART_REAL" ] && ln -s "$DART_REAL" "$TMP/rbin/dart"
-# yaml-language-server は利用者の npm で入れる行（tako は取らない）。一時の prefix へ入れて PATH へ置く
-YAML_LS=""
+# CSS / HTML の言語サーバは利用者の npm で入れる行（tako は取らない）。一時の prefix へ入れて PATH へ置く
+WEB_LS=""
 if [ "${TAKO_1956_SKIP_REAL:-}" != "1" ] && command -v npm >/dev/null 2>&1; then
-  echo "yaml-language-server 1.24.0 を一時の置き場へ入れます（npm。install script は走らせない）…"
+  echo "vscode-langservers-extracted 4.10.0 を一時の置き場へ入れます（npm。install script は走らせない）…"
   if (cd "$TMP" && npm install --prefix "$TMP/npm" --ignore-scripts --no-audit --no-fund \
-      yaml-language-server@1.24.0 >/dev/null 2>&1); then
-    YAML_LS="$TMP/npm/node_modules/.bin/yaml-language-server"
-    ln -s "$YAML_LS" "$TMP/rbin/yaml-language-server"
+      vscode-langservers-extracted@4.10.0 >/dev/null 2>&1); then
+    WEB_LS=1
+    for name in vscode-css-language-server vscode-html-language-server; do
+      ln -s "$TMP/npm/node_modules/.bin/$name" "$TMP/rbin/$name"
+    done
   fi
 fi
 
@@ -96,18 +100,20 @@ export TAKO_ISOLATED=1 HOME="$TMP/home" TAKO_DISCOVERY_DIR="$TMP/disc" \
 
 # --- 素材（どれも誤りを 1 つ含む。ホバーは別の行の語に置く）------------------------------
 P="$TMP/proj"
-mkdir -p "$P/tex" "$P/toml" "$P/swift" "$P/dart" "$P/yaml/.github/workflows"
+mkdir -p "$P/tex" "$P/toml" "$P/swift" "$P/dart" "$P/web"
 printf '\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\begin{itemize}\n  \\item a\n\\end{enumerate}\n\\end{document}\n' > "$P/tex/main.tex"
 printf '[package]\nname = "x"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = \n' > "$P/toml/Cargo.toml"
 printf 'let total: Int = "two"\nprint(total)\n' > "$P/swift/main.swift"
 printf 'void main() {\n  int total = "two";\n  print(total);\n}\n' > "$P/dart/main.dart"
-printf 'name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n     bad: x\n' > "$P/yaml/.github/workflows/ci.yml"
+printf '.a {\n  color: red;\n  colr: red;\n}\n.b {\n' > "$P/web/style.css"
+printf '<!DOCTYPE html>\n<html>\n<body>\n<style>\na { color: ; }\n</style>\n<div>hi</div>\n</body>\n</html>\n' > "$P/web/index.html"
 # 件: 検出表の ID・ファイル・ホバーの位置（CLI = 行は 1 始まり / visual-test = 0 始まり。桁はバイト）
 CASES="texlab	$P/tex/main.tex	2	14
 tombi	$P/toml/Cargo.toml	4	2
 sourcekit-lsp	$P/swift/main.swift	2	1
 dart	$P/dart/main.dart	3	3
-yaml-language-server	$P/yaml/.github/workflows/ci.yml	5	6"
+vscode-css-language-server	$P/web/style.css	2	3
+vscode-html-language-server	$P/web/index.html	7	2"
 
 # GUI を立てる（データの置き場と、足す env を渡す）
 start_gui() {
@@ -189,25 +195,25 @@ watch_until_ready() {
 REAL="$TMP/real"
 if [ "${TAKO_1956_SKIP_REAL:-}" != "1" ]; then
   echo
-  echo "== ① 実のサーバ 5 つ（texlab / tombi は実の配布元から取る。開くだけで 起動 → 診断 → ホバー） =="
+  echo "== ① 実のサーバ 6 つ（texlab / tombi は実の配布元から取る。開くだけで 起動 → 診断 → ホバー） =="
   start_gui "$REAL" "$TMP/gui-real.log"
   T0="$(ms_now)"
   servers_json="$("$TAKO_BIN" lsp servers --json 2>/dev/null)"
   T1="$(ms_now)"
   "$TAKO_BIN" lsp servers --json >/dev/null 2>&1
   T2="$(ms_now)"
-  echo "    観測: tako lsp servers の往復 1 回目（ログインシェルを 9 本並べて引く）$((T1 - T0)) ms・2 回目（覚えた答え）$((T2 - T1)) ms"
-  check_eq "tako lsp servers は 9 行" "9" "$(echo "$servers_json" | json 'len(d["servers"])')"
-  check_eq "第 2 波の 5 行が載る" "['texlab', 'tombi', 'sourcekit-lsp', 'dart', 'yaml-language-server']" \
+  echo "    観測: tako lsp servers の往復 1 回目（ログインシェルを 10 本並べて引く）$((T1 - T0)) ms・2 回目（覚えた答え）$((T2 - T1)) ms"
+  check_eq "tako lsp servers は 10 行" "10" "$(echo "$servers_json" | json 'len(d["servers"])')"
+  check_eq "第 2 波の 6 行が載る" "['texlab', 'tombi', 'sourcekit-lsp', 'dart', 'vscode-css-language-server', 'vscode-html-language-server']" \
     "$(echo "$servers_json" | json '[r["id"] for r in d["servers"]][4:]')"
   mcp_ids="$(mcp tako_lsp_server '{"action":"list"}' | json '[r["id"] for r in d["servers"]]')"
-  check_eq "MCP（tako_lsp_server の list）も同じ 9 行" \
+  check_eq "MCP（tako_lsp_server の list）も同じ 10 行" \
     "$(echo "$servers_json" | json '[r["id"] for r in d["servers"]]')" "$mcp_ids"
   TAB="$(printf '\t')"
   # 件は fd 3 から読む（中で起こす CLI が標準入力を読んでも件を食わない）
   while IFS="$TAB" read -r id file line col <&3; do
     [ -n "$id" ] || continue
-    if [ "$id" = "yaml-language-server" ] && [ -z "$YAML_LS" ]; then
+    if [ "${id#vscode-}" != "$id" ] && [ -z "$WEB_LS" ]; then
       unmeasured "$id: npm が無いので入れられない"
       continue
     fi
@@ -238,12 +244,18 @@ if [ "${TAKO_1956_SKIP_REAL:-}" != "1" ]; then
     else
       fail "$id: 診断が出ない"
     fi
-    hv="$("$TAKO_BIN" lsp hover --pane "$pane" --line "$line" --column "$col" --json 2>/dev/null)"
-    status="$(echo "$hv" | json 'd["status"]')"
+    # 読み込みの直後は空で答えるサーバがある = 出るまで 0.5 秒おきに問い直す（上限 15 秒）
+    status=""
+    for _ in $(seq 1 30); do
+      hv="$("$TAKO_BIN" lsp hover --pane "$pane" --line "$line" --column "$col" --json 2>/dev/null)"
+      status="$(echo "$hv" | json 'd["status"]')"
+      [ "$status" = "found" ] && break
+      sleep 0.5
+    done
     if [ "$status" = "found" ]; then
       pass "$id: ホバー（$line 行 $col 桁）: $(echo "$hv" | json 'd["contents"].strip().splitlines()[0][:90]')"
     else
-      fail "$id: ホバーが出ない（status=$status）"
+      fail "$id: ホバーが出ない（status=${status}）"
     fi
     pid="$(server_field "$id" '["pid"]')"
     sleep 3
@@ -262,10 +274,10 @@ EOF
   stop_gui
 
   echo
-  echo "== ② visual-test lsp-servers（同じ 5 つ。波線の画面とホバーのカードの画面） =="
+  echo "== ② visual-test lsp-servers（同じ 6 つ。波線の画面とホバーのカードの画面） =="
   VCASES="$(echo "$CASES" | while IFS="$TAB" read -r id file line col; do
     [ -n "$id" ] || continue
-    [ "$id" = "yaml-language-server" ] && [ -z "$YAML_LS" ] && continue
+    [ "${id#vscode-}" != "$id" ] && [ -z "$WEB_LS" ] && continue
     [ "$id" = "dart" ] && [ -z "$DART_REAL" ] && continue
     printf '%s\t%s\t%s\n' "$file" "$((line - 1))" "$col"
   done)"

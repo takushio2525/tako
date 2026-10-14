@@ -1,4 +1,5 @@
-//! #1956 の e2e: 言語サーバの検出表の第 2 波（texlab / tombi / sourcekit-lsp / dart / yaml-language-server）
+//! #1956 の e2e: 言語サーバの検出表の第 2 波（texlab / tombi / sourcekit-lsp / dart /
+//! vscode-css-language-server / vscode-html-language-server）
 //!
 //! 1. **足した行の拡張子を編集モードで開くと、その行のサーバが表の languageId で開かれる**:
 //!    偽サーバ（`tako-lsp-fake`）の実プロセス。起動の方法（launcher）が受けた行の ID と、偽サーバに
@@ -41,7 +42,8 @@ const WAVE2: &[&str] = &[
     "tombi",
     "sourcekit-lsp",
     "dart",
-    "yaml-language-server",
+    "vscode-css-language-server",
+    "vscode-html-language-server",
 ];
 
 /// 1 件ぶんの置き場（スコープを抜けると消える = #1312）
@@ -178,8 +180,8 @@ fn 第2波の行は拡張子ごとに表の行と_language_id_で開かれる() 
         }
     }
     assert_eq!(
-        checked, 6,
-        "第 2 波の拡張子は 6 つ（tex / toml / swift / dart / yaml / yml）"
+        checked, 9,
+        "第 2 波の拡張子は 9 つ（tex / toml / swift / dart / css / scss / less / html / htm）"
     );
 }
 
@@ -374,7 +376,7 @@ fn launch_in_child(scratch: &Scratch, id: &str, bin: &std::path::Path) -> String
 
 /// 境界「PATH の版が古くて probe に失敗する」: 取れる行（texlab / tombi）は PATH の物を `--version` で
 /// 確かめ、成功で終わらなければ `Broken`（= 見つからないと同じに扱い、tako が取る側へ回る）。
-/// 確かめに通る物は `Found`。取れない行（yaml-language-server）は代わりが無いので確かめない
+/// 確かめに通る物は `Found`。取れない行（vscode-css-language-server）は代わりが無いので確かめない
 #[cfg(unix)]
 #[test]
 fn path_の古い版は確かめに落ちて信じない() {
@@ -389,7 +391,7 @@ fn path_の古い版は確かめに落ちて信じない() {
         "#!/bin/sh\necho \"error: unexpected argument '--version' found\" >&2\nexit 2\n";
     let fresh_body = "#!/bin/sh\necho \"x 9.9.9\"\nexit 0\n";
     for (dir, body) in [(&stale, stale_body), (&fresh, fresh_body)] {
-        for name in ["texlab", "tombi", "yaml-language-server"] {
+        for name in ["texlab", "tombi", "vscode-css-language-server"] {
             let path = dir.join(name);
             std::fs::write(&path, body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -407,7 +409,7 @@ fn path_の古い版は確かめに落ちて信じない() {
             "{id}: 確かめに通る物は使う: {got}"
         );
     }
-    let got = launch_in_child(&scratch, "yaml-language-server", &stale);
+    let got = launch_in_child(&scratch, "vscode-css-language-server", &stale);
     assert!(
         got.starts_with("Found"),
         "取れない行は確かめない（代わりが無い）: {got}"

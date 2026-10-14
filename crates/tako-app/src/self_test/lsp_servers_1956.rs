@@ -1,11 +1,13 @@
 //! visual-test `lsp-servers`（Issue #1956）: 検出表の第 2 波（texlab / tombi / sourcekit-lsp / dart /
-//! yaml-language-server）を**実のサーバ**で起こし、誤りの波線とホバーのカードが出た画面を落とす。
+//! vscode-css-language-server / vscode-html-language-server）を**実のサーバ**で起こし、誤りの波線と
+//! ホバーのカードが出た画面を落とす。
 //!
 //! 素材は `scripts/test-lsp-servers-1956.sh` が用意する（サーバの置き場・ログインシェルの PATH・誤りを
 //! 含むファイル）。`TAKO_1956_CASES` は 1 行 1 件 `<ファイル>\t<行>\t<桁>`（ホバーを置く位置。0 起点・
 //! 桁はバイト）。受け持つサーバは検出表から引く（言語名・サーバ名をここに書かない）。
 //!
-//! 1 件ごとに: ① 編集モードで開く → 稼働して読み込みが済む ② 診断が 1 件以上届く（波線。`<id>-diag.png`）
+//! 1 件ごとに: ① 編集モードで開く → 稼働して読み込みが済む ② 診断が 1 件以上、画面の写しまで届く
+//! （波線。`<id>-diag.png`）
 //! ③ 実 GUI のマウス経路でホバーのカードが出る（`<id>-hover.png`）。どれかが出なければ名指しの FAILED。
 //! 開いてから ① ② までの時間を `TAKO_VISUAL_PIXEL` に出す（起動時間の記録）。
 //! 単独実行は `TAKO_VISUAL_ONLY=lsp-servers`
@@ -26,6 +28,14 @@ fn dump(any: AnyWindowHandle, cx: &mut AsyncApp, name: &str) {
     if frame.save(&path).is_ok() {
         println!("TAKO_VISUAL_DUMP_FILE: {}", path.display());
     }
+}
+
+/// 画面が波線を描く元（編集セッションの診断の写し）の件数
+fn drawn(app: &TakoApp, pane: PaneId) -> usize {
+    app.preview_edits
+        .get(&pane)
+        .and_then(|edit| edit.diagnostics.as_ref())
+        .map_or(0, |d| d.items.len())
 }
 
 /// 1 件（ファイル・ホバーを置く行と桁）
@@ -120,19 +130,29 @@ pub(super) async fn lsp_servers_visual(
             wait_for_preview_maps(any, window, cx, pane, false).await,
             &format!("visual-test {LABEL} {id}: 行が描かれる"),
         );
-        // ① 稼働して読み込みが済む ② 診断が届く（状態で待つ。上限は初回の索引を見込んで 180 秒）
-        let path = case.path.clone();
+        // ① 稼働して読み込みが済む ② 診断が届く（状態で待つ。上限は初回の索引を見込んで 180 秒）。
+        // 診断と問い合わせは**エディタが持っているパス**で引く（`/tmp` と `/private/tmp` のように、
+        // 渡したパスと文書の URI が symlink の分だけ違うことがある）
+        let path = window
+            .update(cx, |app, _, _| {
+                app.preview_edits
+                    .get(&pane)
+                    .map(|edit| edit.buffer.path().to_path_buf())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| case.path.clone());
         let mut ready_ms = None;
         let mut diagnosed_ms = None;
         let mut last = String::new();
         while started.elapsed() < Duration::from_secs(180) {
             notify_and_draw(any, window, cx);
+            // 波線は manager の表ではなく、画面が持つ写し（`apply_lsp_diagnostics` が差し替える
+            // `edit.diagnostics`）から描く。写しに届いたのを待ってから撮る（表だけを見ると、
+            // 写しが差し替わる前のフレームを撮りうる = 実測で HTML の 1 枚がそうなった）
             let (server, count) = window
                 .update(cx, |app, _, _| {
-                    (
-                        app.lsp_document_server(pane),
-                        app.lsp.diagnostics_count(&path),
-                    )
+                    (app.lsp_document_server(pane), drawn(app, pane))
                 })
                 .unwrap_or((None, 0));
             if let Some(server) = &server {
@@ -154,11 +174,13 @@ pub(super) async fn lsp_servers_visual(
                 .timer(Duration::from_millis(50))
                 .await;
         }
-        let count = window
-            .update(cx, |app, _, _| app.lsp.diagnostics_count(&path))
-            .unwrap_or(0);
+        let (count, table) = window
+            .update(cx, |app, _, _| {
+                (drawn(app, pane), app.lsp.diagnostics_count(&path))
+            })
+            .unwrap_or((0, 0));
         println!(
-            "TAKO_VISUAL_PIXEL: {LABEL} id={id} ready_ms={ready_ms:?} diagnosed_ms={diagnosed_ms:?} diagnostics={count} {last}"
+            "TAKO_VISUAL_PIXEL: {LABEL} id={id} ready_ms={ready_ms:?} diagnosed_ms={diagnosed_ms:?} drawn={count} table={table} {last}"
         );
         check(
             ready_ms.is_some(),
@@ -175,29 +197,42 @@ pub(super) async fn lsp_servers_visual(
             .update(cx, |app, _, _| app.lsp.clone())
             .unwrap_or_else(|_| fail("visual-test lsp-servers: manager"));
         let (line, column) = (case.line, case.column);
-        let hover_path = case.path.clone();
         let asked = std::time::Instant::now();
-        let answer = cx
-            .background_executor()
-            .spawn(async move {
-                manager.hover(&tako_control::lsp::HoverRequest {
-                    path: hover_path,
-                    line,
-                    column,
-                    timeout: Duration::from_secs(60),
-                    document: None,
-                    superseding: false,
-                    open: true,
-                    ticket: None,
+        // 読み込みの直後は空で答えるサーバがある（スキーマ・索引が後から揃う）。
+        // 中身が出るまで 0.5 秒おきに問い直す（上限 15 秒。出ればすぐ抜ける）
+        let mut answer = Err(tako_control::lsp::HoverError::NotOpen);
+        let mut text = String::new();
+        for _ in 0..30 {
+            let manager = manager.clone();
+            let hover_path = path.clone();
+            answer = cx
+                .background_executor()
+                .spawn(async move {
+                    manager.hover(&tako_control::lsp::HoverRequest {
+                        path: hover_path,
+                        line,
+                        column,
+                        timeout: Duration::from_secs(60),
+                        document: None,
+                        superseding: false,
+                        open: true,
+                        ticket: None,
+                    })
                 })
-            })
-            .await;
-        let text = answer
-            .as_ref()
-            .ok()
-            .and_then(|a| a.content.as_ref())
-            .map(|c| c.value.clone())
-            .unwrap_or_default();
+                .await;
+            text = answer
+                .as_ref()
+                .ok()
+                .and_then(|a| a.content.as_ref())
+                .map(|c| c.value.clone())
+                .unwrap_or_default();
+            if !text.is_empty() {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+        }
         println!(
             "TAKO_VISUAL_PIXEL: {LABEL} id={id} hover={} chars={} in {}ms head={:?}",
             answer

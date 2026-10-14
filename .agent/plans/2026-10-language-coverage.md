@@ -404,7 +404,7 @@ open_plan 7・インデント 5）。
 | `.json5` / `.jsonc` → 色なし | JSON で塗る（コメント・末尾カンマの扱いを確認）。✅ #1953（`.jsonc` は JSON、`.json5` は実測で JavaScript へ変えた = §6.1） | 色の補い |
 | `.S` / `.s` → 色なし | 既存の `x86_64 Assembly` へ寄せてよいか（AVR / ARM の命令は x86 ではない）を見て判断。#1953 で**寄せない**と決めた（§6.1） | 色の補い |
 | `.ps1` / `.astro` → 色なし | two-face に構文が無い。構文を足すと構文セット（#815）とビルドに効くので、足す方法と実測を別に | 構文の追加 |
-| 言語サーバ 37 形式 | #1007 の「第 2 波」（Java / Go / …）。#1944 の自動取得と合わせて優先順を決める。✅ #1956 で 5 行（`.tex` `.toml` `.swift` `.dart` `.yaml` `.yml`）。比較・採った順・見送りの理由は §8 | 言語サーバ第 2 波 |
+| 言語サーバ 37 形式 | #1007 の「第 2 波」（Java / Go / …）。#1944 の自動取得と合わせて優先順を決める。✅ #1956 で 6 行（`.tex` `.toml` `.swift` `.dart` `.css` `.scss` `.less` `.html` `.htm`）。比較・採った順・見送りの理由は §8 | 言語サーバ第 2 波 |
 | Finder 24 形式・Windows 0 | #708 の「既定を奪わない」を守ったまま広げられるか（UTI の輸入宣言の可否）を lsregister で実測 | Finder / 関連付け |
 | Code Runner の空き（`.vue` `.svelte` `.astro` `.scss` `.toml` `.yaml` `.json5` `.ini` `.env` `Dockerfile` `.proto` `.graphql` `.h` `.hpp`） | **単体では走らせるものではない**ので今のまま（`.vue` 等は `package.json` の `npm run` を `tako:run:` で書く）。`.m` / `.pde` / `.S` は需要が出たら行を足す | なし |
 
@@ -468,13 +468,19 @@ open_plan 7・インデント 5）。
 
 ### 8.1 測り方
 
-候補ごとに、この PC（macOS 26.4・Apple Silicon）で実のサーバを 1 回ずつ起こした。使い捨ての LSP
-クライアント（node 標準ライブラリだけ。scratchpad に置き、リポジトリへは入れていない）で
-`initialize` → `didOpen` → 最初の診断を待つ → `textDocument/hover` → サーバの RSS を測り、
-`workspace/configuration` には tako と同じく **項目数ぶんの `null`** で答えた（`tako_control::lsp::server::default_reply`）。
-素材は誤りを 1 つ含むファイル（LaTeX は `\begin{itemize}` を `\end{enumerate}` で閉じる・TOML は値の無いキー・
-Swift / Dart は型の誤り・YAML は字下げの崩れ・CSS は閉じない括弧と綴りの誤った性質）。採った 5 行は
-tako 経由でも測った（§8.4。`scripts/test-lsp-servers-1956.sh`）。
+候補ごとに、この PC（macOS 26.4・Apple Silicon）で実のサーバを起こした。使い捨ての LSP クライアント
+（node 標準ライブラリだけ。scratchpad に置き、リポジトリへは入れていない）で `initialize` → `didOpen` →
+最初の診断を待つ → `textDocument/hover` → サーバの RSS を測った。素材は誤りを 1 つ含むファイル
+（LaTeX は `\begin{itemize}` を `\end{enumerate}` で閉じる・TOML は値の無いキー・Swift / Dart は型の誤り・
+CSS は閉じない括弧と綴りの誤った性質・HTML は `<style>` の中の値の無い性質・YAML は字下げの崩れ）。
+採った 6 行は tako 経由（隔離 GUI）でも測った（§8.4。`scripts/test-lsp-servers-1956.sh`）。
+
+**罠（測り直した）**: 1 回目は使い捨てのクライアントが `workspace.configuration` を**申告して** `null` で
+答えていた。tako の `initialize`（`tako_control::lsp::manager::initialize_params`）は申告しないので、
+サーバの振る舞いが変わる。CSS / HTML は申告して `null` で答えると検証が例外
+（`Cannot read properties of null (reading 'validProperties')`）で止まって診断 0 件、申告しなければ既定の
+設定で検証して出る。YAML は逆で、申告しないと設定を受け取らずスキーマ（SchemaStore）を組まないので
+ホバーが出ない（tako の隔離 GUI でも `status=none` を実測）。下の表は tako と同じ申告の値。
 
 ### 8.2 比較表
 
@@ -484,14 +490,14 @@ tako 経由でも測った（§8.4。`scripts/test-lsp-servers-1956.sh`）。
 | 形式 | 候補（版） | 入手経路 | 取得 | 常駐（RSS） | 初回（initialize / 最初の診断） | 誤りの波線 / ホバー（この PC） | Windows | 判断 |
 |---|---|---|---|---|---|---|---|---|
 | `.tex` | texlab 5.26.0 | brew `texlab` / scoop `texlab`（winget なし）/ GitHub Releases 10 MB | ○ digest あり・tar.gz / zip の中の 1 つ | 104.6 MB | 14 ms / 327 ms | ✓ `Mismatched environment` / ✓ `amsmath` の説明（CTAN） | ○ zip（README: VC++ 再頒布可能パッケージが要る場合あり） | **採る（1）** |
-| `.toml` | tombi 1.7.0 | brew `tombi` / winget `tombi-toml.tombi` / GitHub Releases 8 MB | ○ digest あり・tar.gz / zip の中の 1 つ | 19〜25 MB | 5 ms / 140〜223 ms | ✓ `expected value` / ✓ `edition` の説明（Cargo.toml。オフラインでも出る = 内蔵のスキーマ） | ○ zip | **採る（2）** |
+| `.toml` | tombi 1.7.0 | brew `tombi` / winget `tombi-toml.tombi` / GitHub Releases 8 MB | ○ digest あり・tar.gz / zip の中の 1 つ | 19〜25 MB | 5 ms / 140〜223 ms | ✓ `expected value` / ✓ `edition` の説明（Cargo.toml。SchemaStore へ問い合わせるが、届かなくても内蔵のスキーマで出る） | ○ zip | **採る（2）** |
 | `.toml` | taplo 0.10.0 | brew `taplo` / winget `tamasfe.taplo` / GitHub Releases 5 MB | ✗ asset の digest が null・チェックサムの添付も無い | 17.5 MB | 163 ms / 165 ms | ✓ / ✗ SchemaStore の目録を読めない（`data did not match any variant of untagged enum SchemaCatalog`）のでスキーマのホバーが出ない | ○ | 見送る（tombi を採る） |
 | `.swift` | sourcekit-lsp（Xcode 同梱） | `xcode-select --install` / winget `Swift.Toolchain` | —（道具に同梱。単体では動かない） | 23.0 MB | 110 ms / 1,483 ms | ✓ `Cannot convert value of type 'String' to specified type 'Int'` / ✓ `print` の宣言と doc | ○ Swift toolchain に同梱 | **採る（3）** |
-| `.dart` | `dart language-server`（Dart SDK 3.11.5。Flutter 同梱） | brew `dart-sdk` / winget `Google.DartSDK` | —（SDK ごとで 200 MB 超） | 171.1 MB | 218 ms / 679 ms | ✓ `A value of type 'String' can't be assigned …` / ✓ `print` の宣言と doc | ○ | **採る（4）** |
-| `.yaml` `.yml` | yaml-language-server 1.24.0 | npm `-g` | ✗ 依存 20 包み（展開 24 MB）・scoped の `@vscode/l10n` | 81.8〜112.8 MB | 220〜534 ms / 427〜961 ms | ✓ `All mapping items must start at the same column` / ✓ GitHub Workflow のスキーマの説明（SchemaStore から。届かなければホバーは出ず、波線は出る） | ○ npm | **採る（5）。取得は後** |
-| `.css` `.scss` `.less` | vscode-css-language-server（vscode-langservers-extracted 4.10.0） | npm `-g` | ✗ 依存 32 包み（展開 93 MB）・scoped を含む | 53〜85 MB | 132〜321 ms / — | ✗ **0 件**（`null` の設定で検証が例外 `Cannot read properties of null (reading 'validProperties')`。`{}` で答えると 3 件）/ ✓ | ○ | 見送る（tako の client 側の直しが先 = §8.5） |
-| `.html` `.htm` | vscode-html-language-server（同） | npm `-g` | ✗ 同 | 142〜156 MB | 236〜477 ms / — | ✗ **0 件**（同じ例外。`{}` なら埋め込みの CSS の誤り 1 件）/ ✓ `div` の説明 | ○ | 見送る（同） |
-| `.json` | vscode-json-language-server（同） | npm `-g` | ✗ 同 | 未実測 | — | — | — | 見送る（`file_type` に `.json` の行が無い = #1948 の番犬・スキーマの対応付けはクライアントが送る形） |
+| `.dart` | `dart language-server`（Dart SDK 3.11.5。Flutter 同梱） | brew `dart-sdk` / winget `Google.DartSDK` | —（SDK ごとで 200 MB 超） | 153〜171 MB | 218〜362 ms / 679〜858 ms | ✓ `A value of type 'String' can't be assigned …` / ✓ `print` の宣言と doc | ○ | **採る（4）** |
+| `.css` `.scss` `.less` | vscode-css-language-server（vscode-langservers-extracted 4.10.0） | npm `-g vscode-langservers-extracted` | ✗ 依存 32 包み（展開 93 MB・TypeScript 4 系・scoped の `@vscode/l10n`） | 85.6〜86.4 MB | 192〜388 ms / 701〜901 ms | ✓ `} expected` ほか 3 件 / ✓ `color` の説明（MDN。オフラインで出る） | ○ npm（`.cmd`） | **採る（5）。取得は後** |
+| `.html` `.htm` | vscode-html-language-server（同） | npm（同） | ✗ 同 | 155〜159 MB | 310〜418 ms / 817〜927 ms | ✓ `<style>` の中の `property value expected`（HTML の構造は検証しない）/ ✓ `div` の説明 | ○ npm（`.cmd`） | **採る（6）。取得は後** |
+| `.yaml` `.yml` | yaml-language-server 1.24.0 | npm `-g` | ✗ 依存 20 包み（展開 24 MB）・scoped の `@vscode/l10n` | 81.4 MB | 263 ms / 471 ms | ✓ `All mapping items must start at the same column` / ✗ **出ない**（設定を受け取らずスキーマを組まない。`initialized` も `Client doesn't support sending workspace folder change events` で失敗を記録） | ○ | 見送る（tako の client が設定を渡すのが先 = §8.5） |
+| `.json` | vscode-json-language-server（vscode-langservers-extracted） | npm `-g` | ✗ | 未実測 | — | — | — | 見送る（`file_type` に `.json` の行が無い = #1948 の番犬・スキーマの対応付けはクライアントが送る形） |
 | `.java` | jdtls | brew `jdtls`（winget なし） | ✗ Eclipse の配布 約 50 MB + JDK 21 が別に要る | 未実測 | — | この PC は JDK 11 だけ = 起こせない | △ | 見送る（実機で確かめられない・重い） |
 | `.go` | gopls | brew `gopls` / `go install golang.org/x/tools/gopls@latest` | ✗ 配布物が無い（`go install` だけ）。Go の道具が要る | 未実測 | — | この PC に Go が無い | ○ | 見送る（実機で確かめられない） |
 | `.kt` | kotlin-lsp（JetBrains・プレリリース）/ kotlin-language-server（非推奨） | 単体の zip（JVM） | ✗ JVM が要る | 未実測 | — | — | ○ | 見送る（重い・版が固まっていない） |
@@ -504,38 +510,59 @@ tako 経由でも測った（§8.4。`scripts/test-lsp-servers-1956.sh`）。
 
 ### 8.3 採った順の理由
 
-**需要（授業・上位）を、「入れたその日に波線とホバーの両方が出るか」で並べ替えた**。どの候補も行を足すこと
-自体は同じ手間なので、差は利用者側の手間と、この PC で受け入れ条件（波線とホバー）まで確かめられたかで決まる。
+**需要（授業・上位・Web）を、「入れたその日に波線とホバーの両方が出るか」で並べ替えた**。どの候補も行を
+足すこと自体は同じ手間なので、差は利用者側の手間と、この PC で受け入れ条件（波線とホバー）まで確かめられたかで決まる。
 
 1. **tako が取れる単体バイナリ**（texlab / tombi）: 未導入でも開いた時点で tako が取る = 何も入れずに出る。
    texlab はレポート（`.tex`）で授業の需要が大きい。TOML は taplo が最も使われているが、0.10.0 は
    配布元のハッシュが無く（取れない）、今の SchemaStore の目録を読めずホバーが出ないので、
    ハッシュがあり・内蔵のスキーマでオフラインでもホバーが出る tombi を採った
 2. **言語の道具に同梱**（sourcekit-lsp / dart）: Swift / Dart を書ける環境ならもう入っている = 行を足すだけで出る
-3. **利用者の npm で入れる**（yaml-language-server）: 導入コマンドが 1 行で、波線とホバーが出た。
+3. **利用者の npm で入れる**（CSS / HTML）: 導入コマンドが 1 行（2 行とも同じ包み）で、波線とホバーが出た。
    取るには #1944 の npm の口を広げる別の作業が要る（§8.5）
 
 見送ったものは「この PC で確かめられない」（Java / Go / Kotlin / C# / Zig / R / Julia / MATLAB）か
-「受け入れ条件を満たさない」（CSS / HTML = 波線が出ない・taplo = ホバーが出ない）か「行の追加では済まない」
+「受け入れ条件を満たさない」（YAML = ホバーが出ない・taplo = ホバーが出ない）か「行の追加では済まない」
 （JSON / Vue / Svelte / Astro）。
 
-### 8.4 tako 経由の実測（採った 5 行）
+### 8.4 tako 経由の実測（採った 6 行）
 
-`scripts/test-lsp-servers-1956.sh`（隔離 GUI。texlab / tombi は実の配布元から取る）の結果は PR #<未定> に貼る。
-TBD
+`bash scripts/test-lsp-servers-1956.sh`（隔離 GUI・一時 HOME・GUI の PATH は最小・ログインシェルの PATH に
+置いたのは node / dart / CSS と HTML のサーバだけ）。texlab / tombi は実の配布元（GitHub Releases）から取った。
+「開いてから」は `tako open` + `tako edit start` の直後から `tako lsp status` を 0.1 秒おきに見た値。
+常駐は読み込みが済んで 3 秒後のサーバの RSS。2 回目は visual-test `lsp-servers`（取得済み・同じ data dir）。
+
+| 行 | 出どころ | 開いてから（初回）: 状態の移り変わり | 最初の診断 | 常駐 | 2 回目の稼働 + 診断 |
+|---|---|---|---|---|---|
+| texlab | managed（取得 0.8 秒・10,154,621 バイト・置き場 14.6 MB） | 取得中 21 → 起動中 754 → 稼働 1,305 → 読み込み済み 1,487 ms | 約 1,670 ms | 98.1 MB | 380〜448 ms |
+| tombi | managed（取得 0.9 秒・7,594,215 バイト・置き場 16.9 MB） | 取得中 22 → 起動中 937 → 稼働 1,487 → 読み込み済み 1,671 ms | 約 1,844 ms | 24.5 MB | 83〜91 ms |
+| sourcekit-lsp | path（`/usr/bin/sourcekit-lsp`） | 稼働 23 → 読み込み済み 1,171 ms | 約 1,367 ms | 23.1 MB | 1,183 ms |
+| dart | path（Flutter 同梱の dart） | 起動中 22 → 稼働 201 → 読み込み済み 760 ms | 約 951 ms | 155.2 MB | 488〜492 ms |
+| vscode-css-language-server | path（npm の一時の prefix） | 起動中 22 → 稼働 393 → 読み込み済み 773 ms | 約 996 ms（3 件） | 85.5 MB | 753〜818 ms |
+| vscode-html-language-server | path（同） | 起動中 24 → 稼働 398 → 読み込み済み 969 ms | 約 1,157 ms | 154.8 MB | 831〜981 ms |
+
+- 6 つとも `tako lsp diagnostics` に誤りが載り、`tako lsp hover` が中身を返し、visual-test で波線と
+  ホバーのカードの両方を撮れた（波線は画面の写し `edit.diagnostics` に届いてから撮る。manager の表だけを
+  見て撮ると、写しが差し替わる前のフレームになる = 1 回目の HTML の 1 枚で実測）
+- `tako lsp servers` は 10 行を返し、MCP（`tako_lsp_server` の `list`）と同じ並び。起動直後の 1 回目
+  59 ms・2 回目 32 ms（10 行ぶんの解決を並べて引く `resolve_all` のまま）
+- 境界: 配布元に届かない（閉じたポートのミラー）と、GUI 無しの `tako lsp install` は network で失敗して
+  途中の物を残さず、GUI では未導入へ落ちて理由・次の一手・行の導入コマンドが読め、編集は続けられる。
+  PATH の texlab が `--version` で落ちる古い版でも、それを使わず tako の置き場の texlab で起きる
+  （`servers` の `broken` に古い方のパスと理由）。PATH に dart が無ければ未導入へ落ちて `brew install dart-sdk`
 
 ### 8.5 次に足すための作業（別 Issue）
 
-- **`workspace/configuration` に `null` ではなく `{}` で答える**（tako の client 側）: CSS / SCSS / Less / HTML の
-  サーバ（vscode-langservers-extracted）は `null` の設定で検証の途中で例外を投げ、診断を 1 件も送らない。
-  使い捨てのクライアントで `{}` に替えると CSS 3 件・HTML 1 件が出た。直せばこの 2 行は行の追加だけで入る
-  （他のサーバへの影響を測る必要がある）
-- **#1944 の npm の口を scoped の名前と依存の閉包へ広げる**: yaml-language-server（依存 20 包み・24 MB）を
-  tako が取れるようにする。vscode-langservers-extracted は依存 32 包み・展開 93 MB（TypeScript 4 系を含む）で、
-  100 MB の目安に近い
+- **YAML: tako の client から設定を渡す**: yaml-language-server は `workspace.configuration` の申告も
+  `workspace/didChangeConfiguration` も無いとスキーマを組まず、ホバーが出ない（波線は出る）。渡すなら
+  **`null` ではなく `{}`（か既定の設定）で答える**こと — 申告して `null` で答えると、CSS / HTML（同じ
+  vscode 系の実装）の検証が例外で止まる（§8.1）。どちらも client 側（`tako_control::lsp`）の変更で、
+  既存の 4 行への影響も測る必要がある
+- **#1944 の npm の口を scoped の名前と依存の閉包へ広げる**: CSS / HTML（依存 32 包み・展開 93 MB。
+  100 MB の目安に近い）と YAML（依存 20 包み・24 MB）を tako が取れるようにする
 - **取れない行の確かめの口**（今の `probe_args` は `Fetch::Binary` の中だけ）: macOS の `/usr/bin/clangd` と
-  `/usr/bin/sourcekit-lsp` は Xcode の代理（`xcrun` の shim）で、Command Line Tools の無い Mac で起こすと
-  導入のダイアログが出る。起こす前に `xcode-select -p` 相当で確かめれば「未導入 + `xcode-select --install`」へ落とせる。
-  R（包みの有無）も同じ口で確かめられる
+  `/usr/bin/sourcekit-lsp` は `xcrun` の代理（`/usr/bin/swift` と同じ 118,928 バイトの実行ファイル）で、
+  Command Line Tools の無い Mac では起こすと導入を促す（この PC は Xcode 入りで未実測）。起こす前に
+  `xcode-select -p` 相当で確かめれば「未導入 + `xcode-select --install`」へ落とせる。R（包みの有無）も同じ口
 - **Java（jdtls + JDK 21）・Go（gopls）**: 需要は大きいが、この PC に JDK 21 / Go が無く実機で確かめられない。
   jdtls は取るなら Eclipse の配布 約 50 MB + JRE が要る
