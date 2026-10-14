@@ -2915,7 +2915,7 @@ Windows（約 30 分）を回した。macOS のランナーは同時に数本し
   `skipping` で登録されるので、待ち側は完了・緑として数える
 - **Rust を丸ごと止めない**。`no_personal_data`（#927。リポジトリの全ファイルを走査）・
   `context_budget`・`docs_tool_inventory`・`fr_number_watchdog` などは docs / .agent の md を
-  **読んで検査する**ので、docs だけの PR では `docs-watchdogs` ジョブ（macOS）が
+  **読んで検査する**ので、`docs-watchdogs` ジョブ（ubuntu・判定に関係なく毎回）が
   `scripts/ci-docs-watchdogs.sh` でそれらだけを `cargo test --workspace --test …` する
   （`--workspace` は full の macOS ジョブと同じ feature の宇宙で組むため = #1383 の型）。
   一覧は手で持たず、毎回 `crates/*/tests/*.rs` を走査して拾う: コメント行を除いた本文に
@@ -2924,10 +2924,14 @@ Windows（約 30 分）を回した。macOS のランナーは同時に数本し
   ビルド済みなら 46 秒）。**docs や .agent を読む番犬を新しく書くときは、パスを文字列
   リテラルで書く**（関数で組み立てると拾えない）。錨（`no_personal_data` / `context_budget` /
   `docs_tool_inventory`）が拾えなければスクリプトが止まる = 走査の型が変わったら黙って外れない
-- `docs-watchdogs` を macOS で回すのは、full の macOS ジョブと同じ環境で走らせるため。
-  Linux は CI で一度も組んでいないので、ここだけ Linux にすると、コードの PR で Linux 向けの
-  コンパイルが壊れても気づけず、次の docs の PR が赤くなる。rust-cache は main でだけ保存する
-  （PR のスコープは他から読めず容量だけ食う = #1921 と同じ型）
+- `docs-watchdogs` を **ubuntu で毎回**回す理由: macOS に置くと docs の PR もコードの PR / main の
+  macOS ジョブの列に並ぶ（#2089 の検証で実測: macOS は実行中 5 本・待ち 15 本で、docs だけの
+  PR の番犬が 42 分 queued のまま 1 秒も走らなかった）。docs だけのときにしか走らせないと、
+  コードの PR が Linux 向けのビルドを壊しても気づけず、次の docs の PR が身に覚えの無い理由で
+  赤くなるので毎回走らせる。**結果として tako-control / tako-core（とその依存）は Linux でも
+  コンパイルできることが CI の条件になる**（Linux 対応そのものは引き続き「将来検討」。
+  macOS 専用の API は `cfg(target_os = "macos")` の内側に置き、`cfg(unix)` で包まない）。
+  rust-cache は main でだけ保存する（PR のスコープは他から読めず容量だけ食う = #1921 と同じ型）
 - **docs の検査（astro build・OG・内部リンク・SEO・転送と配信ヘッダ・追跡先の Issue・
   リリースノートのページ）は毎回走る `docs` ジョブ（ubuntu）にだけ置く**。macOS ジョブへ
   戻すと docs だけの PR で一緒に skip される

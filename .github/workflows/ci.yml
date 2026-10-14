@@ -7,8 +7,8 @@
 # docs だけの変更（docs/ と .agent/ の md）では macOS / Windows の Rust ジョブを skip する（#2084）。
 # 判定は先頭の `changes`（scripts/ci-change-scope.sh）。`paths-ignore` だとジョブそのものが
 # 「無い」扱いになり、scripts/wait-pr-checks.sh の「期待するチェック名が全部そろう」判定と
-# 噛み合わないので、`if:` で skip を「成功」として残す。docs の検査は `docs`（毎回）、
-# docs / .agent を読む Rust の番犬は `docs-watchdogs`（docs だけのときだけ）が受け持つ。
+# 噛み合わないので、`if:` で skip を「成功」として残す。docs の検査は `docs`（毎回・ubuntu）、
+# docs / .agent を読む Rust の番犬は `docs-watchdogs`（毎回・ubuntu）が受け持つ。
 # 仕組みと判定の境界は .agent/conventions.md「docs だけの変更で Rust の重いジョブを skip する」
 name: CI
 
@@ -118,13 +118,15 @@ jobs:
   # skip するが、`no_personal_data`（#927 = 個人情報の番犬。リポジトリの全ファイルを走査）・
   # `context_budget`・`docs_tool_inventory` などは docs / .agent の md を**読んで検査する**ので、
   # それらだけをここで走らせる。一覧は手で持たず scripts/ci-docs-watchdogs.sh が毎回拾う。
-  # macOS で走らせるのは full の macOS ジョブと同じ環境で回すため（Linux は CI で一度も
-  # 組んでいない = ここだけ Linux にすると、コードの PR で壊れても気づけず docs の PR が赤くなる）
+  # **ubuntu で、判定に関係なく毎回**走らせる:
+  #   - macOS に置くと docs の PR がコードの PR / main の macOS ジョブの列に並ぶ（#2089 の検証で
+  #     実測: macOS は実行中 5 本・待ち 15 本で、docs だけの PR の番犬が 42 分 queued のまま）
+  #   - 毎回走らせるのは「Linux で組めること」をコードの PR で守るため。docs だけのときにしか
+  #     走らせないと、コードの PR が Linux 向けのビルドを壊しても気づけず、次の docs の PR が
+  #     身に覚えの無い理由で赤くなる（コードの PR では macOS の full と重複するが数分で済む）
   docs-watchdogs:
-    name: docs を読む Rust の番犬（docs だけの変更のとき。#2084）
-    needs: changes
-    if: needs.changes.outputs.rust == 'false'
-    runs-on: macos-latest
+    name: docs / .agent を読む Rust の番犬（ubuntu。#2084）
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -146,7 +148,7 @@ jobs:
         shell: bash
         run: key=$(bash scripts/lib/cargo-root-manifest-key.sh) && echo "key=$key" >> "$GITHUB_OUTPUT"
       # PR ごとのキャッシュは保存しない（PR のスコープは他から読めず、容量だけ食う = #1921 と同じ型）。
-      # main の docs だけの push で保存したものを PR が復元する
+      # main の push で保存したものを PR が復元する
       - uses: Swatinem/rust-cache@v2
         with:
           key: manifest-${{ steps.cargo-root.outputs.key }}

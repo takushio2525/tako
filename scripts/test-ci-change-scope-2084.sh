@@ -13,7 +13,7 @@
 #      取りに行く・取れないとき / 想定外のイベントは走らせる側
 #   C. docs を読む番犬の拾い方（コメントだけの言及は拾わない・錨が拾えなければ止まる）
 #   D. ci.yml の配線（docs の検査は毎回走る docs ジョブにだけある・macOS / Windows は
-#      rust=true のときだけ・番犬ジョブは rust=false のときだけ）
+#      rust=true のときだけ・番犬ジョブは毎回 ubuntu で）
 #   E. 本物の ci.yml から scripts/wait-pr-checks.sh が導く期待名に新しいジョブが入る
 # 検出力: 判定・配線を壊した写しを作り、同じ検査が落ちることも確かめる
 set -uo pipefail
@@ -284,8 +284,10 @@ wiring_problems() {
     grep -qE '^    needs: changes[ \t]*$' <<<"${body}" || echo "${id}: needs: changes が無い"
     grep -qF "if: needs.changes.outputs.rust == 'true'" <<<"${body}" || echo "${id}: rust=true のときだけ走る if が無い"
   done
+  # docs を読む番犬は毎回・ubuntu（macOS の列に並ばない / Linux で組めることをコードの PR で守る）
   body="$(job_body "${yml}" docs-watchdogs)"
-  grep -qF "if: needs.changes.outputs.rust == 'false'" <<<"${body}" || echo "docs-watchdogs: rust=false のときだけ走る if が無い"
+  grep -qE '^    (if|needs):' <<<"${body}" && echo "docs-watchdogs: 判定で止まる（if / needs がある）"
+  grep -qE '^    runs-on: ubuntu-latest[ \t]*$' <<<"${body}" || echo "docs-watchdogs: ubuntu で走らない（macOS の列に並ぶ）"
   grep -qF 'bash scripts/ci-docs-watchdogs.sh' <<<"${body}" || echo "docs-watchdogs: ci-docs-watchdogs.sh を呼んでいない"
   body="$(job_body "${yml}" changes)"
   grep -qF 'rust: ${{ steps.scope.outputs.rust }}' <<<"${body}" || echo "changes: outputs.rust が無い"
@@ -332,12 +334,23 @@ sed 's/^    name: docs（ビルド + 検査）$/&\
 probs="$(wiring_problems "${TMP}/ci-docsif.yml")"
 assert_has "（注入）docs ジョブが判定で止まることを名指しする" "docs: 判定で止まる" "${probs}"
 
+# 番犬ジョブを macOS の docs だけのときへ戻す（#2089 の検証で 42 分 queued になった形）
+awk '
+  /^  docs-watchdogs:/ { in_dw = 1 }
+  /^  macos:/ { in_dw = 0 }
+  in_dw && /^    runs-on: ubuntu-latest/ { print "    needs: changes"; print "    if: needs.changes.outputs.rust == '"'"'false'"'"'"; print "    runs-on: macos-latest"; next }
+  { print }
+' "${CI_YML}" > "${TMP}/ci-dw-macos.yml"
+probs="$(wiring_problems "${TMP}/ci-dw-macos.yml")"
+assert_has "（注入）番犬ジョブが判定で止まることを名指しする" "docs-watchdogs: 判定で止まる" "${probs}"
+assert_has "（注入）番犬ジョブが macOS の列に並ぶことを名指しする" "docs-watchdogs: ubuntu で走らない" "${probs}"
+
 echo "== E: 本物の ci.yml から待ちスクリプトが導く期待名 =="
 mkdir -p "${TMP}/ghbin"
 printf '#!/usr/bin/env bash\necho "no checks reported on the '"'"'x'"'"' branch" >&2\nexit 1\n' > "${TMP}/ghbin/gh"
 chmod +x "${TMP}/ghbin/gh"
 out="$(PATH="${TMP}/ghbin:${PATH}" bash "${REPO_ROOT}/scripts/wait-pr-checks.sh" 2084 --timeout 0 --interval 1 2>&1)"
-for name in "変更範囲の判定（#2084）" "docs（ビルド + 検査）" "docs を読む Rust の番犬（docs だけの変更のとき。#2084）" \
+for name in "変更範囲の判定（#2084）" "docs（ビルド + 検査）" "docs / .agent を読む Rust の番犬（ubuntu。#2084）" \
   "macOS（build + lint + test）" "Windows（build + test スモーク）" "Cloudflare Pages"; do
   assert_has "期待名: ${name}" "期待: ${name}" "${out}"
 done
