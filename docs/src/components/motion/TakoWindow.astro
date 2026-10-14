@@ -26,6 +26,8 @@ interface Tab {
 	fx?: string;
 	/** 選択中（active）になる手順。active より優先 */
 	activeAt?: string;
+	/** 状態の点を手順で切り替える（[{ at: '!5', state: 'fail' }, { at: '5', state: 'idle' }]）。state より優先 */
+	states?: { at: string; state: TabState }[];
 }
 
 interface Props {
@@ -44,6 +46,8 @@ interface Props {
 	/** ステータスバーに「master · N workers」を出す手順（data-at の書き方） */
 	masterAt?: string;
 	workers?: number;
+	/** 右パネル（fleet）が開いている手順。ステータスバーの「tmux」（fleet の入口）が点き、狭い幅でも残る */
+	panelAt?: string;
 	/** 窓の高さ（em）。手順で高さが変わらないよう場面ごとに固定する */
 	height?: number;
 	class?: string;
@@ -60,6 +64,7 @@ const {
 	agent = 'claude',
 	masterAt,
 	workers = 2,
+	panelAt,
 	height = 25,
 	class: className,
 } = Astro.props;
@@ -106,7 +111,15 @@ const hasSidebar = Astro.slots.has('sidebar');
 							data-at={t.activeAt}
 							data-fx={t.activeAt ? 'state' : undefined}
 						>
-							<i class:list={['tk-dot', t.state && t.state !== 'idle' && `is-${t.state}`]} />
+							{t.states ? (
+								<span class="tk-dot-stack">
+									{t.states.map((s) => (
+										<i class:list={['tk-dot', s.state !== 'idle' && `is-${s.state}`]} data-at={s.at} data-fx="fade" />
+									))}
+								</span>
+							) : (
+								<i class:list={['tk-dot', t.state && t.state !== 'idle' && `is-${t.state}`]} />
+							)}
 							{t.label}
 						</span>
 					</span>
@@ -183,7 +196,14 @@ const hasSidebar = Astro.slots.has('sidebar');
 							<i />
 						</span>
 					</span>
-					<span class="tk-sb is-end is-mid">tmux</span>
+					{panelAt ? (
+						<span class="tk-sb is-end tk-sb-panel" data-at={panelAt} data-fx="state">
+							<Icon name="fleet" />
+							tmux
+						</span>
+					) : (
+						<span class="tk-sb is-end is-mid">tmux</span>
+					)}
 					<span class="tk-sb is-end">
 						<Icon name="branch" />
 						{branch}
@@ -194,3 +214,19 @@ const hasSidebar = Astro.slots.has('sidebar');
 	</div>
 	<slot name="overlay" />
 </div>
+
+<style is:global>
+	/* 手順で切り替わるタブの点（tabs[].states）。点を同じ場所に重ねる */
+	.tk-dot-stack {
+		display: inline-grid;
+		flex: none;
+	}
+	.tk-dot-stack > .tk-dot {
+		grid-area: 1 / 1;
+	}
+	/* ステータスバーの fleet の入口（panelAt）。開いている手順で点く */
+	.tk-sb-panel[data-fx~='state'].is-on {
+		color: var(--ui-accent);
+		background: var(--ui-tab);
+	}
+</style>

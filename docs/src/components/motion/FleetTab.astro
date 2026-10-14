@@ -1,0 +1,147 @@
+---
+/**
+ * fleet ビューのタブ枠 1 つ（#2056）。Fleet の中に置き、子に FleetRow を並べる。
+ * 見た目と出し分けの正本は crates/tako-app/src/right_panel.rs の render_tmux_view。
+ *
+ *   <FleetTab title="api" count={2} state="fail" collapsed="1-2" open="3+" active="4+"
+ *             chips={['idle', 'fail']} chipsAt="1-2" fail={1}
+ *             map={[{ x: 0, y: 0, w: 50, h: 100, n: 1 }, { x: 50, y: 0, w: 50, h: 100, n: 2, fail: true }]}>
+ *     <FleetRow n={1} label="claude" state="idle" />
+ *   </FleetTab>
+ *
+ * 実物の決まり（right_panel.rs）をそのまま props にしている:
+ * - collapsed: 見出しの ▸ / ▾（利用者が畳んだか）。true か data-at の書き方。既定は開いている（▾）
+ * - open: ミニマップとペイン行が見える手順。実物は「アクティブなタブ」か「畳んでいないタブ」で見える
+ * - chips / chipsAt: 畳んだ非アクティブのタブだけ、見出しにペインごとの状態の小さな帯（と「N fail」）が出る
+ * - active: アクティブなタブ（ACTIVE の札 + 枠の面）。true か data-at
+ * - state: 見出しの点（失敗 > 実行中 > 待機 の順で決まる集約色）。配列で手順ごとに切り替え
+ * - map: ミニレイアウトマップのセル（座標は %）。focus / fail は true か data-at
+ * - markAt: その手順で見出しが押された姿（輪）になる
+ */
+type St = 'running' | 'fail' | 'idle';
+interface StAt {
+	at: string;
+	state: St;
+}
+interface Cell {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+	n: number;
+	focus?: boolean | string;
+	fail?: boolean | string;
+}
+
+interface Props {
+	title: string;
+	count: number;
+	state: St | StAt[];
+	collapsed?: boolean | string;
+	open?: boolean | string;
+	active?: boolean | string;
+	chips?: St[];
+	chipsAt?: string;
+	fail?: number;
+	map?: Cell[];
+	markAt?: string;
+	at?: string;
+	fx?: string;
+}
+
+const {
+	title,
+	count,
+	state,
+	collapsed = false,
+	open = true,
+	active = false,
+	chips = [],
+	chipsAt,
+	fail = 0,
+	map,
+	markAt,
+	at,
+	fx,
+} = Astro.props;
+const states: { at?: string; state: St }[] = Array.isArray(state) ? state : [{ state }];
+/** true / false / data-at を、出す・出さない・手順で出す の 3 つに読む */
+const when = (v: boolean | string) => (typeof v === 'string' ? { show: true, at: v } : { show: v, at: undefined });
+const fold = when(collapsed);
+const body = when(open);
+const act = when(active);
+const fxOf = (spec: string | undefined, fx: string) => (spec ? fx : undefined);
+const dot = (s: St) => ['tk-dot', s !== 'idle' && `is-${s}`];
+---
+
+<div class="tk-ftab" data-at={at} data-fx={fx}>
+	{act.show && <span class="tk-ftab-active" data-at={act.at} data-fx={fxOf(act.at, 'fade')} />}
+	<div class="tk-ftab-head" data-at={markAt} data-fx={fxOf(markAt, 'mark')}>
+		{collapsed !== true && <span class="tk-ftab-head-bg" data-at={fold.at && `!${fold.at}`} data-fx={fxOf(fold.at, 'fade')} />}
+		<span class="tk-ftab-caret">
+			{fold.show && <span data-at={fold.at} data-fx={fxOf(fold.at, 'fade')}>▸</span>}
+			{collapsed !== true && <span data-at={fold.at && `!${fold.at}`} data-fx={fxOf(fold.at, 'fade')}>▾</span>}
+		</span>
+		<span class="tk-ftab-dots">
+			{states.map((s) => <i class:list={dot(s.state)} data-at={s.at} data-fx={fxOf(s.at, 'fade')} />)}
+		</span>
+		<span class="tk-ftab-title">{title}</span>
+		<span class="tk-ftab-count">{count}</span>
+		<span class="tk-ftab-side">
+			{
+				act.show && (
+					<span data-at={act.at} data-fx={fxOf(act.at, 'fade')}>
+						<span class="tk-ftab-badge">ACTIVE</span>
+					</span>
+				)
+			}
+			{
+				chips.length > 0 && (
+					<span data-at={chipsAt} data-fx={fxOf(chipsAt, 'fade')}>
+						<span class="tk-ftab-chips">
+							{chips.map((c) => (
+								<i class:list={{ [`is-${c}`]: c !== 'idle' }} />
+							))}
+							{fail > 0 && <span class="tk-ftab-fail">{fail} fail</span>}
+						</span>
+					</span>
+				)
+			}
+		</span>
+	</div>
+	{
+		body.show && (
+			<div data-at={body.at} data-fx={fxOf(body.at, 'unfold')}>
+				<div class="tk-ftab-body">
+					{map && (
+						<div class="tk-fmap">
+							{map.map((c) => (
+								<span
+									class="tk-fmap-cell"
+									style={`left: calc(${c.x}% + 1px); top: calc(${c.y}% + 1px); width: calc(${c.w}% - 2px); height: calc(${c.h}% - 2px)`}
+								>
+									{c.fail && (
+										<span
+											class="tk-fmap-ring is-fail"
+											data-at={typeof c.fail === 'string' ? c.fail : undefined}
+											data-fx={typeof c.fail === 'string' ? 'fade' : undefined}
+										/>
+									)}
+									{c.focus && (
+										<span
+											class="tk-fmap-ring is-focus"
+											data-at={typeof c.focus === 'string' ? c.focus : undefined}
+											data-fx={typeof c.focus === 'string' ? 'fade' : undefined}
+										/>
+									)}
+									<span class="tk-fmap-n">{c.n}</span>
+								</span>
+							))}
+						</div>
+					)}
+					<slot />
+				</div>
+			</div>
+		)
+	}
+</div>

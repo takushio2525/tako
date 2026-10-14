@@ -182,7 +182,7 @@ v6 のタイムラインは事故を避けるため、guimode の 2 区間だけ
 | 2 | テーマ / 表示モード / パネルがコマンドで切り替わる | `tako theme` / `tako ui-mode` / `tako panel`（`tako --help`。収録で実演） |
 | 3 | Homebrew 1 行でアプリと CLI が入る。zip 手動も可 | `README.md`「インストール」/ `docs/.../getting-started/index.md`「1. インストール」 |
 | 3 | Claude 未導入でも `tako setup` から始められる（インストール → PATH → ログインの 3 段。実行前に計画を表示） | `AGENTS.md` コマンド表「自動セットアップ」（#868 / #1057）/ `tako setup bootstrap install --dry-run`（収録で実演） |
-| 3 | 認証済み CLI が 1 つなら質問ゼロ。claude / codex / agy を検出、プラン別プロファイル生成、MCP 登録 | `docs/.../getting-started/index.md`「3. tako setup」/ `docs/.../getting-started/quickstart.md` |
+| 3 | 認証済み CLI が 1 つなら質問ゼロ。claude / codex / agy を検出、プラン別プロファイル生成、MCP 登録 | `docs/.../getting-started/index.mdx`「3. tako setup」/ `docs/.../getting-started/quickstart.mdx` |
 | 3 | 検出後に対話アシスタントが自動起動。現状を読んでから答え、反映は同意した項目だけ | `crates/tako-cli/src/setup.rs`（`launch_setup_agent`）/ `resources/setup/system-prompt.md`（#470 台本の「③ setup」節に精査記録） |
 | 4 | Cmd+D / Cmd+Shift+D の分割、境界ドラッグ、ペイン並べ替え | `docs/.../features/tabs-and-panes.md` |
 | 4 | Cmd+B でファイルツリー。タブ内の cwd を自動でワークスペース表示 | `docs/.../features/file-preview.md`「ファイルツリー」 |

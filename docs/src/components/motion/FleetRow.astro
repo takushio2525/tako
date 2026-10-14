@@ -1,0 +1,45 @@
+---
+/**
+ * fleet ビューのペイン行 1 つ（#2056）。FleetTab の子に置く。実物は行のクリックでそのペインへ飛ぶ。
+ *
+ *   <FleetRow n={2} label="pytest" state={[{ at: '!5', state: 'fail' }, { at: '5', state: 'idle' }]} focus="4+" />
+ *
+ * - 番号はタブ内の表示順（1 始まり）。番号の札と点は状態の色（running 青 / fail 赤 / idle 緑）
+ * - focus: そのタブでフォーカス中のペイン（左端のアクセントの帯）。true か data-at
+ * - tag: master = ORCH / worker = WORK の札
+ * - markAt: その手順で行が押された姿（輪）になる
+ */
+type St = 'running' | 'fail' | 'idle';
+interface StAt {
+	at: string;
+	state: St;
+}
+
+interface Props {
+	n: number;
+	label: string;
+	state: St | StAt[];
+	focus?: boolean | string;
+	tag?: 'ORCH' | 'WORK';
+	markAt?: string;
+}
+
+const { n, label, state, focus = false, tag, markAt } = Astro.props;
+const states: { at?: string; state: St }[] = Array.isArray(state) ? state : [{ state }];
+---
+
+<div class="tk-frow" data-at={markAt} data-fx={markAt ? 'mark' : undefined}>
+	{focus && <span class="tk-frow-focus" data-at={typeof focus === 'string' ? focus : undefined} data-fx="fade" />}
+	<span class="tk-frow-sts">
+		{
+			states.map((s) => (
+				<span class:list={['tk-frow-st', s.state !== 'idle' && `is-${s.state}`]} data-at={s.at} data-fx={s.at ? 'fade' : undefined}>
+					<span class="tk-frow-n">{n}</span>
+					<i class="tk-dot" />
+				</span>
+			))
+		}
+	</span>
+	<span class="tk-frow-label">{label}</span>
+	{tag && <span class:list={['tk-frow-tag', { 'is-orch': tag === 'ORCH' }]}>{tag}</span>}
+</div>

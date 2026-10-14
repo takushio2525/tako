@@ -1,0 +1,361 @@
+---
+/**
+ * 右パネルの fleet ビュー（全タブのペイン一覧。FR-2.16.6。#2056）。RightPanel の中に置く。
+ * 見た目の正本は crates/tako-app/src/right_panel.rs の render_tmux_view（GUI 上の名前は fleet）。
+ *
+ *   <RightPanel slot="right" active="fleet">
+ *     <Fleet summary={{ running: 3, failed: 1, idle: 1 }}>
+ *       <FleetTab title="my-app" count={2} state="running" active map={[…]}>
+ *         <FleetRow n={1} label="claude" state="running" focus />
+ *       </FleetTab>
+ *       <FleetTab title="api" count={2} state="fail" collapsed open={false} chips={['idle', 'fail']} fail={1} />
+ *     </Fleet>
+ *   </RightPanel>
+ *
+ * - summary に配列を渡すと手順で数が切り替わる: [{ at: '!5', running: 3, failed: 1, idle: 1 }, { at: '5', … }]
+ * - 状態は running（青）/ fail（赤）/ idle（緑）。色は tako 本体の theme（accent / red / green）
+ */
+interface Count {
+	running: number;
+	failed: number;
+	idle: number;
+}
+interface CountAt extends Count {
+	at: string;
+}
+
+interface Props {
+	summary: Count | CountAt[];
+}
+
+const { summary } = Astro.props;
+const sums: (Count & { at?: string })[] = Array.isArray(summary) ? summary : [summary];
+---
+
+<div class="tk-fleet">
+	<div class="tk-fleet-sum">
+		{
+			sums.map((s) => (
+				<span class="tk-fleet-sum-v" data-at={s.at} data-fx={s.at ? 'fade' : undefined}>
+					<span>
+						<i class="tk-dot is-running" />
+						{s.running} running
+					</span>
+					<span class:list={{ 'is-bad': s.failed > 0 }}>
+						<i class="tk-dot is-fail" />
+						{s.failed} failed
+					</span>
+					<span>
+						<i class="tk-dot" />
+						{s.idle} idle
+					</span>
+				</span>
+			))
+		}
+	</div>
+	<div class="tk-fleet-ws">
+		<b>WORKSPACE</b>
+		<span class="tk-fleet-legend">
+			<span><i class="tk-dot is-running" />run</span>
+			<span><i class="tk-dot is-fail" />fail</span>
+			<span><i class="tk-dot" />idle</span>
+		</span>
+	</div>
+	<slot />
+</div>
+
+<style is:global>
+	.tk-fleet {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5em;
+		min-height: 0;
+	}
+	.tk-fleet-sum {
+		display: grid;
+		padding: 0.1em 0.3em 0;
+	}
+	.tk-fleet-sum-v {
+		grid-area: 1 / 1;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.2em 0.9em;
+		color: var(--ui-fg3);
+		font-size: 0.92em;
+	}
+	.tk-fleet-sum-v > span {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4em;
+		white-space: nowrap;
+	}
+	.tk-fleet-sum-v > .is-bad {
+		color: var(--ui-red);
+		font-weight: 700;
+	}
+	.tk-fleet-ws {
+		display: flex;
+		align-items: center;
+		gap: 0.6em;
+		color: var(--ui-muted);
+		font-size: 0.86em;
+		white-space: nowrap;
+		overflow: hidden;
+	}
+	.tk-fleet-ws b {
+		letter-spacing: 0.04em;
+	}
+	.tk-fleet-legend {
+		margin-left: auto;
+		display: inline-flex;
+		gap: 0.6em;
+		font-size: 0.9em;
+	}
+	.tk-fleet-legend > span {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25em;
+	}
+	.tk-fleet-legend .tk-dot {
+		width: 0.5em;
+		height: 0.5em;
+	}
+	@container tkright (max-width: 17em) {
+		.tk-fleet-legend {
+			display: none;
+		}
+	}
+
+	/* タブ枠（タブ名ラベル付きの四角枠） */
+	.tk-ftab {
+		position: relative;
+		flex: none;
+		display: flex;
+		flex-direction: column;
+		gap: 0.3em;
+		padding: 0.5em;
+		border-radius: 9px;
+		border: 1px solid var(--ui-line-heavy);
+		background: #1b1c28;
+	}
+	/* アクティブなタブの枠（面 + 内側のアクセントの輪）。手順で付け外しできるよう別の層で描く */
+	.tk-ftab-active {
+		position: absolute;
+		inset: -1px;
+		border-radius: 9px;
+		background: var(--ui-s1);
+		box-shadow: inset 0 0 0 1px rgb(137 180 250 / 0.18);
+		border: 1px solid var(--ui-line-heavy);
+		pointer-events: none;
+	}
+	.tk-ftab > :not(.tk-ftab-active) {
+		position: relative;
+	}
+	.tk-ftab-head {
+		display: flex;
+		align-items: center;
+		gap: 0.45em;
+		padding: 0.15em 0.3em;
+		border-radius: 4px;
+		white-space: nowrap;
+		min-width: 0;
+	}
+	.tk-ftab-head-bg {
+		position: absolute;
+		inset: 0;
+		border-radius: 4px;
+		background: rgb(137 180 250 / 0.08);
+	}
+	.tk-ftab-head > * {
+		position: relative;
+	}
+	.tk-ftab-caret {
+		display: inline-grid;
+		color: var(--ui-muted);
+		width: 0.8em;
+	}
+	.tk-ftab-caret > span,
+	.tk-ftab-dots > i {
+		grid-area: 1 / 1;
+	}
+	.tk-ftab-dots {
+		display: inline-grid;
+	}
+	.tk-ftab-dots .tk-dot {
+		width: 0.62em;
+		height: 0.62em;
+		box-shadow: 0 0 4px currentColor;
+	}
+	.tk-ftab-title {
+		font-weight: 700;
+		color: var(--ui-fg2);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		min-width: 0;
+	}
+	.tk-ftab-count {
+		color: var(--ui-muted);
+		font-size: 0.9em;
+	}
+	.tk-ftab-badge {
+		font-size: 0.78em;
+		font-weight: 700;
+		padding: 0.1em 0.45em;
+		border-radius: 4px;
+		color: var(--ui-accent);
+		background: rgb(137 180 250 / 0.14);
+	}
+	.tk-ftab-chips {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.2em;
+	}
+	.tk-ftab-chips i {
+		display: inline-block;
+		width: 0.7em;
+		height: 0.33em;
+		border-radius: 1px;
+		background: var(--ui-green);
+	}
+	.tk-ftab-chips i.is-running {
+		background: var(--ui-accent);
+	}
+	.tk-ftab-chips i.is-fail {
+		background: var(--ui-red);
+	}
+	.tk-ftab-fail {
+		margin-left: 0.3em;
+		font-size: 0.8em;
+		font-weight: 700;
+		color: var(--ui-red);
+	}
+	.tk-ftab-side {
+		display: inline-grid;
+		margin-left: auto;
+	}
+	.tk-ftab-side > * {
+		grid-area: 1 / 1;
+		justify-self: end;
+		display: inline-flex;
+		align-items: center;
+	}
+	.tk-ftab-body {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2em;
+	}
+
+	/* ミニレイアウトマップ（ペインの配置を小さな矩形で） */
+	.tk-fmap {
+		position: relative;
+		width: 6.6em;
+		height: 4.6em;
+		margin: 0.1em auto 0.25em;
+		border-radius: 6px;
+		background: var(--ui-crust);
+		border: 1px solid var(--ui-line);
+		overflow: hidden;
+		flex: none;
+	}
+	.tk-fmap-cell {
+		position: absolute;
+		display: grid;
+		place-items: center;
+		border-radius: 4px;
+		border: 1px solid var(--ui-line-heavy);
+		background: var(--ui-s1);
+		color: var(--ui-muted);
+		font-size: 0.85em;
+		font-weight: 700;
+	}
+	/* セルの枠の色（失敗 = 赤 / フォーカス = アクセント）。手順で付け外しできるよう別の層で描く */
+	.tk-fmap-ring {
+		position: absolute;
+		inset: -1px;
+		border-radius: 4px;
+		border: 1px solid var(--ui-accent);
+		box-shadow: 0 0 4px rgb(137 180 250 / 0.4);
+	}
+	.tk-fmap-ring.is-fail {
+		border-color: var(--ui-red);
+		box-shadow: 0 0 4px rgb(243 139 168 / 0.4);
+	}
+	.tk-fmap-n {
+		position: relative;
+	}
+
+	/* ペイン行 */
+	.tk-frow {
+		position: relative;
+		display: flex;
+		align-items: center;
+		gap: 0.4em;
+		padding: 0.15em 0.3em;
+		border-radius: 4px;
+		white-space: nowrap;
+		min-width: 0;
+		--c: var(--ui-green);
+	}
+	.tk-frow-focus {
+		position: absolute;
+		inset: 0;
+		border-radius: 4px;
+		background: rgb(137 180 250 / 0.1);
+		box-shadow: inset 2px 0 0 var(--ui-accent);
+	}
+	.tk-frow > :not(.tk-frow-focus) {
+		position: relative;
+	}
+	.tk-frow-st {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4em;
+	}
+	.tk-frow-sts {
+		display: inline-grid;
+	}
+	.tk-frow-sts > .tk-frow-st {
+		grid-area: 1 / 1;
+	}
+	.tk-frow-n {
+		display: inline-grid;
+		place-items: center;
+		width: 1.4em;
+		height: 1.4em;
+		border-radius: 4px;
+		font-size: 0.86em;
+		font-weight: 700;
+		color: var(--c);
+		background: color-mix(in srgb, var(--c) 20%, transparent);
+	}
+	.tk-frow-st .tk-dot {
+		background: var(--c);
+		box-shadow: 0 0 3px color-mix(in srgb, var(--c) 40%, transparent);
+	}
+	.tk-frow-st.is-running {
+		--c: var(--ui-accent);
+	}
+	.tk-frow-st.is-fail {
+		--c: var(--ui-red);
+	}
+	.tk-frow-label {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		font-weight: 600;
+		color: var(--ui-fg);
+	}
+	.tk-frow-tag {
+		font-size: 0.72em;
+		font-weight: 700;
+		padding: 0.1em 0.42em;
+		border-radius: 4px;
+		color: var(--ui-teal);
+		background: rgb(148 226 213 / 0.14);
+	}
+	.tk-frow-tag.is-orch {
+		color: var(--ui-accent);
+		background: rgb(137 180 250 / 0.14);
+	}
+</style>

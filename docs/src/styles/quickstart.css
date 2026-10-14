@@ -1,0 +1,198 @@
+/*
+ * クイックスタート（getting-started/quickstart。#2056）の場面だけで使う見た目。
+ * 共有の部品（tako-ui.css / motion.css）は変えず、ここで足す。
+ */
+
+/* ターミナルの出力が下から積まれて、古い行が上へ流れて消える（手順で増える行は高さ 0 から開く） */
+.tk-qs-log {
+	display: flex;
+	flex-direction: column;
+	justify-content: flex-end;
+	height: 100%;
+	overflow: hidden;
+}
+[data-motion] .tk-qs-log > [data-at] {
+	max-height: 4.8em;
+	overflow: hidden;
+	transition-property: opacity, transform, max-height, min-height;
+	transition-duration: 0.4s, 0.5s, 0.45s, 0.45s;
+	transition-timing-function: var(--tako-ease);
+}
+[data-motion] .tk-qs-log > [data-at]:not(.is-on) {
+	max-height: 0;
+	min-height: 0;
+}
+/* 「残り」の行（人が次にやること）を薄い黄色で目立たせる */
+.tk-qs-hl {
+	background: rgb(249 226 175 / 0.08);
+	box-shadow: inset 2px 0 0 rgb(249 226 175 / 0.6);
+	padding-left: 0.4em;
+}
+
+/* 手順 5（右へ広げる）で 1 番のペインだけ幅が増える */
+.tk-pane.tk-qs-widen {
+	transition: flex-grow 0.6s var(--tako-ease);
+}
+[data-step='5'] .tk-pane.tk-qs-widen {
+	flex-grow: 1.7;
+}
+
+/* Web ビューのペインの中身（架空のアプリの画面） */
+.tk-qs-web {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	background: #f4f4f7;
+	color: #2a2b3c;
+	font-family: var(--ui-sys);
+}
+.tk-qs-web-bar {
+	padding: 0.35em 0.7em;
+	background: #e4e5ec;
+	color: #5c5f77;
+	font-size: 0.85em;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.tk-qs-web-page {
+	display: flex;
+	flex-direction: column;
+	gap: 0.6em;
+	padding: 1em 0.9em;
+}
+.tk-qs-web-h {
+	font-size: 1.35em;
+	font-weight: 800;
+}
+.tk-qs-web-line {
+	height: 0.5em;
+	border-radius: 99px;
+	background: #d5d7e0;
+}
+.tk-qs-web-line.is-short {
+	width: 60%;
+}
+.tk-qs-web-btn {
+	align-self: flex-start;
+	margin-top: 0.3em;
+	padding: 0.35em 1em;
+	border-radius: 6px;
+	background: #1e66f5;
+	color: #fff;
+	font-weight: 700;
+}
+
+/* 右パネルを引き出しのように右から開く（開くまでは幅 0 で、本体が全幅を使う） */
+.tk-qs-drawer {
+	flex: none;
+	display: flex;
+	justify-content: flex-end;
+	width: min(42cqi, 21em);
+	overflow: hidden;
+}
+.tk-qs-drawer > .tk-right {
+	flex: none;
+	width: min(42cqi, 21em);
+	max-width: none;
+}
+@container tkframe (max-width: 30rem) {
+	.tk-qs-drawer,
+	.tk-qs-drawer > .tk-right {
+		width: 58cqi;
+	}
+}
+[data-motion] .tk-qs-drawer[data-at] {
+	transition-property: opacity, width;
+	transition-duration: 0.3s, 0.65s;
+	transition-timing-function: var(--tako-ease);
+}
+[data-motion] .tk-qs-drawer[data-at]:not(.is-on) {
+	width: 0;
+	transform: none;
+}
+
+/* 冒頭の道のり（4 つの場面への入口） */
+.tk-qs-route {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: var(--tako-space-3);
+	margin: var(--tako-space-6) 0 0 !important;
+	padding: 0 !important;
+	list-style: none;
+	counter-reset: none;
+}
+.tk-qs-route li {
+	margin: 0 !important;
+	padding: 0 !important;
+}
+.tk-qs-route li::before {
+	content: none !important;
+}
+.tk-qs-route a {
+	position: relative;
+	display: grid;
+	grid-template-columns: auto 1fr;
+	grid-template-rows: auto auto;
+	column-gap: 0.6rem;
+	row-gap: 0.15rem;
+	align-items: center;
+	height: 100%;
+	padding: 0.85rem 0.9rem;
+	border-radius: var(--tako-radius-md);
+	border: 1px solid var(--tako-border);
+	background: var(--tako-card);
+	color: var(--tako-ink);
+	text-decoration: none;
+	box-shadow: var(--tako-shadow-sm);
+	transition:
+		border-color 0.2s var(--tako-ease-soft),
+		transform 0.2s var(--tako-ease-soft);
+}
+.tk-qs-route a:hover {
+	border-color: var(--tako-accent-line);
+	transform: translateY(-1px);
+}
+.tk-qs-route-n {
+	position: absolute;
+	top: 0.55rem;
+	right: 0.7rem;
+	font-size: 0.72rem;
+	font-weight: 700;
+	color: var(--tako-ink-subtle);
+}
+.tk-qs-route-ic {
+	grid-row: 1 / span 2;
+	display: inline-grid;
+	place-items: center;
+	width: 2.1rem;
+	height: 2.1rem;
+	border-radius: 10px;
+	color: var(--tako-accent);
+	background: var(--tako-accent-soft);
+}
+.tk-qs-route-ic .tk-ic {
+	width: 1.1rem;
+	height: 1.1rem;
+}
+.tk-qs-route-title {
+	font-weight: 700;
+	font-size: 0.95rem;
+	line-height: 1.35;
+}
+.tk-qs-route-text {
+	font-size: 0.78rem;
+	line-height: 1.45;
+	color: var(--tako-ink-muted);
+}
+@media (max-width: 60rem) {
+	.tk-qs-route {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+@media (max-width: 26rem) {
+	.tk-qs-route {
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--tako-space-2);
+	}
+}

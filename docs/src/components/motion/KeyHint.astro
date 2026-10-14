@@ -1,0 +1,102 @@
+---
+/**
+ * いま押したキーの表示（#2056）。窓の上（slot="overlay"）に置き、その手順で押したキーを
+ * macOS と Windows で並べて見せる。同じ場所に何枚重ねてもよい（手順ごとに入れ替わる）。
+ *
+ *   <KeyHint slot="overlay" at="2" label="右に分割" mac="⌘ D" win="Ctrl Shift D" />
+ *
+ * キーの正本は crates/tako-app/src/keybindings.rs（macOS = base_bindings、Windows = non_macos_bindings）。
+ * Windows のキーを ⌘ → Ctrl の置き換えで書かない（分割は Ctrl+D ではなく Ctrl+Shift+D）。
+ */
+interface Props {
+	/** 何をするキーか（短く） */
+	label: string;
+	/** macOS のキー（空白区切り。例: "⌘ D"） */
+	mac: string;
+	/** Windows のキー（空白区切り。例: "Ctrl Shift D"） */
+	win: string;
+	/** 出す手順（data-at の書き方） */
+	at?: string;
+}
+
+const { label, mac, win, at } = Astro.props;
+const keys = (s: string) => s.trim().split(/\s+/);
+---
+
+<span class="tk-keyhint" data-at={at} data-fx={at ? 'pop' : undefined}>
+	<span class="tk-keyhint-label">{label}</span>
+	<span class="tk-keyhint-os">
+		<span class="tk-keyhint-name">macOS</span>
+		{keys(mac).map((k) => <kbd>{k}</kbd>)}
+	</span>
+	<span class="tk-keyhint-os">
+		<span class="tk-keyhint-name">Windows</span>
+		{keys(win).map((k) => <kbd>{k}</kbd>)}
+	</span>
+</span>
+
+<style is:global>
+	/* 窓の下寄り・中央に浮かぶ札。中央寄せに transform を使わない（出し入れの効果が transform を使うため） */
+	.tk-keyhint {
+		position: absolute;
+		z-index: 4;
+		left: 0;
+		right: 0;
+		bottom: 3.4em;
+		margin-inline: auto;
+		width: max-content;
+		max-width: calc(100% - 1.2em);
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: center;
+		gap: 0.35em 0.9em;
+		padding: 0.5em 0.85em;
+		border-radius: 10px;
+		background: rgb(17 17 27 / 0.92);
+		border: 1px solid var(--ui-line-heavy);
+		box-shadow: 0 14px 30px -12px rgb(0 0 0 / 0.7);
+		color: var(--ui-fg2);
+		font-family: var(--ui-sys);
+		font-size: 1.05em;
+		pointer-events: none;
+	}
+	.tk-keyhint-label {
+		font-weight: 700;
+		color: var(--ui-fg);
+	}
+	.tk-keyhint-os {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25em;
+		white-space: nowrap;
+	}
+	.tk-keyhint-name {
+		margin-right: 0.2em;
+		font-size: 0.82em;
+		color: var(--ui-muted);
+	}
+	.tk-keyhint kbd {
+		display: inline-grid;
+		place-items: center;
+		min-width: 1.7em;
+		height: 1.7em;
+		padding: 0 0.4em;
+		border-radius: 5px;
+		border: 1px solid var(--ui-line-heavy);
+		border-bottom-width: 2px;
+		background: var(--ui-s2);
+		color: var(--ui-fg);
+		font-family: var(--ui-font);
+		font-size: 0.9em;
+		font-weight: 700;
+		line-height: 1;
+	}
+	@container tkframe (max-width: 25rem) {
+		.tk-keyhint {
+			font-size: 0.92em;
+			bottom: 3em;
+			padding: 0.45em 0.7em;
+		}
+	}
+</style>

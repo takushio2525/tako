@@ -1,0 +1,31 @@
+---
+/**
+ * クイックスタートの冒頭の道のり（4 つの場面への入口。#2056）。各項目はページ内の場面へ飛ぶ。
+ */
+import Icon from '../motion/Icon.astro';
+import '../../styles/quickstart.css';
+
+const stops = [
+	{ id: 'setup', icon: 'package', title: 'セットアップ', text: 'ボタン 1 つ。揃っていれば質問なし' },
+	{ id: 'panes', icon: 'columns', title: 'タブとペイン', text: '分割・移動・大きさをキーで' },
+	{ id: 'ask-ai', icon: 'chat', title: 'AI に頼む', text: '隣のペインで dev サーバー' },
+	{ id: 'fleet', icon: 'fleet', title: '見渡して任せる', text: '全部のタブを右パネルで' },
+] as const;
+---
+
+<ol class="tk-qs-route not-content">
+	{
+		stops.map((s, i) => (
+			<li>
+				<a href={`#${s.id}`}>
+					<span class="tk-qs-route-n">{i + 1}</span>
+					<span class="tk-qs-route-ic">
+						<Icon name={s.icon} />
+					</span>
+					<span class="tk-qs-route-title">{s.title}</span>
+					<span class="tk-qs-route-text">{s.text}</span>
+				</a>
+			</li>
+		))
+	}
+</ol>

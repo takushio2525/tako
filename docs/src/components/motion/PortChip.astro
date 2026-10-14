@@ -1,0 +1,68 @@
+---
+/**
+ * ポート検知のチップ（FR-2.4.3。#2056）。ペインの中（.tk-pane-body の直下）に置くと、
+ * 実物と同じくペインの下端・左寄せに浮かぶ。文言は crates/tako-app/src/ui_text/ports.rs、
+ * 見た目は crates/tako-app/src/main.rs の port-chip（タブバーの地 + アクセントの 1px 枠）。
+ *
+ *   <PortChip port={5173} process="node" at="3+" pressAt="4" />
+ *
+ * 承諾（「ブラウザで開く」）したときだけ開く。勝手に開いたり分割したりはしない（設計原則 3）。
+ */
+import Icon from './Icon.astro';
+
+interface Props {
+	port: number;
+	/** listen しているプロセス名（無ければ「localhost:N が listen 中」） */
+	process?: string;
+	at?: string;
+	/** 「ブラウザで開く」が押された姿になる手順 */
+	pressAt?: string;
+}
+
+const { port, process, at, pressAt } = Astro.props;
+const label = process ? `localhost:${port}（${process}）が listen 中` : `localhost:${port} が listen 中`;
+---
+
+<span class="tk-portchip" data-at={at}>
+	<span class="tk-portchip-label">{label}</span>
+	<span class="tk-portchip-open" data-at={pressAt} data-fx={pressAt ? 'mark' : undefined}>ブラウザで開く</span>
+	<span class="tk-portchip-x"><Icon name="x" /></span>
+</span>
+
+<style is:global>
+	.tk-portchip {
+		position: absolute;
+		z-index: 3;
+		left: 0.65em;
+		bottom: 0.35em;
+		max-width: calc(100% - 1.3em);
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.2em 0.7em;
+		padding: 0.3em 0.6em;
+		border-radius: 6px;
+		background: var(--ui-mantle);
+		border: 1px solid var(--ui-accent);
+		color: var(--ui-fg);
+		font-size: 0.92em;
+		box-shadow: 0 8px 20px -10px rgb(0 0 0 / 0.7);
+	}
+	.tk-portchip-label {
+		overflow-wrap: anywhere;
+	}
+	.tk-portchip-open {
+		color: var(--ui-accent);
+		font-weight: 700;
+		white-space: nowrap;
+		border-radius: 4px;
+	}
+	.tk-portchip-x {
+		display: inline-flex;
+		color: rgb(108 112 134 / 0.7);
+	}
+	.tk-portchip-x .tk-ic {
+		width: 0.85em;
+		height: 0.85em;
+	}
+</style>

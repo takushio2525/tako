@@ -1,0 +1,93 @@
+---
+/**
+ * キーの早見表（macOS と Windows を並べる。#2056）。ページ本文に置く。
+ *
+ *   <KeyTable rows={[{ label: '右に分割', mac: '⌘ D', win: 'Ctrl Shift D' }]} />
+ *
+ * キーの正本は crates/tako-app/src/keybindings.rs（macOS = base_bindings、Windows = non_macos_bindings）。
+ */
+import Keys from './Keys.astro';
+
+interface Row {
+	label: string;
+	mac: string;
+	win: string;
+}
+
+interface Props {
+	rows: Row[];
+	/** 表の名前（読み上げ用） */
+	label?: string;
+}
+
+const { rows, label = 'キーボードショートカット（macOS と Windows）' } = Astro.props;
+---
+
+<div class="tk-keytable not-content" role="table" aria-label={label}>
+	<div class="tk-keytable-head" role="row">
+		<span role="columnheader">操作</span>
+		<span role="columnheader">キー</span>
+	</div>
+	{
+		rows.map((r) => (
+			<div class="tk-keytable-row" role="row">
+				<span class="tk-keytable-label" role="cell">
+					{r.label}
+				</span>
+				<span class="tk-keytable-keys" role="cell">
+					<Keys mac={r.mac} win={r.win} />
+				</span>
+			</div>
+		))
+	}
+</div>
+
+<style is:global>
+	.tk-keytable {
+		margin: var(--tako-space-6, 1.5rem) 0;
+		border: 1px solid var(--tako-border);
+		border-radius: var(--tako-radius-md, 12px);
+		background: var(--tako-card);
+		overflow: hidden;
+		font-size: 0.92rem;
+	}
+	.tk-keytable-head,
+	.tk-keytable-row {
+		display: grid;
+		grid-template-columns: minmax(7em, 1fr) minmax(0, 2.2fr);
+		align-items: center;
+		gap: 0.4rem 1rem;
+		padding: 0.55rem 1rem;
+	}
+	.tk-keytable-head {
+		background: var(--tako-surface);
+		color: var(--tako-ink-muted);
+		font-size: 0.78rem;
+		font-weight: 700;
+	}
+	.tk-keytable-row + .tk-keytable-row {
+		border-top: 1px solid var(--tako-border-soft);
+	}
+	.tk-keytable-label {
+		color: var(--tako-ink);
+		font-weight: 600;
+	}
+	/* 広い画面では macOS と Windows を同じ縦位置にそろえる */
+	.tk-keytable-keys .tk-keys {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+		gap: 0.3rem 1rem;
+	}
+	@media (max-width: 34rem) {
+		.tk-keytable-head {
+			display: none;
+		}
+		.tk-keytable-row {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 0.35rem;
+		}
+		.tk-keytable-keys .tk-keys {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+</style>
