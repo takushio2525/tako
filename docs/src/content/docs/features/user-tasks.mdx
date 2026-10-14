@@ -1,0 +1,162 @@
+---
+title: 人がやること（ユーザータスク）
+description: AI から届く「承認してほしい」「見てほしい」を 1 か所に集め、返答をそのまま AI へ返す
+---
+
+import SceneTasksQueue from '../../../components/scenes/SceneTasksQueue.astro';
+import SceneTasksDetail from '../../../components/scenes/SceneTasksDetail.astro';
+import SceneTasksReply from '../../../components/scenes/SceneTasksReply.astro';
+import SceneTasksDelivery from '../../../components/scenes/SceneTasksDelivery.astro';
+import SceneTasksPhone from '../../../components/scenes/SceneTasksPhone.astro';
+import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
+import Cmd from '../../../components/motion/Cmd.astro';
+
+AI に任せていると、レビュー・許可・投稿のような**人にしかできない用事**が溜まります。会話の 1 行で「確認お願いします」と言われても、スクロールで流れて見失います。
+
+tako では、AI がそれを**タスクとして起票**し、待ち行列に並べます。あなたは右パネルで開いて判断を返すだけ。**返答は起票した master の入力欄へそのまま届き**、AI が続きを進めます。
+
+<div class="tk-ut-os not-content">
+<span class="tk-ut-os-tag">Windows</span>
+<span class="tk-ut-os-text">この機能は Windows ではまだ<strong>未実測</strong>です。実装は macOS と共通ですが、Windows 実機で確かめていないので「対応」とは書いていません。スマホからの操作（tako remote）も同じく未確認です。詳しくは<a href="#windows-では">このページの末尾</a>と <a href="/windows-support/">Windows 対応状況</a>にあります。</span>
+</div>
+
+## 右パネルで見る
+
+スクロールすると、画面がその手順の状態に変わります。
+
+<SceneTasksQueue />
+
+右パネルの tasks は、ステータスバーのボタンのほか、コマンドパレット（<kbd>⌘</kbd>+<kbd>K</kbd>）の「tasks パネルを開く」や次のコマンドでも開けます。
+
+<Cmd>tako panel --show --view tasks</Cmd>
+
+### 一覧
+
+- 既定では**未完了のものだけ**が、更新の新しい順に並びます
+- 行の左の丸が種類（灰色は完了・却下したもの）、右の丸が**返答の配送状態**です
+- パネルを細くすると、タブの名前（`fleet` / `orch` / `git` / `tasks`）は詰まってアイコンだけになりますが、**件数の数字は最後まで欠けません**。100 件を超えると `99+` と出ます（正確な件数は一覧の右上の「N 件待ち」）
+
+### 詳細
+
+<SceneTasksDetail />
+
+- 画面の外の行を開いたときは、その行が見える位置まで一覧がスクロールします
+- 一覧は数秒ごとに新しくなりますが、**開いている中身は閉じません**。絞り込みを変えたときと、完了・却下にしたときは閉じます
+- とても大きい画像は「サムネイルなし」と出ますが、行はそのまま押せます。動画には縮小を作りません（押せばそのまま再生できます）
+- AI は動画や画像を書き出す前に起票することがあるので、まだ無いファイルは「見つかりません」と出て押せません
+- **リンク**は押すと既定のブラウザで開きます。添付の行の右の「Finder で表示」で、置き場所も開けます
+
+## 返答する
+
+<SceneTasksReply />
+
+返答は、起票した master の入力欄へ次の形で届きます。本文と添付の中身は載せず、AI が必要なら `tako todo show` で読みにいきます。
+
+```text
+【ユーザー返答】todo u-4「API の設計メモを確認」
+decision=needs_change via=pc kind=review status=open
+コメント: エラー時の応答も書いてほしい
+本文と添付は `tako todo show u-4` で読める。この返答を起点に続きを進めること。
+```
+
+### 届いたかどうかが分かる
+
+<SceneTasksDelivery />
+
+| 表示 | 色 | 意味 |
+|---|---|---|
+| 送信済み（確認待ち） | 黄 | 送ったが、master が受け取ったことをまだ確かめられていない |
+| master を起動しました | 黄 | master が居なかったので、新しいタブで起動して渡した |
+| master に届きました | 緑 | 入力欄へ入ったことを確かめた |
+| 届きませんでした | 赤 | 届けられなかった（理由が併記されます） |
+
+**「送信済み」を「届きました」とは書きません。** 分からないものを分かったことにしない方針です。右パネルを開いているあいだは数秒ごとに確かめ直すので、確定すると表示が変わります。
+
+## スマホから片付ける
+
+<SceneTasksPhone />
+
+スマホ側の主役は**コピーとダウンロード**です。投稿のタスクなら、添付の動画を「端末に保存」で落とし、投稿文・タイトル・タグを「コピー」でひとつずつ入れて、X や YouTube のアプリで貼るところまで、PC を開かずに済みます。
+
+### 添付をその場で見る・鳴らす
+
+- **画像**はその場に表示され、押すと全画面に拡大します
+- **動画**は再生ボタンつきで並び、その場で試聴できます。シークもできます
+- 読み込むのは**詳細を開いたときだけ**です。一覧では取りに行かないので、大きな動画が添付されたタスクが並んでいても一覧は軽いままです
+- PDF・Markdown などは、保存と共有だけです
+- 共有シートに渡せるのは **64 MB まで**です。それより大きいものは「端末に保存」から渡してください
+- スマホの「やりとり」は、新しい順・「3 分前」のような相対時刻で並びます（PC は古い順・時刻つき）
+
+### 開けない添付があるとき
+
+添付は **PC 側で見えているファイルだけ**が落とせます。その場で見られる範囲も同じで、**落とせない添付は見ることもできません**。範囲は端末の権限で決まります。
+
+| 端末の権限 | 落とせる添付 |
+|---|---|
+| Observe | なし（一覧と本文は読めます） |
+| Interact | tako のファイルツリーに出ているフォルダの中にあるもの |
+| Manage 以上 | PC のどこにあっても落とせます |
+
+落とせない添付には**理由が出ます**。権限が足りないだけなら、その場から権限の更新をリクエストできます（承認は PC の画面で行います）。
+
+## コマンドからも同じことができる
+
+画面でできることは、すべて `tako todo` と MCP の `tako_todo` からもできます（逆も同じです）。AI のタスク（`tako task checkpoint` / `tako task gate`）とは別物で、id も `u-1` / `task-1` で見分けられます。
+
+```sh
+tako todo list                       # 未完了の一覧 + 件数
+tako todo show u-1                   # 本文・添付・やりとり・配送状態
+tako todo respond u-1 --decision needs_change --comment "サムネの文字を大きく"
+tako todo done u-1                   # 片付いた
+tako todo dismiss u-1                # やらない
+tako todo expand u-1                 # その 1 件を右パネルで開いて見せる
+tako todo collapse                   # 開いているものを閉じる
+```
+
+`tako todo expand` は右パネルが閉じていても開いて tasks に切り替えるので、AI が「これを見てください」と言うときにそのまま画面へ出せます。いまどれが開いているかは `tako todo list --json` の `expanded` で読めます（画面が無ければ `null`）。`tako todo show` の返答の履歴も、画面と同じ古い順・時刻つきです。
+
+添付を開くのも同じ経路です。右パネルで添付の行を押すのと、そのパスを `tako open` に渡すのは同じ 1 経路なので、AI からも同じものが開けます。
+
+```sh
+tako todo show u-1 --json            # attachments[].path を読む
+tako open /path/to/v6.mp4            # 動画のプレビューで開く（MCP は tako_open_file）
+```
+
+起票は AI が行いますが、自分で書くこともできます。
+
+```sh
+tako todo add "解説動画 v6 を YouTube へ投稿" \
+  --kind post --project my-app \
+  --attach /path/to/v6.mp4 \
+  --copy-text "投稿文=v0.8 を出しました" \
+  --copy-text "タグ=#tako"
+```
+
+詳しい引数は [CLI リファレンス](/guides/cli-reference/#tako-todo)にあります。
+
+## AI 側の作法
+
+master には「ユーザーに**聞くこと・見てもらうこと・許可をもらうこと**は会話や引き継ぎに溜めず、ここへ起票する」という手順が入っています。起票元（どの master か・どの会話か）は自動で記録されるので、AI は戻り先を指定しなくて構いません。AI 自身が手順を読むときは次で引けます。
+
+<Cmd>tako orchestrator guide user-tasks</Cmd>
+
+## Windows では
+
+右パネルの切り替え（`tako panel`）は Windows 実機で確かめてあります。タスクそのものと、スマホからの操作はまだです。
+
+<WindowsLimits
+	items={[
+		{
+			kind: 'pending',
+			title: '人がやること（ユーザータスク）',
+			text: '起票・一覧・返答・配送は macOS と同じ実装を通りますが、Windows 実機での確認がまだです。',
+			tools: ['tako_todo'],
+		},
+		{
+			kind: 'pending',
+			title: 'スマホからの操作（tako remote）',
+			text: 'Windows 実機で「セットアップ → 公開 → スマホから接続」を通しで確かめていません。',
+			tools: ['tako_remote_setup', 'tako_remote_start', 'tako_remote_status'],
+		},
+	]}
+/>

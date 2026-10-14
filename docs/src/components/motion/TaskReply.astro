@@ -1,0 +1,60 @@
+---
+/**
+ * タスクの詳細の「返答」フォーム（#2058）。TaskRow の子に置く。
+ * 判断の 4 択（承認 / 却下 / 直してほしい / 回答）・コメント欄・「返す」。判断を選ぶまでは「返す」が
+ * 押せず「判断を選ぶと返せます」が出る（誤爆防止）。返すと欄は空に戻る（tasks_panel.rs / ui_text/panel.rs）。
+ *
+ *   <TaskReply pick={{ label: '直してほしい', at: '2' }} comment={{ text: 'ボタンを少し大きく', at: '2' }} pressAt="3" />
+ */
+interface Props {
+	/** 選ぶ判断と、選ばれている手順（返したあとの手順は含めない = 欄が空に戻る） */
+	pick?: { label: string; at: string };
+	/** 打つコメントと、入っている手順 */
+	comment?: { text: string; at: string };
+	/** 「返す」を押す手順（押された輪） */
+	pressAt?: string;
+}
+
+const { pick, comment, pressAt } = Astro.props;
+const decisions = ['承認', '却下', '直してほしい', '回答'];
+---
+
+<div class="tk-ut-sec">返答</div>
+<div class="tk-ut-btns">
+	{
+		decisions.map((d) => (
+			<span class="tk-ut-chip" data-at={pick?.label === d ? pick.at : undefined} data-fx={pick?.label === d ? 'state' : undefined}>
+				{d}
+			</span>
+		))
+	}
+</div>
+<div class="tk-ut-field" data-at={comment?.at} data-fx={comment ? 'state' : undefined}>
+	{
+		comment ? (
+			<span class="tk-stack">
+				<span data-at={`!${comment.at}`} data-fx="fade">
+					コメント（任意）
+				</span>
+				<span class="tk-ut-typed" data-at={comment.at} data-fx="type" style="--d: .35s">
+					{comment.text}
+				</span>
+			</span>
+		) : (
+			'コメント（任意）'
+		)
+	}
+</div>
+<div class="tk-ut-send-row">
+	<span class="tk-stack">
+		<span class="tk-ut-send" data-at={pressAt} data-fx={pressAt ? 'mark' : undefined}>返す</span>
+		{
+			pick && (
+				<span class="tk-ut-send is-ready" data-at={pick.at} data-fx="fade">
+					返す
+				</span>
+			)
+		}
+	</span>
+	<span class="tk-ut-hint" data-at={pick ? `!${pick.at}` : undefined} data-fx="fade">判断を選ぶと返せます</span>
+</div>

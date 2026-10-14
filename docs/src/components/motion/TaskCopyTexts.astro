@@ -1,0 +1,28 @@
+---
+/**
+ * タスクの詳細の「コピー用のテキスト」（#2058）。TaskRow の子に置く。
+ * 投稿文・タイトル・タグのように貼り先が別々なので、実物はラベルごとに 1 つずつボタンを出す
+ * （tasks_panel.rs / ui_text/panel.rs の tasks_copy_texts）。押したときの「「…」をコピーしました」は
+ * 一覧の上端に出る（TasksHead の notice）。
+ *
+ *   <TaskCopyTexts labels={['投稿文', 'タグ']} press={{ label: '投稿文', at: '3' }} />
+ */
+interface Props {
+	labels: string[];
+	/** 押されるボタンと手順（押された輪） */
+	press?: { label: string; at: string };
+}
+
+const { labels, press } = Astro.props;
+---
+
+<div class="tk-ut-sec">コピー用のテキスト</div>
+<div class="tk-ut-btns">
+	{
+		labels.map((l) => (
+			<span class="tk-ut-sbtn" data-at={press?.label === l ? press.at : undefined} data-fx={press?.label === l ? 'mark' : undefined}>
+				{l}
+			</span>
+		))
+	}
+</div>

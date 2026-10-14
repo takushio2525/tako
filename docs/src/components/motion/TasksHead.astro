@@ -1,0 +1,77 @@
+---
+/**
+ * tasks ビューの上端（#2058）: 「USER TASKS」と「N 件待ち」、種類の絞り込みのチップ、
+ * 「完了も見る」、その下の 1 行の通知（コピーしました など）。TasksPanel の先頭に置く。
+ * 文言は crates/tako-app/src/ui_text/panel.rs（tasks_open_count / tasks_filter_all / tasks_show_done）。
+ *
+ *   <TasksHead waiting={[{ n: 3, at: '1' }, { n: 4, at: '2+' }]} kinds={['レビュー', '許可', '投稿']}
+ *              picks={[{ label: 'レビュー', at: '3+' }]} doneAt="4" />
+ *
+ * 実物の種類のチップは「いま取ってきた行に出てくる種類だけ」を宣言順（レビュー・確認・許可・投稿・その他）で出す。
+ * 場面の途中でチップの数が変わらないよう、行の種類を揃えて書く。
+ */
+interface Waiting {
+	n: number;
+	at?: string;
+}
+interface Pick {
+	label: string;
+	/** そのチップが選ばれている手順（data-at の書き方） */
+	at: string;
+}
+
+interface Props {
+	waiting: Waiting[];
+	/** 種類のチップ（表示名）。2 つ以上あるときだけ行が出る（実物と同じ） */
+	kinds?: string[];
+	/** 選ばれる種類。どれにも当たらない手順では「すべて」が選ばれた姿 */
+	picks?: Pick[];
+	/** 「完了も見る」が押されている手順 */
+	doneAt?: string;
+	/** 見出しの下の 1 行（「投稿文」をコピーしました など）と、出る手順 */
+	notice?: { text: string; at: string };
+}
+
+const { waiting, kinds = [], picks = [], doneAt, notice } = Astro.props;
+const allAt = picks.length ? `!${picks.map((p) => p.at).join(' ')}` : undefined;
+---
+
+<div class="tk-ut-head">
+	<span class="tk-ut-label">USER TASKS</span>
+	<span class="tk-ut-waiting tk-ut-swap">
+		{
+			waiting.map((w) => (
+				<span data-at={w.at} data-fx={w.at ? 'fade' : undefined}>
+					{w.n} 件待ち
+				</span>
+			))
+		}
+	</span>
+</div>
+{
+	kinds.length > 1 && (
+		<div class="tk-ut-chips">
+			<span class:list={['tk-ut-chip', { 'is-active': !allAt }]} data-at={allAt} data-fx={allAt ? 'state' : undefined}>
+				すべて
+			</span>
+			{kinds.map((k) => {
+				const p = picks.find((x) => x.label === k);
+				return (
+					<span class="tk-ut-chip" data-at={p?.at} data-fx={p ? 'state' : undefined}>
+						{k}
+					</span>
+				);
+			})}
+		</div>
+	)
+}
+<div class="tk-ut-chips">
+	<span class="tk-ut-chip" data-at={doneAt} data-fx={doneAt ? 'state' : undefined}>完了も見る</span>
+</div>
+{
+	notice && (
+		<div data-at={notice.at} data-fx="unfold">
+			<div class="tk-ut-notice">{notice.text}</div>
+		</div>
+	)
+}

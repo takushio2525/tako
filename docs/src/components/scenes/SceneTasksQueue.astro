@@ -1,0 +1,65 @@
+---
+/**
+ * 場面: 人がやることが溜まる・並ぶ（起票 → 通知 → 件数 → 一覧の絞り込み → 完了も見る）。4 手順。#2058
+ * 事実の出どころ: .agent/requirements.md FR-2.40.7（起票の通知は 1 行・本文は出さない）/ FR-2.40.9・2.40.10
+ * （tasks ビュー・種類の絞り込みは取ってきた行の表示側・「完了も見る」は取得条件・件数は open_count）。
+ * 文言: crates/tako-app/src/ui_text/panel.rs・ui_text/sidebar.rs。
+ * 実物は種類の絞り込みを保ったまま「完了も見る」を切り替える（tasks_panel.rs）ので、手順 4 でもレビューの絞り込みが残る。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import TasksPanel from '../motion/TasksPanel.astro';
+import TasksHead from '../motion/TasksHead.astro';
+import TaskRow from '../motion/TaskRow.astro';
+import TaskSideNotice from '../motion/TaskSideNotice.astro';
+---
+
+<div class="tk-ut">
+	<Scrolly label="人がやることが一覧に溜まる流れ">
+		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={24} status={false}>
+			<TaskSideNotice slot="sidebar" notice={{ text: '新しいユーザータスク u-6: ログイン画面の見た目を確認', at: '2+' }} />
+			<Split>
+				<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+					<span class="tk-l tk-tui-msg">ログイン画面ができました</span>
+					<span class="tk-l tk-dim">テストを書いています…</span>
+					<span class="tk-l tk-tui-msg is-tool" data-at="2+">見た目の確認を u-6 として起票しました</span>
+					<span class="tk-l tk-tui-msg" data-at="2+" style="--d: .4s">返答を待つ間に、テストを進めます</span>
+				</Pane>
+			</Split>
+			<TasksPanel slot="right" width="46%" counts={[{ n: 3, at: '1' }, { n: 4, at: '2+' }]}>
+				<TasksHead
+					waiting={[{ n: 3, at: '1' }, { n: 4, at: '2+' }]}
+					kinds={['レビュー', '許可', '投稿']}
+					picks={[{ label: 'レビュー', at: '3+' }]}
+					doneAt="4"
+				/>
+				<div class="tk-ut-list">
+					<TaskRow id="u-6" kind="review" title="ログイン画面の見た目を確認" at="2+" />
+					<TaskRow id="u-5" kind="post" title="リリースのお知らせを X へ投稿" at="!3+" />
+					<TaskRow id="u-4" kind="review" title="API の設計メモを確認" />
+					<TaskRow id="u-3" kind="permission" title="本番 DB のマイグレーションを許可" at="!3+" />
+					<TaskRow id="u-2" kind="review" title="README の書き直しを確認" done at="4" />
+				</div>
+				<Pointer path="3:38,20 4:19,32" click="3 4" />
+			</TasksPanel>
+		</TakoWindow>
+
+		<Step title="人にしかできない用事は、右パネルに並ぶ">
+			<p>レビュー・確認・許可・投稿。AI が進めるうちに溜まる「人の判断が要るもの」は、右パネルの <strong>tasks</strong> に 1 件ずつ並びます。会話の 1 行と違って、スクロールで流れていきません。</p>
+		</Step>
+		<Step title="AI が起票すると、通知と件数で分かる">
+			<p>master が判断の要るものを見つけると、タスクとして起票します。画面に「新しいユーザータスク u-6: …」が 1 行出て、tasks の件数が増えます。</p>
+			<p>通知に出すのは番号とタイトルだけで、本文や添付は出しません。</p>
+		</Step>
+		<Step title="種類で絞り込む">
+			<p>上のチップで「レビュー」「許可」「投稿」などに絞れます。チップに出るのは、いま一覧にある種類だけです。複数のプロジェクトを抱えているときは、プロジェクトでも絞れます。</p>
+		</Step>
+		<Step title="片付けたものも見返せる">
+			<p>「完了も見る」を押すと、完了したものと却下したものも並びます。灰色の丸が終わったものです。種類の絞り込みはそのまま残ります。</p>
+		</Step>
+	</Scrolly>
+</div>

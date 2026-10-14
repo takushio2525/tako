@@ -1,0 +1,89 @@
+---
+/**
+ * 場面: 判断を選んで返す（判断を選ぶまで押せない・返すと欄が空になり「送信中」・履歴に時刻と経路・
+ * 送信済み（確認待ち）→ master に届きました）。5 手順。#2058
+ * 事実の出どころ: .agent/requirements.md FR-2.40.5（返答は起票した master の入力欄へ）/ 2.40.6（配送の顛末）/
+ * 2.40.12（判断を選ぶまで送れない・sent を緑にしない）/ 2.40.30（押した次のフレームで欄が空・「送信中」）/
+ * 2.40.31（やりとりは古い順・時刻 · 経路 · 判断でフォームの上）。
+ * master へ届く本文は crates/tako-control/src/user_tasks.rs の response_message（ここでは先頭 3 行だけ写す）。
+ */
+import Scrolly from '../motion/Scrolly.astro';
+import Step from '../motion/Step.astro';
+import TakoWindow from '../motion/TakoWindow.astro';
+import Split from '../motion/Split.astro';
+import Pane from '../motion/Pane.astro';
+import Pointer from '../motion/Pointer.astro';
+import TasksPanel from '../motion/TasksPanel.astro';
+import TasksHead from '../motion/TasksHead.astro';
+import TaskRow from '../motion/TaskRow.astro';
+import TaskThread from '../motion/TaskThread.astro';
+import TaskReply from '../motion/TaskReply.astro';
+import TaskDelivery from '../motion/TaskDelivery.astro';
+---
+
+<div class="tk-ut">
+	<Scrolly label="タスクに返答する流れ">
+		<TakoWindow slot="stage" tabs={[{ label: 'my-app (AI チーム)', state: 'running', active: true }]} height={30} status={false}>
+			<Split>
+				<Pane n={1} title="マスター" badge="ORCH" state="running" focus>
+					<div class="tk-ut-scroller is-narrow-only" data-at="5" data-fx="state" style="--to: -5em">
+						<span class="tk-l tk-tui-msg">設計メモの確認を u-4 で頼んでいます</span>
+						<span class="tk-l tk-dim">テストを進めています…</span>
+						<div data-at="5" data-fx="unfold">
+							<div>
+								<span class="tk-l tk-tui-user">【ユーザー返答】todo u-4「API の設計メモを確認」
+decision=needs_change via=pc kind=review status=open
+コメント: エラー時の応答も書いてほしい</span>
+								<span class="tk-l tk-tui-msg" data-at="5" style="--d: .8s">エラー時の応答を書き足します</span>
+							</div>
+						</div>
+						<span class="tk-l tk-tui-input" data-at="4"><span data-at="4" data-fx="type">【ユーザー返答】todo u-4</span></span>
+					</div>
+				</Pane>
+			</Split>
+			<TasksPanel slot="right" width="62%" narrow="64%" counts={[{ n: 4 }]}>
+				<TasksHead waiting={[{ n: 4 }]} kinds={['レビュー', '許可', '投稿']} />
+				<div class="tk-ut-list">
+					<div class="tk-ut-scroller" data-at="3+" data-fx="state" style="--to: -4.6em">
+						<div class="tk-ut-scroller" data-at="4+" data-fx="state" style="--to: -2.4em">
+							<TaskRow id="u-4" kind="review" title="API の設計メモを確認" open delivery={[{ state: 'sent', at: '4' }, { state: 'delivered', at: '5' }]}>
+								<div class="tk-ut-meta"><span class="tk-ut-kind">レビュー</span></div>
+								<div class="tk-ut-md">抜けている観点がないか見てください。</div>
+								<TaskThread
+									at="3+"
+									counts={[{ n: 1 }]}
+									entries={[
+										{ head: '送信中 · PC · 直してほしい', text: 'エラー時の応答も書いてほしい', pending: true, at: '3' },
+										{ head: '10:41 · PC · 直してほしい', text: 'エラー時の応答も書いてほしい', at: '4+', swap: true },
+									]}
+								/>
+								<TaskReply pick={{ label: '直してほしい', at: '2' }} comment={{ text: 'エラー時の応答も書いてほしい', at: '2' }} pressAt="3" />
+								<TaskDelivery at="4+" states={[{ state: 'sent', pane: 1, at: '4' }, { state: 'delivered', pane: 1, at: '5' }]} />
+							</TaskRow>
+							<TaskRow id="u-3" kind="permission" title="本番 DB のマイグレーションを許可" />
+						</div>
+					</div>
+				</div>
+			</TasksPanel>
+			<Pointer slot="overlay" path="2:67,75 3:46,92" click="2 3" />
+		</TakoWindow>
+
+		<Step title="判断を選ぶまで、「返す」は押せない">
+			<p>中身の下に返答の欄があります。「承認」「却下」「直してほしい」「回答」のどれかを選ぶまで「返す」は押せず、「判断を選ぶと返せます」と出ます。押し間違いで承認が飛ぶことはありません。</p>
+		</Step>
+		<Step title="判断を選んで、コメントを書く">
+			<p>判断を 1 つ選び、必要ならコメントを書きます。コメントは複数行でき、<kbd>⌘</kbd>+<kbd>Enter</kbd> でも送れます。</p>
+		</Step>
+		<Step title="返すと、欄はすぐ空になる">
+			<p>「返す」を押すと欄はその場で空になり、書いた返答は「やりとり」の末尾に「送信中」で並びます。返し損ねたときは、書いた中身が欄へ戻ります。</p>
+		</Step>
+		<Step title="やりとりに残り、配送の状態が付く">
+			<p>返答は「やりとり」に古い順で積まれ、時刻・どこから返したか（PC / スマホ / CLI / AI）・判断が残ります。</p>
+			<p>配送は、master が受け取ったと確かめられるまで<strong>「送信済み（確認待ち）」</strong>の黄色です。</p>
+		</Step>
+		<Step title="master に届き、AI が続きを進める">
+			<p>入力欄へ入ったことを確かめると「master に届きました」の緑に変わります。返答は起票した master の入力欄へ届くので、AI はそこから作業を続けます。</p>
+			<p>「承認」「却下」はタスクを閉じ、「直してほしい」「回答」は開いたまま残ります（直した物をもう一度見てもらうため）。</p>
+		</Step>
+	</Scrolly>
+</div>

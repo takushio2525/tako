@@ -1,0 +1,816 @@
+/*
+ * 人がやること（ユーザータスク）の画面の再現（#2058）。このページの場面と部品だけが読む。
+ *
+ * - PC: 右パネルの tasks ビュー。正本は crates/tako-app/src/tasks_panel.rs（寸法・色）と
+ *   crates/tako-app/src/ui_text/panel.rs（文言）。色は既定ダークテーマ（theme.rs の default_dark）
+ * - スマホ: PWA の #/tasks。正本は web/tako-remote/src/pages/tasks.jsx と styles/main.css
+ *
+ * 共有の見た目（.tk-ui の変数・.tk-right・.tk-phone）は tako-ui.css のまま使い、ここは足すだけ。
+ * 実物の px は窓の文字（11.5px）に対する em へ直した（10.5px ≒ 0.91em・9.5px ≒ 0.83em）。
+ */
+
+/* ============================================================
+ * 場面の並び（このページだけ図の取り分を少し広げる。右パネルとペインを並べて読める幅にする）
+ * ============================================================ */
+.tk-ut .tk-scrolly,
+.tk-ut .tk-scrolly.is-static .tk-step {
+  grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
+}
+.tk-ut .tk-scrolly.is-flip {
+  grid-template-columns: minmax(0, 1.28fr) minmax(0, 0.72fr);
+}
+
+/* ============================================================
+ * 右パネル（tasks ビュー）
+ * ============================================================ */
+.tk-ui {
+  --ut-surface0: #1b1c28;
+  --ut-surface1: #1c1d2b;
+  --ut-surface2: #20212f;
+  --ut-border-strong: #2b2c3e;
+  --ut-accent-border: #5a6a9e;
+}
+
+/* 共有の RightPanel より広く取れる（上限なし）。窓に対する幅は --rw */
+.tk-win .tk-right.tk-ut-panel {
+  width: var(--rw, 60%);
+  max-width: none;
+}
+@container tkframe (max-width: 26rem) {
+  .tk-win .tk-right.tk-ut-panel {
+    width: var(--rw-narrow, 62%);
+  }
+}
+.tk-right-body.tk-ut-body {
+  position: relative;
+  padding: 0;
+  gap: 0;
+}
+.tk-ut-counts {
+  display: inline-grid;
+}
+
+/* 見出し: USER TASKS と「N 件待ち」 */
+.tk-ut-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.8em 1.1em 0.45em;
+  flex: none;
+}
+.tk-ut-label {
+  font-size: 0.91em;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--ui-muted);
+}
+.tk-ut-waiting {
+  margin-left: auto;
+  font-size: 0.87em;
+  color: var(--ui-faint);
+}
+
+/* 絞り込みのチップ（種類・完了も見る）と、判断の 4 択 */
+.tk-ut-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35em;
+  padding: 0 0.85em 0.35em;
+  flex: none;
+}
+.tk-ut-chips + .tk-ut-chips {
+  padding-bottom: 0.5em;
+}
+.tk-ut-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15em 0.6em;
+  border-radius: 6px;
+  font-size: 0.91em;
+  white-space: nowrap;
+  border: 1px solid var(--ui-line-in);
+  background: var(--ui-chip);
+  color: var(--ui-muted);
+}
+.tk-ut-chip.is-active,
+.tk-ut-chip[data-fx~='state'].is-on {
+  border-color: var(--ut-accent-border);
+  background: var(--ui-accent-muted);
+  color: var(--ui-fg);
+}
+/* 一覧の上の 1 行（「投稿文」をコピーしました など） */
+.tk-ut-notice {
+  padding: 0 1.2em 0.35em;
+  font-size: 0.91em;
+  color: var(--ui-muted);
+  flex: none;
+}
+
+/* 一覧 */
+.tk-ut-list {
+  display: flex;
+  flex-direction: column;
+  padding: 0.2em 0.6em 0.7em;
+  min-height: 0;
+  overflow: hidden;
+}
+.tk-ut-item {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+}
+/* 手順で出し入れする行は高さごと畳む（unfold）ので、行の間の余白は中身の側に持たせる */
+.tk-ut-item > div > .tk-ut-row,
+.tk-ut-item > .tk-ut-row {
+  margin-bottom: 2px;
+}
+.tk-ut-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.4em 0.5em;
+  border-radius: 6px;
+  background: var(--ut-surface0);
+  white-space: nowrap;
+  min-width: 0;
+}
+.tk-ut-row.is-open,
+.tk-ut-row[data-fx~='state'].is-on {
+  background: var(--ut-surface2);
+}
+.tk-ut-chev {
+  color: var(--ui-faint);
+  font-size: 0.85em;
+}
+.tk-ut-row.is-open .tk-ut-chev,
+.tk-ut-row.is-on .tk-ut-chev {
+  color: var(--ui-fg);
+}
+.tk-ut-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--c, var(--ui-muted));
+}
+.tk-ut-dot.is-review {
+  --c: var(--ui-accent);
+}
+.tk-ut-dot.is-confirm {
+  --c: var(--ui-teal);
+}
+.tk-ut-dot.is-permission {
+  --c: var(--ui-peach);
+}
+.tk-ut-dot.is-post {
+  --c: var(--ui-mauve);
+}
+.tk-ut-dot.is-done {
+  --c: var(--ui-faint);
+}
+/* 配送の色。送信済み・起動しただけは「未確定」の黄（緑にしない = 届いたと騙らない） */
+.tk-ut-dot.is-sent,
+.tk-ut-dot.is-launched {
+  --c: var(--ui-yellow);
+}
+.tk-ut-dot.is-delivered {
+  --c: var(--ui-green);
+}
+.tk-ut-dot.is-failed {
+  --c: var(--ui-red);
+}
+.tk-ut-id {
+  font-size: 0.83em;
+  color: var(--ui-faint);
+  flex: none;
+}
+.tk-ut-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ui-fg);
+}
+.tk-ut-row.is-done .tk-ut-title {
+  color: var(--ui-muted);
+}
+/* 開いている行はタイトルを折り返して全文を出す（詳細はタイトルを繰り返さない） */
+.tk-ut-row.is-open .tk-ut-title,
+.tk-ut-row[data-fx~='state'].is-on .tk-ut-title {
+  white-space: normal;
+}
+.tk-ut-stackdot {
+  display: inline-grid;
+  flex: none;
+}
+.tk-ut-stackdot > * {
+  grid-area: 1 / 1;
+}
+
+/* 詳細（行の直下に開く 1 枚） */
+.tk-ut-detail {
+  display: flex;
+  flex-direction: column;
+  margin: 0.15em 0 0.4em;
+  padding: 0.55em 0.7em 0.6em;
+  border-radius: 8px;
+  border: 1px solid var(--ut-border-strong);
+  background: var(--ut-surface1);
+  color: var(--ui-fg2);
+  font-size: 0.96em;
+  white-space: normal;
+}
+.tk-ut-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+}
+.tk-ut-kind {
+  padding: 0 0.45em;
+  border-radius: 4px;
+  background: var(--ui-chip);
+  color: var(--ui-muted);
+  font-size: 0.87em;
+}
+.tk-ut-due {
+  font-size: 0.87em;
+  color: var(--ui-peach);
+}
+.tk-ut-md {
+  padding-top: 0.35em;
+  color: var(--ui-fg);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.tk-ut-md code {
+  font-family: inherit;
+  color: var(--ui-peach);
+  background: var(--ui-crust);
+  border-radius: 3px;
+  padding: 0 0.3em;
+}
+.tk-ut-sec {
+  padding: 0.5em 0 0.2em;
+  font-size: 0.9em;
+  font-weight: 700;
+  color: var(--ui-faint);
+}
+
+/* 添付（行そのものが「プレビューで開く」） */
+.tk-ut-att {
+  display: flex;
+  flex-direction: column;
+  border-radius: 5px;
+  padding: 0.1em 0.3em;
+  margin: 0 -0.3em;
+}
+.tk-ut-att-line {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  padding: 0.15em 0;
+  min-width: 0;
+}
+.tk-ut-route {
+  flex: none;
+  padding: 0 0.4em;
+  border-radius: 4px;
+  font-size: 0.87em;
+  background: var(--ui-chip);
+  color: var(--ui-faint);
+}
+.tk-ut-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ui-fg2);
+}
+.tk-ut-name.is-missing {
+  color: var(--ui-faint);
+}
+.tk-ut-missing {
+  flex: none;
+  font-size: 0.87em;
+  color: var(--ui-red);
+}
+/* 画像の縮小（実物は 320x180 の枠に収めた縮小。ここではログイン画面の絵を CSS で描く） */
+.tk-ut-thumb {
+  margin: 0.25em 0;
+  height: 4.8em;
+  border-radius: 4px;
+  background: var(--ut-surface0);
+  display: grid;
+  place-items: center;
+}
+.tk-ut-shot {
+  width: 7.6em;
+  height: 4.2em;
+  border-radius: 3px;
+  background: linear-gradient(160deg, #2a2f4a, #241f38);
+  border: 1px solid #3a3f5c;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35em;
+}
+.tk-ut-shot i {
+  display: block;
+  width: 5.2em;
+  height: 0.6em;
+  border-radius: 2px;
+  background: rgb(205 214 244 / 0.22);
+}
+.tk-ut-shot i:last-child {
+  width: 3em;
+  height: 0.85em;
+  background: var(--ui-accent);
+  opacity: 0.85;
+}
+
+/* 小さなボタン（Finder で表示・コピー用のテキスト・完了 / 却下） */
+.tk-ut-sbtn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.12em 0.55em;
+  border-radius: 5px;
+  font-size: 0.87em;
+  white-space: nowrap;
+  border: 1px solid var(--ui-line-in);
+  background: var(--ui-chip);
+  color: var(--ui-fg2);
+}
+.tk-ut-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35em;
+}
+
+/* やりとり（古い順・時刻 · 経路 · 判断。末尾に「送信中」） */
+.tk-ut-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+}
+.tk-ut-entry {
+  padding-left: 0.5em;
+  border-left: 2px solid var(--ut-accent-border);
+  display: flex;
+  flex-direction: column;
+}
+.tk-ut-entry.is-pending {
+  border-left-color: var(--ui-line-in);
+}
+.tk-ut-entry-head {
+  font-size: 0.83em;
+  color: var(--ui-faint);
+}
+.tk-ut-entry-text {
+  font-size: 0.91em;
+  color: var(--ui-fg2);
+  overflow-wrap: anywhere;
+}
+.tk-ut-entry.is-pending .tk-ut-entry-text {
+  color: var(--ui-muted);
+}
+
+/* 返答フォーム */
+.tk-ut-field {
+  margin-top: 0.35em;
+  min-height: 2.8em;
+  padding: 0.35em 0.5em;
+  border-radius: 6px;
+  border: 1px solid var(--ui-line-in);
+  background: var(--ut-surface0);
+  color: var(--ui-faint);
+  overflow-wrap: anywhere;
+}
+.tk-ut-field.is-focus,
+.tk-ut-field[data-fx~='state'].is-on {
+  border-color: var(--ut-accent-border);
+}
+.tk-ut-field .tk-ut-typed {
+  color: var(--ui-fg);
+}
+.tk-ut-send-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55em;
+  margin-top: 0.45em;
+}
+.tk-ut-send {
+  flex: none;
+  padding: 0.22em 0.8em;
+  border-radius: 6px;
+  font-size: 0.96em;
+  border: 1px solid var(--ui-line-in);
+  background: var(--ui-chip);
+  color: var(--ui-faint);
+}
+.tk-ut-send.is-ready,
+.tk-ut-send[data-fx~='state'].is-on {
+  border-color: var(--ut-accent-border);
+  background: var(--ui-accent-muted);
+  color: var(--ui-fg);
+}
+.tk-ut-hint {
+  font-size: 0.83em;
+  color: var(--ui-faint);
+}
+
+/* 配送の 1 行（丸 + 「配送: 状態 (pane N) - 理由」） */
+.tk-ut-delivery {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45em;
+  margin-top: 0.4em;
+  color: var(--ui-muted);
+  overflow-wrap: anywhere;
+}
+.tk-ut-delivery .tk-ut-dot {
+  margin-top: 0.5em;
+}
+.tk-ut-delivery-text {
+  min-width: 0;
+}
+
+/* 手順で入れ替える 1 行（配送の状態など）。重ねて、今の手順のものだけ見せる */
+.tk-ut-swap {
+  display: grid;
+}
+.tk-ut-swap > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+/* 通知欄の 1 行（ファイルツリーの上端。成功は緑を 12% 敷く） */
+.tk-ut-side {
+  width: 22%;
+  max-width: 11em;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  background: var(--ui-mantle);
+  border-right: 1px solid var(--ui-line);
+  color: var(--ui-fg2);
+  overflow: hidden;
+  min-width: 0;
+}
+.tk-ut-side-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.6em 0.6em 0.4em;
+  font-weight: 700;
+  color: var(--ui-fg);
+  white-space: nowrap;
+}
+.tk-ut-side-notice {
+  padding: 0.4em 0.75em;
+  font-size: 0.96em;
+  line-height: 1.5;
+  color: var(--ui-fg);
+  background: rgb(166 227 161 / 0.12);
+  border-bottom: 1px solid rgb(42 43 60 / 0.6);
+  overflow-wrap: anywhere;
+}
+.tk-ut-side-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+  padding: 0.4em 0.6em;
+  white-space: nowrap;
+  color: var(--ui-fg3);
+}
+.tk-ut-side-tree span {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@container tkframe (max-width: 26rem) {
+  .tk-ut-side {
+    display: none;
+  }
+}
+
+/* 添付を押して開いたプレビューのペイン（画像） */
+.tk-ut-preview {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  background: var(--ui-crust);
+}
+.tk-ut-preview .tk-ut-shot {
+  width: 80%;
+  max-width: 14em;
+  height: auto;
+  aspect-ratio: 16 / 9;
+}
+
+/* ============================================================
+ * スマホ版 #/tasks（PWA）
+ * ============================================================ */
+.tk-phone {
+  --ph-panel3: #1d232a;
+  --ph-red: #f0655a;
+}
+.tk-ut-ptop {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+.tk-ut-pback {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2em;
+  padding: 0.35em 0.65em;
+  border-radius: 0.7em;
+  border: 1px solid var(--ph-line2);
+  background: var(--ph-panel2);
+  color: var(--ph-fg);
+  font-weight: 700;
+}
+.tk-ut-pcount {
+  margin-left: auto;
+  color: var(--ph-fg2);
+}
+.tk-ut-pfilters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35em;
+}
+.tk-ut-pchip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.3em 0.5em;
+  border-radius: 0.5em;
+  font-size: 0.9em;
+  white-space: nowrap;
+  border: 1px solid var(--ph-line);
+  background: var(--ph-panel2);
+  color: var(--ph-fg2);
+}
+.tk-ut-pchip.is-active,
+.tk-ut-pchip[data-fx~='state'].is-on {
+  background: var(--ph-fg);
+  border-color: var(--ph-fg);
+  color: var(--ph-bg);
+  font-weight: 700;
+}
+.tk-ut-prow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  padding: 0.65em 0.7em;
+  border-radius: 0.8em;
+  border: 1px solid var(--ph-line);
+  background: var(--ph-panel2);
+}
+.tk-ut-prow-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  min-width: 0;
+}
+.tk-ut-ptitle {
+  font-weight: 700;
+  line-height: 1.4;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tk-ut-pkind {
+  flex: none;
+  padding: 0.1em 0.5em;
+  border-radius: 99px;
+  font-size: 0.85em;
+  font-weight: 700;
+  border: 1px solid var(--ph-line2);
+  background: var(--ph-panel3);
+  color: var(--ph-fg2);
+}
+.tk-ut-pkind.is-review {
+  color: var(--ph-blue);
+  border-color: var(--ph-blue);
+}
+.tk-ut-pkind.is-permission {
+  color: var(--ph-amber);
+  border-color: var(--ph-amber);
+}
+.tk-ut-pkind.is-post {
+  color: var(--ph-green);
+  border-color: var(--ph-green);
+}
+.tk-ut-pmeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55em;
+  font-size: 0.88em;
+  color: var(--ph-fg2);
+}
+.tk-ut-pmeta .tk-ut-pid {
+  color: var(--ph-fg3);
+}
+.tk-ut-pmeta .is-ok {
+  color: var(--ph-green);
+}
+.tk-ut-pmeta .is-error {
+  color: var(--ph-red);
+}
+.tk-ut-ph1 {
+  font-size: 1.2em;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.tk-ut-ph2 {
+  font-size: 0.85em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--ph-fg2);
+}
+.tk-ut-pbody {
+  line-height: 1.6;
+  color: var(--ph-fg);
+}
+.tk-ut-pcard {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45em;
+  padding: 0.6em;
+  border-radius: 0.6em;
+  border: 1px solid var(--ph-line);
+  background: var(--ph-panel2);
+}
+.tk-ut-pvideo {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border-radius: 0.5em;
+  background: linear-gradient(160deg, #1d2a3a, #10161e);
+  display: grid;
+  place-items: center;
+  color: var(--ph-fg);
+  overflow: hidden;
+}
+.tk-ut-pvideo .tk-ic {
+  width: 1.9em;
+  height: 1.9em;
+  opacity: 0.85;
+}
+/* 再生のシークバー（手順で伸びる） */
+.tk-ut-pseek {
+  position: absolute;
+  left: 0.6em;
+  right: 0.6em;
+  bottom: 0.5em;
+  height: 0.25em;
+  border-radius: 99px;
+  background: rgb(233 236 239 / 0.2);
+  overflow: hidden;
+}
+.tk-ut-pseek i {
+  display: block;
+  height: 100%;
+  width: 8%;
+  background: var(--ph-fg);
+  transition: width 2.4s linear;
+}
+.tk-ut-pseek i.is-on {
+  width: 46%;
+}
+.tk-ut-pname {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  align-items: baseline;
+  overflow-wrap: anywhere;
+}
+.tk-ut-pname small {
+  color: var(--ph-fg3);
+}
+.tk-ut-pbtns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+}
+.tk-ut-ppre {
+  margin: 0;
+  display: block;
+  padding: 0.45em 0.55em;
+  border-radius: 0.5em;
+  background: var(--ph-bg);
+  color: var(--ph-fg);
+  font: inherit;
+  font-size: 0.92em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tk-ut-pok {
+  color: var(--ph-green);
+  font-size: 0.9em;
+}
+.tk-ut-pfield {
+  min-height: 3.6em;
+  padding: 0.5em 0.6em;
+  border-radius: 0.6em;
+  border: 1px solid var(--ph-line);
+  background: var(--ph-bg);
+  color: var(--ph-fg3);
+}
+.tk-ut-pfield .tk-ut-typed {
+  color: var(--ph-fg);
+}
+.tk-ut-pactions {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+.tk-ut-pactions .tk-pbtn {
+  margin-left: auto;
+}
+
+/* 一覧を手順でスクロールした姿にする（返答の欄が下へ伸びたぶん、読む位置を下げる）。
+ * 実物の一覧もスクロールする。どこまで下げるかは --to（負の em） */
+.tk-ut-scroller {
+  display: flex;
+  flex-direction: column;
+}
+.tk-ut-scroller[data-fx~='state'].is-on {
+  transform: translateY(var(--to, -4em));
+}
+.tk-ut-pseek i[data-at] {
+  transition: width 2.6s linear 0.3s;
+}
+.tk-ut-pback .tk-ic {
+  transform: scaleX(-1);
+}
+
+/* ============================================================
+ * ページ本文: Windows の状況の帯（ページの冒頭。サイトの明暗に従う）
+ * ============================================================ */
+.tk-ut-os {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  margin: var(--tako-space-6, 1.5rem) 0;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--tako-border);
+  border-left: 3px solid #e0a526;
+  border-radius: var(--tako-radius-md);
+  background: var(--tako-card);
+  font-size: 0.9rem;
+  line-height: 1.75;
+  color: var(--tako-ink-muted);
+}
+.tk-ut-os-tag {
+  flex: none;
+  margin-top: 0.25rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 99px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--tako-ink);
+  background: var(--tako-surface-2);
+}
+.tk-ut-os-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tk-ut-os strong {
+  color: var(--tako-ink);
+}
+.tk-ut-os a {
+  color: var(--tako-accent);
+}
+
+/* このページのスマホは一段大きく描く（手順の文字と並べて読める大きさにする） */
+.tk-ut .tk-phone {
+  font-size: 12.5px;
+}
+@container tkframe (max-width: 30rem) {
+  .tk-ut .tk-phone {
+    font-size: 11px;
+  }
+}
+
+/* 窓が狭いときだけ読む位置を下げる（ペインが細いと会話が折り返して長くなり、最後の行が下に隠れる） */
+@container tkframe (min-width: 26rem) {
+  .tk-ut-scroller.is-narrow-only[data-fx~='state'].is-on {
+    transform: none;
+  }
+}
+
+/* スマホ版の添付の動画は横長に詰め、ボタンを 1 行に収める */
+.tk-ut .tk-ut-pvideo {
+  aspect-ratio: 2 / 1;
+}
+.tk-ut-pbtns .tk-pbtn {
+  padding: 0.35em 0.5em;
+  font-size: 0.85em;
+}

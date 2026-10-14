@@ -1,0 +1,77 @@
+---
+/**
+ * タスクの詳細の「やりとり（N）」（#2016 の返答の履歴。#2058）。TaskRow の子に置く。
+ * 実物は古い順（上が古く、下へ積まれる）で、1 件は「時刻 · 経路 · 判断」と本文。
+ * 押した直後は積み終わるまで「送信中」で末尾に出る（tasks_panel.rs の render_thread）。
+ *
+ *   <TaskThread entries={[
+ *     { head: '10:41 · PC · 直してほしい', text: 'ボタンを少し大きく' },
+ *     { head: '送信中 · PC · 承認', pending: true, at: '3', text: '' },
+ *     { head: '11:02 · PC · 承認', at: '4+', text: '' },
+ *   ]} counts={[{ n: 1, at: '!3+' }, { n: 2, at: '3+' }]} />
+ */
+interface Entry {
+	/** 「時刻 · 経路 · 判断」の 1 行（実物の表記: 今日 = HH:MM・経路 = PC / スマホ / CLI / AI（MCP）） */
+	head: string;
+	text?: string;
+	/** 積み終わっていない返答（「送信中」） */
+	pending?: boolean;
+	/** その返答が見えている手順。送信中から確定へ移るときは 2 件並べて at で入れ替える */
+	at?: string;
+	/** 同じ位置に重ねて入れ替える（送信中 → 時刻つき）。直前の 1 件と重ねる */
+	swap?: boolean;
+}
+
+interface Props {
+	entries: Entry[];
+	/** 見出しの件数。手順で変えるときは並べる */
+	counts: { n: number; at?: string }[];
+	/** 区画ごとの出し入れ（0 件の間は出さない = 実物と同じ） */
+	at?: string;
+}
+
+const { entries, counts, at } = Astro.props;
+
+// 重ねる（swap）ものは直前と 1 つの器へまとめる
+const groups: Entry[][] = [];
+for (const e of entries) {
+	if (e.swap && groups.length) groups[groups.length - 1].push(e);
+	else groups.push([e]);
+}
+---
+
+<div data-at={at} data-fx={at ? 'unfold' : undefined}>
+	<div>
+		<div class="tk-ut-sec">
+			やりとり（<span class="tk-ut-swap" style="display: inline-grid">
+				{
+					counts.map((c) => (
+						<span data-at={c.at} data-fx={c.at ? 'fade' : undefined}>
+							{c.n}
+						</span>
+					))
+				}
+			</span>）
+		</div>
+		<div class="tk-ut-thread">
+			{
+				groups.map((g) => (
+					<div data-at={g.length === 1 ? g[0].at : g.map((e) => e.at).join(' ')} data-fx="unfold">
+						<div class="tk-ut-swap">
+							{g.map((e) => (
+								<div
+									class:list={['tk-ut-entry', { 'is-pending': e.pending }]}
+									data-at={g.length > 1 ? e.at : undefined}
+									data-fx={g.length > 1 ? 'fade' : undefined}
+								>
+									<span class="tk-ut-entry-head">{e.head}</span>
+									{e.text && <span class="tk-ut-entry-text">{e.text}</span>}
+								</div>
+							))}
+						</div>
+					</div>
+				))
+			}
+		</div>
+	</div>
+</div>
