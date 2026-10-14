@@ -970,7 +970,8 @@ pub fn monitor_plan(
 /// `/clear` と `/resume` は**同じ claude のプロセスで別の会話が続く**（mod は次の報告で新しい会話 ID を
 /// 運ぶ = `register.ts` の `session.end`）。レジストリは spawn 直後の会話 ID のままなので、名指しが
 /// 食い違って [`monitor_plan`] が `session_mismatch` へ落ち、監視が 5 秒ごとに走査し続けていた
-/// （古い会話は `claude agents --json` に居ないので状態は `gone` で、mod の状態での上書きも効かない）。
+/// （走査は古い会話 ID について答え、応答の `resolved_session_id` も `/clear` 前の会話を指したまま。
+/// 器のあるペインはセッションカタログの 30 秒走査が書き戻すまで、器の無いペインはずっと）。
 ///
 /// 追従する（= 報告の会話 ID を返す）のは次がすべて揃うときだけ:
 ///
@@ -3761,17 +3762,9 @@ mod tests {
             None,
             "呼び出し側が記録と違う会話を明示した = その会話について走査が答える（#2017 のまま）"
         );
-        assert_eq!(
-            follow(&Ok(&s), t0, None, Some("s-old")),
-            None,
-            "名指しなし"
-        );
+        assert_eq!(follow(&Ok(&s), t0, None, Some("s-old")), None, "名指しなし");
         assert_eq!(follow(&Ok(&s), t0, Some(""), Some("")), None, "空の記録");
-        assert_eq!(
-            follow(&Ok(&s), t0, Some("s-old"), None),
-            None,
-            "記録なし"
-        );
+        assert_eq!(follow(&Ok(&s), t0, Some("s-old"), None), None, "記録なし");
         assert_eq!(
             follow(
                 &Ok(&s),
@@ -3789,7 +3782,12 @@ mod tests {
             "会話 ID の無い報告"
         );
         assert_eq!(
-            follow(&Err(ModUnavailable::Absent), t0, Some("s-old"), Some("s-old")),
+            follow(
+                &Err(ModUnavailable::Absent),
+                t0,
+                Some("s-old"),
+                Some("s-old")
+            ),
             None,
             "報告なし"
         );

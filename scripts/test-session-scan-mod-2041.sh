@@ -17,7 +17,8 @@
 #
 # **本物の設定 dir（~/.claude*）には触らない**: HOME を一時 dir へ差し替えて GUI を立てる。claude の設定 dir は
 # mktemp 配下（認証は写さず、偽 API とダミーの API キーを一時の .claude.json で承認済みにする）。最後に本物の
-# ~/.claude* の一覧と更新時刻が前後で同じかを見る。本番 tako が配る env は最初に落とす。落とすのは自分で
+# ~/.claude* に検証で生まれた会話（会話 ID・作業フォルダ名）が 1 件も無いことを見る（この PC では並走中の本番の
+# claude が ~/.claude を常に書くので、更新時刻の比較は物差しにならない）。本番 tako が配る env は最初に落とす。落とすのは自分で
 # 起こした pid と自分の tmux ソケットだけ（pkill / killall は使わない）。窓は仮想ディスプレイ（tako-vd）へ出る。
 #
 # 使い方: bash scripts/test-session-scan-mod-2041.sh   （ONLY=chat|clear|clear_direct。既定は全部）
@@ -54,15 +55,9 @@ LOAD_PID=""
 TMUX_SOCKET="tk2041-$$"
 REAL_HOME="$HOME"
 
-# 本物の設定 dir の指紋（名前・種類・更新時刻。中身は読まない）を前後で比べる
-real_claude_fingerprint() {
-  local d
-  for d in "$REAL_HOME"/.claude*; do
-    [ -e "$d" ] || continue
-    find "$d" -maxdepth 2 -exec stat -f '%N %HT %m' {} + 2>/dev/null
-  done | LC_ALL=C sort | shasum | cut -c1-16
-}
-REAL_BEFORE="$(real_claude_fingerprint)"
+# 検証で生まれた会話 ID（mod の報告で見えたもの）。最後に本物の ~/.claude* に無いことを確かめる
+SIDS="$TMP/sids.txt"
+: > "$SIDS"
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
@@ -162,6 +157,7 @@ start_app() {
   tk autorename off >/dev/null 2>&1
 }
 stop_app() {
+  tk mod --json 2>/dev/null | jq -r '.panes[].report.session_id // empty' >> "$SIDS" 2>/dev/null
   [ -n "$LOAD_PID" ] && kill "$LOAD_PID" 2>/dev/null
   LOAD_PID=""
   stop_isolated_gui "$APP_PID"
@@ -250,7 +246,7 @@ if want chat; then
       echo "  -- new: mod の無い claude（acct-c）を 1 本足す → 走査はそのアカウントと既定だけ"
       P_NOMOD="$(split_new "${PANES%% *}" right)"
       start_claude "$P_NOMOD" "$CFG_C" nomod
-      if wait_for 60 is_chat "$P_NOMOD"; then pass "mod の無い claude も走査でチャット表示になる（pane $P_NOMOD）"; else fail "mod の無い claude がチャット表示にならない（$(display_of "$P_NOMOD")）"; fi
+      if wait_for 60 is_chat "$P_NOMOD"; then pass "mod の無い claude も走査でチャット表示になる（pane ${P_NOMOD}）"; else fail "mod の無い claude がチャット表示にならない（$(display_of "$P_NOMOD")）"; fi
       sleep 2
       scan_log_reset
       sleep 35
@@ -305,9 +301,10 @@ run_clear() {
     start_claude "$P" "$CFG_A"
     wait_for 60 reporting "$P" || { fail "$arm: mod の報告が届かない（state=$(mod_state "$P")）"; stop_app; continue; }
     S1="$(mod_sid "$P")"
+    echo "$S1" >> "$SIDS"
     BACKEND="$(backend_of "$P")"
     if [ "$persist" = 1 ] && [ -z "$BACKEND" ]; then fail "$arm: persist ON なのに器の名前が無い"; fi
-    if [ "$persist" = 0 ] && [ -n "$BACKEND" ]; then fail "$arm: persist OFF なのに器がある（$BACKEND）"; fi
+    if [ "$persist" = 0 ] && [ -n "$BACKEND" ]; then fail "$arm: persist OFF なのに器がある（${BACKEND}）"; fi
     write_worker "$P" "$BACKEND" "$S1"
     before="$(status_json "$P" | jq -c '.agents_scan')"
     check_eq "$arm: /clear の前（レジストリ = 報告の会話）は走査しない" '{"reason":"mod_fresh","skipped":true}' "$(printf '%s' "$before" | jq -cS .)"
@@ -333,7 +330,7 @@ run_clear() {
       new)
         check_eq "new: 1 回目で追従（registry_followed）・走査なし" '{"reason":"mod_fresh","registry_followed":true,"skipped":true}' "$(printf '%s' "$first" | jq -cS '.agents_scan')"
         check_eq "new: 1 回目の会話 ID は /clear 後の会話" "$S2" "$(printf '%s' "$first" | jq -r '.resolved_session_id')"
-        check_eq "new: 1 回目の状態（gone にならない）" idle "$(printf '%s' "$first" | jq -r '.status')"
+        check_eq "new: 1 回目の状態は報告のターン" idle "$(printf '%s' "$first" | jq -r '.status')"
         check_eq "new: レジストリが新しい会話 ID へ更新される" "$S2" "$(registry_sid)"
         check_eq "new: 以後は追従なしで skipped=true" '{"reason":"mod_fresh","skipped":true}' "$(printf '%s' "$last" | jq -cS '.agents_scan')"
         check_eq "new: /clear 後の監視 25 秒に起こした走査" 0 "$n_scans"
@@ -354,8 +351,19 @@ run_clear() {
 if want clear; then run_clear clear 1; fi
 if want clear_direct; then run_clear clear_direct 0; fi
 
-REAL_AFTER="$(real_claude_fingerprint)"
-check_eq "本物の ~/.claude* の一覧と更新時刻が前後で同じ" "$REAL_BEFORE" "$REAL_AFTER"
+# 本物の設定 dir に検証の会話（transcript `<会話 ID>.jsonl`）と作業フォルダの projects の dir が無い
+n_sids="$(sort -u "$SIDS" | grep -c . | tr -d ' ')"
+leaks=0
+while read -r sid; do
+  [ -n "$sid" ] || continue
+  leaks=$((leaks + $(find "$REAL_HOME"/.claude* -maxdepth 3 -name "${sid}.jsonl" 2>/dev/null | wc -l)))
+done < <(sort -u "$SIDS")
+leaks=$((leaks + $(find "$REAL_HOME"/.claude*/projects -maxdepth 1 -name "*tako-2041*" 2>/dev/null | wc -l)))
+if [ "$n_sids" -gt 0 ]; then
+  check_eq "本物の ~/.claude* に検証の会話が書かれていない（検証の会話 ${n_sids} 件）" 0 "$leaks"
+else
+  fail "検証の会話 ID を 1 件も採れていない（本物の設定 dir の検査が空振り）"
+fi
 
 echo
 echo "結果: PASS=$PASS FAIL=$FAIL"

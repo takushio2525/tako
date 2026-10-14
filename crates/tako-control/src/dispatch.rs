@@ -15125,7 +15125,7 @@ fn finish_worker_status(
     // #2041: 名指しがレジストリの記録そのもので、新しい mod の報告が別の会話 ID を運んでいれば
     // `/clear`・`/resume` で同じ claude の会話が移った = 報告の会話 ID を名指しにして、レジストリへも
     // 書き戻す（判断は `claude_mod::follow_session` の 1 実装）。書き戻さないと名指しが古いまま
-    // `session_mismatch` で 5 秒ごとに走査し続け、古い会話は走査に居ないので状態が `gone` になる
+    // `session_mismatch` で 5 秒ごとに走査し続け、答える会話 ID（`resolved_session_id`）も `/clear` 前のまま
     let followed = tako_core::claude_mod::follow_session(
         &mod_view,
         mod_state.at(),
@@ -31808,7 +31808,7 @@ mod tests {
 
     /// `/clear` した worker（レジストリ = spawn 直後の会話・mod の報告 = 新しい会話）を注入で作り、
     /// 1 回目の照会で報告の会話 ID がレジストリへ書き戻され、以後は名指しと報告が一致して走査しない
-    /// （修正前は名指しが古いまま `session_mismatch` で毎回走査し、古い会話は走査に居ないので `gone`）
+    /// （修正前は名指しが古いまま `session_mismatch` で毎回走査し、答える会話 ID も `/clear` 前のまま）
     #[test]
     fn issue2041_clearの後はレジストリの会話idが報告で更新され以後は走査しない() {
         use crate::orchestrator::registry::{self, RegisterSpawn, WorkerRegistry};
@@ -31847,8 +31847,7 @@ mod tests {
         let q = query();
         assert_eq!(q.session_id.as_deref(), Some(OLD));
         let (v, consults) = scan_consults_2017(|| {
-            finish_worker_status(ctx(), q.session_id.as_deref(), q.tmux_session.as_deref())
-                .unwrap()
+            finish_worker_status(ctx(), q.session_id.as_deref(), q.tmux_session.as_deref()).unwrap()
         });
         assert_eq!(
             consults, 0,
@@ -31859,15 +31858,14 @@ mod tests {
             json!({"skipped": true, "reason": "mod_fresh", "registry_followed": true})
         );
         assert_eq!(v["resolved_session_id"], NEW);
-        assert_eq!(v["status"], "idle", "古い会話の `gone` を返さない: {v}");
+        assert_eq!(v["status"], "idle", "{v}");
         assert_eq!(recorded(), NEW, "レジストリが報告の会話 ID へ更新される");
 
         // 以後: レジストリから補った名指しが報告と一致 = 追従なしで走査しない
         let q = query();
         assert_eq!(q.session_id.as_deref(), Some(NEW));
         let (v, consults) = scan_consults_2017(|| {
-            finish_worker_status(ctx(), q.session_id.as_deref(), q.tmux_session.as_deref())
-                .unwrap()
+            finish_worker_status(ctx(), q.session_id.as_deref(), q.tmux_session.as_deref()).unwrap()
         });
         assert_eq!(consults, 0, "{v}");
         assert_eq!(
@@ -31876,9 +31874,8 @@ mod tests {
         );
 
         // 呼び出し側が記録と違う会話を明示したら、その会話について走査が答える（#2017 のまま）
-        let (v, consults) = scan_consults_2017(|| {
-            finish_worker_status(ctx(), Some(OLD), Some(BACKEND)).unwrap()
-        });
+        let (v, consults) =
+            scan_consults_2017(|| finish_worker_status(ctx(), Some(OLD), Some(BACKEND)).unwrap());
         assert!(consults >= 1, "{v}");
         assert_eq!(
             v["agents_scan"],

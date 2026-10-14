@@ -3244,6 +3244,42 @@ master の watch 相当に 4 ペインの `orchestrator status` と `self` を 5
 ペインの mod の無い claude は `reason = disabled` で走査へ落ち、会話 ID は走査で解ける。
 **本番の修正後の値は着地後に計測**（修正前の本番は 40〜60 本/分・子の CPU 24.4%）
 
+### #2041: 残りの走査を mod の報告で埋める（2026-10-15。エピック #2011）
+
+#2017 の後に走査を起こす口が 2 つ残っていた。
+
+- **GUI モードのチャット表示**（`chat_view::load_chat_refresh`）: 2 秒 tick のたびに全アカウントの
+  `live_claude_sessions` を問い、鮮度 30 秒（#1011 の `Ui`）ごとにアカウント数ぶん起こしていた。
+  `collect_chat_targets`（UI スレッド・メモリだけ）で監視と同じ `monitor_plan` を引き、新しい報告のあるペインは
+  `LiveClaudeSession::from_mod`（会話 ID・モデル・`status_word` の状態。ctx% は持たない = 既存の
+  mod → 画面 → transcript の段が採る）で埋める。走査は `chat_scan_ask`（子プロセスが動いていて報告の無いペイン）が
+  残るときだけ `live_claude_sessions_asking` で `ScanScope::Under` に絞る。報告を送るのはペインの env で mod を
+  読んだ claude なので対話型として扱う（#2017 のカタログの `detected_from_mod` と同じ前提。人がペインで打った
+  `claude -p` も報告しうるのは同じ）
+- **`/clear`・`/resume` の後のレジストリの会話 ID**: レジストリは spawn 直後の会話 ID のままなので、
+  `worker_status` の名指しが報告と食い違い（`session_mismatch`）5 秒ごとに走査し続けていた。走査は古い会話 ID に
+  ついて答え（実測で status は idle のまま）、`resolved_session_id` も `/clear` 前の会話を指したまま。
+  器のあるペインはセッションカタログの 30 秒走査（#2017 の `from_mod`）が書き戻すまでで、**器の無いペインは
+  カタログの走査が止まる構成（`tmux_persist` が偽）なのでずっと**。`claude_mod::follow_session` が「名指しが
+  レジストリの記録そのもの・報告が監視の答えになる・会話 ID が違う」ときだけ報告の会話 ID を返し、
+  `finish_worker_status`（background）がそれを名指しにしてレジストリへ書き戻す（`agents_scan.registry_followed`）。
+  呼び出し側が記録と違う会話 ID を明示したら #2017 どおり走査（その会話について答える）。ペインの取り違えは
+  `verify_ctx_pane_identity` が先に報告ごと捨てる
+
+**実測（同一バイナリ A/B。`bash scripts/test-session-scan-mod-2041.sh`）**: 隔離 GUI（tako-vd・一時の HOME）に走査先 4
+（既定 + 一時アカウント 3）と mod 入りの実 claude 2.1.294（偽 Messages API）を置き、走査は GUI の PATH の先頭の
+`claude` の包みで数えた。
+
+| 段 | 旧（`TAKO_2041_LEGACY=1`） | 新 |
+|---|---|---|
+| chat: GUI モード・claude 4 本（4 アカウント）がチャット表示の 60 秒 | 8 本（各アカウント 2 本。2 回とも同じ） | **0 本**（2 回とも） |
+| chat: mod の無い claude（acct-c）を足した 35 秒 | — | 2 本（acct-c 1・既定 1 = 絞った走査）。そのペインもチャット表示になる |
+| clear（器あり）: `/clear` 後の監視（5 秒ごと）25 秒 | 2 本（1・2 回目が `session_mismatch`、3 回目以降はカタログの 30 秒走査が書き戻して `mod_fresh`） | **0 本**（1 回目で `registry_followed`・以後 `mod_fresh`） |
+| clear（器なし = `TAKO_PERSIST=0`）: 同じ 25 秒 | 12 本（6 回とも `session_mismatch`・レジストリは古いまま。2 回とも同じ） | **0 本**（同上） |
+
+表示（4 ペインの `pane_display` = chat・`chat_header` 4 件）と 1 回目の状態（idle）は新旧で同じ。本物の `~/.claude*` に
+検証の会話（会話 ID の transcript・作業フォルダの projects の dir）は 1 件も書かれていない
+
 ## 上限の見出しはペイン幅で折り返される（#1123。2026-09-04）
 
 停止判定（`is_limit_exhausted_line` / `entitlement_block_line`）と解除時刻

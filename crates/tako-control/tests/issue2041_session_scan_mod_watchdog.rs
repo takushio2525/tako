@@ -8,8 +8,8 @@
 //!    2 秒 tick のたびに**全アカウント**を問い、鮮度 30 秒ごとにアカウント数ぶん `claude agents --json`
 //!    を起こしていた（mod の報告が会話 ID を運んでいても）
 //! 2. `/clear`・`/resume` の後もレジストリの会話 ID が spawn 直後のまま残り、worker_status は名指しが
-//!    報告と食い違う（`session_mismatch`）ので 5 秒ごとに走査し続けていた。古い会話は走査に居ないので
-//!    状態は `gone` になり、mod の状態での上書きも効かない
+//!    報告と食い違う（`session_mismatch`）ので 5 秒ごとに走査し続けていた（答える会話 ID も `/clear` 前の
+//!    会話のまま。器の無いペインはセッションカタログの走査が止まる構成なのでずっと）
 //!
 //! # 何を縛るか
 //!
@@ -268,9 +268,9 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
     let rename = first(&w, "let session_id = followed");
     let plan = first(&w, "monitor_plan(");
     // 追従した会話 ID（`new_sid`）を書く行（lazy 昇格の `record_session_detected` は別物）
-    let write = w
-        .iter()
-        .position(|l| !is_comment(l) && l.contains("record_session_detected") && l.contains("new_sid"));
+    let write = w.iter().position(|l| {
+        !is_comment(l) && l.contains("record_session_detected") && l.contains("new_sid")
+    });
     match (follow, rename, plan) {
         (Some(f), Some(r), Some(p)) if f < r && r < p => {}
         _ => {
