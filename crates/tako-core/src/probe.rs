@@ -423,6 +423,21 @@ pub fn issue1991_legacy() -> bool {
     })
 }
 
+/// #2052 の A/B（`TAKO_2052_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// ユーザータスクの一覧（CLI / MCP / PWA の `tako todo list`）と完了・却下（IPC と右パネルの
+/// ボタン）を UI スレッドの同期の dispatch で待ち、そのたびに置き場を読んで配送を畳み込む。
+/// コマンドパレット・`tako panel` で tasks ビューを開いても一覧を引き直さない。
+/// **ゲートはこの 1 か所**で、tako-control / tako-app もここを読む
+pub fn issue2052_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2052_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。

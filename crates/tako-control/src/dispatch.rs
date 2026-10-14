@@ -2735,6 +2735,13 @@ pub enum OffloadJob {
     /// 出す検索の登録だけを行い、走査と照合は background。出す検索の答えを置き場へ置くのは
     /// [`OffloadContinuation::WorkspaceSearch`] で UI スレッドへ戻す
     WorkspaceSearch(Box<crate::workspace_search::WorkspaceSearchJob>),
+    /// ユーザータスクの一覧（CLI / MCP / PWA の 5 秒ごと。#2052）。UI スレッドでは送達フローの
+    /// 観測と画面の展開状態の写しだけを行い、配送の書き戻しと置き場の読みは background
+    /// （workspace に触らないのでそのまま background から応答する）
+    UserTaskList(Box<UserTaskListJob>),
+    /// ユーザータスクの完了・却下（#2052）。書き戻しと状態遷移は background、開いていた行を
+    /// 畳むのは [`OffloadContinuation::UserTaskStatus`] で UI スレッドへ戻す
+    UserTaskStatus(Box<UserTaskStatusJob>),
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -2830,6 +2837,8 @@ pub enum OffloadContinuation {
     Probed(Box<ProbedRequest>),
     /// 右パネルへ出す横断検索の答えを置き場へ置く（[`workspace_search_land`]。#1694）
     WorkspaceSearch(Box<crate::workspace_search::WorkspaceSearchLanding>),
+    /// ユーザータスクの完了・却下の後始末（開いていた行を畳む。[`user_task_status_finish`]。#2052）
+    UserTaskStatus(Box<UserTaskStatusLanding>),
 }
 
 impl OffloadContinuation {
@@ -2841,7 +2850,8 @@ impl OffloadContinuation {
     /// 先取りした要求（#1984）は同期の腕と同じ判定（`protocol::changes_layout`）
     pub fn changes_layout(&self) -> bool {
         match self {
-            Self::List(_) => false,
+            // #2052: 完了・却下は同期の腕の判定（`protocol::changes_layout`）でも偽
+            Self::List(_) | Self::UserTaskStatus(_) => false,
             Self::Probed(probed) => crate::protocol::changes_layout(&probed.request),
             _ => true,
         }
@@ -2893,6 +2903,7 @@ pub fn finish_offload(
             with_ui_probes(&probes, || dispatch(host, request, origin))
         }
         OffloadContinuation::WorkspaceSearch(landing) => workspace_search_land(host, *landing),
+        OffloadContinuation::UserTaskStatus(landing) => Ok(user_task_status_finish(host, *landing)),
     }
 }
 
@@ -3294,6 +3305,15 @@ pub fn prepare_offload(
                 socket: socket.clone(),
             }))
         }
+        // #2052: `tako todo list`（PWA は 5 秒ごと）と完了・却下は置き場の読み書きを UI スレッドで
+        // 待たない。ここで行うのは送達フローの観測と画面の展開状態の写しまで。A/B の
+        // `TAKO_2052_LEGACY=1` は修正前と同じ `None` = UI スレッドで同期実行
+        Request::UserTask { action, .. }
+            if matches!(action.as_str(), "list" | "done" | "dismiss")
+                && !tako_core::probe::issue2052_legacy() =>
+        {
+            Some(user_task_offload_prepare(host, request))
+        }
         // 呼び出し元の pid 祖先辿り・CLI の所在確認・再起動の計画の走査を先取りする。
         // 先取りが要らない（pid の無い self 等）ときは `None` = 同期の腕（子プロセスを起こさない）。
         // 要るものの判断（`probe_needs`）も空の答えの内側で回す（判断の途中で待たない）
@@ -3371,6 +3391,13 @@ impl OffloadJob {
                     round,
                 })))
             }
+            // #2052: 書き換えに失敗したら UI スレッドへ戻らずにそのまま応答する（畳まない）
+            OffloadJob::UserTaskStatus(job) => match user_task_status_store(*job) {
+                Ok(landing) => {
+                    OffloadOutcome::OnUi(OffloadContinuation::UserTaskStatus(Box::new(landing)))
+                }
+                Err(e) => OffloadOutcome::Reply(Err(e)),
+            },
             other => OffloadOutcome::Reply(other.run_reply()),
         }
     }
@@ -3463,6 +3490,7 @@ impl OffloadJob {
                 Ok(json!({ "sessions": fetch_tmux_sessions(&ctx, socket.as_deref()) }))
             }
             OffloadJob::GitWrite { cwd, request } => git_write_reply(&cwd, *request),
+            OffloadJob::UserTaskList(job) => user_task_list_offload(*job),
             OffloadJob::LspMenu(job) => Ok(job.run().to_json()),
             OffloadJob::LspGoto(_) => Err(DispatchError::Operation(
                 "定義ジャンプは run_staged で走らせる（着地に UI スレッドの続きが要る）".into(),
@@ -3493,6 +3521,10 @@ impl OffloadJob {
             )),
             OffloadJob::Probe(_) => Err(DispatchError::Operation(
                 "先取りの要求は run_staged で走らせる（dispatch に UI スレッドの続きが要る）"
+                    .into(),
+            )),
+            OffloadJob::UserTaskStatus(_) => Err(DispatchError::Operation(
+                "完了・却下は run_staged で走らせる（開いていた行を畳むのに UI スレッドの続きが要る）"
                     .into(),
             )),
         }
@@ -19759,7 +19791,7 @@ fn dispatch_user_task(
     origin: PaneOrigin,
     params: UserTaskParams,
 ) -> Result<Value, DispatchError> {
-    use tako_core::user_task::{NewTask, TaskPatch, TaskStatus};
+    use tako_core::user_task::{NewTask, TaskPatch};
 
     let path = crate::user_tasks::store_path()
         .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
@@ -19827,6 +19859,8 @@ fn dispatch_user_task(
             host.notify_user_task_added(&new_id, value["title"].as_str().unwrap_or("-"));
             Ok(value)
         }
+        // #2052: IPC（CLI / MCP / PWA）からは `prepare_offload` が background へ出すので、
+        // ここへ来るのは Context の無い直呼びと A/B の `TAKO_2052_LEGACY=1`。中身は共有の 1 実装
         "list" => {
             let filter = user_task_filter(
                 params.status.as_deref(),
@@ -19834,14 +19868,7 @@ fn dispatch_user_task(
                 params.project.clone(),
                 params.all,
             )?;
-            let mut value = crate::user_tasks::list_at(&path, &filter).map_err(op_err)?;
-            // #1479: 画面が**いまどれを開いているか**を同じ応答で読ませる
-            // （AI から「見えている状態」を問える = 設計原則 5）。
-            // 画面が無い host では `null` = 嘘をつかない
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("expanded".to_string(), json!(host.user_task_expanded()));
-            }
-            Ok(value)
+            user_task_list_reply(&path, &filter, host.user_task_expanded())
         }
         "show" => {
             let id = user_task_id(&params)?;
@@ -19870,21 +19897,16 @@ fn dispatch_user_task(
             };
             crate::user_tasks::update_at(&path, &id, patch).map_err(op_err)
         }
+        // #2052: IPC と右パネルのボタンは `prepare_offload` で ① 観測（UI）→ ② 書き換え
+        // （background）→ ③ 畳む（UI）の 3 段に分かれる。ここは同じ段を同じスレッドで順に通す
         "done" | "dismiss" => {
             let id = user_task_id(&params)?;
-            let status = if params.action == "done" {
-                TaskStatus::Done
-            } else {
-                TaskStatus::Dismissed
-            };
+            let status = user_task_status_of(&params.action);
             let value = crate::user_tasks::set_status_at(&path, &id, status).map_err(op_err)?;
-            // #1479: 画面でその行を開いていたなら畳む。**GUI のボタンも同じことをする**
-            // ので、CLI / MCP から閉じたときだけ「開いていることになっているのに
-            // 一覧に無い」が残る、を作らない
-            if host.user_task_expanded().as_deref() == Some(id.as_str()) {
-                host.set_user_task_expanded(None);
-            }
-            Ok(value)
+            Ok(user_task_status_finish(
+                host,
+                UserTaskStatusLanding { id, value },
+            ))
         }
         // #2016: 積む → 運ぶ → 記録する の 3 段を**同じスレッドで順に**通す。
         // 画面（右パネル）は同じ 3 つを ① ③ = background / ② = UI スレッドに分けて呼ぶ
@@ -20056,11 +20078,23 @@ pub fn user_task_respond_finish(
 }
 
 fn user_task_id(params: &UserTaskParams) -> Result<String, DispatchError> {
-    params
-        .id
-        .clone()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| DispatchError::InvalidParams(format!("{} には id が必要", params.action)))
+    required_user_task_id(&params.action, params.id.as_deref())
+}
+
+/// id の要る action の id（空は無いものと同じ。dispatch と `prepare_offload` が同じ 1 つを通る）
+fn required_user_task_id(action: &str, id: Option<&str>) -> Result<String, DispatchError> {
+    id.filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| DispatchError::InvalidParams(format!("{action} には id が必要")))
+}
+
+/// `done` / `dismiss` の行き先（呼ぶ側は 2 つのどちらかであることを確かめてから呼ぶ）
+fn user_task_status_of(action: &str) -> tako_core::user_task::TaskStatus {
+    if action == "done" {
+        tako_core::user_task::TaskStatus::Done
+    } else {
+        tako_core::user_task::TaskStatus::Dismissed
+    }
 }
 
 /// 起票元（返答の戻り先）。**呼び出し側は何も指定しなくてよい**のが要件
@@ -20180,16 +20214,25 @@ fn user_task_pane_roles(workspace: &tako_core::Workspace) -> Vec<crate::user_tas
 }
 
 /// 決着していない配送を `prompt_delivery_state`（#1259）で確定させる。
-/// 失敗しても呼び出し元の操作は続ける（畳み込みは副次的な仕事）
+/// 失敗しても呼び出し元の操作は続ける（畳み込みは副次的な仕事）。
+///
+/// #2052: 観測（host）と書き戻し（置き場）は background の経路と同じ 2 つ
+/// （[`user_task_flows_observe`] → [`reconcile_user_task_flows`]）を同じスレッドで順に呼ぶ。
+/// 決着したフローが 1 つも無い（ふだん）なら置き場を読まない
 fn reconcile_user_task_deliveries(host: &dyn ControlHost, path: &std::path::Path) {
-    let Ok(store) = crate::user_tasks::load_from(path) else {
-        return;
-    };
-    let observed = observe_user_task_deliveries(host, &pending_delivery_panes(&store));
-    if observed.is_empty() {
+    // A/B（`TAKO_2052_LEGACY=1`）: 修正前 = 毎回置き場を読んで決着待ちの宛先を知ってから観測する
+    if tako_core::probe::issue2052_legacy() {
+        let Ok(store) = crate::user_tasks::load_from(path) else {
+            return;
+        };
+        let observed = observe_user_task_deliveries(host, &pending_delivery_panes(&store));
+        if observed.is_empty() {
+            return;
+        }
+        let _ = crate::user_tasks::reconcile_at(path, &observed);
         return;
     }
-    let _ = crate::user_tasks::reconcile_at(path, &observed);
+    reconcile_user_task_flows(path, &user_task_flows_observe(host));
 }
 
 /// 決着していない配送（タスク id と配送先のペイン）。**正本を読んだ側**が 1 回だけ数える
@@ -20355,6 +20398,187 @@ pub fn user_task_list_load(
         },
         read,
     })
+}
+
+// --- IPC の一覧と完了・却下（#2052） ----------------------------------------
+//
+// CLI / MCP / PWA（5 秒ごと）の `list` と、IPC・右パネルのボタンの `done` / `dismiss` は、
+// UI スレッドの同期の dispatch で置き場を 2 度（配送の畳み込み + 一覧）読み、完了・却下は
+// YAML の書き換えまで待っていた（#2031 と同じ型）。#2031 の観測 / 読みの 2 段と同じく、
+// host に触るのは配送の観測（送達フローを読むだけ）と画面の展開状態だけなので、
+//
+// - list: ① 観測と展開状態の写し（UI。`prepare_offload`）→ ② 書き戻しと読み（background）
+// - done / dismiss: ① 観測（UI）→ ② 書き戻しと状態遷移（background）→ ③ 開いていた行を
+//   畳む（UI。`finish_offload`）= #2016 の respond の 3 段と同じ分け方
+//
+// に分ける。**段の中身は dispatch の同期の腕と共有の 1 実装**（同期の腕は同じ段を順に呼ぶ）。
+// IPC の要求は #2031 の前回の正本を持たないので、どの配送が決着待ちかを UI スレッドでは
+// 知らない。そこで観測は生きている全ペインの決着したフローを採り、突き合わせは ② が行う。
+
+/// 決着した送達フロー（ペイン → 顛末。① が採って ② へ渡す）
+#[derive(Default)]
+pub struct UserTaskFlows(Vec<(u64, Value)>);
+
+/// ① 生きている全ペイン（表示中のタブ + バックグラウンド）の送達フローのうち、決着したものを
+/// 採る（**UI スレッド**。host のメモリを読むだけで置き場に触らない）。
+///
+/// 閉じたペインの顛末は host が落とす（`drop_prompt_delivery_state`）ので、生きているペインを
+/// 見れば旧実装（決着待ちの配送先を名指しで見る）と同じものが採れる
+pub fn user_task_flows_observe(host: &dyn ControlHost) -> UserTaskFlows {
+    UserTaskFlows(
+        host.workspace()
+            .all_panes()
+            .into_iter()
+            .filter_map(|pane| {
+                let flow = host.prompt_delivery_state(pane.id())?;
+                crate::user_tasks::settle_state(Some(&flow))?;
+                Some((pane.id().as_u64(), flow))
+            })
+            .collect(),
+    )
+}
+
+/// ② 決着していない配送を ① のフローで畳み込む（**host に触らない** = background で呼べる）。
+/// 決着したフローが 1 つも無ければ置き場を読まない（ふだんの `list` の読みは一覧の 1 回だけ）
+fn reconcile_user_task_flows(path: &std::path::Path, flows: &UserTaskFlows) {
+    if flows.0.is_empty() {
+        return;
+    }
+    let Ok(store) = crate::user_tasks::load_from(path) else {
+        return;
+    };
+    let observed: Vec<(String, Option<Value>)> = pending_delivery_panes(&store)
+        .into_iter()
+        .filter_map(|(id, pane)| {
+            let (_, flow) = flows.0.iter().find(|(p, _)| Some(*p) == pane)?;
+            Some((id, Some(flow.clone())))
+        })
+        .collect();
+    if observed.is_empty() {
+        return;
+    }
+    let _ = crate::user_tasks::reconcile_at(path, &observed);
+}
+
+/// `list` の応答（dispatch の同期の腕と background の 1 実装）。
+///
+/// #1479: 画面が**いまどれを開いているか**を同じ応答で読ませる（AI から「見えている状態」を
+/// 問える = 設計原則 5）。画面が無い host では `null` = 嘘をつかない。background の経路では
+/// ① が要求の時点の値を写して渡す
+fn user_task_list_reply(
+    path: &std::path::Path,
+    filter: &tako_core::user_task::TaskFilter,
+    expanded: Option<String>,
+) -> Result<Value, DispatchError> {
+    let mut value = crate::user_tasks::list_at(path, filter).map_err(DispatchError::Operation)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("expanded".to_string(), json!(expanded));
+    }
+    Ok(value)
+}
+
+/// `list` の background のジョブ（① で採ったもの）
+pub struct UserTaskListJob {
+    path: PathBuf,
+    filter: tako_core::user_task::TaskFilter,
+    flows: UserTaskFlows,
+    expanded: Option<String>,
+}
+
+/// `done` / `dismiss` の background のジョブ（① で採ったもの）
+pub struct UserTaskStatusJob {
+    path: PathBuf,
+    id: String,
+    status: tako_core::user_task::TaskStatus,
+    flows: UserTaskFlows,
+}
+
+/// ② の結果（書き換えた 1 件）。③ が UI スレッドで後始末をして応答する
+pub struct UserTaskStatusLanding {
+    id: String,
+    value: Value,
+}
+
+/// ① `list` / `done` / `dismiss` の UI スレッドの部分（`prepare_offload` の腕）。
+/// 置き場の場所と引数の検査・送達フローの観測・展開状態の写しだけを行う
+fn user_task_offload_prepare(
+    host: &dyn ControlHost,
+    request: &Request,
+) -> Result<OffloadJob, DispatchError> {
+    let Request::UserTask {
+        action,
+        id,
+        status,
+        kind,
+        project,
+        all,
+        ..
+    } = request
+    else {
+        return Err(DispatchError::InvalidParams(
+            "user_task_offload_prepare が受けるのは UserTask だけ".into(),
+        ));
+    };
+    let path = crate::user_tasks::store_path()
+        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    match action.as_str() {
+        "list" => {
+            let filter =
+                user_task_filter(status.as_deref(), kind.as_deref(), project.clone(), *all)?;
+            Ok(OffloadJob::UserTaskList(Box::new(UserTaskListJob {
+                path,
+                filter,
+                flows: user_task_flows_observe(host),
+                expanded: host.user_task_expanded(),
+            })))
+        }
+        "done" | "dismiss" => Ok(OffloadJob::UserTaskStatus(Box::new(UserTaskStatusJob {
+            path,
+            id: required_user_task_id(action, id.as_deref())?,
+            status: user_task_status_of(action),
+            flows: user_task_flows_observe(host),
+        }))),
+        other => Err(DispatchError::InvalidParams(format!(
+            "user_task_offload_prepare が受けるのは list / done / dismiss だけ（{other:?}）"
+        ))),
+    }
+}
+
+/// ② `list`（background）: 決着した配送を書き戻してから一覧を組む
+fn user_task_list_offload(job: UserTaskListJob) -> Result<Value, DispatchError> {
+    let UserTaskListJob {
+        path,
+        filter,
+        flows,
+        expanded,
+    } = job;
+    reconcile_user_task_flows(&path, &flows);
+    user_task_list_reply(&path, &filter, expanded)
+}
+
+/// ② `done` / `dismiss`（background）: 決着した配送を書き戻してから状態を書き換える
+fn user_task_status_store(job: UserTaskStatusJob) -> Result<UserTaskStatusLanding, DispatchError> {
+    let UserTaskStatusJob {
+        path,
+        id,
+        status,
+        flows,
+    } = job;
+    reconcile_user_task_flows(&path, &flows);
+    let value =
+        crate::user_tasks::set_status_at(&path, &id, status).map_err(DispatchError::Operation)?;
+    Ok(UserTaskStatusLanding { id, value })
+}
+
+/// ③ `done` / `dismiss`（**UI スレッド**）: 画面でその行を開いていたなら畳む（#1479）。
+/// **GUI のボタンも同じことをする**ので、CLI / MCP から閉じたときだけ「開いていることに
+/// なっているのに一覧に無い」が残る、を作らない
+fn user_task_status_finish(host: &mut dyn ControlHost, landing: UserTaskStatusLanding) -> Value {
+    let UserTaskStatusLanding { id, value } = landing;
+    if host.user_task_expanded().as_deref() == Some(id.as_str()) {
+        host.set_user_task_expanded(None);
+    }
+    value
 }
 
 /// 返答を起票 master へ運ぶ（#1450 の要件追加 ③）。
@@ -42210,6 +42434,217 @@ mod tests {
         let after = t2031_load(&before.cache);
         assert!(!after.read, "置き場は変わっていないのに読み直した");
         assert_eq!(after.value["tasks"][0]["attachments"][0]["exists"], true);
+    }
+
+    // --- #2052: IPC の一覧と完了・却下（UI スレッドで置き場を読み書きしない） ---
+
+    fn t2052_request(action: &str, id: Option<&str>) -> Request {
+        Request::UserTask {
+            action: action.into(),
+            id: id.map(str::to_string),
+            title: None,
+            body: None,
+            kind: None,
+            status: None,
+            all: None,
+            project: None,
+            attachments: None,
+            copy_texts: None,
+            links: None,
+            due: None,
+            decision: None,
+            comment: None,
+            via: None,
+            pane: None,
+            caller_role: None,
+        }
+    }
+
+    /// `prepare_offload` → background → 着地を 1 本で回す（IPC の受け口と同じ順）
+    fn t2052_drive(host: &mut MockHost, job: OffloadJob) -> Result<Value, DispatchError> {
+        match job.run_staged() {
+            OffloadOutcome::Reply(result) => result,
+            OffloadOutcome::OnUi(next) => finish_offload(host, next, PaneOrigin::Cli),
+        }
+    }
+
+    /// `list` の UI スレッドの段は置き場を読まない（壊れた置き場でも準備は通り、background の
+    /// 段だけが Err を返す）。応答は dispatch の同期の腕と同じ形（`expanded` は要求の時点の値）
+    #[test]
+    fn issue2052_一覧の準備は置き場を読まずbackgroundだけが読む() {
+        let (dir, _guard) = t1479_env("t2052-list");
+        let path = dir.path().join("user-tasks.yaml");
+        let mut host = MockHost::new();
+        let id = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap()
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        dispatch_user_task(
+            &mut host,
+            PaneOrigin::Cli,
+            t1479_params("expand", Some(&id)),
+        )
+        .unwrap();
+        let sync = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("list", None))
+            .expect("同期の腕");
+        let job = match prepare_offload(&mut host, &t2052_request("list", None)) {
+            Some(Ok(job @ OffloadJob::UserTaskList(_))) => job,
+            Some(Ok(_)) => panic!("list が別のジョブになった"),
+            Some(Err(e)) => panic!("list の準備が失敗した: {e}"),
+            None => panic!("list が UI スレッドの同期の dispatch のまま（#2052）"),
+        };
+        assert_eq!(t2052_drive(&mut host, job).unwrap(), sync);
+        assert_eq!(sync["expanded"].as_str(), Some(id.as_str()));
+        // 壊れた置き場: 準備（UI スレッド）は読まないので通り、background が 0 件へ丸めず Err
+        std::fs::write(&path, "tasks: [ {{{ 壊れた").unwrap();
+        let job = match prepare_offload(&mut host, &t2052_request("list", None)) {
+            Some(Ok(job)) => job,
+            _ => panic!("準備が置き場を読んだ（壊れた置き場で準備が失敗した）"),
+        };
+        assert!(t2052_drive(&mut host, job).is_err_and(|e| e.to_string().contains("パースに失敗")));
+        // 取得条件の誤りは準備（UI スレッド）で即座に返す（置き場に触らない）
+        let mut bad = t2052_request("list", None);
+        if let Request::UserTask { status, .. } = &mut bad {
+            *status = Some("どれでもない".into());
+        }
+        assert!(matches!(
+            prepare_offload(&mut host, &bad),
+            Some(Err(DispatchError::InvalidParams(_)))
+        ));
+    }
+
+    /// 完了・却下は ① 観測（UI）→ ② 書き換え（background）→ ③ 畳む（UI）。② までは画面の展開に
+    /// 触らず、③ で畳む。失敗（無い id）は UI スレッドへ戻らずに Err で、展開は残る
+    #[test]
+    fn issue2052_完了は書き換えをbackgroundで行い着地で畳む() {
+        let (_dir, _guard) = t1479_env("t2052-status");
+        let mut host = MockHost::new();
+        let add = |host: &mut MockHost| {
+            dispatch_user_task(host, PaneOrigin::Cli, t1479_params("add", None)).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let a = add(&mut host);
+        let b = add(&mut host);
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("expand", Some(&a))).unwrap();
+        let job = match prepare_offload(&mut host, &t2052_request("done", Some(&a))) {
+            Some(Ok(job @ OffloadJob::UserTaskStatus(_))) => job,
+            _ => panic!("done が background のジョブにならない（#2052）"),
+        };
+        // ① の時点ではまだ書いていない
+        let open =
+            dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("list", None)).unwrap();
+        assert_eq!(open["count"], 2, "準備（UI スレッド）が書き換えた");
+        let next = match job.run_staged() {
+            OffloadOutcome::OnUi(next) => next,
+            OffloadOutcome::Reply(r) => panic!("畳む続きが無い: {r:?}"),
+        };
+        assert!(!next.changes_layout(), "完了の着地で強制描画を頼んだ");
+        // ② の後・③ の前: 置き場は done、画面はまだ開いたまま（host に触っていない）
+        assert_eq!(host.user_task_expanded.as_deref(), Some(a.as_str()));
+        let value = finish_offload(&mut host, next, PaneOrigin::Cli).unwrap();
+        assert_eq!(value["status"], "done");
+        assert_eq!(host.user_task_expanded, None, "開いていた行を畳まなかった");
+        // 別の行（b）を開いたまま却下しても、開いている行は残る
+        dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("expand", Some(&b))).unwrap();
+        let job = prepare_offload(&mut host, &t2052_request("dismiss", Some(&a)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(t2052_drive(&mut host, job).unwrap()["status"], "dismissed");
+        assert_eq!(host.user_task_expanded.as_deref(), Some(b.as_str()));
+        // 無い id: background の段が Err を返し、UI スレッドへは戻らない
+        let job = prepare_offload(&mut host, &t2052_request("done", Some("t-無い")))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            job.run_staged(),
+            OffloadOutcome::Reply(Err(DispatchError::Operation(_)))
+        ));
+        assert_eq!(host.user_task_expanded.as_deref(), Some(b.as_str()));
+        // id 無し / 空は準備で即座に断る
+        for id in [None, Some("")] {
+            assert!(matches!(
+                prepare_offload(&mut host, &t2052_request("done", id)),
+                Some(Err(DispatchError::InvalidParams(_)))
+            ));
+        }
+        // ほかの action は従来どおり同期の dispatch（範囲外を勝手に背景へ出さない）
+        assert!(prepare_offload(&mut host, &t2052_request("show", Some(&b))).is_none());
+    }
+
+    /// 配送の観測（UI）は生きているペインのフローだけを採り、決着待ちの配送との突き合わせと
+    /// 書き戻しは background。関係の無いペインのフローでは畳まない
+    #[test]
+    fn issue2052_配送の観測と書き戻しが分かれて確定する() {
+        use tako_core::user_task::DeliveryState;
+        let (dir, _guard) = t1479_env("t2052-deliver");
+        let path = dir.path().join("user-tasks.yaml");
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let id = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap()
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        crate::user_tasks::record_delivery_at(
+            &path,
+            &id,
+            crate::user_tasks::delivery_record(
+                DeliveryState::Sent,
+                "t2052",
+                Some(pane),
+                None,
+                None,
+                0,
+            ),
+        )
+        .unwrap();
+        // 決着したフローが無い: 観測は空（background も畳み込みのために読まない）
+        assert!(user_task_flows_observe(&host).0.is_empty());
+        // 送達を確認した: 観測は 1 件、準備の時点では置き場はまだ sent
+        host.prompt_delivery_states.insert(
+            pane,
+            tako_core::prompt_delivery::Status::delivered("pty", "submitted", 1).to_json(),
+        );
+        let job = prepare_offload(&mut host, &t2052_request("list", None))
+            .unwrap()
+            .unwrap();
+        let before = crate::user_tasks::show_at(&path, &id).unwrap();
+        assert_eq!(before["delivery"]["state"], "sent", "準備が書き戻した");
+        let value = t2052_drive(&mut host, job).unwrap();
+        assert_eq!(value["tasks"][0]["delivery"]["state"], "delivered");
+        // 関係の無いペイン（配送先でない）のフローでは畳まない
+        let other = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        crate::user_tasks::record_delivery_at(
+            &path,
+            &other,
+            crate::user_tasks::delivery_record(
+                DeliveryState::Sent,
+                "t2052",
+                Some(pane.wrapping_add(999)),
+                None,
+                None,
+                0,
+            ),
+        )
+        .unwrap();
+        let job = prepare_offload(&mut host, &t2052_request("list", None))
+            .unwrap()
+            .unwrap();
+        let value = t2052_drive(&mut host, job).unwrap();
+        let state = value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"].as_str() == Some(other.as_str()))
+            .map(|t| t["delivery"]["state"].clone());
+        assert_eq!(state, Some(json!("sent")), "別のペインのフローで畳んだ");
     }
 
     // --- #1466: worker が起票したユーザータスクの戻り先 ---
