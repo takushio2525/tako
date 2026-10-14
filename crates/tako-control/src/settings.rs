@@ -58,6 +58,12 @@ pub struct Settings {
     /// ので移行 Step は要らない（`Settings` の指紋は動くが、読み書きは後方互換）
     #[serde(default)]
     pub limit_resume_all: bool,
+    /// 重い処理の順番待ちの上限（FR-2.43.6 / Issue #1994。`tako queue limits` が書く）。
+    /// 各キーは `None` = 機に合わせた既定。**旧ファイルはキーが無くても既定で読める**
+    /// （節ごと `#[serde(default)]`）ので移行 Step は要らない（`Settings` の指紋は動くが、
+    /// 読み書きは後方互換）
+    #[serde(default, skip_serializing_if = "is_default_resources")]
+    pub resources: tako_core::queue::LimitSettings,
     /// PDF・画像・動画サムネのデコード済み画像キャッシュ上限（Issue #258。MiB）
     #[serde(default = "default_preview_cache_max_mb")]
     pub preview_cache_max_mb: u64,
@@ -190,6 +196,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_default_resources(r: &tako_core::queue::LimitSettings) -> bool {
+    *r == tako_core::queue::LimitSettings::default()
+}
+
 fn default_pane_log_max_mb() -> u64 {
     5
 }
@@ -243,6 +253,7 @@ impl Default for Settings {
             lsp_format_on_save: false,
             claude_mod: true,
             limit_resume_all: false,
+            resources: tako_core::queue::LimitSettings::default(),
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::default(),
@@ -674,6 +685,23 @@ mod tests {
         ))
     }
 
+    /// #1994: `resources` 節の無い旧ファイルは既定（機に合わせた上限）で読め、既定のままなら書き出さない
+    #[test]
+    fn 順番待ちの上限の節は無くても読める() {
+        let old: Settings = serde_json::from_str(r#"{"auto_rename": false}"#).unwrap();
+        assert_eq!(old.resources, tako_core::queue::LimitSettings::default());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(
+            json.get("resources").is_none(),
+            "既定のままなら節を書かない: {json}"
+        );
+        let set: Settings =
+            serde_json::from_str(r#"{"resources": {"max_jobs": 2, "max_wait_min": 10}}"#).unwrap();
+        assert_eq!(set.resources.max_jobs, Some(2));
+        assert_eq!(set.resources.max_wait_min, Some(10));
+        assert_eq!(set.resources.reserve_gb, None);
+    }
+
     #[test]
     fn 書き出しと読み戻しが往復する() {
         let path = temp_path("roundtrip");
@@ -689,6 +717,11 @@ mod tests {
             lsp_format_on_save: true,
             claude_mod: false,
             limit_resume_all: true,
+            resources: tako_core::queue::LimitSettings {
+                max_jobs: Some(2),
+                reserve_gb: Some(4.5),
+                ..Default::default()
+            },
             preview_cache_max_mb: 768,
             tmux_persist: false,
             sleep_guard_mode: crate::sleep_guard::SleepGuardMode::On,

@@ -78,6 +78,10 @@ for _p in "$HOME/.nodebrew/current/bin" "$HOME/.volta/bin" "$HOME/.fnm" "$HOME/n
   [[ -d "$_p" ]] && PATH="$_p:$PATH"
 done
 export PATH
+# 中のビルド（build-app.sh の run_heavy → tako queue）は人や worker の後ろへ low で並ぶ。
+# 夜は worker が走っていて待ちが長くなりうるので、待ちの上限は既定の 30 分ではなく 3 時間（#1994）
+export TAKO_QUEUE_PRIORITY=low
+export TAKO_QUEUE_MAX_WAIT=3h
 
 cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD

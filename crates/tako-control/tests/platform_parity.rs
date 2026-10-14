@@ -910,6 +910,19 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
              Windows 側（explorer / cmd start）は #617 で適用済みなので数に入らない",
         ),
         (
+            "crates/tako-control/src/queue.rs",
+            2,
+            "テストモジュール内（#1994。受付番号 = 生きた pid の代役として眠るだけの子を起こす。\
+             unix は sleep・Windows は ping の 2 件。製品コードの起動ではない）",
+        ),
+        (
+            "crates/tako-control/src/queue_wrapper.rs",
+            4,
+            "`tako queue <コマンド>`（CLI のプロセス）が利用者のコマンドを子として起こす 2 件（順番待ちあり / \
+             入れ子・tako 不在の素通し）。子は**親のコンソールを共有するのが正しい**（抑止すると出力が見えず、\
+             Ctrl+C も届かない）。GUI からは到達しない。残り 2 件はテストモジュール内（`#[cfg(unix)]` の sh）。#1994",
+        ),
+        (
             "crates/tako-control/src/remote.rs",
             7,
             "`/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト。#1768 の daemon の子の fd 検査で \

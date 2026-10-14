@@ -1669,17 +1669,24 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-        // 出自: #1993（PC リソース管理 #1992 の S1）
+        // 出自: #1993（PC リソース管理 #1992 の S1）/ #1994（S2 の順番待ち）
         json!({
             "name": "tako_queue",
             "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・\
                 ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。\
                 panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・\
-                ビルドの前に空きを確かめる。",
+                ビルドの前に空きを確かめる。queue 節は `tako queue <コマンド>` の順番待ち（実行中・待ち・上限）。\
+                cancel は id（受付番号）を取り消す。limits は上限の読み書き（省略で読むだけ）。\
+                順番待ちで走らせるのは CLI だけ。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["status"], "default": "status" },
+                    "action": { "type": "string", "enum": ["status", "cancel", "limits"], "default": "status" },
+                    "id": { "type": "integer" },
+                    "limits": {
+                        "type": "object",
+                        "description": "max_jobs / reserve_gb / swap_guard_gb / max_wait_min / reset",
+                    },
                 },
                 "additionalProperties": false,
             },

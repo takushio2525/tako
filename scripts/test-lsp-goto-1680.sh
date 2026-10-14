@@ -45,7 +45,7 @@ trap cleanup EXIT
 isolated_gui_bins || exit 1
 FAKE="$(dirname "$TAKO_BIN")/tako-lsp-fake"
 if [ ! -x "$FAKE" ]; then
-  (cd "$REPO_ROOT" && cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
+  (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
 fi
 
 export HOME="$TMP/home"

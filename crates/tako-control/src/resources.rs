@@ -19,13 +19,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tako_core::platform::resources as b29;
 use tako_core::resources::{
-    self as core_res, CpuTicks, MachineStats, Owner, ProcKey, ProcSample, Report, MIB,
+    self as core_res, CpuTicks, MachineStats, ManagedView, Owner, ProcKey, ProcSample, Report, MIB,
 };
 
 use crate::dispatch::DispatchError;
@@ -54,8 +54,13 @@ const MIN_CPU_WINDOW: Duration = Duration::from_millis(500);
 /// A/B（採取の費用の比較）: 背景スレッドを立てない。status は要求のたびにその場で採る
 const NO_SAMPLER_ENV: &str = "TAKO_1993_NO_SAMPLER";
 
-/// 読む env のキー（ペインの番号・どの tako の受け口か・隔離か）
-const ENV_KEYS: [&str; 3] = ["TAKO_PANE_ID", "TAKO_SOCKET", "TAKO_ISOLATED"];
+/// 読む env のキー（ペインの番号・どの tako の受け口か・隔離か・順番待ちの受付番号 = #1994）
+const ENV_KEYS: [&str; 4] = [
+    "TAKO_PANE_ID",
+    "TAKO_SOCKET",
+    "TAKO_ISOLATED",
+    crate::queue::ENV_JOB,
+];
 
 /// GUI から渡すペイン 1 つ
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,6 +87,9 @@ struct ProcSnapshot {
     readable: usize,
     took: Duration,
     interval: Duration,
+    /// 走査の生の値（順番待ちの木の集計 = [`managed`] が読む。#1994）
+    samples: Arc<Vec<ProcSample>>,
+    cpu: Arc<HashMap<ProcKey, f64>>,
 }
 
 #[derive(Default)]
@@ -102,6 +110,7 @@ struct CachedDetails {
     pane_id: Option<String>,
     socket: Option<String>,
     isolated: bool,
+    queue_job: Option<u64>,
 }
 
 #[derive(Default)]
@@ -265,6 +274,10 @@ fn refresh_processes(scan: &mut ScanState, now: Instant, interval: Duration) {
                 pane_id: d.env.get("TAKO_PANE_ID").cloned(),
                 socket: d.env.get("TAKO_SOCKET").cloned(),
                 isolated: d.env.get("TAKO_ISOLATED").is_some_and(|v| v == "1"),
+                queue_job: d
+                    .env
+                    .get(crate::queue::ENV_JOB)
+                    .and_then(|v| v.trim().parse().ok()),
             },
         );
     }
@@ -330,6 +343,7 @@ fn refresh_processes(scan: &mut ScanState, now: Instant, interval: Duration) {
                     )
                 }),
                 isolated: d.is_some_and(|d| d.isolated),
+                queue_job: d.and_then(|d| d.queue_job),
             }
         })
         .collect();
@@ -344,6 +358,8 @@ fn refresh_processes(scan: &mut ScanState, now: Instant, interval: Duration) {
         readable,
         took: t0.elapsed(),
         interval,
+        samples: Arc::new(samples),
+        cpu: Arc::new(scan.last_proc_pct.clone()),
     };
     lock(published()).procs = Some(snapshot);
 }
@@ -390,6 +406,51 @@ pub fn backend_roots(panes: &[PaneEntry], all: &[(String, u32)]) -> HashMap<u32,
         }
     }
     out
+}
+
+/// 機全体の覚え（採らない。順番待ちの調停役が読む。#1994）
+pub fn machine_stats() -> Option<MachineStats> {
+    lock(published()).machine.as_ref().map(|(_, m)| m.clone())
+}
+
+/// 機全体の覚えが [`MACHINE_INTERVAL`] より古ければこのスレッドで採り直す（8 µs。走査はしない）。
+/// **UI スレッドでは呼ばない**（順番待ちの受け口 = 接続のスレッドが呼ぶ。#1994）
+pub fn refresh_machine_if_stale() {
+    let now = Instant::now();
+    let stale = lock(published())
+        .machine
+        .as_ref()
+        .is_none_or(|(at, _)| now.duration_since(*at) >= MACHINE_INTERVAL);
+    if stale {
+        refresh_machine(&mut lock(scan_state()), now);
+    }
+}
+
+/// `until` までは走査を 2 秒ごとに保つ（順番待ちに件がある間。#1994）
+pub fn keep_scanning(until: Instant) {
+    let mut p = lock(published());
+    if p.wanted_until.is_none_or(|w| w < until) {
+        p.wanted_until = Some(until);
+    }
+}
+
+/// 順番待ちの木（受付番号, wrapper の pid）の消費と、通っていない重い処理の件数（#1994）。
+/// 走査の覚えが `since` より新しいときだけ返す（採らない。集計は走査 1 回ぶんの O(n)）
+pub fn managed(jobs: &[(u64, u32)], since: Option<Instant>) -> Option<(Instant, ManagedView)> {
+    let (at, samples, cpu, heavy) = {
+        let p = lock(published());
+        let snap = p.procs.as_ref()?;
+        if since.is_some_and(|s| snap.at <= s) {
+            return None;
+        }
+        (
+            snap.at,
+            Arc::clone(&snap.samples),
+            Arc::clone(&snap.cpu),
+            snap.report.heavy.clone(),
+        )
+    };
+    Some((at, core_res::managed_view(&samples, &cpu, &heavy, jobs)))
 }
 
 /// IPC / MCP の `Request::Queue` に答える（**UI スレッドでは呼ばない**。`ipc::submit` の手前）。

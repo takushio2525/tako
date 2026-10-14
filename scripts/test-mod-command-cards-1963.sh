@@ -43,6 +43,7 @@ unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_UR
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 ONLY="${ONLY:-}"
 PASS=0
 FAIL=0
@@ -83,7 +84,7 @@ REAL_BEFORE="$(snap_real)"
 CLIP_BEFORE="$(snap_clipboard)"
 
 # --- ビルド（visual-test の節を含む GUI と CLI。rebase 後の古いバイナリを掴まない）------------
-(cd "$REPO_ROOT" && cargo build -q -p tako-app --features visual-test && cargo build -q -p tako-cli) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app --features visual-test && run_heavy cargo build -q -p tako-cli) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins || exit 1

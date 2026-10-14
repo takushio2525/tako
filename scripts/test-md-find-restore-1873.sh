@@ -56,7 +56,7 @@ trap cleanup EXIT
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 echo "visual-test 入りの tako-app / tako をビルドします…"
-(cd "$REPO_ROOT" && cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
 isolated_gui_bins || exit 1
 
 # --- 隔離した環境 -------------------------------------------------------------

@@ -29,6 +29,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
@@ -111,8 +112,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -q -p tako-app --features visual-test || exit 1
-cargo build -q -p tako-cli -p tako-control --bin tako || exit 1
+run_heavy cargo build -q -p tako-app --features visual-test || exit 1
+run_heavy cargo build -q -p tako-cli -p tako-control --bin tako || exit 1
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"

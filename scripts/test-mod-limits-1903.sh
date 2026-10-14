@@ -31,6 +31,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDECODE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 ONLY="${ONLY:-}"
 PASS=0
 FAIL=0
@@ -75,7 +76,7 @@ cleanup() {
 tako_exit_trap cleanup "tako mod S2 の続き（#1903）の実経路テスト"
 
 # visual-test の節を持つ GUI を作る（実 GUI の段も同じバイナリで回す = 1867 と同じ）
-(cd "$REPO_ROOT" && cargo build -q -p tako-app --features visual-test && cargo build -q -p tako-cli) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app --features visual-test && run_heavy cargo build -q -p tako-cli) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins || exit 1

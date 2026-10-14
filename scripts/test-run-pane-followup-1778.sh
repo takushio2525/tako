@@ -35,6 +35,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 unset TAKO_RUN_WAIT_TIMEOUT_SECS
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 PASS=0
 FAIL=0
 
@@ -56,7 +57,7 @@ trap cleanup EXIT
 
 # 呼び出し側がバイナリを差し替えていなければ、いまのソースでビルドする
 if [ -z "${TAKO_BIN:-}" ] && [ -z "${APP_BIN:-}" ]; then
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet) || exit 1
+  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --quiet) || exit 1
 fi
 
 # shellcheck source=lib/isolated-gui.sh

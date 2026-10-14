@@ -72,6 +72,10 @@
 
 set -uo pipefail
 
+# 重い処理（下のビルド）を順番待ちへ通す入口 = run_heavy（#1994）
+# shellcheck source=queue.sh
+. "$(dirname "${BASH_SOURCE[0]}")/queue.sh"
+
 # 起動するバイナリの置き場（**`target/…/tako-app` の直書きをこの 2 行に閉じる**。
 # 散らすと「stale な target を掴んでいた」に気づけない = #432 の罠）
 # ビルドの種類は `TAKO_ISO_PROFILE`（既定 debug）で選ぶ（#1660。性能を測る検証は
@@ -161,9 +165,9 @@ isolated_gui_bins() {
     if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
         echo "バイナリをビルドします…"
         if [ "$ISOLATED_GUI_PROFILE" = release ]; then
-            (cd "$root" && cargo build --release -p tako-cli -p tako-app --quiet)
+            (cd "$root" && run_heavy cargo build --release -p tako-cli -p tako-app --quiet)
         else
-            (cd "$root" && cargo build -p tako-cli -p tako-app --quiet)
+            (cd "$root" && run_heavy cargo build -p tako-cli -p tako-app --quiet)
         fi
     fi
     local b

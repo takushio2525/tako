@@ -44,7 +44,7 @@ trap cleanup EXIT
 
 # visual-test 版をビルドする（同じ target/debug/tako-app を上書きする）
 echo "visual-test 版の tako-app をビルドします…"
-(cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
 isolated_gui_bins || exit 1
 
 export HOME="$TMP/home"

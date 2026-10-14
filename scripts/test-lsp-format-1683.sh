@@ -48,7 +48,7 @@ trap cleanup EXIT
 isolated_gui_bins || exit 1
 FAKE="$REPO_ROOT/target/debug/tako-lsp-fake"
 if [ ! -x "$FAKE" ]; then
-  (cd "$REPO_ROOT" && cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
+  (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
 fi
 
 # 実サーバの節で使う（HOME を差し替える前の rustup / cargo の置き場）

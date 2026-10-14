@@ -163,6 +163,12 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             &["Settings", "ThemePreset"],
         ),
         (
+            // #1994: `LimitSettings` は `Settings.resources` として settings.json へ直に serde される
+            // 永続構造体（順番待ちの上限）。#1041 の `RemoteFolderLayout` と同じく入れ子も挙げる
+            "crates/tako-core/src/queue.rs",
+            &["LimitSettings"],
+        ),
+        (
             "crates/tako-control/src/layout.rs",
             &[
                 "LayoutFile",

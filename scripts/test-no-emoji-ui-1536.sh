@@ -25,6 +25,7 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL
 
 TMP=${TAKO_1536_TMP:-$(mktemp -d "${TMPDIR:-/tmp}/tako-1536-XXXXXX")}
@@ -35,7 +36,7 @@ pass() { PASS=$((PASS+1)); printf '  OK   %s\n' "$1"; }
 fail() { FAIL=$((FAIL+1)); printf '  NG   %s\n' "$1"; }
 
 # visual-test の節は feature 付きビルドにしか無い（素のビルドだと「未知の節」で exit 1）
-cargo build -p tako-app --features visual-test --quiet || exit 1
+run_heavy cargo build -p tako-app --features visual-test --quiet || exit 1
 
 # 起動は必ずヘルパ経由（#1490）。仮想ディスプレイの ensure・置き先・バイナリの決定は
 # `scripts/lib/isolated-gui.sh` の 1 実装が持つので、ここで手書きしない

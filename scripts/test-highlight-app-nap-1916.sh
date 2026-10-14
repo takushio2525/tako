@@ -55,7 +55,7 @@ export TAKO_ISO_PROFILE=release
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 echo "release の tako-app / tako とテストバイナリをビルドします…"
-(cd "$REPO_ROOT" && cargo build --release -q -p tako-cli -p tako-app) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build --release -q -p tako-cli -p tako-app) || exit 1
 isolated_gui_bins || exit 1
 # テストスレッド側（①）のバイナリ。**HOME を差し替える前に**決める（後で cargo を呼ぶと
 # 一時 HOME へツールチェーンとレジストリを丸ごと取り直す）

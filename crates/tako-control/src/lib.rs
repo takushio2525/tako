@@ -65,6 +65,8 @@ pub mod orchestrator;
 pub mod peer_messaging;
 pub mod platform;
 pub mod protocol;
+pub mod queue;
+pub mod queue_wrapper;
 pub mod reach;
 pub mod remote;
 pub mod remote_auth;

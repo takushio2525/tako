@@ -76,10 +76,11 @@ pub fn submit(
     if let Some(opts) = wait::RunOptions::from_start_request(&request) {
         return start_run(tx, &opts, origin);
     }
-    // #1993: PC リソースの状況は UI の受け口へ渡さずここで答える（採取は背景スレッドの覚え、
-    // 古ければこの接続のスレッドで採り直す）。UI が固まっていても答えられる
-    if let Request::Queue { action } = &request {
-        return crate::resources::answer(action.as_deref()).map_err(SubmitError::Rejected);
+    // #1993 / #1994: PC リソースの状況と順番待ちは UI の受け口へ渡さずここで答える（採取は
+    // 背景スレッドの覚え、古ければこの接続のスレッドで採り直す）。UI が固まっていても
+    // 状況を返し、ビルドの割り当ても進む
+    if let Request::Queue { .. } = &request {
+        return crate::queue::answer(&request).map_err(SubmitError::Rejected);
     }
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
     tx.unbounded_send(IncomingRequest {
@@ -141,6 +142,25 @@ impl IpcServer {
         #[cfg(windows)]
         {
             windows_imp::start(tx, token, prefer_temp_socket)
+        }
+    }
+
+    /// **明示したパス**で受け口を張る（順番待ちの調停役の隔離 = `TAKO_QUEUE_SOCKET`。#1994）。
+    ///
+    /// 置き場の決め方（`tako_core::ipc_socket::plan`）も #1441 の記録も通さない（本体の受け口の
+    /// 診断を上書きしない）。生きた先客が居れば奪わずに失敗する。windows は `path` をパイプ名と読む
+    pub fn start_at(
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+        path: &str,
+    ) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            unix_imp::start_at(tx, token, path)
+        }
+        #[cfg(windows)]
+        {
+            windows_imp::start_at(tx, token, path)
         }
     }
 
@@ -315,6 +335,25 @@ mod windows_imp {
             error: None,
         });
 
+        serve(first, name, tx, token)
+    }
+
+    /// 明示したパイプ名で張る（#1994。先客が居れば失敗する）
+    pub(super) fn start_at(
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+        name: &str,
+    ) -> std::io::Result<IpcServer> {
+        let first = named_pipe::create_server_instance(name, true)?;
+        serve(first, name.to_string(), tx, token)
+    }
+
+    fn serve(
+        first: named_pipe::ServerInstance,
+        name: String,
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+    ) -> std::io::Result<IpcServer> {
         let accept_name = name.clone();
         let accept_token = token;
         std::thread::Builder::new()
@@ -448,6 +487,30 @@ mod unix_imp {
                 Err(e)
             }
         }
+    }
+
+    /// 明示したパスで張る（#1994）。生きた先客が居れば奪わない
+    pub(super) fn start_at(
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+        path: &str,
+    ) -> std::io::Result<IpcServer> {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() && UnixStream::connect(&path).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("{} には生きた受け口が居る", path.display()),
+            ));
+        }
+        let plan = SocketPlan {
+            path: path.clone(),
+            kind: SocketPathKind::Temp,
+            pointer: None,
+            limit: tako_core::ipc_socket::max_path_bytes(),
+            well_known_bytes: 0,
+        };
+        let listener = bind(&plan)?;
+        serve(listener, tx, token, path, None)
     }
 
     /// ソケットを張る（親ディレクトリ作成 → 残骸除去 → bind → 0600）

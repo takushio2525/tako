@@ -55,8 +55,8 @@ export TAKO_ISO_PROFILE=release
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 echo "release（visual-test 入り）の tako-app / tako / tako-lsp-fake をビルドします…"
-(cd "$REPO_ROOT" && cargo build --release -q -p tako-cli -p tako-app --features tako-app/visual-test \
-  && cargo build --release -q -p tako-control --bin tako-lsp-fake) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build --release -q -p tako-cli -p tako-app --features tako-app/visual-test \
+  && run_heavy cargo build --release -q -p tako-control --bin tako-lsp-fake) || exit 1
 isolated_gui_bins || exit 1
 FAKE="$(dirname "$TAKO_BIN")/tako-lsp-fake"
 

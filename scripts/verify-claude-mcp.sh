@@ -14,10 +14,11 @@
 #       トークンは検証プロセス内の一時値で、終了とともに無効になる。
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib/queue.sh # run_heavy = 重い処理を順番待ちへ（#1994）
 
 if [ -z "${TAKO_SOCKET:-}" ]; then
   # 外側: ビルドして example ホスト内で自分を再実行する
-  cargo build -p tako-cli --quiet
+  run_heavy cargo build -p tako-cli --quiet
   exec cargo run -p tako-control --example mcp_host --quiet -- bash "$0"
 fi
 
