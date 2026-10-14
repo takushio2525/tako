@@ -63,6 +63,3 @@
 ## 2026-10-14（#2032: issue1944_lsp_fetch の取得中の検査のフレーク = 状態と進捗は別々に変わるので、揃った 1 回の読みを状態待ちで捕まえる）
 - 真因: 製品は状態（取得中）と進捗（fetch のレジストリ）を別々に変えるので、進捗を置く前と、取り終えて進捗を消してから稼働へ移るまで（#1977 の片付けが走る）は「取得中なのに進捗が無い」。旧テストは各時点で両方を求めていた。配布元に最後の 4 KiB を止める `Serve::Held` を足し、status と画面の口をそれぞれ 1 回の読みで確かめる。注入 `TAKO_2032_INJECT_OLD_FILES=<n>`
 - 実測: 旧 + 前の版の段 500 ファイル 5/5 FAILED・旧 + 進捗を置く前に 200 ms 3/3 FAILED（どちらも CI と同じ assert）・新は同じ注入で 5/5 / 3/3 ok・画面に進捗を出さない壊し方で新が名指しで落ちる・新 20/20 ok
-## 2026-10-14（#2052: IPC の `tako todo list` / 完了・却下の置き場の読み書きを UI スレッドから外し、パレット・`tako panel` で開いた瞬間に一覧を引き直す）
-- `prepare_offload` の腕 `user_task_offload_prepare`: ① 送達フローの観測（生きている全ペインの決着したフロー・I/O なし）と展開状態の写し（UI）→ ② 書き戻し + 読み / 書き換え（background）→ ③ 完了・却下だけ開いていた行を畳む（UI）。段は dispatch の同期の腕と共有。右パネルのボタンは `dispatch_off_ui`、パレット / `set_panel` → `after_dispatch` は `spawn_user_tasks_list`。A/B `TAKO_2052_LEGACY=1`・番犬 `issue1984_*` 11 節（注入 10 通り）・カタログ増 0 B
-- 実測（読み 1500 ms の注入・`scripts/test-user-task-offload-2052.sh` 9 PASS）: 一覧 ×6 / done の最中の IPC 最大 新 72 / 34 ms・旧 3073 / 2950 ms、測定区間の UI スレッドの読み 新 0・旧 16 回。visual `tasks-offload`: done のボタン 新 1 ms・旧 6025 ms、パレット / `tako panel` は新だけ開いた更新でジョブ（旧は ① で FAILED）
