@@ -243,6 +243,11 @@ run_visual() { # run_visual <名前> <スケッチ> [VAR=VAL…]
   stop_isolated_gui "$APP_PID"
   APP_PID=""
   grep -E "TAKO_VISUAL_1952|TAKO_APP_SELF_TEST_FAILED|TAKO_VISUAL_TEST_OK|TAKO_VISUAL_DUMP_FILE|panicked" "$log" | mask | sed 's/^/    /'
+  # 判定の行が 1 本も無い（起動の途中で止まった・落ちた）なら、ログの末尾を残す（一時 dir は終わると消える）
+  if ! grep -qE "TAKO_VISUAL_TEST_OK|TAKO_APP_SELF_TEST_FAILED" "$log"; then
+    echo "    （判定の行が無い。ログの末尾 $(wc -l < "$log" | tr -d ' ') 行中の 15 行）"
+    tail -15 "$log" | mask | sed 's/^/      /'
+  fi
   return 0
 }
 if run_visual new "$S/Vis"; then
