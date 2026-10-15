@@ -72,7 +72,7 @@ draw() {
   local l
   printf '\033[H\033[2J'
   printf ' ▐▛███▛█   fake agent (#2112 %s)\n\n' "$NAME"
-  for l in "${conv[@]}"; do
+  for l in ${conv[@]+"${conv[@]}"}; do
     printf '%s\n' "$l"
   done
   if [ "$MODE" = "dialog" ] && [ -z "$answered" ]; then
@@ -97,6 +97,7 @@ cleanup() {
   stty sane 2>/dev/null
   printf '\033[?2004l'
 }
+# tako:exit-guard-ok source されない実行ファイル（偽のエージェント）で set -e も使わない。後始末は端末の設定を戻すだけ
 trap cleanup EXIT
 trap 'measure; draw' WINCH
 measure
