@@ -296,6 +296,12 @@ jobs:
       # 打ち切らない・利用者の設定 dir を使う形へ戻ったらここで落ちる**（#1892）
       - name: 夜間の tako mod の検査のモックテスト
         run: bash scripts/test-nightly-mod-check-1892.sh
+      # 夜間の footprint の回帰の見張り（measure-footprint-2011.sh std を基準と比べて tako todo へ）の
+      # モックテスト。計測・tako・cargo・release.sh は代役、HOME も隔離するので GUI もビルドも起こさない。
+      # **悪化を載せない・同じ悪化を毎晩積む・蓋閉じの夜に起票する・見張りの結果で夜間リリースの
+      # 終了コードが変わる・リリースより先に回る形へ戻ったらここで落ちる**（#2023）
+      - name: 夜間の footprint の回帰の見張りのモックテスト
+        run: bash scripts/test-nightly-footprint-watch-2023.sh
       # .app の差し替え（置き場のパスを一度も空けない）のモックテスト。一時ディレクトリの
       # dummy .app だけを相手にするので本番の /Applications には触らない。
       # **Dock のピンが逃げる形へ戻ったらここで落ちる**（#1042）

@@ -2,7 +2,7 @@
 
 > `AGENTS.md`「リリース運用」節の**詳細**。両 OS 同時リリースの仕組み・配布物に同梱する
 > ライセンス・配布物に個人情報を入れない仕組み・夜間リリース・次回バージョンの予約・
-> 安定版への昇格（Homebrew cask と docs の追従）はここにある。**毎ターンは読まない** —
+> footprint の回帰の見張り・安定版への昇格（Homebrew cask と docs の追従）はここにある。**毎ターンは読まない** —
 > リリースを打つ直前・機構を触る直前にその節だけ Read する。
 
 ## 両 OS 同時リリース（#965）
@@ -207,6 +207,60 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
   利用者の設定ファイルの mtime が前後で一致することを見る）。assert が落ちると、その環境の段（夜間 /
   検査の 1 回の実行）の出力と終了コード・記録ファイル・通知のスタブの記録・claude のスタブの呼び出しが
   ログに出る（#1933。`TAKO_1933_INJECT=version|validate|test` で Test 2 の注入前の 1 回を落として確かめられる）
+
+### footprint の回帰の見張り（#2023 / エピック #2011 の S8）
+
+#814（2026-08）で本番 129 MB まで削ったものが 2 か月で 400〜835 MB に戻り、**誰も気づけなかった**。
+夜ごとに origin/main を同じ条件で測り、直近の中央値より閾値を超えて悪化したら `tako todo`（人がやること）へ
+1 件載せる。本体は `scripts/nightly-footprint-watch.sh`、記録と判定は `scripts/lib/footprint-watch.py`。
+
+- **起動**: `nightly-release.sh` の EXIT trap の最後（使い捨ての worktree の撤去・ロックの解放の後）から別プロセスで呼ぶ。
+  **リリースを遅らせない**（タグ・Release・通知は済んでいる）・**どの結果でも夜間の終了コードを変えない**
+  （`run_footprint_watch || true`。番人 `tako_exit_trap` は trap の前に決めた終了コードで抜ける）・
+  **リリースの有無に依らず毎晩**（変更なし / dirty / 手動リリース進行中で抜けた夜も回す）。dry-run・多重起動・
+  シグナルで中止した実行からは回さない。止めるときは `TAKO_NIGHTLY_FOOTPRINT=0`
+- **1 回の流れ**: 見張りのロック → origin/main を `git worktree add --detach` で出す（共有ツリーの HEAD は触らない。
+  target/ は共有ツリーのものを symlink で使い回す）→ `scripts/build-pwa.sh --if-missing` + `cargo build --release` を
+  1 回の `run_heavy` で（**cargo の前に PWA の dist を作る**: 使い捨ての worktree には dist が無く、tako-control の build.rs に
+  作らせると dist の時刻のせいで計測スクリプトの中の 2 回目のビルド = 順番待ちの外で下流が丸ごと組み直しになる。上限 60 分、
+  順番待ちはその 2/3 で諦める。**並ぶのは起票に使う tako = `/Applications/tako.app` の tako**: 夜間の PATH は先頭が
+  `~/.cargo/bin` で、そこに順番待ちを知らない古い tako が居ると run_heavy が並ばずに走らせる）→ `scripts/measure-footprint-2011.sh std`（上限 15 分・偽の claude・tako-vd の上だけ）→
+  履歴へ 1 行 → 判定 → 悪化なら起票。**そのコミットを描画ありで測り済みなら数秒で飛ばす**（コードが変わらない夜は測らない）
+- **置き場**: `~/.claude-orchestrator/state/tako-footprint/`（`history.tsv` = 1 晩 1 行・未実測の夜も残す /
+  `state` = 続いている悪化 / `last-run.log` = 直近の計測の全出力）。data dir ではなく開発側で、`cargo clean`
+  （`scripts/clean-target.sh`）で基準が消えないよう target/ の外に置く（予約・mod の検査の記録と同じ所）
+- **基準**: origin/main を測った行（と今回と同じ ref の行）のうち、同じ条件（シナリオ・ペインの並び・プレビュー数）・標準の env（`TAKO_FOOTPRINT_ENV` を足していない）・
+  中身が全部入った・**描画の有無が同じ**行の直近 5 回の中央値。3 回に満たない間は「基準づくり中」で起票しない。
+  注入の行（env を足した行）は判定されるが基準には入らない
+- **閾値**（S0 の 2 回のぶれ = 設計書 `.agent/plans/2026-10-lightweight.md` §7.1 から。正本は `footprint-watch.py` の `METRICS`）:
+
+| 項目 | 閾値 | 描画が要る |
+|---|---|---|
+| 放置の footprint / 出力中の footprint / tmux の footprint | +20%（std のぶれ +7〜10%） | 出力中だけ |
+| 放置の CPU | +0.3 ポイント（ぶれ ±0.15） | 要る（アイドルの CPU の大半は毎 vsync の display link） |
+| 出力中の CPU | +1.5 ポイント（ぶれ ±0.9） | 要る |
+| 出力中の子プロセスの CPU | +1.0 ポイントかつ +50%（2 回のぶれの実測なし） | — |
+| スレッド | +5 本（ぶれ ±2） | — |
+| 起動時間 | +1000 ms かつ +50%（その日の最初の起動かで 0.5〜2.6 秒） | — |
+| 出力中の描画回数 | 31.5 回/秒を超える（#1979 の上限 30 + ぶれ 1.5。基準は要らない） | 要る |
+
+- **蓋閉じの夜**: tako-vd を用意できない（計測の終了コード 4）・ビルド / 計測の時間切れは「未実測」として 1 行残して
+  静かに抜ける（起票しない・状態も動かさない）。tako-vd は起きたが画面ロック等でフレームが組まれない夜（`drawn` が
+  「なし」）は描画の値を比べず、残りを描画なしの夜どうしで比べる
+- **同じ悪化を重ねて積まない**: `state` に前の夜から続く悪化の項目と todo の id を持つ。同じ項目が悪化し続ける夜は
+  何もしない。**新しい項目が悪化したときだけ**起票し、未完了の 1 件（title の頭が `[footprint 回帰]`）が残って
+  いればそれを書き換える。回帰なしの夜が来たら `state` を消す（todo は人が片付ける）。`tako todo` へ届かない夜
+  （GUI が居ない）は `state` を動かさず通知だけ出し、次の夜にやり直す
+- **基準は追いつく**: 中央値は悪化した行も含むので、直らない悪化は 3 晩ほどで基準に吸収されて鳴らなくなる
+  （起票は最初の夜の 1 回）。**少しずつの増加（1 晩あたり閾値の内側）は拾えない**のが限界
+- 直近の結果と基準は `scripts/nightly-footprint-watch.sh --status`（読むだけ）。測り直しは `--force`、
+  ブランチを夜間と同じ流れで測るのは `TAKO_FOOTPRINT_WATCH_REF=<コミット>`（その行は origin/main の行と比べられるが、
+  履歴の `ref` 欄で分けるので origin/main の基準には入らない）。
+  注入は `TAKO_FOOTPRINT_WATCH_SCALE=0.5`（閾値を半分）か `TAKO_FOOTPRINT_ENV="TAKO_2009_LEGACY=1"`
+  （#2009 の前の持ち方 = わざと footprint を増やす）
+- 検証は `bash scripts/test-nightly-footprint-watch-2023.sh`（CI の macOS ジョブ。計測・tako・cargo・release.sh は
+  代役、HOME も隔離。判定の単体・見張りの通し・夜間のフックの終了コードを見る）
+- **launchd の登録は変えない**（install_root の nightly-release.sh が呼ぶので、main を pull すれば翌晩から効く）
 
 ## 安定版への昇格（#403 / #1853 / #1592）
 

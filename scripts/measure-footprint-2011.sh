@@ -296,6 +296,8 @@ run_one() {
   [ -n "$TAKO_SOCKET" ] && [ -n "$TAKO_TOKEN" ] || { echo "隔離先の socket / token が空なので止める"; exit 1; }
   wait_isolated_gui "$TMP/app.log" 600 || exit 1
   t1="$(now_ms)"
+  # 窓をどの面へ置いたか（persist.log の解決行）。夜間の見張り（#2023）が「tako-vd の上だけ」の証拠に残す
+  echo "  窓: $(grep -m1 'ディスプレイ指定' "$TAKO_DATA_DIR/persist.log" 2>/dev/null | sed 's/^.*ディスプレイ指定/ディスプレイ指定/' || echo '解決行なし')"
   # 隔離 GUI でも自動命名は claude を呼ぶので切る（memory: isolated-gui-autorename-calls-claude）
   "$TAKO_BIN" autorename off >/dev/null 2>&1 || true
 
