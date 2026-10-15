@@ -4077,7 +4077,7 @@ pub fn tools() -> Vec<Value> {
                 `${ext}` = 拡張子（小文字・ドットなし）/ `${workspaceRoot}` = プロジェクトのルート\
                 （無ければ git → ファイルのディレクトリ）/ `${python}` = 実行環境の python / `${arduino_cli}` = arduino-cli\n\
                 \n.py はプロジェクトの .venv / uv / poetry / conda / pyenv を、.ino は PATH か Arduino IDE 同梱の arduino-cli を\
-                自動で使う（応答の runtime）。\n\
+                自動で使う（tako_run_defaults で選んだ実行環境・プロファイルが優先。応答の runtime）。\n\
                 \n解決順: command 引数 → ファイル内宣言 → ユーザーの拡張子既定 → プロジェクト既定\
                 （Cargo.toml / package.json / pyproject.toml / go.mod / *.csproj / Makefile / *.ino を上へ辿る）→ \
                 組み込みの拡張子既定 → エラー。",
@@ -4157,11 +4157,34 @@ pub fn tools() -> Vec<Value> {
         // 出自: #453
         json!({
             "name": "tako_run_defaults",
-            "description": "拡張子ごとの実行コマンド既定を一覧/設定/削除する。\
-                ext を省略すると全一覧。ext のみで単一情報。ext + command で設定。ext + remove で削除。",
+            "description": "実行の既定を読み書きする。ext = 拡張子ごとのコマンド（省略で全一覧・ext のみで単一・\
+                command で設定・remove で削除）。path = そのファイル / プロジェクトの実行設定（runtime・profile を\
+                選んで保存、reset で自動へ戻す、項目なしなら読むだけ。応答は config / runtime / runtimes / \
+                runtime_unresolved）。ext と path は排他。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "実行設定の対象ファイル（相対は呼び出し元ペインの cwd 基準）",
+                    },
+                    "scope": enum_schema(
+                        &tako_core::runner_config::RunScope::VALUES,
+                        "保存先（既定は runtime = project・他 = file）",
+                    ),
+                    "profile": { "type": "string", "description": "選ぶプロファイル名" },
+                    "runtime": {
+                        "type": "string",
+                        "description": "選ぶ実行環境（runtimes の id・短縮・パス。短縮が複数に当たればエラー）",
+                    },
+                    "reset": {
+                        "type": "array",
+                        "items": enum_schema(
+                            &tako_core::runner_config::RunConfigField::reset_values(),
+                            "all = 全項目",
+                        ),
+                        "description": "自動・既定へ戻す項目（scope を省くと両方の保存先から）",
+                    },
                     "ext": {
                         "type": "string",
                         "description": "拡張子（ドットなし・小文字。省略時は全一覧）",

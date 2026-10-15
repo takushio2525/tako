@@ -380,6 +380,14 @@ tako run script.py --list --refresh  # uv / poetry の場所や Python の版を
 
 conda の env は PATH と `CONDA_PREFIX` を設定するだけで、`activate.d` のスクリプトは走りません。必要なら `tako:run: conda run -n <名前> python ${fileBase}` と書いてください。環境を固定したいときも同じように `tako:run:` で直接書けます。
 
+自動で選ばれたものと違う環境で走らせたいときは、`tako run-config` で選ぶと覚えておきます（実行環境はプロジェクト単位、プロファイルはそのファイル単位が既定）。以後の `tako run` と再生ボタンはそれで走ります。覚えた環境を消した場合は、別の Python へ黙って切り替えずにエラーで止まります。
+
+```bash
+tako run-config script.py                  # 選ばれる環境・候補・覚えた値
+tako run-config script.py --runtime env2   # 候補の名前か id（--list の runtimes）で選ぶ
+tako run-config script.py --reset runtime  # 自動選択へ戻す
+```
+
 ## AI からの操作
 
 ```bash

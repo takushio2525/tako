@@ -88,6 +88,8 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         ("remote/", SchemaId::RemoteDesired),
         // #1960: tako mod の定型の UI 設定（`claude-mod/` の中でこれだけが利用者の宣言 = Shared）
         ("claude-mod/ui.json", SchemaId::ClaudeModUi),
+        // #1731: Code Runner の実行設定（マシン固有のパス = Local）
+        ("run-configs.json", SchemaId::RunConfigs),
     ];
     // tako の data dir の外（Claude Code の設定 dir = カタログの `Root::Claude`）に置く番地
     const CLAUDE_MAPPING: &[(&str, SchemaId)] = &[
@@ -292,6 +294,16 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
         (
             "crates/tako-core/src/remote_shortcuts.rs",
             &["ShortcutsFile", "Shortcut"],
+        ),
+        (
+            // #1731: run-configs.json の外枠
+            "crates/tako-control/src/run_configs.rs",
+            &["RunConfigsFile"],
+        ),
+        (
+            // #1731: run-configs.json の 1 項目（ファイル / プロジェクトの実行設定）と実行環境の参照
+            "crates/tako-core/src/runner_config.rs",
+            &["RunConfig", "RuntimeRef"],
         ),
         (
             // #1485: 「起動していた」の記録。`LastAutostart` は入れない

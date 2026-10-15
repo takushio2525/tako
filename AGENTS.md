@@ -215,6 +215,7 @@ tako/
 | 右パネルのビュー切替 | `tako panel --show --view <fleet|orch|git|tasks|diagnostics>` |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]` |
 | 拡張子既定コマンド設定 | `tako run-default [ext] [command]` |
+| **実行環境・プロファイルを選んで覚える（ファイル / プロジェクト単位。#1731）** | `tako run-config <file> [--runtime <候補>]` |
 | AI コマンド提案カード（#666/#703） | `tako show-command <コマンド>...` |
 | 設定画面（#459/#721） | `tako settings [--tab <名>]` |
 | 初回起動バナー（#549） | `tako welcome [show|dismiss]` |

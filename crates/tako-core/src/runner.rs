@@ -530,7 +530,8 @@ pub fn resolve_file_in(
     let project = bounds.and_then(|b| runner_project::detect(platform, path, head, b, runtime));
     let workspace_root = match (&project, bounds) {
         (Some(p), _) => p.root.clone(),
-        (None, Some(b)) => project_root::repo_root_within(&file_dir, b).unwrap_or(file_dir),
+        // 実行設定のプロジェクトのキー（`project_root::scope_root`。#1731）と同じ落とし先
+        (None, Some(b)) => project_root::fallback_root(&file_dir, b),
         (None, None) => file_dir,
     };
     resolve_core(
@@ -2065,6 +2066,36 @@ mod tests {
         let info =
             crate::project_root::detect_in(&p.base.join("ws/crates/core/src/a.rs"), &p.bounds);
         assert_eq!(info.map(|i| i.root), Some(p.base.join("ws")));
+    }
+
+    /// 実行設定のプロジェクトのキー（`project_root::scope_root`。#1731）は、種別の印が
+    /// **無い**ファイルでも `${workspaceRoot}` と同じ答え（リポジトリのルート → ファイルの段）
+    #[test]
+    fn 実行設定のプロジェクトのキーはworkspace_rootと同じ() {
+        let p = Proj::new("scope-root");
+        p.write("ws/Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        p.write("ws/crates/core/Cargo.toml", "[package]\nname = \"core\"\n");
+        p.write("ws/crates/core/src/a.rs", "");
+        p.write("py/pyproject.toml", "");
+        p.write("py/pkg/cli.py", "");
+        p.write("repo/.git/HEAD", "");
+        p.write("repo/tools/run.py", "");
+        p.write("plain/.venv/pyvenv.cfg", "");
+        p.write("plain/a.py", "");
+        for (rel, want) in [
+            ("ws/crates/core/src/a.rs", "ws"),
+            ("py/pkg/cli.py", "py"),
+            ("repo/tools/run.py", "repo"),
+            ("plain/a.py", "plain"),
+        ] {
+            let file = p.base.join(rel);
+            let key = crate::project_root::scope_root_in(&file, &p.bounds);
+            let res = p
+                .resolve(Platform::current(), rel, &BTreeMap::new())
+                .unwrap_or_else(|e| panic!("{rel}: {e}"));
+            assert_eq!(key, res.workspace_root, "{rel}");
+            assert_eq!(key, p.base.join(want), "{rel}");
+        }
     }
 
     #[test]

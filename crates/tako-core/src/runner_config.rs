@@ -7,7 +7,7 @@
 //!
 //! ## ここに置かないもの
 //!
-//! - **読み書き**（`<data_dir>/run-configs.json`）は tako-control の仕事（S3 = #1731）。
+//! - **読み書き**（`<data_dir>/run-configs.json`）は `tako-control::run_configs`（S3 = #1731）。
 //!   ここは I/O を持たない純粋部分だけ
 //! - **実行環境の名前**（venv / conda …）。[`RuntimeRef::manager`] は enum ではなく
 //!   [`crate::runtime_env`] の表が持つ検出器 ID の文字列にしてある。enum にすると
@@ -75,6 +75,76 @@ impl RunConfigField {
 
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|f| f.as_str() == s)
+    }
+
+    /// 保存先を省いたときのスコープ（設計書 §7.3）。実行環境はプロジェクトの全ファイルで
+    /// 同じものを使うのが普通なので project、それ以外（プロファイル・引数…）はそのファイルだけ
+    pub fn default_scope(self) -> RunScope {
+        match self {
+            Self::Runtime => RunScope::Project,
+            _ => RunScope::File,
+        }
+    }
+
+    /// `--reset` / MCP `reset` で「全項目」を表す語
+    pub const RESET_ALL: &'static str = "all";
+
+    /// `reset` が受ける語（項目名 + [`Self::RESET_ALL`]。MCP の enum の正本 = #1467）
+    pub fn reset_values() -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Self::ALL.iter().map(|f| f.as_str()).collect();
+        out.push(Self::RESET_ALL);
+        out
+    }
+
+    /// `reset` の語の並びを項目へ（`all` は全項目。知らない語はその語を `Err` で返す）
+    pub fn parse_reset(words: &[String]) -> Result<Vec<Self>, String> {
+        let mut out = Vec::new();
+        for w in words {
+            if w == Self::RESET_ALL {
+                return Ok(Self::ALL.to_vec());
+            }
+            let f = Self::parse(w).ok_or_else(|| w.clone())?;
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 実行設定を保存する範囲（設計書 §3）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RunScope {
+    /// そのファイルだけ
+    File,
+    /// プロジェクトのルート配下の全ファイル（ルートは `project_root::scope_root` の 1 本）
+    Project,
+}
+
+impl RunScope {
+    /// 並びは強い順（ファイルがプロジェクトより強い = [`merge`]）
+    pub const ALL: &'static [RunScope] = &[RunScope::File, RunScope::Project];
+
+    /// MCP の enum の正本（#1467）
+    pub const VALUES: [&'static str; 2] = ["file", "project"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => Self::VALUES[0],
+            Self::Project => Self::VALUES[1],
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|v| v.as_str() == s)
+    }
+
+    /// 出どころの表記（[`FieldSource`] と同じ語）
+    pub fn source(self) -> FieldSource {
+        match self {
+            Self::File => FieldSource::File,
+            Self::Project => FieldSource::Project,
+        }
     }
 }
 
@@ -478,6 +548,43 @@ mod tests {
         );
         let back: RunConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn 保存先の既定は実行環境だけプロジェクト() {
+        for f in RunConfigField::ALL {
+            let want = if *f == RunConfigField::Runtime {
+                RunScope::Project
+            } else {
+                RunScope::File
+            };
+            assert_eq!(f.default_scope(), want, "{f:?}");
+        }
+        for s in RunScope::ALL {
+            assert_eq!(RunScope::parse(s.as_str()), Some(*s));
+        }
+        assert_eq!(RunScope::parse("global"), None);
+        assert_eq!(RunScope::File.source(), FieldSource::File);
+        assert_eq!(RunScope::Project.source(), FieldSource::Project);
+    }
+
+    #[test]
+    fn resetの語() {
+        let all = RunConfigField::reset_values();
+        assert_eq!(all.last(), Some(&RunConfigField::RESET_ALL));
+        assert_eq!(all.len(), RunConfigField::ALL.len() + 1);
+        assert_eq!(
+            RunConfigField::parse_reset(&["runtime".into(), "runtime".into()]),
+            Ok(vec![RunConfigField::Runtime])
+        );
+        assert_eq!(
+            RunConfigField::parse_reset(&["profile".into(), "all".into()]),
+            Ok(RunConfigField::ALL.to_vec())
+        );
+        assert_eq!(
+            RunConfigField::parse_reset(&["runtime".into(), "nope".into()]),
+            Err("nope".to_string())
+        );
     }
 
     #[test]

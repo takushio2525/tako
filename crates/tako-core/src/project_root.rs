@@ -222,6 +222,29 @@ pub fn detect_in(file: &Path, bounds: &SearchBounds) -> Option<ProjectInfo> {
     })
 }
 
+/// どの種別も受け持たないファイルのルート（`${workspaceRoot}` の落とし先）。
+/// 境界の内側の git リポジトリのルート、それも無ければファイルのディレクトリ
+pub fn fallback_root(file_dir: &Path, bounds: &SearchBounds) -> PathBuf {
+    repo_root_within(file_dir, bounds).unwrap_or_else(|| file_dir.to_path_buf())
+}
+
+/// 実行設定の「プロジェクト」スコープのキーにするルート（#1731。本番の境界）。
+///
+/// **`${workspaceRoot}` = プロジェクト既定の cwd と同じ答え**を返す: 種別の印があれば
+/// [`detect`] のルート、無ければ [`fallback_root`]。ずれると「project に保存した設定が効かない」
+/// になるので、`runner::resolve_file_in` も同じ [`fallback_root`] を通す
+pub fn scope_root(file: &Path) -> PathBuf {
+    scope_root_in(file, &SearchBounds::for_user())
+}
+
+/// [`scope_root`] の境界を外から渡す版（テスト用）
+pub fn scope_root_in(file: &Path, bounds: &SearchBounds) -> PathBuf {
+    match detect_in(file, bounds) {
+        Some(info) => info.root,
+        None => fallback_root(file.parent().unwrap_or(Path::new(".")), bounds),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

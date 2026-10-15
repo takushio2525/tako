@@ -473,11 +473,7 @@ impl SettingsWindow {
             EditField::RunnerCmd(ext) => {
                 if !value.is_empty() {
                     self.run(
-                        Request::RunnerDefaults {
-                            ext: Some(ext),
-                            command: Some(value),
-                            remove: false,
-                        },
+                        Request::runner_ext_defaults(Some(ext), Some(value), false),
                         cx,
                     );
                 }
@@ -2218,11 +2214,11 @@ impl SettingsWindow {
                             BtnKind::Normal,
                             cx.listener(move |this, _, _, cx| {
                                 this.run(
-                                    Request::RunnerDefaults {
-                                        ext: Some(ext_owned.clone()),
-                                        command: None,
-                                        remove: true,
-                                    },
+                                    Request::runner_ext_defaults(
+                                        Some(ext_owned.clone()),
+                                        None,
+                                        true,
+                                    ),
                                     cx,
                                 );
                             }),
@@ -2365,11 +2361,7 @@ impl SettingsWindow {
             return;
         }
         self.run(
-            Request::RunnerDefaults {
-                ext: Some(ext),
-                command: Some(cmd),
-                remove: false,
-            },
+            Request::runner_ext_defaults(Some(ext), Some(cmd), false),
             cx,
         );
         self.runner_new_ext.clear();

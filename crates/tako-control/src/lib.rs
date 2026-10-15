@@ -84,6 +84,7 @@ pub mod remote_tasks;
 pub mod resources;
 pub mod restore_report;
 pub mod resume_launch;
+pub mod run_configs;
 pub mod runtime_probe;
 pub mod sessions;
 pub mod settings;

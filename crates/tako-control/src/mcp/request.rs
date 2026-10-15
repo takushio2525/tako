@@ -1507,6 +1507,13 @@ pub(super) fn build_request(
             ext: str_arg(args, "ext")?,
             command: str_arg(args, "command")?,
             remove: bool_arg(args, "remove")?.unwrap_or(false),
+            // #1731: そのファイル / プロジェクトの実行設定（相対パスは呼び出し元の cwd 基準）
+            path: str_arg(args, "path")?,
+            pane: caller,
+            scope: str_arg(args, "scope")?,
+            profile: str_arg(args, "profile")?,
+            runtime: str_arg(args, "runtime")?,
+            reset: str_vec_arg(args, "reset")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })

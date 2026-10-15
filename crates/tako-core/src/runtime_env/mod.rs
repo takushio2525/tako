@@ -33,6 +33,7 @@
 
 mod detect;
 pub mod kinds;
+mod select;
 pub mod tier_p;
 
 use std::collections::BTreeMap;
@@ -43,6 +44,9 @@ use crate::runner_config::RuntimeRef;
 
 pub use detect::{apply_probed_env, detect, resolve_ref};
 pub use kinds::KINDS;
+pub use select::{
+    candidate_id, ensure_runnable, match_query, msg_query_error, ref_for_path, QueryError,
+};
 
 // ─── 表の型 ────────────────────────────────────────────────────────────
 

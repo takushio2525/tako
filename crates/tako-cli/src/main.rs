@@ -408,6 +408,10 @@ enum Command {
     /// 拡張子ごとの実行コマンド既定を一覧/設定/削除する（FR-3.18, #453）
     #[command(name = "run-default")]
     RunDefault(RunDefaultArgs),
+    /// ファイル / プロジェクトの実行設定（実行環境・プロファイル）を見る・選ぶ（FR-3.18.5, #1731）。
+    /// 項目を渡さなければ実効値と実行環境の候補を出す
+    #[command(name = "run-config")]
+    RunConfig(RunConfigArgs),
 }
 
 #[derive(Args)]
@@ -484,6 +488,33 @@ struct RunArgs {
     /// --list で、実行環境の問い合わせ（道具の場所・版）を覚えた答えを捨てて聞き直す
     #[arg(long, requires = "list")]
     refresh: bool,
+}
+
+#[derive(Args)]
+struct RunConfigArgs {
+    /// 対象ファイル
+    #[arg(value_name = "FILE")]
+    path: String,
+    /// 実行環境を選ぶ（候補の ID・短縮（.venv / uv / 版名）・パス。既定でプロジェクトに保存）
+    #[arg(long)]
+    runtime: Option<String>,
+    /// プロファイルを選ぶ（既定でこのファイルに保存）
+    #[arg(long)]
+    profile: Option<String>,
+    /// 自動・既定へ戻す（項目名か all。値を省くと全項目。--project / --file を省くと両方から消す）
+    #[arg(long, num_args = 0.., value_name = "項目", value_parser = clap::builder::PossibleValuesParser::new(
+        tako_core::runner_config::RunConfigField::reset_values()
+    ))]
+    reset: Option<Vec<String>>,
+    /// プロジェクトに保存する
+    #[arg(long, conflicts_with = "scope_file")]
+    project: bool,
+    /// このファイルだけに保存する
+    #[arg(long = "file", id = "scope_file")]
+    scope_file: bool,
+    /// 相対パスの基準ペイン（省略時は呼び出し元。CLI は自分の cwd で絶対パスにしてから送る）
+    #[arg(long)]
+    pane: Option<u64>,
 }
 
 #[derive(Args)]
@@ -10691,11 +10722,46 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 new_pane: args.new_pane.then_some(true),
             }
         }
-        Command::RunDefault(ref args) => Request::RunnerDefaults {
-            ext: args.ext.clone(),
-            command: args.command.clone(),
-            remove: args.remove,
-        },
+        Command::RunDefault(ref args) => {
+            Request::runner_ext_defaults(args.ext.clone(), args.command.clone(), args.remove)
+        }
+        Command::RunConfig(ref args) => {
+            use tako_core::runner_config::{RunConfigField, RunScope};
+            // 相対パスは CLI を打ったシェルの cwd 基準（外部のターミナルからでも同じ意味になる）
+            let path = std::path::Path::new(&args.path);
+            let path = if path.is_relative() {
+                std::env::current_dir()
+                    .map_err(|e| format!("作業ディレクトリを読めない: {e}"))?
+                    .join(path)
+            } else {
+                path.to_path_buf()
+            };
+            let scope = if args.project {
+                Some(RunScope::Project)
+            } else if args.scope_file {
+                Some(RunScope::File)
+            } else {
+                None
+            };
+            Request::RunnerDefaults {
+                ext: None,
+                command: None,
+                remove: false,
+                path: Some(path.display().to_string()),
+                pane: args.pane.or_else(caller_pane),
+                scope: scope.map(|s| s.as_str().to_string()),
+                profile: args.profile.clone(),
+                runtime: args.runtime.clone(),
+                // 値なしの `--reset` = 全項目
+                reset: args.reset.as_ref().map(|r| {
+                    if r.is_empty() {
+                        vec![RunConfigField::RESET_ALL.to_string()]
+                    } else {
+                        r.clone()
+                    }
+                }),
+            }
+        }
     })
 }
 
@@ -12579,7 +12645,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::Run(_) => {
             println!("{}", pretty_json(result));
         }
-        Command::RunDefault(_) => {
+        Command::RunDefault(_) | Command::RunConfig(_) => {
             println!("{}", pretty_json(result));
         }
         // remote は run() → print_result を通らない
@@ -15097,6 +15163,8 @@ mod platform_matrix_parity {
         ("click", "tako_send_input"),
         ("resize", "tako_resize_pane"),
         ("run-default", "tako_run_defaults"),
+        // #1731: 実行設定は `tako_run_defaults` の path 側（ツールを増やさない）
+        ("run-config", "tako_run_defaults"),
         ("scroll", "tako_scroll_pane"),
         ("send", "tako_send_input"),
         ("split", "tako_split_pane"),

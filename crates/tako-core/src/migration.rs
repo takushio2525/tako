@@ -106,6 +106,8 @@ pub enum SchemaId {
     /// 「tako が置いた写し」の宣言なので、形式の検査で退避させない（退避すると印が消え、
     /// 写しが「利用者のもの」に見えて以後 tako が触れなくなる）
     ClaudeModMark,
+    /// `<data_dir>/run-configs.json`（Code Runner の実行設定 = 選んだ実行環境・プロファイル。#1731）
+    RunConfigs,
 }
 
 impl SchemaId {
@@ -137,6 +139,7 @@ impl SchemaId {
             Self::RemoteDesired => "remote_desired",
             Self::ClaudeModUi => "claude_mod_ui",
             Self::ClaudeModMark => "claude_mod_mark",
+            Self::RunConfigs => "run_configs",
         }
     }
 
@@ -172,6 +175,7 @@ impl SchemaId {
             Self::RemoteDesired,
             Self::ClaudeModUi,
             Self::ClaudeModMark,
+            Self::RunConfigs,
         ]
     }
 }

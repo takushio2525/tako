@@ -1065,3 +1065,128 @@ fn 保存したide同梱の参照はファイルが消えたら解けない() {
         .expect_err("消えた置き場を既定へ落とさない");
     assert_eq!(err.manager, "arduino-ide");
 }
+
+// ─── 利用者の指定 → 保存する参照（#1731） ───────────────────────────────
+
+fn mono() -> (FakeFs, Detection) {
+    let fs = FakeFs::new()
+        .file("/h/mono/.venv/pyvenv.cfg", "")
+        .file("/h/mono/.venv/bin/python", "")
+        .file("/h/mono/pkg/a/.venv/pyvenv.cfg", "")
+        .file("/h/mono/pkg/a/.venv/bin/python", "")
+        .file("/h/mono/.python-version", "3.12.4\n")
+        .dir("/h/.pyenv/versions/3.12.4");
+    let d = detect_py(
+        MAC,
+        &["/h/mono/pkg/a", "/h/mono/pkg", "/h/mono"],
+        &fs,
+        &home("/h"),
+    );
+    (fs, d)
+}
+
+#[test]
+fn 短縮が2候補に当たると選ばずに候補を並べる() {
+    let (_, d) = mono();
+    let err = match_query(python(), ".venv", &d.candidates).expect_err("1 つを選ばない");
+    assert_eq!(
+        err,
+        QueryError::Ambiguous(vec![
+            "venv:/h/mono/pkg/a/.venv".to_string(),
+            "venv:/h/mono/.venv".to_string(),
+        ])
+    );
+    let msg = msg_query_error(".venv", &err, &d.candidates);
+    assert!(
+        msg.contains("venv:/h/mono/pkg/a/.venv") && msg.contains("venv:/h/mono/.venv"),
+        "{msg}"
+    );
+    // 検出器 ID の短縮も同じ（venv が 2 つ）
+    assert!(matches!(
+        match_query(python(), "venv", &d.candidates),
+        Err(QueryError::Ambiguous(ids)) if ids.len() == 2
+    ));
+}
+
+#[test]
+fn idと一意な短縮は参照へ写る() {
+    let (_, d) = mono();
+    assert_eq!(
+        match_query(python(), "venv:/h/mono/.venv", &d.candidates),
+        Ok(RuntimeRef::new("venv", "/h/mono/.venv"))
+    );
+    // 版名（pyenv の鍵）・検出器 ID（system は 1 つ）
+    assert_eq!(
+        match_query(python(), "3.12.4", &d.candidates),
+        Ok(RuntimeRef::new("pyenv", "3.12.4"))
+    );
+    assert_eq!(
+        match_query(python(), " system ", &d.candidates)
+            .unwrap()
+            .manager,
+        "system"
+    );
+    // 候補に無くても、表の検出器 ID の形なら ID として受ける（解けるかは呼び出し側が確かめる）
+    assert_eq!(
+        match_query(python(), "pyenv:3.10.1", &d.candidates),
+        Ok(RuntimeRef::new("pyenv", "3.10.1"))
+    );
+    // Windows のドライブ（`C:`）は ID と読まない
+    assert_eq!(
+        match_query(python(), r"C:\py\python.exe", &d.candidates),
+        Err(QueryError::NotFound)
+    );
+    assert_eq!(
+        match_query(python(), "", &d.candidates),
+        Err(QueryError::NotFound)
+    );
+    let msg = msg_query_error("nope", &QueryError::NotFound, &d.candidates);
+    assert!(msg.contains("system:"), "選べる候補を並べる: {msg}");
+}
+
+#[test]
+fn パスの指定はinterpreterか印のあるディレクトリ() {
+    let (fs, _) = mono();
+    assert_eq!(
+        ref_for_path(python(), &p("/h/mono/.venv/bin/python"), &fs),
+        Some(RuntimeRef::new(
+            RuntimeRef::EXPLICIT_PATH,
+            "/h/mono/.venv/bin/python"
+        ))
+    );
+    assert_eq!(
+        ref_for_path(python(), &p("/h/mono/.venv"), &fs),
+        Some(RuntimeRef::new("venv", "/h/mono/.venv"))
+    );
+    // 印の無いディレクトリ・無いパスは写さない
+    assert_eq!(ref_for_path(python(), &p("/h/mono/pkg"), &fs), None);
+    assert_eq!(ref_for_path(python(), &p("/h/none"), &fs), None);
+}
+
+#[test]
+fn interpreterの消えた環境は保存した選択として走らせない() {
+    let fs = FakeFs::new().file("/h/proj/.venv/pyvenv.cfg", "");
+    let r = RuntimeRef::new("venv", "/h/proj/.venv");
+    let c = resolve_ref(python(), MAC, &r, None, &fs, &home("/h")).expect("印は残っている");
+    let err = ensure_runnable(c, &fs).expect_err("python が無い");
+    assert_eq!(
+        (err.manager.as_str(), err.key.as_str()),
+        ("venv", "/h/proj/.venv")
+    );
+    assert!(
+        err.reason.contains("/h/proj/.venv/bin/python"),
+        "{}",
+        err.reason
+    );
+    // 素の名前（シェルが解く）は確かめない
+    let sys = resolve_ref(
+        python(),
+        MAC,
+        &RuntimeRef::new("system", "python3"),
+        None,
+        &FakeFs::new(),
+        &home("/h"),
+    )
+    .unwrap();
+    assert!(ensure_runnable(sys, &FakeFs::new()).is_ok());
+}

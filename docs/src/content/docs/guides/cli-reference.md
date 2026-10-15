@@ -1,12 +1,12 @@
 ---
 title: CLI リファレンス
 seoTitle: tako CLI リファレンス — コマンドの逆引き一覧
-description: tako コマンド全 95 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 96 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **95 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **96 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -23,7 +23,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 95 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 96 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -70,6 +70,7 @@ tako orchestrator spawn --help
 | [`web`](#tako-web) | Web ビューペインの操作 |
 | [`run`](#tako-run--run-default) | ファイルを実行する（Code Runner） |
 | [`run-default`](#tako-run--run-default) | 拡張子ごとの実行コマンド既定 |
+| [`run-config`](#tako-run--run-default) | ファイル / プロジェクトごとに実行環境・プロファイルを選んで覚える |
 | [`run-interactive`](#tako-run-interactive) | 入力が要るコマンドを可視ペインへ委譲 |
 | [`run-interactive-status`](#tako-run-interactive) | 委譲したコマンドの完了確認 |
 
@@ -895,7 +896,14 @@ tako run script.py --new-pane      # 差し替えずに新しいペインで走�
 tako run-default                   # 拡張子ごとの既定コマンド一覧
 tako run-default py "python3"      # 既定を設定
 tako run-default py --remove       # 既定を削除
+
+tako run-config script.py                 # 実行設定（選ばれる実行環境・候補・覚えた値）を見る
+tako run-config script.py --runtime .venv # 実行環境を選んで覚える（既定でプロジェクト単位）
+tako run-config script.py --profile test  # プロファイルを選んで覚える（既定でこのファイルだけ）
+tako run-config script.py --reset runtime # 自動選択へ戻す（--reset だけなら全項目）
 ```
+
+`tako run-config` で選んだ実行環境・プロファイルは、`tako run` と再生ボタンが自動で使います（`--profile` を付けた実行はそちらが優先）。覚える先は `<data_dir>/run-configs.json` で、中身がこのマシンのパスなので設定の共有（`tako config`）には載りません。`--runtime` には `--list` の `runtimes` の `id`、ディレクトリ名や版などの短い名前、interpreter のパスを渡せます。短い名前が複数の候補に当たる（例: 2 つの階層にある `.venv`）ときは選ばずに候補を並べて止まるので、`id` で選び直してください。覚えた環境を消した（`.venv` を作り直す前に消した等）ときは、別の Python へ黙って切り替えずにエラーで止まり、`tako run-config <file> --reset runtime` で自動選択へ戻せます。
 
 ### tako run-interactive
 

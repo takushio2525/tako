@@ -82,6 +82,11 @@ fn validate_remote_shortcuts(text: &str) -> Result<(), String> {
     json_ok::<tako_core::remote_shortcuts::ShortcutsFile>(text)
 }
 
+/// Code Runner の実行設定（#1731）。利用者が選んだ実行環境・プロファイル
+fn validate_run_configs(text: &str) -> Result<(), String> {
+    json_ok::<crate::run_configs::RunConfigsFile>(text)
+}
+
 /// 蓋閉じ継続の残留記録（#697 / #1373）。中身は Windows 専用だが、
 /// **読めない記録を「記録なし」へ丸めない**のは両 OS 共通の要件なので検査も共通
 fn validate_lid_guard(text: &str) -> Result<(), String> {
@@ -492,6 +497,10 @@ pub const SPECS: &[SchemaSpec] = &[
     // 版は印の `schema`（`version` ではない）で、形を変えるときも**移行の手順は要らない**:
     // 写しの中身が変われば同期（setup / GUI 起動時）が印ごと書き直す（`claude_mod_install`）
     pristine(SchemaId::ClaudeModMark, None),
+    // #1731: Code Runner の実行設定。利用者が選んだもの（読めなくても捨てない = 退避する）で、
+    // 版数フィールドを持つ。S4 以降で項目を足すときは serde の default で旧ファイルがそのまま
+    // 読めるので Step は要らない（形を変えるときだけ target_version を上げて Step を足す）
+    versioned(SchemaId::RunConfigs, Some(validate_run_configs)),
 ];
 
 /// 種別から登録を引く
@@ -548,6 +557,7 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         }
         SchemaId::RemoteDesired => single("remote/tako-remote.desired"),
         SchemaId::ClaudeModUi => tako_core::claude_mod_ui::ui_path().into_iter().collect(),
+        SchemaId::RunConfigs => crate::run_configs::store_path().into_iter().collect(),
         // #1959: data dir の外（設定 dir ごと）。置く先の解決は claude_mod_install の 1 実装
         SchemaId::ClaudeModMark => crate::claude_mod_install::collect_targets(
             &crate::claude_mod_install::target_inputs(&[]),
