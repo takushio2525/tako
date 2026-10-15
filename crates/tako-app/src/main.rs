@@ -309,6 +309,46 @@ fn drag_scroll_delta(factor_abs: f32) -> f32 {
     speed * (DRAG_SCROLL_INTERVAL_MS as f32 / 1000.0)
 }
 
+/// ドラッグ選択オートスクロールの 1 ティックで何をするか（#310 / #2025）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragScrollStep {
+    /// 表示を `lines` 行送り（正 = 過去方向）、選択の端をその方向の画面端へ伸ばす
+    Scroll { lines: i32 },
+    /// これ以上は送れない: 選択の端を動かさない（マウスの位置で伸ばした端のまま）
+    Hold,
+}
+
+/// 速度係数（正 = 上・負 = 下）を 1 ティックで送る行数へ（符号つき。最低 1 行）
+fn drag_scroll_lines(factor: f32) -> i32 {
+    let lines = drag_scroll_delta(factor.abs()).ceil() as i32;
+    if factor > 0.0 {
+        lines
+    } else {
+        -lines
+    }
+}
+
+/// オートスクロール 1 ティックの手を決める（#2025）。上へ送るのは表示が履歴の最上端に
+/// 達していないときだけ。履歴が無い・既に最上端にいるのに選択の端を (0, 0) へ寄せると、
+/// ドラッグした範囲が画面の左上まで縮む。alt screen は履歴を持たない（`history_size` が 0）
+/// ので、遷移の途中にティックが走っても同じ規則で止まる。
+/// 下へ送る側は #310 のまま（最下部でも画面の右下へ伸ばす = #2025 の対象外）
+fn drag_scroll_step(factor: f32, display_offset: usize, history_size: usize) -> DragScrollStep {
+    if factor > 0.0 && display_offset >= history_size {
+        return DragScrollStep::Hold;
+    }
+    DragScrollStep::Scroll {
+        lines: drag_scroll_lines(factor),
+    }
+}
+
+/// #2025 の A/B。`TAKO_2025_LEGACY=1` で**同一バイナリのまま**旧挙動
+/// （送れるかを見ずに毎ティック選択の端を画面端へ寄せる = 履歴が無いと (0, 0) へ縮む）へ戻す
+fn legacy_2025() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2025_LEGACY").as_deref() == Ok("1"))
+}
+
 /// PDF プレビュー用: 速度係数（0.0..1.0）を 1 ティック分のスクロールピクセル数（正）に変換する（#309）
 const DRAG_SCROLL_MIN_PX_PER_SEC: f32 = 40.0;
 const DRAG_SCROLL_MAX_PX_PER_SEC: f32 = 600.0;
@@ -19598,8 +19638,6 @@ impl TakoApp {
             self.drag_scroll = None;
             return false;
         }
-        let delta_rows = drag_scroll_delta(factor.abs());
-
         let session = match self.terminals.get(&pane_id) {
             Some(s) => s,
             None => {
@@ -19609,13 +19647,24 @@ impl TakoApp {
         };
         let (cols, rows) = session.size();
 
-        if factor > 0.0 {
+        let step = if legacy_2025() {
+            DragScrollStep::Scroll {
+                lines: drag_scroll_lines(factor),
+            }
+        } else {
+            drag_scroll_step(factor, session.display_offset(), session.history_size())
+        };
+        // 送れないあいだもタイマーは回し続ける（ドラッグ中に出力が履歴を作れば次のティックで送る。
+        // false を返すと `drag_scroll` が残ったまま止まり、次の移動でタイマーが立たない）
+        let DragScrollStep::Scroll { lines } = step else {
+            return true;
+        };
+        session.scroll_display(lines);
+        if lines > 0 {
             // 過去方向（上）
-            session.scroll_display(delta_rows.ceil() as i32);
             session.extend_selection(0, 0, false);
         } else {
             // 未来方向（下）
-            session.scroll_display(-(delta_rows.ceil() as i32));
             session.extend_selection(cols.saturating_sub(1), rows.saturating_sub(1), true);
         }
         cx.notify();
@@ -31705,6 +31754,11 @@ mod self_test {
     mod click_forward_1961;
     #[cfg(feature = "visual-test")]
     use click_forward_1961::{click_forward_claude_visual, click_forward_visual};
+    /// #2025: 送れる履歴が無いときのドラッグ選択のオートスクロール（visual-test `drag-autoscroll`）
+    #[cfg(feature = "visual-test")]
+    mod drag_autoscroll_2025;
+    #[cfg(feature = "visual-test")]
+    use drag_autoscroll_2025::drag_autoscroll_visual;
     /// #1962: mod がバーを描いているとき、ステータスバーの claude の区画を外すか（visual-test `mod-bar`）
     #[cfg(feature = "visual-test")]
     mod mod_bar_1962;
@@ -46262,6 +46316,12 @@ mod self_test {
                 }
                 "click-forward-claude" => {
                     click_forward_claude_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #2025: 送れる履歴が無いときのオートスクロールが選択の端を (0, 0) へ寄せないか
+                "drag-autoscroll" => {
+                    drag_autoscroll_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
@@ -97234,6 +97294,120 @@ mod drag_scroll_tests {
             assert!(delta > prev, "factor={factor}: {delta} <= {prev}");
             prev = delta;
         }
+    }
+
+    // --- 送れないときは選択の端を動かさない（#2025） ---
+
+    #[test]
+    fn issue2025_履歴が無いと上へは送らず端を動かさない() {
+        for factor in [0.01, 0.5, 1.0] {
+            assert_eq!(
+                drag_scroll_step(factor, 0, 0),
+                DragScrollStep::Hold,
+                "factor={factor}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue2025_既に最上端にいれば止まる() {
+        assert_eq!(drag_scroll_step(0.5, 5, 5), DragScrollStep::Hold);
+        assert_eq!(drag_scroll_step(1.0, 10_000, 10_000), DragScrollStep::Hold);
+        // 表示位置が履歴を上回る値（alacritty は起こさない想定）が来ても送らない
+        assert_eq!(drag_scroll_step(0.5, 6, 5), DragScrollStep::Hold);
+    }
+
+    #[test]
+    fn issue2025_履歴が残っていれば上へ送る_310() {
+        let lines = drag_scroll_lines(0.5);
+        assert!(lines >= 1, "上へ送る行数は正: {lines}");
+        assert_eq!(
+            drag_scroll_step(0.5, 0, 5),
+            DragScrollStep::Scroll { lines }
+        );
+        assert_eq!(
+            drag_scroll_step(0.5, 4, 5),
+            DragScrollStep::Scroll { lines }
+        );
+        let fastest = drag_scroll_delta(1.0).ceil() as i32;
+        assert_eq!(
+            drag_scroll_step(1.0, 0, 10_000),
+            DragScrollStep::Scroll { lines: fastest }
+        );
+    }
+
+    /// 1 画面未満の履歴: 最上端まで送り切ったら、そこから先のティックは端を動かさない
+    #[test]
+    fn issue2025_1画面未満の履歴は送り切ってから止まる() {
+        let history = 5;
+        let mut offset = 0usize;
+        let mut scrolled = 0;
+        for _ in 0..50 {
+            match drag_scroll_step(0.8, offset, history) {
+                DragScrollStep::Scroll { lines } => {
+                    assert!(lines > 0);
+                    // alacritty の scroll_display と同じく最上端で頭打ち
+                    offset = (offset + lines as usize).min(history);
+                    scrolled += 1;
+                }
+                DragScrollStep::Hold => break,
+            }
+        }
+        assert_eq!(offset, history, "最上端まで送る（#310）");
+        assert!(
+            (1..=history).contains(&scrolled),
+            "送るのは最上端に着くまで: {scrolled} 回"
+        );
+        assert_eq!(drag_scroll_step(0.8, offset, history), DragScrollStep::Hold);
+    }
+
+    /// alt screen（全画面 TUI）の grid は履歴を持たない = 開始の判定（`update_drag_scroll`）を
+    /// すり抜けて alt screen へ移った後のティックでも端を (0, 0) へ寄せない
+    #[test]
+    fn issue2025_alt_screen_の履歴0でも止まる() {
+        assert_eq!(drag_scroll_step(0.7, 0, 0), DragScrollStep::Hold);
+    }
+
+    /// 下へ送る側は #2025 の対象外 = #310 のまま（最下部でも送って右下へ伸ばす）
+    #[test]
+    fn issue2025_下へ送る側は従来どおり() {
+        let lines = drag_scroll_lines(-0.5);
+        assert!(lines <= -1, "下へ送る行数は負: {lines}");
+        assert_eq!(
+            drag_scroll_step(-0.5, 0, 0),
+            DragScrollStep::Scroll { lines }
+        );
+        assert_eq!(
+            drag_scroll_step(-0.5, 3, 5),
+            DragScrollStep::Scroll { lines }
+        );
+    }
+
+    /// 番犬: ティック処理（`tick_drag_scroll`）が判定を `drag_scroll_step` へ通しているか。
+    /// 単体テストは関数の中身しか守れないので、呼び出し側の形をここで固定する
+    /// （**`concat!` で組む**のは、この番犬自身の行が `include_str!` の検査対象に入るため）
+    #[test]
+    fn issue2025_tick_が判定を通す_watchdog() {
+        let src = include_str!("main.rs");
+        let head = concat!("fn tick_drag", "_scroll(&mut self");
+        let start = src.find(head).expect("ティック処理が見つからない");
+        let body = &src[start..];
+        let end = body[head.len()..]
+            .find("\n    fn ")
+            .map(|i| i + head.len())
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains(concat!(
+                "drag_scroll",
+                "_step(factor, session.display_offset()"
+            )),
+            "tick_drag_scroll が送れるかを見ずに選択の端を寄せている（#2025）"
+        );
+        assert!(
+            !body.contains(concat!("delta_rows", ".ceil()")),
+            "tick_drag_scroll が行数を自前で組んでいる（drag_scroll_lines を通す）"
+        );
     }
 }
 
