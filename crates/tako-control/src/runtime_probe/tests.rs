@@ -119,6 +119,8 @@ static TOY: RuntimeKind = RuntimeKind {
             eligible_when_missing: true,
         }),
     ],
+    // #1735: どの候補を選んでも PATH の先頭へ足すプロジェクトの道具の置き場
+    project_bins: &[&["toy_modules", ".bin"]],
 };
 
 fn kind() -> &'static RuntimeKind {
@@ -768,4 +770,131 @@ fn 基板の案内は見つけた実体へ聞いて詰める() {
     let mut m = detect();
     apply_project_followup_with(&mut m, Some(&snap), &quiet, BUDGET);
     assert!(quiet.calls().is_empty());
+}
+
+/// #1735: 表の `project_bins`（node の `node_modules/.bin`）は候補ではなく、自動で選んだ候補にも
+/// 保存した選択にも重なり、**選んだ候補の置き場より前**に並ぶ（近い段が先）
+#[test]
+fn プロジェクトの道具の置き場はどの候補を選んでも選んだ置き場より前に並ぶ() {
+    let s = Sandbox::new("rp-bins");
+    let (venv, marker, interp) = venv_layout_rel();
+    s.write(&format!("proj/{venv}/{marker}"), "version = 3.12.4\n");
+    s.write(&format!("proj/{venv}/{interp}"), "");
+    let bins = kind().project_bins[0].join("/");
+    std::fs::create_dir_all(s.path(&format!("proj/{bins}"))).unwrap();
+    std::fs::create_dir_all(s.path(&format!("proj/pkg/{bins}"))).unwrap();
+    s.write("proj/pkg/src/a.toy", "");
+    let snap = s.run("proj/pkg/src/a.toy", &s.env(&[]), &mut Facts::default());
+    let c = snap.selected().expect("venv を選ぶ").clone();
+    let mut want: Vec<String> = [format!("proj/pkg/{bins}"), format!("proj/{bins}")]
+        .iter()
+        .map(|r| s.path(r).to_string_lossy().into_owned())
+        .collect();
+    want.extend(
+        c.applied
+            .path_prepend
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned()),
+    );
+    assert!(!c.applied.path_prepend.is_empty(), "venv の置き場がある");
+    assert_eq!(snap.path_prepend(), want);
+    assert_eq!(
+        runtime_json(Some(&snap))["path_prepend"],
+        serde_json::json!(want)
+    );
+    // 候補の一覧には並ばない（選ぶものではない）
+    assert!(snap
+        .detection
+        .candidates
+        .iter()
+        .all(|x| !x.key.contains(&bins)));
+
+    // 保存した選択（PATH の名前のまま = 自分の置き場を持たない）でも道具の置き場は効く
+    let mut snap = snap;
+    let system = RuntimeRef::new(
+        "system",
+        runtime_env::fallback_value(kind(), Platform::current()),
+    );
+    snap.choose_with(
+        &system,
+        FieldSource::File,
+        &s.path("proj"),
+        Platform::current(),
+        &RealFs,
+        &s.env(&[]),
+    )
+    .expect("名前のままは解ける");
+    assert_eq!(snap.path_prepend(), want[..2].to_vec());
+
+    // 道具の置き場が無ければ今までどおり（選んだ候補の置き場だけ）
+    let s2 = Sandbox::new("rp-nobins");
+    s2.write("loose/a.toy", "");
+    let snap = s2.run("loose/a.toy", &s2.env(&[]), &mut Facts::default());
+    assert!(snap.path_prepend().is_empty());
+}
+
+/// #1735（差し戻し）: 本物の表の `rust` 行。`rust-toolchain.toml` を自動で見つけただけなら
+/// `RUSTUP_TOOLCHAIN` は入れず（rustup がファイルを読む）、保存した選択のときだけ入れる。
+/// 一覧と同じ鍵を選んでも（一覧の候補をそのまま使う経路）入り、候補の段（tier）は変わらない
+#[test]
+fn toolchainは明示に選んだときだけ環境変数で上書きする() {
+    let s = Sandbox::new("rp-1735-rustup");
+    s.write(
+        "proj/rust-toolchain.toml",
+        "[toolchain]\nchannel = \"1.79.0\"\ncomponents = [\"rustfmt\"]\n",
+    );
+    s.write("proj/src/main.rs", "fn main() {}\n");
+    let kind = runtime_env::kind_by_id("rust").expect("rust の行");
+    let env = s.env(&[]);
+    let detect = || {
+        detect_with(
+            kind,
+            Platform::current(),
+            &s.dirs("proj/src/main.rs"),
+            &RealFs,
+            &env,
+            &mut Facts::default(),
+            None,
+        )
+    };
+    let var = "RUSTUP_TOOLCHAIN".to_string();
+
+    // 自動: 候補には出るが env は空
+    let snap = detect();
+    let c = snap.selected().expect("toolchain を一覧に出す");
+    assert_eq!((c.manager, c.key.as_str()), ("rustup", "1.79.0"));
+    assert!(snap.env().is_empty(), "{:?}", snap.env());
+    let rt = runtime_json(Some(&snap));
+    assert_eq!(rt["source"], "auto");
+    assert_eq!(rt["env"], serde_json::json!({}));
+
+    // 一覧と同じ鍵を保存した: 明示なので入る。候補は一覧のものなので tier は F のまま
+    let mut snap = detect();
+    snap.choose_with(
+        &RuntimeRef::new("rustup", "1.79.0"),
+        FieldSource::Project,
+        &s.path("proj"),
+        Platform::current(),
+        &RealFs,
+        &env,
+    )
+    .expect("一覧の候補");
+    assert_eq!(snap.env(), [(var.clone(), "1.79.0".to_string())]);
+    let rt = runtime_json(Some(&snap));
+    assert_eq!(rt["source"], "project");
+    assert_eq!(rt["tier"], "F");
+    assert_eq!(rt["env"]["RUSTUP_TOOLCHAIN"], "1.79.0");
+
+    // 一覧に無い toolchain を保存した: その値で上書きする
+    let mut snap = detect();
+    snap.choose_with(
+        &RuntimeRef::new("rustup", "nightly"),
+        FieldSource::File,
+        &s.path("proj"),
+        Platform::current(),
+        &RealFs,
+        &env,
+    )
+    .expect("任意の toolchain は rustup が解く");
+    assert_eq!(snap.env(), [(var, "nightly".to_string())]);
 }

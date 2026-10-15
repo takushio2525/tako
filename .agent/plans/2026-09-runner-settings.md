@@ -570,6 +570,9 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
 
 ### 9.1 行の例（S7 で入れる候補）
 
+（#1735 で node / rust を入れた。実際の形は §10 S7 の「実装で決めたこと」。node の `node_modules/.bin` は
+検出器ではなく表の欄 `project_bins` になった）
+
 | kind | 検出器（§5.1 の戦略） | 備考 |
 |---|---|---|
 | node | `VersionFile(.nvmrc / .node-version → nvm / fnm の versions)` → `MarkerDir(node_modules/.bin を PATH 前置)` → `PathLookup(node)` | volta は `package.json` の `volta` をシム自身が読むので、tako は手を出さない |
@@ -755,6 +758,43 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
 - 触る: `crates/tako-core/src/runtime_env/kinds.rs`（行の追加）+ テスト。戦略が足りなければ `detect.rs` に 1 つ足す
 - 受け入れ: §9.1 の検出を偽のファイルシステムで固定（両 OS の列）/ `.nvmrc` のあるプロジェクトで `tako run a.js` が nvm の版の node で走る（隔離実経路）
 - 依存: S2（S3〜S6 とは並走できる。触るのが表とテストだけ）/ 規模: M
+- **実装で決めたこと（#1735。§9.1 の案からの差分。正本は FR-3.18.3 の ⑤）**:
+  - **`node_modules/.bin` は検出器ではなく表の欄**（`RuntimeKind::project_bins`）。検出器は自動選択の順に並ぶ
+    **排他の候補**なので、`MarkerDir` の 1 つにすると「nvm の版」と同時に効かない（`.nvmrc` のあるプロジェクトで
+    版を選べば `node_modules/.bin` が消え、`node_modules/.bin` を選べば版が消える）。欄にして**どの候補を選んでも**
+    PATH の先頭へ近い段から足す（`npm run` と同じ並び）。重ねるのは `runtime_probe::Snapshot::path_prepend`
+    の 1 か所なので、自動選択にも保存した選択（#1731）にも効く
+  - 版の照合に **`VersionMatch::NumericPrefix`** を足した（pyenv は `Exact` のまま）。`.nvmrc` の `20` は
+    `versions/node/v20.11.1` のような名前と完全一致しないので、数字の成分の前方一致で一番新しい版を選ぶ
+    （nvm / fnm と同じ解き方。fnm 1.38.1 の `fnm exec` で `18` → `v18.x.x` を実測）。版の形でないディレクトリ
+    （fnm の作業用 `node-versions/.downloads`。実機に在る）は候補にしない。`lts/*` 等の別名は解かない
+    （nvm の `alias/` は遠隔の最新 LTS を指すことがあり、入っている版と結び付かない）
+  - 道具の置き場を **OS の列 + 候補の列**にした（`VersionFileSpec` の `root_env` / `versions_dir` を `PerOs`、
+    `root_default` を「在る最初のもの」の列に）。nvm と nvm-windows は変数名（`NVM_DIR` / `NVM_HOME`）も
+    並び（`versions/node/<版>` / 直下）も違い、fnm は版によって既定の置き場が変わってきた（macOS の実機は
+    `~/.local/share/fnm`）
+  - **道具の置き場が無ければ「その版が無い」を知らせない**。node は nvm と fnm が同じ版のファイルを読むので、
+    使っていない側が毎回騒ぐ。pyenv の行も同じ規則にした（pyenv の無い人に `.python-version` の版が無いと出していた）
+  - Rust の行は既存の `EnvSwitch` で足りた。ファイルの並びは `rust-toolchain` → `rust-toolchain.toml`
+    （同じ段に両方あれば rustup は旧い名前を使う = rustup 1.28.2 で実測）。**自動で見つけただけなら
+    `RUSTUP_TOOLCHAIN` は入れない**（§9.1 の「行が要るのは明示の上書きだけ」どおり。master の差し戻しで直した）。
+    入れると上書きの出どころがファイルから環境変数へ移り（`rustup show active-toolchain` が `overridden by
+    environment variable` と出す = rustup 1.28.2 で実測）、ファイルの `components` / `targets` / `path` が効かなく
+    なるため。候補（一覧の `runtimes` / `runtime`）には今までどおり出す。**利用者が明示に選んだ（保存した）ときだけ**
+    `RUSTUP_TOOLCHAIN` を入れる。この「選んだときだけ効く当て方」は候補の `Applied` に入れず
+    `runtime_env::explicit_env` が返し、`runtime_probe::Snapshot::env` が保存した選択にだけ重ねる
+    （一覧と同じ鍵を保存したときは一覧の候補をそのまま使う経路なので、候補に入れる形だと取りこぼす）
+  - 同じ段に版のファイルの検出器が複数あるとき（nvm と fnm）、**どれかが版を見つけたら他の「その版が無い」は
+    出さない**（実経路で、nvm の v20 で走っているのに「fnm 20 が入っていない」と出る誤報を見つけた）
+  - TS / JSX（`npx tsx`）も node の行に入れた。既定の行は `${node}` を使わないが、PATH の前置で npx / tsx が
+    その版の node で走る。表のテストは「interpreter を名前で直書きした行（`node ${fileBase}`）」だけを落とす形にした
+  - **Tier P は並列にしない**（#1730 の申し送りの判断）。Tier P は 1 ファイル = 1 kind で走り、S7 の行は
+    1 回の一覧で聞く本数を増やさない（node は PATH の node の場所と版の最大 2 本・Rust は 0 本。nvm / fnm の版は
+    ディレクトリ名で決まる）。固まる道具が重なって上限 × 本数を待つのは python の行（uv / poetry / pipenv の場所・
+    conda の一覧・環境の置き場）だけで、待つのも background の `RunResolve` だけ（`Run` と UI スレッドは待たない）。
+    並列にすると unix ではログインシェル（rc を読む）を同時に何本も起こすので、8 本前後の worker が並ぶこの PC では
+    重さのほうが目立つ。**[提案]** 詰めるなら並列より、場所の探索を 1 本のログインシェルにまとめる
+    （`command -v uv poetry pipenv python3 conda` を 1 回）方が、待ちの上限も子プロセスの数も 1 本ぶんになる
 
 ---
 

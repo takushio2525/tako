@@ -763,6 +763,7 @@ const TOOLCHAIN_KIND: RuntimeKind = RuntimeKind {
         toml_key: Some("channel"),
         var: "TOY_TOOLCHAIN",
     })],
+    project_bins: &[],
 };
 
 #[test]
@@ -774,8 +775,11 @@ fn 環境変数で切り替える戦略はtomlのキーと素の1行の両方を
         let fs = FakeFs::new().file(format!("/h/proj/{file}"), content);
         let d = detect(&TOOLCHAIN_KIND, MAC, &dirs(&["/h/proj"]), &fs, &home("/h"));
         let c = auto(&d);
+        assert_eq!(c.key, "1.80", "{file}");
+        // 見つけただけでは変数を入れない（道具がファイルを自分で読む）。明示に選んだときだけ入れる（#1735）
+        assert!(c.applied.env.is_empty(), "{file}: {:?}", c.applied.env);
         assert_eq!(
-            c.applied.env,
+            explicit_env(&TOOLCHAIN_KIND, c),
             [("TOY_TOOLCHAIN".to_string(), "1.80".to_string())],
             "{file}"
         );
@@ -1190,4 +1194,537 @@ fn interpreterの消えた環境は保存した選択として走らせない() 
     )
     .unwrap();
     assert!(ensure_runnable(sys, &FakeFs::new()).is_ok());
+}
+
+#[test]
+fn pyenvが入っていなければ版の不足を知らせない() {
+    // 道具そのものが無い人に「その版が無い」を毎回出さない（#1735。node の行は 2 つの道具が
+    // 同じ版のファイルを読むので、使っていない側が騒がないための規則を全行で揃えた）
+    let fs = FakeFs::new().file("/h/proj/.python-version", "3.9.1");
+    let d = detect_py(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(auto(&d).manager, "system");
+    assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+}
+
+// ─── #1735: node（nvm / fnm / node_modules/.bin / PATH の node） ───────
+
+fn node() -> &'static RuntimeKind {
+    kind_by_id("node").expect("node の行がある")
+}
+
+fn detect_node(platform: Platform, d: &[&str], fs: &FakeFs, env: &DetectEnv) -> Detection {
+    detect(node(), platform, &dirs(d), fs, env)
+}
+
+/// nvm に版を並べたホーム（`/h/.nvm/versions/node/<版>/bin/node`）
+fn nvm_fs(versions: &[&str]) -> FakeFs {
+    versions.iter().fold(FakeFs::new(), |fs, v| {
+        fs.file(format!("/h/.nvm/versions/node/{v}/bin/node"), "")
+    })
+}
+
+#[test]
+fn nvmrcの番号はnvmの版の前方一致で一番新しいものを選ぶ() {
+    let fs = nvm_fs(&["v18.20.4", "v20.9.0", "v20.11.1", "v22.1.0"]).file("/h/proj/.nvmrc", "20\n");
+    let d = detect_node(MAC, &["/h/proj/src", "/h/proj"], &fs, &home("/h"));
+    let c = auto(&d);
+    assert_eq!(c.manager, "nvm");
+    assert_eq!(
+        (c.key.as_str(), c.label.as_str(), c.version.as_deref()),
+        ("v20.11.1", "nvm v20.11.1", Some("20.11.1"))
+    );
+    assert_eq!(prog(c), ["/h/.nvm/versions/node/v20.11.1/bin/node"]);
+    assert_eq!(
+        ps(&c.applied.path_prepend),
+        ["/h/.nvm/versions/node/v20.11.1/bin"]
+    );
+    assert_eq!(c.found_in, Some(p("/h/proj")));
+    assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+    // 他の版も（自動ではないが）選べるように並ぶ。並びは選んだ版 → 古い順
+    let keys: Vec<&str> = d
+        .candidates
+        .iter()
+        .filter(|x| x.manager == "nvm")
+        .map(|x| x.key.as_str())
+        .collect();
+    assert_eq!(keys, ["v20.11.1", "v18.20.4", "v20.9.0", "v22.1.0"]);
+    assert_eq!(d.candidates.iter().filter(|x| x.auto_eligible).count(), 2);
+    // 最後の砦（PATH の node = 名前のまま）も並ぶ
+    assert_eq!(d.candidates.last().map(|x| x.manager), Some("system"));
+}
+
+#[test]
+fn nvmの版の照合は成分ごとで先頭のvを読み飛ばす() {
+    let fs = nvm_fs(&["v9.11.2", "v10.24.1", "v20.1.0", "v20.11.1"]);
+    for (want, hit) in [
+        ("v20.11.1", Some("v20.11.1")),
+        ("20.11", Some("v20.11.1")),
+        ("20.1", Some("v20.1.0")),
+        ("1", None),
+        ("9", Some("v9.11.2")),
+        ("10", Some("v10.24.1")),
+        ("v20", Some("v20.11.1")),
+        ("20.x", Some("v20.11.1")),
+    ] {
+        let fs =
+            nvm_fs(&["v9.11.2", "v10.24.1", "v20.1.0", "v20.11.1"]).file("/h/proj/.nvmrc", want);
+        let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+        let got = d
+            .auto_candidate()
+            .filter(|c| c.manager == "nvm")
+            .map(|c| c.key.as_str());
+        assert_eq!(got, hit, ".nvmrc = {want}");
+    }
+    // 版の並びは数字の大小（文字列の順なら v10 が v9 より前に来る）
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    let keys: Vec<&str> = d
+        .candidates
+        .iter()
+        .filter(|x| x.manager == "nvm")
+        .map(|x| x.key.as_str())
+        .collect();
+    assert_eq!(keys, ["v9.11.2", "v10.24.1", "v20.1.0", "v20.11.1"]);
+}
+
+#[test]
+fn nvm_dirがあればそちらを見る() {
+    let fs = FakeFs::new()
+        .file("/h/proj/.nvmrc", "v20.11.1")
+        .file("/opt/nvm/versions/node/v20.11.1/bin/node", "");
+    let mut env = home("/h");
+    env.vars.insert("NVM_DIR".into(), "/opt/nvm".into());
+    let d = detect_node(MAC, &["/h/proj"], &fs, &env);
+    assert_eq!(prog(auto(&d)), ["/opt/nvm/versions/node/v20.11.1/bin/node"]);
+}
+
+#[test]
+fn nvmrcとnode_versionは近い段が勝ち同じ段ならnvmrcが勝つ() {
+    let base = nvm_fs(&["v18.20.4", "v20.11.1", "v22.1.0"]);
+    // 同じ段に両方 → .nvmrc（fnm も先に読む = 実測）
+    let fs = nvm_fs(&["v18.20.4", "v20.11.1", "v22.1.0"])
+        .file("/h/proj/.nvmrc", "20")
+        .file("/h/proj/.node-version", "22");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(auto(&d).key, "v20.11.1");
+    // .node-version だけでも読む
+    let fs = nvm_fs(&["v18.20.4", "v20.11.1", "v22.1.0"]).file("/h/proj/.node-version", "22.1.0");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(auto(&d).key, "v22.1.0");
+    // 近い段の .node-version が遠い段の .nvmrc に勝つ
+    let fs = base
+        .file("/h/proj/.nvmrc", "20")
+        .file("/h/proj/pkg/.node-version", "18");
+    let d = detect_node(MAC, &["/h/proj/pkg", "/h/proj"], &fs, &home("/h"));
+    assert_eq!(auto(&d).key, "v18.20.4");
+    assert_eq!(auto(&d).found_in, Some(p("/h/proj/pkg")));
+}
+
+#[test]
+fn nvmrcの別名は解かずに理由を出しシステムへ進む() {
+    for alias in ["lts/*", "lts/iron", "node", "stable", "default"] {
+        let fs = nvm_fs(&["v20.11.1"]).file("/h/proj/.nvmrc", &format!("{alias}\n"));
+        let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+        assert_eq!(auto(&d).manager, "system", "{alias}");
+        // 入っている版は候補に並ぶが自動ではない
+        let nvm: Vec<&Candidate> = d.candidates.iter().filter(|c| c.manager == "nvm").collect();
+        assert_eq!(nvm.len(), 1, "{alias}");
+        assert!(!nvm[0].auto_eligible, "{alias}");
+        // 理由は 1 つ（fnm は入っていないので騒がない）・別名をそのまま載せる
+        assert_eq!(d.warnings.len(), 1, "{alias}: {:?}", d.warnings);
+        assert!(d.warnings[0].contains(alias), "{:?}", d.warnings);
+    }
+}
+
+#[test]
+fn nvmrcのsystemは飛ばし理由も出さない() {
+    let fs = nvm_fs(&["v20.11.1"]).file("/h/proj/.nvmrc", "system");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(auto(&d).manager, "system");
+    assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+}
+
+#[test]
+fn 指す版が入っていなければ候補に出さず理由を出す() {
+    let fs = nvm_fs(&["v20.11.1"]).file("/h/proj/.nvmrc", "18");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(auto(&d).manager, "system");
+    assert!(d
+        .candidates
+        .iter()
+        .all(|c| c.key != "v18" && !c.key.starts_with("v18")));
+    assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
+    assert!(d.warnings[0].contains("18"), "{:?}", d.warnings);
+}
+
+#[test]
+fn nvmもfnmも無ければ版のファイルがあっても騒がずシステムの名前のまま() {
+    let fs = FakeFs::new().file("/h/proj/.nvmrc", "20");
+    for (platform, name) in [(MAC, "node"), (WIN, "node")] {
+        let d = detect_node(platform, &["/h/proj"], &fs, &home("/h"));
+        let c = auto(&d);
+        assert_eq!((c.manager, prog(c)), ("system", vec![name.to_string()]));
+        assert!(c.applied.path_prepend.is_empty() && c.applied.env.is_empty());
+        assert!(d.warnings.is_empty(), "{platform:?}: {:?}", d.warnings);
+        assert_eq!(fallback_value(node(), platform), name);
+    }
+}
+
+#[test]
+fn fnmはnode_versionsの下のinstallationを使い作業用のディレクトリを版と読まない() {
+    // fnm 1.38.1 の実測の形（macOS は `~/.local/share/fnm`。`.downloads` は作業用）
+    let fs = FakeFs::new()
+        .file("/h/proj/.node-version", "22")
+        .file(
+            "/h/.local/share/fnm/node-versions/v22.18.0/installation/bin/node",
+            "",
+        )
+        .dir("/h/.local/share/fnm/node-versions/.downloads")
+        .file("/h/.local/share/fnm/node-versions/.DS_Store", "");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    let c = auto(&d);
+    assert_eq!((c.manager, c.key.as_str()), ("fnm", "v22.18.0"));
+    assert_eq!(
+        prog(c),
+        ["/h/.local/share/fnm/node-versions/v22.18.0/installation/bin/node"]
+    );
+    assert_eq!(
+        ps(&c.applied.path_prepend),
+        ["/h/.local/share/fnm/node-versions/v22.18.0/installation/bin"]
+    );
+    let fnm: Vec<&str> = d
+        .candidates
+        .iter()
+        .filter(|x| x.manager == "fnm")
+        .map(|x| x.key.as_str())
+        .collect();
+    assert_eq!(fnm, ["v22.18.0"], "作業用のディレクトリが版に混ざった");
+    assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+}
+
+#[test]
+fn fnmの置き場は環境変数と在る置き場を新しい順に見る() {
+    let tail = "node-versions/v20.11.1/installation/bin/node";
+    // 旧い置き場（~/.fnm）しか無い
+    let fs = FakeFs::new()
+        .file("/h/proj/.nvmrc", "20")
+        .file(format!("/h/.fnm/{tail}"), "");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(prog(auto(&d)), [format!("/h/.fnm/{tail}")]);
+    // XDG_DATA_HOME
+    let fs = FakeFs::new()
+        .file("/h/proj/.nvmrc", "20")
+        .file(format!("/x/data/fnm/{tail}"), "")
+        .file(format!("/h/.fnm/{tail}"), "");
+    let mut env = home("/h");
+    env.vars.insert("XDG_DATA_HOME".into(), "/x/data".into());
+    let d = detect_node(MAC, &["/h/proj"], &fs, &env);
+    assert_eq!(prog(auto(&d)), [format!("/x/data/fnm/{tail}")]);
+    // FNM_DIR が最優先
+    env.vars.insert("FNM_DIR".into(), "/opt/fnm".into());
+    let fs = fs.file(format!("/opt/fnm/{tail}"), "");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &env);
+    assert_eq!(prog(auto(&d)), [format!("/opt/fnm/{tail}")]);
+}
+
+#[test]
+fn nvmとfnmの両方に版があればnvmが先() {
+    let fs = nvm_fs(&["v20.11.1"]).file("/h/proj/.nvmrc", "20").file(
+        "/h/.local/share/fnm/node-versions/v20.11.1/installation/bin/node",
+        "",
+    );
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    let managers: Vec<&str> = d.candidates.iter().map(|c| c.manager).collect();
+    assert_eq!(managers, ["nvm", "fnm", "system"]);
+    assert_eq!(auto(&d).manager, "nvm");
+    assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+}
+
+#[test]
+fn node_modulesのbinは候補ではなく近い段から全部をpathの先頭へ足す() {
+    let fs = nvm_fs(&["v20.11.1"])
+        .file("/h/mono/.nvmrc", "20")
+        .dir("/h/mono/node_modules/.bin")
+        .dir("/h/mono/pkg/a/node_modules/.bin")
+        // 中間の段には無い
+        .dir("/h/mono/pkg/node_modules");
+    let d = detect_node(
+        MAC,
+        &[
+            "/h/mono/pkg/a/src",
+            "/h/mono/pkg/a",
+            "/h/mono/pkg",
+            "/h/mono",
+        ],
+        &fs,
+        &home("/h"),
+    );
+    assert_eq!(
+        ps(&d.project_bins),
+        [
+            "/h/mono/pkg/a/node_modules/.bin",
+            "/h/mono/node_modules/.bin"
+        ]
+    );
+    // 候補の当て方は版の置き場だけ（重ねるのは呼び出し側 = どの候補を選んでも効く）
+    assert_eq!(auto(&d).manager, "nvm");
+    assert_eq!(
+        ps(&auto(&d).applied.path_prepend),
+        ["/h/.nvm/versions/node/v20.11.1/bin"]
+    );
+    assert!(d.candidates.iter().all(|c| !c.key.contains("node_modules")));
+    // 表に道具の置き場を持たない行（python）は、同じディレクトリでも足さない
+    let py = detect_py(MAC, &["/h/mono"], &fs, &home("/h"));
+    assert!(py.project_bins.is_empty());
+}
+
+#[test]
+fn windowsのnvmはnvm_homeの直下の版のnode_exe() {
+    let fs = FakeFs::new()
+        .file("/w/proj/.nvmrc", "20")
+        .file("/w/nvm/v20.11.1/node.exe", "")
+        .file("/w/nvm/nvm.exe", "")
+        .file("/w/nvm/settings.txt", "")
+        .dir("/w/nvm/nodejs-cache");
+    let mut env = home("/w/user");
+    env.vars.insert("NVM_HOME".into(), "/w/nvm".into());
+    let d = detect_node(WIN, &["/w/proj"], &fs, &env);
+    let c = auto(&d);
+    assert_eq!((c.manager, c.key.as_str()), ("nvm", "v20.11.1"));
+    assert_eq!(prog(c), ["/w/nvm/v20.11.1/node.exe"]);
+    assert_eq!(ps(&c.applied.path_prepend), ["/w/nvm/v20.11.1"]);
+    assert_eq!(
+        d.candidates.iter().filter(|x| x.manager == "nvm").count(),
+        1,
+        "版の形でないディレクトリを版と読んだ"
+    );
+    // macOS の列の変数（NVM_DIR）は Windows では見ない
+    let mut env = home("/w/user");
+    env.vars.insert("NVM_DIR".into(), "/w/nvm".into());
+    let d = detect_node(WIN, &["/w/proj"], &fs, &env);
+    assert_eq!(auto(&d).manager, "system");
+}
+
+#[test]
+fn windowsのnvmとfnmは既定の置き場をappdataから組む() {
+    let fs = FakeFs::new().file("/w/proj/.node-version", "22").file(
+        "/w/roaming/fnm/node-versions/v22.1.0/installation/node.exe",
+        "",
+    );
+    let mut env = home("/w/user");
+    env.vars.insert("APPDATA".into(), "/w/roaming".into());
+    let d = detect_node(WIN, &["/w/proj"], &fs, &env);
+    let c = auto(&d);
+    assert_eq!((c.manager, c.key.as_str()), ("fnm", "v22.1.0"));
+    assert_eq!(
+        prog(c),
+        ["/w/roaming/fnm/node-versions/v22.1.0/installation/node.exe"]
+    );
+    assert_eq!(
+        ps(&c.applied.path_prepend),
+        ["/w/roaming/fnm/node-versions/v22.1.0/installation"]
+    );
+    // nvm-windows の既定の置き場（%LOCALAPPDATA%\nvm）
+    let fs = FakeFs::new()
+        .file("/w/proj/.nvmrc", "20")
+        .file("/w/local/nvm/v20.11.1/node.exe", "");
+    let mut env = home("/w/user");
+    env.vars.insert("LOCALAPPDATA".into(), "/w/local".into());
+    let d = detect_node(WIN, &["/w/proj"], &fs, &env);
+    assert_eq!(prog(auto(&d)), ["/w/local/nvm/v20.11.1/node.exe"]);
+}
+
+#[test]
+fn windowsのシステムのnodeはnode_exeを探しnode_modulesのbinも足す() {
+    let fs = FakeFs::new()
+        .file("/w/pf/nodejs/node.exe", "")
+        .dir("/w/proj/node_modules/.bin");
+    let env = DetectEnv {
+        home: Some(p("/w/user")),
+        path_dirs: vec![p("/w/pf/nodejs")],
+        ..DetectEnv::default()
+    };
+    let d = detect_node(WIN, &["/w/proj"], &fs, &env);
+    let c = auto(&d);
+    assert_eq!((c.manager, prog(c)), ("system", vec!["node".to_string()]));
+    assert_eq!(loc(c).as_deref(), Some("/w/pf/nodejs/node.exe"));
+    assert_eq!(ps(&d.project_bins), ["/w/proj/node_modules/.bin"]);
+}
+
+#[test]
+fn nodeの候補を保存して解き直すと同じ当て方になる() {
+    let fs = nvm_fs(&["v18.20.4", "v20.11.1"])
+        .file("/h/proj/.nvmrc", "20")
+        .file(
+            "/h/.local/share/fnm/node-versions/v22.1.0/installation/bin/node",
+            "",
+        );
+    let env = home("/h");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &env);
+    assert_eq!(d.candidates.len(), 4, "{:?}", d.candidates);
+    for c in &d.candidates {
+        let back = resolve_ref(node(), MAC, &c.reference(), None, &fs, &env)
+            .unwrap_or_else(|e| panic!("{}/{} が解けない: {}", c.manager, c.key, e.reason));
+        assert_eq!(back.applied, c.applied, "{}/{}", c.manager, c.key);
+    }
+    // 消した版は既定へ落とさずに解けない
+    let err = resolve_ref(
+        node(),
+        MAC,
+        &RuntimeRef::new("nvm", "v16.0.0"),
+        None,
+        &fs,
+        &env,
+    )
+    .expect_err("入っていない");
+    assert!(err.reason.contains("v16.0.0"), "{}", err.reason);
+}
+
+// ─── #1735: Rust（rust-toolchain → RUSTUP_TOOLCHAIN） ────────────────────
+
+fn rust() -> &'static RuntimeKind {
+    kind_by_id("rust").expect("rust の行がある")
+}
+
+/// 見つけた toolchain は候補（一覧）に出すが、自動で選んだだけでは `RUSTUP_TOOLCHAIN` を入れない
+/// （rustup がファイルを自分で読み、`components` / `targets` / `path` の指定も生きる）。
+/// 入れるのは利用者が明示に選んだときだけ（`explicit_env`。#1735 の差し戻し）
+#[test]
+fn rust_toolchainのchannelは候補に出すが自動では変数を入れない() {
+    for (file, content, want) in [
+        (
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.79\"\ncomponents = [\"rustfmt\"]\n",
+            "1.79",
+        ),
+        (
+            "rust-toolchain",
+            "nightly-2024-05-01\n",
+            "nightly-2024-05-01",
+        ),
+        (
+            "rust-toolchain",
+            "[toolchain]\nchannel = \"stable\"\n",
+            "stable",
+        ),
+    ] {
+        let fs = FakeFs::new().file(format!("/h/proj/{file}"), content);
+        for platform in [MAC, WIN] {
+            let d = detect(
+                rust(),
+                platform,
+                &dirs(&["/h/proj/src", "/h/proj"]),
+                &fs,
+                &home("/h"),
+            );
+            let c = auto(&d);
+            assert_eq!((c.manager, c.key.as_str()), ("rustup", want), "{file}");
+            assert_eq!(c.version.as_deref(), Some(want), "{file}");
+            assert!(c.applied.env.is_empty(), "{file}: {:?}", c.applied.env);
+            // 明示に選んだときに入れる値はファイルの値
+            assert_eq!(
+                explicit_env(rust(), c),
+                [("RUSTUP_TOOLCHAIN".to_string(), want.to_string())],
+                "{file}"
+            );
+            // 呼ぶのは名前のまま（rustup のプロキシがファイル / env を見て toolchain を選ぶ）
+            assert_eq!(prog(c), ["rustc"]);
+            assert!(c.applied.path_prepend.is_empty());
+            assert_eq!(c.found_in, Some(p("/h/proj")));
+            assert!(d.project_bins.is_empty());
+        }
+    }
+}
+
+#[test]
+fn rust_toolchainが同じ段に両方あれば旧い名前を使う() {
+    // rustup 1.28.2 の実測: 「both … exist. Using `rust-toolchain`」
+    let fs = FakeFs::new()
+        .file("/h/proj/rust-toolchain", "1.95.0\n")
+        .file(
+            "/h/proj/rust-toolchain.toml",
+            "[toolchain]\nchannel = \"stable\"\n",
+        );
+    let d = detect(rust(), MAC, &dirs(&["/h/proj"]), &fs, &home("/h"));
+    assert_eq!(auto(&d).key, "1.95.0");
+}
+
+#[test]
+fn rust_toolchainが無いか読めなければ実行環境は無く名前のまま() {
+    for fs in [
+        FakeFs::new().file("/h/proj/Cargo.toml", "[package]\nname = \"a\"\n"),
+        // channel の無い toolchain（`path` で指す独自の toolchain）は rustup に任せる
+        FakeFs::new().file(
+            "/h/proj/rust-toolchain.toml",
+            "[toolchain]\npath = \"/opt/my-toolchain\"\n",
+        ),
+    ] {
+        let d = detect(rust(), MAC, &dirs(&["/h/proj"]), &fs, &home("/h"));
+        assert_eq!(d.auto, None);
+        assert!(d.candidates.is_empty());
+        for platform in [MAC, WIN] {
+            assert_eq!(fallback_value(rust(), platform), "rustc");
+        }
+    }
+}
+
+#[test]
+fn rustupは保存した任意のtoolchainで上書きできる() {
+    // 一覧に無い toolchain も選べる（rustup が解く。入っていなければ rustup が案内する）
+    let c = resolve_ref(
+        rust(),
+        WIN,
+        &RuntimeRef::new("rustup", "nightly"),
+        None,
+        &FakeFs::new(),
+        &home("/h"),
+    )
+    .expect("解ける");
+    // 候補の当て方には入れず、明示に選んだときの当て方で上書きする
+    assert!(c.applied.env.is_empty(), "{:?}", c.applied.env);
+    assert_eq!(
+        explicit_env(rust(), &c),
+        [("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string())]
+    );
+    assert_eq!(prog(&c), ["rustc"]);
+    // 環境変数で切り替える戦略でない候補（node の nvm）には明示でも足すものが無い
+    let fs = nvm_fs(&["v20.11.1"]).file("/h/proj/.nvmrc", "20");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert!(explicit_env(node(), auto(&d)).is_empty());
+}
+
+#[test]
+fn 片方の道具が版を見つけたら他方の版の不足は知らせない() {
+    // nvm に v20 があり、fnm は入っているが v20 が無い（実経路で見つけた誤報の形）
+    let fnm_only_22 = |fs: FakeFs| {
+        fs.file(
+            "/h/.local/share/fnm/node-versions/v22.18.0/installation/bin/node",
+            "",
+        )
+    };
+    let fs = fnm_only_22(nvm_fs(&["v20.11.1"]).file("/h/proj/.nvmrc", "20"));
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(
+        (auto(&d).manager, auto(&d).key.as_str()),
+        ("nvm", "v20.11.1")
+    );
+    assert!(
+        d.warnings.is_empty(),
+        "走るのは nvm の版なのに騒いだ: {:?}",
+        d.warnings
+    );
+    // どちらにも無ければ、入っている道具それぞれの理由を出す
+    let fs = fnm_only_22(nvm_fs(&["v18.20.4"]).file("/h/proj/.nvmrc", "20"));
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert_eq!(auto(&d).manager, "system");
+    assert_eq!(d.warnings.len(), 2, "{:?}", d.warnings);
+    assert!(
+        d.warnings.iter().any(|w| w.starts_with("nvm ")),
+        "{:?}",
+        d.warnings
+    );
+    assert!(
+        d.warnings.iter().any(|w| w.starts_with("fnm ")),
+        "{:?}",
+        d.warnings
+    );
 }

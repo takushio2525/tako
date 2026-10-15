@@ -204,9 +204,10 @@ fn interpreter_file(c: &Candidate, fs: &dyn FsProbe) -> Option<String> {
     }
 }
 
-/// 版を聞いた出力（`Python 3.12.4` / `3.12.4`）から版を採る。版らしい語が無ければ `None`
+/// 版を聞いた出力（`Python 3.12.4` / `3.12.4` / `v22.18.0`）から版を採る。版らしい語が無ければ `None`
 pub fn parse_version(text: &str) -> Option<String> {
     text.split_whitespace()
+        .map(|w| w.strip_prefix('v').unwrap_or(w))
         .find(|w| w.starts_with(|c: char| c.is_ascii_digit()) && w.contains('.'))
         .and_then(normalize_version)
 }
@@ -474,6 +475,9 @@ mod tests {
         assert_eq!(parse_version("Python 3.12.4\n").as_deref(), Some("3.12.4"));
         assert_eq!(parse_version("3.11.9").as_deref(), Some("3.11.9"));
         assert_eq!(parse_version("Python 3.13.0rc1").as_deref(), Some("3.13"));
+        // 先頭に `v` を付けて返す interpreter（`node --version`）
+        assert_eq!(parse_version("v22.18.0\n").as_deref(), Some("22.18.0"));
+        assert_eq!(parse_version("version"), None);
         assert_eq!(parse_version("command not found"), None);
         assert_eq!(parse_version(""), None);
         assert_eq!(

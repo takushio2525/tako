@@ -158,8 +158,9 @@ pub const TABLE: &[Entry] = &[
     // 一番たちの悪い失敗になる。`py`（python.org の Launcher）は入っていない
     // 配布（Store 版 / conda / uv）があるので既定にしない（#322 = 最簡形）
     same("py", "${python} ${fileBase}"),
-    same("js", "node ${fileBase}"),
-    same("mjs", "node ${fileBase}"),
+    // `${node}` / `${rustc}` も同じ（#1735。`.nvmrc` → nvm / fnm の版。fallback = `node` / `rustc`）
+    same("js", "${node} ${fileBase}"),
+    same("mjs", "${node} ${fileBase}"),
     same("ts", "npx tsx ${fileBase}"),
     same("rb", "ruby ${fileBase}"),
     same("pl", "perl ${fileBase}"),
@@ -195,8 +196,8 @@ pub const TABLE: &[Entry] = &[
     ),
     split(
         "rs",
-        run("rustc ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        run("rustc ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }"),
+        run("${rustc} ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
+        run("${rustc} ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }"),
     ),
     // ランタイムが走らせる形なので OS 差が無い（`go run` / JEP 330 の単一ファイル実行）
     same("go", "go run ${fileBase}"),

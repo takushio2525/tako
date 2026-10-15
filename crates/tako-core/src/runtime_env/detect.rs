@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use super::{
     join, Applied, BundledSpec, Candidate, DetectEnv, Detection, Detector, EnvLayout,
     EnvSwitchSpec, EnvValue, FsProbe, InProjectEnv, Marker, MarkerDirSpec, NamedEnvListSpec,
-    PathLookupSpec, RuntimeKind, Unresolved, VersionFileSpec, VersionSource, WrapperSpec,
-    SCAN_CHILDREN_MAX,
+    PathLookupSpec, RuntimeKind, Unresolved, VersionFileSpec, VersionMatch, VersionSource,
+    WrapperSpec, SCAN_CHILDREN_MAX,
 };
 use crate::i18n::Lang;
 use crate::platform::support::Platform;
@@ -33,6 +33,8 @@ pub fn detect(
     env: &DetectEnv,
 ) -> Detection {
     let mut out = Detection::default();
+    // 版のファイルの検出器の注意（「その版が無い」「別名は解かない」）は最後に足すかを決める
+    let mut version_file_warnings = Vec::new();
     for det in kind.detectors {
         let found = match det {
             Detector::Wrapper(s) => {
@@ -43,7 +45,7 @@ pub fn detect(
                 detect_named_env_list(kind, s, platform, dirs, fs, env, &mut out.warnings)
             }
             Detector::VersionFile(s) => {
-                detect_version_file(kind, s, platform, dirs, fs, env, &mut out.warnings)
+                detect_version_file(kind, s, platform, dirs, fs, env, &mut version_file_warnings)
             }
             Detector::PathLookup(s) => {
                 detect_path_lookup(kind, s, platform, fs, env, &mut out.warnings)
@@ -53,7 +55,20 @@ pub fn detect(
         };
         out.candidates.extend(found);
     }
+    // 同じ版のファイルを読む道具が複数ある行（nvm と fnm）で、どれかがその版を見つけたら、
+    // 他の道具の「その版が無い」は知らせない（走るのは見つけた側の版なので誤報になる）
+    let version_file_hit = out.candidates.iter().any(|c| {
+        c.auto_eligible && matches!(kind.detector(c.manager), Some(Detector::VersionFile(_)))
+    });
+    if !version_file_hit {
+        out.warnings.extend(version_file_warnings);
+    }
     out.auto = out.candidates.iter().position(|c| c.auto_eligible);
+    out.project_bins = dirs
+        .iter()
+        .flat_map(|d| kind.project_bins.iter().map(move |c| join(d, c)))
+        .filter(|p| fs.is_dir(p))
+        .collect();
     out
 }
 
@@ -138,10 +153,10 @@ pub fn resolve_ref(
             }
         }
         Detector::VersionFile(s) => {
-            let Some(root) = version_root(s, platform, env) else {
+            let Some(root) = version_root(s, platform, fs, env) else {
                 return Err(fail(msg_not_installed(s.label_prefix, &r.key)));
             };
-            let dir = join(&root, s.versions_dir).join(&r.key);
+            let dir = join(&root, s.versions_dir.get(platform)).join(&r.key);
             if fs.is_dir(&dir) {
                 Ok(version_candidate(
                     kind, s, platform, &dir, &r.key, None, true,
@@ -539,10 +554,11 @@ fn detect_version_file(
     env: &DetectEnv,
     warnings: &mut Vec<String>,
 ) -> Vec<Candidate> {
-    let Some(root) = version_root(s, platform, env) else {
+    let Some(root) = version_root(s, platform, fs, env) else {
         return Vec::new();
     };
-    let versions = join(&root, s.versions_dir);
+    let versions = join(&root, s.versions_dir.get(platform));
+    // 近い段が勝ち、同じ段なら表の `files` の並びが勝つ
     let wanted = dirs
         .iter()
         .find_map(|d| {
@@ -558,48 +574,99 @@ fn detect_version_file(
         .list_dir(&versions)
         .into_iter()
         .filter(|v| fs.is_dir(&versions.join(v)))
+        .filter(|v| match s.matching {
+            VersionMatch::Exact => true,
+            VersionMatch::NumericPrefix => version_parts(v).is_some(),
+        })
         .collect();
-    installed.sort();
-    if let Some((_, v)) = &wanted {
-        if !installed.contains(v) {
-            warnings.push(msg_not_installed(s.label_prefix, v));
-        }
+    match s.matching {
+        VersionMatch::Exact => installed.sort(),
+        VersionMatch::NumericPrefix => installed.sort_by_key(|v| version_parts(v)),
+    }
+    let hit: Option<String> = wanted
+        .as_ref()
+        .and_then(|(_, v)| matching_version(s.matching, v, &installed));
+    // 道具そのものが入っていない（置き場が無い）なら、その道具の版が無いのは当たり前なので
+    // 知らせない（同じ版のファイルを読む道具が複数ある行で、使っていない側が毎回騒がない）
+    if let (Some((_, v)), None, true) = (&wanted, &hit, fs.is_dir(&root)) {
+        let unresolvable = s.matching == VersionMatch::NumericPrefix && version_parts(v).is_none();
+        warnings.push(if unresolvable {
+            msg_alias_unresolved(s.label_prefix, v)
+        } else {
+            msg_not_installed(s.label_prefix, v)
+        });
     }
 
-    let wanted_version = wanted.as_ref().map(|(_, v)| v.as_str());
     let found_in = wanted.as_ref().map(|(d, _)| d.as_path());
     let mut ordered: Vec<&String> = installed
         .iter()
-        .filter(|v| Some(v.as_str()) == wanted_version)
+        .filter(|v| Some(*v) == hit.as_ref())
         .collect();
-    ordered.extend(
-        installed
-            .iter()
-            .filter(|v| Some(v.as_str()) != wanted_version),
-    );
+    ordered.extend(installed.iter().filter(|v| Some(*v) != hit.as_ref()));
     ordered
         .into_iter()
         .map(|v| {
-            let is_wanted = Some(v.as_str()) == wanted_version;
+            let is_hit = Some(v) == hit.as_ref();
             version_candidate(
                 kind,
                 s,
                 platform,
                 &versions.join(v),
                 v,
-                is_wanted.then_some(found_in).flatten(),
-                is_wanted,
+                is_hit.then_some(found_in).flatten(),
+                is_hit,
             )
         })
         .collect()
 }
 
-fn version_root(s: &VersionFileSpec, platform: Platform, env: &DetectEnv) -> Option<PathBuf> {
-    s.root_env
+/// 道具の置き場（環境変数 → 既定の置き場のうち在る最初のもの → 既定の先頭）
+fn version_root(
+    s: &VersionFileSpec,
+    platform: Platform,
+    fs: &dyn FsProbe,
+    env: &DetectEnv,
+) -> Option<PathBuf> {
+    if let Some(v) = s.root_env.get(platform).iter().find_map(|v| env.var(v)) {
+        return Some(PathBuf::from(v));
+    }
+    let defaults: Vec<PathBuf> = s
+        .root_default
+        .get(platform)
         .iter()
-        .find_map(|v| env.var(v))
-        .map(PathBuf::from)
-        .or_else(|| s.root_default.get(platform).resolve(env))
+        .filter_map(|d| d.resolve(env))
+        .collect();
+    defaults
+        .iter()
+        .find(|d| fs.is_dir(d))
+        .or_else(|| defaults.first())
+        .cloned()
+}
+
+/// 版のファイルの値に当たる、入っている版のディレクトリ名
+fn matching_version(m: VersionMatch, wanted: &str, installed: &[String]) -> Option<String> {
+    match m {
+        VersionMatch::Exact => installed.iter().find(|v| *v == wanted).cloned(),
+        VersionMatch::NumericPrefix => {
+            let want = version_parts(wanted)?;
+            installed
+                .iter()
+                .filter(|v| version_parts(v).is_some_and(|have| have.starts_with(&want)))
+                .max_by_key(|v| version_parts(v))
+                .cloned()
+        }
+    }
+}
+
+/// `v20.11.1` / `20.11` / `20` → 数字の成分（先頭の `v` は読み飛ばす。数字で始まらなければ `None`）。
+/// 数字でない成分（`20.x` の `x`・`-rc.1` の付いた成分）の手前までを採る
+pub(super) fn version_parts(raw: &str) -> Option<Vec<u64>> {
+    let body = raw.strip_prefix('v').unwrap_or(raw);
+    let parts: Vec<u64> = body
+        .split('.')
+        .map_while(|p| p.parse::<u64>().ok())
+        .collect();
+    (!parts.is_empty()).then_some(parts)
 }
 
 fn version_candidate(
@@ -612,12 +679,17 @@ fn version_candidate(
     auto_eligible: bool,
 ) -> Candidate {
     let a = activate(&s.layout, platform, dir, None);
+    // 版の欄は数字の形で揃える（`v20.11.1` → `20.11.1`。鍵とラベルはディレクトリ名のまま）
+    let shown = match s.matching {
+        VersionMatch::Exact => version,
+        VersionMatch::NumericPrefix => version.strip_prefix('v').unwrap_or(version),
+    };
     Candidate {
         kind: kind.id,
         manager: s.id,
         key: version.to_string(),
         label: format!("{}{}", s.label_prefix, version),
-        version: Some(version.to_string()),
+        version: Some(shown.to_string()),
         location: Some(dir.to_path_buf()),
         found_in: found_in.map(Path::to_path_buf),
         auto_eligible,
@@ -807,11 +879,28 @@ fn env_switch_candidate(
         found_in: found_in.map(Path::to_path_buf),
         auto_eligible: true,
         needs_probe: false,
+        // 変数は入れない: 道具（rustup）は cwd から上のファイルを自分で読むので、見つけただけの
+        // 値を入れると上書きの出どころがファイルから変数へ移り、ファイルの他の指定
+        // （`components` / `targets` / `path`）が効かなくなる。入れるのは利用者が明示に
+        // 選んだときだけ（[`explicit_env`]。#1735）
         applied: Applied {
             program: vec![kind.fallback.get(platform).to_string()],
             path_prepend: Vec::new(),
-            env: vec![(s.var.to_string(), value.to_string())],
+            env: Vec::new(),
         },
+    }
+}
+
+/// 利用者が**明示に選んだ（保存した）**ときだけ効く当て方（#1735）。
+///
+/// 環境変数で切り替える戦略（[`EnvSwitchSpec`]）は、自動で見つけた候補では変数を入れず
+/// （道具がファイルを自分で読む）、選ばれたときにだけその値を変数へ入れて上書きする。
+/// 候補の [`Applied`] に入れないのは、一覧の候補と保存した選択が同じ鍵でも、選んだかどうかで
+/// 当て方を変えるため（一覧の候補をそのまま使う経路でも取りこぼさない）。他の戦略は空
+pub fn explicit_env(kind: &RuntimeKind, c: &Candidate) -> Vec<(String, String)> {
+    match kind.detector(c.manager) {
+        Some(Detector::EnvSwitch(s)) => vec![(s.var.to_string(), c.key.clone())],
+        _ => Vec::new(),
     }
 }
 
@@ -973,6 +1062,20 @@ fn msg_not_installed(prefix: &str, version: &str) -> String {
     tr(
         format!("{prefix}{version} が入っていない"),
         format!("{prefix}{version} is not installed"),
+    )
+}
+
+fn msg_alias_unresolved(prefix: &str, value: &str) -> String {
+    tr(
+        format!(
+            "{prefix}の `{value}` は版の番号ではない別名なので tako は解かず、自動では選ばない\
+             （版の番号を書くか、候補から選んでください）"
+        ),
+        format!(
+            "`{value}` for {} is an alias, not a version number, so tako does not resolve it or pick it \
+             automatically (write a version number, or choose one of the candidates)",
+            prefix.trim_end()
+        ),
     )
 }
 

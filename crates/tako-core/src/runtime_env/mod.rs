@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use crate::platform::support::Platform;
 use crate::runner_config::RuntimeRef;
 
-pub use detect::{apply_probed_env, detect, resolve_ref};
+pub use detect::{apply_probed_env, detect, explicit_env, resolve_ref};
 pub use kinds::KINDS;
 pub use select::{
     candidate_id, ensure_runnable, match_query, msg_query_error, ref_for_path, QueryError,
@@ -225,18 +225,35 @@ pub struct NamedEnvListSpec {
     pub list_probe: Option<ListProbe>,
 }
 
+/// 版のファイルの値と、入っている版のディレクトリ名の突き合わせ方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionMatch {
+    /// 名前がそのまま一致する（`3.12.4` → `versions/3.12.4`）
+    Exact,
+    /// 数字の成分の前方一致で、一致した中の**一番新しい版**（`20` → `v20.11.1`。
+    /// 先頭の `v` は両側とも読み飛ばす）。数字で始まらない値（`lts/*` / `stable`）は道具の
+    /// 別名で、ファイルシステムだけでは解けないので解かずに理由を出す。
+    /// 版の形をしていないディレクトリ（作業用の `.downloads` 等）は候補にしない
+    NumericPrefix,
+}
+
 /// 版を書いたファイル → 道具の置き場の `versions/<版>`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionFileSpec {
     pub id: &'static str,
     pub label_prefix: &'static str,
+    /// 同じ段に複数あれば並びの先頭が勝つ
     pub files: &'static [&'static str],
     /// この値なら「道具を使わない」の意味なので飛ばす
     pub skip_values: &'static [&'static str],
-    /// 道具の置き場を指す環境変数（先頭から）
-    pub root_env: &'static [&'static str],
-    pub root_default: PerOs<KnownDir>,
-    pub versions_dir: Components,
+    /// 道具の置き場を指す環境変数（先頭から。OS で道具の作りが違えば名前も違う）
+    pub root_env: PerOs<&'static [&'static str]>,
+    /// 環境変数が無いときの置き場。**在る最初のもの**を使い、どれも無ければ先頭
+    /// （道具の版の移り変わりで既定の置き場が変わった道具は、新しい順に並べる）
+    pub root_default: PerOs<&'static [KnownDir]>,
+    /// 置き場から版のディレクトリが並ぶディレクトリまで（空 = 置き場の直下に並ぶ）
+    pub versions_dir: PerOs<Components>,
+    pub matching: VersionMatch,
     pub layout: EnvLayout,
 }
 
@@ -267,7 +284,8 @@ pub struct BundledSpec {
     pub file_name: PerOs<&'static str>,
 }
 
-/// 環境変数で切り替える toolchain（ファイルの値をそのまま変数へ入れる）
+/// 環境変数で切り替える toolchain。自動で見つけただけなら変数は入れず（道具がファイルを自分で
+/// 読む）、利用者が明示に選んだときだけ選んだ値を変数へ入れて上書きする（[`explicit_env`]。#1735）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvSwitchSpec {
     pub id: &'static str,
@@ -320,6 +338,10 @@ pub struct RuntimeKind {
     pub version_args: &'static [&'static str],
     /// **自動選択の順**に並べた検出器
     pub detectors: &'static [Detector],
+    /// プロジェクトの中の道具の置き場（各段からの相対）。**候補ではなく、どの候補を選んでも**
+    /// PATH の先頭へ足す（近い段が先。パッケージ管理の `run` が組む PATH と同じ並び）。
+    /// interpreter の版を決める検出器と同時に効かせたいものなので、検出器の 1 つにはしない
+    pub project_bins: &'static [Components],
 }
 
 impl RuntimeKind {
@@ -442,9 +464,10 @@ pub fn table_env_names() -> Vec<&'static str> {
                 Detector::Wrapper(s) => s.program_dirs.iter().for_each(|d| known(d, &mut out)),
                 Detector::NamedEnvList(s) => known(&s.list_file, &mut out),
                 Detector::VersionFile(s) => {
-                    out.extend(s.root_env.iter().copied());
-                    known(&s.root_default.macos, &mut out);
-                    known(&s.root_default.windows, &mut out);
+                    out.extend(s.root_env.macos.iter().chain(s.root_env.windows).copied());
+                    for d in s.root_default.macos.iter().chain(s.root_default.windows) {
+                        known(d, &mut out);
+                    }
                 }
                 Detector::PathLookup(s) => {
                     for d in s.exclude_dirs.macos.iter().chain(s.exclude_dirs.windows) {
@@ -515,6 +538,9 @@ pub struct Detection {
     /// 自動で選んだ候補（`candidates` の添字）。`None` = 既定（`fallback` の名前のまま）
     pub auto: Option<usize>,
     pub warnings: Vec<String>,
+    /// どの候補を選んでも PATH の先頭へ足すプロジェクトの道具の置き場（表の
+    /// [`RuntimeKind::project_bins`] のうち在るもの。近い段が先）
+    pub project_bins: Vec<PathBuf>,
 }
 
 impl Detection {
@@ -536,6 +562,7 @@ impl Detection {
             candidates,
             auto,
             warnings,
+            ..
         } = self;
         for c in candidates.iter_mut() {
             let Some(first) = c.applied.program.first() else {
