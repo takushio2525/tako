@@ -20,29 +20,6 @@
 
 ---
 
-## 2026-10-15（#2050: 鍵らしき文字の確認を mod の送信時・スマホの入力・tako send へ広げ、許可リスト・規則ごとの無効化・警告だけの段を足した）
-- mod は `prompt.submit` → `paste-guard check --pane`・選択ダイアログ、スマホは 409 → 確認シート、`tako send` / `tako_send_input` は止めずに警告。許可リストは指紋だけ。tako が流した値はペインごとに 10 分確認済み（PR #2105）
-- 実経路 `scripts/test-paste-guard-2050.sh` 58 PASS（実物の claude・実 daemon・A/B）+ visual ⑫・カタログ +680 B
-
-## 2026-10-15（#2098: tmux_backend の conf 差し替えテストを 700 ms の実時間の窓から読み取り・書き換え各 200 回の回数区切りへ・issue1857 の子の終わりの待ちを 10 → 60 秒）
-- 届かないときはクライアントの状態を出す。注入: 読み取り 30 ms 遅延で旧 3/3「検出力が無い」・新 3/3 ok、非アトミック化で新 5/5「不完全な conf」、kill 12 秒遅延で旧 FAILED / 新 ok。Windows CI 新 38/38 ok（PR #2100）
-
-## 2026-10-15（#1686: LSP の名前の変更 = 既定 dry-run・段階 1 は頼んだペインのバッファだけ・右クリックの欄）
-- `tako_core::lsp::rename`（WorkspaceEdit の changes / documentChanges）+ prepareRename → rename + CLI `tako lsp rename [--yes]` / MCP `tako_lsp` の action=rename（+428 B）+ 右クリックの「名前の変更…」。A/B `TAKO_1686_LEGACY=1`（PR #2099）
-- 実測: `scripts/test-lsp-rename-1686.sh`（偽サーバ + 実の rust-analyzer）で dry-run 後の sha256 一致・--yes で 2 箇所・undo 1 回で差分 0・別ファイルは not-applied・`1abc` は refused、visual-test 新 OK / 旧 ① FAILED
-
-## 2026-10-15（#2092: Windows のペインは文字コード固定の決着まで入力を預かる = `encoding_pin::PinGate`・上限 直接 500 ms / 器 1500 ms）
-- `check-health` の `encoding_pin` 節と persist.log へ諦めを記録。器の内側の固定が本番経路で呼ばれていなかったのを `spawn_in` で配線（PR #2103）
-- Windows CI 実測（各 25 回）: 直接は固定 5〜16 ms / プロンプト 26〜46 ms、器は内側 154〜180 ms / プロンプト 226〜310 ms。注入の A/B で旧は化け・新は `日本語テスト`（直接・器とも 5 巡）
-
-## 2026-10-15（#2104: 対応状況の 2 ページ（windows-support / agent-support）の md をコミットせず、件数を持たない写し `docs/src/data/*.json` から docs のビルドが組む）
-- 写しは 1 行 = 1 フィールドで並列の PR が別々の行を直しても衝突しない（`docs/scripts/support-pages.mjs`・astro の integration）。番犬 `scripts/test-support-snapshot-merge-2104.sh`（CI の docs ジョブ）。PR #2108
-- 実演: 実物の support.rs を直した 2 本は修正前が md で衝突・修正後は衝突なしで `--check` 緑。dist は前後で `diff -r` の差分 0
-
-## 2026-10-15（#1964: tako mod でチャット風の描画 = 吹き出し・コードの Copy（クリック）と帯の `o: copy last code`（キー）・ツールの 1 行の要約）
-- ターミナル表示の既定は Copy だけ。GUI モードは `chat.place mod` でそのペインを本物の画面のまま見せる（既定 = GPUI のチャットはユーザーの判断待ち = tako todo）。GPUI のチャットは報告の `chat_seq` で読み直す（#1883 の内容）。PR #2111
-- A/B `TAKO_1964_LEGACY=1`・番犬 `issue1964_*`（注入 15 通り）・`scripts/test-mod-chat-1964.sh` 全段緑・カタログ増 0 B
-
 ## 2026-10-15（#1951: `.ino` の言語サーバ = arduino-language-server の行・伴走（arduino-cli / clangd）と空の設定ファイルを表の `Arg` で・基板が未選択なら unconfigured で起こさず選ぶコマンドを案内）
 - 実測 `scripts/test-lsp-arduino-1951.sh` 23 OK（IDE 同梱物で診断・ホバー・補完・帯の画像・選べば合図で起きる・ALS なし・A/B）。常駐 ALS + clangd 72〜77 MB。PR #2109
 - `.h` / `.cpp` を ALS へ回すと先に `.ino` を開いた時だけ正しい = #2113 に分けた
@@ -95,3 +72,25 @@
 ## 2026-10-16（#1954: two-face に無い PowerShell（.ps1 / .psm1 / .psd1）の構文を足した）
 - ビルド時に YAML を構文定義へ読み、起動時は末尾へ継ぎ足す（既存 213 構文は 1 バイトも変えない・器 +15.2 KB・起動時 6〜7 ms）。yaml-rust はビルド依存だけ。.astro は ST4 の継承で読めず見送り。PR #2135
 - 比較は language-coverage §6.2・実測 `scripts/test-extra-syntax-1954.sh` 34 PASS（旧は Plain Text）。#1955（Finder の候補）は既定を動かさない方法が無く採らない
+
+## 2026-10-16（#2133: master の引き継ぎの後に spawn した worker が master の領域を割らない = 前任を閉じたら worker の `spawned_by` を後任へ付け替え）
+- 持ち主の判定に後任 master を含め、付け替えは「閉じたのが master・後任がちょうど 1 枚」のときだけ。A/B `TAKO_2133_LEGACY=1`（旧は master 33 → 8 桁 / 新は 33 桁のまま）。PR #2137
+- 実測 `scripts/test-spawn-master-region-2133.sh` 29 PASS・番犬 `issue2133_handoff_spawn_owner_watchdog`・カタログ増 0 B
+
+## 2026-10-16（#2136: fd 漏れテストを理由にした回避策 7 箇所の理由文を実態へ直し（外したもの 0）、IpcServer の drop で受け口を閉じる）
+- 自分へ 1 本繋いで accept を起こし上限 2 秒で listener を手放す。A/B `TAKO_2136_LEGACY=1`（子プロセスの fd 旧 5 → 10 / 新 4 → 4）。PR #2140
+
+## 2026-10-16（#1733: 実行ボタン横のドロップダウンで実行環境・引数・環境変数等を見て変える = Code Runner S5）
+- `RunResolve` の答えを background で取って描くだけ・書き込みは `RunnerDefaults`・出典タグで file ↔ project・候補は 5 件で畳む。`preview_run_selected` 廃止・カタログ増 0 B。PR #2141
+- A/B `TAKO_1733_LEGACY=1`（旧は一覧が `python3 a.py` で Run は .venv）・番犬 `issue1733_run_menu_watchdog`・`scripts/test-run-dropdown-1733.sh`
+
+## 2026-10-16（#1735: 実行環境の表に Node（nvm / fnm・`.nvmrc` の前方一致・`node_modules/.bin` を PATH の先頭）と Rust（rust-toolchain）の行）
+- Rust は一覧に出し、明示に選んだときだけ `RUSTUP_TOOLCHAIN`（自動では rustup にファイルを読ませる）。Tier P は並列にしない。PR #2139
+- 実測 `scripts/test-runner-runtime-1735.sh` 35 PASS（Rust 自動 = `<unset>` / 明示 = 届く・旧は node が候補に出ない）・カタログ増 0 B
+
+## 2026-10-16（#1955: Finder の「このアプリケーションで開く」を動的 UTI の形式へ広げない）
+- 7 案を本物の Launch Services で実測し、候補に出る形はどれも他に宣言するアプリが無い Mac で既定を動かす（後始末後は全拡張子の既定が一致）。`tako_open_file` を Windows degraded（エクスプローラー未登録 = #2134）と申告・設計書 §6.3・FR-3.22。PR #2142
+
+## 2026-10-16（#1981: local-rules の常時部が取り分を超えたら `tako migrate` に区切りを上げる案を出し、明示の `tako migrate run` でだけ動かす）
+- 自動の発火点（setup・起動時）は動かさない・本文はバイト一致・`.pre-v2.bak`。本番の写しで 474 B 超過 → 5,031 B（当てるかはユーザー判断 = tako todo）。PR #2143
+- 実経路 `scripts/test-local-rules-marker-move-1981.sh` 29 PASS（旧 16 FAIL）・番犬 `issue1981_marker_move_watchdog`・カタログ +89 B

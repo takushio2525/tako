@@ -570,3 +570,9 @@
 - 2026-10-15 #1950: `.ino` を再生ボタン / `tako run` で走らせる arduino 種別
 - 2026-10-15 #2085: 器が自ら消えても最後の行までペインログへ = remain-on-exit + pane-died フックで消える前に全履歴と画面を書き出す
 - 2026-10-15 #1956: 言語サーバの検出表の第 2 波 = .tex texlab / .toml tombi（tako が取る）・.swift sourcekit-lsp・.dart dart・.css/.scss/.less と .html/.htm vscode-langservers-extr…
+- 2026-10-15 #2050: 鍵らしき文字の確認を mod の送信時・スマホの入力・tako send へ広げ、許可リスト・規則ごとの無効化・警告だけの段を足した
+- 2026-10-15 #2098: tmux_backend の conf 差し替えテストを 700 ms の実時間の窓から読み取り・書き換え各 200 回の回数区切りへ・issue1857 の子の終わりの待ちを 10 → 60 秒
+- 2026-10-15 #1686: LSP の名前の変更 = 既定 dry-run・段階 1 は頼んだペインのバッファだけ・右クリックの欄
+- 2026-10-15 #2092: Windows のペインは文字コード固定の決着まで入力を預かる = `encoding_pin::PinGate`・上限 直接 500 ms / 器 1500 ms
+- 2026-10-15 #2104: 対応状況の 2 ページ（windows-support / agent-support）の md をコミットせず、件数を持たない写し `docs/src/data/*.json` から docs のビルドが組む
+- 2026-10-15 #1964: tako mod でチャット風の描画 = 吹き出し・コードの Copy（クリック）と帯の `o: copy last code`（キー）・ツールの 1 行の要約
