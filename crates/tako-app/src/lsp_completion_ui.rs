@@ -180,7 +180,8 @@ fn kind_badge(kind: Option<u32>, theme: &tako_core::Theme) -> (&'static str, tak
 }
 
 impl TakoApp {
-    /// このペインで打鍵の補完を使うか。コードの編集中で、検出表にこの拡張子を受け持つサーバがあり、
+    /// このペインで打鍵の補完を使うか。コードの編集中で、このファイルを受け持つサーバがあり
+    /// （`LspManager::resolve`。開いている文書は開いたときの器 = #2113）、
     /// LSP が有効で、A/B の旧挙動（`TAKO_1682_LEGACY=1`）でないときだけ
     pub(crate) fn lsp_completion_enabled_for(&self, pane: PaneId) -> bool {
         if tako_control::lsp::completion::legacy() || !self.lsp.is_enabled() {
