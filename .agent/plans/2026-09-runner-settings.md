@@ -674,6 +674,8 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
     （`.venv` だけのフォルダ）でもキーが決まるよう、`${workspaceRoot}` の落とし先（`fallback_root`）と 1 本にした
   - 指定のパスは実体へ寄せない（venv の python はシンボリックリンクで、`canonicalize` すると環境の外の interpreter を指す）
   - 一覧の候補は `Run` と同じ材料（Tier F + 覚えた Tier P）で、`tako run-config` は子プロセスを起こさない（UI スレッドで呼ばれる）
+  - `command` の上書きは保存した層（実行環境・プロファイル）を素通りする（#1730 の申し送りどおり §4.3 の「素通り」を保存した層に当てた。自動の実行環境は効く）。保存した環境が壊れていても `--command` なら走れる
+  - 応答のプロジェクトのスコープのキーは `scope_root`（`tako run-config` と `RunResolve` の両方）。`RunResolve` の既存の `project_root` は「種別の印のルート」（印が無ければ null）のまま変えない
 
 ### S4: 引数・環境変数・作業ディレクトリ・実行前コマンド
 

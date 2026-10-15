@@ -49,7 +49,7 @@ pub fn match_query(
     // 1. 候補の ID（`<検出器 ID>:<鍵>`）。Windows の `C:\…` を ID と読まないよう、
     //    前半が表の検出器 ID のときだけ ID として扱う
     if let Some((manager, key)) = q.split_once(':') {
-        if !key.is_empty() && kind.manager_ids().iter().any(|m| *m == manager) {
+        if !key.is_empty() && kind.manager_ids().contains(&manager) {
             return Ok(RuntimeRef::new(manager, key));
         }
     }

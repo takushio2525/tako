@@ -268,7 +268,7 @@ fn 選ぶ_重ねる_消える_戻す() {
     assert_eq!(v["runtime"]["source"], "auto", "{v:#}");
     assert_eq!(v["runtime"]["label"], ".venv");
     assert_eq!(v["updated"], json!([]));
-    assert_eq!(v["project_root"], base.display().to_string());
+    assert_eq!(v["scope_root"], base.display().to_string());
 
     // 短縮（ディレクトリ名）で env2 を選ぶ → 既定でプロジェクトへ
     let v = call(&file, None, None, Some("env2"), None).unwrap();
@@ -400,5 +400,42 @@ fn プロファイルは宣言にあるものだけ選べてファイルに保�
     ));
     let v = call(&file, None, None, None, Some(&["all".to_string()])).unwrap();
     assert_eq!(v["config"]["profile"]["source"], "default");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 一覧の外の選択（interpreter のパスを直接指定）も保存でき、`runtime` にだけ載って選ばれる
+#[test]
+fn interpreterのパスを直接選べる() {
+    let base = sandbox("explicit");
+    let file = base.join("a.py");
+    touch(&file, "print(1)\n");
+    let elsewhere = base.join("tools").join("py");
+    venv(&elsewhere);
+    let interp = interpreter(&elsewhere);
+    let file = tako_core::platform::path::canonicalize(&file).unwrap();
+
+    // ファイルの段からの相対パスでも受ける（`./` は落とす）
+    let rel = format!("./{}", interp.strip_prefix(&base).unwrap().display());
+    let v = call(&file, Some("file"), None, Some(&rel), None).unwrap();
+    assert_eq!(
+        v["updated"],
+        json!([{ "scope": "file", "field": "runtime", "action": "set" }])
+    );
+    assert_eq!(v["runtime"]["manager"], RuntimeRef::EXPLICIT_PATH, "{v:#}");
+    assert_eq!(v["runtime"]["key"], interp.display().to_string());
+    assert_eq!(v["runtime"]["source"], "file");
+    assert_eq!(v["runtime"]["selected"], true);
+    // 一覧の候補は自動選択の順のまま（指定のパスは並ばない）で、どれも選ばれていない
+    assert!(v["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["selected"] == false));
+
+    // 無いパスは保存しない
+    assert!(matches!(
+        call(&file, None, None, Some("./nowhere/python"), None),
+        Err(DispatchError::InvalidParams(_))
+    ));
     let _ = std::fs::remove_dir_all(&base);
 }

@@ -430,7 +430,8 @@ pub fn handle(a: PathArgs<'_>) -> Result<Value, DispatchError> {
     );
     Ok(json!({
         "path": a.file.display().to_string(),
-        "project_root": root.display().to_string(),
+        // プロジェクトのスコープのキー（= `${workspaceRoot}`。`RunResolve` の `scope_root` と同じ）
+        "scope_root": root.display().to_string(),
         "saved": {
             "file": saved.file,
             "project": saved.project,

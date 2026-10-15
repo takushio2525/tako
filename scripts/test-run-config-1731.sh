@@ -101,9 +101,10 @@ mkvenv "$PROJ/env2"
 # プロファイル 2 つ（どちらも実行環境の python で走る）
 { printf '# tako:run: ${python} ${fileBase} default\n# tako:run[alt]: ${python} ${fileBase} alt\n'
   printf '%s' "$PRINT_PREFIX"; } > "$PROJ/b.py"
-# monorepo（.venv が 2 段）
+# monorepo（.venv が 2 段）。**別のリポジトリ**にする（同じ `.git` の下だとプロジェクトのスコープの
+# キー = `${workspaceRoot}` が proj と同じになり、④ の保存が ② の保存を上書きする = 仕様どおりの挙動）
 MONO="$FIX/mono"
-mkdir -p "$MONO/pkg"
+mkdir -p "$MONO/pkg" "$MONO/.git"
 printf '%s' "$PRINT_PREFIX" > "$MONO/pkg/a.py"
 mkvenv "$MONO/.venv"
 mkvenv "$MONO/pkg/.venv"
@@ -175,7 +176,7 @@ echo "== ① 読むだけ（自動選択・保存しない） =="
 R1="$("$TAKO_BIN" run-config "$PROJ/a.py" 2>&1)"
 check_eq "① runtime の出どころは auto" "auto" "$(field runtime.source "$R1")"
 check_eq "① 自動選択は .venv" ".venv" "$(field runtime.label "$R1")"
-check_eq "① プロジェクトのルートは材料の根（.git の段）" "$FIX" "$(field project_root "$R1")"
+check_eq "① プロジェクトのキーは材料の根（.git の段）" "$FIX" "$(field scope_root "$R1")"
 check_eq "① 何も書き換えない" "[]" "$(field updated "$R1")"
 [ -f "$STORE" ] && fail "① 読むだけで run-configs.json ができた" || pass "① run-configs.json を作らない"
 
@@ -223,7 +224,16 @@ MCP_N="$(printf '%s' "$MCP_TEXT" | python3 -c "$NORM" 2>/dev/null)"
 [ -n "$MCP_N" ] || echo "  (MCP の生応答) $(oneline "$MCP_TEXT") / stderr: $(oneline "$(cat "$TMP/mcp-err.log")")"
 [ -n "$CLI_N" ] || fail "CLI の応答が JSON でない: $(oneline "$CLI_TEXT" | head -c 300)"
 check_eq "③ 応答全体が字面まで一致する（$(printf '%s' "$CLI_N" | wc -c | tr -d ' ') バイト）" "$CLI_N" "$MCP_N"
-if [ "$CLI_TEXT" = "$MCP_TEXT" ]; then pass "③ 整形済みの本文もバイト一致"; else fail "③ 整形済みの本文がずれる"; fi
+# 整形だけは違う（CLI は整形して表示・MCP の本文は 1 行の JSON）ので、キーの並びを保ったまま
+# 1 行へ詰め直してバイトで比べる（並べ替えない = 並びのずれも拾う）
+COMPACT='import json,sys; print(json.dumps(json.loads(sys.stdin.read()), ensure_ascii=False, separators=(",", ":")))'
+printf '%s' "$CLI_TEXT" | python3 -c "$COMPACT" > "$TMP/cli.txt" 2>/dev/null
+printf '%s' "$MCP_TEXT" | python3 -c "$COMPACT" > "$TMP/mcp.txt" 2>/dev/null
+if [ -s "$TMP/cli.txt" ] && cmp -s "$TMP/cli.txt" "$TMP/mcp.txt"; then
+  pass "③ キーの並びも含めてバイト一致（$(wc -c < "$TMP/cli.txt" | tr -d ' ') バイト）"
+else
+  fail "③ キーの並びまで含めるとずれる: $(diff "$TMP/cli.txt" "$TMP/mcp.txt" | head -4 | tr '\n' ' ' | head -c 300)"
+fi
 
 echo
 echo "== ④ 短縮が 2 候補に当たると保存せずに候補を並べる =="

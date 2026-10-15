@@ -9887,8 +9887,13 @@ fn dispatch_inner(
             // Tier F（stat と先頭読み）+ 一覧で覚えた Tier P の事実だけ = 子プロセスは起こさない
             let mut runtime = crate::runtime_probe::for_run(&resolved);
             // #1731: 保存した実行設定（`tako run-config`）を重ねる。保存した実行環境が
-            // 解けなければ自動選択へ落とさずに止める（#1466）。プロファイルは明示が勝つ
-            let saved = crate::run_configs::saved_for(&resolved);
+            // 解けなければ自動選択へ落とさずに止める（#1466）。プロファイルは明示が勝ち、
+            // `command` の上書き（一回だけ全部変える逃げ道）は保存した層を素通りする（設計書 §4.3）
+            let saved = if cmd_override.is_some() {
+                crate::run_configs::Saved::default()
+            } else {
+                crate::run_configs::saved_for(&resolved)
+            };
             if let Some(snap) = runtime.as_mut() {
                 crate::run_configs::apply_runtime(snap, &saved)
                     .map_err(|u| DispatchError::Operation(u.message(&resolved)))?;
@@ -10627,6 +10632,8 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
         "default_profile": resolution.plan.profile,
         "project": run_project_json(resolution.project.as_ref()),
         "workspace_root": resolution.workspace_root.display().to_string(),
+        // #1731: 実行設定のプロジェクトのスコープのキー（= `${workspaceRoot}`。`tako run-config`）
+        "scope_root": saved.project_root.display().to_string(),
         // #1730: 実行設定の実効値・走らせる実行環境・候補の全部・プロジェクトのルート
         "project_root": resolution
             .project
@@ -40720,6 +40727,90 @@ mod tests {
             PaneOrigin::Mcp,
         )
         .unwrap()
+    }
+
+    /// #1731: 保存した実行環境が解けなければ `Run` は自動へ落とさずに止まり（次の一手つき・
+    /// ペインを割らない）、`command` の上書きは保存した層を素通りして走る。一覧（`RunResolve`）は
+    /// 止めずに `runtime_unresolved` を返す
+    #[test]
+    fn issue1731_保存した実行環境が解けなければrunは止まりcommandの上書きは素通りする() {
+        let (_s, base, venv, file) = venv_project_1730("dispatch-1731-saved", true);
+        let gone = base.join("gone-env");
+        let store = crate::run_configs::store_path().expect("テストの data dir");
+        let kind = tako_core::runtime_env::kind_for_ext("py")
+            .expect("py の行")
+            .id;
+        crate::run_configs::update_at(&store, |st| {
+            st.projects
+                .entry(base.display().to_string())
+                .or_default()
+                .runtime
+                .insert(
+                    kind.to_string(),
+                    tako_core::runner_config::RuntimeRef::new("venv", gone.display().to_string()),
+                );
+        })
+        .unwrap();
+
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let before = host.ws.active_tab().tree().panes().len();
+        let run = |command: Option<&str>| Request::Run {
+            path: file.display().to_string(),
+            pane: Some(pane.as_u64()),
+            tab: None,
+            profile: None,
+            command: command.map(str::to_string),
+            direction: None,
+            ratio: None,
+            auto_close: None,
+            focus: None,
+            new_pane: None,
+        };
+        let err = dispatch(&mut host, run(None), PaneOrigin::Mcp).expect_err("自動へ落とさない");
+        let msg = err.to_string();
+        assert!(msg.contains("--reset runtime"), "{msg}");
+        assert!(msg.contains(&gone.display().to_string()), "{msg}");
+        assert_eq!(
+            host.ws.active_tab().tree().panes().len(),
+            before,
+            "解けないのにペインを割った"
+        );
+
+        // `command` の上書きは保存した層を素通りする（自動の .venv）
+        let v = dispatch(&mut host, run(Some("echo 1731")), PaneOrigin::Mcp).unwrap();
+        assert_eq!(v["runtime"]["source"], "auto", "{v}");
+        assert_eq!(v["runtime"]["path"], venv.display().to_string().as_str());
+
+        // 一覧は止めずに知らせる
+        let r = dispatch(
+            &mut host,
+            Request::RunResolve {
+                path: file.display().to_string(),
+                pane: Some(pane.as_u64()),
+                refresh: false,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            r["runtime_unresolved"]["key"],
+            gone.display().to_string().as_str(),
+            "{r}"
+        );
+        assert_eq!(r["runtime_unresolved"]["source"], "project");
+        assert!(r["runtime_unresolved"]["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("--reset runtime"));
+        assert_eq!(r["runtime"]["source"], "auto");
+        assert_eq!(r["scope_root"], base.display().to_string().as_str());
+        assert_eq!(r["config"]["runtime"][kind]["source"], "project");
+
+        crate::run_configs::update_at(&store, |st| {
+            st.projects.remove(&base.display().to_string());
+        })
+        .unwrap();
     }
 
     /// 受け入れ条件: `RunResolve` は Tier P（子プロセス）を含むので `prepare_offload` を通り、
