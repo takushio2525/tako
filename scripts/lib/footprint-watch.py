@@ -257,17 +257,23 @@ def decide(res, state):
     return "keep", [], prev
 
 
-def body_md(res, new, prev_open, window):
+def body_md(res, new, prev_open):
     cur = res["cur"]
     sha = cur.get("sha", "-")
     base = res["baseline"]
+    extra, _ = env_parts(cur)
     lines = [
         "夜間の計測（`scripts/measure-footprint-2011.sh` の std = 器 30・プレビュー %s・放置 60 秒 + 出力中 60 秒）で、"
-        "直近 %d 回の中央値（基準）より閾値を超えて悪化した。" % (cur.get("previews", "-"), window),
+        "基準（同じ条件の直近 %d 回の中央値）より閾値を超えて悪化した。" % (cur.get("previews", "-"), len(base)),
         "",
         "- 計測: %s・v%s（`%s`）・描画%s・起動 %s ms" % (cur.get("date", "-"), cur.get("version", "-"), sha[:12],
                                                 cur.get("drawn", "-"), cur.get("startup_ms", "-")),
     ]
+    if extra != "-":
+        # 手で A/B を回したとき（TAKO_FOOTPRINT_ENV）。この行は基準には入らない
+        lines.append("- 足した env: `%s`（この行は基準に入らない）" % extra)
+    if ref_of(cur) != MAIN_REF:
+        lines.append("- 測った ref: `%s`（origin/main ではない。この行は origin/main の基準に入らない）" % ref_of(cur))
     if base:
         lines.append("- 基準: 直近 %d 回（%s〜%s・`%s`〜`%s`）の中央値" % (
             len(base), base[0].get("date", "-"), base[-1].get("date", "-"),
@@ -333,7 +339,7 @@ def cmd_judge(a):
             f.write(title_txt(res) + "\n")
         prev = [k for k in (state.get("open_metrics") or "").split(",") if k]
         with open(os.path.join(a.out_dir, "body.md"), "w", encoding="utf-8") as f:
-            f.write(body_md(res, new, prev, a.window))
+            f.write(body_md(res, new, prev))
     return 0
 
 

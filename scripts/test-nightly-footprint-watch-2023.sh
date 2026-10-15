@@ -156,6 +156,8 @@ add_row "$H" "2026-10-12 05:30" f3 ok
 add_row "$H" "2026-10-13 05:30" f4 ok "env=TAKO_2009_LEGACY=1 stub-claude" footprint_mb=700.0 busy_footprint_mb=700.0
 judge_kv "$H" "$A/none" "$A/o6"
 assert_eq "注入の行は悪化として挙がる" "regression" "$(kv_of "$A/o6" verdict)"
+assert_contains "本文に足した env を書く" "$(cat "$A/o6/body.md")" "足した env: \`TAKO_2009_LEGACY=1\`（この行は基準に入らない）"
+assert_contains "本文の基準の回数は実際の回数" "$(cat "$A/o6/body.md")" "同じ条件の直近 3 回の中央値"
 add_row "$H" "2026-10-14 05:30" f5 ok
 judge_kv "$H" "$A/none" "$A/o6b"
 assert_eq "注入の後の標準の夜は clean（注入の値が基準に混ざらない）" "clean" "$(kv_of "$A/o6b" verdict)"
