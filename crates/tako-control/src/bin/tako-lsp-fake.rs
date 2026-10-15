@@ -99,6 +99,17 @@
 //! `loading` の読み込み中は参照と prepare に空（`[]`）で答える（定義ジャンプと同じ）。
 //! 当たる規則が無ければ `null` で答える。
 //!
+//! 名前の変更（`textDocument/prepareRename` / `textDocument/rename`。#1686）は `--rename <file>` か
+//! `TAKO_LSP_FAKE_RENAME` の規則で答える。**渡したときだけ** `renameProvider: { prepareProvider: true }` を
+//! 申告する（`prepareProvider` の無い形は `--providers` で差し替える）。形は定義ジャンプの規則と同じく
+//! **上から順に最初に当たった 1 つ**（`method` / `uri_suffix` / `line`）で、`result`（そのまま返す。`null` も可）/
+//! `error`（`{ code, message }`）/ `silent` / `crash` を持つ。当たる規則が無い・どれも無ければ**既定の答え**:
+//! prepare は問われた位置の語（英数字と `_`）の範囲と `placeholder`（語の上でなければ `null`）、rename は
+//! 新しい名前が `[A-Za-z_][A-Za-z0-9_]*` でなければ -32602（rust-analyzer の文の形）、そうでなければ
+//! 本文の模型（`--disk-model` ならディスクの模型も）でその語が**語として**現れる所すべてを書き換える
+//! `WorkspaceEdit`（既定は `documentChanges`。規則の `shape: "changes"` で `changes` の形、
+//! `resource_op: true` でファイルの名前の変更を 1 つ足す）。
+//!
 //! ## tako の外で変わったファイル（#2034）
 //!
 //! `--watchers <file>`（`TAKO_LSP_FAKE_WATCHERS`。`FileSystemWatcher` の JSON 配列。字面の `{root}` は
@@ -264,6 +275,78 @@ const XREF_METHODS: [&str; 7] = [
     "typeHierarchy/supertypes",
     "typeHierarchy/subtypes",
 ];
+
+/// 名前の変更の method（#1686）
+const RENAME_METHODS: [&str; 2] = ["textDocument/prepareRename", "textDocument/rename"];
+
+/// 名前の変更の既定の答え（#1686。冒頭の説明）。`texts` は本文の模型（とディスクの模型）
+fn rename_answer(
+    texts: &std::collections::BTreeMap<String, String>,
+    breaks: Breaks,
+    method: &str,
+    params: &serde_json::Value,
+    rule: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+    let text = texts.get(uri).cloned().unwrap_or_default();
+    let line = params["position"]["line"].as_u64().unwrap_or(0) as usize;
+    let character = params["position"]["character"].as_u64().unwrap_or(0) as usize;
+    let Some((a, b)) = word_at(&text, offset_at(&text, breaks, line, character)) else {
+        return Ok(serde_json::Value::Null);
+    };
+    let word = text[a..b].to_string();
+    if method == RENAME_METHODS[0] {
+        return Ok(serde_json::json!({
+            "range": range_json(&text, breaks, a, b),
+            "placeholder": word,
+        }));
+    }
+    let new_name = params["newName"].as_str().unwrap_or("");
+    let identifier = new_name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && new_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !identifier {
+        return Err(serde_json::json!({
+            "code": -32602,
+            "message": format!("Invalid name `{new_name}`: not an identifier"),
+        }));
+    }
+    let mut per_uri: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for location in find_locations(texts, breaks, &word, true) {
+        let uri = location["uri"].as_str().unwrap_or("").to_string();
+        let edit = serde_json::json!({ "range": location["range"], "newText": new_name });
+        match per_uri.iter_mut().find(|(u, _)| *u == uri) {
+            Some((_, edits)) => edits.push(edit),
+            None => per_uri.push((uri, vec![edit])),
+        }
+    }
+    let rule = rule.cloned().unwrap_or(serde_json::Value::Null);
+    if rule["shape"].as_str() == Some("changes") {
+        let changes: serde_json::Map<String, serde_json::Value> = per_uri
+            .into_iter()
+            .map(|(uri, edits)| (uri, serde_json::Value::Array(edits)))
+            .collect();
+        return Ok(serde_json::json!({ "changes": changes }));
+    }
+    let mut document_changes: Vec<serde_json::Value> = per_uri
+        .into_iter()
+        .map(|(uri, edits)| {
+            serde_json::json!({ "textDocument": { "uri": uri, "version": null }, "edits": edits })
+        })
+        .collect();
+    if rule["resource_op"].as_bool() == Some(true) {
+        document_changes.push(serde_json::json!({
+            "kind": "rename",
+            "oldUri": uri,
+            "newUri": format!("{uri}.renamed"),
+        }));
+    }
+    Ok(serde_json::json!({ "documentChanges": document_changes }))
+}
 
 /// 参照検索・階層の能力のキー（`--xref` を渡したときだけ申告する。#1685）
 const XREF_PROVIDERS: [&str; 3] = [
@@ -821,6 +904,11 @@ fn main() {
         arg_or_env(&args, "--xref", "TAKO_LSP_FAKE_XREF")
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| serde_json::from_str(&text).ok());
+    // #1686: 名前の変更の規則（渡したときだけ能力を申告する）
+    let rename_rules: Option<Vec<serde_json::Value>> =
+        arg_or_env(&args, "--rename", "TAKO_LSP_FAKE_RENAME")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok());
     let doc_log = arg_or_env(&args, "--doc-log", "TAKO_LSP_FAKE_DOC_LOG");
     // #2034: 監視の登録・解除の合図・ディスクの模型（冒頭の説明）
     let watchers_text: Option<String> = arg_or_env(&args, "--watchers", "TAKO_LSP_FAKE_WATCHERS")
@@ -1017,6 +1105,9 @@ fn main() {
                     for key in XREF_PROVIDERS {
                         capabilities[key] = serde_json::json!(true);
                     }
+                }
+                if rename_rules.is_some() {
+                    capabilities["renameProvider"] = serde_json::json!({ "prepareProvider": true });
                 }
                 if scenario != "no-completion" {
                     capabilities["completionProvider"] = serde_json::json!({
@@ -1233,6 +1324,41 @@ fn main() {
                         .unwrap_or(serde_json::Value::Null),
                 };
                 out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+            }
+            // #1686: 名前の変更（読み込み中の空の答えは持たない = 既定の答えは本文の模型から作る）
+            (method, Some(id)) if RENAME_METHODS.contains(&method) => {
+                let params = &message["params"];
+                let rules = rename_rules.as_deref().unwrap_or_default();
+                let rule = goto_rule(rules, method, params);
+                if let Some(rule) = rule {
+                    if rule["crash"].as_bool() == Some(true) {
+                        std::process::exit(7);
+                    }
+                    if rule["silent"].as_bool() == Some(true) {
+                        continue;
+                    }
+                    if let Some(error) = rule.get("error") {
+                        out.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }));
+                        continue;
+                    }
+                    if let Some(result) = rule.get("result") {
+                        out.send(
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        );
+                        continue;
+                    }
+                }
+                let texts = match disk.as_ref() {
+                    Some(disk) => disk.texts(&docs),
+                    None => docs.iter().map(|(u, t)| (u.clone(), t.clone())).collect(),
+                };
+                let reply = match rename_answer(&texts, breaks, method, params, rule) {
+                    Ok(result) => {
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                    }
+                    Err(error) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+                };
+                out.send(reply);
             }
             (method, Some(id)) if FORMAT_METHODS.contains(&method) => {
                 let params = &message["params"];

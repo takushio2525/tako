@@ -40,7 +40,8 @@
 //!   スクリプトも書かない（答えは `hold_until` = `AnswerGate` で、次の操作が済んでから返させる）
 //! - [`ログを数える前に区切る`] — 「送った」直後に偽サーバのログを数えて落ちた 1684 の e2e は、
 //!   ログ書き込みの遅れ（テストの待ちの周期より長い）を常に渡し、`stop_and_settle` の後に数える
-//! - [`空の答えの判定は_1_実装`] — 定義ジャンプ・補完・ホバー・参照と階層（#1685）の空の答えの後は `wait_after_empty`
+//! - [`空の答えの判定は_1_実装`] — 定義ジャンプ・補完・ホバー・参照と階層（#1685）の空の答えと名前の変更の
+//!   `prepareRename` の断り（#1686）の後は `wait_after_empty`
 //!   （`EmptyAnswer`）だけを通る。偽サーバの `--settle-on-empty` は空の前後で読み込みを終える
 //!
 //! # 見逃す側へ倒れないための作り
@@ -870,13 +871,13 @@ fn scan_empty_answer(manager_src: &str, goto_src: &str) -> Vec<String> {
         .collect();
     callers.sort();
     let names: Vec<&str> = callers.iter().map(|(n, _)| n.as_str()).collect();
-    if names != ["completion", "goto", "hover", "xref"] {
+    if names != ["completion", "goto", "hover", "rename", "xref"] {
         out.push(report(
             MANAGER,
             0,
             &format!(
-                "`wait_after_empty` の呼び手が定義ジャンプ・補完・ホバー・参照と階層（#1685）の 4 つと\
-                 一致しない（{names:?}。#1930 の 6）"
+                "`wait_after_empty` の呼び手が定義ジャンプ・補完・ホバー・参照と階層（#1685）・\
+                 名前の変更の断り（#1686）の 5 つと一致しない（{names:?}。#1930 の 6）"
             ),
         ));
     }

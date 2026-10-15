@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use super::goto::{self, GotoKind, SymbolKind};
 use super::xref::{self, XrefKind};
-use super::{format, hover};
+use super::{format, hover, rename};
 
 /// 右クリックメニューの LSP 項目
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,6 +30,8 @@ pub enum MenuItem {
     Xref(XrefKind),
     /// その語の型・doc のカード（編集メニューの「ホバー情報を表示」と同じ。#1681 / #1893）
     Hover,
+    /// 名前の変更（押すと新しい名前を打つ欄が開く。#1686）
+    Rename,
     /// 文書全体の整形（編集メニューの「コードを整形」と同じ。#1683）
     Format,
     /// 選択範囲の整形（編集メニューの「選択範囲を整形」と同じ。#1683）
@@ -37,8 +39,8 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    /// 全項目。**メニューに出る順**（VSCode / Zed の並びに合わせ、移動 → 参照・階層 → 情報 → 整形）
-    pub const ALL: [MenuItem; 12] = [
+    /// 全項目。**メニューに出る順**（VSCode / Zed の並びに合わせ、移動 → 参照・階層 → 情報 → 名前の変更 → 整形）
+    pub const ALL: [MenuItem; 13] = [
         MenuItem::Goto(GotoKind::Definition),
         MenuItem::Goto(GotoKind::Declaration),
         MenuItem::Goto(GotoKind::TypeDefinition),
@@ -49,6 +51,7 @@ impl MenuItem {
         MenuItem::Xref(XrefKind::Supertypes),
         MenuItem::Xref(XrefKind::Subtypes),
         MenuItem::Hover,
+        MenuItem::Rename,
         MenuItem::Format,
         MenuItem::FormatSelection,
     ];
@@ -68,6 +71,7 @@ impl MenuItem {
             MenuItem::Xref(XrefKind::Supertypes) => "lsp-supertypes",
             MenuItem::Xref(XrefKind::Subtypes) => "lsp-subtypes",
             MenuItem::Hover => "lsp-hover",
+            MenuItem::Rename => "lsp-rename",
             MenuItem::Format => "lsp-format",
             MenuItem::FormatSelection => "lsp-format-selection",
         }
@@ -83,6 +87,7 @@ impl MenuItem {
             MenuItem::Goto(kind) => kind.provider_key(),
             MenuItem::Xref(kind) => kind.provider_key(),
             MenuItem::Hover => hover::PROVIDER_KEY,
+            MenuItem::Rename => rename::PROVIDER_KEY,
             MenuItem::Format => format::provider_key(false),
             MenuItem::FormatSelection => format::provider_key(true),
         }
@@ -95,6 +100,7 @@ pub fn server_supports(capabilities: &Value, item: MenuItem) -> bool {
         MenuItem::Goto(kind) => goto::server_supports(capabilities, kind),
         MenuItem::Xref(kind) => xref::server_supports(capabilities, kind),
         MenuItem::Hover => hover::server_supports(capabilities),
+        MenuItem::Rename => rename::server_supports(capabilities),
         MenuItem::Format => format::server_supports(capabilities, false),
         MenuItem::FormatSelection => format::server_supports(capabilities, true),
     }
@@ -105,7 +111,7 @@ pub fn server_supports(capabilities: &Value, item: MenuItem) -> bool {
 /// - 識別子: すべて（「選択範囲を整形」は右クリックした位置が選択の中のときだけ）
 /// - `#include` のパス: 定義へ移動とホバー（⌘クリックと同じくヘッダを開く・マウスを乗せたときと
 ///   同じくパスのカード = clangd は解決したヘッダのパスを返す。宣言・型定義・実装・参照・階層・
-///   整形はパスに対して意味を持たない）
+///   名前の変更・整形はパスに対して意味を持たない）
 fn fits(item: MenuItem, kind: SymbolKind, selection_at_click: bool) -> bool {
     match kind {
         SymbolKind::IncludePath => {
@@ -152,6 +158,22 @@ mod tests {
 
     fn ids(items: &[MenuItem]) -> Vec<&'static str> {
         items.iter().map(|item| item.id()).collect()
+    }
+
+    /// #1686: 「名前の変更」は `renameProvider` を申告したサーバの識別子の上だけ（`#include` のパスには出さない）
+    #[test]
+    fn 名前の変更は能力のあるサーバの識別子の上だけ() {
+        let caps = json!({ "hoverProvider": true, "renameProvider": { "prepareProvider": true } });
+        assert_eq!(
+            ids(&items(&caps, Some(SymbolKind::Identifier), false)),
+            ["lsp-hover", "lsp-rename"]
+        );
+        assert_eq!(
+            ids(&items(&caps, Some(SymbolKind::IncludePath), false)),
+            ["lsp-hover"]
+        );
+        let caps = json!({ "renameProvider": false });
+        assert!(items(&caps, Some(SymbolKind::Identifier), false).is_empty());
     }
 
     /// 受け入れ条件: 能力の 4 通り（ゼロ / 定義のみ / 全部 / 一部）で項目 ID の列が固定値と一致する

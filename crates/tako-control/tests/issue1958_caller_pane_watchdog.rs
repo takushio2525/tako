@@ -268,8 +268,9 @@ fn scoped_cases(tools: &[Value]) -> Vec<Case> {
         tools,
         "tako_lsp",
         "action",
-        // format は範囲を 4 つそろえないと断る（#1683）ので、位置の系統と同時に満たす値
-        json!({ "line": 1, "column": 1, "end_line": 1, "end_column": 2 }),
+        // format は範囲を 4 つそろえないと断る（#1683）ので、位置の系統と同時に満たす値。
+        // rename は新しい名前が必須（#1686。ほかの action は読まない）
+        json!({ "line": 1, "column": 1, "end_line": 1, "end_column": 2, "new_name": "x" }),
         |a| !matches!(a, "diagnostics" | "format-on-save") && !results_kind(a),
         "diagnostics は全文書・format-on-save は設定（どちらもペインを取らない）・results 系は右パネルの結果",
     ));

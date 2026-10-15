@@ -82,6 +82,7 @@ use super::format::{FormatAnswer, FormatError, FormatRequest};
 use super::goto::{GotoAnswer, GotoError, GotoRequest};
 use super::hover::{HoverAnswer, HoverError, HoverRequest};
 use super::menu::{MenuCapabilities, MenuRequest};
+use super::rename::{RenameAnswer, RenameError, RenameFile, RenameRequest};
 use super::rpc::RequestId;
 use super::server::{Handlers, RpcError, ServerProcess};
 use super::text;
@@ -948,6 +949,21 @@ impl LspManager {
         match &self.shared {
             Some(shared) => shared.xref_expand(request),
             None => Err(GotoError::Disabled),
+        }
+    }
+
+    /// 名前の変更の問い合わせ（#1686）。**背景スレッドから呼ぶ**（サーバの起動と応答を待つ。
+    /// 上限は `request.timeout`）。
+    ///
+    /// `request.document` があればサーバが見ている本文をそれに揃えてから頼む（整形と同じ）。
+    /// `prepareProvider` を申告したサーバには先に `prepareRename` を送り、断られたら `rename` を送らない
+    /// （[`RenameError::Rejected`]。読み込み中に返った断りは済むのを待って 1 回だけ問い直す = 定義ジャンプの
+    /// 空の答えと同じ判定）。答えの `WorkspaceEdit` はファイルごとの箇所と場所・頼んだファイルへの書き換え・
+    /// 段階 1 で当てられない理由へ直して返す（**ここでは何も当てない**。当てるのは dispatch）
+    pub fn rename(&self, request: &RenameRequest) -> Result<RenameAnswer, RenameError> {
+        match &self.shared {
+            Some(shared) => shared.rename(request),
+            None => Err(RenameError::Lsp(GotoError::Disabled)),
         }
     }
 
@@ -3230,7 +3246,8 @@ impl Shared {
         }
         // サーバが見ている本文を頼む本文へ揃える（打鍵の直後で同期がまだ / 同じファイルの
         // 別のペインが後から編集した。どちらも答えの座標が頼んだ本文とずれる）
-        self.align_shadow(&uri, &request.text, spec)?;
+        self.align_shadow(&uri, &request.text, spec)
+            .map_err(FormatError::Lsp)?;
         let params = fmt::params(&uri, &request.text, request.options, request.range.clone());
         let remaining = deadline
             .saturating_duration_since(Instant::now())
@@ -3283,7 +3300,7 @@ impl Shared {
         })
     }
 
-    /// サーバが見ている本文（写し）を `text` に揃える（#1683）。揃っていれば何も送らない。
+    /// サーバが見ている本文（写し）を `text` に揃える（#1683。リネーム = #1686 も通る）。揃っていれば何も送らない。
     ///
     /// 版は文書ごとに単調に 1 つ進める（#1769 の規則）。持ち手ごとの「取り込んだ版」は
     /// 触らない: 次にそのペインが同期したとき、本文が同じなら送らずに版だけ覚える
@@ -3292,11 +3309,11 @@ impl Shared {
         uri: &str,
         text: &str,
         spec: &'static ServerSpec,
-    ) -> Result<(), FormatError> {
+    ) -> Result<(), GotoError> {
         let mut guard = self.lock();
         let inner = &mut *guard;
         let Some(doc) = inner.docs.get_mut(uri) else {
-            return Err(FormatError::Lsp(GotoError::Closed));
+            return Err(GotoError::Closed);
         };
         if doc.text == text {
             return Ok(());
@@ -3314,13 +3331,172 @@ impl Shared {
                     "contentChanges": changes,
                 });
                 if process.notify("textDocument/didChange", params).is_err() {
-                    return Err(FormatError::Lsp(GotoError::Crashed { server: spec.id }));
+                    return Err(GotoError::Crashed { server: spec.id });
                 }
             }
         }
         replace_text(&mut doc.text, text);
         doc.version = version;
         Ok(())
+    }
+}
+
+// --- リネーム（#1686）-----------------------------------------------------------
+
+impl Shared {
+    fn rename(&self, request: &RenameRequest) -> Result<RenameAnswer, RenameError> {
+        use tako_core::lsp::rename as core;
+        let deadline = Instant::now() + request.timeout;
+        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+            return Err(RenameError::Lsp(GotoError::NoServer));
+        };
+        let spec = resolved.spec;
+        let uri = tako_core::file_uri::from_path(&request.path);
+        // 開いていなければ問い合わせのあいだだけ開く（定義ジャンプ・整形と同じ 1 本）
+        let _transient = self
+            .open_for_request(&request.path, &uri, spec, request.document.as_deref())
+            .map_err(RenameError::Lsp)?;
+        let (process, capabilities, key) = self
+            .wait_ready(&uri, spec, request.timeout, deadline, &|| false)
+            .map_err(RenameError::Lsp)?;
+        if !core::server_supports(&capabilities) {
+            return Err(RenameError::Unsupported { server: spec.id });
+        }
+        // サーバが見ている本文を頼む本文へ揃える（整形と同じ理由: 打鍵の直後・別のペインの編集）
+        if let Some(document) = &request.document {
+            self.align_shadow(&uri, document, spec)
+                .map_err(RenameError::Lsp)?;
+        }
+        let Some(base) = self.shadow_text(&uri) else {
+            return Err(RenameError::Lsp(GotoError::Closed));
+        };
+        // 問い合わせる位置は**サーバが見ている本文**で LSP の座標へ直す（#1769）
+        let (line, character) =
+            position::lsp_position_of_line_col(&base, request.line, request.column);
+        let at = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        });
+        let remaining = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+        };
+        let mut placeholder = None;
+        if core::supports_prepare(&capabilities) {
+            let mut empty = super::goto::EmptyAnswer::default();
+            loop {
+                empty.sent(self.sent_while_loading(&key));
+                let detail = match process.request(core::PREPARE_METHOD, at.clone(), remaining()) {
+                    Ok(answer) => match core::parse_prepare(&answer) {
+                        core::Prepared::Accepted { placeholder: shown } => {
+                            // 範囲だけの答え（rust-analyzer）は、その範囲の字面を今の名前にする
+                            placeholder = shown.or_else(|| {
+                                let (start, end) = core::prepare_range(&answer)?;
+                                let index = position::LineIndex::new(&base);
+                                let from = index.byte_offset(start.0, start.1);
+                                let to = index.byte_offset(end.0, end.1);
+                                base.get(from..to).map(str::to_string)
+                            });
+                            break;
+                        }
+                        core::Prepared::Rejected => None,
+                    },
+                    // 断りはエラーでも来る（rust-analyzer は「No references found at position」）
+                    Err(RpcError::Server(e)) => Some(e.message),
+                    Err(e) => return Err(RenameError::Lsp(rpc_failure(spec, request.timeout, e))),
+                };
+                // 断り: 読み込み中のサーバなら済むのを待って問い直す（定義ジャンプの空の答えと同じ判定）
+                match self.wait_after_empty(&key, deadline, &|| false, &mut empty) {
+                    super::goto::Loading::Retry => continue,
+                    super::goto::Loading::Settled => {
+                        return Err(RenameError::Rejected {
+                            server: spec.id,
+                            detail,
+                        })
+                    }
+                    super::goto::Loading::TimedOut => {
+                        return Err(RenameError::Lsp(GotoError::Timeout {
+                            server: spec.id,
+                            secs: request.timeout.as_secs(),
+                            starting: true,
+                        }))
+                    }
+                    super::goto::Loading::Abandoned => {
+                        return Err(RenameError::Lsp(GotoError::Closed))
+                    }
+                }
+            }
+        }
+        let mut params = at;
+        params["newName"] = json!(request.new_name);
+        let answer = match process.request(core::METHOD, params, remaining()) {
+            Ok(answer) => answer,
+            Err(RpcError::Server(e)) => {
+                return Err(RenameError::Refused {
+                    server: spec.id,
+                    detail: e.message,
+                })
+            }
+            Err(e) => return Err(RenameError::Lsp(rpc_failure(spec, request.timeout, e))),
+        };
+        // 待つあいだに写しが変わった（打鍵・別のペイン）= 答えの座標は今の本文に合わない
+        if self.shadow_text(&uri).as_deref() != Some(base.as_str()) {
+            return Err(RenameError::Stale);
+        }
+        let invalid = |detail: String| RenameError::InvalidEdits {
+            server: spec.id,
+            detail,
+        };
+        let edit = core::parse_workspace_edit(&answer).map_err(|e| invalid(e.to_string()))?;
+        let source_key = uri_key(&uri);
+        let is_source = |u: &str| uri_key(u) == source_key;
+        // 頼んだファイルへの書き換え（座標はサーバが見ていた本文 = `base`）
+        let source_edits: Vec<Value> = edit
+            .files
+            .iter()
+            .filter(|f| is_source(&f.uri))
+            .flat_map(|f| f.edits.iter().cloned())
+            .collect();
+        let changes = tako_core::lsp::format::parse_text_edits(&Value::Array(source_edits), &base)
+            .map_err(|e| invalid(e.to_string()))?;
+        let source_changes = tako_core::text_edit::order_changes(&base, changes)
+            .map_err(|e| invalid(e.to_string()))?;
+        // 場所の本文: 頼んだファイルは `base`、開いている文書はサーバの写し、それ以外はディスクの中身
+        let mut budget = super::rename::MAX_SPOTS;
+        let files = edit
+            .files
+            .iter()
+            .map(|file| {
+                let source = is_source(&file.uri);
+                let path = tako_core::lsp::goto::path_of_uri(&file.uri, cfg!(windows));
+                let text = if source {
+                    Some(base.clone())
+                } else {
+                    self.shadow_text(&file.uri).or_else(|| {
+                        let bytes = std::fs::read(path.as_ref()?).ok()?;
+                        Some(String::from_utf8_lossy(&bytes).into_owned())
+                    })
+                };
+                let take = file.edits.len().min(budget);
+                budget -= take;
+                RenameFile {
+                    uri: file.uri.clone(),
+                    path,
+                    source,
+                    edits: file.edits.len(),
+                    spots: core::spots(text.as_deref(), &file.edits[..take]),
+                }
+            })
+            .collect();
+        Ok(RenameAnswer {
+            server: spec.id,
+            placeholder,
+            files,
+            blocker: core::blocker(&edit, is_source),
+            resource_ops: edit.resource_ops,
+            source_changes,
+        })
     }
 }
 
@@ -4078,7 +4254,7 @@ fn stop_process(process: &ServerProcess, timeout: Duration) {
 
 /// クライアントの能力。**実際に使うものだけ**を申告する（使わない能力を申告すると
 /// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種、
-/// #1683 が整形、#1682 が補完、#1681 がホバー、#2034 がファイル監視の動的登録を足した
+/// #1683 が整形、#1682 が補完、#1681 がホバー、#2034 がファイル監視の動的登録、#1686 が名前の変更を足した
 fn initialize_params(root_uri: &str, root_name: &str) -> Value {
     use lsp_types::{
         ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
@@ -4086,8 +4262,10 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
         DidChangeWatchedFilesClientCapabilities, DocumentFormattingClientCapabilities,
         DocumentRangeFormattingClientCapabilities, GeneralClientCapabilities, GotoCapability,
         HoverClientCapabilities, InitializeParams, MarkupKind, PositionEncodingKind,
-        PublishDiagnosticsClientCapabilities, TagSupport, TextDocumentClientCapabilities,
-        TextDocumentSyncClientCapabilities, Uri, WorkspaceClientCapabilities, WorkspaceFolder,
+        PrepareSupportDefaultBehavior, PublishDiagnosticsClientCapabilities,
+        RenameClientCapabilities, TagSupport, TextDocumentClientCapabilities,
+        TextDocumentSyncClientCapabilities, Uri, WorkspaceClientCapabilities,
+        WorkspaceEditClientCapabilities, WorkspaceFolder,
     };
     // #1680: 定義ジャンプの 4 種。`LocationLink` を受けられる（識別子の範囲へ正確に着地する）
     let goto = || {
@@ -4099,13 +4277,22 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
     let uri: Option<Uri> = root_uri.parse().ok();
     // #2034: tako の外で変わったファイルを知らせる（サーバがグロブを登録してくる）。申告しないと
     // サーバ自前の監視次第になる（rust-analyzer 1.95 は根がシンボリックリンクを通ると拾わない = 実測）
-    let workspace = (!super::watch::legacy()).then(|| WorkspaceClientCapabilities {
-        did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
-            dynamic_registration: Some(true),
-            relative_pattern_support: Some(true),
+    // #1686: 名前の変更の答え（`WorkspaceEdit`）は版つきの `documentChanges` で受ける。ファイルの作成 /
+    // 名前の変更 / 削除は申告しない（段階 1 は本文の書き換えだけ。来たら当てずに件数を返す）
+    let workspace = WorkspaceClientCapabilities {
+        did_change_watched_files: (!super::watch::legacy()).then_some(
+            DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: Some(true),
+            },
+        ),
+        workspace_edit: Some(WorkspaceEditClientCapabilities {
+            document_changes: Some(true),
+            resource_operations: Some(Vec::new()),
+            ..Default::default()
         }),
         ..Default::default()
-    });
+    };
     #[allow(deprecated)]
     let params = InitializeParams {
         process_id: Some(std::process::id()),
@@ -4124,7 +4311,7 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
                 position_encodings: Some(vec![PositionEncodingKind::UTF16]),
                 ..Default::default()
             }),
-            workspace,
+            workspace: Some(workspace),
             text_document: Some(TextDocumentClientCapabilities {
                 synchronization: Some(TextDocumentSyncClientCapabilities {
                     dynamic_registration: Some(false),
@@ -4186,6 +4373,16 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
                         ]),
                     }),
                     ..Default::default()
+                }),
+                // #1686: 名前の変更。`prepareRename` で始めてよい位置かを先に問う（申告しないと
+                // サーバは `prepareProvider` を出さない）。範囲を返さない「既定の振る舞い」の答えも受ける
+                rename: Some(RenameClientCapabilities {
+                    dynamic_registration: Some(false),
+                    prepare_support: Some(true),
+                    prepare_support_default_behavior: Some(
+                        PrepareSupportDefaultBehavior::IDENTIFIER,
+                    ),
+                    honors_change_annotations: Some(false),
                 }),
                 ..Default::default()
             }),
@@ -4289,7 +4486,7 @@ mod tests {
     }
 
     #[test]
-    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形と補完とホバーだけ() {
+    fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形と補完とホバーと名前の変更だけ() {
         let params = initialize_params("file:///w", "w");
         assert_eq!(
             params["capabilities"]["general"]["positionEncodings"],
@@ -4309,9 +4506,15 @@ mod tests {
                 "implementation",
                 "publishDiagnostics",
                 "rangeFormatting",
+                "rename",
                 "synchronization",
                 "typeDefinition"
             ]
+        );
+        // #1686: `prepareRename` を使う（申告しないとサーバは `prepareProvider` を出さない）
+        assert_eq!(
+            params["capabilities"]["textDocument"]["rename"]["prepareSupport"],
+            json!(true)
         );
         // #1682: スニペットは申告せず、resolve へ回すのは長い説明だけ（型の要約と自動 import は
         // 一覧に載せる）
@@ -4337,13 +4540,20 @@ mod tests {
         assert_eq!(params["rootUri"], json!("file:///w"));
         assert_eq!(params["workspaceFolders"][0]["name"], json!("w"));
         assert_eq!(params["clientInfo"]["name"], json!("tako"));
-        // #2034: workspace はファイル監視の動的登録（相対パターンつき）だけ
+        // #2034: workspace はファイル監視の動的登録（相対パターンつき）と、#1686 の名前の変更の答えの
+        // 受け方（版つきの documentChanges・ファイルの操作は受けない）だけ
         assert_eq!(
             params["capabilities"]["workspace"],
-            json!({ "didChangeWatchedFiles": {
-                "dynamicRegistration": true,
-                "relativePatternSupport": true,
-            }})
+            json!({
+                "didChangeWatchedFiles": {
+                    "dynamicRegistration": true,
+                    "relativePatternSupport": true,
+                },
+                "workspaceEdit": {
+                    "documentChanges": true,
+                    "resourceOperations": [],
+                },
+            })
         );
     }
 

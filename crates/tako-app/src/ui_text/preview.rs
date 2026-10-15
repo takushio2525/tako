@@ -356,6 +356,34 @@ pub fn format_not_code() -> &'static str {
     )
 }
 
+// --- 名前の変更（キー: preview.rename_*。#1686） ---
+// 結果の注記・理由・次の一手の日英は dispatch の応答（`tako_control::lsp::text`）が持つ。
+// ここは画面だけの語（帯の見出しとキーの案内）
+
+/// 帯の見出し。`{name}` = 今の名前
+pub fn rename_title(name: &str) -> String {
+    tr!(
+        format!("「{name}」の名前を変える"),
+        format!("Rename \"{name}\"")
+    )
+}
+
+/// 帯のキーの案内
+pub fn rename_hint() -> &'static str {
+    tr!(
+        "Enter で書き換える（undo 1 回で戻る・保存はしない）・Esc でやめる",
+        "Enter to rename (one undo reverts it; not saved) · Esc to cancel"
+    )
+}
+
+/// 問い合わせ中の印（帯の中に出す）
+pub fn rename_running() -> &'static str {
+    tr!(
+        "言語サーバに問い合わせています…",
+        "Asking the language server…"
+    )
+}
+
 // --- ホバー（キー: preview.hover_*。#1681） ---
 // 理由・次の一手の日英は dispatch の応答（`tako_control::lsp::text`）が持つ。ここは画面だけの語
 
@@ -512,6 +540,9 @@ mod tests {
                 format_running().to_string(),
                 format_no_selection().to_string(),
                 format_not_code().to_string(),
+                rename_title("value"),
+                rename_hint().to_string(),
+                rename_running().to_string(),
                 hover_link_op().to_string(),
                 hover_not_code().to_string(),
                 hover_no_cursor().to_string(),

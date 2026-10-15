@@ -3,7 +3,7 @@
 //! 本文を**識別子の上で**右クリックすると、ペインのメニュー（ヘッダの右クリックと同じ
 //! `pane_context_menu`）の先頭へ言語サーバの項目（定義へ移動・宣言へ移動・型定義へ移動・
 //! 実装へ移動・参照を検索 / 呼び出し元・呼び出し先・スーパータイプ・サブタイプを表示（#1685）・
-//! ホバー情報を表示（#1893）・コードを整形・選択範囲を整形）を足す。識別子でない位置・受け持つサーバが無い
+//! ホバー情報を表示（#1893）・名前の変更（#1686）・コードを整形・選択範囲を整形）を足す。識別子でない位置・受け持つサーバが無い
 //! ファイル・Markdown では従来のメニューのまま。
 //!
 //! ## 出し分けと操作はここに無い
@@ -186,6 +186,8 @@ impl TakoApp {
             MenuItem::Hover => self.request_lsp_hover(pane, request, cx),
             // #1685: 結果は右パネルの references ビューへ（問い合わせは background）
             MenuItem::Xref(_) => self.request_lsp_xref(pane, request, cx),
+            // #1686: 新しい名前を打つ欄を開く（Enter で CLI の `tako lsp rename --yes` と同じ要求を渡す）
+            MenuItem::Rename => self.open_lsp_rename(pane, target, cx),
             MenuItem::Format | MenuItem::FormatSelection => {
                 self.format_preview_request(pane, request, cx)
             }

@@ -1097,7 +1097,7 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         // 出自: #1679（診断）/ #1680（定義ジャンプ）/ #1683（整形）/ #1682（補完）/ #1684（右クリックメニュー）/
-        // #1681（ホバー）。LSP の言語機能。
+        // #1681（ホバー）/ #1685（参照・階層）/ #1686（名前の変更）。LSP の言語機能。
         // 次のスライスも action を足す（ツールは増やさない）
         json!({
             "name": "tako_lsp",
@@ -1121,6 +1121,8 @@ pub fn tools() -> Vec<Value> {
                 呼び出し階層・型階層のツリー（根を 1 段開いた形）を返し、問い合わせたペインの結果として保持する（show で右パネルにも出す）。\
                 応答の items[] / nodes[] の id を item に渡し、action=open-result でその位置を開く（定義ジャンプと同じ着地）・\
                 expand / collapse でノードを開閉・results で読み直す（retained = 保持件数）・clear-results で消す。\
+                action=rename はその位置の名前を new_name へ変える（既定は書き換えず files・edits を返す。confirm で\
+                pane の編集バッファへ当てる = undo 1 回。別のファイルに及ぶと当てない）。\
                 位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）。", link_click()),
             "inputSchema": {
                 "type": "object",
@@ -1128,8 +1130,8 @@ pub fn tools() -> Vec<Value> {
                     "action": enum_schema(crate::dispatch::LSP_FEATURE_ACTIONS, "操作（既定 diagnostics）"),
                     "pane": pane_schema("プレビューペイン ID（diagnostics は省略で全文書、results 系は結果を問い合わせたペインで省略は右パネルの結果、それ以外は省略で呼び出し元）"),
                     "severity": enum_schema(&tako_core::lsp::diagnostic::Severity::NAMES, "diagnostics: この重大度以上に絞る"),
-                    "line": { "type": "integer", "minimum": 1, "description": "定義ジャンプ / 補完 / menu / ホバー / 参照・階層: 行（1 始まり。必須）/ format: 範囲の始まりの行" },
-                    "column": { "type": "integer", "minimum": 0, "description": "定義ジャンプ / 補完 / menu / ホバー / 参照・階層: 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否。必須）/ format: 範囲の始まりの桁" },
+                    "line": { "type": "integer", "minimum": 1, "description": "定義ジャンプ / 補完 / menu / ホバー / 参照・階層 / rename: 行（1 始まり。必須）/ format: 範囲の始まりの行" },
+                    "column": { "type": "integer", "minimum": 0, "description": "定義ジャンプ / 補完 / menu / ホバー / 参照・階層 / rename: 桁（0 始まりの行内 UTF-8 バイト。文字の途中は拒否。必須）/ format: 範囲の始まりの桁" },
                     "end_line": { "type": "integer", "minimum": 1, "description": "format: 範囲の終わりの行（4 つそろえて範囲の整形）" },
                     "end_column": { "type": "integer", "minimum": 0, "description": "format: 範囲の終わりの桁" },
                     "enabled": { "type": "boolean", "description": "format-on-save: 保存時整形の ON / OFF（省略で今の値）" },
@@ -1140,6 +1142,8 @@ pub fn tools() -> Vec<Value> {
                     "resolve": { "type": "boolean", "description": "補完: 返す候補の説明を補う" },
                     "show": { "type": "boolean", "description": "ホバー: GUI のその位置にカードも出す / 参照・階層: 右パネルにも出す（既定 false）" },
                     "focus": { "type": "boolean", "description": "定義ジャンプ / open-result: 着地したペインへフォーカスを移す（既定 false）" },
+                    "new_name": { "type": "string", "description": "rename: 新しい名前" },
+                    "confirm": { "type": "boolean", "description": "rename: 当てる（既定 false = 書き換えない）" },
                 },
                 "additionalProperties": false,
             },

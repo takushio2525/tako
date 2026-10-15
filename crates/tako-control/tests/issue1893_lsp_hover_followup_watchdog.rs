@@ -433,13 +433,13 @@ fn 逆戻りを名指しできる() {
         ),
         "pub(crate) fn on_preview_body_right_click(",
     );
-    // I. 項目からホバーを外す（NOT_IN_MENU へ戻す形）
+    // I. 項目からホバーを外す（NOT_IN_MENU へ戻す形）。ホバーの次は名前の変更（#1686）
     assert_named(
         "I 項目から外す",
         CORE_MENU,
         (
-            "        MenuItem::Hover,\n        MenuItem::Format,",
-            "        MenuItem::Format,",
+            "        MenuItem::Hover,\n        MenuItem::Rename,",
+            "        MenuItem::Rename,",
         ),
         "    pub const ALL: [MenuItem;",
     );

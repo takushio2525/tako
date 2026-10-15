@@ -844,10 +844,15 @@ impl LspMenuAnswer {
             .items()
             .into_iter()
             .filter_map(|item| {
+                let mut args = menu::item_args(item, &target)?;
+                // #1686: 名前の変更は今の名前を入れて返す（書き換えて渡す。GUI の欄も今の名前で開く）
+                if item == tako_core::lsp::menu::MenuItem::Rename {
+                    args["new_name"] = json!(ctx.symbol_text);
+                }
                 Some(json!({
                     "id": item.id(),
                     "action": menu::action_of(item),
-                    "args": menu::item_args(item, &target)?,
+                    "args": args,
                 }))
             })
             .collect();
@@ -1656,6 +1661,289 @@ fn preview_save(
         out["remote"] = remote;
     }
     Ok(out)
+}
+
+// --- 名前の変更（#1686）-------------------------------------------------------
+
+/// 名前の変更（FR-3.45 / #1686）の問い合わせ。UI スレッドで [`lsp_rename_prepare`] が作り、
+/// [`LspRenameJob::run`] を背景で走らせ、答えを載せた [`LspRenameLanding`] を UI スレッドの
+/// [`lsp_rename_land`] へ戻す（GUI の右クリックメニューの「名前の変更…」・CLI・MCP が同じ 3 段を通る）
+pub struct LspRenameJob {
+    manager: crate::lsp::LspManager,
+    /// `None` は問い合わせるまでもなく答えが決まっている（受け持つサーバが無い = `landing.answer`）
+    request: Option<crate::lsp::RenameRequest>,
+    landing: LspRenameLanding,
+}
+
+impl LspRenameJob {
+    /// 言語サーバへ問い合わせる（**UI スレッドで呼ばない**。上限は `RenameRequest::timeout`）
+    pub fn run(self) -> LspRenameLanding {
+        let mut landing = self.landing;
+        if let Some(request) = &self.request {
+            landing.answer = Some(self.manager.rename(request));
+        }
+        landing
+    }
+}
+
+/// 当てるのに要るもの（頼んだペイン・位置・版）と、背景で得た答え（#1686）
+#[derive(Debug, Clone)]
+pub struct LspRenameLanding {
+    pub pane: PaneId,
+    pub path: String,
+    /// 頼んだ位置（行 1 始まり・桁 0 始まりの行内 UTF-8 バイト）
+    pub line: usize,
+    pub column: usize,
+    pub new_name: String,
+    /// 当てる（`--yes` / `confirm=true`）か。偽なら dry-run（何も書き換えない）
+    pub confirm: bool,
+    /// 当てるときの編集バッファの版（**答えはこの版にだけ当てる**。dry-run は `None`）
+    pub version: Option<u64>,
+    /// 背景で得た答え（[`LspRenameJob::run`] が入れる）
+    pub answer: Option<Result<crate::lsp::RenameAnswer, crate::lsp::RenameError>>,
+}
+
+/// 名前の変更の準備（UI スレッド。#1686）。位置と新しい名前を検査する（空・制御文字は
+/// サーバに問う前に断る。識別子として正しいかは言語ごとに違うのでサーバに任せる）。
+///
+/// dry-run は**編集モードを変えない**（編集中ならその全文、そうでなければディスクの中身で問う）。
+/// 当てるときは整形と同じ口で編集モードへ入り（言語サーバもそこで起きる = FR-3.28）、頼む本文と版を採る。
+/// **1 プロセスも待たない**（起動と問い合わせは background の [`LspRenameJob::run`]）
+#[allow(clippy::too_many_arguments)]
+pub fn lsp_rename_prepare(
+    host: &mut dyn ControlHost,
+    pane: Option<u64>,
+    line: usize,
+    column: usize,
+    new_name: &str,
+    confirm: bool,
+    timeout: std::time::Duration,
+) -> Result<LspRenameJob, DispatchError> {
+    use tako_core::lsp::rename::{check_new_name, NameError};
+    if line == 0 {
+        return Err(DispatchError::InvalidParams(
+            tako_core::open_plan::LINE_ONE_BASED.into(),
+        ));
+    }
+    if let Err(error) = check_new_name(new_name) {
+        return Err(DispatchError::InvalidParams(
+            match error {
+                NameError::Empty => crate::lsp::text::RENAME_EMPTY_NAME,
+                NameError::Control => crate::lsp::text::RENAME_CONTROL_NAME,
+            }
+            .text()
+            .to_string(),
+        ));
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let Some((path, _)) = host.preview_state(target) else {
+        return Err(DispatchError::InvalidParams(format!(
+            "プレビューペインではない: {}",
+            target.as_u64()
+        )));
+    };
+    let Some(manager) = host.lsp().cloned() else {
+        return Err(DispatchError::Operation(
+            crate::lsp::text::UNAVAILABLE.text().to_string(),
+        ));
+    };
+    let mut landing = LspRenameLanding {
+        pane: target,
+        path: path.clone(),
+        line,
+        column,
+        new_name: new_name.to_string(),
+        confirm,
+        version: None,
+        answer: None,
+    };
+    if tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, Path::new(&path))
+        .is_none()
+    {
+        landing.answer = Some(Err(crate::lsp::RenameError::Lsp(
+            crate::lsp::GotoError::NoServer,
+        )));
+        return Ok(LspRenameJob {
+            manager,
+            request: None,
+            landing,
+        });
+    }
+    // 位置の検査（定義ジャンプと同じ。桁は丸めずに拒否）
+    let source = host
+        .preview_goto_source(target, line - 1)
+        .map_err(DispatchError::InvalidParams)?;
+    check_line_column(&source.line_text, line, column)?;
+    let document = if confirm {
+        let source = host
+            .preview_format_source(target, None)
+            .map_err(DispatchError::InvalidParams)?;
+        landing.version = Some(source.version);
+        Some(source.text)
+    } else {
+        source.document
+    };
+    Ok(LspRenameJob {
+        manager,
+        request: Some(crate::lsp::RenameRequest {
+            path: PathBuf::from(&path),
+            line: line - 1,
+            column,
+            new_name: new_name.to_string(),
+            document,
+            timeout,
+        }),
+        landing,
+    })
+}
+
+/// 名前の変更の答えを返す / 当てる（UI スレッド。#1686）。当てる口は
+/// `PreviewHost::apply_preview_changes`（= `TextBuffer::apply_changes` の 1 実装。undo 1 回で戻る）だけ。
+///
+/// `status`: `dry-run`（書き換えていない。`applicable` で当てられるかを言う）/ `renamed`（当てた）/
+/// `not-applied`（段階 1 の制限で当てなかった。`blocked` = `other-files` / `resource-ops`）/
+/// `unchanged`（書き換える所が無い）/ `stale` / `source-gone` / 失敗（`rejected` / `refused` /
+/// `unsupported` / `timeout` / `not-installed` …）。どれも `reason` / `next_step` か `note` を持つ
+pub fn lsp_rename_land(
+    host: &mut dyn ControlHost,
+    landing: &LspRenameLanding,
+) -> Result<Value, DispatchError> {
+    let mut out = match &landing.answer {
+        None => {
+            return Err(DispatchError::Operation(
+                "名前の変更の答えがまだ無い（背景の問い合わせを経ずに当てようとした）".into(),
+            ))
+        }
+        Some(Err(error)) => {
+            let mut out = error.to_json();
+            out["applied"] = json!(false);
+            out
+        }
+        Some(Ok(answer)) => lsp_rename_reply(host, landing, answer),
+    };
+    out["path"] = json!(landing.path);
+    out["line"] = json!(landing.line);
+    out["column"] = json!(landing.column);
+    out["new_name"] = json!(landing.new_name);
+    out["confirm"] = json!(landing.confirm);
+    Ok(out)
+}
+
+/// 答えの節（[`lsp_rename_land`]）。段階 1 の判定は `tako_core::lsp::rename::blocker` の 1 実装
+fn lsp_rename_reply(
+    host: &mut dyn ControlHost,
+    landing: &LspRenameLanding,
+    answer: &crate::lsp::RenameAnswer,
+) -> Value {
+    use crate::lsp::text;
+    let pane = landing.pane;
+    // そのファイルを開いている**別の**ペイン（段階 2 の判断材料。名前が同じものだけ正規化して比べる）
+    let previews: Vec<(PaneId, PathBuf)> = host
+        .workspace()
+        .all_panes()
+        .into_iter()
+        .map(|p| p.id())
+        .filter(|id| *id != pane)
+        .filter_map(|id| host.preview_state(id).map(|(p, _)| (id, PathBuf::from(p))))
+        .collect();
+    let open_in = |path: &Path| -> Vec<u64> {
+        previews
+            .iter()
+            .filter(|(_, p)| p.file_name() == path.file_name() && same_file(p, path))
+            .map(|(id, _)| id.as_u64())
+            .collect()
+    };
+    let mut out = answer.to_json(open_in);
+    out["applied"] = json!(false);
+    let (files, edits) = (answer.file_count(), answer.edit_count());
+    // 書き換える所が無い（空の答え）・当てても本文が変わらない（同じ名前 = 中身の同じ置き換えだけ）
+    let noop = answer.blocker.is_none() && answer.source_changes.is_empty();
+    if edits == 0 || noop {
+        out["status"] = json!("unchanged");
+        out["note"] = json!(text::RENAME_UNCHANGED_NOTE.text());
+        return out;
+    }
+    out["note"] = json!(text::fill(
+        text::RENAME_DRY_RUN_NOTE,
+        &[("files", &files.to_string()), ("edits", &edits.to_string())]
+    ));
+    if let Some(reason) = answer.blocker_reason() {
+        // 段階 1 の制限: dry-run でも先に「当てられない」と言う（`--yes` を付けても変わらない）
+        out["status"] = json!(if landing.confirm {
+            "not-applied"
+        } else {
+            "dry-run"
+        });
+        out["applicable"] = json!(false);
+        out["blocked"] = json!(match answer.blocker {
+            Some(tako_core::lsp::rename::Blocker::ResourceOps { .. }) => "resource-ops",
+            _ => "other-files",
+        });
+        out["reason"] = json!(reason);
+        out["next_step"] = json!(text::RENAME_LIMITED_NEXT_STEP.text());
+        return out;
+    }
+    out["applicable"] = json!(true);
+    if !landing.confirm {
+        out["status"] = json!("dry-run");
+        out["next_step"] = json!(text::RENAME_DRY_RUN_NEXT_STEP.text());
+        return out;
+    }
+    let still_there = host
+        .preview_state(pane)
+        .is_some_and(|(path, _)| path == landing.path);
+    if !still_there {
+        out["status"] = json!("source-gone");
+        out["reason"] = json!(text::GOTO_SOURCE_GONE_REASON.text());
+        out["next_step"] = json!(text::GOTO_RETRY_NEXT_STEP.text());
+        return out;
+    }
+    let current = host
+        .preview_document(pane)
+        .and_then(|document| document["version"].as_u64());
+    let Some(version) = landing.version.filter(|v| current == Some(*v)) else {
+        let stale = crate::lsp::RenameError::Stale.to_json();
+        for key in ["status", "reason", "next_step"] {
+            out[key] = stale[key].clone();
+        }
+        return out;
+    };
+    match host.apply_preview_changes(pane, answer.source_changes.clone(), version) {
+        // 同じ名前など、当てても本文が変わらない（`order_changes` が中身の同じ置き換えを落とす）
+        Ok(applied) if applied.changes == 0 => {
+            out["status"] = json!("unchanged");
+            out["note"] = json!(text::RENAME_UNCHANGED_NOTE.text());
+            out
+        }
+        Ok(applied) => {
+            // 編集系の応答（版・カーソル・undo 履歴）は 1 実装から組む（#1658）
+            let mut reply = preview_edit_reply(host, pane);
+            if let (Some(reply), Some(out)) = (reply.as_object_mut(), out.as_object()) {
+                for (key, value) in out {
+                    reply.insert(key.clone(), value.clone());
+                }
+            }
+            reply["status"] = json!("renamed");
+            reply["applied"] = json!(true);
+            reply["changes"] = json!(applied.changes);
+            reply["note"] = json!(text::fill(
+                text::RENAME_DONE_NOTE,
+                &[("edits", &edits.to_string())]
+            ));
+            reply
+        }
+        Err(detail) => {
+            let invalid = crate::lsp::RenameError::InvalidEdits {
+                server: answer.server,
+                detail,
+            }
+            .to_json();
+            for key in ["status", "reason", "next_step"] {
+                out[key] = invalid[key].clone();
+            }
+            out
+        }
+    }
 }
 
 // --- 補完（#1682）-------------------------------------------------------------
@@ -2683,6 +2971,9 @@ pub enum OffloadJob {
     LspXref(Box<LspXrefJob>),
     /// ツリーの 1 段の展開（#1685。子を読んでいないノードだけ）。子を足すのは UI スレッドの続き
     LspXrefExpand(Box<LspExpandJob>),
+    /// 名前の変更の問い合わせ（#1686）。答えを当てる（編集バッファを書き換える）のは UI スレッドで
+    /// しかできないので [`OffloadOutcome::OnUi`] で戻す（dry-run も版・開いているペインを UI で読む）
+    LspRename(Box<LspRenameJob>),
     /// Code Runner の実行プロファイルと実行環境の一覧（#1730）。実行環境の Tier P
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
@@ -2836,6 +3127,8 @@ pub enum OffloadContinuation {
     LspXref(Box<LspXrefLanding>),
     /// ツリーの展開の着地（[`lsp_expand_land`]。#1685）
     LspXrefExpand(Box<LspExpandLanding>),
+    /// 名前の変更の答えを返す / 当てる（[`lsp_rename_land`]。#1686）
+    LspRename(Box<LspRenameLanding>),
     /// `tako list` の応答（#1979）。background で採った器の window 一覧を反映してから組む。
     /// `None` = 採取できなかった（tmux 不在・サーバー未起動・上限で打ち切り）
     List(Option<std::collections::HashMap<String, Vec<tako_core::TmuxWindow>>>),
@@ -2880,6 +3173,7 @@ pub fn finish_offload(
     match continuation {
         OffloadContinuation::LspGoto(landing) => lsp_goto_land(host, origin, &landing),
         OffloadContinuation::LspFormat(landing) => lsp_format_land(host, &landing),
+        OffloadContinuation::LspRename(landing) => lsp_rename_land(host, &landing),
         OffloadContinuation::FileCopied(landing) => {
             let FileCopyLanding { job, outcomes } = *landing;
             match &job.reply {
@@ -3156,6 +3450,26 @@ pub fn prepare_offload(
             )
             .map(|job| OffloadJob::LspFormat(Box::new(job))),
         ),
+        // #1686: 準備（位置と名前の検査・当てるなら編集モードへ入って本文と版を採る）は UI スレッド、
+        // 問い合わせ（prepareRename → rename）は background、返す / 当てるのは UI スレッドの続き
+        Request::LspRename {
+            pane,
+            line,
+            column,
+            new_name,
+            confirm,
+        } => Some(
+            lsp_rename_prepare(
+                host,
+                *pane,
+                *line,
+                *column,
+                new_name,
+                *confirm,
+                crate::lsp::rename::rename_timeout(),
+            )
+            .map(|job| OffloadJob::LspRename(Box::new(job))),
+        ),
         // #1683: 保存時整形が ON のときだけ整形を挟む（OFF なら `None` = 従来どおり同期で保存）
         // 腕の字面は dispatch_inner の `{ pane, force }` と分ける（#1659 の番犬が字面で探す）
         Request::PreviewSave { force, pane } => lsp_format_on_save_prepare(host, *pane, *force)
@@ -3355,6 +3669,9 @@ impl OffloadJob {
             OffloadJob::LspFormat(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspFormat(Box::new(job.run())))
             }
+            OffloadJob::LspRename(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::LspRename(Box::new(job.run())))
+            }
             OffloadJob::FileCopy(job) => {
                 let outcomes = run_copy_items(&job.items, job.naming, job.ticket.progress());
                 OffloadOutcome::OnUi(OffloadContinuation::FileCopied(Box::new(FileCopyLanding {
@@ -3513,6 +3830,9 @@ impl OffloadJob {
             )),
             OffloadJob::LspFormat(_) => Err(DispatchError::Operation(
                 "整形は run_staged で走らせる（当てるのに UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::LspRename(_) => Err(DispatchError::Operation(
+                "名前の変更は run_staged で走らせる（当てるのに UI スレッドの続きが要る）".into(),
             )),
             OffloadJob::FileCopy(_) => Err(DispatchError::Operation(
                 "コピーは run_staged で走らせる（ツリーの読み直しに UI スレッドの続きが要る）"
@@ -7215,6 +7535,27 @@ fn dispatch_inner(
                 false,
             )?;
             lsp_format_land(host, &job.run())
+        }
+
+        // #1686: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
+        // `TAKO_OFFLOAD=0` か直呼び（テスト）で、同じ 3 段（準備 → 問い合わせ → 返す / 当てる）を直列に通る
+        Request::LspRename {
+            pane,
+            line,
+            column,
+            new_name,
+            confirm,
+        } => {
+            let job = lsp_rename_prepare(
+                host,
+                pane,
+                line,
+                column,
+                &new_name,
+                confirm,
+                crate::lsp::rename::rename_timeout(),
+            )?;
+            lsp_rename_land(host, &job.run())
         }
 
         // #1684: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
@@ -17135,8 +17476,8 @@ pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs", 
 /// MCP `tako_lsp`（言語機能）の action。CLI は `tako lsp <action>`。
 /// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）と
 /// 整形・保存時整形の設定（#1683。綴りは [`LSP_FORMAT_ACTION`] / [`LSP_FORMAT_ON_SAVE_ACTION`]）と
-/// 補完（#1682。[`LSP_COMPLETION_ACTION`]）とホバー（#1681。[`LSP_HOVER_ACTION`]）。
-/// 先頭が MCP の既定。言語機能のスライスはここへ足す（ツールは増やさない）
+/// 補完（#1682。[`LSP_COMPLETION_ACTION`]）とホバー（#1681。[`LSP_HOVER_ACTION`]）と
+/// 名前の変更（#1686。[`LSP_RENAME_ACTION`]）。先頭が MCP の既定。言語機能のスライスはここへ足す（ツールは増やさない）
 pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     "diagnostics",
     tako_core::lsp::goto::GotoKind::NAMES[0],
@@ -17158,7 +17499,11 @@ pub const LSP_FEATURE_ACTIONS: &[&str] = &[
     LSP_COLLAPSE_ACTION,
     LSP_OPEN_RESULT_ACTION,
     LSP_CLEAR_RESULTS_ACTION,
+    LSP_RENAME_ACTION,
 ];
+
+/// 名前の変更の action（#1686。CLI は `tako lsp rename`）
+pub const LSP_RENAME_ACTION: &str = "rename";
 
 /// 整形の action（#1683。CLI は `tako lsp format`）
 pub const LSP_FORMAT_ACTION: &str = "format";
@@ -45938,6 +46283,270 @@ mod tests {
         assert!(moved.contains("\"dest\":\"/w/d\""), "{moved}");
         assert!(moved.contains("\"move\""), "{moved}");
     }
+    // --- 名前の変更（#1686。器は下の #1683 の `format_fixture` を使う）-------------
+
+    const RENAME_1686: &str = "fn main() {\n    let value = 1;\n    drop(value);\n}\n";
+    const RENAMED_1686: &str = "fn main() {\n    let item = 1;\n    drop(item);\n}\n";
+
+    /// 偽の答え（`LspRenameJob::run` の出力の形）。`others` は頼んだファイル以外の箇所の数
+    fn rename_answer(path: &Path, others: usize) -> crate::lsp::RenameAnswer {
+        let spot = |line, column| tako_core::lsp::rename::Spot {
+            line,
+            column,
+            old: "value".into(),
+            new: "item".into(),
+        };
+        let mut files = vec![crate::lsp::rename::RenameFile {
+            uri: tako_core::file_uri::from_path(path),
+            path: Some(path.to_path_buf()),
+            source: true,
+            edits: 2,
+            spots: vec![spot(1, 8), spot(2, 9)],
+        }];
+        if others > 0 {
+            let other = path.with_file_name("lib.rs");
+            files.push(crate::lsp::rename::RenameFile {
+                uri: tako_core::file_uri::from_path(&other),
+                path: Some(other),
+                source: false,
+                edits: others,
+                spots: (0..others).map(|i| spot(i, 0)).collect(),
+            });
+        }
+        crate::lsp::RenameAnswer {
+            server: "fake",
+            placeholder: Some("value".into()),
+            files,
+            resource_ops: Vec::new(),
+            source_changes: vec![change(20..25, "item"), change(40..45, "item")],
+            blocker: (others > 0).then_some(tako_core::lsp::rename::Blocker::OtherFiles {
+                files: 1,
+                edits: others,
+            }),
+        }
+    }
+
+    /// 背景の問い合わせを経た答えを組む（当てるときは整形と同じ口で編集モードへ入って版を採る）
+    fn rename_landing(
+        host: &mut MockHost,
+        pane: u64,
+        answer: Result<crate::lsp::RenameAnswer, crate::lsp::RenameError>,
+        confirm: bool,
+    ) -> LspRenameLanding {
+        let (path, _) = host.preview_state(PaneId::from_raw(pane)).unwrap();
+        let version = confirm.then(|| {
+            host.preview_format_source(PaneId::from_raw(pane), None)
+                .unwrap()
+                .version
+        });
+        LspRenameLanding {
+            pane: PaneId::from_raw(pane),
+            path,
+            line: 2,
+            column: 8,
+            new_name: "item".into(),
+            confirm,
+            version,
+            answer: Some(answer),
+        }
+    }
+
+    /// 受け入れ条件: `--yes` を付けない（dry-run）の後、対象ファイルはバイト一致（1 バイトも書き換えない）。
+    /// 編集モードにも入らない。応答は「N ファイル・M 箇所」と場所と、当てられるか
+    #[test]
+    fn 名前の変更の_dry_run_は何も書き換えない() {
+        let (mut host, pane, dir) = format_fixture("rename-dry", "main.rs", RENAME_1686);
+        let path = dir.join("main.rs");
+        let landing = rename_landing(&mut host, pane, Ok(rename_answer(&path, 0)), false);
+        let out = lsp_rename_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("dry-run"), "{out}");
+        assert_eq!(out["applied"], json!(false));
+        assert_eq!(out["applicable"], json!(true));
+        assert_eq!(out["file_count"], json!(1));
+        assert_eq!(out["edits"], json!(2));
+        assert_eq!(
+            out["files"][0]["places"][0],
+            json!({"line": 2, "column": 8, "old": "value", "new": "item"})
+        );
+        assert_eq!(
+            out["note"],
+            json!(crate::lsp::text::fill(
+                crate::lsp::text::RENAME_DRY_RUN_NOTE,
+                &[("files", "1"), ("edits", "2")]
+            ))
+        );
+        assert_eq!(
+            out["next_step"],
+            json!(crate::lsp::text::RENAME_DRY_RUN_NEXT_STEP.text())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), RENAME_1686.as_bytes());
+        assert!(
+            !host.preview_edits.contains_key(&pane),
+            "dry-run で編集モードへ入った"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 受け入れ条件: 開いているバッファ内のリネームは頼んだ版へ 1 回で当たり、undo 1 回で戻る（保存はしない）
+    #[test]
+    fn 名前の変更は頼んだ版へ当たりundo1回で戻る() {
+        let (mut host, pane, dir) = format_fixture("rename-apply", "main.rs", RENAME_1686);
+        let path = dir.join("main.rs");
+        let landing = rename_landing(&mut host, pane, Ok(rename_answer(&path, 0)), true);
+        let out = lsp_rename_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("renamed"), "{out}");
+        assert_eq!(out["applied"], json!(true));
+        assert_eq!(out["changes"], json!(2));
+        assert_eq!(out["document"]["undo_depth"], json!(1));
+        assert_eq!(buffer_text(&host, pane), RENAMED_1686);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            RENAME_1686.as_bytes(),
+            "保存はしない"
+        );
+        dispatch(
+            &mut host,
+            Request::PreviewUndo { pane: Some(pane) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(buffer_text(&host, pane).as_bytes(), RENAME_1686.as_bytes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 受け入れ条件: 別のファイルを含む答えは `--yes`（confirm）でも当てず、段階 1 の理由（`text` の日英）と
+    /// 件数を返す。dry-run でも同じ理由を先に出す（当てられないと分かる）
+    #[test]
+    fn 別のファイルに及ぶ名前の変更は_confirm_でも当てない() {
+        let (mut host, pane, dir) = format_fixture("rename-others", "main.rs", RENAME_1686);
+        let path = dir.join("main.rs");
+        for confirm in [false, true] {
+            let landing = rename_landing(&mut host, pane, Ok(rename_answer(&path, 3)), confirm);
+            let before = host
+                .preview_edits
+                .get(&pane)
+                .map(|edit| edit.2.text().to_string());
+            let out = lsp_rename_land(&mut host, &landing).unwrap();
+            let status = if confirm { "not-applied" } else { "dry-run" };
+            assert_eq!(out["status"], json!(status), "{out}");
+            assert_eq!(out["applied"], json!(false));
+            assert_eq!(out["applicable"], json!(false));
+            assert_eq!(out["blocked"], json!("other-files"));
+            assert_eq!(
+                (out["file_count"].clone(), out["edits"].clone()),
+                (json!(2), json!(5))
+            );
+            assert_eq!(
+                out["reason"],
+                json!(crate::lsp::text::fill(
+                    crate::lsp::text::RENAME_OTHER_FILES_REASON,
+                    &[("files", "1"), ("edits", "3")]
+                ))
+            );
+            assert_eq!(
+                out["next_step"],
+                json!(crate::lsp::text::RENAME_LIMITED_NEXT_STEP.text())
+            );
+            assert_eq!(
+                host.preview_edits
+                    .get(&pane)
+                    .map(|edit| edit.2.text().to_string()),
+                before.or_else(|| confirm.then(|| RENAME_1686.to_string())),
+                "{status}: バッファを書き換えた"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), RENAME_1686.as_bytes());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同じ名前（サーバは中身の同じ置き換えを返す）は dry-run でも --yes でも `unchanged`（版も進めない）
+    #[test]
+    fn 同じ名前への変更は_unchanged_で何も当てない() {
+        let (mut host, pane, dir) = format_fixture("rename-same", "main.rs", RENAME_1686);
+        let path = dir.join("main.rs");
+        for confirm in [false, true] {
+            let mut answer = rename_answer(&path, 0);
+            answer.source_changes.clear();
+            let landing = rename_landing(&mut host, pane, Ok(answer), confirm);
+            let out = lsp_rename_land(&mut host, &landing).unwrap();
+            assert_eq!(out["status"], json!("unchanged"), "{out}");
+            assert_eq!(out["applied"], json!(false));
+            assert_eq!(
+                out["note"],
+                json!(crate::lsp::text::RENAME_UNCHANGED_NOTE.text())
+            );
+        }
+        assert_eq!(buffer_text(&host, pane), RENAME_1686);
+        assert_eq!(
+            host.preview_document(PaneId::from_raw(pane)).unwrap()["undo_depth"],
+            json!(0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 待つあいだに版が進んだら当てない / 失敗は status と理由で返す / 新しい名前の空と制御文字は
+    /// サーバに問う前に断る（言語に依らない最低限）
+    #[test]
+    fn 名前の変更の版の食い違いと失敗と名前の検査() {
+        let (mut host, pane, dir) = format_fixture("rename-stale", "main.rs", RENAME_1686);
+        let path = dir.join("main.rs");
+        let landing = rename_landing(&mut host, pane, Ok(rename_answer(&path, 0)), true);
+        dispatch(
+            &mut host,
+            Request::PreviewEditRange {
+                pane: Some(pane),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 0,
+                text: "// typed\n".into(),
+                expected_version: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let typed = buffer_text(&host, pane);
+        let out = lsp_rename_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("stale"), "{out}");
+        assert_eq!(buffer_text(&host, pane), typed);
+
+        let refused = crate::lsp::RenameError::Refused {
+            server: "fake",
+            detail: "Invalid name `1abc`: not an identifier".into(),
+        };
+        let landing = rename_landing(&mut host, pane, Err(refused), true);
+        let out = lsp_rename_land(&mut host, &landing).unwrap();
+        assert_eq!(out["status"], json!("refused"), "{out}");
+        assert_eq!(out["applied"], json!(false));
+        assert!(out["reason"].as_str().unwrap().contains("Invalid name"));
+        assert_eq!(buffer_text(&host, pane), typed);
+
+        for (name, note) in [
+            ("", crate::lsp::text::RENAME_EMPTY_NAME),
+            ("   ", crate::lsp::text::RENAME_EMPTY_NAME),
+            ("a\nb", crate::lsp::text::RENAME_CONTROL_NAME),
+        ] {
+            let error = dispatch(
+                &mut host,
+                Request::LspRename {
+                    pane: Some(pane),
+                    line: 2,
+                    column: 8,
+                    new_name: name.into(),
+                    confirm: true,
+                },
+                PaneOrigin::Cli,
+            )
+            .expect_err("名前を断る");
+            assert_eq!(
+                error.to_string(),
+                DispatchError::InvalidParams(note.text().into()).to_string(),
+                "{name:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- #1683: 整形 -----------------------------------------------------------------
 
     /// 整形を試すプレビュー（実ファイルを開く `TextBuffer`）と、置き場
