@@ -20,6 +20,7 @@ mod production_range;
 
 use production_range::code_view::without_comments_checked;
 use std::path::{Path, PathBuf};
+use tako_core::source_scan::fn_head_name;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -56,10 +57,13 @@ fn production(src: &str, rel: &str) -> String {
     without_comments_checked(&production_range::scan(src).text, rel)
 }
 
-/// `line`（0 起点）を囲む関数の名前と、その関数に付いた属性の行（上へ辿って最初の `fn` の行から）
+/// `line`（0 起点）を囲む関数の名前と、その関数に付いた属性の行（上へ辿って最初の関数の頭から。
+/// 頭の判定は `tako_core::source_scan::fn_head_name` の 1 実装 = `pub(crate) fn` / `async fn` も頭。#1496）
 fn enclosing_fn(lines: &[&str], line: usize) -> Option<(String, Vec<String>)> {
-    let at = (0..=line).rev().find(|&i| fn_name(lines[i]).is_some())?;
-    let name = fn_name(lines[at])?;
+    let at = (0..=line)
+        .rev()
+        .find(|&i| fn_head_name(lines[i]).is_some())?;
+    let name = fn_head_name(lines[at])?.to_string();
     let mut attrs = Vec::new();
     for prev in lines[..at].iter().rev() {
         let t = prev.trim();
@@ -74,22 +78,6 @@ fn enclosing_fn(lines: &[&str], line: usize) -> Option<(String, Vec<String>)> {
         break;
     }
     Some((name, attrs))
-}
-
-fn fn_name(line: &str) -> Option<String> {
-    let t = line.trim_start();
-    let t = t
-        .strip_prefix("pub(crate) ")
-        .or_else(|| t.strip_prefix("pub(super) "))
-        .or_else(|| t.strip_prefix("pub "))
-        .unwrap_or(t);
-    let t = t.strip_prefix("async ").unwrap_or(t);
-    let rest = t.strip_prefix("fn ")?;
-    let name: String = rest
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    (!name.is_empty()).then_some(name)
 }
 
 /// 1 ファイルの違反（`rel:line 綴り`）と、寄せた先に当たった数
