@@ -163,6 +163,11 @@ pub(crate) struct ChatPaneState {
     pub transcript: Option<std::path::PathBuf>,
     /// 最後に読んだ transcript の (mtime, サイズ)。変化したときだけ読み直す（§3.1）
     pub stamp: Option<(std::time::SystemTime, u64)>,
+    /// 最後に読んだときの mod の報告の `chat_seq`（#1964 のフォールバック側 = #1883 の置き換え）。
+    /// mod が居るペインはこれが変わったときだけ transcript を読み直す（`claude_mod::chat_reread`）
+    pub chat_seq: Option<u64>,
+    /// `chat_seq` が変わって読み直した後、書き込みの遅れを拾うために mtime を見る残りの回数（#1964）
+    pub stamp_checks: u8,
     pub messages: Vec<ChatMessage>,
     pub model: Option<String>,
     pub ctx_percent: Option<f64>,
@@ -3832,6 +3837,12 @@ pub(crate) struct ChatRefreshTarget {
     prev_session: Option<String>,
     prev_path: Option<std::path::PathBuf>,
     prev_stamp: Option<(std::time::SystemTime, u64)>,
+    /// 読み直すかの合図（#1964。mod の報告の `chat_seq` が変わったか。mod が居なければ mtime の判断）
+    reread: tako_core::claude_mod::ChatReread,
+    prev_stamp_checks: u8,
+    /// mod の報告の設定 dir（`CLAUDE_CONFIG_DIR`。#1964）。accounts.yaml に無い dir の claude でも
+    /// transcript をここから先に探す = 未登録の設定 dir でもチャット表示になる
+    mod_config_dir: Option<std::path::PathBuf>,
 }
 
 impl ChatRefreshTarget {
@@ -3852,6 +3863,9 @@ pub(crate) struct ChatRefreshData {
     session_id: String,
     transcript: Option<std::path::PathBuf>,
     stamp: Option<(std::time::SystemTime, u64)>,
+    /// #1964: 今回控える `chat_seq` と、mtime を見る残りの回数
+    chat_seq: Option<u64>,
+    stamp_checks: u8,
     /// None = transcript に変化が無いので前回のメッセージを使い回す
     messages: Option<Vec<ChatMessage>>,
     model: Option<String>,
@@ -3889,6 +3903,8 @@ impl TakoApp {
         // #1880: tako mod の報告の引き当て（鮮度の基準時刻はこの収集で 1 つ）
         let mod_now = std::time::Instant::now();
         let mod_legacy = tako_core::claude_mod::s2_legacy();
+        // #1964: A/B（`TAKO_1964_LEGACY`）は通知での読み直しと設定 dir の手がかりを使わない = #1964 前
+        let chat_legacy = tako_core::claude_mod::chat_legacy();
         self.terminals
             .iter()
             // #853: セルフテストが注入した fixture のペインは読みに行かない。
@@ -3950,6 +3966,24 @@ impl TakoApp {
                         }
                         tako_core::claude_mod::MonitorPlan::Scan { .. } => None,
                     };
+                // #1964: 会話の行が足されたかは mod の報告（chat_seq）で知る = transcript をポーリングしない
+                let reread = tako_core::claude_mod::chat_reread(
+                    &looked_up,
+                    mod_now,
+                    previous.and_then(|p| p.chat_seq),
+                    chat_legacy,
+                );
+                let mod_config_dir = match (&looked_up, chat_legacy) {
+                    (Ok(stored), false) => stored
+                        .report
+                        .config_dir
+                        .as_deref()
+                        .filter(|d| !d.trim().is_empty())
+                        .map(|d| {
+                            std::path::PathBuf::from(tako_control::orchestrator::expand_tilde(d))
+                        }),
+                    _ => None,
+                };
                 Some(ChatRefreshTarget {
                     pane: *pane,
                     key,
@@ -3969,9 +4003,37 @@ impl TakoApp {
                     prev_session: previous.map(|p| p.session_id.clone()),
                     prev_path: previous.and_then(|p| p.transcript.clone()),
                     prev_stamp: previous.and_then(|p| p.stamp),
+                    reread,
+                    prev_stamp_checks: previous.map_or(0, |p| p.stamp_checks),
+                    mod_config_dir,
                 })
             })
             .collect()
+    }
+
+    /// GUI モードでチャットを mod が持つペインの集合が変わったか（#1964。2 秒 tick から呼ぶ）。
+    ///
+    /// 持ち主の判断（`claude_mod::chat_owner`）はペインの表示を決めるたびに引くが、時間で変わるもの
+    /// （45 秒の失効・claude の終了 = 最後の報告で即座に消える・置き場の写し）は描画が起きないと反映
+    /// されない。集合の指紋を取り、変わったときだけ描き直す = 1 tick 以内に GPUI のチャットへ戻る
+    pub(crate) fn refresh_mod_chat_owners(&mut self) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if self.ui_mode.is_gui() {
+            let now = std::time::Instant::now();
+            let mut panes: Vec<u64> = self.claude_mod.reports.keys().copied().collect();
+            panes.sort_unstable();
+            for pane in panes {
+                if tako_control::claude_mod::chat_owner(self, PaneId::from_raw(pane), now).yields()
+                {
+                    pane.hash(&mut hasher);
+                }
+            }
+        }
+        let sig = hasher.finish();
+        let changed = sig != self.mod_chat_owner_sig;
+        self.mod_chat_owner_sig = sig;
+        changed
     }
 
     /// セルフテストが注入した会話を定期更新から守る（#853。**セルフテスト専用**）。
@@ -4009,6 +4071,8 @@ impl TakoApp {
                 session_id: data.session_id,
                 transcript: data.transcript,
                 stamp: data.stamp,
+                chat_seq: data.chat_seq,
+                stamp_checks: data.stamp_checks,
                 messages,
                 // agents が返せば優先（将来版）→ mod → 画面採取 → transcript（#1021 / #1880）。
                 // 後ろ 3 段は他の 3 経路と同じ `ctx_usage::resolve_full` の 1 実装。
@@ -4163,13 +4227,32 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
             };
             let session_id = session_id.to_string();
             let same_session = target.prev_session.as_deref() == Some(session_id.as_str());
-            // 解決済みパスの使い回し（同じセッションで実在する間だけ）
-            let path = target
-                .prev_path
-                .filter(|p| same_session && p.is_file())
-                .or_else(|| tako_control::transcript::find_transcript(&session_id));
-            let stamp = path.as_deref().and_then(file_stamp);
-            let unchanged = same_session && stamp.is_some() && stamp == target.prev_stamp;
+            let seq = chat_seq_gate(
+                target.reread,
+                same_session && target.prev_path.is_some(),
+                target.prev_stamp_checks,
+            );
+            // 解決済みパスの使い回し（同じセッションで実在する間だけ）。#1964: mod が「会話の行は
+            // 足されていない」と言っている間は stat もしない（`seq.quiet`）
+            let path = match seq.quiet {
+                true => target.prev_path.clone(),
+                false => target
+                    .prev_path
+                    .clone()
+                    .filter(|p| same_session && p.is_file())
+                    .or_else(|| {
+                        tako_control::transcript::find_transcript_hinted(
+                            &session_id,
+                            target.mod_config_dir.as_deref(),
+                        )
+                    }),
+            };
+            let stamp = match seq.quiet {
+                true => target.prev_stamp,
+                false => path.as_deref().and_then(file_stamp),
+            };
+            let unchanged = seq.quiet
+                || (same_session && stamp.is_some() && stamp == target.prev_stamp && !seq.force);
             let (messages, notice) = match (&path, unchanged) {
                 (Some(_), true) => (None, None),
                 (Some(path), false) => {
@@ -4212,6 +4295,8 @@ pub(crate) fn load_chat_refresh(targets: Vec<ChatRefreshTarget>) -> Vec<ChatRefr
                     session_id,
                     transcript: path,
                     stamp,
+                    chat_seq: target.reread.seq(),
+                    stamp_checks: seq.stamp_checks,
                     messages,
                     model: session.and_then(|s| s.model.clone()),
                     ctx_percent: session.and_then(|s| s.ctx_percent),
@@ -4279,6 +4364,51 @@ fn chat_scan_ask(targets: &[ChatRefreshTarget]) -> (Vec<String>, Vec<(u64, u32)>
         }
     }
     (backends, direct)
+}
+
+/// 会話の行が足されたかの合図から、今回の読み方を決める（#1964。純関数）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatSeqGate {
+    /// transcript に触らない（stat もしない）= mod が「足されていない」と言い、猶予も尽きた
+    quiet: bool,
+    /// mtime とサイズが同じでも読み直す（mod が「足された」と言った）
+    force: bool,
+    /// 次回以降に mtime も見る残りの回数（書き込みの遅れを拾う）
+    stamp_checks: u8,
+}
+
+/// `chat_seq` が変わって読み直した後に mtime も見る回数（2 tick = 4 秒。mod は行を足した後の `next` の
+/// 答え = transcript に書いた後で数えるが、書き込みが遅れても取りこぼさない）
+const CHAT_SEQ_STAMP_CHECKS: u8 = 2;
+
+fn chat_seq_gate(
+    reread: tako_core::claude_mod::ChatReread,
+    known: bool,
+    prev_checks: u8,
+) -> ChatSeqGate {
+    use tako_core::claude_mod::ChatReread;
+    match reread {
+        ChatReread::Changed(_) => ChatSeqGate {
+            quiet: false,
+            force: true,
+            stamp_checks: CHAT_SEQ_STAMP_CHECKS,
+        },
+        ChatReread::Same(_) if known && prev_checks == 0 => ChatSeqGate {
+            quiet: true,
+            force: false,
+            stamp_checks: 0,
+        },
+        ChatReread::Same(_) => ChatSeqGate {
+            quiet: false,
+            force: false,
+            stamp_checks: prev_checks.saturating_sub(1),
+        },
+        ChatReread::Stamp => ChatSeqGate {
+            quiet: false,
+            force: false,
+            stamp_checks: 0,
+        },
+    }
 }
 
 /// transcript の (更新時刻, サイズ)。どちらか変われば読み直す
@@ -4744,7 +4874,105 @@ mod tests {
             prev_session: Some(SID_2041.into()),
             prev_path,
             prev_stamp: None,
+            reread: tako_core::claude_mod::ChatReread::Stamp,
+            prev_stamp_checks: 0,
+            mod_config_dir: None,
         }
+    }
+
+    // --- #1964 のフォールバック側（#1883 の置き換え）: mod の通知で読み直す・報告の設定 dir から探す ------
+
+    /// 会話の行が足された（chat_seq が変わった）ときだけ読み、足されていない間は stat もしない。
+    /// 足された直後の 2 tick だけは mtime も見る（書き込みの遅れを拾う）
+    #[test]
+    fn issue1964_chat_seqの合図でtranscriptを読み直す() {
+        use tako_core::claude_mod::ChatReread;
+        let changed = chat_seq_gate(ChatReread::Changed(4), true, 0);
+        assert_eq!(
+            changed,
+            ChatSeqGate {
+                quiet: false,
+                force: true,
+                stamp_checks: CHAT_SEQ_STAMP_CHECKS
+            }
+        );
+        // 足された直後: mtime を見る（減らす）
+        let settle = chat_seq_gate(ChatReread::Same(4), true, 2);
+        assert_eq!(
+            (settle.quiet, settle.force, settle.stamp_checks),
+            (false, false, 1)
+        );
+        // 猶予が尽きた: 触らない
+        let quiet = chat_seq_gate(ChatReread::Same(4), true, 0);
+        assert!(quiet.quiet);
+        // 前回のパスが無い（初めて・セッションが変わった）なら静かにしない
+        assert!(!chat_seq_gate(ChatReread::Same(4), false, 0).quiet);
+        // mod が居ない = 今までどおり mtime
+        assert_eq!(
+            chat_seq_gate(ChatReread::Stamp, true, 0),
+            ChatSeqGate {
+                quiet: false,
+                force: false,
+                stamp_checks: 0
+            }
+        );
+    }
+
+    /// 静かな間は transcript を読まない（ファイルを消しても前回の会話のまま = stat していない）・
+    /// 足されたら mtime が同じでも読む・未登録の設定 dir は報告の手がかりから見つける
+    #[test]
+    fn issue1964_静かな間は読まず足されたら読み未登録の設定dirも探せる() {
+        use tako_core::claude_mod::ChatReread;
+        let dir = tako_core::test_residue::process_scratch("chat-1964");
+        let cfg = dir.join("unregistered-config");
+        let project = cfg.join("projects").join("-work");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join(format!("{SID_2041}.jsonl"));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"role":"user","content":"hello-1964"},"uuid":"u1","timestamp":"2026-10-15T00:00:00Z"}
+"#,
+        )
+        .unwrap();
+        let key = || tako_control::agents::LiveSessionKey::Backend("tako-s1964".into());
+        // 1) 前回のパスが無い + 報告の設定 dir（accounts.yaml に無い）→ 手がかりから見つけて読む
+        let mut first = target_2041(key(), true, Some(mod_live_2041("idle")), None);
+        first.reread = ChatReread::Changed(1);
+        first.mod_config_dir = Some(cfg.clone());
+        let got = load_chat_refresh(vec![first]);
+        let chat = got[0].chat.as_ref().expect("報告の会話でチャットが立つ");
+        assert_eq!(chat.transcript.as_deref(), Some(transcript.as_path()));
+        assert_eq!(chat.chat_seq, Some(1));
+        assert_eq!(chat.stamp_checks, CHAT_SEQ_STAMP_CHECKS);
+        let read = chat.messages.as_ref().expect("足されたので読む");
+        assert!(
+            read.iter().any(|m| m.text.contains("hello-1964")),
+            "{read:?}"
+        );
+        // 2) 静か（足されていない・猶予なし）→ ファイルが消えていても触らない = 前回のまま
+        let stamp = chat.stamp;
+        std::fs::remove_file(&transcript).unwrap();
+        let mut quiet = target_2041(
+            key(),
+            true,
+            Some(mod_live_2041("idle")),
+            Some(transcript.clone()),
+        );
+        quiet.reread = ChatReread::Same(1);
+        quiet.prev_stamp = stamp;
+        let got = load_chat_refresh(vec![quiet]);
+        let chat = got[0].chat.as_ref().unwrap();
+        assert!(
+            chat.messages.is_none(),
+            "静かな間は読まない（stat もしない）"
+        );
+        assert_eq!(chat.stamp, stamp);
+        // 3) A/B 相当（手がかりなし・mtime の判断）では消えたファイルを探しに行く = 未登録の dir は見つからない
+        let mut legacy = target_2041(key(), true, Some(mod_live_2041("idle")), None);
+        legacy.reread = ChatReread::Stamp;
+        let got = load_chat_refresh(vec![legacy]);
+        assert_eq!(got[0].chat.as_ref().unwrap().transcript, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 受け入れ条件 1 の核: claude のペインが mod の報告を出している間、チャットの更新は

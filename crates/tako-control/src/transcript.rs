@@ -140,6 +140,18 @@ pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
     locate_transcript(session_id).map(|l| l.path)
 }
 
+/// session_id の transcript を探す。`hint`（tako mod の報告の `CLAUDE_CONFIG_DIR`）があればその dir を
+/// 先に見る（#1964 のフォールバック側 = #1883 の置き換え）。accounts.yaml に無い設定 dir の claude でも
+/// GUI モードのチャットが会話を読める（mod の報告が会話 ID と設定 dir の両方を運ぶ = 走査も要らない）
+pub fn find_transcript_hinted(session_id: &str, hint: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = hint {
+        if let Some(found) = locate_transcript_in(&[dir.to_path_buf()], None, session_id) {
+            return Some(found.path);
+        }
+    }
+    find_transcript(session_id)
+}
+
 /// resume 実行時にコマンドへ前置するシェル env プレフィクス（Issue #652）。
 ///
 /// claude は `CLAUDE_CONFIG_DIR` で会話の保存先が変わるため、resume は**その会話が

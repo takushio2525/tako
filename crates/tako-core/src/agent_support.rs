@@ -255,6 +255,9 @@ pub mod keys {
     pub const CLAUDE_MOD_BUTTONS: &str = "claude_mod_buttons";
     /// AI が出したコマンドカードをエージェントの画面の中（会話の行と帯）に描き、キーでコピー / 実行する（#1963）
     pub const CLAUDE_MOD_CARDS: &str = "claude_mod_cards";
+    /// チャット風の描画（吹き出し・コードのコピー・ツールの要約）をエージェントの画面の中に描き、GUI モードで
+    /// そのペインを本物の画面のまま見せる（#1964）
+    pub const CLAUDE_MOD_CHAT: &str = "claude_mod_chat";
     /// エージェント自身の設定 dir へ tako の拡張を入れる（setup。外せる・他の拡張と取り合わない。#1959）
     pub const CLAUDE_MOD_INSTALL: &str = "claude_mod_install";
     /// エージェントのプロセス内の拡張（Claude Code の mod）から状態を構造で受け取る（#1879）
@@ -817,6 +820,23 @@ pub const MATRIX: &[AgentFeature] = &[
              縮まない（GPUI のカード帯が出ない）こと・帯のキーで Run すると新しいペインと実行記録が付くこと（全画面と\
              main screen）・Copy が 157 字の論理文字列を改行なしで渡すこと・報告が途切れると 45 秒、claude が\
              終わると 0.2 秒（1 tick 以内）で GPUI の帯へ戻ることを確かめた（scripts/test-mod-command-cards-1963.sh）",
+        ),
+    },
+    AgentFeature {
+        key: keys::CLAUDE_MOD_CHAT,
+        summary: Note::new(
+            "チャット風の描画（発言の吹き出し・コードブロックのコピー・ツール呼び出しの 1 行の要約）をエージェントの画面の中に描く（ターミナル表示では既定でコードのコピーだけ。GUI モードで選べば tako のチャットビューの代わりにその画面を見せる）",
+            "Draws a chat-like view inside the agent's own screen (bubbles for your prompts, copy buttons under code blocks, one-line tool summaries; only the code copy by default in terminal display, and when chosen in GUI mode that screen is shown in place of tako's chat view)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 1885),
+        agy: pending(notes::NOT_INVESTIGATED, 1885),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1964: 一時の設定 dir の実 Claude Code 2.1.294 に偽 Messages API で答えさせ、隔離 GUI の GUI モード\
+             （chat.place mod）で吹き出し・コードブロックの Copy・ツールの要約が描かれ、tako がそのペインをターミナル表示に\
+             して、帯のキーと Copy のクリックで押せること・報告が途切れる / claude が終わると GPUI のチャットへ戻ること・\
+             ターミナル表示の既定では吹き出しを描かないことを確かめた（scripts/test-mod-chat-1964.sh）",
         ),
     },
     AgentFeature {

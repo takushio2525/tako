@@ -356,15 +356,19 @@ fn accept_report(
         crate::claude_mod_ui::import_band(&path, band);
     }
     // #1963: GPUI のカード帯の判断（描画のたびに引く）が ui.json を読まずに済むよう、
-    // cards.place は報告を受けるたびにここで写す
-    let cards_place = host
+    // cards.place は報告を受けるたびにここで写す。#1964: chat.place も同じ（GUI モードの表示の判断）
+    let (cards_place, chat_place) = host
         .claude_mod_ui_path()
-        .map(|p| crate::claude_mod_ui::view(&p).cards.place)
+        .map(|p| {
+            let ui = crate::claude_mod_ui::view(&p);
+            (ui.cards.place, ui.chat.place)
+        })
         .unwrap_or_default();
     let hub = host
         .claude_mod_mut()
         .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?;
     hub.cards_place = cards_place;
+    hub.chat_place = chat_place;
     let accepted = hub.accept(pane_id.as_u64(), parsed, Instant::now());
     Ok(json!({
         "accepted": accepted.as_str(),
@@ -448,7 +452,29 @@ fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandVi
             .map(|c| c.list(Some(pane)).into_iter().cloned().collect())
             .unwrap_or_default(),
         cards_legacy: core::cards_legacy(),
+        // #1964: チャット風の描画の組は表示モードで変わる（ターミナル表示の既定はコードのコピーだけ）
+        ui_mode_gui: host.ui_mode().is_gui(),
+        chat_legacy: core::chat_legacy(),
     })
+}
+
+/// GUI モードでそのペインのチャットを誰が出すか（#1964。判断は `tako_core::claude_mod::chat_owner` の 1 本）。
+/// 報告は一次ソースと同じ [`lookup_pane`]（45 秒）で引き、置き場は報告のたびに写した ui.json の
+/// `chat.place`（[`core::ModHub::chat_place`]）。A/B は `TAKO_1964_LEGACY` と `TAKO_1877_S7_LEGACY`
+/// （S3 の描き方はチャットを描かない）。GPUI はペインの表示を決めるたびに引く（GUI モードのときだけ）
+pub fn chat_owner(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::ChatOwner {
+    core::chat_owner(core::ChatOwnerInput {
+        place: host.claude_mod().map(|h| h.chat_place).unwrap_or_default(),
+        ui_mode_gui: host.ui_mode().is_gui(),
+        stored: lookup_pane(host, pane, now).ok(),
+        legacy: core::chat_legacy() || core::s7_legacy(),
+    })
+}
+
+/// チャットの持ち主の JSON（`tako mod` の各ペインの `chat` と `tako ui-mode` の診断。#1964）
+pub fn chat_owner_json(host: &dyn ControlHost, pane: PaneId, now: Instant) -> Value {
+    let owner = chat_owner(host, pane, now);
+    json!({ "drawn_by": owner.as_str(), "reason": owner.reason() })
 }
 
 /// GPUI のカード帯にそのカードを出すのは誰か（#1963。判断は `tako_core::claude_mod::card_owner`
@@ -687,7 +713,12 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
                     crate::claude_tui::ClaudeScreen::Unknown
                 )
             });
-            panes.push(pane_row(hub, id, pane.title(), on_screen, now));
+            let mut row = pane_row(hub, id, pane.title(), on_screen, now);
+            // #1964: GUI モードでこのペインのチャットを誰が出すか（mod が描いている組は report.renders.chat）
+            if hub.reports.contains_key(&id.as_u64()) {
+                row["chat"] = chat_owner_json(host, id, now);
+            }
+            panes.push(row);
         }
     }
     let count = |state: &str| panes.iter().filter(|p| p["state"] == state).count();
@@ -727,6 +758,14 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
             "place": hub.cards_place.as_str(),
             "legacy": core::cards_legacy(),
             "pickup_grace_ms": core::CARD_PICKUP_GRACE.as_millis() as u64,
+        },
+        // #1964: チャット風の描画（吹き出し・コードのコピー・ツールの要約）。auto の GUI モードでの持ち主は
+        // 判断点が決まるまで tako（GPUI のチャット）。ペインごとの持ち主は panes[].chat
+        "chat": {
+            "place": hub.chat_place.as_str(),
+            "auto_in_gui": core::AUTO_CHAT_OWNER_GUI.as_str(),
+            "ui_mode": host.ui_mode().as_str(),
+            "legacy": core::chat_legacy(),
         },
         "reason": injection.off_reason().map(reason_json),
         "plugin_dir": hub.plugin_dir.as_ref().map(|p| p.display().to_string()),

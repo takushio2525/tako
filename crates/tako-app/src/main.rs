@@ -3024,6 +3024,9 @@ struct TakoApp {
     card_band_probes: HashMap<PaneId, std::rc::Rc<command_card_ui::CardBandProbe>>,
     /// mod が描くカード（GPUI の帯から外すもの。#1963）の集合の指紋。2 秒ポーリングで変わったら描き直す
     mod_card_owner_sig: u64,
+    /// GUI モードでチャットを mod が持つペインの集合の指紋（#1964。2 秒 tick が変化を見て描き直す =
+    /// 報告の失効・claude の終了で 1 tick 以内に GPUI のチャットへ戻る）
+    mod_chat_owner_sig: u64,
 }
 
 /// × ボタン / cmd+W close の確認ダイアログ対象（Issue #172）。
@@ -5137,6 +5140,7 @@ impl TakoApp {
             card_bands: HashMap::new(),
             card_band_probes: HashMap::new(),
             mod_card_owner_sig: 0,
+            mod_chat_owner_sig: 0,
         };
         // #1441: 受け口が立たなかったら画面へ出す（見た目は正常なのに CLI / MCP から
         // 一切操作できない状態を無言で始めない）。立っているときは何も出さない
@@ -6362,6 +6366,11 @@ impl TakoApp {
                     // #1963: mod が描くカードの集合が時間で変わった（拾う猶予の切れ・報告の失効・
                     // claude の終了）なら描き直す = GPUI のカード帯は 1 tick で戻る / 引っ込む
                     if app.refresh_mod_card_owners() {
+                        wcx.notify();
+                    }
+                    // #1964: GUI モードでチャットを mod が持つペインの集合が時間で変わった（報告の失効・
+                    // claude の終了・置き場の写し）なら描き直す = 1 tick で GPUI のチャットへ戻る / 引っ込む
+                    if app.refresh_mod_chat_owners() {
                         wcx.notify();
                     }
                     // #1657: 実行ペインの終了を確定してバッジを切り替える（出力の無い終わり方・
@@ -12751,6 +12760,12 @@ impl TakoApp {
             // claude 判定（#702）は 2 秒ごとの読み取り側で確定させ、ここでは
             // その結果を見るだけにする（毎 render で ps / claude agents を叩かない）
             claude_chat: self.chat_panes.contains_key(&pane_id),
+            // #1964: mod が Claude Code の中でチャットを描いているペインは GPUI のチャットで覆わない。
+            // 判断は `claude_mod::chat_owner` の 1 本（メモリ上の報告を引くだけ = 毎 render でも子プロセスを
+            // 起こさない）。terminal モードでは引かない（`pane_display_for` が材料を見ずに即決する）
+            mod_chat: self.ui_mode.is_gui()
+                && tako_control::claude_mod::chat_owner(self, pane_id, std::time::Instant::now())
+                    .yields(),
             state: session
                 .map(|s| s.command_state())
                 .unwrap_or(tako_core::CommandState::Unknown),
@@ -12805,10 +12820,12 @@ impl TakoApp {
                 if !self.ui_mode.is_gui() {
                     return false;
                 }
-                matches!(
-                    (state.kind, self.pane_display_for(**pane)),
-                    (_, PaneDisplay::Chat) | (SettleKind::Shell, PaneDisplay::Starter)
-                )
+                // #1964: mod がチャットを描いている（本物の画面を出す）も行き先に着いた扱い
+                self.pane_display_input(**pane).mod_chat
+                    || matches!(
+                        (state.kind, self.pane_display_for(**pane)),
+                        (_, PaneDisplay::Chat) | (SettleKind::Shell, PaneDisplay::Starter)
+                    )
             })
             .map(|(pane, _)| *pane)
             .collect();

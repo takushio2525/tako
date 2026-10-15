@@ -140,6 +140,9 @@ pub struct PaneDisplayInput {
     pub alt_screen: bool,
     /// claude 対話 TUI が稼働していると確定した（G2 で配線。G1 は常に false）
     pub claude_chat: bool,
+    /// tako mod が Claude Code の会話の行にチャット風の描画をしていて、このペインのチャットを mod が持つ
+    /// （S7-6 #1964。判断は `claude_mod::chat_owner` の 1 本 = 新鮮な報告 ∧ `renders.chat` ∧ 置き場が mod）
+    pub mod_chat: bool,
     /// OSC 133 由来のコマンド実行状態
     pub state: CommandState,
     /// role 付きペイン（master / solo / worker 等）= エージェント用途
@@ -160,6 +163,7 @@ impl PaneDisplayInput {
             released: false,
             alt_screen: false,
             claude_chat: false,
+            mod_chat: false,
             state: CommandState::Unknown,
             has_role: false,
             busy_children: false,
@@ -208,6 +212,12 @@ pub fn pane_display_in(input: PaneDisplayInput, legacy_alt_screen_first: bool) -
     }
     // 「コマンド入力へ」で明示的にターミナルにしたペインは過渡期より優先して即ターミナル
     if input.released {
+        return PaneDisplay::Terminal;
+    }
+    // #1964: mod が Claude Code の中でチャットを描いている（GUI モードで mod にチャットを持たせた）ペインは
+    // GPUI のチャットで覆わず、本物の画面（= mod の描画）を出す。チャット・過渡期より先に見る
+    // （過渡期の準備中で覆うと mod の描画が見えない。器なしの claude は alt screen を使う = #1397）
+    if input.mod_chat {
         return PaneDisplay::Terminal;
     }
     if legacy_alt_screen_first && input.alt_screen {
@@ -259,6 +269,9 @@ pub enum TerminalReason {
     Failed,
     /// OSC 133 が届いていないので判断できない = **前提（シェル統合）が欠けている疑い**
     ShellStateUnknown,
+    /// tako mod が Claude Code の中でチャット風に描いている（S7-6 #1964。ui.json の `chat.place = mod`）=
+    /// GPUI のチャットで覆わず本物の画面を出している
+    ModChat,
 }
 
 impl TerminalReason {
@@ -273,6 +286,7 @@ impl TerminalReason {
             Self::Running => "running",
             Self::Failed => "failed",
             Self::ShellStateUnknown => "shell_state_unknown",
+            Self::ModChat => "mod_chat",
         }
     }
 
@@ -311,6 +325,10 @@ impl TerminalReason {
                 "シェルのコマンド状態（OSC 133）が届いていないので判断できない。シェル統合が効いていない可能性がある",
                 "The shell command state (OSC 133) is not arriving, so the pane cannot be judged. Shell integration may not be in effect",
             ),
+            Self::ModChat => Note::new(
+                "tako mod が Claude Code の中でチャット風に描いている（吹き出し・コードのコピー・ツールの要約）ので、本物の画面をそのまま出している",
+                "tako mod draws the chat inside Claude Code (bubbles, code copy, tool summaries), so the real screen is shown as is",
+            ),
         }
     }
 
@@ -344,6 +362,10 @@ impl TerminalReason {
                 "`tako shell-integration` で配置と実効を確認する（Windows は `install` が必要）",
                 "Check placement and effectiveness with `tako shell-integration` (Windows needs `install`)",
             ).into()),
+            Self::ModChat => Some(Note::new(
+                "GPUI のチャットへ戻すなら `tako mod ui set chat.place tako`",
+                "To go back to tako's chat view, run `tako mod ui set chat.place tako`",
+            ).into()),
             // 残りは「そういう状態だから出さない」= 正常な判断なので次の一手は無い
             Self::AltScreen | Self::Role | Self::BusyChildren | Self::Running | Self::Failed => None,
         }
@@ -364,6 +386,9 @@ pub fn terminal_reason(input: PaneDisplayInput) -> Option<TerminalReason> {
     }
     if input.released {
         return Some(TerminalReason::Released);
+    }
+    if input.mod_chat {
+        return Some(TerminalReason::ModChat);
     }
     if input.alt_screen {
         return Some(TerminalReason::AltScreen);
@@ -390,6 +415,8 @@ pub struct PaneDisplayMaterials {
     pub released: bool,
     pub alt_screen: bool,
     pub claude_chat: bool,
+    /// mod がこのペインのチャットを持つ（S7-6 #1964）
+    pub mod_chat: bool,
     /// 過渡期（#720）の猶予がまだ生きているか
     pub settling: bool,
 }
@@ -418,6 +445,7 @@ impl PaneDisplayStatus {
                 released: input.released,
                 alt_screen: input.alt_screen,
                 claude_chat: input.claude_chat,
+                mod_chat: input.mod_chat,
                 settling: input.settle.is_some_and(SettleState::active),
             },
         }
@@ -770,6 +798,7 @@ mod tests {
             TerminalReason::Running,
             TerminalReason::Failed,
             TerminalReason::ShellStateUnknown,
+            TerminalReason::ModChat,
         ];
         let mut ids = std::collections::HashSet::new();
         for r in all {
@@ -1011,5 +1040,68 @@ mod tests {
             }),
             PaneDisplay::Terminal
         );
+    }
+
+    /// #1964: mod がチャットを持つペインは GUI モードでもターミナル表示（mod の描画）。チャット確定・過渡期・
+    /// alt screen より先に効き、解除・terminal モードはそのまま。理由は `mod_chat`
+    #[test]
+    fn issue1964_modがチャットを持つペインは本物の画面を出す() {
+        let fresh = SettleState {
+            kind: SettleKind::Agent,
+            elapsed: Duration::from_millis(100),
+        };
+        let chat = PaneDisplayInput {
+            claude_chat: true,
+            has_role: true,
+            busy_children: true,
+            state: CommandState::Running,
+            ..gui_idle()
+        };
+        assert_eq!(
+            pane_display(chat),
+            PaneDisplay::Chat,
+            "mod が持たなければ今の GPUI のチャット"
+        );
+        for input in [
+            PaneDisplayInput {
+                mod_chat: true,
+                ..chat
+            },
+            // チャットとして確定する前（2 秒の読み取りの前）でも準備中で覆わない
+            PaneDisplayInput {
+                mod_chat: true,
+                claude_chat: false,
+                settle: Some(fresh),
+                ..chat
+            },
+            // 器なしの claude の alt screen
+            PaneDisplayInput {
+                mod_chat: true,
+                alt_screen: true,
+                ..chat
+            },
+        ] {
+            assert_eq!(pane_display(input), PaneDisplay::Terminal, "{input:?}");
+            assert_eq!(terminal_reason(input), Some(TerminalReason::ModChat));
+            let status = PaneDisplayStatus::from_input(input);
+            assert!(status.materials.mod_chat);
+        }
+        // 解除・terminal モードの理由はそちらが先
+        let released = PaneDisplayInput {
+            mod_chat: true,
+            released: true,
+            ..chat
+        };
+        assert_eq!(terminal_reason(released), Some(TerminalReason::Released));
+        let terminal = PaneDisplayInput {
+            mod_chat: true,
+            mode: UiMode::Terminal,
+            ..chat
+        };
+        assert_eq!(
+            terminal_reason(terminal),
+            Some(TerminalReason::ModeTerminal)
+        );
+        assert!(TerminalReason::ModChat.next_step().is_some());
     }
 }

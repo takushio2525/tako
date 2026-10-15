@@ -19762,6 +19762,8 @@ fn pane_display_reason_json(status: &tako_core::ui_mode::PaneDisplayStatus) -> V
             "released": m.released,
             "alt_screen": m.alt_screen,
             "claude_chat": m.claude_chat,
+            // #1964: mod がこのペインのチャットを描いている（GPUI のチャットで覆わず本物の画面を出す）
+            "mod_chat": m.mod_chat,
             "settling": m.settling,
         },
     });

@@ -309,7 +309,14 @@ fn scan_rows(register: &str) -> Vec<String> {
     }
     match window(register, USE_OPEN, REG_CLOSE) {
         Some(w) => {
-            if !w.1.contains("await next(e)") {
+            // #1964: カードとツールの要約の 2 つの描き方がそれぞれ `await next(e)` の答えを包む
+            // （描く return の数だけ下の答えを受け取っている）
+            let awaits = w.1.matches("await next(e)").count();
+            let draws = returns(&w)
+                .iter()
+                .filter(|(_, code)| code.contains("return draw"))
+                .count();
+            if awaits == 0 || awaits < draws {
                 out.push(report(
                     REGISTER,
                     w.0,
@@ -317,13 +324,15 @@ fn scan_rows(register: &str) -> Vec<String> {
                 ));
             }
             for (line, code) in returns(&w) {
+                // #1964: ツールの要約も next の答えを包む drawToolSummary( だけ（中身は issue1964 の番犬が見る）
                 if !(code.contains("return next(e)")
-                    || code.contains("return drawCardRow($, e, view, below)"))
+                    || code.contains("return drawCardRow($, e, view, below)")
+                    || code.contains("return drawToolSummary($, e, view, below, open)"))
                 {
                     out.push(report(
                         REGISTER,
                         line,
-                        "ToolUse のフックが next の答えを包まずに返している（返すのは next(e) / drawCardRow( だけ）",
+                        "ToolUse のフックが next の答えを包まずに返している（返すのは next(e) / drawCardRow( / drawToolSummary( だけ）",
                     ));
                 }
             }
@@ -637,8 +646,8 @@ fn 逆戻りを名指しできる() {
     let found = mutate(&|s| {
         replace_once(
             &mut s.register,
-            "    const below = await next(e)\n    return drawCardRow($, e, view, below)",
-            "    return drawCardRow($, e, view, { type: 'engine', ref: 0 })",
+            "      const below = await next(e)\n      return drawCardRow($, e, view, below)",
+            "      return drawCardRow($, e, view, { type: 'engine', ref: 0 })",
         );
     });
     assert_named(&found, REGISTER, "`await next(e)`");
