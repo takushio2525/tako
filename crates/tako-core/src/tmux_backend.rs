@@ -1739,11 +1739,25 @@ set -gq copy-mode-position-format ''
     /// `wrap_options` はペイン spawn のたびに conf を書き直すので、複数ペインを同時に
     /// 立てると別ペインが起動する tmux サーバーの `-f` 読み取りと重なる。途中状態を
     /// 読ませると既定設定のサーバーが立ち、ステータスバー表示・ホイール素通し不可・
-    /// Shift+Enter 劣化を起こす
+    /// Shift+Enter 劣化を起こす。
+    ///
+    /// 検出力は**回数**で区切る（#2098）。以前は 700 ms の実時間の窓で読み取り回数を
+    /// 数えて `n > 100` を求めていたので、置き換え中の読み取りが共有違反で `Err` に
+    /// なりやすい Windows の負荷の下では 24 回しか読めずに落ちた。いまは成功した
+    /// 読み取りと書き換えがそれぞれ規定回数に達するまで回し、`LIMIT` は打ち切りの
+    /// 上限としてだけ使う（届かなければ「検出力が無い」で落とす = 意味は以前と同じ）
     #[test]
     fn conf差し替え中も読み手は完全な内容しか見ない() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
+
+        // 書き換えも数えるのは、速い機で書き手が 1 度も回らないうちに読み終え、
+        // 重なりの無い読み取りだけで通ってしまわないため
+        const READS: usize = 200;
+        const WRITES: usize = 200;
+        const WRITERS: usize = 4;
+        const READERS: usize = 2;
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
         let dir = std::env::temp_dir().join(format!("tako-conf-625-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1754,46 +1768,83 @@ set -gq copy-mode-position-format ''
         let stop = Arc::new(AtomicBool::new(false));
         let partial = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
-        let mut threads = Vec::new();
-        for _ in 0..4 {
-            let (d, s, b) = (dir.clone(), stop.clone(), body.clone());
-            threads.push(std::thread::spawn(move || {
+        let failed_reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        // 全員が揃ってから回し始める = 数える読み取りはすべて書き手が回っている間のもの
+        let start = Arc::new(Barrier::new(WRITERS + READERS));
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let (d, s, b, w, g) = (
+                dir.clone(),
+                stop.clone(),
+                body.clone(),
+                writes.clone(),
+                start.clone(),
+            );
+            writers.push(std::thread::spawn(move || {
+                g.wait();
                 while !s.load(Ordering::Relaxed) {
-                    let _ = write_conf_in(&d, &b);
+                    if write_conf_in(&d, &b).is_ok() {
+                        w.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }));
         }
-        for _ in 0..2 {
-            let (p, s, bad, n, b) = (
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let (p, bad, n, e, w, b, g) = (
                 path.clone(),
-                stop.clone(),
                 partial.clone(),
                 reads.clone(),
+                failed_reads.clone(),
+                writes.clone(),
                 body.clone(),
+                start.clone(),
             );
-            threads.push(std::thread::spawn(move || {
-                while !s.load(Ordering::Relaxed) {
-                    if let Ok(read) = std::fs::read_to_string(&p) {
-                        n.fetch_add(1, Ordering::Relaxed);
-                        if read != *b {
-                            bad.fetch_add(1, Ordering::Relaxed);
+            readers.push(std::thread::spawn(move || {
+                g.wait();
+                let deadline = std::time::Instant::now() + LIMIT;
+                while (n.load(Ordering::Relaxed) < READS || w.load(Ordering::Relaxed) < WRITES)
+                    && std::time::Instant::now() < deadline
+                {
+                    match std::fs::read_to_string(&p) {
+                        Ok(read) => {
+                            n.fetch_add(1, Ordering::Relaxed);
+                            if read != *b {
+                                bad.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        // Windows では置き換え中の open が共有違反で失敗する。
+                        // 途中状態を読んだわけではないので数から外す
+                        Err(_) => {
+                            e.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
             }));
         }
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        stop.store(true, Ordering::Relaxed);
-        for t in threads {
-            t.join().expect("スレッドが panic しない");
+        for t in readers {
+            t.join().expect("読み手が panic しない");
         }
-        let (n, bad) = (
+        // 書き手は読み手が抜けてから止める = 読み取りの全区間で書き換えが走っている
+        stop.store(true, Ordering::Relaxed);
+        for t in writers {
+            t.join().expect("書き手が panic しない");
+        }
+        let (n, failed, w, bad) = (
             reads.load(Ordering::Relaxed),
+            failed_reads.load(Ordering::Relaxed),
+            writes.load(Ordering::Relaxed),
             partial.load(Ordering::Relaxed),
         );
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(n > 100, "読み取り回数が少なすぎて検出力が無い: {n}");
+        // 途中状態を 1 回でも見たら、回数が足りていなくても確定で落ちる
         assert_eq!(bad, 0, "{n} 回中 {bad} 回、不完全な conf を観測した");
+        assert!(
+            n >= READS && w >= WRITES,
+            "読み取り回数が少なすぎて検出力が無い: 読み取り {n} / {READS} 回\
+             （失敗 {failed} 回）・書き換え {w} / {WRITES} 回（上限 {LIMIT:?} で打ち切り）"
+        );
     }
 
     /// 残骸ソケットの判定（#625）。
@@ -2275,12 +2326,14 @@ set -gq copy-mode-position-format ''
             }
             false
         }
-        /// 端末のイベントを流し、子の終わり（ChildExit）が届いたら true
+        /// 端末のイベントを流し、子の終わり（ChildExit）が届いたら true。
+        /// 上限は 600 回 × 100 ms（#2098: 10 秒では並列の負荷の下で届かない回があった）。
+        /// 状態で待つので、届く回は上限に依らずすぐ抜ける
         fn wait_child_exit(
             session: &mut crate::TerminalSession,
             rx: &mut futures::channel::mpsc::UnboundedReceiver<crate::SessionEvent>,
         ) -> bool {
-            for _ in 0..100 {
+            for _ in 0..600 {
                 while let Ok(event) = rx.try_recv() {
                     let child_exit = matches!(
                         event,
@@ -2294,6 +2347,25 @@ set -gq copy-mode-position-format ''
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             false
+        }
+        /// 子の終わりが届かなかったときの切り分け（#2098）。`ps` の状態が実行中なら
+        /// tmux がクライアントをまだ終わらせていない（器の側の遅れ）、`Z` なら終わったのに
+        /// ChildExit が届いていない（イベントの側の遅れ）、載らなければ既に回収済み
+        fn client_state(pid: Option<u32>) -> String {
+            let Some(pid) = pid else {
+                return "pid 不明".into();
+            };
+            match std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+            {
+                Ok(out) if out.status.success() => format!(
+                    "pid {pid} の状態={:?}",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                ),
+                Ok(_) => format!("pid {pid} は居ない"),
+                Err(e) => format!("ps を起動できない: {e}"),
+            }
         }
         let client_of = |name: &str| {
             for _ in 0..50 {
@@ -2338,7 +2410,8 @@ set -gq copy-mode-position-format ''
         }
         assert!(
             wait_child_exit(&mut first, &mut rx1),
-            "attach クライアントの終わりが届く"
+            "attach クライアントの終わりが届く。クライアント: {}",
+            client_state(first.child_pid())
         );
         // tmux のクライアントは SIGTERM を受けると後始末をして exit 1 で終わる
         assert_eq!(
@@ -2387,10 +2460,10 @@ set -gq copy-mode-position-format ''
         assert!(
             exited,
             "セッションの終わりでクライアントも終わる。kill-session={killed:?} 生死={:?} \
-             ソケットファイル={} クライアント pid={:?}",
+             ソケットファイル={} クライアント: {}",
             probe_session(&socket, session),
             socket_file_present(&socket),
-            second.child_pid(),
+            client_state(second.child_pid()),
         );
         assert_eq!(probe_session(&socket, session), SessionProbe::SessionGone);
 
@@ -2400,7 +2473,8 @@ set -gq copy-mode-position-format ''
                 .expect("spawn 自体はできる");
         assert!(
             wait_child_exit(&mut third, &mut rx3),
-            "無いセッションへの attach はすぐ終わる"
+            "無いセッションへの attach は作らずに終わる。クライアント: {}",
+            client_state(third.child_pid())
         );
         assert!(
             !crate::tmux::has_session(Some(&socket), session),
