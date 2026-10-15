@@ -80,7 +80,59 @@ fn probe_center(
         .flatten()
 }
 
-/// 実マウスで押す（矩形が無ければ名指しで落とす）
+fn probe_bounds(
+    window: WindowHandle<TakoApp>,
+    cx: &mut AsyncApp,
+    key: &str,
+) -> Option<gpui::Bounds<Pixels>> {
+    window
+        .update(cx, |app, _, _| {
+            app.panel_click_probe_bounds.borrow().get(key).copied()
+        })
+        .ok()
+        .flatten()
+}
+
+/// メニューの中の行を、メニュー本体を実ホイールで送って見える位置まで出す（メニューは窓の高さで
+/// 打ち切ってスクロールする。見えていない行は押せない）。メニューの外の要素は何もしない
+fn reveal(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp, key: &str) {
+    if !key.starts_with("run-menu-") {
+        return;
+    }
+    for _ in 0..40 {
+        notify_and_draw(any, window, cx);
+        let (Some(menu), Some(b)) = (
+            probe_bounds(window, cx, "run-menu"),
+            probe_bounds(window, cx, key),
+        ) else {
+            return;
+        };
+        // 枠の余白（6px）の内側に収まっていれば見えている
+        let top = menu.top() + px(6.0);
+        let bottom = menu.bottom() - px(6.0);
+        if b.top() >= top && b.bottom() <= bottom {
+            return;
+        }
+        let dy = if b.bottom() > bottom {
+            -(b.bottom() - bottom + px(12.0))
+        } else {
+            top - b.top() + px(12.0)
+        };
+        let at = menu.center();
+        let _ = any.update(cx, |_, win, cx| {
+            win.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position: at,
+                    delta: ScrollDelta::Pixels(point(px(0.0), dy)),
+                    ..ScrollWheelEvent::default()
+                }),
+                cx,
+            );
+        });
+    }
+}
+
+/// 実マウスで押す（矩形が無ければ名指しで落とす）。メニューの中の行は先に見える位置まで送る
 fn click_probe(
     any: AnyWindowHandle,
     window: WindowHandle<TakoApp>,
@@ -89,6 +141,7 @@ fn click_probe(
     step: &str,
 ) {
     notify_and_draw(any, window, cx);
+    reveal(any, window, cx, key);
     let at = probe_center(window, cx, key)
         .unwrap_or_else(|| fail(&format!("visual-test {LABEL} {step}: `{key}` の矩形が無い")));
     click_at(any, cx, at);
@@ -96,21 +149,29 @@ fn click_probe(
 }
 
 /// 別に取った `RunResolve`（同期の dispatch = CLI `tako run <f> --list` と同じ答え）
-fn resolve_now(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, path: &std::path::Path) -> Value {
+fn resolve_now(
+    window: WindowHandle<TakoApp>,
+    cx: &mut AsyncApp,
+    pane: PaneId,
+    path: &std::path::Path,
+) -> Value {
     window
         .update(cx, |app, _, _| {
             tako_control::dispatch(
                 app,
                 tako_control::protocol::Request::RunResolve {
                     path: path.display().to_string(),
-                    pane: None,
+                    pane: Some(pane.as_u64()),
                     refresh: false,
                 },
                 PaneOrigin::Cli,
             )
         })
         .ok()
-        .and_then(Result::ok)
+        .and_then(|r| {
+            r.map_err(|e| println!("TAKO_VISUAL_1733: RunResolve が断られた: {e}"))
+                .ok()
+        })
         .unwrap_or(Value::Null)
 }
 
@@ -301,6 +362,14 @@ pub(super) async fn run_dropdown_1733_visual(
         .update(cx, |app, _, cx| {
             app.drawer_visible = false;
             app.panel_visible = false;
+            // 初回起動のバナーを閉じて縦の場所を空ける（メニューは窓の高さで打ち切る）
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Welcome {
+                    action: Some("dismiss".into()),
+                },
+                PaneOrigin::Cli,
+            );
             let root = app.workspace.active_tab().tree().focused();
             let r = tako_control::dispatch(
                 app,
@@ -331,7 +400,14 @@ pub(super) async fn run_dropdown_1733_visual(
         &format!("visual-test {LABEL} ①: 一覧（RunResolve）が届く"),
     );
     let view = view_of(window, cx, pv).unwrap_or_default();
-    let fresh = resolve_now(window, cx, &a);
+    let error = window
+        .update(cx, |app, _, _| app.run_menu.error(pv).map(str::to_string))
+        .ok()
+        .flatten();
+    if let Some(e) = &error {
+        println!("TAKO_VISUAL_1733: ① 一覧の取得がエラー: {e}");
+    }
+    let fresh = resolve_now(window, cx, pv, &a);
     let menu_cmd = view
         .selected_row()
         .map(|r| r.command.clone())
@@ -530,6 +606,8 @@ pub(super) async fn run_dropdown_1733_visual(
         })
         .ok()
         .flatten();
+    // 理由の行を見える位置まで送ってから撮る
+    reveal(any, window, cx, "run-menu-input-notice");
     dump(any, window, cx, "env-invalid");
     let env_saved = stored(&read_store(), "file", "env");
     println!("TAKO_VISUAL_1733: ⑤ bad env notice={notice:?} env={env_saved:?}");
@@ -594,7 +672,7 @@ pub(super) async fn run_dropdown_1733_visual(
     );
 
     // ⑦ 次の Run が一覧の走らせるコマンドと一致し、引数が付く
-    let fresh = resolve_now(window, cx, &a);
+    let fresh = resolve_now(window, cx, pv, &a);
     let diffs = diff_with_resolve(&back, &fresh);
     check(
         diffs.is_empty(),

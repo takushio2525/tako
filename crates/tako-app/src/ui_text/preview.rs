@@ -83,6 +83,10 @@ pub fn run_menu_redetecting() -> &'static str {
 pub fn run_menu_pick_path() -> &'static str {
     tr!("パスを指定…", "Choose a path…")
 }
+/// 畳んだ実行環境の候補を広げるボタン
+pub fn run_menu_more(n: usize) -> String {
+    tr!(format!("他 {n} 件を表示"), format!("Show {n} more"))
+}
 pub fn run_menu_no_candidates() -> &'static str {
     tr!("候補が見つかりません", "No runtimes found")
 }
@@ -121,8 +125,8 @@ pub fn run_menu_edit_hint() -> &'static str {
 /// 空のまま Enter を押したとき（保存しない）
 pub fn run_menu_empty() -> &'static str {
     tr!(
-        "空のままでは保存しません（既定へ戻すときは行の × を押す）",
-        "Empty values are not saved (press × on the row to go back to the default)"
+        "空のままでは保存しません（既定へ戻すときは行の右端の「既定に戻す」を押す）",
+        "Empty values are not saved (use \"Back to the default\" at the right of the row instead)"
     )
 }
 /// 環境変数の欄に `=` が無いとき（保存しない）
@@ -627,6 +631,7 @@ mod tests {
                 run_menu_redetect().to_string(),
                 run_menu_redetecting().to_string(),
                 run_menu_pick_path().to_string(),
+                run_menu_more(4),
                 run_menu_no_candidates().to_string(),
                 run_menu_reset().to_string(),
                 run_menu_args().to_string(),

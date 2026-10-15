@@ -44,6 +44,10 @@ use crate::{hsla, hsla_alpha, rgba, rgba_alpha, AppTextInput, TakoApp};
 const MENU_W: f32 = 380.0;
 /// 欄の上限（バイト。貼り付けた巨大な文字列で欄と保存先を膨らませない）
 const FIELD_MAX_BYTES: usize = 4096;
+/// 畳んだときに出す実行環境の候補の数（conda の env が多い機でも、下の項目の欄が画面の外へ押し出されない）。
+/// 残りは「他 N 件を表示」で広げる（入れ子のスクロールにしないのは、この GPUI では内側を回すと外側も一緒に
+/// 送られるため）
+const RUNTIME_ROWS_FOLDED: usize = 5;
 
 /// A/B（`TAKO_1733_LEGACY=1`）: 一覧を #1733 以前の同期の解決（実行環境・保存した設定を重ねない）で作る。
 /// 一覧のコマンドと `Run` が走らせるコマンドのずれ（venv の例）を同じバイナリで見比べるためだけの腕
@@ -270,6 +274,22 @@ fn is_saved_source(source: &str) -> bool {
     matches!(source, "file" | "project")
 }
 
+/// 出す実行環境の候補の添字（畳んでいれば先頭 [`RUNTIME_ROWS_FOLDED`] 件 + 選んでいる候補）と、隠した件数
+pub(crate) fn visible_runtimes(runtimes: &[RuntimeRow], expanded: bool) -> (Vec<usize>, usize) {
+    if expanded || runtimes.len() <= RUNTIME_ROWS_FOLDED {
+        return ((0..runtimes.len()).collect(), 0);
+    }
+    let mut shown: Vec<usize> = (0..RUNTIME_ROWS_FOLDED).collect();
+    // 選んでいる候補は畳んでも必ず出す（印の付いた行が見えないと、何で走るかが分からない）
+    if let Some(i) = runtimes.iter().position(|r| r.selected) {
+        if i >= RUNTIME_ROWS_FOLDED {
+            shown.push(i);
+        }
+    }
+    let hidden = runtimes.len() - shown.len();
+    (shown, hidden)
+}
+
 /// 出典タグのクリックで移す先（保存した値だけ。宣言・自動・既定は移すものが無い）
 pub(crate) fn other_scope(source: &str) -> Option<&'static str> {
     match source {
@@ -350,6 +370,8 @@ pub(crate) struct RunMenuUi {
     pub(crate) edit: Option<FieldEdit>,
     /// メニューの下に出す「保存できなかった」理由
     pub(crate) notice: Option<(PaneId, String)>,
+    /// 実行環境の候補を全部出しているか（開き直すと畳む）
+    pub(crate) runtimes_expanded: bool,
     seq: u64,
 }
 
@@ -592,10 +614,11 @@ impl TakoApp {
             cx.notify();
             return;
         }
-        // 絶対パスなので `pane` は要らない（閉じかけのペインを名指しして失敗させない）
+        // 宛先はそのプレビューのペイン（GUI の中の dispatch には「呼び出し元のペイン」が無いので、
+        // 省くと「対象ペインが未指定」で断られる。パスは絶対なので cwd の基準には使われない）
         let request = Request::RunResolve {
             path: path.display().to_string(),
-            pane: None,
+            pane: Some(pane.as_u64()),
             refresh,
         };
         self.dispatch_off_ui(request, PaneOrigin::User, cx, move |app, result, cx| {
@@ -655,6 +678,7 @@ impl TakoApp {
             return;
         }
         self.close_run_menu();
+        self.run_menu.runtimes_expanded = false;
         let vw = f32::from(viewport.width);
         let vh = f32::from(viewport.height);
         let left = (f32::from(at.x) - MENU_W / 2.0).clamp(4.0, (vw - MENU_W - 4.0).max(4.0));
@@ -1210,7 +1234,9 @@ impl TakoApp {
                     .child(crate::ui_text::preview::run_menu_no_candidates()),
             );
         }
-        for (i, r) in view.runtimes.iter().enumerate() {
+        let (shown, hidden) = visible_runtimes(&view.runtimes, self.run_menu.runtimes_expanded);
+        for i in shown {
+            let r = &view.runtimes[i];
             let id = r.id.clone();
             let key = format!("run-menu-runtime-{i}");
             col = col.child(
@@ -1255,6 +1281,23 @@ impl TakoApp {
                             .child(SharedString::from(v))
                     }))
                     .child(probe_canvas(probe.clone(), key)),
+            );
+        }
+        if hidden > 0 {
+            col = col.child(
+                action_button(
+                    "run-menu-runtimes-more",
+                    crate::file_icons::ui_icon::CHEVRON_DOWN,
+                    &crate::ui_text::preview::run_menu_more(hidden),
+                    theme,
+                )
+                .mx(px(2.0))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.run_menu.runtimes_expanded = true;
+                    cx.notify();
+                }))
+                .child(probe_canvas(probe.clone(), "run-menu-runtimes-more".into())),
             );
         }
         // 再検出・パスを指定
@@ -1543,7 +1586,21 @@ impl TakoApp {
                     .flex_none()
                     .child(SharedString::from(after.to_string())),
             )
-            .child(probe_canvas(probe, "run-menu-input".into()));
+            .child(probe_canvas(probe.clone(), "run-menu-input".into()));
+        // 保存されなかった理由は操作の案内と差し替えて欄の真下に出す（欄がメニューの下端に寄っていても、
+        // 欄と一緒に見える位置に置く）
+        let below = match edit.notice.clone() {
+            Some(reason) => div()
+                .relative()
+                .text_size(px(10.5))
+                .text_color(hsla(theme.yellow))
+                .child(SharedString::from(reason))
+                .child(probe_canvas(probe, "run-menu-input-notice".into())),
+            None => div()
+                .text_size(px(10.5))
+                .text_color(hsla_alpha(theme.foreground, 0.6))
+                .child(crate::ui_text::preview::run_menu_edit_hint()),
+        };
         Some(
             div()
                 .flex()
@@ -1552,18 +1609,7 @@ impl TakoApp {
                 .px(px(6.0))
                 .py(px(4.0))
                 .child(field)
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(hsla_alpha(theme.foreground, 0.6))
-                        .child(crate::ui_text::preview::run_menu_edit_hint()),
-                )
-                .children(edit.notice.clone().map(|n| {
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(hsla(theme.yellow))
-                        .child(SharedString::from(n))
-                }))
+                .child(below)
                 .into_any_element(),
         )
     }
@@ -1952,6 +1998,42 @@ mod tests {
             (reset.scope, reset.reset),
             (Some("file"), Some(vec!["profile".to_string()]))
         );
+    }
+
+    #[test]
+    fn 候補が多ければ畳み選んでいる候補は残す() {
+        let rows = |n: usize, selected: usize| -> Vec<RuntimeRow> {
+            (0..n)
+                .map(|i| RuntimeRow {
+                    id: format!("conda:e{i}"),
+                    kind: "python".into(),
+                    label: format!("e{i}"),
+                    version: None,
+                    auto: i == 0,
+                    selected: i == selected,
+                })
+                .collect()
+        };
+        // 少なければ全部
+        assert_eq!(visible_runtimes(&rows(3, 0), false), (vec![0, 1, 2], 0));
+        assert_eq!(
+            visible_runtimes(&rows(5, 4), false),
+            (vec![0, 1, 2, 3, 4], 0)
+        );
+        // 多ければ先頭 5 件 + 隠した件数
+        assert_eq!(
+            visible_runtimes(&rows(9, 1), false),
+            (vec![0, 1, 2, 3, 4], 4)
+        );
+        // 選んでいる候補が畳んだ側にあっても出す
+        assert_eq!(
+            visible_runtimes(&rows(9, 7), false),
+            (vec![0, 1, 2, 3, 4, 7], 3)
+        );
+        // 広げれば全部
+        assert_eq!(visible_runtimes(&rows(9, 7), true).0.len(), 9);
+        // 候補 0
+        assert_eq!(visible_runtimes(&[], false), (vec![], 0));
     }
 
     #[test]
