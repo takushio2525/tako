@@ -776,6 +776,9 @@ pub(crate) enum NoticeArm {
     /// プレビューの「履歴」ボタンで変更履歴を取れなかった（git が上限まで返らない等。
     /// `TAKO_2014_LEGACY`）。旧挙動では UI スレッドで上限なしに待つので失敗が起きず、通知も出ない
     Issue2014,
+    /// 変更履歴の行のクリックで diff を取れなかった（git が上限まで返らない等。`TAKO_2150_LEGACY`）。
+    /// 旧挙動では UI スレッドで上限なしに待ち、失敗は黙って何もしないので、通知も出ない
+    Issue2150,
 }
 
 impl NoticeArm {
@@ -798,6 +801,7 @@ impl NoticeArm {
             NoticeArm::Issue1685 => tako_control::lsp::xref::legacy(),
             NoticeArm::Issue1945 => tako_core::limit_resume_all::legacy(),
             NoticeArm::Issue2014 => tako_core::probe::issue2014_legacy(),
+            NoticeArm::Issue2150 => tako_core::probe::issue2150_legacy(),
         }
     }
 }

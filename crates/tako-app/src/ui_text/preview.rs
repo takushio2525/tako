@@ -275,6 +275,11 @@ pub fn op_run_file() -> &'static str {
 pub fn op_changelog() -> &'static str {
     tr!("変更履歴の表示", "Show file history")
 }
+/// 変更履歴の行を押してそのコミットの差分を開こうとしたときの**操作名**（#2150。git が上限まで
+/// 返らなかった等）
+pub fn op_changelog_diff() -> &'static str {
+    tr!("変更履歴の差分の表示", "Show commit diff")
+}
 pub fn item_count(n: usize) -> String {
     tr!(format!("{n} 件"), format!("{n} items"))
 }

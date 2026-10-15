@@ -242,6 +242,8 @@ impl TakoApp {
                     OffloadContinuation::UserTaskStored(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2014 の変更履歴の続き）
                     OffloadContinuation::PreviewChangelog(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2150 の変更履歴の行の展開の続き）
+                    OffloadContinuation::PreviewChangelogDiff(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

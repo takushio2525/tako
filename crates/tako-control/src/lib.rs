@@ -121,9 +121,10 @@ pub use dispatch::{
     OffloadLanding, OffloadOutcome, PinnedView, TmuxContext,
 };
 pub use host::{
-    cleanup_tmux_servers_default, OrphanCleanupPlan, PreviewConflict, PreviewFormatSource,
-    PreviewGotoSource, PreviewHost, PreviewLineTarget, RemoteHost, SessionHost, SystemHost,
-    TmuxCleanupJob, TmuxHost, UiStateHost, VideoStatus, WebViewHost, WorkspaceHost,
+    cleanup_tmux_servers_default, ChangelogDiffTarget, OrphanCleanupPlan, PreviewConflict,
+    PreviewFormatSource, PreviewGotoSource, PreviewHost, PreviewLineTarget, RemoteHost,
+    SessionHost, SystemHost, TmuxCleanupJob, TmuxHost, UiStateHost, VideoStatus, WebViewHost,
+    WorkspaceHost,
 };
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;

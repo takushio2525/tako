@@ -1447,10 +1447,29 @@ lid-guard.json が使う）:
   ペインが閉じた・別のファイルへ切り替わったら置かずに理由を返す。上限に達したら状態を変えずに失敗として返す
   （git 管理外・git を起こせないは従来どおり空の履歴 =「git 管理外」）。host（`set_preview_changelog`）は渡された
   履歴を置くだけで git を起こさない。GUI のボタンは `dispatch_off_ui` を通り、取っている間の重ね押しは無視
-  （`preview_changelog_pending`）、失敗は通知欄（`NoticeArm::Issue2014`）。閉じる・状態取得・diff の展開
-  （`expand` = `git diff`）は同期の腕のまま。番犬は `issue1984_ui_thread_offload_watchdog.rs` の 13 節
+  （`preview_changelog_pending`）、失敗は通知欄（`NoticeArm::Issue2014`）。閉じる・状態取得は同期の腕のまま
+  （git を起こさない）。番犬は `issue1984_ui_thread_offload_watchdog.rs` の 13 節
   （注入 9 通り）、A/B は `TAKO_2014_LEGACY=1`（UI スレッドで上限なし）、実経路は
   `scripts/test-changelog-offload-2014.sh`（PATH の先頭の偽の git）と visual-test `changelog-offload`
+- **プレビューの変更履歴の行の diff の展開**（#2150）: CLI `tako preview-changelog --expand <hash>` / MCP
+  `tako_preview_changelog` の `expand` / GUI のコミット行のクリックは `git diff <hash>^..<hash>`（初期コミットは
+  `git diff-tree --root -p`）を UI スレッドで上限なしに待っていた。`prepare_offload` が展開（`expand: Some`。
+  畳んでいる行）を `OffloadJob::PreviewChangelogDiff` にし、UI スレッドの準備（`preview_changelog_diff_prepare`）は
+  変更履歴を開いたときに取った値（リポジトリ・相対パス・完全なハッシュ = host の `changelog_diff_target`）だけを
+  写す。background の本体（`PreviewChangelogDiffJob::run`）は `tako_core::git::commit_file_diff`（上限なしの
+  `diff_file_commit` と同じ 2 段・同じ解析で、2 段を合わせて上限つき）を**変更履歴と同じ上限**（`changelog_timeout()`
+  = 既定 30 秒・`TAKO_CHANGELOG_GIT_TIMEOUT_SECS`。実測: 5 万行の `dispatch.rs` の 1 コミットの diff が 0.05〜0.07 秒）
+  で通す。置くのは UI スレッドの着地（`preview_changelog_diff_land`）で、取っている間にペインが閉じた・別のファイルへ
+  切り替わった・変更履歴が閉じた・別のリポジトリ / パスの変更履歴へ入れ替わったら置かずに理由を返す（#2014 の
+  「閉じた後に開いた結果が着地すると残る」型は、展開では閉じた変更履歴へ置かないので起きない。同じファイルの
+  変更履歴を開き直しただけなら置く = 同じコミットの同じ diff。同じ行の展開が重なって着地しても同じ diff を置き直す
+  だけ）。上限に達したら行を畳んだまま失敗として返す（2 段とも失敗・git を起こせないは従来どおり空の diff）。
+  畳むのは状態を外すだけなので同期の腕。host（`set_changelog_diff`）は渡された diff を置く / 外すだけで git を
+  起こさない。GUI のクリック（`toggle_changelog_diff`）は `dispatch_off_ui` を通り、取っている間の同じ行の
+  重ね押しは無視（`preview_changelog_diff_pending`）、失敗は通知欄（`NoticeArm::Issue2150`）。上限なしの
+  `diff_file_commit` は `tako git show --file`（既に background のジョブ）だけが使う。番犬は
+  `issue1984_ui_thread_offload_watchdog.rs` の 14 節（注入 12 通り）、A/B は `TAKO_2150_LEGACY=1`（UI スレッドで
+  上限なし）、実経路は `scripts/test-changelog-expand-2150.sh`（PATH の先頭の偽の git）と visual-test `changelog-expand`
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の
