@@ -540,6 +540,16 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // #1951: 言語サーバへ渡す空の設定ファイル（arduino-language-server の `-cli-config`）。
+    // 起こすたびに無ければ作る 0 バイトのファイルなので共有しない
+    Entry {
+        root: Root::TakoData,
+        path: "lsp-config/",
+        class: Class::Local,
+        note: notes::GENERATED,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::TakoData,
         path: "pane-logs/",

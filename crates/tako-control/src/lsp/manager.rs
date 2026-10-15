@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::{Action, Event, Lifecycle, RestartPolicy, ServerState};
-use tako_core::lsp::{position, root, sync};
+use tako_core::lsp::{launch, position, root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
 use super::completion::{CompletionAnswer, CompletionError, CompletionRequest};
@@ -161,16 +161,24 @@ pub enum Launch {
         program_path: String,
         detail: String,
     },
+    /// サーバは見つかったが、起動に要る伴走の実行ファイル（検出表の `Arg::Companion`）が無い
+    /// （#1951）。見つからないのと同じに扱う（行の導入コマンドで両方が揃う）
+    CompanionMissing {
+        program_path: String,
+        companion: String,
+    },
 }
 
 /// 起動の方法を決める関数（本番は [`default_launch`]。テストは偽サーバを返す）
 pub type Launcher = Arc<dyn Fn(&ServerSpec) -> Launch + Send + Sync>;
 
-/// 本番の解決: `TAKO_LSP_BIN_<ID>` → `platform::exe::find_with_timeout`（境界 B16）→ `child_cmd`（B21）
+/// 本番の解決: `TAKO_LSP_BIN_<ID>` → `platform::exe::find_with_timeout`（境界 B16）→ 行の `bundled`
+/// （アプリの同梱。#1951）→ `child_cmd`（B21）
 ///
 /// unix は `$SHELL -l -c 'exec <path> <args>'` で起こす（`.app` を Dock から起動すると
 /// PATH が最小構成で、rust-analyzer が `cargo` を見つけられない）。`exec` なので
-/// 子の pid はサーバそのもの（間にシェルが残らない）。Windows はシェルを経由しない
+/// 子の pid はサーバそのもの（間にシェルが残らない）。Windows はシェルを経由しない。
+/// 伴走の実行ファイルと空の設定ファイルを引数に持つ行（#1951）は [`launch_args`] が組む
 pub fn default_launch(spec: &ServerSpec) -> Launch {
     let override_env = servers::override_env_name(spec.id);
     let resolved = match std::env::var(&override_env) {
@@ -189,13 +197,21 @@ pub fn default_launch(spec: &ServerSpec) -> Launch {
                 spec.program,
                 tako_core::probe::probe_timeout(),
             );
-            if let Some(notice) = found.timeout {
-                return Launch::TimedOut {
-                    program: spec.program.to_string(),
-                    waited_secs: notice.waited_secs,
-                };
+            // #1951: PATH に無ければアプリの同梱（stat だけ。打ち切ったときも同梱にあればそれを使う）
+            let bundled = || bundled_server(spec);
+            match (found.path, found.timeout) {
+                (Some(path), _) => Some(path),
+                (None, Some(notice)) => match bundled() {
+                    Some(path) => Some(path),
+                    None => {
+                        return Launch::TimedOut {
+                            program: spec.program.to_string(),
+                            waited_secs: notice.waited_secs,
+                        }
+                    }
+                },
+                (None, None) => bundled(),
             }
-            found.path
         }
     };
     let Some(program_path) = resolved else {
@@ -214,18 +230,135 @@ pub fn default_launch(spec: &ServerSpec) -> Launch {
             };
         }
     }
+    let args = match launch_args(spec, &program_path) {
+        Ok(args) => args,
+        Err(missing) => return missing,
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut snippet = format!("exec {}", tako_core::shell::quote_for_shell(&program_path));
-    for arg in spec.args {
+    for arg in &args {
         snippet.push(' ');
         snippet.push_str(&tako_core::shell::quote_for_shell(arg));
     }
-    match child_cmd::user_env_cli(&snippet, &program_path, spec.args) {
+    match child_cmd::user_env_cli(&snippet, &program_path, &args) {
         Some(plan) => Launch::Found { plan, program_path },
         None => Launch::NotFound {
             program: spec.program.to_string(),
             override_env: None,
         },
     }
+}
+
+/// 検証用の注入（#1951）: `TAKO_1951_INJECT_NO_BUNDLE=1` でアプリの同梱を探さない（Arduino IDE を
+/// 入れていない PC と同じ解決 = 実機の検査で「ALS なし」を作る。IDE を消さずに済む）
+fn inject_no_bundle() -> bool {
+    std::env::var("TAKO_1951_INJECT_NO_BUNDLE").is_ok_and(|v| v == "1")
+}
+
+/// 起こした実行ファイルの出どころ（`override` = 差し替えの env / `bundled` = アプリの同梱（#1951）/
+/// `path` = 利用者の PATH）。同梱の置き場の下かは文字列で見る（stat しない）
+fn found_source(spec: &ServerSpec, program_path: &str) -> &'static str {
+    if std::env::var(servers::override_env_name(spec.id)).is_ok_and(|v| !v.trim().is_empty()) {
+        return "override";
+    }
+    let Some(bundle) = spec.bundled else {
+        return "path";
+    };
+    let env = launch::process_env(spec);
+    let platform = tako_core::platform::support::Platform::current();
+    if tako_core::app_bundle::dirs(bundle, platform, &env)
+        .iter()
+        .any(|dir| Path::new(program_path).starts_with(dir))
+    {
+        "bundled"
+    } else {
+        "path"
+    }
+}
+
+/// 本物の周り（この OS・ログインシェルの PATH（上限つき）・プロセスの環境・ファイルシステム）で `f` を呼ぶ。
+/// `f` へ渡す行は注入を当てたもの（同梱の探索は行の `bundled` を見るので、行ごと差し替える）
+fn with_locator<T>(spec: &ServerSpec, f: impl FnOnce(&ServerSpec, &launch::Locator<'_>) -> T) -> T {
+    // 注入（`TAKO_1951_INJECT_NO_BUNDLE`）は伴走の探索からも同梱を外す
+    let unbundled;
+    let spec = if inject_no_bundle() {
+        unbundled = ServerSpec {
+            bundled: None,
+            ..*spec
+        };
+        &unbundled
+    } else {
+        spec
+    };
+    let on_path = |name: &str| {
+        tako_core::platform::exe::find_with_timeout(name, tako_core::probe::probe_timeout())
+            .path
+            .map(PathBuf::from)
+    };
+    let env = launch::process_env(spec);
+    let loc = launch::Locator {
+        platform: tako_core::platform::support::Platform::current(),
+        on_path: &on_path,
+        env: &env,
+        fs: &tako_core::runtime_env::RealFs,
+    };
+    f(spec, &loc)
+}
+
+/// 行の `bundled` からサーバを探す（#1951。差し替えの env と PATH に無かったとき）
+fn bundled_server(spec: &ServerSpec) -> Option<String> {
+    if spec.bundled.is_none() || inject_no_bundle() {
+        return None;
+    }
+    with_locator(spec, launch::bundled_server)
+        .filter(|p| tako_core::platform::exe::is_executable_file(p))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// 空の設定ファイルの置き場（`<data_dir>/lsp-config`。data dir が決まらなければ一時 dir）
+pub fn empty_file_dir() -> PathBuf {
+    tako_core::paths::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("lsp-config")
+}
+
+/// 起動引数（#1951）: 固定の文字列はそのまま、伴走は見つけたパス（サーバと同じ場所 → PATH → 同梱）、
+/// 空の設定ファイルは `<data_dir>/lsp-config/<id>/<名前>` に 0 バイトで用意してそのパス。
+/// 伴走が無い・ファイルを作れないなら起こさない（その理由の [`Launch`]）
+fn launch_args(spec: &ServerSpec, program_path: &str) -> Result<Vec<String>, Launch> {
+    if spec.args.iter().all(|a| matches!(a, servers::Arg::Lit(_))) {
+        return Ok(spec.literal_args().iter().map(|a| a.to_string()).collect());
+    }
+    let built = with_locator(spec, |spec, loc| {
+        launch::build(spec, Path::new(program_path), loc, &empty_file_dir())
+    })
+    .map_err(|companion| Launch::CompanionMissing {
+        program_path: program_path.to_string(),
+        companion: companion.to_string(),
+    })?;
+    for path in &built.empty_files {
+        // 中身は要らない（在れば触らない = 利用者が書き足していても消さない）
+        if path.is_file() {
+            continue;
+        }
+        let made = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(path, b""));
+        if let Err(error) = made {
+            return Err(Launch::Broken {
+                program_path: program_path.to_string(),
+                detail: text::fill(
+                    text::EMPTY_FILE_FAILED_DETAIL,
+                    &[
+                        ("path", &path.display().to_string()),
+                        ("error", &error.kind().to_string()),
+                    ],
+                ),
+            });
+        }
+    }
+    Ok(built.args)
 }
 
 /// PATH で見つかったものを `probe_args` で起こし、成功で終わらなければその理由（#1944）
@@ -519,6 +652,9 @@ struct Slot {
     source: Option<&'static str>,
     program_path: Option<String>,
     runtime: Option<String>,
+    /// 起こす前提が未設定の理由（前提の側の文）と満たすコマンド（#1951。[`ServerState::Unconfigured`] の
+    /// あいだだけ。起こし直すときに捨てる）
+    unmet: Option<(String, String)>,
     /// サーバが登録したファイル監視（#2034。プロセスが変わったら捨てる）
     watch: Registrations,
     /// 監視の知らせを送った回数・変化の数・送れなかった変化の数（#2034。起動をまたいで数える）
@@ -565,6 +701,8 @@ struct NotInstalled {
     timed_out: Option<u64>,
     /// PATH で見つかったが動かなかった（パスと理由。#1944）
     broken: Option<(String, String)>,
+    /// サーバは見つかったが伴走の実行ファイルが無い（見つけたサーバのパスと伴走の名前。#1951）
+    companion: Option<(String, String)>,
     /// 取りに行って失敗した（#1944）。記録があるあいだは開き直しても自動では取り直さない
     fetch_error: Option<FetchError>,
 }
@@ -577,6 +715,7 @@ impl NotInstalled {
             override_env: None,
             timed_out: None,
             broken: None,
+            companion: None,
             fetch_error: None,
         };
         match launch {
@@ -598,6 +737,10 @@ impl NotInstalled {
                 program_path,
                 detail,
             } => record.broken = Some((program_path, detail)),
+            Launch::CompanionMissing {
+                program_path,
+                companion,
+            } => record.companion = Some((program_path, companion)),
             Launch::Found { .. } => {}
         }
         record
@@ -1444,6 +1587,7 @@ impl Shared {
         slot.quiescent = None;
         slot.running_since = None;
         slot.diagnosed = false;
+        slot.unmet = None;
         // #2034: 登録は前のプロセスのもの（監視の根は前のプロセスの on_exit の後で揃え直す）
         slot.watch.clear();
         let generation = slot.generation;
@@ -1469,9 +1613,7 @@ impl Shared {
         // #1944: 差し替えの env → 利用者の PATH → tako の置き場 → 取る の順。グローバルがあればそれ
         let (plan, source, program_path, runtime) = match launch {
             Launch::Found { plan, program_path } => {
-                let overridden = std::env::var(servers::override_env_name(spec.id))
-                    .is_ok_and(|v| !v.trim().is_empty());
-                let source = if overridden { "override" } else { "path" };
+                let source = found_source(spec, &program_path);
                 (plan, source, program_path, None)
             }
             // 見つからない / 打ち切った / 動かない は同じ「未導入」の扱い（理由の文だけが違う。#1769）
@@ -1489,6 +1631,25 @@ impl Shared {
                 None => return,
             },
         };
+        // #1951: 起こす前提（Arduino の基板）。満たしていなければ起こさず、理由と満たすコマンドを残す
+        // （基板の無い ALS は 15 秒待っても診断を 1 回も送らない = 黙って何も出ない。実測）
+        if let Some(unmet) = requirement_unmet(spec, &key.root, &program_path) {
+            let mut guard = self.lock();
+            let inner = &mut *guard;
+            let Some(slot) = inner.servers.get_mut(key) else {
+                return;
+            };
+            if slot.generation != generation {
+                return;
+            }
+            self.step(slot, Event::Unconfigured);
+            slot.unmet = Some(unmet);
+            slot.source = Some(source);
+            slot.program_path = Some(program_path);
+            crate::diag::persist_log(&format!("LSP 起こす前提が未設定: server={}", spec.id));
+            notify_refresh(inner);
+            return;
+        }
         let handlers = self.handlers(key, generation);
         let raw_log = self
             .config
@@ -1625,11 +1786,19 @@ impl Shared {
             return None;
         }
         self.step(slot, Event::NotFound);
-        crate::diag::persist_log(&match (record.timed_out, &record.broken) {
-            (Some(secs), _) => format!("LSP 解決の打ち切り: server={} {secs} 秒", spec.id),
-            (None, Some(_)) => format!("LSP PATH のものが動かない: server={}", spec.id),
-            (None, None) => format!("LSP 未導入: server={}", spec.id),
-        });
+        crate::diag::persist_log(
+            &match (record.timed_out, &record.broken, &record.companion) {
+                (Some(secs), _, _) => format!("LSP 解決の打ち切り: server={} {secs} 秒", spec.id),
+                (None, Some(_), _) => format!("LSP PATH のものが動かない: server={}", spec.id),
+                (None, None, Some((_, companion))) => {
+                    format!(
+                        "LSP 伴走が見つからない: server={} 伴走={companion}",
+                        spec.id
+                    )
+                }
+                (None, None, None) => format!("LSP 未導入: server={}", spec.id),
+            },
+        );
         inner.not_installed.insert(
             spec.id,
             NotInstalled {
@@ -1861,6 +2030,7 @@ impl Shared {
     /// ここはロックを短く取ってスレッドを出すだけで、ログインシェルは背景のスレッド 1 本が起こす）。
     /// 間隔は直前の 1 巡にかかった時間で伸びる（[`recheck_interval`]。#1977）
     fn on_shell_activity(&self) {
+        self.recheck_unconfigured();
         let mut inner = self.lock();
         if inner.not_installed.is_empty() || inner.rechecking {
             return;
@@ -1932,6 +2102,65 @@ impl Shared {
             });
     }
 
+    /// 前提が未設定の器（文書を開いているもの）を確かめ直し、満たされていれば起こす（#1951。
+    /// `arduino-cli board attach` を tako のターミナルで打てば、コマンドの終わりの合図で起きる）。
+    /// 確かめるのはファイル 1 つの読みで、ログインシェルは起こさない。合図は UI スレッドの OSC の処理から
+    /// 来るので、読むのは背景のスレッド
+    fn recheck_unconfigured(&self) {
+        let targets: Vec<(ServerKey, &'static ServerSpec, u64, String)> = {
+            let inner = self.lock();
+            inner
+                .servers
+                .iter()
+                .filter(|(key, slot)| {
+                    slot.lifecycle.state == ServerState::Unconfigured
+                        && inner.docs.values().any(|d| d.key == **key)
+                })
+                .map(|(key, slot)| {
+                    (
+                        key.clone(),
+                        slot.spec,
+                        slot.generation,
+                        slot.program_path.clone().unwrap_or_default(),
+                    )
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let Some(shared) = self.arc() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("lsp-recheck-unconfigured".into())
+            .spawn(move || {
+                for (key, spec, generation, program_path) in targets {
+                    if requirement_unmet(spec, &key.root, &program_path).is_some() {
+                        continue;
+                    }
+                    let mut guard = shared.lock();
+                    let inner = &mut *guard;
+                    let Some(slot) = inner.servers.get_mut(&key) else {
+                        continue;
+                    };
+                    if slot.generation != generation
+                        || slot.lifecycle.state != ServerState::Unconfigured
+                    {
+                        continue;
+                    }
+                    if shared.step(slot, Event::Configured) == Action::Spawn {
+                        crate::diag::persist_log(&format!(
+                            "LSP 起こす前提が整った（シェル統合の合図）: server={}",
+                            spec.id
+                        ));
+                        shared.begin_spawn(slot, &key, None);
+                        notify_refresh(inner);
+                    }
+                }
+            });
+    }
+
     /// 引き直しの様子（#1977。`tako lsp status` の `recheck`。**待たない**）
     fn recheck_summary(inner: &Inner) -> Value {
         json!({
@@ -1998,6 +2227,10 @@ impl Shared {
                 let (reason, next) = stopped_guidance(slot);
                 (Some(reason), Some(next))
             }
+            ServerState::Unconfigured => match slot.and_then(unconfigured_guidance) {
+                Some((reason, next, _)) => (Some(reason), Some(next)),
+                None => (None, None),
+            },
             _ => (None, None),
         };
         Some(DocumentServer {
@@ -2519,14 +2752,7 @@ impl Shared {
                 match launch {
                     Launch::Found { program_path, .. } => {
                         row["installed"] = json!(true);
-                        row["source"] =
-                            json!(if std::env::var(servers::override_env_name(spec.id))
-                                .is_ok_and(|v| !v.trim().is_empty())
-                            {
-                                "override"
-                            } else {
-                                "path"
-                            });
+                        row["source"] = json!(found_source(spec, &program_path));
                         row["path"] = json!(program_path);
                     }
                     missing => {
@@ -2697,6 +2923,10 @@ impl Shared {
                     crashes: slot.lifecycle.crashes,
                 })
             }
+            (ServerState::Unconfigured, _) => match unconfigured_error(spec, slot) {
+                Some(error) => MenuCapabilities::Failed(error),
+                None => MenuCapabilities::Pending,
+            },
             _ => MenuCapabilities::Pending,
         }
     }
@@ -3154,6 +3384,12 @@ impl Shared {
                                 state: slot.lifecycle.state,
                                 crashes: slot.lifecycle.crashes,
                             })
+                        }
+                        // #1951: 前提が未設定なら待たない（満たされるまで起きない）
+                        ServerState::Unconfigured => {
+                            if let Some(error) = unconfigured_error(spec, slot) {
+                                return Err(error);
+                            }
                         }
                         _ => {}
                     }
@@ -3970,6 +4206,7 @@ impl Slot {
             source: None,
             program_path: None,
             runtime: None,
+            unmet: None,
             watch: Registrations::default(),
             watch_sent: (0, 0, 0),
         }
@@ -4086,9 +4323,62 @@ fn slot_status(
             value["reason"] = json!(reason);
             value["next_step"] = json!(next_step);
         }
+        ServerState::Unconfigured => {
+            if let Some((reason, next_step, command)) = unconfigured_guidance(slot) {
+                value["reason"] = json!(reason);
+                value["next_step"] = json!(next_step);
+                value["setup_command"] = json!(command);
+            }
+        }
         _ => {}
     }
     value
+}
+
+/// 起こす前提を満たしていなければ、前提の側の理由と満たすコマンド（#1951）。ファイルを 1 つ読み、
+/// 案内のコマンドの先頭（伴走）はサーバと同じ場所か同梱にあればフルパス・無ければ名前（ログインシェルは
+/// 起こさない = 起動の流れの中でも、シェル統合の合図の確かめ直しでも安い）
+fn requirement_unmet(
+    spec: &ServerSpec,
+    root: &Path,
+    program_path: &str,
+) -> Option<(String, String)> {
+    let requirement = spec.requires?;
+    let platform = tako_core::platform::support::Platform::current();
+    let name = requirement.companion();
+    let no_path = |_: &str| None;
+    let env = launch::process_env(spec);
+    let loc = launch::Locator {
+        platform,
+        on_path: &no_path,
+        env: &env,
+        fs: &tako_core::runtime_env::RealFs,
+    };
+    let cli = launch::find_companion(spec, name, Path::new(program_path), &loc)
+        .map(|c| c.command_name())
+        .unwrap_or_else(|| name.to_string());
+    requirement.unmet(root, &cli, platform)
+}
+
+/// 前提が未設定の理由・次の一手・満たすコマンド（`tako lsp status` と画面の帯と問い合わせの失敗が
+/// 同じ文を出す。#1951）
+fn unconfigured_guidance(slot: &Slot) -> Option<(String, String, String)> {
+    let (detail, command) = slot.unmet.as_ref()?;
+    Some((
+        text::fill(text::UNCONFIGURED_REASON, &[("detail", detail)]),
+        text::fill(text::UNCONFIGURED_NEXT_STEP, &[("command", command)]),
+        command.clone(),
+    ))
+}
+
+/// 前提が未設定の器への問い合わせの失敗（#1951。待たずに理由と満たすコマンドを返す）
+fn unconfigured_error(spec: &'static ServerSpec, slot: &Slot) -> Option<GotoError> {
+    let (reason, next_step, _) = unconfigured_guidance(slot)?;
+    Some(GotoError::Unconfigured {
+        server: spec.id,
+        reason,
+        next_step,
+    })
 }
 
 /// 諦めた・止めたの理由と次の一手（`tako lsp status` と画面の 1 行が同じ文を出す）
@@ -4163,6 +4453,17 @@ fn not_installed_guidance(spec: &ServerSpec, record: &NotInstalled, can_fetch: b
             "install_command": command,
         });
     }
+    if let Some((path, companion)) = &record.companion {
+        return json!({
+            "reason": text::fill(
+                text::COMPANION_NOT_FOUND_REASON,
+                &[("path", path), ("program", companion)]
+            ),
+            "next_step": next_step,
+            "install_command": command,
+            "missing_companion": companion,
+        });
+    }
     if let Some(secs) = record.timed_out {
         return json!({
             "reason": text::fill(
@@ -4173,12 +4474,17 @@ fn not_installed_guidance(spec: &ServerSpec, record: &NotInstalled, can_fetch: b
             "install_command": command,
         });
     }
-    let reason = match &record.override_env {
-        Some(env) => text::fill(
+    let reason = match (&record.override_env, spec.bundled) {
+        (Some(env), _) => text::fill(
             text::OVERRIDE_INVALID_REASON,
             &[("env", env), ("path", program)],
         ),
-        None => text::fill(text::NOT_INSTALLED_REASON, &[("program", program)]),
+        // #1951: アプリの同梱も探した行は、どこを探したかを名指す
+        (None, Some(bundle)) => text::fill(
+            text::BUNDLED_NOT_INSTALLED_REASON,
+            &[("program", program), ("bundle", bundle.label)],
+        ),
+        (None, None) => text::fill(text::NOT_INSTALLED_REASON, &[("program", program)]),
     };
     json!({
         "reason": reason,

@@ -262,9 +262,9 @@
     {
       "key": "tako_lsp_server",
       "status": "pending",
-      "note_ja": "言語サーバの起動・握手・文書同期と、未導入のサーバを data dir へ取って起こす経路（#1944）は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことも、配布元から実際に取ったこともまだ無い（#1007）。第 2 波の 6 行（#1956）も同じで、texlab / tombi の Windows 向けの取得物（zip の中の tako が取り出す 1 つ）・sourcekit-lsp（Swift toolchain に同梱）・dart・vscode-css-language-server / vscode-html-language-server（npm の .cmd）を Windows 実機で起こしたことはまだ無い",
+      "note_ja": "言語サーバの起動・握手・文書同期と、未導入のサーバを data dir へ取って起こす経路（#1944）は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことも、配布元から実際に取ったこともまだ無い（#1007）。第 2 波の 6 行（#1956）も同じで、texlab / tombi の Windows 向けの取得物（zip の中の tako が取り出す 1 つ）・sourcekit-lsp（Swift toolchain に同梱）・dart・vscode-css-language-server / vscode-html-language-server（npm の .cmd）を Windows 実機で起こしたことはまだ無い。Arduino のスケッチ（.ino）の arduino-language-server（#1951）も、Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）と伴走の arduino-cli.exe / clangd.exe の探索は macOS の単体から固定しただけで、Windows 実機では未確認",
       "evidence": "unit-test",
-      "evidence_detail": "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）と issue1944_lsp_fetch（ローカルの配布元から偽サーバの gzip を取ってハッシュを検証して起こす・グローバル優先・ハッシュ不一致 / オフライン / 404 / 大きすぎるで未導入へ落ちる・2 つの器で 1 回だけ取る・取っている途中で閉じたら起こさない）と issue1956_lsp_servers_wave2（第 2 波の 9 つの拡張子 → 表の行と languageId・未導入なら取得の失敗の理由か導入コマンドへ落ちる）が CI の Windows ジョブで緑。zip の中の 1 つを取り出すのは lsp::archive の単体（stored / deflate）"
+      "evidence_detail": "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）と issue1944_lsp_fetch（ローカルの配布元から偽サーバの gzip を取ってハッシュを検証して起こす・グローバル優先・ハッシュ不一致 / オフライン / 404 / 大きすぎるで未導入へ落ちる・2 つの器で 1 回だけ取る・取っている途中で閉じたら起こさない）と issue1956_lsp_servers_wave2（第 2 波の 9 つの拡張子 → 表の行と languageId・未導入なら取得の失敗の理由か導入コマンドへ落ちる）と issue1951_lsp_arduino（.ino → arduino-language-server・伴走の arduino-cli / clangd と空の設定ファイルのパスが起動引数に並ぶ・基板が無ければ起こさず理由・ALS / clangd なしで未導入）が CI の Windows ジョブで緑。zip の中の 1 つを取り出すのは lsp::archive の単体（stored / deflate）"
     },
     {
       "key": "tako_menu",

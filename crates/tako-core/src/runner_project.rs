@@ -1131,6 +1131,38 @@ impl SketchYaml {
     }
 }
 
+/// スケッチのフォルダ `sketch` の基板が選ばれているか（`sketch.yaml` の `default_fqbn` か
+/// `default_profile`）。Code Runner（#1950）と言語サーバの前提（#1951。`lsp::servers::Requirement`）が
+/// 同じ 1 実装を読む。実測（arduino-language-server・同梱の arduino-cli 1.2.0）: どちらの鍵でも
+/// 言語サーバは基板を解く（`default_profile` だけでも `build.fqbn` が決まる）
+pub fn sketch_board_selected(sketch: &Path) -> bool {
+    SketchYaml::read(sketch).is_some_and(|y| y.board_selected())
+}
+
+/// 基板が選ばれていないときの案内（文と、選ぶコマンド）。`cli` は打つ arduino-cli
+/// （見つけたフルパスか名前。引用と PowerShell の呼び出し演算子は方言の `command_words` = Code Runner の
+/// `${arduino_cli}` と同じ 1 実装）。Code Runner の実行ペインの案内と言語サーバの
+/// 状態表示（#1951）が同じ文・同じコマンドを出す
+pub fn board_not_selected_note(sketch: &Path, cli: &str, platform: Platform) -> (String, String) {
+    let lang = crate::i18n::lang();
+    let dialect = crate::platform::shell::run_pane_dialect_for(platform);
+    (
+        msg_board_not_selected(lang),
+        board_attach_command(
+            &dialect.command_words(&[cli.to_string()]),
+            &dialect.quote_arg(&sketch.to_string_lossy()),
+            lang,
+        ),
+    )
+}
+
+fn board_attach_command(cli: &str, sketch_arg: &str, lang: Lang) -> String {
+    format!(
+        "{cli} board attach -b {} {sketch_arg}",
+        board_placeholder(lang)
+    )
+}
+
 /// YAML の 1 行の値（引用符を外し、行末のコメントを落とす）。空なら `None`
 fn yaml_scalar(raw: &str) -> Option<String> {
     let v = raw.trim();
@@ -1222,10 +1254,7 @@ fn plan_arduino(p: &Probe<'_>) -> Option<Planned> {
         planned.notes.push(ProjectNote {
             id: NOTE_BOARD,
             message: msg_board_not_selected(lang),
-            commands: vec![format!(
-                "{cli} board attach -b {} {sketch_arg}",
-                board_placeholder(lang)
-            )],
+            commands: vec![board_attach_command(&cli, &sketch_arg, lang)],
             unless_found: None,
             profile: None,
         });
@@ -2215,6 +2244,55 @@ mod tests {
         let m = s.detect(Platform::MacOs, "Outer/inner/inner.ino").unwrap();
         assert_eq!(s.rel(&m.root), "Outer/inner");
         assert!(ids(&m).contains(&"board_not_selected"), "{:?}", ids(&m));
+    }
+
+    /// #1951: 言語サーバの前提も同じ 1 実装（基板の判定・案内の文・選ぶコマンド）を使う
+    #[test]
+    fn 基板の判定と案内は言語サーバと同じ1実装() {
+        let s = Sandbox::new("arduino-board-1951");
+        s.write("Blink/Blink.ino", BLINK);
+        let sketch = s.base.join("Blink");
+        assert!(!sketch_board_selected(&sketch), "sketch.yaml が無い");
+        s.write("Blink/sketch.yaml", "default_port: /dev/cu.usbmodem1101\n");
+        assert!(
+            !sketch_board_selected(&sketch),
+            "ポートだけでは基板にならない"
+        );
+        s.write("Blink/sketch.yaml", "default_fqbn: arduino:avr:uno\n");
+        assert!(sketch_board_selected(&sketch));
+        s.write(
+            "Blink/sketch.yaml",
+            "profiles:\n  uno:\n    fqbn: arduino:avr:uno\ndefault_profile: uno\n",
+        );
+        assert!(
+            sketch_board_selected(&sketch),
+            "default_profile でも基板が決まる"
+        );
+        // 案内の文は Code Runner の実行ペインと同じ。コマンドは名前のままなら引用しない（#322）
+        let (message, command) = board_not_selected_note(&sketch, "arduino-cli", Platform::MacOs);
+        assert_eq!(message, msg_board_not_selected(crate::i18n::lang()));
+        let sketch_arg = crate::shell::quote_for_shell(&sketch.to_string_lossy());
+        assert_eq!(
+            command,
+            format!(
+                "arduino-cli board attach -b {} {sketch_arg}",
+                board_placeholder(crate::i18n::lang())
+            )
+        );
+        // IDE 同梱のフルパス（空白を含む）は引用し、PowerShell では呼び出し演算子を付ける
+        let ide = "/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli";
+        let (_, command) = board_not_selected_note(&sketch, ide, Platform::MacOs);
+        assert!(
+            command.starts_with(&format!("'{ide}' board attach -b ")),
+            "{command}"
+        );
+        let win = r"C:\Users\winuser\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe";
+        let (_, command) =
+            board_not_selected_note(Path::new(r"C:\s\Blink"), win, Platform::Windows);
+        assert!(
+            command.starts_with(&format!("& '{win}' board attach -b ")),
+            "{command}"
+        );
     }
 
     #[test]

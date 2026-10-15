@@ -409,7 +409,8 @@ fn launch_plan(
         Fetch::Binary { .. } => {
             let program = table::binary_program(dir, spec.program, windows);
             let program = program.to_string_lossy().into_owned();
-            let args: Vec<&str> = spec.args.to_vec();
+            // 取れる行は固定の引数だけ（伴走・空のファイルを持たない = 表の単体が固定する）
+            let args: Vec<&str> = spec.literal_args();
             Some(Managed {
                 plan: plan_for(&program, &args)?,
                 program_path: program,
@@ -428,7 +429,7 @@ fn launch_plan(
             };
             let entry = dir.join(entry).to_string_lossy().into_owned();
             let mut args: Vec<&str> = vec![entry.as_str()];
-            args.extend(spec.args.iter().copied());
+            args.extend(spec.literal_args());
             let mut lease_dirs = vec![dir.to_path_buf()];
             if source == "managed" {
                 lease_dirs.push(table::node_dir(&config.root, &table::NODE));

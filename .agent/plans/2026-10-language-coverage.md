@@ -330,6 +330,44 @@ open_plan 7・インデント 5）。
 7. 常駐: ALS + clangd + arduino-cli の別プロセスで合計およそ 90 MB（avr・12 行のスケッチ・
    1 セッションの概算。稼働中の IDE のプロセスと名前が同じなので内訳は曖昧）。tako のヒープではない
 
+**実装で決めたこと（#1951）**（正本は `.agent/requirements.md` FR-3.46）:
+
+- **表の形**: `ServerSpec.args` を `Arg` の列にした（`Lit` = 固定の文字列 / `Companion(名前)` = 伴走の実行ファイルの
+  パス / `EmptyFile(名前)` = tako が `<data_dir>/lsp-config/<id>/<名前>` に 0 バイトで用意するファイルのパス）。
+  行に `root_scope`（`FileDir` = ファイルのディレクトリ。印も `.git` も見ない）・`bundled`（PATH に無いときに探す
+  アプリの同梱 = `app_bundle::ARDUINO_IDE`。#1950 と 1 実装）・`requires`（`SketchBoard { cli }`）を足した。
+  組み立ては純粋関数 `tako_core::lsp::launch`（`Platform` と `FsProbe` を受ける = Windows の `.exe` の置き場を
+  macOS の単体で固定）。言語名・実行ファイル名は表の中だけ（番犬 `issue1678_lsp_watchdog` の `table_values` に
+  伴走とファイルの名前も足した）
+- **探す順**: サーバは 差し替えの env → ログインシェルの PATH（打ち切ったときも同梱にあれば使う）→ 同梱。
+  伴走は **見つけたサーバと同じディレクトリ** → PATH → 同梱。状態の `source` に `bundled` を足した
+- **基板の正本は sketch.yaml のまま**（`-fqbn` は渡さない）。判定と案内の文・コマンドは Code Runner と同じ
+  `runner_project::sketch_board_selected` / `board_not_selected_note`（`default_fqbn` か `default_profile`。
+  実測: `default_profile` だけでも ALS は基板を解く）。満たさなければ状態 `unconfigured`（状態機械の 10 番目）で
+  起こさず、`reason` / `next_step` / `setup_command`（`arduino-cli board attach -b <基板> <スケッチ>`。伴走が
+  ALS と同じ場所にあればフルパス）を返す。確かめ直すのは シェル統合の合図（tako のターミナルで board attach を
+  打った）・開き直し・`restart`（画面の帯の「もう一度確かめる」）。ファイル 1 つの読みだけでログインシェルは起こさない。
+  問い合わせ（ホバー・定義ジャンプ・補完・メニュー）は待たずに `unconfigured` で返る（上限の 120 秒まで固まらない）
+- **常駐の実測**（§5.3 の 7 の概算 90 MB の測り直し）: tako 経由（manager + 既定の解決・IDE 同梱物・arduino:avr・
+  13 行のスケッチ・読み込み後 3 秒）で ALS 20.0 MB + clangd 52.3 MB = **72.3 MB**。使い捨てのクライアントでは 83.4 MB。
+  arduino-cli は常駐しない（組み直しのたびに起きて終わる）。開いてから稼働まで 66 ms・最初の診断まで 7.5 秒
+  （隔離 HOME の冷えたビルドのキャッシュ。使い捨てのクライアントで同じ素材は 5.2 秒）
+- **伴走が無い**（`Launch::CompanionMissing`）は未導入と同じに扱い、理由に見つけたサーバのパスと伴走の名前、
+  次の一手は行の導入コマンド（IDE を入れれば揃う）。`missing_companion` を応答に足した
+- **6 の `.h` / `.cpp` は ALS へ回さない（この Issue では）**。実測（ALS 0.0.0-git = IDE 2.3.5 同梱・
+  arduino:avr:uno・`.ino` + 自作 `helper.h` + `helper.cpp`）:
+
+  | 渡し方 | `.h` | `.cpp` |
+  |---|---|---|
+  | 今（拡張子で clangd = Apple 17・db 無し） | 嘘のエラー 2 件（`'Arduino.h' file not found` / `Unknown type name 'uint8_t'`）・ホバー null | 嘘のエラー 2 件 |
+  | ALS・**先に `.ino` を開いてから**（IDE の順） | 0 件・ホバー可（`digitalWrite`）・補完可 | 0 件・ホバー可 |
+  | ALS・`.h` だけを先に（`.ino` を開かない） | 疑わしい 1 件（Xcode の SDK のヘッダで `expected identifier`）が残る。ALS の初回ビルド後（8 秒）に開いても同じ | 0 件 |
+
+  ALS へ回すと正しくなるのは「同じ器で先に `.ino` を開いた」ときだけなので、回すには tako が利用者の開いていない
+  本体の `.ino` を隠れて開く仕組み（持ち手・閉じる時機）が要る。加えて表の解決が拡張子だけでなく「ディレクトリに
+  `<フォルダ名>.ino` があるか」（ファイルシステムを見る）になり、`resolve_in` の呼び手 約 25 か所（ホバーのマウス・
+  打鍵の補完・状態の帯の描画を含む）がすべて同じ器を指す形へ揃える必要がある。別 Issue に切り出す
+
 ### 5.4 Code Runner（コンパイルと書き込み）
 
 実測（同梱の arduino-cli 1.2.0・`arduino:avr:uno`・ビルドのキャッシュは一時 dir）:

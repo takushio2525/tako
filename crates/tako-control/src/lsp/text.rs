@@ -37,6 +37,39 @@ pub const NOT_INSTALLED_NEXT_STEP: Note = Note::new(
     "Install it: {command} (it starts automatically when installed from a tako terminal; otherwise run tako lsp restart)",
 );
 
+// --- アプリの同梱・伴走・起こす前提（#1951）------------------------------------------
+
+/// 同梱も探す行の未導入の理由。`{program}` / `{bundle}` = 同梱するアプリの名前
+pub const BUNDLED_NOT_INSTALLED_REASON: Note = Note::new(
+    "{program} が見つからない（ログインシェルの PATH にも {bundle} の同梱にも無い）",
+    "{program} was not found (neither on the login shell PATH nor bundled with {bundle})",
+);
+
+/// サーバは見つかったが、起動に要る伴走の実行ファイルが無い。`{path}` = 見つけたサーバ・`{program}` = 伴走
+pub const COMPANION_NOT_FOUND_REASON: Note = Note::new(
+    "{path} は見つかったが、起動に要る {program} が見つからない（同じ場所・ログインシェルの PATH・アプリの同梱を探した）",
+    "{path} was found, but {program} that it needs was not (searched the same folder, the login shell PATH and the app bundle)",
+);
+
+/// tako が用意する空の設定ファイルを作れない。`{path}` / `{error}`
+pub const EMPTY_FILE_FAILED_DETAIL: Note = Note::new(
+    "起動に渡す設定ファイル {path} を作れない: {error}",
+    "could not create the config file {path} passed at startup: {error}",
+);
+
+/// 起こす前提が整っていない（Arduino のスケッチの基板が未選択）。`{detail}` = 前提の側の文
+/// （Code Runner の案内と同じ 1 実装 = `tako_core::runner_project::board_not_selected_note`）
+pub const UNCONFIGURED_REASON: Note = Note::new(
+    "言語サーバを起こしていない: {detail}",
+    "The language server is not started: {detail}",
+);
+
+/// 前提を満たす次の一手。`{command}`。tako のターミナルで打てばシェル統合の合図で確かめ直して起きる
+pub const UNCONFIGURED_NEXT_STEP: Note = Note::new(
+    "{command}（tako のターミナルで実行すれば自動で起きる。外で実行したら tako lsp restart）",
+    "{command} (it starts automatically when run from a tako terminal; otherwise run tako lsp restart)",
+);
+
 // --- 取得（#1944）--------------------------------------------------------------
 // 未導入のサーバを tako の data dir へ取る。失敗したら理由を出して上の「導入する」の案内へ落ちる
 

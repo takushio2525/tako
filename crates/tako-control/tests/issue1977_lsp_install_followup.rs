@@ -29,7 +29,7 @@ use tako_control::lsp::{
 };
 use tako_core::lsp::completion::Trigger;
 use tako_core::lsp::fetch::{self as table, Fetch};
-use tako_core::lsp::servers::{self, DocumentKind, InstallHint, ServerSpec};
+use tako_core::lsp::servers::{self, Arg, DocumentKind, InstallHint, RootScope, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
 
@@ -315,9 +315,17 @@ fn binary_spec(scratch: &Scratch, version: &'static str) -> &'static ServerSpec 
             language_id: "fakesweep",
         }])),
         program: PROGRAM,
-        args: Box::leak(args.into_boxed_slice()),
+        args: Box::leak(
+            args.into_iter()
+                .map(Arg::Lit)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
         root_markers: &["sweep.marker"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "install-fake-sweep-yourself",
             windows: "install-fake-sweep-yourself",

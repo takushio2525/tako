@@ -283,11 +283,13 @@ tako preview-reload off
 | Dart（`.dart`） | dart（`dart language-server`） | 取ってこない（Dart SDK・Flutter に入っています） |
 | CSS / SCSS / Less（`.css` `.scss` `.less`） | vscode-css-language-server | 取ってこない（`npm install -g vscode-langservers-extracted`） |
 | HTML（`.html` `.htm`） | vscode-html-language-server | 取ってこない（同上。誤りの波線は `<style>` / `<script>` の中だけ） |
+| Arduino のスケッチ（`.ino`） | arduino-language-server（Arduino IDE に同梱） | 取ってこない（`brew install --cask arduino-ide`。IDE を入れていれば追加の導入はいりません） |
 
 - **グローバルに入っていればそちらを使います**。無いときだけ、版を固定したものを tako のデータフォルダへ取り、配布元が公開しているハッシュで確かめてから使います。npm や Homebrew は起こさず、PATH も書き換えません。pyright と typescript-language-server は Node.js で動くので、足りる版の node が PATH に無ければ Node.js 24.21.0 も一緒に取ります
 - 状態は編集中のペインの上に「取得中（取っているものと n / m MB）→ 起動中 → 読み込み中 → 動作中」と出ます。取れなかった・止まったときはその下に帯が出て、理由と「入れる」「もう一度取得」「起こし直す」のボタンが並びます
 - 前もって入れておく・取り直すときは `tako lsp install`、状態を見るときは `tako lsp status` です
 - 表に無い言語（Java・Go・YAML・JSON など）は、今は言語サーバを起こしません（色分けと編集はそのまま使えます）
+- **Arduino のスケッチ（`.ino`）は、基板を選ぶまで言語サーバを起こしません**（基板が無いと誤りの波線も説明のカードも出ないため）。選んでいないときは編集中のペインの上に帯が出て、選ぶコマンド `arduino-cli board attach -b <基板> <スケッチのフォルダ>` を案内します（基板の名前の例: `arduino:avr:uno`。選ぶとスケッチのフォルダの `sketch.yaml` に書かれ、Arduino IDE とも共有されます）。tako のターミナルで打てばそのまま起き、外で打ったときは帯の「もう一度確かめる」を押します。言語サーバ・arduino-cli・clangd は PATH か Arduino IDE の同梱から探すので、授業で IDE を入れている PC はそのまま使えます。スケッチの中の `.h` / `.cpp` は今は C / C++ の言語サーバ（clangd）が受け持ちます
 - TOML の説明のカードは、ファイルに合うスキーマがあるときに出ます（`Cargo.toml`・`pyproject.toml` など）。tombi はスキーマの一覧を SchemaStore（schemastore.org）へ問い合わせますが、`Cargo.toml` と `pyproject.toml` は内蔵のスキーマでオフラインでも出ます
 
 | 操作 | macOS | Windows |

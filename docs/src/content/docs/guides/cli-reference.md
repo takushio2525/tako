@@ -449,7 +449,7 @@ tako title --pane 3 ""   # 空文字でクリア（自動リネームに戻る�
 
 ### tako lsp
 
-コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright / LaTeX = texlab / TOML = tombi / Swift = sourcekit-lsp / Dart = dart / CSS・SCSS・Less = vscode-css-language-server / HTML = vscode-html-language-server）が自動的に起きます。**入っていなければ、tako がその場で取ってきて起こします**（pyright / typescript-language-server / rust-analyzer / texlab / tombi。置き場は tako のデータフォルダで、npm や brew のグローバルには入れません。Node.js が要るサーバは、足りる Node.js が無ければそれも取ります。PATH に入っている版があればそちらを使います）。エディタのタイトルに「取得中 / 起動中 / 読み込み中 / 動作中」が出て、取れなかったときはタイトルの下に理由と「もう一度取得」のボタンが出ます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」、整形は「コードを整形する」、補完は「補完の候補を読む」を参照してください。
+コードプレビューを**編集モードにすると**、拡張子に合う言語サーバ（Rust = rust-analyzer / C・C++ = clangd / TypeScript・JavaScript = typescript-language-server / Python = pyright / LaTeX = texlab / TOML = tombi / Swift = sourcekit-lsp / Dart = dart / CSS・SCSS・Less = vscode-css-language-server / HTML = vscode-html-language-server / Arduino のスケッチ（`.ino`）= arduino-language-server）が自動的に起きます。**入っていなければ、tako がその場で取ってきて起こします**（pyright / typescript-language-server / rust-analyzer / texlab / tombi。置き場は tako のデータフォルダで、npm や brew のグローバルには入れません。Node.js が要るサーバは、足りる Node.js が無ければそれも取ります。PATH に入っている版があればそちらを使います）。エディタのタイトルに「取得中 / 起動中 / 読み込み中 / 動作中」が出て、取れなかったときはタイトルの下に理由と「もう一度取得」のボタンが出ます。`tako lsp` はその状態を見たり、起こし直したり、診断（エラー・警告）を一覧したりするコマンドです。診断は画面でも、コードの波線（エラー = 赤 / 警告 = 黄 / 情報 = 青 / ヒント = 灰）と右パネルの diagnostics ビューに出ます。定義ジャンプは下の「定義へ飛ぶ」、整形は「コードを整形する」、補完は「補完の候補を読む」を参照してください。
 
 ```bash
 tako lsp status          # 状態（稼働中か・pid・診断の件数）。未導入なら理由と導入コマンド
@@ -463,6 +463,8 @@ tako lsp diagnostics --pane 7 --severity warning   # そのペインの、警告
 ```
 
 `--name rust-analyzer` のように 1 つだけを指定できます。MCP では `tako_lsp_server`（`action` 引数）が同じ操作です。
+
+Arduino のスケッチ（`.ino`）は**基板を選ぶまで言語サーバを起こしません**。そのあいだ `tako lsp status` の `state` は `unconfigured` で、理由と選ぶコマンド（`setup_command` = `arduino-cli board attach -b <基板> <スケッチのフォルダ>`）が返ります。tako のターミナルで選べばそのまま起き、外で選んだときは `tako lsp restart` です。
 
 `tako lsp servers` の答え（入っているか・どこに在るか）は覚えておくので、2 回目からはすぐ返ります。探し直すのは `tako lsp restart` のときと、tako のターミナルでコマンドを実行したり `cd` したりしたとき（PATH が変わりうるため）です。同じファイルを 2 つのペインで編集しても、言語サーバには 1 つの文書として届き、診断は両方のペインに出ます。
 

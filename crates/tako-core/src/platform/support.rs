@@ -237,8 +237,8 @@ pub mod notes {
     );
 
     pub const WIN_LSP_REAL_SERVER_UNMEASURED: Note = Note::new(
-        "言語サーバの起動・握手・文書同期と、未導入のサーバを data dir へ取って起こす経路（#1944）は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことも、配布元から実際に取ったこともまだ無い（#1007）。第 2 波の 6 行（#1956）も同じで、texlab / tombi の Windows 向けの取得物（zip の中の tako が取り出す 1 つ）・sourcekit-lsp（Swift toolchain に同梱）・dart・vscode-css-language-server / vscode-html-language-server（npm の .cmd）を Windows 実機で起こしたことはまだ無い",
-        "Starting, handshaking, syncing documents and fetching a missing server into the data dir (#1944) are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken or downloaded from its real source on real Windows hardware yet (#1007). The same holds for the six second-wave rows (#1956): the Windows downloads of texlab / tombi (one file tako extracts from the zip), sourcekit-lsp (shipped with the Swift toolchain), dart and vscode-css-language-server / vscode-html-language-server (npm .cmd shims) have not been started on real Windows hardware yet",
+        "言語サーバの起動・握手・文書同期と、未導入のサーバを data dir へ取って起こす経路（#1944）は偽サーバの e2e で確かめているが、Windows 実機で実サーバ（rust-analyzer 等）と握手したことも、配布元から実際に取ったこともまだ無い（#1007）。第 2 波の 6 行（#1956）も同じで、texlab / tombi の Windows 向けの取得物（zip の中の tako が取り出す 1 つ）・sourcekit-lsp（Swift toolchain に同梱）・dart・vscode-css-language-server / vscode-html-language-server（npm の .cmd）を Windows 実機で起こしたことはまだ無い。Arduino のスケッチ（.ino）の arduino-language-server（#1951）も、Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）と伴走の arduino-cli.exe / clangd.exe の探索は macOS の単体から固定しただけで、Windows 実機では未確認",
+        "Starting, handshaking, syncing documents and fetching a missing server into the data dir (#1944) are covered by the fake-server e2e, but no real language server (rust-analyzer etc.) has been handshaken or downloaded from its real source on real Windows hardware yet (#1007). The same holds for the six second-wave rows (#1956): the Windows downloads of texlab / tombi (one file tako extracts from the zip), sourcekit-lsp (shipped with the Swift toolchain), dart and vscode-css-language-server / vscode-html-language-server (npm .cmd shims) have not been started on real Windows hardware yet. For Arduino sketches (.ino), the arduino-language-server row (#1951) — looking it up in the Arduino IDE bundle (%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…) together with its arduino-cli.exe / clangd.exe companions — is only pinned by macOS unit tests and has not been verified on real Windows",
     );
 
     /// LSP の言語機能（診断 #1679 / 定義ジャンプ #1680）。受信・問い合わせ・変換・絞り込み・着地は
@@ -844,14 +844,15 @@ pub const MATRIX: &[Feature] = &[
         // zip の取得物（実の rust-analyzer / node.exe）を Windows 実機で取って起こしたことはまだ無い。
         // #1956 の第 2 波（texlab / tombi の zip・sourcekit-lsp・dart・CSS / HTML の npm の .cmd）も同じ。
         // 行と languageId の選び方は OS 分岐を持たず、偽サーバの e2e（issue1956_lsp_servers_wave2）が
-        // Windows の CI でも走る
+        // Windows の CI でも走る。#1951 の Arduino（IDE 同梱の置き場・`.exe` の伴走）は lsp::launch の
+        // 単体（Platform::Windows の置き場を macOS 上で固定）と issue1951_lsp_arduino（偽の同梱）だけ
         macos: Support::Supported,
         windows: Support::Pending {
             note: notes::WIN_LSP_REAL_SERVER_UNMEASURED,
             issue: 1007,
         },
         windows_evidence: Evidence::UnitTest(
-            "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）と issue1944_lsp_fetch（ローカルの配布元から偽サーバの gzip を取ってハッシュを検証して起こす・グローバル優先・ハッシュ不一致 / オフライン / 404 / 大きすぎるで未導入へ落ちる・2 つの器で 1 回だけ取る・取っている途中で閉じたら起こさない）と issue1956_lsp_servers_wave2（第 2 波の 9 つの拡張子 → 表の行と languageId・未導入なら取得の失敗の理由か導入コマンドへ落ちる）が CI の Windows ジョブで緑。zip の中の 1 つを取り出すのは lsp::archive の単体（stored / deflate）",
+            "issue1678_lsp_e2e（偽サーバとの握手・送信列・分割受信・再起動の上限・親が落ちたら子も終わる）と issue1944_lsp_fetch（ローカルの配布元から偽サーバの gzip を取ってハッシュを検証して起こす・グローバル優先・ハッシュ不一致 / オフライン / 404 / 大きすぎるで未導入へ落ちる・2 つの器で 1 回だけ取る・取っている途中で閉じたら起こさない）と issue1956_lsp_servers_wave2（第 2 波の 9 つの拡張子 → 表の行と languageId・未導入なら取得の失敗の理由か導入コマンドへ落ちる）と issue1951_lsp_arduino（.ino → arduino-language-server・伴走の arduino-cli / clangd と空の設定ファイルのパスが起動引数に並ぶ・基板が無ければ起こさず理由・ALS / clangd なしで未導入）が CI の Windows ジョブで緑。zip の中の 1 つを取り出すのは lsp::archive の単体（stored / deflate）",
         ),
     },
     Feature {

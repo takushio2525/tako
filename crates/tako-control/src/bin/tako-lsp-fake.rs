@@ -171,6 +171,10 @@
 //!   必ず済んだと知っている（#1930 の問い直しを決定的に通す）
 //! - `--log-delay-ms <ms>`（`TAKO_LSP_FAKE_LOG_DELAY_MS`）: 受けたメッセージを `--log` へ書く前に
 //!   待つ（manager が「送った」ものがログに「届いた」と載るのが遅れる = #1930 の 1684 の形）
+//!
+//! `TAKO_LSP_FAKE_ARGV_LOG=<ファイル>`（#1951）: 起動のたびに自分の起動引数（0 番 = 実行ファイルを含む）を
+//! 1 行 1 JSON の配列で追記する。知らない引数は読み飛ばすので、検出表の行が組んだ引数（`-cli <パス>` 等）を
+//! そのまま受けて、何が並んだかを e2e が読める（env だけで指定する = 起動引数を汚さない）
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -181,6 +185,10 @@ fn arg_or_env(args: &[String], flag: &str, env: &str) -> Option<String> {
         .or_else(|| std::env::var(env).ok().filter(|v| !v.is_empty()))
 }
 
+/// 1 行を追記する。**本文と改行を 1 回の書き込みで**（#1951）: `writeln!` は書式の部品ごとに書く
+/// （本文・改行の 2 回）ので、同じログを 2 つの偽サーバが同時に書く（器が 2 つ = shutdown を同時に受ける）と
+/// 「本文 A・本文 B・改行・改行」と混ざってどちらの行も読めなくなる（Windows の CI で shutdown が 0 件と
+/// 数えられた）。追記モードの 1 回の書き込みはまとめて末尾へ付く
 fn append(path: &Option<String>, line: &str) {
     if let Some(path) = path {
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -188,7 +196,7 @@ fn append(path: &Option<String>, line: &str) {
             .append(true)
             .open(path)
         {
-            let _ = writeln!(file, "{line}");
+            let _ = file.write_all(format!("{line}\n").as_bytes());
         }
     }
 }
@@ -923,6 +931,12 @@ fn main() {
     let mut disk: Option<Disk> = None;
     let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     append(&spawns, &std::process::id().to_string());
+    append(
+        &std::env::var("TAKO_LSP_FAKE_ARGV_LOG")
+            .ok()
+            .filter(|v| !v.is_empty()),
+        &serde_json::Value::from(args.clone()).to_string(),
+    );
     eprintln!("tako-lsp-fake: scenario={scenario}");
     if scenario == "die" {
         // 起動直後に即死する（initialize を 1 通も読まない）
