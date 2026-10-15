@@ -445,10 +445,15 @@ fn 報告スクリプトは件数と名前を出し0件で落ちる() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
     let script = repo_root().join("scripts/ci-real-tmux-report.sh");
+    // CI の macOS ランナーの既定ロケール（en_US.UTF-8）で走らせる。この照合順序では
+    // 日本語のテスト名どうしが「等しい」扱いになり、`sort -u` が別のテストを 1 本へ潰した
+    // （#2106 の初回の CI で 52 回 → 51 本と数え、issue1293 の 1 本が名前ごと消えた）
     let run = |ledger: &Path| {
         Command::new("bash")
             .arg(&script)
             .arg(ledger)
+            .env("LC_ALL", "en_US.UTF-8")
+            .env("LANG", "en_US.UTF-8")
             .output()
             .expect("bash を起こせる")
     };
@@ -456,20 +461,28 @@ fn 報告スクリプトは件数と名前を出し0件で落ちる() {
     let filled = dir.join("filled.tsv");
     std::fs::write(
         &filled,
-        "a::t1\tcrates/x/src/a.rs:10\na::t1\tcrates/x/src/a.rs:10\nt2\tcrates/y/tests/b.rs:5\n",
+        "a::t1\tcrates/x/src/a.rs:10\na::t1\tcrates/x/src/a.rs:10\nt2\tcrates/y/tests/b.rs:5\n\
+         issue1_会話ログの上の下見\tcrates/y/tests/c.rs:7\nissue1_番号指定は選択肢へ\tcrates/y/tests/c.rs:9\n",
     )
     .unwrap();
     let ok = run(&filled);
     let ok_text = text(&ok);
     assert!(ok.status.success(), "台帳があるのに落ちた:\n{ok_text}");
     assert!(
-        ok_text.contains("2 本（門を通った回数 3"),
-        "同じテストの重複を 1 本に数えた件数が出ていない:\n{ok_text}"
+        ok_text.contains("4 本（門を通った回数 5"),
+        "同じテストの重複だけを 1 本に数え、日本語の別のテストは潰さない件数が出ていない:\n{ok_text}"
     );
-    assert!(
-        ok_text.contains("a::t1") && ok_text.contains("t2"),
-        "テスト名が出ていない:\n{ok_text}"
-    );
+    for name in [
+        "a::t1",
+        "t2",
+        "issue1_会話ログの上の下見",
+        "issue1_番号指定は選択肢へ",
+    ] {
+        assert!(
+            ok_text.contains(name),
+            "テスト名 {name} が出ていない:\n{ok_text}"
+        );
+    }
 
     let empty = dir.join("empty.tsv");
     std::fs::write(&empty, "").unwrap();

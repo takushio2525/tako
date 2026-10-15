@@ -2735,7 +2735,10 @@ CI の macOS ランナー（image `macos-26-arm64`）には tmux が無く、実
   （本物の tmux が無い）。値は未設定・空・`0` だけが「許す」で、`true` 等の綴り違いは禁じる側
 - **`TAKO_TEST_TMUX_LEDGER=<file>` の下では、門を通ったテストの名前（スレッド名 = テスト名）と
   門を呼んだ `file:line` を 1 行ずつ追記する**。CI は `scripts/ci-real-tmux-report.sh` で
-  件数・ファイルごとの本数・テスト名をログへ出し、0 件（配線切れ）なら落とす
+  件数・ファイルごとの本数・テスト名をログへ出し、0 件（配線切れ）なら落とす。
+  **数えるシェルは `LC_ALL=C` で `sort` / `uniq` する**: ランナーの既定（en_US.UTF-8）の照合順序では
+  日本語のテスト名どうしが「等しい」扱いになり、初回の CI は `sort -u` が別のテストを潰して
+  52 回 → 51 本と数えた（`issue1293_会話ログの上の…` と `issue1293_番号指定は…` が 1 本に）
 - 手元で「tmux が無い」を作るときは PATH から外すだけでは足りない（`tmux_bin()` は既知の場所と
   ログインシェルまで探す）。`TAKO_TMUX_BIN=<実在しないパス>` で解決順の全段を塞ぐ
 - 番犬は `crates/tako-control/tests/issue2106_real_tmux_gate_watchdog.rs`: ①門を通らない

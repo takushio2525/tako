@@ -17,6 +17,11 @@
 
 set -u
 
+# sort / uniq はバイトで比べる。CI の macOS ランナーの既定（en_US.UTF-8）の照合順序では
+# 日本語のテスト名どうしが「等しい」扱いになり、`sort -u` が別のテストを 1 本へ潰した
+# （#2106 の初回の CI: `issue1293_会話ログの上の…` と `issue1293_番号指定は…` が 1 本に数えられた）
+export LC_ALL=C
+
 ledger="${1:-}"
 if [ -z "${ledger}" ]; then
   echo "使い方: bash scripts/ci-real-tmux-report.sh <台帳>" >&2
