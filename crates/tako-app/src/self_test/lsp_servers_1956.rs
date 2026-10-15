@@ -5,6 +5,9 @@
 //! 素材は `scripts/test-lsp-servers-1956.sh` が用意する（サーバの置き場・ログインシェルの PATH・誤りを
 //! 含むファイル）。`TAKO_1956_CASES` は 1 行 1 件 `<ファイル>\t<行>\t<桁>`（ホバーを置く位置。0 起点・
 //! 桁はバイト）。受け持つサーバは検出表から引く（言語名・サーバ名をここに書かない）。
+//! 4 列目に `unconfigured` を書いた件（#1951。`scripts/test-lsp-arduino-1951.sh` の基板の無いスケッチ）は、
+//! サーバを起こさず「前提が未設定」の帯（理由・選ぶコマンド・確かめ直すボタン）が描かれた画面
+//! （`<id>-unconfigured.png`）を落とす。
 //!
 //! 1 件ごとに: ① 編集モードで開く → 稼働して読み込みが済む ② 診断が 1 件以上、画面の写しまで届く
 //! （波線。`<id>-diag.png`）
@@ -38,11 +41,13 @@ fn drawn(app: &TakoApp, pane: PaneId) -> usize {
         .map_or(0, |d| d.items.len())
 }
 
-/// 1 件（ファイル・ホバーを置く行と桁）
+/// 1 件（ファイル・ホバーを置く行と桁・期待する状態）
 struct Case {
     path: std::path::PathBuf,
     line: usize,
     column: usize,
+    /// `Some("unconfigured")` = 起こす前提が未設定の帯を撮る（#1951）。`None` = 波線とホバー
+    expect: Option<String>,
 }
 
 fn cases() -> Vec<Case> {
@@ -64,6 +69,7 @@ fn cases() -> Vec<Case> {
                 column: c
                     .parse()
                     .unwrap_or_else(|_| fail("visual-test lsp-servers: 桁")),
+                expect: parts.next().map(str::to_string),
             }
         })
         .collect()
@@ -142,6 +148,10 @@ pub(super) async fn lsp_servers_visual(
             .ok()
             .flatten()
             .unwrap_or_else(|| case.path.clone());
+        if case.expect.as_deref() == Some("unconfigured") {
+            unconfigured_bar(any, window, cx, pane, id, started).await;
+            continue;
+        }
         let mut ready_ms = None;
         let mut diagnosed_ms = None;
         let mut last = String::new();
@@ -262,4 +272,55 @@ pub(super) async fn lsp_servers_visual(
         hover_move(any, cx, point(px(2.0), px(2.0)));
         notify_and_draw(any, window, cx);
     }
+}
+
+/// 起こす前提が未設定（#1951）の件: 状態が unconfigured になり、帯（理由・次の一手・確かめ直すボタン）が
+/// 描かれるまで待って撮る。ボタンの矩形（`preview-lsp-action-<pane>`）が描画で記録されたら帯が出ている
+async fn unconfigured_bar(
+    any: AnyWindowHandle,
+    window: WindowHandle<TakoApp>,
+    cx: &mut AsyncApp,
+    pane: PaneId,
+    id: &str,
+    started: std::time::Instant,
+) {
+    use tako_core::lsp::state::ServerState;
+    const LABEL: &str = "lsp-servers";
+    let probe = format!("preview-lsp-action-{}", pane.as_u64());
+    let mut seen = None;
+    let mut last = String::new();
+    while started.elapsed() < Duration::from_secs(60) {
+        notify_and_draw(any, window, cx);
+        let (server, drawn_bar) = window
+            .update(cx, |app, _, _| {
+                (
+                    app.lsp_document_server(pane),
+                    app.panel_click_probe_bounds.borrow().contains_key(&probe),
+                )
+            })
+            .unwrap_or((None, false));
+        if let Some(server) = &server {
+            last = format!(
+                "state={:?} reason={:?} next_step={:?}",
+                server.state, server.reason, server.next_step
+            );
+            if server.state == ServerState::Unconfigured
+                && server.reason.is_some()
+                && server.next_step.is_some()
+                && drawn_bar
+            {
+                seen = Some(started.elapsed().as_millis());
+                break;
+            }
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(50))
+            .await;
+    }
+    println!("TAKO_VISUAL_PIXEL: {LABEL} id={id} unconfigured_ms={seen:?} {last}");
+    check(
+        seen.is_some(),
+        &format!("visual-test {LABEL} {id}: 前提が未設定の帯が描かれる（{last}）"),
+    );
+    dump(any, cx, &format!("{id}-unconfigured.png"));
 }

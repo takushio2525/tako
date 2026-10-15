@@ -170,6 +170,13 @@ EOF
 printf 'default_fqbn: arduino:avr:uno\n' > "$S/Blink/sketch.yaml"
 cp "$S/Blink/Blink.ino" "$S/NoBoard/NoBoard.ino"
 cp "$S/Blink/helper.h" "$S/NoBoard/helper.h"
+# ② の帯の画像用（基板なし）と、⓪ の実経路用の複製（⓪ は NoBoard に基板を書くので ③ と分ける）
+mkdir -p "$S/NoBoardVt"
+cp "$S/Blink/Blink.ino" "$S/NoBoardVt/NoBoardVt.ino"
+cp "$S/Blink/helper.h" "$S/NoBoardVt/helper.h"
+S0="$TMP/sketches0"
+mkdir -p "$S0/.git"
+cp -R "$S/Blink" "$S/NoBoard" "$S0/"
 
 start_gui() { # start_gui <data> <ログ> [VAR=VAL…]
   local data="$1" log="$2"
@@ -225,7 +232,7 @@ echo
 echo "== ⓪ GUI を除いた tako の実経路で実の同梱物を起こす（manager + 既定の解決） =="
 if [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
   # cargo と rustup は本物の HOME で動かし、テストの子プロセスだけを隔離 HOME で起こす
-  (cd "$REPO_ROOT" && HOME="$REAL_HOME" TAKO_1951_REAL_HOME="$TMP/home" TAKO_1951_REAL_SKETCHES="$S" \
+  (cd "$REPO_ROOT" && HOME="$REAL_HOME" TAKO_1951_REAL_HOME="$TMP/home" TAKO_1951_REAL_SKETCHES="$S0" \
     run_heavy cargo test -q -p tako-control --test issue1951_lsp_arduino \
     実機_arduino_ide_の同梱物で診断とホバーと補完が出る -- --exact --nocapture) > "$TMP/real.log" 2>&1
   real_rc=$?
@@ -313,13 +320,14 @@ if [ "$GUI_OK" = 1 ] && [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
   stop_gui
 
   echo
-  echo "== ② visual-test lsp-servers（同じ .ino。波線の画面とホバーのカード） =="
+  echo "== ② visual-test lsp-servers（同じ .ino の波線とホバーのカード + 基板なしの帯） =="
   launch_isolated_gui "$TMP/vt.log" HOME="$TMP/home" ZDOTDIR="$TMP/zdot" PATH="$MIN_PATH" \
     TAKO_PERSIST=0 TAKO_AUTORENAME=0 TAKO_DATA_DIR="$TMP/data-vt" \
     TAKO_DISCOVERY_DIR="$TMP/disc" TAKO_ORCHESTRATOR_DIR="$TMP/orch" \
     TAKO_TMUX_SOCKET="$TMUX_SOCKET" \
     TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=lsp-servers TAKO_VISUAL_DUMP_DIR="$DUMP" \
-    TAKO_1956_CASES="$(printf '%s\t%s\t%s' "$S/Blink/Blink.ino" 5 4)" || exit $?
+    TAKO_1956_CASES="$(printf '%s\t%s\t%s\n%s\t%s\t%s\t%s' "$S/Blink/Blink.ino" 5 4 \
+      "$S/NoBoardVt/NoBoardVt.ino" 5 4 unconfigured)" || exit $?
   vpid="$ISOLATED_GUI_PID"
   for _ in $(seq 1 6000); do
     kill -0 "$vpid" 2>/dev/null || break
@@ -329,7 +337,7 @@ if [ "$GUI_OK" = 1 ] && [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
   ISOLATED_GUI_PID=""
   grep "TAKO_VISUAL_PIXEL: lsp-servers id=\|TAKO_VISUAL_DUMP_FILE" "$TMP/vt.log" | sed "s#$TMP#<tmp>#g; s/^/    /"
   if grep -q "TAKO_VISUAL_TEST_OK" "$TMP/vt.log"; then
-    pass "visual-test lsp-servers: .ino で波線とホバーのカードが出る（TAKO_VISUAL_TEST_OK）"
+    pass "visual-test lsp-servers: .ino で波線とホバーのカード・基板なしで帯が出る（TAKO_VISUAL_TEST_OK）"
   else
     fail "visual-test lsp-servers: $(grep -h 'FAILED' "$TMP/vt.log" | head -1)"
   fi

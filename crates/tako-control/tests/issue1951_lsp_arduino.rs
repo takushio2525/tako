@@ -671,10 +671,14 @@ fn 子プロセス_実機の同梱物で問い合わせる() {
         &std::fs::read_to_string(&no_board).unwrap(),
         1,
     );
-    wait_for("基板なしは前提の未設定", Duration::from_secs(60), || {
-        status = find(&no_board_root);
-        status["state"] == json!("unconfigured")
-    });
+    wait_for(
+        "基板なしは前提の未設定",
+        Duration::from_secs(60),
+        || {
+            status = find(&no_board_root);
+            status["state"] == json!("unconfigured")
+        },
+    );
     let mut entry = json!({
         "state": status["state"],
         "spawn_count": status["spawn_count"],
@@ -692,10 +696,14 @@ fn 子プロセス_実機の同梱物で問い合わせる() {
         .unwrap();
     entry["attach_exit"] = json!(attached.status.code());
     tako_core::shell_activity::note();
-    wait_for("基板を選んだら合図で稼働", Duration::from_secs(90), || {
-        status = find(&no_board_root);
-        status["state"] == json!("running")
-    });
+    wait_for(
+        "基板を選んだら合図で稼働",
+        Duration::from_secs(90),
+        || {
+            status = find(&no_board_root);
+            status["state"] == json!("running")
+        },
+    );
     entry["after_attach"] = status["state"].clone();
     result.insert("no_board".into(), entry);
     manager.shutdown_all(Duration::from_secs(5));
