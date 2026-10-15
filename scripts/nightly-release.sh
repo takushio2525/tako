@@ -32,6 +32,10 @@
 #      （GitHub Release + Pages デプロイ）
 #   7. 失敗経路（ビルド失敗 / 先端が進んだ / push 拒否 / シグナル）はすべて worktree ごと
 #      破棄して終わる。共有ツリーには残骸もリリースコミットも残らない（リモートは無傷）
+#   8. footprint の回帰の見張り（#2023）: 後始末とロックの解放が済んだ後、EXIT trap から
+#      scripts/nightly-footprint-watch.sh を回す（origin/main を std で測り、基準より悪化したら
+#      tako todo へ載せる）。**リリースの有無に依らず毎晩**・**リリースを遅らせない**・
+#      **どの結果でも終了コードを変えない**（理由は run_footprint_watch の注記）
 #
 # 両 OS 同時リリース（#965）:
 #   タグ push が GitHub Actions（.github/workflows/release-windows.yml）を起こし、
@@ -303,6 +307,9 @@ HELD_LOCKS=()
 WORKTREE=""
 WORKTREE_PARENT=""
 HEAD_REF_AT_START=""
+# ロックを取った（= この実行が夜間の本体になった）後だけ 1 にする。多重起動で抜ける・dry-run・
+# シグナルで中止した実行からは見張りを回さない（#2023）
+FOOTPRINT_WATCH_ARMED=0
 
 cleanup_worktree() {
   # cwd が worktree の中だと remove が転ぶことがあるので先に出る
@@ -335,6 +342,39 @@ check_shared_tree_invariant() {
   return 0
 }
 
+# ---- footprint の回帰の見張り（#2023）------------------------------------------
+# #814 で本番 129 MB まで削ったものが 2 か月で 400〜835 MB に戻り、誰も気づけなかった。
+# 毎晩 origin/main を同じ条件で測り（scripts/measure-footprint-2011.sh の std・tako-vd の上だけ）、
+# 直近の中央値より悪化したら tako todo へ載せる（本体は scripts/nightly-footprint-watch.sh）。
+#   - **リリースを遅らせない**: EXIT trap の最後（worktree の撤去とロックの解放の後）で回す。
+#     リリースの成否・タグ・通知はすべて済んでいる
+#   - **終了コードを変えない**: 別プロセスで回し、何が起きても `|| true` で受ける（番人
+#     tako_exit_trap が trap の前に決めた終了コードで抜ける）。蓋閉じで tako-vd が起きない夜・
+#     時間切れ・計測の失敗は見張り側が「未実測」として 1 行残して抜ける（起票しない）
+#   - **リリースの有無に依らず毎晩**: 変更なし / dirty / 手動リリース進行中で抜けた夜も回す
+#     （同じコミットを描画ありで測り済みなら見張り側が数秒で飛ばす）
+#   - 止めるときは TAKO_NIGHTLY_FOOTPRINT=0（launchd の env か手動実行で）
+run_footprint_watch() {
+  [[ "$FOOTPRINT_WATCH_ARMED" == 1 ]] || return 0
+  FOOTPRINT_WATCH_ARMED=0
+  case "${TAKO_NIGHTLY_FOOTPRINT:-1}" in
+    0 | off | false)
+      log "footprint: 見張りは止めてある（TAKO_NIGHTLY_FOOTPRINT=${TAKO_NIGHTLY_FOOTPRINT}）"
+      return 0
+      ;;
+  esac
+  local script="$REPO_ROOT/scripts/nightly-footprint-watch.sh" rc=0 line
+  if [[ ! -f "$script" ]]; then
+    log "footprint: scripts/nightly-footprint-watch.sh が無いので見張りを飛ばす"
+    return 0
+  fi
+  log "footprint: 回帰の見張りを始める（リリースの成否・終了コードには関わらない）"
+  # 1 行ずつ時刻つきでログへ流す（計測は数分かかるので、終わってからまとめて書かない）
+  /bin/bash "$script" < /dev/null 2>&1 | while IFS= read -r line; do log "  footprint: ${line}"; done || rc=$?
+  log "footprint: 見張りの終了コード ${rc}（0 = 判定済み / 3 = 未実測 / 1 = 失敗。夜間リリースの終了コードは変えない）"
+  return 0
+}
+
 # EXIT trap は tako_exit_trap で張る。launchd は /bin/bash（3.2）で起動するので、素の trap だと
 # 途中で未定義の変数などを踏んで死んでも exit 0 になり、夜間リリースが黙って成功扱いになる。
 # 成功で抜ける所はすべて tako_exit 0 を通す（印の無い 0 は番人が 1 にする。#1864）
@@ -346,9 +386,11 @@ cleanup_all() {
   cleanup_worktree
   check_shared_tree_invariant
   release_locks
+  # 後始末とロックの解放が済んでから（= リリースを遅らせない）。結果は終了コードに混ぜない（#2023）
+  run_footprint_watch || true
 }
 tako_exit_trap 'cleanup_all' "夜間リリース"
-trap 'log "ABORT: シグナルを受けたのでリリースを中止する（残骸は片付ける）"; exit 130' INT TERM
+trap 'FOOTPRINT_WATCH_ARMED=0; log "ABORT: シグナルを受けたのでリリースを中止する（残骸は片付ける）"; exit 130' INT TERM
 
 # ---- 多重起動ロック --------------------------------------------------------
 # mkdir はアトミック。stale ロック（前回実行の異常死）は記録 PID の生存で判定する。
@@ -388,6 +430,9 @@ REPO_LOCK_DIR="$GIT_COMMON_DIR/tako-nightly-release.lock"
 
 acquire_lock "$REPO_LOCK_DIR" "リポジトリ単位" || tako_exit 0
 acquire_lock "$LOCK_DIR" "HOME 単位" || tako_exit 0
+# ここから先で抜ける実行（リリースした / 変更なし / dirty / 失敗）はすべて最後に見張りを回す。
+# dry-run は「何も変更しない」なので回さない（#2023）
+[[ $DRY_RUN -eq 1 ]] || FOOTPRINT_WATCH_ARMED=1
 
 # ---- 共有ツリーに残った detached HEAD を戻す（#1136 の後始末）---------------
 # 旧版が残していった detached（先端が夜間リリースのコミット・かつ clean）だけを
