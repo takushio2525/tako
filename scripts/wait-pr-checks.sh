@@ -29,6 +29,12 @@
 #   期待名は永久に未登録のままなので、未登録が残っている間は `mergeable` も見て、
 #   衝突していたら名指しで案内して終わる（判定と案内文は lib/pr-conflict.sh の 1 実装）。
 #
+# 上限に達した = 失敗ではない（#2047）:
+#   macOS の CI が上限 2400 秒を 19 秒だけ超えた PR（#2040）を「merge してはいけない」と返した。
+#   上限は「これ以上は待たない」であって CI の結論ではないので、上限に達したら**最後にもう一度**
+#   状態を見て、全部そろって完了していればそれを結論にする（確定はいつもどおり 2 回連続の観測）。
+#   上限は --timeout > TAKO_WAIT_PR_CHECKS_TIMEOUT > 既定（DEFAULT_TIMEOUT）の順で決まる。
+#
 # 使い方: bash scripts/wait-pr-checks.sh <PR番号> [--timeout <秒>] [--interval <秒>]
 # 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
 #             4 = base と衝突していて CI の run が作られない
@@ -42,10 +48,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 外部連携のチェック（GitHub App が PR ごとに 1 本出す）。ワークフローから導出できないぶんはここ
 EXTERNAL_CHECKS=("Cloudflare Pages")
 
-# 実測（2026-09-11 の PR CI）: macOS 12〜13 分 / Windows 13〜15 分、キャッシュが冷えると 25 分。
-# job 側の timeout-minutes は macOS 60 / Windows 90 なので、ここで待ち切らない = 手順違反ではなく
-# 「揃わなかった（終了コード 2）」として返す
-DEFAULT_TIMEOUT=2400
+# 実測（2026-10-15〜16 の PR CI。#2047）: macOS 36〜54 分（PR #2141 = 54 分 30 秒）/ Windows 30〜38 分。
+# テストの本数と負荷で macOS は伸び続けている（2026-09-11 は 12〜13 分だった）。
+# 既定は **macOS の job 自身の上限（ci.yml の timeout-minutes: 60）+ 変更範囲の判定と runner 待ちの
+# 余裕 20 分** = 80 分。緑になり得る macOS の run を、CI 自身が打ち切るより先に諦めない
+# （Windows の上限 90 分は実所要がその半分以下なので追わない）。足りない日は
+# TAKO_WAIT_PR_CHECKS_TIMEOUT=<秒> か --timeout <秒> で伸ばす（--timeout が優先）
+DEFAULT_TIMEOUT=4800
 DEFAULT_INTERVAL=20
 # 待機が長いときの生存表示（秒）
 HEARTBEAT=300
@@ -62,6 +71,13 @@ LEGACY="${TAKO_1333_LEGACY:-0}"
 #   scripts/test-wait-pr-checks.sh の Test 20legacy がこの腕で待ち続けることを固定している
 LEGACY_1365="${TAKO_1365_LEGACY:-0}"
 
+# A/B（検出力の確認・計測専用）。1 = **#2047 の前**へ戻す = 上限に達した瞬間に 2 で終わる腕
+#   （最後の確認をしない・既定の上限も 2400 秒）。上限の直後に緑がそろった PR を
+#   「merge してはいけない」と誤判定する。scripts/test-wait-pr-checks.sh の Test 33 がこの腕で
+#   2 になることを固定している
+LEGACY_2047="${TAKO_2047_LEGACY:-0}"
+if [[ "${LEGACY_2047}" == "1" ]]; then DEFAULT_TIMEOUT=2400; fi
+
 die() {
   echo "エラー: $*" >&2
   exit 3
@@ -73,6 +89,8 @@ usage() {
 
   PR の CI が「期待するチェックが全部そろって、全部完了」するまで待つ。
   同じ結論を 2 回連続で観測するまで確定しない（GitHub API の揺れ対策）。
+  上限（既定 4800 秒）に達したら最後にもう一度状態を見て、そろっていればそれを結論にする。
+  上限は --timeout か環境変数 TAKO_WAIT_PR_CHECKS_TIMEOUT（秒）で変えられる（--timeout が優先）。
 
 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
             4 = base と衝突していて CI の run が作られない（取り込んで push し直す）
@@ -81,12 +99,18 @@ USAGE
 
 PR=""
 TIMEOUT="${DEFAULT_TIMEOUT}"
+TIMEOUT_SRC="既定"
+if [[ -n "${TAKO_WAIT_PR_CHECKS_TIMEOUT:-}" ]]; then
+  TIMEOUT="${TAKO_WAIT_PR_CHECKS_TIMEOUT}"
+  TIMEOUT_SRC="TAKO_WAIT_PR_CHECKS_TIMEOUT"
+fi
 INTERVAL="${DEFAULT_INTERVAL}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --timeout)
       [[ $# -ge 2 ]] || die "--timeout には秒数が要る"
       TIMEOUT="$2"
+      TIMEOUT_SRC="--timeout"
       shift 2
       ;;
     --interval)
@@ -112,7 +136,7 @@ done
   die "PR 番号が要る"
 }
 [[ "${PR}" =~ ^[0-9]+$ ]] || die "PR 番号が数値ではない: ${PR}"
-[[ "${TIMEOUT}" =~ ^[0-9]+$ ]] || die "--timeout が数値ではない: ${TIMEOUT}"
+[[ "${TIMEOUT}" =~ ^[0-9]+$ ]] || die "${TIMEOUT_SRC} が数値ではない: ${TIMEOUT}"
 [[ "${INTERVAL}" =~ ^[0-9]+$ ]] && [[ "${INTERVAL}" -ge 1 ]] || die "--interval は 1 以上の整数: ${INTERVAL}"
 command -v gh >/dev/null 2>&1 || die "gh が見つからない（https://cli.github.com/）"
 command -v jq >/dev/null 2>&1 || die "jq が見つからない（brew install jq）"
@@ -318,7 +342,7 @@ elapsed_text() {
 
 # ---------------------------------------------------------------- 待つ
 
-echo "PR #${PR} の CI を待つ（期待 ${#EXPECTED[@]} 本 / 上限 ${TIMEOUT} 秒 / 間隔 ${INTERVAL} 秒）"
+echo "PR #${PR} の CI を待つ（期待 ${#EXPECTED[@]} 本 / 上限 ${TIMEOUT} 秒 = ${TIMEOUT_SRC} / 間隔 ${INTERVAL} 秒）"
 for _name in ${EXPECTED[@]+"${EXPECTED[@]}"}; do echo "  期待: ${_name}"; done
 
 START="$(date +%s)"
@@ -328,6 +352,8 @@ LAST_HEARTBEAT=0
 POLLS=0
 CONFLICT_SEEN=0
 PROBE_WARNED=0
+# 上限に達した後に足した観測の回数（#2047。最大 2 回）
+FINAL_POLLS=0
 
 while :; do
   if ! poll_checks; then
@@ -406,10 +432,25 @@ while :; do
 
   NOW_ELAPSED=$(($(date +%s) - START))
   if [[ ${NOW_ELAPSED} -ge ${TIMEOUT} ]]; then
-    echo "タイムアウト（${TIMEOUT} 秒 / ${POLLS} 回確認）: CI が揃わなかった"
+    # 上限 = 失敗ではない（#2047）。最後にもう一度見て、そろっていればそれを結論にする。
+    # 確定はいつもどおり 2 回連続の観測なので、足す観測は最大 2 回:
+    #   1 回目 = 上限に達した後の観測 / 2 回目 = それが「全部完了」だったときだけ、同じ結論の確認。
+    # 完了でない（未登録・実行中・揺れ）と分かった時点で打ち切る = 延びるのは高々 間隔 × 2
+    if [[ "${LEGACY_2047}" != "1" && ${FINAL_POLLS} -lt 2 ]] && [[ ${FINAL_POLLS} -eq 0 || ${READY} -eq 1 ]]; then
+      if [[ ${FINAL_POLLS} -eq 0 ]]; then
+        echo "[$(now)] 上限 ${TIMEOUT} 秒に達した。時間切れ = 失敗とはせず、最後にもう一度状態を確かめる"
+      fi
+      FINAL_POLLS=$((FINAL_POLLS + 1))
+      sleep "${INTERVAL}"
+      continue
+    fi
+    echo "タイムアウト（${TIMEOUT} 秒 + 最後の確認 ${FINAL_POLLS} 回 / ${POLLS} 回確認）: CI が揃わなかった"
     if [[ ${#MISSING[@]} -gt 0 ]]; then echo "  未登録: $(join_names ${MISSING[@]+"${MISSING[@]}"})"; fi
     if [[ ${PENDING_N} -gt 0 ]]; then echo "  実行中: ${PENDING_N} 本"; fi
+    # 最後の確認を 2 回とも完了で見たのに確定しなかった = 観測ごとに結論が違った（GitHub API の揺れ）
+    if [[ ${READY} -eq 1 && ${FINAL_POLLS} -ge 2 ]]; then echo "  完了の結論が観測ごとに揺れて確定しなかった"; fi
     echo "  merge してはいけない（CI の結論が出ていない）"
+    echo "  上限は TAKO_WAIT_PR_CHECKS_TIMEOUT=<秒> か --timeout <秒> で伸ばせる（既定 ${DEFAULT_TIMEOUT} 秒）"
     exit 2
   fi
   if [[ $((NOW_ELAPSED - LAST_HEARTBEAT)) -ge ${HEARTBEAT} ]]; then
