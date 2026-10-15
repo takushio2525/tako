@@ -1604,6 +1604,18 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   - **スリープ防止（#173）のアサーションを握っている間は間引かれない**（#1926 で実測。隔離 GUI でも
     `tako sleep-guard set --mode on` で優先度 28 のまま）。性能を比べる腕ではスリープ防止の状態を揃える
 
+### 節が作る一時ファイルは `remove_on_fail` で登録する（Issue #2051）
+
+`fail()` は即 `exit(1)` するので、節の末尾の `remove_dir_all` は**落ちた経路では走らない**
+（#2046 では偽の鍵を受けたファイルが `$TMPDIR` に残りえた）。
+
+- 一時ファイル / dir のパスを決めたら、作る前でよいので `remove_on_fail(&path)` を 1 行置く。
+  `fail()` が exit の前に登録簿を消す（FR-4.8.23）。正常経路の後片付けは今までどおり節の末尾に書く
+- 登録できるのは `std::env::temp_dir()` / `TAKO_DATA_DIR` より**下**だけ（置き場そのもの・`..`・
+  外は `fail()` で止まる）。登録は外さない仕組みなので、guard を `let _ =` で落とす事故は起きない
+- 消えたかは `TAKO_APP_SELF_TEST_CLEANUP: registered=N removed=M left=K` の行で読む。
+  A/B は `TAKO_2051_LEGACY=1`、実経路は `bash scripts/test-visual-fail-cleanup-2051.sh`
+
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 
 エージェント CLI は**フッター行を自分でペイン幅に合わせて `…` で切る**。だから

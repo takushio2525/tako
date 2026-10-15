@@ -66,6 +66,7 @@ pub(super) async fn syntax_alias_visual(
     inject_section_failure(SECTION);
     ensure_fresh_scene(window, cx, SECTION).await;
     let dir = std::env::temp_dir().join(format!("tako-visual-1953-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("一時 dir");
     let dark = tako_core::theme::Theme::for_mode(tako_core::theme::ThemeMode::Dark);

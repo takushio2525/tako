@@ -237,6 +237,7 @@ pub(super) async fn rename_1686_visual(
     // ④ の答えに載せる URI は場面の前に組む（tako は開いたファイルを実パスへ直す = /private/var）
     let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
     let dir = tmp.join(format!("tako-visual-{LABEL}-{}", std::process::id()));
+    remove_on_fail(&dir);
     let main_uri = tako_core::file_uri::from_path(&dir.join("src").join("main.rs"));
     let lib_uri = tako_core::file_uri::from_path(&dir.join("src").join("lib.rs"));
     let edit = |line: u64, character: u64, len: u64| {
@@ -260,6 +261,7 @@ pub(super) async fn rename_1686_visual(
         "tako-visual-{LABEL}-rename-{}.json",
         std::process::id()
     ));
+    remove_on_fail(&rules_file);
     std::fs::write(&rules_file, rules.to_string()).expect("rename.json");
     std::env::set_var("TAKO_LSP_FAKE_RENAME", &rules_file);
     let (pane, _dir, _override_env) = completion_scene(

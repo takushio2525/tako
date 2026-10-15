@@ -339,6 +339,7 @@ pub(super) async fn run_dropdown_1733_visual(
 ) {
     // 材料（短いパス。`TAKO_DATA_DIR` の外 = 一時 dir）
     let dir = std::env::temp_dir().join(format!("tako-st1733-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     let dir = tako_core::platform::path::canonicalize(&dir).unwrap_or(dir);
