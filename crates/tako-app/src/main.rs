@@ -7339,7 +7339,11 @@ impl TakoApp {
         }
         Some(autorename::TabMaterials {
             tab: tab_id,
-            rename_tab: tab.title_source() != TitleSource::Manual,
+            // master のいるタブの名前は master 自身が付ける（#2120）
+            rename_tab: tab.title_source() != TitleSource::Manual
+                && tako_core::master_tab::app_may_name_tab(
+                    tab.tree().panes().iter().map(|p| p.role()),
+                ),
             panes,
         })
     }
@@ -7365,7 +7369,11 @@ impl TakoApp {
             .get_tab_mut(tab_id)
             .expect("直前に存在確認済み");
         let mut auto_named = false;
-        if let Some(title) = &plan.tab {
+        // 生成中（haiku の応答待ちは数十秒）に master が立ったタブへは付けない。
+        // 起動で付けたプロジェクト名を、master が立つ前の画面から作った名前で潰さない（#2120）
+        let may_name_tab =
+            tako_core::master_tab::app_may_name_tab(tab.tree().panes().iter().map(|p| p.role()));
+        if let Some(title) = plan.tab.as_ref().filter(|_| may_name_tab) {
             auto_named = tab.set_title_auto(title.clone());
         }
         let pane_ids: Vec<PaneId> = tab.tree().panes().iter().map(|p| p.id()).collect();
@@ -31720,6 +31728,12 @@ mod self_test {
     mod tasks_offload_2052;
     #[cfg(feature = "visual-test")]
     use tasks_offload_2052::tasks_offload_visual;
+    /// #2120: 復元したタブバーを撮り、master のタブが役割名の手動名で固定されていないか
+    /// （visual-test `master-tab-title`）
+    #[cfg(feature = "visual-test")]
+    mod master_tab_title_2120;
+    #[cfg(feature = "visual-test")]
+    use master_tab_title_2120::master_tab_title_visual;
     /// #1958: pane を省いた MCP のカードが呼び出し元ペインの実ピクセルに描かれる（visual-test `show-command-caller`）
     #[cfg(feature = "visual-test")]
     mod show_command_caller_1958;
@@ -46256,6 +46270,12 @@ mod self_test {
                 // #1946: たまり場の縮小サムネイル・親 master の見出し・幽霊の後始末・間引き
                 "background-drawer" => {
                     background_drawer_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #2120: 復元したタブバーを撮り、master のタブが役割名の手動名で固定されていないか
+                "master-tab-title" => {
+                    master_tab_title_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

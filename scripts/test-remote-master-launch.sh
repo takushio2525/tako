@@ -6,6 +6,7 @@
 #   ① role の gate（observe では 403 / manage で通る）
 #   ② タブが本当に作られ、tako 側の一覧（= Mac 画面）に出る
 #   ③ master 起動でペインの role / タブ名 / 起動コマンドが CLI 経路と同じ形になる
+#      （タブ名は管轄プロジェクトの名前を自動名で。汎用 master はタブ名に触らない = #2120）
 #   ④ 壊れた指定（存在しないタブ / 未登録プロファイル）でペインを壊さない
 # を実測する。
 #
@@ -147,6 +148,21 @@ effort: high
 env:
   PATH: "$STUB_BIN:/usr/bin:/bin"
 YAML
+# #2120: 管轄プロジェクトを持つ専用プロファイル（タブ名がプロジェクト名になる側）
+mkdir -p "$TMP/p1078"
+cat > "$TAKO_ORCHESTRATOR_DIR/projects.yaml" <<YAML
+projects:
+  p1078:
+    cwd: "$TMP/p1078"
+YAML
+cat > "$TAKO_ORCHESTRATOR_DIR/profiles/t1078d.yaml" <<YAML
+model: null
+effort: high
+projects:
+- p1078
+env:
+  PATH: "$STUB_BIN:/usr/bin:/bin"
+YAML
 
 # --- 起動 ---------------------------------------------------------------------
 echo "=== 準備: 隔離 tako-app と daemon を起動 ==="
@@ -243,7 +259,13 @@ CODE="$(api POST "/api/tabs/$NEW_TAB/master" '{"profile":"t1078"}')"
 check_eq "master 起動は 200" "200" "$CODE"
 check_eq "プロファイル名が返る" "t1078" "$(jqf profile)"
 check_eq "表示用 role が CLI と同じ形" "orchestrator-master:t1078" "$(jqf role)"
-check_eq "タブ名が CLI と同じ形" "master-t1078" "$(jqf tab_title)"
+# #2120: 汎用 master（管轄なし）はタブ名に触らない = 応答のタブ名は作ったときのまま
+TAB_BEFORE_TITLE="$("$TAKO_BIN" list | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for t in d["tabs"]:
+    if t["id"]=='"$NEW_TAB"': print(t.get("title") or ""); raise SystemExit
+print("")')"
+check_eq "応答のタブ名は今のタブ名（役割名にしない）" "$TAB_BEFORE_TITLE" "$(jqf tab_title)"
 check_eq "系統が claude" "claude" "$(jqf agent)"
 # opt-in していないプロファイルなので理由が返る（受け入れ条件 ②）
 check_eq "Remote Control は off" "off" "$(jqf remote_control.state)"
@@ -267,9 +289,25 @@ d=json.load(sys.stdin)
 for t in d["tabs"]:
     if t["id"]=='"$NEW_TAB"': print(t.get("title") or ""); raise SystemExit
 print("")')"
-check_eq "タブ名が反映された" "master-t1078" "$TITLE"
+case "$TITLE" in
+  master*) fail "汎用 master のタブ名が役割名になった: $TITLE" ;;
+  *) pass "汎用 master のタブ名は役割名にならない（'$TITLE'）" ;;
+esac
 SCREEN="$("$TAKO_BIN" read --pane "$NEW_PANE" 2>/dev/null || true)"
 check_contains "起動コマンドがペインで実行された" "$SCREEN" "STUB_CLAUDE_STARTED"
+
+# #2120: 専用プロファイルの master はタブ名が管轄プロジェクトの名前（自動名）になる
+CODE="$(api POST /api/tabs "{\"cwd\":\"$TMP\"}")"
+DED_TAB="$(jqf tab)"
+CODE="$(api POST "/api/tabs/$DED_TAB/master" '{"profile":"t1078d"}')"
+check_eq "専用 master の起動は 200" "200" "$CODE"
+check_eq "応答のタブ名がプロジェクト名" "p1078" "$(jqf tab_title)"
+DED_STATE="$("$TAKO_BIN" list | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for t in d["tabs"]:
+    if t["id"]=='"$DED_TAB"': print(str(t.get("title"))+"/"+str(t.get("title_source"))); raise SystemExit
+print("")')"
+check_eq "タブ名がプロジェクト名の自動名" "p1078/auto" "$DED_STATE"
 
 echo
 echo "=== Test 4: 壊れた指定でペインを壊さない ==="

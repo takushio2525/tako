@@ -17,6 +17,14 @@
 //! | リモート daemon（#1078） | `Request::TabNew` で作ったタブの初期ペイン | `Request::Send` |
 //! | 引き継ぎ（#193 / #917） | 退役 master のペインを分割 | `queue_command_flow` |
 //!
+//! ## タブ名はプロジェクト名（#2120）
+//!
+//! 起動でタブに付けるのは**管轄プロジェクトの名前を自動名として**（[`tab_naming`]）。
+//! 以前は `master` / `master-<名前>` を手動名で付けていたため、master 自身の
+//! `tako_rename_tab(source: "auto")` が全部弾かれてタブ名が役割名で固定された。
+//! 汎用の master（管轄なし）はタブ名に触らず、採用（#1453）の時点でプロジェクト名になる。
+//! 引き継ぎの後任は同じタブに立つのでタブ名に触らない（前任が付けた主題が残る）
+//!
 //! ## role の語彙は 2 つある（#761）
 //!
 //! ペインに貼る表示用（`orchestrator-master[:<名前>]`）と、起動コマンドが注入する
@@ -34,8 +42,8 @@ use crate::orchestrator::{self, Profile};
 pub struct MasterLaunchPlan {
     /// プロファイル名（`default` を含む）
     pub profile_name: String,
-    /// タブ名（`master` / `master-<名前>`）
-    pub tab_title: String,
+    /// 起動でタブへ付ける名前（#2120。`None` = 汎用 master なのでタブ名に触らない）
+    pub tab_naming: Option<TabNaming>,
     /// ペインに貼る表示用 role（`orchestrator-master[:<名前>]`）
     pub pane_role: String,
     /// 起動コマンドへ注入される role（`master[:<名前>]`）
@@ -67,7 +75,8 @@ impl MasterLaunchPlan {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "profile": self.profile_name,
-            "tab_title": self.tab_title,
+            // 起動で付ける名前（#2120）。実際のタブ名は呼び出し側が上書きして返す
+            "tab_title": self.tab_naming.as_ref().map(|n| n.title.as_str()),
             "role": self.pane_role,
             "agent": self.agent.as_str(),
             "model": self.model_label,
@@ -152,7 +161,7 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
 
     Ok(MasterLaunchPlan {
         profile_name: profile_name.to_string(),
-        tab_title: tab_title_for(profile_name),
+        tab_naming: tab_naming(profile_name, &profile),
         pane_role,
         role_env,
         command,
@@ -166,8 +175,11 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
     })
 }
 
-/// タブ名。CLI の `tako master -<名前>` と同じ形（`master` / `master-<名前>`）
-pub fn tab_title_for(profile_name: &str) -> String {
+/// ペインの表示名（`master` / `master-<名前>`）。CLI の `tako master -<名前>` と同じ形。
+///
+/// **タブ名には使わない**（#2120）。役割名でタブを固定すると、master が作業の主題で
+/// 付け直せなくなる。タブ名は [`tab_naming`] が決める
+pub fn pane_title_for(profile_name: &str) -> String {
     if profile_name.is_empty() || profile_name == "default" {
         "master".to_string()
     } else {
@@ -175,17 +187,55 @@ pub fn tab_title_for(profile_name: &str) -> String {
     }
 }
 
+/// 起動・採用でタブへ付ける名前（#2120）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabNaming {
+    /// タブ名
+    pub title: String,
+    /// `Request::TabRename` の `source`。`Some("auto")` = 自動名（ユーザーの手動名は
+    /// 上書きしない・master が後から付け直せる）。`None` = 手動名（#2120 前の A/B だけ）
+    pub source: Option<String>,
+}
+
+impl TabNaming {
+    /// 手動名か（`Request::TabNew` の `title` へ渡してよいのはこちらだけ。
+    /// 明示タイトル付きの作成は手動名扱いになる）
+    pub fn is_manual(&self) -> bool {
+        self.source.is_none()
+    }
+}
+
+/// master のタブの名前を決める（#2120）。
+///
+/// 管轄プロジェクトの名前を**自動名で**付ける（`takodev` の管轄が `[tako]` なら `tako`）。
+/// 管轄が無い汎用の master は `None` = タブ名に触らない。
+/// `TAKO_2120_LEGACY=1` のときだけ旧挙動（`master` / `master-<名前>` の手動名）を返す
+pub fn tab_naming(profile_name: &str, profile: &Profile) -> Option<TabNaming> {
+    if tako_core::master_tab::legacy() {
+        return Some(TabNaming {
+            title: pane_title_for(profile_name),
+            source: None,
+        });
+    }
+    tako_core::master_tab::initial_title(profile.projects.as_deref().unwrap_or_default()).map(
+        |title| TabNaming {
+            title,
+            source: Some("auto".into()),
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// role とタブ名の語彙は CLI の `-<名前>` 起動と一致していなければならない。
+    /// role とペイン名の語彙は CLI の `-<名前>` 起動と一致していなければならない。
     /// ずれると #761 の事故（後任 / 別経路の master が default 扱いになる）が再来する
     #[test]
-    fn role_とタブ名は_cli_の形と一致する() {
-        assert_eq!(tab_title_for("default"), "master");
-        assert_eq!(tab_title_for(""), "master");
-        assert_eq!(tab_title_for("dev"), "master-dev");
+    fn role_とペイン名は_cli_の形と一致する() {
+        assert_eq!(pane_title_for("default"), "master");
+        assert_eq!(pane_title_for(""), "master");
+        assert_eq!(pane_title_for("dev"), "master-dev");
         // 表示用と env 用の 2 語彙（正本は tako_core::handoff）
         assert_eq!(
             tako_core::handoff::master_pane_role("default"),
@@ -208,6 +258,29 @@ mod tests {
         }
     }
 
+    /// #2120: タブ名は管轄プロジェクトの名前を自動名で。役割名・プロファイル名にしない
+    #[test]
+    fn タブ名は管轄プロジェクトの自動名() {
+        if tako_core::master_tab::legacy() {
+            return; // A/B の旧挙動で回しているときは対象外
+        }
+        let dedicated = Profile {
+            projects: Some(vec!["tako".into()]),
+            ..Profile::default()
+        };
+        let naming = tab_naming("takodev", &dedicated).expect("専用なら名前が付く");
+        assert_eq!(naming.title, "tako");
+        assert_eq!(naming.source.as_deref(), Some("auto"));
+        assert!(!naming.is_manual());
+        // 汎用（管轄なし）はタブ名に触らない = 採用の時点で付く
+        assert_eq!(tab_naming("default", &Profile::default()), None);
+        let empty = Profile {
+            projects: Some(Vec::new()),
+            ..Profile::default()
+        };
+        assert_eq!(tab_naming("fable", &empty), None);
+    }
+
     /// 存在しないプロファイルは**ペインを作る前に**落とす
     #[test]
     fn 未登録プロファイルは組み立てで落ちる() {
@@ -220,7 +293,7 @@ mod tests {
     fn opt_in_していなければ理由と有効化コマンドを返す() {
         let plan = MasterLaunchPlan {
             profile_name: "dev".into(),
-            tab_title: "master-dev".into(),
+            tab_naming: None,
             pane_role: "orchestrator-master:dev".into(),
             role_env: "master:dev".into(),
             command: "claude".into(),

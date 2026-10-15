@@ -116,11 +116,11 @@ function WaitPanel({ result, onClose, onOpenPane }) {
   return (
     <div class="launch-result">
       <div class="launch-result-head">
-        <span class="launch-result-title">
-          {result.tab_title} を起動しました
-        </span>
+        {/* #2120: タブ名は役割名ではなくプロジェクト名（汎用 master は元のタブ名のまま）
+            なので、見出しは「master を」で固定し、タブ名は補足の行へ置く */}
+        <span class="launch-result-title">master を起動しました</span>
         <span class="launch-result-sub">
-          タブ {result.tab} · ペイン {result.pane} · {result.profile}
+          タブ {result.tab}{result.tab_title ? `（${result.tab_title}）` : ''} · ペイン {result.pane} · {result.profile}
           {result.model ? ` · ${result.model}` : ''}
         </span>
       </div>
