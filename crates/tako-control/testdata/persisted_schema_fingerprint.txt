@@ -40,6 +40,9 @@ RecentEntry: directory, repository, ssh
 RecentList: entries
 RecordOwner: pid, started_unix
 RemoteFolderLayout: host, path, origin
+RunConfig: profile, runtime, args, env, cwd, before, updated_at
+RunConfigsFile: version, projects, files
+RuntimeRef: manager, key
 SavedLidState: scheme, ac, dc, owner
 SessionCatalog: entries, pending
 SessionEntry: kind, label, project, profile, agent, model, effort, issues, prompt_head, cwd, tab, pane, tmux_session, log_file, started_at, last_seen_at
@@ -100,3 +103,4 @@ version remote_shortcuts: v1 steps=0
 version remote_desired: v1 steps=0
 version claude_mod_ui: v1 steps=0
 version claude_mod_mark: v1 steps=0
+version run_configs: v1 steps=0

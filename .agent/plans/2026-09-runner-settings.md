@@ -660,6 +660,22 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
   - CLI と MCP の応答が字面一致（同じ dispatch）/ parity テスト（`run-config` → `tako_run_defaults`）緑
   - `tako context-budget` の増分を PR に書く
 - 依存: S2 / **#1657 と #1662 の着地**（どちらも dispatch の `Run` を触る。直列）/ 規模: L
+- **実装で決めたこと（#1731。この節の案からの差分。正本は FR-3.18.5）**:
+  - **MCP はツールを足さない**（§8.3 案 A）。`tako_run_defaults` の `path` / `scope` / `profile` / `runtime` / `reset`。
+    `pane` は MCP では呼び出し元を詰めるだけで引数にしない（カタログを増やさない）
+  - **`Run` の「解けない」はエラーの本文に次の一手を載せる**。JSON-RPC の error には data 欄が無い（`RpcError { code, message }`）ので、
+    構造化した `runtime_unresolved.next_step` は一覧（`RunResolve` / `tako run-config`）の応答に載せる。`Run` の本文と一覧の
+    `next_step` は同じ 1 実装（`runtime_probe::RuntimeUnresolved`）から作る
+  - **`--reset` は保存先を省くと両方のスコープから消す**（実効値を自動へ戻す = §5.5 の案内どおりに効く）。実行環境の reset は
+    その kind だけを消す（プロジェクトに保存した他言語の選択は残す）
+  - **解けない指定は保存しない**（保存した瞬間から `Run` が止まる）。interpreter の実在まで確かめる
+    （`runtime_env::ensure_runnable`。印の `pyvenv.cfg` だけ残った環境は保存も実行もしない）
+  - プロジェクトのキーは `project_root::scope_root`（種別の印 → 境界内の git → ファイルの段）。種別の印の無い `.py`
+    （`.venv` だけのフォルダ）でもキーが決まるよう、`${workspaceRoot}` の落とし先（`fallback_root`）と 1 本にした
+  - 指定のパスは実体へ寄せない（venv の python はシンボリックリンクで、`canonicalize` すると環境の外の interpreter を指す）
+  - 一覧の候補は `Run` と同じ材料（Tier F + 覚えた Tier P）で、`tako run-config` は子プロセスを起こさない（UI スレッドで呼ばれる）
+  - `command` の上書きは保存した層（実行環境・プロファイル）を素通りする（#1730 の申し送りどおり §4.3 の「素通り」を保存した層に当てた。自動の実行環境は効く）。保存した環境が壊れていても `--command` なら走れる
+  - 応答のプロジェクトのスコープのキーは `scope_root`（`tako run-config` と `RunResolve` の両方）。`RunResolve` の既存の `project_root` は「種別の印のルート」（印が無ければ null）のまま変えない
 
 ### S4: 引数・環境変数・作業ディレクトリ・実行前コマンド
 

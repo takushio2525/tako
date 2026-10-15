@@ -48,9 +48,11 @@ use tako_core::platform::support::Platform;
 use tako_core::probe::{Outcome, TimeoutNotice};
 use tako_core::project_root::{self, SearchBounds};
 use tako_core::runner::{RunPlan, RuntimeWords};
-use tako_core::runner_config::{self, Declared, EffectiveConfig, RunConfigField, Sourced};
+use tako_core::runner_config::{
+    self, Declared, EffectiveConfig, FieldSource, RunConfig, RunConfigField, RuntimeRef, Sourced,
+};
 use tako_core::runtime_env::{
-    self, tier_p, Candidate, DetectEnv, Detection, FsProbe, RealFs, RuntimeKind,
+    self, tier_p, Candidate, DetectEnv, Detection, FsProbe, RealFs, RuntimeKind, Unresolved,
 };
 
 /// #1730 以前（実行環境の層を通さない）へ戻す A/B のゲート。**ここ 1 か所だけ**
@@ -89,12 +91,151 @@ pub struct Snapshot {
     /// Tier P を走らせた時間（走らせなかったら `None`）
     pub tier_p_elapsed: Option<Duration>,
     pub timeouts: Vec<TimeoutNotice>,
+    /// 保存した選択（#1731）。`None` = 自動選択（`detection.auto`）が走る
+    pub chosen: Option<Chosen>,
+}
+
+/// 保存した実行環境を当てた結果（#1731）
+#[derive(Debug, Clone)]
+pub struct Chosen {
+    pub candidate: Candidate,
+    /// `detection.candidates` の添字（一覧の外 = 印の外の環境・指定のパスなら `None`）
+    pub index: Option<usize>,
+    /// どのスコープに保存してあったか
+    pub source: FieldSource,
+}
+
+/// 保存した実行環境が解けない（`.venv` を消した等）。**自動選択へ落とさない**（#1466 /
+/// 設計書 §5.5）。`Run` はエラーにし、一覧（`RunResolve` / `tako run-config`）は応答の
+/// `runtime_unresolved` に載せる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeUnresolved {
+    pub unresolved: Unresolved,
+    pub source: FieldSource,
+}
+
+impl RuntimeUnresolved {
+    /// 次の一手（最も簡単なコマンド = #322。`--reset runtime` は両方のスコープから消す）
+    pub fn next_step(&self, file: &Path) -> String {
+        let f = tako_core::shell::quote_for_shell(&file.display().to_string());
+        match tako_core::i18n::lang() {
+            tako_core::i18n::Lang::Ja => format!(
+                "`tako run-config {f} --reset runtime` で自動選択へ戻すか、\
+                 `tako run-config {f} --runtime <候補>` で選び直す（候補は `tako run-config {f}`）"
+            ),
+            tako_core::i18n::Lang::En => format!(
+                "Run `tako run-config {f} --reset runtime` to go back to automatic selection, or \
+                 `tako run-config {f} --runtime <candidate>` to choose again (candidates: `tako run-config {f}`)"
+            ),
+        }
+    }
+
+    /// エラーの本文（`Run`）
+    pub fn message(&self, file: &Path) -> String {
+        let u = &self.unresolved;
+        let scope = self.source.as_str();
+        match tako_core::i18n::lang() {
+            tako_core::i18n::Lang::Ja => format!(
+                "保存した実行環境（{}:{}。{scope} に保存）が解けないので走らせない（自動選択へは落とさない）: {}。{}",
+                u.manager,
+                u.key,
+                u.reason,
+                self.next_step(file)
+            ),
+            tako_core::i18n::Lang::En => format!(
+                "The saved runtime ({}:{}, saved for the {scope}) cannot be resolved, so it is not run \
+                 (no fallback to automatic selection): {}. {}",
+                u.manager,
+                u.key,
+                u.reason,
+                self.next_step(file)
+            ),
+        }
+    }
+
+    /// 応答の `runtime_unresolved`
+    pub fn to_json(&self, file: &Path) -> Value {
+        json!({
+            "manager": self.unresolved.manager,
+            "key": self.unresolved.key,
+            "reason": self.unresolved.reason,
+            "source": self.source.as_str(),
+            "next_step": self.next_step(file),
+        })
+    }
 }
 
 impl Snapshot {
-    /// 走らせる候補（S2 は自動選択。保存した選択は #1726 S3）
+    /// 走らせる候補（保存した選択 → 自動選択）
     pub fn selected(&self) -> Option<&Candidate> {
-        self.detection.auto_candidate()
+        match &self.chosen {
+            Some(c) => Some(&c.candidate),
+            None => self.detection.auto_candidate(),
+        }
+    }
+
+    /// 走らせる候補の `detection.candidates` での添字
+    fn selected_index(&self) -> Option<usize> {
+        match &self.chosen {
+            Some(c) => c.index,
+            None => self.detection.auto,
+        }
+    }
+
+    /// 走らせる候補の出どころ
+    fn selected_source(&self) -> FieldSource {
+        self.chosen.as_ref().map_or(FieldSource::Auto, |c| c.source)
+    }
+
+    /// 保存した参照を当てる（#1731）。一覧に居ればその候補（Tier P の答えを重ねたもの）、
+    /// 居なければ参照を解き直す。**interpreter が今在るか**まで確かめ、解けなければ
+    /// 選択を変えずに `Err`（自動選択へ落とさない）。`root` は相対の鍵を解く基準
+    pub fn choose(
+        &mut self,
+        r: &RuntimeRef,
+        source: FieldSource,
+        root: &Path,
+    ) -> Result<(), RuntimeUnresolved> {
+        self.choose_with(
+            r,
+            source,
+            root,
+            Platform::current(),
+            &RealFs,
+            &DetectEnv::from_process(),
+        )
+    }
+
+    fn choose_with(
+        &mut self,
+        r: &RuntimeRef,
+        source: FieldSource,
+        root: &Path,
+        platform: Platform,
+        fs: &dyn FsProbe,
+        env: &DetectEnv,
+    ) -> Result<(), RuntimeUnresolved> {
+        let index = self
+            .detection
+            .candidates
+            .iter()
+            .position(|c| c.manager == r.manager && c.key == r.key);
+        let found = match index {
+            Some(i) => Ok(self.detection.candidates[i].clone()),
+            None => runtime_env::resolve_ref(self.kind, platform, r, Some(root), fs, env),
+        }
+        .and_then(|c| runtime_env::ensure_runnable(c, fs));
+        match found {
+            Ok(candidate) => {
+                self.chosen = Some(Chosen {
+                    candidate,
+                    index,
+                    source,
+                });
+                Ok(())
+            }
+            Err(unresolved) => Err(RuntimeUnresolved { unresolved, source }),
+        }
     }
 
     /// `resolve_file` へ渡す `${<variable>}` の値
@@ -474,6 +615,7 @@ fn detect_with(
         tier_f_elapsed,
         tier_p_elapsed,
         timeouts,
+        chosen: None,
     }
 }
 
@@ -537,15 +679,16 @@ fn first_line(bytes: &[u8]) -> Option<String> {
 
 // ─── 応答 ──────────────────────────────────────────────────────────────
 
-/// 候補の保存用の ID（`<manager>:<key>`。#1726 S3 の `--runtime` が受ける形）
-fn candidate_id(c: &Candidate) -> String {
-    format!("{}:{}", c.manager, c.key)
-}
-
-fn candidate_json(snap: &Snapshot, index: usize, c: &Candidate) -> Value {
-    let auto = snap.detection.auto == Some(index);
+fn candidate_json(snap: &Snapshot, index: Option<usize>, c: &Candidate) -> Value {
+    let auto = index.is_some() && snap.detection.auto == index;
+    // 一覧の外の選択（指定のパス等）は `runtime` にだけ載り、選ばれている
+    let selected = match index {
+        Some(_) => snap.selected_index() == index,
+        None => true,
+    };
     json!({
-        "id": candidate_id(c),
+        // `<manager>:<key>`（`tako run-config --runtime` が受ける形。#1731）
+        "id": runtime_env::candidate_id(c),
         "kind": c.kind,
         "manager": c.manager,
         "key": c.key,
@@ -554,8 +697,8 @@ fn candidate_json(snap: &Snapshot, index: usize, c: &Candidate) -> Value {
         "path": c.location.as_ref().map(|p| p.display().to_string()),
         "program": c.applied.program,
         "auto": auto,
-        // S2 は自動で選んだものが走る（保存した選択が勝つのは #1726 S3）
-        "selected": auto,
+        // 走らせる候補（保存した選択 → 自動選択。#1731）
+        "selected": selected,
         "tier": snap.tier_of(c).as_str(),
         "needs_probe": c.needs_probe,
     })
@@ -571,7 +714,7 @@ pub fn runtimes_json(snap: Option<&Snapshot>) -> Value {
             .candidates
             .iter()
             .enumerate()
-            .map(|(i, c)| candidate_json(snap, i, c))
+            .map(|(i, c)| candidate_json(snap, Some(i), c))
             .collect(),
     )
 }
@@ -626,16 +769,13 @@ pub fn runtime_json(snap: Option<&Snapshot>) -> Value {
     let Some(snap) = snap else {
         return Value::Null;
     };
-    let Some((index, c)) = snap
-        .detection
-        .auto
-        .and_then(|i| snap.detection.candidates.get(i).map(|c| (i, c)))
-    else {
+    let Some(c) = snap.selected() else {
         return Value::Null;
     };
-    let mut v = candidate_json(snap, index, c);
+    let mut v = candidate_json(snap, snap.selected_index(), c);
     if let Value::Object(map) = &mut v {
-        map.insert("source".into(), json!("auto"));
+        // auto（自動選択）/ file / project（保存した選択。#1731）
+        map.insert("source".into(), json!(snap.selected_source().as_str()));
         map.insert("path_prepend".into(), json!(snap.path_prepend()));
         let env: Map<String, Value> = snap
             .env()
@@ -680,16 +820,21 @@ pub fn warnings(snap: Option<&Snapshot>, plan: &RunPlan) -> Vec<String> {
     out
 }
 
-/// 実行設定の実効値（項目ごとの `{ value, source }`。S2 は保存した設定が無いので
-/// 宣言の作業ディレクトリと自動の実行環境だけが既定以外になる）
-pub fn effective_config(snap: Option<&Snapshot>, declared_cwd: Option<&str>) -> EffectiveConfig {
+/// 実行設定の実効値（項目ごとの `{ value, source }`）。保存した設定（#1731。`file` /
+/// `project`）→ 宣言の作業ディレクトリ → 自動の実行環境、の順に重ねる
+pub fn effective_config(
+    snap: Option<&Snapshot>,
+    declared_cwd: Option<&str>,
+    file: Option<&RunConfig>,
+    project: Option<&RunConfig>,
+) -> EffectiveConfig {
     let mut auto = std::collections::BTreeMap::new();
-    if let Some((snap, c)) = snap.and_then(|s| s.selected().map(|c| (s, c))) {
+    if let Some((snap, c)) = snap.and_then(|s| s.detection.auto_candidate().map(|c| (s, c))) {
         auto.insert(snap.kind.id.to_string(), c.reference());
     }
     runner_config::merge(
-        None,
-        None,
+        file,
+        project,
         &Declared {
             cwd: declared_cwd.map(str::to_string),
         },

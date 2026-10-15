@@ -44,11 +44,17 @@ const OUTSIDE_TABLE: &[&str] = &[
     "crates/tako-core/src/runtime_env/mod.rs",
     "crates/tako-core/src/runtime_env/detect.rs",
     "crates/tako-core/src/runtime_env/tier_p.rs",
+    // #1731: 利用者の指定（ID・短縮・パス）→ 保存する参照
+    "crates/tako-core/src/runtime_env/select.rs",
     "crates/tako-core/src/runner_config.rs",
 ];
 /// 名前の規則（規則 1）だけを見る本番コード（#1730）。Tier P を実際に起こす層なので、
 /// 子プロセスと実行中の OS（規則 3・4）はここの仕事として正しく持つ
-const NAMES_ONLY: &[&str] = &["crates/tako-control/src/runtime_probe.rs"];
+const NAMES_ONLY: &[&str] = &[
+    "crates/tako-control/src/runtime_probe.rs",
+    // #1731: 実行設定の保存と `tako run-config` の本体（kind は表の id を引くだけ）
+    "crates/tako-control/src/run_configs.rs",
+];
 /// 表そのもの（規則 2〜4 はここも見る）
 const TABLE: &str = "crates/tako-core/src/runtime_env/kinds.rs";
 

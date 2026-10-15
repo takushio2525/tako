@@ -206,6 +206,14 @@ pub mod notes {
         "会話・セッションの記録。分量が大きく秘匿情報を含みうるので共有しない",
         "Conversation and session records: large and potentially sensitive, so they are not shared",
     );
+    /// Code Runner の実行設定（#1731）。**共有すると別デバイスで壊れた選択が効く**:
+    /// 中身は interpreter の置き場（`.venv` の絶対パス・pyenv の版）とファイルの絶対パスで、
+    /// 別の機械では解けない（解けない選択は `Run` を止める = 共有先の実行が全部止まる）
+    pub const RUN_CONFIGS: Note = Note::new(
+        "Code Runner の実行設定（選んだ実行環境・プロファイル）。中身がこのマシンのパスなので共有しない",
+        "Code Runner run configs (chosen runtimes and profiles); they hold this machine's paths, \
+         so they are not shared",
+    );
     pub const BACKUP: Note = Note::new(
         "バックアップ・ロック・一時ファイル。共有対象の元ファイルだけを扱う",
         "Backup, lock, and temporary files; only the original file is handled",
@@ -460,6 +468,15 @@ pub const CATALOG: &[Entry] = &[
         path: "recent.json",
         class: Class::Local,
         note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    // #1731: settings.json（Shared）に相乗りさせない理由は notes::RUN_CONFIGS
+    Entry {
+        root: Root::TakoData,
+        path: "run-configs.json",
+        class: Class::Local,
+        note: notes::RUN_CONFIGS,
         local_fields: &[],
         needs_local_unless: &[],
     },

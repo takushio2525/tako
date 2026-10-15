@@ -929,11 +929,11 @@ pub(super) fn bare_program(name: &str) -> &str {
     name.strip_suffix(".exe").unwrap_or(name)
 }
 
-fn path_str(p: &Path) -> String {
+pub(super) fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn file_name(p: &Path) -> String {
+pub(super) fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path_str(p))
@@ -941,7 +941,7 @@ fn file_name(p: &Path) -> String {
 
 // ─── 案内文（日英。名前は表の値から組む） ──────────────────────────────
 
-fn tr(ja: String, en: String) -> String {
+pub(super) fn tr(ja: String, en: String) -> String {
     match crate::i18n::lang() {
         Lang::Ja => ja,
         Lang::En => en,

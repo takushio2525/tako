@@ -617,7 +617,7 @@ fn 応答の形は候補と実効値を項目ごとに持つ() {
     ] {
         assert!(arr[0].get(key).is_some(), "{key} が無い: {}", arr[0]);
     }
-    let eff = effective_config(Some(&snap), Some(".."));
+    let eff = effective_config(Some(&snap), Some(".."), None, None);
     let cfg = config_json(&eff);
     for f in RunConfigField::ALL {
         assert!(
@@ -639,7 +639,7 @@ fn 応答の形は候補と実効値を項目ごとに持つ() {
     assert_eq!(runtimes_json(None), serde_json::json!([]));
     assert!(runtime_json(None).is_null());
     assert_eq!(
-        config_sources_json(&effective_config(None, None))["runtime"],
+        config_sources_json(&effective_config(None, None, None, None))["runtime"],
         "default"
     );
 }

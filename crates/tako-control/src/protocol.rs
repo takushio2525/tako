@@ -2530,7 +2530,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         refresh: bool,
     },
-    /// 拡張子既定コマンドの一覧/設定/削除（FR-3.18, #453）
+    /// 実行の既定の読み書き。`ext` = 拡張子既定コマンドの一覧/設定/削除（FR-3.18, #453）、
+    /// `path` = そのファイル / プロジェクトの実行設定（実行環境・プロファイル。FR-3.18.5, #1731。
+    /// 保存先は `<data_dir>/run-configs.json`）。**`ext` と `path` は排他**
     RunnerDefaults {
         /// 拡張子（省略時は一覧を返す）
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2541,6 +2543,23 @@ pub enum Request {
         /// true で削除
         #[serde(default)]
         remove: bool,
+        /// 実行設定の対象ファイル（相対は `pane` の cwd 基準）。項目を渡さなければ読むだけ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// 保存先（"file" / "project"。省略時は実行環境 = project、それ以外 = file）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        /// 選ぶプロファイル（宣言名）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+        /// 選ぶ実行環境（候補の ID / 短縮 / パス）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
+        /// 既定（自動）へ戻す項目名（"all" = 全項目）。`scope` 省略時は両方のスコープから消す
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset: Option<Vec<String>>,
     },
     /// 設定画面の操作（Issue #459）。
     /// `action` = "open"（既定。GUI 設定画面を開く）/ "status"（開いているか + 現在タブ）
@@ -2645,6 +2664,21 @@ pub enum Request {
 }
 
 impl Request {
+    /// 拡張子既定コマンドの一覧/設定/削除（`RunnerDefaults` の `ext` 側。実行設定の欄は空）
+    pub fn runner_ext_defaults(ext: Option<String>, command: Option<String>, remove: bool) -> Self {
+        Self::RunnerDefaults {
+            ext,
+            command,
+            remove,
+            path: None,
+            pane: None,
+            scope: None,
+            profile: None,
+            runtime: None,
+            reset: None,
+        }
+    }
+
     /// ログ・計測用の種別名（Issue #113 の dispatch 遅延計測）。
     /// Debug 表記の先頭トークン = variant 名だけを返し、ペイロード（送信テキスト・
     /// パス等）は含めない（conventions: ペイン内容・送信テキストをログに出さない）
