@@ -924,8 +924,15 @@ system prompt の予算 24 KB のうち **tako が作る部分は 18.5 KB 以内
   MCP `tako_orchestrator_guide({ topic: "local-rules" })` で引く。prompt には
   見出しを並べた**索引 1 行だけ**が自動生成で載る（索引はファイルへ書かない）
 - **内容は 1 文字も消えない**（増えるのはマーカー行 1 本だけ・旧ファイルは `.pre-v1.bak`）。
-  自分で区切りを置けばそこが優先され、移行は二度と触らない
-- 分割しても常時部が予算を超えるときは `tako context-budget check` が
+  自分で区切りを置けばそこが優先され、自動の移行は二度と触らない
+- **区切りのあとで常時部が伸びて取り分を超えたら（#1981）**、`tako migrate`（status）が
+  `files[].state = proposed` で「N バイト超過・区切りを M 行目の『## X』の前へ上げる案」を出す。
+  どこまでを常時に残すかは利用者の判断なので、**自動の発火点（setup / 起動時）は動かさない**。
+  利用者が承認したら `tako migrate run`（MCP `tako_migrate` の run）で見出し境界へ上がる
+  （区切りの行を除く本文はバイト単位で同じ・旧内容は `.pre-v2.bak`）。master は案を見たら
+  自分で run せず、`tako todo` で利用者へ判断を回す
+- 上げても収まらない（常時部に題名以外の見出しが無い / 先頭の節だけで超過）ときは、案内
+  （`approvable: false`）だけが出て区切りは動かない。`tako context-budget check` も
   「区切りを何行上へ動かすか」を具体値で返す
 
 委任の判断材料（プロファイルの `delegate_guidance` と ledger 由来の既定）も同じ理由で

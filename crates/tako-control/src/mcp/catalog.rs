@@ -2843,7 +2843,8 @@ pub fn tools() -> Vec<Value> {
                 status（既定・書き換えない）: 全永続ファイル（settings.json / layout.json / projects.yaml / \
                 profiles / accounts / sessions / workers / ledger 等）の版数と、これから当たる移行。\
                 run: 実際に当てる（旧内容は .pre-v<N>.bak へ退避。冪等）。files[].state は absent / \
-                up_to_date / migrated / unreadable / refused / failed、files[].steps に移行の説明。\
+                up_to_date / migrated / unreadable / refused / failed / proposed（利用者の判断が要る案。\
+                status にだけ出て run で当たる）、files[].steps に移行の説明。\
                 status では backup_planned / quarantine_planned（「退避済み」ではない）。\
                 **unreadable は「設定が壊れているので既定値で動いている」**で、quarantine に元の内容が\
                 残っているのでユーザーへ知らせる。schema で種別を 1 つに絞れる。GUI が起動しないときは \
