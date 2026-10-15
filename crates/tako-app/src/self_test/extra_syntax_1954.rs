@@ -102,17 +102,23 @@ pub(super) async fn extra_syntax_visual(
                 reply["mode"]
             ),
         );
-        check(
-            wait_for_preview_maps(any, window, cx, target, false).await,
-            &format!("visual-test {SECTION}: {file} の平文 paint"),
-        );
-        window
-            .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
-            .ok();
-        // 空の本文は塗る字句が無いので、塗りの完了を待たない
+        // 空の本文は描く行も塗る字句も無いので、行の描画と塗りの完了を待たない（描画だけ回す）
         let painted = if text.is_empty() {
+            for _ in 0..4 {
+                notify_and_draw(any, window, cx);
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+            }
             true
         } else {
+            check(
+                wait_for_preview_maps(any, window, cx, target, false).await,
+                &format!("visual-test {SECTION}: {file} の平文 paint"),
+            );
+            window
+                .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
+                .ok();
             wait_for_preview_highlight(any, window, cx, target).await
         };
         let (lines, painted_syntax) = window

@@ -91,7 +91,7 @@ Slug.psd1 PowerShell Plain_Text powershell
 empty.ps1 PowerShell Plain_Text powershell
 big.ps1 PowerShell Plain_Text powershell
 deploy PowerShell Plain_Text -
-run.sh Bash Bash shellscript
+run.sh Bourne_Again_Shell_(bash) Bourne_Again_Shell_(bash) shellscript
 A.cs C# C# csharp"
 
 # CLI と MCP で全形式を開き、`file 経路 file_type syntax` を 1 行ずつ出す
