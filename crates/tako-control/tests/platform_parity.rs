@@ -1009,6 +1009,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
              どの POSIX シェルでも構文が壊れないことを実測する。`#[cfg(unix)]`）",
         ),
         (
+            "crates/tako-core/src/pty_loop.rs",
+            1,
+            "テストモジュール内（#2114。PTY の子がゾンビ = スレーブが全部閉じたことを `ps` で\
+             読み、書き込みの EIO の前提を状態で待つ。`#[cfg(unix)]`）",
+        ),
+        (
             "crates/tako-core/src/tmux.rs",
             1,
             "tmux e2e テスト内（`#[cfg(unix)]`）",
