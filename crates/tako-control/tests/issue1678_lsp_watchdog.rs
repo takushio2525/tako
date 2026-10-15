@@ -3,9 +3,10 @@
 //! 1. **tokio を持ち込まない**: `Cargo.lock` に `name = "tokio"` が 0 件
 //!    （`lsp-types` は型定義だけで tokio を引かない。`async-lsp` は既定で引く）
 //! 2. **表以外に言語名を書かない**: 検出表（`tako_core::lsp::servers::SERVERS`）の値
-//!    （ID・実行ファイル名・languageId・拡張子・ルートの印・導入コマンド）が、LSP の
+//!    （ID・実行ファイル名・伴走の実行ファイル名と tako が用意するファイルの名前（#1951）・
+//!    languageId・拡張子・ルートの印・導入コマンド）が、LSP の
 //!    モジュールに文字列として現れたら file:line で名指す。言語の追加が「表への行追加だけ」で
-//!    済む形を、表の行数を数える単体（`servers.rs` の `第2波までで9行`）と対で守る
+//!    済む形を、表の行数を数える単体（`servers.rs` の `arduinoの行までで11行`）と対で守る
 //! 3. **診断ログに本文を出さない**（AGENTS.md の絶対ルール。LSP の I/O はソースコードを
 //!    含む）: LSP のモジュールで `println!` / `eprintln!` / `dbg!` を使わない。
 //!    `persist_log` / `perf_log` / `flow_log` の引数に本文を運ぶ名前
@@ -18,7 +19,7 @@ mod production_range;
 
 use production_range::code_view::without_comments_checked;
 use std::path::{Path, PathBuf};
-use tako_core::lsp::servers::SERVERS;
+use tako_core::lsp::servers::{Arg, SERVERS};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -98,6 +99,11 @@ fn table_values() -> Vec<&'static str> {
         values.extend(spec.root_markers.iter().copied());
         values.push(spec.install.macos);
         values.push(spec.install.windows);
+        // #1951: 伴走の実行ファイル名と tako が用意するファイルの名前も表の値
+        values.extend(spec.args.iter().filter_map(|arg| match arg {
+            Arg::Companion(name) | Arg::EmptyFile(name) => Some(*name),
+            Arg::Lit(_) => None,
+        }));
         if let Some(ws) = spec.workspace_root {
             values.push(ws.file);
             values.push(ws.contains);
@@ -142,6 +148,12 @@ fn 表の値の直書きを名指せる() {
     assert_eq!(
         hits,
         vec!["sample.rs:2 に表の値 \"rust-analyzer\"".to_string()]
+    );
+    // #1951: 伴走の実行ファイル名も名指す
+    let src = "fn f() -> &'static str {\n    \"arduino-cli\"\n}\n";
+    assert_eq!(
+        language_literals("sample.rs", src, &values),
+        vec!["sample.rs:2 に表の値 \"arduino-cli\"".to_string()]
     );
     // テストの中とコメントは対象外
     let src = "// \"rust-analyzer\"\nfn f() {}\n#[cfg(test)]\nmod tests {\n    const X: &str = \"rust-analyzer\";\n}\n";

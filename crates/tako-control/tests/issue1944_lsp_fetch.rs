@@ -27,7 +27,7 @@ use tako_control::lsp::fetch::{self, FetchConfig, FetchError};
 use tako_control::lsp::manager::DEFAULT_IDLE_GRACE;
 use tako_control::lsp::{text, DocLink, Launch, LspConfig, LspManager};
 use tako_core::lsp::fetch::{Archive, Asset, Digest, Fetch, PlatformAsset};
-use tako_core::lsp::servers::{DocumentKind, InstallHint, ServerSpec};
+use tako_core::lsp::servers::{Arg, DocumentKind, InstallHint, RootScope, ServerSpec};
 use tako_core::lsp::state::{RestartPolicy, ServerState};
 use tako_core::platform::child_cmd::ChildCmd;
 
@@ -293,9 +293,17 @@ fn spec_for(scratch: &Scratch, asset: &str, bytes: &[u8], size: u64) -> &'static
             language_id: "fakefetch",
         }])),
         program: "fake-fetch-server",
-        args: Box::leak(args.into_boxed_slice()),
+        args: Box::leak(
+            args.into_iter()
+                .map(Arg::Lit)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
         root_markers: &["fetch.marker"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: INSTALL_COMMAND,
             windows: INSTALL_COMMAND,

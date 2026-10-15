@@ -6,6 +6,8 @@
 //! [起動中] --(無いが取れる)--> [取得中] --(取れた)--> [起動中]（同じ起動の流れが続ける。#1944）
 //!                                  └-(取れない)--> [未導入]（理由 = 取得の失敗）
 //! [未導入] --(入ったと分かった・取り直す)--> [起動中]（#1944 / #1823）
+//! [起動中] --(起こす前提が満たされていない)--> [前提が未設定]（#1951。Arduino の基板が未選択）
+//! [前提が未設定] --(満たされたと分かった・開き直した)--> [起動中]（前提をもう一度確かめる）
 //! [起動中] --(initialize の応答)--> [稼働]
 //! [起動中 / 稼働] --(プロセスが死んだ)--> [クラッシュ] --(待ってから)--> [起動中]
 //!                                          └-(上限を超えた)--> [諦めた]
@@ -38,6 +40,9 @@ pub enum ServerState {
     Crashed,
     /// 再起動の上限を超えた（restart まで起こさない）
     GaveUp,
+    /// 起こす前提が満たされていない（#1951。Arduino のスケッチの基板が未選択）。プロセスは居ない。
+    /// 理由と満たすコマンドを案内し、満たされたと分かったら（シェル統合の合図・開き直し・restart）起こす
+    Unconfigured,
 }
 
 impl ServerState {
@@ -53,10 +58,11 @@ impl ServerState {
             Self::Fetching => "fetching",
             Self::Crashed => "crashed",
             Self::GaveUp => "gave_up",
+            Self::Unconfigured => "unconfigured",
         }
     }
 
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::NotStarted,
         Self::Starting,
         Self::Running,
@@ -66,6 +72,7 @@ impl ServerState {
         Self::Fetching,
         Self::Crashed,
         Self::GaveUp,
+        Self::Unconfigured,
     ];
 
     /// プロセスが居る（居るはずの）状態か
@@ -105,6 +112,10 @@ pub enum Event {
     UserStop,
     /// 利用者の restart
     UserRestart,
+    /// 起こす前提が満たされていなかった（#1951。理由は呼び手が記録する）
+    Unconfigured,
+    /// 前提が満たされたと分かった（#1951。シェル統合の合図で確かめ直した）
+    Configured,
 }
 
 /// 遷移に伴ってやること
@@ -200,7 +211,12 @@ impl Lifecycle {
                 };
                 (next, action)
             }
-            (S::NotStarted, Event::Open) => (self.with(S::Starting), Action::Spawn),
+            // 前提が未設定のまま開き直したら、もう一度確かめる（確かめるのは起動の流れ = ファイルを読むだけ）
+            (S::NotStarted | S::Unconfigured, Event::Open) => {
+                (self.with(S::Starting), Action::Spawn)
+            }
+            (S::Starting, Event::Unconfigured) => (self.with(S::Unconfigured), Action::None),
+            (S::Unconfigured, Event::Configured) => (self.with(S::Starting), Action::Spawn),
             (S::Starting, Event::NotFound) => (self.with(S::NotInstalled), Action::None),
             (S::Starting, Event::FetchStarted) => (self.with(S::Fetching), Action::None),
             (S::Fetching, Event::Fetched) => (self.with(S::Starting), Action::None),
@@ -419,6 +435,36 @@ mod tests {
             running.step(Event::Installed, policy()),
             (running, Action::None)
         );
+    }
+
+    /// #1951: 前提が未設定なら起こさず、満たされたと分かった・開き直した・restart で確かめ直す
+    #[test]
+    fn 前提が未設定なら止まり満たされれば起こす() {
+        let (lc, actions) = run(&[Event::Open, Event::Unconfigured]);
+        assert_eq!(lc.state, S::Unconfigured);
+        assert_eq!(actions, vec![Action::Spawn, Action::None]);
+        assert!(!lc.state.has_process());
+        // 落ちたのではない（数えない・待ってから起こさない）
+        assert_eq!(lc.step(Event::Exited, policy()), (lc, Action::None));
+        assert_eq!(lc.crashes, 0);
+        // 満たされた
+        assert_eq!(
+            lc.step(Event::Configured, policy()),
+            (lc.with(S::Starting), Action::Spawn)
+        );
+        // 開き直したらもう一度確かめる
+        assert_eq!(lc.step(Event::Open, policy()).1, Action::Spawn);
+        // restart も確かめ直す
+        assert_eq!(lc.step(Event::UserRestart, policy()).1, Action::Spawn);
+        // stop はその場で「止めた」（プロセスが無い）。止めたら満たされても起こさない
+        let (stopped, action) = lc.step(Event::UserStop, policy());
+        assert_eq!((stopped.state, action), (S::Stopped, Action::None));
+        assert_eq!(stopped.step(Event::Configured, policy()).1, Action::None);
+        // 稼働中に「満たされた」「満たされない」が来ても何もしない
+        let (running, _) = run(&[Event::Open, Event::Initialized]);
+        for event in [Event::Configured, Event::Unconfigured] {
+            assert_eq!(running.step(event, policy()), (running, Action::None));
+        }
     }
 
     #[test]

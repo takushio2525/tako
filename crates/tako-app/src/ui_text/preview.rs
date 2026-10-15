@@ -475,6 +475,17 @@ pub fn lsp_retry() -> &'static str {
 pub fn lsp_restart() -> &'static str {
     tr!("起こし直す", "Restart")
 }
+/// 帯の見出し: 起こす前提が整っていない（#1951。Arduino の基板が未選択）。理由と選ぶコマンドは帯の下の行
+pub fn lsp_unconfigured(name: &str) -> String {
+    tr!(
+        format!("言語サーバ {name} は準備ができるまで起こしていません（補完・診断・ホバーは出ません）"),
+        format!("Language server {name} is not started until it is set up (no completion, diagnostics or hover)")
+    )
+}
+/// 前提を満たしたかをもう一度確かめるボタン（manager の restart = CLI `tako lsp restart` と同じ口）
+pub fn lsp_recheck() -> &'static str {
+    tr!("もう一度確かめる", "Check again")
+}
 
 #[cfg(test)]
 mod tests {
@@ -559,6 +570,8 @@ mod tests {
                 lsp_install().to_string(),
                 lsp_retry().to_string(),
                 lsp_restart().to_string(),
+                lsp_unconfigured("srv"),
+                lsp_recheck().to_string(),
             ]
         });
     }

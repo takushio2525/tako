@@ -171,6 +171,10 @@
 //!   必ず済んだと知っている（#1930 の問い直しを決定的に通す）
 //! - `--log-delay-ms <ms>`（`TAKO_LSP_FAKE_LOG_DELAY_MS`）: 受けたメッセージを `--log` へ書く前に
 //!   待つ（manager が「送った」ものがログに「届いた」と載るのが遅れる = #1930 の 1684 の形）
+//!
+//! `TAKO_LSP_FAKE_ARGV_LOG=<ファイル>`（#1951）: 起動のたびに自分の起動引数（0 番 = 実行ファイルを含む）を
+//! 1 行 1 JSON の配列で追記する。知らない引数は読み飛ばすので、検出表の行が組んだ引数（`-cli <パス>` 等）を
+//! そのまま受けて、何が並んだかを e2e が読める（env だけで指定する = 起動引数を汚さない）
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -923,6 +927,12 @@ fn main() {
     let mut disk: Option<Disk> = None;
     let mut docs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     append(&spawns, &std::process::id().to_string());
+    append(
+        &std::env::var("TAKO_LSP_FAKE_ARGV_LOG")
+            .ok()
+            .filter(|v| !v.is_empty()),
+        &serde_json::Value::from(args.clone()).to_string(),
+    );
     eprintln!("tako-lsp-fake: scenario={scenario}");
     if scenario == "die" {
         // 起動直後に即死する（initialize を 1 通も読まない）

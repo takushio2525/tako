@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use super::fetch::{Archive, Asset, Digest, Fetch, NpmPackage, PlatformAsset};
+use crate::app_bundle::AppBundle;
 
 /// 表の 1 行 = 1 つの言語サーバ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,17 +25,101 @@ pub struct ServerSpec {
     pub documents: &'static [DocumentKind],
     /// 実行ファイル名。解決は必ず `platform::exe::find` を通す
     pub program: &'static str,
-    /// 起動引数
-    pub args: &'static [&'static str],
+    /// 起動引数（並びのまま渡す）。固定の文字列のほかに、伴走の実行ファイルのパスと tako が
+    /// 用意する空のファイルのパスを置ける（#1951。組み立ては [`super::launch`] の 1 実装）
+    pub args: &'static [Arg],
     /// ルートの印。ファイルの場所から上へ辿って最初に見つかったものを rootUri にする
     pub root_markers: &'static [&'static str],
+    /// ルートの取り方（#1951。ほとんどの行は [`RootScope::Project`]）
+    pub root_scope: RootScope,
     /// 印が入れ子になる言語の「最上位」判定（例: Cargo の workspace）。無ければ `None`
     pub workspace_root: Option<WorkspaceRoot>,
+    /// PATH に無いときに探すアプリの同梱（#1951。サーバと伴走の両方を探す。置き場の知識は
+    /// [`crate::app_bundle`] の表 1 枚 = Code Runner の #1950 と同じ 1 実装）。無ければ `None`
+    pub bundled: Option<&'static AppBundle>,
+    /// 起こす前に満たすべきこと（#1951）。満たさなければ起こさず、理由と満たすコマンドを出す
+    pub requires: Option<Requirement>,
     /// 未導入のときに案内する導入コマンド
     pub install: InstallHint,
     /// 見つからないときに tako が data dir へ取ってくる方法（#1944）。取れないサーバは `None`
     /// （導入コマンドの案内だけ = #1678 の振る舞い）
     pub fetch: Option<Fetch>,
+}
+
+/// 起動引数 1 つ（#1951）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arg {
+    /// そのままの文字列（`--stdio` 等）
+    Lit(&'static str),
+    /// 伴走する実行ファイルのパス（名前を書く）。見つけたサーバと同じディレクトリ → PATH →
+    /// 行の `bundled` の順に探し、無ければサーバを起こさない（未導入として理由を出す）
+    Companion(&'static str),
+    /// tako が `<data_dir>/lsp-config/<id>/<名前>` に用意する 0 バイトのファイルのパス
+    /// （「設定ファイルのパスを必ず渡せ」と求めるが中身は要らないサーバ向け）
+    EmptyFile(&'static str),
+}
+
+impl ServerSpec {
+    /// 固定の文字列の引数だけ（tako が取ったサーバの起動 = 伴走も空のファイルも持たない行で使う）
+    pub fn literal_args(&self) -> Vec<&'static str> {
+        self.args
+            .iter()
+            .filter_map(|arg| match arg {
+                Arg::Lit(value) => Some(*value),
+                Arg::Companion(_) | Arg::EmptyFile(_) => None,
+            })
+            .collect()
+    }
+
+    /// 伴走の実行ファイルの名前（並びのまま）
+    pub fn companions(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.args.iter().filter_map(|arg| match arg {
+            Arg::Companion(name) => Some(*name),
+            _ => None,
+        })
+    }
+}
+
+/// ルートの取り方（#1951）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootScope {
+    /// 印を上へ辿る → `.git` → ファイルの場所（[`crate::lsp::root`] の冒頭の規則）
+    Project,
+    /// ファイルのあるディレクトリ（印も `.git` も見ない）。Arduino のスケッチはフォルダ単位で、
+    /// 上の段のスケッチや repo の根をルートにするとサーバが別のスケッチを組む
+    FileDir,
+}
+
+/// 起こす前の前提（#1951）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requirement {
+    /// Arduino のスケッチの基板が選ばれている（ルート = スケッチのフォルダの設定を読む。読みと
+    /// 案内の文は Code Runner の #1950 と同じ 1 実装 = [`crate::runner_project::sketch_board_selected`]）。
+    /// `cli` は選び方のコマンドを打つ伴走（[`Arg::Companion`] の名前）
+    SketchBoard { cli: &'static str },
+}
+
+impl Requirement {
+    /// 満たすコマンドを打つ伴走の名前（[`Arg::Companion`] の 1 つ）
+    pub fn companion(&self) -> &'static str {
+        match self {
+            Self::SketchBoard { cli } => cli,
+        }
+    }
+
+    /// ルート `root` で満たしていなければ、理由と満たすコマンド。`cli` は案内のコマンドの先頭に
+    /// 置く伴走の形（[`super::launch::Companion::command_name`]）。ファイルを 1 つ読むだけ
+    pub fn unmet(
+        &self,
+        root: &Path,
+        cli: &str,
+        platform: crate::platform::support::Platform,
+    ) -> Option<(String, String)> {
+        match self {
+            Self::SketchBoard { .. } => (!crate::runner_project::sketch_board_selected(root))
+                .then(|| crate::runner_project::board_not_selected_note(root, cli, platform)),
+        }
+    }
 }
 
 /// 拡張子 1 つぶん
@@ -92,6 +177,9 @@ const fn doc(extension: &'static str, language_id: &'static str) -> DocumentKind
 /// LaTeX（texlab）→ TOML（tombi）→ Swift（sourcekit-lsp）→ Dart（dart）→ CSS / SCSS / Less と HTML
 /// （vscode-langservers-extracted）。前の 2 つは tako が取れる単体バイナリ、Swift と Dart は言語の道具に同梱
 /// （入っていれば言語サーバも在る）、CSS と HTML は利用者の npm で入れる（依存 32 包みを取る口がまだ無い）
+///
+/// Arduino の 1 行（#1951）: `.ino` を arduino-language-server（Arduino IDE の同梱物）へ。伴走の
+/// arduino-cli / clangd と空の設定ファイルを引数に並べ、基板が選ばれるまで起こさない
 pub const SERVERS: &[ServerSpec] = &[
     ServerSpec {
         id: "rust-analyzer",
@@ -99,10 +187,13 @@ pub const SERVERS: &[ServerSpec] = &[
         program: "rust-analyzer",
         args: &[],
         root_markers: &["Cargo.toml"],
+        root_scope: RootScope::Project,
         workspace_root: Some(WorkspaceRoot {
             file: "Cargo.toml",
             contains: "[workspace]",
         }),
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "rustup component add rust-analyzer",
             windows: "rustup component add rust-analyzer",
@@ -179,9 +270,12 @@ pub const SERVERS: &[ServerSpec] = &[
         program: "clangd",
         args: &[],
         root_markers: &["compile_commands.json", "compile_flags.txt", ".clangd"],
+        root_scope: RootScope::Project,
         workspace_root: None,
         // macOS は Command Line Tools の clangd（#1956。#1944 の提案: 取らない代わりに Apple 公式の 1 行を案内する。
         // CLT を入れると `/usr/bin/clangd` とコンパイラのヘッダが一緒に入る = LLVM 一式は要らない）
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "xcode-select --install",
             windows: "winget install LLVM.LLVM",
@@ -204,9 +298,12 @@ pub const SERVERS: &[ServerSpec] = &[
             doc("jsx", "javascriptreact"),
         ],
         program: "typescript-language-server",
-        args: &["--stdio"],
+        args: &[Arg::Lit("--stdio")],
         root_markers: &["tsconfig.json", "jsconfig.json", "package.json"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "npm install -g typescript-language-server typescript",
             windows: "npm install -g typescript-language-server typescript",
@@ -237,7 +334,7 @@ pub const SERVERS: &[ServerSpec] = &[
         id: "pyright",
         documents: &[doc("py", "python"), doc("pyi", "python")],
         program: "pyright-langserver",
-        args: &["--stdio"],
+        args: &[Arg::Lit("--stdio")],
         root_markers: &[
             "pyrightconfig.json",
             "pyproject.toml",
@@ -245,7 +342,10 @@ pub const SERVERS: &[ServerSpec] = &[
             "setup.cfg",
             "requirements.txt",
         ],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "npm install -g pyright",
             windows: "npm install -g pyright",
@@ -277,7 +377,10 @@ pub const SERVERS: &[ServerSpec] = &[
             "texlabroot",
             "Tectonic.toml",
         ],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "brew install texlab",
             // winget に包みが無い（tako が取れないときだけ出る案内）
@@ -344,11 +447,14 @@ pub const SERVERS: &[ServerSpec] = &[
         id: "tombi",
         documents: &[doc("toml", "toml")],
         program: "tombi",
-        args: &["lsp"],
+        args: &[Arg::Lit("lsp")],
         // 設定ファイルだけを印にする（Cargo.toml / pyproject.toml を印にすると workspace の crate ごとに
         // 器が分かれる）。無ければ `.git` → ファイルの場所
         root_markers: &["tombi.toml"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "brew install tombi",
             windows: "winget install tombi-toml.tombi",
@@ -417,7 +523,10 @@ pub const SERVERS: &[ServerSpec] = &[
         program: "sourcekit-lsp",
         args: &[],
         root_markers: &["Package.swift", "buildServer.json"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "xcode-select --install",
             windows: "winget install Swift.Toolchain",
@@ -430,9 +539,12 @@ pub const SERVERS: &[ServerSpec] = &[
         id: "dart",
         documents: &[doc("dart", "dart")],
         program: "dart",
-        args: &["language-server", "--protocol=lsp"],
+        args: &[Arg::Lit("language-server"), Arg::Lit("--protocol=lsp")],
         root_markers: &["pubspec.yaml"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "brew install dart-sdk",
             windows: "winget install Google.DartSDK",
@@ -445,9 +557,12 @@ pub const SERVERS: &[ServerSpec] = &[
         id: "vscode-css-language-server",
         documents: &[doc("css", "css"), doc("scss", "scss"), doc("less", "less")],
         program: "vscode-css-language-server",
-        args: &["--stdio"],
+        args: &[Arg::Lit("--stdio")],
         root_markers: &["package.json"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "npm install -g vscode-langservers-extracted",
             windows: "npm install -g vscode-langservers-extracted",
@@ -463,15 +578,53 @@ pub const SERVERS: &[ServerSpec] = &[
         id: "vscode-html-language-server",
         documents: &[doc("html", "html"), doc("htm", "html")],
         program: "vscode-html-language-server",
-        args: &["--stdio"],
+        args: &[Arg::Lit("--stdio")],
         root_markers: &["package.json"],
+        root_scope: RootScope::Project,
         workspace_root: None,
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "npm install -g vscode-langservers-extracted",
             windows: "npm install -g vscode-langservers-extracted",
         },
         // 取らない（まだ）: CSS の行と同じ包み・同じ理由。診断は埋め込みの `<style>` / `<script>` の誤り
         // （HTML の構造そのものは検証しない）、ホバーは要素と属性の説明
+        fetch: None,
+    },
+    // ─── Arduino（#1951。設計 `.agent/plans/2026-10-language-coverage.md` §5.3）──────────
+    ServerSpec {
+        id: "arduino-language-server",
+        // languageId は Arduino IDE と同じ `cpp`。clangd の行には `.ino` を入れない（clangd 単体は `.ino` を
+        // 解けず、arduino-cli の compile db を渡すと正しいスケッチに嘘のエラーが 10 件出る = S0 の実測）。
+        // スケッチ内の `.h` / `.cpp` は拡張子のまま clangd（ALS へ回すには「先に `.ino` を開く」順を
+        // tako が作る必要がある = §5.3 の 6 の実測）
+        documents: &[doc("ino", "cpp")],
+        program: "arduino-language-server",
+        // `-cli-config` が無いと `Path to ArduinoCLI config file must be set.` で即終了し、0 バイトの
+        // ファイルで足りる（実測）。基板は `-fqbn` で渡さない（正本は sketch.yaml = 2 つにしない）
+        args: &[
+            Arg::Lit("-cli"),
+            Arg::Companion("arduino-cli"),
+            Arg::Lit("-clangd"),
+            Arg::Companion("clangd"),
+            Arg::Lit("-cli-config"),
+            Arg::EmptyFile("arduino-cli.yaml"),
+        ],
+        root_markers: &[],
+        root_scope: RootScope::FileDir,
+        workspace_root: None,
+        // brew に ALS の formula は無い。現実的な入手経路は Arduino IDE の同梱物（arduino-cli と
+        // clangd 14 も同じ場所に並ぶ = 伴走は ALS と同じディレクトリを先に探す）
+        bundled: Some(&crate::app_bundle::ARDUINO_IDE),
+        // 基板が無いと 15 秒待っても診断が 1 回も来ずホバーも時間切れ = 黙って何も出ない（実測）
+        requires: Some(Requirement::SketchBoard { cli: "arduino-cli" }),
+        // Code Runner の「arduino-cli が無い」の案内（#1950）の 1 つ目と同じ（言語サーバまで揃う方）
+        install: InstallHint {
+            macos: "brew install --cask arduino-ide",
+            windows: "winget install --id ArduinoSA.IDE.stable",
+        },
+        // 取らない: 単体の配布が無く、伴走（arduino-cli・clangd）とコア（数百 MB）が別に要る
         fetch: None,
     },
 ];
@@ -527,12 +680,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 第2波までで10行() {
+    fn arduinoの行までで11行() {
         assert_eq!(
             SERVERS.len(),
-            10,
+            11,
             "表の行数が変わったら番犬とドキュメントも直す"
         );
+    }
+
+    /// #1951: `.ino` は arduino-language-server の行。伴走 2 つと空の設定ファイルを引数に並べ、
+    /// ルートはファイルのディレクトリ・Arduino IDE の同梱を探す・基板が要る
+    #[test]
+    fn inoはarduino_language_serverの行が受け持つ() {
+        let got = resolve(Path::new("Blink/Blink.ino")).expect(".ino の行");
+        assert_eq!(
+            (got.spec.id, got.language_id),
+            ("arduino-language-server", "cpp")
+        );
+        let spec = got.spec;
+        assert_eq!(
+            spec.args,
+            &[
+                Arg::Lit("-cli"),
+                Arg::Companion("arduino-cli"),
+                Arg::Lit("-clangd"),
+                Arg::Companion("clangd"),
+                Arg::Lit("-cli-config"),
+                Arg::EmptyFile("arduino-cli.yaml"),
+            ]
+        );
+        assert_eq!(
+            spec.companions().collect::<Vec<_>>(),
+            ["arduino-cli", "clangd"]
+        );
+        assert_eq!(spec.literal_args(), ["-cli", "-clangd", "-cli-config"]);
+        assert_eq!(spec.root_scope, RootScope::FileDir);
+        assert_eq!(spec.bundled, Some(&crate::app_bundle::ARDUINO_IDE));
+        assert_eq!(
+            spec.requires,
+            Some(Requirement::SketchBoard { cli: "arduino-cli" })
+        );
+        assert!(spec.fetch.is_none(), "単体の配布が無いので取らない");
+        // clangd の行は `.ino` を受け持たない（嘘のエラー 10 件 = S0）
+        let clangd = find_in(SERVERS, "clangd").unwrap();
+        assert!(clangd.documents.iter().all(|d| d.extension != "ino"));
+        // スケッチ内の `.h` / `.cpp` は拡張子のまま clangd（§5.3 の 6 の実測で決めた）
+        for path in ["Blink/helper.h", "Blink/helper.cpp"] {
+            assert_eq!(resolve(Path::new(path)).map(|r| r.spec.id), Some("clangd"));
+        }
+        assert_eq!(
+            override_env_name(spec.id),
+            "TAKO_LSP_BIN_ARDUINO_LANGUAGE_SERVER"
+        );
+    }
+
+    /// 前提・伴走・取得の組み合わせが整っている（前提の `cli` は伴走の名前・取れる行は固定の引数だけ =
+    /// 取った版の起動は伴走を探さない・`FileDir` の行は印を持たない）
+    #[test]
+    fn 行の新しい欄の組み合わせが整っている() {
+        for spec in SERVERS {
+            if let Some(Requirement::SketchBoard { cli }) = spec.requires {
+                assert!(
+                    spec.companions().any(|c| c == cli),
+                    "{}: 前提の cli {cli} が伴走に無い",
+                    spec.id
+                );
+            }
+            if spec.fetch.is_some() {
+                assert!(
+                    spec.args.iter().all(|a| matches!(a, Arg::Lit(_))),
+                    "{}: 取れる行は固定の引数だけ",
+                    spec.id
+                );
+            }
+            if spec.root_scope == RootScope::FileDir {
+                assert!(spec.root_markers.is_empty() && spec.workspace_root.is_none());
+            }
+            for arg in spec.args {
+                if let Arg::Companion(name) | Arg::EmptyFile(name) = arg {
+                    assert!(
+                        !name.is_empty() && !name.contains(['/', '\\']),
+                        "{}: {name}",
+                        spec.id
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -637,7 +870,10 @@ mod tests {
             program: "jdtls",
             args: &[],
             root_markers: &["pom.xml", "build.gradle"],
+            root_scope: RootScope::Project,
             workspace_root: None,
+            bundled: None,
+            requires: None,
             install: InstallHint {
                 macos: "brew install jdtls",
                 windows: "scoop install jdtls",

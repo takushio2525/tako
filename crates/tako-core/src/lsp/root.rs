@@ -7,6 +7,9 @@
 //! 3. 印が無ければ `.git` を持つ所（リポジトリの根）
 //! 4. それも無ければファイルの親ディレクトリ
 //!
+//! 表の `root_scope` が [`RootScope::FileDir`] の行（Arduino のスケッチ = フォルダ単位。#1951）は
+//! 1〜3 を見ずにファイルの親ディレクトリ（上の段のスケッチや repo の根をルートにしない）。
+//!
 //! **`git` は起こさない**。`git::repo_root` は `git rev-parse` を起こすので、
 //! 編集モードに入った瞬間の UI スレッドから呼ぶと窓が止まりうる（#1503 の型）。
 //! `.git`（ディレクトリでも worktree のファイルでもよい）の有無を見る走査で足りる。
@@ -16,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::servers::ServerSpec;
+use super::servers::{RootScope, ServerSpec};
 
 /// 実ファイルシステムでルートを決める
 pub fn find_root(spec: &ServerSpec, file: &Path) -> PathBuf {
@@ -33,6 +36,9 @@ pub fn find_root_with(
     read: &dyn Fn(&Path) -> Option<String>,
 ) -> PathBuf {
     let start = file.parent().unwrap_or(file);
+    if spec.root_scope == RootScope::FileDir {
+        return start.to_path_buf();
+    }
     let marked = start.ancestors().find(|dir| {
         spec.root_markers
             .iter()
@@ -70,10 +76,13 @@ mod tests {
         program: "fake",
         args: &[],
         root_markers: &["proj.toml"],
+        root_scope: RootScope::Project,
         workspace_root: Some(WorkspaceRoot {
             file: "proj.toml",
             contains: "[workspace]",
         }),
+        bundled: None,
+        requires: None,
         install: InstallHint {
             macos: "",
             windows: "",
@@ -140,6 +149,30 @@ mod tests {
         assert_eq!(
             root(&入れ子なし, &files, "/repo/docs/x/a.x"),
             PathBuf::from("/repo")
+        );
+    }
+
+    /// #1951: スケッチはフォルダ単位。印・`.git`・上の段の印があってもファイルのディレクトリ
+    #[test]
+    fn ファイルのディレクトリの行は上へ辿らない() {
+        const フォルダ単位: ServerSpec = ServerSpec {
+            root_markers: &[],
+            root_scope: RootScope::FileDir,
+            workspace_root: None,
+            ..印あり
+        };
+        let files = fs(&[
+            ("/repo/.git", "gitdir: …"),
+            ("/repo/sketches/proj.toml", "[workspace]\n"),
+        ]);
+        assert_eq!(
+            root(&フォルダ単位, &files, "/repo/sketches/Blink/Blink.x"),
+            PathBuf::from("/repo/sketches/Blink")
+        );
+        // 同じファイルシステムで、今までの行は上の段の印を採る（違いはこの欄だけ）
+        assert_eq!(
+            root(&入れ子なし, &files, "/repo/sketches/Blink/Blink.x"),
+            PathBuf::from("/repo/sketches")
         );
     }
 

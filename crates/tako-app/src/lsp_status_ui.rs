@@ -1,5 +1,6 @@
 //! エディタに言語サーバの状態を出す（#1944）: タイトルの 1 行（取得中 / 起動中 / 読み込み中 /
-//! 動作中）と、未導入・取得の失敗・止まったときの帯（理由 + 次の一手 + 押せば入るボタン）
+//! 動作中）と、未導入・取得の失敗・止まった・起こす前提が未設定（#1951。Arduino の基板）のときの帯
+//! （理由 + 次の一手 + 押せば入る / 確かめ直すボタン）
 //!
 //! 「インテリジェンス機能が黙って出ない」を無くすのが目的。状態の正本は manager
 //! （`LspManager::document_server`。`tako lsp status` / MCP `tako_lsp_server` と同じ判定と同じ文）で、
@@ -69,6 +70,11 @@ impl TakoApp {
                 crate::ui_text::preview::lsp_unavailable(server.id),
                 Some(BarAction::Restart),
             ),
+            // #1951: 理由の行に満たすコマンド（`arduino-cli board attach -b <基板> …`）。ボタンは確かめ直し
+            ServerState::Unconfigured => (
+                crate::ui_text::preview::lsp_unconfigured(server.id),
+                Some(BarAction::Recheck),
+            ),
             _ => return None,
         };
         let key = pane_id.as_u64();
@@ -85,6 +91,7 @@ impl TakoApp {
                 BarAction::Install(false) => crate::ui_text::preview::lsp_install(),
                 BarAction::Install(true) => crate::ui_text::preview::lsp_retry(),
                 BarAction::Restart => crate::ui_text::preview::lsp_restart(),
+                BarAction::Recheck => crate::ui_text::preview::lsp_recheck(),
             };
             div()
                 .id(("preview-lsp-action", key))
@@ -191,7 +198,8 @@ impl TakoApp {
                     BarAction::Install(_) => {
                         manager.install(Some(id));
                     }
-                    BarAction::Restart => {
+                    // 確かめ直しも restart の口（前提を満たしていれば起き、まだなら同じ帯に戻る）
+                    BarAction::Restart | BarAction::Recheck => {
                         manager.restart(Some(id));
                     }
                 }
@@ -221,6 +229,8 @@ enum BarAction {
     /// 取って入れる（`true` = 失敗のあとのもう一度）
     Install(bool),
     Restart,
+    /// 起こす前提を満たしたかを確かめ直す（#1951）
+    Recheck,
 }
 
 /// タイトルの 1 行の中身（帯を出す状態は `None`）
@@ -258,7 +268,10 @@ fn badge_of(server: &DocumentServer) -> Option<(String, BadgeTone)> {
             crate::ui_text::preview::lsp_running(server.id),
             BadgeTone::Quiet,
         ),
-        ServerState::NotInstalled | ServerState::GaveUp | ServerState::Stopped => return None,
+        ServerState::NotInstalled
+        | ServerState::GaveUp
+        | ServerState::Stopped
+        | ServerState::Unconfigured => return None,
     })
 }
 
@@ -285,7 +298,10 @@ mod tests {
             let shown = badge_of(&server(state)).is_some();
             let bar = matches!(
                 state,
-                ServerState::NotInstalled | ServerState::GaveUp | ServerState::Stopped
+                ServerState::NotInstalled
+                    | ServerState::GaveUp
+                    | ServerState::Stopped
+                    | ServerState::Unconfigured
             );
             assert_eq!(shown, !bar, "{state:?}");
         }

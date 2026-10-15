@@ -1081,7 +1081,8 @@ pub fn tools() -> Vec<Value> {
                 拡張子に合うサーバ（rust-analyzer 等）が起きる。無ければ tako の data dir へ取って起こす（state=fetching。\
                 グローバルの版を優先）。action=status（既定）で状態・source（path / managed）・取得の進捗・能力・診断件数、\
                 list で検出表と導入済みか（解決はキャッシュ。restart で引き直す）、restart で起こし直す（未導入・諦めたも）、stop で止める、\
-                logs で stderr の直近、install で未導入のサーバを取る（name 省略で全部）。未導入なら reason / next_step / install_command を返す。\
+                logs で stderr の直近、install で未導入のサーバを取る（name 省略で全部）。未導入なら reason / next_step / install_command、\
+                起こす前提が未設定（.ino の基板）なら state=unconfigured と reason / next_step / setup_command を返す。\
                 status の fetch.cleanup は表の版を上げた後の古い版の片付け、recheck は未導入の引き直しの間隔。",
             "inputSchema": {
                 "type": "object",

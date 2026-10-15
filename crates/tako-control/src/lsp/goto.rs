@@ -219,6 +219,12 @@ pub enum GotoError {
         next_step: String,
         install_command: &'static str,
     },
+    /// 起こす前提が整っていない（#1951。Arduino の基板が未選択）。理由と満たすコマンドは manager が組む
+    Unconfigured {
+        server: &'static str,
+        reason: String,
+        next_step: String,
+    },
     /// サーバがその種類に対応していない（能力に無い）
     Unsupported { server: &'static str },
     /// 上限までに答えが来なかった。`starting` = 起動と握手が終わらなかった
@@ -254,6 +260,7 @@ impl GotoError {
             Self::Disabled => "disabled",
             Self::NoServer => "no-server",
             Self::NotInstalled { .. } => "not-installed",
+            Self::Unconfigured { .. } => "unconfigured",
             Self::Unsupported { .. } => "unsupported",
             Self::Timeout { .. } => "timeout",
             Self::Unavailable { .. } => "unavailable",
@@ -275,7 +282,7 @@ impl GotoError {
         match self {
             Self::Disabled => text::DISABLED_REASON.text().to_string(),
             Self::NoServer => text::GOTO_NO_SERVER_REASON.text().to_string(),
-            Self::NotInstalled { reason, .. } => reason.clone(),
+            Self::NotInstalled { reason, .. } | Self::Unconfigured { reason, .. } => reason.clone(),
             Self::Unsupported { server } => {
                 text::fill(unsupported, &[("server", server), ("kind", label)])
             }
@@ -326,7 +333,9 @@ impl GotoError {
                 text::GOTO_RETRY_NEXT_STEP.text().to_string()
             }
             Self::NoServer => text::GOTO_NO_SERVER_NEXT_STEP.text().to_string(),
-            Self::NotInstalled { next_step, .. } => next_step.clone(),
+            Self::NotInstalled { next_step, .. } | Self::Unconfigured { next_step, .. } => {
+                next_step.clone()
+            }
             Self::Unsupported { .. } => text::GOTO_UNSUPPORTED_NEXT_STEP.text().to_string(),
             Self::Timeout { .. } => text::GOTO_TIMEOUT_NEXT_STEP.text().to_string(),
             Self::Unavailable { state, .. } => match state {
@@ -362,7 +371,8 @@ impl GotoError {
                 out["server"] = json!(server);
                 out["install_command"] = json!(install_command);
             }
-            Self::Unsupported { server }
+            Self::Unconfigured { server, .. }
+            | Self::Unsupported { server }
             | Self::Timeout { server, .. }
             | Self::Unavailable { server, .. }
             | Self::Crashed { server }
