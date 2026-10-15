@@ -692,15 +692,16 @@
     {
       "key": "tako_run",
       "status": "degraded",
-      "note_ja": "宣言・拡張子既定・プロジェクト既定の解決と実行は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）は Windows 実機で未確認（#1950）",
+      "note_ja": "宣言・拡張子既定・プロジェクト既定の解決と実行・実行設定の保存は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）・基板とポートの選択（arduino-cli board attach）は Windows 実機で未確認（#1950 / #1952）",
       "evidence": "measured",
       "evidence_detail": "#875 の実機 before/after: 「PTY を起動できなかった」→ 出力 + __TAKO_EXIT=0。終了コード 4 型・引用符・日本語・psmux 経由まで実測 + セルフテスト項目 91(d) の実行検査が ran=true。拡張子既定も #1655 で Windows 用の列を持つ（`python` / `.exe` / `cmd /c` / `pwsh -File`。`&&` と `./` は PowerShell 5.1 で通らないので使わない）。#1950 の Arduino（IDE 同梱の `arduino-cli.exe` の置き場・案内の PowerShell の形）は macOS の単体から固定しただけ"
     },
     {
       "key": "tako_run_defaults",
-      "status": "supported",
+      "status": "degraded",
+      "note_ja": "宣言・拡張子既定・プロジェクト既定の解決と実行・実行設定の保存は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）・基板とポートの選択（arduino-cli board attach）は Windows 実機で未確認（#1950 / #1952）",
       "evidence": "unit-test",
-      "evidence_detail": "拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑。組み込み既定は #1655 で OS 別の表になり、Windows の列（41 拡張子中 36 件）を macOS の単体から解決結果ごと固定している"
+      "evidence_detail": "拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑。組み込み既定は #1655 で OS 別の表になり、Windows の列（41 拡張子中 36 件）を macOS の単体から解決結果ごと固定している。#1952 の .ino の基板とポート（board list の COM ポート・board attach の argv・PowerShell の core install の案内）は macOS の単体で固定しただけ"
     },
     {
       "key": "tako_run_interactive",
@@ -717,7 +718,7 @@
     {
       "key": "tako_run_resolve",
       "status": "degraded",
-      "note_ja": "宣言・拡張子既定・プロジェクト既定の解決と実行は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）は Windows 実機で未確認（#1950）",
+      "note_ja": "宣言・拡張子既定・プロジェクト既定の解決と実行・実行設定の保存は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）・基板とポートの選択（arduino-cli board attach）は Windows 実機で未確認（#1950 / #1952）",
       "evidence": "measured",
       "evidence_detail": "#875 の実機実測で Code Runner の宣言 / 拡張子既定の解決から実行まで通した（3 経路のうちの 1 つ）。#1656 のプロジェクト既定（cargo / npm / python / go / dotnet / make）と #1950 の arduino は Windows の列を macOS の単体から固定したが実機は未検証"
     },
