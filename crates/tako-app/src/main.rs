@@ -31654,6 +31654,12 @@ mod self_test {
     mod mod_card_1963;
     #[cfg(feature = "visual-test")]
     use mod_card_1963::mod_card_visual;
+    /// #1964: GPUI のチャットと mod の描画を同じ会話で並べて撮り、mod の描画の Copy をクリック / キーで押せるか
+    /// （visual-test `mod-chat`）
+    #[cfg(feature = "visual-test")]
+    mod mod_chat_1964;
+    #[cfg(feature = "visual-test")]
+    use mod_chat_1964::mod_chat_visual;
     /// #1909: 補完の打鍵の取り消しの番号を UI スレッドで先に取る（visual-test `completion-cancel`）
     #[cfg(feature = "visual-test")]
     mod completion_cancel_1909;
@@ -46172,6 +46178,12 @@ mod self_test {
                 // #1963: mod が描いたコマンドカードは GPUI のカード帯へ出さず、viewport を縮めないか
                 "mod-card" => {
                     mod_card_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1964: GPUI のチャットと mod の描画（同じ会話）を並べて撮る・mod の描画の Copy を押せるか
+                "mod-chat" => {
+                    mod_chat_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

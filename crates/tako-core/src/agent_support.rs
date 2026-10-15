@@ -833,10 +833,12 @@ pub const MATRIX: &[AgentFeature] = &[
         agy: pending(notes::NOT_INVESTIGATED, 1885),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
-            "#1964: 一時の設定 dir の実 Claude Code 2.1.294 に偽 Messages API で答えさせ、隔離 GUI の GUI モード\
-             （chat.place mod）で吹き出し・コードブロックの Copy・ツールの要約が描かれ、tako がそのペインをターミナル表示に\
-             して、帯のキーと Copy のクリックで押せること・報告が途切れる / claude が終わると GPUI のチャットへ戻ること・\
-             ターミナル表示の既定では吹き出しを描かないことを確かめた（scripts/test-mod-chat-1964.sh）",
+            "#1964: 一時の設定 dir の実 Claude Code 2.1.294 に偽 Messages API で答えさせ、隔離 GUI の GUI モードで\
+             chat.place mod にすると 11〜12 秒（次の報告）でペインがターミナル表示（理由 mod_chat）になり、吹き出し・\
+             コードブロックの Copy・ツールの 1 行の要約が描かれ、Copy をクリック・帯の o をキーで押せること・報告が途切れると\
+             最後の報告から 45.2 秒、claude が終わると即座に GPUI のチャットへ戻ること・ターミナル表示の既定では吹き出しを\
+             描かずコードのコピーだけであること・同じ描画の口を包む他の mod が外側 / 内側のどちらでも両方の描画が残ることを\
+             確かめた（scripts/test-mod-chat-1964.sh）",
         ),
     },
     AgentFeature {

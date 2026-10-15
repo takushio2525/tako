@@ -150,6 +150,32 @@
       }
     },
     {
+      "key": "claude_mod_chat",
+      "summary_ja": "チャット風の描画（発言の吹き出し・コードブロックのコピー・ツール呼び出しの 1 行の要約）をエージェントの画面の中に描く（ターミナル表示では既定でコードのコピーだけ。GUI モードで選べば tako のチャットビューの代わりにその画面を見せる）",
+      "evidence": "measured",
+      "evidence_detail": "#1964: 一時の設定 dir の実 Claude Code 2.1.294 に偽 Messages API で答えさせ、隔離 GUI の GUI モードでchat.place mod にすると 11〜12 秒（次の報告）でペインがターミナル表示（理由 mod_chat）になり、吹き出し・コードブロックの Copy・ツールの 1 行の要約が描かれ、Copy をクリック・帯の o をキーで押せること・報告が途切れると最後の報告から 45.2 秒、claude が終わると即座に GPUI のチャットへ戻ること・ターミナル表示の既定では吹き出しを描かずコードのコピーだけであること・同じ描画の口を包む他の mod が外側 / 内側のどちらでも両方の描画が残ることを確かめた（scripts/test-mod-chat-1964.sh）",
+      "agents": {
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
       "key": "claude_mod_install",
       "summary_ja": "tako setup がエージェントの設定 dir ごとに tako の拡張を入れる（管理印つき・同名の他の拡張があれば入れない・tako mod uninstall で外せる）",
       "evidence": "measured",

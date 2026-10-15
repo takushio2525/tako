@@ -59,6 +59,14 @@ AI からは、最後の AI の発話をそのままコピーできます。ど�
 
 <Cmd>tako chat copy</Cmd>
 
+### Claude Code の画面のままチャット風に（選べる）
+
+Claude Code のペインで tako mod（tako が Claude Code に入れる拡張）が動いているときは、チャットビューの代わりに Claude Code の画面そのものをチャット風にして出せます。自分の発言は右寄せの吹き出しに、AI の返答のコードブロックの下には「コピー」のボタン（押すと画面の折り返しが混ざらない元の文字列が写ります）、ツールの呼び出しは 1 行の要約になります。入力欄も Claude Code の本物です。
+
+<Cmd>tako mod ui set chat.place mod</Cmd>
+
+既定はいまのチャットビューのままです（戻すときは `tako mod ui set chat.place auto`）。コードブロックの下の「コピー」はマウスで押せ、キーボードでは入力欄の上の帯（<kbd>Ctrl</kbd>+<kbd>X</kbd> → <kbd>Tab</kbd>）の `o: copy last code` で最新の返答のコードを写せます。ターミナル表示のままでも、この「コピー」のボタンだけは既定で出ます（要らなければ `tako mod ui set chat.code_copy false`）。Windows での tako mod は実機で確かめている途中です（[#1886](https://github.com/takushio2525/tako/issues/1886)）。
+
 ## ターミナル表示に戻す
 
 <GuiModeBack />
@@ -94,6 +102,7 @@ AI からは、最後の AI の発話をそのままコピーできます。ど�
 | それを戻す | `tako ui-mode restore --pane N` | `tako_ui_mode`（`restore`） |
 | いま各ペインに何が出ているか | `tako ui-mode`（応答の `pane_display`） | `tako_ui_mode` |
 | チャットの本文のコピー | `tako chat copy` | `tako_chat_copy` |
+| チャットを Claude Code の画面のままチャット風に | `tako mod ui set chat.place mod` | `tako_mod`（`ui`） |
 
 `pane_display` は各ペインの表示（`terminal` / `starter` / `chat` / `preparing`）を返すので、AI は「いまユーザーの画面に何が出ているか」を確かめてから案内できます。
 

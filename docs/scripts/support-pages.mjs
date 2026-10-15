@@ -384,7 +384,7 @@ const AGENT_CATEGORIES = [
     'worker_idle_with_background',
     'worker_prompt_undelivered', 'worker_death_resume',
     'worker_refusal_detect', 'worker_refusal_work_proof',
-    'worker_login_expired_detect', 'claude_mod_state', 'claude_mod_band', 'claude_mod_buttons', 'claude_mod_cards', 'claude_mod_ui',
+    'worker_login_expired_detect', 'claude_mod_state', 'claude_mod_band', 'claude_mod_buttons', 'claude_mod_cards', 'claude_mod_chat', 'claude_mod_ui',
     'claude_mod_install',
   ]],
   ['worker への指示と応答', [
