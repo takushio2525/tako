@@ -296,17 +296,20 @@ pub(super) fn build_request(
         "tako_confirm_close" => Request::ConfirmClose {
             enabled: bool_arg(args, "enabled")?,
         },
-        // #813: 一覧（all）のときは対象ペインを解決しない（呼び出し元が無くても引ける）
+        // #813: 一覧（all）のときは対象ペインを解決しない（呼び出し元が無くても引ける）。
+        // #2112: network（全体の設定）も同じ
         "tako_limit_resume" => {
             let all = bool_arg(args, "all")?;
+            let network = bool_arg(args, "network")?;
             Request::LimitResume {
-                pane: if all == Some(true) {
+                pane: if all == Some(true) || network.is_some() {
                     None
                 } else {
                     Some(target_pane(args, caller)?)
                 },
                 enabled: bool_arg(args, "enabled")?,
                 all,
+                network,
             }
         }
         "tako_open_file" => Request::OpenFile {

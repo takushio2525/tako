@@ -382,7 +382,7 @@ const AGENT_CATEGORIES = [
   ['worker の監視', [
     'worker_status_detect', 'worker_status_structured',
     'worker_idle_with_background',
-    'worker_prompt_undelivered', 'worker_death_resume',
+    'worker_prompt_undelivered', 'worker_death_resume', 'network_autoresume',
     'worker_refusal_detect', 'worker_refusal_work_proof',
     'worker_login_expired_detect', 'claude_mod_state', 'claude_mod_band', 'claude_mod_buttons', 'claude_mod_cards', 'claude_mod_chat', 'claude_mod_ui',
     'claude_mod_install',

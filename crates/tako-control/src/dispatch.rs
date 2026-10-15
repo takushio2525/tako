@@ -6194,7 +6194,25 @@ fn dispatch_inner(
             Ok(json!({ "enabled": host.confirm_close_enabled() }))
         }
 
-        Request::LimitResume { pane, enabled, all } => {
+        Request::LimitResume {
+            pane,
+            enabled,
+            all,
+            network,
+        } => {
+            // #2112: ネット復帰の即時再開は**全体の設定**（ペインを解かない）。
+            // 設定画面のトグル・CLI `--network on|off`・MCP の `network` がここを通る
+            if let Some(val) = network {
+                if enabled.is_some() {
+                    return Err(DispatchError::InvalidParams(
+                        "network と enabled は併用できない（全体の設定かペインの設定のどちらか）"
+                            .into(),
+                    ));
+                }
+                host.set_network_resume(val);
+                crate::diag::persist_log(&format!("[net-resume] enabled={val}"));
+                return Ok(json!({ "network": network_resume_json(host) }));
+            }
             let legacy = tako_core::limit_resume_all::legacy();
             if all.unwrap_or(false) {
                 match enabled {
@@ -18165,6 +18183,9 @@ fn limit_resume_entry(host: &dyn ControlHost, target: PaneId) -> Value {
         }),
         "shelved": ws.background_pane(target).is_some(),
         "state": host.limit_resume_state(target),
+        // #2112: 接続エラーで止まっていれば、その停止と回線の復帰を待つ状態（全体の設定は
+        // `--all` の `network`。ネット復帰の再開はペインのオプトインに依らない）
+        "network_stop": host.network_resume_state(target),
     })
 }
 
@@ -18204,6 +18225,15 @@ fn limit_resume_list(host: &dyn ControlHost) -> Value {
         v["default"] = json!(host.limit_resume_default());
         v["summary"] = limit_resume_summary(host).to_json();
     }
+    v["network"] = network_resume_json(host);
+    v
+}
+
+/// ネット復帰の即時再開（#2112）の設定と実行状態。GUI は止まっているペイン・到達確認・
+/// 直近の再開を返し、実行状態を持たないホストは設定だけを返す
+fn network_resume_json(host: &dyn ControlHost) -> Value {
+    let mut v = host.network_resume_status().unwrap_or_else(|| json!({}));
+    v["enabled"] = json!(host.network_resume_enabled());
     v
 }
 
@@ -23522,6 +23552,8 @@ mod tests {
         limit_service: tako_core::LimitService,
         /// #1945: 自動復帰の全体の既定（GUI の `TakoApp::limit_resume_all` の代役）
         limit_resume_all: bool,
+        /// #2112: ネット復帰の即時再開の全体の設定（GUI の `TakoApp::net_resume.enabled` の代役）
+        network_resume: bool,
         /// #1945: 手起動のエージェントを検出済みのペイン（GUI の会話検出の代役）
         agents_detected: std::collections::HashSet<u64>,
         preview_reload: tako_core::PreviewReloadState,
@@ -23674,6 +23706,7 @@ mod tests {
                 lang_resolved: None,
                 limit_service: tako_core::LimitService::Claude,
                 limit_resume_all: false,
+                network_resume: tako_core::net_resume::DEFAULT_ENABLED,
                 agents_detected: std::collections::HashSet::new(),
                 preview_reload: tako_core::PreviewReloadState::default(),
                 preview_cache: tako_core::PreviewCacheStats {
@@ -23964,6 +23997,14 @@ mod tests {
 
         fn set_limit_resume_default(&mut self, enabled: bool) {
             self.limit_resume_all = enabled;
+        }
+
+        fn network_resume_enabled(&self) -> bool {
+            self.network_resume
+        }
+
+        fn set_network_resume(&mut self, enabled: bool) {
+            self.network_resume = enabled;
         }
 
         fn agent_detected(&self, pane: PaneId) -> bool {
@@ -25453,6 +25494,7 @@ mod tests {
                 pane: Some(root),
                 enabled: None,
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25467,6 +25509,7 @@ mod tests {
                 pane: Some(root),
                 enabled: Some(true),
                 all: None,
+                network: None,
             },
             PaneOrigin::Mcp,
         )
@@ -25491,6 +25534,7 @@ mod tests {
                 pane: None,
                 enabled: None,
                 all: Some(true),
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25508,6 +25552,7 @@ mod tests {
                 pane: Some(root),
                 enabled: Some(false),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25524,6 +25569,7 @@ mod tests {
                 pane: Some(9999),
                 enabled: Some(true),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         );
@@ -25559,6 +25605,7 @@ mod tests {
                 pane: None,
                 enabled,
                 all: Some(true),
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25572,6 +25619,7 @@ mod tests {
                 pane: Some(pane),
                 enabled: None,
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25625,6 +25673,7 @@ mod tests {
                 pane: Some(manual),
                 enabled: Some(false),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25639,6 +25688,61 @@ mod tests {
         assert!(!host.limit_resume_all);
     }
 
+    /// #2112: `network` は全体の設定。ペインを解かず（呼び出し元が無くても通る）、
+    /// ペイン単位の `enabled` とは併用できない。一覧と 1 ペインの応答の両方から読める
+    #[test]
+    fn issue2112_networkは全体の設定を書きペインを解かない() {
+        let (mut host, master, _, _, worker) = issue1945_host();
+        let req = |network: Option<bool>, enabled: Option<bool>, pane: Option<u64>| {
+            Request::LimitResume {
+                pane,
+                enabled,
+                all: None,
+                network,
+            }
+        };
+        // 既定 ON（一覧の `network.enabled`）
+        let before = issue1945_bulk(&mut host, None);
+        assert_eq!(before["network"]["enabled"], true, "{before}");
+        // 切る: ペインが無くても通り、応答は全体の設定
+        let off = dispatch(&mut host, req(Some(false), None, None), PaneOrigin::Mcp).unwrap();
+        assert_eq!(off["network"]["enabled"], false, "{off}");
+        assert!(!host.network_resume);
+        // ペイン単位の自動復帰（#813）には触らない
+        assert!(!host
+            .ws
+            .pane_anywhere(PaneId::from_raw(master))
+            .unwrap()
+            .limit_autoresume());
+        assert_eq!(issue1945_bulk(&mut host, None)["network"]["enabled"], false);
+        // 1 ペインの応答には停止の状態の欄がある（GUI 以外のホストは null）
+        let entry = dispatch(&mut host, req(None, None, Some(worker)), PaneOrigin::Cli).unwrap();
+        assert!(
+            entry.get("network_stop").is_some_and(Value::is_null),
+            "{entry}"
+        );
+        // 戻す
+        let on = dispatch(
+            &mut host,
+            req(Some(true), None, Some(master)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(on["network"]["enabled"], true);
+        assert!(host.network_resume);
+        // ペイン単位の切替と同時には言えない（どちらの意味か取り違えない）
+        let both = dispatch(
+            &mut host,
+            req(Some(false), Some(true), Some(master)),
+            PaneOrigin::Cli,
+        );
+        assert!(
+            matches!(both, Err(DispatchError::InvalidParams(_))),
+            "{both:?}"
+        );
+        assert!(host.network_resume, "併用エラーなのに書き換えた");
+    }
+
     /// #1945: 退避中のペインも `--pane N` で読み書きできる（#1945 前は PaneNotFound）
     #[test]
     fn issue1945_退避中のペインもpane指定で切り替えられる() {
@@ -25649,6 +25753,7 @@ mod tests {
                 pane: Some(worker),
                 enabled: Some(true),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25667,6 +25772,7 @@ mod tests {
                 pane: Some(9999),
                 enabled: Some(true),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         );
@@ -25688,6 +25794,7 @@ mod tests {
                 pane: Some(worker),
                 enabled: Some(true),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25729,6 +25836,7 @@ mod tests {
                 pane: Some(decided),
                 enabled: Some(false),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )
@@ -25825,6 +25933,7 @@ mod tests {
                     pane: Some(pane),
                     enabled: None,
                     all: None,
+                    network: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -25851,6 +25960,7 @@ mod tests {
                 pane: Some(off_pane),
                 enabled: Some(true),
                 all: None,
+                network: None,
             },
             PaneOrigin::Cli,
         )

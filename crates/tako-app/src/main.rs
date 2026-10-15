@@ -48,6 +48,7 @@ mod lsp_rename_ui;
 mod lsp_status_ui;
 mod md_view;
 mod menu_bar;
+mod net_autoresume;
 mod open_files;
 mod overlays;
 mod platform;
@@ -2536,6 +2537,8 @@ struct TakoApp {
     /// ステータスバーの一括ボタンが描く集計（Issue #1945）。**描画のたびに数えない**:
     /// 2 秒 tick・一括 / 個別の切り替えの直後だけ数え直す（`refresh_limit_resume_summary`）
     limit_resume_summary: tako_core::limit_resume_all::BulkSummary,
+    /// ネット復帰の即時再開（Issue #2112。全体の設定 + 止まったペインの追跡 + 到達確認）
+    net_resume: net_autoresume::NetResumeState,
     /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
     codex_metrics: AgentMetrics,
     /// codex の**構造化されたレート制限**（#985。ペイン → rollout の `rate_limits`）。
@@ -4933,6 +4936,9 @@ impl TakoApp {
             limit_resume: HashMap::new(),
             limit_resume_all: tako_control::settings::load().limit_resume_all,
             limit_resume_summary: Default::default(),
+            net_resume: net_autoresume::NetResumeState::new(
+                tako_control::settings::load().network_resume,
+            ),
             codex_limits: HashMap::new(),
             transcript_ctx: HashMap::new(),
             transcript_ctx_scan: handoff_ctx::TranscriptCtxScan::default(),
@@ -6247,6 +6253,11 @@ impl TakoApp {
                 if !app.prompt_flows.is_empty() {
                     app.drive_prompt_flows();
                 }
+                // #2112: 到達確認の結果を拾う（走っていなければフラグを見るだけ）。
+                // 2 秒 tick を待たずに拾うので、回線の復帰から再開までの遅れが縮む
+                if app.net_resume.probe_in_flight() {
+                    app.poll_net_probe();
+                }
             });
             if ok.is_err() {
                 break;
@@ -6326,6 +6337,12 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:limit_autoresume");
                         app.drive_limit_autoresume()
                     };
+                    // #2112: 接続エラーで止まったエージェントを拾い、送ってよい停止があるときだけ
+                    // 到達確認を 1 本だけ背景で起こす（設定 OFF なら即 return。結果は 500ms ループ）
+                    {
+                        let _s = tako_control::diag::perf_span("periodic_prep:net_autoresume");
+                        app.drive_net_autoresume();
+                    }
                     // #2009: 見えていないプレビューを猶予つきで手放し、実効上限を見えている量へ
                     // 合わせる。手放したら描き直して GPUI の asset / atlas からの解放を流す
                     // （解放はアプリの render 冒頭 = drain_preview_image_evictions）
@@ -25094,6 +25111,22 @@ impl UiStateHost for TakoApp {
         self.limit_resume_agent_detected(pane)
     }
 
+    fn network_resume_enabled(&self) -> bool {
+        self.net_resume.enabled
+    }
+
+    fn set_network_resume(&mut self, enabled: bool) {
+        self.apply_network_resume_setting(enabled);
+    }
+
+    fn network_resume_status(&self) -> Option<serde_json::Value> {
+        Some(self.net_resume_status_json())
+    }
+
+    fn network_resume_state(&self, pane: PaneId) -> Option<serde_json::Value> {
+        self.net_resume_state_json(pane)
+    }
+
     fn auto_rename_enabled(&self) -> bool {
         self.autorename.enabled
     }
@@ -28281,6 +28314,7 @@ impl TakoApp {
                                         pane: Some(pane_id.as_u64()),
                                         enabled: Some(next),
                                         all: None,
+                                        network: None,
                                     },
                                     PaneOrigin::User,
                                 );
@@ -31696,6 +31730,11 @@ mod self_test {
     mod paste_guard_2046;
     #[cfg(feature = "visual-test")]
     use paste_guard_2046::paste_guard_visual;
+    /// #2112: 設定画面のネット復帰の再開のトグルと CLI / MCP の答えが揃う（visual-test `net-resume`）
+    #[cfg(feature = "visual-test")]
+    mod net_resume_2112;
+    #[cfg(feature = "visual-test")]
+    use net_resume_2112::net_resume_visual;
     /// #2016: tasks ビューの返答欄（IME・折り返し・送信の間）と返答の履歴（visual-test `tasks-input`）
     #[cfg(feature = "visual-test")]
     mod tasks_input_2016;
@@ -46251,6 +46290,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2112: 設定画面「一般」のネット復帰の再開のトグルを実マウスで押し、
+                // 実行状態・settings.json・CLI / MCP の答えが揃うか
+                "net-resume" => {
+                    net_resume_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1691: カーソルを括弧に置くと対の括弧が実ピクセルで強調され、対が無いと出ないか
                 "bracket-match" => {
                     bracket_match_visual(any, window, cx).await;
@@ -46276,7 +46322,7 @@ mod self_test {
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
-                         syntax-alias / \
+                         syntax-alias / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759）"
                     );
@@ -60254,6 +60300,7 @@ mod self_test {
                         pane: Some(pane.as_u64()),
                         enabled: Some(enabled),
                         all: None,
+                        network: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -82814,6 +82861,7 @@ mod self_test {
                                     pane: Some(pane.as_u64()),
                                     enabled: Some(on),
                                     all: None,
+                                    network: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -85248,6 +85296,7 @@ mod self_test {
                                     pane: Some(pane),
                                     enabled: None,
                                     all: None,
+                                    network: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -92834,6 +92883,7 @@ mod self_test {
                                     pane: Some(pane),
                                     enabled: None,
                                     all: None,
+                                    network: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -92887,6 +92937,7 @@ mod self_test {
                                 pane: Some(off_pane146),
                                 enabled: Some(true),
                                 all: None,
+                                network: None,
                             },
                             PaneOrigin::Cli,
                         );

@@ -284,6 +284,8 @@ pub mod keys {
     pub const MASTER_MCP: &str = "master_mcp";
     /// master への system prompt 注入
     pub const MASTER_SYSTEM_PROMPT: &str = "master_system_prompt";
+    /// 回線が戻ったら、接続エラーで止まったセッションをすぐ再開する（#2112）
+    pub const NETWORK_AUTORESUME: &str = "network_autoresume";
     /// ベンダー公式のリモート操作（スマホアプリ / Web）への会話の委譲
     pub const REMOTE_CONTROL: &str = "remote_control";
     /// PC 再起動（tmux サーバーごと消える）後の復元で、会話ごと戻せるか（#1238）
@@ -1073,6 +1075,26 @@ pub const MATRIX: &[AgentFeature] = &[
             "claude は --append-system-prompt-file、codex は developer_instructions で注入する \
              （orchestrator/mod.rs）。agy の注入手段（custom agent 定義の起動時選択）は \
              公式ドキュメントに記載が無く #987 で実機確認する",
+        ),
+    },
+    AgentFeature {
+        key: keys::NETWORK_AUTORESUME,
+        summary: Note::new(
+            "回線が戻ったら、接続エラーで止まったセッションへ続きを送ってすぐ再開する（#2112）",
+            "Resumes sessions that stopped on a connection error as soon as the network is back (#2112)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 975),
+        agy: pending(notes::NOT_INVESTIGATED, 975),
+        local: local_pending(),
+        evidence: AgentEvidence::Measured(
+            "#2112（2026-10-15 / claude 2.1.294）: 停止の文言は会話記録の `isApiErrorMessage` 300 件超の集計と、\
+             claude を到達できない API 先（`.invalid`）へ向けて採った実画面（100 桁 / 32 桁・再試行中・2 回目の停止）から\
+             決めた（`tako_core::net_resume::connection_error_kind` / `tako_control::net_stop::detect` のテストが\
+             実画面をそのまま持つ）。送達は FR-2.27.4 と同じ確認つきの経路で、隔離 GUI の実経路テスト\
+             （scripts/test-net-resume-2112.sh）が回線断 → 復帰で worker / master / 退避中の solo へ届き、\
+             使用制限・ログイン失効・質問・下書き・ダイアログには届かないことを見る。\
+             codex / agy は接続エラーで止まった実画面を採れていない（推測の文言を置かない = #1034 と同じ作法）",
         ),
     },
     AgentFeature {
