@@ -576,3 +576,8 @@
 - 2026-10-15 #2092: Windows のペインは文字コード固定の決着まで入力を預かる = `encoding_pin::PinGate`・上限 直接 500 ms / 器 1500 ms
 - 2026-10-15 #2104: 対応状況の 2 ページ（windows-support / agent-support）の md をコミットせず、件数を持たない写し `docs/src/data/*.json` から docs のビルドが組む
 - 2026-10-15 #1964: tako mod でチャット風の描画 = 吹き出し・コードの Copy（クリック）と帯の `o: copy last code`（キー）・ツールの 1 行の要約
+- 2026-10-15 #1951: `.ino` の言語サーバ = arduino-language-server の行・伴走（arduino-cli / clangd）と空の設定ファイルを表の `Arg` で・基板が未選択なら unconfigured で起こさず選ぶコマンドを案内
+- 2026-10-15 #2106: CI の macOS で実 tmux のテストが 1 本も走っていなかった = ランナーの image に tmux が無く全部 skip のまま ok
+- 2026-10-15 #2023: 夜間リリースの後に footprint を測って基準と比べ、悪化を tako todo へ = 同じ悪化は重ねない・蓋閉じは未実測・終了コードは変えない
+- 2026-10-15 #2112: ネット復帰で接続エラーで止まった全セッションを即時に再開 = 既定 ON・`tako limit-resume --network` / MCP `tako_limit_resume` の `network` / 設定画面「一般」
+- 2026-10-15 #2114: issue1857 のフレークの真因 = PTY への書き込みが EIO（子の側が全部閉じた）で `pty_loop` が ChildExit を送らずに畳まれていた
