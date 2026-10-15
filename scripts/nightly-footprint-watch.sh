@@ -262,7 +262,11 @@ mask < "$WORK/measure.log" > "$DIR/last-run.log" 2>/dev/null || true
 grep -E '^  persist|^  direct|窓:|未実測|ERROR|接続できない' "$WORK/measure.log" 2>/dev/null | mask | sed 's/^ *//; s/^/  /'
 
 if [ "$rc" -eq 4 ]; then
-  reason="$(sed -n 's/^未実測: //p' "$WORK/measure.log" | head -1 | cut -c1-120)"
+  # 原因は「未実測: … を開かない（<原因>。状態は …）」の括弧の中（形が違えば行ごと）
+  line="$(grep -m1 '^未実測: ' "$WORK/measure.log" 2>/dev/null || true)"
+  reason="$(printf '%s' "$line" | sed -n 's/^未実測: .*を開かない（\(.*\)。状態は.*$/\1/p')"
+  [ -n "$reason" ] || reason="${line#未実測: }"
+  reason="$(printf '%s' "$reason" | cut -c1-120)"
   say "未実測: tako-vd を用意できない（蓋閉じ・スリープ）。起票しない（${measure_s} 秒）"
   record unmeasured "tako-vd を用意できない${reason:+: ${reason}}" "$measure_s"
   exit 3

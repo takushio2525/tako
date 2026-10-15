@@ -376,16 +376,23 @@ def cmd_status(a):
         print("  まだ 1 回も記録していない（夜間リリースの後に scripts/nightly-footprint-watch.sh が測る）")
         return 0
     print("直近の %d 回:" % min(len(rows), a.last))
-    print("  %-16s %-8s %-10s %-4s %9s %9s %7s %7s %7s %5s" % (
-        "日時", "コミット", "状態", "描画", "放置MB", "出力中MB", "放置CPU", "出力CPU", "描画/秒", "スレ"))
+    print("  %-16s %-8s %-6s %-4s %9s %9s %7s %7s %7s %5s  %s" % (
+        "日時", "コミット", "状態", "描画", "放置MB", "出力中MB", "放置CPU", "出力CPU", "描画/秒", "スレ", "備考"))
     for r in rows[-a.last:]:
-        st = r.get("status", "-")
-        if st != "ok":
-            st = st + "(" + (r.get("reason") or "-")[:18] + ")"
-        print("  %-16s %-8s %-10s %-4s %9s %9s %7s %7s %7s %5s" % (
+        st = {"ok": "ok", "unmeasured": "未実測", "failed": "失敗"}.get(r.get("status", "-"), r.get("status", "-"))
+        # 理由・足した env・ref は表の外（行末）に出す（列をはみ出させない）
+        notes = []
+        if r.get("status") != "ok":
+            notes.append(r.get("reason") or "-")
+        extra, _ = env_parts(r)
+        if r.get("status") == "ok" and extra != "-":
+            notes.append("env " + extra)
+        if ref_of(r) != MAIN_REF:
+            notes.append("ref " + ref_of(r)[:12])
+        print("  %-16s %-8s %-6s %-4s %9s %9s %7s %7s %7s %5s  %s" % (
             r.get("date", "-")[:16], r.get("sha", "-")[:7], st, r.get("drawn", "-"),
             r.get("footprint_mb", "-"), r.get("busy_footprint_mb", "-"), r.get("cpu_pct", "-"),
-            r.get("busy_cpu_pct", "-"), r.get("busy_body_renders_s", "-"), r.get("threads", "-")))
+            r.get("busy_cpu_pct", "-"), r.get("busy_body_renders_s", "-"), r.get("threads", "-"), "・".join(notes)))
     res = judge(rows, state, a.window, a.min, a.scale)
     print("最後の行の判定: %s" % res["summary"])
     for line in res["lines"]:
