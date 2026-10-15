@@ -134,7 +134,7 @@ open_plan 7・インデント 5）。
 | 言語サーバ | 8（`.h` `.hpp` `.c` `.cpp` `.py` `.jsx` `.tsx` `.rs`） | `crates/tako-core/src/lsp/servers.rs:85`（4 行） |
 | Code Runner | macOS 23・Windows 23（`Makefile` のプロジェクト既定を含む） | `crates/tako-core/src/platform/runner_defaults.rs:127` + `crates/tako-core/src/runner_project.rs:92` |
 | 言語ごとの設定 | 例外はタブ 2（`Makefile` `.go`）・`:` 2（`.py` `.yaml`）・継承 1（`CMakeLists.txt`） | `text_edit.rs:244` / `:294` |
-| Finder | 21（Windows は 0。`installer/windows/tako.iss` に `[Registry]` が無い） | `scripts/build-app.sh:160` は UTI だけで宣言（#708 の「既定を奪わない」） |
+| Finder | 21（Windows は 0。`installer/windows/tako.iss` に `[Registry]` が無い）。#1955 で**動的 UTI の 22 形式へは広げない**と決めた（§6.3） | `scripts/build-app.sh:160` は UTI だけで宣言（#708 の「既定を奪わない」） |
 
 - **Markdown のコードブロック** ```` ```ino ```` / ```` ```arduino ```` / ```` ```pde ```` は色なし
   （`preview.rs:2378` の `highlight_lang` は `find_syntax_by_token` だけで別名の補いが無い）。
@@ -166,7 +166,7 @@ open_plan 7・インデント 5）。
 | 7 | インデント | `crates/tako-core/src/text_edit.rs:244` `IndentUnit::for_path` + `:294` `IndentRules::for_path` | 既定の 1 段・Enter の規則 | △ `indent` だけ |
 | 8 | アイコン | `crates/tako-app/src/file_icons.rs:507` / `:534` | ファイル名・拡張子 → アイコン | ✗ |
 | 9 | Finder | `scripts/build-app.sh:160`（UTI だけ） | 「このアプリケーションで開く」 | — |
-| 10 | Windows の関連付け | なし（`installer/windows/tako.iss`） | — | — |
+| 10 | Windows の関連付け | なし（`installer/windows/tako.iss`。案は #2134） | — | `tako platform` の `tako_open_file`（Windows = degraded） |
 
 **同じ並びが重複している例**:
 
@@ -493,7 +493,7 @@ open_plan 7・インデント 5）。
 | `.S` / `.s` → 色なし | 既存の `x86_64 Assembly` へ寄せてよいか（AVR / ARM の命令は x86 ではない）を見て判断。#1953 で**寄せない**と決めた（§6.1） | 色の補い |
 | `.ps1` / `.astro` → 色なし | two-face に構文が無い。構文を足すと構文セット（#815）とビルドに効くので、足す方法と実測を別に。✅ #1954 で PowerShell（`.ps1` / `.psm1` / `.psd1`）を足した。`.astro` は足さない（§6.2） | 構文の追加 |
 | 言語サーバ 37 形式 | #1007 の「第 2 波」（Java / Go / …）。#1944 の自動取得と合わせて優先順を決める。✅ #1956 で 6 行（`.tex` `.toml` `.swift` `.dart` `.css` `.scss` `.less` `.html` `.htm`）。比較・採った順・見送りの理由は §8 | 言語サーバ第 2 波 |
-| Finder 24 形式・Windows 0 | #708 の「既定を奪わない」を守ったまま広げられるか（UTI の輸入宣言の可否）を lsregister で実測 | Finder / 関連付け |
+| Finder 24 形式・Windows 0 | #708 の「既定を奪わない」を守ったまま広げられるか（UTI の輸入宣言の可否）を lsregister で実測。✅ #1955 で**広げない**と決めた（7 案のどれも、他に宣言するアプリが無い形式で既定を動かす = §6.3）。Windows は #2134（OpenWithProgids の案・未実機） | Finder / 関連付け |
 | Code Runner の空き（`.vue` `.svelte` `.astro` `.scss` `.toml` `.yaml` `.json5` `.ini` `.env` `Dockerfile` `.proto` `.graphql` `.h` `.hpp`） | **単体では走らせるものではない**ので今のまま（`.vue` 等は `package.json` の `npm run` を `tako:run:` で書く）。`.m` / `.pde` / `.S` は需要が出たら行を足す | なし |
 
 ### 6.1 実装で決めたこと（#1953）
@@ -614,6 +614,40 @@ bash 242 行 +13.64 MB・C++ 244 行 +19.78 MB（§5.2）。ヒアドキュメ�
 A/B は `TAKO_1954_LEGACY=1`（足さない = two-face の 213 構文のまま）。実測は
 `scripts/test-extra-syntax-1954.sh`（CLI / MCP の応答の `syntax` と visual-test `extra-syntax` を新旧で）。
 
+### 6.3 実装で決めたこと（#1955）
+
+**macOS は広げない**（Info.plist は UTI だけの宣言のまま）。実測の全文は
+[#1955 のコメント](https://github.com/takushio2525/tako/issues/1955#issuecomment-6197222793)。
+
+測り方: main の `build-app.sh` の heredoc を写した Info.plist に案ごとの差分を足し、bundle id だけ変えた
+試験用の .app（実行ファイルは何もしないスタブ）を 1 案ずつ `lsregister -f` → 計測 → 実体を消して `-u`
+（#837 の順序）。45 形式の空ファイルに既定 5 種（`LSCopyDefaultApplicationURLForURL` の All / Editor /
+Viewer / 開く役・`NSWorkspace.urlForApplication`）と候補 3 種（`LSCopyApplicationURLsForURL` の All /
+開く役・`NSWorkspace.urlsForApplications`）を問い、変更前の記録と照合した。この PC では動的 UTI が 22 形式、
+うち 15 は他アプリ（Arduino IDE・Zed・VS Code・Processing）が拡張子で宣言、7（`.svelte` `.kt` `.astro`
+`.zig` `.jl` `.json5` `.graphql`）はどのアプリも宣言していない（既定なし）。
+
+| 案 | 22 形式で候補 | 既定の変化（登録中） |
+|---|---|---|
+| `dyn.*` を `LSItemContentTypes` に Alternate | 0 | 0 |
+| `UTImportedTypeDeclarations` で `public.source-code` へ適合（Issue の案） | 22 | 43（宣言の無い 7 形式で「なし → TextEdit」・22 形式でビューアが「なし → Pages」・他の 18〜19 アプリが候補に増える） |
+| `CFBundleTypeExtensions` を rank None | 0 | 0 |
+| `CFBundleTypeExtensions` を Alternate（#708 が避けた形） | 22 | 21（宣言の無い 7 形式で「なし → tako」） |
+| UTI の輸入（適合先なし）+ Alternate | 0（LS が輸入を採らない） | 0 |
+| UTI の輸入（`public.data` へ適合）+ Alternate | 22 | 21（同じ 7 形式で「なし → tako」） |
+| `CFBundleTypeExtensions` を role None + Alternate | `kLSRolesAll` だけ 22・開く役 0・NSWorkspace 0 | `kLSRolesAll` だけ 7 |
+
+- **観測した規則**: 開く役で rank Alternate 以上の宣言は候補に出て、その拡張子を**他に宣言するアプリが
+  無いと既定に選ばれる**。rank None / role None / `dyn.*` は開く候補に出ない。「他に宣言するアプリが
+  あるか」は Mac ごとに違うので、静的な Info.plist で既定不変を保証できる形式は 22 の中に無い
+- 動的 UTI の形式は Finder の「このアプリケーションで開く」に出ないまま。tako の中ではファイルツリーと
+  `tako open` で開ける（FR-3.22 に記載）。`.env` / `Dockerfile` は `public.data` なので元から対象外
+- **罠**: 一時 dir（`/private/tmp`・`/var/folders`）の .app は LS が `in-temp-dir` + `launch-disabled` の印を
+  付け、候補にも既定にも出ない。LS の実測で試験用の .app を置くなら非一時の使い捨て dir に置く
+- **Windows** は `OpenWithProgids`（既定の ProgID を書かずに「プログラムから開く」へ出す登録）の案だけで
+  未実機。`tako platform` では `tako_open_file` を Windows で degraded（`WIN_EXPLORER_OPEN_WITH`）として
+  申告し、実装と実機確認は #2134
+
 ## 7. 子 Issue（依存つき）
 
 正本は #1943 のコメント。
@@ -627,7 +661,7 @@ A/B は `TAKO_1954_LEGACY=1`（足さない = two-face の 213 構文のまま�
 | S5 | #1952 | 基板とポートを実行設定のドロップダウン / `tako run-config` で選ぶ（`sketch.yaml` が正本） | #1950・#1731・#1733 | S〜M |
 | S6 | #1953 | 既存の構文への別名で埋まる色の穴（`.h` `.m` `.pde` `.json5` `.S`） | #1948 | S |
 | S7 | #1954 | two-face に無い構文（`.ps1` / `.astro` 等）を足せるか + #815 実測 | #1948 | M（調査込み） |
-| S8 | #1955 | Finder / Windows の関連付けを動的 UTI の形式へ広げられるか | なし | S（調査込み） |
+| S8 | #1955 | Finder / Windows の関連付けを動的 UTI の形式へ広げられるか（✅ 広げない = §6.3。Windows は #2134） | なし | S（調査込み） |
 | S9 | #1956 | 言語サーバの検出表の第 2 波（授業・上位形式の優先順） | #1948・#1944 | M |
 
 `.ino` を急ぐなら、#1949 の中身（`.ino` → C++）は #1948 を待たずに `preview.rs:2077` の補い 1 行でも
