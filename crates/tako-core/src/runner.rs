@@ -2465,9 +2465,11 @@ mod tests_1732 {
         std::fs::write(base.join("c/Makefile"), "run:\n\techo run\n").unwrap();
         let file = base.join("c/Makefile");
         let bounds = SearchBounds::with_ceilings([base.clone()]);
+        // 両 OS で絶対パス（Windows の `/abs` はドライブ無し = ルート相対で、`C:/abs` へ解ける）
+        let elsewhere = base.join("elsewhere");
         let l = ConfigLayer {
             args: Some("V=1".into()),
-            cwd: Some("/abs".into()),
+            cwd: Some(elsewhere.display().to_string()),
             ..layer()
         };
         let res = resolve_file_in(
@@ -2485,7 +2487,7 @@ mod tests_1732 {
         assert_eq!(res.plan.source, RunSource::ProjectDefault);
         assert_eq!(res.plan.command, "make run V=1");
         assert_eq!(res.plan.template, "make run");
-        assert_eq!(res.plan.cwd, PathBuf::from("/abs"));
+        assert_eq!(res.plan.cwd, elsewhere);
         // ルートで走る前提のコマンドなので、移したことを止めずに知らせる
         assert!(
             res.warnings.iter().any(|w| w.contains("--reset cwd")),
