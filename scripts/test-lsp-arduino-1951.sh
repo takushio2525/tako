@@ -3,6 +3,11 @@
 # Arduino IDE の同梱物（arduino-language-server・arduino-cli・clangd）で確かめる（隔離 GUI）
 #
 # 何を確かめるか（Issue #1951 の受け入れ条件のうち、実機で言えるもの）:
+#   ⓪ GUI を除いた tako の実経路（manager + 既定の解決）で実の同梱物を起こす（e2e の
+#      `実機_arduino_ide_の同梱物で診断とホバーと補完が出る`）: 出どころ bundled・誤り 1 件を 12 行目・
+#      ホバー・補完・常駐・基板なし → 実の arduino-cli で選ぶ → 合図で起きる。面（tako-vd）が無くても測れる
+#   ⓪' GUI 無しの CLI の A/B: `tako lsp install --name arduino-language-server` が本番の旧版では
+#      「知らないサーバ」・新版では検出表の行（取らない行）として答える
 #   ① 基板あり（sketch.yaml の default_fqbn）: 編集モードで開くだけで 起動 → 誤りの診断（.ino の行番号）→
 #      ホバー → 補完。出どころは Arduino IDE の同梱（bundled）。常駐（ALS + clangd の RSS の合計）を測る
 #   ② visual-test lsp-servers（#1956 の汎用の口に同じ .ino を渡す）: 波線の画面とホバーのカードを落とす
@@ -19,7 +24,8 @@
 #
 # 使い方: bash scripts/test-lsp-arduino-1951.sh
 #   TAKO_1951_DUMP_DIR=<dir>   画像の置き場（既定は一時 = 終わると消える）
-#   Arduino IDE（/Applications/Arduino IDE.app）か arduino:avr のコアが無い機では ①〜③ を「未実測」と出す
+#   Arduino IDE（/Applications/Arduino IDE.app）か arduino:avr のコアが無い機では ⓪〜③ を「未実測」と出す。
+#   面（tako-vd）を用意できない機（蓋閉じ）では ①〜⑤ の GUI の段を「未実測」と出し、⓪ / ⓪' だけを測る
 #
 # 窓は仮想ディスプレイ tako-vd へ出す（`scripts/lib/isolated-gui.sh` の 1 実装。#1141 / #1490）。
 # 落とすのは自分で起こした pid だけ。macOS の bash 3.2 で通す（#1499 / #1518）。
@@ -28,6 +34,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REAL_HOME="$HOME"
 . "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 PASS=0
 FAIL=0
@@ -75,6 +82,7 @@ trap cleanup EXIT
 # ビルドは HOME を差し替える前に（後で呼ぶとツールチェーンとレジストリを一時 HOME へ取り直す）
 echo "visual-test 版の tako-app と tako をビルドします…"
 (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo test -q -p tako-control --test issue1951_lsp_arduino --no-run) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins || exit 1
@@ -213,7 +221,55 @@ echo "== 前提 =="
 echo "  Arduino IDE の同梱: $([ "$HAVE_IDE" = 1 ] && echo "あり（$("$IDE_DIR/arduino-cli" version 2>/dev/null | head -1 | sed "s#$TMP#<tmp>#g")・$("$IDE_DIR/clangd" --version 2>/dev/null | head -1)）" || echo 無い)"
 echo "  arduino:avr のコア: $([ "$HAVE_CORE" = 1 ] && echo 一時 HOME へ複製した || echo 無い)"
 
+echo
+echo "== ⓪ GUI を除いた tako の実経路で実の同梱物を起こす（manager + 既定の解決） =="
 if [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
+  # cargo と rustup は本物の HOME で動かし、テストの子プロセスだけを隔離 HOME で起こす
+  (cd "$REPO_ROOT" && HOME="$REAL_HOME" TAKO_1951_REAL_HOME="$TMP/home" TAKO_1951_REAL_SKETCHES="$S" \
+    run_heavy cargo test -q -p tako-control --test issue1951_lsp_arduino \
+    実機_arduino_ide_の同梱物で診断とホバーと補完が出る -- --exact --nocapture) > "$TMP/real.log" 2>&1
+  real_rc=$?
+  sed -n '/TAKO_1951_REAL:/,/^}/p' "$TMP/real.log" | sed "s#$TMP#<tmp>#g; s/^/    /"
+  if [ "$real_rc" -eq 0 ] && grep -q "TAKO_1951_REAL:" "$TMP/real.log"; then
+    pass "実の同梱物: bundled・12 行目の誤り 1 件・ホバー・補完・基板なしは起こさず選べば起きる"
+  else
+    fail "実の同梱物の実経路（$(grep -m1 -E 'panicked|assert' "$TMP/real.log" | sed "s#$TMP#<tmp>#g")）"
+  fi
+else
+  unmeasured "⓪: Arduino IDE の同梱か arduino:avr のコアが無い"
+fi
+
+echo
+echo "== ⓪' GUI 無しの CLI の A/B（tako lsp install --name ${ID}。旧 = 本番の /Applications/tako.app） =="
+PROD_CLI="/Applications/tako.app/Contents/MacOS/tako"
+mkdir -p "$TMP/nodisc"
+cli_local() { env -u TAKO_SOCKET -u TAKO_TOKEN TAKO_DISCOVERY_DIR="$TMP/nodisc" TAKO_DATA_DIR="$TMP/cli-data" "$@" lsp install --name "$ID" --json 2>&1; }
+new_out="$(cli_local "$NEW_TAKO_BIN")"
+echo "    新: $(echo "$new_out" | head -c 300 | sed "s#$TMP#<tmp>#g")"
+check_eq "新: 検出表の行として答える（tako が取らない行）" "$ID" "$(echo "$new_out" | json 'd["servers"][0]["id"]')"
+if [ -x "$PROD_CLI" ]; then
+  old_out="$(cli_local "$PROD_CLI")"
+  echo "    旧: $(echo "$old_out" | head -c 300 | sed "s#$TMP#<tmp>#g")"
+  check_eq "旧: 検出表に行が無い（servers が空か、知らない名前）" "True" \
+    "$(echo "$old_out" | python3 -c 'import json,sys
+t = sys.stdin.read()
+try:
+    d = json.loads(t)
+    print(not any(s.get("id") == sys.argv[1] for s in d.get("servers", [])))
+except Exception:
+    print(True)' "$ID")"
+else
+  unmeasured "⓪': /Applications/tako.app が無い"
+fi
+
+GUI_OK=1
+if ! "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1; then
+  GUI_OK=0
+  echo
+  unmeasured "①〜⑤ の GUI の段: 面（tako-vd）を用意できない（$("$REPO_ROOT/scripts/lib/virtual-display.sh" status 2>&1 | head -1)。蓋閉じなら開いてから打ち直す）"
+fi
+
+if [ "$GUI_OK" = 1 ] && [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
   echo
   echo "== ① 基板あり: 開くだけで 起動 → 誤りの診断（.ino の行）→ ホバー → 補完 =="
   start_gui "$TMP/data" "$TMP/gui.log"
@@ -310,10 +366,11 @@ if [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
     fi
   fi
   stop_gui
-else
+elif [ "$GUI_OK" = 1 ]; then
   unmeasured "①〜③: Arduino IDE の同梱か arduino:avr のコアが無い"
 fi
 
+if [ "$GUI_OK" = 1 ]; then
 echo
 echo "== ④ ALS なし（注入 TAKO_1951_INJECT_NO_BUNDLE=1 = Arduino IDE の無い PC と同じ解決） =="
 start_gui "$TMP/data-noide" "$TMP/gui-noide.log" TAKO_1951_INJECT_NO_BUNDLE=1
@@ -337,7 +394,6 @@ stop_gui
 echo
 echo "== ⑤ A/B: 本番の /Applications/tako.app（#1951 より前）では .ino に言語サーバが付かない =="
 PROD_APP="/Applications/tako.app/Contents/MacOS/tako-app"
-PROD_CLI="/Applications/tako.app/Contents/MacOS/tako"
 if [ -x "$PROD_APP" ] && [ -x "$PROD_CLI" ]; then
   TAKO_BIN="$PROD_CLI" APP_BIN="$PROD_APP"
   start_gui "$TMP/data-old" "$TMP/gui-old.log"
@@ -352,6 +408,7 @@ if [ -x "$PROD_APP" ] && [ -x "$PROD_CLI" ]; then
 else
   unmeasured "⑤: /Applications/tako.app が無い"
 fi
+fi # GUI_OK
 
 echo
 echo "== 本物の Arduino の data dir に触れていない =="

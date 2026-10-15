@@ -424,8 +424,9 @@ fn als_なしと伴走なしは未導入へ落ちて理由と導入コマンド�
 
 // --- 4. 前提が未設定の器への問い合わせは待たない -------------------------------------
 
-/// 境界: 基板が無いスケッチでホバー・定義ジャンプを頼んでも、上限（ここでは 10 秒）まで待たずに
-/// 理由（`unconfigured`）で返る。サーバは起こさない
+/// 境界: 基板が無いスケッチでホバー・定義ジャンプを頼んでも、上限まで待たずに理由（`unconfigured`）で
+/// 返る。サーバは起こさない。測るのは**どの経路で抜けたか**（待っていれば上限で `Timeout` が返る =
+/// 実時間で比べない。`.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）
 #[test]
 fn 前提が未設定なら問い合わせは待たずに理由を返す() {
     let scratch = Scratch::new("query");
@@ -447,7 +448,6 @@ fn 前提が未設定なら問い合わせは待たずに理由を返す() {
     wait_for("前提の未設定", Duration::from_secs(20), || {
         status_of(&manager)["state"] == json!("unconfigured")
     });
-    let started = Instant::now();
     let hover = manager.hover(&HoverRequest {
         path: ino.clone(),
         line: 1,
@@ -485,11 +485,6 @@ fn 前提が未設定なら問い合わせは待たずに理由を返す() {
         }
         other => panic!("定義ジャンプは前提の未設定で返る: {other:?}"),
     }
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "上限まで待たない: {:?}",
-        started.elapsed()
-    );
     // 解決はしたが（どの ALS かは状態に出る）、起こしてはいない
     let status = status_of(&manager);
     assert_eq!(status["spawn_count"], json!(0), "{status:#}");
@@ -497,4 +492,255 @@ fn 前提が未設定なら問い合わせは待たずに理由を返す() {
     assert!(spawned.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     manager.shutdown_all(Duration::from_secs(5));
     drop(link);
+}
+
+// --- 5. 実機（Arduino IDE の同梱物。GUI を除いた tako の実経路）-------------------------------
+
+/// 実機の検査の入口: `TAKO_1951_REAL_HOME`（arduino:avr のコアを複製した隔離 HOME）と
+/// `TAKO_1951_REAL_SKETCHES`（Blink = 基板あり・NoBoard = 基板なし）を渡したときだけ動く
+/// （`scripts/test-lsp-arduino-1951.sh` が用意する。無ければ何もしない = CI・IDE の無い機）。
+/// HOME を差し替えるので子プロセスで走らせる（ALS が起こす arduino-cli は空の設定ファイル =
+/// 既定の置き場 `~/Library/Arduino15` を読む = 本物の data dir に触れない）
+#[test]
+fn 実機_arduino_ide_の同梱物で診断とホバーと補完が出る() {
+    let (Ok(home), Ok(sketches)) = (
+        std::env::var("TAKO_1951_REAL_HOME"),
+        std::env::var("TAKO_1951_REAL_SKETCHES"),
+    ) else {
+        return;
+    };
+    let scratch = Scratch::new("real");
+    let out = scratch.path("real.json");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "子プロセス_実機の同梱物で問い合わせる",
+            "--nocapture",
+        ])
+        .env(REAL_CHILD_ENV, &out)
+        .env("TAKO_1951_REAL_SKETCHES", &sketches)
+        .env("TAKO_DATA_DIR", scratch.path("data"))
+        .env("HOME", &home)
+        .env_remove(servers::override_env_name(ID))
+        .stdin(std::process::Stdio::null());
+    if cfg!(unix) {
+        child.env("SHELL", "/bin/sh");
+    }
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "子プロセスが落ちた（{}）: {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    println!(
+        "TAKO_1951_REAL: {}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
+    let blink = &result["blink"];
+    assert_eq!(blink["source"], json!("bundled"), "{blink:#}");
+    assert_eq!(
+        blink["diagnostics"],
+        json!([{ "line": 12, "severity": "error" }]),
+        "誤り（blinkMss）を .ino の 12 行目で 1 件: {blink:#}"
+    );
+    assert!(
+        blink["hover"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pinMode(uint8_t pin, uint8_t mode)"),
+        "{blink:#}"
+    );
+    assert_eq!(blink["completion_has_begin"], json!(true), "{blink:#}");
+    let no_board = &result["no_board"];
+    assert_eq!(no_board["state"], json!("unconfigured"), "{no_board:#}");
+    assert_eq!(no_board["spawn_count"], json!(0), "{no_board:#}");
+    assert_eq!(no_board["after_attach"], json!("running"), "{no_board:#}");
+}
+
+const REAL_CHILD_ENV: &str = "TAKO_1951_REAL_CHILD";
+
+/// 実機の子プロセス側（`REAL_CHILD_ENV` があるときだけ動く）
+#[test]
+fn 子プロセス_実機の同梱物で問い合わせる() {
+    let Ok(out) = std::env::var(REAL_CHILD_ENV) else {
+        return;
+    };
+    let sketches = PathBuf::from(std::env::var("TAKO_1951_REAL_SKETCHES").unwrap());
+    let mut config = config(Arc::new(tako_control::lsp::manager::default_launch));
+    config.request_timeout = Duration::from_secs(60);
+    let manager = LspManager::new(config);
+    let mut result = serde_json::Map::new();
+    let blink = sketches.join("Blink/Blink.ino");
+    let blink_root = blink.parent().unwrap().to_path_buf();
+    let text = std::fs::read_to_string(&blink).unwrap();
+    let find = |root: &Path| {
+        manager.status(Some(ID))["servers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|s| s["root"] == json!(root.display().to_string()))
+            .unwrap_or(Value::Null)
+    };
+    let started = Instant::now();
+    let mut link = DocLink::default();
+    manager.sync(&mut link, true, &blink, &text, 1);
+    let mut status = Value::Null;
+    wait_for("実の ALS が稼働", Duration::from_secs(90), || {
+        status = find(&blink_root);
+        status["state"] == json!("running")
+    });
+    let running_ms = started.elapsed().as_millis();
+    let uri = match &link {
+        DocLink::Open(lease) => lease.uri().to_string(),
+        other => panic!("文書が開いていない: {other:?}"),
+    };
+    let mut diagnostics = Vec::new();
+    wait_for("実の ALS の診断", Duration::from_secs(90), || {
+        diagnostics = manager
+            .document_diagnostics(&uri)
+            .map(|d| d.diagnostics.items.to_vec())
+            .unwrap_or_default();
+        !diagnostics.is_empty()
+    });
+    let diagnosed_ms = started.elapsed().as_millis();
+    let hover = manager
+        .hover(&HoverRequest {
+            path: blink.clone(),
+            line: 5,
+            column: 4,
+            timeout: Duration::from_secs(60),
+            document: None,
+            superseding: false,
+            open: true,
+            ticket: None,
+        })
+        .ok()
+        .and_then(|a| a.content)
+        .map(|h| h.value)
+        .unwrap_or_default();
+    let completion = manager.completion(&tako_control::lsp::CompletionRequest {
+        path: blink.clone(),
+        line: 6,
+        column: 9,
+        timeout: Duration::from_secs(60),
+        document: None,
+        trigger: tako_core::lsp::completion::Trigger::Character('.'),
+        superseding: false,
+        ticket: None,
+        resolve_top: 0,
+    });
+    let labels: Vec<String> = completion
+        .as_ref()
+        .map(|a| a.items.iter().map(|i| i.label.trim().to_string()).collect())
+        .unwrap_or_default();
+    // 常駐: ALS とその子（clangd）の RSS（読み込み後 3 秒）
+    std::thread::sleep(Duration::from_secs(3));
+    let pid = find(&blink_root)["pid"].as_u64().unwrap_or_default();
+    let rss = process_tree_rss_kb(pid);
+    result.insert(
+        "blink".into(),
+        json!({
+            "source": status["source"],
+            "program_path": status["program_path"],
+            "running_ms": running_ms,
+            "first_diagnostics_ms": diagnosed_ms,
+            "diagnostics": diagnostics
+                .iter()
+                .map(|d| json!({ "line": d.start.line + 1, "severity": d.severity.slug() }))
+                .collect::<Vec<_>>(),
+            "messages": diagnostics.iter().map(|d| d.message.lines().next().unwrap_or("").to_string()).collect::<Vec<_>>(),
+            "hover": hover,
+            "completion_head": labels.iter().take(6).collect::<Vec<_>>(),
+            "completion_has_begin": labels.iter().any(|l| l.starts_with("begin")),
+            "rss_kb": rss,
+        }),
+    );
+    // 基板なし → 起こさない → 実の arduino-cli で選ぶ → 合図で起きる
+    let no_board = sketches.join("NoBoard/NoBoard.ino");
+    let no_board_root = no_board.parent().unwrap().to_path_buf();
+    let mut link2 = DocLink::default();
+    manager.sync(
+        &mut link2,
+        true,
+        &no_board,
+        &std::fs::read_to_string(&no_board).unwrap(),
+        1,
+    );
+    wait_for("基板なしは前提の未設定", Duration::from_secs(60), || {
+        status = find(&no_board_root);
+        status["state"] == json!("unconfigured")
+    });
+    let mut entry = json!({
+        "state": status["state"],
+        "spawn_count": status["spawn_count"],
+        "reason": status["reason"],
+        "setup_command": status["setup_command"],
+    });
+    let command = status["setup_command"]
+        .as_str()
+        .unwrap_or_default()
+        .replace("<基板>", "arduino:avr:uno")
+        .replace("<board>", "arduino:avr:uno");
+    let attached = std::process::Command::new("/bin/sh")
+        .args(["-c", &command])
+        .output()
+        .unwrap();
+    entry["attach_exit"] = json!(attached.status.code());
+    tako_core::shell_activity::note();
+    wait_for("基板を選んだら合図で稼働", Duration::from_secs(90), || {
+        status = find(&no_board_root);
+        status["state"] == json!("running")
+    });
+    entry["after_attach"] = status["state"].clone();
+    result.insert("no_board".into(), entry);
+    manager.shutdown_all(Duration::from_secs(5));
+    drop((link, link2));
+    std::fs::write(out, Value::Object(result).to_string()).unwrap();
+}
+
+/// pid とその子孫の RSS（KB）を名前ごとに（`ps` を 1 回）
+fn process_tree_rss_kb(root: u64) -> Value {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,rss=,comm="])
+        .output()
+    else {
+        return Value::Null;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let rows: Vec<(u64, u64, u64, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid = it.next()?.parse().ok()?;
+            let ppid = it.next()?.parse().ok()?;
+            let rss = it.next()?.parse().ok()?;
+            let comm = it.collect::<Vec<_>>().join(" ");
+            let name = Path::new(&comm)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(comm);
+            Some((pid, ppid, rss, name))
+        })
+        .collect();
+    let mut todo = vec![root];
+    let mut out = serde_json::Map::new();
+    let mut total = 0;
+    while let Some(pid) = todo.pop() {
+        for (p, pp, rss, name) in &rows {
+            if *p == pid {
+                out.insert(format!("{pid} {name}"), json!(rss));
+                total += rss;
+            }
+            if *pp == pid {
+                todo.push(*p);
+            }
+        }
+    }
+    out.insert("total".into(), json!(total));
+    Value::Object(out)
 }
