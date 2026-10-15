@@ -302,6 +302,13 @@ jobs:
       # 終了コードが変わる・リリースより先に回る形へ戻ったらここで落ちる**（#2023）
       - name: 夜間の footprint の回帰の見張りのモックテスト
         run: bash scripts/test-nightly-footprint-watch-2023.sh
+      # 夜間リリースの PATH（先頭 ~/.cargo/bin に順番待ちを知らない古い tako）でも、run_heavy と
+      # build-app.sh のリリースビルドが順番待ちを通るモックテスト。tako・cargo は代役で、
+      # .app の置き場も偽物へ差し替えるので本物の tako・順番待ち・ビルドには触らない。
+      # **PATH の先頭の 1 本だけで決めて並ばずに走る・知っている tako が無い / 応答しないときに
+      # 夜間リリースが止まる形へ戻ったらここで落ちる**（#2119）
+      - name: 夜間の PATH で順番待ちを通るモックテスト
+        run: /bin/bash scripts/test-nightly-queue-path-2119.sh
       # .app の差し替え（置き場のパスを一度も空けない）のモックテスト。一時ディレクトリの
       # dummy .app だけを相手にするので本番の /Applications には触らない。
       # **Dock のピンが逃げる形へ戻ったらここで落ちる**（#1042）

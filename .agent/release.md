@@ -122,6 +122,14 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
   `trap` で撤去する。ビルド中に origin/main が進んだら**何も作らず中止**する（旧版はここで
   push が拒否されて無言で死に、未 push のリリースコミットごと detached を残していた =
   同じ版が別 SHA で 2 本できる原因）。多重起動ロックは HOME 単位 + **リポジトリ単位**の 2 段
+- **中のビルドは順番待ち（#1994）を通る**: `build-app.sh` のリリースビルドは `scripts/lib/queue.sh` の
+  `run_heavy` を通り、env の `TAKO_QUEUE_PRIORITY=low` / `TAKO_QUEUE_MAX_WAIT=3h` で人や worker の後ろへ並ぶ
+  （3 時間で諦めた `tako queue` は 75 で返り、その夜のリリースは失敗として通知される）。launchd の PATH は先頭が
+  `~/.cargo/bin` で、そこに順番待ちを知らない古い tako（`cargo install` の残り）が居ると、旧版の `run_heavy` は
+  PATH の先頭の 1 本だけを見て並ばずに走らせていた（#2119）。いまは PATH の tako を上から全部 → `.app` の同梱 CLI の
+  順に確かめて最初に知っている 1 本で並び、飛ばした tako をログへ 1 行残す。**知っている tako が無い・応答しない
+  （10 秒）ときは今どおり直に走らせる**（夜間を止めない）。モックは `bash scripts/test-nightly-queue-path-2119.sh`
+  （夜間の PATH の export 行をそのまま評価して再現する・A/B は `TAKO_2119_LEGACY=1`）
 - ジョブ登録は `scripts/nightly-release.sh --install-launchd`（解除は `--uninstall-launchd`、
   確認は `launchctl list | grep tako-nightly`）。plist はリポに置かず実行時に生成する
 - Homebrew cask の更新は**安定版への昇格**（下の節）が行う（夜間のテスト版では cask を動かさない）。
@@ -223,8 +231,8 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
   target/ は共有ツリーのものを symlink で使い回す）→ `scripts/build-pwa.sh --if-missing` + `cargo build --release` を
   1 回の `run_heavy` で（**cargo の前に PWA の dist を作る**: 使い捨ての worktree には dist が無く、tako-control の build.rs に
   作らせると dist の時刻のせいで計測スクリプトの中の 2 回目のビルド = 順番待ちの外で下流が丸ごと組み直しになる。上限 60 分、
-  順番待ちはその 2/3 で諦める。**並ぶのは起票に使う tako = `/Applications/tako.app` の tako**: 夜間の PATH は先頭が
-  `~/.cargo/bin` で、そこに順番待ちを知らない古い tako が居ると run_heavy が並ばずに走らせる）→ `scripts/measure-footprint-2011.sh std`（上限 15 分・偽の claude・tako-vd の上だけ）→
+  順番待ちはその 2/3 で諦める。**並ぶのは起票に使う tako = `/Applications/tako.app` の tako**（その置き場を PATH の
+  先頭へ置く。起票と並ぶ先を同じ 1 本に揃えるため。PATH の先頭の古い tako に負けない点は run_heavy 自身も #2119 で直した））→ `scripts/measure-footprint-2011.sh std`（上限 15 分・偽の claude・tako-vd の上だけ）→
   履歴へ 1 行 → 判定 → 悪化なら起票。**そのコミットを描画ありで測り済みなら数秒で飛ばす**（コードが変わらない夜は測らない）
 - **置き場**: `~/.claude-orchestrator/state/tako-footprint/`（`history.tsv` = 1 晩 1 行・未実測の夜も残す /
   `state` = 続いている悪化 / `last-run.log` = 直近の計測の全出力）。data dir ではなく開発側で、`cargo clean`
