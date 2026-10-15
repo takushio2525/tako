@@ -6281,7 +6281,9 @@ worker_agents:
         assert!(!master.contains("{TAB_NAMING_CONVENTION}"));
         // #2120: master はプロジェクト / 主題で呼ぶ（役割名・プロファイル名にしない）
         assert!(master.contains("the project or current subject"));
-        assert!(master.contains("never a profile or role name"));
+        // 折り返しをまたぐので語を分けて見る（"never a profile\n   or role name"）
+        assert!(master.contains("never a profile"));
+        assert!(master.contains("or role name"));
     }
 
     #[test]
