@@ -1008,8 +1008,9 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-core/src/tmux_backend.rs",
-            4,
-            "tmux e2e テスト内（`#[cfg(unix)]`）",
+            5,
+            "tmux e2e テスト内（`#[cfg(unix)]`）。#2098 で 1 件（issue1857 の e2e で子の終わりが\
+             届かなかった回だけ `ps` でクライアントの状態を読み、失敗メッセージへ出す。`#[cfg(unix)]`）",
         ),
     ];
 
