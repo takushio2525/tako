@@ -280,8 +280,11 @@ cli_arm() {
     fail "${label}: N 応答が想定外"
   fi
 
-  # H 武装して展開を背景で打ち、最中の別の要求を測る
-  local before took took_mcp waits rc elapsed after
+  # H 武装して展開を背景で打ち、最中の別の要求を測る。MCP は GUI を立てて最初の 1 回だけ組み立ての
+  # 固定費が載る（武装なしで先に 1 回叩いて所要を残し、最中の計測から外す）
+  local before took took_mcp waits rc elapsed after warm
+  warm="$(timed "$UI_REPLY_LIMIT" python3 "$TMP/mcp.py" tako_list_panes '{}')"
+  echo "    H 武装なしの MCP tako_list_panes（初回）: ${warm} 秒 / 2 回目: $(timed "$UI_REPLY_LIMIT" python3 "$TMP/mcp.py" tako_list_panes '{}') 秒"
   before="$(count "$CALLS")"
   bg_armed h "$TAKO_BIN" preview-changelog --pane "$P" --expand "$A_HEAD"
   local bg="$BG"
