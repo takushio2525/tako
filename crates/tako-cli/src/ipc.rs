@@ -38,17 +38,22 @@ pub fn resolve_caller_pane_via_app(
         pane: requested,
         caller_pid: Some(std::process::id()),
     };
-    match send_request(request) {
+    match send_request_classified(request, None) {
         Ok(value) => Ok(value["pane"].as_u64().map(|pane| ResolvedCaller {
             pane,
             method: value["method"].as_str().map(str::to_string),
         })),
-        Err(e) => match send_request(Request::List) {
-            Ok(list) => Ok(requested
-                .filter(|p| list_contains_pane(&list, *p))
-                .map(|pane| ResolvedCaller { pane, method: None })),
-            Err(_) => Err(e),
-        },
+        // 応答しない GUI へ list を撃ち直しても同じだけ待つので縮退しない（#2123）
+        Err(e @ SendFailure::Timeout(_)) => Err(e.message()),
+        Err(e) => {
+            let e = e.message();
+            match send_request(Request::List) {
+                Ok(list) => Ok(requested
+                    .filter(|p| list_contains_pane(&list, *p))
+                    .map(|pane| ResolvedCaller { pane, method: None })),
+                Err(_) => Err(e),
+            }
+        }
     }
 }
 
@@ -77,8 +82,21 @@ pub enum SendFailure {
     /// 繋がったが応答の途中で切れた（送れない・応答が返らない・応答を読めない）。
     /// 順番待ち（#1994）だけが「届かない」と同じに扱い、他の呼び手は操作の失敗と同じに扱う
     Broken(String),
+    /// 繋がったが上限まで応答が来ない（GUI が固まっている。#2123）。値は待った上限。
+    /// 順番待ちは「届かない」と同じく待たずに走らせ、他の呼び手は操作の失敗と同じに扱う
+    Timeout(std::time::Duration),
     /// 届いたが操作が失敗した
     Operation(String),
+}
+
+impl SendFailure {
+    /// 利用者へ出す 1 行（時間切れは CLI・MCP のブリッジで同じ文言。#2123）
+    pub fn message(self) -> String {
+        match self {
+            SendFailure::Unreachable(m) | SendFailure::Broken(m) | SendFailure::Operation(m) => m,
+            SendFailure::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
+        }
+    }
 }
 
 /// 接続情報の解決とフォールバック（FR-2.2.9）。
@@ -89,9 +107,7 @@ pub enum SendFailure {
 /// 生きているメインへ自動で届く（2026-06-12 バグ (8) の恒久対策）。
 /// 操作エラーはフォールバックせずそのまま返す。どの情報源も無ければ「tako の外」
 pub fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value, String> {
-    send_request_classified(request, origin).map_err(|e| match e {
-        SendFailure::Unreachable(m) | SendFailure::Broken(m) | SendFailure::Operation(m) => m,
-    })
+    send_request_classified(request, origin).map_err(SendFailure::message)
 }
 
 /// [`send_request_via`] の本体。届かなかったのか、届いて操作が失敗したのかを分けて返す
@@ -109,6 +125,8 @@ pub fn send_request_classified(
             Ok(value) => return Ok(value),
             Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
             Err(TransportError::Broken(message)) => return Err(SendFailure::Broken(message)),
+            // 固まった GUI の残りの候補へ回ると待ちが候補の数だけ伸びるので、ここで返す
+            Err(TransportError::Timeout(limit)) => return Err(SendFailure::Timeout(limit)),
             Err(stale) => last_failure = Some(stale),
         }
     }
@@ -126,6 +144,7 @@ pub fn send_request_classified(
             Ok(value) => return Ok(value),
             Err(TransportError::Other(message)) => return Err(SendFailure::Operation(message)),
             Err(TransportError::Broken(message)) => return Err(SendFailure::Broken(message)),
+            Err(TransportError::Timeout(limit)) => return Err(SendFailure::Timeout(limit)),
             // 死んだ残骸・別インスタンスのトークン → 次の候補へ
             Err(stale) => last_failure = Some(stale),
         }
@@ -145,6 +164,8 @@ pub enum TransportError {
     Auth(String),
     /// 繋がった後の送受信の失敗（応答の途中で相手が落ちた等。フォールバックしない。#1994）
     Broken(String),
+    /// 繋がったが上限まで応答が来ない（値は待った上限。フォールバックしない。#2123）
+    Timeout(std::time::Duration),
     /// その他（操作エラー・プロトコルエラー。フォールバックしない）
     Other(String),
 }
@@ -156,6 +177,7 @@ impl TransportError {
             | TransportError::Auth(m)
             | TransportError::Broken(m)
             | TransportError::Other(m) => m,
+            TransportError::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
         }
     }
 }
@@ -163,9 +185,14 @@ impl TransportError {
 pub mod transport {
     //! Layer 1 IPC のクライアント側。ワイヤ処理（1 行 1 JSON）はトランスポート
     //! 非依存（`roundtrip_on`）で、接続の確立だけがプラットフォームで異なる
-    //! （unix: Unix domain socket / windows: named pipe = 抽象境界 B3）
+    //! （unix: Unix domain socket / windows: named pipe = 抽象境界 B3）。
+    //!
+    //! 応答を待つ上限（#2123）は要求の種類から決まる（`protocol::reply_timeout` の 1 実装）。
+    //! unix はソケットの読み書きの時間切れ（往復の全体に掛かる締め切り）、windows は
+    //! 同期ハンドルの named pipe に読み取りの時間切れが無いので往復を別スレッドで回して待つ
 
     use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::Duration;
 
     use serde_json::Value;
     use tako_control::protocol::{error_code, Request, RequestEnvelope, ResponseEnvelope};
@@ -179,12 +206,27 @@ pub mod transport {
         request: Request,
         origin: Option<&str>,
     ) -> Result<Value, TransportError> {
-        let (read_half, write_half) = connect(socket)?;
-        roundtrip_on(read_half, write_half, token, request, origin)
+        let limit = tako_control::protocol::reply_timeout(&request);
+        roundtrip_within(socket, token, request, origin, limit)
+    }
+
+    /// [`roundtrip`] の本体（上限を外から渡す = テストが env に依らない）。`None` は上限なし
+    pub fn roundtrip_within(
+        socket: &str,
+        token: &str,
+        request: Request,
+        origin: Option<&str>,
+        limit: Option<Duration>,
+    ) -> Result<Value, TransportError> {
+        let (read_half, write_half) = connect(socket, limit)?;
+        exchange(read_half, write_half, token, request, origin, limit)
     }
 
     #[cfg(unix)]
-    fn connect(socket: &str) -> Result<(impl Read, impl Write), TransportError> {
+    fn connect(
+        socket: &str,
+        limit: Option<Duration>,
+    ) -> Result<(deadline::Stream, deadline::Stream), TransportError> {
         use std::os::unix::net::UnixStream;
         let stream = UnixStream::connect(socket).map_err(|e| {
             TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
@@ -192,11 +234,19 @@ pub mod transport {
         let read_half = stream
             .try_clone()
             .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
-        Ok((read_half, stream))
+        // 読み書きの両方に「繋がってから上限まで」の同じ締め切りを掛ける
+        let at = limit.map(|l| std::time::Instant::now() + l);
+        Ok((
+            deadline::Stream::new(read_half, at),
+            deadline::Stream::new(stream, at),
+        ))
     }
 
     #[cfg(windows)]
-    fn connect(socket: &str) -> Result<(impl Read, impl Write), TransportError> {
+    fn connect(
+        socket: &str,
+        _limit: Option<Duration>,
+    ) -> Result<(std::fs::File, std::fs::File), TransportError> {
         let stream =
             tako_control::platform::named_pipe::connect_client(socket, 3_000).map_err(|e| {
                 TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
@@ -207,24 +257,86 @@ pub mod transport {
         Ok((read_half, stream))
     }
 
+    #[cfg(unix)]
+    fn exchange(
+        read_half: deadline::Stream,
+        write_half: deadline::Stream,
+        token: &str,
+        request: Request,
+        origin: Option<&str>,
+        limit: Option<Duration>,
+    ) -> Result<Value, TransportError> {
+        roundtrip_on(read_half, write_half, token, request, origin, limit)
+    }
+
+    /// 上限を過ぎたら往復のスレッドは置いていく（GUI が返事をするかパイプが閉じれば抜ける）。
+    /// CLI はこの直後に終わる。常駐する MCP のブリッジでは固まっている間の時間切れ 1 回につき
+    /// 1 本残るが、GUI が戻って溜まった要求に答えるか GUI が終わればすべて抜ける
+    #[cfg(windows)]
+    fn exchange(
+        read_half: std::fs::File,
+        write_half: std::fs::File,
+        token: &str,
+        request: Request,
+        origin: Option<&str>,
+        limit: Option<Duration>,
+    ) -> Result<Value, TransportError> {
+        let Some(limit) = limit else {
+            return roundtrip_on(read_half, write_half, token, request, origin, None);
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let token = token.to_string();
+        let origin = origin.map(str::to_string);
+        std::thread::spawn(move || {
+            let result = roundtrip_on(
+                read_half,
+                write_half,
+                &token,
+                request,
+                origin.as_deref(),
+                Some(limit),
+            );
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(limit) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(TransportError::Timeout(limit)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(TransportError::Broken(
+                "応答を待つスレッドが途中で終わった".into(),
+            )),
+        }
+    }
+
     fn roundtrip_on<R: Read, W: Write>(
         read_half: R,
         mut write_half: W,
         token: &str,
         request: Request,
         origin: Option<&str>,
+        limit: Option<Duration>,
     ) -> Result<Value, TransportError> {
+        // 締め切りを過ぎた読み書き（unix は EAGAIN = WouldBlock）は時間切れ、それ以外は途中で切れた
+        let broken = |what: &str, e: std::io::Error| match limit {
+            Some(limit)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                TransportError::Timeout(limit)
+            }
+            _ => TransportError::Broken(format!("{what}に失敗: {e}")),
+        };
         let mut envelope = RequestEnvelope::new(1, token, request);
         envelope.origin = origin.map(Into::into);
         let json = serde_json::to_string(&envelope)
             .map_err(|e| TransportError::Other(format!("送信の構築に失敗: {e}")))?;
-        writeln!(write_half, "{json}")
-            .map_err(|e| TransportError::Broken(format!("送信に失敗: {e}")))?;
+        writeln!(write_half, "{json}").map_err(|e| broken("送信", e))?;
 
         let mut line = String::new();
         BufReader::new(read_half)
             .read_line(&mut line)
-            .map_err(|e| TransportError::Broken(format!("応答の受信に失敗: {e}")))?;
+            .map_err(|e| broken("応答の受信", e))?;
         if line.is_empty() {
             return Err(TransportError::Broken(
                 "tako アプリから応答が返らなかった".into(),
@@ -240,6 +352,60 @@ pub mod transport {
             });
         }
         Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    /// 締め切りつきの Unix domain socket（#2123）。読み書きのたびに残りの時間を入れ直すので、
+    /// 上限は 1 回の read ではなく往復の全体に掛かる（少しずつ届く応答で延びない）
+    #[cfg(unix)]
+    mod deadline {
+        use std::io::{self, Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        pub struct Stream {
+            stream: UnixStream,
+            at: Option<Instant>,
+        }
+
+        impl Stream {
+            pub fn new(stream: UnixStream, at: Option<Instant>) -> Self {
+                Self { stream, at }
+            }
+
+            /// 残りの時間（締め切りが無ければ `None`、過ぎていれば `TimedOut`）
+            fn left(&self) -> io::Result<Option<Duration>> {
+                let Some(at) = self.at else {
+                    return Ok(None);
+                };
+                let left = at.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                Ok(Some(left))
+            }
+        }
+
+        impl Read for Stream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if let Some(left) = self.left()? {
+                    self.stream.set_read_timeout(Some(left))?;
+                }
+                self.stream.read(buf)
+            }
+        }
+
+        impl Write for Stream {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if let Some(left) = self.left()? {
+                    self.stream.set_write_timeout(Some(left))?;
+                }
+                self.stream.write(buf)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.stream.flush()
+            }
+        }
     }
 }
 
@@ -268,5 +434,128 @@ mod tests {
         );
         // 応答が壊れていても panic せず「居ない」に倒す
         assert!(!list_contains_pane(&serde_json::json!({}), 780));
+    }
+
+    // ---- Issue #2123: 接続を受けたまま返事をしない受け口で永久に待たない ----
+
+    mod reply_timeout {
+        use std::time::{Duration, Instant};
+
+        use tako_control::protocol::{Request, ResponseEnvelope};
+
+        use crate::ipc::transport::roundtrip_within;
+        use crate::ipc::TransportError;
+
+        /// 偽の受け口の振る舞い
+        #[derive(Clone, Copy)]
+        enum Fake {
+            /// 接続を受けて要求も読まず、返事をしないまま持ち続ける（固まった GUI）
+            Silent,
+            /// 要求を 1 行読み、`delay` 置いてから応答を返す
+            ReplyAfter(Duration),
+        }
+
+        /// 受け口を 1 本立てて、1 接続だけ `fake` の通りに振る舞う。戻り値は接続先
+        #[cfg(unix)]
+        fn serve(tag: &str, fake: Fake) -> String {
+            use std::os::unix::net::UnixListener;
+            let path =
+                std::env::temp_dir().join(format!("tk2123-{}-{tag}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("受け口を作れる");
+            std::thread::spawn(move || {
+                if let Ok((stream, _)) = listener.accept() {
+                    behave(stream.try_clone().expect("複製できる"), stream, fake);
+                }
+            });
+            path.to_string_lossy().into_owned()
+        }
+
+        #[cfg(windows)]
+        fn serve(tag: &str, fake: Fake) -> String {
+            use tako_control::platform::named_pipe;
+            let name = format!(r"\\.\pipe\tako-test-2123-{}-{tag}", std::process::id());
+            let instance = named_pipe::create_server_instance(&name, true).expect("パイプを作れる");
+            std::thread::spawn(move || {
+                if let Ok(stream) = instance.wait_client() {
+                    behave(stream.try_clone().expect("複製できる"), stream, fake);
+                }
+            });
+            name
+        }
+
+        fn behave<R: std::io::Read, W: std::io::Write>(
+            read_half: R,
+            mut write_half: W,
+            fake: Fake,
+        ) {
+            use std::io::BufRead;
+            match fake {
+                Fake::Silent => {
+                    // 返事をしないまま持ち続ける（テストの上限より十分長く）
+                    std::thread::sleep(Duration::from_secs(20));
+                    drop((read_half, write_half));
+                }
+                Fake::ReplyAfter(delay) => {
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(read_half).read_line(&mut line);
+                    std::thread::sleep(delay);
+                    let reply = ResponseEnvelope::ok(1, serde_json::json!({ "ok": true }));
+                    let json = serde_json::to_string(&reply).expect("応答を組める");
+                    let _ = writeln!(write_half, "{json}");
+                    let _ = write_half.flush();
+                }
+            }
+        }
+
+        #[test]
+        fn 返事をしない受け口は上限で時間切れを返す() {
+            let endpoint = serve("silent", Fake::Silent);
+            let limit = Duration::from_millis(400);
+            let started = Instant::now();
+            let result = roundtrip_within(&endpoint, "t", Request::List, None, Some(limit));
+            let waited = started.elapsed();
+            match result {
+                Err(TransportError::Timeout(got)) => assert_eq!(got, limit),
+                Err(e) => panic!("時間切れではない: {}", e.message()),
+                Ok(v) => panic!("返事をしない受け口から応答が来た: {v}"),
+            }
+            assert!(waited >= limit, "上限より早く諦めた: {waited:?}");
+            assert!(
+                waited < Duration::from_secs(5),
+                "上限を過ぎても待ち続けた: {waited:?}"
+            );
+        }
+
+        #[test]
+        fn 上限の内に返る応答は受け取れる() {
+            let endpoint = serve("slow", Fake::ReplyAfter(Duration::from_millis(300)));
+            let got = roundtrip_within(
+                &endpoint,
+                "t",
+                Request::List,
+                None,
+                Some(Duration::from_secs(10)),
+            );
+            match got {
+                Ok(v) => assert_eq!(v["ok"], true),
+                Err(e) => panic!("上限の内の応答を取りこぼした: {}", e.message()),
+            }
+        }
+
+        #[test]
+        fn 上限なしは応答まで待つ() {
+            let endpoint = serve("nolimit", Fake::ReplyAfter(Duration::from_millis(600)));
+            match roundtrip_within(&endpoint, "t", Request::List, None, None) {
+                Ok(v) => assert_eq!(v["ok"], true),
+                Err(e) => panic!("上限なしで応答を取りこぼした: {}", e.message()),
+            }
+        }
+
+        #[test]
+        fn 時間切れの文言は上限の秒数を出す() {
+            let m = TransportError::Timeout(Duration::from_secs(30)).message();
+            assert!(m.starts_with("tako アプリが 30 秒応答しない"), "{m}");
+        }
     }
 }

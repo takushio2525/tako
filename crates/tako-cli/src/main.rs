@@ -6903,12 +6903,22 @@ fn check_health_cli(json: bool) -> Result<(), String> {
 /// GUI に届かないときに添える 1 行（#1993。順番待ち #1994 は GUI の中の調停役が持つ）
 const QUEUE_OFFLINE_NOTE: &str = "順番待ちは無効（tako が起動していない）";
 
+/// GUI が繋がったまま応答しないときに添える 1 行（#2123）
+fn queue_unresponsive_note(limit: std::time::Duration) -> String {
+    format!(
+        "順番待ちの状況は読めない（tako が {} 秒応答しない = GUI が固まっている可能性。\
+         tako queue <コマンド> は待たずに走る）",
+        limit.as_secs()
+    )
+}
+
 /// 機全体の CPU% を出すために、GUI が居ないとき 2 回採る間隔
 const QUEUE_OFFLINE_CPU_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// 順番待ちの要求を調停役へ送る（#1994）。`TAKO_QUEUE_SOCKET` を明示していればそこだけ
 /// （隔離の調停役。本番へ漏れない）、無ければいつもの解決（env → 発見ファイル）。
-/// 接続できない・応答の途中で切れた = 届かない、届いて断られた = 断られた
+/// 接続できない・応答の途中で切れた = 届かない、繋がったが上限まで応答しない = 応答しない（#2123）、
+/// 届いて断られた = 断られた
 fn queue_send(request: Request) -> Result<Value, tako_control::queue_wrapper::SendError> {
     use tako_control::queue_wrapper::SendError;
     if let Some(socket) = tako_control::queue::explicit_socket() {
@@ -6916,12 +6926,14 @@ fn queue_send(request: Request) -> Result<Value, tako_control::queue_wrapper::Se
         return match transport::roundtrip(&socket, &token, request, None) {
             Ok(v) => Ok(v),
             Err(TransportError::Other(m)) => Err(SendError::Rejected(m)),
+            Err(TransportError::Timeout(limit)) => Err(SendError::Timeout(limit)),
             Err(e) => Err(SendError::Unreachable(e.message())),
         };
     }
     match send_request_classified(request, None) {
         Ok(v) => Ok(v),
         Err(SendFailure::Unreachable(m) | SendFailure::Broken(m)) => Err(SendError::Unreachable(m)),
+        Err(SendFailure::Timeout(limit)) => Err(SendError::Timeout(limit)),
         Err(SendFailure::Operation(m)) => Err(SendError::Rejected(m)),
     }
 }
@@ -6992,6 +7004,7 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
             };
             let result = queue_send(request).map_err(|e| match e {
                 SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
+                SendError::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
                 SendError::Rejected(m) => m,
             })?;
             if *json {
@@ -7031,10 +7044,10 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
                 id: None,
                 limits: Some(patch.clone()),
             };
-            // GUI が居なくても設定ファイルは変えられる（調停役は次に mtime を見て読み直す）
+            // GUI が居なくても・応答しなくても設定ファイルは変えられる（調停役は次に mtime を見て読み直す）
             let result = match queue_send(request) {
                 Ok(v) => v,
-                Err(SendError::Unreachable(_)) => {
+                Err(SendError::Unreachable(_) | SendError::Timeout(_)) => {
                     tako_control::queue::limits_offline(patch).map_err(|e| e.to_string())?
                 }
                 Err(SendError::Rejected(m)) => return Err(m),
@@ -7071,6 +7084,15 @@ fn queue_status_cli(json: bool) -> Result<(), String> {
             local["gui"] = serde_json::json!(false);
             local["note"] = serde_json::json!(QUEUE_OFFLINE_NOTE);
             local["reason"] = serde_json::json!(reason);
+            local
+        }
+        // #2123: 繋がったまま応答しない GUI。機の状態はこのプロセスで採って返す
+        Err(SendError::Timeout(limit)) => {
+            let mut local = tako_control::resources::machine_only(QUEUE_OFFLINE_CPU_WINDOW);
+            local["gui"] = serde_json::json!(false);
+            local["note"] = serde_json::json!(queue_unresponsive_note(limit));
+            local["reason"] =
+                serde_json::json!(tako_control::protocol::reply_timeout_message(limit));
             local
         }
     };
@@ -7921,6 +7943,10 @@ fn run(command: Command) -> Result<(), String> {
             Err(SendFailure::Unreachable(_)) => lsp_install_local(name.as_deref())?,
             Err(SendFailure::Broken(message) | SendFailure::Operation(message)) => {
                 return Err(message)
+            }
+            // 応答しない GUI が取得を続けているかもしれないので、こちらで二重には取らない（#2123）
+            Err(SendFailure::Timeout(limit)) => {
+                return Err(tako_control::protocol::reply_timeout_message(limit))
             }
         };
         print_result(&command, &result);

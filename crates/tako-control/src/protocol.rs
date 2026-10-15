@@ -2975,6 +2975,104 @@ pub fn changes_layout(request: &Request) -> bool {
     }
 }
 
+// ===== IPC の 1 往復で応答を待つ上限（#2123） =====
+
+/// 順番待ち（`Request::Queue`）の 1 往復の上限。受け口の接続スレッドが UI を通らずに答える
+/// （`ipc::submit` の手前）ので普段は数 ms。`tako queue` の長い待ちは 1 秒ごとの短い往復の
+/// 連続なので、この上限で待ちそのものは切れない。受付・待ちの poll の時間切れは「順番待ちを
+/// 抜けて走る」に繋がる（メモリ圧の最中に誤って切ると負荷を足す）ので、短くしすぎない
+pub const QUEUE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 順番待ちのうち、届かなくても構わない往復（実行中の心拍 `started`・終わりの `done`）の上限。
+/// 時間切れは「その回を飛ばす」だけで害が無いので短く切り、固まった GUI に当たっても
+/// 子の終わり・シグナル・`tako queue` の終了を待たせない
+pub const QUEUE_NOTIFY_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// それ以外の要求の 1 往復の上限（安全網）。UI スレッド・background の準備は普段は秒未満〜
+/// 数十秒で、ここは「GUI が固まったまま永久に待つ」を無くすための値（夜間リリースの
+/// `tako todo` など、人の居ないところで撃つ CLI が止まり続けないように）
+pub const DEFAULT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// 上限の上書き（秒。正の整数ならすべての要求をその秒数で切る・`0` は上限なし）
+pub const REPLY_TIMEOUT_ENV: &str = "TAKO_IPC_TIMEOUT_SECS";
+/// A/B（`1`）: 修正前と同じく上限なしで待つ
+pub const REPLY_TIMEOUT_LEGACY_ENV: &str = "TAKO_2123_LEGACY";
+
+/// 要求ごとの既定の上限（`None` = 上限なし）。
+///
+/// **上限なしにするのは、応答が外の仕事の終わりを待つ要求だけ**: ダウンロード・導入
+/// （言語サーバの取得・更新・setup の各段）、大きさに比例するコピー、git の書き込み
+/// （フック・LFS・ネットワーク。同じリポジトリへの書き込みは 1 本ずつなので、stage も前の
+/// push の終わりを待つ = `dispatch::git_write_reply`）・設定の共有。これらは中で各自の上限を
+/// 持つか、利用者が終わりを待つと分かって撃つもので、ここで切ると GUI では処理が続いて
+/// いるのに CLI だけが失敗を返す。それ以外は UI スレッドで答える（300 秒かかるなら GUI が
+/// 固まっている）か、background で各自の上限（言語サーバ 120 秒・検索の時間上限）を持つ
+pub fn default_reply_timeout(request: &Request) -> Option<std::time::Duration> {
+    match request {
+        Request::Queue { action, .. } if matches!(action.as_deref(), Some("started" | "done")) => {
+            Some(QUEUE_NOTIFY_REPLY_TIMEOUT)
+        }
+        Request::Queue { .. } => Some(QUEUE_REPLY_TIMEOUT),
+        Request::LspServer { action, .. } if action == "install" => None,
+        Request::FileOp { .. }
+        | Request::FileOpMany { .. }
+        | Request::Update { .. }
+        | Request::SetupBootstrap { .. }
+        | Request::SetupDeps { .. }
+        | Request::SetupModels { .. }
+        | Request::SetupMcp { .. }
+        | Request::SetupRun { .. }
+        | Request::RemoteSetup { .. }
+        | Request::ConfigShare { .. }
+        | Request::GitCommit { .. }
+        | Request::GitPull { .. }
+        | Request::GitPush { .. }
+        | Request::GitStage { .. }
+        | Request::GitUnstage { .. }
+        | Request::GitCheckout { .. }
+        | Request::GitBranchCreate { .. }
+        | Request::GitMerge { .. }
+        | Request::GitMergeAbort { .. } => None,
+        _ => Some(DEFAULT_REPLY_TIMEOUT),
+    }
+}
+
+/// env を当てた上限（純関数）。`legacy` なら上限なし、`env` が整数なら全要求をその秒数
+/// （`0` = 上限なし）、読めなければ既定
+pub fn resolve_reply_timeout(
+    default: Option<std::time::Duration>,
+    env: Option<&str>,
+    legacy: bool,
+) -> Option<std::time::Duration> {
+    if legacy {
+        return None;
+    }
+    match env.map(str::trim).and_then(|v| v.parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => default,
+    }
+}
+
+/// この要求の 1 往復で応答を待つ上限（CLI・MCP の stdio ブリッジが通る 1 実装）
+pub fn reply_timeout(request: &Request) -> Option<std::time::Duration> {
+    resolve_reply_timeout(
+        default_reply_timeout(request),
+        std::env::var(REPLY_TIMEOUT_ENV).ok().as_deref(),
+        matches!(
+            std::env::var(REPLY_TIMEOUT_LEGACY_ENV).ok().as_deref(),
+            Some("1" | "true" | "on")
+        ),
+    )
+}
+
+/// 時間切れの文言（CLI・MCP の stdio ブリッジ・`tako queue` の状況が同じ 1 行を出す）
+pub fn reply_timeout_message(limit: std::time::Duration) -> String {
+    format!(
+        "tako アプリが {} 秒応答しない（接続は受けたが返事が無い = GUI が固まっている可能性。\
+         要求は届いているので、GUI が戻ると後から処理されることがある。\
+         待つ上限は env {REPLY_TIMEOUT_ENV}（秒・0 で上限なし））",
+        limit.as_secs()
+    )
+}
+
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
 /// `origin` は生成主体の自己申告（`"mcp"` = MCP 経由。省略時は CLI）。
 /// トークンを持つプロセスは信頼済みのため、これは UI 表示・ポリシー用のラベルであって
@@ -3532,5 +3630,134 @@ mod tests {
                 req.kind_name()
             );
         }
+    }
+
+    // ---- #2123: IPC の 1 往復で応答を待つ上限 ----
+
+    fn queue(action: &str) -> Request {
+        Request::Queue {
+            action: Some(action.into()),
+            job: None,
+            id: None,
+            limits: None,
+        }
+    }
+
+    #[test]
+    fn 順番待ちは短い上限でそれ以外は安全網() {
+        assert_eq!(
+            default_reply_timeout(&queue("poll")),
+            Some(QUEUE_REPLY_TIMEOUT),
+            "接続スレッドが即答する順番待ちは 30 秒"
+        );
+        for action in ["enqueue", "status", "limits", "cancel"] {
+            assert_eq!(
+                default_reply_timeout(&queue(action)),
+                Some(QUEUE_REPLY_TIMEOUT),
+                "{action}"
+            );
+        }
+        for action in ["started", "done"] {
+            assert_eq!(
+                default_reply_timeout(&queue(action)),
+                Some(QUEUE_NOTIFY_REPLY_TIMEOUT),
+                "届かなくても構わない往復（{action}）は短く切る"
+            );
+        }
+        assert!(QUEUE_NOTIFY_REPLY_TIMEOUT < QUEUE_REPLY_TIMEOUT);
+        assert_eq!(
+            default_reply_timeout(&Request::List),
+            Some(DEFAULT_REPLY_TIMEOUT)
+        );
+        assert_eq!(
+            default_reply_timeout(&Request::OrchestratorReport {
+                pane_id: Some(3),
+                lines: None,
+                messages: None,
+                worker: None,
+            }),
+            Some(DEFAULT_REPLY_TIMEOUT),
+            "worker の報告も永久には待たない"
+        );
+        assert!(QUEUE_REPLY_TIMEOUT < DEFAULT_REPLY_TIMEOUT);
+    }
+
+    #[test]
+    fn 外の仕事の終わりを待つ要求は上限なし() {
+        let install = Request::LspServer {
+            action: "install".into(),
+            name: None,
+        };
+        assert_eq!(default_reply_timeout(&install), None, "言語サーバの取得");
+        let status = Request::LspServer {
+            action: "status".into(),
+            name: None,
+        };
+        assert_eq!(
+            default_reply_timeout(&status),
+            Some(DEFAULT_REPLY_TIMEOUT),
+            "状態の読み取りは安全網のまま"
+        );
+        let update = Request::Update {
+            action: Some("apply".into()),
+            channel: None,
+        };
+        assert_eq!(default_reply_timeout(&update), None, "更新のダウンロード");
+        let stage = Request::GitStage {
+            pane: None,
+            paths: vec!["a".into()],
+        };
+        assert_eq!(
+            default_reply_timeout(&stage),
+            None,
+            "git の書き込みは同じリポジトリで 1 本ずつ（前の push の終わりを待つ）"
+        );
+        assert_eq!(
+            default_reply_timeout(&Request::GitConflicts { pane: None }),
+            Some(DEFAULT_REPLY_TIMEOUT),
+            "読むだけの conflicts は順番を待たないので安全網のまま"
+        );
+    }
+
+    #[test]
+    fn env_の上書きと_a_b() {
+        let d = Some(QUEUE_REPLY_TIMEOUT);
+        assert_eq!(resolve_reply_timeout(d, None, false), d, "未設定は既定");
+        assert_eq!(
+            resolve_reply_timeout(d, Some("2"), false),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            resolve_reply_timeout(None, Some(" 7 "), false),
+            Some(std::time::Duration::from_secs(7)),
+            "上限なしの要求も env の秒数で切れる"
+        );
+        assert_eq!(
+            resolve_reply_timeout(d, Some("0"), false),
+            None,
+            "0 は上限なし"
+        );
+        assert_eq!(
+            resolve_reply_timeout(d, Some("x"), false),
+            d,
+            "読めなければ既定"
+        );
+        assert_eq!(
+            resolve_reply_timeout(d, Some("-1"), false),
+            d,
+            "負は読めない = 既定"
+        );
+        assert_eq!(
+            resolve_reply_timeout(d, Some("2"), true),
+            None,
+            "修正前（TAKO_2123_LEGACY=1）は上限なし"
+        );
+    }
+
+    #[test]
+    fn 時間切れの文言は秒数と上書きの口を出す() {
+        let m = reply_timeout_message(std::time::Duration::from_secs(30));
+        assert!(m.starts_with("tako アプリが 30 秒応答しない"), "{m}");
+        assert!(m.contains(REPLY_TIMEOUT_ENV), "{m}");
     }
 }
