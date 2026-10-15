@@ -72,6 +72,13 @@ pub trait SessionHost {
     }
     /// 貼り付けの確認の on / off（#2046。次の貼り付けから効く・永続化は実装側）
     fn set_paste_guard(&mut self, _enabled: bool) {}
+    /// 貼り付けの確認の段・許可リスト・無効にした規則（#2050。値は検証済み・永続化は実装側）
+    fn set_paste_guard_policy(&mut self, _policy: tako_core::paste_guard::Policy) {}
+    /// 段・許可リスト・規則を変えるときの土台（#2050）。既定は今の状態。GUI は**保存済みの設定**を
+    /// 返す（settings.json を手で直した後の変更で、古いメモリの許可リストを書き戻さない）
+    fn paste_guard_policy_base(&self) -> tako_core::paste_guard::Policy {
+        self.paste_guard_status().policy
+    }
     /// 確認待ちの貼り付けへ答える（#2046）。GUI のボタンと同じ 1 実装を通す。
     /// 確認待ちが無ければ `Err`（理由の本文）
     fn answer_paste_guard(

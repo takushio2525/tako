@@ -169,6 +169,12 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             &["LimitSettings"],
         ),
         (
+            // #2050: `Policy` は `Settings.paste_guard_policy` として settings.json へ直に serde される
+            // 永続構造体（貼り付けの確認の段・許可リスト・無効にした規則）。`AllowEntry` はその許可リストの行
+            "crates/tako-core/src/paste_guard.rs",
+            &["Policy", "AllowEntry"],
+        ),
+        (
             "crates/tako-control/src/layout.rs",
             &[
                 "LayoutFile",

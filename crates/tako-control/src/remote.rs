@@ -4471,12 +4471,32 @@ fn session_name_of(target: &str) -> String {
     target.split(':').next().unwrap_or(target).to_string()
 }
 
+/// スマホの入力（`/api/panes/<id>/input`）の応答（#2050）。送らなかった（確認の段で鍵らしき文字が
+/// 当たった）ときは 409 と伏せ字を返し、PWA が「送る / やめる」を出す。警告だけの段で送ったときは
+/// 200 に伏せ字の警告を添える。**本文は載せない**（dispatch の応答も伏せ字だけ）
+fn input_reply(reply: &Value) -> (u16, Value) {
+    if reply["sent"] == json!(false) && reply.get("paste_guard").is_some() {
+        return (
+            409,
+            json!({
+                "error": "鍵らしき文字が入っている（送っていない）",
+                "paste_guard": reply["paste_guard"],
+            }),
+        );
+    }
+    match reply.get("paste_guard") {
+        Some(warning) => (200, json!({ "ok": true, "paste_guard": warning })),
+        None => (200, json!({ "ok": true })),
+    }
+}
+
 /// IPC 経由で Send dispatch を呼ぶ。app が不在なら 503 を返す。
 /// `pane` は tako PaneId（GUI 側 resolve_pane で解決 = 送達検証フローが効く正規経路）、
 /// `tmux_session` はペイン消失時のフォールバック用**セッション名**。
 /// 注意: "session:0.0" のような tmux ターゲット形式を tmux_session に渡してはならない。
 /// deliver 系は `={session}:` を組み立てるため `=session:0.0:` となり
-/// can't find pane で無音失敗する（#428 の根因）
+/// can't find pane で無音失敗する（#428 の根因）。
+/// `paste_guard`（#2050）はスマホの人の入力の印（`human` / `confirmed`）。キー（`keys`）には付けない
 fn dispatch_send(
     app_conn: &Arc<RwLock<AppConnection>>,
     pane: Option<u64>,
@@ -4484,6 +4504,7 @@ fn dispatch_send(
     text: &str,
     newline: bool,
     keys: Option<&str>,
+    paste_guard: Option<&str>,
 ) -> Result<Value, (u16, String)> {
     let request = if let Some(keys_str) = keys {
         crate::protocol::Request::Send {
@@ -4492,6 +4513,7 @@ fn dispatch_send(
             newline: false,
             tmux_session,
             await_prompt: false,
+            paste_guard: None,
         }
     } else {
         crate::protocol::Request::Send {
@@ -4500,6 +4522,7 @@ fn dispatch_send(
             newline,
             tmux_session,
             await_prompt: false,
+            paste_guard: paste_guard.map(str::to_string),
         }
     };
 
@@ -5560,6 +5583,13 @@ fn handle_api_v2_routes(
             let pane_id: Option<u64> = pane_param.parse().ok();
             let session_name = resolve_pane_param(&pane_param, app_conn, pane_mapping)
                 .map(|t| session_name_of(&t));
+            // #2050: スマホの入力は人の入力 = 貼り付けの確認の段に従う。確かめた後の再送は
+            // `confirm_secret: true` を付けてくる
+            let relay = if parsed["confirm_secret"].as_bool() == Some(true) {
+                tako_core::paste_guard::Relay::Confirmed
+            } else {
+                tako_core::paste_guard::Relay::Human
+            };
             match dispatch_send(
                 app_conn,
                 pane_id,
@@ -5567,8 +5597,12 @@ fn handle_api_v2_routes(
                 &text,
                 newline,
                 keys.as_deref(),
+                Some(relay.as_str()),
             ) {
-                Ok(_) => respond(request, 200, Some(json!({ "ok": true }).to_string())),
+                Ok(reply) => {
+                    let (status, body) = input_reply(&reply);
+                    respond(request, status, Some(body.to_string()))
+                }
                 Err((status, e)) => {
                     respond(request, status, Some(json!({ "error": e }).to_string()))
                 }
@@ -5982,6 +6016,7 @@ fn handle_tab_master(
             newline: true,
             tmux_session: None,
             await_prompt: false,
+            paste_guard: None,
         },
         "リモートからの master 起動",
     ) {
@@ -6590,6 +6625,27 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2050: スマホの入力の応答。確認の段で送らなかったら 409 と伏せ字、警告だけの段は 200 に
+    /// 伏せ字を添え、当たらない入力は今までどおり 200 だけ
+    #[test]
+    fn issue2050_入力の応答は送らなかったら409と伏せ字_警告は200に添える() {
+        let guard = json!({
+            "verdict": "confirm",
+            "findings": [{ "rule": "github_token", "line": 1, "masked": "ghp_…qrst" }],
+        });
+        let (status, body) = input_reply(&json!({ "sent": false, "paste_guard": guard }));
+        assert_eq!(status, 409);
+        assert_eq!(body["paste_guard"]["findings"][0]["masked"], "ghp_…qrst");
+        assert!(body["error"].as_str().unwrap().contains("送っていない"));
+        let warned = json!({ "queued": true, "paste_guard": { "verdict": "warn" } });
+        let (status, body) = input_reply(&warned);
+        assert_eq!((status, body["ok"].clone()), (200, json!(true)));
+        assert_eq!(body["paste_guard"]["verdict"], "warn");
+        for plain in [Value::Null, json!({ "queued": true })] {
+            assert_eq!(input_reply(&plain), (200, json!({ "ok": true })));
+        }
+    }
 
     /// env var（TAKO_REMOTE_STATE_DIR / PATH）はプロセス全域のため、これを set/remove する
     /// テスト同士が並列実行でレースする。特に PATH を空にする窓では verify_pid_identity の

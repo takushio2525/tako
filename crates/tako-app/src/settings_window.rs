@@ -688,10 +688,16 @@ impl SettingsWindow {
                 unfocused_fps: None,
                 mouse_forward: Some(s.mouse_click_forward),
             },
+            // #2050: 段も当てる（変更の土台は保存済みの設定 = 手で直した許可リスト・規則も取り込む）
             Request::PasteGuard {
                 enabled: Some(s.paste_guard),
                 check: None,
                 respond: None,
+                mode: Some(s.paste_guard_policy.mode.as_str().into()),
+                allow: None,
+                unallow: None,
+                rules: None,
+                pane: None,
             },
             Request::LimitService {
                 action: Some("set".into()),
@@ -1529,6 +1535,11 @@ impl SettingsWindow {
                                 enabled: Some(!paste_guard),
                                 check: None,
                                 respond: None,
+                                mode: None,
+                                allow: None,
+                                unallow: None,
+                                rules: None,
+                                pane: None,
                             },
                             cx,
                         );

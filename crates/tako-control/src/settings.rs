@@ -127,6 +127,14 @@ pub struct Settings {
     /// （serde の default。古い版が書いた設定ファイルで off にならない = 移行は要らない）
     #[serde(default = "default_paste_guard")]
     pub paste_guard: bool,
+    /// 貼り付けの確認の段（確認 / 警告だけ）・許可リスト（指紋と伏せ字だけ）・無効にした規則
+    /// （Issue #2050）。**旧ファイルは節が無くても既定（確認・許可なし・全規則）で読める**
+    /// （節ごと `#[serde(default)]`・各キーも default）ので移行 Step は要らない
+    #[serde(
+        default,
+        skip_serializing_if = "tako_core::paste_guard::Policy::is_default"
+    )]
+    pub paste_guard_policy: tako_core::paste_guard::Policy,
     /// UI テーマ（Issue #217。"dark" / "light"。既定 dark）
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -275,6 +283,7 @@ impl Default for Settings {
             unfocused_redraw_fps: default_unfocused_redraw_fps(),
             mouse_click_forward: default_mouse_click_forward(),
             paste_guard: default_paste_guard(),
+            paste_guard_policy: tako_core::paste_guard::Policy::default(),
             theme: default_theme(),
             ui_mode: default_ui_mode(),
             sidebar_width: default_sidebar_width(),
@@ -744,6 +753,15 @@ mod tests {
             unfocused_redraw_fps: 12,
             mouse_click_forward: false,
             paste_guard: false,
+            paste_guard_policy: tako_core::paste_guard::Policy {
+                mode: tako_core::paste_guard::Mode::Warn,
+                allow: vec![tako_core::paste_guard::AllowEntry {
+                    fingerprint: "0".repeat(64),
+                    rule: "google_api_key".into(),
+                    masked: "AIza…x0".into(),
+                }],
+                disabled_rules: vec!["high_entropy".into()],
+            },
             theme: "light".into(),
             ui_mode: "gui".into(),
             sidebar_width: 300,
@@ -802,6 +820,19 @@ mod tests {
         // 明示した off は off のまま
         let off: Settings = serde_json::from_str(r#"{"paste_guard":false}"#).unwrap();
         assert!(!off.paste_guard);
+        // #2050: 段・許可リスト・無効にした規則の節は、無い旧ファイルでも既定（確認・許可なし・
+        // 全規則）で読め、既定のままなら書き出さない（指紋テストの更新理由がこれ・移行 Step は要らない）
+        assert!(parsed.paste_guard_policy.is_default());
+        assert!(old.paste_guard_policy.is_default());
+        assert!(!serde_json::to_string(&Settings::default())
+            .unwrap()
+            .contains("paste_guard_policy"));
+        let warn: Settings =
+            serde_json::from_str(r#"{"paste_guard_policy":{"mode":"warn"}}"#).unwrap();
+        assert_eq!(
+            warn.paste_guard_policy.mode,
+            tako_core::paste_guard::Mode::Warn
+        );
         // 手書きの 0 / 桁違いでも起動は成立する（0 = 書いていない扱い・上限超えは上限）
         let zero: Settings = serde_json::from_str(r#"{"unfocused_redraw_fps":0}"#).unwrap();
         assert_eq!(

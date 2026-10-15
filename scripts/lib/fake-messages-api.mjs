@@ -11,6 +11,8 @@
 // #1963: 最後の発話に「Show this card: {JSON}」があれば、要求の tools にある `…tako_show_command` を
 // その JSON（commands / label）で呼ぶ tool_use を返し、その結果（tool_result）が来たら「CARD-DONE」と答える。
 // 受けた要求は 1 行ずつ FAKE_LOG へ（経路・stream・要約の依頼か・ツールを呼んだかだけ。本文は書かない）。
+// #2050: FAKE_MARK を渡すと、最後の発話がその文字を含んだかの真偽（marked）も書く（鍵らしき文字の
+// 確認で「やめた送信が API へ届いていない」を本文を残さずに確かめる口）。
 //
 // 使い方: node scripts/lib/fake-messages-api.mjs <port>   （127.0.0.1 だけで待つ）
 import http from 'node:http'
@@ -19,6 +21,7 @@ import fs from 'node:fs'
 const port = Number(process.argv[2] ?? 0)
 const inputTokens = Number(process.env.FAKE_INPUT_TOKENS ?? 60000)
 const log = process.env.FAKE_LOG
+const mark = process.env.FAKE_MARK
 
 function textOf(content) {
   if (typeof content === 'string') return content
@@ -65,7 +68,8 @@ function answer(body) {
         : count > 0
           ? Array.from({ length: count }, (_, i) => `LINE-${i + 1}`).join('\n')
           : 'ok'
-  return { reply, summarize, call }
+  const marked = mark ? text.includes(mark) : null
+  return { reply, summarize, call, marked }
 }
 
 const server = http.createServer((req, res) => {
@@ -91,8 +95,8 @@ const server = http.createServer((req, res) => {
       res.end('{}')
       return
     }
-    const { reply, summarize, call } = answer(body)
-    if (log) fs.appendFileSync(log, `${JSON.stringify({ path, stream: body.stream === true, summarize, tool: call?.name ?? null })}\n`)
+    const { reply, summarize, call, marked } = answer(body)
+    if (log) fs.appendFileSync(log, `${JSON.stringify({ path, stream: body.stream === true, summarize, tool: call?.name ?? null, marked })}\n`)
     const model = typeof body.model === 'string' ? body.model : 'claude-haiku-fake'
     const usage = { input_tokens: inputTokens, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     const message = { id: `msg_${Date.now()}`, type: 'message', role: 'assistant', model, stop_sequence: null }

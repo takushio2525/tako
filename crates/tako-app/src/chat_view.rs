@@ -977,6 +977,7 @@ impl TakoApp {
                 newline: true,
                 tmux_session: None,
                 await_prompt: false,
+                paste_guard: None,
             },
             PaneOrigin::User,
         );

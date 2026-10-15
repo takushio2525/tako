@@ -3,6 +3,7 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { createClient } from '../api';
 import { AgentIcon, agentColor, agentDarkColor } from './agent-icon';
+import { usePasteGuard } from './paste-guard';
 
 marked.setOptions({
   breaks: true,
@@ -388,6 +389,8 @@ function PendingAttachment({ entry, onRemove }) {
 
 
 export function ChatView({ paneId, info, agentType, onStop, me }) {
+  // #2050: 鍵らしき文字の確認（判定は PC 側。409 なら確認シート）
+  const pasteGuard = usePasteGuard();
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [input, setInput] = useState('');
@@ -444,13 +447,16 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
     atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
   }
 
+  // 送れたら true、鍵らしき文字の確認で「やめる」を選んだら false（#2050）
   async function send(text) {
     const t = (text || '').trim();
-    if (!t) return;
+    if (!t) return true;
     if (navigator.vibrate) navigator.vibrate(10);
     try {
-      await createClient().input(paneId, t, true);
-    } catch {}
+      return await pasteGuard.sendText(createClient(), paneId, t, true);
+    } catch {
+      return true;
+    }
   }
 
   // permission ダイアログへの応答（#425）。サーバーがダイアログ実在を再検証する。
@@ -471,7 +477,8 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
     setInput('');
     setShowSlash(false);
     setAttachments([]);
-    await send(text);
+    // 鍵らしき文字の確認でやめたら、直せるように入力欄へ戻す（#2050）
+    if (!(await send(text))) setInput(text);
     inputRef.current?.focus();
   }
 
@@ -714,6 +721,10 @@ export function ChatView({ paneId, info, agentType, onStop, me }) {
           agentType={agentType}
         />
       )}
+
+      {/* #2050: 鍵らしき文字の確認シートと、警告だけの段の通知 */}
+      {pasteGuard.sheet}
+      {pasteGuard.notice}
     </>
   );
 }

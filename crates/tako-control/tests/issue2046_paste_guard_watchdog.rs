@@ -113,7 +113,8 @@ fn 貼り付けの振り分けは関所を通る() {
         "    fn paste_to_terminal(&mut self, pane: PaneId, text: String, cx: &mut Context<Self>) {",
     );
     let g = joined(&gate);
-    let scan = g.find("tako_core::paste_guard::scan(");
+    // #2050: 判定は許可リスト・規則の無効化を当てる `scan_with`（同じ 1 実装）
+    let scan = g.find("pg::scan_with(");
     let pend = g.find("self.pending_paste = Some(");
     let write = g.find("session.paste(&text)");
     assert!(

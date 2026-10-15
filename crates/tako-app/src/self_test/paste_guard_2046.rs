@@ -22,9 +22,12 @@
 //! ⑨ ブラケットペーストを要求するアプリ → 送ると `ESC[200~` 本文 `ESC[201~` で届く
 //! ⑩ 設定画面「一般」の「貼り付けの確認」トグルを実マウスで押す → 切ると確認なしで届き、戻すと確認が出る
 //! ⑪ persist.log に本文・伏せ字が出ない（規則名と件数だけ）
+//! ⑫ #2050: 警告だけの段 → 確認なしで届き、通知が描かれる（押すと消える）。許可リストの値は確認なしで届き、
+//!    許可の値と鍵の混在は鍵だけで確認が出る。規則を無効にすると確認なしで届く。全規則の無効でも届く。
+//!    `TAKO_2050_LEGACY=1` では段・許可・無効化を当てないので ⑫ の最初で FAILED になる
 //!
 //! 画像は判定の前に `TAKO_VISUAL_DUMP_DIR` へ `paste-guard-dialog.png` / `paste-guard-multi.png` /
-//! `paste-guard-settings-off.png` で落とす。
+//! `paste-guard-settings-off.png` / `paste-guard-warning.png`（#2050）で落とす。
 //! `TAKO_2046_LEGACY=1`（同一バイナリの旧挙動）は ② で FAILED になる。
 //! 単独実行は `TAKO_VISUAL_ONLY=paste-guard`
 
@@ -68,7 +71,43 @@ fn paste_guard_req(
         enabled,
         check: None,
         respond: respond.map(str::to_string),
+        mode: None,
+        allow: None,
+        unallow: None,
+        rules: None,
+        pane: None,
     }
+}
+
+/// #2050: 段・許可リスト・規則の変更（CLI / MCP と同じ dispatch）
+fn policy_req(
+    mode: Option<&str>,
+    allow: Option<&str>,
+    unallow: Option<&str>,
+    rules: &[(&str, bool)],
+) -> tako_control::protocol::Request {
+    tako_control::protocol::Request::PasteGuard {
+        enabled: None,
+        check: None,
+        respond: None,
+        mode: mode.map(str::to_string),
+        allow: allow.map(str::to_string),
+        unallow: unallow.map(str::to_string),
+        rules: (!rules.is_empty()).then(|| {
+            rules
+                .iter()
+                .map(|(name, on)| (name.to_string(), *on))
+                .collect()
+        }),
+        pane: None,
+    }
+}
+
+/// #2050: 「警告だけ」の段の通知が出ているか
+fn warning_shown(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> bool {
+    window
+        .update(cx, |app, _, _| app.paste_warning.is_some())
+        .unwrap_or(false)
 }
 
 /// 受け手のペイン（届いたバイトをそのまま `sink` へ）。`bracketed` ならブラケットペーストを要求する
@@ -761,6 +800,130 @@ pub(super) async fn paste_guard_visual(
             "visual-test {SECTION}: 累計が操作と一致する (prompted={} sent={} cancelled={})",
             final_stats.prompted, final_stats.sent, final_stats.cancelled
         ),
+    );
+
+    // ⑫ #2050: 警告だけの段・許可リスト・規則の無効化（判定の 1 実装 = scan_with を GUI の関所で）。
+    // ⑨ / ⑩ はブラケットペーストの受け手へフォーカスを移したままなので、素の受け手へ戻す
+    focus(window, cx, plain);
+    let warned_before = stats(window, cx).warned;
+    let warn = dispatch_req(window, cx, policy_req(Some("warn"), None, None, &[]));
+    notify_and_draw(any, window, cx);
+    let (before_warn, scale) = capture_frame(any, cx).unwrap_or_else(|| {
+        fail(&format!(
+            "visual-test {SECTION} ⑫: 出す前のフレームを撮れない"
+        ))
+    });
+    paste(window, cx, &secret_text);
+    expected.extend_from_slice(secret_text.as_bytes());
+    let got = wait_sink(cx, &sink, &expected).await;
+    let mut notice = None;
+    for _ in 0..40 {
+        notify_and_draw(any, window, cx);
+        sleep(cx, 30).await;
+        notice = rect(window, cx, "paste-guard-warning");
+        if notice.is_some() {
+            break;
+        }
+    }
+    let (after_warn, _) = capture_frame(any, cx).unwrap_or_else(|| {
+        fail(&format!(
+            "visual-test {SECTION} ⑫: 出した後のフレームを撮れない"
+        ))
+    });
+    dump(&after_warn, "paste-guard-warning.png");
+    let (changed, total) = notice
+        .map(|n| diff_in(&before_warn, &after_warn, n, scale))
+        .unwrap_or((0, 0));
+    println!(
+        "TAKO_VISUAL_PIXEL: {SECTION} warning mode={} drawn={} changed={changed}/{total} warned={}",
+        warn["mode"],
+        notice.is_some(),
+        stats(window, cx).warned - warned_before
+    );
+    check(
+        warn["mode"] == serde_json::json!("warn")
+            && pending_rules(window, cx).is_none()
+            && got == expected
+            && stats(window, cx).warned == warned_before + 1,
+        &format!(
+            "visual-test {SECTION} ⑫: 警告だけの段では確認を出さずに本文がそのまま届く (bytes={} want={})",
+            got.len(),
+            expected.len()
+        ),
+    );
+    check(
+        notice.is_some() && total > 0 && changed * 3 >= total,
+        &format!(
+            "visual-test {SECTION} ⑫: 警告だけの段の通知が画面に描かれる (changed={changed}/{total})"
+        ),
+    );
+    if let Some(n) = notice {
+        click_at(any, cx, center(n));
+    }
+    forget_rects(window, cx);
+    notify_and_draw(any, window, cx);
+    check(
+        !warning_shown(window, cx),
+        &format!("visual-test {SECTION} ⑫: 通知は押すと消える"),
+    );
+    dispatch_req(window, cx, policy_req(Some("confirm"), None, None, &[]));
+
+    // 許可リスト: 許可した値は確認なしで届き、鍵と混ぜると鍵だけで確認が出る
+    let allowed = dispatch_req(window, cx, policy_req(None, Some(&github), None, &[]));
+    let gh_text = format!("gh: {github}");
+    paste(window, cx, &gh_text);
+    expected.extend_from_slice(gh_text.as_bytes());
+    let got = wait_sink(cx, &sink, &expected).await;
+    check(
+        allowed["allowed"][0]["rule"] == serde_json::json!("github_token")
+            && pending_rules(window, cx).is_none()
+            && got == expected,
+        &format!("visual-test {SECTION} ⑫: 許可リストの値は確認なしで届く"),
+    );
+    paste(window, cx, &format!("{github}\n{anthropic}"));
+    check(
+        pending_rules(window, cx) == Some(vec![Rule::AnthropicApiKey]),
+        &format!(
+            "visual-test {SECTION} ⑫: 許可の値と鍵の混在は鍵だけで確認が出る ({:?})",
+            pending_rules(window, cx)
+        ),
+    );
+    dispatch_req(window, cx, paste_guard_req(None, Some("cancel")));
+    check(
+        mark_only(window, cx, &sink, &mut expected, "MARK12").await,
+        &format!("visual-test {SECTION} ⑫: 混在をやめると許可の値も含めて 1 バイトも届かない"),
+    );
+    dispatch_req(window, cx, policy_req(None, None, Some("all"), &[]));
+
+    // 規則の無効化: 無効にした規則では確認が出ない（全規則の無効でも届く）
+    dispatch_req(
+        window,
+        cx,
+        policy_req(None, None, None, &[("anthropic_api_key", false)]),
+    );
+    paste(window, cx, &secret_text);
+    expected.extend_from_slice(secret_text.as_bytes());
+    let got = wait_sink(cx, &sink, &expected).await;
+    check(
+        pending_rules(window, cx).is_none() && got == expected,
+        &format!("visual-test {SECTION} ⑫: 無効にした規則では確認なしで届く"),
+    );
+    let all_off: Vec<(&str, bool)> = Rule::ALL.iter().map(|r| (r.as_str(), false)).collect();
+    dispatch_req(window, cx, policy_req(None, None, None, &all_off));
+    let multi_all = format!("{anthropic} {github} {aws}");
+    paste(window, cx, &multi_all);
+    expected.extend_from_slice(multi_all.as_bytes());
+    let got = wait_sink(cx, &sink, &expected).await;
+    check(
+        pending_rules(window, cx).is_none() && got == expected,
+        &format!("visual-test {SECTION} ⑫: 全規則を無効にすると鍵だらけでも確認なしで届く"),
+    );
+    let all_on: Vec<(&str, bool)> = Rule::ALL.iter().map(|r| (r.as_str(), true)).collect();
+    let back = dispatch_req(window, cx, policy_req(None, None, None, &all_on));
+    check(
+        back["disabled_rules"] == serde_json::json!([])
+            && back["mode"] == serde_json::json!("confirm"),
+        &format!("visual-test {SECTION} ⑫: 段・規則を既定へ戻せる"),
     );
 
     // 後片付け（以降の節へ持ち越さない）

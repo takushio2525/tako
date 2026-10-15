@@ -92,6 +92,22 @@ pub fn keys_hint() -> &'static str {
     )
 }
 
+/// 「警告だけ」の段で送った貼り付けの通知の見出し（#2050）
+pub fn warned_title() -> &'static str {
+    tr!(
+        "鍵らしき文字を含む貼り付けをそのまま送りました",
+        "Sent a paste that looks like it contains a secret"
+    )
+}
+
+/// 「警告だけ」の段の案内（確認へ戻す最簡のコマンド = #322）
+pub fn warned_hint() -> &'static str {
+    tr!(
+        "警告だけの設定です。送る前に確かめるには tako paste-guard on。押すと閉じます。",
+        "Warn-only mode. To check before sending, run tako paste-guard on. Click to close."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -111,6 +127,8 @@ mod tests {
                 cancel().to_string(),
                 send().to_string(),
                 keys_hint().to_string(),
+                warned_title().to_string(),
+                warned_hint().to_string(),
             ];
             texts.extend(Rule::ALL.iter().map(|r| rule_label(*r).to_string()));
             texts

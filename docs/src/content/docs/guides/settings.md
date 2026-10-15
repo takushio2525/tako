@@ -92,10 +92,13 @@ git の SHA・URL・ファイルパスでは出ません。Enter と Esc は「�
 ```bash
 tako paste-guard        # 現在状態
 tako paste-guard off    # 確かめずに貼る
+tako paste-guard warn   # 止めずに送って警告だけ出す
 pbpaste | tako paste-guard check   # 判定だけ試す
+pbpaste | tako paste-guard allow   # その値を許可リストへ（公開鍵・テスト用の鍵など）
 ```
 
-設定画面の「一般」タブの「貼り付けの確認」も同じスイッチです。
+Claude Code の入力欄で打った文字（tako mod が送信の直前に確かめます）と、スマホからの入力にも同じ確認が
+効きます。設定画面の「一般」タブの「貼り付けの確認」も同じスイッチです。
 
 ### 閉じる確認
 

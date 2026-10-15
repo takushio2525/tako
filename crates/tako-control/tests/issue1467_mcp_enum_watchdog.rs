@@ -167,6 +167,14 @@ fn registry() -> Vec<Source> {
             binding: Binding::Consumed,
             values: owned(&tako_core::paste_guard::Answer::VALUES),
         },
+        // #2050: 貼り付けの確認の段（confirm / warn）
+        Source {
+            tool: "tako_settings",
+            prop: "mode",
+            origin: "paste_guard::Mode::VALUES（tako-core/src/paste_guard.rs）",
+            binding: Binding::Consumed,
+            values: owned(&tako_core::paste_guard::Mode::VALUES),
+        },
         // --- 束縛: 手書きのまま値だけ縛る（正本へ値を足したら落ちる） ---
         Source {
             tool: "tako_agent_support",
@@ -505,9 +513,10 @@ fn 走査が空振りしていない() {
         literals >= 90,
         "直書き enum の採取が {literals} 件しかない（走査が壊れている。#1467 時点で 97 件）"
     );
+    // #2050 で tako_settings の mode（paste_guard::Mode::VALUES）を足して 11 件
     assert_eq!(
-        generated, 10,
-        "生成 site が 10 件でない（{generated} 件）。正本を消費する site を増減したら\
+        generated, 11,
+        "生成 site が 11 件でない（{generated} 件）。正本を消費する site を増減したら\
          `registry()` の Consumed も合わせること"
     );
     assert!(

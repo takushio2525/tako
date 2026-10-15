@@ -11,6 +11,7 @@ import { ChatView } from '../components/chat-view';
 import { SshSheet, SshConnectBar } from '../components/ssh';
 import { RemoteLinkRow } from '../components/remote-link';
 import { CommandCards } from '../components/command-cards';
+import { usePasteGuard } from '../components/paste-guard';
 
 const QUICK_KEYS = [
   { label: 'esc',    seq: 'Escape' },
@@ -116,6 +117,8 @@ function buildScreen(screenLines, cursor) {
 }
 
 export function TerminalPage({ paneId, me, onMeRefresh }) {
+  // #2050: 鍵らしき文字の確認（判定は PC 側。409 なら確認シート）
+  const pasteGuard = usePasteGuard();
   const [view, setView] = useState('chat');
   const [loading, setLoading] = useState(true);
   const [info, setInfo] = useState(null);
@@ -346,7 +349,10 @@ export function TerminalPage({ paneId, me, onMeRefresh }) {
     setInput('');
     if (inputRef.current) inputRef.current.style.height = 'auto';
     if (navigator.vibrate) navigator.vibrate(10);
-    try { await clientRef.current.input(paneId, text, true); } catch {}
+    let sent = true;
+    try { sent = await pasteGuard.sendText(clientRef.current, paneId, text, true); } catch {}
+    // 鍵らしき文字の確認でやめたら、直せるように入力欄へ戻す（#2050）
+    if (!sent) setInput(text);
     inputRef.current?.focus();
   }
 
@@ -587,6 +593,10 @@ export function TerminalPage({ paneId, me, onMeRefresh }) {
           <p class="no-terminal-detail">This pane does not have a terminal (e.g. preview, web view)</p>
         </div>
       )}
+
+      {/* #2050: 鍵らしき文字の確認シートと、警告だけの段の通知 */}
+      {pasteGuard.sheet}
+      {pasteGuard.notice}
     </div>
   );
 }
