@@ -27,6 +27,12 @@
 //! 伸びた分は `pty_read` の最後に初期サイズへ戻すので、一度混雑したペインが
 //! 1 MiB を抱えたままにはならない。
 //!
+//! 意図して変えたのは「子の終了を必ず `ChildExit` で知らせる」ための 1 点（#2114）:
+//! unix で書き込みが EIO（子の側 = スレーブが全部閉じた）になっても**ループを畳まない**。
+//! upstream はここで畳むので、子の終了の合図（SIGCHLD）より先に書き込みが失敗した回は
+//! `Pty` の drop が子を回収し、子の終了が誰にも届かない。tako は書けない入力を捨て、
+//! PTY の fd を監視から外して合図を待つ。
+//!
 //! # 由来とライセンス
 //!
 //! alacritty_terminal 0.26.0 `src/event_loop.rs`（Apache-2.0）の移植。
@@ -70,6 +76,41 @@ const EXIT_DRAIN_MAX: Duration = Duration::from_millis(500);
 /// #817 の移植で落ちていた形へ戻す。検証専用で、既定では通らない
 fn legacy_1628_skip_drain() -> bool {
     std::env::var("TAKO_1628_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// A/B の旧経路アーム（`TAKO_2114_LEGACY=1`）。書き込みが「相手側が閉じた」で失敗したら
+/// **その場でループを畳む** = #2114 の前の形（upstream と同じ）へ戻す。検証専用で、既定では通らない
+fn legacy_2114_break_on_closed_write() -> bool {
+    std::env::var("TAKO_2114_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// 注入（`TAKO_2114_INJECT_CHILD_EVENT_DELAY_MS=<ms>`）。子の終了の合図（SIGCHLD）を受けてから
+/// 処理するまでを指定の時間だけ遅らせる = 負荷の下で合図の処理が遅れた回を再現する。
+/// その間も PTY の読み書きは回る。検証専用で、既定では通らない（#2114）
+fn inject_2114_child_event_delay() -> Option<Duration> {
+    std::env::var("TAKO_2114_INJECT_CHILD_EVENT_DELAY_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_millis)
+}
+
+/// 書き込みの失敗が「子の側（スレーブ）が全部閉じた」ことを表すか（#2114）。
+///
+/// unix の master は、スレーブの fd が全部閉じて出力を読み切った後の write が EIO になる
+/// （macOS で実測。子が tty を閉じて生きている間も同じ）。子の終了の合図はこれとは別の
+/// 経路（SIGCHLD）で後から届くので、この失敗は「子が終わった」の代わりにはならない。
+/// Windows（ConPTY）は対象外 = 従来どおり畳む
+fn is_peer_closed(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 /// 読み取りバッファの初期サイズ。`MAX_LOCKED_READ` 以上の最小の 2 冪（64 KiB）。
@@ -235,6 +276,13 @@ impl State {
     #[inline]
     fn set_current(&mut self, new: Option<Writing>) {
         self.writing = new;
+    }
+
+    /// 書き込み待ちを全部捨てる（相手側が閉じた PTY へは二度と届かない。#2114）
+    #[inline]
+    fn clear_writes(&mut self) {
+        self.write_list.clear();
+        self.writing = None;
     }
 }
 
@@ -522,6 +570,12 @@ where
                 let mut events =
                     Events::with_capacity(NonZeroUsize::new(1024).expect("1024 は非ゼロ"));
                 let mut warned_unknown_token = false;
+                // 子の側（スレーブ）が全部閉じた後か（#2114）。立ったら PTY の fd を監視から
+                // 外し、届く入力は捨てて、子の終了の合図だけを待つ
+                let mut peer_closed = false;
+                // 注入（#2114）: 子の終了の合図を遅らせる幅と、遅らせ始めた時刻
+                let child_event_delay = inject_2114_child_event_delay();
+                let mut child_event_seen: Option<Instant> = None;
 
                 'event_loop: loop {
                     // 同期更新のタイムアウトが来たら poll を起こす
@@ -552,10 +606,24 @@ where
                     if !self.drain_recv_channel(&mut state) {
                         break;
                     }
+                    // 相手側が閉じた PTY へは二度と届かない。溜めると捨てられずに積もる（#2114）
+                    if peer_closed {
+                        state.clear_writes();
+                    }
 
                     for event in events.iter() {
                         match event.key {
                             PTY_CHILD_EVENT_TOKEN => {
+                                // 注入（#2114）: 合図を読まずに残して遅らせる。level の poll が
+                                // 起こし続けるので 1 ms ずつ寝る（その間も PTY の読み書きは回る）
+                                if let Some(delay) = child_event_delay {
+                                    let seen = *child_event_seen.get_or_insert_with(Instant::now);
+                                    if seen.elapsed() < delay {
+                                        std::thread::sleep(Duration::from_millis(1));
+                                        continue;
+                                    }
+                                    child_event_seen = None;
+                                }
                                 if let Some(ChildEvent::Exited(status)) =
                                     self.pty.next_child_event()
                                 {
@@ -594,8 +662,34 @@ where
 
                                 if event.writable {
                                     if let Err(err) = self.pty_write(&mut state) {
-                                        tracing::error!("PTY の書き込みに失敗した: {err}");
-                                        break 'event_loop;
+                                        if !is_peer_closed(&err)
+                                            || legacy_2114_break_on_closed_write()
+                                        {
+                                            tracing::error!("PTY の書き込みに失敗した: {err}");
+                                            break 'event_loop;
+                                        }
+                                        // #2114: 子の側が全部閉じた（子が終わりかけ / tty を
+                                        // 閉じた）。ここで畳むと子の終了（ChildExit）を誰も
+                                        // 知らせないまま `Pty` の drop が子を回収し、ペインは
+                                        // 子の死を知らない。書けない入力は捨て、fd の監視を
+                                        // 外して（R / W とも EOF が立ち続けるので、外さないと
+                                        // 空回りする）子の終了の合図を待つ。その腕が読み切り
+                                        // （#1628）と ChildExit を通常どおり行う
+                                        tracing::debug!(
+                                            "PTY の相手側が閉じた。子の終了を待つ: {err}"
+                                        );
+                                        peer_closed = true;
+                                        state.clear_writes();
+                                        interest.readable = false;
+                                        interest.writable = false;
+                                        if let Err(err) =
+                                            self.pty.reregister(&self.poll, interest, poll_opts)
+                                        {
+                                            tracing::error!(
+                                                "PTY イベントの再登録に失敗した: {err}"
+                                            );
+                                            break 'event_loop;
+                                        }
                                     }
                                 }
                             }
@@ -612,8 +706,9 @@ where
                     }
 
                     // 書き込み待ちがあれば write interest を登録する
+                    // （相手側が閉じた後は fd を監視に戻さない。#2114）
                     let needs_write = state.needs_write();
-                    if needs_write != interest.writable {
+                    if !peer_closed && needs_write != interest.writable {
                         interest.writable = needs_write;
 
                         if let Err(err) = self.pty.reregister(&self.poll, interest, poll_opts) {
@@ -752,5 +847,317 @@ mod tests {
             "PTY_CHILD_EVENT_TOKEN={PTY_CHILD_EVENT_TOKEN} で子プロセス終了イベントが来なかった。\
              alacritty_terminal の tty::PTY_CHILD_EVENT_TOKEN が変わった可能性がある"
         );
+    }
+
+    /// #2114 の単体テスト用の部品。実 PTY を包み、子の終了の合図を握れるようにし、
+    /// 読み書きの回数を数える
+    #[cfg(unix)]
+    mod held {
+        use super::*;
+        use alacritty_terminal::tty::{EventedReadWrite, Pty};
+        use std::fs::File;
+        use std::sync::atomic::AtomicUsize;
+
+        /// ループが PTY をどう触ったかの数え
+        #[derive(Default)]
+        pub(super) struct Counts {
+            pub reads: AtomicUsize,
+            pub read_bytes: AtomicUsize,
+            pub writes: AtomicUsize,
+            pub eio: AtomicUsize,
+            /// 合図を握っている間に `next_child_event` が呼ばれた回数 = ループが回った回数
+            pub held: AtomicUsize,
+        }
+
+        pub(super) struct CountingReader {
+            file: File,
+            counts: Arc<Counts>,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.counts.reads.fetch_add(1, Ordering::SeqCst);
+                let result = self.file.read(buf);
+                if let Ok(n) = result {
+                    self.counts.read_bytes.fetch_add(n, Ordering::SeqCst);
+                }
+                result
+            }
+        }
+
+        pub(super) struct CountingWriter {
+            file: File,
+            counts: Arc<Counts>,
+        }
+
+        impl Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.counts.writes.fetch_add(1, Ordering::SeqCst);
+                let result = self.file.write(buf);
+                if matches!(&result, Err(e) if e.raw_os_error() == Some(libc::EIO)) {
+                    self.counts.eio.fetch_add(1, Ordering::SeqCst);
+                }
+                result
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.file.flush()
+            }
+        }
+
+        /// `hold` が立っている間、子の終了の合図を**読まずに**握る PTY。
+        /// 読み書きは同じ master の複製 fd（状態フラグ = O_NONBLOCK は共有）で行う
+        pub(super) struct HeldPty {
+            inner: Pty,
+            reader: CountingReader,
+            writer: CountingWriter,
+            hold: Arc<AtomicBool>,
+            counts: Arc<Counts>,
+        }
+
+        impl HeldPty {
+            pub fn new(inner: Pty, hold: Arc<AtomicBool>, counts: Arc<Counts>) -> io::Result<Self> {
+                let reader = CountingReader {
+                    file: inner.file().try_clone()?,
+                    counts: counts.clone(),
+                };
+                let writer = CountingWriter {
+                    file: inner.file().try_clone()?,
+                    counts: counts.clone(),
+                };
+                Ok(Self {
+                    inner,
+                    reader,
+                    writer,
+                    hold,
+                    counts,
+                })
+            }
+
+            pub fn child_pid(&self) -> u32 {
+                self.inner.child().id()
+            }
+        }
+
+        impl EventedReadWrite for HeldPty {
+            type Reader = CountingReader;
+            type Writer = CountingWriter;
+
+            unsafe fn register(
+                &mut self,
+                poll: &Arc<Poller>,
+                interest: PollingEvent,
+                mode: PollMode,
+            ) -> io::Result<()> {
+                // Safety: 呼び手の約束（登録元は deregister まで生きる）をそのまま引き継ぐ
+                unsafe { self.inner.register(poll, interest, mode) }
+            }
+
+            fn reregister(
+                &mut self,
+                poll: &Arc<Poller>,
+                interest: PollingEvent,
+                mode: PollMode,
+            ) -> io::Result<()> {
+                self.inner.reregister(poll, interest, mode)
+            }
+
+            fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+                self.inner.deregister(poll)
+            }
+
+            fn reader(&mut self) -> &mut CountingReader {
+                &mut self.reader
+            }
+
+            fn writer(&mut self) -> &mut CountingWriter {
+                &mut self.writer
+            }
+        }
+
+        impl EventedPty for HeldPty {
+            fn next_child_event(&mut self) -> Option<ChildEvent> {
+                if self.hold.load(Ordering::SeqCst) {
+                    // 合図は level で起こし続けるので、握っている間は 1 ms ずつ寝る
+                    self.counts.held.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
+                    return None;
+                }
+                self.inner.next_child_event()
+            }
+        }
+
+        impl event::OnResize for HeldPty {
+            fn on_resize(&mut self, window_size: WindowSize) {
+                self.inner.on_resize(window_size);
+            }
+        }
+
+        /// 端末のイベントをそのまま流す受け手
+        #[derive(Clone)]
+        pub(super) struct ChanListener(pub mpsc::Sender<Event>);
+
+        impl EventListener for ChanListener {
+            fn send_event(&self, event: Event) {
+                let _ = self.0.send(event);
+            }
+        }
+
+        /// 途中で落ちても合図を放してループを畳む（握ったままのループを残さない）
+        pub(super) struct Release(pub Arc<AtomicBool>, pub LoopSender);
+
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+                let _ = self.1.send(Msg::Shutdown);
+            }
+        }
+
+        /// `ps` の状態（`Z` = ゾンビ = 子は終わってスレーブは全部閉じた）。居なければ None
+        pub(super) fn ps_stat(pid: u32) -> Option<String> {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+
+        /// 条件が立つまで待つ（上限 30 秒で偽）
+        pub(super) fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+            for _ in 0..3000 {
+                if cond() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+    }
+
+    /// #2114: 子の側（スレーブ）が全部閉じた後に書き込みが届いても、ループは畳まずに
+    /// 子の終了の合図を待ち、`ChildExit` を送る。
+    ///
+    /// 負荷の下では「子が終わる → 届いた書き込みが EIO → まだ処理していない子の終了の合図」の
+    /// 順になりうる（issue1857 のテストが 60 秒 `ChildExit` を待って落ちた回）。ここでは合図を
+    /// **ラッパーで握って**その順を必ず作り、段は時間ではなく状態（ゾンビ・EIO の回数・
+    /// ループの周回数）で進める。修正前（`TAKO_2114_LEGACY=1`）は EIO でループが畳まれ、
+    /// `Pty` の drop が子を回収するので `ChildExit` が来ないまま終わる
+    #[cfg(unix)]
+    #[test]
+    fn issue2114_子の側が閉じた後の書き込みでもchildexitが届く() {
+        use alacritty_terminal::term::{test::TermSize, Config, Term};
+        use alacritty_terminal::tty::{self, Options, Shell};
+        use held::{ps_stat, wait_until, ChanListener, Counts, HeldPty, Release};
+        use std::sync::atomic::AtomicUsize;
+
+        const READY: &str = "TAKO2114READY";
+        let options = Options {
+            shell: Some(Shell::new(
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), format!("printf {READY}; exit 7")],
+            )),
+            ..Options::default()
+        };
+        let window_size = WindowSize {
+            num_lines: 24,
+            num_cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let counts = Arc::new(Counts::default());
+        let hold = Arc::new(AtomicBool::new(true));
+        let pty = HeldPty::new(
+            tty::new(&options, window_size, 0).expect("PTY を張れる"),
+            hold.clone(),
+            counts.clone(),
+        )
+        .expect("master を複製できる");
+        let pid = pty.child_pid();
+        let (tx, rx) = mpsc::channel();
+        let listener = ChanListener(tx);
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &TermSize::new(80, 24),
+            listener.clone(),
+        )));
+        let event_loop = PtyLoop::new(term, listener, pty, Arc::new(AtomicBool::new(false)))
+            .expect("ループを作れる");
+        let sender = event_loop.channel();
+        let _release = Release(hold.clone(), sender.clone());
+        let handle = event_loop.spawn();
+        let seen = |c: &AtomicUsize| c.load(Ordering::SeqCst);
+
+        // ① 子が出力して終わり（ゾンビ = スレーブは全部閉じた）、ループがその出力を読み切った
+        assert!(
+            wait_until(|| seen(&counts.read_bytes) >= READY.len()
+                && ps_stat(pid).is_some_and(|s| s.starts_with('Z'))),
+            "前提: 子が終わり出力を読み切る。読んだ={} 子={:?}",
+            seen(&counts.read_bytes),
+            ps_stat(pid)
+        );
+
+        // ② 合図を握ったまま入力を届ける = 書き込みが EIO になる
+        sender
+            .send(Msg::Input(Cow::Borrowed(&b"x"[..])))
+            .expect("ループへ送れる");
+        assert!(
+            wait_until(|| seen(&counts.eio) >= 1 || handle.is_finished()),
+            "前提: 閉じた PTY への書き込みが EIO になる。書いた={} ループ終了={}",
+            seen(&counts.writes),
+            handle.is_finished()
+        );
+
+        // ③ 畳まずに合図を待っている。その後に届いた入力は書きに行かず、fd を監視から
+        // 外したので読みにも行かない（R / W とも EOF が立ち続ける = 外さないと空回りする）
+        let reads_at_eio = seen(&counts.reads);
+        let writes_at_eio = seen(&counts.writes);
+        let held_at_eio = seen(&counts.held);
+        let _ = sender.send(Msg::Input(Cow::Borrowed(&b"y"[..])));
+        wait_until(|| handle.is_finished() || seen(&counts.held) >= held_at_eio + 50);
+        assert!(
+            !handle.is_finished(),
+            "書き込みの EIO でループが畳まれた = 子の終了（ChildExit）が誰にも届かない。子: {:?}",
+            ps_stat(pid)
+        );
+        assert_eq!(
+            seen(&counts.reads) - reads_at_eio,
+            0,
+            "相手側が閉じた後も PTY を読みに行っている（空回り）"
+        );
+        assert_eq!(
+            seen(&counts.writes) - writes_at_eio,
+            0,
+            "相手側が閉じた後も PTY へ書きに行っている"
+        );
+
+        // ④ 合図を放すと、読み切り → ChildExit（終了コード 7）が届いてループが畳まれる
+        hold.store(false, Ordering::SeqCst);
+        let mut exit = None;
+        wait_until(|| {
+            // 畳まれたのを先に見てから受け取る（畳まれた後に送られるイベントは無いので、
+            // ここで空なら ChildExit は来ていない）
+            let finished = handle.is_finished();
+            while let Ok(event) = rx.try_recv() {
+                if let Event::ChildExit(status) = event {
+                    exit = Some(status);
+                }
+            }
+            exit.is_some() || finished
+        });
+        let status = exit.unwrap_or_else(|| {
+            panic!(
+                "子の終了（ChildExit）が届かない。ループ終了={} 子: {:?}",
+                handle.is_finished(),
+                ps_stat(pid)
+            )
+        });
+        assert_eq!(status.code(), Some(7), "子の終了コードがそのまま届く");
+        assert!(
+            wait_until(|| handle.is_finished()),
+            "ChildExit の後はループが畳まれる"
+        );
+        assert_eq!(ps_stat(pid), None, "子は回収済み");
     }
 }
