@@ -301,6 +301,7 @@ fn spec_for(scratch: &Scratch, asset: &str, bytes: &[u8], size: u64) -> &'static
         ),
         root_markers: &["fetch.marker"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,

@@ -8,6 +8,9 @@
 //! 4 列目に `unconfigured` を書いた件（#1951。`scripts/test-lsp-arduino-1951.sh` の基板の無いスケッチ）は、
 //! サーバを起こさず「前提が未設定」の帯（理由・選ぶコマンド・確かめ直すボタン）が描かれた画面
 //! （`<id>-unconfigured.png`）を落とす。
+//! #2113（`scripts/test-lsp-sketch-headers-2113.sh` のスケッチ内の `.h` / `.cpp`）: `clean` は**誤りの無い**
+//! ファイル = ホバーの答えが出た（サーバが文書を読んだ）後も波線が 0 本のまま（`<id>-clean.png`）で、
+//! カードが出る。`diag` は波線だけを撮る（旧挙動の嘘のエラー。ホバーは見ない）。
 //!
 //! 1 件ごとに: ① 編集モードで開く → 稼働して読み込みが済む ② 診断が 1 件以上、画面の写しまで届く
 //! （波線。`<id>-diag.png`）
@@ -46,7 +49,8 @@ struct Case {
     path: std::path::PathBuf,
     line: usize,
     column: usize,
-    /// `Some("unconfigured")` = 起こす前提が未設定の帯を撮る（#1951）。`None` = 波線とホバー
+    /// `Some("unconfigured")` = 起こす前提が未設定の帯を撮る（#1951）。`Some("clean")` = 波線が出ず
+    /// ホバーが出る / `Some("diag")` = 波線だけ（#2113）。`None` = 波線とホバー
     expect: Option<String>,
 }
 
@@ -152,6 +156,7 @@ pub(super) async fn lsp_servers_visual(
             unconfigured_bar(any, window, cx, pane, id, started).await;
             continue;
         }
+        let clean = case.expect.as_deref() == Some("clean");
         let mut ready_ms = None;
         let mut diagnosed_ms = None;
         let mut last = String::new();
@@ -177,7 +182,7 @@ pub(super) async fn lsp_servers_visual(
             if count > 0 && diagnosed_ms.is_none() {
                 diagnosed_ms = Some(started.elapsed().as_millis());
             }
-            if ready_ms.is_some() && diagnosed_ms.is_some() {
+            if ready_ms.is_some() && (diagnosed_ms.is_some() || clean) {
                 break;
             }
             cx.background_executor()
@@ -196,12 +201,17 @@ pub(super) async fn lsp_servers_visual(
             ready_ms.is_some(),
             &format!("visual-test {LABEL} {id}: 稼働して読み込みが済む（{last}）"),
         );
-        check(
-            count > 0,
-            &format!("visual-test {LABEL} {id}: 誤りの診断が届く（波線）"),
-        );
-        notify_and_draw(any, window, cx);
-        dump(any, cx, &format!("{id}-diag.png"));
+        if !clean {
+            check(
+                count > 0,
+                &format!("visual-test {LABEL} {id}: 誤りの診断が届く（波線）"),
+            );
+            notify_and_draw(any, window, cx);
+            dump(any, cx, &format!("{id}-diag.png"));
+        }
+        if case.expect.as_deref() == Some("diag") {
+            continue;
+        }
         // ③ ホバー: CLI と同じ問い合わせで答えの中身を確かめてから、実 GUI のマウス経路でカードを出す
         let manager = window
             .update(cx, |app, _, _| app.lsp.clone())
@@ -256,6 +266,9 @@ pub(super) async fn lsp_servers_visual(
             !text.is_empty(),
             &format!("visual-test {LABEL} {id}: ホバーの答えに中身がある"),
         );
+        if clean {
+            clean_after_answer(any, window, cx, pane, &path, id).await;
+        }
         let Some(at) = hover_point(window, cx, pane, line, column) else {
             fail(&format!(
                 "visual-test {LABEL} {id}: ホバーの位置が描かれていない"
@@ -273,6 +286,49 @@ pub(super) async fn lsp_servers_visual(
         notify_and_draw(any, window, cx);
     }
 }
+
+/// 誤りの無いファイル（#2113 の `clean`）: サーバが文書を読んだ（ホバーの答えが出た）後、診断が届くのを
+/// 待つ時間（[`CLEAN_SETTLE`]）のあいだ画面の写しも表も 0 件のまま。その画面を撮る
+async fn clean_after_answer(
+    any: AnyWindowHandle,
+    window: WindowHandle<TakoApp>,
+    cx: &mut AsyncApp,
+    pane: PaneId,
+    path: &std::path::Path,
+    id: &str,
+) {
+    const LABEL: &str = "lsp-servers";
+    let since = std::time::Instant::now();
+    let mut most = (0, 0);
+    while since.elapsed() < CLEAN_SETTLE {
+        notify_and_draw(any, window, cx);
+        let now = window
+            .update(cx, |app, _, _| {
+                (drawn(app, pane), app.lsp.diagnostics_count(path))
+            })
+            .unwrap_or((0, 0));
+        most = (most.0.max(now.0), most.1.max(now.1));
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+    println!(
+        "TAKO_VISUAL_PIXEL: {LABEL} id={id} clean_settle_ms={} drawn_max={} table_max={}",
+        CLEAN_SETTLE.as_millis(),
+        most.0,
+        most.1
+    );
+    check(
+        most == (0, 0),
+        &format!("visual-test {LABEL} {id}: 誤りの無いファイルに波線が出ない（{most:?}）"),
+    );
+    notify_and_draw(any, window, cx);
+    dump(any, cx, &format!("{id}-clean.png"));
+}
+
+/// `clean` の件で、答えが出てから波線が出ないのを見続ける時間（ALS は clangd の診断を答えの後に
+/// まとめて送ることがある = 余裕を持たせる）
+const CLEAN_SETTLE: Duration = Duration::from_secs(8);
 
 /// 起こす前提が未設定（#1951）の件: 状態が unconfigured になり、帯（理由・次の一手・確かめ直すボタン）が
 /// 描かれるまで待って撮る。ボタンの矩形（`preview-lsp-action-<pane>`）が描画で記録されたら帯が出ている

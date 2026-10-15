@@ -41,8 +41,7 @@ impl TakoApp {
             return false;
         }
         self.previews.get(&pane).is_some_and(|p| {
-            p.mode == preview::PreviewMode::Code
-                && tako_core::lsp::servers::resolve(&p.path).is_some()
+            p.mode == preview::PreviewMode::Code && self.lsp.resolve(&p.path).is_some()
         })
     }
 

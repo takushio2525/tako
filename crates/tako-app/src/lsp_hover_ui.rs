@@ -301,7 +301,7 @@ impl TakoApp {
             return false;
         };
         if state.mode != preview::PreviewMode::Code
-            || tako_core::lsp::servers::resolve(&state.path).is_none()
+            || self.lsp.resolve(&state.path).is_none()
             || self.lsp_completion_open_in(pane)
             // 右クリックメニュー（#1684 の言語サーバの項目を含む）を開いているあいだは出さない
             // （カードはメニューより手前に積まれるので、語の上でマウスが動くとメニューを隠す）
