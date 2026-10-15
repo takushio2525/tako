@@ -1089,14 +1089,15 @@ fn mono() -> (FakeFs, Detection) {
 fn 短縮が2候補に当たると選ばずに候補を並べる() {
     let (_, d) = mono();
     let err = match_query(python(), ".venv", &d.candidates).expect_err("1 つを選ばない");
+    let QueryError::Ambiguous(ids) = &err else {
+        panic!("{err:?}")
+    };
+    // 鍵は `join` で組んだパス（Windows のホストでは `\\` 区切り）なので `/` に揃えて比べる
     assert_eq!(
-        err,
-        QueryError::Ambiguous(vec![
-            "venv:/h/mono/pkg/a/.venv".to_string(),
-            "venv:/h/mono/.venv".to_string(),
-        ])
+        ids.iter().map(|id| slash(id)).collect::<Vec<_>>(),
+        ["venv:/h/mono/pkg/a/.venv", "venv:/h/mono/.venv"]
     );
-    let msg = msg_query_error(".venv", &err, &d.candidates);
+    let msg = slash(&msg_query_error(".venv", &err, &d.candidates));
     assert!(
         msg.contains("venv:/h/mono/pkg/a/.venv") && msg.contains("venv:/h/mono/.venv"),
         "{msg}"
@@ -1174,7 +1175,7 @@ fn interpreterの消えた環境は保存した選択として走らせない() 
         ("venv", "/h/proj/.venv")
     );
     assert!(
-        err.reason.contains("/h/proj/.venv/bin/python"),
+        slash(&err.reason).contains("/h/proj/.venv/bin/python"),
         "{}",
         err.reason
     );
