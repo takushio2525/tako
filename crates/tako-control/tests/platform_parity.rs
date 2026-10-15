@@ -911,6 +911,13 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             "tmux e2e テスト内（`#[cfg(unix)]`）",
         ),
         (
+            "crates/tako-control/src/ipc.rs",
+            1,
+            "fd 漏れの番犬（#2129）が**自分と同じテストバイナリ**を子として起こし、並列のテストが \
+             居ないプロセスで fd を数える 1 件。unix 限定のテストモジュールの中で、製品コードの \
+             起動ではないので Windows の GUI からは到達しない",
+        ),
+        (
             "crates/tako-control/src/platform/os_integration.rs",
             7,
             "境界 B8 の macOS / Linux 実装（open / osascript / xdg-open）+ テストの osascript 1 件。\

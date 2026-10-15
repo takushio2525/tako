@@ -742,7 +742,7 @@ mod run_start_over_ipc {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
 
     use futures::channel::mpsc::unbounded;
@@ -784,18 +784,294 @@ mod tests {
         assert!(response.error.is_none());
     }
 
+    /// #2129: fd の計測を子プロセスで走らせるときの目印（これが無ければ子の本体は何もしない）
+    const FD_CHILD_ENV: &str = "TAKO_2129_FD_CHILD";
+
+    /// 子のテスト名（`--exact` で名指しするので、改名したらここも直す）
+    const FD_CHILD_TEST: &str = "ipc::tests::子プロセス_連続接続の前後でfdを数える";
+
+    /// 子が計測値を親へ渡す目印（libtest は子の出力を飲み込むので `--nocapture` で出す）
+    const FD_MARKER: &str = "TAKO_2129_FD";
+
+    /// 注入（#2129）: 計測のあいだ、**テストプロセスの別スレッド**が開いたままにする fd の数。
+    /// 並列で走る他のテストが fd を抱えている状態の再現（CI の macOS で +7 を踏んだ形）
+    const INJECT_NOISE_ENV: &str = "TAKO_2129_INJECT_FD_NOISE";
+
+    /// 注入（#2129）: 計測する 10 回の接続のうち、先頭から何本を**閉じずに捨てる**か（本当の漏れ）
+    const INJECT_LEAK_ENV: &str = "TAKO_2129_INJECT_LEAK";
+
+    /// A/B（#2129）: 修正前の計測（テストプロセスの中でプロセス全体の fd を数え、
+    /// 6 秒間の最小値を許容 +6 で見る）へ戻す
+    const LEGACY_ENV: &str = "TAKO_2129_LEGACY";
+
+    /// 計測する往復の回数（ウォームアップは別）
+    const FD_ROUNDTRIPS: usize = 10;
+
+    fn env_count(key: &str) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn fd_count() -> usize {
+        std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// EOF 待ちの打ち切り（#2129）。13 回の往復で**共有する**予算で、閉じないサーバー
+    /// （= 漏れ）で固まらないためだけにある。通る経路は EOF で抜けるので判定に効かない。
+    ///
+    /// 120 秒なのは、ローカルの lib 全体の実行（他の worker のビルドが並走する負荷の下）で
+    /// 1 回、応答を返したサーバーが EOF を 30 秒以上返さなかった（当初は 1 接続 30 秒で
+    /// 打ち切っていた）ため。子にはプロセスを起こす経路が無く、サーバー側のソケットを
+    /// 握れるのは子の接続スレッドだけなので、子が止まっていた側の事象と見ている
+    /// （打ち切ったときは下の診断がどちらかを名指す）
+    const FD_EOF_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// 1 往復して、**サーバーが自分の側を閉じたのを見届けてから**戻る（#2129）。
+    /// 戻り値は EOF が届くまでにかかった時間。
+    ///
+    /// 応答を読んだら書き側を閉じ（サーバーは EOF を読んで接続を畳む）、読み側で EOF を待つ。
+    /// ソケットの EOF はサーバー側の fd（読み・書きの 2 本 = `try_clone`）が**両方**閉じた
+    /// ときにだけ届く。だから戻った時点で、この接続に由来する fd はクライアント側も含めて
+    /// 全部閉じている = 計測に sleep も「落ち着くまで待つ」も要らない。
+    /// `leak` は注入: 接続を閉じずに fd を捨てる（サーバー側も読み待ちのまま 2 本残る）
+    fn closed_roundtrip(
+        endpoint: &str,
+        leak: bool,
+        deadline: std::time::Instant,
+    ) -> std::time::Duration {
+        let pre = fd_count();
+        let stream = UnixStream::connect(endpoint).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let envelope = RequestEnvelope::new(1, TEST_TOKEN.to_string(), Request::List);
+        writeln!(writer, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(!line.is_empty(), "応答が返る前に接続が閉じた");
+        if leak {
+            std::mem::forget(reader);
+            std::mem::forget(writer);
+            return std::time::Duration::ZERO;
+        }
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        let started = std::time::Instant::now();
+        let left = deadline.saturating_duration_since(started);
+        let eof = if left.is_zero() {
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        } else {
+            reader.get_ref().set_read_timeout(Some(left)).unwrap();
+            reader.read_to_end(&mut Vec::new())
+        };
+        if let Err(e) = eof {
+            // 診断（判定はもう決まっている = 落ちる）。クライアント側の 2 本を開いたまま数え、
+            // そのあと少しだけ EOF を読み直す。数える前に自分の側を閉じると、そのあいだに
+            // サーバーが遅れて閉じた回を「別のプロセスが握っている」と取り違える
+            let now = fd_count();
+            let _ = reader
+                .get_ref()
+                .set_read_timeout(Some(std::time::Duration::from_millis(100)));
+            let late_eof = reader.read_to_end(&mut Vec::new()).is_ok();
+            let verdict = if now >= pre + 4 {
+                "サーバー側の 2 本がこの子プロセスに残っていた = 漏れ、またはサーバーの停止"
+            } else if late_eof {
+                "打ち切りの直後に EOF が届いた = サーバーが遅れて閉じた（停止）"
+            } else {
+                "この子プロセスではサーバー側が閉じているのに EOF が来ない = 別のプロセスが握っている"
+            };
+            panic!(
+                "サーバーが接続を閉じない（EOF 待ちの予算 {} 秒を使い切った）: {e}。\
+                 fd は接続の前 {pre} → 打ち切り時 {now}（クライアント側の 2 本を含む）。{verdict}",
+                FD_EOF_BUDGET.as_secs()
+            );
+        }
+        started.elapsed()
+    }
+
+    /// 子の計測結果
+    struct FdMeasure {
+        before: usize,
+        after: usize,
+        /// EOF が届くまでにいちばんかかった往復（診断用。判定には使わない）
+        slowest_eof: std::time::Duration,
+    }
+
+    /// 受け口とダミーのディスパッチャを立て、ウォームアップ 3 回のあと 10 回往復して
+    /// 前後の fd 数を返す。`leaks` 本目までは閉じずに捨てる（注入）
+    fn measure_roundtrip_fds(leaks: usize) -> FdMeasure {
+        let (tx, mut rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(Ok(json!({})));
+            }
+        });
+        let deadline = std::time::Instant::now() + FD_EOF_BUDGET;
+        let mut slowest_eof = std::time::Duration::ZERO;
+        // ウォームアップ（初回だけ確保される物を測定から外す）
+        for _ in 0..3 {
+            slowest_eof = slowest_eof.max(closed_roundtrip(server.endpoint(), false, deadline));
+        }
+        let before = fd_count();
+        for i in 0..FD_ROUNDTRIPS {
+            slowest_eof = slowest_eof.max(closed_roundtrip(server.endpoint(), i < leaks, deadline));
+        }
+        FdMeasure {
+            before,
+            after: fd_count(),
+            slowest_eof,
+        }
+    }
+
+    /// 注入の雑音: 別スレッドで `n` 本の fd を開き、返り値が drop されるまで開いたままにする。
+    /// 開き終わってから返す（計測のあいだ確実に開いている）
+    struct HeldFds(Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>);
+
+    impl Drop for HeldFds {
+        fn drop(&mut self) {
+            if let Some((stop, handle)) = self.0.take() {
+                drop(stop);
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn hold_fds_in_other_thread(n: usize) -> HeldFds {
+        if n == 0 {
+            return HeldFds(None);
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let files: Vec<_> = (0..n)
+                .map(|_| std::fs::File::open("/dev/null").expect("/dev/null を開ける"))
+                .collect();
+            let _ = ready_tx.send(());
+            // 送り手が drop されるまで抱える
+            let _ = stop_rx.recv();
+            drop(files);
+        });
+        ready_rx.recv().expect("雑音のスレッドが fd を開き終える");
+        HeldFds(Some((stop_tx, handle)))
+    }
+
+    /// 子が 1 バイトも出さずに失敗した回を起こし直す上限（初回を含む。#1832 と同じ扱い）
+    const SILENT_CHILD_ATTEMPTS: usize = 3;
+
+    /// このテストバイナリを子として起こし、[`FD_CHILD_TEST`] だけを走らせて
+    /// `(前の fd 数, 後の fd 数, EOF のいちばん遅い往復の ms)` を受け取る
+    fn measure_in_child_process() -> (usize, usize, usize) {
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["--exact", FD_CHILD_TEST, "--test-threads=1", "--nocapture"])
+            .env(FD_CHILD_ENV, "1")
+            // 雑音は親（= 並列のテストが同居するプロセス）に留める。漏れの注入はそのまま子へ継ぐ
+            .env_remove(INJECT_NOISE_ENV);
+        let mut statuses: Vec<String> = Vec::new();
+        let out = loop {
+            let out = cmd.output().expect("子テストプロセスを起こせる");
+            let reached = out.status.success() || !out.stdout.is_empty() || !out.stderr.is_empty();
+            if reached || statuses.len() + 1 >= SILENT_CHILD_ATTEMPTS {
+                break out;
+            }
+            statuses.push(out.status.to_string());
+        };
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "fd を数える子が失敗した（{}。起こし直した回: {statuses:?}）:\n{text}",
+            out.status
+        );
+        let field = |line: &str, key: &str| -> Option<usize> {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+        };
+        // 目印は行頭とは限らない（libtest の `test <名前> ... ` の後ろに改行なしで続く）
+        text.lines()
+            .filter_map(|line| line.split_once(FD_MARKER).map(|(_, rest)| rest))
+            .find_map(|rest| {
+                Some((
+                    field(rest, "before")?,
+                    field(rest, "after")?,
+                    field(rest, "slowest_eof_ms")?,
+                ))
+            })
+            .unwrap_or_else(|| {
+                panic!("子が計測まで届いていない（{FD_CHILD_TEST} の改名漏れ？）:\n{text}")
+            })
+    }
+
+    /// #2129: 計測の本体。親の [`連続接続でfdが漏れない`] から子プロセスとしてだけ走る
+    /// （普段のテスト実行では目印が無いので何もしない）
+    #[test]
+    fn 子プロセス_連続接続の前後でfdを数える() {
+        if std::env::var_os(FD_CHILD_ENV).is_none() {
+            return;
+        }
+        let m = measure_roundtrip_fds(env_count(INJECT_LEAK_ENV));
+        println!(
+            "{FD_MARKER} before={} after={} slowest_eof_ms={}",
+            m.before,
+            m.after,
+            m.slowest_eof.as_millis()
+        );
+    }
+
+    /// 連続接続で fd が漏れないこと。
+    ///
+    /// **計測は子プロセスで行う**（#2129）。数えているのはプロセス全体の fd（`/dev/fd` の
+    /// 件数）なので、テストプロセスの中で数えると並列で走る他のテストの fd の開閉を拾う
+    /// （#916 で 15 → 18 を最小値で見る形でしのぎ、#983 で 10 → 14 を許容 +6 でしのぎ、
+    /// #2129 で +7 を踏んだ）。子プロセスにはこの計測しか居ないので雑音が入らない。
+    /// 往復はサーバーが閉じたのを見届けてから戻る（[`closed_roundtrip`]）ので、前後の差は
+    /// **許容 0** で比べられる = 1 接続の取りこぼしでも落ちる（旧の許容 +6 は、サーバー側
+    /// 2 本ずつの漏れなら 3 接続ぶんまで吸収していた）。件数で見るので、ソケット以外の
+    /// 種類の fd（ファイル・パイプ）の漏れも取りこぼさない。
+    ///
+    /// 注入と A/B（既定では効かない）:
+    /// - `TAKO_2129_INJECT_FD_NOISE=<n>`: 計測のあいだテストプロセスの別スレッドが n 本の
+    ///   fd を開いたままにする（並列テストの再現）。修正後は通る / `TAKO_2129_LEGACY=1` は n ≥ 7 で落ちる
+    /// - `TAKO_2129_INJECT_LEAK=<k>`: 10 回の接続のうち k 本を閉じずに捨てる（本当の漏れ）。
+    ///   修正後は k ≥ 1 で落ちる / 旧は k = 1 を見逃す
     #[test]
     fn 連続接続でfdが漏れない() {
-        fn fd_count() -> usize {
-            std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+        let noise = env_count(INJECT_NOISE_ENV);
+        let leaks = env_count(INJECT_LEAK_ENV);
+        if std::env::var_os(LEGACY_ENV).is_some() {
+            legacy_fd_leak_check(noise, leaks);
+            return;
         }
-        fn one_roundtrip(endpoint: &str) {
+        let (before, after, slowest_eof_ms) = {
+            let _noise = hold_fds_in_other_thread(noise);
+            measure_in_child_process()
+        };
+        println!(
+            "#2129 子プロセスの fd: {before} → {after}（雑音の注入 {noise} 本・EOF の最遅 {slowest_eof_ms} ms）"
+        );
+        assert!(
+            after <= before,
+            "IPC 接続 {FD_ROUNDTRIPS} 回で fd が {before} → {after} に増えた（漏れ）"
+        );
+    }
+
+    /// A/B（`TAKO_2129_LEGACY=1`）: 修正前の計測そのもの。テストプロセスの中でプロセス全体の
+    /// fd を数え、往復の後 6 秒間の最小値を許容 +6 で見る。注入の口だけを足してある
+    /// （雑音は基準を取った直後に開き、判定が済むまで抱える）
+    fn legacy_fd_leak_check(noise: usize, leaks: usize) {
+        fn one_roundtrip(endpoint: &str, leak: bool) {
             let stream = UnixStream::connect(endpoint).unwrap();
             let mut writer = stream.try_clone().unwrap();
             let envelope = RequestEnvelope::new(1, TEST_TOKEN.to_string(), Request::List);
             writeln!(writer, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
             let mut line = String::new();
-            BufReader::new(stream).read_line(&mut line).unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.read_line(&mut line).unwrap();
+            if leak {
+                std::mem::forget(reader);
+                std::mem::forget(writer);
+            }
         }
 
         let (tx, mut rx) = unbounded::<IncomingRequest>();
@@ -805,28 +1081,15 @@ mod tests {
                 let _ = incoming.reply.send(Ok(json!({})));
             }
         });
-        // ウォームアップ（スレッドスタック等の初期確保を測定から外す）
         for _ in 0..3 {
-            one_roundtrip(server.endpoint());
+            one_roundtrip(server.endpoint(), false);
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
         let before = fd_count();
-        for _ in 0..10 {
-            one_roundtrip(server.endpoint());
+        let _noise = hold_fds_in_other_thread(noise);
+        for i in 0..FD_ROUNDTRIPS {
+            one_roundtrip(server.endpoint(), i < leaks);
         }
-        // 接続スレッドの終了（fd クローズ）を待つ。fd 数はプロセス全体の共有状態で、
-        // 並列実行中の他テストが一時的に開く fd でも揺れるため、落ち着くまでリトライで
-        // 待つ（真のリークなら fd は開いたままなので待っても失敗が保たれる）
-        // 判定は**観測期間の最小値**で行う。fd 数はプロセス全体の共有量なので、
-        // 並列実行中の他テストが一時的に開いた fd が「増えた」に見える
-        // （#916 でファイルを触るテストが増えたあと CI で 15 → 18 の偽陽性が出た）。
-        // 真のリークなら fd は開いたままなので最小値も下がらず、検出力は落ちない。
-        //
-        // 許容差を 2 → 6 へ広げた（#983）。設定ファイルを触るテストがさらに増え、
-        // **このテスト単体では緑・スイート全体では 3/3 で 10 → 14** という形で偽陽性が出た
-        // （#983 のテストだけを一緒に走らせると緑 = リークではなく他テストの同時保持）。
-        // 検出力は落ちない: このテストは 10 回接続するので、1 接続でも取りこぼせば
-        // 最小値は +10 側へ動き、+6 では吸収できない
         const FD_NOISE_TOLERANCE: usize = 6;
         let mut lowest = usize::MAX;
         for _ in 0..30 {
