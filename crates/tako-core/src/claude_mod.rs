@@ -30,6 +30,12 @@
 //!   叩く CLI の引数・帯のホットキー）を載せ、mod が会話の行（`tako_show_command` の行）と帯の 1 行に描く。
 //!   mod が帯に描いたカードの id は報告の `renders.cards` で返り、GPUI のカード帯はそのカードを出さない
 //!   （[`card_owner`]。store には残る = スマホ・CLI は今と同じ）
+//! - **チャット風の描画（S7-6 #1964）**: 応答の `view.chat`（[`chat_view`]）で、吹き出し・コードのコピー・
+//!   ツールの要約のどれを描くかを tako が決める（ui.json の `chat` × 表示モード。ターミナル表示では既定で
+//!   コードのコピーだけ）。mod は描いている組を報告の `renders.chat` で返し、GUI モードでそのペインの
+//!   チャットを mod が持つと決まれば（[`chat_owner`]）GPUI のチャットビューの代わりにターミナル表示
+//!   （= mod の描いた本物の Claude Code）を出す。`chat.place = auto` の GUI モードでの持ち主は
+//!   **判断点**（#1964 の受け入れ 4）が決まるまで tako（[`AUTO_CHAT_OWNER_GUI`]）
 //!
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
@@ -95,6 +101,9 @@ pub const S7_LEGACY_ENV: &str = "TAKO_1877_S7_LEGACY";
 /// コマンドカードを mod で描く前（S7-4 #1963）へ戻す A/B の入口。応答の `view` に `cards` を載せない
 /// （mod はカードを描かない）・GPUI のカード帯は mod の報告を見ずに今のまま出す
 pub const CARDS_LEGACY_ENV: &str = "TAKO_1963_LEGACY";
+/// チャット風の描画を mod でする前（S7-6 #1964）へ戻す A/B の入口。応答の `view` に `chat` を載せない
+/// （mod はチャットを描かない）・GUI モードのチャット表示は mod の報告を見ずに GPUI のチャットビューのまま
+pub const CHAT_LEGACY_ENV: &str = "TAKO_1964_LEGACY";
 
 /// env の一覧の区切り（PATH と同じ。macOS / Linux は `:`、Windows は `;`）
 pub const LIST_SEP: char = if cfg!(windows) { ';' } else { ':' };
@@ -445,6 +454,11 @@ pub fn cards_legacy() -> bool {
     std::env::var_os(CARDS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
+/// S7-6 の A/B（[`CHAT_LEGACY_ENV`]）が立っているか
+pub fn chat_legacy() -> bool {
+    std::env::var_os(CHAT_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
 /// #1903 の A/B（[`LIMITS_LEGACY_ENV`]）が立っているか
 pub fn limits_legacy() -> bool {
     std::env::var_os(LIMITS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
@@ -662,6 +676,29 @@ pub struct ModRenders {
     /// GPUI のカード帯はここに載った id を出さない（[`card_owner`]）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cards: Option<Vec<u64>>,
+    /// チャット風の描画で今あてている組（S7-6 #1964。応答の `view.chat` をそのまま受けて描いている）。
+    /// 無い = チャットを描かない mod（S7-6 前・応答に `view.chat` が無かった）。GUI モードで
+    /// チャットを mod に持たせる条件（[`chat_owner`]）はこれがあること
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ModChatRenders>,
+}
+
+/// チャット風の描画で mod が今あてている組（S7-6 #1964。報告の `renders.chat`）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModChatRenders {
+    /// 利用者の発話を吹き出しに描く
+    #[serde(default)]
+    pub bubble: bool,
+    /// AI の返答のコードブロックの下にコピーのボタンを描く
+    #[serde(default)]
+    pub code_copy: bool,
+    /// ツールの呼び出しを 1 行の要約に描く
+    #[serde(default)]
+    pub tool_summary: bool,
+    /// 会話の行が足されるたびにすぐ報告している（応答の `view.chat.notify` を受けた。GPUI のチャットは
+    /// これが真の報告の `chat_seq` だけを読み直しの合図にする = [`chat_reread`]）
+    #[serde(default)]
+    pub notify: bool,
 }
 
 /// ボタンを押した結果（S7-3 #1962。報告の `last_press`）。**語彙の種類と成否だけ**を載せる
@@ -731,6 +768,12 @@ pub struct ModReport {
     /// 最後に押されたボタン（S7-3 #1962）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_press: Option<ModPress>,
+    /// 会話の行が足された回数（S7-6 #1964。mod が起きてからの `session.append` のうち本筋の会話 =
+    /// サブエージェントでない user / assistant の行。**数だけ**で本文・uuid は載せない）。GPUI のチャットは
+    /// これが変わったときだけ transcript を読み直す（[`chat_reread`]。`renders.chat.notify` が真のときだけ）。
+    /// S7-6 前の mod は送らない
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_seq: Option<u64>,
     #[serde(default)]
     pub ended: bool,
 }
@@ -1183,6 +1226,8 @@ pub struct ModHub {
     /// ui.json の `cards.place`（S7-4 #1963）。報告の応答を組むたびに ui.json から写す
     /// （GPUI の描画のたびにファイルを読まない。`tako mod ui` の変更は次の報告 = 最大 15 秒で効く）
     pub cards_place: crate::claude_mod_ui::Place,
+    /// ui.json の `chat.place`（S7-6 #1964。[`Self::cards_place`] と同じく報告のたびに写す）
+    pub chat_place: crate::claude_mod_ui::Place,
 }
 
 /// [`ModHub::accept`] の結果
@@ -1595,6 +1640,10 @@ pub struct BandView {
     /// （ui.json の `cards.place` が `tako`・A/B の `TAKO_1963_LEGACY` / `TAKO_1877_S7_LEGACY`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cards: Option<CardsView>,
+    /// チャット風の描画（S7-6 #1964。[`chat_view`]）。無い = mod はチャットを描かない（ui.json の
+    /// `chat.place` が `tako`・A/B の `TAKO_1964_LEGACY` / `TAKO_1877_S7_LEGACY`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatView>,
 }
 
 /// [`band_view`] の入力
@@ -1625,6 +1674,10 @@ pub struct BandInput {
     pub cards: Vec<crate::CommandCard>,
     /// A/B の `TAKO_1963_LEGACY`（[`cards_legacy`]）
     pub cards_legacy: bool,
+    /// tako の表示モードが GUI ライク表示か（`ui_mode = gui`。S7-6 #1964）
+    pub ui_mode_gui: bool,
+    /// A/B の `TAKO_1964_LEGACY`（[`chat_legacy`]）
+    pub chat_legacy: bool,
 }
 
 impl Default for BandThresholds {
@@ -1679,6 +1732,11 @@ pub fn band_view(input: BandInput) -> BandView {
         &input.ui,
         input.s7_legacy || input.cards_legacy,
     );
+    let chat = chat_view(
+        &input.ui,
+        input.ui_mode_gui,
+        input.s7_legacy || input.chat_legacy,
+    );
     // バーを描くなら帯の ctx / 使用制限の警告は出さない（同じ値を 2 か所で動かさない。§9.3）
     let warnings = if usage_bar.as_ref().is_some_and(|b| b.draw) {
         Vec::new()
@@ -1711,6 +1769,7 @@ pub fn band_view(input: BandInput) -> BandView {
         button_args,
         band_style,
         cards,
+        chat,
     }
 }
 
@@ -2125,6 +2184,258 @@ pub fn card_owner(input: CardOwnerInput<'_>) -> CardOwner {
         return CardOwner::Mod("pending");
     }
     CardOwner::Tako("mod_not_drawn")
+}
+
+// --- S7-6（#1964）: チャット風の描画を mod で描く ------------------------------------------
+//
+// 吹き出し（利用者の発話）・コードのコピー（AI の返答のコードブロックの下のボタン）・ツールの要約（ツールの
+// 呼び出しを 1 行に）を mod が Claude Code の会話の行に描く。どれを描くかは tako が ui.json の `chat` と表示
+// モードから決めて応答の `view.chat` に載せ（[`chat_view`]）、mod は今あてている組を報告の `renders.chat` で
+// 返す。GUI モードでそのペインのチャットを mod が持つなら（[`chat_owner`]）、GPUI のチャットビューの代わりに
+// ターミナル表示を出す（mod の描画は本物の Claude Code の画面そのもの = 入力欄のミラーも画面の推測も要らない）
+
+/// `chat.place = auto` の GUI モードでチャットを持つのは誰か（S7-6 #1964 の**判断点** = 受け入れ 4）。
+///
+/// 判断が出るまでは今の GPUI のチャットビュー（tako）のまま。mod の描画は `tako mod ui set chat.place mod`
+/// で選べる。判断が出たらこの 1 行を変える（ui.json の値は `auto` のままなので書き換え・移行は要らない）
+pub const AUTO_CHAT_OWNER_GUI: crate::claude_mod_ui::Place = crate::claude_mod_ui::Place::Tako;
+
+/// 応答の `view.chat`（mod の契約は `types/index.d.ts` の `TakoChat`）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChatView {
+    /// どの組か: `gui` = GUI モードで mod がチャットを持つ（ui.json の `gui_only` も描く）/
+    /// `terminal` = ターミナル表示の利用者・GPUI のチャットの裏（`always` だけ描く）/
+    /// `off` = ui.json の `chat.place = tako`（何も描かない = S7-6 前の見た目。通知だけは受ける）
+    pub mode: &'static str,
+    /// 利用者の発話を吹き出しに描く
+    pub bubble: bool,
+    /// AI の返答のコードブロックの下にコピーのボタン（と帯の「最新のコードをコピー」）を描く
+    pub code_copy: bool,
+    /// ツールの呼び出しを 1 行の要約に描く
+    pub tool_summary: bool,
+    /// 帯の「最新のコードをコピー」のホットキー（[`chat_hotkey`]）
+    pub hotkey: String,
+    /// 会話の行が足されたらすぐ報告してほしいか（GUI モードで GPUI のチャットが表に出ているペイン =
+    /// transcript を通知で読み直す。#1883 の置き換え）。偽なら `chat_seq` は他の報告に相乗りするだけ
+    /// （ターミナル表示・mod がチャットを持つペインで報告を増やさない）
+    pub notify: bool,
+}
+
+/// `chat.place` を表示モードの中で解く（`auto` は GUI モードで [`AUTO_CHAT_OWNER_GUI`]）
+pub fn resolve_chat_place(place: crate::claude_mod_ui::Place) -> crate::claude_mod_ui::Place {
+    use crate::claude_mod_ui::Place;
+    match place {
+        Place::Auto => AUTO_CHAT_OWNER_GUI,
+        other => other,
+    }
+}
+
+/// 帯の「最新のコードをコピー」のホットキーを選ぶ（純関数）。ui.json のボタンとカードのボタン
+/// （[`card_hotkeys`]）と重ならない英小文字。数字は使わない（空の入力欄で打った数字が帯のボタンを押す
+/// エンジンの仕様 = カードと同じ理由）。好みは o（copy の 2 字目）→ k → g、埋まっていれば a〜z の空き
+pub fn chat_hotkey(buttons: &[crate::claude_mod_ui::Button]) -> String {
+    let cards = card_hotkeys(buttons);
+    let mut taken: BTreeSet<char> = buttons
+        .iter()
+        .filter_map(|b| {
+            let mut chars = b.hotkey.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        })
+        .collect();
+    for key in [&cards.copy, &cards.run, &cards.next, &cards.dismiss] {
+        taken.extend(key.chars());
+    }
+    ['o', 'k', 'g']
+        .into_iter()
+        .chain('a'..='z')
+        .find(|c| !taken.contains(c))
+        .unwrap_or('z')
+        .to_string()
+}
+
+/// 応答の `view.chat` を組む（純関数）。`legacy` は A/B（[`chat_legacy`] か [`s7_legacy`]）。
+///
+/// - A/B → 載せない = mod はチャットを描かず、通知もしない（S7-6 前）
+/// - `chat.place = tako` → `off` の組（何も描かない = S7-6 前の見た目。GPUI のチャットのための通知だけ）
+/// - GUI モードでチャットを mod が持つ（`mod`。`auto` は [`AUTO_CHAT_OWNER_GUI`]）→ `gui` の組:
+///   `bubble` / `tool_summary` は `off` 以外で描く・`code_copy` は ui.json のまま
+/// - それ以外（ターミナル表示・GUI モードでも GPUI のチャットが表に出る）→ `terminal` の組:
+///   `bubble` / `tool_summary` は `always` のときだけ（**ターミナル表示の利用者の見た目を勝手に変えない**。
+///   既定では `code_copy` だけ）
+pub fn chat_view(
+    ui: &crate::claude_mod_ui::UiConfig,
+    ui_mode_gui: bool,
+    legacy: bool,
+) -> Option<ChatView> {
+    use crate::claude_mod_ui::{ChatShow, Place};
+    if legacy {
+        return None;
+    }
+    let off = ui.chat.place == Place::Tako;
+    let gui = ui_mode_gui && resolve_chat_place(ui.chat.place) == Place::Mod;
+    let show = |s: ChatShow| match s {
+        _ if off => false,
+        ChatShow::Always => true,
+        ChatShow::GuiOnly => gui,
+        ChatShow::Off => false,
+    };
+    Some(ChatView {
+        mode: if off {
+            "off"
+        } else if gui {
+            "gui"
+        } else {
+            "terminal"
+        },
+        bubble: show(ui.chat.bubble),
+        code_copy: !off && ui.chat.code_copy,
+        tool_summary: show(ui.chat.tool_summary),
+        hotkey: chat_hotkey(&ui.buttons),
+        // GPUI のチャットが表に出るのは GUI モードで mod がチャットを持たないとき
+        notify: ui_mode_gui && !gui,
+    })
+}
+
+/// GUI モードでそのペインのチャットを誰が出すか（§9.6。**判断はこの 1 本**）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatOwner {
+    /// GPUI のチャットビューが今のまま出す（理由のコード）
+    Tako(&'static str),
+    /// mod が Claude Code の会話の行に描く = GPUI はそのペインをターミナル表示にする（理由のコード）
+    Mod(&'static str),
+}
+
+impl ChatOwner {
+    /// GPUI のチャットビューを引っ込めるか
+    pub fn yields(self) -> bool {
+        matches!(self, Self::Mod(_))
+    }
+
+    /// `drawn_by` の語（`mod` / `tako`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tako(_) => "tako",
+            Self::Mod(_) => "mod",
+        }
+    }
+
+    /// 理由のコード
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Tako(r) | Self::Mod(r) => r,
+        }
+    }
+}
+
+/// [`chat_owner`] の入力
+#[derive(Debug, Clone, Copy)]
+pub struct ChatOwnerInput<'a> {
+    /// ui.json の `chat.place`（[`ModHub::chat_place`]）
+    pub place: crate::claude_mod_ui::Place,
+    /// tako の表示モードが GUI ライク表示か
+    pub ui_mode_gui: bool,
+    /// そのペインの**新鮮な**報告（45 秒以内。無い = mod なし・古い・終わった・休眠）
+    pub stored: Option<&'a StoredReport>,
+    /// A/B（[`chat_legacy`] か [`s7_legacy`]）
+    pub legacy: bool,
+}
+
+/// GUI モードで GPUI のチャットビューを引っ込め、ターミナル表示（mod の描画）にするか
+/// （§9.6「新鮮な報告 ∧ `renders.chat` ∧ 置き場が mod」）。
+///
+/// - A/B・ターミナル表示・`chat.place = tako`・`auto`（判断点が決まるまで = [`AUTO_CHAT_OWNER_GUI`]）→ `Tako`
+/// - 新鮮な報告が無い（mod なし・止まった・45 秒途切れた・claude が終わった = 最後の報告で即座に消える・休眠）・
+///   チャットを描かない mod（`renders.chat` が無い = S7-6 前）→ `Tako`（今の GPUI のチャット）
+/// - それ以外 → `Mod("drawn")`。mod があてている組が `terminal` のまま（表示モードを変えた直後 = 次の報告の
+///   応答まで最大 15 秒）でもターミナル表示にする（GPUI のチャット → 本物の画面 → 吹き出しが出る、の順で
+///   切り替わる。表示が 2 回入れ替わるより、本物の画面へ 1 回で移る方を採る）
+pub fn chat_owner(input: ChatOwnerInput<'_>) -> ChatOwner {
+    use crate::claude_mod_ui::Place;
+    if input.legacy {
+        return ChatOwner::Tako("legacy_env");
+    }
+    if !input.ui_mode_gui {
+        return ChatOwner::Tako("mode_terminal");
+    }
+    match input.place {
+        Place::Tako => return ChatOwner::Tako("place_tako"),
+        Place::Auto if resolve_chat_place(Place::Auto) == Place::Tako => {
+            return ChatOwner::Tako("place_auto")
+        }
+        _ => {}
+    }
+    let Some(stored) = input.stored else {
+        return ChatOwner::Tako("no_fresh_report");
+    };
+    if stored
+        .report
+        .renders
+        .as_ref()
+        .and_then(|r| r.chat)
+        .is_none()
+    {
+        return ChatOwner::Tako("mod_not_drawing_chat");
+    }
+    ChatOwner::Mod("drawn")
+}
+
+/// GPUI のチャットが transcript を読み直すかの合図（S7-6 #1964 のフォールバック側 = #1883 の置き換え）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatReread {
+    /// mod の報告の `chat_seq` が前回読んだときから変わった（= 会話の行が足された）→ 読み直す
+    Changed(u64),
+    /// 変わっていない → 読み直さない（ファイルの stat もしない = transcript をポーリングしない）
+    Same(u64),
+    /// 新しい報告に `chat_seq` が無い（mod なし・古い・S7-6 前の mod・A/B）→ 今までどおり mtime とサイズで見る
+    Stamp,
+}
+
+impl ChatReread {
+    /// 今回控える `chat_seq`（次の判断の `prev_seq`）
+    pub fn seq(self) -> Option<u64> {
+        match self {
+            Self::Changed(seq) | Self::Same(seq) => Some(seq),
+            Self::Stamp => None,
+        }
+    }
+}
+
+/// transcript を読み直すかを決める（純関数）。新しい報告（[`MONITOR_SKIP_FOR`] = 20 秒以内）の `chat_seq`
+/// だけを合図にする: `renders.chat.notify` が真の mod は本筋の会話の行が足されるたびに dirty を立てて
+/// 1 秒以内に報告するので、通知から 1 tick（2 秒）以内に読み直せる。報告が途切れかけた（20 秒）・通知して
+/// いない mod（表示モードを変えた直後 = 次の応答まで・`chat_seq` を送らない S7-6 前の mod）・報告なし・A/B は
+/// `Stamp`（今の経路）へ落とす。前回が mtime の判断だった（`prev_seq` が無い）なら `Changed` = 読む
+pub fn chat_reread(
+    looked_up: &Result<&StoredReport, ModUnavailable>,
+    now: Instant,
+    prev_seq: Option<u64>,
+    legacy: bool,
+) -> ChatReread {
+    if legacy {
+        return ChatReread::Stamp;
+    }
+    let Ok(stored) = looked_up else {
+        return ChatReread::Stamp;
+    };
+    if now.saturating_duration_since(stored.received) > MONITOR_SKIP_FOR {
+        return ChatReread::Stamp;
+    }
+    let notifying = stored
+        .report
+        .renders
+        .as_ref()
+        .and_then(|r| r.chat)
+        .is_some_and(|c| c.notify);
+    let Some(seq) = stored.report.chat_seq.filter(|_| notifying) else {
+        return ChatReread::Stamp;
+    };
+    match prev_seq {
+        Some(prev) if prev == seq => ChatReread::Same(seq),
+        _ => ChatReread::Changed(seq),
+    }
 }
 
 #[cfg(test)]
@@ -3796,5 +4107,271 @@ mod tests {
             None,
             "A/B（TAKO_2041_LEGACY）は追従しない = 修正前"
         );
+    }
+
+    // --- S7-6（#1964）-----------------------------------------------------------------
+
+    /// renders.chat / chat_seq を持つ報告（`chat` が None ならチャットを描かない mod）
+    fn chat_report(chat: Option<(bool, bool, bool)>, seq: Option<u64>) -> ModReport {
+        chat_report_notify(chat, seq, true)
+    }
+
+    fn chat_report_notify(
+        chat: Option<(bool, bool, bool)>,
+        seq: Option<u64>,
+        notify: bool,
+    ) -> ModReport {
+        let mut v = report_json();
+        v["renders"] = serde_json::json!({
+            "band": true, "buttons": 1, "band_hook": true, "hint_hook": true,
+        });
+        if let Some((bubble, code_copy, tool_summary)) = chat {
+            v["renders"]["chat"] = serde_json::json!({
+                "bubble": bubble, "code_copy": code_copy, "tool_summary": tool_summary, "notify": notify,
+            });
+        }
+        if let Some(seq) = seq {
+            v["chat_seq"] = serde_json::json!(seq);
+        }
+        parse_report(v).unwrap()
+    }
+
+    /// #1964: renders.chat と chat_seq は後方互換で読める（無い = チャットを描かない mod / 数えない mod）
+    #[test]
+    fn issue1964_報告のrenders_chatとchat_seqは後方互換で読める() {
+        let r = chat_report(Some((true, true, false)), Some(7));
+        assert_eq!(
+            r.renders.as_ref().unwrap().chat,
+            Some(ModChatRenders {
+                bubble: true,
+                code_copy: true,
+                tool_summary: false,
+                notify: true,
+            })
+        );
+        assert_eq!(r.chat_seq, Some(7));
+        let old = parse_report(report_json()).unwrap();
+        assert_eq!(old.chat_seq, None);
+        assert_eq!(old.renders.as_ref().and_then(|r| r.chat), None);
+        // 本文の欄を持たない（数と真偽だけ）
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["renders"]["chat"],
+            serde_json::json!({"bubble": true, "code_copy": true, "tool_summary": false, "notify": true})
+        );
+    }
+
+    /// #1964: view.chat は ui.json の chat × 表示モードで決まる。ターミナル表示の既定はコードのコピーだけ・
+    /// GUI モードでも `auto` は判断点が決まるまで GPUI のチャットの裏 = terminal の組
+    #[test]
+    fn issue1964_view_chatは置き場と表示モードで組が決まる() {
+        use crate::claude_mod_ui::{ChatShow, Place, UiConfig};
+        let ui = UiConfig::default();
+        assert_eq!(ui.chat.place, Place::Auto, "既定の置き場");
+        // ターミナル表示: 既定はコードのコピーだけ（受け入れ 3 = 吹き出しを出さない）・通知しない
+        let v = chat_view(&ui, false, false).unwrap();
+        assert_eq!(
+            (v.mode, v.bubble, v.code_copy, v.tool_summary, v.notify),
+            ("terminal", false, true, false, false)
+        );
+        // GUI モード + auto（判断点が決まるまで GPUI のチャット = mod は terminal の組 + 通知）
+        assert_eq!(AUTO_CHAT_OWNER_GUI, Place::Tako);
+        let v = chat_view(&ui, true, false).unwrap();
+        assert_eq!(
+            (v.mode, v.bubble, v.tool_summary, v.notify),
+            ("terminal", false, false, true)
+        );
+        // GUI モード + mod: gui_only も描く・GPUI のチャットは裏なので通知しない
+        let mut on = ui.clone();
+        on.chat.place = Place::Mod;
+        let v = chat_view(&on, true, false).unwrap();
+        assert_eq!(
+            (v.mode, v.bubble, v.code_copy, v.tool_summary, v.notify),
+            ("gui", true, true, true, false)
+        );
+        // mod でもターミナル表示なら gui_only は描かない
+        let v = chat_view(&on, false, false).unwrap();
+        assert_eq!(
+            (v.mode, v.bubble, v.tool_summary),
+            ("terminal", false, false)
+        );
+        // always はターミナル表示でも描く・off は GUI でも描かない
+        let mut mixed = on.clone();
+        mixed.chat.bubble = ChatShow::Always;
+        mixed.chat.tool_summary = ChatShow::Off;
+        mixed.chat.code_copy = false;
+        let v = chat_view(&mixed, false, false).unwrap();
+        assert_eq!(
+            (v.bubble, v.code_copy, v.tool_summary),
+            (true, false, false)
+        );
+        let v = chat_view(&mixed, true, false).unwrap();
+        assert_eq!(
+            (v.bubble, v.code_copy, v.tool_summary),
+            (true, false, false)
+        );
+        // place tako = 何も描かない（S7-6 前の見た目）。GUI モードなら GPUI のチャットのために通知だけ
+        let mut off = ui.clone();
+        off.chat.place = Place::Tako;
+        off.chat.bubble = ChatShow::Always;
+        let v = chat_view(&off, true, false).unwrap();
+        assert_eq!(
+            (v.mode, v.bubble, v.code_copy, v.tool_summary, v.notify),
+            ("off", false, false, false, true)
+        );
+        assert!(!chat_view(&off, false, false).unwrap().notify);
+        // A/B は載せない（描かない・通知もしない）
+        assert_eq!(chat_view(&on, true, true), None);
+        // band_view は表示モードと A/B（S7 / #1964）を通す
+        let base = |ui: UiConfig, gui: bool, chat_legacy: bool, s7_legacy: bool| BandInput {
+            pane: 7,
+            lang: "ja",
+            ui,
+            ui_mode_gui: gui,
+            chat_legacy,
+            s7_legacy,
+            ..BandInput::default()
+        };
+        assert_eq!(
+            band_view(base(on.clone(), true, false, false))
+                .chat
+                .map(|c| c.mode),
+            Some("gui")
+        );
+        assert_eq!(band_view(base(on.clone(), true, true, false)).chat, None);
+        assert_eq!(band_view(base(on.clone(), true, false, true)).chat, None);
+        let v = serde_json::to_value(band_view(base(ui, false, false, false))).unwrap();
+        assert_eq!(v["chat"]["mode"], "terminal");
+        assert_eq!(v["chat"]["hotkey"], "o");
+    }
+
+    /// #1964: 帯の「最新のコードをコピー」のホットキーはボタンとカードのホットキーに重ならない英小文字
+    #[test]
+    fn issue1964_コードのコピーのホットキーはボタンとカードに重ならない() {
+        use crate::claude_mod_ui::{Button, ButtonAction, SlashCommand};
+        let b = |hotkey: &str| Button {
+            id: format!("b-{hotkey}"),
+            label: "x".into(),
+            hotkey: hotkey.into(),
+            action: ButtonAction::Slash {
+                command: SlashCommand::Compact,
+            },
+        };
+        assert_eq!(chat_hotkey(&[]), "o");
+        // y を取られるとカードの copy が o へ移る = コードは k
+        assert_eq!(card_hotkeys(&[b("y")]).copy, "o");
+        assert_eq!(chat_hotkey(&[b("y")]), "k");
+        assert_eq!(chat_hotkey(&[b("o"), b("k"), b("g")]), "a");
+        let key = chat_hotkey(&[b("c")]);
+        let cards = card_hotkeys(&[b("c")]);
+        for taken in ["c", &cards.copy, &cards.run, &cards.next, &cards.dismiss] {
+            assert_ne!(key, taken);
+        }
+        assert!(
+            key.chars().all(|c| c.is_ascii_lowercase()),
+            "数字は使わない"
+        );
+    }
+
+    /// #1964: GUI モードで GPUI のチャットを引っ込めるのは「GUI ∧ 置き場が mod ∧ 新鮮な報告 ∧ renders.chat」だけ
+    #[test]
+    fn issue1964_チャットの持ち主は表示モードと置き場と報告で決まる() {
+        use crate::claude_mod_ui::Place;
+        let now = Instant::now();
+        let drawing = stored(chat_report(Some((true, true, true)), Some(3)), now, None);
+        let old_mod = stored(chat_report(None, None), now, None);
+        let input = |place, gui, stored, legacy| ChatOwnerInput {
+            place,
+            ui_mode_gui: gui,
+            stored,
+            legacy,
+        };
+        assert_eq!(
+            chat_owner(input(Place::Mod, true, Some(&drawing), false)),
+            ChatOwner::Mod("drawn")
+        );
+        assert!(chat_owner(input(Place::Mod, true, Some(&drawing), false)).yields());
+        // 判断点が決まるまで auto は GPUI のチャットのまま
+        assert_eq!(
+            chat_owner(input(Place::Auto, true, Some(&drawing), false)),
+            ChatOwner::Tako("place_auto")
+        );
+        assert_eq!(
+            chat_owner(input(Place::Tako, true, Some(&drawing), false)),
+            ChatOwner::Tako("place_tako")
+        );
+        assert_eq!(
+            chat_owner(input(Place::Mod, false, Some(&drawing), false)),
+            ChatOwner::Tako("mode_terminal")
+        );
+        assert_eq!(
+            chat_owner(input(Place::Mod, true, Some(&drawing), true)),
+            ChatOwner::Tako("legacy_env")
+        );
+        // mod が止まった・古い・終わった（新鮮な報告が無い）= GPUI のチャットへ戻る（受け入れ 2）
+        assert_eq!(
+            chat_owner(input(Place::Mod, true, None, false)),
+            ChatOwner::Tako("no_fresh_report")
+        );
+        // チャットを描かない mod（S7-6 前）
+        assert_eq!(
+            chat_owner(input(Place::Mod, true, Some(&old_mod), false)),
+            ChatOwner::Tako("mod_not_drawing_chat")
+        );
+        assert_eq!(ChatOwner::Mod("drawn").as_str(), "mod");
+        assert_eq!(ChatOwner::Tako("x").reason(), "x");
+    }
+
+    /// #1964 のフォールバック側（#1883 の置き換え）: 新しい報告の chat_seq が変わったときだけ読み直す。
+    /// 数えない mod・報告が途切れかけ・報告なし・A/B は mtime の判断へ落ちる
+    #[test]
+    fn issue1964_transcriptの読み直しはchat_seqの変化で決まる() {
+        let now = Instant::now();
+        let s = stored(chat_report(Some((false, true, false)), Some(5)), now, None);
+        assert_eq!(
+            chat_reread(&Ok(&s), now, Some(4), false),
+            ChatReread::Changed(5)
+        );
+        assert_eq!(
+            chat_reread(&Ok(&s), now, Some(5), false),
+            ChatReread::Same(5)
+        );
+        assert_eq!(
+            chat_reread(&Ok(&s), now, None, false),
+            ChatReread::Changed(5),
+            "前回が mtime の判断だった（mod が来た直後）は読む"
+        );
+        assert_eq!(chat_reread(&Ok(&s), now, Some(5), true), ChatReread::Stamp);
+        assert_eq!(
+            chat_reread(
+                &Ok(&s),
+                now + MONITOR_SKIP_FOR + Duration::from_millis(1),
+                Some(5),
+                false
+            ),
+            ChatReread::Stamp,
+            "heartbeat が途絶えかけた報告を合図にしない"
+        );
+        let no_seq = stored(chat_report(None, None), now, None);
+        assert_eq!(
+            chat_reread(&Ok(&no_seq), now, Some(5), false),
+            ChatReread::Stamp
+        );
+        // 数えていても通知していない（ターミナル表示の応答を受けたまま = 表示モードを変えた直後）は合図にしない
+        let quiet_mod = stored(
+            chat_report_notify(Some((false, true, false)), Some(5), false),
+            now,
+            None,
+        );
+        assert_eq!(
+            chat_reread(&Ok(&quiet_mod), now, Some(4), false),
+            ChatReread::Stamp
+        );
+        assert_eq!(
+            chat_reread(&Err(ModUnavailable::Absent), now, Some(5), false),
+            ChatReread::Stamp
+        );
+        assert_eq!(ChatReread::Same(5).seq(), Some(5));
+        assert_eq!(ChatReread::Stamp.seq(), None);
     }
 }

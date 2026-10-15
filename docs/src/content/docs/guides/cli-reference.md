@@ -1184,6 +1184,8 @@ tako ui-mode restore --pane 3    # 戻した指定を解除する
 
 応答の `pane_display` が、いま各ペインに出ているもの（`terminal` / `starter` / `chat` / `preparing`）を返します。AI はこれを見てから案内できます。
 
+tako mod がチャット風の描画を受け持つペイン（`tako mod ui set chat.place mod`）は `terminal` になり、`pane_display_reason` の `reason` が `mod_chat` です（Claude Code の画面そのものを出しています）。
+
 :::note[表示レイヤだけの切替です]
 モードを変えても PTY・tmux セッション・実行中のプロセスには影響しません。`release` / `restore` は永続化されないので、再起動すると全ペインがモードどおりの表示に戻ります。
 :::

@@ -835,7 +835,8 @@ tako | <ペイン名> | タブ <タブ名>                                      
   加えて、カードを描ける mod が居るペインの**まだ拾われていない新しいカード**は 5 秒まで外したまま（§9.10）
 - 使用量のバー: **フォーカス中のペイン**の claude の mod の新鮮な報告に `renders.usage_bar` があれば、ステータス
   バーの claude の 5h / 7d / ctx のメーターを出さない（サービスの選択チップは残す = codex へ切り替えられる。FR-2.42.38）
-- チャット: GUI モードで `renders.chat` のペインは GPUI のチャットビューの代わりにターミナル表示
+- チャット: GUI モードで `renders.chat` のペインは GPUI のチャットビューの代わりにターミナル表示（#1964 で入れた形は §9.11。
+  `chat.place = auto` の GUI モードは判断点が決まるまで GPUI のチャットのまま）
 
 ### 9.7 定型の UI 設定（`ui.json`）
 
@@ -883,7 +884,7 @@ tako | <ペイン名> | タブ <タブ名>                                      
 #1961 [判断点] tako がクリックを TUI へ渡す                              （依存なし）
 #1962 S7-3 帯を next で包む 1 行に + カスタムボタン + バー               ← #1960 ✅ 済（PR #1987）
 #1963 S7-4 コマンドカードを mod で描く                                   ← #1958 #1960 #1962 ✅ 済（PR #2004）
-#1964 S7-6 チャット風の描画と GUI モードの切り替え（#1883 の置き換え）   ← #1960 #1963 #1961
+#1964 S7-6 チャット風の描画と GUI モードの切り替え（#1883 の置き換え）   ← #1960 #1963 #1961 （PR。既定は判断点 = §9.11）
 #1965 S7-7 この PC の claude へ setup で入れて実機で効く（最後）         ← #1959 #1960 #1962 #1963
 ```
 
@@ -938,3 +939,33 @@ tako | <ペイン名> | タブ <タブ名>                                      
   隔離 tmux（`set-clipboard off`・クライアントなし）の claude で押す
 - 実測（2.1.294・偽 Messages API・隔離 GUI の 201 桁 × 44 行のペイン。`scripts/test-mod-command-cards-1963.sh`）は
   `.agent/requirements.md` の FR-2.42.41〜45 と #1963 の PR に置く
+
+### 9.11 S7-6（#1964）で決めたこと・実測
+
+- **描くもの**（2.1.294 の実物で確かめた）: 吹き出し = `UserMessage`（`origin` が `composer` / `bridge`）を右寄せの
+  `round` の枠に（エンジンの行なら本文の Text で描き直す・他の mod の描画は箱の中へ包む）。コードのコピー =
+  `AssistantMessage` の閉じた囲みのコードブロックごとに Copy のボタン（**クリック** = 会話の行はフォーカスできない）と、
+  **キー**の口として帯の tako の行の `o: copy last code`（`turn.complete` の `answer` = 最新の本筋の返答の最後の
+  ブロック。ホットキーは tako が選ぶ `chat_hotkey`）。ツールの要約 = **2.1.294 の全画面は Bash の呼び出しも
+  `ToolGroup`（「Ran 1 shell command」）に畳む**ので、グループを `isExpanded: true` で流して `ToolUse` を 1 行
+  （名前・何に対してか・状態・「詳細」）に描く。「詳細」はエンジンの行（出力つき）を要約の下に戻す
+- **共存**（§9.5 の規則どおり `next(e)` を包む）: ui.render の同じ口（発話・返答・ツールの行）を包む代役の mod を
+  `--plugin-dir`（tako の外側）と `CLAUDE_CODE_PLUGIN_DIRS` の tako の後ろ（内側）の両方で読ませ、どちらでも代役の
+  印と tako の吹き出し・Copy・要約が両方残ることを実物で確かめた（外側 = 代役の印の下に tako の描画 / 内側 = tako の
+  吹き出しの中に代役の印とエンジンの `❯` の行、ツールは代役の行の下に tako の要約）
+- **Copy の拒否**: カード（§9.10）と違い tako の store に無い文字列なので CLI へは落とさず、他の mod の選択を尊重して
+  写さない（トーストで知らせ、`last_press` は `code_copy` / 失敗）
+- **何を描くかは tako**（`chat_view`）: ターミナル表示は `always` だけ（既定 = コードのコピーだけ）、GUI モードで mod が
+  チャットを持つときだけ `gui_only` も。`chat.place = tako` は `mode: off`（何も描かない）。**`auto` の GUI モードでの持ち主は
+  `AUTO_CHAT_OWNER_GUI`（= tako）**で、判断点（受け入れ 4）が決まったらこの 1 行を変える（ui.json は `auto` のまま =
+  移行なし）
+- **切り替え**（`chat_owner`）: 新鮮な報告 ∧ `renders.chat` ∧ 置き場が mod ∧ GUI モード。表示モードを変えた直後に mod の組が
+  追いつくのは次の報告（最大 15 秒。push の #1884 が入れば消える）だが、tako は表示を先に切り替える（GPUI のチャット →
+  本物の画面 → 吹き出しが出る、の順。表示を 2 回入れ替えない）。戻すのは 2 秒 tick の指紋（`refresh_mod_chat_owners`）
+- **フォールバック側（#1883 の置き換え）**: `session.append` の本筋の user / assistant の行を `chat_seq` で数え、
+  GUI モードで GPUI のチャットが表に出ているペイン（`view.chat.notify`）だけすぐ報告する（ターミナル表示で報告を
+  増やさない = PC の負荷）。GPUI のチャットは `renders.chat.notify` の報告の `chat_seq` が変わったときだけ読み直し、
+  静かな間は stat もしない。transcript は報告の `config_dir` から先に探す = 未登録の設定 dir の claude でも会話が出る
+- 実測（2.1.294・偽 Messages API・隔離 GUI。`scripts/test-mod-chat-1964.sh`）は `.agent/requirements.md` の
+  FR-2.42.48〜52 と #1964 の PR に置く
+

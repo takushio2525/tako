@@ -17,6 +17,14 @@
 //   クリックを渡さない = #1961）。正本は tako の store（応答の view.cards）。帯に押せる形で描いたカードの
 //   id を報告の renders.cards で返し、tako はそのカードを GPUI のカード帯から外す。Copy は $.ui.copy
 //   （他の mod に拒まれたら tako の CLI の show-command --copy へ落とす）、Run / 閉じるは tako が組んだ引数
+// - チャット風の描画（#1964）: 利用者の発話（composer / bridge）を右寄せの吹き出しに・AI の返答のコードブロックの
+//   下に Copy のボタン（論理文字列 = 画面の折り返しは混ざらない。クリックで押す）と帯の「最新のコードをコピー」
+//   （キーで押す）・ツールの呼び出しを 1 行の要約に（ToolGroup は展開して 1 呼び出し 1 行。「詳細」で
+//   エンジンの行に戻す）。どれを描くかは tako が決める（view.chat。ターミナル表示の既定はコードのコピーだけ）。
+//   どれも next(e) の答えを包む（エンジンの行なら置き換え、他の mod が描いていればその描画を中に / 上に残す）。
+//   今あてている組は報告の renders.chat で返し、GUI モードで tako が mod にチャットを任せたペインは
+//   GPUI のチャットビューの代わりにこの画面がそのまま出る。会話の行が足された数（chat_seq）も報告に載せ、
+//   GPUI のチャットが表に出ているペイン（view.chat.notify）ではすぐ報告する = transcript を通知で読み直す
 // - `/tako`: サイドバーのペイン（$.ui.open）に詳細。頼まれずには開かない（開くのはコマンドだけ）
 // - 帯を隠すトグル: 正本は tako の ui.json の band.hidden（#1960）。$.store の `band`（{ hidden, at }）は
 //   この読み込み元の写しで、`/tako band on|off`・ペインのボタンで変えたら報告の band.toggled_at で tako へ
@@ -59,6 +67,8 @@ import type {
   TakoButton,
   TakoCard,
   TakoCardCommand,
+  TakoChat,
+  TakoChatRenders,
   TakoLimitsSeen,
   TakoModReport,
   TakoPress,
@@ -135,6 +145,16 @@ const HIDDEN = { plugin: 'tako', key: 'bandHidden' } as const
 const LIMITS_SEEN = { plugin: 'tako', key: 'limitsSeen' } as const
 // 帯で選んでいるカードのコマンド（#1963。n で次へ。描画が購読する）
 const CARD_CURSOR = { plugin: 'tako', key: 'cardCursor' } as const
+// 最新の AI の返答のコードブロック（#1964。帯の「最新のコードをコピー」が写す。報告には載せない）
+const CHAT_CODES = { plugin: 'tako', key: 'chatCodes' } as const
+// ツールの要約から「詳細」で開いた呼び出し（#1964。開いた行はエンジンの描画に戻す）
+const TOOL_OPEN = { plugin: 'tako', key: 'toolOpen' } as const
+/** 開いた呼び出しを覚える上限（古いものから忘れる） */
+const TOOL_OPEN_MAX = 64
+/** 吹き出しにする発話の出どころ（人の入力 = その端末の composer と Remote Control の bridge） */
+const BUBBLE_ORIGINS: readonly string[] = ['composer', 'bridge']
+/** 吹き出しを右へ寄せるとき左に空ける桁の下限（幅の 1/5 と比べて大きい方） */
+const BUBBLE_INDENT_MIN = 4
 
 // モジュール変数。ホットリロードで消えるが、そのとき session.start が再発火して張り直す
 let cli: string | undefined
@@ -190,6 +210,10 @@ let lastPress: TakoPress | undefined
 let cardsOffered = false
 let bandCards: number[] = []
 let newestCard: number | undefined
+// チャット風の描画（#1964）: 最後に受け取った view.chat（今あてている組 = renders.chat）と、起きてから
+// 足された本筋の会話の行の数（chat_seq。数だけ = 本文は持たない）
+let chatView: TakoChat | undefined
+let chatSeq = 0
 
 // effort の値を読む。turn.step は文字列（2.1.294 の実測: "medium"）、classic 系は { level } で運ぶ
 function effortLevel(value: unknown): string | undefined {
@@ -302,6 +326,7 @@ async function buildReport($: EngineInterface, ended: boolean, dormant?: 'user_d
     status_line: statusLine,
     renders: currentRenders(),
     last_press: lastPress,
+    chat_seq: chatSeq,
     ended,
   }
 }
@@ -317,7 +342,15 @@ function currentRenders(): TakoRenders | undefined {
     hint_hook: hintHookSeen,
     // #1963: tako が描かせたときだけ（描けなかったら空 = tako は猶予の後に GPUI の帯へ出す）
     cards: cardsOffered ? bandCards : undefined,
+    // #1964: tako が描かせた組（応答に view.chat が無ければ欠ける = tako は GPUI のチャットのまま）
+    chat: chatRenders(),
   }
+}
+
+// 今あてているチャット風の描画の組（#1964。view.chat をそのまま返す = 描いたと言うのは tako が頼んだものだけ）
+function chatRenders(): TakoChatRenders | undefined {
+  if (chatView === undefined) return undefined
+  return { bubble: chatView.bubble, code_copy: chatView.code_copy, tool_summary: chatView.tool_summary, notify: chatView.notify }
 }
 
 // 1 回送る。応答（tako 側のスナップショット = 帯・サイドバーの材料）を $.state へ写す
@@ -458,6 +491,17 @@ type Words = {
   guardCancel: string
   guardDropped: string
   guardWarned: (found: string) => string
+  // チャット風の描画（#1964）
+  copyCode: (index: number, of: number, lang: string) => string
+  latestCode: (of: number) => string
+  copied: string
+  copyRefused: string
+  toolDone: string
+  toolRunning: string
+  toolError: string
+  toolInterrupted: string
+  toolDetails: string
+  toolHide: string
 }
 
 const WORDS: Record<'ja' | 'en', Words> = {
@@ -503,6 +547,16 @@ const WORDS: Record<'ja' | 'en', Words> = {
     guardCancel: 'やめる',
     guardDropped: 'tako: 鍵らしき文字が入っているので送りませんでした',
     guardWarned: found => `tako: 鍵らしき文字を含むまま送りました（${found}）`,
+    copyCode: (i, of, lang) => `コピー${of > 1 ? ` ${i}` : ''}${lang === '' ? '' : ` ${lang}`}`,
+    latestCode: of => (of > 1 ? '最後のコードをコピー' : 'コードをコピー'),
+    copied: 'コードをコピーしました',
+    copyRefused: 'コピーできませんでした（他の mod が止めた可能性）',
+    toolDone: '完了',
+    toolRunning: '実行中',
+    toolError: 'エラー',
+    toolInterrupted: '中断',
+    toolDetails: '詳細',
+    toolHide: '閉じる',
   },
   en: {
     tab: 'tab',
@@ -546,6 +600,16 @@ const WORDS: Record<'ja' | 'en', Words> = {
     guardCancel: "Don't send",
     guardDropped: 'tako: not sent because it looks like it contains a secret',
     guardWarned: found => `tako: sent a prompt that looks like it contains a secret (${found})`,
+    copyCode: (i, of, lang) => `Copy${of > 1 ? ` ${i}` : ''}${lang === '' ? '' : ` ${lang}`}`,
+    latestCode: of => (of > 1 ? 'copy last code' : 'copy code'),
+    copied: 'Copied the code',
+    copyRefused: 'Could not copy (another mod may have stopped it)',
+    toolDone: 'done',
+    toolRunning: 'running',
+    toolError: 'error',
+    toolInterrupted: 'interrupted',
+    toolDetails: 'details',
+    toolHide: 'hide',
   },
 }
 
@@ -665,8 +729,8 @@ type Press = { kind: 'slash'; command: string } | { kind: 'prompt'; text: string
 /** 帯のボタン 1 つ（#1962）。rank は区切りと同じ物差し（左のボタンほど最後まで残す） */
 type BandButton = { button: TakoButton; press: Press; rank: number }
 
-/** 帯のカードのボタンの操作（#1963） */
-type CardOp = 'copy' | 'run' | 'next' | 'dismiss'
+/** 帯のカードのボタンの操作（#1963）。code は「最新のコードをコピー」（#1964。同じ plain の形で並べる） */
+type CardOp = 'copy' | 'run' | 'next' | 'dismiss' | 'code'
 /** 帯のカードのボタン 1 つ（#1963）。`y: コピー` の形（plain = ホットキーを見せる）で描く */
 type CardButton = { op: CardOp; label: string; hotkey: string; rank: number }
 /** 帯で選んでいるカードのコマンド（#1963）。pairs は新しいカードから（カード, コマンド）の並び */
@@ -892,15 +956,20 @@ function bandRow(
   columns: number,
   bar: string | null,
   cursor: { card: number; index: number } | null = null,
+  codes: readonly string[] = [],
 ): RenderElement {
   const s3 = view.ui === undefined
+  // #1964: 最新の返答のコードをキーで写す口（会話の行の Copy はクリックでしか押せない）
+  const code = codeButtonOf(view, codes)
+  const extra = (c: CardSel | null): CardButton[] => (code === null ? cardButtonsOf(view, c) : [...cardButtonsOf(view, c), code])
   let card = cardSelection(view, cursor)
-  let fitted = fitBand(segmentsOf(view, s3, bar, card), buttonsOf(view), columns, cardButtonsOf(view, card))
+  let fitted = fitBand(segmentsOf(view, s3, bar, card), buttonsOf(view), columns, extra(card))
   if (card !== null && !cardPressable(fitted.cards, card)) {
     card = null
-    fitted = fitBand(segmentsOf(view, s3, bar, null), buttonsOf(view), columns)
+    fitted = fitBand(segmentsOf(view, s3, bar, null), buttonsOf(view), columns, extra(null))
   }
   const kinds = fitted.segments.map(seg => seg.kind)
+  if (fitted.cards.some(b => b.op === 'code')) kinds.push('code')
   if (fitted.buttons.length > 0) kinds.push('buttons')
   // 押せる形で描いたカード（「次」で全部へ行ける）= GPUI の帯から外してよいカード
   const claimed = card === null ? [] : (view.cards?.items ?? []).map(c => c.id)
@@ -916,12 +985,17 @@ function bandRow(
   })
   const line = Text({ color: colors.dim, wrap: 'truncate-end', children: parts })
   const selected = card
-  const cardButtons =
-    selected === null
+  const latest = codes.at(-1)
+  const cardButtons = fitted.cards.flatMap(b => {
+    if (b.op === 'code') {
+      return latest === undefined
+        ? []
+        : [Button({ key: 'tako-code-latest', label: b.label, hotkey: b.hotkey, plain: true, onPress: press => copyCode($, latest, press) })]
+    }
+    return selected === null
       ? []
-      : fitted.cards.map(b =>
-          Button({ key: `tako-card-${b.op}`, label: b.label, hotkey: b.hotkey, plain: true, onPress: press => pressCard($, b.op, selected, press) }),
-        )
+      : [Button({ key: `tako-card-${b.op}`, label: b.label, hotkey: b.hotkey, plain: true, onPress: press => pressCard($, b.op, selected, press) })]
+  })
   if (fitted.buttons.length === 0 && cardButtons.length === 0) return line
   const buttons = fitted.buttons.map(b =>
     Button({ key: `tako-button-${b.button.id}`, label: b.button.label, hotkey: b.button.hotkey, onPress: () => pressButton($, b.press) }),
@@ -1073,6 +1147,199 @@ function drawCardRow($: EngineInterface, e: RenderInput<'ToolUse'>, view: TakoVi
   return Box({ flexDirection: 'column', children: [below, box] })
 }
 
+// --- チャット風の描画（#1964）------------------------------------------------------------------
+
+/** 囲みのコードブロック 1 つ（言語と論理文字列） */
+type CodeBlock = { lang: string; source: string }
+
+// Markdown の囲みのコードブロック（``` / ~~~。3 字以上・行頭の空白 3 字まで）を順に取り出す。中身は
+// 論理文字列のまま（画面の折り返しは混ざらない = Copy に渡すのはこれ）。閉じていないブロック（生成中）は数えない
+function codeBlocks(text: string): CodeBlock[] {
+  const out: CodeBlock[] = []
+  let open: { fence: string; lang: string; body: string[] } | null = null
+  for (const line of text.split('\n')) {
+    if (open === null) {
+      const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
+      if (m === null) continue
+      const fence = m[1] ?? ''
+      const info = (m[2] ?? '').trim()
+      // ``` の情報文字列に ` は入らない（CommonMark）= それはコードブロックではない
+      if (fence.startsWith('`') && info.includes('`')) continue
+      open = { fence, lang: info.split(/\s+/)[0] ?? '', body: [] }
+      continue
+    }
+    const fence: string = open.fence
+    const trimmed = line.replace(/^ {0,3}/, '').trimEnd()
+    if (trimmed.length >= fence.length && trimmed === (fence[0] ?? '').repeat(trimmed.length)) {
+      out.push({ lang: open.lang, source: open.body.join('\n') })
+      open = null
+    } else {
+      open.body.push(line)
+    }
+  }
+  return out
+}
+
+// コードを写す（#1964）。$.ui.copy（論理文字列そのまま）。他の mod の ui.copy フックに拒まれたら、その mod の
+// 選択を尊重して写さず、トーストで知らせる（カードと違い tako の store に無い文字列なので CLI へは落とさない）
+async function copyCode($: EngineInterface, text: string, press: UiPressArgument): Promise<void> {
+  let ok = false
+  try {
+    ok = (await $.ui.copy({ text, surface: press.surface })).isCopied
+  } catch (err) {
+    $.ui.log(`tako mod: code copy failed: ${String(err).slice(0, 200)}`, { to: 'debug' })
+  }
+  const w = words(lang)
+  try {
+    $.ui.toast(ok ? w.copied : w.copyRefused, { timeoutMs: 3_000 })
+  } catch {
+    // トーストが出せなくても写した結果は変わらない
+  }
+  lastPress = { kind: 'code_copy', ok, at: await $.clock.now() }
+  dirty = true
+}
+
+// 利用者の発話を右寄せの吹き出しに（#1964）。エンジンの行（{ type: 'engine' }）なら本文を Text で描き直し、
+// 他の mod が描いていればその描画を吹き出しの中に包む（next(e) の答えを捨てない）
+function drawBubble($: EngineInterface, e: RenderInput<'UserMessage'>, view: TakoView, below: RenderElement): RenderElement {
+  const colors = view.ui?.colors ?? DEFAULT_COLORS
+  const { Box, Text } = $.ui.resolve(e)
+  const inner = below.type === 'engine' ? Text({ wrap: 'wrap', children: e.props.text }) : below
+  const columns = e.viewport?.columns ?? 80
+  return Box({
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    paddingLeft: Math.max(BUBBLE_INDENT_MIN, Math.floor(columns / 5)),
+    children: [Box({ borderStyle: 'round', borderColor: colors.accent, paddingX: 1, flexShrink: 1, children: [inner] })],
+  })
+}
+
+// AI の返答の下にコードブロックごとの Copy（#1964。クリックで押す。key は返答の id と順番で固定 = 描き直しで
+// mount し直さない = Claude Code が描いた直後 300 ms のクリックを捨てる窓を作り直さない）
+function drawCodeCopy(
+  $: EngineInterface,
+  e: RenderInput<'AssistantMessage'>,
+  view: TakoView,
+  below: RenderElement,
+  blocks: readonly CodeBlock[],
+): RenderElement {
+  const w = words(view.lang)
+  const { Box, Button } = $.ui.resolve(e)
+  const buttons = blocks.map((block, i) =>
+    Button({
+      key: `tako-code-${e.requestId}-${i}`,
+      label: w.copyCode(i + 1, blocks.length, block.lang),
+      onPress: press => copyCode($, block.source, press),
+    }),
+  )
+  const copies = Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, paddingLeft: 2, children: buttons })
+  return Box({ flexDirection: 'column', children: [below, copies] })
+}
+
+// 帯の「最新のコードをコピー」（#1964）。view.chat.code_copy が真で、最新の返答にコードブロックがあるときだけ。
+// 優先度はカスタムボタンより低い（幅が足りなければ先に落とす。会話の行の Copy はクリックで押せる）
+function codeButtonOf(view: TakoView, codes: readonly string[]): CardButton | null {
+  const chat = view.chat
+  if (chat === undefined || !chat.code_copy || codes.length === 0 || view.band_style === 's3') return null
+  return { op: 'code', label: words(view.lang).latestCode(codes.length), hotkey: chat.hotkey, rank: 3.5 }
+}
+
+// ツールの名前（MCP の `mcp__<登録名>__<名前>` は `<登録名>.<名前>`）
+function toolName(tool: string): string {
+  const m = /^mcp__(.+?)__(.+)$/.exec(tool)
+  return m === null ? tool : `${m[1]}.${m[2]}`
+}
+
+// ツールの要約の中身（何に対しての呼び出しか。1 行目だけ）。よく使うツールは決まったキー、他は最初の文字列
+function toolSubject(tool: string, input: unknown): string {
+  const o = typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {}
+  const pick = (...keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const v = o[key]
+      if (typeof v === 'string' && v.trim() !== '') return v
+    }
+    return undefined
+  }
+  let text: string | undefined
+  if (tool === 'Bash') text = pick('command')
+  else if (tool === 'Read' || tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') text = pick('file_path')
+  else if (tool === 'NotebookEdit') text = pick('notebook_path')
+  else if (tool === 'Grep' || tool === 'Glob') text = pick('pattern')
+  else if (tool === 'WebFetch') text = pick('url')
+  else if (tool === 'WebSearch') text = pick('query')
+  else if (tool === 'Task' || tool === 'Agent') text = pick('description', 'prompt')
+  else if (tool === 'TodoWrite' && Array.isArray(o.todos)) text = `${o.todos.length} todos`
+  if (text === undefined) {
+    for (const v of Object.values(o)) {
+      if (typeof v === 'string' && v.trim() !== '') {
+        text = v
+        break
+      }
+    }
+  }
+  return (text ?? '').trim().split('\n')[0] ?? ''
+}
+
+// ツールの呼び出しの 1 行の要約（#1964）: 名前・何に対してか・状態・「詳細」/「閉じる」（クリックで押す）
+function toolSummaryRow($: EngineInterface, e: RenderInput<'ToolUse'>, view: TakoView, open: boolean): RenderElement {
+  const w = words(view.lang)
+  const colors = view.ui?.colors ?? DEFAULT_COLORS
+  const { Box, Button, Text } = $.ui.resolve(e)
+  const p = e.props
+  const state = p.isRunning ? w.toolRunning : p.isInterrupted ? w.toolInterrupted : p.isErrored ? w.toolError : w.toolDone
+  const tone = p.isRunning ? colors.accent : p.isErrored || p.isInterrupted ? 'error' : 'success'
+  return Box({
+    flexDirection: 'row',
+    columnGap: 1,
+    paddingLeft: 2,
+    children: [
+      Text({ color: colors.accent, bold: true, children: toolName(p.tool) }),
+      Box({ flexGrow: 1, flexShrink: 1, children: [Text({ color: colors.dim, wrap: 'truncate-end', children: toolSubject(p.tool, p.input) })] }),
+      Text({ color: tone, children: state }),
+      Button({ key: `tako-tool-${p.tool_use_id}`, label: open ? w.toolHide : w.toolDetails, plain: true, dimColor: true, onPress: () => toggleTool($, p.tool_use_id) }),
+    ],
+  })
+}
+
+// ツールの行（#1964）: エンジンの行なら 1 行の要約に置き換え、他の mod が描いていればその下に要約を足す。
+// 「詳細」で開いた呼び出しは要約の下に next の答え（エンジンの行 = 出力つき）を戻す
+function drawToolSummary(
+  $: EngineInterface,
+  e: RenderInput<'ToolUse'>,
+  view: TakoView,
+  below: RenderElement,
+  open: boolean,
+): RenderElement {
+  const row = toolSummaryRow($, e, view, open)
+  if (!open && below.type === 'engine') return row
+  const { Box } = $.ui.resolve(e)
+  return Box({ flexDirection: 'column', children: open ? [row, below] : [below, row] })
+}
+
+// 「詳細」/「閉じる」: 開いた呼び出しはエンジンの行（出力つき）を要約の下に戻す（$.state = 描き直しが購読する）
+async function toggleTool($: EngineInterface, id: string): Promise<void> {
+  const open = (await $.state.get(TOOL_OPEN)).value ?? []
+  const next = open.includes(id) ? open.filter(x => x !== id) : [...open, id].slice(-TOOL_OPEN_MAX)
+  await $.state.set(TOOL_OPEN, next)
+}
+
+// 応答の view.chat を取り込む（#1964）。組が変わったら次の報告の renders.chat で tako へ返す
+function absorbChat(view: TakoView | null): void {
+  const next = view === null || view.band_style === 's3' ? undefined : view.chat
+  if (JSON.stringify(next) === JSON.stringify(chatView)) return
+  chatView = next
+  dirty = true
+}
+
+// 最新の返答のコードブロックを控える（#1964。帯の「最新のコードをコピー」。サブエージェントのターンは数えない）
+async function noteAnswer($: EngineInterface, answer: string): Promise<void> {
+  try {
+    await $.state.set(CHAT_CODES, codeBlocks(answer).map(b => b.source))
+  } catch (err) {
+    $.ui.log(`tako mod: chat codes unwritable: ${String(err).slice(0, 200)}`, { to: 'debug' })
+  }
+}
+
 // 残り時間（リセットまで）。端末の時刻帯に依らない書き方にする
 function untilText(ms: number): string {
   const minutes = Math.max(0, Math.round(ms / 60_000))
@@ -1095,6 +1362,8 @@ function savedBand(value: unknown): SavedBand | undefined {
 
 // tako の材料を $.state へ（同じなら書かない）
 async function setView($: EngineInterface, view: TakoView | null): Promise<void> {
+  // 材料が消えた（tako が応答しない・休眠）ならチャットも描かない = renders.chat を引っ込める（#1964）
+  if (view === null) absorbChat(null)
   const json = JSON.stringify(view)
   if (json === lastViewJson) return
   lastViewJson = json
@@ -1167,6 +1436,7 @@ async function absorb($: EngineInterface, stdout: string): Promise<void> {
     }
   }
   await absorbCards($, view)
+  absorbChat(view)
   await setView($, view)
 }
 
@@ -1282,6 +1552,20 @@ export const register: Register = on => {
       pendingTool = undefined
       lastTurn = { duration_ms: e.durationMs, reason: e.reason }
       dirty = true
+      // #1964: 帯の「最新のコードをコピー」の材料（本文は $.state に置くだけで報告には載せない）
+      if (cli !== undefined) await noteAnswer($, e.answer)
+    }
+    return done
+  }).catch(($, e, next) => next(e))
+
+  // 会話の行が足された（#1964）: 本筋（サブエージェントでない）の user / assistant の行を数える。GPUI の
+  // チャットが表に出ているペイン（view.chat.notify）ではすぐ報告する = transcript を通知で読み直す。
+  // 数えるのは next(e) の後（= transcript に書かれた後）
+  on('session.append', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agentId === undefined && (e.message.type === 'user' || e.message.type === 'assistant')) {
+      chatSeq += 1
+      if (chatView?.notify === true) dirty = true
     }
     return done
   }).catch(($, e, next) => next(e))
@@ -1303,6 +1587,8 @@ export const register: Register = on => {
       pendingTool = undefined
       lastTurn = undefined
       dirty = true
+      // 前の会話のコードを帯から外す（#1964）
+      if (cli !== undefined) await noteAnswer($, '')
       return next(e)
     }
     await finish($)
@@ -1329,26 +1615,56 @@ export const register: Register = on => {
     const below = await next(e)
     const bar = barPlace(view) === 'band' ? barText(view) : null
     const cursor = (await $.state.get(CARD_CURSOR)).value ?? null
-    return stackBand($, e, below, bandRow($, e, view, columns, bar, cursor))
+    const codes = view.chat?.code_copy === true ? ((await $.state.get(CHAT_CODES)).value ?? []) : []
+    return stackBand($, e, below, bandRow($, e, view, columns, bar, cursor, codes))
   }).catch(($, e, next) => next(e))
 
   // 会話の行（#1963）: tako_show_command の呼び出しを含むグループ（「Called tako」の 1 行）を展開する
-  // = その呼び出しが ToolUse の行になり、下のフックがカードに描き替える。展開は isExpanded を書き換えて
-  // next へ流すだけ（グループの描画はエンジン / 他の mod のまま）。tako が描かせないときは触らない
+  // = その呼び出しが ToolUse の行になり、下のフックがカードに描き替える。#1964: ツールの要約を描くなら
+  // どのグループも展開する（1 呼び出し 1 行の要約になる）。展開は isExpanded を書き換えて next へ流すだけ
+  // （グループの描画はエンジン / 他の mod のまま）。tako が描かせないときは触らない
   on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
-    if (e.props.isExpanded || !e.props.calls.some(call => isShowCall(call.tool, call.input))) return next(e)
-    const view = (await $.state.get(VIEW)).value ?? null
-    if (cli === undefined || view?.cards === undefined) return next(e)
+    if (e.props.isExpanded) return next(e)
+    const view = cli === undefined ? null : ((await $.state.get(VIEW)).value ?? null)
+    if (view === null) return next(e)
+    const card = view.cards !== undefined && e.props.calls.some(call => isShowCall(call.tool, call.input))
+    const summary = view.chat?.tool_summary === true && view.band_style !== 's3'
+    if (!card && !summary) return next(e)
     return next({ ...e, props: { ...e.props, isExpanded: true } })
   }).catch(($, e, next) => next(e))
 
-  // tako_show_command の行をカードに描き替える（#1963）。他の mod が描いていればその下に足す
+  // tako_show_command の行をカードに描き替える（#1963）。#1964: それ以外の呼び出しはツールの要約を描くなら
+  // 1 行の要約に（「詳細」で開いた呼び出しは要約の下にエンジンの行を戻す）。他の mod が描いていればその下に足す
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    if (!isShowCall(e.props.tool, e.props.input) || e.props.isErrored || e.props.isInterrupted) return next(e)
-    const view = (await $.state.get(VIEW)).value ?? null
-    if (cli === undefined || view?.cards === undefined) return next(e)
+    const view = cli === undefined ? null : ((await $.state.get(VIEW)).value ?? null)
+    if (view === null) return next(e)
+    const show = isShowCall(e.props.tool, e.props.input) && !e.props.isErrored && !e.props.isInterrupted
+    if (show && view.cards !== undefined) {
+      const below = await next(e)
+      return drawCardRow($, e, view, below)
+    }
+    if (view.chat?.tool_summary !== true || view.band_style === 's3') return next(e)
+    const open = ((await $.state.get(TOOL_OPEN)).value ?? []).includes(e.props.tool_use_id)
     const below = await next(e)
-    return drawCardRow($, e, view, below)
+    return drawToolSummary($, e, view, below, open)
+  }).catch(($, e, next) => next(e))
+
+  // 利用者の発話を吹き出しに（#1964）。tako が描かせない・人の入力でない（通知・他のエージェントの発話）は触らない
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const view = cli === undefined ? null : ((await $.state.get(VIEW)).value ?? null)
+    if (view?.chat?.bubble !== true || view.band_style === 's3' || !BUBBLE_ORIGINS.includes(e.props.origin.kind)) return next(e)
+    const below = await next(e)
+    return drawBubble($, e, view, below)
+  }).catch(($, e, next) => next(e))
+
+  // AI の返答のコードブロックの下に Copy（#1964）。要約の行（isSummary）・コードの無い返答は触らない
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    const view = cli === undefined ? null : ((await $.state.get(VIEW)).value ?? null)
+    if (view?.chat?.code_copy !== true || view.band_style === 's3' || e.props.isSummary === true) return next(e)
+    const blocks = codeBlocks(e.props.text)
+    if (blocks.length === 0) return next(e)
+    const below = await next(e)
+    return drawCodeCopy($, e, view, below, blocks)
   }).catch(($, e, next) => next(e))
 
   // 入力欄の下の行（#1962）: 末尾（tail）に使用制限・ctx のバー。描くかは tako（view.usage_bar）。

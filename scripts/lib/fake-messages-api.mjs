@@ -13,6 +13,9 @@
 // 受けた要求は 1 行ずつ FAKE_LOG へ（経路・stream・要約の依頼か・ツールを呼んだかだけ。本文は書かない）。
 // #2050: FAKE_MARK を渡すと、最後の発話がその文字を含んだかの真偽（marked）も書く（鍵らしき文字の
 // 確認で「やめた送信が API へ届いていない」を本文を残さずに確かめる口）。
+// #1964: 「Reply with code blocks」なら 2 つのコードブロック（157 字・改行なしの長いコマンドと Python）を
+// 含む Markdown、「Run this command: <cmd>」なら要求の tools にある Bash をその command で呼び、結果が
+// 来たら「RUN-DONE」と答える（チャット風の描画 = 吹き出し・コードのコピー・ツールの要約を実物で見る材料）。
 //
 // 使い方: node scripts/lib/fake-messages-api.mjs <port>   （127.0.0.1 だけで待つ）
 import http from 'node:http'
@@ -49,6 +52,37 @@ function cardCall(body, text) {
   return tool === undefined ? null : { name: tool.name, input }
 }
 
+// 「Run this command: <cmd>」の Bash 呼び出し（要求の tools に Bash があるときだけ）
+function bashCall(body, text) {
+  const m = /Run this command: (.+)$/m.exec(text)
+  if (m === null) return null
+  const tools = Array.isArray(body?.tools) ? body.tools : []
+  if (!tools.some(t => t?.name === 'Bash')) return null
+  return { name: 'Bash', input: { command: m[1].trim(), description: 'Run the check command' } }
+}
+
+// 直前の assistant の発話が呼んだツールの名前（tool_result への答えを呼んだツールで分ける）
+function lastToolName(messages) {
+  const prev = [...messages].reverse().find(m => m?.role === 'assistant')
+  const parts = Array.isArray(prev?.content) ? prev.content : []
+  return parts.find(part => part?.type === 'tool_use')?.name ?? null
+}
+
+// #1964: コードブロックを 2 つ含む Markdown（1 つ目は 157 字・改行なし = コピーで改行が混ざらないかを見る）
+const CODE_REPLY = [
+  'Here is the build command:',
+  '',
+  '```bash',
+  'cargo build -p tako-cli && TAKO_ISOLATED=1 TAKO_DATA_DIR=/tmp/tako-s7-very-long-data-dir-name ./out/tako-cli/tako mod --json | jq ".panes[] | {pane, reason}"',
+  '```',
+  '',
+  'Then check it from Python:',
+  '',
+  '```python',
+  'print("hello from tako")',
+  '```',
+].join('\n')
+
 function answer(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : []
   const last = [...messages].reverse().find(m => m?.role === 'user')
@@ -58,16 +92,20 @@ function answer(body) {
   const word = /Reply with exactly one word: ([A-Za-z0-9_-]+)/.exec(text)
   const lines = /Reply with (\d+) numbered lines/.exec(text)
   const count = lines ? Math.min(500, Math.max(1, Number(lines[1]))) : 0
-  const call = summarize ? null : cardCall(body, text)
+  const call = summarize || isToolResult(last?.content) ? null : (cardCall(body, text) ?? bashCall(body, text))
   const reply = summarize
     ? 'SUMMARY-1962: the conversation so far was a short check.'
     : isToolResult(last?.content)
-      ? 'CARD-DONE'
+      ? lastToolName(messages) === 'Bash'
+        ? 'RUN-DONE'
+        : 'CARD-DONE'
       : word
         ? word[1]
         : count > 0
           ? Array.from({ length: count }, (_, i) => `LINE-${i + 1}`).join('\n')
-          : 'ok'
+          : /Reply with code blocks/.test(text)
+            ? CODE_REPLY
+            : 'ok'
   const marked = mark ? text.includes(mark) : null
   return { reply, summarize, call, marked }
 }

@@ -1,6 +1,6 @@
 // tako mod が tako へ送る報告の契約（#1879。設計書 .agent/plans/2026-10-tako-mod.md §4.2）と、
 // tako が応答で返す帯・サイドバーの材料（#1881。§7 S3）・定型の UI 設定（#1960。§9.7）・描いたもの（#1962）・
-// コマンドカード（#1963。§9.3）、mod の $.state の契約。
+// コマンドカード（#1963。§9.3）・チャット風の描画（#1964。§9.3）、mod の $.state の契約。
 // 受け手 / 送り手の正本は tako_core::claude_mod::{ModReport, ModBand, ModRenders, BandView} と tako_core::claude_mod_ui::UiConfig。
 // キーを増やすときは両方を同じコミットで直す。
 //
@@ -71,6 +71,12 @@ export type TakoModReport = {
   renders?: TakoRenders
   /** 最後に押されたボタン（#1962。種類と成否だけ） */
   last_press?: TakoPress
+  /**
+   * 会話の行が足された回数（#1964。起きてからの session.append のうち本筋 = サブエージェントでない
+   * user / assistant の行。**数だけ**で本文・uuid は載せない）。GPUI のチャットはこれが変わったときだけ
+   * transcript を読み直す（renders.chat.notify が真のとき）
+   */
+  chat_seq?: number
   /** session.end を受けた最後の報告。tako はそのペインの報告を即座に捨てる */
   ended: boolean
 }
@@ -92,14 +98,29 @@ export type TakoRenders = {
    * 応答に view.cards が無い（tako が描かせない）ときは欠ける。tako は載った id を GPUI のカード帯から外す
    */
   cards?: number[]
+  /**
+   * チャット風の描画で今あてている組（#1964。応答の view.chat をそのまま）。応答に view.chat が無い
+   * （A/B・古い tako）ときは欠ける。GUI モードで tako はこれがあるペインのチャットを mod に任せうる
+   */
+  chat?: TakoChatRenders
+}
+
+/** チャット風の描画で今あてている組（tako_core::claude_mod::ModChatRenders） */
+export type TakoChatRenders = {
+  bubble: boolean
+  code_copy: boolean
+  tool_summary: boolean
+  /** 会話の行が足されるたびにすぐ報告している（view.chat.notify を受けた） */
+  notify: boolean
 }
 
 /**
  * ボタンを押した結果（tako_core::claude_mod::ModPress）。ラベル・コマンド・入力欄へ入れる文は載せない。
- * card_* はコマンドカードの帯のボタン（#1963。card_copy_cli = $.ui.copy が拒まれて tako の CLI で写した）
+ * card_* はコマンドカードの帯のボタン（#1963。card_copy_cli = $.ui.copy が拒まれて tako の CLI で写した）。
+ * code_copy はチャット風の描画のコードのコピー（#1964。会話の行のボタンと帯の「最新のコードをコピー」）
  */
 export type TakoPress = {
-  kind: 'slash' | 'tako' | 'shell' | 'prompt' | 'card_copy' | 'card_copy_cli' | 'card_run' | 'card_dismiss'
+  kind: 'slash' | 'tako' | 'shell' | 'prompt' | 'card_copy' | 'card_copy_cli' | 'card_run' | 'card_dismiss' | 'code_copy'
   ok: boolean
   /** 押した時刻（epoch ms） */
   at: number
@@ -170,6 +191,30 @@ export type TakoView = {
    * tako・A/B の TAKO_1963_LEGACY / TAKO_1877_S7_LEGACY・古い tako の応答には無い）
    */
   cards?: TakoCards
+  /**
+   * チャット風の描画（#1964。A/B の TAKO_1964_LEGACY / TAKO_1877_S7_LEGACY・古い tako の応答には無い =
+   * 何も描かない）。何を描くかは tako が ui.json の chat × 表示モードで決める
+   */
+  chat?: TakoChat
+}
+
+/** チャット風の描画（tako_core::claude_mod::ChatView） */
+export type TakoChat = {
+  /**
+   * どの組か: gui = GUI モードで mod がチャットを持つ / terminal = ターミナル表示・GPUI のチャットの裏
+   * （ui.json の always だけ）/ off = chat.place が tako（何も描かない）
+   */
+  mode: 'gui' | 'terminal' | 'off'
+  /** 利用者の発話（composer / bridge）を右寄せの吹き出しに描く */
+  bubble: boolean
+  /** AI の返答のコードブロックの下にコピーのボタン、帯に「最新のコードをコピー」 */
+  code_copy: boolean
+  /** ツールの呼び出しを 1 行の要約に描く（ToolGroup は展開して 1 呼び出し 1 行） */
+  tool_summary: boolean
+  /** 帯の「最新のコードをコピー」のホットキー（tako がボタン・カードと重ならない英小文字を選ぶ） */
+  hotkey: string
+  /** 会話の行が足されたらすぐ報告する（GUI モードで GPUI のチャットが表に出ているペイン） */
+  notify: boolean
 }
 
 /** コマンドカード（tako_core::claude_mod::CardsView）。正本は tako の store（`tako show-command --list`） */
@@ -267,6 +312,12 @@ declare module 'claude-code' {
       limitsSeen: TakoLimitsSeen
       /** 帯で選んでいるカードのコマンド（#1963。null = いちばん新しいカードの 1 件目） */
       cardCursor: { card: number; index: number } | null
+      /**
+       * 最新の AI の返答のコードブロック（#1964。帯の「最新のコードをコピー」が写す。**報告には載せない**）
+       */
+      chatCodes: string[]
+      /** ツールの要約から「詳細」で開いた呼び出しの tool_use_id（#1964。開いた行はエンジンの描画に戻す） */
+      toolOpen: string[]
     }
   }
 }
