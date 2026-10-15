@@ -13,7 +13,6 @@
 //! 本物の tmux が無い環境（psmux しか無い Windows 等）ではスキップする。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tako_control::reach::DialogAccess;
@@ -26,16 +25,6 @@ mod tmux_e2e;
 /// 取り合って `duplicate session` で落ちる（実測は `tmux_e2e` のモジュール doc）
 fn socket() -> &'static str {
     tmux_e2e::socket_for("1293")
-}
-
-fn real_tmux() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| tako_core::tmux::announces_only_tmux(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
 }
 
 /// tmux セッションと一時ディレクトリを片付けるガード
@@ -227,8 +216,7 @@ fn read_log(log: &Path) -> (Vec<String>, Option<String>) {
 
 #[test]
 fn issue1293_会話ログの上のダイアログの下見が三択を返す() {
-    if !real_tmux() {
-        eprintln!("skip: 本物の tmux が無い環境");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
 
@@ -275,8 +263,7 @@ fn issue1293_会話ログの上のダイアログの下見が三択を返す() {
 /// 監査ログと応答 JSON だけが嘘になる
 #[test]
 fn issue1293_番号指定はダイアログ側の選択肢へ解決される() {
-    if !real_tmux() {
-        eprintln!("skip: 本物の tmux が無い環境");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
     let (guard, log) = launch_emulator("choice1");

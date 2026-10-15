@@ -33,16 +33,6 @@ fn socket() -> &'static str {
     tmux_e2e::socket_for("1273")
 }
 
-fn real_tmux() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| tako_core::tmux::announces_only_tmux(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
-}
-
 struct EmuGuard {
     session: String,
     dir: PathBuf,
@@ -203,8 +193,7 @@ fn send(session: &str, key: &str) {
 /// 受け入れ条件 1 + 3: 実端末の画面で「ターン終了 = 入力待ち」「生成中 = 判定しない」
 #[test]
 fn 実端末の画面で背景作業つき入力待ちを見分ける() {
-    if !real_tmux() {
-        eprintln!("[e2e-1273] 本物の tmux が無いのでスキップ");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
     let guard = launch_emulator("detect");
@@ -289,8 +278,7 @@ fn 実端末の画面で背景作業つき入力待ちを見分ける() {
 /// エッジ: 折りたたみ画面（`collapsed`）では実端末の画面でも判定しない
 #[test]
 fn 折りたたみ画面では実端末でも判定しない() {
-    if !real_tmux() {
-        eprintln!("[e2e-1273] 本物の tmux が無いのでスキップ");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
     let guard = launch_emulator("collapsed");

@@ -12,7 +12,6 @@
 //! 本物の tmux が無い環境（psmux しか無い Windows 等）ではスキップする。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tako_control::reach::DialogAccess;
@@ -31,16 +30,6 @@ const LABELS: [&str; 3] = [
     "自分で流す",
     "AWS は後回し、PR だけ進める",
 ];
-
-fn real_tmux() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| tako_core::tmux::announces_only_tmux(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
-}
 
 struct EmuGuard {
     session: String,
@@ -260,8 +249,7 @@ fn respond_once(tag: &str, choice: &str) -> (serde_json::Value, Vec<String>, Opt
 
 #[test]
 fn issue1447_previewつき三択へ番号とラベルで応答できる() {
-    if !real_tmux() {
-        eprintln!("skip: 本物の tmux が無い環境");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
 

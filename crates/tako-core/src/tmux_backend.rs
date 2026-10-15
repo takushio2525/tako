@@ -1976,15 +1976,7 @@ set -gq copy-mode-position-format ''
         // （Windows の psmux）は同じ値を返さないので、「器があるか」
         // （`survives_app_exit`）ではなく「本物の tmux を引けるか」で入る（#1278）。
         // 判定は `tmux::announces_only_tmux` の 1 実装（#873 と同じ規則）
-        let Some(version) = crate::tmux::version_announcement() else {
-            eprintln!("skip: tmux 系の CLI が無い環境");
-            return;
-        };
-        if !crate::tmux::announces_only_tmux(version) {
-            eprintln!(
-                "skip: tmux 互換の別実装（{}）。グループ意味論が本物の tmux と違う",
-                version.lines().next().unwrap_or("").trim()
-            );
+        if !crate::tmux_test_gate::real_tmux() {
             return;
         }
         let socket = format!("tako-coretest-{}-grouped", std::process::id());
@@ -2074,8 +2066,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn cleanup_orphansは直近アクティブなdetachedセッションを猶予する() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-grace", std::process::id());
@@ -2130,8 +2121,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn find_orphansはprotected外のtakoセッションだけ返す() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-orphan", std::process::id());
@@ -2165,8 +2155,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn session_cwdはセッションのcwdを返す() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-cwd", std::process::id());
@@ -2198,8 +2187,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn セッションはクライアント切断後もattachで内容ごと戻る() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}", std::process::id());
@@ -2301,8 +2289,7 @@ set -gq copy-mode-position-format ''
     #[cfg(unix)]
     fn issue1857_クライアントだけ殺されてもattach専用で戻りセッションが無ければ作らない() {
         use crate::backend_reattach::{probe_session, ClientExit, ReattachState, SessionProbe};
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-1857-{}", std::process::id());
@@ -2488,12 +2475,11 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn osc7はtmuxパススルーで外へ届く() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         if !std::path::Path::new("/bin/zsh").exists() {
-            eprintln!("skip: zsh が無い環境");
+            crate::tmux_test_gate::skip("zsh が無い環境");
             return;
         }
         let socket = format!("tako-coretest-osc-{}", std::process::id());
@@ -2558,12 +2544,11 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn 器のサーバーが別インスタンスを指していてもosc7が届く() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         if !std::path::Path::new("/bin/zsh").exists() {
-            eprintln!("skip: zsh が無い環境");
+            crate::tmux_test_gate::skip("zsh が無い環境");
             return;
         }
         let socket = format!("tako-coretest-stale-{}", std::process::id());
@@ -2595,7 +2580,7 @@ set -gq copy-mode-position-format ''
             .map(|s| s.success())
             .unwrap_or(false);
         if !started {
-            eprintln!("skip: 先行サーバーを立てられない");
+            crate::tmux_test_gate::skip("先行サーバーを立てられない");
             let _ = std::fs::remove_dir_all(&stale);
             return;
         }
@@ -2665,12 +2650,11 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn ソケット名がtakoで始まらなくてもosc7が届く() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         if !std::path::Path::new("/bin/zsh").exists() {
-            eprintln!("skip: zsh が無い環境");
+            crate::tmux_test_gate::skip("zsh が無い環境");
             return;
         }
         // **接頭辞をわざと外す**（`tako` で始まらない名前）。それでも残骸掃除が拾う
@@ -2730,8 +2714,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn マウスレポートと拡張キーがtmux越しに生で届く() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-mouse-{}", std::process::id());
@@ -2933,8 +2916,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn マウスレポート洪水でも断片がテキスト化しない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-flood-{}", std::process::id());
@@ -3083,8 +3065,7 @@ set -gq copy-mode-position-format ''
     #[cfg(unix)]
     fn クリックのtmux直接注入は断片を混ぜず押す離すを欠かさない() {
         use crate::mouse_forward::{self as mf, ClickPhase, Encoding};
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-click-{}", std::process::id());
@@ -3191,8 +3172,7 @@ set -gq copy-mode-position-format ''
     #[cfg(unix)]
     fn マウスを要求しない器のペインへはクリックを渡さない() {
         use crate::mouse_forward as mf;
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-noclick-{}", std::process::id());
@@ -3257,8 +3237,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn esc単押しは非kittyアプリにも素のescで届き27uが漏れない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-esc-{}", std::process::id());
@@ -3370,8 +3349,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn ネストtmux越しのホイールで内側スクロールバックを遡れる() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let backend = format!("tako-coretest-nestw-{}", std::process::id());
@@ -3435,8 +3413,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn ネストtmux越しのcsi_uが最内アプリへ届く() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let backend = format!("tako-coretest-nestk-{}", std::process::id());
@@ -3481,8 +3458,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn cjkはロケール無し環境でもtmux越しに描画される() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-cjk-{}", std::process::id());
@@ -3531,8 +3507,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn 通常ペインのホイールはcopy_modeで遡りインジケータを出さない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-ind-{}", std::process::id());
@@ -3620,8 +3595,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn sync_confは稼働中サーバーへ設定を再適用する() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-sync-{}", std::process::id());
@@ -3669,7 +3643,7 @@ set -gq copy-mode-position-format ''
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         else {
-            eprintln!("skip: copy-mode-position-format 非対応の tmux");
+            crate::tmux_test_gate::skip("copy-mode-position-format 非対応の tmux");
             return;
         };
         assert!(
@@ -3705,8 +3679,7 @@ set -gq copy-mode-position-format ''
     #[test]
     #[cfg(unix)]
     fn alt_screenの非マウスペインでホイールが矢印に化けない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-alt-{}", std::process::id());
@@ -4052,8 +4025,7 @@ mod pane_died_tests {
     #[test]
     #[cfg(unix)]
     fn 実tmux_出力中に器が自ら消えても最後の行まで書き出される() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-2085wrap", std::process::id());
@@ -4119,8 +4091,7 @@ mod pane_died_tests {
     #[test]
     #[cfg(unix)]
     fn 実tmux_altscreenのまま死んでも書き出して閉じる() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-2085alt", std::process::id());
@@ -4155,8 +4126,7 @@ mod pane_died_tests {
     #[test]
     #[cfg(unix)]
     fn 実tmux_明示のkillでは書き出さない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-2085kill", std::process::id());
@@ -4179,8 +4149,7 @@ mod pane_died_tests {
     #[test]
     #[cfg(unix)]
     fn 実tmux_書き出しに失敗してもペインは閉じる() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-2085fail", std::process::id());
@@ -4220,8 +4189,7 @@ mod pane_died_tests {
     #[test]
     #[cfg(unix)]
     fn 実tmux_同時に死んでも名前と中身が食い違わない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-2085many", std::process::id());
@@ -4276,8 +4244,7 @@ mod pane_died_tests {
     #[test]
     #[cfg(unix)]
     fn 実tmux_set_hookが通らなければremain_on_exitも立たない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-{}-2085hook", std::process::id());

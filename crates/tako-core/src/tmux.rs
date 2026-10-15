@@ -1556,8 +1556,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ロケール無し環境でもタブ区切り出力が壊れない() {
-        if !crate::backend::capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-loc-{}", std::process::id());

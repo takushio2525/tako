@@ -15,7 +15,6 @@
 //! A/B のフラグが混ざらないようにするため）。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tako_control::claude_tui;
@@ -33,16 +32,6 @@ fn socket() -> &'static str {
 /// 模擬 TUI が描く選択肢（claude 2.x の実採取と同じ並び。既定は拒否側）
 const DECLINE: &str = "No, exit";
 const ACCEPT: &str = "Yes, I trust this folder";
-
-fn real_tmux() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| tako_core::tmux::announces_only_tmux(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
-}
 
 /// tmux セッションと一時ディレクトリを片付けるガード
 struct EmuGuard {
@@ -223,8 +212,7 @@ fn run_auto_accept(tag: &str) -> (Vec<String>, Option<String>) {
 
 #[test]
 fn issue1236_自動承諾は承諾側を確定する() {
-    if !real_tmux() {
-        eprintln!("skip: 本物の tmux が無い環境");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
 

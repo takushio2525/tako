@@ -32062,10 +32062,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn issue1186_resetがwindowサイズを実際に戻す() {
-        if !tako_core::tmux::version_announcement()
-            .is_some_and(tako_core::tmux::announces_only_tmux)
-        {
-            eprintln!("skip: 本物の tmux が無い環境");
+        if !tako_core::tmux_test_gate::real_tmux() {
             return;
         }
         let socket = format!("tako-e2e-1186-{}", std::process::id());
@@ -32164,10 +32161,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn issue1190_killとresizeのソケット解決とエラー文面() {
-        if !tako_core::tmux::version_announcement()
-            .is_some_and(tako_core::tmux::announces_only_tmux)
-        {
-            eprintln!("skip: 本物の tmux が無い環境");
+        if !tako_core::tmux_test_gate::real_tmux() {
             return;
         }
         let socket = format!("tako-e2e-1190-{}", std::process::id());
@@ -32336,10 +32330,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn issue1185_取り込みビューのselect_windowが内側へ届く() {
-        if !tako_core::tmux::version_announcement()
-            .is_some_and(tako_core::tmux::announces_only_tmux)
-        {
-            eprintln!("skip: 本物の tmux が無い（grouped session と完全一致ターゲットが前提）");
+        // grouped session と完全一致ターゲットが前提
+        if !tako_core::tmux_test_gate::real_tmux() {
             return;
         }
         let socket = format!("tako-e2e-1185-{}", std::process::id());

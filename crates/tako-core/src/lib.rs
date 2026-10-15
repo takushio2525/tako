@@ -108,6 +108,7 @@ pub mod theme;
 pub mod tmux;
 pub mod tmux_backend;
 pub mod tmux_cleanup;
+pub mod tmux_test_gate;
 pub mod tree_select;
 pub mod ui_mode;
 pub mod url_guard;
