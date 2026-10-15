@@ -20,25 +20,6 @@
 
 ---
 
-## 2026-10-15（#2021: MCP の stdio ブリッジ 1 本 約 7 MB → 1.09 MB）
-- clap を通らない・カタログを使い捨ての子プロセスで組む・.app では libSystem だけの `tako-mcp` へ exec で引き渡す。登録は `tako mcp serve` のまま（移行なし）、応答はバイト単位で同じ。計測は `scripts/measure-mcp-bridge-2021.sh`、番犬は `issue2021_mcp_bridge`
-
-## 2026-10-15（#2041: 残りの `claude agents --json` 走査を mod の報告で埋めた = GUI モードのチャット表示と /clear 後のレジストリの会話 ID）
-- チャット表示は報告のあるペインを問わず、残りだけ絞って走査。`/clear` 後はレジストリの会話 ID を報告へ追従（`agents_scan.registry_followed`）。A/B `TAKO_2041_LEGACY=1`・番犬 `issue2041_*`。PR #2091
-- 実測 `scripts/test-session-scan-mod-2041.sh`: chat 60 秒 8 → 0 本・/clear 後 25 秒 器あり 2 → 0 本 / 器なし 12 → 0 本
-
-## 2026-10-15（#1950: `.ino` を再生ボタン / `tako run` で走らせる arduino 種別）
-- `arduino-cli compile` / プロファイル `upload`。arduino-cli は PATH → Arduino IDE 同梱（`app_bundle`）で探し、基板未選択・名前の不一致・arduino-cli なしを実行ペインと `project.notes` で案内。PR #2093
-- 実測: `scripts/test-runner-arduino-1950.sh` 25 PASS（IDE 同梱 1.2.0 で compile exit 0・A/B `TAKO_1950_LEGACY=1`）。upload は基板なしで未検証
-
-## 2026-10-15（#2085: 器が自ら消えても最後の行までペインログへ = remain-on-exit + pane-died フックで消える前に全履歴と画面を書き出す）
-- `<data_dir>/pane-died/` へ書き出し、ProcessExit の閉じ方で読む（子プロセス 0 本）。psmux は未実測で立てず `tako_logs` を Windows degraded に申告（PR #2095）
-- 実測: `test-pane-log-pace-2018.sh both` ③ 新 0〜1499 欠け 0 / `TAKO_2085_LEGACY=1` 末尾 626 行欠け、⑤ 閉じるまで 152 ms（旧 151 ms）、tmux 起動本数・常駐は新旧同じ
-
-## 2026-10-15（#1956: 言語サーバの検出表の第 2 波 = .tex texlab / .toml tombi（tako が取る）・.swift sourcekit-lsp・.dart dart・.css/.scss/.less と .html/.htm vscode-langservers-extracted）
-- 候補 18 種の比較と採った順は language-coverage §8。workspace.configuration を申告しない条件で測り直し、YAML（ホバーが出ない）を見送って CSS / HTML を採った。taplo はハッシュ無し + ホバー不可で tombi（PR #2102）
-- 実測: `scripts/test-lsp-servers-1956.sh` 37 OK（6 行とも開くだけで波線とホバー・visual-test `lsp-servers`・境界 2 つ）。e2e `issue1956_lsp_servers_wave2` 5 本
-
 ## 2026-10-15（#2050: 鍵らしき文字の確認を mod の送信時・スマホの入力・tako send へ広げ、許可リスト・規則ごとの無効化・警告だけの段を足した）
 - mod は `prompt.submit` → `paste-guard check --pane`・選択ダイアログ、スマホは 409 → 確認シート、`tako send` / `tako_send_input` は止めずに警告。許可リストは指紋だけ。tako が流した値はペインごとに 10 分確認済み（PR #2105）
 - 実経路 `scripts/test-paste-guard-2050.sh` 58 PASS（実物の claude・実 daemon・A/B）+ visual ⑫・カタログ +680 B
@@ -90,3 +71,27 @@
 
 ## 2026-10-16（#2120: master のタブ名を役割名の手動名で固定せず、管轄プロジェクトの自動名で付ける・adopt でプロジェクト名・旧版の「master」手動名は復元時に解除）
 - 真因は起動 3 経路（CLI / スマホ / 人タスク）の手動名 + adopt がタブ名を変えない。アプリの自動命名は master のタブを命名しない。`scripts/test-master-tab-title-2120.sh` 39 PASS（A/B `TAKO_2120_LEGACY=1`）・visual-test `master-tab-title`・カタログ増 0 B。PR #2124。solo の同型は #2127
+
+## 2026-10-16（#1731: Code Runner の実行設定を `<data_dir>/run-configs.json` に覚える = `tako run-config` / MCP `tako_run_defaults` の path 側）
+- 保存した環境が解けなければ自動へ落とさず `Run` はエラー（`--reset runtime` を案内）・短縮が 2 候補なら選ばない。カタログ +1,012 B・A/B `TAKO_1731_LEGACY=1`。PR #2122
+- 実測 `scripts/test-run-config-1731.sh` 37 PASS（env2 で走る / 消すと止まる / reset で .venv / CLI と MCP 一致）
+
+## 2026-10-16（#2113: スケッチ内の `.h` / `.cpp` を arduino-language-server へ・本体の `.ino` を tako が隠れて先に didOpen）
+- 表の `FolderClaim` + 開いた文書は開いたときの器で引く `LspManager::resolve` へ呼び手を寄せた（番犬 `issue2113_lsp_resolve_watchdog`）。A/B `TAKO_2113_LEGACY=1`。PR #2126
+- 実測 `scripts/test-lsp-sketch-headers-2113.sh` 22 OK（新は嘘のエラー 0・ホバー / 補完あり、旧と main は 2 件・基板なしは unconfigured・スケッチ外は新旧同じ）
+
+## 2026-10-16（#2127: solo のタブ名を「solo」の手動名で固定せず、作業フォルダのリポジトリ名の自動名で付ける）
+- HOME では触らない・`--tab` はそのフォルダで開く・旧版の手動名は復元時に解除（role から組み立てた旧名と完全一致のときだけ）。PR #2130
+- 実測 `scripts/test-solo-tab-title-2127.sh` 35 PASS（A/B `TAKO_2120_LEGACY=1`）・visual-test `master-tab-title` に solo の判定・カタログ増 0 B
+
+## 2026-10-16（#2129: ipc の fd 漏れテストを子プロセス（同じテストバイナリの `--exact`）で数え、並列テストの fd に引きずられないようにした）
+- 往復はサーバーが閉じる EOF を見届けてから戻す = 許容 +6・6 秒の最小値をやめて許容 0。注入 `TAKO_2129_INJECT_FD_NOISE` / `_LEAK`・A/B `TAKO_2129_LEGACY=1`。PR #2131
+- 実測: 雑音 7 本で旧 5 → 12 FAILED / 新 5 → 5 ok、漏れ 1 本は旧が見逃し新は 5 → 9 で落ちる。残りの後始末は #2136
+
+## 2026-10-16（#1732: 実行設定に引数・環境変数・作業ディレクトリ・実行前コマンド = `tako run-config --args/--env/--unset-env/--cwd/--before`）
+- env はコマンド文字列へ埋める（器の中へ届く）・before は群の門（本体が複合文でも止まる）・cwd を移すと `${fileBase}` は絶対パス。カタログ +391 B（残り約 2.5 KB）。PR #2132
+- A/B `TAKO_1732_LEGACY=1`・番犬 `issue1732_run_config_log_watchdog`・実経路 `scripts/test-run-config-1732.sh` 37 PASS
+
+## 2026-10-16（#1954: two-face に無い PowerShell（.ps1 / .psm1 / .psd1）の構文を足した）
+- ビルド時に YAML を構文定義へ読み、起動時は末尾へ継ぎ足す（既存 213 構文は 1 バイトも変えない・器 +15.2 KB・起動時 6〜7 ms）。yaml-rust はビルド依存だけ。.astro は ST4 の継承で読めず見送り。PR #2135
+- 比較は language-coverage §6.2・実測 `scripts/test-extra-syntax-1954.sh` 34 PASS（旧は Plain Text）。#1955（Finder の候補）は既定を動かさない方法が無く採らない
