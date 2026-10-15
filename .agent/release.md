@@ -221,12 +221,13 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
   シグナルで中止した実行からは回さない。止めるときは `TAKO_NIGHTLY_FOOTPRINT=0`
 - **1 回の流れ**: 見張りのロック → origin/main を `git worktree add --detach` で出す（共有ツリーの HEAD は触らない。
   target/ は共有ツリーのものを symlink で使い回す）→ `run_heavy cargo build --release`（順番待ちを通す・上限 60 分、
-  順番待ちはその 2/3 で諦める）→ `scripts/measure-footprint-2011.sh std`（上限 15 分・偽の claude・tako-vd の上だけ）→
+  順番待ちはその 2/3 で諦める。**並ぶのは起票に使う tako = `/Applications/tako.app` の tako**: 夜間の PATH は先頭が
+  `~/.cargo/bin` で、そこに順番待ちを知らない古い tako が居ると run_heavy が並ばずに走らせる）→ `scripts/measure-footprint-2011.sh std`（上限 15 分・偽の claude・tako-vd の上だけ）→
   履歴へ 1 行 → 判定 → 悪化なら起票。**そのコミットを描画ありで測り済みなら数秒で飛ばす**（コードが変わらない夜は測らない）
 - **置き場**: `~/.claude-orchestrator/state/tako-footprint/`（`history.tsv` = 1 晩 1 行・未実測の夜も残す /
   `state` = 続いている悪化 / `last-run.log` = 直近の計測の全出力）。data dir ではなく開発側で、`cargo clean`
   （`scripts/clean-target.sh`）で基準が消えないよう target/ の外に置く（予約・mod の検査の記録と同じ所）
-- **基準**: 同じ条件（シナリオ・ペインの並び・プレビュー数）・標準の env（`TAKO_FOOTPRINT_ENV` を足していない）・
+- **基準**: origin/main を測った行（と今回と同じ ref の行）のうち、同じ条件（シナリオ・ペインの並び・プレビュー数）・標準の env（`TAKO_FOOTPRINT_ENV` を足していない）・
   中身が全部入った・**描画の有無が同じ**行の直近 5 回の中央値。3 回に満たない間は「基準づくり中」で起票しない。
   注入の行（env を足した行）は判定されるが基準には入らない
 - **閾値**（S0 の 2 回のぶれ = 設計書 `.agent/plans/2026-10-lightweight.md` §7.1 から。正本は `footprint-watch.py` の `METRICS`）:
@@ -250,7 +251,9 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
   （GUI が居ない）は `state` を動かさず通知だけ出し、次の夜にやり直す
 - **基準は追いつく**: 中央値は悪化した行も含むので、直らない悪化は 3 晩ほどで基準に吸収されて鳴らなくなる
   （起票は最初の夜の 1 回）。**少しずつの増加（1 晩あたり閾値の内側）は拾えない**のが限界
-- 直近の結果と基準は `scripts/nightly-footprint-watch.sh --status`（読むだけ）。測り直しは `--force`。
+- 直近の結果と基準は `scripts/nightly-footprint-watch.sh --status`（読むだけ）。測り直しは `--force`、
+  ブランチを夜間と同じ流れで測るのは `TAKO_FOOTPRINT_WATCH_REF=<コミット>`（その行は origin/main の行と比べられるが、
+  履歴の `ref` 欄で分けるので origin/main の基準には入らない）。
   注入は `TAKO_FOOTPRINT_WATCH_SCALE=0.5`（閾値を半分）か `TAKO_FOOTPRINT_ENV="TAKO_2009_LEGACY=1"`
   （#2009 の前の持ち方 = わざと footprint を増やす）
 - 検証は `bash scripts/test-nightly-footprint-watch-2023.sh`（CI の macOS ジョブ。計測・tako・cargo・release.sh は

@@ -209,6 +209,21 @@ assert_eq "完了・別件を除いた最初の 1 件" "u-5" "$(printf '%s' "$li
 assert_eq "状態の id が未完了ならそれ" "u-9" "$(printf '%s' "$list" | python3 "$PY" find-open --prefer u-9)"
 assert_eq "状態の id が完了済みなら別の未完了" "u-5" "$(printf '%s' "$list" | python3 "$PY" find-open --prefer u-1)"
 
+echo "A11: ブランチの行（ref が origin/main 以外）は main の行と比べられるが、main の基準には入らない"
+H="$A/h11.tsv"
+add_row "$H" "2026-10-10 05:30" k1 ok
+add_row "$H" "2026-10-11 05:30" k2 ok
+add_row "$H" "2026-10-12 05:30" k3 ok
+row="$TMP_ROOT/row-branch.tsv"
+fake_row busy_footprint_mb=700.0 > "$row"
+python3 "$PY" record --history "$H" --date "2026-10-12 12:00" --sha kb --ref test/branch --status ok --elapsed 240 --row "$row"
+judge_kv "$H" "$A/none" "$A/o11"
+assert_eq "ブランチの悪化は main の基準と比べて挙がる" "busy_footprint_mb" "$(kv_of "$A/o11" metrics)"
+add_row "$H" "2026-10-13 05:30" k4 ok
+judge_kv "$H" "$A/none" "$A/o11b"
+assert_eq "次の main の夜の基準は main の 3 回だけ" "3" "$(kv_of "$A/o11b" baseline_n)"
+assert_eq "前に測れたコミットにブランチを数えない" "k3" "$(kv_of "$A/o11b" prev_sha)"
+
 # ============================================================================
 echo
 echo "B. 見張りの通し（計測・tako・cargo は代役）"
@@ -257,6 +272,12 @@ with open(os.path.join(os.environ["FAKE_DIR"], "tako.log"), "a") as f:
 if os.environ.get("FAKE_TODO_DOWN") == "1":
     print("tako の外で実行されている", file=sys.stderr)
     sys.exit(1)
+if args[:1] == ["queue"]:
+    # 順番待ちを知っている tako のふり（`queue --help` に --max-wait・`queue <コマンド>` は記録して走らせる）
+    if args[1:] == ["--help"]:
+        print("Usage: tako queue [--max-wait <時間>] <コマンド>")
+        sys.exit(0)
+    os.execvp(args[1], args[1:])
 data = json.load(open(store)) if os.path.exists(store) else {"tasks": []}
 def opt(name):
     return args[args.index(name) + 1] if name in args else None
@@ -426,6 +447,19 @@ assert_contains "直近の行" "$(cat "$B/status.txt")" "直近の 10 回"
 assert_contains "載せた悪化" "$(cat "$B/status.txt")" "載せた悪化: threads（u-2"
 assert_eq "履歴を書き換えない" "$before" "$(cksum < "$HIST")"
 assert_not_contains "ホームの実パスを出さない" "$(cat "$B/status.txt")" "$B/home"
+
+echo "B15: ビルドは起票に使う tako の順番待ちを通す（PATH の先頭の古い tako = 順番待ちを知らない、に負けない）"
+printf '#!/bin/sh\necho "old tako $*" >> "$FAKE_DIR/old-tako.log"\nexit 0\n' > "$B/bin/tako"
+chmod +x "$B/bin/tako"
+: > "$B/tako.log"
+new_commit n16
+env -i HOME="$B/home" PATH="$B/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+  FAKE_DIR="$B" FAKE_LOG="$B/calls.log" \
+  TAKO_FOOTPRINT_WATCH_MEASURE="$B/measure.sh" TAKO_FOOTPRINT_WATCH_TAKO="$B/tako" \
+  /bin/bash "$B/repo/scripts/nightly-footprint-watch.sh" > "$B/out.txt" 2>&1
+assert_contains "cargo build を tako queue 経由で走らせた" "$(cat "$B/tako.log")" "queue cargo build"
+assert_eq "古い tako には並ばせない" "" "$(cat "$B/old-tako.log" 2>/dev/null)"
+rm -f "$B/bin/tako"
 
 echo "B14: 別の見張りが走っている間は飛ばす（ロック）"
 mkdir -p "$B/home/.claude-orchestrator/locks/tako-footprint-watch.lock"

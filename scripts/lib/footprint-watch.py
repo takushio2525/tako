@@ -23,7 +23,9 @@ import tempfile
 # 起票の title の頭。**同じ悪化を重ねて積まない**ための目印でもある（find-open がこれで探す）
 PREFIX = "[footprint 回帰]"
 # 履歴の先頭の列（計測スクリプトの列はこの後ろに和集合で並ぶ）
-LEAD = ["date", "sha", "version", "status", "reason", "elapsed_s"]
+LEAD = ["date", "sha", "version", "ref", "status", "reason", "elapsed_s"]
+# 夜間が測る ref。これ以外（ブランチ）の行は判定されるが、origin/main の判定の基準には入らない
+MAIN_REF = "origin/main"
 # 履歴に残す行の上限（1 晩 1 行なので 3 年弱。古い行から落とす）
 MAX_ROWS = 1000
 # 同じ条件か（ペインの並び・プレビューの数が違う行どうしは比べない）
@@ -138,6 +140,12 @@ def filled_complete(row):
     return a != "" and a == b
 
 
+def ref_of(row):
+    """ref 欄（ref を持たない古い行は origin/main とみなす）"""
+    r = row.get("ref") or "-"
+    return MAIN_REF if r == "-" else r
+
+
 def cond_key(row):
     return tuple(row.get(k, "-") for k in CONDITION)
 
@@ -146,8 +154,8 @@ def cond_key(row):
 def cmd_record(a):
     fields, rows = read_tsv(a.history)
     mfields, measured = read_tsv(a.row)
-    new = {"date": a.date, "sha": a.sha, "version": a.version or "-", "status": a.status,
-           "reason": a.reason or "-", "elapsed_s": a.elapsed or "-"}
+    new = {"date": a.date, "sha": a.sha, "version": a.version or "-", "ref": a.ref or MAIN_REF,
+           "status": a.status, "reason": a.reason or "-", "elapsed_s": a.elapsed or "-"}
     if a.status == "ok":
         if not measured:
             print("record: 計測の行が無いのに status=ok", file=sys.stderr)
@@ -177,9 +185,12 @@ def judge(rows, state, window, min_n, scale):
         return res
     drawn = cur.get("drawn") == "あり"
     _, stub = env_parts(cur)
+    # 基準は origin/main の行と、今回と同じ ref の行（ブランチの行は main の基準を汚さない）
+    refs = (MAIN_REF, ref_of(cur))
     base = [r for r in rows[:-1]
             if r.get("status") == "ok" and cond_key(r) == cond_key(cur) and filled_complete(r)
-            and env_parts(r) == ("-", stub) and (r.get("drawn") == "あり") == drawn][-window:]
+            and env_parts(r) == ("-", stub) and ref_of(r) in refs
+            and (r.get("drawn") == "あり") == drawn][-window:]
     res["baseline"] = base
     for key, label, unit, kind, th, needs_draw in METRICS:
         v = num(cur.get(key))
@@ -288,7 +299,7 @@ def prev_measured_sha(rows):
     """今回より前に測れた（status=ok・標準の env）最後の行のコミット（変更の範囲を出すため）"""
     cur_sha = rows[-1].get("sha")
     for r in reversed(rows[:-1]):
-        if r.get("status") == "ok" and env_parts(r)[0] == "-" and r.get("sha") != cur_sha:
+        if r.get("status") == "ok" and env_parts(r)[0] == "-" and ref_of(r) == MAIN_REF and r.get("sha") != cur_sha:
             return r.get("sha")
     return ""
 
@@ -390,6 +401,7 @@ def main():
     r.add_argument("--date", required=True)
     r.add_argument("--sha", required=True)
     r.add_argument("--version", default="")
+    r.add_argument("--ref", default=MAIN_REF)
     r.add_argument("--status", required=True, choices=["ok", "unmeasured", "failed"])
     r.add_argument("--reason", default="")
     r.add_argument("--elapsed", default="")

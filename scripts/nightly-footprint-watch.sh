@@ -46,6 +46,8 @@
 #   TAKO_FOOTPRINT_WATCH_DIR           履歴・状態の置き場
 #   TAKO_FOOTPRINT_WATCH_TAKO          起票に使う tako（既定 /Applications/tako.app の tako → PATH の tako）
 #   TAKO_FOOTPRINT_WATCH_MEASURE       計測スクリプト（既定は測るコミットの scripts/measure-footprint-2011.sh）
+#   TAKO_FOOTPRINT_WATCH_REF           測るコミット（既定 origin/main。ブランチを夜間と同じ流れで測るとき。
+#                                      その行は origin/main の行と比べられるが、origin/main の基準には入らない）
 #
 # bash 3.2（macOS 同梱）で通す。set -e は使わない（失敗はすべて自分で受けて記録する）。
 set -uo pipefail
@@ -164,15 +166,29 @@ now() { date '+%Y-%m-%d %H:%M'; }
 RUN_DATE="$(now)"
 
 record() { # <status> <理由> <経過秒> [計測の TSV]
-  python3 "$PY" record --history "$HISTORY" --date "$RUN_DATE" --sha "$SHA" --version "$VERSION" \
+  python3 "$PY" record --history "$HISTORY" --date "$RUN_DATE" --sha "$SHA" --version "$VERSION" --ref "$REF" \
     --status "$1" --reason "$2" --elapsed "$3" --row "${4:-}"
 }
 
-# --- 測るコミット（origin/main）------------------------------------------------
-git -C "$ROOT" fetch origin --quiet 2>/dev/null || say "WARN: git fetch に失敗。手元の origin/main を測る"
-SHA="$(git -C "$ROOT" rev-parse --verify --quiet origin/main 2>/dev/null || true)"
+# 起票に使う tako。**ビルドの順番待ちもこの tako の置き場で通す**: 夜間リリースの PATH は先頭が
+# ~/.cargo/bin で、そこに古い tako（順番待ちを知らない）が居ると run_heavy が並ばずに走らせてしまう
+TAKO_CLI="${TAKO_FOOTPRINT_WATCH_TAKO:-}"
+if [ -z "$TAKO_CLI" ]; then
+  if [ -x /Applications/tako.app/Contents/MacOS/tako ]; then
+    TAKO_CLI=/Applications/tako.app/Contents/MacOS/tako
+  else
+    TAKO_CLI="$(command -v tako 2>/dev/null || true)"
+  fi
+fi
+BUILD_PATH="$PATH"
+[ -n "$TAKO_CLI" ] && BUILD_PATH="$(dirname "$TAKO_CLI"):$PATH"
+
+# --- 測るコミット（既定 origin/main）---------------------------------------------
+REF="${TAKO_FOOTPRINT_WATCH_REF:-origin/main}"
+git -C "$ROOT" fetch origin --quiet 2>/dev/null || say "WARN: git fetch に失敗。手元の ${REF} を測る"
+SHA="$(git -C "$ROOT" rev-parse --verify --quiet "${REF}^{commit}" 2>/dev/null || true)"
 if [ -z "$SHA" ]; then
-  say "ERROR: origin/main が引けないので測らない"
+  say "ERROR: ${REF} が引けないので測らない"
   exit 1
 fi
 VERSION="$(git -C "$ROOT" show "$SHA:Cargo.toml" 2>/dev/null | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
@@ -208,7 +224,7 @@ t0=$(date +%s)
 rc=0
 # 順番待ちは上限の 2/3 で諦めさせる（残りをビルドに充てる。諦めた tako queue は 75 で返る）
 run_limited "$BUILD_TIMEOUT" "$WORK/build.log" \
-  env TAKO_QUEUE_MAX_WAIT="$((BUILD_TIMEOUT * 2 / 3))s" \
+  env PATH="$BUILD_PATH" TAKO_QUEUE_MAX_WAIT="$((BUILD_TIMEOUT * 2 / 3))s" \
   /bin/bash -c 'cd "$1" && . scripts/lib/queue.sh && run_heavy cargo build --release -q -p tako-cli -p tako-app' _ "$WT" \
   || rc=$?
 build_s=$(( $(date +%s) - t0 ))
@@ -281,14 +297,6 @@ case "$ACTION" in
 esac
 
 # --- 起票（同じ悪化の未完了の 1 件があれば書き換える）--------------------------------------
-TAKO_CLI="${TAKO_FOOTPRINT_WATCH_TAKO:-}"
-if [ -z "$TAKO_CLI" ]; then
-  if [ -x /Applications/tako.app/Contents/MacOS/tako ]; then
-    TAKO_CLI=/Applications/tako.app/Contents/MacOS/tako
-  else
-    TAKO_CLI="$(command -v tako 2>/dev/null || true)"
-  fi
-fi
 BODY="$WORK/judge/body.md"
 PREV_SHA="$(kv prev_sha)"
 if [ -n "$PREV_SHA" ]; then
