@@ -20,25 +20,6 @@
 
 ---
 
-## 2026-10-15（#1951: `.ino` の言語サーバ = arduino-language-server の行・伴走（arduino-cli / clangd）と空の設定ファイルを表の `Arg` で・基板が未選択なら unconfigured で起こさず選ぶコマンドを案内）
-- 実測 `scripts/test-lsp-arduino-1951.sh` 23 OK（IDE 同梱物で診断・ホバー・補完・帯の画像・選べば合図で起きる・ALS なし・A/B）。常駐 ALS + clangd 72〜77 MB。PR #2109
-- `.h` / `.cpp` を ALS へ回すと先に `.ino` を開いた時だけ正しい = #2113 に分けた
-
-## 2026-10-15（#2106: CI の macOS で実 tmux のテストが 1 本も走っていなかった = ランナーの image に tmux が無く全部 skip のまま ok）
-- tmux の導入段（11 秒）+ `tako_core::tmux_test_gate`（`TAKO_TEST_REQUIRE_TMUX=1` で skip を panic・台帳から件数を出す）+ 番犬 `issue2106_*`。CI で 52 本が実 tmux で走る。PR #2110
-- 罠: 件数の `sort -u` が en_US.UTF-8 の照合で日本語のテスト名を潰した（`LC_ALL=C`）。issue1857 の負荷依存のフレークは #2114
-
-## 2026-10-15（#2023: 夜間リリースの後に footprint を測って基準と比べ、悪化を tako todo へ = 同じ悪化は重ねない・蓋閉じは未実測・終了コードは変えない）
-- `scripts/nightly-footprint-watch.sh` + `scripts/lib/footprint-watch.py`。実機で注入 `TAKO_PERSIST=0` → 起票（+116%）・翌晩は重ねない・tako-vd 不可は未実測。計測の段 163〜165 秒。モック 130 PASS。PR #2116
-- 出力中の footprint は同じコミットでも ±12% 揺れる（閾値 +20%）= 誤検出が出たら閾値を見直す
-
-## 2026-10-15（#2112: ネット復帰で接続エラーで止まった全セッションを即時に再開 = 既定 ON・`tako limit-resume --network` / MCP `tako_limit_resume` の `network` / 設定画面「一般」）
-- 入力欄を錨にした画面の判定 + 送ってよい停止があるあいだだけの到達確認 + 送達確認つきの経路（#813 と同じ層）。カタログ +332 B。PR #2118
-- 実測 `scripts/test-net-resume-2112.sh` 43 PASS（復帰 → 3 本へ送達・送ってはいけない 5 種へ 0・OFF の A/B・止まっていないあいだの到達確認 0 回・visual-test `net-resume`）
-
-## 2026-10-15（#2114: issue1857 のフレークの真因 = PTY への書き込みが EIO（子の側が全部閉じた）で `pty_loop` が ChildExit を送らずに畳まれていた）
-- unix の EIO は相手側が閉じたとして入力を捨て fd を監視から外し、子の終了の合図を待つ。A/B `TAKO_2114_LEGACY=1`・注入 `TAKO_2114_INJECT_CHILD_EVENT_DELAY_MS`・番犬 `issue2114_*`。PR #2117
-
 ## 2026-10-15（#2119: 夜間の PATH の先頭の古い tako に負けず、run_heavy が順番待ちを知る tako を探して並ぶ）
 - PATH の tako を上から全部 → .app の同梱 CLI を `--max-wait` で確かめ、無い / 応答しない（10 秒）は直に走る。A/B `TAKO_2119_LEGACY=1`。モック `scripts/test-nightly-queue-path-2119.sh` を CI の macOS へ。PR #2121
 
@@ -94,3 +75,18 @@
 ## 2026-10-16（#1981: local-rules の常時部が取り分を超えたら `tako migrate` に区切りを上げる案を出し、明示の `tako migrate run` でだけ動かす）
 - 自動の発火点（setup・起動時）は動かさない・本文はバイト一致・`.pre-v2.bak`。本番の写しで 474 B 超過 → 5,031 B（当てるかはユーザー判断 = tako todo）。PR #2143
 - 実経路 `scripts/test-local-rules-marker-move-1981.sh` 29 PASS（旧 16 FAIL）・番犬 `issue1981_marker_move_watchdog`・カタログ +89 B
+
+## 2026-10-16（#2047: CI 待ちの上限を 4800 秒へ伸ばし、上限に達したら最後に 2 回まで見て緑 / 赤を確定する）
+- `TAKO_WAIT_PR_CHECKS_TIMEOUT` で変更可。モック 197 PASS（修正前に当てると Test 33〜35 の 34 件が落ちる）・A/B `TAKO_2047_LEGACY=1`。PR #2145
+
+## 2026-10-16（#2015: ファイルツリーで表に無い拡張子なしの dotfile（`.npmrc` 等）を設定アイコンに = 常に偽だった判定を直した）
+- `.env.local` は従来どおり拡張子で引く（`.env` との食い違いは #2152）。PR #2149
+
+## 2026-10-16（#2014: プレビューの変更履歴を開く切替の git（rev-parse / log --follow）を background の `OffloadJob::PreviewChangelog` へ・上限 30 秒）
+- 実経路 `scripts/test-changelog-offload-2014.sh` 19 PASS（最中の list は修正後 0.03 秒 / 修正前 8 秒で打ち切り）・A/B `TAKO_2014_LEGACY=1`・カタログ増 0 B。PR #2148。diff の展開は #2150
+
+## 2026-10-16（#1952: `.ino` の基板とポートをドロップダウン・`tako run-config --board/--port`・MCP で選ぶ = `board attach` が sketch.yaml へ書く・コア無しは案内だけ）
+- 実経路 `scripts/test-run-board-1952.sh` 28 PASS（3 経路とも arduino-cli の直書きとバイト一致・`core install` 0 回）・カタログ +282 B。PR #2144
+
+## 2026-10-16（#2025: 上端ドラッグのオートスクロールが送れる履歴なし / 最上端で選択を (0, 0) へ縮めていた → `drag_scroll_step` で送れないときは端を動かさない）
+- A/B `TAKO_2025_LEGACY=1`・番犬 `issue2025_tick_が判定を通す_watchdog`・実クリック `scripts/test-drag-autoscroll-2025.sh`。下端の対称は #2153。PR #2147
