@@ -110,6 +110,61 @@ pub fn index_text(on_demand: &str) -> String {
     format!("<{FETCH_HINT}: {}>\n", heads.join(" / "))
 }
 
+/// 追記が prompt に払う量 = `常時部 + 生成される索引`（**取り分と比べる値の正本**）。
+/// 区切りを入れる位置（#1477）も、区切りを上げる案（#1981）も、この 1 本で測る
+pub fn always_cost(always: &str, on_demand: &str) -> usize {
+    always.len() + index_text(on_demand).len()
+}
+
+/// 見出し行の行頭バイトオフセット・深さ・行番号（1 始まり）を、`text` の先頭から
+/// `end` バイトの手前まで集める。
+///
+/// **コードフェンス（```` ``` ```` / `~~~`）の中の `#` 行は見出しにしない**（#1981）。
+/// シェルの例の `# コメント` を見出しと取り違えると、それが最も浅いレベルになって
+/// 区切りの候補を独占し、コードブロックの途中で切ってしまう
+fn heading_lines(text: &str, end: usize) -> Vec<(usize, usize, usize)> {
+    let mut heads = Vec::new();
+    let mut fence: Option<char> = None;
+    let mut offset = 0usize;
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        if offset >= end {
+            break;
+        }
+        let trimmed = line.trim_start();
+        let opener = ['`', '~']
+            .into_iter()
+            .find(|c| trimmed.starts_with(&c.to_string().repeat(3)));
+        match (fence, opener) {
+            (None, Some(c)) => fence = Some(c),
+            (Some(f), Some(c)) if f == c => fence = None,
+            (None, None) => {
+                if let Some(level) = heading_level(line) {
+                    heads.push((offset, level, i + 1));
+                }
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    heads
+}
+
+/// 区切りの候補 = 先頭の見出し（題名）を除き、残りの**最も浅いレベル**の見出しの
+/// 行頭（バイトオフセットと行番号）。節の途中（深い見出し）では切らない
+/// （親の見出しと本文が別れると意味が壊れる）
+fn cut_candidates(heads: &[(usize, usize, usize)]) -> Vec<(usize, usize)> {
+    let Some(rest) = heads.get(1..) else {
+        return Vec::new();
+    };
+    let Some(min_level) = rest.iter().map(|(_, l, _)| *l).min() else {
+        return Vec::new();
+    };
+    rest.iter()
+        .filter(|(_, l, _)| *l == min_level)
+        .map(|(off, _, line)| (*off, *line))
+        .collect()
+}
+
 /// 区切りを入れる位置（バイトオフセット）を決める。
 ///
 /// 見出し境界でしか切らない。ファイル順に常時部へ詰め、
@@ -120,25 +175,124 @@ pub fn plan_marker_offset(text: &str, budget: usize) -> Option<usize> {
     if split(text).marked {
         return None;
     }
-    // 行頭のバイトオフセットと見出しの深さ
-    let mut heads: Vec<(usize, usize)> = Vec::new();
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n') {
-        if let Some(level) = heading_level(line) {
-            heads.push((offset, level));
-        }
-        offset += line.len();
+    cut_candidates(&heading_lines(text, text.len()))
+        .into_iter()
+        .map(|(off, _)| off)
+        .rfind(|off| always_cost(&text[..*off], &text[*off..]) <= budget)
+}
+
+/// 区切りのある追記の常時部が取り分を超えたときの、区切りを上げる案（#1981）。
+///
+/// #1477 の自動分割は「区切りがまだ無いファイル」へ 1 回入れるだけなので、その後に
+/// 利用者が常時部へ規則を書き足して取り分を超えても誰も直さない。どこまでを常時に
+/// 残すかは利用者の判断なので**自動では動かさず**、ここで案を作り、明示の承認
+/// （`tako migrate run`）でだけ [`move_marker`] が当てる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerMove {
+    /// 何も出さない = 区切りが無い（#1477 の自動分割の受け持ち）か、取り分に収まっている
+    Fits,
+    /// 見出し境界へ上げれば取り分に収まる
+    Move(MovePlan),
+    /// 上げても収まらない（常時部に題名以外の見出しが無い / 先頭の節だけで超過）。
+    /// 区切りは動かさない（機械的に切ると意味が壊れる）
+    CannotFit {
+        /// 今の `常時部 + 索引`
+        cost: usize,
+        budget: usize,
+    },
+}
+
+/// 区切りをどこへ上げるか（行番号はすべて**動かす前の**ファイルの 1 始まり）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovePlan {
+    /// 今の `常時部 + 索引`
+    pub cost: usize,
+    pub budget: usize,
+    /// 動かしたあとの `常時部 + 索引`
+    pub new_cost: usize,
+    /// 今の区切りの行
+    pub marker_line: usize,
+    /// 区切りをこの見出しの前へ置く（その行）
+    pub heading_line: usize,
+    /// その見出し行（`## 詳細` のように `#` ごと）
+    pub heading: String,
+    /// on-demand 部へ移る見出し（`#` を除いた文言。ファイル順）
+    pub moved: Vec<String>,
+    /// 見出し行の行頭バイトオフセット（[`move_marker`] が使う）
+    offset: usize,
+}
+
+impl MovePlan {
+    /// 取り分の超過バイト数
+    pub fn over_bytes(&self) -> usize {
+        self.cost.saturating_sub(self.budget)
     }
-    // 先頭の見出し（題名）では切らない。残りの最も浅いレベルだけを境界にする
-    let rest = heads.get(1..)?;
-    let min_level = rest.iter().map(|(_, l)| *l).min()?;
-    let cuts: Vec<usize> = rest
-        .iter()
-        .filter(|(_, l)| *l == min_level)
-        .map(|(off, _)| *off)
-        .collect();
-    cuts.into_iter()
-        .rfind(|off| text[..*off].len() + index_text(&text[*off..]).len() <= budget)
+}
+
+/// 区切りを上げる案を作る（書き換えない）。
+///
+/// 候補は**今の常時部の中の**見出し境界（題名を除く最も浅いレベル。#1477 と同じ規則）で、
+/// 取り分に収まる境界のうち**区切りに最も近いもの**（= 常時部に最も多く残るもの）を選ぶ。
+/// 区切りを下げる案は出さない（取り分に収まっていれば何も言わない）
+pub fn plan_marker_move(text: &str, budget: usize) -> MarkerMove {
+    let s = split(text);
+    if !s.marked {
+        return MarkerMove::Fits;
+    }
+    let cost = always_cost(s.always, s.on_demand);
+    if cost <= budget {
+        return MarkerMove::Fits;
+    }
+    let marker_at = s.always.len();
+    let heads = heading_lines(text, marker_at);
+    for (off, line) in cut_candidates(&heads).into_iter().rev() {
+        let on_demand = format!("{}{}", &text[off..marker_at], s.on_demand);
+        let new_cost = always_cost(&text[..off], &on_demand);
+        if new_cost > budget {
+            continue;
+        }
+        let line_at = |o: usize| text[o..].lines().next().unwrap_or_default().trim_end();
+        let level = heading_level(line_at(off));
+        return MarkerMove::Move(MovePlan {
+            cost,
+            budget,
+            new_cost,
+            marker_line: s.always.split_inclusive('\n').count() + 1,
+            heading_line: line,
+            heading: line_at(off).to_string(),
+            // 移る**節**（区切りと同じ深さの見出し）だけを並べる。小見出しまで並べると
+            // 案の 1 文が読めなくなる
+            moved: heads
+                .iter()
+                .filter(|(o, l, _)| *o >= off && Some(*l) == level)
+                .map(|(o, _, _)| line_at(*o).trim_start_matches('#').trim().to_string())
+                .collect(),
+            offset: off,
+        });
+    }
+    MarkerMove::CannotFit { cost, budget }
+}
+
+/// 案のとおりに区切りを上げた本文（`None` = 案が無い = 触らない）。
+///
+/// やるのは**区切りの行を抜いて見出しの前へ 1 行入れ直すことだけ**なので、
+/// 区切りの行を除いた本文は前後でバイト単位で一致する
+/// （`strip_marker(new) == strip_marker(old)`）。表記ゆれの区切り
+/// （`<!-- TAKO:ONDEMAND -->` 等）は正本の [`MARKER`] で入れ直す。
+/// 2 本目以降の区切りは on-demand 部の中身なので触らない
+pub fn move_marker(text: &str, budget: usize) -> Option<String> {
+    let MarkerMove::Move(plan) = plan_marker_move(text, budget) else {
+        return None;
+    };
+    let s = split(text);
+    let marker_at = s.always.len();
+    let marker_end = text.len() - s.on_demand.len();
+    Some(format!(
+        "{}{MARKER}\n{}{}",
+        &text[..plan.offset],
+        &text[plan.offset..marker_at],
+        &text[marker_end..]
+    ))
 }
 
 /// 区切りを 1 行だけ入れた本文（`None` = 切れないので触らない）。
@@ -165,7 +319,8 @@ pub struct SplitAdvice {
 /// 目の前のファイルで何行動かせば足りるかを答える）。
 ///
 /// `marked` が false = まだ区切りが無い追記なので、**人に手を動かさせる前に
-/// 自動移行を案内する**（#916 の原則。手で切るのは最終手段）
+/// 自動移行を案内する**（#916 の原則。手で切るのは最終手段）。
+/// `marked` が true でも、手で動かさせる前に `tako migrate` の案（#1981）を案内する
 pub fn split_advice(over_bytes: usize, always: &str, marked: bool) -> SplitAdvice {
     let lines = always.lines().count().max(1);
     let avg = (always.len() / lines).max(1);
@@ -173,10 +328,10 @@ pub fn split_advice(over_bytes: usize, always: &str, marked: bool) -> SplitAdvic
     let (ja, en) = if marked {
         (
             format!(
-                "常時部が {over_bytes} バイト超過している。区切り `{MARKER}` を {move_lines} 行ぶん上へ動かして詳細を on-demand 部（`tako orchestrator guide local-rules` で引ける）へ移すか、常時部を {over_bytes} バイト短くする"
+                "常時部が {over_bytes} バイト超過している。区切り `{MARKER}` を見出し境界へ上げる案を `tako migrate` が出す（承認すると `tako migrate run` で動く。上げた節は on-demand 部 = `tako orchestrator guide local-rules` で引け、内容は 1 文字も消えない）。案が出ない（上げても収まらない）ときは区切りを {move_lines} 行ぶん上へ自分で動かすか、常時部を {over_bytes} バイト短くする"
             ),
             format!(
-                "The always-on part is {over_bytes} bytes over. Move the `{MARKER}` divider up by about {move_lines} lines so the detail sits in the on-demand part (fetched with `tako orchestrator guide local-rules`), or shorten the always-on part by {over_bytes} bytes"
+                "The always-on part is {over_bytes} bytes over. `tako migrate` proposes moving the `{MARKER}` divider up to a heading boundary (approve it with `tako migrate run`; the moved sections stay in the on-demand part, fetched with `tako orchestrator guide local-rules`, and nothing is deleted). If no proposal appears (moving up cannot make it fit), move the divider up about {move_lines} lines yourself or shorten the always-on part by {over_bytes} bytes"
             ),
         )
     } else {
@@ -322,5 +477,151 @@ mod tests {
         assert!(none.en.contains("tako migrate run"), "{}", none.en);
         // 空でも 0 除算しない
         assert_eq!(split_advice(1, "", true).move_lines, 1);
+    }
+
+    // ─── #1981: 区切りを上げる案 ─────────────────────────────────────
+
+    /// 区切りの手前に 3 節（A / B / C）、後ろに 1 節（D）
+    const MARKED: &str = "# 題名\n\n前書き\n\n## A\n\naaa\n\n## B\n\nbbb\n\n## C\n\nccc\n<!-- tako:on-demand -->\n## D\n\nddd\n";
+
+    fn cost_of(text: &str) -> usize {
+        let s = split(text);
+        always_cost(s.always, s.on_demand)
+    }
+
+    fn plan(text: &str, budget: usize) -> MovePlan {
+        match plan_marker_move(text, budget) {
+            MarkerMove::Move(p) => p,
+            other => panic!("案が出ない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 取り分を超えたら区切りに最も近い見出しの前へ上げる案を出す() {
+        let cost = cost_of(MARKED);
+        // 1 バイト超過 = 1 節（C）を下ろせば足りる
+        let p = plan(MARKED, cost - 1);
+        assert_eq!(p.heading, "## C");
+        assert_eq!(p.heading_line, 13);
+        assert_eq!(p.marker_line, 16);
+        assert_eq!(p.over_bytes(), 1);
+        assert_eq!(p.moved, vec!["C"]);
+        assert!(p.new_cost <= p.budget, "{p:?}");
+        assert_eq!(cost_of(&move_marker(MARKED, cost - 1).unwrap()), p.new_cost);
+        // C を下ろしても収まらなければ 1 つ手前（B）へ
+        let p2 = plan(MARKED, p.new_cost - 1);
+        assert_eq!(p2.heading, "## B");
+        assert_eq!(p2.moved, vec!["B", "C"]);
+    }
+
+    #[test]
+    fn 上げても区切りの行を除いた本文はバイト単位で一致する() {
+        let budget = cost_of(MARKED) - 1;
+        let moved = move_marker(MARKED, budget).expect("上げられる");
+        assert_eq!(strip_marker(&moved), strip_marker(MARKED));
+        assert_eq!(moved.len(), MARKED.len(), "区切りの行が 1 本のまま");
+        assert_eq!(moved.matches(MARKER).count(), 1);
+        let s = split(&moved);
+        assert!(s.always.ends_with("bbb\n\n"), "{moved}");
+        assert!(s.on_demand.starts_with("## C\n"), "{moved}");
+        // 当てたあとは取り分に収まる = もう案は出ない（2 回目は no-op）
+        assert_eq!(plan_marker_move(&moved, budget), MarkerMove::Fits);
+        assert_eq!(move_marker(&moved, budget), None);
+    }
+
+    #[test]
+    fn 取り分内か区切りが無ければ何も出さない() {
+        assert_eq!(
+            plan_marker_move(MARKED, cost_of(MARKED)),
+            MarkerMove::Fits,
+            "ちょうど取り分なら超過ではない"
+        );
+        // 区切りが無いものは #1477 の自動分割の受け持ち（ここでは何も言わない）
+        assert_eq!(plan_marker_move(SAMPLE, 1), MarkerMove::Fits);
+        assert_eq!(move_marker(SAMPLE, 1), None);
+    }
+
+    #[test]
+    fn 上げても収まらなければ動かさない() {
+        // 常時部に見出しが 1 つも無い
+        let flat = format!("{}{MARKER}\n## D\nddd\n", "本文\n".repeat(50));
+        assert!(matches!(
+            plan_marker_move(&flat, 10),
+            MarkerMove::CannotFit { .. }
+        ));
+        assert_eq!(move_marker(&flat, 10), None);
+        // 題名と先頭の節だけで取り分を超える（どの境界へ上げても収まらない）
+        let fat = format!(
+            "# 題名\n{}\n## A\na\n{MARKER}\n## D\nddd\n",
+            "x".repeat(500)
+        );
+        match plan_marker_move(&fat, 100) {
+            MarkerMove::CannotFit { cost, budget } => {
+                assert_eq!(cost, cost_of(&fat));
+                assert_eq!(budget, 100);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(move_marker(&fat, 100), None);
+        // 区切りが先頭 = 常時部が空。索引だけなら収まる（何も出さない）
+        let top = format!("{MARKER}\n## A\naaa\n## B\nbbb\n");
+        assert_eq!(plan_marker_move(&top, 1000), MarkerMove::Fits);
+        // 索引だけで超えても、上げる先が無いので動かさない
+        assert!(matches!(
+            plan_marker_move(&top, 1),
+            MarkerMove::CannotFit { .. }
+        ));
+    }
+
+    #[test]
+    fn コードフェンスの中のシャープ行は見出しにしない() {
+        let text = "# 題名\n\n## A\n\n```bash\n# コメント\necho\n```\n\n## B\n\nbbb\n<!-- tako:on-demand -->\n## C\n";
+        let p = plan(text, cost_of(text) - 1);
+        assert_eq!(
+            p.heading, "## B",
+            "フェンス内の `# コメント` で切った: {p:?}"
+        );
+        // #1477 の自動分割も同じ走査を通る（フェンスの中では切らない）
+        let unmarked = strip_marker(text);
+        let b = unmarked.find("## B").unwrap();
+        let budget = always_cost(&unmarked[..b], &unmarked[b..]);
+        let off = plan_marker_offset(&unmarked, budget);
+        assert_eq!(off, Some(b), "フェンス内の `# コメント` で切った");
+    }
+
+    #[test]
+    fn 表記ゆれの区切りは正本で入れ直し_2本目の区切りは残す() {
+        let text = "# 題名\n\n## A\n\naaa\n\n## B\n\nbbb\n<!-- TAKO:ONDEMAND -->\n## C\n\nccc\n<!-- tako:on-demand -->\n## D\n";
+        let moved = move_marker(text, cost_of(text) - 1).expect("上げられる");
+        assert!(!moved.contains("TAKO:ONDEMAND"), "{moved}");
+        assert_eq!(
+            moved.matches(MARKER).count(),
+            2,
+            "2 本目は on-demand 部の中身"
+        );
+        assert_eq!(strip_marker(&moved), strip_marker(text));
+    }
+
+    #[test]
+    fn 末尾の改行が無い区切りでも本文は変わらない() {
+        // on-demand 部が空 = 索引が無い。上げると索引（約 100 バイト）が増えるので、
+        // それより大きい節を下ろす形にする
+        let text = format!(
+            "# 題名\n\n## A\n\naaa\n\n## B\n\n{}\n{MARKER}",
+            "b".repeat(300)
+        );
+        let text = text.as_str();
+        let moved = move_marker(text, cost_of(text) - 1).expect("上げられる");
+        assert_eq!(strip_marker(&moved), strip_marker(text));
+        assert!(split(&moved).on_demand.starts_with("## B"), "{moved}");
+    }
+
+    #[test]
+    fn 移る節は区切りと同じ深さの見出しだけを並べる() {
+        let text = "# 題名\n\n## A\n\naaa\n\n## B\n\n### B-1\n\nb\n\n## C\n\nccc\n<!-- tako:on-demand -->\n## D\n";
+        let c = plan(text, cost_of(text) - 1);
+        let p = plan(text, c.new_cost - 1);
+        assert_eq!(p.heading, "## B");
+        assert_eq!(p.moved, vec!["B", "C"], "小見出し B-1 は並べない");
     }
 }

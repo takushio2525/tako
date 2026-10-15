@@ -1124,6 +1124,11 @@ tako migrate run --schema profiles # 種別を 1 つに絞る
 超えたら、最初の 1 本を残して古いほうから詰めます）。応答の `files[].state` が
 `unreadable` のものは「設定が壊れているので既定値で動いている」という意味です。
 
+`files[].state` が `proposed` のものは、**あなたの判断が要るので自動では当てない案**です
+（例: 個人ルール `local-rules.md` の「いつも読む部分」が上限を超えたので、区切りを
+どの見出しの前へ上げるか）。中身は `files[].proposal` に出ます。それでよければ
+`tako migrate run` で当たります（`tako setup` や起動時の自動移行では当たりません）。
+
 **設定が壊れて GUI が起動しないときの復旧手段**なので、`tako recover` と同じく
 アプリが動いていなくても実行できます。
 

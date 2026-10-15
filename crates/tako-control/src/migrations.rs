@@ -26,7 +26,8 @@
 use std::path::{Path, PathBuf};
 
 use tako_core::migration::{
-    self, FileOutcome, FileReport, MigrationIo, MigrationReport, SchemaId, SchemaSpec, Step,
+    self, FileOutcome, FileReport, MigrationIo, MigrationReport, Proposal, SchemaId, SchemaSpec,
+    Step,
 };
 use tako_core::platform::support::Note;
 
@@ -334,6 +335,155 @@ const PROMPT_APPEND_STEPS: &[Step] = &[Step {
     once: false,
     apply: split_oversized_append,
 }];
+
+// --- 追記の区切りを上げる案（#1981）------------------------------------------
+//
+// #1477 の手順は「区切りがまだ無いファイル」へ 1 回入れるだけで、区切りのあるファイルは
+// 世代 v2 = 二度と触らない。その後に利用者が常時部へ規則を書き足して取り分を超えても
+// `status` は up_to_date のままだった。**どこまでを常時に残すかは利用者の判断**なので
+// 世代（= 自動で当たる移行）にはせず、`status` に案として出して明示の `run` でだけ当てる
+
+/// 自動では当てない案をどう扱うか（#1981）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proposals {
+    /// 自動の発火点（setup / 起動時）: 出さない・当てない（勝手に動かさない）
+    Hide,
+    /// `tako migrate status`: 案として出す（書かない）
+    Show,
+    /// 明示の `tako migrate run` / MCP `tako_migrate` の run: 当てる
+    Apply,
+}
+
+const PROMPT_APPEND_MARKER_MOVED: Note = Note::new(
+    "常時部が取り分を超えていたので、区切り `<!-- tako:on-demand -->` を見出し境界へ上げた（明示の tako migrate run による承認。区切りの行を除く本文は 1 文字も変えない。#1981）",
+    "The always-on part was over its share, so the `<!-- tako:on-demand -->` divider was moved up to a heading boundary (approved by an explicit `tako migrate run`; apart from the divider line nothing changed; #1981)",
+);
+
+/// 案の文言と内訳（`None` = 何も出さない = 区切りが無いか取り分に収まっている）
+fn marker_move_proposal(plan: &tako_core::prompt_append::MarkerMove) -> Option<Proposal> {
+    use tako_core::prompt_append::MarkerMove;
+    match plan {
+        MarkerMove::Fits => None,
+        MarkerMove::Move(p) => {
+            let over = p.over_bytes();
+            let moved_ja = p.moved.join("・");
+            let moved_en = p.moved.join(", ");
+            Some(Proposal {
+                ja: format!(
+                    "常時部（区切りの手前 + 索引）が {} / {} バイトで {over} バイト超過。区切りを {} 行目から {} 行目の「{}」の前へ上げる案（常時部は {} バイトになり、{moved_ja} が on-demand 部へ移る。内容は 1 文字も消えない）。当てるなら tako migrate run",
+                    p.cost, p.budget, p.marker_line, p.heading_line, p.heading, p.new_cost
+                ),
+                en: format!(
+                    "The always-on part (before the divider + index) is {} / {} bytes, {over} bytes over. Proposal: move the divider from line {} to before \"{}\" on line {} (the always-on part becomes {} bytes and {moved_en} move to the on-demand part; nothing is deleted). Apply it with `tako migrate run`",
+                    p.cost, p.budget, p.marker_line, p.heading, p.heading_line, p.new_cost
+                ),
+                approvable: true,
+                facts: serde_json::json!({
+                    "always_bytes": p.cost,
+                    "limit": p.budget,
+                    "over_bytes": over,
+                    "after_bytes": p.new_cost,
+                    "marker_line": p.marker_line,
+                    "move_before_line": p.heading_line,
+                    "move_before": p.heading,
+                    "moves_to_on_demand": p.moved,
+                    "approve": "tako migrate run",
+                }),
+            })
+        }
+        MarkerMove::CannotFit { cost, budget } => {
+            let over = cost.saturating_sub(*budget);
+            Some(Proposal {
+                ja: format!(
+                    "常時部（区切りの手前 + 索引）が {cost} / {budget} バイトで {over} バイト超過しているが、見出し境界へ上げても収まらない（常時部に題名以外の見出しが無いか、先頭の節だけで超過）。区切りは動かさない。常時部を {over} バイト短くするか、区切りを自分で手前へ置く"
+                ),
+                en: format!(
+                    "The always-on part (before the divider + index) is {cost} / {budget} bytes, {over} bytes over, and moving the divider up to a heading boundary cannot make it fit (no heading besides the title before the divider, or the first section alone is over). The divider is left as is. Shorten the always-on part by {over} bytes or place the divider earlier yourself"
+                ),
+                approvable: false,
+                facts: serde_json::json!({
+                    "always_bytes": cost,
+                    "limit": budget,
+                    "over_bytes": over,
+                }),
+            })
+        }
+    }
+}
+
+/// 追記 1 本ぶんの報告へ #1981 の案を重ねる。
+///
+/// 触るのは**区切りがあって up_to_date の追記だけ**（区切りが無いものは #1477 の
+/// 自動分割の受け持ち = その報告をそのまま返す）。当てるときは移行と同じく
+/// ロックを取って読み直し、**区切りの行を除いた本文が前後で一致することを
+/// データで確かめてから**、移行と同じ退避（`.pre-v2.bak`）を通して書く
+fn append_marker_move(file: FileReport, proposals: Proposals) -> FileReport {
+    use tako_core::prompt_append;
+    if proposals == Proposals::Hide || !matches!(file.outcome, FileOutcome::UpToDate { .. }) {
+        return file;
+    }
+    let budget = tako_core::context_budget::PROMPT_APPEND_MAX_BYTES;
+    let Ok(Some(text)) = migration::FsIo.read(&file.path) else {
+        return file;
+    };
+    let Some(proposal) = marker_move_proposal(&prompt_append::plan_marker_move(&text, budget))
+    else {
+        return file;
+    };
+    if proposals == Proposals::Show || !proposal.approvable {
+        return FileReport {
+            outcome: FileOutcome::Proposed { proposal },
+            ..file
+        };
+    }
+    let _lock = crate::config_io::lock_exclusive(&file.path).ok();
+    // 待っている間に別プロセスが動かしていれば、読み直した内容では案が出ない
+    let Ok(Some(text)) = migration::FsIo.read(&file.path) else {
+        return file;
+    };
+    let plan = prompt_append::plan_marker_move(&text, budget);
+    let Some(moved) = prompt_append::move_marker(&text, budget) else {
+        return file;
+    };
+    if prompt_append::strip_marker(&moved) != prompt_append::strip_marker(&text) {
+        return FileReport {
+            outcome: FileOutcome::Failed {
+                reason: "区切りの行以外が変わる書き換えになったので書かない（#1981）".into(),
+            },
+            ..file
+        };
+    }
+    let outcome = match migration::write_with_backup(
+        &file.path,
+        &text,
+        &moved,
+        PROMPT_APPEND_VERSION,
+        &ConfigIo,
+    ) {
+        Ok(backup) => {
+            // どこからどこへ動かしたかを残す（見出しの文言 = 利用者のルールは書かない）
+            if let tako_core::prompt_append::MarkerMove::Move(p) = &plan {
+                crate::diag::persist_log(&format!(
+                    "区切りを上げた: {} {} 行目 -> {} 行目の見出しの前（常時部 + 索引 {} -> {} B・取り分 {} B・明示の tako migrate run。#1981）",
+                    file.path.display(),
+                    p.marker_line,
+                    p.heading_line,
+                    p.cost,
+                    p.new_cost,
+                    p.budget
+                ));
+            }
+            FileOutcome::Migrated {
+                from: PROMPT_APPEND_VERSION,
+                to: PROMPT_APPEND_VERSION,
+                backup,
+                applied: vec![PROMPT_APPEND_MARKER_MOVED],
+            }
+        }
+        Err(reason) => FileOutcome::Failed { reason },
+    };
+    FileReport { outcome, ..file }
+}
 
 const PROFILE_STEPS: &[Step] = &[
     Step {
@@ -692,8 +842,25 @@ impl MigrationIo for ReadOnlyIo {
 /// 登録簿の全ファイルを最新形式へ揃える（`Mode::Check` なら見るだけ）。
 ///
 /// **発火点はここを呼ぶ**（setup / GUI 起動 / master・CLI 経路）。
-/// `only` を渡すとその種別だけ扱う
+/// `only` を渡すとその種別だけ扱う。
+///
+/// 利用者の判断が要る案（#1981）は、`Check` では案として出し、`Apply` では**当てない**
+/// （自動の発火点が勝手に動かさない）。当てるのは [`run_explicit`] だけ
 pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
+    let proposals = match mode {
+        Mode::Check => Proposals::Show,
+        Mode::Apply => Proposals::Hide,
+    };
+    run_inner(mode, only, proposals)
+}
+
+/// 明示の `tako migrate run` / MCP `tako_migrate` の run（#1981）。
+/// 自動の発火点と同じ移行に加えて、`status` に出ていた**案も当てる**（= 利用者の承認）
+pub fn run_explicit(only: Option<SchemaId>) -> MigrationReport {
+    run_inner(Mode::Apply, only, Proposals::Apply)
+}
+
+fn run_inner(mode: Mode, only: Option<SchemaId>, proposals: Proposals) -> MigrationReport {
     let mut report = MigrationReport::default();
     // **ユニットテストは本番のデータディレクトリを触らない**。#916 の棚卸しで、
     // 隔離せずに本番の profiles/ を書くテストが実際に残骸を作っていたのが見つかった
@@ -719,7 +886,12 @@ pub fn run(mode: Mode, only: Option<SchemaId>) -> MigrationReport {
             continue;
         }
         for path in targets(spec.id) {
-            report.push(migrate_one(spec, &path, mode));
+            let file = migrate_one(spec, &path, mode);
+            report.push(if spec.id == SchemaId::PromptAppend {
+                append_marker_move(file, proposals)
+            } else {
+                file
+            });
         }
         // #1453: 既存プロファイルの形を直したあと、**まだ無いプロジェクト専用
         // プロファイル**を作る。登録済みプロジェクトを後から自動化の対象にするのに
@@ -1074,7 +1246,8 @@ pub fn setup_lines() -> Vec<String> {
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
                 lines.push(format!("{}: {reason}", file.path.display()))
             }
-            FileOutcome::Absent | FileOutcome::UpToDate { .. } => {}
+            // 案（#1981）は自動の発火点では出ない・書かない
+            FileOutcome::Absent | FileOutcome::UpToDate { .. } | FileOutcome::Proposed { .. } => {}
         }
     }
     lines
@@ -1097,7 +1270,8 @@ pub fn report_json(action: &str, only: Option<&str>) -> Result<serde_json::Value
         })?),
     };
     let report = if mode == Mode::Apply {
-        let report = run(Mode::Apply, only);
+        // 明示の run = status に出ていた案（#1981）の承認も兼ねる
+        let report = run_explicit(only);
         record(&report, "cli");
         report
     } else {
@@ -1108,6 +1282,7 @@ pub fn report_json(action: &str, only: Option<&str>) -> Result<serde_json::Value
         "applied": mode == Mode::Apply,
         "migrated": report.changed_count(),
         "needs_attention": report.attention().count(),
+        "proposed": report.proposed().count(),
         "notice": report.notice_for(mode == Mode::Apply),
         "files": report
             .files
@@ -1188,6 +1363,17 @@ fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
             }
             map.insert("reason".into(), reason.clone().into());
         }
+        FileOutcome::Proposed { proposal } => {
+            map.insert("proposal".into(), proposal.text().into());
+            map.insert("proposal_ja".into(), proposal.ja.clone().into());
+            map.insert("proposal_en".into(), proposal.en.clone().into());
+            map.insert("approvable".into(), proposal.approvable.into());
+            if let Some(facts) = proposal.facts.as_object() {
+                for (k, v) in facts {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+        }
         FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
             map.insert("reason".into(), reason.clone().into());
         }
@@ -1240,7 +1426,8 @@ fn record(report: &MigrationReport, origin: &str) {
                     file.path.display()
                 ))
             }
-            FileOutcome::Absent | FileOutcome::UpToDate { .. } => {}
+            // 案（#1981）は自動の発火点では出ない・書かない
+            FileOutcome::Absent | FileOutcome::UpToDate { .. } | FileOutcome::Proposed { .. } => {}
         }
     }
 }

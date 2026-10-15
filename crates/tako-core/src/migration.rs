@@ -27,6 +27,14 @@
 //! - **実施の可視化**: 何をどう変えたかは [`MigrationReport`] に残り、CLI / MCP / ログが
 //!   同じ 1 本から文言を作る（日英は [`Note`]）
 //!
+//! ## 自動では当てない「案」（#1981）
+//!
+//! 形式の変更ではなく**利用者の判断が要る書き換え**（例: 個人の追記の区切りを
+//! どの見出しまで上げるか）は、二段構えの発火点（setup / 起動時）では当てない。
+//! `tako migrate status` に [`FileOutcome::Proposed`] として出し、明示の
+//! `tako migrate run`（MCP `tako_migrate` の run）でだけ当てる。当てるときの退避は
+//! 移行と同じ [`write_with_backup`] を通る（作法を 2 本に分けない）
+//!
 //! ## 版数の付け方
 //!
 //! 版数は「そのファイル種別のスキーマ世代」で、[`SchemaSpec::target_version`] が現在の正。
@@ -352,6 +360,9 @@ pub enum FileOutcome {
         reason: String,
         evicted: bool,
     },
+    /// 自動では当てない書き換えの**案**（#1981）。`tako migrate status` にだけ出し、
+    /// 明示の `tako migrate run` で当てる（発火点 = setup / 起動時の報告には載らない）
+    Proposed { proposal: Proposal },
     /// 登録の壊れ方が判明したので触らなかった
     Refused { reason: String },
     /// 移行しようとして失敗した（元のファイルは無傷）
@@ -382,8 +393,31 @@ impl FileOutcome {
             Self::Migrated { .. } => "migrated",
             Self::Created { .. } => "created",
             Self::Unreadable { .. } => "unreadable",
+            Self::Proposed { .. } => "proposed",
             Self::Refused { .. } => "refused",
             Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// 自動では当てない書き換えの案（#1981）。文言は**具体値つき**で作る側が組み立てる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    /// 案の 1 文（日英）
+    pub ja: String,
+    pub en: String,
+    /// `tako migrate run` で当たるか（false = 上げても収まらない等で、手で直すしかない）
+    pub approvable: bool,
+    /// 機械可読の内訳（CLI / MCP の応答へそのまま載る）
+    pub facts: serde_json::Value,
+}
+
+impl Proposal {
+    /// 現在の表示言語での文言
+    pub fn text(&self) -> &str {
+        match crate::i18n::lang() {
+            crate::i18n::Lang::Ja => &self.ja,
+            crate::i18n::Lang::En => &self.en,
         }
     }
 }
@@ -417,6 +451,13 @@ impl MigrationReport {
         self.files.iter().filter(|f| f.outcome.needs_attention())
     }
 
+    /// 自動では当てない書き換えの案（#1981）
+    pub fn proposed(&self) -> impl Iterator<Item = &FileReport> {
+        self.files
+            .iter()
+            .filter(|f| matches!(f.outcome, FileOutcome::Proposed { .. }))
+    }
+
     pub fn changed_count(&self) -> usize {
         self.migrated().count()
     }
@@ -440,7 +481,8 @@ impl MigrationReport {
             .count();
         let migrated = self.changed_count() - created;
         let attention = self.attention().count();
-        if migrated == 0 && created == 0 && attention == 0 {
+        let proposed = self.proposed().count();
+        if migrated == 0 && created == 0 && attention == 0 && proposed == 0 {
             return None;
         }
         let mut parts = Vec::new();
@@ -467,6 +509,9 @@ impl MigrationReport {
                     .replace("{n}", &attention.to_string()),
             );
         }
+        if proposed > 0 {
+            parts.push(NOTICE_PROPOSED.text().replace("{n}", &proposed.to_string()));
+        }
         Some(parts.join(" / "))
     }
 }
@@ -490,6 +535,11 @@ const NOTICE_CREATE_PENDING: Note = Note::new(
 const NOTICE_ATTENTION: Note = Note::new(
     "設定ファイル {n} 件を読めないので既定値で動いています（tako migrate status で確認できます）",
     "{n} config file(s) could not be read, so defaults are in use (see `tako migrate status`)",
+);
+
+const NOTICE_PROPOSED: Note = Note::new(
+    "利用者の判断が要る案が {n} 件あります（内容は files[].proposal。当てるなら tako migrate run）",
+    "{n} proposal(s) need your decision (see files[].proposal; apply them with `tako migrate run`)",
 );
 
 /// 移行前の退避先（`<name>.pre-v<from>.bak`）。
@@ -746,29 +796,45 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
         }
     };
     let (body, from, applied) = migrated;
+    match write_with_backup(path, &text, &body, from, io) {
+        Ok(backup) => FileOutcome::Migrated {
+            from,
+            to: spec.target_version,
+            backup,
+            applied,
+        },
+        Err(reason) => FileOutcome::Failed { reason },
+    }
+}
+
+/// **先に旧内容を退避してから**書く（移行と #1981 の案の適用が共有する 1 実装）。
+///
+/// 退避先は [`backup_path`]（`<name>.pre-v<from>.bak`）で、**既にあれば上書きしない**
+/// （最初の旧内容を潰さない）。退避が取れなければ書かない。戻り値は退避先
+pub fn write_with_backup(
+    path: &Path,
+    old: &str,
+    new: &str,
+    from: u32,
+    io: &dyn MigrationIo,
+) -> Result<PathBuf, String> {
     let backup = backup_path(path, from);
     // 退避が取れないなら書かない（旧内容を失う経路を作らない）
     if !io.exists(&backup) {
-        if let Err(e) = io.write(&backup, &text) {
-            return FileOutcome::Failed {
-                reason: format!("退避に失敗したので移行しない ({}): {e}", backup.display()),
-            };
+        if let Err(e) = io.write(&backup, old) {
+            return Err(format!(
+                "退避に失敗したので移行しない ({}): {e}",
+                backup.display()
+            ));
         }
     }
-    if let Err(e) = io.write(path, &body) {
-        return FileOutcome::Failed {
-            reason: format!(
-                "書き込みに失敗: {e}（旧内容は {} に残る）",
-                backup.display()
-            ),
-        };
+    if let Err(e) = io.write(path, new) {
+        return Err(format!(
+            "書き込みに失敗: {e}（旧内容は {} に残る）",
+            backup.display()
+        ));
     }
-    FileOutcome::Migrated {
-        from,
-        to: spec.target_version,
-        backup,
-        applied,
-    }
+    Ok(backup)
 }
 
 /// 解釈できなかったファイルを退避する（**既定値へ落とす前に必ず呼ぶ**）。
