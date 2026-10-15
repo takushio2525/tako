@@ -251,21 +251,16 @@ impl RunConfigsFile {
                 cfg.updated_at = Some(now.to_string());
             }
         }
-        let scalars: [(
-            &Option<(RunScope, String)>,
-            RunConfigField,
-            fn(&mut RunConfig, String),
-        ); 3] = [
-            (&edit.args, RunConfigField::Args, |c, v| c.args = Some(v)),
-            (&edit.cwd, RunConfigField::Cwd, |c, v| c.cwd = Some(v)),
-            (&edit.before, RunConfigField::Before, |c, v| {
-                c.before = Some(v)
-            }),
-        ];
-        for (value, field, set) in scalars {
+        for (value, field) in [
+            (&edit.args, RunConfigField::Args),
+            (&edit.cwd, RunConfigField::Cwd),
+            (&edit.before, RunConfigField::Before),
+        ] {
             let Some((scope, v)) = value else { continue };
             let cfg = self.map_mut(*scope).entry(key_for(*scope)).or_default();
-            set(cfg, v.clone());
+            if let Some(slot) = text_slot(cfg, field) {
+                *slot = Some(v.clone());
+            }
             cfg.updated_at = Some(now.to_string());
             changes.push(Change {
                 scope: *scope,
@@ -324,6 +319,16 @@ impl RunConfigsFile {
                 self.files.remove(&key);
             }
         }
+    }
+}
+
+/// 1 本の文字列の項目の欄（引数・作業ディレクトリ・実行前コマンド。#1732）
+fn text_slot(cfg: &mut RunConfig, field: RunConfigField) -> Option<&mut Option<String>> {
+    match field {
+        RunConfigField::Args => Some(&mut cfg.args),
+        RunConfigField::Cwd => Some(&mut cfg.cwd),
+        RunConfigField::Before => Some(&mut cfg.before),
+        RunConfigField::Profile | RunConfigField::Runtime | RunConfigField::Env => None,
     }
 }
 
@@ -411,6 +416,22 @@ pub fn bad_env_names(names: &[String], file: &Path) -> DispatchError {
         format!(
             "The saved environment variable name \"{list}\" cannot be used (letters, digits and _ \
              only, not starting with a digit). Remove it with `tako run-config {f} --unset-env {q}`"
+        ),
+    ))
+}
+
+/// 保存した作業ディレクトリが今無いときのエラー（`Run`。既定へ落とさず、戻し方を案内する）
+pub fn saved_cwd_missing(dir: &Path, file: &Path) -> DispatchError {
+    let f = tako_core::shell::quote_for_shell(&file.display().to_string());
+    let d = dir.display();
+    DispatchError::Operation(tr(
+        format!(
+            "保存した作業ディレクトリが無い: {d}。`tako run-config {f} --reset cwd` で既定へ戻すか、\
+             `tako run-config {f} --cwd <ディレクトリ>` で選び直す"
+        ),
+        format!(
+            "The saved working directory does not exist: {d}. Run `tako run-config {f} --reset cwd` \
+             to go back to the default, or `tako run-config {f} --cwd <dir>` to choose again"
         ),
     ))
 }

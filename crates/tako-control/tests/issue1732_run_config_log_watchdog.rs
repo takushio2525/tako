@@ -70,7 +70,7 @@ fn line_of(src: &str, offset: usize) -> usize {
     src[..offset].matches('\n').count() + 1
 }
 
-/// 目印 `from` から `to` の手前まで（コメント・文字列を潰した眺めで探す）。
+/// 目印 `from` から `to` の手前まで（テスト領域を潰した本番コードの眺めで探す）。
 /// **見つからないことも FAILED**（走査範囲が空だとどんな回帰でも通る）
 fn region(rel: &str, src: &str, from: &str, to: &str) -> Result<(usize, usize), String> {
     let start = src

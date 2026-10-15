@@ -2515,7 +2515,7 @@ mod tests_1732 {
     /// 作業ディレクトリが移れば `${fileBase}` はファイルの絶対パス（移った先からも引ける）。
     /// 移っていなければ今まで通り（ファイル名だけ）
     #[test]
-    fn 作業ディレクトリが移ればfileBaseは絶対パス() {
+    fn 作業ディレクトリが移ればfile_baseは絶対パス() {
         let moved = ConfigLayer {
             cwd: Some("sub".into()),
             ..layer()

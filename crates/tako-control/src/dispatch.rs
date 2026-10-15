@@ -9945,13 +9945,15 @@ fn dispatch_inner(
 
             let plan = &resolution.plan;
 
-            // cwd 存在検査
+            // cwd 存在検査（保存した作業ディレクトリなら戻し方も添える。#1732）
             let cwd = plan.cwd.clone();
             if !cwd.is_dir() {
-                return Err(DispatchError::Operation(format!(
-                    "cwd が存在しない: {}",
-                    cwd.display()
-                )));
+                return Err(match layer.cwd {
+                    Some(_) => crate::run_configs::saved_cwd_missing(&cwd, &resolved),
+                    None => {
+                        DispatchError::Operation(format!("cwd が存在しない: {}", cwd.display()))
+                    }
+                });
             }
 
             // シェル指定時はコマンドを包む（包み方は宣言されたシェルの方言で決まる。#875）
@@ -41202,6 +41204,30 @@ mod tests {
         let over_pane = over["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&over_pane).expect("options 記録");
         assert_run_pane_command(opts.command.as_ref().expect("command"), &plain, over_pane);
+
+        // 保存した作業ディレクトリを消すと、既定へ落とさずに戻し方つきで止まる（ペインは割らない）
+        std::fs::remove_dir_all(base.join("sub")).unwrap();
+        let panes = host.ws.active_tab().tree().panes().len();
+        let pane_id = host.ws.active_tab().tree().focused();
+        let err = dispatch(
+            &mut host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(pane_id.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+                new_pane: Some(true),
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect_err("消えた作業ディレクトリで走らせない");
+        assert!(err.to_string().contains("--reset cwd"), "{err}");
+        assert_eq!(host.ws.active_tab().tree().panes().len(), panes);
 
         let store = crate::run_configs::store_path().expect("テストの data dir");
         crate::run_configs::update_at(&store, |st| {
