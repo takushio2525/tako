@@ -48,6 +48,12 @@ windows.workspace = true
 # PDF 構造パーサ（#693）。ラスタライズは WinRT、リンク注釈・目次は lopdf で補う
 lopdf.workspace = true
 
+# two-face に無い構文（#1954）の YAML をビルド時に構文定義へ読む（build.rs の
+# `compile_extra_syntaxes`）。YAML のパーサ（yaml-rust）はビルドスクリプトにだけ入り、
+# 配布バイナリへは入らない（起動時は直列化した構文定義を読むだけ）
+[build-dependencies]
+syntect = { workspace = true, features = ["yaml-load"] }
+
 # アイコン / バージョン情報リソースの埋め込み（#587。build.rs 参照）。
 # cfg(windows) を付けて macOS のビルドグラフに載せない
 [target.'cfg(windows)'.build-dependencies]

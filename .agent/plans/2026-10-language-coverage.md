@@ -491,7 +491,7 @@ open_plan 7・インデント 5）。
 | `.pde` → 色なし | Processing（Java 系）として Java で塗る。旧 Arduino のスケッチ（`.pde`）は今では少数。✅ #1953 | 色の補い |
 | `.json5` / `.jsonc` → 色なし | JSON で塗る（コメント・末尾カンマの扱いを確認）。✅ #1953（`.jsonc` は JSON、`.json5` は実測で JavaScript へ変えた = §6.1） | 色の補い |
 | `.S` / `.s` → 色なし | 既存の `x86_64 Assembly` へ寄せてよいか（AVR / ARM の命令は x86 ではない）を見て判断。#1953 で**寄せない**と決めた（§6.1） | 色の補い |
-| `.ps1` / `.astro` → 色なし | two-face に構文が無い。構文を足すと構文セット（#815）とビルドに効くので、足す方法と実測を別に | 構文の追加 |
+| `.ps1` / `.astro` → 色なし | two-face に構文が無い。構文を足すと構文セット（#815）とビルドに効くので、足す方法と実測を別に。✅ #1954 で PowerShell（`.ps1` / `.psm1` / `.psd1`）を足した。`.astro` は足さない（§6.2） | 構文の追加 |
 | 言語サーバ 37 形式 | #1007 の「第 2 波」（Java / Go / …）。#1944 の自動取得と合わせて優先順を決める。✅ #1956 で 6 行（`.tex` `.toml` `.swift` `.dart` `.css` `.scss` `.less` `.html` `.htm`）。比較・採った順・見送りの理由は §8 | 言語サーバ第 2 波 |
 | Finder 24 形式・Windows 0 | #708 の「既定を奪わない」を守ったまま広げられるか（UTI の輸入宣言の可否）を lsregister で実測 | Finder / 関連付け |
 | Code Runner の空き（`.vue` `.svelte` `.astro` `.scss` `.toml` `.yaml` `.json5` `.ini` `.env` `Dockerfile` `.proto` `.graphql` `.h` `.hpp`） | **単体では走らせるものではない**ので今のまま（`.vue` 等は `package.json` の `npm run` を `tako:run:` で書く）。`.m` / `.pde` / `.S` は需要が出たら行を足す | なし |
@@ -532,6 +532,87 @@ open_plan 7・インデント 5）。
   ```` ```jsonc ```` = JSON・```` ```json5 ```` = JavaScript）
 - **A/B** は `TAKO_1953_LEGACY=1`（別名の行の `syntax` と本文の判定を外す）。実測は
   `scripts/test-syntax-alias-1953.sh`（CLI / MCP の応答の `syntax` と visual-test `syntax-alias` を新旧で）
+
+### 6.2 実装で決めたこと（#1954）
+
+**PowerShell を足した。足し方は「YAML をビルド時に構文定義へ読み、起動時は既存の構文セットの末尾へ
+継ぎ足すだけ」（下表の B'）**。理由: 起動ごとの費用（A1 は 380 ms + 一時の山 34 MB、A2 でも
+YAML の読み込みだけで 57 ms）と配布バイナリへの YAML パーサの追加を避け、既存の 213 構文は
+1 バイトも変えないまま起動時の増分を 6〜7 ms に抑えられる案がこれだけだったため。
+
+**構文の出どころ**（どちらも MIT = GPL-3.0-or-later と両立）:
+
+| 候補 | fancy-regex 0.16.2 | 採否 |
+|---|---|---|
+| bat 同梱（`PowerShell/EditorSyntax` の tmLanguage を変換したもの。two-face の onig 版に入っている） | **組めない**（`u\{(?:(?:10)?([0-9a-fA-F]){1,4}\|0?\g<1>{1,5})}` のサブルーチン呼び出し。two-face が fancy 版から外した理由） | 不採用 |
+| Sublime Text 公式パッケージ `SublimeText/PowerShell`（タグ `st4107-5.1.2`。1,557 行・文脈 156・正規表現 257） | **257 本すべて組める** | **採用**（上流とバイト単位で同一のまま同梱 = `crates/tako-app/syntaxes/PowerShell/`。出所は同じ dir の `PROVENANCE.md`、告知は `THIRD-PARTY-NOTICES.md`） |
+
+採用した定義で syntect に合わせる点は 2 つで、どちらもファイルは変えず `build.rs` が読むときに当てる:
+① ヒアドキュメントの中の C# が名指す `scope:source.cs.embedded.powershell` は上流の別ファイル
+（Sublime Text 4 の `extends` で書かれていて syntect は読めない）なので two-face の C#（`source.cs`）へ
+向ける（結べない参照は塗る途中で panic する）② `first_line_match` の `{{shebang_language}}` を展開する
+（syntect はこの欄の変数を展開しない。展開しないと**どの形式の 1 行目の判定でも**組めない正規表現で
+panic しうる）。正規表現が 1 本でも組めなければビルドを落とす。`version: 2` の `pop: 1` は syntect が
+`pop: true` と同じに読む（この定義は 2 以上を使わない）。
+
+**足し方の比較**（同じ syntect 5.3.0 / two-face 0.5.1 / fancy-regex 0.16.2 の使い捨てクレート・
+release・カウンタ付きのアロケータで生きているヒープを数えた。3〜5 回の幅）:
+
+| 案 | 起動ごとの費用（プロセスで 1 回） | 一時の山 | 配布バイナリ | ビルド |
+|---|---|---|---|---|
+| A1 同梱した YAML を起動時に読み、`into_builder` で全体を作り直す | 365〜389 ms | +34.11 MB | YAML パーサ（yaml-rust。最小構成の比較で +1.59 MB） | 変わらない |
+| A2 同梱した YAML を起動時に読み、PowerShell だけを継ぎ足す | 66〜68 ms（うち YAML 56〜58 ms） | +3.36 MB | 同上 | 変わらない |
+| B ビルド時に全体を作り直して埋め込む | 0 ms（埋め込みを読むだけ） | 0 | +973 KB（two-face の 959 KB は退避先として残る） | ビルドスクリプトで 3.55 s（opt-level 0）+ syntect のビルド時の二重コンパイル |
+| **B' ビルド時に YAML を構文定義へ・起動時は継ぎ足すだけ（採用）** | **9.3〜10.9 ms**。うち 2.8 ms は two-face の読み込みと直列化の往復で #1917 の構築と同じ作業 = 増分 6〜7 ms | +3.19 MB | +9.7 KB（圧縮した構文定義） | ビルドスクリプトで 0.5〜0.9 s（opt-level 0）+ syntect のビルド時の二重コンパイル（素のビルドのときだけ。使い捨てクレートで素から 7.1〜7.3 s・CPU 12.7〜14.6 s = 上限。tako ではホスト向けの proc-macro 等を共有する） |
+| C 足さない | 0 | 0 | 0 | 0 |
+
+継ぎ足しは、既存の構文と同じ並び・名前・scope の**身代わり**（名指される C# と正規表現にだけ本物と
+同じ名前の空の文脈を持たせる）と PowerShell で syntect の builder を回し、結んだ PowerShell だけを
+直列化の鏡（#1917 の `SetMirror`）の末尾へ足す（`crates/tako-app/src/syntax_extra.rs`）。builder は
+文脈を名前の順に番号付けするので、結んだ番号は本物と一致する。**A1（`into_builder` で全体を
+作り直したもの）と PowerShell の文脈が展開後・圧縮後ともバイト単位で同一**であることを単体が見る。
+ほかの構文の文脈を `include` する定義は身代わりでは結べない（`uses_backrefs` が伝わらない）ので、
+その形が来たら足さずに two-face のままにする。
+
+**#815 への影響と突き合わせ**（どの「足す」案でも同じ。上と同じ計測）:
+
+| 項目 | main（213 構文） | #1954（214 構文） |
+|---|---|---|
+| 構文セットの器（載せた直後） | 1,076,419 B | 1,091,649 B（+15.2 KB） |
+| 1 行目の判定のキャッシュ込み | 2,103,413 B | 2,133,291 B（+29.9 KB） |
+| 直列化（#1917 が常駐させるバイト列の元） | 959,011 B | 972,820 B（+13.8 KB） |
+| `.ps1`（103 行の見本）を塗った増分 | Plain Text: +0.01 MB・色あり 0 字句 | PowerShell: +17.24 MB・57.5 ms・634 字句のうち色あり 303・`invalid` 0 |
+| 既存の全拡張子の解決（大文字の綴りを含む 1,186 通り） | — | 変化 0（`ps1` / `psm1` / `psd1` が None → PowerShell だけ） |
+| 既存 213 構文の文脈（展開後のバイト列）・名前・拡張子・変数 | — | 213 / 213 が同一・結ばれていない参照 0 |
+
+塗った増分は言語ごとの正規表現の遅延展開（#815 の 30 秒で解放）で、ほかの言語と同じ桁:
+bash 242 行 +13.64 MB・C++ 244 行 +19.78 MB（§5.2）。ヒアドキュメントの C# と `-match` の正規表現を
+含む 112 行では C# と Regular Expression も展開するので +28.25 MB。1 MB（42,848 行）の `.ps1` は
+2.39 s・+17.24 MB（同じ大きさの Python 2.47 s・bash 1.21 s。5,000 行を超えるので背景で塗る = #1660）。
+
+**`.psm1` / `.psd1` も同じ構文**（上流の `file_extensions` に入っている。VS Code の powershell 言語も
+3 つ）。`file_type` の `powershell` 行にも足した（応答の `file_type` と行コメントの `#`）。
+
+**`.astro` は足さない**。上流の構文（`SublimeText/Astro`・MIT）は `extends: Packages/HTML/HTML.sublime-syntax`
+（Sublime Text 4 の継承）と `meta_prepend` で書かれていて syntect は読めない。足すには継承元の HTML ごと
+手で平らにする移植になり、保守の負担が残る。既存の構文への別名も比べた（46 行の見本・色あり字句 / 字句）:
+
+| 寄せ先 | フロントマター（TS） | テンプレート | `invalid` |
+|---|---|---|---|
+| Plain Text（今） | 0 / 16 | 0 / 25 | 0 |
+| HTML | 0 / 16 | 60 / 158 | 2（属性の `{…}` を不正な属性値として） |
+| Vue Component | 0 / 16 | 56 / 154 | 0 |
+| Svelte | 13 / 36（`{` を式の始まりと読み、まだらに色が付く） | 91 / 163 | 0 |
+
+テンプレートは Svelte が最もよく塗るが、フロントマターの読み違いが残るので別名にもしない（Svelte への
+別名は §6.1 と同じ 1 行で入るので、需要が出たら別 Issue で）。
+
+**`.S` / `.s`（GAS）**は今回足していない。足すなら `crates/tako-app/syntaxes/<名前>/` に定義と
+`LICENSE` / `PROVENANCE.md` を置き、`build.rs` の `SOURCES` と `syntax_extra::NAMES` に 1 行ずつ足す
+（正規表現が組めなければビルドが落ちる・既存の構文が変わらないことは単体が見る）。
+
+A/B は `TAKO_1954_LEGACY=1`（足さない = two-face の 213 構文のまま）。実測は
+`scripts/test-extra-syntax-1954.sh`（CLI / MCP の応答の `syntax` と visual-test `extra-syntax` を新旧で）。
 
 ## 7. 子 Issue（依存つき）
 

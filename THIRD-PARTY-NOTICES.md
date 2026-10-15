@@ -165,6 +165,50 @@ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH RE
 
 ---
 
+## PowerShell の構文定義 / PowerShell syntax definition
+
+- バージョン / Version: **st4107-5.1.2**（commit `45b7abf9`）
+- 用途 / Used for: `.ps1` / `.psm1` / `.psd1` のコードプレビュー・編集の色分け（Issue #1954）。
+  two-face（bat 由来の構文セット）は fancy-regex で組めない構文として PowerShell を外しているので、
+  fancy-regex で組める Sublime Text 公式パッケージの定義を同梱し、ビルド時に読んで
+  構文セットの末尾へ足す
+- 同梱物 / Bundled files: `crates/tako-app/syntaxes/PowerShell/PowerShell.sublime-syntax`
+  （上流とバイト単位で同一。ビルド時に構文定義へ読んだものをバイナリへ埋め込む）
+- 上流 / Upstream: https://github.com/SublimeText/PowerShell
+- 出所の詳細 / Provenance:
+  [`crates/tako-app/syntaxes/PowerShell/PROVENANCE.md`](crates/tako-app/syntaxes/PowerShell/PROVENANCE.md)
+- ライセンス / License: MIT
+  （全文: [`crates/tako-app/syntaxes/PowerShell/LICENSE`](crates/tako-app/syntaxes/PowerShell/LICENSE)）
+
+```text
+Copyright (c) 2011-2015 Guillermo López-Anglada
+              2020-2025 Michael Lyons
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### 加えた変更 / Changes made
+
+ファイルは改変していない。ビルド時に読むときだけ次を置き換える（`crates/tako-app/build.rs` の
+`compile_extra_syntaxes`）:
+
+- 埋め込みの C#（ヒアドキュメントの中）が名指す `scope:source.cs.embedded.powershell`
+  （上流の別ファイル。Sublime Text 4 の `extends` で書かれていて syntect は読めない）を、
+  two-face の C#（`scope:source.cs`）へ向けた
+- `first_line_match` の変数（`{{shebang_language}}`）を構文の変数で展開した
+  （syntect はこの欄の変数を展開しない）
+
+The file itself is unmodified. At build time, the embedded C# reference
+`scope:source.cs.embedded.powershell` (an upstream file written with Sublime Text 4's
+`extends`, which syntect cannot load) is redirected to two-face's C# (`scope:source.cs`),
+and the variable in `first_line_match` is expanded, since syntect does not expand it.
+
+---
+
 ## スマホ用画面（tako remote の PWA）/ Phone UI (tako remote PWA)
 
 `web/tako-remote/` をビルドした成果物（JavaScript・CSS・フォント）は、tako のバイナリへ

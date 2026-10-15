@@ -12,8 +12,9 @@
 //! - 対応括弧の探索が中を飛ばす文字列とコメント（`lexical` 列 + `comment` 列。#1691）
 //! - CLI / MCP の応答の `file_type`（`tako open` の結果・`tako edit` の応答）
 //!
-//! **全 213 構文を並べない**。行を持つのは「既定（[`CODE`] = code・two-face 任せ・4 スペース・
-//! 括弧で深く）から外れる形式」と「挙動の表が名指す形式」だけで、表に無い形式は既定のまま。
+//! **全 214 構文（two-face の 213 + two-face に無い PowerShell = #1954）を並べない**。
+//! 行を持つのは「既定（[`CODE`] = code・two-face 任せ・4 スペース・括弧で深く）から外れる形式」と
+//! 「挙動の表が名指す形式」だけで、表に無い形式は既定のまま。
 //! 拡張子だけでは塗る構文が決まらない形式（`.m` = MATLAB / Objective-C）は、本文の手掛かりで
 //! 構文を決める純粋関数 [`syntax_by_content`] を色分けが行の `syntax` より先に引く（#1953）。
 //!
@@ -466,7 +467,9 @@ pub const TABLE: &[FileType] = &[
         HASH,
         LEX_SHELL,
     ),
-    lexed("powershell", &["ps1"], HASH, LEX_SCRIPT),
+    // `.psm1`（モジュール）/ `.psd1`（マニフェスト = ハッシュテーブルの式）も同じ言語
+    // （VS Code の powershell 言語と同じ。色は #1954 で足した PowerShell の構文）
+    lexed("powershell", &["ps1", "psm1", "psd1"], HASH, LEX_SCRIPT),
     lang("bat", &["bat", "cmd"], Some(CommentSyntax::Line("REM"))),
     lexed("ruby", &["rb"], HASH, LEX_SCRIPT),
     lexed("perl", &["pl"], HASH, LEX_SCRIPT),
