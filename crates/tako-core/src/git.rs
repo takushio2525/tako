@@ -2631,10 +2631,10 @@ mod tests {
         repo.git(&["mv", "a.txt", "b.txt"]);
         repo.git(&["commit", "-q", "-m", "rename"]);
         repo.commit("b.txt", "1\n2\n3\n", "three");
-        // macOS の一時 dir は symlink（/var → /private/var）。git が返す実パスに揃える
-        let file = repo.path().join("b.txt").canonicalize().expect("実パス");
+        // macOS の一時 dir は symlink（/var → /private/var）。git が返す実パスから組む
+        let root = repo_root(repo.path()).expect("リポジトリ");
+        let file = root.join("b.txt");
         let history = file_history(&file, 50, DEFAULT_CHANGELOG_TIMEOUT).expect("上限内に終わる");
-        let root = repo_root(&file).expect("リポジトリ");
         assert_eq!(history.repo_root.as_deref(), Some(root.as_path()));
         assert_eq!(history.rel_path.as_deref(), Some("b.txt"));
         assert_eq!(history.commits, log_file_commits(&root, "b.txt", 50));
@@ -2672,14 +2672,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git/objects")).expect("mkdir");
         std::fs::create_dir_all(dir.join(".git/refs")).expect("mkdir");
-        let made = std::process::Command::new("mkfifo")
-            .arg(dir.join(".git/HEAD"))
-            .status()
-            .is_ok_and(|s| s.success());
-        if !made {
-            let _ = std::fs::remove_dir_all(&dir);
-            return; // mkfifo の無い環境
-        }
+        let head = std::ffi::CString::new(dir.join(".git/HEAD").as_os_str().as_encoded_bytes())
+            .expect("NUL を含まない");
+        // SAFETY: NUL 終端のパスを渡すだけ
+        assert_eq!(unsafe { libc::mkfifo(head.as_ptr(), 0o644) }, 0);
         std::fs::write(dir.join("f.txt"), "x\n").expect("write");
         let start = Instant::now();
         let got = file_history(&dir.join("f.txt"), 50, Duration::from_millis(500));

@@ -182,7 +182,8 @@ main_thread_waits() {
 wait_ready() {
   local i
   for i in $(seq 1 "${1:-300}"); do
-    ( perl -e 'alarm shift; exec @ARGV' 3 "$TAKO_BIN" theme ) >/dev/null 2>&1 && return 0
+    # 起動前の打ち切りでシェルが出す「Alarm clock」の 1 行も落とす
+    { ( perl -e 'alarm shift; exec @ARGV' 3 "$TAKO_BIN" theme ) >/dev/null 2>&1; } 2>/dev/null && return 0
     sleep 0.1
   done
   return 1

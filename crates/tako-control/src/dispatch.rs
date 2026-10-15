@@ -32460,11 +32460,8 @@ mod tests {
 
     /// #2014 の材料: このリポジトリの実ファイル（git 管理下）
     fn changelog_repo_file() -> Option<PathBuf> {
-        let file = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../Cargo.toml")
-            .canonicalize()
-            .ok()?;
-        tako_core::git::repo_root(&file).map(|_| file)
+        tako_core::git::repo_root(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .map(|root| root.join("Cargo.toml"))
     }
 
     fn changelog_on(pane: u64) -> Request {
@@ -32577,14 +32574,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
         std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
-        let made = std::process::Command::new("mkfifo")
-            .arg(dir.join(".git/HEAD"))
-            .status()
-            .is_ok_and(|s| s.success());
-        if !made {
-            let _ = std::fs::remove_dir_all(&dir);
-            return; // mkfifo の無い環境
-        }
+        let head =
+            std::ffi::CString::new(dir.join(".git/HEAD").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL 終端のパスを渡すだけ
+        assert_eq!(unsafe { libc::mkfifo(head.as_ptr(), 0o644) }, 0);
         std::fs::write(dir.join("f.txt"), "x\n").unwrap();
         let mut host = MockHost::new();
         let root = host.root_pane();
