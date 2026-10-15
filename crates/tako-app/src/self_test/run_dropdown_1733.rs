@@ -4,7 +4,7 @@
 //!
 //! 場面: 一時 dir（宣言 2 つの `a.py` + 偽の `.venv` + 偽の別の venv `alt/` + 宣言の無い `b.py`）。
 //!
-//! - ① `a.py` を開く → 一覧（background の `RunResolve`）が届き、**別に取った `RunResolve` と字面一致**
+//! - ① `a.py` を開く → 一覧（background の `RunResolve`）が届き（メニューを開いて画像 `list`）、**別に取った `RunResolve` と字面一致**
 //!   （プロファイルの名前とコマンド・候補の ID と自動 / 選択の印・項目の出典）。走らせるコマンドは
 //!   `.venv` の python で、**dispatch `Run` の応答の `command` と一致**（A/B: `TAKO_1733_LEGACY=1` は一覧が
 //!   `python3 a.py` のままなのでここで名指しの FAILED）
@@ -419,6 +419,26 @@ pub(super) async fn run_dropdown_1733_visual(
         ran["runtime"]["id"],
         view.profiles.len()
     );
+    // 判定の前にメニューを開いて撮る（A/B の旧の腕もここで 1 枚残る = 一覧のコマンドを画像で見比べる）
+    notify_and_draw(any, window, cx);
+    click_probe(
+        any,
+        window,
+        cx,
+        &format!("preview-run-dd-{}", pv.as_u64()),
+        "①",
+    );
+    let _ = vt1860_wait(any, window, cx, Duration::from_secs(5), &|cx| {
+        window
+            .update(cx, |app, _, _| app.run_menu.is_open(pv))
+            .unwrap_or(false)
+    })
+    .await;
+    dump(any, window, cx, "list");
+    let _ = window.update(cx, |app, _, cx| {
+        app.close_run_menu();
+        cx.notify();
+    });
     check(
         !run_cmd.is_empty() && menu_cmd == run_cmd,
         &format!(
