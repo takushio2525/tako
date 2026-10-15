@@ -62,17 +62,29 @@ export function windowsSnapshot(win, generator) {
   };
 }
 
-/** `tako agent-support --json` → 写し */
+/**
+ * `tako agent-support --json` → 写し。
+ *
+ * 系統ごとのマスは**系統の一覧（`agents`）の順**で並べる。tako の出力の中のマスの並びは
+ * serde_json の `preserve_order` が効くかどうか（ビルドする crate の組み合わせ = feature の
+ * 統合）で変わる（実測: `cargo build -p tako-cli` だと辞書順、workspace 全体だと定義順）。
+ * 出力の並びをそのまま写すと、手元と CI で写しが食い違って `--check` が落ちる
+ */
 export function agentSnapshot(m, generator) {
+  const order = m.agents.map((a) => a.key);
   return {
     _note: `生成物（${generator}）。手で直さず能力マトリクスを直して作り直す（#2104）`,
     agents: m.agents.map((a) => pick(a, AGENT_META_FIELDS)),
-    features: m.features.map((f) => ({
-      ...pick(f, AGENT_FIELDS),
-      agents: Object.fromEntries(
-        Object.entries(f.agents).map(([k, cell]) => [k, pick(cell, AGENT_CELL_FIELDS)]),
-      ),
-    })),
+    features: m.features.map((f) => {
+      const extra = Object.keys(f.agents).filter((k) => !order.includes(k));
+      if (extra.length) {
+        throw new Error(`${f.key} に系統の一覧に無い列があります: ${extra.join(', ')}`);
+      }
+      return {
+        ...pick(f, AGENT_FIELDS),
+        agents: Object.fromEntries(order.map((k) => [k, pick(f.agents[k] ?? {}, AGENT_CELL_FIELDS)])),
+      };
+    }),
   };
 }
 

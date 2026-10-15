@@ -147,6 +147,18 @@ if (cmd === 'init') {
     }
   }
   save(win, agent);
+} else if (cmd === 'reorder') {
+  // オブジェクトのキーの並びを全部逆にする（配列の並びは変えない）。tako の出力の中のキーの
+  // 並びは serde_json の preserve_order が効くかどうか = ビルドの feature の統合で変わる
+  const rev = (x) => Array.isArray(x)
+    ? x.map(rev)
+    : x && typeof x === 'object'
+      ? Object.fromEntries(Object.keys(x).reverse().map((k) => [k, rev(x[k])]))
+      : x;
+  const [win, agent] = load(ops[0]);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'windows.json'), JSON.stringify(rev(win)));
+  writeFileSync(join(dir, 'agent.json'), JSON.stringify(rev(agent)));
 } else {
   fail(`知らないコマンド: ${cmd}`);
 }
@@ -162,6 +174,8 @@ check() { # $1=マトリクスの dir。--check の終了コードを返す（�
   ( cd "${REPO}" && TAKO_2104_FX="$1" node scripts/gen-windows-support-docs.mjs --check \
     && TAKO_2104_FX="$1" node scripts/gen-agent-support-docs.mjs --check ) >"${SB}/check.log" 2>&1
 }
+# --check が落ちた理由の 1 行（windows が通って agent が落ちたときに windows の行を出さない）
+why() { grep -m1 -v 'と同期しています' "${SB}/check.log" || head -1 "${SB}/check.log"; }
 g() { git -C "${REPO}" "$@"; }
 commit() { g add -A && g commit -q -m "$1"; }
 
@@ -228,7 +242,7 @@ scenario() {
   fi
   case "${result}" in
     clean) what="後の PR も衝突せず merge でき、merge 後も同期している（--check 緑）" ;;
-    unsynced) what="git は衝突させないが merge 後が同期していない（--check 赤: $(head -1 "${SB}/check.log")）" ;;
+    unsynced) what="git は衝突させないが merge 後が同期していない（--check 赤: $(why)）" ;;
     conflict) what="後の PR が衝突する（${files% }）" ;;
   esac
   case "${expect}:${result}" in
@@ -247,7 +261,7 @@ scenario() {
   if check "${FX}/${name}-ab"; then
     ok "${name}: 生成し直すだけで衝突が解け、両方を直したマトリクスと同期する（--check 緑）"
   else
-    ng "${name}: 生成し直しても同期しない: $(head -1 "${SB}/check.log")"
+    ng "${name}: 生成し直しても同期しない: $(why)"
   fi
 }
 
@@ -256,6 +270,14 @@ if [ -z "${GEN_REF}" ]; then
     *support.md*) ng "ページ（*.md）がコミットされている: ${TRACKED}" ;;
     *) ok "コミットされるのは写し（*.json）だけ" ;;
   esac
+  # 写しは tako の出力の中のキーの並びに依らない（手元の `cargo build -p tako-cli` と CI の
+  # workspace 全体のビルドで agent のマスの並びが違い、CI の --check だけが落ちた）
+  fx reorder "${FX}/reordered" "${FX}/base"
+  if check "${FX}/reordered"; then
+    ok "tako の出力のキーの並びが逆でも写しは同じ（--check 緑）"
+  else
+    ng "tako の出力のキーの並びで写しが変わる: $(why)"
+  fi
 fi
 
 # 10/15 の #2093 → #2095 型: 別々の節の行の状態を変える（件数の行が両方で変わる）
@@ -298,7 +320,7 @@ console.log(f.status === "supported" ? "対応" : "一部対応");
   elif grep -qF '同期していません' "${SB}/check.log"; then
     ok "写しより 1 行進んだマトリクスで --check が落ちる"
   else
-    ng "--check の落ち方が違う: $(head -1 "${SB}/check.log")"
+    ng "--check の落ち方が違う: $(why)"
   fi
 fi
 
