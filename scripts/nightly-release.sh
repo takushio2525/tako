@@ -83,7 +83,9 @@ for _p in "$HOME/.nodebrew/current/bin" "$HOME/.volta/bin" "$HOME/.fnm" "$HOME/n
 done
 export PATH
 # 中のビルド（build-app.sh の run_heavy → tako queue）は人や worker の後ろへ low で並ぶ。
-# 夜は worker が走っていて待ちが長くなりうるので、待ちの上限は既定の 30 分ではなく 3 時間（#1994）
+# 夜は worker が走っていて待ちが長くなりうるので、待ちの上限は既定の 30 分ではなく 3 時間（#1994）。
+# 上の PATH の先頭（~/.cargo/bin）に順番待ちを知らない古い tako が居ても、run_heavy は PATH の後ろと
+# .app の同梱 CLI から順番待ちを知る tako を探して並ぶ（#2119。見つからなければ今どおり直に走る）
 export TAKO_QUEUE_PRIORITY=low
 export TAKO_QUEUE_MAX_WAIT=3h
 

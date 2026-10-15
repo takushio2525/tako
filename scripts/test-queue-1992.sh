@@ -20,7 +20,8 @@
 #   ⑪ メモリ圧 critical は止める（0 件でも）・空きメモリの予約で待つ（注入した機の値）
 #   ⑫ UI の代役が答えない（固まった UI）状態でも割り当ては進む
 #   ⑬ 上限の読み書き（範囲外は弾く・GUI が居なくても設定ファイルへ書ける）
-#   ⑭ scripts/lib/queue.sh の run_heavy（順番待ちへ通す・入れ子と tako の無い環境はそのまま）
+#   ⑭ scripts/lib/queue.sh の run_heavy（順番待ちへ通す・入れ子と tako の無い環境はそのまま・
+#      PATH の先頭が順番待ちを知らない古い tako でも後ろの tako で並ぶ = #2119）
 #
 # 落とすのは自分で起こした pid とソケットだけ（名前一致で殺さない）。
 # 使い方: bash scripts/test-queue-1992.sh
@@ -384,8 +385,17 @@ out="$(PATH="$TMP/pathbin:$PATH" TAKO_QUEUE_SOCKET="$SOCK" bash -c '. "'"$REPO_R
 case "$out" in job=[0-9]*) pass "run_heavy は順番待ちへ通す（${out}）" ;; *) fail "run_heavy: $out" ;; esac
 out="$(PATH="$TMP/pathbin:$PATH" TAKO_QUEUE_SOCKET="$SOCK" TAKO_QUEUE_JOB=77 bash -c '. "'"$REPO_ROOT"'/scripts/lib/queue.sh"; run_heavy sh -c "echo job=\$TAKO_QUEUE_JOB"')"
 [ "$out" = "job=77" ] && pass "入れ子（TAKO_QUEUE_JOB がある）はそのまま走らせる" || fail "入れ子: $out"
-out="$(PATH="/usr/bin:/bin" bash -c '. "'"$REPO_ROOT"'/scripts/lib/queue.sh"; run_heavy sh -c "exit 6"; echo "rc=$?"')"
+# .app の置き場（TAKO_QUEUE_FALLBACKS の既定 = /Applications/tako.app）も空にする（この機の本番の tako を拾わない。#2119）
+out="$(PATH="/usr/bin:/bin" TAKO_QUEUE_FALLBACKS="" bash -c '. "'"$REPO_ROOT"'/scripts/lib/queue.sh"; run_heavy sh -c "exit 6"; echo "rc=$?"')"
 [ "$out" = "rc=6" ] && pass "tako の無い環境（CI）はそのまま走らせ終了コードを返す" || fail "tako なし: $out"
+# 夜間リリースの PATH（#2119）: 先頭に順番待ちを知らない古い tako が居ても、後ろの tako で並ぶ
+mkdir -p "$TMP/oldbin"
+printf '#!/bin/sh\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$TMP/oldbin/tako"
+chmod +x "$TMP/oldbin/tako"
+out="$(PATH="$TMP/oldbin:/usr/bin:/bin" TAKO_QUEUE_FALLBACKS="$TAKO" TAKO_QUEUE_SOCKET="$SOCK" bash -c '. "'"$REPO_ROOT"'/scripts/lib/queue.sh"; run_heavy sh -c "echo job=\$TAKO_QUEUE_JOB"' 2>/dev/null)"
+case "$out" in job=[0-9]*) pass "PATH の先頭が古い tako でも後ろの tako で並ぶ（${out}）" ;; *) fail "古い tako が先: $out" ;; esac
+out="$(PATH="$TMP/oldbin:/usr/bin:/bin" TAKO_QUEUE_FALLBACKS="$TAKO" TAKO_QUEUE_SOCKET="$SOCK" TAKO_2119_LEGACY=1 bash -c '. "'"$REPO_ROOT"'/scripts/lib/queue.sh"; run_heavy sh -c "echo job=\${TAKO_QUEUE_JOB:-none}"' 2>/dev/null)"
+[ "$out" = "job=none" ] && pass "修正前（TAKO_2119_LEGACY=1）は並ばない（${out}）" || fail "LEGACY: $out"
 PATH="$TMP/pathbin:$PATH" TAKO_QUEUE_SOCKET="$SOCK" bash -c '. "'"$REPO_ROOT"'/scripts/lib/queue.sh"; run_heavy --priority low sh -c "exit 0"' \
   && pass "run_heavy --priority low" || fail "run_heavy --priority low"
 
