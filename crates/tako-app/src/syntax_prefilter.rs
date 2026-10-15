@@ -47,7 +47,7 @@
 //! 300 行で 1 回目から速くなる（343〜356 → 249〜252 ms）。表は `.agent/architecture.md`
 //! 「TS の塗りの正規表現の前置き（#1917）」
 //!
-//! `TAKO_1917_LEGACY=1` で書き換え前（two-face の構文セットそのまま）へ戻して同一バイナリで
+//! `TAKO_1917_LEGACY=1` で書き換え前（土台の構文セットそのまま）へ戻して同一バイナリで
 //! A/B を取れる。
 
 use std::collections::{BTreeMap, HashMap};
@@ -72,15 +72,16 @@ pub(crate) fn legacy() -> bool {
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1917_LEGACY").is_some())
 }
 
-/// 塗りに使う構文セット（[`crate::preview`] の `SyntectHighlighter::new` が呼ぶ）
+/// 塗りに使う構文セット（[`crate::preview`] の `SyntectHighlighter::new` が呼ぶ）。
+/// 土台は two-face に無い構文を末尾へ足したもの（[`crate::syntax_extra::base_set`]。#1954）
 pub(crate) fn syntax_set() -> SyntaxSet {
     if legacy() {
-        return two_face::syntax::extra_newlines();
+        return crate::syntax_extra::base_set();
     }
     match built() {
         Ok(built) => syntect::dumps::from_uncompressed_data(&built.bytes)
-            .unwrap_or_else(|_| two_face::syntax::extra_newlines()),
-        Err(_) => two_face::syntax::extra_newlines(),
+            .unwrap_or_else(|_| crate::syntax_extra::base_set()),
+        Err(_) => crate::syntax_extra::base_set(),
     }
 }
 
@@ -98,7 +99,7 @@ pub(crate) struct Built {
 /// 書き換えた構文セット（プロセスで 1 回だけ作る。失敗の理由は文字列で残す）
 pub(crate) fn built() -> &'static Result<Built, String> {
     static BUILT: OnceLock<Result<Built, String>> = OnceLock::new();
-    BUILT.get_or_init(|| build(&two_face::syntax::extra_newlines()))
+    BUILT.get_or_init(|| build(&crate::syntax_extra::base_set()))
 }
 
 /// 起動時に専用スレッドで [`built`] を済ませておく（release 実測 34〜36 ms。最初の塗りが
@@ -117,30 +118,31 @@ pub(crate) fn warm_up() {
 
 // ---- syntect 5 の直列化の鏡（並び・型を syntect の `#[derive(Serialize)]` と揃える） ----
 
-/// `SyntaxSet`（`first_line_cache` / `metadata` は直列化されない）
+/// `SyntaxSet`（`first_line_cache` / `metadata` は直列化されない）。
+/// two-face に無い構文を末尾へ足すとき（[`crate::syntax_extra`]。#1954）もこの鏡を使う
 #[derive(Serialize, Deserialize)]
-struct SetMirror {
-    syntaxes: Vec<ReferenceMirror>,
-    path_syntaxes: Vec<(String, usize)>,
+pub(crate) struct SetMirror {
+    pub(crate) syntaxes: Vec<ReferenceMirror>,
+    pub(crate) path_syntaxes: Vec<(String, usize)>,
 }
 
 /// `SyntaxReference`（`lazy_contexts` は直列化されない。`variables` は鍵の順に並ぶ）
 #[derive(Serialize, Deserialize)]
-struct ReferenceMirror {
-    name: String,
-    file_extensions: Vec<String>,
-    scope: Scope,
-    first_line_match: Option<String>,
-    hidden: bool,
-    variables: BTreeMap<String, String>,
-    serialized_lazy_contexts: Vec<u8>,
+pub(crate) struct ReferenceMirror {
+    pub(crate) name: String,
+    pub(crate) file_extensions: Vec<String>,
+    pub(crate) scope: Scope,
+    pub(crate) first_line_match: Option<String>,
+    pub(crate) hidden: bool,
+    pub(crate) variables: BTreeMap<String, String>,
+    pub(crate) serialized_lazy_contexts: Vec<u8>,
 }
 
 /// `LazyContexts`（zlib で圧縮した bincode として `serialized_lazy_contexts` に入っている）
 #[derive(Serialize, Deserialize, PartialEq)]
-struct LazyMirror {
-    context_ids: BTreeMap<String, ContextId>,
-    contexts: Vec<Context>,
+pub(crate) struct LazyMirror {
+    pub(crate) context_ids: BTreeMap<String, ContextId>,
+    pub(crate) contexts: Vec<Context>,
 }
 
 fn build(base: &SyntaxSet) -> Result<Built, String> {
@@ -596,8 +598,9 @@ export const List: React.FC<Props> = ({ title, items = [] }) => {
 };
 "#;
 
+    /// 書き換えの入力（two-face に無い構文を足した土台。#1954）
     fn base() -> SyntaxSet {
-        two_face::syntax::extra_newlines()
+        crate::syntax_extra::base_set()
     }
 
     /// 1 行ずつの (スコープ操作, 色・太字・斜体・文字) を並べた塗りの全記録

@@ -2173,7 +2173,8 @@ pub struct SyntectHighlighter {
 
 impl SyntectHighlighter {
     fn new() -> Self {
-        // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 213 構文。#320）。
+        // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 213 構文。#320）+ two-face に
+        // 無い構文（PowerShell。#1954 = `syntax_extra`）の 214 構文。
         // TS / TSX の正規表現だけ「当たらない行で VM を起こさない」等価形へ書き換えたもの（#1917）
         let syntaxes = crate::syntax_prefilter::syntax_set();
         let mut themes = syntect::highlighting::ThemeSet::load_defaults().themes;
@@ -2190,7 +2191,7 @@ impl SyntectHighlighter {
 
     /// 読み取り / 編集で共用する構文解決。本文の手掛かり（`.m` = MATLAB / Objective-C。#1953）→
     /// 言語の同定の正本（`tako_core::file_type`）の行が構文を名指していればそれ（#1948）。
-    /// 無ければ two-face（bat 由来の 213 構文）の表を
+    /// 無ければ構文セット（two-face = bat 由来の 213 構文 + PowerShell。#1954）の表を
     /// ファイル名 → 拡張子 → shebang（1 行目）の優先順で引く。
     /// ファイル名を先に試すのは CMakeLists.txt 等の拡張子が汎用（.txt）でも
     /// ファイル名で特定できるケースを拾うため。
@@ -5266,6 +5267,10 @@ mod file_type_parity_tests;
 #[cfg(any(test, feature = "visual-test"))]
 pub(crate) mod alias_samples_1953;
 
+/// #1954 の検査用の本文（単体と visual-test `extra-syntax` で共用）
+#[cfg(any(test, feature = "visual-test"))]
+pub(crate) mod extra_samples_1954;
+
 #[cfg(test)]
 mod syntax_resolution_tests {
     use super::*;
@@ -5364,9 +5369,10 @@ mod syntax_resolution_tests {
                 "本文の判定の構文 {name} が構文セットに無い"
             );
         }
+        // two-face の 213 + two-face に無い構文（#1954 = PowerShell）
         assert_eq!(
             hl.syntaxes.syntaxes().len(),
-            213,
+            213 + crate::syntax_extra::NAMES.len(),
             "構文の数が変わった（#815 の常駐と #1948 の全数一致の前提）"
         );
     }
@@ -5417,6 +5423,98 @@ mod syntax_resolution_tests {
         ] {
             assert_eq!(hl.syntax_for_token(token).name, expected, "```{token}");
         }
+    }
+
+    /// #1954: two-face に構文が無かった PowerShell の 3 つの拡張子が、足した構文で塗られる。
+    /// 複数の構文色・ダークの面で消える字句が 0（`invalid` を地の色で描くテーマなので、
+    /// 構文の取り違えはここで出る）・`file_type` も同じ行（`powershell`）
+    #[test]
+    fn powershellの3つの拡張子は足した構文で塗られる() {
+        use super::extra_samples_1954::*;
+        let hl = SyntectHighlighter::new();
+        let dark = tako_core::theme::Theme::for_mode(tako_core::theme::ThemeMode::Dark);
+        for (path, text, min_colors) in [
+            ("pack.ps1", PS_SCRIPT, 6),
+            ("Slug.psm1", PS_MODULE, 4),
+            ("Slug.psd1", PS_MANIFEST, 3),
+            ("Hasher.ps1", PS_CSHARP_HEREDOC, 4),
+            ("PACK.PS1", PS_SCRIPT, 6),
+        ] {
+            let path = Path::new(path);
+            assert_eq!(
+                hl.syntax_for_path(path, text).name,
+                "PowerShell",
+                "{path:?}"
+            );
+            assert_eq!(
+                tako_core::file_type::identify(path).map(|row| row.id),
+                Some("powershell"),
+                "{path:?}"
+            );
+            let (lines, name) = hl.highlight_named(path, text);
+            assert_eq!(name, "PowerShell");
+            assert_eq!(lines.len(), text.lines().count(), "{path:?}");
+            let colors = lines
+                .iter()
+                .flatten()
+                .filter_map(|span| span.color)
+                .map(|c| (c.r, c.g, c.b))
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert!(colors >= min_colors, "{path:?}: {colors} 色");
+            let faint: Vec<&str> = lines
+                .iter()
+                .flatten()
+                .filter(|span| !span.text.trim().is_empty())
+                .filter(|span| {
+                    span.color
+                        .is_some_and(|c| c.contrast_ratio(dark.background) < 1.5)
+                })
+                .map(|span| span.text.as_str())
+                .collect();
+            assert!(faint.is_empty(), "{path:?}: ダークで消える字句 {faint:?}");
+        }
+        // ヒアドキュメントの中の C#（two-face の C# へ結んだ参照）と、`-match` の正規表現
+        // （two-face の Regular Expression）が、それぞれの構文で塗られる（結べていない参照は
+        // 塗る途中で panic する）
+        let syntax = hl.syntaxes.find_syntax_by_name("PowerShell").unwrap();
+        let mut parse = syntect::parsing::ParseState::new(syntax);
+        let mut stack = syntect::parsing::ScopeStack::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let text = format!("{PS_SCRIPT}{PS_CSHARP_HEREDOC}");
+        for line in syntect::util::LinesWithEndings::from(&text) {
+            for (_, op) in parse.parse_line(line, &hl.syntaxes).unwrap() {
+                stack.apply(&op).unwrap();
+                for scope in stack.as_slice() {
+                    let scope = scope.build_string();
+                    if scope.starts_with("source.cs") || scope.starts_with("source.regexp") {
+                        seen.insert(scope);
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().any(|s| s.starts_with("source.cs")), "{seen:?}");
+        assert!(
+            seen.iter().any(|s| s.starts_with("source.regexp")),
+            "{seen:?}"
+        );
+    }
+
+    /// #1954 の境界: 空の `.ps1` と、1 行目が shebang の拡張子なしのスクリプト
+    #[test]
+    fn 空のps1とshebangのpwsh() {
+        let hl = SyntectHighlighter::new();
+        let (lines, name) = hl.highlight_named(Path::new("empty.ps1"), "");
+        assert_eq!(name, "PowerShell");
+        assert!(lines
+            .iter()
+            .flatten()
+            .all(|span| span.text.trim().is_empty()));
+        let script = "#!/usr/bin/env pwsh\nWrite-Host 'hi'\n";
+        assert_eq!(
+            hl.syntax_for_path(Path::new("deploy"), script).name,
+            "PowerShell"
+        );
     }
 
     /// #1953: A/B（`TAKO_1953_LEGACY=1`）は別名の行と本文の判定だけを外し、#1953 以前へ戻す

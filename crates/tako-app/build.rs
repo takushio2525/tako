@@ -21,6 +21,9 @@
 //! 2 の分岐は tako-cli/build.rs にも同じ形で置いてある。ビルドスクリプトは
 //! クレートをまたいで共有できず、共有のためだけにヘルパークレートを足す方が高くつくため
 //! （両方 40 行弱で、変更するときは対で直す）。
+//!
+//! もう 1 つの役目は、two-face に無い構文（#1954。`syntaxes/` の `.sublime-syntax`）をビルド時に
+//! syntect の構文定義へ読んでおくこと（`compile_extra_syntaxes`。全ターゲット・全プロファイル）。
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -29,6 +32,9 @@ fn main() {
     // （例: "3"）があれば `-win.3` を付与。update_checker.rs が自バイナリの正確な版数として
     // 使い、-win.N 間の更新検知を可能にする。全プラットフォーム・全プロファイルで emit する
     emit_full_version();
+
+    // two-face に無い構文（#1954）。全ターゲットで要るので Windows の判定より前に置く
+    compile_extra_syntaxes();
 
     // `cfg!(target_os = "windows")` はビルドスクリプト自身（= ホスト）を指してしまうので使わない。
     // CARGO_CFG_TARGET_OS が「これから作るバイナリ」の OS。
@@ -90,6 +96,98 @@ fn embed_windows_resources() {
              配布用の exe は Windows 実機（installer/windows/release-windows.ps1）で作ること"
         );
     }
+}
+
+/// two-face に無い構文（#1954）を YAML（`.sublime-syntax`）から syntect の構文定義へ読み、
+/// 直列化して `OUT_DIR/extra-syntaxes.bin` へ置く。起動時は YAML を読まない
+/// （YAML の読み込みは release で 57 ms かかり、YAML のパーサを配布バイナリへ入れることになる）。
+/// ほかの構文への参照の結びつけは、起動時に `src/syntax_extra.rs` が既存の構文セットに対して行う。
+///
+/// ここで落とすもの（どれも見逃すと、塗る途中や 1 行目での構文の判定で syntect が panic する）:
+/// - 正規表現が fancy-regex で組めない（two-face が PowerShell を外していた理由。bat 同梱の
+///   PowerShell はサブルーチン呼び出し `\g<1>` を使う）
+/// - `first_line_match` の変数（`{{…}}`）。syntect は文脈の正規表現の変数は展開するが
+///   `first_line_match` は展開しないので、ここで展開してから組めるかを見る
+fn compile_extra_syntaxes() {
+    use syntect::parsing::syntax_definition::Pattern;
+    use syntect::parsing::{Regex, SyntaxDefinition};
+
+    /// 構文のファイルと、読む前に当てる置き換え（`(元, 後)`。元が無ければ上流が変わったので落とす）
+    const SOURCES: &[(&str, &[(&str, &str)])] = &[(
+        "syntaxes/PowerShell/PowerShell.sublime-syntax",
+        // 埋め込みの C# は上流の別ファイル（Sublime Text 4 の `extends` で書かれていて syntect は
+        // 読めない）を名指すので、two-face の C# へ向ける（置き換えの内容は PROVENANCE.md）
+        &[("scope:source.cs.embedded.powershell", "scope:source.cs")],
+    )];
+
+    let mut defs = Vec::new();
+    for (path, replaces) in SOURCES {
+        println!("cargo:rerun-if-changed={path}");
+        let mut text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{path} を読めない（#1954）: {e}"));
+        for (from, to) in *replaces {
+            assert!(
+                text.contains(from),
+                "{path}: 置き換える `{from}` が見つからない。上流の構文が変わったので \
+                 PROVENANCE.md と置き換えを見直すこと（#1954）"
+            );
+            text = text.replace(from, to);
+        }
+        let mut def = SyntaxDefinition::load_from_str(&text, true, None)
+            .unwrap_or_else(|e| panic!("{path} を構文として読めない（#1954）: {e:?}"));
+        if let Some(line) = def.first_line_match.take() {
+            def.first_line_match = Some(expand_variables(&line, &def.variables, path));
+        }
+        let mut regexes: Vec<(String, &str)> = def
+            .first_line_match
+            .iter()
+            .map(|r| ("first_line_match".to_string(), r.as_str()))
+            .collect();
+        for (name, context) in &def.contexts {
+            for pattern in &context.patterns {
+                if let Pattern::Match(m) = pattern {
+                    regexes.push((name.clone(), m.regex.regex_str()));
+                }
+            }
+        }
+        for (context, regex) in regexes {
+            if let Some(e) = Regex::try_compile(regex) {
+                panic!(
+                    "{path}: 文脈 {context} の正規表現を fancy-regex で組めない（#1954）\n  \
+                     {regex}\n  {e}"
+                );
+            }
+        }
+        defs.push(def);
+    }
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("extra-syntaxes.bin");
+    std::fs::write(&out, syntect::dumps::dump_binary(&defs))
+        .unwrap_or_else(|e| panic!("{} を書けない（#1954）: {e}", out.display()));
+}
+
+/// `{{名前}}` を構文の変数で展開する（変数の中の変数も。syntect の文脈の正規表現と同じ扱い）
+fn expand_variables(
+    text: &str,
+    variables: &std::collections::HashMap<String, String>,
+    path: &str,
+) -> String {
+    let mut out = text.to_string();
+    for _ in 0..64 {
+        let Some(start) = out.find("{{") else {
+            return out;
+        };
+        let end = out[start..]
+            .find("}}")
+            .map(|at| start + at)
+            .unwrap_or_else(|| panic!("{path}: `{{{{` が閉じていない（#1954）"));
+        let name = &out[start + 2..end];
+        let value = variables
+            .get(name)
+            .unwrap_or_else(|| panic!("{path}: 変数 {name} が無い（#1954）"));
+        out = format!("{}{value}{}", &out[..start], &out[end + 2..]);
+    }
+    panic!("{path}: 変数の展開が終わらない（#1954）");
 }
 
 fn emit_full_version() {

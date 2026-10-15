@@ -67,6 +67,7 @@ mod spinner;
 mod ssh_folders;
 mod starter;
 mod status_bar;
+mod syntax_extra;
 mod syntax_prefilter;
 mod tab_bar;
 mod tab_shape;
@@ -31335,8 +31336,8 @@ fn main() {
     tako_control::diag::mark_main_thread();
     tako_control::diag::spawn_stall_watchdog();
     // #1917: TS の塗りの正規表現を書き換えた構文セットを先に作っておく（release 実測 34〜36 ms・
-    // プロセスで 1 回）。最初の塗りが UI スレッド（チャットのコードブロック・小さいファイルの
-    // 編集開始）でも、そこで払わずに済む
+    // プロセスで 1 回。#1954 の two-face に無い構文の継ぎ足し 6〜7 ms もここで済む）。最初の塗りが
+    // UI スレッド（チャットのコードブロック・小さいファイルの編集開始）でも、そこで払わずに済む
     syntax_prefilter::warm_up();
     // #777: SIGTERM を正規の quit（`on_app_quit` を通る）へ読み替える。**本番も対象**
     // （#770 では隔離インスタンス限定だった）。`kill -TERM` / スクリプトからの停止でも
@@ -31718,6 +31719,12 @@ mod self_test {
     mod syntax_alias_1953;
     #[cfg(feature = "visual-test")]
     use syntax_alias_1953::syntax_alias_visual;
+    /// #1954: two-face に構文が無かった PowerShell（`.ps1` / `.psm1` / `.psd1`）を足した構文で塗り、
+    /// 応答の `syntax` で読める（visual-test `extra-syntax`）
+    #[cfg(feature = "visual-test")]
+    mod extra_syntax_1954;
+    #[cfg(feature = "visual-test")]
+    use extra_syntax_1954::extra_syntax_visual;
     /// #2031: tasks の 2 秒ごとの一覧更新の最中も返答欄への打鍵が止まらない（visual-test `tasks-tick`）
     #[cfg(feature = "visual-test")]
     mod tasks_tick_2031;
@@ -46253,6 +46260,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1954: two-face に無い PowerShell の構文で塗り、応答の syntax で読めるか
+                "extra-syntax" => {
+                    extra_syntax_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #2031: tasks の 2 秒ごとの一覧更新の最中も返答欄への打鍵が止まらないか
                 // （置き場の読みは `TAKO_2031_INJECT=slow:<ミリ秒>` で遅らせて測る）
                 "tasks-tick" => {
@@ -46342,7 +46355,7 @@ mod self_test {
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
-                         syntax-alias / net-resume / \
+                         syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759）"
                     );
