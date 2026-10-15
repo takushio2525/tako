@@ -614,8 +614,11 @@ pub fn resolve_file_icon(path: &Path) -> FileIconKind {
         return kind;
     }
 
-    // 隠しファイル（ドットファイル）
-    if name.starts_with('.') && !name.contains('.') {
+    // 隠しファイル（拡張子の無いドットファイル = 先頭の `.` の後ろに `.` を含まない。#2015）
+    if name
+        .strip_prefix('.')
+        .is_some_and(|rest| !rest.contains('.'))
+    {
         return FileIconKind::Settings;
     }
 
@@ -746,6 +749,49 @@ mod tests {
             resolve_file_icon(Path::new("Sketch.INO")),
             FileIconKind::Cpp
         );
+    }
+
+    /// #2015: 表に無い拡張子の無い dotfile（先頭の `.` の後ろに `.` が無い名前）は設定アイコン。
+    /// 修正前は判定が常に偽で、`extension()` が None → 既定の `File` へ落ちていた
+    #[test]
+    fn 拡張子の無いdotfileは設定アイコン() {
+        for name in [
+            ".npmrc",
+            ".zshrc",
+            ".bashrc",
+            ".editorconfig",
+            ".nvmrc",
+            ".env",
+            "home/.zshrc",
+        ] {
+            assert_eq!(
+                resolve_file_icon(Path::new(name)),
+                FileIconKind::Settings,
+                "{name}"
+            );
+        }
+    }
+
+    /// #2015 の境界: 表の名前は dotfile の判定より先・途中にも `.` がある名前は dotfile 扱いに
+    /// せず最後の拡張子で引く（`.env.local` は `local` が表に無いので `File` のまま）・
+    /// 先頭が `.` でない名前と名前の取れないパスは従来どおり
+    #[test]
+    fn dotfile判定の境界() {
+        for (name, kind) in [
+            (".gitignore", FileIconKind::Git),
+            (".dockerignore", FileIconKind::Docker),
+            (".prettierrc", FileIconKind::Prettier),
+            (".env.local", FileIconKind::File),
+            (".eslintrc.cjs", FileIconKind::JavaScript),
+            ("..foo", FileIconKind::File),
+            ("a.txt", FileIconKind::Book),
+            ("Makefile", FileIconKind::Terminal),
+            ("noext", FileIconKind::File),
+            ("", FileIconKind::File),
+            ("..", FileIconKind::File),
+        ] {
+            assert_eq!(resolve_file_icon(Path::new(name)), kind, "{name:?}");
+        }
     }
 
     #[test]
