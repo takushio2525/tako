@@ -2703,6 +2703,9 @@ struct TakoApp {
     run_menu: crate::run_menu_ui::RunMenuUi,
     /// チェンジログビューのデータ（Issue #338。pane ごと）
     preview_changelogs: HashMap<PaneId, preview::ChangelogData>,
+    /// 「履歴」ボタンで変更履歴を取っている最中のペイン（#2014。git は background で待つので、
+    /// その間の重ね押しを無視する）
+    preview_changelog_pending: std::collections::HashSet<PaneId>,
     /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
     preview_views: HashMap<PaneId, tako_core::PreviewViewState>,
     /// PDF・画像プレビューの 2 軸スクロールとページ移動を共有する GPUI handle。
@@ -5017,6 +5020,7 @@ impl TakoApp {
             video_resume: HashMap::new(),
             run_menu: crate::run_menu_ui::RunMenuUi::default(),
             preview_changelogs: HashMap::new(),
+            preview_changelog_pending: std::collections::HashSet::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
             filetree_scroll_handle: gpui::ScrollHandle::new(),
@@ -27027,61 +27031,25 @@ impl PreviewHost for TakoApp {
         }
     }
 
+    /// #2014: 履歴は dispatch が上限つきで background で取ってから渡す（ここで git を起こさない）
     fn set_preview_changelog(
         &mut self,
         pane: PaneId,
-        enabled: bool,
-        max_count: usize,
-    ) -> Result<serde_json::Value, String> {
-        let state = self
-            .previews
-            .get(&pane)
-            .ok_or_else(|| format!("プレビューペインではない: {}", pane.as_u64()))?;
-        if !enabled {
-            self.preview_changelogs.remove(&pane);
-            return Ok(serde_json::json!({
-                "pane": pane.as_u64(),
-                "changelog": false,
-            }));
+        history: Option<tako_core::git::FileHistory>,
+    ) -> Result<(), String> {
+        if !self.previews.contains_key(&pane) {
+            return Err(format!("プレビューペインではない: {}", pane.as_u64()));
         }
-        let path = state.path.clone();
-        let repo = tako_core::git::repo_root(&path);
-        let repo = match repo {
-            Some(r) => r,
+        match history {
             None => {
-                let data = preview::ChangelogData::default();
-                self.preview_changelogs.insert(pane, data);
-                return Ok(serde_json::json!({
-                    "pane": pane.as_u64(),
-                    "changelog": true,
-                    "commits": 0,
-                    "message": "git 管理外のファイル",
-                }));
+                self.preview_changelogs.remove(&pane);
             }
-        };
-        // git は常に `/` 区切りのパスを期待する（#520）
-        let rel = tako_core::git::repo_relative(&repo, &path)
-            .unwrap_or_else(|| tako_core::git::to_git_path(&path));
-        let commits = tako_core::git::log_file_commits(&repo, &rel, max_count);
-        let commit_count = commits.len();
-        let entries: Vec<preview::ChangelogEntry> = commits
-            .into_iter()
-            .map(|c| preview::ChangelogEntry {
-                commit: c,
-                expanded_diff: None,
-            })
-            .collect();
-        let data = preview::ChangelogData {
-            entries,
-            repo_root: Some(repo),
-            rel_path: Some(rel),
-        };
-        self.preview_changelogs.insert(pane, data);
-        Ok(serde_json::json!({
-            "pane": pane.as_u64(),
-            "changelog": true,
-            "commits": commit_count,
-        }))
+            Some(history) => {
+                self.preview_changelogs
+                    .insert(pane, preview::ChangelogData::from_history(history));
+            }
+        }
+        Ok(())
     }
 
     fn toggle_changelog_diff(
@@ -31827,6 +31795,11 @@ mod self_test {
     mod enter_1759;
     #[cfg(feature = "visual-test")]
     use enter_1759::enter_1759_visual;
+    /// #2014: プレビューの「履歴」ボタンが UI スレッドで git を待たない（visual-test `changelog-offload`）
+    #[cfg(feature = "visual-test")]
+    mod changelog_offload_2014;
+    #[cfg(feature = "visual-test")]
+    use changelog_offload_2014::changelog_offload_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -46392,6 +46365,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2014: 「履歴」ボタンが返らない git の最中も UI スレッドを止めず、上限で理由を知らせる
+                "changelog-offload" => {
+                    changelog_offload_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -46407,7 +46386,8 @@ mod self_test {
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
-                         workspace-search-1694 / paste-guard / bracket-match / enter-1759）"
+                         workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
+                         changelog-offload）"
                     );
                     std::process::exit(1);
                 }

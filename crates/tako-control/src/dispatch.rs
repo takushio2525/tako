@@ -3038,6 +3038,37 @@ pub enum OffloadJob {
     UserTaskStore(Box<UserTaskStoreJob>),
     /// 返答の配送の記録と読み直し（#2086 の ④。③ の配送を UI スレッドで済ませた後の background）
     UserTaskRespondRecord(Box<UserTaskRespondRecordJob>),
+    /// プレビューの変更履歴を開く（#2014）。UI スレッドではプレビューのパス（キャッシュ済みの値）
+    /// だけを写し、リポジトリの解決（`git rev-parse`）と履歴（`git log --follow`）は上限つきで
+    /// background。プレビューの状態へ置くのは [`OffloadContinuation::PreviewChangelog`] で UI スレッドへ戻す
+    PreviewChangelog(Box<PreviewChangelogJob>),
+}
+
+/// プレビューの変更履歴を取るジョブ（#2014。[`preview_changelog_prepare`] が UI スレッドで作る）
+pub struct PreviewChangelogJob {
+    pane: PaneId,
+    path: PathBuf,
+    max_count: usize,
+}
+
+impl PreviewChangelogJob {
+    /// 履歴を取る（子プロセスを待つ。UI スレッドで呼ぶのは同期の腕 = テスト・直呼び・A/B だけ）
+    fn run(self, budget: std::time::Duration) -> PreviewChangelogLanding {
+        let history = tako_core::git::file_history(&self.path, self.max_count, budget);
+        PreviewChangelogLanding {
+            pane: self.pane,
+            path: self.path,
+            history,
+        }
+    }
+}
+
+/// 取った変更履歴を UI スレッドへ運ぶもの（#2014）
+pub struct PreviewChangelogLanding {
+    pane: PaneId,
+    /// 取ったときのプレビューのパス（着地までに別のファイルへ切り替わっていたら置かない）
+    path: PathBuf,
+    history: Result<tako_core::git::FileHistory, tako_core::git::HistoryTimedOut>,
 }
 
 /// コピーのジョブ（`op=copy` は 1 件、`paths` のまとめた `op=copy` と `op=paste` は渡した数だけ。
@@ -3139,6 +3170,8 @@ pub enum OffloadContinuation {
     UserTaskStatus(Box<UserTaskStatusLanding>),
     /// ユーザータスクの host に触る後始末（起票の通知・返答の配送・展開。[`user_task_land`]。#2086）
     UserTaskStored(Box<UserTaskLanding>),
+    /// 取った変更履歴をプレビューの状態へ置く（[`preview_changelog_land`]。#2014）
+    PreviewChangelog(Box<PreviewChangelogLanding>),
 }
 
 impl OffloadContinuation {
@@ -3150,8 +3183,9 @@ impl OffloadContinuation {
     /// 先取りした要求（#1984）は同期の腕と同じ判定（`protocol::changes_layout`）
     pub fn changes_layout(&self) -> bool {
         match self {
-            // #2052: 完了・却下は同期の腕の判定（`protocol::changes_layout`）でも偽
-            Self::List(_) | Self::UserTaskStatus(_) => false,
+            // #2052: 完了・却下は同期の腕の判定（`protocol::changes_layout`）でも偽。
+            // #2014: 変更履歴もプレビューの中身だけを変える（同期の腕の判定でも偽）
+            Self::List(_) | Self::UserTaskStatus(_) | Self::PreviewChangelog(_) => false,
             // #2086: 同期の腕と同じ判定（返答だけが真 = master を起こすとタブが増える）
             Self::UserTaskStored(landing) => matches!(**landing, UserTaskLanding::Responded { .. }),
             Self::Probed(probed) => crate::protocol::changes_layout(&probed.request),
@@ -3208,6 +3242,7 @@ pub fn finish_offload(
         OffloadContinuation::WorkspaceSearch(landing) => workspace_search_land(host, *landing),
         OffloadContinuation::UserTaskStatus(landing) => Ok(user_task_status_finish(host, *landing)),
         OffloadContinuation::UserTaskStored(landing) => user_task_land(host, *landing),
+        OffloadContinuation::PreviewChangelog(landing) => preview_changelog_land(host, *landing),
     }
 }
 
@@ -3620,6 +3655,18 @@ pub fn prepare_offload(
                 request: Box::new(request.clone()),
             }))
         }
+        // #2014: 変更履歴を開く切替は `git rev-parse` / `git log --follow` を待つ。UI スレッドでは
+        // プレビューのパスだけを写し、git は上限つきで background（閉じる・状態取得・diff の展開は
+        // 同期の腕のまま。A/B の `TAKO_2014_LEGACY=1` は修正前と同じ同期の腕 = 上限なし）
+        Request::PreviewChangelog {
+            pane,
+            enabled: Some(true),
+            max_count,
+            expand: None,
+        } if !tako_core::probe::issue2014_legacy() => Some(
+            preview_changelog_prepare(host, *pane, *max_count)
+                .map(|job| OffloadJob::PreviewChangelog(Box::new(job))),
+        ),
         Request::RemoteAgents if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::RemoteAgents))
         }
@@ -3725,6 +3772,12 @@ impl OffloadJob {
             },
             // #2086: 詳細・更新はそのまま応答し、host に触る後始末が要るものだけ UI スレッドへ戻す
             OffloadJob::UserTaskStore(job) => user_task_store_staged(*job),
+            // #2014: 履歴は上限つきで取り、プレビューの状態へ置くのは UI スレッドへ戻す
+            OffloadJob::PreviewChangelog(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::PreviewChangelog(Box::new(
+                    job.run(tako_core::git::changelog_timeout()),
+                )))
+            }
             other => OffloadOutcome::Reply(other.run_reply()),
         }
     }
@@ -3860,6 +3913,10 @@ impl OffloadJob {
             )),
             OffloadJob::UserTaskStore(_) => Err(DispatchError::Operation(
                 "ユーザータスクは run_staged で走らせる（通知・配送・展開に UI スレッドの続きが要る）"
+                    .into(),
+            )),
+            OffloadJob::PreviewChangelog(_) => Err(DispatchError::Operation(
+                "変更履歴は run_staged で走らせる（プレビューの状態へ置くのに UI スレッドの続きが要る）"
                     .into(),
             )),
         }
@@ -4486,6 +4543,66 @@ pub fn land_offload(
         },
         other => OffloadLanding::Done(finish_offload(host, other, origin)),
     }
+}
+
+/// 変更履歴の準備（UI スレッド。#2014）。写すのはプレビューのパス（キャッシュ済みの値）だけで、
+/// git は起こさない（リポジトリの解決も [`PreviewChangelogJob::run`] = background）
+fn preview_changelog_prepare(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    max_count: Option<usize>,
+) -> Result<PreviewChangelogJob, DispatchError> {
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    let (path, _) = host.preview_state(target).ok_or_else(|| {
+        DispatchError::Operation(format!("プレビューペインではない: {}", target.as_u64()))
+    })?;
+    Ok(PreviewChangelogJob {
+        pane: target,
+        path: PathBuf::from(path),
+        max_count: max_count.unwrap_or(50),
+    })
+}
+
+/// 取った変更履歴をプレビューの状態へ置いて応答を組む（UI スレッド。同期の腕と background の
+/// 着地の 1 実装。#2014）。上限に達した（`Err`）ときは状態を変えずに失敗として返す
+fn preview_changelog_land(
+    host: &mut dyn ControlHost,
+    landing: PreviewChangelogLanding,
+) -> Result<Value, DispatchError> {
+    let PreviewChangelogLanding {
+        pane,
+        path,
+        history,
+    } = landing;
+    // 待っている間にペインが閉じた・別のファイルへ切り替わったら置かない（別のファイルの履歴を出さない）
+    match host.preview_state(pane) {
+        Some((now, _)) if Path::new(&now) == path => {}
+        Some(_) => {
+            return Err(DispatchError::Operation(
+                "変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）".into(),
+            ))
+        }
+        None => {
+            return Err(DispatchError::Operation(format!(
+                "プレビューペインではない: {}",
+                pane.as_u64()
+            )))
+        }
+    }
+    let history = history.map_err(|e| DispatchError::Operation(e.to_string()))?;
+    let commits = history.commits.len();
+    let in_repo = history.repo_root.is_some();
+    host.set_preview_changelog(pane, Some(history))
+        .map_err(DispatchError::Operation)?;
+    let mut out = json!({
+        "pane": pane.as_u64(),
+        "changelog": true,
+        "commits": commits,
+    });
+    if !in_repo {
+        out["message"] = json!("git 管理外のファイル");
+    }
+    Ok(out)
 }
 
 /// スマホの一覧（`RemoteAgents`）の応答（同期の腕と #1984 の background の 1 実装）。
@@ -6975,17 +7092,35 @@ fn dispatch_inner(
                     .toggle_changelog_diff(target, &hash)
                     .map_err(DispatchError::Operation);
             }
-            if let Some(enabled) = enabled {
-                let count = max_count.unwrap_or(50);
-                return host
-                    .set_preview_changelog(target, enabled, count)
-                    .map_err(DispatchError::Operation);
+            match enabled {
+                Some(false) => {
+                    host.set_preview_changelog(target, None)
+                        .map_err(DispatchError::Operation)?;
+                    Ok(json!({
+                        "pane": target.as_u64(),
+                        "changelog": false,
+                    }))
+                }
+                // #2014: 開くのは通常 `prepare_offload` の腕（background）。ここへ来るのはテスト・
+                // 直呼び・`TAKO_OFFLOAD=0`・A/B だけで、本体は background と同じ 1 実装を通す
+                // （A/B の `TAKO_2014_LEGACY=1` だけ修正前と同じく上限なしで待つ）
+                Some(true) => {
+                    let job = preview_changelog_prepare(host, Some(target.as_u64()), max_count)?;
+                    let budget = if tako_core::probe::issue2014_legacy() {
+                        std::time::Duration::MAX
+                    } else {
+                        tako_core::git::changelog_timeout()
+                    };
+                    preview_changelog_land(host, job.run(budget))
+                }
+                None => {
+                    let changelog_on = host.preview_changelog_state(target).unwrap_or(false);
+                    Ok(json!({
+                        "pane": target.as_u64(),
+                        "changelog": changelog_on,
+                    }))
+                }
             }
-            let changelog_on = host.preview_changelog_state(target).unwrap_or(false);
-            Ok(json!({
-                "pane": target.as_u64(),
-                "changelog": changelog_on,
-            }))
         }
         Request::FileOp {
             op,
@@ -23693,6 +23828,8 @@ mod tests {
         /// #1659: 編集開始で**実ファイルを開く**か（既定 false = 従来どおり空のバッファ）。
         /// 外部変更の往復を本物の `TextBuffer` の保存・読み直しで確かめるテストだけが立てる
         preview_real_files: bool,
+        /// #2014: 変更履歴を開いたペインと置いた履歴（GUI の `preview_changelogs` の代役）
+        preview_changelogs: std::collections::HashMap<u64, tako_core::git::FileHistory>,
         /// #1659: 外部変更の競合（GUI の `EditState::conflict` の代役）
         preview_conflicts: std::collections::HashMap<u64, crate::host::PreviewConflict>,
         /// #1681: `show_lsp_hover` が出したカード（ペイン・位置・本文）。GUI の `LspHoverUi::card` の代役
@@ -23856,6 +23993,7 @@ mod tests {
                 preview_limits: std::collections::HashMap::new(),
                 preview_highlighting: std::collections::HashSet::new(),
                 preview_real_files: false,
+                preview_changelogs: std::collections::HashMap::new(),
                 preview_conflicts: std::collections::HashMap::new(),
                 hover_cards: Vec::new(),
                 collapsed: std::collections::HashSet::new(),
@@ -24444,6 +24582,22 @@ mod tests {
         }
         fn preview_state(&self, pane: PaneId) -> Option<(String, PreviewModeWire)> {
             self.previews.get(&pane.as_u64()).cloned()
+        }
+        fn preview_changelog_state(&self, pane: PaneId) -> Option<bool> {
+            self.previews
+                .contains_key(&pane.as_u64())
+                .then(|| self.preview_changelogs.contains_key(&pane.as_u64()))
+        }
+        fn set_preview_changelog(
+            &mut self,
+            pane: PaneId,
+            history: Option<tako_core::git::FileHistory>,
+        ) -> Result<(), String> {
+            match history {
+                None => self.preview_changelogs.remove(&pane.as_u64()),
+                Some(h) => self.preview_changelogs.insert(pane.as_u64(), h),
+            };
+            Ok(())
         }
         /// #1676: 行数は**実ファイルを読んで**数える（GUI と同じ材料）。
         /// 丸めと 1 始まりの判定は `open_plan` の 1 実装を GUI と共有する
@@ -32302,6 +32456,160 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["changelog"].as_bool(), Some(false));
+    }
+
+    /// #2014 の材料: このリポジトリの実ファイル（git 管理下）
+    fn changelog_repo_file() -> Option<PathBuf> {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Cargo.toml")
+            .canonicalize()
+            .ok()?;
+        tako_core::git::repo_root(&file).map(|_| file)
+    }
+
+    fn changelog_on(pane: u64) -> Request {
+        Request::PreviewChangelog {
+            pane: Some(pane),
+            enabled: Some(true),
+            max_count: Some(5),
+            expand: None,
+        }
+    }
+
+    /// #2014: 開く切替は background のジョブになり、UI スレッドの準備は状態に触らない。
+    /// 着地（UI スレッド）が置いた履歴と応答は同期の腕（テスト・直呼び・A/B）と同じ
+    #[test]
+    fn preview_changelogの開く切替はbackgroundのジョブで同期の腕と同じ応答になる() {
+        let Some(file) = changelog_repo_file() else {
+            return; // git の無い環境
+        };
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        host.previews
+            .insert(root, (file.display().to_string(), PreviewModeWire::Code));
+        // 閉じる・状態取得・diff の展開は git を待たない（または別件）のでジョブにしない
+        for other in [
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: Some(false),
+                max_count: None,
+                expand: None,
+            },
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: None,
+                max_count: None,
+                expand: None,
+            },
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: Some(true),
+                max_count: None,
+                expand: Some("abc".into()),
+            },
+        ] {
+            assert!(prepare_offload(&mut host, &other).is_none());
+        }
+        let job = prepare_offload(&mut host, &changelog_on(root))
+            .expect("開く切替はジョブになる")
+            .expect("準備に成功する");
+        assert!(matches!(job, OffloadJob::PreviewChangelog(_)));
+        assert!(host.preview_changelogs.is_empty(), "準備は状態を変えない");
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("置くのは UI スレッドの続き");
+        };
+        assert!(!next.changes_layout(), "プレビューの中身だけを変える");
+        let staged = finish_offload(&mut host, next, PaneOrigin::Cli).expect("着地");
+        let placed = host.preview_changelogs.remove(&root).expect("履歴を置いた");
+        assert!(placed.repo_root.is_some());
+        assert!(
+            staged["commits"].as_u64().is_some_and(|n| n >= 1),
+            "{staged}"
+        );
+        let sync = dispatch(&mut host, changelog_on(root), PaneOrigin::Cli).expect("同期の腕");
+        assert_eq!(staged, sync);
+        assert_eq!(host.preview_changelogs.get(&root), Some(&placed));
+        // 閉じるは同期の腕で状態を外す
+        let off = dispatch(
+            &mut host,
+            Request::PreviewChangelog {
+                pane: Some(root),
+                enabled: Some(false),
+                max_count: None,
+                expand: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .expect("閉じる");
+        assert_eq!(off["changelog"].as_bool(), Some(false));
+        assert!(host.preview_changelogs.is_empty());
+    }
+
+    /// #2014: 取っている間に別のファイルへ切り替わった・ペインが閉じたら置かない（別のファイルの履歴を出さない）
+    #[test]
+    fn preview_changelogは着地までにファイルが変わったら置かない() {
+        let Some(file) = changelog_repo_file() else {
+            return;
+        };
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        host.previews
+            .insert(root, (file.display().to_string(), PreviewModeWire::Code));
+        let job = prepare_offload(&mut host, &changelog_on(root))
+            .expect("ジョブ")
+            .expect("準備");
+        host.previews
+            .insert(root, ("/tmp/other.rs".into(), PreviewModeWire::Code));
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("UI スレッドの続き");
+        };
+        let err = finish_offload(&mut host, next, PaneOrigin::Cli).expect_err("置かない");
+        assert!(err.to_string().contains("ファイルが変わった"), "{err}");
+        assert!(host.preview_changelogs.is_empty());
+    }
+
+    /// #2014: 返らない git は上限で打ち切り、状態を変えずに失敗として返す。
+    /// `.git/HEAD` を FIFO にすると `git rev-parse` は書き手を待って返らない（偽の git を置かずに再現）
+    #[cfg(unix)]
+    #[test]
+    fn preview_changelogは返らないgitを上限で失敗として返し状態を変えない() {
+        let dir = std::env::temp_dir().join(format!("tako-2014-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join(".git/HEAD"))
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // mkfifo の無い環境
+        }
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        host.previews.insert(
+            root,
+            (
+                dir.join("f.txt").display().to_string(),
+                PreviewModeWire::Code,
+            ),
+        );
+        let job = preview_changelog_prepare(&host, Some(root), None).expect("準備");
+        let start = std::time::Instant::now();
+        let landing = job.run(std::time::Duration::from_millis(500));
+        let waited = start.elapsed();
+        let err = preview_changelog_land(&mut host, landing).expect_err("上限で失敗");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("打ち切った"), "{msg}");
+        assert!(msg.contains("rev-parse"), "{msg}");
+        assert!(
+            !msg.contains("tako-2014-fifo"),
+            "パスを載せない（#927）: {msg}"
+        );
+        assert!(host.preview_changelogs.is_empty(), "状態を変えない");
     }
 
     #[test]

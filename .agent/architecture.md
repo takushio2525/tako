@@ -1437,6 +1437,20 @@ lid-guard.json が使う）:
   `git_write_reply` → `tako_core::git::repo_root`、R は武装を解くまで 600 秒起動しない）。
   **起動時の回収は他の tako-app が 1 つでも生きていれば見送る**（#1187 の Startup の規則）ので、本番 GUI が動いている
   機の隔離 GUI では器まで届かず、この経路の注入 A/B は実経路では打てない（番犬の注入でだけ縛る）
+- **プレビューの変更履歴を開く切替**（#2014）: CLI `tako preview-changelog on` / MCP `tako_preview_changelog` /
+  GUI の「履歴」ボタンは `git rev-parse --show-toplevel` と `git log --follow` を UI スレッドで上限なしに待っていた。
+  `prepare_offload` が開く切替（`enabled: Some(true)` かつ `expand` なし）を `OffloadJob::PreviewChangelog` にし、
+  UI スレッドの準備（`preview_changelog_prepare`）はプレビューのパス（キャッシュ済みの値）だけを写す。background の
+  本体（`PreviewChangelogJob::run`）は `tako_core::git::file_history` の 1 実装で、2 段を合わせて上限つき（既定 30 秒・
+  `TAKO_CHANGELOG_GIT_TIMEOUT_SECS`。0 / 不正は既定 = 外せない。根拠は Homebrew 本体 53,069 コミットで最も遅い
+  ファイルが 0.66 秒の約 45 倍）。置くのは UI スレッドの着地（`preview_changelog_land`）で、取っている間に
+  ペインが閉じた・別のファイルへ切り替わったら置かずに理由を返す。上限に達したら状態を変えずに失敗として返す
+  （git 管理外・git を起こせないは従来どおり空の履歴 =「git 管理外」）。host（`set_preview_changelog`）は渡された
+  履歴を置くだけで git を起こさない。GUI のボタンは `dispatch_off_ui` を通り、取っている間の重ね押しは無視
+  （`preview_changelog_pending`）、失敗は通知欄（`NoticeArm::Issue2014`）。閉じる・状態取得・diff の展開
+  （`expand` = `git diff`）は同期の腕のまま。番犬は `issue1984_ui_thread_offload_watchdog.rs` の 13 節
+  （注入 9 通り）、A/B は `TAKO_2014_LEGACY=1`（UI スレッドで上限なし）、実経路は
+  `scripts/test-changelog-offload-2014.sh`（PATH の先頭の偽の git）と visual-test `changelog-offload`
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

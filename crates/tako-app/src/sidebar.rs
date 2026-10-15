@@ -773,6 +773,9 @@ pub(crate) enum NoticeArm {
     /// 自動復帰の一括ボタンの失敗・既定を保存できなかった（`TAKO_1945_LEGACY`）。
     /// 旧挙動ではボタンが無いので、通知だけ残っても意味がない
     Issue1945,
+    /// プレビューの「履歴」ボタンで変更履歴を取れなかった（git が上限まで返らない等。
+    /// `TAKO_2014_LEGACY`）。旧挙動では UI スレッドで上限なしに待つので失敗が起きず、通知も出ない
+    Issue2014,
 }
 
 impl NoticeArm {
@@ -794,6 +797,7 @@ impl NoticeArm {
             NoticeArm::Issue1681 => tako_control::lsp::hover::legacy(),
             NoticeArm::Issue1685 => tako_control::lsp::xref::legacy(),
             NoticeArm::Issue1945 => tako_core::limit_resume_all::legacy(),
+            NoticeArm::Issue2014 => tako_core::probe::issue2014_legacy(),
         }
     }
 }

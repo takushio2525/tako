@@ -359,6 +359,24 @@ pub struct ChangelogData {
     pub rel_path: Option<String>,
 }
 
+impl ChangelogData {
+    /// dispatch が background で取った履歴から組む（#2014。git 管理外は空のまま = 「git 管理外」の表示）
+    pub fn from_history(history: tako_core::git::FileHistory) -> Self {
+        Self {
+            entries: history
+                .commits
+                .into_iter()
+                .map(|commit| ChangelogEntry {
+                    commit,
+                    expanded_diff: None,
+                })
+                .collect(),
+            repo_root: history.repo_root,
+            rel_path: history.rel_path,
+        }
+    }
+}
+
 /// 読み込み済みのプレビュー内容
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreviewContent {

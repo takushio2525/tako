@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::theme::Rgb;
 
@@ -388,6 +389,136 @@ pub fn log_file_commits(repo: &Path, file_path: &str, max_count: usize) -> Vec<G
     )
     .unwrap_or_default();
     parse_log(&out)
+}
+
+// ──────────────────────── プレビューの変更履歴（#338 / #2014） ────────────────────────
+
+/// 変更履歴の取得（`git rev-parse` + `git log --follow`）の既定の上限（#2014）。
+///
+/// 根拠（実測 2026-10-16・macOS）: `git log --follow --max-count=50` はこのリポジトリ
+/// （1,440 コミット）で 0.04〜0.27 秒、Homebrew 本体（53,069 コミット）でいちばん遅いファイルが
+/// 0.61〜0.66 秒。30 秒はその約 45 倍で、さらに 1 桁大きいリポジトリでも打ち切らない見込み。
+/// 待つのは background（UI スレッドは待たない）なので、上限は「返らない git（ネットワーク上の
+/// フォルダ・ロック）を永久に待たず、失敗として知らせる」ためにある
+pub const DEFAULT_CHANGELOG_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 変更履歴の上限の上書き（秒）。0 / 不正 / 空は既定へ落ちる（**上限は外せない**）
+pub const CHANGELOG_TIMEOUT_ENV: &str = "TAKO_CHANGELOG_GIT_TIMEOUT_SECS";
+
+/// 変更履歴の上限（env で上書き可。外すことはできない。#2014）
+pub fn changelog_timeout() -> Duration {
+    crate::probe::parse_timeout_secs(
+        std::env::var(CHANGELOG_TIMEOUT_ENV).ok().as_deref(),
+        DEFAULT_CHANGELOG_TIMEOUT,
+    )
+}
+
+/// 1 ファイルの変更履歴（プレビューの「履歴」ビューの材料。#338）
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileHistory {
+    /// リポジトリのルート。git 管理外（リポジトリでない・git を起こせない）なら None
+    pub repo_root: Option<std::path::PathBuf>,
+    /// リポジトリからの相対パス（git 表記 = `/` 区切り。#520）
+    pub rel_path: Option<String>,
+    /// 新しい順のコミット
+    pub commits: Vec<GitCommit>,
+}
+
+/// 変更履歴の取得が上限に達した（#2014）。文面は CLI / MCP の応答と GUI の通知にそのまま出るので、
+/// パスを含めない（#927）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryTimedOut {
+    /// 返らなかった git の段（`rev-parse --show-toplevel` / `log --follow`）
+    pub step: &'static str,
+    /// 取得全体の上限
+    pub budget: Duration,
+}
+
+impl std::fmt::Display for HistoryTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "変更履歴の取得を {} 秒で打ち切った（`git {}` が返らない。巨大なリポジトリ・\
+             ネットワーク上のフォルダ・ロック中の git を疑う。上限は env {CHANGELOG_TIMEOUT_ENV}）",
+            self.budget.as_secs(),
+            self.step
+        )
+    }
+}
+
+/// 1 ファイルの変更履歴を**上限つきで**取る（#2014。`git rev-parse` → `git log --follow`）。
+///
+/// `budget` は 2 段を合わせた上限。UI スレッドで呼ばない（呼び手は dispatch の background の
+/// ジョブ）。git 管理外・git を起こせない（PATH に無い）ときは `repo_root: None` の空の履歴で、
+/// 上限に達したときだけ `Err`（従来の「git 管理外」の表示を変えない）
+pub fn file_history(
+    path: &Path,
+    max_count: usize,
+    budget: Duration,
+) -> Result<FileHistory, HistoryTimedOut> {
+    let start = Instant::now();
+    let timed_out = |step| HistoryTimedOut { step, budget };
+    let dir = if path.is_file() {
+        path.parent()
+    } else {
+        Some(path)
+    };
+    let Some(dir) = dir else {
+        return Ok(FileHistory::default());
+    };
+    let step = "rev-parse --show-toplevel";
+    let Some(out) = bounded_git(dir, &["rev-parse", "--show-toplevel"], step, budget)
+        .ok_or_else(|| timed_out(step))?
+    else {
+        return Ok(FileHistory::default());
+    };
+    let root = String::from_utf8_lossy(&out.stdout);
+    let root = root.trim();
+    if root.is_empty() {
+        return Ok(FileHistory::default());
+    }
+    // git は Windows でも `/` 区切りで返す。OS の区切りへ寄せる（#1102）
+    let repo = normalize_repo_root(root);
+    // git は常に `/` 区切りのパスを期待する（#520）
+    let rel = repo_relative(&repo, path).unwrap_or_else(|| to_git_path(path));
+    let step = "log --follow";
+    let commits = bounded_git(
+        &repo,
+        &[
+            "log",
+            "--follow",
+            &format!("--max-count={max_count}"),
+            &format!("--format={LOG_FORMAT}"),
+            "--",
+            &rel,
+        ],
+        step,
+        budget.saturating_sub(start.elapsed()),
+    )
+    .ok_or_else(|| timed_out(step))?
+    .map(|out| parse_log(&String::from_utf8_lossy(&out.stdout)))
+    .unwrap_or_default();
+    Ok(FileHistory {
+        repo_root: Some(repo),
+        rel_path: Some(rel),
+        commits,
+    })
+}
+
+/// git を上限つきで待つ（#2014）。`None` = 上限に達した（子は kill 済み）、`Some(None)` = 失敗
+/// （終了コード・起動できない）、`Some(Some(出力))` = 成功。名札は段の名前だけ（パスを載せない = #927）
+fn bounded_git(
+    dir: &Path,
+    args: &[&str],
+    step: &str,
+    budget: Duration,
+) -> Option<Option<std::process::Output>> {
+    let mut cmd = git_command(dir);
+    cmd.args(args);
+    match crate::probe::command_output_with_timeout(&mut cmd, &format!("git {step}"), budget) {
+        crate::probe::Outcome::TimedOut { .. } => None,
+        outcome => Some(outcome.into_output().filter(|o| o.status.success())),
+    }
 }
 
 /// 特定コミットでの特定ファイルの diff を取得する。
@@ -2486,6 +2617,84 @@ mod tests {
         repo.commit("f.txt", "a\nFEAT\nc\n", "feat change");
         repo.git(&["checkout", "-q", "main"]);
         repo.commit("f.txt", "a\nMAIN\nc\n", "main change");
+    }
+
+    // ──────────────── プレビューの変更履歴（#2014）────────────────
+
+    /// 上限つきの 1 実装が、従来の 2 段（`repo_root` → `log_file_commits`）と同じ履歴を返す（A/B）。
+    /// リネームを越えて辿る（`--follow`）ことも同じ
+    #[test]
+    fn file_historyは従来の2段と同じ履歴を返す() {
+        let repo = TempRepo::new("2014");
+        repo.commit("a.txt", "1\n", "one");
+        repo.commit("a.txt", "1\n2\n", "two");
+        repo.git(&["mv", "a.txt", "b.txt"]);
+        repo.git(&["commit", "-q", "-m", "rename"]);
+        repo.commit("b.txt", "1\n2\n3\n", "three");
+        // macOS の一時 dir は symlink（/var → /private/var）。git が返す実パスに揃える
+        let file = repo.path().join("b.txt").canonicalize().expect("実パス");
+        let history = file_history(&file, 50, DEFAULT_CHANGELOG_TIMEOUT).expect("上限内に終わる");
+        let root = repo_root(&file).expect("リポジトリ");
+        assert_eq!(history.repo_root.as_deref(), Some(root.as_path()));
+        assert_eq!(history.rel_path.as_deref(), Some("b.txt"));
+        assert_eq!(history.commits, log_file_commits(&root, "b.txt", 50));
+        let subjects: Vec<&str> = history.commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["three", "rename", "two", "one"]);
+        // 件数の上限も従来どおり
+        let two = file_history(&file, 2, DEFAULT_CHANGELOG_TIMEOUT).expect("上限内");
+        assert_eq!(two.commits.len(), 2);
+    }
+
+    /// git 管理外は空の履歴（従来の「git 管理外」の表示を変えない。上限の失敗にはしない）
+    #[test]
+    fn file_historyはリポジトリの外なら空の履歴() {
+        let dir = std::env::temp_dir().join(format!("tako-git-2014-norepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("f.txt"), "x\n").expect("write");
+        let history = file_history(&dir.join("f.txt"), 50, DEFAULT_CHANGELOG_TIMEOUT);
+        let missing = file_history(&dir.join("nope/f.txt"), 50, DEFAULT_CHANGELOG_TIMEOUT);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(history, Ok(FileHistory::default()));
+        assert_eq!(
+            missing,
+            Ok(FileHistory::default()),
+            "無いパスでも失敗にしない"
+        );
+    }
+
+    /// 返らない git は上限で打ち切る。`.git/HEAD` を FIFO にすると `git rev-parse` は書き手を
+    /// 待って返らない（偽の git を置かずに再現する）
+    #[cfg(unix)]
+    #[test]
+    fn file_historyは返らないgitを上限で打ち切る() {
+        let dir = std::env::temp_dir().join(format!("tako-git-2014-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/objects")).expect("mkdir");
+        std::fs::create_dir_all(dir.join(".git/refs")).expect("mkdir");
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join(".git/HEAD"))
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // mkfifo の無い環境
+        }
+        std::fs::write(dir.join("f.txt"), "x\n").expect("write");
+        let start = Instant::now();
+        let got = file_history(&dir.join("f.txt"), 50, Duration::from_millis(500));
+        let waited = start.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = got.expect_err("上限で打ち切る");
+        assert_eq!(err.step, "rev-parse --show-toplevel");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("git rev-parse --show-toplevel"), "{msg}");
+        assert!(msg.contains(CHANGELOG_TIMEOUT_ENV), "{msg}");
+        assert!(
+            !msg.contains("tako-git-2014"),
+            "パスを載せない（#927）: {msg}"
+        );
     }
 
     #[test]
