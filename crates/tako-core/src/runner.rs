@@ -1274,6 +1274,43 @@ mod tests {
         }
     }
 
+    /// #1735: `js` / `mjs` / `rs` の行を `${node}` / `${rustc}` にしても、実行環境が無いときの
+    /// 展開は変更前の行（ここへ写す）と両 OS でバイト一致
+    #[test]
+    fn 実行環境が無いときのjsとrsの展開は1735以前と両osでバイト一致() {
+        let before: &[(&str, Platform, &str)] = &[
+            ("js", Platform::MacOs, "node ${fileBase}"),
+            ("js", Platform::Windows, "node ${fileBase}"),
+            ("mjs", Platform::MacOs, "node ${fileBase}"),
+            ("mjs", Platform::Windows, "node ${fileBase}"),
+            (
+                "rs",
+                Platform::MacOs,
+                "rustc ${fileBase} -o ${fileNoExt} && ./${fileNoExt}",
+            ),
+            (
+                "rs",
+                Platform::Windows,
+                "rustc ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }",
+            ),
+        ];
+        for (ext, platform, old_template) in before {
+            let now = crate::platform::runner_defaults::entry(ext)
+                .and_then(|e| e.get(*platform).command())
+                .unwrap_or_else(|| panic!("{ext} の行がある"));
+            assert_ne!(now, *old_template, "{ext}: 変数へ変わっていない");
+            for name in ["a", "my script", "データ解析", "it's", "$HOME", "a;b"] {
+                let path = PathBuf::from(format!("/tmp/プロジェクト x/{name}.{ext}"));
+                let vars = RunVars::for_file(&path).on(*platform);
+                assert_eq!(
+                    expand_variables(now, &vars),
+                    expand_variables(old_template, &vars),
+                    "{platform:?} {name}.{ext}"
+                );
+            }
+        }
+    }
+
     /// #1950: `${arduino_cli}` も同じ口で展開される（宣言から IDE 同梱の実体を使える）
     #[test]
     fn arduino_cliの変数は見つけた実体へ無ければ名前のままへ展開される() {
@@ -1369,10 +1406,10 @@ mod tests {
             expand_variables("${python} ${fileBase}", &wrapped),
             "/h/.local/bin/uv run python a.py"
         );
-        // 表に無い名前は今までどおり残す
+        // 表に無い名前は今までどおり残す（#1735 で `${node}` は表に入ったので言語名でない名前で見る）
         assert_eq!(
-            expand_variables("${node} ${HOME}", &wrapped),
-            "${node} ${HOME}"
+            expand_variables("${notInTable} ${HOME}", &wrapped),
+            "${notInTable} ${HOME}"
         );
     }
 

@@ -94,6 +94,9 @@ fn 表の語彙() -> Vec<&'static str> {
         words.extend([kind.id, kind.variable, kind.wrapped_program]);
         words.extend([kind.fallback.macos, kind.fallback.windows]);
         words.extend(kind.extensions.iter().copied());
+        // #1735: プロジェクトの道具の置き場（`node_modules` 等。汎用の `.bin` 等も並ぶが、
+        // 表の外の本番コードに文字列で現れる理由が無いので見張ってよい）
+        words.extend(kind.project_bins.iter().flat_map(|c| c.iter()).copied());
         for det in kind.detectors {
             words.push(det.id());
             match det {
@@ -130,7 +133,7 @@ fn 表の語彙() -> Vec<&'static str> {
                 Detector::VersionFile(s) => {
                     words.push(s.label_prefix.trim());
                     words.extend(s.files.iter().copied());
-                    words.extend(s.root_env.iter().copied());
+                    words.extend(s.root_env.macos.iter().chain(s.root_env.windows).copied());
                 }
                 Detector::PathLookup(s) => {
                     words.extend(s.file_names.macos.iter().copied());

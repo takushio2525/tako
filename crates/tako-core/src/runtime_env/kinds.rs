@@ -4,14 +4,14 @@
 //! `.agent/plans/2026-09-runner-settings.md` §5.2（要点は各行のコメント）。
 //! OS で変わる置き場は [`PerOs`] の 2 列で書く（#1655 の作法）。
 //!
-//! Windows の列のうち conda の PATH 5 本と pyenv-win の置き場は、conda / pyenv-win が
-//! activation で組む値を写したもの。**実機で確かめたものではない**ので、S2（#1730）以降の
+//! Windows の列のうち conda の PATH 5 本・pyenv-win の置き場・nvm-windows と fnm の置き場は、
+//! それぞれの道具が activation / 導入で組む値を写したもの。**実機で確かめたものではない**ので、
 //! Windows 実測で食い違えばここを直す（`platform::support::MATRIX` には実測分だけを書く = #591）。
 
 use super::{
-    BundledSpec, Detector, EnvLayout, EnvValue, InProjectEnv, KnownDir, ListProbe, Marker,
-    MarkerDirSpec, NamedEnvListSpec, PathLookupSpec, PerOs, ProbeCmd, RuntimeKind, VersionFileSpec,
-    VersionSource, WrapperSpec,
+    BundledSpec, Detector, EnvLayout, EnvSwitchSpec, EnvValue, InProjectEnv, KnownDir, ListProbe,
+    Marker, MarkerDirSpec, NamedEnvListSpec, PathLookupSpec, PerOs, ProbeCmd, RuntimeKind,
+    VersionFileSpec, VersionMatch, VersionSource, WrapperSpec,
 };
 
 /// venv（PEP 405。`pyvenv.cfg` を持つディレクトリ）の中の置き場
@@ -186,12 +186,13 @@ const PYTHON_DETECTORS: &[Detector] = &[
         label_prefix: "pyenv ",
         files: &[".python-version"],
         skip_values: &["system"],
-        root_env: &["PYENV_ROOT"],
+        root_env: PerOs::same(&["PYENV_ROOT"]),
         root_default: PerOs {
-            macos: KnownDir::Home(&[".pyenv"]),
-            windows: KnownDir::Home(&[".pyenv", "pyenv-win"]),
+            macos: &[KnownDir::Home(&[".pyenv"])],
+            windows: &[KnownDir::Home(&[".pyenv", "pyenv-win"])],
         },
-        versions_dir: &["versions"],
+        versions_dir: PerOs::same(&["versions"]),
+        matching: VersionMatch::Exact,
         layout: PYENV_LAYOUT,
     }),
     // 7. システム: 解くのは実行ペインのシェル（今までと同じ）。ここは表示用に PATH を覗くだけ
@@ -208,6 +209,118 @@ const PYTHON_DETECTORS: &[Detector] = &[
         eligible_when_missing: true,
     }),
 ];
+
+/// nvm の `versions/node/<版>`（Windows は nvm-windows の `<NVM_HOME>\<版>`）の中の置き場
+const NVM_LAYOUT: EnvLayout = EnvLayout {
+    interpreter: PerOs {
+        macos: &["bin", "node"],
+        windows: &["node.exe"],
+    },
+    path_dirs: PerOs {
+        macos: &[&["bin"]],
+        windows: &[&[]],
+    },
+    env: &[],
+};
+
+/// fnm の `node-versions/<版>` の中の置き場（macOS は fnm 1.38.1 の実測。npm / npx も同じ bin に並ぶ）
+const FNM_LAYOUT: EnvLayout = EnvLayout {
+    interpreter: PerOs {
+        macos: &["installation", "bin", "node"],
+        windows: &["installation", "node.exe"],
+    },
+    path_dirs: PerOs {
+        macos: &[&["installation", "bin"]],
+        windows: &[&["installation"]],
+    },
+    env: &[],
+};
+
+/// node の版を書くファイル。同じ段に両方あれば `.nvmrc`（nvm が読むのはこちらだけで、fnm も
+/// 先に読む = fnm 1.38.1 の `fnm exec` で実測）
+const NODE_VERSION_FILES: &[&str] = &[".nvmrc", ".node-version"];
+
+/// node（#1735）。volta は `package.json` の `volta` をシム自身が読むので、ここでは手を出さない
+/// （PATH の `node` = volta のシムが 3 で拾われ、そのまま正しい版で走る）
+const NODE_DETECTORS: &[Detector] = &[
+    // 1. nvm: 版を書いたファイル → 入っている版のうち**番号の前方一致で一番新しいもの**
+    //    （`.nvmrc` の `20` → `v20.11.1`。nvm / fnm と同じ解き方）。`lts/*` 等の別名は解かない
+    Detector::VersionFile(VersionFileSpec {
+        id: "nvm",
+        label_prefix: "nvm ",
+        files: NODE_VERSION_FILES,
+        skip_values: &["system"],
+        root_env: PerOs {
+            macos: &["NVM_DIR"],
+            windows: &["NVM_HOME"],
+        },
+        // 導入スクリプトは `XDG_CONFIG_HOME` があればその下、無ければ `~/.nvm` へ入れる。
+        // Windows（nvm-windows）の既定の置き場は版で違い、実機では確かめていない（`NVM_HOME` は導入時に入る）
+        root_default: PerOs {
+            macos: &[
+                KnownDir::Var("XDG_CONFIG_HOME", &["nvm"]),
+                KnownDir::Home(&[".nvm"]),
+            ],
+            windows: &[
+                KnownDir::Var("LOCALAPPDATA", &["nvm"]),
+                KnownDir::Var("APPDATA", &["nvm"]),
+            ],
+        },
+        versions_dir: PerOs {
+            macos: &["versions", "node"],
+            windows: &[],
+        },
+        matching: VersionMatch::NumericPrefix,
+        layout: NVM_LAYOUT,
+    }),
+    // 2. fnm: 1 と同じファイルを読み、同じ解き方をする。既定の置き場は fnm の版で変わってきたので
+    //    新しい順に並べ、在る最初のものを使う（macOS の `~/.local/share/fnm` は 1.38.1 の実測。
+    //    Windows の `%APPDATA%\fnm` は実機では確かめていない）
+    Detector::VersionFile(VersionFileSpec {
+        id: "fnm",
+        label_prefix: "fnm ",
+        files: NODE_VERSION_FILES,
+        skip_values: &["system"],
+        root_env: PerOs::same(&["FNM_DIR"]),
+        root_default: PerOs {
+            macos: &[
+                KnownDir::Var("XDG_DATA_HOME", &["fnm"]),
+                KnownDir::Home(&[".local", "share", "fnm"]),
+                KnownDir::Home(&[".fnm"]),
+                KnownDir::Home(&["Library", "Application Support", "fnm"]),
+            ],
+            windows: &[
+                KnownDir::Var("APPDATA", &["fnm"]),
+                KnownDir::Home(&[".fnm"]),
+            ],
+        },
+        versions_dir: PerOs::same(&["node-versions"]),
+        matching: VersionMatch::NumericPrefix,
+        layout: FNM_LAYOUT,
+    }),
+    // 3. システム: 解くのは実行ペインのシェル（今までと同じ）。ここは表示用に PATH を覗くだけ
+    Detector::PathLookup(PathLookupSpec {
+        id: "system",
+        file_names: PerOs {
+            macos: &["node"],
+            windows: &["node.exe"],
+        },
+        exclude_dirs: PerOs::same(&[]),
+        eligible_when_missing: true,
+    }),
+];
+
+/// Rust（#1735）。rustup は cwd から上の toolchain のファイルを**自分で読む**ので、この行は
+/// 「どの toolchain で走るか」を一覧に見せ、利用者が別の toolchain を選んだ（保存した）ときに
+/// `RUSTUP_TOOLCHAIN` で上書きする口。features は実行環境ではなく実行設定の引数（`--args`）
+const RUST_DETECTORS: &[Detector] = &[Detector::EnvSwitch(EnvSwitchSpec {
+    id: "rustup",
+    label_prefix: "rustup ",
+    // 同じ段に両方あれば rustup は旧い名前の `rust-toolchain` を使う（後方互換）ので、その順
+    files: &["rust-toolchain", "rust-toolchain.toml"],
+    toml_key: Some("channel"),
+    var: "RUSTUP_TOOLCHAIN",
+})];
 
 /// Arduino のスケッチ（`.ino`）を compile / 書き込みする `arduino-cli` の探し方（#1950）。
 /// 順は PATH → Arduino IDE 同梱 → 名前のまま（`fallback`。見つからないときの案内が自然になる）
@@ -250,6 +363,34 @@ pub const KINDS: &[RuntimeKind] = &[
         // Tier P: `Python 3.12.4` の形で返る（2 系は stderr へ出すので、呼び手は両方を見る）
         version_args: &["--version"],
         detectors: PYTHON_DETECTORS,
+        project_bins: &[],
+    },
+    // node（#1735）。TS / JSX は拡張子既定が `npx tsx`（node は TS を解さない）で `${node}` を
+    // 使わないが、PATH の前置（版の bin と `node_modules/.bin`）で npx / tsx がその版の node で走る
+    RuntimeKind {
+        id: "node",
+        extensions: &["js", "mjs", "cjs", "ts", "mts", "cts", "tsx", "jsx"],
+        variable: "node",
+        fallback: PerOs::same("node"),
+        // 包む形の検出器を持たないので使われない（表の語として持つだけ）
+        wrapped_program: "node",
+        // Tier P: `v22.18.0` の形で返る
+        version_args: &["--version"],
+        detectors: NODE_DETECTORS,
+        // `npm run` / `npx` と同じく、各段の `node_modules/.bin` をどの版を選んでも先頭へ
+        project_bins: &[&["node_modules", ".bin"]],
+    },
+    // Rust（#1735）。走らせるのは拡張子既定の `rustc`（単体）かプロジェクト種別 `cargo` の
+    // `cargo run`。どちらも実行ペインの先頭に `RUSTUP_TOOLCHAIN` が埋まる
+    RuntimeKind {
+        id: "rust",
+        extensions: &["rs"],
+        variable: "rustc",
+        fallback: PerOs::same("rustc"),
+        wrapped_program: "rustc",
+        version_args: &["--version"],
+        detectors: RUST_DETECTORS,
+        project_bins: &[],
     },
     // Arduino のスケッチ（#1950）。走らせるのはプロジェクト種別 `arduino`（`runner_project` の
     // `KINDS`）で、拡張子既定の表には行を持たない（スケッチはフォルダ単位でしか走らない）。
@@ -264,6 +405,7 @@ pub const KINDS: &[RuntimeKind] = &[
         // Tier P: `arduino-cli  Version: 1.2.0 Commit: … Date: …` の形（実測 1.2.0）
         version_args: &["version"],
         detectors: ARDUINO_DETECTORS,
+        project_bins: &[],
     },
 ];
 
@@ -311,6 +453,10 @@ mod tests {
     /// 組み込み既定表のこの kind の行は interpreter を `${<variable>}` で受け（#1730）、
     /// 実行環境が見つからないときは fallback（#1730 以前の既定表の先頭の語）へ展開される。
     ///
+    /// interpreter を呼ばない行（TS の `npx tsx` = PATH の前置だけが効く。#1735）は変数を
+    /// 使わなくてよいが、**interpreter を名前で直書きした行**（`node ${fileBase}`）は落とす
+    /// （実行環境で選んだ版を素通りする）。
+    ///
     /// 既定表に行を持たない拡張子（`.ino` = スケッチはフォルダ単位でしか走らない。#1950）は、
     /// プロジェクト種別が受け持っていること（でないと変数を使う既定がどこにも無い）
     #[test]
@@ -332,6 +478,14 @@ mod tests {
                         continue;
                     };
                     let var = format!("${{{}}}", kind.variable);
+                    if !cmd.contains(&var) {
+                        assert_ne!(
+                            cmd.split_whitespace().next(),
+                            Some(kind.fallback.get(p)),
+                            "{ext} / {p:?}: 既定表の `{cmd}` が interpreter を名前で直書きしている（{var} で受ける）"
+                        );
+                        continue;
+                    }
                     assert!(
                         cmd.starts_with(&format!("{var} ")),
                         "{ext} / {p:?}: 既定表の `{cmd}` が {var} で interpreter を受けていない"
@@ -426,6 +580,26 @@ mod tests {
                 .chain(l.path_dirs.windows.iter().flat_map(|c| c.iter()));
             for c in comps {
                 assert!(!c.contains('/') && !c.contains('\\'), "{name}: 成分 `{c}`");
+            }
+        }
+        for kind in KINDS {
+            let mut comps: Vec<&str> = kind
+                .project_bins
+                .iter()
+                .flat_map(|c| c.iter())
+                .copied()
+                .collect();
+            for det in kind.detectors {
+                if let Detector::VersionFile(s) = det {
+                    comps.extend(s.versions_dir.macos.iter().chain(s.versions_dir.windows));
+                }
+            }
+            for c in comps {
+                assert!(
+                    !c.contains('/') && !c.contains('\\'),
+                    "{}: 成分 `{c}`",
+                    kind.id
+                );
             }
         }
     }

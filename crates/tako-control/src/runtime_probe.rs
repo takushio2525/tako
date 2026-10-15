@@ -254,17 +254,16 @@ impl Snapshot {
             .unwrap_or_default()
     }
 
-    /// 実行ペインのコマンドの前に付ける PATH（文字列にしたもの）
+    /// 実行ペインのコマンドの前に付ける PATH（文字列にしたもの）。プロジェクトの道具の置き場
+    /// （`Detection::project_bins`。#1735）を先頭に、選んだ候補の置き場をその後ろに並べる
     pub fn path_prepend(&self) -> Vec<String> {
-        self.selected()
-            .map(|c| {
-                c.applied
-                    .path_prepend
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let selected = self.selected().map(|c| c.applied.path_prepend.as_slice());
+        self.detection
+            .project_bins
+            .iter()
+            .chain(selected.unwrap_or_default())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
     }
 
     /// 候補が Tier P の答えで変わったか
