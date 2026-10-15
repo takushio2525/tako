@@ -416,6 +416,10 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
 - unix: `$TMPDIR/tako-<pid>-<seq>.sock`（パーミッション 0600）+ 32 バイト CSPRNG トークン
   （getrandom）。accept スレッド + 接続毎スレッドのブロッキング IO で受け、リクエストは
   futures channel で UI スレッドへ渡して dispatch する（tokio を持ち込まない方針を維持）
+- **`IpcServer` の drop は受け口を閉じる**（#2136）: 旗を立てて自分の受け口へ 1 本繋いで
+  accept を起こし、accept スレッドが listener（windows は待ち受け中のパイプ）を手放すのを
+  上限 2 秒で待ってから戻る。張っていた接続は切らない。起こせない（ソケットファイルを外から
+  消された）ときは待たずに戻る。A/B は `TAKO_2136_LEGACY=1`
 - **クライアントの 1 往復には応答を待つ上限がある**（FR-2.2.12 / #2123）: 上限は要求の種類から
   決まる 1 実装（`protocol::reply_timeout`。順番待ち 30 秒・その心拍と done 5 秒・外の仕事の終わりを
   待つ要求は上限なし・それ以外は安全網 300 秒）。unix は締め切りつきのソケット（読み書きの度に

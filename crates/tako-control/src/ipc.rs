@@ -110,13 +110,17 @@ fn start_run(
     .map_err(|e| SubmitError::Rejected(DispatchError::Operation(e)))
 }
 
-/// IPC サーバーのハンドル。drop でソケットファイル（と #1441 の参照ファイル）を片付ける。
+/// IPC サーバーのハンドル。drop で受け口を閉じ（accept スレッドを止めて listener を手放す。
+/// #2136）、ソケットファイル（と #1441 の参照ファイル）を片付ける。張っていた接続は
+/// 切らない（接続ごとのスレッドが自分のストリームを持っている）。
 /// `endpoint` はペインのシェルへ `TAKO_SOCKET` として注入する
 pub struct IpcServer {
     endpoint: String,
     /// data dir 側に置いた実体への参照（#1441。短縮したときだけ `Some`）
     #[cfg_attr(windows, allow(dead_code))]
     pointer: Option<std::path::PathBuf>,
+    /// accept スレッドを止める口（#2136）
+    accept: AcceptStop,
 }
 
 impl IpcServer {
@@ -172,6 +176,10 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
+        // 受け口を閉じるのが先（起こす 1 本はソケットファイルを通って繋ぐ = 消す前に）
+        if !legacy_2136() {
+            self.accept.close(&self.endpoint);
+        }
         #[cfg(unix)]
         {
             let _ = std::fs::remove_file(&self.endpoint);
@@ -181,6 +189,83 @@ impl Drop for IpcServer {
             }
         }
     }
+}
+
+/// #2136 の A/B（`TAKO_2136_LEGACY=1`）: drop で受け口を閉じない（修正前 = accept スレッドが
+/// listener / 待ち受け中のパイプを握ったまま残り、捨てたサーバーごとに fd とスレッドが 1 つずつ残る）
+fn legacy_2136() -> bool {
+    std::env::var_os("TAKO_2136_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// drop が accept スレッドの終わりを待つ上限（#2136）。起こせた後は accept が即座に返るので
+/// 普段は 1 ms もかからない。上限は drop（GUI の終了など）を固めないためだけにある
+const ACCEPT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// accept スレッドを止める口（#2136）。
+///
+/// accept スレッドは受け口（unix の listener / windows の待ち受け中のパイプ）を握ったまま
+/// accept で眠っている。別スレッドから fd を閉じるのは fd 番号の再利用と競合するうえ、
+/// macOS の `shutdown` は listen 中のソケットに ENOTCONN を返して accept を起こさない（実測）
+/// ので、drop は旗を立てたうえで**自分の受け口へ 1 本繋いで起こす**。起きたスレッドは旗を見て
+/// 抜け、受け口を手放してから [`AcceptGuard`] を落とす = `done` が切れる。drop はそれを
+/// [`ACCEPT_STOP_WAIT`] まで待つ
+struct AcceptStop {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// accept スレッド側の持ち物。**受け口を手放した後に drop する**（drop が `done` の切断で
+/// 「閉じた」と知るため。順番が逆だと drop が閉じる前に戻る）
+struct AcceptGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _done: std::sync::mpsc::Sender<()>,
+}
+
+fn accept_stop_pair() -> (AcceptStop, AcceptGuard) {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    (
+        AcceptStop {
+            stop: stop.clone(),
+            done: done_rx,
+        },
+        AcceptGuard {
+            stop,
+            _done: done_tx,
+        },
+    )
+}
+
+impl AcceptGuard {
+    /// drop が止めにかかっている（いま受けた接続は起こすための 1 本 = 捨てて抜ける）
+    fn stopping(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl AcceptStop {
+    fn close(&self, endpoint: &str) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        // 起こせなかった（ソケットファイルを外から消された・スレッドが既に抜けた）なら待たない。
+        // drop を固めないのが優先で、そのときスレッドは修正前と同じく残る
+        if wake_accept(endpoint) {
+            // 送る者は居ないので、返るのは「切れた」（= 閉じた）か上限だけ
+            let _ = self.done.recv_timeout(ACCEPT_STOP_WAIT);
+        }
+    }
+}
+
+/// accept で眠っているスレッドを起こす 1 本を繋ぐ（繋いだ側はすぐ捨てる）
+#[cfg(unix)]
+fn wake_accept(endpoint: &str) -> bool {
+    std::os::unix::net::UnixStream::connect(endpoint).is_ok()
+}
+
+/// accept で眠っているスレッドを起こす 1 本を繋ぐ（繋いだ側はすぐ捨てる）。
+/// 全インスタンスが使用中なら次のインスタンスが立つまで少し待つ
+#[cfg(windows)]
+fn wake_accept(endpoint: &str) -> bool {
+    crate::platform::named_pipe::connect_client(endpoint, 1_000).is_ok()
 }
 
 /// トランスポート非依存の接続処理（1 行 1 JSON のリクエスト / レスポンス）。
@@ -263,7 +348,7 @@ mod conn {
 mod windows_imp {
     use futures::channel::mpsc::UnboundedSender;
 
-    use super::{conn, IncomingRequest, IpcServer};
+    use super::{accept_stop_pair, conn, IncomingRequest, IpcServer};
     use crate::platform::named_pipe;
 
     /// PID + 連番の一時パイプ名（テスト・セルフテスト・セカンダリモード用）
@@ -356,6 +441,7 @@ mod windows_imp {
     ) -> std::io::Result<IpcServer> {
         let accept_name = name.clone();
         let accept_token = token;
+        let (accept, guard) = accept_stop_pair();
         std::thread::Builder::new()
             .name("tako-ipc-accept".into())
             .spawn(move || {
@@ -371,7 +457,12 @@ mod windows_imp {
                             }
                         },
                     };
-                    match instance.wait_client() {
+                    let waited = instance.wait_client();
+                    // #2136: drop が起こした。次のインスタンスを作らずに抜ける（= 待ち受けが消える）
+                    if guard.stopping() {
+                        break;
+                    }
+                    match waited {
                         Ok(stream) => {
                             let tx = tx.clone();
                             let token = accept_token.clone();
@@ -390,11 +481,15 @@ mod windows_imp {
                         Err(e) => tracing::warn!("IPC accept に失敗: {e}"),
                     }
                 }
+                // 起こした 1 本（`waited`）はループの中で捨て終えている。待ち受けの
+                // インスタンスはもう無いので、ここで drop へ知らせる
+                drop(guard);
             })?;
 
         Ok(IpcServer {
             endpoint: name,
             pointer: None,
+            accept,
         })
     }
 }
@@ -407,7 +502,7 @@ mod unix_imp {
     use futures::channel::mpsc::UnboundedSender;
     use tako_core::ipc_socket::{IpcStatus, SocketPathKind, SocketPlan};
 
-    use super::{conn, IncomingRequest, IpcServer};
+    use super::{accept_stop_pair, conn, IncomingRequest, IpcServer};
 
     /// PID ベースの一時ソケットパス（テスト・セルフテスト・多重起動フォールバック用）
     fn temp_socket_path() -> SocketPlan {
@@ -537,10 +632,15 @@ mod unix_imp {
         pointer: Option<std::path::PathBuf>,
     ) -> std::io::Result<IpcServer> {
         let accept_token = token;
+        let (accept, guard) = accept_stop_pair();
         std::thread::Builder::new()
             .name("tako-ipc-accept".into())
             .spawn(move || {
                 for stream in listener.incoming() {
+                    // #2136: drop が起こした（受けたのは起こすための 1 本 = 捨てて抜ける）
+                    if guard.stopping() {
+                        break;
+                    }
                     match stream {
                         Ok(stream) => {
                             let tx = tx.clone();
@@ -560,11 +660,15 @@ mod unix_imp {
                         Err(e) => tracing::warn!("IPC accept に失敗: {e}"),
                     }
                 }
+                // listener（受け口の fd）を閉じてから drop へ知らせる
+                drop(listener);
+                drop(guard);
             })?;
 
         Ok(IpcServer {
             endpoint: path.display().to_string(),
             pointer,
+            accept,
         })
     }
 }
@@ -962,9 +1066,17 @@ mod tests {
     /// このテストバイナリを子として起こし、[`FD_CHILD_TEST`] だけを走らせて
     /// `(前の fd 数, 後の fd 数, EOF のいちばん遅い往復の ms)` を受け取る
     fn measure_in_child_process() -> (usize, usize, usize) {
+        let [before, after, slowest_eof_ms] =
+            run_fd_child(FD_CHILD_TEST, ["before", "after", "slowest_eof_ms"]);
+        (before, after, slowest_eof_ms)
+    }
+
+    /// このテストバイナリを子として起こし、`child_test` だけを走らせて、子が [`FD_MARKER`] の
+    /// 行に出した `key=値` を `keys` の順で受け取る（#2129 の計測と #2136 の計測が共有する）
+    fn run_fd_child<const N: usize>(child_test: &str, keys: [&str; N]) -> [usize; N] {
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(exe);
-        cmd.args(["--exact", FD_CHILD_TEST, "--test-threads=1", "--nocapture"])
+        cmd.args(["--exact", child_test, "--test-threads=1", "--nocapture"])
             .env(FD_CHILD_ENV, "1")
             // 雑音は親（= 並列のテストが同居するプロセス）に留める。漏れの注入はそのまま子へ継ぐ
             .env_remove(INJECT_NOISE_ENV);
@@ -992,14 +1104,11 @@ mod tests {
         text.lines()
             .filter_map(|line| line.split_once(FD_MARKER).map(|(_, rest)| rest))
             .find_map(|rest| {
-                Some((
-                    field(rest, "before")?,
-                    field(rest, "after")?,
-                    field(rest, "slowest_eof_ms")?,
-                ))
+                let values: Option<Vec<usize>> = keys.iter().map(|k| field(rest, k)).collect();
+                <[usize; N]>::try_from(values?).ok()
             })
             .unwrap_or_else(|| {
-                panic!("子が計測まで届いていない（{FD_CHILD_TEST} の改名漏れ？）:\n{text}")
+                panic!("子が計測まで届いていない（{child_test} の改名漏れ？）:\n{text}")
             })
     }
 
@@ -1137,6 +1246,117 @@ mod tests {
         drop(server);
         assert!(std::fs::metadata(&path).is_err());
     }
+
+    /// #2136: 立てて捨てる回数（ウォームアップの 1 回は別）
+    const SERVER_CYCLES: usize = 5;
+
+    /// #2136 の子のテスト名（`--exact` で名指しするので、改名したらここも直す）
+    const SERVER_CHILD_TEST: &str = "ipc::tests::子プロセス_サーバーを立てて捨てる前後でfdを数える";
+
+    /// サーバーを立てて 1 往復し（accept スレッドが接続を受けて回った状態にする）、捨てる。
+    /// 戻り値は drop にかかった時間（診断用。判定には使わない）
+    fn start_roundtrip_drop(deadline: std::time::Instant) -> std::time::Duration {
+        let (tx, mut rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(Ok(json!({})));
+            }
+        });
+        closed_roundtrip(server.endpoint(), false, deadline);
+        let started = std::time::Instant::now();
+        drop(server);
+        started.elapsed()
+    }
+
+    /// #2136: 計測の本体。親の [`サーバーを立てて捨てた後にfdが元へ戻る`] から子プロセスとして
+    /// だけ走る（普段のテスト実行では目印が無いので何もしない）
+    #[test]
+    fn 子プロセス_サーバーを立てて捨てる前後でfdを数える() {
+        if std::env::var_os(FD_CHILD_ENV).is_none() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + FD_EOF_BUDGET;
+        // ウォームアップ（初回だけ確保される物を測定から外す）
+        start_roundtrip_drop(deadline);
+        let before = fd_count();
+        let mut slowest_drop = std::time::Duration::ZERO;
+        for _ in 0..SERVER_CYCLES {
+            slowest_drop = slowest_drop.max(start_roundtrip_drop(deadline));
+        }
+        println!(
+            "{FD_MARKER} before={before} after={} slowest_drop_us={}",
+            fd_count(),
+            slowest_drop.as_micros()
+        );
+    }
+
+    /// drop した IpcServer は受け口（listener の fd）を閉じる（#2136）。
+    ///
+    /// 修正前は accept スレッドが listener を握ったまま眠り続け、立てて捨てるたびに fd が 1 本
+    /// （とスレッドが 1 本）残った。計測は [`連続接続でfdが漏れない`] と同じく子プロセスで行い
+    /// （並列の他のテストの fd を拾わない）、drop が戻った直後に数えて**許容 0** で比べる
+    /// （drop は受け口が閉じるのを待ってから戻る）。
+    /// A/B: `TAKO_2136_LEGACY=1` で drop が受け口を閉じなくなり、fd が [`SERVER_CYCLES`] 本増えて落ちる
+    #[test]
+    fn サーバーを立てて捨てた後にfdが元へ戻る() {
+        let [before, after, slowest_drop_us] =
+            run_fd_child(SERVER_CHILD_TEST, ["before", "after", "slowest_drop_us"]);
+        println!(
+            "#2136 子プロセスの fd: {before} → {after}（立てて捨てた回数 {SERVER_CYCLES}・drop の最遅 {slowest_drop_us} µs）"
+        );
+        assert!(
+            after <= before,
+            "IpcServer を {SERVER_CYCLES} 回立てて捨てたら fd が {before} → {after} に増えた\
+             （drop が受け口の fd を閉じていない）"
+        );
+    }
+
+    /// #2136: ソケットファイルを外から消されていると、起こす 1 本が繋がらない。そのとき drop は
+    /// 待たずに戻る（受け口は修正前と同じく残るが、drop = GUI の終了を固めないのが優先）
+    #[test]
+    fn ソケットファイルを外から消されていてもdropは待たずに戻る() {
+        let (tx, _rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        std::fs::remove_file(server.endpoint()).unwrap();
+        let started = std::time::Instant::now();
+        drop(server);
+        let took = started.elapsed();
+        println!("#2136 起こせないときの drop: {took:?}");
+        assert!(
+            took < ACCEPT_STOP_WAIT,
+            "起こせないのに上限まで待った（{took:?}）"
+        );
+    }
+
+    /// #2136: drop が閉じるのは受け口だけ。張っていた接続は切らず、その接続で送った
+    /// リクエストには drop の後でも応答が返る
+    #[test]
+    fn drop後も張っていた接続には応答が返る() {
+        let (tx, mut rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(Ok(json!({ "pong": true })));
+            }
+        });
+        let stream = UnixStream::connect(server.endpoint()).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut ask = |id: u64| -> ResponseEnvelope {
+            let envelope = RequestEnvelope::new(id, TEST_TOKEN.to_string(), Request::List);
+            writeln!(writer, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).expect("レスポンスを解釈できる")
+        };
+        // 1 往復目で接続が受けられた（接続のスレッドが立った）ことを確かめてから捨てる
+        assert_eq!(ask(1).id, 1);
+        drop(server);
+        let after = ask(2);
+        assert_eq!(after.id, 2);
+        assert_eq!(after.result.expect("応答が返る")["pong"], json!(true));
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1223,5 +1443,25 @@ mod windows_tests {
             BufReader::new(stream).read_line(&mut line).unwrap();
             assert!(!line.is_empty(), "{i} 回目の応答が空");
         }
+    }
+
+    /// #2136: drop したら受け口（待ち受け中のパイプのインスタンス）が閉じ、その名前へはもう
+    /// 繋がらない。修正前は accept スレッドが次のインスタンスを抱えたまま残り、捨てたサーバーへ
+    /// 繋がった（A/B: `TAKO_2136_LEGACY=1` でこのテストは落ちる）
+    #[test]
+    fn dropで受け口が閉じて繋がらなくなる() {
+        let (tx, _rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        let name = server.endpoint().to_string();
+        assert!(named_pipe::probe_alive(&name), "立てた直後は待ち受けている");
+        drop(server);
+        assert!(
+            !named_pipe::probe_alive(&name),
+            "drop の後も {name} の待ち受けが残っている"
+        );
+        assert!(
+            named_pipe::connect_client(&name, 200).is_err(),
+            "drop したサーバー（{name}）へ繋がった"
+        );
     }
 }
