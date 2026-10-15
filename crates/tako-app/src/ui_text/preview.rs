@@ -44,6 +44,119 @@ pub fn run_profile_default() -> &'static str {
     tr!("実行", "Run")
 }
 
+// --- 実行ボタン横のドロップダウン（#1733。キー: preview.run_menu_*） ---
+
+/// 再生ボタンのツールチップ（実行されるコマンドの全文）
+pub fn run_tooltip(command: &str) -> String {
+    tr!(
+        format!("実行されるコマンド: {command}"),
+        format!("Command to run: {command}")
+    )
+}
+pub fn run_menu_command_title() -> &'static str {
+    tr!("実行されるコマンド", "Command to run")
+}
+/// コマンドの下に出す作業ディレクトリ
+pub fn run_menu_in_dir(dir: &str) -> String {
+    tr!(format!("{dir} で実行"), format!("Runs in {dir}"))
+}
+pub fn run_menu_loading() -> &'static str {
+    tr!("読み込み中…", "Loading…")
+}
+pub fn run_menu_profiles() -> &'static str {
+    tr!("プロファイル", "Profiles")
+}
+/// 実行環境の見出し（`kind` は実行環境の種類の ID = `python` 等）
+pub fn run_menu_runtime(kind: &str) -> String {
+    tr!(format!("実行環境（{kind}）"), format!("Runtime ({kind})"))
+}
+/// 自動選択の候補に添える印
+pub fn run_menu_auto_mark() -> &'static str {
+    tr!("自動", "auto")
+}
+pub fn run_menu_redetect() -> &'static str {
+    tr!("再検出", "Re-detect")
+}
+pub fn run_menu_redetecting() -> &'static str {
+    tr!("確かめています…", "Checking…")
+}
+pub fn run_menu_pick_path() -> &'static str {
+    tr!("パスを指定…", "Choose a path…")
+}
+/// 畳んだ実行環境の候補を広げるボタン
+pub fn run_menu_more(n: usize) -> String {
+    tr!(format!("他 {n} 件を表示"), format!("Show {n} more"))
+}
+pub fn run_menu_no_candidates() -> &'static str {
+    tr!("候補が見つかりません", "No runtimes found")
+}
+/// 行の × のツールチップ（その項目の保存した値を消して既定 / 自動へ戻す）
+pub fn run_menu_reset() -> &'static str {
+    tr!("既定に戻す", "Back to the default")
+}
+pub fn run_menu_args() -> &'static str {
+    tr!("引数", "Arguments")
+}
+pub fn run_menu_env() -> &'static str {
+    tr!("環境変数", "Environment")
+}
+pub fn run_menu_cwd() -> &'static str {
+    tr!("作業ディレクトリ", "Working directory")
+}
+pub fn run_menu_before() -> &'static str {
+    tr!("実行前コマンド", "Before run")
+}
+pub fn run_menu_unset() -> &'static str {
+    tr!("未設定", "Not set")
+}
+pub fn run_menu_env_add() -> &'static str {
+    tr!("追加", "Add")
+}
+pub fn run_menu_open_settings() -> &'static str {
+    tr!("Code Runner の設定を開く", "Open Code Runner settings")
+}
+/// 編集中の欄の下に出す操作の案内
+pub fn run_menu_edit_hint() -> &'static str {
+    tr!(
+        "Enter で保存 / Esc で取り消し",
+        "Enter to save / Esc to cancel"
+    )
+}
+/// 空のまま Enter を押したとき（保存しない）
+pub fn run_menu_empty() -> &'static str {
+    tr!(
+        "空のままでは保存しません（既定へ戻すときは行の右端の「既定に戻す」を押す）",
+        "Empty values are not saved (use \"Back to the default\" at the right of the row instead)"
+    )
+}
+/// 環境変数の欄に `=` が無いとき（保存しない）
+pub fn run_menu_env_format() -> &'static str {
+    tr!("名前=値 の形で入れてください", "Enter it as NAME=value")
+}
+/// 出典タグ（項目の値がどこから来たか = `RunResolve` の `config.*.source`）
+pub fn run_menu_source(source: &str) -> &'static str {
+    match source {
+        "file" => tr!("ファイル", "File"),
+        "project" => tr!("プロジェクト", "Project"),
+        "declaration" => tr!("宣言", "Declared"),
+        "auto" => tr!("自動", "Auto"),
+        _ => tr!("既定", "Default"),
+    }
+}
+/// 出典タグのツールチップ（クリックで保存先を移す）
+pub fn run_menu_move_to(source: &str) -> &'static str {
+    match source {
+        "file" => tr!(
+            "クリックでプロジェクト全体の設定へ移す",
+            "Click to move it to the project"
+        ),
+        _ => tr!(
+            "クリックでこのファイルだけの設定へ移す",
+            "Click to move it to this file only"
+        ),
+    }
+}
+
 // --- 編集ステータス（キー: preview.status_*） ---
 
 pub fn saved_suffix() -> &'static str {
@@ -508,6 +621,36 @@ mod tests {
                 run_button().to_string(),
                 run_no_command().to_string(),
                 run_profile_default().to_string(),
+                run_tooltip("python3 a.py"),
+                run_menu_command_title().to_string(),
+                run_menu_in_dir("/tmp"),
+                run_menu_loading().to_string(),
+                run_menu_profiles().to_string(),
+                run_menu_runtime("python"),
+                run_menu_auto_mark().to_string(),
+                run_menu_redetect().to_string(),
+                run_menu_redetecting().to_string(),
+                run_menu_pick_path().to_string(),
+                run_menu_more(4),
+                run_menu_no_candidates().to_string(),
+                run_menu_reset().to_string(),
+                run_menu_args().to_string(),
+                run_menu_env().to_string(),
+                run_menu_cwd().to_string(),
+                run_menu_before().to_string(),
+                run_menu_unset().to_string(),
+                run_menu_env_add().to_string(),
+                run_menu_open_settings().to_string(),
+                run_menu_edit_hint().to_string(),
+                run_menu_empty().to_string(),
+                run_menu_env_format().to_string(),
+                run_menu_source("file").to_string(),
+                run_menu_source("project").to_string(),
+                run_menu_source("declaration").to_string(),
+                run_menu_source("auto").to_string(),
+                run_menu_source("default").to_string(),
+                run_menu_move_to("file").to_string(),
+                run_menu_move_to("project").to_string(),
                 saved_suffix().to_string(),
                 conflict_suffix().to_string(),
                 error_suffix().to_string(),

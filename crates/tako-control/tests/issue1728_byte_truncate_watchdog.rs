@@ -41,6 +41,8 @@ mod production_range;
 mod range_index;
 
 const PREVIEW_RENDER: &str = "crates/tako-app/src/preview_render.rs";
+/// 実行ボタン横のドロップダウン（#1733 で `preview_render.rs` から移した。行のコマンドを切り詰める）
+const RUN_MENU: &str = "crates/tako-app/src/run_menu_ui.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -133,6 +135,22 @@ fn preview_renderにバイト位置の切り詰めが無い() {
     assert_clean(&raw, &code, PREVIEW_RENDER);
 }
 
+/// #1733: 実行メニューの描画は `run_menu_ui.rs` へ移った。同じ規則（先頭からの範囲添字を持たない）を当てる
+#[test]
+fn 実行メニューにバイト位置の切り詰めが無い() {
+    let raw = read(RUN_MENU);
+    let code = code_of(&raw, RUN_MENU);
+    let raw_lines: Vec<&str> = raw.lines().collect();
+    let found: Vec<String> = byte_prefix_slices(&code)
+        .into_iter()
+        .map(|line| {
+            let text = raw_lines.get(line - 1).map(|l| l.trim()).unwrap_or("");
+            format!("{RUN_MENU}:{line} — 文字列をバイト位置で切っている（`{text}`）（#1728）")
+        })
+        .collect();
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
 /// 走査が空振りしていないこと（#1728 が実在した 3 か所が視界に入っているか）。
 ///
 /// ファイル移動・改名や、テスト領域の潰し方の破損で黙って 0 件になるのを防ぐ。
@@ -142,10 +160,8 @@ fn 走査が空振りしていない() {
     let raw = read(PREVIEW_RENDER);
     let code = code_of(&raw, PREVIEW_RENDER);
     for (needle, inside) in [
-        // ツールチップ（ヘッダの再生ボタン）
-        ("let _tooltip: String", "p.command"),
-        // 実行メニュー
-        ("fn render_run_menu_overlay(", "plan.command"),
+        // ツールチップ（ヘッダの再生ボタン。#1733 から全文を出す）
+        ("let tooltip: String", "run_tooltip("),
         // 検索 / 置換欄
         ("fn render_field_with_cursor(", "ime_text"),
     ] {
@@ -157,6 +173,17 @@ fn 走査が空振りしていない() {
             "{PREVIEW_RENDER}: `{needle}` の後ろに `{inside}` が無い（走査先が違う）"
         );
     }
+    // 実行メニューの行（#1733 で `run_menu_ui.rs` へ移った）がコマンドを文字数で切っている
+    let menu = code_of(&read(RUN_MENU), RUN_MENU);
+    let at = menu
+        .find("fn render_run_menu_profiles(")
+        .unwrap_or_else(|| {
+            panic!("{RUN_MENU} の本番コードに `fn render_run_menu_profiles(` が無い")
+        });
+    assert!(
+        menu[at..].contains("truncate_chars(") && menu[at..].contains("p.command"),
+        "{RUN_MENU}: 実行メニューの行がコマンドを `truncate_chars` で切っていない（走査先が違う）"
+    );
     // 単体テストの中の `text[*start..]` は本番コードではないので潰れている
     let tests = production_range::tests_only(&raw);
     assert!(

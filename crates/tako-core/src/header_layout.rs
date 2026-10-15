@@ -69,6 +69,12 @@ pub struct PreviewHeaderVisibility {
     pub file_icon: bool,
     pub path_label: bool,
     pub run_button: bool,
+    /// 実行ボタン横のシェブロン（#1733。実行設定のドロップダウンの入口）。**再生ボタンと一緒に畳む**:
+    /// 設定の入口なので、ボタンが見えているのにシェブロンだけ消える幅を作らない
+    pub run_chevron: bool,
+    /// 再生ボタンの右に淡色で出す、選んだ実行環境の短いラベル（#1733。`.venv 3.12` / `uv run`）。
+    /// 補足の表示なので再生ボタンより先に畳む（編集・表示切替より後まで残さない）
+    pub run_runtime_label: bool,
     pub mode_toggle: bool,
     pub edit_button: bool,
     pub save_button: bool,
@@ -83,6 +89,8 @@ impl PreviewHeaderVisibility {
             file_icon: width >= 100.0,
             path_label: width >= 200.0,
             run_button: width >= 250.0,
+            run_chevron: width >= 250.0,
+            run_runtime_label: width >= 360.0,
             page_info: width >= 250.0,
             edit_button: width >= 300.0,
             mode_toggle: width >= 350.0,
@@ -335,5 +343,39 @@ mod tests {
         assert!(!below.run_button);
         let at = PreviewHeaderVisibility::from_width(250.0);
         assert!(at.run_button);
+    }
+
+    /// #1733: 狭い幅での畳み方。実行環境のラベルが先に消え（360 未満）、再生ボタンとシェブロンは
+    /// 一緒に消える（250 未満）。ボタンが見えているのにシェブロン（設定の入口）だけ消える幅は無い
+    #[test]
+    fn preview_header_run_dropdown_folds_label_then_button() {
+        let narrow = PreviewHeaderVisibility::from_width(249.0);
+        assert!(!narrow.run_button && !narrow.run_chevron && !narrow.run_runtime_label);
+
+        let button_only = PreviewHeaderVisibility::from_width(250.0);
+        assert!(button_only.run_button && button_only.run_chevron);
+        assert!(
+            !button_only.run_runtime_label,
+            "250 では実行環境のラベルを出さない"
+        );
+
+        let below_label = PreviewHeaderVisibility::from_width(359.0);
+        assert!(below_label.run_chevron && !below_label.run_runtime_label);
+
+        let label = PreviewHeaderVisibility::from_width(360.0);
+        assert!(label.run_button && label.run_chevron && label.run_runtime_label);
+
+        // 全幅で: ラベル ⇒ ボタン、シェブロン ⇔ ボタン
+        for w in 0..=1000 {
+            let v = PreviewHeaderVisibility::from_width(w as f32);
+            assert_eq!(
+                v.run_chevron, v.run_button,
+                "width={w}: シェブロンはボタンと一緒に畳む"
+            );
+            assert!(
+                !v.run_runtime_label || v.run_button,
+                "width={w}: ラベルだけ残らない"
+            );
+        }
     }
 }
