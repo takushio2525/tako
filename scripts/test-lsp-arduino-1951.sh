@@ -270,10 +270,35 @@ else
 fi
 
 GUI_OK=1
-if ! "$REPO_ROOT/scripts/lib/virtual-display.sh" ensure >/dev/null 2>&1; then
+echo
+echo "== ④ ALS なし（注入 TAKO_1951_INJECT_NO_BUNDLE=1 = Arduino IDE の無い PC と同じ解決） =="
+# 面（tako-vd）の有無は子シェルで 1 回立てて止めて分かる（用意できなければ start_gui の中の
+# launch_isolated_gui が 4 = 未実測で抜ける。#1744。親で立てると exit でスクリプトごと終わる）
+( start_gui "$TMP/data-probe" "$TMP/gui-probe.log" && stop_gui )
+gui_rc=$?
+if [ "$gui_rc" -eq 4 ]; then
   GUI_OK=0
-  echo
-  unmeasured "①〜⑤ の GUI の段: 面（tako-vd）を用意できない（$("$REPO_ROOT/scripts/lib/virtual-display.sh" status 2>&1 | head -1)。蓋閉じなら開いてから打ち直す）"
+  unmeasured "①〜⑤ の GUI の段: 面（tako-vd）を用意できない（蓋閉じなら開いてから打ち直す）"
+elif [ "$gui_rc" -ne 0 ]; then
+  exit "$gui_rc"
+else
+  start_gui "$TMP/data-noide" "$TMP/gui-noide.log" TAKO_1951_INJECT_NO_BUNDLE=1
+  pane="$(open_edit "$S/Blink/Blink.ino")" || { fail "開けない"; exit 1; }
+  if wait_state "$S/Blink" not_installed 30; then
+    pass "未導入へ落ちる"
+  else
+    fail "未導入に届かない（$(server_field "$S/Blink" '.get("state")')）"
+  fi
+  reason="$(server_field "$S/Blink" '["reason"]')"
+  echo "    理由: $reason"
+  echo "    次の一手: $(server_field "$S/Blink" '["next_step"]')"
+  check_has "理由は同梱も探したことを名指す" "Arduino IDE" "$reason"
+  check_eq "導入コマンドは IDE ごと（言語サーバまで揃う方）" "brew install --cask arduino-ide" "$(server_field "$S/Blink" '["install_command"]')"
+  "$TAKO_BIN" edit replace-range 1:0 1:0 "// x
+" --pane "$pane" >/dev/null 2>&1
+  check_eq "編集はそのまま続けられる（editing・dirty）" "(True, True)" \
+    "$("$TAKO_BIN" edit status --pane "$pane" 2>/dev/null | json '(d["editing"], d["dirty"])')"
+  stop_gui
 fi
 
 if [ "$GUI_OK" = 1 ] && [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
@@ -379,26 +404,6 @@ elif [ "$GUI_OK" = 1 ]; then
 fi
 
 if [ "$GUI_OK" = 1 ]; then
-echo
-echo "== ④ ALS なし（注入 TAKO_1951_INJECT_NO_BUNDLE=1 = Arduino IDE の無い PC と同じ解決） =="
-start_gui "$TMP/data-noide" "$TMP/gui-noide.log" TAKO_1951_INJECT_NO_BUNDLE=1
-pane="$(open_edit "$S/Blink/Blink.ino")" || { fail "開けない"; exit 1; }
-if wait_state "$S/Blink" not_installed 30; then
-  pass "未導入へ落ちる"
-else
-  fail "未導入に届かない（$(server_field "$S/Blink" '.get("state")')）"
-fi
-reason="$(server_field "$S/Blink" '["reason"]')"
-echo "    理由: $reason"
-echo "    次の一手: $(server_field "$S/Blink" '["next_step"]')"
-check_has "理由は同梱も探したことを名指す" "Arduino IDE" "$reason"
-check_eq "導入コマンドは IDE ごと（言語サーバまで揃う方）" "brew install --cask arduino-ide" "$(server_field "$S/Blink" '["install_command"]')"
-"$TAKO_BIN" edit replace-range 1:0 1:0 "// x
-" --pane "$pane" >/dev/null 2>&1
-check_eq "編集はそのまま続けられる（editing・dirty）" "(True, True)" \
-  "$("$TAKO_BIN" edit status --pane "$pane" 2>/dev/null | json '(d["editing"], d["dirty"])')"
-stop_gui
-
 echo
 echo "== ⑤ A/B: 本番の /Applications/tako.app（#1951 より前）では .ino に言語サーバが付かない =="
 PROD_APP="/Applications/tako.app/Contents/MacOS/tako-app"
