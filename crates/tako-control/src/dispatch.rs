@@ -17459,7 +17459,7 @@ fn run_setup_cli_within(
 }
 
 /// UI スレッドでしか採れない材料（#1505）。ここから先は workspace を触らない
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckHealthCtx {
     tabs: usize,
     panes: usize,
@@ -17468,6 +17468,9 @@ pub struct CheckHealthCtx {
     /// DPI 認識レベル（#1063）。**スレッドごとの問い合わせ**（Windows の
     /// `GetThreadDpiAwarenessContext`）なので、必ず UI スレッドで採って持ち回る
     dpi_awareness: tako_core::platform::dpi::DpiAwareness,
+    /// ペインごとの文字コード固定の記録（#2092。門を持つペイン = Windows だけ）。
+    /// 記録の写しを採るだけ（ロック 1 回）で、いまのコードページの読み直しは background で行う
+    encoding_pins: Vec<(u64, tako_core::encoding_pin::PinReport)>,
 }
 
 /// `tako lsp` / MCP `tako_lsp_server` の action（#1678）。CLI と MCP はこの綴りを共有する
@@ -17735,6 +17738,14 @@ fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
         backgrounded: ws.all_background_panes().len(),
         persist_enabled: host.tmux_persist_enabled(),
         dpi_awareness: tako_core::platform::dpi::process_awareness(),
+        encoding_pins: ws
+            .all_panes()
+            .iter()
+            .filter_map(|pane| {
+                let report = host.session(pane.id())?.encoding_pin()?;
+                Some((pane.id().as_u64(), report))
+            })
+            .collect(),
     }
 }
 
@@ -17899,6 +17910,14 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         issues.push(issue);
     }
 
+    // ペインの文字コード固定（#2092。Windows だけ記録を持つ）。諦めたペインは
+    // UTF-8 のバイト列で書く子の出力が化けるので、ペインを名指しで申告する
+    issues.extend(encoding_pin_issues(&ctx.encoding_pins));
+    let encoding_pin = encoding_pin_section(
+        &ctx.encoding_pins,
+        tako_core::platform::console::read_pane_code_pages,
+    );
+
     // ワークスペースの状態サマリ（UI スレッドで採った値）
     let tab_count = ctx.tabs;
     let pane_count = ctx.panes;
@@ -17936,6 +17955,10 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         // #1441: IPC の受け口の実測。`bound=false` なら CLI / MCP は届かない
         // （`kind=shortened` は深い data dir を短いパスへ逃がした正常な状態）
         "ipc": ipc.as_ref().map(ipc_describe),
+        // #2092: ペインの文字コード固定（Windows）。`panes[].state` が `gave_up` のペインは
+        // UTF-8 のバイト列で書く子の出力が化ける。`targets[].code_pages` はいまの値の読み直し、
+        // `hold` は固定の決着まで入力を預かった記録（`release=limit` なら決着を待たずに流した）
+        "encoding_pin": encoding_pin,
         // #1505: 環境診断の項目（`tako setup --check` と同じ 1 実装から出る）。
         // `items[].key` が安定した機械キーで、`items[].lines` は `--check` が
         // そのまま表示する行。`remaining` は人の手が要る残り作業
@@ -17961,6 +17984,99 @@ fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus) -> Value {
         "well_known_bytes": status.well_known_bytes,
         "error": status.error,
     })
+}
+
+/// `check_health` の `encoding_pin` 節（#2092）。記録（UI スレッドで採った写し）に、
+/// いまのコードページの読み直し（`read`。本番は `platform::console::read_pane_code_pages` =
+/// 一瞬相乗りして読む）を添える。読み直しはシェルや利用者が後から `chcp` で変えたことも映す
+fn encoding_pin_section(
+    pins: &[(u64, tako_core::encoding_pin::PinReport)],
+    read: impl Fn(u32) -> Result<tako_core::platform::console::PaneCodePages, String>,
+) -> Value {
+    use tako_core::encoding_pin::{CONTAINER_HOLD_LIMIT, DIRECT_HOLD_LIMIT};
+    let panes: Vec<Value> = pins
+        .iter()
+        .map(|(pane, report)| {
+            let targets: Vec<Value> = report
+                .targets
+                .iter()
+                .map(|t| {
+                    let live = t.pid.map(&read);
+                    json!({
+                        "target": t.target.as_str(),
+                        "pid": t.pid,
+                        "state": t.state.as_str(),
+                        "reason": t.state.reason(),
+                        "settled_ms": t.settled_ms,
+                        "code_pages": live.as_ref().and_then(|r| r.as_ref().ok()).map(|cp| json!({
+                            "input": cp.input,
+                            "output": cp.output,
+                            "utf8": cp.is_utf8(),
+                        })),
+                        "code_pages_error": live.and_then(Result::err),
+                    })
+                })
+                .collect();
+            json!({
+                "pane": pane,
+                "state": report.state(),
+                "targets": targets,
+                "hold": {
+                    "held_writes": report.hold.held_writes,
+                    "held_bytes": report.hold.held_bytes,
+                    "release": report.hold.release.map(|r| r.as_str()),
+                    "held_ms": report.hold.held_ms,
+                    "limit_ms": report.hold.limit_ms,
+                },
+            })
+        })
+        .collect();
+    let gave_up: Vec<u64> = pins
+        .iter()
+        .filter(|(_, r)| r.gave_up().next().is_some())
+        .map(|(pane, _)| *pane)
+        .collect();
+    json!({
+        // 固定が要るプラットフォームか（Windows だけ true。unix は `panes` が常に空）
+        "needed": tako_core::platform::console::pin_needed(),
+        "hold_limit_ms": {
+            "direct": DIRECT_HOLD_LIMIT.as_millis() as u64,
+            "container": CONTAINER_HOLD_LIMIT.as_millis() as u64,
+        },
+        "panes": panes,
+        "gave_up": gave_up,
+    })
+}
+
+/// 固定を諦めたペインごとに 1 件の申告（#2092）。直し方は最簡のコマンド（#322）
+fn encoding_pin_issues(pins: &[(u64, tako_core::encoding_pin::PinReport)]) -> Vec<Value> {
+    pins.iter()
+        .filter_map(|(pane, report)| {
+            let reasons: Vec<String> = report
+                .gave_up()
+                .map(|t| {
+                    format!(
+                        "{}: {}",
+                        t.target.as_str(),
+                        t.state.reason().unwrap_or("理由不明")
+                    )
+                })
+                .collect();
+            (!reasons.is_empty()).then(|| {
+                json!({
+                    "level": "warning",
+                    "check": "encoding_pin",
+                    "pane": pane,
+                    "message": format!(
+                        "ペイン {pane} の文字コードを UTF-8 に固定できなかった（{}）。\
+                         このペインで UTF-8 のバイト列を書く子（type・CRT の printf 等）の出力は化ける。\
+                         そのペインで chcp 65001 を実行すると直る（#2092）",
+                        reasons.join(" / ")
+                    ),
+                })
+            })
+        })
+        .collect()
 }
 
 /// 受け口が立たなかったときだけ申告する（立っているときは黙る = 通常起動と同じ）。
@@ -48847,5 +48963,95 @@ mod tests {
             key: Some("enter".into()),
             tab: None,
         }));
+    }
+
+    /// #2092: 固定を諦めたペインは `encoding_pin` 節の `gave_up` と issues の両方に名指しで出る。
+    /// いまのコードページの読み直しは対象の pid ごとに添える（読めなければ理由）
+    #[test]
+    fn issue2092_諦めたペインは診断に名指しで出る() {
+        use tako_core::encoding_pin::{
+            HoldReport, PinReport, PinState, PinTarget, Release, TargetReport,
+        };
+        use tako_core::platform::console::PaneCodePages;
+        let report = |targets: Vec<TargetReport>, release| PinReport {
+            targets,
+            hold: HoldReport {
+                held_writes: 1,
+                held_bytes: 9,
+                release,
+                held_ms: Some(31),
+                limit_ms: 1500,
+            },
+        };
+        let target = |target, pid, state| TargetReport {
+            target,
+            pid,
+            state,
+            settled_ms: Some(40),
+        };
+        let pins = vec![
+            (
+                3,
+                report(
+                    vec![target(PinTarget::Direct, Some(100), PinState::Pinned)],
+                    Some(Release::Settled),
+                ),
+            ),
+            (
+                7,
+                report(
+                    vec![
+                        target(PinTarget::Direct, Some(200), PinState::Pinned),
+                        target(
+                            PinTarget::Container,
+                            Some(201),
+                            PinState::GaveUp("AttachConsole err=31".into()),
+                        ),
+                    ],
+                    Some(Release::Limit),
+                ),
+            ),
+        ];
+        let read = |pid: u32| match pid {
+            100 | 200 => Ok(PaneCodePages {
+                input: 65001,
+                output: 65001,
+            }),
+            201 => Ok(PaneCodePages {
+                input: 437,
+                output: 437,
+            }),
+            _ => Err("AttachConsole err=87".to_string()),
+        };
+        let section = encoding_pin_section(&pins, read);
+        assert_eq!(section["gave_up"], json!([7]));
+        assert_eq!(section["panes"][0]["state"], "pinned");
+        assert_eq!(section["panes"][1]["state"], "gave_up");
+        let inner = &section["panes"][1]["targets"][1];
+        assert_eq!(inner["target"], "container");
+        assert_eq!(inner["reason"], "AttachConsole err=31");
+        assert_eq!(inner["code_pages"]["output"], 437);
+        assert_eq!(inner["code_pages"]["utf8"], false);
+        assert_eq!(section["panes"][1]["hold"]["release"], "limit");
+        assert_eq!(section["panes"][1]["hold"]["held_bytes"], 9);
+        assert_eq!(section["hold_limit_ms"]["direct"], 500);
+
+        let issues = encoding_pin_issues(&pins);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0]["pane"], 7);
+        assert_eq!(issues[0]["check"], "encoding_pin");
+        let message = issues[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("container: AttachConsole err=31"),
+            "{message}"
+        );
+        assert!(message.contains("chcp 65001"), "{message}");
+
+        // 記録が無い（unix・legacy）なら節は空で、申告も無い。
+        // 固定が要るのは Windows だけ（unix の check-health は `needed=false`）
+        let empty = encoding_pin_section(&[], read);
+        assert_eq!(empty["needed"], cfg!(windows));
+        assert_eq!(empty["panes"], json!([]));
+        assert!(encoding_pin_issues(&[]).is_empty());
     }
 }
