@@ -298,7 +298,8 @@
     },
     {
       "key": "tako_open_file",
-      "status": "supported",
+      "status": "degraded",
+      "note_ja": "エクスプローラーの「プログラムから開く」に tako は出ない（インストーラが関連付けを登録しない）。既定のアプリを奪わない登録（OpenWithProgids）の案は Windows 実機で未確認（#2134）。tako の中ではファイルツリーと `tako open` で開ける",
       "evidence": "self-test",
       "evidence_detail": "項目 66 / 66b / 68b / 112 / 114 / 116（dispatch・tako open・direction・新しいタブ）"
     },

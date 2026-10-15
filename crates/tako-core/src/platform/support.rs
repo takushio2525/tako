@@ -121,6 +121,13 @@ pub mod notes {
         "PDFs render as page images, but the Windows renderer does not expose glyph positions, so text selection, outlines and in-PDF links are unavailable (#693)",
     );
 
+    /// #1955 / #2134。インストーラ（`installer/windows/tako.iss`）が関連付けを 1 つも登録しない。
+    /// tako の中から開く操作（`tako open` / ファイルツリー）は両 OS で同じに動く
+    pub const WIN_EXPLORER_OPEN_WITH: Note = Note::new(
+        "エクスプローラーの「プログラムから開く」に tako は出ない（インストーラが関連付けを登録しない）。既定のアプリを奪わない登録（OpenWithProgids）の案は Windows 実機で未確認（#2134）。tako の中ではファイルツリーと `tako open` で開ける",
+        "tako does not appear in Explorer's \"Open with\" list because the installer registers no file associations. Registering it without taking over default apps (OpenWithProgids) is planned but unverified on real Windows hardware (#2134). Inside tako, files open from the file tree or with `tako open`",
+    );
+
     /// #521。動画は macOS の AVFoundation 実装しかなく、非 macOS はスタブ
     pub const WIN_VIDEO: Note = Note::new(
         "動画デコーダの Windows 実装が無く、動画ファイルを開くとエラーになる",
@@ -917,9 +924,17 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // #1955: Finder の「このアプリケーションで開く」（FR-3.22）に当たる OS の入口が Windows に無い。
+        // tako の中から開く操作（このツール・`tako open`）は両 OS で同じに動くので Degraded。
+        // Pending にすると `gate` がこのツール自体を Windows で止めてしまう。
+        // macOS 側の「動的 UTI の形式（.rs / .go / .ino 等）は Finder の候補に出ない」は
+        // 既定を動かさずに出す方法が無いと実測して採らないと決めた設計判断（#1955）なので、
+        // ここ（system prompt とリリースノートの既知の制限へ流れる）には載せず FR-3.22 に書く
         key: "tako_open_file",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_EXPLORER_OPEN_WITH,
+        },
         windows_evidence: Evidence::SelfTest(
             "項目 66 / 66b / 68b / 112 / 114 / 116（dispatch・tako open・direction・新しいタブ）",
         ),
@@ -2151,6 +2166,16 @@ mod tests {
                 f.key
             );
         }
+    }
+
+    /// #1955: エクスプローラーの「プログラムから開く」に出ないのは OS の入口だけの縮退で、
+    /// tako の中から開く操作は Windows でも止めない。Pending へ倒すと `gate` がツールごと止める
+    #[test]
+    fn エクスプローラーの入口が無くてもtako_open_fileはwindowsで使える() {
+        let win = support_for(Platform::Windows, "tako_open_file").expect("MATRIX に無い");
+        assert_eq!(win.note(), Some(notes::WIN_EXPLORER_OPEN_WITH));
+        assert!(gate_in(Platform::Windows, "tako_open_file", Lang::Ja).is_ok());
+        assert!(gate_in(Platform::MacOs, "tako_open_file", Lang::Ja).is_ok());
     }
 
     /// **macOS 上で Windows 側の縮退表を検証できる**ことの担保。

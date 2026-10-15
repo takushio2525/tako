@@ -53,6 +53,12 @@ import WindowsLimits from '../../../components/motion/WindowsLimits.astro';
 		},
 		{
 			kind: 'degraded',
+			title: 'エクスプローラーの「プログラムから開く」',
+			text: 'tako はまだ候補に出ません。tako のファイルツリーから開くか、tako open コマンドを使ってください。',
+			tools: ['tako_open_file'],
+		},
+		{
+			kind: 'degraded',
 			title: 'PDF',
 			text: '表示はできますが、文字の選択・目次・PDF 内のリンクは使えません。',
 			tools: ['tako_preview_outline', 'tako_preview_follow_link'],
@@ -223,6 +229,14 @@ tako tree selection --key down       # ↓ を押したのと同じ（up / left 
 | その他 | Git Ignore, Git Attributes, AppleScript, R, Clojure, Erlang, Groovy, nginx.conf 等 |
 
 拡張子に加え、ファイル名でも判定します（例: `Cargo.lock` → TOML, `Dockerfile` → Dockerfile, `CMakeLists.txt` → CMake, `.gitignore` → Git Ignore）。shebang（`#!/bin/bash` 等）による自動検出にも対応しています。Markdown のコードブロックも同じ構文で塗り、```` ```ino ```` / ```` ```arduino ```` は C++ として扱います。
+
+### Finder の「このアプリケーションで開く」
+
+Finder でファイルを右クリックし、「このアプリケーションで開く」から tako を選ぶと新しいタブで開きます。tako が既定のアプリを奪うことはありません（候補に並ぶだけです）。
+
+候補に tako が出るのは、macOS がその拡張子の種類を知っている形式（`.c` `.py` `.md` `.json` `.yaml`・画像・PDF・動画など）です。`.rs` `.go` `.toml` `.ino` のように macOS が種類を持たない拡張子には出ません。出すように宣言すると、ほかにその拡張子を開くアプリが入っていない Mac で tako が勝手に既定のアプリになってしまうためです。これらは tako のファイルツリーか `tako open <ファイル>` で開いてください。
+
+Windows のエクスプローラーの「プログラムから開く」には、まだ tako が出ません。
 
 ## Markdown プレビュー
 
