@@ -2976,6 +2976,9 @@ pub enum OffloadJob {
     /// （道具の場所・版・環境の置き場を子プロセスに聞く）を含むので、UI スレッドでは
     /// 相対パスの基準（ペインの cwd）だけを採る
     RunResolve { ctx: RunResolveCtx },
+    /// `.ino` の実行設定（#1952）。基板とポートの読み（`board list` / `board listall`）と書き込み
+    /// （`board attach`）が arduino-cli を起こすので、UI スレッドでは対象ファイルの解決だけを行う
+    RunConfigSketch(Box<RunConfigSketchJob>),
     /// ファイル・フォルダのコピー（#1860）。大きなフォルダの複製で UI を止めないよう
     /// 写す本体だけを background へ出し、ツリーの読み直しは UI スレッドへ戻す
     FileCopy(Box<FileCopyJob>),
@@ -3543,10 +3546,18 @@ pub fn prepare_offload(
             path,
             pane,
             refresh,
+            boards,
         } => Some(
-            collect_run_resolve(host, path, *pane, *refresh)
+            collect_run_resolve(host, path, *pane, *refresh, boards.clone())
                 .map(|ctx| OffloadJob::RunResolve { ctx }),
         ),
+        // #1952: `.ino` の実行設定は基板とポートの読み書きで arduino-cli を起こす（それ以外のファイルは
+        // 子プロセスを起こさないので `None` = 同期のまま）
+        Request::RunnerDefaults {
+            path: Some(path),
+            pane,
+            ..
+        } => run_config_sketch_prepare(host, request, path, *pane),
         // #1984: 以下は UI スレッドの同期の dispatch で子プロセスを待っていた残り
         // （#1979 で上限つきにはなったが、最大 2〜15 秒は止まりうる）。A/B の
         // `TAKO_1984_LEGACY=1` は修正前と同じ `None` = UI スレッドで同期実行
@@ -3773,6 +3784,7 @@ impl OffloadJob {
                 name,
             } => lsp_server_action(Some(&manager), &action, name.as_deref()),
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
+            OffloadJob::RunConfigSketch(job) => job.run(),
             OffloadJob::RemoteAgents => remote_agents_reply(),
             OffloadJob::StaleStatus { ctx } => Ok(finish_stale_status(&ctx)),
             OffloadJob::TmuxWrite(request) => match *request {
@@ -10080,7 +10092,8 @@ fn dispatch_inner(
             path,
             pane,
             refresh,
-        } => finish_run_resolve(&collect_run_resolve(host, &path, pane, refresh)?),
+            boards,
+        } => finish_run_resolve(&collect_run_resolve(host, &path, pane, refresh, boards)?),
 
         Request::RunnerDefaults {
             ext,
@@ -10096,6 +10109,8 @@ fn dispatch_inner(
             env,
             cwd,
             before,
+            board,
+            port,
         } => {
             // #1731: `path` = そのファイル / プロジェクトの実行設定（`ext` = 拡張子既定とは排他）
             if let Some(path) = path {
@@ -10107,18 +10122,29 @@ fn dispatch_inner(
                 }
                 let file = resolve_run_file(host, &path, pane)?;
                 let head = read_file_head(&file)?;
-                return crate::run_configs::handle(crate::run_configs::PathArgs {
-                    file: &file,
-                    head: &head,
-                    scope: scope.as_deref(),
-                    profile: profile.as_deref(),
-                    runtime: runtime.as_deref(),
-                    reset: reset.as_deref(),
-                    args: args.as_deref(),
-                    cwd: cwd.as_deref(),
-                    before: before.as_deref(),
-                    env: env.as_ref(),
-                });
+                // #1952: `.ino` の基板・ポートを書くなら arduino-cli を起こす（IPC と GUI のボタンは
+                // `prepare_offload` で background へ出る。ここは offload を使わない host の同期経路で、
+                // 読むだけなら子プロセスを起こさない = 候補は background の経路だけが聞く）
+                return crate::sketch_board::handle_path(
+                    crate::run_configs::PathArgs {
+                        file: &file,
+                        head: &head,
+                        scope: scope.as_deref(),
+                        profile: profile.as_deref(),
+                        runtime: runtime.as_deref(),
+                        reset: reset.as_deref(),
+                        args: args.as_deref(),
+                        cwd: cwd.as_deref(),
+                        before: before.as_deref(),
+                        env: env.as_ref(),
+                    },
+                    crate::sketch_board::BoardEdit {
+                        board: board.as_deref(),
+                        port: port.as_deref(),
+                    },
+                    false,
+                    host.lsp(),
+                );
             }
             if scope.is_some()
                 || profile.is_some()
@@ -10128,9 +10154,11 @@ fn dispatch_inner(
                 || env.is_some()
                 || cwd.is_some()
                 || before.is_some()
+                || board.is_some()
+                || port.is_some()
             {
                 return Err(DispatchError::InvalidParams(
-                    "scope / profile / runtime / reset / args / env / cwd / before は \
+                    "scope / profile / runtime / reset / args / env / cwd / before / board / port は \
                      path（対象ファイル）と一緒に渡す"
                         .into(),
                 ));
@@ -10571,6 +10599,8 @@ pub struct RunResolveCtx {
     /// ペインの cwd を基準にした（まだ正規化していない）パス
     joined: PathBuf,
     refresh: bool,
+    /// `.ino` の基板を探す語（#1952。`None` = 探さない）
+    boards: Option<String>,
 }
 
 fn collect_run_resolve(
@@ -10578,6 +10608,7 @@ fn collect_run_resolve(
     path: &str,
     pane: Option<u64>,
     refresh: bool,
+    boards: Option<String>,
 ) -> Result<RunResolveCtx, DispatchError> {
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let mut joined = PathBuf::from(path);
@@ -10590,6 +10621,7 @@ fn collect_run_resolve(
         raw: path.to_string(),
         joined,
         refresh,
+        boards,
     })
 }
 
@@ -10616,6 +10648,90 @@ fn resolve_run_file(
         )));
     }
     Ok(resolved)
+}
+
+/// `.ino` の実行設定のジョブ（#1952）。要求をそのまま持ち、対象ファイルだけを UI スレッドで解く
+pub struct RunConfigSketchJob {
+    file: PathBuf,
+    request: Request,
+    lsp: Option<crate::lsp::LspManager>,
+}
+
+impl RunConfigSketchJob {
+    /// background の本体（同期の腕と同じ `sketch_board::handle_path`。ここは候補も聞く）
+    fn run(self) -> Result<Value, DispatchError> {
+        let Request::RunnerDefaults {
+            ext,
+            command,
+            remove,
+            scope,
+            profile,
+            runtime,
+            reset,
+            args,
+            env,
+            cwd,
+            before,
+            board,
+            port,
+            ..
+        } = self.request
+        else {
+            return Err(DispatchError::Operation(
+                "実行設定でない要求（RunConfigSketch）".into(),
+            ));
+        };
+        if ext.is_some() || command.is_some() || remove {
+            return Err(DispatchError::InvalidParams(
+                "path（実行設定）と ext / command / remove（拡張子既定）は同時に使えない".into(),
+            ));
+        }
+        let head = read_file_head(&self.file)?;
+        crate::sketch_board::handle_path(
+            crate::run_configs::PathArgs {
+                file: &self.file,
+                head: &head,
+                scope: scope.as_deref(),
+                profile: profile.as_deref(),
+                runtime: runtime.as_deref(),
+                reset: reset.as_deref(),
+                args: args.as_deref(),
+                cwd: cwd.as_deref(),
+                before: before.as_deref(),
+                env: env.as_ref(),
+            },
+            crate::sketch_board::BoardEdit {
+                board: board.as_deref(),
+                port: port.as_deref(),
+            },
+            true,
+            self.lsp.as_ref(),
+        )
+    }
+}
+
+/// `prepare_offload` の `.ino` の実行設定の腕（#1952）。スケッチでなければ `None` = 同期のまま。
+/// 対象ファイルの解決（ペインの cwd・正規化 = stat だけ）は UI スレッドで行う
+fn run_config_sketch_prepare(
+    host: &dyn ControlHost,
+    request: &Request,
+    path: &str,
+    pane: Option<u64>,
+) -> Option<Result<OffloadJob, DispatchError>> {
+    if tako_core::sketch_board::legacy() {
+        return None;
+    }
+    match resolve_run_file(host, path, pane) {
+        Ok(file) if tako_core::sketch_board::sketch_dir_of(&file).is_some() => Some(Ok(
+            OffloadJob::RunConfigSketch(Box::new(RunConfigSketchJob {
+                file,
+                request: request.clone(),
+                lsp: host.lsp().cloned(),
+            })),
+        )),
+        Ok(_) => None,
+        Err(e) => Some(Err(e)),
+    }
 }
 
 /// `RunResolve` の本体（**UI スレッドで呼ばない**。実行環境の Tier P が子プロセスを起こす）
@@ -10656,10 +10772,24 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
     )
     .map_err(|e| DispatchError::Operation(e.to_string()))?;
     // #1950: 子プロセスに聞けば詰められる案内（繋がっている基板の FQBN）を、実行環境の層が
-    // 見つけた実行ファイルで聞く（ここは background。`Run` では聞かない）
-    if let Some(project) = resolution.project.as_mut() {
-        crate::runtime_probe::apply_project_followup(project, runtime.as_ref());
-    }
+    // 見つけた実行ファイルで聞く（ここは background。`Run` では聞かない）。
+    // #1952: スケッチなら基板とポートの欄も組む（`board list` は案内と 1 回で共有する）
+    let board = match (
+        resolution.project.as_mut(),
+        tako_core::sketch_board::sketch_dir_of(&resolved),
+    ) {
+        (Some(project), Some(sketch)) => Some(crate::sketch_board::resolve_block(
+            project,
+            &sketch,
+            runtime.as_ref(),
+            ctx.boards.as_deref(),
+        )),
+        (Some(project), None) => {
+            crate::runtime_probe::apply_project_followup(project, runtime.as_ref());
+            None
+        }
+        (None, _) => None,
+    };
 
     let profiles: Vec<Value> = resolution
         .all_profiles
@@ -10706,6 +10836,8 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
         "runtime_unresolved": runtime_unresolved,
         "runtimes": crate::runtime_probe::runtimes_json(runtime.as_ref()),
         "probe": crate::runtime_probe::probe_json(runtime.as_ref()),
+        // #1952: `.ino` の基板とポート（正本は sketch.yaml。それ以外のファイルは null）
+        "board": board,
     }))
 }
 
@@ -40692,6 +40824,7 @@ mod tests {
                 path: ino.display().to_string(),
                 pane: Some(pane.as_u64()),
                 refresh: false,
+                boards: None,
             },
             PaneOrigin::Mcp,
         )
@@ -40833,6 +40966,7 @@ mod tests {
                 path: main.display().to_string(),
                 pane: Some(pane.as_u64()),
                 refresh: false,
+                boards: None,
             },
             PaneOrigin::Mcp,
         )
@@ -40918,6 +41052,7 @@ mod tests {
                 path: loose.display().to_string(),
                 pane: Some(pane.as_u64()),
                 refresh: false,
+                boards: None,
             },
             PaneOrigin::Mcp,
         )
@@ -41052,6 +41187,7 @@ mod tests {
                 path: file.display().to_string(),
                 pane: Some(pane.as_u64()),
                 refresh: false,
+                boards: None,
             },
             PaneOrigin::Mcp,
         )
@@ -41105,6 +41241,8 @@ mod tests {
                 )])),
                 cwd: Some("sub".into()),
                 before: Some("make build".into()),
+                board: None,
+                port: None,
             },
             PaneOrigin::Mcp,
         )
@@ -41160,6 +41298,7 @@ mod tests {
                 path: file.display().to_string(),
                 pane: Some(pane.as_u64()),
                 refresh: false,
+                boards: None,
             },
             PaneOrigin::Mcp,
         )
@@ -41246,6 +41385,7 @@ mod tests {
             path: file.display().to_string(),
             pane: Some(pane.as_u64()),
             refresh: false,
+            boards: None,
         };
         let job = prepare_offload(&mut host, &req)
             .expect("RunResolve は offload の対象")
@@ -41283,6 +41423,7 @@ mod tests {
             path: "a.py".into(),
             pane: Some(999_999),
             refresh: false,
+            boards: None,
         };
         assert!(matches!(prepare_offload(&mut host, &bad), Some(Err(_))));
     }

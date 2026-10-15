@@ -157,6 +157,81 @@ pub fn run_menu_move_to(source: &str) -> &'static str {
     }
 }
 
+// --- 基板とポートの欄（#1952。`.ino` だけ。キー: preview.run_menu_board_* / run_menu_port_*） ---
+
+pub fn run_menu_board() -> &'static str {
+    tr!("基板", "Board")
+}
+pub fn run_menu_port() -> &'static str {
+    tr!("ポート", "Port")
+}
+/// 基板・ポートの出典タグ（正本は Arduino の sketch.yaml = IDE とも共有）
+pub fn run_menu_board_source() -> &'static str {
+    "sketch.yaml"
+}
+/// 出典タグのツールチップ
+pub fn run_menu_board_source_tip() -> &'static str {
+    tr!(
+        "選ぶと arduino-cli board attach が sketch.yaml へ書きます（Arduino IDE とも共有）",
+        "Selecting runs arduino-cli board attach, which writes sketch.yaml (shared with Arduino IDE)"
+    )
+}
+pub fn run_menu_board_unset() -> &'static str {
+    tr!("未選択", "Not selected")
+}
+/// 基板を名前か FQBN で探す欄を開くボタン
+pub fn run_menu_board_search() -> &'static str {
+    tr!("基板を探す…", "Find a board…")
+}
+/// 欄の下（探す語に当たる基板が無い）
+pub fn run_menu_board_no_match() -> &'static str {
+    tr!(
+        "入っているコアの基板に当たるものがありません（FQBN をそのまま入れて Enter でも選べます）",
+        "No installed board matches (you can also type an FQBN and press Enter)"
+    )
+}
+/// 基板の欄の操作の案内
+pub fn run_menu_board_hint() -> &'static str {
+    tr!(
+        "名前か FQBN で絞り込み、行を押すか Enter で選ぶ / Esc で取り消し",
+        "Type a name or FQBN to filter, then click a row or press Enter / Esc to cancel"
+    )
+}
+/// 繋がっている基板に添える印
+pub fn run_menu_board_connected() -> &'static str {
+    tr!("接続中", "connected")
+}
+/// コアが入っていない基板に添える印（選ぶと導入のコマンドを示すだけ）
+pub fn run_menu_board_core_missing() -> &'static str {
+    tr!("コア未導入", "core not installed")
+}
+/// 書いている間（arduino-cli board attach）
+pub fn run_menu_board_attaching() -> &'static str {
+    tr!("sketch.yaml へ書いています…", "Writing sketch.yaml…")
+}
+/// 入っているコアの基板の件数（探す欄の見出し）
+pub fn run_menu_board_installed(n: usize) -> String {
+    tr!(
+        format!("入っているコアの基板 {n} 件"),
+        format!("{n} boards in the installed cores")
+    )
+}
+/// ポートを入れる欄を開くボタン
+pub fn run_menu_port_pick() -> &'static str {
+    tr!("ポートを指定…", "Enter a port…")
+}
+/// 選んであるポートが今は見つからない（繋いでいない）
+pub fn run_menu_port_absent() -> &'static str {
+    tr!("繋がっていない", "not connected")
+}
+/// ポートが 1 つも見つからない
+pub fn run_menu_port_none() -> &'static str {
+    tr!(
+        "ポートが見つかりません（基板を繋いで再検出）",
+        "No ports found (connect the board and re-detect)"
+    )
+}
+
 // --- 編集ステータス（キー: preview.status_*） ---
 
 pub fn saved_suffix() -> &'static str {
@@ -651,6 +726,20 @@ mod tests {
                 run_menu_source("default").to_string(),
                 run_menu_move_to("file").to_string(),
                 run_menu_move_to("project").to_string(),
+                run_menu_board().to_string(),
+                run_menu_port().to_string(),
+                run_menu_board_source_tip().to_string(),
+                run_menu_board_unset().to_string(),
+                run_menu_board_search().to_string(),
+                run_menu_board_no_match().to_string(),
+                run_menu_board_hint().to_string(),
+                run_menu_board_connected().to_string(),
+                run_menu_board_core_missing().to_string(),
+                run_menu_board_attaching().to_string(),
+                run_menu_board_installed(27),
+                run_menu_port_pick().to_string(),
+                run_menu_port_absent().to_string(),
+                run_menu_port_none().to_string(),
                 saved_suffix().to_string(),
                 conflict_suffix().to_string(),
                 error_suffix().to_string(),

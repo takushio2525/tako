@@ -118,6 +118,146 @@ impl RuntimeRow {
     }
 }
 
+/// 基板の行（`board.candidates[]` / `board.matches[]`。#1952）
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoardRow {
+    pub(crate) fqbn: String,
+    pub(crate) name: String,
+    /// 繋がっているポート
+    pub(crate) port: Option<String>,
+    pub(crate) connected: bool,
+    /// コアが入っているか（分からなければ `None`）
+    pub(crate) installed: Option<bool>,
+}
+
+impl BoardRow {
+    fn from_json(v: &Value) -> Option<Self> {
+        let fqbn = v["fqbn"].as_str()?.to_string();
+        Some(Self {
+            name: v["name"].as_str().unwrap_or(&fqbn).to_string(),
+            port: v["port"].as_str().map(str::to_string),
+            connected: v["connected"].as_bool().unwrap_or(false),
+            // 一覧（matches）は入っているコアの基板だけ
+            installed: v["installed"].as_bool().or(Some(true)),
+            fqbn,
+        })
+    }
+}
+
+/// ポートの行（`board.ports[]`）
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PortRow {
+    pub(crate) address: String,
+    /// `Serial Port (USB)` 等と、そのポートに繋がっている基板の名前
+    pub(crate) detail: String,
+}
+
+/// `.ino` の基板とポート（`RunResolve` の `board` 欄をそのまま写したもの。正本は sketch.yaml。#1952）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct BoardView {
+    pub(crate) fqbn: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) port: Option<String>,
+    /// 繋がっている基板 + 今の基板
+    pub(crate) candidates: Vec<BoardRow>,
+    /// 見つかったポート（`None` = 聞けていない）
+    pub(crate) ports: Option<Vec<PortRow>>,
+    /// 入っているコアの基板（「基板を探す」が絞る元）
+    pub(crate) installed: Vec<BoardRow>,
+    /// 注意（default_profile が勝つ・今の基板のコアが無い）と、聞けなかった理由
+    pub(crate) notes: Vec<String>,
+}
+
+impl BoardView {
+    fn from_json(b: &Value) -> Option<Self> {
+        if !b.is_object() {
+            return None;
+        }
+        let rows = |key: &str| -> Vec<BoardRow> {
+            b[key]
+                .as_array()
+                .map(|a| a.iter().filter_map(BoardRow::from_json).collect())
+                .unwrap_or_default()
+        };
+        let strs = |key: &str| -> Vec<String> {
+            b[key]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut notes = strs("notes");
+        notes.extend(strs("errors"));
+        Some(Self {
+            fqbn: b["fqbn"].as_str().map(str::to_string),
+            name: b["name"].as_str().map(str::to_string),
+            port: b["port"].as_str().map(str::to_string),
+            candidates: rows("candidates"),
+            ports: b["ports"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|p| {
+                        let address = p["address"].as_str()?.to_string();
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(l) = p["protocol_label"].as_str().filter(|l| !l.is_empty()) {
+                            parts.push(l.to_string());
+                        }
+                        parts.extend(
+                            p["boards"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|n| n.as_str().map(str::to_string)),
+                        );
+                        Some(PortRow {
+                            address,
+                            detail: parts.join(" · "),
+                        })
+                    })
+                    .collect()
+            }),
+            installed: rows("matches"),
+            notes,
+        })
+    }
+
+    /// 今の基板の表示名（一覧で名前が引けなければ FQBN）
+    pub(crate) fn label(&self) -> Option<String> {
+        self.name.clone().or_else(|| self.fqbn.clone())
+    }
+}
+
+/// 「基板を探す」の欄の絞り込み（名前か FQBN の部分一致・大文字小文字を区別しない。空 = 全部）。
+/// 一覧の順（arduino-cli の並び）のまま先頭 `limit` 件
+pub(crate) fn filter_boards<'a>(
+    rows: &'a [BoardRow],
+    text: &str,
+    limit: usize,
+) -> Vec<&'a BoardRow> {
+    let q = text.trim().to_lowercase();
+    rows.iter()
+        .filter(|b| {
+            q.is_empty() || b.name.to_lowercase().contains(&q) || b.fqbn.to_lowercase().contains(&q)
+        })
+        .take(limit)
+        .collect()
+}
+
+/// 「基板を探す」の欄で Enter: 絞り込みがちょうど 1 件ならその基板、そうでなければ打った文字列を
+/// FQBN として渡す（形・コアの有無・実在は dispatch が検めて断る）
+pub(crate) fn board_choice(rows: &[BoardRow], text: &str) -> String {
+    let typed = text.trim();
+    match filter_boards(rows, typed, 2).as_slice() {
+        [only] if !rows.iter().any(|b| b.fqbn == typed) => only.fqbn.clone(),
+        _ => typed.to_string(),
+    }
+}
+
+/// 探す欄の下に出す行の上限（数百ある esp32 でもメニューを押し出さない）
+const BOARD_ROWS_SHOWN: usize = 8;
+
 /// メニューが見せるもの（`RunResolve` の応答をそのまま型へ写したもの。判定を足さない）
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct RunView {
@@ -141,6 +281,8 @@ pub(crate) struct RunView {
     pub(crate) before: Sourced,
     /// 環境変数（名前順 = 応答の object の順）
     pub(crate) env: Vec<(String, Sourced)>,
+    /// `.ino` の基板とポート（それ以外のファイルは `None` = 節を出さない。#1952）
+    pub(crate) board: Option<BoardView>,
 }
 
 impl RunView {
@@ -212,6 +354,7 @@ impl RunView {
             cwd: Sourced::from_json(&config["cwd"]),
             before: Sourced::from_json(&config["before"]),
             env,
+            board: BoardView::from_json(&v["board"]),
         }
     }
 
@@ -345,6 +488,17 @@ pub(crate) enum EditTarget {
     },
     /// 実行環境の interpreter のパス
     RuntimePath,
+    /// `.ino` の基板（打つと入っているコアの基板を絞り込む。#1952）
+    Board,
+    /// `.ino` の書き込み先のポート（#1952）
+    Port,
+}
+
+impl EditTarget {
+    /// 書くと arduino-cli を起こす（`dispatch_off_ui` で送る）欄か
+    fn writes_sketch(&self) -> bool {
+        matches!(self, EditTarget::Board | EditTarget::Port)
+    }
 }
 
 /// 開いている欄
@@ -372,6 +526,8 @@ pub(crate) struct RunMenuUi {
     pub(crate) notice: Option<(PaneId, String)>,
     /// 実行環境の候補を全部出しているか（開き直すと畳む）
     pub(crate) runtimes_expanded: bool,
+    /// `arduino-cli board attach` の答えを待っているペイン（#1952）
+    pub(crate) attaching: Option<PaneId>,
     seq: u64,
 }
 
@@ -414,6 +570,9 @@ pub(crate) struct Write {
     pub(crate) env: Option<BTreeMap<String, Option<String>>>,
     pub(crate) cwd: Option<String>,
     pub(crate) before: Option<String>,
+    /// `.ino` の基板とポート（#1952。arduino-cli を起こすので `dispatch_off_ui` だけで送る）
+    pub(crate) board: Option<String>,
+    pub(crate) port: Option<String>,
 }
 
 impl Write {
@@ -432,6 +591,8 @@ impl Write {
             env: self.env,
             cwd: self.cwd,
             before: self.before,
+            board: self.board,
+            port: self.port,
         }
     }
 }
@@ -455,6 +616,8 @@ pub(crate) fn build_write(
         EditTarget::Cwd => w.cwd = Some(text.to_string()),
         EditTarget::Before => w.before = Some(text.to_string()),
         EditTarget::RuntimePath => w.runtime = Some(text.trim().to_string()),
+        EditTarget::Board => w.board = Some(text.trim().to_string()),
+        EditTarget::Port => w.port = Some(text.trim().to_string()),
         EditTarget::Env { original } => {
             let Some((name, value)) = text.split_once('=') else {
                 return Err(crate::ui_text::preview::run_menu_env_format().to_string());
@@ -618,10 +781,13 @@ impl TakoApp {
         }
         // 宛先はそのプレビューのペイン（GUI の中の dispatch には「呼び出し元のペイン」が無いので、
         // 省くと「対象ペインが未指定」で断られる。パスは絶対なので cwd の基準には使われない）
+        // #1952: `.ino` なら入っているコアの基板を全部もらう（欄の「基板を探す」がこの一覧を絞る）。
+        // それ以外のファイルでは dispatch が無視する
         let request = Request::RunResolve {
             path: path.display().to_string(),
             pane: Some(pane.as_u64()),
             refresh,
+            boards: Some(String::new()),
         };
         self.dispatch_off_ui(request, PaneOrigin::User, cx, move |app, result, cx| {
             let Some(entry) = app
@@ -651,6 +817,9 @@ impl TakoApp {
     /// ペインを閉じた・プレビューでなくなったときの後片付け
     pub(crate) fn forget_run_menu(&mut self, pane: PaneId) {
         self.run_menu.resolved.remove(&pane);
+        if self.run_menu.attaching == Some(pane) {
+            self.run_menu.attaching = None;
+        }
         self.run_menu.pending.retain(|(p, _)| *p != pane);
         if self.run_menu.is_open(pane) {
             self.close_run_menu();
@@ -809,6 +978,75 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// 基板・ポートを選ぶ（#1952。`RunnerDefaults { path, board, port }` = CLI `tako run-config --board/--port`・
+    /// MCP `tako_run_defaults` と同じ口）。dispatch が arduino-cli（`board listall` で検めて `board attach`）を
+    /// 起こすので **UI スレッドで待たず** `dispatch_off_ui` で送る。断られた理由（コアが入っていない = 導入の
+    /// コマンド・基板が無い・形が違う）は欄の下か、欄が無ければメニューの下に出す。答えが来たら取り直す
+    pub(crate) fn run_menu_attach(
+        &mut self,
+        pane: PaneId,
+        board: Option<String>,
+        port: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.run_menu.resolved.get(&pane).map(|r| r.path.clone()) else {
+            return;
+        };
+        if self.run_menu.attaching == Some(pane) {
+            return;
+        }
+        self.run_menu.attaching = Some(pane);
+        self.run_menu.notice = None;
+        let request = Write {
+            board,
+            port,
+            ..Write::default()
+        }
+        .into_request(&path);
+        self.dispatch_off_ui(request, PaneOrigin::User, cx, move |app, result, cx| {
+            if app.run_menu.attaching == Some(pane) {
+                app.run_menu.attaching = None;
+            }
+            let editing_sketch = app
+                .run_menu
+                .edit
+                .as_ref()
+                .is_some_and(|e| e.pane == pane && e.target.writes_sketch());
+            match result {
+                Ok(v) => {
+                    if editing_sketch {
+                        app.close_run_menu_edit();
+                    }
+                    // 取り直し（`board list` で数秒）を待たずに、書いた後の sketch.yaml の値を出す
+                    if let Some(view) = app
+                        .run_menu
+                        .resolved
+                        .get_mut(&pane)
+                        .and_then(|r| r.answer.as_mut())
+                        .and_then(|a| a.as_mut().ok())
+                        .and_then(|v| v.board.as_mut())
+                    {
+                        let b = &v["board"];
+                        view.fqbn = b["fqbn"].as_str().map(str::to_string);
+                        view.port = b["port"].as_str().map(str::to_string);
+                        view.name = b["name"].as_str().map(str::to_string);
+                    }
+                    app.run_menu.notice = None;
+                }
+                Err(e) => {
+                    let reason = e.to_string();
+                    match app.run_menu.edit.as_mut().filter(|_| editing_sketch) {
+                        Some(edit) => edit.notice = Some(reason),
+                        None => app.run_menu.notice = Some((pane, reason)),
+                    }
+                }
+            }
+            app.request_run_resolve(pane, path, false, cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     /// 再検出（`RunResolve { refresh: true }` = CLI `tako run-config <f> --refresh` と同じ口）
     pub(crate) fn run_menu_redetect(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         if let Some(path) = self.run_menu.resolved.get(&pane).map(|r| r.path.clone()) {
@@ -928,6 +1166,31 @@ impl TakoApp {
             return;
         };
         let pane = edit.pane;
+        // #1952: 基板・ポートは arduino-cli を起こすので background へ（欄は答えが来るまで開いたまま）
+        if edit.target.writes_sketch() {
+            let text = edit.field.text().to_string();
+            if text.trim().is_empty() {
+                if let Some(edit) = self.run_menu.edit.as_mut() {
+                    edit.notice = Some(crate::ui_text::preview::run_menu_empty().to_string());
+                }
+                cx.notify();
+                return;
+            }
+            let (board, port) = match edit.target {
+                EditTarget::Board => {
+                    let rows = self
+                        .run_menu
+                        .view(pane)
+                        .and_then(|v| v.board.as_ref())
+                        .map(|b| b.installed.as_slice())
+                        .unwrap_or_default();
+                    (Some(board_choice(rows, &text)), None)
+                }
+                _ => (None, Some(text.trim().to_string())),
+            };
+            self.run_menu_attach(pane, board, port, cx);
+            return;
+        }
         let write = build_write(&edit.target, edit.field.text(), edit.scope);
         let outcome = match write {
             Ok(w) => self.run_menu_apply(pane, vec![w], cx),
@@ -973,6 +1236,11 @@ impl TakoApp {
                 }
                 if view.runtime_kind.is_some() {
                     sections.push(self.render_run_menu_runtime(pane, view, &theme, cx));
+                }
+                // #1952: `.ino` の基板とポート（正本は sketch.yaml）
+                if let Some(board) = view.board.as_ref() {
+                    sections.push(self.render_run_menu_board(pane, board, &theme, cx));
+                    sections.push(self.render_run_menu_port(pane, board, &theme, cx));
                 }
                 sections.push(self.render_run_menu_fields(pane, view, &theme, cx));
             }
@@ -1374,6 +1642,312 @@ impl TakoApp {
         col.into_any_element()
     }
 
+    /// 基板の節（#1952）: 今の基板・注意・繋がっている基板・「基板を探す」（打つと入っているコアの基板を
+    /// 絞り込む欄）。行を押すと `run_menu_attach`（background の `RunnerDefaults { board }`）
+    fn render_run_menu_board(
+        &self,
+        pane: PaneId,
+        board: &BoardView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let probe = self.panel_click_probe_bounds.clone();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .px(px(4.0))
+            .child(sketch_section_header(
+                crate::ui_text::preview::run_menu_board(),
+                theme,
+            ));
+        // 今の基板（未選択は黄色）
+        col = col.child(
+            div()
+                .id("run-menu-board-current")
+                .relative()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .child(check_slot(board.fqbn.is_some(), theme))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .text_size(px(11.5))
+                        .text_color(hsla(if board.fqbn.is_some() {
+                            theme.foreground
+                        } else {
+                            theme.yellow
+                        }))
+                        .child(SharedString::from(board.label().unwrap_or_else(|| {
+                            crate::ui_text::preview::run_menu_board_unset().to_string()
+                        }))),
+                )
+                .children(
+                    board
+                        .fqbn
+                        .clone()
+                        .filter(|f| board.name.as_deref() != Some(f.as_str()))
+                        .map(|f| {
+                            div()
+                                .flex_none()
+                                .font_family(SharedString::from(theme.font_family.clone()))
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.text_faint))
+                                .child(SharedString::from(f))
+                        }),
+                )
+                .child(probe_canvas(probe.clone(), "run-menu-board-current".into())),
+        );
+        for note in &board.notes {
+            col = col.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .text_size(px(10.5))
+                    .text_color(hsla(theme.yellow))
+                    .child(SharedString::from(note.clone())),
+            );
+        }
+        // 繋がっている基板（押すと基板とそのポートを選ぶ）
+        let current = (board.fqbn.as_deref(), board.port.as_deref());
+        for (i, c) in board.candidates.iter().filter(|c| c.connected).enumerate() {
+            let key = format!("run-menu-board-connected-{i}");
+            let (fqbn, port) = (c.fqbn.clone(), c.port.clone());
+            col = col.child(
+                board_row(
+                    &key,
+                    c,
+                    current == (Some(c.fqbn.as_str()), c.port.as_deref()),
+                    theme,
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.run_menu_attach(pane, Some(fqbn.clone()), port.clone(), cx);
+                }))
+                .child(probe_canvas(probe.clone(), key)),
+            );
+        }
+        // 基板を探す（欄が開いていれば欄と絞り込んだ行）
+        let editing = self
+            .run_menu
+            .edit
+            .as_ref()
+            .filter(|e| e.pane == pane && e.target == EditTarget::Board);
+        match editing {
+            Some(edit) => {
+                col = col.children(self.render_run_menu_field_editor(
+                    pane,
+                    &EditTarget::Board,
+                    theme,
+                ));
+                col = col.child(
+                    div()
+                        .px(px(6.0))
+                        .text_size(px(10.0))
+                        .text_color(hsla(theme.text_faint))
+                        .child(SharedString::from(
+                            crate::ui_text::preview::run_menu_board_installed(
+                                board.installed.len(),
+                            ),
+                        )),
+                );
+                let rows = filter_boards(&board.installed, edit.field.text(), BOARD_ROWS_SHOWN);
+                if rows.is_empty() {
+                    col = col.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(3.0))
+                            .text_size(px(10.5))
+                            .text_color(hsla(theme.text_faint))
+                            .child(crate::ui_text::preview::run_menu_board_no_match()),
+                    );
+                }
+                for (i, b) in rows.into_iter().enumerate() {
+                    let key = format!("run-menu-board-match-{i}");
+                    let fqbn = b.fqbn.clone();
+                    col = col.child(
+                        board_row(
+                            &key,
+                            b,
+                            board.fqbn.as_deref() == Some(b.fqbn.as_str()),
+                            theme,
+                        )
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.run_menu_attach(pane, Some(fqbn.clone()), None, cx);
+                        }))
+                        .child(probe_canvas(probe.clone(), key)),
+                    );
+                }
+            }
+            None => {
+                col = col.child(
+                    action_button(
+                        "run-menu-board-search",
+                        crate::file_icons::ui_icon::SEARCH,
+                        crate::ui_text::preview::run_menu_board_search(),
+                        theme,
+                    )
+                    .mx(px(2.0))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_run_menu_edit(
+                            pane,
+                            EditTarget::Board,
+                            String::new(),
+                            "default",
+                            cx,
+                        );
+                    }))
+                    .child(probe_canvas(probe.clone(), "run-menu-board-search".into())),
+                );
+            }
+        }
+        if self.run_menu.attaching == Some(pane) {
+            col = col.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(3.0))
+                    .text_size(px(10.5))
+                    .text_color(hsla(theme.text_faint))
+                    .child(crate::ui_text::preview::run_menu_board_attaching()),
+            );
+        }
+        col.into_any_element()
+    }
+
+    /// ポートの節（#1952）: 見つかったポート（押すと選ぶ）・選んであるが今は無いポート・「ポートを指定」
+    fn render_run_menu_port(
+        &self,
+        pane: PaneId,
+        board: &BoardView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let probe = self.panel_click_probe_bounds.clone();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .px(px(4.0))
+            .child(sketch_section_header(
+                crate::ui_text::preview::run_menu_port(),
+                theme,
+            ));
+        let ports = board.ports.clone().unwrap_or_default();
+        let mut rows: Vec<(String, String, bool)> = ports
+            .iter()
+            .map(|p| {
+                (
+                    p.address.clone(),
+                    p.detail.clone(),
+                    board.port.as_deref() == Some(p.address.as_str()),
+                )
+            })
+            .collect();
+        // 選んであるポートが今は見つからない（繋いでいない）なら印つきで先頭へ
+        if let Some(cur) = board.port.as_deref() {
+            if !ports.iter().any(|p| p.address == cur) {
+                rows.insert(
+                    0,
+                    (
+                        cur.to_string(),
+                        crate::ui_text::preview::run_menu_port_absent().to_string(),
+                        true,
+                    ),
+                );
+            }
+        }
+        if rows.is_empty() && board.ports.is_some() {
+            col = col.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.text_faint))
+                    .child(crate::ui_text::preview::run_menu_port_none()),
+            );
+        }
+        for (i, (address, detail, selected)) in rows.into_iter().enumerate() {
+            let key = format!("run-menu-port-{i}");
+            let choose = address.clone();
+            col = col.child(
+                div()
+                    .id(SharedString::from(key.clone()))
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(6.0))
+                    .py(px(5.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.run_menu_attach(pane, None, Some(choose.clone()), cx);
+                    }))
+                    .child(check_slot(selected, theme))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .font_family(SharedString::from(theme.font_family.clone()))
+                            .text_size(px(11.0))
+                            .text_color(hsla(if selected {
+                                theme.foreground
+                            } else {
+                                theme.text_secondary
+                            }))
+                            .child(SharedString::from(address)),
+                    )
+                    .when(!detail.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .text_color(hsla(theme.text_faint))
+                                .child(SharedString::from(tako_core::text::truncate_chars(
+                                    &detail, 32,
+                                ))),
+                        )
+                    })
+                    .child(probe_canvas(probe.clone(), key)),
+            );
+        }
+        let editing = self
+            .run_menu
+            .edit
+            .as_ref()
+            .is_some_and(|e| e.pane == pane && e.target == EditTarget::Port);
+        if editing {
+            col = col.children(self.render_run_menu_field_editor(pane, &EditTarget::Port, theme));
+        } else {
+            let initial = board.port.clone().unwrap_or_default();
+            col = col.child(
+                action_button(
+                    "run-menu-port-pick",
+                    crate::file_icons::ui_icon::PENCIL,
+                    crate::ui_text::preview::run_menu_port_pick(),
+                    theme,
+                )
+                .mx(px(2.0))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.open_run_menu_edit(pane, EditTarget::Port, initial.clone(), "default", cx);
+                }))
+                .child(probe_canvas(probe, "run-menu-port-pick".into())),
+            );
+        }
+        col.into_any_element()
+    }
+
     /// 引数・環境変数・作業ディレクトリ・実行前コマンド（行を押すとその場で直す）
     fn render_run_menu_fields(
         &self,
@@ -1610,7 +2184,11 @@ impl TakoApp {
             None => div()
                 .text_size(px(10.5))
                 .text_color(hsla_alpha(theme.foreground, 0.6))
-                .child(crate::ui_text::preview::run_menu_edit_hint()),
+                .child(if edit.target == EditTarget::Board {
+                    crate::ui_text::preview::run_menu_board_hint()
+                } else {
+                    crate::ui_text::preview::run_menu_edit_hint()
+                }),
         };
         Some(
             div()
@@ -1751,6 +2329,109 @@ fn section_title(text: &str, theme: &Theme) -> gpui::Div {
         .text_size(px(10.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(hsla(theme.text_tertiary))
+        .child(SharedString::from(text.to_string()))
+}
+
+/// 基板・ポートの節の見出し（出典は常に sketch.yaml = 押しても移さない・消さない。ツールチップで書き先を示す）
+fn sketch_section_header(title: &str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    let tip_theme = theme.clone();
+    div()
+        .id(SharedString::from(format!(
+            "run-menu-sketch-header-{title}"
+        )))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(6.0))
+        .py(px(4.0))
+        .child(section_title(title, theme))
+        .child(
+            div()
+                .id(SharedString::from(format!("run-menu-sketch-tag-{title}")))
+                .flex_none()
+                .px(px(6.0))
+                .py(px(1.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(hsla(theme.border_subtle))
+                .text_size(px(10.0))
+                .text_color(hsla(theme.text_faint))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| {
+                        crate::tab_bar::HintTooltip::new(
+                            crate::ui_text::preview::run_menu_board_source_tip().to_string(),
+                            tip_theme.clone(),
+                        )
+                    })
+                    .into()
+                })
+                .child(crate::ui_text::preview::run_menu_board_source()),
+        )
+}
+
+/// 基板の 1 行（印・名前・接続中 / コア未導入の印・ポートか FQBN）
+fn board_row(key: &str, b: &BoardRow, selected: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(key.to_string()))
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(6.0))
+        .py(px(5.0))
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+        .child(check_slot(selected, theme))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_size(px(11.5))
+                .text_color(hsla(if selected {
+                    theme.foreground
+                } else {
+                    theme.text_secondary
+                }))
+                .child(SharedString::from(b.name.clone())),
+        )
+        .when(b.connected, |d| {
+            d.child(pill(
+                crate::ui_text::preview::run_menu_board_connected(),
+                theme,
+            ))
+        })
+        .when(b.installed == Some(false), |d| {
+            d.child(warn_pill(
+                crate::ui_text::preview::run_menu_board_core_missing(),
+                theme,
+            ))
+        })
+        .child(
+            div()
+                .flex_none()
+                .font_family(SharedString::from(theme.font_family.clone()))
+                .text_size(px(10.0))
+                .text_color(hsla(theme.text_faint))
+                .child(SharedString::from(tako_core::text::truncate_chars(
+                    b.port.as_deref().unwrap_or(&b.fqbn),
+                    28,
+                ))),
+        )
+}
+
+/// 注意の印（コアが入っていない基板）
+fn warn_pill(text: &str, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .rounded(px(6.0))
+        .bg(rgba_alpha(theme.yellow, 0.15))
+        .text_size(px(9.5))
+        .text_color(hsla(theme.yellow))
         .child(SharedString::from(text.to_string()))
 }
 
@@ -2045,6 +2726,127 @@ mod tests {
         assert_eq!(visible_runtimes(&rows(9, 7), true).0.len(), 9);
         // 候補 0
         assert_eq!(visible_runtimes(&[], false), (vec![], 0));
+    }
+
+    /// `RunResolve` の `board` 欄の形（#1952 の dispatch が返すもの。Windows の COM ポートを含む）
+    fn sketch_sample() -> Value {
+        json!({
+            "profiles": [{ "profile": "default", "command": "arduino-cli compile", "cwd": "/s/Blink" }],
+            "default_profile": "default",
+            "config": { "runtime": {} },
+            "board": {
+                "sketch": "/s/Blink",
+                "fqbn": "arduino:avr:uno",
+                "name": "Arduino UNO",
+                "port": "COM9",
+                "profile": null,
+                "core_installed": true,
+                "candidates": [
+                    { "fqbn": "arduino:avr:uno", "name": "Arduino Uno", "port": "COM3", "connected": true, "installed": true },
+                    { "fqbn": "arduino:renesas_uno:unor4wifi", "name": "Arduino UNO R4 WiFi", "port": "COM7", "connected": true, "installed": false },
+                ],
+                "ports": [
+                    { "address": "COM3", "label": "COM3", "protocol": "serial", "protocol_label": "Serial Port (USB)", "boards": ["Arduino Uno"] },
+                    { "address": "COM1", "label": "COM1", "protocol": "serial", "protocol_label": "Serial Port", "boards": [] },
+                ],
+                "installed_boards": 3,
+                "matches": [
+                    { "fqbn": "arduino:avr:uno", "name": "Arduino UNO" },
+                    { "fqbn": "arduino:avr:nano", "name": "Arduino Nano" },
+                    { "fqbn": "arduino:avr:mega", "name": "Arduino Mega or Mega 2560" },
+                ],
+                "notes": ["注意"],
+                "errors": ["board list: 打ち切った"],
+            },
+        })
+    }
+
+    #[test]
+    fn 基板の欄を写す() {
+        let v = RunView::from_json(&sketch_sample());
+        let b = v.board.expect("board 欄");
+        assert_eq!(b.fqbn.as_deref(), Some("arduino:avr:uno"));
+        assert_eq!(b.label().as_deref(), Some("Arduino UNO"));
+        assert_eq!(b.port.as_deref(), Some("COM9"));
+        assert_eq!(b.candidates.len(), 2);
+        assert_eq!(b.candidates[1].installed, Some(false));
+        let ports = b.ports.unwrap();
+        assert_eq!(
+            ports.iter().map(|p| p.address.as_str()).collect::<Vec<_>>(),
+            vec!["COM3", "COM1"]
+        );
+        assert_eq!(ports[0].detail, "Serial Port (USB) · Arduino Uno");
+        assert_eq!(b.installed.len(), 3);
+        assert!(b.installed.iter().all(|r| r.installed == Some(true)));
+        // 注意と聞けなかった理由はどちらも節の中に出す
+        assert_eq!(
+            b.notes,
+            vec!["注意".to_string(), "board list: 打ち切った".to_string()]
+        );
+
+        // スケッチでないファイル（board = null）は節を出さない・ports が null = 聞けていない
+        assert!(RunView::from_json(&sample()).board.is_none());
+        let mut no_ports = sketch_sample();
+        no_ports["board"]["ports"] = Value::Null;
+        assert!(RunView::from_json(&no_ports).board.unwrap().ports.is_none());
+    }
+
+    #[test]
+    fn 基板を探す欄の絞り込みとenter() {
+        let b = RunView::from_json(&sketch_sample()).board.unwrap();
+        let rows = &b.installed;
+        assert_eq!(filter_boards(rows, "", 8).len(), 3);
+        assert_eq!(filter_boards(rows, "", 2).len(), 2, "上限で打ち切る");
+        assert_eq!(
+            filter_boards(rows, "NANO", 8)
+                .iter()
+                .map(|r| r.fqbn.as_str())
+                .collect::<Vec<_>>(),
+            vec!["arduino:avr:nano"]
+        );
+        assert!(filter_boards(rows, "esp32", 8).is_empty());
+        // 1 件に絞れたらその基板・FQBN そのものならそのまま・当たらなければ打った文字列（dispatch が検める）
+        assert_eq!(board_choice(rows, " nano "), "arduino:avr:nano");
+        assert_eq!(board_choice(rows, "arduino:avr:uno"), "arduino:avr:uno");
+        assert_eq!(board_choice(rows, "arduino"), "arduino");
+        assert_eq!(
+            board_choice(rows, "arduino:renesas_uno:unor4wifi"),
+            "arduino:renesas_uno:unor4wifi"
+        );
+    }
+
+    #[test]
+    fn 基板とポートの欄の書き込み() {
+        let w = build_write(&EditTarget::Board, " arduino:avr:uno ", None).unwrap();
+        assert_eq!(w.board.as_deref(), Some("arduino:avr:uno"));
+        let w = build_write(&EditTarget::Port, "COM3", None).unwrap();
+        assert_eq!(w.port.as_deref(), Some("COM3"));
+        for t in [EditTarget::Board, EditTarget::Port] {
+            assert!(build_write(&t, "  ", None).is_err());
+            assert!(t.writes_sketch());
+        }
+        assert!(!EditTarget::Args.writes_sketch());
+        match (Write {
+            board: Some("arduino:avr:uno".into()),
+            port: Some("COM3".into()),
+            ..Write::default()
+        })
+        .into_request(Path::new("/s/Blink/Blink.ino"))
+        {
+            Request::RunnerDefaults {
+                path,
+                board,
+                port,
+                scope,
+                ..
+            } => {
+                assert_eq!(path.as_deref(), Some("/s/Blink/Blink.ino"));
+                assert_eq!(board.as_deref(), Some("arduino:avr:uno"));
+                assert_eq!(port.as_deref(), Some("COM3"));
+                assert!(scope.is_none(), "基板・ポートは tako の保存先に持たない");
+            }
+            other => panic!("RunnerDefaults ではない: {other:?}"),
+        }
     }
 
     #[test]

@@ -163,6 +163,7 @@ fn resolve_now(
                     path: path.display().to_string(),
                     pane: Some(pane.as_u64()),
                     refresh: false,
+                    boards: None,
                 },
                 PaneOrigin::Cli,
             )

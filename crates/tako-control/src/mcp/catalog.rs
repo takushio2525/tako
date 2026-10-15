@@ -4139,7 +4139,7 @@ pub fn tools() -> Vec<Value> {
             "description": "ファイルの実行プロファイルを解決して返す（実行しない。tako_run の事前確認に使う）。\
                 プロファイル一覧・コマンド・cwd・source・属するプロジェクト（project。notes = 走らせる前の案内）・\
                 実行環境の候補（runtimes: id / manager / label / version / auto / tier）・\
-                走らせるもの（runtime）・項目ごとの実効値と出典（config）を返す。",
+                走らせるもの（runtime）・項目ごとの実効値と出典（config）・.ino の基板とポート（board）を返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4152,6 +4152,7 @@ pub fn tools() -> Vec<Value> {
                         "type": "boolean",
                         "description": "true で道具の場所・版の問い合わせをやり直す",
                     },
+                    "boards": { "type": "string", "description": ".ino の基板を探す語（空 = 全部）" },
                 },
                 "required": ["path"],
                 "additionalProperties": false,
@@ -4196,6 +4197,8 @@ pub fn tools() -> Vec<Value> {
                     },
                     "cwd": { "type": "string", "description": "作業ディレクトリ" },
                     "before": { "type": "string", "description": "実行前コマンド（失敗で本体を止める）" },
+                    "board": { "type": "string", "description": ".ino の基板 FQBN（sketch.yaml へ）" },
+                    "port": { "type": "string", "description": ".ino の書き込みポート" },
                     "ext": {
                         "type": "string",
                         "description": "拡張子（ドットなし・小文字。省略時は全一覧）",

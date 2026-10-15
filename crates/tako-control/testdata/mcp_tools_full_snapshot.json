@@ -5288,10 +5288,14 @@
     "name": "tako_run"
   },
   {
-    "description": "ファイルの実行プロファイルを解決して返す（実行しない。tako_run の事前確認に使う）。プロファイル一覧・コマンド・cwd・source・属するプロジェクト（project。notes = 走らせる前の案内）・実行環境の候補（runtimes: id / manager / label / version / auto / tier）・走らせるもの（runtime）・項目ごとの実効値と出典（config）を返す。",
+    "description": "ファイルの実行プロファイルを解決して返す（実行しない。tako_run の事前確認に使う）。プロファイル一覧・コマンド・cwd・source・属するプロジェクト（project。notes = 走らせる前の案内）・実行環境の候補（runtimes: id / manager / label / version / auto / tier）・走らせるもの（runtime）・項目ごとの実効値と出典（config）・.ino の基板とポート（board）を返す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "boards": {
+          "description": ".ino の基板を探す語（空 = 全部）",
+          "type": "string"
+        },
         "pane": {
           "description": "相対パス解決の基準ペイン ID（省略時は呼び出し元）",
           "minimum": 0,
@@ -5326,6 +5330,10 @@
           "description": "実行前コマンド（失敗で本体を止める）",
           "type": "string"
         },
+        "board": {
+          "description": ".ino の基板 FQBN（sketch.yaml へ）",
+          "type": "string"
+        },
         "command": {
           "description": "設定するコマンドテンプレート（変数展開 ${fileBase} 等が使える）",
           "type": "string"
@@ -5350,6 +5358,10 @@
         },
         "path": {
           "description": "実行設定の対象ファイル（相対は呼び出し元ペインの cwd 基準）",
+          "type": "string"
+        },
+        "port": {
+          "description": ".ino の書き込みポート",
           "type": "string"
         },
         "profile": {

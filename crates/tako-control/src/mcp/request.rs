@@ -1505,6 +1505,8 @@ pub(super) fn build_request(
             path: str_arg(args, "path")?.ok_or("path を指定する")?,
             pane: u64_arg(args, "pane")?.or(caller),
             refresh: bool_arg(args, "refresh")?.unwrap_or(false),
+            // #1952: `.ino` の基板を探す語（空 = 全部）
+            boards: str_arg(args, "boards")?,
         },
         "tako_run_defaults" => Request::RunnerDefaults {
             ext: str_arg(args, "ext")?,
@@ -1522,6 +1524,9 @@ pub(super) fn build_request(
             env: env_map_arg(args, "env")?,
             cwd: str_arg(args, "cwd")?,
             before: str_arg(args, "before")?,
+            // #1952: `.ino` の基板とポート（sketch.yaml へ arduino-cli board attach で書く）
+            board: str_arg(args, "board")?,
+            port: str_arg(args, "port")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })

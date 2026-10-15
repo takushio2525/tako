@@ -210,10 +210,11 @@ pub mod notes {
     );
 
     /// #1950。Code Runner の解決と実行は実測済みだが、Arduino のスケッチが使う arduino-cli の
-    /// Arduino IDE 同梱の置き場（`app_bundle::ARDUINO_IDE` の Windows の列）は実機で見ていない
+    /// Arduino IDE 同梱の置き場（`app_bundle::ARDUINO_IDE` の Windows の列）は実機で見ていない。
+    /// #1952 の基板とポートの選択（`board attach` / `board list` の COM ポート）も macOS の単体で固定しただけ
     pub const WIN_RUN_ARDUINO_UNVERIFIED: Note = Note::new(
-        "宣言・拡張子既定・プロジェクト既定の解決と実行は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）は Windows 実機で未確認（#1950）",
-        "Resolving and running declarations, extension defaults and project defaults works, but for Arduino sketches (.ino) the lookup of the arduino-cli bundled with Arduino IDE (%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…) and upload ports (COM3 etc.) have not been verified on real Windows (#1950)",
+        "宣言・拡張子既定・プロジェクト既定の解決と実行・実行設定の保存は動くが、Arduino のスケッチ（.ino）が使う arduino-cli のうち Arduino IDE 同梱の置き場（%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…）の探索と、書き込み先のポート（COM3 等）・基板とポートの選択（arduino-cli board attach）は Windows 実機で未確認（#1950 / #1952）",
+        "Resolving and running declarations, extension defaults and project defaults and saving run configs work, but for Arduino sketches (.ino) the lookup of the arduino-cli bundled with Arduino IDE (%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…), upload ports (COM3 etc.) and selecting the board and port (arduino-cli board attach) have not been verified on real Windows (#1950 / #1952)",
     );
 
     /// #1057。検出は両 OS で動くが、パッケージ導入の代行は brew（macOS）だけ
@@ -1515,9 +1516,11 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_run_defaults",
         macos: Support::Supported,
-        windows: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_RUN_ARDUINO_UNVERIFIED,
+        },
         windows_evidence: Evidence::UnitTest(
-            "拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑。組み込み既定は #1655 で OS 別の表になり、Windows の列（41 拡張子中 36 件）を macOS の単体から解決結果ごと固定している",
+            "拡張子既定の登録・削除・一覧は設定ファイル I/O だけで、単体が実機で緑。組み込み既定は #1655 で OS 別の表になり、Windows の列（41 拡張子中 36 件）を macOS の単体から解決結果ごと固定している。#1952 の .ino の基板とポート（board list の COM ポート・board attach の argv・PowerShell の core install の案内）は macOS の単体で固定しただけ",
         ),
     },
     Feature {
