@@ -11693,7 +11693,7 @@ impl TakoApp {
             })
             .and_then(|p| p.spawned_by());
         match tab.tree_mut().close(pane_id) {
-            Ok(_) => {
+            Ok(closed_pane) => {
                 // Issue #165: worker が抜けた領域を残りの worker で再配分する
                 // （master・ユーザー由来ペインの矩形は変わらない）
                 if let Some(anchor) = reflow_anchor {
@@ -11705,6 +11705,9 @@ impl TakoApp {
                     // 借りているので予約だけ置き、次の render で当て直す
                     reflow_refit = true;
                 }
+                // #2133: 引き継ぎの前任 master なら、その worker の spawn 元を後任へ付け替える
+                // （× / exit で閉じても dispatch の Close と同じ 1 実装。master 以外は no-op）
+                let _ = self.workspace.hand_over_spawned(&closed_pane);
                 // ペインログの最終フラッシュ（Issue #112 B。セッション破棄前に書き残す）
                 if let Some(data) = log_close {
                     self.apply_pane_log_close(pane_id, data, reason);

@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pane::{Pane, PaneId};
-use crate::pane_tree::{PaneTreeError, SplitDirection};
+use crate::pane_tree::{PaneTree, PaneTreeError, SplitDirection};
 use crate::tab::{Tab, TabId};
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -800,6 +800,63 @@ impl Workspace {
             .collect()
     }
 
+    /// 閉じた master の spawn 元の役目を後任 master へ引き渡す（#2133）。
+    ///
+    /// 引き継ぎ（#749 / #917）の後任は `spawned_by = 前任` で立つ。前任を閉じたあとも前任を
+    /// 指したままの worker は誰の worker 領域にも入らないので、後任から spawn すると後任自身が
+    /// 割られていた（引き継ぎを 2 回重ねると、木の中の判定 = `PaneTree::spawn_owners` では
+    /// 閉じた前任の先を辿れない）。`closed`（閉じた直後のペイン）が master の role で、
+    /// それを `spawned_by` に持つ master の role のペイン（= 後任）がちょうど 1 枚あるとき:
+    ///
+    /// - `closed` を指していたほかのペイン（worker）の spawn 元を後任へ付け替える
+    /// - 後任の spawn 元を `closed` の spawn 元へ繋ぎ直す（多くは None = 後任が系統の根になる）
+    ///
+    /// 表示中のタブ・退避タブ・退避ペインのすべてを見る。後任が居ない・特定できないときは
+    /// 何もしない（`TAKO_2133_LEGACY=1` も）。戻り値は付け替えた先の後任
+    pub fn hand_over_spawned(&mut self, closed: &Pane) -> Option<PaneId> {
+        if crate::spawn_layout::issue2133_legacy() || !closed.role().is_some_and(is_master_role) {
+            return None;
+        }
+        let closed_id = closed.id();
+        let mut successors = self
+            .tabs
+            .iter()
+            .map(Tab::tree)
+            .chain(self.shelved_tabs.iter().map(|t| t.tab.tree()))
+            .flat_map(PaneTree::panes)
+            .chain(self.shelved.iter().map(BackgroundPane::pane))
+            .filter(|p| p.spawned_by() == Some(closed_id) && p.role().is_some_and(is_master_role))
+            .map(Pane::id);
+        let successor = successors.next()?;
+        if successors.next().is_some() {
+            return None;
+        }
+        let relink = |p: &mut Pane| {
+            if p.id() == successor {
+                p.set_spawned_by(closed.spawned_by());
+            } else if p.spawned_by() == Some(closed_id) {
+                p.set_spawned_by(Some(successor));
+            }
+        };
+        let trees = self
+            .tabs
+            .iter_mut()
+            .map(Tab::tree_mut)
+            .chain(self.shelved_tabs.iter_mut().map(|t| t.tab.tree_mut()));
+        for tree in trees {
+            let ids: Vec<PaneId> = tree.panes().iter().map(|p| p.id()).collect();
+            for id in ids {
+                if let Some(p) = tree.get_mut(id) {
+                    relink(p);
+                }
+            }
+        }
+        for bp in &mut self.shelved {
+            relink(&mut bp.pane);
+        }
+        Some(successor)
+    }
+
     /// バックグラウンドのペイン 1 本を由来つきで引く（平坦な退避 + 退避タブ配下）。
     /// 返すのは (ペイン, 由来タブ ID, 由来タブ名)
     pub fn background_pane(&self, pane_id: PaneId) -> Option<(&Pane, TabId, &str)> {
@@ -1297,6 +1354,159 @@ mod tests {
         assert_eq!(ids(&ws, m), want);
         assert!(is_master_role("master:sol") && !is_master_role("worker:a"));
         assert!(is_worker_role("worker:a") && !is_worker_role("orchestrator-master"));
+    }
+
+    // --- #2133: 前任 master を閉じたときの spawn 元の引き渡し ---
+
+    fn with_2133_arm<R>(legacy: bool, f: impl FnOnce() -> R) -> R {
+        crate::spawn_layout::ISSUE2133_FORCE_LEGACY.with(|c| c.set(Some(legacy)));
+        let out = f();
+        crate::spawn_layout::ISSUE2133_FORCE_LEGACY.with(|c| c.set(None));
+        out
+    }
+
+    fn ratio03() -> crate::spawn_layout::SpawnLayoutConfig {
+        crate::spawn_layout::SpawnLayoutConfig {
+            master_ratio: 0.3,
+            ..Default::default()
+        }
+    }
+
+    /// dispatch の spawn と同じ手順で、`anchor` から worker を 1 体置く
+    fn spawn_worker(ws: &mut Workspace, tab: TabId, anchor: PaneId) -> PaneId {
+        let tree = ws.get_tab_mut(tab).unwrap().tree_mut();
+        let id = tree
+            .spawn_worker(anchor, pane(), &ratio03())
+            .expect("spawn できる");
+        let p = tree.get_mut(id).unwrap();
+        p.set_spawned_by(Some(anchor));
+        p.set_role(Some("orchestrator-worker:p".into()));
+        id
+    }
+
+    /// dispatch の handoff と同じ手順（前任を右分割 + `spawned_by = 前任` + master の role）
+    fn handoff(ws: &mut Workspace, tab: TabId, previous: PaneId) -> PaneId {
+        let successor = with_role("orchestrator-master:dev", Some(previous));
+        let id = successor.id();
+        ws.get_tab_mut(tab)
+            .unwrap()
+            .tree_mut()
+            .split(previous, SplitDirection::Right, successor)
+            .unwrap();
+        id
+    }
+
+    /// dispatch の Close と同じ手順（木から外す → 引き渡し）
+    fn close_master(ws: &mut Workspace, tab: TabId, id: PaneId) -> Option<PaneId> {
+        let closed = ws.get_tab_mut(tab).unwrap().tree_mut().close(id).unwrap();
+        ws.hand_over_spawned(&closed)
+    }
+
+    fn spawned_by_of(ws: &Workspace, id: PaneId) -> Option<PaneId> {
+        ws.tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .chain(ws.all_background_panes())
+            .find(|p| p.id() == id)
+            .and_then(Pane::spawned_by)
+    }
+
+    fn rect_x_width(ws: &Workspace, tab: TabId, id: PaneId) -> (f32, f32) {
+        let rects = ws.get_tab(tab).unwrap().tree().layout(crate::Rect::UNIT);
+        let r = rects.iter().find(|(p, _)| *p == id).unwrap().1;
+        (r.x, r.width)
+    }
+
+    /// 引き継ぎを 2 回重ねても（A → B → C）、A が spawn した worker は後任の領域に残り、
+    /// 後任からの spawn は右の worker 領域へ入る。タブを跨いだ worker と退避中の worker も移る
+    #[test]
+    fn issue2133_前任を閉じるとworkerのspawn元が後任へ移り引き継ぎを重ねても切れない() {
+        with_2133_arm(false, || {
+            let a_pane = with_role("orchestrator-master:dev", None);
+            let a = a_pane.id();
+            let mut ws = Workspace::new("main", a_pane);
+            let tab = ws.active_tab_id();
+            let w1 = spawn_worker(&mut ws, tab, a);
+            let w2 = spawn_worker(&mut ws, tab, a);
+            // 別タブへ移した worker と、退避中の worker（どちらも A を指す）
+            let far = with_role("orchestrator-worker:p", Some(a));
+            let far_id = far.id();
+            ws.create_tab("other", far);
+            let bg = with_role("orchestrator-worker:p", Some(a));
+            let bg_id = bg.id();
+            ws.create_tab("bg", bg);
+            ws.shelve_pane(bg_id).unwrap();
+
+            let b = handoff(&mut ws, tab, a);
+            assert_eq!(close_master(&mut ws, tab, a), Some(b));
+            for id in [w1, w2, far_id, bg_id] {
+                assert_eq!(spawned_by_of(&ws, id), Some(b), "pane {id} が後任へ移る");
+            }
+            assert_eq!(spawned_by_of(&ws, b), None, "後任が系統の根になる");
+
+            let c = handoff(&mut ws, tab, b);
+            assert_eq!(close_master(&mut ws, tab, b), Some(c));
+            assert_eq!(spawned_by_of(&ws, w1), Some(c));
+            assert_eq!(spawned_by_of(&ws, c), None);
+
+            let n1 = spawn_worker(&mut ws, tab, c);
+            let (cx, cw) = rect_x_width(&ws, tab, c);
+            assert!(cx.abs() < 1e-4 && (cw - 0.3).abs() < 1e-4, "C は 0.3: {cw}");
+            for id in [w1, w2, n1] {
+                let (x, _) = rect_x_width(&ws, tab, id);
+                assert!(x >= 0.3 - 1e-4, "pane {id} は worker 領域: x={x}");
+            }
+        });
+    }
+
+    /// A/B の対照: 旧挙動では引き渡さず、引き継ぎを重ねると後任からの spawn が後任を割る
+    #[test]
+    fn issue2133_旧挙動は引き渡さず後任が割られる() {
+        with_2133_arm(true, || {
+            let a_pane = with_role("orchestrator-master:dev", None);
+            let a = a_pane.id();
+            let mut ws = Workspace::new("main", a_pane);
+            let tab = ws.active_tab_id();
+            let w1 = spawn_worker(&mut ws, tab, a);
+            let b = handoff(&mut ws, tab, a);
+            assert_eq!(close_master(&mut ws, tab, a), None);
+            assert_eq!(spawned_by_of(&ws, w1), Some(a), "閉じた A を指したまま");
+            let c = handoff(&mut ws, tab, b);
+            assert_eq!(close_master(&mut ws, tab, b), None);
+            let _n1 = spawn_worker(&mut ws, tab, c);
+            let (_, cw) = rect_x_width(&ws, tab, c);
+            assert!((cw - 0.09).abs() < 1e-4, "C が 0.3 × 0.3 へ割られる: {cw}");
+        });
+    }
+
+    /// 引き渡すのは「閉じたのが master で、後任 master がちょうど 1 枚」のときだけ
+    #[test]
+    fn issue2133_後任が決まらなければ引き渡さない() {
+        with_2133_arm(false, || {
+            let a_pane = with_role("orchestrator-master:dev", None);
+            let a = a_pane.id();
+            let mut ws = Workspace::new("main", a_pane);
+            let tab = ws.active_tab_id();
+            let w1 = spawn_worker(&mut ws, tab, a);
+            // worker を閉じても何も起きない（master ではない）
+            let w2 = spawn_worker(&mut ws, tab, a);
+            let closed = ws.get_tab_mut(tab).unwrap().tree_mut().close(w2).unwrap();
+            assert_eq!(ws.hand_over_spawned(&closed), None);
+            // 後任が 2 枚（どちらへ寄せるか決められない）
+            let b = handoff(&mut ws, tab, a);
+            let c = handoff(&mut ws, tab, a);
+            assert_eq!(close_master(&mut ws, tab, a), None);
+            assert_eq!(spawned_by_of(&ws, w1), Some(a));
+            assert_eq!(spawned_by_of(&ws, b), Some(a));
+            assert_eq!(spawned_by_of(&ws, c), Some(a));
+            // 後任の居ない master を閉じても worker の spawn 元は変えない
+            let m_pane = with_role("orchestrator-master:other", None);
+            let m = m_pane.id();
+            let m_tab = ws.create_tab("m", m_pane);
+            let mw = spawn_worker(&mut ws, m_tab, m);
+            assert_eq!(close_master(&mut ws, m_tab, m), None);
+            assert_eq!(spawned_by_of(&ws, mw), Some(m));
+        });
     }
 
     #[test]

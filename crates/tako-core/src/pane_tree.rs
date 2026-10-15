@@ -683,30 +683,110 @@ impl PaneTree {
     /// 矩形は変わらない。worker 領域が無い（全 worker が閉じた・anchor が消えた等）
     /// 場合は何もせず false を返す
     pub fn reflow_workers(&mut self, anchor: PaneId, algorithm: WorkerLayoutAlgorithm) -> bool {
-        if !self.contains(anchor) {
+        // #2133: 前任 master を指したまま残った worker を閉じたときは、後任の領域を組み直す
+        let Some(anchor) = self.live_spawn_anchor(anchor) else {
             return false;
-        }
+        };
         self.rebuild_worker_area(anchor, &mut None, algorithm)
     }
 
+    /// `anchor` と同じ worker 領域の持ち主として扱うペイン（`anchor` 自身を含む。#2133）。
+    ///
+    /// master の引き継ぎ（#749 / #917）の後任は前任の右に `spawned_by = 前任` で立ち、前任の
+    /// worker は前任を指したまま残る。後任から見ると「自分から spawn された worker」が 1 体も
+    /// 無いので worker 領域を見つけられず、後任自身を右分割して master を潰していた。
+    /// そこで `anchor` が master の role なら、spawn 元を **生きている master の role のペイン**か
+    /// **閉じたペイン**まで辿り、その worker も `anchor` の worker として扱う。閉じたペインの先は
+    /// 木に残っていないので辿れない（引き継ぎが重なっても切れないように、前任を閉じた時点で
+    /// worker の spawn 元を後任へ付け替える = [`crate::Workspace::hand_over_spawned`]）
+    fn spawn_owners(&self, anchor: PaneId) -> std::collections::HashSet<PaneId> {
+        let mut owners = std::collections::HashSet::from([anchor]);
+        if crate::spawn_layout::issue2133_legacy() {
+            return owners;
+        }
+        let mut cur = self.get(anchor);
+        while let Some(pane) = cur {
+            if !pane.role().is_some_and(crate::workspace::is_master_role) {
+                break;
+            }
+            let Some(parent) = pane.spawned_by() else {
+                break;
+            };
+            match self.get(parent) {
+                // 閉じたペイン: その worker を引き継ぐが、その先は辿れない
+                None => {
+                    owners.insert(parent);
+                    break;
+                }
+                // 前任 master（まだ閉じていない）: その worker も引き継ぐ。循環は打ち切る
+                Some(p) if p.role().is_some_and(crate::workspace::is_master_role) => {
+                    if !owners.insert(parent) {
+                        break;
+                    }
+                    cur = Some(p);
+                }
+                // master でない分割元（`handoff --tab` のフォーカスペイン等）は持ち主にしない
+                Some(_) => break,
+            }
+        }
+        owners
+    }
+
+    /// spawn 元 `anchor` を、この木に居る持ち主へ読み替える（#2133）。
+    ///
+    /// 生きていればそのまま。閉じていれば、それを [`Self::spawn_owners`] に含む master が
+    /// ちょうど 1 枚のときだけその master を返す（引き継ぎの前に保存した木の復元などで、
+    /// 前任を指したまま残った worker を閉じたときのリフロー・フォントの当て直しのため）
+    fn live_spawn_anchor(&self, anchor: PaneId) -> Option<PaneId> {
+        if self.contains(anchor) {
+            return Some(anchor);
+        }
+        if crate::spawn_layout::issue2133_legacy() {
+            return None;
+        }
+        let mut heirs = self
+            .panes()
+            .into_iter()
+            .filter(|p| p.role().is_some_and(crate::workspace::is_master_role))
+            .map(|p| p.id())
+            .filter(|&id| self.spawn_owners(id).contains(&anchor));
+        let heir = heirs.next()?;
+        heirs.next().is_none().then_some(heir)
+    }
+
     /// `anchor` から spawn されたペイン（`spawned_by` チェーンが anchor へ到達するもの）の集合。
-    /// 保存データ破損による循環は打ち切る
+    /// 保存データ破損による循環は打ち切る。
+    ///
+    /// #2133: 到達先は `anchor` の持ち主（[`Self::spawn_owners`] = 引き継いだ前任を含む）で、
+    /// master の role のペイン（引き継ぎの後任・前任）は worker に数えない
     fn spawn_descendants_of(&self, anchor: PaneId) -> std::collections::HashSet<PaneId> {
         use std::collections::{HashMap, HashSet};
-        let spawn_map: HashMap<PaneId, Option<PaneId>> = self
-            .panes()
-            .iter()
-            .map(|p| (p.id(), p.spawned_by()))
-            .collect();
+        let legacy = crate::spawn_layout::issue2133_legacy();
+        let owners = self.spawn_owners(anchor);
+        let panes = self.panes();
+        let spawn_map: HashMap<PaneId, Option<PaneId>> =
+            panes.iter().map(|p| (p.id(), p.spawned_by())).collect();
+        let masters: HashSet<PaneId> = if legacy {
+            HashSet::new()
+        } else {
+            panes
+                .iter()
+                .filter(|p| p.role().is_some_and(crate::workspace::is_master_role))
+                .map(|p| p.id())
+                .collect()
+        };
         let mut workers: HashSet<PaneId> = HashSet::new();
         for &id in spawn_map.keys() {
+            if owners.contains(&id) || masters.contains(&id) {
+                continue;
+            }
             let mut cur = id;
             let mut seen = HashSet::new();
             while let Some(Some(parent)) = spawn_map.get(&cur).copied() {
                 if !seen.insert(cur) {
                     break; // 保存データ破損などによる循環の防御
                 }
-                if parent == anchor {
+                if owners.contains(&parent) {
                     workers.insert(id);
                     break;
                 }
@@ -725,9 +805,8 @@ impl PaneTree {
     ///
     /// spawn する前に「足したときにどれだけ狭くなるか」を見積もるために使う
     pub fn worker_area_panes(&self, anchor: PaneId) -> Option<Vec<PaneId>> {
-        if !self.contains(anchor) {
-            return None;
-        }
+        // #2133: 閉じた前任 master を渡されたら後任の領域を返す（reflow_workers と同じ読み替え）
+        let anchor = self.live_spawn_anchor(anchor)?;
         let workers = self.spawn_descendants_of(anchor);
         if workers.is_empty() {
             return None;
@@ -778,8 +857,8 @@ impl PaneTree {
 
     /// anchor の worker 領域を見つけ、（あれば `extra` を末尾に加えて）`algorithm` で
     /// 再構築する。worker 領域 = anchor Leaf から根へのパス上で anchor と反対側にあり、
-    /// 全リーフの `spawned_by` チェーンが anchor へ到達するサブツリー
-    /// （anchor に最も近い祖先を優先）。見つからなければ何もせず false
+    /// 全リーフの `spawned_by` チェーンが anchor（と引き継いだ前任 master = #2133）へ到達する
+    /// サブツリー（anchor に最も近い祖先を優先）。見つからなければ何もせず false
     fn rebuild_worker_area(
         &mut self,
         anchor: PaneId,
@@ -1654,6 +1733,226 @@ mod tests {
             assert_rect(&t, ws[2], 0.5, 2.0 * h3, 0.25, h3);
             assert_rect(&t, ws[3], 0.75, 0.0, 0.25, 0.5);
             assert_rect(&t, ws[4], 0.75, 0.5, 0.25, 0.5);
+        }
+
+        // --- #2133: master の引き継ぎの後の配置 ---
+
+        /// Issue の本番と同じ取り分（master 0.3）
+        fn ratio03() -> SpawnLayoutConfig {
+            SpawnLayoutConfig {
+                master_ratio: 0.3,
+                ..grid_config()
+            }
+        }
+
+        /// 腕を決めて走らせる（env はプロセス全体なので thread_local で決める）
+        fn with_arm<R>(legacy: bool, f: impl FnOnce() -> R) -> R {
+            crate::spawn_layout::ISSUE2133_FORCE_LEGACY.with(|c| c.set(Some(legacy)));
+            let out = f();
+            crate::spawn_layout::ISSUE2133_FORCE_LEGACY.with(|c| c.set(None));
+            out
+        }
+
+        /// dispatch の spawn と同じ手順（spawn_worker → spawned_by → worker の role）
+        fn spawn_worker_pane(
+            t: &mut PaneTree,
+            anchor: PaneId,
+            config: &SpawnLayoutConfig,
+        ) -> PaneId {
+            let id = spawn(t, anchor, config);
+            t.get_mut(id)
+                .unwrap()
+                .set_role(Some("orchestrator-worker:p".into()));
+            id
+        }
+
+        /// 引き継ぎ（dispatch の handoff と同じ手順）: 前任のペインを右分割し、
+        /// 後任へ `spawned_by = 前任` と master の role を付ける
+        fn handoff(t: &mut PaneTree, previous: PaneId) -> PaneId {
+            let id = t
+                .split(previous, SplitDirection::Right, Pane::new(PaneOrigin::Mcp))
+                .unwrap();
+            let p = t.get_mut(id).unwrap();
+            p.set_spawned_by(Some(previous));
+            p.set_role(Some("orchestrator-master:dev".into()));
+            id
+        }
+
+        /// master A（role 付き）+ worker 3 体 = Issue の 1. の前の木
+        fn master_with_three(config: &SpawnLayoutConfig) -> (PaneTree, PaneId, [PaneId; 3]) {
+            let (mut t, a) = tree();
+            t.get_mut(a)
+                .unwrap()
+                .set_role(Some("orchestrator-master:dev".into()));
+            let w1 = spawn_worker_pane(&mut t, a, config);
+            let w2 = spawn_worker_pane(&mut t, a, config);
+            let w3 = spawn_worker_pane(&mut t, a, config);
+            (t, a, [w1, w2, w3])
+        }
+
+        /// 閉じて、dispatch の Close と同じく閉じた worker の spawn 元でリフローする
+        fn close_worker(t: &mut PaneTree, id: PaneId, config: &SpawnLayoutConfig) {
+            let anchor = t.get(id).unwrap().spawned_by().unwrap();
+            t.close(id).unwrap();
+            let _ = t.reflow_workers(anchor, config.algorithm);
+        }
+
+        fn assert_in_worker_area(t: &PaneTree, id: PaneId) {
+            let r = rect_of(t, id);
+            assert!(
+                r.x >= 0.3 - 1e-4,
+                "ペイン {id} が master の領域（x < 0.3）に入った: {r:?}"
+            );
+        }
+
+        /// Issue の 1〜5 を木の上で踏む。前任 A を閉じたあと（木の中だけの判定 = 付け替え前に
+        /// 保存した木の復元と同じ形）でも、後任 B からの spawn は worker 領域へ入る
+        #[test]
+        fn issue2133_引き継ぎの後のspawnはworker領域へ入りmasterの取り分が保たれる() {
+            with_arm(false, || {
+                let config = ratio03();
+                let (mut t, a, [w1, w2, w3]) = master_with_three(&config);
+                // 1. 引き継ぎ: A と B で左の 0.3 を分ける
+                let b = handoff(&mut t, a);
+                assert_rect(&t, a, 0.0, 0.0, 0.15, 1.0);
+                assert_rect(&t, b, 0.15, 0.0, 0.15, 1.0);
+                // 2. A を閉じる: B が A の矩形ごと継ぐ
+                t.close(a).unwrap();
+                assert_rect(&t, b, 0.0, 0.0, 0.3, 1.0);
+                // 3. B から spawn → 右の worker 領域の 4 体目（2x2）
+                let n1 = spawn_worker_pane(&mut t, b, &config);
+                assert_rect(&t, b, 0.0, 0.0, 0.3, 1.0);
+                for id in [w1, w2, w3, n1] {
+                    assert_in_worker_area(&t, id);
+                }
+                assert_rect(&t, n1, 0.65, 0.5, 0.35, 0.5);
+                // 4. w1 を閉じる（spawn 元 = 閉じた A）→ 後任 B の領域で組み直す → spawn
+                close_worker(&mut t, w1, &config);
+                assert_rect(&t, w2, 0.3, 0.0, 0.35, 0.5);
+                let n2 = spawn_worker_pane(&mut t, b, &config);
+                assert_rect(&t, b, 0.0, 0.0, 0.3, 1.0);
+                // 5. w2 を閉じる → spawn
+                close_worker(&mut t, w2, &config);
+                let n3 = spawn_worker_pane(&mut t, b, &config);
+                assert_rect(&t, b, 0.0, 0.0, 0.3, 1.0);
+                for id in [w3, n1, n2, n3] {
+                    assert_in_worker_area(&t, id);
+                }
+                // 4 体 = 右の 0.7 を十字に 4 等分（spawn 順）
+                assert_rect(&t, w3, 0.3, 0.0, 0.35, 0.5);
+                assert_rect(&t, n1, 0.3, 0.5, 0.35, 0.5);
+                assert_rect(&t, n2, 0.65, 0.0, 0.35, 0.5);
+                assert_rect(&t, n3, 0.65, 0.5, 0.35, 0.5);
+                // 領域の読み取り（フォントの当て直しの材料）も同じ 4 体。閉じた A を渡しても B の領域
+                let mut area = t.worker_area_panes(b).unwrap();
+                area.sort_unstable_by_key(|id| id.as_u64());
+                assert_eq!(area, vec![w3, n1, n2, n3]);
+                assert_eq!(t.worker_area_panes(a), t.worker_area_panes(b));
+                // 境界: worker を全部閉じた後の spawn は B を右分割して領域を作り直す
+                for id in [w3, n1, n2, n3] {
+                    close_worker(&mut t, id, &config);
+                }
+                assert_rect(&t, b, 0.0, 0.0, 1.0, 1.0);
+                let n4 = spawn_worker_pane(&mut t, b, &config);
+                assert_rect(&t, b, 0.0, 0.0, 0.3, 1.0);
+                assert_rect(&t, n4, 0.3, 0.0, 0.7, 1.0);
+            });
+        }
+
+        /// A/B の対照: 旧挙動では Issue の最終の木
+        /// `X(0.3): [X(0.3): B, X(0.5): [Y: n1 / n2], n3], w3` がそのまま再現する
+        #[test]
+        fn issue2133_旧挙動はissueの最終の木を再現する() {
+            with_arm(true, || {
+                let config = ratio03();
+                let (mut t, a, [w1, w2, w3]) = master_with_three(&config);
+                let b = handoff(&mut t, a);
+                t.close(a).unwrap();
+                let n1 = spawn_worker_pane(&mut t, b, &config);
+                // 3. の時点で B が割られる（0.3 → 0.09）
+                assert_rect(&t, b, 0.0, 0.0, 0.09, 1.0);
+                assert_rect(&t, n1, 0.09, 0.0, 0.21, 1.0);
+                close_worker(&mut t, w1, &config);
+                let n2 = spawn_worker_pane(&mut t, b, &config);
+                close_worker(&mut t, w2, &config);
+                let n3 = spawn_worker_pane(&mut t, b, &config);
+                assert_rect(&t, b, 0.0, 0.0, 0.09, 1.0);
+                assert_rect(&t, n1, 0.09, 0.0, 0.105, 0.5);
+                assert_rect(&t, n2, 0.09, 0.5, 0.105, 0.5);
+                assert_rect(&t, n3, 0.195, 0.0, 0.105, 1.0);
+                assert_rect(&t, w3, 0.3, 0.0, 0.7, 1.0);
+            });
+        }
+
+        /// 境界: 前任 A と後任 B が並んだまま（A を閉じる前）に B から spawn しても
+        /// worker 領域へ入り、A + B の 0.3 は変わらない。A の側から見た領域にも B は入らない
+        #[test]
+        fn issue2133_前任と後任が並んだままのspawnもworker領域へ入る() {
+            with_arm(false, || {
+                let config = ratio03();
+                let (mut t, a, [w1, w2, w3]) = master_with_three(&config);
+                let b = handoff(&mut t, a);
+                let n1 = spawn_worker_pane(&mut t, b, &config);
+                assert_rect(&t, a, 0.0, 0.0, 0.15, 1.0);
+                assert_rect(&t, b, 0.15, 0.0, 0.15, 1.0);
+                for id in [w1, w2, w3, n1] {
+                    assert_in_worker_area(&t, id);
+                }
+                // 前任から見た領域（フォントの当て直しは spawn 元でない master を起点に回る）も
+                // 右の 4 体で、後任 B（master）を worker と取り違えない
+                let mut area = t.worker_area_panes(a).unwrap();
+                area.sort_unstable_by_key(|id| id.as_u64());
+                assert_eq!(area, vec![w1, w2, w3, n1]);
+                // その後 A を閉じても B が 0.3 を継ぎ、次の spawn も右へ
+                t.close(a).unwrap();
+                let n2 = spawn_worker_pane(&mut t, b, &config);
+                assert_rect(&t, b, 0.0, 0.0, 0.3, 1.0);
+                assert_in_worker_area(&t, n2);
+            });
+        }
+
+        /// 閉じた spawn 元を後任へ読み替えるのは**後任が 1 枚に決まるときだけ**
+        /// （同じ前任を指す master が 2 枚なら、どちらの領域も勝手に組み直さない）
+        #[test]
+        fn issue2133_閉じたspawn元の後任が決まらなければ読み替えない() {
+            with_arm(false, || {
+                let config = ratio03();
+                let (mut t, a, [w1, ..]) = master_with_three(&config);
+                let b = handoff(&mut t, a);
+                let c = handoff(&mut t, a);
+                t.close(a).unwrap();
+                assert_eq!(t.worker_area_panes(a), None);
+                assert!(!t.reflow_workers(a, config.algorithm));
+                // それぞれの master から見た領域はある（spawn は右へ入る）
+                assert!(t.worker_area_panes(b).is_some_and(|ids| ids.contains(&w1)));
+                assert!(t.worker_area_panes(c).is_some_and(|ids| ids.contains(&w1)));
+            });
+        }
+
+        /// role の無いペイン（`tako master` を経ないユーザーのペイン）からの spawn は
+        /// これまでどおり spawn 元 1 枚だけで領域を決める（系譜を辿らない）
+        #[test]
+        fn issue2133_masterのroleが無いspawn元は系譜を辿らない() {
+            with_arm(false, || {
+                let config = ratio03();
+                let (mut t, user) = tree();
+                let _w1 = spawn_worker_pane(&mut t, user, &config);
+                // user から右に開いたペイン（spawned_by = user だが master の role ではない）
+                let other = t
+                    .split(user, SplitDirection::Right, Pane::new(PaneOrigin::User))
+                    .unwrap();
+                t.get_mut(other).unwrap().set_spawned_by(Some(user));
+                // other から見て user の worker（w1）は other の worker ではない
+                assert_eq!(
+                    t.spawn_owners(other),
+                    std::collections::HashSet::from([other])
+                );
+                assert!(t.worker_area_panes(other).is_none());
+                // user を閉じても、role の無い other は user の worker を継がない
+                t.close(user).unwrap();
+                assert!(t.worker_area_panes(user).is_none());
+                assert!(t.worker_area_panes(other).is_none());
+            });
         }
     }
 
