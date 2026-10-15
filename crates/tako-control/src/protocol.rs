@@ -2560,6 +2560,18 @@ pub enum Request {
         /// 既定（自動）へ戻す項目名（"all" = 全項目）。`scope` 省略時は両方のスコープから消す
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reset: Option<Vec<String>>,
+        /// 引数（シェルへそのまま渡る 1 本の文字列。`${args}` が無ければ末尾へ足す。#1732）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<String>,
+        /// 環境変数（キー単位で重ねる。値 `null` = そのキーを消す = `scope` 省略時は両方から。#1732）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<std::collections::BTreeMap<String, Option<String>>>,
+        /// 作業ディレクトリ（相対はファイルのディレクトリ基準。#1732）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// 実行前コマンド（失敗したら本体を走らせない。#1732）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
     },
     /// 設定画面の操作（Issue #459）。
     /// `action` = "open"（既定。GUI 設定画面を開く）/ "status"（開いているか + 現在タブ）
@@ -2676,6 +2688,10 @@ impl Request {
             profile: None,
             runtime: None,
             reset: None,
+            args: None,
+            env: None,
+            cwd: None,
+            before: None,
         }
     }
 

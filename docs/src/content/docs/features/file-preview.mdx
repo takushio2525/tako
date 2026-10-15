@@ -388,6 +388,15 @@ tako run-config script.py --runtime env2   # 候補の名前か id（--list の 
 tako run-config script.py --reset runtime  # 自動選択へ戻す
 ```
 
+引数・環境変数・作業ディレクトリ・実行前コマンドも同じコマンドで覚えられます（既定はそのファイルだけ）。
+
+```bash
+tako run-config script.py --args "--verbose data.csv"   # 引数（コマンドの末尾か ${args} の位置へ）
+tako run-config script.py --env APP_ENV=dev             # 環境変数（--unset-env APP_ENV で消す）
+tako run-config script.py --cwd ..                      # 作業ディレクトリ（相対はファイルの場所から）
+tako run-config script.py --before "make build"         # 実行前コマンド（失敗したら本体は走らない）
+```
+
 ## AI からの操作
 
 ```bash

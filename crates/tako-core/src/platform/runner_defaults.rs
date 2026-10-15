@@ -166,33 +166,37 @@ pub const TABLE: &[Entry] = &[
     same("php", "php ${fileBase}"),
     same("lua", "lua ${fileBase}"),
     // ─── コンパイル系（Windows は出力を `.exe`・`&&` を使わない） ──────
+    // 実行設定の引数（`${args}`。#1732）は、テンプレートに無ければ末尾へ足される。
+    // Windows の `; if ($?) { … }` は末尾だと `}` の外 = 構文が壊れるので、ブロックの中に
+    // `${args}` を明示する（`if ($?) {` を含む行は `${args}` を含む = テストが縛る）。
+    // 引数が無ければ `${args}` は直前の空白ごと消えるので、展開結果は今と変わらない
     // `cc` / `c++` は POSIX の総称名で Windows には無い。MinGW-w64 / MSYS2 /
     // w64devkit のどれで入れても `gcc` / `g++` は付いてくるので、そちらを名指す
     // （MSVC の `cl` は開発者コマンドプロンプトの環境変数が要るので既定にしない）
     split(
         "c",
         run("cc ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        run("gcc ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe }"),
+        run("gcc ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }"),
     ),
     split(
         "cpp",
         run("c++ ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        run("g++ ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe }"),
+        run("g++ ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }"),
     ),
     split(
         "cc",
         run("c++ ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        run("g++ ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe }"),
+        run("g++ ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }"),
     ),
     split(
         "cxx",
         run("c++ ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        run("g++ ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe }"),
+        run("g++ ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }"),
     ),
     split(
         "rs",
         run("rustc ${fileBase} -o ${fileNoExt} && ./${fileNoExt}"),
-        run("rustc ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe }"),
+        run("rustc ${fileBase} -o ${fileNoExt}.exe; if ($?) { .\\${fileNoExt}.exe ${args} }"),
     ),
     // ランタイムが走らせる形なので OS 差が無い（`go run` / JEP 330 の単一ファイル実行）
     same("go", "go run ${fileBase}"),
@@ -232,7 +236,7 @@ pub const TABLE: &[Entry] = &[
     split(
         "kt",
         run("kotlinc ${fileBase} -include-runtime -d ${fileNoExt}.jar && java -jar ${fileNoExt}.jar"),
-        run("kotlinc ${fileBase} -include-runtime -d ${fileNoExt}.jar; if ($?) { java -jar ${fileNoExt}.jar }"),
+        run("kotlinc ${fileBase} -include-runtime -d ${fileNoExt}.jar; if ($?) { java -jar ${fileNoExt}.jar ${args} }"),
     ),
     // .NET 10 の file-based apps（`dotnet run app.cs`）。`.csproj` の中なら
     // プロジェクト既定（`dotnet run`。`runner_project` の表 = #1656）が先に効く
@@ -344,6 +348,34 @@ mod tests {
                 "{ext}: 失敗したコンパイルの後でも走ってしまう（`if ($?)` が無い）: {cmd}"
             );
         }
+    }
+
+    /// 「`if ($?) {` を含む行は `${args}` を含む」（#1732）。実行設定の引数はテンプレートに
+    /// `${args}` が無ければ末尾へ足されるので、`}` で終わる行は `}` の外へ付いて構文が壊れる。
+    /// 位置まで見る: `${args}` は最後の `if ($?) {` より後ろ・閉じの `}` より前（ブロックの中）
+    #[test]
+    fn if_dollar_questionを含む行はargsを含む() {
+        let mut checked = 0;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for (ext, cmd) in builtin_defaults(platform) {
+                let Some(open) = cmd.rfind("if ($?) {") else {
+                    continue;
+                };
+                checked += 1;
+                let at = cmd.find(crate::runner::ARGS_VARIABLE).unwrap_or_else(|| {
+                    panic!(
+                        "{platform:?} の .{ext}: `if ($?) {{` があるのに `${{args}}` が無い: {cmd}"
+                    )
+                });
+                let close = cmd.rfind('}').expect("閉じの `}`");
+                assert!(
+                    open < at && at < close,
+                    "{platform:?} の .{ext}: `${{args}}` がブロックの外にある: {cmd}"
+                );
+            }
+        }
+        // c / cpp / cc / cxx / rs / kt の Windows 行（0 件なら走査が空 = 何も縛っていない）
+        assert_eq!(checked, 6, "`if ($?) {{` の行の数");
     }
 
     /// シェルスクリプトの拡張子は**両 OS とも既定を持つ**。

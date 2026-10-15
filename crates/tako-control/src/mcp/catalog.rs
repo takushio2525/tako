@@ -4161,9 +4161,9 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_run_defaults",
             "description": "実行の既定を読み書きする。ext = 拡張子ごとのコマンド（省略で全一覧・ext のみで単一・\
-                command で設定・remove で削除）。path = そのファイル / プロジェクトの実行設定（runtime・profile を\
-                選んで保存、reset で自動へ戻す、項目なしなら読むだけ。応答は config / runtime / runtimes / \
-                runtime_unresolved）。ext と path は排他。",
+                command で設定・remove で削除）。path = そのファイル / プロジェクトの実行設定（runtime・profile・\
+                args・env・cwd・before を保存、reset で自動へ戻す、項目なしなら読むだけ。応答は config / runtime / \
+                runtimes / runtime_unresolved）。ext と path は排他。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4188,6 +4188,14 @@ pub fn tools() -> Vec<Value> {
                         ),
                         "description": "自動・既定へ戻す項目（scope を省くと両方の保存先から）",
                     },
+                    "args": { "type": "string", "description": "引数（${args} が無ければ末尾へ）" },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": "環境変数（null で消す）",
+                    },
+                    "cwd": { "type": "string", "description": "作業ディレクトリ" },
+                    "before": { "type": "string", "description": "実行前コマンド（失敗で本体を止める）" },
                     "ext": {
                         "type": "string",
                         "description": "拡張子（ドットなし・小文字。省略時は全一覧）",

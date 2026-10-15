@@ -5334,9 +5334,10 @@ impl TakoApp {
                 &settings.runner_defaults,
                 None,
                 None,
-                // 一覧の表示用（実行は dispatch `Run` が実行環境を重ねる。一覧を RunResolve へ
-                // 寄せるのは #1726 S5）
+                // 一覧の表示用（実行は dispatch `Run` が実行環境・実行設定を重ねる。一覧を
+                // RunResolve へ寄せるのは #1726 S5）
                 &runner::RuntimeWords::new(),
+                &runner::ConfigLayer::default(),
             ) {
                 Ok(resolution) => {
                     self.preview_run_profiles

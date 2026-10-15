@@ -206,6 +206,19 @@ impl RunConfig {
     }
 }
 
+/// 環境変数の名前として受けるか（`[A-Za-z_][A-Za-z0-9_]*`。#1732）。
+///
+/// 名前はコマンド文字列の `export <名前>=…` / `$env:<名前> = …` へそのまま入る
+/// （`platform::shell::compose_run_script`）ので、識別子でない名前は保存も実行もしない
+/// （`A=1; rm -rf ~; B` のような名前がシェルの文へ化けない）
+pub fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// 値の出どころ（UI の出典タグ・応答の `source`）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldSource {
@@ -585,6 +598,26 @@ mod tests {
             RunConfigField::parse_reset(&["runtime".into(), "nope".into()]),
             Err("nope".to_string())
         );
+    }
+
+    #[test]
+    fn 環境変数の名前は識別子だけ() {
+        for ok in ["A", "APP_ENV", "_x", "a1", "PATH"] {
+            assert!(valid_env_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "1A",
+            "A-B",
+            "A B",
+            "A=1",
+            "A;B",
+            "Ａ",
+            "$A",
+            "A=1; rm -rf ~; B",
+        ] {
+            assert!(!valid_env_name(bad), "{bad}");
+        }
     }
 
     #[test]
