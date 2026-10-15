@@ -21,7 +21,9 @@
 #   止まらないよう TAKO_QUEUE_PROBE_TIMEOUT 秒（既定 10）で切る（perl の alarm。perl が無ければ切らない）
 # - tako が無い（CI）・順番待ちを知る tako が見つからない・入れ子（TAKO_QUEUE_JOB がある = 既に枠の中）・
 #   TAKO_NO_QUEUE=1 のときは、そのまま走らせる
-# - tako が起動していなければ `tako queue` 自身が待たずに走らせる（fail-open）
+# - tako が起動していなければ `tako queue` 自身が待たずに走らせる（fail-open）。繋がったまま返事を
+#   しない GUI（固まった夜 = #2002 / #1976）も `tako queue` が 1 往復の上限（30 秒）で切って待たずに走らせ、
+#   待ちの途中なら 60 秒で走らせる（#2123）。ここでは何もしない = 終了コードはコマンドのまま返る
 # - テストは TAKO_QUEUE_FALLBACKS を空（= PATH だけ）か偽の置き場へ差し替える。
 #   A/B は TAKO_2119_LEGACY=1（PATH の先頭の tako だけを見る = 修正前）
 #

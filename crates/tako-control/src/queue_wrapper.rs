@@ -17,6 +17,12 @@
 //!   調停役でない tako（隔離 / 旧版で順番待ちを知らない）に当たったときも同じ
 //! - 待ちの途中で調停役へ繋がらなくなったら 1 → 5 秒で繋ぎ直し、[`LOST_GRACE`] を過ぎたら走る。
 //!   繋ぎ直した先へは元の受付時刻で登録し直る（正本はこちら）
+//! - 繋がったまま応答しない調停役（GUI が固まった。#2123）は 1 往復の上限
+//!   （`protocol::QUEUE_REPLY_TIMEOUT` = 30 秒）で切れて「届かない」と同じに扱う: 受付なら待たずに走り、
+//!   待ちの途中なら [`LOST_GRACE`]（失敗した往復を始めた時刻から数える）を過ぎたら走る。
+//!   待ちそのものは 1 秒ごとの短い往復の連続なので、応答が届いている限り長い待ちは切れない。
+//!   届かなくても構わない心拍（`started`）と `done` は `protocol::QUEUE_NOTIFY_REPLY_TIMEOUT`（5 秒）で
+//!   切る（子の終わり・シグナル・自分の終了を固まった GUI に待たせない）
 //! - 実行中に調停役が居なくなっても子は止めない（繋がったら子の pid で登録し直す）
 //! - 待ちの上限（既定 30 分・`--max-wait`）で 75、待ちの取り消しで 125、Ctrl+C / 親の SIGTERM で
 //!   128 + 番号（待ちから外れて終わる）。実行中のシグナルは子へ転送する
@@ -54,6 +60,8 @@ const CHILD_TICK: Duration = Duration::from_millis(100);
 pub enum SendError {
     /// 調停役（tako）へ届かない
     Unreachable(String),
+    /// 繋がったが上限まで応答が来ない（調停役の GUI が固まっている。#2123）。値は待った上限
+    Timeout(Duration),
     /// 届いたが断られた（調停役でない tako・旧版で順番待ちを知らない・引数の誤り）
     Rejected(String),
 }
@@ -334,6 +342,13 @@ fn run_with(
             note("tako が起動していないので、順番待ちせずに走らせる");
             return run_direct(argv);
         }
+        Err(SendError::Timeout(limit)) => {
+            note(&format!(
+                "tako が {} 秒応答しないので、順番待ちせずに走らせる（GUI が固まっている可能性）",
+                limit.as_secs()
+            ));
+            return run_direct(argv);
+        }
         Err(SendError::Rejected(m)) => {
             note(&format!(
                 "順番待ちを受けていない（{m}）ので、そのまま走らせる"
@@ -388,17 +403,24 @@ fn run_with(
             ));
             return q::EXIT_MAX_WAIT;
         }
+        // 見失った時刻は「失敗した往復を始めた時刻」（応答しない調停役は 1 往復が上限まで
+        // かかるので、終わった時刻から数えると猶予が上限の分だけ伸びる。#2123）
+        let polled_at = Instant::now();
         match send(request("poll", &wire)) {
             Ok(v) => {
                 resp = v;
                 lost_since = None;
                 attempts = 0;
             }
-            Err(SendError::Unreachable(_)) => {
-                let since = *lost_since.get_or_insert_with(Instant::now);
+            Err(failure @ (SendError::Unreachable(_) | SendError::Timeout(_))) => {
+                let since = *lost_since.get_or_insert(polled_at);
                 if since.elapsed() >= LOST_GRACE {
                     display.finish(None);
-                    note("順番待ちの調停役を見失ったまま 60 秒たったので、待たずに走らせる");
+                    note(if matches!(failure, SendError::Timeout(_)) {
+                        "順番待ちの調停役が応答しないまま 60 秒たったので、待たずに走らせる"
+                    } else {
+                        "順番待ちの調停役を見失ったまま 60 秒たったので、待たずに走らせる"
+                    });
                     return run_direct(argv);
                 }
                 std::thread::sleep(reconnect_delay(attempts).saturating_sub(POLL_INTERVAL));
@@ -454,9 +476,12 @@ fn run_with(
             signals::forward(child.id(), sig);
         }
         if Instant::now() >= next_beat {
-            next_beat = Instant::now() + HEARTBEAT_INTERVAL;
             // 届かなくても子は止めない（繋がったら子の pid で登録し直る）
-            if let Ok(v) = send(request("started", &wire)) {
+            let beat = send(request("started", &wire));
+            // 次の心拍は往復が終わってから数える（応答しない調停役で 1 往復が上限まで
+            // かかっても、次の心拍までの間は子の終わりとシグナルを見られる。#2123）
+            next_beat = Instant::now() + HEARTBEAT_INTERVAL;
+            if let Ok(v) = beat {
                 if v["cancel"] == true && cancel_at.is_none() {
                     note("取り消されたので子を止める（SIGTERM → 10 秒で SIGKILL）");
                     tree::terminate(&mut child, false);
@@ -694,6 +719,54 @@ mod tests {
         );
         // 待たなかったことは「受付の 1 回で諦めた」= 再試行も poll もしていないことで見る
         assert_eq!(calls, 1, "受付の 1 回だけ");
+    }
+
+    /// 繋がったまま応答しない調停役（#2123）も待たずに走り、子の終了コードを素通しする
+    #[cfg(unix)]
+    #[test]
+    fn 応答しなければ待たずに走る() {
+        let argv: Vec<String> = ["sh", "-c", "exit 8"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut calls = 0;
+        let mut send = |_req: Request| -> Result<Value, SendError> {
+            calls += 1;
+            Err(SendError::Timeout(Duration::from_secs(30)))
+        };
+        assert_eq!(
+            run_with(&argv, &Options::default(), &mut send, false, &|_| false),
+            8
+        );
+        assert_eq!(calls, 1, "受付の 1 回で諦める（done も送らない）");
+    }
+
+    /// 実行中の心拍が応答しなくても子は止めず、終わりまで走らせて done を送る（#2123）
+    #[cfg(unix)]
+    #[test]
+    fn 実行中に応答しなくなっても子は走りきる() {
+        let argv: Vec<String> = ["sh", "-c", "sleep 0.3; exit 6"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut actions: Vec<String> = Vec::new();
+        let mut send = |req: Request| -> Result<Value, SendError> {
+            let Request::Queue { action, .. } = &req else {
+                panic!()
+            };
+            let action = action.clone().unwrap_or_default();
+            actions.push(action.clone());
+            match action.as_str() {
+                "enqueue" => Ok(json!({ "state": "granted", "share": 0 })),
+                _ => Err(SendError::Timeout(Duration::from_millis(10))),
+            }
+        };
+        assert_eq!(
+            run_with(&argv, &Options::default(), &mut send, false, &|_| false),
+            6
+        );
+        assert_eq!(actions.first().map(String::as_str), Some("enqueue"));
+        assert_eq!(actions.last().map(String::as_str), Some("done"));
     }
 
     #[test]
