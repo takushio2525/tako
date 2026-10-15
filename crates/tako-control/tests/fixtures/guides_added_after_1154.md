@@ -336,3 +336,13 @@ call it with `TAKO_ORCHESTRATOR_ROLE=master:<profile>` so the reply has an addre
    interact-or-higher device can run it after one confirmation, so it works while the
    user is away from the PC too. Running the same command again is refused while its
    previous run is still going; `action: "list"` reports each command's run state.
+
+<!-- #2120: master のタブ名はプロジェクト名か作業の主題（役割名・「活動の短い句」ではなく）。 -->
+<!-- 旧い 3 行（"a short phrase describing the activity" と例）は意図して消し、 -->
+<!-- system_prompt_before_1154.md からも同じ PR で外した。behavior の項目 10 へ足した本文 -->
+   Name it after the project ("tako", "my-site"), or after
+   the subject when one repository spans several (a course such as "アジャイル"
+   or "数理モデリング" in a lecture-notes repo). A dedicated master's tab starts
+   with its project's name, and a generic master's tab gets it on `adopt`.
+   Do not use profile names or role names as tab titles — those are already
+   visible elsewhere. `source: "auto"` never overwrites a name the user set.

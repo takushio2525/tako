@@ -5059,10 +5059,10 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     std::fs::write(&prompt_path, &prompt_content)
         .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
 
-    let tab_title = match suffix {
-        Some(s) => format!("master-{s}"),
-        None => "master".into(),
-    };
+    // #2120: タブ名は管轄プロジェクトの名前を**自動名で**付ける（汎用 master は触らない）。
+    // 役割名（`master` / `master-<名前>`）を手動名で付けると、master 自身の
+    // `tako_rename_tab(source: "auto")` が全部弾かれてタブ名が固定される
+    let tab_naming = orchestrator::master_launch::tab_naming(suffix.unwrap_or("default"), &profile);
 
     let role = match suffix {
         Some(s) => format!("orchestrator-master:{s}"),
@@ -5078,7 +5078,8 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）: 新タブ起動
-    let target = resolve_launch_target(&tab_title, use_tab, &master_cmd_hint(profile_name))?;
+    let target =
+        resolve_launch_target(tab_naming.as_ref(), use_tab, &master_cmd_hint(profile_name))?;
     let pane_id = target.pane;
 
     send_request(Request::Title {
@@ -5096,10 +5097,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         paste_guard: None,
     })?;
 
-    eprintln!(
-        "master を起動しました: {}",
-        launch_location(&tab_title, &target)
-    );
+    eprintln!("master を起動しました: {}", launch_location(&target));
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         master_agent.as_str(),
@@ -5267,7 +5265,12 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
 
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）は新タブ起動
-    let target = resolve_launch_target(&tab_title, use_tab, &solo_cmd_hint(profile_name))?;
+    // solo のタブ名は従来どおり手動名（#2120 は master だけを直す）
+    let tab_naming = orchestrator::master_launch::TabNaming {
+        title: tab_title,
+        source: None,
+    };
+    let target = resolve_launch_target(Some(&tab_naming), use_tab, &solo_cmd_hint(profile_name))?;
     let pane_id = target.pane;
 
     send_request(Request::Title {
@@ -5285,10 +5288,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         paste_guard: None,
     })?;
 
-    eprintln!(
-        "solo を起動しました: {}",
-        launch_location(&tab_title, &target)
-    );
+    eprintln!("solo を起動しました: {}", launch_location(&target));
     eprintln!(
         "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
         solo_agent.as_str(),
@@ -8184,14 +8184,16 @@ struct LaunchTarget {
     pane: u64,
     /// 新規タブを作ったか（表示文言と復旧案内の出し分けに使う）
     new_tab: bool,
+    /// 起動で付けたタブ名（付けなかった = 汎用 master なら `None`。#2120）
+    tab_title: Option<String>,
 }
 
 /// 起動場所の表示文言（Issue #567。フォールバックで新タブになった場合もタブ表記になる）
-fn launch_location(tab_title: &str, target: &LaunchTarget) -> String {
-    if target.new_tab {
-        format!("タブ '{tab_title}'（ペイン {}）", target.pane)
-    } else {
-        format!("ペイン {}（インライン）", target.pane)
+fn launch_location(target: &LaunchTarget) -> String {
+    match (target.new_tab, target.tab_title.as_deref()) {
+        (true, Some(title)) => format!("タブ '{title}'（ペイン {}）", target.pane),
+        (true, None) => format!("新しいタブ（ペイン {}）", target.pane),
+        (false, _) => format!("ペイン {}（インライン）", target.pane),
     }
 }
 
@@ -8220,14 +8222,17 @@ fn profile_cmd_hint(base: &str, profile_name: &str) -> String {
 ///
 /// アプリへ届かないときだけエラーで止め、復旧手順を添える。
 /// `cmd_hint` は案内文に出す最簡形のコマンド（例: `tako master -fable`。#322）
+///
+/// タブ名は `naming` のとおりに付ける（`None` = 触らない）。master は管轄プロジェクトの
+/// 自動名、solo は従来どおりの手動名（#2120）
 fn resolve_launch_target(
-    tab_title: &str,
+    naming: Option<&tako_control::orchestrator::master_launch::TabNaming>,
     use_tab: bool,
     cmd_hint: &str,
 ) -> Result<LaunchTarget, String> {
     let requested = caller_pane();
     if use_tab {
-        return new_tab_target(tab_title, cmd_hint, requested);
+        return new_tab_target(naming, cmd_hint, requested);
     }
     let resolved = resolve_caller_pane_via_app(requested)
         .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
@@ -8248,16 +8253,11 @@ fn resolve_launch_target(
                 }
                 eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
             }
-            send_request(Request::TabRename {
-                tab: None,
-                pane: Some(pane),
-                title: tab_title.to_string(),
-                source: None,
-            })
-            .ok();
+            let tab_title = naming.and_then(|n| rename_launch_tab(n, None, Some(pane)));
             Ok(LaunchTarget {
                 pane,
                 new_tab: false,
+                tab_title,
             })
         }
         None => {
@@ -8269,23 +8269,26 @@ fn resolve_launch_target(
                     eprintln!("[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）")
                 }
             }
-            eprintln!("  新しいタブ '{tab_title}' を作ってそこで起動します");
+            eprintln!("  新しいタブを作ってそこで起動します");
             if requested.is_some() {
                 eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
             }
-            new_tab_target(tab_title, cmd_hint, requested)
+            new_tab_target(naming, cmd_hint, requested)
         }
     }
 }
 
 /// 新規タブを作って起動先にする（Issue #567 のフォールバック / `--tab` 指定時）
 fn new_tab_target(
-    tab_title: &str,
+    naming: Option<&tako_control::orchestrator::master_launch::TabNaming>,
     cmd_hint: &str,
     requested: Option<u64>,
 ) -> Result<LaunchTarget, String> {
+    // 明示タイトル付きの作成は手動名になるので、渡すのは手動名（solo）のときだけ。
+    // 自動名（master。#2120）は作ってから `source: auto` で付ける
+    let manual_title = naming.filter(|n| n.is_manual()).map(|n| n.title.clone());
     let tab_result = send_request(Request::TabNew {
-        title: Some(tab_title.to_string()),
+        title: manual_title.clone(),
         focus: Some(true),
         cwd: None,
     })
@@ -8293,10 +8296,36 @@ fn new_tab_target(
     let pane = tab_result["pane"]
         .as_u64()
         .ok_or("タブ作成の応答に pane が含まれない")?;
+    let tab_title = match naming {
+        Some(n) if !n.is_manual() => tab_result["tab"]
+            .as_u64()
+            .and_then(|tab| rename_launch_tab(n, Some(tab), None)),
+        _ => manual_title,
+    };
     Ok(LaunchTarget {
         pane,
         new_tab: true,
+        tab_title,
     })
+}
+
+/// 起動先のタブへ名前を付け、付いた名前を返す（#2120）。
+///
+/// 自動名はユーザーが手で付けた名前を上書きしないので、返るのは**実際のタブ名**
+/// （手動名が残ったならその名前）。名前付けの失敗は起動を止めない
+fn rename_launch_tab(
+    naming: &tako_control::orchestrator::master_launch::TabNaming,
+    tab: Option<u64>,
+    pane: Option<u64>,
+) -> Option<String> {
+    send_request(Request::TabRename {
+        tab,
+        pane,
+        title: naming.title.clone(),
+        source: naming.source.clone(),
+    })
+    .ok()
+    .and_then(|v| v["title"].as_str().map(str::to_string))
 }
 
 /// 起動先を確保できないときのエラー文（Issue #567）。
@@ -14785,19 +14814,22 @@ mod tests {
         let inline = LaunchTarget {
             pane: 780,
             new_tab: false,
+            tab_title: Some("tako".into()),
         };
-        assert_eq!(
-            launch_location("master", &inline),
-            "ペイン 780（インライン）"
-        );
+        assert_eq!(launch_location(&inline), "ペイン 780（インライン）");
         let fallback = LaunchTarget {
             pane: 900,
             new_tab: true,
+            tab_title: Some("tako".into()),
         };
-        assert_eq!(
-            launch_location("master-fable", &fallback),
-            "タブ 'master-fable'（ペイン 900）"
-        );
+        assert_eq!(launch_location(&fallback), "タブ 'tako'（ペイン 900）");
+        // #2120: 汎用 master はタブ名に触らないので、名前の無い表記になる
+        let generic = LaunchTarget {
+            pane: 901,
+            new_tab: true,
+            tab_title: None,
+        };
+        assert_eq!(launch_location(&generic), "新しいタブ（ペイン 901）");
     }
 
     /// 復旧案内は最簡形で出す（既定プロファイルに余計な引数を付けない。#322）

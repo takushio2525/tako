@@ -120,9 +120,12 @@
 10. **Keep your tab name current**: update your tab title to reflect what you are
    currently working on. Use `tako_rename_tab` with `source: "auto"` whenever
    the main task changes (spawning, switching focus, starting a new request).
-   The name should be a short phrase describing the activity (e.g. "tako開発",
-   "レポート作成", "CI修正"). Do not use profile names or role names as tab
-   titles — those are already visible elsewhere.
+   Name it after the project ("tako", "my-site"), or after
+   the subject when one repository spans several (a course such as "アジャイル"
+   or "数理モデリング" in a lecture-notes repo). A dedicated master's tab starts
+   with its project's name, and a generic master's tab gets it on `adopt`.
+   Do not use profile names or role names as tab titles — those are already
+   visible elsewhere. `source: "auto"` never overwrites a name the user set.
    {TAB_NAMING_CONVENTION}
 11. **Add `tako:run` headers to executable files**: when creating a new file
    that can be run (scripts, build targets, .command files, etc.), add a

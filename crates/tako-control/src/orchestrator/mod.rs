@@ -1637,9 +1637,12 @@ impl Profile {
     /// 取り分（`SYSTEM_PROMPT_BASE_MAX_BYTES`）の充足を測れる。対応マトリクスの
     /// 「判定は純粋関数 = `Platform` を引数で受ける」作法（設計 §3.1）をここまで伸ばした形
     pub fn render_prompt_placeholders_on(&self, text: &str, platform: Platform) -> String {
-        let naming_convention = self.tab_naming_convention.as_deref().unwrap_or(
-            "Naming rule: describe the current activity concisely in the user's language.",
-        );
+        // 何で呼ぶか（master はプロジェクト / 主題、solo は作業）は各 prompt の項目が言う。
+        // 既定はその両方と食い違わない「短く・利用者の言語で」だけにする（#2120）
+        let naming_convention = self
+            .tab_naming_convention
+            .as_deref()
+            .unwrap_or("Naming rule: keep it short, in the user's language.");
         let out = text.replace("{TAB_NAMING_CONVENTION}", naming_convention);
         // 引き継ぎ閾値の注入（#749）。実効値を prompt に焼くので、master は
         // 自分の閾値を知るために毎回 tako_orchestrator_self を呼ばなくて済む
@@ -6274,8 +6277,11 @@ worker_agents:
     fn tab_naming_convention_default_when_unset() {
         let p = Profile::default();
         let master = p.build_system_prompt("default");
-        assert!(master.contains("Naming rule: describe the current activity"));
+        assert!(master.contains("Naming rule: keep it short"));
         assert!(!master.contains("{TAB_NAMING_CONVENTION}"));
+        // #2120: master はプロジェクト / 主題で呼ぶ（役割名・プロファイル名にしない）
+        assert!(master.contains("the project or current subject"));
+        assert!(master.contains("never a profile or role name"));
     }
 
     #[test]

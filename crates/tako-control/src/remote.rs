@@ -5996,17 +5996,25 @@ fn handle_tab_master(
     ) {
         return respond(request, status, Some(json!({ "error": e }).to_string()));
     }
-    // タブ名も CLI と同じ形にする（`master` / `master-<名前>`）
-    let _ = app_dispatch(
-        app_conn,
-        crate::protocol::Request::TabRename {
-            tab: Some(tab_id),
-            pane: None,
-            title: plan.tab_title.clone(),
-            source: None,
-        },
-        "リモートからの master 起動",
-    );
+    // タブ名は CLI と同じ決め方（#2120: 管轄プロジェクトの自動名。汎用 master は触らない）。
+    // 自動名はユーザーが手で付けた名前を上書きしないので、応答には実際のタブ名を返す
+    let mut tab_title = tab_title_of(&list, tab_id);
+    if let Some(naming) = &plan.tab_naming {
+        if let Ok(v) = app_dispatch(
+            app_conn,
+            crate::protocol::Request::TabRename {
+                tab: Some(tab_id),
+                pane: None,
+                title: naming.title.clone(),
+                source: naming.source.clone(),
+            },
+            "リモートからの master 起動",
+        ) {
+            if let Some(title) = v["title"].as_str() {
+                tab_title = Some(title.to_string());
+            }
+        }
+    }
     // 起動コマンドを流す（CLI の `tako master` と同じ `Send`）
     if let Err((status, e)) = app_dispatch(
         app_conn,
@@ -6026,8 +6034,19 @@ fn handle_tab_master(
     let mut body = plan.to_json();
     body["tab"] = json!(tab_id);
     body["pane"] = json!(pane_id);
+    body["tab_title"] = json!(tab_title);
     body["ok"] = json!(true);
     respond(request, 200, Some(body.to_string()))
+}
+
+/// タブ id からそのタブの名前を引く（`List` の応答を読むだけ）
+fn tab_title_of(list: &Value, tab_id: u64) -> Option<String> {
+    list["tabs"]
+        .as_array()?
+        .iter()
+        .find(|t| t["id"].as_u64() == Some(tab_id))?["title"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// タブ id からそのタブのフォーカスペインを解く（`List` の応答を読むだけ）。

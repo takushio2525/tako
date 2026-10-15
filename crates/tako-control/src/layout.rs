@@ -1128,14 +1128,84 @@ fn restore_tab(tab_layout: &TabLayout, restored: &mut Vec<RestoredPane>) -> Opti
             .filter(|f| seen.insert(f.remote.clone()))
             .collect()
     };
-    Some(Tab::restore(
+    let mut tab = Tab::restore(
         tab_layout.id,
         tab_layout.title.clone(),
         parse_title_source(&tab_layout.title_source),
         tree,
         pinned,
         remote_folders,
-    ))
+    );
+    if !tako_core::master_tab::legacy() {
+        if let Some(released) = release_legacy_master_title(&mut tab, &profile_initial_title) {
+            crate::diag::persist_log(&format!(
+                "[tab-title] tab={} 旧版が付けた役割名の手動名を解除 profile={} project_name={}（#2120）",
+                tab.id().as_u64(),
+                released.profile,
+                if released.renamed { "applied" } else { "none" },
+            ));
+        }
+    }
+    Some(tab)
+}
+
+/// [`release_legacy_master_title`] が解除した内訳（persist.log へ残す）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleasedMasterTitle {
+    /// そのタブにいる master のプロファイル名
+    profile: String,
+    /// 管轄プロジェクトの名前へ付け直したか（汎用 master なら false = 名前は残して手動だけ外す）
+    renamed: bool,
+}
+
+/// 旧版の tako が master の起動で付けた**役割名の手動名**を外す（#2120）。
+///
+/// #2120 以前の起動経路は、タブ名を `master` / `master-<名前>` の手動名で付けていた。
+/// 手動名は自動命名より強いので、master 自身が主題でタブ名を付けようとしても
+/// 全部弾かれる。解除の対象は 3 つが揃うタブだけ:
+///
+/// 1. 手動名である
+/// 2. 名前が役割名の形（[`tako_core::master_tab::is_legacy_role_title`]）
+/// 3. master のペインがいる（ただの `master` という名前 = git のブランチ名などは対象外）
+///
+/// **ユーザーが付けた別の名前（`tako` / `アジャイル` など）は 2 に当たらないので残る**。
+/// 外したあとは管轄プロジェクトの名前を自動名で付ける（汎用 master なら名前は残して
+/// 手動だけを外す = master が次に付け直せる）。
+///
+/// **ファイルの移行（#916 の `Step`）ではなく復元の側で直す理由**: layout.json は
+/// 動いている GUI が持っていて終了まで書き戻す。CLI 側の移行（`tako master` も発火点）で
+/// ファイルだけ直しても GUI の次の保存で消える。読み込みの側で直せば、GUI の
+/// 再起動・`tako recover`・退避タブ（#1487）のどれもこの 1 か所を通る
+pub(crate) fn release_legacy_master_title(
+    tab: &mut Tab,
+    initial_title_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<ReleasedMasterTitle> {
+    if tab.title_source() != TitleSource::Manual
+        || !tako_core::master_tab::is_legacy_role_title(tab.title())
+    {
+        return None;
+    }
+    let profile = tab
+        .tree()
+        .panes()
+        .iter()
+        .find_map(|p| {
+            p.role()
+                .and_then(tako_core::handoff::master_profile_of_role)
+        })?
+        .to_string();
+    tab.clear_manual_title();
+    let renamed = match initial_title_of(&profile) {
+        Some(title) => tab.set_title_auto(title),
+        None => false,
+    };
+    Some(ReleasedMasterTitle { profile, renamed })
+}
+
+/// プロファイルの管轄プロジェクトから master のタブの初期名を引く（#2120。読めなければ `None`）
+fn profile_initial_title(profile: &str) -> Option<String> {
+    let profile = crate::orchestrator::Profile::load(profile).ok()?;
+    tako_core::master_tab::initial_title(profile.projects.as_deref().unwrap_or_default())
 }
 
 /// ノードを PaneNode へ写す。戻りの PaneId は「focused 指定に一致した葉」（無ければ先頭葉）
@@ -1720,6 +1790,124 @@ mod tests {
             std::slice::from_ref(&win),
             "空のエントリだけ落ちる"
         );
+    }
+
+    /// #2120: タブ 1 枚（ペイン 1 枚・role とタブ名の出どころを指定）を作る
+    fn master_tab_fixture(
+        ws: &mut Workspace,
+        title: &str,
+        manual: bool,
+        role: Option<&str>,
+    ) -> TabId {
+        let mut pane = Pane::new(PaneOrigin::User);
+        pane.set_role(role.map(str::to_string));
+        let id = ws.create_tab(title, pane);
+        let tab = ws.get_tab_mut(id).unwrap();
+        if manual {
+            tab.set_title_manual(title);
+        } else {
+            tab.set_title_auto(title);
+        }
+        id
+    }
+
+    /// #2120 受け入れ条件 4: 旧版が付けた「master」の手動名だけが外れ、別の手動名は残る
+    #[test]
+    fn issue2120_旧い役割名の手動名だけを解除する() {
+        let resolver = |profile: &str| (profile == "takodev").then(|| "tako".to_string());
+        let mut ws = Workspace::new("1", Pane::new(PaneOrigin::User));
+        let generic = master_tab_fixture(&mut ws, "master", true, Some("orchestrator-master"));
+        let dedicated = master_tab_fixture(
+            &mut ws,
+            "master-takodev",
+            true,
+            Some("orchestrator-master:takodev"),
+        );
+        // ユーザー（または応急で master）が手で付けた名前
+        let users = master_tab_fixture(
+            &mut ws,
+            "アジャイル",
+            true,
+            Some("orchestrator-master:campus"),
+        );
+        // master のいないタブの「master」（git のブランチ名など）は触らない
+        let branch = master_tab_fixture(&mut ws, "master", true, None);
+        // worker / solo のタブも触らない
+        let solo = master_tab_fixture(&mut ws, "master", true, Some("solo"));
+        // 既に自動名なら解除するものが無い
+        let auto = master_tab_fixture(&mut ws, "master", false, Some("orchestrator-master"));
+
+        let mut released = Vec::new();
+        for id in [generic, dedicated, users, branch, solo, auto] {
+            let tab = ws.get_tab_mut(id).unwrap();
+            released.push(release_legacy_master_title(tab, &resolver));
+        }
+        assert_eq!(
+            released,
+            vec![
+                Some(ReleasedMasterTitle {
+                    profile: "default".into(),
+                    renamed: false
+                }),
+                Some(ReleasedMasterTitle {
+                    profile: "takodev".into(),
+                    renamed: true
+                }),
+                None,
+                None,
+                None,
+                None,
+            ]
+        );
+        let state = |id: TabId| {
+            let t = ws.get_tab(id).unwrap();
+            (t.title().to_string(), t.title_source())
+        };
+        // 汎用 master: 名前は残して手動だけ外す（master が次に付け直せる）
+        assert_eq!(state(generic), ("master".into(), TitleSource::Default));
+        // 専用 master: 管轄プロジェクトの自動名
+        assert_eq!(state(dedicated), ("tako".into(), TitleSource::Auto));
+        assert_eq!(state(users), ("アジャイル".into(), TitleSource::Manual));
+        assert_eq!(state(branch), ("master".into(), TitleSource::Manual));
+        assert_eq!(state(solo), ("master".into(), TitleSource::Manual));
+        assert_eq!(state(auto), ("master".into(), TitleSource::Auto));
+
+        // 解除したあとは master の自動名が通る（以前は手動名に弾かれて `master` のまま）
+        let t = ws.get_tab_mut(generic).unwrap();
+        assert!(t.set_title_auto("数理モデリング"));
+        // 手で付けた名前は自動名で上書きされない（受け入れ条件 3）
+        let t = ws.get_tab_mut(users).unwrap();
+        assert!(!t.set_title_auto("campus"));
+        assert_eq!(t.title(), "アジャイル");
+    }
+
+    /// #2120 受け入れ条件 4（ファイル経由）: 旧形式の layout.json を読ませると、
+    /// 復元の時点で「master」の手動名が外れ、別の手動名は残る
+    #[test]
+    fn issue2120_旧形式のlayoutを復元すると役割名の手動名が外れる() {
+        if tako_core::master_tab::legacy() {
+            return; // A/B の旧挙動で回しているときは対象外
+        }
+        let mut ws = Workspace::new("1", Pane::new(PaneOrigin::User));
+        let generic = master_tab_fixture(&mut ws, "master", true, Some("orchestrator-master"));
+        let users = master_tab_fixture(&mut ws, "my-site", true, Some("orchestrator-master:x2120"));
+        let branch = master_tab_fixture(&mut ws, "master", true, None);
+        let json = serde_json::to_string(&capture(&ws, &|_| PaneMeta::default(), None)).unwrap();
+        // 旧版が書いた形そのもの（手動名の「master」が入っている）
+        assert!(
+            json.contains(r#""title":"master","title_source":"manual""#),
+            "{json}"
+        );
+
+        let file: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored, _) = restore(&file).expect("復元できる");
+        let by_id = |id: TabId| {
+            let t = restored.get_tab(id).expect("同じ ID で戻る");
+            (t.title().to_string(), t.title_source())
+        };
+        assert_eq!(by_id(generic), ("master".into(), TitleSource::Default));
+        assert_eq!(by_id(users), ("my-site".into(), TitleSource::Manual));
+        assert_eq!(by_id(branch), ("master".into(), TitleSource::Manual));
     }
 
     #[test]

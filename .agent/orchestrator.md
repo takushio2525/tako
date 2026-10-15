@@ -343,9 +343,17 @@ tako master
 suffix を付けると複数 master を区別できる:
 
 ```bash
-tako master dev     # "master-dev" タブ
-tako master blog    # "master-blog" タブ
+tako master dev     # プロファイル dev の master
+tako master blog    # プロファイル blog の master
 ```
+
+タブ名は**役割名（`master` / `master-<名前>`）にしない**（#2120 / FR-2.12.14）。
+専用プロファイル（`projects: [<key>]`）なら起動時に管轄プロジェクトの名前
+（`takodev` の管轄が `[tako]` なら `tako`）を**自動名**で付け、汎用の master は
+`tako orchestrator adopt <プロジェクト>` の時点でそのプロジェクト名になる。以後は
+master が作業の主題（1 つのリポジトリで複数の科目を扱うなら科目名）で
+`tako_rename_tab(source: "auto")` を呼んで付け直す。自動名なのでユーザーが手で
+付けた名前は上書きしない。master のいるタブの名前はアプリの自動命名（haiku）が作らない
 
 ### 2. master に作業を依頼する
 
@@ -373,7 +381,7 @@ master は結果を確認してユーザーに報告する。
 
 | オプション | 説明 |
 |---|---|
-| `-<プロファイル名>` | プロファイル指定（省略時は default。タブ名は `master-<名前>`。旧形式のサフィックス指定も後方互換で動く） |
+| `-<プロファイル名>` | プロファイル指定（省略時は default。タブ名は管轄プロジェクトの名前 = #2120。旧形式のサフィックス指定も後方互換で動く） |
 | `--tab` | 常に新規タブで起動する |
 
 起動先ペインは **pid 祖先辿り → `TAKO_PANE_ID` → stale pane map（#210）** の順で解決し、

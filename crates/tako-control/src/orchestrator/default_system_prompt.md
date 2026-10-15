@@ -290,8 +290,8 @@ edge cases.
 9. **Delegate interactive commands**: sudo, browser auth and the like go through
    `tako_run_interactive` + `_status`, never an instruction for the user to type them.
 10. **Keep your tab name current**: `tako_rename_tab` with `source: "auto"` when the
-   main task changes — a short phrase for the activity, never a profile or role name.
-   {TAB_NAMING_CONVENTION}
+   main task changes — the project or current subject (e.g. a course), never a profile
+   or role name. {TAB_NAMING_CONVENTION}
 11. **Add `tako:run` headers to executable files** you create, so the user can run them
    from the preview pane's play button.
 12. **Show commands as cards**: pass the exact string to `tako_show_command` whenever

@@ -1428,8 +1428,10 @@ Tailscale が未セットアップの場合、`tako remote start` は不足項�
 tako master              # default プロファイル、今のペインで
 tako master --tab        # 新しいタブを作って起動
 tako master -fast        # プロファイル指定（profiles/fast.yaml）
-tako master dev          # 旧形式のサフィックス指定（"master-dev" タブ）
+tako master dev          # 旧形式のサフィックス指定（-dev と同じ）
 ```
+
+タブには担当プロジェクトの名前が付きます（`tako` / `my-site` など）。その後は master が作業の主題に合わせて付け直します（1 つのリポジトリで複数の授業を扱うなら科目名）。あなたが手で付けたタブ名は上書きしません。
 
 ### tako solo
 

@@ -11491,12 +11491,27 @@ fn dispatch_orchestrator_adopt(
             .get_mut(pane_id)
             .ok_or_else(|| op_err("ペインが見つからない"))?;
         pane_obj.set_role(Some(new_role.clone()));
-        // タブ名 / 表示名の形は `tako master -<名前>` と同じ 1 実装から採る（#761 の語彙）
-        pane_obj.set_title(Some(orchestrator::master_launch::tab_title_for(name)));
+        // ペインの表示名の形は `tako master -<名前>` と同じ 1 実装から採る（#761 の語彙）
+        pane_obj.set_title(Some(orchestrator::master_launch::pane_title_for(name)));
         // #1140 の 1 実装。採用先のプロファイル既定を本人のペインへ配る
         apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()), all_default);
         limit_resume = pane_obj.limit_autoresume();
+        // #2120: 汎用の master がプロジェクトを採用した時点で、タブ名をそのプロジェクトの
+        // 名前にする（`tako master -<名前>` の起動と同じ決め方）。自動名なので
+        // ユーザーが手で付けた名前は上書きしない。旧挙動（A/B）ではタブ名に触らない
+        if !tako_core::master_tab::legacy() {
+            if let Some(naming) = orchestrator::master_launch::tab_naming(name, &target) {
+                if let Some(tab) = host.workspace_mut().get_tab_mut(tab_id) {
+                    tab.set_title_auto(naming.title);
+                }
+            }
+        }
     }
+    let (tab_title, tab_title_source) = host
+        .workspace()
+        .get_tab(tab_id)
+        .map(|t| (t.title().to_string(), t.title_source().as_str()))
+        .unwrap_or_default();
     if changed {
         crate::diag::persist_log(&format!(
             "[adopt] pane={} profile:{current_name} -> profile:{name} generated={} source={}",
@@ -11539,6 +11554,9 @@ fn dispatch_orchestrator_adopt(
         "project_handoffs": project_handoffs,
         // 採用の効きが一目で分かるよう、引き継ぎの後任がどう立つかを返す
         "successor_command": tako_core::handoff::master_launch_command(name),
+        // #2120: 採用後のタブ名（手動名ならユーザーの名前が残っている）
+        "tab_title": tab_title,
+        "tab_title_source": tab_title_source,
         "limit_resume": limit_resume,
         "warnings": warnings,
         // #1453 の A/B。true なら TAKO_1453_LEGACY=1 で何も書き換えていない
@@ -21929,10 +21947,16 @@ fn launch_master_for_response(
             );
         }
     };
+    // #2120: 明示タイトル付きの作成は手動名になるので、渡すのは手動名（A/B の旧挙動）の
+    // ときだけ。自動名（管轄プロジェクトの名前）はタブを作ってから付ける
     let created = match dispatch(
         host,
         Request::TabNew {
-            title: Some(plan.tab_title.clone()),
+            title: plan
+                .tab_naming
+                .as_ref()
+                .filter(|n| n.is_manual())
+                .map(|n| n.title.clone()),
             focus: Some(false),
             cwd: plan.cwd.as_ref().map(|p| p.display().to_string()),
         },
@@ -21963,6 +21987,18 @@ fn launch_master_for_response(
             index,
         );
     };
+    if let (Some(naming), Some(tab)) = (plan.tab_naming.as_ref().filter(|n| !n.is_manual()), tab) {
+        let _ = dispatch(
+            host,
+            Request::TabRename {
+                tab: Some(tab),
+                pane: None,
+                title: naming.title.clone(),
+                source: naming.source.clone(),
+            },
+            PaneOrigin::User,
+        );
+    }
     // role を先に貼る（コマンドが走り出した時点で master として見える。#1078 と同じ順）
     let _ = dispatch(
         host,
@@ -36322,6 +36358,86 @@ mod tests {
             Some("default"),
             "legacy なのに profile が動いた: {after}"
         );
+    }
+
+    /// #2120 受け入れ条件 2 / 3: 汎用 master が採用した時点でタブ名がプロジェクト名
+    /// （自動名）になり、ユーザーが手で付けた名前は採用でも上書きされない
+    #[test]
+    fn issue2120_採用でタブ名がプロジェクト名になり手動名は残る() {
+        if tako_core::master_tab::legacy() {
+            return; // A/B の旧挙動で回しているときは対象外
+        }
+        // config_dir はプロセス共有。プロファイルを作る / 消すので直列化する
+        let _guard = TEST_PROJECT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = "_tako_2120_a1_";
+        let (mut host, pane) = t1453_master_host(project);
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                t1453_cleanup(self.0);
+            }
+        }
+        let _cleanup = Cleanup(project);
+        let tab = |host: &MockHost| {
+            let t = &host.workspace().tabs()[0];
+            (t.title().to_string(), t.title_source())
+        };
+        // 汎用 master の起動はタブ名に触らない（初期の連番のまま）
+        assert_eq!(tab(&host).1, tako_core::TitleSource::Default);
+
+        let res = t1453_adopt(&mut host, pane, project).expect("採用が通る");
+        assert_eq!(
+            tab(&host),
+            (project.to_string(), tako_core::TitleSource::Auto),
+            "採用でタブ名がプロジェクト名の自動名にならない"
+        );
+        assert_eq!(res["tab_title"].as_str(), Some(project), "{res}");
+        assert_eq!(res["tab_title_source"].as_str(), Some("auto"), "{res}");
+        // ペインの表示名は従来どおり役割の語彙（タブ名とは別）
+        let pane_title = host.workspace().tabs()[0]
+            .tree()
+            .panes()
+            .iter()
+            .find(|p| p.id().as_u64() == pane)
+            .and_then(|p| p.title().map(str::to_string));
+        assert_eq!(pane_title, Some(format!("master-{project}")));
+
+        // master は主題で付け直せる（自動名どうし）
+        let renamed = dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: Some(pane),
+                tab: None,
+                title: "数理モデリング".into(),
+                source: Some("auto".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(renamed["title"].as_str(), Some("数理モデリング"));
+
+        // ユーザーが手で付けた名前は、採用し直しても自動名でも上書きされない
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: Some(pane),
+                tab: None,
+                title: "自分の名前".into(),
+                source: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        t1453_adopt(&mut host, pane, "default").expect("汎用へ戻せる");
+        let res = t1453_adopt(&mut host, pane, project).expect("採用し直せる");
+        assert_eq!(
+            tab(&host),
+            ("自分の名前".to_string(), tako_core::TitleSource::Manual)
+        );
+        assert_eq!(res["tab_title"].as_str(), Some("自分の名前"), "{res}");
+        assert_eq!(res["tab_title_source"].as_str(), Some("manual"), "{res}");
     }
 
     #[test]
