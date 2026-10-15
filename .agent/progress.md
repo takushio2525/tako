@@ -20,25 +20,6 @@
 
 ---
 
-## 2026-10-15（#2084: docs だけの PR と main への push で CI の macOS / Windows の Rust ジョブを skip する）
-- 判定ジョブ `changes`（`scripts/ci-change-scope.sh`・テスト 92 項目）+ docs の検査を `docs`（ubuntu）へ移設 + docs / .agent を読む番犬 27 本を `docs-watchdogs`（ubuntu・毎回）で。検証用 PR #2090 で 4 分 43 秒で緑（Rust 2 本は skip）。PR #2089
-
-## 2026-10-15（#1759: エディタの Enter の続き = Python の抜ける文の後ろを 1 段浅く・Markdown のリストの印を引き継ぐ / 括弧の自動閉じ = 入れた閉じ括弧の飛び越しと対・設定で切れる）
-- 規則は `file_type` の列 `dedent_after` / `list_continuation` / `auto_close`。打鍵 1 文字は `EditorCommand::Type` → `TextBuffer::type_char` の 1 実装で GUI の文字入力と `tako edit type` / MCP `tako_preview_edit` の `command: "type"` が同じ口。設定 `editor_auto_close`（既定 ON・serde default）+ `tako edit auto-close` + MCP `auto_close`。カタログ +299 B・A/B `TAKO_1759_LEGACY=1`
-- 実測: `scripts/test-editor-enter-1759.sh` 28 PASS（visual `enter-1759` 新 OK / 旧は ① で FAILED・CLI / MCP の同じ手順が GUI の打鍵とバイト一致）・番犬 `issue1759_enter_auto_close_watchdog`（注入 6 通り）
-
-## 2026-10-15（#2082 / #2088: docs の .mdx で表が描かれない・コマンドの -- や "" が化けるのを直した）
-- 真因: Astro 6.4 で `markdown.gfm` の既定が未設定 → Starlight が足す @astrojs/mdx 5.0.6 が GFM を外す / mdx の smartypants が JSX の子（<Cmd>）の `--` `"` を置き換える。`astro.config.mjs` で `mdx({ optimize: true, gfm: true, smartypants: false })`
-- 表 15 個（5 ページ）・コマンド 3・コード 2 が直り、他 29 ページは出力が 1 バイトも変わらない。番犬 `docs/scripts/verify-markdown.mjs` を postbuild に（注入 3 通りで npm run build が落ちる）
-
-## 2026-10-15（#2077: ドキュメントサイト刷新の仕上げ S3 = 共有部品の提案を反映しページをまたぐ直し）
-- 共有部品の提案 20 件を反映（Starter / Phone / CommandCard を 1 本化、TakoWindow に remote・ctx・押した印、data-fx の log / drawer、ポインターの「手順:-」、Scrolly の intro）・初回バナーの列ずれ / WindowsLimits の字下げ / 隠したタブの空きを直した
-- 見送り: ページ名「ファイルツリー＆プレビュー」（据え置き）・mdx の表と全角ダッシュ（#2083 で着地済み。more の <Cmd> の回避は外した）・progress（master）
-
-## 2026-10-15（#2086: UserTask の起票・詳細・更新・返答（PWA を含む）・展開も IPC から UI スレッドで置き場を読み書きしない）
-- #2052 の腕を門 `user_task_offloads` で全 action へ（A/B `TAKO_2086_LEGACY=1`）。add は workspace 由来の材料だけ UI で写し起票元の解決（プロファイル・セッションカタログ）と書き込みは background、respond は届いた順の札 → 積む（bg）→ 運ぶ（UI）→ 記録（bg。`OffloadLanding::Settled` で後処理の後）、expand の同期の引き直しは `list_poll.pending` へ。via を省いた返答だけ同期（MCP は `mcp` を埋める）。番犬 12 節（注入 10 通り）・カタログ増 0 B
-- 実測（読み 1500 ms の注入・`scripts/test-user-task-offload-2086.sh` 16 PASS）: 最中の IPC 最大 新 17〜32 ms・旧 1402〜4421 ms、UI スレッドの読み 新 0・旧 10 回。PWA 実経路 69 PASS・配送 45 PASS
-
 ## 2026-10-15（#2021: MCP の stdio ブリッジ 1 本 約 7 MB → 1.09 MB）
 - clap を通らない・カタログを使い捨ての子プロセスで組む・.app では libSystem だけの `tako-mcp` へ exec で引き渡す。登録は `tako mcp serve` のまま（移行なし）、応答はバイト単位で同じ。計測は `scripts/measure-mcp-bridge-2021.sh`、番犬は `issue2021_mcp_bridge`
 
@@ -88,3 +69,24 @@
 ## 2026-10-15（#2106: CI の macOS で実 tmux のテストが 1 本も走っていなかった = ランナーの image に tmux が無く全部 skip のまま ok）
 - tmux の導入段（11 秒）+ `tako_core::tmux_test_gate`（`TAKO_TEST_REQUIRE_TMUX=1` で skip を panic・台帳から件数を出す）+ 番犬 `issue2106_*`。CI で 52 本が実 tmux で走る。PR #2110
 - 罠: 件数の `sort -u` が en_US.UTF-8 の照合で日本語のテスト名を潰した（`LC_ALL=C`）。issue1857 の負荷依存のフレークは #2114
+
+## 2026-10-15（#2023: 夜間リリースの後に footprint を測って基準と比べ、悪化を tako todo へ = 同じ悪化は重ねない・蓋閉じは未実測・終了コードは変えない）
+- `scripts/nightly-footprint-watch.sh` + `scripts/lib/footprint-watch.py`。実機で注入 `TAKO_PERSIST=0` → 起票（+116%）・翌晩は重ねない・tako-vd 不可は未実測。計測の段 163〜165 秒。モック 130 PASS。PR #2116
+- 出力中の footprint は同じコミットでも ±12% 揺れる（閾値 +20%）= 誤検出が出たら閾値を見直す
+
+## 2026-10-15（#2112: ネット復帰で接続エラーで止まった全セッションを即時に再開 = 既定 ON・`tako limit-resume --network` / MCP `tako_limit_resume` の `network` / 設定画面「一般」）
+- 入力欄を錨にした画面の判定 + 送ってよい停止があるあいだだけの到達確認 + 送達確認つきの経路（#813 と同じ層）。カタログ +332 B。PR #2118
+- 実測 `scripts/test-net-resume-2112.sh` 43 PASS（復帰 → 3 本へ送達・送ってはいけない 5 種へ 0・OFF の A/B・止まっていないあいだの到達確認 0 回・visual-test `net-resume`）
+
+## 2026-10-15（#2114: issue1857 のフレークの真因 = PTY への書き込みが EIO（子の側が全部閉じた）で `pty_loop` が ChildExit を送らずに畳まれていた）
+- unix の EIO は相手側が閉じたとして入力を捨て fd を監視から外し、子の終了の合図を待つ。A/B `TAKO_2114_LEGACY=1`・注入 `TAKO_2114_INJECT_CHILD_EVENT_DELAY_MS`・番犬 `issue2114_*`。PR #2117
+
+## 2026-10-15（#2119: 夜間の PATH の先頭の古い tako に負けず、run_heavy が順番待ちを知る tako を探して並ぶ）
+- PATH の tako を上から全部 → .app の同梱 CLI を `--max-wait` で確かめ、無い / 応答しない（10 秒）は直に走る。A/B `TAKO_2119_LEGACY=1`。モック `scripts/test-nightly-queue-path-2119.sh` を CI の macOS へ。PR #2121
+
+## 2026-10-16（#2123: CLI の IPC の 1 往復に応答の上限 = 返事をしない GUI で tako queue・夜間リリースが固まらない）
+- `protocol::reply_timeout`（順番待ち 30 秒・心拍と done 5 秒・外の仕事を待つ要求は上限なし・他は 300 秒）+ unix の締め切りつきソケット / Windows のスレッド。`tako queue` は時間切れで直に走る。A/B `TAKO_2123_LEGACY=1`。PR #2125
+- 実測 `scripts/test-ipc-timeout-2123.sh` 40 OK（修正前 45 秒で打ち切り / 修正後 30 秒で直に走る・72 秒の待ちは切れない・途中の SIGSTOP は 67 秒で走る）
+
+## 2026-10-16（#2120: master のタブ名を役割名の手動名で固定せず、管轄プロジェクトの自動名で付ける・adopt でプロジェクト名・旧版の「master」手動名は復元時に解除）
+- 真因は起動 3 経路（CLI / スマホ / 人タスク）の手動名 + adopt がタブ名を変えない。アプリの自動命名は master のタブを命名しない。`scripts/test-master-tab-title-2120.sh` 39 PASS（A/B `TAKO_2120_LEGACY=1`）・visual-test `master-tab-title`・カタログ増 0 B。PR #2124。solo の同型は #2127
