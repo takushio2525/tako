@@ -219,13 +219,17 @@ if [ ! -f "$MEASURE" ]; then
 fi
 say "計測: v${VERSION}（${SHORT}）を std で測る（ビルドの上限 ${BUILD_TIMEOUT} 秒・計測の上限 ${MEASURE_TIMEOUT} 秒）"
 
-# --- ビルド（順番待ちを通す。計測スクリプトの中のビルドはこの後なら手早く済む）------------
+# --- ビルド（順番待ちを通す。計測スクリプトの中のビルドはこの後なら空振りで済む）------------
+# **cargo の前に PWA の dist/ を作る**（build-app.sh と同じ）: 使い捨ての worktree には dist/ が無く、
+# 無いまま cargo を回すと tako-control の build.rs が PWA を作る。作った dist/ の時刻のせいで
+# 2 回目のビルド（計測スクリプトの中 = 順番待ちの外）でも build.rs が再実行され、tako-control から
+# 下流が丸ごと組み直しになる（実測 約 9 分。tako / tako-app が計測の段の最中に書き換わっていた）
 t0=$(date +%s)
 rc=0
 # 順番待ちは上限の 2/3 で諦めさせる（残りをビルドに充てる。諦めた tako queue は 75 で返る）
 run_limited "$BUILD_TIMEOUT" "$WORK/build.log" \
   env PATH="$BUILD_PATH" TAKO_QUEUE_MAX_WAIT="$((BUILD_TIMEOUT * 2 / 3))s" \
-  /bin/bash -c 'cd "$1" && . scripts/lib/queue.sh && run_heavy cargo build --release -q -p tako-cli -p tako-app' _ "$WT" \
+  /bin/bash -c 'cd "$1" && . scripts/lib/queue.sh && run_heavy /bin/bash -c "{ [ ! -f scripts/build-pwa.sh ] || bash scripts/build-pwa.sh --if-missing; }; cargo build --release -q -p tako-cli -p tako-app"' _ "$WT" \
   || rc=$?
 build_s=$(( $(date +%s) - t0 ))
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 75 ]; then

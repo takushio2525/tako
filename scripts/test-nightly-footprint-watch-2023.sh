@@ -268,7 +268,7 @@ import json, os, sys
 store = os.path.join(os.environ["FAKE_DIR"], "todo.json")
 args = sys.argv[1:]
 with open(os.path.join(os.environ["FAKE_DIR"], "tako.log"), "a") as f:
-    f.write(" ".join(args[:3]) + "\n")
+    f.write(" ".join(args if args[:1] == ["queue"] else args[:3]) + "\n")
 if os.environ.get("FAKE_TODO_DOWN") == "1":
     print("tako の外で実行されている", file=sys.stderr)
     sys.exit(1)
@@ -309,6 +309,8 @@ git -C "$B/repo" remote add origin "$B/origin.git"
 mkdir -p "$B/repo/scripts/lib" "$B/repo/target/release"
 cp "$REPO_ROOT/scripts/nightly-footprint-watch.sh" "$B/repo/scripts/"
 cp "$REPO_ROOT/scripts/lib/footprint-watch.py" "$REPO_ROOT/scripts/lib/queue.sh" "$B/repo/scripts/lib/"
+# build-pwa.sh の代役（呼ばれた引数を残す。cargo より先に呼ばれることを B1 で見る）
+printf '#!/bin/sh\necho "build-pwa $*" >> "$FAKE_LOG"\n' > "$B/repo/scripts/build-pwa.sh"
 printf '/target\n' > "$B/repo/.gitignore"
 printf '[workspace.package]\nversion = "0.8.40"\n' > "$B/repo/Cargo.toml"
 git -C "$B/repo" add -A
@@ -343,6 +345,7 @@ assert_eq "終了コード 0" "0" "$WATCH_RC"
 assert_contains "基準づくり中" "$(cat "$B/out.txt")" "基準づくり中"
 assert_contains "窓の行（tako-vd の上）を流す" "$(cat "$B/out.txt")" "窓: ディスプレイ指定 tako-vd"
 assert_contains "ビルドを release で通す" "$(cat "$B/calls.log")" "cargo build --release -q -p tako-cli -p tako-app"
+assert_eq "cargo より先に PWA の dist を作る（2 回目のビルドを空振りにする）" "build-pwa --if-missing|cargo build --release -q -p tako-cli -p tako-app" "$(head -2 "$B/calls.log" | tr '\n' '|' | sed 's/|$//')"
 assert_eq "計測は std" "args=std" "$(sed -n 1p "$B/measure.env")"
 assert_eq "計測の中では並び直さない" "no_queue=1" "$(sed -n 2p "$B/measure.env")"
 assert_eq "偽の claude で回す（子の CPU を claude CLI の版で揺らさない）" "stub=1" "$(sed -n 3p "$B/measure.env")"
@@ -457,7 +460,8 @@ env -i HOME="$B/home" PATH="$B/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/b
   FAKE_DIR="$B" FAKE_LOG="$B/calls.log" \
   TAKO_FOOTPRINT_WATCH_MEASURE="$B/measure.sh" TAKO_FOOTPRINT_WATCH_TAKO="$B/tako" \
   /bin/bash "$B/repo/scripts/nightly-footprint-watch.sh" > "$B/out.txt" 2>&1
-assert_contains "cargo build を tako queue 経由で走らせた" "$(cat "$B/tako.log")" "queue cargo build"
+assert_contains "PWA と cargo build を tako queue 経由で走らせた" "$(cat "$B/tako.log")" "cargo build --release -q -p tako-cli -p tako-app"
+assert_contains "並んだのは queue" "$(cat "$B/tako.log")" "queue /bin/bash -c"
 assert_eq "古い tako には並ばせない" "" "$(cat "$B/old-tako.log" 2>/dev/null)"
 rm -f "$B/bin/tako"
 

@@ -220,7 +220,9 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
   **リリースの有無に依らず毎晩**（変更なし / dirty / 手動リリース進行中で抜けた夜も回す）。dry-run・多重起動・
   シグナルで中止した実行からは回さない。止めるときは `TAKO_NIGHTLY_FOOTPRINT=0`
 - **1 回の流れ**: 見張りのロック → origin/main を `git worktree add --detach` で出す（共有ツリーの HEAD は触らない。
-  target/ は共有ツリーのものを symlink で使い回す）→ `run_heavy cargo build --release`（順番待ちを通す・上限 60 分、
+  target/ は共有ツリーのものを symlink で使い回す）→ `scripts/build-pwa.sh --if-missing` + `cargo build --release` を
+  1 回の `run_heavy` で（**cargo の前に PWA の dist を作る**: 使い捨ての worktree には dist が無く、tako-control の build.rs に
+  作らせると dist の時刻のせいで計測スクリプトの中の 2 回目のビルド = 順番待ちの外で下流が丸ごと組み直しになる。上限 60 分、
   順番待ちはその 2/3 で諦める。**並ぶのは起票に使う tako = `/Applications/tako.app` の tako**: 夜間の PATH は先頭が
   `~/.cargo/bin` で、そこに順番待ちを知らない古い tako が居ると run_heavy が並ばずに走らせる）→ `scripts/measure-footprint-2011.sh std`（上限 15 分・偽の claude・tako-vd の上だけ）→
   履歴へ 1 行 → 判定 → 悪化なら起票。**そのコミットを描画ありで測り済みなら数秒で飛ばす**（コードが変わらない夜は測らない）
