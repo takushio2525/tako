@@ -249,37 +249,26 @@ mod tests {
     #[test]
     fn 引数は表の並びのまま伴走と空のファイルのパスを差し込む() {
         let e = env("/Users/testuser", &[]);
-        let fs = Files(
-            [
-                PathBuf::from("/opt/x/tool-a"),
-                PathBuf::from("/opt/x/tool-b"),
-            ]
-            .into(),
-        );
+        // 期待値は `join` で組む（Windows の `join` は `\` で繋ぐ = 文字列の直書きでは比べられない）
+        let dir = Path::new("/opt/x");
+        let config = Path::new("/data/lsp-config");
+        let fs = Files([dir.join("tool-a"), dir.join("tool-b")].into());
         let no_path = |_: &str| None;
         let loc = locate(Platform::MacOs, &no_path, &e, &fs);
-        let built = build(
-            &伴走あり,
-            Path::new("/opt/x/srv-ls"),
-            &loc,
-            Path::new("/data/lsp-config"),
-        )
-        .unwrap();
+        let built = build(&伴走あり, &dir.join("srv-ls"), &loc, config).unwrap();
+        let text = |p: PathBuf| p.to_string_lossy().into_owned();
         assert_eq!(
             built.args,
             [
-                "-a",
-                "/opt/x/tool-a",
-                "-b",
-                "/opt/x/tool-b",
-                "-c",
-                "/data/lsp-config/srv/conf.yaml"
+                "-a".to_string(),
+                text(dir.join("tool-a")),
+                "-b".to_string(),
+                text(dir.join("tool-b")),
+                "-c".to_string(),
+                text(config.join("srv").join("conf.yaml")),
             ]
         );
-        assert_eq!(
-            built.empty_files,
-            [PathBuf::from("/data/lsp-config/srv/conf.yaml")]
-        );
+        assert_eq!(built.empty_files, [config.join("srv").join("conf.yaml")]);
         assert!(built.companions.iter().all(|c| c.found == Found::SameDir));
     }
 
@@ -287,7 +276,7 @@ mod tests {
     #[test]
     fn 伴走は同じディレクトリから_path_同梱の順に探す() {
         let e = env("/Users/testuser", &[]);
-        let in_ide = PathBuf::from(format!("{IDE}/tool-a"));
+        let in_ide = Path::new(IDE).join("tool-a");
         let fs = Files([PathBuf::from("/opt/x/tool-a"), in_ide.clone()].into());
         let on_path = |name: &str| (name == "tool-a").then(|| PathBuf::from("/usr/bin/tool-a"));
         let loc = locate(Platform::MacOs, &on_path, &e, &fs);
@@ -330,7 +319,7 @@ mod tests {
     fn サーバそのものは同梱を最後の段で探す() {
         let e = env("/Users/testuser", &[]);
         let no_path = |_: &str| None;
-        let server = PathBuf::from(format!("{IDE}/srv-ls"));
+        let server = Path::new(IDE).join("srv-ls");
         let fs = Files([server.clone()].into());
         let loc = locate(Platform::MacOs, &no_path, &e, &fs);
         assert_eq!(bundled_server(&伴走あり, &loc), Some(server));
