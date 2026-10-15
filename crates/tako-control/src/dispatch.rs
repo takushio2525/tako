@@ -37987,10 +37987,9 @@ mod tests {
     #[test]
     fn issue983_cli不在のspawnはペインを作らずに落ちる() {
         with_test_project(|| {
-            // 代表 1 系統だけを dispatch 層で確かめる（agent ごとの文言は
-            // `agent_cli` の unit テストが 3 系統ぶん見ている）。ここで系統数ぶん
-            // 回すと設定ファイルの読み書きが増え、プロセス全体の fd 数を見ている
-            // `ipc::連続接続でfdが漏れない` を揺らす（既に #916 で一度踏んでいる罠）
+            // 代表 1 系統だけを dispatch 層で確かめる。spawn の事前検査は agent を
+            // 引数に取る 1 経路（`agent_cli::preflight`）で系統による分岐が無く、
+            // agent ごとの文言は `agent_cli` の unit テストが全系統ぶん見ている
             {
                 let agent = crate::orchestrator::WorkerAgent::Codex;
                 let _guard = crate::orchestrator::agent_cli::test_force_missing(&[agent]);
@@ -38052,11 +38051,10 @@ mod tests {
     #[test]
     fn issue983_cliが在れば従来どおりspawnできて実行ファイルが応答に載る() {
         with_test_project(|| {
-            // 実探索（ログインシェルの起動）はここでは通さない。この経路の関心事は
-            // 「見つかったら従来どおり spawn できて、解決したパスが応答に載る」ことで、
-            // 探索そのものは agent_cli の unit テストが担保する（重い経路を本筋から
-            // 外す。プロセス全体の fd 数を見る `ipc::連続接続でfdが漏れない` が
-            // 一時的な子プロセスで揺れるため）
+            // この経路の関心事は「見つかったら従来どおり spawn できて、解決したパスが
+            // 応答に載る」ことなので、決まったパスで見つかった状態を作る（`cfg(test)` の
+            // 探索は実探索をしない。理由は `agent_cli::locate`。探索そのものは
+            // `tako_core::platform::exe` のテストが担保する）
             let _guard = crate::orchestrator::agent_cli::test_force_found(&[(
                 crate::orchestrator::WorkerAgent::Claude,
                 "/usr/local/bin/claude",

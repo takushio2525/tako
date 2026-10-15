@@ -669,10 +669,10 @@ pub fn legacy_skip_preflight() -> bool {
 thread_local! {
     static TEST_MISSING: std::cell::RefCell<Vec<WorkerAgent>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    // 「見つかったことにする」側。**実探索（ログインシェルの起動）を避ける**ための穴で、
-    // dispatch の正常系テストが使う。実探索そのものは agent_cli の unit テストが 1 回だけ
-    // 通す（プロセス全体の fd 数を見ている `ipc::連続接続でfdが漏れない` は、テストが
-    // 一時的に開く fd で揺れる。重い経路をテストの本筋から外して安定させる）
+    // 「見つかったことにする」側。`cfg(test)` の `locate` は実探索をせず既定の偽パス
+    // （`/test-stub/bin/<agent>`）を返す。**見つかったことをテストの中で明示し、パスも
+    // 決め打ちにしたい**テストがこれを使う（dispatch の正常系は解決したパスが応答に
+    // 載ることを見る / setup は引き継ぎ先の候補が居る状態を作る）
     static TEST_FOUND: std::cell::RefCell<Vec<(WorkerAgent, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -726,10 +726,11 @@ fn forced_found(agent: WorkerAgent) -> Option<String> {
 /// 反映されていない」状態を #868 の `resolve_binary` が拾えるので、その順で見る
 /// （`tako setup` の `find_agent_command` と同じ考え方）
 pub fn locate(agent: WorkerAgent) -> Result<String, AgentCliError> {
-    // テストでは**既定で実探索をしない**。実探索は unix ではログインシェルを起動する
-    // （`$SHELL -l -c`）ので、spawn 系テスト 1 本ごとに子プロセスが増え、プロセス全体の
-    // fd 数を見ている `ipc::連続接続でfdが漏れない` が 6 秒間の最小値でも tolerance を
-    // 超える（実測: fd 10 → 14。main では緑）。探索そのものは別のテストバイナリにある
+    // テストでは**実探索をしない**。①spawn 系テストの成否を「その機械に claude / codex /
+    // agy が入っているか」に左右させない（CI のランナー等には入っているとは限らない）
+    // ②unix の実探索はログインシェル（`$SHELL -l -c`）を起動するので、テスト 1 本ごとに
+    // 利用者の rc の重さぶん待ち、テストからログインシェルを起こすことにもなる。
+    // 探索そのものは別のテストバイナリにある
     // `tako_core::platform::exe::tests::実環境の基本コマンドを解決できる` が担保する
     #[cfg(test)]
     {
@@ -872,9 +873,8 @@ mod tests {
 
     // 探索経路（B16 = `platform::exe::find`）そのものの健全性は
     // `tako_core::platform::exe::tests::実環境の基本コマンドを解決できる` が見ている。
-    // **ここで同じことをやり直さない**: unix の実探索はログインシェルを起動するので、
-    // このクレートのテストバイナリでやると `ipc::連続接続でfdが漏れない`（プロセス全体の
-    // fd 数を見る）を数秒ぶん揺らして落とす（実測: fd 10 → 14。main では緑）
+    // **ここで同じことをやり直さない**: 同じ検査の二重持ちになるうえ、`locate` は
+    // `cfg(test)` では実探索をしない（理由は `locate` の中のコメント）
 
     #[test]
     fn 系統と種別の総当たりで理由と次の一手が必ず出る() {

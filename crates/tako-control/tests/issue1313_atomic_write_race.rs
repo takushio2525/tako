@@ -5,9 +5,9 @@
 //! 読み手は「空」または「どちらの本文でもない中身」を観測し、B の rename も失敗する。
 //! #638（`shell_integration::write_state_file`）/ #625（`tmux-backend.conf`）と同型。
 //!
-//! **単体テストではなく統合テスト（別バイナリ）に置く**。8 本のファイルを同時に開くので、
-//! 同じプロセスで走る `ipc::tests::連続接続でfdが漏れない`（プロセス全体の fd の
-//! 6 秒間最小値を見る）を押し上げうるため。
+//! **単体テストではなく統合テスト（別バイナリ）に置く**。公開 API（`config_io::atomic_write`）
+//! だけで組める回帰なので、issue ごとの回帰を `tests/issue<N>_*.rs` に置く慣例に揃える
+//! （A/B も `--test issue1313_atomic_write_race` でこの 1 本へ絞って回せる）。
 //!
 //! A/B: `TAKO_1313_LEGACY=1` で修正前の tmp 名へ戻り、このテストは FAILED になる。
 
