@@ -355,7 +355,7 @@ S1〜S6 には入れない。
 | action | 中身 | CLI | MCP |
 |---|---|---|---|
 | `status` | 展開先・版・注入の有無・ペインごとの最終報告（鮮度つき） | `tako mod`（引数なし = status。#322 の最簡形） | `tako_mod` の `action=status` |
-| `on` / `off` | 設定 `claude_mod` の切替 | `tako mod on` / `off` | `tako_mod` の `action=on|off` |
+| `on` / `off` | 設定 `claude_mod` の切替 | `tako mod on` / `off` | `tako_mod` の `action=on\|off` |
 | `report` | mod からの状態報告（§4.2）。応答に tako 側のスナップショット（§2.3） | `tako mod report`（stdin に JSON。`--help` には出さない） | **出さない**（理由は下） |
 
 - `report` を MCP カタログに載せないのは、AI が叩くと**自分の状態を偽って注入できるだけ**で、

@@ -33,6 +33,11 @@
 
 - 仕様書は `.agent/`（日本語）。コードコメントも日本語
 - 仕様変更時は該当する `.agent/*.md` を**同一コミット**で更新する
+- **Markdown の表のセルに書く `|` は `\|` にする（コードスパンの中でも）**（Issue #2051）。GFM は
+  inline より先に行を `|` で割るので、`` `tako mouse [on|off]` `` のままだとセルがはみ出し、
+  GitHub・docs サイト・tako のプレビューのどれもがはみ出した分を描かない。列が足りない行は空セル
+  （`|  |`）で揃える。番犬 `crates/tako-control/tests/issue2051_md_table_columns_watchdog.rs` が
+  リポジトリの全 md（`fixtures/` を除く）を見て `file:line` で落とす
 - 公開サイト（`docs/`）のアクセス解析タグは `docs/astro.config.mjs` の Starlight `head` に
   置き、**ID はファイル冒頭の定数 1 か所**（`GA_MEASUREMENT_ID` / `ADSENSE_PUBLISHER_ID`）で持つ。
   GA4 は `takushio2525.com` 一族で 1 プロパティを共有し、AdSense は所有権確認の meta だけ
