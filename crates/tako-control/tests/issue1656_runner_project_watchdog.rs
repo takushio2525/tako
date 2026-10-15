@@ -4,7 +4,7 @@
 //!
 //! 1. **入口がプロジェクトを見ない解決を呼ぶ形**。dispatch の `Run` / `RunResolve`
 //!    （CLI `tako run` / `--dry-run`・MCP `tako_run` / `tako_run_resolve`）と、再生ボタンの
-//!    プロファイル検出（`preview_render.rs`）が `resolve_file` 以外を通ると、cargo
+//!    一覧（#1733 から `run_menu_ui.rs` が dispatch `RunResolve` を取る）が `resolve_file` 以外を通ると、cargo
 //!    プロジェクトの `.rs` が `rustc` 単体へ落ちる元の症状へ戻る。プロジェクトを見ない
 //!    `resolve` / `resolve_for` は `#[cfg(test)] pub(crate)` なので外からはコンパイルが
 //!    通らないが、**探索を切れる `resolve_file_in(…, None)` はコンパイルが通る**。
@@ -47,7 +47,8 @@ fn read(rel: &str) -> String {
 }
 
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
-const PREVIEW: &str = "crates/tako-app/src/preview_render.rs";
+/// 再生ボタンの一覧（#1733 で `preview_render.rs` の同期の検出から、ドロップダウンの background 取得へ移った）
+const RUN_MENU: &str = "crates/tako-app/src/run_menu_ui.rs";
 const RUNNER: &str = "crates/tako-core/src/runner.rs";
 const PROJECT: &str = "crates/tako-core/src/runner_project.rs";
 const ROOT: &str = "crates/tako-core/src/project_root.rs";
@@ -101,19 +102,34 @@ fn dispatchの入口を確かめる(src: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 再生ボタンのプロファイル検出が `resolve_file` を通る（ドロップダウンと実行がずれない）
+/// 再生ボタンの一覧が dispatch `RunResolve`（= `finish_run_resolve` が `resolve_file` を通る）から
+/// 来る（ドロップダウンと実行がずれない）。#1733 で一覧は `run_menu_ui.rs` の background 取得へ移った。
+/// A/B の腕（`TAKO_1733_LEGACY=1`）だけが同期で `resolve_file` を呼ぶ
 fn 再生ボタンの入口を確かめる(src: &str) -> Result<(), String> {
-    let view = code_view(&production(src, PREVIEW));
+    let view = code_view(&production(src, RUN_MENU));
     let (from, body) = 区間(
         &view,
-        PREVIEW,
-        "fn detect_preview_run_profiles(",
-        "fn run_preview_file(",
+        RUN_MENU,
+        "pub(crate) fn request_run_resolve(",
+        "pub(crate) fn forget_run_menu(",
     )?;
-    if !body.contains("runner::resolve_file(") {
+    if !body.contains("Request::RunResolve {") {
         return Err(format!(
-            "{PREVIEW}:{} の `detect_preview_run_profiles` が `runner::resolve_file` を\
-             通っていない。再生ボタンの一覧と実行（dispatch `Run`）で解決がずれる（Issue #1656）",
+            "{RUN_MENU}:{} の `request_run_resolve` が dispatch `RunResolve` を通っていない。\
+             再生ボタンの一覧と実行（dispatch `Run`）で解決がずれる（Issue #1656 / #1733）",
+            行番号(src, from)
+        ));
+    }
+    let (from, legacy) = 区間(
+        &view,
+        RUN_MENU,
+        "fn legacy(path: &Path)",
+        "fn selected_profile(",
+    )?;
+    if !legacy.contains("runner::resolve_file(") {
+        return Err(format!(
+            "{RUN_MENU}:{} の A/B の腕（`RunView::legacy`）が `runner::resolve_file` を通っていない。\
+             プロジェクトを見ない解決は #1656 以前の形になる（Issue #1656）",
             行番号(src, from)
         ));
     }
@@ -168,7 +184,7 @@ fn dispatchのrunとrun_resolveはプロジェクトを見る入口を通る() {
 
 #[test]
 fn 再生ボタンのプロファイル検出はプロジェクトを見る入口を通る() {
-    再生ボタンの入口を確かめる(&read(PREVIEW)).unwrap_or_else(|e| panic!("{e}"));
+    再生ボタンの入口を確かめる(&read(RUN_MENU)).unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[test]
@@ -287,15 +303,20 @@ fn 注入した違反をfile_lineで名指しする() {
     );
     assert!(err.contains("1 回"), "{err}");
 
-    // 2. 再生ボタンの検出を探索なしへ戻す
-    let preview = read(PREVIEW);
-    let injected = preview.replacen("runner::resolve_file(", "runner::resolve_legacy(", 1);
-    let err =
-        再生ボタンの入口を確かめる(&injected).expect_err("再生ボタンの迂回を検出できていない");
-    assert!(
-        err.contains(&format!("{PREVIEW}:")),
-        "名指ししていない: {err}"
-    );
+    // 2. 再生ボタンの一覧を dispatch の外の解決へ戻す / A/B の腕を探索なしへ戻す
+    let menu = read(RUN_MENU);
+    for (from, to) in [
+        ("Request::RunResolve {", "LocalResolve {"),
+        ("runner::resolve_file(", "runner::resolve_legacy("),
+    ] {
+        let injected = menu.replacen(from, to, 1);
+        let err =
+            再生ボタンの入口を確かめる(&injected).expect_err("再生ボタンの迂回を検出できていない");
+        assert!(
+            err.contains(&format!("{RUN_MENU}:")),
+            "名指ししていない（{from}）: {err}"
+        );
+    }
 
     // 3. 探索を切る入口を本番コードで呼ぶ（コンパイルは通る形）
     let injected = dispatch.replacen(

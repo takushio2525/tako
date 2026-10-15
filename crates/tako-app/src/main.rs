@@ -59,6 +59,7 @@ mod references_panel;
 mod remote_panel;
 mod resource_panes;
 mod right_panel;
+mod run_menu_ui;
 mod search_panel;
 mod settings_sleep;
 mod settings_window;
@@ -1493,6 +1494,9 @@ enum AppTextInput {
     WorkspaceSearch,
     /// コードプレビューの名前の変更の欄（#1686）。同じ理由で最初から宛先に入れる
     LspRename,
+    /// 実行ボタン横のドロップダウンの欄（引数・環境変数・作業ディレクトリ・実行前・実行環境のパス。
+    /// #1733）。同じ理由で最初から宛先に入れる
+    RunMenu,
 }
 
 /// IME 変換中（未確定文字列 = marked text）の状態（FR-1.9）。
@@ -2693,12 +2697,10 @@ struct TakoApp {
     preview_restored_total: u64,
     /// 裏で手放した動画プレイヤーの再生状態（#2009。表に戻したら同じ位置・設定で開き直す）
     video_resume: HashMap<PaneId, VideoResume>,
-    /// Code Runner のプロファイルドロップダウンが開いているペインとアンカー位置
-    preview_run_menu: Option<(PaneId, gpui::Point<Pixels>)>,
-    /// Code Runner: ペインごとのキャッシュ済みプロファイル一覧（プレビュー読込時に解決）
-    preview_run_profiles: HashMap<PaneId, Vec<tako_core::RunPlan>>,
-    /// Code Runner: ペインごとの選択中プロファイル名
-    preview_run_selected: HashMap<PaneId, String>,
+    /// Code Runner: 実行ボタン横のドロップダウン（#1733）。ペインごとの `RunResolve` の答え・
+    /// 開いているメニュー・欄。選んだプロファイルは `run-configs.json` に保存する（#1731 以前の
+    /// メモリ上だけの `preview_run_selected` は廃止）
+    run_menu: crate::run_menu_ui::RunMenuUi,
     /// チェンジログビューのデータ（Issue #338。pane ごと）
     preview_changelogs: HashMap<PaneId, preview::ChangelogData>,
     /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
@@ -5013,9 +5015,7 @@ impl TakoApp {
             preview_released_total: 0,
             preview_restored_total: 0,
             video_resume: HashMap::new(),
-            preview_run_menu: None,
-            preview_run_profiles: HashMap::new(),
-            preview_run_selected: HashMap::new(),
+            run_menu: crate::run_menu_ui::RunMenuUi::default(),
             preview_changelogs: HashMap::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
@@ -5480,9 +5480,10 @@ impl TakoApp {
                         state
                     };
                     app.previews.insert(pane, state);
-                    // Code Runner: 復元経路でも実行プロファイルを検出する（#453）。
-                    // 検出しないと再生ボタンが淡色（クリック無効）のまま表示される
-                    app.detect_preview_run_profiles(pane, path);
+                    // Code Runner: 復元経路でも実行プロファイルを取る（#453）。取らないと再生ボタンが
+                    // 淡色（クリック無効）のまま表示される。`RunResolve` は background（#1733）なので
+                    // 積んでおき、下の `drain_pending_preview_loads` が流す
+                    app.queue_run_resolve(pane, path);
                     let outcome = tako_control::restore_report::PaneOutcome::Preview.within(hidden);
                     breakdown.record(outcome);
                     continue;
@@ -10639,6 +10640,8 @@ impl TakoApp {
         self.search_ui.focused = false;
         // #1686: 名前の変更の欄は閉じる出口を通す（欄宛ての変換も捨てる）
         self.close_lsp_rename();
+        // #1733: 実行ボタンのドロップダウンの欄も同じ（メニューは開いたまま）
+        self.close_run_menu_edit();
         self.git_agent_menu_open = false;
         // #1750: Web の 2 つの URL 欄は閉じる出口を通す（その欄宛ての変換も捨てる）
         self.blur_web_dock_url();
@@ -16637,6 +16640,11 @@ impl TakoApp {
             self.insert_app_text_input(AppTextInput::LspRename, &text, cx);
             return;
         }
+        // #1733: 実行ボタンのドロップダウンの欄
+        if self.run_menu_input_active() {
+            self.insert_app_text_input(AppTextInput::RunMenu, &text, cx);
+            return;
+        }
         if self.web_address_bar_editing().is_some() {
             self.insert_app_text_input(AppTextInput::WebAddress, &text, cx);
             return;
@@ -16871,6 +16879,8 @@ impl TakoApp {
             || self.search_input_active()
             // #1686: 名前の変更の欄も同じ
             || self.lsp_rename_input_active()
+            // #1733: 実行ボタンのドロップダウンの欄も同じ
+            || self.run_menu_input_active()
     }
 
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
@@ -16926,6 +16936,16 @@ impl TakoApp {
         }
         if self.lsp_rename.input.is_some() {
             self.handle_lsp_rename_key(keystroke, cx);
+            cx.stop_propagation();
+            return;
+        }
+        // #1733: 実行ボタンのドロップダウンの欄。見えていない欄（メニューを閉じた・タブを切り替えた）は
+        // 畳んでから下のチェーンへ流す（#1725 と同じ規則）
+        if self.run_menu.edit.is_some() && !self.run_menu_input_active() {
+            self.close_run_menu_edit();
+        }
+        if self.run_menu.edit.is_some() {
+            self.handle_run_menu_key(keystroke, cx);
             cx.stop_propagation();
             return;
         }
@@ -17272,6 +17292,10 @@ impl TakoApp {
         if self.lsp_rename_input_active() {
             return Some(AppTextInput::LspRename);
         }
+        // #1733: 実行ボタンのドロップダウンの欄も同じ
+        if self.run_menu_input_active() {
+            return Some(AppTextInput::RunMenu);
+        }
         if legacy_1750 && self.webview_dock_url_focused {
             return None;
         }
@@ -17325,6 +17349,7 @@ impl TakoApp {
             AppTextInput::WebDockUrl => self.web_dock_url_insert(text, cx),
             AppTextInput::WorkspaceSearch => self.search_insert(text, cx),
             AppTextInput::LspRename => self.lsp_rename_insert(text, cx),
+            AppTextInput::RunMenu => self.run_menu_insert(text, cx),
         }
     }
 
@@ -26694,7 +26719,9 @@ impl PreviewHost for TakoApp {
             self.preview_navigation_panel = None;
         }
         self.previews.insert(pane, state);
-        self.detect_preview_run_profiles(pane, path);
+        // #1733: 一覧は dispatch `RunResolve` を background で取る（dispatch の内側 = Context が無いので
+        // 積んでおき、`after_dispatch` の `drain_pending_preview_loads` が流す）
+        self.queue_run_resolve(pane, path);
         self.sync_preview_watches();
         Ok(())
     }
@@ -27741,6 +27768,14 @@ impl EntityInputHandler for TakoApp {
         if self.lsp_rename_input_active() {
             self.ime = None;
             self.insert_app_text_input(AppTextInput::LspRename, text, cx);
+            window.invalidate_character_coordinates();
+            cx.notify();
+            return;
+        }
+        // #1733: 実行ボタンのドロップダウンの欄（同上）
+        if self.run_menu_input_active() {
+            self.ime = None;
+            self.insert_app_text_input(AppTextInput::RunMenu, text, cx);
             window.invalidate_character_coordinates();
             cx.notify();
             return;
@@ -31659,8 +31694,14 @@ mod self_test {
     /// `rename-1686-real`）
     #[cfg(feature = "visual-test")]
     mod rename_1686;
+    /// #1733: 実行ボタン横のドロップダウン（開閉・候補・欄・出典タグ・RunResolve との一致）
+    /// （visual-test `run-dropdown-1733`）
+    #[cfg(feature = "visual-test")]
+    mod run_dropdown_1733;
     #[cfg(feature = "visual-test")]
     use rename_1686::{rename_1686_real_visual, rename_1686_visual};
+    #[cfg(feature = "visual-test")]
+    use run_dropdown_1733::run_dropdown_1733_visual;
     /// #1944: 言語サーバを取って起こす・エディタの状態（visual-test `lsp-fetch`）
     #[cfg(feature = "visual-test")]
     mod lsp_fetch_1944;
@@ -46090,6 +46131,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1733: 実行ボタン横のドロップダウン（実マウスで開く・候補を選ぶ・欄で直す・出典タグ）
+                "run-dropdown-1733" => {
+                    run_dropdown_1733_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1893: 右クリックの「ホバー情報を表示」・キー・補完中のキー・巨大な doc（偽サーバ）
                 "hover-1893" => {
                     hover_1893_visual(any, window, cx).await;
@@ -46350,7 +46397,7 @@ mod self_test {
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / tasks-tick / tasks-offload / shelve-tab / no-emoji / editor-keys / \
-                         run-command-truncate / viewport-lines / jump-keys / search-case / goto-hover / \
+                         run-command-truncate / run-dropdown-1733 / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
@@ -59422,6 +59469,36 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 実行ボタンの一覧（background の `RunResolve`。#1733）が届くまで待つ。届けば true
+    #[cfg(feature = "visual-test")]
+    async fn wait_run_view(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        limit: Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            notify_and_draw(any, window, cx);
+            let ready = window
+                .update(cx, |app: &mut TakoApp, _, _| {
+                    (app.run_menu.view(pane).is_some() || app.run_menu.error(pane).is_some())
+                        && !app.run_menu.loading(pane)
+                })
+                .unwrap_or(false);
+            if ready {
+                return true;
+            }
+            if start.elapsed() > limit {
+                return false;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+    }
+
     /// 実行コマンドと検索欄を**文字の途中で切って落ちない**か（#1728）。
     ///
     /// ヘッダの再生ボタンは描画のたびに実行コマンドを 60 で、実行メニューは行ごとに 40 で
@@ -59477,11 +59554,12 @@ mod self_test {
         };
         // 各プロファイルのコマンドのバイト数と、その位置が文字の途中か（場面が
         // 修正前に落ちる形になっているかをログで読めるようにする）
+        // #1733: 一覧は dispatch `RunResolve` を background で取った完成品（`run_menu`）
         let commands = |app: &TakoApp, pane: PaneId, cut: usize| -> Vec<(usize, bool)> {
-            app.preview_run_profiles
-                .get(&pane)
-                .map(|plans| {
-                    plans
+            app.run_menu
+                .view(pane)
+                .map(|view| {
+                    view.profiles
                         .iter()
                         .map(|p| {
                             let mid = p.command.len() > cut && !p.command.is_char_boundary(cut);
@@ -59500,11 +59578,19 @@ mod self_test {
                 let root = app.workspace.active_tab().tree().focused();
                 let pv = open(app, root, &first, true);
                 cx.notify();
-                pv.map(|pv| (pv, commands(app, pv, 60)))
+                pv
             })
             .ok()
             .flatten();
+        if let Some(pv) = opened {
+            wait_run_view(any, window, cx, pv, Duration::from_secs(10)).await;
+        }
         wait(cx, 700).await;
+        let opened = opened.and_then(|pv| {
+            window
+                .update(cx, |app: &mut TakoApp, _, _| (pv, commands(app, pv, 60)))
+                .ok()
+        });
         let Some((pv, first_cmds)) = opened else {
             println!("TAKO_VISUAL_1728: SKIPPED（1 枚目を開けない）");
             let _ = std::fs::remove_dir_all(&dir);
@@ -59515,7 +59601,7 @@ mod self_test {
         // 2. 同じペインへ 2 枚目を開き、実行メニュー（行ごとに 40 で切る）と
         //    検索欄（「ab」を打ったあとクエリだけ「あいう」へ差し替わった状態）を出す
         let second_state = window
-            .update(cx, |app: &mut TakoApp, win, cx| {
+            .update(cx, |app: &mut TakoApp, _, cx| {
                 let pv2 = open(app, pv, &second, false).unwrap_or(pv);
                 let search = |app: &mut TakoApp, query: &str| {
                     let _ = tako_control::dispatch(
@@ -59544,12 +59630,22 @@ mod self_test {
                     edit.search_focus = preview::SearchFieldFocus::Query;
                     (edit.search_cursor, edit.search_query.len())
                 });
-                let vp = win.viewport_size();
-                app.preview_run_menu = Some((pv2, gpui::point(vp.width * 0.75, px(72.0))));
                 cx.notify();
-                (pv2, commands(app, pv2, 40), cursor)
+                (pv2, cursor)
             })
             .ok();
+        if let Some((pv2, _)) = second_state {
+            wait_run_view(any, window, cx, pv2, Duration::from_secs(10)).await;
+        }
+        let second_state = second_state.and_then(|(pv2, cursor)| {
+            window
+                .update(cx, |app: &mut TakoApp, win, cx| {
+                    let vp = win.viewport_size();
+                    app.toggle_run_menu(pv2, gpui::point(vp.width * 0.75, px(72.0)), vp, cx);
+                    (pv2, commands(app, pv2, 40), cursor)
+                })
+                .ok()
+        });
         wait(cx, 700).await;
         let Some((pv2, menu_cmds, cursor)) = second_state else {
             println!("TAKO_VISUAL_1728: SKIPPED（2 枚目の場面を組めない）");
@@ -59558,7 +59654,7 @@ mod self_test {
         };
         let frame = capture_frame(any, cx);
         let menu_open = window
-            .update(cx, |app: &mut TakoApp, _, _| app.preview_run_menu.is_some())
+            .update(cx, |app: &mut TakoApp, _, _| app.run_menu.open.is_some())
             .unwrap_or(false);
         if let (Ok(dump), Some((frame, _))) = (std::env::var("TAKO_VISUAL_DUMP_DIR"), &frame) {
             let _ = frame.save(std::path::Path::new(&dump).join("run-command-truncate.png"));
@@ -59572,7 +59668,7 @@ mod self_test {
             frame.as_ref().map(|(f, _)| f.dimensions())
         );
         let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
-            app.preview_run_menu = None;
+            app.close_run_menu();
             cx.notify();
         });
         let _ = std::fs::remove_dir_all(&dir);

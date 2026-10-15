@@ -714,6 +714,30 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
   - 描画から検出関数を呼んでいない番犬（`render_*` の本文に `runtime_env::` / `runtime_probe::` が現れたら落とす）
   - 仮想ディスプレイ上の隔離 GUI でスクショ（メニューの開閉・候補・TextField 編集・出典タグの切り替え）。目視項目は manual-checks.md へ
 - 依存: S3（S4 の項目は、S4 が未着地なら行を出さない）/ #1657（`preview_render.rs` の完了バッジと重なる）/ 規模: L
+- **実装で決めたこと（#1733。この節の案からの差分。正本は FR-3.18.7）**:
+  - **置き場は新しいモジュール `crates/tako-app/src/run_menu_ui.rs`**（状態・取得・書き込み・欄・メニューの描画）。
+    `preview_render.rs` はヘッダの再生ボタン・シェブロン・実行環境のラベルだけを持つ（#1686 の名前の変更の欄と同じ切り方）。
+    状態は §7.4 の `preview_run_resolved` ではなく `run_menu: RunMenuUi`（ペインごとの答え + 開いているメニュー + 欄）に
+    まとめ、`preview_run_menu` / `preview_run_profiles` / `preview_run_selected` の 3 つは廃止した
+  - **答えは `RunView`（応答を型へ写しただけ）と原文の両方を持つ**。描画は前者を読む。visual-test は別に取った
+    `RunResolve` と字面で突き合わせる。選んでいるプロファイルは `config.profile.value` → `default_profile`
+    （`RunResolve` の `default_profile` は保存した選択を重ねない宣言の既定なので、`Run` の `profile.or(saved)` と同じ順で読む）
+  - **取得の起点**: Context の無い経路（dispatch の `set_preview`・復元・改名の追従）は `queue_run_resolve` で積み、
+    `drain_pending_preview_loads`（`after_dispatch` と全ての `drain_pending_highlights` が通る）が `dispatch_off_ui` へ流す。
+    リロードとメニューを開いた時点は Context があるので直に頼む（CLI からの `tako run-config` を開いた時点で拾う）
+  - **シェブロンの条件**: 走らせるコマンドがある（`profiles` が空でない）か、`RunResolve` の答えに実行環境の種類がある。
+    `RunResolve` がエラー（コマンド無し）の拡張子は種類を返さないので出ない（拡張子既定を空にした `.py` 等。既知の限界）
+  - **幅の閾値**: `run_chevron` は `run_button` と同じ 250（ボタンが見えているのに設定の入口だけ消える幅を作らない）、
+    `run_runtime_label` は 360（`mode_toggle` 350 の後）
+  - **保存先**: 新しく入れた値は dispatch の既定（実行環境 = project・それ以外 = file）、既に保存した項目は今の保存先へ書く。
+    出典タグは「移す先へ書く → 元から消す」の 2 回の `RunnerDefaults`。宣言 / 自動 / 既定のタグは押せない
+  - **空のまま Enter は保存しない**（§7.3 には無い。`args: ""` を保存すると下のスコープの値を空で覆い隠すが、
+    画面からは「消した」と区別できない。既定へ戻すのは行の ×）。名前の検め・作業ディレクトリの実在・実行環境が解けるかは
+    dispatch が断り、その理由を欄の下に出す（UI で判定を重ねない）
+  - **再検出は回転表示にしない**（§7.5 の #945）。押している間は文言だけ「確かめています…」に替え、答えが届いたら戻す
+  - **プロファイルの行は「選んで保存 → 走らせる」**（#453 M4 の挙動を保つ）。再生ボタンは `profile` を渡さず、保存した選択を
+    dispatch `Run` が重ねる（CLI `tako run <f>` と同じ選び方）
+  - A/B は `TAKO_1733_LEGACY=1`（一覧を #1733 以前の同期の解決で作る）。visual-test `run-dropdown-1733` の ① が名指しで落ちる
 
 ### S6: 実行先（同じペイン / 新しいペイン）を覚える
 

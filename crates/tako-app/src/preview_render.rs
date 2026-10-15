@@ -2018,19 +2018,24 @@ impl TakoApp {
         // Markdown のリンク当たり判定（#680。md 以外は None = 前フレームの残骸を消す）
         let mut md_link_hits: Option<Vec<MdLinkHit>> = None;
 
-        // Code Runner 状態（#453 M4）
-        let run_profiles = self
-            .preview_run_profiles
-            .get(&pane_id)
-            .cloned()
-            .unwrap_or_default();
-        let run_capable = !run_profiles.is_empty();
-        let run_has_multiple = run_profiles.len() >= 2;
-        let run_selected = self
-            .preview_run_selected
-            .get(&pane_id)
-            .cloned()
+        // Code Runner 状態（#453 M4）。#1733: dispatch `RunResolve` の答え（background で取った完成品）を
+        // 読むだけ（描画から検出を呼ばない = 番犬 `issue1733_run_menu_watchdog`）
+        let run_view = self.run_menu.view(pane_id);
+        let run_capable = run_view.is_some_and(|v| v.run_capable());
+        let run_has_multiple = run_view.is_some_and(|v| v.profiles.len() >= 2);
+        // シェブロンは実行できるか、実行環境の種類があるときは常に出す（設定の入口。#1733）
+        let run_chevron = run_capable || run_view.is_some_and(|v| v.runtime_kind.is_some());
+        let run_selected = run_view
+            .map(|v| v.selected_profile().to_string())
             .unwrap_or_else(|| "default".to_string());
+        // 再生ボタンのツールチップ = 実行されるコマンドの全文（P2。#1733 以前は組んでも出していなかった）
+        let run_command = run_view
+            .and_then(|v| v.selected_row())
+            .map(|r| r.command.clone());
+        let run_runtime_label = run_view
+            .and_then(|v| v.runtime.as_ref())
+            .map(|r| r.short_label());
+        let run_menu_open = self.run_menu.is_open(pane_id);
         let run_file_path = state.path.clone();
         let is_code_or_md = matches!(
             mode,
@@ -3364,32 +3369,26 @@ impl TakoApp {
                                         ),
                                 )
                             })
-                            // Code Runner 再生ボタン（#453 M4）
+                            // Code Runner 再生ボタン（#453 M4）+ ドロップダウンのシェブロン（#1733）
                             .when(phv.run_button && is_code_or_md, |d| {
                                 let run_path = run_file_path.clone();
-                                let run_sel = run_selected.clone();
-                                let run_profile_label = if run_sel == "default" {
+                                let run_profile_label = if run_selected == "default" {
                                     crate::ui_text::preview::run_profile_default().to_string()
                                 } else {
-                                    run_sel.clone()
+                                    run_selected.clone()
                                 };
-                                let _tooltip: String = if run_capable {
-                                    run_profiles
-                                        .iter()
-                                        .find(|p| p.profile == run_sel)
-                                        .or_else(|| run_profiles.first())
-                                        // 文字数で切る（#1728。バイト位置で切ると日本語の
-                                        // ファイル名の途中に当たって描画中に panic する）
-                                        .map(|p| tako_core::text::truncate_chars(&p.command, 60))
-                                        .unwrap_or_default()
-                                } else {
-                                    crate::ui_text::preview::run_no_command().to_string()
+                                let tooltip: String = match (&run_command, run_capable) {
+                                    (Some(cmd), true) => crate::ui_text::preview::run_tooltip(cmd),
+                                    _ => crate::ui_text::preview::run_no_command().to_string(),
                                 };
+                                let tip_theme = theme.clone();
                                 let icon_color = if run_capable {
                                     theme.green
                                 } else {
                                     theme.text_faint
                                 };
+                                let chevron_probe = self.panel_click_probe_bounds.clone();
+                                let chevron_key = format!("preview-run-dd-{}", pane_id.as_u64());
                                 d.child(
                                     div()
                                         .flex()
@@ -3419,6 +3418,15 @@ impl TakoApp {
                                                         ))
                                                     })
                                                 })
+                                                .tooltip(move |_, cx| {
+                                                    cx.new(|_| {
+                                                        crate::tab_bar::HintTooltip::new(
+                                                            tooltip.clone(),
+                                                            tip_theme.clone(),
+                                                        )
+                                                    })
+                                                    .into()
+                                                })
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(|_, _: &MouseDownEvent, _, cx| {
@@ -3427,14 +3435,14 @@ impl TakoApp {
                                                 )
                                                 .when(run_capable, |d| {
                                                     let path_for_click = run_path.clone();
-                                                    let sel_for_click = run_sel.clone();
                                                     d.on_click(cx.listener(
                                                         move |this, _, _, cx| {
                                                             cx.stop_propagation();
+                                                            // 選んだプロファイルは dispatch `Run` が
+                                                            // 保存した実行設定から重ねる（#1731 / #1733）
                                                             this.run_preview_file(
                                                                 pane_id,
                                                                 &path_for_click,
-                                                                &sel_for_click,
                                                                 cx,
                                                             );
                                                         },
@@ -3460,21 +3468,43 @@ impl TakoApp {
                                                         run_profile_label.clone(),
                                                     ))
                                                     .text_color(hsla(icon_color))
-                                                }),
+                                                })
+                                                // 選んだ実行環境の短いラベル（淡色。幅 360 以上）
+                                                .when_some(
+                                                    run_runtime_label
+                                                        .clone()
+                                                        .filter(|_| phv.run_runtime_label),
+                                                    |d, label| {
+                                                        d.child(
+                                                            div()
+                                                                .text_size(px(10.5))
+                                                                .text_color(hsla(theme.text_faint))
+                                                                .child(SharedString::from(label)),
+                                                        )
+                                                    },
+                                                ),
                                         )
-                                        // ドロップダウンシェブロン（2+ プロファイル時のみ）
-                                        .when(run_has_multiple, |d| {
+                                        // ドロップダウンのシェブロン（実行設定の入口。#1733）
+                                        .when(phv.run_chevron && run_chevron, |d| {
                                             d.child(
                                                 div()
                                                     .id((
                                                         "preview-run-dd",
                                                         pane_id.as_u64(),
                                                     ))
+                                                    .relative()
                                                     .flex()
                                                     .items_center()
                                                     .px(px(2.0))
+                                                    .py(px(2.0))
                                                     .rounded_sm()
                                                     .cursor_pointer()
+                                                    .when(run_menu_open, |d| {
+                                                        d.bg(rgba_alpha(
+                                                            theme.tab_active_background,
+                                                            0.8,
+                                                        ))
+                                                    })
                                                     .hover(|d| {
                                                         d.bg(rgba_alpha(
                                                             theme.tab_active_background,
@@ -3486,24 +3516,15 @@ impl TakoApp {
                                                         cx.listener(
                                                             move |this,
                                                                   event: &MouseDownEvent,
-                                                                  _,
+                                                                  window,
                                                                   cx| {
                                                                 cx.stop_propagation();
-                                                                if this
-                                                                    .preview_run_menu
-                                                                    .as_ref()
-                                                                    .map(|m| m.0)
-                                                                    == Some(pane_id)
-                                                                {
-                                                                    this.preview_run_menu = None;
-                                                                } else {
-                                                                    this.preview_run_menu =
-                                                                        Some((
-                                                                            pane_id,
-                                                                            event.position,
-                                                                        ));
-                                                                }
-                                                                cx.notify();
+                                                                this.toggle_run_menu(
+                                                                    pane_id,
+                                                                    event.position,
+                                                                    window.viewport_size(),
+                                                                    cx,
+                                                                );
                                                             },
                                                         ),
                                                     )
@@ -3517,6 +3538,24 @@ impl TakoApp {
                                                             .text_color(hsla(
                                                                 theme.text_tertiary,
                                                             )),
+                                                    )
+                                                    // 実矩形（visual-test が実マウスで押す）
+                                                    .child(
+                                                        canvas(
+                                                            |_, _, _| (),
+                                                            move |bounds, _, _, _| {
+                                                                chevron_probe
+                                                                    .borrow_mut()
+                                                                    .insert(
+                                                                        chevron_key.clone(),
+                                                                        bounds,
+                                                                    );
+                                                            },
+                                                        )
+                                                        .absolute()
+                                                        .top_0()
+                                                        .left_0()
+                                                        .size_full(),
                                                     ),
                                             )
                                         }),
@@ -4381,8 +4420,8 @@ impl TakoApp {
         self.preview_md_resume_heading.remove(&pane_id);
         self.preview_md_block_index.remove(&pane_id);
         self.preview_changelogs.remove(&pane_id);
-        self.preview_run_profiles.remove(&pane_id);
-        self.preview_run_selected.remove(&pane_id);
+        // #1733: 実行ボタンの一覧・開いているメニュー・欄
+        self.forget_run_menu(pane_id);
         // #919: リモート由来の記録（ヘッダ表示と保存先の切り替えに使う）
         self.preview_remote_origins.remove(&pane_id);
         // #966: 書き戻しの進行状態。**退避（pending）は消さない**
@@ -4390,9 +4429,6 @@ impl TakoApp {
         self.preview_remote_read_only.remove(&pane_id);
         self.preview_remote_push.remove(&pane_id);
         self.remote_push_again.remove(&pane_id);
-        if self.preview_run_menu.as_ref().map(|m| m.0) == Some(pane_id) {
-            self.preview_run_menu = None;
-        }
         self.preview_pdf_char_bounds.remove(&pane_id);
         self.preview_pdf_highlight_paint_count.remove(&pane_id);
         self.preview_pdf_page_image_bounds.remove(&pane_id);
@@ -5318,54 +5354,17 @@ impl TakoApp {
         cx.notify();
     }
 
-    /// Code Runner: 再生ボタンクリック → dispatch Run（#453 M4）
-    /// Code Runner: プレビュー対象ファイルの実行プロファイルを検出して登録する（#453 M4）。
-    /// set_preview（dispatch OpenFile）だけでなく persist 復元・ライブリロードの
-    /// プレビュー差し替えでも呼ぶ。呼び漏れると `preview_run_profiles` が空のままになり、
-    /// 再生ボタンが淡色（クリック無効）で表示される
-    pub(crate) fn detect_preview_run_profiles(&mut self, pane: PaneId, path: &std::path::Path) {
-        use tako_core::runner;
-        if let Some(head) = runner::read_file_head_for_ui(path) {
-            let settings = tako_control::settings::load();
-            // dispatch `Run` と同じ 1 本（プロジェクト既定まで見る。#1656）
-            match runner::resolve_file(
-                path,
-                &head,
-                &settings.runner_defaults,
-                None,
-                None,
-                // 一覧の表示用（実行は dispatch `Run` が実行環境・実行設定を重ねる。一覧を
-                // RunResolve へ寄せるのは #1726 S5）
-                &runner::RuntimeWords::new(),
-                &runner::ConfigLayer::default(),
-            ) {
-                Ok(resolution) => {
-                    self.preview_run_profiles
-                        .insert(pane, resolution.all_profiles);
-                }
-                Err(_) => {
-                    self.preview_run_profiles.insert(pane, Vec::new());
-                }
-            }
-        } else {
-            self.preview_run_profiles.remove(&pane);
-        }
-    }
-
+    /// Code Runner: 再生ボタン / ドロップダウンのプロファイルの行 → dispatch `Run`（#453 M4）。
+    /// プロファイルは渡さない: 選んだプロファイルは保存した実行設定（#1731）として dispatch が重ねる
+    /// （CLI `tako run <file>` と同じ選び方になる。#1733 で `preview_run_selected` を廃止）
     pub(crate) fn run_preview_file(
         &mut self,
         pane_id: PaneId,
         path: &std::path::Path,
-        profile: &str,
         cx: &mut gpui::Context<Self>,
     ) {
         // 未保存の編集は dispatch `Run` が走らせる前に保存する（#1662。`tako run` /
         // MCP `tako_run` と同じ 1 実装。保存できなければ Err で返り、下の通知欄に出る）
-        let profile_param = if profile == "default" {
-            None
-        } else {
-            Some(profile.to_string())
-        };
 
         let result = tako_control::dispatch(
             self,
@@ -5373,7 +5372,7 @@ impl TakoApp {
                 path: path.to_string_lossy().to_string(),
                 pane: Some(pane_id.as_u64()),
                 tab: None,
-                profile: profile_param,
+                profile: None,
                 command: None,
                 direction: Some(tako_control::protocol::Direction::Down),
                 ratio: Some(0.3),
@@ -5413,117 +5412,6 @@ impl TakoApp {
             }
         }
         cx.notify();
-    }
-
-    /// Code Runner: プロファイルドロップダウンオーバーレイの描画（#453 M4）
-    pub(crate) fn render_run_menu_overlay(
-        &self,
-        cx: &mut gpui::Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let (pane_id, anchor) = self.preview_run_menu?;
-        let profiles = self.preview_run_profiles.get(&pane_id)?.clone();
-        if profiles.is_empty() {
-            return None;
-        }
-        let theme = self.theme.clone();
-        let selected = self
-            .preview_run_selected
-            .get(&pane_id)
-            .cloned()
-            .unwrap_or_else(|| "default".to_string());
-
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for plan in &profiles {
-            let profile_name = plan.profile.clone();
-            let display_name = if profile_name == "default" {
-                crate::ui_text::preview::run_profile_default().to_string()
-            } else {
-                profile_name.clone()
-            };
-            let is_selected = profile_name == selected;
-            // 文字数で切る（#1728。バイト位置で切ると文字の途中に当たって描画中に panic する）
-            let cmd_preview = tako_core::text::truncate_chars(&plan.command, 40);
-            let path = self
-                .previews
-                .get(&pane_id)
-                .map(|s| s.path.clone())
-                .unwrap_or_default();
-
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("run-profile-{}", profile_name)))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    .when(is_selected, |d| d.bg(rgba(theme.surface_hover_strong)))
-                    .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.preview_run_selected
-                            .insert(pane_id, profile_name.clone());
-                        this.preview_run_menu = None;
-                        this.run_preview_file(pane_id, &path, &profile_name, cx);
-                    }))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(11.5))
-                            .text_color(if is_selected {
-                                hsla(theme.foreground)
-                            } else {
-                                hsla(theme.text_secondary)
-                            })
-                            .child(SharedString::from(display_name)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(hsla(theme.text_faint))
-                            .child(SharedString::from(cmd_preview)),
-                    )
-                    .into_any_element(),
-            );
-        }
-
-        let menu_w: f32 = 280.0;
-        let menu_left = (f32::from(anchor.x) - menu_w / 2.0).max(0.0);
-
-        Some(
-            div()
-                .id("run-menu-dismiss")
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .size_full()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.preview_run_menu = None;
-                        cx.stop_propagation();
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(menu_left))
-                        .top(px(f32::from(anchor.y) + 4.0))
-                        .w(px(menu_w))
-                        .bg(rgba(theme.surface_1))
-                        .border_1()
-                        .border_color(hsla(theme.border_default))
-                        .rounded(px(8.0))
-                        .shadow_lg()
-                        .p(px(6.0))
-                        .children(rows),
-                )
-                .into_any_element(),
-        )
     }
 
     /// チェンジログビューの本文描画（Issue #338）

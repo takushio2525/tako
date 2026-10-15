@@ -3527,6 +3527,8 @@ impl TakoApp {
         for (pane, path, text, ticket) in std::mem::take(&mut self.pending_md_resumes) {
             self.spawn_md_resume(pane, path, text, ticket, cx);
         }
+        // #1733: 実行ボタンの一覧（dispatch `RunResolve`）も background で取る
+        self.drain_pending_run_resolves(cx);
     }
 
     /// 編集を抜けた大きい Markdown を background で描き直す（#1661）。
@@ -3803,8 +3805,9 @@ impl TakoApp {
                 edit.diagnostics = None;
             }
             self.sync_preview_lsp(pane);
-            // Code Runner の宣言はパスから決まる（`${file}` の展開先も変わる）
-            self.detect_preview_run_profiles(pane, &follow.to);
+            // Code Runner の宣言はパスから決まる（`${file}` の展開先も変わる）。#1733: 取り直しは
+            // background（積んでおき `drain_pending_preview_loads` が流す）
+            self.queue_run_resolve(pane, &follow.to);
         }
         // 戻る / 進むの項目も付け替える（残すと「消えていた」として捨てられる）
         self.jump_history.retarget_path(from, to);
@@ -5045,8 +5048,9 @@ impl TakoApp {
         // これにより暗転（空 div フォールバック）と旧資源残留を同時に防ぐ。(#257 / #258)
         self.pending_pdf_rasters.remove(&pane);
         self.previews.insert(pane, loaded.state);
-        // Code Runner: リロードで tako:run 宣言の追加・削除を反映する（#453）
-        self.detect_preview_run_profiles(pane, path);
+        // Code Runner: リロードで tako:run 宣言の追加・削除を反映する（#453。#1733 で background の
+        // `RunResolve` へ。取得中は前回の一覧を出す）
+        self.request_run_resolve(pane, path.to_path_buf(), false, cx);
         self.preview_reload_apply_count = self.preview_reload_apply_count.saturating_add(1);
         cx.notify();
     }
