@@ -1325,8 +1325,9 @@ unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる�
 純粋関数なので**表示言語グローバルに触らず検査できる**（#608 / #807 の競合対策と同じ作法）。
 claude の導入手順は境界 B17（`platform::agent_install`）の正本から引き、ログインのコマンドは
 `agent_cli::auth_command` が正本（#1002 の `agent_models` もここを引く = 二重管理しない）。
-`cfg(test)` では実探索をしない（unix の実探索はログインシェルを起動するので、テストごとに
-子プロセスが増えて `ipc::連続接続でfdが漏れない` を落とす）。
+`cfg(test)` では実探索をしない（spawn 系テストの成否をその機械に agent CLI が入っているかに
+左右させない・unix の実探索はログインシェルを起動する。探索そのものは
+`tako_core::platform::exe` のテストが担保する）。
 
 失敗の種別は **6 つ**（`cli_not_found` / `not_authenticated` / `trust_write_failed` /
 `exited_immediately` / `local_runtime_down` / `local_model_missing`）で、**4 系統 × 起こりうる
