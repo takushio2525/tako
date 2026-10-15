@@ -1145,8 +1145,61 @@ fn restore_tab(tab_layout: &TabLayout, restored: &mut Vec<RestoredPane>) -> Opti
                 if released.renamed { "applied" } else { "none" },
             ));
         }
+        // solo のペインの cwd は layout が持っている（復元したペインの記録から引く）
+        let solo_initial_title = |pane: PaneId| {
+            restored
+                .iter()
+                .find(|r| r.pane == pane.as_u64())
+                .and_then(|r| r.cwd.as_deref())
+                .and_then(|cwd| tako_core::master_tab::solo_initial_title(Path::new(cwd)))
+        };
+        if let Some(renamed) = release_legacy_solo_title(&mut tab, &solo_initial_title) {
+            crate::diag::persist_log(&format!(
+                "[tab-title] tab={} 旧版が付けた solo の手動名を解除 project_name={}（#2127）",
+                tab.id().as_u64(),
+                if renamed { "applied" } else { "none" },
+            ));
+        }
     }
     Some(tab)
+}
+
+/// 旧版の tako が `tako solo` の起動で付けた**役割名の手動名**を外す（#2127）。
+///
+/// #2127 以前の `tako solo` は、タブ名を `solo` / `solo-<名前>` の手動名で付けていたので、
+/// solo の `tako_rename_tab(source: "auto")` が全部弾かれた。判定は master の
+/// [`release_legacy_master_title`] と同じ形で、解除の対象は 3 つが揃うタブだけ:
+///
+/// 1. 手動名である
+/// 2. 名前が、タブにいる solo のペインの role から組み立てた旧い名前と一致する
+///    （[`tako_core::master_tab::is_legacy_solo_title`]。`solo:fast` のペインなら `solo-fast`）
+/// 3. 2 の solo のペインがいる（solo のいないタブの `solo` は対象外）
+///
+/// 外したあとは solo の作業フォルダ（`initial_title_of` が solo のペインから引く）の
+/// リポジトリ名を自動名で付ける。引けなければ名前は残して手動だけを外す（solo が次に
+/// 付け直せる）。戻りは「付け直したか」（解除しなかったら `None`）
+pub(crate) fn release_legacy_solo_title(
+    tab: &mut Tab,
+    initial_title_of: &dyn Fn(PaneId) -> Option<String>,
+) -> Option<bool> {
+    if tab.title_source() != TitleSource::Manual {
+        return None;
+    }
+    let title = tab.title().to_string();
+    let solo = tab
+        .tree()
+        .panes()
+        .iter()
+        .find(|p| {
+            p.role()
+                .is_some_and(|r| tako_core::master_tab::is_legacy_solo_title(&title, r))
+        })?
+        .id();
+    tab.clear_manual_title();
+    Some(match initial_title_of(solo) {
+        Some(name) => tab.set_title_auto(name),
+        None => false,
+    })
 }
 
 /// [`release_legacy_master_title`] が解除した内訳（persist.log へ残す）
@@ -1908,6 +1961,99 @@ mod tests {
         assert_eq!(by_id(generic), ("master".into(), TitleSource::Default));
         assert_eq!(by_id(users), ("my-site".into(), TitleSource::Manual));
         assert_eq!(by_id(branch), ("master".into(), TitleSource::Manual));
+    }
+
+    /// #2127: 旧版の `tako solo` が付けた「solo」の手動名だけが外れ、別の手動名は残る
+    #[test]
+    fn issue2127_旧いsoloの手動名だけを解除する() {
+        let mut ws = Workspace::new("1", Pane::new(PaneOrigin::User));
+        let plain = master_tab_fixture(&mut ws, "solo", true, Some("solo"));
+        // 再起動で tmux の env から戻した語彙 + 名前付きのプロファイル
+        let named = master_tab_fixture(&mut ws, "solo-fast", true, Some("orchestrator-solo:fast"));
+        // role と名前が合わない（`tako solo` のペインに `solo-fast`）= 旧版の起動ではない
+        let mismatch = master_tab_fixture(&mut ws, "solo-fast", true, Some("solo"));
+        // ユーザーが solo のタブへ手で付けた名前
+        let users = master_tab_fixture(&mut ws, "レポート", true, Some("solo"));
+        // solo のいないタブの「solo」/ master のタブの「solo」は触らない
+        let no_role = master_tab_fixture(&mut ws, "solo", true, None);
+        let master = master_tab_fixture(&mut ws, "solo", true, Some("orchestrator-master"));
+        // 既に自動名なら解除するものが無い
+        let auto = master_tab_fixture(&mut ws, "solo", false, Some("solo"));
+        // solo のペイン → 作業フォルダのリポジトリ名（`tako solo` のペインだけ引ける想定）
+        let plain_pane = ws.get_tab(plain).unwrap().tree().panes()[0].id();
+        let resolver = move |pane: PaneId| (pane == plain_pane).then(|| "my-app".to_string());
+
+        let mut released = Vec::new();
+        for id in [plain, named, mismatch, users, no_role, master, auto] {
+            let tab = ws.get_tab_mut(id).unwrap();
+            released.push(release_legacy_solo_title(tab, &resolver));
+        }
+        assert_eq!(
+            released,
+            vec![Some(true), Some(false), None, None, None, None, None]
+        );
+        let state = |id: TabId| {
+            let t = ws.get_tab(id).unwrap();
+            (t.title().to_string(), t.title_source())
+        };
+        // 作業フォルダが引ければそのリポジトリ名の自動名
+        assert_eq!(state(plain), ("my-app".into(), TitleSource::Auto));
+        // 引けなければ名前は残して手動だけ外す（solo が次に付け直せる）
+        assert_eq!(state(named), ("solo-fast".into(), TitleSource::Default));
+        assert_eq!(state(mismatch), ("solo-fast".into(), TitleSource::Manual));
+        assert_eq!(state(users), ("レポート".into(), TitleSource::Manual));
+        assert_eq!(state(no_role), ("solo".into(), TitleSource::Manual));
+        assert_eq!(state(master), ("solo".into(), TitleSource::Manual));
+        assert_eq!(state(auto), ("solo".into(), TitleSource::Auto));
+
+        // 解除したあとは solo の自動名が通る（以前は手動名に弾かれて `solo` のまま）
+        let t = ws.get_tab_mut(named).unwrap();
+        assert!(t.set_title_auto("CI修正"));
+        // 手で付けた名前は自動名で上書きされない
+        let t = ws.get_tab_mut(users).unwrap();
+        assert!(!t.set_title_auto("my-app"));
+        assert_eq!(t.title(), "レポート");
+    }
+
+    /// #2127（ファイル経由）: 旧形式の layout.json を読ませると、復元の時点で「solo」の
+    /// 手動名が外れて solo の作業フォルダのリポジトリ名になり、ユーザーの手動名と
+    /// master の側（#2120）はそれぞれの規則のまま
+    #[test]
+    fn issue2127_旧形式のlayoutを復元するとsoloの手動名が外れる() {
+        if tako_core::master_tab::legacy() {
+            return; // A/B の旧挙動で回しているときは対象外
+        }
+        let base = std::env::temp_dir().join(format!("tako-layout-2127-{}", std::process::id()));
+        let repo = base.join("s2127-app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        let mut ws = Workspace::new("1", Pane::new(PaneOrigin::User));
+        let solo = master_tab_fixture(&mut ws, "solo", true, Some("solo"));
+        let users = master_tab_fixture(&mut ws, "自分の名前", true, Some("solo:fast"));
+        let master = master_tab_fixture(&mut ws, "master", true, Some("orchestrator-master"));
+        let solo_pane = ws.get_tab(solo).unwrap().tree().panes()[0].id();
+        let cwd = repo.join("docs").display().to_string();
+        let meta = |pane: PaneId| PaneMeta {
+            cwd: (pane == solo_pane).then(|| cwd.clone()),
+            ..PaneMeta::default()
+        };
+        let json = serde_json::to_string(&capture(&ws, &meta, None)).unwrap();
+        // 旧版が書いた形そのもの（手動名の「solo」が入っている）
+        assert!(
+            json.contains(r#""title":"solo","title_source":"manual""#),
+            "{json}"
+        );
+
+        let file: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored, _) = restore(&file).expect("復元できる");
+        let _ = std::fs::remove_dir_all(&base);
+        let by_id = |id: TabId| {
+            let t = restored.get_tab(id).expect("同じ ID で戻る");
+            (t.title().to_string(), t.title_source())
+        };
+        assert_eq!(by_id(solo), ("s2127-app".into(), TitleSource::Auto));
+        assert_eq!(by_id(users), ("自分の名前".into(), TitleSource::Manual));
+        assert_eq!(by_id(master), ("master".into(), TitleSource::Default));
     }
 
     #[test]

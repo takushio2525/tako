@@ -1,5 +1,6 @@
-//! visual-test `master-tab-title`（Issue #2120）: **復元したままのタブバー**を撮り、
-//! master のいるタブが役割名の手動名（`master` / `master-<名前>`）で固定されていないかを見る。
+//! visual-test `master-tab-title`（Issue #2120 / #2127）: **復元したままのタブバー**を撮り、
+//! master / solo のいるタブが役割名の手動名（`master` / `master-<名前>` / `solo` /
+//! `solo-<名前>`）で固定されていないかを見る。
 //!
 //! 場面は節の中で作らない。`scripts/test-master-tab-title-2120.sh` が実 CLI
 //! （`tako master` / `tako orchestrator adopt` / `tako tab rename`）で組んだ layout を、
@@ -11,8 +12,10 @@
 //! ③ 画像を判定の前に `TAKO_VISUAL_DUMP_DIR` へ `master-tab-title.png`（全体）と
 //!    `master-tab-title-bar.png`（上端の帯）で落とす
 //! ④ master のペインがいるタブが役割名の手動名なら落とす（#2120 の症状そのもの）
+//! ⑤ solo のペインがいるタブが、その solo の旧い役割名の手動名なら落とす（#2127。
+//!    solo の場面は `scripts/test-solo-tab-title-2127.sh` が組む）
 //!
-//! 修正前（`TAKO_2120_LEGACY=1`）で旧い layout を復元すると ④ で落ちる。
+//! 修正前（`TAKO_2120_LEGACY=1`）で旧い layout を復元すると ④ / ⑤ で落ちる。
 //! 単独実行は `TAKO_VISUAL_ONLY=master-tab-title`
 
 use super::*;
@@ -56,7 +59,7 @@ pub(super) async fn master_tab_title_visual(
     }
 
     // ② タブ名・出どころ・タブバーの表示名（default はフォーカスペインの OSC タイトル）
-    let rows: Vec<(u64, String, &'static str, String, bool)> = window
+    let rows: Vec<(u64, String, &'static str, String, bool, bool)> = window
         .update(cx, |app, _, _| {
             app.workspace
                 .tabs()
@@ -76,20 +79,26 @@ pub(super) async fn master_tab_title_visual(
                             .and_then(tako_core::handoff::master_profile_of_role)
                             .is_some()
                     });
+                    let hosts_solo = tab
+                        .tree()
+                        .panes()
+                        .iter()
+                        .any(|p| p.role().is_some_and(tako_core::master_tab::is_solo_role));
                     (
                         tab.id().as_u64(),
                         tab.title().to_string(),
                         tab.title_source().as_str(),
                         label,
                         hosts_master,
+                        hosts_solo,
                     )
                 })
                 .collect()
         })
         .unwrap_or_default();
-    for (id, title, source, label, hosts_master) in &rows {
+    for (id, title, source, label, hosts_master, hosts_solo) in &rows {
         println!(
-            "TAKO_VISUAL_TAB: {SECTION} id={id} title={title} source={source} label={label} master={hosts_master}"
+            "TAKO_VISUAL_TAB: {SECTION} id={id} title={title} source={source} label={label} master={hosts_master} solo={hosts_solo}"
         );
     }
 
@@ -113,7 +122,7 @@ pub(super) async fn master_tab_title_visual(
     }
 
     // ④ master のいるタブが役割名の手動名で固定されていない
-    for (id, title, source, _, hosts_master) in &rows {
+    for (id, title, source, _, hosts_master, _) in &rows {
         check(
             !(*hosts_master
                 && *source == "manual"
@@ -123,4 +132,30 @@ pub(super) async fn master_tab_title_visual(
             ),
         );
     }
+
+    // ⑤ solo のいるタブが、その solo の旧い役割名の手動名で固定されていない（#2127）
+    let legacy_solo: Vec<String> = window
+        .update(cx, |app, _, _| {
+            app.workspace
+                .tabs()
+                .iter()
+                .filter(|tab| tab.title_source() == TitleSource::Manual)
+                .filter(|tab| {
+                    tab.tree().panes().iter().any(|p| {
+                        p.role().is_some_and(|r| {
+                            tako_core::master_tab::is_legacy_solo_title(tab.title(), r)
+                        })
+                    })
+                })
+                .map(|tab| format!("{} '{}'", tab.id().as_u64(), tab.title()))
+                .collect()
+        })
+        .unwrap_or_default();
+    check(
+        legacy_solo.is_empty(),
+        &format!(
+            "visual-test {SECTION}: solo のいるタブが役割名の手動名で固定されている: {}",
+            legacy_solo.join(", ")
+        ),
+    );
 }

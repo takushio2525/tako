@@ -7339,7 +7339,7 @@ impl TakoApp {
         }
         Some(autorename::TabMaterials {
             tab: tab_id,
-            // master のいるタブの名前は master 自身が付ける（#2120）
+            // master / solo のいるタブの名前は本人が付ける（#2120 / #2127）
             rename_tab: tab.title_source() != TitleSource::Manual
                 && tako_core::master_tab::app_may_name_tab(
                     tab.tree().panes().iter().map(|p| p.role()),
@@ -7369,7 +7369,7 @@ impl TakoApp {
             .get_tab_mut(tab_id)
             .expect("直前に存在確認済み");
         let mut auto_named = false;
-        // 生成中（haiku の応答待ちは数十秒）に master が立ったタブへは付けない。
+        // 生成中（haiku の応答待ちは数十秒）に master / solo が立ったタブへは付けない。
         // 起動で付けたプロジェクト名を、master が立つ前の画面から作った名前で潰さない（#2120）
         let may_name_tab =
             tako_core::master_tab::app_may_name_tab(tab.tree().panes().iter().map(|p| p.role()));
@@ -31728,7 +31728,7 @@ mod self_test {
     mod tasks_offload_2052;
     #[cfg(feature = "visual-test")]
     use tasks_offload_2052::tasks_offload_visual;
-    /// #2120: 復元したタブバーを撮り、master のタブが役割名の手動名で固定されていないか
+    /// #2120 / #2127: 復元したタブバーを撮り、master / solo のタブが役割名の手動名で固定されていないか
     /// （visual-test `master-tab-title`）
     #[cfg(feature = "visual-test")]
     mod master_tab_title_2120;
@@ -46273,7 +46273,7 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
-                // #2120: 復元したタブバーを撮り、master のタブが役割名の手動名で固定されていないか
+                // #2120 / #2127: 復元したタブバーを撮り、master / solo のタブが役割名の手動名で固定されていないか
                 "master-tab-title" => {
                     master_tab_title_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");

@@ -5083,8 +5083,12 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）: 新タブ起動
-    let target =
-        resolve_launch_target(tab_naming.as_ref(), use_tab, &master_cmd_hint(profile_name))?;
+    let target = resolve_launch_target(
+        tab_naming.as_ref(),
+        None,
+        use_tab,
+        &master_cmd_hint(profile_name),
+    )?;
     let pane_id = target.pane;
 
     send_request(Request::Title {
@@ -5256,10 +5260,16 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     std::fs::write(&prompt_path, &prompt_content)
         .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
 
-    let tab_title = match suffix {
-        Some(s) => format!("solo-{s}"),
-        None => "solo".into(),
-    };
+    // #2127: タブ名は solo が作業するフォルダ（Part 5 の cwd 移動の後）のリポジトリ名を
+    // **自動名で**付ける（HOME で立てたら触らない）。役割名（`solo` / `solo-<名前>`）を
+    // 手動名で付けると、solo 自身の `tako_rename_tab(source: "auto")` が全部弾かれる
+    let solo_dir = std::env::current_dir().ok();
+    let tab_naming = orchestrator::master_launch::solo_tab_naming(suffix, solo_dir.as_deref());
+    // 新しいタブで立てるときはそのフォルダで開く（開かないとアプリの起動フォルダで立ち、
+    // タブ名と solo の作業場所が食い違う）。A/B の旧挙動では従来どおりアプリの既定
+    let new_tab_cwd = solo_dir
+        .as_deref()
+        .filter(|_| !tako_core::master_tab::legacy());
 
     let role = match suffix {
         Some(s) => format!("solo:{s}"),
@@ -5270,12 +5280,12 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
 
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）は新タブ起動
-    // solo のタブ名は従来どおり手動名（#2120 は master だけを直す）
-    let tab_naming = orchestrator::master_launch::TabNaming {
-        title: tab_title,
-        source: None,
-    };
-    let target = resolve_launch_target(Some(&tab_naming), use_tab, &solo_cmd_hint(profile_name))?;
+    let target = resolve_launch_target(
+        tab_naming.as_ref(),
+        new_tab_cwd,
+        use_tab,
+        &solo_cmd_hint(profile_name),
+    )?;
     let pane_id = target.pane;
 
     send_request(Request::Title {
@@ -8255,15 +8265,18 @@ fn profile_cmd_hint(base: &str, profile_name: &str) -> String {
 /// `cmd_hint` は案内文に出す最簡形のコマンド（例: `tako master -fable`。#322）
 ///
 /// タブ名は `naming` のとおりに付ける（`None` = 触らない）。master は管轄プロジェクトの
-/// 自動名、solo は従来どおりの手動名（#2120）
+/// 自動名（#2120）、solo は作業フォルダのリポジトリの自動名（#2127）。
+/// 新しいタブを作るときは `new_tab_cwd` で開く（`None` = アプリの既定。solo はタブ名を
+/// 付けたフォルダで開かないと、名前と作業場所が食い違う）
 fn resolve_launch_target(
     naming: Option<&tako_control::orchestrator::master_launch::TabNaming>,
+    new_tab_cwd: Option<&std::path::Path>,
     use_tab: bool,
     cmd_hint: &str,
 ) -> Result<LaunchTarget, String> {
     let requested = caller_pane();
     if use_tab {
-        return new_tab_target(naming, cmd_hint, requested);
+        return new_tab_target(naming, new_tab_cwd, cmd_hint, requested);
     }
     let resolved = resolve_caller_pane_via_app(requested)
         .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
@@ -8304,7 +8317,7 @@ fn resolve_launch_target(
             if requested.is_some() {
                 eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
             }
-            new_tab_target(naming, cmd_hint, requested)
+            new_tab_target(naming, new_tab_cwd, cmd_hint, requested)
         }
     }
 }
@@ -8312,16 +8325,17 @@ fn resolve_launch_target(
 /// 新規タブを作って起動先にする（Issue #567 のフォールバック / `--tab` 指定時）
 fn new_tab_target(
     naming: Option<&tako_control::orchestrator::master_launch::TabNaming>,
+    cwd: Option<&std::path::Path>,
     cmd_hint: &str,
     requested: Option<u64>,
 ) -> Result<LaunchTarget, String> {
-    // 明示タイトル付きの作成は手動名になるので、渡すのは手動名（solo）のときだけ。
-    // 自動名（master。#2120）は作ってから `source: auto` で付ける
+    // 明示タイトル付きの作成は手動名になるので、渡すのは手動名（#2120 / #2127 前の A/B）の
+    // ときだけ。自動名は作ってから `source: auto` で付ける
     let manual_title = naming.filter(|n| n.is_manual()).map(|n| n.title.clone());
     let tab_result = send_request(Request::TabNew {
         title: manual_title.clone(),
         focus: Some(true),
-        cwd: None,
+        cwd: cwd.map(|p| p.display().to_string()),
     })
     .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
     let pane = tab_result["pane"]
