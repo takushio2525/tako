@@ -73,7 +73,7 @@ const CODE_REPLY = [
   'Here is the build command:',
   '',
   '```bash',
-  'cargo build -p tako-cli && TAKO_ISOLATED=1 TAKO_DATA_DIR=/tmp/tako-s7-very-long-data-dir-name ./target/debug/tako mod --json | jq ".panes[] | {pane, reason}"',
+  'cargo build -p tako-cli && TAKO_ISOLATED=1 TAKO_DATA_DIR=/tmp/tako-s7-very-long-data-dir-name ./out/tako-cli/tako mod --json | jq ".panes[] | {pane, reason}"',
   '```',
   '',
   'Then check it from Python:',

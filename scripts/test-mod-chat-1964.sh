@@ -197,7 +197,7 @@ fi
 exec '$TAKO_BIN' "\$@"
 EOF
 chmod +x "$CLI_GATE"
-LONG='cargo build -p tako-cli && TAKO_ISOLATED=1 TAKO_DATA_DIR=/tmp/tako-s7-very-long-data-dir-name ./target/debug/tako mod --json | jq ".panes[] | {pane, reason}"'
+LONG='cargo build -p tako-cli && TAKO_ISOLATED=1 TAKO_DATA_DIR=/tmp/tako-s7-very-long-data-dir-name ./out/tako-cli/tako mod --json | jq ".panes[] | {pane, reason}"'
 
 # --- 隔離 GUI -------------------------------------------------------------------------
 export TAKO_DATA_DIR="$TMP/data"
