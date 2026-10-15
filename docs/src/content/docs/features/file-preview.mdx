@@ -384,7 +384,7 @@ conda の env は PATH と `CONDA_PREFIX` を設定するだけで、`activate.d
 
 `.js` / `.mjs` / `.ts` / `.tsx` などは、フォルダから上へ辿って見つけた `.nvmrc`（同じフォルダに無ければ `.node-version`）の版を、nvm か fnm に入っている node から選びます。`20` のように番号の一部だけなら、その番号で始まる一番新しい版を使います。`lts/*` のような別名は解かずに `warnings` で知らせ、PATH の `node` で走ります。プロジェクトの `node_modules/.bin` は、どの node を選んでも PATH の先頭に足すので、`npm run` と同じようにプロジェクトに入れた道具がそのまま使えます。宣言の中で `${node}` と書くと、選ばれた node に置き換わります。
 
-`.rs` は、`rust-toolchain.toml`（または `rust-toolchain`）に書いた toolchain を `RUSTUP_TOOLCHAIN` で指定して走らせます（`cargo run` でも単体の `rustc` でも同じ）。別の toolchain で走らせたいときは `tako run-config main.rs --runtime rustup:nightly` のように選びます。
+`.rs` は、`rust-toolchain.toml`（または `rust-toolchain`）に書いた toolchain を `--list` に出しますが、走らせるときは何も足しません（rustup がそのファイルを自分で読むので、`components` や `targets` の指定もそのまま効きます）。別の toolchain で走らせたいときは `tako run-config main.rs --runtime rustup:nightly` のように選ぶと、`RUSTUP_TOOLCHAIN` で上書きして走らせます（`cargo run` でも単体の `rustc` でも同じ）。
 
 ```bash
 tako run app.js --list   # 選ばれた node（nvm / fnm の版）と候補

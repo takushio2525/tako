@@ -311,8 +311,10 @@ const NODE_DETECTORS: &[Detector] = &[
 ];
 
 /// Rust（#1735）。rustup は cwd から上の toolchain のファイルを**自分で読む**ので、この行は
-/// 「どの toolchain で走るか」を一覧に見せ、利用者が別の toolchain を選んだ（保存した）ときに
-/// `RUSTUP_TOOLCHAIN` で上書きする口。features は実行環境ではなく実行設定の引数（`--args`）
+/// 「どの toolchain で走るか」を一覧に見せるだけで、自動で見つけたときは変数を入れない
+/// （入れるとファイルの `components` / `targets` / `path` が効かなくなる）。利用者が toolchain を
+/// 明示に選んだ（保存した）ときだけ `RUSTUP_TOOLCHAIN` で上書きする（`explicit_env`）。
+/// features は実行環境ではなく実行設定の引数（`--args`）
 const RUST_DETECTORS: &[Detector] = &[Detector::EnvSwitch(EnvSwitchSpec {
     id: "rustup",
     label_prefix: "rustup ",
@@ -381,7 +383,7 @@ pub const KINDS: &[RuntimeKind] = &[
         project_bins: &[&["node_modules", ".bin"]],
     },
     // Rust（#1735）。走らせるのは拡張子既定の `rustc`（単体）かプロジェクト種別 `cargo` の
-    // `cargo run`。どちらも実行ペインの先頭に `RUSTUP_TOOLCHAIN` が埋まる
+    // `cargo run`。toolchain を明示に選んだときは、どちらも実行ペインの先頭に `RUSTUP_TOOLCHAIN` が埋まる
     RuntimeKind {
         id: "rust",
         extensions: &["rs"],

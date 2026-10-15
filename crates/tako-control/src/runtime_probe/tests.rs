@@ -832,3 +832,69 @@ fn プロジェクトの道具の置き場はどの候補を選んでも選ん�
     let snap = s2.run("loose/a.toy", &s2.env(&[]), &mut Facts::default());
     assert!(snap.path_prepend().is_empty());
 }
+
+/// #1735（差し戻し）: 本物の表の `rust` 行。`rust-toolchain.toml` を自動で見つけただけなら
+/// `RUSTUP_TOOLCHAIN` は入れず（rustup がファイルを読む）、保存した選択のときだけ入れる。
+/// 一覧と同じ鍵を選んでも（一覧の候補をそのまま使う経路）入り、候補の段（tier）は変わらない
+#[test]
+fn toolchainは明示に選んだときだけ環境変数で上書きする() {
+    let s = Sandbox::new("rp-1735-rustup");
+    s.write(
+        "proj/rust-toolchain.toml",
+        "[toolchain]\nchannel = \"1.79.0\"\ncomponents = [\"rustfmt\"]\n",
+    );
+    s.write("proj/src/main.rs", "fn main() {}\n");
+    let kind = runtime_env::kind_by_id("rust").expect("rust の行");
+    let env = s.env(&[]);
+    let detect = || {
+        detect_with(
+            kind,
+            Platform::current(),
+            &s.dirs("proj/src/main.rs"),
+            &RealFs,
+            &env,
+            &mut Facts::default(),
+            None,
+        )
+    };
+    let var = "RUSTUP_TOOLCHAIN".to_string();
+
+    // 自動: 候補には出るが env は空
+    let snap = detect();
+    let c = snap.selected().expect("toolchain を一覧に出す");
+    assert_eq!((c.manager, c.key.as_str()), ("rustup", "1.79.0"));
+    assert!(snap.env().is_empty(), "{:?}", snap.env());
+    let rt = runtime_json(Some(&snap));
+    assert_eq!(rt["source"], "auto");
+    assert_eq!(rt["env"], serde_json::json!({}));
+
+    // 一覧と同じ鍵を保存した: 明示なので入る。候補は一覧のものなので tier は F のまま
+    let mut snap = detect();
+    snap.choose_with(
+        &RuntimeRef::new("rustup", "1.79.0"),
+        FieldSource::Project,
+        &s.path("proj"),
+        Platform::current(),
+        &RealFs,
+        &env,
+    )
+    .expect("一覧の候補");
+    assert_eq!(snap.env(), [(var.clone(), "1.79.0".to_string())]);
+    let rt = runtime_json(Some(&snap));
+    assert_eq!(rt["source"], "project");
+    assert_eq!(rt["tier"], "F");
+    assert_eq!(rt["env"]["RUSTUP_TOOLCHAIN"], "1.79.0");
+
+    // 一覧に無い toolchain を保存した: その値で上書きする
+    let mut snap = detect();
+    snap.choose_with(
+        &RuntimeRef::new("rustup", "nightly"),
+        FieldSource::File,
+        &s.path("proj"),
+        Platform::current(),
+        &RealFs,
+        &env,
+    )
+    .expect("任意の toolchain は rustup が解く");
+    assert_eq!(snap.env(), [(var, "nightly".to_string())]);
+}

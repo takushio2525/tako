@@ -747,11 +747,14 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
   - **道具の置き場が無ければ「その版が無い」を知らせない**。node は nvm と fnm が同じ版のファイルを読むので、
     使っていない側が毎回騒ぐ。pyenv の行も同じ規則にした（pyenv の無い人に `.python-version` の版が無いと出していた）
   - Rust の行は既存の `EnvSwitch` で足りた。ファイルの並びは `rust-toolchain` → `rust-toolchain.toml`
-    （同じ段に両方あれば rustup は旧い名前を使う = rustup 1.28.2 で実測）。自動で選んだときも `RUSTUP_TOOLCHAIN`
-    を入れる（一覧と実行が同じものを示す）。代わりに上書きの出どころが環境変数になり（`rustup show
-    active-toolchain` が `overridden by environment variable` と出す = rustup 1.28.2 で実測）、ファイルの
-    `components` / `targets` は効かない。`cargo run` が要るのは toolchain 本体だけなので実害は小さいと見たが、
-    困る例が出たら「自動選択のときは env を入れない」へ寄せる
+    （同じ段に両方あれば rustup は旧い名前を使う = rustup 1.28.2 で実測）。**自動で見つけただけなら
+    `RUSTUP_TOOLCHAIN` は入れない**（§9.1 の「行が要るのは明示の上書きだけ」どおり。master の差し戻しで直した）。
+    入れると上書きの出どころがファイルから環境変数へ移り（`rustup show active-toolchain` が `overridden by
+    environment variable` と出す = rustup 1.28.2 で実測）、ファイルの `components` / `targets` / `path` が効かなく
+    なるため。候補（一覧の `runtimes` / `runtime`）には今までどおり出す。**利用者が明示に選んだ（保存した）ときだけ**
+    `RUSTUP_TOOLCHAIN` を入れる。この「選んだときだけ効く当て方」は候補の `Applied` に入れず
+    `runtime_env::explicit_env` が返し、`runtime_probe::Snapshot::env` が保存した選択にだけ重ねる
+    （一覧と同じ鍵を保存したときは一覧の候補をそのまま使う経路なので、候補に入れる形だと取りこぼす）
   - 同じ段に版のファイルの検出器が複数あるとき（nvm と fnm）、**どれかが版を見つけたら他の「その版が無い」は
     出さない**（実経路で、nvm の v20 で走っているのに「fnm 20 が入っていない」と出る誤報を見つけた）
   - TS / JSX（`npx tsx`）も node の行に入れた。既定の行は `${node}` を使わないが、PATH の前置で npx / tsx が

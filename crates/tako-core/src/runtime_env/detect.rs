@@ -879,11 +879,28 @@ fn env_switch_candidate(
         found_in: found_in.map(Path::to_path_buf),
         auto_eligible: true,
         needs_probe: false,
+        // 変数は入れない: 道具（rustup）は cwd から上のファイルを自分で読むので、見つけただけの
+        // 値を入れると上書きの出どころがファイルから変数へ移り、ファイルの他の指定
+        // （`components` / `targets` / `path`）が効かなくなる。入れるのは利用者が明示に
+        // 選んだときだけ（[`explicit_env`]。#1735）
         applied: Applied {
             program: vec![kind.fallback.get(platform).to_string()],
             path_prepend: Vec::new(),
-            env: vec![(s.var.to_string(), value.to_string())],
+            env: Vec::new(),
         },
+    }
+}
+
+/// 利用者が**明示に選んだ（保存した）**ときだけ効く当て方（#1735）。
+///
+/// 環境変数で切り替える戦略（[`EnvSwitchSpec`]）は、自動で見つけた候補では変数を入れず
+/// （道具がファイルを自分で読む）、選ばれたときにだけその値を変数へ入れて上書きする。
+/// 候補の [`Applied`] に入れないのは、一覧の候補と保存した選択が同じ鍵でも、選んだかどうかで
+/// 当て方を変えるため（一覧の候補をそのまま使う経路でも取りこぼさない）。他の戦略は空
+pub fn explicit_env(kind: &RuntimeKind, c: &Candidate) -> Vec<(String, String)> {
+    match kind.detector(c.manager) {
+        Some(Detector::EnvSwitch(s)) => vec![(s.var.to_string(), c.key.clone())],
+        _ => Vec::new(),
     }
 }
 

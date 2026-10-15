@@ -9,15 +9,16 @@
 #      `node_modules/.bin` が PATH の先頭、その次が版の bin
 #   ② `package.json` のあるプロジェクト（`node index.js` = 名前で呼ぶ）でも PATH の前置で同じ版が走る
 #   ③ `tako run a.js --list` と MCP `tako_run_resolve` の `runtimes` に node の候補が出て、字面まで一致する
-#   ④ Rust: `rust-toolchain.toml` のあるプロジェクトで `cargo run`（プロジェクト種別 cargo）と
-#      単体の `rustc`（拡張子既定）の実行時に `RUSTUP_TOOLCHAIN` が届く（偽の cargo / rustc が env を書き出す。
-#      toolchain の実体は無くてよい = 本物の rustup に導入させない）
+#   ④ Rust: `rust-toolchain.toml` / `rust-toolchain` の toolchain は一覧に出るが、**自動で見つけただけなら
+#      `RUSTUP_TOOLCHAIN` を入れない**（rustup がファイルを読む = `cargo run`（プロジェクト種別 cargo）でも
+#      単体の `rustc`（拡張子既定）でも `<unset>`）。`tako run-config` で**明示に選んだときだけ**届く
+#      （偽の cargo / rustc が env を書き出す。toolchain の実体は無くてよい = 本物の rustup に導入させない）
 #   ⑤ 境界: `.nvmrc` が別名（`lts/*`）/ 指す版が入っていない（`16`）→ 候補に出さず理由を出す /
 #      `.nvmrc` と `.node-version` が両方 → `.nvmrc` / `.ts` も同じ版（`npx tsx` の PATH）
 #   ⑥ 本物の fnm（この PC にあれば。**読み取りだけ**）: `.node-version` の版を fnm の置き場から選び、
 #      その node で走る
 #   ⑦ A/B: 修正前のバイナリ（既定は `/Applications/tako.app` = main から入れたもの。`OLD_APP_BIN` /
-#      `OLD_TAKO_BIN` で差し替え）では ① の候補に node が出ず、① の判定が FAILED・④ の env が届かない
+#      `OLD_TAKO_BIN` で差し替え）では ① の候補に node が出ず、① の判定が FAILED・④ で保存した toolchain も届かない
 #
 # を実測する。
 #
@@ -184,6 +185,7 @@ except Exception as e:
 rt = d.get("runtime") or {}
 print("manager=%s" % rt.get("manager"))
 print("key=%s" % rt.get("key"))
+print("source=%s" % rt.get("source"))
 print("program=%s" % " ".join(rt.get("program") or []))
 print("path_prepend=%s" % ":".join(rt.get("path_prepend") or []))
 print("env=%s" % json.dumps(rt.get("env") or {}, sort_keys=True))
@@ -328,19 +330,38 @@ check_eq "③ probe 以外の応答全体も一致する" \
   "$(printf '%s' "$MCP_TEXT" | python3 -c "$NORM_ALL" 2>/dev/null)"
 
 echo
-echo "== ④ Rust: rust-toolchain の値が実行時の RUSTUP_TOOLCHAIN へ届く =="
+echo "== ④ Rust: 自動で見つけただけなら RUSTUP_TOOLCHAIN は入れず、明示に選んだときだけ届く =="
 L4="$(list "$FIX/cargoproj/src/main.rs")"
-echo "  list: manager=$(field manager "$L4") key=$(field key "$L4") env=$(field env "$L4") command=$(field command "$L4")"
-check_eq "④ 一覧の runtime は rustup の 1.79.0-fake1735" "rustup 1.79.0-fake1735" \
+echo "  list: manager=$(field manager "$L4") key=$(field key "$L4") source=$(field source "$L4") env=$(field env "$L4") command=$(field command "$L4")"
+check_eq "④ 一覧の runtime は rustup の 1.79.0-fake1735（候補には出る）" "rustup 1.79.0-fake1735" \
   "$(field manager "$L4") $(field key "$L4")"
+check_eq "④ 自動では env を入れない（一覧の runtime.env が空）" "{}" "$(field env "$L4")"
 S4="$(run_file "$FIX/cargoproj/src/main.rs" "$FIX/cargoproj/cargo.out")"
-echo "  cargo の実行: $S4 / $(kv args "$FIX/cargoproj/cargo.out") / toolchain=$(kv toolchain "$FIX/cargoproj/cargo.out")"
-check_eq "④ cargo run に RUSTUP_TOOLCHAIN が届く" "1.79.0-fake1735" "$(kv toolchain "$FIX/cargoproj/cargo.out")"
+echo "  cargo の実行（自動）: $S4 / $(kv args "$FIX/cargoproj/cargo.out") / toolchain=$(kv toolchain "$FIX/cargoproj/cargo.out")"
+check_eq "④ 自動: cargo run に RUSTUP_TOOLCHAIN は届かない（rustup がファイルを読む）" "<unset>" \
+  "$(kv toolchain "$FIX/cargoproj/cargo.out")"
+check_eq "④ 自動: cargo run も走る" "exited 0" "$S4"
 S4b="$(run_file "$FIX/loosers/a.rs" "$FIX/loosers/rustc.out")"
-echo "  rustc の実行: $S4b / $(kv args "$FIX/loosers/rustc.out") / toolchain=$(kv toolchain "$FIX/loosers/rustc.out")"
-check_eq "④ 単体の rustc（rust-toolchain の素の 1 行）にも届く" "nightly-fake1735" \
+echo "  rustc の実行（自動）: $S4b / $(kv args "$FIX/loosers/rustc.out") / toolchain=$(kv toolchain "$FIX/loosers/rustc.out")"
+check_eq "④ 自動: 単体の rustc（rust-toolchain の素の 1 行）にも届かない" "<unset>" \
   "$(kv toolchain "$FIX/loosers/rustc.out")"
-check_eq "④ 単体の rustc の後の実行も走る" "exited 0" "$S4b"
+check_eq "④ 自動: 単体の rustc の後の実行も走る" "exited 0" "$S4b"
+# 明示に選ぶ（実行設定に保存する。既定はプロジェクト単位）。ファイルと違う toolchain で上書きできる
+RC="$("$TAKO_BIN" run-config "$FIX/cargoproj/src/main.rs" --runtime rustup:stable-fake1735 2>&1)"
+echo "  run-config: $(oneline "$RC" | head -c 200)"
+L4e="$(list "$FIX/cargoproj/src/main.rs")"
+echo "  list（明示）: key=$(field key "$L4e") source=$(field source "$L4e") env=$(field env "$L4e")"
+check_eq "④ 明示: 一覧の runtime は保存した toolchain（出典は project）" "stable-fake1735 project" \
+  "$(field key "$L4e") $(field source "$L4e")"
+S4e="$(run_file "$FIX/cargoproj/src/main.rs" "$FIX/cargoproj/cargo.out")"
+echo "  cargo の実行（明示）: $S4e / toolchain=$(kv toolchain "$FIX/cargoproj/cargo.out")"
+check_eq "④ 明示: cargo run に RUSTUP_TOOLCHAIN が届く" "stable-fake1735" \
+  "$(kv toolchain "$FIX/cargoproj/cargo.out")"
+# ファイルと同じ toolchain を明示に選んでも届く（一覧の候補をそのまま使う経路）
+"$TAKO_BIN" run-config "$FIX/loosers/a.rs" --runtime rustup:nightly-fake1735 >/dev/null 2>&1
+S4f="$(run_file "$FIX/loosers/a.rs" "$FIX/loosers/rustc.out")"
+check_eq "④ 明示: ファイルと同じ toolchain を選んでも単体の rustc に届く" "nightly-fake1735" \
+  "$(kv toolchain "$FIX/loosers/rustc.out")"
 
 echo
 echo "== ⑤ 境界 =="
@@ -401,7 +422,7 @@ if [ -x "$OLD_APP_BIN" ] && [ -x "$OLD_TAKO_BIN" ]; then
   echo "  修正前の実行: $SO / $(kv version "$OUT1") / self=$(kv self "$OUT1")"
   check_eq "⑦ 修正前は ① の判定が FAILED（PATH の node へ戻る）" "FAILED" "$(judge_nvm "$OUT1")"
   SOR="$(run_file "$FIX/cargoproj/src/main.rs" "$FIX/cargoproj/cargo.out")"
-  check_eq "⑦ 修正前は cargo run に RUSTUP_TOOLCHAIN が届かない" "<unset>" \
+  check_eq "⑦ 修正前は ④ で保存した toolchain も cargo run に届かない" "<unset>" \
     "$(kv toolchain "$FIX/cargoproj/cargo.out")"
   APP_BIN="$NEW_APP_BIN"
   TAKO_BIN="$NEW_TAKO_BIN"

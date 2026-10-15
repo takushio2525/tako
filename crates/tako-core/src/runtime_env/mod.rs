@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use crate::platform::support::Platform;
 use crate::runner_config::RuntimeRef;
 
-pub use detect::{apply_probed_env, detect, resolve_ref};
+pub use detect::{apply_probed_env, detect, explicit_env, resolve_ref};
 pub use kinds::KINDS;
 pub use select::{
     candidate_id, ensure_runnable, match_query, msg_query_error, ref_for_path, QueryError,
@@ -284,7 +284,8 @@ pub struct BundledSpec {
     pub file_name: PerOs<&'static str>,
 }
 
-/// 環境変数で切り替える toolchain（ファイルの値をそのまま変数へ入れる）
+/// 環境変数で切り替える toolchain。自動で見つけただけなら変数は入れず（道具がファイルを自分で
+/// 読む）、利用者が明示に選んだときだけ選んだ値を変数へ入れて上書きする（[`explicit_env`]。#1735）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvSwitchSpec {
     pub id: &'static str,

@@ -247,11 +247,17 @@ impl Snapshot {
         out
     }
 
-    /// 実行ペインのコマンドの前に付ける env
+    /// 実行ペインのコマンドの前に付ける env。保存した選択（#1731）なら、明示に選んだときだけ
+    /// 効く当て方（toolchain の上書き = `runtime_env::explicit_env`。#1735）をその後ろに足す
     pub fn env(&self) -> Vec<(String, String)> {
-        self.selected()
-            .map(|c| c.applied.env.clone())
-            .unwrap_or_default()
+        let Some(c) = self.selected() else {
+            return Vec::new();
+        };
+        let mut env = c.applied.env.clone();
+        if self.chosen.is_some() {
+            env.extend(runtime_env::explicit_env(self.kind, c));
+        }
+        env
     }
 
     /// 実行ペインのコマンドの前に付ける PATH（文字列にしたもの）。プロジェクトの道具の置き場

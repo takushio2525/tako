@@ -775,8 +775,11 @@ fn 環境変数で切り替える戦略はtomlのキーと素の1行の両方を
         let fs = FakeFs::new().file(format!("/h/proj/{file}"), content);
         let d = detect(&TOOLCHAIN_KIND, MAC, &dirs(&["/h/proj"]), &fs, &home("/h"));
         let c = auto(&d);
+        assert_eq!(c.key, "1.80", "{file}");
+        // 見つけただけでは変数を入れない（道具がファイルを自分で読む）。明示に選んだときだけ入れる（#1735）
+        assert!(c.applied.env.is_empty(), "{file}: {:?}", c.applied.env);
         assert_eq!(
-            c.applied.env,
+            explicit_env(&TOOLCHAIN_KIND, c),
             [("TOY_TOOLCHAIN".to_string(), "1.80".to_string())],
             "{file}"
         );
@@ -1582,8 +1585,11 @@ fn rust() -> &'static RuntimeKind {
     kind_by_id("rust").expect("rust の行がある")
 }
 
+/// 見つけた toolchain は候補（一覧）に出すが、自動で選んだだけでは `RUSTUP_TOOLCHAIN` を入れない
+/// （rustup がファイルを自分で読み、`components` / `targets` / `path` の指定も生きる）。
+/// 入れるのは利用者が明示に選んだときだけ（`explicit_env`。#1735 の差し戻し）
 #[test]
-fn rust_toolchainのchannelをrustup_toolchainへ入れる() {
+fn rust_toolchainのchannelは候補に出すが自動では変数を入れない() {
     for (file, content, want) in [
         (
             "rust-toolchain.toml",
@@ -1612,12 +1618,15 @@ fn rust_toolchainのchannelをrustup_toolchainへ入れる() {
             );
             let c = auto(&d);
             assert_eq!((c.manager, c.key.as_str()), ("rustup", want), "{file}");
+            assert_eq!(c.version.as_deref(), Some(want), "{file}");
+            assert!(c.applied.env.is_empty(), "{file}: {:?}", c.applied.env);
+            // 明示に選んだときに入れる値はファイルの値
             assert_eq!(
-                c.applied.env,
+                explicit_env(rust(), c),
                 [("RUSTUP_TOOLCHAIN".to_string(), want.to_string())],
                 "{file}"
             );
-            // 呼ぶのは名前のまま（rustup のプロキシが env を見て toolchain を選ぶ）
+            // 呼ぶのは名前のまま（rustup のプロキシがファイル / env を見て toolchain を選ぶ）
             assert_eq!(prog(c), ["rustc"]);
             assert!(c.applied.path_prepend.is_empty());
             assert_eq!(c.found_in, Some(p("/h/proj")));
@@ -1670,11 +1679,17 @@ fn rustupは保存した任意のtoolchainで上書きできる() {
         &home("/h"),
     )
     .expect("解ける");
+    // 候補の当て方には入れず、明示に選んだときの当て方で上書きする
+    assert!(c.applied.env.is_empty(), "{:?}", c.applied.env);
     assert_eq!(
-        c.applied.env,
+        explicit_env(rust(), &c),
         [("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string())]
     );
     assert_eq!(prog(&c), ["rustc"]);
+    // 環境変数で切り替える戦略でない候補（node の nvm）には明示でも足すものが無い
+    let fs = nvm_fs(&["v20.11.1"]).file("/h/proj/.nvmrc", "20");
+    let d = detect_node(MAC, &["/h/proj"], &fs, &home("/h"));
+    assert!(explicit_env(node(), auto(&d)).is_empty());
 }
 
 #[test]
