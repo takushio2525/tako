@@ -11,7 +11,7 @@
 //! 日英の訳が要らない）。「見つからない」「入れるには」という日英の文は tako-control 側の
 //! 1 か所（`tako_control::lsp::text`）が持ち、ここは行ごとの差だけを持つ。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::fetch::{Archive, Asset, Digest, Fetch, NpmPackage, PlatformAsset};
 use crate::app_bundle::AppBundle;
@@ -32,6 +32,8 @@ pub struct ServerSpec {
     pub root_markers: &'static [&'static str],
     /// ルートの取り方（#1951。ほとんどの行は [`RootScope::Project`]）
     pub root_scope: RootScope,
+    /// フォルダの形で受け持つ文書（#2113。拡張子だけでは決まらない受け持ち）。無ければ `None`
+    pub folder: Option<FolderClaim>,
     /// 印が入れ子になる言語の「最上位」判定（例: Cargo の workspace）。無ければ `None`
     pub workspace_root: Option<WorkspaceRoot>,
     /// PATH に無いときに探すアプリの同梱（#1951。サーバと伴走の両方を探す。置き場の知識は
@@ -86,8 +88,26 @@ pub enum RootScope {
     /// 印を上へ辿る → `.git` → ファイルの場所（[`crate::lsp::root`] の冒頭の規則）
     Project,
     /// ファイルのあるディレクトリ（印も `.git` も見ない）。Arduino のスケッチはフォルダ単位で、
-    /// 上の段のスケッチや repo の根をルートにするとサーバが別のスケッチを組む
+    /// 上の段のスケッチや repo の根をルートにするとサーバが別のスケッチを組む。行が
+    /// [`FolderClaim`] を持てば、形に合うフォルダ（`src/` の下のファイルならその上の本体のフォルダ。#2113）
     FileDir,
+}
+
+/// フォルダの形で受け持つ文書（#2113）。Arduino のスケッチ内の `.h` / `.cpp` のように、拡張子は他の行
+/// （C / C++ の行）と同じでも、**本体と同じフォルダにあるときだけ**この行が受け持つ（拡張子だけの行より
+/// 先に見る）。
+///
+/// 形: ファイルのあるフォルダ、または上へ辿った `nested` の名前のフォルダの親に、フォルダと同じ名前の
+/// `<フォルダ名>.<main>`（**大文字小文字まで一致**）があること。そのフォルダがルートで、仲間の文書を
+/// 開くときは本体を先に開く（[`folder_main`]。サーバが本体から組んだ形でないと仲間を正しく解けない = 実測）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderClaim {
+    /// 本体の拡張子（先頭の `.` を含まない）。行の `documents` のどれか
+    pub main: &'static str,
+    /// 本体のフォルダの直下で、その下を何段でも仲間に数えるフォルダの名前
+    pub nested: &'static str,
+    /// 形に合うときに受け持つ拡張子と `languageId`（他の行と重なってよい）
+    pub documents: &'static [DocumentKind],
 }
 
 /// 起こす前の前提（#1951）
@@ -179,7 +199,8 @@ const fn doc(extension: &'static str, language_id: &'static str) -> DocumentKind
 /// （入っていれば言語サーバも在る）、CSS と HTML は利用者の npm で入れる（依存 32 包みを取る口がまだ無い）
 ///
 /// Arduino の 1 行（#1951）: `.ino` を arduino-language-server（Arduino IDE の同梱物）へ。伴走の
-/// arduino-cli / clangd と空の設定ファイルを引数に並べ、基板が選ばれるまで起こさない
+/// arduino-cli / clangd と空の設定ファイルを引数に並べ、基板が選ばれるまで起こさない。スケッチ内の
+/// `.h` / `.cpp` もフォルダの形（[`FolderClaim`]）でこの行が受け持つ（#2113）
 pub const SERVERS: &[ServerSpec] = &[
     ServerSpec {
         id: "rust-analyzer",
@@ -188,6 +209,7 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[],
         root_markers: &["Cargo.toml"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: Some(WorkspaceRoot {
             file: "Cargo.toml",
             contains: "[workspace]",
@@ -271,6 +293,7 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[],
         root_markers: &["compile_commands.json", "compile_flags.txt", ".clangd"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         // macOS は Command Line Tools の clangd（#1956。#1944 の提案: 取らない代わりに Apple 公式の 1 行を案内する。
         // CLT を入れると `/usr/bin/clangd` とコンパイラのヘッダが一緒に入る = LLVM 一式は要らない）
@@ -301,6 +324,7 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[Arg::Lit("--stdio")],
         root_markers: &["tsconfig.json", "jsconfig.json", "package.json"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -343,6 +367,7 @@ pub const SERVERS: &[ServerSpec] = &[
             "requirements.txt",
         ],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -378,6 +403,7 @@ pub const SERVERS: &[ServerSpec] = &[
             "Tectonic.toml",
         ],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -452,6 +478,7 @@ pub const SERVERS: &[ServerSpec] = &[
         // 器が分かれる）。無ければ `.git` → ファイルの場所
         root_markers: &["tombi.toml"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -524,6 +551,7 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[],
         root_markers: &["Package.swift", "buildServer.json"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -542,6 +570,7 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[Arg::Lit("language-server"), Arg::Lit("--protocol=lsp")],
         root_markers: &["pubspec.yaml"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -560,6 +589,7 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[Arg::Lit("--stdio")],
         root_markers: &["package.json"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -581,6 +611,7 @@ pub const SERVERS: &[ServerSpec] = &[
         args: &[Arg::Lit("--stdio")],
         root_markers: &["package.json"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
@@ -596,9 +627,7 @@ pub const SERVERS: &[ServerSpec] = &[
     ServerSpec {
         id: "arduino-language-server",
         // languageId は Arduino IDE と同じ `cpp`。clangd の行には `.ino` を入れない（clangd 単体は `.ino` を
-        // 解けず、arduino-cli の compile db を渡すと正しいスケッチに嘘のエラーが 10 件出る = S0 の実測）。
-        // スケッチ内の `.h` / `.cpp` は拡張子のまま clangd（ALS へ回すには「先に `.ino` を開く」順を
-        // tako が作る必要がある = §5.3 の 6 の実測）
+        // 解けず、arduino-cli の compile db を渡すと正しいスケッチに嘘のエラーが 10 件出る = S0 の実測）
         documents: &[doc("ino", "cpp")],
         program: "arduino-language-server",
         // `-cli-config` が無いと `Path to ArduinoCLI config file must be set.` で即終了し、0 バイトの
@@ -613,6 +642,24 @@ pub const SERVERS: &[ServerSpec] = &[
         ],
         root_markers: &[],
         root_scope: RootScope::FileDir,
+        // #2113: スケッチ内の C / C++（`src/` の下を含む = arduino-cli が一緒に組む範囲）もこの行。拡張子の
+        // まま clangd へ渡すと Arduino の型を知らず嘘のエラーが出る（`'Arduino.h' file not found` 等 2 件）。
+        // ALS は同じ器で先に `.ino` を開いた順でだけ正しく解く（`.h` だけ先だと疑わしい 1 件 = §5.3 の 6）ので、
+        // 利用者が本体を開いていなければ tako が隠れて開く。languageId は C のファイルだけ `c`
+        folder: Some(FolderClaim {
+            main: "ino",
+            nested: "src",
+            documents: &[
+                doc("h", "cpp"),
+                doc("hh", "cpp"),
+                doc("hpp", "cpp"),
+                doc("hxx", "cpp"),
+                doc("cpp", "cpp"),
+                doc("cc", "cpp"),
+                doc("cxx", "cpp"),
+                doc("c", "c"),
+            ],
+        }),
         workspace_root: None,
         // brew に ALS の formula は無い。現実的な入手経路は Arduino IDE の同梱物（arduino-cli と
         // clangd 14 も同じ場所に並ぶ = 伴走は ALS と同じディレクトリを先に探す）
@@ -641,18 +688,116 @@ pub fn resolve(path: &Path) -> Option<Resolved<'static>> {
     resolve_in(SERVERS, path)
 }
 
-/// 表を指定して引く（**表の行を足すと答えが変わる**ことを表以外に触れずに示すための入口）
+/// 表を指定して引く（**表の行を足すと答えが変わる**ことを表以外に触れずに示すための入口）。
+///
+/// フォルダの形の行（[`FolderClaim`]。#2113）があるので**ファイルシステムを見る**（拡張子がその行に当たる
+/// ファイルだけ: 親のフォルダと、上の `nested` の名前のフォルダの親を stat 1 回ずつ。当たったフォルダだけ
+/// 中身を並べて大文字小文字を確かめる）。**開いている文書は開いたときに決めた器で引く**こと
+/// （`tako_control::lsp::LspManager::resolve`。開いた後で本体を足し引きしても器がぶれない）。
+/// `TAKO_2113_LEGACY=1` は拡張子だけで引く（#2113 より前）
 pub fn resolve_in<'a>(table: &'a [ServerSpec], path: &Path) -> Option<Resolved<'a>> {
+    if folder_legacy() {
+        return resolve_with(table, path, &|_, _| false);
+    }
+    resolve_with(table, path, &file_named)
+}
+
+/// 存在の確かめを注入して引く（純粋関数）。`named(dir, name)` は `dir` に名前が `name` と大文字小文字まで
+/// 一致するファイルがあるか
+pub fn resolve_with<'a>(
+    table: &'a [ServerSpec],
+    path: &Path,
+    named: &dyn Fn(&Path, &str) -> bool,
+) -> Option<Resolved<'a>> {
     let extension = path.extension()?.to_str()?;
-    table.iter().find_map(|spec| {
-        spec.documents
-            .iter()
-            .find(|kind| kind.extension.eq_ignore_ascii_case(extension))
-            .map(|kind| Resolved {
+    let by_folder = table.iter().find_map(|spec| {
+        let claim = spec.folder.as_ref()?;
+        let kind = kind_of(claim.documents, extension)?;
+        folder_root_with(claim, path, named)?;
+        Some(Resolved {
+            spec,
+            language_id: kind.language_id,
+        })
+    });
+    by_folder.or_else(|| {
+        table.iter().find_map(|spec| {
+            kind_of(spec.documents, extension).map(|kind| Resolved {
                 spec,
                 language_id: kind.language_id,
             })
+        })
     })
+}
+
+fn kind_of<'a>(documents: &'a [DocumentKind], extension: &str) -> Option<&'a DocumentKind> {
+    documents
+        .iter()
+        .find(|kind| kind.extension.eq_ignore_ascii_case(extension))
+}
+
+/// フォルダの形の根（#2113。純粋関数）: ファイルのあるフォルダが本体を持てばそこ、無ければ上へ辿って
+/// `nested` の名前のフォルダの親で本体を持つ最も近いもの。形に合わなければ `None`
+pub fn folder_root_with(
+    claim: &FolderClaim,
+    file: &Path,
+    named: &dyn Fn(&Path, &str) -> bool,
+) -> Option<PathBuf> {
+    let parent = file.parent()?;
+    let holds_main = |dir: &Path| {
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| named(dir, &format!("{name}.{}", claim.main)))
+    };
+    if holds_main(parent) {
+        return Some(parent.to_path_buf());
+    }
+    parent
+        .ancestors()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == claim.nested))
+        .filter_map(Path::parent)
+        .find(|dir| holds_main(dir))
+        .map(Path::to_path_buf)
+}
+
+/// フォルダの形で受け持った文書（本体でない仲間）なら、本体のパス（#2113。純粋関数）。サーバは本体を
+/// 先に開いた順でないと仲間を正しく解けない = manager が利用者の開いていない本体を隠れて開く相手。
+/// 本体そのもの・拡張子で受け持った文書・形に合わない文書は `None`
+pub fn folder_main_with(
+    spec: &ServerSpec,
+    path: &Path,
+    named: &dyn Fn(&Path, &str) -> bool,
+) -> Option<PathBuf> {
+    let claim = spec.folder.as_ref()?;
+    let extension = path.extension()?.to_str()?;
+    kind_of(claim.documents, extension)?;
+    let root = folder_root_with(claim, path, named)?;
+    let name = root.file_name()?.to_str()?;
+    Some(root.join(format!("{name}.{}", claim.main)))
+}
+
+/// [`folder_main_with`] の実ファイルシステム版（`TAKO_2113_LEGACY=1` は常に `None`）
+pub fn folder_main(spec: &ServerSpec, path: &Path) -> Option<PathBuf> {
+    if folder_legacy() {
+        return None;
+    }
+    folder_main_with(spec, path, &file_named)
+}
+
+/// `dir` に名前が `name` と大文字小文字まで一致するファイルがあるか。stat が当たったときだけ中身を並べる
+/// （大文字小文字を区別しないディスクでは stat だけだと `blink.ino` が `Blink.ino` に当たる。arduino-cli は
+/// 名前の違いを「missing」で落とす = Code Runner の #1950 と同じ判定）
+pub fn file_named(dir: &Path, name: &str) -> bool {
+    dir.join(name).is_file()
+        && std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name() == name)
+        })
+}
+
+/// フォルダの形を見ない（#2113 より前 = 拡張子だけ）か
+pub fn folder_legacy() -> bool {
+    std::env::var_os("TAKO_2113_LEGACY").is_some_and(|v| v == "1")
 }
 
 /// ID で表を引く
@@ -724,13 +869,127 @@ mod tests {
         // clangd の行は `.ino` を受け持たない（嘘のエラー 10 件 = S0）
         let clangd = find_in(SERVERS, "clangd").unwrap();
         assert!(clangd.documents.iter().all(|d| d.extension != "ino"));
-        // スケッチ内の `.h` / `.cpp` は拡張子のまま clangd（§5.3 の 6 の実測で決めた）
-        for path in ["Blink/helper.h", "Blink/helper.cpp"] {
-            assert_eq!(resolve(Path::new(path)).map(|r| r.spec.id), Some("clangd"));
-        }
+        // #2113: スケッチ内の C / C++ はフォルダの形でこの行（本体は `.ino`・`src/` の下も仲間）
+        let claim = spec.folder.expect("フォルダの形の受け持ち");
+        assert_eq!((claim.main, claim.nested), ("ino", "src"));
+        let clangd_exts: Vec<_> = clangd.documents.iter().map(|d| d.extension).collect();
+        let mut claimed: Vec<_> = claim.documents.iter().map(|d| d.extension).collect();
+        claimed.sort_unstable();
+        let mut expected = clangd_exts.clone();
+        expected.sort_unstable();
+        assert_eq!(claimed, expected, "C / C++ の行と同じ拡張子を受け持つ");
         assert_eq!(
             override_env_name(spec.id),
             "TAKO_LSP_BIN_ARDUINO_LANGUAGE_SERVER"
+        );
+    }
+
+    /// 偽のファイルシステム（ある名前の集合。大文字小文字まで一致で答える）
+    fn named_in(files: &'static [&'static str]) -> impl Fn(&Path, &str) -> bool {
+        move |dir: &Path, name: &str| files.iter().any(|f| Path::new(f) == dir.join(name))
+    }
+
+    /// #2113: フォルダの形 = ファイルのあるフォルダか `src/` の上に `<フォルダ名>.ino` があれば ALS の行。
+    /// 無ければ今どおり拡張子の行（clangd）。本体そのものは仲間でない（`folder_main` が `None`）
+    #[test]
+    fn スケッチ内の_c_と_cpp_はフォルダの形で_arduino_の行() {
+        const FILES: &[&str] = &[
+            "/w/Blink/Blink.ino",
+            "/w/Blink/helper.h",
+            "/w/Blink/src/util/deep.hpp",
+            "/w/Blink/src/net.c",
+            "/w/lib/lib.h",
+            "/w/blinkc/Blinkc.ino",
+            "/w/Blink/other/other.cpp",
+        ];
+        let named = named_in(FILES);
+        let id = |path: &str| {
+            resolve_with(SERVERS, Path::new(path), &named).map(|r| (r.spec.id, r.language_id))
+        };
+        let als = "arduino-language-server";
+        assert_eq!(id("/w/Blink/helper.h"), Some((als, "cpp")));
+        assert_eq!(
+            id("/w/Blink/helper.CPP"),
+            Some((als, "cpp")),
+            "拡張子の大小"
+        );
+        assert_eq!(id("/w/Blink/src/util/deep.hpp"), Some((als, "cpp")));
+        assert_eq!(id("/w/Blink/src/net.c"), Some((als, "c")));
+        assert_eq!(id("/w/Blink/Blink.ino"), Some((als, "cpp")));
+        // 形に合わない: スケッチでないフォルダ・大小だけ違う本体・`src/` でない入れ子
+        assert_eq!(id("/w/lib/lib.h"), Some(("clangd", "c")));
+        assert_eq!(id("/w/blinkc/x.cpp"), Some(("clangd", "cpp")));
+        assert_eq!(id("/w/Blink/other/other.cpp"), Some(("clangd", "cpp")));
+        // 他の言語は見ない（フォルダの形の行の拡張子でない）
+        assert_eq!(
+            resolve_with(SERVERS, Path::new("/w/Blink/notes.rs"), &named).map(|r| r.spec.id),
+            Some("rust-analyzer")
+        );
+        let spec = find_in(SERVERS, als).unwrap();
+        let main = |path: &str| folder_main_with(spec, Path::new(path), &named);
+        assert_eq!(
+            main("/w/Blink/helper.h"),
+            Some(PathBuf::from("/w/Blink/Blink.ino"))
+        );
+        assert_eq!(
+            main("/w/Blink/src/util/deep.hpp"),
+            Some(PathBuf::from("/w/Blink/Blink.ino"))
+        );
+        assert_eq!(main("/w/Blink/Blink.ino"), None, "本体は仲間でない");
+        assert_eq!(main("/w/lib/lib.h"), None);
+        // 拡張子だけの行は本体を持たない
+        let clangd = find_in(SERVERS, "clangd").unwrap();
+        assert_eq!(
+            folder_main_with(clangd, Path::new("/w/Blink/helper.h"), &named),
+            None
+        );
+    }
+
+    /// 入れ子のスケッチ: いちばん近い形のフォルダを採る（上の段のスケッチへ上がらない）
+    #[test]
+    fn フォルダの形は最も近いフォルダを採る() {
+        const FILES: &[&str] = &["/w/Outer/Outer.ino", "/w/Outer/src/Inner/Inner.ino"];
+        let named = named_in(FILES);
+        let claim = find_in(SERVERS, "arduino-language-server")
+            .and_then(|s| s.folder)
+            .unwrap();
+        let root = |path: &str| folder_root_with(&claim, Path::new(path), &named);
+        assert_eq!(
+            root("/w/Outer/src/Inner/a.h"),
+            Some(PathBuf::from("/w/Outer/src/Inner"))
+        );
+        assert_eq!(
+            root("/w/Outer/src/Inner/src/b.h"),
+            Some(PathBuf::from("/w/Outer/src/Inner"))
+        );
+        assert_eq!(root("/w/Outer/src/c.h"), Some(PathBuf::from("/w/Outer")));
+        assert_eq!(root("/w/Outer/lib/d.h"), None);
+        assert_eq!(root("e.h"), None, "親の無い相対パス");
+    }
+
+    /// 実ファイルシステム: 大文字小文字を区別しないディスクでも名前の違う本体は形に合わない。
+    /// `TAKO_2113_LEGACY` は env を変えるので子プロセスの e2e（tako-control）で見る
+    #[test]
+    fn 実ファイルシステムで本体の名前を大文字小文字まで確かめる() {
+        let dir = crate::test_residue::ScratchDir::new("tako-2113-named");
+        let sketch = dir.path().join("Blink");
+        std::fs::create_dir_all(&sketch).unwrap();
+        std::fs::write(sketch.join("Blink.ino"), "").unwrap();
+        std::fs::write(sketch.join("helper.h"), "").unwrap();
+        assert!(file_named(&sketch, "Blink.ino"));
+        assert!(!file_named(&sketch, "blink.ino"));
+        assert!(!file_named(&sketch, "Missing.ino"));
+        assert_eq!(
+            resolve(&sketch.join("helper.h")).map(|r| r.spec.id),
+            Some("arduino-language-server")
+        );
+        let other = dir.path().join("blink2");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("Blink2.ino"), "").unwrap();
+        assert_eq!(
+            resolve(&other.join("x.h")).map(|r| r.spec.id),
+            Some("clangd"),
+            "フォルダ名と大小だけ違う本体は形に合わない"
         );
     }
 
@@ -755,6 +1014,17 @@ mod tests {
             }
             if spec.root_scope == RootScope::FileDir {
                 assert!(spec.root_markers.is_empty() && spec.workspace_root.is_none());
+            }
+            // #2113: フォルダの形の本体は行自身の拡張子で、ルートは形のフォルダ（FileDir）
+            if let Some(claim) = spec.folder {
+                assert!(
+                    spec.documents.iter().any(|d| d.extension == claim.main),
+                    "{}: 本体の拡張子 {} を行が受け持たない",
+                    spec.id,
+                    claim.main
+                );
+                assert_eq!(spec.root_scope, RootScope::FileDir, "{}", spec.id);
+                assert!(!claim.documents.is_empty() && !claim.nested.is_empty());
             }
             for arg in spec.args {
                 if let Arg::Companion(name) | Arg::EmptyFile(name) = arg {
@@ -871,6 +1141,7 @@ mod tests {
             args: &[],
             root_markers: &["pom.xml", "build.gradle"],
             root_scope: RootScope::Project,
+            folder: None,
             workspace_root: None,
             bundled: None,
             requires: None,

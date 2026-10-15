@@ -108,6 +108,17 @@ fn table_values() -> Vec<&'static str> {
             values.push(ws.file);
             values.push(ws.contains);
         }
+        // #2113: フォルダの形（本体の拡張子・入れ子のフォルダ名・受け持つ拡張子）も表の値
+        if let Some(claim) = spec.folder {
+            values.push(claim.main);
+            values.push(claim.nested);
+            values.extend(
+                claim
+                    .documents
+                    .iter()
+                    .flat_map(|d| [d.extension, d.language_id]),
+            );
+        }
     }
     values.sort_unstable();
     values.dedup();

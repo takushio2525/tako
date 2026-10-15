@@ -34,15 +34,15 @@ const MENU_WIDTH: f32 = 440.0;
 impl TakoApp {
     /// このペインで定義ジャンプ（⌘ホバー / ⌘クリック）を使うか。
     ///
-    /// コード表示で、検出表にこの拡張子を受け持つサーバがあり、LSP が有効なときだけ。
+    /// コード表示で、このファイルを受け持つサーバがあり（`LspManager::resolve`。開いている文書は
+    /// 開いたときの器 = #2113）、LSP が有効なときだけ。
     /// 受け持つサーバが無いファイルに下線を引くと「押しても何も起きない下線」になる
     pub(crate) fn lsp_goto_enabled_for(&self, pane: PaneId) -> bool {
         if tako_control::dispatch::lsp_goto_legacy() || !self.lsp.is_enabled() {
             return false;
         }
         self.previews.get(&pane).is_some_and(|p| {
-            p.mode == preview::PreviewMode::Code
-                && tako_core::lsp::servers::resolve(&p.path).is_some()
+            p.mode == preview::PreviewMode::Code && self.lsp.resolve(&p.path).is_some()
         })
     }
 

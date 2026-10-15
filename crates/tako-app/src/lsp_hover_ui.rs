@@ -289,7 +289,8 @@ fn contains_with_margin(bounds: &Bounds<Pixels>, point: Point<Pixels>, margin: f
 }
 
 impl TakoApp {
-    /// このペインでマウスのホバーを使うか。コード表示で、検出表にこの拡張子を受け持つサーバがあり、
+    /// このペインでマウスのホバーを使うか。コード表示で、このファイルを受け持つサーバがあり
+    /// （`LspManager::resolve`。開いている文書は開いたときの器 = #2113）、
     /// LSP が有効で、A/B の旧挙動（`TAKO_1681_LEGACY=1`）でなく、**文書が言語サーバにつながっている**
     /// （編集モードか、別のペインが編集している = 乗せただけでサーバを起こさない）ときだけ。
     /// 補完の一覧を出しているペイン・右クリックメニューを開いているあいだは出さない（重ねない）
@@ -301,7 +302,7 @@ impl TakoApp {
             return false;
         };
         if state.mode != preview::PreviewMode::Code
-            || tako_core::lsp::servers::resolve(&state.path).is_none()
+            || self.lsp.resolve(&state.path).is_none()
             || self.lsp_completion_open_in(pane)
             // 右クリックメニュー（#1684 の言語サーバの項目を含む）を開いているあいだは出さない
             // （カードはメニューより手前に積まれるので、語の上でマウスが動くとメニューを隠す）

@@ -1420,9 +1420,7 @@ pub fn lsp_format_prepare(
         save_after,
         answer: None,
     };
-    if tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, Path::new(&path))
-        .is_none()
-    {
+    if manager.resolve(Path::new(&path)).is_none() {
         landing.answer = Some(Err(crate::lsp::FormatError::Lsp(
             crate::lsp::GotoError::NoServer,
         )));
@@ -1480,7 +1478,9 @@ pub fn lsp_format_on_save_prepare(
     if !editing
         || host.preview_conflict(target).is_some()
         || host.preview_remote_state(target).is_some()
-        || tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, Path::new(&path))
+        || host
+            .lsp()
+            .and_then(|manager| manager.resolve(Path::new(&path)))
             .is_none()
     {
         return None;
@@ -1757,9 +1757,7 @@ pub fn lsp_rename_prepare(
         version: None,
         answer: None,
     };
-    if tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, Path::new(&path))
-        .is_none()
-    {
+    if manager.resolve(Path::new(&path)).is_none() {
         landing.answer = Some(Err(crate::lsp::RenameError::Lsp(
             crate::lsp::GotoError::NoServer,
         )));

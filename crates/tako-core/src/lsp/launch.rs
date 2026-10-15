@@ -209,6 +209,7 @@ mod tests {
         ],
         root_markers: &[],
         root_scope: RootScope::FileDir,
+        folder: None,
         workspace_root: None,
         bundled: Some(&ARDUINO_IDE),
         requires: None,

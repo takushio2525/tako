@@ -8,7 +8,9 @@
 //! 4. それも無ければファイルの親ディレクトリ
 //!
 //! 表の `root_scope` が [`RootScope::FileDir`] の行（Arduino のスケッチ = フォルダ単位。#1951）は
-//! 1〜3 を見ずにファイルの親ディレクトリ（上の段のスケッチや repo の根をルートにしない）。
+//! 1〜3 を見ずにファイルの親ディレクトリ（上の段のスケッチや repo の根をルートにしない）。行が
+//! フォルダの形（`servers::FolderClaim`。#2113）を持ち、ファイルが形に合えばその形のフォルダ
+//! （`src/` の下の `.h` もスケッチのフォルダ = `.ino` と同じ器）。
 //!
 //! **`git` は起こさない**。`git::repo_root` は `git rev-parse` を起こすので、
 //! 編集モードに入った瞬間の UI スレッドから呼ぶと窓が止まりうる（#1503 の型）。
@@ -19,25 +21,40 @@
 
 use std::path::{Path, PathBuf};
 
-use super::servers::{RootScope, ServerSpec};
+use super::servers::{self, RootScope, ServerSpec};
 
 /// 実ファイルシステムでルートを決める
 pub fn find_root(spec: &ServerSpec, file: &Path) -> PathBuf {
-    find_root_with(spec, file, &|p| p.exists(), &|p| {
-        std::fs::read_to_string(p).ok()
-    })
+    let named: &dyn Fn(&Path, &str) -> bool = if servers::folder_legacy() {
+        &|_, _| false
+    } else {
+        &servers::file_named
+    };
+    find_root_with(
+        spec,
+        file,
+        &|p| p.exists(),
+        &|p| std::fs::read_to_string(p).ok(),
+        named,
+    )
 }
 
-/// 存在確認と読み込みを注入してルートを決める（純粋関数）
+/// 存在確認と読み込みを注入してルートを決める（純粋関数）。`named(dir, name)` はフォルダの形の
+/// 本体の確かめ（[`servers::file_named`] = 大文字小文字まで一致）
 pub fn find_root_with(
     spec: &ServerSpec,
     file: &Path,
     exists: &dyn Fn(&Path) -> bool,
     read: &dyn Fn(&Path) -> Option<String>,
+    named: &dyn Fn(&Path, &str) -> bool,
 ) -> PathBuf {
     let start = file.parent().unwrap_or(file);
     if spec.root_scope == RootScope::FileDir {
-        return start.to_path_buf();
+        return spec
+            .folder
+            .as_ref()
+            .and_then(|claim| servers::folder_root_with(claim, file, named))
+            .unwrap_or_else(|| start.to_path_buf());
     }
     let marked = start.ancestors().find(|dir| {
         spec.root_markers
@@ -77,6 +94,7 @@ mod tests {
         args: &[],
         root_markers: &["proj.toml"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: Some(WorkspaceRoot {
             file: "proj.toml",
             contains: "[workspace]",
@@ -103,9 +121,13 @@ mod tests {
     }
 
     fn root(spec: &ServerSpec, files: &HashMap<PathBuf, String>, file: &str) -> PathBuf {
-        find_root_with(spec, Path::new(file), &|p| files.contains_key(p), &|p| {
-            files.get(p).cloned()
-        })
+        find_root_with(
+            spec,
+            Path::new(file),
+            &|p| files.contains_key(p),
+            &|p| files.get(p).cloned(),
+            &|dir, name| files.contains_key(&dir.join(name)),
+        )
     }
 
     #[test]
@@ -158,6 +180,7 @@ mod tests {
         const フォルダ単位: ServerSpec = ServerSpec {
             root_markers: &[],
             root_scope: RootScope::FileDir,
+            folder: None,
             workspace_root: None,
             ..印あり
         };
@@ -174,6 +197,38 @@ mod tests {
             root(&入れ子なし, &files, "/repo/sketches/Blink/Blink.x"),
             PathBuf::from("/repo/sketches")
         );
+    }
+
+    /// #2113: フォルダの形を持つ行は、`src/` の下のファイルも本体のフォルダ（`.ino` と同じ器）。
+    /// 形に合わなければ今どおりファイルのディレクトリ
+    #[test]
+    fn フォルダの形の行は_src_の下も本体のフォルダ() {
+        use crate::lsp::servers::{DocumentKind, FolderClaim};
+        const 形あり: ServerSpec = ServerSpec {
+            root_markers: &[],
+            root_scope: RootScope::FileDir,
+            folder: Some(FolderClaim {
+                main: "m",
+                nested: "src",
+                documents: &[DocumentKind {
+                    extension: "h",
+                    language_id: "h",
+                }],
+            }),
+            workspace_root: None,
+            ..印あり
+        };
+        let files = fs(&[("/repo/.git", ""), ("/repo/Blink/Blink.m", "")]);
+        for (file, want) in [
+            ("/repo/Blink/a.h", "/repo/Blink"),
+            ("/repo/Blink/src/a.h", "/repo/Blink"),
+            ("/repo/Blink/src/x/y/a.h", "/repo/Blink"),
+            ("/repo/Blink/Blink.m", "/repo/Blink"),
+            ("/repo/Blink/lib/a.h", "/repo/Blink/lib"),
+            ("/repo/other/a.h", "/repo/other"),
+        ] {
+            assert_eq!(root(&形あり, &files, file), PathBuf::from(want), "{file}");
+        }
     }
 
     #[test]

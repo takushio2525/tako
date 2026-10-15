@@ -689,8 +689,32 @@ struct Doc {
     /// 診断の URI 照合用に正規化した形
     uri_key: String,
     /// 持ち手（編集セッション）ごとに、最後に写しへ取り込んだ**その持ち手のバッファの版**（#1769）。
-    /// 空になったら閉じる
+    /// 空になったら閉じる（[`Self::hidden`] なら閉じない）
     holders: BTreeMap<u64, u64>,
+    /// フォルダの形で受け持った仲間（#2113。スケッチの `.h` / `.cpp`）。本体を先に開いてから送る
+    member: bool,
+    /// 器に仲間が開いているあいだ tako が持つ本体（#2113）。持ち手が空でも閉じず、最後の仲間が
+    /// 閉じたら手放す。持ち手が無いあいだの本文はディスクの中身（診断は持ち手のペインにしか出ない）
+    hidden: bool,
+}
+
+impl Doc {
+    /// 利用者の持ち手が無く、tako だけが持っている本体（#2113）
+    fn hidden_only(&self) -> bool {
+        self.hidden && self.holders.is_empty()
+    }
+}
+
+/// 持ち手が無い本体へ利用者が加わった印（#2113）。最初の同期で必ず本文を比べる
+/// （[`Shared::change`] は版が変わっていない持ち手の同期を送らない）
+const UNSYNCED: u64 = u64::MAX;
+
+/// 仲間を開くときに隠れて開く本体（#2113。[`Shared::hidden_main`]）
+struct HiddenMain {
+    uri: String,
+    language_id: &'static str,
+    /// ディスクの中身（本体が既に開いていれば読まない = `None`）
+    text: Option<String>,
 }
 
 #[derive(Clone)]
@@ -921,6 +945,17 @@ impl LspManager {
     /// 起こしていなければ `None`
     pub fn document_server(&self, path: &Path) -> Option<DocumentServer> {
         self.shared.as_ref()?.document_server(path)
+    }
+
+    /// 文書を受け持つ行（#2113）。**開いている文書は開いたときに決めた器**（ファイルシステムを見ない）、
+    /// 開いていなければ表の解決（スケッチの `.h` / `.cpp` はフォルダの形を見る）。「この文書に言語サーバが
+    /// 付くか・どれか」を問う側（dispatch の整形・名前の変更）はここを通す（表を直接引き直さない）。
+    /// LSP を止めていても表の答えを返す
+    pub fn resolve(&self, path: &Path) -> Option<servers::Resolved<'static>> {
+        match &self.shared {
+            Some(shared) => shared.resolve_document(path),
+            None => servers::resolve(path),
+        }
     }
 
     /// stderr の直近の行（`tako lsp logs`）
@@ -1409,7 +1444,7 @@ impl Shared {
 
     fn open(&self, path: &Path, text: &str, version: u64) -> DocLink {
         let epoch = self.lock().epoch;
-        let Some(resolved) = servers::resolve_in(self.config.table, path) else {
+        let Some(resolved) = self.resolve_document(path) else {
             return DocLink::Declined { epoch };
         };
         let spec = resolved.spec;
@@ -1423,6 +1458,9 @@ impl Shared {
             id: spec.id,
             root: root.clone(),
         };
+        // #2113: フォルダの形の仲間（スケッチの `.h` / `.cpp`）は、サーバが本体を先に開いた順でないと
+        // 正しく解けない（実測）。本体が開いていなければディスクから読んで隠れて開く（読むのはロックの外で）
+        let main = self.hidden_main(spec, path, &uri);
         let mut guard = self.lock();
         let inner = &mut *guard;
         let holder = inner.next_holder;
@@ -1437,21 +1475,64 @@ impl Shared {
         // #1769: 同じファイルを別のペインが開いていれば、その文書の持ち手に加わるだけ
         // （didOpen は送らない。本文は自分が編集したときに送る = 相手の未保存の編集を上書きしない）
         if let Some(doc) = inner.docs.get_mut(&uri) {
-            doc.holders.insert(holder, version);
-            return lease(uri);
+            // #2113: tako だけが持っていた本体（中身はディスク）なら、利用者の本文をこの場で比べて送る
+            let adopt = doc.hidden_only();
+            doc.holders
+                .insert(holder, if adopt { UNSYNCED } else { version });
+            drop(guard);
+            let link = lease(uri);
+            if let (true, DocLink::Open(joined)) = (adopt, &link) {
+                self.change(joined, text, version);
+            }
+            return link;
         }
         inner.docs.insert(
             uri.clone(),
             Doc {
                 key: key.clone(),
-                language_id: resolved_language(self.config.table, spec, path),
+                language_id: resolved.language_id,
                 text: text.to_string(),
                 version: to_lsp_version(version),
                 opened: None,
                 uri_key: uri_key(&uri),
                 holders: BTreeMap::from([(holder, version)]),
+                member: main.is_some(),
+                hidden: false,
             },
         );
+        // 本体: 利用者が開いていれば tako も持つ印だけ、開いていなければディスクの中身で（持ち手なし）
+        let main_uri = match main {
+            Some(HiddenMain {
+                uri: main_uri,
+                language_id,
+                text,
+            }) => match inner.docs.get_mut(&main_uri) {
+                Some(doc) if doc.key == key => {
+                    doc.hidden = true;
+                    Some(main_uri)
+                }
+                // 別の器の文書（開いた後で形が変わった）には触らない
+                Some(_) => None,
+                None => text.map(|text| {
+                    inner.docs.insert(
+                        main_uri.clone(),
+                        Doc {
+                            key: key.clone(),
+                            language_id,
+                            text,
+                            version: 0,
+                            opened: None,
+                            uri_key: uri_key(&main_uri),
+                            holders: BTreeMap::new(),
+                            member: false,
+                            hidden: true,
+                        },
+                    );
+                    main_uri
+                }),
+            },
+            None => None,
+        };
         let slot = inner
             .servers
             .entry(key.clone())
@@ -1463,14 +1544,66 @@ impl Shared {
             _ => {
                 if slot.lifecycle.state == ServerState::Running {
                     let generation = slot.generation;
-                    let process = slot.process.clone();
-                    if let (Some(process), Some(doc)) = (process, inner.docs.get_mut(&uri)) {
-                        send_did_open(&process, &uri, doc, generation);
+                    if let Some(process) = slot.process.clone() {
+                        // 本体を先に（まだこの世代へ送っていなければ）
+                        for uri in main_uri.iter().chain(std::iter::once(&uri)) {
+                            if let Some(doc) = inner.docs.get_mut(uri) {
+                                if doc.opened != Some(generation) {
+                                    send_did_open(&process, uri, doc, generation);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         lease(uri)
+    }
+
+    /// 文書を受け持つ行（#2113）。**開いている文書は開いたときに決めた行**（フォルダの形はファイル
+    /// システムを見るので、開いた後で本体を足し引きすると表の答えが変わる = ホバー・補完・帯が開いた
+    /// 器と別の行を指す。開いている文書はファイルシステムも見ない）。開いていなければ表の解決
+    fn resolve_document(&self, path: &Path) -> Option<servers::Resolved<'static>> {
+        let uri = tako_core::file_uri::from_path(path);
+        let recorded = self
+            .lock()
+            .docs
+            .get(&uri)
+            .map(|doc| (doc.key.id, doc.language_id));
+        match recorded {
+            Some((id, language_id)) => servers::find_in(self.config.table, id)
+                .map(|spec| servers::Resolved { spec, language_id }),
+            None => servers::resolve_in(self.config.table, path),
+        }
+    }
+
+    /// 仲間を開くときに隠れて開く本体（#2113）。仲間でない・仲間が既に開いていれば `None`。
+    /// 本体が開いていなければディスクの中身を読む（読めなければ本文は `None` = 仲間だけを開く）
+    fn hidden_main(&self, spec: &'static ServerSpec, path: &Path, uri: &str) -> Option<HiddenMain> {
+        let main = servers::folder_main(spec, path)?;
+        let extension = main.extension()?.to_str()?;
+        let language_id = spec
+            .documents
+            .iter()
+            .find(|kind| kind.extension.eq_ignore_ascii_case(extension))?
+            .language_id;
+        let main_uri = tako_core::file_uri::from_path(&main);
+        let already = {
+            let inner = self.lock();
+            if inner.docs.contains_key(uri) {
+                return None;
+            }
+            inner.docs.contains_key(&main_uri)
+        };
+        let text = (!already)
+            .then(|| std::fs::read(&main).ok())
+            .flatten()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        Some(HiddenMain {
+            uri: main_uri,
+            language_id,
+            text,
+        })
     }
 
     /// 開いている文書へ持ち手として加わる（本文は送らない。#1769 の共有と同じ）。
@@ -1496,7 +1629,7 @@ impl Shared {
         let uri = lease.uri();
         let mut guard = self.lock();
         let inner = &mut *guard;
-        let Some(doc) = inner.docs.get_mut(uri) else {
+        let Some(doc) = inner.docs.get(uri) else {
             return;
         };
         // 自分のバッファが変わっていなければ送らない（#1769: 変わっていないペインの同期 =
@@ -1507,39 +1640,11 @@ impl Shared {
             Some(&seen) if seen != buffer_version => {}
             _ => return,
         }
-        if doc.text == text {
-            doc.holders.insert(holder, buffer_version);
-            return;
-        }
-        // 版は文書ごとに単調に進める（ペインが 1 つならバッファの版そのもの。2 つ目のペインの
-        // バッファの版は若いことがあるので、下回るときは 1 つ進める）
-        let version = to_lsp_version(buffer_version).max(doc.version.saturating_add(1));
-        let slot = inner.servers.get(&doc.key);
-        let live = slot.and_then(|slot| {
-            (slot.lifecycle.state == ServerState::Running && doc.opened == Some(slot.generation))
-                .then(|| slot.process.clone().map(|p| (p, slot.sync_kind)))
-                .flatten()
-        });
-        let Some((process, kind)) = live else {
-            // まだ開いていない（起動中・未導入）: 写しだけ進める。開いたときに全文で送る
-            replace_text(&mut doc.text, text);
-            doc.version = version;
-            doc.holders.insert(holder, buffer_version);
-            return;
-        };
-        if let Some(changes) = content_changes(kind, &doc.text, text) {
-            let params = json!({
-                "textDocument": { "uri": uri, "version": version },
-                "contentChanges": changes,
-            });
-            // 送れなかったら写しを進めない（次の変更と一緒に差分で送り直す）
-            if process.notify("textDocument/didChange", params).is_err() {
-                return;
+        if push_text(inner, uri, text, to_lsp_version(buffer_version)) {
+            if let Some(doc) = inner.docs.get_mut(uri) {
+                doc.holders.insert(holder, buffer_version);
             }
         }
-        replace_text(&mut doc.text, text);
-        doc.version = version;
-        doc.holders.insert(holder, buffer_version);
     }
 
     fn close(&self, uri: &str, holder: u64) {
@@ -1553,26 +1658,60 @@ impl Shared {
         if !doc.holders.is_empty() {
             return;
         }
+        if doc.hidden {
+            // #2113: 利用者が閉じた本体。器に仲間が開いているあいだは tako が持ち続け、本文はディスクの
+            // 中身へ戻す（保存せずに閉じた編集をサーバに残さない。読むのはロックの外で）
+            drop(guard);
+            self.resync_hidden(uri);
+            return;
+        }
         let Some(doc) = inner.docs.remove(uri) else {
             return;
         };
-        if inner.diagnostics.forget(uri) {
-            notify_diagnostics(inner, uri);
+        send_did_close(inner, uri, &doc);
+        // #2113: 最後の仲間が閉じた = tako が持っていた本体を手放す（利用者も開いていなければ閉じる）
+        if doc.member && !inner.docs.values().any(|d| d.key == doc.key && d.member) {
+            let mains: Vec<String> = inner
+                .docs
+                .iter()
+                .filter(|(_, d)| d.key == doc.key && d.hidden)
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            for main in mains {
+                let Some(held) = inner.docs.get_mut(&main) else {
+                    continue;
+                };
+                held.hidden = false;
+                if held.holders.is_empty() {
+                    if let Some(held) = inner.docs.remove(&main) {
+                        send_did_close(inner, &main, &held);
+                    }
+                }
+            }
         }
         let still_open = inner.docs.values().any(|d| d.key == doc.key);
         let Some(slot) = inner.servers.get_mut(&doc.key) else {
             return;
         };
-        if let Some(process) = &slot.process {
-            if slot.lifecycle.state == ServerState::Running && doc.opened == Some(slot.generation) {
-                let _ = process.notify(
-                    "textDocument/didClose",
-                    json!({ "textDocument": { "uri": uri } }),
-                );
-            }
-        }
         if !still_open && slot.lifecycle.state == ServerState::Running {
             self.schedule_idle_stop(slot, &doc.key);
+        }
+    }
+
+    /// 持ち手の無い本体の本文をディスクの中身へ揃える（#2113。違えば `didChange`）
+    fn resync_hidden(&self, uri: &str) {
+        let Some(path) = tako_core::lsp::goto::path_of_uri(uri, cfg!(windows)) else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        // 読んでいるあいだに利用者が開き直した・手放した本体には触らない
+        if inner.docs.get(uri).is_some_and(Doc::hidden_only) {
+            push_text(inner, uri, &text, 0);
         }
     }
 
@@ -1734,9 +1873,12 @@ impl Shared {
         self.step(slot, Event::Initialized);
         slot.running_since = Some(Instant::now());
         notify_refresh(inner);
-        for (uri, doc) in inner.docs.iter_mut() {
-            if doc.key == *key {
-                send_did_open(&process, uri, doc, generation);
+        // #2113: 本体を仲間より先に（サーバは本体から組んだ形でないと仲間を正しく解けない）
+        for members in [false, true] {
+            for (uri, doc) in inner.docs.iter_mut() {
+                if doc.key == *key && doc.member == members {
+                    send_did_open(&process, uri, doc, generation);
+                }
             }
         }
         // 起動中に最後の文書が閉じられていたら、ここから猶予を数える
@@ -2175,7 +2317,7 @@ impl Shared {
     }
 
     fn document_server(&self, path: &Path) -> Option<DocumentServer> {
-        let resolved = servers::resolve_in(self.config.table, path)?;
+        let resolved = self.resolve_document(path)?;
         let spec = resolved.spec;
         let progress = self
             .fetch
@@ -2893,7 +3035,7 @@ impl Shared {
 
 impl Shared {
     fn menu_capabilities_now(&self, path: &Path) -> MenuCapabilities {
-        let Some(resolved) = servers::resolve_in(self.config.table, path) else {
+        let Some(resolved) = self.resolve_document(path) else {
             return MenuCapabilities::Failed(GotoError::NoServer);
         };
         let spec = resolved.spec;
@@ -2941,7 +3083,7 @@ impl Shared {
             MenuCapabilities::Pending => {}
         }
         let deadline = Instant::now() + request.timeout;
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(GotoError::NoServer);
         };
         let spec = resolved.spec;
@@ -3012,7 +3154,7 @@ impl Shared {
     fn xref(&self, request: &XrefRequest) -> Result<XrefAnswer, GotoError> {
         use tako_core::lsp::xref as core;
         let deadline = Instant::now() + request.timeout;
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(GotoError::NoServer);
         };
         let spec = resolved.spec;
@@ -3130,7 +3272,7 @@ impl Shared {
     fn xref_expand(&self, request: &ExpandRequest) -> Result<ExpandAnswer, GotoError> {
         use tako_core::lsp::xref as core;
         let deadline = Instant::now() + request.timeout;
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(GotoError::NoServer);
         };
         let spec = resolved.spec;
@@ -3167,7 +3309,7 @@ impl Shared {
 impl Shared {
     fn goto(&self, request: &GotoRequest) -> Result<GotoAnswer, GotoError> {
         let deadline = Instant::now() + request.timeout;
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(GotoError::NoServer);
         };
         let spec = resolved.spec;
@@ -3462,7 +3604,7 @@ impl Shared {
     fn format(&self, request: &FormatRequest) -> Result<FormatAnswer, FormatError> {
         use tako_core::lsp::format as fmt;
         let deadline = Instant::now() + request.timeout;
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(FormatError::Lsp(GotoError::NoServer));
         };
         let spec = resolved.spec;
@@ -3583,7 +3725,7 @@ impl Shared {
     fn rename(&self, request: &RenameRequest) -> Result<RenameAnswer, RenameError> {
         use tako_core::lsp::rename as core;
         let deadline = Instant::now() + request.timeout;
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(RenameError::Lsp(GotoError::NoServer));
         };
         let spec = resolved.spec;
@@ -3828,7 +3970,7 @@ impl Shared {
             .then(|| self.enter_lane(Lane::Completion, request.ticket));
         let lane = entered.as_ref().map(LaneCall::key);
         let superseded = || lane.is_some_and(|(lane, ticket)| !self.is_current(lane, ticket));
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(GotoError::NoServer.into());
         };
         let spec = resolved.spec;
@@ -4013,7 +4155,7 @@ impl Shared {
         // 番号は UI が先に取ったもの（#1909。打鍵の補完と同じ口）
         let entered = self.enter_lane(Lane::Resolve, ticket);
         let lane = Some(entered.key());
-        let Some(resolved) = servers::resolve_in(self.config.table, path) else {
+        let Some(resolved) = self.resolve_document(path) else {
             return Err(GotoError::NoServer.into());
         };
         let spec = resolved.spec;
@@ -4054,7 +4196,7 @@ impl Shared {
             .then(|| self.enter_lane(Lane::Hover, request.ticket));
         let lane = entered.as_ref().map(LaneCall::key);
         let superseded = || lane.is_some_and(|(lane, ticket)| !self.is_current(lane, ticket));
-        let Some(resolved) = servers::resolve_in(self.config.table, &request.path) else {
+        let Some(resolved) = self.resolve_document(&request.path) else {
             return Err(GotoError::NoServer.into());
         };
         let spec = resolved.spec;
@@ -4246,12 +4388,18 @@ fn slot_status(
     key: &ServerKey,
     slot: &Slot,
 ) -> Value {
+    // #2113: tako だけが持っている本体は利用者の文書に数えない（診断も画面に出ない）
     let docs: Vec<&String> = inner
         .docs
         .iter()
-        .filter(|(_, d)| d.key == *key)
+        .filter(|(_, d)| d.key == *key && !d.hidden_only())
         .map(|(uri, _)| uri)
         .collect();
+    let hidden = inner
+        .docs
+        .values()
+        .filter(|d| d.key == *key && d.hidden_only())
+        .count();
     let diagnostics: usize = docs.iter().map(|uri| inner.diagnostics.count(uri)).sum();
     // 文書を開いている持ち手（編集セッション + 問い合わせ中の一時的な持ち手）の数（#1769）
     let views: usize = inner
@@ -4270,6 +4418,8 @@ fn slot_status(
         "spawn_count": slot.spawn_count,
         "crashes": slot.lifecycle.crashes,
         "documents": docs.len(),
+        // #2113: 仲間（スケッチの `.h` / `.cpp`）のために tako が隠れて開いている本体の数
+        "hidden_documents": hidden,
         "views": views,
         "diagnostics": diagnostics,
         "text_document_sync": slot.sync_kind.slug(),
@@ -4499,11 +4649,60 @@ fn merge(target: &mut Value, extra: Value) {
     }
 }
 
-fn resolved_language(table: &'static [ServerSpec], spec: &ServerSpec, path: &Path) -> &'static str {
-    servers::resolve_in(table, path)
-        .filter(|r| r.spec.id == spec.id)
-        .map(|r| r.language_id)
-        .unwrap_or("plaintext")
+/// 写しを `text` へ進め、サーバが開いていれば差分を `didChange` で送る（版は `wanted` と「写しの版 + 1」の
+/// 大きい方 = 文書ごとに単調。#1769）。送れなかったら写しを進めず偽（次の変更と一緒に差分で送り直す）
+fn push_text(inner: &mut Inner, uri: &str, text: &str, wanted: i32) -> bool {
+    let Some(doc) = inner.docs.get_mut(uri) else {
+        return false;
+    };
+    if doc.text == text {
+        return true;
+    }
+    // 版は文書ごとに単調に進める（ペインが 1 つならバッファの版そのもの。2 つ目のペインの
+    // バッファの版は若いことがあるので、下回るときは 1 つ進める）
+    let version = wanted.max(doc.version.saturating_add(1));
+    let slot = inner.servers.get(&doc.key);
+    let live = slot.and_then(|slot| {
+        (slot.lifecycle.state == ServerState::Running && doc.opened == Some(slot.generation))
+            .then(|| slot.process.clone().map(|p| (p, slot.sync_kind)))
+            .flatten()
+    });
+    let Some((process, kind)) = live else {
+        // まだ開いていない（起動中・未導入）: 写しだけ進める。開いたときに全文で送る
+        replace_text(&mut doc.text, text);
+        doc.version = version;
+        return true;
+    };
+    if let Some(changes) = content_changes(kind, &doc.text, text) {
+        let params = json!({
+            "textDocument": { "uri": uri, "version": version },
+            "contentChanges": changes,
+        });
+        if process.notify("textDocument/didChange", params).is_err() {
+            return false;
+        }
+    }
+    replace_text(&mut doc.text, text);
+    doc.version = version;
+    true
+}
+
+/// 外した文書の後始末: 診断を捨て、サーバが開いていれば `didClose` を送る
+fn send_did_close(inner: &mut Inner, uri: &str, doc: &Doc) {
+    if inner.diagnostics.forget(uri) {
+        notify_diagnostics(inner, uri);
+    }
+    let Some(slot) = inner.servers.get(&doc.key) else {
+        return;
+    };
+    if let Some(process) = &slot.process {
+        if slot.lifecycle.state == ServerState::Running && doc.opened == Some(slot.generation) {
+            let _ = process.notify(
+                "textDocument/didClose",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+        }
+    }
 }
 
 /// `didChange` の `contentChanges`（写し `old` → 今の本文 `new`）。同期しないサーバは `None`

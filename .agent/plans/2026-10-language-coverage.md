@@ -368,6 +368,40 @@ open_plan 7・インデント 5）。
   `<フォルダ名>.ino` があるか」（ファイルシステムを見る）になり、`resolve_in` の呼び手 約 25 か所（ホバーのマウス・
   打鍵の補完・状態の帯の描画を含む）がすべて同じ器を指す形へ揃える必要がある。別 Issue に切り出す
 
+**実装で決めたこと（#2113。6 の続き）**（正本は `.agent/requirements.md` FR-3.46）:
+
+- **表の形**: 行に `folder: Option<FolderClaim>`（本体の拡張子 `ino`・入れ子のフォルダ名 `src`・受け持つ拡張子と
+  languageId = C / C++ の行と同じ 8 つ。`.c` だけ `c`）。解決は「フォルダの形の行 → 拡張子だけの行」の順で、形は
+  ファイルのあるフォルダか、上へ辿った `src` の親に `<フォルダ名>.ino` が**大文字小文字まで一致**してあること
+  （stat が当たったときだけ中身を並べる = 大文字小文字を区別しないディスクで `blink.ino` を `Blink.ino` に当てない。
+  arduino-cli は名前の違いを missing で落とす = §5.4）。入れ子のスケッチは最も近い形のフォルダ。ルートも同じ規則
+  （`src/` の下の `.h` も `.ino` と同じ器）。`src/` 以外の入れ子（`lib/` 等）は arduino-cli が一緒に組まないので形に合わない
+- **隠れた本体**: 利用者が本体を開いていなければ、仲間を開くときに tako がディスクから読んで**仲間より先に** `didOpen`
+  （持ち手なし・起こし直しでも本体が先・最後の仲間が閉じたら `didClose`）。利用者が本体を開いて閉じても仲間が開いて
+  いれば器に残し、本文はディスクの中身へ戻す（保存せずに閉じた編集をサーバに残さない）。隠れていた本体を利用者が
+  開いたら利用者の本文へ揃える。診断は持ち手のペインにしか出ないので画面に出ない。`tako lsp status` の
+  `hidden_documents` が数で、`documents` / `diagnostics` / `views` には数えない
+- **呼び手の揃え**: 表の解決がファイルシステムを見るので、開いている文書は**開いたときに決めた器**で引く
+  （`LspManager::resolve` → `Shared::resolve_document`）。ホバー・補完・定義ジャンプの有効判定（UI）、帯
+  （`document_server`）、メニュー・定義ジャンプ・参照・整形・名前の変更・補完・ホバー（manager）、整形と名前の変更の
+  前段（dispatch）をここへ寄せた。表を直接引いてよいのは寄せた先・セルフテスト・visual-test の素材だけ
+  （番犬 `issue2113_lsp_resolve_watchdog`）
+- **ALS が無い PC**: スケッチ内の `.h` も `.ino` と同じ未導入の案内（IDE を入れる）。clangd へ戻さない
+  （戻しても `Arduino.h` を解けず嘘のエラーになる = 下の旧の行）
+- **実測**（`scripts/test-lsp-sketch-headers-2113.sh`。Arduino IDE 2.3.5 同梱物・arduino:avr:uno・誤りの無い
+  `.ino` + `helper.h` + `helper.cpp`。旧 = `TAKO_2113_LEGACY=1` と本番の main の .app）:
+
+  | 開き方 | `.h` | `.cpp` | ホバー / 補完 |
+  |---|---|---|---|
+  | 新・`.ino` を先に | 0 件 | 0 件 | `digitalWrite` / `println` |
+  | 新・`.h` だけ（本体は tako が隠れて開く = hidden 1） | 0 件 | 0 件 | 同上（答えの後に数え直しても 0 件） |
+  | 新・`src/` の `.h` だけ | 0 件 | — | — |
+  | 新・基板なし | unconfigured（起こさない・波線なし・帯） | — | — |
+  | 旧（拡張子で clangd） | 2 件（`'Arduino.h' file not found` / `Unknown type name 'uint8_t'`） | 2 件 | ホバー空・補完に `println` 無し |
+  | スケッチでないフォルダ | 新旧とも clangd・同じ答え（0 件） | 同左 | — |
+
+  #1951 で残った「`.h` だけを先に開くと疑わしい 1 件」は、本体を先に送る順で出なくなった
+
 ### 5.4 Code Runner（コンパイルと書き込み）
 
 実測（同梱の arduino-cli 1.2.0・`arduino:avr:uno`・ビルドのキャッシュは一時 dir）:

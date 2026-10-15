@@ -289,7 +289,7 @@ tako preview-reload off
 - 状態は編集中のペインの上に「取得中（取っているものと n / m MB）→ 起動中 → 読み込み中 → 動作中」と出ます。取れなかった・止まったときはその下に帯が出て、理由と「入れる」「もう一度取得」「起こし直す」のボタンが並びます
 - 前もって入れておく・取り直すときは `tako lsp install`、状態を見るときは `tako lsp status` です
 - 表に無い言語（Java・Go・YAML・JSON など）は、今は言語サーバを起こしません（色分けと編集はそのまま使えます）
-- **Arduino のスケッチ（`.ino`）は、基板を選ぶまで言語サーバを起こしません**（基板が無いと誤りの波線も説明のカードも出ないため）。選んでいないときは編集中のペインの上に帯が出て、選ぶコマンド `arduino-cli board attach -b <基板> <スケッチのフォルダ>` を案内します（基板の名前の例: `arduino:avr:uno`。選ぶとスケッチのフォルダの `sketch.yaml` に書かれ、Arduino IDE とも共有されます）。tako のターミナルで打てばそのまま起き、外で打ったときは帯の「もう一度確かめる」を押します。言語サーバ・arduino-cli・clangd は PATH か Arduino IDE の同梱から探すので、授業で IDE を入れている PC はそのまま使えます。スケッチの中の `.h` / `.cpp` は今は C / C++ の言語サーバ（clangd）が受け持ちます
+- **Arduino のスケッチ（`.ino`）は、基板を選ぶまで言語サーバを起こしません**（基板が無いと誤りの波線も説明のカードも出ないため）。選んでいないときは編集中のペインの上に帯が出て、選ぶコマンド `arduino-cli board attach -b <基板> <スケッチのフォルダ>` を案内します（基板の名前の例: `arduino:avr:uno`。選ぶとスケッチのフォルダの `sketch.yaml` に書かれ、Arduino IDE とも共有されます）。tako のターミナルで打てばそのまま起き、外で打ったときは帯の「もう一度確かめる」を押します。言語サーバ・arduino-cli・clangd は PATH か Arduino IDE の同梱から探すので、授業で IDE を入れている PC はそのまま使えます。スケッチの中の `.h` / `.cpp`（`src/` の下を含む）も同じ言語サーバが受け持つので、Arduino の型（`uint8_t` や `Arduino.h`）を知らない誤りの波線は出ません。`.ino` を開いていなくても tako が裏で一緒に読み込みます（画面には出さず、ファイルも書き換えません）。スケッチでないフォルダの C / C++ は今どおり clangd です
 - TOML の説明のカードは、ファイルに合うスキーマがあるときに出ます（`Cargo.toml`・`pyproject.toml` など）。tombi はスキーマの一覧を SchemaStore（schemastore.org）へ問い合わせますが、`Cargo.toml` と `pyproject.toml` は内蔵のスキーマでオフラインでも出ます
 
 | 操作 | macOS | Windows |

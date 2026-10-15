@@ -323,6 +323,7 @@ fn binary_spec(scratch: &Scratch, version: &'static str) -> &'static ServerSpec 
         ),
         root_markers: &["sweep.marker"],
         root_scope: RootScope::Project,
+        folder: None,
         workspace_root: None,
         bundled: None,
         requires: None,
