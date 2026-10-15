@@ -20,26 +20,6 @@
 
 ---
 
-## 2026-10-15（#2053 S2: ドキュメントサイトの機能ページをスクロール連動のモーションで作り直した = クイックスタート #2056 / かんたん表示 #2060 / 人がやること #2058 / エディタ #2062 / リモート #2061 / オーケストレーション #2059）
-- 各ページの場面は `docs/src/components/scenes/`、再現部品は新しいファイルで足し共有部品は無変更（PR #2068 / #2066 / #2074 / #2076 / #2069 / #2067）。Windows で pending の機能は `WindowsLimits` で対応表と突き合わせ（対応へ上がるとビルドが落ちる）。各ページ 1440 / 375 × 明暗 × reduced-motion で横はみ出し 0
-- 罠: Astro 6.4 + @astrojs/mdx 5.0.6 で `.mdx` の GFM の表が描かれない（#2082 で直す）。ページをまたぐ直しと共有部品の提案は #2077（S3）に集約。S2 の PR は progress を触らず、master がこの 1 件にまとめた
-
-## 2026-10-15（#1994: 重い処理の順番待ち `tako queue <コマンド>` = 調停役・割り当ての条件・再起動をまたぐ・この repo の入口で採用）
-- 判断は純関数 `tako_core::queue::admit`、調停役 `tako_control::queue` は本番 GUI の 1 つだけで `ipc::submit` の手前で答える。`settings.json` の `resources` 節（serde default）・`tako queue limits / cancel`・MCP `tako_queue` の action（+395 B）。`run_heavy` を build-app / isolated-gui / 検証スクリプトが通す（PR #2071）
-- 実測: e2e `scripts/test-queue-1992.sh` 46 PASS。見込みは build 3.5 GB / test 7 GB。swap 10 GB の機では既定の警戒線で 1 件ずつになる（`tako queue limits --swap-guard-gb`）
-
-## 2026-10-15（#2018: 器のペインログの取り込みを出力の合図で間引き、probe と capture を 1 回の tmux へ）
-- 出力が続く器だけ 10 秒ごと・止まったら次の tick・30 秒の保険は相乗り、probe + capture を 1 回へ、閉じる直前に増分と画面を 1 回で読む。A/B `TAKO_2018_LEGACY=1`（PR #2080）
-- 実測: 出力中 60 秒の tmux 68 → 10 本、子の CPU 約 1/6。欠け・重複 0（修正前は欠け 72 行）。出力中に器が自ら消えると最後の最大 10 秒が抜ける = #2085 で直す
-
-## 2026-10-15（#1953: 既存の構文への別名で色の穴を埋めた = `.h` を C++・`.m` を本文で MATLAB / Objective-C・`.pde` を Java・`.jsonc` を JSON・`.json5` を JavaScript）
-- `file_type` の行 + 純粋関数 `syntax_by_content`（先頭 200 行）。`.json5` は JSON だと JSON5 だけの書き方が `invalid` でダークで字が消える（144 字句中 113）ので JavaScript、`.S` / `.s` は ARM の `@` が消えるので寄せない。A/B `TAKO_1953_LEGACY=1`・構文 213 のまま（PR #2072）
-- 実測: `scripts/test-syntax-alias-1953.sh` 38 PASS（CLI / MCP の `syntax` 新旧・visual `syntax-alias`）
-
-## 2026-10-15（#1696: encoding_conpty の描画テスト 2 本がコードページの UTF-8 固定を状態で待ってから type を送る）
-- `read_pane_code_pages` を足し、描画 2 本は 65001 を状態で待つ形へ。Windows CI で 12 回 × 2 本 × 2 巡が 0 失敗・注入（固定前を作る）で旧形 3/3 化け / 新形 3/3 通過。PR #2079
-- 固定はプロンプトの 7〜34 ms 前（20/20）でシェルと同期していない = 製品側の差し止め（最初の書き込みの保留・診断・諦めの記録）は #2092
-
 ## 2026-10-15（#2057: docs にコマンドカードのページを新設 = 折り返しの比較・帯・コピー・実行・複数・スマホ・Claude Code の画面の中をスクロール連動で見せる）
 - `features/command-card` に 5 場面（20 手順）。部品は `CommandCardFull`（複数・改行・失敗の赤）と `PhoneCommandCards`（全文の確認シート）を新しいファイルで足し、共有部品は不変。実行ペインは実物どおり下へ 35%（`dispatch.rs` の `Direction::Down`）
 - 実測: Playwright で 1440 / 375 × ライト / ダーク / 動かさない = 120 枚・横はみ出し 0・手順の不一致 0。① は AI 側を 14.6em（≒ 21 桁）に固定し 1440 / 1024 / 768 / 375 で折り返り・はみ出し 0・良い側 1 行を確認
@@ -80,3 +60,26 @@
 ## 2026-10-15（#1950: `.ino` を再生ボタン / `tako run` で走らせる arduino 種別）
 - `arduino-cli compile` / プロファイル `upload`。arduino-cli は PATH → Arduino IDE 同梱（`app_bundle`）で探し、基板未選択・名前の不一致・arduino-cli なしを実行ペインと `project.notes` で案内。PR #2093
 - 実測: `scripts/test-runner-arduino-1950.sh` 25 PASS（IDE 同梱 1.2.0 で compile exit 0・A/B `TAKO_1950_LEGACY=1`）。upload は基板なしで未検証
+
+## 2026-10-15（#2085: 器が自ら消えても最後の行までペインログへ = remain-on-exit + pane-died フックで消える前に全履歴と画面を書き出す）
+- `<data_dir>/pane-died/` へ書き出し、ProcessExit の閉じ方で読む（子プロセス 0 本）。psmux は未実測で立てず `tako_logs` を Windows degraded に申告（PR #2095）
+- 実測: `test-pane-log-pace-2018.sh both` ③ 新 0〜1499 欠け 0 / `TAKO_2085_LEGACY=1` 末尾 626 行欠け、⑤ 閉じるまで 152 ms（旧 151 ms）、tmux 起動本数・常駐は新旧同じ
+
+## 2026-10-15（#1956: 言語サーバの検出表の第 2 波 = .tex texlab / .toml tombi（tako が取る）・.swift sourcekit-lsp・.dart dart・.css/.scss/.less と .html/.htm vscode-langservers-extracted）
+- 候補 18 種の比較と採った順は language-coverage §8。workspace.configuration を申告しない条件で測り直し、YAML（ホバーが出ない）を見送って CSS / HTML を採った。taplo はハッシュ無し + ホバー不可で tombi（PR #2102）
+- 実測: `scripts/test-lsp-servers-1956.sh` 37 OK（6 行とも開くだけで波線とホバー・visual-test `lsp-servers`・境界 2 つ）。e2e `issue1956_lsp_servers_wave2` 5 本
+
+## 2026-10-15（#2050: 鍵らしき文字の確認を mod の送信時・スマホの入力・tako send へ広げ、許可リスト・規則ごとの無効化・警告だけの段を足した）
+- mod は `prompt.submit` → `paste-guard check --pane`・選択ダイアログ、スマホは 409 → 確認シート、`tako send` / `tako_send_input` は止めずに警告。許可リストは指紋だけ。tako が流した値はペインごとに 10 分確認済み（PR #2105）
+- 実経路 `scripts/test-paste-guard-2050.sh` 58 PASS（実物の claude・実 daemon・A/B）+ visual ⑫・カタログ +680 B
+
+## 2026-10-15（#2098: tmux_backend の conf 差し替えテストを 700 ms の実時間の窓から読み取り・書き換え各 200 回の回数区切りへ・issue1857 の子の終わりの待ちを 10 → 60 秒）
+- 届かないときはクライアントの状態を出す。注入: 読み取り 30 ms 遅延で旧 3/3「検出力が無い」・新 3/3 ok、非アトミック化で新 5/5「不完全な conf」、kill 12 秒遅延で旧 FAILED / 新 ok。Windows CI 新 38/38 ok（PR #2100）
+
+## 2026-10-15（#1686: LSP の名前の変更 = 既定 dry-run・段階 1 は頼んだペインのバッファだけ・右クリックの欄）
+- `tako_core::lsp::rename`（WorkspaceEdit の changes / documentChanges）+ prepareRename → rename + CLI `tako lsp rename [--yes]` / MCP `tako_lsp` の action=rename（+428 B）+ 右クリックの「名前の変更…」。A/B `TAKO_1686_LEGACY=1`（PR #2099）
+- 実測: `scripts/test-lsp-rename-1686.sh`（偽サーバ + 実の rust-analyzer）で dry-run 後の sha256 一致・--yes で 2 箇所・undo 1 回で差分 0・別ファイルは not-applied・`1abc` は refused、visual-test 新 OK / 旧 ① FAILED
+
+## 2026-10-15（#2092: Windows のペインは文字コード固定の決着まで入力を預かる = `encoding_pin::PinGate`・上限 直接 500 ms / 器 1500 ms）
+- `check-health` の `encoding_pin` 節と persist.log へ諦めを記録。器の内側の固定が本番経路で呼ばれていなかったのを `spawn_in` で配線（PR #2103）
+- Windows CI 実測（各 25 回）: 直接は固定 5〜16 ms / プロンプト 26〜46 ms、器は内側 154〜180 ms / プロンプト 226〜310 ms。注入の A/B で旧は化け・新は `日本語テスト`（直接・器とも 5 巡）
