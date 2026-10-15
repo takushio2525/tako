@@ -334,7 +334,7 @@ impl Prober for BlockedProber {
     }
 }
 
-fn default_prober() -> &'static dyn Prober {
+pub(crate) fn default_prober() -> &'static dyn Prober {
     if tako_core::paths::is_test_process() {
         &BlockedProber
     } else {
@@ -751,11 +751,7 @@ fn apply_project_followup_with(
     let Some(followup) = project.followup() else {
         return;
     };
-    let Some(program) = snap
-        .and_then(Snapshot::selected)
-        .and_then(|c| c.location.clone())
-        .filter(|l| l.is_file())
-    else {
+    let Some(program) = selected_program(snap) else {
         return;
     };
     let out = prober.output(
@@ -767,6 +763,14 @@ fn apply_project_followup_with(
     if let Some(o) = out.into_output().filter(|o| o.status.success()) {
         project.apply_followup(&String::from_utf8_lossy(&o.stdout));
     }
+}
+
+/// 実行環境の層が選んだ候補の実体（実在するファイルだけ。名前のまま = 見つからなかったなら `None`）。
+/// 案内の問い合わせ（#1950）と基板の欄（#1952）が起こすのはこれ
+pub(crate) fn selected_program(snap: Option<&Snapshot>) -> Option<std::path::PathBuf> {
+    snap.and_then(Snapshot::selected)
+        .and_then(|c| c.location.clone())
+        .filter(|l| l.is_file())
 }
 
 /// `Run` / `RunResolve` の `runtime`（走らせる 1 つ + 実行ペインへ前置するもの）

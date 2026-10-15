@@ -489,6 +489,9 @@ struct RunArgs {
     /// --list で、実行環境の問い合わせ（道具の場所・版）を覚えた答えを捨てて聞き直す
     #[arg(long, requires = "list")]
     refresh: bool,
+    /// --list で、.ino の基板を名前か FQBN で探す（語を省くと入っているコアの基板を全部。#1952）
+    #[arg(long, requires = "list", value_name = "語", num_args = 0..=1, default_missing_value = "")]
+    boards: Option<String>,
 }
 
 #[derive(Args)]
@@ -517,6 +520,12 @@ struct RunConfigArgs {
     /// 実行前コマンド（失敗したら本体を走らせない。既定でこのファイルに保存）
     #[arg(long, allow_hyphen_values = true)]
     before: Option<String>,
+    /// .ino の基板（FQBN。例 arduino:avr:uno）を選ぶ。`arduino-cli board attach` で sketch.yaml へ書く（#1952）
+    #[arg(long, value_name = "FQBN")]
+    board: Option<String>,
+    /// .ino の書き込み先のポートを選ぶ（sketch.yaml の default_port。#1952）
+    #[arg(long, allow_hyphen_values = true)]
+    port: Option<String>,
     /// 自動・既定へ戻す（項目名か all。値を省くと全項目。--project / --file を省くと両方から消す）
     #[arg(long, num_args = 0.., value_name = "項目", value_parser = clap::builder::PossibleValuesParser::new(
         tako_core::runner_config::RunConfigField::reset_values()
@@ -10858,6 +10867,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 env: run_config_env(&args.env, &args.unset_env)?,
                 cwd: args.cwd.clone(),
                 before: args.before.clone(),
+                board: args.board.clone(),
+                port: args.port.clone(),
                 // 値なしの `--reset` = 全項目
                 reset: args.reset.as_ref().map(|r| {
                     if r.is_empty() {
@@ -11118,6 +11129,7 @@ fn run_list(command: &Command) -> Result<(), String> {
         path: args.file.clone(),
         pane: target_pane(args.pane)?,
         refresh: args.refresh,
+        boards: args.boards.clone(),
     };
     let result = send_request(request)?;
     println!("{}", pretty_json(&result));

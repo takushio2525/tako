@@ -454,6 +454,36 @@ open_plan 7・インデント 5）。
 - `upload` には 4 つ目の案内（`default_port` が無い → `board attach -p <ポート>`）を付けた。
   書き込みそのものは基板を繋いでいないので**未検証**
 
+**実装で決めたこと（#1952。4 の「ドロップダウンでの選択」）**（正本は `.agent/requirements.md` FR-3.18.8）:
+
+- **書く前に検める**（実測 1.2.0・一時 HOME・arduino:avr だけを複製）: `board attach` は何でも書く。
+
+  | 呼び方 | 結果 |
+  |---|---|
+  | `-b arduino:avr:nosuch`（入っているコアに無い基板） | rc=0・`default_fqbn: arduino:avr:nosuch` |
+  | `-b arduino:renesas_uno:unor4wifi`（入っていないコア） | rc=0・そのまま書く |
+  | `-b foo`（形が崩れている） | rc=0・`default_fqbn: foo` |
+  | `--fqbn=`（空） | rc=0・**消さずに残す**（消す口は無い） |
+  | `-p` だけ / `-b` だけ | もう片方の鍵を保つ |
+  | 既にあるファイル（コメント・`profiles:`・行末コメント付きの `default_fqbn`） | コメントと `profiles:` を保ち、書き換えた行の行末コメントだけ落ちる |
+  | `--port=-weird` / `--port=/dev/cu.with space` | そのまま 1 語で入る（`-p -weird` の形より安全） |
+
+  そのため tako は `board listall` でコアの有無と基板の実在を確かめてから書く（コアが無ければ `core install` を示すだけ）
+- **一覧の取り方**（この PC の 5 コア・545 基板）: `board listall --format json` は 20.9 MB・2.0 秒（基板ごとにコアの全基板を
+  繰り返す）、`--format jsonmini` は 11.5 MB・0.4 秒、表（`board listall`）は 40 KB・0.36 秒。表は見出しが訳されうるので読まず、
+  `jsonmini` を**使う欄だけの型**で読む（入れ子の列は serde が読み飛ばす）。`board list --format json` は 1.7〜3.2 秒（ポートを
+  走査する）で、#1950 の案内と 1 回で共有する
+- **`default_profile` が勝つ**: `default_profile: uno`（arduino:avr:uno）+ `default_fqbn: arduino:avr:mega` の compile は
+  uno の容量（32256 バイト）で組む = 基板を選んでも compile に効かない。応答の `board.notes` と欄に注意を出す（プロファイルは
+  変えない = 利用者の設定）
+- **消す口は作らない**: arduino-cli に `default_fqbn` を消す口が無く、tako は書式を真似しないので、欄の出典タグは
+  `sketch.yaml` 固定（移す・消すは無い）。選び直しは別の基板を選ぶ
+- **言語サーバ**: 基板を書いたら、そのスケッチをルートに持つ前提つきの器だけを起こし直す（`LspManager::restart_requiring`。
+  ルートは両方を正規化して比べる = `/tmp` と `/private/tmp`）。unconfigured の器は確かめ直して起き、動いている器は新しい基板で
+  組み直す（ALS は起動時に `sketch.yaml` を読むので、組み直さないと前の基板のまま）。ポートだけなら起こし直さない
+- **Windows**: `board list` の COM ポート（`COM3`）・argv（`--port=COM3`）・PowerShell の導入コマンド（`& '<arduino-cli.exe>' core
+  install <コア>`）を macOS の単体で固定。**実機は未検証**
+
 ### 5.5 無い環境のフォールバックと導入の案内
 
 - **arduino-cli も ALS も無い**: 色分けだけ効く（§5.2）。言語サーバは `not_installed`、実行は

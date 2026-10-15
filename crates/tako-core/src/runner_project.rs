@@ -1131,6 +1131,21 @@ impl SketchYaml {
     }
 }
 
+/// `sketch.yaml` の今の値（#1952。基板とポートの欄・`tako run-config` の読み = `sketch_board::sketch_defaults`）
+pub(crate) fn sketch_yaml_defaults(sketch: &Path) -> crate::sketch_board::SketchDefaults {
+    let y = SketchYaml::read(sketch).unwrap_or_default();
+    crate::sketch_board::SketchDefaults {
+        fqbn: y.default_fqbn,
+        port: y.default_port,
+        profile: y.default_profile,
+    }
+}
+
+/// A/B（`TAKO_1950_LEGACY=1`）で arduino の行を外しているか（#1952 の基板の欄もそれに従う）
+pub(crate) fn arduino_disabled() -> bool {
+    KINDS.iter().any(|k| k.id == "arduino" && k.disabled())
+}
+
 /// スケッチのフォルダ `sketch` の基板が選ばれているか（`sketch.yaml` の `default_fqbn` か
 /// `default_profile`）。Code Runner（#1950）と言語サーバの前提（#1951。`lsp::servers::Requirement`）が
 /// 同じ 1 実装を読む。実測（arduino-language-server・同梱の arduino-cli 1.2.0）: どちらの鍵でも
@@ -1349,19 +1364,18 @@ fn msg_port_not_selected(lang: Lang) -> String {
 /// 形（実測 1.2.0 + 公式の JSON 出力）: `{"detected_ports":[{"matching_boards":[{"name","fqbn"}],
 /// "port":{"address", …}}]}`。基板が繋がっていなければ `matching_boards` が無い
 fn refine_board_note(note: &mut ProjectNote, stdout: &str) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
+    // 読み方は基板の欄（#1952）と同じ 1 実装
+    let Some(ports) = crate::sketch_board::parse_board_list(stdout) else {
         return;
     };
-    let mut boards: Vec<(String, String, String)> = Vec::new();
-    for port in v["detected_ports"].as_array().into_iter().flatten() {
-        let address = port["port"]["address"].as_str().unwrap_or_default();
-        for b in port["matching_boards"].as_array().into_iter().flatten() {
-            if let Some(fqbn) = b["fqbn"].as_str().filter(|f| !f.is_empty()) {
-                let name = b["name"].as_str().unwrap_or(fqbn);
-                boards.push((name.to_string(), fqbn.to_string(), address.to_string()));
-            }
-        }
-    }
+    let boards: Vec<(String, String, String)> = ports
+        .iter()
+        .flat_map(|p| {
+            p.boards
+                .iter()
+                .map(|b| (b.name.clone(), b.fqbn.clone(), p.address.clone()))
+        })
+        .collect();
     let lang = crate::i18n::lang();
     match boards.as_slice() {
         [] => {}

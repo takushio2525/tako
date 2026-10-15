@@ -2529,6 +2529,9 @@ pub enum Request {
         /// true = 実行環境の子プロセスの問い合わせ（道具の場所・版）を覚えた答えを捨てて聞き直す
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         refresh: bool,
+        /// `.ino`: 入っているコアの基板を名前か FQBN で探す語（空 = 全部）。応答の `board.matches`（#1952）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boards: Option<String>,
     },
     /// 実行の既定の読み書き。`ext` = 拡張子既定コマンドの一覧/設定/削除（FR-3.18, #453）、
     /// `path` = そのファイル / プロジェクトの実行設定（実行環境・プロファイル。FR-3.18.5, #1731。
@@ -2572,6 +2575,13 @@ pub enum Request {
         /// 実行前コマンド（失敗したら本体を走らせない。#1732）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<String>,
+        /// `.ino`: 基板（FQBN）。`arduino-cli board attach` で `sketch.yaml` の `default_fqbn` へ書く
+        /// （tako の保存先には持たない。コアが入っていなければ書かずに導入のコマンドを返す。#1952）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        board: Option<String>,
+        /// `.ino`: 書き込み先のポート（`sketch.yaml` の `default_port`。#1952）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<String>,
     },
     /// 設定画面の操作（Issue #459）。
     /// `action` = "open"（既定。GUI 設定画面を開く）/ "status"（開いているか + 現在タブ）
@@ -2692,6 +2702,8 @@ impl Request {
             env: None,
             cwd: None,
             before: None,
+            board: None,
+            port: None,
         }
     }
 

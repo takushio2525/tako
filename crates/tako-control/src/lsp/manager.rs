@@ -922,6 +922,17 @@ impl LspManager {
         shared.restart(name)
     }
 
+    /// 起こす前提（`.ino` の基板 = `sketch.yaml`）を変えたので、**前提つきの器のうちルートが `root` の
+    /// ものだけ**を起こし直す（#1952。基板を選んだ直後）。未設定（unconfigured）なら確かめ直して起き、
+    /// 動いていれば新しい基板で組み直す。文書を開いていなければ器が無いので何もしない。**待たない**
+    /// （起こすのは背景）。他のスケッチ・前提の無いサーバ（clangd 等）は触らない
+    pub fn restart_requiring(&self, root: &Path) -> Value {
+        let Some(shared) = &self.shared else {
+            return disabled_status();
+        };
+        shared.restart_requiring(root)
+    }
+
     /// 止める（`tako lsp stop`）。restart まで自動では起こさない
     pub fn stop(&self, name: Option<&str>) -> Value {
         let Some(shared) = &self.shared else {
@@ -2727,13 +2738,28 @@ impl Shared {
         inner
             .resolved
             .retain(|id, _| name.is_some_and(|n| n != *id));
-        let mut restarted = Vec::new();
         let keys: Vec<ServerKey> = inner
             .servers
             .keys()
             .filter(|k| name.is_none_or(|n| n == k.id))
             .cloned()
             .collect();
+        let restarted = self.restart_keys(inner, keys);
+        crate::diag::persist_log(&format!(
+            "LSP 再起動（利用者）: 対象={} 件 未導入の記録を消した={} 件",
+            restarted.len(),
+            cleared.len()
+        ));
+        json!({
+            "action": "restart",
+            "restarted": restarted,
+            "cleared_not_installed": cleared,
+        })
+    }
+
+    /// 器を止めて起こし直す（`restart` と `restart_requiring` の共通。ロックは呼び手が持つ）
+    fn restart_keys(&self, inner: &mut Inner, keys: Vec<ServerKey>) -> Vec<Value> {
+        let mut restarted = Vec::new();
         for key in keys {
             let Some(slot) = inner.servers.get_mut(&key) else {
                 continue;
@@ -2758,16 +2784,39 @@ impl Shared {
                 restarted.push(json!({ "id": key.id, "root": key.root.display().to_string() }));
             }
         }
+        restarted
+    }
+
+    fn restart_requiring(&self, root: &Path) -> Value {
+        // ルートの比べ方: 器のルートは開いた文書のパスから決まり（/tmp と /private/tmp のような
+        // 別名がありうる）、呼び手のルートは正規化済み。両方を正規化して比べる（ロックの外で stat する）
+        let canon = |p: &Path| {
+            tako_core::platform::path::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        };
+        let want = canon(root);
+        let candidates: Vec<ServerKey> = {
+            let inner = self.lock();
+            inner
+                .servers
+                .iter()
+                .filter(|(_, slot)| slot.spec.requires.is_some())
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        let keys: Vec<ServerKey> = candidates
+            .into_iter()
+            .filter(|k| canon(&k.root) == want)
+            .collect();
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        inner.epoch = inner.epoch.wrapping_add(1);
+        let restarted = self.restart_keys(inner, keys);
+        drop(guard);
         crate::diag::persist_log(&format!(
-            "LSP 再起動（利用者）: 対象={} 件 未導入の記録を消した={} 件",
-            restarted.len(),
-            cleared.len()
+            "LSP 起こし直し（起こす前提を変えた = sketch.yaml。#1952）: 対象={} 件",
+            restarted.len()
         ));
-        json!({
-            "action": "restart",
-            "restarted": restarted,
-            "cleared_not_installed": cleared,
-        })
+        json!({ "action": "restart", "restarted": restarted })
     }
 
     fn stop(&self, name: Option<&str>) -> Value {

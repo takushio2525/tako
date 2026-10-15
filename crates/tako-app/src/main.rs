@@ -31673,6 +31673,12 @@ mod self_test {
     use rename_1686::{rename_1686_real_visual, rename_1686_visual};
     #[cfg(feature = "visual-test")]
     use run_dropdown_1733::run_dropdown_1733_visual;
+    /// #1952: ドロップダウンの基板とポートの欄（実の arduino-cli で sketch.yaml・言語サーバの起き直し）
+    /// （visual-test `run-board-1952`）
+    #[cfg(feature = "visual-test")]
+    mod run_board_1952;
+    #[cfg(feature = "visual-test")]
+    use run_board_1952::run_board_1952_visual;
     /// #1944: 言語サーバを取って起こす・エディタの状態（visual-test `lsp-fetch`）
     #[cfg(feature = "visual-test")]
     mod lsp_fetch_1944;
@@ -46113,6 +46119,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #1952: 基板とポートの欄（実の arduino-cli。素材は scripts/test-run-board-1952.sh）
+                "run-board-1952" => {
+                    run_board_1952_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1893: 右クリックの「ホバー情報を表示」・キー・補完中のキー・巨大な doc（偽サーバ）
                 "hover-1893" => {
                     hover_1893_visual(any, window, cx).await;
@@ -46379,7 +46391,7 @@ mod self_test {
                          remote-tree / flicker / ime-preedit / screen-lines / \
                          pane-border / tasks-panel / task-attachment / \
                          tasks-accordion / tasks-tick / tasks-offload / shelve-tab / no-emoji / editor-keys / \
-                         run-command-truncate / run-dropdown-1733 / viewport-lines / jump-keys / search-case / goto-hover / \
+                         run-command-truncate / run-dropdown-1733 / run-board-1952 / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
