@@ -428,7 +428,7 @@ if [ "$GUI_OK" = 1 ] && [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
     if [ "$(echo "$d_old" | awk '{print $2}')" -gt 0 ] 2>/dev/null; then
       pass "旧: 嘘のエラーが出る（$(echo "$d_old" | awk '{print $2}') 件）"
     else
-      fail "旧: 嘘のエラーが出ない（$d_old）"
+      fail "旧: 嘘のエラーが出ない（${d_old}）"
     fi
     stop_gui
 
@@ -446,7 +446,7 @@ if [ "$GUI_OK" = 1 ] && [ "$HAVE_IDE" = 1 ] && [ "$HAVE_CORE" = 1 ]; then
       if [ "$(echo "$d_main" | awk '{print $2}')" -gt 0 ] 2>/dev/null; then
         pass "main: 嘘のエラーが出る（$(echo "$d_main" | awk '{print $2}') 件）"
       else
-        fail "main: 嘘のエラーが出ない（$d_main）"
+        fail "main: 嘘のエラーが出ない（${d_main}）"
       fi
       stop_gui
       TAKO_BIN="$NEW_TAKO_BIN" APP_BIN="$NEW_APP_BIN"
