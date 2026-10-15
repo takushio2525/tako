@@ -669,6 +669,49 @@ pub fn backend_observation(
     obs
 }
 
+/// 閉じる直前の取り込み（最後の増分）で読む範囲（#2018 / #2085。純関数）。
+///
+/// [`plan_backend_capture`] と同じだが、増分が無くても probe の後に伸びた行を揃えで拾うため
+/// 余白だけは読む（器を kill する閉じ方は probe と capture が別の起動になる）
+pub fn backend_close_plan(
+    probe: &crate::tmux::PaneLogProbe,
+    last_history: usize,
+    last_bytes: u64,
+    budget: usize,
+) -> BackendCapture {
+    match plan_backend_capture(probe, last_history, last_bytes, budget, false) {
+        BackendCapture::Skip if probe.history >= last_history => BackendCapture::Counted {
+            delta: 0,
+            take: 0,
+            margin: ALIGN_MARGIN,
+        },
+        plan => plan,
+    }
+}
+
+/// 器が自ら閉じたときの書き出し（`pane-died` フックの全履歴 + 画面。#2085）から、
+/// 最後の取り込みの後の行の観測と、閉じる直前の画面を作る（純関数）。
+///
+/// 読む範囲と揃えは閉じる直前の取り込みと同じ 1 実装（[`backend_close_plan`] +
+/// [`backend_observation`]）。書き出しは死んだ瞬間の probe と履歴が同じ時点のものなので
+/// ずれは出ないが、取り込み済みの末尾で揃えることで最後の tick と重ならない
+pub fn pane_died_observation(
+    dump: crate::tmux_backend::PaneDiedDump,
+    last_history: usize,
+    last_bytes: u64,
+    anchor: &[String],
+    budget: usize,
+) -> (PaneObservation, Vec<String>) {
+    let crate::tmux_backend::PaneDiedDump {
+        probe,
+        mut history,
+        screen,
+    } = dump;
+    let plan = backend_close_plan(&probe, last_history, last_bytes, budget);
+    let tail = history.split_off(history.len().saturating_sub(plan.lines_to_read()));
+    (backend_observation(&probe, plan, anchor, tail), screen)
+}
+
 /// 余白つきで読んだ履歴から、取り込み済みの末尾（`anchor`）の直後を新しい行として切り出す。
 /// 戻り値は (新しい行, probe の後に伸びた行数)。ずれの小さい側を優先する（同じ行の繰り返しで
 /// 複数の位置が合うときは、修正前と同じ範囲 = ずれ 0 に倒れる）
@@ -1717,5 +1760,59 @@ mod tests {
             ChunkKind::Counted { lines, delta } => assert_eq!((lines.len(), delta), (20, 20)),
             other => panic!("Counted でない: {other:?}"),
         }
+    }
+
+    fn dump(history: usize, screen: usize) -> crate::tmux_backend::PaneDiedDump {
+        crate::tmux_backend::PaneDiedDump {
+            probe: probe(history, 0, false),
+            history: numbered(0, history),
+            screen: numbered(history, history + screen),
+        }
+    }
+
+    /// #2085: 器が自ら閉じたときの書き出しから、最後の取り込みの後の行と画面を作る
+    #[test]
+    fn 自ら閉じた器の書き出しは最後の取り込みの後の行と画面になる() {
+        // 100 行まで取り込み済み → 書き出しは履歴 281 行 + 画面 20 行
+        let (obs, screen) = pane_died_observation(dump(281, 20), 100, 0, &numbered(92, 100), 4000);
+        assert_eq!(screen, numbered(281, 301));
+        assert_eq!(obs.history, 281);
+        match obs.chunk {
+            ChunkKind::Counted { lines, delta } => {
+                assert_eq!(lines, numbered(100, 281));
+                assert_eq!(delta, 181);
+            }
+            other => panic!("Counted でない: {other:?}"),
+        }
+        // 取り込みの後に履歴が伸びていない（出力が止まってから終わった）: 何も足さず画面だけ
+        let (obs, screen) = pane_died_observation(dump(281, 20), 281, 0, &numbered(273, 281), 4000);
+        assert_eq!(screen.len(), 20);
+        match obs.chunk {
+            ChunkKind::Counted { lines, delta } => assert_eq!((lines.len(), delta), (0, 0)),
+            other => panic!("Counted でない: {other:?}"),
+        }
+        // 一度も取り込んでいない（初回の tick より先に終わった）: 履歴を頭から
+        let (obs, _) = pane_died_observation(dump(50, 20), 0, 0, &[], 4000);
+        match obs.chunk {
+            ChunkKind::Counted { lines, .. } => assert_eq!(lines, numbered(0, 50)),
+            other => panic!("Counted でない: {other:?}"),
+        }
+    }
+
+    /// 洪水の上限（時間あたり）は閉じる直前の取り込みと同じ: 超えた分は省略マーカーになる
+    #[test]
+    fn 自ら閉じた器の書き出しも読む行数の上限に従う() {
+        let (obs, _) = pane_died_observation(dump(3000, 20), 100, 0, &numbered(92, 100), 400);
+        match obs.chunk {
+            ChunkKind::Counted { lines, delta } => {
+                assert_eq!(delta, 2900);
+                assert_eq!(lines, numbered(2600, 3000), "末尾 400 行");
+            }
+            other => panic!("Counted でない: {other:?}"),
+        }
+        // 履歴が巻き戻った（clear-history）なら読まない
+        let (obs, screen) = pane_died_observation(dump(10, 20), 100, 0, &numbered(92, 100), 400);
+        assert!(matches!(obs.chunk, ChunkKind::None));
+        assert_eq!(screen.len(), 20);
     }
 }

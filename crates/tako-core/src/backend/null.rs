@@ -41,6 +41,8 @@ impl SessionBackend for NullBackend {
             extended_keys: true,
             // 器が無い = copy mode 自体が無い（スクロールは tako 側。FR-2.5.13）
             suppresses_copy_mode_indicator: true,
+            // 器が無い = 履歴は tako のメモリにあり、閉じるときに読み切る（#2085）
+            keeps_exit_output: true,
             label: "none",
         }
     }

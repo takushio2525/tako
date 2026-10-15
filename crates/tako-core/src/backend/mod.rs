@@ -308,6 +308,17 @@ pub struct BackendCapabilities {
     /// このオプションを持たない**（実測 #974）ので消す手段が無い。
     /// 器が無いときは copy mode 自体が無い（スクロールは tako 側）ので true
     pub suppresses_copy_mode_indicator: bool,
+    /// **器のペインが自ら閉じるとき、最後の出力を閉じる前に書き出せるか**（#2085）。
+    ///
+    /// 器の履歴はセッションと一緒に消えるので、出力し続けている最中に中のコマンドが
+    /// 終わると、ペインログ（FR-5.13）の最後の取り込みの後の行（#2018 で最大 10 秒）が入らない。
+    /// tmux は `remain-on-exit` + `pane-died` フックで、ペインを閉じる前に全履歴と画面を
+    /// ファイルへ書かせてから `kill-pane` できる（`tmux_backend::pane_died_conf`）。
+    /// **psmux は未実測**（`set-hook` はあるが `pane-died`・入れ子のコマンド列・
+    /// `save-buffer` のパスの書式展開を Windows 実機で確かめていない）ので false =
+    /// 設定を 1 行も足さず、最後の取り込みの後の行は従来どおり入らない。
+    /// 器が無いときは tako が履歴をメモリで持つ（閉じるときに読み切る）ので true
+    pub keeps_exit_output: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -349,6 +360,8 @@ impl BackendCapabilities {
             // #974: 器で止まるものを 1:1 で見えるようにする（`tako persist` / MCP）
             "extended_keys": self.extended_keys,
             "suppresses_copy_mode_indicator": self.suppresses_copy_mode_indicator,
+            // #2085: 自ら閉じたペインの最後の出力がペインログへ入るか
+            "keeps_exit_output": self.keeps_exit_output,
             "note": self.degraded_note(),
         })
     }
@@ -1605,6 +1618,7 @@ mod tests {
             keystrokes_ascii_only: false,
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
+            keeps_exit_output: true,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -1620,6 +1634,7 @@ mod tests {
             keystrokes_ascii_only: false,
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
+            keeps_exit_output: true,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -1641,6 +1656,7 @@ mod tests {
             keystrokes_ascii_only: false,
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
+            keeps_exit_output: true,
             label: "none",
         };
         let v = caps.describe();
@@ -1661,6 +1677,7 @@ mod tests {
             keystrokes_ascii_only: false,
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
+            keeps_exit_output: true,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -1682,6 +1699,7 @@ mod tests {
             keystrokes_ascii_only: true,
             extended_keys: false,
             suppresses_copy_mode_indicator: false,
+            keeps_exit_output: false,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -1693,6 +1711,9 @@ mod tests {
         assert_eq!(v["suppresses_copy_mode_indicator"], false);
         assert_eq!(tmux.describe()["extended_keys"], true);
         assert_eq!(tmux.describe()["suppresses_copy_mode_indicator"], true);
+        // #2085: 自ら閉じたペインの最後の出力を残せるかも同じ 1 箇所から読める
+        assert_eq!(v["keeps_exit_output"], false);
+        assert_eq!(tmux.describe()["keeps_exit_output"], true);
     }
 
     /// 案 B-1（器だけの ConPTY セッションホスト）の形をした偽 backend。
@@ -1729,6 +1750,7 @@ mod tests {
                 keystrokes_ascii_only: false,
                 extended_keys: true,
                 suppresses_copy_mode_indicator: true,
+                keeps_exit_output: true,
                 label: "session-host",
             }
         }
@@ -1933,6 +1955,7 @@ mod tests {
             keystrokes_ascii_only: false,
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
+            keeps_exit_output: true,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -2005,6 +2028,7 @@ mod tests {
                 keystrokes_ascii_only: false,
                 extended_keys: true,
                 suppresses_copy_mode_indicator: true,
+                keeps_exit_output: true,
                 label: "capture-only",
             }
         }

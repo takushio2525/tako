@@ -16,10 +16,15 @@ import { windowsSupport } from '../motion/windowsSupport';
 
 // 「Windows でも psmux で戻る」（手順 2 の補足とページの「Windows では」）と書く根拠。
 // 対応表から外れたらビルドを落とす
-for (const tool of ['tako_persist', 'tako_sessions', 'tako_logs']) {
+for (const tool of ['tako_persist', 'tako_sessions']) {
 	if (windowsSupport.rows.get(tool) !== '対応') {
 		throw new Error(`SceneRelaunch: Windows の ${tool} が「対応」ではなくなった。手順 2 の補足とページの「Windows では」を直すこと`);
 	}
+}
+// ペインのログは「使える」と書く。#2085 から一部対応（psmux の中で自ら終わったコマンドの最後の出力が入らない）で、
+// 落ちる分はページの「Windows では」の一覧に載せてある（対応に戻ればその一覧の側がビルドを落とす）
+if (!['対応', '一部対応'].includes(windowsSupport.rows.get('tako_logs') ?? '')) {
+	throw new Error('SceneRelaunch: Windows の tako_logs が使えなくなった。ページの「Windows では」を直すこと');
 }
 ---
 

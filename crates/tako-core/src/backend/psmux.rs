@@ -307,6 +307,9 @@ impl SessionBackend for PsmuxBackend {
             extended_keys: false,
             // `copy-mode-position-format` を持たない（#974 の実機実測）
             suppresses_copy_mode_indicator: false,
+            // `pane-died` フックで最後の出力を書き出す形を Windows 実機で確かめていない（#2085）。
+            // 立てると conf へ `set-hook` / `remain-on-exit` を書くことになるので、実測までは外す
+            keeps_exit_output: false,
             label: "psmux",
         }
     }

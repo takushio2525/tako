@@ -91,6 +91,8 @@ impl SessionBackend for TmuxBackend {
             // conf の `copy-mode-position-format ''` で消せる（tmux 3.6 の既定書式は
             // 先頭行のタイムスタンプを出す。2026-06-12 実機バグ (2)）
             suppresses_copy_mode_indicator: true,
+            // conf の `remain-on-exit` + `pane-died` フックが閉じる前に全履歴と画面を書き出す（#2085）
+            keeps_exit_output: true,
             label: "tmux",
         }
     }

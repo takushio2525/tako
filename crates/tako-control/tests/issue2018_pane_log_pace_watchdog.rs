@@ -21,6 +21,9 @@
 //! 3. 器の取り込み（2 秒ごとの本体と、閉じる直前の取り込み）が同じ錠で 1 本ずつに並ぶ
 //!    （並ばないと同じ増分を 2 回書く）
 //! 4. `drop_backend_session` の kill のスレッドが、最後の増分の取り込み → kill の順に呼ぶ
+//! 5. 器が自ら消えた閉じ方（#2085）は、器の `pane-died` フックが書いた全履歴 + 画面を
+//!    **別スレッドで**読む（`apply_pane_log_close_from` は UI スレッド）。読み手
+//!    `finish_backend_pane_log_exit` も 3. と同じ錠で並ぶ（2 秒ごとの取り込みと同じ増分を読む）
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -65,12 +68,17 @@ const FORBIDDEN_ON_UI: &[(&str, &str)] = &[
     ),
     ("kill_session(", "`tmux kill-session` を起こす"),
     ("Command::new(", "子プロセスを起こす"),
+    (
+        "take_pane_died_dump(",
+        "器が自ら消える前の書き出し（全履歴 + 画面）をファイルから読む = #2085",
+    ),
 ];
 
 /// 器の取り込みを並べる錠を取るべき関数
 const SERIALIZED: &[&str] = &[
     "fn process_pane_log_jobs(",
     "fn finish_backend_pane_log_close(",
+    "fn finish_backend_pane_log_exit(",
 ];
 
 const INGEST_LOCK: &str = "PANE_LOG_BACKEND_INGEST";
@@ -227,6 +235,31 @@ fn scan(src: &str) -> Vec<Offender> {
             }
         }
     }
+
+    // 5. 器が自ら消えた閉じ方は、書き出しを別スレッドで読む（#2085）
+    match fn_window(src, "fn apply_pane_log_close_from(") {
+        None => {}
+        Some((at, window)) => {
+            let off_ui = window.iter().any(|l| {
+                !is_comment(l)
+                    && l.contains("std::thread::spawn(")
+                    && l.contains("finish_backend_pane_log_exit(")
+            });
+            if !off_ui {
+                let call = code_lines_with(&window, "finish_backend_pane_log_exit(")
+                    .first()
+                    .copied()
+                    .unwrap_or(0);
+                push(
+                    at + call,
+                    "`apply_pane_log_close_from` が器の書き出しの取り込み（`finish_backend_pane_log_exit`）を \
+                     `std::thread::spawn(` の中で呼んでいない（UI スレッドでファイルを読み、2 秒ごとの取り込みの錠を \
+                     待つ = #2085 / #1979）"
+                        .into(),
+                );
+            }
+        }
+    }
     out
 }
 
@@ -262,6 +295,8 @@ fn 走査が空振りしていない() {
         ("fn pane_log_close_data(", "visible_lines()"),
         ("fn process_pane_log_jobs(", "pane_log_probe_batch("),
         ("fn finish_backend_pane_log_close(", "flush_close("),
+        ("fn finish_backend_pane_log_exit(", "take_pane_died_dump("),
+        ("fn apply_pane_log_close_from(", "CloseOrigin::ProcessExit"),
         ("fn drop_backend_session(", "backend_sessions.remove("),
     ] {
         let (_, w) = fn_window(&main, head).unwrap();
@@ -296,9 +331,27 @@ const INJECTIONS: &[Injection] = &[
     },
     Injection {
         name: "閉じる直前の取り込みを並べない",
-        from: "    let _serial = PANE_LOG_BACKEND_INGEST\n        .lock()\n        .unwrap_or_else(|poisoned| poisoned.into_inner());\n    let data = close.data;",
-        to: "    let data = close.data;",
+        from: "    socket: &str,\n    pane: PaneId,\n    close: PendingPaneLogClose,\n) {\n    let _serial = PANE_LOG_BACKEND_INGEST\n        .lock()\n        .unwrap_or_else(|poisoned| poisoned.into_inner());\n    let data = close.data;",
+        to: "    socket: &str,\n    pane: PaneId,\n    close: PendingPaneLogClose,\n) {\n    let data = close.data;",
         expect: INGEST_LOCK,
+    },
+    Injection {
+        name: "器が自ら消えたときの書き出しの取り込みを並べない（#2085）",
+        from: "PaneLogManager>>,\n    pane: PaneId,\n    close: PendingPaneLogClose,\n) {\n    let _serial = PANE_LOG_BACKEND_INGEST\n        .lock()\n        .unwrap_or_else(|poisoned| poisoned.into_inner());\n    let data = close.data;",
+        to: "PaneLogManager>>,\n    pane: PaneId,\n    close: PendingPaneLogClose,\n) {\n    let data = close.data;",
+        expect: INGEST_LOCK,
+    },
+    Injection {
+        name: "器が自ら消えたときの書き出しを UI スレッドで読む（#2085）",
+        from: "            std::thread::spawn(move || finish_backend_pane_log_exit(&logs, pane, close));",
+        to: "            finish_backend_pane_log_exit(&logs, pane, close);",
+        expect: "std::thread::spawn(",
+    },
+    Injection {
+        name: "書き出しを UI スレッドのクローズフラッシュで読む（#2085）",
+        from: "        use tako_core::pane_log::{ChunkKind, PaneObservation};\n        let mut mgr = self.pane_logs_lock();",
+        to: "        use tako_core::pane_log::{ChunkKind, PaneObservation};\n        let _ = tako_core::tmux_backend::take_pane_died_dump(std::path::Path::new(\"x\"), \"x\");\n        let mut mgr = self.pane_logs_lock();",
+        expect: "take_pane_died_dump(",
     },
     Injection {
         name: "kill してから最後の増分を取り込む",
