@@ -56,6 +56,8 @@ const OVERLAYS: &str = "crates/tako-app/src/overlays.rs";
 const SEARCH_PANEL: &str = "crates/tako-app/src/search_panel.rs";
 /// #1686: 名前の変更の欄（`AppTextInput::LspRename`）の描画
 const LSP_RENAME_UI: &str = "crates/tako-app/src/lsp_rename_ui.rs";
+/// #1733: 実行ボタン横のドロップダウンの欄（`AppTextInput::RunMenu`）の描画
+const RUN_MENU_UI: &str = "crates/tako-app/src/run_menu_ui.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const CLI: &str = "crates/tako-cli/src/main.rs";
 
@@ -68,6 +70,7 @@ const RENDER_FILES: &[&str] = &[
     OVERLAYS,
     SEARCH_PANEL,
     LSP_RENAME_UI,
+    RUN_MENU_UI,
 ];
 
 /// 未確定文字列を描いたしるし
@@ -203,6 +206,7 @@ struct Sources {
     overlays: String,
     search_panel: String,
     lsp_rename_ui: String,
+    run_menu_ui: String,
     dispatch: String,
     cli: String,
 }
@@ -217,6 +221,7 @@ impl Sources {
             overlays: prod(root, OVERLAYS),
             search_panel: prod(root, SEARCH_PANEL),
             lsp_rename_ui: prod(root, LSP_RENAME_UI),
+            run_menu_ui: prod(root, RUN_MENU_UI),
             dispatch: prod(root, DISPATCH),
             cli: prod(root, CLI),
         }
@@ -231,6 +236,7 @@ impl Sources {
             OVERLAYS => &self.overlays,
             SEARCH_PANEL => &self.search_panel,
             LSP_RENAME_UI => &self.lsp_rename_ui,
+            RUN_MENU_UI => &self.run_menu_ui,
             DISPATCH => &self.dispatch,
             _ => &self.cli,
         }

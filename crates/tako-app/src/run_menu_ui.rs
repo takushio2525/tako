@@ -392,6 +392,8 @@ impl RunMenuUi {
             .map(String::as_str)
     }
 
+    /// 取り直しの最中か（visual-test が答えの届くのを待つための読み口）
+    #[cfg(feature = "visual-test")]
     pub(crate) fn loading(&self, pane: PaneId) -> bool {
         self.resolved.get(&pane).is_some_and(|r| r.loading)
     }
@@ -818,14 +820,23 @@ impl TakoApp {
     /// 設定画面の Code Runner タブ（dispatch `Settings` = CLI `tako settings --tab runner`）
     pub(crate) fn run_menu_open_settings(&mut self, cx: &mut Context<Self>) {
         self.close_run_menu();
-        let _ = tako_control::dispatch(
+        if let Err(e) = tako_control::dispatch(
             self,
             Request::Settings {
                 action: Some("open".into()),
                 tab: Some("runner".into()),
             },
             PaneOrigin::User,
-        );
+        ) {
+            // 弾かれたら黙って捨てない（#1399 の作法。メニューは閉じたので共有の通知欄へ）
+            self.notify_ui_dispatch_failed(
+                crate::sidebar::NoticeArea::Preview,
+                crate::sidebar::NoticeArm::Issue1422,
+                crate::ui_text::preview::run_menu_open_settings(),
+                None,
+                &e,
+            );
+        }
         cx.notify();
     }
 
