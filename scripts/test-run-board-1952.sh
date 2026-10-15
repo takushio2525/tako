@@ -156,8 +156,8 @@ printf '%s' "$KEEP_YAML" > "$S/Keep/sketch.yaml"
 printf '%s' "$KEEP_YAML" > "$S/KeepRef/sketch.yaml"
 "$REAL_CLI" board attach -b arduino:avr:mega "$S/KeepRef" >/dev/null 2>&1
 
-start_gui() { # start_gui <data> <ログ> [VAR=VAL…]
-  local data="$1" log="$2"
+start_gui() { # start_gui <data> <ログ> [VAR=VAL…]（戻り値 = launch_isolated_gui の終了コード。4 = 面を用意できない）
+  local data="$1" log="$2" launch_rc=0
   shift 2
   mkdir -p "$data"
   export TAKO_DATA_DIR="$data"
@@ -166,7 +166,9 @@ start_gui() { # start_gui <data> <ログ> [VAR=VAL…]
     TAKO_DISCOVERY_DIR="$TMP/disc" TAKO_ORCHESTRATOR_DIR="$TMP/orch" \
     TAKO_SESSIONS_FILE="$TMP/sessions.yaml" TAKO_PANE_LOG_DIR="$TMP/panelogs" \
     TAKO_WORKERS_FILE="$TMP/workers.yaml" TAKO_TMUX_SOCKET="$TMUX_SOCKET" \
-    TAKO_DATA_DIR="$data" ${1+"$@"}
+    TAKO_DATA_DIR="$data" ${1+"$@"} || launch_rc=$?
+  # 呼び手が 4 を未実測へ、それ以外の失敗を FAIL へ読み替える
+  return "$launch_rc"
 }
 server_field() { # server_field <ルート> <式>
   "$TAKO_BIN" lsp status --name arduino-language-server --json 2>/dev/null |
