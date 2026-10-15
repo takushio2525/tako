@@ -20,17 +20,6 @@
 
 ---
 
-## 2026-10-15（#2057: docs にコマンドカードのページを新設 = 折り返しの比較・帯・コピー・実行・複数・スマホ・Claude Code の画面の中をスクロール連動で見せる）
-- `features/command-card` に 5 場面（20 手順）。部品は `CommandCardFull`（複数・改行・失敗の赤）と `PhoneCommandCards`（全文の確認シート）を新しいファイルで足し、共有部品は不変。実行ペインは実物どおり下へ 35%（`dispatch.rs` の `Direction::Down`）
-- 実測: Playwright で 1440 / 375 × ライト / ダーク / 動かさない = 120 枚・横はみ出し 0・手順の不一致 0。① は AI 側を 14.6em（≒ 21 桁）に固定し 1440 / 1024 / 768 / 375 で折り返り・はみ出し 0・良い側 1 行を確認
-
-## 2026-10-15（#2052: IPC の `tako todo list` / 完了・却下の置き場の読み書きを UI スレッドから外し、パレット・`tako panel` で開いた瞬間に一覧を引き直す）
-- `prepare_offload` の腕 `user_task_offload_prepare`: ① 送達フローの観測（生きている全ペインの決着したフロー・I/O なし）と展開状態の写し（UI）→ ② 書き戻し + 読み / 書き換え（background）→ ③ 完了・却下だけ開いていた行を畳む（UI）。段は dispatch の同期の腕と共有。右パネルのボタンは `dispatch_off_ui`、パレット / `set_panel` → `after_dispatch` は `spawn_user_tasks_list`。A/B `TAKO_2052_LEGACY=1`・番犬 `issue1984_*` 11 節（注入 10 通り）・カタログ増 0 B
-- 実測（読み 1500 ms の注入・`scripts/test-user-task-offload-2052.sh` 9 PASS）: 一覧 ×6 / done の最中の IPC 最大 新 72 / 34 ms・旧 3073 / 2950 ms、測定区間の UI スレッドの読み 新 0・旧 16 回。visual `tasks-offload`: done のボタン 新 1 ms・旧 6025 ms、パレット / `tako panel` は新だけ開いた更新でジョブ（旧は ① で FAILED）
-
-## 2026-10-15（#2063: docs「閉じても消えない」をスクロール連動のモーションで作り直す）
-- 4 場面（閉じる / PC 再起動の resume / tako recover / CLI 更新の張り直し）・暗転の部品 Blackout を追加。Windows の対応状況はビルド時に対応表と突き合わせる（値が変わるとビルドが落ちる）。PR #2078
-
 ## 2026-10-15（#2084: docs だけの PR と main への push で CI の macOS / Windows の Rust ジョブを skip する）
 - 判定ジョブ `changes`（`scripts/ci-change-scope.sh`・テスト 92 項目）+ docs の検査を `docs`（ubuntu）へ移設 + docs / .agent を読む番犬 27 本を `docs-watchdogs`（ubuntu・毎回）で。検証用 PR #2090 で 4 分 43 秒で緑（Rust 2 本は skip）。PR #2089
 
@@ -51,7 +40,7 @@
 - 実測（読み 1500 ms の注入・`scripts/test-user-task-offload-2086.sh` 16 PASS）: 最中の IPC 最大 新 17〜32 ms・旧 1402〜4421 ms、UI スレッドの読み 新 0・旧 10 回。PWA 実経路 69 PASS・配送 45 PASS
 
 ## 2026-10-15（#2021: MCP の stdio ブリッジ 1 本 約 7 MB → 1.09 MB）
--clap を通らない・カタログを使い捨ての子プロセスで組む・.app では libSystem だけの `tako-mcp` へ exec で引き渡す。登録は `tako mcp serve` のまま（移行なし）、応答はバイト単位で同じ。計測は `scripts/measure-mcp-bridge-2021.sh`、番犬は `issue2021_mcp_bridge`
+- clap を通らない・カタログを使い捨ての子プロセスで組む・.app では libSystem だけの `tako-mcp` へ exec で引き渡す。登録は `tako mcp serve` のまま（移行なし）、応答はバイト単位で同じ。計測は `scripts/measure-mcp-bridge-2021.sh`、番犬は `issue2021_mcp_bridge`
 
 ## 2026-10-15（#2041: 残りの `claude agents --json` 走査を mod の報告で埋めた = GUI モードのチャット表示と /clear 後のレジストリの会話 ID）
 - チャット表示は報告のあるペインを問わず、残りだけ絞って走査。`/clear` 後はレジストリの会話 ID を報告へ追従（`agents_scan.registry_followed`）。A/B `TAKO_2041_LEGACY=1`・番犬 `issue2041_*`。PR #2091
@@ -83,3 +72,19 @@
 ## 2026-10-15（#2092: Windows のペインは文字コード固定の決着まで入力を預かる = `encoding_pin::PinGate`・上限 直接 500 ms / 器 1500 ms）
 - `check-health` の `encoding_pin` 節と persist.log へ諦めを記録。器の内側の固定が本番経路で呼ばれていなかったのを `spawn_in` で配線（PR #2103）
 - Windows CI 実測（各 25 回）: 直接は固定 5〜16 ms / プロンプト 26〜46 ms、器は内側 154〜180 ms / プロンプト 226〜310 ms。注入の A/B で旧は化け・新は `日本語テスト`（直接・器とも 5 巡）
+
+## 2026-10-15（#2104: 対応状況の 2 ページ（windows-support / agent-support）の md をコミットせず、件数を持たない写し `docs/src/data/*.json` から docs のビルドが組む）
+- 写しは 1 行 = 1 フィールドで並列の PR が別々の行を直しても衝突しない（`docs/scripts/support-pages.mjs`・astro の integration）。番犬 `scripts/test-support-snapshot-merge-2104.sh`（CI の docs ジョブ）。PR #2108
+- 実演: 実物の support.rs を直した 2 本は修正前が md で衝突・修正後は衝突なしで `--check` 緑。dist は前後で `diff -r` の差分 0
+
+## 2026-10-15（#1964: tako mod でチャット風の描画 = 吹き出し・コードの Copy（クリック）と帯の `o: copy last code`（キー）・ツールの 1 行の要約）
+- ターミナル表示の既定は Copy だけ。GUI モードは `chat.place mod` でそのペインを本物の画面のまま見せる（既定 = GPUI のチャットはユーザーの判断待ち = tako todo）。GPUI のチャットは報告の `chat_seq` で読み直す（#1883 の内容）。PR #2111
+- A/B `TAKO_1964_LEGACY=1`・番犬 `issue1964_*`（注入 15 通り）・`scripts/test-mod-chat-1964.sh` 全段緑・カタログ増 0 B
+
+## 2026-10-15（#1951: `.ino` の言語サーバ = arduino-language-server の行・伴走（arduino-cli / clangd）と空の設定ファイルを表の `Arg` で・基板が未選択なら unconfigured で起こさず選ぶコマンドを案内）
+- 実測 `scripts/test-lsp-arduino-1951.sh` 23 OK（IDE 同梱物で診断・ホバー・補完・帯の画像・選べば合図で起きる・ALS なし・A/B）。常駐 ALS + clangd 72〜77 MB。PR #2109
+- `.h` / `.cpp` を ALS へ回すと先に `.ino` を開いた時だけ正しい = #2113 に分けた
+
+## 2026-10-15（#2106: CI の macOS で実 tmux のテストが 1 本も走っていなかった = ランナーの image に tmux が無く全部 skip のまま ok）
+- tmux の導入段（11 秒）+ `tako_core::tmux_test_gate`（`TAKO_TEST_REQUIRE_TMUX=1` で skip を panic・台帳から件数を出す）+ 番犬 `issue2106_*`。CI で 52 本が実 tmux で走る。PR #2110
+- 罠: 件数の `sort -u` が en_US.UTF-8 の照合で日本語のテスト名を潰した（`LC_ALL=C`）。issue1857 の負荷依存のフレークは #2114
