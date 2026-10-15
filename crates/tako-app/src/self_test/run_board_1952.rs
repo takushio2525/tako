@@ -9,7 +9,7 @@
 //!
 //! - ① `.ino` を編集モードで開く → 一覧（background の `RunResolve`）に `board` 欄が届く・基板は未選択・
 //!   言語サーバは unconfigured（A/B: `TAKO_1952_LEGACY=1` は欄が無いのでここで名指しの FAILED）
-//! - ② シェブロンを実マウスで押す → 基板とポートの節が描かれる（画像 `open`）
+//! - ② シェブロンを実マウスで押す → 基板とポートの節が描かれる（画像 `open`。① の判定の前に撮る = 旧の腕にも残る）
 //! - ③ 「基板を探す」を押して実キーで `uno` → 入っているコアの基板が絞られる（画像 `search`）→ `arduino:avr:uno` の
 //!   行を押す → sketch.yaml に `default_fqbn`
 //! - ④ 「ポートを指定」を押して実キーでポートを打って Enter → sketch.yaml に `default_port`（画像 `port`）
@@ -259,28 +259,8 @@ pub(super) async fn run_board_1952_visual(
         board.as_ref().map_or(0, |b| b.installed.len()),
         board.as_ref().and_then(|b| b.ports.as_ref().map(Vec::len)),
     );
-    check(
-        board.is_some(),
-        &format!(
-            "visual-test {LABEL} ①: `.ino` の一覧に基板とポートの欄（board）がある（legacy={legacy}）"
-        ),
-    );
-    let board = board.unwrap_or_default();
-    check(
-        board.fqbn.is_none() && board.installed.iter().any(|b| b.fqbn == "arduino:avr:uno"),
-        &format!(
-            "visual-test {LABEL} ①: 未選択・入っているコアの基板に arduino:avr:uno（{} 件）",
-            board.installed.len()
-        ),
-    );
-    check(
-        state_before == Some(ServerState::Unconfigured),
-        &format!(
-            "visual-test {LABEL} ①: 基板が無いので言語サーバは unconfigured（{state_before:?}）"
-        ),
-    );
-
-    // ② シェブロンを実マウスで押す → 基板とポートの節
+    // ② シェブロンを実マウスで押す → 基板とポートの節（判定の前に開いて撮る = A/B の旧の腕にも
+    // 欄の無いメニューの画像が 1 枚残る）
     click_probe(
         any,
         window,
@@ -301,6 +281,26 @@ pub(super) async fn run_board_1952_visual(
     .await;
     reveal(any, window, cx, "run-menu-board-search");
     dump(any, window, cx, "open");
+    check(
+        board.is_some(),
+        &format!(
+            "visual-test {LABEL} ①: `.ino` の一覧に基板とポートの欄（board）がある（legacy={legacy}）"
+        ),
+    );
+    let board = board.unwrap_or_default();
+    check(
+        board.fqbn.is_none() && board.installed.iter().any(|b| b.fqbn == "arduino:avr:uno"),
+        &format!(
+            "visual-test {LABEL} ①: 未選択・入っているコアの基板に arduino:avr:uno（{} 件）",
+            board.installed.len()
+        ),
+    );
+    check(
+        state_before == Some(ServerState::Unconfigured),
+        &format!(
+            "visual-test {LABEL} ①: 基板が無いので言語サーバは unconfigured（{state_before:?}）"
+        ),
+    );
     check(
         opened,
         &format!("visual-test {LABEL} ②: シェブロンで基板とポートの節が描かれる"),

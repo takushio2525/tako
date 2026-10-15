@@ -12,13 +12,14 @@
 #      tako が起こした arduino-cli の引数を全部記録し（PATH の先頭の記録係）、`core install` が 1 度も無い
 #   ④ 境界: 形の崩れた FQBN / スケッチでないファイル / 入っているコアに無い基板 / `--boards` の検索
 #   ⑤ A/B: `TAKO_1952_LEGACY=1` はドロップダウンに基板の欄が無い（visual-test が ① で名指しの FAILED）・
-#      本番の /Applications/tako.app（#1952 より前）の CLI には `--board` が無い
+#      修正前（main）の CLI には `--board` が無い（`TAKO_1952_MAIN_TAKO=<main の tako>` を渡したとき）
 #
 # **ユーザーの Arduino の設定・スケッチには書かない**: HOME を一時 dir へ差し替え（arduino-cli の既定の data dir と
 # ビルドのキャッシュも一時 dir になる）、arduino:avr のコアは本物の data dir から APFS の複製（`cp -c`）で写す。
 # 本物の inventory.yaml / package_index.json / library_index.json の mtime を前後で比べる（#1950 / #1951 の作法）。
 #
 # 使い方: bash scripts/test-run-board-1952.sh
+#   TAKO_1952_MAIN_TAKO=<path> 修正前（main）の tako CLI（⑤ の CLI の A/B。無ければ未実測）
 #   TAKO_1952_DUMP_DIR=<dir>   画像の置き場（新旧で new / legacy に分ける。既定は一時 = 終わると消える）
 #   Arduino IDE（/Applications/Arduino IDE.app）か arduino:avr のコアが無い機では全段を「未実測」と出す。
 #   面（tako-vd）を用意できない機（蓋閉じ）では GUI の段を「未実測」と出す。
@@ -148,6 +149,7 @@ KEEP_YAML='# 授業用の設定
 profiles:
   nano:
     fqbn: arduino:avr:nano
+default_profile: nano
 default_fqbn: arduino:avr:nano   # 古い
 '
 printf '%s' "$KEEP_YAML" > "$S/Keep/sketch.yaml"
@@ -202,16 +204,19 @@ if [ "$HAVE_IDE" != 1 ] || [ "$HAVE_CORE" != 1 ] || [ ! -f "$S/Ref/sketch.yaml" 
 fi
 
 echo
-echo "== ⑤ A/B（CLI）: 本番の /Applications/tako.app には --board が無い =="
-PROD_CLI="/Applications/tako.app/Contents/MacOS/tako"
-if [ -x "$PROD_CLI" ]; then
-  old="$(env -u TAKO_SOCKET TAKO_DISCOVERY_DIR="$TMP/nodisc" "$PROD_CLI" run-config "$S/Bad/Bad.ino" --board arduino:avr:uno 2>&1)"
-  echo "    旧: $(printf '%s' "$old" | head -2 | mask | tr '\n' ' ')"
-  check_has "旧: --board を知らない（#1952 より前）" "--board" "$old"
+echo "== ⑤ A/B（CLI）: 修正前（main）の tako には --board が無い =="
+# 修正前の CLI は呼び手が渡す（`TAKO_1952_MAIN_TAKO`。main を別の worktree で `cargo build -p tako-cli` したもの）。
+# /Applications の版は main より古いことがある（run-config 自体が無い版）ので既定にしない
+MAIN_CLI="${TAKO_1952_MAIN_TAKO:-}"
+if [ -n "$MAIN_CLI" ] && [ -x "$MAIN_CLI" ]; then
+  old="$(env -u TAKO_SOCKET TAKO_DISCOVERY_DIR="$TMP/nodisc" "$MAIN_CLI" run-config "$S/Bad/Bad.ino" --board arduino:avr:uno 2>&1)"
+  echo "    旧: $(printf '%s' "$old" | head -1 | mask)"
+  check_has "旧: run-config はあるが --board を知らない" "unexpected argument '--board'" "$old"
   [ ! -f "$S/Bad/sketch.yaml" ] && pass "旧: sketch.yaml を書いていない" || fail "旧: sketch.yaml を書いた"
 else
-  unmeasured "⑤ CLI: /Applications/tako.app が無い"
+  unmeasured "⑤ CLI: 修正前の tako（TAKO_1952_MAIN_TAKO）が渡されていない"
 fi
+check_has "新: run-config の --help に --board と --port がある" "--port" "$("$TAKO_BIN" run-config --help 2>&1 | grep -E -- '--board|--port' | tr '\n' ' ')"
 
 echo
 echo "== ① visual-test run-board-1952（ドロップダウン・実マウス・実キー） =="
@@ -223,10 +228,10 @@ run_visual() { # run_visual <名前> <スケッチ> [VAR=VAL…]
     TAKO_VISUAL_DUMP_DIR="$DUMP/$name" TAKO_1952_SKETCH="$sketch_dir" TAKO_1952_REF="$S/Ref" ${1+"$@"}
   rc=$?
   if [ "$rc" = 4 ]; then
-    unmeasured "visual-test（$name）: 面（tako-vd）を用意できない"
+    unmeasured "visual-test（${name}）: 面（tako-vd）を用意できない"
     return 4
   fi
-  [ "$rc" = 0 ] || { fail "visual-test（$name）: GUI が立たない（rc=$rc）"; return 1; }
+  [ "$rc" = 0 ] || { fail "visual-test（${name}）: GUI が立たない（rc=${rc}）"; return 1; }
   APP_PID="$ISOLATED_GUI_PID"
   local i
   for i in $(seq 1 240); do
@@ -326,7 +331,7 @@ for line in open(sys.argv[1]):
   crc=$?
   echo "    コア無し: rc=$crc $(printf '%s' "$C" | mask | tr '\n' ' ' | head -c 400)"
   echo "    起こした arduino-cli: $(tr '\n' '|' < "$ARGV_LOG" | mask)"
-  [ "$crc" != 0 ] && pass "③ コアが無い基板は断る（rc=$crc）" || fail "③ コアが無い基板を受けた"
+  [ "$crc" != 0 ] && pass "③ コアが無い基板は断る（rc=${crc}）" || fail "③ コアが無い基板を受けた"
   check_has "③ 導入のコマンドを示す" "core install arduino:renesas_uno" "$C"
   [ ! -f "$S/Core/sketch.yaml" ] && pass "③ sketch.yaml を書いていない" || fail "③ sketch.yaml を書いた"
   if grep -q "core install" "$ARGV_LOG"; then fail "③ arduino-cli に core install が渡った"; else pass "③ arduino-cli に core install が 1 度も渡っていない（$(wc -l < "$ARGV_LOG" | tr -d ' ') 回の呼び出し）"; fi

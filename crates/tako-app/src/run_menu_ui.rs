@@ -1027,9 +1027,15 @@ impl TakoApp {
                         .and_then(|v| v.board.as_mut())
                     {
                         let b = &v["board"];
-                        view.fqbn = b["fqbn"].as_str().map(str::to_string);
+                        let fqbn = b["fqbn"].as_str().map(str::to_string);
+                        // ポートだけを書いた答えは名前を引いていない（listall を聞かない）= 基板が
+                        // 変わらないなら前の名前を保つ
+                        let name = b["name"].as_str().map(str::to_string);
+                        if fqbn != view.fqbn || name.is_some() {
+                            view.name = name;
+                        }
+                        view.fqbn = fqbn;
                         view.port = b["port"].as_str().map(str::to_string);
-                        view.name = b["name"].as_str().map(str::to_string);
                     }
                     app.run_menu.notice = None;
                 }
