@@ -2714,6 +2714,36 @@ v3.3.8 を実測）: `-f` があるとそのファイルだけを読み、既定
 （外れた名前の定義行と `-f` の無い `new-session` の行を `file:line` で落とす。セルフテストの範囲を
 拾えなくなったときも落ちる）。
 
+## 実 tmux のテストは門を通して飛ばす（Issue #2106）
+
+**「tmux が無いので飛ばす」を `eprintln!("skip: …"); return;` で直書きしない**。
+cargo test は通ったテストの stderr を捨てるので、skip したかどうかはログに残らない。
+CI の macOS ランナー（image `macos-26-arm64`）には tmux が無く、実 tmux の番犬
+（#2095 の pane-died・#1857 の attach 専用・#2100 の conf 差し替え ほか）は **CI で 1 度も
+走っていなかった**（#2106 の実測: 修正前の main の macOS ジョブで実 tmux の e2e 10 バイナリが
+すべて finished in 0.00〜0.03s。手元の実 tmux では `trust_auto_accept_e2e` 8.47s・
+`issue1259_*` 1.89s・`issue1447_*` 2.01s）。
+
+- 入口は `tako_core::tmux_test_gate` の 1 実装: 器を通すテストは `container()`、本物の tmux
+  （psmux の名前貸しではない）が要るテストは `real_tmux()`、ファイル固有の前提は
+  `require(bool, 欠けた前提)` / `require_some(Option, …)`、前提が崩れたときの途中の skip
+  （zsh が無い・先行サーバーを立てられない 等）は `skip(理由)`。形は
+  `if !tako_core::tmux_test_gate::container() { return; }`
+- **`TAKO_TEST_REQUIRE_TMUX=1` の下では skip が panic になる**。立てるのは CI の macOS ジョブ
+  （`brew install tmux` の段の後ろの `cargo test --workspace`）だけ。tmux の無い手元の
+  `cargo test` は env が無いので従来どおり skip で通る。Windows ジョブは立てない
+  （本物の tmux が無い）。値は未設定・空・`0` だけが「許す」で、`true` 等の綴り違いは禁じる側
+- **`TAKO_TEST_TMUX_LEDGER=<file>` の下では、門を通ったテストの名前（スレッド名 = テスト名）と
+  門を呼んだ `file:line` を 1 行ずつ追記する**。CI は `scripts/ci-real-tmux-report.sh` で
+  件数・ファイルごとの本数・テスト名をログへ出し、0 件（配線切れ）なら落とす
+- 手元で「tmux が無い」を作るときは PATH から外すだけでは足りない（`tmux_bin()` は既知の場所と
+  ログインシェルまで探す）。`TAKO_TMUX_BIN=<実在しないパス>` で解決順の全段を塞ぐ
+- 番犬は `crates/tako-control/tests/issue2106_real_tmux_gate_watchdog.rs`: ①門を通らない
+  tmux の skip の直書き（`eprintln!` の文言が tmux と skip / スキップを言う）を `file:line` で
+  落とす（Windows 専用・`#[ignore]`・セルフテストの 3 ファイルは件数つきの `KNOWN`）
+  ②env の効き目（自分を子の役で起こし直し、必須の env + tmux 無しで落ちる / env 無しなら
+  skip で通る / 台帳に名前が載る）③ci.yml の段の順と env・報告スクリプトの 0 件で落ちる形
+
 ## 新しい worktree は PWA のビルドから始まる（Issue #1309 / #574）
 
 `git worktree add` 直後のツリーには `web/tako-remote/dist/` が無い（`.gitignore` 対象）。

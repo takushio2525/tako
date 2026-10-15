@@ -1252,6 +1252,9 @@ mod tests {
             .env("TEMP", &tmp)
             .env_remove("TAKO_DATA_DIR")
             .env_remove("TAKO_1296_LEGACY")
+            // 残骸を数えるための再実行なので、実 tmux のテストの台帳（#2106）へは書かせない
+            // （CI の件数が同じテストの 2 回分で水増しされる）
+            .env_remove(crate::tmux_test_gate::LEDGER_ENV)
             .stdin(std::process::Stdio::null())
             .stdout(std::fs::File::create(&log).expect("子のログを作れる"))
             .stderr(

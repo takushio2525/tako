@@ -157,8 +157,10 @@ fn ペインidとセッション名の両方でscrollbackが返る() {
     std::env::set_var("TAKO_DISCOVERY_DIR", &disc);
     std::env::set_var("TAKO_TMUX_SOCKET", &socket);
 
-    let Some(bin) = container_bin() else {
-        eprintln!("SKIP: 器になれるバイナリが無い（tmux / psmux）");
+    let Some(bin) = tako_core::tmux_test_gate::require_some(
+        container_bin(),
+        "器になれるバイナリ（tmux / psmux）が無い",
+    ) else {
         return;
     };
     if let Err(e) = start_session(&bin, &socket) {

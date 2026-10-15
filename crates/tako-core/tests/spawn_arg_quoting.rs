@@ -310,8 +310,9 @@ fn container(bin: &str, socket: &str) -> Command {
 /// （tako の器設定は `remain-on-exit` が off なので画面には何も出ない）
 #[test]
 fn 器ありでも空白入りcwdのペインが生き残る() {
-    let Some(bin) = container_bin() else {
-        eprintln!("skip: 器（tmux / psmux）が無い");
+    let Some(bin) =
+        tako_core::tmux_test_gate::require_some(container_bin(), "器（tmux / psmux）が無い")
+    else {
         return;
     };
     let space_dir = std::env::temp_dir().join(format!("tako-884 cwd {}", std::process::id()));
@@ -445,8 +446,9 @@ fn 器ありでも空白入りcwdのペインが生き残る() {
 /// 実行されるためセッションごと落ちる
 #[test]
 fn 空白を含むenvの値も1語のまま器へ届く() {
-    let Some(bin) = container_bin() else {
-        eprintln!("skip: 器（tmux / psmux）が無い");
+    let Some(bin) =
+        tako_core::tmux_test_gate::require_some(container_bin(), "器（tmux / psmux）が無い")
+    else {
         return;
     };
     let socket = format!("tako-884env-{}", std::process::id());

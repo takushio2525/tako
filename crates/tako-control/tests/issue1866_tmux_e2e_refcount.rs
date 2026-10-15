@@ -37,16 +37,6 @@ fn hang_guard() -> Duration {
     tmux_e2e::budget_for(tmux_e2e::BASE) * 2
 }
 
-fn real_tmux() -> bool {
-    std::process::Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| tako_core::tmux::announces_only_tmux(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
-}
-
 /// 器のソケットファイルがあるか（`=` 付きの別名も見る。消すのは 1 実装だけ）
 fn socket_file_exists() -> bool {
     let Some(dir) = tako_core::tmux_backend::socket_dir() else {
@@ -126,8 +116,7 @@ fn race_once(tag: &str) -> Outcome {
 
 #[test]
 fn 隣の起動中に最後の1本が返っても器を畳まない() {
-    if !real_tmux() {
-        eprintln!("[e2e-1866] 本物の tmux が無いのでスキップ");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
     std::env::remove_var("TAKO_1866_LEGACY");

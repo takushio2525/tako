@@ -41,7 +41,7 @@ struct Fixture {
 impl Fixture {
     /// 履歴へ押し出す行と、現画面に残る行の両方を作る
     fn new(tag: &str) -> Option<Self> {
-        let bin = real_tmux()?;
+        let bin = tako_core::tmux_test_gate::require_some(real_tmux(), "本物の tmux が無い環境")?;
         let socket = format!("tako-972test-{}-{tag}", std::process::id());
         let session = format!("tako972{tag}");
         let script = "for i in $(seq 1 120); do echo LINE_$i; done; echo TAIL_MARKER; sleep 300";
@@ -68,6 +68,7 @@ impl Fixture {
             .map(|s| s.success())
             .unwrap_or(false);
         if !ok {
+            tako_core::tmux_test_gate::skip("隔離した tmux サーバーを立てられない");
             return None;
         }
         // 出力が落ち着くまで待つ（固定待ちにしない = #796 の作法）
@@ -135,7 +136,6 @@ impl Drop for Fixture {
 #[test]
 fn 器の境界経由で履歴と現画面が採れる() {
     let Some(fx) = Fixture::new("main") else {
-        eprintln!("SKIP: 本物の tmux が無い（psmux 等は psmux_backend.rs が見る）");
         return;
     };
     let lines = fx
@@ -158,7 +158,6 @@ fn 器の境界経由で履歴と現画面が採れる() {
 #[test]
 fn 行数指定で遡り幅が変わる() {
     let Some(fx) = Fixture::new("lines") else {
-        eprintln!("SKIP: 本物の tmux が無い");
         return;
     };
     let few = fx.capture(5).expect("採取が失敗した");
@@ -177,11 +176,10 @@ fn 行数指定で遡り幅が変わる() {
 #[test]
 fn 裸の完全一致ターゲットではペインを解決できない() {
     let Some(fx) = Fixture::new("legacy") else {
-        eprintln!("SKIP: 本物の tmux が無い");
         return;
     };
     if tako_core::tmux::target_syntax() != tako_core::tmux::TmuxTargetSyntax::Exact {
-        eprintln!("SKIP: この CLI は `=` を使わない（psmux 等）");
+        tako_core::tmux_test_gate::skip("この CLI は `=` を使わない（psmux 等）");
         return;
     }
     let (ok, stderr) = fx.legacy_capture();

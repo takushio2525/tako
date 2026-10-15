@@ -14,7 +14,6 @@
 //! 本物の tmux が無い環境（psmux しか無い Windows 等）ではスキップする。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tako_control::reach::DialogAccess;
@@ -31,16 +30,6 @@ fn socket() -> &'static str {
 
 /// 模擬 TUI が描く選択肢（Issue #1263 本文の実採取と同じ並び）
 const LABELS: [&str; 3] = ["Yes", "Not now", "Don't show again"];
-
-fn real_tmux() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| tako_core::tmux::announces_only_tmux(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
-}
 
 /// tmux セッションと一時ディレクトリを片付けるガード
 struct EmuGuard {
@@ -265,8 +254,7 @@ fn respond_once(tag: &str, choice: &str) -> (serde_json::Value, Vec<String>, Opt
 
 #[test]
 fn issue1263_auto_mode確認へラベルと番号で応答できる() {
-    if !real_tmux() {
-        eprintln!("skip: 本物の tmux が無い環境");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
 

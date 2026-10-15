@@ -32,16 +32,6 @@ fn socket() -> &'static str {
 /// 送る本文（実採取物は貼らない = #927。到達判定に使うので一意にする）
 const PAYLOAD: &str = "E2E1259 please answer with the word pineapple";
 
-fn real_tmux() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| tako_core::tmux::announces_only_tmux(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(false)
-}
-
 struct EmuGuard {
     session: String,
     dir: PathBuf,
@@ -250,8 +240,7 @@ fn child_alive(dir: &Path) -> bool {
 /// 会話ログに番号つきの並びが残っていても `is_choice_dialog` は偽・`input_line` は真
 #[test]
 fn 背景シェルが生き残ったidleペインへも送達が成立する() {
-    if !real_tmux() {
-        eprintln!("[e2e-1259] 本物の tmux が無いのでスキップ");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
     let (guard, log) = launch_emulator("deliver");
@@ -312,8 +301,7 @@ fn 背景シェルが生き残ったidleペインへも送達が成立する() {
 /// 貼り付けが起きないこと（`GOT=` が下書きそのまま）を確かめる
 #[test]
 fn 人間の下書きは送達で壊れない() {
-    if !real_tmux() {
-        eprintln!("[e2e-1259] 本物の tmux が無いのでスキップ");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
     let (guard, log) = launch_emulator("draft");
@@ -358,8 +346,7 @@ fn 人間の下書きは送達で壊れない() {
 /// どちらでも `verified` かつ相手が本文を受け取ることを実測する
 #[test]
 fn 子プロセスが無い通常のidleでも送達が成立する() {
-    if !real_tmux() {
-        eprintln!("[e2e-1259] 本物の tmux が無いのでスキップ");
+    if !tako_core::tmux_test_gate::real_tmux() {
         return;
     }
     let (guard, log) = launch_emulator_with("nochild", false);

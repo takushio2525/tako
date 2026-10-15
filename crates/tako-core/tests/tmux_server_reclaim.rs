@@ -73,14 +73,13 @@ fn dead_pid() -> Option<u32> {
 /// #1192 の必須検査。生きた所有者のサーバーは `--apply` でも消えない
 #[test]
 fn 所有者が生きているサーバーはapplyでも消えない() {
-    if !tmux_available() {
-        eprintln!("skip: tmux が無い環境");
+    if !tako_core::tmux_test_gate::require(tmux_available(), "tmux が無い環境") {
         return;
     }
     let Some(dead_owner) = dead_pid() else {
-        eprintln!(
-            "skip: この環境の process_alive は死んだ pid を報告しない\
-             （非 unix は常に true = tmux のソケットを 1 つも回収しない側へ倒す設計）"
+        tako_core::tmux_test_gate::skip(
+            "この環境の process_alive は死んだ pid を報告しない\
+             （非 unix は常に true = tmux のソケットを 1 つも回収しない側へ倒す設計）",
         );
         return;
     };
@@ -148,12 +147,11 @@ fn 所有者が生きているサーバーはapplyでも消えない() {
 /// 生きていれば残り、死んだ残骸は回収される。手書きの `tk*` は数字があっても触らない
 #[test]
 fn issue1918_tk_coretestの残骸は所有者の生死で回収される() {
-    if !tmux_available() {
-        eprintln!("skip: tmux が無い環境");
+    if !tako_core::tmux_test_gate::require(tmux_available(), "tmux が無い環境") {
         return;
     }
     let Some(dead_owner) = dead_pid() else {
-        eprintln!("skip: この環境の process_alive は死んだ pid を報告しない");
+        tako_core::tmux_test_gate::skip("この環境の process_alive は死んだ pid を報告しない");
         return;
     };
     let dir = std::env::temp_dir().join(format!("tako-1918-tk-{}", std::process::id()));

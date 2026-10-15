@@ -222,8 +222,30 @@ jobs:
         run: cargo clippy -p tako-core -p tako-control -p tako-cli --all-targets -- -D warnings
       - name: ビルド
         run: cargo build --workspace
+      # 実 tmux を使うテスト（tmux_backend の番犬 = #2095 の pane-died・#1857 の attach 専用・
+      # #2100 の conf 差し替え ほか）のための tmux。ランナーの image（macos-26-arm64）には
+      # 入っていないので、以前は全部が skip して `ok` と出ていた（#2106 の実測: 該当テストの
+      # バイナリの所要が 0.00〜0.03 秒）。auto update はしない（時間がかかるうえ、
+      # 要るのは tmux の bottle だけ）
+      - name: tmux を入れる（実 tmux のテストを走らせる。#2106）
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install tmux
+          tmux -V
+      # TAKO_TEST_REQUIRE_TMUX: 実 tmux のテストの skip を panic に変える（tmux が消えたら
+      # 黙って skip へ戻らずに落ちる）。TAKO_TEST_TMUX_LEDGER: 実 tmux で走ったテストの名前の
+      # 台帳。どちらも tako_core::tmux_test_gate の 1 実装が読む（#2106）
       - name: テスト
+        env:
+          TAKO_TEST_REQUIRE_TMUX: "1"
+          TAKO_TEST_TMUX_LEDGER: ${{ runner.temp }}/real-tmux-tests.tsv
         run: cargo test --workspace
+      # cargo test は通ったテストの出力を捨てるので、実 tmux で走ったかは台帳でしか見えない。
+      # 件数と名前をログへ出し、0 件（配線切れ）なら落とす（#2106）
+      - name: 実 tmux のテストが走った件数と名前（#2106）
+        run: bash scripts/ci-real-tmux-report.sh "$RUNNER_TEMP/real-tmux-tests.tsv"
       # 対応マトリクス（support.rs）から生成している docs ページが古いまま
       # コミットされるのを止める。宣言は system prompt にも流れるので
       # 「docs だけ古い」を許すと利用者と AI で見えている事実が食い違う（#591 / #516）

@@ -204,7 +204,6 @@ fn send_copy_command(target: &ScrollTarget, command: &str, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::capabilities;
     use crate::terminal::{SpawnCommand, SpawnOptions};
     use crate::tmux_backend::{wrap_options, TmuxTestGuard};
 
@@ -227,8 +226,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn バックエンドのスクロールを正確な行数で駆動できる() {
-        if !capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-scr-{}", std::process::id());
@@ -295,8 +293,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 履歴ゼロではcopy_modeに入らない() {
-        if !capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let socket = format!("tako-coretest-scr0-{}", std::process::id());
@@ -347,8 +344,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ネスト先セッションを解決して駆動できる() {
-        if !capabilities().survives_app_exit {
-            eprintln!("skip: tmux が無い環境");
+        if !crate::tmux_test_gate::container() {
             return;
         }
         let backend = format!("tako-coretest-scrn-{}", std::process::id());
