@@ -185,6 +185,10 @@ fn arg_or_env(args: &[String], flag: &str, env: &str) -> Option<String> {
         .or_else(|| std::env::var(env).ok().filter(|v| !v.is_empty()))
 }
 
+/// 1 行を追記する。**本文と改行を 1 回の書き込みで**（#1951）: `writeln!` は書式の部品ごとに書く
+/// （本文・改行の 2 回）ので、同じログを 2 つの偽サーバが同時に書く（器が 2 つ = shutdown を同時に受ける）と
+/// 「本文 A・本文 B・改行・改行」と混ざってどちらの行も読めなくなる（Windows の CI で shutdown が 0 件と
+/// 数えられた）。追記モードの 1 回の書き込みはまとめて末尾へ付く
 fn append(path: &Option<String>, line: &str) {
     if let Some(path) = path {
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -192,7 +196,7 @@ fn append(path: &Option<String>, line: &str) {
             .append(true)
             .open(path)
         {
-            let _ = writeln!(file, "{line}");
+            let _ = file.write_all(format!("{line}\n").as_bytes());
         }
     }
 }
