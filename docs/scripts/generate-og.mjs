@@ -25,6 +25,8 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 
+import { writeSupportPages } from './support-pages.mjs';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DOCS = resolve(HERE, '..');
 const CONTENT = join(DOCS, 'src/content/docs');
@@ -232,6 +234,9 @@ const FIT_SCRIPT = `<script>
 </script>`;
 
 /* ── 生成 ── */
+// 対応状況の 2 ページはコミットせずビルドが組む（#2104）。走査の前に組んでおかないと、
+// その 2 ページが manifest から落ちる
+writeSupportPages();
 const pages = walk(CONTENT).map((file) => {
   const rel = relative(CONTENT, file);
   const { slug, pathname } = routeOf(rel);

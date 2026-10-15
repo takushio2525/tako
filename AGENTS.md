@@ -210,7 +210,7 @@ tako/
 | **重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。#1994）** | `tako queue <コマンド>` |
 | **codex の利用制限データ（#357 / #985）** | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
 | **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude|codex|agy|local] [--status supported|degraded|pending|unsupported] [--json]` |
-| Windows 対応状況ページの生成（#591） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |
+| Windows 対応状況ページのデータの生成（ページは docs のビルドが組む。#591 / #2104） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |
 | **Windows のウインドウを実測する（#1063）** | `pwsh -File scripts/windows/measure-window.ps1 -TakoPid <pid>` |
 | 右パネルのビュー切替 | `tako panel --show --view <fleet|orch|git|tasks|diagnostics>` |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]` |

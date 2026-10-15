@@ -81,7 +81,8 @@ if [ -n "$closed" ]; then
     追跡先（残りの仕事を持つ Issue / 親エピック）へ付け替える
   - 済んだ調査・実装を引きたいだけなら、番号は Note 本文か evidence 側へ移す
     （そちらは closed でよい。むしろ確定した事実として強い）
-  - 生成ページは node scripts/gen-agent-support-docs.mjs で作り直す
+  - 生成ページのデータは node scripts/gen-agent-support-docs.mjs で作り直す
+    （ページは docs のビルドがそのデータから組む。#2104）
 MSG
   exit 1
 fi

@@ -1,8 +1,9 @@
 /**
  * Windows 対応状況を、生成ページ `src/content/docs/windows-support.md` から**ビルド時に**読む（#2053）。
  *
- * そのページは tako 本体の対応マトリクス（crates/tako-core/src/platform/support.rs）から
- * `scripts/gen-windows-support-docs.mjs` が作り、CI が同期を検査している。数字をここで手書きしないので、
+ * そのページは tako 本体の対応マトリクス（crates/tako-core/src/platform/support.rs）の写し
+ * `src/data/windows-support.json`（`scripts/gen-windows-support-docs.mjs` が作り、CI が同期を検査している）から
+ * ビルドの頭で組まれる（`docs/scripts/support-pages.mjs`。#2104）。数字をここで手書きしないので、
  * マトリクスが変われば トップ / インストールページの「Windows でどこまで使えるか」も一緒に変わる。
  * 生成ページの書式が変わって読めなくなったら、黙って 0 を出さずにビルドを落とす。
  */
@@ -35,7 +36,7 @@ const STATUSES: Status[] = ['対応', '一部対応', '未対応 / 未実測', '
 function fail(what: string): never {
 	throw new Error(
 		`windowsSupport.ts: windows-support.md から ${what} を読めません。` +
-			'生成ページの書式（scripts/gen-windows-support-docs.mjs）が変わったら、この読み取りも直してください'
+			'生成ページの書式（docs/scripts/support-pages.mjs）が変わったら、この読み取りも直してください'
 	);
 }
 

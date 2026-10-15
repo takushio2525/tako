@@ -19,3 +19,7 @@ pnpm-debug.log*
 
 # macOS-specific files
 .DS_Store
+
+# 対応状況の 2 ページは src/data の写しからビルドが組む（#2104。scripts/support-pages.mjs）
+src/content/docs/windows-support.md
+src/content/docs/agent-support.md

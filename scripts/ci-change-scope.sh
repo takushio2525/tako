@@ -29,11 +29,14 @@ DOCS_ONLY=(
 )
 
 # DOCS_ONLY に当たっても Rust が要るもの（`パターン|理由`）。
-# 生成ページは macOS ジョブが tako バイナリの出力と突き合わせる（gen-*-docs.mjs --check）ので、
-# 手で直した PR を docs だけとして通すと main で初めて食い違いが見つかる
+# 対応状況ページのデータ（マトリクスの写し。#2104）は macOS ジョブが tako バイナリの出力と
+# 突き合わせる（gen-*-docs.mjs --check）ので、手で直した PR を docs だけとして通すと
+# main で初めて食い違いが見つかる（ページ本体はコミットせずビルドが写しから組む）。
+# 写しの書式と分類を持つ support-pages.mjs も --check の結果を変えるので同じ扱い
 RUST_REQUIRED=(
-  'docs/src/content/docs/windows-support.md|生成ページ（gen-windows-support-docs.mjs --check が tako バイナリと突き合わせる）'
-  'docs/src/content/docs/agent-support.md|生成ページ（gen-agent-support-docs.mjs --check が tako バイナリと突き合わせる）'
+  'docs/src/data/windows-support.json|対応状況ページのデータ（gen-windows-support-docs.mjs --check が tako バイナリと突き合わせる）'
+  'docs/src/data/agent-support.json|対応状況ページのデータ（gen-agent-support-docs.mjs --check が tako バイナリと突き合わせる）'
+  'docs/scripts/support-pages.mjs|対応状況ページの写しの書式と分類（gen-*-docs.mjs --check がこれで写しを作り直して突き合わせる）'
 )
 
 # 理由に並べるパスの上限（長い PR で summary を埋めない）
