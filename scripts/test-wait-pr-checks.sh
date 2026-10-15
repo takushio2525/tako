@@ -14,11 +14,14 @@
 #   5. 揺れ（1 回 completed → 次 in_progress）で確定しない
 #   6. base と衝突していて **run が作られない**状態は待たずに 4 で終わる（#1365）
 #   7. skip されたチェック（docs だけの PR の macOS / Windows）は完了・緑として数える（#2084）
+#   8. 上限に達した = 失敗ではない。最後にもう一度見て、そろっていれば緑・赤の結論を出す（#2047）
 # 併せて期待名の導出（pull_request で起動する job のみ / name 無しは job id）と、
 # merge-pr.sh が「揃っていないときに merge を呼ばない」ことも見る。
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$PWD"
+# 実行した人の環境の上限・A/B の腕を持ち込まない（Test 35 が既定の上限を見る）
+unset TAKO_WAIT_PR_CHECKS_TIMEOUT TAKO_2047_LEGACY
 WAIT_SH="${REPO_ROOT}/scripts/wait-pr-checks.sh"
 MERGE_SH="${REPO_ROOT}/scripts/merge-pr.sh"
 
@@ -839,6 +842,159 @@ rc=$?
 assert_eq "判定の後に skip が登録されて 0" "${rc}" "0"
 assert_hasnt "判定だけ緑の時点では揃ったと言わない（1 回目の観測は 3 本目以降）" "全 2 本が完了" "${out}"
 assert_has "skip の本数を言う" "うち 2 本は skip（成功扱い" "${out}"
+
+# 上限に達した時点ではまだ macOS が走っている形（#2040 = 上限 2400 秒を 19 秒超えた macOS）。
+# 1 回目の応答だけを置くので、2 回目以降はケースごとに書く。上限は環境変数で 0 秒へ縮めて注入する
+setup_2047_late() {
+  new_case "$1"
+  checks_json "${CF}|pass|2026-10-15T19:30:00Z" "${MAC}|pending|" "${WIN}|pass|2026-10-15T20:03:55Z" \
+    > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  cat > "${TAKO_GH_MOCK_DIR}/view.json" <<'JSON'
+{"number":2141,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"fix/2047-wait-pr-checks-timeout","title":"[修正] テスト用","url":"https://example.invalid/pr/2141"}
+JSON
+}
+# 上限の直後の応答（$1 = 何回目, $2 = macOS の結論, $3 = Windows の結論）
+late_reply() {
+  local mac_at="2026-10-15T20:22:57Z" win_at="2026-10-15T20:03:55Z"
+  [[ "$2" == "pending" ]] && mac_at=""
+  [[ "$3" == "pending" ]] && win_at=""
+  checks_json "${CF}|pass|2026-10-15T19:30:00Z" "${MAC}|$2|${mac_at}" "${WIN}|$3|${win_at}" \
+    > "${TAKO_GH_MOCK_DIR}/checks.$1.json"
+}
+
+echo "== Test 33: 上限の直後に緑がそろったら緑で終わる = 時間切れを失敗にしない（#2047）=="
+setup_2047_late t33
+late_reply 2 pass pass
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "上限を縮めても、直後に緑がそろえば 0" "${rc}" "0"
+assert_has "上限の出どころを言う" "上限 0 秒 = TAKO_WAIT_PR_CHECKS_TIMEOUT" "${out}"
+assert_has "上限に達したことを言い、最後にもう一度見る" "上限 0 秒に達した。時間切れ = 失敗とはせず、最後にもう一度状態を確かめる" "${out}"
+assert_has "揃ったことを言う" "CI が全部緑で揃った（期待 3 本 / 報告 3 本）" "${out}"
+assert_has "結論と完了時刻を出す（macOS）" "[pass] ${MAC} — 完了 2026-10-15T20:22:57Z" "${out}"
+assert_hasnt "タイムアウトとは言わない" "タイムアウト（" "${out}"
+assert_hasnt "merge してはいけないとは言わない" "merge してはいけない" "${out}"
+assert_eq "最後の確認も 2 回連続の観測で確定する（上限の 1 回 + 2 回）" "$(calls_of 'pr checks')" "3"
+
+setup_2047_late t33legacy
+late_reply 2 pass pass
+out="$(TAKO_2047_LEGACY=1 TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "修正前（最後の確認をしない）は緑の直前で 2 = 検出力" "${rc}" "2"
+assert_has "修正前は merge してはいけないと誤判定する" "merge してはいけない（CI の結論が出ていない）" "${out}"
+assert_eq "修正前は上限の 1 回で打ち切る" "$(calls_of 'pr checks')" "1"
+
+setup_2047_late t33merge
+late_reply 2 pass pass
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_merge 2141 --interval 1)"
+rc=$?
+assert_eq "merge-pr.sh も環境変数の上限を受け取り、上限の直後の緑で merge する" "${rc}" "0"
+assert_has "merge-pr.sh 経由でも上限の出どころが見える" "上限 0 秒 = TAKO_WAIT_PR_CHECKS_TIMEOUT" "${out}"
+assert_eq "squash + ブランチ削除で merge する" "$(cat "${TAKO_GH_MOCK_DIR}/merged" 2>/dev/null)" "pr merge 2141 --squash --delete-branch"
+
+setup_2047_late t33ready
+# 上限に達したのが「1 回目の完了を見た」その観測だった形 = 足す観測は 1 回で確定する
+checks_json "${CF}|pass|2026-10-15T19:30:00Z" "${MAC}|pass|2026-10-15T20:22:57Z" "${WIN}|pass|2026-10-15T20:03:55Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "上限の観測が 1 回目の完了なら、確認の 1 回で 0" "${rc}" "0"
+assert_eq "足す観測は 1 回だけ（計 2 回）" "$(calls_of 'pr checks')" "2"
+
+echo "== Test 34: 最後の確認でも未完了・赤・揺れなら従来どおり merge してはいけない（#2047）=="
+setup_2047_late t34pending
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "最後の確認でも実行中ならタイムアウト 2" "${rc}" "2"
+assert_has "最後の確認をしたうえでの結論だと言う" "タイムアウト（0 秒 + 最後の確認 1 回 / 2 回確認）: CI が揃わなかった" "${out}"
+assert_has "実行中の本数を出す" "実行中: 1 本" "${out}"
+assert_has "merge してはいけないと言う" "merge してはいけない（CI の結論が出ていない）" "${out}"
+assert_has "上限の伸ばし方を出す" "上限は TAKO_WAIT_PR_CHECKS_TIMEOUT=<秒> か --timeout <秒> で伸ばせる（既定 4800 秒）" "${out}"
+assert_hasnt "緑で揃ったとは言わない" "CI が全部緑で揃った" "${out}"
+assert_eq "完了でないと分かった時点で打ち切る（足す観測は 1 回）" "$(calls_of 'pr checks')" "2"
+
+new_case t34missing
+checks_json "${CF}|pass|2026-10-15T19:30:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "最後の確認でも未登録が残ればタイムアウト 2" "${rc}" "2"
+assert_has "未登録の名前を出す" "未登録: ${MAC}, ${WIN}" "${out}"
+
+setup_2047_late t34red
+late_reply 2 fail pass
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "最後の確認で赤がそろえば 1（タイムアウトの 2 ではない）" "${rc}" "1"
+assert_has "失敗の本数を出して merge してはいけないと言う" "失敗しているチェックが 1 本ある。merge してはいけない" "${out}"
+assert_has "赤の結論を出す" "[fail] ${MAC}" "${out}"
+assert_eq "赤も 2 回連続の観測で確定する" "$(calls_of 'pr checks')" "3"
+
+setup_2047_late t34redmerge
+late_reply 2 fail pass
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_merge 2141 --interval 1)"
+rc=$?
+assert_eq "merge-pr.sh も最後の確認の赤で 1" "${rc}" "1"
+assert_has "merge しない理由を言う" "merge しない: CI が揃っていない（wait-pr-checks.sh の終了コード 1）" "${out}"
+assert_eq "merge を呼ばない" "$(calls_of 'pr merge')" "0"
+
+setup_2047_late t34wobble
+late_reply 2 pass pass
+late_reply 3 pass pending
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "最後の確認で揺れたら確定しない（タイムアウト 2）" "${rc}" "2"
+assert_has "揺れを 1 行で出す" "揺れ: 完了の観測を取り消す" "${out}"
+assert_hasnt "緑で揃ったとは言わない" "CI が全部緑で揃った" "${out}"
+assert_eq "足す観測は最大 2 回（計 3 回）" "$(calls_of 'pr checks')" "3"
+
+setup_2047_late t34flip
+late_reply 2 pass pass
+late_reply 3 fail pass
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=0 run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "完了どうしでも結論が食い違えば確定しない（タイムアウト 2）" "${rc}" "2"
+assert_has "結論が揺れたと言う" "完了の結論が観測ごとに揺れて確定しなかった" "${out}"
+assert_eq "足す観測は最大 2 回で止まる（計 3 回）" "$(calls_of 'pr checks')" "3"
+
+echo "== Test 35: 上限は --timeout > TAKO_WAIT_PR_CHECKS_TIMEOUT > 既定（#2047）=="
+new_case t35
+checks_json "${CF}|pass|2026-10-15T19:30:00Z" "${MAC}|pass|2026-10-15T20:22:57Z" "${WIN}|pass|2026-10-15T20:03:55Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2141 --interval 1)"
+assert_has "既定は 4800 秒" "上限 4800 秒 = 既定" "${out}"
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=7 run_wait 2141 --interval 1)"
+assert_has "環境変数で変えられる" "上限 7 秒 = TAKO_WAIT_PR_CHECKS_TIMEOUT" "${out}"
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=7 run_wait 2141 --timeout 9 --interval 1)"
+assert_has "--timeout が環境変数より優先" "上限 9 秒 = --timeout" "${out}"
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT='' run_wait 2141 --interval 1)"
+assert_has "空の環境変数は未設定と同じ（既定）" "上限 4800 秒 = 既定" "${out}"
+out="$(TAKO_WAIT_PR_CHECKS_TIMEOUT=40m run_wait 2141 --interval 1)"
+rc=$?
+assert_eq "数値でない環境変数は 3" "${rc}" "3"
+assert_has "どこの値が駄目かを名指しする" "TAKO_WAIT_PR_CHECKS_TIMEOUT が数値ではない: 40m" "${out}"
+out="$(run_wait 2141 --timeout 40m --interval 1)"
+assert_has "--timeout の誤りは従来どおり --timeout を名指しする" "--timeout が数値ではない: 40m" "${out}"
+out="$(TAKO_2047_LEGACY=1 run_wait 2141 --interval 1)"
+assert_has "修正前の既定は 2400 秒" "上限 2400 秒 = 既定" "${out}"
+
+# 既定の上限は、緑になり得る macOS の run を CI 自身より先に諦めない値であること
+# （実物の ci.yml の macOS job の timeout-minutes 以上 = wait-pr-checks.sh の DEFAULT_TIMEOUT の根拠）。
+# job の上限を伸ばしたのに待ちを据え置くと、ここで落ちる
+MAC_LIMIT_MIN="$(awk '
+  /^  [A-Za-z0-9_-]+:[ \t]*$/ { in_mac = ($0 ~ /^  macos:/) }
+  in_mac && /^    timeout-minutes:/ { sub(/^    timeout-minutes:[ \t]*/, ""); print; exit }
+' "${REPO_ROOT}/.github/workflows/ci.yml")"
+DEFAULT_SEC="$(sed -n 's/^DEFAULT_TIMEOUT=\([0-9][0-9]*\)$/\1/p' "${WAIT_SH}")"
+if [[ "${MAC_LIMIT_MIN}" =~ ^[0-9]+$ && "${DEFAULT_SEC}" =~ ^[0-9]+$ ]]; then
+  if [[ ${DEFAULT_SEC} -ge $((MAC_LIMIT_MIN * 60)) ]]; then
+    ok "既定の上限 ${DEFAULT_SEC} 秒は macOS の job の上限 ${MAC_LIMIT_MIN} 分以上"
+  else
+    ng "既定の上限が macOS の job の上限より短い" "DEFAULT_TIMEOUT=${DEFAULT_SEC} 秒 / timeout-minutes: ${MAC_LIMIT_MIN}"
+  fi
+else
+  ng "既定の上限と macOS の job の上限を読めない" "DEFAULT_TIMEOUT='${DEFAULT_SEC}' / timeout-minutes='${MAC_LIMIT_MIN}'"
+fi
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="
