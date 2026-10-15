@@ -64,6 +64,13 @@ pub struct Settings {
     /// ので移行 Step は要らない（`Settings` の指紋は動くが、読み書きは後方互換）
     #[serde(default)]
     pub limit_resume_all: bool,
+    /// ネットワークが戻ったら、接続エラーで止まったエージェントのセッションをすぐ再開する
+    /// （FR-2.27.17 / Issue #2112。**既定 ON** = ユーザー判断）。`tako limit-resume --network on|off` /
+    /// MCP `tako_limit_resume`（`network`）/ 設定画面「一般」が書く。**旧ファイルはキーが無くても
+    /// ON で読める**（`default_network_resume`）ので移行 Step は要らない（`Settings` の指紋は動くが、
+    /// 読み書きは後方互換）
+    #[serde(default = "default_network_resume")]
+    pub network_resume: bool,
     /// 重い処理の順番待ちの上限（FR-2.43.6 / Issue #1994。`tako queue limits` が書く）。
     /// 各キーは `None` = 機に合わせた既定。**旧ファイルはキーが無くても既定で読める**
     /// （節ごと `#[serde(default)]`）ので移行 Step は要らない（`Settings` の指紋は動くが、
@@ -238,6 +245,10 @@ fn default_paste_guard() -> bool {
     tako_core::paste_guard::DEFAULT_ENABLED
 }
 
+fn default_network_resume() -> bool {
+    tako_core::net_resume::DEFAULT_ENABLED
+}
+
 fn default_lid_battery_floor() -> u8 {
     crate::sleep_guard::DEFAULT_LID_BATTERY_FLOOR
 }
@@ -268,6 +279,7 @@ impl Default for Settings {
             editor_auto_close: true,
             claude_mod: true,
             limit_resume_all: false,
+            network_resume: default_network_resume(),
             resources: tako_core::queue::LimitSettings::default(),
             preview_cache_max_mb: default_preview_cache_max_mb(),
             tmux_persist: true,
@@ -734,6 +746,7 @@ mod tests {
             editor_auto_close: false,
             claude_mod: false,
             limit_resume_all: true,
+            network_resume: false,
             resources: tako_core::queue::LimitSettings {
                 max_jobs: Some(2),
                 reserve_gb: Some(4.5),
@@ -870,6 +883,12 @@ mod tests {
         // 移行 Step 不要。指紋テストの更新理由がこれ）
         assert!(!parsed.limit_resume_all);
         assert!(!Settings::default().limit_resume_all);
+        // #2112: ネット復帰の即時再開は既定 ON（旧ファイル = キー無しでも true = 移行 Step 不要。
+        // 指紋テストの更新理由がこれ）。明示の false は false のまま読む
+        assert!(parsed.network_resume);
+        assert!(Settings::default().network_resume);
+        let off: Settings = serde_json::from_str(r#"{"network_resume":false}"#).unwrap();
+        assert!(!off.network_resume);
         // #1879: tako mod は既定 ON（旧ファイル = キー無しでも true = 移行 Step 不要。
         // 指紋テストの更新理由がこれ）
         assert!(parsed.claude_mod);

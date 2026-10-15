@@ -381,6 +381,7 @@ impl TakoApp {
                 pane: None,
                 enabled: Some(next),
                 all: Some(true),
+                network: None,
             },
             tako_core::PaneOrigin::User,
         ) {

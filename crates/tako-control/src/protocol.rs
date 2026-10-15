@@ -644,6 +644,11 @@ pub enum Request {
         /// true = 全ペインの状態を一覧する（`enabled` とは併用しない）
         #[serde(default)]
         all: Option<bool>,
+        /// ネット復帰の即時再開（FR-2.27.17 / Issue #2112）の**全体の設定**を書き換える
+        /// （settings.json の `network_resume`。既定 ON）。`pane` は解かず、`enabled` とは併用しない。
+        /// 読むだけなら `all` の一覧の `network` を見る（1 ペインの応答にも `network_stop` が載る）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network: Option<bool>,
     },
     /// 右サイドバー情報パネル（統合 tmux ビュー / git）の表示・幅・ビュー切替と、
     /// 左サイドバーのファイルツリー表示切替（FR-2.16.5。下部ステータスバーのトグルと

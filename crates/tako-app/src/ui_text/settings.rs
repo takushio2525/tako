@@ -205,6 +205,18 @@ pub fn desc_paste_guard() -> &'static str {
     )
 }
 
+/// ネット復帰の即時再開（FR-2.27.17 / #2112）
+pub fn label_network_resume() -> &'static str {
+    tr!("ネット復帰で再開", "Resume when back online")
+}
+
+pub fn desc_network_resume() -> &'static str {
+    tr!(
+        "回線が戻ったら、接続エラーで止まったエージェントのセッションへ続きを送って再開させる",
+        "When the network comes back, send a continue message to agent sessions that stopped on a connection error"
+    )
+}
+
 pub fn label_autosuggest_tab() -> &'static str {
     tr!("Tab キーでも確定", "Accept with Tab too")
 }
@@ -1585,6 +1597,8 @@ mod tests {
                 desc_autosuggest_hint().into(),
                 label_paste_guard().into(),
                 desc_paste_guard().into(),
+                label_network_resume().into(),
+                desc_network_resume().into(),
                 label_persist().into(),
                 desc_persist().into(),
                 desc_persist_no_tmux().into(),

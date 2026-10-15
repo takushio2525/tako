@@ -41,6 +41,7 @@ mod tests {
                 pane: None,
                 enabled: Some(true),
                 all: Some(true),
+                network: None,
             }
         );
         assert_eq!(
@@ -50,9 +51,21 @@ mod tests {
                 pane: Some(42),
                 enabled: Some(false),
                 all: None,
+                network: None,
             }
         );
         assert!(validate_known_params("tako_limit_resume", &json!({"all": true, "enabled": false})).is_ok());
+        // #2112: network は全体の設定 = 呼び出し元ペインを解かない（ペインの外からも書ける）
+        assert_eq!(
+            build_request("tako_limit_resume", &json!({"network": false}), None, None).unwrap(),
+            Request::LimitResume {
+                pane: None,
+                enabled: None,
+                all: None,
+                network: Some(false),
+            }
+        );
+        assert!(validate_known_params("tako_limit_resume", &json!({"network": true})).is_ok());
     }
 
     /// #1908: `tako_tree_folder` の `selection` はツリーの選択の要求（CLI `tako tree selection`

@@ -703,6 +703,13 @@ impl SettingsWindow {
                 action: Some("set".into()),
                 service: Some(s.limit_service.clone()),
             },
+            // #2112: ネット復帰の即時再開（全体の設定）
+            Request::LimitResume {
+                pane: None,
+                enabled: None,
+                all: None,
+                network: Some(s.network_resume),
+            },
             Request::SleepGuard {
                 action: Some("set".into()),
                 mode: Some(s.sleep_guard_mode.as_str().to_string()),
@@ -1403,6 +1410,7 @@ impl SettingsWindow {
         let autosuggest_tab = s.autosuggest_tab;
         let mouse_click_forward = s.mouse_click_forward;
         let paste_guard = s.paste_guard;
+        let network_resume = s.network_resume;
         let persist = s.tmux_persist;
         let telemetry = s.telemetry;
         let reload = s.preview_live_reload;
@@ -1540,6 +1548,26 @@ impl SettingsWindow {
                                 unallow: None,
                                 rules: None,
                                 pane: None,
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            ))
+            // ネット復帰の即時再開（Issue #2112。既定 ON）
+            .child(self.row(
+                txt::label_network_resume(),
+                txt::desc_network_resume(),
+                self.toggle(
+                    "network_resume",
+                    network_resume,
+                    cx.listener(move |this, _, _, cx| {
+                        this.run(
+                            Request::LimitResume {
+                                pane: None,
+                                enabled: None,
+                                all: None,
+                                network: Some(!network_resume),
                             },
                             cx,
                         );

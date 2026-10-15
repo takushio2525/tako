@@ -200,6 +200,7 @@ tako/
 | スリープ防止 | `tako sleep-guard status` |
 | **会話を引き継いだセッション再起動（ペインの右クリック。#1067）** | `tako session-restart [--mode harness|handoff] [--pane N]` |
 | **リミット後の自動復帰（ペイン単位 / 一括 = ステータスバーのボタン。#813 / #1945）** | `tako limit-resume [on|off] [--pane N] [--all]` |
+| **ネット復帰で、接続エラーで止まったセッションを再開（既定 ON。#2112）** | `tako limit-resume --network [on|off]` |
 | 入力予測（tako 内 zsh のゴースト予測。#600/#614） | `tako autosuggest [on|off]` |
 | UI テーマ切替 | `tako theme [dark|light|toggle]` |
 | UI 表示モード切替（GUI ライク表示。#691/#694/#702/#715/#716/#720/#725/#737/#739） | `tako ui-mode [gui|terminal|toggle]` |

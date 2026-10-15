@@ -3512,10 +3512,11 @@ struct AutosuggestArgs {
     state: Option<String>,
 }
 
-/// 利用上限後の自動復帰の引数（Issue #813 / #1945）。
+/// 利用上限後の自動復帰の引数（Issue #813 / #1945）とネット復帰の即時再開（Issue #2112）。
 ///
 /// `tako limit-resume` = 呼び出し元ペインの現在値、`on` / `off` で切替、
 /// `--all` で全ペインの一覧、`on --all` / `off --all` で一括（ステータスバーのボタンと同じ）。
+/// `--network` = ネット復帰の再開の設定と状態、`off --network` / `on --network` で切替。
 /// 素のコマンドが最短で済む形にしてある（#322）
 #[derive(Args)]
 struct LimitResumeArgs {
@@ -3529,6 +3530,10 @@ struct LimitResumeArgs {
     /// ペインを一括で切り替え、以後に立つペインの既定も同じ値にする（#1945）
     #[arg(long, conflicts_with = "pane")]
     all: bool,
+    /// ネット復帰の即時再開（全体の設定。既定 on）。回線が戻ったら、接続エラーで止まった
+    /// 全エージェントのセッションへ続きを送る。単独なら設定と状態、on / off で切替（#2112）
+    #[arg(long, conflicts_with_all = ["pane", "all"])]
+    network: bool,
 }
 
 #[derive(Args)]
@@ -9287,10 +9292,22 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: args.pane.or_else(caller_pane),
             mode: args.mode.clone(),
         },
+        // #2112: `--network on|off` は全体の設定（ペインを解かない）。`--network` 単独は
+        // 一覧を引いて `network` の節だけを出す（読むための専用の要求を作らない）
+        Command::LimitResume(args) if args.network => {
+            let enabled = args.state.as_deref().map(|s| s == "on");
+            Request::LimitResume {
+                pane: None,
+                enabled: None,
+                all: enabled.is_none().then_some(true),
+                network: enabled,
+            }
+        }
         Command::LimitResume(args) => Request::LimitResume {
             pane: args.pane.or_else(caller_pane),
             enabled: args.state.as_deref().map(|s| s == "on"),
             all: args.all.then_some(true),
+            network: None,
         },
         Command::Theme(args) => {
             let m = args.mode.as_deref();
@@ -12416,6 +12433,10 @@ fn print_result(command: &Command, result: &Value) {
         | Command::Pin(_) => {
             println!("{result}")
         }
+        // #2112: `--network` は全体の設定と実行状態の節だけ（一覧の panes は出さない）
+        Command::LimitResume(args) if args.network => {
+            println!("{}", pretty_json(&result["network"]))
+        }
         // #813: 状態（stop / resume_at / attempts）が入れ子なので整形して出す
         Command::LimitResume(_) => println!("{}", pretty_json(result)),
         Command::Mod(args) => print_mod(args, result),
@@ -14087,7 +14108,8 @@ mod tests {
             Request::LimitResume {
                 pane: caller_pane(),
                 enabled: None,
-                all: None
+                all: None,
+                network: None
             }
         );
         let enable = parse(&["tako", "limit-resume", "on", "--pane", "12"]);
@@ -14096,7 +14118,8 @@ mod tests {
             Request::LimitResume {
                 pane: Some(12),
                 enabled: Some(true),
-                all: None
+                all: None,
+                network: None
             }
         );
         let disable = parse(&["tako", "limit-resume", "off", "--pane", "12"]);
@@ -14105,7 +14128,8 @@ mod tests {
             Request::LimitResume {
                 pane: Some(12),
                 enabled: Some(false),
-                all: None
+                all: None,
+                network: None
             }
         );
         // 一覧は呼び出し元ペインが分からなくても引ける（dispatch 側が pane を見ない）
@@ -14115,7 +14139,8 @@ mod tests {
             Request::LimitResume {
                 pane: caller_pane(),
                 enabled: None,
-                all: Some(true)
+                all: Some(true),
+                network: None
             }
         );
         // #1945: on / off + --all は一括（dispatch が all + enabled を一括として扱う）
@@ -14125,13 +14150,38 @@ mod tests {
             Request::LimitResume {
                 pane: caller_pane(),
                 enabled: Some(true),
-                all: Some(true)
+                all: Some(true),
+                network: None
             }
         );
         // 一括とペイン指定は同時に言えない（どちらの意味か取り違えない）
         assert!(
             Cli::try_parse_from(["tako", "limit-resume", "off", "--all", "--pane", "3"]).is_err()
         );
+        // #2112: --network は全体の設定。単独は一覧を引いて network の節を読む
+        let net = parse(&["tako", "limit-resume", "--network"]);
+        assert_eq!(
+            build_request(&net).unwrap(),
+            Request::LimitResume {
+                pane: None,
+                enabled: None,
+                all: Some(true),
+                network: None,
+            }
+        );
+        let net_off = parse(&["tako", "limit-resume", "off", "--network"]);
+        assert_eq!(
+            build_request(&net_off).unwrap(),
+            Request::LimitResume {
+                pane: None,
+                enabled: None,
+                all: None,
+                network: Some(false),
+            }
+        );
+        // ペイン指定・一覧とは同時に言えない
+        assert!(Cli::try_parse_from(["tako", "limit-resume", "--network", "--pane", "3"]).is_err());
+        assert!(Cli::try_parse_from(["tako", "limit-resume", "--network", "--all"]).is_err());
         // on / off 以外は clap が弾く（誤った語で黙って状態取得にならない）
         assert!(Cli::try_parse_from(["tako", "limit-resume", "yes"]).is_err());
     }

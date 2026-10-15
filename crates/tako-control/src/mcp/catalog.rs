@@ -1374,13 +1374,16 @@ pub fn tools() -> Vec<Value> {
                 all=true + enabled で一括: 退避中を含む全エージェントのペイン（master / worker / solo /\
                 手起動の claude 等。シェル・プレビューは除く）を揃え、既定も同じ値にする\
                 （ステータスバーのボタンと同じ）。pane は退避中も指定可。\
-                応答の state は現在の停止状況・復帰予定時刻・試行回数。",
+                応答の state は現在の停止状況・復帰予定時刻・試行回数。\
+                network = 回線が戻ったら接続エラーで止まった全エージェントへ続きを送る全体の設定（既定 true。\
+                ペイン単位の enabled とは別）。状態は all=true の network、各ペインの network_stop。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": pane_schema("対象ペイン"),
                     "enabled": { "type": "boolean", "description": "true = 有効化、false = 無効化（省略時は状態取得）" },
                     "all": { "type": "boolean", "description": "true = 全ペインの一覧。enabled と併用で一括 ON / OFF" },
+                    "network": { "type": "boolean", "description": "ネット復帰の再開を ON / OFF（全体）" },
                 },
                 "additionalProperties": false,
             },

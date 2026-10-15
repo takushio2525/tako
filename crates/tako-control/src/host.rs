@@ -710,6 +710,20 @@ pub trait UiStateHost {
     fn limit_resume_state(&self, _pane: PaneId) -> Option<serde_json::Value> {
         None
     }
+    /// ネット復帰の即時再開（FR-2.27.17 / Issue #2112）の全体の設定（既定 ON）
+    fn network_resume_enabled(&self) -> bool {
+        tako_core::net_resume::DEFAULT_ENABLED
+    }
+    /// 設定の書き換え（実行状態の更新と settings.json への永続化は実装側の責務）
+    fn set_network_resume(&mut self, _enabled: bool) {}
+    /// 実行状態（止まっているペイン・到達確認・直近の再開）。GUI 以外のホストは持たない
+    fn network_resume_status(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// 1 ペインの停止の追跡状態（接続エラーで止まっていなければ None）
+    fn network_resume_state(&self, _pane: PaneId) -> Option<serde_json::Value> {
+        None
+    }
     /// ステータスバーの利用制限表示で選択中のサービス（Issue #321）
     fn limit_service(&self) -> tako_core::LimitService {
         tako_core::LimitService::Claude
