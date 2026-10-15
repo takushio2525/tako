@@ -305,14 +305,12 @@ fn envが無ければtmuxが無くても従来どおりskipで通る() {
 
 #[test]
 fn 門を通ったテストは台帳に名前が載る() {
-    let dir = std::env::temp_dir().join(format!("tako-2106-ledger-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
-    let ledger = dir.join("ledger.tsv");
+    // スコープを抜けたら（panic でも）消える置き場（#1312）
+    let dir = tako_core::test_residue::ScratchDir::new("tako-2106-ledger");
+    let ledger = dir.path().join("ledger.tsv");
     let out = run_role("available", false, true, Some(&ledger));
     let all = text(&out);
     let written = std::fs::read_to_string(&ledger).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "揃っている前提で落ちた:\n{all}");
     assert!(all.contains("ROLE_RAN"), "本体まで進んでいない:\n{all}");
     let lines: Vec<&str> = written.lines().collect();
@@ -441,9 +439,9 @@ fn ciの段の切り出しはジョブとstepsの境界を取り違えない() {
 #[test]
 #[cfg(unix)]
 fn 報告スクリプトは件数と名前を出し0件で落ちる() {
-    let dir = std::env::temp_dir().join(format!("tako-2106-report-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+    // スコープを抜けたら（panic でも）消える置き場（#1312）
+    let scratch = tako_core::test_residue::ScratchDir::new("tako-2106-report");
+    let dir = scratch.path();
     let script = repo_root().join("scripts/ci-real-tmux-report.sh");
     // CI の macOS ランナーの既定ロケール（en_US.UTF-8）で走らせる。この照合順序では
     // 日本語のテスト名どうしが「等しい」扱いになり、`sort -u` が別のテストを 1 本へ潰した
@@ -496,5 +494,4 @@ fn 報告スクリプトは件数と名前を出し0件で落ちる() {
             text(&out)
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
