@@ -259,6 +259,8 @@ echo "  list: manager=$(field manager "$L1") key=$(field key "$L1") command=$(fi
 echo "  候補: $(field ids "$L1")"
 check_eq "一覧の runtime は nvm の v20.11.1（前方一致の一番新しい版）" "nvm v20.11.1" \
   "$(field manager "$L1") $(field key "$L1")"
+# 本物の fnm（v20 を持たない）が同じ .nvmrc を読んでも「fnm 20 が入っていない」と騒がない
+check_eq "① nvm が版を見つけたので他の道具の不足は知らせない" "" "$(field warnings "$L1")"
 OUT1="$FIX/nvmproj/src/a.js.node-out"
 S1="$(run_file "$FIX/nvmproj/src/a.js" "$OUT1")"
 echo "  実行: $S1 / $(kv version "$OUT1") / self=$(kv self "$OUT1")"
