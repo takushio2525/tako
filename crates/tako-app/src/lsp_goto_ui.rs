@@ -240,6 +240,8 @@ impl TakoApp {
                     OffloadContinuation::UserTaskStatus(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2086 のユーザータスクの続き）
                     OffloadContinuation::UserTaskStored(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2014 の変更履歴の続き）
+                    OffloadContinuation::PreviewChangelog(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

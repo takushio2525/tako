@@ -1189,13 +1189,15 @@ pub trait PreviewHost {
     fn preview_changelog_state(&self, _pane: PaneId) -> Option<bool> {
         None
     }
-    /// チェンジログビューの ON/OFF 切替。コミット一覧の取得・描画は実装側の責務。
+    /// チェンジログビューの ON/OFF 切替（`None` = 閉じる）。描画は実装側の責務。
+    ///
+    /// 履歴（`git rev-parse` / `git log`）は dispatch が上限つきで background で取ってから渡す
+    /// （#2014）。実装はここで git を起こさない（UI スレッドで呼ばれる）
     fn set_preview_changelog(
         &mut self,
         _pane: PaneId,
-        _enabled: bool,
-        _max_count: usize,
-    ) -> Result<serde_json::Value, String> {
+        _history: Option<tako_core::git::FileHistory>,
+    ) -> Result<(), String> {
         Err("チェンジログビューは未対応".into())
     }
     /// チェンジログビューで特定コミットの diff を展開/折りたたみする。

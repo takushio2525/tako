@@ -271,6 +271,10 @@ pub fn code_block_n(index: usize) -> String {
 pub fn op_run_file() -> &'static str {
     tr!("ファイルの実行", "Run file")
 }
+/// 「履歴」ボタンで変更履歴を開こうとしたときの**操作名**（#2014。git が上限まで返らなかった等）
+pub fn op_changelog() -> &'static str {
+    tr!("変更履歴の表示", "Show file history")
+}
 pub fn item_count(n: usize) -> String {
     tr!(format!("{n} 件"), format!("{n} items"))
 }

@@ -58,6 +58,13 @@
 //!     （`OffloadLanding::Settled` → 受け口が後処理を済ませてから出す）。同期の腕も同じ段を順に呼ぶ。
 //!     AI からの展開で一覧に居ない行の引き直しは background（同期は A/B のゲートの後ろだけ）。
 //!     MCP の返答は経路を埋めて送る（省くと準備の段が呼び出し元を知らず同期の腕に残る）
+//! 13. #2014: プレビューの変更履歴を開く切替（IPC の `PreviewChangelog` と GUI の「履歴」ボタン）は
+//!     `prepare_offload` の腕で background のジョブ（`OffloadJob::PreviewChangelog`）になる。UI スレッドの段
+//!     （準備 = プレビューのパスの写し・着地 = 状態へ置く）は git を起こさず、background の本体
+//!     （`PreviewChangelogJob::run`）は上限つきの `git::file_history` だけを通す。同期の腕
+//!     （テスト・直呼び・A/B）も同じ本体を通り、上限なしは A/B のゲートの腕だけ。tako-app の host
+//!     （`set_preview_changelog`）とボタン（`toggle_preview_changelog`）は git を起こさず、ボタンは
+//!     `dispatch_off_ui` を通る
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -78,6 +85,7 @@ const TASKS_PANEL: &str = "crates/tako-app/src/tasks_panel.rs";
 const TMUX_BACKEND: &str = "crates/tako-core/src/tmux_backend.rs";
 const STATUS_BAR: &str = "crates/tako-app/src/status_bar.rs";
 const MCP_REQUEST: &str = "crates/tako-control/src/mcp/request.rs";
+const PREVIEW_RENDER: &str = "crates/tako-app/src/preview_render.rs";
 
 /// #1991: background のジョブ（`OffloadJob::GitWrite`）にする git の要求（`prepare_offload` の腕に
 /// 全部並んでいること。1 つでも漏れると、その要求は同期の腕 = UI スレッドで git を待つ）
@@ -163,6 +171,13 @@ const RAW: &[(&str, &str)] = &[
         "`claude agents --json` + 器の pid 祖先辿り",
     ),
     ("query_agent_status(", "`claude agents --json`"),
+    // #2014: プレビューの変更履歴（`git log --follow` は上限なし。`file_history` は上限つきだが、
+    // 待つのは background の `PreviewChangelogJob::run` だけ）
+    ("git::log_file_commits(", "`git log --follow`（上限なし）"),
+    (
+        "git::file_history(",
+        "`git rev-parse` + `git log --follow`（上限つきでも UI スレッドで待たない）",
+    ),
 ];
 
 /// UI スレッドで走る dispatch の経路（先取りの判断を含む）。窓の頭の綴り
@@ -190,6 +205,9 @@ const UI_PATHS: &[&str] = &[
     "fn tmux_select_window_target(",
     // #1991
     "fn git_pane_cwd(",
+    // #2014
+    "fn preview_changelog_prepare(",
+    "fn preview_changelog_land(",
 ];
 
 /// 読む側の関数（子プロセスの口は `Probed::Outside` の腕でだけ呼ぶ）
@@ -1886,6 +1904,202 @@ fn scan_user_tasks_ipc_rest(dispatch: &str, main: &str, mcp: &str) -> Vec<Offend
     out
 }
 
+/// 13. #2014: プレビューの変更履歴を開く切替は git を UI スレッドで待たない
+fn scan_preview_changelog(dispatch: &str, main: &str, render: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let mut push =
+        |file: &'static str, line: usize, why: String| out.push(Offender { file, line, why });
+    // (a) `prepare_offload` の腕が開く切替を background のジョブにする（A/B のゲートつき）
+    match fn_window(dispatch, "pub fn prepare_offload(") {
+        None => push(
+            DISPATCH,
+            0,
+            "`prepare_offload` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            let head = window
+                .iter()
+                .position(|l| !is_comment(l) && l.trim() == "Request::PreviewChangelog {");
+            let job = code_lines_with(&window, "OffloadJob::PreviewChangelog(");
+            match (head, job.first()) {
+                (Some(head), Some(&job)) if head < job => {
+                    let arm = &window[head..=job];
+                    for (needle, what) in [
+                        (
+                            "enabled: Some(true),",
+                            "開く切替（`enabled: Some(true)`）に限っていない",
+                        ),
+                        ("issue2014_legacy()", "A/B のゲート（`issue2014_legacy()`）が無い"),
+                        (
+                            "preview_changelog_prepare(",
+                            "UI スレッドの写しを `preview_changelog_prepare` で作っていない",
+                        ),
+                    ] {
+                        if code_lines_with(arm, needle).is_empty() {
+                            push(
+                                DISPATCH,
+                                at + head,
+                                format!("`prepare_offload` の変更履歴の腕が{what}（#2014）"),
+                            );
+                        }
+                    }
+                }
+                _ => push(
+                    DISPATCH,
+                    at,
+                    "`prepare_offload` が変更履歴を開く切替を background のジョブ \
+                     （`Request::PreviewChangelog { … } … OffloadJob::PreviewChangelog`）にしていない \
+                     （`git rev-parse` / `git log --follow` を UI スレッドで待つ = #2014）"
+                        .into(),
+                ),
+            }
+        }
+    }
+    // (b) background の段は上限つきの本体を上限つきで呼ぶ
+    match fn_window(dispatch, "pub fn run_staged(self)") {
+        None => push(
+            DISPATCH,
+            0,
+            "`run_staged` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            let arm = code_lines_with(&window, "OffloadJob::PreviewChangelog(job) =>");
+            let bounded = arm.first().is_some_and(|&i| {
+                window[i..(i + 4).min(window.len())]
+                    .iter()
+                    .any(|l| l.contains("job.run(tako_core::git::changelog_timeout())"))
+            });
+            if !bounded {
+                push(
+                    DISPATCH,
+                    arm.first().map_or(at, |&i| at + i),
+                    "`run_staged` が変更履歴のジョブを上限（`changelog_timeout()`）つきで走らせていない \
+                     （#2014）"
+                        .into(),
+                );
+            }
+        }
+    }
+    match fn_window(dispatch, "-> PreviewChangelogLanding {") {
+        None => push(
+            DISPATCH,
+            0,
+            "`PreviewChangelogJob::run` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if code_lines_with(&window, "git::file_history(").is_empty() {
+                push(
+                    DISPATCH,
+                    at,
+                    "`PreviewChangelogJob::run` が上限つきの `git::file_history` を通っていない（#2014）".into(),
+                );
+            }
+            for needle in ["git::repo_root(", "git::log_file_commits(", ".output()"] {
+                for i in code_lines_with(&window, needle) {
+                    push(
+                        DISPATCH,
+                        at + i,
+                        format!(
+                            "`PreviewChangelogJob::run` が上限なしの `{needle}` を呼んでいる \
+                             （返らない git を永久に待つ = #2014）"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // (c) 同期の腕（テスト・直呼び・A/B）は同じ本体を通り、git を直に起こさない
+    let lines: Vec<&str> = dispatch.lines().collect();
+    let sync = lines.iter().enumerate().position(|(i, l)| {
+        l.trim() == "Request::PreviewChangelog {"
+            && lines.get(i + 2).is_some_and(|n| n.trim() == "enabled,")
+    });
+    match sync {
+        None => push(
+            DISPATCH,
+            0,
+            "dispatch_inner の変更履歴の同期の腕（`Request::PreviewChangelog { pane, enabled, … }`）が \
+             見つからない"
+                .into(),
+        ),
+        Some(start) => {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, l)| l.starts_with("        Request::"))
+                .map(|(i, _)| i)
+                .unwrap_or(lines.len());
+            let arm: Vec<String> = lines[start..end].iter().map(|l| l.to_string()).collect();
+            for (needle, what) in [
+                ("preview_changelog_land(", "着地の 1 実装（`preview_changelog_land`）"),
+                ("preview_changelog_prepare(", "準備の 1 実装（`preview_changelog_prepare`）"),
+                ("issue2014_legacy()", "上限なしを A/B のゲートの腕に限る判定"),
+            ] {
+                if code_lines_with(&arm, needle).is_empty() {
+                    push(
+                        DISPATCH,
+                        start + 1,
+                        format!("変更履歴の同期の腕が{what}を通っていない（本体を 2 本にしない = #2014）"),
+                    );
+                }
+            }
+            for (needle, why) in RAW {
+                for i in code_lines_with(&arm, needle) {
+                    push(
+                        DISPATCH,
+                        start + 1 + i,
+                        format!(
+                            "変更履歴の同期の腕が `{needle}` を直に呼んでいる（{why}。本体は \
+                             `PreviewChangelogJob::run` の 1 実装 = #2014）"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // (d) tako-app: host とボタンは git を起こさず、ボタンは background の口を通る
+    for (file, src, head, must) in [
+        (MAIN, main, "fn set_preview_changelog(", None),
+        (
+            PREVIEW_RENDER,
+            render,
+            "pub(crate) fn toggle_preview_changelog(",
+            Some("dispatch_off_ui("),
+        ),
+    ] {
+        let Some((at, window)) = fn_window(src, head) else {
+            push(file, 0, format!("`{head}` が見つからない（走査が空振り）"));
+            continue;
+        };
+        if let Some(must) = must {
+            if code_lines_with(&window, must).is_empty() {
+                push(
+                    file,
+                    at,
+                    format!(
+                        "`{head}` が `{must}` を通っていない（「履歴」ボタンが UI スレッドで同期に \
+                         dispatch する = #2014）"
+                    ),
+                );
+            }
+        }
+        for (needle, why) in RAW {
+            for i in code_lines_with(&window, needle) {
+                push(
+                    file,
+                    at + i,
+                    format!(
+                        "UI スレッドで走る `{head}` が `{needle}` を直に呼んでいる（{why}。変更履歴の \
+                         git は dispatch の background のジョブで取る = #2014）"
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
 struct Sources {
     dispatch: String,
     main: String,
@@ -1896,6 +2110,7 @@ struct Sources {
     tasks_panel: String,
     status_bar: String,
     mcp_request: String,
+    preview_render: String,
 }
 
 impl Sources {
@@ -1911,6 +2126,7 @@ impl Sources {
             tasks_panel: read(&root, TASKS_PANEL),
             status_bar: read(&root, STATUS_BAR),
             mcp_request: read(&root, MCP_REQUEST),
+            preview_render: read(&root, PREVIEW_RENDER),
         }
     }
 
@@ -1942,6 +2158,11 @@ impl Sources {
             &self.dispatch,
             &self.main,
             &self.mcp_request,
+        ));
+        v.extend(scan_preview_changelog(
+            &self.dispatch,
+            &self.main,
+            &self.preview_render,
         ));
         v
     }
@@ -2136,6 +2357,28 @@ fn 走査が空振りしていない() {
         ),
         (&s.main, "fn land_offload_on_ui(", "after_dispatch("),
         (&s.main, "fn set_user_task_expanded(", "scroll_to_task("),
+        // #2014
+        (
+            &s.dispatch,
+            "pub fn prepare_offload(",
+            "OffloadJob::PreviewChangelog(",
+        ),
+        (
+            &s.dispatch,
+            "-> PreviewChangelogLanding {",
+            "git::file_history(",
+        ),
+        (
+            &s.dispatch,
+            "fn preview_changelog_land(",
+            "set_preview_changelog(",
+        ),
+        (&s.main, "fn set_preview_changelog(", "from_history("),
+        (
+            &s.preview_render,
+            "pub(crate) fn toggle_preview_changelog(",
+            "dispatch_off_ui(",
+        ),
     ] {
         let (_, w) = fn_window(src, head).unwrap_or_else(|| panic!("{head} の窓"));
         assert!(
@@ -2919,6 +3162,126 @@ fn 逆戻りを名指しできる() {
         rest(&s.dispatch, &s.main, &mcp),
         MCP_REQUEST,
         "返答の経路を省いたまま送っている",
+    );
+
+    // (53)〜(61) #2014: プレビューの変更履歴を開く切替を UI スレッドの git の待ちへ戻す
+    let cl = |d: &str, m: &str, r: &str| scan_preview_changelog(d, m, r);
+    // (53) 「履歴」ボタンが修正前と同じく UI スレッドでリポジトリを解決する
+    let r = inject(
+        &s.preview_render,
+        "        let request = tako_control::protocol::Request::PreviewChangelog {\n            pane: Some(pane_id.as_u64()),",
+        "        let _ = tako_core::git::repo_root(std::path::Path::new(\".\"));\n        let request = tako_control::protocol::Request::PreviewChangelog {\n            pane: Some(pane_id.as_u64()),",
+        "(53)",
+    );
+    expect_named(
+        "「履歴」ボタンで git rev-parse",
+        cl(&s.dispatch, &s.main, &r),
+        PREVIEW_RENDER,
+        "toggle_preview_changelog",
+    );
+    // (54) 「履歴」ボタンが background の口（`dispatch_off_ui`）を通らず同期に dispatch する
+    let r = inject(
+        &s.preview_render,
+        "        self.dispatch_off_ui(request, PaneOrigin::User, cx, move |app, result, cx| {\n            app.preview_changelog_pending.remove(&pane_id);",
+        "        let _ = tako_control::dispatch(self, request.clone(), PaneOrigin::User);\n        self.dispatch_later(request, PaneOrigin::User, cx, move |app, result, cx| {\n            app.preview_changelog_pending.remove(&pane_id);",
+        "(54)",
+    );
+    expect_named(
+        "「履歴」ボタンを同期の dispatch へ",
+        cl(&s.dispatch, &s.main, &r),
+        PREVIEW_RENDER,
+        "dispatch_off_ui(",
+    );
+    // (55) host（UI スレッド）が修正前と同じく履歴を自分で取る
+    let m = inject(
+        &s.main,
+        "        match history {\n            None => {\n                self.preview_changelogs.remove(&pane);",
+        "        let _ = tako_core::git::log_file_commits(std::path::Path::new(\".\"), \"x\", 50);\n        match history {\n            None => {\n                self.preview_changelogs.remove(&pane);",
+        "(55)",
+    );
+    expect_named(
+        "host が git log --follow",
+        cl(&s.dispatch, &m, &s.preview_render),
+        MAIN,
+        "set_preview_changelog",
+    );
+    // (56) `prepare_offload` が開く切替をジョブにしない（同期の腕 = UI スレッドで git を待つ）
+    let d = inject(
+        &s.dispatch,
+        "                .map(|job| OffloadJob::PreviewChangelog(Box::new(job))),",
+        "                .map(|_| OffloadJob::RemoteAgents),",
+        "(56)",
+    );
+    expect_named(
+        "開く切替を同期の腕へ",
+        cl(&d, &s.main, &s.preview_render),
+        DISPATCH,
+        "OffloadJob::PreviewChangelog",
+    );
+    // (57) A/B のゲートが外れる（修正前の形へ戻せない = 前後を同じバイナリで測れない）
+    let d = inject(
+        &s.dispatch,
+        "        } if !tako_core::probe::issue2014_legacy() => Some(\n            preview_changelog_prepare(",
+        "        } => Some(\n            preview_changelog_prepare(",
+        "(57)",
+    );
+    expect_named(
+        "変更履歴の腕から A/B のゲートを外す",
+        cl(&d, &s.main, &s.preview_render),
+        DISPATCH,
+        "issue2014_legacy()",
+    );
+    // (58) UI スレッドの準備がリポジトリまで解決する（`git rev-parse` を UI で待つ）
+    let d = inject(
+        &s.dispatch,
+        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    let (path, _) = host.preview_state(target).ok_or_else(|| {",
+        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    let _ = tako_core::git::file_history(Path::new(\".\"), 1, tako_core::git::changelog_timeout());\n    let (path, _) = host.preview_state(target).ok_or_else(|| {",
+        "(58)",
+    );
+    expect_named(
+        "準備で git を起こす",
+        scan_ui_paths(&d),
+        DISPATCH,
+        "fn preview_changelog_prepare(",
+    );
+    // (59) background の本体が上限なしの `repo_root` を通る
+    let d = inject(
+        &s.dispatch,
+        "        let history = tako_core::git::file_history(&self.path, self.max_count, budget);",
+        "        let _ = tako_core::git::repo_root(&self.path);\n        let history = tako_core::git::file_history(&self.path, self.max_count, budget);",
+        "(59)",
+    );
+    expect_named(
+        "本体を上限なしへ",
+        cl(&d, &s.main, &s.preview_render),
+        DISPATCH,
+        "PreviewChangelogJob::run",
+    );
+    // (60) background が上限を外して走らせる
+    let d = inject(
+        &s.dispatch,
+        "                    job.run(tako_core::git::changelog_timeout()),",
+        "                    job.run(std::time::Duration::MAX),",
+        "(60)",
+    );
+    expect_named(
+        "background の上限を外す",
+        cl(&d, &s.main, &s.preview_render),
+        DISPATCH,
+        "changelog_timeout()",
+    );
+    // (61) 同期の腕が git を直に起こす 2 本目の実装を持つ
+    let d = inject(
+        &s.dispatch,
+        "                    let job = preview_changelog_prepare(host, Some(target.as_u64()), max_count)?;",
+        "                    let _ = tako_core::git::log_file_commits(Path::new(\".\"), \"x\", 50);\n                    let job = preview_changelog_prepare(host, Some(target.as_u64()), max_count)?;",
+        "(61)",
+    );
+    expect_named(
+        "同期の腕が git を直に",
+        cl(&d, &s.main, &s.preview_render),
+        DISPATCH,
+        "同期の腕",
     );
 
     // ⑩ check_qos を修正前の上限なしの ps へ戻す

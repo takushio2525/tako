@@ -454,6 +454,20 @@ pub fn issue2086_legacy() -> bool {
     })
 }
 
+/// #2014 の A/B（`TAKO_2014_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// プレビューの変更履歴の切替（IPC = CLI / MCP と GUI の「履歴」ボタン）が UI スレッドの同期の
+/// dispatch で `git rev-parse` / `git log --follow` を**上限なしで**待つ。**ゲートはこの 1 か所**で、
+/// tako-control / tako-app もここを読む
+pub fn issue2014_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2014_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。

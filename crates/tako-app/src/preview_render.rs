@@ -5306,51 +5306,39 @@ impl TakoApp {
             .into_any_element()
     }
 
-    /// チェンジログビューのトグル（Issue #338）
+    /// チェンジログビューのトグル（Issue #338）。
+    ///
+    /// CLI / MCP の `tako preview-changelog` と同じ dispatch を通す。開くときの `git rev-parse` /
+    /// `git log --follow` は `dispatch_off_ui` で background へ出し、UI スレッドで待たない（#2014）。
+    /// 取っている間の重ね押しは無視し、上限に達した等の失敗は通知欄へ知らせる
     pub(crate) fn toggle_preview_changelog(
         &mut self,
         pane_id: PaneId,
         cx: &mut gpui::Context<Self>,
     ) {
-        let currently_on = self.preview_changelogs.contains_key(&pane_id);
-        if currently_on {
-            self.preview_changelogs.remove(&pane_id);
-        } else {
-            let state = match self.previews.get(&pane_id) {
-                Some(s) => s,
-                None => return,
-            };
-            let path = state.path.clone();
-            let repo = tako_core::git::repo_root(&path);
-            match repo {
-                Some(repo) => {
-                    // git は常に `/` 区切りのパスを期待する（#520）。
-                    // Windows で `src\foo.rs` を渡すと履歴が空で返る
-                    let rel = tako_core::git::repo_relative(&repo, &path)
-                        .unwrap_or_else(|| tako_core::git::to_git_path(&path));
-                    let commits = tako_core::git::log_file_commits(&repo, &rel, 50);
-                    let entries = commits
-                        .into_iter()
-                        .map(|c| preview::ChangelogEntry {
-                            commit: c,
-                            expanded_diff: None,
-                        })
-                        .collect();
-                    self.preview_changelogs.insert(
-                        pane_id,
-                        preview::ChangelogData {
-                            entries,
-                            repo_root: Some(repo),
-                            rel_path: Some(rel),
-                        },
-                    );
-                }
-                None => {
-                    self.preview_changelogs
-                        .insert(pane_id, preview::ChangelogData::default());
-                }
-            }
+        if !self.previews.contains_key(&pane_id) || !self.preview_changelog_pending.insert(pane_id)
+        {
+            return;
         }
+        let request = tako_control::protocol::Request::PreviewChangelog {
+            pane: Some(pane_id.as_u64()),
+            enabled: Some(!self.preview_changelogs.contains_key(&pane_id)),
+            max_count: None,
+            expand: None,
+        };
+        self.dispatch_off_ui(request, PaneOrigin::User, cx, move |app, result, cx| {
+            app.preview_changelog_pending.remove(&pane_id);
+            if let Err(e) = result {
+                app.notify_ui_op_failed(
+                    crate::sidebar::NoticeArea::Preview,
+                    crate::sidebar::NoticeArm::Issue2014,
+                    crate::ui_text::preview::op_changelog(),
+                    None,
+                    &e.to_string(),
+                );
+            }
+            cx.notify();
+        });
         cx.notify();
     }
 
