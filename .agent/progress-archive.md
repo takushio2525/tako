@@ -565,3 +565,8 @@
 - 2026-10-15 #2082 / #2088: docs の .mdx で表が描かれない・コマンドの -- や "" が化けるのを直した
 - 2026-10-15 #2077: ドキュメントサイト刷新の仕上げ S3 = 共有部品の提案を反映しページをまたぐ直し
 - 2026-10-15 #2086: UserTask の起票・詳細・更新・返答（PWA を含む）・展開も IPC から UI スレッドで置き場を読み書きしない
+- 2026-10-15 #2021: MCP の stdio ブリッジ 1 本 約 7 MB → 1.09 MB
+- 2026-10-15 #2041: 残りの `claude agents --json` 走査を mod の報告で埋めた = GUI モードのチャット表示と /clear 後のレジストリの会話 ID
+- 2026-10-15 #1950: `.ino` を再生ボタン / `tako run` で走らせる arduino 種別
+- 2026-10-15 #2085: 器が自ら消えても最後の行までペインログへ = remain-on-exit + pane-died フックで消える前に全履歴と画面を書き出す
+- 2026-10-15 #1956: 言語サーバの検出表の第 2 波 = .tex texlab / .toml tombi（tako が取る）・.swift sourcekit-lsp・.dart dart・.css/.scss/.less と .html/.htm vscode-langservers-extr…
