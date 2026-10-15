@@ -328,13 +328,17 @@ fn drag_scroll_lines(factor: f32) -> i32 {
     }
 }
 
-/// オートスクロール 1 ティックの手を決める（#2025）。上へ送るのは表示が履歴の最上端に
+/// オートスクロール 1 ティックの手を決める（#2025 / #2153）。上へ送るのは表示が履歴の最上端に
 /// 達していないときだけ。履歴が無い・既に最上端にいるのに選択の端を (0, 0) へ寄せると、
 /// ドラッグした範囲が画面の左上まで縮む。alt screen は履歴を持たない（`history_size` が 0）
 /// ので、遷移の途中にティックが走っても同じ規則で止まる。
-/// 下へ送る側は #310 のまま（最下部でも画面の右下へ伸ばす = #2025 の対象外）
+/// 下へ送るのは表示が最下部（`display_offset == 0`）に達していないときだけ（#2153。上端と対称）。
+/// 直接ペインは最下部が普段の状態なので、ここで端を画面の右下へ寄せると最後の行を途中まで選べない
 fn drag_scroll_step(factor: f32, display_offset: usize, history_size: usize) -> DragScrollStep {
     if factor > 0.0 && display_offset >= history_size {
+        return DragScrollStep::Hold;
+    }
+    if factor < 0.0 && display_offset == 0 {
         return DragScrollStep::Hold;
     }
     DragScrollStep::Scroll {
@@ -347,6 +351,14 @@ fn drag_scroll_step(factor: f32, display_offset: usize, history_size: usize) -> 
 fn legacy_2025() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_2025_LEGACY").as_deref() == Ok("1"))
+}
+
+/// #2153 の A/B。`TAKO_2153_LEGACY=1` で**同一バイナリのまま**下へ送る側だけ旧挙動
+/// （最下部でも毎ティック選択の端を画面の右下へ寄せる = 最後の行を途中まで選べない）へ戻す。
+/// 上へ送る側（#2025）は新しいまま
+fn legacy_2153() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2153_LEGACY").as_deref() == Ok("1"))
 }
 
 /// PDF プレビュー用: 速度係数（0.0..1.0）を 1 ティック分のスクロールピクセル数（正）に変換する（#309）
@@ -19647,7 +19659,7 @@ impl TakoApp {
         };
         let (cols, rows) = session.size();
 
-        let step = if legacy_2025() {
+        let step = if legacy_2025() || (legacy_2153() && factor < 0.0) {
             DragScrollStep::Scroll {
                 lines: drag_scroll_lines(factor),
             }
@@ -97368,18 +97380,127 @@ mod drag_scroll_tests {
         assert_eq!(drag_scroll_step(0.7, 0, 0), DragScrollStep::Hold);
     }
 
-    /// 下へ送る側は #2025 の対象外 = #310 のまま（最下部でも送って右下へ伸ばす）
+    /// 下へ送る側は #2025 の規則（最上端で止まる）を受けない = 最上端からでも下へは送る。
+    /// 最下部で止まるのは #2153（`issue2153_*`）
     #[test]
     fn issue2025_下へ送る側は従来どおり() {
         let lines = drag_scroll_lines(-0.5);
         assert!(lines <= -1, "下へ送る行数は負: {lines}");
         assert_eq!(
-            drag_scroll_step(-0.5, 0, 0),
+            drag_scroll_step(-0.5, 3, 5),
             DragScrollStep::Scroll { lines }
         );
         assert_eq!(
-            drag_scroll_step(-0.5, 3, 5),
+            drag_scroll_step(-0.5, 5, 5),
             DragScrollStep::Scroll { lines }
+        );
+    }
+
+    // --- 最下部では下へ送らず選択の端を動かさない（#2153。#2025 の下端版） ---
+
+    #[test]
+    fn issue2153_最下部では下へは送らず端を動かさない() {
+        for factor in [-0.01, -0.5, -1.0] {
+            for history in [0, 5, 10_000] {
+                assert_eq!(
+                    drag_scroll_step(factor, 0, history),
+                    DragScrollStep::Hold,
+                    "factor={factor} history={history}"
+                );
+            }
+        }
+    }
+
+    /// 最下部でも上へは送れる（#2153 の条件が #310 の上側を巻き込まない）
+    #[test]
+    fn issue2153_最下部からでも上へは送る() {
+        let lines = drag_scroll_lines(0.5);
+        assert_eq!(
+            drag_scroll_step(0.5, 0, 5),
+            DragScrollStep::Scroll { lines }
+        );
+    }
+
+    /// 履歴の途中（`display_offset > 0`）なら下へ送って右下へ伸ばす = #310 のまま
+    #[test]
+    fn issue2153_履歴の途中なら下へ送る_310() {
+        let lines = drag_scroll_lines(-0.5);
+        assert!(lines <= -1, "下へ送る行数は負: {lines}");
+        assert_eq!(
+            drag_scroll_step(-0.5, 1, 5),
+            DragScrollStep::Scroll { lines }
+        );
+        let fastest = -(drag_scroll_delta(1.0).ceil() as i32);
+        assert_eq!(
+            drag_scroll_step(-1.0, 10_000, 10_000),
+            DragScrollStep::Scroll { lines: fastest }
+        );
+        // 下へ送る側は最下部までの残り行数で行数を削らない（alacritty の scroll_display が 0 で頭打ち）
+        assert_eq!(
+            drag_scroll_step(-1.0, 1, 10_000),
+            DragScrollStep::Scroll { lines: fastest }
+        );
+    }
+
+    /// 履歴の途中から: 最下部まで送り切ったら、そこから先のティックは端を動かさない
+    #[test]
+    fn issue2153_途中から最下部まで送り切ってから止まる() {
+        let history = 40;
+        let start = 7usize;
+        let mut offset = start;
+        let mut scrolled = 0;
+        for _ in 0..50 {
+            match drag_scroll_step(-0.8, offset, history) {
+                DragScrollStep::Scroll { lines } => {
+                    assert!(lines < 0);
+                    // alacritty の scroll_display と同じく最下部で頭打ち
+                    offset = offset.saturating_sub(lines.unsigned_abs() as usize);
+                    scrolled += 1;
+                }
+                DragScrollStep::Hold => break,
+            }
+        }
+        assert_eq!(offset, 0, "最下部まで送る（#310）");
+        assert!(
+            (1..=start).contains(&scrolled),
+            "送るのは最下部に着くまで: {scrolled} 回"
+        );
+        assert_eq!(
+            drag_scroll_step(-0.8, offset, history),
+            DragScrollStep::Hold
+        );
+    }
+
+    /// 番犬: ティック処理が選択の端を画面の右下へ寄せるのは `Scroll` の手を受けた後だけ
+    /// （`Hold` を受けても寄せる形に戻ると、最下部で最後の行を途中まで選べなくなる = #2153）。
+    /// A/B の旧挙動は下へ送る側だけ（`legacy_2153() && factor < 0.0`）に閉じる
+    #[test]
+    fn issue2153_tick_が下端で寄せない_watchdog() {
+        let src = include_str!("main.rs");
+        let head = concat!("fn tick_drag", "_scroll(&mut self");
+        let start = src.find(head).expect("ティック処理が見つからない");
+        let body = &src[start..];
+        let end = body[head.len()..]
+            .find("\n    fn ")
+            .map(|i| i + head.len())
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        let gate = body
+            .find(concat!(
+                "let DragScrollStep::Scroll { lines } = ",
+                "step else"
+            ))
+            .expect("tick_drag_scroll が Hold で抜けていない（#2025 / #2153）");
+        let extend = body
+            .find(concat!("extend_selection(cols", ".saturating_sub(1)"))
+            .expect("tick_drag_scroll が下へ送るときに右下へ伸ばしていない（#310）");
+        assert!(
+            gate < extend,
+            "tick_drag_scroll が Hold を見る前に選択の端を右下へ寄せている（#2153）"
+        );
+        assert!(
+            body.contains(concat!("legacy_2153() && factor ", "< 0.0")),
+            "#2153 の A/B が下へ送る側に閉じていない"
         );
     }
 
