@@ -1451,6 +1451,8 @@ tako solo --tab
 tako solo -fast
 ```
 
+タブには作業しているフォルダのリポジトリ名が付きます（`my-app` など）。その後は solo が作業内容に合わせて付け直します。あなたが手で付けたタブ名は上書きしません。`--tab` で作る新しいタブは、コマンドを打ったフォルダで開きます。
+
 ### tako orchestrator projects
 
 master が作業対象にできるプロジェクトの登録・管理です。**通常は master に「◯◯のリポジトリを追加して」と頼むだけで済みます**。登録内容は `~/Library/Application Support/tako/orchestrator/projects.yaml` に保存されます。

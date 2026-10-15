@@ -24,6 +24,10 @@ tako solo docs       # 旧形式サフィックス、role=solo:docs
 - `projects.yaml` は master と共有。solo は `tako_orchestrator_projects` でプロジェクトの
   作業ディレクトリを引き、`cd` して直接作業する（「demo の README 直して」で通る）
 - 「最近やってること」は起動時にロードせず、必要なとき各プロジェクトで `git log` を見る
+- タブ名は**役割名（`solo` / `solo-<名前>`）にしない**（#2127 / FR-2.12.15）。起動で
+  **作業フォルダのリポジトリ名**（リポジトリの外ならフォルダ名。HOME で立てたら触らない）を
+  自動名で付け、以後は solo が作業内容で `tako_rename_tab(source: "auto")` を呼んで付け直す。
+  `--tab` の新しいタブはそのフォルダで開く。ユーザーが手で付けた名前は上書きしない
 
 ## 前提条件
 

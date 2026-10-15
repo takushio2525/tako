@@ -23,7 +23,8 @@
 //! 以前は `master` / `master-<名前>` を手動名で付けていたため、master 自身の
 //! `tako_rename_tab(source: "auto")` が全部弾かれてタブ名が役割名で固定された。
 //! 汎用の master（管轄なし）はタブ名に触らず、採用（#1453）の時点でプロジェクト名になる。
-//! 引き継ぎの後任は同じタブに立つのでタブ名に触らない（前任が付けた主題が残る）
+//! 引き継ぎの後任は同じタブに立つのでタブ名に触らない（前任が付けた主題が残る）。
+//! `tako solo` も同じ形で、作業フォルダのリポジトリ名を自動名で付ける（[`solo_tab_naming`]。#2127）
 //!
 //! ## role の語彙は 2 つある（#761）
 //!
@@ -225,6 +226,26 @@ pub fn tab_naming(profile_name: &str, profile: &Profile) -> Option<TabNaming> {
     )
 }
 
+/// solo のタブの名前を決める（#2127。master の [`tab_naming`] と同じ形）。
+///
+/// solo には管轄プロジェクトが無いので、**solo が作業するフォルダ（`dir`）のリポジトリ名**を
+/// 自動名で付ける（`tako_core::master_tab::solo_initial_title`）。HOME・ルートで立てた
+/// solo と、フォルダが分からないときは `None` = タブ名に触らない。
+/// `TAKO_2120_LEGACY=1` のときだけ旧挙動（`solo` / `solo-<名前>` の手動名）を返す
+pub fn solo_tab_naming(suffix: Option<&str>, dir: Option<&std::path::Path>) -> Option<TabNaming> {
+    if tako_core::master_tab::legacy() {
+        return Some(TabNaming {
+            title: tako_core::master_tab::legacy_solo_title(suffix),
+            source: None,
+        });
+    }
+    dir.and_then(tako_core::master_tab::solo_initial_title)
+        .map(|title| TabNaming {
+            title,
+            source: Some("auto".into()),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +300,27 @@ mod tests {
             ..Profile::default()
         };
         assert_eq!(tab_naming("fable", &empty), None);
+    }
+
+    /// #2127: solo のタブ名は作業フォルダのリポジトリ名を自動名で。役割名にしない
+    #[test]
+    fn soloのタブ名は作業フォルダのリポジトリの自動名() {
+        if tako_core::master_tab::legacy() {
+            return; // A/B の旧挙動で回しているときは対象外
+        }
+        let base =
+            std::env::temp_dir().join(format!("tako-2127-solo-naming-{}", std::process::id()));
+        let repo = base.join("my-app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let naming = solo_tab_naming(Some("fast"), Some(&repo.join("src")))
+            .expect("リポジトリなら名前が付く");
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(naming.title, "my-app");
+        assert_eq!(naming.source.as_deref(), Some("auto"));
+        assert!(!naming.is_manual());
+        // フォルダが分からなければタブ名に触らない
+        assert_eq!(solo_tab_naming(None, None), None);
     }
 
     /// 存在しないプロファイルは**ペインを作る前に**落とす
