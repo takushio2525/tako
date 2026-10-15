@@ -408,7 +408,8 @@ enum Command {
     /// 拡張子ごとの実行コマンド既定を一覧/設定/削除する（FR-3.18, #453）
     #[command(name = "run-default")]
     RunDefault(RunDefaultArgs),
-    /// ファイル / プロジェクトの実行設定（実行環境・プロファイル）を見る・選ぶ（FR-3.18.5, #1731）。
+    /// ファイル / プロジェクトの実行設定（実行環境・プロファイル・引数・環境変数・作業ディレクトリ・
+    /// 実行前コマンド）を見る・選ぶ（FR-3.18.5 / FR-3.18.6, #1731 / #1732）。
     /// 項目を渡さなければ実効値と実行環境の候補を出す
     #[command(name = "run-config")]
     RunConfig(RunConfigArgs),
@@ -501,6 +502,21 @@ struct RunConfigArgs {
     /// プロファイルを選ぶ（既定でこのファイルに保存）
     #[arg(long)]
     profile: Option<String>,
+    /// 引数（シェルへそのまま渡る 1 本の文字列。`${args}` が無ければコマンドの末尾へ足す。既定でこのファイルに保存）
+    #[arg(long, allow_hyphen_values = true)]
+    args: Option<String>,
+    /// 環境変数を設定する（K=V。繰り返せる。既定でこのファイルに保存）
+    #[arg(long = "env", value_name = "K=V")]
+    env: Vec<String>,
+    /// 環境変数を消す（繰り返せる。--project / --file を省くと両方から）
+    #[arg(long = "unset-env", value_name = "K")]
+    unset_env: Vec<String>,
+    /// 作業ディレクトリ（相対はファイルのディレクトリ基準。既定でこのファイルに保存）
+    #[arg(long)]
+    cwd: Option<String>,
+    /// 実行前コマンド（失敗したら本体を走らせない。既定でこのファイルに保存）
+    #[arg(long, allow_hyphen_values = true)]
+    before: Option<String>,
     /// 自動・既定へ戻す（項目名か all。値を省くと全項目。--project / --file を省くと両方から消す）
     #[arg(long, num_args = 0.., value_name = "項目", value_parser = clap::builder::PossibleValuesParser::new(
         tako_core::runner_config::RunConfigField::reset_values()
@@ -10838,6 +10854,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 scope: scope.map(|s| s.as_str().to_string()),
                 profile: args.profile.clone(),
                 runtime: args.runtime.clone(),
+                args: args.args.clone(),
+                env: run_config_env(&args.env, &args.unset_env)?,
+                cwd: args.cwd.clone(),
+                before: args.before.clone(),
                 // 値なしの `--reset` = 全項目
                 reset: args.reset.as_ref().map(|r| {
                     if r.is_empty() {
@@ -10849,6 +10869,31 @@ fn build_request(command: &Command) -> Result<Request, String> {
             }
         }
     })
+}
+
+/// `tako run-config` の `--env K=V` / `--unset-env K` → `RunnerDefaults.env`（値 `None` = 消す。#1732）。
+/// 同じ名前を設定と削除の両方に渡したら、どちらのつもりか決められないので拒否する
+fn run_config_env(
+    set: &[String],
+    unset: &[String],
+) -> Result<Option<std::collections::BTreeMap<String, Option<String>>>, String> {
+    if set.is_empty() && unset.is_empty() {
+        return Ok(None);
+    }
+    let mut map = std::collections::BTreeMap::new();
+    for kv in set {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("--env は K=V の形で指定する（指定: {kv:?}）"))?;
+        map.insert(k.to_string(), Some(v.to_string()));
+    }
+    for k in unset {
+        if map.contains_key(k) {
+            return Err(format!("{k} を --env と --unset-env の両方に渡している"));
+        }
+        map.insert(k.clone(), None);
+    }
+    Ok(Some(map))
 }
 
 /// 委任台帳のローカル処理（YAML I/O のみ。IPC 不要。#292）
@@ -15524,5 +15569,65 @@ mod help_text_parity {
             "この検査は agy = supported を前提にしている（#1002）"
         );
         assert_no_stale_unsupported_claim(&help, keys::EFFORT_CONTROL, "--agent-effort の help");
+    }
+}
+
+/// #1732: `tako run-config` の `--env K=V` / `--unset-env K` → `RunnerDefaults.env`
+#[cfg(test)]
+mod tests_1732 {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn 環境変数の設定と削除を1つの表へ畳む() {
+        assert_eq!(run_config_env(&[], &[]), Ok(None));
+        let got = run_config_env(&v(&["A=1", "B=x=y", "C="]), &v(&["D"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.get("A"), Some(&Some("1".to_string())));
+        // 値の中の `=` はそのまま（最初の `=` で割る）・空の値も値
+        assert_eq!(got.get("B"), Some(&Some("x=y".to_string())));
+        assert_eq!(got.get("C"), Some(&Some(String::new())));
+        assert_eq!(got.get("D"), Some(&None));
+    }
+
+    #[test]
+    fn k_eq_vでない指定と設定と削除の重なりは拒否する() {
+        let e = run_config_env(&v(&["NOVALUE"]), &[]).unwrap_err();
+        assert!(e.contains("K=V"), "{e}");
+        let e = run_config_env(&v(&["A=1"]), &v(&["A"])).unwrap_err();
+        assert!(e.contains("--unset-env"), "{e}");
+    }
+
+    /// `--args` / `--before` はハイフンで始まる値も受ける（`--args --verbose`）
+    #[test]
+    fn ハイフンで始まる引数を値として受ける() {
+        let cli = Cli::try_parse_from([
+            "tako",
+            "run-config",
+            "a.py",
+            "--args",
+            "--verbose -n 1",
+            "--before",
+            "-x",
+            "--env",
+            "A=1",
+            "--unset-env",
+            "B",
+            "--cwd",
+            "..",
+        ])
+        .unwrap();
+        let Command::RunConfig(a) = cli.command else {
+            panic!("run-config に解釈されない");
+        };
+        assert_eq!(a.args.as_deref(), Some("--verbose -n 1"));
+        assert_eq!(a.before.as_deref(), Some("-x"));
+        assert_eq!(a.env, v(&["A=1"]));
+        assert_eq!(a.unset_env, v(&["B"]));
+        assert_eq!(a.cwd.as_deref(), Some(".."));
     }
 }

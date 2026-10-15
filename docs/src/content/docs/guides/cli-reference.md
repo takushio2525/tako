@@ -70,7 +70,7 @@ tako orchestrator spawn --help
 | [`web`](#tako-web) | Web ビューペインの操作 |
 | [`run`](#tako-run--run-default) | ファイルを実行する（Code Runner） |
 | [`run-default`](#tako-run--run-default) | 拡張子ごとの実行コマンド既定 |
-| [`run-config`](#tako-run--run-default) | ファイル / プロジェクトごとに実行環境・プロファイルを選んで覚える |
+| [`run-config`](#tako-run--run-default) | ファイル / プロジェクトごとに実行環境・プロファイル・引数・環境変数などを覚える |
 | [`run-interactive`](#tako-run-interactive) | 入力が要るコマンドを可視ペインへ委譲 |
 | [`run-interactive-status`](#tako-run-interactive) | 委譲したコマンドの完了確認 |
 
@@ -901,9 +901,14 @@ tako run-config script.py                 # 実行設定（選ばれる実行環
 tako run-config script.py --runtime .venv # 実行環境を選んで覚える（既定でプロジェクト単位）
 tako run-config script.py --profile test  # プロファイルを選んで覚える（既定でこのファイルだけ）
 tako run-config script.py --reset runtime # 自動選択へ戻す（--reset だけなら全項目）
+tako run-config script.py --args "--verbose"     # 引数を覚える（既定でこのファイルだけ）
+tako run-config script.py --env APP_ENV=dev      # 環境変数を覚える（--unset-env APP_ENV で消す）
+tako run-config script.py --cwd .. --before "make build"  # 作業ディレクトリと実行前コマンド
 ```
 
 `tako run-config` で選んだ実行環境・プロファイルは、`tako run` と再生ボタンが自動で使います（`--profile` を付けた実行はそちらが優先）。覚える先は `<data_dir>/run-configs.json` で、中身がこのマシンのパスなので設定の共有（`tako config`）には載りません。`--runtime` には `--list` の `runtimes` の `id`、ディレクトリ名や版などの短い名前、interpreter のパスを渡せます。短い名前が複数の候補に当たる（例: 2 つの階層にある `.venv`）ときは選ばずに候補を並べて止まるので、`id` で選び直してください。覚えた環境を消した（`.venv` を作り直す前に消した等）ときは、別の Python へ黙って切り替えずにエラーで止まり、`tako run-config <file> --reset runtime` で自動選択へ戻せます。
+
+引数（`--args`）は 1 本の文字列のままシェルへ渡るので、`--args "--name 'a b'"` のように書けます。コマンドに `${args}` があればその位置へ、無ければ末尾へ入ります（`cargo run` に渡すなら `--args "-- x"`）。環境変数（`--env K=V`）の値は書いたとおりに渡り、`${fileDir}` などの tako の変数だけが展開されます。作業ディレクトリ（`--cwd`）を移すと、`python3 ${fileBase}` のような既定のコマンドはファイルを絶対パスで指すので、移った先からでも走ります。実行前コマンド（`--before`）が失敗すると本体は走らず、実行ペインの終了コードはその失敗の値になります。
 
 ### tako run-interactive
 

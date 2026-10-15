@@ -192,15 +192,19 @@ pub fn run_pane_dialect() -> ShellDialect {
     run_pane_dialect_for(crate::platform::support::Platform::current())
 }
 
-/// 実行ペインへ渡す前に、コマンド本体の前へ置くもの（Code Runner の実行環境。#1730）
+/// 実行ペインへ渡す前に、コマンド本体の前へ置くもの（Code Runner の実行環境 #1730 /
+/// 実行設定の環境変数・実行前コマンド #1732）
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunScript<'a> {
-    /// 実行ペインへ渡す環境変数（値はリテラル。シェルの `$VAR` は展開させない）
+    /// 実行ペインへ渡す環境変数（値はリテラル。シェルの `$VAR` は展開させない）。
+    /// 並びの後ろが勝つ（同じ名前なら後の `export` が上書きする）
     pub env: &'a [(String, String)],
     /// PATH の先頭へ足すディレクトリ（並びがそのまま PATH の順）
     pub path_prepend: &'a [String],
     /// コマンドの前に画面へ出す案内（#1950。env / PATH の後 = コマンドと同じ PATH で判定する）
     pub notices: &'a [RunNotice],
+    /// 実行前コマンド（#1732。**失敗したら本体を走らせない**。空白だけなら無いのと同じ）
+    pub before: Option<&'a str>,
     /// コマンド本体（`tako:shell` の包みまで済んだもの）
     pub command: &'a str,
 }
@@ -217,7 +221,8 @@ pub struct RunNotice {
     pub unless_found: Option<String>,
 }
 
-/// 実行環境の env と PATH の前置をコマンド本体の前に付ける（境界 B1 の 1 実装。#1730）。
+/// 実行環境の env と PATH の前置・実行前コマンドをコマンド本体の前に付ける
+/// （境界 B1 の 1 実装。#1730 / #1732）。
 ///
 /// **`SpawnOptions.env` ではなくコマンド文字列へ埋める**のが要点
 /// （`.agent/plans/2026-09-runner-settings.md` §6.3）:
@@ -232,11 +237,15 @@ pub struct RunNotice {
 /// **そのまま返す**（実行環境が無いときの実行ペインは今と 1 バイトも変わらない）。
 /// 方言を引数で受けるので、macOS の単体から PowerShell の形まで固定できる。
 ///
-/// 前提: 変数名は識別子（`[A-Za-z_][A-Za-z0-9_]*`）。いま渡すのは実行環境の表が持つ名前
-/// （`VIRTUAL_ENV` / `CONDA_PREFIX` …）だけで、利用者が書く env（#1726 S4）を載せるときは
-/// 呼び出し側で名前を検める
+/// 実行前コマンドは「失敗したら本体を走らせない」形で前に置く（[`guard_with_before`]）。
+/// 終了コードは失敗した実行前コマンドのもの（`before` = `false` なら 1）。
+///
+/// 前提: 変数名は識別子（`[A-Za-z_][A-Za-z0-9_]*`）。実行環境の表が持つ名前
+/// （`VIRTUAL_ENV` / `CONDA_PREFIX` …）と、利用者が書いた名前（#1732。保存時と実行時に
+/// `runner_config::valid_env_name` で検める）だけが来る
 pub fn compose_run_script(dialect: ShellDialect, s: &RunScript<'_>) -> String {
-    if s.env.is_empty() && s.path_prepend.is_empty() && s.notices.is_empty() {
+    let before = s.before.filter(|b| !b.trim().is_empty());
+    if s.env.is_empty() && s.path_prepend.is_empty() && s.notices.is_empty() && before.is_none() {
         return s.command.to_string();
     }
     let mut parts: Vec<String> = Vec::with_capacity(s.env.len() + 2);
@@ -265,8 +274,30 @@ pub fn compose_run_script(dialect: ShellDialect, s: &RunScript<'_>) -> String {
             .filter(|n| !n.lines.is_empty())
             .map(|n| notice_script(dialect, n)),
     );
-    parts.push(s.command.to_string());
+    parts.push(match before {
+        Some(b) => guard_with_before(dialect, b, s.command),
+        None => s.command.to_string(),
+    });
     parts.join("; ")
+}
+
+/// 実行前コマンド `before` が成功したときだけ `command` を走らせる片（#1732）。
+///
+/// - POSIX: `{ <before>⏎} && { <command>⏎}`
+/// - PowerShell: `<before>⏎if ($?) { <command>⏎}`（Windows のコンパイル行と同じ `$?` の門）
+///
+/// 素の `before && command` にしないのは、本体が複合文のとき門が前半にしか効かないため
+/// （宣言の `make; ./a` は `before && make; ./a` になり、before が失敗しても `./a` が走る）。
+/// 群（`{ }`）の閉じを改行の後に置くのは、行末のコメント（`make # build`）や末尾の `&` が
+/// 閉じ括弧を飲み込まないため。終了コードは、before が失敗すればその値、成功すれば本体の値
+/// （POSIX の `&&` と、PowerShell の `$?` が `if` を飛ばした後も偽のまま残る性質による。
+/// pwsh 7.6 で実測。実行ペインは `$?` → `$LASTEXITCODE` の順で確定する =
+/// `powershell_exit_code_script`）
+fn guard_with_before(dialect: ShellDialect, before: &str, command: &str) -> String {
+    match dialect {
+        ShellDialect::Posix => format!("{{ {before}\n}} && {{ {command}\n}}"),
+        ShellDialect::PowerShell => format!("{before}\nif ($?) {{ {command}\n}}"),
+    }
 }
 
 /// 案内 1 件を出す片（POSIX は `printf '%s\n'`、PowerShell は `Write-Host`）。
@@ -2095,6 +2126,158 @@ mod tests_1730 {
             "it's $HOME|from-prepended\n",
             "{line}"
         );
+    }
+}
+
+/// #1732: 実行設定の環境変数・実行前コマンド（両方言の形を macOS から固定し、
+/// 実行中の OS のシェル = macOS は sh・Windows は PowerShell へ通して効き目まで見る）
+#[cfg(test)]
+mod tests_1732 {
+    use super::*;
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, x)| (k.to_string(), x.to_string()))
+            .collect()
+    }
+
+    /// 引用に `'`・空白・日本語・`$`、PATH 前置、before の失敗で本体が走らない形
+    #[test]
+    fn 環境変数と実行前コマンドを両方言で固定する() {
+        let env = pairs(&[("APP_ENV", "dev"), ("NOTE", "it's $HOME 日本 語")]);
+        let path = vec!["/my proj/.venv/bin".to_string()];
+        let script = RunScript {
+            env: &env,
+            path_prepend: &path,
+            before: Some("make build"),
+            command: "python3 a.py --name 'a b'",
+            ..RunScript::default()
+        };
+        assert_eq!(
+            compose_run_script(ShellDialect::Posix, &script),
+            "export APP_ENV=dev; export NOTE='it'\\''s $HOME 日本 語'; \
+             export PATH='/my proj/.venv/bin':\"$PATH\"; \
+             { make build\n} && { python3 a.py --name 'a b'\n}"
+        );
+        let win_path = vec![r"C:\my proj\.venv\Scripts".to_string()];
+        assert_eq!(
+            compose_run_script(
+                ShellDialect::PowerShell,
+                &RunScript {
+                    env: &env,
+                    path_prepend: &win_path,
+                    before: Some("make build"),
+                    command: "python a.py --name 'a b'",
+                    ..RunScript::default()
+                }
+            ),
+            "$env:APP_ENV = 'dev'; $env:NOTE = 'it''s $HOME 日本 語'; \
+             $env:PATH = 'C:\\my proj\\.venv\\Scripts;' + $env:PATH; \
+             make build\nif ($?) { python a.py --name 'a b'\n}"
+        );
+    }
+
+    /// before だけでも組み立てる（env / PATH が無くても素通しにしない）。
+    /// 空白だけの before は無いのと同じ = コマンドがそのまま
+    #[test]
+    fn 実行前コマンドだけでも門を付け空白だけなら付けない() {
+        for (dialect, want) in [
+            (ShellDialect::Posix, "{ false\n} && { make\n}"),
+            (ShellDialect::PowerShell, "false\nif ($?) { make\n}"),
+        ] {
+            let got = compose_run_script(
+                dialect,
+                &RunScript {
+                    before: Some("false"),
+                    command: "make",
+                    ..RunScript::default()
+                },
+            );
+            assert_eq!(got, want, "{dialect:?}");
+            let blank = compose_run_script(
+                dialect,
+                &RunScript {
+                    before: Some("  "),
+                    command: "make",
+                    ..RunScript::default()
+                },
+            );
+            assert_eq!(blank, "make", "{dialect:?}");
+        }
+    }
+
+    /// 案内（#1950）は実行前コマンドより前（どちらも本体の前）
+    #[test]
+    fn 案内は実行前コマンドより前() {
+        let notices = vec![RunNotice {
+            lines: vec!["[tako] n".into()],
+            unless_found: None,
+        }];
+        assert_eq!(
+            compose_run_script(
+                ShellDialect::Posix,
+                &RunScript {
+                    notices: &notices,
+                    before: Some("true"),
+                    command: "make",
+                    ..RunScript::default()
+                }
+            ),
+            "printf '%s\\n' '[tako] n'; { true\n} && { make\n}"
+        );
+    }
+
+    /// 実行中の OS のシェル（unix = `sh -c`・Windows = PowerShell）へ実際に通す:
+    /// ① before が失敗すれば本体は走らず、終了コードは before のもの
+    /// ② 本体が複合文でも後半まで止まる（素の `before && 本体` では後半が走る）
+    /// ③ before が成功すれば本体が走り、終了コードは本体のもの
+    /// ④ 値は `'`・`$`・空白・日本語を含んでもリテラルのまま届く
+    /// ⑤ before の行末コメントが門を飲み込まない
+    #[test]
+    fn 実行中のosのシェルでbeforeの失敗が本体を止める() {
+        let dialect = run_pane_dialect();
+        // 方言ごとの「失敗する before」「印字」「n で終わる」
+        let (fail3, ok, print, exit7) = match dialect {
+            ShellDialect::Posix => (
+                "sh -c 'exit 3'",
+                "true # c",
+                "printf '%s|' \"$TAKO_1732_V\"",
+                "exit 7",
+            ),
+            ShellDialect::PowerShell => (
+                "cmd /c exit 3",
+                "cmd /c exit 0 # c",
+                "Write-Output (\"$env:TAKO_1732_V\" + '|')",
+                "cmd /c exit 7",
+            ),
+        };
+        let env = pairs(&[("TAKO_1732_V", "it's $HOME 日本 語")]);
+        let run = |before: &str, command: &str| {
+            let line = compose_run_script(
+                dialect,
+                &RunScript {
+                    env: &env,
+                    before: Some(before),
+                    command,
+                    ..RunScript::default()
+                },
+            );
+            let out = output_command(&line).output().unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                line,
+            )
+        };
+        // ①②: 本体は「印字 → 7 で終わる」の複合文
+        let body = format!("{print}; {exit7}");
+        let (code, stdout, line) = run(fail3, &body);
+        assert_eq!(code, Some(3), "{line}");
+        assert_eq!(stdout, "", "before が失敗したのに本体が走った: {line}");
+        // ③④⑤
+        let (code, stdout, line) = run(ok, &body);
+        assert_eq!(code, Some(7), "{line}");
+        assert_eq!(stdout, "it's $HOME 日本 語|", "{line}");
     }
 }
 

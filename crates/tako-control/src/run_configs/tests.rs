@@ -54,7 +54,23 @@ fn call(
         profile,
         runtime,
         reset,
+        ..PathArgs::empty(file)
     })
+}
+
+/// #1732: 引数・環境変数・作業ディレクトリ・実行前コマンドだけを渡す
+fn call_1732<'a>(
+    file: &'a Path,
+    scope: Option<&'a str>,
+    edit: impl FnOnce(&mut PathArgs<'a>),
+) -> Result<Value, DispatchError> {
+    let mut a = PathArgs {
+        scope,
+        ..PathArgs::empty(file)
+    };
+    edit(&mut a);
+    let head = std::fs::read_to_string(file).unwrap();
+    handle(PathArgs { head: &head, ..a })
 }
 
 fn rr(manager: &str, key: &str) -> RuntimeRef {
@@ -437,5 +453,194 @@ fn interpreterのパスを直接選べる() {
         call(&file, None, None, Some("./nowhere/python"), None),
         Err(DispatchError::InvalidParams(_))
     ));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ─── #1732: 引数・環境変数・作業ディレクトリ・実行前コマンド ─────────────
+
+fn env_of(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+        .collect()
+}
+
+/// 保存先の既定はファイル・応答の config に出典つきで載る・`Saved::layer` が解決へ渡す形になる
+#[test]
+fn 引数と環境変数と作業ディレクトリと実行前を保存し既定はファイル() {
+    let base = sandbox("s4-save");
+    let file = base.join("proj").join("a.py");
+    touch(&file, "print(1)\n");
+    std::fs::create_dir_all(base.join("proj").join("build")).unwrap();
+    let env = env_of(&[("APP_ENV", Some("dev")), ("NOTE", Some("it's $HOME 日本"))]);
+    let v = call_1732(&file, None, |a| {
+        a.args = Some("--name 'a b' x");
+        a.env = Some(&env);
+        a.cwd = Some("build");
+        a.before = Some("make build");
+    })
+    .unwrap();
+    let updated: Vec<(String, String)> = v["updated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["field"].as_str().unwrap().to_string(),
+                format!(
+                    "{}:{}",
+                    c["scope"].as_str().unwrap(),
+                    c["action"].as_str().unwrap()
+                ),
+            )
+        })
+        .collect();
+    for field in ["args", "cwd", "before", "env"] {
+        assert!(
+            updated.contains(&(field.to_string(), "file:set".to_string())),
+            "{field}: {updated:?}"
+        );
+    }
+    assert_eq!(
+        v["config"]["args"],
+        json!({ "value": "--name 'a b' x", "source": "file" })
+    );
+    assert_eq!(v["config"]["cwd"]["source"], "file");
+    assert_eq!(v["config"]["before"]["value"], "make build");
+    assert_eq!(
+        v["config"]["env"]["NOTE"],
+        json!({ "value": "it's $HOME 日本", "source": "file" })
+    );
+    assert_eq!(v["saved"]["file"]["env"]["APP_ENV"], "dev", "{v:#}");
+
+    let (layer, bad) = saved_for(&file).layer();
+    assert!(bad.is_empty());
+    assert_eq!(layer.args.as_deref(), Some("--name 'a b' x"));
+    assert_eq!(layer.cwd.as_deref(), Some("build"));
+    assert_eq!(layer.before.as_deref(), Some("make build"));
+    assert_eq!(
+        layer.env.get("NOTE").map(String::as_str),
+        Some("it's $HOME 日本")
+    );
+
+    // 読むだけの呼び出しは何も書き換えない
+    let v = call_1732(&file, None, |_| {}).unwrap();
+    assert_eq!(v["updated"], json!([]));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 環境変数はキー単位で重なる（ファイルが勝つ）。値 null は保存先を省くと両方から消す
+#[test]
+fn 環境変数はキー単位で重なりnullで両方から消える() {
+    let base = sandbox("s4-env");
+    let file = base.join("a.py");
+    touch(&file, "print(1)\n");
+    let p = env_of(&[("A", Some("project")), ("B", Some("project"))]);
+    call_1732(&file, Some("project"), |a| a.env = Some(&p)).unwrap();
+    let f = env_of(&[("A", Some("file"))]);
+    call_1732(&file, None, |a| a.env = Some(&f)).unwrap();
+
+    let (layer, _) = saved_for(&file).layer();
+    assert_eq!(layer.env.get("A").map(String::as_str), Some("file"));
+    assert_eq!(layer.env.get("B").map(String::as_str), Some("project"));
+
+    let unset = env_of(&[("A", None)]);
+    let v = call_1732(&file, None, |a| a.env = Some(&unset)).unwrap();
+    assert_eq!(
+        v["updated"],
+        json!([
+            { "scope": "file", "field": "env", "action": "reset" },
+            { "scope": "project", "field": "env", "action": "reset" },
+        ]),
+        "{v:#}"
+    );
+    let (layer, _) = saved_for(&file).layer();
+    assert_eq!(layer.env.get("A"), None);
+    assert_eq!(layer.env.get("B").map(String::as_str), Some("project"));
+    // 無い名前を消しても何も変わらない
+    let none = env_of(&[("ZZZ", None)]);
+    let v = call_1732(&file, None, |a| a.env = Some(&none)).unwrap();
+    assert_eq!(v["updated"], json!([]));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 識別子でない名前は保存しない。手で書き換えた保存値は `layer` が分けて返し、消すことはできる
+#[test]
+fn 使えない環境変数の名前は保存せず手書きの名前は分けて返す() {
+    let base = sandbox("s4-badenv");
+    let file = base.join("a.py");
+    touch(&file, "print(1)\n");
+    for bad in ["1A", "A-B", "A=1; rm -rf ~; B", ""] {
+        let env = env_of(&[(bad, Some("x"))]);
+        let e = call_1732(&file, None, |a| a.env = Some(&env)).expect_err(bad);
+        assert!(matches!(e, DispatchError::InvalidParams(_)), "{bad}: {e:?}");
+    }
+    // 手で書き換えた保存値（保存の口を通らない）
+    let store = store_path().unwrap();
+    update_at(&store, |st| {
+        let cfg = st.files.entry(key_of(&file)).or_default();
+        cfg.env.insert("A-B".into(), "x".into());
+        cfg.env.insert("OK".into(), "y".into());
+    })
+    .unwrap();
+    let (layer, bad) = saved_for(&file).layer();
+    assert_eq!(bad, vec!["A-B".to_string()]);
+    assert_eq!(layer.env.keys().collect::<Vec<_>>(), vec!["OK"]);
+    let msg = bad_env_names(&bad, &file).to_string();
+    assert!(msg.contains("--unset-env"), "{msg}");
+    // 壊れた名前でも消せる
+    let unset = env_of(&[("A-B", None)]);
+    call_1732(&file, None, |a| a.env = Some(&unset)).unwrap();
+    assert!(saved_for(&file).layer().1.is_empty());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 作業ディレクトリは今あるものだけ保存する（空は受けない = 既定へ戻すのは reset）
+#[test]
+fn 作業ディレクトリは今あるものだけ保存する() {
+    let base = sandbox("s4-cwd");
+    let file = base.join("src").join("a.py");
+    touch(&file, "print(1)\n");
+    for bad in ["nope", "", "  "] {
+        let e = call_1732(&file, None, |a| a.cwd = Some(bad)).expect_err(bad);
+        assert!(
+            matches!(e, DispatchError::InvalidParams(_)),
+            "{bad:?}: {e:?}"
+        );
+    }
+    // 相対はファイルの段から・変数も展開して確かめる
+    call_1732(&file, None, |a| a.cwd = Some("..")).unwrap();
+    call_1732(&file, None, |a| a.cwd = Some("${fileDir}")).unwrap();
+    let (layer, _) = saved_for(&file).layer();
+    assert_eq!(layer.cwd.as_deref(), Some("${fileDir}"));
+    // reset で既定へ
+    let v = call_1732(&file, None, |a| a.reset = Some(&[])).unwrap();
+    assert_eq!(v["updated"], json!([]), "空の reset は何もしない");
+    let reset = ["cwd".to_string()];
+    call_1732(&file, None, |a| a.reset = Some(&reset)).unwrap();
+    assert_eq!(saved_for(&file).layer().0.cwd, None);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 空文字の引数・実行前コマンドは「無し」という明示の値（プロジェクトの値を塞ぐ）
+#[test]
+fn 空文字の引数と実行前はプロジェクトの値を塞ぐ() {
+    let base = sandbox("s4-empty");
+    let file = base.join("a.py");
+    touch(&file, "print(1)\n");
+    call_1732(&file, Some("project"), |a| {
+        a.args = Some("--p");
+        a.before = Some("false");
+    })
+    .unwrap();
+    assert_eq!(saved_for(&file).layer().0.args.as_deref(), Some("--p"));
+    call_1732(&file, None, |a| {
+        a.args = Some("");
+        a.before = Some("");
+    })
+    .unwrap();
+    let (layer, _) = saved_for(&file).layer();
+    assert_eq!(layer.args.as_deref(), Some(""));
+    assert_eq!(layer.before.as_deref(), Some(""));
     let _ = std::fs::remove_dir_all(&base);
 }

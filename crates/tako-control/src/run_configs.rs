@@ -1,7 +1,8 @@
 //! Code Runner の実行設定の保存（`<data_dir>/run-configs.json`。Issue #1731 / #1726 S3）
 //!
 //! 「**このマシンでこのファイル / プロジェクトをどう走らせるか**」（選んだ実行環境・
-//! プロファイル）を覚え、`Run` / `RunResolve` がそれを重ねる。型と重ね方は
+//! プロファイル・引数・環境変数・作業ディレクトリ・実行前コマンド = #1732）を覚え、
+//! `Run` / `RunResolve` がそれを重ねる。型と重ね方は
 //! `tako_core::runner_config`、実行環境の解き方は `tako_core::runtime_env` の 1 実装で、
 //! ここが持つのは**読み書き**と、`tako run-config` / MCP `tako_run_defaults`（`path`）の本体だけ。
 //! 設計: `.agent/plans/2026-09-runner-settings.md` §4.2〜§4.5 / §5.5 / §8
@@ -29,14 +30,24 @@
 //! ## A/B
 //!
 //! `TAKO_1731_LEGACY=1` で `Run` / `RunResolve` が保存値を読まない（#1731 以前 = 自動選択と
-//! 宣言の既定だけ）。ゲートは [`legacy_1731`] の 1 か所
+//! 宣言の既定だけ）。ゲートは [`legacy_1731`] の 1 か所。
+//! `TAKO_1732_LEGACY=1` は引数・環境変数・作業ディレクトリ・実行前コマンドだけを読まない
+//! （#1732 以前 = 保存しても実行に効かない）。ゲートは [`legacy_1732`] の 1 か所
+//!
+//! ## 診断ログへ出さない
+//!
+//! 環境変数の値・引数・実行前コマンドはユーザーデータ（AGENTS.md の絶対ルール）。
+//! このモジュールは persist.log / perf.log / stderr へ何も書かない
+//! （番犬 `tests/issue1732_run_config_log_watchdog.rs`）
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tako_core::runner_config::{FieldSource, RunConfig, RunConfigField, RunScope, RuntimeRef};
+use tako_core::runner_config::{
+    valid_env_name, FieldSource, RunConfig, RunConfigField, RunScope, RuntimeRef,
+};
 use tako_core::runtime_env::{self, QueryError, RealFs};
 
 use crate::dispatch::DispatchError;
@@ -52,6 +63,12 @@ pub const FILES_MAX: usize = 1_000;
 /// #1731 以前（保存値を読まない）へ戻す A/B のゲート。**ここ 1 か所だけ**
 pub fn legacy_1731() -> bool {
     std::env::var("TAKO_1731_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// #1732 以前（引数・環境変数・作業ディレクトリ・実行前コマンドを実行に重ねない）へ戻す
+/// A/B のゲート。**ここ 1 か所だけ**（保存・読み出しの口はそのまま = 同じ保存値で比べられる）
+pub fn legacy_1732() -> bool {
+    std::env::var("TAKO_1732_LEGACY").is_ok_and(|v| v == "1")
 }
 
 /// `run-configs.json` の中身
@@ -145,8 +162,16 @@ pub struct Edit {
     pub profile: Option<(RunScope, String)>,
     /// (保存先, kind, 参照)
     pub runtime: Option<(RunScope, String, RuntimeRef)>,
+    /// 引数・作業ディレクトリ・実行前コマンド（#1732）
+    pub args: Option<(RunScope, String)>,
+    pub cwd: Option<(RunScope, String)>,
+    pub before: Option<(RunScope, String)>,
+    /// 設定する環境変数（名前は検証済み。キー単位で重ねる）
+    pub env_set: Option<(RunScope, BTreeMap<String, String>)>,
+    /// 消す環境変数の名前（`reset_scopes` のスコープから。名前は検めない = 壊れた名前も消せる）
+    pub env_unset: Vec<String>,
     pub reset: Vec<RunConfigField>,
-    /// 消すスコープ（保存先を省いた reset は両方 = 実効値を既定へ戻す）
+    /// 消すスコープ（保存先を省いた reset / 環境変数の削除は両方 = 実効値を既定へ戻す）
     pub reset_scopes: Vec<RunScope>,
     /// 実行環境の reset で消す kind（`None` = 全 kind。他言語の選択は残す）
     pub kind: Option<String>,
@@ -154,7 +179,14 @@ pub struct Edit {
 
 impl Edit {
     pub fn writes(&self) -> bool {
-        self.profile.is_some() || self.runtime.is_some() || !self.reset.is_empty()
+        self.profile.is_some()
+            || self.runtime.is_some()
+            || self.args.is_some()
+            || self.cwd.is_some()
+            || self.before.is_some()
+            || self.env_set.is_some()
+            || !self.env_unset.is_empty()
+            || !self.reset.is_empty()
     }
 }
 
@@ -202,9 +234,51 @@ impl RunConfigsFile {
                     });
                 }
             }
+            // 環境変数のキー単位の削除（reset の後 = 同じ呼び出しの set が勝つ）
+            let mut removed = false;
+            for name in &edit.env_unset {
+                removed |= cfg.env.remove(name).is_some();
+            }
+            if removed {
+                touched = true;
+                changes.push(Change {
+                    scope: *scope,
+                    field: RunConfigField::Env,
+                    action: "reset",
+                });
+            }
             if touched {
                 cfg.updated_at = Some(now.to_string());
             }
+        }
+        for (value, field) in [
+            (&edit.args, RunConfigField::Args),
+            (&edit.cwd, RunConfigField::Cwd),
+            (&edit.before, RunConfigField::Before),
+        ] {
+            let Some((scope, v)) = value else { continue };
+            let cfg = self.map_mut(*scope).entry(key_for(*scope)).or_default();
+            if let Some(slot) = text_slot(cfg, field) {
+                *slot = Some(v.clone());
+            }
+            cfg.updated_at = Some(now.to_string());
+            changes.push(Change {
+                scope: *scope,
+                field,
+                action: "set",
+            });
+        }
+        if let Some((scope, vars)) = &edit.env_set {
+            let cfg = self.map_mut(*scope).entry(key_for(*scope)).or_default();
+            for (k, v) in vars {
+                cfg.env.insert(k.clone(), v.clone());
+            }
+            cfg.updated_at = Some(now.to_string());
+            changes.push(Change {
+                scope: *scope,
+                field: RunConfigField::Env,
+                action: "set",
+            });
         }
         if let Some((scope, name)) = &edit.profile {
             let cfg = self.map_mut(*scope).entry(key_for(*scope)).or_default();
@@ -248,6 +322,16 @@ impl RunConfigsFile {
     }
 }
 
+/// 1 本の文字列の項目の欄（引数・作業ディレクトリ・実行前コマンド。#1732）
+fn text_slot(cfg: &mut RunConfig, field: RunConfigField) -> Option<&mut Option<String>> {
+    match field {
+        RunConfigField::Args => Some(&mut cfg.args),
+        RunConfigField::Cwd => Some(&mut cfg.cwd),
+        RunConfigField::Before => Some(&mut cfg.before),
+        RunConfigField::Profile | RunConfigField::Runtime | RunConfigField::Env => None,
+    }
+}
+
 // ─── ファイルに効く保存値 ──────────────────────────────────────────────
 
 /// あるファイルに効く保存値（ファイルのスコープ + プロジェクトのスコープ）
@@ -287,6 +371,69 @@ impl Saved {
             .into_iter()
             .find_map(|(c, s)| c.and_then(|c| c.profile.as_deref()).map(|p| (p, s)))
     }
+
+    /// 解決へ渡す実行設定の層（#1732。引数・作業ディレクトリ・実行前コマンドはファイル →
+    /// プロジェクトの順の先勝ち、環境変数はキー単位で重ねる = `runner_config::merge` と同じ）。
+    ///
+    /// 環境変数の名前が識別子でないもの（手で書き換えた保存値）は層に入れず、2 つ目で返す
+    /// （名前はコマンド文字列の文へそのまま入るので、`Run` は走らせずに止める）
+    pub fn layer(&self) -> (tako_core::ConfigLayer, Vec<String>) {
+        if legacy_1732() {
+            return Default::default();
+        }
+        let eff = tako_core::runner_config::merge(
+            self.file.as_ref(),
+            self.project.as_ref(),
+            &tako_core::runner_config::Declared::default(),
+            &BTreeMap::new(),
+        );
+        let (env, bad): (BTreeMap<_, _>, BTreeMap<_, _>) = eff
+            .env
+            .into_iter()
+            .map(|(k, v)| (k, v.value))
+            .partition(|(k, _)| valid_env_name(k));
+        let layer = tako_core::ConfigLayer {
+            args: eff.args.map(|s| s.value),
+            cwd: eff.cwd.map(|s| s.value),
+            before: eff.before.map(|s| s.value),
+            env,
+        };
+        (layer, bad.into_keys().collect())
+    }
+}
+
+/// 保存した環境変数の名前が使えないときのエラー（`Run`。既定へ落とさず、消し方を案内する）
+pub fn bad_env_names(names: &[String], file: &Path) -> DispatchError {
+    let f = tako_core::shell::quote_for_shell(&file.display().to_string());
+    let list = names.join(" / ");
+    let first = names.first().map(String::as_str).unwrap_or("<名前>");
+    let q = tako_core::shell::quote_for_shell(first);
+    DispatchError::Operation(tr(
+        format!(
+            "保存した環境変数の名前「{list}」は使えない（英字・数字・_ だけ・先頭は数字以外）。\
+             `tako run-config {f} --unset-env {q}` で消す"
+        ),
+        format!(
+            "The saved environment variable name \"{list}\" cannot be used (letters, digits and _ \
+             only, not starting with a digit). Remove it with `tako run-config {f} --unset-env {q}`"
+        ),
+    ))
+}
+
+/// 保存した作業ディレクトリが今無いときのエラー（`Run`。既定へ落とさず、戻し方を案内する）
+pub fn saved_cwd_missing(dir: &Path, file: &Path) -> DispatchError {
+    let f = tako_core::shell::quote_for_shell(&file.display().to_string());
+    let d = dir.display();
+    DispatchError::Operation(tr(
+        format!(
+            "保存した作業ディレクトリが無い: {d}。`tako run-config {f} --reset cwd` で既定へ戻すか、\
+             `tako run-config {f} --cwd <ディレクトリ>` で選び直す"
+        ),
+        format!(
+            "The saved working directory does not exist: {d}. Run `tako run-config {f} --reset cwd` \
+             to go back to the default, or `tako run-config {f} --cwd <dir>` to choose again"
+        ),
+    ))
 }
 
 /// `Run` / `RunResolve` が読む保存値（A/B 中は空。プロジェクトのルートだけは決める）
@@ -339,6 +486,30 @@ pub struct PathArgs<'a> {
     pub profile: Option<&'a str>,
     pub runtime: Option<&'a str>,
     pub reset: Option<&'a [String]>,
+    /// 引数・作業ディレクトリ・実行前コマンド（#1732）
+    pub args: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub before: Option<&'a str>,
+    /// 環境変数（値 `None` = そのキーを消す）
+    pub env: Option<&'a BTreeMap<String, Option<String>>>,
+}
+
+impl<'a> PathArgs<'a> {
+    /// 項目を 1 つも渡さない（= 読むだけ）材料。先頭は空
+    pub fn empty(file: &'a Path) -> Self {
+        Self {
+            file,
+            head: "",
+            scope: None,
+            profile: None,
+            runtime: None,
+            reset: None,
+            args: None,
+            cwd: None,
+            before: None,
+            env: None,
+        }
+    }
 }
 
 /// 読む（項目を渡さない）か、検証して保存してから今の実効値を返す。
@@ -370,6 +541,8 @@ pub fn handle(a: PathArgs<'_>) -> Result<Value, DispatchError> {
         None,
         None,
         &snap.as_ref().map(|s| s.words()).unwrap_or_default(),
+        // 宣言のプロファイルを数えるだけ（コマンドは使わない）
+        &tako_core::ConfigLayer::default(),
     )
     .ok();
     let profiles: Vec<String> = resolution
@@ -402,6 +575,34 @@ pub fn handle(a: PathArgs<'_>) -> Result<Value, DispatchError> {
         }
         let to = scope.unwrap_or(RunConfigField::Profile.default_scope());
         edit.profile = Some((to, name.to_string()));
+    }
+    // #1732: 引数・作業ディレクトリ・実行前コマンド・環境変数
+    let to = |field: RunConfigField| scope.unwrap_or(field.default_scope());
+    edit.args = a.args.map(|v| (to(RunConfigField::Args), v.to_string()));
+    edit.before = a
+        .before
+        .map(|v| (to(RunConfigField::Before), v.to_string()));
+    if let Some(cwd) = a.cwd {
+        // 今解けない作業ディレクトリは保存しない（保存した瞬間から `Run` が「cwd が存在しない」で止まる）
+        check_cwd(a.file, &root, cwd)?;
+        edit.cwd = Some((to(RunConfigField::Cwd), cwd.to_string()));
+    }
+    if let Some(env) = a.env {
+        let mut set = BTreeMap::new();
+        for (name, value) in env {
+            match value {
+                Some(v) => {
+                    if !valid_env_name(name) {
+                        return Err(invalid(msg_bad_env_name(name)));
+                    }
+                    set.insert(name.clone(), v.clone());
+                }
+                None => edit.env_unset.push(name.clone()),
+            }
+        }
+        if !set.is_empty() {
+            edit.env_set = Some((to(RunConfigField::Env), set));
+        }
     }
 
     let (changes, store) = if edit.writes() {
@@ -474,6 +675,29 @@ fn query_to_ref(snap: &Snapshot, q: &str, file: &Path) -> Result<RuntimeRef, Dis
     }
 }
 
+/// 作業ディレクトリの指定が今解けるか（`Run` と同じ展開 = `runner::expand_literal` と
+/// ファイルの段からの相対）。空は受けない（既定へ戻すのは `--reset cwd`）
+fn check_cwd(file: &Path, root: &Path, cwd: &str) -> Result<(), DispatchError> {
+    if cwd.trim().is_empty() {
+        return Err(DispatchError::InvalidParams(msg_empty_cwd()));
+    }
+    let vars = tako_core::RunVars::new(file, root);
+    let expanded = tako_core::runner::expand_literal(cwd, &vars);
+    let p = Path::new(&expanded);
+    let dir = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        file.parent().unwrap_or(Path::new(".")).join(p)
+    };
+    if dir.is_dir() {
+        Ok(())
+    } else {
+        Err(DispatchError::InvalidParams(msg_cwd_missing(
+            &dir.display().to_string(),
+        )))
+    }
+}
+
 /// `./` の成分だけを落とす（`..` は残す = シンボリックリンク越しの意味を変えない）
 fn without_cur_dir(p: &Path) -> PathBuf {
     p.components()
@@ -526,6 +750,30 @@ fn msg_unknown_profile(name: &str, profiles: &[String]) -> String {
     tr(
         format!("プロファイル「{name}」はこのファイルに無い。選べるもの: {list}"),
         format!("This file has no profile \"{name}\". Available: {list}"),
+    )
+}
+
+fn msg_bad_env_name(name: &str) -> String {
+    tr(
+        format!("環境変数の名前「{name}」は使えない（英字・数字・_ だけ・先頭は数字以外）"),
+        format!(
+            "\"{name}\" cannot be used as an environment variable name \
+             (letters, digits and _ only, not starting with a digit)"
+        ),
+    )
+}
+
+fn msg_empty_cwd() -> String {
+    tr(
+        "cwd は空にできない（既定へ戻すなら --reset cwd）".to_string(),
+        "cwd cannot be empty (use --reset cwd to go back to the default)".to_string(),
+    )
+}
+
+fn msg_cwd_missing(dir: &str) -> String {
+    tr(
+        format!("作業ディレクトリが無いので保存しない: {dir}"),
+        format!("Not saved: the working directory does not exist: {dir}"),
     )
 }
 

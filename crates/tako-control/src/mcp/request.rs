@@ -1517,6 +1517,11 @@ pub(super) fn build_request(
             profile: str_arg(args, "profile")?,
             runtime: str_arg(args, "runtime")?,
             reset: str_vec_arg(args, "reset")?,
+            // #1732: 引数・環境変数（値 null = 消す）・作業ディレクトリ・実行前コマンド
+            args: str_arg(args, "args")?,
+            env: env_map_arg(args, "env")?,
+            cwd: str_arg(args, "cwd")?,
+            before: str_arg(args, "before")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })
@@ -1764,6 +1769,27 @@ fn direction_arg(args: &Value) -> Result<Option<Direction>, String> {
         Some(other) => Err(format!(
             "direction が不正: {other}（right / down / left / up のいずれか）"
         )),
+    }
+}
+
+/// 環境変数の object（#1732）。値は文字列か `null`（= そのキーを消す）。
+/// それ以外（数値・配列）は黙って文字列化せずに拒否する（保存される値が呼び手の意図とずれる）
+fn env_map_arg(
+    args: &Value,
+    key: &str,
+) -> Result<Option<std::collections::BTreeMap<String, Option<String>>>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => Ok((k.clone(), Some(s.clone()))),
+                Value::Null => Ok((k.clone(), None)),
+                _ => Err(format!("{key} の値は文字列か null で指定する（{k}）")),
+            })
+            .collect::<Result<_, _>>()
+            .map(Some),
+        Some(_) => Err(format!("{key} は object（名前 → 値）で指定する")),
     }
 }
 

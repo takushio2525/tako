@@ -9916,6 +9916,12 @@ fn dispatch_inner(
             }
             let saved_profile = saved.profile().filter(|_| profile.is_none());
             let profile = profile.or_else(|| saved_profile.map(|(p, _)| p.to_string()));
+            // #1732: 保存した引数・作業ディレクトリ・実行前コマンド・環境変数。名前が識別子でない
+            // 環境変数（手で書き換えた保存値）はコマンド文字列の文へ化けうるので走らせない
+            let (layer, bad_env) = saved.layer();
+            if !bad_env.is_empty() {
+                return Err(crate::run_configs::bad_env_names(&bad_env, &resolved));
+            }
 
             // 解決（宣言 → ユーザーの拡張子既定 → プロジェクト既定 → 組み込み。#1656）
             let settings = crate::settings::load();
@@ -9926,6 +9932,7 @@ fn dispatch_inner(
                 profile.as_deref(),
                 cmd_override.as_deref(),
                 &runtime.as_ref().map(|r| r.words()).unwrap_or_default(),
+                &layer,
             )
             .map_err(|e| match saved_profile {
                 Some((name, scope)) => {
@@ -9936,13 +9943,15 @@ fn dispatch_inner(
 
             let plan = &resolution.plan;
 
-            // cwd 存在検査
+            // cwd 存在検査（保存した作業ディレクトリなら戻し方も添える。#1732）
             let cwd = plan.cwd.clone();
             if !cwd.is_dir() {
-                return Err(DispatchError::Operation(format!(
-                    "cwd が存在しない: {}",
-                    cwd.display()
-                )));
+                return Err(match layer.cwd {
+                    Some(_) => crate::run_configs::saved_cwd_missing(&cwd, &resolved),
+                    None => {
+                        DispatchError::Operation(format!("cwd が存在しない: {}", cwd.display()))
+                    }
+                });
             }
 
             // シェル指定時はコマンドを包む（包み方は宣言されたシェルの方言で決まる。#875）
@@ -9954,8 +9963,10 @@ fn dispatch_inner(
             };
             // 実行環境の activation（PATH の前置 + `VIRTUAL_ENV` 等）はコマンド文字列の先頭へ
             // 埋める（器の中へ届き、rc が PATH を組み直した後に効く = 境界 B1 の 1 実装。#1730）。
-            // 前に付けるものが無ければ `wrapped` のまま（今と 1 バイトも変わらない）
-            let env = runtime.as_ref().map(|r| r.env()).unwrap_or_default();
+            // 前に付けるものが無ければ `wrapped` のまま（今と 1 バイトも変わらない）。
+            // 実行設定の環境変数（#1732）は実行環境の env の後ろ = 同じ名前なら利用者の値が勝つ
+            let mut env = runtime.as_ref().map(|r| r.env()).unwrap_or_default();
+            env.extend(resolution.env.iter().cloned());
             let path_prepend = runtime
                 .as_ref()
                 .map(|r| r.path_prepend())
@@ -9969,6 +9980,8 @@ fn dispatch_inner(
                     env: &env,
                     path_prepend: &path_prepend,
                     notices: &notices,
+                    // #1732: 実行前コマンド（失敗したら本体を走らせない）
+                    before: resolution.before.as_deref(),
                     command: &wrapped,
                 },
             );
@@ -10076,6 +10089,10 @@ fn dispatch_inner(
             profile,
             runtime,
             reset,
+            args,
+            env,
+            cwd,
+            before,
         } => {
             // #1731: `path` = そのファイル / プロジェクトの実行設定（`ext` = 拡張子既定とは排他）
             if let Some(path) = path {
@@ -10094,11 +10111,25 @@ fn dispatch_inner(
                     profile: profile.as_deref(),
                     runtime: runtime.as_deref(),
                     reset: reset.as_deref(),
+                    args: args.as_deref(),
+                    cwd: cwd.as_deref(),
+                    before: before.as_deref(),
+                    env: env.as_ref(),
                 });
             }
-            if scope.is_some() || profile.is_some() || runtime.is_some() || reset.is_some() {
+            if scope.is_some()
+                || profile.is_some()
+                || runtime.is_some()
+                || reset.is_some()
+                || args.is_some()
+                || env.is_some()
+                || cwd.is_some()
+                || before.is_some()
+            {
                 return Err(DispatchError::InvalidParams(
-                    "scope / profile / runtime / reset は path（対象ファイル）と一緒に渡す".into(),
+                    "scope / profile / runtime / reset / args / env / cwd / before は \
+                     path（対象ファイル）と一緒に渡す"
+                        .into(),
                 ));
             }
             let mut settings = crate::settings::load();
@@ -10607,6 +10638,9 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
         .as_mut()
         .and_then(|snap| crate::run_configs::apply_runtime(snap, &saved).err())
         .map(|u| u.to_json(&resolved));
+    // #1732: 一覧のコマンド・作業ディレクトリも保存した引数・作業ディレクトリで示す（`Run` と同じ層）。
+    // 使えない名前の環境変数は止めずに warnings へ（一覧は直すための入口）
+    let (layer, bad_env) = saved.layer();
 
     let mut resolution = tako_core::resolve_file(
         &resolved,
@@ -10615,6 +10649,7 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
         None,
         None,
         &runtime.as_ref().map(|r| r.words()).unwrap_or_default(),
+        &layer,
     )
     .map_err(|e| DispatchError::Operation(e.to_string()))?;
     // #1950: 子プロセスに聞けば詰められる案内（繋がっている基板の FQBN）を、実行環境の層が
@@ -10640,6 +10675,9 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
         runtime.as_ref(),
         &resolution.plan,
     ));
+    if !bad_env.is_empty() {
+        warnings.push(crate::run_configs::bad_env_names(&bad_env, &resolved).to_string());
+    }
 
     Ok(json!({
         "path": resolved.display().to_string(),
@@ -41033,6 +41071,165 @@ mod tests {
 
         crate::run_configs::update_at(&store, |st| {
             st.projects.remove(&base.display().to_string());
+        })
+        .unwrap();
+    }
+
+    /// #1732: `RunnerDefaults { path, args, env, cwd, before }` で保存 → `Run` が実行ペインの
+    /// 起動コマンドへ env（実行環境の env の後ろ）・実行前コマンド・引数を埋め、作業ディレクトリを
+    /// 当てる（移った先からもファイルが引けるよう `${fileBase}` は絶対パス）。一覧（`RunResolve`）
+    /// のコマンド・作業ディレクトリも同じ。`command` の上書きは保存した層を素通りする
+    #[test]
+    fn issue1732_保存した引数と環境変数と実行前と作業ディレクトリでrunが走る() {
+        let (_s, base, venv, file) = venv_project_1730("dispatch-1732", true);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused();
+        let saved = dispatch(
+            &mut host,
+            Request::RunnerDefaults {
+                ext: None,
+                command: None,
+                remove: false,
+                path: Some(file.display().to_string()),
+                pane: Some(pane.as_u64()),
+                scope: None,
+                profile: None,
+                runtime: None,
+                reset: None,
+                args: Some("x 'y z'".into()),
+                env: Some(std::collections::BTreeMap::from([(
+                    "APP_ENV".to_string(),
+                    Some("it's dev".to_string()),
+                )])),
+                cwd: Some("sub".into()),
+                before: Some("make build".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(saved["updated"].as_array().unwrap().len(), 4, "{saved}");
+
+        let v = run_1730(&mut host, &file);
+        let command = v["command"].as_str().unwrap().to_string();
+        assert!(command.ends_with(" x 'y z'"), "{command}");
+        assert!(
+            command.contains(&tako_core::shell::quote_for_shell(
+                &file.display().to_string()
+            )),
+            "移った先から引けるよう絶対パス: {command}"
+        );
+        assert_eq!(v["cwd"], base.join("sub").display().to_string().as_str());
+        for field in ["args", "env", "cwd", "before"] {
+            assert_eq!(v["config_sources"][field], "file", "{field}: {v}");
+        }
+        // 起動コマンド = 実行環境の env → 実行設定の env → PATH → 実行前コマンドの門 → 本体
+        let env = vec![
+            ("VIRTUAL_ENV".to_string(), venv.display().to_string()),
+            ("APP_ENV".to_string(), "it's dev".to_string()),
+        ];
+        let path_prepend = vec![venv_interpreter_1730(&venv)
+            .parent()
+            .unwrap()
+            .display()
+            .to_string()];
+        let launch = tako_core::platform::shell::compose_run_script(
+            tako_core::platform::shell::run_pane_dialect(),
+            &tako_core::platform::shell::RunScript {
+                env: &env,
+                path_prepend: &path_prepend,
+                before: Some("make build"),
+                command: &command,
+                ..Default::default()
+            },
+        );
+        let run_pane = v["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&run_pane).expect("options 記録");
+        assert_run_pane_command(opts.command.as_ref().expect("command"), &launch, run_pane);
+        assert_eq!(opts.cwd.as_deref(), Some(base.join("sub").as_path()));
+        assert!(
+            opts.env.is_empty(),
+            "SpawnOptions.env は器へ届かないので使わない"
+        );
+
+        // 一覧も同じコマンド・作業ディレクトリ
+        let r = dispatch(
+            &mut host,
+            Request::RunResolve {
+                path: file.display().to_string(),
+                pane: Some(pane.as_u64()),
+                refresh: false,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(r["profiles"][0]["command"], command.as_str(), "{r}");
+        assert_eq!(
+            r["profiles"][0]["cwd"],
+            base.join("sub").display().to_string().as_str()
+        );
+        assert_eq!(r["config"]["env"]["APP_ENV"]["value"], "it's dev");
+
+        // `command` の上書きは保存した層（引数・env・実行前・作業ディレクトリ）を素通りする
+        let over = dispatch(
+            &mut host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(pane.as_u64()),
+                tab: None,
+                profile: None,
+                command: Some("echo 1732".into()),
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+                new_pane: Some(true),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(over["command"], "echo 1732");
+        assert_eq!(over["cwd"], base.display().to_string().as_str());
+        let plain = tako_core::platform::shell::compose_run_script(
+            tako_core::platform::shell::run_pane_dialect(),
+            &tako_core::platform::shell::RunScript {
+                env: &env[..1],
+                path_prepend: &path_prepend,
+                command: "echo 1732",
+                ..Default::default()
+            },
+        );
+        let over_pane = over["pane"].as_u64().unwrap();
+        let opts = host.attached_options.get(&over_pane).expect("options 記録");
+        assert_run_pane_command(opts.command.as_ref().expect("command"), &plain, over_pane);
+
+        // 保存した作業ディレクトリを消すと、既定へ落とさずに戻し方つきで止まる（ペインは割らない）
+        std::fs::remove_dir_all(base.join("sub")).unwrap();
+        let panes = host.ws.active_tab().tree().panes().len();
+        let pane_id = host.ws.active_tab().tree().focused();
+        let err = dispatch(
+            &mut host,
+            Request::Run {
+                path: file.display().to_string(),
+                pane: Some(pane_id.as_u64()),
+                tab: None,
+                profile: None,
+                command: None,
+                direction: None,
+                ratio: None,
+                auto_close: None,
+                focus: None,
+                new_pane: Some(true),
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect_err("消えた作業ディレクトリで走らせない");
+        assert!(err.to_string().contains("--reset cwd"), "{err}");
+        assert_eq!(host.ws.active_tab().tree().panes().len(), panes);
+
+        let store = crate::run_configs::store_path().expect("テストの data dir");
+        crate::run_configs::update_at(&store, |st| {
+            st.files.remove(&file.display().to_string());
         })
         .unwrap();
     }
