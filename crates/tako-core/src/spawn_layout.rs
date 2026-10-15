@@ -71,6 +71,25 @@ pub const DEFAULT_MASTER_RATIO: f32 = 0.5;
 /// Legacy ポリシーでの新ペイン側取り分（従来の spawn 分割比率）
 pub const LEGACY_WORKER_SHARE: f32 = 0.45;
 
+/// #2133 の A/B。`TAKO_2133_LEGACY=1` で、master の引き継ぎを worker 領域の判定に持ち込まない
+/// 旧挙動へ戻す（後任は前任の worker を自分の worker と見なさない・master の role のペインも
+/// worker に数える・閉じたペインを指す spawn 元を後任へ読み替えない・前任を閉じても worker の
+/// spawn 元を後任へ付け替えない）。後任から spawn すると後任自身が右分割され、master が潰れる
+pub fn issue2133_legacy() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ISSUE2133_FORCE_LEGACY.with(std::cell::Cell::get) {
+        return forced;
+    }
+    std::env::var("TAKO_2133_LEGACY").is_ok_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// テストから腕を決める（env はプロセス全体なので並列のテストで取り合いになる）
+    pub(crate) static ISSUE2133_FORCE_LEGACY: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// worker ペイン 1 枚に保証する最小の桁数（#1132）の既定値。
 ///
 /// # なぜ 60 桁か

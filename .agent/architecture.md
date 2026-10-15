@@ -284,6 +284,11 @@ worker spawn の配置を「呼び出し元の右に等分割」から差し替�
   `PaneTree::reflow_workers(anchor, algorithm)`（`pane_tree.rs`）。
   **worker 領域 = anchor Leaf から根へのパス上で anchor と反対側にあり、全リーフの
   `spawned_by` チェーンが anchor へ到達するサブツリー**（最も近い祖先を優先）。
+  #2133: 到達先は anchor の持ち主（`spawn_owners` = anchor が master の role なら、
+  引き継いだ前任 master と閉じた spawn 元も含む）で、master の role のペインは worker に
+  数えない。閉じた spawn 元を渡されたリフロー / 領域の読み取りは後任へ読み替える
+  （`live_spawn_anchor`）。前任 master を閉じた経路は `Workspace::hand_over_spawned` で
+  worker の `spawned_by` を後任へ付け替える（引き継ぎを重ねても系譜が切れない）。
   領域が無ければ anchor を右分割して新設（anchor 側に master_ratio を残す）、
   あれば領域内の Pane を集めて理想形に再構築する（= anchor・領域外ペインの
   ratio / rect には一切触れない）。ユーザーペインが混在したサブツリーは領域と

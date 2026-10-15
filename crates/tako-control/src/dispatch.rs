@@ -5259,7 +5259,10 @@ fn dispatch_inner(
 
             let closed = tree_mut(host.workspace_mut(), tab).close(target);
             match closed {
-                Ok(_) => {
+                Ok(closed_pane) => {
+                    // #2133: 引き継ぎの前任 master なら、その worker の spawn 元を後任へ付け替える
+                    // （後任から spawn しても後任自身を割らない。master 以外は no-op）
+                    let _ = host.workspace_mut().hand_over_spawned(&closed_pane);
                     // Issue #165: worker が抜けた領域を残りの worker で再配分する
                     // （master・ユーザー由来ペインの矩形は変わらない）
                     if let Some(anchor) = reflow_anchor {
@@ -45834,6 +45837,89 @@ mod tests {
         );
         // 新しいタブは全幅なので下限を満たす
         assert_eq!(plan.predicted_cols, Some(124));
+    }
+
+    /// #2133: dispatch の Close で引き継ぎの前任 master を閉じると、前任の worker の spawn 元が
+    /// 後任へ移る。後任からの spawn の見積もりは右の worker 領域を見て（後任を割る見積もりに
+    /// ならない）、worker を閉じたときのリフローも後任の領域で効く
+    #[test]
+    fn issue2133_前任masterをcloseするとworkerが後任へ移り後任の領域で見積もる() {
+        let mut host = MockHost::new();
+        // 400 桁のタブ: master 半分 = 200 桁、worker 領域 200 桁
+        host.tab_cols = Some(400.0);
+        let (tab, a) = layout_with_workers(&mut host, 1);
+        let tree = host.ws.get_tab_mut(tab).unwrap().tree_mut();
+        let w0 = tree
+            .panes()
+            .iter()
+            .map(|p| p.id())
+            .find(|&id| id != a)
+            .unwrap();
+        tree.get_mut(a)
+            .unwrap()
+            .set_role(Some("orchestrator-master:dev".into()));
+        tree.get_mut(w0)
+            .unwrap()
+            .set_role(Some("orchestrator-worker:p".into()));
+        // 引き継ぎ（dispatch の handoff と同じ: 前任を右分割 + spawned_by = 前任 + master の role）
+        let b_pane = Pane::new(PaneOrigin::Mcp);
+        let b = b_pane.id();
+        tree.split(a, tako_core::SplitDirection::Right, b_pane)
+            .unwrap();
+        let bp = tree.get_mut(b).unwrap();
+        bp.set_spawned_by(Some(a));
+        bp.set_role(Some("orchestrator-master:dev".into()));
+
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(a.as_u64()),
+                force: false,
+                caller_role: Some("orchestrator-master:dev".into()),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let tree = host.ws.get_tab(tab).unwrap().tree();
+        assert_eq!(tree.get(w0).unwrap().spawned_by(), Some(b));
+        assert_eq!(tree.get(b).unwrap().spawned_by(), None);
+        assert_eq!(tree.worker_area_panes(b), Some(vec![w0]));
+        // 後任から足す見積もり: 右の 200 桁の領域を上下に分ける = 200 桁
+        // （旧挙動は後任 B（200 桁）を割って新しい領域を作る = 100 桁）
+        let layout = tako_core::SpawnLayoutConfig::default();
+        let plan = plan_worker_placement(&host, tab, b, &layout, PlacementArm::SameTab);
+        assert_eq!(plan.predicted_cols, Some(200));
+
+        // 後任から 2 体足す（spawn と同じ手順）→ 右の領域は左列 w0 / n1 + 右列 n2
+        let tree = host.ws.get_tab_mut(tab).unwrap().tree_mut();
+        let mut spawn_from_b = || {
+            let pane = Pane::new(PaneOrigin::Mcp);
+            let id = pane.id();
+            tree.spawn_worker(b, pane, &layout).unwrap();
+            let p = tree.get_mut(id).unwrap();
+            p.set_spawned_by(Some(b));
+            p.set_role(Some("orchestrator-worker:p".into()));
+            id
+        };
+        let n1 = spawn_from_b();
+        let n2 = spawn_from_b();
+        // w0 を閉じたリフローは後任の領域で効く（残り 2 体が上下に組み直る）
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(w0.as_u64()),
+                force: true,
+                caller_role: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let tree = host.ws.get_tab(tab).unwrap().tree();
+        let rects = tree.layout(tako_core::Rect::UNIT);
+        let rect = |id: PaneId| rects.iter().find(|(p, _)| *p == id).unwrap().1;
+        assert_eq!((rect(b).x, rect(b).width), (0.0, 0.5));
+        assert_eq!((rect(n1).x, rect(n1).y, rect(n1).width), (0.5, 0.0, 0.5));
+        assert_eq!((rect(n2).x, rect(n2).y, rect(n2).width), (0.5, 0.5, 0.5));
     }
 
     #[test]
