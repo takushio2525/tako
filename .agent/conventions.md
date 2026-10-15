@@ -2896,14 +2896,15 @@ Windows（約 30 分）を回した。macOS のランナーは同時に数本し
 順番待ちになり、コードの PR もその後ろに並んだ（1 本で最大 100 分）。そこで先頭の
 判定ジョブ `changes` が差分を見て、**docs だけなら macOS / Windows のジョブを `if:` で skip する**。
 
-- **docs だけ = 変更パスが全部 `docs/` 配下か `.agent/` 配下の `.md` で、生成ページ
-  （`docs/src/content/docs/windows-support.md` / `agent-support.md`）を含まない**。
+- **docs だけ = 変更パスが全部 `docs/` 配下か `.agent/` 配下の `.md` で、対応状況ページのデータ
+  （`docs/src/data/windows-support.json` / `agent-support.json`）とその書式を持つ
+  `docs/scripts/support-pages.mjs` を含まない**（#2104。ページ本体はコミットしない）。
   型は `scripts/ci-change-scope.sh` の `DOCS_ONLY` / `RUST_REQUIRED` が正。ルートの md
   （`AGENTS.md` / `CHANGELOG.md` / `README.md`）・`scripts/`・`.github/`・`Cargo.*`・`web/` は
   1 つでも触れば全部走る。**迷うものは走らせる側**（差分が空・取れない・HEAD が merge
   コミットでない・push の before が取れない・想定外のイベント）
-- 生成ページを例外にするのは、macOS ジョブが tako バイナリの出力と突き合わせる
-  （`gen-*-docs.mjs --check`）ため。手で直した生成ページを docs だけとして通すと、
+- 対応状況ページのデータを例外にするのは、macOS ジョブが tako バイナリの出力と突き合わせる
+  （`gen-*-docs.mjs --check`）ため。手で直したデータを docs だけとして通すと、
   main で初めて食い違いが見つかる
 - 差分は **CI が組み合わせた merge コミットの第 1 親から**取る（`pull_request` の checkout は
   `refs/pull/<PR>/merge`。base 側で進んだ変更を混ぜない）。push は `github.event.before` から
@@ -3516,6 +3517,38 @@ robots.txt から辿れることを確かめる。URL を渡すと配信中の�
 `title` のまま。末尾の「| tako」は `docs/src/starlightRouteData.ts` が付ける）。構造化データは
 実態どおりのものだけを `docs/src/structuredData.ts` の 1 か所で組む（評価の無い
 SoftwareApplication は書かない）。
+
+## 対応状況ページはマトリクスの写しから組む（Issue #2104）
+
+Windows 対応状況（`windows-support`）とエージェント別の対応状況（`agent-support`）の 2 ページは、
+**ページ（md）をコミットせず、マトリクスの写し（`docs/src/data/windows-support.json` /
+`agent-support.json`）をコミットする**。ページは docs のビルドが写しから組む
+（`docs/scripts/support-pages.mjs`。`astro.config.mjs` の integration が build / dev の頭で呼ぶので、
+Cloudflare Pages がどのコマンドで組んでも同じ。Pages のビルド環境には Rust も tako も無い）。
+
+以前はページそのものをコミットしていて、2026-10-15 の 1 晩で 3 回、対応表の別々の行を直す並列の
+PR が衝突した（#2095 で 2 回・#2099 で衝突 + CI の赤）。ページには**どの行を直しても書き換わる行**
+（「全体」の件数・節ごとの件数・系統ごとの件数）と、対応表では離れているのに**ページでは隣り合う行**
+があるため。しかも両側の件数の行が同じ値に変わると git は衝突させずに通し、merge 後の件数が
+誤ったまま main の `--check` が赤くなる（`scripts/test-support-snapshot-merge-2104.sh` を
+`TAKO_2104_GEN_REF=<修正前の ref>` で回すと再現する）。
+
+- **写しに件数を持たせない**（ページが数える。`gen-*-docs.mjs` は数えた値が tako 本体の集計と
+  一致することを確かめてから書く）。**1 行 = 1 フィールドに整形し、並びは対応表と同じ**
+  （key の辞書順）。1 行 = 1 機能に詰めると、対応表で隣り合う 2 行を別々の PR が直したとき
+  写しの隣り合う 2 行が変わり、git はそれを衝突として扱う
+- 衝突が残るのは**同じ機能を両方が直す**とき・**対応表の同じ場所へ行を足す**ときだけで、
+  これは対応表（`support.rs` / `agent_support.rs`）そのものも衝突する形。対応表の衝突を解いて
+  `node scripts/gen-*-support-docs.mjs` で作り直せば解ける（写しを手で直さない）。
+  行を足すときの分類（`support-pages.mjs` の CATEGORIES）は、同じ節の同じ位置へ並列で足すと衝突する
+- 番犬は `scripts/test-support-snapshot-merge-2104.sh`（CI の `docs` ジョブ）。tako のスタブで
+  別々の行を直す PR を 2 本模して merge し、後の PR が衝突しないこと・merge 後も `--check` が
+  緑のことを見る
+- ページを読む側（`docs/src/components/motion/windowsSupport.ts` の `?raw`・OG 画像の生成・
+  promo の撮影）はビルドが組んだページを読む。ビルドを通らずにページを読むスクリプトを足すなら、
+  先に `node docs/scripts/support-pages.mjs` を呼ぶ（`generate-og.mjs` / `scripts/promo/lib.sh` と同じ）
+- 置き場の変更は docs のリポジトリ内のファイルの話で、利用者の設定・データ（#916 の自動
+  マイグレーションの対象）には当たらない
 
 ## 個人情報を現行コードへ書かない（Issue #927）
 

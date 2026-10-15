@@ -399,6 +399,8 @@ LOG
     # 画面に出さないよう、リポジトリから /private/tmp 配下へ写しを置く）
     cp "$repo/README.md" "$PROMO_DEMO/tako-docs/README.md"
     cp "$repo/LICENSE" "$PROMO_DEMO/tako-docs/LICENSE"
+    # このページはコミットせず docs のビルドが写しから組む（#2104）ので、写す前に組んでおく
+    node "$repo/docs/scripts/support-pages.mjs" >/dev/null
     # docs の frontmatter（--- title/description ---）は md プレビューでは本文として描かれるので
     # 見出しに置き換える
     { echo "# Windows 対応状況"; echo;

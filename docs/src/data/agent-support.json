@@ -1,0 +1,1409 @@
+{
+  "_note": "生成物（scripts/gen-agent-support-docs.mjs）。手で直さず能力マトリクスを直して作り直す（#2104）",
+  "agents": [
+    {
+      "key": "claude",
+      "label": "Claude Code",
+      "baseline": true
+    },
+    {
+      "key": "codex",
+      "label": "OpenAI Codex CLI",
+      "baseline": false
+    },
+    {
+      "key": "agy",
+      "label": "Antigravity CLI",
+      "baseline": false
+    },
+    {
+      "key": "local",
+      "label": "Local LLM",
+      "baseline": false
+    }
+  ],
+  "features": [
+    {
+      "key": "account_switch",
+      "summary_ja": "アカウント（資格情報）の切替に追従する",
+      "evidence": "source",
+      "evidence_detail": "orchestrator/agent.rs の事前信頼は claude だけ CLAUDE_CONFIG_DIR（#512 / #558）を 見て書き先を決め、codex は ~/.codex/config.toml、agy は ~/.gemini/antigravity-cli/settings.json を固定で開く（同ファイルのコメントが明示）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "agent_select_at_spawn",
+      "summary_ja": "worker を立てるときに系統を選べる（設定の書き換えや再起動なしで）",
+      "evidence": "source",
+      "evidence_detail": "orchestrator/agent.rs の WorkerAgent が spawn 引数・プロファイルの両方から 解決され、build_worker_cmd_in が 3 系統ぶんのコマンドを組む。ペイン単位・タスク単位の切替導線は #988",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "claude_mod_band",
+      "summary_ja": "エージェントの画面の中（プロンプトの上の帯 1 行・/tako のサイドバー・入力欄の下の行の使用制限 / ctx のバー）に tako のペイン・タブ・worker と要注意の数を出す。利用者の他の拡張の帯は消さない",
+      "evidence": "measured",
+      "evidence_detail": "#1881: Claude Code 2.1.294 の mod（AbovePrompt の帯・$.ui.open のペイン・$.store のトグル）を隔離 GUI のペインと 80 / 144 / 300 桁の隔離 tmux で実 claude に描かせ、帯が 1 行に収まること・ダイアログの後に戻ること・トグルが再起動後も保たれることを画面の capture で確かめた（scripts/test-claude-mod-band-1881.sh）。#1962: 帯は next(e) の答え（他の mod の行）を包む形にし、帯を描く別の mod と読み込み順を入れ替えて両方の行が出ること・PromptHint の末尾のバーが出て同じときにステータスバーの claude の区画が消え報告を止めて 45 秒で戻ること・statusLine が ctx を出す構成では描かないことを一時の設定 dir の実 claude で確かめた（scripts/test-mod-band-buttons-1962.sh）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "claude_mod_buttons",
+      "summary_ja": "エージェントの画面の中（プロンプトの上の帯）に定型のカスタムボタン（既定は /compact。組み込みコマンド・tako の操作・新しいペインで実行するコマンド・入力欄へ入れる文）を描き、キーで押して実行する",
+      "evidence": "measured",
+      "evidence_detail": "#1962: 一時の設定 dir の実 Claude Code 2.1.294 で、帯の /compact のボタンを ctrl+x → Tab → ホットキーで押すと会話が圧縮され、tako の操作（split right）のボタンで隔離 GUI のペインが増えた。押した結果（種類と成否）は tako mod の行の report.last_press に出る（scripts/test-mod-band-buttons-1962.sh）。クリックで押すのは tako がクリックを TUI へ渡す #1961 から",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "claude_mod_cards",
+      "summary_ja": "AI が出したコマンドカードをエージェントの画面の中（会話の行と入力欄の上の帯）に描き、キーでコピー / 新しいペインで実行する（描いたカードはペイン下のカード帯に出さない = 画面が縮まない）",
+      "evidence": "measured",
+      "evidence_detail": "#1963: 一時の設定 dir の実 Claude Code 2.1.294 に偽 Messages API で tako の MCP の tako_show_command を呼ばせ、会話の行のカードと帯の card N / y: copy / r: run が出て、ペインの行数が 0.1 秒おきの採取（47 回）で一度も縮まない（GPUI のカード帯が出ない）こと・帯のキーで Run すると新しいペインと実行記録が付くこと（全画面とmain screen）・Copy が 157 字の論理文字列を改行なしで渡すこと・報告が途切れると 45 秒、claude が終わると 0.2 秒（1 tick 以内）で GPUI の帯へ戻ることを確かめた（scripts/test-mod-command-cards-1963.sh）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "claude_mod_install",
+      "summary_ja": "tako setup がエージェントの設定 dir ごとに tako の拡張を入れる（管理印つき・同名の他の拡張があれば入れない・tako mod uninstall で外せる）",
+      "evidence": "measured",
+      "evidence_detail": "#1959: 一時の設定 dir 2 つへ tako setup の段が skills/tako の写しを置き、実物の Claude Code 2.1.294 の claude plugin list に tako@skills-dir（enabled）・デバッグログに hooks module tako@skills-dir が出た。env の注入と同時でも hooks module は tako@inline の 1 つだけ・利用者の skills/tako と別の出どころの 同名 tako には触らない・uninstall で写しだけが消えることを確かめた（scripts/test-mod-skills-1959.sh）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "claude_mod_state",
+      "summary_ja": "エージェントの中で動く拡張（tako mod）から ctx・使用制限・ターン・権限待ちを構造で受け取る",
+      "evidence": "measured",
+      "evidence_detail": "#1879: Claude Code 2.1.294 の mod を env CLAUDE_CODE_PLUGIN_DIRS で注入し、隔離 GUI の直接ペインと tmux ペインの両方で tako mod report が届いて tako mod の行に ctx・使用制限・turn・model が載った（scripts/test-claude-mod-1879.sh）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "claude_mod_ui",
+      "summary_ja": "エージェントの画面の中の UI（カスタムボタン・使用量のバー・帯の区切り・色）の設定を、選ぶだけの定型の口（ui.json）で持ち、検証済みの値をエージェントの中の拡張へ届ける",
+      "evidence": "unit-test",
+      "evidence_detail": "#1960: tako_core::claude_mod_ui の単体（語彙の外の値は書かずに許される値を返す・ランダムな操作列 1,000 通りで常に形を満たす・壊れた ui.json は読める部分で動き .unreadable.bak へ保全）、dispatch の issue1960_*（報告の応答の tako.view.ui に検証済みの値が載り、変更が次の報告で届く）、issue1960_mod_ui_watchdog（CLI / MCP / setup の 3 つの口で ui.json が字面で一致）。mod が効かせるのは今は帯のトグルで、ボタン・バー・区切り・色の描画は #1962",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 1885
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "effort_control",
+      "summary_ja": "thinking / reasoning effort を tako から指定する",
+      "evidence": "measured",
+      "evidence_detail": "#1002 の実測（agy 1.1.22）: `--effort（low|medium|high）` が --help に実在し、`agy models` が挙げる 6 モデルすべてで不正値が `invalid --effort \"bogus\" (valid: low, medium, high)` として咎められる = 表示名に \"(High)\" 等を含むモデルでも --effort の検証が走る。正しい組み合わせは 検証を通り API 呼び出しへ進む。**未知のモデル名のときだけ** `--effort is not supported for model \"…\"` になる（この文言を「agy は effort 非対応」と 読み違えないこと）。orchestrator/agent.rs は claude = --effort / codex = -c model_reasoning_effort= / agy = --effort へ写像する（旧挙動は TAKO_1002_LEGACY=1）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "git_resolve_agent",
+      "summary_ja": "コンフリクト解消エージェントとして起動する（#496）",
+      "evidence": "source",
+      "evidence_detail": "dispatch.rs の git resolve は worker spawn と**同じ `WorkerLaunch`**（#986 で              `tako_bin` を配線済み）を通るので、MCP の一時注入も同じ 1 実装で効く。             番犬 `worker_mcp_injection_watchdog::worker_を起動する経路は_tako_bin_を渡している` が              片方だけ配線が落ちる形を落とし、MCP が実際に通ることは worker 経路で実測済み              （WORKER_MCP 行）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "limit_autocontinue_upstream",
+      "summary_ja": "エージェント CLI 自身が上限解除後に続行する（同じプロセスが生き続けているあいだだけ。#1140）",
+      "evidence": "by-design",
+      "evidence_detail": "#1140 の実物調査（claude 2.1.258 の実装ソースをバイナリから採取）: 上限の API エラーを受けた時点で `bUn(quotaLimits, …)` が**ダイアログ無しで**自動的に armed へ入り、解除時刻 + 30〜90 秒のジッタで自分へ継続プロンプト （`Your claude.ai usage limit has reset. Continue the task you were working on …`）を投げる。設定キーは `autoContinueAtUsageLimit`（**未設定なら ON**）、ゲートは `tengu_marble_heron` の `enabled` / `autoArm`（未設定なら ON）。連続の張り直しは 2 回まで（`rearm_cap`）、自動 arm は解除が 24 時間より 先だと張らない（`horizon_exceeded`）。**上限ダイアログの `Stop and wait for limit to reset`（値 `cancel`）は arm しない**: 継続が既にキューへ入っているか episode が stale なら**解除**し、それ以外はメニューを閉じるだけ。arm する選択肢は別で、`Wait here, then continue automatically …`（値 `auto-resume`）。`escape` / `ctrl_c` / `kill_agents_chord` / 手入力の送信 / `conversation_reset`（clear / resume / remote_attach）/ `account_switch` / `relaunch` / `process_exit` で解除される。**codex 0.153.0 と agy 1.1.27 のバイナリには相当する文字列が 1 件も無い** （`continue automatically` / `auto_resume` / `auto-resume` / `autoResume` / `wait for limit` / `resume automatically` が各 0 件。同じ走査で codex の `hit your usage limit` は 7 件・`Try again at` は 1 件当たるので走査は有効）。**解除時刻をまたぐ実機観測は行っていない**（実装ソースからの判定）",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "agy はクレジットを使い切っても「解除を待つ」出口が無い（買い足す導線しか無い）ので、待って再開するという動作が成立しない（#985）"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "unsupported",
+          "note_ja": "codex の CLI には上限解除を待って自分で続行する仕組みが無い（止まったままなので tako 側のナッジが唯一の再開手段）"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので利用上限という概念が無い"
+        }
+      }
+    },
+    {
+      "key": "limit_service_switch",
+      "summary_ja": "ステータスバーの利用制限表示をこの系統へ切り替えられる（#217 / #357）",
+      "evidence": "measured",
+      "evidence_detail": "#985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を 読む形になり、有料プランの実データが出る。agy は取得不能を再確認して unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持）。#1903（claude）: tako mod の報告があれば 5h / 7d はその値、無ければ画面 （取得元は tako limit-service --refresh の claude.source）",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査）"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "master_auto_handoff",
+      "summary_ja": "ctx% が閾値を超えたら自分で引き継ぐ（#749）",
+      "evidence": "source",
+      "evidence_detail": "#749 の発火材料は画面由来の ctx%。codex 側のパターンは terminal.rs にあるが 採取 fixture が無く、実際に描画されるかは未確認（棚卸し §10 の 2 番）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy は worker 専用で、master / solo としては起動前にエラーになる（#127）",
+          "issue": 987
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "master_ctx_percent",
+      "summary_ja": "コンテキスト残量を画面から読み取れる",
+      "evidence": "measured",
+      "evidence_detail": "#984: rollout の token_count に last_token_usage.total_tokens と model_context_window があり、worker_status の ctx_percent へ載せた（実測で 8%）。master の #749 は terminal.rs の画面パターンを見る別経路なのでそこは未確認。#1033: agy の実況 JSONL は状態と発話を持つがトークン数は持たない。#1880（claude）: tako mod の報告があれば一次ソース（ctx_source=mod。窓も claude が答える）、無ければ画面 → transcript。statusLine を外した実 claude で 4 経路が mod を返し、報告を止めると 45 秒後に落ちて ctx_mod_reason=mod_stale が出た（scripts/test-mod-primary-1880.sh）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy の実況ログ（brain/<id>/.system_generated/logs/transcript.jsonl）には codex の token_count に相当するトークン数が無く、残量は対話の画面にも常時出ないので読む口が無い（#1033 で agy 1.1.27 の全ステップ種別を確認）",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "degraded",
+          "note_ja": "worker の状態照会では構造化ソースから ctx% が取れるが、master の自動ハンドオフは画面のパターンを見るので master 経路では未確認"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "master_handoff",
+      "summary_ja": "master の引き継ぎ（後任の spawn と管轄の受け渡し）が通る",
+      "evidence": "source",
+      "evidence_detail": "handoff の後任は build_master_cmd_in（orchestrator/mod.rs）を通るので master が起動できる系統では通る。agy はその関数に到達しない",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy は worker 専用で、master / solo としては起動前にエラーになる（#127）",
+          "issue": 987
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "master_launch",
+      "summary_ja": "master オーケストレーターとして起動する（`tako master`）",
+      "evidence": "source",
+      "evidence_detail": "orchestrator/mod.rs の build_master_cmd_in は claude / codex で分岐し、agy は unreachable!() で到達しない（#127 の設計判断。前提の再評価は #987）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy は worker 専用で、master / solo としては起動前にエラーになる（#127）",
+          "issue": 987
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "master_mcp",
+      "summary_ja": "master が tako の MCP ツール群を呼べる",
+      "evidence": "source",
+      "evidence_detail": "orchestrator/mod.rs が codex へ -c mcp_servers.tako.* を起動時に一時注入する （恒久登録はしない = tako 外の codex にツールを出さない。FR-2.3.2）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy は worker 専用で、master / solo としては起動前にエラーになる（#127）",
+          "issue": 987
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "master_system_prompt",
+      "summary_ja": "master の system prompt がモデルへ届く",
+      "evidence": "source",
+      "evidence_detail": "claude は --append-system-prompt-file、codex は developer_instructions で注入する （orchestrator/mod.rs）。agy の注入手段（custom agent 定義の起動時選択）は 公式ドキュメントに記載が無く #987 で実機確認する",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy は worker 専用で、master / solo としては起動前にエラーになる（#127）",
+          "issue": 987
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "remote_control",
+      "summary_ja": "会話をベンダー公式のリモート操作（スマホアプリ / Web）へ委譲できる（#1068）",
+      "evidence": "measured",
+      "evidence_detail": "#1068 の実測（2026-09-02）: claude 2.1.232 の `--help` に `--remote-control [name]  Start an interactive session with Remote Control enabled` が在り、tako は build_master_cmd_in / build_worker_cmd_in の claude 分岐でこれを渡す。codex 0.150.1 の `--help` には `remote-control  [experimental] Manage the app-server daemon with remote control enabled` と `--remote <ADDR>` があるが自前ホストの app-server 経路で別物。agy 1.1.23 の `--help` 全件にはリモート操作の口が無い",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "agy の `--help` 全件（フラグ 24 / サブコマンド 11）にリモート操作の口が無い（`mic-serve` はマイクを別ホストへ配るだけ）ので、会話を外の端末から操作する手段がそもそも無い"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "codex にも remote-control（experimental）はあるが、これは自前で app-server デーモンを立てて websocket + bearer トークンで TUI を繋ぐ形で、ベンダー側のスマホアプリへ会話を出すものではない。tako 側の配線も無い",
+          "issue": 1059
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "restore_after_reboot",
+      "summary_ja": "PC 再起動（tmux サーバーごと消える）後の復元で会話ごと戻る（#1238）",
+      "evidence": "measured",
+      "evidence_detail": "#1238 の実測（2026-09-09 / codex-cli 0.153.0 / agy 1.1.27）: 生きた codex は $CODEX_HOME/thread-writer-locks/<id>.lock を、生きた agy は ~/.gemini/antigravity-cli/brain/<id> を開いたまま持つ（#1033 の実測）。ペイン → 子孫 pid → lsof でその ID を採り layout.json へ保存すると、tmux サーバーを kill したあとの復元で `codex resume <id>` / `agy --conversation <id>` が会話を履歴ごと戻した。**Windows は lsof が無いので ID を採れない**（復元の内訳は `resume 非対応` と出す。判定は tako_core::agent_resume::restore_support）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "resume_launch_args",
+      "summary_ja": "会話を再開するとき、元の起動と同じ引数（モデル・effort・system prompt・許可モード・Remote Control）で立てる（#1967）",
+      "evidence": "source",
+      "evidence_detail": "tako-control/src/resume_launch.rs が master / solo は build_master_cmd、worker は build_worker_cmd（元の起動の正本）で組んで `--resume <id>` を足す。claude 以外は 起動の引数を resume へ持ち込めない・持ち込まない（`codex resume` は --model を受けない = agent_resume::ResumeSpec の accepts_launch_flags）ので従来のカタログのメタだけの組み立てに残る",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "session_restart_handoff",
+      "summary_ja": "引き継ぎを書かせてセッションを交代する（#1067。ペインの右クリック / `tako session-restart --mode handoff`）",
+      "evidence": "source",
+      "evidence_detail": "引き継ぎ再起動は master ペインへ定型文を送り、エージェント自身が              tako_orchestrator_handoff を呼ぶ形（handoff.rs の restart_prompt）。             codex master は #979 で MCP が届くので成立しうるが未実測。             agy は master になれない（#987）ので対象そのものが無い",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy は worker 専用で、master / solo としては起動前にエラーになる（#127）",
+          "issue": 987
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "手段は揃っているが実機で確かめていない（claude で先行実装した）",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "session_restart_harness",
+      "summary_ja": "会話を保ったまま CLI プロセスだけ建て直す（#1067。CLI の自動更新に追いつく手段）",
+      "evidence": "source",
+      "evidence_detail": "resume コマンド自体は #1238 で 3 系統ぶん組めるようになった（agent_resume::resume_spec）。残る欠けは**ペイン → 会話 ID の解決**で、session_restart は claude の検出（agents --json / セッションカタログ）に依るため codex / agy では ID が出てこない。#1238 が採る ID は復元用に layout.json へ保存する経路で、まだここへは配線していない",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "sessions_catalog",
+      "summary_ja": "会話がセッションカタログに索引される（#112）",
+      "evidence": "source",
+      "evidence_detail": "sessions.rs の昇格は claude のセッション検出（transcript）に依存する。3 系統とも spawn 時に pending 記録は作られるが、claude 以外は昇格しない",
+      "agents": {
+        "agy": {
+          "status": "degraded",
+          "note_ja": "spawn の記録は残るが、会話の実体を索引できないので pending のまま期限切れで消える"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "degraded",
+          "note_ja": "spawn の記録は残るが、会話の実体を索引できないので pending のまま期限切れで消える"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "sessions_resume",
+      "summary_ja": "過去の会話を復元して続ける（`tako sessions resume`）",
+      "evidence": "source",
+      "evidence_detail": "コマンドの組み立ては #1238 で 3 系統に広がったが、`tako sessions resume` が引くのはカタログ本体（entries）で、そこへ昇格するのは claude だけ（sessions_catalog 参照）。codex / agy の会話は pending にしか残らないので一覧に出ない。dispatch.rs の実在確認も ~/.claude/projects の transcript 固定",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "setup_auth_check",
+      "summary_ja": "setup が認証済みかどうかを判定できる",
+      "evidence": "source",
+      "evidence_detail": "tako-cli/src/setup.rs のプラン解決は認証済み・導入済みの provider だけを巡る （#262）。agy は provider としてプランを返さない",
+      "agents": {
+        "agy": {
+          "status": "degraded",
+          "note_ja": "認証の有無は分かるがプランを取れないので、推奨プロファイルの規模を決められない"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "setup_auth_launch",
+      "summary_ja": "未認証なら setup がその系統のログインコマンドを案内する",
+      "evidence": "measured",
+      "evidence_detail": "#989: `setup_bootstrap::auth_instructions_for` が claude = `claude auth login` / codex = `codex login` / agy = 引数なしの `agy` を案内する（agy は専用の ログインサブコマンドを持たず、公式 docs の sign-in も引数なし起動）。ログイン自体はブラウザ操作が要るので tako は 3 系統とも代行しない（#1129）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "setup_cli_install",
+      "summary_ja": "CLI 自体が入っていない環境へ setup が導入する（#868）",
+      "evidence": "measured",
+      "evidence_detail": "#989: platform/agent_install.rs の recipe() が 3 系統 × 2 プラットフォームぶんの 公式手順を持ち、まっさら HOME + PATH 剥ぎで 3 系統とも `tako setup bootstrap install` が通る（実測）。**Windows の実行代行は claude だけ** （codex / agy は can_run=false = 状態照会と案内まで。#525）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "setup_detect",
+      "summary_ja": "setup がこの CLI の導入を検出する",
+      "evidence": "source",
+      "evidence_detail": "setup.rs の SetupAgent が 3 系統を列挙し、platform::exe::find（B16）で解決する",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "setup_mcp_register",
+      "summary_ja": "setup が tako の MCP サーバーをこの CLI へ恒久登録する",
+      "evidence": "measured",
+      "evidence_detail": "#979（main の 63a7c26）で `tako setup-mcp` が 3 系統へ登録するようになった。書き先は claude = ~/.claude.json / codex = ~/.codex/config.toml の [mcp_servers.tako] / agy = ~/.gemini/config/mcp_config.json で、codex は env_vars 許可リストまで足して実セッションから tako_list_panes が通ることを実測。正本は tako-control::agent_mcp",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "setup_model_picker",
+      "summary_ja": "setup でモデルを選んでプロファイルへ反映できる（一覧は CLI から実取得し、一覧コマンドを持たない系統は同梱の既知リスト + 取得不可の明示。#1002）",
+      "evidence": "measured",
+      "evidence_detail": "#1002 の実測（2026-08-27）: codex 0.150.1 は `codex debug models` が `Render the raw model catalog as JSON` で slug / display_name / supported_reasoning_levels / context_window を返す（未認証でも既定カタログ、 認証すると内容が変わる）。agy 1.1.22 は `agy models` が `id<TAB>表示名` の TSV を stdout へ返し未認証は exit 1 + `Please sign in to view available models.`。 claude 2.1.232 は該当サブコマンドが無く `claude models` は**プロンプトとして 解釈される**（一覧はセッション内の /model のみ）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "setup_plan_detect",
+      "summary_ja": "setup が契約プランを検出して推奨規模を決める",
+      "evidence": "source",
+      "evidence_detail": "setup.rs の Provider は Claude / Gpt / Google の 3 値だが、プラン取得は claude / gpt の 2 経路しか実装が無い（#226）",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "agy はプラン情報を出さないので検出できない"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "ローカルモデルに契約プランという概念が無い"
+        }
+      }
+    },
+    {
+      "key": "setup_profile_recommend",
+      "summary_ja": "setup が起動プロファイルを組み立てる",
+      "evidence": "source",
+      "evidence_detail": "setup.rs は選択した agent を worker_agent へ書くが、master_agent は claude / codex しか受け付けない（agy は起動前エラーになるため）",
+      "agents": {
+        "agy": {
+          "status": "degraded",
+          "note_ja": "worker としてのプロファイルは作れるが、master には別系統が自動で選ばれる"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "setup_rules_sync",
+      "summary_ja": "共通ルールをこの CLI のグローバル指示ファイルへ同期する（#136）",
+      "evidence": "source",
+      "evidence_detail": "agents_sync.rs の AgentKind が 3 系統ぶんの書き先を持つ （~/.claude/CLAUDE.md / ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "solo_launch",
+      "summary_ja": "1 対 1 対話の solo として起動する（`tako solo`）",
+      "evidence": "source",
+      "evidence_detail": "solo は master と同じ build_master_cmd_in を通るので、agy は同じ理由で 起動前にエラーになる（#111 / #127）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy は worker 専用で、master / solo としては起動前にエラーになる（#127）",
+          "issue": 987
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_bypass_preaccept",
+      "summary_ja": "起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）",
+      "evidence": "source",
+      "evidence_detail": "dispatch.rs の事前承諾は 2 箇所とも WorkerAgent::Claude を条件にしている。codex / agy は default_skip_permissions() が true なので常に skip 側なのに 事前承諾が無い（棚卸し §1.3(c)）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_choice_dialog",
+      "summary_ja": "選択肢ダイアログを構造として読み、番号やラベルで応答する（#748）",
+      "evidence": "source",
+      "evidence_detail": "claude_tui.rs は claude v2.1.198 / codex 0.144.1 / agy 1.1.0 の実採取画面の 和集合として実装され、CODEX_TRUST_DIALOG / AGY_PERMISSION_DIALOG 等の fixture が同ファイルに在る。番号なし・選択肢 2 つ（claude 2.x の信頼 ダイアログ = TRUST_DIALOG_NO_NUMBER）も #1223 で検知対象。claude の auto mode 環境学習の確認（番号つき 3 択の**下に空の入力欄**が 描かれる形 = TEACH_AUTO_MODE_DIALOG）は #1263 で検知対象",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_cli_control",
+      "summary_ja": "worker ペインの中から tako CLI で tako を操作できる",
+      "evidence": "source",
+      "evidence_detail": "TAKO_PANE_ID / TAKO_SOCKET / TAKO_TOKEN の注入と PATH 注入（#601）は ペイン単位で agent に依らない",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_death_resume",
+      "summary_ja": "突然死を検知して復旧コマンドを提示する（#390）",
+      "evidence": "source",
+      "evidence_detail": "dispatch.rs のレジストリの resume_command はコメントどおり claude のみ （session ID から claude --resume を組む）",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_delivery_peer",
+      "summary_ja": "画面を介さずに指示を直送する（生成中でも取りこぼさない。#790）",
+      "evidence": "by-design",
+      "evidence_detail": "第 1 層は claude の Cross-Session Messaging（受信箱の socket へ直送）に固有。AGENTS.md「worker への指示送達（#790）」も codex / agy / Windows は常に 第 2 層と明記している",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "画面を介さない直送は claude の受信箱（Cross-Session Messaging）に固有の仕組みで、他系統には相当物が無い"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "unsupported",
+          "note_ja": "画面を介さない直送は claude の受信箱（Cross-Session Messaging）に固有の仕組みで、他系統には相当物が無い"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "画面を介さない直送は claude の受信箱（Cross-Session Messaging）に固有の仕組みで、他系統には相当物が無い"
+        }
+      }
+    },
+    {
+      "key": "worker_entitlement_detect",
+      "summary_ja": "時間では解けない利用阻害で止まったことを検知する（#1106）",
+      "evidence": "measured",
+      "evidence_detail": "#1106: claude 2.1.258 のバイナリで阻害の前置き（`dCt` / `pCt` / `Par`）を読み、時間で解ける 4 条件（#1096）を除いた 6 分類 / 8 文言 —— 座席種別 3 種・管理者による無効化・グループ枠 $0・クレジット要求・追加利用ぶんの枯渇・組織でのサービス無効 —— を `tako_core::limit_resume::entitlement_block_line` で受け、`WorkerErrorKind::EntitlementBlocked`（`needs_human`）として返す。#1107（2026-09-04 の実物調査）: codex 0.153.0 のバイナリに **6 実文言 / 3 分類**（クレジット残高の枯渇 = `You're out of credits.` / `Your workspace is out of credits. {Add credits to continue. | Ask your workspace owner to refill in order to continue. | Add credits to continue using Codex.}`、spend cap = `You hit your spend cap set {in your workspace | by the owner of your workspace}. …`、workspace のクレジット上限 = `You've reached your workspace credit limit` + `… Notify owner?`）、agy 1.1.25 に **2 実文言**（`AI: Out of credits` = 前払いクレジットが 0。変更履歴に「spurious \"Out of credits\" errors」の修正が 2 件あり実表示だと分かる / `No license available for this project and location. Contact your administrator to setup Gemini Enterprise for this project.`）が在ることを確認し、`out of credits` / `spend cap` / `workspace credit limit` / `no license available` の 4 語句として受ける。**この 4 語句は claude 2.1.258 の バイナリに 1 件も無い**（各 0 件。逆に claude の `out of usage credits` 12 件・`spend limit` 75 件は codex / agy に 0 件 = 語彙が系統ごとに分かれている）ので claude の判定は 1 ビットも変わらない。**座席種別・組織のサービス無効に相当する 停止文言は codex / agy には無い**（`disabled for your` 0 件。`seat` は Seatbelt サンドボックスと SQL 予約語、`entitlement` は MCP の `openai/entitlementContext` = ツール権限の文脈で停止文言ではない）。**codex の構造化ソースでは区別できない** （rollout の `rate_limits` は `used_percent` / `resets_at` / `window_minutes` だけで、クレジット残高や権利の欠如を表すフィールドが無い = #985 の枠情報のみ）ので画面の文言が唯一の根拠になる。実文言の fixture は `detect_worker_errorはcodexとagyの阻害も別種として検知する` / `issue1107_codexとagyの阻害文言も別種として読む`、上限停止（#1093 / #1096 / #985）との排他は `issue1107_workspace_credit_limitはテンプレートより阻害が優先する` と `issue1107_codexの上限系は従来どおり時間で解ける扱い` が固定している。**残高を 0 にして実際に踏ませる再現はしていない**（課金・管理者権限が要る）。ローカル LLM にはベンダーの座席・クレジット・組織ポリシーが無い",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので、座席種別・クレジット・組織ポリシーという概念が無い（阻害される権利がそもそも存在しない）"
+        }
+      }
+    },
+    {
+      "key": "worker_idle_with_background",
+      "summary_ja": "背景作業（背景シェル・Monitor 等）が残っていても、ターンが終わって入力待ちになったことを検知する（#1273）",
+      "evidence": "measured",
+      "evidence_detail": "**3 系統とも検知できるが経路が違う**。claude（#1273・2026-09-09 実測）: 2.1.258 の `agents --json` は `isLoading || delegatedActive ? \"busy\" : \"idle\"` で 状態を決め、**背景シェル / Monitor が生きているあいだ busy を返し続ける**ので、tako は画面の状態行 `· <内訳> still running` を根拠に idle へ倒す （この行は claude 自身が**ターンが終わっているときだけ**継ぎ足し、完了を待って止まっているあいだは `Waiting for … to finish` になる = 「終わった」と「待っている」を取り違えない）。codex / agy（#1277・2026-09-11 実測）: **一次シグナルが張り付かないので覆す必要が無い**。隔離 tmux 上の実 CLI に背景作業を残したままターンを終わらせたところ、codex-cli 0.154.0 は背景ターミナル（`sleep 600`）が生きたまま rollout へ `task_complete` を書き（`read_turn_state` → `idle`）、Antigravity CLI 1.2.0 も背景タスクが生きたまま実況 JSONL の終端へ `MODEL/PLANNER_RESPONSE`（`status=DONE`・`tool_calls` なし）を書いた （`read_turn_state` → `idle`）。どちらの画面も `screen_looks_busy=false` / `screen_looks_idle=true` なので idle が覆されない。両系統は背景作業を画面へ申告もする（codex = `1 background terminal running · /ps to view · /stop to close` / agy = フッターの `· 1 task(s) · /tasks`）ので `worker_status` の `background_work` はその内訳を返すが、**この申告は生成中も同じ形で出る** （#120 / #1015 の採取）ため claude と違ってターン終了の根拠には使わない （`wait::declaration_implies_turn_end`）。**claude の入力欄は属性で読む**（#1297・2026-09-09 本番観測）: claude は空欄へ AI のゴースト提案を dim で描くので、文字列だけで「空か」を見ると提案が 人の下書きに見えて覆せない（本番 pane 1636 / 1761 / 1775 / 1784 が永久 busy）。判定は `read_pane` の `input_status.style` と同じ 1 実装 （`screen::analyze_input_line`）を通し、ghost / none は下書きなし・user / mixed は下書きありとして扱う。属性の取れない素の tmux capture では 従来の文字列判定へ落ち、`worker_status` の `idle_override_blocked` に `input_draft_unreadable` を残す",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_limit_autoresume",
+      "summary_ja": "利用上限の解除後に自分で再開する（#813）",
+      "evidence": "measured",
+      "evidence_detail": "#985 実測（2026-08-27 / codex-cli 0.150.1）: codex の解除時刻は 2 つの経路で 取れる。① 画面の `Try again at Aug 28th, 2026 4:24 AM.`（バイナリ内書式 `\" Try again at \"` + `\", %Y %-I:%M %p\"`。日付を挟む形は #985 前は読めず、不明の猶予 900 秒で早撃ちして 3 回で諦めていた）② rollout の `rate_limits.<枠>.resets_at`（epoch 秒。書式にもタイムゾーンにも依存しない）。セルフテスト項目 111 の codex 節が解除前は撃たず解除後に再開するところまで見る （`TAKO_985_LEGACY=1` へ戻すと reset_at=None で FAILED になることを実測）。agy 1.1.22 は `/credits` に「待つ」出口が無く（Get More AI Credits / See Activity）、待って再開する動作そのものが成立しない",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "agy はクレジットを使い切っても「解除を待つ」出口が無い（買い足す導線しか無い）ので、待って再開するという動作が成立しない（#985）"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "degraded",
+          "note_ja": "5h / 週の枠は解除を待って自分で再開するが、ワークスペースのクレジットが尽きた場合は「待つ」出口が無い（増枠申請・購入・獲得済みリセットの引き換えしか無いので、tako は何も選ばずに止まる）"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので利用上限という概念が無い"
+        }
+      }
+    },
+    {
+      "key": "worker_limit_detect",
+      "summary_ja": "利用上限で止まったことを検知する",
+      "evidence": "measured",
+      "evidence_detail": "#985 実測（2026-08-27）: codex 0.150.1 の停止文言 `You've hit your usage limit.` と 接近ダイアログ `Approaching rate limits` をバイナリ内文字列で確認し、`limit_stop.rs` の実採取 fixture が両方を検知することをテストで固定した。agy 1.1.22 は**窓つきの利用上限を持たない**（`agy --help` に usage / quota 系の サブコマンドが無く、バイナリの `RateLimit` は全部 PR レビュー設定と Go / sentry の内部名。残量は `/credits` = 前払いクレジット）ので、検知すべき「上限で止まった状態」自体が存在しない。#1880（claude）: 停止の判定は画面のまま。tako mod の報告があれば解除時刻だけを mod の値（秒精度）に差し替える（LimitHint::from_mod。mod の値だけでは停止と判定しない）",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査）"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので利用上限という概念が無い"
+        }
+      }
+    },
+    {
+      "key": "worker_limit_metrics",
+      "summary_ja": "利用制限の残量（%）を取り出す（#357）",
+      "evidence": "measured",
+      "evidence_detail": "#985 実測（2026-08-27 / codex-cli 0.150.1 / plan_type = plus = **有料プラン**）: rollout の `token_count` に `rate_limits.primary`（`window_minutes: 300` = 5h）と `.secondary`（`10080` = 週）が数値で載る。**#357 の画面スクレイピングは 0.150.1 では成立しない**（実測: TUI のフッターはモデル名と cwd だけで、`5h limit: [██…] 90% left (resets 23:23)` は `/status` のモーダルの中にしか 出ない = 常時見えるところに `primary NN%` は無い）ので、構造化ソースが正になった。両者の解除時刻が一致することも確認（rollout の 1787840583 = 画面の 23:23）。agy 1.1.22 は前払いクレジットで枠が無い（`/credits` を実行して確認）",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査）"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので利用上限という概念が無い"
+        }
+      }
+    },
+    {
+      "key": "worker_login_expired_detect",
+      "summary_ja": "アカウントのログイン失効で止まったことを検知する（#757）",
+      "evidence": "measured",
+      "evidence_detail": "#757（2026-08-01 / 08-03 / 08-05 の実観測を 3 回）: claude の worker が              `OAuth refresh token is no longer valid; run /login to re-authenticate` /              `Login expired · Please run /login` / `Please run /login` を出して止まる。             画面には先に `API Error: Unable to connect to API (ENOTFOUND / ECONNRESET)` が              出るため、#757 前は `api_error`（推奨 `resume`）に分類され、**続行ナッジを              何度撃っても復帰しなかった**（master が 3 回空回りした）。この 3 文言を              `orchestrator::agent_cli::login_expired_line`（#983 の起動時未認証検知と              **同じ正本**）で受け、`WorkerErrorKind::LoginExpired`（`relogin`）として返す。             対象アカウントは会話（session_id）の transcript の所在から逆引きする              （`orchestrator::login_expired_account`。#652 の resume と同じ根拠）ので、             **会話が claude の config ディレクトリに在る系統でしか名指しできない**。             codex / agy は失効時の実画面を採れていないので文言を足していない              （推測を置かないのは #1034 の `execution_refused_patterns` と同じ作法）。             **実機で失効させる再現はしていない**（同一アカウントを別マシンから使った              直後に起きるもので、任意のタイミングでは作れない）ので、検証は実観測の              文言を描いた fixture と隔離 tmux のペインで行った",
+      "agents": {
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない）",
+          "issue": 975
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統でログイン失効時に画面へ何が出るかを実物で採れていない（#757 の 3 文言は claude の実観測。推測の文言は置かない）",
+          "issue": 975
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので、ベンダーへのログインとその失効という概念が無い（失効する資格情報がそもそも存在しない）"
+        }
+      }
+    },
+    {
+      "key": "worker_mcp",
+      "summary_ja": "worker が tako の MCP ツール群を呼べる",
+      "evidence": "measured",
+      "evidence_detail": "#986 の実測（2026-09-09 / 隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）:              **codex** = spawn の起動コマンドへ master と同じ `-c mcp_servers.tako.*` を一時注入する              （正本は orchestrator::agent::codex_mcp_args の 1 実装）。実 worker が              `tako.tako_list_panes({})` を呼び、**pane を省略した** `tako_set_title` が              自分のペインへ当たった。効いているのが一時注入だと分かるのは env の指紋で、             MCP 子プロセスの初期環境は一時注入の 5 個（TAKO_TAB_ID を含む）に対し、             `TAKO_986_LEGACY=1` の旧アームでは恒久登録（#979）の 4 個（TAKO_TAB_ID 無し）だった。             **agy** = per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27: -c / --mcp-config なし）ので              恒久登録（#979）に委ねる。agy は親 env をそのまま渡す（実測: MCP 子が TAKO_* を 15 個受け取る              = claude と同じ形）ため、実 worker から pane 省略の `tako_set_title` が自分のペインへ当たった。             `TAKO_PANE_ID` が届かない系統でも解けるよう、caller_pane は **pid 祖先辿り**へ落ちる              （`tako mcp serve` が `Request::ResolvePane` で問う。#288 / #567 と同じ 1 実装）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_model_default_inherit",
+      "summary_ja": "claude 語彙で書かれたモデル / effort の既定（プロファイルの worker_model / アカウントの default_model）を worker へ継承する（#1013）",
+      "evidence": "measured",
+      "evidence_detail": "#1013 の実発生: profile（worker_model: claude-opus-5）+ アカウント（default_model: claude-opus-5）の master が agent=codex・model 省略で spawn した 結果、`codex --model claude-opus-5 …` が組み立てられ、codex がモデル警告の画面で 止まってプロンプトも届かなかった。orchestrator/mod.rs の resolve_agent_launch は claude 以外へ profile の worker_model を渡さない設計だったが、アカウントの default_model が spawn の明示指定と同じ段に混ざっていた",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "unsupported",
+          "note_ja": "モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる"
+        }
+      }
+    },
+    {
+      "key": "worker_permission_dialog",
+      "summary_ja": "permission ダイアログを検知して応答する（#319 / #577）",
+      "evidence": "source",
+      "evidence_detail": "claude_tui.rs の detect_permission_dialog は 3 系統のパターンを持ち、agy の「Do you want to proceed?」も対象に入っている。#1880（claude）: tako mod の報告があれば権限待ち・質問待ちを先に見るが、答え方（respond）は画面のダイアログを読むので画面の検出を正にし、食い違い（classic_events=false の組織アカウントではルールの無い ask を mod が拾えない）を worker_status の warnings に出す",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_prompt_delivery",
+      "summary_ja": "初期プロンプトが送達確認つきで届く（#32 / #530）",
+      "evidence": "source",
+      "evidence_detail": "第 2 層のキー操作経路（claude_tui::deliver_via_tmux）は 3 系統の入力欄 （❯ / › / >）を見分けるので agent 非依存に動く",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_prompt_undelivered",
+      "summary_ja": "プロンプトが届かなかったことを検知して再送手段を出す（#390 / #530）",
+      "evidence": "unit-test",
+      "evidence_detail": "#983 の変更 2 で prompt_delivery_assessment の判断を delivery_observation （このマトリクスの WORKER_STATUS_STRUCTURED）から引く形にした。codex は rollout の task_started を送達の証拠にできるので claude と同じく未達を断定し、agy は画面確認しか 無いので未達ではなく unverified（+ verify_then_resend）を返す。緑のテスト: registry の「一次シグナルの無い系統は未達と断定せず未確認を返す」「送達の観測手段はマトリクスから引く」「ターンが走った証拠は画面検証の失敗より強い」/ dispatch の「issue983_観測手段の無い系統でも送達判定が黙らない」",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_refusal_detect",
+      "summary_ja": "「起動も送達も成立したのに実行を断られた」停止を、完了ではなく error として検知する（#1034）",
+      "evidence": "measured",
+      "evidence_detail": "#1034: 北極星実測（#975）で agy worker がアカウントの適格性の検証待ちに当たり、1 文字も作業していないのに status=idle / prompt_delivery=delivered / WORKER_IDLE（50.07 秒後）を返した。#983 の分類は「まだ送達の証拠が無い worker」に限るゲートを持つので設計どおりその外だった。#1033 で agy が 実況 JSONL を得たので、**送達後でも「MODEL のステップを 1 件も観測して いない」**を条件に分類できるようになった（画面推定の busy は TUI の 起動描画を拾うので根拠にならない）。**文言は版で変わる**（agy 1.1.22 = `Verifying your account...` / `We're finishing verifying your account eligibility.`、1.1.27 = `Unable to verify account eligibility.` / `Eligibility check failed:`）ので、両版に共通して残る `account eligibility` を軸にした。**claude 2.1.258 / codex 0.153.0 のバイナリには一時的な検証待ちの文言が 無い**（2026-09-09 に実物を走査。`eligibility` の該当はすべて内部識別子・API パス・models cache の判定で、画面へ出る拒否の文ではない）ので、この 2 系統には判定パターンを宣言していない（`execution_refused_patterns` が空 = 推測を置かない）。両系統で観測されている拒否の形は未認証 （`not_authenticated`。#983）と時間で解けない利用阻害 （`entitlement_blocked`。#1106 / #1107）で、どちらも既に error になる",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない）"
+        }
+      }
+    },
+    {
+      "key": "worker_refusal_work_proof",
+      "summary_ja": "実行拒否と判定する前に「作業を 1 歩も始めていない」ことの直接の証拠（一次シグナルの実観測）を要求できる（#1295）",
+      "evidence": "measured",
+      "evidence_detail": "#1034: agy の実物では拒否が **CLI の起動直後**（会話が作られる前）に出るので、実況 JSONL がまだ無く「作業ゼロ」を直接は観測できない。代わりに会話が 1 件も 解決できないことを代理の証拠にしている（`agy_session::resolve_conversation_id_for_backend` の解決は sticky なので、一度でも会話を開いたペインは以後ずっと `Some(..)` を返す = 「解決できない」が durable に言える）。#1295: claude / codex にはこの代理が要らない。両系統で観測されている拒否は 未認証（#983 の `detect_launch_failure`）と時間で解けない利用阻害（#1106）で、どちらも別の分類が先に error にする。むしろ代理を許すと害がある: **claude の腕（`dispatch.rs` の `query_agent_status`）は `agent_work_started` を一度も代入しない**ので、`None` を作業ゼロと数えると 正常に働いた worker（`status=idle` / `prompt_delivery=delivered`）の画面に 同じ文字列が流れただけで完了を `error` / `retry_spawn` へ落とす （#983 が `command not found` で避けた誤検知と同型）。再現は `dispatch::tests::issue1295_claudeの正常完了を実行拒否へ落とさない`。local は断る主体がそもそも居ない（`worker_refusal_detect` と同じ理由）",
+      "agents": {
+        "agy": {
+          "status": "unsupported",
+          "note_ja": "実行の拒否が会話の作成前に起こるので、作業を 1 歩も始めていないことを実況ログで直接は確かめられない（#1034 の実物では拒否の時点で会話がまだ無い）。代わりに「会話が 1 件も解決できない」ことを作業ゼロの代理の証拠として使う"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "unsupported",
+          "note_ja": "自分のマシンで動かすモデルなので、アカウントや座席の確認で実行を断られるという事象が起こらない（断る主体がそもそも存在しない）"
+        }
+      }
+    },
+    {
+      "key": "worker_report_scrollback",
+      "summary_ja": "画面の履歴から報告を取れる（#364 の第 1 層）",
+      "evidence": "source",
+      "evidence_detail": "第 1 層は器の capture（capture-pane -p -J -S）なので agent に依らない （dispatch.rs の report が明記）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_report_transcript",
+      "summary_ja": "構造化された会話ログから報告を取れる（#364 の第 2 層 / `--messages`）",
+      "evidence": "measured",
+      "evidence_detail": "#984 で codex アダプタを実装。rollout JSONL の response_item（role=assistant）を 読むので `report --messages N` が codex でも実データを返す。応答の transcript_agent でどれを読んだか分かる。#1033 で agy アダプタを追加: 実況 JSONL の PLANNER_RESPONSE で本文を持つ行が発話なので同じく実データを返す （北極星実測では agy だけ messages が 0 件だった）",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_spawn",
+      "summary_ja": "worker として起動できる",
+      "evidence": "source",
+      "evidence_detail": "orchestrator/agent.rs の build_worker_cmd_in が唯一の組み立て口で、effort / 権限スキップ / role 注入の 3 点だけを系統別に分岐する",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
+      "key": "worker_status_detect",
+      "summary_ja": "作業中か終わったかを判定する",
+      "evidence": "measured",
+      "evidence_detail": "#984: codex は構造化ソース（codex-session）を得たので need_streak が 8 → 3 に なり claude と同じ確定速度になる。同一タスクの A/B 実測（primes 25 個）で before = source=screen / ctx=None / **開始前の t=3s・6s に idle を出す**、after = t=9s から source=codex-session で busy を 2 標本とも捉え t=15s から idle + ctx=8。#1033: agy も実況 JSONL（agy-session）を得て need_streak が 8 → 3 になった。北極星と同じ測り方の A/B 実測（同一タスク・各 3 標本・TAKO_1033_LEGACY での同一バイナリ A/B）で検知遅延の中央値が 39.46s（38.25 / 39.46 / 41.49）→ 13.92s（13.30 / 13.92 / 14.04）。claude 15.40s / codex 11.68s と同水準で、旧側は北極星の 39.38s を再現する。偽 idle（回答前に単発 status が idle を返す最早時刻）は 3.5〜6.1s → 4.3〜5.7s で増えておらず、watch の偽イベントは 6 ラウンドとも 0 件。(Thinking) 型の誤爆（#120）は弱マーカーの agent 別分離で構造的に起こらない。#1880（claude）: tako mod の報告があれば turn を一次ソースにする（status_source=mod）。無い・古い・止まったら claude agents --json → 画面へ落ちる。#2017: 報告が 20 秒以内（heartbeat 15 秒 + 余裕）で会話 ID を持てば claude agents --json を起こさない（応答の agents_scan.skipped）。完了・権限待ち・idle の判定は同じ報告の turn と画面の補正のままで変わらない",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_status_structured",
+      "summary_ja": "画面に依らない一次シグナルで状態を取れる（`claude agents --json` 相当）",
+      "evidence": "measured",
+      "evidence_detail": "#984 で codex-cli 0.150.1 を実物調査: $CODEX_HOME/sessions/ の rollout JSONL に task_started / task_complete が**逐次**書かれる（250 語生成を 1 秒刻みで観測: t=1s 開始 → t=27s 完了）。tako は status_source=codex-session として読む。#1033 で agy 1.1.27 を実物調査: 会話ごとの brain/<id>/.system_generated/logs/transcript.jsonl が**逐次追記**され、画面に答えが出た時刻と終端 PLANNER_RESPONSE が書かれた時刻が同一標本 （0.2 秒ポーリングで差 0.00 秒）。tako は status_source=agy-session として読む。ペイン → 会話は生きた agy が開いたままの brain/<id> を lsof で引く （codex の thread-writer-locks と同じ形）。claude の一次シグナルは #1880 / #2017 から **tako mod の報告**（会話 ID・turn・モデル・ctx）: 新しい報告（20 秒以内）があるペインは claude agents --json を起こさない。走査は mod の 無い・古い・止まった claude だけで、起こすのもその claude が居る config dir（台帳 <config dir>/sessions/<pid>.json で絞る）と既定だけ・ログインシェルを経由しない。本番 v0.8.31 の実測で走査は 1 分 60 本（4 アカウント × 15 回）・回収済みの子の CPU 24.4%",
+      "agents": {
+        "agy": {
+          "status": "supported"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "supported"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
+      "key": "worker_trust",
+      "summary_ja": "作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）",
+      "evidence": "source",
+      "evidence_detail": "orchestrator/agent.rs の ensure_trusted_in が 3 系統ぶん書き分けてある （claude = <config dir>/.claude.json / codex = ~/.codex/config.toml / agy = ~/.gemini/antigravity-cli/settings.json）。claude 以外は固定パス",
+      "agents": {
+        "agy": {
+          "status": "degraded",
+          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない"
+        },
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "degraded",
+          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM のハーネスが決まっていないので可否が定まらない（codex TUI を借りる #990 なら在り、非 TUI 経路の #991 なら無い）",
+          "issue": 990
+        }
+      }
+    }
+  ]
+}

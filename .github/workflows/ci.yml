@@ -113,6 +113,11 @@ jobs:
       # CHANGELOG / git tag の最大値から採る（checkout はタグを持たないので Cargo.toml が主）
       - name: リリースノートのページが現行の版に追いついている
         run: node docs/scripts/check-releases-page.mjs
+      # 対応状況ページのデータ（マトリクスの写し）が、対応表の別々の行を直す並列の PR どうしで
+      # 衝突しない形を保っているか（#2104）。ページそのものをコミットしていた頃は件数の行で
+      # 毎回衝突していた。tako のスタブで PR を 2 本模して merge する（git と node だけで数秒）
+      - name: 対応状況ページのデータが並列の PR で衝突しない（#2104）
+        run: bash scripts/test-support-snapshot-merge-2104.sh
 
   # docs / .agent を読む Rust の番犬（#2084）。docs だけの PR では macOS / Windows の Rust ジョブを
   # skip するが、`no_personal_data`（#927 = 個人情報の番犬。リポジトリの全ファイルを走査）・

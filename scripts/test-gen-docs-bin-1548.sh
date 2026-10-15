@@ -9,6 +9,7 @@
 #
 # ここでは本物のリポジトリを汚さずに、テンポラリへ**偽リポジトリ**（scripts/ と
 # Cargo.toml と docs/ だけを持つ）を組み、tako のスタブで版を自由に振って実測する。
+# コミットする生成物はマトリクスの写し（docs/src/data/*.json。#2104）で、ページはそこから組む。
 # 本物のバイナリは JSON の採取（fixtures）と最後のツリー実測にだけ読み取りで使う。
 set -uo pipefail
 
@@ -35,14 +36,17 @@ FIX="$FAKE/fixtures"
 DEBUG_BIN="$FAKE/target/debug/tako"
 RELEASE_BIN="$FAKE/target/release/tako"
 OTHER_BIN="$FAKE/other/tako"
+WIN_DATA="$FAKE/docs/src/data/windows-support.json"
+AGENT_DATA="$FAKE/docs/src/data/agent-support.json"
 WIN_MD="$FAKE/docs/src/content/docs/windows-support.md"
-AGENT_MD="$FAKE/docs/src/content/docs/agent-support.md"
 MARKER="$SANDBOX/used-explicit"
 OUT="$SANDBOX/out"
-mkdir -p "$FAKE/scripts/lib" "$FAKE/docs/src/content/docs" "$FAKE/target/debug" "$FAKE/target/release" "$FAKE/other" "$FIX"
+mkdir -p "$FAKE/scripts/lib" "$FAKE/docs/scripts" "$FAKE/docs/src/data" "$FAKE/docs/src/content/docs" \
+  "$FAKE/target/debug" "$FAKE/target/release" "$FAKE/other" "$FIX"
 
 cp "$ROOT/scripts/gen-windows-support-docs.mjs" "$ROOT/scripts/gen-agent-support-docs.mjs" "$FAKE/scripts/"
 cp "$ROOT/scripts/lib/tako-bin.mjs" "$FAKE/scripts/lib/"
+cp "$ROOT/docs/scripts/support-pages.mjs" "$FAKE/docs/scripts/"
 
 # 偽 Cargo.toml。**別の節の version を掴まないこと**も同時に測る（[package] は 0.0.1）
 cat > "$FAKE/Cargo.toml" <<'TOML'
@@ -59,19 +63,16 @@ TOML
 "$TAKO" platform --platform windows --json > "$FIX/windows.json" || { echo "platform --json の採取に失敗"; exit 1; }
 "$TAKO" agent-support --json > "$FIX/agent.json" || { echo "agent-support --json の採取に失敗"; exit 1; }
 
-# 「古いバイナリ」用に**中身の違う** JSON も作る（counts の葉を 1 つ増やす）。
-# これで版の門番を外したときに **md が実際に巻き戻る**のが観測できる
+# 「古いバイナリ」用に**中身の違う** JSON も作る（先頭の機能の根拠の文言を変える）。
+# 写しに載るフィールドで、件数は変えない（件数を変えると「ページが数える件数と本体の集計が
+# 一致しない」で落ち、写しの巻き戻りを観測できない）。これで版の門番を外したときに
+# **写しが実際に巻き戻る**のが観測できる
 mutate(){ node -e '
 const fs = require("node:fs");
 const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-const bump = (o) => {
-  for (const k of Object.keys(o)) {
-    if (typeof o[k] === "number") { o[k] += 1; return true; }
-    if (o[k] && typeof o[k] === "object" && bump(o[k])) return true;
-  }
-  return false;
-};
-if (!bump(j.counts)) { console.error("counts に数値が無い"); process.exit(1); }
+const f = j.features[0];
+if (!f) { console.error("features が空"); process.exit(1); }
+f.evidence_detail = String(f.evidence_detail ?? "") + "（古い版）";
 fs.writeFileSync(process.argv[2], JSON.stringify(j));
 ' "$1" "$2"; }
 mutate "$FIX/windows.json" "$FIX/windows-old.json" || exit 1
@@ -106,7 +107,8 @@ sum(){ shasum "$1" | awk '{print $1}'; }
 
 echo "== A: 既定の探索で版が一致していれば通る =="
 GEN_ARGS="" rc="$(run_win)"; check "windows: 生成が通る" "$rc" "0"
-if [ -s "$WIN_MD" ]; then ok "windows: md が生成された"; else ng "windows: md が生成されていない"; fi
+if [ -s "$WIN_DATA" ]; then ok "windows: 写しが生成された"; else ng "windows: 写しが生成されていない"; fi
+if [ -s "$WIN_MD" ]; then ok "windows: 手元のページも組まれた"; else ng "windows: 手元のページが組まれていない"; fi
 GEN_ARGS="--check" rc="$(run_win)"; check "windows: --check が緑" "$rc" "0"
 contains "windows: 同期している旨が出る" "同期しています" "$OUT"
 GEN_ARGS="" rc="$(run_agent)"; check "agent: 生成が通る" "$rc" "0"
@@ -114,7 +116,7 @@ GEN_ARGS="--check" rc="$(run_agent)"; check "agent: --check が緑" "$rc" "0"
 contains "agent: 同期している旨が出る" "同期しています" "$OUT"
 
 echo "== B: 古いバイナリなら偽の赤ではなく理由つきで落ちる =="
-WIN_SUM="$(sum "$WIN_MD")"; AGENT_SUM="$(sum "$AGENT_MD")"
+WIN_SUM="$(sum "$WIN_DATA")"; AGENT_SUM="$(sum "$AGENT_DATA")"
 make_stub "$DEBUG_BIN" 0.0.1 plain "-old"
 GEN_ARGS="--check" rc="$(run_win)"
 check "windows: --check が非 0 で落ちる" "$rc" "1"
@@ -128,14 +130,14 @@ absent "windows: スタックトレースを出さない" "    at " "$OUT"
 contains "windows: 明示指定の口を案内する" "TAKO_BIN" "$OUT"
 GEN_ARGS="" rc="$(run_win)"
 check "windows: --check 無しでも落ちる" "$rc" "1"
-check "windows: md を巻き戻さない（古い版は別内容を返す）" "$(sum "$WIN_MD")" "$WIN_SUM"
+check "windows: 写しを巻き戻さない（古い版は別内容を返す）" "$(sum "$WIN_DATA")" "$WIN_SUM"
 GEN_ARGS="--check" rc="$(run_agent)"
 check "agent: --check が非 0 で落ちる" "$rc" "1"
 contains "agent: 理由が読める" "が古いバイナリです" "$OUT"
 absent "agent: 偽の赤（同期していません）を出さない" "同期していません" "$OUT"
 GEN_ARGS="" rc="$(run_agent)"
 check "agent: --check 無しでも落ちる" "$rc" "1"
-check "agent: md を巻き戻さない（古い版は別内容を返す）" "$(sum "$AGENT_MD")" "$AGENT_SUM"
+check "agent: 写しを巻き戻さない（古い版は別内容を返す）" "$(sum "$AGENT_DATA")" "$AGENT_SUM"
 
 echo "== C: TAKO_BIN での明示指定 =="
 rm -f "$MARKER"
@@ -191,8 +193,8 @@ if [ "$REAL_VER" = "$WANT_VER" ]; then
   check "本物のツリーで windows --check が緑" "$rc" "0"
   rc="$( ( cd "$ROOT" && env -u TAKO_BIN node scripts/gen-agent-support-docs.mjs --check ) >"$OUT" 2>&1; echo $? )"
   check "本物のツリーで agent --check が緑" "$rc" "0"
-  if cmp -s "$WIN_MD" "$ROOT/docs/src/content/docs/windows-support.md"; then ok "偽リポジトリの生成物が本物と 1 バイト同じ"; else ng "生成内容が本物と食い違う"; fi
-  if cmp -s "$AGENT_MD" "$ROOT/docs/src/content/docs/agent-support.md"; then ok "agent 側も本物と 1 バイト同じ"; else ng "agent の生成内容が本物と食い違う"; fi
+  if cmp -s "$WIN_DATA" "$ROOT/docs/src/data/windows-support.json"; then ok "偽リポジトリの生成物が本物と 1 バイト同じ"; else ng "生成内容が本物と食い違う"; fi
+  if cmp -s "$AGENT_DATA" "$ROOT/docs/src/data/agent-support.json"; then ok "agent 側も本物と 1 バイト同じ"; else ng "agent の生成内容が本物と食い違う"; fi
 else
   skip "本物の tako が v${REAL_VER}（Cargo.toml は v${WANT_VER}）なのでツリー実測は飛ばす"
 fi

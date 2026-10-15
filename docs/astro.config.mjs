@@ -3,6 +3,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import mdx from '@astrojs/mdx';
 
+import { AGENT_DATA, WINDOWS_DATA, writeSupportPages } from './scripts/support-pages.mjs';
+
 // Google アナリティクス 4 の測定 ID。takushio2525.com とその全サブドメインで 1 つの
 // プロパティを共有している（gtag は既定で cookie_domain: 'auto' なので `_ga` は書ける
 // 一番上のドメイン = takushio2525.com に置かれ、サブドメインをまたいでも同じ訪問者として
@@ -22,11 +24,30 @@ const ADSENSE_PUBLISHER_ID = 'ca-pub-3136871606832456';
 const WEB_FONTS_CSS =
 	'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;500;600&display=swap';
 
+// 対応状況の 2 ページ（windows-support / agent-support）はコミットせず、ビルド / dev の頭で
+// src/data のマトリクスの写しから組む（#2104。理由は scripts/support-pages.mjs の冒頭）。
+// Cloudflare Pages がどのコマンド（npm run build / astro build）で組んでも同じになるよう、
+// package.json の prebuild ではなく astro 自身のフックに載せる。content の読み込みより前に走るよう
+// integrations の先頭に置く。dev 中に写しが変わったら設定の読み直しと一緒に組み直す
+function supportPages() {
+	return {
+		name: 'tako-support-pages',
+		hooks: {
+			'astro:config:setup': ({ addWatchFile }) => {
+				writeSupportPages();
+				addWatchFile(WINDOWS_DATA);
+				addWatchFile(AGENT_DATA);
+			},
+		},
+	};
+}
+
 export default defineConfig({
 	// 公開 URL。canonical / og:url / sitemap / OG 画像の絶対 URL の基点になる
 	// （crates/tako-app/src/about_window.rs の DOCUMENTATION_URL と同じ URL）
 	site: 'https://tako.takushio2525.com',
 	integrations: [
+		supportPages(),
 		starlight({
 			title: 'tako',
 			description: 'AI エージェントのための次世代ターミナル',

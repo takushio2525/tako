@@ -1288,7 +1288,7 @@ unit 6 本 + セルフテスト項目 117 = 適用を外すと FAILED になる�
 | FR-2.29.4 | 縮退の理由文は `Note`（日英対）で**マトリクス 1 箇所に定義**し、診断・docs・将来の system prompt がすべてそこから引く（#435 / #516 と同じ方針） | M | ✅ |
 | FR-2.29.5 | **同じ概念の enum が 5 つ並存している**現状（`WorkerAgent` / `SetupAgent` / `agents_sync::AgentKind` / `agent_install::AgentKind` / `LimitService`）を統合ではなく**対応の機械検証**で縛る。どれかに値が増減したらテストが落ちる。値の集合が本当に違う（`Local` は `WorkerAgent` に無いのが正しい）ため統合しない。対応表は `.agent/agent-enums.md` | M | ✅ |
 | FR-2.29.6 | 操作は CLI `tako agent-support` + MCP `tako_agent_support` で 1:1（開発不変条件）。**CLI 側はローカル処理**（GUI が無くても引ける = 「worker が動かない」を調べるときに tako 本体が生きている前提を置かない。`tako platform` と同じ判断） | M | ✅ |
-| FR-2.29.7 | docs（`docs/src/content/docs/agent-support.md`）は**生成物**で、CI が `node scripts/gen-agent-support-docs.mjs --check` で同期を検査する。カテゴリ未分類の能力があると生成が失敗する（分類漏れの検出） | M | ✅ |
+| FR-2.29.7 | docs（`docs/src/content/docs/agent-support.md`）は**生成物**で、コミットするのは能力マトリクスの写し `docs/src/data/agent-support.json`（ページは docs のビルドが写しから組む。並列の PR が件数の行で衝突しないため = #2104）。CI が `node scripts/gen-agent-support-docs.mjs --check` で写しの同期を検査する。カテゴリ未分類の能力があると生成が失敗する（分類漏れの検出） | M | ✅ |
 | FR-2.29.8 | 能力判断の呼び出し側は**各スライスがその機能を実装するときに**マトリクス経由へ寄せる（一斉置換しない）。#982 では `WorkerAgent::has_agents_api()` を吸収した（`TAKO_982_LEGACY=1` で吸収前へ戻せる）。残りの寄せ先一覧は `.agent/agent-enums.md` | M | ✅ |
 
 初期値（40 能力 × 4 系統）は棚卸しレポートの §1 / §9 から引いた。**実機を動かしていない**ため

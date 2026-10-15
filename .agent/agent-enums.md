@@ -99,5 +99,6 @@
 1. `agent_support::Agent` へ値を足す（`ALL` / `as_str` / `parse` / `label`）
 2. `MATRIX` の全行にその列の値を書く（**根拠なしに `Supported` へ倒すとテストが落ちる**）
 3. `agent_parity.rs` の `WATCHED` の期待値を直す
-4. `scripts/gen-agent-support-docs.mjs` を走らせて docs を再生成（CI が `--check` する）
+4. `scripts/gen-agent-support-docs.mjs` を走らせて docs のデータ（`docs/src/data/agent-support.json`）を
+   再生成（CI が `--check` する。ページは docs のビルドがデータから組む = #2104）
 5. このファイルの対応表を直す
