@@ -1826,6 +1826,19 @@ Windows は Pending（#1886。区切り `;` の連結は単体テスト済み、
 | FR-2.43.9 | **割り当ての条件**（純関数 `tako_core::queue::admit`）: 並びは優先度 → 受付の古い順で**追い越さない**。先頭について ①同じ target dir の処理が走っている（停滞も含む）→ 待つ ②メモリ圧 critical → 待つ ③**管理下の実行中（停滞を除く）が 0 件なら入れる**（最低限の前進）④メモリ圧 warn / swap が警戒線以上 → 待つ（= 1 件ずつ）⑤実行中 + tako の外の重い処理（順番待ちを通っていないもの。1 件 = 1 枠）≥ 同時数 → 待つ ⑥空き − 走り出したばかりの処理がまだ使っていない見込み − 見込み < 予約 → 待つ。機の値が採れなければ同時数だけ。見込みは区分ごと（build 3.5 GB・test 7 GB・browser 2 GB・その他 1 GB。build / test は tako 自身の `cargo build --workspace` / `cargo test --workspace` の木の最大メモリの実測 = 設計書 §4.7）。上限は `settings.json` の `resources` 節（`max_jobs` / `reserve_gb` / `swap_guard_gb` / `max_wait_min`。**キーが無ければ機に合わせた既定** = 同時数 RAM 12 GB あたり 1（1〜4）・予約 max(2 GB, RAM の 10%)・swap 2 GB・30 分。旧ファイルは serde default でそのまま読める）。CLI `tako queue limits [--max-jobs N] [--reserve-gb X] [--swap-guard-gb Y] [--max-wait-min M] [--reset]`（範囲外は弾く。GUI が居なくても設定ファイルへ書ける）/ MCP `tako_queue` の `action: limits` | M | ✅ #1994 |
 | FR-2.43.10 | **この repo の入口で採用**: AGENTS.md のコマンド表（build / test / lint）は `tako queue cargo …`。`scripts/lib/queue.sh` の `run_heavy` を build-app / isolated-gui のビルド / cargo を呼ぶ検証スクリプトが通し、夜間リリースは env `TAKO_QUEUE_PRIORITY=low` / `TAKO_QUEUE_MAX_WAIT=3h` で中のビルドを low で並べる。**tako が無い（CI）・順番待ちを知らない古い tako・入れ子はそのまま走る** | S | ✅ #1994 |
 
+### FR-2.44 usage 分析（エピック #2192。S1 = 利用制限の観測とログインの鍵 ✅ #2200）
+
+> アカウント（ログイン）ごとに、どのプロジェクト・どの機能の実装が利用制限をどれだけ使ったかを見る。
+> 利用制限の % の履歴はこの機のどこにも残っておらず後から遡れないので、観測を残す S1 を最初に入れた。
+> 設計の正本は `.agent/plans/2026-10-usage-analytics.md`（§9 にスライスと受け入れ条件）。
+
+| ID | 要件 | 優先度 | 状況 |
+|---|---|---|---|
+| FR-2.44.1 | **利用制限の観測を残す**: tako mod の報告を受けるたび（FR-2.42）、同じペインの前の報告から値（% か解除時刻）が変わった枠と初めての会話だけを `ModHub` に積み（純関数 `tako_core::usage::pending_from_report`。heartbeat では積まない・上限 256）、GUI の 2 秒の定期処理（`drive_usage_record`）が背景で `tako_control::usage::record_for_gui` へ渡す。記録器はログイン × 枠ごとに最後に書いた（解除時刻, %, `observed_at`）を覚え、**同じ値と、`observed_at` が古い観測（放置したペインの古い値）は書かない**（`LimitTracker`）。書くのは `<data_dir>/usage/limits.jsonl`（`login` / `key_from` / `kind` / `percent` / `resets_at`（unix 秒）/ `observed_at` / `recorded_at` / `source: mod`）と `sessions.jsonl`（`session_id` → `login` / `key_from` / `seen_at`。後ろの行が正）。**起動時は何も読まない**: 覚えは最初の追記の直前にファイルの末尾 256 KB から作る（読めない行・書きかけの行は飛ばす）。置き場は設定共有のカタログで `Local`（鍵の塩がマシン固有）。行の型は `migration_registry` の指紋で縛る（追記だけのファイルなので版数の番地は持たない）。A/B は `TAKO_2192_S1_LEGACY=1`（記録しない・置き場も作らない） | M | ✅ #2200 |
+| FR-2.44.2 | **ログインの鍵**: 利用制限はログインごとにかかり、tako のアカウント（設定 dir）は同じログインを重ねうる（この機では 4 アカウントが 2 ログイン）。鍵は資格情報のファイル（報告の `config_dir` = `CLAUDE_CONFIG_DIR` があれば `<それ>/.claude.json`、無ければ `<ホーム>/.claude.json`。**既定の設定 dir の 2 通り = `CLAUDE_CONFIG_DIR` 無しと `=~/.claude` は別のファイル**）の `oauthAccount.accountUuid` を `<data_dir>/machine_id`（無ければ OS の乱数で作る・0600）で塩付けした SHA-256 の先頭 12 桁。資格情報が無い・読めない・accountUuid が無いときは設定 dir の塩付きハッシュ（`key_from: config_dir`）。資格情報のファイルは更新時刻と大きさが同じ間は読み直さない。**生の accountUuid・メールは保存しない・表示しない**。診断ログ（persist.log）には最初の記録の件数と最初の失敗の種類だけを出す（cwd・label・鍵・設定 dir を出さない） | M | ✅ #2200 |
+| FR-2.44.3 | **読み取りの口**: CLI `tako usage [--json]`（ローカル処理 = GUI が動いていなくても読める）/ MCP `tako_sessions` の `action: "usage"`（新しいツールは足さない）/ dispatch `Request::Sessions { action: "usage" }`（IPC / MCP は `prepare_offload` が background のジョブ `OffloadJob::UsageSummary` にする）。すべて `tako_control::usage::summary_payload` の 1 実装。応答はログインごとに `label`（初めて見た順に A, B, …）・`login`（鍵）・`key_from`・枠ごとの最新の観測（`used_percent` / `resets_at` / `resets_at_iso` / `observed_at` / `expired` / 点数）・観測と会話の数。番犬 `crates/tako-control/tests/issue2200_usage_watchdog.rs`（生の識別子・本文・設定 dir が `usage/` と persist.log に出ない・行の型の欄・UI スレッドと起動の段で usage のファイルに触らない）、実経路 `scripts/test-usage-limits-2200.sh` | M | ✅ #2200 |
+| FR-2.44.4 | mod の無いペインの画面の値（`source: screen`）/ 使用量の索引と `tako usage --by` / `--window`（S2 #2201）/ 区間按分（S3）/ 右パネルの `usage` ビュー（S4）/ codex（S5）/ agy の調査（S6）/ スマホ（S7） | M | #2201〜 |
+
 ## FR-3 コンセプト②: 軽量 IDE 的ワークスペース
 
 | ID | 要件 | 優先度 |

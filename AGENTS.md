@@ -192,6 +192,7 @@ tako/
 | **tmux への再接続が止まったペインを繋ぎ直す（#1857）** | `tako persist reattach --pane N` |
 | **再起動後にエージェントが戻らないとき（#1076 / #1238 / #1554）** | `<data_dir>/persist.log` の「復元の内訳」 |
 | セッションカタログ（会話の発見・復元。#112 / #1069） | `tako sessions list [--role r] [--project p]` |
+| **利用制限の観測の要約（ログインごとの 5h / 7d。#2200）** | `tako usage` |
 | ペインの平文ログ（ペイン死亡後も出力を遡る。#112） | `tako logs list` |
 | **スクロールバック保持上限（直接ペインの RAM。#818）** | `tako scrollback [lines]` |
 | **フォーカスの無いペインの再描画の上限（CPU。#1979）** | `tako redraw-limit [fps]` |

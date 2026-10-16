@@ -21,9 +21,11 @@ DeliveryState: Sent, Launched, Delivered, Failed
 DesiredState: since
 Device: id, name, login, node_name, role, created_at, last_seen
 DevicesFile: devices
+KeyFrom: Account, ConfigDir
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows, shelved_tabs
 Ledger: entries
 LedgerEntry: id, ts, project, label, issue, task_type, model, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
+LimitObservation: login, key_from, kind, percent, resets_at, observed_at, recorded_at, source
 LimitSettings: max_jobs, reserve_gb, swap_guard_gb, max_wait_min
 ManagedMark: schema, managed_by, tako_version, content_hash, files
 NodeLayout: Pane, Split, axis, ratio, first, second
@@ -47,6 +49,7 @@ RuntimeRef: manager, key
 SavedLidState: scheme, ac, dc, owner
 SessionCatalog: entries, pending
 SessionEntry: kind, label, project, profile, agent, model, effort, issues, prompt_head, cwd, tab, pane, tmux_session, log_file, started_at, last_seen_at
+SessionLogin: session_id, login, key_from, seen_at
 Settings: auto_rename, port_detect, ssh_auto_folders, autosuggest, autosuggest_hint, autosuggest_tab, preview_live_reload, lsp_format_on_save, lsp_init_options, editor_auto_close, claude_mod, limit_resume_all, network_resume, resources, preview_cache_max_mb, tmux_persist, sleep_guard_mode, sleep_guard_power, lid_sleep_mode, lid_sleep_power, lid_battery_floor, pane_logs, pane_log_max_mb, pane_log_total_max_mb, scrollback_lines, unfocused_redraw_fps, mouse_click_forward, paste_guard, paste_guard_policy, theme, ui_mode, sidebar_width, show_hidden_files, telemetry, welcome_dismissed, update_card_dismissed, limit_service, language, runner_defaults, theme_colors, theme_presets, font_family, font_size
 SetupConfig: orchestrator, setup, agents_sync, spawn_layout, confirm_close, ctx_threshold
 SetupState: completed, completed_at, applied_revision, applied_version, selected_agent, provider_plans

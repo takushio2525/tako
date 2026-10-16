@@ -2991,6 +2991,10 @@ pub enum OffloadJob {
     /// スマホの一覧（#1984）。`claude agents --json`（上限 15 秒）と器の `list-panes` を
     /// UI スレッドで待たない（workspace に触らないのでそのまま background から応答する）
     RemoteAgents,
+    /// 利用制限の観測の要約（`tako_sessions` の `action: "usage"`。usage 分析 S1 #2200）。
+    /// `<data_dir>/usage/` のファイルは記録が続くほど育つので、UI スレッドで読まない
+    /// （workspace に触らないのでそのまま background から応答する）
+    UsageSummary,
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -3767,6 +3771,7 @@ pub fn prepare_offload(
         Request::RemoteAgents if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::RemoteAgents))
         }
+        Request::Sessions { action, .. } if action == "usage" => Some(Ok(OffloadJob::UsageSummary)),
         Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::TmuxList {
                 ctx: collect_tmux_context(host),
@@ -3937,6 +3942,9 @@ impl OffloadJob {
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
             OffloadJob::RunConfigSketch(job) => job.run(),
             OffloadJob::RemoteAgents => remote_agents_reply(),
+            OffloadJob::UsageSummary => {
+                crate::usage::summary_payload().map_err(DispatchError::Operation)
+            }
             OffloadJob::StaleStatus { ctx } => Ok(finish_stale_status(&ctx)),
             OffloadJob::TmuxWrite(request) => match *request {
                 Request::TmuxKill {
@@ -9590,8 +9598,11 @@ fn dispatch_inner(
             }
             // #1069: Claude 公式 Remote Control の session URL
             "link" => dispatch_sessions_link(host, origin, id.as_deref(), pane),
+            // #2200: 利用制限の観測の要約（IPC / MCP は prepare_offload が background へ出す。
+            // ここはテスト・直呼びの同期の腕で、本体は同じ 1 実装）
+            "usage" => crate::usage::summary_payload().map_err(DispatchError::Operation),
             other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（list / show / resume / link のいずれか）"
+                "不明な action: {other:?}（list / show / resume / link / usage のいずれか）"
             ))),
         },
 

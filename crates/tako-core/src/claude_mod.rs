@@ -1236,6 +1236,11 @@ pub struct ModHub {
     pub cards_place: crate::claude_mod_ui::Place,
     /// ui.json の `chat.place`（S7-6 #1964。[`Self::cards_place`] と同じく報告のたびに写す）
     pub chat_place: crate::claude_mod_ui::Place,
+    /// 利用制限の観測と会話 → ログインの対応の材料（usage 分析 S1 #2200）。報告を受けるたびに
+    /// 同じペインの前の報告と比べ、値が変わった枠・初めての会話だけを積む（heartbeat では積まない）。
+    /// GUI の定期処理が汲み出し、鍵の解決と `<data_dir>/usage/` への追記は背景で行う
+    /// （UI スレッドでファイルを読み書きしない）。上限は [`crate::usage::MAX_PENDING`]
+    pub pending_usage: Vec<crate::usage::PendingUsage>,
 }
 
 /// [`ModHub::accept`] の結果
@@ -1305,6 +1310,12 @@ impl ModHub {
         }
         self.dormant.remove(&pane);
         let prev = self.reports.get(&pane);
+        if let Some(pending) = crate::usage::pending_from_report(prev.map(|s| &s.report), &report) {
+            if self.pending_usage.len() >= crate::usage::MAX_PENDING {
+                self.pending_usage.remove(0);
+            }
+            self.pending_usage.push(pending);
+        }
         let count = prev.map_or(0, |s| s.count) + 1;
         let prev_received = prev.map(|s| s.received);
         self.reports.insert(
@@ -1397,6 +1408,11 @@ impl ModHub {
     /// まだ置きに行っていない、報告で見えた設定 dir を取り出す（#1959）
     pub fn take_pending_config_dirs(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_config_dirs)
+    }
+
+    /// 積んだ利用制限の観測の材料を取り出す（usage 分析 S1 #2200）
+    pub fn take_pending_usage(&mut self) -> Vec<crate::usage::PendingUsage> {
+        std::mem::take(&mut self.pending_usage)
     }
 }
 
@@ -2880,6 +2896,40 @@ mod tests {
         r.config_dir = config_dir.map(str::to_string);
         r.rate_limits = limits;
         r
+    }
+
+    /// #2200: 報告を受けるたびに観測の材料を積むのは「値が変わった・会話が新しい」ときだけ
+    /// （heartbeat では積まない = UI スレッドの仕事を比べて積むだけにする）
+    #[test]
+    fn issue2200_観測の材料は値が変わったときだけ積む() {
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        let r = |pct| {
+            report_with(
+                None,
+                vec![limit("five_hour", pct, "2026-10-16T18:20:00.000Z", 1)],
+            )
+        };
+        hub.accept(1, r(10.0), t0);
+        assert_eq!(hub.pending_usage.len(), 1, "初めての報告");
+        for _ in 0..5 {
+            hub.accept(1, r(10.0), t0);
+        }
+        assert_eq!(hub.pending_usage.len(), 1, "同じ値の heartbeat で増えた");
+        hub.accept(1, r(11.0), t0);
+        assert_eq!(hub.pending_usage.len(), 2);
+        let taken = hub.take_pending_usage();
+        assert_eq!(taken[1].limits[0].percent_used, 11.0);
+        assert!(hub.pending_usage.is_empty());
+        // 汲み出されないまま溜まっても上限で古いものから捨てる
+        for i in 0..(crate::usage::MAX_PENDING + 10) {
+            hub.accept(2, r(i as f64), t0);
+        }
+        assert_eq!(hub.pending_usage.len(), crate::usage::MAX_PENDING);
+        assert_eq!(
+            hub.pending_usage.last().unwrap().limits[0].percent_used,
+            (crate::usage::MAX_PENDING + 9) as f64
+        );
     }
 
     #[test]

@@ -340,6 +340,14 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             "crates/tako-core/src/claude_mod_install.rs",
             &["ManagedMark"],
         ),
+        (
+            // #2200: usage 分析の `<data_dir>/usage/limits.jsonl`（観測 1 点 = 1 行）と `sessions.jsonl`
+            // （会話 → ログイン）の行。追記だけのファイルで版数の番地は持たない（共有しない Local。
+            // 旧い行は serde の default で読む・読めない行は飛ばす）が、欄を増減・改名したら
+            // 旧い行が読めるかをここで選ばせる。鍵の出どころの語（enum）も載せる
+            "crates/tako-core/src/usage.rs",
+            &["LimitObservation", "SessionLogin", "KeyFrom"],
+        ),
     ];
     let mut out = BTreeMap::new();
     for (file, names) in TARGETS {

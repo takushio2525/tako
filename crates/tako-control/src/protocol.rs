@@ -2213,6 +2213,8 @@ pub enum Request {
     ///   `claude --resume <session_id>` を注入。claude セッションのみ対応）。
     ///   配置は `pane`（省略時は呼び出し元）を `direction`（省略時は右）へ分割、
     ///   `tab` 指定時はそのタブのフォーカスペインの隣
+    /// - "usage": 利用制限（5h / 7d）の観測の要約（ログインごとの最新の % と観測の点数。
+    ///   usage 分析 S1 #2200。`tako_control::usage::summary_payload` の 1 実装 = CLI `tako usage` と同じ）
     Sessions {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

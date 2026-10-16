@@ -365,6 +365,9 @@ enum Command {
     /// ペインの平文ターミナルログの参照・設定（Issue #112。ペインが死んでも出力を遡る）
     #[command(subcommand)]
     Logs(LogsCommand),
+    /// 利用制限（5h / 7d）の観測の要約（usage 分析 #2192 の S1 = #2200）。
+    /// ログインごとの最新の % と観測の点数を出す。GUI が動いていなくても読める
+    Usage(UsageArgs),
     /// レイアウトの世代バックアップからの復旧（#177）。
     /// 引数なしで現在の layout.json とバックアップ世代の一覧を表示する。
     /// タブ・ペインが大量消失したときは tako を終了してから
@@ -3915,6 +3918,14 @@ impl ShowCommandArgs {
     }
 }
 
+/// 利用制限の観測の要約の引数（Issue #2200）
+#[derive(Args)]
+struct UsageArgs {
+    /// 生の JSON で出力する（MCP `tako_sessions` の `action: "usage"` と同じ形）
+    #[arg(long)]
+    json: bool,
+}
+
 /// agent 能力マトリクスの参照引数（Issue #982）
 #[derive(Args)]
 struct AgentSupportArgs {
@@ -4867,6 +4878,10 @@ fn cli_main() -> ExitCode {
             json,
         }) => orchestrator_guide_local(topic.as_deref(), profile.as_deref(), json),
         Command::AgentSupport(ref args) => agent_support_local(args),
+        // #2200: 観測の要約は data dir のファイルを読むだけなのでローカル処理。
+        // **GUI が動いていなくても読める**。実体は dispatch（MCP `tako_sessions` の action=usage）と
+        // 共通の tako_control::usage::summary_payload
+        Command::Usage(ref args) => usage_local(args),
         // GUI を必要としないローカル処理（platform と同じ扱い）。
         // 実体は dispatch と共通の tako_control::shell_integration::run
         Command::ShellIntegration(ref args) => shell_integration_local(args),
@@ -6569,6 +6584,101 @@ fn migrate_local(args: &MigrateArgs) -> Result<(), String> {
     let result = tako_control::migrations::report_json(action, args.schema.as_deref())?;
     println!("{}", pretty_json(&result));
     Ok(())
+}
+
+/// `tako usage`（#2200。ローカル処理 = GUI 不要）。MCP `tako_sessions` の `action: "usage"` と
+/// 同じ `tako_control::usage::summary_payload` を通る（観測は GUI が `<data_dir>/usage/` へ書く）
+fn usage_local(args: &UsageArgs) -> Result<(), String> {
+    let payload = tako_control::usage::summary_payload()?;
+    if args.json {
+        println!("{}", pretty_json(&payload));
+        return Ok(());
+    }
+    let now = tako_core::user_task::unix_now();
+    let offset = tako_core::platform::clock::local_utc_offset();
+    print!("{}", usage_text(&payload, now, offset));
+    Ok(())
+}
+
+/// `tako usage` の既定出力（機械検証できるよう印字と分けてある）。時刻の表記は
+/// `tako todo show` と同じ 1 実装（`user_task::response_stamp`）
+fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
+    let stamp_ms = |ms: &Value| {
+        ms.as_u64()
+            .map(|ms| tako_core::user_task::response_stamp((ms / 1000) as i64, now, utc_offset))
+            .unwrap_or_else(|| "-".into())
+    };
+    let pct = |v: &Value| {
+        let f = v.as_f64().unwrap_or(0.0);
+        if f.fract() == 0.0 {
+            format!("{f:.0}%")
+        } else {
+            format!("{f:.1}%")
+        }
+    };
+    let mut out =
+        String::from("利用制限の観測（tako mod の報告。% か解除時刻が変わったときだけ記録）\n");
+    if p["recording"] == Value::Bool(false) {
+        out.push_str(&format!(
+            "  記録していない（{} が立っている）\n",
+            p["legacy_env"].as_str().unwrap_or("A/B の env")
+        ));
+    }
+    let logins = p["logins"].as_array().cloned().unwrap_or_default();
+    if logins.is_empty() {
+        if let Some(hint) = p["hint"].as_str() {
+            out.push_str(&format!("  {hint}\n"));
+        }
+        return out;
+    }
+    for l in &logins {
+        let from = match l["key_from"].as_str() {
+            Some("config_dir") => " = 資格情報を読めず設定 dir で束ねた",
+            _ => "",
+        };
+        out.push_str(&format!(
+            "  ログイン {}（鍵 {}{from}）  観測 {} 点・会話 {} 本\n",
+            l["label"].as_str().unwrap_or("-"),
+            l["login"].as_str().unwrap_or("-"),
+            l["observations"].as_u64().unwrap_or(0),
+            l["sessions"].as_u64().unwrap_or(0),
+        ));
+        for w in l["windows"].as_array().cloned().unwrap_or_default() {
+            let kind = match w["kind"].as_str() {
+                Some("five_hour") => "5h".to_string(),
+                Some("seven_day") => "7d".to_string(),
+                other => other.unwrap_or("-").to_string(),
+            };
+            let resets = w["resets_at"]
+                .as_i64()
+                .map(|r| tako_core::user_task::response_stamp(r, now, utc_offset))
+                .unwrap_or_else(|| "-".into());
+            let expired = if w["expired"] == Value::Bool(true) {
+                "（過ぎた = 今の窓の値ではない）"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "    {kind:<3} {:>5}  解除 {resets}{expired}  最新の観測 {}（{} 点）\n",
+                pct(&w["used_percent"]),
+                stamp_ms(&w["observed_at"]),
+                w["observations"].as_u64().unwrap_or(0),
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "  記録 {} 点（{} 〜 {}）\n",
+        p["observations"].as_u64().unwrap_or(0),
+        stamp_ms(&p["first_observed_at"]),
+        stamp_ms(&p["last_observed_at"]),
+    ));
+    if let Some(n) = p["unreadable_lines"].as_u64() {
+        out.push_str(&format!(
+            "  読めない行 {n} 行を飛ばした（書きかけ・壊れた行）\n"
+        ));
+    }
+    out.push_str("  どのプロジェクト・機能が使ったかの内訳は後続のスライス（#2201）で足す\n");
+    out
 }
 
 /// agent 能力マトリクスの表示（#982。ローカル処理・IPC 不要）。
@@ -10660,6 +10770,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::AgentSupport(_) => {
             unreachable!("agent-support は run() を通らない（ローカル処理）")
         }
+        Command::Usage(_) => unreachable!("usage は run() を通らない（ローカル処理）"),
         Command::Migrate(_) => unreachable!("migrate は run() を通らない（ローカル処理）"),
         Command::ShellIntegration(_) => {
             unreachable!("shell-integration は run() を通らない（ローカル処理）")
@@ -15468,6 +15579,61 @@ mod tests {
         );
     }
 
+    /// #2200: `tako usage` の既定出力（ログインごとの最新の % と点数・解除時刻・過ぎた窓・空のとき）
+    #[test]
+    fn usageの既定出力() {
+        // 2026-10-13 02:02:00 UTC
+        let at = 1_791_856_920;
+        let payload = serde_json::json!({
+            "recording": true,
+            "observations": 3,
+            "first_observed_at": at * 1000,
+            "last_observed_at": (at + 600) * 1000,
+            "logins": [{
+                "label": "A", "login": "0123456789ab", "key_from": "account",
+                "observations": 3, "sessions": 2,
+                "windows": [
+                    {"kind": "five_hour", "used_percent": 12.0, "resets_at": at + 3_600,
+                     "observed_at": (at + 600) * 1000, "expired": false, "observations": 2},
+                    {"kind": "seven_day", "used_percent": 40.5, "resets_at": at - 60,
+                     "observed_at": at * 1000, "expired": true, "observations": 1},
+                ],
+            }, {
+                "label": "B", "login": "ba9876543210", "key_from": "config_dir",
+                "observations": 0, "sessions": 1, "windows": [],
+            }],
+        });
+        let text = usage_text(&payload, at + 600, 9 * 3_600);
+        assert!(
+            text.contains("  ログイン A（鍵 0123456789ab）  観測 3 点・会話 2 本\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    5h    12%  解除 12:02  最新の観測 11:12（2 点）\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    7d  40.5%  解除 11:01（過ぎた = 今の窓の値ではない）"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ログイン B（鍵 ba9876543210 = 資格情報を読めず設定 dir で束ねた）"),
+            "{text}"
+        );
+        assert!(text.contains("  記録 3 点（11:02 〜 11:12）\n"), "{text}");
+        // 観測が無いときは案内だけ・A/B では記録していないと出す
+        let empty = serde_json::json!({
+            "recording": false, "legacy_env": "TAKO_2192_S1_LEGACY",
+            "observations": 0, "logins": [], "hint": "まだ観測が無い",
+        });
+        let text = usage_text(&empty, at, 0);
+        assert!(
+            text.contains("記録していない（TAKO_2192_S1_LEGACY が立っている）"),
+            "{text}"
+        );
+        assert!(text.ends_with("  まだ観測が無い\n"), "{text}");
+    }
+
     /// Windows の出力（CRLF）・末尾 5 行の抜粋・120 文字での切り詰めを通っても字下げが揃う
     #[test]
     fn gateの証拠はcrlfと切り詰めを通っても全行が同じ字下げ() {
@@ -15599,6 +15765,8 @@ mod platform_matrix_parity {
         ("run-default", "tako_run_defaults"),
         // #1731: 実行設定は `tako_run_defaults` の path 側（ツールを増やさない）
         ("run-config", "tako_run_defaults"),
+        // #2200: 利用制限の観測の要約は `tako_sessions` の action=usage（ツールを増やさない）
+        ("usage", "tako_sessions"),
         ("scroll", "tako_scroll_pane"),
         ("send", "tako_send_input"),
         ("split", "tako_split_pane"),

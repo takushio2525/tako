@@ -6409,6 +6409,8 @@ impl TakoApp {
                     }
                     // #1959: mod の報告で新しく見えた設定 dir へ skills/tako（読み書きは背景）
                     app.drive_claude_mod_skills_sync(wcx);
+                    // #2200: 報告で積んだ利用制限の観測を `<data_dir>/usage/` へ（鍵の解決と追記は背景）
+                    app.drive_usage_record(wcx);
                     {
                         // #572: busy 中に人間が打った指示が claude のキューに滞留したまま
                         // 止まっていないかを見張り、見つけたら送り出す
@@ -10069,6 +10071,20 @@ impl TakoApp {
             .spawn(async move {
                 tako_control::claude_mod_install::sync_for_gui(&dirs, true, &skills_ctx)
             })
+            .detach();
+    }
+
+    /// 利用制限の観測を書く（usage 分析 S1 #2200。定期処理から呼ぶ）。dispatch が報告のたびに
+    /// `ModHub` へ積んだ材料（値が変わった枠・初めての会話）を汲み出すだけで、資格情報のファイルの読み・
+    /// 重複除去・追記は背景で行う（UI スレッドでファイルに触らない）。A/B（`TAKO_2192_S1_LEGACY=1`）は
+    /// 背景の側が何も書かない
+    fn drive_usage_record(&mut self, cx: &mut Context<Self>) {
+        if self.claude_mod.pending_usage.is_empty() {
+            return;
+        }
+        let batch = self.claude_mod.take_pending_usage();
+        cx.background_executor()
+            .spawn(async move { tako_control::usage::record_for_gui(batch) })
             .detach();
     }
 
