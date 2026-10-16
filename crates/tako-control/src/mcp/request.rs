@@ -1305,6 +1305,9 @@ pub(super) fn build_request(
                 limit: u64_arg(args, "limit")?.map(|v| v as usize),
                 tab: u64_arg(args, "tab")?,
                 direction: direction_arg(args)?,
+                by: str_arg(args, "by")?,
+                window: str_arg(args, "window")?,
+                account: str_arg(args, "account")?,
             }
         }
         "tako_logs" => Request::Logs {

@@ -20,6 +20,15 @@
 //! `oauthAccount.accountUuid` を、マシン固有の塩（`<data_dir>/machine_id`）で包んだハッシュの先頭
 //! [`KEY_HEX_LEN`] 桁にする。**生の accountUuid もメールも持たない・書かない・表示しない**（§6）。
 //! 資格情報が無い・読めないときは設定 dir そのものの塩付きハッシュへ落とす（[`KeyFrom::ConfigDir`]）。
+//!
+//! # 使用量の索引（S2 = #2201）
+//!
+//! 会話記録の assistant 行の使用量メタデータを増分で読み（[`index`]）、単価表（[`price`]）で
+//! API 換算し、ログイン → プロジェクト → Issue → 会話の内訳を組む（[`report`]）。
+
+pub mod index;
+pub mod price;
+pub mod report;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -393,6 +402,17 @@ pub fn summarize(
     sessions: &[SessionLogin],
     now_secs: i64,
 ) -> Summary {
+    summarize_with(observations, sessions, &[], now_secs)
+}
+
+/// [`summarize`] に、使用量の索引（S2）にだけ現れたログイン `extra`（鍵・最初の時刻 epoch ms・出どころ）
+/// を足して短い名前を振る（観測の無いログインも A, B, … の並びに入る）
+pub fn summarize_with(
+    observations: &[LimitObservation],
+    sessions: &[SessionLogin],
+    extra: &[(String, u64, KeyFrom)],
+    now_secs: i64,
+) -> Summary {
     // 会話 → ログインは後ろの行が正
     let mut session_login: BTreeMap<&str, &SessionLogin> = BTreeMap::new();
     for row in sessions {
@@ -414,6 +434,12 @@ pub fn summarize(
             .or_insert((row.seen_at, row.key_from));
         if row.seen_at < entry.0 {
             entry.0 = row.seen_at;
+        }
+    }
+    for (login, at, from) in extra {
+        let entry = first_seen.entry(login.as_str()).or_insert((*at, *from));
+        if *at < entry.0 {
+            entry.0 = *at;
         }
     }
     let mut order: Vec<(&str, u64, KeyFrom)> = first_seen

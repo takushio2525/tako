@@ -365,8 +365,9 @@ enum Command {
     /// ペインの平文ターミナルログの参照・設定（Issue #112。ペインが死んでも出力を遡る）
     #[command(subcommand)]
     Logs(LogsCommand),
-    /// 利用制限（5h / 7d）の観測の要約（usage 分析 #2192 の S1 = #2200）。
-    /// ログインごとの最新の % と観測の点数を出す。GUI が動いていなくても読める
+    /// 利用制限（5h / 7d）の観測と使用量の内訳（usage 分析 #2192 の S1 = #2200 / S2 = #2201）。
+    /// ログインごとの最新の % と、期間の中のトークン・API 換算・会話数をプロジェクト・Issue・会話などの段で
+    /// 出す。GUI が動いていなくても読める（会話記録の索引を追いつかせてから答える）
     Usage(UsageArgs),
     /// レイアウトの世代バックアップからの復旧（#177）。
     /// 引数なしで現在の layout.json とバックアップ世代の一覧を表示する。
@@ -3918,9 +3919,24 @@ impl ShowCommandArgs {
     }
 }
 
-/// 利用制限の観測の要約の引数（Issue #2200）
+/// 利用制限の観測と使用量の内訳の引数（Issue #2200 / #2201。どれも省略できる）
 #[derive(Args)]
 struct UsageArgs {
+    /// 束ねる段: project（既定）/ issue / task-type / session / model / account / day / role / login
+    #[arg(long)]
+    by: Option<String>,
+    /// 期間: 7d（既定 = 今の 7d の窓）/ 5h / day / week / month / all
+    #[arg(long)]
+    window: Option<String>,
+    /// tako のアカウント名で絞る
+    #[arg(long)]
+    account: Option<String>,
+    /// プロジェクト（master はプロファイル名）で絞る
+    #[arg(long)]
+    project: Option<String>,
+    /// 段の上位の件数（既定 10）
+    #[arg(long)]
+    limit: Option<usize>,
     /// 生の JSON で出力する（MCP `tako_sessions` の `action: "usage"` と同じ形）
     #[arg(long)]
     json: bool,
@@ -4878,9 +4894,9 @@ fn cli_main() -> ExitCode {
             json,
         }) => orchestrator_guide_local(topic.as_deref(), profile.as_deref(), json),
         Command::AgentSupport(ref args) => agent_support_local(args),
-        // #2200: 観測の要約は data dir のファイルを読むだけなのでローカル処理。
-        // **GUI が動いていなくても読める**。実体は dispatch（MCP `tako_sessions` の action=usage）と
-        // 共通の tako_control::usage::summary_payload
+        // #2200 / #2201: 観測の要約と使用量の内訳は data dir と会話記録を読むだけなのでローカル処理。
+        // **GUI が動いていなくても読める**（索引を追いつかせてから答える）。実体は dispatch
+        // （MCP `tako_sessions` の action=usage）と共通の tako_control::usage::usage_payload
         Command::Usage(ref args) => usage_local(args),
         // GUI を必要としないローカル処理（platform と同じ扱い）。
         // 実体は dispatch と共通の tako_control::shell_integration::run
@@ -6586,10 +6602,27 @@ fn migrate_local(args: &MigrateArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako usage`（#2200。ローカル処理 = GUI 不要）。MCP `tako_sessions` の `action: "usage"` と
-/// 同じ `tako_control::usage::summary_payload` を通る（観測は GUI が `<data_dir>/usage/` へ書く）
+/// `tako usage`（#2200 / #2201。ローカル処理 = GUI 不要）。MCP `tako_sessions` の `action: "usage"` と
+/// 同じ `tako_control::usage::usage_payload` を通る（観測は GUI が `<data_dir>/usage/` へ書き、
+/// 使用量の索引は GUI の背景とこのコマンドが同じ関数で読み進める）
 fn usage_local(args: &UsageArgs) -> Result<(), String> {
-    let payload = tako_control::usage::summary_payload()?;
+    let query = tako_control::usage::UsageQuery {
+        by: args.by.clone(),
+        window: args.window.clone(),
+        account: args.account.clone(),
+        project: args.project.clone(),
+        limit: args.limit,
+    };
+    let payload = tako_control::usage::usage_payload(&query, tako_control::usage::Refresh::Full)?;
+    let update = &payload["index"]["update"];
+    if update["bytes_read"].as_u64().unwrap_or(0) >= 256 * 1024 * 1024 {
+        eprintln!(
+            "使用量の索引を作った（会話記録 {} 本・{} MB を {:.1} 秒。次からは追記された分だけを読む）",
+            update["read_files"].as_u64().unwrap_or(0),
+            update["bytes_read"].as_u64().unwrap_or(0) / (1024 * 1024),
+            update["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0,
+        );
+    }
     if args.json {
         println!("{}", pretty_json(&payload));
         return Ok(());
@@ -6598,6 +6631,63 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
     let offset = tako_core::platform::clock::local_utc_offset();
     print!("{}", usage_text(&payload, now, offset));
     Ok(())
+}
+
+/// トークン数の表記（万・億）
+fn usage_tokens(n: u64) -> String {
+    if n >= 100_000_000 {
+        format!("{:.2} 億", n as f64 / 100_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1} 万", n as f64 / 10_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// 量の 1 行（API 換算・トークン・応答・会話）
+fn usage_amount(t: &Value) -> String {
+    let mut out = format!(
+        "API 換算 ${:.2}・トークン {}（出力 {}）・応答 {}・会話 {}",
+        t["api_usd"].as_f64().unwrap_or(0.0),
+        usage_tokens(t["total_tokens"].as_u64().unwrap_or(0)),
+        usage_tokens(t["tokens"]["output"].as_u64().unwrap_or(0)),
+        t["responses"].as_u64().unwrap_or(0),
+        t["sessions"].as_u64().unwrap_or(0),
+    );
+    if let Some(n) = t["unpriced_tokens"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!("・単価不明 {}", usage_tokens(n)));
+    }
+    out
+}
+
+/// 期間の表記
+fn usage_range(window: &str, r: &Value, now: i64, utc_offset: i32) -> String {
+    let stamp = |v: &Value| {
+        v.as_i64()
+            .map(|t| tako_core::user_task::response_stamp(t, now, utc_offset))
+            .unwrap_or_else(|| "-".into())
+    };
+    let length = match window {
+        "5h" => "5 時間",
+        _ => "7 日",
+    };
+    match r["basis"].as_str() {
+        Some("observed") => format!(
+            "今の {window} の窓（{} 〜・解除 {}）",
+            stamp(&r["from"]),
+            stamp(&r["resets_at"])
+        ),
+        Some("rolling") => format!("直近 {length}（観測した今の窓が無い）"),
+        Some("calendar") => {
+            let name = match window {
+                "day" => "今日",
+                "week" => "今週",
+                _ => "今月",
+            };
+            format!("{name}（{} 〜）", stamp(&r["from"]))
+        }
+        _ => "索引のすべて".to_string(),
+    }
 }
 
 /// `tako usage` の既定出力（機械検証できるよう印字と分けてある）。時刻の表記は
@@ -6616,8 +6706,9 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
             format!("{f:.1}%")
         }
     };
-    let mut out =
-        String::from("利用制限の観測（tako mod の報告。% か解除時刻が変わったときだけ記録）\n");
+    let mut out = String::from(
+        "利用制限の観測（tako mod の報告。% か解除時刻が変わったときだけ記録）と使用量の内訳\n",
+    );
     if p["recording"] == Value::Bool(false) {
         out.push_str(&format!(
             "  記録していない（{} が立っている）\n",
@@ -6631,17 +6722,24 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
         }
         return out;
     }
+    let window = p["window"].as_str().unwrap_or("7d");
+    let by = p["by"].as_str().unwrap_or("project");
     for l in &logins {
         let from = match l["key_from"].as_str() {
             Some("config_dir") => " = 資格情報を読めず設定 dir で束ねた",
             _ => "",
         };
+        // 内訳があるときの会話数は内訳の行に出す（ここの会話は mod の報告で対応づけた数で、意味が違う）
+        let sessions = if l["usage"].is_object() {
+            String::new()
+        } else {
+            format!("・会話 {} 本", l["sessions"].as_u64().unwrap_or(0))
+        };
         out.push_str(&format!(
-            "  ログイン {}（鍵 {}{from}）  観測 {} 点・会話 {} 本\n",
+            "  ログイン {}（鍵 {}{from}）  観測 {} 点{sessions}\n",
             l["label"].as_str().unwrap_or("-"),
             l["login"].as_str().unwrap_or("-"),
             l["observations"].as_u64().unwrap_or(0),
-            l["sessions"].as_u64().unwrap_or(0),
         ));
         for w in l["windows"].as_array().cloned().unwrap_or_default() {
             let kind = match w["kind"].as_str() {
@@ -6665,19 +6763,50 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
                 w["observations"].as_u64().unwrap_or(0),
             ));
         }
+        let usage = &l["usage"];
+        if usage.is_object() {
+            out.push_str(&format!(
+                "    {}  {}\n",
+                usage_range(window, &usage["range"], now, utc_offset),
+                usage_amount(&usage["total"])
+            ));
+            for g in usage["groups"].as_array().cloned().unwrap_or_default() {
+                out.push_str(&format!(
+                    "      {}  {}\n",
+                    g["name"].as_str().unwrap_or("-"),
+                    usage_amount(&g)
+                ));
+            }
+            if let Some(n) = usage["more_groups"].as_u64() {
+                out.push_str(&format!("      ほか {n} 件（--limit で増やせる）\n"));
+            }
+        } else if p["index"]["enabled"] == Value::Bool(true) {
+            out.push_str("    この期間の使用量は無い\n");
+        }
     }
-    out.push_str(&format!(
-        "  記録 {} 点（{} 〜 {}）\n",
-        p["observations"].as_u64().unwrap_or(0),
-        stamp_ms(&p["first_observed_at"]),
-        stamp_ms(&p["last_observed_at"]),
-    ));
+    let observations = p["observations"].as_u64().unwrap_or(0);
+    if observations > 0 {
+        out.push_str(&format!(
+            "  記録 {observations} 点（{} 〜 {}）\n",
+            stamp_ms(&p["first_observed_at"]),
+            stamp_ms(&p["last_observed_at"]),
+        ));
+    } else if let Some(hint) = p["hint"].as_str() {
+        out.push_str(&format!("  {hint}\n"));
+    }
     if let Some(n) = p["unreadable_lines"].as_u64() {
         out.push_str(&format!(
             "  読めない行 {n} 行を飛ばした（書きかけ・壊れた行）\n"
         ));
     }
-    out.push_str("  どのプロジェクト・機能が使ったかの内訳は後続のスライス（#2201）で足す\n");
+    if p["index"]["enabled"] == Value::Bool(true) && by != "project" {
+        out.push_str(&format!("  段: {by}（既定は project）\n"));
+    }
+    for note in p["notes"].as_array().cloned().unwrap_or_default() {
+        if let Some(note) = note.as_str() {
+            out.push_str(&format!("  注: {note}\n"));
+        }
+    }
     out
 }
 
@@ -10648,6 +10777,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 pane: None,
                 tab: None,
                 direction: None,
+                by: None,
+                window: None,
+                account: None,
             },
             SessionsCommand::Link { pane, id, .. } => Request::Sessions {
                 action: "link".into(),
@@ -10664,6 +10796,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 },
                 tab: None,
                 direction: None,
+                by: None,
+                window: None,
+                account: None,
             },
             SessionsCommand::Show { id } => Request::Sessions {
                 action: "show".to_string(),
@@ -10674,6 +10809,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 pane: None,
                 tab: None,
                 direction: None,
+                by: None,
+                window: None,
+                account: None,
             },
             SessionsCommand::Resume {
                 id,
@@ -10696,6 +10834,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 },
                 tab: *tab,
                 direction: direction.as_deref().map(parse_direction).transpose()?,
+                by: None,
+                window: None,
+                account: None,
             },
         },
         Command::Logs(sub) => match sub {
@@ -15609,6 +15750,10 @@ mod tests {
             "{text}"
         );
         assert!(
+            !text.contains("この期間の使用量"),
+            "索引が無い（S1 だけ）の応答: {text}"
+        );
+        assert!(
             text.contains("    5h    12%  解除 12:02  最新の観測 11:12（2 点）\n"),
             "{text}"
         );
@@ -15621,6 +15766,46 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("  記録 3 点（11:02 〜 11:12）\n"), "{text}");
+        // #2201: 使用量の内訳（期間・合計・段・残りの件数・注記）
+        let mut with_usage = payload.clone();
+        with_usage["window"] = serde_json::json!("7d");
+        with_usage["by"] = serde_json::json!("issue");
+        with_usage["index"] = serde_json::json!({"enabled": true});
+        with_usage["notes"] = serde_json::json!(["api_usd は API 換算"]);
+        let amount = serde_json::json!({
+            "api_usd": 12.345, "total_tokens": 123_456_789u64, "tokens": {"output": 45_678},
+            "responses": 10, "sessions": 2, "unpriced_tokens": 5,
+        });
+        let mut group = amount.clone();
+        group["name"] = serde_json::json!("tako #2201");
+        with_usage["logins"][0]["usage"] = serde_json::json!({
+            "range": {"basis": "observed", "from": at - 3_600, "to": at + 600, "resets_at": at + 600},
+            "total": amount,
+            "groups": [group],
+            "more_groups": 3,
+        });
+        let text = usage_text(&with_usage, at + 600, 9 * 3_600);
+        assert!(
+            text.contains(
+                "    今の 7d の窓（10:02 〜・解除 11:12）  API 換算 $12.35・トークン 1.23 億（出力 4.6 万）・応答 10・会話 2・単価不明 5\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("      tako #2201  API 換算 $12.35"), "{text}");
+        assert!(
+            text.contains("  ログイン A（鍵 0123456789ab）  観測 3 点\n"),
+            "内訳があるときは mod の会話数を出さない: {text}"
+        );
+        assert!(
+            text.contains("      ほか 3 件（--limit で増やせる）\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    この期間の使用量は無い\n"),
+            "ログイン B: {text}"
+        );
+        assert!(text.contains("  段: issue（既定は project）\n"), "{text}");
+        assert!(text.ends_with("  注: api_usd は API 換算\n"), "{text}");
         // 観測が無いときは案内だけ・A/B では記録していないと出す
         let empty = serde_json::json!({
             "recording": false, "legacy_env": "TAKO_2192_S1_LEGACY",

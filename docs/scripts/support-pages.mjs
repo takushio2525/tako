@@ -401,7 +401,7 @@ const AGENT_CATEGORIES = [
   ['利用制限', [
     'worker_limit_detect', 'worker_limit_autoresume', 'limit_autocontinue_upstream',
     'worker_limit_metrics', 'worker_entitlement_detect',
-    'limit_service_switch',
+    'limit_service_switch', 'usage_tokens',
   ]],
   ['リモートからの操作', ['remote_control']],
   ['その他', ['git_resolve_agent']],

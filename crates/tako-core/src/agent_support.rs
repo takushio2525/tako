@@ -321,6 +321,8 @@ pub mod keys {
     pub const SETUP_RULES_SYNC: &str = "setup_rules_sync";
     /// solo の起動
     pub const SOLO_LAUNCH: &str = "solo_launch";
+    /// 会話記録の使用量（トークン 5 成分・API 換算）を索引してプロジェクト・Issue・会話の内訳を出す（#2201）
+    pub const USAGE_TOKENS: &str = "usage_tokens";
     /// Bypass ダイアログの事前承諾
     pub const WORKER_BYPASS_PREACCEPT: &str = "worker_bypass_preaccept";
     /// 選択肢ダイアログの検知と応答
@@ -429,6 +431,12 @@ pub mod notes {
     pub const AGY_CREDITS_NOT_WINDOWED: Note = Note::new(
         "agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査）",
         "In agy, headroom is a prepaid AI-credit balance: there is no 5h/weekly window and no reset time. The balance appears only inside the interactive /credits modal, so there is no way to read it without disturbing the worker's screen (re-verified on agy 1.1.22 in #985)",
+    );
+
+    /// #2201: agy の使用量は会話の保管庫（SQLite）の中にしか無い
+    pub const AGY_USAGE_IN_SQLITE: Note = Note::new(
+        "agy のトークン数は会話の保管庫（conversations/<id>.db = SQLite の gen_metadata の行）にしか無く、実況ログには無い。tako は SQLite を読む依存を持たない（#984 の判断）ので、依存の可否を #2205 で調べる",
+        "agy records token counts only inside its conversation store (conversations/<id>.db, the gen_metadata rows in SQLite), not in its live log. tako has no dependency for reading SQLite (the #984 decision), so whether to add one is being investigated in #2205",
     );
 
     /// #985: 上限で「止まる」概念が無いので待つべきリセットが存在しない
@@ -1392,6 +1400,22 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Source(
             "solo は master と同じ build_master_cmd_in を通るので、agy は同じ理由で \
              起動前にエラーになる（#111 / #127）",
+        ),
+    },
+    AgentFeature {
+        key: keys::USAGE_TOKENS,
+        summary: Note::new(
+            "会話記録の使用量（トークン・API 換算）をプロジェクト・Issue・会話ごとに集計する（#2201）",
+            "Usage from conversation logs (tokens, API-equivalent cost) is tallied per project, Issue and session (#2201)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_WIRED, 2204),
+        agy: pending(notes::AGY_USAGE_IN_SQLITE, 2205),
+        local: local_pending(),
+        evidence: AgentEvidence::UnitTest(
+            "tako_control::usage::index::tests（偽の transcript の分割行・仮の output・<synthetic>・\
+             サブエージェント・書きかけの最終行・切り詰め・追記分だけの読み直し・カタログの追い出し）。\
+             codex は rollout の token_count に累積値がある（設計書 §1.5 = #2204 で取り込む）",
         ),
     },
     AgentFeature {

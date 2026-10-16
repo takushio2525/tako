@@ -3570,7 +3570,8 @@ pub fn tools() -> Vec<Value> {
                 （tako_orchestrator_profiles の remote_control: true で起動し直す）。\
                 remote_link.account_label はどの tako アカウント配下か（スマホが別アカウントだと一覧に出ない）。\
                 resume / link は claude のみ（codex / agy は list だけ）。\
-                usage: ログインごとの利用制限（5h / 7d）の最新の観測と点数。",
+                usage: ログインごとの利用制限（5h / 7d）の最新の観測と、期間の中の使用量\
+                （トークン 5 成分・API 換算・会話数）を by の段で。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3590,11 +3591,25 @@ pub fn tools() -> Vec<Value> {
                     },
                     "project": {
                         "type": "string",
-                        "description": "list のプロジェクト絞り込み",
+                        "description": "list / usage のプロジェクト絞り込み",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "list の最大件数（既定 30）",
+                        "description": "list の最大件数（既定 30）/ usage の段の上位（既定 10）",
+                    },
+                    "by": {
+                        "type": "string",
+                        "enum": ["project", "issue", "task-type", "session", "model", "account", "day", "role", "login"],
+                        "description": "usage の段（既定 project）",
+                    },
+                    "window": {
+                        "type": "string",
+                        "enum": ["5h", "7d", "day", "week", "month", "all"],
+                        "description": "usage の期間（既定 7d = 今の窓）",
+                    },
+                    "account": {
+                        "type": "string",
+                        "description": "usage の tako アカウント絞り込み",
                     },
                     "pane": {
                         "type": "integer",

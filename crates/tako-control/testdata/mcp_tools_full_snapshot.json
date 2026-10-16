@@ -4566,10 +4566,14 @@
     "name": "tako_tree_folder"
   },
   {
-    "description": "tako が起動した master / worker / solo / 手動 claude の会話の索引（ラベル・ロール・プロジェクト・Issue 番号つき。本文は transcript への参照だけ）の参照と会話の復元。list: role / project で絞り込み、last_seen の新しい順に limit 件。show: id（前方一致可）のメタ情報 + 会話冒頭の抜粋。resume: ペイン・タブ・tmux / psmux が全滅していても、記録された cwd で新ペインを分割起動し、元の起動と同じ引数（モデル・effort・system prompt・許可モード）+ `--resume <session_id>` で復元する（応答の recipe に組み立て方）。link: その会話を Claude 公式アプリ / claude.ai で開く session URL を返す。remote_link.state = connected（url あり）/ not_connected / ineligible: <理由> / unknown（会話が特定できない）。繋がっていなければ url は無く、remote_link.reason を読み remote_link.next_step / enable_command に従う（tako_orchestrator_profiles の remote_control: true で起動し直す）。remote_link.account_label はどの tako アカウント配下か（スマホが別アカウントだと一覧に出ない）。resume / link は claude のみ（codex / agy は list だけ）。usage: ログインごとの利用制限（5h / 7d）の最新の観測と点数。",
+    "description": "tako が起動した master / worker / solo / 手動 claude の会話の索引（ラベル・ロール・プロジェクト・Issue 番号つき。本文は transcript への参照だけ）の参照と会話の復元。list: role / project で絞り込み、last_seen の新しい順に limit 件。show: id（前方一致可）のメタ情報 + 会話冒頭の抜粋。resume: ペイン・タブ・tmux / psmux が全滅していても、記録された cwd で新ペインを分割起動し、元の起動と同じ引数（モデル・effort・system prompt・許可モード）+ `--resume <session_id>` で復元する（応答の recipe に組み立て方）。link: その会話を Claude 公式アプリ / claude.ai で開く session URL を返す。remote_link.state = connected（url あり）/ not_connected / ineligible: <理由> / unknown（会話が特定できない）。繋がっていなければ url は無く、remote_link.reason を読み remote_link.next_step / enable_command に従う（tako_orchestrator_profiles の remote_control: true で起動し直す）。remote_link.account_label はどの tako アカウント配下か（スマホが別アカウントだと一覧に出ない）。resume / link は claude のみ（codex / agy は list だけ）。usage: ログインごとの利用制限（5h / 7d）の最新の観測と、期間の中の使用量（トークン 5 成分・API 換算・会話数）を by の段で。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "account": {
+          "description": "usage の tako アカウント絞り込み",
+          "type": "string"
+        },
         "action": {
           "description": "操作種別",
           "enum": [
@@ -4578,6 +4582,21 @@
             "resume",
             "link",
             "usage"
+          ],
+          "type": "string"
+        },
+        "by": {
+          "description": "usage の段（既定 project）",
+          "enum": [
+            "project",
+            "issue",
+            "task-type",
+            "session",
+            "model",
+            "account",
+            "day",
+            "role",
+            "login"
           ],
           "type": "string"
         },
@@ -4596,7 +4615,7 @@
           "type": "string"
         },
         "limit": {
-          "description": "list の最大件数（既定 30）",
+          "description": "list の最大件数（既定 30）/ usage の段の上位（既定 10）",
           "type": "integer"
         },
         "pane": {
@@ -4604,7 +4623,7 @@
           "type": "integer"
         },
         "project": {
-          "description": "list のプロジェクト絞り込み",
+          "description": "list / usage のプロジェクト絞り込み",
           "type": "string"
         },
         "role": {
@@ -4620,6 +4639,18 @@
         "tab": {
           "description": "resume の分割先タブ ID（そのタブのフォーカスペインの隣）",
           "type": "integer"
+        },
+        "window": {
+          "description": "usage の期間（既定 7d = 今の窓）",
+          "enum": [
+            "5h",
+            "7d",
+            "day",
+            "week",
+            "month",
+            "all"
+          ],
+          "type": "string"
         }
       },
       "required": [

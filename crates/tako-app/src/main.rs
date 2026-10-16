@@ -6410,7 +6410,8 @@ impl TakoApp {
                     }
                     // #1959: mod の報告で新しく見えた設定 dir へ skills/tako（読み書きは背景）
                     app.drive_claude_mod_skills_sync(wcx);
-                    // #2200: 報告で積んだ利用制限の観測を `<data_dir>/usage/` へ（鍵の解決と追記は背景）
+                    // #2200 / #2201: 報告で積んだ利用制限の観測を `<data_dir>/usage/` へ・使用量の索引を
+                    // 読み進める（番の判断・鍵の解決・読み書きはすべて背景）
                     app.drive_usage_record(wcx);
                     {
                         // #572: busy 中に人間が打った指示が claude のキューに滞留したまま
@@ -10075,17 +10076,15 @@ impl TakoApp {
             .detach();
     }
 
-    /// 利用制限の観測を書く（usage 分析 S1 #2200。定期処理から呼ぶ）。dispatch が報告のたびに
-    /// `ModHub` へ積んだ材料（値が変わった枠・初めての会話）を汲み出すだけで、資格情報のファイルの読み・
-    /// 重複除去・追記は背景で行う（UI スレッドでファイルに触らない）。A/B（`TAKO_2192_S1_LEGACY=1`）は
-    /// 背景の側が何も書かない
+    /// 利用制限の観測を書き、使用量の索引を読み進める（usage 分析 S1 #2200 / S2 #2201。定期処理から呼ぶ）。
+    /// dispatch が報告のたびに `ModHub` へ積んだ材料（値が変わった枠・初めての会話）を汲み出して
+    /// 背景へ渡すだけで、資格情報のファイルの読み・重複除去・追記と、索引の番の判断（起動から 60 秒後・
+    /// 以後 60 秒ごと）・会話記録の読み込みは背景で行う（UI スレッドでファイルに触らない）。
+    /// A/B（`TAKO_2192_S1_LEGACY=1` / `TAKO_2192_S2_LEGACY=1`）は背景の側が何もしない
     fn drive_usage_record(&mut self, cx: &mut Context<Self>) {
-        if self.claude_mod.pending_usage.is_empty() {
-            return;
-        }
         let batch = self.claude_mod.take_pending_usage();
         cx.background_executor()
-            .spawn(async move { tako_control::usage::record_for_gui(batch) })
+            .spawn(async move { tako_control::usage::drive_for_gui(batch) })
             .detach();
     }
 
