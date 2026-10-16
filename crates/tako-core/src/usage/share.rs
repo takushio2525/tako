@@ -80,6 +80,16 @@ impl ObservedWindow {
     }
 }
 
+/// 解除時刻の揺れを寄せた束（[`windows_for`] の途中）
+struct ResetGroup {
+    /// 束の解除時刻（いちばん遅いもの）
+    last: i64,
+    /// 揺れの中でいちばん早い解除時刻（codex の窓の開始に使う）
+    first: i64,
+    /// 観測（unix 秒, %）
+    points: Vec<(i64, f64)>,
+}
+
 /// ログイン `login` の枠 `kind` の観測がすべて codex の rollout から来たか（S5 #2204。窓の寄せ方と推定の有無が違う）
 pub fn codex_only(observations: &[LimitObservation], login: &str, kind: &str) -> bool {
     let mut any = false;
@@ -126,22 +136,30 @@ pub fn windows_for(
     } else {
         len / 2
     };
-    // （束の解除時刻 = いちばん遅いもの, いちばん早いもの, 観測）
-    let mut groups: Vec<(i64, i64, Vec<(i64, f64)>)> = Vec::new();
+    let mut groups: Vec<ResetGroup> = Vec::new();
     for (r, pts) in by_reset {
         match groups.last_mut() {
-            Some((gr, _, gpts)) if r - *gr <= tolerance => {
-                *gr = r;
-                gpts.extend(pts);
+            Some(g) if r - g.last <= tolerance => {
+                g.last = r;
+                g.points.extend(pts);
             }
-            _ => groups.push((r, r, pts)),
+            _ => groups.push(ResetGroup {
+                last: r,
+                first: r,
+                points: pts,
+            }),
         }
     }
     let mut out = Vec::with_capacity(groups.len());
     let mut prev_reset: Option<i64> = None;
     // codex: 前の窓の最後の点（窓の区間が重ならないよう、次の窓の開始をこれより前に置かない）
     let mut prev_last: Option<i64> = None;
-    for (r, first_r, mut pts) in groups {
+    for ResetGroup {
+        last: r,
+        first: first_r,
+        points: mut pts,
+    } in groups
+    {
         let start = if codex {
             // 早く始まった窓は前の窓の解除を待たない。揺れの中でいちばん早い解除時刻から開始を取る
             prev_last.map_or(first_r - len, |p| (first_r - len).max(p))

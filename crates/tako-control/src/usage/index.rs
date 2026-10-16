@@ -1080,7 +1080,7 @@ impl Indexer {
             }
             self.codex_seen = Some(seen);
         }
-        limits.sort_by(|a, b| a.1.observed_at.cmp(&b.1.observed_at));
+        limits.sort_by_key(|(_, l)| l.observed_at);
         let now = now_ms();
         let mut logins: HashMap<usize, LoginKey> = HashMap::new();
         let mut out = Vec::new();

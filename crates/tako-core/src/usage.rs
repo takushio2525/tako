@@ -677,7 +677,10 @@ mod tests {
             r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-秘密","tokens":{{"id_token":"秘密","access_token":"秘密","refresh_token":"秘密","account_id":" {UUID_A} "}},"last_refresh":"2026-10-01"}}"#
         );
         assert_eq!(codex_account_id_from_json(&text).as_deref(), Some(UUID_A));
-        assert_eq!(codex_account_id_from_json(r#"{"OPENAI_API_KEY":"sk-x"}"#), None);
+        assert_eq!(
+            codex_account_id_from_json(r#"{"OPENAI_API_KEY":"sk-x"}"#),
+            None
+        );
         assert_eq!(
             codex_account_id_from_json(r#"{"tokens":{"account_id":""}}"#),
             None
@@ -686,7 +689,11 @@ mod tests {
         let k = codex_account_key(SALT, UUID_A);
         assert_eq!(k.key.len(), KEY_HEX_LEN);
         assert_eq!(k.from, KeyFrom::Account);
-        assert_ne!(k.key, account_key(SALT, UUID_A).key, "claude の鍵と突き合わない");
+        assert_ne!(
+            k.key,
+            account_key(SALT, UUID_A).key,
+            "claude の鍵と突き合わない"
+        );
         assert_eq!(k, codex_account_key(SALT, &format!(" {UUID_A}\n")));
         let h = codex_home_key(SALT, Path::new("/home/testuser/.codex"));
         assert_eq!(h.from, KeyFrom::ConfigDir);
