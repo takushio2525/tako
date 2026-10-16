@@ -130,7 +130,7 @@ draw_scroll() {
     printf '⏺ Bash(cargo test %d)\n  ⎿  test result: ok. 12 passed\n\n' "$i"
     i=$((i + 1))
   done
-  for l in "${conv[@]}"; do
+  for l in ${conv[@]+"${conv[@]}"}; do
     printf '%s\n' "$l"
   done
   footer_block
