@@ -1096,11 +1096,10 @@ async function pressCard($: EngineInterface, op: CardOp, sel: CardSel, press: Ui
   } catch (err) {
     $.ui.log(`tako mod: card ${op} failed: ${String(err).slice(0, 200)}`, { to: 'debug' })
   }
-  const at = await $.clock.now()
-  lastPress = { kind, ok, at }
+  lastPress = { kind, ok, at: await $.clock.now() }
   if (op === 'run') {
     // 走らせたら少しの間だけ捨てる（ダブルクリックの 2 打目）・断られた / 失敗したらすぐ押し直せる
-    if (ok) runBusy.set(runKey, at + RUN_REPEAT_MS)
+    if (ok) runBusy.set(runKey, lastPress.at + RUN_REPEAT_MS)
     else runBusy.delete(runKey)
     if (!ok) {
       try {

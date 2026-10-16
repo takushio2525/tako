@@ -196,7 +196,7 @@ fn scan_guard(register: &str) -> Vec<String> {
         &[
             "if ((runBusy.get(runKey) ?? 0) > now) return",
             "runBusy.set(runKey, Number.POSITIVE_INFINITY)",
-            "if (ok) runBusy.set(runKey, at + RUN_REPEAT_MS)",
+            "if (ok) runBusy.set(runKey, lastPress.at + RUN_REPEAT_MS)",
             "else runBusy.delete(runKey)",
         ],
         "Run は CLI を叩く前に番を取り、走ったら RUN_REPEAT_MS まで捨て、断られたら外す（ダブルクリックで 2 本走らせない）",
@@ -411,7 +411,7 @@ fn 逆戻りを名指しできる() {
     let found = mutate(&|s| {
         replace_once(
             &mut s.register,
-            "    if (ok) runBusy.set(runKey, at + RUN_REPEAT_MS)\n",
+            "    if (ok) runBusy.set(runKey, lastPress.at + RUN_REPEAT_MS)\n",
             "    if (ok) runBusy.delete(runKey)\n",
         );
     });
