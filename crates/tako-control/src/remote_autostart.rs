@@ -250,14 +250,13 @@ pub const REASON_SPAWN_FAILED: &str = "spawn-failed";
 pub const DETAIL_MAX_CHARS: usize = 300;
 
 /// 理由文を記録・診断へ載せる形へ整える（純関数）。
-/// 改行を 1 行へ畳み、長すぎるものは切る（`status` の JSON と persist.log の 1 行が壊れない）
+/// 改行を 1 行へ畳み、長すぎるものは切る（`status` の JSON と persist.log の 1 行が壊れない）。
+///
+/// 切るのは `tako_core::text::truncate_chars` の 1 実装（#1790）。`…` を上限の外に付ける
+/// 契約なので上限を `DETAIL_MAX_CHARS + 1` で渡す = `…` 込みで最大 `DETAIL_MAX_CHARS + 1` 文字
 pub fn trim_detail(detail: &str) -> String {
     let joined = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    if joined.chars().count() <= DETAIL_MAX_CHARS {
-        return joined;
-    }
-    let cut: String = joined.chars().take(DETAIL_MAX_CHARS).collect();
-    format!("{cut}…")
+    tako_core::text::truncate_chars(&joined, DETAIL_MAX_CHARS + 1)
 }
 
 impl LastAutostart {
@@ -537,11 +536,9 @@ mod tests {
         let max = DETAIL_MAX_CHARS;
         // ちょうど上限は切らない
         assert_eq!(trim_detail(&"あ".repeat(max)), "あ".repeat(max));
-        // 上限 + 1 文字ちょうど
-        assert_eq!(
-            trim_detail(&"あ".repeat(max + 1)),
-            format!("{}…", "あ".repeat(max))
-        );
+        // 上限 + 1 文字ちょうどは原文のまま（寄せる前は「max 文字 + `…`」= 同じ幅で
+        // 末尾 1 文字を `…` に置き換えていた。#1790 で寄せた後の唯一の差）
+        assert_eq!(trim_detail(&"あ".repeat(max + 1)), "あ".repeat(max + 1));
         // 上限 + 2 文字以上は内容 max 文字 + `…`
         assert_eq!(
             trim_detail(&"あ".repeat(max + 2)),

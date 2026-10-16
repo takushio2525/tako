@@ -885,15 +885,13 @@ fn extract_issues_with(text: &str, legacy: bool) -> Vec<u32> {
     out
 }
 
-/// プロンプト冒頭の抜粋（1 行に正規化して最大 `max` 文字）
+/// プロンプト冒頭の抜粋（1 行に正規化して最大 `max` 文字 + `…`）。
+///
+/// 切るのは `tako_core::text::truncate_chars` の 1 実装（#1790）。`…` を上限の外に付ける
+/// 契約なので上限を `max + 1` で渡す = `…` 込みで最大 `max + 1` 文字
 pub fn prompt_head(prompt: &str, max: usize) -> String {
     let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        let head: String = flat.chars().take(max).collect();
-        format!("{head}…")
-    }
+    tako_core::text::truncate_chars(&flat, max.saturating_add(1))
 }
 
 /// 表示用の短縮 ID（先頭 8 文字）
@@ -1587,11 +1585,9 @@ mod tests {
     fn prompt_headの切り詰めの固定値() {
         // ちょうど max 文字は切らない
         assert_eq!(prompt_head(&"あ".repeat(10), 10), "あ".repeat(10));
-        // max + 1 文字ちょうど
-        assert_eq!(
-            prompt_head(&"あ".repeat(11), 10),
-            format!("{}…", "あ".repeat(10))
-        );
+        // max + 1 文字ちょうどは原文のまま（寄せる前は「max 文字 + `…`」= 同じ幅で
+        // 末尾 1 文字を `…` に置き換えていた。#1790 で寄せた後の唯一の差）
+        assert_eq!(prompt_head(&"あ".repeat(11), 10), "あ".repeat(11));
         // max + 2 文字以上は内容 max 文字 + `…`
         assert_eq!(
             prompt_head(&"あ".repeat(12), 10),
@@ -1612,9 +1608,9 @@ mod tests {
             "Issue #12 を 直す"
         );
         assert_eq!(prompt_head("a\n\nb c d", 3), "a b…");
-        // max = 0（1 文字でも `…` だけ）・max が最大でもあふれない
+        // max = 0 は `…` だけ（1 文字ちょうどは上の差と同じで原文）・max が最大でもあふれない
         assert_eq!(prompt_head("abc", 0), "…");
-        assert_eq!(prompt_head("a", 0), "…");
+        assert_eq!(prompt_head("a", 0), "a");
         assert_eq!(prompt_head("abc", usize::MAX), "abc");
         // 空・空白だけは空
         assert_eq!(prompt_head("", 10), "");
