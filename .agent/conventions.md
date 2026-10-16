@@ -3213,7 +3213,8 @@ false になり、`status` の予告と `run` の報告が食い違った。
 
 退避の口は `tako_core::migration::quarantine_unreadable` の 1 実装で、移行（`migrate_file`）と
 「読めなければ既定値へ落とす」読み手（`settings::load_from` / `RecentList::load_from` /
-`ShortcutsFile::load_from` / `lid.rs` の `read_from`）が全員ここを通る。
+`ShortcutsFile::load_from` / `lid.rs` の `read_from`）と、復元に使えない layout.json の後始末
+（`layout::stash_unrestorable`。#1824）が全員ここを通る。
 
 以前は退避先（`<name>.unreadable.bak`）が既にあると**何も写さずそのパスを返していた**ので、
 実行中にもう一度別の中身で壊れると 2 回目の中身はどこにも残らず、呼び出し側の保存
@@ -3241,6 +3242,33 @@ false になり、`status` の予告と `run` の報告が食い違った。
 - 実経路の検査は `scripts/test-unreadable-quarantine-1819.sh`（隔離 GUI に対して 3 回壊す /
   同じ中身 / 人が消した後 / 壊れたまま再起動 / 上限 / recent・shortcuts / layout /
   projects・profiles の fail-loud）
+
+### 口を通らなかった 2 経路を寄せた（Issue #1824）
+
+#1819 の後も、退避の口を通らない・記録が残らない経路が 2 つ残っていた。
+
+- **recent.json / remote/shortcuts.json の破損が persist.log に残らなかった**。読み手は
+  tako-core にあり、診断ログの書き手（tako-control の `diag`）を呼べない。いまは core の読み手
+  （`RecentList::load_from_checked` / `ShortcutsFile::load_from_checked`）が落とした理由
+  （`tako_core::load_issue::LoadIssue`）を返し、既定の置き場から読む口
+  `tako_control::data_files::{load_recent, load_remote_shortcuts}` が**移行の記録と同じ形**の 1 行
+  （`移行できず: recent <パス>（理由・退避 <先>・発生源 load）`。読めないときは `移行を中止: …`）を残す。
+  dispatch・PWA・GUI はこの口だけを通る（core の読み手を直に呼ぶ本番コードは番犬が名指す）。
+  記録は**壊れた中身ごとに 1 回**: 退避が今回写した回だけ書き（起動時の移行が先に写して記録した
+  中身は二重に書かない。CLI は呼ぶたびに別プロセスなので copied で判断する）、写せない・読めない
+  ときはプロセス内で 1 回
+- **layout.json の `.corrupt` rename が前回分を上書きしていた**。中身が残っていたのは GUI の main が
+  先に `ensure_migrated` で番号付きの退避へ写していたからで、呼び出し順に頼った保全だった。
+  いまは復元失敗の後始末 `layout::stash_after_failed_restore`（→ `stash_unrestorable`）が自分で
+  `quarantine_unreadable` を通し、残せたら layout.json を表から外す。文字として読めない中身
+  （UTF-8 でない・権限で読めない）は写せないので**バイトのまま**空いている番号へ rename する
+  （捨てると次の保存の tmp → rename が消す）。どこにも残せなければ layout.json に触らない
+- **診断ログの理由に読んだ値を載せない**: serde_json の文言は型が違うと
+  `invalid type: string "<値>"` のように値を含む（実測）。読み手と layout の復元失敗（persist.log と
+  テレメトリへ出る）の理由は `tako_core::load_issue::json_reason`（種類と行・列だけ）で組む
+- A/B は `TAKO_1824_LEGACY=1`（記録しない・`.corrupt` へ rename）。検査は
+  `crates/tako-control/tests/issue1824_corrupt_quarantine_ab.rs`（移行を先に通さない呼び順）・
+  番犬 `issue1824_corrupt_quarantine_watchdog.rs`・実経路 `scripts/test-corrupt-quarantine-1824.sh`
 
 ### 置き場を変える移行は隔離中に走らせない（Issue #1019）
 

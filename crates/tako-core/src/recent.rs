@@ -1,6 +1,7 @@
 //! 最近開いたディレクトリ/SSH ホストの記録と永続化。
 //! `<data_dir>/recent.json` に保存する。
 
+use crate::load_issue::LoadIssue;
 use crate::paths;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -43,25 +44,31 @@ pub struct RecentList {
 }
 
 impl RecentList {
-    pub fn load() -> Self {
-        let path = match recent_path() {
-            Some(p) => p,
-            None => return Self::default(),
-        };
-        Self::load_from(&path)
+    /// 指定パスから読む。**解釈できない内容は既定値へ落とす前に退避する**（#916）。
+    /// 退避しておかないと、直後の [`save`](Self::save) が元の内容を上書きして消す。
+    ///
+    /// 既定の置き場から読むのは `tako_control::data_files::load_recent`（落とした理由を
+    /// persist.log へ残す口。#1824）。ここを直接呼ぶと記録が残らない
+    pub fn load_from(path: &std::path::Path) -> Self {
+        Self::load_from_checked(path).0
     }
 
-    /// 指定パスから読む。**解釈できない内容は既定値へ落とす前に退避する**（#916）。
-    /// 退避しておかないと、直後の [`save`](Self::save) が元の内容を上書きして消す
-    pub fn load_from(path: &std::path::Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
+    /// [`load_from`](Self::load_from) の本体。既定値へ落としたなら理由も返す（#1824）
+    pub fn load_from_checked(path: &std::path::Path) -> (Self, Option<LoadIssue>) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => return (Self::default(), LoadIssue::from_read_error(&e)),
         };
         match serde_json::from_str(&text) {
-            Ok(list) => list,
-            Err(_) => {
-                let _ = crate::migration::quarantine_unreadable(path, &crate::migration::FsIo);
-                Self::default()
+            Ok(list) => (list, None),
+            Err(e) => {
+                let quarantine =
+                    crate::migration::quarantine_unreadable(path, &crate::migration::FsIo);
+                let issue = LoadIssue::Unparsable {
+                    reason: crate::load_issue::json_reason(&e),
+                    quarantine,
+                };
+                (Self::default(), Some(issue))
             }
         }
     }
@@ -92,7 +99,8 @@ impl RecentList {
     }
 }
 
-fn recent_path() -> Option<PathBuf> {
+/// 既定の置き場（`<data_dir>/recent.json`）
+pub fn recent_path() -> Option<PathBuf> {
     paths::data_dir().map(|d| d.join(FILENAME))
 }
 
@@ -114,6 +122,36 @@ mod tests {
             std::fs::read_to_string(crate::migration::quarantine_path(&path)).expect("読める"),
             "[こわれた"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1824: 既定値へ落とした理由を返す（不在と正常は理由にしない）
+    #[test]
+    fn 落とした理由を返す() {
+        let dir = std::env::temp_dir().join(format!("tako-recent-issue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("作れる");
+        let path = dir.join("recent.json");
+        assert!(path.starts_with(std::env::temp_dir()), "一時 dir の中だけ");
+
+        assert_eq!(RecentList::load_from_checked(&path).1, None, "不在");
+        for (body, slot) in [("", 1), (r#"{"entries": [{"type": "dire"#, 2)] {
+            std::fs::write(&path, body).expect("書ける");
+            let (list, issue) = RecentList::load_from_checked(&path);
+            assert!(list.entries.is_empty());
+            match issue {
+                Some(LoadIssue::Unparsable {
+                    quarantine: Some(q),
+                    ..
+                }) => {
+                    assert!(q.copied, "{body:?} は初めて見る中身");
+                    assert_eq!(q.path, crate::migration::quarantine_slot_path(&path, slot));
+                }
+                other => panic!("{body:?} の理由が違う: {other:?}"),
+            }
+        }
+        std::fs::write(&path, r#"{"entries": []}"#).expect("書ける");
+        assert_eq!(RecentList::load_from_checked(&path).1, None, "正常");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

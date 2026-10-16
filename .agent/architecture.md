@@ -648,7 +648,8 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   `<data_dir>/persist.log`（`tako-control::diag`。復元成否・理由・明示削除を記録、
   256KB で `.old` ローテート）と `tako persist` / MCP `tako_persist` の
   `layout_path` / `layout_exists` / `last_restore` / `log_path` で診断できる。
-  破損 layout.json は上書きせず `layout.json.corrupt` へ退避する
+  破損 layout.json は上書きせず番号付きの退避（`layout.json.unreadable[.<n>].bak`）へ移す
+  （`layout::stash_unrestorable`。#1824 で前回分を上書きする `.corrupt` の rename から寄せた）
 - **close 整合**: 明示 close（×・cmd+W・CLI / MCP close）= バックエンドセッションも kill。
   アプリ終了・クラッシュ = detach のみ（= 永続化）。PTY 死亡由来の close
   （SessionNotice::Exited。`CloseReason` で明示 close と区別）はセッションを kill せず、

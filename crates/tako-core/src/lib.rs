@@ -40,6 +40,7 @@ pub mod jump_history;
 pub mod limit_resume;
 pub mod limit_resume_all;
 pub mod links;
+pub mod load_issue;
 pub mod lsp;
 pub mod master_tab;
 pub mod md_links;

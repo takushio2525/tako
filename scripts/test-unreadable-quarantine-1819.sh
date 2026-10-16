@@ -266,9 +266,10 @@ done
 
 echo
 echo "== ⑦ layout.json を中身を変えて 3 回壊し、そのたびに GUI を起動し直す =="
-# layout.json は tako が書くファイルで、壊れていると起動時の復元が `layout.json.corrupt` へ
-# rename する（#30。rename は前回の `.corrupt` を上書きする）。起動時の自動移行（#916）も
-# 同じファイルを退避する。隔離起動は既定で復元を切る（TAKO_PERSIST=0）ので明示して通す
+# layout.json は tako が書くファイルで、壊れていると起動時の復元が番号付きの退避
+# （`layout.json.unreadable[.<n>].bak`）へ移す（#1824。以前は `layout.json.corrupt` への rename で
+# 前回分を上書きしていた）。起動時の自動移行（#916）も同じ口で退避する。隔離起動は既定で
+# 復元を切る（TAKO_PERSIST=0）ので明示して通す
 for k in 1 2 3; do
   stop_isolated_gui "$APP_PID"
   APP_PID=""

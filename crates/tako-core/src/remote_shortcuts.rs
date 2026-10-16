@@ -26,6 +26,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::load_issue::LoadIssue;
 use crate::paths;
 
 /// 登録できるショートカットの上限。UI の一覧が実用の範囲に収まればよく、
@@ -189,19 +190,20 @@ impl ShortcutError {
 }
 
 impl ShortcutsFile {
-    /// 既定の置き場から読む
-    pub fn load() -> Self {
-        match shortcuts_path() {
-            Some(p) => Self::load_from(&p),
-            None => Self::default(),
-        }
+    /// 指定パスから読む。**解釈できない内容は既定値へ落とす前に退避する**（#916）。
+    /// 退避しておかないと、直後の [`save_to`](Self::save_to) が元の内容を上書きして消す。
+    ///
+    /// 既定の置き場から読むのは `tako_control::data_files::load_remote_shortcuts`
+    /// （落とした理由を persist.log へ残す口。#1824）。ここを直接呼ぶと記録が残らない
+    pub fn load_from(path: &Path) -> Self {
+        Self::load_from_checked(path).0
     }
 
-    /// 指定パスから読む。**解釈できない内容は既定値へ落とす前に退避する**（#916）。
-    /// 退避しておかないと、直後の [`save_to`](Self::save_to) が元の内容を上書きして消す
-    pub fn load_from(path: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
+    /// [`load_from`](Self::load_from) の本体。既定値へ落としたなら理由も返す（#1824）
+    pub fn load_from_checked(path: &Path) -> (Self, Option<LoadIssue>) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => return (Self::default(), LoadIssue::from_read_error(&e)),
         };
         match serde_json::from_str::<Self>(&text) {
             Ok(mut file) => {
@@ -210,11 +212,16 @@ impl ShortcutsFile {
                 for s in &mut file.shortcuts {
                     s.builtin = false;
                 }
-                file
+                (file, None)
             }
-            Err(_) => {
-                let _ = crate::migration::quarantine_unreadable(path, &crate::migration::FsIo);
-                Self::default()
+            Err(e) => {
+                let quarantine =
+                    crate::migration::quarantine_unreadable(path, &crate::migration::FsIo);
+                let issue = LoadIssue::Unparsable {
+                    reason: crate::load_issue::json_reason(&e),
+                    quarantine,
+                };
+                (Self::default(), Some(issue))
             }
         }
     }
