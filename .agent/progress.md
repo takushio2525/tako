@@ -20,27 +20,6 @@
 
 ---
 
-## 2026-10-16（#2151: git_bin() / tmux_bin() の初回の解決に全体 5 秒の締め切り = 戻らないログインシェルで止まらない）
-- `tako_core::bin_resolve`・打ち切ったら素の名前へ・理由を persist.log へ。A/B `TAKO_2151_LEGACY=1`・修正後 2.05 秒 / 修正前は戻らない。PR #2171
-
-## 2026-10-16（#2169: CLI の IPC で上限の入れ直しが EINVAL のとき、届いた応答を待たない読みで読む）
-- 未着なら待たずに元の誤り。修正前は 4 本が os error 22・番犬 `issue2169_ipc_einval_watchdog`。PR #2172
-
-## 2026-10-16（#2048: 隔離 GUI では言語サーバを自動で起こさず・取らない = `TAKO_LSP_AUTOSTART=1` / `TAKO_LSP_AUTO_FETCH=1` で従来どおり）
-- 呼び手 22 本へ env・A/B `TAKO_2048_LEGACY=1`・`scripts/test-lsp-isolated-2048.sh` 26 PASS。既存の `test-lsp-1678.sh` ③ の失敗は #2174。PR #2173
-
-## 2026-10-16（#2174: test-lsp-1678.sh の ③ で servers の `cached`（呼んだ順の印）の値だけを比べず、キーと型・他の全フィールドは比べる）
-- 修正前 32 PASS 1 FAIL → 修正後 33 PASS・id / installed の取り違えの注入は ③ で落ちる。PR #2176
-
-## 2026-10-16（#1858: recover --apply がバックアップ後のタブを合流・復元時に器の無い master / worker のペインだけを刈り込む）
-- 判断の正本 `tako_control::layout_reconcile`・A/B `TAKO_1858_LEGACY=1`・実経路 `scripts/test-recover-merge-prune-1858.sh`。PR #2178
-
-## 2026-10-16（#2042: 番犬 issue1984 の 15 節 = UI スレッドの入口から呼び出しを辿り、別名の関数で包んだ子プロセスの口も名指し）
-- 共有部品 `tests/common/call_graph.rs`・製品コード不変・誤検知 0・注入 (G1)〜(G5)。見つかった返答配送の master 起動は #2182。PR #2179
-
-## 2026-10-16（#2035: rust-analyzer へ `cargo.targetDir = true` を既定で渡し、利用者の cargo build が target のロック待ちにならない）
-- 上書きは `tako lsp options` / MCP `tako_lsp_server` action=options・実測 `scripts/test-lsp-target-dir-2035.sh` 22 PASS・A/B `TAKO_2035_LEGACY=1`・カタログ +241 B。PR #2177
-
 ## 2026-10-16（#2180: bin_resolve の「戻らないログインシェル」テストの間欠 = 真因は macOS の新しい実行ファイルの初回 exec の検査（約 0.3 秒・システム全体で直列））
 - pid の確認を締め切りの判定から分け、偽の実行ファイルを空打ち・注入 `TAKO_2180_INJECT_SHELL_DELAY_MS`・修正後 25/25 緑。同型の結合テストは #2185。PR #2183
 
@@ -79,3 +58,24 @@
 
 ## 2026-10-16（#2200: usage 分析 S1 = tako mod の報告から利用制限の観測を `usage/limits.jsonl` へ・ログインの鍵は accountUuid の塩付きハッシュ・`tako usage`）
 - `scripts/test-usage-limits-2200.sh` 31 PASS・A/B `TAKO_2192_S1_LEGACY=1`・カタログ +91 B。10/17 00:50 に本番へ入れて記録開始を確認。PR #2208
+
+## 2026-10-17（#1790 項目 1: 製品ファイルの理由の無い範囲添字 100 件を仕分け、番犬 `issue1790_byte_index_repo_watchdog` を `crates/*/src/` 全体へ）
+- 判定は `range_index::sites` へ移して #2043 と共有。本番の経路で多バイトで落ちるものは 0 件・偽 LSP の `%xx` の panic を A/B 付きで修正。PR #2210
+
+## 2026-10-17（#2209: ipc の fd 数えテストが 120 秒で落ちる真因は XNU の half-close の起こしの取りこぼし = 46.7 万往復に 1 回）
+- EOF は 500 ms で区切り、来なければ完全に閉じて fd の数で見届ける。A/B `TAKO_2209_LEGACY=1`・製品コード不変。PR #2212
+
+## 2026-10-17（#2201: usage 分析 S2 = 会話記録の使用量の索引 `<data_dir>/usage/` と `tako usage --by/--window`・MCP `tako_sessions` usage の by / window / account）
+- 実データで参照集計とトークン完全一致（37 日）・初回 4.4 GB を 4.1 秒 / RSS 72 MB・カタログ +514 B。PR #2214
+
+## 2026-10-17（#1790 項目 2: `truncate_path_middle` の末尾省略・`trim_detail`・`prompt_head` を固定値テストで固定してから `truncate_chars` へ寄せる）
+- 総当たり A/B の差は「畳んだ後が max + 1 文字ちょうど」の 44 件だけ（同じ幅で原文を返す）・注入で固定値テスト 5 本が落ちる。PR #2215
+
+## 2026-10-17（#2213: #2161 の番犬も XNU の half-close の起こしの取りこぼしで 120 秒落ちうる → FIN 待ちを 500 ms で区切り、新しい接続で往復をやり直す）
+- A/B `TAKO_2213_LEGACY=1`（120 秒で落ちる）・製品コード不変。PR #2216
+
+## 2026-10-17（#1838: setup の打ち切りテストで probe_timeouts が空の間欠 = 偽の子の初回 exec の検査が 30 秒の上限を食っていた）
+- 偽の子を作った時点で空打ち・A/B `TAKO_1838_LEGACY=1` で修正前 10/10 落ち → 修正後 0/10・製品コード不変。PR #2218
+
+## 2026-10-17（#2217: 右パネルの `git_feedback_text` の文字数の切り詰めを固定値テストで固定してから `truncate_chars(…, max + 1)` へ寄せる）
+- 総当たり A/B 33,230 件の差は「行を落とさず 601 文字ちょうど」の 324 件だけ・行数の切り詰めは不変。PR #2219
