@@ -467,6 +467,16 @@ tako lsp diagnostics --pane 7 --severity warning   # そのペインの、警告
 
 Arduino のスケッチ（`.ino`）は**基板を選ぶまで言語サーバを起こしません**。そのあいだ `tako lsp status` の `state` は `unconfigured` で、理由と選ぶコマンド（`setup_command` = `arduino-cli board attach -b <基板> <スケッチのフォルダ>`）が返ります。tako のターミナルで選べばそのまま起き、外で選んだときは `tako lsp restart` です。
 
+Rust のプロジェクトでは、rust-analyzer が起きた直後にプロジェクト全体の確認（build script と `cargo check`）を走らせます。tako はこれを **`target/rust-analyzer` で走らせる**ように rust-analyzer へ伝えるので、そのあいだに自分で `cargo build` しても `Blocking waiting for file lock` で待たされません（そのぶん build script と proc-macro の成果物は 2 か所に置かれます）。言語サーバへ渡すこうした初期設定は `tako lsp options` で見たり変えたりできます。
+
+```bash
+tako lsp options                                                   # 既定・上書き・いま動いているサーバへ渡した値
+tako lsp options --name rust-analyzer --set cargo.targetDir=false   # 分けずに同じ target を使う（ディスクを節約したいとき）
+tako lsp options --name rust-analyzer --set cargo.targetDir=null    # tako の既定へ戻す
+```
+
+変えた値は tako のデータフォルダの `settings.json`（`lsp_init_options`）に保存され、次に言語サーバを起こしたときから効きます（今すぐなら `tako lsp restart`）。値は JSON として読めればその値（`true` / `3` / `"文字列"`）、読めなければ文字列のまま渡ります。MCP では `tako_lsp_server` の `action=options`（`set` にキー → 値）が同じ操作です。
+
 `tako lsp servers` の答え（入っているか・どこに在るか）は覚えておくので、2 回目からはすぐ返ります。探し直すのは `tako lsp restart` のときと、tako のターミナルでコマンドを実行したり `cd` したりしたとき（PATH が変わりうるため）です。同じファイルを 2 つのペインで編集しても、言語サーバには 1 つの文書として届き、診断は両方のペインに出ます。
 
 `tako lsp diagnostics` は 1 件 1 行で `行:桁-行:桁  重大度  メッセージ  (出所 コード)` を出します。位置は `tako edit replace-range` と同じ（行は 1 始まり・桁は 0 始まりのバイト）なので、そのまま範囲編集へ渡せます。`--severity` は `error` / `warning` / `info` / `hint` で、**その重大度以上**に絞ります。`--json` を付けると重大度ごとの数（`counts`）と、tako が保持している診断の総数（`retained`）も返ります。MCP では `tako_lsp`（`action=diagnostics`）が同じ操作です。

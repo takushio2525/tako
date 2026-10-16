@@ -101,6 +101,7 @@ mod tests {
         }),
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "",
             windows: "",

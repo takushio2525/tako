@@ -77,10 +77,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::{Action, Event, Lifecycle, RestartPolicy, ServerState};
-use tako_core::lsp::{launch, position, root, sync};
+use tako_core::lsp::{init_options, launch, position, root, sync};
 use tako_core::platform::child_cmd::{self, ChildCmd};
 
 use super::completion::{CompletionAnswer, CompletionError, CompletionRequest};
@@ -152,6 +152,15 @@ pub fn legacy() -> bool {
 pub fn legacy_2048() -> bool {
     matches!(
         std::env::var("TAKO_2048_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// `TAKO_2035_LEGACY=1` で初期化オプション（`initializationOptions`）を送らない（#2035 の前へ戻す
+/// A/B の入口。rust-analyzer が利用者の `cargo build` と同じ target のロックを取り合う）
+pub fn legacy_2035() -> bool {
+    matches!(
+        std::env::var("TAKO_2035_LEGACY").ok().as_deref(),
         Some("1" | "true" | "on")
     )
 }
@@ -534,6 +543,10 @@ struct Shared {
     fetch: Option<FetchConfig>,
     /// 文書を開いた時点で起こすか（#2048。偽 = 隔離起動。[`autostart_from_env`]）
     autostart: bool,
+    /// 初期化オプションの上書きを settings.json から読むか（#2035。真 = 本番の [`LspManager::from_env`]。
+    /// 起こすたびと `options` のたびに読み直す = 手で直した settings.json も次の起動から効く。
+    /// 偽 = テストの manager で、[`LspManager::set_init_overrides`] で渡したものを使う）
+    overrides_from_settings: bool,
     inner: Mutex<Inner>,
     /// tako の外で変わったファイルの監視（#2034。全サーバで 1 つ）。
     /// **ロックの順は `watch` → `inner`**（`inner` を持ったまま `watch` を取らない）
@@ -579,6 +592,8 @@ struct Inner {
     rechecks: u64,
     /// 直前の古い版の片付けの結果（#1977。`tako lsp status` の `fetch.cleanup`）
     last_sweep: Option<(Instant, fetch::Sweep)>,
+    /// 初期化オプションの上書き（#2035。サーバ ID ごと。settings から読まない manager だけが使う）
+    init_overrides: BTreeMap<String, init_options::Overrides>,
 }
 
 /// 取り消し合う要求の列（#1682）
@@ -703,6 +718,8 @@ struct Slot {
     watch_sent: (u64, u64, u64),
     /// 隔離起動なので開いても起こさず「止めた」に置いた（#2048。理由の文を替える印。restart・stop で外す）
     autostart_held: bool,
+    /// 直近の initialize で送った初期化オプション（#2035。送らなかったら `None`）
+    init_options: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,6 +898,15 @@ impl LspManager {
 
     /// 開いた時点で起こすかも渡して作る（#2048。偽なら開いた器を「止めた」に置き、restart で起こす）
     pub fn with_autostart(config: LspConfig, fetch: Option<FetchConfig>, autostart: bool) -> Self {
+        Self::build(config, fetch, autostart, false)
+    }
+
+    fn build(
+        config: LspConfig,
+        fetch: Option<FetchConfig>,
+        autostart: bool,
+        overrides_from_settings: bool,
+    ) -> Self {
         if legacy() {
             return Self::disabled();
         }
@@ -896,6 +922,7 @@ impl LspManager {
                 config,
                 fetch,
                 autostart,
+                overrides_from_settings,
                 inner: Mutex::new(Inner::default()),
                 watch: Mutex::new(WatchHub::new(on_batch)),
                 this: this.clone(),
@@ -916,11 +943,13 @@ impl LspManager {
     }
 
     /// 本番の設定で作る（未導入のサーバは data dir へ取る。#1944）。隔離起動は自動で起こさず取らない（#2048）
+    /// 初期化オプションの上書きは settings.json の `lsp_init_options` から読む（#2035）
     pub fn from_env() -> Self {
-        Self::with_autostart(
+        Self::build(
             LspConfig::from_env(),
             FetchConfig::from_env(),
             autostart_from_env(),
+            true,
         )
     }
 
@@ -985,6 +1014,28 @@ impl LspManager {
             return disabled_status();
         };
         shared.restart_requiring(root)
+    }
+
+    /// 初期化オプションの既定・上書き・実効値（`tako lsp options`。#2035）。`set` があれば先に当てる
+    /// （キー → 値。`null` で消す = 表の既定へ戻す。`name` が要る = 呼び手が検査する）。効くのは
+    /// 次に起こしたときから（動いているサーバは `running[].current` が偽になる）
+    pub fn options(
+        &self,
+        name: Option<&str>,
+        set: Option<&Map<String, Value>>,
+    ) -> Result<Value, String> {
+        let Some(shared) = &self.shared else {
+            return Ok(disabled_status());
+        };
+        shared.options(name, set)
+    }
+
+    /// 初期化オプションの上書きを渡す（#2035。settings.json を読まない manager = テスト用。
+    /// 本番の [`Self::from_env`] は起こすたびに settings.json を読むので、これを呼んでも使わない）
+    pub fn set_init_overrides(&self, overrides: BTreeMap<String, init_options::Overrides>) {
+        if let Some(shared) = &self.shared {
+            shared.lock().init_overrides = overrides;
+        }
     }
 
     /// 止める（`tako lsp stop`）。restart まで自動では起こさない
@@ -1893,6 +1944,8 @@ impl Shared {
                 return;
             }
         };
+        // #2035: settings.json はロックの外で読む（ファイル 1 つ）
+        let init_options = self.init_options_to_send(spec);
         let root_uri = {
             let mut inner = self.lock();
             let Some(slot) = inner.servers.get_mut(key) else {
@@ -1908,6 +1961,8 @@ impl Shared {
             slot.source = Some(source);
             slot.program_path = Some(program_path);
             slot.runtime = runtime;
+            // #2035: 送る初期化オプション（表の既定 + 利用者の上書き）。status で読めるよう写す
+            slot.init_options = init_options.clone();
             crate::diag::persist_log(&format!(
                 "LSP 起動: server={} pid={} 世代={generation} 回数={}",
                 spec.id,
@@ -1923,7 +1978,7 @@ impl Shared {
             .unwrap_or_default();
         let outcome = process.request(
             "initialize",
-            initialize_params(&root_uri, &root_name),
+            initialize_params(&root_uri, &root_name, init_options),
             self.config.request_timeout,
         );
         let mut guard = self.lock();
@@ -2995,6 +3050,120 @@ impl Shared {
             value["note"] = json!(text::IDLE_NOTE.text());
         }
         value
+    }
+
+    // --- 初期化オプション（#2035）---------------------------------------------
+
+    /// 今の上書き（全サーバ）。本番は settings.json を読む（手で直したものも次の起動から効く）。
+    /// **`inner` のロックを持ったまま呼ばない**（settings から読まない manager はロックを取る）
+    fn current_overrides(&self) -> BTreeMap<String, init_options::Overrides> {
+        if self.overrides_from_settings {
+            crate::settings::load().lsp_init_options
+        } else {
+            self.lock().init_overrides.clone()
+        }
+    }
+
+    /// この行へ送る初期化オプション（表の既定 + 上書き）。`TAKO_2035_LEGACY=1` は送らない
+    fn init_options_to_send(&self, spec: &ServerSpec) -> Option<Value> {
+        if legacy_2035() {
+            return None;
+        }
+        let overrides = self.current_overrides();
+        init_options::to_object(&init_options::effective(
+            spec.init_options,
+            overrides.get(spec.id),
+        ))
+    }
+
+    fn options(
+        &self,
+        name: Option<&str>,
+        set: Option<&Map<String, Value>>,
+    ) -> Result<Value, String> {
+        if let (Some(set), Some(name)) = (set, name) {
+            let apply = |all: &mut BTreeMap<String, init_options::Overrides>| {
+                let entry = all.entry(name.to_string()).or_default();
+                init_options::apply(entry, set)?;
+                if entry.is_empty() {
+                    all.remove(name);
+                }
+                Ok::<(), String>(())
+            };
+            if self.overrides_from_settings {
+                let mut settings = crate::settings::load();
+                apply(&mut settings.lsp_init_options)?;
+                crate::settings::save(&settings).map_err(|e| {
+                    text::fill(text::OPTIONS_SAVE_FAILED, &[("error", &e.to_string())])
+                })?;
+            } else {
+                apply(&mut self.lock().init_overrides)?;
+            }
+            crate::diag::persist_log(&format!(
+                "LSP 初期化オプションを変更: server={name} keys={}",
+                set.keys().cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
+        let overrides = self.current_overrides();
+        let legacy = legacy_2035();
+        let inner = self.lock();
+        let rows: Vec<Value> = self
+            .config
+            .table
+            .iter()
+            .filter(|spec| match name {
+                Some(n) => spec.id == n,
+                None => !spec.init_options.is_empty() || overrides.contains_key(spec.id),
+            })
+            .map(|spec| {
+                let entries = init_options::effective(spec.init_options, overrides.get(spec.id));
+                let effective = if legacy {
+                    None
+                } else {
+                    init_options::to_object(&entries)
+                };
+                let running: Vec<Value> = inner
+                    .servers
+                    .iter()
+                    .filter(|(key, slot)| key.id == spec.id && slot.process.is_some())
+                    .map(|(key, slot)| {
+                        json!({
+                            "root": key.root.display().to_string(),
+                            "state": slot.lifecycle.state.slug(),
+                            "sent": slot.init_options,
+                            // 偽 = 変えた値はまだ届いていない（次に起こしたときから）
+                            "current": slot.init_options == effective,
+                        })
+                    })
+                    .collect();
+                let options: Vec<Value> = entries
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "key": e.key,
+                            "value": e.value,
+                            "source": e.source.slug(),
+                            "default": e.default,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "id": spec.id,
+                    "options": options,
+                    "effective": effective,
+                    "running": running,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "action": "options",
+            "changed": set.is_some(),
+            "servers": rows,
+            // A/B（`TAKO_2035_LEGACY=1`）: 何も送らない（`effective` はすべて null）
+            "legacy": legacy,
+            "settings_key": "lsp_init_options",
+            "note": text::OPTIONS_NOTE.text(),
+        }))
     }
 
     fn servers(&self) -> Value {
@@ -4483,6 +4652,7 @@ impl Slot {
             watch: Registrations::default(),
             watch_sent: (0, 0, 0),
             autostart_held: false,
+            init_options: None,
         }
     }
 }
@@ -4565,6 +4735,9 @@ fn slot_status(
         "pending_requests": slot.process.as_ref().map(|p| p.pending_count()),
         // サーバがプロジェクトを読み込み中か（#1869。補完の「読み込み中」と同じ判定）
         "loading": slot_loading(slot),
+        // #2035: 直近の initialize で送った初期化オプション（送らなければ null。変えた値は
+        // 次に起こしたときから = `tako lsp options` の `running[].current`）
+        "init_options": slot.init_options,
         // #1944: 起こした実行ファイルの出どころ（path / override / managed）とパス
         "source": slot.source,
         "program_path": slot.program_path,
@@ -4898,7 +5071,9 @@ fn stop_process(process: &ServerProcess, timeout: Duration) {
 /// クライアントの能力。**実際に使うものだけ**を申告する（使わない能力を申告すると
 /// サーバが無駄な仕事をする）。S1 は文書同期と診断の受信、#1680 が定義ジャンプの 4 種、
 /// #1683 が整形、#1682 が補完、#1681 がホバー、#2034 がファイル監視の動的登録、#1686 が名前の変更を足した
-fn initialize_params(root_uri: &str, root_name: &str) -> Value {
+///
+/// `init_options` は `initializationOptions`（#2035。表の既定 + 利用者の上書き。`None` は送らない）
+fn initialize_params(root_uri: &str, root_name: &str, init_options: Option<Value>) -> Value {
     use lsp_types::{
         ClientCapabilities, ClientInfo, CompletionClientCapabilities, CompletionItemCapability,
         CompletionItemCapabilityResolveSupport, CompletionItemTag, CompletionListCapability,
@@ -5035,6 +5210,7 @@ fn initialize_params(root_uri: &str, root_name: &str) -> Value {
             name: "tako".into(),
             version: Some(env!("CARGO_PKG_VERSION").into()),
         }),
+        initialization_options: init_options,
         ..Default::default()
     };
     serde_json::to_value(params).unwrap_or(Value::Null)
@@ -5130,7 +5306,17 @@ mod tests {
 
     #[test]
     fn 初期化の申告は_utf16_と文書同期と診断と定義ジャンプと整形と補完とホバーと名前の変更だけ() {
-        let params = initialize_params("file:///w", "w");
+        let params = initialize_params("file:///w", "w", None);
+        // #2035: 初期化オプションは渡したときだけ載る（既定を持たない行は変更前と同じ形）
+        assert!(params.get("initializationOptions").is_none());
+        assert_eq!(
+            initialize_params(
+                "file:///w",
+                "w",
+                Some(json!({"cargo": {"targetDir": true}}))
+            )["initializationOptions"],
+            json!({"cargo": {"targetDir": true}})
+        );
         assert_eq!(
             params["capabilities"]["general"]["positionEncodings"],
             json!(["utf-16"])

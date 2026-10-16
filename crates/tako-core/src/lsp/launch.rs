@@ -213,6 +213,7 @@ mod tests {
         workspace_root: None,
         bundled: Some(&ARDUINO_IDE),
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "",
             windows: "",

@@ -2948,6 +2948,8 @@ pub enum OffloadJob {
         manager: crate::lsp::LspManager,
         action: String,
         name: Option<String>,
+        /// action=options の上書き（#2035）
+        set: Option<serde_json::Map<String, Value>>,
     },
     /// 定義ジャンプの問い合わせ（#1680）。サーバの起動と応答を待つので background へ出し、
     /// 着地（ペインを開く）は [`OffloadOutcome::OnUi`] で UI スレッドへ戻す
@@ -3496,11 +3498,12 @@ pub fn prepare_offload(
             .map(|job| OffloadJob::WorkspaceSearch(Box::new(job))),
         ),
         // #1678: manager を持たない host は同期実行へ落として「使えない」を返す
-        Request::LspServer { action, name } => host.lsp().map(|manager| {
+        Request::LspServer { action, name, set } => host.lsp().map(|manager| {
             Ok(OffloadJob::Lsp {
                 manager: manager.clone(),
                 action: action.clone(),
                 name: name.clone(),
+                set: set.clone(),
             })
         }),
         // #1680: 準備（引数の検査）は UI スレッド、問い合わせ（位置の変換を含む。#1769）は background
@@ -3908,7 +3911,8 @@ impl OffloadJob {
                 manager,
                 action,
                 name,
-            } => lsp_server_action(Some(&manager), &action, name.as_deref()),
+                set,
+            } => lsp_server_action(Some(&manager), &action, name.as_deref(), set.as_ref()),
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
             OffloadJob::RunConfigSketch(job) => job.run(),
             OffloadJob::RemoteAgents => remote_agents_reply(),
@@ -7797,8 +7801,8 @@ fn dispatch_inner(
 
         // #1678: 通常は prepare_offload が background へ出す。ここへ来るのは
         // `TAKO_OFFLOAD=0` か manager を持たない host（= 「使えない」と答える）
-        Request::LspServer { action, name } => {
-            lsp_server_action(host.lsp(), &action, name.as_deref())
+        Request::LspServer { action, name, set } => {
+            lsp_server_action(host.lsp(), &action, name.as_deref(), set.as_ref())
         }
 
         // #1679: 表を読むだけ（ロックを短く取る）なので UI スレッドで同期実行する
@@ -18102,7 +18106,9 @@ pub struct CheckHealthCtx {
 }
 
 /// `tako lsp` / MCP `tako_lsp_server` の action（#1678）。CLI と MCP はこの綴りを共有する
-pub const LSP_ACTIONS: &[&str] = &["status", "list", "restart", "stop", "logs", "install"];
+pub const LSP_ACTIONS: &[&str] = &[
+    "status", "list", "restart", "stop", "logs", "install", "options",
+];
 
 /// MCP `tako_lsp`（言語機能）の action。CLI は `tako lsp <action>`。
 /// 診断（#1679）と定義ジャンプの 4 種（#1680。綴りの正本は `GotoKind::NAMES`）と
@@ -18159,12 +18165,30 @@ pub fn lsp_server_action(
     manager: Option<&crate::lsp::LspManager>,
     action: &str,
     name: Option<&str>,
+    set: Option<&serde_json::Map<String, Value>>,
 ) -> Result<Value, DispatchError> {
     if !LSP_ACTIONS.contains(&action) {
         return Err(DispatchError::InvalidParams(format!(
             "action が不正: {action}（{}）",
             LSP_ACTIONS.join(" / ")
         )));
+    }
+    // #2035: 上書きは action=options だけ・サーバの ID が要る・キーの形は先に検査する
+    if let Some(set) = set {
+        if action != "options" {
+            return Err(DispatchError::InvalidParams(
+                "set は action=options のときだけ使える".into(),
+            ));
+        }
+        if name.is_none() {
+            return Err(DispatchError::InvalidParams(
+                crate::lsp::text::OPTIONS_NAME_REQUIRED.text().to_string(),
+            ));
+        }
+        for key in set.keys() {
+            tako_core::lsp::init_options::validate_key(key)
+                .map_err(DispatchError::InvalidParams)?;
+        }
     }
     if let Some(name) = name {
         if tako_core::lsp::servers::find_in(tako_core::lsp::servers::SERVERS, name).is_none() {
@@ -18190,6 +18214,10 @@ pub fn lsp_server_action(
         "logs" => manager.logs(name),
         // #1944: 未導入のサーバを data dir へ取る（待つ = offload の背景で走る）
         "install" => manager.install(name),
+        // #2035: 初期化オプション（settings.json を読み書きする = 背景で走る）
+        "options" => manager
+            .options(name, set)
+            .map_err(DispatchError::Operation)?,
         _ => manager.status(name),
     })
 }

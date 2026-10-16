@@ -961,12 +961,17 @@ pub enum Request {
     /// - "logs": サーバの stderr の直近の行（診断用）
     /// - "install": 未導入のサーバを tako の data dir へ取る（#1944。グローバルには入れない・
     ///   グローバルに入っていれば取らない。待ちうる）
+    /// - "options": 初期化オプションの既定・上書き・実効値（#2035。`set` で上書きを書く）
     ///
     /// `name` はサーバの ID（省略で全部。install は取れるもの全部）。言語機能（診断の描画・補完…）は各スライスが足す
     LspServer {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// action=options の上書き（#2035。ドット区切りのキー → JSON の値。`null` で消す = tako の
+        /// 既定へ戻す。`name` が要る）。settings.json の `lsp_init_options` へ書き、次の起動から効く
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set: Option<serde_json::Map<String, serde_json::Value>>,
     },
     /// 診断の一覧（FR-3.30 / #1679。`tako lsp diagnostics` / MCP `tako_lsp` の
     /// action=diagnostics）。波線と右パネルの diagnostics ビューが読むのと同じ表を返す。
@@ -3756,11 +3761,13 @@ mod tests {
         let install = Request::LspServer {
             action: "install".into(),
             name: None,
+            set: None,
         };
         assert_eq!(default_reply_timeout(&install), None, "言語サーバの取得");
         let status = Request::LspServer {
             action: "status".into(),
             name: None,
+            set: None,
         };
         assert_eq!(
             default_reply_timeout(&status),

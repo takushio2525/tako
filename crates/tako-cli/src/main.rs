@@ -1033,6 +1033,21 @@ enum LspCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// 言語サーバの初期化オプション（#2035）。既定・上書き・実効値と、動いているサーバへ送った値を出す。
+    /// rust-analyzer の既定は cargo.targetDir = true（初回の check を target/rust-analyzer で走らせ、
+    /// 自分の cargo build と target のロックを取り合わない）。`--set KEY=VALUE` で上書きを
+    /// settings.json へ書く（値は JSON か文字列・null で tako の既定へ戻す。`--name` が要る）。
+    /// 次に起こしたときから効く。tako が起動していなくても読み書きできる。MCP は `tako_lsp_server` の action=options
+    Options {
+        /// サーバの ID（省略で既定か上書きを持つもの全部）
+        #[arg(long)]
+        name: Option<String>,
+        /// 上書き（`cargo.targetDir=false` の形。繰り返せる）
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// 未導入の言語サーバを tako の data dir へ取る（グローバルには入れない。#1944）。
     /// 省略で取れるもの全部。グローバルに入っていれば取らない。tako が起動していなくても取れる
     Install {
@@ -1365,6 +1380,7 @@ impl LspCommand {
         let server = |action: &str, name: &Option<String>| Request::LspServer {
             action: action.to_string(),
             name: name.clone(),
+            set: None,
         };
         Ok(match self {
             Self::Status { name, .. } => server("status", name),
@@ -1373,6 +1389,18 @@ impl LspCommand {
             Self::Stop { name } => server("stop", name),
             Self::Logs { name } => server("logs", name),
             Self::Install { name, .. } => server("install", name),
+            Self::Options { name, set, .. } => {
+                let mut map = serde_json::Map::new();
+                for item in set {
+                    let (key, value) = tako_core::lsp::init_options::parse_assignment(item)?;
+                    map.insert(key, value);
+                }
+                Request::LspServer {
+                    action: "options".into(),
+                    name: name.clone(),
+                    set: (!map.is_empty()).then_some(map),
+                }
+            }
             Self::Diagnostics { pane, severity, .. } => Request::LspDiagnostics {
                 pane: *pane,
                 severity: severity.clone(),
@@ -1508,6 +1536,7 @@ impl LspCommand {
             Self::Status { json, .. }
             | Self::Servers { json }
             | Self::Install { json, .. }
+            | Self::Options { json, .. }
             | Self::Diagnostics { json, .. }
             | Self::Format { json, .. } => *json,
             Self::Definition(args)
@@ -8012,11 +8041,13 @@ fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
 
 fn run(command: Command) -> Result<(), String> {
     let request = build_request(&command)?;
-    // #1944: 言語サーバの取得は tako が起動していなくても取れる（同じ実装を CLI のプロセスで走らせる）
-    if let Command::Lsp(LspCommand::Install { name, .. }) = &command {
+    // #1944: 言語サーバの取得は tako が起動していなくても取れる（同じ実装を CLI のプロセスで走らせる）。
+    // #2035: 初期化オプションの読み書きも同じ（settings.json を読み書きするだけ）
+    if let Command::Lsp(LspCommand::Install { .. } | LspCommand::Options { .. }) = &command {
+        let local = request.clone();
         let result = match send_request_classified(request, None) {
             Ok(value) => value,
-            Err(SendFailure::Unreachable(_)) => lsp_install_local(name.as_deref())?,
+            Err(SendFailure::Unreachable(_)) => lsp_server_local(&local)?,
             Err(SendFailure::Broken(message) | SendFailure::Operation(message)) => {
                 return Err(message)
             }
@@ -8033,13 +8064,18 @@ fn run(command: Command) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako lsp install` を GUI 抜きで行う（#1944）。GUI の manager と同じ `LspManager::install` を通り、
-/// 置き場（`<data_dir>/lsp-servers`）も同じ。名前の検査も dispatch と同じ 1 実装
-fn lsp_install_local(name: Option<&str>) -> Result<Value, String> {
+/// `tako lsp install`（#1944）/ `tako lsp options`（#2035）を GUI 抜きで行う。GUI の manager と同じ
+/// `LspManager::install` / `options` を通り、置き場（`<data_dir>/lsp-servers`・settings.json）も同じ。
+/// 名前・キーの検査も dispatch と同じ 1 実装
+fn lsp_server_local(request: &Request) -> Result<Value, String> {
+    let Request::LspServer { action, name, set } = request else {
+        return Err("言語サーバの要求ではない".into());
+    };
     tako_control::dispatch::lsp_server_action(
         Some(&tako_control::lsp::LspManager::from_env()),
-        "install",
-        name,
+        action,
+        name.as_deref(),
+        set.as_ref(),
     )
     .map(|mut value| {
         value["local"] = Value::Bool(true);
@@ -12053,6 +12089,12 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
         }
         return;
     }
+    if !sub.json() && matches!(sub, LspCommand::Options { .. }) {
+        for line in lsp_options_lines(result) {
+            println!("{line}");
+        }
+        return;
+    }
     if sub.json()
         || !matches!(
             sub,
@@ -12123,6 +12165,55 @@ fn print_lsp(sub: &LspCommand, result: &Value) {
             println!("{line}");
         }
     }
+}
+
+/// `tako lsp options` の人向けの体裁（#2035）。サーバごとにキー = 値（出どころ）と、動いている
+/// サーバへ送った値がいまの実効値と同じか（違えば restart で効く）
+fn lsp_options_lines(result: &Value) -> Vec<String> {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    if result["enabled"] == Value::Bool(false) {
+        return vec![text(&result["reason"])];
+    }
+    let mut out = Vec::new();
+    if result["legacy"] == Value::Bool(true) {
+        out.push("TAKO_2035_LEGACY=1: initializationOptions を送らない".to_string());
+    }
+    for server in result["servers"].as_array().cloned().unwrap_or_default() {
+        out.push(text(&server["id"]));
+        let options = server["options"].as_array().cloned().unwrap_or_default();
+        if options.is_empty() {
+            out.push("  (なし)".to_string());
+        }
+        for option in options {
+            let source = text(&option["source"]);
+            let origin = match (source.as_str(), &option["default"]) {
+                ("user", Value::Null) => "user".to_string(),
+                ("user", default) => format!("user, default {default}"),
+                _ => source,
+            };
+            out.push(format!(
+                "  {} = {}  ({origin})",
+                text(&option["key"]),
+                option["value"]
+            ));
+        }
+        for running in server["running"].as_array().cloned().unwrap_or_default() {
+            let mark = if running["current"] == Value::Bool(true) {
+                "current"
+            } else {
+                "stale (tako lsp restart)"
+            };
+            out.push(format!(
+                "  running {}  sent={}  {mark}",
+                text(&running["root"]),
+                running["sent"]
+            ));
+        }
+    }
+    if let Some(note) = result["note"].as_str() {
+        out.push(note.to_string());
+    }
+    out
 }
 
 /// `tako lsp install` の人向けの体裁（#1944）。1 サーバ 1 行（ID・結果・置き場か理由）+ 次の一手
@@ -13730,6 +13821,8 @@ mod tests {
                 "install",
                 Some("x"),
             ),
+            // #2035: 初期化オプションも同じ 1 ツール（MCP `tako_lsp_server` の action=options）
+            (vec!["tako", "lsp", "options"], "options", None),
         ] {
             assert!(tako_control::dispatch::LSP_ACTIONS.contains(&action));
             assert_eq!(
@@ -13737,7 +13830,47 @@ mod tests {
                 Request::LspServer {
                     action: action.into(),
                     name: name.map(str::to_string),
+                    set: None,
                 }
+            );
+        }
+        // #2035: `--set KEY=VALUE` は JSON として読める値はその値・読めなければ文字列・null は消す印
+        let Request::LspServer { action, name, set } = build_request(&parse(&[
+            "tako",
+            "lsp",
+            "options",
+            "--name",
+            "rust-analyzer",
+            "--set",
+            "cargo.targetDir=false",
+            "--set",
+            "check.command=clippy",
+            "--set",
+            "cargo.features=null",
+        ]))
+        .unwrap() else {
+            panic!("LspServer にならない");
+        };
+        assert_eq!(
+            (action.as_str(), name.as_deref()),
+            ("options", Some("rust-analyzer"))
+        );
+        assert_eq!(
+            Value::Object(set.unwrap()),
+            serde_json::json!({
+                "cargo.targetDir": false,
+                "check.command": "clippy",
+                "cargo.features": null,
+            })
+        );
+        // 形の崩れた `--set` は送る前に断る
+        for bad in ["cargo.targetDir", "bad key=1", "=1"] {
+            assert!(
+                build_request(&parse(&[
+                    "tako", "lsp", "options", "--name", "x", "--set", bad
+                ]))
+                .is_err(),
+                "{bad:?} を通した"
             );
         }
         // #1677: `tako jump <操作>` は action の綴りを dispatch の正本と共有する。
@@ -15341,6 +15474,7 @@ mod platform_matrix_parity {
         ("lsp stop", "tako_lsp_server"),
         ("lsp logs", "tako_lsp_server"),
         ("lsp install", "tako_lsp_server"),
+        ("lsp options", "tako_lsp_server"),
         ("lsp", "tako_lsp"),
         ("open-in dir", "tako_open_dir"),
         ("open-in remote", "tako_open_remote"),

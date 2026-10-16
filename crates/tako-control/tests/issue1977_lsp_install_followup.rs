@@ -327,6 +327,7 @@ fn binary_spec(scratch: &Scratch, version: &'static str) -> &'static ServerSpec 
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "install-fake-sweep-yourself",
             windows: "install-fake-sweep-yourself",

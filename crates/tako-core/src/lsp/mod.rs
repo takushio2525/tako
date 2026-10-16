@@ -7,6 +7,7 @@
 //! - [`servers`] — サーバ検出表（言語の追加 = 表への行追加）
 //! - [`launch`] — 起動引数の組み立て（伴走の実行ファイル・空の設定ファイル）と同梱の置き場の探索（#1951）
 //! - [`fetch`] — 未導入のサーバを data dir へ取る表（取得元・版・ハッシュ・置き場。#1944）
+//! - [`init_options`] — 初期化オプションの既定（表の列）と利用者の上書きの重ね方（#2035）
 //! - [`root`] — プロジェクトルートの検出
 //! - [`state`] — ライフサイクルの状態機械
 //! - [`sync`] — `didChange` の中身（送った本文の写しとの差分）
@@ -26,6 +27,7 @@ pub mod fetch;
 pub mod format;
 pub mod goto;
 pub mod hover;
+pub mod init_options;
 pub mod launch;
 pub mod menu;
 pub mod position;
