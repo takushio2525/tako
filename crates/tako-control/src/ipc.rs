@@ -925,12 +925,40 @@ mod tests {
     /// EOF 待ちの打ち切り（#2129）。13 回の往復で**共有する**予算で、閉じないサーバー
     /// （= 漏れ）で固まらないためだけにある。通る経路は EOF で抜けるので判定に効かない。
     ///
-    /// 120 秒なのは、ローカルの lib 全体の実行（他の worker のビルドが並走する負荷の下）で
-    /// 1 回、応答を返したサーバーが EOF を 30 秒以上返さなかった（当初は 1 接続 30 秒で
-    /// 打ち切っていた）ため。子にはプロセスを起こす経路が無く、サーバー側のソケットを
-    /// 握れるのは子の接続スレッドだけなので、子が止まっていた側の事象と見ている
-    /// （打ち切ったときは下の診断がどちらかを名指す）
+    /// #2129 のローカル（30 秒超え）と #2209 の CI（120 秒）で、応答を返したサーバーが EOF を
+    /// 返さないまま予算を使い切ったのは、macOS（XNU）の起こしの取りこぼし（[`EOF_KICK_AFTER`]）と
+    /// 同じ形（サーバー側の 2 本が残ったまま、負荷の引いた後も EOF が来ない）で、実機でもその形を
+    /// 再現できた。いまは取りこぼしを救済するので、この予算を使い切るのは救済の後もサーバー側が
+    /// 閉じない（= 本当の漏れか停止）ときだけ
     const FD_EOF_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// half-close（書き側の `shutdown`）の後、サーバーの EOF をこれだけ待って来なければ、
+    /// クライアントを**完全に閉じて**サーバーを起こす（#2209）。
+    ///
+    /// macOS（XNU）の `soreceive` は、データの無い read が眠る直前に `uipc_rcvd` でソケットの
+    /// ロックを一度手放す（相手のソケットとアドレスの順でロックを取り直す）。その窓に相手の
+    /// `shutdown(SHUT_WR)`（`unp_shutdown`）が来ると、受信の終わり（`SS_CANTRCVMORE`）は立つが
+    /// まだ眠っていないので起こしは空振りし、読み手は眠る前にそれを見直さずに `sbwait` へ入る。
+    /// サーバーの接続スレッドは**相手が完全に閉じるまで** read で眠り、EOF を待つクライアントと
+    /// 待ち合う（実機の再現で約 42 万往復に 1 回。PR 本文）。完全に閉じる側（`unp_disconnect`）は
+    /// `UNP_DONTDISCONNECT` で窓の終わりを待ってから起こすので取りこぼさない。製品の CLI は
+    /// 応答を読んだら完全に閉じる（half-close して待たない）ので、この待ち合いは起きない。
+    ///
+    /// 普段の EOF はマイクロ秒で届く（ローカルの単独 300 回で最遅 0 ms）。救済しても判定は
+    /// 変わらない（サーバー側が閉じたのを fd の数で見届ける = [`wait_server_side_closed`]）ので、
+    /// 負荷で遅いだけのサーバーを救済しても害は無い
+    const EOF_KICK_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// 注入（#2209）: 計測する 10 回の接続のうち、先頭から何本で**書き側の shutdown を送らない**か。
+    /// サーバーは half-close を受け取らず、クライアントが完全に閉じるまで read で眠る = XNU の
+    /// 起こしの取りこぼしを踏んだサーバーと同じ状態を毎回作る
+    const INJECT_LOST_WAKEUP_ENV: &str = "TAKO_2209_INJECT_LOST_WAKEUP";
+
+    /// A/B（#2209）: 修正前（half-close の EOF を予算いっぱいまで待ち続け、救済しない）へ戻す
+    const LEGACY_2209_ENV: &str = "TAKO_2209_LEGACY";
+
+    /// この（子）プロセスで救済（[`EOF_KICK_AFTER`]）が走った回数（診断と #2209 の番犬用）
+    static EOF_KICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// 注入（#2161）: 書き側を閉じた後、サーバーが接続を畳んで FIN が届いたのを見届けてから
     /// EOF 待ちへ進む。CI の macOS で間欠的に踏んだ「FIN が先に届く」順序を毎回作る
@@ -940,30 +968,51 @@ mod tests {
     const LEGACY_2161_ENV: &str = "TAKO_2161_LEGACY";
 
     /// 1 往復して、**サーバーが自分の側を閉じたのを見届けてから**戻る（#2129）。
-    /// 戻り値は EOF が届くまでにかかった時間。
+    /// 戻り値は EOF（救済したときはサーバー側の閉じ）を見届けるまでにかかった時間。
     ///
     /// 応答を読んだら書き側を閉じ（サーバーは EOF を読んで接続を畳む）、読み側で EOF を待つ。
     /// ソケットの EOF はサーバー側の fd（読み・書きの 2 本 = `try_clone`）が**両方**閉じた
     /// ときにだけ届く。だから戻った時点で、この接続に由来する fd はクライアント側も含めて
     /// 全部閉じている = 計測に sleep も「落ち着くまで待つ」も要らない。
-    /// `leak` は注入: 接続を閉じずに fd を捨てる（サーバー側も読み待ちのまま 2 本残る）
+    /// EOF が [`EOF_KICK_AFTER`] までに来なければ（XNU の起こしの取りこぼし = #2209）、
+    /// 完全に閉じてサーバーを起こし、サーバー側の 2 本が閉じたのを fd の数で見届ける。
+    /// fd の数を見るので**子プロセスの計測からだけ呼ぶ**（並列のテストが居るプロセスでは数が揺れる）。
+    /// `leak` は注入: 接続を閉じずに fd を捨てる（サーバー側も読み待ちのまま 2 本残る）。
+    /// `skip_half_close` は注入（#2209）: 書き側の shutdown を送らない
     fn closed_roundtrip(
         endpoint: &str,
         leak: bool,
+        skip_half_close: bool,
         deadline: std::time::Instant,
     ) -> std::time::Duration {
         let fin_first = std::env::var_os(INJECT_FIN_FIRST_ENV).is_some();
-        closed_roundtrip_ordered(endpoint, leak, deadline, fin_first).0
+        let end = closed_roundtrip_ordered(endpoint, leak, deadline, fin_first, skip_half_close);
+        match end.kicked_at {
+            Some(pre) => end.elapsed + wait_server_side_closed(pre, deadline),
+            None => end.elapsed,
+        }
+    }
+
+    /// [`closed_roundtrip_ordered`] の結果
+    struct RoundtripEnd {
+        /// 書き側を閉じてから EOF が届くまで（救済したときは完全に閉じるまで）の時間
+        elapsed: std::time::Duration,
+        /// 注入（#2161）の FIN を EOF 待ちの前に見届けたか
+        fin_seen: bool,
+        /// #2209: EOF が来ず、完全に閉じてサーバーを起こした。値は接続前の fd 数
+        /// （サーバー側が閉じたのは呼び手が [`wait_server_side_closed`] で見届ける）
+        kicked_at: Option<usize>,
     }
 
     /// [`closed_roundtrip`] の本体。`fin_first` は注入（#2161）: 書き側を閉じた後、FIN が
-    /// 届くまで待ってから EOF 待ちへ進む。戻り値の 2 つ目は、その FIN を見届けたか
+    /// 届くまで待ってから EOF 待ちへ進む
     fn closed_roundtrip_ordered(
         endpoint: &str,
         leak: bool,
         deadline: std::time::Instant,
         fin_first: bool,
-    ) -> (std::time::Duration, bool) {
+        skip_half_close: bool,
+    ) -> RoundtripEnd {
         let pre = fd_count();
         let stream = UnixStream::connect(endpoint).unwrap();
         let mut writer = stream.try_clone().unwrap();
@@ -976,27 +1025,59 @@ mod tests {
         if leak {
             std::mem::forget(reader);
             std::mem::forget(writer);
-            return (std::time::Duration::ZERO, false);
+            return RoundtripEnd {
+                elapsed: std::time::Duration::ZERO,
+                fin_seen: false,
+                kicked_at: None,
+            };
         }
         let legacy = std::env::var_os(LEGACY_2161_ENV).is_some();
+        let legacy_2209 = std::env::var_os(LEGACY_2209_ENV).is_some();
         let started = std::time::Instant::now();
         let left = deadline.saturating_duration_since(started);
+        // half-close の EOF を待つのは救済の手前まで（#2209。修正前は予算いっぱい）
+        let eof_wait = if legacy_2209 {
+            left
+        } else {
+            left.min(EOF_KICK_AFTER)
+        };
         // 読み取りの上限は書き側を閉じる**前**に入れる（#2161）。閉じた後だと、サーバーが EOF を
         // 読んで接続を畳み FIN が先に届いた回で、送受信の両方が閉じたソケットへの setsockopt に
         // macOS（XNU）が EINVAL を返す。閉じる前ならサーバーはまだ次の行を待っている
-        if !legacy && !left.is_zero() {
-            reader.get_ref().set_read_timeout(Some(left)).unwrap();
+        if !legacy && !eof_wait.is_zero() {
+            reader.get_ref().set_read_timeout(Some(eof_wait)).unwrap();
         }
-        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        if !skip_half_close {
+            writer.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        // FIN の先着の注入（#2161）は予算いっぱいまで待つ（負荷で遅いサーバーでも順序を作る）
         let fin_seen = fin_first && wait_for_fin(reader.get_ref(), deadline);
-        let eof = if left.is_zero() {
+        let eof = if eof_wait.is_zero() {
             Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
         } else {
             if legacy {
-                reader.get_ref().set_read_timeout(Some(left)).unwrap();
+                reader.get_ref().set_read_timeout(Some(eof_wait)).unwrap();
             }
             reader.read_to_end(&mut Vec::new())
         };
+        let timed_out = eof.as_ref().is_err_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        });
+        if timed_out && !legacy_2209 && std::time::Instant::now() < deadline {
+            // #2209: サーバーが half-close の起こしを取りこぼして眠っている（か、負荷で遅い）。
+            // 完全に閉じれば unp_disconnect が起こす。閉じたかは呼び手が fd の数で見届ける
+            drop(reader);
+            drop(writer);
+            EOF_KICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return RoundtripEnd {
+                elapsed: started.elapsed(),
+                fin_seen,
+                kicked_at: Some(pre),
+            };
+        }
         if let Err(e) = eof {
             // 診断（判定はもう決まっている = 落ちる）。クライアント側の 2 本を開いたまま数え、
             // そのあと少しだけ EOF を読み直す。数える前に自分の側を閉じると、そのあいだに
@@ -1019,7 +1100,36 @@ mod tests {
                 FD_EOF_BUDGET.as_secs()
             );
         }
-        (started.elapsed(), fin_seen)
+        RoundtripEnd {
+            elapsed: started.elapsed(),
+            fin_seen,
+            kicked_at: None,
+        }
+    }
+
+    /// 救済（#2209）で完全に閉じた後、サーバー側の 2 本が閉じて fd の数が接続前（`pre`）へ
+    /// 戻るのを見届ける。クライアント側の 2 本は閉じ済みで、この子プロセスには計測しか
+    /// 居ないので、数が戻った = サーバーの接続スレッドが EOF を読んで接続を畳んだ。
+    /// 戻り値は見届けるまでの時間
+    fn wait_server_side_closed(pre: usize, deadline: std::time::Instant) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        loop {
+            let now = fd_count();
+            if now <= pre {
+                return started.elapsed();
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "サーバーが接続を閉じない（half-close の EOF が {} ms で来ず、完全に閉じた後も\
+                     EOF 待ちの予算 {} 秒を使い切った）。fd は接続の前 {pre} → 打ち切り時 {now}\
+                     （クライアント側は閉じ済み）。サーバー側がこの子プロセスに残っていた = 漏れ、\
+                     またはサーバーの停止",
+                    EOF_KICK_AFTER.as_millis(),
+                    FD_EOF_BUDGET.as_secs()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// 注入（#2161）: サーバーが接続を畳んで FIN が届くまで待つ。非ブロッキングで覗くだけで
@@ -1050,11 +1160,14 @@ mod tests {
         after: usize,
         /// EOF が届くまでにいちばんかかった往復（診断用。判定には使わない）
         slowest_eof: std::time::Duration,
+        /// half-close の EOF が来ず、完全に閉じて救済した往復の数（#2209。診断と番犬用）
+        kicks: usize,
     }
 
     /// 受け口とダミーのディスパッチャを立て、ウォームアップ 3 回のあと 10 回往復して
-    /// 前後の fd 数を返す。`leaks` 本目までは閉じずに捨てる（注入）
-    fn measure_roundtrip_fds(leaks: usize) -> FdMeasure {
+    /// 前後の fd 数を返す。`leaks` 本目までは閉じずに捨て、`lost` 本目までは書き側の
+    /// shutdown を送らない（どちらも注入）
+    fn measure_roundtrip_fds(leaks: usize, lost: usize) -> FdMeasure {
         let (tx, mut rx) = unbounded::<IncomingRequest>();
         let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
         std::thread::spawn(move || {
@@ -1066,16 +1179,19 @@ mod tests {
         let mut slowest_eof = std::time::Duration::ZERO;
         // ウォームアップ（初回だけ確保される物を測定から外す）
         for _ in 0..3 {
-            slowest_eof = slowest_eof.max(closed_roundtrip(server.endpoint(), false, deadline));
+            slowest_eof =
+                slowest_eof.max(closed_roundtrip(server.endpoint(), false, false, deadline));
         }
         let before = fd_count();
         for i in 0..FD_ROUNDTRIPS {
-            slowest_eof = slowest_eof.max(closed_roundtrip(server.endpoint(), i < leaks, deadline));
+            let took = closed_roundtrip(server.endpoint(), i < leaks, i < lost, deadline);
+            slowest_eof = slowest_eof.max(took);
         }
         FdMeasure {
             before,
             after: fd_count(),
             slowest_eof,
+            kicks: EOF_KICKS.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1115,22 +1231,30 @@ mod tests {
     const SILENT_CHILD_ATTEMPTS: usize = 3;
 
     /// このテストバイナリを子として起こし、[`FD_CHILD_TEST`] だけを走らせて
-    /// `(前の fd 数, 後の fd 数, EOF のいちばん遅い往復の ms)` を受け取る
-    fn measure_in_child_process() -> (usize, usize, usize) {
-        let [before, after, slowest_eof_ms] =
-            run_fd_child(FD_CHILD_TEST, ["before", "after", "slowest_eof_ms"]);
-        (before, after, slowest_eof_ms)
+    /// `[前の fd 数, 後の fd 数, EOF のいちばん遅い往復の ms, 救済した往復の数]` を受け取る。
+    /// `envs` は子にだけ足す env（#2209 の番犬が注入を名指しする口）
+    fn measure_in_child_process(envs: &[(&str, &str)]) -> [usize; 4] {
+        run_fd_child(
+            FD_CHILD_TEST,
+            ["before", "after", "slowest_eof_ms", "kicks"],
+            envs,
+        )
     }
 
     /// このテストバイナリを子として起こし、`child_test` だけを走らせて、子が [`FD_MARKER`] の
     /// 行に出した `key=値` を `keys` の順で受け取る（#2129 の計測と #2136 の計測が共有する）
-    fn run_fd_child<const N: usize>(child_test: &str, keys: [&str; N]) -> [usize; N] {
+    fn run_fd_child<const N: usize>(
+        child_test: &str,
+        keys: [&str; N],
+        envs: &[(&str, &str)],
+    ) -> [usize; N] {
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(exe);
         cmd.args(["--exact", child_test, "--test-threads=1", "--nocapture"])
             .env(FD_CHILD_ENV, "1")
             // 雑音は親（= 並列のテストが同居するプロセス）に留める。漏れの注入はそのまま子へ継ぐ
-            .env_remove(INJECT_NOISE_ENV);
+            .env_remove(INJECT_NOISE_ENV)
+            .envs(envs.iter().copied());
         let mut statuses: Vec<String> = Vec::new();
         let out = loop {
             let out = cmd.output().expect("子テストプロセスを起こせる");
@@ -1170,12 +1294,16 @@ mod tests {
         if std::env::var_os(FD_CHILD_ENV).is_none() {
             return;
         }
-        let m = measure_roundtrip_fds(env_count(INJECT_LEAK_ENV));
+        let m = measure_roundtrip_fds(
+            env_count(INJECT_LEAK_ENV),
+            env_count(INJECT_LOST_WAKEUP_ENV),
+        );
         println!(
-            "{FD_MARKER} before={} after={} slowest_eof_ms={}",
+            "{FD_MARKER} before={} after={} slowest_eof_ms={} kicks={}",
             m.before,
             m.after,
-            m.slowest_eof.as_millis()
+            m.slowest_eof.as_millis(),
+            m.kicks
         );
     }
 
@@ -1195,6 +1323,9 @@ mod tests {
     ///   fd を開いたままにする（並列テストの再現）。修正後は通る / `TAKO_2129_LEGACY=1` は n ≥ 7 で落ちる
     /// - `TAKO_2129_INJECT_LEAK=<k>`: 10 回の接続のうち k 本を閉じずに捨てる（本当の漏れ）。
     ///   修正後は k ≥ 1 で落ちる / 旧は k = 1 を見逃す
+    /// - `TAKO_2209_INJECT_LOST_WAKEUP=<k>`: 10 回の接続のうち k 本で書き側の shutdown を
+    ///   送らない（XNU の起こしの取りこぼし = [`EOF_KICK_AFTER`]）。修正後は通る /
+    ///   `TAKO_2209_LEGACY=1` は EOF 待ちの予算 120 秒を使い切って落ちる
     #[test]
     fn 連続接続でfdが漏れない() {
         let noise = env_count(INJECT_NOISE_ENV);
@@ -1203,16 +1334,40 @@ mod tests {
             legacy_fd_leak_check(noise, leaks);
             return;
         }
-        let (before, after, slowest_eof_ms) = {
+        let [before, after, slowest_eof_ms, kicks] = {
             let _noise = hold_fds_in_other_thread(noise);
-            measure_in_child_process()
+            measure_in_child_process(&[])
         };
         println!(
-            "#2129 子プロセスの fd: {before} → {after}（雑音の注入 {noise} 本・EOF の最遅 {slowest_eof_ms} ms）"
+            "#2129 子プロセスの fd: {before} → {after}（雑音の注入 {noise} 本・EOF の最遅 {slowest_eof_ms} ms・\
+             取りこぼしの救済 {kicks} 回）"
         );
         assert!(
             after <= before,
             "IPC 接続 {FD_ROUNDTRIPS} 回で fd が {before} → {after} に増えた（漏れ）"
+        );
+    }
+
+    /// #2209 の番犬: サーバーが half-close（クライアントの書き側の shutdown）の起こしを
+    /// 取りこぼしても、往復の後始末（[`closed_roundtrip`]）が EOF 待ちの予算を使い切らずに戻り、
+    /// サーバー側の fd も閉じる。
+    ///
+    /// CI の macOS で「サーバーが接続を閉じない（予算 120 秒を使い切った）」で落ちた型
+    /// （PR #2198 の 1 回目）。真因は XNU の取りこぼし（[`EOF_KICK_AFTER`]）で、実機では
+    /// 数十万往復に 1 回しか踏まないので、注入で毎回作る: 計測する 1 本目で書き側の shutdown を
+    /// 送らない = サーバーは取りこぼしたときと同じく、クライアントが完全に閉じるまで read で眠る。
+    /// A/B: `TAKO_2209_LEGACY=1` では救済せずに EOF を待ち続け、予算 120 秒を使い切って落ちる
+    #[test]
+    fn issue2209_サーバーがhalf_closeの起こしを取りこぼしても往復の後始末が戻る() {
+        let [before, after, _, kicks] = measure_in_child_process(&[(INJECT_LOST_WAKEUP_ENV, "1")]);
+        println!("#2209 子プロセスの fd: {before} → {after}（取りこぼしの救済 {kicks} 回）");
+        assert!(
+            kicks >= 1,
+            "救済が 1 回も走っていない = 注入が取りこぼしを作れておらず、番犬が何も試していない"
+        );
+        assert!(
+            after <= before,
+            "取りこぼしを救済した往復でサーバー側の fd が {before} → {after} に残った"
         );
     }
 
@@ -1314,7 +1469,7 @@ mod tests {
                 let _ = incoming.reply.send(Ok(json!({})));
             }
         });
-        closed_roundtrip(server.endpoint(), false, deadline);
+        closed_roundtrip(server.endpoint(), false, false, deadline);
         let started = std::time::Instant::now();
         drop(server);
         started.elapsed()
@@ -1351,8 +1506,11 @@ mod tests {
     /// A/B: `TAKO_2136_LEGACY=1` で drop が受け口を閉じなくなり、fd が [`SERVER_CYCLES`] 本増えて落ちる
     #[test]
     fn サーバーを立てて捨てた後にfdが元へ戻る() {
-        let [before, after, slowest_drop_us] =
-            run_fd_child(SERVER_CHILD_TEST, ["before", "after", "slowest_drop_us"]);
+        let [before, after, slowest_drop_us] = run_fd_child(
+            SERVER_CHILD_TEST,
+            ["before", "after", "slowest_drop_us"],
+            &[],
+        );
         println!(
             "#2136 子プロセスの fd: {before} → {after}（立てて捨てた回数 {SERVER_CYCLES}・drop の最遅 {slowest_drop_us} µs）"
         );
@@ -1381,7 +1539,8 @@ mod tests {
             }
         });
         let deadline = std::time::Instant::now() + FD_EOF_BUDGET;
-        let (_, fin_seen) = closed_roundtrip_ordered(server.endpoint(), false, deadline, true);
+        let fin_seen =
+            closed_roundtrip_ordered(server.endpoint(), false, deadline, true, false).fin_seen;
         assert!(
             fin_seen,
             "EOF 待ちの前に FIN が届いていない = 注入が順序を作れておらず、番犬が何も試していない"
