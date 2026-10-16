@@ -967,6 +967,10 @@ mod tests {
     /// A/B（#2161）: 修正前の順序（書き側を閉じてから読み取りの上限を入れる）へ戻す
     const LEGACY_2161_ENV: &str = "TAKO_2161_LEGACY";
 
+    /// A/B（#2213）: 修正前の FIN の待ち方（FIN の先着の注入で FIN を予算いっぱい待ち、
+    /// #2161 の番犬は往復をやり直さない）へ戻す
+    const LEGACY_2213_ENV: &str = "TAKO_2213_LEGACY";
+
     /// 1 往復して、**サーバーが自分の側を閉じたのを見届けてから**戻る（#2129）。
     /// 戻り値は EOF（救済したときはサーバー側の閉じ）を見届けるまでにかかった時間。
     ///
@@ -986,7 +990,14 @@ mod tests {
         deadline: std::time::Instant,
     ) -> std::time::Duration {
         let fin_first = std::env::var_os(INJECT_FIN_FIRST_ENV).is_some();
-        let end = closed_roundtrip_ordered(endpoint, leak, deadline, fin_first, skip_half_close);
+        let end = closed_roundtrip_ordered(
+            endpoint,
+            leak,
+            deadline,
+            fin_first,
+            skip_half_close,
+            EOF_KICK_AFTER,
+        );
         match end.kicked_at {
             Some(pre) => end.elapsed + wait_server_side_closed(pre, deadline),
             None => end.elapsed,
@@ -1005,13 +1016,16 @@ mod tests {
     }
 
     /// [`closed_roundtrip`] の本体。`fin_first` は注入（#2161）: 書き側を閉じた後、FIN が
-    /// 届くまで待ってから EOF 待ちへ進む
+    /// 届くまで待ってから EOF 待ちへ進む。`kick_after` は half-close の EOF（`fin_first` では
+    /// FIN）を待つ区切りで、来なければ完全に閉じてサーバーを起こす（#2209 / #2213。
+    /// 普段は [`EOF_KICK_AFTER`]）
     fn closed_roundtrip_ordered(
         endpoint: &str,
         leak: bool,
         deadline: std::time::Instant,
         fin_first: bool,
         skip_half_close: bool,
+        kick_after: std::time::Duration,
     ) -> RoundtripEnd {
         let pre = fd_count();
         let stream = UnixStream::connect(endpoint).unwrap();
@@ -1033,13 +1047,14 @@ mod tests {
         }
         let legacy = std::env::var_os(LEGACY_2161_ENV).is_some();
         let legacy_2209 = std::env::var_os(LEGACY_2209_ENV).is_some();
+        let legacy_2213 = std::env::var_os(LEGACY_2213_ENV).is_some();
         let started = std::time::Instant::now();
         let left = deadline.saturating_duration_since(started);
         // half-close の EOF を待つのは救済の手前まで（#2209。修正前は予算いっぱい）
         let eof_wait = if legacy_2209 {
             left
         } else {
-            left.min(EOF_KICK_AFTER)
+            left.min(kick_after)
         };
         // 読み取りの上限は書き側を閉じる**前**に入れる（#2161）。閉じた後だと、サーバーが EOF を
         // 読んで接続を畳み FIN が先に届いた回で、送受信の両方が閉じたソケットへの setsockopt に
@@ -1050,9 +1065,18 @@ mod tests {
         if !skip_half_close {
             writer.shutdown(std::net::Shutdown::Write).unwrap();
         }
-        // FIN の先着の注入（#2161）は予算いっぱいまで待つ（負荷で遅いサーバーでも順序を作る）
-        let fin_seen = fin_first && wait_for_fin(reader.get_ref(), deadline);
-        let eof = if eof_wait.is_zero() {
+        // FIN の先着の注入（#2161）も救済の手前までしか待たない（#2213。修正前は予算いっぱい）。
+        // サーバーが half-close の起こしを取りこぼした回（#2209）の FIN は、こちらが完全に
+        // 閉じるまで来ない。負荷で遅いだけの回は、呼び手が区切りを延ばして往復をやり直す
+        let fin_deadline = if legacy_2213 {
+            deadline
+        } else {
+            started + eof_wait
+        };
+        let fin_seen = fin_first && wait_for_fin(reader.get_ref(), fin_deadline);
+        // 区切りまでに FIN が来なかった = EOF の待ちの区切りも使い切った（読み直さずに救済へ進む）
+        let fin_missed = fin_first && !fin_seen && !legacy_2213;
+        let eof = if eof_wait.is_zero() || fin_missed {
             Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
         } else {
             if legacy {
@@ -1521,16 +1545,49 @@ mod tests {
         );
     }
 
-    /// #2161 の番犬: サーバーの FIN が EOF 待ちより先に届いた回でも、往復の後始末
-    /// （[`closed_roundtrip`]）が落ちない。
+    /// FIN の先着（#2161）を作れるまで往復をやり直し、FIN を見届けた往復が何本目か
+    /// （1 始まり）を返す。FIN を見届けられなかったら `None`（`TAKO_2213_LEGACY=1` のときだけ）。
     ///
-    /// 修正前は書き側を閉じてから読み取りの上限を入れていたので、その間にサーバーが接続を
-    /// 畳んだ回は、送受信の両方が閉じたソケットへの setsockopt に macOS が EINVAL を返して
-    /// fd 数えのテストが落ちた（CI の macOS で間欠的に踏んだ形）。ここでは注入で FIN の先着を
-    /// 毎回作るので、タイミングに依らず検出する。
-    /// A/B: `TAKO_2161_LEGACY=1` で macOS では EINVAL で落ちる
-    #[test]
-    fn issue2161_サーバーのfinが先に届いても往復の後始末が落ちない() {
+    /// サーバーが half-close の起こしを取りこぼした回（#2209）は、こちらが完全に閉じるまで
+    /// FIN が来ない。完全に閉じた接続では「FIN が先に届く」順序を作れないので、区切り
+    /// （[`EOF_KICK_AFTER`] から倍々。負荷で遅いだけなら次の区切りで間に合う）までに FIN が
+    /// 来なければ、[`closed_roundtrip_ordered`] が完全に閉じてサーバーを起こし、ここで新しい
+    /// 接続からやり直す（#2213）。取りこぼしは数十万往復に 1 回なので、続けて踏む見込みは無い。
+    /// 親プロセス（並列のテストが同居する）で走るので、救済した接続のサーバー側が閉じたかは
+    /// fd の数で見届けない（この番犬が見るのは順序だけ）。
+    /// サーバーが half-close で一度も閉じない（本物の停止）ときは予算 120 秒で落ちる。
+    /// `lost` は注入（#2209）: 先頭から何本の往復で書き側の shutdown を送らないか
+    fn fin_first_roundtrip(
+        endpoint: &str,
+        lost: usize,
+        deadline: std::time::Instant,
+    ) -> Option<usize> {
+        let legacy_2213 = std::env::var_os(LEGACY_2213_ENV).is_some();
+        let mut kick_after = EOF_KICK_AFTER;
+        let mut tries = 0;
+        loop {
+            let skip_half_close = tries < lost;
+            tries += 1;
+            let end = closed_roundtrip_ordered(
+                endpoint,
+                false,
+                deadline,
+                true,
+                skip_half_close,
+                kick_after,
+            );
+            if end.fin_seen {
+                return Some(tries);
+            }
+            if legacy_2213 || end.kicked_at.is_none() {
+                return None;
+            }
+            kick_after = kick_after.saturating_mul(2);
+        }
+    }
+
+    /// [`fin_first_roundtrip`] の番犬用に、受け口とダミーのディスパッチャを立てる
+    fn start_fin_first_server() -> IpcServer {
         let (tx, mut rx) = unbounded::<IncomingRequest>();
         let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
         std::thread::spawn(move || {
@@ -1538,12 +1595,53 @@ mod tests {
                 let _ = incoming.reply.send(Ok(json!({})));
             }
         });
+        server
+    }
+
+    /// #2161 の番犬: サーバーの FIN が EOF 待ちより先に届いた回でも、往復の後始末
+    /// （[`closed_roundtrip`]）が落ちない。
+    ///
+    /// 修正前は書き側を閉じてから読み取りの上限を入れていたので、その間にサーバーが接続を
+    /// 畳んだ回は、送受信の両方が閉じたソケットへの setsockopt に macOS が EINVAL を返して
+    /// fd 数えのテストが落ちた（CI の macOS で間欠的に踏んだ形）。ここでは注入で FIN の先着を
+    /// 毎回作るので、タイミングに依らず検出する。サーバーが half-close の起こしを取りこぼした
+    /// 回は往復をやり直す（[`fin_first_roundtrip`]。#2213）。
+    /// A/B: `TAKO_2161_LEGACY=1` で macOS では EINVAL で落ちる。
+    /// 注入: `TAKO_2209_INJECT_LOST_WAKEUP=<k>` で先頭の k 本を取りこぼした回にする
+    #[test]
+    fn issue2161_サーバーのfinが先に届いても往復の後始末が落ちない() {
+        let server = start_fin_first_server();
         let deadline = std::time::Instant::now() + FD_EOF_BUDGET;
-        let fin_seen =
-            closed_roundtrip_ordered(server.endpoint(), false, deadline, true, false).fin_seen;
+        let lost = env_count(INJECT_LOST_WAKEUP_ENV);
+        let tries = fin_first_roundtrip(server.endpoint(), lost, deadline);
+        println!("#2161 FIN の先着を作れた往復: {tries:?}（取りこぼしの注入 {lost} 本）");
         assert!(
-            fin_seen,
+            tries.is_some(),
             "EOF 待ちの前に FIN が届いていない = 注入が順序を作れておらず、番犬が何も試していない"
+        );
+    }
+
+    /// #2213 の番犬: FIN の先着を作る往復（#2161 の番犬）で、サーバーが half-close の起こしを
+    /// 取りこぼしても（#2209）、予算を使い切らずに往復をやり直して順序を作る。
+    ///
+    /// 修正前は FIN を予算 120 秒いっぱい待ったので、取りこぼした回は 120 秒で落ちた
+    /// （実機では数十万往復に 1 回なので、注入で毎回作る: 1 本目で書き側の shutdown を送らない
+    /// = サーバーは取りこぼしたときと同じく、こちらが完全に閉じるまで read で眠る）。
+    /// A/B: `TAKO_2213_LEGACY=1` では FIN を待ち続け、予算 120 秒を使い切って落ちる
+    #[test]
+    fn issue2213_finの先着を待つ往復で起こしを取りこぼしてもやり直して順序を作る() {
+        let server = start_fin_first_server();
+        let deadline = std::time::Instant::now() + FD_EOF_BUDGET;
+        let started = std::time::Instant::now();
+        let tries = fin_first_roundtrip(server.endpoint(), 1, deadline);
+        println!(
+            "#2213 FIN の先着を作れた往復: {tries:?}（取りこぼしの注入 1 本・{:?}）",
+            started.elapsed()
+        );
+        let tries = tries.expect("取りこぼした往復をやり直した後も FIN の先着を作れない");
+        assert!(
+            tries >= 2,
+            "1 本目で FIN が届いた = 注入が取りこぼしを作れておらず、番犬が何も試していない"
         );
     }
 
