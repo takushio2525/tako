@@ -3635,8 +3635,8 @@ enum OffloadLanded {
         Vec<AnyWindowHandle>,
     ),
     /// もう一巡 background で走らせる（先取りの答えがまだ足りない #1984 / 着地で host を変えた
-    /// 続きがある #2086）。後ろの 2 つは、着地の後処理が失敗させた応答と強制描画する窓
-    /// （先取りの一巡では後処理をしないので空）
+    /// 続きがある #2086 / 返答の配送で master の起動の組み立てが要る #2182）。後ろの 2 つは、
+    /// 着地の後処理が失敗させた応答と強制描画する窓（先取りと組み立ての一巡では後処理をしないので空）
     Again(
         Box<tako_control::OffloadJob>,
         Option<tako_control::DispatchError>,
@@ -31910,6 +31910,11 @@ mod self_test {
     mod tasks_input_2016;
     #[cfg(feature = "visual-test")]
     use tasks_input_2016::tasks_input_visual;
+    /// #2182: 右パネルの「返す」が master の起動の組み立てを UI スレッドで待たない（visual-test `tasks-launch-2182`）
+    #[cfg(feature = "visual-test")]
+    mod tasks_launch_2182;
+    #[cfg(feature = "visual-test")]
+    use tasks_launch_2182::tasks_launch_visual;
     /// #2009: 見えていないプレビューを手放し、表に戻した見た目と操作が変わらない（visual-test `preview-memory`）
     #[cfg(feature = "visual-test")]
     mod preview_memory_2009;
@@ -46712,6 +46717,13 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2182: 右パネルの「返す」が返らないログインシェルの最中も UI スレッドを止めず、
+                // master の起動の組み立てが打ち切られたら失敗として記録する
+                "tasks-launch-2182" => {
+                    tasks_launch_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -46728,7 +46740,7 @@ mod self_test {
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
-                         changelog-offload / changelog-expand）"
+                         changelog-offload / changelog-expand / tasks-launch-2182）"
                     );
                     std::process::exit(1);
                 }

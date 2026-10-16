@@ -895,7 +895,9 @@ impl TakoApp {
     /// 1 本は dispatch の "respond" と共有の 3 段: ① 積む（`user_task_respond_store`。YAML の
     /// 読み書き = background）→ ② 運ぶ（`_deliver`。workspace と送達フローに触る = UI スレッド）→
     /// ③ 記録して読み直す（`_finish` = background）。着地したら次の 1 本を出す
-    /// （並行に出すと返答の並びが送った順とずれる）
+    /// （並行に出すと返答の並びが送った順とずれる）。② で起票 master が居なければ、起動の組み立て
+    /// （`UserTaskLaunchJob::run`。CLI の所在確認 = ログインシェル）を background で待ってから
+    /// UI スレッドで起こす（`user_task_launch_land`。#2182）
     pub(crate) fn pump_user_task_sends(&mut self, cx: &mut Context<Self>) {
         if self.user_tasks.send_running {
             return;
@@ -924,22 +926,32 @@ impl TakoApp {
                 }
             };
             // ② 運ぶ（workspace と送達フローに触るので UI スレッド）
-            let Ok(delivered) = this.update(cx, |app: &mut TakoApp, cx| {
-                let delivered = tako_control::dispatch::user_task_respond_deliver(app, stored);
-                // master を起こして運んだときはペインの PTY をここで立てる（#1023 の不変条件。
-                // UI から dispatch を呼んだ経路は待ちを自分で消化する）
-                if let Err(reason) = app.attach_pending_sessions(cx) {
-                    app.notify_ui_op_failed(
-                        NoticeArea::UserTasks,
-                        NoticeArm::Issue1450B2,
-                        "user_task_respond",
-                        None,
-                        &reason,
-                    );
-                }
-                delivered
+            let Ok(step) = this.update(cx, |app: &mut TakoApp, cx| {
+                let step = tako_control::dispatch::user_task_respond_deliver(app, stored);
+                app.attach_respond_sessions(cx);
+                step
             }) else {
                 return;
+            };
+            let delivered = match step {
+                tako_control::dispatch::UserTaskRespondStep::Delivered(delivered) => delivered,
+                // #2182: 起票 master が居ない。起動の組み立て（CLI の所在確認のログインシェルと
+                // tako の実行ファイルの解決）は background で待ち、起こすのは UI スレッドへ戻ってから
+                tako_control::dispatch::UserTaskRespondStep::Launch(job) => {
+                    let landing = cx
+                        .background_executor()
+                        .spawn(async move { job.run() })
+                        .await;
+                    let Ok(delivered) = this.update(cx, |app: &mut TakoApp, cx| {
+                        let (delivered, _) =
+                            tako_control::dispatch::user_task_launch_land(app, landing);
+                        app.attach_respond_sessions(cx);
+                        delivered
+                    }) else {
+                        return;
+                    };
+                    delivered
+                }
             };
             // ③ 配送を記録して読み直す（YAML の読み書き。background）
             let finished = cx
@@ -967,6 +979,20 @@ impl TakoApp {
             });
         })
         .detach();
+    }
+
+    /// 返答を運んだ後に、master を起こしたペインの PTY をここで立てる（#1023 の不変条件。
+    /// UI から dispatch を呼んだ経路は待ちを自分で消化する）。起こしていなければ何もしない
+    fn attach_respond_sessions(&mut self, cx: &mut Context<Self>) {
+        if let Err(reason) = self.attach_pending_sessions(cx) {
+            self.notify_ui_op_failed(
+                NoticeArea::UserTasks,
+                NoticeArm::Issue1450B2,
+                "user_task_respond",
+                None,
+                &reason,
+            );
+        }
     }
 
     /// 積めなかった返答を戻す（#2016）。押した項目をまだ開いていて欄が空なら**その場で**戻し、

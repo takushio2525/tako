@@ -80,6 +80,13 @@
 //!     その本体に子プロセスの口（[`RAW`] + [`GRAPH_LEAVES`]）があれば、入口の中で次の段を呼んだ行を
 //!     file:line で名指しする。辿らないもの（先取りの外側の腕・A/B の旧経路の腕・別スレッド・
 //!     集約点の `dispatch`・既知の残り [`GRAPH_KNOWN`]）は理由つきで宣言する
+//! 16. #2182: 返答の配送で起票 master が居ないときの起動の組み立て（`master_launch::plan` = CLI の
+//!     所在確認のログインシェル・tako の実行ファイルの解決）は background のジョブ
+//!     （`OffloadJob::UserTaskLaunch`）。③ 運ぶ（`user_task_respond_deliver`。UI）は宛先を決めるだけで、
+//!     起動が要れば `UserTaskRespondStep::Launch` を返し、`land_offload` がもう一巡 background へ出し、
+//!     起こすのは着地（`user_task_launch_land`。UI）。右パネルの「返す」も同じ段を `background_executor()`
+//!     で回す。15 節の既知の残りだった辺はこれで消えた。組み立ての呼び出しはグラフが辿るので、ここは
+//!     グラフの読まない形（UI スレッドの関数の `job.run()`・tako-app）を見る。A/B は `TAKO_2182_LEGACY=1`
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -243,6 +250,10 @@ const UI_PATHS: &[&str] = &[
     // #2150
     "fn preview_changelog_diff_prepare(",
     "fn preview_changelog_diff_land(",
+    // #2182: 返答の配送（③ 運ぶ）と、組み立てた起動で起こす着地
+    "pub fn user_task_respond_deliver(",
+    "pub fn user_task_launch_land(",
+    "fn launch_master_for_response(",
 ];
 
 /// 読む側の関数（子プロセスの口は `Probed::Outside` の腕でだけ呼ぶ）
@@ -2383,6 +2394,123 @@ fn scan_preview_changelog_diff(dispatch: &str, main: &str, render: &str) -> Vec<
     out
 }
 
+/// 16 節（#2182）: 返答の配送で起票 master が居ないときの起動の組み立て（`master_launch::plan` = CLI の
+/// 所在確認のログインシェルと tako の実行ファイルの解決）は background のジョブ
+/// （`OffloadJob::UserTaskLaunch` / 右パネルは `background_executor()`）。
+///
+/// 組み立ての呼び出しそのもの（`plan_master_for_response` → `master_launch::plan`）は 15 節の
+/// 呼び出しグラフが辿る。ここが見るのはグラフの読まない形: 受け手の型が字面から決まらない
+/// メソッド呼び出し（`job.run()`）を UI スレッドの関数で書く逆戻りと、tako-app（グラフの範囲外）
+fn scan_user_task_launch(dispatch: &str, tasks: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let mut push =
+        |file: &'static str, line: usize, why: String| out.push(Offender { file, line, why });
+    // (a) UI スレッドの関数はジョブを走らせない（`job.run()` = 組み立てを待つ）
+    for head in [
+        "pub fn land_offload(",
+        "pub fn finish_offload(",
+        "fn user_task_land(",
+        "pub fn user_task_respond_deliver(",
+        "pub fn user_task_launch_land(",
+        "fn launch_master_for_response(",
+    ] {
+        match fn_window(dispatch, head) {
+            None => push(
+                DISPATCH,
+                0,
+                format!("`{head}` が見つからない（走査が空振り。改名したなら番犬も追うこと）"),
+            ),
+            Some((at, window)) => {
+                for i in code_lines_with(&window, ".run()") {
+                    push(
+                        DISPATCH,
+                        at + i,
+                        format!(
+                            "UI スレッドで走る `{head}` がジョブを走らせている（`.run()`。返答の配送の \
+                             起動の組み立て = ログインシェルの `command -v` を UI スレッドで待つ = #2182）"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // (b) background の段（`run_staged`）が組み立てのジョブを走らせ、着地を UI スレッドへ戻す
+    match fn_window(dispatch, "pub fn run_staged(self)") {
+        None => push(
+            DISPATCH,
+            0,
+            "`run_staged` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            let arm = code_lines_with(&window, "OffloadJob::UserTaskLaunch(job) =>");
+            let land = code_lines_with(&window, "OffloadContinuation::UserTaskLaunched(");
+            if arm.is_empty() || land.is_empty() {
+                push(
+                    DISPATCH,
+                    at,
+                    "`run_staged` が返答の配送の起動の組み立て（`OffloadJob::UserTaskLaunch`）を \
+                     background で走らせて `OffloadContinuation::UserTaskLaunched` で戻していない（#2182）"
+                        .into(),
+                );
+            }
+        }
+    }
+    // (c) IPC の着地は起動が要るとき組み立てのジョブを background へ出す（もう一巡）
+    if let Some((at, window)) = fn_window(dispatch, "pub fn land_offload(") {
+        if code_lines_with(&window, "OffloadJob::UserTaskLaunch(").is_empty() {
+            push(
+                DISPATCH,
+                at,
+                "`land_offload` が返答の配送で起票 master が居ないとき、起動の組み立てを background \
+                 のジョブ（`OffloadJob::UserTaskLaunch`）へ出していない（#2182）"
+                    .into(),
+            );
+        }
+    }
+    // (d) tako-app: 右パネルの「返す」は組み立てを background のブロックの中でだけ走らせる
+    match fn_window(tasks, "pub(crate) fn pump_user_task_sends(") {
+        None => push(
+            TASKS_PANEL,
+            0,
+            "`pump_user_task_sends` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            let runs = code_lines_with(&window, ".run()");
+            if runs.is_empty() {
+                push(
+                    TASKS_PANEL,
+                    at,
+                    "`pump_user_task_sends` が起票 master の起動の組み立て（`job.run()`）を回していない \
+                     （master が居ないときの返答が届かない。#2182）"
+                        .into(),
+                );
+            }
+            for i in runs {
+                if !window[i].contains(".spawn(async move {") {
+                    push(
+                        TASKS_PANEL,
+                        at + i,
+                        "右パネルの「返す」が起票 master の起動の組み立て（`.run()`）を background の \
+                         ブロック（`background_executor().spawn(async move { … })`）の外 = UI スレッドで \
+                         走らせている（ログインシェルの `command -v` を待つ = #2182）"
+                            .into(),
+                    );
+                }
+            }
+            if code_lines_with(&window, "user_task_launch_land(").is_empty() {
+                push(
+                    TASKS_PANEL,
+                    at,
+                    "`pump_user_task_sends` が組み立てた起動を `user_task_launch_land` で起こしていない \
+                     （画面だけ別の起こし方になる。#2182）"
+                        .into(),
+                );
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // 15. #2042: 包んだ口を見逃さない（UI スレッドの入口から呼び出しを辿る）
 // ---------------------------------------------------------------------------
@@ -2420,15 +2548,11 @@ const GRAPH_STOPS: &[(&str, &str)] = &[
     ("dispatch_inner", "`dispatch` の本体（同上）"),
 ];
 
-/// 既知の残り: 本物の UI スレッドの子プロセス待ちだが #2042 では直さない辺（`(呼び手, 行き先, 理由)`）。
-/// 直したら外すこと（辺が消えると [`既知の残りがまだ残っている`] が落ちる）
-const GRAPH_KNOWN: &[(&str, &str, &str)] = &[(
-    "launch_master_for_response",
-    "plan",
-    "返答の配送（#2086 の ③ 運ぶ = `land_offload` の UI スレッド）で起票 master が居ないとき、\
-     `master_launch::plan` が CLI の所在確認（`agent_cli::preflight` = ログインシェルの `command -v`。上限つき）と \
-     tako の実行ファイルの解決（`resolve_tako_binary`）を UI スレッドで待つ。#2042 の番犬が見つけた（直すのは別 Issue）",
-)];
+/// 既知の残り: 本物の UI スレッドの子プロセス待ちだがまだ直していない辺（`(呼び手, 行き先, 理由)`）。
+/// 直したら外すこと（辺が消えると [`既知の残りがまだ残っている`] が落ちる）。
+/// #2042 で見つけた返答の配送の `launch_master_for_response` → `plan` は #2182 で直して外した
+/// （16 節と [`返答の配送の起動の組み立てを戻すと名指す`]）
+const GRAPH_KNOWN: &[(&str, &str, &str)] = &[];
 
 /// 到達した関数で探す葉（[`RAW`] に足す、子プロセスの口の素の形。右は名指しの理由）
 const GRAPH_LEAVES: &[(&str, &str)] = &[
@@ -2747,6 +2871,7 @@ impl Sources {
             &self.main,
             &self.preview_render,
         ));
+        v.extend(scan_user_task_launch(&self.dispatch, &self.tasks_panel));
         v
     }
 }
@@ -3696,11 +3821,11 @@ fn 逆戻りを名指しできる() {
         "`fn user_task_add_finish(` が `add_at(`",
     );
 
-    // ㊼ #2086: 返答の配送の記録を着地（UI スレッド）で書く
+    // ㊼ #2086: 返答の配送の記録を着地（UI スレッド）で書く（#2182 で ③ は `match` で結末を分ける形）
     let d = inject(
         &s.dispatch,
-        "                let delivered = user_task_respond_deliver(host, *stored);",
-        "                let delivered = user_task_respond_deliver(host, *stored);\n                let _ = user_task_respond_finish(todo!());",
+        "                match user_task_respond_deliver(host, *stored) {",
+        "                let _ = user_task_respond_finish(todo!());\n                match user_task_respond_deliver(host, *stored) {",
         "㊼",
     );
     expect_named(
@@ -4553,6 +4678,129 @@ fn 既知の残りがまだ残っている() {
         );
         eprintln!("既知の残り（外すと）→ {}", hit.unwrap().report());
     }
+}
+
+/// 16 節（#2182）の逆戻り（返答の配送の起動の組み立てを UI スレッドへ戻す注入）を名指す。
+/// 組み立ての呼び出しを戻す形は 15 節（呼び出しグラフ）が、グラフの読まない形（UI スレッドの
+/// 関数の `job.run()`・tako-app の右パネル）は 16 節の窓が名指す
+#[test]
+fn 返答の配送の起動の組み立てを戻すと名指す() {
+    let s = Sources::load();
+    assert!(s.offenders().is_empty(), "前提: 現行は緑");
+    let inject = |src: &str, from: &str, to: &str, label: &str| {
+        let injected = src.replacen(from, to, 1);
+        assert_ne!(injected, src, "注入「{label}」の置換元がある");
+        injected
+    };
+    let graph_of = |d: &str| {
+        let mut injected = s.clone();
+        injected.dispatch = d.to_string();
+        let graph = injected.graph();
+        scan_call_graph(&graph, &graph_leaves(RAW), &graph_known_edges(&graph))
+    };
+
+    // (L1) 修正前の形: ③ 運ぶが、起動が要ると組み立てをその場で待って起こす
+    let d = inject(
+        &s.dispatch,
+        "            None => return Routed::NeedsPlan(profile),",
+        "            None => launch_master_for_response(host, task, index, &profile, plan_master_for_response(&profile)),",
+        "(L1)",
+    );
+    let named = graph_of(&d);
+    let hit = named.iter().find(|o| {
+        o.why.contains("`deliver_user_task_response`")
+            && o.why.contains("`plan_master_for_response`")
+            && o.why.contains("agent_cli::preflight(")
+    });
+    assert!(
+        hit.is_some(),
+        "注入「(L1) 組み立てをその場で待つ」を 15 節が名指せない: {:?}",
+        named.iter().map(Offender::report).collect::<Vec<_>>()
+    );
+    eprintln!("注入「(L1)」→ {}", hit.unwrap().report());
+
+    // (L2) A/B のゲートを外す（`TAKO_2182_LEGACY=1` の腕が製品の既定になる）。ゲートの中なら
+    // 名指さない（現行が緑 = 旧経路の腕を辿っていない）ことの裏返し
+    let d = inject(
+        &s.dispatch,
+        "    if tako_core::probe::issue2182_legacy() {\n        let plan = plan_master_for_response(&profile);",
+        "    {\n        let plan = plan_master_for_response(&profile);",
+        "(L2)",
+    );
+    let named = graph_of(&d);
+    let line = line_in(
+        &d,
+        "pub fn user_task_respond_deliver(",
+        "let plan = plan_master_for_response(&profile);",
+    );
+    let hit = named
+        .iter()
+        .find(|o| o.line == line && o.why.contains("`plan_master_for_response`"));
+    assert!(
+        hit.is_some(),
+        "注入「(L2) A/B のゲートを外す」を 15 節が {DISPATCH}:{line} で名指せない: {:?}",
+        named.iter().map(Offender::report).collect::<Vec<_>>()
+    );
+    eprintln!("注入「(L2)」→ {}", hit.unwrap().report());
+
+    // (L3) もう一巡を出せない着地がジョブを走らせる（`job.run()` = 受け手の型が字面から決まらない
+    // メソッド呼び出し）。15 節は辿らないので見逃し、16 節の窓が名指す
+    let d = inject(
+        &s.dispatch,
+        "UserTaskRespondStep::Launch(job) => job.refused_on_ui(),",
+        "UserTaskRespondStep::Launch(job) => user_task_launch_land(host, job.run()).0,",
+        "(L3)",
+    );
+    assert!(
+        graph_of(&d).is_empty(),
+        "前提: 15 節は `job.run()` を辿らない（16 節の窓が要る理由）"
+    );
+    let line = line_in(&d, "fn user_task_land(", "job.run()");
+    let window = scan_user_task_launch(&d, &s.tasks_panel);
+    assert!(
+        window
+            .iter()
+            .any(|o| o.file == DISPATCH && o.line == line && o.why.contains("#2182")),
+        "注入「(L3) 着地がジョブを走らせる」を 16 節が {DISPATCH}:{line} で名指せない: {:?}",
+        window.iter().map(Offender::report).collect::<Vec<_>>()
+    );
+
+    // (L4) 右パネルの「返す」が組み立てを UI スレッドで走らせる（tako-app = グラフの範囲外）
+    let t = inject(
+        &s.tasks_panel,
+        "                    let landing = cx\n                        .background_executor()\n                        .spawn(async move { job.run() })\n                        .await;",
+        "                    let landing = job.run();",
+        "(L4)",
+    );
+    let line = line_in(
+        &t,
+        "pub(crate) fn pump_user_task_sends(",
+        "let landing = job.run();",
+    );
+    let window = scan_user_task_launch(&s.dispatch, &t);
+    assert!(
+        window
+            .iter()
+            .any(|o| o.file == TASKS_PANEL && o.line == line && o.why.contains("#2182")),
+        "注入「(L4) 右パネルが組み立てを UI スレッドで走らせる」を 16 節が {TASKS_PANEL}:{line} で名指せない: {:?}",
+        window.iter().map(Offender::report).collect::<Vec<_>>()
+    );
+
+    // (L5) IPC の着地が組み立てのジョブを background へ出さない（もう一巡が消える）
+    let d = inject(
+        &s.dispatch,
+        "OffloadJob::UserTaskLaunch(job.holding(turn))",
+        "OffloadJob::UserTaskRespondRecord(job.holding(turn))",
+        "(L5)",
+    );
+    let window = scan_user_task_launch(&d, &s.tasks_panel);
+    assert!(
+        window.iter().any(|o| o
+            .why
+            .contains("`land_offload` が返答の配送で起票 master が居ないとき")),
+        "注入「(L5) 着地が組み立てを background へ出さない」を 16 節が名指せない: {:?}",
+        window.iter().map(Offender::report).collect::<Vec<_>>()
+    );
 }
 
 /// 包んだ口を通して UI スレッドで子プロセスを待つ注入を、1〜14 は見逃し、15 が file:line で名指しする

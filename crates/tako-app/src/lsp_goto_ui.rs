@@ -244,6 +244,8 @@ impl TakoApp {
                     OffloadContinuation::PreviewChangelog(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2150 の変更履歴の行の展開の続き）
                     OffloadContinuation::PreviewChangelogDiff(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2182 の返答の配送の master 起動の続き）
+                    OffloadContinuation::UserTaskLaunched(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }
