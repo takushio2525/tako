@@ -15785,9 +15785,11 @@ fn dispatch_orchestrator_spawn(
     // `tmux_session` が None になる。以前はこのブロックごと飛ばしていたので、
     // spawn 時のメタ（プロンプト・Issue 番号・model）が永久に記録されず、
     // カタログが「発見性」という存在意義を果たせなかった。キーはペイン ID へ倒す
+    //
+    // #2199: Issue 番号はラベル → プロンプトの書いた順で 1 回だけ拾い、カタログ・台帳・
+    // レジストリへ同じ値を渡す（先頭 = 主の Issue。台帳の `issue` はその 1 件）
+    let spawn_issues = crate::sessions::spawn_issues(label, prompt);
     {
-        let issues =
-            crate::sessions::extract_issues(&format!("{} {prompt}", label.unwrap_or_default()));
         let record = crate::sessions::PendingSpawn {
             tmux_session: tmux_session.clone(),
             kind: "worker".into(),
@@ -15796,7 +15798,7 @@ fn dispatch_orchestrator_spawn(
             agent: Some(worker_agent.as_str().to_string()),
             model: launch.model.clone(),
             effort: launch.effort.clone(),
-            issues,
+            issues: spawn_issues.clone(),
             prompt_head: Some(crate::sessions::prompt_head(prompt, 200)),
             cwd: Some(cwd.clone()),
             tab: Some(tab_id.as_u64()),
@@ -15809,11 +15811,7 @@ fn dispatch_orchestrator_spawn(
     }
 
     // 委任台帳への自動記録（Issue #292 層1）。失敗しても spawn は止めない
-    let issue_num =
-        crate::sessions::extract_issues(&format!("{} {prompt}", label.unwrap_or_default()))
-            .into_iter()
-            .next();
-    let issue_str = issue_num.map(|n| format!("#{n}"));
+    let issue_str = spawn_issues.first().map(|n| format!("#{n}"));
     let ledger_id = crate::orchestrator::ledger::record_spawn(
         project,
         label,
@@ -15840,10 +15838,7 @@ fn dispatch_orchestrator_spawn(
             pane: new_id.as_u64(),
             tab: Some(tab_id.as_u64()),
             tmux_session: tmux_session.clone(),
-            issues: crate::sessions::extract_issues(&format!(
-                "{} {prompt}",
-                label.unwrap_or_default()
-            )),
+            issues: spawn_issues,
             ledger_id: Some(ledger_id.clone()).filter(|s| !s.is_empty()),
             cwd: Some(cwd.clone()),
             prompt_head: Some(crate::sessions::prompt_head(prompt, 200)),
