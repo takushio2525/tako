@@ -435,6 +435,18 @@ pub mod notes {
         "In agy, headroom is a prepaid AI-credit balance: there is no 5h/weekly window and no reset time. The balance appears only inside the interactive /credits modal, so there is no way to read it without disturbing the worker's screen (re-verified on agy 1.1.22 in #985)",
     );
 
+    /// #2204: codex の使用量は rollout から数えるが、モデルが単価表に無く、rollout はログインを持たない
+    pub const CODEX_USAGE_UNPRICED: Note = Note::new(
+        "codex のモデル（gpt-* / codex-auto-review）は API 換算の単価表に無いので、使用量はトークン数だけを数える（API 換算は出ない）。rollout はどのログインで使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる（#2204）",
+        "codex models (gpt-* / codex-auto-review) are not in the API-equivalent price table, so usage is counted in tokens only (no API-equivalent cost). Rollouts do not record which login was used, so past usage is attributed to the login in the current auth.json (#2204)",
+    );
+
+    /// #2204: codex の % は rollout の観測から過去の分まで配れるが、重みは生トークン
+    pub const CODEX_SHARE_TOKEN_WEIGHTED: Note = Note::new(
+        "codex の % は rollout の rate_limits を観測にして過去の分まで配るが、重みは API 換算ではなく生トークンの比（codex のモデルは単価表に無い）。rollout はどのログインで使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる（#2204）",
+        "For codex the percentage is shared out back through past usage using the rate_limits in its rollouts as observations, but the weight is the raw token ratio rather than the API-equivalent cost (codex models are not in the price table). Rollouts do not record which login was used, so past usage is attributed to the login in the current auth.json (#2204)",
+    );
+
     /// #2201: agy の使用量は会話の保管庫（SQLite）の中にしか無い
     pub const AGY_USAGE_IN_SQLITE: Note = Note::new(
         "agy のトークン数は会話の保管庫（conversations/<id>.db = SQLite の gen_metadata の行）にしか無く、実況ログには無い。tako は SQLite を読む依存を持たない（#984 の判断）ので、依存の可否を #2205 で調べる",
@@ -1411,7 +1423,7 @@ pub const MATRIX: &[AgentFeature] = &[
             "The observed rise in the usage-limit percentage (5h / 7d) is shared out to projects, Issues and sessions by each interval's usage (#2202)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 2204),
+        codex: degraded(notes::CODEX_SHARE_TOKEN_WEIGHTED),
         agy: unsupported(notes::AGY_CREDITS_NOT_WINDOWED),
         local: unsupported(notes::NO_LOCAL_USAGE_LIMIT),
         evidence: AgentEvidence::Measured(
@@ -1420,7 +1432,10 @@ pub const MATRIX: &[AgentFeature] = &[
              混雑時間帯の係数・窓のまたぎ・古い値のペイン・下がる報告・使用量 0 の区間（tako の外）・\
              最後の観測より後と観測の無い窓（推定）を含め、合計が観測と一致しキーごとの誤差が 1 ポイント以内。\
              agy は #985 の実測（agy 1.1.22）で窓つきの利用上限と使用率を持たない（残量は前払いクレジット）ので\
-             配る % が無い。codex は rollout の token_count が rate_limits の履歴を持つ（設計書 §1.5 = #2204）",
+             配る % が無い。codex は #2204 実測（2026-10-17・この機の rollout 264 本の写し）: 過去の rate_limits から 5h は 11 窓で延べ \
+             478% = 段 478.00 + tako の外 0・7d は 17 窓で 718% = 段 718.00 + 0（窓ごとの最大の % の和を別実装で \
+             出しても同じ）。重みは生トークン（単価表に無い）で推定はしない。単体テスト \
+             tako_core::usage::share::tests::codexの窓は揺れを1時間まで寄せ早く始まった窓を分ける",
         ),
     },
     AgentFeature {
@@ -1430,13 +1445,15 @@ pub const MATRIX: &[AgentFeature] = &[
             "Usage from conversation logs (tokens, API-equivalent cost) is tallied per project, Issue and session (#2201)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 2204),
+        codex: degraded(notes::CODEX_USAGE_UNPRICED),
         agy: pending(notes::AGY_USAGE_IN_SQLITE, 2205),
         local: local_pending(),
-        evidence: AgentEvidence::UnitTest(
+        evidence: AgentEvidence::Measured(
             "tako_control::usage::index::tests（偽の transcript の分割行・仮の output・<synthetic>・\
              サブエージェント・書きかけの最終行・切り詰め・追記分だけの読み直し・カタログの追い出し）。\
-             codex は rollout の token_count に累積値がある（設計書 §1.5 = #2204 で取り込む）",
+             codex は #2204 実測（2026-10-17・この機の rollout 264 本・631 MB の写し）: token_count の累積の差分の和が \
+             rollout ごとの最後の累積の和（別実装の python）と 19.41 億トークンで完全一致・会話 262 本すべて一致。\
+             gpt-* / codex-auto-review は単価表に無いので API 換算は出ない",
         ),
     },
     AgentFeature {

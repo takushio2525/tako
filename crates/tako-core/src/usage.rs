@@ -30,7 +30,15 @@
 //!
 //! 観測した used_percent の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配る（[`share`]）。
 //! 合計は観測と一致し、区間に使用量が無ければ「tako の外」、観測の区間の外は係数で割った「推定」。
+//!
+//! # codex（S5 = #2204）
+//!
+//! codex の rollout（`$CODEX_HOME/sessions/**/rollout-*.jsonl`）は使用量（`token_count` の累積）と
+//! 利用制限の観測（同じ行の `rate_limits`）を 1 本に持つ（[`codex`]）。使用量は索引へ、観測は
+//! `limits.jsonl` へ `source: codex` で入り、過去の分まで区間按分できる。ログインの鍵は
+//! `<CODEX_HOME>/auth.json` の `tokens.account_id` の塩付きハッシュ（[`codex_account_key`]）。
 
+pub mod codex;
 pub mod index;
 pub mod price;
 pub mod report;
@@ -47,8 +55,10 @@ use crate::claude_mod::{parse_resets_at, ModRateLimit, ModReport};
 pub const S1_LEGACY_ENV: &str = "TAKO_2192_S1_LEGACY";
 /// ログインの鍵の桁数（16 進。§3.2 の「12 桁」）
 pub const KEY_HEX_LEN: usize = 12;
-/// 観測の出どころ: tako mod の報告（S5 で `codex`、画面の読み取りを足すなら `screen`）
+/// 観測の出どころ: tako mod の報告（画面の読み取りを足すなら `screen`）
 pub const SOURCE_MOD: &str = "mod";
+/// 観測の出どころ: codex の rollout の `rate_limits`（S5 #2204）
+pub const SOURCE_CODEX: &str = "codex";
 /// `ModHub` に積んでおく材料の上限（GUI の定期処理が汲み出さないホストでも溜まり続けない。
 /// 超えたら古いものから捨てる）
 pub const MAX_PENDING: usize = 256;
@@ -114,6 +124,44 @@ pub fn config_dir_key(salt: &str, config_dir: &Path) -> LoginKey {
         key: salted_key("config_dir", salt, &config_dir.to_string_lossy()),
         from: KeyFrom::ConfigDir,
     }
+}
+
+/// codex の `auth.json` の `tokens.account_id` からログインの鍵を作る（S5 #2204）。区切りの語が claude の
+/// accountUuid と違うので、同じ文字列から作っても claude のログインと突き合わない
+pub fn codex_account_key(salt: &str, account_id: &str) -> LoginKey {
+    LoginKey {
+        key: salted_key("codex_account", salt, account_id.trim()),
+        from: KeyFrom::Account,
+    }
+}
+
+/// codex の資格情報を読めないときの鍵（`CODEX_HOME` そのものの塩付きハッシュ）
+pub fn codex_home_key(salt: &str, codex_home: &Path) -> LoginKey {
+    LoginKey {
+        key: salted_key("codex_home", salt, &codex_home.to_string_lossy()),
+        from: KeyFrom::ConfigDir,
+    }
+}
+
+/// codex の `auth.json` から `tokens.account_id` **だけ**を読む（トークンそのもの・API キーは serde が
+/// 読み飛ばし、値を持ち出さない）
+pub fn codex_account_id_from_json(text: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct AuthJson {
+        #[serde(default)]
+        tokens: Option<AuthTokens>,
+    }
+    #[derive(Deserialize)]
+    struct AuthTokens {
+        #[serde(default)]
+        account_id: Option<String>,
+    }
+    let parsed: AuthJson = serde_json::from_str(text).ok()?;
+    parsed
+        .tokens?
+        .account_id
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
 }
 
 /// 報告の `config_dir`（`CLAUDE_CONFIG_DIR` の生の値）を正規化する。空は「無し」、
@@ -620,6 +668,32 @@ mod tests {
         );
         assert_eq!(account_uuid_from_json(r#"{"oauthAccount": null}"#), None);
         assert_eq!(account_uuid_from_json("{ 壊れた"), None);
+    }
+
+    /// #2204: codex の auth.json からは account_id だけを読み、claude の鍵と突き合わない鍵にする
+    #[test]
+    fn codexのauth_jsonからaccount_idだけを読み別の区切りで鍵にする() {
+        let text = format!(
+            r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-秘密","tokens":{{"id_token":"秘密","access_token":"秘密","refresh_token":"秘密","account_id":" {UUID_A} "}},"last_refresh":"2026-10-01"}}"#
+        );
+        assert_eq!(codex_account_id_from_json(&text).as_deref(), Some(UUID_A));
+        assert_eq!(codex_account_id_from_json(r#"{"OPENAI_API_KEY":"sk-x"}"#), None);
+        assert_eq!(
+            codex_account_id_from_json(r#"{"tokens":{"account_id":""}}"#),
+            None
+        );
+        assert_eq!(codex_account_id_from_json("{ 壊れた"), None);
+        let k = codex_account_key(SALT, UUID_A);
+        assert_eq!(k.key.len(), KEY_HEX_LEN);
+        assert_eq!(k.from, KeyFrom::Account);
+        assert_ne!(k.key, account_key(SALT, UUID_A).key, "claude の鍵と突き合わない");
+        assert_eq!(k, codex_account_key(SALT, &format!(" {UUID_A}\n")));
+        let h = codex_home_key(SALT, Path::new("/home/testuser/.codex"));
+        assert_eq!(h.from, KeyFrom::ConfigDir);
+        assert_ne!(
+            h.key,
+            config_dir_key(SALT, Path::new("/home/testuser/.codex")).key
+        );
     }
 
     #[test]

@@ -13,12 +13,14 @@ ButtonAction: Slash, Tako, Shell, Prompt
 CardsUi: place
 ChatShow: Always, GuiOnly, Off
 ChatUi: place, bubble, code_copy, tool_summary
+CodexCursor: session, fork, model, total, replay_at, counted
+CodexUsage: input, cached, cache_write, output, reasoning, total
 ColorsUi: accent, warn, dim
 CompactedMonth: size, daily
 CompactedState: months, maintained_at
 ControlInfo: version, pid, socket, token, mcp_url
 CopyText: label, text
-CursorRow: file, dev, ino, offset, last, ids, at
+CursorRow: file, dev, ino, offset, last, ids, at, codex
 Decision: Approve, Reject, NeedsChange, Answered
 Delivery: state, profile, pane, tab, reason, at, response_index
 DeliveryState: Sent, Launched, Delivered, Failed

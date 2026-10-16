@@ -17,6 +17,11 @@
 //! 5. 観測の区間の外（最後の観測より後・観測の無い窓）の使用量は、係数（直近 7 日の区間の「1% あたりの
 //!    API 換算」の中央値）で割った値を**推定**として別に持つ。係数が無ければ推定できない（量だけ数える）
 //!
+//! **codex（S5 #2204）は推定しない**（[`allocate_with`]）: codex の rollout は使用量と観測を同じ行に持つので
+//! 観測の無い使用量が無く、区間の外の使用量は「% が上がらなかった続き」か「その枠の無いプランの期間
+//! （週の枠だけ）」のどちらか。係数で割ると後者を 5h の % へ数えてしまう（この機の rollout で延べ 15 万 %）。
+//! 窓の寄せ方も違う（[`CODEX_RESET_JITTER_SECS`]）。
+//!
 //! 行（5 分刻み。35 日より古い月は日単位）の中の使用量は時間に一様とみなす。
 
 use std::collections::BTreeMap;
@@ -33,6 +38,14 @@ pub const SEVEN_DAY: &str = "seven_day";
 pub const KINDS: [(&str, i64); 2] = [(FIVE_HOUR, 5 * 3600), (SEVEN_DAY, 7 * 86_400)];
 /// 推定の係数を取る区間の新しさ（区間の終わりが今からこの秒数以内。無ければすべての区間へ広げる）
 pub const COEFFICIENT_RECENT_SECS: i64 = 7 * 86_400;
+/// codex の観測（`source: codex`）で同じ窓とみなす解除時刻の揺れ（秒。S5 #2204）。
+///
+/// codex は `resets_at` を報告のたびに計算し直すので秒単位で揺れ、同じログインの別の会話は数分ずれる
+/// （この機の rollout で最大 298 秒）。一方で**週の枠が前の窓の解除より前に新しく始まる**（プランの切り替え・
+/// 早い解除。実測で 1.5〜3.9 日ずれた解除時刻が続いた）ので、claude の「窓の長さの半分」で寄せると
+/// 別の窓を 1 つに束ねて延べの % を落とす。0% の間の解除時刻は「今 + 長さ」で動くので、使い始める前の
+/// 報告は小さな窓として残る（値の上がった点が無いので配る区間は無い）
+pub const CODEX_RESET_JITTER_SECS: i64 = 3600;
 
 /// 観測の点（unix 秒・%）
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -67,6 +80,21 @@ impl ObservedWindow {
     }
 }
 
+/// ログイン `login` の枠 `kind` の観測がすべて codex の rollout から来たか（S5 #2204。窓の寄せ方と推定の有無が違う）
+pub fn codex_only(observations: &[LimitObservation], login: &str, kind: &str) -> bool {
+    let mut any = false;
+    for o in observations
+        .iter()
+        .filter(|o| o.login == login && o.kind == kind)
+    {
+        if o.source != super::SOURCE_CODEX {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 /// ログイン `login` の枠 `kind`（長さ `len` 秒）の窓を古い順に組む。2 つ目は解除時刻の無い・% の壊れた観測の数
 pub fn windows_for(
     observations: &[LimitObservation],
@@ -76,6 +104,8 @@ pub fn windows_for(
 ) -> (Vec<ObservedWindow>, usize) {
     let mut by_reset: BTreeMap<i64, Vec<(i64, f64)>> = BTreeMap::new();
     let mut unusable = 0usize;
+    // codex の観測だけのログイン・枠は窓の寄せ方が違う（[`CODEX_RESET_JITTER_SECS`]）
+    let codex = codex_only(observations, login, kind);
     for o in observations
         .iter()
         .filter(|o| o.login == login && o.kind == kind)
@@ -89,21 +119,35 @@ pub fn windows_for(
         }
     }
     // 解除時刻の揺れを同じ窓へ寄せる。続く窓の解除時刻は前の窓の解除時刻から長さ以上離れる
-    // （新しい窓は前の窓が解けた後の最初の使用で始まる）ので、長さの半分以内は同じ窓とみなす
-    let mut groups: Vec<(i64, Vec<(i64, f64)>)> = Vec::new();
+    // （新しい窓は前の窓が解けた後の最初の使用で始まる）ので、長さの半分以内は同じ窓とみなす。
+    // codex は前の窓の解除より前に新しい窓が始まりうるので、揺れの上限で寄せる
+    let tolerance = if codex {
+        CODEX_RESET_JITTER_SECS.min(len / 2)
+    } else {
+        len / 2
+    };
+    // （束の解除時刻 = いちばん遅いもの, いちばん早いもの, 観測）
+    let mut groups: Vec<(i64, i64, Vec<(i64, f64)>)> = Vec::new();
     for (r, pts) in by_reset {
         match groups.last_mut() {
-            Some((gr, gpts)) if r - *gr <= len / 2 => {
+            Some((gr, _, gpts)) if r - *gr <= tolerance => {
                 *gr = r;
                 gpts.extend(pts);
             }
-            _ => groups.push((r, pts)),
+            _ => groups.push((r, r, pts)),
         }
     }
     let mut out = Vec::with_capacity(groups.len());
     let mut prev_reset: Option<i64> = None;
-    for (r, mut pts) in groups {
-        let start = prev_reset.map_or(r - len, |p| (r - len).max(p));
+    // codex: 前の窓の最後の点（窓の区間が重ならないよう、次の窓の開始をこれより前に置かない）
+    let mut prev_last: Option<i64> = None;
+    for (r, first_r, mut pts) in groups {
+        let start = if codex {
+            // 早く始まった窓は前の窓の解除を待たない。揺れの中でいちばん早い解除時刻から開始を取る
+            prev_last.map_or(first_r - len, |p| (first_r - len).max(p))
+        } else {
+            prev_reset.map_or(r - len, |p| (r - len).max(p))
+        };
         prev_reset = Some(r);
         pts.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         let observations = pts.len();
@@ -134,6 +178,7 @@ pub fn windows_for(
             }
             points.push(Point { t, percent: p });
         }
+        prev_last = points.last().map(|p| p.t);
         out.push(ObservedWindow {
             start,
             resets_at: r,
@@ -330,6 +375,17 @@ fn spread(mut values: Vec<f64>) -> Option<Spread> {
 
 /// 区間按分の本体（§2.4 の 3〜5）。`slices` は 1 つのログインの全行（期間・絞り込みの前）
 pub fn allocate(slices: &[UsageSlice], windows: &[ObservedWindow], now: i64) -> Allocation {
+    allocate_with(slices, windows, now, true)
+}
+
+/// [`allocate`] に、観測の区間の外の使用量を推定するかを渡す（codex は `false` = 区間の外は配らない。
+/// 観測は使用量と同じ行に載るので、区間の外は % の上がらなかった続きか、その枠の無いプランの期間）
+pub fn allocate_with(
+    slices: &[UsageSlice],
+    windows: &[ObservedWindow],
+    now: i64,
+    estimate: bool,
+) -> Allocation {
     let mut intervals: Vec<Interval> = Vec::new();
     for (wi, w) in windows.iter().enumerate() {
         for pair in w.points.windows(2) {
@@ -501,6 +557,7 @@ pub fn allocate(slices: &[UsageSlice], windows: &[ObservedWindow], now: i64) -> 
                     piece.observed = intervals[ii].delta * mine / total;
                 }
             }
+            None if !estimate => {}
             None => {
                 let c = out.coefficient;
                 match (s.usd, c.and_then(|c| c.usd_per_percent)) {
@@ -636,6 +693,101 @@ mod tests {
             current_window(&[], LEN5, R),
             Current::Rolling { start: R - LEN5 }
         );
+    }
+
+    /// S5 #2204: codex の観測は解除時刻の揺れを 1 時間まで寄せ、前の窓の解除より前に始まる窓
+    /// （プランの切り替え・早い解除）を別の窓として配る。claude の寄せ方（長さの半分）だと束ねて延べを落とす
+    #[test]
+    fn codexの窓は揺れを1時間まで寄せ早く始まった窓を分ける() {
+        const D: i64 = 86_400;
+        const LEN7: i64 = 7 * D;
+        let codex = |percent: f64, resets_at: i64, t: i64| LimitObservation {
+            source: crate::usage::SOURCE_CODEX.into(),
+            ..obs(SEVEN_DAY, percent, resets_at, t)
+        };
+        let s_a = R; // 窓 A の開始
+        let r_a = s_a + LEN7;
+        let t_p = s_a + 2 * D + 2 * H; // 0% の報告（使い始める前 = 解除時刻は今 + 長さ）
+        let s_b = s_a + 2 * D + 12 * H; // 窓 B は A の解除を待たずに始まる
+        let r_b = s_b + LEN7;
+        let rows = vec![
+            codex(0.0, r_a - 12, s_a + 5),
+            codex(10.0, r_a, s_a + 3 * H),
+            codex(10.0, r_a + 1, s_a + 4 * H),
+            // 同じログインの別の会話の低い値（数分ずれた解除時刻）= 下がった値として捨てる
+            codex(1.0, r_a + 298, s_a + 5 * H),
+            codex(20.0, r_a, s_a + 6 * H),
+            codex(40.0, r_a + 1, s_a + 2 * D),
+            codex(0.0, t_p + LEN7, t_p),
+            codex(1.0, r_b, s_b + 600),
+            codex(33.0, r_b + 2, s_b + 3 * H),
+            codex(76.0, r_b, s_b + 5 * H),
+        ];
+        let (w, _) = windows_for(&rows, "L", SEVEN_DAY, LEN7);
+        assert_eq!(w.len(), 3, "A・使い始める前の 0%・B");
+        assert_eq!(
+            w[0].start,
+            r_a - 12 - LEN7,
+            "揺れの中でいちばん早い解除時刻から開始"
+        );
+        assert_eq!(w[0].resets_at, r_a + 298);
+        assert_eq!(w[0].latest_percent(), 40.0);
+        assert_eq!(w[0].ignored, 1, "別の会話の低い値");
+        assert_eq!(w[1].points.len(), 1, "0% だけの窓は配る区間を持たない");
+        assert_eq!(w[2].start, s_b, "B は A の解除（r_a）を待たずに始まる");
+        assert_eq!(w[2].latest_percent(), 76.0);
+        // 区間は重ならず、配った合計は窓ごとの最新の観測の和（延べ 116%）
+        let slices: Vec<UsageSlice> = (0..60)
+            .map(|i| UsageSlice {
+                t: s_a + i * 2 * H,
+                span: 300,
+                usd: None,
+                tokens: 1000,
+            })
+            .chain((0..30).map(|i| UsageSlice {
+                t: s_b + 300 + i * 600,
+                span: 300,
+                usd: None,
+                tokens: 1000,
+            }))
+            .collect();
+        let alloc = allocate(&slices, &w, s_b + 10 * D);
+        let observed: f64 = alloc.pieces.iter().map(|p| p.observed).sum::<f64>()
+            + alloc.outside.iter().map(|o| o.percent).sum::<f64>();
+        assert!((observed - 116.0).abs() < 1e-9, "{observed}");
+        assert!(
+            alloc.token_weighted_intervals > 0,
+            "単価表に無いモデルは生トークンの比"
+        );
+        // 推定の有無: 既定（claude）は区間の外（A の後〜B の前・B の後）を推定し、codex は配らない
+        let est = |a: &Allocation| {
+            a.pieces
+                .iter()
+                .map(|p| p.estimated + p.unestimated_tokens + p.unestimated_usd)
+                .sum::<f64>()
+        };
+        assert!(est(&alloc) > 0.0);
+        let codex_alloc = allocate_with(&slices, &w, s_b + 10 * D, false);
+        assert_eq!(est(&codex_alloc), 0.0, "codex は観測の区間の外を推定しない");
+        let codex_observed: f64 = codex_alloc.pieces.iter().map(|p| p.observed).sum::<f64>()
+            + codex_alloc.outside.iter().map(|o| o.percent).sum::<f64>();
+        assert!((codex_observed - 116.0).abs() < 1e-9);
+        assert!(codex_only(&rows, "L", SEVEN_DAY));
+        assert!(
+            !codex_only(&rows, "L", FIVE_HOUR),
+            "観測の無い枠は codex と言わない"
+        );
+        // 同じ観測を claude（mod）の寄せ方で読むと A と B が 1 つに束なり、延べは 76% しか残らない
+        let as_mod: Vec<LimitObservation> = rows
+            .iter()
+            .map(|o| LimitObservation {
+                source: "mod".into(),
+                ..o.clone()
+            })
+            .collect();
+        let (m, _) = windows_for(&as_mod, "L", SEVEN_DAY, LEN7);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].latest_percent(), 76.0);
     }
 
     #[test]

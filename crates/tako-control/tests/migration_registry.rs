@@ -367,6 +367,12 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             "crates/tako-control/src/usage/index.rs",
             &["CompactedState", "CompactedMonth"],
         ),
+        (
+            // #2204: codex の rollout の読みの状態（`cursor.jsonl` の行の `codex`。claude の行には無い =
+            // serde の default で旧い行がそのまま読める）
+            "crates/tako-core/src/usage/codex.rs",
+            &["CodexCursor", "CodexUsage"],
+        ),
     ];
     let mut out = BTreeMap::new();
     for (file, names) in TARGETS {
