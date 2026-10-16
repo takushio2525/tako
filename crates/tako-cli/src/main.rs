@@ -6729,12 +6729,17 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
             Some("config_dir") => " = 資格情報を読めず設定 dir で束ねた",
             _ => "",
         };
+        // 内訳があるときの会話数は内訳の行に出す（ここの会話は mod の報告で対応づけた数で、意味が違う）
+        let sessions = if l["usage"].is_object() {
+            String::new()
+        } else {
+            format!("・会話 {} 本", l["sessions"].as_u64().unwrap_or(0))
+        };
         out.push_str(&format!(
-            "  ログイン {}（鍵 {}{from}）  観測 {} 点・会話 {} 本\n",
+            "  ログイン {}（鍵 {}{from}）  観測 {} 点{sessions}\n",
             l["label"].as_str().unwrap_or("-"),
             l["login"].as_str().unwrap_or("-"),
             l["observations"].as_u64().unwrap_or(0),
-            l["sessions"].as_u64().unwrap_or(0),
         ));
         for w in l["windows"].as_array().cloned().unwrap_or_default() {
             let kind = match w["kind"].as_str() {
@@ -6779,12 +6784,16 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
             out.push_str("    この期間の使用量は無い\n");
         }
     }
-    out.push_str(&format!(
-        "  記録 {} 点（{} 〜 {}）\n",
-        p["observations"].as_u64().unwrap_or(0),
-        stamp_ms(&p["first_observed_at"]),
-        stamp_ms(&p["last_observed_at"]),
-    ));
+    let observations = p["observations"].as_u64().unwrap_or(0);
+    if observations > 0 {
+        out.push_str(&format!(
+            "  記録 {observations} 点（{} 〜 {}）\n",
+            stamp_ms(&p["first_observed_at"]),
+            stamp_ms(&p["last_observed_at"]),
+        ));
+    } else if let Some(hint) = p["hint"].as_str() {
+        out.push_str(&format!("  {hint}\n"));
+    }
     if let Some(n) = p["unreadable_lines"].as_u64() {
         out.push_str(&format!(
             "  読めない行 {n} 行を飛ばした（書きかけ・壊れた行）\n"
@@ -15783,6 +15792,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("      tako #2201  API 換算 $12.35"), "{text}");
+        assert!(
+            text.contains("  ログイン A（鍵 0123456789ab）  観測 3 点\n"),
+            "内訳があるときは mod の会話数を出さない: {text}"
+        );
         assert!(
             text.contains("      ほか 3 件（--limit で増やせる）\n"),
             "{text}"

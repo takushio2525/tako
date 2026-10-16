@@ -765,7 +765,7 @@ fn index_tick_for_gui() {
                 tick.logged_catch_up = true;
                 // 件数・バイト数・所要だけ（cwd・label・Issue・トークンの内訳を出さない = §6）
                 crate::diag::persist_log(&format!(
-                    "usage: 使用量の索引が追いついた（transcript {} 本・読んだ {} 本 {:.1} MB・応答 {} 件・所要 {:.1} 秒・{} 回に分けた）",
+                    "usage: 使用量の索引が追いついた（transcript {} 本・読んだ延べ {} 本 {:.1} MB・応答 {} 件・所要 {:.1} 秒・{} 回に分けた）",
                     out.files,
                     tick.catch_up.read_files,
                     tick.catch_up.bytes_read as f64 / (1024.0 * 1024.0),

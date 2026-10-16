@@ -656,7 +656,8 @@ impl Indexer {
                 .collect()
         };
         let mut pending = Pending::default();
-        let mut last_pressure = Instant::now() - PRESSURE_EVERY;
+        // メモリ圧を最後に見た時刻（まだ見ていない = None。最初のファイルの前に 1 回見る）
+        let mut last_pressure: Option<Instant> = None;
         let mut touched_months: BTreeSet<String> = BTreeSet::new();
         let mut index = 0usize;
         while index < work.len() {
@@ -667,8 +668,9 @@ impl Indexer {
                     break;
                 }
             }
-            if opts.stop_on_pressure && last_pressure.elapsed() >= PRESSURE_EVERY {
-                last_pressure = Instant::now();
+            if opts.stop_on_pressure && last_pressure.is_none_or(|t| t.elapsed() >= PRESSURE_EVERY)
+            {
+                last_pressure = Some(Instant::now());
                 if memory_pressure_high() {
                     outcome.stopped = Some("memory_pressure");
                     break;
