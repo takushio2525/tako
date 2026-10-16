@@ -20,30 +20,6 @@
 
 ---
 
-## 2026-10-16（#1733: 実行ボタン横のドロップダウンで実行環境・引数・環境変数等を見て変える = Code Runner S5）
-- `RunResolve` の答えを background で取って描くだけ・書き込みは `RunnerDefaults`・出典タグで file ↔ project・候補は 5 件で畳む。`preview_run_selected` 廃止・カタログ増 0 B。PR #2141
-- A/B `TAKO_1733_LEGACY=1`（旧は一覧が `python3 a.py` で Run は .venv）・番犬 `issue1733_run_menu_watchdog`・`scripts/test-run-dropdown-1733.sh`
-
-## 2026-10-16（#1735: 実行環境の表に Node（nvm / fnm・`.nvmrc` の前方一致・`node_modules/.bin` を PATH の先頭）と Rust（rust-toolchain）の行）
-- Rust は一覧に出し、明示に選んだときだけ `RUSTUP_TOOLCHAIN`（自動では rustup にファイルを読ませる）。Tier P は並列にしない。PR #2139
-- 実測 `scripts/test-runner-runtime-1735.sh` 35 PASS（Rust 自動 = `<unset>` / 明示 = 届く・旧は node が候補に出ない）・カタログ増 0 B
-
-## 2026-10-16（#1955: Finder の「このアプリケーションで開く」を動的 UTI の形式へ広げない）
-- 7 案を本物の Launch Services で実測し、候補に出る形はどれも他に宣言するアプリが無い Mac で既定を動かす（後始末後は全拡張子の既定が一致）。`tako_open_file` を Windows degraded（エクスプローラー未登録 = #2134）と申告・設計書 §6.3・FR-3.22。PR #2142
-
-## 2026-10-16（#1981: local-rules の常時部が取り分を超えたら `tako migrate` に区切りを上げる案を出し、明示の `tako migrate run` でだけ動かす）
-- 自動の発火点（setup・起動時）は動かさない・本文はバイト一致・`.pre-v2.bak`。本番の写しで 474 B 超過 → 5,031 B（当てるかはユーザー判断 = tako todo）。PR #2143
-- 実経路 `scripts/test-local-rules-marker-move-1981.sh` 29 PASS（旧 16 FAIL）・番犬 `issue1981_marker_move_watchdog`・カタログ +89 B
-
-## 2026-10-16（#2047: CI 待ちの上限を 4800 秒へ伸ばし、上限に達したら最後に 2 回まで見て緑 / 赤を確定する）
-- `TAKO_WAIT_PR_CHECKS_TIMEOUT` で変更可。モック 197 PASS（修正前に当てると Test 33〜35 の 34 件が落ちる）・A/B `TAKO_2047_LEGACY=1`。PR #2145
-
-## 2026-10-16（#2015: ファイルツリーで表に無い拡張子なしの dotfile（`.npmrc` 等）を設定アイコンに = 常に偽だった判定を直した）
-- `.env.local` は従来どおり拡張子で引く（`.env` との食い違いは #2152）。PR #2149
-
-## 2026-10-16（#2014: プレビューの変更履歴を開く切替の git（rev-parse / log --follow）を background の `OffloadJob::PreviewChangelog` へ・上限 30 秒）
-- 実経路 `scripts/test-changelog-offload-2014.sh` 19 PASS（最中の list は修正後 0.03 秒 / 修正前 8 秒で打ち切り）・A/B `TAKO_2014_LEGACY=1`・カタログ増 0 B。PR #2148。diff の展開は #2150
-
 ## 2026-10-16（#1952: `.ino` の基板とポートをドロップダウン・`tako run-config --board/--port`・MCP で選ぶ = `board attach` が sketch.yaml へ書く・コア無しは案内だけ）
 - 実経路 `scripts/test-run-board-1952.sh` 28 PASS（3 経路とも arduino-cli の直書きとバイト一致・`core install` 0 回）・カタログ +282 B。PR #2144
 
@@ -83,3 +59,24 @@
 
 ## 2026-10-16（#2048: 隔離 GUI では言語サーバを自動で起こさず・取らない = `TAKO_LSP_AUTOSTART=1` / `TAKO_LSP_AUTO_FETCH=1` で従来どおり）
 - 呼び手 22 本へ env・A/B `TAKO_2048_LEGACY=1`・`scripts/test-lsp-isolated-2048.sh` 26 PASS。既存の `test-lsp-1678.sh` ③ の失敗は #2174。PR #2173
+
+## 2026-10-16（#2174: test-lsp-1678.sh の ③ で servers の `cached`（呼んだ順の印）の値だけを比べず、キーと型・他の全フィールドは比べる）
+- 修正前 32 PASS 1 FAIL → 修正後 33 PASS・id / installed の取り違えの注入は ③ で落ちる。PR #2176
+
+## 2026-10-16（#1858: recover --apply がバックアップ後のタブを合流・復元時に器の無い master / worker のペインだけを刈り込む）
+- 判断の正本 `tako_control::layout_reconcile`・A/B `TAKO_1858_LEGACY=1`・実経路 `scripts/test-recover-merge-prune-1858.sh`。PR #2178
+
+## 2026-10-16（#2042: 番犬 issue1984 の 15 節 = UI スレッドの入口から呼び出しを辿り、別名の関数で包んだ子プロセスの口も名指し）
+- 共有部品 `tests/common/call_graph.rs`・製品コード不変・誤検知 0・注入 (G1)〜(G5)。見つかった返答配送の master 起動は #2182。PR #2179
+
+## 2026-10-16（#2035: rust-analyzer へ `cargo.targetDir = true` を既定で渡し、利用者の cargo build が target のロック待ちにならない）
+- 上書きは `tako lsp options` / MCP `tako_lsp_server` action=options・実測 `scripts/test-lsp-target-dir-2035.sh` 22 PASS・A/B `TAKO_2035_LEGACY=1`・カタログ +241 B。PR #2177
+
+## 2026-10-16（#2180: bin_resolve の「戻らないログインシェル」テストの間欠 = 真因は macOS の新しい実行ファイルの初回 exec の検査（約 0.3 秒・システム全体で直列））
+- pid の確認を締め切りの判定から分け、偽の実行ファイルを空打ち・注入 `TAKO_2180_INJECT_SHELL_DELAY_MS`・修正後 25/25 緑。同型の結合テストは #2185。PR #2183
+
+## 2026-10-16（#2036: `tako panel --help` の `--view` の説明を `PanelViewWire::summary` から生成し、md の候補を 7 値へ揃えて番犬 `issue2036_panel_view_docs_watchdog` で縛る）
+- FR 番号の重複は前方一致による誤検出だった・カタログ増 0 B。PR #2184
+
+## 2026-10-16（#2043: 番犬の固定バイト幅の切り出し 12 か所を `tests/common/byte_window.rs` へ寄せ、`issue2043_byte_window_watchdog` で直書きを縛る）
+- 修正前 panic / 修正後 緑の A/B 3 本・製品ファイルの `#[cfg(test)]` に残る同型は #1790 へ。PR #2186
