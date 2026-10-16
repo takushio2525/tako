@@ -79,7 +79,7 @@ fn fn_body(code: &str, name: &str) -> Option<(usize, usize, usize)> {
 }
 
 /// `needle` の後ろの最初の `{` から対応する `}` までの塊（無ければ空）
-fn block_after<'a>(code: &'a str, at: usize) -> &'a str {
+fn block_after(code: &str, at: usize) -> &str {
     code[at..]
         .find('{')
         .map(|i| at + i)
