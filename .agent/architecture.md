@@ -1473,6 +1473,16 @@ lid-guard.json が使う）:
   `diff_file_commit` は `tako git show --file`（既に background のジョブ）だけが使う。番犬は
   `issue1984_ui_thread_offload_watchdog.rs` の 14 節（注入 12 通り）、A/B は `TAKO_2150_LEGACY=1`（UI スレッドで
   上限なし）、実経路は `scripts/test-changelog-expand-2150.sh`（PATH の先頭の偽の git）と visual-test `changelog-expand`
+- **包んだ口の見逃しを塞ぐ**（#2042）: 1〜14 節は UI スレッドの関数の窓の中の**直書き**だけを見ていたので、
+  口を別名の関数で包むと見逃した（#2017 の `orchestrator self`）。番犬の 15 節は UI スレッドの入口
+  （`UI_PATHS` の関数 + `prepare_offload` / `finish_offload`。同期の腕 `dispatch_stale_binary_status` は
+  除く）から呼び出しを辿り（`tests/common/call_graph.rs`。tako-control と tako-core の `src` 全部 =
+  約 300 ファイル・8,000 関数）、届いた関数の本体に子プロセスの口があれば、入口で次の段を呼んだ行を
+  file:line で名指す。集約点の `dispatch` / `dispatch_inner` は辿らない（要求ごとに UI か background かが
+  分かれる）。製品コードは変えていない（印を付けて回る方式は、包む関数すべてに印が要り付け忘れが穴になる）。
+  **既知の残り**: 返答の配送（#2086 の ③ = `land_offload`）で起票 master が居ないとき
+  `launch_master_for_response` → `master_launch::plan` が CLI の所在確認（ログインシェルの `command -v`。上限つき）と
+  `resolve_tako_binary` を UI スレッドで待つ（番犬の `GRAPH_KNOWN`。直すのは別 Issue）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

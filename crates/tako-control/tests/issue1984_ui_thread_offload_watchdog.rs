@@ -73,16 +73,30 @@
 //!     同じ準備・着地を通り、上限なしは A/B のゲートの腕だけ。tako-app の host（`changelog_diff_target` /
 //!     `set_changelog_diff`）とクリック（`toggle_changelog_diff`）は git を起こさず、クリックは
 //!     `dispatch_off_ui` を通る
+//! 15. #2042: 1〜14 は窓の中の**直書き**しか見ないので、口を別名の関数で包むと見逃す（#2017 の
+//!     `orchestrator self` は `resolve_session_id_for_pane_via_host` 越しに `claude agents --json` を
+//!     UI スレッドで走らせていたが、緑のままだった）。ここは UI スレッドの入口（[`UI_PATHS`] の関数 +
+//!     `prepare_offload` / `finish_offload`）から**呼び出しを辿って**届く関数を集め（`common/call_graph.rs`）、
+//!     その本体に子プロセスの口（[`RAW`] + [`GRAPH_LEAVES`]）があれば、入口の中で次の段を呼んだ行を
+//!     file:line で名指しする。辿らないもの（先取りの外側の腕・A/B の旧経路の腕・別スレッド・
+//!     集約点の `dispatch`・既知の残り [`GRAPH_KNOWN`]）は理由つきで宣言する
 //!
 //! # 見逃す側へ倒れないための作り
 //!
 //! 窓が採れていることを [`走査が空振りしていない`] で固定し、[`逆戻りを名指しできる`] で
-//! **修正前を再現した注入**が file:line で名指しされることを確かめる。
+//! **修正前を再現した注入**が file:line で名指しされることを確かめる。15 節は
+//! [`呼び出しグラフが空振りしていない`]（実コードで各解決の形と辿らない領域が効いている）・
+//! [`呼び出しグラフの読み方`]（合成した小さなクレートで 1 形ずつ）・[`包んだ口を名指しできる`]
+//! （包んだ口の注入を 1〜14 は見逃し、15 節が名指しする = 同じテストの中の A/B）で固定する。
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[path = "common/production_range.rs"]
 mod production_range;
+
+#[path = "common/call_graph.rs"]
+mod call_graph;
 
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const MAIN: &str = "crates/tako-app/src/main.rs";
@@ -323,6 +337,11 @@ fn code_lines_with(window: &[String], needle: &str) -> Vec<usize> {
 
 /// 1. UI スレッドの経路が子プロセスの口を直に呼ばない
 fn scan_ui_paths(dispatch: &str) -> Vec<Offender> {
+    scan_ui_paths_with(dispatch, RAW)
+}
+
+/// [`scan_ui_paths`] の口の一覧を渡す版（#2042: #2017 より前の一覧で見逃したことを再現する）
+fn scan_ui_paths_with(dispatch: &str, raw: &[(&str, &str)]) -> Vec<Offender> {
     let mut out = Vec::new();
     for head in UI_PATHS {
         let Some((at, window)) = fn_window(dispatch, head) else {
@@ -333,7 +352,7 @@ fn scan_ui_paths(dispatch: &str) -> Vec<Offender> {
             });
             continue;
         };
-        for (needle, why) in RAW {
+        for (needle, why) in raw {
             for i in code_lines_with(&window, needle) {
                 out.push(Offender {
                     file: DISPATCH,
@@ -2364,6 +2383,280 @@ fn scan_preview_changelog_diff(dispatch: &str, main: &str, render: &str) -> Vec<
     out
 }
 
+// ---------------------------------------------------------------------------
+// 15. #2042: 包んだ口を見逃さない（UI スレッドの入口から呼び出しを辿る）
+// ---------------------------------------------------------------------------
+
+/// 呼び出しグラフを組む範囲（dispatch が呼ぶ製品コードの全部）
+const GRAPH_ROOTS: &[&str] = &["crates/tako-control/src", "crates/tako-core/src"];
+
+/// グラフの入口に足す UI スレッドの関数（[`UI_PATHS`] の外。右は UI スレッドで走る理由）
+const GRAPH_EXTRA_ENTRIES: &[(&str, &str)] = &[
+    (
+        "prepare_offload",
+        "要求を background のジョブにするかの判断そのもの（受け口と `dispatch_off_ui` が UI スレッドで呼ぶ）",
+    ),
+    (
+        "finish_offload",
+        "background の答えの着地（`land_offload` の続き = UI スレッド。先取りの続きの腕もここ）",
+    ),
+];
+
+/// [`UI_PATHS`] のうちグラフの入口にしない関数（製品の既定では UI スレッドで走らない同期の腕。右は理由）
+const GRAPH_SYNC_ARMS: &[(&str, &str)] = &[(
+    "dispatch_stale_binary_status",
+    "`prepare_offload` が `OffloadJob::StaleStatus` で background へ出す。UI スレッドで走るのは \
+     `collect_stale_status_ctx`（入口に挙げてある）だけで、同期の腕はテスト・直呼び・A/B \
+     （`TAKO_1989_LEGACY=1`）用",
+)];
+
+/// 辿らない集約点（右は理由）
+const GRAPH_STOPS: &[(&str, &str)] = &[
+    (
+        "dispatch",
+        "要求ごとに UI スレッドか background かが分かれる。`prepare_offload` が background へ出す要求の \
+         同期の腕まで UI スレッドの経路と読まないため、UI スレッドで走る経路は入口として挙げる",
+    ),
+    ("dispatch_inner", "`dispatch` の本体（同上）"),
+];
+
+/// 既知の残り: 本物の UI スレッドの子プロセス待ちだが #2042 では直さない辺（`(呼び手, 行き先, 理由)`）。
+/// 直したら外すこと（辺が消えると [`既知の残りがまだ残っている`] が落ちる）
+const GRAPH_KNOWN: &[(&str, &str, &str)] = &[(
+    "launch_master_for_response",
+    "plan",
+    "返答の配送（#2086 の ③ 運ぶ = `land_offload` の UI スレッド）で起票 master が居ないとき、\
+     `master_launch::plan` が CLI の所在確認（`agent_cli::preflight` = ログインシェルの `command -v`。上限つき）と \
+     tako の実行ファイルの解決（`resolve_tako_binary`）を UI スレッドで待つ。#2042 の番犬が見つけた（直すのは別 Issue）",
+)];
+
+/// 到達した関数で探す葉（[`RAW`] に足す、子プロセスの口の素の形。右は名指しの理由）
+const GRAPH_LEAVES: &[(&str, &str)] = &[
+    (
+        "process::Command",
+        "子プロセスを起こす（`std::process::Command` を直に書いた形）",
+    ),
+    (".spawn()", "子プロセスを起こす"),
+    ("wait_with_output(", "子プロセスを待つ"),
+    (
+        "output_with_timeout(",
+        "子プロセスを上限つきで待つ（`probe::output_with_timeout` / `command_output_with_timeout`）",
+    ),
+    (
+        "find_with_timeout(",
+        "ログインシェルの `command -v` を上限つきで待つ",
+    ),
+];
+
+/// 葉の一覧（`raw` = 直書きの口の一覧 + [`GRAPH_LEAVES`]）
+fn graph_leaves<'a>(raw: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    raw.iter().chain(GRAPH_LEAVES).copied().collect()
+}
+
+/// グラフの入口の関数名（[`UI_PATHS`] の関数から同期の腕を除き、[`GRAPH_EXTRA_ENTRIES`] を足す）
+fn graph_entry_names() -> Vec<&'static str> {
+    let mut names: Vec<&str> = UI_PATHS
+        .iter()
+        .filter_map(|head| {
+            // 窓の頭（`fn 名前(` / `pub fn 名前(`）の最後の語が関数名。match の腕の頭は関数ではない
+            let mut words = head.split_whitespace().rev();
+            let name = words.next()?.strip_suffix('(')?;
+            (words.next() == Some("fn")).then_some(name)
+        })
+        .filter(|name| !GRAPH_SYNC_ARMS.iter().any(|(arm, _)| arm == name))
+        .collect();
+    names.extend(GRAPH_EXTRA_ENTRIES.iter().map(|(name, _)| *name));
+    names
+}
+
+/// [`GRAPH_ROOTS`] の `.rs` を全部（テスト領域を潰した本文と、その眺め）。読むのは 1 回だけ
+fn graph_sources() -> &'static [(String, call_graph::Source)] {
+    static CACHE: OnceLock<Vec<(String, call_graph::Source)>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let entries =
+                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?} が読める: {e}"));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = workspace_root();
+        let mut paths = Vec::new();
+        for dir in GRAPH_ROOTS {
+            walk(&root.join(dir), &mut paths);
+        }
+        paths.sort();
+        paths
+            .iter()
+            .map(|path| {
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("ワークスペースの中")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = read(&root, &rel);
+                let source = call_graph::Source::new(&rel, &text);
+                (text, source)
+            })
+            .collect()
+    })
+}
+
+/// `overrides`（`(相対パス, テスト領域を潰した本文)` = 注入）で差し替えたグラフ
+fn graph_with(overrides: &[(&str, &str)]) -> call_graph::Graph {
+    let sources = graph_sources()
+        .iter()
+        .map(
+            |(text, source)| match overrides.iter().find(|(rel, _)| *rel == source.rel) {
+                Some((rel, injected)) if injected != text => call_graph::Source::new(rel, injected),
+                _ => source.clone(),
+            },
+        )
+        .collect();
+    call_graph::Graph::build(sources)
+}
+
+/// dispatch.rs の関数 `name`（ちょうど 1 つでなければ理由）
+fn one_fn(graph: &call_graph::Graph, name: &str) -> Result<usize, String> {
+    match graph.find(DISPATCH, name).as_slice() {
+        [f] => Ok(*f),
+        [] => Err(format!(
+            "`fn {name}` が見つからない（走査が空振り。改名したなら番犬も追うこと）"
+        )),
+        many => Err(format!(
+            "`fn {name}` が {} 個ある（入口が 1 つに決まらない）",
+            many.len()
+        )),
+    }
+}
+
+/// 既知の残りの辺（`(呼び手, 行き先)`。辺が見つからないものは入れない）
+fn graph_known_edges(graph: &call_graph::Graph) -> Vec<(usize, usize)> {
+    GRAPH_KNOWN
+        .iter()
+        .filter_map(|(caller, callee, _)| {
+            let from = one_fn(graph, caller).ok()?;
+            let to = graph
+                .callees(from)
+                .into_iter()
+                .find(|&g| graph.fns[g].name == *callee)?;
+            Some((from, to))
+        })
+        .collect()
+}
+
+/// 15. UI スレッドの入口から呼び出しを辿って届く関数が子プロセスの口を呼ばない（#2042）。
+///
+/// 名指しの行は「入口の本体で次の段を呼んだ行」（入口そのものに口があればその行）。
+/// 口を包んだ関数を UI スレッドの経路に足した人が、まさに書き足した行になる
+fn scan_call_graph(
+    graph: &call_graph::Graph,
+    leaves: &[(&str, &str)],
+    known: &[(usize, usize)],
+) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let mut entries = Vec::new();
+    for name in graph_entry_names() {
+        match one_fn(graph, name) {
+            Ok(f) => entries.push(f),
+            Err(why) => out.push(Offender {
+                file: DISPATCH,
+                line: 0,
+                why,
+            }),
+        }
+    }
+    let mut stops = Vec::new();
+    for (name, _) in GRAPH_STOPS {
+        match one_fn(graph, name) {
+            Ok(f) => stops.push(f),
+            Err(why) => out.push(Offender {
+                file: DISPATCH,
+                line: 0,
+                why: format!("集約点: {why}"),
+            }),
+        }
+    }
+    let reach = graph.reach(&entries, &|from, to| {
+        stops.contains(&to) || known.contains(&(from, to))
+    });
+    // 名指しの行ごとに 1 件へまとめる（包んだ口 1 つの先に口のある関数がいくつあっても 1 件）。
+    // 値は口のある関数ごとの（道筋の段数, 関数, 届いた口の一覧）
+    type Leaf = (usize, usize, Vec<String>);
+    let mut by_site: std::collections::BTreeMap<usize, Vec<Leaf>> =
+        std::collections::BTreeMap::new();
+    let mut reached: Vec<usize> = reach.keys().copied().collect();
+    reached.sort();
+    for f in reached {
+        let leaf_rel = &graph.sources[graph.fns[f].file].rel;
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for (needle, why) in leaves {
+            for line in graph.hits(f, needle) {
+                found.push((
+                    line,
+                    format!(
+                        "`{}` の {leaf_rel}:{line} `{needle}`（{why}）",
+                        graph.fns[f].name
+                    ),
+                ));
+            }
+        }
+        found.sort();
+        let Some(&(first_line, _)) = found.first() else {
+            continue;
+        };
+        let path = graph.path_to(&reach, f);
+        let line = path.get(1).and_then(|(_, at)| *at).unwrap_or(first_line);
+        by_site.entry(line).or_default().push((
+            path.len(),
+            f,
+            found.into_iter().map(|(_, what)| what).collect(),
+        ));
+    }
+    for (line, mut leaves_at) in by_site {
+        // 道筋の短い順（包んだ口に近い関数の口から先に見せる）
+        leaves_at.sort();
+        let path = graph.path_to(&reach, leaves_at[0].1);
+        let what: Vec<String> = leaves_at.into_iter().flat_map(|(_, _, w)| w).collect();
+        let route: String = path
+            .windows(2)
+            .map(|w| {
+                let caller_rel = &graph.sources[graph.fns[w[0].0].file].rel;
+                format!(
+                    " → `{}`（{caller_rel}:{} で呼ぶ）",
+                    graph.fns[w[1].0].name,
+                    w[1].1.unwrap_or(0)
+                )
+            })
+            .collect();
+        // 口の一覧は先頭の数件だけ（残りは件数。全部は同じ道筋を辿れば見える）
+        const SHOWN: usize = 4;
+        let rest = what.len().saturating_sub(SHOWN);
+        let mut shown = what.into_iter().take(SHOWN).collect::<Vec<_>>().join(" / ");
+        if rest > 0 {
+            shown.push_str(&format!(" ほか {rest} 件"));
+        }
+        out.push(Offender {
+            file: DISPATCH,
+            line,
+            why: format!(
+                "UI スレッドの入口 `{}`{route} と辿った先が子プロセスを待つ: {shown}。\
+                 口を別名の関数で包んでも UI スレッドで待つことは変わらない（#1984 / #2042）。\
+                 先取り（`probe_needs` + 読む側の関数の `Probed::Outside` の腕）か background のジョブ \
+                 （`prepare_offload`）へ出すこと。製品の既定で通らない A/B の腕なら `if …legacy() {{` の形で書く",
+                graph.fns[path[0].0].name,
+            ),
+        });
+    }
+    out
+}
+
+#[derive(Clone)]
 struct Sources {
     dispatch: String,
     main: String,
@@ -2394,7 +2687,28 @@ impl Sources {
         }
     }
 
+    /// 1〜15 の全部
     fn offenders(&self) -> Vec<Offender> {
+        let mut v = self.window_offenders();
+        let graph = self.graph();
+        let known = graph_known_edges(&graph);
+        v.extend(scan_call_graph(&graph, &graph_leaves(RAW), &known));
+        v
+    }
+
+    /// 15 節のグラフ（このファイル群の本文で差し替えたもの = 注入が効く）
+    fn graph(&self) -> call_graph::Graph {
+        graph_with(&[
+            (DISPATCH, &self.dispatch),
+            (SLEEP_GUARD, &self.sleep_guard),
+            (AGENT_CLI, &self.agent_cli),
+            (TMUX_BACKEND, &self.tmux_backend),
+            (MCP_REQUEST, &self.mcp_request),
+        ])
+    }
+
+    /// 1〜14（窓の中の直書きを見る節。#2042 の A/B で「見逃す側」）
+    fn window_offenders(&self) -> Vec<Offender> {
         let mut v = scan_ui_paths(&self.dispatch);
         v.extend(scan_readers(&self.dispatch));
         v.extend(scan_prepare(&self.dispatch));
@@ -3752,5 +4066,680 @@ fn 逆戻りを名指しできる() {
         scan_sleep_guard(&g),
         SLEEP_GUARD,
         "check_qos",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15 節（#2042）の検出力
+// ---------------------------------------------------------------------------
+
+/// 関数 `head` の窓の中で `needle` を含むコードの行（1 始まり。ちょうど 1 行であること）
+fn line_in(text: &str, head: &str, needle: &str) -> usize {
+    let (at, window) = fn_window(text, head).unwrap_or_else(|| panic!("`{head}` の窓"));
+    let lines = code_lines_with(&window, needle);
+    assert_eq!(
+        lines.len(),
+        1,
+        "`{head}` の中で `{needle}` を含む行がちょうど 1 つ: {lines:?}"
+    );
+    at + lines[0]
+}
+
+/// `caller` が生きた範囲で呼ぶ関数に、`callee_rel` の `callee` が居るか
+fn calls_into(graph: &call_graph::Graph, caller: usize, callee_rel: &str, callee: &str) -> bool {
+    graph
+        .callees(caller)
+        .into_iter()
+        .any(|g| graph.fns[g].name == callee && graph.sources[graph.fns[g].file].rel == callee_rel)
+}
+
+/// 実コードで、各解決の形と辿らない領域が効いている（グラフが空振りしていない）
+#[test]
+fn 呼び出しグラフが空振りしていない() {
+    let graph = graph_with(&[]);
+    // 実測（2026-10-16）: 309 ファイル・7,959 関数。下限は桁で置く（増えて落ちることはない）
+    assert!(
+        graph.sources.len() >= 150 && graph.fns.len() >= 4000,
+        "走査範囲が小さすぎる（{} ファイル・{} 関数）。GRAPH_ROOTS の読み先を確かめること",
+        graph.sources.len(),
+        graph.fns.len()
+    );
+    // 入口は UI_PATHS の関数の頭（`(` で終わる綴り）を 1 つも落としていない
+    assert_eq!(
+        graph_entry_names().len(),
+        UI_PATHS.iter().filter(|h| h.ends_with('(')).count() - GRAPH_SYNC_ARMS.len()
+            + GRAPH_EXTRA_ENTRIES.len(),
+        "UI_PATHS の頭から関数名を取り落としている: {:?}",
+        graph_entry_names()
+    );
+    // 入口・集約点・同期の腕はどれも dispatch.rs にちょうど 1 つ
+    let names = graph_entry_names()
+        .into_iter()
+        .chain(GRAPH_STOPS.iter().map(|(n, _)| *n))
+        .chain(GRAPH_SYNC_ARMS.iter().map(|(n, _)| *n));
+    for name in names {
+        if let Err(why) = one_fn(&graph, name) {
+            panic!("{why}");
+        }
+    }
+    let f = |name: &str| one_fn(&graph, name).expect("dispatch.rs の関数");
+
+    // 届く範囲が入口だけで閉じていない（実測 793 関数）
+    let entries: Vec<usize> = graph_entry_names().into_iter().map(f).collect();
+    let stops: Vec<usize> = GRAPH_STOPS.iter().map(|(n, _)| f(n)).collect();
+    let reach = graph.reach(&entries, &|_, to| stops.contains(&to));
+    assert!(reach.len() >= 300, "届いた関数が {} しかない", reach.len());
+
+    // 各解決の形（実コードの 1 例ずつ）
+    let me = f("dispatch_orchestrator_self");
+    for (caller, rel, callee, form) in [
+        (
+            me,
+            DISPATCH,
+            "resolve_caller_pane",
+            "同じファイルの素の関数",
+        ),
+        (
+            me,
+            "crates/tako-control/src/claude_mod.rs",
+            "lookup_pane",
+            "`crate::` のパス",
+        ),
+        (
+            me,
+            "crates/tako-core/src/claude_mod.rs",
+            "monitor_plan",
+            "`tako_core::` のパス（別クレート）",
+        ),
+        (
+            me,
+            "crates/tako-control/src/orchestrator/handoff_store.rs",
+            "ensure_migrated",
+            "`use crate::orchestrator;` で取り込んだモジュール名のパス",
+        ),
+        (
+            f("launch_master_for_response"),
+            "crates/tako-control/src/user_tasks.rs",
+            "delivery_record",
+            "`use` で取り込んだ関数を素の名前で",
+        ),
+    ] {
+        assert!(
+            calls_into(&graph, caller, rel, callee),
+            "{form}の解決が効いていない: `{}` → {rel} の `{callee}`",
+            graph.fns[caller].name
+        );
+    }
+    // 同名の別モジュール（migrations.rs の `ensure_migrated`）へは繋がない
+    assert!(
+        !calls_into(
+            &graph,
+            me,
+            "crates/tako-control/src/migrations.rs",
+            "ensure_migrated"
+        ),
+        "モジュールのパスを末尾の名前だけで照合している（同名の別関数へ繋がる）"
+    );
+    // `Type::f(`（`orchestrator::Profile::load`）
+    assert!(
+        graph
+            .callees(me)
+            .into_iter()
+            .any(|g| graph.fns[g].name == "load"
+                && graph.fns[g].owner == call_graph::Owner::Type("Profile".into())),
+        "`Type::f(` の解決が効いていない（`Profile::load`）"
+    );
+
+    // 辿らない領域が実コードで効いている（本文には呼び出しがあるのに、辺は無い）
+    let body_has = |rel: &str, name: &str, needle: &str| {
+        let g = graph.find(rel, name)[0];
+        let def = &graph.fns[g];
+        graph.sources[def.file].code[def.body.0..=def.body.1].contains(needle)
+    };
+    let agents = "crates/tako-control/src/agents.rs";
+    for (rel, caller, callee, region) in [
+        (
+            DISPATCH,
+            "self_agent_scan",
+            "resolve_session_id_for_pane_via_host",
+            "先取りの外側の腕（`Probed::Outside`）",
+        ),
+        (
+            agents,
+            "capture_process_table_uncached",
+            "ps_table_unbounded_legacy",
+            "A/B の旧経路の腕（`if tako_core::probe::issue1979_legacy() {`）",
+        ),
+    ] {
+        assert!(
+            body_has(rel, caller, &format!("{callee}(")),
+            "前提: `{caller}` の本文に `{callee}(` がある（実コードが変わったなら例を選び直すこと）"
+        );
+        let g = graph.find(rel, caller)[0];
+        assert!(
+            !calls_into(&graph, g, rel, callee),
+            "{region}を辿っている: `{caller}` → `{callee}`"
+        );
+    }
+    // 集約点は実際に呼ばれている（止めないと全要求の同期の腕へ広がる）
+    assert!(
+        calls_into(&graph, f("finish_offload"), DISPATCH, "dispatch"),
+        "`finish_offload` が `dispatch` を呼んでいない（集約点の宣言が空振り）"
+    );
+
+    // 入口が消えた・2 つになったら黙って緑にならない（入口を辿らない = 空振り）
+    let s = Sources::load();
+    for (label, from, to, why) in [
+        (
+            "入口の改名",
+            "fn collect_stale_status_ctx(",
+            "fn collect_stale_status_ctx_renamed(",
+            "`fn collect_stale_status_ctx` が見つからない",
+        ),
+        (
+            "入口の重複",
+            "fn git_pane_cwd(",
+            "fn git_pane_cwd() {}\nfn git_pane_cwd(",
+            "`fn git_pane_cwd` が 2 個ある",
+        ),
+    ] {
+        let mut injected = s.clone();
+        injected.dispatch = s.dispatch.replacen(from, to, 1);
+        assert_ne!(injected.dispatch, s.dispatch, "{label} の置換元がある");
+        let graph = injected.graph();
+        let named = scan_call_graph(&graph, &graph_leaves(RAW), &graph_known_edges(&graph));
+        assert!(
+            named.iter().any(|o| o.line == 0 && o.why.contains(why)),
+            "{label}を名指さない: {:?}",
+            named.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// 合成した小さなクレートで、読み方を 1 形ずつ固定する
+#[test]
+fn 呼び出しグラフの読み方() {
+    let files = [
+        (
+            "crates/tako-control/src/dispatch.rs",
+            r#"
+use crate::agents::{list as agent_list, other};
+use crate::orchestrator;
+use tako_core::probe;
+
+pub fn ui(host: &dyn Host, req: Req) -> u32 {
+    same_file();
+    agent_list();
+    orchestrator::agent_cli::locate();
+    crate::agents::by_path();
+    agents::tail_match();
+    tako_core::probe::cross();
+    probe::via_use();
+    Snapshot::capture();
+    Wrapper::make();
+    parse::<u32>(1);
+    host.method_on_host();
+    host
+        .chained();
+    let closure = || 1;
+    closure();
+    let _ = Req::Make(1);
+    nested();
+    fn nested() {
+        nested_target();
+    }
+    fn unused_nested() {
+        std::process::Command::new("x");
+    }
+    // std::process::Command::new("in comment")
+    let s = "std::process::Command::new(";
+    let _ = match probed() {
+        Probed::Answer(x) => x,
+        Probed::Missing => 0,
+        Probed::Outside => outside_only(),
+    };
+    if tako_core::probe::issue1_legacy() {
+        legacy_only();
+    }
+    if !tako_core::probe::issue2_legacy() {
+        new_side();
+    } else {
+        legacy_else_only();
+    }
+    if tako_core::probe::issue3_legacy() && cond() {
+        compound_side();
+    }
+    std::thread::spawn(move || {
+        thread_only();
+    });
+    match req {
+        Req::A if crate::diag::issue4_legacy() => guard_legacy_only(),
+        Req::A => guard_new(),
+    }
+}
+
+pub struct Job;
+impl Job {
+    pub fn run_ui(&self) {
+        self.helper();
+        Self::assoc();
+    }
+    fn helper(&self) {}
+    fn assoc() {}
+}
+impl<T: Clone> Make for Wrapper<T> {
+    fn make() -> Self {
+        loop {}
+    }
+}
+trait Decl {
+    fn decl_only(&self);
+}
+
+fn same_file() {}
+fn closure() {}
+fn chained() {}
+fn method_on_host() {}
+fn nested_target() {}
+fn parse<T>(x: u32) -> T { todo!() }
+fn probed() -> Probed { todo!() }
+fn outside_only() {}
+fn legacy_only() {}
+fn new_side() {}
+fn legacy_else_only() {}
+fn cond() -> bool { true }
+fn compound_side() {}
+fn thread_only() {}
+fn guard_legacy_only() {}
+fn guard_new() {}
+
+pub fn ui2(cb: impl Fn(), x: tyname::Type) {
+    cb();
+    [1].iter().for_each(|step| step());
+    [1].iter().for_each(|a, last| last());
+    tyname();
+}
+fn cb() {}
+fn step() {}
+fn last() {}
+fn tyname() {}
+"#,
+        ),
+        (
+            "crates/tako-control/src/agents.rs",
+            "pub fn list() {}\npub fn other() {}\npub fn by_path() {\n    self::inner();\n}\nfn inner() {}\npub fn tail_match() {}\n",
+        ),
+        (
+            "crates/tako-control/src/orchestrator/mod.rs",
+            "pub fn parent_helper() {}\n",
+        ),
+        (
+            "crates/tako-control/src/orchestrator/agent_cli.rs",
+            "pub fn locate() {\n    super::parent_helper();\n}\n",
+        ),
+        (
+            "crates/tako-core/src/probe.rs",
+            "pub fn cross() {}\npub fn via_use() {}\npub struct Snapshot;\nimpl Snapshot {\n    pub fn capture() -> Self {\n        Snapshot\n    }\n}\n",
+        ),
+        // 同名の関数を別クレートに置く（パスの照合がクレートを見ていること）
+        ("crates/tako-core/src/agents.rs", "pub fn by_path() {}\n"),
+    ];
+    let graph = call_graph::Graph::build(
+        files
+            .iter()
+            .map(|(rel, text)| call_graph::Source::new(rel, text))
+            .collect(),
+    );
+    let reached_names = |rel: &str, entry: &str| -> Vec<(String, String)> {
+        let e = graph.find(rel, entry)[0];
+        let mut v: Vec<(String, String)> = graph
+            .reach(&[e], &|_, _| false)
+            .keys()
+            .map(|&g| {
+                (
+                    graph.sources[graph.fns[g].file].rel.clone(),
+                    graph.fns[g].name.clone(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let d = "crates/tako-control/src/dispatch.rs";
+    let got = reached_names(d, "ui");
+    let has = |rel: &str, name: &str| got.iter().any(|(r, n)| r == rel && n == name);
+    // 辿る形
+    for (rel, name, form) in [
+        (d, "same_file", "同じファイルの素の関数"),
+        (
+            "crates/tako-control/src/agents.rs",
+            "list",
+            "`use … as` の別名",
+        ),
+        (
+            "crates/tako-control/src/orchestrator/agent_cli.rs",
+            "locate",
+            "`use` したモジュール名のパス",
+        ),
+        (
+            "crates/tako-control/src/orchestrator/mod.rs",
+            "parent_helper",
+            "`super::`",
+        ),
+        ("crates/tako-control/src/agents.rs", "by_path", "`crate::`"),
+        ("crates/tako-control/src/agents.rs", "inner", "`self::`"),
+        (
+            "crates/tako-control/src/agents.rs",
+            "tail_match",
+            "起点の見えないパス（末尾の一致）",
+        ),
+        ("crates/tako-core/src/probe.rs", "cross", "`tako_core::`"),
+        (
+            "crates/tako-core/src/probe.rs",
+            "via_use",
+            "`use` した別クレートのモジュール名",
+        ),
+        ("crates/tako-core/src/probe.rs", "capture", "`Type::f(`"),
+        (d, "make", "`impl<T> Trait for Type<T>` の `Type::f(`"),
+        (d, "parse", "ターボフィッシュ"),
+        (d, "nested", "入れ子の関数"),
+        (d, "nested_target", "入れ子の関数の中の呼び出し"),
+        (d, "new_side", "`if !…legacy()` の then 側（新しい経路）"),
+        (d, "cond", "組み合わせた条件"),
+        (
+            d,
+            "compound_side",
+            "組み合わせた条件の腕（読まない = 辿る）",
+        ),
+        (d, "guard_new", "ガードの無い腕"),
+    ] {
+        assert!(
+            has(rel, name),
+            "{form}を辿っていない: {rel} `{name}`\n{got:?}"
+        );
+    }
+    // 辿らない形
+    for (rel, name, form) in [
+        (
+            "crates/tako-core/src/agents.rs",
+            "by_path",
+            "`crate::` を別クレートの同名関数へ",
+        ),
+        (
+            d,
+            "method_on_host",
+            "受け手の型が決まらないメソッド呼び出し",
+        ),
+        (d, "chained", "行をまたぐメソッドの鎖"),
+        (d, "closure", "`let` で束ねたクロージャ"),
+        (d, "unused_nested", "呼ばれない入れ子の関数"),
+        (d, "outside_only", "先取りの外側の腕"),
+        (d, "legacy_only", "`if …legacy() {` の then 側"),
+        (
+            d,
+            "legacy_else_only",
+            "`if !…legacy() {…} else {…}` の else 側",
+        ),
+        (d, "thread_only", "別スレッドへ渡すクロージャ"),
+        (d, "guard_legacy_only", "`… if …legacy() =>` の腕"),
+        (d, "other", "取り込んだが呼ばない関数"),
+    ] {
+        assert!(!has(rel, name), "{form}を辿っている: {rel} `{name}`");
+    }
+    // 引数・クロージャの引数で束ねた名前は同名の関数へ繋がない（型のパス `tyname::Type` は束ねではない）
+    let ui2 = reached_names(d, "ui2");
+    for name in ["cb", "step", "last"] {
+        assert!(
+            !ui2.iter().any(|(_, n)| n == name),
+            "束ねた `{name}` を同名の関数へ繋いでいる: {ui2:?}"
+        );
+    }
+    assert!(
+        ui2.iter().any(|(_, n)| n == "tyname"),
+        "型のパス `tyname::Type` を引数の束ねと読んでいる: {ui2:?}"
+    );
+    // 持ち主: `self.f(` / `Self::f(` は同じ型の関数へ。本体の無い宣言は関数ではない
+    let job = reached_names(d, "run_ui");
+    for name in ["helper", "assoc"] {
+        assert!(
+            job.iter().any(|(_, n)| n == name),
+            "`self.` / `Self::` の `{name}` を辿っていない: {job:?}"
+        );
+    }
+    assert!(
+        graph.find(d, "decl_only").is_empty(),
+        "本体の無い宣言を関数にしている"
+    );
+    // 葉はコメント・文字列・入れ子の関数の中では数えない
+    let ui = graph.find(d, "ui")[0];
+    assert!(
+        graph.hits(ui, "process::Command").is_empty(),
+        "コメント・文字列・入れ子の関数の中の口を数えている: {:?}",
+        graph.hits(ui, "process::Command")
+    );
+    let unused = graph.find(d, "unused_nested")[0];
+    assert_eq!(
+        graph.hits(unused, "process::Command").len(),
+        1,
+        "入れ子の関数の中の口は、その関数の口として数える"
+    );
+}
+
+/// 既知の残りは今も残っている（直ったら [`GRAPH_KNOWN`] から外す）。外したら名指しされる = 本物の違反
+#[test]
+fn 既知の残りがまだ残っている() {
+    let graph = graph_with(&[]);
+    let known = graph_known_edges(&graph);
+    assert_eq!(
+        known.len(),
+        GRAPH_KNOWN.len(),
+        "既知の残りの辺が見つからない（直ったなら GRAPH_KNOWN から外すこと）: {GRAPH_KNOWN:?}"
+    );
+    for (i, (caller, callee, _)) in GRAPH_KNOWN.iter().enumerate() {
+        let rest: Vec<(usize, usize)> = known
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, e)| *e)
+            .collect();
+        let named = scan_call_graph(&graph, &graph_leaves(RAW), &rest);
+        let hit = named.iter().find(|o| {
+            o.why.contains(&format!("`{caller}`")) && o.why.contains(&format!("`{callee}`"))
+        });
+        assert!(
+            hit.is_some(),
+            "既知の残り `{caller}` → `{callee}` を外しても名指しされない（もう違反ではない = 一覧から外すこと）: {:?}",
+            named.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+        eprintln!("既知の残り（外すと）→ {}", hit.unwrap().report());
+    }
+}
+
+/// 包んだ口を通して UI スレッドで子プロセスを待つ注入を、1〜14 は見逃し、15 が file:line で名指しする
+#[test]
+fn 包んだ口を名指しできる() {
+    let s = Sources::load();
+    assert!(s.offenders().is_empty(), "前提: 現行は緑");
+
+    let inject = |src: &str, from: &str, to: &str, label: &str| {
+        let injected = src.replacen(from, to, 1);
+        assert_ne!(injected, src, "注入「{label}」の置換元がある");
+        injected
+    };
+    // A/B: A = 1〜14（窓の中の直書き）は見逃す / B = 15（呼び出しグラフ）が注入した行を名指す
+    let a_b = |label: &str, d: &str, head: &str, line_text: &str, why: &str| {
+        let mut injected = s.clone();
+        injected.dispatch = d.to_string();
+        let old = injected.window_offenders();
+        assert!(
+            old.is_empty(),
+            "注入「{label}」を 1〜14 が名指した（包んだ口の注入になっていない）: {:?}",
+            old.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+        let graph = injected.graph();
+        let new = scan_call_graph(&graph, &graph_leaves(RAW), &graph_known_edges(&graph));
+        let line = line_in(d, head, line_text);
+        let hit = new
+            .iter()
+            .find(|o| o.file == DISPATCH && o.line == line && o.why.contains(why));
+        assert!(
+            hit.is_some(),
+            "注入「{label}」を 15 節が {DISPATCH}:{line} で名指せない: {:?}",
+            new.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            new.iter().filter(|o| o.line == line).count(),
+            1,
+            "注入「{label}」の名指しが 1 件にまとまっていない（先の口の数だけ並ぶ）"
+        );
+        eprintln!("注入「{label}」→ {}", hit.unwrap().report());
+    };
+
+    // (G1) 同じファイルの 2 段の包んだ口（名前はどれも RAW に無い）
+    let d = inject(
+        &s.dispatch,
+        "        _ => self_agent_scan(host, pane_id),",
+        "        _ => (pane_session_hint(host, pane_id), \"unknown\".to_string()),",
+        "(G1)",
+    ) + "\nfn pane_session_hint(host: &dyn ControlHost, pane_id: PaneId) -> Option<String> {\n    host.backend_session(pane_id).and_then(|b| backend_owner_pid(&b))\n}\n\nfn backend_owner_pid(backend: &str) -> Option<String> {\n    let out = std::process::Command::new(\"tmux\").arg(backend).output().ok()?;\n    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())\n}\n";
+    a_b(
+        "同じファイルの 2 段の包んだ口",
+        &d,
+        "fn dispatch_orchestrator_self(",
+        "_ => (pane_session_hint(host, pane_id)",
+        "`backend_owner_pid`",
+    );
+
+    // (G2) 別モジュールの既存の別名（`agents::list_agents` = `claude agents --json`。RAW は
+    // `list_agents_with_panes(` しか持たない）
+    let d = inject(
+        &s.dispatch,
+        "    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+        "    let _ = crate::agents::list_agents();\n    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+        "(G2)",
+    );
+    a_b(
+        "別モジュールの既存の別名",
+        &d,
+        "fn collect_stale_status_ctx(",
+        "let _ = crate::agents::list_agents();",
+        "`list_agents`",
+    );
+
+    // (G3) `use … as` の別名を素の名前で呼ぶ
+    let d = inject(
+        &s.dispatch,
+        "    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+        "    use crate::agents::list_agents as agents_now;\n    let _ = agents_now();\n    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+        "(G3)",
+    );
+    a_b(
+        "`use … as` の別名",
+        &d,
+        "fn collect_stale_status_ctx(",
+        "let _ = agents_now();",
+        "`list_agents`",
+    );
+
+    // (G4) #2017 の穴の再現: #2017 より前の口の一覧（包んだ口の 2 つを持たない）で、
+    // 修正前の `orchestrator self`（㉔ と同じ）を 1 節は見逃し、15 節は名指す
+    let raw_before_2017: Vec<(&str, &str)> = RAW
+        .iter()
+        .copied()
+        .filter(|(needle, _)| {
+            !matches!(
+                *needle,
+                "resolve_session_id_for_pane_via_host(" | "query_agent_status("
+            )
+        })
+        .collect();
+    assert_eq!(
+        raw_before_2017.len() + 2,
+        RAW.len(),
+        "#2017 の 2 つを外した"
+    );
+    let d = inject(
+        &s.dispatch,
+        "        _ => self_agent_scan(host, pane_id),",
+        "        _ => {\n            let sid = resolve_session_id_for_pane_via_host(host, pane_id);\n            let status = sid\n                .as_deref()\n                .map(|s| orchestrator::query_agent_status(s).status)\n                .unwrap_or_default();\n            (sid, status)\n        }",
+        "(G4)",
+    );
+    let old = scan_ui_paths_with(&d, &raw_before_2017);
+    assert!(
+        old.is_empty(),
+        "前提: #2017 より前の 1 節は修正前の self を見逃す: {:?}",
+        old.iter().map(Offender::report).collect::<Vec<_>>()
+    );
+    let mut injected = s.clone();
+    injected.dispatch = d.clone();
+    let graph = injected.graph();
+    let new = scan_call_graph(
+        &graph,
+        &graph_leaves(&raw_before_2017),
+        &graph_known_edges(&graph),
+    );
+    for (line_text, why) in [
+        (
+            "let sid = resolve_session_id_for_pane_via_host(host, pane_id);",
+            "`resolve_session_id_for_backend`",
+        ),
+        (
+            ".map(|s| orchestrator::query_agent_status(s).status)",
+            "`query_agent_status`",
+        ),
+    ] {
+        let line = line_in(&d, "fn dispatch_orchestrator_self(", line_text);
+        let hit = new.iter().find(|o| o.line == line && o.why.contains(why));
+        assert!(
+            hit.is_some(),
+            "#2017 の穴（{line_text}）を 15 節が {DISPATCH}:{line} で名指せない: {:?}",
+            new.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+        eprintln!("注入「#2017 の穴」→ {}", hit.unwrap().report());
+    }
+
+    // (G5) 誤検知しない側: 同じ包んだ口でも、先取りの外側の腕・A/B の旧経路の腕の中なら名指さない。
+    // 他の条件と組んだ腕は読まない（見逃す側へ倒さない）ので名指す
+    let quiet = |label: &str, d: &str| {
+        let mut injected = s.clone();
+        injected.dispatch = d.to_string();
+        let graph = injected.graph();
+        let new = scan_call_graph(&graph, &graph_leaves(RAW), &graph_known_edges(&graph));
+        assert!(
+            new.is_empty(),
+            "注入「{label}」は UI スレッドで走らないのに名指した: {:?}",
+            new.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+    };
+    quiet(
+        "先取りの外側の腕",
+        &inject(
+            &s.dispatch,
+            "        Probed::Outside => {\n            let sid = resolve_session_id_for_pane_via_host(host, pane_id);",
+            "        Probed::Outside => {\n            let _ = crate::agents::list_agents();\n            let sid = resolve_session_id_for_pane_via_host(host, pane_id);",
+            "(G5a)",
+        ),
+    );
+    quiet(
+        "A/B の旧経路の腕",
+        &inject(
+            &s.dispatch,
+            "    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+            "    if tako_core::probe::issue1989_legacy() {\n        let _ = crate::agents::list_agents();\n    }\n    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+            "(G5b)",
+        ),
+    );
+    let d = inject(
+        &s.dispatch,
+        "    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+        "    if tako_core::probe::issue1989_legacy() || pane.is_some() {\n        let _ = crate::agents::list_agents();\n    }\n    Ok(StaleStatusCtx {\n        pane: pane_id.as_u64(),",
+        "(G5c)",
+    );
+    a_b(
+        "他の条件と組んだ A/B の条件",
+        &d,
+        "fn collect_stale_status_ctx(",
+        "let _ = crate::agents::list_agents();",
+        "`list_agents`",
     );
 }
