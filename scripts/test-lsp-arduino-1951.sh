@@ -85,6 +85,8 @@ echo "visual-test 版の tako-app と tako をビルドします…"
 (cd "$REPO_ROOT" && run_heavy cargo test -q -p tako-control --test issue1951_lsp_arduino --no-run) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
+export TAKO_LSP_AUTOSTART=1
 isolated_gui_bins || exit 1
 NEW_TAKO_BIN="$TAKO_BIN"
 NEW_APP_BIN="$APP_BIN"

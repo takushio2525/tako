@@ -31759,6 +31759,11 @@ mod self_test {
     mod lsp_fetch_1944;
     #[cfg(feature = "visual-test")]
     use lsp_fetch_1944::lsp_fetch_visual;
+    /// #2048: 隔離 GUI では言語サーバを起こさず、タイトルの 1 行だけを出す（visual-test `lsp-held-2048`）
+    #[cfg(feature = "visual-test")]
+    mod lsp_held_2048;
+    #[cfg(feature = "visual-test")]
+    use lsp_held_2048::lsp_held_visual;
     /// #1956: 検出表の第 2 波を実のサーバで起こし、波線とホバーのカードを撮る（visual-test `lsp-servers`）
     #[cfg(feature = "visual-test")]
     mod lsp_servers_1956;
@@ -46409,6 +46414,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2048: 隔離 GUI で .rs を編集しても言語サーバを起こさず、タイトルの 1 行だけか（偽サーバ）
+                "lsp-held-2048" => {
+                    lsp_held_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1956: 第 2 波の言語サーバ（実物）で波線とホバーのカードが出るか（素材はスクリプト）
                 "lsp-servers" => {
                     lsp_servers_visual(any, window, cx).await;
@@ -46659,7 +46670,7 @@ mod self_test {
                          tasks-accordion / tasks-tick / tasks-offload / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / run-dropdown-1733 / run-board-1952 / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / \
+                         tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / lsp-held-2048 / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          syntax-alias / extra-syntax / net-resume / \
