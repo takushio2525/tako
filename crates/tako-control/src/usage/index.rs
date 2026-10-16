@@ -58,7 +58,7 @@ const PRESSURE_EVERY: Duration = Duration::from_secs(1);
 /// 月のファイルを書き直す下限（これより小さければ重複の行があっても書き直さない）
 const COMPACT_MIN_BYTES: u64 = 1024 * 1024;
 /// 日単位へまとめる・消す月（その月の終わりからの日数）
-const DAILY_AFTER_DAYS: i64 = 35;
+const DAILY_AFTER_DAYS: i64 = core_index::DAILY_AFTER_DAYS;
 const RETAIN_DAYS: i64 = 365;
 /// 月の掃除（日単位へまとめる・古い月を消す）の間隔
 const MAINTAIN_EVERY_MS: u64 = 24 * 3600 * 1000;

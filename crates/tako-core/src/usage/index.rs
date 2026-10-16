@@ -559,6 +559,18 @@ pub fn to_daily(rows: impl IntoIterator<Item = BucketRow>, utc_offset: i32) -> V
     }))
 }
 
+/// 月の終わりからこの日数を過ぎた月は日単位へまとめる（`tako_control::usage::index` の月の掃除）
+pub const DAILY_AFTER_DAYS: i64 = 35;
+
+/// 行の刻みの長さ（区間按分 = S3 で行の使用量を時間に散らす幅）。日単位へまとめた月の行は 1 日。
+/// まとめる前の 5 分の行も日単位とみなす（月の掃除は 1 日に 1 回なので遅れうる。差は区間の端の比だけ）
+pub fn row_span(t: i64, now: i64) -> i64 {
+    match month_range(&month_of(t)) {
+        Some((_, end)) if end + DAILY_AFTER_DAYS * 86_400 < now => 86_400,
+        _ => BUCKET_SECS,
+    }
+}
+
 /// 刻みの頭（unix 秒）→ 月のファイル名の `YYYY-MM`（UTC）
 pub fn month_of(t: i64) -> String {
     let (y, m, _) = crate::limit_resume::civil_from_days(t.div_euclid(86_400));

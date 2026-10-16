@@ -321,6 +321,8 @@ pub mod keys {
     pub const SETUP_RULES_SYNC: &str = "setup_rules_sync";
     /// solo の起動
     pub const SOLO_LAUNCH: &str = "solo_launch";
+    /// 利用制限の 5h / 7d の % を観測の増分の区間按分でプロジェクト・Issue・会話へ配る（#2202）
+    pub const USAGE_LIMIT_SHARE: &str = "usage_limit_share";
     /// 会話記録の使用量（トークン 5 成分・API 換算）を索引してプロジェクト・Issue・会話の内訳を出す（#2201）
     pub const USAGE_TOKENS: &str = "usage_tokens";
     /// Bypass ダイアログの事前承諾
@@ -1400,6 +1402,25 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Source(
             "solo は master と同じ build_master_cmd_in を通るので、agy は同じ理由で \
              起動前にエラーになる（#111 / #127）",
+        ),
+    },
+    AgentFeature {
+        key: keys::USAGE_LIMIT_SHARE,
+        summary: Note::new(
+            "観測した利用制限（5h / 7d）の % の増分を、区間の使用量の比でプロジェクト・Issue・会話へ配る（#2202）",
+            "The observed rise in the usage-limit percentage (5h / 7d) is shared out to projects, Issues and sessions by each interval's usage (#2202)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_WIRED, 2204),
+        agy: unsupported(notes::AGY_CREDITS_NOT_WINDOWED),
+        local: unsupported(notes::NO_LOCAL_USAGE_LIMIT),
+        evidence: AgentEvidence::Measured(
+            "#2202 実測（2026-10-17・この機の limits.jsonl と会話記録の写し）: 7d の配った合計 + tako の外が \
+             観測と一致（2 ログイン）。単体テスト tako_core::usage::share::tests は既知の重みで合成した観測の列で、\
+             混雑時間帯の係数・窓のまたぎ・古い値のペイン・下がる報告・使用量 0 の区間（tako の外）・\
+             最後の観測より後と観測の無い窓（推定）を含め、合計が観測と一致しキーごとの誤差が 1 ポイント以内。\
+             agy は #985 の実測（agy 1.1.22）で窓つきの利用上限と使用率を持たない（残量は前払いクレジット）ので\
+             配る % が無い。codex は rollout の token_count が rate_limits の履歴を持つ（設計書 §1.5 = #2204）",
         ),
     },
     AgentFeature {

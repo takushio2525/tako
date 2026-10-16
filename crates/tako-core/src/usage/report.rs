@@ -3,7 +3,16 @@
 //!
 //! 索引の行（[`BucketRow`]）と写した鍵（[`SessionKeys`]）から、ログインごとに期間の中の
 //! トークン（5 成分）・API 換算・応答数・会話数を、指定した段（[`By`]）で束ねて返す純関数。
-//! **利用制限の % へは配らない**（区間按分は S3 #2202）。
+//! 段の行には利用制限の 5h / 7d の % を区間按分（[`super::share`]。S3 #2202）で配った値も載せる。
+//!
+//! # % 列の範囲（S3）
+//!
+//! - 実窓（`5h` / `7d`）の問い合わせ: 枠ごとに**今の窓**（の、期間に重なる分）。`7d` の既定では 7d の列の合計が
+//!   今の 7d の観測と、5h の列の合計が今の 5h の観測と一致する（設計書 §2.4「5h は今の窓だけを出す」）
+//! - 暦（`day` / `week` / `month`）と `all`: 期間に重なる**すべての窓の延べ**（窓をまたぐと 100% を超えうる）
+//!
+//! 按分は期間・絞り込み（`account` / `project`）の前のログインの全行で行い、段へ足すときに絞る
+//! （絞ってから配ると、そのプロジェクトが区間の Δ を独り占めする）。
 //!
 //! # 期間（§3.4）
 //!
@@ -19,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use super::index::{BucketRow, ProjectFrom, SessionKeys, Tokens};
+use super::share::{self, Current, ObservedWindow, UsageSlice};
 use super::{price, KeyFrom, LimitObservation};
 
 /// 束ねる段
@@ -128,7 +138,7 @@ impl Window {
 pub enum Basis {
     /// 観測した解除時刻 − 長さ（実窓）
     Observed,
-    /// 観測が無い・解除時刻を過ぎた → 今から長さだけ遡る
+    /// 観測が無い・解除時刻を過ぎた → 今から長さだけ遡る（最後に解けた窓の解除時刻より前へは遡らない）
     Rolling,
     /// ローカル時刻の暦
     Calendar,
@@ -188,20 +198,19 @@ pub fn window_range(
         }
         Window::FiveHour | Window::SevenDay => {
             let (kind, len) = window.limit_window().unwrap_or(("", 0));
-            let latest = observations
-                .iter()
-                .filter(|o| o.login == login && o.kind == kind)
-                .filter_map(|o| o.resets_at.map(|r| (o.observed_at, r)))
-                .max();
-            match latest {
-                Some((_, resets)) if resets > now => Range {
-                    from: Some(resets - len),
+            // 窓の切り方は区間按分（S3）と同じ 1 実装（解除時刻の揺れの寄せ・前の窓との重なりの切り詰め）
+            let (windows, _) = share::windows_for(observations, login, kind, len);
+            match share::current_window(&windows, len, now) {
+                Current::Observed {
+                    start, resets_at, ..
+                } => Range {
+                    from: Some(start),
                     to: now,
                     basis: Basis::Observed,
-                    resets_at: Some(resets),
+                    resets_at: Some(resets_at),
                 },
-                _ => Range {
-                    from: Some(now - len),
+                Current::Rolling { start } => Range {
+                    from: Some(start),
                     to: now,
                     basis: Basis::Rolling,
                     resets_at: None,
@@ -219,6 +228,13 @@ pub fn earliest_from(window: Window, now: i64, utc_offset: i32) -> Option<i64> {
             .map(|(_, len)| now - len - BUCKET_SLACK),
         other => window_range(other, "", &[], now, utc_offset).from,
     }
+}
+
+/// 索引から読む最も早い時刻（S3）。期間の始まりに重なる窓の区間（窓は期間の始まりより最大 7 日前に始まる）と、
+/// 推定の係数を取る直近 7 日の区間（その窓の始まりまで）を配れるだけ遡る
+pub fn read_from(window: Window, now: i64, utc_offset: i32) -> Option<i64> {
+    earliest_from(window, now, utc_offset)
+        .map(|f| f.min(now - share::COEFFICIENT_RECENT_SECS) - 7 * 86_400 - BUCKET_SLACK)
 }
 
 /// 窓の端を刻みの頭へ丸める分の余裕
@@ -241,6 +257,137 @@ pub struct Totals {
 fn is_zero(v: &u64) -> bool {
     *v == 0
 }
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// % の桁（小数第 2 位）
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// 1% あたりの API 換算の桁（小数第 6 位 = マイクロドル。行の並びで変わる足し算の末尾の桁を応答に出さない）
+fn round_usd6(v: f64) -> f64 {
+    (v * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn rounded_spread(s: share::Spread) -> share::Spread {
+    share::Spread {
+        median: round_usd6(s.median),
+        p25: round_usd6(s.p25),
+        p75: round_usd6(s.p75),
+    }
+}
+
+/// 1 つの枠の段の %（観測から配った分と推定）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Share {
+    /// 観測した % の増分から配った分
+    pub percent: f64,
+    /// 推定（観測の区間の外の使用量 ÷ 1% あたりの API 換算）
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub estimated: f64,
+}
+
+impl Share {
+    fn rounded(self) -> Share {
+        Share {
+            percent: round2(self.percent),
+            estimated: round2(self.estimated),
+        }
+    }
+}
+
+/// 段の行の 5h / 7d の %（観測の無い枠は無し）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct GroupShares {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<Share>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<Share>,
+}
+
+impl GroupShares {
+    fn slot(&mut self, kind: &str) -> &mut Option<Share> {
+        if kind == share::FIVE_HOUR {
+            &mut self.five_hour
+        } else {
+            &mut self.seven_day
+        }
+    }
+
+    pub fn get(&self, kind: &str) -> Option<Share> {
+        if kind == share::FIVE_HOUR {
+            self.five_hour
+        } else {
+            self.seven_day
+        }
+    }
+}
+
+/// % 列の範囲
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareScope {
+    /// 枠の今の窓（の、期間に重なる分）
+    CurrentWindow,
+    /// 期間に重なるすべての窓の延べ
+    Period,
+}
+
+/// ログインの 1 つの枠の按分の要約
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KindShare {
+    /// `five_hour` / `seven_day`
+    pub kind: &'static str,
+    /// このログインのこの枠の観測があるか（無ければ % は出さない = tako mod の報告が無いログイン）
+    pub available: bool,
+    pub scope: ShareScope,
+    /// % 列の範囲（unix 秒。`all` は始まりなし）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<i64>,
+    pub to: i64,
+    /// 今の窓の解除時刻（`current_window` で観測した窓があるとき）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    /// 今の窓の最新の観測（%）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_percent: Option<f64>,
+    /// 範囲の中で観測から配った % の合計（段 + tako の外。絞り込みの前）。今の窓を丸ごと見るときは
+    /// `latest_percent` と一致する
+    pub observed: f64,
+    /// そのうち段へ配った分（絞り込みの後）
+    pub allocated: f64,
+    /// tako の外（区間にローカルの使用量が無いのに % が増えた分）
+    pub outside: f64,
+    /// 推定（最後の観測より後・観測の無い窓の使用量 ÷ 係数。絞り込みの後）
+    pub estimated: f64,
+    /// 推定できなかった API 換算（係数が無い）
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub unestimated_usd: f64,
+    /// 推定できなかった単価不明のトークン
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unestimated_tokens: u64,
+    /// 推定の係数（直近 7 日の区間の 1% あたりの量の中央値）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coefficient: Option<share::Coefficient>,
+    /// 範囲に重なる窓の当てはまり（新しい方から [`MAX_WINDOW_FITS`] 個まで。古い順）
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<share::WindowFit>,
+    /// 載せきれなかった窓の数
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub more_windows: usize,
+    /// 単価表に無いモデルの行を含み、生トークンの比で配った区間の数
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub token_weighted_intervals: usize,
+    /// 使わなかった観測（下がった値 = 古い報告・窓の外の時刻・解除時刻の無いもの）
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub ignored_observations: usize,
+}
+
+/// `KindShare::windows` に載せる窓の上限
+pub const MAX_WINDOW_FITS: usize = 10;
 
 /// 束ねる鍵（段に要る欄だけが埋まる）
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -276,6 +423,9 @@ pub struct Group {
     pub name: String,
     #[serde(flatten)]
     pub totals: Totals,
+    /// 利用制限の 5h / 7d の %（S3）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_share: Option<GroupShares>,
 }
 
 /// ログインごとの内訳
@@ -289,6 +439,8 @@ pub struct LoginUsage {
     /// `limit` で切った残りの段の数
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub more_groups: usize,
+    /// 利用制限の % の按分（S3。5h → 7d の順）
+    pub limit_share: Vec<KindShare>,
 }
 
 fn is_zero_usize(v: &usize) -> bool {
@@ -501,7 +653,162 @@ impl Acc {
     }
 }
 
-/// 内訳を組む。`rows` は期間を含む月の行（同じ鍵の行が複数あってよい）
+/// 段の絞り込み（`account` / `project`）に通るか
+fn passes(query: &Query<'_>, keys: Option<&SessionKeys>) -> bool {
+    if let Some(account) = query.account {
+        if keys.and_then(|k| k.account.as_deref()) != Some(account) {
+            return false;
+        }
+    }
+    if let Some(project) = query.project {
+        if keys.and_then(|k| k.project.as_deref()) != Some(project) {
+            return false;
+        }
+    }
+    true
+}
+
+/// % 列の範囲（[`ShareScope`]）と今の窓の添字
+fn column_period(
+    query: Window,
+    range: &Range,
+    windows: &[ObservedWindow],
+    len: i64,
+    now: i64,
+) -> (Option<i64>, i64, ShareScope, Option<usize>) {
+    match query {
+        Window::FiveHour | Window::SevenDay => {
+            let (start, current) = match share::current_window(windows, len, now) {
+                Current::Observed { index, start, .. } => (start, Some(index)),
+                Current::Rolling { start } => (start, None),
+            };
+            let from = range.from.map_or(start, |f| f.max(start));
+            (Some(from), now, ShareScope::CurrentWindow, current)
+        }
+        _ => (range.from, range.to, ShareScope::Period, None),
+    }
+}
+
+/// 1 つのログインの区間按分（S3）: 枠ごとの要約と、段ごとの %
+#[allow(clippy::too_many_arguments)]
+fn login_shares(
+    login: &str,
+    login_rows: &[usize],
+    rows: &[BucketRow],
+    keys: &BTreeMap<String, SessionKeys>,
+    observations: &[LimitObservation],
+    query: &Query<'_>,
+    range: &Range,
+    now: i64,
+    utc_offset: i32,
+) -> (Vec<KindShare>, BTreeMap<GroupKey, GroupShares>) {
+    let slices: Vec<UsageSlice> = login_rows
+        .iter()
+        .map(|&ri| {
+            let r = &rows[ri];
+            UsageSlice {
+                t: r.t,
+                span: super::index::row_span(r.t, now),
+                usd: price::cost_usd(&r.model, r.fast, &r.tokens),
+                tokens: r.tokens.total(),
+            }
+        })
+        .collect();
+    let mut groups: BTreeMap<GroupKey, GroupShares> = BTreeMap::new();
+    let mut kinds = Vec::with_capacity(share::KINDS.len());
+    for (kind, len) in share::KINDS {
+        let (windows, unusable) = share::windows_for(observations, login, kind, len);
+        let (from, to, scope, current) = column_period(query.window, range, &windows, len, now);
+        let mut ks = KindShare {
+            kind,
+            available: !windows.is_empty(),
+            scope,
+            from,
+            to,
+            resets_at: current.map(|i| windows[i].resets_at),
+            latest_percent: current.map(|i| windows[i].latest_percent()),
+            observed: 0.0,
+            allocated: 0.0,
+            outside: 0.0,
+            estimated: 0.0,
+            unestimated_usd: 0.0,
+            unestimated_tokens: 0,
+            coefficient: None,
+            windows: Vec::new(),
+            more_windows: 0,
+            token_weighted_intervals: 0,
+            ignored_observations: unusable + windows.iter().map(|w| w.ignored).sum::<usize>(),
+        };
+        if !ks.available {
+            kinds.push(ks);
+            continue;
+        }
+        let alloc = share::allocate(&slices, &windows, now);
+        let (lo, hi) = (from.unwrap_or(i64::MIN), to);
+        let mut unestimated_tokens = 0.0;
+        for piece in &alloc.pieces {
+            let f = share::overlap_fraction(piece.from, piece.to, lo, hi);
+            if f <= 0.0 {
+                continue;
+            }
+            ks.observed += piece.observed * f;
+            let row = &rows[login_rows[piece.slice]];
+            let k = keys.get(&row.session);
+            if !passes(query, k) {
+                continue;
+            }
+            ks.allocated += piece.observed * f;
+            ks.estimated += piece.estimated * f;
+            ks.unestimated_usd += piece.unestimated_usd * f;
+            unestimated_tokens += piece.unestimated_tokens * f;
+            if query.by != By::Login {
+                let slot = groups
+                    .entry(group_key(query.by, row, k, utc_offset))
+                    .or_default()
+                    .slot(kind)
+                    .get_or_insert_with(Share::default);
+                slot.percent += piece.observed * f;
+                slot.estimated += piece.estimated * f;
+            }
+        }
+        for o in &alloc.outside {
+            let f = share::overlap_fraction(o.from, o.to, lo, hi);
+            ks.outside += o.percent * f;
+            ks.observed += o.percent * f;
+        }
+        let fits: Vec<share::WindowFit> = alloc
+            .fits
+            .into_iter()
+            .filter(|w| w.start < hi && w.resets_at > lo)
+            .collect();
+        ks.more_windows = fits.len().saturating_sub(MAX_WINDOW_FITS);
+        ks.windows = fits
+            .into_iter()
+            .skip(ks.more_windows)
+            .map(|mut w| {
+                w.usd_per_percent = w.usd_per_percent.map(rounded_spread);
+                w
+            })
+            .collect();
+        ks.coefficient = alloc.coefficient.map(|c| share::Coefficient {
+            usd_per_percent: c.usd_per_percent.map(round_usd6),
+            tokens_per_percent: c.tokens_per_percent.map(f64::round),
+            ..c
+        });
+        ks.token_weighted_intervals = alloc.token_weighted_intervals;
+        ks.observed = round2(ks.observed);
+        ks.allocated = round2(ks.allocated);
+        ks.outside = round2(ks.outside);
+        ks.estimated = round2(ks.estimated);
+        ks.unestimated_usd = round_usd6(ks.unestimated_usd);
+        ks.unestimated_tokens = unestimated_tokens.round() as u64;
+        kinds.push(ks);
+    }
+    (kinds, groups)
+}
+
+/// 内訳を組む。`rows` は期間を含む月の行（同じ鍵の行が複数あってよい。区間按分のため期間より前の行も
+/// [`read_from`] まで含めてよい = 量は期間の中の行だけを数える）
 pub fn breakdown(
     rows: &[BucketRow],
     keys: &BTreeMap<String, SessionKeys>,
@@ -516,32 +823,32 @@ pub fn breakdown(
         range: Range,
         total: Acc,
         groups: BTreeMap<GroupKey, Acc>,
+        /// このログインの全行（期間・絞り込みの前。区間按分に使う）
+        rows: Vec<usize>,
     }
+    let new_login = |login: &str, from: KeyFrom| PerLogin {
+        key_from: from,
+        range: window_range(query.window, login, observations, now, utc_offset),
+        total: Acc::default(),
+        groups: BTreeMap::new(),
+        rows: Vec::new(),
+    };
     let mut logins: BTreeMap<String, PerLogin> = BTreeMap::new();
     let mut unpriced_models = BTreeSet::new();
     let mut unkeyed = 0u64;
-    for row in rows {
+    for (ri, row) in rows.iter().enumerate() {
         let k = keys.get(&row.session);
         let Some((login, from)) = effective_login(&row.session, k, mod_logins) else {
             unkeyed += row.tokens.total();
             continue;
         };
-        if let Some(account) = query.account {
-            if k.and_then(|k| k.account.as_deref()) != Some(account) {
-                continue;
-            }
+        let entry = logins
+            .entry(login.to_string())
+            .or_insert_with(|| new_login(login, from));
+        entry.rows.push(ri);
+        if !passes(query, k) {
+            continue;
         }
-        if let Some(project) = query.project {
-            if k.and_then(|k| k.project.as_deref()) != Some(project) {
-                continue;
-            }
-        }
-        let entry = logins.entry(login.to_string()).or_insert_with(|| PerLogin {
-            key_from: from,
-            range: window_range(query.window, login, observations, now, utc_offset),
-            total: Acc::default(),
-            groups: BTreeMap::new(),
-        });
         let in_range = entry
             .range
             .from
@@ -559,40 +866,97 @@ pub fn breakdown(
                 .add(row, &mut unpriced_models);
         }
     }
+    // 使用量が無くても観測のあるログイン（claude.ai だけで使った等 = すべて tako の外）。絞り込みの無いときだけ
+    if query.account.is_none() && query.project.is_none() {
+        for o in observations {
+            if !logins.contains_key(&o.login) {
+                let entry = new_login(&o.login, o.key_from);
+                logins.insert(o.login.clone(), entry);
+            }
+        }
+    }
+    let main_kind = if query.window == Window::FiveHour {
+        share::FIVE_HOUR
+    } else {
+        share::SEVEN_DAY
+    };
     let logins = logins
         .into_iter()
-        .filter(|(_, p)| p.total.responses > 0 || !p.total.tokens.is_zero())
-        .map(|(login, p)| {
-            let mut groups: Vec<Group> = p
-                .groups
+        .filter_map(|(login, p)| {
+            let (limit_share, mut shares) = login_shares(
+                &login,
+                &p.rows,
+                rows,
+                keys,
+                observations,
+                query,
+                &p.range,
+                now,
+                utc_offset,
+            );
+            let has_usage = p.total.responses > 0 || !p.total.tokens.is_zero();
+            // 絞り込みのあるときは絞った後の分だけで決める（絞り込みに当たる行の無いログインは出さない）
+            let filtered = query.account.is_some() || query.project.is_some();
+            let has_share = limit_share.iter().any(|k| {
+                k.estimated > 0.0
+                    || if filtered {
+                        k.allocated > 0.0
+                    } else {
+                        k.observed > 0.0
+                    }
+            });
+            if !has_usage && !has_share {
+                return None;
+            }
+            let mut accs = p.groups;
+            // % だけを持つ段（期間の量の外の切れ端）も行にする
+            for key in shares.keys() {
+                accs.entry(key.clone()).or_default();
+            }
+            let mut groups: Vec<Group> = accs
                 .into_iter()
-                .map(|(key, acc)| Group {
-                    name: group_name(query.by, &key),
-                    key,
-                    totals: acc.totals(),
+                .map(|(key, acc)| {
+                    let mut gs = shares.remove(&key).unwrap_or_default();
+                    for ks in limit_share.iter().filter(|k| k.available) {
+                        let slot = gs.slot(ks.kind);
+                        *slot = Some(slot.unwrap_or_default().rounded());
+                    }
+                    let any = gs.five_hour.is_some() || gs.seven_day.is_some();
+                    Group {
+                        name: group_name(query.by, &key),
+                        key,
+                        totals: acc.totals(),
+                        limit_share: any.then_some(gs),
+                    }
                 })
                 .collect();
             if query.by == By::Day {
                 groups.sort_by(|a, b| a.key.day.cmp(&b.key.day));
             } else {
+                let score = |g: &Group| {
+                    g.limit_share
+                        .and_then(|s| s.get(main_kind))
+                        .map_or(0.0, |s| s.percent + s.estimated)
+                };
                 groups.sort_by(|a, b| {
-                    b.totals
-                        .api_usd
-                        .total_cmp(&a.totals.api_usd)
+                    score(b)
+                        .total_cmp(&score(a))
+                        .then(b.totals.api_usd.total_cmp(&a.totals.api_usd))
                         .then(b.totals.total_tokens.cmp(&a.totals.total_tokens))
                         .then(a.name.cmp(&b.name))
                 });
             }
             let more = groups.len().saturating_sub(query.limit.max(1));
             groups.truncate(query.limit.max(1));
-            LoginUsage {
+            Some(LoginUsage {
                 login,
                 key_from: p.key_from,
                 range: p.range,
                 total: p.total.totals(),
                 groups,
                 more_groups: more,
-            }
+                limit_share,
+            })
         })
         .collect();
     Breakdown {
@@ -828,6 +1192,127 @@ mod tests {
         let l1 = b.logins.iter().find(|l| l.login == "L1").unwrap();
         assert_eq!(l1.groups.len(), 2);
         assert!(l1.groups[0].name < l1.groups[1].name, "日付は古い順");
+    }
+
+    fn limit(login: &str, kind: &str, percent: f64, resets_at: i64, ago: i64) -> LimitObservation {
+        LimitObservation {
+            login: login.into(),
+            key_from: KeyFrom::Account,
+            kind: kind.into(),
+            percent,
+            resets_at: Some(resets_at),
+            observed_at: ((NOW - ago) * 1000) as u64,
+            recorded_at: 0,
+            source: "mod".into(),
+        }
+    }
+
+    /// #2202: 段の % は今の窓の観測と合計が一致し（段 + tako の外 = 最新の観測）、観測の区間の外は推定。
+    /// 絞っても按分は絞る前の全行で行い、絞り込みに当たらないログインは出さない。使用量の無いログインは
+    /// 絞り込みの無いときだけ「すべて tako の外」として出る
+    #[test]
+    fn 段の利用制限の割合は観測と一致し絞っても按分は全行() {
+        let (rows, keys) = fixture();
+        let r7 = NOW + 3 * 86_400;
+        let observations = vec![
+            // L1 の 7d: 2 時間前に 10%（それまで使用なし = tako の外）・30 分前に 14%（s1 の 1 時間前の使用）
+            limit("L1", "seven_day", 10.0, r7, 7200),
+            limit("L1", "seven_day", 14.0, r7, 1800),
+            // L2 は区間に使用が無いまま 5%（s4 は最後の観測より後）
+            limit("L2", "seven_day", 5.0, NOW + 86_400, 100),
+            // L3 は会話記録に現れない（claude.ai だけ）
+            limit("L3", "seven_day", 7.0, NOW + 86_400, 100),
+        ];
+        let b = breakdown(
+            &rows,
+            &keys,
+            &BTreeMap::new(),
+            &observations,
+            &query(By::Project, Window::SevenDay),
+            NOW,
+            0,
+        );
+        let l1 = b.logins.iter().find(|l| l.login == "L1").unwrap();
+        let s7 = l1
+            .limit_share
+            .iter()
+            .find(|k| k.kind == "seven_day")
+            .unwrap();
+        assert_eq!(s7.scope, ShareScope::CurrentWindow);
+        assert_eq!(s7.latest_percent, Some(14.0));
+        assert_eq!((s7.observed, s7.allocated, s7.outside), (14.0, 4.0, 10.0));
+        // 推定: 係数 = 20.4 USD / 4% = 5.1。s2（読み出し 1M = 0.2 USD）→ 0.04・s3（単価不明 1,000,005 トークン /
+        // 750,000 トークン毎 %）→ 1.33
+        assert!((s7.estimated - 1.37).abs() < 0.011, "{}", s7.estimated);
+        assert_eq!(s7.coefficient.unwrap().usd_per_percent, Some(5.1));
+        let s5 = l1
+            .limit_share
+            .iter()
+            .find(|k| k.kind == "five_hour")
+            .unwrap();
+        assert!(!s5.available, "5h の観測は無い");
+        let names: Vec<&str> = l1.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["tako", "プロファイル: default"],
+            "7d の % の大きい順"
+        );
+        let tako = l1.groups[0].limit_share.unwrap();
+        assert_eq!(tako.seven_day.map(|s| s.percent), Some(4.0));
+        assert_eq!(tako.five_hour, None, "観測の無い枠は出さない");
+        let default = l1.groups[1].limit_share.unwrap().seven_day.unwrap();
+        assert_eq!(default.percent, 0.0);
+        assert!((default.estimated - 1.33).abs() < 0.011);
+        // L2: 区間に使用が無い → すべて tako の外。最後の観測より後の s4 は係数が無いので % へ直さない
+        let l2 = b.logins.iter().find(|l| l.login == "L2").unwrap();
+        let s7 = l2
+            .limit_share
+            .iter()
+            .find(|k| k.kind == "seven_day")
+            .unwrap();
+        assert_eq!((s7.observed, s7.outside, s7.estimated), (5.0, 5.0, 0.0));
+        assert!((s7.unestimated_usd - 0.1).abs() < 1e-9);
+        // L3: 使用量が無くても観測のあるログインは出る（すべて tako の外）
+        let l3 = b
+            .logins
+            .iter()
+            .find(|l| l.login == "L3")
+            .expect("観測だけのログイン");
+        assert_eq!(l3.limit_share[1].outside, 7.0);
+        assert!(l3.groups.is_empty());
+
+        // 絞り込み: tako の % は絞らないときと同じ（区間の Δ を独り占めしない）。当たらないログインは出さない
+        let mut q = query(By::Project, Window::SevenDay);
+        q.project = Some("tako");
+        let b = breakdown(&rows, &keys, &BTreeMap::new(), &observations, &q, NOW, 0);
+        assert_eq!(
+            b.logins
+                .iter()
+                .map(|l| l.login.as_str())
+                .collect::<Vec<_>>(),
+            ["L1"]
+        );
+        let s7 = &b.logins[0].limit_share[1];
+        assert_eq!((s7.observed, s7.allocated), (14.0, 4.0));
+        assert!(
+            (s7.estimated - 0.04).abs() < 0.011,
+            "絞った後の推定は tako の分だけ"
+        );
+
+        // 暦の期間は延べ。窓をまたいでも期間に重なる分だけ
+        let b = breakdown(
+            &rows,
+            &keys,
+            &BTreeMap::new(),
+            &observations,
+            &query(By::Login, Window::All),
+            NOW,
+            0,
+        );
+        let l1 = b.logins.iter().find(|l| l.login == "L1").unwrap();
+        assert_eq!(l1.limit_share[1].scope, ShareScope::Period);
+        assert_eq!(l1.limit_share[1].observed, 14.0);
+        assert!(l1.groups.is_empty(), "login の段は合計だけ");
     }
 
     #[test]

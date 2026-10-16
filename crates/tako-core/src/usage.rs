@@ -25,10 +25,16 @@
 //!
 //! 会話記録の assistant 行の使用量メタデータを増分で読み（[`index`]）、単価表（[`price`]）で
 //! API 換算し、ログイン → プロジェクト → Issue → 会話の内訳を組む（[`report`]）。
+//!
+//! # 利用制限の % の按分（S3 = #2202）
+//!
+//! 観測した used_percent の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配る（[`share`]）。
+//! 合計は観測と一致し、区間に使用量が無ければ「tako の外」、観測の区間の外は係数で割った「推定」。
 
 pub mod index;
 pub mod price;
 pub mod report;
+pub mod share;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

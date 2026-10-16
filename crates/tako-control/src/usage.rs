@@ -505,6 +505,58 @@ fn round_usd_in(v: &mut Value) {
     }
 }
 
+/// 区間按分（S3）の読み方の注記
+fn share_notes(b: &report::Breakdown, summary: &core::Summary, notes: &mut Vec<String>) {
+    let kinds = || b.logins.iter().flat_map(|l| l.limit_share.iter());
+    if kinds().any(|k| k.available) {
+        let scope = if kinds().any(|k| k.scope == report::ShareScope::Period) {
+            "期間に重なるすべての窓の延べ（窓をまたぐと 100% を超えうる）"
+        } else {
+            "枠（5h / 7d）ごとの今の窓の、期間に重なる分。今の窓を丸ごと見るときは段の合計 + tako の外 = 最新の観測"
+        };
+        notes.push(format!(
+            "limit_share は観測した % の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配った値。範囲は{scope}"
+        ));
+        notes.push(
+            "outside（tako の外）は区間にローカルの使用量が無いのに % が増えた分（claude.ai・別の PC など）。\
+             estimated（推定）は観測の区間の外（最後の観測より後・観測の無い窓）の使用量を、直近 7 日の区間の \
+             1% あたりの API 換算の中央値で割った値"
+                .to_string(),
+        );
+    }
+    let missing: Vec<String> = b
+        .logins
+        .iter()
+        .filter(|l| l.limit_share.iter().any(|k| !k.available))
+        .map(|l| {
+            let kinds: Vec<&str> = l
+                .limit_share
+                .iter()
+                .filter(|k| !k.available)
+                .map(|k| if k.kind == "five_hour" { "5h" } else { "7d" })
+                .collect();
+            let label = summary
+                .logins
+                .iter()
+                .find(|s| s.login == l.login)
+                .map_or(l.login.as_str(), |s| s.label.as_str());
+            format!("ログイン {label}（{}）", kinds.join(" / "))
+        })
+        .collect();
+    if !missing.is_empty() {
+        notes.push(format!(
+            "観測の無いログインと枠は % を出していない: {}。tako mod の効いた claude のペインが利用制限を報告すると記録が始まる",
+            missing.join("・")
+        ));
+    }
+    if kinds().any(|k| k.unestimated_usd > 0.0 || k.unestimated_tokens > 0) {
+        notes.push(
+            "unestimated_usd / unestimated_tokens は観測の区間の外の使用量のうち、係数が無く % へ直せなかった分"
+                .to_string(),
+        );
+    }
+}
+
 /// [`usage_payload`] の本体（置き場・読み進めた結果・現在時刻・ローカル時刻のずれを引数で受ける = テスト用）
 pub fn payload_in(
     dir: &Path,
@@ -527,7 +579,8 @@ pub fn payload_in(
         for row in &sessions {
             mods.insert(row.session_id.clone(), (row.login.clone(), row.key_from));
         }
-        let from = report::earliest_from(window, now_secs, utc_offset);
+        // 区間按分（S3）は期間の始まりに重なる窓と直近 7 日の係数の区間まで遡って配る
+        let from = report::read_from(window, now_secs, utc_offset);
         let (rows, bad_rows) = index::read_rows(dir, from);
         bad_index = bad_keys + bad_rows;
         keyed_sessions = keys.len();
@@ -570,6 +623,7 @@ pub fn payload_in(
                     "range": u.range,
                     "total": u.total,
                     "groups": u.groups,
+                    "limit_share": u.limit_share,
                 });
                 if u.more_groups > 0 {
                     usage["more_groups"] = json!(u.more_groups);
@@ -577,6 +631,11 @@ pub fn payload_in(
                 iso(&mut usage["range"], "from");
                 iso(&mut usage["range"], "to");
                 iso(&mut usage["range"], "resets_at");
+                if let Some(kinds) = usage["limit_share"].as_array_mut() {
+                    for k in kinds {
+                        iso(k, "resets_at");
+                    }
+                }
                 login["usage"] = usage;
             }
         }
@@ -612,9 +671,10 @@ pub fn payload_in(
             }
             out["scope"] = json!(
                 "ログインごとの観測の要約（最新の % と点数）と、期間の中の使用量の内訳（トークン 5 成分・\
-                 API 換算・応答数・会話数）。利用制限の % をプロジェクト・Issue へ配るのは後続のスライス\
-                 （#2202 / エピック #2192）"
+                 API 換算・応答数・会話数）と、利用制限の 5h / 7d の % を観測の増分の区間按分で段へ配った値\
+                 （limit_share）"
             );
+            share_notes(b, &summary, &mut notes);
             let mut index = json!({
                 "enabled": true,
                 "sessions": keyed_sessions,
