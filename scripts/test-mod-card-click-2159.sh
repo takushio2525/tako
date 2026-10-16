@@ -13,8 +13,8 @@
 #   place      4. `cards.place=tako` と mod なしのペイン（TAKO_CLI と CLAUDE_CODE_PLUGIN_DIRS を外した claude = mod は
 #                 休眠。隔離 GUI は起動時に設定 dir の skills/tako へ写しを置くので、注入を外すだけでは mod が読まれる）は今の挙動
 #                 （GPUI のカード帯が出る・会話の行にボタンを置かない）
-#   copy       会話の行の `[ copy ]` をクリックで押すと論理文字列（157 字・改行なし）が $.ui.copy へ渡る
-#              （**隔離 tmux の claude で押す** = 本物のクリップボードへ書かない。クリックは SGR の列を send-keys -H で）
+#   copy       会話の行の `[ copy ]` をクリック 1 回で押すと、帯の Copy と同じ経路を通る（ui.copy を拒む mod を同居させ、
+#              退避先の `show-command --copy` は CLI の包みで控える = 本物のクリップボードへ書かない）
 #   visual     1 / 2. visual-test `mod-card-click`（実 OS と同じ PlatformInput のクリック 1 回で実行・150 ms 後の
 #                 2 打目と実行中の押し直しで 2 本目が走らない・画像を書き出す）。A/B（TAKO_2159_LEGACY=1）は ① で落ちる。
 #                 新旧で書き出し先を分ける
@@ -23,8 +23,8 @@
 # **本物の設定 dir（~/.claude*）には書かない**: claude の設定 dir は mktemp 配下（認証は写さず、偽 API と
 # ダミーの API キーを一時の .claude.json で承認済みにする）。前後で本物の ~/.claude*/skills・plugins の
 # 一覧とハッシュを比べる。**本物のクリップボードにも書かない**: GUI のペインの claude の $.ui.copy は偽の pbcopy を
-# 置いても OSC 52 で tako 経由のシステムのクリップボードへ届く（#1963）ので、Copy は隔離 tmux（set-clipboard off・
-# クライアントなし）の claude でだけ押し、前後で pbpaste のハッシュを比べる。
+# 置いても OSC 52 で tako 経由のシステムのクリップボードへ届く（#1963）ので、Copy は ui.copy を拒む mod を同居させて
+# 押し（退避先の CLI は包みで控える）、前後で pbpaste のハッシュを比べる（段ごとの変化も控える）。
 # 本番 tako が配る env（TAKO_SOCKET / TAKO_PANE_ID / TAKO_CLI / CLAUDE_CODE_PLUGIN_DIRS 等）は最初に落とす。
 # 落とすのは自分で起こした pid と tmux ソケットだけ。
 #
@@ -149,6 +149,33 @@ mkdir -p "$FAKEBIN"
 printf '#!/bin/sh\ncat > %s/pbcopy.out\n' "$TMP" > "$FAKEBIN/pbcopy"
 chmod +x "$FAKEBIN/pbcopy"
 
+# 他の mod の代役: ui.copy を拒む（会話の行の Copy が tako の CLI へ落ちる経路 = 本物のクリップボードへ届かない）
+OTHER_REFUSE="$TMP/mods/other-refuse"
+mkdir -p "$OTHER_REFUSE/.claude-plugin" "$OTHER_REFUSE/hooks"
+printf '{"name":"other-refuse","version":"0.0.1","description":"refuses ui.copy for the #2159 check"}\n' \
+  > "$OTHER_REFUSE/.claude-plugin/plugin.json"
+printf '{ "modules": ["./register.ts"] }\n' > "$OTHER_REFUSE/hooks/hooks.json"
+cat > "$OTHER_REFUSE/hooks/register.ts" <<'EOF2'
+import type { Register } from 'claude-code'
+export const register: Register = on => {
+  on('ui.copy', () => ({ value: { isCopied: false, reason: 'refused' } })).catch(($, e, next) => next(e))
+}
+EOF2
+# mod が叩く CLI（TAKO_CLI）の薄い包み: `show-command --copy` は叩いた引数を控えて成功を返す（GUI がシステムの
+# クリップボードへ書くので本物を呼ばない）。ほかはそのまま本物の CLI へ
+GATE_LOG="$TMP/gate.log"
+CLI_GATE="$TMP/tako-cli-gate"
+cat > "$CLI_GATE" <<EOF2
+#!/bin/sh
+if [ "\$1" = show-command ] && [ "\$2" = --copy ]; then
+  echo "\$*" >> '$GATE_LOG'
+  echo '{"copied":true}'
+  exit 0
+fi
+exec '$TAKO_BIN' "\$@"
+EOF2
+chmod +x "$CLI_GATE"
+
 # 試すカード: すぐには終わらないコマンド（実行中の押し直しを見る。visual-test は押してから画像を 2 枚書き出して
 # から押し直すので十数秒は走らせる）と、157 字・改行なしの長いコマンド（Copy）
 RUN_CMD="printf 'click-2159\\n'; sleep 12"
@@ -236,11 +263,11 @@ for row, line in enumerate(sys.stdin.read().split("\n")):
 }
 
 # 隔離 GUI の直接ペインで claude を起こす（ペインの env = tako の注入はそのまま）。$2 は前に置く env、$3 は
-# claude の前のコマンド（`env -u CLAUDE_CODE_PLUGIN_DIRS -u TAKO_CLI` = mod なし）
+# claude の前のコマンド（`env -u CLAUDE_CODE_PLUGIN_DIRS -u TAKO_CLI` = mod なし）、$4 は claude の引数
 gui_claude() {
-  local pane="$1" extra="${2:-}" pre="${3:-}"
+  local pane="$1" extra="${2:-}" pre="${3:-}" args="${4:-}"
   if reporting "$pane"; then quit_claude "$pane"; fi
-  tk send --pane "$pane" "cd '$WORK' && clear && env PATH='$FAKEBIN':\$PATH CLAUDE_CONFIG_DIR='$CCD' ANTHROPIC_BASE_URL='$API_URL' ANTHROPIC_API_KEY='$API_KEY' DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 $extra $pre claude --model haiku --allowedTools mcp__tako__tako_show_command" >/dev/null
+  tk send --pane "$pane" "cd '$WORK' && clear && env PATH='$FAKEBIN':\$PATH CLAUDE_CONFIG_DIR='$CCD' ANTHROPIC_BASE_URL='$API_URL' ANTHROPIC_API_KEY='$API_KEY' DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 $extra $pre claude --model haiku --allowedTools mcp__tako__tako_show_command $args" >/dev/null
   if [ -n "$pre" ]; then
     # mod なし = 報告が来ない。入力欄が出るまで待つ
     if ! wait_for 60 screen_has "$pane" '❯'; then
@@ -445,9 +472,20 @@ place_check() {
   check_eq "${label}: 会話の行に [ run ] を置かない" "" "$(cell_of "$p" '[ run ]')"
 }
 phase_place() {
-  echo "== 4. cards.place=tako と mod なしのペインは今の挙動（GPUI のカード帯・会話の行にボタンなし）"
+  echo "== 4. mod なしのペインと cards.place=tako は今の挙動（GPUI のカード帯・会話の行にボタンなし）"
   local p rows0
   p="$(root_pane)"
+  # mod なし: 注入（CLAUDE_CODE_PLUGIN_DIRS）と TAKO_CLI を外す。設定 dir の skills/tako の写し（#1959）は読まれるが、
+  # TAKO_CLI が無ければ mod は休眠する（報告も描画もしない = mod を入れていない claude と同じ）。
+  # place-tako より先に回す（tako が置き場の写しを ui.json から取り直すのは mod の報告を受けたときだけなので、
+  # 後に回すと報告の来ないこのペインの理由が place_tako のまま残る。GPUI の帯が出ることは同じ）
+  gui_claude "$p" "" "env -u CLAUDE_CODE_PLUGIN_DIRS -u TAKO_CLI" || return 1
+  rows0="$(rows_of "$p")"
+  show_card "$p" "$CARD_JSON" || return 1
+  place_check no-mod "$p" "$rows0" no_fresh_report
+  close_runs "$p"
+  exit_claude "$p"
+  sleep 2
   tk mod ui set cards.place tako >/dev/null || fail "tako mod ui set cards.place tako が通らない"
   gui_claude "$p" || return 1
   rows0="$(rows_of "$p")"
@@ -457,97 +495,41 @@ phase_place() {
   close_runs "$p"
   quit_claude "$p"
   tk mod ui reset >/dev/null 2>&1
-  # mod なし: 注入（CLAUDE_CODE_PLUGIN_DIRS）と TAKO_CLI を外す。設定 dir の skills/tako の写し（#1959）は読まれるが、
-  # TAKO_CLI が無ければ mod は休眠する（報告も描画もしない = mod を入れていない claude と同じ）
-  gui_claude "$p" "" "env -u CLAUDE_CODE_PLUGIN_DIRS -u TAKO_CLI" || return 1
-  rows0="$(rows_of "$p")"
-  show_card "$p" "$CARD_JSON" || return 1
-  place_check no-mod "$p" "$rows0" no_fresh_report
-  close_runs "$p"
-  exit_claude "$p"
-  sleep 2
 }
 
-# --- copy（隔離 tmux）--------------------------------------------------------------------------
-start_tmux_claude() {
-  local name="$1" pane="$2" dirs="$3"
-  tmx kill-session -t "=$name" >/dev/null 2>&1
-  tmx new-session -d -s "$name" -x 144 -y 40 -c "$WORK" \
-    env PATH="$FAKEBIN:$PATH" TAKO_ISOLATED=1 TAKO_DATA_DIR="$TAKO_DATA_DIR" TAKO_DISCOVERY_DIR="$TAKO_DISCOVERY_DIR" \
-    TAKO_ORCHESTRATOR_DIR="$TAKO_ORCHESTRATOR_DIR" CLAUDE_CONFIG_DIR="$CCD" \
-    ANTHROPIC_BASE_URL="$API_URL" ANTHROPIC_API_KEY="$API_KEY" DISABLE_AUTOUPDATER=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-    TAKO_PANE_ID="$pane" TAKO_CLI="$TAKO_BIN" CLAUDE_CODE_PLUGIN_DIRS="$dirs" \
-    claude --model haiku --allowedTools mcp__tako__tako_show_command
-  # tmux へ届く OSC 52 をどこへも渡さない（クライアントも付けない）
-  tmx set-option -g set-clipboard off >/dev/null 2>&1
-  tmx set-option -t "=$name" remain-on-exit off >/dev/null 2>&1
-}
-tcap() { tmx capture-pane -p -t "=$1:" 2>/dev/null; }
-tscreen_has() { tcap "$1" | grep -q -- "$2"; }
-tcell_of() {
-  tcap "$1" | python3 -I -c '
-import sys, unicodedata
-label = sys.argv[1]
-for row, line in enumerate(sys.stdin.read().split("\n")):
-    at = line.find(label)
-    if at < 0:
-        continue
-    width = lambda s: sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
-    print(row, width(line[:at]) + width(label) // 2)
-    break
-' "$2"
-}
-# SGR のクリック（押す・離す）を tmux の器のペインへ直接（#1961 の器のペインと同じ send-keys -H）
-tclick() {
-  local s="$1" row="$2" col="$3" seq hex
-  for seq in "$(printf '\033[<0;%d;%dM' $((col + 1)) $((row + 1)))" "$(printf '\033[<0;%d;%dm' $((col + 1)) $((row + 1)))"; do
-    hex="$(printf '%s' "$seq" | od -An -tx1 | tr -s ' \n' ' ')"
-    # shellcheck disable=SC2086
-    tmx send-keys -t "=$s:" -H $hex
-    sleep 0.05
-  done
-}
+# --- copy（GUI のペイン。本物のクリップボードへ書かない）--------------------------------------------
+# GUI のペインの claude の $.ui.copy は偽の pbcopy を置いても OSC 52 で tako 経由の本物のクリップボードへ届く（#1963）。
+# そこで ui.copy を拒む mod を同居させ（Copy は tako の CLI へ落ちる = 帯の Copy と同じ退避の経路）、mod が叩く CLI は
+# 包みで `show-command --copy` を控えて成功を返す（GUI のクリップボードへ書く dispatch へは行かない）。論理文字列そのものは
+# claude plugin test（cards.test.ts）と dispatch の単体テストが見る。隔離 tmux の claude では、偽 API に渡るツール一覧に
+# tako の MCP が載らず AI の呼び出しの行（ToolUse）を作れなかったので、この形にした
 phase_copy() {
-  echo "== 会話の行の [ copy ] をクリックで押すと論理文字列（157 字・改行なし）が \$.ui.copy へ（隔離 tmux）"
-  local p dirs s cell copied
+  echo "== 会話の行の [ copy ] をクリックで押す（ui.copy を拒む mod と CLI の包み = 本物のクリップボードへ書かない）"
+  local p cell before
   p="$(root_pane)"
-  dirs="$(mod_dir)"
-  s="copy"
-  start_tmux_claude "$s" "$p" "$dirs"
-  # 入力欄が出ただけでは打鍵を取りこぼすことがある（起動直後の案内）。mod が起きて報告が届くまで待つ（#1964 と同じ）
-  if ! wait_for 60 tscreen_has "$s" '❯' || ! wait_for 60 reporting "$p"; then
-    fail "tmux の claude の入力欄が出ない・報告が届かない"
+  : > "$GATE_LOG"
+  gui_claude "$p" "TAKO_CLI='$CLI_GATE'" "" "--plugin-dir '$OTHER_REFUSE'" || return 1
+  show_card "$p" "$(jq -cn --arg a "$LONG" '{commands: [$a], label: "copy 2159"}')" || return 1
+  if ! wait_for 20 screen_has "$p" '\[ copy \]'; then
+    fail "会話の行のカードに [ copy ] が出ない"
     return 1
   fi
   sleep 2
-  tmx send-keys -t "=$s:" -l "Show this card: $(jq -cn --arg a "$LONG" '{commands: [$a], label: "copy 2159"}')"
-  sleep 1
-  tmx send-keys -t "=$s:" Enter
-  if ! wait_for 40 tscreen_has "$s" 'CARD-DONE'; then
-    fail "tmux の claude: AI の tako_show_command が終わらない"
-    tcap "$s" | mask | tail -10 | sed 's/^/      | /'
-    return 1
-  fi
-  if ! wait_for 30 tscreen_has "$s" '\[ copy \]'; then
-    fail "tmux の claude: 会話の行のカードに [ copy ] が出ない"
-    tcap "$s" | mask | tail -14 | sed 's/^/      | /'
-    return 1
-  fi
-  sleep 2
-  cell="$(tcell_of "$s" '[ copy ]')"
-  tcap "$s" | mask > "$OUT/capture-new/copy.txt"
-  rm -f "$TMP/pbcopy.out"
+  save_pane "$p" "$OUT/capture-new/copy.txt"
+  cell="$(cell_of "$p" '[ copy ]')"
+  before="$(pane_count)"
   # shellcheck disable=SC2086
   set -- $cell
-  tclick "$s" "$1" "$2"
-  wait_for 10 test -f "$TMP/pbcopy.out" || true
-  copied="$(cat "$TMP/pbcopy.out" 2>/dev/null)"
-  check_eq "[ copy ] のクリックで渡った文字列は論理文字列そのまま" "$LONG" "$copied"
-  check_eq "長さ 157 字・改行 0" "157 0" "$(printf '%s' "$copied" | wc -m | tr -d ' ') $(printf '%s' "$copied" | tr -cd '\n' | wc -c | tr -d ' ')"
-  tmx kill-session -t "=$s" >/dev/null 2>&1
+  tk click --pane "$p" --row "$1" --col "$2" >/dev/null || fail "tako click が通らない"
+  wait_for 10 test -s "$GATE_LOG" || true
+  check_eq "[ copy ] のクリック 1 回で、拒まれた Copy が show-command --copy --card N --index 1 へ落ちた（帯の Copy と同じ退避）" \
+    "show-command --copy --card $CARD --index 1" "$(tail -1 "$GATE_LOG" 2>/dev/null)"
+  wait_for 10 sh -c "'$TAKO_BIN' mod --json | jq -e '.panes[] | select(.pane == $p) | .report.last_press.kind == \"card_copy_cli\"' >/dev/null" || true
+  check_eq "報告の last_press は card_copy_cli で成功" "card_copy_cli/true" "$(row_field "$p" '.report.last_press | "\(.kind)/\(.ok)"')"
+  check_eq "Copy は実行しない（ペイン数そのまま）" "$before" "$(pane_count)"
+  check_eq "偽の pbcopy は呼ばれない（拒む mod が \$.ui.copy を止めた）" "false" "$([ -e "$TMP/pbcopy.out" ] && echo true || echo false)"
   tk show-command --dismiss --pane "$p" >/dev/null 2>&1
-  wait_for 30 not_reporting "$p" || true
+  quit_claude "$p"
 }
 
 # --- visual ---------------------------------------------------------------------------------
