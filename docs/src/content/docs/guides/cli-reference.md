@@ -1167,6 +1167,8 @@ tako panel --view orch           # orch  = master + ワーカーツリー
 tako panel --view git            # git   = ブランチ・変更・履歴・diff
 tako panel --view tasks          # tasks = 人がやること（承認・レビュー・投稿）
 tako panel --view diagnostics    # diagnostics = 言語サーバの診断（LSP の文書があるときだけタブが出る）
+tako panel --view references     # references = 参照・呼び出し階層・型階層の結果（ふだんは結果があるときだけタブが出る）
+tako panel --view search         # search = ワークスペース横断検索（⇧⌘F と同じ。ふだんは結果があるときだけタブが出る）
 tako panel --hide
 tako panel --filetree on         # 左のファイルツリー
 tako panel --width 360

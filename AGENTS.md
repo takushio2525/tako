@@ -213,7 +213,7 @@ tako/
 | **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude\|codex\|agy\|local] [--status supported\|degraded\|pending\|unsupported] [--json]` |
 | Windows 対応状況ページのデータの生成（ページは docs のビルドが組む。#591 / #2104） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |
 | **Windows のウインドウを実測する（#1063）** | `pwsh -File scripts/windows/measure-window.ps1 -TakoPid <pid>` |
-| 右パネルのビュー切替 | `tako panel --show --view <fleet\|orch\|git\|tasks\|diagnostics>` |
+| 右パネルのビュー切替 | `tako panel --show --view <fleet\|orch\|git\|tasks\|diagnostics\|references\|search>` |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]` |
 | 拡張子既定コマンド設定 | `tako run-default [ext] [command]` |
 | **実行環境・プロファイルを選んで覚える（ファイル / プロジェクト単位。#1731）** | `tako run-config <file> [--runtime <候補>]` |
