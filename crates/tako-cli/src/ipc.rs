@@ -383,12 +383,36 @@ pub mod transport {
                 }
                 Ok(Some(left))
             }
+
+            /// 上限を入れ直せなかった読み（#2169）。macOS は相手が閉じて送受信の両方が閉じた
+            /// ソケットへの setsockopt に EINVAL を返すが、届いている応答はまだ読める（GUI が
+            /// 応答を書いてすぐ閉じた回）。その状態は受信も閉じているので、待たない読みを 1 回
+            /// だけして届いている分か終わり（0）を返す。何も届かず受信も閉じていなければ
+            /// （WouldBlock）上限を掛けられないので、待たずに元の誤りを返す（修正前と同じ失敗 =
+            /// 上限を越えて待つ経路は作らない）。Linux はこの状態でも setsockopt が通るので来ない
+            fn read_unarmed(&mut self, buf: &mut [u8], refused: io::Error) -> io::Result<usize> {
+                if refused.kind() != io::ErrorKind::InvalidInput
+                    || self.stream.set_nonblocking(true).is_err()
+                {
+                    return Err(refused);
+                }
+                let got = self.stream.read(buf);
+                // 戻せなくても待ち続ける読みは生まれない（受信が閉じていれば読みは待たず、
+                // 閉じていなければ下で失敗を返して往復が終わる）
+                let _ = self.stream.set_nonblocking(false);
+                match got {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(refused),
+                    got => got,
+                }
+            }
         }
 
         impl Read for Stream {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 if let Some(left) = self.left()? {
-                    self.stream.set_read_timeout(Some(left))?;
+                    if let Err(refused) = self.stream.set_read_timeout(Some(left)) {
+                        return self.read_unarmed(buf, refused);
+                    }
                 }
                 self.stream.read(buf)
             }
@@ -470,8 +494,8 @@ pub mod transport {
 
             #[test]
             fn 応答を書いてすぐ閉じる受け口でも往復は応答を返す() {
-                let path = std::env::temp_dir()
-                    .join(format!("tk2169-{}-close.sock", std::process::id()));
+                let path =
+                    std::env::temp_dir().join(format!("tk2169-{}-close.sock", std::process::id()));
                 let _ = std::fs::remove_file(&path);
                 let listener = UnixListener::bind(&path).expect("受け口を作れる");
                 let server = std::thread::spawn(move || {
@@ -564,6 +588,41 @@ pub mod transport {
                     Ok(v) => assert_eq!(v["pad"].as_str().map(str::len), Some(PAD)),
                     Err(e) => panic!("届いた応答を読まずに失敗した: {}", e.message()),
                 }
+            }
+
+            /// 上限を掛けられないまま待つ経路が無い: 受信が開いていて何も届いていなければ、
+            /// 待たずに元の誤りを返し、ソケットは待つ読みへ戻る。EINVAL 以外は読まずにそのまま返す
+            #[test]
+            fn 上限を入れ直せず未着なら待たずに元の誤りを返す() {
+                let (ours, mut theirs) = UnixStream::pair().expect("対を作れる");
+                let mut stream = Stream::new(ours, deadline_in(Duration::from_secs(10)));
+                let mut buf = [0u8; 16];
+                let started = Instant::now();
+                let e = stream
+                    .read_unarmed(&mut buf, std::io::Error::from_raw_os_error(22))
+                    .expect_err("未着なら読めない");
+                assert_eq!(e.raw_os_error(), Some(22), "元の誤りを返す: {e:?}");
+                assert!(started.elapsed() < Duration::from_secs(1), "待った");
+                // 待つ読みへ戻っている（上限を入れれば上限まで待ってから時間切れ）
+                stream
+                    .stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .expect("開いたソケットには入れられる");
+                let started = Instant::now();
+                let e = stream.stream.read(&mut buf).expect_err("届いていない");
+                assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+                assert!(
+                    started.elapsed() >= Duration::from_millis(150),
+                    "待たない読みのまま: {:?}",
+                    started.elapsed()
+                );
+                // EINVAL 以外は届いていても読まずにそのまま返す（修正前と同じ）
+                theirs.write_all(b"data\n").expect("書ける");
+                let e = stream
+                    .read_unarmed(&mut buf, std::io::ErrorKind::PermissionDenied.into())
+                    .expect_err("そのまま返す");
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(stream.stream.read(&mut buf).expect("残っている"), 5);
             }
 
             #[test]
