@@ -54,6 +54,10 @@
 
 use std::path::{Path, PathBuf};
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 fn crate_file(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
@@ -98,8 +102,8 @@ fn 実行拒否は一次シグナルの作業ゼロで門番している() {
     let call = src
         .find("detect_execution_refused")
         .expect("実行拒否の分類が dispatch から外れている（idle + delivered へ戻る）");
-    // 呼び出しの手前 1200 文字にゲートがあること
-    let before = &src[call.saturating_sub(1200)..call];
+    // 呼び出しの手前 1200 バイトにゲートがあること（始端は文字境界まで前へ広げる。#2043）
+    let before = byte_window::before(&src, call, 1200);
     assert!(
         before.contains("work_unobserved"),
         "実行拒否の分類が「一次シグナルで作業を 1 歩も観測していない」で門番されていない。\
@@ -135,7 +139,7 @@ fn 既存の送達ゲートを緩めていない() {
     let launch = src
         .find("detect_launch_failure")
         .expect("#983 の起動失敗の分類が消えている");
-    let before = &src[launch.saturating_sub(700)..launch];
+    let before = byte_window::before(&src, launch, 700);
     assert!(
         before.contains("never_delivered"),
         "#983 の分類が never_delivered ゲートの中から出ている"

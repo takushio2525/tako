@@ -35,6 +35,10 @@ use std::path::{Path, PathBuf};
 #[path = "common/production_range.rs"]
 mod production_range;
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 fn link_rs() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/claude_remote_link.rs")
 }
@@ -139,13 +143,13 @@ fn remote_link_の形は1実装だけが組む() {
             };
             let production = without_comments(&production_source(&text));
             // **代入だけを見る**（`&result["remote_link"]` のような読み出しは正当）。
-            // 値が次の行へ折り返すので、代入の直後 240 文字を窓にして `to_json` を探す
+            // 値が次の行へ折り返すので、代入の直後 240 バイトを窓にして `to_json` を探す
+            // （終端は文字境界まで後ろへ広げる。#2043）
             let mut from = 0usize;
             while let Some(rel) = production[from..].find("[\"remote_link\"] =") {
                 let at = from + rel;
                 from = at + 1;
-                let window_end = (at + 240).min(production.len());
-                let window = &production[at..window_end];
+                let window = byte_window::after(&production, at, 240);
                 if window.contains("to_json") {
                     continue;
                 }

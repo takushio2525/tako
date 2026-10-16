@@ -287,6 +287,7 @@ mod prompt_single_source {
             // 別種のプレースホルダを勝手に増やしていないこと
             let others: Vec<&str> = src
                 .match_indices("{{")
+                // 切り出し安全: i は `{{`（ASCII）を見つけた位置・+2 は `{{` / `}}` の幅
                 .map(|(i, _)| &src[i..src[i..].find("}}").map(|e| i + e + 2).unwrap_or(i + 2)])
                 .filter(|m| *m != PLACEHOLDER)
                 .collect();

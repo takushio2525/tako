@@ -16,6 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -85,12 +89,9 @@ fn 子プロセス不在の分岐は保持規則を通る() {
         .find("if !has_children {")
         .expect("has_children の前段ガードが見つからない（#368 の構造が変わった）");
     // 900 バイト目が多バイト文字（日本語のコメント）の途中に来ても落ちないよう、
-    // 文字境界まで戻して切る（#2020 で同じ区間の agent_resume_watchdog が踏んだ）
-    let mut end = (idx + 900).min(source.len());
-    while !source.is_char_boundary(end) {
-        end -= 1;
-    }
-    let block = &source[idx..end];
+    // 終端を文字境界まで後ろへ広げて切る（#2020 で同じ区間の agent_resume_watchdog が踏んだ。
+    // #2043 で共通の補助へ寄せた）
+    let block = byte_window::after(&source, idx, 900);
     assert!(
         block.contains("apply_claude_resume_sessions(&[])"),
         "has_children が false の分岐が保持規則を通っていない（#1076）。\n\
