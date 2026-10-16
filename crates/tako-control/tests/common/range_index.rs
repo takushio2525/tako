@@ -9,6 +9,8 @@
 //! （バイト長と行番号が保たれるので `file:line` がそのまま使える）。字面から型は読めないので
 //! `Vec` / `&[u8]` のスライスも同じ形で拾う。番犬ごとの絞り方は [`RangeIndex`] の分類
 //! （[`RangeIndex::is_prefix`] = #1728 / [`RangeIndex::is_rounded`] と [`has_reason`] = #1746）で選ぶ。
+//! 番犬・テスト側の固定幅の窓（#2043 の `issue2043_byte_window_watchdog`）も同じ検出器を使い、
+//! `.get(a..b)` の範囲も [`get_ranges`] で数える。
 //! 規約は `.agent/conventions.md`「文字列をバイト位置で切らない」
 
 // 取り込む番犬ごとに使う関数が違う（片方しか使わないファイルがある）
@@ -92,6 +94,61 @@ pub fn range_indexes(code: &str) -> Vec<RangeIndex> {
             inner: inner.to_string(),
         });
     }
+    hits
+}
+
+/// `.get(a..b)` / `.get_mut(a..b)` の範囲の引数を出現順に返す（#2043）。
+///
+/// 返す [`RangeIndex::open`] は**開き括弧 `(` の位置**で、`inner` は括弧の中身。
+/// 添字（[`range_indexes`]）と違って文字の途中でも panic せず `None` を返すが、
+/// 番犬の窓を `.get(…).unwrap_or("")` で取ると、端が文字の途中に来た日に**窓が空になって
+/// 番犬が黙って何も見なくなる**ので、固定幅の窓を見張る番犬は同じ規則で数える。
+/// 中身の最上位に `..` があり `,` / `;` が無いものだけ（`..` 単独は数えない）
+pub fn get_ranges(code: &str) -> Vec<RangeIndex> {
+    let bytes = code.as_bytes();
+    let mut hits = Vec::new();
+    for head in [".get(", ".get_mut("] {
+        for (at, _) in code.match_indices(head) {
+            let open = at + head.len() - 1;
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, &c) in bytes.iter().enumerate().skip(open) {
+                match c {
+                    b'[' | b'(' | b'{' => depth += 1,
+                    b']' | b')' | b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { continue };
+            let inner = &code[open + 1..close];
+            let mut nest = 0i32;
+            let mut top = String::new();
+            for c in inner.chars() {
+                match c {
+                    '[' | '(' | '{' => nest += 1,
+                    ']' | ')' | '}' => nest -= 1,
+                    _ if nest == 0 => top.push(c),
+                    _ => {}
+                }
+            }
+            if !top.contains("..") || top.contains(',') || top.contains(';') || inner.trim() == ".."
+            {
+                continue;
+            }
+            hits.push(RangeIndex {
+                open,
+                line: line_at(code, open),
+                inner: inner.to_string(),
+            });
+        }
+    }
+    hits.sort_by_key(|r| r.open);
     hits
 }
 
