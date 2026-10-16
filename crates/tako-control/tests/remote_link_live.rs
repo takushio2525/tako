@@ -16,6 +16,10 @@
 
 use tako_control::claude_remote_link::{self, LinkState};
 
+// 固定のバイト幅の窓は 1 実装（#2043）。形の違う URL の頭を出すときも端を文字境界へ
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 /// 実 transcript のパスを数本返す（**読み直しのコスト測定用**）
 fn sample_paths() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
@@ -121,7 +125,7 @@ fn 実transcriptで接続済みと未接続を言い分ける() {
         assert!(
             url.starts_with("https://claude.ai/code/session_"),
             "URL の形が違う（先頭 30 文字: {}）",
-            &url[..url.len().min(30)]
+            byte_window::head(url, 30)
         );
         let session_id = link.session_id.as_deref().expect("id が要る");
         assert!(session_id.starts_with("session_"), "互換形式になっていない");

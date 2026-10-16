@@ -24,6 +24,10 @@ use tako_control::orchestrator::{
     join_prompt_pieces, Profile, PromptMode, DEFAULT_SYSTEM_PROMPT, SOLO_SYSTEM_PROMPT,
 };
 
+// 固定のバイト幅の窓は 1 実装（#2043）。手順書は日本語なので、見出しの頭を切るときも端を文字境界へ
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 /// topic 名の正本（prompt の表・MCP の説明・この番犬が同じ 1 語を指す）
 const TOPIC: &str = "remote";
 
@@ -207,7 +211,7 @@ fn トリガーは手順を抱えず予算に収まっている() {
     for line in body.lines().map(str::trim).filter(|l| l.len() > 60) {
         for (label, prompt) in &prompts {
             if prompt.contains(line) {
-                inlined.push(format!("  [{label}] {}", &line[..line.len().min(80)]));
+                inlined.push(format!("  [{label}] {}", byte_window::head(line, 80)));
             }
         }
     }

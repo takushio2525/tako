@@ -23,6 +23,10 @@
 
 use std::path::{Path, PathBuf};
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -315,7 +319,7 @@ fn 合成イベントの修飾も1実装から組む() {
             if !body.contains("platform:") {
                 continue;
             }
-            let back = &src[at.saturating_sub(LOOKBACK)..at];
+            let back = byte_window::before(&src, at, LOOKBACK);
             if back.contains("Keystroke {") {
                 continue;
             }

@@ -30,6 +30,10 @@ use std::path::{Path, PathBuf};
 mod production_range;
 use production_range::code_view;
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 const APP: &str = "crates/tako-app/src/main.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const MCP_REQUEST: &str = "crates/tako-control/src/mcp/request.rs";
@@ -376,7 +380,7 @@ fn 状態はlistとreadに載りmcpとcliは同じ要求へ振り分ける() {
                  （MCP のツールは増やさず既存の引数で表す）"
             )
         });
-    let window = &mcp.text[persist..(persist + 400).min(mcp.text.len())];
+    let window = byte_window::after(&mcp.text, persist, 400);
     assert!(
         window.contains("Request::BackendReattach { pane }"),
         "{}:{} tako_persist の reattach が BackendReattach へ振り分けられていない",
@@ -390,7 +394,7 @@ fn 状態はlistとreadに載りmcpとcliは同じ要求へ振り分ける() {
         .unwrap_or_else(|| {
             panic!("{CLI}: tako persist reattach が無い（CLI から再 attach できない）")
         });
-    let window = &cli.text[at..(at + 400).min(cli.text.len())];
+    let window = byte_window::after(&cli.text, at, 400);
     assert!(
         window.contains("Request::BackendReattach"),
         "{}:{} tako persist reattach が BackendReattach へ振り分けられていない",

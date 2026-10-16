@@ -57,6 +57,10 @@ fn repo_root() -> PathBuf {
 #[path = "common/code_view.rs"]
 mod code_view;
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 /// **肯定の存在確認**（「この記録 / このラベルが在る」）が見る眺め = コメントを落とした本文。
 ///
 /// 全文へ `contains` すると、走査先の doc コメントに書いた同じ綴りで真になり、
@@ -245,7 +249,7 @@ fn 合計とペイン数の食い違いを黙らせない() {
         .nth(1)
         .unwrap_or_default();
     assert!(
-        call[..call.len().min(200)].contains("persist_diag("),
+        byte_window::head(call, 200).contains("persist_diag("),
         "食い違いを persist.log へ残していない（読めない診断は診断ではない）"
     );
 }

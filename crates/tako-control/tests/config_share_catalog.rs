@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 
 use tako_control::config_share::catalog::{self, Class, Root};
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -54,12 +58,8 @@ fn referenced_paths() -> BTreeSet<(Root, String)> {
                         continue;
                     }
                     // マーカー直後の限られた範囲だけを見る（無関係な join を拾わない）。
-                    // 日本語コメントを含むので、必ず char 境界で切る
-                    let mut end = text.len().min(at + 300);
-                    while end > at && !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    let window = &text[at..end];
+                    // 日本語コメントを含むので、終端を char 境界まで後ろへ広げて切る（#2043）
+                    let window = byte_window::after(&text, at, 300);
                     if let Some(name) = first_join_arg(window) {
                         out.insert((Root::TakoData, format!("{prefix}{name}")));
                     }
