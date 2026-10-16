@@ -9746,7 +9746,7 @@ fn dispatch_inner(
             host.sync_filetree();
 
             // Recent に記録
-            let mut recent = tako_core::recent::RecentList::load();
+            let mut recent = crate::data_files::load_recent();
             recent.push(tako_core::recent::RecentEntry::Directory {
                 path: dir.to_string_lossy().to_string(),
             });
@@ -9795,7 +9795,7 @@ fn dispatch_inner(
 
             // Recent への記録は 3 経路で共通（どの開き方でも「最近つないだ相手」）
             let record_recent = |host_name: &str| {
-                let mut recent = tako_core::recent::RecentList::load();
+                let mut recent = crate::data_files::load_recent();
                 recent.push(tako_core::recent::RecentEntry::Ssh {
                     host: host_name.to_string(),
                 });
@@ -9991,7 +9991,7 @@ fn dispatch_inner(
 
         Request::RecentItems { action } => match action.as_str() {
             "list" => {
-                let recent = tako_core::recent::RecentList::load();
+                let recent = crate::data_files::load_recent();
                 let entries: Vec<Value> = recent
                     .entries
                     .iter()
@@ -10000,7 +10000,7 @@ fn dispatch_inner(
                 Ok(json!({ "entries": entries }))
             }
             "clear" => {
-                let mut recent = tako_core::recent::RecentList::load();
+                let mut recent = crate::data_files::load_recent();
                 recent.clear();
                 recent.save();
                 Ok(json!({ "cleared": true }))
@@ -19021,12 +19021,12 @@ pub fn dispatch_remote_shortcuts(
         .unwrap_or(0);
 
     match action {
-        "list" => Ok(listing(&ShortcutsFile::load())),
+        "list" => Ok(listing(&crate::data_files::load_remote_shortcuts())),
         "add" => {
             let target = path.ok_or_else(|| {
                 DispatchError::InvalidParams("add には path が必要（絶対パス）".to_string())
             })?;
-            let mut file = ShortcutsFile::load();
+            let mut file = crate::data_files::load_remote_shortcuts();
             let added = file
                 .add(std::path::Path::new(target), name, now)
                 .map_err(|e| DispatchError::Operation(e.message_ja()))?;
@@ -19040,7 +19040,7 @@ pub fn dispatch_remote_shortcuts(
             let key = path.ok_or_else(|| {
                 DispatchError::InvalidParams("remove には path が必要（id でも可）".to_string())
             })?;
-            let mut file = ShortcutsFile::load();
+            let mut file = crate::data_files::load_remote_shortcuts();
             let removed = file
                 .remove(key, home.as_deref())
                 .map_err(|e| DispatchError::Operation(e.message_ja()))?;

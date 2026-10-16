@@ -1404,32 +1404,58 @@ fn record(report: &MigrationReport, origin: &str) {
                 quarantine,
                 reason,
                 evicted,
-            } => {
-                let mut where_to = match quarantine {
-                    Some(dest) => format!("退避 {}", dest.display()),
-                    None => "退避しない種別".to_string(),
-                };
-                if *evicted {
-                    where_to.push('・');
-                    where_to.push_str(&migration::eviction_note());
-                }
-                crate::diag::persist_log(&format!(
-                    "移行できず: {} {}（{reason}・{where_to}・発生源 {origin}）",
-                    file.id.as_str(),
-                    file.path.display()
-                ))
-            }
+            } => crate::diag::persist_log(&unreadable_line(
+                file.id,
+                &file.path,
+                reason,
+                quarantine.as_deref(),
+                *evicted,
+                "退避しない種別",
+                origin,
+            )),
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
-                crate::diag::persist_log(&format!(
-                    "移行を中止: {} {}（{reason}・発生源 {origin}）",
-                    file.id.as_str(),
-                    file.path.display()
-                ))
+                crate::diag::persist_log(&aborted_line(file.id, &file.path, reason, origin))
             }
             // 案（#1981）は自動の発火点では出ない・書かない
             FileOutcome::Absent | FileOutcome::UpToDate { .. } | FileOutcome::Proposed { .. } => {}
         }
     }
+}
+
+/// 「移行できず」の 1 行。移行の記録と、読み手が既定値へ落とした記録（`data_files`。#1824）が
+/// **同じ形**を使う（persist.log を種別やパスで grep すれば両方が並ぶ）。
+/// `no_quarantine` は退避先が無いときの言い方（移行 = 退避しない種別 / 読み手 = 写せなかった）
+pub(crate) fn unreadable_line(
+    id: SchemaId,
+    path: &Path,
+    reason: &str,
+    quarantine: Option<&Path>,
+    evicted: bool,
+    no_quarantine: &str,
+    origin: &str,
+) -> String {
+    let mut where_to = match quarantine {
+        Some(dest) => format!("退避 {}", dest.display()),
+        None => no_quarantine.to_string(),
+    };
+    if evicted {
+        where_to.push('・');
+        where_to.push_str(&migration::eviction_note());
+    }
+    format!(
+        "移行できず: {} {}（{reason}・{where_to}・発生源 {origin}）",
+        id.as_str(),
+        path.display()
+    )
+}
+
+/// 「移行を中止」の 1 行（読み取り自体に失敗したときも、移行と読み手が同じ形を使う。#1824）
+pub(crate) fn aborted_line(id: SchemaId, path: &Path, reason: &str, origin: &str) -> String {
+    format!(
+        "移行を中止: {} {}（{reason}・発生源 {origin}）",
+        id.as_str(),
+        path.display()
+    )
 }
 
 /// 実行時発火の枠を取る。**最初の 1 回だけ true**。

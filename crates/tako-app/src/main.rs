@@ -4747,17 +4747,9 @@ impl TakoApp {
                     let msg = if e == tako_control::layout::LayoutError::NotFound {
                         format!("復元なし: {e}")
                     } else {
-                        let stashed = tako_control::layout::layout_path()
-                            .map(|p| std::fs::rename(&p, p.with_extension("json.corrupt")).is_ok())
-                            .unwrap_or(false);
-                        let msg = format!(
-                            "復元失敗: {e}{}",
-                            if stashed {
-                                "（layout.json.corrupt へ退避）"
-                            } else {
-                                ""
-                            }
-                        );
+                        // 壊れた layout.json は番号付きの退避へ（#1824。前回の退避を上書きしない・
+                        // 起動時の移行を先に通したかに頼らない）
+                        let msg = tako_control::layout::stash_after_failed_restore(&e);
                         tako_control::telemetry::report_critical(
                             tako_control::telemetry::ErrorKind::RestoreFailed,
                             &msg,
@@ -13197,7 +13189,7 @@ impl TakoApp {
     }
 
     fn open_recent_palette(&mut self, cx: &mut Context<Self>) {
-        let recent = tako_core::recent::RecentList::load();
+        let recent = tako_control::data_files::load_recent();
         self.command_palette = Some(CommandPalette {
             query: String::new(),
             selected: 0,
@@ -14413,7 +14405,7 @@ impl TakoApp {
         entry_kind: tako_core::recent::RecentEntry,
         cx: &mut Context<Self>,
     ) {
-        use tako_core::recent::{RecentEntry, RecentList};
+        use tako_core::recent::RecentEntry;
 
         // 解決は境界（B26）を通す。ここは GUI の「フォルダ / リポジトリを開く」と
         // 最近使った項目の入口で、値はペインの起動 cwd・タブ名・recent.json へ入る（#970）
@@ -14447,7 +14439,7 @@ impl TakoApp {
             RecentEntry::Repository { .. } => RecentEntry::Repository { path: path_str },
             _ => RecentEntry::Directory { path: path_str },
         };
-        let mut recent = RecentList::load();
+        let mut recent = tako_control::data_files::load_recent();
         recent.push(recent_entry);
         recent.save();
 

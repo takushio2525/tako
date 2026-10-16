@@ -1388,7 +1388,10 @@ pub fn load_file(path: &Path) -> Result<LayoutFile, LayoutError> {
             LayoutError::Io(e.to_string())
         }
     })?;
-    serde_json::from_str(&json).map_err(|e| LayoutError::Parse(e.to_string()))
+    // 理由は種類と位置だけ（serde の素の文言は読んだ値 = タブ名やパスを含み、復元失敗の行は
+    // persist.log とテレメトリへ出る。#1824）
+    serde_json::from_str(&json)
+        .map_err(|e| LayoutError::Parse(tako_core::load_issue::json_reason(&e)))
 }
 
 /// 書き出し（tmp + rename。settings と同方式）。
@@ -1432,6 +1435,84 @@ pub fn snapshot_good() {
     if let Err(e) = std::fs::copy(&path, &good) {
         eprintln!("warning: 良品スナップショット（layout.json.good）の作成に失敗: {e}");
     }
+}
+
+/// 起動時の復元が不在以外の理由で失敗したときの後始末（GUI の main の 1 か所が呼ぶ）。
+/// layout.json を [`stash_unrestorable`] で退避し、persist.log / テレメトリへ出す 1 行を返す
+pub fn stash_after_failed_restore(e: &LayoutError) -> String {
+    let stashed = layout_path().and_then(|p| stash_unrestorable(&p));
+    restore_failed_message(e, stashed.as_ref())
+}
+
+/// [`stash_unrestorable`] が今回の中身を残した場所
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stashed {
+    pub path: PathBuf,
+    /// 退避が上限に達していたので最も古い中身（2 本目）を押し出したか
+    pub evicted: bool,
+}
+
+/// 復元に使えなかった layout.json を退避して表から外す（#1824）。
+///
+/// 以前は `layout.json.corrupt` へ rename していたので、壊れた layout を開くたびに前回の
+/// `.corrupt` を上書きして消していた。起動時の移行（`migrations::ensure_migrated`）が先に
+/// 番号付きの退避へ写していたので中身は残っていたが、それは呼び出し順に頼った保全だった。
+/// ここは自分で退避の口（`migration::quarantine_unreadable`）を通すので、移行を先に
+/// 通らない呼び順でも残る:
+///
+/// 1. 中身を番号付きの退避（`layout.json.unreadable[.<n>].bak`）へ写す。同じ中身の退避が
+///    既にあれば写さない（壊れたまま何度起動しても本数が増えない）
+/// 2. 1 が写せない（UTF-8 でない・権限で読めない・空きはあるのに書けない）中身は、**バイトのまま**
+///    空いている番号へ rename する。捨てると次の保存（tmp → rename）がその中身を消す
+/// 3. 残せたら layout.json を表から外す（従来の rename と同じく、次の起動で同じ破損を読み直さない）
+///
+/// どれも残せなければ何もしない（layout.json はそのまま = 消える経路を作らない）
+pub fn stash_unrestorable(path: &Path) -> Option<Stashed> {
+    if crate::data_files::legacy() {
+        let dest = path.with_extension("json.corrupt");
+        return std::fs::rename(path, &dest).ok().map(|()| Stashed {
+            path: dest,
+            evicted: false,
+        });
+    }
+    if let Some(q) = tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo)
+    {
+        if let Err(e) = std::fs::remove_file(path) {
+            eprintln!(
+                "warning: 退避した layout.json を外せない（次の起動でも同じ中身を読む）: {e}"
+            );
+        }
+        return Some(Stashed {
+            path: q.path,
+            evicted: q.evicted,
+        });
+    }
+    let free = (1..=tako_core::migration::QUARANTINE_LIMIT)
+        .map(|n| tako_core::migration::quarantine_slot_path(path, n))
+        .find(|slot| std::fs::symlink_metadata(slot).is_err())?;
+    std::fs::rename(path, &free).ok().map(|()| Stashed {
+        path: free,
+        evicted: false,
+    })
+}
+
+/// 復元失敗の 1 行（persist.log と、有効ならテレメトリへも出る）。
+/// **退避先はファイル名だけ**を載せる（テレメトリへホームのパスを送らない）
+pub fn restore_failed_message(e: &LayoutError, stashed: Option<&Stashed>) -> String {
+    let Some(stashed) = stashed else {
+        return format!("復元失敗: {e}");
+    };
+    let name = stashed
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let evicted = if stashed.evicted {
+        format!("・{}", tako_core::migration::eviction_note())
+    } else {
+        String::new()
+    };
+    format!("復元失敗: {e}（{name} へ退避{evicted}）")
 }
 
 /// 縮退保存とみなすしきい値: 直前 4 ペイン以上から半分未満へ減る保存。
@@ -2801,5 +2882,153 @@ mod tests {
         let bg_restored = restored_panes.iter().find(|p| p.preview.is_some()).unwrap();
         assert_eq!(bg_restored.preview.as_ref().unwrap().path, "/tmp/test.md");
         assert_eq!(bg_restored.preview.as_ref().unwrap().mode, "markdown");
+    }
+
+    /// #1824 のテスト用の一時 dir（**本番の data dir に触れない**）
+    fn stash_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tako-layout-1824-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.starts_with(std::env::temp_dir()), "一時 dir の中だけ");
+        dir
+    }
+
+    /// #1824: 壊れた layout.json を 2 回続けて開いても 1 回目の中身が残る。
+    /// **起動時の移行（ensure_migrated）を先に通さない**呼び順で確かめる
+    #[test]
+    fn 壊れたlayoutを二回開いても一回目の中身が残る() {
+        let dir = stash_dir("twice");
+        let path = dir.join("layout.json");
+        for (k, body) in ["{ \"version\": 1, \"tabs\": [ \"A\"\n", ""]
+            .iter()
+            .enumerate()
+        {
+            std::fs::write(&path, body).unwrap();
+            assert!(load_file(&path).is_err());
+            let stashed = stash_unrestorable(&path).expect("退避できる");
+            assert_eq!(
+                stashed.path,
+                tako_core::migration::quarantine_slot_path(&path, k + 1)
+            );
+            assert!(!path.exists(), "退避したら表から外す");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("layout.json.unreadable.bak")).unwrap(),
+            "{ \"version\": 1, \"tabs\": [ \"A\"\n",
+            "1 回目の中身が残る"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("layout.json.unreadable.2.bak")).unwrap(),
+            ""
+        );
+        assert!(!dir.join("layout.json.corrupt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同じ中身で壊れたまま何度起動しても退避の本数は増えない（表からは外す）
+    #[test]
+    fn 同じ中身の破損は退避を増やさない() {
+        let dir = stash_dir("same");
+        let path = dir.join("layout.json");
+        for _ in 0..3 {
+            std::fs::write(&path, "{ \"tabs\": [] }").unwrap();
+            let stashed = stash_unrestorable(&path).expect("退避できる");
+            assert_eq!(stashed.path, dir.join("layout.json.unreadable.bak"));
+            assert!(!path.exists());
+        }
+        assert!(!dir.join("layout.json.unreadable.2.bak").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文字として読めない中身（UTF-8 でない）は写せないので、バイトのまま空きの番号へ移す
+    /// （以前の `.corrupt` の rename が残していた中身を、ここで落とさない）
+    #[test]
+    fn utf8でない中身はバイトのまま退避する() {
+        let dir = stash_dir("bytes");
+        let path = dir.join("layout.json");
+        std::fs::write(&path, "{}").unwrap();
+        stash_unrestorable(&path).expect("1 本目");
+        let bytes = [0xff_u8, 0xfe, b'{', 0x00];
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(load_file(&path), Err(LayoutError::Io(_))));
+        let stashed = stash_unrestorable(&path).expect("退避できる");
+        assert_eq!(stashed.path, dir.join("layout.json.unreadable.2.bak"));
+        assert_eq!(std::fs::read(&stashed.path).unwrap(), bytes);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 権限で読めない layout.json も消さずに退避へ移す（次の保存の rename で上書きされない）
+    #[cfg(unix)]
+    #[test]
+    fn 権限で読めない中身も残す() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = stash_dir("perm");
+        let path = dir.join("layout.json");
+        std::fs::write(&path, "{\"version\": 1}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // root で走ると権限を落としても読める（確かめる対象が無い）
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let stashed = stash_unrestorable(&path).expect("退避できる");
+        assert_eq!(stashed.path, dir.join("layout.json.unreadable.bak"));
+        assert!(!path.exists());
+        std::fs::set_permissions(&stashed.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stashed.path).unwrap(),
+            "{\"version\": 1}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// どこにも残せないときは layout.json に触らない（消える経路を作らない）
+    #[test]
+    fn 残せないときは触らない() {
+        let dir = stash_dir("full");
+        let path = dir.join("layout.json");
+        for n in 1..=tako_core::migration::QUARANTINE_LIMIT {
+            std::fs::write(
+                tako_core::migration::quarantine_slot_path(&path, n),
+                [0xff_u8, n as u8],
+            )
+            .unwrap();
+        }
+        let bytes = [0xff_u8, 0xee];
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(stash_unrestorable(&path), None);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "元のまま");
+        assert_eq!(stash_unrestorable(&dir.join("absent.json")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 復元失敗の 1 行は退避先のファイル名だけを載せる（テレメトリへホームのパスを出さない）
+    #[test]
+    fn 復元失敗の行はファイル名だけを載せる() {
+        let e = LayoutError::Parse("EOF".into());
+        let stashed = Stashed {
+            path: PathBuf::from("/private/tmp/x/layout.json.unreadable.2.bak"),
+            evicted: false,
+        };
+        assert_eq!(
+            restore_failed_message(&e, Some(&stashed)),
+            "復元失敗: レイアウトファイルを解釈できない（破損）: EOF（layout.json.unreadable.2.bak へ退避）"
+        );
+        assert_eq!(
+            restore_failed_message(&e, None),
+            "復元失敗: レイアウトファイルを解釈できない（破損）: EOF"
+        );
+        let evicted = Stashed {
+            evicted: true,
+            ..stashed
+        };
+        assert!(
+            restore_failed_message(&e, Some(&evicted)).ends_with(&format!(
+                "へ退避・{}）",
+                tako_core::migration::eviction_note()
+            ))
+        );
     }
 }

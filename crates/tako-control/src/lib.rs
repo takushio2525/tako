@@ -47,6 +47,7 @@ pub mod codex_session;
 pub mod config_io;
 pub mod config_share;
 pub mod context_budget;
+pub mod data_files;
 pub mod delivery;
 pub mod diag;
 pub mod diagnostics;

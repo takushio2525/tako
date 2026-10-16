@@ -2063,7 +2063,7 @@ pub fn handle_files_request(
 // あって読める範囲を広げないが、**絶対パスは画面に映らない在庫情報**なので、
 // 全体閲覧ができない端末へ配らない。
 
-use tako_core::remote_shortcuts::{Shortcut, ShortcutError, ShortcutsFile};
+use tako_core::remote_shortcuts::{Shortcut, ShortcutError};
 
 /// ショートカットの絶対パスを「どのルートの・どの相対パスか」へ解決する。
 ///
@@ -2136,7 +2136,7 @@ fn read_shortcuts(deps: &FilesDeps) -> (u16, Value) {
         Ok(r) => r,
         Err(e) => return app_unreachable(&e),
     };
-    let file = ShortcutsFile::load();
+    let file = crate::data_files::load_remote_shortcuts();
     let list = file.listing(tako_core::paths::home_dir().as_deref());
     let items: Vec<Value> = list.iter().map(|s| shortcut_json(s, &roots)).collect();
     (deps.audit)("files", audit_payload("shortcuts", 0, items.len()));
@@ -2165,7 +2165,7 @@ fn add_shortcut(deps: &FilesDeps, body: &Value) -> (u16, Value) {
         Ok(r) => r,
         Err(e) => return app_unreachable(&e),
     };
-    let mut file = ShortcutsFile::load();
+    let mut file = crate::data_files::load_remote_shortcuts();
     let added = match file.add(Path::new(path), name, now_secs()) {
         Ok(s) => s,
         Err(e) => return shortcut_failure(e),
@@ -2189,7 +2189,7 @@ fn remove_shortcut(deps: &FilesDeps, id: Option<&str>) -> (u16, Value) {
     let Some(key) = id.filter(|s| !s.is_empty()) else {
         return shortcut_failure(ShortcutError::UnknownShortcut);
     };
-    let mut file = ShortcutsFile::load();
+    let mut file = crate::data_files::load_remote_shortcuts();
     let removed = match file.remove(key, tako_core::paths::home_dir().as_deref()) {
         Ok(s) => s,
         Err(e) => return shortcut_failure(e),
