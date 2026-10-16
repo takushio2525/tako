@@ -2582,7 +2582,18 @@ mod tests {
     /// 使い捨てリポジトリを作るヘルパ（#496）。**実リポジトリは絶対に触らない**
     struct TempRepo {
         dir: std::path::PathBuf,
+        /// 固定の時計（#2164）。`Some` なら `git()` を呼ぶたびに 1 分ずつ進めた過去の時刻を
+        /// author / committer の日時として渡す（`None` = git が「いま」を使う）
+        clock: Option<std::cell::Cell<i64>>,
     }
+
+    /// 固定の時計（#2164）の author の起点（2001-09-09T01:46:40Z）
+    const FIXED_AUTHOR_EPOCH: i64 = 1_000_000_000;
+
+    /// 固定の時計（#2164）の committer の起点（2011-03-13T07:06:40Z）。author と相対表記が別になる
+    /// （2026-10 の実測: author「25 years ago」/ committer「16 years ago」）ので、片方だけ
+    /// `%ar` と `%cr` を取り違えた回帰も比較で落ちる
+    const FIXED_COMMITTER_EPOCH: i64 = 1_300_000_000;
 
     impl TempRepo {
         fn new(tag: &str) -> Self {
@@ -2594,7 +2605,7 @@ mod tests {
                 std::env::temp_dir().join(format!("tako-git-496-{tag}-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("mkdir");
-            let repo = TempRepo { dir };
+            let repo = TempRepo { dir, clock: None };
             repo.git(&["init", "-q", "-b", "main"]);
             // **リポジトリの config へ書く**（#1278）。下の `git()` は env で identity を
             // 渡すが、**製品の関数（`merge` / `checkout` 等）が起こす git には届かない**。
@@ -2612,22 +2623,42 @@ mod tests {
             repo
         }
 
+        /// コミットの日時を過去の固定時刻にする版（#2164）。`git log` の相対表記（`%cr`）が
+        /// 「N years ago」になり、2 回の呼び出しが秒の境目をまたいでも変わらない
+        fn with_fixed_clock(tag: &str) -> Self {
+            let mut repo = Self::new(tag);
+            repo.clock = Some(std::cell::Cell::new(0));
+            repo
+        }
+
         fn path(&self) -> &Path {
             &self.dir
         }
 
         fn git(&self, args: &[&str]) -> String {
-            let out = std::process::Command::new("git")
-                .args(args)
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args)
                 .current_dir(&self.dir)
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@example.com")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@example.com")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .expect("git");
+                .env("GIT_CONFIG_SYSTEM", "/dev/null");
+            if let Some(clock) = &self.clock {
+                // 1 分ずつ進める（コミットの新旧の順を日時でも保つ）
+                let minutes = clock.get();
+                clock.set(minutes + 1);
+                cmd.env(
+                    "GIT_AUTHOR_DATE",
+                    format!("@{} +0000", FIXED_AUTHOR_EPOCH + minutes * 60),
+                )
+                .env(
+                    "GIT_COMMITTER_DATE",
+                    format!("@{} +0000", FIXED_COMMITTER_EPOCH + minutes * 60),
+                );
+            }
+            let out = cmd.output().expect("git");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 
@@ -2663,11 +2694,28 @@ mod tests {
 
     // ──────────────── プレビューの変更履歴（#2014）────────────────
 
+    /// 注入（#2164）: `file_history` と従来の 2 段の `git log` のあいだを空けるミリ秒
+    /// （2 回が秒の境目をまたぐ順序の再現。CI の Windows で踏んだ形）
+    const INJECT_GAP_2164_ENV: &str = "TAKO_2164_INJECT_GAP_MS";
+
+    /// A/B（#2164）: 修正前のコミットの作り方（日時 = git が見た「いま」）へ戻す
+    const LEGACY_2164_ENV: &str = "TAKO_2164_LEGACY";
+
     /// 上限つきの 1 実装が、従来の 2 段（`repo_root` → `log_file_commits`）と同じ履歴を返す（A/B）。
-    /// リネームを越えて辿る（`--follow`）ことも同じ
+    /// リネームを越えて辿る（`--follow`）ことも同じ。
+    ///
+    /// コミットの日時は過去の固定時刻（#2164）。比べる `GitCommit` は git が「いま」から数える
+    /// 相対表記（`date_relative`）を含むので、作った直後のコミットでは 2 回の `git log` が秒の
+    /// 境目をまたぐと「0 seconds ago」と「1 second ago」で食い違う。比較から外さないのは、
+    /// 2 段が相対表記を同じに作ることも「従来と同じ履歴」の一部だから。
+    /// `TAKO_2164_INJECT_GAP_MS=1000` で 2 回のあいだを空けても通る（`TAKO_2164_LEGACY=1` は落ちる）
     #[test]
     fn file_historyは従来の2段と同じ履歴を返す() {
-        let repo = TempRepo::new("2014");
+        let repo = if std::env::var(LEGACY_2164_ENV).is_ok_and(|v| v == "1") {
+            TempRepo::new("2014")
+        } else {
+            TempRepo::with_fixed_clock("2014")
+        };
         repo.commit("a.txt", "1\n", "one");
         repo.commit("a.txt", "1\n2\n", "two");
         repo.git(&["mv", "a.txt", "b.txt"]);
@@ -2675,10 +2723,27 @@ mod tests {
         repo.commit("b.txt", "1\n2\n3\n", "three");
         // macOS の一時 dir は symlink（/var → /private/var）。git が返す実パスから組む
         let root = repo_root(repo.path()).expect("リポジトリ");
+        if repo.clock.is_some() {
+            // 時計が効いていなければ相対表記が秒で動き、下の比較が間欠的に落ちる形へ戻る
+            let ct: i64 = repo
+                .git(&["log", "-1", "--format=%ct"])
+                .parse()
+                .expect("コミット時刻");
+            assert!(
+                ct < FIXED_COMMITTER_EPOCH + 3600,
+                "固定の時計が効いていない: {ct}"
+            );
+        }
         let file = root.join("b.txt");
         let history = file_history(&file, 50, DEFAULT_CHANGELOG_TIMEOUT).expect("上限内に終わる");
         assert_eq!(history.repo_root.as_deref(), Some(root.as_path()));
         assert_eq!(history.rel_path.as_deref(), Some("b.txt"));
+        if let Some(ms) = std::env::var(INJECT_GAP_2164_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         assert_eq!(history.commits, log_file_commits(&root, "b.txt", 50));
         let subjects: Vec<&str> = history.commits.iter().map(|c| c.subject.as_str()).collect();
         assert_eq!(subjects, ["three", "rename", "two", "one"]);
