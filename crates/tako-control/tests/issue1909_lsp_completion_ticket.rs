@@ -17,7 +17,9 @@
 //!
 //! 順序は実時間に任せない: 「背景が走り出す前に取り消す」はテストの手で順に呼ぶか、背景の走り出しを
 //! 合図のファイルまで止める注入（`TAKO_1909_INJECT_HOLD`）で作る。読み込みの終わりは
-//! `common/lsp_fake_e2e.rs`（#1922）の合図で決める。env を触るので、このファイルのテストは 1 本ずつ。
+//! `common/lsp_fake_e2e.rs`（#1922）の合図で決める。サーバへ届いた数は、manager が「送った」直後に
+//! 数えず `wait_received` で偽サーバのログに載るのを待ってから数える（#2163）。env を触るので、
+//! このファイルのテストは 1 本ずつ。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -265,6 +267,9 @@ fn 答えない間に閉じた要求は待ちの表に残らない() {
     assert_eq!(waiting.join().unwrap(), Err(CompletionError::Superseded));
     assert_eq!(pending(&manager), 0, "取り消した要求は待ちの表に残らない");
     assert_eq!(inflight(&manager, "completion"), 0);
+    // 待ち手は `$/cancelRequest` を送り口へ積む前に起こされる = 偽サーバがログへ書く前にここへ
+    // 着くことがある（#2163。macOS の CI で 0 件と数えて落ちた）。届いたのを待ってから数える
+    lsp_fake_e2e::wait_received(&scratch.log(), "$/cancelRequest", 1);
     assert_eq!(
         received(&scratch, "$/cancelRequest"),
         1,
