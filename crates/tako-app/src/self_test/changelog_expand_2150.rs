@@ -258,7 +258,9 @@ pub(super) async fn changelog_expand_visual(
     })
     .await;
     let folded = window
-        .update(cx, |app: &mut TakoApp, _, _| expanded(app, pane, &hash).is_none())
+        .update(cx, |app: &mut TakoApp, _, _| {
+            expanded(app, pane, &hash).is_none()
+        })
         .unwrap_or(false);
 
     println!(
