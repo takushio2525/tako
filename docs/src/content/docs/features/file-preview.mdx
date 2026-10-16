@@ -421,7 +421,10 @@ tako run-config script.py --args "--verbose data.csv"   # 引数（コマンド�
 tako run-config script.py --env APP_ENV=dev             # 環境変数（--unset-env APP_ENV で消す）
 tako run-config script.py --cwd ..                      # 作業ディレクトリ（相対はファイルの場所から）
 tako run-config script.py --before "make build"         # 実行前コマンド（失敗したら本体は走らない）
+tako run-config script.py --target new                  # 実行先（毎回新しいペイン。reuse で同じペインへ戻す）
 ```
+
+実行先は、再生ボタンを押すたびに同じペインで走らせ直す（既定）か、毎回新しいペインに分けるかを覚えます。実行ボタン横のメニューの「実行先」からも切り替えられます。一回だけ新しいペインで走らせたいときは `tako run --new-pane` が覚えた値より優先されます。
 
 ## AI からの操作
 

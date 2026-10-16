@@ -10330,7 +10330,10 @@ fn dispatch_inner(
                 path: resolved.clone(),
                 profile: plan.profile.clone(),
             };
-            let reuse = if new_pane.unwrap_or(false) || tako_core::run_pane::legacy_1657() {
+            // #1734: 省略時は保存した実行先（`tako run-config --target`）に従う。一回限りの
+            // `new_pane`（CLI `--new-pane` / MCP）は `false` でも保存値より勝つ
+            let new_pane = saved.new_pane(new_pane);
+            let reuse = if new_pane || tako_core::run_pane::legacy_1657() {
                 None
             } else {
                 find_run_pane(host.workspace(), tab_id, &key)
@@ -10392,6 +10395,9 @@ fn dispatch_inner(
                 // 前の実行がまだ終わっていなかったか（= 止めて走らせ直した）
                 "reused_from": reuse.map(|p| p.as_u64()),
                 "stopped_running": stopped_running,
+                // #1734: 実行先の判断（`new` = 分割した / `reuse` = 使い回す側。使い回せる実行ペインが
+                // 無ければ `reuse` でも `reused_from` は null）。出典は `config_sources.target`
+                "target": if new_pane { "new" } else { "reuse" },
                 // #1662: 走らせる前に保存したプレビュー（未保存の編集が無ければ空）
                 "saved_panes": saved_panes.iter().map(|p| p.as_u64()).collect::<Vec<_>>(),
                 // #1730: 走らせた実行環境（無い拡張子・A/B 中は null）と、項目ごとの出典
@@ -10433,6 +10439,7 @@ fn dispatch_inner(
             before,
             board,
             port,
+            target,
         } => {
             // #1731: `path` = そのファイル / プロジェクトの実行設定（`ext` = 拡張子既定とは排他）
             if let Some(path) = path {
@@ -10459,6 +10466,7 @@ fn dispatch_inner(
                         cwd: cwd.as_deref(),
                         before: before.as_deref(),
                         env: env.as_ref(),
+                        target: target.as_deref(),
                     },
                     crate::sketch_board::BoardEdit {
                         board: board.as_deref(),
@@ -10478,10 +10486,11 @@ fn dispatch_inner(
                 || before.is_some()
                 || board.is_some()
                 || port.is_some()
+                || target.is_some()
             {
                 return Err(DispatchError::InvalidParams(
-                    "scope / profile / runtime / reset / args / env / cwd / before / board / port は \
-                     path（対象ファイル）と一緒に渡す"
+                    "scope / profile / runtime / reset / args / env / cwd / before / board / port / \
+                     target は path（対象ファイル）と一緒に渡す"
                         .into(),
                 ));
             }
@@ -10996,6 +11005,7 @@ impl RunConfigSketchJob {
             before,
             board,
             port,
+            target,
             ..
         } = self.request
         else {
@@ -11021,6 +11031,7 @@ impl RunConfigSketchJob {
                 cwd: cwd.as_deref(),
                 before: before.as_deref(),
                 env: env.as_ref(),
+                target: target.as_deref(),
             },
             crate::sketch_board::BoardEdit {
                 board: board.as_deref(),
@@ -41996,6 +42007,7 @@ mod tests {
                 before: Some("make build".into()),
                 board: None,
                 port: None,
+                target: None,
             },
             PaneOrigin::Mcp,
         )
@@ -42326,6 +42338,93 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap()
+    }
+
+    /// #1734: 実行先を `RunnerDefaults { path, target }` で保存する（`reset` で既定へ戻す）
+    fn issue1734_save_target(
+        host: &mut MockHost,
+        file: &std::path::Path,
+        target: Option<&str>,
+        reset: bool,
+    ) -> Value {
+        let mut req = Request::runner_ext_defaults(None, None, false);
+        if let Request::RunnerDefaults {
+            path,
+            target: t,
+            reset: r,
+            ..
+        } = &mut req
+        {
+            *path = Some(file.display().to_string());
+            *t = target.map(str::to_string);
+            *r = reset.then(|| vec!["target".to_string()]);
+        }
+        dispatch(host, req, PaneOrigin::Mcp).unwrap()
+    }
+
+    /// #1734 の受け入れ条件: 保存した実行先が `new` なら `Run`（再生ボタン / `tako run` の同じ経路）
+    /// 2 回でペインが 2 枚増え、`reuse` なら 1 枚のまま。一回限りの `new_pane` は `false` でも
+    /// `true` でも保存値より勝つ
+    #[test]
+    fn issue1734_保存した実行先で分割と使い回しが決まり一回限りの指定が勝つ() {
+        let (dir, file) = issue1657_target("target-1734", "a.sh");
+        let mut host = MockHost::new();
+        let root = host.ws.active_tab().tree().focused();
+        let panes = |host: &MockHost| host.ws.active_tab().tree().panes().len();
+
+        let saved = issue1734_save_target(&mut host, &file, Some("new"), false);
+        assert_eq!(
+            saved["config"]["target"],
+            json!({ "value": "new", "source": "file" }),
+            "{saved}"
+        );
+        for i in 1..=2 {
+            let v = issue1657_run(&mut host, &file, root, None, None);
+            assert_eq!(panes(&host), 1 + i, "{i} 回目で分割していない: {v}");
+            assert_eq!(v["reused_from"], Value::Null, "{v}");
+            assert_eq!(v["target"], "new", "{v}");
+            assert_eq!(v["config_sources"]["target"], "file", "{v}");
+        }
+        // 一回限りの `new_pane: false` が保存の new より勝つ = 使い回す
+        let v = issue1657_run(&mut host, &file, root, None, Some(false));
+        assert_eq!(panes(&host), 3, "{v}");
+        assert!(v["reused_from"].as_u64().is_some(), "{v}");
+        assert_eq!(v["target"], "reuse", "{v}");
+
+        // reuse を保存 → 2 回押しても増えない
+        issue1734_save_target(&mut host, &file, Some("reuse"), false);
+        for _ in 0..2 {
+            let v = issue1657_run(&mut host, &file, root, None, None);
+            assert_eq!(panes(&host), 3, "{v}");
+            assert!(v["reused_from"].as_u64().is_some(), "{v}");
+        }
+        // 一回限りの `new_pane: true` が保存の reuse より勝つ
+        let v = issue1657_run(&mut host, &file, root, None, Some(true));
+        assert_eq!(panes(&host), 4, "{v}");
+        assert_eq!(v["reused_from"], Value::Null, "{v}");
+
+        // 既定へ戻すと #1657 の既定（使い回す）
+        let back = issue1734_save_target(&mut host, &file, None, true);
+        assert_eq!(back["config"]["target"]["source"], "default", "{back}");
+        let v = issue1657_run(&mut host, &file, root, None, None);
+        assert_eq!(panes(&host), 4, "{v}");
+        assert_eq!(v["config_sources"]["target"], "default", "{v}");
+
+        // 正本に無い語・path の無い target は断る
+        let mut bad = Request::runner_ext_defaults(None, None, false);
+        if let Request::RunnerDefaults { path, target, .. } = &mut bad {
+            *path = Some(file.display().to_string());
+            *target = Some("tab".into());
+        }
+        let e = dispatch(&mut host, bad, PaneOrigin::Mcp).unwrap_err();
+        assert!(matches!(e, DispatchError::InvalidParams(_)), "{e:?}");
+        let mut no_path = Request::runner_ext_defaults(None, None, false);
+        if let Request::RunnerDefaults { target, .. } = &mut no_path {
+            *target = Some("new".into());
+        }
+        let e = dispatch(&mut host, no_path, PaneOrigin::Mcp).unwrap_err();
+        assert!(e.to_string().contains("target"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 受け入れ条件 1: 同じファイルを 5 回走らせても実行ペインは 1 枚のまま

@@ -109,6 +109,17 @@ pub fn run_menu_before() -> &'static str {
 pub fn run_menu_unset() -> &'static str {
     tr!("未設定", "Not set")
 }
+/// 実行先の行の名前（#1734）
+pub fn run_menu_target() -> &'static str {
+    tr!("実行先", "Run in")
+}
+/// 実行先の選択肢（#1734。`reuse` = 同じペインで再実行 / `new` = 毎回新しいペイン）
+pub fn run_menu_target_choice(t: tako_core::runner_config::RunTarget) -> &'static str {
+    match t {
+        tako_core::runner_config::RunTarget::Reuse => tr!("同じペイン", "Same pane"),
+        tako_core::runner_config::RunTarget::New => tr!("新しいペイン", "New pane"),
+    }
+}
 pub fn run_menu_env_add() -> &'static str {
     tr!("追加", "Add")
 }
@@ -723,6 +734,9 @@ mod tests {
                 run_menu_cwd().to_string(),
                 run_menu_before().to_string(),
                 run_menu_unset().to_string(),
+                run_menu_target().to_string(),
+                run_menu_target_choice(tako_core::runner_config::RunTarget::Reuse).to_string(),
+                run_menu_target_choice(tako_core::runner_config::RunTarget::New).to_string(),
                 run_menu_env_add().to_string(),
                 run_menu_open_settings().to_string(),
                 run_menu_edit_hint().to_string(),

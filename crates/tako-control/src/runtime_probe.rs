@@ -866,6 +866,11 @@ pub fn config_json(eff: &EffectiveConfig) -> Value {
             RunConfigField::Args => scalar(&eff.args),
             RunConfigField::Cwd => scalar(&eff.cwd),
             RunConfigField::Before => scalar(&eff.before),
+            // #1734: 実行先（`value` null = 既定 = 同じペインで再実行）
+            RunConfigField::Target => match &eff.target {
+                Some(s) => json!({ "value": s.value.as_str(), "source": s.source.as_str() }),
+                None => json!({ "value": null, "source": "default" }),
+            },
             RunConfigField::Runtime => Value::Object(
                 eff.runtime
                     .iter()

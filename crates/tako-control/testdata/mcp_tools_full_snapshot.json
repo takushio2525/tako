@@ -5252,7 +5252,7 @@
           "type": "boolean"
         },
         "new_pane": {
-          "description": "true で新しく分割する。既定は同じファイル・プロファイルの実行ペインをその位置で差し替える（実行中なら止めて再実行）",
+          "description": "true で新しく分割・false で使い回す（省略時は tako_run_defaults の target、無ければ同じファイル・プロファイルの実行ペインをその位置で差し替える。実行中なら止めて再実行）",
           "type": "boolean"
         },
         "pane": {
@@ -5318,7 +5318,7 @@
     "name": "tako_run_resolve"
   },
   {
-    "description": "実行の既定を読み書きする。ext = 拡張子ごとのコマンド（省略で全一覧・ext のみで単一・command で設定・remove で削除）。path = そのファイル / プロジェクトの実行設定（runtime・profile・args・env・cwd・before を保存、reset で自動へ戻す、項目なしなら読むだけ。応答は config / runtime / runtimes / runtime_unresolved）。ext と path は排他。",
+    "description": "実行の既定を読み書きする。ext = 拡張子ごとのコマンド（省略で全一覧・ext のみで単一・command で設定・remove で削除）。path = そのファイル / プロジェクトの実行設定（runtime・profile・args・env・cwd・before・target を保存、reset で自動へ戻す、項目なしなら読むだけ。応答は config / runtime / runtimes / runtime_unresolved）。ext と path は排他。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -5383,6 +5383,7 @@
               "env",
               "cwd",
               "before",
+              "target",
               "all"
             ],
             "type": "string"
@@ -5398,6 +5399,14 @@
           "enum": [
             "file",
             "project"
+          ],
+          "type": "string"
+        },
+        "target": {
+          "description": "実行先",
+          "enum": [
+            "reuse",
+            "new"
           ],
           "type": "string"
         }

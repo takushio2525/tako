@@ -1527,6 +1527,8 @@ pub(super) fn build_request(
             // #1952: `.ino` の基板とポート（sketch.yaml へ arduino-cli board attach で書く）
             board: str_arg(args, "board")?,
             port: str_arg(args, "port")?,
+            // #1734: 実行先（reuse / new）
+            target: str_arg(args, "target")?,
         },
         _ => return Err(format!("不明なツール: {name}")),
     })

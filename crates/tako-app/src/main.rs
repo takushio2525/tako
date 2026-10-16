@@ -31748,6 +31748,12 @@ mod self_test {
     mod run_board_1952;
     #[cfg(feature = "visual-test")]
     use run_board_1952::run_board_1952_visual;
+    /// #1734: ドロップダウンの実行先の行（実マウスで切り替え → 実マウスの再生ボタンがその実行先で走る）
+    /// （visual-test `run-target-1734`）
+    #[cfg(feature = "visual-test")]
+    mod run_target_1734;
+    #[cfg(feature = "visual-test")]
+    use run_target_1734::run_target_1734_visual;
     /// #1944: 言語サーバを取って起こす・エディタの状態（visual-test `lsp-fetch`）
     #[cfg(feature = "visual-test")]
     mod lsp_fetch_1944;
@@ -46202,6 +46208,12 @@ mod self_test {
                 // #1952: 基板とポートの欄（実の arduino-cli。素材は scripts/test-run-board-1952.sh）
                 "run-board-1952" => {
                     run_board_1952_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #1734: 実行先の行を実マウスで切り替え、実マウスの再生ボタン 2 回でペインの増え方が変わる
+                "run-target-1734" => {
+                    run_target_1734_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

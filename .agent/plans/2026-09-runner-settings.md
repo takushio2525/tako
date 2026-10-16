@@ -160,7 +160,7 @@ pub struct RunConfig {
     pub cwd: Option<String>,
     /// 実行前コマンド（失敗したら本体を走らせない）
     pub before: Option<String>,
-    /// 実行先（#1657 着地後の S6 で足す）
+    /// 実行先（S6 = #1734 で足した）
     pub target: Option<RunTarget>, // Reuse | New
     /// LRU 用（ファイル数の上限で古いものから落とす）
     pub updated_at: Option<String>,
@@ -752,6 +752,18 @@ tako run-config report.py --reset runtime        # 自動選択へ戻す（--res
 - 触る: `crates/tako-core/src/runner_config.rs`（`target`）/ `crates/tako-control/src/dispatch.rs`（`Run` が #1657 の再利用へ `target` を渡す）/ CLI・MCP（`--target` / `target`）/ `preview_render.rs`（メニューの 1 行）/ 移行の指紋（`serde(default)` なので Step 無し = PR に明記）
 - 受け入れ: `target=new` を保存すると再生ボタン 2 回で 2 枚、`reuse` なら 1 枚（隔離実経路）/ 一回限りの `--new-pane`（#1657）が保存値より勝つ
 - 依存: #1657 / S5 / 規模: S
+- **実装で決めたこと（#1734。正本は FR-3.18.9）**:
+  - **`RunConfigField::Target` を足した**（`reset` の語・UI の行・出典が他の項目と同じ仕組みで効く）。保存先の既定はファイル。
+    語の正本は `RunTarget::VALUES`（`reuse` / `new`）で、serde の `snake_case` と同じ字面であることをテストで縛る
+  - **移行は無し**: 欄は `#[serde(default)]` で、#1733 までのファイルは 1 バイトも変えずに読み書きできる（`run_configs` の単体テストで固定）。
+    指紋には `RunTarget` の enum も載せた（語を消すと旧いファイルが読めなくなる = ui.json と同じ扱い）
+  - **一回限りの `new_pane` は `false` も明示の値**として保存値より勝つ（MCP `tako_run { new_pane: false }` で、保存が new でも今回は使い回す）。
+    CLI には `--reuse` を足していない（#322 の最簡形。要るのは保存の reuse で足りる）。判断は `run_configs::Saved::new_pane` の 1 か所
+  - **`command` の上書きは実行先も素通り**（§4.3「保存した層を素通り」をそのまま当てた。例外を作らない）
+  - `Run` の応答に `target`（今回の判断）を足した。保存の出典は既存の `config_sources.target`
+  - ドロップダウンの行は 2 択（印は `check.svg`）+ 出典タグ + ×。今と同じ選択肢を押しても書かない。再生ボタンに実矩形のプローブ
+    （`preview-run-<pane>`）を足し、visual-test `run-target-1734` が実マウスで押す
+  - A/B は `TAKO_1734_LEGACY=1`（保存しても `Run` は使い回す。保存・読み出しの口はそのまま）
 
 ### S7: 他言語の行（Node / Rust）
 

@@ -40,8 +40,9 @@ RecentEntry: directory, repository, ssh
 RecentList: entries
 RecordOwner: pid, started_unix
 RemoteFolderLayout: host, path, origin
-RunConfig: profile, runtime, args, env, cwd, before, updated_at
+RunConfig: profile, runtime, args, env, cwd, before, target, updated_at
 RunConfigsFile: version, projects, files
+RunTarget: Reuse, New
 RuntimeRef: manager, key
 SavedLidState: scheme, ac, dc, owner
 SessionCatalog: entries, pending

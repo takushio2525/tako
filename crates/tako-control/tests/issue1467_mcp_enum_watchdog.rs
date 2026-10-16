@@ -190,6 +190,14 @@ fn registry() -> Vec<Source> {
             binding: Binding::Consumed,
             values: owned(&tako_core::runner_config::RunConfigField::reset_values()),
         },
+        // #1734: 実行先（tako_run_defaults の path 側）
+        Source {
+            tool: "tako_run_defaults",
+            prop: "target",
+            origin: "RunTarget::VALUES（tako-core/src/runner_config.rs）",
+            binding: Binding::Consumed,
+            values: owned(&tako_core::runner_config::RunTarget::VALUES),
+        },
         // --- 束縛: 手書きのまま値だけ縛る（正本へ値を足したら落ちる） ---
         Source {
             tool: "tako_agent_support",
@@ -529,10 +537,10 @@ fn 走査が空振りしていない() {
         "直書き enum の採取が {literals} 件しかない（走査が壊れている。#1467 時点で 97 件）"
     );
     // #2050 で tako_settings の mode（paste_guard::Mode::VALUES）を足して 11 件、
-    // #1731 で tako_run_defaults の scope / reset（items）を足して 13 件
+    // #1731 で tako_run_defaults の scope / reset（items）を足して 13 件、#1734 で target を足して 14 件
     assert_eq!(
-        generated, 13,
-        "生成 site が 13 件でない（{generated} 件）。正本を消費する site を増減したら\
+        generated, 14,
+        "生成 site が 14 件でない（{generated} 件）。正本を消費する site を増減したら\
          `registry()` の Consumed も合わせること"
     );
     assert!(

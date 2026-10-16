@@ -409,7 +409,7 @@ enum Command {
     #[command(name = "run-default")]
     RunDefault(RunDefaultArgs),
     /// ファイル / プロジェクトの実行設定（実行環境・プロファイル・引数・環境変数・作業ディレクトリ・
-    /// 実行前コマンド）を見る・選ぶ（FR-3.18.5 / FR-3.18.6, #1731 / #1732）。
+    /// 実行前コマンド・実行先）を見る・選ぶ（FR-3.18.5 / FR-3.18.6 / FR-3.18.9, #1731 / #1732 / #1734）。
     /// 項目を渡さなければ実効値と実行環境の候補を出す
     #[command(name = "run-config")]
     RunConfig(RunConfigArgs),
@@ -479,8 +479,9 @@ struct RunArgs {
     /// 完了まで待って exit code を返す（ポーリング）
     #[arg(long)]
     wait: bool,
-    /// 同じファイルの実行ペインを使い回さず、新しく分割する（#1657。既定は
-    /// 同じファイル・プロファイルの実行ペインをその位置で差し替える）
+    /// 同じファイルの実行ペインを使い回さず、新しく分割する（#1657。保存した実行先
+    /// `tako run-config --target` より勝つ = #1734。既定は同じファイル・プロファイルの
+    /// 実行ペインをその位置で差し替える）
     #[arg(long)]
     new_pane: bool,
     /// 実行せずプロファイル一覧と実行環境の候補を表示する（--dry-run / --list）
@@ -526,6 +527,12 @@ struct RunConfigArgs {
     /// .ino の書き込み先のポートを選ぶ（sketch.yaml の default_port。#1952）
     #[arg(long, allow_hyphen_values = true)]
     port: Option<String>,
+    /// 実行先（reuse = 同じペインで再実行 / new = 毎回新しいペイン。既定でこのファイルに保存。
+    /// `tako run --new-pane` が保存値より勝つ。#1734）
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+        tako_core::runner_config::RunTarget::VALUES
+    ))]
+    target: Option<String>,
     /// 自動・既定へ戻す（項目名か all。値を省くと全項目。--project / --file を省くと両方から消す）
     #[arg(long, num_args = 0.., value_name = "項目", value_parser = clap::builder::PossibleValuesParser::new(
         tako_core::runner_config::RunConfigField::reset_values()
@@ -10869,6 +10876,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 before: args.before.clone(),
                 board: args.board.clone(),
                 port: args.port.clone(),
+                target: args.target.clone(),
                 // 値なしの `--reset` = 全項目
                 reset: args.reset.as_ref().map(|r| {
                     if r.is_empty() {
@@ -15641,5 +15649,33 @@ mod tests_1732 {
         assert_eq!(a.env, v(&["A=1"]));
         assert_eq!(a.unset_env, v(&["B"]));
         assert_eq!(a.cwd.as_deref(), Some(".."));
+    }
+
+    /// #1734: `--target` は正本（`RunTarget::VALUES`）の語だけを受け、`RunnerDefaults.target` へ渡る
+    #[test]
+    fn 実行先は正本の語だけを受けて実行設定の口へ渡る() {
+        for t in tako_core::runner_config::RunTarget::VALUES {
+            let cli =
+                Cli::try_parse_from(["tako", "run-config", "/p/a.py", "--target", t]).unwrap();
+            match build_request(&cli.command).unwrap() {
+                // パスは Windows では `/p/a.py` が相対扱い（cwd と結ぶ）なので見ない
+                Request::RunnerDefaults { path, target, .. } => {
+                    assert!(path.is_some());
+                    assert_eq!(target.as_deref(), Some(t));
+                }
+                other => panic!("RunnerDefaults ではない: {other:?}"),
+            }
+        }
+        for bad in ["New", "tab"] {
+            assert!(
+                Cli::try_parse_from(["tako", "run-config", "a.py", "--target", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        let cli = Cli::try_parse_from(["tako", "run-config", "/p/a.py"]).unwrap();
+        match build_request(&cli.command).unwrap() {
+            Request::RunnerDefaults { target, .. } => assert_eq!(target, None),
+            other => panic!("RunnerDefaults ではない: {other:?}"),
+        }
     }
 }

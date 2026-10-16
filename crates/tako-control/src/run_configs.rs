@@ -1,7 +1,7 @@
 //! Code Runner の実行設定の保存（`<data_dir>/run-configs.json`。Issue #1731 / #1726 S3）
 //!
 //! 「**このマシンでこのファイル / プロジェクトをどう走らせるか**」（選んだ実行環境・
-//! プロファイル・引数・環境変数・作業ディレクトリ・実行前コマンド = #1732）を覚え、
+//! プロファイル・引数・環境変数・作業ディレクトリ・実行前コマンド = #1732・実行先 = #1734）を覚え、
 //! `Run` / `RunResolve` がそれを重ねる。型と重ね方は
 //! `tako_core::runner_config`、実行環境の解き方は `tako_core::runtime_env` の 1 実装で、
 //! ここが持つのは**読み書き**と、`tako run-config` / MCP `tako_run_defaults`（`path`）の本体だけ。
@@ -32,7 +32,9 @@
 //! `TAKO_1731_LEGACY=1` で `Run` / `RunResolve` が保存値を読まない（#1731 以前 = 自動選択と
 //! 宣言の既定だけ）。ゲートは [`legacy_1731`] の 1 か所。
 //! `TAKO_1732_LEGACY=1` は引数・環境変数・作業ディレクトリ・実行前コマンドだけを読まない
-//! （#1732 以前 = 保存しても実行に効かない）。ゲートは [`legacy_1732`] の 1 か所
+//! （#1732 以前 = 保存しても実行に効かない）。ゲートは [`legacy_1732`] の 1 か所。
+//! `TAKO_1734_LEGACY=1` は実行先だけを読まない（#1734 以前 = 保存しても `Run` は同じペインで
+//! 再実行する）。ゲートは [`legacy_1734`] の 1 か所
 //!
 //! ## 診断ログへ出さない
 //!
@@ -46,7 +48,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tako_core::runner_config::{
-    valid_env_name, FieldSource, RunConfig, RunConfigField, RunScope, RuntimeRef,
+    valid_env_name, FieldSource, RunConfig, RunConfigField, RunScope, RunTarget, RuntimeRef,
 };
 use tako_core::runtime_env::{self, QueryError, RealFs};
 
@@ -69,6 +71,12 @@ pub fn legacy_1731() -> bool {
 /// A/B のゲート。**ここ 1 か所だけ**（保存・読み出しの口はそのまま = 同じ保存値で比べられる）
 pub fn legacy_1732() -> bool {
     std::env::var("TAKO_1732_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// #1734 以前（保存した実行先を `Run` に効かせない = 一回限りの `new_pane` だけが分割を決める）へ
+/// 戻す A/B のゲート。**ここ 1 か所だけ**（保存・読み出しの口はそのまま = 同じ保存値で比べられる）
+pub fn legacy_1734() -> bool {
+    std::env::var("TAKO_1734_LEGACY").is_ok_and(|v| v == "1")
 }
 
 /// `run-configs.json` の中身
@@ -170,6 +178,8 @@ pub struct Edit {
     pub env_set: Option<(RunScope, BTreeMap<String, String>)>,
     /// 消す環境変数の名前（`reset_scopes` のスコープから。名前は検めない = 壊れた名前も消せる）
     pub env_unset: Vec<String>,
+    /// 実行先（#1734）
+    pub target: Option<(RunScope, RunTarget)>,
     pub reset: Vec<RunConfigField>,
     /// 消すスコープ（保存先を省いた reset / 環境変数の削除は両方 = 実効値を既定へ戻す）
     pub reset_scopes: Vec<RunScope>,
@@ -186,6 +196,7 @@ impl Edit {
             || self.before.is_some()
             || self.env_set.is_some()
             || !self.env_unset.is_empty()
+            || self.target.is_some()
             || !self.reset.is_empty()
     }
 }
@@ -300,6 +311,16 @@ impl RunConfigsFile {
                 action: "set",
             });
         }
+        if let Some((scope, target)) = &edit.target {
+            let cfg = self.map_mut(*scope).entry(key_for(*scope)).or_default();
+            cfg.target = Some(*target);
+            cfg.updated_at = Some(now.to_string());
+            changes.push(Change {
+                scope: *scope,
+                field: RunConfigField::Target,
+                action: "set",
+            });
+        }
         changes
     }
 
@@ -328,7 +349,10 @@ fn text_slot(cfg: &mut RunConfig, field: RunConfigField) -> Option<&mut Option<S
         RunConfigField::Args => Some(&mut cfg.args),
         RunConfigField::Cwd => Some(&mut cfg.cwd),
         RunConfigField::Before => Some(&mut cfg.before),
-        RunConfigField::Profile | RunConfigField::Runtime | RunConfigField::Env => None,
+        RunConfigField::Profile
+        | RunConfigField::Runtime
+        | RunConfigField::Env
+        | RunConfigField::Target => None,
     }
 }
 
@@ -370,6 +394,20 @@ impl Saved {
         self.layers()
             .into_iter()
             .find_map(|(c, s)| c.and_then(|c| c.profile.as_deref()).map(|p| (p, s)))
+    }
+
+    /// 選んだ実行先（ファイル → プロジェクト。#1734）
+    pub fn target(&self) -> Option<(RunTarget, RunScope)> {
+        self.layers()
+            .into_iter()
+            .find_map(|(c, s)| c.and_then(|c| c.target).map(|t| (t, s)))
+    }
+
+    /// `Run` が新しいペインに分割するか（#1734）。一回限りの `new_pane`（CLI `--new-pane` /
+    /// MCP `tako_run` の `new_pane`。`false` も明示の値 = 保存が new でも今回は使い回す）が
+    /// 保存値より勝ち、どちらも無ければ同じペインで再実行する（#1657 の既定）
+    pub fn new_pane(&self, once: Option<bool>) -> bool {
+        once.unwrap_or_else(|| !legacy_1734() && self.target().is_some_and(|(t, _)| t.new_pane()))
     }
 
     /// 解決へ渡す実行設定の層（#1732。引数・作業ディレクトリ・実行前コマンドはファイル →
@@ -492,6 +530,8 @@ pub struct PathArgs<'a> {
     pub before: Option<&'a str>,
     /// 環境変数（値 `None` = そのキーを消す）
     pub env: Option<&'a BTreeMap<String, Option<String>>>,
+    /// 実行先（`reuse` / `new`。#1734）
+    pub target: Option<&'a str>,
 }
 
 impl<'a> PathArgs<'a> {
@@ -508,6 +548,7 @@ impl<'a> PathArgs<'a> {
             cwd: None,
             before: None,
             env: None,
+            target: None,
         }
     }
 }
@@ -603,6 +644,11 @@ pub fn handle(a: PathArgs<'_>) -> Result<Value, DispatchError> {
         if !set.is_empty() {
             edit.env_set = Some((to(RunConfigField::Env), set));
         }
+    }
+    // #1734: 実行先（語は正本 `RunTarget::VALUES` だけを受ける）
+    if let Some(t) = a.target {
+        let t = RunTarget::parse(t).ok_or_else(|| invalid(msg_bad_target(t)))?;
+        edit.target = Some((to(RunConfigField::Target), t));
     }
 
     let (changes, store) = if edit.writes() {
@@ -719,6 +765,14 @@ fn msg_bad_scope(s: &str) -> String {
     tr(
         format!("scope は {all} のどれか（指定: {s:?}）"),
         format!("scope must be one of {all} (got {s:?})"),
+    )
+}
+
+fn msg_bad_target(t: &str) -> String {
+    let all = RunTarget::VALUES.join(" / ");
+    tr(
+        format!("target は {all} のどれか（指定: {t:?}）"),
+        format!("target must be one of {all} (got {t:?})"),
     )
 }
 

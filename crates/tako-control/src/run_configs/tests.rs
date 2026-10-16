@@ -644,3 +644,107 @@ fn 空文字の引数と実行前はプロジェクトの値を塞ぐ() {
     assert_eq!(layer.before.as_deref(), Some(""));
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// #1734: 実行先を保存する（既定の保存先はファイル・語は `RunTarget::VALUES` だけ）。
+/// `Run` が読む `Saved::new_pane` は、一回限りの `new_pane`（`false` も明示の値）が保存値より勝つ
+#[test]
+fn 実行先を保存し既定はファイルで一回限りの指定が勝つ() {
+    let base = sandbox("s6-target");
+    let file = base.join("a.py");
+    touch(&file, "print(1)\n");
+    assert!(!saved_for(&file).new_pane(None), "既定は同じペインで再実行");
+
+    let v = call_1732(&file, None, |a| a.target = Some("new")).unwrap();
+    assert_eq!(
+        v["updated"],
+        json!([{ "scope": "file", "field": "target", "action": "set" }]),
+        "{v:#}"
+    );
+    assert_eq!(
+        v["config"]["target"],
+        json!({ "value": "new", "source": "file" })
+    );
+    assert_eq!(v["saved"]["file"]["target"], "new", "{v:#}");
+    let saved = saved_for(&file);
+    assert_eq!(saved.target(), Some((RunTarget::New, RunScope::File)));
+    assert!(saved.new_pane(None));
+    assert!(
+        !saved.new_pane(Some(false)),
+        "一回限りの false が保存の new より勝つ"
+    );
+    assert!(saved.new_pane(Some(true)));
+
+    // プロジェクトの reuse はファイルの new に負ける
+    call_1732(&file, Some("project"), |a| a.target = Some("reuse")).unwrap();
+    assert_eq!(
+        saved_for(&file).target(),
+        Some((RunTarget::New, RunScope::File))
+    );
+    // ファイルから消すとプロジェクトの reuse が効く
+    let reset = ["target".to_string()];
+    let v = call_1732(&file, Some("file"), |a| a.reset = Some(&reset)).unwrap();
+    assert_eq!(v["config"]["target"]["source"], "project", "{v:#}");
+    assert!(!saved_for(&file).new_pane(None));
+
+    // 正本に無い語は保存しない（大文字・別の語）
+    for bad in ["New", "tab", ""] {
+        let e = call_1732(&file, None, |a| a.target = Some(bad)).expect_err(bad);
+        assert!(matches!(e, DispatchError::InvalidParams(_)), "{bad}: {e:?}");
+        assert!(e.to_string().contains("reuse / new"), "{e}");
+    }
+    assert_eq!(
+        saved_for(&file).target().map(|(t, _)| t),
+        Some(RunTarget::Reuse)
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #1734: `target` の欄が無い旧い `run-configs.json`（#1733 までの版が書いた形）は移行の Step なしで
+/// そのまま読め（`.unreadable.bak` へ退避しない）、書き戻しても `target` の欄は増えない
+#[test]
+fn 実行先の無い旧いrun_configsは移行なしで読める() {
+    let dir = sandbox("s6-old-file");
+    let path = dir.join(FILENAME);
+    let old = r#"{
+  "version": 1,
+  "projects": {
+    "/w/p": {
+      "runtime": {
+        "python": {
+          "manager": "venv",
+          "key": ".venv"
+        }
+      },
+      "env": {
+        "APP_ENV": "dev"
+      }
+    }
+  },
+  "files": {
+    "/w/p/a.py": {
+      "profile": "test",
+      "args": "--verbose",
+      "cwd": "..",
+      "before": "make",
+      "updated_at": "2026-10-16T00:00:00Z"
+    }
+  }
+}
+"#;
+    std::fs::write(&path, old).unwrap();
+    let store = load_from(&path);
+    let f = &store.files["/w/p/a.py"];
+    assert_eq!(f.target, None);
+    assert_eq!(f.profile.as_deref(), Some("test"));
+    assert_eq!(f.before.as_deref(), Some("make"));
+    assert_eq!(store.projects["/w/p"].env["APP_ENV"], "dev");
+    let quarantined = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.file_name().to_string_lossy().contains("unreadable"));
+    assert!(!quarantined, "旧い形を読めないとして退避した");
+    // 書き戻しても形は同じ（今の版が書く整形と 1 バイトも変わらない）
+    update_at(&path, |_| ()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2517,7 +2517,9 @@ pub enum Request {
         focus: Option<bool>,
         /// true = 同じファイルの実行ペインがあっても使い回さず、新しく分割する（#1657。
         /// 既定 false = 同じタブの「同じファイル + 同じプロファイル」の実行ペインを
-        /// その位置で差し替える。実行中なら止めて走らせ直す）
+        /// その位置で差し替える。実行中なら止めて走らせ直す）。
+        /// 省略時は保存した実行先（`RunnerDefaults { target }`。#1734）に従い、指定すれば
+        /// `false` でもその値が保存値より勝つ（一回限り）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_pane: Option<bool>,
     },
@@ -2582,6 +2584,10 @@ pub enum Request {
         /// `.ino`: 書き込み先のポート（`sketch.yaml` の `default_port`。#1952）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         port: Option<String>,
+        /// 実行先（`reuse` = 同じペインで再実行 / `new` = 毎回新しいペイン。#1734）。
+        /// `Run` の一回限りの `new_pane` が保存値より勝つ
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     /// 設定画面の操作（Issue #459）。
     /// `action` = "open"（既定。GUI 設定画面を開く）/ "status"（開いているか + 現在タブ）
@@ -2704,6 +2710,7 @@ impl Request {
             before: None,
             board: None,
             port: None,
+            target: None,
         }
     }
 

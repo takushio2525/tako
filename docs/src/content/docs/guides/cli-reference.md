@@ -70,7 +70,7 @@ tako orchestrator spawn --help
 | [`web`](#tako-web) | Web ビューペインの操作 |
 | [`run`](#tako-run--run-default) | ファイルを実行する（Code Runner） |
 | [`run-default`](#tako-run--run-default) | 拡張子ごとの実行コマンド既定 |
-| [`run-config`](#tako-run--run-default) | ファイル / プロジェクトごとに実行環境・プロファイル・引数・環境変数などを覚える |
+| [`run-config`](#tako-run--run-default) | ファイル / プロジェクトごとに実行環境・プロファイル・引数・環境変数・実行先などを覚える |
 | [`run-interactive`](#tako-run-interactive) | 入力が要るコマンドを可視ペインへ委譲 |
 | [`run-interactive-status`](#tako-run-interactive) | 委譲したコマンドの完了確認 |
 
@@ -881,7 +881,7 @@ tako web close
 
 **Code Runner**。ファイル内の `tako:run` 宣言、プロジェクト既定（`Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` などを上へ辿り、そのルートで `cargo run` / `npm run` 等を走らせる）、または拡張子ごとの既定コマンドで、新しいペインを分割して実行します。プレビューヘッダの再生ボタンと同じ経路です。`--list`（`--dry-run`）はどのプロジェクトとして解決したか（`project`）も返します。`.py` はプロジェクトの `.venv` / uv / poetry / conda / pyenv を設定なしで使い、`--list` の `runtime`（選ばれた環境）と `runtimes`（候補）で確認できます。`--list --refresh` は uv などの場所や Python の版を調べ直します。Arduino のスケッチ（`.ino`）はスケッチのフォルダで `arduino-cli compile` を走らせ（`--profile upload` で書き込み）、arduino-cli は PATH に無ければ Arduino IDE に同梱のものを使います。基板が選ばれていない・フォルダ名と `.ino` の名前が違う・arduino-cli が無いときは、直し方の案内が実行ペインと `--list` の `project.notes` に出ます。
 
-同じタブに**同じファイル・同じプロファイルの実行ペイン**があれば、分割せずに**その位置で差し替えて**走らせ直します（何度押してもペインは 1 枚のまま。前の実行がまだ走っていれば止めてから走らせ直し、応答の `stopped_running` が `true` になります）。別々に並べたいときだけ `--new-pane` を付けます。終わると画面に「`[tako] 終了コード N / Enter でこのペインを閉じます`」が出て、ペインのタイトルバーに「完了」「失敗 (N)」のバッジが付きます（実行中は「実行中」）。同じ状態は `tako list` の各ペインの `run`（`status` / `exit_code` / `outcome`）でも読めます。
+同じタブに**同じファイル・同じプロファイルの実行ペイン**があれば、分割せずに**その位置で差し替えて**走らせ直します（何度押してもペインは 1 枚のまま。前の実行がまだ走っていれば止めてから走らせ直し、応答の `stopped_running` が `true` になります）。別々に並べたいときだけ `--new-pane` を付けます（毎回並べたいファイルは `tako run-config <file> --target new` で覚えておけます）。終わると画面に「`[tako] 終了コード N / Enter でこのペインを閉じます`」が出て、ペインのタイトルバーに「完了」「失敗 (N)」のバッジが付きます（実行中は「実行中」）。同じ状態は `tako list` の各ペインの `run`（`status` / `exit_code` / `outcome`）でも読めます。
 
 プレビューに**保存していない編集**があれば、走らせる前に保存します（再生ボタンと同じ。保存したペインは応答の `saved_panes` に載ります。読み取り専用などで保存できないときは走らせずにエラーを返します）。`--auto-close success` / `always` は `--wait` を付けなくても効き、終わった時点でペインを閉じます（閉じたあとも `tako run-interactive-status <pane>` で終了コードを読めます）。`--wait` は**最長 600 秒**待ち、超えると「まだ実行中」（応答の `timed_out: true`）を返して**終了コード 124** で終わります（`timeout` コマンドと同じ値です。実行は止めません）。コマンド自身が失敗したときの終了コードは 1 なので、「失敗した」と「待ちきれなかった」を終了コードで見分けられます。上限は環境変数 `TAKO_RUN_WAIT_TIMEOUT_SECS` で変えられます（0 は既定の 600 秒）。`--auto-close` で閉じたペインは、ペインログ（`tako logs show <ペイン ID>`）のクローズの記録が `close:auto` になり、手で閉じたものと見分けられます。
 
@@ -904,11 +904,14 @@ tako run-config script.py --reset runtime # 自動選択へ戻す（--reset だ�
 tako run-config script.py --args "--verbose"     # 引数を覚える（既定でこのファイルだけ）
 tako run-config script.py --env APP_ENV=dev      # 環境変数を覚える（--unset-env APP_ENV で消す）
 tako run-config script.py --cwd .. --before "make build"  # 作業ディレクトリと実行前コマンド
+tako run-config script.py --target new           # 毎回新しいペインで走らせる（reuse で同じペインへ戻す）
 ```
 
 `tako run-config` で選んだ実行環境・プロファイルは、`tako run` と再生ボタンが自動で使います（`--profile` を付けた実行はそちらが優先）。覚える先は `<data_dir>/run-configs.json` で、中身がこのマシンのパスなので設定の共有（`tako config`）には載りません。`--runtime` には `--list` の `runtimes` の `id`、ディレクトリ名や版などの短い名前、interpreter のパスを渡せます。短い名前が複数の候補に当たる（例: 2 つの階層にある `.venv`）ときは選ばずに候補を並べて止まるので、`id` で選び直してください。覚えた環境を消した（`.venv` を作り直す前に消した等）ときは、別の Python へ黙って切り替えずにエラーで止まり、`tako run-config <file> --reset runtime` で自動選択へ戻せます。
 
 引数（`--args`）は 1 本の文字列のままシェルへ渡るので、`--args "--name 'a b'"` のように書けます。コマンドに `${args}` があればその位置へ、無ければ末尾へ入ります（`cargo run` に渡すなら `--args "-- x"`）。環境変数（`--env K=V`）の値は書いたとおりに渡り、`${fileDir}` などの tako の変数だけが展開されます。作業ディレクトリ（`--cwd`）を移すと、`python3 ${fileBase}` のような既定のコマンドはファイルを絶対パスで指すので、移った先からでも走ります。実行前コマンド（`--before`）が失敗すると本体は走らず、実行ペインの終了コードはその失敗の値になります。
+
+実行先（`--target`）は、再生ボタンと `tako run` を同じペインで走らせ直す（`reuse`。既定）か、毎回新しいペインに分割する（`new`）かです。一回だけ変えたいときは `tako run --new-pane` が覚えた値より優先されます。
 
 ### tako run-interactive
 
