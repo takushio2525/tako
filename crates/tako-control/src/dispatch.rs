@@ -3043,6 +3043,10 @@ pub enum OffloadJob {
     UserTaskStore(Box<UserTaskStoreJob>),
     /// 返答の配送の記録と読み直し（#2086 の ④。③ の配送を UI スレッドで済ませた後の background）
     UserTaskRespondRecord(Box<UserTaskRespondRecordJob>),
+    /// 返答の配送で起票 master が居ないときの起動の組み立て（#2182。`master_launch::plan` = CLI の
+    /// 所在確認のログインシェルと tako の実行ファイルの解決は background）。タブを作って起動コマンドと
+    /// 返答を流すのは [`OffloadContinuation::UserTaskLaunched`] で UI スレッドへ戻す
+    UserTaskLaunch(Box<UserTaskLaunchJob>),
     /// プレビューの変更履歴を開く（#2014）。UI スレッドではプレビューのパス（キャッシュ済みの値）
     /// だけを写し、リポジトリの解決（`git rev-parse`）と履歴（`git log --follow`）は上限つきで
     /// background。プレビューの状態へ置くのは [`OffloadContinuation::PreviewChangelog`] で UI スレッドへ戻す
@@ -3218,6 +3222,8 @@ pub enum OffloadContinuation {
     UserTaskStatus(Box<UserTaskStatusLanding>),
     /// ユーザータスクの host に触る後始末（起票の通知・返答の配送・展開。[`user_task_land`]。#2086）
     UserTaskStored(Box<UserTaskLanding>),
+    /// 組み立てた起動で起票 master を起こして返答を流す（[`user_task_launch_land`]。#2182）
+    UserTaskLaunched(Box<UserTaskLaunchLanding>),
     /// 取った変更履歴をプレビューの状態へ置く（[`preview_changelog_land`]。#2014）
     PreviewChangelog(Box<PreviewChangelogLanding>),
     /// 取った 1 行の diff を変更履歴へ置く（[`preview_changelog_diff_land`]。#2150）
@@ -3241,6 +3247,8 @@ impl OffloadContinuation {
             | Self::PreviewChangelogDiff(_) => false,
             // #2086: 同期の腕と同じ判定（返答だけが真 = master を起こすとタブが増える）
             Self::UserTaskStored(landing) => matches!(**landing, UserTaskLanding::Responded { .. }),
+            // #2182: master を起こす着地（タブが増える）
+            Self::UserTaskLaunched(_) => true,
             Self::Probed(probed) => crate::protocol::changes_layout(&probed.request),
             _ => true,
         }
@@ -3295,6 +3303,14 @@ pub fn finish_offload(
         OffloadContinuation::WorkspaceSearch(landing) => workspace_search_land(host, *landing),
         OffloadContinuation::UserTaskStatus(landing) => Ok(user_task_status_finish(host, *landing)),
         OffloadContinuation::UserTaskStored(landing) => user_task_land(host, *landing),
+        // #2182: もう一巡を出せない直の呼び手は、起こして（UI）から記録まで（④）を同じスレッドで順に通す
+        OffloadContinuation::UserTaskLaunched(landing) => {
+            let (delivered, turn) = user_task_launch_land(host, *landing);
+            user_task_respond_record(UserTaskRespondRecordJob {
+                delivered,
+                _turn: turn,
+            })
+        }
         OffloadContinuation::PreviewChangelog(landing) => preview_changelog_land(host, *landing),
         OffloadContinuation::PreviewChangelogDiff(landing) => {
             preview_changelog_diff_land(host, *landing)
@@ -3853,6 +3869,11 @@ impl OffloadJob {
             },
             // #2086: 詳細・更新はそのまま応答し、host に触る後始末が要るものだけ UI スレッドへ戻す
             OffloadJob::UserTaskStore(job) => user_task_store_staged(*job),
+            // #2182: 起動の組み立て（CLI の所在確認・tako の実行ファイルの解決）だけをここで待ち、
+            // タブを作って流すのは UI スレッドへ戻す
+            OffloadJob::UserTaskLaunch(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::UserTaskLaunched(Box::new(job.run())))
+            }
             // #2014: 履歴は上限つきで取り、プレビューの状態へ置くのは UI スレッドへ戻す
             OffloadJob::PreviewChangelog(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::PreviewChangelog(Box::new(
@@ -4002,6 +4023,10 @@ impl OffloadJob {
             )),
             OffloadJob::UserTaskStore(_) => Err(DispatchError::Operation(
                 "ユーザータスクは run_staged で走らせる（通知・配送・展開に UI スレッドの続きが要る）"
+                    .into(),
+            )),
+            OffloadJob::UserTaskLaunch(_) => Err(DispatchError::Operation(
+                "master の起動の組み立ては run_staged で走らせる（タブを作って流すのに UI スレッドの続きが要る）"
                     .into(),
             )),
             OffloadJob::PreviewChangelog(_) => Err(DispatchError::Operation(
@@ -4580,7 +4605,8 @@ fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> 
 pub enum OffloadLanding {
     /// 応答する
     Done(Result<Value, DispatchError>),
-    /// 先取りの答えがまだ足りない（handoff の後任の agent は呼び出し元が決まってから決まる）。
+    /// 先取りの答えがまだ足りない（handoff の後任の agent は呼び出し元が決まってから決まる）・
+    /// 返答の配送で起票 master が居ないので起動の組み立てが要る（#2182。host はまだ変えていない）。
     /// 受け口はこのジョブを background で走らせ、もう一度着地させる
     Again(Box<OffloadJob>),
     /// 着地で host を変えたうえで、続きを background で走らせる（#2086 の返答: ③ 運ぶ → ④ 記録する）。
@@ -4622,18 +4648,34 @@ pub fn land_offload(
         }
         // #2086: 返答は ③ 運ぶ（UI）の後に ④ 記録する（background）がある。運んだ後の host は
         // 変わっている（master を起こした = PTY の起動待ち）ので、受け口に後処理をさせてから出す
+        // #2182: 起票 master が居なければ、起動の組み立てを background へ出す（札はジョブが持ち回る）。
+        // この着地は host を変えていない（宛先を決めただけ）ので後処理の要らない一巡にする
         OffloadContinuation::UserTaskStored(landing) => match *landing {
             UserTaskLanding::Responded { stored, turn } => {
-                let delivered = user_task_respond_deliver(host, *stored);
-                OffloadLanding::Settled(Box::new(OffloadJob::UserTaskRespondRecord(Box::new(
-                    UserTaskRespondRecordJob {
-                        delivered,
-                        _turn: turn,
-                    },
-                ))))
+                match user_task_respond_deliver(host, *stored) {
+                    UserTaskRespondStep::Delivered(delivered) => OffloadLanding::Settled(Box::new(
+                        OffloadJob::UserTaskRespondRecord(Box::new(UserTaskRespondRecordJob {
+                            delivered,
+                            _turn: Some(turn),
+                        })),
+                    )),
+                    UserTaskRespondStep::Launch(job) => OffloadLanding::Again(Box::new(
+                        OffloadJob::UserTaskLaunch(job.holding(turn)),
+                    )),
+                }
             }
             other => OffloadLanding::Done(user_task_land(host, other)),
         },
+        // #2182: 組み立てた起動で master を起こして返答を流し（UI）、④ 記録する（background）へ
+        OffloadContinuation::UserTaskLaunched(landing) => {
+            let (delivered, turn) = user_task_launch_land(host, *landing);
+            OffloadLanding::Settled(Box::new(OffloadJob::UserTaskRespondRecord(Box::new(
+                UserTaskRespondRecordJob {
+                    delivered,
+                    _turn: turn,
+                },
+            ))))
+        }
         other => OffloadLanding::Done(finish_offload(host, other, origin)),
     }
 }
@@ -21400,7 +21442,11 @@ fn dispatch_user_task(
         // （送った直後に欄を空にできる）。段の中身はここにしか無い
         "respond" => {
             let stored = respond_store_at(path, &params, origin)?;
-            let delivered = user_task_respond_deliver(host, stored);
+            let delivered = match user_task_respond_deliver(host, stored) {
+                UserTaskRespondStep::Delivered(delivered) => delivered,
+                // #2182: 起動の組み立て（background の段）も同じスレッドで順に通す
+                UserTaskRespondStep::Launch(job) => user_task_launch_land(host, job.run()).0,
+            };
             user_task_respond_finish(delivered)
         }
         // #1479: 右パネル tasks ビューの「その場で展開」を AI からも操作する
@@ -21540,16 +21586,129 @@ fn user_task_respond_fields(
     Ok((id, decision, via))
 }
 
-/// ② 起票 master へ運ぶ（**UI スレッド**。workspace と送達フローに触る）
+/// ② 起票 master へ運ぶ（**UI スレッド**。workspace と送達フローに触る）。
+///
+/// 起票 master が生きていれば送って [`UserTaskRespondStep::Delivered`]。居なければ起動の組み立て
+/// （`master_launch::plan` = CLI の所在確認のログインシェルと tako の実行ファイルの解決）を
+/// **ここでは待たず** [`UserTaskRespondStep::Launch`] を返す（#2182）。呼び手はジョブを background で
+/// 走らせ（[`UserTaskLaunchJob::run`]）、UI スレッドで [`user_task_launch_land`] へ渡す
 pub fn user_task_respond_deliver(
     host: &mut dyn ControlHost,
     stored: UserTaskRespondStored,
-) -> UserTaskRespondDelivered {
-    let delivery = deliver_user_task_response(host, &stored.task, stored.index);
-    UserTaskRespondDelivered {
-        path: stored.path,
-        id: stored.task.id,
-        delivery,
+) -> UserTaskRespondStep {
+    let profile = match deliver_user_task_response(host, &stored.task, stored.index, None) {
+        Routed::Done(delivery) => {
+            return UserTaskRespondStep::Delivered(stored.delivered(delivery))
+        }
+        Routed::NeedsPlan(profile) => profile,
+    };
+    // A/B（`TAKO_2182_LEGACY=1`）: 修正前と同じく起動の組み立てをその場（UI スレッド）で待つ
+    if tako_core::probe::issue2182_legacy() {
+        let plan = plan_master_for_response(&profile);
+        let delivery = launch_master_for_response(host, &stored.task, stored.index, &profile, plan);
+        return UserTaskRespondStep::Delivered(stored.delivered(delivery));
+    }
+    UserTaskRespondStep::Launch(Box::new(UserTaskLaunchJob {
+        stored,
+        profile,
+        turn: None,
+    }))
+}
+
+/// ② の結末（#2182）
+pub enum UserTaskRespondStep {
+    /// 運び終えた（生きている master へ送った・起票元が解けない）。③ 記録する へ
+    Delivered(UserTaskRespondDelivered),
+    /// 起票 master が居ない。起動の組み立てを background で走らせてから
+    /// [`user_task_launch_land`]（UI スレッド）で起こす
+    Launch(Box<UserTaskLaunchJob>),
+}
+
+/// 起票 master の起動の組み立てのジョブ（#2182。[`user_task_respond_deliver`] が UI スレッドで作る）
+pub struct UserTaskLaunchJob {
+    stored: UserTaskRespondStored,
+    /// 起票元のプロファイル（宛先を決めたときに解いたもの）
+    profile: String,
+    /// IPC の返答の札（#2086。④ 記録するの終わりまで持ち回る。右パネルの送信は自前の門
+    /// `send_running` で 1 本ずつ流すので持たない）
+    turn: Option<RespondTurn>,
+}
+
+impl UserTaskLaunchJob {
+    /// 札を持たせる（IPC の着地 = [`land_offload`] だけ）
+    fn holding(mut self: Box<Self>, turn: RespondTurn) -> Box<Self> {
+        self.turn = Some(turn);
+        self
+    }
+
+    /// 起動を組み立てる（**子プロセスを待つ** = CLI の所在確認と tako の実行ファイルの解決。
+    /// UI スレッドで呼ぶのは同期の腕 = 経路を省いた返答・テスト・直呼び・`TAKO_2086_LEGACY=1` だけ）
+    pub fn run(self) -> UserTaskLaunchLanding {
+        let plan = plan_master_for_response(&self.profile);
+        UserTaskLaunchLanding { job: self, plan }
+    }
+
+    /// もう一巡を出せない UI スレッドの呼び手（[`user_task_land`]）が、組み立てを待たずに断る
+    fn refused_on_ui(self) -> UserTaskRespondDelivered {
+        log_user_task_delivery(&self.stored.task.id, "launch_plan_deferred", "operation");
+        let delivery = crate::user_tasks::delivery_record(
+            tako_core::user_task::DeliveryState::Failed,
+            &self.profile,
+            None,
+            None,
+            Some(
+                "master の起動の組み立て（CLI の所在確認）を UI スレッドでは待たない\
+                 （もう一度返答すると組み立て直す）"
+                    .into(),
+            ),
+            self.stored.index,
+        );
+        self.stored.delivered(delivery)
+    }
+}
+
+/// 組み立てた起動を UI スレッドへ運ぶもの（#2182）
+pub struct UserTaskLaunchLanding {
+    job: UserTaskLaunchJob,
+    plan: Result<crate::orchestrator::master_launch::MasterLaunchPlan, String>,
+}
+
+/// 組み立てた起動で起票 master を起こして返答を流す（**UI スレッド**。#2182）。
+///
+/// 宛先は**ここで決め直す**: 組み立てを待つ間に起票 master が現れていれば（`tako master` を
+/// 手で立てた等）、起こさずにそのペインへ送る（同じプロファイルの master を 2 つにしない）。
+/// 戻すのは ③ 記録するの材料と、持ち回っていた札
+pub fn user_task_launch_land(
+    host: &mut dyn ControlHost,
+    landing: UserTaskLaunchLanding,
+) -> (UserTaskRespondDelivered, Option<RespondTurn>) {
+    let UserTaskLaunchLanding { job, plan } = landing;
+    let UserTaskLaunchJob { stored, turn, .. } = job;
+    let delivery = match deliver_user_task_response(host, &stored.task, stored.index, Some(plan)) {
+        Routed::Done(delivery) => delivery,
+        // 組み立てを渡したので起こすか送るかで決着する（ここへは来ない。来ても無言にしない）
+        Routed::NeedsPlan(profile) => {
+            log_user_task_delivery(&stored.task.id, "launch_plan_lost", "operation");
+            crate::user_tasks::delivery_record(
+                tako_core::user_task::DeliveryState::Failed,
+                &profile,
+                None,
+                None,
+                Some("master の起動の組み立てが着地へ届かなかった".into()),
+                stored.index,
+            )
+        }
+    };
+    (stored.delivered(delivery), turn)
+}
+
+impl UserTaskRespondStored {
+    fn delivered(self, delivery: tako_core::user_task::Delivery) -> UserTaskRespondDelivered {
+        UserTaskRespondDelivered {
+            path: self.path,
+            id: self.task.id,
+            delivery,
+        }
     }
 }
 
@@ -22448,8 +22607,9 @@ pub enum UserTaskLanding {
 /// ④ 返答の記録のジョブ（③ で運んだもの）
 pub struct UserTaskRespondRecordJob {
     delivered: UserTaskRespondDelivered,
-    /// 記録を書き終えるまで手放さない（次の返答はこの後に積む）
-    _turn: RespondTurn,
+    /// 記録を書き終えるまで手放さない（次の返答はこの後に積む）。IPC の返答はいつも `Some`
+    /// （`None` は札を持たない直の呼び手 = [`finish_offload`] で起こした着地だけ。#2182）
+    _turn: Option<RespondTurn>,
 }
 
 /// ② background: 決着した配送を書き戻してから、置き場を読み書きする。
@@ -22493,7 +22653,11 @@ fn user_task_store_staged(job: UserTaskStoreJob) -> OffloadOutcome {
 
 /// ③ host に触る後始末（**UI スレッド**）。返答は IPC の受け口では [`land_offload`] が ③ 運ぶ →
 /// ④ 記録する（background）へ分ける。ここで返答を受けるのは、もう一巡を出せない直の呼び手
-/// （[`finish_offload`]）だけで、③ と ④ を同じスレッドで順に通す
+/// （[`finish_offload`]）だけで、③ と ④ を同じスレッドで順に通す。
+///
+/// 起票 master が居ないとき、直の呼び手は起動の組み立て（子プロセスを待つ）を UI スレッドで
+/// 待たずに配送の失敗として記録する（#2182。`Probed::Missing` と同じく待たない側へ倒す）。
+/// 返答そのものは ② で積めている
 fn user_task_land(
     host: &mut dyn ControlHost,
     landing: UserTaskLanding,
@@ -22502,10 +22666,13 @@ fn user_task_land(
         UserTaskLanding::Added(added) => Ok(user_task_add_finish(host, added)),
         UserTaskLanding::Expand(target) => Ok(user_task_expand_finish(host, target)),
         UserTaskLanding::Responded { stored, turn } => {
-            let delivered = user_task_respond_deliver(host, *stored);
+            let delivered = match user_task_respond_deliver(host, *stored) {
+                UserTaskRespondStep::Delivered(delivered) => delivered,
+                UserTaskRespondStep::Launch(job) => job.refused_on_ui(),
+            };
             user_task_respond_record(UserTaskRespondRecordJob {
                 delivered,
-                _turn: turn,
+                _turn: Some(turn),
             })
         }
     }
@@ -22517,17 +22684,30 @@ fn user_task_respond_record(job: UserTaskRespondRecordJob) -> Result<Value, Disp
     user_task_respond_finish(delivered)
 }
 
+/// [`deliver_user_task_response`] の結末（#2182）
+enum Routed {
+    /// 決着した（送った・起こした・宛先が解けない・失敗した）
+    Done(tako_core::user_task::Delivery),
+    /// 起票 master が居ないが、起動の組み立てをまだ持っていない（中身は起票元のプロファイル）
+    NeedsPlan(String),
+}
+
 /// 返答を起票 master へ運ぶ（#1450 の要件追加 ③）。
 ///
 /// **新しい送達経路は作らない**。生きている master へは `Request::Send`
 /// （= `tako_send_input` と同じ腕）、居ないときは
 /// `orchestrator::master_launch::plan`（= `tako master` / PWA の「+ master」と
-/// 同じ組み立て）で起動してから `queue_prompt_flow` で初回メッセージを流す
+/// 同じ組み立て）で起動してから `queue_prompt_flow` で初回メッセージを流す。
+///
+/// 組み立ては子プロセスを待つ（CLI の所在確認 = ログインシェル・tako の実行ファイルの解決）ので
+/// ここ（UI スレッド）では組まない（#2182）。`plan` が無くて起動が要るときは
+/// [`Routed::NeedsPlan`] を返し、呼び手が background の [`plan_master_for_response`] へ回す
 fn deliver_user_task_response(
     host: &mut dyn ControlHost,
     task: &tako_core::user_task::UserTask,
     index: usize,
-) -> tako_core::user_task::Delivery {
+    plan: Option<Result<crate::orchestrator::master_launch::MasterLaunchPlan, String>>,
+) -> Routed {
     use crate::user_tasks::{delivery_record, DeliveryTarget};
     use tako_core::user_task::DeliveryState;
 
@@ -22535,11 +22715,11 @@ fn deliver_user_task_response(
     // 無関係なプロジェクトの master の入力欄へ返答が入り、双方に何も分からない
     let Some(profile) = crate::user_tasks::origin_profile(task) else {
         log_user_task_delivery(&task.id, "origin_unresolved", "operation");
-        return crate::user_tasks::unresolved_delivery(index);
+        return Routed::Done(crate::user_tasks::unresolved_delivery(index));
     };
     let panes = user_task_pane_roles(host.workspace());
     let origin_pane = task.origin.as_ref().and_then(|o| o.pane);
-    match crate::user_tasks::choose_target(&panes, &profile, origin_pane) {
+    let delivery = match crate::user_tasks::choose_target(&panes, &profile, origin_pane) {
         DeliveryTarget::Pane(pane) => {
             let text = crate::user_tasks::response_message(task, index);
             match dispatch(
@@ -22570,23 +22750,42 @@ fn deliver_user_task_response(
                 }
             }
         }
-        DeliveryTarget::Launch => launch_master_for_response(host, task, index, &profile),
-    }
+        DeliveryTarget::Launch => match plan {
+            Some(plan) => launch_master_for_response(host, task, index, &profile, plan),
+            None => return Routed::NeedsPlan(profile),
+        },
+    };
+    Routed::Done(delivery)
 }
 
-/// 起票 master が居ないので同じプロファイルで起動し、初回メッセージへ返答を載せる
+/// 起票 master の起動の組み立て（**background**。#2182）。`tako master` / PWA の「+ master」と
+/// 同じ `master_launch::plan` を通す（プロファイル検証・CLI の実在検査 = ログインシェルの
+/// `command -v`・system prompt の書き出し・tako の実行ファイルの解決）
+fn plan_master_for_response(
+    profile: &str,
+) -> Result<crate::orchestrator::master_launch::MasterLaunchPlan, String> {
+    // `TAKO_PERF_VERBOSE=1` の分布で組んだスレッドが分かる（UI スレッドなら `user_task_launch_plan`、
+    // background なら `bg:user_task_launch_plan`）
+    let _span = crate::diag::perf_span("user_task_launch_plan");
+    crate::orchestrator::master_launch::plan(profile)
+}
+
+/// 起票 master が居ないので同じプロファイルで起動し、初回メッセージへ返答を載せる（**UI スレッド**）。
+///
+/// 組み立て（`plan`）は呼び手が background で済ませて渡す（#2182。ここでは子プロセスを待たない）
 fn launch_master_for_response(
     host: &mut dyn ControlHost,
     task: &tako_core::user_task::UserTask,
     index: usize,
     profile: &str,
+    plan: Result<crate::orchestrator::master_launch::MasterLaunchPlan, String>,
 ) -> tako_core::user_task::Delivery {
     use crate::user_tasks::delivery_record;
     use tako_core::user_task::DeliveryState;
 
-    // 組み立て（プロファイル検証・CLI の実在検査）はペインを作る前に済ませる。
-    // ここで落ちたら空のタブを残さない（#983 と同じ順序）
-    let plan = match crate::orchestrator::master_launch::plan(profile) {
+    // 組み立て（プロファイル検証・CLI の実在検査）はペインを作る前に済ませてある。
+    // 落ちていたら空のタブを残さない（#983 と同じ順序）
+    let plan = match plan {
         Ok(p) => p,
         Err(e) => {
             log_user_task_delivery(&task.id, "launch_plan_failed", "operation");
@@ -46511,6 +46710,220 @@ mod tests {
         assert!(prepare_offload(&mut host, &t2086_req(p)).is_none());
     }
 
+    // --- #2182: 返答の配送で起票 master が居ないときの起動の組み立てを UI スレッドで待たない ---
+
+    /// 起票 master のペインの role を付け替える（`None` = master が居ない）
+    fn t2182_set_master_role(host: &mut MockHost, master: PaneId, role: Option<&str>) {
+        let tab = host.ws.active_tab_id();
+        host.ws
+            .get_tab_mut(tab)
+            .unwrap()
+            .tree_mut()
+            .get_mut(master)
+            .unwrap()
+            .set_role(role.map(str::to_string));
+    }
+
+    /// ③ の着地まで回す（② 積む → ③ 運ぶ）。返すのは ③ の結末
+    fn t2182_land_respond(host: &mut MockHost, id: &str, comment: &str) -> OffloadLanding {
+        let job = t2086_prepare(host, &t2086_respond(id, comment));
+        let next = match job.run_staged() {
+            OffloadOutcome::OnUi(next) => next,
+            OffloadOutcome::Reply(r) => panic!("運ぶ続きが無い: {r:?}"),
+        };
+        land_offload(host, next, PaneOrigin::Cli)
+    }
+
+    /// 組み立てた体の起動（`master_launch::plan` を通さずに着地だけを確かめる）
+    fn t2182_plan(profile: &str) -> crate::orchestrator::master_launch::MasterLaunchPlan {
+        crate::orchestrator::master_launch::MasterLaunchPlan {
+            profile_name: profile.to_string(),
+            tab_naming: None,
+            pane_role: tako_core::handoff::master_pane_role(profile),
+            role_env: tako_core::handoff::master_role_env(profile),
+            command: "echo t2182-master-launch".into(),
+            cwd: None,
+            agent: crate::orchestrator::WorkerAgent::Claude,
+            model_label: "t2182".into(),
+            effort: "high".into(),
+            limit_resume: false,
+            remote_control_opt_in: false,
+            remote_control: crate::claude_remote::RemoteControlDecision::off(),
+        }
+    }
+
+    /// 起票 master が居ないとき、③ 運ぶ（UI）は宛先を決めるだけで組み立てを待たず、組み立ては
+    /// もう一巡の background（`OffloadJob::UserTaskLaunch`）、起こすのは次の着地（UI）、記録は ④。
+    /// 組み立てが失敗したら（プロファイルが無い）タブを作らずに失敗として記録し、札は手放す
+    #[test]
+    fn issue2182_masterが居ない返答は組み立てをbackgroundへ出す() {
+        let (dir, _guard) = t1479_env("t2182-launch");
+        let path = dir.path().join("user-tasks.yaml");
+        let (mut host, master, id) = t2086_master_task();
+        t2182_set_master_role(&mut host, master, None);
+        let tabs = host.ws.tabs().len();
+        let job = match t2182_land_respond(&mut host, &id, "起こして") {
+            OffloadLanding::Again(job) => job,
+            _ => panic!("③ が組み立てを background へ出していない（UI スレッドで組んだ?）"),
+        };
+        assert!(
+            matches!(*job, OffloadJob::UserTaskLaunch(_)),
+            "③ の続きが組み立てのジョブでない"
+        );
+        // ③ は host に何も起こしていない（宛先を決めただけ）・記録もまだ
+        assert_eq!(host.ws.tabs().len(), tabs, "③ がタブを作った");
+        assert!(host.command_flows.is_empty() && host.prompt_flows.is_empty());
+        assert!(crate::user_tasks::show_at(&path, &id).unwrap()["delivery"].is_null());
+        // 組み立て（background）→ 起こす着地（UI。master を起こすので描く）
+        let next = match job.run_staged() {
+            OffloadOutcome::OnUi(next) => next,
+            OffloadOutcome::Reply(r) => panic!("起こす続きが無い: {r:?}"),
+        };
+        assert!(next.changes_layout(), "master を起こす着地で描かない");
+        let record = match land_offload(&mut host, next, PaneOrigin::Cli) {
+            OffloadLanding::Settled(job) => job,
+            _ => panic!("起こした後に ④ 記録する続きが無い"),
+        };
+        // プロファイルが無い = 組み立てが失敗 → 空のタブを残さない（#983 と同じ順序）
+        assert_eq!(
+            host.ws.tabs().len(),
+            tabs,
+            "組み立ての失敗で空のタブを作った"
+        );
+        assert!(host.command_flows.is_empty());
+        let value = t2086_settle(&mut host, record.run_staged()).unwrap();
+        assert_eq!(value["delivery"]["state"], "failed");
+        assert!(
+            value["delivery"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("master を起動できない")),
+            "組み立ての失敗の理由が記録されていない: {}",
+            value["delivery"]
+        );
+        let (next_ticket, serving) = respond_turn_state();
+        assert_eq!(
+            next_ticket, serving,
+            "組み立てを挟んだ返答の札が手放されていない"
+        );
+    }
+
+    /// 組み立てを待つ間に起票 master が現れたら（`tako master` を手で立てた等）、着地で宛先を
+    /// 決め直してそのペインへ送る（同じプロファイルの master を 2 つにしない）
+    #[test]
+    fn issue2182_組み立ての間にmasterが現れたらそちらへ送る() {
+        let (_dir, _guard) = t1479_env("t2182-appeared");
+        let (mut host, master, id) = t2086_master_task();
+        t2182_set_master_role(&mut host, master, None);
+        let tabs = host.ws.tabs().len();
+        let OffloadLanding::Again(job) = t2182_land_respond(&mut host, &id, "現れた") else {
+            panic!("③ が組み立てを background へ出していない");
+        };
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("起こす続きが無い");
+        };
+        t2182_set_master_role(&mut host, master, Some("orchestrator-master:_tako_2086_r_"));
+        let OffloadLanding::Settled(record) = land_offload(&mut host, next, PaneOrigin::Cli) else {
+            panic!("④ 記録する続きが無い");
+        };
+        assert_eq!(
+            host.ws.tabs().len(),
+            tabs,
+            "現れた master が居るのに起こした"
+        );
+        assert_eq!(host.prompt_flows.len(), 1, "現れた master へ送っていない");
+        assert_eq!(host.prompt_flows[0].0, master);
+        assert!(host.prompt_flows[0].1.contains("現れた"));
+        let value = t2086_settle(&mut host, record.run_staged()).unwrap();
+        assert_eq!(value["delivery"]["state"], "sent");
+        assert_eq!(value["delivery"]["pane"], master.as_u64());
+    }
+
+    /// 組み立てた起動の着地（UI）: 新しいタブに起こし、role を貼り、起動コマンドを #640 のフローへ、
+    /// 返答を初回メッセージとして prompt のフローへ積む。組み立ては走らせない（渡されたものを使う）
+    #[test]
+    fn issue2182_組み立てた起動で起こし返答を流す() {
+        let (dir, _guard) = t1479_env("t2182-land");
+        let path = dir.path().join("user-tasks.yaml");
+        let (mut host, master, id) = t2086_master_task();
+        t2182_set_master_role(&mut host, master, None);
+        let tabs = host.ws.tabs().len();
+        let mut p = t1479_params("respond", Some(&id));
+        p.decision = Some("approve".into());
+        p.comment = Some("起こして流す".into());
+        p.via = Some("pwa".into());
+        let stored = respond_store_at(path.clone(), &p, PaneOrigin::Cli).unwrap();
+        let UserTaskRespondStep::Launch(job) = user_task_respond_deliver(&mut host, stored) else {
+            panic!("master が居ないのに運び終えた");
+        };
+        assert_eq!(job.profile, "_tako_2086_r_");
+        let landing = UserTaskLaunchLanding {
+            plan: Ok(t2182_plan(&job.profile)),
+            job: *job,
+        };
+        let (delivered, turn) = user_task_launch_land(&mut host, landing);
+        assert!(turn.is_none(), "右パネルの経路は札を持たない");
+        assert_eq!(host.ws.tabs().len(), tabs + 1, "新しいタブに起こしていない");
+        let pane = delivered.delivery.pane.expect("起こしたペイン");
+        let pane = PaneId::from_raw(pane);
+        assert_eq!(
+            host.command_flows,
+            vec![(pane, "echo t2182-master-launch".to_string())],
+            "起動コマンドが #640 のフローに積まれていない"
+        );
+        assert_eq!(host.prompt_flows.len(), 1);
+        assert_eq!(host.prompt_flows[0].0, pane);
+        assert!(host.prompt_flows[0].1.contains("起こして流す"));
+        let role = host
+            .ws
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .find(|p| p.id() == pane)
+            .and_then(|p| p.role().map(str::to_string));
+        assert_eq!(role.as_deref(), Some("orchestrator-master:_tako_2086_r_"));
+        let value = user_task_respond_finish(delivered).unwrap();
+        assert_eq!(value["delivery"]["state"], "launched");
+        assert_eq!(value["delivery"]["pane"], pane.as_u64());
+    }
+
+    /// もう一巡を出せない直の呼び手（`finish_offload`）は、起票 master が居なくても組み立てを
+    /// UI スレッドで待たずに配送の失敗として記録する（返答は積めている・札は手放す）
+    #[test]
+    fn issue2182_直の呼び手は組み立てを待たず失敗として記録する() {
+        let (_dir, _guard) = t1479_env("t2182-direct");
+        let (mut host, master, id) = t2086_master_task();
+        t2182_set_master_role(&mut host, master, None);
+        let tabs = host.ws.tabs().len();
+        let job = t2086_prepare(&mut host, &t2086_respond(&id, "直の呼び手"));
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("運ぶ続きが無い");
+        };
+        let value = finish_offload(&mut host, next, PaneOrigin::Cli).unwrap();
+        assert_eq!(host.ws.tabs().len(), tabs, "直の呼び手が master を起こした");
+        assert_eq!(value["responses"][0]["comment"], "直の呼び手");
+        assert_eq!(value["delivery"]["state"], "failed");
+        assert!(value["delivery"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("UI スレッドでは待たない")));
+        let (next_ticket, serving) = respond_turn_state();
+        assert_eq!(next_ticket, serving, "札が手放されていない");
+    }
+
+    /// 同期の腕（経路を省いた返答・直呼び）は組み立ても同じスレッドで順に通す（失敗の記録は同じ）
+    #[test]
+    fn issue2182_同期の腕は組み立ても順に通す() {
+        let (_dir, _guard) = t1479_env("t2182-sync");
+        let (mut host, master, id) = t2086_master_task();
+        t2182_set_master_role(&mut host, master, None);
+        let mut p = t1479_params("respond", Some(&id));
+        p.decision = Some("approve".into());
+        let value = dispatch_user_task(&mut host, PaneOrigin::Cli, p).unwrap();
+        assert_eq!(value["delivery"]["state"], "failed");
+        assert!(value["delivery"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("master を起動できない")));
+    }
+
     /// 展開: 在ることの確かめは background、開く・右パネルを出すのは着地（UI）。無い id は
     /// background の Err で画面に触らない。折りたたみも同じ腕
     #[test]
@@ -46734,7 +47147,10 @@ mod tests {
                 delivery: None,
             };
             let mut host2 = MockHost::new();
-            let delivery = deliver_user_task_response(&mut host2, &task, 0);
+            let Routed::Done(delivery) = deliver_user_task_response(&mut host2, &task, 0, None)
+            else {
+                panic!("role={role:?} の返答で master を起こそうとした（宛先不明は起こさない）");
+            };
             assert_eq!(
                 delivery.state,
                 tako_core::user_task::DeliveryState::Failed,

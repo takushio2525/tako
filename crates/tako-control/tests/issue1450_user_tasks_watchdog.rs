@@ -391,7 +391,28 @@ fn scan_delivery(src: &str) -> Vec<Offender> {
             }
         }
     }
-    // (b) master が居ないときは `master_launch::plan`（= tako master / #1078 と同じ組み立て）
+    // (b) master が居ないときは `master_launch::plan`（= tako master / #1078 と同じ組み立て）。
+    // 組み立ては子プロセスを待つので background の `plan_master_for_response` が呼び（#2182）、
+    // 起こすのは UI スレッドの `launch_master_for_response`
+    match fn_window(src, "fn plan_master_for_response(") {
+        None => out.push(Offender {
+            file: DISPATCH,
+            line: 0,
+            why: "`plan_master_for_response` が見つからない（master の起動を組み立てない。#1450 / #2182）"
+                .into(),
+        }),
+        Some((at, window)) => {
+            if !code_only(&window).contains("master_launch::plan(") {
+                out.push(Offender {
+                    file: DISPATCH,
+                    line: at,
+                    why: "master の起動が `master_launch::plan` を通っていない（CLI / PWA と\
+                          組み立てが割れると「この経路の master だけ prompt が付かない」= #761）"
+                        .into(),
+                });
+            }
+        }
+    }
     match fn_window(src, "fn launch_master_for_response(") {
         None => out.push(Offender {
             file: DISPATCH,
@@ -402,11 +423,6 @@ fn scan_delivery(src: &str) -> Vec<Offender> {
         Some((at, window)) => {
             let code = code_only(&window);
             for (mark, why) in [
-                (
-                    "master_launch::plan(",
-                    "master の起動が `master_launch::plan` を通っていない（CLI / PWA と\
-                     組み立てが割れると「この経路の master だけ prompt が付かない」= #761）",
-                ),
                 (
                     "Request::TabNew {",
                     "master を新しいタブへ起こしていない（#1450 の要件追加 ③）",
@@ -504,6 +520,11 @@ fn 走査が空振りしていない() {
             "master 起動",
             &sources.dispatch,
             "fn launch_master_for_response(",
+        ),
+        (
+            "master 起動の組み立て（#2182）",
+            &sources.dispatch,
+            "fn plan_master_for_response(",
         ),
         ("通知", &sources.sidebar, "fn notify_user_task_added("),
     ] {

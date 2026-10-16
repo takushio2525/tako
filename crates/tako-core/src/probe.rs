@@ -495,6 +495,20 @@ pub fn issue2151_legacy() -> bool {
     })
 }
 
+/// #2182 の A/B（`TAKO_2182_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// タスクへの返答の配送（IPC = CLI / MCP / PWA と右パネルの「返す」）で起票 master が居ないとき、
+/// 起動の組み立て（`master_launch::plan` = CLI の所在確認のログインシェルと tako の実行ファイルの
+/// 解決）を UI スレッドで待つ。**ゲートはこの 1 か所**で、tako-control / tako-app もここを読む
+pub fn issue2182_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2182_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。

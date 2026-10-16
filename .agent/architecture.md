@@ -1480,9 +1480,21 @@ lid-guard.json が使う）:
   約 300 ファイル・8,000 関数）、届いた関数の本体に子プロセスの口があれば、入口で次の段を呼んだ行を
   file:line で名指す。集約点の `dispatch` / `dispatch_inner` は辿らない（要求ごとに UI か background かが
   分かれる）。製品コードは変えていない（印を付けて回る方式は、包む関数すべてに印が要り付け忘れが穴になる）。
-  **既知の残り**: 返答の配送（#2086 の ③ = `land_offload`）で起票 master が居ないとき
-  `launch_master_for_response` → `master_launch::plan` が CLI の所在確認（ログインシェルの `command -v`。上限つき）と
-  `resolve_tako_binary` を UI スレッドで待つ（番犬の `GRAPH_KNOWN`。直すのは別 Issue）
+  見つけた既知の残り（返答の配送の master 起動の組み立て）は #2182 で直し、`GRAPH_KNOWN` は空
+- **返答の配送で master を起こす組み立ても UI スレッドで待たない**（#2182）: タスクへの返答の ③ 運ぶ
+  （`user_task_respond_deliver`。UI）は宛先を決めるだけで、起票 master が居なければ組み立て
+  （`master_launch::plan` = CLI の所在確認のログインシェル `command -v`・上限 15 秒 + tako の実行ファイルの解決）を
+  待たずに `UserTaskRespondStep::Launch` を返す。IPC の着地（`land_offload`）はもう一巡 background
+  （`OffloadJob::UserTaskLaunch` → `plan_master_for_response`）へ出し、次の着地（`user_task_launch_land`。UI）で
+  タブを作って起動コマンドと返答を流し、④ 記録する（background）へ進む。返答の札（`RespondTurn`）は
+  組み立ての間もジョブが持ち回る（後ろの返答は background で番を待つ = UI は待たない）。着地では宛先を
+  **決め直し**、組み立ての間に起票 master が現れていれば起こさずにそちらへ送る。右パネルの「返す」も同じ段を
+  `background_executor()` で回す。もう一巡を出せない直の呼び手（`finish_offload`）は組み立てを待たずに配送の
+  失敗として記録する（`Probed::Missing` と同じく待たない側へ倒す。製品の経路は通らない）。同期の腕（経路を
+  省いた返答・直呼び）は組み立ても同じスレッドで順に通す。番犬は `issue1984_ui_thread_offload_watchdog.rs` の
+  15 節（グラフ）+ 16 節（`job.run()` の形と tako-app）、A/B は `TAKO_2182_LEGACY=1`（UI スレッドで組む）、
+  実経路は `scripts/test-respond-master-launch-2182.sh`（`$SHELL` を差し替えた戻らないログインシェル）と
+  visual-test `tasks-launch-2182`（右パネルの「返す」の入口 `user_task_respond`）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

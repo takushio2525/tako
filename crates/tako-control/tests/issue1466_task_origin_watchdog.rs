@@ -624,8 +624,8 @@ fn 逆戻りを名指しできる() {
     // (5) 配送が宛先不明を握りつぶす（誰かへ届く）
     let mut s = Sources::load(&root);
     s.dispatch = s.dispatch.replace(
-        "        return crate::user_tasks::unresolved_delivery(index);",
-        "        return delivery_record(DeliveryState::Failed, \"default\", None, None, None, index);",
+        "        return Routed::Done(crate::user_tasks::unresolved_delivery(index));",
+        "        return Routed::Done(delivery_record(DeliveryState::Failed, \"default\", None, None, None, index));",
     );
     expect_hit(&s, DISPATCH, "`unresolved_delivery` を返していない");
 
