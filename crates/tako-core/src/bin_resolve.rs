@@ -335,10 +335,6 @@ static NOTICES: NoticeSink = NoticeSink::new();
 mod tests {
     use super::*;
 
-    /// 偽の実行ファイルの空打ちの引数（これを受けたら本文を走らせずに終わる）
-    #[cfg(unix)]
-    const WARM_ARG: &str = "tako-2180-warm";
-
     /// 偽のシェルが pid を書く行の前に遅れを置く注入（検証専用・#2180。値はミリ秒）。
     /// 起動が締め切りより遅れた回を、CPU を焼かずに作る
     #[cfg(unix)]
@@ -350,24 +346,17 @@ mod tests {
 
     /// 偽の実行ファイル（引数を無視して本文を実行する。ログインシェル・`git` の代役）。
     ///
-    /// 作った時点で 1 回空打ちする（#2180）。macOS は新しい実行ファイルの初回の exec に約 0.3 秒の
-    /// 検査を挟み、その検査はシステム全体で 1 本ずつ進む（実測: 6 本同時なら最後は 1.7 秒）。
-    /// 並列のテストが偽の実行ファイルを同時に起こすと、締め切りを測っている最中にその列で待たされるので、
-    /// 検査は締め切りの外で済ませておく（済んだものは列の最中でも 5〜11 ms で起きる）
+    /// 作った時点で 1 回空打ちする（#2180 → 共通の 1 実装 `fake_exec` へ寄せた = #2222）。
+    /// macOS は新しい実行ファイルの初回の exec に約 0.3 秒の検査を挟み、その検査はシステム全体で
+    /// 1 本ずつ進む（実測: 6 本同時なら最後は 1.7 秒）。並列のテストが偽の実行ファイルを同時に起こすと、
+    /// 締め切りを測っている最中にその列で待たされるので、検査は締め切りの外で済ませておく
+    /// （済んだものは列の最中でも 5〜11 ms で起きる）。空打ちが終わらなくても進む
+    /// （本番の起動が遅れるだけで、判定は遅れに頼らない = `assert_reaped`）
     #[cfg(unix)]
     fn fake_bin(dir: &std::path::Path, name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\n[ \"$1\" = {WARM_ARG} ] && exit 0\n{body}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = path.display().to_string();
-        // 空打ちが終わらなくても進む（本番の起動が遅れるだけで、判定は遅れに頼らない = `assert_reaped`）
-        let _ = crate::probe::output_with_timeout(&path, &[WARM_ARG], OUTER_DEADLINE);
-        path
+        crate::fake_exec::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
+        path.display().to_string()
     }
 
     /// 戻らないログインシェル。`exec` で置き換える = 打ち切りの kill が眠る本人に当たる（孫を残さない）。

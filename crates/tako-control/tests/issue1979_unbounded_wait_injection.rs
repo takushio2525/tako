@@ -53,11 +53,11 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// 偽のコマンドを書き、作った時点で空打ちする（#2222）。初回 exec の検査を、修正後の腕の
+/// 器の問い合わせの上限（`TMUX_QUERY_TIMEOUT` = 5 秒）と修正前の腕の [`LEGACY_DEADLINE`] の外で
+/// 済ませる（列で待たされると呼び出しの記録より先に打ち切られ、回数の判定が偽の赤になる）
 fn write_exec(path: &Path, body: &str) {
-    std::fs::write(path, body).expect("偽のコマンドを書く");
-    let mut perm = std::fs::metadata(path).expect("meta").permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-    std::fs::set_permissions(path, perm).expect("chmod");
+    tako_core::fake_exec::write_script(path, body);
 }
 
 /// 偽のコマンドが残した孫を落とす（**自分が記録した pid だけ**）

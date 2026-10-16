@@ -18,6 +18,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"
+# shellcheck source=lib/fake-exec.sh
+. "$ROOT/scripts/lib/fake-exec.sh"
 PASS=0; FAIL=0
 
 ok()   { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -129,6 +131,11 @@ mkenv(){ # $1 = mcp list の振る舞い
   printf '#!/bin/sh\necho "==> Pouring $2"\nexit 0\n' > "$BIN/brew"
   write_claude "$1"
   chmod +x "$BIN"/* 2>/dev/null
+  # 作りたてのスタブは作った時点で空打ちし、初回 exec の検査を外側の締め切り（DEADLINE）の外で
+  # 済ませる（#2222）。段ごとに作り直すスタブの初回の exec は、判定に効く probe（3 秒）ではなく
+  # 上限の無い段で起きて所要に足されるので、1 本あたりの検査が 17 秒を超える回（#1838 で見た
+  # 30 秒級の列）では 40 秒の締め切りに掛かって「固まった」と読まれる（注入 20 秒で再現）
+  fake_exec_warm "$BIN"/*
 }
 
 # 隔離した tako を**外側の締め切りつき**で走らせる。

@@ -36,8 +36,6 @@ const NEW_DEADLINE: Duration = Duration::from_secs(30);
 const LEGACY_DEADLINE: Duration = Duration::from_secs(6);
 /// B が引き始めるまでの間（A の解決が始まってから引く）
 const B_DELAY: Duration = Duration::from_millis(200);
-/// スタブの空打ちの引数（これを受けたら本文を走らせずに終わる）
-const WARM_ARG: &str = "tako-2185-warm";
 /// スタブが pid を書く行の前に遅れを置く注入（検証専用・値はミリ秒）。bin_resolve のテストモジュールの
 /// 偽のシェル（#2180）と同じ名前なので、1 つの値で両方が同じだけ遅れる
 const INJECT_SHELL_DELAY_ENV: &str = "TAKO_2180_INJECT_SHELL_DELAY_MS";
@@ -72,28 +70,24 @@ fn 子プロセスの本体() {
 
 /// 戻らないログインシェル（自分の pid を `calls` へ追記してから眠る。`exec` = 打ち切りの kill が本人に当たる）。
 ///
-/// 作った時点で 1 回空打ちする（#2185）。macOS は新しく書いた実行ファイルの初回の exec に約 0.3 秒の
-/// 検査を挟み、その検査はシステム全体で 1 本ずつ進む（実測: 6 本同時なら最後は 1.7 秒。#2180）。
-/// 並列のテストが偽の実行ファイルを同時に起こすと、子の中の上限（2 秒）を測っている最中にその列で
-/// 待たされるので、検査は締め切りの外で済ませておく（済んだものは列の最中でも 5〜11 ms で起きる）
+/// 作った時点で 1 回空打ちする（#2185 → 共通の 1 実装 `fake_exec` へ寄せた = #2222）。macOS は
+/// 新しく書いた実行ファイルの初回の exec に約 0.3 秒の検査を挟み、その検査はシステム全体で 1 本ずつ
+/// 進む（実測: 6 本同時なら最後は 1.7 秒。#2180）。並列のテストが偽の実行ファイルを同時に起こすと、
+/// 子の中の上限（2 秒）を測っている最中にその列で待たされるので、検査は締め切りの外で済ませておく
+/// （済んだものは列の最中でも 5〜11 ms で起きる）。空打ちが終わらなくても進む（子の中の起動が
+/// 遅れるだけで、判定は pid に頼らない）
 fn hang_shell(dir: &Path) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("hang-shell");
     let calls = dir.join("calls");
-    std::fs::write(
+    tako_core::fake_exec::write_script(
         &path,
-        format!(
-            "#!/bin/sh\n[ \"$1\" = {WARM_ARG} ] && exit 0\n{}echo $$ >> '{}'\nexec /bin/sleep 600\n",
+        &format!(
+            "#!/bin/sh\n{}echo $$ >> '{}'\nexec /bin/sleep 600\n",
             start_delay(),
             calls.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = path.display().to_string();
-    // 空打ちが終わらなくても進む（子の中の起動が遅れるだけで、判定は pid に頼らない）
-    let _ = tako_core::probe::output_with_timeout(&path, &[WARM_ARG], NEW_DEADLINE);
-    path
+    );
+    path.display().to_string()
 }
 
 /// [`INJECT_SHELL_DELAY_ENV`] の遅れ（無ければ空）。子の PATH は空のディレクトリなので絶対パスで呼ぶ

@@ -120,14 +120,13 @@ fn hits(body: &str, base_line: usize, rel: &str, needle: &str) -> Vec<String> {
         .collect()
 }
 
-/// 実行できるスタブを置いてパスを返す
+/// 実行できるスタブを置いてパスを返す。作った時点で空打ちして、初回 exec の検査を
+/// 確かめの上限（`TAILSCALE_TIMEOUT` = 10 秒）の外で済ませる（#2222）
 #[cfg(unix)]
 fn stub(dir: &Path, name: &str, body: &str) -> String {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).expect("スタブの置き場");
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("スタブ");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    tako_core::fake_exec::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
     path.to_str().expect("UTF-8").to_string()
 }
 

@@ -336,21 +336,19 @@ fn 子プロセス_既定の解決を1回走らせて結果を書く() {
 }
 
 /// 偽のログインシェル（`-l -c 'command -v <name>'` に `bin` の中のパスを答える）で、子プロセスに
-/// 既定の解決を走らせた結果（`Launch` の Debug 表記）
+/// 既定の解決を走らせた結果（`Launch` の Debug 表記）。偽のシェルは作った時点で空打ちし、
+/// 初回 exec の検査を解決の上限（`probe_timeout` = 15 秒）の外で済ませる（#2222）
 #[cfg(unix)]
 fn launch_in_child(scratch: &Scratch, id: &str, bin: &std::path::Path) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let shell = scratch.path(&format!("shell-{id}"));
-    std::fs::write(
+    tako_core::fake_exec::write_script(
         &shell,
-        format!(
+        &format!(
             "#!/bin/sh\nname=\"${{3#command -v }}\"\n[ -x \"{}/$name\" ] && echo \"{}/$name\"\nexit 0\n",
             bin.display(),
             bin.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let out = scratch.path(&format!("result-{id}.txt"));
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -380,7 +378,6 @@ fn launch_in_child(scratch: &Scratch, id: &str, bin: &std::path::Path) -> String
 #[cfg(unix)]
 #[test]
 fn path_の古い版は確かめに落ちて信じない() {
-    use std::os::unix::fs::PermissionsExt;
     let scratch = Scratch::new("probe");
     let stale = scratch.path("stale");
     let fresh = scratch.path("fresh");
@@ -390,11 +387,10 @@ fn path_の古い版は確かめに落ちて信じない() {
     let stale_body =
         "#!/bin/sh\necho \"error: unexpected argument '--version' found\" >&2\nexit 2\n";
     let fresh_body = "#!/bin/sh\necho \"x 9.9.9\"\nexit 0\n";
+    // 偽物は作った時点で空打ちし、初回 exec の検査を確かめの上限（15 秒）の外で済ませる（#2222）
     for (dir, body) in [(&stale, stale_body), (&fresh, fresh_body)] {
         for name in ["texlab", "tombi", "vscode-css-language-server"] {
-            let path = dir.join(name);
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            tako_core::fake_exec::write_script(&dir.join(name), body);
         }
     }
     for id in ["texlab", "tombi"] {
