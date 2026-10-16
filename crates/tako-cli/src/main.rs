@@ -5135,11 +5135,15 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         Some(s) => ("default", Some(s)),
     };
 
-    let profile = match orchestrator::Profile::load(profile_name) {
-        Ok(p) => p,
-        Err(_) if profile_name == "default" => orchestrator::Profile::default(),
-        Err(e) => return Err(e),
-    };
+    // 読み込みはスマホ・返答の配送と同じ 1 実装（#2227）。読めない default は組み込み既定で
+    // 立てるが黙らない（`-<key>` が #1825 で作られていなければ理由と直し方で止まる）
+    let orchestrator::master_launch::LaunchProfile {
+        profile,
+        warning: load_warning,
+    } = orchestrator::master_launch::load_profile(profile_name)?;
+    if let Some(w) = &load_warning {
+        eprintln!("警告: {w}");
+    }
 
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env()?;
@@ -5191,7 +5195,11 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         }
     }
 
-    let prompt_content = profile.build_system_prompt(profile_name);
+    // #2227: 上の `警告:` 行は claude の全画面 TUI に隠れうるので、master 本人にも渡す
+    let prompt_content = orchestrator::master_launch::with_startup_warning(
+        profile.build_system_prompt(profile_name),
+        load_warning.as_deref(),
+    );
     let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
     let prompt_path = dir.join(format!("_system_prompt_{profile_name}.md"));
     std::fs::write(&prompt_path, &prompt_content)

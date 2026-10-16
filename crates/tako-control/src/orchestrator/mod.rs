@@ -2949,6 +2949,38 @@ fn not_inherited_reason(key: &str, why: &str) -> String {
     )
 }
 
+/// `tako master -<key>` の専用プロファイルが無い理由が #1825（継承元の default.yaml を
+/// 読めないので作っていない）なら、`projects add` と同じ理由と直し方を返す（#2227）。
+///
+/// 登録済みのキーで・ファイルが無く・継承元を読めないときだけ `Some`。それ以外
+/// （未登録の名前・継承元は読める）は呼び出し元の「見つからない」をそのまま出す
+pub fn missing_project_profile_reason(key: &str) -> Option<String> {
+    let path = ProfileKind::Master.path(key).ok()?;
+    let registered = ProjectsConfig::load()
+        .map(|c| c.projects.contains_key(key))
+        .unwrap_or(false);
+    missing_project_profile_reason_from(
+        key,
+        path.is_file(),
+        registered,
+        check_project_profile_base(),
+    )
+}
+
+/// [`missing_project_profile_reason`] の判定（純粋部分。テストは状態を直接渡す）
+fn missing_project_profile_reason_from(
+    key: &str,
+    exists: bool,
+    registered: bool,
+    base: Result<(), String>,
+) -> Option<String> {
+    if exists || !registered {
+        return None;
+    }
+    let why = base.err()?;
+    Some(not_inherited_reason(key, &why))
+}
+
 /// projects.yaml に登録されている cwd（生値。`~` は展開しない）
 fn project_entry_cwd(key: &str) -> Option<String> {
     ProjectsConfig::load()
@@ -4406,6 +4438,36 @@ mod tests {
         assert!(
             reason.contains("tako migrate run") && reason.contains("'k'"),
             "直し方が無い: {reason}"
+        );
+    }
+
+    /// #2227: `tako master -<key>` の「見つからない」に足すのは、登録済み・未生成・
+    /// 継承元が読めない、の 3 つが揃ったときだけ（他は従来の文のまま）
+    #[test]
+    fn issue2227_専用プロファイルが無い理由は継承元が読めないときだけ足す() {
+        let broken = || Err::<(), String>("d.yaml を読めない（x）".into());
+        let reason = missing_project_profile_reason_from("k", false, true, broken())
+            .expect("登録済み・未生成・継承元が読めない = 理由を足す");
+        assert!(
+            reason.contains("d.yaml を読めない")
+                && reason.contains("tako migrate run")
+                && reason.contains("'k'"),
+            "理由と直し方が無い: {reason}"
+        );
+        assert_eq!(
+            missing_project_profile_reason_from("k", true, true, broken()),
+            None,
+            "ファイルがあるなら読めない理由はそのファイル自身のもの"
+        );
+        assert_eq!(
+            missing_project_profile_reason_from("k", false, false, broken()),
+            None,
+            "未登録の名前は従来どおり「見つからない」だけ"
+        );
+        assert_eq!(
+            missing_project_profile_reason_from("k", false, true, Ok(())),
+            None,
+            "継承元が読めるなら #1825 の理由ではない"
         );
     }
 

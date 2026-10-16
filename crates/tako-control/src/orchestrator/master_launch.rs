@@ -32,8 +32,19 @@
 //! `TAKO_ORCHESTRATOR_ROLE`（`master[:<名前>]`）。正本は `tako_core::handoff` の
 //! `master_pane_role` / `master_role_env` で、ここもそれを通す
 //! （CLI の `-<名前>` 起動と同じ形になる = `master_pane_role` の doc と #761 の記録が根拠）。
+//!
+//! ## 読めない default.yaml でも立てるが、黙らない（#2227）
+//!
+//! プロファイルの読み込みは [`load_profile`] の 1 実装（CLI / スマホ / 返答の配送が通る）。
+//! `default` が読めないときは**組み込み既定で立てる**（#916 の「退避して既定値で動き、
+//! 知らせる」と同じ方針。止めると YAML を直せない利用者が master を立てられず、
+//! スマホ・返答の配送からの起動も失敗する）。その代わり、個人ルール・モデルが効いていない
+//! ことを CLI の `警告:` 行（スマホの起動は応答の `warnings`。PWA はまだ表示しない）・
+//! persist.log・master 本人の system prompt（[`with_startup_warning`]）へ出す。CLI の行は
+//! claude の全画面 TUI に隠れうるので、どの経路でも利用者へ確実に届くのは master の最初の返答。
+//! `-<key>` の専用プロファイルが #1825 で作られていないときは、理由と直し方を足して止める
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::orchestrator::{self, Profile};
 
@@ -67,6 +78,8 @@ pub struct MasterLaunchPlan {
     pub remote_control_opt_in: bool,
     /// Remote Control（#1068）の決定。**opt-in していても環境が不適格ならフラグは付かない**
     pub remote_control: crate::claude_remote::RemoteControlDecision,
+    /// 立てるが利用者に必ず見せる理由（読めない default.yaml を組み込み既定で代えた等。#2227）
+    pub warning: Option<String>,
 }
 
 impl MasterLaunchPlan {
@@ -85,6 +98,8 @@ impl MasterLaunchPlan {
             "cwd": self.cwd.as_ref().map(|p| p.display().to_string()),
             "limit_resume": self.limit_resume,
             "remote_control": self.remote_control_json(),
+            // 立てたが黙らせない理由（#2227。`projects add` の `warnings` と同じ形）
+            "warnings": self.warning.iter().collect::<Vec<_>>(),
         })
     }
 
@@ -128,12 +143,8 @@ impl MasterLaunchPlan {
 ///
 /// 表示言語は呼び出し側が初期化しておくこと（理由文が英語で凍る。#983 で踏んだ）
 pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
-    let profile = match Profile::load(profile_name) {
-        Ok(p) => p,
-        // 未設定の既定プロファイルは組み込み既定で立てる（CLI と同じ緩和）
-        Err(_) if profile_name == "default" => Profile::default(),
-        Err(e) => return Err(e),
-    };
+    // 読み込みは CLI と同じ 1 実装（#2227。読めない default は立てるが warning を持つ）
+    let LaunchProfile { profile, warning } = load_profile(profile_name)?;
 
     profile.validate_env()?;
     let cwd = profile.resolve_cwd()?;
@@ -144,7 +155,10 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
     // `command not found` を出すと、tako 側は成功と報告してしまう）
     orchestrator::agent_cli::preflight(agent).map_err(|e| e.message())?;
 
-    let prompt_content = profile.build_system_prompt(profile_name);
+    let prompt_content = with_startup_warning(
+        profile.build_system_prompt(profile_name),
+        warning.as_deref(),
+    );
     let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
     let prompt_path = dir.join(format!("_system_prompt_{profile_name}.md"));
     if let Some(parent) = prompt_path.parent() {
@@ -173,7 +187,103 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
         limit_resume: orchestrator::resolve_master_limit_resume(&profile),
         remote_control_opt_in: profile.remote_control_enabled(),
         remote_control,
+        warning,
     })
+}
+
+/// master の起動で使うプロファイル（[`load_profile`] の結果。#2227）
+#[derive(Debug, Clone)]
+pub struct LaunchProfile {
+    pub profile: Profile,
+    /// 立てるが利用者に必ず見せる理由（`None` = 黙ってよい）
+    pub warning: Option<String>,
+}
+
+/// #2227 の A/B。`TAKO_2227_LEGACY=1` で修正前（読めない default.yaml は黙って組み込み既定・
+/// `-<key>` は直し方の無い「見つからない」）へ戻す
+pub fn legacy_profile_load() -> bool {
+    std::env::var_os("TAKO_2227_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// master の起動で使うプロファイルを読む（#2227）。**CLI の `tako master` と [`plan`]
+/// （スマホの「+ master」・返答の配送）が同じ 1 実装を通る**。
+///
+/// - `default` が読めないときは**組み込み既定で立てる**が、理由を `warning` に載せて
+///   persist.log へも 1 行残す（中身は `.unreadable.bak` へ退避・default.yaml には触らない）。
+///   無いだけなら従来どおり黙って組み込み既定（ゼロコンフィグの初回）
+/// - `-<key>` が無く、そのキーが登録済みで継承元の default.yaml を読めない
+///   （#1825 で作っていない）ときは、「見つからない」に理由と直し方を足して止める
+pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
+    if legacy_profile_load() {
+        let profile = match Profile::load(name) {
+            Ok(p) => p,
+            Err(_) if name == tako_core::handoff::DEFAULT_PROFILE => Profile::default(),
+            Err(e) => return Err(e),
+        };
+        return Ok(LaunchProfile {
+            profile,
+            warning: None,
+        });
+    }
+    if name == tako_core::handoff::DEFAULT_PROFILE {
+        let loaded = load_default_at(&orchestrator::ProfileKind::Master.path(name)?);
+        if let Some(w) = &loaded.warning {
+            crate::diag::persist_log(&format!("[master] {name}: {w}"));
+        }
+        return Ok(loaded);
+    }
+    match Profile::load(name) {
+        Ok(profile) => Ok(LaunchProfile {
+            profile,
+            warning: None,
+        }),
+        Err(e) => match orchestrator::missing_project_profile_reason(name) {
+            Some(why) => {
+                let msg = format!("{e}。{why}");
+                crate::diag::persist_log(&format!("[master] {name}: {msg}"));
+                Err(msg)
+            }
+            None => Err(e),
+        },
+    }
+}
+
+/// [`load_profile`] の `default` の本体（パス指定。テストは一時 dir で回す）。
+///
+/// 読み方は専用プロファイルの継承元と同じ 1 実装（[`orchestrator::project_profile_base_at`]。
+/// 無い = 組み込み既定・空 = 設定なし・読めない = 退避して `Err`）。`Err` を握りつぶさず
+/// warning にする
+pub fn load_default_at(path: &Path) -> LaunchProfile {
+    match orchestrator::project_profile_base_at(path) {
+        Ok(profile) => LaunchProfile {
+            profile,
+            warning: None,
+        },
+        Err(why) => LaunchProfile {
+            profile: Profile::default(),
+            warning: Some(format!(
+                "{why}。default.yaml の個人ルール（prompt_blocks）・モデルなどの設定を使わず、\
+                 組み込み既定で master を立てる。default.yaml を直すと次の起動から効く"
+            )),
+        },
+    }
+}
+
+/// 起動時の警告を master 本人の system prompt の末尾へも添える（#2227）。
+///
+/// CLI の `警告:` 行は claude の全画面 TUI に隠れうる。master が最初の返答で利用者へ
+/// 伝えれば、どの起動経路（CLI / スマホ / 返答の配送）でも確実に届く。警告が無ければ不変
+pub fn with_startup_warning(prompt: String, warning: Option<&str>) -> String {
+    match warning {
+        None => prompt,
+        Some(w) => format!(
+            "{prompt}\n\n## Startup warning from tako (#2227)\n\n\
+             This master started on tako's built-in defaults because its profile could not be \
+             read, so the user's personal rules (`prompt_blocks`) and model settings from it are \
+             NOT in effect. Tell the user this in your first reply, quoting the detail below, \
+             and do not guess the missing rules.\n\nDetail: {w}\n"
+        ),
+    }
 }
 
 /// ペインの表示名（`master` / `master-<名前>`）。CLI の `tako master -<名前>` と同じ形。
@@ -346,6 +456,7 @@ mod tests {
             limit_resume: false,
             remote_control_opt_in: false,
             remote_control: crate::claude_remote::RemoteControlDecision::off(),
+            warning: None,
         };
         let v = plan.remote_control_json();
         assert_eq!(v["state"], "off");
@@ -359,5 +470,91 @@ mod tests {
         let full = plan.to_json();
         assert!(full.get("command").is_none());
         assert_eq!(full["role"], "orchestrator-master:dev");
+        assert_eq!(
+            full["warnings"],
+            serde_json::json!([]),
+            "警告が無ければ空の列"
+        );
+        let warned = MasterLaunchPlan {
+            warning: Some("w2227".into()),
+            ..plan
+        };
+        assert_eq!(warned.to_json()["warnings"], serde_json::json!(["w2227"]));
+    }
+
+    /// #2227 の default.yaml（**共有の隔離先ではなく使い捨て dir** に置く。共有の
+    /// profiles/default.yaml を壊すと、並行する他のテストが壊れた default を読む）
+    fn t2227_default(body: Option<&[u8]>) -> (tako_core::test_residue::ScratchDir, PathBuf) {
+        let dir = tako_core::test_residue::ScratchDir::new("issue2227-default");
+        assert!(
+            dir.path().starts_with(std::env::temp_dir()),
+            "一時 dir の外に書こうとしている: {}",
+            dir.path().display()
+        );
+        let path = dir.path().join("default.yaml");
+        if let Some(body) = body {
+            std::fs::write(&path, body).expect("default.yaml を置ける");
+        }
+        (dir, path)
+    }
+
+    /// 読めない default（壊れた YAML / 型違い / UTF-8 でない）は組み込み既定で立てるが、
+    /// 理由・直し方を warning に持ち、中身を退避して default.yaml には触らない
+    #[test]
+    fn issue2227_読めないdefaultは組み込み既定で立てて警告する() {
+        for body in [
+            &b"model: m2227\nprompt_blocks:\n  append: \"PERSONAL\n  prepend: [\n"[..],
+            &b"model: m2227\nprompt_blocks:\n  append: [PERSONAL]\n"[..],
+            &b"model: m2227\n\xff\xfe\x00broken\n"[..],
+        ] {
+            let (_dir, path) = t2227_default(Some(body));
+            let loaded = load_default_at(&path);
+            let w = loaded
+                .warning
+                .as_deref()
+                .expect("黙って組み込み既定へ落としている");
+            assert!(
+                w.contains(&path.display().to_string())
+                    && w.contains("組み込み既定")
+                    && w.contains("default.yaml を直す"),
+                "理由・直し方が無い: {w}"
+            );
+            assert_eq!(loaded.profile.model, None, "組み込み既定で立てていない");
+            assert_eq!(
+                std::fs::read(&path).expect("元が残る"),
+                body,
+                "default.yaml を書き換えている"
+            );
+        }
+    }
+
+    /// 回帰なし: 読める / 空 / 無い default は従来どおり黙って立つ（無い = ゼロコンフィグの初回）
+    #[test]
+    fn issue2227_読める空無いdefaultは警告しない() {
+        let (_d1, good) = t2227_default(Some(b"model: m2227\nprompt_blocks:\n  append: P\n"));
+        let loaded = load_default_at(&good);
+        assert_eq!(loaded.warning, None);
+        assert_eq!(loaded.profile.model.as_deref(), Some("m2227"));
+        let (_d2, empty) = t2227_default(Some(b""));
+        assert_eq!(load_default_at(&empty).warning, None, "空は設定なし");
+        let (_d3, absent) = t2227_default(None);
+        let loaded = load_default_at(&absent);
+        assert_eq!(loaded.warning, None, "無いのは初回の正常な状態");
+        assert!(!absent.exists(), "読むだけで作らない");
+    }
+
+    #[test]
+    fn issue2227_警告はmaster本人のpromptにも載る() {
+        assert_eq!(
+            with_startup_warning("P".into(), None),
+            "P",
+            "警告が無ければ不変"
+        );
+        let p = with_startup_warning("P".into(), Some("d.yaml を読めない"));
+        assert!(p.starts_with("P\n"), "元の prompt を残す: {p}");
+        assert!(
+            p.contains("Startup warning") && p.contains("d.yaml を読めない"),
+            "{p}"
+        );
     }
 }
