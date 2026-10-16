@@ -394,6 +394,22 @@ master は結果を確認してユーザーに報告する。
 （読み替え・フォールバックが起きたときは案内と `unset TAKO_PANE_ID` を表示する）。
 `tako solo` も同じ解決順。
 
+**default.yaml を読めなくても立てるが、黙らない**（#2227）。プロファイルの読み込みは
+`master_launch::load_profile` の 1 実装で、CLI・スマホの「+ master」・返答の配送（#1450）が
+同じ判定を通る。壊れた YAML・型違い・UTF-8 でない default.yaml では**組み込み既定で立てる**
+（止めると YAML を直せない利用者が master を立てられず、スマホ・返答の配送からの起動も
+失敗する。#916 の「退避して既定値で動き、知らせる」と同じ方針）。その代わり、個人ルール
+（`prompt_blocks`）・モデルが効いていないことと直し方を CLI の `警告:` 行（スマホの起動は応答の
+`warnings`。PWA はまだ表示しない）・persist.log の `[master] default: …` の 1 行・**master 本人の system prompt の末尾**
+（`## Startup warning from tako`）へ出す。CLI の行は claude の全画面 TUI に隠れうるので、
+利用者へ確実に届くのは master の最初の返答になる。壊れた中身は `default.yaml.unreadable.bak`
+へ退避し、default.yaml そのものには触らない。無い（初回）・空（設定なし）は従来どおり黙って立つ。
+`tako master -<key>` で、#1825 のため専用プロファイルが作られていない（登録済み・未生成・
+継承元を読めない）ときは、「見つからない」に `projects add` と同じ理由と直し方
+（default.yaml を直すと `tako migrate run` で作られる）を足して止まる。直した後は
+`tako master -<key>` 自身の起動時の差分検出が継承して作って立てる。
+A/B は `TAKO_2227_LEGACY=1`（修正前 = 黙って組み込み既定 / 直し方の無い「見つからない」）。
+
 ### `tako orchestrator projects list`
 
 登録済みプロジェクトの一覧を表示する。

@@ -46835,6 +46835,7 @@ mod tests {
             limit_resume: false,
             remote_control_opt_in: false,
             remote_control: crate::claude_remote::RemoteControlDecision::off(),
+            warning: None,
         }
     }
 
