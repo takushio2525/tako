@@ -406,6 +406,177 @@ pub mod transport {
                 self.stream.flush()
             }
         }
+
+        // ---- Issue #2169: 相手が応答を書いてすぐ閉じても、届いた応答を読む ----
+        #[cfg(test)]
+        mod tests {
+            use std::io::{BufRead, Read, Write};
+            use std::os::unix::net::{UnixListener, UnixStream};
+            use std::time::{Duration, Instant};
+
+            use tako_control::protocol::{Request, ResponseEnvelope};
+
+            use super::Stream;
+
+            fn deadline_in(limit: Duration) -> Option<Instant> {
+                Some(Instant::now() + limit)
+            }
+
+            #[test]
+            fn 相手が書いてすぐ閉じても届いた分は読める() {
+                let (ours, mut theirs) = UnixStream::pair().expect("対を作れる");
+                theirs.write_all(b"response\n").expect("書ける");
+                drop(theirs);
+                let mut stream = Stream::new(ours, deadline_in(Duration::from_secs(10)));
+                let mut got = Vec::new();
+                let started = Instant::now();
+                stream
+                    .read_to_end(&mut got)
+                    .expect("届いた応答を読めない（#2169 の EINVAL）");
+                assert_eq!(got, b"response\n");
+                assert!(started.elapsed() < Duration::from_secs(2), "待った");
+            }
+
+            #[test]
+            fn 何も書かずに閉じた相手は待たずに終わりを返す() {
+                let (ours, theirs) = UnixStream::pair().expect("対を作れる");
+                drop(theirs);
+                let mut stream = Stream::new(ours, deadline_in(Duration::from_secs(10)));
+                let mut buf = [0u8; 16];
+                let started = Instant::now();
+                assert_eq!(stream.read(&mut buf).expect("EOF を返す"), 0);
+                assert!(started.elapsed() < Duration::from_secs(2), "待った");
+            }
+
+            /// 要求の 1 行を書いた後に止まる書き口（相手が応答を書いて閉じるのを先に起こす）
+            struct PauseAfterLine<W> {
+                inner: W,
+                pause: Duration,
+            }
+
+            impl<W: Write> Write for PauseAfterLine<W> {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    let n = self.inner.write(buf)?;
+                    if buf[..n].contains(&b'\n') {
+                        std::thread::sleep(self.pause);
+                    }
+                    Ok(n)
+                }
+
+                fn flush(&mut self) -> std::io::Result<()> {
+                    self.inner.flush()
+                }
+            }
+
+            #[test]
+            fn 応答を書いてすぐ閉じる受け口でも往復は応答を返す() {
+                let path = std::env::temp_dir()
+                    .join(format!("tk2169-{}-close.sock", std::process::id()));
+                let _ = std::fs::remove_file(&path);
+                let listener = UnixListener::bind(&path).expect("受け口を作れる");
+                let server = std::thread::spawn(move || {
+                    let (stream, _) = listener.accept().expect("受けられる");
+                    let mut line = String::new();
+                    std::io::BufReader::new(stream.try_clone().expect("複製できる"))
+                        .read_line(&mut line)
+                        .expect("要求を読める");
+                    let reply = ResponseEnvelope::ok(1, serde_json::json!({ "ok": true }));
+                    let json = serde_json::to_string(&reply).expect("応答を組める");
+                    let mut stream = stream;
+                    writeln!(stream, "{json}").expect("応答を書ける");
+                    // 応答を書いた直後に閉じる（GUI が応答を書いて終わった回）
+                });
+                let stream = UnixStream::connect(&path).expect("繋がる");
+                let at = deadline_in(Duration::from_secs(10));
+                let read_half = Stream::new(stream.try_clone().expect("複製できる"), at);
+                let write_half = PauseAfterLine {
+                    inner: Stream::new(stream, at),
+                    pause: Duration::from_millis(300),
+                };
+                let got = super::super::roundtrip_on(
+                    read_half,
+                    write_half,
+                    "t",
+                    Request::List,
+                    None,
+                    Some(Duration::from_secs(10)),
+                );
+                server.join().expect("受け口が落ちない");
+                let _ = std::fs::remove_file(&path);
+                match got {
+                    Ok(v) => assert_eq!(v["ok"], true),
+                    Err(e) => panic!("届いた応答を読まずに失敗した: {}", e.message()),
+                }
+            }
+
+            /// 読むたびに間を置く読み口（何回かに分けて読む応答の途中で相手が閉じるのを先に起こす）
+            struct PauseBeforeRead<R> {
+                inner: R,
+                pause: Duration,
+            }
+
+            impl<R: Read> Read for PauseBeforeRead<R> {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    std::thread::sleep(self.pause);
+                    self.inner.read(buf)
+                }
+            }
+
+            /// 何回かに分けて読む大きさの応答を書き、書き終えたらすぐ閉じる受け口で往復する。
+            /// 最後の数回の読みは相手が閉じた後になる（修正前はそこで EINVAL）
+            #[test]
+            fn 大きな応答を書いてすぐ閉じる受け口からも受け取れる() {
+                const PAD: usize = 64 * 1024;
+                let path =
+                    std::env::temp_dir().join(format!("tk2169-{}-big.sock", std::process::id()));
+                let _ = std::fs::remove_file(&path);
+                let listener = UnixListener::bind(&path).expect("受け口を作れる");
+                let server = std::thread::spawn(move || {
+                    let (stream, _) = listener.accept().expect("受けられる");
+                    let mut line = String::new();
+                    std::io::BufReader::new(stream.try_clone().expect("複製できる"))
+                        .read_line(&mut line)
+                        .expect("要求を読める");
+                    let pad = "x".repeat(PAD);
+                    let reply = ResponseEnvelope::ok(1, serde_json::json!({ "pad": pad }));
+                    let json = serde_json::to_string(&reply).expect("応答を組める");
+                    let mut stream = stream;
+                    // 読み手が途中で諦めたら書けなくなるだけ（判定は読み手の側でする）
+                    let _ = writeln!(stream, "{json}");
+                });
+                let stream = UnixStream::connect(&path).expect("繋がる");
+                let at = deadline_in(Duration::from_secs(10));
+                let read_half = PauseBeforeRead {
+                    inner: Stream::new(stream.try_clone().expect("複製できる"), at),
+                    pause: Duration::from_millis(50),
+                };
+                let got = super::super::roundtrip_on(
+                    read_half,
+                    Stream::new(stream, at),
+                    "t",
+                    Request::List,
+                    None,
+                    Some(Duration::from_secs(10)),
+                );
+                server.join().expect("受け口が落ちない");
+                let _ = std::fs::remove_file(&path);
+                match got {
+                    Ok(v) => assert_eq!(v["pad"].as_str().map(str::len), Some(PAD)),
+                    Err(e) => panic!("届いた応答を読まずに失敗した: {}", e.message()),
+                }
+            }
+
+            #[test]
+            fn 締め切りを過ぎた読みは閉じた相手でも時間切れ() {
+                let (ours, mut theirs) = UnixStream::pair().expect("対を作れる");
+                theirs.write_all(b"late\n").expect("書ける");
+                drop(theirs);
+                let mut stream = Stream::new(ours, Some(Instant::now()));
+                let mut buf = [0u8; 16];
+                let e = stream.read(&mut buf).expect_err("締め切りを過ぎている");
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+            }
+        }
     }
 }
 
