@@ -921,6 +921,12 @@ pub(super) fn build_request(
         "tako_lsp_server" => Request::LspServer {
             action: str_arg(args, "action")?.unwrap_or_else(|| "status".to_string()),
             name: str_arg(args, "name")?,
+            // #2035: action=options の上書き（オブジェクト以外は断る）
+            set: match args.get("set") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(map)) => Some(map.clone()),
+                Some(_) => return Err("set はオブジェクト（キー → 値）".into()),
+            },
         },
         // #1679 / #1680 / #1683 / #1682 / #1681 / #1686: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
         // （省略は LSP_FEATURE_ACTIONS の先頭 = diagnostics）

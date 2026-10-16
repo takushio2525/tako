@@ -45,6 +45,15 @@ pub struct Settings {
     /// 要らない（`Settings` の指紋は動くが、読み書きは後方互換）
     #[serde(default)]
     pub lsp_format_on_save: bool,
+    /// 言語サーバの初期化オプションの上書き（FR-3.28 / Issue #2035。サーバ ID → ドット区切りの
+    /// キー → JSON の値）。既定は検出表の `init_options` 列（rust-analyzer の `cargo.targetDir = true`）で、
+    /// ここは利用者が変えたキーだけを持つ（`tako lsp options --name <ID> --set KEY=VALUE` /
+    /// MCP `tako_lsp_server` の action=options が書く。値 `null` で消す = 表の既定へ戻す）。
+    /// 効くのは次にサーバを起こしたときから。**旧ファイルはキーが無くても空で読める**
+    /// （`#[serde(default)]`）ので移行 Step は要らない（`Settings` の指紋は動くが、読み書きは後方互換）
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub lsp_init_options:
+        std::collections::BTreeMap<String, tako_core::lsp::init_options::Overrides>,
     /// 括弧の自動閉じ（FR-3.5 / Issue #1759。**既定 ON**。形式ごとの既定は `file_type` の
     /// `auto_close` 列で、Markdown・プレーンテキストは ON でも閉じない）。
     /// **旧ファイルはキーが無くても true で読める**（`default_true`）ので移行 Step は要らない
@@ -276,6 +285,7 @@ impl Default for Settings {
             autosuggest_tab: true,
             preview_live_reload: true,
             lsp_format_on_save: false,
+            lsp_init_options: std::collections::BTreeMap::new(),
             editor_auto_close: true,
             claude_mod: true,
             limit_resume_all: false,
@@ -743,6 +753,7 @@ mod tests {
             autosuggest_tab: false,
             preview_live_reload: false,
             lsp_format_on_save: true,
+            lsp_init_options: std::collections::BTreeMap::new(),
             editor_auto_close: false,
             claude_mod: false,
             limit_resume_all: true,

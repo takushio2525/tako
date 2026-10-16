@@ -1083,16 +1083,18 @@ pub fn tools() -> Vec<Value> {
                 list で検出表と導入済みか（解決はキャッシュ。restart で引き直す）、restart で起こし直す（未導入・諦めたも）、stop で止める、\
                 logs で stderr の直近、install で未導入のサーバを取る（name 省略で全部）。未導入なら reason / next_step / install_command、\
                 起こす前提が未設定（.ino の基板）なら state=unconfigured と reason / next_step / setup_command を返す。\
-                status の fetch.cleanup は表の版を上げた後の古い版の片付け、recheck は未導入の引き直しの間隔。",
+                status の fetch.cleanup は表の版を上げた後の古い版の片付け、recheck は未導入の引き直しの間隔。\
+                options で初期化オプションの既定・上書き・実効値（set で上書き。null で既定へ。次の起動から効く）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "list", "restart", "stop", "logs", "install"],
+                        "enum": ["status", "list", "restart", "stop", "logs", "install", "options"],
                         "default": "status",
                     },
                     "name": { "type": "string", "description": "サーバの ID（省略で全部）" },
+                    "set": { "type": "object", "description": "options: キー（cargo.targetDir の形）→ 値" },
                 },
                 "additionalProperties": false,
             },

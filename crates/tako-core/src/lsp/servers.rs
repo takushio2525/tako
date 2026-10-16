@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use super::fetch::{Archive, Asset, Digest, Fetch, NpmPackage, PlatformAsset};
+pub use super::init_options::InitOption;
 use crate::app_bundle::AppBundle;
 
 /// 表の 1 行 = 1 つの言語サーバ
@@ -41,6 +42,10 @@ pub struct ServerSpec {
     pub bundled: Option<&'static AppBundle>,
     /// 起こす前に満たすべきこと（#1951）。満たさなければ起こさず、理由と満たすコマンドを出す
     pub requires: Option<Requirement>,
+    /// 初期化オプション（`initialize` の `initializationOptions`）の既定（#2035）。無ければ空 =
+    /// 送らない。利用者の上書きは settings.json の `lsp_init_options`（重ね方は
+    /// [`super::init_options`] の 1 実装）
+    pub init_options: &'static [InitOption],
     /// 未導入のときに案内する導入コマンド
     pub install: InstallHint,
     /// 見つからないときに tako が data dir へ取ってくる方法（#1944）。取れないサーバは `None`
@@ -216,6 +221,14 @@ pub const SERVERS: &[ServerSpec] = &[
         }),
         bundled: None,
         requires: None,
+        // #2035: 初回の build script と `cargo check` を `<target>/rust-analyzer` で走らせ、利用者の
+        // `cargo build` と target のロックを取り合わない（cargo 1.95 の表示は `Blocking waiting for file
+        // lock on artifact directory`）。費用は build script と proc-macro の成果物が 2 組になること
+        // （比べた案と実測は `.agent/plans/2026-09-lsp-s1.md` §29）
+        init_options: &[InitOption {
+            key: "cargo.targetDir",
+            value: "true",
+        }],
         install: InstallHint {
             macos: "rustup component add rust-analyzer",
             windows: "rustup component add rust-analyzer",
@@ -299,6 +312,7 @@ pub const SERVERS: &[ServerSpec] = &[
         // CLT を入れると `/usr/bin/clangd` とコンパイラのヘッダが一緒に入る = LLVM 一式は要らない）
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "xcode-select --install",
             windows: "winget install LLVM.LLVM",
@@ -328,6 +342,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "npm install -g typescript-language-server typescript",
             windows: "npm install -g typescript-language-server typescript",
@@ -371,6 +386,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "npm install -g pyright",
             windows: "npm install -g pyright",
@@ -407,6 +423,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "brew install texlab",
             // winget に包みが無い（tako が取れないときだけ出る案内）
@@ -482,6 +499,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "brew install tombi",
             windows: "winget install tombi-toml.tombi",
@@ -555,6 +573,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "xcode-select --install",
             windows: "winget install Swift.Toolchain",
@@ -574,6 +593,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "brew install dart-sdk",
             windows: "winget install Google.DartSDK",
@@ -593,6 +613,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "npm install -g vscode-langservers-extracted",
             windows: "npm install -g vscode-langservers-extracted",
@@ -615,6 +636,7 @@ pub const SERVERS: &[ServerSpec] = &[
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: "npm install -g vscode-langservers-extracted",
             windows: "npm install -g vscode-langservers-extracted",
@@ -667,6 +689,7 @@ pub const SERVERS: &[ServerSpec] = &[
         // 基板が無いと 15 秒待っても診断が 1 回も来ずホバーも時間切れ = 黙って何も出ない（実測）
         requires: Some(Requirement::SketchBoard { cli: "arduino-cli" }),
         // Code Runner の「arduino-cli が無い」の案内（#1950）の 1 つ目と同じ（言語サーバまで揃う方）
+        init_options: &[],
         install: InstallHint {
             macos: "brew install --cask arduino-ide",
             windows: "winget install --id ArduinoSA.IDE.stable",
@@ -831,6 +854,31 @@ mod tests {
             11,
             "表の行数が変わったら番犬とドキュメントも直す"
         );
+    }
+
+    /// #2035: 初期化オプションの既定は字句が JSON として読め、キーの形が正しい。
+    /// 今あるのは rust-analyzer の `cargo.targetDir = true` だけ（増やしたら設計書 §29 も直す）
+    #[test]
+    fn 初期化オプションの既定は読める字句で_rust_analyzerだけが持つ() {
+        use crate::lsp::init_options::{default_value, validate_key};
+        for spec in SERVERS {
+            for option in spec.init_options {
+                assert!(
+                    default_value(option).is_some(),
+                    "{} の {} の字句 {:?} が JSON として読めない",
+                    spec.id,
+                    option.key,
+                    option.value
+                );
+                validate_key(option.key).unwrap();
+            }
+        }
+        let with: Vec<(&str, Vec<&str>)> = SERVERS
+            .iter()
+            .filter(|s| !s.init_options.is_empty())
+            .map(|s| (s.id, s.init_options.iter().map(|o| o.key).collect()))
+            .collect();
+        assert_eq!(with, vec![("rust-analyzer", vec!["cargo.targetDir"])]);
     }
 
     /// #1951: `.ino` は arduino-language-server の行。伴走 2 つと空の設定ファイルを引数に並べ、
@@ -1145,6 +1193,7 @@ mod tests {
             workspace_root: None,
             bundled: None,
             requires: None,
+            init_options: &[],
             install: InstallHint {
                 macos: "brew install jdtls",
                 windows: "scoop install jdtls",

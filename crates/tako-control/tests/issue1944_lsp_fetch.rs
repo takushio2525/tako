@@ -305,6 +305,7 @@ fn spec_for(scratch: &Scratch, asset: &str, bytes: &[u8], size: u64) -> &'static
         workspace_root: None,
         bundled: None,
         requires: None,
+        init_options: &[],
         install: InstallHint {
             macos: INSTALL_COMMAND,
             windows: INSTALL_COMMAND,

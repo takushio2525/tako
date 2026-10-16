@@ -381,6 +381,43 @@ mod tests {
         );
     }
 
+    /// #2035: `tako_lsp_server` の action=options は CLI `tako lsp options` と同じ要求になる
+    /// （`set` はオブジェクトのまま。null は「既定へ戻す」の印として dispatch まで運ぶ）
+    #[test]
+    fn tako_lsp_server_の初期化オプションは_cli_と同じ要求になる() {
+        assert_eq!(
+            build_request("tako_lsp_server", &json!({"action": "options"}), None, None).unwrap(),
+            Request::LspServer {
+                action: "options".into(),
+                name: None,
+                set: None,
+            }
+        );
+        let Request::LspServer { set, name, .. } = build_request(
+            "tako_lsp_server",
+            &json!({"action": "options", "name": "rust-analyzer",
+                    "set": {"cargo.targetDir": false, "cargo.features": null}}),
+            None,
+            None,
+        )
+        .unwrap() else {
+            panic!("LspServer にならない");
+        };
+        assert_eq!(name.as_deref(), Some("rust-analyzer"));
+        assert_eq!(
+            Value::Object(set.unwrap()),
+            json!({"cargo.targetDir": false, "cargo.features": null})
+        );
+        let err = build_request(
+            "tako_lsp_server",
+            &json!({"action": "options", "name": "rust-analyzer", "set": "cargo.targetDir=false"}),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("set"), "{err}");
+    }
+
     /// #1682: `tako_lsp` の action=completion は CLI `tako lsp completion` と同じ要求になる
     /// （pane の省略は呼び出し元 = 定義ジャンプと同じ。位置は必須）
     #[test]

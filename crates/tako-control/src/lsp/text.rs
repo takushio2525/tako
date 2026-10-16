@@ -197,6 +197,24 @@ pub const IDLE_NOTE: Note = Note::new(
     "A language server starts when you edit a supported file (see tako lsp servers)",
 );
 
+/// 初期化オプション（`tako lsp options`。#2035）の注記
+pub const OPTIONS_NOTE: Note = Note::new(
+    "変えた値は次にサーバを起こしたときから効く（今すぐは tako lsp restart）。値に null を渡すと tako の既定へ戻る",
+    "Changes take effect the next time the server starts (run tako lsp restart to apply now). Pass null as the value to go back to the tako default",
+);
+
+/// `--set` に `--name` が無い（#2035）
+pub const OPTIONS_NAME_REQUIRED: Note = Note::new(
+    "--set にはサーバの ID（--name）が要る（例: tako lsp options --name rust-analyzer --set cargo.targetDir=false）",
+    "--set needs the server ID (--name), e.g. tako lsp options --name rust-analyzer --set cargo.targetDir=false",
+);
+
+/// 上書きを settings.json へ書けない（#2035）。`{error}`
+pub const OPTIONS_SAVE_FAILED: Note = Note::new(
+    "初期化オプションを settings.json へ保存できない: {error}",
+    "could not save the initialization options to settings.json: {error}",
+);
+
 /// stderr の直近の行を返すときの注記
 pub const STDERR_NOTE: Note = Note::new(
     "サーバが stderr へ出した直近の行（診断用。ソースコードの断片を含みうる。メモリに保つだけでファイルへは書かない）",
