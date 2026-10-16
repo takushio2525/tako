@@ -340,8 +340,13 @@ else
     kb() { du -sk "$1" 2>/dev/null | cut -f1; }
     total="$(kb "$RA_DIR")"
     build="$(kb "$RA_DIR/debug/build")"
-    procs="$(find "$RA_DIR/debug/deps" -name '*.dylib' -o -name '*.so' -o -name '*.dll' 2>/dev/null | xargs du -ck 2>/dev/null | tail -1 | cut -f1)"
-    echo "  target/rust-analyzer: ${total} KB（うち build script ${build} KB・proc-macro ${procs:-0} KB = 利用者の target/debug と重複しうるぶん）"
+    # check では通常の依存は .rmeta だけになる。.rlib / .dylib はホスト向けに本当にコンパイルしたもの
+    # （build script と proc-macro とその依存）= 利用者の target/debug と 2 重になるのはここと debug/build
+    sum_kb() { find "$RA_DIR/debug/deps" \( "$@" \) -print0 2>/dev/null | xargs -0 du -ck 2>/dev/null | tail -1 | cut -f1; }
+    procs="$(sum_kb -name '*.dylib' -o -name '*.so' -o -name '*.dll')"
+    rlibs="$(sum_kb -name '*.rlib')"
+    rmetas="$(sum_kb -name '*.rmeta')"
+    echo "  target/rust-analyzer: ${total} KB（うち build script ${build} KB・proc-macro ${procs:-0} KB・ホスト向けの rlib ${rlibs:-0} KB = 利用者の target/debug と 2 重になるぶん / check の rmeta ${rmetas:-0} KB = 分けなくても増えるぶん）"
     echo "  参考: 利用者の target/debug: $(kb "$REPO_ROOT/target/debug") KB"
     "$TAKO_BIN" lsp stop >/dev/null 2>&1
     stop_isolated_gui "$APP_PID"; APP_PID=""
