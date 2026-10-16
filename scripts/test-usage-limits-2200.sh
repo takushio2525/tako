@@ -50,7 +50,9 @@ VHOME=""
 TMUX_SOCKET="tako-2200-$$"
 TMUX_SOCKET_AB="tako-2200ab-$$"
 MASK_USER="$(id -un)"
-mask() { sed -e "s#${HOME}#~#g" -e "s#${MASK_USER}#<user>#g" -e "s#${TMP}#<TMP>#g"; }
+MASK_TMPDIR="${TMPDIR:-/tmp}"
+MASK_TMPDIR="${MASK_TMPDIR%/}"
+mask() { sed -e "s#${HOME}#~#g" -e "s#${MASK_USER}#<user>#g" -e "s#${TMP}#<TMP>#g" -e "s#${MASK_TMPDIR}#<TMPDIR>#g"; }
 
 cleanup() {
   stop_isolated_gui "$APP_PID"
@@ -291,9 +293,12 @@ check_eq "資格情報が壊れている → 設定 dir の鍵" "config_dir" "$(
 check_ne "無い / 壊れているは別の設定 dir = 別の鍵" "$(session_f s-missing login)" "$(session_f s-broken login)"
 check_eq "観測は C / B / missing / broken の 4 ログインぶん増える（A の同じ値は増えない）" "8" "$(wait_lines "$LIMITS" 8)"
 
-echo "-- 3. 生の識別子・メール・設定 dir が usage/ と persist.log に出ない"
+echo "-- 3. 生の識別子・メール・設定 dir が usage/ と persist.log の usage の行に出ない"
+# persist.log は usage の行だけを見る（同じ報告で #1959 が「設定 dir へ skills/tako を置いた」を
+# 置き場のパスつきで書くのは既存の設計 = この Issue の対象外）
+grep 'usage:' "$TAKO_DATA_DIR/persist.log" > "$TMP/persist-usage.log" 2>/dev/null || true
 LEAK=""
-for f in "$LIMITS" "$SESSIONS" "$TAKO_DATA_DIR/persist.log"; do
+for f in "$LIMITS" "$SESSIONS" "$TMP/persist-usage.log"; do
   for needle in "$UUID_A" "$UUID_B" "$UUID_C" "${UUID_A%%-*}" "$EMAIL" "body-marker-2200" "$TMP" "$VHOME"; do
     if grep -qF -- "$needle" "$f" 2>/dev/null; then LEAK="${LEAK} $(basename "$f"):$(printf '%s' "$needle" | mask)"; fi
   done
