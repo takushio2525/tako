@@ -24313,6 +24313,20 @@ fn dispatch_stale_binary_dismiss(
 #[cfg(all(test, unix))]
 mod setup_run_timeout_tests {
     use std::io::Write as _;
+    use std::time::Duration;
+
+    /// 偽の子の空打ちの引数（これを受けたら本文を走らせずに終わる。#1838）
+    const WARM_ARG: &str = "tako-1838-warm";
+
+    /// 空打ちを待つ上限。初回 exec の検査の列（下記）を吸うためのもので、空打ち自体は即座に終わる
+    const WARM_BUDGET: Duration = Duration::from_secs(120);
+
+    /// 自分で終わる子を待つ上限。子は数 ms で終わるので、ここでは上限そのものを見ていない
+    const FINISH_BUDGET: Duration = Duration::from_secs(30);
+
+    /// [`FINISH_BUDGET`] を縮める注入（検証専用・#1838。値はミリ秒）。
+    /// 初回 exec の検査が上限を食う回を、CPU を焼かずに作る
+    const INJECT_BUDGET_ENV: &str = "TAKO_1838_INJECT_BUDGET_MS";
 
     /// `<dir>/tako setup --yes --answers -` として起動される使い捨ての子。
     /// 置き場は**スコープを抜けると消える器**（#1312 の `ScratchDir`）
@@ -24321,20 +24335,44 @@ mod setup_run_timeout_tests {
     }
 
     impl FakeTako {
+        /// 作った時点で 1 回空打ちする（#1838）。macOS は新しく書いた実行ファイルの初回の exec に
+        /// 検査を挟み、その検査はシステム全体で 1 本ずつ進む（#2180。実測: 単独で 0.16〜0.34 秒、
+        /// 他の worker のビルドと重なると 6 秒）。上限を測っている最中にその列で待たされると、
+        /// 子は知らせを 1 行も書かないまま打ち切られ、`timed_out: true` かつ `probe_timeouts: []` になる。
+        /// 検査は上限の外で済ませておく（済んだものは 4〜5 ms で起きる）。
+        /// A/B の `TAKO_1838_LEGACY=1` は修正前と同じく空打ちしない
         fn new(tag: &str, body: &str) -> Self {
             let dir = tako_core::test_residue::ScratchDir::new(&format!("dispatch-1503-{tag}"));
             let bin = dir.path().join("tako");
             let mut f = std::fs::File::create(&bin).expect("スクリプト");
-            write!(f, "#!/bin/sh\n{body}\n").expect("書き出し");
+            write!(f, "#!/bin/sh\n[ \"$1\" = {WARM_ARG} ] && exit 0\n{body}\n").expect("書き出し");
             drop(f);
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("実行権");
-            Self { dir }
+            let fake = Self { dir };
+            if std::env::var_os("TAKO_1838_LEGACY").is_none() {
+                let warm =
+                    tako_core::probe::output_with_timeout(&fake.path(), &[WARM_ARG], WARM_BUDGET);
+                assert!(
+                    matches!(warm, tako_core::probe::Outcome::Done { .. }),
+                    "偽の子の空打ちが上限内に終わらない（初回 exec の検査の列が長すぎる）: {warm:?}"
+                );
+            }
+            fake
         }
 
         fn path(&self) -> String {
             self.dir.path().join("tako").display().to_string()
         }
+    }
+
+    /// 自分で終わる子を待つ上限（[`INJECT_BUDGET_ENV`] があればその値）
+    fn finish_budget() -> Duration {
+        std::env::var(INJECT_BUDGET_ENV)
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(FINISH_BUDGET)
     }
 
     #[test]
@@ -24372,8 +24410,7 @@ mod setup_run_timeout_tests {
         };
         let fake = FakeTako::new("notice", &format!("echo '  {notice}' >&2\nexit 0"));
         let value =
-            super::run_setup_cli_within(&fake.path(), "{}", std::time::Duration::from_secs(30))
-                .expect("正常終了");
+            super::run_setup_cli_within(&fake.path(), "{}", finish_budget()).expect("正常終了");
         assert_eq!(value["completed"], serde_json::json!(true), "{value}");
         assert_eq!(value["timed_out"], serde_json::json!(false), "{value}");
         assert_eq!(
@@ -24387,8 +24424,10 @@ mod setup_run_timeout_tests {
     fn 打ち切りが無ければprobe_timeoutsは空() {
         let fake = FakeTako::new("clean", "echo 'セットアップ完了' >&2\nexit 0");
         let value =
-            super::run_setup_cli_within(&fake.path(), "{}", std::time::Duration::from_secs(30))
-                .expect("正常終了");
+            super::run_setup_cli_within(&fake.path(), "{}", finish_budget()).expect("正常終了");
+        // 前提（打ち切りが無い）を先に見る。打ち切られた回は `probe_timeouts` も空なので、
+        // ここを見ないと前提が崩れた回も素通りする（#1838）
+        assert_eq!(value["timed_out"], serde_json::json!(false), "{value}");
         assert_eq!(value["probe_timeouts"], serde_json::json!([]), "{value}");
     }
 }
