@@ -105,7 +105,7 @@ done <<<"${TARGETS}"
 echo "docs / .agent を読む番犬 $((${#ARGS[@]} / 2)) 本を走らせる:"
 printf '%s\n' "${TARGETS}" | awk -F'\t' '{ printf "  %-50s %s\n", $2, $3 }'
 # --workspace: full の macOS ジョブ（cargo test --workspace）と同じ feature の宇宙で組む。
-# `-p tako-control` だと gpui が要求する feature（serde_json/preserve_order ほか）が外れ、
-# 同じテストが別の宇宙で走る（#1383 の食い違いと同じ型）
+# `-p tako-control` だと gpui が要求する feature（libc/extra_traits・smallvec/union ほか。
+# serde_json/preserve_order は #1829 から全宇宙で有効）が外れ、同じテストが別の宇宙で走る（#1383 の食い違いと同じ型）
 cd "${ROOT}"
 exec cargo test --workspace ${ARGS[@]+"${ARGS[@]}"} -- ${PASS_THROUGH[@]+"${PASS_THROUGH[@]}"}

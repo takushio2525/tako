@@ -149,7 +149,7 @@ if (cmd === 'init') {
   save(win, agent);
 } else if (cmd === 'reorder') {
   // オブジェクトのキーの並びを全部逆にする（配列の並びは変えない）。tako の出力の中のキーの
-  // 並びは serde_json の preserve_order が効くかどうか = ビルドの feature の統合で変わる
+  // 並びは以前ビルドの feature の統合で変わっていた（#1829 で揃えたが、写しは出力の並びに頼らない）
   const rev = (x) => Array.isArray(x)
     ? x.map(rev)
     : x && typeof x === 'object'

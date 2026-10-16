@@ -35,7 +35,11 @@ thiserror = "2"
 tracing = "0.1"
 # IPC / CLI のプロトコル定義（JSON-RPC 風）に使う
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` = `Map` のキーを挿入順に保つ（IndexMap）。gpui（zed 由来）も要求するので
+# tako-app と一緒のビルドでは元から効いていたが、gpui を含まないビルド（`cargo build -p tako-cli`）
+# では外れて辞書順になり、CLI の JSON の並びがビルドの形で揺れた（#1829）。全メンバーへ有効にして
+# 揃える（indexmap は gpui 経由で既にツリー内）。外れたら tako-core の lib.rs 末尾の番犬が落とす
+serde_json = { version = "1", features = ["preserve_order"] }
 # TAKO_TOKEN 生成用の OS CSPRNG（FR-2.3.4。std に相当機能が無いため採用）
 getrandom = "0.3"
 # `tako` CLI の引数パーサ（デファクト標準）

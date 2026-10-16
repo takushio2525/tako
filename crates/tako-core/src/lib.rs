@@ -187,3 +187,12 @@ pub use workspace::{
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。
 /// `tmux_bin()` / `git_bin()` の共通基盤で、待ちの上限は [`bin_resolve`] が持つ（#2151）
 pub(crate) use bin_resolve::resolve_bin;
+
+// 番犬（#1829）: serde_json の `preserve_order`（`Map` のキーを挿入順に保つ）がどのビルド形でも
+// 効いていること。ルートの Cargo.toml の `[workspace.dependencies]` で全メンバーへ有効にしている。
+// `Map::shift_insert` は `preserve_order` のときだけ在るので、外すと gpui を含まないビルド
+// （`cargo build -p tako-cli`・CI の「gpui 抜きの feature 宇宙」の clippy）がここで落ちる。
+// 外れたまま通ると、CLI の JSON のキーの並びがビルドの形で辞書順 / 挿入順に揺れる
+const _: () = {
+    let _ = serde_json::Map::<String, serde_json::Value>::shift_insert;
+};

@@ -215,12 +215,14 @@ jobs:
       - name: Clippy（visual-test feature。#1072）
         run: cargo clippy -p tako-app --features visual-test --all-targets -- -D warnings
       # 上の `--workspace` 形は **全メンバーの feature を統合した 1 つの宇宙**しか見ない。
-      # gpui（zed 由来）が `serde_json/preserve_order` を要求するので、workspace 形では
-      # `serde_json::Map` が IndexMap 実装になり `Value` が**有意な Drop** を持つ
-      # → clippy の `unnecessary_lazy_evaluations` は `then_some` を提案しなくなる。
-      # 一方 GUI を含まない `-p tako-control` の宇宙では Map は BTreeMap 実装（Drop は
-      # insignificant）なので同じ行に lint が出る。**CI 緑なのに手元の `-p` が赤**という
-      # 食い違いがこれで生まれた（#1383。実測は .agent/commands.md の lint 行）。
+      # gpui（zed 由来）を含む宇宙では依存の feature が足される（`libc/extra_traits`・
+      # `smallvec/union`・`log/kv` ほか）ので、GUI を含まない `-p tako-control` などとは
+      # 別のコードを型検査している。**CI 緑なのに手元の `-p` が赤**という食い違いが
+      # これで生まれた（#1383。当時の差は `serde_json/preserve_order` = `Map` の実装で、
+      # clippy の `unnecessary_lazy_evaluations` が片側にだけ出た。実測は .agent/commands.md の lint 行）。
+      # `serde_json/preserve_order` は #1829 でルートの Cargo.toml から全メンバーへ有効にした
+      # （CLI の JSON の並びをビルドの形で揺らさない）ので、いまはどちらの宇宙でも IndexMap。
+      # 外れたら tako-core の lib.rs 末尾の番犬がこのステップのコンパイルで落とす。
       # そこで **gpui を含まない宇宙**を 1 回だけ別に lint する。tako-app 側の宇宙は
       # 上の 2 ステップが既に見ているので、足すのはこの 3 クレートだけでよい
       - name: Clippy（gpui 抜きの feature 宇宙。#1383）
