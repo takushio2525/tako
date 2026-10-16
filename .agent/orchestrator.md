@@ -416,6 +416,18 @@ master は結果を確認してユーザーに報告する。
 **登録済みのプロジェクトは `tako setup` / GUI 起動 / `tako migrate run` の差分検出で揃う**
 ので、手で作り直す必要はない。
 
+**default.yaml を読めないときは作らない**（#1825）。壊れた YAML・型違い（`append` が列など）・
+UTF-8 でない中身のまま組み込み既定で作ると、個人ルール（`prompt_blocks`）とモデルの抜けた
+プロファイルが残り、生成は既存に触らないので **default.yaml を直しても二度と追いつかない**（実測）。
+そこで登録だけを済ませ（`profile_generation: skipped`）、理由を応答の `warnings`（と
+`profile_note`）・persist.log の `[projects add] <key>: …` の 1 行・CLI の `警告:` 行に出す。
+壊れた中身は `default.yaml.unreadable.bak`（2 本目以降は `.unreadable.<n>.bak`）へ退避し、
+default.yaml そのものには触らない。直したら `tako migrate run`（GUI の次の起動でも同じ）が
+正しく継承して作る。`tako migrate` の予告も「作る」ではなく `failed` を出す。
+空の default.yaml は「設定なし」として読める（移行の `validate_profile` と同じ判定）ので
+そのまま作る。`adopt` で未生成のキーを渡したときも同じ理由で止まる。A/B は `TAKO_1825_LEGACY=1`
+（修正前 = 黙って組み込み既定で作り「default から継承」と表示する）。
+
 ### `tako orchestrator projects remove`
 
 プロジェクトを削除する。

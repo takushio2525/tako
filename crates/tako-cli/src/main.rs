@@ -5789,17 +5789,26 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?;
             eprintln!("追加しました: {key} → {cwd}");
+            // #1825: 黙らせてはいけない理由（default を継承できなかった等）。
+            // 同じ文が profile_note にも載るので、そちらは重ねて出さない
+            let warnings: Vec<&str> = res["warnings"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|w| w.as_str()).collect())
+                .unwrap_or_default();
+            let note = res["profile_note"].as_str().unwrap_or("理由不明");
             // 専用プロファイルの生成結果も見せる（黙って作らない / 黙って作らないでもない）
             match res["profile_generation"].as_str() {
                 Some("created") => eprintln!(
                     "専用プロファイルを作りました: {}（default から継承）",
                     res["profile_path"].as_str().unwrap_or("")
                 ),
-                Some("skipped") => eprintln!(
-                    "専用プロファイルは作りませんでした: {}",
-                    res["profile_note"].as_str().unwrap_or("理由不明")
-                ),
+                Some("skipped") if !warnings.contains(&note) => {
+                    eprintln!("専用プロファイルは作りませんでした: {note}")
+                }
                 _ => {}
+            }
+            for w in &warnings {
+                eprintln!("警告: {w}");
             }
             Ok(())
         }

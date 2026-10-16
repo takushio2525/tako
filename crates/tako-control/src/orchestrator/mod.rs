@@ -2812,6 +2812,12 @@ pub fn legacy_auto_profile() -> bool {
     std::env::var_os("TAKO_1453_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// #1825 の A/B。`TAKO_1825_LEGACY=1` で「読めない default.yaml を黙って組み込み既定に
+/// して専用プロファイルを作る（退避もしない）」修正前の挙動へ戻す
+pub fn legacy_silent_profile_base() -> bool {
+    std::env::var_os("TAKO_1825_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// プロジェクト専用プロファイルの自動生成の結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileGen {
@@ -2821,6 +2827,13 @@ pub enum ProfileGen {
     Exists(PathBuf),
     /// 作らなかった（理由つき。プロジェクト追加そのものは失敗させない）
     Skipped { reason: String },
+    /// 継承元の `profiles/default.yaml` を読めないので作らなかった（#1825）。
+    ///
+    /// 組み込み既定で作ると個人ルール（`prompt_blocks`）・モデルの抜けたプロファイルが残り、
+    /// 生成は既存に触らない（冪等）ので **default.yaml を直しても二度と追いつかない**（実測）。
+    /// 作らずにおけば、直した後の `tako migrate run` / GUI 起動の差分検出が正しく継承して作る。
+    /// [`Skipped`](Self::Skipped) と違い、理由は黙らせない（応答の `warnings` と persist.log）
+    NotInherited { reason: String },
 }
 
 impl ProfileGen {
@@ -2831,27 +2844,109 @@ impl ProfileGen {
     pub fn path(&self) -> Option<&Path> {
         match self {
             Self::Created(p) | Self::Exists(p) => Some(p),
-            Self::Skipped { .. } => None,
+            Self::Skipped { .. } | Self::NotInherited { .. } => None,
         }
     }
 
-    /// 機械可読な状態名（CLI / MCP の応答で使う）
+    /// 機械可読な状態名（CLI / MCP の応答で使う）。
+    /// `NotInherited` も「作らなかった」なので語彙は増やさず `skipped`（理由で見分ける）
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Created(_) => "created",
             Self::Exists(_) => "exists",
-            Self::Skipped { .. } => "skipped",
+            Self::Skipped { .. } | Self::NotInherited { .. } => "skipped",
+        }
+    }
+
+    /// 作らなかった理由（作った / 既にあるなら `None`）
+    pub fn skip_reason(&self) -> Option<&str> {
+        match self {
+            Self::Skipped { reason } | Self::NotInherited { reason } => Some(reason),
+            Self::Created(_) | Self::Exists(_) => None,
+        }
+    }
+
+    /// 利用者に必ず見せる理由（応答の `warnings` と persist.log へ出す。#1825）
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            Self::NotInherited { reason } => Some(reason),
+            _ => None,
         }
     }
 }
 
-/// 自動生成の**継承元**（`profiles/default.yaml`。読めなければ組み込み既定）。
+/// 自動生成の**継承元**（`profiles/default.yaml`。無ければ組み込み既定）。
 ///
 /// default から継ぐのは、ユーザーが default へ書いた個人ルール（`prompt_blocks` の
 /// prepend / append）・アカウント・モデル・worker 既定をそのまま持ち込むため。
-/// これが「素の master と同じ振る舞いのまま、管轄だけが決まる」の中身になる
-pub fn project_profile_base() -> Profile {
+/// これが「素の master と同じ振る舞いのまま、管轄だけが決まる」の中身になる。
+///
+/// **読めないときは `Err`**（#1825）。以前は組み込み既定へ黙って落としていたので、
+/// 壊れた default.yaml のまま `projects add` すると個人ルールとモデルが抜けた
+/// プロファイルが「default から継承」と表示されて作られていた（実測）
+pub fn project_profile_base() -> Result<Profile, String> {
+    if legacy_silent_profile_base() {
+        return Ok(legacy_project_profile_base());
+    }
+    let path = ProfileKind::Master.path(tako_core::handoff::DEFAULT_PROFILE)?;
+    project_profile_base_at(&path)
+}
+
+/// #1825 の A/B の旧挙動（読めなければ黙って組み込み既定・退避もしない）
+fn legacy_project_profile_base() -> Profile {
     load_profile_of(ProfileKind::Master, tako_core::handoff::DEFAULT_PROFILE).unwrap_or_default()
+}
+
+/// [`project_profile_base`] の本体（パス指定。テストは一時 dir で回す）。
+///
+/// 読めない中身は理由を返す前に `<name>.unreadable[.<n>].bak` へ退避する（#916 / #1819 の
+/// 共通口）。default.yaml そのものには触らない
+pub fn project_profile_base_at(path: &Path) -> Result<Profile, String> {
+    read_profile_base_at(path).map_err(|why| {
+        let kept =
+            match tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo) {
+                Some(q) => format!("中身は {} に退避した", q.path.display()),
+                None => "退避はできなかったが default.yaml そのものには触っていない".to_string(),
+            };
+        format!("{} を読めない（{why}）。{kept}", path.display())
+    })
+}
+
+/// 継承元を**読むだけ**で判定する（書かない）。退避つきの [`project_profile_base_at`] と
+/// `tako migrate status` の予告（[`check_project_profile_base`]）が同じ判定を通る。
+///
+/// 「読める」の基準は移行の `validate_profile` と同じ（`Profile` として解釈できるか）なので、
+/// 空のファイルは「設定なし」として読める（移行機構の判定と食い違わない）
+fn read_profile_base_at(path: &Path) -> Result<Profile, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // 無い = 継ぐべき個人設定がそもそも無い
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProfileKind::Master.default_profile())
+        }
+        Err(e) => return Err(format!("読み取りに失敗: {e}")),
+    };
+    serde_yaml::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// 継承元が読めるかだけを見る（書かない・退避しない）。`tako migrate status` 用
+pub fn check_project_profile_base() -> Result<(), String> {
+    if legacy_silent_profile_base() {
+        return Ok(());
+    }
+    let path = ProfileKind::Master.path(tako_core::handoff::DEFAULT_PROFILE)?;
+    read_profile_base_at(&path)
+        .map(|_| ())
+        .map_err(|why| format!("{} を読めない（{why}）", path.display()))
+}
+
+/// 継承元を読めずに作らなかったときの理由文（直し方まで言う）
+fn not_inherited_reason(key: &str, why: &str) -> String {
+    format!(
+        "{why}。default を継承できないので専用プロファイル '{key}' は作らなかった\
+         （組み込み既定で作ると個人ルール・モデルが抜けたまま残る）。\
+         default.yaml を直すと tako migrate run（GUI の次の起動でも自動）で作られる"
+    )
 }
 
 /// projects.yaml に登録されている cwd（生値。`~` は展開しない）
@@ -2873,7 +2968,8 @@ fn project_entry_cwd(key: &str) -> Option<String> {
 ///
 /// 残りは [`project_profile_base`] の値をそのまま使う。
 /// 生成できない理由（プロファイル名に使えないキー・書き込み失敗）は
-/// `Skipped` に載せて返し、**呼び出し元の操作そのものは失敗させない**
+/// `Skipped` に載せて返し、**呼び出し元の操作そのものは失敗させない**。
+/// 継承元を読めないときは作らずに `NotInherited` を返す（#1825）
 pub fn ensure_project_profile(key: &str) -> ProfileGen {
     if legacy_auto_profile() {
         return ProfileGen::Skipped {
@@ -2895,7 +2991,14 @@ pub fn ensure_project_profile(key: &str) -> ProfileGen {
     if let Err(e) = ProfileKind::Master.ensure_defaults() {
         return ProfileGen::Skipped { reason: e };
     }
-    let mut profile = project_profile_base();
+    let mut profile = match project_profile_base() {
+        Ok(profile) => profile,
+        Err(why) => {
+            return ProfileGen::NotInherited {
+                reason: not_inherited_reason(key, &why),
+            }
+        }
+    };
     profile.projects = Some(vec![key.to_string()]);
     if let Some(cwd) = project_entry_cwd(key) {
         profile.cwd = Some(cwd);
@@ -4185,6 +4288,124 @@ mod tests {
         assert!(
             !ProfileKind::Master.path(key).expect("パス").is_file(),
             "legacy なのにファイルができている"
+        );
+    }
+
+    /// #1825 の継承元テスト用の default.yaml（**共有の隔離先ではなく使い捨て dir** に置く。
+    /// 共有の profiles/default.yaml を壊すと、並行する他のテストが壊れた default を読む）
+    fn t1825_base(body: &[u8]) -> (tako_core::test_residue::ScratchDir, PathBuf) {
+        let dir = tako_core::test_residue::ScratchDir::new("issue1825-base");
+        assert!(
+            dir.path().starts_with(std::env::temp_dir()),
+            "一時 dir の外に書こうとしている: {}",
+            dir.path().display()
+        );
+        let path = dir.path().join("default.yaml");
+        std::fs::write(&path, body).expect("default.yaml を置ける");
+        (dir, path)
+    }
+
+    #[test]
+    fn issue1825_読める継承元は個人ルールとモデルを返す() {
+        let (_dir, path) =
+            t1825_base("model: claude-test\nprompt_blocks:\n  append: \"個人\"\n".as_bytes());
+        let base = project_profile_base_at(&path).expect("読める");
+        assert_eq!(base.model.as_deref(), Some("claude-test"));
+        assert_eq!(
+            base.prompt_blocks.and_then(|b| b.append).as_deref(),
+            Some("個人")
+        );
+        assert!(
+            !tako_core::migration::quarantine_path(&path).exists(),
+            "読めるのに退避している"
+        );
+    }
+
+    /// 壊れた YAML / 型違い（append が列）は `Err` + 中身の退避。default.yaml は触らない
+    #[test]
+    fn issue1825_読めない継承元は理由と退避先を返し既定へ落とさない() {
+        for body in [
+            &b"model: m\nprompt_blocks:\n  append: \"PERSONAL\n  prepend: [\n"[..],
+            &b"model: m\nprompt_blocks:\n  append: [PERSONAL]\n"[..],
+        ] {
+            let (_dir, path) = t1825_base(body);
+            let err = project_profile_base_at(&path).expect_err("黙って既定へ落としている");
+            let kept = tako_core::migration::quarantine_path(&path);
+            assert!(
+                err.contains(&kept.display().to_string()),
+                "理由に退避先が無い: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&kept).expect("退避がある"),
+                body,
+                "退避の中身が元と違う"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("元が残る"),
+                body,
+                "default.yaml を書き換えている"
+            );
+            // 同じ中身で 2 回目に読んでも写しは増えない（#1819 の共通口の約束）
+            let again = project_profile_base_at(&path).expect_err("2 回目も Err");
+            assert!(again.contains(&kept.display().to_string()));
+            assert!(!tako_core::migration::quarantine_slot_path(&path, 2).exists());
+        }
+    }
+
+    /// 境界: 空 / 数値の append は**読める**（移行の validate_profile と同じ判定）。
+    /// 空は「設定なし」なので継ぐものが無く、数値は serde_yaml が文字列として読む
+    #[test]
+    fn issue1825_空と数値のappendは読める扱い() {
+        let (_dir, empty) = t1825_base(b"");
+        let base = project_profile_base_at(&empty).expect("空は設定なし");
+        assert!(base.prompt_blocks.is_none());
+        assert!(
+            crate::migrations::spec(tako_core::migration::SchemaId::Profiles)
+                .and_then(|s| s.validate)
+                .is_some_and(|v| v("").is_ok())
+        );
+
+        let (_dir2, num) = t1825_base(b"prompt_blocks:\n  append: 123\n");
+        let base = project_profile_base_at(&num).expect("数値は文字列に読まれる");
+        assert_eq!(
+            base.prompt_blocks.and_then(|b| b.append).as_deref(),
+            Some("123")
+        );
+        assert!(!tako_core::migration::quarantine_path(&num).exists());
+    }
+
+    /// 境界: UTF-8 でない中身は退避の口で写せない（文字列で読む口）が、
+    /// それでも既定へ落とさず、default.yaml にも触らない
+    #[test]
+    fn issue1825_utf8でない継承元も既定へ落とさない() {
+        let body = b"model: m\n\xff\xfe\x00broken\n";
+        let (_dir, path) = t1825_base(body);
+        let err = project_profile_base_at(&path).expect_err("黙って既定へ落としている");
+        assert!(err.contains("退避はできなかった"), "{err}");
+        assert_eq!(std::fs::read(&path).expect("元が残る"), body);
+    }
+
+    #[test]
+    fn issue1825_無い継承元は組み込み既定() {
+        let dir = tako_core::test_residue::ScratchDir::new("issue1825-absent");
+        let base = project_profile_base_at(&dir.path().join("default.yaml")).expect("無い = 既定");
+        assert!(base.prompt_blocks.is_none() && base.model.is_none());
+    }
+
+    #[test]
+    fn issue1825_継承できない理由は黙らせない() {
+        let gen = ProfileGen::NotInherited { reason: "r".into() };
+        assert_eq!(gen.kind(), "skipped", "応答の語彙は増やさない");
+        assert_eq!(gen.warning(), Some("r"));
+        assert_eq!(gen.skip_reason(), Some("r"));
+        assert_eq!(gen.path(), None);
+        let skipped = ProfileGen::Skipped { reason: "s".into() };
+        assert_eq!(skipped.warning(), None, "従来の見送りは警告にしない");
+        assert_eq!(skipped.skip_reason(), Some("s"));
+        let reason = not_inherited_reason("k", "x を読めない");
+        assert!(
+            reason.contains("tako migrate run") && reason.contains("'k'"),
+            "直し方が無い: {reason}"
         );
     }
 
