@@ -359,8 +359,9 @@ Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**�
   `max` 文字以内・数えるのは `char`・表示幅は見ない）。`chars().take(n)` + `…` を自前で
   書かない（#1757 で tako-app の `truncate` と context_budget の私有版を、#1790 で
   `truncate_path_middle` の末尾省略・remote_autostart の `trim_detail`・sessions の
-  `prompt_head` を寄せた）。`…` を上限の**外**に付ける契約（内容 `max` 文字 + `…`）は上限を
-  `max + 1` で渡す（transcript の 1 行要約 `summary_line`・`trim_detail`・`prompt_head`）。
+  `prompt_head` を、#2217 で右パネルの `git_feedback_text` を寄せた）。`…` を上限の**外**に
+  付ける契約（内容 `max` 文字 + `…`）は上限を `max + 1` で渡す（transcript の 1 行要約
+  `summary_line`・`trim_detail`・`prompt_head`・`git_feedback_text`）。
   内容がちょうど `max + 1` 文字なら切らずに原文を返す（同じ幅で末尾が欠けない）
 - **長さの比較も文字で数える**: 「6 桁か」「上限を超えたか」を `s.len()` で見ない。
   `s.chars().count()` か、1 文字ずつ検査しながら数える（#1756 の `parse_hex_color`）。

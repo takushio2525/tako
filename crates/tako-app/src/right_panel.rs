@@ -32,6 +32,9 @@ pub(crate) fn git_result_summary(out: &str, fallback: &str) -> String {
 pub(crate) const GIT_FEEDBACK_MAX_LINES: usize = 6;
 pub(crate) const GIT_FEEDBACK_MAX_CHARS: usize = 600;
 
+/// 文字数で切るのは `tako_core::text::truncate_chars` の 1 実装（#2217）。内容
+/// `GIT_FEEDBACK_MAX_CHARS` 文字 + `…` の契約なので上限を `+ 1` で渡す。行を落とした印の
+/// `…` は先に付けて一緒に数える（文字数でも切るときは印ごと切られて付け直される = 印は 1 個）
 pub(crate) fn git_feedback_text(message: &str) -> String {
     let mut lines: Vec<&str> = message
         .lines()
@@ -44,13 +47,10 @@ pub(crate) fn git_feedback_text(message: &str) -> String {
     let truncated_lines = lines.len() > GIT_FEEDBACK_MAX_LINES;
     lines.truncate(GIT_FEEDBACK_MAX_LINES);
     let mut out = lines.join("\n");
-    if out.chars().count() > GIT_FEEDBACK_MAX_CHARS {
-        out = head_chars(&out, GIT_FEEDBACK_MAX_CHARS);
-        out.push('…');
-    } else if truncated_lines {
+    if truncated_lines {
         out.push('…');
     }
-    out
+    tako_core::text::truncate_chars(&out, GIT_FEEDBACK_MAX_CHARS + 1)
 }
 
 /// 末尾 `n` 文字だけを返す（#494。長いメッセージでキャレットを画面内に留めるため）
@@ -6339,8 +6339,9 @@ mod tests {
         // ── 行数は上限内 ──
         // ちょうど上限は切らない
         assert_eq!(git_feedback_text(&a(max)), a(max));
-        // 上限 + 1 文字ちょうどは内容 max 文字 + `…`
-        assert_eq!(git_feedback_text(&a(max + 1)), format!("{}…", a(max)));
+        // 上限 + 1 文字ちょうどは原文のまま（寄せる前は「max 文字 + `…`」= 同じ幅で末尾 1 文字を
+        // `…` に置き換えていた。#2217 で寄せた後の唯一の差。行を落としたときは差が無い = 下）
+        assert_eq!(git_feedback_text(&a(max + 1)), a(max + 1));
         // 上限 + 2 文字以上は内容 max 文字 + `…`
         assert_eq!(git_feedback_text(&a(max + 2)), format!("{}…", a(max)));
         // 4 バイト文字も 1 文字・結合文字（NFD の「が」）は濁点を別の 1 文字に数える
