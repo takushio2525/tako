@@ -13,6 +13,7 @@
 //!
 //! 按分は期間・絞り込み（`account` / `project`）の前のログインの全行で行い、段へ足すときに絞る
 //! （絞ってから配ると、そのプロジェクトが区間の Δ を独り占めする）。
+//!
 //! # 期間（§3.4）
 //!
 //! - `5h` / `7d`: ログインごとの**実窓** = 観測した解除時刻 − 長さ（S1 の `limits.jsonl`）。
@@ -894,9 +895,16 @@ pub fn breakdown(
                 utc_offset,
             );
             let has_usage = p.total.responses > 0 || !p.total.tokens.is_zero();
-            let has_share = limit_share
-                .iter()
-                .any(|k| k.observed > 0.0 || k.estimated > 0.0);
+            // 絞り込みのあるときは絞った後の分だけで決める（絞り込みに当たる行の無いログインは出さない）
+            let filtered = query.account.is_some() || query.project.is_some();
+            let has_share = limit_share.iter().any(|k| {
+                k.estimated > 0.0
+                    || if filtered {
+                        k.allocated > 0.0
+                    } else {
+                        k.observed > 0.0
+                    }
+            });
             if !has_usage && !has_share {
                 return None;
             }
@@ -1184,6 +1192,127 @@ mod tests {
         let l1 = b.logins.iter().find(|l| l.login == "L1").unwrap();
         assert_eq!(l1.groups.len(), 2);
         assert!(l1.groups[0].name < l1.groups[1].name, "日付は古い順");
+    }
+
+    fn limit(login: &str, kind: &str, percent: f64, resets_at: i64, ago: i64) -> LimitObservation {
+        LimitObservation {
+            login: login.into(),
+            key_from: KeyFrom::Account,
+            kind: kind.into(),
+            percent,
+            resets_at: Some(resets_at),
+            observed_at: ((NOW - ago) * 1000) as u64,
+            recorded_at: 0,
+            source: "mod".into(),
+        }
+    }
+
+    /// #2202: 段の % は今の窓の観測と合計が一致し（段 + tako の外 = 最新の観測）、観測の区間の外は推定。
+    /// 絞っても按分は絞る前の全行で行い、絞り込みに当たらないログインは出さない。使用量の無いログインは
+    /// 絞り込みの無いときだけ「すべて tako の外」として出る
+    #[test]
+    fn 段の利用制限の割合は観測と一致し絞っても按分は全行() {
+        let (rows, keys) = fixture();
+        let r7 = NOW + 3 * 86_400;
+        let observations = vec![
+            // L1 の 7d: 2 時間前に 10%（それまで使用なし = tako の外）・30 分前に 14%（s1 の 1 時間前の使用）
+            limit("L1", "seven_day", 10.0, r7, 7200),
+            limit("L1", "seven_day", 14.0, r7, 1800),
+            // L2 は区間に使用が無いまま 5%（s4 は最後の観測より後）
+            limit("L2", "seven_day", 5.0, NOW + 86_400, 100),
+            // L3 は会話記録に現れない（claude.ai だけ）
+            limit("L3", "seven_day", 7.0, NOW + 86_400, 100),
+        ];
+        let b = breakdown(
+            &rows,
+            &keys,
+            &BTreeMap::new(),
+            &observations,
+            &query(By::Project, Window::SevenDay),
+            NOW,
+            0,
+        );
+        let l1 = b.logins.iter().find(|l| l.login == "L1").unwrap();
+        let s7 = l1
+            .limit_share
+            .iter()
+            .find(|k| k.kind == "seven_day")
+            .unwrap();
+        assert_eq!(s7.scope, ShareScope::CurrentWindow);
+        assert_eq!(s7.latest_percent, Some(14.0));
+        assert_eq!((s7.observed, s7.allocated, s7.outside), (14.0, 4.0, 10.0));
+        // 推定: 係数 = 20.4 USD / 4% = 5.1。s2（読み出し 1M = 0.2 USD）→ 0.04・s3（単価不明 1,000,005 トークン /
+        // 750,000 トークン毎 %）→ 1.33
+        assert!((s7.estimated - 1.37).abs() < 0.011, "{}", s7.estimated);
+        assert_eq!(s7.coefficient.unwrap().usd_per_percent, Some(5.1));
+        let s5 = l1
+            .limit_share
+            .iter()
+            .find(|k| k.kind == "five_hour")
+            .unwrap();
+        assert!(!s5.available, "5h の観測は無い");
+        let names: Vec<&str> = l1.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["tako", "プロファイル: default"],
+            "7d の % の大きい順"
+        );
+        let tako = l1.groups[0].limit_share.unwrap();
+        assert_eq!(tako.seven_day.map(|s| s.percent), Some(4.0));
+        assert_eq!(tako.five_hour, None, "観測の無い枠は出さない");
+        let default = l1.groups[1].limit_share.unwrap().seven_day.unwrap();
+        assert_eq!(default.percent, 0.0);
+        assert!((default.estimated - 1.33).abs() < 0.011);
+        // L2: 区間に使用が無い → すべて tako の外。最後の観測より後の s4 は係数が無いので % へ直さない
+        let l2 = b.logins.iter().find(|l| l.login == "L2").unwrap();
+        let s7 = l2
+            .limit_share
+            .iter()
+            .find(|k| k.kind == "seven_day")
+            .unwrap();
+        assert_eq!((s7.observed, s7.outside, s7.estimated), (5.0, 5.0, 0.0));
+        assert!((s7.unestimated_usd - 0.1).abs() < 1e-9);
+        // L3: 使用量が無くても観測のあるログインは出る（すべて tako の外）
+        let l3 = b
+            .logins
+            .iter()
+            .find(|l| l.login == "L3")
+            .expect("観測だけのログイン");
+        assert_eq!(l3.limit_share[1].outside, 7.0);
+        assert!(l3.groups.is_empty());
+
+        // 絞り込み: tako の % は絞らないときと同じ（区間の Δ を独り占めしない）。当たらないログインは出さない
+        let mut q = query(By::Project, Window::SevenDay);
+        q.project = Some("tako");
+        let b = breakdown(&rows, &keys, &BTreeMap::new(), &observations, &q, NOW, 0);
+        assert_eq!(
+            b.logins
+                .iter()
+                .map(|l| l.login.as_str())
+                .collect::<Vec<_>>(),
+            ["L1"]
+        );
+        let s7 = &b.logins[0].limit_share[1];
+        assert_eq!((s7.observed, s7.allocated), (14.0, 4.0));
+        assert!(
+            (s7.estimated - 0.04).abs() < 0.011,
+            "絞った後の推定は tako の分だけ"
+        );
+
+        // 暦の期間は延べ。窓をまたいでも期間に重なる分だけ
+        let b = breakdown(
+            &rows,
+            &keys,
+            &BTreeMap::new(),
+            &observations,
+            &query(By::Login, Window::All),
+            NOW,
+            0,
+        );
+        let l1 = b.logins.iter().find(|l| l.login == "L1").unwrap();
+        assert_eq!(l1.limit_share[1].scope, ShareScope::Period);
+        assert_eq!(l1.limit_share[1].observed, 14.0);
+        assert!(l1.groups.is_empty(), "login の段は合計だけ");
     }
 
     #[test]
