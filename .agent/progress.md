@@ -20,37 +20,6 @@
 
 ---
 
-## 2026-10-16（#1952: `.ino` の基板とポートをドロップダウン・`tako run-config --board/--port`・MCP で選ぶ = `board attach` が sketch.yaml へ書く・コア無しは案内だけ）
-- 実経路 `scripts/test-run-board-1952.sh` 28 PASS（3 経路とも arduino-cli の直書きとバイト一致・`core install` 0 回）・カタログ +282 B。PR #2144
-
-## 2026-10-16（#2025: 上端ドラッグのオートスクロールが送れる履歴なし / 最上端で選択を (0, 0) へ縮めていた → `drag_scroll_step` で送れないときは端を動かさない）
-- A/B `TAKO_2025_LEGACY=1`・番犬 `issue2025_tick_が判定を通す_watchdog`・実クリック `scripts/test-drag-autoscroll-2025.sh`。下端の対称は #2153。PR #2147
-
-## 2026-10-16（#2152: ファイルツリーで `.env.local` / `.env.production` 等の `.env.*` を `.env` と同じ設定アイコンに）
-- 特殊ファイル名の表に 1 行・最後の拡張子が表にある `.env.ts` 等と `.envrc` は従来どおり。PR #2156
-
-## 2026-10-16（#2150: 変更履歴の行の diff の展開（クリック / `--expand`）を `OffloadJob::PreviewChangelogDiff` へ・#2014 と同じ上限）
-- A/B `TAKO_2150_LEGACY=1`・番犬 14 節（注入 12 通り）・`scripts/test-changelog-expand-2150.sh` cli 16 / visual 2 PASS・カタログ増 0 B。PR #2160
-
-## 2026-10-16（#2153: 最下部ではドラッグ選択のオートスクロールで選択の端を行末へ寄せない = #2025 の下端版）
-- `drag_scroll_step` に下端の Hold・A/B `TAKO_2153_LEGACY=1`・番犬 `issue2153_tick_が下端で寄せない_watchdog`。実画面は蓋閉じで未実測。PR #2158
-
-## 2026-10-16（#2157: ネット復帰の再開が、エラー直後の通知行が挟まった停止と、同じ形の止まり直しを取りこぼさない = ユーザー依頼）
-- 締めの行より下の `⏺` を読み飛ばし、会話が進んだら・届いたら鍵を捨てる。A/B `TAKO_2157_LEGACY=1`・`scripts/test-net-resume-2157.sh` 38 PASS。PR #2165
-- 10/16 12:40 の 22 分の DNS 断で、止まった全ペインに自動で続きが届いた（手で再開 0 本）
-
-## 2026-10-16（#1734: Code Runner の実行先（reuse / new）を実行設定に覚える = `tako run-config --target`・MCP `tako_run_defaults` の `target`）
-- 一回限りの `new_pane` > 保存値 > 既定・serde default で移行なし。カタログ +159 B・`scripts/test-run-target-1734.sh` 32 PASS。PR #2162
-
-## 2026-10-16（#2163 / #2161 / #2164: CI の間欠 3 つ = LSP 取り消しの数え・ipc の fd テストの EINVAL・git 履歴の date_relative）
-- いずれも注入で原因を確定してテストだけ直した（`wait_received` で待つ・上限を shutdown の前へ・コミットを過去の固定時刻に）。PR #2167 / #2168 / #2170
-
-## 2026-10-16（#2051: md の表の `|` を `\|` で揃えて番犬で縛る + visual-test の `fail()` の経路でも節の一時ファイルを消す）
-- 番犬 `issue2051_md_table_columns_watchdog`・`remove_on_fail` の登録 93 か所・A/B `TAKO_2051_LEGACY=1`。PR #2154
-
-## 2026-10-16（#2159: tako mod の会話のカードに [ run ] / [ copy ] = クリック 1 回で実行（ユーザー依頼）・二重押しは止める）
-- 手順 新 1 クリック / 旧 3 打（A/B `TAKO_2159_LEGACY=1`）・`scripts/test-mod-card-click-2159.sh` 42 PASS・カタログ増 0 B。PR #2166
-
 ## 2026-10-16（#2151: git_bin() / tmux_bin() の初回の解決に全体 5 秒の締め切り = 戻らないログインシェルで止まらない）
 - `tako_core::bin_resolve`・打ち切ったら素の名前へ・理由を persist.log へ。A/B `TAKO_2151_LEGACY=1`・修正後 2.05 秒 / 修正前は戻らない。PR #2171
 
@@ -80,3 +49,33 @@
 
 ## 2026-10-16（#2043: 番犬の固定バイト幅の切り出し 12 か所を `tests/common/byte_window.rs` へ寄せ、`issue2043_byte_window_watchdog` で直書きを縛る）
 - 修正前 panic / 修正後 緑の A/B 3 本・製品ファイルの `#[cfg(test)]` に残る同型は #1790 へ。PR #2186
+
+## 2026-10-16（#2181: ネット復帰の自動再開が、低いペインで締めの行より上へ押し出された接続エラーの停止を拾う）
+- 見えている形が「締めの行 + 通知だけ」のときだけ画面の外の直近 200 行を足して同じ判定を通す。A/B `TAKO_2181_LEGACY=1`・`scripts/test-net-resume-2181.sh` 54 PASS。PR #2187
+
+## 2026-10-16（#2003: concept.md の Non-goals から LSP 統合を外し、「コードエディタの位置づけ」節に 9/24 の方針変更・やり方・未着手を書いた）
+- README / docs に同じ主張は無し。PR #2189
+
+## 2026-10-16（#2182: 返答の配送で起票 master を起こす組み立て（ログインシェルの所在確認）を `OffloadJob::UserTaskLaunch` で UI の外へ・右パネルも同じ）
+- 戻らないログインシェルで最中の IPC 新 45 ms / 旧 14,957 ms・`scripts/test-respond-master-launch-2182.sh` 13 PASS・A/B `TAKO_2182_LEGACY=1`。PR #2190
+
+## 2026-10-16（#2185: issue2151_git_bin_oncelock の結合テストも初回 exec の検査の列で落ちる間欠を #2183 と同じ形で止めた）
+- 8 本同時で修正前 24 本中 9 本落ち → 修正後 0 本・製品コード不変。PR #2191
+
+## 2026-10-16（#1938: セルフテスト項目 154 が止まる真因は、右クリックで立った行の選択が入力欄を閉じても残り、次の Enter がツリーへ吸われていたこと）
+- `close_inline_edit` で選択も畳む（製品 3 行）・セルフテストが `TAKO_APP_SELF_TEST_OK` まで完走・A/B `TAKO_1938_LEGACY=1`。PR #2194
+
+## 2026-10-16（#2192 S0: usage 分析の設計書 `.agent/plans/2026-10-usage-analytics.md` = 区間按分・API 換算の重み・ログイン単位・`tako_sessions` の action・増分索引）
+- 利用制限の % の履歴がどこにも無いことを実測で確認 → S1 を最優先に。台帳の主 Issue の不具合（#2199）を発見。PR #2195
+
+## 2026-10-16（#2196: scroll_mirror のホイール直接注入 e2e の間欠 = 内側の stty 前に注入して tty と perl の echo で 2 回見えていた）
+- アンカーを器のペインの `history_state` へ・列を個数まで比較・A/B `TAKO_2196_LEGACY=1` で CI と同一の画面。PR #2197
+
+## 2026-10-16（#2193: ports の libproc と ps の照合テストの間欠の真因は、ps が改行などを `\012` へ表記し直すこと（時刻差ではない））
+- libproc → ps → libproc で挟んで全件一致・表記し直しは手前の ASCII だけ比べる・テストだけの変更。PR #2198
+
+## 2026-10-16（#2199: 委任台帳の `issue` とカタログの `issues` の先頭を、ラベルに書いた主の Issue にした）
+- `extract_issues` を書いた順へ・A/B `TAKO_2199_LEGACY=1`・`scripts/test-ledger-primary-issue-2199.sh` 26 PASS・フィールド不変。PR #2207
+
+## 2026-10-16（#2200: usage 分析 S1 = tako mod の報告から利用制限の観測を `usage/limits.jsonl` へ・ログインの鍵は accountUuid の塩付きハッシュ・`tako usage`）
+- `scripts/test-usage-limits-2200.sh` 31 PASS・A/B `TAKO_2192_S1_LEGACY=1`・カタログ +91 B。10/17 00:50 に本番へ入れて記録開始を確認。PR #2208
