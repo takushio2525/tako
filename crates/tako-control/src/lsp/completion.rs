@@ -301,6 +301,7 @@ mod tests {
                 server: "s",
                 state: ServerState::GaveUp,
                 crashes: 3,
+                held: false,
             }
             .into(),
             GotoError::Crashed { server: "s" }.into(),

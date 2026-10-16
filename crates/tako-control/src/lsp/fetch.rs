@@ -108,18 +108,27 @@ impl FetchConfig {
     }
 }
 
-/// 開いた時点で取りに行くか。既定は取りに行く。`TAKO_LSP_AUTO_FETCH=0` で止め、セルフテスト・
-/// visual-test（`TAKO_SELF_TEST` / `TAKO_VISUAL_TEST`）は明示（`=1`）が無ければ取らない
-/// （検証のたびに配布元から取り直さない）
+/// 開いた時点で取りに行くか。既定は取りに行く。`TAKO_LSP_AUTO_FETCH=0` で止め、検証のための起動
+/// （隔離 `TAKO_ISOLATED`（#2048）・セルフテスト `TAKO_SELF_TEST`・visual-test `TAKO_VISUAL_TEST`）は
+/// 明示（`=1`）が無ければ取らない（検証のたびに配布元から取り直さない・隔離の検証からネットワークへ
+/// 出ない）。検証の起動の判定は窓の置き場と同じ 1 実装（`platform::display::is_verification_gui`）。
+/// A/B は `TAKO_2048_LEGACY=1`（隔離を数えない = セルフテスト・visual-test だけ）
 pub fn auto_from_env() -> bool {
+    let isolated = std::env::var("TAKO_ISOLATED")
+        .ok()
+        .filter(|_| !super::manager::legacy_2048());
     auto_from(
         std::env::var("TAKO_LSP_AUTO_FETCH").ok().as_deref(),
-        std::env::var_os("TAKO_SELF_TEST").is_some()
-            || std::env::var_os("TAKO_VISUAL_TEST").is_some(),
+        tako_core::platform::display::is_verification_gui(
+            isolated.as_deref(),
+            std::env::var_os("TAKO_SELF_TEST").is_some(),
+            std::env::var_os("TAKO_VISUAL_TEST").is_some(),
+        ),
     )
 }
 
-/// [`auto_from_env`] の判定（純粋関数）。`explicit` = `TAKO_LSP_AUTO_FETCH` の値
+/// [`auto_from_env`] の判定（純粋関数）。`explicit` = `TAKO_LSP_AUTO_FETCH` の値、
+/// `self_test` = 検証のための起動か（隔離・セルフテスト・visual-test）
 pub fn auto_from(explicit: Option<&str>, self_test: bool) -> bool {
     match explicit.map(str::trim) {
         Some("0" | "false" | "off") => false,
@@ -1182,7 +1191,7 @@ mod tests {
         assert!(auto_from(None, false), "既定は開いた時点で取る");
         assert!(
             !auto_from(None, true),
-            "セルフテスト・visual-test は明示が無ければ取らない"
+            "検証の起動（隔離・セルフテスト・visual-test）は明示が無ければ取らない"
         );
         assert!(auto_from(Some("1"), true));
         assert!(auto_from(Some(" on "), true));

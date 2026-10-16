@@ -652,6 +652,13 @@ pub fn lsp_loading(name: &str) -> String {
 pub fn lsp_running(name: &str) -> String {
     tr!(format!("{name} 動作中"), format!("{name} running"))
 }
+/// 隔離起動なので自動では起こさなかった（#2048。起こすのは `tako lsp restart`）
+pub fn lsp_held(name: &str) -> String {
+    tr!(
+        format!("{name} 自動起動なし（隔離）"),
+        format!("{name} not auto-started (isolated)")
+    )
+}
 /// 帯の見出し: 入っていない（補完・診断が出ないことを先に言う = 黙って出ない状態を無くす）
 pub fn lsp_not_installed(name: &str) -> String {
     tr!(

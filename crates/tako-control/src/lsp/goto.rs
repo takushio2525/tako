@@ -233,11 +233,12 @@ pub enum GotoError {
         secs: u64,
         starting: bool,
     },
-    /// 止めた / 諦めた（restart まで起きない）
+    /// 止めた / 諦めた（restart まで起きない）。`held` = 隔離起動なので自動では起こさなかった（#2048）
     Unavailable {
         server: &'static str,
         state: ServerState,
         crashes: u32,
+        held: bool,
     },
     /// 問い合わせの途中で落ちた
     Crashed { server: &'static str },
@@ -298,10 +299,16 @@ impl GotoError {
                 },
                 &[("server", server), ("secs", &secs.to_string())],
             ),
-            Self::Unavailable { state, crashes, .. } => match state {
+            Self::Unavailable {
+                state,
+                crashes,
+                held,
+                ..
+            } => match state {
                 ServerState::GaveUp => {
                     text::fill(text::GAVE_UP_REASON, &[("count", &crashes.to_string())])
                 }
+                _ if *held => text::HELD_REASON.text().to_string(),
                 _ => text::STOPPED_REASON.text().to_string(),
             },
             Self::Crashed { server } => {
@@ -338,8 +345,9 @@ impl GotoError {
             }
             Self::Unsupported { .. } => text::GOTO_UNSUPPORTED_NEXT_STEP.text().to_string(),
             Self::Timeout { .. } => text::GOTO_TIMEOUT_NEXT_STEP.text().to_string(),
-            Self::Unavailable { state, .. } => match state {
+            Self::Unavailable { state, held, .. } => match state {
                 ServerState::GaveUp => text::GAVE_UP_NEXT_STEP.text().to_string(),
+                _ if *held => text::HELD_NEXT_STEP.text().to_string(),
                 _ => text::STOPPED_NEXT_STEP.text().to_string(),
             },
             Self::Crashed { .. } | Self::ServerError { .. } => {
@@ -488,11 +496,19 @@ mod tests {
                 server: "s",
                 state: ServerState::GaveUp,
                 crashes: 3,
+                held: false,
             },
             GotoError::Unavailable {
                 server: "s",
                 state: ServerState::Stopped,
                 crashes: 0,
+                held: false,
+            },
+            GotoError::Unavailable {
+                server: "s",
+                state: ServerState::Stopped,
+                crashes: 0,
+                held: true,
             },
             GotoError::Crashed { server: "s" },
             GotoError::Closed,
@@ -503,6 +519,23 @@ mod tests {
             },
             GotoError::Unreadable { error: "e".into() },
         ]
+    }
+
+    /// #2048: 隔離起動で起こさなかった器は「stop で止めた」と言わず、隔離であることと restart を案内する
+    #[test]
+    fn 隔離で起こさなかった器は隔離の理由を返す() {
+        let error = |held| GotoError::Unavailable {
+            server: "s",
+            state: ServerState::Stopped,
+            crashes: 0,
+            held,
+        };
+        let held = error(true).to_json(GotoKind::Definition);
+        assert_eq!(held["status"], json!("unavailable"));
+        assert_eq!(held["reason"], json!(text::HELD_REASON.text()));
+        assert_eq!(held["next_step"], json!(text::HELD_NEXT_STEP.text()));
+        let stopped = error(false).to_json(GotoKind::Definition);
+        assert_eq!(stopped["reason"], json!(text::STOPPED_REASON.text()));
     }
 
     #[test]

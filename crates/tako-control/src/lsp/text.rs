@@ -173,6 +173,18 @@ pub const STOPPED_NEXT_STEP: Note = Note::new(
     "Run tako lsp restart to resume",
 );
 
+/// 隔離起動なので自動では起こさなかった（#2048）
+pub const HELD_REASON: Note = Note::new(
+    "隔離起動（TAKO_ISOLATED）なので自動では起こさない",
+    "Not started automatically in an isolated launch (TAKO_ISOLATED)",
+);
+
+/// 隔離起動で起こさなかったときの次の一手（#2048）
+pub const HELD_NEXT_STEP: Note = Note::new(
+    "起こすには tako lsp restart（起動時から起こすなら TAKO_LSP_AUTOSTART=1）",
+    "Run tako lsp restart to start it (or launch with TAKO_LSP_AUTOSTART=1)",
+);
+
 /// `TAKO_1007_LEGACY=1` で丸ごと止めている
 pub const DISABLED_REASON: Note = Note::new(
     "TAKO_1007_LEGACY=1 で LSP を止めている（編集は LSP 無しで動く）",

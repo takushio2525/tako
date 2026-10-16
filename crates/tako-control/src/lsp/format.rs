@@ -195,6 +195,7 @@ mod tests {
                 server: "s",
                 state: ServerState::GaveUp,
                 crashes: 3,
+                held: false,
             }),
             FormatError::Lsp(GotoError::Crashed { server: "s" }),
             FormatError::Lsp(GotoError::ServerError {
