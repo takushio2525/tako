@@ -10,6 +10,7 @@ pub mod app_bundle;
 pub mod backend;
 pub mod backend_reattach;
 pub mod background_groups;
+pub mod bin_resolve;
 pub mod byte_lru;
 pub mod claude_mod;
 pub mod claude_mod_install;
@@ -183,51 +184,5 @@ pub use workspace::{
 };
 
 /// 外部バイナリの解決（環境変数 → PATH 直 → 既知パス → ログインシェル）。
-/// `tmux_bin()` / `git_bin()` の共通基盤
-pub(crate) fn resolve_bin(
-    env_var: &str,
-    name: &str,
-    version_flag: &str,
-    candidates: &[&str],
-) -> String {
-    if let Some(bin) = std::env::var_os(env_var) {
-        if !bin.is_empty() {
-            return bin.to_string_lossy().into_owned();
-        }
-    }
-    // #586: バイナリ存在確認も GUI プロセスから走る（コンソールウィンドウを出させない）
-    if platform::process::no_console_window(&mut std::process::Command::new(name))
-        .arg(version_flag)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        return name.into();
-    }
-    for candidate in candidates {
-        if std::path::Path::new(candidate).is_file() {
-            return (*candidate).into();
-        }
-    }
-    #[cfg(unix)]
-    {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        if let Ok(output) = std::process::Command::new(shell)
-            .args(["-l", "-c", &format!("command -v {name}")])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() && std::path::Path::new(&path).is_file() {
-                    return path;
-                }
-            }
-        }
-    }
-    name.into()
-}
+/// `tmux_bin()` / `git_bin()` の共通基盤で、待ちの上限は [`bin_resolve`] が持つ（#2151）
+pub(crate) use bin_resolve::resolve_bin;

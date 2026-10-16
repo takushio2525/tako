@@ -844,6 +844,15 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
 - **検証は状態で書く**（`.agent/conventions.md`「効果を測る単体テストは実時間で比べない」）。
   見るのは `Outcome` がどれか・応答に `timed_out` が載るか・**打ち切った子が残っていないか**で、
   所要そのものは assert にしない（実経路テストは外側の締め切りで殺し、所要は証拠として出す）
+- **`OnceLock` の初期化の中で待つときは、待ちが他のスレッドへ伝染する**（#2151）。`git_bin()` /
+  `tmux_bin()` の初回の解決（`tako_core::bin_resolve`）は `--version` とログインシェルの
+  `command -v` を上限なしに待っており、rc が固まると最初に引いたスレッドだけでなく
+  **同じ値を引く全スレッドが**初期化の完了を待った。初期化の全体に締め切りを 1 本置き
+  （既定 5 秒・`TAKO_BIN_RESOLVE_TIMEOUT_SECS`。外せない）、子プロセスの段には残りだけを渡す。
+  打ち切ったら次の段へ進み（最後は素の名前 = PATH）、理由を persist.log へ 1 行残す。tako-core は
+  persist.log の書き手を持たないので、受け口は tako-app / tako CLI の main が
+  `bin_resolve::set_notice_sink` で渡す（番犬 `crates/tako-control/tests/issue2151_bin_resolve_watchdog.rs`、
+  実経路 `bash scripts/test-bin-resolve-timeout-2151.sh`、A/B `TAKO_2151_LEGACY=1`）
 - **子プロセスでない相手を聞き直して待つときも同じ**（#1662）。`tako run --wait` は実行ペインの
   終わりを IPC で 2 秒ごとに聞き直す無限ループで、サーバーを走らせると永久に返らなかった。
   聞き直しは `tako_core::probe::poll_with_timeout` の 1 実装を通す（眠りは残り時間で頭打ち・

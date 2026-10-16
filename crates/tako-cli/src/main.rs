@@ -4450,6 +4450,9 @@ fn main() -> ExitCode {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**。`cli_main` のスレッドより前）。
     // これが無いプロセスは置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
     tako_core::paths::mark_product_process();
+    // #2151: git の場所の解決（`tako open-in repo` 等が CLI のプロセスで git を起こす）が
+    // ログインシェル等を締め切りで打ち切ったら、理由を persist.log へ
+    tako_core::bin_resolve::set_notice_sink(tako_control::diag::persist_log);
     // #2021: MCP の stdio ブリッジ（claude 1 本に 1 本常駐）は clap を通さない。
     // コマンド定義の木を組むだけで malloc が約 2 MB の山を作り、解放しても OS へ返らず
     // 常駐の間ずっと footprint に残るため。`TAKO_2021_LEGACY=1` は clap を通る旧経路
