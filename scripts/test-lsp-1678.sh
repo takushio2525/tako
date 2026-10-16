@@ -4,7 +4,8 @@
 # 何を確かめるか（Issue #1678 の受け入れ条件のうち、GUI を通して初めて言えるもの）:
 #   ① 編集モードに入ると偽サーバが起きて握手し、didOpen が届く（開いただけでは起こさない）
 #   ② 範囲編集（tako edit replace-range）が didChange（incremental・UTF-16 の桁・#1658 の版）で届く
-#   ③ `tako lsp status --json` と MCP `tako_lsp_server` が同じ答えを返す（同じ dispatch）
+#   ③ `tako lsp status --json` と MCP `tako_lsp_server` が同じ答えを返す（同じ dispatch。
+#      `servers` の各行の `cached` は呼んだ順で変わるので値だけは比べない = #2174）
 #   ④ restart で起こし直す（spawn が 1 つ増え、今の本文で didOpen し直す）/ stop で止まる
 #   ⑤ `tako lsp servers` が未導入のサーバに理由と導入コマンドを返す
 #   ⑥ アイドル中（既定 60 秒 = IDLE_SECS）に偽サーバが受信した行数が 0（#772）
@@ -185,9 +186,37 @@ same_json() { python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1])
 CLI_STATUS="$("$TAKO_BIN" lsp status --json)"
 MCP_STATUS="$(mcp status)"
 if same_json "$CLI_STATUS" "$MCP_STATUS"; then pass "status が CLI と MCP で一致"; else fail "status が食い違う: CLI=$CLI_STATUS MCP=$MCP_STATUS"; fi
+# `servers` の各行の `cached`（#1769: その呼び出しがキャッシュから答えたか）は答えではなく呼んだ順の印
+# （先に呼ぶ CLI が温めるので、後の MCP は true になる）。値だけは比べず、キーの有無と型・それ以外の
+# 全フィールドは従来どおり比べる（#2174）。キャッシュの振る舞いそのものは
+# scripts/test-lsp-followup-1769.sh の ① と issue1769_lsp_followup.rs が見る。
+# 温めてから両方 true で比べる形にしないのは、合間にシェルの合図（OSC 7 等）が入ると引き直して揺れるため
+same_servers() { python3 -c 'import json,sys
+def norm(s):
+    d = json.loads(s)
+    for row in d.get("servers", []):
+        if "cached" in row:
+            row["cached"] = type(row["cached"]).__name__
+    return d
+NONE = object()
+def show(v):
+    return "（キーなし）" if v is NONE else json.dumps(v, ensure_ascii=False)
+def diff(path, x, y):
+    if isinstance(x, dict) and isinstance(y, dict):
+        for k in sorted(set(x) | set(y)):
+            diff(path + "." + k, x.get(k, NONE), y.get(k, NONE))
+    elif isinstance(x, list) and isinstance(y, list) and len(x) == len(y):
+        for i, (u, v) in enumerate(zip(x, y)):
+            diff(path + "[" + str(i) + "]", u, v)
+    elif x != y:
+        print("    " + path + ": CLI=" + show(x) + " MCP=" + show(y))
+a, b = norm(sys.argv[1]), norm(sys.argv[2])
+if a != b:
+    diff("", a, b)
+sys.exit(0 if a == b else 1)' "$1" "$2"; }
 CLI_SERVERS="$("$TAKO_BIN" lsp servers --json)"
 MCP_SERVERS="$(mcp list)"
-if same_json "$CLI_SERVERS" "$MCP_SERVERS"; then pass "servers / list が CLI と MCP で一致"; else fail "servers が食い違う"; fi
+if same_servers "$CLI_SERVERS" "$MCP_SERVERS"; then pass "servers / list が CLI と MCP で一致（cached の値を除く）"; else fail "servers が食い違う"; fi
 
 echo
 echo "== ⑤ 未導入のサーバには理由と導入コマンド =="
