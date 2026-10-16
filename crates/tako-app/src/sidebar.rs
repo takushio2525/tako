@@ -2380,6 +2380,10 @@ impl TakoApp {
     ///   続く確定がどこにも入らない / 次の変換の宛先がずれる）
     /// - `restore_focus` のとき（Esc / 確定）は、開いたときのペインへ打鍵を戻す。
     ///   外側のクリックで閉じたときは戻さない（押した先が次のフォーカスを決める）
+    /// - 打鍵を戻すときはツリーの行の選択も畳む（#1938）。右クリックで入力欄を開くと
+    ///   その行が選ばれる（#1860）ので、残すと閉じた直後の Enter / ↑↓ / ←→（#1908）・
+    ///   ⌘C / ⌘V・Esc がペインではなくツリーへ向く（Enter は選んでいた行を開く）。
+    ///   外側のクリックは押下の捕捉フェーズが選択を外す（行を押したならその行を選び直す）
     pub(crate) fn close_inline_edit(&mut self, restore_focus: bool) {
         let Some(edit) = self.inline_edit.take() else {
             return;
@@ -2390,6 +2394,9 @@ impl TakoApp {
             .is_some_and(|ime| ime.app_input == Some(AppTextInput::TreeName))
         {
             self.ime = None;
+        }
+        if restore_focus && !Self::legacy_1938() {
+            self.tree_selection = None;
         }
         if restore_focus && self.focused_pane() != edit.origin_pane {
             // 開いていたあいだに外から（CLI / MCP の focus 等）動かされていても戻る。
@@ -3075,6 +3082,15 @@ impl TakoApp {
     pub(crate) fn legacy_1725() -> bool {
         static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *LEGACY.get_or_init(|| std::env::var("TAKO_1725_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
+    /// #1938 の A/B。`TAKO_1938_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （Esc / 確定で入力欄を閉じてもツリーの選択を残す = 閉じた直後の Enter がツリーへ向く。
+    /// セルフテスト項目 154 は前提の待ちも修正前の固定 20 秒の窓へ戻る）。項目 154 が FAILED に
+    /// なるのが A/B の実測
+    pub(crate) fn legacy_1938() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_1938_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// #1417 の A/B。`TAKO_1417_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す

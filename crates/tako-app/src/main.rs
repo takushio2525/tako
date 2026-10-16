@@ -32155,6 +32155,39 @@ mod self_test {
             && delta.clock == 0
     }
 
+    /// 項目 154 の 2 巡目の前提（ターミナルへ出力が流れ始める）を待つ上限（純粋関数。#1938）。
+    ///
+    /// 新経路は素の 20 秒を [`state_wait_budget`] で混み具合に応じて伸ばす（伸ばすだけ・4 倍で
+    /// 打ち切り）。旧経路（`TAKO_1938_LEGACY=1`）は修正前の固定 20 秒の窓。`inject` は素の上限を
+    /// 差し替える注入（`TAKO_1938_INJECT_WINDOW_MS`。窓を縮めて A/B を取る）で、両方の経路に効く。
+    ///
+    /// #1938 の真因は窓の長さではなかった（閉じた入力欄の行の選択が残り、Enter がツリーへ向いて
+    /// コマンドが確定しない。修正前の実測は 20 秒のあいだ `command_state` が Idle のままで、
+    /// PTY へ直に `\r` を書くとすぐ流れ始めた = 待っても成立しない）。窓を縮めても修正後は通る
+    /// （流れ始めは 0.1 秒前後）
+    pub(crate) fn st1938_flow_budget(
+        inject: Option<Duration>,
+        busy: Option<f64>,
+        legacy: bool,
+    ) -> Duration {
+        let base = inject.unwrap_or(Duration::from_secs(20));
+        if legacy {
+            base
+        } else {
+            state_wait_budget(base, busy)
+        }
+    }
+
+    /// `TAKO_1938_INJECT_WINDOW_MS=<ms>`: 項目 154 の前提の素の上限を差し替える（#1938 の A/B 用）
+    fn st1938_inject_window() -> Option<Duration> {
+        std::env::var("TAKO_1938_INJECT_WINDOW_MS")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_millis)
+    }
+
     /// 項目 154 の道具: 実 OS マウスと同じ `PlatformInput` 経路で 1 回押す（#1725）。
     /// 動かしてから 1 フレーム描くのは `click_at`（#738 / #496）と同じ理由
     /// （hover はフレーム構築時のヒットテストで決まるので、動かしただけでは届かない）
@@ -32290,6 +32323,11 @@ mod self_test {
     /// 判定は**新しい挙動を無条件に主張する**（項目 149 / 153 と同じ作法）。
     /// `TAKO_1725_LEGACY=1` は変換の宛先と外側クリックを修正前へ戻すので、この項目が
     /// FAILED になる = 同一バイナリでの A/B
+    ///
+    /// #1938: 閉じるたびに「打鍵がツリーの選択へ向いていない」も見る。右クリックで行が選ばれる
+    /// （#1860）ので、Esc / 確定で閉じても選択が残ると、閉じた直後の Enter（#1908 で行を開く）が
+    /// ターミナルへ届かず、2 巡目の前提（出力が流れ始める）が窓の長さに関係なく成立しなかった。
+    /// 前提の上限は [`st1938_flow_budget`]。A/B は `TAKO_1938_LEGACY=1`（選択を残す + 固定 20 秒の窓）
     async fn st1725_tree_inline_input(
         any: AnyWindowHandle,
         window: WindowHandle<TakoApp>,
@@ -32402,18 +32440,45 @@ mod self_test {
         let mut busy_ticks: Option<(u64, u64)> = None;
         for round in 1..=ROUNDS {
             if round == 2 {
-                // ターミナルへ出力を流し始める（2・3 巡目のあいだ流れ続ける長さ）
+                // ターミナルへ出力を流し始める（2・3 巡目のあいだ流れ続ける長さ）。
+                // 打つ Enter は `handle_key` を通るので、1 巡目で閉じた入力欄が打鍵をペインへ
+                // 戻していなければここで止まる（#1938 の真因 = 右クリックで立った行の選択が
+                // 残り、Enter がツリーへ向いてコマンドが確定しない。待っても成立しない）
                 type_text(
                     any,
                     cx,
                     &sh.emit_numbered_lines("ST1725TICK", 4000, 10),
                     true,
                 );
-                let started =
-                    wait_for_focused_text(window, cx, "ST1725TICK3", Duration::from_secs(20)).await;
+                let inject = st1938_inject_window();
+                let budget = st1938_flow_budget(inject, machine_busy(), TakoApp::legacy_1938());
+                let waited = wait_for_focused_text_timed(window, cx, "ST1725TICK3", budget).await;
+                // 判定に使った材料そのもの（#796）: シェルがコマンドを確定したか
+                // （OSC 133 の状態）・打鍵の宛先がツリーの選択か・フォーカスが元のペインか
+                let (command_state, tree_keys, focus_ok) = window
+                    .update(cx, |app, _, _| {
+                        (
+                            app.terminals.get(&origin).map(|s| s.command_state()),
+                            app.active_tree_selection().is_some(),
+                            app.focused_pane() == origin,
+                        )
+                    })
+                    .unwrap_or((None, false, false));
+                println!(
+                    "TAKO_SELF_TEST_1938: item=154 ok={} waited={} budget={:.1}s legacy={} \
+                     inject_window_ms={inject:?} command_state={command_state:?} \
+                     tree_keys={tree_keys} focus_ok={focus_ok} {}",
+                    waited.is_some(),
+                    waited
+                        .map(|d| format!("{:.1}s", d.as_secs_f32()))
+                        .unwrap_or_else(|| "none".to_string()),
+                    budget.as_secs_f32(),
+                    TakoApp::legacy_1938(),
+                    env_line()
+                );
                 check(
-                    started,
-                    "項目 154: ターミナルへ出力が流れ始める（前提。#1725）",
+                    waited.is_some(),
+                    "項目 154: ターミナルへ出力が流れ始める（前提。#1725 / #1938）",
                 );
             }
             let tick_now = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| -> u64 {
@@ -32700,6 +32765,15 @@ mod self_test {
                     check(
                         focus_now == Some(origin),
                         &format!("項目 154: {label}: 閉じたあとフォーカスが元のペインへ戻らない: {focus_now:?} != {origin:?} (#1725)"),
+                    );
+                    // 打鍵がペインへ戻ったか（#1938）。フォーカスが戻っても、右クリックで立った
+                    // 行の選択が残っていれば Enter / ↑↓ / ⌘V はツリーへ向く（Enter は行を開く）
+                    let tree_keys = window
+                        .update(cx, |app, _, _| app.active_tree_selection().is_some())
+                        .unwrap_or(true);
+                    check(
+                        !tree_keys,
+                        &format!("項目 154: {label}: 閉じたあとの打鍵がペインではなくツリーの選択へ向く（Enter がターミナルへ届かない） (#1938)"),
                     );
                 }
             }
@@ -96367,9 +96441,36 @@ mod selftest_pty_enter_watchdog {
 #[cfg(test)]
 mod self_test_wait_budget_tests {
     use super::self_test::{
-        cli_state_budget, inject_1180_delay, resolve_text_wait, state_wait_budget, text_wait_budget,
+        cli_state_budget, inject_1180_delay, resolve_text_wait, st1938_flow_budget,
+        state_wait_budget, text_wait_budget,
     };
     use std::time::Duration;
+
+    /// #1938: 項目 154 の前提の上限。旧経路（`TAKO_1938_LEGACY=1`）は修正前の固定 20 秒の窓、
+    /// 新経路は混み具合で伸ばすだけ、注入（`TAKO_1938_INJECT_WINDOW_MS`）は両方の素の上限を差し替える
+    #[test]
+    fn 項目154の前提の上限は伸ばすだけで注入が両経路に効く() {
+        let twenty = Duration::from_secs(20);
+        assert_eq!(
+            st1938_flow_budget(None, Some(3.0), true),
+            twenty,
+            "旧経路が固定 20 秒でない"
+        );
+        assert_eq!(st1938_flow_budget(None, None, false), twenty);
+        assert_eq!(st1938_flow_budget(None, Some(0.0), false), twenty);
+        assert!(
+            st1938_flow_budget(None, Some(1.0), false) > twenty,
+            "混んだ機で伸びていない"
+        );
+        assert_eq!(
+            st1938_flow_budget(None, Some(9.0), false),
+            twenty * 4,
+            "4 倍で打ち切っていない"
+        );
+        let shrunk = Duration::from_millis(1500);
+        assert_eq!(st1938_flow_budget(Some(shrunk), Some(3.0), true), shrunk);
+        assert_eq!(st1938_flow_budget(Some(shrunk), Some(0.0), false), shrunk);
+    }
 
     /// `load=unknown` の環境（Windows 実機で 1 か月ぶん出ていた）でも予算は残る
     #[test]
