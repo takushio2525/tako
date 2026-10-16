@@ -947,6 +947,7 @@ mod tests {
         );
         assert_eq!(report.untrusted, None);
         // 世代の中身はそのまま（アクティブタブも世代のもの）
+        // 切り出し安全: tabs はタブの Vec
         assert_eq!(merged.tabs[..2], backup.tabs[..]);
         assert_eq!(merged.active_tab, backup.active_tab);
         crate::layout::restore(&merged).expect("合流後も復元できる");

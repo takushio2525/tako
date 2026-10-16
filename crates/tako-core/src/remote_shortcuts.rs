@@ -101,6 +101,7 @@ fn display_path(path: &str) -> String {
 /// 暗号学的強度は要らない: id は秘密ではなく、削除の宛先を指すだけ。
 /// **同じパスは必ず同じ id** になるので、二重登録が構造的に起きない
 pub fn id_of(path: &str) -> String {
+    // 切り出し安全: `{:012x}` の 16 進は 12 桁以上の ASCII
     format!("{:012x}", crate::fnv::fnv1a64(path.as_bytes()))[..12].to_string()
 }
 

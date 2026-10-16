@@ -305,6 +305,7 @@ fn parse_directive(rest: &str) -> Option<(&str, Option<&str>, &str)> {
     // プロファイル名（`[name]` 部分、省略可）
     let (profile_name, after_profile) = if after_key.starts_with('[') {
         let bracket_end = after_key.find(']')?;
+        // 切り出し安全: 先頭は直前で確かめた ASCII の `[`、bracket_end は find(']') の位置
         let name = &after_key[1..bracket_end];
         // プロファイル名の検証: [A-Za-z0-9_-]{1,32}
         if name.is_empty()
@@ -492,6 +493,7 @@ fn expand_with(template: &str, vars: &RunVars, quote: bool) -> String {
         if c == '$' && template[i + 1..].starts_with('{') {
             // ${...} パターンの検出
             if let Some(end) = template[i + 2..].find('}') {
+                // 切り出し安全: i は ASCII の `$`、i + 1 は `{`、end は find('}') の位置
                 let var_name = &template[i + 2..i + 2 + end];
                 let replacement = match var_name {
                     "file" => Some(q(&file_str)),
@@ -978,6 +980,7 @@ fn no_command_hint(platform: Platform, ext: &str) -> String {
 fn strip_quotes(s: &str) -> String {
     if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
         // エスケープされたクオートも元に戻す
+        // 切り出し安全: 両端は直前で確かめた ASCII の `'`
         s[1..s.len() - 1].replace("'\\''", "'")
     } else {
         s.to_string()

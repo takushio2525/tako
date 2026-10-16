@@ -549,6 +549,7 @@ fn resolve_string(doc: &LopdfDocument, obj: &lopdf::Object) -> Option<String> {
         lopdf::Object::String(bytes, _) => {
             if bytes.starts_with(&[0xFE, 0xFF]) {
                 // UTF-16BE BOM 付き
+                // 切り出し安全: lopdf の String の中身はバイト列（Vec<u8>）
                 let u16s: Vec<u16> = bytes[2..]
                     .chunks_exact(2)
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
@@ -712,6 +713,7 @@ mod tests {
         let page = doc.GetPage(0).unwrap();
         let png = render_page_png_inner(&page, 16, 16).expect("描画できる");
         assert_eq!(
+            // 切り出し安全: png は描いた PNG のバイト列（Vec<u8>）
             &png[..4],
             &[0x89, 0x50, 0x4E, 0x47],
             "既定エンコーダが PNG である"

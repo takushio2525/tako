@@ -79,7 +79,7 @@ impl OscScanner {
     /// （同一性は `groundの読み飛ばしが1バイト送りと同じ結果になる` が固定する）。
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
         let mut out = Vec::new();
-        let mut rest = bytes;
+        let mut rest: &[u8] = bytes;
         while !rest.is_empty() {
             if self.state == ScanState::Ground {
                 // memchr クレートは足さない: この読み取り粒度では SIMD 差が

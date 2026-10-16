@@ -2370,6 +2370,7 @@ mod tests_1657 {
         let got =
             powershell_run_pane_command_1657(PWSH, "cargo test", MARKER, Some(file), Lang::Ja);
         assert_eq!(got.program, PWSH);
+        // 切り出し安全: args は引数の Vec
         assert_eq!(&got.args[..2], ["-NoLogo", "-EncodedCommand"]);
         let script = decode_powershell_command(&got.args[2]);
         // 終了コードの決め方は PTY 無しの実行と同じ 1 実装（#935）

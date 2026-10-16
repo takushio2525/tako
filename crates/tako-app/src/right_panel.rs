@@ -4663,6 +4663,7 @@ impl TakoApp {
                                         detail
                                             .parents
                                             .iter()
+                                            // 切り出し安全: 親は git の `%P`（16 進の hash = ASCII）
                                             .map(|p| &p[..p.len().min(8)])
                                             .collect::<Vec<_>>()
                                             .join(", "),
@@ -6510,7 +6511,7 @@ mod dismiss_guard_watchdog {
         let body = &src[at..];
         let end = body
             .find("fn render_branch_confirm")
-            .unwrap_or(body.len().min(8000));
+            .unwrap_or(body.ceil_char_boundary(8000));
         assert!(
             body[..end].contains(".on_mouse_down("),
             "render_branch_input の入力欄が on_mouse_down で stop_propagation していない"

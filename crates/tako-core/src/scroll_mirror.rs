@@ -245,6 +245,7 @@ mod tests {
             lines[0].cell_cols
         );
         // あ=col0(幅2), i=col2, う=col3(幅2)
+        // 切り出し安全: cell_cols は列の Vec
         assert_eq!(&lines[0].cell_cols[..3], &[0, 2, 3]);
     }
 

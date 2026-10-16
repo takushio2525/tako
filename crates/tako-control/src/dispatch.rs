@@ -33406,6 +33406,7 @@ mod tests {
                 rel_path: Some("f.txt".into()),
                 commits: vec![tako_core::git::GitCommit {
                     hash: hash.into(),
+                    // 切り出し安全: hash は固定の 16 進のリテラル
                     short_hash: hash[..7].into(),
                     author: "testuser".into(),
                     date_relative: "now".into(),
@@ -33416,6 +33417,7 @@ mod tests {
             },
         );
         let ChangelogDiffStep::Expand(job) =
+            // 切り出し安全: hash は固定の 16 進のリテラル
             preview_changelog_diff_prepare(&host, Some(root), &hash[..7]).expect("準備")
         else {
             panic!("畳んでいる行は展開になる");

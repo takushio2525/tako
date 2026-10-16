@@ -178,6 +178,7 @@ pub fn comment_syntax_in(table: &[FileType], path: &Path) -> Option<CommentSynta
 
 /// 行頭の空白（半角スペースとタブだけ。インデントとして数えるもの）
 fn leading_ws(content: &str) -> &str {
+    // 切り出し安全: 行頭の ASCII の空白とタブのバイト数
     &content[..content.len() - content.trim_start_matches([' ', '\t']).len()]
 }
 

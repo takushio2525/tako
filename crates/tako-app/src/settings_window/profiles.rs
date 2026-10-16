@@ -1889,7 +1889,7 @@ mod tests {
         let fetch_start = src
             .find("fn fetch_model_catalog(")
             .expect("fetch_model_catalog がある");
-        let fetch_body = &src[fetch_start..fetch_start + 1200];
+        let fetch_body = &src[fetch_start..src.ceil_char_boundary(fetch_start + 1200)];
         assert!(
             fetch_body.contains("background_executor()"),
             "fetch_model_catalog が background executor を通っていない"

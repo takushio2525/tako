@@ -878,6 +878,7 @@ fn uri_key(uri: &str) -> String {
     if let Some(rest) = decoded.strip_prefix("file:///") {
         let rb = rest.as_bytes();
         if rb.len() >= 2 && rb[0].is_ascii_alphabetic() && rb[1] == b':' {
+            // 切り出し安全: 先頭 1 バイトは直前で確かめた ASCII の英字
             decoded = format!("file:///{}{}", rest[..1].to_ascii_lowercase(), &rest[1..]);
         }
     }
@@ -4163,6 +4164,7 @@ impl Shared {
                     path,
                     source,
                     edits: file.edits.len(),
+                    // 切り出し安全: edits は編集の Vec
                     spots: core::spots(text.as_deref(), &file.edits[..take]),
                 }
             })

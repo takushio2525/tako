@@ -601,6 +601,7 @@ pub fn shell_path(path: &str) -> String {
         && bytes[2] == b':'
         && (bytes.len() == 3 || bytes[3] == b'/')
     {
+        // 切り出し安全: 先頭は直前で確かめた ASCII の `/`
         return path[1..].to_string();
     }
     path.to_string()

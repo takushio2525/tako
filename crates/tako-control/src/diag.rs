@@ -897,8 +897,8 @@ mod tests {
             assert!(
                 line.starts_with('[')
                     && line.len() > 22
-                    && &line[21..23] == "] "
-                    && line[23..].starts_with("thread"),
+                    && line.as_bytes()[21..23] == *b"] "
+                    && line.as_bytes()[23..].starts_with(b"thread"),
                 "混線した行: {line:?}"
             );
         }

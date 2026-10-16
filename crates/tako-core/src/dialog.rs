@@ -1235,9 +1235,10 @@ pub fn numbered_choice(inner: &str) -> Option<(u32, &str)> {
     if digits == 0 {
         return None;
     }
-    let rest = &inner[digits..];
+    // 切り出し安全: digits は先頭の ASCII 数字のバイト数
+    let (number, rest) = (&inner[..digits], &inner[digits..]);
     let label = rest.strip_prefix(". ")?;
-    inner[..digits].parse().ok().map(|n| (n, label))
+    number.parse().ok().map(|n| (n, label))
 }
 
 /// `inner`（`line` の部分スライス）が `line` の何バイト目から始まるかを返す。
@@ -1265,6 +1266,7 @@ fn aligned_sibling(line: &str, indent: usize) -> bool {
     }
     let stripped = line.trim_start();
     let leading = line.len() - stripped.len();
+    // 切り出し安全: leading は trim_start が残した後ろ側の始まり = 文字境界
     line[..leading].chars().count() == indent
 }
 

@@ -446,6 +446,7 @@ pub fn word_start(line: &str, col: usize) -> usize {
     if !line.is_char_boundary(col) {
         return col;
     }
+    // 切り出し安全: 直前で行の長さへ丸め、文字境界でなければ返している
     line[..col]
         .char_indices()
         .rev()

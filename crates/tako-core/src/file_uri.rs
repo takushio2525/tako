@@ -34,6 +34,7 @@ pub fn strip_drive_slash(path: &str) -> &str {
         && bytes[2] == b':'
         && (bytes.len() == 3 || bytes[3] == b'/');
     if looks_like_drive {
+        // 切り出し安全: 先頭は直前で確かめた ASCII の `/`
         &path[1..]
     } else {
         path
@@ -101,11 +102,9 @@ pub fn from_path_str(path: &str, windows: bool) -> String {
     // ドライブ文字の `:` はそのまま残す（`file:///C:/…`）
     let bytes = slashed.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return format!(
-            "file:///{}:{}",
-            &slashed[..1],
-            percent_encode_path(&slashed[2..])
-        );
+        // 切り出し安全: 先頭 2 バイトは直前で確かめた ASCII の `C:`
+        let (drive, rest) = (&slashed[..1], &slashed[2..]);
+        return format!("file:///{drive}:{}", percent_encode_path(rest));
     }
     format!("file://{}", percent_encode_path(&slashed))
 }

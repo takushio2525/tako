@@ -243,6 +243,7 @@ mod tests {
         let mut rest = s;
         while let Some(i) = rest.find("\\u") {
             out.push_str(&rest[..i]);
+            // 切り出し安全: テスト専用。入力は自前の `\uXXXX`（16 進 ASCII 4 桁）
             let hex = &rest[i + 2..i + 6];
             out.push(char::from_u32(u32::from_str_radix(hex, 16).expect("16 進")).expect("文字"));
             rest = &rest[i + 6..];

@@ -759,7 +759,7 @@ mod tests {
             assert!(
                 !evidence.contains('\u{fffd}'),
                 "pad={pad} で文字が壊れた: {}",
-                &evidence[..40.min(evidence.len())]
+                &evidence[..evidence.ceil_char_boundary(40)]
             );
             assert!(evidence.len() <= EVIDENCE_MAX_BYTES + 32, "pad={pad}");
         }

@@ -673,6 +673,7 @@ fn has_elapsed_marker(line: &str) -> bool {
         .any(|tok| {
             tok.len() >= 2
                 && tok.ends_with('s')
+                // 切り出し安全: 末尾の 1 バイトは直前の ends_with('s') で ASCII
                 && tok[..tok.len() - 1].chars().all(|c| c.is_ascii_digit())
         })
 }

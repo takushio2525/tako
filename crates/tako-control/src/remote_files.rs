@@ -105,6 +105,7 @@ impl TreeRoot {
 /// 「その id が**今の**ルート一覧に在るか」の照合で行うため。
 /// 万一衝突しても `roots_from_payload` が接尾辞で分離するので取り違えは起きない
 pub fn root_id_of(path: &str) -> String {
+    // 切り出し安全: `{:012x}` の 16 進は 12 桁以上の ASCII
     format!("{:012x}", fnv1a64(path.as_bytes()))[..12].to_string()
 }
 
@@ -662,6 +663,7 @@ pub fn parse_range(header: Option<&str>, total: u64) -> RangeSpec {
     let Some(rest) = raw
         .get(..6)
         .filter(|p| p.eq_ignore_ascii_case("bytes="))
+        // 切り出し安全: 先頭 6 バイトは直前で確かめた ASCII の `bytes=`
         .map(|_| &raw[6..])
     else {
         return RangeSpec::Whole;
@@ -900,6 +902,7 @@ pub fn ssh_root_id_of(host: &str, path: &str) -> String {
     let key = format!("{host}\u{0}{path}");
     format!(
         "{SSH_ID_PREFIX}{}",
+        // 切り出し安全: `{:012x}` の 16 進は 12 桁以上の ASCII
         &format!("{:012x}", fnv1a64(key.as_bytes()))[..12]
     )
 }

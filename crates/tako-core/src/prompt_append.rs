@@ -291,6 +291,7 @@ pub fn move_marker(text: &str, budget: usize) -> Option<String> {
         "{}{MARKER}\n{}{}",
         &text[..plan.offset],
         &text[plan.offset..marker_at],
+        // 切り出し安全: on_demand は text の後ろ側の切り出し = 文字境界
         &text[marker_end..]
     ))
 }

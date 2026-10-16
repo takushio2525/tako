@@ -240,10 +240,7 @@ impl ServerProcess {
                         let text = String::from_utf8_lossy(&line);
                         let text = text.trim_end_matches('\r');
                         raw_log_line(&raw_log, "err", text);
-                        let mut end = text.len().min(STDERR_LINE_BYTES);
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
+                        let end = text.floor_char_boundary(STDERR_LINE_BYTES);
                         if let Ok(mut tail) = tail.lock() {
                             if tail.len() == STDERR_TAIL_LINES {
                                 tail.pop_front();
