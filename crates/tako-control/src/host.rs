@@ -838,6 +838,20 @@ pub struct PreviewGotoSource {
     pub document: Option<String>,
 }
 
+/// 変更履歴の 1 行（コミット）の展開の材料（#2150。[`PreviewHost::changelog_diff_target`]）。
+/// UI スレッドで写すキャッシュ済みの値だけで、git は起こさない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelogDiffTarget {
+    /// コミットの完全なハッシュ（短縮で指定されても完全なものへ寄せる）
+    pub hash: String,
+    /// いま展開しているか（展開中なら折りたたむ = git を起こさない）
+    pub expanded: bool,
+    /// リポジトリのルート（変更履歴を開いたときに取った値。git 管理外なら None）
+    pub repo_root: Option<std::path::PathBuf>,
+    /// リポジトリからの相対パス（git 表記 = `/` 区切り。#520）
+    pub rel_path: Option<String>,
+}
+
 pub trait PreviewHost {
     /// ペインのプレビュー状態（FR-3.2。`(path, mode)`。プレビューペインでなければ None）
     fn preview_state(&self, _pane: PaneId) -> Option<(String, crate::protocol::PreviewModeWire)> {
@@ -1200,12 +1214,25 @@ pub trait PreviewHost {
     ) -> Result<(), String> {
         Err("チェンジログビューは未対応".into())
     }
-    /// チェンジログビューで特定コミットの diff を展開/折りたたみする。
-    fn toggle_changelog_diff(
+    /// チェンジログビューの 1 行（コミット）の展開の材料を写す（#2150）。`hash` は完全 / 短縮の
+    /// どちらでもよい。実装はここで git を起こさない（UI スレッドで呼ばれる。キャッシュ済みの値だけ）
+    fn changelog_diff_target(
+        &self,
+        _pane: PaneId,
+        _hash: &str,
+    ) -> Result<ChangelogDiffTarget, String> {
+        Err("チェンジログビューは未対応".into())
+    }
+    /// チェンジログビューの 1 行の diff を置く / 外す（`None` = 折りたたむ。`hash` は完全なハッシュ）。
+    ///
+    /// diff（`git diff` / `git diff-tree`）は dispatch が上限つきで background で取ってから渡す
+    /// （#2150）。実装はここで git を起こさない（UI スレッドで呼ばれる）
+    fn set_changelog_diff(
         &mut self,
         _pane: PaneId,
         _hash: &str,
-    ) -> Result<serde_json::Value, String> {
+        _hunks: Option<Vec<tako_core::DiffHunk>>,
+    ) -> Result<(), String> {
         Err("チェンジログビューは未対応".into())
     }
     /// タブ内の既存プレビューペイン（OpenFile の再利用先。VSCode のプレビュータブ相当）

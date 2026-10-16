@@ -468,6 +468,20 @@ pub fn issue2014_legacy() -> bool {
     })
 }
 
+/// #2150 の A/B（`TAKO_2150_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// プレビューの変更履歴の行の diff の展開（IPC = CLI / MCP の `--expand` と GUI のコミット行の
+/// クリック）が UI スレッドの同期の dispatch で `git diff` / `git diff-tree` を**上限なしで**待つ。
+/// **ゲートはこの 1 か所**で、tako-control / tako-app もここを読む
+pub fn issue2150_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2150_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。

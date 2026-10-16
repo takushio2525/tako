@@ -5447,8 +5447,7 @@ impl TakoApp {
                             .cursor_pointer()
                             .hover(|d| d.bg(rgba_alpha(theme.surface_hover, 0.5)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_changelog_diff(pane_id, &commit_hash_full);
-                                cx.notify();
+                                this.toggle_changelog_diff(pane_id, &commit_hash_full, cx);
                             }))
                             .child(
                                 div()
@@ -5742,28 +5741,43 @@ impl TakoApp {
             .into_any_element()
     }
 
-    /// toggle_changelog_diff のローカル版（UI から直接呼ぶ）
-    fn toggle_changelog_diff(&mut self, pane_id: PaneId, hash: &str) {
-        let data = match self.preview_changelogs.get_mut(&pane_id) {
-            Some(d) => d,
-            None => return,
-        };
-        let entry = match data
-            .entries
-            .iter_mut()
-            .find(|e| e.commit.hash == hash || e.commit.short_hash == hash)
+    /// 変更履歴の行のクリック = その 1 コミットの diff の展開 / 折りたたみ（Issue #338）。
+    ///
+    /// CLI / MCP の `tako preview-changelog --expand` と同じ dispatch を通す。展開の `git diff` は
+    /// `dispatch_off_ui` で background へ出し、UI スレッドで待たない（#2150）。取っている間の同じ行の
+    /// 重ね押しは無視し、上限に達した等の失敗は通知欄へ知らせる
+    pub(crate) fn toggle_changelog_diff(
+        &mut self,
+        pane_id: PaneId,
+        hash: &str,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let key = (pane_id, hash.to_string());
+        if !self.preview_changelogs.contains_key(&pane_id)
+            || !self.preview_changelog_diff_pending.insert(key.clone())
         {
-            Some(e) => e,
-            None => return,
-        };
-        if entry.expanded_diff.is_some() {
-            entry.expanded_diff = None;
-        } else {
-            if let (Some(repo), Some(rel)) = (data.repo_root.as_deref(), data.rel_path.as_deref()) {
-                let hunks = tako_core::git::diff_file_commit(repo, &entry.commit.hash, rel);
-                entry.expanded_diff = Some(hunks);
-            }
+            return;
         }
+        let request = tako_control::protocol::Request::PreviewChangelog {
+            pane: Some(pane_id.as_u64()),
+            enabled: None,
+            max_count: None,
+            expand: Some(hash.to_string()),
+        };
+        self.dispatch_off_ui(request, PaneOrigin::User, cx, move |app, result, cx| {
+            app.preview_changelog_diff_pending.remove(&key);
+            if let Err(e) = result {
+                app.notify_ui_op_failed(
+                    crate::sidebar::NoticeArea::Preview,
+                    crate::sidebar::NoticeArm::Issue2150,
+                    crate::ui_text::preview::op_changelog_diff(),
+                    None,
+                    &e.to_string(),
+                );
+            }
+            cx.notify();
+        });
+        cx.notify();
     }
 }
 

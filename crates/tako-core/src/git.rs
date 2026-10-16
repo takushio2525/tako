@@ -424,11 +424,12 @@ pub struct FileHistory {
     pub commits: Vec<GitCommit>,
 }
 
-/// 変更履歴の取得が上限に達した（#2014）。文面は CLI / MCP の応答と GUI の通知にそのまま出るので、
-/// パスを含めない（#927）
+/// 変更履歴の取得が上限に達した（#2014。行の diff の展開 = #2150 も同じ）。文面は CLI / MCP の応答と
+/// GUI の通知にそのまま出るので、パスを含めない（#927）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryTimedOut {
-    /// 返らなかった git の段（`rev-parse --show-toplevel` / `log --follow`）
+    /// 返らなかった git の段（`rev-parse --show-toplevel` / `log --follow` / `diff` /
+    /// `diff-tree --root -p`）
     pub step: &'static str,
     /// 取得全体の上限
     pub budget: Duration,
@@ -524,7 +525,10 @@ fn bounded_git(
 /// 特定コミットでの特定ファイルの diff を取得する。
 /// `git diff <hash>^..<hash> -- <file>`（親を持たない初期コミットは
 /// `git diff-tree --root -p` フォールバック。#487 で `git diff --root` から修正 =
-/// 旧実装は「コミット vs 作業ツリー」を返していた）
+/// 旧実装は「コミット vs 作業ツリー」を返していた）。
+///
+/// **上限なし**（`tako git show --file` の background のジョブが使う）。プレビューの変更履歴の
+/// 行の展開は上限つきの [`commit_file_diff`] を通す（#2150）
 pub fn diff_file_commit(repo: &Path, hash: &str, file_path: &str) -> Vec<DiffHunk> {
     let out = run_git(
         repo,
@@ -538,6 +542,44 @@ pub fn diff_file_commit(repo: &Path, hash: &str, file_path: &str) -> Vec<DiffHun
     };
     let files = parse_diff(&raw);
     files.into_iter().flat_map(|f| f.hunks).collect()
+}
+
+/// [`diff_file_commit`] の**上限つき**版（プレビューの変更履歴の行の展開。#338 / #2150）。
+///
+/// 同じ 2 段（`git diff <hash>^..<hash>` → 失敗したら `git diff-tree --root -p`）・同じ解析で、
+/// `budget` は 2 段を合わせた上限（変更履歴と同じ [`changelog_timeout`] を渡す）。UI スレッドで
+/// 呼ばない（呼び手は dispatch の background のジョブ）。git を起こせない・2 段とも失敗したときは
+/// 従来どおり空で、上限に達したときだけ `Err`
+pub fn commit_file_diff(
+    repo: &Path,
+    hash: &str,
+    file_path: &str,
+    budget: Duration,
+) -> Result<Vec<DiffHunk>, HistoryTimedOut> {
+    let start = Instant::now();
+    let timed_out = |step| HistoryTimedOut { step, budget };
+    let step = "diff";
+    let range = format!("{hash}^..{hash}");
+    let out = match bounded_git(repo, &["diff", &range, "--", file_path], step, budget)
+        .ok_or_else(|| timed_out(step))?
+    {
+        Some(out) => Some(out),
+        None => {
+            let step = "diff-tree --root -p";
+            bounded_git(
+                repo,
+                &["diff-tree", "--root", "-p", hash, "--", file_path],
+                step,
+                budget.saturating_sub(start.elapsed()),
+            )
+            .ok_or_else(|| timed_out(step))?
+        }
+    };
+    let raw = out
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let files = parse_diff(&raw);
+    Ok(files.into_iter().flat_map(|f| f.hunks).collect())
 }
 
 // ──────────────────────── git branch ────────────────────────
@@ -2689,6 +2731,99 @@ mod tests {
         assert!(msg.contains(CHANGELOG_TIMEOUT_ENV), "{msg}");
         assert!(
             !msg.contains("tako-git-2014"),
+            "パスを載せない（#927）: {msg}"
+        );
+    }
+
+    // ──────────────── 変更履歴の行の diff の展開（#2150）────────────────
+
+    /// 上限つきの版が、修正前の展開が呼んでいた上限なしの `diff_file_commit` と同じ hunk を返す
+    /// （A/B）。初期コミット（`diff-tree` へ落ちる）・通常の変更・リネーム・バイナリ・巨大な差分・
+    /// 履歴に無いハッシュ（両段とも失敗 = 空）
+    #[test]
+    fn commit_file_diffは上限なしの版と同じhunkを返す() {
+        let repo = TempRepo::new("2150");
+        repo.commit("a.txt", "1\n2\n3\n", "one");
+        repo.commit("a.txt", "1\nTWO\n3\n4\n", "two");
+        repo.git(&["mv", "a.txt", "b.txt"]);
+        repo.git(&["commit", "-q", "-m", "rename"]);
+        std::fs::write(repo.path().join("bin.dat"), [0u8, 1, 2, 0, 255, 0]).expect("write");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "binary"]);
+        std::fs::write(repo.path().join("bin.dat"), [0u8, 9, 9, 0, 255, 0, 7]).expect("write");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "binary2"]);
+        let big: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        repo.commit("big.txt", &big, "big");
+        let big2: String = (0..20_000).map(|i| format!("LINE {i}\n")).collect();
+        repo.commit("big.txt", &big2, "big2");
+        let root = repo_root(repo.path()).expect("リポジトリ");
+        let mut checked = 0;
+        // b.txt の古い 2 件は改名前（a.txt）のコミットなので b.txt の差分は空（新旧とも）
+        for (file, root_commit_has_hunks) in [
+            ("a.txt", true),
+            ("b.txt", false),
+            ("bin.dat", false),
+            ("big.txt", true),
+        ] {
+            let commits = log_file_commits(&root, file, 50);
+            assert!(!commits.is_empty(), "{file} の履歴");
+            for c in &commits {
+                let new = commit_file_diff(&root, &c.hash, file, DEFAULT_CHANGELOG_TIMEOUT)
+                    .expect("上限内に終わる");
+                let old = diff_file_commit(&root, &c.hash, file);
+                assert_eq!(new, old, "{file} @ {}", c.subject);
+                checked += 1;
+            }
+            if root_commit_has_hunks {
+                // a.txt の最古は親の無い初期コミット（`git diff` が失敗して `diff-tree --root` へ落ちる）
+                let first = commits.last().expect("最古");
+                let hunks = commit_file_diff(&root, &first.hash, file, DEFAULT_CHANGELOG_TIMEOUT)
+                    .expect("上限内");
+                assert!(!hunks.is_empty(), "{file} の最古のコミットの差分");
+            }
+        }
+        assert!(checked >= 8, "{checked}");
+        // 巨大な差分は 2 万行の削除 + 2 万行の追加がそのまま届く
+        let big_head = &log_file_commits(&root, "big.txt", 1)[0];
+        let hunks = commit_file_diff(&root, &big_head.hash, "big.txt", DEFAULT_CHANGELOG_TIMEOUT)
+            .expect("上限内");
+        let lines: usize = hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(lines, 40_000);
+        // 履歴に無いハッシュは両段とも失敗 = 空（失敗にしない。従来どおり）
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            commit_file_diff(&root, missing, "a.txt", DEFAULT_CHANGELOG_TIMEOUT),
+            Ok(Vec::new())
+        );
+        assert!(diff_file_commit(&root, missing, "a.txt").is_empty());
+    }
+
+    /// 返らない git は上限で打ち切る。`.git/HEAD` を FIFO にすると `git diff` も書き手を待って
+    /// 返らない（偽の git を置かずに再現する。#2014 と同じ材料）
+    #[cfg(unix)]
+    #[test]
+    fn commit_file_diffは返らないgitを上限で打ち切る() {
+        let dir = std::env::temp_dir().join(format!("tako-git-2150-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/objects")).expect("mkdir");
+        std::fs::create_dir_all(dir.join(".git/refs")).expect("mkdir");
+        let head = std::ffi::CString::new(dir.join(".git/HEAD").as_os_str().as_encoded_bytes())
+            .expect("NUL を含まない");
+        // SAFETY: NUL 終端のパスを渡すだけ
+        assert_eq!(unsafe { libc::mkfifo(head.as_ptr(), 0o644) }, 0);
+        let start = Instant::now();
+        let got = commit_file_diff(&dir, "abc1234", "f.txt", Duration::from_millis(500));
+        let waited = start.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = got.expect_err("上限で打ち切る");
+        assert_eq!(err.step, "diff");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("`git diff`"), "{msg}");
+        assert!(msg.contains(CHANGELOG_TIMEOUT_ENV), "{msg}");
+        assert!(
+            !msg.contains("tako-git-2150"),
             "パスを載せない（#927）: {msg}"
         );
     }

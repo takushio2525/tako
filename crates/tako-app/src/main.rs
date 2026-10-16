@@ -2746,6 +2746,9 @@ struct TakoApp {
     /// 「履歴」ボタンで変更履歴を取っている最中のペイン（#2014。git は background で待つので、
     /// その間の重ね押しを無視する）
     preview_changelog_pending: std::collections::HashSet<PaneId>,
+    /// 変更履歴の行のクリックで diff を取っている最中の行（#2150。ペインと完全なハッシュ。
+    /// git は background で待つので、その間の同じ行の重ね押しを無視する）
+    preview_changelog_diff_pending: std::collections::HashSet<(PaneId, String)>,
     /// PDF・画像プレビューのズーム / パン / ページ状態（#234。core モデル）。
     preview_views: HashMap<PaneId, tako_core::PreviewViewState>,
     /// PDF・画像プレビューの 2 軸スクロールとページ移動を共有する GPUI handle。
@@ -5061,6 +5064,7 @@ impl TakoApp {
             run_menu: crate::run_menu_ui::RunMenuUi::default(),
             preview_changelogs: HashMap::new(),
             preview_changelog_pending: std::collections::HashSet::new(),
+            preview_changelog_diff_pending: std::collections::HashSet::new(),
             preview_views: HashMap::new(),
             preview_scroll_handles: HashMap::new(),
             filetree_scroll_handle: gpui::ScrollHandle::new(),
@@ -27101,38 +27105,42 @@ impl PreviewHost for TakoApp {
         Ok(())
     }
 
-    fn toggle_changelog_diff(
+    /// #2150: 展開の材料（変更履歴を開いたときに取った値）を写すだけ（ここで git を起こさない）
+    fn changelog_diff_target(
+        &self,
+        pane: PaneId,
+        hash: &str,
+    ) -> Result<tako_control::ChangelogDiffTarget, String> {
+        let data = self
+            .preview_changelogs
+            .get(&pane)
+            .ok_or("チェンジログビューが有効ではない")?;
+        let entry = data
+            .entry(hash)
+            .ok_or_else(|| format!("コミット {} が見つからない", hash))?;
+        Ok(tako_control::ChangelogDiffTarget {
+            hash: entry.commit.hash.clone(),
+            expanded: entry.expanded_diff.is_some(),
+            repo_root: data.repo_root.clone(),
+            rel_path: data.rel_path.clone(),
+        })
+    }
+
+    /// #2150: diff は dispatch が上限つきで background で取ってから渡す（ここで git を起こさない）
+    fn set_changelog_diff(
         &mut self,
         pane: PaneId,
         hash: &str,
-    ) -> Result<serde_json::Value, String> {
-        let data = self
+        hunks: Option<Vec<tako_core::DiffHunk>>,
+    ) -> Result<(), String> {
+        let entry = self
             .preview_changelogs
             .get_mut(&pane)
-            .ok_or("チェンジログビューが有効ではない")?;
-        let entry = data
-            .entries
-            .iter_mut()
-            .find(|e| e.commit.hash == hash || e.commit.short_hash == hash)
+            .ok_or("チェンジログビューが有効ではない")?
+            .entry_mut(hash)
             .ok_or_else(|| format!("コミット {} が見つからない", hash))?;
-        if entry.expanded_diff.is_some() {
-            entry.expanded_diff = None;
-            Ok(serde_json::json!({
-                "pane": pane.as_u64(),
-                "hash": hash,
-                "expanded": false,
-            }))
-        } else {
-            let repo = data.repo_root.as_deref().ok_or("リポジトリ情報がない")?;
-            let rel = data.rel_path.as_deref().ok_or("ファイルパス情報がない")?;
-            let hunks = tako_core::git::diff_file_commit(repo, &entry.commit.hash, rel);
-            entry.expanded_diff = Some(hunks);
-            Ok(serde_json::json!({
-                "pane": pane.as_u64(),
-                "hash": hash,
-                "expanded": true,
-            }))
-        }
+        entry.expanded_diff = hunks;
+        Ok(())
     }
 }
 
@@ -31860,6 +31868,12 @@ mod self_test {
     mod changelog_offload_2014;
     #[cfg(feature = "visual-test")]
     use changelog_offload_2014::changelog_offload_visual;
+    /// #2150: プレビューの変更履歴のコミット行のクリックが UI スレッドで git を待たない
+    /// （visual-test `changelog-expand`）
+    #[cfg(feature = "visual-test")]
+    mod changelog_expand_2150;
+    #[cfg(feature = "visual-test")]
+    use changelog_expand_2150::changelog_expand_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -46443,6 +46457,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2150: コミット行のクリックが返らない git の最中も UI スレッドを止めず、上限で理由を知らせる
+                "changelog-expand" => {
+                    changelog_expand_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -46459,7 +46479,7 @@ mod self_test {
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
-                         changelog-offload）"
+                         changelog-offload / changelog-expand）"
                     );
                     std::process::exit(1);
                 }

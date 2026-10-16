@@ -375,6 +375,20 @@ impl ChangelogData {
             rel_path: history.rel_path,
         }
     }
+
+    /// 完全 / 短縮のハッシュで 1 行を引く（#338。CLI の `--expand` は短縮も受け付ける）
+    pub fn entry(&self, hash: &str) -> Option<&ChangelogEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.commit.hash == hash || e.commit.short_hash == hash)
+    }
+
+    /// [`Self::entry`] の書き換え版（#2150。diff を置く / 外す）
+    pub fn entry_mut(&mut self, hash: &str) -> Option<&mut ChangelogEntry> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.commit.hash == hash || e.commit.short_hash == hash)
+    }
 }
 
 /// 読み込み済みのプレビュー内容
