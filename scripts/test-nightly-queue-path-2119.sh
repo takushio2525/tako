@@ -30,6 +30,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QUEUE_SH="$REPO_ROOT/scripts/lib/queue.sh"
+# shellcheck source=lib/fake-exec.sh
+. "$REPO_ROOT/scripts/lib/fake-exec.sh"
 
 # 外側の順番待ちの枠の中で走らせても、このテストの run_heavy が入れ子と見なされないように
 unset TAKO_QUEUE_JOB TAKO_NO_QUEUE TAKO_QUEUE_PRIORITY TAKO_QUEUE_MAX_WAIT TAKO_QUEUE_FALLBACKS
@@ -93,7 +95,10 @@ echo $$ >> "$TK_HANG_PIDS"
 exec sleep 30
 SH
 chmod +x "$H/.cargo/bin/tako" "$T/new-tako" "$T/hang/tako"
-cp "$T/new-tako" "$APP_TAKO"
+# 作りたてのスタブ（コピーも新しいファイル）は作った時点で空打ちし、初回 exec の検査を
+# 調べの上限（既定 10 秒・⑥ は 1 秒）の外で済ませる（#2222）。コピーは置くたびに掛け直す
+fake_exec_warm "$H/.cargo/bin/tako" "$T/new-tako" "$T/hang/tako"
+cp "$T/new-tako" "$APP_TAKO" && fake_exec_warm "$APP_TAKO"
 
 # 夜間と同じ PATH: nightly-release.sh の export 行を HOME=$H で評価する。
 # テストの外の置き場に本物の tako が居れば（この機の /opt/homebrew/bin 等）、そこだけ抜く
@@ -149,7 +154,7 @@ expect_lacks "古い tako には並ばせない（調べるだけ）" "old queue
 expect_has "古い tako を飛ばしたことを 1 行知らせる" "run_heavy: ~/.cargo/bin/tako（順番待ち（#1994）を知らない古い版）を飛ばして $APP_TAKO で並ぶ" "$(cat "$ERR")"
 
 echo "== ② PATH の後ろの ~/.local/bin に知っている tako が居る =="
-cp "$T/new-tako" "$H/.local/bin/tako"
+cp "$T/new-tako" "$H/.local/bin/tako" && fake_exec_warm "$H/.local/bin/tako"
 out="$(TK_NAME=local heavy "$NIGHTLY_PATH" sh -c "$JOB")"
 expect_eq "順番待ちを通る" "job=42" "$out"
 expect_has "PATH の順で ~/.local/bin の tako で並ぶ" "queue local" "$(cat "$LOG")"
@@ -157,7 +162,7 @@ expect_has "知らせる行は ~/.local/bin/tako を名指す" "を飛ばして 
 rm -f "$H/.local/bin/tako"
 
 echo "== ③ PATH の先頭が知っている tako（今までどおり）=="
-cp "$T/new-tako" "$T/head/tako"
+cp "$T/new-tako" "$T/head/tako" && fake_exec_warm "$T/head/tako"
 out="$(TK_NAME=head heavy "$T/head:$NIGHTLY_PATH" sh -c "$JOB")"
 expect_eq "順番待ちを通る" "job=42" "$out"
 expect_eq "先頭の tako だけを調べて並ぶ（古い tako も .app も見ない）" "probe head

@@ -449,13 +449,12 @@ fn resolve_with_pathext(
 mod tests {
     use super::*;
 
-    /// 偽のログインシェル（`-l -c <script>` を無視して本文を実行する）を置く
+    /// 偽のログインシェル（`-l -c <script>` を無視して本文を実行する）を置く。
+    /// 作った時点で空打ちして、初回 exec の検査を探索の上限の外で済ませる（#2222）
     #[cfg(unix)]
     fn fake_shell(dir: &std::path::Path, name: &str, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_exec::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path.display().to_string()
     }
 

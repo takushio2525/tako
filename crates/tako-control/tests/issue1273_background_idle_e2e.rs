@@ -111,16 +111,8 @@ fn launch_emulator(tag: &str) -> EmuGuard {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("作業ディレクトリを作れる");
     let script = dir.join("bg-idle-emu.sh");
-    std::fs::write(&script, EMULATOR).expect("模擬 TUI を書ける");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = std::fs::metadata(&script)
-            .expect("stat できる")
-            .permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&script, perm).expect("実行権を付けられる");
-    }
+    // 作った時点で空打ちし、初回 exec の検査を描画待ちの上限（15 秒）の外で済ませる（#2222）
+    tako_core::fake_exec::write_script(&script, EMULATOR);
     let session = format!("tako1273{tag}");
     // 起動より**先に**ガードを作る。起動が落ちたときも作業ディレクトリと器が残らない
     let guard = EmuGuard {

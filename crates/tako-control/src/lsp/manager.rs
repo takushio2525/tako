@@ -5395,11 +5395,11 @@ mod tests {
     }
 
     /// #1944: PATH で見つかった物を表の `probe_args` で確かめ、落ちたら理由（stderr の 1 行目）を返す。
-    /// rustup の代理は component が無くても PATH に居て、起こすと即座に落ちる（諦めた まで 3 回）
+    /// rustup の代理は component が無くても PATH に居て、起こすと即座に落ちる（諦めた まで 3 回）。
+    /// 偽物は作った時点で空打ちし、初回 exec の検査を確かめの上限（15 秒）の外で済ませる（#2222）
     #[cfg(unix)]
     #[test]
     fn path_の物が動かなければ理由を返す() {
-        use std::os::unix::fs::PermissionsExt;
         use tako_core::lsp::fetch::{Archive, Asset, Digest, Fetch, PlatformAsset};
         let dir = std::env::temp_dir().join(format!(
             "tako-1944-probe-{}-{}",
@@ -5412,8 +5412,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let script = |name: &str, body: &str| {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            tako_core::fake_exec::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
             path.display().to_string()
         };
         let broken = script(

@@ -109,16 +109,8 @@ fn launch_emulator(tag: &str) -> (EmuGuard, PathBuf) {
     ));
     std::fs::create_dir_all(&dir).expect("作業ディレクトリを作れる");
     let script = dir.join("trust-emu.sh");
-    std::fs::write(&script, EMULATOR).expect("模擬 TUI を書ける");
-    let mut perm = std::fs::metadata(&script)
-        .expect("stat できる")
-        .permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        perm.set_mode(0o755);
-    }
-    std::fs::set_permissions(&script, perm).expect("実行権を付けられる");
+    // 作った時点で空打ちし、初回 exec の検査を描画待ちの上限（10 秒）の外で済ませる（#2222）
+    tako_core::fake_exec::write_script(&script, EMULATOR);
 
     let log = dir.join("keys.log");
     let session = format!("tako1236{tag}");
