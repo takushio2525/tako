@@ -106,6 +106,10 @@
   なり、実態と違って見える
 - この不具合は usage 分析と独立に直せる（spawn の記録に「主 Issue」= ラベルの最初の番号を持たせ、ledger の `issue` も同じ値にする。
   §9 の S2 に含めるか、先に別の Issue で直す）
+- **#2199 で直した**: `extract_issues` は書いた順（重複は最初の出現だけ）で返し、spawn は `spawn_issues`（ラベル → プロンプトの順）で
+  1 回だけ拾って、ledger の `issue` = その先頭、カタログ・レジストリの `issues` = 同じ並びを書く（先頭 = 主 Issue）。フィールドは
+  増やしていない（移行なし）。**修正前の記録は書き換えない**（ledger は最小の番号・`issues` は昇順のまま）ので、過去分は S2 が
+  ラベルから引き直す。A/B は `TAKO_2199_LEGACY=1`（昇順へ戻す）、実経路は `scripts/test-ledger-primary-issue-2199.sh`
 
 ### 1.5 codex と agy
 

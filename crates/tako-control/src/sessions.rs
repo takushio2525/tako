@@ -111,7 +111,8 @@ pub struct SessionEntry {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// プロンプト・ラベルから抽出した Issue 番号（`#123` 形式）
+    /// ラベル・プロンプトから抽出した Issue 番号（`#123` 形式）。ラベル → プロンプトの書いた順で、
+    /// 先頭が主の Issue（#2199。それより前の記録は昇順 = 先頭は最小の番号）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<u32>,
     /// spawn プロンプトの冒頭抜粋（発見性のため。ローカルファイル限定）
@@ -751,12 +752,10 @@ fn apply_detected(
             entry.agent = Some("claude".into());
         }
         if entry.issues.is_empty() {
-            let text = format!(
-                "{} {}",
-                entry.label.as_deref().unwrap_or(""),
-                entry.prompt_head.as_deref().unwrap_or("")
+            entry.issues = spawn_issues(
+                entry.label.as_deref(),
+                entry.prompt_head.as_deref().unwrap_or(""),
             );
-            entry.issues = extract_issues(&text);
         }
     }
     gc(catalog, &now);
@@ -834,8 +833,30 @@ pub fn parse_role(role: &str) -> ParsedRole {
     }
 }
 
-/// テキストから Issue 番号（`#123`）を抽出する（昇順・重複なし）
+/// #2199 の A/B。`TAKO_2199_LEGACY=1` で**同一バイナリのまま**修正前
+/// （拾った番号を昇順に並べる = 台帳の `issue` とカタログの先頭が最小の番号になる）へ戻す
+pub fn legacy_2199() -> bool {
+    std::env::var_os("TAKO_2199_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// テキストから Issue 番号（`#123`）を抽出する（**書いた順**・重複は最初の出現だけ）。
+///
+/// 先頭が主の Issue になる（#2199）。修正前は昇順に並べていたので、プロンプトが前例や規約として
+/// 触れた小さい番号が先頭に来て、委任台帳の `issue` がラベルの Issue と食い違っていた
+/// （直近 7 日の 176 件中 170 件。`.agent/plans/2026-10-usage-analytics.md` §1.4）
 pub fn extract_issues(text: &str) -> Vec<u32> {
+    extract_issues_with(text, legacy_2199())
+}
+
+/// spawn の記録（セッションカタログ・委任台帳・worker レジストリ）に載せる Issue 番号（#2199）。
+/// ラベル → プロンプトの順に書いた順で並べるので、先頭 = 主の Issue
+/// （ラベルに書いた最初の `#N`。ラベルに番号が無ければプロンプトに書いた最初の `#N`）
+pub fn spawn_issues(label: Option<&str>, prompt: &str) -> Vec<u32> {
+    extract_issues(&format!("{} {prompt}", label.unwrap_or_default()))
+}
+
+/// [`extract_issues`] の本体。`legacy` は #2199 の修正前（昇順に並べ替える）
+fn extract_issues_with(text: &str, legacy: bool) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -858,7 +879,9 @@ pub fn extract_issues(text: &str) -> Vec<u32> {
             i += 1;
         }
     }
-    out.sort_unstable();
+    if legacy {
+        out.sort_unstable();
+    }
     out
 }
 
@@ -1486,6 +1509,41 @@ mod tests {
         assert_eq!(
             extract_issues("fix/112-log は # なしなので拾わない"),
             Vec::<u32>::new()
+        );
+    }
+
+    /// #2199: 書いた順で並べ、先頭が主の Issue になる（修正前は昇順で先頭が最小の番号）
+    #[test]
+    fn issue2199_書いた順で先頭が主のissue() {
+        // ラベルの番号が先頭。プロンプトが前例として触れた小さい番号は後ろへ
+        let issues = spawn_issues(
+            Some("#2192 usage S0"),
+            "前例は #322 と #1877。#2192 の設計書を読む",
+        );
+        assert_eq!(issues, vec![2192, 322, 1877]);
+        assert_eq!(issues.first(), Some(&2192));
+        // ラベルに番号が複数あれば書いた順で最初（束ねた worker の `#A / #B: …`）
+        assert_eq!(
+            spawn_issues(Some("#2181 / #2157: ネット復帰"), "#100 を参照").first(),
+            Some(&2181)
+        );
+        // ラベルに番号が無ければプロンプトに書いた順で最初
+        assert_eq!(
+            spawn_issues(Some("ledger-primary"), "Issue #2199 を直す。#322 の原則"),
+            vec![2199, 322]
+        );
+        assert_eq!(
+            spawn_issues(None, "#2199 を直す。#322 の原則").first(),
+            Some(&2199)
+        );
+        // どこにも番号が無ければ空（台帳の `issue` は付かない）
+        assert!(spawn_issues(Some("調査"), "番号の無い依頼").is_empty());
+        // 修正前の対照（`TAKO_2199_LEGACY=1` の腕）: 昇順で先頭が最小の番号
+        let legacy = extract_issues_with("#2192 usage S0 前例は #322 と #1877", true);
+        assert_eq!(legacy, vec![322, 1877, 2192]);
+        assert_eq!(
+            extract_issues_with("#2192 usage S0 前例は #322 と #1877", false),
+            vec![2192, 322, 1877]
         );
     }
 
