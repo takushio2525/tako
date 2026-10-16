@@ -335,36 +335,89 @@ static NOTICES: NoticeSink = NoticeSink::new();
 mod tests {
     use super::*;
 
-    /// 偽の実行ファイル（引数を無視して本文を実行する。ログインシェル・`git` の代役）
+    /// 偽の実行ファイルの空打ちの引数（これを受けたら本文を走らせずに終わる）
+    #[cfg(unix)]
+    const WARM_ARG: &str = "tako-2180-warm";
+
+    /// 偽のシェルが pid を書く行の前に遅れを置く注入（検証専用・#2180。値はミリ秒）。
+    /// 起動が締め切りより遅れた回を、CPU を焼かずに作る
+    #[cfg(unix)]
+    const INJECT_SHELL_DELAY_ENV: &str = "TAKO_2180_INJECT_SHELL_DELAY_MS";
+
+    /// 外側の締め切り。上限が効いていれば 1〜2 秒で戻るので、これは「戻らない」を落ちとして見るためのもの
+    #[cfg(unix)]
+    const OUTER_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// 偽の実行ファイル（引数を無視して本文を実行する。ログインシェル・`git` の代役）。
+    ///
+    /// 作った時点で 1 回空打ちする（#2180）。macOS は新しい実行ファイルの初回の exec に約 0.3 秒の
+    /// 検査を挟み、その検査はシステム全体で 1 本ずつ進む（実測: 6 本同時なら最後は 1.7 秒）。
+    /// 並列のテストが偽の実行ファイルを同時に起こすと、締め切りを測っている最中にその列で待たされるので、
+    /// 検査は締め切りの外で済ませておく（済んだものは列の最中でも 5〜11 ms で起きる）
     #[cfg(unix)]
     fn fake_bin(dir: &std::path::Path, name: &str, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$1\" = {WARM_ARG} ] && exit 0\n{body}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path.display().to_string()
+        let path = path.display().to_string();
+        // 空打ちが終わらなくても進む（本番の起動が遅れるだけで、判定は遅れに頼らない = `assert_reaped`）
+        let _ = crate::probe::output_with_timeout(&path, &[WARM_ARG], OUTER_DEADLINE);
+        path
     }
 
     /// 戻らないログインシェル。`exec` で置き換える = 打ち切りの kill が眠る本人に当たる（孫を残さない）。
-    /// 自分の pid を `pid` へ書いてから眠る（打ち切った子が残っていないかを見るため）
+    /// 自分の pid を `pid` へ書いてから眠る（打ち切った子が残っていないかを見るため）。
+    /// pid を書く行より先に締め切りが来たら pid は書かれない（#2180 → `assert_reaped`）
     #[cfg(unix)]
     fn hang_shell(dir: &std::path::Path) -> String {
         let pid = dir.join("pid");
         fake_bin(
             dir,
             "hang-shell",
-            &format!("echo $$ > '{}'\nexec sleep 600", pid.display()),
+            &format!(
+                "{}echo $$ > '{}'\nexec sleep 600",
+                start_delay(),
+                pid.display()
+            ),
         )
     }
 
-    /// 打ち切った子が居なくなるまで待つ（刈り取りは別スレッドなので少し遅れる）
+    /// [`INJECT_SHELL_DELAY_ENV`] の遅れ（無ければ空）。遅れは子の `sleep` なので、その最中に
+    /// 打ち切られると `sleep` だけが遅れの長さぶん残って自分で終わる（注入したときだけ）
+    #[cfg(unix)]
+    fn start_delay() -> String {
+        std::env::var(INJECT_SHELL_DELAY_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|ms| format!("sleep {}\n", ms as f64 / 1000.0))
+            .unwrap_or_default()
+    }
+
+    /// 打ち切った子が居なくなるまで待つ（刈り取りは別スレッドなので少し遅れる）。
+    ///
+    /// pid が無い（空も含む）のは、偽のシェルが pid を書く行へ届く前に締め切りが来た回（#2180。空打ちの後でも
+    /// 負荷で起動が遅れれば起こりうる）。そのとき kill は pid を書く前のシェル本人に当たっていて、
+    /// `exec sleep` の前なので見届ける子も居ない。打ち切りと素の名前への落ちは呼び手が戻り値で
+    /// 見ているので、締め切りの判定はこの確認に頼らない
     #[cfg(unix)]
     fn assert_reaped(dir: &std::path::Path) {
-        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
-            .expect("偽のシェルが起動して pid を書いた")
-            .trim()
-            .parse()
-            .expect("pid");
+        let raw = match std::fs::read_to_string(dir.join("pid")) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => panic!("pid を読めない: {e}"),
+        };
+        // `echo` の 1 回の write は途中で切れないので、中身は空か pid 全体のどちらか
+        let raw = raw.trim();
+        if raw.is_empty() {
+            eprintln!("#2180: 偽のシェルは pid を書く前に打ち切られた（見届ける子は無い）");
+            return;
+        }
+        let pid: u32 = raw.parse().expect("pid");
         let until = Instant::now() + Duration::from_secs(10);
         // 生死は境界の 1 実装で見る（#1557。ゾンビは「居る」なので刈り取りまで待つことになる）
         while crate::platform::process::pid_alive(pid) {
@@ -374,20 +427,27 @@ mod tests {
     }
 
     /// 受け入れ条件 1: 戻らないログインシェルは締め切りで打ち切り、素の名前（PATH）へ落ちて理由を残す。
-    /// 状態で見る（実時間は assert しない）。上限が無ければここで戻らない
+    /// 状態で見る（実時間は assert しない）。上限が無ければ外側の締め切りで落ちる
     #[cfg(unix)]
     #[test]
     fn 戻らないログインシェルは締め切りで打ち切って素の名前へ落ちる() {
         let dir = crate::test_residue::ScratchDir::new("bin-resolve-hang");
         let shell = hang_shell(dir.path());
-        let got = resolve_within(
-            "TAKO_2151_TEST_UNSET",
-            "tako-2151-absent",
-            "--version",
-            &[],
-            Some(&shell),
-            Duration::from_secs(1),
-        );
+        // 別スレッドで解決する（上限が効かない回帰で、テストが戻らずに止まらず落ちるように）
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_within(
+                "TAKO_2151_TEST_UNSET",
+                "tako-2151-absent",
+                "--version",
+                &[],
+                Some(&shell),
+                Duration::from_secs(1),
+            ));
+        });
+        let got = rx
+            .recv_timeout(OUTER_DEADLINE)
+            .expect("戻らないログインシェルを締め切りを過ぎても待っている（上限が効いていない）");
         assert_eq!(got.path, "tako-2151-absent");
         assert_eq!(got.source, Source::BareName);
         assert_eq!(got.timeouts.len(), 1, "{got:?}");
@@ -459,7 +519,7 @@ mod tests {
         let mut got = Vec::new();
         for _ in 0..2 {
             got.push(
-                rx.recv_timeout(Duration::from_secs(30))
+                rx.recv_timeout(OUTER_DEADLINE)
                     .expect("git を引いたスレッドが締め切りを過ぎても戻らない"),
             );
         }
