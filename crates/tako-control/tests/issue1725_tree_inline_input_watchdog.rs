@@ -24,7 +24,8 @@
 //! 3. **手書きのカーソル演算を持たない** — 状態は `TextField`、編集は `handle_edit_key`
 //! 4. **開く / 閉じるが 1 本ずつ** — `inline_edit = Some(` は `open_inline_edit` だけ、
 //!    `inline_edit = None` / `.take()` は `close_inline_edit` だけ。閉じる出口が
-//!    この入力欄宛ての変換を捨て、元のペインへ打鍵を戻す
+//!    この入力欄宛ての変換を捨て、元のペインへ打鍵を戻す（右クリックで立った行の選択も
+//!    畳む = 閉じた直後の Enter をツリーへ向けない。#1938）
 //! 5. **描画** — 未確定文字列とキャレットを共有部品（`text_input_marked_at` /
 //!    `text_input_caret`）で入力欄の中に描き、外側の押下（`on_mouse_down_out`）で閉じる
 //! 6. **見えない入力欄は打鍵を奪わない** — `handle_key` と `text_input_swallows_keys` が
@@ -33,8 +34,8 @@
 //! # 見逃す側へ倒れないための作り
 //!
 //! 走査が空振りすれば全部が無意味に緑になるので、[`走査が空振りしていない`] で窓が
-//! 採れていることを固定し、[`逆戻りを名指しできる`] で**注入 13 通り**が `file:line` で
-//! 名指しされることを確かめる。範囲取りは #1420 の 1 実装（`production_range`）を通す
+//! 採れていることを固定し、[`逆戻りを名指しできる`] で**注入 14 通り**（#1938 の (10b) を含む）が
+//! `file:line` で名指しされることを確かめる。範囲取りは #1420 の 1 実装（`production_range`）を通す
 //! （`main.rs` は本番コードと隔離セルフテストが交互に並ぶ）。
 
 use std::path::{Path, PathBuf};
@@ -429,6 +430,11 @@ fn scan_single_open_close(sources: &Sources) -> Vec<Offender> {
                 ".focus(edit.origin_pane)",
                 "閉じたとき元のペインへ打鍵を戻していない（#1725）",
             ),
+            (
+                "self.tree_selection = None",
+                "閉じても右クリックで立った行の選択を残している（閉じた直後の Enter / ↑↓ / ⌘V が\
+                 ペインではなくツリーへ向く = セルフテスト項目 154 が止まる。#1938）",
+            ),
         ],
         &mut out,
     );
@@ -739,6 +745,16 @@ fn 逆戻りを名指しできる() {
         ".focus(self.focused_pane());",
     );
     expect_hit(&s, SIDEBAR, "元のペインへ打鍵を戻していない");
+
+    // (10b) 閉じても行の選択を残す（#1938 の修正前の形）
+    let mut s = Sources::load(&root);
+    s.sidebar = replace_in_fn(
+        &s.sidebar,
+        "fn close_inline_edit(",
+        "self.tree_selection = None;",
+        "let _ = &self.tree_selection;",
+    );
+    expect_hit(&s, SIDEBAR, "右クリックで立った行の選択を残している");
 
     // (11) 外側の押下で閉じない
     let mut s = Sources::load(&root);
