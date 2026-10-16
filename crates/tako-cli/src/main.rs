@@ -242,7 +242,7 @@ enum Command {
     /// 引数なしで現在サービスを表示、claude / codex / agy で指定
     #[command(name = "limit-service")]
     LimitService(LimitServiceArgs),
-    /// 右サイドバー情報パネル（tmux 一覧 / agents 集約センター）の表示・幅・ビュー切替。
+    /// 右サイドバー情報パネルの表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示操作。
     /// 引数なしで現在状態を表示する
     Panel(PanelArgs),
     /// サイドバー tmux ビューのタブ枠を折りたたむ / 展開する
@@ -3497,14 +3497,21 @@ struct PreviewCopyCodeArgs {
 
 /// `--view` の受理値（#553）。正式値は GUI のタブ表示名と 1:1 で、
 /// 旧称は後方互換のため受理を続ける（`--help` と invalid value エラーの
-/// possible values に旧称も出し、どちらの語彙からでも辿れるようにする）
+/// possible values に旧称も出し、どちらの語彙からでも辿れるようにする）。
+///
+/// 各値の意味は MCP `tako_panel` の説明と同じ正本（[`PanelViewWire::summary`]）から引く。
+/// `--view` の説明文に値を手書きで並べると、ビューが増えたときに追従が漏れる
+/// （#2036: fleet / orch / git の 3 つのまま tasks 以降が抜けていた）
 fn panel_view_parser() -> clap::builder::PossibleValuesParser {
     use clap::builder::PossibleValue;
     use tako_control::protocol::PanelViewWire;
 
     let mut values: Vec<PossibleValue> = PanelViewWire::VALUES
         .iter()
-        .map(|v| PossibleValue::new(*v))
+        .map(|v| {
+            let view = PanelViewWire::parse(v).expect("VALUES の値は parse を通る");
+            PossibleValue::new(*v).help(view.summary())
+        })
         .collect();
     values.extend(
         PanelViewWire::LEGACY_VALUES
@@ -3525,7 +3532,7 @@ struct PanelArgs {
     /// パネル幅（px）
     #[arg(long)]
     width: Option<f32>,
-    /// 表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称）
+    /// 表示するビュー（値は GUI の右パネルのタブ名と同じ。各値の意味は `--help` の一覧）
     #[arg(long, value_parser = panel_view_parser())]
     view: Option<String>,
     /// 左サイドバーのファイルツリー表示（FR-2.16.5。on = 表示、off = 非表示）
@@ -15695,6 +15702,86 @@ mod help_text_parity {
             "この検査は agy = supported を前提にしている（#1002）"
         );
         assert_no_stale_unsupported_claim(&help, keys::EFFORT_CONTROL, "--agent-effort の help");
+    }
+
+    /// `text` が `word` を英数字の語として含むか（`git` が `github` の一部で当たらないように）
+    fn names_word(text: &str, word: &str) -> bool {
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+        text.match_indices(word).any(|(i, _)| {
+            let before = text[..i].chars().next_back().is_none_or(|c| !is_word(c));
+            let after = text[i + word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_word(c));
+            before && after
+        })
+    }
+
+    /// Issue #2036: `tako panel --help` が候補値の一覧と食い違わない。
+    ///
+    /// 各値の説明は MCP `tako_panel` と同じ正本（`PanelViewWire::summary`）から生成する。
+    /// 手書きの説明（`--view` の説明文・サブコマンドの見出し）は値を挙げないか、
+    /// 挙げるなら全件を挙げる（#2036 の症状 = fleet / orch / git の 3 つで止まっていた）
+    #[test]
+    fn panel_viewのhelpは候補値の全件を説明つきで載せる() {
+        use tako_control::protocol::PanelViewWire;
+
+        let panel = subcommand(&["panel"]);
+        let help = panel.clone().render_long_help().to_string();
+        for v in PanelViewWire::VALUES {
+            let summary = PanelViewWire::parse(v)
+                .expect("VALUES は parse を通る")
+                .summary();
+            assert!(
+                help.lines().any(|l| {
+                    let l = l.trim_start();
+                    l.starts_with(&format!("- {v}:")) && l.contains(summary)
+                }),
+                "panel --help の一覧に {v} の説明（{summary}）が無い:\n{help}"
+            );
+        }
+
+        let view = panel
+            .get_arguments()
+            .find(|a| a.get_id() == "view")
+            .expect("panel に --view が在る");
+        let handwritten = [
+            ("--view の説明文", view.get_help()),
+            ("--view の説明文（長）", view.get_long_help()),
+            ("サブコマンドの見出し", panel.get_about()),
+            ("サブコマンドの見出し（長）", panel.get_long_about()),
+        ];
+        for (place, text) in handwritten {
+            let Some(text) = text.map(|t| t.to_string()) else {
+                continue;
+            };
+            let named: Vec<&str> = PanelViewWire::VALUES
+                .iter()
+                .copied()
+                .filter(|v| names_word(&text, v))
+                .collect();
+            assert!(
+                named.is_empty() || named.len() == PanelViewWire::VALUES.len(),
+                "{place}が候補値の一部（{named:?}）だけを挙げている。\
+                 値の一覧は possible values の生成に任せて手書きで並べない: {text}"
+            );
+        }
+    }
+
+    /// `names_word` の検出力: #2036 の修正前の説明文は 3 値だけを挙げていたと判定できる
+    #[test]
+    fn names_wordは語の一部を値として拾わない() {
+        let before = "表示するビュー（GUI のタブ名と同じ。fleet = ペイン / セッション俯瞰、\
+                      orch = オーケストレーター俯瞰、git = git。tmux は fleet の旧称）";
+        let named: Vec<&str> = tako_control::protocol::PanelViewWire::VALUES
+            .iter()
+            .copied()
+            .filter(|v| names_word(before, v))
+            .collect();
+        assert_eq!(named, ["fleet", "orch", "git"]);
+        assert!(!names_word("github の search-index", "git"));
+        assert!(!names_word("github の search-index", "search"));
+        assert!(names_word("view=search は", "search"));
     }
 }
 
