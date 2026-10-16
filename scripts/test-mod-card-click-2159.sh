@@ -10,7 +10,8 @@
 #                 旧（TAKO_2159_LEGACY=1）= 会話の行にボタンが無く、カードの行をクリックしても何も起きない。
 #                 帯の ctrl+x → Tab → r（3 打 + 入力欄へ戻す Esc）で初めて実行される
 #   mouseoff   3. `tako mouse off`（クリックを渡さない）では会話の行にボタンを置かず、帯のホットキーで今どおり押せる
-#   place      4. `cards.place=tako` と mod なしのペイン（CLAUDE_CODE_PLUGIN_DIRS を外した claude）は今の挙動
+#   place      4. `cards.place=tako` と mod なしのペイン（TAKO_CLI と CLAUDE_CODE_PLUGIN_DIRS を外した claude = mod は
+#                 休眠。隔離 GUI は起動時に設定 dir の skills/tako へ写しを置くので、注入を外すだけでは mod が読まれる）は今の挙動
 #                 （GPUI のカード帯が出る・会話の行にボタンを置かない）
 #   copy       会話の行の `[ copy ]` をクリックで押すと論理文字列（157 字・改行なし）が $.ui.copy へ渡る
 #              （**隔離 tmux の claude で押す** = 本物のクリップボードへ書かない。クリックは SGR の列を send-keys -H で）
@@ -76,6 +77,14 @@ snap_real() {
 snap_clipboard() { /usr/bin/pbpaste 2>/dev/null | shasum -a 256 | cut -c1-16; }
 REAL_BEFORE="$(snap_real)"
 CLIP_BEFORE="$(snap_clipboard)"
+# 段ごとにクリップボードが変わったかを控える（中身は読まない。PC を同時に使う他の作業の書き込みと切り分ける）
+CLIP_LAST="$CLIP_BEFORE"
+clip_mark() {
+  local now
+  now="$(snap_clipboard)"
+  if [ "$now" != "$CLIP_LAST" ]; then echo "    観測: クリップボードのハッシュが「$1」の段の間に変わった（$CLIP_LAST → $now）"; fi
+  CLIP_LAST="$now"
+}
 
 # --- ビルド（visual-test の節を含む GUI と CLI。rebase 後の古いバイナリを掴まない）------------
 (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app --features visual-test && run_heavy cargo build -q -p tako-cli) || exit 1
@@ -140,8 +149,9 @@ mkdir -p "$FAKEBIN"
 printf '#!/bin/sh\ncat > %s/pbcopy.out\n' "$TMP" > "$FAKEBIN/pbcopy"
 chmod +x "$FAKEBIN/pbcopy"
 
-# 試すカード: すぐには終わらないコマンド（実行中の押し直しを見る）と、157 字・改行なしの長いコマンド（Copy）
-RUN_CMD="printf 'click-2159\\n'; sleep 4"
+# 試すカード: すぐには終わらないコマンド（実行中の押し直しを見る。visual-test は押してから画像を 2 枚書き出して
+# から押し直すので十数秒は走らせる）と、157 字・改行なしの長いコマンド（Copy）
+RUN_CMD="printf 'click-2159\\n'; sleep 12"
 LONG='cargo build -p tako-cli && TAKO_ISOLATED=1 TAKO_DATA_DIR=/tmp/tako-s7-very-long-data-dir-name ./target/debug/tako mod --json | jq ".panes[] | {pane, reason}"'
 CARD_JSON="$(jq -cn --arg a "$RUN_CMD" '{commands: [$a], label: "click 2159"}')"
 
@@ -226,7 +236,7 @@ for row, line in enumerate(sys.stdin.read().split("\n")):
 }
 
 # 隔離 GUI の直接ペインで claude を起こす（ペインの env = tako の注入はそのまま）。$2 は前に置く env、$3 は
-# claude の前のコマンド（`env -u CLAUDE_CODE_PLUGIN_DIRS` = mod なし）
+# claude の前のコマンド（`env -u CLAUDE_CODE_PLUGIN_DIRS -u TAKO_CLI` = mod なし）
 gui_claude() {
   local pane="$1" extra="${2:-}" pre="${3:-}"
   if reporting "$pane"; then quit_claude "$pane"; fi
@@ -447,8 +457,9 @@ phase_place() {
   close_runs "$p"
   quit_claude "$p"
   tk mod ui reset >/dev/null 2>&1
-  # mod なし（ペインの CLAUDE_CODE_PLUGIN_DIRS を外す = mod が読まれず報告も来ない）
-  gui_claude "$p" "" "env -u CLAUDE_CODE_PLUGIN_DIRS" || return 1
+  # mod なし: 注入（CLAUDE_CODE_PLUGIN_DIRS）と TAKO_CLI を外す。設定 dir の skills/tako の写し（#1959）は読まれるが、
+  # TAKO_CLI が無ければ mod は休眠する（報告も描画もしない = mod を入れていない claude と同じ）
+  gui_claude "$p" "" "env -u CLAUDE_CODE_PLUGIN_DIRS -u TAKO_CLI" || return 1
   rows0="$(rows_of "$p")"
   show_card "$p" "$CARD_JSON" || return 1
   place_check no-mod "$p" "$rows0" no_fresh_report
@@ -504,11 +515,12 @@ phase_copy() {
   dirs="$(mod_dir)"
   s="copy"
   start_tmux_claude "$s" "$p" "$dirs"
-  if ! wait_for 60 tscreen_has "$s" '❯'; then
-    fail "tmux の claude の入力欄が出ない"
+  # 入力欄が出ただけでは打鍵を取りこぼすことがある（起動直後の案内）。mod が起きて報告が届くまで待つ（#1964 と同じ）
+  if ! wait_for 60 tscreen_has "$s" '❯' || ! wait_for 60 reporting "$p"; then
+    fail "tmux の claude の入力欄が出ない・報告が届かない"
     return 1
   fi
-  sleep 3
+  sleep 2
   tmx send-keys -t "=$s:" -l "Show this card: $(jq -cn --arg a "$LONG" '{commands: [$a], label: "copy 2159"}')"
   sleep 1
   tmx send-keys -t "=$s:" Enter
@@ -576,13 +588,13 @@ want static && phase_static
 if want steps || want mouseoff || want place || want copy; then
   start_app main
   echo "  隔離 GUI: pid $APP_PID / mod: $(mod_json | jq -c '{injecting, claude_version, cards}' | mask)"
-  want steps && phase_steps
-  want mouseoff && phase_mouseoff
-  want place && phase_place
-  want copy && phase_copy
+  if want steps; then phase_steps; clip_mark steps; fi
+  if want mouseoff; then phase_mouseoff; clip_mark mouseoff; fi
+  if want place; then phase_place; clip_mark place; fi
+  if want copy; then phase_copy; clip_mark copy; fi
   stop_app
 fi
-want visual && phase_visual
+if want visual; then phase_visual; clip_mark visual; fi
 
 REAL_AFTER="$(snap_real)"
 check_eq "本物の ~/.claude*/skills・plugins は前後で同じ（${REAL_BEFORE}）" "$REAL_BEFORE" "$REAL_AFTER"

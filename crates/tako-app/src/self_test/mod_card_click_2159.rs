@@ -7,8 +7,9 @@
 //! ② `[ run ]` を 1 回クリック → 新しいペインが 1 枚だけ増える（手元のペインと同じタブ・タイトル `(>) …`・
 //!    フォーカスは手元のまま）・カードの実行記録 runs[0] が count 1（GPUI のカードの「実行」と同じ dispatch の run）。
 //!    クリックは 150 ms 後にもう 1 回（ダブルクリックの 2 打目）届けても増えない → `mod-card-click-after.png`
-//! ③ 実行中（`sleep` で数秒走る）にもう 1 回押す → tako の dispatch が断り（実行中の再実行）、ペインは増えず
-//!    count 1 のまま・画面に断った理由のトースト → `mod-card-click-refused.png`
+//! ③ 実行中（`sleep` で十数秒走る。押す直前に GPUI と同じ判定でまだ実行中かを確かめる）にもう 1 回押す →
+//!    tako の dispatch が断り（実行中の再実行）、ペインは増えず count 1 のまま・画面に断った理由のトースト
+//!    → `mod-card-click-refused.png`
 //! ④ 実行が終わると、会話の行の実行記録が `exited 0`（次の報告 = 最大 15 秒で届く）
 //!
 //! 判定は新しい挙動を無条件に主張する。`TAKO_2159_LEGACY=1` は会話の行にボタンを置かないので ① が FAILED =
@@ -284,6 +285,7 @@ pub(super) async fn mod_card_click_visual(
     // ② クリック 1 回（Claude Code は描かれて 300 ms 以内のクリックを捨てるので 1 秒置く）+ 150 ms 後の 2 打目
     sleep(cx, 1_000).await;
     let at = cell_center(window, cx, pane, col, row);
+    let first_click = std::time::Instant::now();
     click(any, cx, at, 1).await;
     sleep(cx, 150).await;
     click(any, cx, at, 2).await;
@@ -340,42 +342,57 @@ pub(super) async fn mod_card_click_visual(
         ));
     }
 
-    // ③ 実行中にもう 1 回押す → tako の dispatch が断る（ペインは増えない・回数も 1 のまま）
-    let still_running = matches!(run, Some((_, tako_core::CardRunState::Running, _)));
-    let found = label.iter().find_map(|l| find_label(window, cx, pane, l));
-    if let (true, Some((col, row))) = (still_running, found) {
-        let at = cell_center(window, cx, pane, col, row);
-        click(any, cx, at, 1).await;
-        let pressed = std::time::Instant::now();
-        let toast = loop {
-            let screen = screen_of(window, cx, pane);
-            if screen.contains("could not run") || screen.contains("実行できませんでした")
-            {
-                break true;
-            }
-            if pressed.elapsed() > Duration::from_secs(5) {
-                break false;
-            }
-            sleep(cx, 100).await;
-        };
-        redraw(any, window, cx).await;
-        dump(any, cx, "mod-card-click-refused.png");
-        let (again, _) = panes_of(window, cx, pane);
-        let run = card_of(window, cx, pane).and_then(|(_, run)| run);
-        println!(
-            "TAKO_VISUAL_2159: {SECTION} ③ panes={} run={run:?} toast={toast}",
-            again.len()
-        );
-        if again.len() != after_panes.len() || !matches!(run, Some((_, _, 1))) {
-            fail(&format!(
-                "visual-test {SECTION} ③: 実行中に押し直したら 2 本目が走った（ペイン {} 枚・{run:?}）",
-                again.len()
-            ));
+    // ③ 実行中にもう 1 回押す → tako の dispatch が断る（ペインは増えない・回数も 1 のまま）。押す直前に、GPUI の
+    // 2 秒 tick と同じ判定（記録を実行ペインの実態へ寄せる）でまだ実行中かを見る = 1 本目が終わった後の押下
+    // （GPUI のカードと同じく再実行になる = 正しい挙動）と取り違えない
+    let Some((col, row)) = label.iter().find_map(|l| find_label(window, cx, pane, l)) else {
+        fail(&format!("visual-test {SECTION} ③: 画面に [ run ] が無い"));
+    };
+    let before3 = window
+        .update(cx, |app, _, _| {
+            tako_control::dispatch::refresh_command_card_runs(app);
+        })
+        .ok()
+        .and_then(|_| card_of(window, cx, pane))
+        .and_then(|(_, run)| run);
+    let since = first_click.elapsed().as_millis();
+    if !matches!(before3, Some((_, tako_core::CardRunState::Running, 1))) {
+        fail(&format!(
+            "visual-test {SECTION} ③: 前提 = 押す直前に 1 本目がまだ実行中（{before3:?}・1 回目のクリックから {since} ms）"
+        ));
+    }
+    let at = cell_center(window, cx, pane, col, row);
+    click(any, cx, at, 1).await;
+    let pressed = std::time::Instant::now();
+    let toast = loop {
+        let screen = screen_of(window, cx, pane);
+        if screen.contains("could not run") || screen.contains("実行できませんでした") {
+            break true;
         }
-    } else {
-        println!(
-            "TAKO_VISUAL_2159: {SECTION} ③ skipped（実行がもう終わった = {run:?} / ボタン {found:?}）"
-        );
+        if pressed.elapsed() > Duration::from_secs(4) {
+            break false;
+        }
+        sleep(cx, 100).await;
+    };
+    redraw(any, window, cx).await;
+    dump(any, cx, "mod-card-click-refused.png");
+    let (again, _) = panes_of(window, cx, pane);
+    let run = card_of(window, cx, pane).and_then(|(_, run)| run);
+    println!(
+        "TAKO_VISUAL_2159: {SECTION} ③ before={before3:?} since_first_click_ms={since} panes={} run={run:?} toast={toast}",
+        again.len()
+    );
+    if again.len() != after_panes.len() || !matches!(run, Some((_, _, 1))) {
+        fail(&format!(
+            "visual-test {SECTION} ③: 実行中に押し直したら 2 本目が走った（ペイン {} 枚・{run:?}）",
+            again.len()
+        ));
+    }
+    if !toast {
+        fail(&format!(
+            "visual-test {SECTION} ③: 断った理由のトーストが出ない（画面: {:?}）",
+            screen_of(window, cx, pane)
+        ));
     }
 
     // ④ 終わると会話の行の実行記録が exited 0（mod の次の報告 = 最大 15 秒で届く）
