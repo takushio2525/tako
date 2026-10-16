@@ -12,11 +12,15 @@
 //   描くかは tako が決める（view.usage_bar。利用者の statusLine が既に出していれば描かない）。描いたら
 //   報告の renders.usage_bar で返し、tako は画面下のステータスバーの claude の区画を引っ込める
 // - コマンドカード（#1963）: AI の `tako_show_command` の行（会話の中で「Called tako」に畳まれる ToolGroup を
-//   展開した ToolUse）をカード（ラベル・コマンドを Code で・実行記録）に描き替え、押す口は帯の tako の行の
-//   `カード N` と `y: コピー` / `r: 実行`（ホットキー。会話の行のボタンはクリックでしか押せず、tako は
-//   クリックを渡さない = #1961）。正本は tako の store（応答の view.cards）。帯に押せる形で描いたカードの
+//   展開した ToolUse）をカード（ラベル・コマンドを Code で・実行記録）に描き替える。押す口は 2 つ:
+//   会話の行のコマンドごとの `[ 実行 ]` / `[ コピー ]`（**クリック 1 回**。#2159。tako がクリックを TUI へ
+//   渡し（#1961 = view.cards.click）、全画面のときだけ置く = 押せないボタンを見せない）と、帯の tako の行の
+//   `カード N` と `y: コピー` / `r: 実行`（ホットキー。クリックが届かない main screen・`tako mouse off` でも
+//   押せる）。正本は tako の store（応答の view.cards）。帯に押せる形で描いたカードの
 //   id を報告の renders.cards で返し、tako はそのカードを GPUI のカード帯から外す。Copy は $.ui.copy
-//   （他の mod に拒まれたら tako の CLI の show-command --copy へ落とす）、Run / 閉じるは tako が組んだ引数
+//   （他の mod に拒まれたら tako の CLI の show-command --copy へ落とす）、Run / 閉じるは tako が組んだ引数。
+//   Run は同じコマンドを 2 回走らせない: 押した CLI が返るまでと返ってから RUN_REPEAT_MS の間の押下は捨て
+//   （ダブルクリックの 2 打目）、その後は tako の dispatch が実行中の再実行を断る（GPUI のカードと同じ判断）
 // - チャット風の描画（#1964）: 利用者の発話（composer / bridge）を右寄せの吹き出しに・AI の返答のコードブロックの
 //   下に Copy のボタン（論理文字列 = 画面の折り返しは混ざらない。クリックで押す）と帯の「最新のコードをコピー」
 //   （キーで押す）・ツールの呼び出しを 1 行の要約に（ToolGroup は展開して 1 呼び出し 1 行。「詳細」で
@@ -122,6 +126,14 @@ const BUTTON_CHROME = 4
 const BUTTON_GAP = 1
 /** ボタンで叩く CLI 1 回の上限（session-restart は引き継ぎの書き出しを待つので長め） */
 const PRESS_TIMEOUT_MS = 30_000
+/**
+ * カードの Run を押した CLI が返ってから、同じコマンドの Run の押下を捨てる間（#2159）。ダブルクリックの
+ * 2 打目（macOS の既定の間隔は 0.5 秒）が、すぐ終わるコマンドの終了の後に届いて 2 本目を走らせないため。
+ * 実行中の押し直しはこの後も tako の dispatch が断る（スマホ・GPUI のカードと同じ判断）
+ */
+const RUN_REPEAT_MS = 1_000
+/** 実行を断られた理由をトーストに出す上限（桁） */
+const RUN_REASON_MAX = 80
 /** ui.json が届く前（古い tako）の帯の並び（tako_core::claude_mod_ui::BandUi の既定と同じ） */
 const DEFAULT_SEGMENTS: readonly TakoBandSegment[] = ['pane', 'tab', 'workers', 'attention', 'card', 'buttons']
 /** tako の MCP の `tako_show_command`（`mcp__<登録名>__tako_show_command`。登録名は利用者の環境次第） */
@@ -210,6 +222,9 @@ let lastPress: TakoPress | undefined
 let cardsOffered = false
 let bandCards: number[] = []
 let newestCard: number | undefined
+// カードの Run の二重押しの番（#2159）: `カード id:コマンドの番号` → この時刻（epoch ms）まで押下を捨てる
+// （CLI が返るまでは無限 = 押した後の CLI の往復中の 2 打目も捨てる）。帯と会話の行のボタンで共有する
+const runBusy = new Map<string, number>()
 // チャット風の描画（#1964）: 最後に受け取った view.chat（今あてている組 = renders.chat）と、起きてから
 // 足された本筋の会話の行の数（chat_seq。数だけ = 本文は持たない）
 let chatView: TakoChat | undefined
@@ -483,6 +498,9 @@ type Words = {
   close: string
   cardClosed: string
   cardHint: (copy: string, run: string) => string
+  // 会話の行にボタンを置いたときの案内（#2159。キーの口は帯）
+  cardKeyHint: (copy: string, run: string) => string
+  runRefused: (reason: string) => string
   runState: (run: NonNullable<TakoCardCommand['run']>) => string
   // 送信時の確認（#2050）
   guardHeader: string
@@ -539,6 +557,8 @@ const WORDS: Record<'ja' | 'en', Words> = {
     close: '閉じる',
     cardClosed: 'このカードは閉じた',
     cardHint: (copy, run) => `帯（ctrl+x → Tab）の ${copy}: コピー / ${run}: 実行`,
+    cardKeyHint: (copy, run) => `キーでは帯（ctrl+x → Tab）の ${copy}: コピー / ${run}: 実行`,
+    runRefused: reason => (reason === '' ? 'tako: 実行できませんでした' : `tako: 実行できませんでした（${reason}）`),
     runState: run =>
       `→ ペイン ${run.pane} ${run.state === 'running' ? '実行中' : run.state === 'exited' ? `終了 ${run.exit_code ?? '?'}` : 'が閉じた'}`,
     guardHeader: 'tako',
@@ -592,6 +612,8 @@ const WORDS: Record<'ja' | 'en', Words> = {
     close: 'close',
     cardClosed: 'this card was closed',
     cardHint: (copy, run) => `in the band (ctrl+x → Tab): ${copy}: copy / ${run}: run`,
+    cardKeyHint: (copy, run) => `keys: in the band (ctrl+x → Tab) ${copy}: copy / ${run}: run`,
+    runRefused: reason => (reason === '' ? 'tako: could not run it' : `tako: could not run it (${reason})`),
     runState: run =>
       `→ pane ${run.pane} ${run.state === 'running' ? 'running' : run.state === 'exited' ? `exited ${run.exit_code ?? '?'}` : 'closed'}`,
     guardHeader: 'tako',
@@ -1033,18 +1055,28 @@ async function pressButton($: EngineInterface, press: Press): Promise<void> {
   dirty = true
 }
 
-// 帯のカードのボタンを押したとき（#1963）。Copy は Claude Code の $.ui.copy（論理文字列をそのまま）。
-// 他の mod の ui.copy フックに拒まれる等で写らなければ tako の CLI（show-command --copy = GUI が
-// クリップボードへ書く）へ落とす。Run / 閉じるは tako が組んだ引数をそのまま（実行記録はスマホ・GPUI の
-// カードと同じ dispatch が付ける）。「次」は帯の選択を進めるだけ（tako へは何も送らない）
+// カードのボタンを押したとき（帯 = #1963・会話の行 = #2159。どちらもここを通る）。Copy は Claude Code の
+// $.ui.copy（論理文字列をそのまま）。他の mod の ui.copy フックに拒まれる等で写らなければ tako の CLI
+// （show-command --copy = GUI がクリップボードへ書く）へ落とす。Run / 閉じるは tako が組んだ引数をそのまま
+// （実行記録はスマホ・GPUI のカードと同じ dispatch が付ける）。「次」は帯の選択を進めるだけ（tako へは何も送らない）。
+// Run は同じコマンドの二重押しを捨て（runBusy）、tako に断られたら（実行中の再実行等）理由をトーストで知らせる
 async function pressCard($: EngineInterface, op: CardOp, sel: CardSel, press: UiPressArgument): Promise<void> {
   if (op === 'next') {
     const next = sel.pairs[(sel.pos + 1) % sel.pairs.length] ?? sel
     await $.state.set(CARD_CURSOR, { card: next.card.id, index: next.index })
     return
   }
+  // #2159: 読みと書きの間に await を挟まない = 同時に届いた 2 打目も必ずこの番に当たる
+  const runKey = `${sel.card.id}:${sel.index}`
+  if (op === 'run') {
+    const now = await $.clock.now()
+    if ((runBusy.get(runKey) ?? 0) > now) return
+    for (const [key, until] of runBusy) if (until <= now) runBusy.delete(key)
+    runBusy.set(runKey, Number.POSITIVE_INFINITY)
+  }
   let kind: TakoPress['kind'] = op === 'copy' ? 'card_copy' : op === 'run' ? 'card_run' : 'card_dismiss'
   let ok = false
+  let reason = ''
   try {
     if (op === 'copy') {
       const copied = await $.ui.copy({ text: sel.command.text, surface: press.surface })
@@ -1058,14 +1090,34 @@ async function pressCard($: EngineInterface, op: CardOp, sel: CardSel, press: Ui
       const argv = op === 'run' ? sel.command.run_args : sel.card.dismiss_args
       const done = await $.process.run([cli, ...argv], { timeoutMs: PRESS_TIMEOUT_MS })
       ok = done.exitCode === 0
+      if (!ok) reason = refusedReason(done.stderr)
     }
     if (!ok) $.ui.log(`tako mod: card ${op} failed`, { to: 'debug' })
   } catch (err) {
     $.ui.log(`tako mod: card ${op} failed: ${String(err).slice(0, 200)}`, { to: 'debug' })
   }
   lastPress = { kind, ok, at: await $.clock.now() }
+  if (op === 'run') {
+    // 走らせたら少しの間だけ捨てる（ダブルクリックの 2 打目）・断られた / 失敗したらすぐ押し直せる
+    if (ok) runBusy.set(runKey, lastPress.at + RUN_REPEAT_MS)
+    else runBusy.delete(runKey)
+    if (!ok) {
+      try {
+        $.ui.toast(words(lang).runRefused(reason), { timeoutMs: 5_000 })
+      } catch {
+        // トーストが出せなくても断られた結果は変わらない（last_press に残る）
+      }
+    }
+  }
   // 実行記録・閉じたことは次の応答（view.cards）で届く
   dirty = true
+}
+
+// tako の CLI が断った理由（`error: <理由>` の最後の行。tako の dispatch の文言 = 実行中なら「このコマンドは
+// まだ実行中…」）。トーストに収まるよう切る
+function refusedReason(stderr: string): string {
+  const line = stderr.split('\n').map(l => l.trim()).filter(l => l !== '').at(-1) ?? ''
+  return clipCells(line.replace(/^error:\s*/, ''), RUN_REASON_MAX)
 }
 
 // tako_show_command の show（action を省いた呼び出しを含む）か
@@ -1110,7 +1162,9 @@ function callCommands(input: unknown): { commands: string[]; label?: string } {
 }
 
 // 会話の行のカード（#1963）: 見出し（tako・カード N・ラベル）・コマンドを Code で（見た目だけ折り返す。
-// 写すのは帯のボタン = 論理文字列）・実行記録・帯で押す案内。カードが store に無い（閉じた・押し出された）
+// 写すのはボタン = 論理文字列）・実行記録・押す案内。クリックが届く（#2159: tako がクリックを渡す = view.cards.click
+// ∧ 全画面の端末）ならコマンドごとに `[ 実行 ]` / `[ コピー ]`（クリック 1 回。帯と同じ pressCard）を置き、
+// 届かなければ帯で押す案内だけ（押せないボタンを見せない）。カードが store に無い（閉じた・押し出された）
 // なら引数から描いて「閉じた」と添える。下の他の mod が描いていればその下に足す（next の答えを包む）
 function drawCardRow($: EngineInterface, e: RenderInput<'ToolUse'>, view: TakoView, below: RenderElement): RenderElement {
   const w = words(view.lang)
@@ -1121,7 +1175,8 @@ function drawCardRow($: EngineInterface, e: RenderInput<'ToolUse'>, view: TakoVi
   const commands: Array<{ text: string; run?: TakoCardCommand['run'] }> =
     card === undefined ? call.commands.map(text => ({ text })) : card.commands
   const label = card === undefined ? call.label : card.label
-  const { Box, Code, Text } = $.ui.resolve(e)
+  const clickable = card !== undefined && view.cards?.click === true && e.surface === 'terminal' && e.viewport?.isFullscreen === true
+  const { Box, Button, Code, Text } = $.ui.resolve(e)
   const title: Array<ReturnType<typeof Text> | string> = [Text({ color: colors.accent, bold: true, children: 'tako' })]
   if (id !== undefined) title.push('  ', Text({ bold: true, children: w.card(id) }))
   if (label !== undefined) title.push(`  ${label}`)
@@ -1134,13 +1189,31 @@ function drawCardRow($: EngineInterface, e: RenderInput<'ToolUse'>, view: TakoVi
         ? Box({ flexDirection: 'row', children: [Text({ color: colors.dim, children: `${i + 1} ` }), Box({ flexGrow: 1, flexShrink: 1, children: [code] })] })
         : code,
     )
-    if (command.run !== undefined) {
-      const tone = command.run.state === 'running' ? colors.accent : command.run.exit_code === 0 ? 'success' : command.run.state === 'exited' ? 'error' : colors.dim
-      rows.push(Text({ color: tone, children: w.runState(command.run) }))
+    const state =
+      command.run === undefined
+        ? null
+        : Text({
+            color: command.run.state === 'running' ? colors.accent : command.run.exit_code === 0 ? 'success' : command.run.state === 'exited' ? 'error' : colors.dim,
+            children: w.runState(command.run),
+          })
+    const pair = card === undefined ? undefined : card.commands[i]
+    if (clickable && card !== undefined && pair !== undefined) {
+      // key はカード id と番号で固定（描き直しで mount し直さない = Claude Code が描いた直後 300 ms のクリックを
+      // 捨てる窓を作り直さない）。押した後の流れは帯のボタンと同じ pressCard（Run は tako が組んだ run_args）
+      const sel: CardSel = { card, index: i + 1, command: pair, pos: 0, pairs: [{ card, index: i + 1, command: pair }] }
+      const buttons: RenderElement[] = [
+        Button({ key: `tako-card-${card.id}-${i + 1}-run`, label: w.run, variant: 'primary', onPress: press => pressCard($, 'run', sel, press) }),
+        Button({ key: `tako-card-${card.id}-${i + 1}-copy`, label: w.copy, onPress: press => pressCard($, 'copy', sel, press) }),
+      ]
+      if (state !== null) buttons.push(state)
+      rows.push(Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, children: buttons }))
+    } else if (state !== null) {
+      rows.push(state)
     }
   })
   if (card !== undefined && view.cards !== undefined) {
-    rows.push(Text({ color: colors.dim, wrap: 'wrap', children: w.cardHint(view.cards.hotkeys.copy, view.cards.hotkeys.run) }))
+    const hint = clickable ? w.cardKeyHint : w.cardHint
+    rows.push(Text({ color: colors.dim, wrap: 'wrap', children: hint(view.cards.hotkeys.copy, view.cards.hotkeys.run) }))
   }
   const box = Box({ flexDirection: 'column', borderStyle: 'round', borderColor: colors.accent, paddingX: 1, children: rows })
   if (below.type === 'engine') return box

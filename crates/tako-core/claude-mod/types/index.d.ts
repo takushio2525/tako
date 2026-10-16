@@ -221,6 +221,12 @@ export type TakoChat = {
 export type TakoCards = {
   /** 帯のカードのボタンのホットキー（tako が ui.json のボタンと重ならない英小文字を選ぶ。数字は使わない） */
   hotkeys: { copy: string; run: string; next: string; dismiss: string }
+  /**
+   * 会話の行のカードにクリックで押す「実行 / コピー」を置いてよいか（#2159。tako がこのペインの TUI へ
+   * 左クリックを渡す = `tako mouse` が on ∧ A/B でない）。置くのはさらに全画面（viewport.isFullscreen）の
+   * 端末のときだけ。偽なら帯で押す案内だけ（#1963 の形）。帯のボタンはどちらでも描く（キーの口）
+   */
+  click: boolean
   /** 古い順（store の並び）。帯は新しいものから選ぶ */
   items: TakoCard[]
 }

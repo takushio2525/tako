@@ -31801,6 +31801,12 @@ mod self_test {
     mod mod_chat_1964;
     #[cfg(feature = "visual-test")]
     use mod_chat_1964::mod_chat_visual;
+    /// #2159: mod が会話の行に描いたコマンドカードの `[ run ]` をクリック 1 回で実行し、二重押しで 2 本走らないか
+    /// （visual-test `mod-card-click`）
+    #[cfg(feature = "visual-test")]
+    mod mod_card_click_2159;
+    #[cfg(feature = "visual-test")]
+    use mod_card_click_2159::mod_card_click_visual;
     /// #1909: 補完の打鍵の取り消しの番号を UI スレッドで先に取る（visual-test `completion-cancel`）
     #[cfg(feature = "visual-test")]
     mod completion_cancel_1909;
@@ -46539,6 +46545,12 @@ mod self_test {
                 // #1964: GPUI のチャットと mod の描画（同じ会話）を並べて撮る・mod の描画の Copy を押せるか
                 "mod-chat" => {
                     mod_chat_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #2159: mod が会話の行に描いたカードの [ run ] をクリック 1 回で実行・二重押しで 2 本走らない
+                "mod-card-click" => {
+                    mod_card_click_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

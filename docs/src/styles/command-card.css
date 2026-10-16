@@ -304,6 +304,24 @@
 .tk-mc-card .tk-l {
   min-height: 1.45em;
 }
+/* 会話の行のカードのボタン（#2159。端末の `[ 実行 ]` / `[ コピー ]`。実行は primary = アクセント色） */
+.tk-mc-btns {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+}
+.tk-mc-btn {
+  color: var(--ui-fg);
+  border-radius: 2px;
+}
+.tk-mc-primary {
+  color: var(--ui-accent);
+}
+/* 押した瞬間（実物は押すと反転する） */
+.tk-ui .tk-mc-btn.is-on {
+  background: var(--ui-accent);
+  color: #11111b;
+}
 /* 帯（入力欄の上の 1 行。区切りは「 | 」） */
 .tk-ui .tk-mc-band {
   display: flex;

@@ -452,10 +452,22 @@ fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandVi
             .map(|c| c.list(Some(pane)).into_iter().cloned().collect())
             .unwrap_or_default(),
         cards_legacy: core::cards_legacy(),
+        // #2159: 会話の行のカードにクリックで押す「実行 / コピー」を置いてよいか
+        card_click: card_click(host),
         // #1964: チャット風の描画の組は表示モードで変わる（ターミナル表示の既定はコードのコピーだけ）
         ui_mode_gui: host.ui_mode().is_gui(),
         chat_legacy: core::chat_legacy(),
     })
+}
+
+/// tako がペインの TUI へ左クリックを渡すか（#2159。応答の `view.cards.click` と `tako mod` の `cards.click`）。
+/// `tako mouse` の設定（#1961）が on で、#1961 の A/B（クリックは常に tako の選択）でも #2159 の A/B でも
+/// ないときだけ真。偽なら mod は会話の行のカードにボタンを置かず、帯のホットキーで押す案内だけを描く
+/// （押せないボタンを見せない = §9.10）。全画面かどうか（main screen はマウス報告を要求しない）は mod が
+/// 描くときに `viewport.isFullscreen` で見る
+pub fn card_click(host: &dyn ControlHost) -> bool {
+    let mouse = host.mouse_forward_status();
+    mouse.enabled && !mouse.legacy && !core::card_click_legacy()
 }
 
 /// GUI モードでそのペインのチャットを誰が出すか（#1964。判断は `tako_core::claude_mod::chat_owner` の 1 本）。
@@ -758,6 +770,9 @@ fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
             "place": hub.cards_place.as_str(),
             "legacy": core::cards_legacy(),
             "pickup_grace_ms": core::CARD_PICKUP_GRACE.as_millis() as u64,
+            // #2159: 会話の行のカードをクリックで押せるか（偽 = 帯のホットキーで押す）と、その A/B
+            "click": card_click(host),
+            "click_legacy": core::card_click_legacy(),
         },
         // #1964: チャット風の描画（吹き出し・コードのコピー・ツールの要約）。auto の GUI モードでの持ち主は
         // 判断点が決まるまで tako（GPUI のチャット）。ペインごとの持ち主は panes[].chat

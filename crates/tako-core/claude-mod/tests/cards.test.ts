@@ -12,6 +12,9 @@ type World = {
   runs: string[][]
   copies: { text: string; surface?: string }[]
   groups: boolean[]
+  toasts: string[]
+  /** report 以外の CLI（Run / 閉じる / Copy の退避）の答え（#2159: 断られた Run を試す） */
+  cli: { exitCode: number; stderr: string }
 }
 
 const SURFACES = ['terminal', 'desktop'] as const
@@ -58,8 +61,9 @@ function cardItem(id: number, commands: string[], label?: string, runs: Record<n
 
 const HOTKEYS = { copy: 'y', run: 'r', next: 'n', dismiss: 'x' }
 
-function cards(items: Record<string, unknown>[]): Record<string, unknown> {
-  return { hotkeys: HOTKEYS, items }
+// click = tako がこのペインへクリックを渡す（#2159。Rust の cards_view は常に載せる）
+function cards(items: Record<string, unknown>[], click = true): Record<string, unknown> {
+  return { hotkeys: HOTKEYS, click, items }
 }
 
 function view(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -84,7 +88,7 @@ function view(extra: Record<string, unknown> = {}): Record<string, unknown> {
 
 // copy: 'ok' = 写せた / 'refused' = 他の mod の ui.copy フックが拒んだ
 function world(on: On, reply: Reply, copy: 'ok' | 'refused' = 'ok', inner: string | null = null): World {
-  const w: World = { sent: [], runs: [], copies: [], groups: [] }
+  const w: World = { sent: [], runs: [], copies: [], groups: [], toasts: [], cli: { exitCode: 0, stderr: '' } }
   on('process.run', ($, e) => {
     if (e.argv[1] === 'mod' && e.argv[2] === 'report') {
       w.sent.push({ argv: e.argv, report: JSON.parse(e.init?.stdin ?? '{}') as Record<string, unknown> })
@@ -93,7 +97,11 @@ function world(on: On, reply: Reply, copy: 'ok' | 'refused' = 'ok', inner: strin
       return { value: { exitCode: reply.exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     w.runs.push([...e.argv])
-    return { value: { exitCode: 0, stdout: '{}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode: w.cli.exitCode, stdout: '{}', stderr: w.cli.stderr, isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('ui.toast', ($, e) => {
+    w.toasts.push(typeof e.text === 'string' ? e.text : JSON.stringify(e.text))
+    return { value: undefined }
   })
   on('ui.copy', ($, e) => {
     w.copies.push({ text: e.text, surface: e.surface })
@@ -142,6 +150,11 @@ function toolUse(output: unknown, input: Record<string, unknown> = { commands: [
     component: 'ToolUse' as const,
     props: { tool_use_id: 'toolu_1', tool, input, isRunning: false, isErrored: false, isInterrupted: false, output },
   }
+}
+
+// 全画面の端末の会話の行（#2159。クリックが届く = Claude Code がマウス報告を要求している）
+function fullscreen<T extends object>(target: T, isFullscreen = true): T & { viewport: { columns: number; rows: number; isFullscreen: boolean } } {
+  return { ...target, viewport: { columns: 120, rows: 40, isFullscreen } }
 }
 
 function toolGroup(calls: { tool: string; input: unknown }[], isExpanded = false) {
@@ -411,6 +424,115 @@ describe('会話の行のカード（#1963）', () => {
     const g = await $.ui.mount({ ...toolGroup([{ tool: TOOL, input: { commands: ['ls'] } }]), surface: 'terminal' })
     expect(await g.find({ type: 'Text', text: 'Called tako' })).toBeDefined()
     await g.unmount()
+  })
+})
+
+// #2159: 会話の行のカードをクリック 1 回で押す（コマンドごとの `[ 実行 ]` / `[ コピー ]`）
+const ROW_KEYS = ['tako-card-5-1-run', 'tako-card-5-1-copy', 'tako-card-5-2-run', 'tako-card-5-2-copy'] as const
+
+async function rowButtons(ui: { find: (q: { type?: string; key?: string }) => Promise<unknown> }): Promise<string[]> {
+  const out: string[] = []
+  for (const key of ROW_KEYS) if ((await ui.find({ type: 'Button', key })) !== undefined) out.push(key)
+  return out
+}
+
+describe('会話の行のカードをクリック 1 回で（#2159）', () => {
+  test('クリックが届く全画面の端末ではコマンドごとに 実行 / コピー を置き、実行は tako が組んだ run_args を叩く', async ($, on) => {
+    const runs = { 1: { pane: 12, state: 'exited', exit_code: 0, count: 1 } }
+    const { w, clock } = await started(on, $, { exitCode: 0, view: view({ cards: cards([cardItem(5, [LONG, MULTI], 'ビルドと確認', runs)]) }) })
+    const ui = await $.ui.mount({ ...fullscreen(toolUse(mcpOutput(5))), surface: 'terminal' })
+    expect(await rowButtons(ui)).toEqual([...ROW_KEYS])
+    const run = await ui.find({ type: 'Button', key: 'tako-card-5-1-run' })
+    expect(run?.props.label).toBe('実行')
+    expect(run?.props.variant).toBe('primary')
+    expect((await ui.find({ type: 'Button', key: 'tako-card-5-1-copy' }))?.props.label).toBe('コピー')
+    // 実行記録はボタンの横に・キーの口（帯）の案内は残す
+    expect(await ui.find({ type: 'Text', text: '→ ペイン 12 終了 0' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'キーでは帯（ctrl+x → Tab）の y: コピー / r: 実行' })).toBeDefined()
+    // 2 件目の実行 = クリック 1 回で 2 件目の run_args（帯の「次」を押さなくてよい）
+    await ui.press({ key: 'tako-card-5-2-run' })
+    expect(w.runs).toEqual([[CLI, 'show-command', '--run', '--card', '5', '--index', '2']])
+    await clock.advance(1_000)
+    expect(w.sent.at(-1)?.report.last_press).toEqual(expect.objectContaining({ kind: 'card_run', ok: true }))
+    expect(w.toasts).toEqual([])
+    await ui.unmount()
+  })
+
+  test('コピーは論理文字列（157 字・改行なし）を $.ui.copy へ・拒まれたら show-command --copy へ', async ($, on) => {
+    const { w } = await started(on, $, { exitCode: 0, view: view() }, 'refused')
+    const ui = await $.ui.mount({ ...fullscreen(toolUse(mcpOutput(5))), surface: 'terminal' })
+    await ui.press({ key: 'tako-card-5-1-copy' })
+    expect(w.copies).toEqual([{ text: LONG, surface: 'terminal' }])
+    expect(w.runs).toEqual([[CLI, 'show-command', '--copy', '--card', '5', '--index', '1']])
+    await ui.unmount()
+  })
+
+  test('同じコマンドを 2 回押しても 1 回だけ実行する（同時の 2 打目・直後の 2 打目・帯のキー）', async ($, on) => {
+    const { w, clock } = await started(on, $, { exitCode: 0, view: view() })
+    const ui = await $.ui.mount({ ...fullscreen(toolUse(mcpOutput(5))), surface: 'terminal' })
+    // ダブルクリック（2 打が CLI の往復中に届く）
+    await Promise.all([ui.press({ key: 'tako-card-5-1-run' }), ui.press({ key: 'tako-card-5-1-run' })])
+    expect(w.runs.length).toBe(1)
+    // 返ってすぐの 2 打目（すぐ終わるコマンドの終了の後でも走らせない）と、帯の r（同じコマンド）
+    await ui.press({ key: 'tako-card-5-1-run' })
+    const strip = await $.ui.mount({ ...band(139), surface: 'terminal' })
+    await strip.press({ key: 'tako-card-run' })
+    await strip.unmount()
+    expect(w.runs.length).toBe(1)
+    // 別のコマンドは別の番（同じカードの 2 件目は走る）
+    await ui.press({ key: 'tako-card-5-2-run' })
+    expect(w.runs.map(r => r.at(-1))).toEqual(['1', '2'])
+    // 間を置いた押し直しは tako の判断（実行中なら dispatch が断る・終わっていれば再実行 = GPUI のカードと同じ）
+    await clock.advance(1_000)
+    await ui.press({ key: 'tako-card-5-1-run' })
+    expect(w.runs.map(r => r.at(-1))).toEqual(['1', '2', '1'])
+    await ui.unmount()
+  })
+
+  test('tako に断られたら（実行中）理由をトーストで出し、すぐ押し直せる', async ($, on) => {
+    const { w, clock } = await started(on, $, { exitCode: 0, view: view() })
+    w.cli = { exitCode: 1, stderr: 'error: このコマンドはまだ実行中（ペイン 12）\n' }
+    const ui = await $.ui.mount({ ...fullscreen(toolUse(mcpOutput(5))), surface: 'terminal' })
+    await ui.press({ key: 'tako-card-5-1-run' })
+    expect(w.toasts).toEqual(['tako: 実行できませんでした（このコマンドはまだ実行中（ペイン 12））'])
+    await clock.advance(1_000)
+    expect(w.sent.at(-1)?.report.last_press).toEqual(expect.objectContaining({ kind: 'card_run', ok: false }))
+    // 断られた後は待たずに押せる（番を残さない）
+    w.cli = { exitCode: 0, stderr: '' }
+    await ui.press({ key: 'tako-card-5-1-run' })
+    expect(w.runs.length).toBe(2)
+    expect(w.toasts.length).toBe(1)
+    await ui.unmount()
+  })
+
+  test('クリックが届かない（tako がクリックを渡さない・main screen・desktop）・閉じたカードはボタンを置かず帯の案内だけ', async ($, on) => {
+    const reply: Reply = { exitCode: 0, view: view({ cards: cards([cardItem(5, [LONG, MULTI])], false) }) }
+    const { clock } = await started(on, $, reply)
+    // tako がクリックを渡さない（tako mouse off・#1961 / #2159 の A/B）= #1963 の形のまま
+    let ui = await $.ui.mount({ ...fullscreen(toolUse(mcpOutput(5))), surface: 'terminal' })
+    expect(await rowButtons(ui)).toEqual([])
+    expect(await ui.find({ type: 'Text', text: '帯（ctrl+x → Tab）の y: コピー / r: 実行' })).toBeDefined()
+    await ui.unmount()
+    // 帯のキーの口はクリックが届かなくても描く（受け入れ 3）
+    let strip = await $.ui.mount({ ...band(139), surface: 'terminal' })
+    expect(await strip.find({ type: 'Button', key: 'tako-card-run' })).toBeDefined()
+    await strip.unmount()
+    reply.view = view()
+    await clock.advance(15_000)
+    const cases: Array<[string, Record<string, unknown>, 'terminal' | 'desktop']> = [
+      ['main screen（マウス報告なし）', fullscreen(toolUse(mcpOutput(5)), false), 'terminal'],
+      ['全画面か分からない', toolUse(mcpOutput(5)), 'terminal'],
+      ['desktop', fullscreen(toolUse(mcpOutput(5))), 'desktop'],
+      ['閉じたカード（store に無い）', fullscreen(toolUse(mcpOutput(2), { commands: ['echo gone'] })), 'terminal'],
+    ]
+    for (const [why, target, surface] of cases) {
+      ui = await $.ui.mount({ ...target, surface } as never)
+      expect({ why, buttons: (await ui.findAll({ type: 'Button' })).length }).toEqual({ why, buttons: 0 })
+      await ui.unmount()
+    }
+    strip = await $.ui.mount({ ...band(139), surface: 'terminal' })
+    expect(await strip.find({ type: 'Button', key: 'tako-card-run' })).toBeDefined()
+    await strip.unmount()
   })
 })
 
