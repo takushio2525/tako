@@ -448,6 +448,7 @@ fn position_at(text: &str, breaks: Breaks, offset: usize) -> (usize, usize) {
     let starts = line_starts(text, breaks);
     let line = starts.partition_point(|&s| s <= offset) - 1;
     let (start, end) = line_span(text, &starts, line, breaks);
+    // 切り出し安全: offset は offset_at / word_at / match_indices の位置で、end は行末 = 文字境界
     let character = text[start..offset.min(end)]
         .chars()
         .map(char::len_utf16)
@@ -531,7 +532,9 @@ fn path_of_file_uri(uri: &str) -> Option<std::path::PathBuf> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+            // バイト列から読む（`&rest[…]` で切ると `%` の直後の多バイト文字の途中で panic する。#1790）
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
                 out.push(b);
                 i += 3;
                 continue;
@@ -543,6 +546,7 @@ fn path_of_file_uri(uri: &str) -> Option<std::path::PathBuf> {
     let text = String::from_utf8(out).ok()?;
     let b = text.as_bytes();
     let text = if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        // 切り出し安全: 先頭は直前で確かめた ASCII の `/`
         text[1..].to_string()
     } else {
         text
@@ -1540,4 +1544,32 @@ fn main() {
         }
     }
     // stdin が閉じた（親が落ちた）ら自分で終わる = 孤児にならない
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_of_file_uri;
+
+    /// #1790: `%` の直後が多バイト文字の URI でも落ちない（修正前は `&rest[i + 1..i + 3]` が
+    /// 「あ」の途中を指して panic した）。復号できない `%` はそのまま残す
+    #[test]
+    fn percentの直後が多バイト文字でも落ちない() {
+        assert_eq!(
+            path_of_file_uri("file:///tmp/%あ.rs"),
+            Some(std::path::PathBuf::from("/tmp/%あ.rs"))
+        );
+        assert_eq!(
+            path_of_file_uri("file:///tmp/a%e3%81%82.rs"),
+            Some(std::path::PathBuf::from("/tmp/aあ.rs"))
+        );
+        // 末尾の `%` / 16 進でない 2 文字は復号しない（境界）
+        assert_eq!(
+            path_of_file_uri("file:///tmp/x%"),
+            Some(std::path::PathBuf::from("/tmp/x%"))
+        );
+        assert_eq!(
+            path_of_file_uri("file:///tmp/%zz"),
+            Some(std::path::PathBuf::from("/tmp/%zz"))
+        );
+    }
 }
