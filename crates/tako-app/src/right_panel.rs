@@ -6329,6 +6329,72 @@ mod tests {
         assert_eq!(out.chars().count(), GIT_FEEDBACK_MAX_CHARS + 1);
     }
 
+    /// フィードバックの切り詰めの固定値（#2217）。内容は最大 `GIT_FEEDBACK_MAX_CHARS` 文字で
+    /// `…` は上限の外（`…` 込みで最大 `GIT_FEEDBACK_MAX_CHARS + 1` 文字）。行の区切りの改行も
+    /// 1 文字に数え、行を落としたときは文字数に関係なく `…` が付く
+    #[test]
+    fn フィードバックの切り詰めの固定値() {
+        let max = GIT_FEEDBACK_MAX_CHARS;
+        let a = |n: usize| "あ".repeat(n);
+        // ── 行数は上限内 ──
+        // ちょうど上限は切らない
+        assert_eq!(git_feedback_text(&a(max)), a(max));
+        // 上限 + 1 文字ちょうどは内容 max 文字 + `…`
+        assert_eq!(git_feedback_text(&a(max + 1)), format!("{}…", a(max)));
+        // 上限 + 2 文字以上は内容 max 文字 + `…`
+        assert_eq!(git_feedback_text(&a(max + 2)), format!("{}…", a(max)));
+        // 4 バイト文字も 1 文字・結合文字（NFD の「が」）は濁点を別の 1 文字に数える
+        assert_eq!(
+            git_feedback_text(&"🎉".repeat(max + 50)),
+            format!("{}…", "🎉".repeat(max))
+        );
+        let ga = "か\u{3099}";
+        assert_eq!(git_feedback_text(&ga.repeat(max / 2)), ga.repeat(max / 2));
+        // 基底文字と結合文字のあいだで切れる（見た目は欠けるが UTF-8 は壊れない）
+        assert_eq!(
+            git_feedback_text(&format!("a{}", ga.repeat(max / 2 + 1))),
+            format!("a{}か…", ga.repeat(max / 2 - 1))
+        );
+        // 区切りの改行も 1 文字（100 文字 × 6 行 = 605 文字 → 6 行目の 95 文字目まで）
+        let six = vec![a(100); 6].join("\n");
+        assert_eq!(
+            git_feedback_text(&six),
+            format!("{}\n{}…", vec![a(100); 5].join("\n"), a(95))
+        );
+        // 改行の直後で切れたら改行も残る
+        assert_eq!(
+            git_feedback_text(&format!("{}\nbc", "a".repeat(max - 1))),
+            format!("{}\n…", "a".repeat(max - 1))
+        );
+        // 行末の空白（全角空白・タブ・CR）は数える前に落とす・CRLF も LF へ
+        assert_eq!(
+            git_feedback_text(&format!("{}\u{3000}\t \r\n", a(max))),
+            a(max)
+        );
+        assert_eq!(git_feedback_text("a\r\n\r\nb\r\n"), "a\nb");
+        // ── 行数が上限を超える（空行は数えない） ──
+        let seven = (1..=7).map(|i| format!("行{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            git_feedback_text(&seven.join("\n\n  \n")),
+            "行1\n行2\n行3\n行4\n行5\n行6…"
+        );
+        // 残した 6 行がちょうど上限なら `…` 込みで max + 1 文字
+        let tail = |head: usize| format!("{}{}\nう", a(head), "\nい".repeat(5));
+        assert_eq!(
+            git_feedback_text(&tail(max - 10)),
+            format!("{}{}…", a(max - 10), "\nい".repeat(5))
+        );
+        // 残した 6 行が上限 + 1 文字なら内容 max 文字 + `…`（行を落とした印は付いたまま）
+        assert_eq!(
+            git_feedback_text(&tail(max - 9)),
+            format!("{}{}\n…", a(max - 9), "\nい".repeat(4))
+        );
+        assert_eq!(git_feedback_text(&tail(max + 50)), format!("{}…", a(max)));
+        // ── 空 ──
+        assert_eq!(git_feedback_text(""), "");
+        assert_eq!(git_feedback_text("\n \n\t\u{3000}\n"), "");
+    }
+
     /// #494: 成功出力の要約は「最後の意味のある行」
     #[test]
     fn コマンド出力の要約() {
