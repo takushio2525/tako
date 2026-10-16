@@ -82,7 +82,7 @@ CLIP_LAST="$CLIP_BEFORE"
 clip_mark() {
   local now
   now="$(snap_clipboard)"
-  if [ "$now" != "$CLIP_LAST" ]; then echo "    観測: クリップボードのハッシュが「$1」の段の間に変わった（$CLIP_LAST → $now）"; fi
+  if [ "$now" != "$CLIP_LAST" ]; then echo "    観測: クリップボードのハッシュが「${1}」の段の間に変わった（${CLIP_LAST} → ${now}）"; fi
   CLIP_LAST="$now"
 }
 
