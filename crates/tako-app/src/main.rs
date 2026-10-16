@@ -2395,6 +2395,9 @@ struct TakoApp {
     /// 起動時のレイアウト復元結果（人間可読 1 行。Issue #30 の診断用。
     /// `tako persist` / MCP `tako_persist` の `last_restore` として公開する）
     restore_report: Option<String>,
+    /// 起動時の復元で器（tmux セッション）が無いので刈り込んだペイン（#1858。
+    /// `tako persist` / MCP `tako_persist` の `restore_pruned`）
+    restore_pruned: Vec<tako_control::layout_reconcile::PrunedPane>,
     /// OS ウィンドウの現フレーム（render で採取し layout 保存に含める。FR-5）
     window_frame: Option<tako_control::layout::WindowFrame>,
     /// tmux ビューのアコーディオン折りたたみ状態（FR-2.16.14。折りたたむと配下の
@@ -4671,6 +4674,8 @@ impl TakoApp {
         let mut webview_dock_restore: Vec<String> = Vec::new();
         // 複数ウィンドウの保存フレーム（Issue #339。復元ウィンドウの初期 bounds に使う）
         let mut window_frames_restore: Vec<(u64, tako_control::layout::WindowFrame)> = Vec::new();
+        // 器（tmux セッション）が無いので復元より前に外したペイン（#1858）
+        let mut restore_prune = tako_control::layout_reconcile::PruneReport::default();
         let (workspace, restore_report) = if let Some(reason) = &secondary_reason {
             let msg = format!(
                 "復元スキップ: {reason}のためセカンダリモードで起動\
@@ -4679,7 +4684,31 @@ impl TakoApp {
             persist_diag(&msg);
             (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)
         } else if tmux_persist {
-            let loaded = tako_control::layout::try_load().and_then(|file| {
+            let loaded = tako_control::layout::try_load().and_then(|mut file| {
+                // #1858: 器（tmux セッション）が消えたと**確かめられた** master / worker の
+                // ペインを復元より前に表のタブから外す（master が片付けたペイン。2026-09-30 の
+                // 復旧では完了済みの worker 3 枚が木に残り手で外した）。利用者のペインは
+                // 「閉じすぎた構成を recover で戻す」用途があるので従来どおり開き直す。
+                // 一覧は spawn より前に 1 回だけ取る（最初の spawn がサーバーを起こした後に
+                // 問い合わせると、PC の再起動で器ごと消えた全ペインを「消えた」と読む）。
+                // 問い合わせられない・layout の器が 1 つも居ない一覧では何も外さない
+                if tmux_available {
+                    restore_prune = tako_control::layout_reconcile::prune_dead_backends(
+                        &mut file,
+                        tako_core::tmux::live_session_names(Some(
+                            &tako_core::tmux_backend::socket_name(),
+                        )),
+                    );
+                    for pruned in &restore_prune.pruned {
+                        persist_diag(&pruned.log_line());
+                    }
+                    if let Some(line) = restore_prune.held_line() {
+                        persist_diag(&line);
+                    }
+                    if let Some(line) = restore_prune.reopened_line() {
+                        persist_diag(&line);
+                    }
+                }
                 // 折りたたみ状態（FR-2.16.14）を控えてから復元する。タブ ID は
                 // Phase 5.5 で同一値に復元されるので再起動後も対応が保たれる
                 collapsed_tmux_tabs = file
@@ -4947,6 +4976,7 @@ impl TakoApp {
             last_saved_layout: None,
             save_layout_stats: tako_control::layout::SaveStats::default(),
             restore_report,
+            restore_pruned: restore_prune.pruned.clone(),
             window_frame: None,
             drag_kind: None,
             drop_cmd_held: false,
@@ -5432,6 +5462,9 @@ impl TakoApp {
             // 全ペインを説明できていなかった）。
             // 系統ごとの resume 件数（#1238）と新規シェルの理由（#1076）も同じ器が持つ
             let mut breakdown = tako_control::restore_report::RestoreBreakdown::new();
+            // 復元より前に刈り込んだペイン（#1858）。復元していないので M の内訳には入れず、
+            // 1 行目の括弧の外と 2 行目の末尾に添える
+            breakdown.note_pruned(restore_prune.pruned.len(), restore_prune.closed_tabs.len());
             // タブ配下に居ないペイン（たまり場 = FR-2.15.5 / 退避タブ = #1487）。
             // **復元の失敗ではない**（#1554。本番 persist.log の「内訳の合計が 1〜2 足りない」
             // 行の正体）。#1576 からは表のペインと**同じ経路で器へ繋ぎ直し、退避のまま戻す**:
@@ -27468,6 +27501,10 @@ impl SystemHost for TakoApp {
 
     fn persist_restore_report(&self) -> Option<String> {
         self.restore_report.clone()
+    }
+
+    fn persist_restore_pruned(&self) -> Vec<tako_control::layout_reconcile::PrunedPane> {
+        self.restore_pruned.clone()
     }
 
     fn recovered_sessions_count(&self) -> usize {

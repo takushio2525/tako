@@ -7695,12 +7695,43 @@ fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Resul
     }
     let layout = tako_control::layout::load_file(&bak)
         .map_err(|e| format!("バックアップ {} を読めない: {e}", bak.display()))?;
+    // #1858: 世代をそのまま写すと、バックアップより後に作られたタブ（復旧をしている
+    // master 自身のタブを含む）が消える。現在の layout.json にあって世代に無いタブを、
+    // 起動時に刈り込まれるだけのタブ（器の消えた master / worker のペインしか無い）以外は
+    // 合流させる（判断の正本は `layout_reconcile::merge_after_backup`。
+    // A/B は `TAKO_1858_LEGACY=1`）
+    let merge = if tako_control::layout_reconcile::legacy() || !path.is_file() {
+        None
+    } else {
+        match tako_control::layout::load_file(path) {
+            Ok(current) => Some(tako_control::layout_reconcile::merge_after_backup(
+                &layout,
+                &current,
+                tako_core::tmux::live_session_names(Some(&tako_core::tmux_backend::socket_name())),
+            )),
+            Err(e) => {
+                eprintln!(
+                    "現在の layout.json を読めないので、バックアップより後のタブは合流しない: {e}"
+                );
+                None
+            }
+        }
+    };
     if path.is_file() {
         let stash = path.with_extension("json.pre-recover");
         std::fs::copy(path, &stash).map_err(|e| format!("現在の layout.json の退避に失敗: {e}"))?;
         eprintln!("現在の layout.json → {} へ退避", stash.display());
     }
-    std::fs::copy(&bak, path).map_err(|e| format!("復元コピーに失敗: {e}"))?;
+    match &merge {
+        // 合流があるときだけ書き直す（無ければ世代とバイト一致のコピーのまま）
+        Some((merged, report)) if !report.merged.is_empty() => {
+            tako_control::layout::write_file(path, merged)
+                .map_err(|e| format!("復元の書き込みに失敗: {e}"))?
+        }
+        _ => {
+            std::fs::copy(&bak, path).map_err(|e| format!("復元コピーに失敗: {e}"))?;
+        }
+    }
     eprintln!(
         "{}（{} タブ / {} ペイン）→ layout.json へ復元しました。",
         bak.file_name()
@@ -7709,8 +7740,70 @@ fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Resul
         layout.tabs.len(),
         layout.pane_count()
     );
+    if let Some((merged, report)) = &merge {
+        print_recover_merge(merged, report);
+        if let Some(line) = report.log_line(generation) {
+            tako_control::diag::persist_log(&line);
+        }
+    }
     eprintln!("tako を起動すると、このレイアウトで復元されます。");
     Ok(())
+}
+
+/// `recover --apply` の合流の結果（#1858）。タブ名はここ（利用者へ見せる出力）にだけ出す
+fn print_recover_merge(
+    merged: &tako_control::layout::LayoutFile,
+    report: &tako_control::layout_reconcile::MergeReport,
+) {
+    if !report.merged.is_empty() {
+        eprintln!(
+            "バックアップより後に作られたタブを {} 枚合流しました:",
+            report.merged.len()
+        );
+        for t in &report.merged {
+            let mut notes = vec![format!("tmux セッションあり {}", t.alive)];
+            if t.dead > 0 {
+                notes.push(format!(
+                    "終わっている {}（master / worker のペインは起動時に外し、ほかは開き直す）",
+                    t.dead
+                ));
+            }
+            if t.duplicates > 0 {
+                notes.push(format!(
+                    "バックアップ側にあるペイン {} を除いた",
+                    t.duplicates
+                ));
+            }
+            eprintln!(
+                "  タブ {}「{}」: {} ペイン（{}）",
+                t.id,
+                t.title,
+                t.panes,
+                notes.join("・")
+            );
+        }
+    }
+    if !report.skipped.is_empty() {
+        eprintln!("合流しなかったタブ {} 枚:", report.skipped.len());
+        for t in &report.skipped {
+            eprintln!("  タブ {}「{}」: {}", t.id, t.title, t.reason.label());
+        }
+    }
+    if let Some(untrusted) = report.untrusted {
+        if !report.merged.is_empty() {
+            eprintln!(
+                "（{}ので、tmux セッションの生死は確かめずに合流しました）",
+                untrusted.label()
+            );
+        }
+    }
+    if !report.merged.is_empty() {
+        eprintln!(
+            "合流後: {} タブ / {} ペイン",
+            merged.tabs.len(),
+            merged.pane_count()
+        );
+    }
 }
 
 /// `sleep-guard status` の状態を採る（#372）。

@@ -367,6 +367,23 @@ pub fn has_session(socket: Option<&str>, name: &str) -> bool {
     run_tmux(socket, &["has-session", "-t", &exact_target(name)]).is_ok()
 }
 
+/// サーバーに今ある器（セッション）の名前（`list-sessions` 1 回。#1858）。
+///
+/// **`None` = 問い合わせられなかった**（サーバー未起動・ソケットが無い・tmux 不在・
+/// 上限切れ）で、「器が 1 つも無い」= 空の集合と区別する。[`has_session`] は
+/// どちらも `false` になるので、「消えたと確かめられた器」だけを扱う判断
+/// （recover の合流・復元時の刈り込み）はこちらを使う
+pub fn live_session_names(socket: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    let out = run_tmux(socket, &["list-sessions", "-F", "#{session_name}"]).ok()?;
+    Some(
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+    )
+}
+
 /// 全クライアントの (client_pid, セッション名) 一覧（`list-clients`、1 コマンド）。
 /// 復元強奪ガード（#177）が「生きた別 tako のクライアントが attach 中のセッション」を
 /// 検出するのに使う。サーバー不在・クライアント無しは空
