@@ -1347,7 +1347,8 @@ lid-guard.json が使う）:
   EOF が来ない（#1768 で同じ穴を実測。CPU 0% のまま止まる形と合う）。直し方 =
   ①親子表は macOS で libproc（`ports::process_table` = `proc_listpids` + `PROC_PIDT_SHORTBSDINFO` +
   `KERN_PROCARGS2`。子プロセスもパイプも無い。`PROC_PIDTBSDINFO` は root のプロセスで失敗するので
-  使わない）、libproc の無い unix の `ps` は上限つき ②器への問い合わせ（`tmux::run_tmux` /
+  使わない。argv は生のまま返すので、`ps` が表記し直す印字できない文字（改行 → `\012` 等）を含む
+  argv だけは表記が違う = #2193）、libproc の無い unix の `ps` は上限つき ②器への問い合わせ（`tmux::run_tmux` /
   `run_tmux_at` / `session_alive` / `paste_text` / backend の `pane_pids*` / `capture_history_joined` /
   `scroll_probe` / `agents::tmux_pane_pids`）は `probe::command_output_with_timeout`
   （`TMUX_QUERY_TIMEOUT` = 5 秒。実測 0.01 秒未満）を通す。`claude agents --json` の走査

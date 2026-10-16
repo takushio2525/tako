@@ -614,6 +614,11 @@ fn procargs2_into(pid: u32, buf: &mut [u8]) -> Option<usize> {
 /// ## `ps` との違い（実測で揃えた）
 ///
 /// - コマンド行は `KERN_PROCARGS2` の argv を空白で繋ぐ（`ps` の `command` 列と同じ材料）
+/// - 印字できない文字（改行・タブ・制御文字・ゼロ幅文字）は**そのまま**返す（不正な UTF-8 は
+///   U+FFFD）。`ps` は表示用に `\012` / `^A` などへ表記し直すので、複数行の `sh -c` の本文の
+///   ような argv は表記だけが違う（実測 2026-10-16・#2193）。読み手が見る第 1 語（codex / agy /
+///   stale binary）と ssh 本体の引数には出ない
+/// - ゾンビは載らない（`PROC_PIDT_SHORTBSDINFO` が 0 バイトで返る。`ps` は `<defunct>` で出す）
 /// - 読めないプロセスは `ps` の流儀で `(名前)` を入れる。**別ユーザー（root）のプロセスの
 ///   コマンド行は読めない**: `/bin/ps` は Apple の特権付きバイナリなので読めるが、tako からの
 ///   `KERN_PROCARGS2` は拒まれる（実測 2026-10-10: 自分のプロセスは 791 件中 789 件が `ps` と
@@ -1180,74 +1185,362 @@ mod tests {
     /// #1979: libproc の親子表が `ps -axo pid=,ppid=,command=` と**同じ答え**を返す。
     ///
     /// 置き換えの前後で ssh の宛先検知（#976）・agent の判定（argv）・stale binary 検知が
-    /// 黙って変わらないことの実測。2 回の採取の間に生まれた / 消えたプロセスは比べない
-    /// （両方に居る pid だけを見る）。親子は**全ユーザーぶん**、コマンド行は**自分の
-    /// プロセス**の一致を求める（別ユーザーのものは特権付きの `/bin/ps` にしか読めない）
+    /// 黙って変わらないことの実測。親子は**全ユーザーぶん**、コマンド行は**自分の
+    /// プロセス**を比べる（別ユーザーのものは特権付きの `/bin/ps` にしか読めない）。
+    ///
+    /// 比べ方は [`compare_with_ps`]（#2193）。libproc → `ps` → libproc の順に取り、
+    /// 2 回の libproc が同じ答えのものは `ps` と**全件一致**を求める（許容の % は置かない）
     #[test]
     fn libprocの親子表はpsと同じ答えを返す() {
-        let (parents, argv) = process_table().expect("macOS は列挙できる");
         let me = std::process::id();
-        assert!(parents.contains_key(&me), "自分が載っていない");
+        let mut before = process_table().expect("macOS は列挙できる");
         let mut ps = std::process::Command::new("/bin/ps");
         let out = crate::platform::process::no_console_window(&mut ps)
-            .args(["-axo", "pid=,ppid=,command="])
+            .args(["-axo", "pid=,uid=,ppid=,command="])
             .output()
             .expect("ps");
-        let text = String::from_utf8_lossy(&out.stdout);
-        let (mut common, mut ppid_same, mut argv_same, mut mine, mut mine_same) = (0, 0, 0, 0, 0);
-        let mut diffs = Vec::new();
+        let mut after = process_table().expect("macOS は列挙できる");
+        assert!(
+            before.0.contains_key(&me) && after.0.contains_key(&me),
+            "自分が載っていない"
+        );
+        let rows = parse_ps_rows(&String::from_utf8_lossy(&out.stdout));
         // SAFETY: getuid は引数を取らず必ず成功する
         let my_uid = unsafe { libc::getuid() };
-        for line in text.lines() {
-            let mut it = line.split_whitespace();
-            let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
-                continue;
-            };
-            let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
-                continue;
-            };
-            let Some(&got_ppid) = parents.get(&pid) else {
-                continue; // 2 回の採取の間に生まれた
-            };
-            let command = it.collect::<Vec<_>>().join(" ");
-            common += 1;
-            ppid_same += usize::from(got_ppid == ppid);
-            let got = argv.get(&pid).map(String::as_str).unwrap_or("");
-            // 空白の連続は 1 つに畳んで比べる（`ps` の列の組み立てと同じ扱い）
-            let got_norm = got.split_whitespace().collect::<Vec<_>>().join(" ");
-            let same = got_norm == command;
-            argv_same += usize::from(same);
-            if owner_uid(pid) == Some(my_uid) {
-                mine += 1;
-                mine_same += usize::from(same);
-            }
-            if !same && diffs.len() < 5 {
-                diffs.push(format!(
-                    "pid {pid}: ps の長さ {} / libproc の長さ {}",
-                    command.len(),
-                    got_norm.len()
-                ));
-            }
+        if let Ok(spec) = std::env::var(INJECT_ENV) {
+            inject_2193(&spec, &mut before, &mut after, &rows, my_uid);
         }
+        let cmp = compare_with_ps(&before, &rows, &after, my_uid);
         eprintln!(
-            "共通 {common} 件: ppid 一致 {ppid_same} / コマンド行一致 {argv_same} \
-             （自分のプロセス {mine} 件中 {mine_same}）。不一致の例: {diffs:?}"
+            "共通 {} 件（うち採取の間に変わった {}）・自分のプロセスのコマンド行 {} 件\
+             （うち ps が表記し直す文字を含み手前だけ比べた {}）・ずれ {} 件",
+            cmp.common,
+            cmp.moved,
+            cmp.mine,
+            cmp.rewritten,
+            cmp.mismatches.len()
         );
-        assert!(common > 10, "比べる材料が無い（ps が空?）");
-        // 採取の間に親が変わる（孤児が launchd へ付け替わる）ことはあるので、全件一致は求めない
-        assert!(ppid_same * 100 >= common * 99, "親子が ps とずれている");
-        // 自分のプロセスはどちらも KERN_PROCARGS2 を読めるので一致する（採取の間に
-        // argv を書き換えるプロセスがあるので 1 % の揺れだけ許す）
-        assert!(mine > 0, "自分のプロセスが 1 つも比べられていない");
+        assert!(cmp.common > 10, "比べる材料が無い（ps が空?）");
+        assert!(cmp.mine > 0, "自分のプロセスが 1 つも比べられていない");
         assert!(
-            mine_same * 100 >= mine * 99,
-            "自分のプロセスのコマンド行が ps とずれている"
+            cmp.mismatches.is_empty(),
+            "libproc の答えが ps とずれている（{} 件。先頭 10 件: {:?}）",
+            cmp.mismatches.len(),
+            &cmp.mismatches[..cmp.mismatches.len().min(10)]
+        );
+        // 2 回の libproc の間（数十 ms）に変わるのは exec した・親が死んだものだけで、
+        // 実測は 1 回に 0〜1 件（`ps` の前へ 3 秒の遅れを入れても 0 件。2026-10-16）。
+        // 1 割も揺れるなら、時刻ではなく libproc の答えが揺れている（比べずに見逃さない）
+        assert!(
+            cmp.moved * 10 < cmp.common,
+            "採取の間に変わったものが多すぎる（{} / {} 件。libproc の答えが呼ぶたびに違う?）",
+            cmp.moved,
+            cmp.common
         );
     }
 
-    /// 所有ユーザー（`pbi_uid`）。比べる対象を「自分のプロセス」に絞るためだけに使う
-    fn owner_uid(pid: u32) -> Option<u32> {
-        bsd_info(pid as i32).map(|info| info.pbi_uid)
+    /// #2193 の注入（検証専用）。`churn[:N]` は 1 回目の libproc の表だけを書き換え、
+    /// 共通の pid の N 件に 1 件を「採取の間に変わった」形（exec 前・前の親が死ぬ前）にし、
+    /// 別の N 件に 1 件ずつを「1 回目の後に生まれた」「`ps` の後に死んだ」にする。
+    /// `regress[:N]` は 2 回の表の**両方**を同じに書き換える（親子表が本当にずれる回帰）。
+    /// N の既定は 20（= 5 %。修正前の比べ方の許容 1 % を超える）
+    const INJECT_ENV: &str = "TAKO_2193_INJECT";
+
+    /// 採取の間に死んだ前の親の代役（実在しない pid）
+    const GONE_PARENT: u32 = 0x7fff_fff0;
+
+    fn inject_2193(spec: &str, before: &mut Table, after: &mut Table, rows: &[PsRow], my_uid: u32) {
+        let (kind, every) = spec
+            .split_once(':')
+            .map_or((spec, 20), |(k, n)| (k, n.parse().unwrap_or(0)));
+        assert!(every > 0, "{INJECT_ENV} の N は正の整数（{spec}）");
+        let regress = match kind {
+            "churn" => false,
+            "regress" => true,
+            _ => panic!("{INJECT_ENV} は churn[:N] か regress[:N]"),
+        };
+        let common: Vec<&PsRow> = rows
+            .iter()
+            .filter(|r| before.0.contains_key(&r.pid) && after.0.contains_key(&r.pid))
+            .collect();
+        for (i, row) in common.into_iter().enumerate() {
+            match (i % every, regress) {
+                (0, _) => {
+                    // churn: 1 回目だけ古い（exec 前 / 付け替え前）。regress: 2 回とも同じに違う
+                    let wrong_argv = |argv: &str| match argv.rsplit_once(' ') {
+                        Some((head, _)) if regress => head.to_string(),
+                        _ if regress => String::new(),
+                        _ => "(exec 前)".to_string(),
+                    };
+                    let mut tables = vec![&mut *before];
+                    if regress {
+                        tables.push(&mut *after);
+                    }
+                    for table in tables {
+                        table.0.insert(row.pid, GONE_PARENT);
+                        if row.uid == my_uid {
+                            let argv = table.1.get(&row.pid).cloned().unwrap_or_default();
+                            table.1.insert(row.pid, wrong_argv(&argv));
+                        }
+                    }
+                }
+                (1, false) => {
+                    before.0.remove(&row.pid); // 1 回目の後に生まれた
+                    before.1.remove(&row.pid);
+                }
+                (2, false) => {
+                    after.0.remove(&row.pid); // `ps` の後に死んだ
+                    after.1.remove(&row.pid);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 親子表とコマンド行（[`process_table`] の戻りと同じ形）
+    type Table = (HashMap<u32, u32>, HashMap<u32, String>);
+
+    /// `ps -axo pid=,uid=,ppid=,command=` の 1 行
+    struct PsRow {
+        pid: u32,
+        uid: u32,
+        ppid: u32,
+        /// 空白の連続は 1 つに畳んである（`ps` の列は空白で区切られて届く）
+        command: String,
+    }
+
+    fn parse_ps_rows(text: &str) -> Vec<PsRow> {
+        text.lines()
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                let pid = it.next()?.parse().ok()?;
+                let uid = it.next()?.parse().ok()?;
+                let ppid = it.next()?.parse().ok()?;
+                let command = it.collect::<Vec<_>>().join(" ");
+                Some(PsRow {
+                    pid,
+                    uid,
+                    ppid,
+                    command,
+                })
+            })
+            .collect()
+    }
+
+    /// [`compare_with_ps`] の結果
+    #[derive(Debug, Default)]
+    struct PsComparison {
+        /// 2 回の libproc と `ps` のすべてに居た pid（採取の間に生まれた / 死んだものは入らない）
+        common: usize,
+        /// そのうち 2 回の libproc の間に親かコマンド行が変わったもの
+        moved: usize,
+        /// コマンド行を比べた自分のプロセス
+        mine: usize,
+        /// そのうち `ps` が表記し直す文字を含み、手前の ASCII だけを比べたもの
+        rewritten: usize,
+        /// 本当のずれ（1 件でもあれば落とす）。コマンド行の中身は出さない（長さと位置だけ）
+        mismatches: Vec<String>,
+    }
+
+    /// libproc の 2 回の採取（`before` / `after`）で `ps` の 1 回（`rows`）を挟んで比べる（#2193）。
+    ///
+    /// - **2 回の libproc が同じ答え**なら、その間に走った `ps` も同じものを見ているはず
+    ///   （変わって元に戻る、は数十 ms では起きない）なので**全件一致**を求める
+    /// - 2 回の間に変わったもの（exec した・前の親が死んで launchd へ付け替わった）は、
+    ///   `ps` がどちらを見たかが時刻で決まるので比べない。ただし親の付け替えは 1 回しか
+    ///   起きないので、`ps` の親は 2 回のどちらかと同じでなければずれ
+    /// - コマンド行は `ps` が印字できない文字を表記し直す（[`ps_prints_verbatim`]）ので、
+    ///   そういう文字を含む argv は手前の ASCII だけを比べる
+    fn compare_with_ps(before: &Table, rows: &[PsRow], after: &Table, my_uid: u32) -> PsComparison {
+        let mut cmp = PsComparison::default();
+        for row in rows {
+            let pid = row.pid;
+            let (Some(&p1), Some(&p2)) = (before.0.get(&pid), after.0.get(&pid)) else {
+                continue; // 採取の間に生まれた / 死んだ（ゾンビも libproc には載らない）
+            };
+            cmp.common += 1;
+            let mut moved = p1 != p2;
+            if row.ppid != p1 && row.ppid != p2 {
+                cmp.mismatches.push(if moved {
+                    format!("pid {pid}: 親が libproc {p1} → {p2} / ps {}", row.ppid)
+                } else {
+                    format!("pid {pid}: 親が libproc {p1} / ps {}", row.ppid)
+                });
+            }
+            if row.uid == my_uid {
+                let a1 = before.1.get(&pid).map(String::as_str).unwrap_or("");
+                let a2 = after.1.get(&pid).map(String::as_str).unwrap_or("");
+                if a1 != a2 {
+                    moved = true;
+                } else {
+                    cmp.mine += 1;
+                    let rewritten = !a1.chars().all(ps_prints_verbatim);
+                    cmp.rewritten += usize::from(rewritten);
+                    let expected = if rewritten {
+                        let end = a1.find(|c: char| !matches!(c, ' '..='~'));
+                        squeeze(&a1[..end.unwrap_or(a1.len())])
+                    } else {
+                        squeeze(a1)
+                    };
+                    let same = if rewritten {
+                        row.command.starts_with(&expected)
+                    } else {
+                        row.command == expected
+                    };
+                    if !same {
+                        let at = expected
+                            .chars()
+                            .zip(row.command.chars())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        cmp.mismatches.push(format!(
+                            "pid {pid}: コマンド行が {at} 文字目から違う（libproc {} 文字 / ps {} 文字{}）",
+                            expected.chars().count(),
+                            row.command.chars().count(),
+                            if rewritten { "・手前だけ比較" } else { "" }
+                        ));
+                    }
+                }
+            }
+            cmp.moved += usize::from(moved);
+        }
+        cmp
+    }
+
+    /// `ps` がそのまま出す文字（#2193 の実測 2026-10-16）。
+    ///
+    /// `ps` は印字できない文字を表記し直す: 改行 → `\012`・タブ → `\011`・0x01 → `^A`・
+    /// DEL → `^?`・C1 制御文字 / ゼロ幅空白 / BOM / 不正な UTF-8 → `M^E` / `\040^K` /
+    /// `M-~M^?` など。日本語・全角空白・NBSP・U+2028 はそのまま。libproc は生のまま返すので、
+    /// これらを含む argv（複数行の `sh -c` の本文・Bash ツールのラッパー等）は**時刻と関係なく**
+    /// 表記が食い違う。文字でも空白でもないもの（絵文字・記号など。実測ではそのまま出た）は
+    /// 一律に「表記し直す側」へ倒す（手前だけ比べるので、確かめていない文字で偽のずれを出さない）
+    fn ps_prints_verbatim(c: char) -> bool {
+        matches!(c, ' '..='~') || (!c.is_control() && (c.is_alphanumeric() || c.is_whitespace()))
+    }
+
+    /// 空白の連続を 1 つに畳む（`ps` の列の組み立てと同じ扱い）
+    fn squeeze(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn table(entries: &[(u32, u32, &str)]) -> Table {
+        let parents = entries.iter().map(|&(pid, ppid, _)| (pid, ppid)).collect();
+        let argv = entries
+            .iter()
+            .map(|&(pid, _, argv)| (pid, argv.to_string()))
+            .collect();
+        (parents, argv)
+    }
+
+    /// 比べる側の自分の uid（合成の表で使う）
+    const ME: u32 = 501;
+
+    #[test]
+    fn ps照合は採取の間に変わったものを比べない_2193() {
+        let before = table(&[
+            (10, 1, "tako"),
+            (11, 10, "tako"), // 1 回目の後に exec（fork 直後は親のコマンド行のまま）
+            (12, 10, "zsh -c make"), // 前の親が死んで launchd へ付け替わる
+            (13, 10, "sleep 1"), // `ps` の後に死ぬ
+            (14, 10, "cargo build"),
+        ]);
+        let rows = parse_ps_rows(
+            "10 501 1 tako\n11 501 10 git status\n12 501 1 zsh -c make\n\
+             13 501 10 sleep 1\n14 501 10 cargo build\n15 501 10 rustc -vV\n",
+        );
+        let after = table(&[
+            (10, 1, "tako"),
+            (11, 10, "git status"),
+            (12, 1, "zsh -c make"),
+            (14, 10, "cargo build"),
+            (15, 10, "rustc -vV"), // 1 回目の後に生まれた
+        ]);
+        let cmp = compare_with_ps(&before, &rows, &after, ME);
+        assert!(cmp.mismatches.is_empty(), "{:?}", cmp.mismatches);
+        // 共通は 10 / 11 / 12 / 14。変わったのは 11（exec）と 12（付け替え）。
+        // コマンド行を比べたのは変わっていない 10 / 12 / 14
+        assert_eq!((cmp.common, cmp.moved, cmp.mine), (4, 2, 3));
+        // `ps` が変わる前を見た（exec が `ps` の後）でも同じ
+        let late = parse_ps_rows("11 501 10 tako\n12 501 10 zsh -c make\n");
+        assert!(compare_with_ps(&before, &late, &after, ME)
+            .mismatches
+            .is_empty());
+    }
+
+    #[test]
+    fn ps照合はlibprocの本当のずれを見逃さない_2193() {
+        // 2 回の libproc が同じ答えなのに `ps` と違う = 採取の時刻では説明できない
+        let both = table(&[(10, 7, "cargo build"), (11, 1, "sleep 600")]);
+        let rows = parse_ps_rows("10 501 8 cargo build\n11 501 1 sleep 600 --x\n");
+        let cmp = compare_with_ps(&both, &rows, &both, ME);
+        assert_eq!(cmp.mismatches.len(), 2, "{:?}", cmp.mismatches);
+        // 親が変わった最中でも、`ps` が 2 回のどちらとも違う親を見ていればずれ
+        let (before, after) = (table(&[(12, 5, "a")]), table(&[(12, 1, "a")]));
+        let cmp = compare_with_ps(&before, &parse_ps_rows("12 501 9 a\n"), &after, ME);
+        assert_eq!(cmp.mismatches.len(), 1, "{:?}", cmp.mismatches);
+        // 1,000 件中 1 件のずれでも落とす（修正前の比べ方は 1 % まで見逃した）
+        let many: Vec<(u32, u32, String)> = (100..1100).map(|p| (p, 1, format!("w {p}"))).collect();
+        let many_table = table(
+            &many
+                .iter()
+                .map(|(p, pp, a)| (*p, *pp, a.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let text: String = (100..1100)
+            .map(|p| format!("{p} 501 {} w {p}\n", if p == 500 { 2 } else { 1 }))
+            .collect();
+        let cmp = compare_with_ps(&many_table, &parse_ps_rows(&text), &many_table, ME);
+        assert_eq!(cmp.mismatches, ["pid 500: 親が libproc 1 / ps 2"]);
+        // 別ユーザーのコマンド行は比べない（特権付きの `ps` だけが読める）
+        let root = table(&[(13, 1, "(sshd)")]);
+        let cmp = compare_with_ps(
+            &root,
+            &parse_ps_rows("13 0 1 /usr/sbin/sshd -D\n"),
+            &root,
+            ME,
+        );
+        assert!(cmp.mismatches.is_empty() && cmp.mine == 0);
+    }
+
+    #[test]
+    fn ps照合はpsの表記し直しを同じとみなす_2193() {
+        // 実測（2026-10-16）で `ps` がそのまま出した文字と、表記し直した文字
+        for c in [
+            'a', ' ', '~', 'é', '日', 'ー', '\u{3000}', '\u{a0}', '\u{2028}',
+        ] {
+            assert!(ps_prints_verbatim(c), "{c:?} はそのまま出る");
+        }
+        for c in [
+            '\n', '\t', '\u{1}', '\u{7f}', '\u{85}', '\u{200b}', '\u{feff}', '\u{fffd}',
+        ] {
+            assert!(!ps_prints_verbatim(c), "{c:?} は表記し直される");
+        }
+        let t = table(&[
+            (20, 1, "/bin/sh -c sleep 900\n: x"),
+            (21, 1, "printf a\tb\u{1}"),
+            (22, 1, "git commit -m 日本語\u{3000}です"),
+            (23, 1, "sh -c echo 日本語\nx"),
+        ]);
+        let rows = parse_ps_rows(
+            "20 501 1 /bin/sh -c sleep 900\\012: x\n21 501 1 printf a\\011b^A\n\
+             22 501 1 git commit -m 日本語\u{3000}です\n23 501 1 sh -c echo 日本語\\012x\n",
+        );
+        let cmp = compare_with_ps(&t, &rows, &t, ME);
+        assert!(cmp.mismatches.is_empty(), "{:?}", cmp.mismatches);
+        assert_eq!((cmp.mine, cmp.rewritten), (4, 3));
+        // 表記し直しのある argv でも、手前が違えばずれ
+        let bad = table(&[(24, 1, "/bin/sh -c slep 900\n: x")]);
+        let cmp = compare_with_ps(
+            &bad,
+            &parse_ps_rows("24 501 1 /bin/sh -c sleep 900\\012: x\n"),
+            &bad,
+            ME,
+        );
+        assert_eq!(
+            cmp.mismatches,
+            ["pid 24: コマンド行が 14 文字目から違う（libproc 19 文字 / ps 27 文字・手前だけ比較）"]
+        );
     }
 
     #[test]
