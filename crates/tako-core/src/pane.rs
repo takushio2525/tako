@@ -14,7 +14,7 @@ static PANE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl PaneId {
     /// 新しいユニーク ID を採番する（プロセス全体で単調増加）
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         PaneId(PANE_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 

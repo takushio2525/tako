@@ -14,7 +14,7 @@ pub struct TabId(u64);
 static TAB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl TabId {
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         TabId(TAB_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 

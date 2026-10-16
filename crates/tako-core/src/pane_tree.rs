@@ -1671,9 +1671,9 @@ mod tests {
                 "混在領域は含まず、新設された領域だけを指す"
             );
 
-            // 居ない anchor は None（reflow も false）
+            // 居ない anchor は None（reflow も false）。決め打ちの ID は採番しだいで実在しうる（#1868）
             let (t, _master) = tree();
-            let ghost = PaneId::from_raw(9_999_999);
+            let ghost = crate::unused_id::pane();
             assert_eq!(t.worker_area_panes(ghost), None);
         }
 

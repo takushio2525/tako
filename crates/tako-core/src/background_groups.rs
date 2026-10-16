@@ -578,8 +578,8 @@ mod tests {
         add_tab(&mut ws, "m2", vec![with_role(Some("master:b"), None)]);
         assert_eq!(parent_master(&ws, orphan_id), MasterKey::Unknown);
 
-        // 親が閉じた
-        let gone = PaneId::from_raw(9_999_001);
+        // 親が閉じた（決め打ちの ID は採番しだいで実在しうる = #1868）
+        let gone = crate::unused_id::pane();
         let lost = with_role(Some("orchestrator-worker:z"), Some(gone));
         let lost_id = lost.id();
         add_tab(&mut ws, "lost", vec![lost]);
