@@ -1226,7 +1226,7 @@ tako chat copy --markdown            # Markdown ソースのまま
 
 ターミナル領域を縮めて作った専用の帯に、コピー・実行ボタンつきのコマンドカードを出します。**AI が会話本文に書いたコマンドは折り返しでコピーが壊れる**ため、実行を頼むコマンドはこれで提示します（カードは永続化されません）。
 
-Claude Code のペインで tako mod が動いているときは、カードを Claude Code の画面の中（会話の行と入力欄の上の帯）に出し、ペイン下の帯は作りません（画面が縮まない）。帯の `card N` の横の `y: copy` / `r: run` は ctrl+x → Tab でフォーカスしてからキーで押します。どちらに出ているかは `tako show-command --list` の各カードの `owner.drawn_by`（`mod` / `tako`）で分かり、ペイン下の帯へ戻すなら `tako mod ui set cards.place tako` です。
+Claude Code のペインで tako mod が動いているときは、カードを Claude Code の画面の中（会話の行と入力欄の上の帯）に出し、ペイン下の帯は作りません（画面が縮まない）。会話の行のカードの `[ run ]` を**クリック 1 回**で新しいペインで実行し、`[ copy ]` でコピーします（同じコマンドを続けて押しても 2 本は走りません）。キーで押すなら、帯の `card N` の横の `y: copy` / `r: run` を ctrl+x → Tab でフォーカスしてから押します。クリックを渡していない（`tako mouse off`）・main screen の claude では会話の行にボタンを置かず、帯のキーで押します。どちらに出ているかは `tako show-command --list` の各カードの `owner.drawn_by`（`mod` / `tako`）で分かり、ペイン下の帯へ戻すなら `tako mod ui set cards.place tako` です。
 
 ```bash
 tako show-command "cargo test --workspace" --label "テストを流す"

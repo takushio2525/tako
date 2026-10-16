@@ -8219,6 +8219,16 @@ fn print_mod(args: &ModArgs, result: &Value) {
         println!(
             "カード: 置き場 {place}（mod が Claude Code の画面に描いたカードはペイン下のカード帯に出さない）"
         );
+        // #2159: 会話の行のカードをクリックで押せるか（押せなくても帯のキーで押せる）
+        match (
+            cards["click"].as_bool(),
+            cards["click_legacy"].as_bool() == Some(true),
+        ) {
+            (Some(true), _) => println!("  会話の行のカードの「実行」をクリック 1 回で押せる（全画面の claude）"),
+            (Some(false), true) => println!("  会話の行のカードにボタンを置かない（TAKO_2159_LEGACY）。帯の ctrl+x → Tab → キーで押す"),
+            (Some(false), false) => println!("  クリックを渡していないので、帯の ctrl+x → Tab → キーで押す（クリックで押すなら tako mouse on）"),
+            _ => {}
+        }
     }
     let percent = |v: &Value| v.as_f64().map_or("-".to_string(), |p| format!("{p:.0}%"));
     for row in result["panes"].as_array().into_iter().flatten() {

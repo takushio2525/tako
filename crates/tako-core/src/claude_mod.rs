@@ -101,6 +101,9 @@ pub const S7_LEGACY_ENV: &str = "TAKO_1877_S7_LEGACY";
 /// コマンドカードを mod で描く前（S7-4 #1963）へ戻す A/B の入口。応答の `view` に `cards` を載せない
 /// （mod はカードを描かない）・GPUI のカード帯は mod の報告を見ずに今のまま出す
 pub const CARDS_LEGACY_ENV: &str = "TAKO_1963_LEGACY";
+/// 会話の行のカードにクリックで押す「実行 / コピー」を置く前（#2159）へ戻す A/B の入口。応答の
+/// `view.cards.click` を常に偽にする（mod は会話の行にボタンを置かず、帯で押す案内だけを描く = #1963 の形）
+pub const CARD_CLICK_LEGACY_ENV: &str = "TAKO_2159_LEGACY";
 /// チャット風の描画を mod でする前（S7-6 #1964）へ戻す A/B の入口。応答の `view` に `chat` を載せない
 /// （mod はチャットを描かない）・GUI モードのチャット表示は mod の報告を見ずに GPUI のチャットビューのまま
 pub const CHAT_LEGACY_ENV: &str = "TAKO_1964_LEGACY";
@@ -452,6 +455,11 @@ pub fn s7_legacy() -> bool {
 /// S7-4 の A/B（[`CARDS_LEGACY_ENV`]）が立っているか
 pub fn cards_legacy() -> bool {
     std::env::var_os(CARDS_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// #2159 の A/B（[`CARD_CLICK_LEGACY_ENV`]）が立っているか
+pub fn card_click_legacy() -> bool {
+    std::env::var_os(CARD_CLICK_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
 /// S7-6 の A/B（[`CHAT_LEGACY_ENV`]）が立っているか
@@ -1674,6 +1682,9 @@ pub struct BandInput {
     pub cards: Vec<crate::CommandCard>,
     /// A/B の `TAKO_1963_LEGACY`（[`cards_legacy`]）
     pub cards_legacy: bool,
+    /// tako がこのペインの TUI へ左クリックを渡すか（#2159。`tako mouse` が on ∧ #1961 / #2159 の A/B で
+    /// ない。[`CardsView::click`] になる）
+    pub card_click: bool,
     /// tako の表示モードが GUI ライク表示か（`ui_mode = gui`。S7-6 #1964）
     pub ui_mode_gui: bool,
     /// A/B の `TAKO_1964_LEGACY`（[`chat_legacy`]）
@@ -1731,6 +1742,7 @@ pub fn band_view(input: BandInput) -> BandView {
         &input.cards,
         &input.ui,
         input.s7_legacy || input.cards_legacy,
+        input.card_click,
     );
     let chat = chat_view(
         &input.ui,
@@ -2001,6 +2013,10 @@ pub struct CardView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CardsView {
     pub hotkeys: CardHotkeys,
+    /// 会話の行のカードにクリックで押す「実行 / コピー」を置いてよいか（#2159）。tako がこのペインの TUI へ
+    /// 左クリックを渡すとき（`tako mouse` が on ∧ A/B でない）だけ真。mod はさらに全画面（`isFullscreen`）の
+    /// ときだけ置く（main screen はマウス報告を要求しない = 押せない）。偽なら帯で押す案内だけ（#1963 の形）
+    pub click: bool,
     /// 古い順（store の並び）。帯は新しいものから選ぶ
     pub items: Vec<CardView>,
 }
@@ -2056,6 +2072,7 @@ pub fn cards_view(
     cards: &[crate::CommandCard],
     ui: &crate::claude_mod_ui::UiConfig,
     legacy: bool,
+    click: bool,
 ) -> Option<CardsView> {
     if legacy || ui.cards.place == crate::claude_mod_ui::Place::Tako {
         return None;
@@ -2090,6 +2107,7 @@ pub fn cards_view(
         .collect();
     Some(CardsView {
         hotkeys: card_hotkeys(&ui.buttons),
+        click,
         items,
     })
 }
@@ -3882,6 +3900,46 @@ mod tests {
             ..input(Default::default(), false, false)
         });
         assert_eq!(empty.cards.map(|c| c.items.len()), Some(0));
+    }
+
+    /// #2159: view.cards.click は「tako がこのペインへクリックを渡すか」をそのまま運ぶ（mod は真のときだけ
+    /// 会話の行に「実行 / コピー」のボタンを置く）。カードを載せない置き場・A/B では cards ごと無い
+    #[test]
+    fn issue2159_view_cards_clickはクリックの転送をそのまま運ぶ() {
+        let pane = crate::Pane::new(crate::PaneOrigin::User).id();
+        let mut store = crate::CommandCards::new();
+        store.show(pane, &["npm test".to_string()], None).unwrap();
+        let cards: Vec<crate::CommandCard> = store.list(Some(pane)).into_iter().cloned().collect();
+        let input = |card_click: bool| BandInput {
+            pane: pane.as_u64(),
+            lang: "ja",
+            cards: cards.clone(),
+            card_click,
+            ..BandInput::default()
+        };
+        let on = band_view(input(true)).cards.expect("auto は載せる");
+        assert!(on.click);
+        let off = band_view(input(false))
+            .cards
+            .expect("クリックが届かなくても載せる");
+        assert!(
+            !off.click,
+            "クリックが届かない = 帯で押す案内だけ（#1963 の形）"
+        );
+        // JSON の形（mod の契約 = TakoCards.click）
+        let v = serde_json::to_value(&on).unwrap();
+        assert_eq!(v["click"], serde_json::json!(true));
+        // 既定の BandInput（呼び出し側が知らない = 古い経路）は押せない側
+        assert!(!BandInput::default().card_click);
+        // 置き場 tako では cards ごと載せない（click も無い）
+        let mut tako = crate::claude_mod_ui::UiConfig::default();
+        tako.cards.place = crate::claude_mod_ui::Place::Tako;
+        let v = serde_json::to_value(band_view(BandInput {
+            ui: tako,
+            ..input(true)
+        }))
+        .unwrap();
+        assert!(v.get("cards").is_none(), "{v}");
     }
 
     // --- #2017: 監視の走査を mod の報告で置き換える判断 ---------------------------
