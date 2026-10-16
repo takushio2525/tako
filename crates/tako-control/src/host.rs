@@ -1417,6 +1417,11 @@ pub trait SystemHost {
     fn persist_restore_report(&self) -> Option<String> {
         None
     }
+    /// 起動時の復元で、器（tmux セッション）が無いので刈り込んだペイン（#1858）。
+    /// 判断の正本は `crate::layout_reconcile::prune_dead_backends`
+    fn persist_restore_pruned(&self) -> Vec<crate::layout_reconcile::PrunedPane> {
+        Vec::new()
+    }
     /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
     fn recovered_sessions_count(&self) -> usize {
         0

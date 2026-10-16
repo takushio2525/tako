@@ -65,6 +65,8 @@ pub const LABEL_WEBVIEW: &str = "Web ビュー";
 pub const LABEL_HIDDEN: &str = "たまり場・退避";
 /// 同上（復元できなかったペインの件数）
 pub const LABEL_FAILED: &str = "復元失敗";
+/// 器（tmux セッション）が無いので復元より前に外したペインの件数（#1858）
+pub const LABEL_PRUNED: &str = "刈り込み";
 
 /// #1554 の A/B。`TAKO_1554_LEGACY=1` で修正前の挙動
 /// （1 行目は 4 カテゴリのみ = 合計が M と合わない・個別の失敗は残らない）
@@ -245,6 +247,10 @@ pub struct RestoreBreakdown {
     hidden_wakes: BTreeMap<&'static str, usize>,
     /// 失敗の理由の内訳。件数の合計が `復元失敗` の件数（別に持つと食い違う）
     failures: BTreeMap<&'static str, usize>,
+    /// 復元より前に刈り込んだペイン数と、空になって閉じたタブ数（#1858）。
+    /// **区間（`segments`）には入れない**: 刈り込んだペインは復元していないので
+    /// 「M ペインを余さず説明する」の M に含まれない（1 行目の括弧の外に添える）
+    pruned: (usize, usize),
 }
 
 impl RestoreBreakdown {
@@ -266,6 +272,7 @@ impl RestoreBreakdown {
             hidden: BTreeMap::new(),
             hidden_wakes: BTreeMap::new(),
             failures: BTreeMap::new(),
+            pruned: (0, 0),
         }
     }
 
@@ -296,6 +303,23 @@ impl RestoreBreakdown {
             PaneOutcome::Failed(reason) => {
                 *self.failures.entry(reason.label()).or_insert(0) += 1;
             }
+        }
+    }
+
+    /// 復元より前に刈り込んだペイン数と、空になって閉じたタブ数を載せる（#1858。
+    /// 判断の正本は `crate::layout_reconcile::prune_dead_backends`）
+    pub fn note_pruned(&mut self, panes: usize, closed_tabs: usize) {
+        self.pruned = (panes, closed_tabs);
+    }
+
+    /// 刈り込みの添え書き（1 行目・2 行目の共通部。0 件なら空）
+    fn pruned_note(&self) -> String {
+        match self.pruned {
+            (0, _) => String::new(),
+            (panes, 0) => format!("{LABEL_PRUNED} {panes}（tmux セッションが無い）"),
+            (panes, tabs) => format!(
+                "{LABEL_PRUNED} {panes}（tmux セッションが無い。空になったタブ {tabs} 枚を閉じた）"
+            ),
         }
     }
 
@@ -362,9 +386,15 @@ impl RestoreBreakdown {
             })
             .map(|(label, n)| format!("{label} {n}"))
             .collect();
+        let pruned = self.pruned_note();
         format!(
-            "復元成功: {tabs} タブ / {panes} ペイン（{}）",
-            inner.join(" / ")
+            "復元成功: {tabs} タブ / {panes} ペイン（{}）{}",
+            inner.join(" / "),
+            if pruned.is_empty() {
+                String::new()
+            } else {
+                format!("・{pruned}")
+            }
         )
     }
 
@@ -376,7 +406,7 @@ impl RestoreBreakdown {
         } else {
             (self.hidden(), self.failed())
         };
-        if self.resumed_total() + self.fresh_shells + hidden + failed == 0 {
+        if self.resumed_total() + self.fresh_shells + hidden + failed + self.pruned.0 == 0 {
             return None;
         }
         let (claude, claude_role) = self.resumed_of(Agent::Claude);
@@ -411,9 +441,16 @@ impl RestoreBreakdown {
                 join_counts(&self.failures)
             )
         };
+        // 刈り込み（#1858）は復元しなかったペインなので末尾へ別の区切りで添える
+        let pruned = self.pruned_note();
+        let pruned = if pruned.is_empty() {
+            pruned
+        } else {
+            format!(" / {pruned}")
+        };
         Some(format!(
             "復元の内訳: Claude resume {claude}（役割つき {claude_role} / 役割なし {}）\
-             {others} / 新規シェル {}{}{hidden}{failures}",
+             {others} / 新規シェル {}{}{hidden}{failures}{pruned}",
             claude - claude_role,
             self.fresh_shells,
             if reasons.is_empty() {
@@ -771,5 +808,37 @@ mod tests {
                  復元失敗 1（器も戻す手掛かりも無い退避を外した 1）"
             )
         );
+    }
+
+    /// #1858: 刈り込みは区間（M の合計）に入れず、1 行目の括弧の外と 2 行目の末尾に添える
+    #[test]
+    fn 刈り込みはmの外に添える() {
+        let mut b = RestoreBreakdown::with_legacy(false);
+        b.record(PaneOutcome::Reattached);
+        b.note_pruned(3, 1);
+        assert_eq!(b.total(), 1, "刈り込んだペインを M の内訳に数えない");
+        assert_eq!(b.mismatch(1), None);
+        assert_eq!(
+            b.summary(1, 1),
+            "復元成功: 1 タブ / 1 ペイン（tmux 再 attach 1 / Claude resume 0 / \
+             新規シェル 0 / プレビュー 0 / Web ビュー 0 / たまり場・退避 0 / 復元失敗 0）・\
+             刈り込み 3（tmux セッションが無い。空になったタブ 1 枚を閉じた）"
+        );
+        // 再 attach だけの起動でも、刈り込みがあれば 2 行目を出す
+        assert_eq!(
+            b.detail().as_deref(),
+            Some(
+                "復元の内訳: Claude resume 0（役割つき 0 / 役割なし 0） / 新規シェル 0 / \
+                 刈り込み 3（tmux セッションが無い。空になったタブ 1 枚を閉じた）"
+            )
+        );
+        // 閉じたタブが無ければタブの件数は書かない・0 件なら何も足さない
+        b.note_pruned(2, 0);
+        assert!(b
+            .summary(1, 1)
+            .ends_with("・刈り込み 2（tmux セッションが無い）"));
+        b.note_pruned(0, 0);
+        assert!(!b.summary(1, 1).contains(LABEL_PRUNED));
+        assert_eq!(b.detail(), None);
     }
 }

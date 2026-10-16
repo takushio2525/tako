@@ -1490,6 +1490,13 @@ fn backup_if_lossy(path: &Path, next: &LayoutFile, min_interval: Duration) {
     }
 }
 
+/// 世代バックアップを回さずに `path` へ書く（tmp + rename）。`tako recover --apply` が
+/// 合流した layout を書く口（#1858）。復旧は「世代を layout.json へ戻す」操作なので、
+/// [`save`] の喪失前バックアップを回すと戻した先の世代を自分で押し出してしまう
+pub fn write_file(path: &Path, layout: &LayoutFile) -> io::Result<()> {
+    save_to(path, layout)
+}
+
 fn save_to(path: &Path, layout: &LayoutFile) -> io::Result<()> {
     let dir = path
         .parent()

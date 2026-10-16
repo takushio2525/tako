@@ -6574,6 +6574,9 @@ fn dispatch_inner(
                     .map(|p| p.is_file())
                     .unwrap_or(false),
                 "last_restore": host.persist_restore_report(),
+                // 起動時の復元で器（tmux セッション）が無いので刈り込んだペイン（#1858）。
+                // 件数は last_restore の行にも載る。会話の記録があれば `conversation` に系統名
+                "restore_pruned": host.persist_restore_pruned(),
                 // 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
                 "recovered_count": host.recovered_sessions_count(),
                 // 保存の内訳（#1425）: calls / skipped（変化検出で省いた）/

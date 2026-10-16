@@ -57,6 +57,7 @@ pub mod host;
 pub mod ipc;
 pub mod launch_cmd;
 pub mod layout;
+pub mod layout_reconcile;
 pub mod limit_stop;
 pub mod lsp;
 pub mod mcp;
