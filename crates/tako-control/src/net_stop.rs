@@ -19,6 +19,19 @@
 //! - 最後の項目が人の発言（`❯ 続き`）= もう誰かが送った
 //! - 最後のターンにログイン失効（#757）・使用制限（#813）・利用阻害（#1106）の行がある
 //! - 入力欄が見えない（選択ダイアログ・メニュー。[`NetScreen::Dialog`] で返す）
+//!
+//! 前の 2 つは「会話が先へ進んだ」とはっきり言える画面なので [`NetScreen::Progressed`] で返す
+//! （前に送った停止は片付いた = 次に見える停止は、鍵が同じでも新しい停止。#2157）。
+//!
+//! # ターンの締めの後の通知行（#2157）
+//!
+//! claude はターンの外の出来事（plugin / hooks の再読み込み等）を `⏺` の項目として会話の末尾へ
+//! 足す（`⏺ tako: plugin.json changed — reloaded …`）。実際にエラーの 0.2 秒後に出て、最後の項目が
+//! 通知になったペインを取りこぼした。ターンの締めの行（`✻ Cooked for 31m 35s · done 9:20 AM`）より
+//! 下が `⏺` の項目だけなら、それはターンの外の通知なので読み飛ばし、締めの行の上の項目を見る。
+//! 人の発言（`❯`）・ツールの結果（`⎿`）が混ざれば会話が進んでいるので読み飛ばさない。
+//! 新しいターンは必ず締めの行で終わるか、生成中（中断の案内）なので、締めの行の無いまま
+//! assistant の発言が残ることはない
 
 use std::time::{Duration, Instant};
 
@@ -44,15 +57,37 @@ pub enum NetScreen {
     Stopped(NetStop),
     /// 接続系のエラーが見えるが、入力欄の代わりに選択ダイアログ・メニューが出ている（送らない）
     Dialog(NetStop),
-    /// 該当しない
+    /// 会話が先へ進んでいる（最後の項目が人の発言・生成中 / 再試行中）。送らないことは
+    /// `Clear` と同じで、加えて「前の停止は片付いた」と言える（#2157）
+    Progressed,
+    /// 該当しない（読めない・接続系でない停止を含む）
     Clear,
 }
 
 /// 会話の項目の頭（claude の発言 = `⏺`（Windows は `●`）・ツールの結果 = `⎿`・人の発言 = `❯`）
 const ENTRY_MARKS: [char; 4] = ['⏺', '●', '⎿', '❯'];
 
+/// claude の発言の頭（ターンの外の通知もこの記号で出る）
+const SAY_MARKS: [char; 2] = ['⏺', '●'];
+
+/// ターンの締めの行の頭の記号（claude のスピナーの字形。Windows の版は `*` / `·`）
+const CLOSING_GLYPHS: [char; 7] = ['✻', '✶', '✳', '✢', '✽', '*', '·'];
+
+/// #2157 の A/B。`TAKO_2157_LEGACY=1` で #2157 **前**の判定へ戻す
+/// （ターンの締めの後の通知行を読み飛ばさない・中断の案内を末尾の窓の全体で探す・
+/// 会話が進んだと言わない = 前に送った停止と同じ形の次の停止を「同じ停止」とみなす）。
+/// 2 秒 tick から引かれるので env はプロセスで 1 回だけ読む
+pub fn legacy_2157() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2157_LEGACY").is_ok_and(|v| v == "1"))
+}
+
 /// 画面（上から順の行）を判定する
 pub fn detect(lines: &[String]) -> NetScreen {
+    detect_with(lines, legacy_2157())
+}
+
+fn detect_with(lines: &[String], legacy: bool) -> NetScreen {
     let Some(input) = input_box(lines) else {
         // 入力欄が無い。選択ダイアログの裏に接続エラーが見えていれば「ダイアログ中」と返す
         // （見送りの理由を状態に出すため）。送らないことは Clear と同じ
@@ -76,19 +111,40 @@ pub fn detect(lines: &[String]) -> NetScreen {
         return NetScreen::Clear;
     };
     // 生成中・再試行中（`Retrying in 3s · attempt 3/4` の行には中断の案内が付く）
-    if crate::claude_tui::interrupt_hint_visible(lines) {
+    if legacy && crate::claude_tui::interrupt_hint_visible(lines) {
         return NetScreen::Clear;
     }
     // 入力欄の上の区切り線（input - 1）より上で、最後の会話の項目を探す
     let top = input - 1;
-    let Some(entry) = (0..top).rev().find(|&i| is_entry(&lines[i])) else {
+    let Some(last) = (0..top).rev().find(|&i| is_entry(&lines[i])) else {
         return NetScreen::Clear;
     };
-    if lines[entry].trim_start().starts_with('❯') {
-        return NetScreen::Clear; // 人の発言が最後 = もう送られている
+    // 中断の案内は最後の項目から下（スピナーの行・フッター）でだけ探す。会話の本文
+    // （ツールの結果に写った `esc to interrupt` 等）を理由に止まった画面を見落とさない（#2157）
+    if !legacy && crate::claude_tui::interrupt_hint_visible(&lines[last..]) {
+        return NetScreen::Progressed;
     }
-    let message = join_entry(&lines[entry..top]);
-    let Some(kind) = connection_error_kind(&message) else {
+    if lines[last].trim_start().starts_with('❯') {
+        // 人の発言が最後 = もう送られている
+        return if legacy {
+            NetScreen::Clear
+        } else {
+            NetScreen::Progressed
+        };
+    }
+    let mut entry = last;
+    let mut message = join_entry(&lines[last..top]);
+    let mut kind = connection_error_kind(&message);
+    // 最後の項目がターンの外の通知なら、締めの行の上の項目を見る（#2157）
+    if kind.is_none() && !legacy {
+        if let Some(e) = entry_before_notices(lines, top) {
+            let m = join_entry(&lines[e..top]);
+            if let Some(k) = connection_error_kind(&m) {
+                (entry, message, kind) = (e, m, Some(k));
+            }
+        }
+    }
+    let Some(kind) = kind else {
         return NetScreen::Clear;
     };
     // 最後のターン（直前の人の発言から入力欄まで）に、回線では直らない停止の行が無いか
@@ -118,6 +174,52 @@ fn closing_line(after_entry: &[String]) -> Option<&str> {
         .find(|t| !t.is_empty())?;
     let glyph = line.chars().next().is_some_and(|c| !c.is_alphanumeric());
     (glyph && line.contains(" for ") && line.chars().any(|c| c.is_ascii_digit())).then_some(line)
+}
+
+/// ターンの締めの行（`✻ Cooked for 31m 35s · done 9:20 AM` / `✻ Worked for 0s · done 6:55 PM`）か。
+/// スピナーの記号 1 字・動詞 1 語・`for`・数字で始まる経過時間、の並びだけを採る
+/// （`⏺ Waited for 5s` のような発言・箇条書きの本文を締めと取り違えない）
+fn is_turn_closing(t: &str) -> bool {
+    let mut w = t.split_whitespace();
+    let (Some(glyph), Some(verb), Some(word), Some(took)) =
+        (w.next(), w.next(), w.next(), w.next())
+    else {
+        return false;
+    };
+    let mut g = glyph.chars();
+    g.next().is_some_and(|c| CLOSING_GLYPHS.contains(&c))
+        && g.next().is_none()
+        && verb.chars().all(char::is_alphabetic)
+        && word == "for"
+        && took.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// 入力欄の上（`top` より上）が「…項目 / ターンの締めの行 / claude の記号の項目（通知）だけ」の
+/// 形なら、締めの行の上の最後の項目の位置を返す（#2157）。締めの行より下に人の発言・
+/// ツールの結果がある・締めの行が無い・締めの行の下に何も無いなら None
+fn entry_before_notices(lines: &[String], top: usize) -> Option<usize> {
+    let mut notices = 0usize;
+    for i in (0..top).rev() {
+        let t = lines[i].trim();
+        if t.is_empty() {
+            continue;
+        }
+        if is_turn_closing(t) {
+            if notices == 0 {
+                return None;
+            }
+            let entry = (0..i).rev().find(|&j| is_entry(&lines[j]))?;
+            return (!lines[entry].trim_start().starts_with('❯')).then_some(entry);
+        }
+        if is_entry(&lines[i]) {
+            if !t.starts_with(SAY_MARKS) {
+                return None;
+            }
+            notices += 1;
+        }
+        // それ以外は項目の続きの行（折り返し）
+    }
+    None
 }
 
 fn stop_key(echo: Option<&str>, message: &str, closing: Option<&str>) -> u64 {
@@ -344,13 +446,20 @@ mod tests {
 
     #[test]
     fn issue2112_再試行中_人の発言の後_下書きの画面は止まっていない() {
-        assert_eq!(detect(&lines(RETRYING_100)), NetScreen::Clear);
+        // #2157 から「止まっていない」のうち会話が進んだとはっきり言える画面は Progressed
+        // （送らないことは Clear と同じ。旧判定では Clear）
+        assert_eq!(
+            detect_with(&lines(RETRYING_100), false),
+            NetScreen::Progressed
+        );
+        assert_eq!(detect_with(&lines(RETRYING_100), true), NetScreen::Clear);
         // 「続き」を送った直後（人の発言が最後の項目）
         let sent = ENOTFOUND_100.replace(
             "✻ Worked for 0s · done 6:55 PM",
             "✻ Worked for 0s · done 6:55 PM\n\n❯ つづき",
         );
-        assert_eq!(detect(&lines(&sent)), NetScreen::Clear);
+        assert_eq!(detect_with(&lines(&sent), false), NetScreen::Progressed);
+        assert_eq!(detect_with(&lines(&sent), true), NetScreen::Clear);
         // 入力欄に人の文字がある画面も「止まっている」とは言う（見送りは駆動側の
         // 下書き判定 = 文字の dim 属性で決める。文字列だけではプレースホルダと区別できない）
         let draft = ENOTFOUND_100.replace("❯ \n", "❯ つづき\n");
@@ -459,6 +568,163 @@ mod tests {
         assert!(!needs_full_screen(&lines(
             "⏺ 作業中\n\n✻ Thinking… (esc to interrupt)"
         )));
+    }
+
+    /// 60 桁の区切り線と入力欄・フッター（#2157 の実画面の幅）
+    fn footer60() -> String {
+        let rule = "─".repeat(60);
+        format!("{rule}\n❯ \n{rule}\n  ⏵⏵ auto mode on (shift+tab to cycle)")
+    }
+
+    /// pane 2670 で取りこぼした実画面（2026-10-16 09:20 JST。60 桁・claude 2.1.294）。
+    /// 会話記録では API エラーの 0.2 秒後に `system informational`（level=notice）の
+    /// `tako: plugin.json changed — reloaded` が足され、最初の 2 秒 tick の時点で最後の項目は
+    /// もう通知だった。直前の人の発言は架空の文へ置き換えた
+    fn screen_2670(notices: &str) -> String {
+        format!(
+            "❯ 実装を続けて\n\n\
+             ⏺ API Error: Can't reach the API server — check your\n  internet or DNS (ENOTFOUND)\n\n\
+             ✻ Cooked for 31m 35s · done 9:20 AM\n\n\
+             {notices}{}",
+            footer60()
+        )
+    }
+
+    const NOTICE_PLUGIN: &str = "⏺ tako: plugin.json changed — reloaded (modules:\n  hooks/register.ts unchanged; 14 hooks: …)\n";
+    const NOTICE_HOOKS: &str = "⏺ tako: hooks.json changed — reloaded (modules:\n  hooks/register.ts unchanged; 14 hooks: …)\n";
+
+    #[test]
+    fn issue2157_締めの後の通知行を読み飛ばして接続エラーの停止と見分ける() {
+        let screen = screen_2670(&format!("{NOTICE_PLUGIN}\n"));
+        let NetScreen::Stopped(s) = detect_with(&lines(&screen), false) else {
+            panic!("通知行が挟まった実画面を止まっていると読めない");
+        };
+        assert_eq!(s.kind, ConnErrorKind::Dns);
+        assert_eq!(
+            s.message,
+            "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+        );
+        // 旧判定（#2157 前）はこの画面を読めなかった = 取りこぼしの原因
+        assert_eq!(detect_with(&lines(&screen), true), NetScreen::Clear);
+        // 通知が出る前と後で同じ停止（同じ鍵）。出る前に見ていても 2 回目の停止と取り違えない
+        let before = screen_2670("");
+        let NetScreen::Stopped(b) = detect_with(&lines(&before), false) else {
+            panic!("通知が出る前の画面");
+        };
+        assert_eq!(b.key, s.key);
+        // 通知が 2 つ（plugin.json と hooks.json）・空行なしで続いても同じ
+        let two = screen_2670(&format!("{NOTICE_PLUGIN}\n{NOTICE_HOOKS}"));
+        assert!(matches!(
+            detect_with(&lines(&two), false),
+            NetScreen::Stopped(t) if t.key == s.key
+        ));
+    }
+
+    /// 本当に会話が先へ進んだ画面・締めの行で区切れない画面は、通知行の読み飛ばしの対象にしない
+    #[test]
+    fn issue2157_会話が進んだ画面は通知と取り違えない() {
+        let reply = "❯ つづき\n\n⏺ 続けます。\n\n✻ Worked for 12s · done 9:41 AM\n\n";
+        let cases: [(&str, String, NetScreen); 6] = [
+            // エラーの後に人の発言と assistant の発言（新しいターンの締めの後に通知）
+            (
+                "人の発言と返答の後の通知",
+                screen_2670(&format!("{reply}{NOTICE_PLUGIN}")),
+                NetScreen::Clear,
+            ),
+            // 締めの後にツールの呼び出しと結果（新しいターンの途中・締めがまだ無い）
+            (
+                "締めの後のツールの結果",
+                screen_2670("⏺ Bash(ls)\n  ⎿  a.txt\n"),
+                NetScreen::Clear,
+            ),
+            // 通知の後で生成中（中断の案内）
+            (
+                "通知の後で生成中",
+                screen_2670(&format!(
+                    "{NOTICE_PLUGIN}\n✻ Thinking… (esc to interrupt)\n\n"
+                )),
+                NetScreen::Progressed,
+            ),
+            // 通知の後に人の発言（送信済み）
+            (
+                "通知の後に人の発言",
+                screen_2670(&format!("{NOTICE_PLUGIN}\n❯ つづき\n\n")),
+                NetScreen::Progressed,
+            ),
+            // 締めの後の項目が回線では直らない停止（ログイン失効）
+            (
+                "締めの後のログイン失効",
+                screen_2670("⏺ Login expired · Please run /login\n"),
+                NetScreen::Clear,
+            ),
+            // 発言の本文が「記号 動詞 for 数字」の形（締めの行と取り違えない）
+            (
+                "締めに似た発言",
+                "❯ 実装を続けて\n\n⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)\n\n⏺ Waited for 5s before retrying\n\n⏺ 待ちます\n"
+                    .to_string()
+                    + &footer60(),
+                NetScreen::Clear,
+            ),
+        ];
+        for (name, screen, want) in cases {
+            assert_eq!(detect_with(&lines(&screen), false), want, "{name}");
+        }
+        // 締めの行が無いまま通知（エラーとの間に締めが無い）は読み飛ばさない（安全側）
+        let no_closing = format!(
+            "❯ 実装を続けて\n\n⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)\n\n{NOTICE_PLUGIN}{}",
+            footer60()
+        );
+        assert_eq!(detect_with(&lines(&no_closing), false), NetScreen::Clear);
+    }
+
+    /// 中断の案内は最後の項目から下でだけ探す。会話の本文（ツールの結果に写った文言）で
+    /// 止まった画面を見落とさない
+    #[test]
+    fn issue2157_本文に写った中断の案内では止まった画面を見落とさない() {
+        let screen = format!(
+            "❯ 判定を読んで\n\n⏺ Read(claude_tui.rs)\n  ⎿  l.contains(\"esc to interrupt\") || l.contains(\"Generating\")\n\n\
+             ⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)\n\n\
+             ✻ Worked for 3m 2s · done 9:41 AM\n\n{}",
+            footer60()
+        );
+        assert!(matches!(
+            detect_with(&lines(&screen), false),
+            NetScreen::Stopped(_)
+        ));
+        assert_eq!(detect_with(&lines(&screen), true), NetScreen::Clear);
+        // スピナーの行・フッターにあれば従来どおり生成中
+        let generating = screen.replace(
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
+        );
+        assert_eq!(
+            detect_with(&lines(&generating), false),
+            NetScreen::Progressed
+        );
+    }
+
+    #[test]
+    fn issue2157_締めの行の形() {
+        for t in [
+            "✻ Cooked for 31m 35s · done 9:20 AM",
+            "✻ Worked for 0s · done 6:55 PM",
+            "✻ Crunched for 0s · done 7:09 PM",
+            "✻ Sautéed for 2m 1s",
+            "* Worked for 4s",
+        ] {
+            assert!(is_turn_closing(t), "{t}");
+        }
+        for t in [
+            "⏺ Waited for 5s",
+            "✻ Thinking… (esc to interrupt)",
+            "- Worked for 4s",
+            "✻ Worked for long",
+            "✻✻ Worked for 4s",
+            "✻ Worked",
+            "",
+        ] {
+            assert!(!is_turn_closing(t), "{t}");
+        }
     }
 
     #[test]

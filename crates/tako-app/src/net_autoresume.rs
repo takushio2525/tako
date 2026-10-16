@@ -85,9 +85,11 @@ pub(crate) struct NetResumeState {
     probe: ProbeState,
     /// ペインごとの再開の時刻（打ち切りの判断。エピソードをまたいで持つ）
     resumes: HashMap<PaneId, Vec<i64>>,
-    /// ペインごとの最後に送った停止の鍵。追跡が途切れても（ペインを上へスクロールして
-    /// 入力欄が画面外へ出た等）、同じ停止を見つけ直して 2 回送らないために持つ
-    sent_keys: HashMap<PaneId, u64>,
+    /// ペインごとの最後に送った停止の鍵と送った瞬間。追跡が途切れても（ペインを上へスクロールして
+    /// 入力欄が画面外へ出た等）、同じ停止を見つけ直して 2 回送らないために持つ。
+    /// 会話が先へ進んだのを見た・送達が届いたと決着したら捨てる（#2157。その後に同じ形の
+    /// 停止が見えても、それは次の停止）
+    sent_keys: HashMap<PaneId, (u64, Instant)>,
     /// 直近の再開の回（応答に出す）
     last_round: Option<serde_json::Value>,
     total_resumed: u64,
@@ -146,18 +148,46 @@ impl TakoApp {
             .sent_keys
             .retain(|id, _| targets.iter().any(|(t, _)| t == id));
 
+        let legacy = tako_control::net_stop::legacy_2157();
         let mut ready = 0usize;
         for (pane, shelved) in targets {
-            let Some(screen) = self.observe_net_stop(pane) else {
-                self.net_resume.trackers.remove(&pane);
-                continue;
+            let (stop, dialog) = match self.read_net_screen(pane) {
+                NetScreen::Stopped(s) => (s, false),
+                NetScreen::Dialog(s) => (s, true),
+                NetScreen::Progressed => {
+                    // 会話が先へ進んだ = 前に送った停止は片付いた。この後に同じ形の停止が
+                    // 見えても、それは次の停止（#2157）
+                    self.net_resume.trackers.remove(&pane);
+                    if !legacy {
+                        self.net_resume.sent_keys.remove(&pane);
+                    }
+                    continue;
+                }
+                NetScreen::Clear => {
+                    self.net_resume.trackers.remove(&pane);
+                    continue;
+                }
             };
-            let (stop, dialog) = screen;
+            // 送った停止と同じ形でも、送達が届いたと決着した後に見えたものは次の停止（#2157）。
+            // 「続き」を受けてすぐ同じ形で止まり直すと、2 秒 tick は進んだ画面を見ないまま
+            // 同じ鍵へ戻る（直前の人の発言 = 同じ「続き」・締めの行は分の精度）
+            if !legacy && self.answered_since_sent(pane) {
+                self.net_resume.sent_keys.remove(&pane);
+                if self
+                    .net_resume
+                    .trackers
+                    .get(&pane)
+                    .is_some_and(|t| t.sent_at.is_some())
+                {
+                    self.net_resume.trackers.remove(&pane);
+                }
+            }
             let tracker = match self.net_resume.trackers.get_mut(&pane) {
                 Some(t) if t.key == stop.key => t,
                 _ => {
                     // 新しい停止。ただし前に送った停止を見つけ直しただけなら送らない
-                    let already = self.net_resume.sent_keys.get(&pane) == Some(&stop.key);
+                    let already =
+                        self.net_resume.sent_keys.get(&pane).map(|(k, _)| *k) == Some(stop.key);
                     if !already {
                         tako_control::diag::persist_log(&format!(
                             "[net-resume] pane={} 接続エラーで停止 kind={} shelved={shelved}",
@@ -203,9 +233,11 @@ impl TakoApp {
         self.maybe_start_net_probe(ready);
     }
 
-    /// 画面を読んで停止を切り出す。(停止, ダイアログ中か)。止まっていなければ None
-    fn observe_net_stop(&self, pane: PaneId) -> Option<(NetStop, bool)> {
-        let session = self.terminals.get(&pane)?;
+    /// 画面を読んで判定する（ペインの画面が無ければ Clear）
+    fn read_net_screen(&self, pane: PaneId) -> NetScreen {
+        let Some(session) = self.terminals.get(&pane) else {
+            return NetScreen::Clear;
+        };
         // 普段は画面末尾だけ。入力欄の上に会話の項目が見えないときだけ全体を読む
         let tail = session.tail_lines(tako_core::terminal::AGENT_TUI_TAIL_LINES);
         let lines = if tako_control::net_stop::needs_full_screen(&tail) {
@@ -213,11 +245,32 @@ impl TakoApp {
         } else {
             tail
         };
-        match tako_control::net_stop::detect(&lines) {
+        tako_control::net_stop::detect(&lines)
+    }
+
+    /// 画面を読んで停止を切り出す。(停止, ダイアログ中か)。止まっていなければ None
+    fn observe_net_stop(&self, pane: PaneId) -> Option<(NetStop, bool)> {
+        match self.read_net_screen(pane) {
             NetScreen::Stopped(s) => Some((s, false)),
             NetScreen::Dialog(s) => Some((s, true)),
-            NetScreen::Clear => None,
+            NetScreen::Progressed | NetScreen::Clear => None,
         }
+    }
+
+    /// このペインへ最後に「続き」を送った後で、送達が「届いた」と決着したか（#2157）。
+    /// tako の「続き」でも人の送信でも、届いたなら送った停止は片付いている。
+    /// 送達が走っているあいだ（後続のフローが残っている）はまだ決着していない
+    fn answered_since_sent(&self, pane: PaneId) -> bool {
+        let Some((_, sent)) = self.net_resume.sent_keys.get(&pane) else {
+            return false;
+        };
+        !self.prompt_flows.iter().any(|f| f.pane == pane)
+            && self
+                .prompt_delivery_states
+                .get(&pane)
+                .is_some_and(|(status, at)| {
+                    status.state == tako_core::prompt_delivery::State::Delivered && at > sent
+                })
     }
 
     /// 送ってよいかを判断する（材料はその場で取る = 送る直前にも同じ判断を通す）
@@ -399,7 +452,9 @@ impl TakoApp {
                     if let Some(t) = self.net_resume.trackers.get_mut(&pane) {
                         t.sent_at = Some(now);
                         t.hold = Some(Hold::AlreadyResumed);
-                        self.net_resume.sent_keys.insert(pane, t.key);
+                        self.net_resume
+                            .sent_keys
+                            .insert(pane, (t.key, Instant::now()));
                     }
                     self.net_resume.resumes.entry(pane).or_default().push(now);
                     self.net_resume.total_resumed += 1;
