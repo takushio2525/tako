@@ -1,7 +1,8 @@
 //! 「読めなければ既定値へ落とす」データファイルを既定の置き場から読む口（#1824）
 //!
 //! `recent.json` / `remote/shortcuts.json` の読み手は tako-core にあり、壊れた中身は
-//! `migration::quarantine_unreadable` で退避するが、診断ログ（persist.log）へは書けない。
+//! `migration::quarantine_unreadable` で退避する（文字として読めない中身はバイトのまま
+//! `migration::quarantine_raw` へ。#2231）が、診断ログ（persist.log）へは書けない。
 //! 以前は 1 回目の破損でも何も残らず、「いつ壊れていたか」を後から追えなかった。
 //! ここが core の読み手から理由（[`LoadIssue`]）を受け取り、**移行の記録と同じ形の 1 行**
 //! （`移行できず: <種別> <パス>（理由・退避先・発生源 load）`）で残す。
@@ -11,7 +12,9 @@
 //! - 退避が今回新しく写した = この中身を初めて見た → 書く
 //! - 同じ中身の退避が既にあった（起動時の移行か前の読み込みが写して記録した）→ 書かない。
 //!   CLI は呼ぶたびに別プロセスなので、プロセス内の重複除けだけでは毎回 1 行増える
-//! - 退避できなかった・読めなかった（権限・UTF-8 でない）→ プロセス内で同じ中身 / 理由につき 1 回
+//! - 読めなかった（権限・UTF-8 でない）中身をバイトのまま移した → 移した回ごとに書く
+//!   （元は表から外れるので、同じ中身を読み直すことはない。#2231）
+//! - 退避できなかった・移せなかった → プロセス内で同じ中身 / 理由につき 1 回
 //! - 読めた（直った）→ 忘れる（同じ中身でまた壊れたら、それも記録する）
 //!
 //! **ファイルの中身は載せない**（AGENTS.md の絶対ルール）。載るのはパスと serde の理由
@@ -111,7 +114,26 @@ fn report_line(
                 ORIGIN,
             ))
         }
-        LoadIssue::ReadFailed { reason } => seen
+        // バイトのまま移した（#2231）。移した回ごとに 1 行（元は表から外れているので、
+        // 中身で重複を除く必要が無い。同じバイト列の退避が既にあった回は書かない）
+        LoadIssue::ReadFailed {
+            reason,
+            quarantine: Some(q),
+        } => q.copied.then(|| {
+            crate::migrations::unreadable_line(
+                id,
+                path,
+                reason,
+                Some(&q.path),
+                q.evicted,
+                "退避できず",
+                ORIGIN,
+            )
+        }),
+        LoadIssue::ReadFailed {
+            reason,
+            quarantine: None,
+        } => seen
             .first_sighting(path, reason)
             .then(|| crate::migrations::aborted_line(id, path, reason, ORIGIN)),
     }
@@ -194,21 +216,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 読めない（権限・UTF-8 でない）は「移行を中止」と同じ形で、理由ごとに 1 回
+    /// UTF-8 でない中身はバイトのまま退避へ移り、「移行できず」の形で退避先を残す（#2231）。
+    /// 移した回ごとに 1 行・同じバイト列の退避が既にあれば書かない
     #[test]
-    fn 読めないファイルは中止の形で一度() {
+    fn 読めない中身はバイトのまま移して退避先を記録する() {
         let dir = tmp("readfail");
         let path = dir.join("recent.json");
-        std::fs::write(&path, [0xff_u8, 0xfe, b'{']).expect("書ける");
+        let body = [0xff_u8, 0xfe, b'{'];
+        std::fs::write(&path, body).expect("書ける");
         let (list, issue) = RecentList::load_from_checked(&path);
         assert!(list.entries.is_empty());
         assert!(
-            matches!(issue, Some(LoadIssue::ReadFailed { .. })),
+            matches!(
+                issue,
+                Some(LoadIssue::ReadFailed {
+                    quarantine: Some(_),
+                    ..
+                })
+            ),
             "{issue:?}"
         );
+        assert!(!path.exists(), "表から外す");
+        let slot = tako_core::migration::quarantine_path(&path);
+        assert_eq!(std::fs::read(&slot).expect("読める"), body, "バイト一致");
         let seen = UnreadableSeen::new();
+        let line = report_line(SchemaId::Recent, &path, issue.as_ref(), &seen)
+            .expect("移した回は記録する");
+        assert!(
+            line.starts_with(&format!(
+                "移行できず: recent {}（読み取りに失敗: ",
+                path.display()
+            )),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("・退避 {}・発生源 load）", slot.display())),
+            "{line}"
+        );
+        // 移したあとは不在 = 記録しない
+        let (_, absent) = RecentList::load_from_checked(&path);
+        assert_eq!(
+            report_line(SchemaId::Recent, &path, absent.as_ref(), &seen),
+            None
+        );
+        // 同じバイト列でまた壊れた = 退避は積まず、記録もしない
+        std::fs::write(&path, body).expect("書ける");
+        let (_, again) = RecentList::load_from_checked(&path);
+        assert_eq!(
+            report_line(SchemaId::Recent, &path, again.as_ref(), &seen),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 移せなかった（読めない・置き場が無い）は「移行を中止」と同じ形で、理由ごとに 1 回
+    #[test]
+    fn 移せないときは中止の形で一度() {
+        let dir = tmp("readfail-stay");
+        let path = dir.join("recent.json");
+        let seen = UnreadableSeen::new();
+        let issue = LoadIssue::ReadFailed {
+            reason: "読み取りに失敗: stream did not contain valid UTF-8".into(),
+            quarantine: None,
+        };
         let line =
-            report_line(SchemaId::Recent, &path, issue.as_ref(), &seen).expect("1 回目は記録する");
+            report_line(SchemaId::Recent, &path, Some(&issue), &seen).expect("1 回目は記録する");
         assert!(
             line.starts_with(&format!(
                 "移行を中止: recent {}（読み取りに失敗: ",
@@ -217,7 +289,7 @@ mod tests {
             "{line}"
         );
         assert_eq!(
-            report_line(SchemaId::Recent, &path, issue.as_ref(), &seen),
+            report_line(SchemaId::Recent, &path, Some(&issue), &seen),
             None
         );
         let _ = std::fs::remove_dir_all(&dir);

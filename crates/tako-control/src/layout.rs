@@ -1463,7 +1463,9 @@ pub struct Stashed {
 /// 1. 中身を番号付きの退避（`layout.json.unreadable[.<n>].bak`）へ写す。同じ中身の退避が
 ///    既にあれば写さない（壊れたまま何度起動しても本数が増えない）
 /// 2. 1 が写せない（UTF-8 でない・権限で読めない・空きはあるのに書けない）中身は、**バイトのまま**
-///    空いている番号へ rename する。捨てると次の保存（tmp → rename）がその中身を消す
+///    退避へ移す（`migration::quarantine_raw`。recent.json / remote/shortcuts.json の読み手と同じ
+///    1 実装 = #2231。満杯なら 1 本目を残して 2 本目を押し出す）。捨てると次の保存
+///    （tmp → rename）がその中身を消す
 /// 3. 残せたら layout.json を表から外す（従来の rename と同じく、次の起動で同じ破損を読み直さない）
 ///
 /// どれも残せなければ何もしない（layout.json はそのまま = 消える経路を作らない）
@@ -1487,12 +1489,9 @@ pub fn stash_unrestorable(path: &Path) -> Option<Stashed> {
             evicted: q.evicted,
         });
     }
-    let free = (1..=tako_core::migration::QUARANTINE_LIMIT)
-        .map(|n| tako_core::migration::quarantine_slot_path(path, n))
-        .find(|slot| std::fs::symlink_metadata(slot).is_err())?;
-    std::fs::rename(path, &free).ok().map(|()| Stashed {
-        path: free,
-        evicted: false,
+    tako_core::migration::quarantine_raw(path).map(|q| Stashed {
+        path: q.path,
+        evicted: q.evicted,
     })
 }
 
@@ -2984,12 +2983,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// どこにも残せないときは layout.json に触らない（消える経路を作らない）
+    /// 退避が読めない中身で満杯でも、1 本目を残して 2 本目を押し出し、今回の中身を末尾へ移す
+    /// （#2231。以前は layout.json を置いたままにしていたので、次の保存の rename が消していた）
     #[test]
-    fn 残せないときは触らない() {
+    fn 満杯なら2本目を押し出して移す() {
         let dir = stash_dir("full");
         let path = dir.join("layout.json");
-        for n in 1..=tako_core::migration::QUARANTINE_LIMIT {
+        let limit = tako_core::migration::QUARANTINE_LIMIT;
+        for n in 1..=limit {
             std::fs::write(
                 tako_core::migration::quarantine_slot_path(&path, n),
                 [0xff_u8, n as u8],
@@ -2998,9 +2999,42 @@ mod tests {
         }
         let bytes = [0xff_u8, 0xee];
         std::fs::write(&path, bytes).unwrap();
-        assert_eq!(stash_unrestorable(&path), None);
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "元のまま");
+        let stashed = stash_unrestorable(&path).expect("押し出して移す");
+        assert!(stashed.evicted);
+        assert_eq!(
+            stashed.path,
+            tako_core::migration::quarantine_slot_path(&path, limit)
+        );
+        assert_eq!(std::fs::read(&stashed.path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(tako_core::migration::quarantine_slot_path(&path, 1)).unwrap(),
+            [0xff_u8, 1],
+            "1 本目は動かさない"
+        );
+        assert!(!path.exists());
         assert_eq!(stash_unrestorable(&dir.join("absent.json")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// どこにも残せない（置き場へ書けない）ときは layout.json に触らない（消える経路を作らない）
+    #[cfg(unix)]
+    #[test]
+    fn 残せないときは触らない() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = stash_dir("readonly");
+        let path = dir.join("layout.json");
+        let bytes = [0xff_u8, 0xee];
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // root で走ると権限を落としても書ける（確かめる対象が無い）
+        let writable = std::fs::write(dir.join("probe"), "").is_ok();
+        let stashed = (!writable).then(|| stash_unrestorable(&path));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Some(stashed) = stashed {
+            assert_eq!(stashed, None);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "元のまま");
+            assert!(!tako_core::migration::quarantine_path(&path).exists());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

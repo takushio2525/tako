@@ -3214,7 +3214,9 @@ false になり、`status` の予告と `run` の報告が食い違った。
 退避の口は `tako_core::migration::quarantine_unreadable` の 1 実装で、移行（`migrate_file`）と
 「読めなければ既定値へ落とす」読み手（`settings::load_from` / `RecentList::load_from` /
 `ShortcutsFile::load_from` / `lid.rs` の `read_from`）と、復元に使えない layout.json の後始末
-（`layout::stash_unrestorable`。#1824）が全員ここを通る。
+（`layout::stash_unrestorable`。#1824）が全員ここを通る。文字として読めない中身は
+`migration::quarantine_raw` がバイトのまま同じ番号へ移す（下の「文字として読めない中身も
+バイトのまま残す」。#2231）。
 
 以前は退避先（`<name>.unreadable.bak`）が既にあると**何も写さずそのパスを返していた**ので、
 実行中にもう一度別の中身で壊れると 2 回目の中身はどこにも残らず、呼び出し側の保存
@@ -3269,6 +3271,36 @@ false になり、`status` の予告と `run` の報告が食い違った。
 - A/B は `TAKO_1824_LEGACY=1`（記録しない・`.corrupt` へ rename）。検査は
   `crates/tako-control/tests/issue1824_corrupt_quarantine_ab.rs`（移行を先に通さない呼び順）・
   番犬 `issue1824_corrupt_quarantine_watchdog.rs`・実経路 `scripts/test-corrupt-quarantine-1824.sh`
+
+### 文字として読めない中身もバイトのまま残す（Issue #2231）
+
+#1824 の後も、recent.json / remote/shortcuts.json の**UTF-8 でない中身**（と権限で読めない
+ファイル）は文字列の退避口を通れず、「移行を中止」の記録だけ残して既定値へ落ちていた。
+そのあと項目を足して保存すると（`tako remote shortcuts add` / フォルダを開く）元の中身が
+上書きされて**どこにも残らなかった**（実測）。layout.json だけは #1824 で自前の rename 枝を
+持っていた。
+
+- バイトのまま退避へ移すのは `tako_core::migration::quarantine_raw` の 1 実装。ファイルそのものを
+  rename するので中身も権限も変わらない。置き場と本数の規則は `quarantine_unreadable` と同じ
+  （空いている一番若い番号・同じバイト列は積まずに元を外すだけ・満杯なら 1 本目を残して 2 本目を
+  押し出す）。どこにも移せなければ元のファイルに触らない
+- recent / shortcuts の読み手は理由を `LoadIssue::read_failed`（読めない → `quarantine_raw`）と
+  `LoadIssue::unparsable`（解釈できない → `quarantine_unreadable`、写せなければ `quarantine_raw`）で
+  組み、**退避まで済ませる**。理由を直に組む本番コードは番犬が名指す
+- layout の `stash_unrestorable` の rename 枝も同じ口へ寄せた。満杯のときは以前は layout.json を
+  置いたままにしていた（次の保存の rename が消す）が、いまは 2 本目を押し出して移す
+- 記録は `移行できず: recent <パス>（読み取りに失敗: …・退避 <先>・発生源 load）`。移した回ごとに
+  1 行（元は表から外れるので同じ中身を読み直さない）、同じバイト列の退避が既にあった回は書かない。
+  移せなかったときは従来どおり `移行を中止: …`（プロセス内で理由ごとに 1 回）
+- BOM 付きの JSON は UTF-8 として読めるので従来の文字列の退避（BOM ごとバイト一致で残る）
+- **範囲外で同じ穴が残っているもの**: `settings.json` / `run-configs.json` の読み手は文字列で
+  読めないと既定値へ落ちて退避しない。ui.json（#1960）は UTF-8 でない中身を 1 本目へ写すだけで、
+  1 本目が既にあると 2 回目の中身を写さない（番犬 `issue2231_raw_quarantine_watchdog.rs` の
+  `SLOT_KNOWN` に既知の 1 か所として載せてある。寄せたら外す）
+- A/B は `TAKO_2231_LEGACY=1`（文字として読めない中身を移さない）。検査は
+  `crates/tako-control/tests/issue2231_raw_quarantine_ab.rs`（recent は GUI の OpenDir と同じ
+  load → push → save、shortcuts は dispatch の本体）・番犬 `issue2231_raw_quarantine_watchdog.rs`・
+  実経路 `scripts/test-nonutf8-quarantine-2231.sh`
 
 ### 置き場を変える移行は隔離中に走らせない（Issue #1019）
 

@@ -910,6 +910,63 @@ fn quarantine_text(path: &Path, text: &str, io: &dyn MigrationIo) -> Result<Quar
     }
 }
 
+/// 文字として読めない中身を**バイトのまま**退避へ移して表から外す（#2231）。
+///
+/// [`quarantine_unreadable`] は中身を文字列で読んで写すので、UTF-8 でない中身・権限で読めない
+/// ファイルは写せない。写せないまま既定値へ落とすと、呼び手の次の保存（load → 既定値 → save）が
+/// 元の中身を上書きして消す（recent.json / remote/shortcuts.json で実測）。ここはファイル
+/// そのものを rename するので中身は 1 バイトも変わらない（layout.json の復元失敗の後始末も
+/// 同じ口を通る。#1824）。置き場と本数の規則は [`quarantine_unreadable`] と同じ:
+///
+/// - 同じバイト列の退避が既にあれば移さず、元を外すだけ（積まない。`copied: false`）
+/// - 空いている一番若い番号へ rename する
+/// - [`QUARANTINE_LIMIT`] 本すべて埋まっていたら、1 本目は動かさず 2 本目を押し出して詰め、
+///   空いた番号へ置く（`evicted: true`）
+///
+/// どこにも移せなければ何もしない（`None`。元のファイルはそのまま = 消える経路を作らない）
+pub fn quarantine_raw(path: &Path) -> Option<Quarantine> {
+    std::fs::symlink_metadata(path).ok()?;
+    let slots: Vec<PathBuf> = (1..=QUARANTINE_LIMIT)
+        .map(|n| quarantine_slot_path(path, n))
+        .collect();
+    let taken = |slot: &PathBuf| std::fs::symlink_metadata(slot).is_ok();
+    // 同じバイト列は積まない（権限で読めないなら比べずに移す）
+    if let Ok(bytes) = std::fs::read(path) {
+        let same = slots
+            .iter()
+            .rev()
+            .filter(|slot| taken(slot))
+            .find(|slot| std::fs::read(slot).is_ok_and(|b| b == bytes));
+        if let Some(slot) = same {
+            // 外せなくても中身は退避に残っている（呼び手の保存が上書きしても失わない）
+            let _ = std::fs::remove_file(path);
+            return Some(Quarantine {
+                path: slot.clone(),
+                copied: false,
+                evicted: false,
+            });
+        }
+    }
+    let mut evicted = false;
+    if slots.iter().all(taken) {
+        // 満杯。rename は置き換えなので、3 本目を 2 本目へ移した時点で 2 本目が押し出される。
+        // 途中で移せなくなったら止める（その手前に空きができていればそこへ置く）
+        for pair in slots[1..].windows(2) {
+            if std::fs::rename(&pair[1], &pair[0]).is_err() {
+                break;
+            }
+            evicted = true;
+        }
+    }
+    let free = slots.iter().find(|slot| !taken(slot))?;
+    std::fs::rename(path, free).ok()?;
+    Some(Quarantine {
+        path: free.clone(),
+        copied: true,
+        evicted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,6 +1523,127 @@ mod tests {
             Err(quarantine_slot_path(&path, QUARANTINE_LIMIT))
         );
         assert_eq!(quarantined(&path), before, "押し出しも起きない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 退避先の中身をバイトで 1 本目から順に並べる（無い番号は飛ばす）
+    fn quarantined_bytes(path: &Path) -> Vec<Vec<u8>> {
+        (1..=QUARANTINE_LIMIT + 2)
+            .filter_map(|n| std::fs::read(quarantine_slot_path(path, n)).ok())
+            .collect()
+    }
+
+    /// #2231: UTF-8 でない中身はバイトのまま移る。2 回目の別の中身は 2 本目へ（1 本目を上書きしない）。
+    /// 同じバイト列は積まずに元を外すだけ。文字列の退避（`quarantine_unreadable`）と番号を共有する
+    #[test]
+    fn 文字として読めない中身はバイトのまま移る() {
+        let dir = temp_dir("quarantine-raw");
+        assert!(dir.starts_with(std::env::temp_dir()), "一時 dir の中だけ");
+        let path = dir.join("recent.json");
+        let one: &[u8] = b"\xff\xfe{\"entries\": []}";
+        let two: &[u8] = b"{\"entries\": [\"\xe3\x81"; // 途中で切れた UTF-8
+        assert_eq!(quarantine_unreadable(&path, &FsIo), None, "不在");
+        assert_eq!(quarantine_raw(&path), None, "不在なら何もしない");
+
+        std::fs::write(&path, one).expect("書ける");
+        assert_eq!(
+            quarantine_unreadable(&path, &FsIo),
+            None,
+            "前提: 文字列の口では写せない"
+        );
+        let q = quarantine_raw(&path).expect("移せる");
+        assert_eq!(q.path, quarantine_path(&path));
+        assert!(q.copied && !q.evicted);
+        assert!(
+            !path.exists(),
+            "表から外す（次の保存が上書きする相手が無い）"
+        );
+
+        std::fs::write(&path, two).expect("書ける");
+        let q = quarantine_raw(&path).expect("移せる");
+        assert_eq!(q.path, quarantine_slot_path(&path, 2), "2 回目は 2 本目へ");
+        assert_eq!(quarantined_bytes(&path), [one, two], "1 回目を上書きしない");
+
+        // 同じバイト列をもう一度 = 積まない
+        std::fs::write(&path, one).expect("書ける");
+        let q = quarantine_raw(&path).expect("退避先を返す");
+        assert_eq!(q.path, quarantine_path(&path));
+        assert!(!q.copied);
+        assert!(!path.exists(), "同じ中身は退避に残っているので外す");
+        assert_eq!(quarantined_bytes(&path), [one, two]);
+
+        // 文字列の退避と混ざっても番号を潰さない（文字列の口は空いている番号へ写す）
+        std::fs::write(&path, "[こわれた").expect("書ける");
+        let q = quarantine_unreadable(&path, &FsIo).expect("写せる");
+        assert_eq!(q.path, quarantine_slot_path(&path, 3));
+        assert_eq!(quarantined_bytes(&path), [one, two, "[こわれた".as_bytes()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2231: 満杯なら 1 本目は動かさず 2 本目を押し出して詰め、今回の中身を末尾へ置く。
+    /// 文字列の退避の満杯の詰め直しは、読めない（UTF-8 でない）退避が混ざると何もしない
+    /// （`quarantine_text`）ので、そのときの受け皿もここ
+    #[test]
+    fn 満杯ならバイトのまま2本目を押し出して末尾へ置く() {
+        let dir = temp_dir("quarantine-raw-limit");
+        let path = dir.join("shortcuts.json");
+        let body = |i: usize| -> Vec<u8> { vec![0xff, i as u8] };
+        for i in 1..=QUARANTINE_LIMIT {
+            std::fs::write(&path, body(i)).expect("書ける");
+            let q = quarantine_raw(&path).expect("移せる");
+            assert!(!q.evicted, "{i} 本目までは押し出さない");
+        }
+        std::fs::write(&path, "満杯のあとの文字列").expect("書ける");
+        assert_eq!(
+            quarantine_unreadable(&path, &FsIo),
+            None,
+            "前提: 文字列の口は読めない退避を詰め直さない"
+        );
+        let q = quarantine_raw(&path).expect("押し出して移す");
+        assert!(q.copied && q.evicted);
+        assert_eq!(q.path, quarantine_slot_path(&path, QUARANTINE_LIMIT));
+        let mut expected: Vec<Vec<u8>> = std::iter::once(1)
+            .chain(3..=QUARANTINE_LIMIT)
+            .map(body)
+            .collect();
+        expected.push("満杯のあとの文字列".as_bytes().to_vec());
+        assert_eq!(
+            quarantined_bytes(&path),
+            expected,
+            "1 本目と新しいほうが残る"
+        );
+        assert!(!path.exists());
+        assert!(!quarantine_slot_path(&path, QUARANTINE_LIMIT + 1).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2231: 権限で読めないファイルも（比べずに）そのまま移す。権限ごと残る
+    #[cfg(unix)]
+    #[test]
+    fn 権限で読めないファイルもそのまま移す() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("quarantine-raw-perm");
+        let path = dir.join("recent.json");
+        std::fs::write(&path, r#"{"entries": []}"#).expect("書ける");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).expect("落とせる");
+        if std::fs::read(&path).is_ok() {
+            // root で走らせると読めてしまう
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let q = quarantine_raw(&path).expect("移せる");
+        assert_eq!(q.path, quarantine_path(&path));
+        assert!(!path.exists());
+        let mode = std::fs::metadata(&q.path)
+            .expect("ある")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o200, "権限も変えない");
+        std::fs::set_permissions(&q.path, std::fs::Permissions::from_mode(0o600)).expect("戻せる");
+        assert_eq!(
+            std::fs::read_to_string(&q.path).expect("読める"),
+            r#"{"entries": []}"#
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

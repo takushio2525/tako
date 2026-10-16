@@ -5,6 +5,13 @@
 //! 退避するだけで何も申告しなかったので、「いつ壊れていたか」を後から追えなかった。
 //! ここでは**理由と退避の結果を返すだけ**にして、記録は tako-control の 1 つの口
 //! （`data_files`）が「移行できず」と同じ形の 1 行で書く。
+//!
+//! 退避も理由と同じ所（[`LoadIssue::read_failed`] / [`LoadIssue::unparsable`]）で済ませる。
+//! 文字として読めない中身（UTF-8 でない・権限で読めない）は文字列の退避口を通れないので、
+//! バイトのまま移す（`migration::quarantine_raw`。#2231）。読み手ごとに書き分けると、
+//! 片方だけ退避を忘れる形が戻る
+
+use std::path::Path;
 
 use crate::migration::Quarantine;
 
@@ -16,8 +23,18 @@ pub enum LoadIssue {
         reason: String,
         quarantine: Option<Quarantine>,
     },
-    /// 読むこと自体ができなかった（権限・UTF-8 でない等）。文字として読めないので退避できない
-    ReadFailed { reason: String },
+    /// 読むこと自体ができなかった（権限・UTF-8 でない等）。`quarantine` はバイトのまま移した
+    /// 退避の結果（移せなければ `None`。#2231）
+    ReadFailed {
+        reason: String,
+        quarantine: Option<Quarantine>,
+    },
+}
+
+/// #2231 の A/B。`TAKO_2231_LEGACY=1` で修正前の挙動（文字として読めない中身を退避せずに
+/// 既定値へ落とす = 呼び手の次の保存が元の中身を上書きする）
+pub fn legacy_2231() -> bool {
+    std::env::var_os("TAKO_2231_LEGACY").is_some()
 }
 
 /// JSON を解釈できなかった理由を**中身を含めずに**言う（#1824）。
@@ -37,11 +54,42 @@ pub fn json_reason(e: &serde_json::Error) -> String {
 }
 
 impl LoadIssue {
-    /// `std::fs::read_to_string` の失敗を理由へ。**不在は理由にしない**（既定値が正しい答え）
-    pub fn from_read_error(e: &std::io::Error) -> Option<Self> {
-        (e.kind() != std::io::ErrorKind::NotFound).then(|| Self::ReadFailed {
+    /// `std::fs::read_to_string` の失敗を理由へ。**不在は理由にしない**（既定値が正しい答え）。
+    ///
+    /// 読めなかった中身は既定値へ落とす前に**バイトのまま**退避へ移す（#2231）。移さないと、
+    /// 呼び手の次の保存（load → 既定値 → save）が元の中身を上書きして消す
+    pub fn read_failed(path: &Path, e: &std::io::Error) -> Option<Self> {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return None;
+        }
+        let quarantine = if legacy_2231() {
+            None
+        } else {
+            crate::migration::quarantine_raw(path)
+        };
+        Some(Self::ReadFailed {
             reason: format!("読み取りに失敗: {e}"),
+            quarantine,
         })
+    }
+
+    /// JSON を解釈できなかった理由へ。中身は既定値へ落とす前に退避する（#916）。
+    ///
+    /// 文字列の退避口（`quarantine_unreadable`）で写せなかったとき（満杯の詰め直しに読めない
+    /// 退避が混ざる・置き場へ書けない）は、バイトのまま移す口へ落とす（#2231）
+    pub fn unparsable(path: &Path, e: &serde_json::Error) -> Self {
+        let quarantine = crate::migration::quarantine_unreadable(path, &crate::migration::FsIo)
+            .or_else(|| {
+                if legacy_2231() {
+                    None
+                } else {
+                    crate::migration::quarantine_raw(path)
+                }
+            });
+        Self::Unparsable {
+            reason: json_reason(e),
+            quarantine,
+        }
     }
 }
 
@@ -79,12 +127,21 @@ mod tests {
 
     #[test]
     fn 不在は理由にしない() {
+        let dir = std::env::temp_dir().join(format!("tako-load-issue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("作れる");
+        assert!(dir.starts_with(std::env::temp_dir()), "一時 dir の中だけ");
+        let path = dir.join("recent.json");
         let absent = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert_eq!(LoadIssue::from_read_error(&absent), None);
+        assert_eq!(LoadIssue::read_failed(&path, &absent), None);
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         assert!(matches!(
-            LoadIssue::from_read_error(&denied),
-            Some(LoadIssue::ReadFailed { .. })
+            LoadIssue::read_failed(&path, &denied),
+            Some(LoadIssue::ReadFailed {
+                quarantine: None,
+                ..
+            })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
