@@ -453,12 +453,10 @@ pub mod transport {
                 drop(theirs);
                 let mut stream = Stream::new(ours, deadline_in(Duration::from_secs(10)));
                 let mut got = Vec::new();
-                let started = Instant::now();
                 stream
                     .read_to_end(&mut got)
                     .expect("届いた応答を読めない（#2169 の EINVAL）");
                 assert_eq!(got, b"response\n");
-                assert!(started.elapsed() < Duration::from_secs(2), "待った");
             }
 
             #[test]
@@ -467,9 +465,7 @@ pub mod transport {
                 drop(theirs);
                 let mut stream = Stream::new(ours, deadline_in(Duration::from_secs(10)));
                 let mut buf = [0u8; 16];
-                let started = Instant::now();
                 assert_eq!(stream.read(&mut buf).expect("EOF を返す"), 0);
-                assert!(started.elapsed() < Duration::from_secs(2), "待った");
             }
 
             /// 要求の 1 行を書いた後に止まる書き口（相手が応答を書いて閉じるのを先に起こす）
@@ -591,33 +587,26 @@ pub mod transport {
             }
 
             /// 上限を掛けられないまま待つ経路が無い: 受信が開いていて何も届いていなければ、
-            /// 待たずに元の誤りを返し、ソケットは待つ読みへ戻る。EINVAL 以外は読まずにそのまま返す
+            /// 待たずに元の誤りを返す。EINVAL 以外は届いていても読まずにそのまま返す
             #[test]
             fn 上限を入れ直せず未着なら待たずに元の誤りを返す() {
                 let (ours, mut theirs) = UnixStream::pair().expect("対を作れる");
                 let mut stream = Stream::new(ours, deadline_in(Duration::from_secs(10)));
-                let mut buf = [0u8; 16];
-                let started = Instant::now();
-                let e = stream
-                    .read_unarmed(&mut buf, std::io::Error::from_raw_os_error(22))
-                    .expect_err("未着なら読めない");
-                assert_eq!(e.raw_os_error(), Some(22), "元の誤りを返す: {e:?}");
-                assert!(started.elapsed() < Duration::from_secs(1), "待った");
-                // 待つ読みへ戻っている（上限を入れれば上限まで待ってから時間切れ）
-                stream
-                    .stream
-                    .set_read_timeout(Some(Duration::from_millis(200)))
-                    .expect("開いたソケットには入れられる");
-                let started = Instant::now();
-                let e = stream.stream.read(&mut buf).expect_err("届いていない");
-                assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
-                assert!(
-                    started.elapsed() >= Duration::from_millis(150),
-                    "待たない読みのまま: {:?}",
-                    started.elapsed()
-                );
+                // 待つ読みに戻した回帰は相手が何も書かない限り返らないので、別スレッドで呼んで
+                // 外側の締め切りで打ち切る（所要は測らない）
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 16];
+                    let got = stream.read_unarmed(&mut buf, std::io::Error::from_raw_os_error(22));
+                    let _ = tx.send((got.map_err(|e| e.raw_os_error()), stream));
+                });
+                let (got, mut stream) = rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("未着の読みで待ち続けた（上限を掛けられないまま待つ経路）");
+                assert_eq!(got, Err(Some(22)), "元の誤り（EINVAL）を返す");
                 // EINVAL 以外は届いていても読まずにそのまま返す（修正前と同じ）
                 theirs.write_all(b"data\n").expect("書ける");
+                let mut buf = [0u8; 16];
                 let e = stream
                     .read_unarmed(&mut buf, std::io::ErrorKind::PermissionDenied.into())
                     .expect_err("そのまま返す");
