@@ -32,7 +32,8 @@ pub fn strip_bom(s: &str) -> &str {
 /// `max_chars` が 0 のときも、空でなければ `…` の 1 文字を返す。
 ///
 /// **文字数で切る実装はこれ 1 本**（#1757 で tako-app の `truncate` と context_budget の
-/// 私有版を寄せた。transcript の 1 行要約 `summary_line` も数える部分はここを通す）。
+/// 私有版を、#1790 で `truncate_path_middle` の末尾省略を寄せた。transcript の 1 行要約
+/// `summary_line` も数える部分はここを通す）。
 /// 規約は `.agent/conventions.md`「文字列をバイト位置で切らない」
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {

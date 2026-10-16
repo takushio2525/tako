@@ -113,9 +113,8 @@ pub fn truncate_path_middle(path: &str, max_chars: usize) -> String {
     // ファイル名（末尾コンポーネント）は必ず残す
     let parts: Vec<&str> = display.split('/').collect();
     if parts.len() <= 2 {
-        // 1-2 コンポーネントなら末尾省略で十分
-        let cut: String = display.chars().take(max_chars.saturating_sub(1)).collect();
-        return format!("{cut}\u{2026}");
+        // 1-2 コンポーネントなら末尾省略で十分（`…` 込みで max_chars 文字。#1790）
+        return crate::text::truncate_chars(&display, max_chars);
     }
 
     let file_name = parts.last().unwrap_or(&"");

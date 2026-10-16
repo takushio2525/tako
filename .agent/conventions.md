@@ -357,8 +357,9 @@ Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**�
 
 - **表示の切り詰めは `tako_core::text::truncate_chars(s, max)` の 1 本**を通す（`…` 込みで
   `max` 文字以内・数えるのは `char`・表示幅は見ない）。`chars().take(n)` + `…` を自前で
-  書かない（#1757 で tako-app の `truncate` と context_budget の私有版を寄せた。
-  transcript の 1 行要約 `summary_line` も数える部分はここを通す）
+  書かない（#1757 で tako-app の `truncate` と context_budget の私有版を、#1790 で
+  `truncate_path_middle` の末尾省略を寄せた。transcript の 1 行要約 `summary_line` も
+  数える部分はここを通す）
 - **長さの比較も文字で数える**: 「6 桁か」「上限を超えたか」を `s.len()` で見ない。
   `s.chars().count()` か、1 文字ずつ検査しながら数える（#1756 の `parse_hex_color`）。
   `len()` を使うのは**バイトの予算**（IPC のサイズ・ファイルの大きさ）を見るときだけ
