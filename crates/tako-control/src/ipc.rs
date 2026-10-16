@@ -932,6 +932,13 @@ mod tests {
     /// （打ち切ったときは下の診断がどちらかを名指す）
     const FD_EOF_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
+    /// 注入（#2161）: 書き側を閉じた後、サーバーが接続を畳んで FIN が届いたのを見届けてから
+    /// EOF 待ちへ進む。CI の macOS で間欠的に踏んだ「FIN が先に届く」順序を毎回作る
+    const INJECT_FIN_FIRST_ENV: &str = "TAKO_2161_INJECT_FIN_FIRST";
+
+    /// A/B（#2161）: 修正前の順序（書き側を閉じてから読み取りの上限を入れる）へ戻す
+    const LEGACY_2161_ENV: &str = "TAKO_2161_LEGACY";
+
     /// 1 往復して、**サーバーが自分の側を閉じたのを見届けてから**戻る（#2129）。
     /// 戻り値は EOF が届くまでにかかった時間。
     ///
@@ -945,6 +952,18 @@ mod tests {
         leak: bool,
         deadline: std::time::Instant,
     ) -> std::time::Duration {
+        let fin_first = std::env::var_os(INJECT_FIN_FIRST_ENV).is_some();
+        closed_roundtrip_ordered(endpoint, leak, deadline, fin_first).0
+    }
+
+    /// [`closed_roundtrip`] の本体。`fin_first` は注入（#2161）: 書き側を閉じた後、FIN が
+    /// 届くまで待ってから EOF 待ちへ進む。戻り値の 2 つ目は、その FIN を見届けたか
+    fn closed_roundtrip_ordered(
+        endpoint: &str,
+        leak: bool,
+        deadline: std::time::Instant,
+        fin_first: bool,
+    ) -> (std::time::Duration, bool) {
         let pre = fd_count();
         let stream = UnixStream::connect(endpoint).unwrap();
         let mut writer = stream.try_clone().unwrap();
@@ -957,15 +976,25 @@ mod tests {
         if leak {
             std::mem::forget(reader);
             std::mem::forget(writer);
-            return std::time::Duration::ZERO;
+            return (std::time::Duration::ZERO, false);
         }
-        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        let legacy = std::env::var_os(LEGACY_2161_ENV).is_some();
         let started = std::time::Instant::now();
         let left = deadline.saturating_duration_since(started);
+        // 読み取りの上限は書き側を閉じる**前**に入れる（#2161）。閉じた後だと、サーバーが EOF を
+        // 読んで接続を畳み FIN が先に届いた回で、送受信の両方が閉じたソケットへの setsockopt に
+        // macOS（XNU）が EINVAL を返す。閉じる前ならサーバーはまだ次の行を待っている
+        if !legacy && !left.is_zero() {
+            reader.get_ref().set_read_timeout(Some(left)).unwrap();
+        }
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        let fin_seen = fin_first && wait_for_fin(reader.get_ref(), deadline);
         let eof = if left.is_zero() {
             Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
         } else {
-            reader.get_ref().set_read_timeout(Some(left)).unwrap();
+            if legacy {
+                reader.get_ref().set_read_timeout(Some(left)).unwrap();
+            }
             reader.read_to_end(&mut Vec::new())
         };
         if let Err(e) = eof {
@@ -990,7 +1019,29 @@ mod tests {
                 FD_EOF_BUDGET.as_secs()
             );
         }
-        started.elapsed()
+        (started.elapsed(), fin_seen)
+    }
+
+    /// 注入（#2161）: サーバーが接続を畳んで FIN が届くまで待つ。非ブロッキングで覗くだけで
+    /// 読み取りの上限（setsockopt）には触らないので、修正前の順序でも「FIN が届いた後に上限を
+    /// 入れる」形をそのまま作れる。`deadline` までに届けば true
+    fn wait_for_fin(stream: &UnixStream, deadline: std::time::Instant) -> bool {
+        stream.set_nonblocking(true).unwrap();
+        let mut peek: &UnixStream = stream;
+        let seen = loop {
+            match peek.read(&mut [0u8; 1]) {
+                Ok(0) => break true,
+                Ok(_) => panic!("応答の後にサーバーが余計なバイトを送った"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("FIN を待つ読み取りが失敗した: {e}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        stream.set_nonblocking(false).unwrap();
+        seen
     }
 
     /// 子の計測結果
@@ -1309,6 +1360,31 @@ mod tests {
             after <= before,
             "IpcServer を {SERVER_CYCLES} 回立てて捨てたら fd が {before} → {after} に増えた\
              （drop が受け口の fd を閉じていない）"
+        );
+    }
+
+    /// #2161 の番犬: サーバーの FIN が EOF 待ちより先に届いた回でも、往復の後始末
+    /// （[`closed_roundtrip`]）が落ちない。
+    ///
+    /// 修正前は書き側を閉じてから読み取りの上限を入れていたので、その間にサーバーが接続を
+    /// 畳んだ回は、送受信の両方が閉じたソケットへの setsockopt に macOS が EINVAL を返して
+    /// fd 数えのテストが落ちた（CI の macOS で間欠的に踏んだ形）。ここでは注入で FIN の先着を
+    /// 毎回作るので、タイミングに依らず検出する。
+    /// A/B: `TAKO_2161_LEGACY=1` で macOS では EINVAL で落ちる
+    #[test]
+    fn issue2161_サーバーのfinが先に届いても往復の後始末が落ちない() {
+        let (tx, mut rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(Ok(json!({})));
+            }
+        });
+        let deadline = std::time::Instant::now() + FD_EOF_BUDGET;
+        let (_, fin_seen) = closed_roundtrip_ordered(server.endpoint(), false, deadline, true);
+        assert!(
+            fin_seen,
+            "EOF 待ちの前に FIN が届いていない = 注入が順序を作れておらず、番犬が何も試していない"
         );
     }
 
