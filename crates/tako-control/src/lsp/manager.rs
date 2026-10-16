@@ -36,6 +36,14 @@
 //! 状態が変わったら「つながりを作り直して描き直す」（[`LspManager::take_refresh_wanted`] が真）、取得の
 //! 進捗は描き直すだけ。診断の口は従来どおり URI だけを運ぶ（#1679 の約束を崩さない）。
 //!
+//! ## 隔離起動では自動で起こさない（#2048）
+//!
+//! 隔離起動（`TAKO_ISOLATED`）の manager は文書を開いても未起動の器を起こさず、「止めた」
+//! （[`ServerState::Stopped`]）に置く（[`autostart_from_env`]。利用者の stop と同じ遷移で、理由の文だけ
+//! `Slot::autostart_held` で替える）。起こすのは `restart`（明示）だけで、シェル統合の合図・基板の選択
+//! （`restart_requiring`）・`install` では起こさない。取るほう（[`FetchConfig::auto`]）も隔離では止まる。
+//! `TAKO_LSP_AUTOSTART=1` で従来どおり起こす（LSP の検証）。
+//!
 //! ## 文書の同期
 //!
 //! 文書ごとに**サーバへ送った本文の写し**を持ち、今の本文との差分を `didChange` で送る
@@ -138,6 +146,38 @@ pub fn legacy() -> bool {
         std::env::var("TAKO_1007_LEGACY").ok().as_deref(),
         Some("1" | "true" | "on")
     )
+}
+
+/// `TAKO_2048_LEGACY=1` で隔離起動でも自動で起こし・取る（#2048 の前へ戻す A/B の入口）
+pub fn legacy_2048() -> bool {
+    matches!(
+        std::env::var("TAKO_2048_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// 文書を開いた時点でサーバを自動で起こすか（#2048）。既定は起こす。**隔離起動（`TAKO_ISOLATED`）は
+/// `TAKO_LSP_AUTOSTART=1` が無ければ起こさない**（検証の GUI で rust-analyzer がワークスペース全体の
+/// `cargo check` を走らせて CPU / メモリを汚さない）。起こさなかった器は「止めた」に置き、
+/// `tako lsp restart` で起きる。`TAKO_LSP_AUTOSTART=0` は隔離でなくても止める
+pub fn autostart_from_env() -> bool {
+    autostart_from(
+        std::env::var("TAKO_LSP_AUTOSTART").ok().as_deref(),
+        !legacy_2048()
+            && tako_core::tmux_cleanup::is_isolated_value(
+                std::env::var("TAKO_ISOLATED").ok().as_deref(),
+            ),
+    )
+}
+
+/// [`autostart_from_env`] の判定（純粋関数）。`explicit` = `TAKO_LSP_AUTOSTART` の値、
+/// `isolated` = 隔離起動か。解釈できない値は既定へ落とす（`fetch::auto_from` と同じ読み）
+pub fn autostart_from(explicit: Option<&str>, isolated: bool) -> bool {
+    match explicit.map(str::trim) {
+        Some("0" | "false" | "off") => false,
+        Some("1" | "true" | "on") => true,
+        _ => !isolated,
+    }
 }
 
 /// 実行ファイルの解決結果
@@ -492,6 +532,8 @@ struct Shared {
     config: LspConfig,
     /// 未導入のサーバを取る設定（#1944）。`None` は取らない（`TAKO_1944_LEGACY=1`・テストの既定）
     fetch: Option<FetchConfig>,
+    /// 文書を開いた時点で起こすか（#2048。偽 = 隔離起動。[`autostart_from_env`]）
+    autostart: bool,
     inner: Mutex<Inner>,
     /// tako の外で変わったファイルの監視（#2034。全サーバで 1 つ）。
     /// **ロックの順は `watch` → `inner`**（`inner` を持ったまま `watch` を取らない）
@@ -659,6 +701,8 @@ struct Slot {
     watch: Registrations,
     /// 監視の知らせを送った回数・変化の数・送れなかった変化の数（#2034。起動をまたいで数える）
     watch_sent: (u64, u64, u64),
+    /// 隔離起動なので開いても起こさず「止めた」に置いた（#2048。理由の文を替える印。restart・stop で外す）
+    autostart_held: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -830,8 +874,13 @@ impl LspManager {
         Self::with_fetch(config, None)
     }
 
-    /// 取得の設定も渡して作る（#1944。`None` なら取らない）
+    /// 取得の設定も渡して作る（#1944。`None` なら取らない）。開いた時点で起こす
     pub fn with_fetch(config: LspConfig, fetch: Option<FetchConfig>) -> Self {
+        Self::with_autostart(config, fetch, true)
+    }
+
+    /// 開いた時点で起こすかも渡して作る（#2048。偽なら開いた器を「止めた」に置き、restart で起こす）
+    pub fn with_autostart(config: LspConfig, fetch: Option<FetchConfig>, autostart: bool) -> Self {
         if legacy() {
             return Self::disabled();
         }
@@ -846,6 +895,7 @@ impl LspManager {
             Shared {
                 config,
                 fetch,
+                autostart,
                 inner: Mutex::new(Inner::default()),
                 watch: Mutex::new(WatchHub::new(on_batch)),
                 this: this.clone(),
@@ -865,9 +915,13 @@ impl LspManager {
         }
     }
 
-    /// 本番の設定で作る（未導入のサーバは data dir へ取る。#1944）
+    /// 本番の設定で作る（未導入のサーバは data dir へ取る。#1944）。隔離起動は自動で起こさず取らない（#2048）
     pub fn from_env() -> Self {
-        Self::with_fetch(LspConfig::from_env(), FetchConfig::from_env())
+        Self::with_autostart(
+            LspConfig::from_env(),
+            FetchConfig::from_env(),
+            autostart_from_env(),
+        )
     }
 
     /// 何もしない manager
@@ -1372,6 +1426,8 @@ pub struct DocumentServer {
     pub can_install: bool,
     /// 取りに行って失敗した
     pub fetch_failed: bool,
+    /// 隔離起動なので自動では起こさずにいる（#2048。状態は「止めた」）
+    pub held: bool,
 }
 
 /// 診断が変わった知らせを UI へ積む（満杯なら捨てて印を立てる。待たない）
@@ -1448,6 +1504,22 @@ impl Shared {
     fn step(&self, slot: &mut Slot, event: Event) -> Action {
         let (next, action) = slot.lifecycle.step(event, self.config.restart);
         slot.lifecycle = next;
+        action
+    }
+
+    /// 文書を開いた（[`Event::Open`]）。自動で起こさない manager（#2048 = 隔離起動）は、未起動の器を
+    /// 起こさずに「止めた」へ置く（利用者の stop と同じ遷移 = restart で起きる。理由の文だけ替える）。
+    /// 未起動以外（restart で起こした後の前提の確かめ直し等）は従来どおり
+    fn step_open(&self, slot: &mut Slot, key: &ServerKey) -> Action {
+        if self.autostart || slot.lifecycle.state != ServerState::NotStarted {
+            return self.step(slot, Event::Open);
+        }
+        let action = self.step(slot, Event::UserStop);
+        slot.autostart_held = true;
+        crate::diag::persist_log(&format!(
+            "LSP 自動起動を見送り（隔離起動。#2048）: server={} 起こすには tako lsp restart",
+            key.id
+        ));
         action
     }
 
@@ -1550,7 +1622,7 @@ impl Shared {
             .or_insert_with(|| Slot::new(spec, &root));
         // 猶予つきの停止を取り消す
         slot.idle_token = slot.idle_token.wrapping_add(1);
-        match self.step(slot, Event::Open) {
+        match self.step_open(slot, &key) {
             Action::Spawn => self.begin_spawn(slot, &key, None),
             _ => {
                 if slot.lifecycle.state == ServerState::Running {
@@ -2395,6 +2467,7 @@ impl Shared {
             next_step,
             can_install,
             fetch_failed: record.is_some_and(|r| r.fetch_error.is_some()),
+            held: slot.is_some_and(|s| s.autostart_held),
         })
     }
 
@@ -2713,7 +2786,7 @@ impl Shared {
                 // 止めている間に開き直された文書があれば起こし直す
                 if reopen {
                     if let Some(slot) = inner.servers.get_mut(&key) {
-                        if shared.step(slot, Event::Open) == Action::Spawn {
+                        if shared.step_open(slot, &key) == Action::Spawn {
                             shared.begin_spawn(slot, &key, None);
                         }
                     }
@@ -2778,6 +2851,8 @@ impl Shared {
             let Some(slot) = inner.servers.get_mut(&key) else {
                 continue;
             };
+            // #2048: 隔離起動で起こさずにいた器も、明示の restart では起こす
+            slot.autostart_held = false;
             let action = self.step(slot, Event::UserRestart);
             if matches!(action, Action::Spawn | Action::Respawn) {
                 self.begin_spawn(slot, &key, previous);
@@ -2796,10 +2871,11 @@ impl Shared {
         let want = canon(root);
         let candidates: Vec<ServerKey> = {
             let inner = self.lock();
+            // #2048: 隔離起動で起こさずにいた器は、基板を選んでも起こさない（起こすのは明示の restart だけ）
             inner
                 .servers
                 .iter()
-                .filter(|(_, slot)| slot.spec.requires.is_some())
+                .filter(|(_, slot)| slot.spec.requires.is_some() && !slot.autostart_held)
                 .map(|(key, _)| key.clone())
                 .collect()
         };
@@ -2833,6 +2909,8 @@ impl Shared {
             let Some(slot) = inner.servers.get_mut(&key) else {
                 continue;
             };
+            // #2048: 明示の stop の後は「stop で止めた」と案内する
+            slot.autostart_held = false;
             let action = self.step(slot, Event::UserStop);
             if action == Action::Shutdown {
                 self.begin_stop(slot, &key);
@@ -2903,6 +2981,8 @@ impl Shared {
             "documents": inner.docs.len(),
             "diagnostics_total": inner.diagnostics.total(),
             "inflight": inflight,
+            // #2048: 文書を開いた時点で起こすか（偽 = 隔離起動。起こさなかった器は state=stopped）
+            "autostart": self.autostart,
             // #1944: 未導入のサーバを取るか・置き場（取っている最中のものは各サーバの `fetch`）。
             // #1977: 直前の古い版の片付け（`cleanup`）
             "fetch": fetch_summary(self.fetch.as_ref(), inner.last_sweep.as_ref()),
@@ -3112,6 +3192,7 @@ impl Shared {
                     server: spec.id,
                     state: slot.lifecycle.state,
                     crashes: slot.lifecycle.crashes,
+                    held: slot.autostart_held,
                 })
             }
             (ServerState::Unconfigured, _) => match unconfigured_error(spec, slot) {
@@ -3574,6 +3655,7 @@ impl Shared {
                                 server: spec.id,
                                 state: slot.lifecycle.state,
                                 crashes: slot.lifecycle.crashes,
+                                held: slot.autostart_held,
                             })
                         }
                         // #1951: 前提が未設定なら待たない（満たされるまで起きない）
@@ -4400,6 +4482,7 @@ impl Slot {
             unmet: None,
             watch: Registrations::default(),
             watch_sent: (0, 0, 0),
+            autostart_held: false,
         }
     }
 }
@@ -4589,6 +4672,12 @@ fn stopped_guidance(slot: &Slot) -> (String, String) {
                 &[("count", &slot.lifecycle.crashes.to_string())],
             ),
             text::GAVE_UP_NEXT_STEP.text().to_string(),
+        )
+    } else if slot.autostart_held {
+        // #2048: 隔離起動なので自動では起こさなかった
+        (
+            text::HELD_REASON.text().to_string(),
+            text::HELD_NEXT_STEP.text().to_string(),
         )
     } else {
         (

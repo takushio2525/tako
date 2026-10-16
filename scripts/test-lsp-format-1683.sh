@@ -45,6 +45,8 @@ cleanup() {
 trap cleanup EXIT
 
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
+export TAKO_LSP_AUTOSTART=1
 isolated_gui_bins || exit 1
 FAKE="$REPO_ROOT/target/debug/tako-lsp-fake"
 if [ ! -x "$FAKE" ]; then

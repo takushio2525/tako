@@ -62,6 +62,8 @@ echo "visual-test 版の tako-app と tako をビルドします…"
 (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# 隔離 GUI は言語サーバを自動では起こさず取らない（#2048）。この検証は開いた時点で取って起こす前提なので明示する
+export TAKO_LSP_AUTOSTART=1 TAKO_LSP_AUTO_FETCH=1
 isolated_gui_bins || exit 1
 
 json() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1" 2>/dev/null; }

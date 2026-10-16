@@ -50,6 +50,8 @@ cleanup() {
 trap cleanup EXIT
 
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
+export TAKO_LSP_AUTOSTART=1
 
 if [ "${TAKO_2034_SKIP_BUILD:-0}" != "1" ]; then
   echo "tako-app と偽サーバをビルドします…"

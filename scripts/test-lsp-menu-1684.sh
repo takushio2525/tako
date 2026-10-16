@@ -58,6 +58,8 @@ FAKE="$REPO_ROOT/target/debug/tako-lsp-fake"
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
+export TAKO_LSP_AUTOSTART=1
 isolated_gui_bins || exit 1
 
 mkdir -p "$TMP/home" "$TMP/zdot" "$TMP/disc" "$TMP/orch" "$TMP/tmpdir"

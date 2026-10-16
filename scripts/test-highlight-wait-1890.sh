@@ -51,6 +51,8 @@ trap cleanup EXIT
 export TAKO_ISO_PROFILE=release
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
+export TAKO_LSP_AUTOSTART=1
 echo "release（visual-test 入り）の tako-app / tako / tako-lsp-fake をビルドします…"
 (cd "$REPO_ROOT" && run_heavy cargo build --release -q -p tako-cli -p tako-app --features tako-app/visual-test \
   && run_heavy cargo build --release -q -p tako-control --bin tako-lsp-fake) || exit 1

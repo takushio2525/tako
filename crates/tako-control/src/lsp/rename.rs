@@ -297,6 +297,7 @@ mod tests {
                 server: "s",
                 state: ServerState::GaveUp,
                 crashes: 3,
+                held: false,
             }),
             RenameError::Lsp(GotoError::Crashed { server: "s" }),
             RenameError::Unsupported { server: "s" },

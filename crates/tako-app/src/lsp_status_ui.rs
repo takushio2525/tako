@@ -268,6 +268,12 @@ fn badge_of(server: &DocumentServer) -> Option<(String, BadgeTone)> {
             crate::ui_text::preview::lsp_running(server.id),
             BadgeTone::Quiet,
         ),
+        // #2048: 隔離起動で自動では起こさなかった = 帯（本文の高さが変わる）ではなく控えめな 1 行。
+        // 検証の GUI の画面を、言語サーバの有無で変えない
+        ServerState::Stopped if server.held => (
+            crate::ui_text::preview::lsp_held(server.id),
+            BadgeTone::Quiet,
+        ),
         ServerState::NotInstalled
         | ServerState::GaveUp
         | ServerState::Stopped
@@ -289,6 +295,7 @@ mod tests {
             next_step: None,
             can_install: true,
             fetch_failed: false,
+            held: false,
         }
     }
 
@@ -305,6 +312,18 @@ mod tests {
             );
             assert_eq!(shown, !bar, "{state:?}");
         }
+    }
+
+    /// #2048: 隔離起動で起こさなかった器は帯を出さず（本文の高さを変えない）、控えめな 1 行だけ
+    #[test]
+    fn 隔離で起こさなかった器は帯でなく控えめな_1_行() {
+        let mut s = server(ServerState::Stopped);
+        s.held = true;
+        let (text, tone) = badge_of(&s).expect("1 行を出す");
+        assert_eq!(tone, BadgeTone::Quiet);
+        assert!(text.starts_with("srv "), "{text}");
+        // 利用者の stop で止めた器は従来どおり帯（1 行は出さない）
+        assert!(badge_of(&server(ServerState::Stopped)).is_none());
     }
 
     #[test]
