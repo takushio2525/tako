@@ -32713,7 +32713,7 @@ mod tests {
         let root = host.root_pane();
         host.previews
             .insert(root, (file.display().to_string(), PreviewModeWire::Code));
-        // 閉じる・状態取得・diff の展開は git を待たない（または別件）のでジョブにしない
+        // 閉じる・状態取得は git を待たないのでジョブにしない
         for other in [
             Request::PreviewChangelog {
                 pane: Some(root),
@@ -32727,15 +32727,25 @@ mod tests {
                 max_count: None,
                 expand: None,
             },
-            Request::PreviewChangelog {
-                pane: Some(root),
-                enabled: Some(true),
-                max_count: None,
-                expand: Some("abc".into()),
-            },
         ] {
             assert!(prepare_offload(&mut host, &other).is_none());
         }
+        // `expand` つきは開く切替ではなく行の展開（#2150 の腕。変更履歴が閉じていれば同期の腕と
+        // 同じ文面で準備の段から返す）
+        let with_expand = Request::PreviewChangelog {
+            pane: Some(root),
+            enabled: Some(true),
+            max_count: None,
+            expand: Some("abc".into()),
+        };
+        let err = prepare_offload(&mut host, &with_expand)
+            .expect("行の展開の腕")
+            .err()
+            .expect("変更履歴が閉じている");
+        assert!(
+            err.to_string().contains("チェンジログビューが有効ではない"),
+            "{err}"
+        );
         let job = prepare_offload(&mut host, &changelog_on(root))
             .expect("開く切替はジョブになる")
             .expect("準備に成功する");
