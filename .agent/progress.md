@@ -20,47 +20,6 @@
 
 ---
 
-## 2026-10-15（#2119: 夜間の PATH の先頭の古い tako に負けず、run_heavy が順番待ちを知る tako を探して並ぶ）
-- PATH の tako を上から全部 → .app の同梱 CLI を `--max-wait` で確かめ、無い / 応答しない（10 秒）は直に走る。A/B `TAKO_2119_LEGACY=1`。モック `scripts/test-nightly-queue-path-2119.sh` を CI の macOS へ。PR #2121
-
-## 2026-10-16（#2123: CLI の IPC の 1 往復に応答の上限 = 返事をしない GUI で tako queue・夜間リリースが固まらない）
-- `protocol::reply_timeout`（順番待ち 30 秒・心拍と done 5 秒・外の仕事を待つ要求は上限なし・他は 300 秒）+ unix の締め切りつきソケット / Windows のスレッド。`tako queue` は時間切れで直に走る。A/B `TAKO_2123_LEGACY=1`。PR #2125
-- 実測 `scripts/test-ipc-timeout-2123.sh` 40 OK（修正前 45 秒で打ち切り / 修正後 30 秒で直に走る・72 秒の待ちは切れない・途中の SIGSTOP は 67 秒で走る）
-
-## 2026-10-16（#2120: master のタブ名を役割名の手動名で固定せず、管轄プロジェクトの自動名で付ける・adopt でプロジェクト名・旧版の「master」手動名は復元時に解除）
-- 真因は起動 3 経路（CLI / スマホ / 人タスク）の手動名 + adopt がタブ名を変えない。アプリの自動命名は master のタブを命名しない。`scripts/test-master-tab-title-2120.sh` 39 PASS（A/B `TAKO_2120_LEGACY=1`）・visual-test `master-tab-title`・カタログ増 0 B。PR #2124。solo の同型は #2127
-
-## 2026-10-16（#1731: Code Runner の実行設定を `<data_dir>/run-configs.json` に覚える = `tako run-config` / MCP `tako_run_defaults` の path 側）
-- 保存した環境が解けなければ自動へ落とさず `Run` はエラー（`--reset runtime` を案内）・短縮が 2 候補なら選ばない。カタログ +1,012 B・A/B `TAKO_1731_LEGACY=1`。PR #2122
-- 実測 `scripts/test-run-config-1731.sh` 37 PASS（env2 で走る / 消すと止まる / reset で .venv / CLI と MCP 一致）
-
-## 2026-10-16（#2113: スケッチ内の `.h` / `.cpp` を arduino-language-server へ・本体の `.ino` を tako が隠れて先に didOpen）
-- 表の `FolderClaim` + 開いた文書は開いたときの器で引く `LspManager::resolve` へ呼び手を寄せた（番犬 `issue2113_lsp_resolve_watchdog`）。A/B `TAKO_2113_LEGACY=1`。PR #2126
-- 実測 `scripts/test-lsp-sketch-headers-2113.sh` 22 OK（新は嘘のエラー 0・ホバー / 補完あり、旧と main は 2 件・基板なしは unconfigured・スケッチ外は新旧同じ）
-
-## 2026-10-16（#2127: solo のタブ名を「solo」の手動名で固定せず、作業フォルダのリポジトリ名の自動名で付ける）
-- HOME では触らない・`--tab` はそのフォルダで開く・旧版の手動名は復元時に解除（role から組み立てた旧名と完全一致のときだけ）。PR #2130
-- 実測 `scripts/test-solo-tab-title-2127.sh` 35 PASS（A/B `TAKO_2120_LEGACY=1`）・visual-test `master-tab-title` に solo の判定・カタログ増 0 B
-
-## 2026-10-16（#2129: ipc の fd 漏れテストを子プロセス（同じテストバイナリの `--exact`）で数え、並列テストの fd に引きずられないようにした）
-- 往復はサーバーが閉じる EOF を見届けてから戻す = 許容 +6・6 秒の最小値をやめて許容 0。注入 `TAKO_2129_INJECT_FD_NOISE` / `_LEAK`・A/B `TAKO_2129_LEGACY=1`。PR #2131
-- 実測: 雑音 7 本で旧 5 → 12 FAILED / 新 5 → 5 ok、漏れ 1 本は旧が見逃し新は 5 → 9 で落ちる。残りの後始末は #2136
-
-## 2026-10-16（#1732: 実行設定に引数・環境変数・作業ディレクトリ・実行前コマンド = `tako run-config --args/--env/--unset-env/--cwd/--before`）
-- env はコマンド文字列へ埋める（器の中へ届く）・before は群の門（本体が複合文でも止まる）・cwd を移すと `${fileBase}` は絶対パス。カタログ +391 B（残り約 2.5 KB）。PR #2132
-- A/B `TAKO_1732_LEGACY=1`・番犬 `issue1732_run_config_log_watchdog`・実経路 `scripts/test-run-config-1732.sh` 37 PASS
-
-## 2026-10-16（#1954: two-face に無い PowerShell（.ps1 / .psm1 / .psd1）の構文を足した）
-- ビルド時に YAML を構文定義へ読み、起動時は末尾へ継ぎ足す（既存 213 構文は 1 バイトも変えない・器 +15.2 KB・起動時 6〜7 ms）。yaml-rust はビルド依存だけ。.astro は ST4 の継承で読めず見送り。PR #2135
-- 比較は language-coverage §6.2・実測 `scripts/test-extra-syntax-1954.sh` 34 PASS（旧は Plain Text）。#1955（Finder の候補）は既定を動かさない方法が無く採らない
-
-## 2026-10-16（#2133: master の引き継ぎの後に spawn した worker が master の領域を割らない = 前任を閉じたら worker の `spawned_by` を後任へ付け替え）
-- 持ち主の判定に後任 master を含め、付け替えは「閉じたのが master・後任がちょうど 1 枚」のときだけ。A/B `TAKO_2133_LEGACY=1`（旧は master 33 → 8 桁 / 新は 33 桁のまま）。PR #2137
-- 実測 `scripts/test-spawn-master-region-2133.sh` 29 PASS・番犬 `issue2133_handoff_spawn_owner_watchdog`・カタログ増 0 B
-
-## 2026-10-16（#2136: fd 漏れテストを理由にした回避策 7 箇所の理由文を実態へ直し（外したもの 0）、IpcServer の drop で受け口を閉じる）
-- 自分へ 1 本繋いで accept を起こし上限 2 秒で listener を手放す。A/B `TAKO_2136_LEGACY=1`（子プロセスの fd 旧 5 → 10 / 新 4 → 4）。PR #2140
-
 ## 2026-10-16（#1733: 実行ボタン横のドロップダウンで実行環境・引数・環境変数等を見て変える = Code Runner S5）
 - `RunResolve` の答えを background で取って描くだけ・書き込みは `RunnerDefaults`・出典タグで file ↔ project・候補は 5 件で畳む。`preview_run_selected` 廃止・カタログ増 0 B。PR #2141
 - A/B `TAKO_1733_LEGACY=1`（旧は一覧が `python3 a.py` で Run は .venv）・番犬 `issue1733_run_menu_watchdog`・`scripts/test-run-dropdown-1733.sh`
@@ -90,3 +49,37 @@
 
 ## 2026-10-16（#2025: 上端ドラッグのオートスクロールが送れる履歴なし / 最上端で選択を (0, 0) へ縮めていた → `drag_scroll_step` で送れないときは端を動かさない）
 - A/B `TAKO_2025_LEGACY=1`・番犬 `issue2025_tick_が判定を通す_watchdog`・実クリック `scripts/test-drag-autoscroll-2025.sh`。下端の対称は #2153。PR #2147
+
+## 2026-10-16（#2152: ファイルツリーで `.env.local` / `.env.production` 等の `.env.*` を `.env` と同じ設定アイコンに）
+- 特殊ファイル名の表に 1 行・最後の拡張子が表にある `.env.ts` 等と `.envrc` は従来どおり。PR #2156
+
+## 2026-10-16（#2150: 変更履歴の行の diff の展開（クリック / `--expand`）を `OffloadJob::PreviewChangelogDiff` へ・#2014 と同じ上限）
+- A/B `TAKO_2150_LEGACY=1`・番犬 14 節（注入 12 通り）・`scripts/test-changelog-expand-2150.sh` cli 16 / visual 2 PASS・カタログ増 0 B。PR #2160
+
+## 2026-10-16（#2153: 最下部ではドラッグ選択のオートスクロールで選択の端を行末へ寄せない = #2025 の下端版）
+- `drag_scroll_step` に下端の Hold・A/B `TAKO_2153_LEGACY=1`・番犬 `issue2153_tick_が下端で寄せない_watchdog`。実画面は蓋閉じで未実測。PR #2158
+
+## 2026-10-16（#2157: ネット復帰の再開が、エラー直後の通知行が挟まった停止と、同じ形の止まり直しを取りこぼさない = ユーザー依頼）
+- 締めの行より下の `⏺` を読み飛ばし、会話が進んだら・届いたら鍵を捨てる。A/B `TAKO_2157_LEGACY=1`・`scripts/test-net-resume-2157.sh` 38 PASS。PR #2165
+- 10/16 12:40 の 22 分の DNS 断で、止まった全ペインに自動で続きが届いた（手で再開 0 本）
+
+## 2026-10-16（#1734: Code Runner の実行先（reuse / new）を実行設定に覚える = `tako run-config --target`・MCP `tako_run_defaults` の `target`）
+- 一回限りの `new_pane` > 保存値 > 既定・serde default で移行なし。カタログ +159 B・`scripts/test-run-target-1734.sh` 32 PASS。PR #2162
+
+## 2026-10-16（#2163 / #2161 / #2164: CI の間欠 3 つ = LSP 取り消しの数え・ipc の fd テストの EINVAL・git 履歴の date_relative）
+- いずれも注入で原因を確定してテストだけ直した（`wait_received` で待つ・上限を shutdown の前へ・コミットを過去の固定時刻に）。PR #2167 / #2168 / #2170
+
+## 2026-10-16（#2051: md の表の `|` を `\|` で揃えて番犬で縛る + visual-test の `fail()` の経路でも節の一時ファイルを消す）
+- 番犬 `issue2051_md_table_columns_watchdog`・`remove_on_fail` の登録 93 か所・A/B `TAKO_2051_LEGACY=1`。PR #2154
+
+## 2026-10-16（#2159: tako mod の会話のカードに [ run ] / [ copy ] = クリック 1 回で実行（ユーザー依頼）・二重押しは止める）
+- 手順 新 1 クリック / 旧 3 打（A/B `TAKO_2159_LEGACY=1`）・`scripts/test-mod-card-click-2159.sh` 42 PASS・カタログ増 0 B。PR #2166
+
+## 2026-10-16（#2151: git_bin() / tmux_bin() の初回の解決に全体 5 秒の締め切り = 戻らないログインシェルで止まらない）
+- `tako_core::bin_resolve`・打ち切ったら素の名前へ・理由を persist.log へ。A/B `TAKO_2151_LEGACY=1`・修正後 2.05 秒 / 修正前は戻らない。PR #2171
+
+## 2026-10-16（#2169: CLI の IPC で上限の入れ直しが EINVAL のとき、届いた応答を待たない読みで読む）
+- 未着なら待たずに元の誤り。修正前は 4 本が os error 22・番犬 `issue2169_ipc_einval_watchdog`。PR #2172
+
+## 2026-10-16（#2048: 隔離 GUI では言語サーバを自動で起こさず・取らない = `TAKO_LSP_AUTOSTART=1` / `TAKO_LSP_AUTO_FETCH=1` で従来どおり）
+- 呼び手 22 本へ env・A/B `TAKO_2048_LEGACY=1`・`scripts/test-lsp-isolated-2048.sh` 26 PASS。既存の `test-lsp-1678.sh` ③ の失敗は #2174。PR #2173
