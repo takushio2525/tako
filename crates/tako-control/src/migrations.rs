@@ -922,17 +922,28 @@ fn project_profile_reports(mode: Mode) -> Vec<FileReport> {
         let Ok(config) = orchestrator::ProjectsConfig::load() else {
             return Vec::new();
         };
+        // #1825: 継承元を読めないなら run でも作らない。予告も「作る」ではなく理由を出す
+        let base = orchestrator::check_project_profile_base();
         return config
             .projects
             .keys()
             .filter_map(|key| {
                 let path = orchestrator::ProfileKind::Master.path(key).ok()?;
-                (!path.is_file()).then_some(FileReport {
-                    id: SchemaId::Profiles,
-                    path,
-                    outcome: FileOutcome::Created {
+                if path.is_file() {
+                    return None;
+                }
+                let outcome = match &base {
+                    Ok(()) => FileOutcome::Created {
                         reason: PROFILE_AUTO_CREATED,
                     },
+                    Err(why) => FileOutcome::Failed {
+                        reason: format!("{why}。default を継承できないので作らない"),
+                    },
+                };
+                Some(FileReport {
+                    id: SchemaId::Profiles,
+                    path,
+                    outcome,
                 })
             })
             .collect();
@@ -949,7 +960,9 @@ fn project_profile_reports(mode: Mode) -> Vec<FileReport> {
             }),
             // 既にある = 揃っている（記録に出さない。毎回 N 行増えるのを避ける）
             orchestrator::ProfileGen::Exists(_) => None,
-            orchestrator::ProfileGen::Skipped { reason } => Some(FileReport {
+            // 継承元を読めない（#1825）も同じく「中止」として記録へ残す（persist.log と通知）
+            orchestrator::ProfileGen::Skipped { reason }
+            | orchestrator::ProfileGen::NotInherited { reason } => Some(FileReport {
                 id: SchemaId::Profiles,
                 path: PathBuf::from(format!("{key}.yaml")),
                 outcome: FileOutcome::Failed { reason },

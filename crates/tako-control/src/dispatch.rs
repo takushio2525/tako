@@ -12052,14 +12052,25 @@ pub fn dispatch_orchestrator_projects(
             // 生成が cwd を projects.yaml から読むから。作れなかった理由は
             // `profile_note` に載せるが、プロジェクト登録そのものは成功させる
             let gen = orchestrator::ensure_project_profile(&key);
+            // #1825: default を継承できずに作らなかったことは黙らせない
+            // （登録は済んでいるのでエラーにはしない = 応答の warnings と persist.log の 1 行）
+            let warnings: Vec<String> = gen
+                .warning()
+                .map(|w| {
+                    crate::diag::persist_log(&format!("[projects add] {key}: {w}"));
+                    w.to_string()
+                })
+                .into_iter()
+                .collect();
             let mut result = json!({
                 "added": key,
                 "cwd": cwd,
                 "profile": key,
                 "profile_generation": gen.kind(),
                 "profile_path": gen.path().map(|p| p.display().to_string()),
+                "warnings": warnings,
             });
-            if let orchestrator::ProfileGen::Skipped { ref reason } = gen {
+            if let Some(reason) = gen.skip_reason() {
                 result["profile_note"] = json!(reason);
             }
             Ok(result)
@@ -12167,7 +12178,14 @@ fn dispatch_orchestrator_adopt(
                 if projects.is_empty() { "（なし）".into() } else { projects.join(" / ") },
             )));
         }
-        generated = ProfileGenReport::of(&orchestrator::ensure_project_profile(name));
+        let gen = orchestrator::ensure_project_profile(name);
+        // #1825: default を継承できずに作っていない = 採用先が無い。
+        // 「見つからない」ではなく理由（直し方つき）で止め、persist.log にも残す
+        if let Some(w) = gen.warning() {
+            crate::diag::persist_log(&format!("[adopt] {name}: {w}"));
+            return Err(DispatchError::Operation(w.to_string()));
+        }
+        generated = ProfileGenReport::of(&gen);
     }
     let target = orchestrator::Profile::load(name).map_err(DispatchError::Operation)?;
 
