@@ -310,7 +310,7 @@ fn ui_violations(core_mod: &str, control_mod: &str, main: &str, dispatch: &str) 
     }
     // IPC / MCP の要約は background のジョブ
     if !dispatch.contains(
-        "Request::Sessions { action, .. } if action == \"usage\" => Some(Ok(OffloadJob::UsageSummary)),",
+        "Request::Sessions { action, .. } if action == \"usage\" => {\n            Some(Ok(OffloadJob::UsageSummary(usage_query(request))))",
     ) {
         out.push(format!(
             "{DISPATCH}: prepare_offload に tako_sessions の action=usage の腕が無い（UI スレッドで読む）"
@@ -354,8 +354,8 @@ fn 逆戻りを名指しできる() {
     );
     // (2) GUI が UI スレッドで直に記録する（背景へ出さない）
     let injected = main.replacen(
-        "        cx.background_executor()\n            .spawn(async move { tako_control::usage::record_for_gui(batch) })\n            .detach();\n",
-        "        tako_control::usage::record_for_gui(batch);\n",
+        "        cx.background_executor()\n            .spawn(async move { tako_control::usage::drive_for_gui(batch) })\n            .detach();\n",
+        "        tako_control::usage::drive_for_gui(batch);\n",
         1,
     );
     assert_ne!(injected, main, "注入 (2) の足場が無い");
@@ -377,7 +377,7 @@ fn 逆戻りを名指しできる() {
     );
     // (4) 要約を background のジョブから外す
     let injected = dispatch.replacen(
-        "Request::Sessions { action, .. } if action == \"usage\" => Some(Ok(OffloadJob::UsageSummary)),",
+        "Request::Sessions { action, .. } if action == \"usage\" => {\n            Some(Ok(OffloadJob::UsageSummary(usage_query(request))))",
         "",
         1,
     );

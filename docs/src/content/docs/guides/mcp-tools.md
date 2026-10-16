@@ -250,7 +250,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_telemetry` | エラーレポート自動送信（テレメトリ）の状態確認・切替 |
 | `tako_agents_sync_rules` | エージェント共通ルールを各 CLI の指示ファイルへ同期する |
 | `tako_config_share` | AI 系設定（claude のグローバル指示 + tako の宣言的設定）の git ベース共有 |
-| `tako_sessions` | セッションカタログの参照と会話の復元・利用制限の観測の要約（`action: "usage"`） |
+| `tako_sessions` | セッションカタログの参照と会話の復元・利用制限の観測と使用量の内訳（`action: "usage"` + `by` / `window`） |
 | `tako_logs` | ペインの平文ターミナルログの参照・設定 |
 | `tako_context_budget` | 起動時ロードの予算の確認と、積もった作業ログの自動移送 |
 | `tako_test_residue` | テスト・検証が一時ディレクトリへ残した使い捨て dir の掃除（既定は下見だけ） |

@@ -916,6 +916,32 @@
       }
     },
     {
+      "key": "usage_tokens",
+      "summary_ja": "会話記録の使用量（トークン・API 換算）をプロジェクト・Issue・会話ごとに集計する（#2201）",
+      "evidence": "unit-test",
+      "evidence_detail": "tako_control::usage::index::tests（偽の transcript の分割行・仮の output・<synthetic>・サブエージェント・書きかけの最終行・切り詰め・追記分だけの読み直し・カタログの追い出し）。codex は rollout の token_count に累積値がある（設計書 §1.5 = #2204 で取り込む）",
+      "agents": {
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
+          "issue": 2204
+        },
+        "agy": {
+          "status": "pending",
+          "note_ja": "agy のトークン数は会話の保管庫（conversations/<id>.db = SQLite の gen_metadata の行）にしか無く、実況ログには無い。tako は SQLite を読む依存を持たない（#984 の判断）ので、依存の可否を #2205 で調べる",
+          "issue": 2205
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
       "key": "worker_bypass_preaccept",
       "summary_ja": "起動直後の Bypass 確認ダイアログを事前に承諾しておく（#407）",
       "evidence": "source",

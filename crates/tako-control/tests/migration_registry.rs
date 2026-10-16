@@ -348,6 +348,25 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             "crates/tako-core/src/usage.rs",
             &["LimitObservation", "SessionLogin", "KeyFrom"],
         ),
+        (
+            // #2201: 使用量の索引（`cursor.jsonl` / `buckets/<YYYY-MM>.jsonl` / `keys.jsonl`）の行。
+            // 追記だけのファイルで版数の番地は持たない（Local）。欄を足すなら serde の default で旧い行を
+            // 読めるようにし、意味を変えるなら索引を作り直す移行を選ばせる
+            "crates/tako-core/src/usage/index.rs",
+            &[
+                "BucketRow",
+                "CursorRow",
+                "LastMessage",
+                "SessionKeys",
+                "Tokens",
+                "ProjectFrom",
+            ],
+        ),
+        (
+            // #2201: 月のファイルの書き直しの覚え（`buckets/compacted.json`）
+            "crates/tako-control/src/usage/index.rs",
+            &["CompactedState", "CompactedMonth"],
+        ),
     ];
     let mut out = BTreeMap::new();
     for (file, names) in TARGETS {

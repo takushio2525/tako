@@ -7,14 +7,18 @@ AgentResumeLayout: agent, id
 AllowEntry: fingerprint, rule, masked
 BandSegment: Pane, Tab, Workers, Attention, Ctx, Limits, Buttons, Card
 BandUi: hidden, segments, toggled_at
+BucketRow: t, session, model, fast, tokens, responses
 Button: id, label, hotkey, action
 ButtonAction: Slash, Tako, Shell, Prompt
 CardsUi: place
 ChatShow: Always, GuiOnly, Off
 ChatUi: place, bubble, code_copy, tool_summary
 ColorsUi: accent, warn, dim
+CompactedMonth: size, daily
+CompactedState: months, maintained_at
 ControlInfo: version, pid, socket, token, mcp_url
 CopyText: label, text
+CursorRow: file, dev, ino, offset, last, ids, at
 Decision: Approve, Reject, NeedsChange, Answered
 Delivery: state, profile, pane, tab, reason, at, response_index
 DeliveryState: Sent, Launched, Delivered, Failed
@@ -22,6 +26,7 @@ DesiredState: since
 Device: id, name, login, node_name, role, created_at, last_seen
 DevicesFile: devices
 KeyFrom: Account, ConfigDir
+LastMessage: id, t, session, model, fast, tokens
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows, shelved_tabs
 Ledger: entries
 LedgerEntry: id, ts, project, label, issue, task_type, model, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
@@ -37,6 +42,7 @@ Policy: mode, allow, disabled_rules
 PreviewLayout: path, mode
 Profile: master_agent, model, effort, worker_model_policy, worker_model, worker_effort, delegate_guidance, worker_agent, worker_agents, system_prompt, prompt_blocks, projects, tab_naming_convention, supervisor_mode, auto_resume_dead, supervisor_max_retries, cwd, env, master_account, worker_account, ctx_threshold, auto_handoff, limit_resume, bypass_sandbox, remote_control
 ProjectEntry: cwd, description
+ProjectFrom: Cwd, Profile, Catalog
 ProjectsConfig: projects
 RecentEntry: directory, repository, ssh
 RecentList: entries
@@ -49,6 +55,7 @@ RuntimeRef: manager, key
 SavedLidState: scheme, ac, dc, owner
 SessionCatalog: entries, pending
 SessionEntry: kind, label, project, profile, agent, model, effort, issues, prompt_head, cwd, tab, pane, tmux_session, log_file, started_at, last_seen_at
+SessionKeys: session_id, login, key_from, agent, account, role, project, project_from, issue, task_type, ledger_id, label, first_at, recorded_at
 SessionLogin: session_id, login, key_from, seen_at
 Settings: auto_rename, port_detect, ssh_auto_folders, autosuggest, autosuggest_hint, autosuggest_tab, preview_live_reload, lsp_format_on_save, lsp_init_options, editor_auto_close, claude_mod, limit_resume_all, network_resume, resources, preview_cache_max_mb, tmux_persist, sleep_guard_mode, sleep_guard_power, lid_sleep_mode, lid_sleep_power, lid_battery_floor, pane_logs, pane_log_max_mb, pane_log_total_max_mb, scrollback_lines, unfocused_redraw_fps, mouse_click_forward, paste_guard, paste_guard_policy, theme, ui_mode, sidebar_width, show_hidden_files, telemetry, welcome_dismissed, update_card_dismissed, limit_service, language, runner_defaults, theme_colors, theme_presets, font_family, font_size
 SetupConfig: orchestrator, setup, agents_sync, spawn_layout, confirm_close, ctx_threshold
@@ -71,6 +78,7 @@ TaskStatus: Open, Done, Dismissed
 TaskStore: version, tasks
 ThemeColor: Text, Inactive, Subtle, Suggestion, Remember, Success, Error, Warning, Merged, Claude, Permission, PlanMode, AutoAccept, Ide
 ThemePreset: base, colors
+Tokens: input, output, cache_5m, cache_1h, cache_read
 UiConfig: schema_version, band, usage_bar, buttons, cards, chat, colors
 UsageBarPlace: PromptHint, Band, Off
 UsageBarUi: place, items

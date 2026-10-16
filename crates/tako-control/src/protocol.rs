@@ -2214,7 +2214,9 @@ pub enum Request {
     ///   配置は `pane`（省略時は呼び出し元）を `direction`（省略時は右）へ分割、
     ///   `tab` 指定時はそのタブのフォーカスペインの隣
     /// - "usage": 利用制限（5h / 7d）の観測の要約（ログインごとの最新の % と観測の点数。
-    ///   usage 分析 S1 #2200。`tako_control::usage::summary_payload` の 1 実装 = CLI `tako usage` と同じ）
+    ///   usage 分析 S1 #2200）と、期間の中の使用量の内訳（トークン 5 成分・API 換算・応答数・会話数を
+    ///   `by` の段で束ねる。S2 #2201。`window` は期間、`account` / `project` は絞り込み、`limit` は段の上位）。
+    ///   `tako_control::usage::usage_payload` の 1 実装 = CLI `tako usage` と同じ
     Sessions {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2231,6 +2233,15 @@ pub enum Request {
         tab: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction: Option<Direction>,
+        /// usage の段（#2201）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        /// usage の期間（#2201）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<String>,
+        /// usage の tako アカウントの絞り込み（#2201）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
     /// ペインの平文ターミナルログの参照・設定（Issue #112 B）。
     /// `action`:
