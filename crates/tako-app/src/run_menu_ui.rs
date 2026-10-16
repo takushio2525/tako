@@ -2112,7 +2112,16 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let current = view.run_target();
-        let mut choices = div().flex_1().min_w(px(0.0)).flex().flex_row().gap(px(2.0));
+        // 行の幅（348px）に名前の欄（104px）・2 択・出典タグ・× を並べる。印は選んでいる側にだけ付け
+        // （空の印の枠を両方に取ると「新しいペイン」が出典タグの下へ潜った = #1734 の実画面）、
+        // それでも収まらない字の大きさでは重ねずに切る
+        let mut choices = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .gap(px(2.0));
         for t in RunTarget::ALL.iter().copied() {
             let selected = t == current;
             let key = format!("run-menu-target-{}", t.as_str());
@@ -2124,8 +2133,9 @@ impl TakoApp {
                     .flex()
                     .flex_row()
                     .items_center()
+                    .flex_none()
                     .gap(px(3.0))
-                    .px(px(5.0))
+                    .px(px(4.0))
                     .py(px(2.0))
                     .rounded(px(3.0))
                     .text_size(px(11.0))
@@ -2143,7 +2153,7 @@ impl TakoApp {
                         cx.stop_propagation();
                         this.run_menu_select_target(pane, t, cx);
                     }))
-                    .child(check_slot(selected, theme))
+                    .when(selected, |d| d.child(check_slot(true, theme)))
                     .child(crate::ui_text::preview::run_menu_target_choice(t))
                     .child(probe_canvas(probe, key)),
             );

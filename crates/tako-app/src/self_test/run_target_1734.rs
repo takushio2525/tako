@@ -6,7 +6,8 @@
 //!
 //! - ① `a.sh` を開く → シェブロンを実マウスで押す → 実行先の行（同じペイン / 新しいペイン）が描かれ、
 //!   既定は「同じペイン」・出典は既定（画像 `open`）
-//! - ② 「新しいペイン」を押す → `run-configs.json` の files に `target: "new"`・出典はファイル（画像 `new`）
+//! - ② 「新しいペイン」を押す → `run-configs.json` の files に `target: "new"`・出典はファイル（画像 `new`）・
+//!   選択肢が出典タグに重ならない（④ でも見る）
 //! - ③ 再生ボタンを実マウスで 2 回押す → タブのペインが **2 枚**増える（画像 `two`。A/B:
 //!   `TAKO_1734_LEGACY=1` は保存しても使い回すので 1 枚しか増えず、ここで名指しの FAILED）
 //! - ④ 「同じペイン」を押す → `target: "reuse"`（保存先は今の出典 = ファイル）→ 再生ボタン 2 回で増えない（画像 `reuse`）
@@ -104,6 +105,26 @@ fn click_probe(
         .unwrap_or_else(|| fail(&format!("visual-test {LABEL} {step}: `{key}` の矩形が無い")));
     click_at(any, cx, at);
     notify_and_draw(any, window, cx);
+}
+
+/// 実行先の選択肢が出典タグに重ならない（右の選択肢の右端 ≤ タグの左端。#1734 の実画面で
+/// 「新しいペイン」がタグの下へ潜った形を名指しで落とす）
+fn check_no_overlap(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, step: &str) {
+    let choice = probe_bounds(window, cx, "run-menu-target-new");
+    let tag = probe_bounds(window, cx, "run-menu-target-tag");
+    let (Some(choice), Some(tag)) = (choice, tag) else {
+        fail(&format!(
+            "visual-test {LABEL} {step}: 実行先の選択肢か出典タグの矩形が無い"
+        ));
+    };
+    check(
+        choice.right() <= tag.left(),
+        &format!(
+            "visual-test {LABEL} {step}: 実行先の選択肢が出典タグに重ならない（選択肢の右端 {:?} / タグの左端 {:?}）",
+            choice.right(),
+            tag.left()
+        ),
+    );
 }
 
 /// 開いているタブのペインの数
@@ -287,6 +308,7 @@ pub(super) async fn run_target_1734_visual(
     let _ = wait_run_view(any, window, cx, pv, Duration::from_secs(15)).await;
     reveal(any, window, cx, "run-menu-target-new");
     dump(any, window, cx, "new");
+    check_no_overlap(window, cx, "②");
     let view = view_of(window, cx, pv).unwrap_or_default();
     let files = stored_targets("file");
     println!("TAKO_VISUAL_1734: ② files.target={files:?}");
@@ -338,6 +360,7 @@ pub(super) async fn run_target_1734_visual(
     open_menu(any, window, cx, pv, "④").await;
     reveal(any, window, cx, "run-menu-target-reuse");
     dump(any, window, cx, "reuse");
+    check_no_overlap(window, cx, "④");
     check(
         after == before,
         &format!(

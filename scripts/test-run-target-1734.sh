@@ -149,14 +149,15 @@ d = json.load(sys.stdin)
 print(len(d["tabs"][0]["panes"]))' 2>/dev/null || echo "__NO_LIST__"
 }
 
-# run_twice <file> → 2 回走らせて「増えた枚数」（応答は $RUN1 / $RUN2）
+# run_twice <file> → 2 回走らせ、増えた枚数を ADDED・応答を RUN1 / RUN2 へ置く
+# （`$(run_twice …)` で呼ぶとサブシェルになり RUN1 / RUN2 が呼び手へ戻らないので、値はグローバルで返す）
 run_twice() {
   local before after
   before="$(pane_count)"
   RUN1="$("$TAKO_BIN" run "$1" --pane "$ROOT" 2>&1)"
   RUN2="$("$TAKO_BIN" run "$1" --pane "$ROOT" 2>&1)"
   after="$(pane_count)"
-  echo $((after - before))
+  ADDED=$((after - before))
 }
 
 # ② と ⑦ の判定（A/B で同じ関数を使う）: target=new を保存して 2 回で 2 枚増えたか
@@ -201,9 +202,9 @@ check_eq "① run-configs.json の files に target new" "new" "$(stored_target 
 
 echo
 echo "== ② tako run を 2 回 → ペインが 2 枚増える =="
-N2="$(run_twice "$PROJ/a.sh")"
-echo "  増えた枚数: $N2 / 2 回目の応答: $(oneline "$RUN2" | head -c 300)"
-check_eq "② target=new で 2 回 = 2 枚増える" "OK" "$(judge_two_panes "$N2")"
+run_twice "$PROJ/a.sh"
+echo "  増えた枚数: $ADDED / 2 回目の応答: $(oneline "$RUN2" | head -c 300)"
+check_eq "② target=new で 2 回 = 2 枚増える" "OK" "$(judge_two_panes "$ADDED")"
 check_eq "② 応答の target は new" "new" "$(field target "$RUN2")"
 check_eq "② 2 回目も分割した（reused_from は null）" "None" "$(field reused_from "$RUN2")"
 check_eq "② 出典は file" "file" "$(field config_sources.target "$RUN2")"
@@ -217,8 +218,8 @@ check_eq "③ MCP new_pane:false は保存の new でも使い回す（増えな
 check_eq "③ その応答の target は reuse" "reuse" "$(field target "$M3")"
 R3="$("$TAKO_BIN" run-config "$PROJ/a.sh" --target reuse 2>&1)"
 check_eq "③ --target reuse を保存（今の保存先 = ファイル）" "reuse" "$(stored_target files "$PROJ/a.sh")"
-N3="$(run_twice "$PROJ/a.sh")"
-check_eq "③ target=reuse で 2 回 = 増えない" "0" "$N3"
+run_twice "$PROJ/a.sh"
+check_eq "③ target=reuse で 2 回 = 増えない" "0" "$ADDED"
 B3b="$(pane_count)"
 R3b="$("$TAKO_BIN" run "$PROJ/a.sh" --pane "$ROOT" --new-pane 2>&1)"
 A3b="$(pane_count)"
@@ -276,20 +277,20 @@ check_eq "⑥ 旧い形の引数が効く（出典 file）" '{"source": "file", 
 check_eq "⑥ 実行先は既定" '{"source": "default", "value": null}' "$(field config.target "$R6")"
 UNREADABLE="$(ls "$TAKO_DATA_DIR" | grep -c unreadable)"
 check_eq "⑥ 読めないとして退避していない（.unreadable.bak が 0 件）" "0" "$UNREADABLE"
-N6="$(run_twice "$PROJ/b.sh")"
-check_eq "⑥ 実行先が既定なので 2 回で 1 枚（使い回す）" "1" "$N6"
+run_twice "$PROJ/b.sh"
+check_eq "⑥ 実行先が既定なので 2 回で 1 枚（使い回す）" "1" "$ADDED"
 
 echo
 echo "== ⑦ A/B: TAKO_1734_LEGACY=1 で立て直す =="
 "$TAKO_BIN" run-config "$PROJ/a.sh" --target new >/dev/null 2>&1
-NN="$(run_twice "$PROJ/a.sh")"
-check_eq "⑦ 新しい挙動では 2 枚増える" "OK" "$(judge_two_panes "$NN")"
+run_twice "$PROJ/a.sh"
+check_eq "⑦ 新しい挙動では 2 枚増える" "OK" "$(judge_two_panes "$ADDED")"
 stop_gui
 start_gui "$TMP/app-legacy.log" TAKO_1734_LEGACY=1 || exit 1
 check_eq "⑦ LEGACY でも保存値は読める（保存の口は同じ）" "new" "$(stored_target files "$PROJ/a.sh")"
-NL="$(run_twice "$PROJ/a.sh")"
-echo "  LEGACY の増えた枚数: $NL"
-check_eq "⑦ LEGACY では ② の判定が FAILED（保存の new が効かない）" "FAILED" "$(judge_two_panes "$NL")"
+run_twice "$PROJ/a.sh"
+echo "  LEGACY の増えた枚数: $ADDED"
+check_eq "⑦ LEGACY では ② の判定が FAILED（保存の new が効かない）" "FAILED" "$(judge_two_panes "$ADDED")"
 stop_gui
 
 echo
