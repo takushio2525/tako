@@ -1581,6 +1581,47 @@ mod tests {
         assert!(head.ends_with('…'));
     }
 
+    /// プロンプト冒頭の抜粋の固定値（#1790）。内容は最大 `max` 文字で `…` は上限の外・
+    /// 空白は畳んでから数える。本番の呼び手は spawn の記録（`max` = 200）
+    #[test]
+    fn prompt_headの切り詰めの固定値() {
+        // ちょうど max 文字は切らない
+        assert_eq!(prompt_head(&"あ".repeat(10), 10), "あ".repeat(10));
+        // max + 1 文字ちょうど
+        assert_eq!(
+            prompt_head(&"あ".repeat(11), 10),
+            format!("{}…", "あ".repeat(10))
+        );
+        // max + 2 文字以上は内容 max 文字 + `…`
+        assert_eq!(
+            prompt_head(&"あ".repeat(12), 10),
+            format!("{}…", "あ".repeat(10))
+        );
+        // 4 バイト文字も 1 文字・結合文字（NFD の「が」）は濁点を別の 1 文字に数える
+        assert_eq!(
+            prompt_head(&"🎉".repeat(300), 200),
+            format!("{}…", "🎉".repeat(200))
+        );
+        assert_eq!(
+            prompt_head(&"か\u{3099}".repeat(10), 5),
+            "か\u{3099}か\u{3099}か…"
+        );
+        // 改行・タブ・全角空白は半角空白 1 個へ畳み、前後は落としてから数える
+        assert_eq!(
+            prompt_head("\n  Issue #12\tを\u{3000}直す  \n", 200),
+            "Issue #12 を 直す"
+        );
+        assert_eq!(prompt_head("a\n\nb c d", 3), "a b…");
+        // max = 0（1 文字でも `…` だけ）・max が最大でもあふれない
+        assert_eq!(prompt_head("abc", 0), "…");
+        assert_eq!(prompt_head("a", 0), "…");
+        assert_eq!(prompt_head("abc", usize::MAX), "abc");
+        // 空・空白だけは空
+        assert_eq!(prompt_head("", 10), "");
+        assert_eq!(prompt_head("", 0), "");
+        assert_eq!(prompt_head(" \n\t", 10), "");
+    }
+
     #[test]
     fn pending記録と昇格の統合() {
         let path = temp_path("promote");

@@ -530,6 +530,47 @@ mod tests {
         assert!(cut.ends_with('…'));
     }
 
+    /// 理由文の切り詰めの固定値（#1790）。内容は最大 `DETAIL_MAX_CHARS` 文字で `…` は
+    /// 上限の外（`…` 込みで最大 `DETAIL_MAX_CHARS + 1` 文字）・空白は畳んでから数える
+    #[test]
+    fn 理由文の切り詰めの固定値() {
+        let max = DETAIL_MAX_CHARS;
+        // ちょうど上限は切らない
+        assert_eq!(trim_detail(&"あ".repeat(max)), "あ".repeat(max));
+        // 上限 + 1 文字ちょうど
+        assert_eq!(
+            trim_detail(&"あ".repeat(max + 1)),
+            format!("{}…", "あ".repeat(max))
+        );
+        // 上限 + 2 文字以上は内容 max 文字 + `…`
+        assert_eq!(
+            trim_detail(&"あ".repeat(max + 2)),
+            format!("{}…", "あ".repeat(max))
+        );
+        // 4 バイト文字も 1 文字・結合文字（NFD の「が」）は濁点を別の 1 文字に数える
+        assert_eq!(
+            trim_detail(&"🎉".repeat(max + 50)),
+            format!("{}…", "🎉".repeat(max))
+        );
+        assert_eq!(
+            trim_detail(&"か\u{3099}".repeat(max)),
+            format!("{}…", "か\u{3099}".repeat(max / 2))
+        );
+        // 改行・タブ・全角空白は半角空白 1 個へ畳み、前後は落とす
+        assert_eq!(
+            trim_detail(" \tTailscale が\r\n\u{3000}見つかりません \n"),
+            "Tailscale が 見つかりません"
+        );
+        // 畳んだ後の文字数で切る（「あ あ … あ」= 2 * max - 1 文字）
+        assert_eq!(
+            trim_detail(&"あ\n".repeat(max)),
+            format!("{}…", "あ ".repeat(max / 2))
+        );
+        // 空・空白だけは空
+        assert_eq!(trim_detail(""), "");
+        assert_eq!(trim_detail(" \n\t"), "");
+    }
+
     /// status は daemon が止まっていても意図を名乗る（黙らない）
     #[test]
     fn statusは意図と直近の結果を載せる() {
