@@ -998,6 +998,28 @@ impl TerminalSession {
         out
     }
 
+    /// 表示中の画面の**直上の履歴 `history` 行（あるだけ）+ 画面**を、上から順の平文で返す（#2181）。
+    ///
+    /// 1 回のロックで読むので、履歴と画面の継ぎ目で行が重ならない・抜けない
+    /// （[`Self::history_plain_lines`] と [`Self::visible_lines`] を別々に呼ぶと、あいだに
+    /// PTY の出力が入りうる）。上へスクロールしていれば、その表示位置の直上を読む。
+    /// 各行は [`Self::visible_lines`] と 1 バイトも変わらない（[`Self::compose_grid_row`] の 1 実装）
+    pub fn lines_with_history(&self, history: usize) -> Vec<String> {
+        use alacritty_terminal::index::Line;
+
+        let term = self.term.lock();
+        let rows = term.screen_lines() as i32;
+        let grid = term.grid();
+        let cols = grid.columns();
+        let offset = grid.display_offset();
+        let above = grid.history_size().saturating_sub(offset).min(history) as i32;
+        let offset = offset as i32;
+        // 表示位置 d の画面は Line(-d ..= rows-d-1)（`tail_lines` と同じ）。その直上の above 行から読む
+        (-offset - above..rows - offset)
+            .map(|line| Self::compose_grid_row(&grid[Line(line)], cols))
+            .collect()
+    }
+
     /// スクロールバック表示を絶対位置へ動かす（0 = 最下部。history を超えると先頭へクランプ）。
     /// 行単位 API なので端数はリセットして整数位置へスナップする
     pub fn scroll_to(&self, offset: usize) {
@@ -3232,6 +3254,52 @@ mod tests {
             seen.iter().any(|l| l.is_empty()),
             "空行が比べた窓に入っていない: {seen:?}"
         );
+    }
+
+    /// #2181: `lines_with_history` は「表示位置の直上の履歴 + 画面」を継ぎ目なしで返す
+    /// （履歴の平文行 + 可視行と 1 バイトも変わらない。上へスクロールしていればその位置の直上）
+    #[cfg(unix)]
+    #[test]
+    fn issue2181_履歴つきの行は直上の履歴と画面を継ぎ目なしで返す() {
+        const COLS: usize = 20;
+        const ROWS: usize = 6;
+
+        let script = "i=0; while [ $i -lt 12 ]; do printf 'L%02d\\n' $i; i=$((i+1)); done; \
+                      printf 'READY\\n'; sleep 30";
+        let (session, _rx) = TerminalSession::spawn(
+            COLS,
+            ROWS,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+
+        i1387_wait_visible(&session, "READY", "履歴つきの行");
+        let history = session.history_size();
+        assert!(history >= 6, "履歴へ出ていない: history={history}");
+        // 最下部: 直上の 4 行 + 画面
+        let got = session.lines_with_history(4);
+        let mut want = session.history_plain_lines(0, 4);
+        want.extend(session.visible_lines());
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 4 + ROWS);
+        // 境界: 0 行なら画面だけ・履歴より多く求めればあるだけ
+        assert_eq!(session.lines_with_history(0), session.visible_lines());
+        let all = session.lines_with_history(10_000);
+        assert_eq!(all.len(), history + ROWS);
+        assert!(all.iter().any(|l| l == "L00"), "最古の行まで届く: {all:?}");
+        // 上へ 2 行スクロール: その表示位置の直上を読む
+        session.scroll_to(2);
+        let got = session.lines_with_history(3);
+        let mut want = session.history_plain_lines(2, 3);
+        want.extend(session.visible_lines());
+        assert_eq!(got, want);
+        session.scroll_to_bottom();
     }
 
     /// **#1390**: `set_scrollback_limit` が他の設定を巻き添えにしないこと。

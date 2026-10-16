@@ -20,6 +20,15 @@
 //! （メモリ上のグリッド）だけで、プロセスは起こさない。到達確認（名前解決 + TCP 接続）は
 //! **送ってよい停止が 1 つ以上あるときだけ**、1 本ずつ背景のスレッドで走る
 //! （UI スレッドでは名前解決をしない。結果は 500ms ループが拾う）
+//!
+//! # 締めの行より上が画面の外（#2181）
+//!
+//! 低いペインで、締めの行と通知行だけが見えてエラーの項目が画面の外にある形
+//! （`net_stop::offscreen_print` が印を返す形）に限り、画面の外の直近の行を足して同じ判定を通す。
+//! 器（tmux / psmux）のペインは器の履歴を**背景のスレッド**で読み（UI スレッドで子プロセスを
+//! 起こさない）、結果は次の 2 秒 tick が拾う。器の無い直接のペインは外側の端末の履歴を
+//! メモリから読む。答えは形の印と一緒に覚え、見えている形が同じ印のあいだだけ使う
+//! （止まって動かないペインで読むのは 1 回だけ）
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -57,6 +66,26 @@ struct NetStopTracker {
 /// 到達確認の結果（背景のスレッドが書き、500ms ループが拾う）
 type ProbeSlot = Arc<Mutex<Option<Result<Duration, String>>>>;
 
+/// 画面の外を読んだ結果（背景のスレッドが書き、2 秒 tick が拾う。#2181）。
+/// (ペイン, 読みに行ったときの形の印, 器の「履歴 + 画面」)
+type OffscreenSlot = Arc<Mutex<Vec<(PaneId, u64, Result<Vec<String>, String>)>>>;
+
+/// 1 ペインの画面の外の読み（#2181）。`print` は読みに行ったときの見えている形の印
+#[derive(Debug, Clone)]
+enum Offscreen {
+    /// 器の履歴を背景のスレッドで読んでいる
+    Reading { print: u64 },
+    /// 読んで判定した
+    Read { print: u64, screen: NetScreen },
+}
+
+/// 画面を読んだ結果
+enum NetRead {
+    Screen(NetScreen),
+    /// 見えている行だけでは判定できない（締めの行より上が画面の外）。値は形の印（#2181）
+    Offscreen(u64),
+}
+
 /// 到達確認の状態
 #[derive(Debug, Default)]
 struct ProbeState {
@@ -90,6 +119,9 @@ pub(crate) struct NetResumeState {
     /// 会話が先へ進んだのを見た・送達が届いたと決着したら捨てる（#2157。その後に同じ形の
     /// 停止が見えても、それは次の停止）
     sent_keys: HashMap<PaneId, (u64, Instant)>,
+    /// ペインごとの画面の外の読み（#2181）
+    offscreen: HashMap<PaneId, Offscreen>,
+    offscreen_slot: OffscreenSlot,
     /// 直近の再開の回（応答に出す）
     last_round: Option<serde_json::Value>,
     total_resumed: u64,
@@ -103,6 +135,8 @@ impl NetResumeState {
             probe: ProbeState::default(),
             resumes: HashMap::new(),
             sent_keys: HashMap::new(),
+            offscreen: HashMap::new(),
+            offscreen_slot: OffscreenSlot::default(),
             last_round: None,
             total_resumed: 0,
         }
@@ -121,6 +155,7 @@ impl TakoApp {
             if !self.net_resume.trackers.is_empty() {
                 self.net_resume.trackers.clear();
             }
+            self.net_resume.offscreen.clear();
             self.stop_net_probe_period("disabled");
             return;
         }
@@ -147,11 +182,30 @@ impl TakoApp {
         self.net_resume
             .sent_keys
             .retain(|id, _| targets.iter().any(|(t, _)| t == id));
+        self.net_resume
+            .offscreen
+            .retain(|id, _| targets.iter().any(|(t, _)| t == id));
+        self.take_offscreen_reads();
 
         let legacy = tako_control::net_stop::legacy_2157();
         let mut ready = 0usize;
+        // 画面の外を読みに行っているペイン（答えが来るまで追跡を動かさない = #2181）
+        let mut reading = 0usize;
         for (pane, shelved) in targets {
-            let (stop, dialog) = match self.read_net_screen(pane) {
+            let screen = match self.read_net_screen(pane) {
+                NetRead::Screen(s) => {
+                    self.net_resume.offscreen.remove(&pane);
+                    s
+                }
+                NetRead::Offscreen(print) => match self.offscreen_screen(pane, print) {
+                    Some(s) => s,
+                    None => {
+                        reading += 1;
+                        continue;
+                    }
+                },
+            };
+            let (stop, dialog) = match screen {
                 NetScreen::Stopped(s) => (s, false),
                 NetScreen::Dialog(s) => (s, true),
                 NetScreen::Progressed => {
@@ -227,30 +281,149 @@ impl TakoApp {
             }
         }
         if ready == 0 {
-            self.stop_net_probe_period("nothing_to_resume");
+            // 読みに行っている停止があるあいだは到達確認の期間を閉じない（次の tick で答えが来る）
+            if reading == 0 {
+                self.stop_net_probe_period("nothing_to_resume");
+            }
             return;
         }
         self.maybe_start_net_probe(ready);
     }
 
-    /// 画面を読んで判定する（ペインの画面が無ければ Clear）
-    fn read_net_screen(&self, pane: PaneId) -> NetScreen {
+    /// 画面を読んで判定する（ペインの画面が無ければ Clear）。見えている行だけでは判定できない
+    /// 形（締めの行より上が画面の外）なら `Offscreen` を返す（#2181）
+    fn read_net_screen(&self, pane: PaneId) -> NetRead {
+        use tako_control::net_stop;
         let Some(session) = self.terminals.get(&pane) else {
-            return NetScreen::Clear;
+            return NetRead::Screen(NetScreen::Clear);
         };
         // 普段は画面末尾だけ。入力欄の上に会話の項目が見えないときだけ全体を読む
         let tail = session.tail_lines(tako_core::terminal::AGENT_TUI_TAIL_LINES);
-        let lines = if tako_control::net_stop::needs_full_screen(&tail) {
-            session.visible_lines()
-        } else {
-            tail
+        let full = net_stop::needs_full_screen(&tail);
+        let lines = if full { session.visible_lines() } else { tail };
+        let screen = net_stop::detect(&lines);
+        if screen != NetScreen::Clear {
+            return NetRead::Screen(screen);
+        }
+        let Some(print) = net_stop::offscreen_print(&lines) else {
+            return NetRead::Screen(screen);
         };
-        tako_control::net_stop::detect(&lines)
+        // 窓より低いペインは末尾の窓が画面全体
+        if full || lines.len() < tako_core::terminal::AGENT_TUI_TAIL_LINES {
+            return NetRead::Offscreen(print);
+        }
+        // 末尾の窓の外でも画面の中なら、画面全体で足りる（背の高いペイン）
+        let lines = session.visible_lines();
+        match net_stop::detect(&lines) {
+            NetScreen::Clear => match net_stop::offscreen_print(&lines) {
+                Some(print) => NetRead::Offscreen(print),
+                None => NetRead::Screen(NetScreen::Clear),
+            },
+            screen => NetRead::Screen(screen),
+        }
     }
 
-    /// 画面を読んで停止を切り出す。(停止, ダイアログ中か)。止まっていなければ None
+    /// 画面の外を足した判定（#2181）。覚えた答えが同じ形の印なら使う。無ければ読みに行く:
+    /// 器の無い直接のペインはメモリの履歴をその場で、器のペインは背景のスレッドで
+    /// （その間は None = 判定を保留する）
+    fn offscreen_screen(&mut self, pane: PaneId, print: u64) -> Option<NetScreen> {
+        use tako_control::net_stop;
+        match self.net_resume.offscreen.get(&pane) {
+            Some(Offscreen::Read { print: p, screen }) if *p == print => {
+                return Some(screen.clone())
+            }
+            Some(Offscreen::Reading { print: p }) if *p == print => return None,
+            _ => {}
+        }
+        // 取り込みビュー（外部の tmux セッションの attach クライアント。#1185）は tako の器の
+        // 外なので読まない（止まっていると言わない）
+        if self.tmux_view_panes.contains_key(&pane) {
+            return Some(NetScreen::Clear);
+        }
+        let Some(session) = self.backend_sessions.get(&pane).cloned() else {
+            let lines = self
+                .terminals
+                .get(&pane)?
+                .lines_with_history(net_stop::OFFSCREEN_LINES);
+            let screen = net_stop::detect_offscreen(&lines, print);
+            self.net_resume.offscreen.insert(
+                pane,
+                Offscreen::Read {
+                    print,
+                    screen: screen.clone(),
+                },
+            );
+            return Some(screen);
+        };
+        self.net_resume
+            .offscreen
+            .insert(pane, Offscreen::Reading { print });
+        let slot = self.net_resume.offscreen_slot.clone();
+        let spawned = std::thread::Builder::new()
+            .name("tako-net-offscreen".into())
+            .spawn(move || {
+                let read = net_stop::capture_offscreen(&session);
+                if let Ok(mut s) = slot.lock() {
+                    s.push((pane, print, read));
+                }
+            });
+        if let Err(e) = spawned {
+            // 読めないなら止まっていると言わない（同じ形のあいだは読み直さない）
+            self.net_resume.offscreen.insert(
+                pane,
+                Offscreen::Read {
+                    print,
+                    screen: NetScreen::Clear,
+                },
+            );
+            tako_control::diag::persist_log(&format!(
+                "[net-resume] 画面の外を読むスレッドを起こせない: {e}"
+            ));
+        }
+        None
+    }
+
+    /// 背景のスレッドが読み終えた画面の外を取り込む（#2181）。読みに行ったときと同じ形の印の
+    /// ままのペインだけ判定する（読むあいだに形が変わったものは捨てる = 新しい形で読み直す）
+    fn take_offscreen_reads(&mut self) {
+        let done = match self.net_resume.offscreen_slot.lock() {
+            Ok(mut s) => std::mem::take(&mut *s),
+            Err(_) => return,
+        };
+        for (pane, print, read) in done {
+            if !matches!(
+                self.net_resume.offscreen.get(&pane),
+                Some(Offscreen::Reading { print: p }) if *p == print
+            ) {
+                continue;
+            }
+            let screen = match read {
+                Ok(lines) => tako_control::net_stop::detect_offscreen(&lines, print),
+                Err(e) => {
+                    tako_control::diag::persist_log(&format!(
+                        "[net-resume] pane={} 画面の外を読めない: {e}",
+                        pane.as_u64()
+                    ));
+                    NetScreen::Clear
+                }
+            };
+            self.net_resume
+                .offscreen
+                .insert(pane, Offscreen::Read { print, screen });
+        }
+    }
+
+    /// 画面を読んで停止を切り出す。(停止, ダイアログ中か)。止まっていなければ None。
+    /// 締めの行より上が画面の外なら、同じ形の印で覚えた答えだけを使う（ここでは読みに行かない）
     fn observe_net_stop(&self, pane: PaneId) -> Option<(NetStop, bool)> {
-        match self.read_net_screen(pane) {
+        let screen = match self.read_net_screen(pane) {
+            NetRead::Screen(s) => s,
+            NetRead::Offscreen(print) => match self.net_resume.offscreen.get(&pane) {
+                Some(Offscreen::Read { print: p, screen }) if *p == print => screen.clone(),
+                _ => return None,
+            },
+        };
+        match screen {
             NetScreen::Stopped(s) => Some((s, false)),
             NetScreen::Dialog(s) => Some((s, true)),
             NetScreen::Progressed | NetScreen::Clear => None,
@@ -517,6 +690,7 @@ impl TakoApp {
         self.net_resume.enabled = enabled;
         if !enabled {
             self.net_resume.trackers.clear();
+            self.net_resume.offscreen.clear();
             self.stop_net_probe_period("disabled");
         }
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
