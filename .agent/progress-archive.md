@@ -578,3 +578,10 @@
 - 2026-10-16 #1954: two-face に無い PowerShell（.ps1 / .psm1 / .psd1）の構文を足した
 - 2026-10-16 #2133: master の引き継ぎの後に spawn した worker が master の領域を割らない = 前任を閉じたら worker の `spawned_by` を後任へ付け替え
 - 2026-10-16 #2136: fd 漏れテストを理由にした回避策 7 箇所の理由文を実態へ直し（外したもの 0）、IpcServer の drop で受け口を閉じる
+- 2026-10-16 #1733: 実行ボタン横のドロップダウンで実行環境・引数・環境変数等を見て変える = Code Runner S5
+- 2026-10-16 #1735: 実行環境の表に Node（nvm / fnm・`.nvmrc` の前方一致・`node_modules/.bin` を PATH の先頭）と Rust（rust-toolchain）の行
+- 2026-10-16 #1955: Finder の「このアプリケーションで開く」を動的 UTI の形式へ広げない
+- 2026-10-16 #1981: local-rules の常時部が取り分を超えたら `tako migrate` に区切りを上げる案を出し、明示の `tako migrate run` でだけ動かす
+- 2026-10-16 #2047: CI 待ちの上限を 4800 秒へ伸ばし、上限に達したら最後に 2 回まで見て緑 / 赤を確定する
+- 2026-10-16 #2015: ファイルツリーで表に無い拡張子なしの dotfile（`.npmrc` 等）を設定アイコンに = 常に偽だった判定を直した
+- 2026-10-16 #2014: プレビューの変更履歴を開く切替の git（rev-parse / log --follow）を background の `OffloadJob::PreviewChangelog` へ・上限 30 秒
