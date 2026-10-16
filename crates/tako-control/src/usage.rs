@@ -582,7 +582,7 @@ mod tests {
             seen += 1;
             for needle in [
                 UUID_A,
-                &UUID_A[..8],
+                UUID_A.split('-').next().unwrap(),
                 "someone@example.com",
                 "label-marker",
                 "/secret-cwd",

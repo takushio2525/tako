@@ -165,8 +165,9 @@ fn 実経路で生の識別子も設定dirも出さず_heartbeatで増えず_ab_
     let cfg_text = cfg.display().to_string();
     let needles = [
         UUID,
-        &UUID[..8],
-        &UUID[UUID.len() - 12..],
+        // uuid の先頭と末尾の塊（断片だけが出ても名指す）
+        UUID.split('-').next().unwrap(),
+        UUID.rsplit('-').next().unwrap(),
         EMAIL,
         BODY_MARK,
         cfg_text.as_str(),
