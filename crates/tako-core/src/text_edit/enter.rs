@@ -97,10 +97,12 @@ pub(super) fn list_item(line: &str) -> Option<ListItem<'_>> {
         }
         _ => marker.to_string(),
     };
+    // 切り出し安全: spacing は印の後ろの ASCII の空白とタブのバイト数
     let space = &after_marker[..spacing];
     let mut content_start = indent_len + marker_len + spacing;
     let mut next_marker = format!("{next}{space}");
     // チェックボックス（`[ ]` / `[x]`）は空の箱を引き継ぐ
+    // 切り出し安全: spacing は印の後ろの ASCII の空白とタブのバイト数
     let body = &after_marker[spacing..];
     if let Some(after_box) = ["[ ]", "[x]", "[X]"]
         .iter()
@@ -109,6 +111,7 @@ pub(super) fn list_item(line: &str) -> Option<ListItem<'_>> {
         let box_spacing = after_box.len() - after_box.trim_start_matches([' ', '\t']).len();
         if box_spacing > 0 || after_box.is_empty() {
             let gap = if box_spacing > 0 {
+                // 切り出し安全: box_spacing は箱の後ろの ASCII の空白とタブのバイト数
                 &after_box[..box_spacing]
             } else {
                 " "
@@ -144,10 +147,7 @@ pub(super) fn fence_scan_start(text: &str, line_start: usize) -> usize {
     if line_start <= SCAN_WINDOW {
         return 0;
     }
-    let mut from = line_start - SCAN_WINDOW;
-    while !text.is_char_boundary(from) {
-        from += 1;
-    }
+    let from = text.ceil_char_boundary(line_start - SCAN_WINDOW);
     text[from..line_start]
         .find('\n')
         .map_or(line_start, |p| from + p + 1)
@@ -166,6 +166,7 @@ pub(super) fn in_fenced_code(text: &str, from: usize, line_start: usize) -> bool
         if lead > 3 {
             continue;
         }
+        // 切り出し安全: lead は行頭の ASCII の空白のバイト数
         let rest = &line[lead..];
         let Some(&mark) = rest.as_bytes().first().filter(|b| matches!(b, b'`' | b'~')) else {
             continue;

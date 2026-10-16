@@ -1453,6 +1453,7 @@ impl TextBuffer {
             return;
         }
         let before = &self.text[line_start..range.start];
+        // 切り出し安全: 行頭の ASCII の空白とタブのバイト数
         let indent = &before[..before.len() - before.trim_start_matches([' ', '\t']).len()];
         let line_end = self.line_end(range.end);
         let after = &self.text[range.end..line_end];
@@ -3108,6 +3109,7 @@ fn changed_span<'a>(old: &str, new: &'a str) -> (Range<usize>, &'a str) {
     while !old.is_char_boundary(a.len() - suffix) {
         suffix -= 1;
     }
+    // 切り出し安全: old の文字境界へ丸めた共通部分は new でも同じバイト列 = new でも文字境界
     (prefix..a.len() - suffix, &new[prefix..b.len() - suffix])
 }
 
@@ -6758,6 +6760,7 @@ mod tests {
         assert_eq!(b.cursor(), 27);
         assert_eq!(&formatted[b.cursor()..b.cursor() + 1], "x");
         assert_eq!(b.anchor(), Some(18));
+        // 切り出し安全: 固定の ASCII の整形結果
         assert_eq!(&formatted[18..19], "t");
         // 書き換えの始まりにいたら手前のまま（挿入された空白の前）
         let mut b = TextBuffer::from_text(path("f13.rs"), UNFORMATTED.into());

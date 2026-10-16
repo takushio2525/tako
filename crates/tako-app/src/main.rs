@@ -1480,6 +1480,7 @@ const CLEANUP_STARTUP_GRACE_SECS: u64 = 3600;
 fn new_backend_session_name() -> String {
     let token =
         tako_control::generate_token().unwrap_or_else(|_| format!("{:024x}", std::process::id()));
+    // 切り出し安全: token は generate_token の 16 進（失敗時の `{:024x}` も）= ASCII
     let tail = &token[..12.min(token.len())];
     format!("{}{tail}", tako_core::tmux_backend::SESSION_PREFIX)
 }
@@ -13675,7 +13676,7 @@ impl TakoApp {
                 }
             }
             // 材料はここで 1 回だけ採る（どちらもプロセスを起こさない）
-            let lines = self
+            let lines: Vec<String> = self
                 .terminals
                 .get(&pane)
                 .map(|s| s.visible_lines())
@@ -42878,6 +42879,7 @@ mod self_test {
                             .unwrap_or(point(x0.x + cell, x0.y));
                         let last = layout
                             .position_for_index(
+                                // 切り出し安全: fixture の固定行で、終端は find の位置か行末（文字境界）
                                 lines[e.line][..e.bytes.end.min(lines[e.line].len())]
                                     .char_indices()
                                     .last()
@@ -50828,6 +50830,7 @@ mod self_test {
             editing
                 && matches!(section, Some(LspMenuSection::Items(_)))
                 && drawn.len() > 5
+                // 切り出し安全: drawn は項目 id の Vec（直前で 5 件を超えると確かめた）
                 && drawn[..5] == goto_ids[..],
             &format!("visual-test lsp-context-menu ⑤': 編集モードでも識別子の右クリックで項目が出る（{drawn:?}）"),
         );
@@ -95803,7 +95806,7 @@ mod chunk_tests {
         let mut infos: Vec<CharInfo> = "ターミナル".chars().map(|c| ci(c, 2, 0, false)).collect();
         infos.push(ci('U', 1, 0, true));
         infos.push(ci('I', 1, 0, true));
-        let chunks = chunk_line_chars(&infos);
+        let chunks: Vec<_> = chunk_line_chars(&infos);
         assert_eq!(chunks.len(), 6); // 全角 5 個 + "UI" 1 グループ
         for c in &chunks[..5] {
             assert_eq!(c.end - c.start, 1);
@@ -99353,7 +99356,8 @@ impl Workspace {
         );
         let after_set = &text[sets[0].0..];
         assert!(
-            after_set[..400].contains("press(final_any, cx, \"cmd-q\")"),
+            after_set[..after_set.ceil_char_boundary(400)]
+                .contains("press(final_any, cx, \"cmd-q\")"),
             "ラッチが最終項目の cmd-q の直前に無い（#872）"
         );
     }
@@ -101380,7 +101384,7 @@ mod pane_menu_items_tests {
         use tako_core::lsp::goto::GotoKind;
         use tako_core::lsp::menu::MenuItem;
         let base = ids(facts(true, false));
-        let with = ids(lsp_facts(LspMenuSection::Items(vec![
+        let with: Vec<&str> = ids(lsp_facts(LspMenuSection::Items(vec![
             MenuItem::Goto(GotoKind::Definition),
             MenuItem::Goto(GotoKind::Implementation),
             MenuItem::Format,
@@ -101420,7 +101424,7 @@ mod pane_menu_items_tests {
     #[test]
     fn 握手待ちは押せない1行で識別子でない位置は従来のまま() {
         use crate::lsp_menu_ui::LspMenuSection;
-        let pending = ids(lsp_facts(LspMenuSection::Pending));
+        let pending: Vec<&str> = ids(lsp_facts(LspMenuSection::Pending));
         assert_eq!(&pending[..2], &["note-lsp-pending", "sep-lsp"]);
         assert!(
             tako_core::lsp::menu::MenuItem::from_id(pending[0]).is_none(),

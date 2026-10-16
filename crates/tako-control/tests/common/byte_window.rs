@@ -14,6 +14,8 @@
 //!
 //! 固定幅の添字を直書きしないことは `issue2043_byte_window_watchdog` が縛る。
 //! 他の crate の `tests/` から使うときも `#[path]` でこのファイルを取り込む（写さない）。
+//! 製品ファイルの `#[cfg(test)]` からは取り込めないので、同じ向き（外側）へ std の
+//! `ceil_char_boundary` / `floor_char_boundary` で丸める（#1790 の番犬が見る）。
 //! 規約は `.agent/conventions.md`「文字列をバイト位置で切らない」
 
 // 取り込む番犬ごとに使う関数が違う（片方しか使わないファイルがある）

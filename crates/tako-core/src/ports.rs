@@ -1226,6 +1226,7 @@ mod tests {
             cmp.mismatches.is_empty(),
             "libproc の答えが ps とずれている（{} 件。先頭 10 件: {:?}）",
             cmp.mismatches.len(),
+            // 切り出し安全: mismatches はずれの行の Vec
             &cmp.mismatches[..cmp.mismatches.len().min(10)]
         );
         // 2 回の libproc の間（数十 ms）に変わるのは exec した・親が死んだものだけで、

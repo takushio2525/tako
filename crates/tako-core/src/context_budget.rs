@@ -575,6 +575,7 @@ impl LogEntry {
     /// 見出しの日付より後ろの部分（`## 2026-08-24（…）` → `（…）`）
     fn heading_tail(&self) -> &str {
         let after = self.heading.trim_start_matches('#').trim_start();
+        // 切り出し安全: date は見出しの先頭 10 文字の ASCII（heading_date）
         after[self.date.len().min(after.len())..].trim()
     }
 

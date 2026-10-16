@@ -303,6 +303,7 @@ fn release_lost(any: AnyWindowHandle, cx: &mut AsyncApp, at: Point<Pixels>) {
 
 /// 選択の頭が端を置いた位置（`TOP-` / `ALT-` 行の 8 桁目 = `e`）か
 fn starts_at_col8(text: &str, head: &str) -> bool {
+    // 切り出し安全: TAIL は ASCII の定数
     text.starts_with(&TAIL[4..]) && !text.contains(&format!("{head}-abcd"))
 }
 

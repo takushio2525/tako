@@ -676,6 +676,7 @@ fn parse_status(raw: &str) -> GitStatus {
             // 通常変更 / リネーム
             let bytes = line.as_bytes();
             if bytes.len() > 4 {
+                // 切り出し安全: porcelain v2 の XY は行頭の `1 ` / `2 ` の直後の ASCII 2 文字
                 let xy_str = &line[2..4];
                 let mut chars = xy_str.chars();
                 let index = chars.next().unwrap_or('.');

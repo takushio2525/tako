@@ -1105,7 +1105,7 @@ mod tests {
         // PowerShell 側は `-EncodedCommand`（#903）。器（psmux）が内側コマンドを
         // 単語分割するので、引用符・空白・非 ASCII を含む片は符号化しないと死ぬ
         let snippet = "$last = ''; Write-Host -NoNewline '❯ 箱'; Start-Sleep 30";
-        let got = PS.shell_snippet_command(snippet);
+        let got: Vec<String> = PS.shell_snippet_command(snippet);
         assert_eq!(got[..3], ["powershell", "-NoProfile", "-EncodedCommand"]);
         assert!(
             got[3]
@@ -1286,7 +1286,7 @@ mod tests {
     #[test]
     fn 打鍵をそのまま返すペインのargvは方言で変わる() {
         assert_eq!(POSIX.echo_stdin_command(), vec!["cat".to_string()]);
-        let ps = PS.echo_stdin_command();
+        let ps: Vec<String> = PS.echo_stdin_command();
         // 渡し方は `shell_snippet_command` と同じ = `-EncodedCommand`（#903）
         assert_eq!(ps[..3], ["powershell", "-NoProfile", "-EncodedCommand"]);
         let snippet = crate::platform::shell::decode_powershell_command(&ps[3]);

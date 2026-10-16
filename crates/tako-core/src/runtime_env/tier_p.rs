@@ -259,13 +259,7 @@ impl FsProbe for OverlayFs<'_> {
 
     fn read_head(&self, path: &Path, max: usize) -> Option<String> {
         match self.files.get(path) {
-            Some(text) => {
-                let mut end = text.len().min(max);
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                Some(text[..end].to_string())
-            }
+            Some(text) => Some(text[..text.floor_char_boundary(max)].to_string()),
             None => self.inner.read_head(path, max),
         }
     }

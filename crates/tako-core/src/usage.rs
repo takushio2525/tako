@@ -81,6 +81,7 @@ fn salted_key(domain: &str, salt: &str, value: &str) -> String {
     h.update(b"\n");
     h.update(value.as_bytes());
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    // 切り出し安全: SHA-256 の 16 進（ASCII）の先頭 12 桁
     hex[..KEY_HEX_LEN].to_string()
 }
 

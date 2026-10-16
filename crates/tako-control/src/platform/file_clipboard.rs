@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn dropfilesは頭20バイトと二重nul終端のutf16で組み読み戻せる() {
         let paths = vec![wide(r"C:\w\a.txt"), wide(r"C:\日本 語\b")];
-        let bytes = dropfiles_bytes(&paths);
+        let bytes: Vec<u8> = dropfiles_bytes(&paths);
         assert_eq!(&bytes[0..4], &20u32.to_le_bytes(), "pFiles は頭の直後");
         assert_eq!(&bytes[16..20], &1i32.to_le_bytes(), "fWide = UTF-16");
         assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0], "最後は二重 NUL");
@@ -706,7 +706,7 @@ mod tests {
         ansi.extend_from_slice(b"C:\\x.txt\0\0");
         assert_eq!(parse_dropfiles(&ansi), vec![wide(r"C:\x.txt")]);
         assert!(parse_dropfiles(&bytes[..10]).is_empty());
-        let mut far = bytes.clone();
+        let mut far: Vec<u8> = bytes.clone();
         far[0..4].copy_from_slice(&9999u32.to_le_bytes());
         assert!(parse_dropfiles(&far).is_empty());
     }

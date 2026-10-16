@@ -1073,6 +1073,7 @@ pub fn parse_resets_at(text: &str) -> Option<i64> {
         let at = rest.rfind(['+', '-'])?;
         let (c, tz) = rest.split_at(at);
         let sign = if tz.starts_with('-') { -1 } else { 1 };
+        // 切り出し安全: tz の先頭は rfind した ASCII の `+` / `-`
         let (oh, om) = tz[1..].split_once(':')?;
         let (oh, om): (i64, i64) = (oh.parse().ok()?, om.parse().ok()?);
         if oh > 23 || om > 59 {

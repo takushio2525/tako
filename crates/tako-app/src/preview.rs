@@ -2311,6 +2311,7 @@ impl SyntectHighlighter {
                 let len = fragment.len().min(remaining);
                 remaining -= len;
                 Some(Span {
+                    // 切り出し安全: region は行を隙間なく覆い、len は断片の端か改行の直前 = 文字境界
                     text: fragment[..len].to_string(),
                     color: Some(tako_core::Rgb {
                         r: style.foreground.r,
@@ -3110,10 +3111,7 @@ fn limit_text(text: &str) -> (std::borrow::Cow<'_, str>, Truncated) {
     if truncated.is_none() {
         return (std::borrow::Cow::Borrowed(text), None);
     }
-    let mut end = text.len().min(MAX_BYTES);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(MAX_BYTES);
     let cut = &text[..end];
     let cut = if cut.lines().count() > MAX_LINES {
         cut.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n")
@@ -4372,6 +4370,7 @@ mod tests {
                 assert_eq!(data.pages.len(), 3, "全ページをラスタライズする");
                 for (i, page) in data.pages.iter().enumerate() {
                     assert!(!page.is_empty(), "{i} ページ目が空でない");
+                    // 切り出し安全: page は PNG のバイト列（Vec<u8>）
                     assert_eq!(&page[..4], &[0x89, 0x50, 0x4E, 0x47], "{i} ページ目が PNG");
                 }
                 // MediaBox は 612x792 pt。px @96DPI のまま入っていれば 816x1056 になる

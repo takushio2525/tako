@@ -1205,7 +1205,8 @@ mod tests {
     /// #2018: probe と capture を 1 回の tmux へつなぐ argv（区切りは display-message）
     #[test]
     fn probeとcaptureを1回のtmuxへつなぐ() {
-        let args = pane_log_probe_and_capture_args("MK", &[("tako-a", 3), ("tako-b", 40)]);
+        let args: Vec<String> =
+            pane_log_probe_and_capture_args("MK", &[("tako-a", 3), ("tako-b", 40)]);
         assert_eq!(&args[..4], &PANE_LOG_PROBE_BATCH_ARGS.map(String::from));
         let rest: Vec<&str> = args[4..].iter().map(String::as_str).collect();
         let (ta, tb) = (session_pane_target("tako-a"), session_pane_target("tako-b"));

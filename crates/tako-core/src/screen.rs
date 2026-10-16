@@ -585,6 +585,7 @@ pub fn analyze_input_line_at(screen: &Screen, line_idx: usize) -> Option<InputSt
     let full_line = line.text.trim_end().to_string();
 
     // ❯ の右側のテキストを抽出
+    // 切り出し安全: prompt_byte_pos は trim_start が残した後ろ側の始まり = 文字境界
     let after_prompt = &line.text[prompt_byte_pos..];
     let after_char = after_prompt
         .strip_prefix('❯')
@@ -602,6 +603,7 @@ pub fn analyze_input_line_at(screen: &Screen, line_idx: usize) -> Option<InputSt
 
     // 入力テキスト部分のバイト範囲を特定
     // ❯ の後のスペースを飛ばした位置が入力テキストの開始
+    // 切り出し安全: prompt_byte_pos は trim_start が残した後ろ側の始まり = 文字境界
     let prompt_str = &line.text[prompt_byte_pos..];
     let after_prompt_marker = &prompt_str['❯'.len_utf8()..];
     let trimmed_len = after_prompt_marker.trim_start().len();
@@ -620,6 +622,7 @@ pub fn analyze_input_line_at(screen: &Screen, line_idx: usize) -> Option<InputSt
         // 重なる範囲のテキストが空白だけならスキップ
         let overlap_start = run.range.start.max(input_byte_start);
         let overlap_end = run.range.end.min(input_byte_end);
+        // 切り出し安全: ランの範囲も入力の範囲も line.text の文字境界（max / min も境界）
         if line.text[overlap_start..overlap_end].trim().is_empty() {
             continue;
         }
@@ -1796,6 +1799,7 @@ mod tests {
             line.cell_cols
         );
         // `a`=0 / `か`=1（濁点も 1）/ `e`=3（アクセントも 3）/ `b`=4
+        // 切り出し安全: cell_cols は列の Vec
         assert_eq!(&line.cell_cols[..6], &[0, 1, 1, 3, 3, 4]);
         assert_eq!(
             line.cell_cols[3] - line.cell_cols[1],
@@ -1820,6 +1824,7 @@ mod tests {
             "空白セルの結合文字が落ちている: {:?}",
             line.text
         );
+        // 切り出し安全: cell_cols は列の Vec
         assert_eq!(&line.cell_cols[..2], &[0, 0]);
         assert_runs_cover(line);
     }
@@ -1832,6 +1837,7 @@ mod tests {
         let s = snapshot(&term, &theme());
         let line = &s.lines[0];
         assert_eq!(line.text.trim_end(), "e\u{301}\u{302}");
+        // 切り出し安全: cell_cols は列の Vec
         assert_eq!(&line.cell_cols[..3], &[0, 0, 0]);
     }
 }

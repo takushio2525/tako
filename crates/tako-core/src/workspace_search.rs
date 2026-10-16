@@ -475,6 +475,7 @@ fn search_file(
     let Ok(bytes) = std::fs::read(path) else {
         return FileVerdict::Unreadable;
     };
+    // 切り出し安全: bytes は fs::read のバイト列（Vec<u8>）
     if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
         return FileVerdict::Binary;
     }
@@ -530,9 +531,11 @@ fn search_file(
 /// 抜粋の外に出たものは落とす / はみ出たものは端で切る
 pub fn excerpt(line: &str, byte_ranges: &[(usize, usize)]) -> (String, Vec<(usize, usize)>) {
     let lead_bytes = line.len() - line.trim_start().len();
+    // 切り出し安全: lead_bytes は trim_start が残した後ろ側の始まり = 文字境界
     let body = &line[lead_bytes..];
     // バイト → 文字の位置（本文の中）
     let to_char = |byte: usize| {
+        // 切り出し安全: 一致は str の正規表現（find_iter）の位置 = 文字境界、lead_bytes も境界
         body[..byte.saturating_sub(lead_bytes).min(body.len())]
             .chars()
             .count()

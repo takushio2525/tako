@@ -658,6 +658,7 @@ fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<Pa
 
     // `~` 展開
     let expanded = if raw.starts_with("~/") || raw == "~" {
+        // 切り出し安全: 先頭 2 バイトは ASCII の `~/`（`~` 単独は上の len < 2 で返している）
         home.map(|h| h.join(&raw[2..]))
     } else {
         None

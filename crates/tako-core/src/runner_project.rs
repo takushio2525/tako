@@ -494,6 +494,7 @@ fn strip_toml_comment(line: &str) -> &str {
 fn toml_string(value: &str) -> Option<String> {
     let value = value.trim_start();
     let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    // 切り出し安全: 先頭は直前で確かめた ASCII の引用符
     let body = &value[1..];
     let mut out = String::new();
     let mut escaped = false;
@@ -958,7 +959,7 @@ fn python_module(parts: &[String]) -> Option<String> {
 
 fn plan_python(p: &Probe<'_>) -> Option<Planned> {
     let root = p.marker_dir;
-    let rel = rel_parts(root, p.file)?;
+    let rel: Vec<String> = rel_parts(root, p.file)?;
     let py = interpreter(p);
     let rel_slash = rel.join("/");
     let name = rel.last()?;
@@ -1182,6 +1183,7 @@ fn board_attach_command(cli: &str, sketch_arg: &str, lang: Lang) -> String {
 fn yaml_scalar(raw: &str) -> Option<String> {
     let v = raw.trim();
     let v = match v.chars().next() {
+        // 切り出し安全: 先頭は直前で確かめた ASCII の引用符
         Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or_default(),
         _ => v.split(" #").next().unwrap_or_default().trim(),
     };

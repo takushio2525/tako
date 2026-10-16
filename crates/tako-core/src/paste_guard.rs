@@ -684,7 +684,7 @@ pub fn scan_with(text: &str, policy: &Policy) -> ScanReport {
 pub fn mask(value: &str, prefix_chars: usize) -> String {
     let chars: Vec<char> = value.chars().collect();
     let p = prefix_chars.min(chars.len());
-    let body = &chars[p..];
+    let body: &[char] = &chars[p..];
     let n = body.len();
     let tail = (n / 6).min(4);
     let head = if p > 0 { 0 } else { (n / 6).min(3) };
