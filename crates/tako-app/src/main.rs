@@ -31420,6 +31420,9 @@ fn main() {
     // 「猶予（既定 5 秒）を過ぎたら必ず死ぬ」ウォッチドッグが対で要る = install が両方入れる。
     // 強制終了の理由は persist.log に残す（A/B は `TAKO_777_LEGACY=1`）
     tako_core::platform::quit_signal::install(persist_diag);
+    // #2151: git / tmux の場所の解決がログインシェル等を締め切りで打ち切ったら、理由を persist.log へ
+    // （tako-core は persist.log の書き手を持たないので受け口を渡す。渡す前の行は溜めておかれる）
+    tako_core::bin_resolve::set_notice_sink(persist_diag);
     // 一括隔離モード（#177）: TAKO_ISOLATED=1 だけで本番リソース（layout.json /
     // tmux バックエンド / discovery）に一切触れない起動になる。実験・検証で個別の
     // 隔離変数を指定し漏らす事故（TAKO_DISCOVERY_DIR だけ隔離した dev 起動が

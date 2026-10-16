@@ -100,9 +100,14 @@ fn pick_found_path(stdout: &str) -> Option<String> {
 
 /// ログインシェル `shell` で `name` を探す（unix の [`find_with_timeout`] の本体。
 /// シェルを差し替えて上限・判定をテストで固定するために分けてある = #1769）。
-/// `name` は [`find_with_timeout`] が検査済み
+/// `name` は [`find_with_timeout`] が検査済み。git / tmux の場所の解決（`bin_resolve`。#2151）も
+/// 締め切りの残りを渡してここを通す（名前は固定の定数なので検査を通さない）
 #[cfg(unix)]
-fn login_shell_find(shell: &str, name: &str, budget: std::time::Duration) -> BoundedFind {
+pub(crate) fn login_shell_find(
+    shell: &str,
+    name: &str,
+    budget: std::time::Duration,
+) -> BoundedFind {
     let lookup = format!("command -v {name}");
     let outcome = crate::probe::output_with_timeout(shell, &["-l", "-c", &lookup], budget);
     let timeout = outcome.timeout_notice();
@@ -111,6 +116,13 @@ fn login_shell_find(shell: &str, name: &str, budget: std::time::Duration) -> Bou
         .filter(|o| o.status.success())
         .and_then(|o| pick_found_path(&String::from_utf8_lossy(&o.stdout)));
     BoundedFind { path, timeout }
+}
+
+/// 場所を尋ねるログインシェル（`$SHELL`。空・未設定なら `/bin/sh`）。
+/// [`find`] と git / tmux の場所の解決（`bin_resolve`。#2151）が同じ規則で読む
+#[cfg(unix)]
+pub(crate) fn user_shell() -> String {
+    imp::user_shell()
 }
 
 /// 「実行できる通常ファイル」か。symlink は追う（`which` と同じ判定）。
@@ -156,7 +168,7 @@ mod imp {
         super::login_shell_find(&user_shell(), name, budget)
     }
 
-    fn user_shell() -> String {
+    pub fn user_shell() -> String {
         std::env::var("SHELL")
             .ok()
             .filter(|s| !s.is_empty())

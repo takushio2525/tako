@@ -564,9 +564,11 @@ fn 実行ファイルの探索がログインシェル経由で境界の外に�
             "境界 B16 の実装本体（unix 経路）",
         ),
         (
-            "crates/tako-core/src/lib.rs",
-            "resolve_bin(): 素の名前へフォールバックするので Windows でも `.exe` なら解決できる\
-             （PATHEXT とユーザー導入先を見ないので `.cmd` シムには届かない = B16 より弱い）",
+            "crates/tako-core/src/bin_resolve.rs",
+            "resolve_bin_legacy(): #2151 の A/B の再現アーム（`TAKO_2151_LEGACY=1`）。製品の既定は\
+             境界 B16 の `exe::login_shell_find` を締め切りつきで通す。どちらも素の名前へフォールバック\
+             するので Windows でも `.exe` なら解決できる（PATHEXT とユーザー導入先を見ないので \
+             `.cmd` シムには届かない = B16 より弱い）",
         ),
         (
             "crates/tako-app/src/preview.rs",
@@ -960,9 +962,10 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         ("crates/tako-core/src/git.rs", 6, "テストモジュール内"),
         (
-            "crates/tako-core/src/lib.rs",
+            "crates/tako-core/src/bin_resolve.rs",
             1,
-            "ログインシェル経由のフォールバック（`#[cfg(unix)]`）",
+            "#2151 の A/B の再現アーム（`resolve_bin_legacy`）のログインシェル経由のフォールバック\
+             （`#[cfg(unix)]`）。製品の既定は `probe::output_with_timeout`（抑止済み）を通す",
         ),
         (
             "crates/tako-core/src/platform/display.rs",

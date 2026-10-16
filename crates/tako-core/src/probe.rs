@@ -482,6 +482,19 @@ pub fn issue2150_legacy() -> bool {
     })
 }
 
+/// #2151 の A/B（`TAKO_2151_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// git / tmux の場所の解決（`bin_resolve::resolve_bin`）が `--version` とログインシェルの
+/// `command -v` を**上限なしで**待ち、打ち切りの知らせも出さない。**ゲートはこの 1 か所**
+pub fn issue2151_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2151_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。
