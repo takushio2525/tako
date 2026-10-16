@@ -37,6 +37,18 @@
 //! `alt_screenの非マウスペインでホイールが矢印に化けない`）は対象外。どれも
 //! **内側が実際に出した内容**（`LINE-99`）か器の `#{alternate_on}`（`wait_alt_screen`）を
 //! アンカーにしていて、外側 `mouse_reporting()` を単独のアンカーにしていない
+//!
+//! ## 別ファイルの同じ罠（#2196）
+//!
+//! `crates/tako-core/src/scroll_mirror.rs` の `ホイールレポートのtmux直接注入が内側に生で届く`
+//! も外側 `mouse_reporting()` をアンカーにしていて、この番犬の対象外だった。
+//! こちらは `send-keys -H`（器のマウス処理を通らない直接注入）なので copy-mode には
+//! 食われない代わりに、内側アプリの `stty raw -echo` より先に届いた注入を cooked の tty が
+//! echo（ECHOCTL の `^[`）し、raw になってから内側アプリも同じバイトを読んで echo する
+//! = **2 回見える**（CI の macOS で上方向の SGR が 3 → 6 個・80 桁の折り返しで X10 が分断）。
+//! 本体（`TAKO_2196_LEGACY_ARM` を除く）に器のペイン側のアンカー
+//! （`history_state(` = `#{mouse_sgr_flag}`）があり、`mouse_reporting()` と自前の
+//! `std::thread::sleep` が無いことを見る
 
 use std::path::{Path, PathBuf};
 
@@ -150,4 +162,65 @@ fn 番犬が走査対象を見つけている() {
         "アームを落とせていない"
     );
     assert!(stripped.contains("keep-a") && stripped.contains("keep-b"));
+}
+
+/// #2196 の現場（`scroll_mirror.rs`）。同じ偽アンカーの罠を別ファイルで踏んでいた
+fn scroll_mirror_target() -> PathBuf {
+    repo_root().join("crates/tako-core/src/scroll_mirror.rs")
+}
+
+const SCROLL_MIRROR_GUARDED: &str = "ホイールレポートのtmux直接注入が内側に生で届く";
+const ARM_BEGIN_2196: &str = "TAKO_2196_LEGACY_ARM 開始";
+const ARM_END_2196: &str = "TAKO_2196_LEGACY_ARM 終了";
+
+#[test]
+fn ホイール直接注入e2eは器のペイン側のアンカーで待っている() {
+    let src = std::fs::read_to_string(scroll_mirror_target()).expect("scroll_mirror.rs を読める");
+    let body = body_of(&src, SCROLL_MIRROR_GUARDED)
+        .unwrap_or_else(|| panic!("テスト本体が見つからない: {SCROLL_MIRROR_GUARDED}"));
+    let (code, _dropped) = strip_arms(&body, ARM_BEGIN_2196, ARM_END_2196);
+    // コメントを落とした眺めで見る（本体の説明コメントが `mouse_reporting()` と
+    // 綴っているので、全文だと誤検知する = #1609）
+    let code = code_view::without_comments(&code);
+    let mut offenders: Vec<&str> = Vec::new();
+    if !code.contains("history_state(") {
+        offenders.push("器のペイン側のアンカー（history_state = #{mouse_sgr_flag}）を使っていない");
+    }
+    if code.contains("mouse_reporting()") {
+        offenders.push("外側 `mouse_reporting()` を見ている");
+    }
+    if code.contains("std::thread::sleep") {
+        offenders.push("自前の固定待ちを入れている（`std::thread::sleep`）");
+    }
+    assert!(
+        offenders.is_empty(),
+        "{SCROLL_MIRROR_GUARDED}: 外側 `mouse_reporting()` は conf の `set -g mouse on` で\n\
+         attach 時に真になり、内側の `stty raw -echo` を待たない。その前に `send-keys -H` で\n\
+         注入すると cooked の tty の echo と内側アプリの echo で 2 回見える（#2196）。\n\
+         器のペインの `#{{mouse_sgr_flag}}` を待つこと（`history_state`）:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// #2196 の走査先を取り違えて**何も見ていない番犬**になっていないこと
+#[test]
+fn 番犬が2196の走査対象を見つけている() {
+    let path = scroll_mirror_target();
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+    let body = body_of(&src, SCROLL_MIRROR_GUARDED)
+        .unwrap_or_else(|| panic!("#2196 の現場（{SCROLL_MIRROR_GUARDED}）が切り出せていない"));
+    let (_, dropped) = strip_arms(&body, ARM_BEGIN_2196, ARM_END_2196);
+    assert!(
+        dropped > 0,
+        "{SCROLL_MIRROR_GUARDED} に A/B の旧経路アーム（{ARM_BEGIN_2196}）が無い。\
+         マーカーを消したなら番犬の前提が崩れているので、番犬側も直すこと"
+    );
+    // アンカーの実体（`history_state`）が器のペイン側のフラグを問い合わせていること。
+    // コメントを落とした眺めで見る（説明コメントの綴りで緑にならないように = #1609）
+    let code = code_view::without_comments_checked(&src, "crates/tako-core/src/scroll_mirror.rs");
+    assert!(
+        code.contains("pub fn history_state(") && code.contains("#{mouse_sgr_flag}"),
+        "history_state が器のペイン側のフラグ（#{{mouse_sgr_flag}}）を問い合わせていない"
+    );
 }
