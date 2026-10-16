@@ -1,6 +1,6 @@
 //! 実行ボタン横のドロップダウン（FR-3.18.7 / Issue #1733。エピック #1726 の S5。設計
 //! `.agent/plans/2026-09-runner-settings.md` §7）: 実行されるコマンド・プロファイル・実行環境・
-//! 引数・環境変数・作業ディレクトリ・実行前コマンドを見て、その場で変える。
+//! 引数・環境変数・作業ディレクトリ・実行前コマンド・実行先（#1734 = S6）を見て、その場で変える。
 //!
 //! ## 解決と保存はここに無い
 //!
@@ -34,6 +34,7 @@ use gpui::{
 };
 use serde_json::Value;
 use tako_control::protocol::Request;
+use tako_core::runner_config::RunTarget;
 use tako_core::theme::Theme;
 use tako_core::{PaneId, PaneOrigin};
 
@@ -279,6 +280,8 @@ pub(crate) struct RunView {
     pub(crate) args: Sourced,
     pub(crate) cwd: Sourced,
     pub(crate) before: Sourced,
+    /// 実行先（`config.target`。`value` が無ければ既定 = 同じペインで再実行。#1734）
+    pub(crate) target: Sourced,
     /// 環境変数（名前順 = 応答の object の順）
     pub(crate) env: Vec<(String, Sourced)>,
     /// `.ino` の基板とポート（それ以外のファイルは `None` = 節を出さない。#1952）
@@ -353,6 +356,7 @@ impl RunView {
             args: Sourced::from_json(&config["args"]),
             cwd: Sourced::from_json(&config["cwd"]),
             before: Sourced::from_json(&config["before"]),
+            target: Sourced::from_json(&config["target"]),
             env,
             board: BoardView::from_json(&v["board"]),
         }
@@ -409,6 +413,15 @@ impl RunView {
     /// 再生ボタンを押せるか（走らせるコマンドがある）
     pub(crate) fn run_capable(&self) -> bool {
         !self.profiles.is_empty()
+    }
+
+    /// 今の実行先（保存が無い・読めない語なら既定 = 同じペインで再実行 = dispatch `Run` と同じ向き）
+    pub(crate) fn run_target(&self) -> RunTarget {
+        self.target
+            .value
+            .as_deref()
+            .and_then(RunTarget::parse)
+            .unwrap_or(RunTarget::Reuse)
     }
 }
 
@@ -573,6 +586,8 @@ pub(crate) struct Write {
     /// `.ino` の基板とポート（#1952。arduino-cli を起こすので `dispatch_off_ui` だけで送る）
     pub(crate) board: Option<String>,
     pub(crate) port: Option<String>,
+    /// 実行先（`reuse` / `new`。#1734）
+    pub(crate) target: Option<String>,
 }
 
 impl Write {
@@ -593,6 +608,7 @@ impl Write {
             before: self.before,
             board: self.board,
             port: self.port,
+            target: self.target,
         }
     }
 }
@@ -646,6 +662,8 @@ pub(crate) enum Item {
     Args,
     Cwd,
     Before,
+    /// 実行先（#1734）
+    Target,
     Env(String),
 }
 
@@ -658,6 +676,7 @@ impl Item {
             Item::Args => "args",
             Item::Cwd => "cwd",
             Item::Before => "before",
+            Item::Target => "target",
             Item::Env(_) => "env",
         }
     }
@@ -674,6 +693,7 @@ impl Item {
             Item::Args => pick(&v.args),
             Item::Cwd => pick(&v.cwd),
             Item::Before => pick(&v.before),
+            Item::Target => pick(&v.target),
             Item::Env(name) => v
                 .env
                 .iter()
@@ -690,6 +710,7 @@ impl Item {
             Item::Args => w.args = Some(value),
             Item::Cwd => w.cwd = Some(value),
             Item::Before => w.before = Some(value),
+            Item::Target => w.target = Some(value),
             Item::Env(name) => w.env = Some(BTreeMap::from([(name.clone(), Some(value))])),
         }
     }
@@ -948,6 +969,36 @@ impl TakoApp {
             vec![Write {
                 scope,
                 runtime: Some(id),
+                ..Write::default()
+            }],
+            cx,
+        );
+        self.run_menu_report(pane, outcome);
+        cx.notify();
+    }
+
+    /// 実行先の選択肢（#1734）: 選ぶ（保存先は今の出典 → 既定 = ファイル）。今の実行先と同じなら
+    /// 書かない（既定へ戻すのは行の ×）。`RunnerDefaults { path, target }` = CLI `tako run-config
+    /// --target`・MCP `tako_run_defaults { target }` と同じ口
+    pub(crate) fn run_menu_select_target(
+        &mut self,
+        pane: PaneId,
+        target: RunTarget,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_run_menu_edit();
+        let Some(view) = self.run_menu.view(pane) else {
+            return;
+        };
+        if view.run_target() == target {
+            return;
+        }
+        let scope = scope_of(&view.target.source);
+        let outcome = self.run_menu_apply(
+            pane,
+            vec![Write {
+                scope,
+                target: Some(target.as_str().to_string()),
                 ..Write::default()
             }],
             cx,
@@ -2047,7 +2098,74 @@ impl TakoApp {
                 col = col.children(self.render_run_menu_field_editor(pane, &add, theme));
             }
         }
-        col.into_any_element()
+        col.child(self.render_run_menu_target(pane, view, theme, cx))
+            .into_any_element()
+    }
+
+    /// 実行先の行（#1734。名前 / 同じペイン・新しいペインの 2 択 / 出典タグ / ×）。選んでいる側に印。
+    /// 押すと `run_menu_select_target`（保存 → 取り直し）
+    fn render_run_menu_target(
+        &self,
+        pane: PaneId,
+        view: &RunView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let current = view.run_target();
+        let mut choices = div().flex_1().min_w(px(0.0)).flex().flex_row().gap(px(2.0));
+        for t in RunTarget::ALL.iter().copied() {
+            let selected = t == current;
+            let key = format!("run-menu-target-{}", t.as_str());
+            let probe = self.panel_click_probe_bounds.clone();
+            choices = choices.child(
+                div()
+                    .id(SharedString::from(key.clone()))
+                    .relative()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(3.0))
+                    .px(px(5.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .text_size(px(11.0))
+                    .text_color(hsla(if selected {
+                        theme.foreground
+                    } else {
+                        theme.text_secondary
+                    }))
+                    .when(selected, |d| d.bg(rgba_alpha(theme.accent, 0.12)))
+                    .when(!selected, |d| {
+                        d.cursor_pointer()
+                            .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.run_menu_select_target(pane, t, cx);
+                    }))
+                    .child(check_slot(selected, theme))
+                    .child(crate::ui_text::preview::run_menu_target_choice(t))
+                    .child(probe_canvas(probe, key)),
+            );
+        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(6.0))
+            .py(px(3.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(104.0))
+                    .text_size(px(11.0))
+                    .text_color(hsla(theme.text_secondary))
+                    .child(crate::ui_text::preview::run_menu_target()),
+            )
+            .child(choices)
+            .child(self.source_controls(pane, Item::Target, &view.target.source, theme, cx))
+            .into_any_element()
     }
 
     /// 項目の 1 行（名前 / 値（押すと欄）/ 出典タグ / ×）
@@ -2696,6 +2814,48 @@ mod tests {
             (reset.scope, reset.reset),
             (Some("file"), Some(vec!["profile".to_string()]))
         );
+    }
+
+    /// #1734: 実行先の行は `config.target` を写し、無い・読めない語は既定（同じペイン）。
+    /// 出典タグ・× は他の項目と同じ書き込み（`target` の値を移す / `reset: ["target"]`）
+    #[test]
+    fn 実行先を写し既定は同じペインで出典タグと既定へ戻すで書き込む() {
+        let mut raw = sample();
+        // 実行先の欄が無い（#1734 以前の dispatch）・読めない語 = 既定
+        assert_eq!(RunView::from_json(&raw).run_target(), RunTarget::Reuse);
+        raw["config"]["target"] = json!({ "value": "tab", "source": "file" });
+        assert_eq!(RunView::from_json(&raw).run_target(), RunTarget::Reuse);
+        raw["config"]["target"] = json!({ "value": null, "source": "default" });
+        let v = RunView::from_json(&raw);
+        assert_eq!(v.run_target(), RunTarget::Reuse);
+        assert!(
+            reset_write(&Item::Target, &v).is_none(),
+            "既定は消すものが無い"
+        );
+
+        raw["config"]["target"] = json!({ "value": "new", "source": "project" });
+        let v = RunView::from_json(&raw);
+        assert_eq!(v.run_target(), RunTarget::New);
+        assert_eq!(v.target.source, "project");
+        let [set, unset] = move_writes(&Item::Target, &v).unwrap();
+        assert_eq!(
+            (set.scope, set.target.as_deref()),
+            (Some("file"), Some("new"))
+        );
+        assert_eq!(
+            (unset.scope, unset.reset),
+            (Some("project"), Some(vec!["target".to_string()]))
+        );
+        let reset = reset_write(&Item::Target, &v).unwrap();
+        assert_eq!(reset.reset, Some(vec!["target".to_string()]));
+        // 書き込みは実行設定の口の `target` へ
+        match set.into_request(Path::new("/p/a.py")) {
+            Request::RunnerDefaults { target, scope, .. } => {
+                assert_eq!(target.as_deref(), Some("new"));
+                assert_eq!(scope.as_deref(), Some("file"));
+            }
+            other => panic!("RunnerDefaults ではない: {other:?}"),
+        }
     }
 
     #[test]

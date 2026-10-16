@@ -301,9 +301,10 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             &["RunConfigsFile"],
         ),
         (
-            // #1731: run-configs.json の 1 項目（ファイル / プロジェクトの実行設定）と実行環境の参照
+            // #1731: run-configs.json の 1 項目（ファイル / プロジェクトの実行設定）と実行環境の参照。
+            // #1734: 実行先の語（enum）も載せる = 値を消すと旧いファイルが読めなくなる（ui.json と同じ扱い）
             "crates/tako-core/src/runner_config.rs",
-            &["RunConfig", "RuntimeRef"],
+            &["RunConfig", "RuntimeRef", "RunTarget"],
         ),
         (
             // #1485: 「起動していた」の記録。`LastAutostart` は入れない

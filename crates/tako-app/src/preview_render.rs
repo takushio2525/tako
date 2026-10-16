@@ -3389,6 +3389,8 @@ impl TakoApp {
                                 };
                                 let chevron_probe = self.panel_click_probe_bounds.clone();
                                 let chevron_key = format!("preview-run-dd-{}", pane_id.as_u64());
+                                let play_probe = self.panel_click_probe_bounds.clone();
+                                let play_key = format!("preview-run-{}", pane_id.as_u64());
                                 d.child(
                                     div()
                                         .flex()
@@ -3399,6 +3401,7 @@ impl TakoApp {
                                         .child(
                                             div()
                                                 .id(("preview-run", pane_id.as_u64()))
+                                                .relative()
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
@@ -3482,6 +3485,21 @@ impl TakoApp {
                                                                 .child(SharedString::from(label)),
                                                         )
                                                     },
+                                                )
+                                                // 実矩形（visual-test が実マウスで押す。#1734）
+                                                .child(
+                                                    canvas(
+                                                        |_, _, _| (),
+                                                        move |bounds, _, _, _| {
+                                                            play_probe
+                                                                .borrow_mut()
+                                                                .insert(play_key.clone(), bounds);
+                                                        },
+                                                    )
+                                                    .absolute()
+                                                    .top_0()
+                                                    .left_0()
+                                                    .size_full(),
                                                 ),
                                         )
                                         // ドロップダウンのシェブロン（実行設定の入口。#1733）
@@ -5366,7 +5384,8 @@ impl TakoApp {
                 ratio: Some(0.3),
                 auto_close: None,
                 focus: Some(true),
-                // 再生ボタンは既定 = 同じファイルの実行ペインを使い回す（#1657）
+                // 再生ボタンは保存した実行先（#1734）に従う。無ければ同じファイルの実行ペインを
+                // 使い回す（#1657）
                 new_pane: None,
             },
             PaneOrigin::User,

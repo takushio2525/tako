@@ -49,6 +49,8 @@ pub enum RunConfigField {
     Env,
     Cwd,
     Before,
+    /// 実行先（同じペインで再実行 / 新しいペイン。#1734）
+    Target,
 }
 
 impl RunConfigField {
@@ -60,6 +62,7 @@ impl RunConfigField {
         RunConfigField::Env,
         RunConfigField::Cwd,
         RunConfigField::Before,
+        RunConfigField::Target,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -70,6 +73,7 @@ impl RunConfigField {
             Self::Env => "env",
             Self::Cwd => "cwd",
             Self::Before => "before",
+            Self::Target => "target",
         }
     }
 
@@ -148,6 +152,43 @@ impl RunScope {
     }
 }
 
+/// 実行先（#1734 / #1726 S6）: 実行ペインを同じファイル・同じプロファイルの実行ペインの位置で
+/// 差し替えるか（#1657 の再利用）、毎回新しく分割するか。
+///
+/// 保存の語は [`Self::VALUES`]（MCP の enum・CLI の possible values の正本 = #1467）。
+/// 一回限りの `new_pane`（CLI `--new-pane` / MCP `tako_run` の `new_pane`）が保存値より勝つ
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTarget {
+    /// 同じペインで再実行する（#1657 の既定）
+    Reuse,
+    /// 毎回新しいペインに分割する
+    New,
+}
+
+impl RunTarget {
+    pub const ALL: &'static [RunTarget] = &[RunTarget::Reuse, RunTarget::New];
+
+    /// 保存・CLI・MCP の語（serde の `snake_case` と同じ字面 = テストで縛る）
+    pub const VALUES: [&'static str; 2] = ["reuse", "new"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reuse => Self::VALUES[0],
+            Self::New => Self::VALUES[1],
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|t| t.as_str() == s)
+    }
+
+    /// 新しいペインに分割するか（`Run` の `new_pane` と同じ向き）
+    pub fn new_pane(self) -> bool {
+        self == Self::New
+    }
+}
+
 /// 1 スコープ（ファイル / プロジェクト）ぶんの上書き。`None` / 空 = 上位へ委ねる
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -170,6 +211,10 @@ pub struct RunConfig {
     /// 実行前コマンド（失敗したら本体を走らせない = S4）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
+    /// 実行先（#1734。`None` = 既定 = 同じペインで再実行）。欄の無い #1734 以前のファイルは
+    /// 構造体の `#[serde(default)]` でそのまま読める（移行の Step は要らない）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<RunTarget>,
     /// 最後に書いた時刻（ファイル数の上限で古いものから落とすための LRU の材料。S3）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -190,6 +235,7 @@ impl RunConfig {
             RunConfigField::Env => !self.env.is_empty(),
             RunConfigField::Cwd => self.cwd.is_some(),
             RunConfigField::Before => self.before.is_some(),
+            RunConfigField::Target => self.target.is_some(),
         }
     }
 
@@ -202,6 +248,7 @@ impl RunConfig {
             RunConfigField::Env => self.env.clear(),
             RunConfigField::Cwd => self.cwd = None,
             RunConfigField::Before => self.before = None,
+            RunConfigField::Target => self.target = None,
         }
     }
 }
@@ -275,6 +322,7 @@ pub struct EffectiveConfig {
     pub env: BTreeMap<String, Sourced<String>>,
     pub cwd: Option<Sourced<String>>,
     pub before: Option<Sourced<String>>,
+    pub target: Option<Sourced<RunTarget>>,
 }
 
 impl EffectiveConfig {
@@ -297,6 +345,10 @@ impl EffectiveConfig {
             RunConfigField::Cwd => self.cwd.as_ref().map_or(FieldSource::Default, |s| s.source),
             RunConfigField::Before => self
                 .before
+                .as_ref()
+                .map_or(FieldSource::Default, |s| s.source),
+            RunConfigField::Target => self
+                .target
                 .as_ref()
                 .map_or(FieldSource::Default, |s| s.source),
         }
@@ -356,6 +408,9 @@ pub fn merge(
                 .map(|v| Sourced::new(v.clone(), FieldSource::Declaration))
         }),
         before: scalar(|c| c.before.as_ref()),
+        target: layers
+            .iter()
+            .find_map(|(cfg, src)| cfg.and_then(|c| c.target).map(|t| Sourced::new(t, *src))),
     }
 }
 
@@ -543,7 +598,7 @@ mod tests {
             assert_eq!(RunConfigField::parse(f.as_str()), Some(*f));
             assert!(seen.insert(f.as_str()), "重複: {}", f.as_str());
         }
-        assert_eq!(RunConfigField::parse("target"), None, "target は S6 で足す");
+        assert_eq!(RunConfigField::parse("nope"), None);
     }
 
     #[test]
@@ -622,8 +677,74 @@ mod tests {
 
     #[test]
     fn 知らない項目があっても読める() {
-        // S6 の target のように後から足す項目を、古い版の tako が読んでも壊れない
-        let back: RunConfig = serde_json::from_str(r#"{"args":"x","target":"new"}"#).unwrap();
+        // 後から足す項目を、古い版の tako が読んでも壊れない（#1734 の target を #1733 の版が読むのと同じ）
+        let back: RunConfig = serde_json::from_str(r#"{"args":"x","later":"new"}"#).unwrap();
         assert_eq!(back.args.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn 実行先の語はserdeとvaluesで同じ字面() {
+        for t in RunTarget::ALL {
+            assert_eq!(RunTarget::parse(t.as_str()), Some(*t));
+            assert_eq!(
+                serde_json::to_string(t).unwrap(),
+                format!("\"{}\"", t.as_str()),
+                "保存の語と MCP / CLI の語がずれる"
+            );
+        }
+        assert_eq!(
+            RunTarget::ALL
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>(),
+            RunTarget::VALUES
+        );
+        assert_eq!(RunTarget::parse("New"), None);
+        assert!(RunTarget::New.new_pane());
+        assert!(!RunTarget::Reuse.new_pane());
+    }
+
+    #[test]
+    fn 実行先はファイルがプロジェクトより強く既定はファイルに保存() {
+        let mut project = cfg();
+        project.target = Some(RunTarget::New);
+        let eff = merge(None, Some(&project), &Declared::default(), &BTreeMap::new());
+        assert_eq!(
+            eff.target,
+            Some(Sourced::new(RunTarget::New, FieldSource::Project))
+        );
+        let mut file = cfg();
+        file.target = Some(RunTarget::Reuse);
+        let eff = merge(
+            Some(&file),
+            Some(&project),
+            &Declared::default(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            eff.target,
+            Some(Sourced::new(RunTarget::Reuse, FieldSource::File))
+        );
+        assert_eq!(eff.source_of(RunConfigField::Target), FieldSource::File);
+        assert_eq!(RunConfigField::Target.default_scope(), RunScope::File);
+        assert!(file.has(RunConfigField::Target));
+        file.clear(RunConfigField::Target);
+        assert!(file.is_empty());
+    }
+
+    #[test]
+    fn 実行先の無い旧い保存形はそのまま読めて書き戻しても欄が増えない() {
+        // #1734 以前の版が書いた 1 項目（target の欄が無い）
+        let old = r#"{"profile":"test","args":"--verbose","updated_at":"2026-10-16T00:00:00Z"}"#;
+        let back: RunConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(back.target, None);
+        assert_eq!(back.profile.as_deref(), Some("test"));
+        assert_eq!(serde_json::to_string(&back).unwrap(), old);
+
+        let mut c = cfg();
+        c.target = Some(RunTarget::New);
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#"{"target":"new"}"#);
+        assert_eq!(serde_json::from_str::<RunConfig>(&json).unwrap(), c);
     }
 }

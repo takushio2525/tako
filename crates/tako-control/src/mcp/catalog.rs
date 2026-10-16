@@ -4127,7 +4127,7 @@ pub fn tools() -> Vec<Value> {
                     },
                     "new_pane": {
                         "type": "boolean",
-                        "description": "true で新しく分割する。既定は同じファイル・プロファイルの実行ペインをその位置で差し替える（実行中なら止めて再実行）",
+                        "description": "true で新しく分割・false で使い回す（省略時は tako_run_defaults の target、無ければ同じファイル・プロファイルの実行ペインをその位置で差し替える。実行中なら止めて再実行）",
                     },
                 },
                 "required": ["path"],
@@ -4164,7 +4164,7 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_run_defaults",
             "description": "実行の既定を読み書きする。ext = 拡張子ごとのコマンド（省略で全一覧・ext のみで単一・\
                 command で設定・remove で削除）。path = そのファイル / プロジェクトの実行設定（runtime・profile・\
-                args・env・cwd・before を保存、reset で自動へ戻す、項目なしなら読むだけ。応答は config / runtime / \
+                args・env・cwd・before・target を保存、reset で自動へ戻す、項目なしなら読むだけ。応答は config / runtime / \
                 runtimes / runtime_unresolved）。ext と path は排他。",
             "inputSchema": {
                 "type": "object",
@@ -4200,6 +4200,10 @@ pub fn tools() -> Vec<Value> {
                     "before": { "type": "string", "description": "実行前コマンド（失敗で本体を止める）" },
                     "board": { "type": "string", "description": ".ino の基板 FQBN（sketch.yaml へ）" },
                     "port": { "type": "string", "description": ".ino の書き込みポート" },
+                    "target": enum_schema(
+                        &tako_core::runner_config::RunTarget::VALUES,
+                        "実行先",
+                    ),
                     "ext": {
                         "type": "string",
                         "description": "拡張子（ドットなし・小文字。省略時は全一覧）",
