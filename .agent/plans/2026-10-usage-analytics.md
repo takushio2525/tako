@@ -13,8 +13,8 @@
 |---|---|---|
 | 「利用制限をどれだけ使ったか」 | **観測した used_percent の増分を、観測点の間の区間ごとに、その区間のローカルの使用量の比でキーへ按分する**（区間按分）。合計は観測と必ず一致する。観測が無い期間だけ、直近の換算係数で割った値を「推定」と明示して出す | §2 |
 | 按分の重み | **API 換算**（モデル別単価 × 5 成分。fast は 2 倍）。生のトークン総量は量として併記する | §2.3 |
-| 利用制限の単位 | **ログイン**（`<設定 dir>/.claude.json` の `oauthAccount.accountUuid` の塩付きハッシュ）。tako のアカウント（設定 dir）はその下の段。この機では 4 アカウントが 2 ログインに収まっていた | §1.3 |
-| 帰属の鍵 | プロジェクト = カタログの `project` / master の `profile` → cwd の最長前方一致。機能 = ledger の `issue` と `task_type`（カタログに `ledger_id` を持たせて結ぶ）。**gitBranch は鍵にしない**（Issue 形は使用量の 3.2%） | §3 |
+| 利用制限の単位 | **ログイン**（起動に使った資格情報のファイル `.claude.json` の `oauthAccount.accountUuid` の塩付きハッシュ）。tako のアカウント（設定 dir）はその下の段。この機では 4 アカウントが 2 ログインに収まっていた | §1.3 |
+| 帰属の鍵 | プロジェクト = カタログの `project` / master の `profile` → cwd の最長前方一致。機能 = spawn のラベルに書いた順で最初の `#N`（**ledger の `issue` は最小の番号が入る不具合があり使わない**）と ledger の `task_type`（カタログに `ledger_id` を持たせて結ぶ）。**gitBranch は鍵にしない**（Issue 形は使用量の 3.2%） | §1.4 / §3 |
 | 鍵の持ち方 | **取り込んだ時点で鍵を索引へ写す**（カタログ 500 件・レジストリ 200 件の追い出しと transcript の 30 日の削除より長く残すため） | §3.3 |
 | 期間 | 実窓（5h / 7d = 解除時刻 − 長さ）と暦（日・週・月）。ccusage 式の推定ブロックは使わない | §3.4 |
 | 見せる場所 | 右パネルの新ビュー `usage` + ステータスバーの 5h / 7d から開く | §4.1 |
@@ -36,7 +36,7 @@
 | assistant 行で使うキー | `message.id` / `requestId` / `timestamp` / `message.model` / `message.usage.{input_tokens, output_tokens, cache_read_input_tokens, cache_creation.ephemeral_5m_input_tokens, cache_creation.ephemeral_1h_input_tokens, speed}` / `sessionId` / `cwd` / `gitBranch` / `isSidechain`。**`message.content` と `wireToolInputs` は読まない** |
 | 1 応答が複数行に分かれる | 1 応答の content ブロックごとに 1 行（平均 **2.1 行 / 応答**。256,063 行 → 119,387 応答）。同じ `message.id` の行は**ファイル内で必ず連続**していた（割り込み 0 件） |
 | 仮の output_tokens | 同じ id で usage が食い違う 142 件は**すべて output_tokens だけ**が違い、先の行がストリーミング途中の仮の値・最後の行が確定値（最大）だった。**最初の行を採ると output を取りこぼす**。ccusage も「総量の大きい方へ差し替える」（`rust/adapters/claude/src/lib.rs` の `should_replace_deduped_entry`） |
-| セッションをまたぐ重複 | 0 件（resume しても前の応答は写されていない）。それでも鍵は `message.id` で全体一意として扱う（ccusage と同じ。上流の変更に強い） |
+| セッションをまたぐ重複 | 0 件（resume しても前の応答は写されていない）。それでも鍵は全体一意で持つ: Anthropic 形式の `message.id`（`msg_…`）ならそれだけ、それ以外（ゲートウェイ経由で id を使い回す等）は `message.id` + `requestId` + `sessionId` + 時刻。ccusage は `message.id` + `requestId` を主にし、`/btw` のサイドチェーンが親の応答を新しい requestId で写す場合とゲートウェイの使い回しを別に照合している（`rust/adapters/claude/src/lib.rs` の `push_deduped_entry`）。`message.id` だけを鍵にすれば `/btw` の写しも 1 回として数えられる |
 | `usage.iterations` | 直近 10 日の 117,658 件がすべて `type: "message"` で、上位の usage と一致。advisor 等の別モデルの使用量が外に隠れていることは無かった |
 | `<synthetic>` | 1,991 件（エラー時の合成応答。usage 0）。除外する |
 | `speed: "fast"` | 保持中の全体で 0 件（`standard` 117,350・空 46）。単価 2 倍の扱いだけ用意する |
@@ -58,7 +58,8 @@
 - ただし `ModHub` に残っていた**古いペインの最終報告**は、それぞれ別の時刻の観測を持っていた。ログイン A の 7d で
   10 点（11% → 83%・3.4 日分）が取れたので、これを §2.1 の較正に使った
 - 解除時刻は `13:20Z` / `15:40Z` / `13:00Z` / `22:00Z` のように**ちょうどの時刻とは限らない**（20 分刻みに見える）。
-  ccusage の blocks は「最初の発言を時刻の頭へ切り捨てて 5 時間」と推定するので、実窓と最大 40 分ずれる（§3.4）
+  ccusage の blocks は「最初の発言を時刻の頭へ切り捨てて 5 時間」と推定する（`rust/crates/ccusage/src/blocks.rs` の
+  `floor_to_hour`）ので、実窓と最大 40 分ずれる（§3.4）
 
 ### 1.3 ログインと設定 dir
 
@@ -70,6 +71,11 @@
   帯・ステータスバーの用途では困らないが、usage 分析ではログインの鍵を別に持つ
 - transcript の `bridge-session` 行に `ownerAccountUuid` がある。ただし Remote Control を有効にしたセッションにしか無く
   （10/09 以降の 1,633 本のうち 163 本）、その範囲では設定 dir とログインの対応に食い違いは無かった。ログインの鍵の主には使えない
+- **既定の設定 dir の transcript には 2 通りのセッションが混ざりうる**: `CLAUDE_CONFIG_DIR` 無しで起動したもの（資格情報は
+  `~/.claude.json`）と、`CLAUDE_CONFIG_DIR=~/.claude` で起動したもの（`~/.claude/.claude.json`）。どちらも `~/.claude/projects` へ
+  書くので、**置き場だけではログインを決めきれない**（この機では今は 2 つとも同じログイン。accounts.yaml の説明には「`inherit` だと
+  既定の `~/.claude.json` = 別のログインを拾う」とある）。mod の報告は `session_id` と `config_dir`（既定なら無し）を持つので、
+  **報告が来たセッションはログインを確定できる**（§3.2・S1）
 
 ### 1.4 帰属の鍵になる tako 側のファイル
 
@@ -87,12 +93,19 @@
 | cwd → projects.yaml（30 日） | **95.0%**。外れの大半（3.6%）はホーム dir で起動した master / solo（→ カタログの `profile` で拾える） |
 | gitBranch（30 日） | `main` 83.0%・`HEAD` 11.7%・`<種別>/<Issue>-…` **3.2%**・その他 2.1%。**tako の worker は共有ツリーで起動して別の worktree で作業する**ので、transcript の gitBranch に作業ブランチが出ない。cwd が `-wt-N` の worktree だったのも 0.1% |
 | セッションカタログ（日別） | 10/08 以降は **94〜100%**、10/04 より前は **0〜20%**（500 件の上限で追い出された） |
-| 直近 7 日 | カタログに載る 99.6%（worker 87.4%・master 12.2%）。**worker の使用量の 88.0% が ledger の task_type まで、84.6% が Issue 番号まで辿れた** |
+| 直近 7 日 | カタログに載る 99.6%（worker 87.4%・master 12.2%）。**worker の使用量の 88.0% が ledger の task_type まで辿れた**。Issue は**ラベルに書いた順で最初の `#N`** で 85.5% に付いた（ledger の `issue` は下の不具合で使えない） |
 | レジストリから消えた worker を ledger へ（ラベル・プロジェクト・開始時刻 10 分以内で後付け） | 216 件中 69 件（32%）しか当たらない → 後付けではなく spawn の時点で `ledger_id` をカタログへ持たせる（§3.2） |
 
-- カタログの `issues` は**プロンプトに出た番号を全部**持つ（1 本の worker で 8 個など）。「その worker の Issue」は
-  ledger の `issue`（ラベル → プロンプトの順で最初の番号）を使う
-- 直近 7 日の Issue は 92 件で、Issue が付いた使用量のうち上位 10 件で 48%・上位 20 件で 62%（最大の 1 件で 11%）
+- **ledger の `issue` は「その worker の Issue」ではない（不具合）**: `extract_issues`（`crates/tako-control/src/sessions.rs`）は
+  ラベルとプロンプトから拾った番号を `sort_unstable()` で昇順に並べ、spawn の dispatch はその先頭 = **最小の番号**を ledger へ
+  記録する。プロンプトは前例や規約の Issue に触れるので、直近 7 日でラベルに番号のある 176 件中 **170 件（97%）がラベルの最初の
+  番号と食い違った**（この S0 自身も、前例として触れたエピックの番号で記録されていた）。カタログ・レジストリの `issues` も同じ
+  関数の結果（並べ替え済みの全部。1 本の worker で 8 個など）なので、どれが主かは分からない
+- 機能の鍵は**ラベルに書いた順で最初の `#N`** にする。直近 7 日の worker の使用量の 85.5% に付き、Issue は 172 件・上位 10 件で
+  15%・上位 20 件で 26%（最大の 1 件で 2%）。ledger の `issue` で数えると小さい番号へ寄せ集められて 92 件・上位 10 件で 48% に
+  なり、実態と違って見える
+- この不具合は usage 分析と独立に直せる（spawn の記録に「主 Issue」= ラベルの最初の番号を持たせ、ledger の `issue` も同じ値にする。
+  §9 の S2 に含めるか、先に別の Issue で直す）
 
 ### 1.5 codex と agy
 
@@ -160,8 +173,8 @@
   モデル差では説明できない。候補は (1) tako の外の使用（claude.ai・別の PC。同じ枠を共有する = §1.6）が週の前半に多かった、
   (2) 一時的に設定 dir とログインの対応がずれていた（`inherit` の起動が別のログインの資格情報を拾う注意が accounts.yaml の
   説明にある）。どちらも transcript からは確かめられない（§10）
-- **固定の係数で % を出すと、この窓では最大で数十ポイントずれる**。区間按分（§2.2 の A）なら、どの区間でも観測した Δ% を
-  そのまま配るので合計は崩れない
+- **固定の係数で % を出すと、この窓では最大 12 ポイントずれる**（後半の係数を窓全体に当てると、週の前半は −6〜−10 pt、
+  10/15 以降は +11〜+12 pt）。区間按分（§2.2 の A）なら、どの区間でも観測した Δ% をそのまま配るので合計は崩れない
 - この窓に区間按分を当てると合計 83.1%（観測 83%）・未分類 0.4%。**窓全体の比で配った場合と比べて、最大のプロジェクトで
   8.7 ポイント**（P1: 区間按分 30.9% / 全体の比 39.6%）違った。P1 の使用が 1% あたりの量の多い区間に偏っていたため
 
@@ -180,8 +193,8 @@
 - API 換算は 1% の段の量子化（±0.5 pt）の中に収まった。**1 つの 5h 窓の中では 1% あたりの量はほぼ一定**
 - 混雑時間帯（太平洋時間 5 時 = 12:00Z）の前後で、1% あたりの API 換算は **1.00 : 0.99**（窓の開始〜12:02 は使用の 95% が
   12:00Z より前、12:02〜12:42 はすべて後）。告知の「混雑時間帯は 5h が速く減る」は、このログインのこの日には見えなかった
-- 5h の 1% は、同じログインの 7d の 1% の約 6 分の 1（ログイン A は約 4 分の 1。A の 5h は 2 点だけ）。窓の大きさの比は
-  プランで違う
+- 5h の 1% は、同じログインの 7d の 1% の約 6 分の 1（B の 7d は 1 点だけ）。ログイン A は約 4 分の 1（A の 5h は 2 点だけ）。
+  窓の大きさの比はプランで違う
 
 ### 2.2 比較と決定
 
@@ -260,11 +273,11 @@
 
 | 鍵 | 決め方（上から順に、最初に決まったもの） | 被覆（§1.4） |
 |---|---|---|
-| ログイン | `<設定 dir>/.claude.json` の `oauthAccount.accountUuid` を `<data_dir>/machine_id` で塩付けしたハッシュ（12 桁）。読めなければ設定 dir そのもの | 全件 |
+| ログイン | 資格情報のファイル（`CLAUDE_CONFIG_DIR` があれば `<それ>/.claude.json`、無ければ `~/.claude.json`）の `oauthAccount.accountUuid` を `<data_dir>/machine_id` で塩付けしたハッシュ（12 桁）。どの資格情報で起動したかは ① mod の報告（`session_id` + `config_dir`）で確定 ② 無ければ transcript の置き場から推す（既定の設定 dir は `~/.claude.json` 側とみなす）。読めなければ設定 dir そのもの | 全件（①は mod の報告が来たセッション） |
 | tako のアカウント | accounts.yaml の `config_dir` と transcript の置き場の一致。どれにも当たらなければ設定 dir の名前 | 全件 |
 | プロジェクト | ① カタログの `project`（worker）② カタログの `profile`（master。「プロファイル: X」として出す）③ cwd の最長前方一致（`<project>-wt-N` は元のプロジェクトへ寄せる）④ 「未分類」 | 30 日で 95.0%（cwd だけ）、直近 7 日はカタログで 99.6% |
-| Issue | ① カタログの `ledger_id`（S2 で足す）→ ledger の `issue` ② レジストリの `ledger_id` → ledger の `issue` ③ カタログの `label` の最初の `#N` ④ 無し | 直近 7 日の worker で 84.6% |
-| task_type | ledger の `task_type`（Issue と同じ経路） | 直近 7 日の worker で 88.0% |
+| Issue | ① spawn の記録の主 Issue（S2 で足す。ラベルに書いた順で最初の `#N`）② カタログの `label` の最初の `#N`（書いた順で読む。`issues` は並べ替え済みなので使わない）③ 無し。**ledger の `issue` は使わない**（§1.4 の不具合） | 直近 7 日の worker で 85.5% |
+| task_type | ① カタログの `ledger_id`（S2 で足す）→ ledger の `task_type` ② レジストリの `ledger_id` → ledger の `task_type`（spawn の引数そのままなので正しい） | 直近 7 日の worker で 88.0% |
 | 役割 | カタログの `kind`。無ければ「手動」 | 直近 7 日で 99.6% |
 | gitBranch | **鍵にしない**。セッションの詳細に参考として出すだけ | Issue 形は 3.2% |
 
@@ -272,14 +285,17 @@
 
 | 案 | トレードオフ |
 |---|---|
-| **A. tako の spawn の記録（ledger / レジストリ / カタログ）を session_id で結ぶ（推奨）** | 直近 7 日で worker の 84.6% に Issue が付く。tako の外で起動した claude には付かない（→ プロジェクトまでは cwd で付く） |
+| **A. tako の spawn の記録（ラベル・ledger / レジストリ / カタログ）を session_id で結ぶ（推奨）** | 直近 7 日で worker の 85.5% に Issue が付く。tako の外で起動した claude には付かない（→ プロジェクトまでは cwd で付く） |
 | B. gitBranch | 3.2% しか付かない（§1.4） |
 | C. cwd の worktree 名 | 0.1% |
 | D. 会話の本文から推定 | **本文を読まない約束に反する**ので採らない |
 
-- **カタログと `PendingSpawn` に `ledger_id` を足す**（spawn の dispatch は ledger を書いた直後に id を持っている =
-  `crates/tako-control/src/dispatch.rs` の `record_spawn` の並び。カタログの記録を ledger の後へ回すか、後から書き足す）。
+- **カタログと `PendingSpawn` に `ledger_id` と主 Issue（`primary_issue` = ラベルに書いた順で最初の `#N`）を足す**（spawn の
+  dispatch は ledger を書いた直後に id を持っている = `crates/tako-control/src/dispatch.rs` の `record_spawn` の並び。カタログの
+  記録を ledger の後へ回すか、後から書き足す）。ledger の `issue` にも同じ主 Issue を入れて §1.4 の不具合を直す。
   serde の default で旧ファイルはそのまま読めるので移行は要らないが、`migration_registry` の指紋が変わる（PR で明示する）
+- ラベルに番号が複数ある（不具合を束ねた worker の `#A / #B / #C: …` など）ときは最初の 1 つへ寄せる。分けて見たい需要が
+  出たら S3 で「ラベルの番号で均等割り」を選べるようにする
 - ledger にも `session_id` を持たせる案はあるが、ledger の記録は session_id の検出より前なので書き足しの経路が増える。
   カタログ側に `ledger_id` を持たせれば片方向で足りる
 
@@ -320,8 +336,9 @@ usage            [今の 7d ▾] [プロジェクト ▾]
   P1            30.9%  ██████░░░░  API 換算 …  12 セッション
   P2            25.3%  █████░░░░░
   …
+  未分類          0.4%
   tako の外      0.0%
-  推定（観測後）  0.4%
+  推定（最後の観測より後）  …
 ログイン B  7d 12%  5h 19%
   …
 ```
@@ -369,7 +386,7 @@ usage            [今の 7d ▾] [プロジェクト ▾]
 |---|---|---|
 | `cursor.json` | transcript ごとの `dev` / `ino` / `size` / 読んだバイト位置 / 最後の `message.id` とその時点で数えた 5 成分 | ファイル数（3,700）× 約 150 バイト |
 | `buckets/<YYYY-MM>.jsonl` | 5 分刻み × セッション × モデルの 5 成分と API 換算（マイクロドル）。追記のみで、読むときに同じ鍵を足し合わせる | 30 日で 13,197 行（この機）≒ 2 MB |
-| `sessions.jsonl` | session_id → ログイン・アカウント・agent・役割・プロジェクト・プロファイル・Issue・task_type・ledger_id・label・最初 / 最後の時刻（§3.3） | 30 日で 2,272 セッション |
+| `sessions.jsonl` | session_id → ログイン・アカウント・agent・役割・プロジェクト・プロファイル・Issue・task_type・ledger_id・label・最初 / 最後の時刻（§3.3） | 保持中の transcript で 2,272 セッション |
 | `limits.jsonl` | ログイン・枠・解除時刻・%・`observed_at`・出どころ（`mod` / `codex` / `screen`）。値が変わったときだけ追記 | 1 日に数百行 |
 
 - 同じ id の行は連続するので（§1.1）、増分の読み手は「そのファイルの最後の id と数えた値」だけ覚えればよい。続きの行で
@@ -417,10 +434,10 @@ usage            [今の 7d ▾] [プロジェクト ▾]
 
 | 判断点 | 推奨 | 根拠（1 行） | 他案のトレードオフ |
 |---|---|---|---|
-| % の出し方 | 区間按分（A） | 観測を正にするので、係数が 0.44〜2.04 倍動いても合計が崩れない | B: 観測なしで出せるが数十 pt ずれる / C: % が出ない / D: 公式 API が無い |
-| 重み | API 換算 | 実測で最良級（変動係数 0.11）かつモデル差を表せ、ccusage と照合できる | 生トークン: 同等の当てはまりだがモデル差が消える / 読み出し除外: 後半で悪い / 回帰: 今のデータでは決まらない |
+| % の出し方 | 区間按分（A） | 観測を正にするので、係数が 0.44〜2.04 倍動いても合計が崩れない | B: 観測なしで出せるが、この窓で最大 12 pt ずれた / C: % が出ない / D: 公式 API が無い |
+| 重み | API 換算 | 実測で最良（B の 5h で RMSE 0.11 pt・A の 7d の後半で変動係数 0.11）かつモデル差を表せ、ccusage と照合できる | 生トークン: 同等の当てはまりだがモデル差が消える / 読み出し除外: 後半で悪い / 回帰: 今のデータでは決まらない |
 | 束ねる単位 | ログイン | 4 アカウントが 2 ログインに収まっていた。枠はログインにかかる | 設定 dir: 同じ枠を重ねて数える |
-| 機能の鍵 | tako の spawn の記録（ledger_id で結ぶ） | 直近 7 日で worker の 84.6% に Issue が付く | gitBranch 3.2% / worktree 名 0.1% / 本文は読まない |
+| 機能の鍵 | ラベルに書いた順で最初の `#N` + ledger の task_type（ledger_id で結ぶ） | 直近 7 日で worker の 85.5% に Issue が付く。ledger の `issue` は最小の番号が入る不具合で 97% が食い違う | gitBranch 3.2% / worktree 名 0.1% / 本文は読まない |
 | 期間 | 実窓 + 暦 | 解除時刻を観測しているので窓が正確に切れる | 推定ブロック: 最大 40 分ずれる / 暦だけ: 枠と合わない |
 | 画面 | 右パネルの `usage` + ステータスバーから | 既存のビューと同じ置き場・1 クリックで辿れる | 設定画面: 不自然 / PWA: 権限の整理が先 / ポップオーバー: 狭い |
 | MCP | `tako_sessions` の action | +506 バイトで済み、既存の引数を使い回せる | 新ツール: +1,021 バイト / accounts: 意味が混ざる |
@@ -451,11 +468,12 @@ S7 スマホ（PWA の #/usage）                   （S4 の後。[提案]）
 
 - やること: `ModHub` が報告を受けるたび、ログイン × 枠の `(解除時刻, %)` が前回と違えば `limits.jsonl` へ 1 行追記
   （`observed_at`・`source: mod`）。mod の無いペインでステータスバーが画面から読んだ値は `source: screen` で追記（按分では mod を優先）。
-  ログインの鍵（§3.2）。置き場 `<data_dir>/usage/` の作成・設定共有のカタログへ `Local` で登録・`migration_registry` の指紋。
+  ログインの鍵（§3.2）と、報告の `session_id` → ログインの対応（`sessions.jsonl` の最初の列。S2 が使用量の帰属に使う）。
+  置き場 `<data_dir>/usage/` の作成・設定共有のカタログへ `Local` で登録・`migration_registry` の指紋。
   `tako usage`（この段では観測の履歴の要約だけ = ログインごとの最新の % と観測の点数）と MCP `tako_sessions` `action: "usage"`
 - 受け入れ条件:
   1. 隔離 GUI で `tako mod report` に偽の報告を流し、% か解除時刻が変わったときだけ 1 行増える（同じ値の heartbeat では増えない）
-  2. 同じログインの 2 つの設定 dir が同じ鍵になり、別のログインは別の鍵になる。`.claude.json` が無い・読めないときは設定 dir の鍵へ落ちる
+  2. 同じログインの 2 つの設定 dir が同じ鍵になり、別のログインは別の鍵になる。既定の設定 dir で `CLAUDE_CONFIG_DIR` 無し / `=~/.claude` の 2 本の偽セッションが、資格情報のファイルの違いどおりに別の鍵へ入る。`.claude.json` が無い・読めないときは設定 dir の鍵へ落ちる
   3. 鍵とファイルに `accountUuid` の生の値が出ない（番犬）。診断ログに cwd・label が出ない
   4. 起動時に `limits.jsonl` を読まない（最初の追記で開く）。`catalog_coverage` / `migration_registry` / `mcp_catalog_snapshot` が緑で、増分のバイト数を PR に書く
   5. A/B: `TAKO_2192_S1_LEGACY=1` で記録しない
@@ -464,14 +482,17 @@ S7 スマホ（PWA の #/usage）                   （S4 の後。[提案]）
 ### S2 使用量の索引（claude）+ `tako usage`（量だけ）
 
 - やること: §5.2 の `cursor` / `buckets` / `sessions` と増分の読み手（§1.1 の分割行・仮の output・`<synthetic>`・サブエージェント・
-  ファイルの縮み / 消失）、取り込み時の鍵の写し（§3.2 / §3.3）、カタログと `PendingSpawn` の `ledger_id`、単価表（§2.3）。
-  `tako usage --by … --window …` はトークン（5 成分）・API 換算・セッション数を出す。MATRIX `usage_tokens`
+  ファイルの縮み / 消失）、取り込み時の鍵の写し（§3.2 / §3.3）、カタログと `PendingSpawn` の `ledger_id` / `primary_issue`、
+  ledger の `issue` の不具合（最小の番号が入る。§1.4）の修正、単価表（§2.3）。
+  `tako usage --by … --window …` はトークン（5 成分）・API 換算・セッション数を出す。MATRIX `usage_tokens`。
+  ledger の不具合だけは先に別の Issue で直してもよい（直すまでの spawn も、カタログの `label` から主 Issue を引けるので失われない）
 - 受け入れ条件:
   1. 偽の transcript（分割行・仮の output・`<synthetic>`・subagents・書きかけの最終行・切り詰め）で期待値どおり。2 回目の更新で読むバイトが追記分だけ
   2. この機の実データで、jq の参照集計（S0 で使った抽出 = 同じ定義）と API 換算・トークン数の合計が一致する（±0.1%）
   3. 本文の印が `<data_dir>/usage/` に出ない番犬。初回の取り込みの所要・ピークの RSS を PR に書く（背景で走り、UI が止まらない）
   4. カタログが追い出した後も、取り込み済みのセッションは鍵を保つ（500 件を超える合成カタログで確認）
   5. 表に無いモデルは「単価不明」として別に数え、注記が出る
+  6. ラベル `#2192 …` でプロンプトにもっと小さい番号（`#322` 等）があっても、主 Issue と ledger の `issue` が 2192 になる（A/B）
 - 依存: S1
 
 ### S3 区間按分（%）
