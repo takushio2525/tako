@@ -7,7 +7,8 @@
 //! （待たない読みを 1 回だけ）へ回す形を守らせる。
 //!
 //! 振る舞いは `ipc::transport::deadline::tests`（応答を書いてすぐ閉じる受け口の注入）が見る。
-//! ここは CI が Linux でも見張れるよう、`set_read_timeout(…)?` の直書きを `file:line` で落とす。
+//! 振る舞いのテストは unix でだけ走る（`deadline` は unix の型）ので、ここは OS に依らず
+//! `set_read_timeout(…)?` の直書きを `file:line` で落とす。
 
 use std::path::{Path, PathBuf};
 
