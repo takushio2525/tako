@@ -919,15 +919,14 @@
       "key": "usage_limit_share",
       "summary_ja": "観測した利用制限（5h / 7d）の % の増分を、区間の使用量の比でプロジェクト・Issue・会話へ配る（#2202）",
       "evidence": "measured",
-      "evidence_detail": "#2202 実測（2026-10-17・この機の limits.jsonl と会話記録の写し）: 7d の配った合計 + tako の外が 観測と一致（2 ログイン）。単体テスト tako_core::usage::share::tests は既知の重みで合成した観測の列で、混雑時間帯の係数・窓のまたぎ・古い値のペイン・下がる報告・使用量 0 の区間（tako の外）・最後の観測より後と観測の無い窓（推定）を含め、合計が観測と一致しキーごとの誤差が 1 ポイント以内。agy は #985 の実測（agy 1.1.22）で窓つきの利用上限と使用率を持たない（残量は前払いクレジット）ので配る % が無い。codex は rollout の token_count が rate_limits の履歴を持つ（設計書 §1.5 = #2204）",
+      "evidence_detail": "#2202 実測（2026-10-17・この機の limits.jsonl と会話記録の写し）: 7d の配った合計 + tako の外が 観測と一致（2 ログイン）。単体テスト tako_core::usage::share::tests は既知の重みで合成した観測の列で、混雑時間帯の係数・窓のまたぎ・古い値のペイン・下がる報告・使用量 0 の区間（tako の外）・最後の観測より後と観測の無い窓（推定）を含め、合計が観測と一致しキーごとの誤差が 1 ポイント以内。agy は #985 の実測（agy 1.1.22）で窓つきの利用上限と使用率を持たない（残量は前払いクレジット）ので配る % が無い。codex は #2204 実測（2026-10-17・この機の rollout 264 本の写し）: 過去の rate_limits から 5h は 11 窓で延べ 478% = 段 478.00 + tako の外 0・7d は 17 窓で 718% = 段 718.00 + 0（窓ごとの最大の % の和を別実装で 出しても同じ）。重みは生トークン（単価表に無い）で推定はしない。単体テスト tako_core::usage::share::tests::codexの窓は揺れを1時間まで寄せ早く始まった窓を分ける",
       "agents": {
         "claude": {
           "status": "supported"
         },
         "codex": {
-          "status": "pending",
-          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
-          "issue": 2204
+          "status": "degraded",
+          "note_ja": "codex の % は rollout の rate_limits を観測にして過去の分まで配るが、重みは API 換算ではなく生トークンの比（codex のモデルは単価表に無い）。rollout はどのログインで使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる（#2204）"
         },
         "agy": {
           "status": "unsupported",
@@ -942,16 +941,15 @@
     {
       "key": "usage_tokens",
       "summary_ja": "会話記録の使用量（トークン・API 換算）をプロジェクト・Issue・会話ごとに集計する（#2201）",
-      "evidence": "unit-test",
-      "evidence_detail": "tako_control::usage::index::tests（偽の transcript の分割行・仮の output・<synthetic>・サブエージェント・書きかけの最終行・切り詰め・追記分だけの読み直し・カタログの追い出し）。codex は rollout の token_count に累積値がある（設計書 §1.5 = #2204 で取り込む）",
+      "evidence": "measured",
+      "evidence_detail": "tako_control::usage::index::tests（偽の transcript の分割行・仮の output・<synthetic>・サブエージェント・書きかけの最終行・切り詰め・追記分だけの読み直し・カタログの追い出し）。codex は #2204 実測（2026-10-17・この機の rollout 264 本・631 MB の写し）: token_count の累積の差分の和が rollout ごとの最後の累積の和（別実装の python）と 19.41 億トークンで完全一致・会話 262 本すべて一致。gpt-* / codex-auto-review は単価表に無いので API 換算は出ない",
       "agents": {
         "claude": {
           "status": "supported"
         },
         "codex": {
-          "status": "pending",
-          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い",
-          "issue": 2204
+          "status": "degraded",
+          "note_ja": "codex のモデル（gpt-* / codex-auto-review）は API 換算の単価表に無いので、使用量はトークン数だけを数える（API 換算は出ない）。rollout はどのログインで使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる（#2204）"
         },
         "agy": {
           "status": "pending",
