@@ -526,6 +526,16 @@ fn match_special_filename(name: &str) -> Option<FileIconKind> {
         "gemfile" | "gemfile.lock" => Some(FileIconKind::Ruby),
         "go.mod" | "go.sum" => Some(FileIconKind::Go),
         "flake.nix" | "flake.lock" | "default.nix" | "shell.nix" => Some(FileIconKind::Nix),
+        // `.env.local` / `.env.production` 等は `.env` と同じ設定アイコン（#2152）。
+        // 最後の拡張子が表にある名前（`.env.ts` / `.env.sh`）は従来どおり拡張子で引く
+        _ if lower.starts_with(".env.")
+            && Path::new(&lower)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_none_or(|ext| match_extension(ext) == FileIconKind::File) =>
+        {
+            Some(FileIconKind::Settings)
+        }
         _ => None,
     }
 }
@@ -773,15 +783,16 @@ mod tests {
     }
 
     /// #2015 の境界: 表の名前は dotfile の判定より先・途中にも `.` がある名前は dotfile 扱いに
-    /// せず最後の拡張子で引く（`.env.local` は `local` が表に無いので `File` のまま）・
-    /// 先頭が `.` でない名前と名前の取れないパスは従来どおり
+    /// せず最後の拡張子で引く（`.foo.local` は `local` が表に無いので `File` のまま。
+    /// `.env.*` だけは表で `.env` に揃える = #2152）・先頭が `.` でない名前と名前の取れない
+    /// パスは従来どおり
     #[test]
     fn dotfile判定の境界() {
         for (name, kind) in [
             (".gitignore", FileIconKind::Git),
             (".dockerignore", FileIconKind::Docker),
             (".prettierrc", FileIconKind::Prettier),
-            (".env.local", FileIconKind::File),
+            (".foo.local", FileIconKind::File),
             (".eslintrc.cjs", FileIconKind::JavaScript),
             ("..foo", FileIconKind::File),
             ("a.txt", FileIconKind::Book),
@@ -789,6 +800,53 @@ mod tests {
             ("noext", FileIconKind::File),
             ("", FileIconKind::File),
             ("..", FileIconKind::File),
+        ] {
+            assert_eq!(resolve_file_icon(Path::new(name)), kind, "{name:?}");
+        }
+    }
+
+    /// #2152: `.env.local` / `.env.production` 等は `.env` と同じ設定アイコン。
+    /// 修正前は最後の拡張子（`local` / `production`）で引かれ `File` に落ち、`.env` と食い違っていた。
+    /// 大文字小文字は特殊ファイル名の表の流儀どおり問わない
+    #[test]
+    fn env系のdotfileはenvと同じアイコン() {
+        let env = resolve_file_icon(Path::new(".env"));
+        assert_eq!(env, FileIconKind::Settings);
+        for name in [
+            ".env.local",
+            ".env.production",
+            ".env.development",
+            ".env.test",
+            ".env.development.local",
+            ".env.example",
+            ".env.sample",
+            ".ENV.LOCAL",
+            ".Env.Production",
+            "app/.env.local",
+        ] {
+            assert_eq!(resolve_file_icon(Path::new(name)), env, "{name}");
+        }
+    }
+
+    /// #2152 の境界: `.env.` で始まらない名前（`.envrc` / `.environment` / `.envrc.local` /
+    /// `env.local` / `foo.env`）は従来どおりの判定・`.env.` の後ろの最後の拡張子が表にある名前
+    /// （`.env.ts` / `.env.sh` / `.env.yml`）はその拡張子で引く
+    #[test]
+    fn env系判定の境界() {
+        for (name, kind) in [
+            // `.env.` で始まらない（dotfile / 拡張子の判定のまま）
+            (".envrc", FileIconKind::Settings),
+            (".environment", FileIconKind::Settings),
+            (".envrc.local", FileIconKind::File),
+            ("env.local", FileIconKind::File),
+            ("foo.env", FileIconKind::Settings),
+            ("x.env.local", FileIconKind::File),
+            // 最後の拡張子が表にある `.env.*` は拡張子で引く
+            (".env.ts", FileIconKind::TypeScript),
+            (".env.d.ts", FileIconKind::TypeScript),
+            (".env.sh", FileIconKind::Terminal),
+            (".env.yml", FileIconKind::Yaml),
+            (".env.json", FileIconKind::Settings),
         ] {
             assert_eq!(resolve_file_icon(Path::new(name)), kind, "{name:?}");
         }
