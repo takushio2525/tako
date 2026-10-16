@@ -32248,6 +32248,7 @@ mod self_test {
         use tako_control::protocol::Request as Req;
         let legacy = TakoApp::legacy_1725();
         let fixture0 = std::env::temp_dir().join(format!("tako-st1725-{}", std::process::id()));
+        remove_on_fail(&fixture0);
         let _ = std::fs::remove_dir_all(&fixture0);
         let _ = std::fs::create_dir_all(fixture0.join("sub"));
         let _ = std::fs::write(fixture0.join("a.txt"), "x");
@@ -33603,6 +33604,7 @@ mod self_test {
 
         // --- 場面の材料: Rust 2 本・C 1 本・ヘッダ 1 本と、偽サーバの規則 ---
         let dir0 = std::env::temp_dir().join(format!("tako-st1680-{}", std::process::id()));
+        remove_on_fail(&dir0);
         let _ = std::fs::remove_dir_all(&dir0);
         let _ = std::fs::create_dir_all(dir0.join("src"));
         let _ = std::fs::write(dir0.join("Cargo.toml"), "[package]\nname = \"st1680\"\n");
@@ -34122,7 +34124,159 @@ mod self_test {
         // 環境要因（load / feature 構成）は失敗と同じ場所に出す（#796）
         println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
         println!("TAKO_APP_SELF_TEST_FAILED: {step}");
+        run_fail_cleanup();
         std::process::exit(1);
+    }
+
+    /// 節が作った一時ファイル / dir の登録簿（#2051 / FR-4.8.23）。
+    ///
+    /// `fail()` は即 `exit(1)` するので、節の末尾の後片付け（`remove_dir_all`）は落ちた経路では
+    /// 走らず、fixture や受け手のファイルが `$TMPDIR` に残る。節は作る場所を [`remove_on_fail`] で
+    /// 登録し、`fail()` が exit の前にまとめて消す。
+    ///
+    /// 登録は足すだけで外さない（正常に終わった節は末尾で自分で消しているので、fail の時点では
+    /// 消す物が無いだけ）。guard の drop で外す形にしないのは、`let _ = guard` と書くと
+    /// その場で drop されて登録が黙って消えるため
+    static FAIL_CLEANUP: std::sync::Mutex<Vec<std::path::PathBuf>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// 節が作る一時ファイル / dir を、`fail()` の経路でも消えるように登録する（#2051）。
+    ///
+    /// 作る前に呼んでよい（消す時点で無ければ何もしない）。受けるのは一時置き場
+    /// （`std::env::temp_dir()` か `TAKO_DATA_DIR`）より**下**のパスだけで、置き場そのもの・
+    /// `..` を含むもの・外のパスは `fail()` で止める（登録の書き違いで本物を消さない）
+    pub(crate) fn remove_on_fail(path: &std::path::Path) {
+        // 相対パス（`TAKO_DATA_DIR=data` 等）は fs の操作と同じく作業ディレクトリから読む
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let path = cwd.join(path);
+        let mut roots = vec![std::env::temp_dir()];
+        roots.extend(std::env::var_os("TAKO_DATA_DIR").map(|d| cwd.join(d)));
+        if !fail_cleanup_allowed(&path, &roots) {
+            fail(&format!(
+                "remove_on_fail: 一時置き場の下ではないので登録しない (#2051): {}",
+                path.display()
+            ));
+        }
+        let mut list = FAIL_CLEANUP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !list.contains(&path) {
+            list.push(path);
+        }
+    }
+
+    /// `path` が `roots` のどれかより**真に下**にあり、`..` を含まないか（#2051）。
+    /// macOS の `/var` → `/private/var` のような別名は、正規化した形どうしでも比べる
+    fn fail_cleanup_allowed(path: &std::path::Path, roots: &[std::path::PathBuf]) -> bool {
+        use std::path::Component;
+        if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+            return false;
+        }
+        let canon = |p: &std::path::Path| tako_core::platform::path::canonicalize_or_self(p);
+        // 末尾（まだ作っていないことがある）は外して親だけを正規化する
+        let resolved = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => canon(parent).join(name),
+            _ => return false,
+        };
+        let under = |p: &std::path::Path, r: &std::path::Path| p.starts_with(r) && p != r;
+        roots
+            .iter()
+            .any(|root| under(path, root) || under(&resolved, &canon(root)))
+    }
+
+    /// [`FAIL_CLEANUP`] を空にしながら消す（`fail()` から 1 度だけ）。
+    /// `TAKO_2051_LEGACY=1` は修正前（消さずに exit）= 同一バイナリでの A/B
+    fn run_fail_cleanup() {
+        if std::env::var_os("TAKO_2051_LEGACY").is_some() {
+            return;
+        }
+        let paths = std::mem::take(
+            &mut *FAIL_CLEANUP
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let (removed, left) = remove_registered(&paths);
+        println!(
+            "TAKO_APP_SELF_TEST_CLEANUP: registered={} removed={removed} left={}",
+            paths.len(),
+            left.len()
+        );
+        for path in left {
+            println!("TAKO_APP_SELF_TEST_CLEANUP_LEFT: {}", path.display());
+        }
+    }
+
+    /// 登録された場所を消し、(消した数, 消せずに残った場所) を返す。無いものは数えない。
+    /// リンクは辿らずリンクそのものを消す
+    fn remove_registered(paths: &[std::path::PathBuf]) -> (usize, Vec<std::path::PathBuf>) {
+        let mut removed = 0;
+        let mut left = Vec::new();
+        for path in paths {
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                continue;
+            };
+            let result = if meta.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            match result {
+                Ok(()) => removed += 1,
+                Err(_) => left.push(path.clone()),
+            }
+        }
+        (removed, left)
+    }
+
+    #[cfg(test)]
+    mod fail_cleanup_tests {
+        use super::{fail_cleanup_allowed, remove_registered};
+        use std::path::PathBuf;
+
+        #[test]
+        fn 一時置き場より下だけを受ける() {
+            let tmp = std::env::temp_dir();
+            // TAKO_DATA_DIR の代わり（まだ無い dir。絶対パスの形は OS に合わせる）
+            let data = std::env::current_dir()
+                .unwrap()
+                .join("nonexistent-2051-data");
+            let roots = vec![tmp.clone(), data.clone()];
+            assert!(fail_cleanup_allowed(&tmp.join("tako-visual-x-1"), &roots));
+            assert!(fail_cleanup_allowed(&tmp.join("a/b.txt"), &roots));
+            assert!(fail_cleanup_allowed(&data.join("tk2046-1"), &roots));
+            // 置き場そのもの・外・`..`・相対は受けない
+            assert!(!fail_cleanup_allowed(&tmp, &roots));
+            assert!(!fail_cleanup_allowed(&data, &roots));
+            assert!(!fail_cleanup_allowed(
+                &std::env::current_dir().unwrap().join("x"),
+                &roots
+            ));
+            assert!(!fail_cleanup_allowed(&tmp.join("../outside"), &roots));
+            assert!(!fail_cleanup_allowed(&PathBuf::from("relative/x"), &roots));
+            // 別名（macOS の /var と /private/var）でも置き場の下と分かる
+            let canon = tako_core::platform::path::canonicalize_or_self(&tmp);
+            assert!(fail_cleanup_allowed(&canon.join("tako-visual-x-1"), &roots));
+        }
+
+        #[test]
+        fn 登録した場所を消し_無いものは数えない() {
+            let base = std::env::temp_dir().join(format!("tako-2051-unit-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("dir/sub")).unwrap();
+            std::fs::write(base.join("dir/sub/f.txt"), "x").unwrap();
+            std::fs::write(base.join("file.bin"), "y").unwrap();
+            let paths = vec![
+                base.join("dir"),
+                base.join("file.bin"),
+                base.join("never-made"),
+            ];
+            let (removed, left) = remove_registered(&paths);
+            assert_eq!((removed, left.len()), (2, 0));
+            assert!(!base.join("dir").exists() && !base.join("file.bin").exists());
+            // 2 度目は消す物が無い（正常に終わった節の登録が fail の時点で残っている形）
+            assert_eq!(remove_registered(&paths), (0, Vec::new()));
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     fn check(cond: bool, step: &str) {
@@ -38280,6 +38434,7 @@ mod self_test {
         cx: &mut AsyncApp,
     ) {
         let dir = std::env::temp_dir().join(format!("tako-visual-745-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test #745 一時ディレクトリ");
         let path = dir.join("table.md");
@@ -38614,6 +38769,7 @@ mod self_test {
         cx: &mut AsyncApp,
     ) {
         let dir = std::env::temp_dir().join(format!("tako-visual-md-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test md 一時ディレクトリ");
         let path = dir.join("showcase.md");
@@ -39585,6 +39741,7 @@ mod self_test {
         let dump_dir = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
         let mut dump = String::new();
         let dir = std::env::temp_dir().join(format!("tako-visual-grid-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test グリッド fixture ディレクトリ");
 
@@ -42067,6 +42224,7 @@ mod self_test {
         inject_section_failure("preview-code");
         ensure_fresh_scene(window, cx, "preview-code").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-code-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test code 一時ディレクトリ");
         let path = dir.join("sample.rs");
@@ -42359,6 +42517,7 @@ mod self_test {
                 )
             });
         let dir = std::env::temp_dir().join(format!("tako-visual-diag-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).expect("visual-test 診断の一時ディレクトリ");
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"v\"\n").expect("Cargo.toml");
@@ -42967,6 +43126,7 @@ mod self_test {
         ensure_fresh_scene(window, cx, "cursor-follow").await;
         let legacy = preview_render::cursor_follow_legacy();
         let dir = std::env::temp_dir().join(format!("tako-visual-cursor-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test cursor 一時ディレクトリ");
         let path = dir.join("follow.rs");
@@ -44810,6 +44970,7 @@ mod self_test {
 
         // --- ラウンド 3: プレビュー（コード + md + PDF。静止） ---
         let dir = std::env::temp_dir().join(format!("tako-flicker-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("flicker: fixture ディレクトリ");
         let code = dir.join("sample.rs");
@@ -45834,6 +45995,7 @@ mod self_test {
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
         let dir = std::env::temp_dir().join(format!("tako-grid-bench-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("bench fixture ディレクトリ");
 
@@ -46593,6 +46755,7 @@ mod self_test {
             {
                 let fixture =
                     std::env::temp_dir().join(format!("tako-visual-tree-{}", std::process::id()));
+                remove_on_fail(&fixture);
                 let _ = std::fs::remove_dir_all(&fixture);
                 let deep = fixture.join("docs/guide/deep");
                 std::fs::create_dir_all(&deep).expect("visual-test ツリー fixture");
@@ -46755,6 +46918,7 @@ mod self_test {
 
             let dir = std::env::temp_dir()
                 .join(format!("tako-visual-preview-{}", std::process::id()));
+            remove_on_fail(&dir);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("visual-test 一時ディレクトリを作れる");
             let pdf_path = dir.join("sample.pdf");
@@ -48944,6 +49108,7 @@ mod self_test {
         // 添付は「在るもの」と「消えたもの」の 2 件（起票時に実在を問わない設計の裏返し）
         let live1450 =
             std::env::temp_dir().join(format!("tako-visual-1450-{}.txt", std::process::id()));
+        remove_on_fail(&live1450);
         let gone1450 = std::env::temp_dir().join(format!(
             "tako-visual-1450-missing-{}.png",
             std::process::id()
@@ -49903,6 +50068,7 @@ mod self_test {
         inject_section_failure("goto-hover");
         let anchor = ensure_fresh_scene(window, cx, "goto-hover").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-goto-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).expect("visual-test goto-hover 一時ディレクトリ");
         let _ = std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"v\"\n");
@@ -50220,6 +50386,7 @@ mod self_test {
         inject_section_failure(LABEL);
         let anchor = ensure_fresh_scene(window, cx, LABEL).await;
         let dir = std::env::temp_dir().join(format!("tako-visual-lsp-menu-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src"))
             .expect("visual-test lsp-context-menu 一時ディレクトリ");
@@ -50647,6 +50814,7 @@ mod self_test {
         let anchor = ensure_fresh_scene(window, cx, LABEL).await;
         let dir =
             std::env::temp_dir().join(format!("tako-visual-lsp-menu-real-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src"))
             .expect("visual-test lsp-context-menu-real 一時ディレクトリ");
@@ -50735,6 +50903,7 @@ mod self_test {
         use tako_control::protocol::Request as Req;
         let anchor = ensure_fresh_scene(window, cx, label).await;
         let dir = std::env::temp_dir().join(format!("tako-visual-{label}-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).expect("visual-test 補完の一時ディレクトリ");
         std::fs::write(
@@ -51395,6 +51564,7 @@ mod self_test {
         inject_section_failure(LABEL);
         let work =
             std::env::temp_dir().join(format!("tako-visual-1930-{LABEL}-{}", std::process::id()));
+        remove_on_fail(&work);
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).expect("visual-test completion-loading の置き場");
         let (log, gate) = (work.join("received.jsonl"), work.join("loading-done"));
@@ -51867,6 +52037,7 @@ mod self_test {
             "tako-visual-{label}-hover-{}.json",
             std::process::id()
         ));
+        remove_on_fail(&file);
         std::fs::write(&file, rules.to_string()).expect("hover.json");
         std::env::set_var("TAKO_LSP_FAKE_HOVER", &file);
         let completion = serde_json::json!({ "items": [{ "label": "totalx" }] });
@@ -52657,6 +52828,7 @@ mod self_test {
         };
 
         let dir = std::env::temp_dir().join(format!("tako-visual-jump-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test jump-keys 一時ディレクトリ");
         let body: String = (1..=300).map(|i| format!("// line {i}\n")).collect();
@@ -52848,6 +53020,7 @@ mod self_test {
         let delete_word_forward = key("alt-delete", "ctrl-delete");
 
         let dir = std::env::temp_dir().join(format!("tako-visual-keys-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test editor-keys 一時ディレクトリ");
         let path = dir.join("keys.rs");
@@ -53654,6 +53827,7 @@ mod self_test {
             });
         let original = std::fs::read(&source).expect("visual-test large-file-edit 元ファイル");
         let dir = std::env::temp_dir().join(format!("tako-visual-1660-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test large-file-edit 一時ディレクトリ");
         // 言語サーバの根（Cargo.toml）を置く = 偽サーバを繋いだときに受け持たせる
@@ -54013,6 +54187,7 @@ mod self_test {
         inject_section_failure("large-file-decor");
         ensure_fresh_scene(window, cx, "large-file-decor").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-1660d-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test large-file-decor 一時ディレクトリ");
         // 言語サーバの根（Cargo.toml）。⌘ホバーは `.rs` を受け持つサーバがあることだけを見る
@@ -54842,6 +55017,7 @@ mod self_test {
             "ctrl-="
         };
         let dir = std::env::temp_dir().join(format!("tako-visual-vlines-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test viewport-lines 一時ディレクトリ");
         let write = |name: &str, body: String| -> std::path::PathBuf {
@@ -55659,6 +55835,7 @@ mod self_test {
             ("ctrl-=", "ctrl--", "ctrl-0", "ctrl-end")
         };
         let dir = std::env::temp_dir().join(format!("tako-visual-1772-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test editor-font 一時ディレクトリ");
         let write = |name: &str, body: String| -> std::path::PathBuf {
@@ -56726,6 +56903,7 @@ mod self_test {
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
         let dir = std::env::temp_dir().join(format!("tako-visual-1659-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test external-change 一時ディレクトリ");
         let path = dir.join("conflict.rs");
@@ -56964,6 +57142,7 @@ mod self_test {
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
         let dir = std::env::temp_dir().join(format!("tako-visual-1661-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test md-edit-resume 一時ディレクトリ");
         let path = dir.join("note.md");
@@ -57307,6 +57486,7 @@ mod self_test {
             "ctrl-shift-f"
         };
         let dir = std::env::temp_dir().join(format!("tako-visual-1873-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test md-find-restore 一時ディレクトリ");
         let path = dir.join("note.md");
@@ -57863,6 +58043,7 @@ mod self_test {
         // --- 場面: 一時 dir の中だけに fixture を作る（本物のファイルを動かさない = #1811） ---
         let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
         let raw = tmp.join(format!("tako-vt1834-{}", std::process::id()));
+        remove_on_fail(&raw);
         let _ = std::fs::remove_dir_all(&raw);
         for dir in ["src", "folder/inner", "dst", "taken", "日本 語"] {
             std::fs::create_dir_all(raw.join(dir)).expect("visual-test tree-move fixture");
@@ -58516,6 +58697,7 @@ mod self_test {
         // ⑬ 別のタブ（別のワークスペースのフォルダ）を表示している間の移動（CLI / MCP と同じ口）。
         // 別のタブのフォルダは fixture の外（兄弟の dir）に置く
         let elsewhere = tmp.join(format!("tako-vt1834-other-{}", std::process::id()));
+        remove_on_fail(&elsewhere);
         let _ = std::fs::create_dir_all(&elsewhere);
         let other_ok = window
             .update(cx, |app, _, cx| {
@@ -58741,6 +58923,7 @@ mod self_test {
         // --- 場面: 一時 dir の中だけに fixture を作る（本物のファイルを書き換えない = #1811） ---
         let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
         let raw = tmp.join(format!("tako-vt1860-{}", std::process::id()));
+        remove_on_fail(&raw);
         let _ = std::fs::remove_dir_all(&raw);
         for dir in ["src", "folder/inner", "dst", "deep/sub", "finder"] {
             std::fs::create_dir_all(raw.join(dir)).expect("visual-test tree-clipboard fixture");
@@ -59321,6 +59504,7 @@ mod self_test {
         };
 
         let dir = std::env::temp_dir().join(format!("tako-visual-1653-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test search-case 一時ディレクトリ");
         let path = dir.join("value.rs");
@@ -59619,6 +59803,7 @@ mod self_test {
         // 材料: Issue #1728 の 2 例をファイル名にし、実行コマンドもそのまま宣言する
         // （1 枚目は 68 バイトで 60 バイト目が、2 枚目は 63 バイトで 40 バイト目が文字の途中）
         let dir = std::env::temp_dir().join(format!("tako-st1728-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let first = dir.join("aデータ解析結果のまとめレポート最終版.py");
         let second = dir.join("report_最終版_データ解析結果まとめ_v2.py");
@@ -59810,6 +59995,7 @@ mod self_test {
 
         // --- 道具: 偽の claude 風 TUI・出力し続ける worker・Markdown ---
         let dir = std::env::temp_dir().join(format!("tako-1946-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let tui = dir.join("tui.sh");
         let _ = std::fs::write(
@@ -60733,6 +60919,7 @@ mod self_test {
         // 場面: 右パネル fleet に BG ペイン行（グリップ + 復帰ボタン）を出し、
         // 同時にプレビューの検索 / 置換欄（置換の印）を開く
         let md1536 = std::env::temp_dir().join(format!("tako-st1536-{}.md", std::process::id()));
+        remove_on_fail(&md1536);
         let _ = std::fs::write(&md1536, "# 見出し\n\nalpha beta alpha\n");
         let ready1536 = window
             .update(cx, |app: &mut TakoApp, _, cx| {
@@ -60881,6 +61068,7 @@ mod self_test {
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
         let dir = std::env::temp_dir().join(format!("tako-st1657-{}", std::process::id()));
+        remove_on_fail(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let cases: [(&str, &str); 3] = [
             ("ok.sh", "# tako:run: printf 'ok-1657\\n'\n"),
@@ -61179,6 +61367,7 @@ mod self_test {
         // リスナー配線を通る）で行う。判定は「解消エージェントのペインが増える」
         {
             let iso496 = std::env::temp_dir().join(format!("tako-st496-{}", std::process::id()));
+            remove_on_fail(&iso496);
             let _ = std::fs::remove_dir_all(&iso496);
             let git496 = |args: &[&str]| -> bool {
                 std::process::Command::new("git")
@@ -63399,6 +63588,7 @@ mod self_test {
                 // 組むとここで割れるので、この項目自身がクオート漏れの回帰を踏む
                 let as_home =
                     std::env::temp_dir().join(format!("tako-st600 space-{}", std::process::id()));
+                remove_on_fail(&as_home);
                 let _ = std::fs::remove_dir_all(&as_home);
                 std::fs::create_dir_all(&as_home).expect("隔離 HOME を作れる");
                 // 予測のネタになる履歴を 1 行だけ置く
@@ -63830,6 +64020,7 @@ mod self_test {
                 // 41c と同じく空白は意図的（#833）。`HOME=` / `PATH=` の両方を踏む
                 let iso =
                     std::env::temp_dir().join(format!("tako-st601 space-{}", std::process::id()));
+                remove_on_fail(&iso);
                 let _ = std::fs::remove_dir_all(&iso);
                 std::fs::create_dir_all(iso.join("bin")).expect("隔離 HOME を作れる");
                 let zshrc = iso.join(".zshrc");
@@ -66216,6 +66407,7 @@ mod self_test {
             //     の後処理は不要 = 項目 56 の罠の対象外）
             let preview_dir =
                 std::env::temp_dir().join(format!("tako-selftest-preview-{}", std::process::id()));
+            remove_on_fail(&preview_dir);
             let _ = std::fs::remove_dir_all(&preview_dir);
             std::fs::create_dir_all(&preview_dir).expect("一時ディレクトリを作れる");
             let mut code_fixture = String::from(
@@ -68971,6 +69163,7 @@ mod self_test {
                     .unwrap_or(0);
                 let ws_out = std::env::temp_dir()
                     .join(format!("tako-selftest-ws-{}.json", std::process::id()));
+                remove_on_fail(&ws_out);
                 let _ = std::fs::remove_file(&ws_out);
                 press(any, cx, sh.clear_line_key());
                 type_text(
@@ -69552,6 +69745,7 @@ mod self_test {
             //      既存プレビューがあっても再利用せず指定方向に分割して開く
             let dnd_dir =
                 std::env::temp_dir().join(format!("tako-selftest-dnd-file-{}", std::process::id()));
+            remove_on_fail(&dnd_dir);
             let _ = std::fs::remove_dir_all(&dnd_dir);
             std::fs::create_dir_all(&dnd_dir).expect("一時ディレクトリを作れる");
             std::fs::write(dnd_dir.join("a.rs"), "fn main() {}\n").unwrap();
@@ -69676,6 +69870,7 @@ mod self_test {
             //     list にも preview.mode="image" として公開される
             let img_dir =
                 std::env::temp_dir().join(format!("tako-selftest-img-{}", std::process::id()));
+            remove_on_fail(&img_dir);
             let _ = std::fs::remove_dir_all(&img_dir);
             std::fs::create_dir_all(&img_dir).expect("一時ディレクトリを作れる");
             // 最小の有効な PNG（1x1 透明ピクセル）
@@ -70208,6 +70403,7 @@ mod self_test {
             {
                 let pdf_dir =
                     std::env::temp_dir().join(format!("tako-selftest-pdf-{}", std::process::id()));
+                remove_on_fail(&pdf_dir);
                 let _ = std::fs::remove_dir_all(&pdf_dir);
                 std::fs::create_dir_all(&pdf_dir).expect("一時ディレクトリを作れる");
                 let pdf_path = pdf_dir.join("test.pdf");
@@ -71096,6 +71292,7 @@ mod self_test {
 
                 let scratch = std::env::temp_dir()
                     .join(format!("tako-selftest-165-{}", std::process::id()));
+                remove_on_fail(&scratch);
                 let _ = std::fs::create_dir_all(&scratch);
                 let registered = (|| -> Result<(), String> {
                     let mut config = tako_control::orchestrator::ProjectsConfig::load()?;
@@ -72169,6 +72366,7 @@ mod self_test {
             //     クリック座標→秒数の写像そのものは video_player の単体テストが持つ
             let video_dir =
                 std::env::temp_dir().join(format!("tako-selftest-video-{}", std::process::id()));
+            remove_on_fail(&video_dir);
             let _ = std::fs::remove_dir_all(&video_dir);
             std::fs::create_dir_all(&video_dir).expect("一時ディレクトリを作れる");
             let video_path = video_dir.join("seekbar.mp4");
@@ -73308,6 +73506,7 @@ mod self_test {
             {
                 let fixture =
                     std::env::temp_dir().join(format!("tako-st550-{}", std::process::id()));
+                remove_on_fail(&fixture);
                 let _ = std::fs::remove_dir_all(&fixture);
                 let home = fixture.join("home");
                 let project = fixture.join("project");
@@ -73371,6 +73570,7 @@ mod self_test {
             {
                 let fixture =
                     std::env::temp_dir().join(format!("tako-st559-{}", std::process::id()));
+                remove_on_fail(&fixture);
                 let _ = std::fs::remove_dir_all(&fixture);
                 let _ = std::fs::create_dir_all(fixture.join("sub/deep"));
                 let _ = std::fs::write(fixture.join("sub/z-last.txt"), "x");
@@ -73443,6 +73643,7 @@ mod self_test {
             {
                 let fixture =
                     std::env::temp_dir().join(format!("tako-st1399-{}", std::process::id()));
+                remove_on_fail(&fixture);
                 let _ = std::fs::remove_dir_all(&fixture);
                 let _ = std::fs::create_dir_all(&fixture);
                 let _ = std::fs::write(fixture.join("keep.txt"), "x");
@@ -73630,6 +73831,7 @@ mod self_test {
                     "tako-st1417-{}-note.md",
                     std::process::id()
                 ));
+                remove_on_fail(&md1417);
                 let _ = std::fs::write(&md1417, "# 見出し A\n\n本文\n\n## 見出し B\n\n本文\n");
                 let preview_pane = window
                     .update(cx, |app, _, cx| {
@@ -73832,6 +74034,7 @@ mod self_test {
                 // ⑥ 裏取り: **成功するコピーでは通知を出さない**（誤検知していない）
                 let md1422 = std::env::temp_dir()
                     .join(format!("tako-st1422-{}-code.md", std::process::id()));
+                remove_on_fail(&md1422);
                 let _ = std::fs::write(&md1422, "# コード\n\n```rust\nfn main() {}\n```\n");
                 let code_pane = window
                     .update(cx, |app, _, cx| {
@@ -74524,6 +74727,7 @@ mod self_test {
             {
                 let fixture =
                     std::env::temp_dir().join(format!("tako-st549-{}", std::process::id()));
+                remove_on_fail(&fixture);
                 let _ = std::fs::remove_dir_all(&fixture);
                 let path = fixture.join("settings.json");
                 let defaults = tako_control::settings::Settings::default();
@@ -75092,6 +75296,7 @@ mod self_test {
                 {
                     let fixture =
                         std::env::temp_dir().join(format!("tako-st616-{}", std::process::id()));
+                    remove_on_fail(&fixture);
                     let _ = std::fs::remove_dir_all(&fixture);
                     let path = fixture.join("settings.json");
                     let saved = tako_control::settings::Settings {
@@ -76238,6 +76443,7 @@ mod self_test {
                 // 一時パスへ書く（`TakoApp::new` が読むのと同じ `ui_mode()` で解決する）
                 let fixture =
                     std::env::temp_dir().join(format!("tako-st694-{}", std::process::id()));
+                remove_on_fail(&fixture);
                 let _ = std::fs::remove_dir_all(&fixture);
                 let path = fixture.join("settings.json");
                 let saved_gui = {
@@ -78429,6 +78635,7 @@ mod self_test {
                 // ①入力欄の確定が yaml へ届く ②空欄で解除される
                 // ③弾かれたときは保存されず、**CLI と同じ文言**が画面に出る、の 3 点
                 let cwd_dir = std::env::temp_dir().join(format!("tako-1119-{}", std::process::id()));
+                remove_on_fail(&cwd_dir);
                 let _ = std::fs::create_dir_all(&cwd_dir);
                 let cwd_str = cwd_dir.display().to_string();
                 let bad_cwd = cwd_dir.join("この階層は存在しない").display().to_string();
@@ -79983,6 +80190,7 @@ mod self_test {
                 let legacy = std::env::var_os("TAKO_903_LEGACY").is_some();
                 let body_path = std::env::temp_dir()
                     .join(format!("tako-selftest-737-{}.txt", std::process::id()));
+                remove_on_fail(&body_path);
                 // 箱の中身（実バイト）。`❯` の後は NBSP = 実採取の形。描いたあとカーソルを
                 // 入力行の末尾へ戻す（IME のキャレット位置の検査のため）。
                 // 組み立ては dialog の単体テストと同じ 1 実装（#1913）
@@ -81573,6 +81781,7 @@ mod self_test {
 
                 let root =
                     std::env::temp_dir().join(format!("tako-selftest-772-{}", std::process::id()));
+                remove_on_fail(&root);
                 let _ = std::fs::remove_dir_all(&root);
                 if std::fs::create_dir_all(&root).is_err() {
                     fail("#772: 検証用ディレクトリを作れない");
@@ -81864,6 +82073,7 @@ mod self_test {
                 wait(cx, 1500).await;
                 let pdf770 =
                     std::env::temp_dir().join(format!("tako-st770-{}.pdf", std::process::id()));
+                remove_on_fail(&pdf770);
                 write_test_pdf(&pdf770);
                 fire(
                     Req::OpenFile {
@@ -84098,6 +84308,7 @@ mod self_test {
                 // 小さい実ファイルを Code モードで開く（大きいファイルは debug ビルドだと
                 // ハイライトそのものに数十秒かかり、寿命の検査が待ち時間に化ける）
                 let dir815 = std::env::temp_dir().join(format!("tako-815-{}", std::process::id()));
+                remove_on_fail(&dir815);
                 let _ = std::fs::create_dir_all(&dir815);
                 let src = dir815.join("sample.rs");
                 let _ = std::fs::write(
@@ -84594,6 +84805,7 @@ mod self_test {
                 let any826 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
                 let window826 = any826.downcast::<TakoApp>().unwrap_or(window);
                 let dir826 = std::env::temp_dir().join(format!("tako-826-{}", std::process::id()));
+                remove_on_fail(&dir826);
                 let _ = std::fs::create_dir_all(&dir826);
                 let src826 = dir826.join("big.md");
                 // 1 画面にはとても入らない量。見出し（= 目次項目）・段落・リンク・
@@ -85268,6 +85480,7 @@ mod self_test {
                 let window835 = any835.downcast::<TakoApp>().unwrap_or(window);
                 let dir835 = std::env::temp_dir()
                     .join(format!("tako-selftest-835-{}", std::process::id()));
+                remove_on_fail(&dir835);
                 let _ = std::fs::remove_dir_all(&dir835);
                 let _ = std::fs::create_dir_all(dir835.join("プロジェクト"));
                 let _ = std::fs::write(dir835.join("読み物.md"), "# 見出し\n\n本文\n");
@@ -85434,6 +85647,7 @@ mod self_test {
                 let project = "tako-selftest-822";
                 let scratch =
                     std::env::temp_dir().join(format!("tako-selftest-822-{}", std::process::id()));
+                remove_on_fail(&scratch);
                 let _ = std::fs::create_dir_all(&scratch);
                 let registered = (|| -> Result<(), String> {
                     let mut config = tako_control::orchestrator::ProjectsConfig::load()?;
@@ -87302,6 +87516,7 @@ mod self_test {
                 //     ガードを外しても通ってしまう（検出力ゼロのテストになる）
                 let fixture = std::env::temp_dir()
                     .join(format!("tako-selftest-919-{}.md", std::process::id()));
+                remove_on_fail(&fixture);
                 let _ = std::fs::write(&fixture, "# remote preview\n");
                 let (local_ok, blocked, msg) = window
                     .update(cx, |app, _, cx| {
@@ -89302,6 +89517,7 @@ mod self_test {
                     "tako-selftest-1009-{}",
                     std::process::id()
                 ));
+                remove_on_fail(&base1009);
                 let _ = std::fs::remove_dir_all(&base1009);
                 let repo1009 = base1009.join("repo");
                 let plain1009 = base1009.join("plain");
@@ -89804,6 +90020,7 @@ mod self_test {
                 // （実機で 2/2 とも `phase=connected` のまま = #1127）
                 let fixture1040 = std::env::temp_dir()
                     .join(format!("tako-selftest-1040-{}.txt", std::process::id()));
+                remove_on_fail(&fixture1040);
                 let emit1040 = |lines: &[&str]| {
                     let _ = std::fs::write(&fixture1040, format!("{}\n", lines.join("\n")));
                     sh.print_file(&fixture1040)
@@ -90287,6 +90504,7 @@ mod self_test {
                 // シェルのエコー行にも本文が載り、マーカーの最初の出現がそちらになる）
                 let fixture1446 = std::env::temp_dir()
                     .join(format!("tako-selftest-1446-{}.txt", std::process::id()));
+                remove_on_fail(&fixture1446);
                 let _ = std::fs::write(&fixture1446, format!("{stale1446}\n"));
                 let emit1446 = sh.print_file(&fixture1446);
                 let _ = window.update(cx, |app: &mut TakoApp, _, _| {
@@ -91529,6 +91747,7 @@ mod self_test {
                 };
                 let body_path = std::env::temp_dir()
                     .join(format!("tako-selftest-1067-{}.txt", std::process::id()));
+                remove_on_fail(&body_path);
                 // claude TUI 風の箱（`❯` の後は NBSP = 実採取の形）。
                 // `footer` に生成中ヒントや上限行を差し替えて関門を作る。
                 // 組み立ては dialog の単体テストと同じ 1 実装（#1913）
@@ -91860,6 +92079,7 @@ mod self_test {
             //      (a) が落ちる = 検出力
             {
                 let dir141 = std::env::temp_dir().join(format!("tako-973-{}", std::process::id()));
+                remove_on_fail(&dir141);
                 let _ = std::fs::remove_dir_all(&dir141);
                 std::fs::create_dir_all(&dir141).expect("973: 一時ディレクトリを作れる");
                 let file141 = dir141.join("note.txt");
@@ -92163,6 +92383,7 @@ mod self_test {
             {
                 let body142 = std::env::temp_dir()
                     .join(format!("tako-selftest-1021-{}.txt", std::process::id()));
+                remove_on_fail(&body142);
                 // claude TUI のフッターの形。`agent_metrics` は末尾 8 行だけ見るので
                 // 先に改行でグリッドを流して最下部へ置く
                 let footer = |body: &str| format!("{}{body}\n", "\n".repeat(60));
@@ -92477,6 +92698,7 @@ mod self_test {
                     .any(|(k, _)| k == "ZDOTDIR");
                 let home143 =
                     std::env::temp_dir().join(format!("tako-1031-home-{}", std::process::id()));
+                remove_on_fail(&home143);
                 let mut probe143 = String::new();
                 let mut probe_pane143 = None;
                 if cfg!(unix) && zsh143 && zdot_injected143 {
@@ -93242,6 +93464,7 @@ mod self_test {
                 // fixture は**スクラッチに自分で作る**（ユーザーのファイルを開かない）
                 let base147 =
                     std::env::temp_dir().join(format!("tako_st1182_{}", std::process::id()));
+                remove_on_fail(&base147);
                 let _ = std::fs::remove_dir_all(&base147);
                 let plain147 = base147.join("plain.txt");
                 let spaced147 = base147.join("読み 込み.txt");
@@ -94202,6 +94425,7 @@ mod self_test {
                     .unwrap_or(false);
                 let key149 = "st1453";
                 let repo149 = std::env::temp_dir().join(format!("tako-st1453-{}", std::process::id()));
+                remove_on_fail(&repo149);
                 let _ = std::fs::create_dir_all(&repo149);
 
                 // 前回の残骸を消す（項目は何度も走りうる）
@@ -94564,6 +94788,7 @@ mod self_test {
                 use tako_control::protocol::Request as Req;
                 let dir1676 =
                     std::env::temp_dir().join(format!("tako-1676-{}", std::process::id()));
+                remove_on_fail(&dir1676);
                 let _ = std::fs::create_dir_all(&dir1676);
                 let src1676 = dir1676.join("big.rs");
                 const LINES_1676: usize = 5000;

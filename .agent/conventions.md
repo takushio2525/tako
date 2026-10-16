@@ -33,6 +33,11 @@
 
 - 仕様書は `.agent/`（日本語）。コードコメントも日本語
 - 仕様変更時は該当する `.agent/*.md` を**同一コミット**で更新する
+- **Markdown の表のセルに書く `|` は `\|` にする（コードスパンの中でも）**（Issue #2051）。GFM は
+  inline より先に行を `|` で割るので、`` `tako mouse [on|off]` `` のままだとセルがはみ出し、
+  GitHub・docs サイト・tako のプレビューのどれもがはみ出した分を描かない。列が足りない行は空セル
+  （`|  |`）で揃える。番犬 `crates/tako-control/tests/issue2051_md_table_columns_watchdog.rs` が
+  リポジトリの全 md（`fixtures/` を除く）を見て `file:line` で落とす
 - 公開サイト（`docs/`）のアクセス解析タグは `docs/astro.config.mjs` の Starlight `head` に
   置き、**ID はファイル冒頭の定数 1 か所**（`GA_MEASUREMENT_ID` / `ADSENSE_PUBLISHER_ID`）で持つ。
   GA4 は `takushio2525.com` 一族で 1 プロパティを共有し、AdSense は所有権確認の meta だけ
@@ -1598,6 +1603,18 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     `forget` / static / フィールドに持つ形は番犬 `issue1926_app_nap_watchdog` が落とす）
   - **スリープ防止（#173）のアサーションを握っている間は間引かれない**（#1926 で実測。隔離 GUI でも
     `tako sleep-guard set --mode on` で優先度 28 のまま）。性能を比べる腕ではスリープ防止の状態を揃える
+
+### 節が作る一時ファイルは `remove_on_fail` で登録する（Issue #2051）
+
+`fail()` は即 `exit(1)` するので、節の末尾の `remove_dir_all` は**落ちた経路では走らない**
+（#2046 では偽の鍵を受けたファイルが `$TMPDIR` に残りえた）。
+
+- 一時ファイル / dir のパスを決めたら、作る前でよいので `remove_on_fail(&path)` を 1 行置く。
+  `fail()` が exit の前に登録簿を消す（FR-4.8.23）。正常経路の後片付けは今までどおり節の末尾に書く
+- 登録できるのは `std::env::temp_dir()` / `TAKO_DATA_DIR` より**下**だけ（置き場そのもの・`..`・
+  外は `fail()` で止まる）。登録は外さない仕組みなので、guard を `let _ =` で落とす事故は起きない
+- 消えたかは `TAKO_APP_SELF_TEST_CLEANUP: registered=N removed=M left=K` の行で読む。
+  A/B は `TAKO_2051_LEGACY=1`、実経路は `bash scripts/test-visual-fail-cleanup-2051.sh`
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 

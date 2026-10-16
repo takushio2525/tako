@@ -224,6 +224,7 @@ pub(super) async fn run_target_1734_visual(
     cx: &mut AsyncApp,
 ) {
     let dir = std::env::temp_dir().join(format!("tako-st1734-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(dir.join(".git"));
     let dir = tako_core::platform::path::canonicalize(&dir).unwrap_or(dir);

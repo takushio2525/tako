@@ -125,6 +125,7 @@ fn retained(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> serde_json::Val
 /// 探す範囲の置き場を作る（git のリポジトリ。`target/` は .gitignore・bin.dat はバイナリ）
 fn fixture() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("tako-visual-{LABEL}-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).expect("src");
     std::fs::create_dir_all(dir.join(".git")).expect(".git");

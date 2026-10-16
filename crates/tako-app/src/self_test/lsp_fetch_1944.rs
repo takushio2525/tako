@@ -78,6 +78,7 @@ pub(super) async fn lsp_fetch_visual(
     );
     let anchor = ensure_fresh_scene(window, cx, LABEL).await;
     let dir = std::env::temp_dir().join(format!("tako-visual-{LABEL}-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("visual-test lsp-fetch の一時ディレクトリ");
     std::fs::write(dir.join("pyproject.toml"), "[project]\nname = \"v\"\n").expect("pyproject");

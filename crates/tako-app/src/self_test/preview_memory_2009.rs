@@ -213,6 +213,7 @@ pub(super) async fn preview_memory_visual(
 
     // --- 素材 ---
     let dir = std::env::temp_dir().join(format!("tako-2009-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::create_dir_all(&dir);
     let pdf = dir.join("pages12.pdf");
     write_pages_pdf(&pdf, 12);

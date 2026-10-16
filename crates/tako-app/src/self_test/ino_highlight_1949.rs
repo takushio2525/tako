@@ -131,6 +131,7 @@ pub(super) async fn ino_highlight_visual(
     inject_section_failure(SECTION);
     ensure_fresh_scene(window, cx, SECTION).await;
     let dir = std::env::temp_dir().join(format!("tako-visual-ino-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     let ino = dir.join("sketch").join("sketch.ino");
     let cpp = dir.join("cpp").join("sketch.cpp");

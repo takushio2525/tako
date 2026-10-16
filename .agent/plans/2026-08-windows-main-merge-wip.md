@@ -1036,8 +1036,7 @@ dispatch 経由の 2 件は builder を直接呼べないので期待値を構�
 | `is not recognized` エラー | **消滅**（4 回の観測すべてで False） |
 | **claude が起動** | TUI 描画を確認（`[Opus 5 (1M context) · MAX]` / ctx バー / auto mode） |
 | **プロンプトが届いた** | `❯ 1 と 2 を足した数だけを答えてください。説明は不要です。` |
-| **claude が応答** | `● Login expired · Please run /login`（**この機の claude ログイン期限切れ**。
-起動と送達と応答は成立） |
+| **claude が応答** | `● Login expired · Please run /login`（**この機の claude ログイン期限切れ**。起動と送達と応答は成立） |
 | **env が実プロセスへ届いた** | claude.exe の PEB を読み `TAKO_ORCHESTRATOR_ROLE=worker:p867` を確認 |
 | `flow_log` | `シェル準備待ち → エコー待ち → 実行確認`（書き直し 0 回・長さ 62） |
 

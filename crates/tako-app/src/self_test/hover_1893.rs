@@ -412,6 +412,7 @@ pub(super) async fn hover_loading_visual(
     inject_section_failure(LABEL);
     let work =
         std::env::temp_dir().join(format!("tako-visual-1930-{LABEL}-{}", std::process::id()));
+    remove_on_fail(&work);
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).expect("visual-test hover-loading の置き場");
     // 合図は相ごとに別のファイル（偽サーバは起動のたびに env を読む = ③④の再起動は前の相の合図を

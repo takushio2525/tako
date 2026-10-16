@@ -329,12 +329,14 @@ pub(super) async fn paste_guard_visual(
 ) {
     use tako_core::paste_guard::Rule;
     let origin = ensure_fresh_scene(window, cx, SECTION).await;
-    // 受け手の置き場は隔離の data dir の下（`fail()` は即 exit して下の後片付けを通らないので、
-    // 呼び出し側 = `scripts/test-paste-guard-2046.sh` の後始末が必ず消す場所に置く。#1296）
+    // 受け手（偽の鍵を受けるファイル）の置き場は隔離の data dir の下。落ちた経路は `fail()` が
+    // 登録簿（`remove_on_fail`）から消し（#2051）、プロセスごと殺された経路も呼び出し側 =
+    // `scripts/test-paste-guard-2046.sh` の後始末が消す（#1296）
     let dir = std::env::var_os("TAKO_DATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join(format!("tk2046-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)
         .unwrap_or_else(|e| fail(&format!("visual-test {SECTION}: 一時 dir を作れない: {e}")));

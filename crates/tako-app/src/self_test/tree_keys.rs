@@ -58,6 +58,7 @@ pub(super) async fn tree_keys_visual(
     // --- 場面: 一時 dir の中だけに fixture を作る（本物のファイルを書き換えない = #1811） ---
     let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
     let raw = tmp.join(format!("tako-vt1908-{}", std::process::id()));
+    remove_on_fail(&raw);
     let _ = std::fs::remove_dir_all(&raw);
     for dir in ["keys/sub", "keys/empty", "keys/zz", "big", "dst"] {
         std::fs::create_dir_all(raw.join(dir)).expect("visual-test tree-keys fixture");

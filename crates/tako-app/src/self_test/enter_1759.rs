@@ -38,6 +38,7 @@ pub(super) async fn enter_1759_visual(
     let base = ensure_fresh_scene(window, cx, SECTION).await;
     let legacy = tako_core::text_edit::legacy_1759();
     let dir = std::env::temp_dir().join(format!("tako-visual-1759-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("visual-test enter-1759 一時ディレクトリ");
     let dump_dir = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();

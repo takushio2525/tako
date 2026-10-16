@@ -49,6 +49,7 @@ pub(super) async fn tree_keyboard_copy_visual(
     // --- 場面: 一時 dir の中だけに fixture を作る（本物のファイルを書き換えない = #1811） ---
     let tmp = tako_core::platform::path::canonicalize_or_self(&std::env::temp_dir());
     let raw = tmp.join(format!("tako-vt1895-{}", std::process::id()));
+    remove_on_fail(&raw);
     let _ = std::fs::remove_dir_all(&raw);
     for dir in ["keys/sub", "trash-me", "big", "dst", "bin"] {
         std::fs::create_dir_all(raw.join(dir)).expect("visual-test tree-keyboard-copy fixture");

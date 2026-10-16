@@ -96,6 +96,7 @@ pub(super) async fn bracket_match_visual(
     inject_section_failure(SECTION);
     let base = ensure_fresh_scene(window, cx, SECTION).await;
     let dir = std::env::temp_dir().join(format!("tako-visual-1691-{}", std::process::id()));
+    remove_on_fail(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("visual-test bracket-match 一時ディレクトリ");
     let path = dir.join("brackets.rs");

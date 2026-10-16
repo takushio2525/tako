@@ -79,6 +79,7 @@ pub(super) async fn completion_cancel_visual(
     const LABEL: &str = "completion-cancel";
     inject_section_failure(LABEL);
     let work = std::env::temp_dir().join(format!("tako-visual-1909-{}", std::process::id()));
+    remove_on_fail(&work);
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).expect("visual-test completion-cancel の置き場");
     let (log, gate, hold) = (

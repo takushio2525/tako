@@ -97,10 +97,10 @@ tako/
 | セルフテスト起動（入力経路 + CLI / MCP e2e の機械検証） | `TAKO_SELF_TEST=1 cargo run -p tako-app` |
 | 実 claude の e2e（#28 / #716。要 claude CLI + 認証 + tmux） | `env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID -u CLAUDECODE -u CLAUDE_CONFIG_DIR TAKO_SELF_TEST=1 TAKO_SELF_TEST_CLAUDE=1 cargo run -p tako-app` |
 | Claude Code 実機検証（MCP 設定ゼロ接続） | `scripts/verify-claude-mcp.sh` |
-| 自動セットアップ | `tako setup [--yes] [--answers <json|@file|->]` |
+| 自動セットアップ | `tako setup [--yes] [--answers <json\|@file\|->]` |
 | **エージェント CLI のゼロスタート導入（claude / codex / agy。#868 / #1057 / #989）** | `tako setup bootstrap [status\|status-all\|install\|path\|undo-path\|handoff] [--agent <claude\|codex\|agy>]` |
 | **任意依存のその場導入（#88 / #1057 / #1499）** | `tako setup deps [install] [--dep <名>] [--dry-run] [--json]` |
-| **モデル一覧の実取得とピッカー（#1002）** | `tako setup models [--agent <claude|codex|agy>] [--json]` |
+| **モデル一覧の実取得とピッカー（#1002）** | `tako setup models [--agent <claude\|codex\|agy>] [--json]` |
 | **MCP セットアップ（claude / codex / agy。#979）** | `tako setup-mcp` |
 | `tako` CLI ビルド | `cargo build -p tako-cli` |
 | .app バンドル生成（macOS） | `scripts/build-app.sh [--verify] [--install]` |
@@ -122,7 +122,7 @@ tako/
 | オーケストレーター worker spawn | `tako orchestrator spawn --project <key> --prompt "..."` |
 | **worker への指示送達（#790）** | `<data_dir>/persist.log` |
 | オーケストレーター worker 監視 | `tako orchestrator watch --pane <N>` |
-| オーケストレーター ダイアログ応答（#319 → #748 で全種別） | `tako orchestrator respond --pane <N> [--choice <番号|ラベル>]` |
+| オーケストレーター ダイアログ応答（#319 → #748 で全種別） | `tako orchestrator respond --pane <N> [--choice <番号\|ラベル>]` |
 | オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]` |
 | オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]` |
 | オーケストレーター プロジェクト管理（add は専用プロファイルも作る。#1453） | `tako orchestrator projects list/add/remove` |
@@ -130,7 +130,7 @@ tako/
 | **走っている master を専用プロファイルへその場で寄せる（#1453）** | `tako orchestrator adopt <名前>` |
 | **スマホから会話を操作する（Claude 公式 Remote Control。#1068 / #1069 / #1077 / #1078）** | `tako orchestrator profiles set <名前> --remote-control true` |
 | オーケストレーター アカウント管理（#504/#548） | `tako orchestrator accounts list/show/add/remove` |
-| worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved|legacy] [--master-ratio 0.5] [--algorithm grid|spiral]` |
+| worker spawn のレイアウト設定 | `tako orchestrator layout [--policy master-reserved\|legacy] [--master-ratio 0.5] [--algorithm grid\|spiral]` |
 | **PWA を単独でビルドする（新規 worktree で dist が無いとき。#1309）** | `scripts/build-pwa.sh` |
 | **PWA の e2e（Playwright。書き出しは outputDir の中だけ。#1357 / #1449 / #1749）** | `cd web/tako-remote && npm run e2e` |
 | build | `tako queue cargo build --workspace` |
@@ -169,21 +169,21 @@ tako/
 | プレビュー目次操作 | `tako preview-outline [--pane N] [--item N]` |
 | プレビュー内リンク（#680 / #271） | `tako preview-link-list` |
 | Markdown コードブロックのコピー（#680） | `tako preview-copy-code [index]` |
-| プレビューライブリロード | `tako preview-reload [on|off]` |
+| プレビューライブリロード | `tako preview-reload [on\|off]` |
 | プレビュー画像キャッシュ | `tako preview-cache [max_mb]` |
-| 設定の自動マイグレーション（#916） | `tako migrate [status|run] [--schema <種別>]` |
+| 設定の自動マイグレーション（#916） | `tako migrate [status\|run] [--schema <種別>]` |
 | **ユーザー向けタスク（人がやること。承認待ち・レビュー・投稿。#1450）** | `tako todo list` |
 | **その 1 件を右パネルで開いて見せる（#1479）** | `tako todo expand <id>` |
 | **人がやることを画面で見る・返答する（右パネル。#1450 B2）** | `tako panel --show --view tasks` |
 | **人がやることをスマホから片付ける（PWA。#1450 B3）** | `#/tasks` |
 | 受け入れゲート（#244 / #935） | `tako task gate set <task_id> --command "cmd" [--pr-merged N] [--custom "desc"]` |
 | git ブランチ操作（#496） | `tako git checkout <branch>` |
-| コンフリクト解消エージェント（#496） | `tako git resolve [--agent claude|codex|agy] [--tab N]` |
+| コンフリクト解消エージェント（#496） | `tako git resolve [--agent claude\|codex\|agy] [--tab N]` |
 | Web ビューペイン操作 | `tako web open <url>` |
 | 複数ウィンドウ操作（ビューポート方式 + 共有タブバー。#339/#380） | `tako window list` |
 | **窓の位置・寸法を外から決める（検証で窓を並べる。AX は使わない。#1442）** | `TAKO_WINDOW_BOUNDS=x,y,w,h` / `tako window move` / `resize` |
-| **シェル統合（cwd 追従・コマンド状態。#525）** | `tako shell-integration [status|install|uninstall]` |
-| **tako mod（Claude Code の mod 連携。ctx・使用制限・ターンの報告 #1879・画面の帯 #1881・画面の UI 設定 #1960・設定 dir の skills/tako へ入れる / 外す #1959）** | `tako mod [on|off]` / `tako mod band [on|off]` / `tako mod ui` / `tako mod install|uninstall` |
+| **シェル統合（cwd 追従・コマンド状態。#525）** | `tako shell-integration [status\|install\|uninstall]` |
+| **tako mod（Claude Code の mod 連携。ctx・使用制限・ターンの報告 #1879・画面の帯 #1881・画面の UI 設定 #1960・設定 dir の skills/tako へ入れる / 外す #1959）** | `tako mod [on\|off]` / `tako mod band [on\|off]` / `tako mod ui` / `tako mod install\|uninstall` |
 | エージェント共通ルール同期 | `tako agents sync-rules` |
 | AI 系設定のデバイス間共有（#513） | `tako config` |
 | **tmux の一覧・取り込み・window 切替（#1185 / #1190 / #1186）** | `tako tmux list` / `tako tmux open <session> [--window N]` / `tako tmux select-window N` |
@@ -195,32 +195,32 @@ tako/
 | ペインの平文ログ（ペイン死亡後も出力を遡る。#112） | `tako logs list` |
 | **スクロールバック保持上限（直接ペインの RAM。#818）** | `tako scrollback [lines]` |
 | **フォーカスの無いペインの再描画の上限（CPU。#1979）** | `tako redraw-limit [fps]` |
-| **TUI（全画面の claude 等）へのクリックの転送（⌥ / Shift + ドラッグで tako の選択。#1961）** | `tako mouse [on|off]` |
-| **貼り付けに鍵らしき文字があれば送る前に確かめる（既定 ON。#2046）** | `tako paste-guard [on|off|check]` |
+| **TUI（全画面の claude 等）へのクリックの転送（⌥ / Shift + ドラッグで tako の選択。#1961）** | `tako mouse [on\|off]` |
+| **貼り付けに鍵らしき文字があれば送る前に確かめる（既定 ON。#2046）** | `tako paste-guard [on\|off\|check]` |
 | スリープ防止 | `tako sleep-guard status` |
-| **会話を引き継いだセッション再起動（ペインの右クリック。#1067）** | `tako session-restart [--mode harness|handoff] [--pane N]` |
-| **リミット後の自動復帰（ペイン単位 / 一括 = ステータスバーのボタン。#813 / #1945）** | `tako limit-resume [on|off] [--pane N] [--all]` |
-| **ネット復帰で、接続エラーで止まったセッションを再開（既定 ON。#2112）** | `tako limit-resume --network [on|off]` |
-| 入力予測（tako 内 zsh のゴースト予測。#600/#614） | `tako autosuggest [on|off]` |
-| UI テーマ切替 | `tako theme [dark|light|toggle]` |
-| UI 表示モード切替（GUI ライク表示。#691/#694/#702/#715/#716/#720/#725/#737/#739） | `tako ui-mode [gui|terminal|toggle]` |
+| **会話を引き継いだセッション再起動（ペインの右クリック。#1067）** | `tako session-restart [--mode harness\|handoff] [--pane N]` |
+| **リミット後の自動復帰（ペイン単位 / 一括 = ステータスバーのボタン。#813 / #1945）** | `tako limit-resume [on\|off] [--pane N] [--all]` |
+| **ネット復帰で、接続エラーで止まったセッションを再開（既定 ON。#2112）** | `tako limit-resume --network [on\|off]` |
+| 入力予測（tako 内 zsh のゴースト予測。#600/#614） | `tako autosuggest [on\|off]` |
+| UI テーマ切替 | `tako theme [dark\|light\|toggle]` |
+| UI 表示モード切替（GUI ライク表示。#691/#694/#702/#715/#716/#720/#725/#737/#739） | `tako ui-mode [gui\|terminal\|toggle]` |
 | チャット本文のコピー（#725） | `tako chat copy [--pane N] [--message N] [--code K] [--markdown] [--list]` |
-| プラットフォーム対応マトリクス（#515 / #591） | `tako platform [--platform macos|windows] [--status pending] [--known-limitations] [--json]` |
+| プラットフォーム対応マトリクス（#515 / #591） | `tako platform [--platform macos\|windows] [--status pending] [--known-limitations] [--json]` |
 | **環境の健全性診断（IPC の受け口・CLI の PATH・tmux。#1441）** | `tako check-health [--json]` |
 | **PC のメモリ・CPU と重い処理（どのペインで何が食っているか）（#1993）** | `tako queue` |
 | **重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。#1994）** | `tako queue <コマンド>` |
 | **codex の利用制限データ（#357 / #985）** | `$CODEX_HOME/sessions/**/rollout-*.jsonl` |
-| **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude|codex|agy|local] [--status supported|degraded|pending|unsupported] [--json]` |
+| **agent 能力マトリクス（#982）** | `tako agent-support [--agent claude\|codex\|agy\|local] [--status supported\|degraded\|pending\|unsupported] [--json]` |
 | Windows 対応状況ページのデータの生成（ページは docs のビルドが組む。#591 / #2104） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |
 | **Windows のウインドウを実測する（#1063）** | `pwsh -File scripts/windows/measure-window.ps1 -TakoPid <pid>` |
-| 右パネルのビュー切替 | `tako panel --show --view <fleet|orch|git|tasks|diagnostics>` |
+| 右パネルのビュー切替 | `tako panel --show --view <fleet\|orch\|git\|tasks\|diagnostics>` |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]` |
 | 拡張子既定コマンド設定 | `tako run-default [ext] [command]` |
 | **実行環境・プロファイルを選んで覚える（ファイル / プロジェクト単位。#1731）** | `tako run-config <file> [--runtime <候補>]` |
 | AI コマンド提案カード（#666/#703） | `tako show-command <コマンド>...` |
 | 設定画面（#459/#721） | `tako settings [--tab <名>]` |
-| 初回起動バナー（#549） | `tako welcome [show|dismiss]` |
-| アプリ内更新（#36/#403/#616/#690/#1042） | `tako update [status|check|apply|apply-zip|repair]` |
+| 初回起動バナー（#549） | `tako welcome [show\|dismiss]` |
+| アプリ内更新（#36/#403/#616/#690/#1042） | `tako update [status\|check\|apply\|apply-zip\|repair]` |
 | **テスト・検証プロセスの残骸の後片付け（一時 dir。既定は dry-run。#1296 / #1312）** | `tako test-residue [--apply]` |
 | target 掃除 | `scripts/clean-target.sh` |
 | **cargo の target を Spotlight の索引から外す（既定は状態だけ。#1968）** | `scripts/spotlight-noindex.sh [--apply]` |

@@ -134,12 +134,14 @@ pub(super) async fn xref_1685_visual(
     inject_section_failure(LABEL);
     // 偽サーバの参照の規則（場面の置き場は `completion_scene` が作り直すので、ファイルは場面の後に書く）
     let dir = std::env::temp_dir().join(format!("tako-visual-{LABEL}-{}", std::process::id()));
+    remove_on_fail(&dir);
     let main = dir.join("src").join("main.rs");
     let other = dir.join("src").join("other.rs");
     let rules_file = std::env::temp_dir().join(format!(
         "tako-visual-{LABEL}-xref-{}.json",
         std::process::id()
     ));
+    remove_on_fail(&rules_file);
     let rules = serde_json::json!([{ "method": "textDocument/references", "result": [
         location(&main, 1, 4),
         location(&other, TARGET_LINE as u64, 7),
