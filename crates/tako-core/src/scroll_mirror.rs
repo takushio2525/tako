@@ -371,8 +371,53 @@ mod tests {
         }
     }
 
+    /// A/B: `TAKO_2196_LEGACY=1` は #2196 **前**のアンカーと判定へ戻す
+    /// （アンカー = 外側 `mouse_reporting()` / 判定 = 改行で連結した画面への `contains`）
+    #[cfg(unix)]
+    fn legacy_2196() -> bool {
+        std::env::var("TAKO_2196_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// 注入（#2196）: 混み具合ではなく**順序そのもの**を入れる。
+    ///
+    /// - `late-stty` = 内側の `stty raw -echo` とマウス要求を 1 秒遅らせ、1 発目の注入の
+    ///   あとで内側の要求が届くまで待ってから 2 発目以降を打つ（= stty が 1 発目と
+    ///   2 発目のあいだに入る。CI の macOS で起きた順序の固定）
+    /// - `double` = 1 発目の注入を 2 回打つ（製品の二重送達の模擬。**新しい判定でも
+    ///   落ちるのが正しい** = 個数まで比べていることの確認）
+    /// - `never` = 内側アプリがマウスを要求しない（**新しいアンカーが診断つきで落ちるのが
+    ///   正しい** = 状態待ちが本物の回帰を隠さないことの確認）
+    #[cfg(unix)]
+    fn inject_2196() -> Option<String> {
+        std::env::var("TAKO_2196_INJECT")
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
+
+    /// 状態待ち（#2196）。`step` が `Some` を返すまで 100 ms ごとに呼ぶ。上限は
+    /// [`crate::wait_budget::state_wait_budget`]（混み具合で伸ばすだけ）で、尽きたら
+    /// 待った時間を `Err` で返す（呼び手が「何を待っていたか / 何が届いたか」を添えて落とす）
+    #[cfg(unix)]
+    fn wait_state<T>(
+        base: std::time::Duration,
+        mut step: impl FnMut() -> Option<T>,
+    ) -> Result<T, std::time::Duration> {
+        let budget =
+            crate::wait_budget::state_wait_budget(base, crate::wait_budget::machine_busy());
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(value) = step() {
+                return Ok(value);
+            }
+            if started.elapsed() >= budget {
+                return Err(started.elapsed());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// `send_wheel`（tmux 直接注入。#167）でホイールレポートが内側アプリへ
-    /// **生のまま**届く e2e。外側クライアント PTY を経由しない（= tty_keys パース・
+    /// **生のまま・1 回ずつ**届く e2e。外側クライアント PTY を経由しない（= tty_keys パース・
     /// 部分 write・escape-time と無縁）ことがこの経路の存在意義
     #[test]
     #[cfg(unix)]
@@ -384,12 +429,24 @@ mod tests {
         }
         let socket = format!("tako-coretest-sw-{}", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let inject = inject_2196();
+        let (delay, request) = match inject.as_deref() {
+            Some("late-stty") => ("sleep 1; ", r"printf '\033[?1000h\033[?1006h'; "),
+            Some("never") => ("", ""),
+            _ => ("", r"printf '\033[?1000h\033[?1006h'; "),
+        };
         // 内側アプリ: raw mode + 受信バイトの ESC を「^[」に可視化して即時 echo
-        let inner = r#"stty raw -echo; printf '\033[?1000h\033[?1006h'; exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#;
+        let inner = [
+            delay,
+            "stty raw -echo; ",
+            request,
+            r#"exec perl -e '$|=1; while (sysread(STDIN,$b,4096)) { $b =~ s/\x1b/^[/g; syswrite(STDOUT,$b) }'"#,
+        ]
+        .concat();
         let options = SpawnOptions {
             command: Some(SpawnCommand {
                 program: "/bin/sh".into(),
-                args: vec!["-c".into(), inner.into()],
+                args: vec!["-c".into(), inner],
             }),
             cwd: Some(std::env::temp_dir()),
             env: vec![],
@@ -398,40 +455,114 @@ mod tests {
         let (session, _rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, "tako-e2e-sw"))
                 .expect("spawn できる");
-        let mut mouse_on = false;
-        for _ in 0..100 {
-            if session.mouse_reporting() {
-                mouse_on = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(mouse_on, "内側のマウス要求が伝わる");
         let target = ScrollTarget::Backend {
             socket: socket.clone(),
             session: "tako-e2e-sw".into(),
         };
+        // 器のペイン側で内側アプリが SGR マウスを要求済み（= 製品が `send_wheel` を
+        // 選ぶのと同じ判定）。内側は `stty raw -echo` の**後**に要求を出すので、
+        // これが立てば以後の注入は raw の tty へ届く
+        let pane_ready = || history_state(&target).filter(|s| s.mouse && s.sgr);
+
+        // **アンカーは器のペイン側の要求**（#2196。#1252 と同じ偽アンカーの罠）。
+        // 外側 `mouse_reporting()` は器の conf の `set -g mouse on` で attach の時点で
+        // 真になり、内側の `stty raw -echo` を待たない。`send-keys -H` は器のマウス処理を
+        // 通らないので copy-mode には食われない代わりに、stty より先に届いた注入は
+        // cooked の tty が echo（ECHOCTL の `^[`）し、raw になってから内側アプリも
+        // 同じバイトを読んで echo する = **2 回見える**（CI の macOS で上方向が 3 → 6 個）
+        if legacy_2196() {
+            // TAKO_2196_LEGACY_ARM 開始（#2196 **前**のアンカー。番犬はここを対象外にする）
+            let mut mouse_on = false;
+            for _ in 0..100 {
+                if session.mouse_reporting() {
+                    mouse_on = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(mouse_on, "内側のマウス要求が伝わる");
+            eprintln!(
+                "TAKO_2196: 旧アンカー成立時の器のペイン={:?}",
+                history_state(&target)
+            );
+            // TAKO_2196_LEGACY_ARM 終了
+        } else {
+            let pane = wait_state(std::time::Duration::from_secs(10), pane_ready)
+                .unwrap_or_else(|waited| {
+                    panic!(
+                        "TAKO_2196: 内側アプリのマウス要求が器のペインへ届かない\
+                         （#{{mouse_sgr_flag}}=1 を待った）。waited={:.1}s 器のペイン={:?} 画面: {:?}",
+                        waited.as_secs_f64(),
+                        history_state(&target),
+                        session.visible_lines().join("\n")
+                    )
+                });
+            eprintln!("TAKO_2196: アンカー成立時の器のペイン={pane:?}");
+        }
+
         // SGR 上方向 3 イベント + 下方向 1 イベント + X10 上方向 1 イベント
         send_wheel(&target, 3, 5, 5, true);
+        match inject.as_deref() {
+            Some("double") => send_wheel(&target, 3, 5, 5, true),
+            Some("late-stty") => {
+                wait_state(std::time::Duration::from_secs(10), pane_ready).unwrap_or_else(
+                    |waited| {
+                        panic!(
+                            "TAKO_2196: 注入 late-stty で内側の要求が来ない。waited={:.1}s",
+                            waited.as_secs_f64()
+                        )
+                    },
+                );
+            }
+            _ => {}
+        }
         send_wheel(&target, -1, 5, 5, true);
         send_wheel(&target, 1, 5, 5, false);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let expect_sgr_up = "^[[<64;6;6M^[[<64;6;6M^[[<64;6;6M";
+        let sgr_up = "^[[<64;6;6M";
+        let expect_sgr_up = sgr_up.repeat(3);
         let expect_sgr_down = "^[[<65;6;6M";
         let expect_x10 = "^[[M`&&"; // 32+64=0x60(`)、32+6=0x26(&)
-        loop {
-            let screen = session.visible_lines().join("\n");
-            if screen.contains(expect_sgr_up)
-                && screen.contains(expect_sgr_down)
-                && screen.contains(expect_x10)
-            {
-                break;
+        if legacy_2196() {
+            // TAKO_2196_LEGACY_ARM 開始（#2196 **前**の判定。番犬はここを対象外にする）
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let screen = session.visible_lines().join("\n");
+                if screen.contains(&expect_sgr_up)
+                    && screen.contains(expect_sgr_down)
+                    && screen.contains(expect_x10)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "直接注入のレポートが内側へ届かない。画面: {screen:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "直接注入のレポートが内側へ届かない。画面: {screen:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // TAKO_2196_LEGACY_ARM 終了
+        } else {
+            // 内側アプリは改行を出さないので、受信したバイトは**画面上の 1 本の列**になる。
+            // 行をそのままつなぐ（`visible_lines` は行ごとに `trim_end` 済み）と 80 桁の
+            // 折り返しを跨いでも一致する。比べるのは**列そのもの**: `contains` だと
+            // 2 回届いても通ってしまう（#2196 は 6 個届いて、折り返しで X10 が分断された
+            // ときだけ落ちていた）
+            let expected = format!("{expect_sgr_up}{expect_sgr_down}{expect_x10}");
+            let stream = || session.visible_lines().concat();
+            if let Err(waited) = wait_state(std::time::Duration::from_secs(5), || {
+                (stream() == expected).then_some(())
+            }) {
+                let got = stream();
+                panic!(
+                    "TAKO_2196: 直接注入のレポートが 1 回ずつ届かない。\
+                     上方向 SGR={}（期待 3）/ 下方向 SGR={}（期待 1）/ X10={}（期待 1）\
+                     waited={:.1}s 器のペイン={:?} 列: {got:?}",
+                    got.matches(sgr_up).count(),
+                    got.matches(expect_sgr_down).count(),
+                    got.matches(expect_x10).count(),
+                    waited.as_secs_f64(),
+                    history_state(&target),
+                )
+            }
         }
     }
 }

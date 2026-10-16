@@ -1487,6 +1487,15 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     Web ビューの 3 か所は `dispatch(\n app,\n web_req("read", …)` の形で行を畳んでも
     `read(app)` にならないので、#1162 の番犬へ `tako_control::dispatch(` を足した
 
+- **器のペインへマウス入力を打つ前のアンカーは器のペイン側の要求**（#1252 / #2196）。
+  外側の `mouse_reporting()` は器の conf の `set -g mouse on` で attach の時点で真になり、
+  内側アプリが起きた証跡にならない。要求より前に打つと、外側 PTY 経由のホイールは器が食って
+  copy-mode へ入り（#1252）、`send-keys -H` の直接注入は内側の `stty raw -echo` より先に
+  cooked の tty へ届いて **tty の echo（ECHOCTL の `^[`）と内側アプリの echo で 2 回見える**
+  （#2196。CI の macOS で上方向の SGR が 3 → 6 個）。待つのは `#{mouse_sgr_flag}`
+  （`wait_pane_mouse_ready` / `scroll_mirror::history_state`）。届いた列は**個数まで**比べる
+  （`contains` は 2 回届いても通る）。番犬 `mouse_report_wait_watchdog` が両方の現場を名指しで落とす
+
 - **「窓が尽きた」は症状で、原因ではない**（#1265）。固定窓のテストが落ちたとき、
   出力から読めるのは「時間内に来なかった」だけで、**窓が短いのか / 相手が動いて
   いないのか**は区別できない。ここを取り違えると窓を伸ばす直しに走って再発する。
