@@ -1,7 +1,7 @@
-//! visual-test `drag-autoscroll`（Issue #2025 / #310）: ドラッグ選択のオートスクロールが、
-//! 送れる履歴が無いときに選択の端を (0, 0) へ寄せないか。実 OS マウスと同じ `PlatformInput`
-//! 経路（GPUI のヒットテストとリスナー配線まで通る = #738）で押してドラッグし、ペイン上端の
-//! 余白（`DRAG_SCROLL_MARGIN` = 40px）の中でマウスを止めてティックを回す。
+//! visual-test `drag-autoscroll`（Issue #2025 / #2153 / #310）: ドラッグ選択のオートスクロールが、
+//! 送れる履歴が無いときに選択の端を (0, 0) へ寄せないか・最下部で行末へ寄せないか。実 OS マウスと
+//! 同じ `PlatformInput` 経路（GPUI のヒットテストとリスナー配線まで通る = #738）で押してドラッグし、
+//! ペイン上下端の余白（`DRAG_SCROLL_MARGIN` = 40px）の中でマウスを止めてティックを回す。
 //!
 //! 場面ごとに新しいペインを立てて閉じる（行を刷る小さなアプリ。マウスは要求しない = tako の選択）:
 //! ① 履歴が無い → 選択はドラッグした範囲のまま（修正前は (0, 0) へ縮む）
@@ -9,11 +9,14 @@
 //!    b. 最上端に着いた後にマウスを動かす → その位置のまま（修正前は (0, 0) へ戻される）
 //! ③ 履歴が 1 画面以上 → 送りながら選択が履歴へ伸びる（#310 のまま）
 //! ④ alt screen（全画面 TUI）→ オートスクロールは立たず、選択はドラッグした範囲のまま
-//! ⑤ 下端（#2025 の対象外）→ 判定せず、最下部で選択が行末へ寄るかを観察して出すだけ
+//! ⑤ 最下部（履歴あり）で最下行の 5 桁目に止める → 選択はその位置のまま（#2153。修正前は行末へ寄る）
+//! ⑥ 履歴の途中（3 行上）→ a. 最下部まで送って選択が最下行の行末まで伸びる（#310）
+//!    b. 最下部に着いた後にマウスを動かす → その位置のまま（#2153。修正前は行末へ戻される）
 //!
-//! 器のペイン（`TAKO_PERSIST=1`）では ①④ だけを判定し、②③ は観察を出す（器の外側の端末は
-//! 履歴を持たないので #310 の送りがそもそも働かない = この Issue の前からの形）。
-//! 判定は最後にまとめて落とす（`TAKO_2025_LEGACY=1` は ① と ②b で落ちる = 同一バイナリの A/B）。
+//! 器のペイン（`TAKO_PERSIST=1`）では ①④⑤ だけを判定し、②③ は観察を出し、⑥ は飛ばす（器の外側の
+//! 端末は履歴を持たないので #310 の送りがそもそも働かない = この Issue の前からの形）。
+//! 判定は最後にまとめて落とす（同一バイナリの A/B: `TAKO_2025_LEGACY=1` は ①・②b・⑤・⑥b、
+//! `TAKO_2153_LEGACY=1` は ⑤・⑥b だけで落ちる）。
 //! **離すは「窓の外で離した」形で終える**（素の離すは copy-on-select で本物のクリップボードへ書く）
 
 use super::*;
@@ -303,6 +306,12 @@ fn starts_at_col8(text: &str, head: &str) -> bool {
     text.starts_with(&TAIL[4..]) && !text.contains(&format!("{head}-abcd"))
 }
 
+/// 選択の尻が `BOT-` 行の途中（マウスを置いた 5 桁目の手前）で止まっているか = 行末へ寄っていない
+fn ends_short_on_bot(text: &str) -> bool {
+    let last = text.lines().last().unwrap_or("");
+    last.starts_with("BOT-") && last.len() < format!("BOT-{TAIL}").len()
+}
+
 fn short(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let first = lines.first().copied().unwrap_or("");
@@ -317,6 +326,7 @@ pub(super) async fn drag_autoscroll_visual(
 ) {
     let root = ensure_fresh_scene(window, cx, SECTION).await;
     let legacy = legacy_2025();
+    let legacy_bottom = legacy_2153();
     let mut failed: Vec<String> = Vec::new();
     let mut judge = |step: &str, ok: bool, detail: String| {
         println!("TAKO_VISUAL_2025: step={step} ok={ok} {detail}");
@@ -331,7 +341,9 @@ pub(super) async fn drag_autoscroll_visual(
         .update(cx, |app, _, _| app.mirror_scroll_pane(pane))
         .unwrap_or(false);
     let mode = if tmux { "tmux" } else { "direct" };
-    println!("TAKO_VISUAL_2025: mode={mode} legacy={legacy} rows={rows}");
+    println!(
+        "TAKO_VISUAL_2025: mode={mode} legacy={legacy} legacy_2153={legacy_bottom} rows={rows}"
+    );
     command(any, window, cx, pane, "lines 4", "DONE-4").await;
     let before = probe(window, cx, pane);
     check(
@@ -508,33 +520,123 @@ pub(super) async fn drag_autoscroll_visual(
     );
     close(window, cx, pane);
 
-    // ⑤ 下端（#2025 の対象外 = 観察だけ）: 最下行を埋め、最下行の 5 桁目で止める
+    // ⑤ 最下部（#2153）: 履歴を作って最下行を埋め（TOP + N 行 + BOT = 行数 + 5 行 → 履歴 5 行）、
+    // 最下行の 5 桁目で止める
     let (pane, rows) = open_printer(any, window, cx, root).await;
     command(
         any,
         window,
         cx,
         pane,
-        &format!("bot {}", rows - 2),
+        &format!("bot {}", rows + 3),
         &format!("BOT-{TAIL}"),
     )
     .await;
     let before = probe(window, cx, pane);
+    if !tmux {
+        check(
+            before.history > 0 && before.offset == 0,
+            &format!("visual-test {SECTION} ⑤: 前提 = 履歴があって最下部にいる（{before:?}）"),
+        );
+    }
     let from = cell_at(window, cx, pane, 2.2, 1);
     let to = cell_at(window, cx, pane, 5.2, rows - 1);
     drag_and_hold(any, cx, from, to, 400).await;
     let p = probe(window, cx, pane);
     dump(any, cx, &format!("{mode}-5-bottom.png"));
     release_lost(any, cx, to);
-    println!(
-        "TAKO_VISUAL_2025: step=⑤（下端・観察） 履歴 {}・表示位置 {}・速度係数 {:?}・行末へ寄った {}・選択 {}",
-        before.history,
-        p.offset,
-        p.speed,
-        p.text.ends_with(&format!("BOT-{TAIL}")),
-        short(&p.text)
+    // 直接ペインはオートスクロールが立つ（立たないと何も確かめていない）。器のペインは ① と同じく
+    // 外側の端末が alt screen（履歴 0）で立たない = 立ったかどうかは観察として出す
+    judge(
+        "⑤",
+        ends_short_on_bot(&p.text) && p.offset == 0 && (tmux || p.speed.is_some()),
+        format!(
+            "最下部（履歴 {}）: 速度係数 {:?}・表示位置 {}・選択 {}",
+            before.history,
+            p.speed,
+            p.offset,
+            short(&p.text)
+        ),
     );
     close(window, cx, pane);
+
+    // ⑥ 履歴の途中（#310 の下へ送る側 + #2153）: 3 行上から下端で止める
+    if tmux {
+        println!(
+            "TAKO_VISUAL_2025: step=⑥（器・飛ばす） 外側の端末に履歴が無く、履歴の途中から送れない"
+        );
+    } else {
+        let (pane, rows) = open_printer(any, window, cx, root).await;
+        let n = rows * 3;
+        command(
+            any,
+            window,
+            cx,
+            pane,
+            &format!("bot {n}"),
+            &format!("BOT-{TAIL}"),
+        )
+        .await;
+        let back = 3usize;
+        let _ = window.update(cx, |app, _, cx| {
+            if let Some(s) = app.terminals.get(&pane) {
+                s.scroll_display(back as i32);
+            }
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        let before = probe(window, cx, pane);
+        check(
+            before.offset == back && before.history >= rows,
+            &format!(
+                "visual-test {SECTION} ⑥: 前提 = 履歴の途中（{back} 行上）にいる（{before:?}）"
+            ),
+        );
+        let from = cell_at(window, cx, pane, 2.2, 1);
+        let to = cell_at(window, cx, pane, 5.2, rows - 1);
+        drag_and_hold(any, cx, from, to, 50).await;
+        // 最下部まで送り切るのを待つ（1 ティック 1 行以上 = 3 行なら数ティック）
+        let started = std::time::Instant::now();
+        let mut p = probe(window, cx, pane);
+        while p.offset > 0 && started.elapsed() < Duration::from_secs(3) {
+            sleep(cx, 30).await;
+            p = probe(window, cx, pane);
+        }
+        sleep(cx, 200).await;
+        let p = probe(window, cx, pane);
+        dump(any, cx, &format!("{mode}-6a-mid-history-scrolled.png"));
+        // 送った行のぶん選択が伸び（押した 1 行目〜最下行 = 行数 - 1 行 + 送った 3 行）、
+        // 尻は最下行の行末（#310 のまま）
+        judge(
+            "⑥a",
+            p.offset == 0
+                && p.text.ends_with(&format!("BOT-{TAIL}"))
+                && p.text.lines().count() >= rows - 1 + back,
+            format!(
+                "履歴の途中 {back} 行上: 表示位置 {}・選択 {}",
+                p.offset,
+                short(&p.text)
+            ),
+        );
+        // b. 最下部に着いた後にマウスを動かす → その位置で伸ばした端のまま
+        let to2 = point(to.x, to.y - px(1.0));
+        mouse_move(any, cx, to2, true);
+        sleep(cx, 400).await;
+        let p = probe(window, cx, pane);
+        dump(any, cx, &format!("{mode}-6b-at-bottom.png"));
+        release_lost(any, cx, to2);
+        judge(
+            "⑥b",
+            ends_short_on_bot(&p.text) && p.offset == 0 && p.speed.is_some(),
+            format!(
+                "最下部: 表示位置 {}・速度係数 {:?}・選択 {}",
+                p.offset,
+                p.speed,
+                short(&p.text)
+            ),
+        );
+        close(window, cx, pane);
+    }
 
     check(
         failed.is_empty(),
