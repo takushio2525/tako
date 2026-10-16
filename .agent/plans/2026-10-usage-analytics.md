@@ -83,7 +83,7 @@
 |---|---|---|---|
 | `<data_dir>/sessions.yaml`（セッションカタログ #112） | session_id → `kind`（master / worker / solo）・`project`・`profile`・`label`・`issues`・`cwd`・`started_at` | **500 件**（`sessions.rs` の `MAX_ENTRIES`）。この機で約 22 日分 | session_id = transcript のファイル名 |
 | `<data_dir>/workers.yaml`（worker レジストリ #390） | session_id・`ledger_id`・`label`・`project` | **200 件**（`registry.rs` の `MAX_WORKERS`）。約 16 日分 | session_id |
-| `<data_dir>/orchestrator/ledger.yaml`（委任台帳 #292） | `task_type`（統制語彙 7 種）・`issue`（ラベルとプロンプトの最初の `#N`）・`project`・`model` | 上限なし（7 月から 1,493 件） | **session_id を持たない**。`ledger_id` 経由でしか結べない |
+| `<data_dir>/orchestrator/ledger.yaml`（委任台帳 #292） | `task_type`（統制語彙 7 種）・`issue`（ラベルとプロンプトに出た**最小の** `#N`。下の不具合）・`project`・`model` | 上限なし（7 月から 1,493 件） | **session_id を持たない**。`ledger_id` 経由でしか結べない |
 | `<data_dir>/orchestrator/projects.yaml` | プロジェクトキー → `cwd` | 80 件 | cwd の最長前方一致 |
 
 使用量（API 換算の重み）に対して鍵がどこまで付くか:
@@ -125,12 +125,14 @@
 
 | 方式 | 中身 | 出典 |
 |---|---|---|
-| ccusage | transcript の assistant 行を `message.id` + `requestId` で重複除去し、トークン（キャッシュ込みの総量）と LiteLLM 等の単価による費用を日・週・月・セッション・5 時間ブロックで集計。ブロックは「最初の発言から 5 時間」。上限は `--token-limit max`（過去の最大ブロック）で推定 | `docs/guide/blocks-reports.md` / `docs/guide/cost-modes.md` |
-| Claude-Code-Usage-Monitor | プランごとの固定のトークン上限（Pro 19k / Max5 88k / Max20 220k）か、過去ブロックの **P90** で上限を推定し、burn rate で予測 | README の「Token Limits by Plan」 |
+| ccusage | transcript の assistant 行を `message.id` + `requestId` で重複除去し、トークン（キャッシュ込みの総量）と LiteLLM 等の単価による費用を日・週・月・セッション・5 時間ブロックで集計。ブロックは「最初の発言を時刻の頭へ切り捨てて 5 時間」。上限は `--token-limit max`（過去の最大ブロック）で推定。used_percent は見ない | `docs/guide/blocks-reports.md` / `docs/guide/cost-modes.md` / `rust/crates/ccusage/src/blocks.rs` |
+| Claude-Code-Usage-Monitor（v4） | statusLine のフックで Claude Code の**公式の `rate_limits` を取り込み、新しいうちはそれを正**にする。古い・切れたら、プランの固定上限（Pro 19k / Max5 88k / Max20 220k トークン）か過去ブロックの **P90** による推定へ落とし、数値に出どころの印（`official` / `local_estimate` / `experimental` / `unknown`）を付ける。7d の % は公式値だけで出す。履歴は任意の warehouse に source / account / project / model / day で残し、30 日の削除を越えて保持（既定 365 日） | README の「Key Features」「Persistent Usage Warehouse」「Token Limits by Plan」 |
 | Anthropic | Pro / Max の Claude と Claude Code は 1 つの使用枠を共有する。重いモデルほど速く減る。**2026-03-26 以降、平日の混雑時間帯（太平洋時間 5〜11 時）は 5h 枠が速く減る**（週の枠は変わらない） | support.anthropic.com の Max プランの記事 / 2026-03 の報道（TechRadar・PCWorld） |
 
-- どちらの既存ツールも **used_percent そのものを見ていない**（Claude Code が % を出す前の設計）。tako は mod・statusLine と
-  同じ値を観測できるので、「上限を推定して割る」必要が無い。これが §2 で区間按分を採る土台
+- ccusage は上限を推定して割る方式、Claude-Code-Usage-Monitor は**公式の % を正にして推定には印を付ける**方式。tako は
+  tako mod の報告で同じ公式の値をペインごとに既に受けているので、Monitor と同じく公式値を正にできる。Monitor の README には
+  **観測した % をプロジェクト・Issue へ配る（按分する）仕組みは書かれていない**ので、そこが tako の足す部分になる（§2）。
+  「推定」の印（§2.4）と 30 日を越える保持（§5.2）は Monitor の作りに揃える
 - 混雑時間帯の告知どおりなら、5h の「1% あたりの量」は時間帯で変わり、**固定の換算係数で 5h の % を予測する方式は
   原理的にずれる**（ただし §2.1 の実測では、12:00Z の前後で差は見えなかった）
 
@@ -204,7 +206,7 @@
 | 方式 | 中身 | トレードオフ |
 |---|---|---|
 | **A. 区間按分（推奨）** | ログインと枠（5h / 7d）ごとの観測の列で、隣り合う観測の間の Δ% を、その区間に同じログインで使われたローカルの使用量の比でキーへ配る | 合計が観測と必ず一致し、混雑時間帯・プロモーション・プランの変更・重みの不確かさに引きずられない。観測が無い期間は出せない（→ B で補う） |
-| B. 換算係数で割る | 「1% あたりの量」を推定し（ccusage の `-t max`、Usage-Monitor の P90 と同系）、使用量 ÷ 係数で % にする | 観測が無くても出せるが、§2.1 で係数が区間ごとに 0.44〜2.04 倍動いた。**観測の無い期間の推定にだけ使い、「推定」と明示する**（係数は直近 7 日の区間の中央値） |
+| B. 換算係数で割る | 「1% あたりの量」を推定し（ccusage の `-t max`、Usage-Monitor の P90 と同系）、使用量 ÷ 係数で % にする | 観測が無くても出せるが、§2.1 で係数が区間ごとに 0.44〜2.04 倍動いた。**観測の無い期間の推定にだけ使い、「推定」と明示する**（係数は直近 7 日の区間の中央値。Monitor v4 も公式値が古いときだけ推定へ落ち、印を付ける） |
 | C. % を出さない | トークンと API 換算だけを見せる（ccusage の daily / session と同じ） | 依頼の「利用制限をどのくらい持っていかれたか」に答えられない。量の表示としては A と並べて出す |
 | D. 公式の集計 API | サブスクリプションのログインの 5h / 7d の % を返す公開の API は見当たらない（Admin API の Usage and Cost は API 組織の従量課金の集計。出口は Claude Code の `/usage` の画面と mod / statusLine の `rate_limits` だけ） | 使えない |
 
@@ -235,8 +237,8 @@
 | claude-haiku-5-5 | 0.10 | 0.50 | 0.125 | 0.2 | 0.01（×0.1） |
 | claude-haiku-4-5 | 1 | 5 | 1.25 | 2 | 0.1（×0.1） |
 
-- 表は `tako-core` に 1 か所で持つ。**索引に現れたモデルで表に無いものは API 換算を「単価不明」として 0 にせず別に数え**、
-  `tako usage` の注記と番犬（表に無いモデルが出たら落ちるテスト用の固定データ）で気づけるようにする
+- 表は `tako-core` に 1 か所で持つ。**索引に現れたモデルで表に無いものは API 換算を 0 にせず「単価不明」として別に数え**、
+  `tako usage` の注記で気づけるようにする（S2 の受け入れ条件 5）。按分ではその区間の生トークン総量の比で代わりに配る
 - 表示では API 換算に必ず「API 換算」と添える（サブスクリプションの請求額ではない）
 
 ### 2.4 区間按分の手順
@@ -315,7 +317,7 @@
 | 案 | トレードオフ |
 |---|---|
 | **A. 実窓（5h / 7d = 観測した解除時刻 − 長さ）+ 暦（日・週・月。ローカル時刻）（推奨）** | 「今の窓で何 % を持っていかれたか」に正確に答えられ、暦で振り返れる。実窓は観測が要る（無い窓は B の推定） |
-| B. ccusage 式の推定ブロック（最初の発言から 5 時間） | 観測が無くても切れるが、実際の解除時刻は 20 分刻み（§1.2）で最大 40 分ずれる。7d には使えない |
+| B. ccusage 式の推定ブロック（最初の発言を時刻の頭へ切り捨てて 5 時間） | 観測が無くても切れるが、実際の解除時刻は 20 分刻み（§1.2）で最大 40 分ずれる（§2.1 の B の 5h では 20 分ずれた）。7d には使えない |
 | C. 暦だけ | 単純だが、利用制限の窓と合わない |
 
 **決定: A**。既定の期間は「今の 7d の窓」（週の枠が一番効くため。#2192 の依頼の「どのくらい持ってかれてるか」）。
@@ -395,7 +397,7 @@ usage            [今の 7d ▾] [プロジェクト ▾]
 - 同じ id の行は連続するので（§1.1）、増分の読み手は「そのファイルの最後の id と数えた値」だけ覚えればよい。続きの行で
   output が増えていたら差分だけを足す
 - ファイルが縮んだ・`ino` が変わったら最初から読み直す（その transcript の分は `message.id` で数え直し済みを除く）
-- transcript が消えても集約は残す。**保持は 400 日**、35 日より古い刻みは月替わりに日単位へまとめる（S2 の判断点）
+- transcript が消えても集約は残す。**保持は 365 日**（Claude-Code-Usage-Monitor の warehouse の既定と同じ）、35 日より古い刻みは月替わりに日単位へまとめる（S2 の判断点）
 - 書き込みは追記（`buckets` / `limits`）と config_io の排他 + アトミック書き換え（`cursor` / `sessions`）
 - 新しい永続ファイルなので、`migration_registry` の指紋に登録し、置き場は設定共有のカタログ（#513 の許可リスト）に
   `Class::Local` で載せる（載せないと `catalog_coverage` が落ちる = 共有されない側に倒れる）
@@ -445,12 +447,12 @@ usage            [今の 7d ▾] [プロジェクト ▾]
 | 画面 | 右パネルの `usage` + ステータスバーから | 既存のビューと同じ置き場・1 クリックで辿れる | 設定画面: 不自然 / PWA: 権限の整理が先 / ポップオーバー: 狭い |
 | MCP | `tako_sessions` の action | +506 バイトで済み、既存の引数を使い回せる | 新ツール: +1,021 バイト / accounts: 意味が混ざる |
 | 持ち方 | 増分の索引 | 平常時は追記分だけ・起動時は 0 | 全走査: 1 分超 / push: 過去と tako の外を拾えない / DB: 新しい依存 |
-| 保持 | 集約は 400 日（35 日より古いものは日単位へ） | transcript の 30 日より長く振り返れ、大きさは数十 MB に収まる | 30 日: transcript と同じで振り返れない / 無期限: 際限が無い |
+| 保持 | 集約は 365 日（35 日より古いものは日単位へ） | transcript の 30 日より長く振り返れ、大きさは数十 MB に収まる。Monitor の既定と同じ | 30 日: transcript と同じで振り返れない / 無期限: 際限が無い |
 
 利用者に確認したい点（S2 の前に master が判断する）:
 
 1. API 換算の金額を画面に出すか（推奨: 「API 換算」と添えて出す。サブスクリプションの請求額と誤解される恐れはある）
-2. 保持期間 400 日でよいか
+2. 保持期間 365 日でよいか
 3. スマホ（PWA）にも出すか（出すならどの権限から見せるか）
 
 ## 9. スライス
@@ -550,5 +552,5 @@ S7 スマホ（PWA の #/usage）                   （S4 の後。[提案]）
 - Claude Code の版で transcript の行の種類が増えている（`api-request` 系は今回の版で確認）。読み手はキー名で拾い、知らない
   キーは無視する。usage の形が変わったら S2 の参照集計との一致で気づける
 - Windows の transcript の置き場（`%USERPROFILE%\.claude\projects`）と `.claude.json` は同じ形の見込みで、実機では未実測
-- `cleanupPeriodDays` を短くしている利用者は、初回の取り込みで遡れる期間が短くなる（索引に入った後は 400 日残る）
+- `cleanupPeriodDays` を短くしている利用者は、初回の取り込みで遡れる期間が短くなる（索引に入った後は 365 日残る）
 - 単価はモデルの追加で古くなる（§2.3 の「単価不明」の扱い）
