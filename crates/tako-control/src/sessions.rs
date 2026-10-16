@@ -885,15 +885,13 @@ fn extract_issues_with(text: &str, legacy: bool) -> Vec<u32> {
     out
 }
 
-/// プロンプト冒頭の抜粋（1 行に正規化して最大 `max` 文字）
+/// プロンプト冒頭の抜粋（1 行に正規化して最大 `max` 文字 + `…`）。
+///
+/// 切るのは `tako_core::text::truncate_chars` の 1 実装（#1790）。`…` を上限の外に付ける
+/// 契約なので上限を `max + 1` で渡す = `…` 込みで最大 `max + 1` 文字
 pub fn prompt_head(prompt: &str, max: usize) -> String {
     let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        let head: String = flat.chars().take(max).collect();
-        format!("{head}…")
-    }
+    tako_core::text::truncate_chars(&flat, max.saturating_add(1))
 }
 
 /// 表示用の短縮 ID（先頭 8 文字）
@@ -1579,6 +1577,45 @@ mod tests {
         let head = prompt_head(&long, 10);
         assert_eq!(head.chars().count(), 11);
         assert!(head.ends_with('…'));
+    }
+
+    /// プロンプト冒頭の抜粋の固定値（#1790）。内容は最大 `max` 文字で `…` は上限の外・
+    /// 空白は畳んでから数える。本番の呼び手は spawn の記録（`max` = 200）
+    #[test]
+    fn prompt_headの切り詰めの固定値() {
+        // ちょうど max 文字は切らない
+        assert_eq!(prompt_head(&"あ".repeat(10), 10), "あ".repeat(10));
+        // max + 1 文字ちょうどは原文のまま（寄せる前は「max 文字 + `…`」= 同じ幅で
+        // 末尾 1 文字を `…` に置き換えていた。#1790 で寄せた後の唯一の差）
+        assert_eq!(prompt_head(&"あ".repeat(11), 10), "あ".repeat(11));
+        // max + 2 文字以上は内容 max 文字 + `…`
+        assert_eq!(
+            prompt_head(&"あ".repeat(12), 10),
+            format!("{}…", "あ".repeat(10))
+        );
+        // 4 バイト文字も 1 文字・結合文字（NFD の「が」）は濁点を別の 1 文字に数える
+        assert_eq!(
+            prompt_head(&"🎉".repeat(300), 200),
+            format!("{}…", "🎉".repeat(200))
+        );
+        assert_eq!(
+            prompt_head(&"か\u{3099}".repeat(10), 5),
+            "か\u{3099}か\u{3099}か…"
+        );
+        // 改行・タブ・全角空白は半角空白 1 個へ畳み、前後は落としてから数える
+        assert_eq!(
+            prompt_head("\n  Issue #12\tを\u{3000}直す  \n", 200),
+            "Issue #12 を 直す"
+        );
+        assert_eq!(prompt_head("a\n\nb c d", 3), "a b…");
+        // max = 0 は `…` だけ（1 文字ちょうどは上の差と同じで原文）・max が最大でもあふれない
+        assert_eq!(prompt_head("abc", 0), "…");
+        assert_eq!(prompt_head("a", 0), "a");
+        assert_eq!(prompt_head("abc", usize::MAX), "abc");
+        // 空・空白だけは空
+        assert_eq!(prompt_head("", 10), "");
+        assert_eq!(prompt_head("", 0), "");
+        assert_eq!(prompt_head(" \n\t", 10), "");
     }
 
     #[test]

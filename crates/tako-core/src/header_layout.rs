@@ -113,9 +113,8 @@ pub fn truncate_path_middle(path: &str, max_chars: usize) -> String {
     // ファイル名（末尾コンポーネント）は必ず残す
     let parts: Vec<&str> = display.split('/').collect();
     if parts.len() <= 2 {
-        // 1-2 コンポーネントなら末尾省略で十分
-        let cut: String = display.chars().take(max_chars.saturating_sub(1)).collect();
-        return format!("{cut}\u{2026}");
+        // 1-2 コンポーネントなら末尾省略で十分（`…` 込みで max_chars 文字。#1790）
+        return crate::text::truncate_chars(&display, max_chars);
     }
 
     let file_name = parts.last().unwrap_or(&"");
@@ -306,6 +305,42 @@ mod tests {
     fn truncate_path_middle_two_components() {
         let path = "/file.txt";
         assert_eq!(truncate_path_middle(path, 20), path);
+    }
+
+    /// 1〜2 コンポーネントのパスの末尾省略の固定値（#1790）。`…` は上限の内側
+    /// （`…` 込みで `max_chars` 文字）・数えるのは `char`
+    #[test]
+    fn truncate_path_middle_末尾省略の固定値() {
+        // ルート直下の長いファイル名（`""` と名前の 2 コンポーネント）
+        let root_file = format!("/{}.txt", "あ".repeat(30));
+        assert_eq!(
+            truncate_path_middle(&root_file, 20),
+            format!("/{}…", "あ".repeat(18))
+        );
+        // ちょうど上限は切らず、1 文字あふれたら `…` 込みで上限へ収める
+        let exact = format!("/{}", "あ".repeat(19));
+        assert_eq!(truncate_path_middle(&exact, 20), exact);
+        let over = format!("/{}", "あ".repeat(20));
+        assert_eq!(
+            truncate_path_middle(&over, 20),
+            format!("/{}…", "あ".repeat(18))
+        );
+        // `/` の無い 1 コンポーネント（4 バイト文字・結合文字）
+        assert_eq!(
+            truncate_path_middle(&"🎉".repeat(12), 10),
+            format!("{}…", "🎉".repeat(9))
+        );
+        assert_eq!(
+            truncate_path_middle(&"か\u{3099}".repeat(6), 7),
+            "か\u{3099}か\u{3099}か\u{3099}…"
+        );
+        // `\` 区切りは割らないので Windows のパスはこの分岐に入る
+        assert_eq!(
+            truncate_path_middle("C:\\work\\プロジェクト\\src\\main.rs", 12),
+            "C:\\work\\プロジ…"
+        );
+        // 上限が 6 未満なら省略しない
+        assert_eq!(truncate_path_middle(&root_file, 5), root_file);
     }
 
     #[test]

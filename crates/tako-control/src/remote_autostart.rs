@@ -250,14 +250,13 @@ pub const REASON_SPAWN_FAILED: &str = "spawn-failed";
 pub const DETAIL_MAX_CHARS: usize = 300;
 
 /// 理由文を記録・診断へ載せる形へ整える（純関数）。
-/// 改行を 1 行へ畳み、長すぎるものは切る（`status` の JSON と persist.log の 1 行が壊れない）
+/// 改行を 1 行へ畳み、長すぎるものは切る（`status` の JSON と persist.log の 1 行が壊れない）。
+///
+/// 切るのは `tako_core::text::truncate_chars` の 1 実装（#1790）。`…` を上限の外に付ける
+/// 契約なので上限を `DETAIL_MAX_CHARS + 1` で渡す = `…` 込みで最大 `DETAIL_MAX_CHARS + 1` 文字
 pub fn trim_detail(detail: &str) -> String {
     let joined = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    if joined.chars().count() <= DETAIL_MAX_CHARS {
-        return joined;
-    }
-    let cut: String = joined.chars().take(DETAIL_MAX_CHARS).collect();
-    format!("{cut}…")
+    tako_core::text::truncate_chars(&joined, DETAIL_MAX_CHARS + 1)
 }
 
 impl LastAutostart {
@@ -528,6 +527,45 @@ mod tests {
         let cut = trim_detail(&long);
         assert_eq!(cut.chars().count(), DETAIL_MAX_CHARS + 1, "末尾の … を含む");
         assert!(cut.ends_with('…'));
+    }
+
+    /// 理由文の切り詰めの固定値（#1790）。内容は最大 `DETAIL_MAX_CHARS` 文字で `…` は
+    /// 上限の外（`…` 込みで最大 `DETAIL_MAX_CHARS + 1` 文字）・空白は畳んでから数える
+    #[test]
+    fn 理由文の切り詰めの固定値() {
+        let max = DETAIL_MAX_CHARS;
+        // ちょうど上限は切らない
+        assert_eq!(trim_detail(&"あ".repeat(max)), "あ".repeat(max));
+        // 上限 + 1 文字ちょうどは原文のまま（寄せる前は「max 文字 + `…`」= 同じ幅で
+        // 末尾 1 文字を `…` に置き換えていた。#1790 で寄せた後の唯一の差）
+        assert_eq!(trim_detail(&"あ".repeat(max + 1)), "あ".repeat(max + 1));
+        // 上限 + 2 文字以上は内容 max 文字 + `…`
+        assert_eq!(
+            trim_detail(&"あ".repeat(max + 2)),
+            format!("{}…", "あ".repeat(max))
+        );
+        // 4 バイト文字も 1 文字・結合文字（NFD の「が」）は濁点を別の 1 文字に数える
+        assert_eq!(
+            trim_detail(&"🎉".repeat(max + 50)),
+            format!("{}…", "🎉".repeat(max))
+        );
+        assert_eq!(
+            trim_detail(&"か\u{3099}".repeat(max)),
+            format!("{}…", "か\u{3099}".repeat(max / 2))
+        );
+        // 改行・タブ・全角空白は半角空白 1 個へ畳み、前後は落とす
+        assert_eq!(
+            trim_detail(" \tTailscale が\r\n\u{3000}見つかりません \n"),
+            "Tailscale が 見つかりません"
+        );
+        // 畳んだ後の文字数で切る（「あ あ … あ」= 2 * max - 1 文字）
+        assert_eq!(
+            trim_detail(&"あ\n".repeat(max)),
+            format!("{}…", "あ ".repeat(max / 2))
+        );
+        // 空・空白だけは空
+        assert_eq!(trim_detail(""), "");
+        assert_eq!(trim_detail(" \n\t"), "");
     }
 
     /// status は daemon が止まっていても意図を名乗る（黙らない）
