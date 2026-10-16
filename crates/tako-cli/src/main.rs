@@ -6690,6 +6690,131 @@ fn usage_range(window: &str, r: &Value, now: i64, utc_offset: i32) -> String {
     }
 }
 
+/// 利用制限の % の列に出す枠（主の枠 = `--window 5h` なら 5h、それ以外は 7d を左に）
+fn usage_share_kinds(share: &Value, window: &str) -> Vec<Value> {
+    let mut kinds = share.as_array().cloned().unwrap_or_default();
+    let main = if window == "5h" {
+        "five_hour"
+    } else {
+        "seven_day"
+    };
+    kinds.sort_by_key(|k| k["kind"].as_str() != Some(main));
+    kinds
+}
+
+fn usage_kind_label(k: &Value) -> &'static str {
+    match k["kind"].as_str() {
+        Some("five_hour") => "5h",
+        _ => "7d",
+    }
+}
+
+/// % の 1 マス（12 桁: `30.9%` を右寄せ 6 桁 + 推定 `+0.4` を 6 桁。観測の無い枠は `-`）
+fn usage_share_cell(available: bool, share: &Value) -> String {
+    if !available {
+        return format!("{:>6}{:6}", "-", "");
+    }
+    let percent = share["percent"].as_f64().unwrap_or(0.0);
+    let estimated = share["estimated"].as_f64().unwrap_or(0.0);
+    let est = if estimated >= 0.05 {
+        format!(" +{estimated:<4.1}")
+    } else {
+        String::new()
+    };
+    format!("{:>6}{est:6}", format!("{percent:.1}%"))
+}
+
+fn usage_share_cells(kinds: &[Value], share: &Value) -> String {
+    kinds
+        .iter()
+        .map(|k| {
+            let kind = k["kind"].as_str().unwrap_or("-");
+            usage_share_cell(k["available"] == Value::Bool(true), &share[kind])
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// 段の後ろの行: tako の外・推定の合計と、枠ごとの按分の要約（観測 = 段 + tako の外・係数とその幅）
+fn usage_share_footer(kinds: &[Value]) -> String {
+    let mut out = String::new();
+    let f = |k: &Value, key: &str| k[key].as_f64().unwrap_or(0.0);
+    let available = |k: &Value| k["available"] == Value::Bool(true);
+    let row = |label: &str, key: &str| {
+        let cells: Vec<String> = kinds
+            .iter()
+            .map(|k| usage_share_cell(available(k), &serde_json::json!({ "percent": f(k, key) })))
+            .collect();
+        format!("      {}  {label}\n", cells.join("  "))
+    };
+    out.push_str(&row(
+        "tako の外（区間にローカルの使用量が無いのに増えた分）",
+        "outside",
+    ));
+    if kinds.iter().any(|k| f(k, "estimated") >= 0.05) {
+        let cells: Vec<String> = kinds
+            .iter()
+            .map(|k| {
+                if available(k) {
+                    format!("{:>6}{:6}", format!("+{:.1}", f(k, "estimated")), "")
+                } else {
+                    format!("{:>6}{:6}", "-", "")
+                }
+            })
+            .collect();
+        out.push_str(&format!(
+            "      {}  推定の合計（観測の区間の外 = 最後の観測より後・観測の無い窓）\n",
+            cells.join("  ")
+        ));
+    }
+    for k in kinds {
+        let label = usage_kind_label(k);
+        if !available(k) {
+            out.push_str(&format!(
+                "    {label} の按分: このログインの観測が無いので % を出していない\n"
+            ));
+            continue;
+        }
+        let head = match (k["scope"].as_str(), k["latest_percent"].as_f64()) {
+            (Some("period"), _) => format!("期間の延べ {:.1}%", f(k, "observed")),
+            (_, Some(latest)) => format!("今の窓 {latest:.1}%"),
+            _ => "観測した今の窓が無い".to_string(),
+        };
+        let mut line = format!(
+            "    {label} の按分: {head} = 段 {:.1} + tako の外 {:.1}",
+            f(k, "allocated"),
+            f(k, "outside")
+        );
+        if f(k, "estimated") >= 0.05 {
+            line.push_str(&format!("・推定 +{:.1}", f(k, "estimated")));
+        }
+        if let Some(per) = k["coefficient"]["usd_per_percent"].as_f64() {
+            line.push_str(&format!(
+                "・1% あたり API 換算 ${per:.2}（区間 {} 本",
+                k["coefficient"]["intervals"].as_u64().unwrap_or(0)
+            ));
+            let fit = k["windows"]
+                .as_array()
+                .and_then(|w| w.last())
+                .map(|w| &w["usd_per_percent"]);
+            match fit.filter(|v| v.is_object()) {
+                Some(v) => line.push_str(&format!(
+                    "・直近の窓の四分位 ${:.2}〜${:.2}）",
+                    v["p25"].as_f64().unwrap_or(0.0),
+                    v["p75"].as_f64().unwrap_or(0.0)
+                )),
+                None => line.push('）'),
+            }
+        }
+        if let Some(usd) = k["unestimated_usd"].as_f64().filter(|v| *v > 0.0) {
+            line.push_str(&format!("・% へ直せない API 換算 ${usd:.2}"));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 /// `tako usage` の既定出力（機械検証できるよう印字と分けてある）。時刻の表記は
 /// `tako todo show` と同じ 1 実装（`user_task::response_stamp`）
 fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
@@ -6770,15 +6895,40 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
                 usage_range(window, &usage["range"], now, utc_offset),
                 usage_amount(&usage["total"])
             ));
-            for g in usage["groups"].as_array().cloned().unwrap_or_default() {
+            // #2202: 利用制限の % の列（観測のある枠だけ。主の枠を左に）
+            let kinds = usage_share_kinds(&usage["limit_share"], window);
+            let shares = kinds.iter().any(|k| k["available"] == Value::Bool(true));
+            if shares {
+                let scope = match kinds.iter().find_map(|k| k["scope"].as_str()) {
+                    Some("period") => "期間に重なる窓の延べ",
+                    _ => "今の窓のうち各段が使った分",
+                };
+                let heads: Vec<String> = kinds
+                    .iter()
+                    .map(|k| format!("{:>6}{:6}", usage_kind_label(k), ""))
+                    .collect();
                 out.push_str(&format!(
-                    "      {}  {}\n",
+                    "      {}（% は{scope}・+ は推定）\n",
+                    heads.join("  ")
+                ));
+            }
+            for g in usage["groups"].as_array().cloned().unwrap_or_default() {
+                let cells = if shares {
+                    format!("{}  ", usage_share_cells(&kinds, &g["limit_share"]))
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "      {cells}{}  {}\n",
                     g["name"].as_str().unwrap_or("-"),
                     usage_amount(&g)
                 ));
             }
             if let Some(n) = usage["more_groups"].as_u64() {
                 out.push_str(&format!("      ほか {n} 件（--limit で増やせる）\n"));
+            }
+            if shares {
+                out.push_str(&usage_share_footer(&kinds));
             }
         } else if p["index"]["enabled"] == Value::Bool(true) {
             out.push_str("    この期間の使用量は無い\n");

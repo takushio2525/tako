@@ -90,7 +90,7 @@ tako orchestrator spawn --help
 | [`mouse`](#tako-mouse) | マウスを使う TUI へのクリックの転送の確認・切替 |
 | [`paste-guard`](#tako-paste-guard) | 貼り付け・入力に API キー・パスワードらしきものがあれば送る前に確かめる機能の確認・切替・判定・許可リスト |
 | [`sessions`](#tako-logs--sessions) | 会話セッションの発見と復元 |
-| [`usage`](#tako-logs--sessions) | 利用制限（5h / 7d）の観測と、どのプロジェクト・Issue・会話がトークンをどれだけ使ったか |
+| [`usage`](#tako-logs--sessions) | 利用制限（5h / 7d）の観測と、どのプロジェクト・Issue・会話が利用制限の何 % とトークンをどれだけ使ったか |
 
 ### git
 
@@ -1168,7 +1168,7 @@ tako sessions list --role worker
 tako sessions show <session-id>         # メタ情報と会話冒頭
 tako sessions resume <session-id>       # 記録された cwd で復元（claude のみ）
 
-tako usage                              # ログインごとの 5h / 7d と、今の 7d の窓のプロジェクトの上位
+tako usage                              # ログインごとの 5h / 7d と、今の 7d の窓のプロジェクトの上位（7d / 5h の % つき）
 tako usage --by issue                   # Issue ごと（ほかに task-type / session / model / account / day / role）
 tako usage --window 5h                  # 期間（ほかに day / week / month / all）
 ```
@@ -1177,6 +1177,15 @@ tako usage --window 5h                  # 期間（ほかに day / week / month 
 トークン（入力・出力・キャッシュの作成と読み出し）・API 換算の金額・会話数を出します。API 換算はモデル別の単価で
 計算した目安で、サブスクリプションの請求額ではありません。会話の本文は読みません。初回は会話記録を全部読むので
 数十秒かかります（次からは増えた分だけ）。
+
+段の行の左の 2 列は、利用制限の % のうちその段が使った分です。tako mod が観測した 5h / 7d の % の増え方を、
+観測と観測の間にどの段がどれだけ使ったか（API 換算の比）で配るので、**段の合計 + 「tako の外」は観測した %
+と一致します**。既定（今の 7d の窓）と `--window 5h` では、それぞれの枠の今の窓の %、`day` / `week` / `month` /
+`all` では期間に重なる窓の延べ（窓をまたぐと 100% を超えることがあります）です。
+
+- **tako の外** — 観測の間にこの PC の会話記録の使用が無いのに % が増えた分（claude.ai・別の PC など）
+- **+ の付いた値（推定）** — 最後の観測より後や、観測の無い窓の使用量を、直近 7 日の「1% あたりの API 換算」で
+  割った目安です。観測が無いログイン（tako mod の報告が無い）は % を出しません
 
 ## 表示・設定のトグル
 

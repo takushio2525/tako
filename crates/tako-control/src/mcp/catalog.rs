@@ -3571,7 +3571,7 @@ pub fn tools() -> Vec<Value> {
                 remote_link.account_label はどの tako アカウント配下か（スマホが別アカウントだと一覧に出ない）。\
                 resume / link は claude のみ（codex / agy は list だけ）。\
                 usage: ログインごとの利用制限（5h / 7d）の最新の観測と、期間の中の使用量\
-                （トークン 5 成分・API 換算・会話数）を by の段で。",
+                （トークン 5 成分・API 換算・会話数）と % の按分（limit_share）を by の段で。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
