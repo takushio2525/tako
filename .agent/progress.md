@@ -20,21 +20,6 @@
 
 ---
 
-## 2026-10-16（#2180: bin_resolve の「戻らないログインシェル」テストの間欠 = 真因は macOS の新しい実行ファイルの初回 exec の検査（約 0.3 秒・システム全体で直列））
-- pid の確認を締め切りの判定から分け、偽の実行ファイルを空打ち・注入 `TAKO_2180_INJECT_SHELL_DELAY_MS`・修正後 25/25 緑。同型の結合テストは #2185。PR #2183
-
-## 2026-10-16（#2036: `tako panel --help` の `--view` の説明を `PanelViewWire::summary` から生成し、md の候補を 7 値へ揃えて番犬 `issue2036_panel_view_docs_watchdog` で縛る）
-- FR 番号の重複は前方一致による誤検出だった・カタログ増 0 B。PR #2184
-
-## 2026-10-16（#2043: 番犬の固定バイト幅の切り出し 12 か所を `tests/common/byte_window.rs` へ寄せ、`issue2043_byte_window_watchdog` で直書きを縛る）
-- 修正前 panic / 修正後 緑の A/B 3 本・製品ファイルの `#[cfg(test)]` に残る同型は #1790 へ。PR #2186
-
-## 2026-10-16（#2181: ネット復帰の自動再開が、低いペインで締めの行より上へ押し出された接続エラーの停止を拾う）
-- 見えている形が「締めの行 + 通知だけ」のときだけ画面の外の直近 200 行を足して同じ判定を通す。A/B `TAKO_2181_LEGACY=1`・`scripts/test-net-resume-2181.sh` 54 PASS。PR #2187
-
-## 2026-10-16（#2003: concept.md の Non-goals から LSP 統合を外し、「コードエディタの位置づけ」節に 9/24 の方針変更・やり方・未着手を書いた）
-- README / docs に同じ主張は無し。PR #2189
-
 ## 2026-10-16（#2182: 返答の配送で起票 master を起こす組み立て（ログインシェルの所在確認）を `OffloadJob::UserTaskLaunch` で UI の外へ・右パネルも同じ）
 - 戻らないログインシェルで最中の IPC 新 45 ms / 旧 14,957 ms・`scripts/test-respond-master-launch-2182.sh` 13 PASS・A/B `TAKO_2182_LEGACY=1`。PR #2190
 
@@ -79,3 +64,18 @@
 
 ## 2026-10-17（#2217: 右パネルの `git_feedback_text` の文字数の切り詰めを固定値テストで固定してから `truncate_chars(…, max + 1)` へ寄せる）
 - 総当たり A/B 33,230 件の差は「行を落とさず 601 文字ちょうど」の 324 件だけ・行数の切り詰めは不変。PR #2219
+
+## 2026-10-17（#2202: usage 分析 S3 = 観測した利用制限の % の増分を区間の使用量の比で段へ配る `tako_core::usage::share`・5h / 7d の % 列・tako の外・推定）
+- 合成データでキーの誤差 1 pt 以内・実データで 7d の合計 = 観測・実経路 26 PASS・mod の無いログインは `available: false`・カタログ +32 B。PR #2221
+
+## 2026-10-17（#1829: serde_json の `preserve_order` をワークスペースの依存で全メンバーへ有効にし、CLI の JSON の並びを単独ビルドと配布形で揃えた）
+- tako-core の lib.rs 末尾にコンパイル時の番犬（`Map::shift_insert`）・`scripts/test-cli-json-key-order-1829.sh` 修正前 27/8 → 後 35/0・配布物の出力は不変。PR #2220
+
+## 2026-10-17（#1825: 壊れた default.yaml では専用プロファイルを作らず、`projects add` は登録だけ成功させて warnings / persist.log に理由・中身は `.unreadable.bak` へ）
+- 直したら `tako migrate run` で継承して作る。A/B `TAKO_1825_LEGACY=1`・結合テスト 5 本 + 番犬。`tako master` 側の残りは #2227。PR #2224
+
+## 2026-10-17（#2222: 作りたての偽の実行ファイルを短い上限で待つテストを洗い出し、空打ちの共通の補助 `tako_core::fake_exec` / `scripts/lib/fake-exec.sh` へ通した）
+- Rust 11 ファイル・CI のシェル 2 本・A/B `TAKO_2222_LEGACY=1`（#2218 の `TAKO_1838_LEGACY` を統合）・20 回 240/240 緑。残りは #2228。PR #2225
+
+## 2026-10-17（#1824: recent / shortcuts の破損を `data_files` 経由で persist.log へ・layout の `.corrupt` rename を番号付きの退避 `stash_unrestorable` へ）
+- A/B `TAKO_1824_LEGACY=1`・`scripts/test-corrupt-quarantine-1824.sh` 16 PASS・理由は `json_reason`（値を載せない）。残りは #2230 / #2231。PR #2226

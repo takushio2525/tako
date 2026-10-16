@@ -602,3 +602,8 @@
 - 2026-10-16 #1858: recover --apply がバックアップ後のタブを合流・復元時に器の無い master / worker のペインだけを刈り込む
 - 2026-10-16 #2042: 番犬 issue1984 の 15 節 = UI スレッドの入口から呼び出しを辿り、別名の関数で包んだ子プロセスの口も名指し
 - 2026-10-16 #2035: rust-analyzer へ `cargo.targetDir = true` を既定で渡し、利用者の cargo build が target のロック待ちにならない
+- 2026-10-16 #2180: bin_resolve の「戻らないログインシェル」テストの間欠 = 真因は macOS の新しい実行ファイルの初回 exec の検査（約 0.3 秒・システム全体で直列）
+- 2026-10-16 #2036: `tako panel --help` の `--view` の説明を `PanelViewWire::summary` から生成し、md の候補を 7 値へ揃えて番犬 `issue2036_panel_view_docs_watchdog` で縛る
+- 2026-10-16 #2043: 番犬の固定バイト幅の切り出し 12 か所を `tests/common/byte_window.rs` へ寄せ、`issue2043_byte_window_watchdog` で直書きを縛る
+- 2026-10-16 #2181: ネット復帰の自動再開が、低いペインで締めの行より上へ押し出された接続エラーの停止を拾う
+- 2026-10-16 #2003: concept.md の Non-goals から LSP 統合を外し、「コードエディタの位置づけ」節に 9/24 の方針変更・やり方・未着手を書いた
