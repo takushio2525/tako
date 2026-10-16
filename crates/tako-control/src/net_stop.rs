@@ -32,6 +32,24 @@
 //! 人の発言（`❯`）・ツールの結果（`⎿`）が混ざれば会話が進んでいるので読み飛ばさない。
 //! 新しいターンは必ず締めの行で終わるか、生成中（中断の案内）なので、締めの行の無いまま
 //! assistant の発言が残ることはない
+//!
+//! # 締めの行より上が画面の外（#2181）
+//!
+//! 低いペイン（worker を並べると 20 行前後）では、締めの行と通知行（6 行）と入力欄だけで画面が
+//! 埋まり、締めの行の上の項目（エラーそのもの）が画面の外へ押し出される。見えている行だけでは
+//! 判定に掛からない（2026-10-16 の DNS 断で pane 2716 を取りこぼした）。
+//!
+//! 材料は**画面の外の直近の行**（器の履歴 / 外側の端末の履歴）にした。判定は上の 1 実装
+//! （[`detect`]）のまま、読む行を上へ足すだけ。tako mod の報告（ターンの終わりの理由）は
+//! エラーの種類（接続系か 5xx か）を運ばず、会話記録は claude だけの第 2 の判定になり画面と
+//! 時間差で食い違いうるので、一次の材料にしない（誤って送らないことが最優先）。
+//!
+//! - [`offscreen_print`] は、見えている行が「入力欄の上は締めの行と通知だけで、締めの行より上に
+//!   項目が無い」形のときだけ、その形の印（締めの行と通知の頭の行）を返す。足して読むのは
+//!   この形のときだけ（普段の 2 秒 tick は器を起こさない）
+//! - [`detect_offscreen`] は、足した行（履歴 + 画面）の締めの行と通知が見えている形と同じ印の
+//!   ときだけ [`detect`] を通す（読む前に会話が動いていたら止まっていると言わない）
+//! - [`capture_offscreen`] は器の履歴を読む I/O（**UI スレッドから呼ばない**）
 
 use std::time::{Duration, Instant};
 
@@ -82,9 +100,97 @@ pub fn legacy_2157() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_2157_LEGACY").is_ok_and(|v| v == "1"))
 }
 
+/// #2181 の A/B。`TAKO_2181_LEGACY=1` で #2181 **前**へ戻す（締めの行より上が画面の外でも
+/// 画面の外の行を読まない = 見えている行だけで判定する）
+pub fn legacy_2181() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2181_LEGACY").is_ok_and(|v| v == "1"))
+}
+
+/// 画面の外から足して読む行数（#2181）。締めの行の直上の項目（エラー）と、その前の人の発言・
+/// 同じターンの回線では直らない停止の行に届けばよい
+pub const OFFSCREEN_LINES: usize = 200;
+
 /// 画面（上から順の行）を判定する
 pub fn detect(lines: &[String]) -> NetScreen {
     detect_with(lines, legacy_2157())
+}
+
+/// 見えている行だけでは判定できず、画面の外の行が要る形か（#2181）。要るならその形の印を返す。
+///
+/// 形: 入力欄が見えていて、その上が「ターンの締めの行 + claude の記号の項目（通知）だけ」で
+/// （通知は 0 個でもよい）、**締めの行より上に会話の項目が 1 つも無い**（= 締めの行の上の項目の
+/// 頭の行が画面の外）。締めの行より下に中断の案内（生成中）があれば要らない。
+/// 印は締めの行と通知の頭の行から作る（帯・ヒント・入力欄・フッターは入れない = 時間で変わる）
+pub fn offscreen_print(lines: &[String]) -> Option<u64> {
+    // 通知行の読み飛ばし（#2157）の上に立つので、#2157 の旧判定でも読まない
+    offscreen_print_with(lines, legacy_2157() || legacy_2181())
+}
+
+fn offscreen_print_with(lines: &[String], legacy: bool) -> Option<u64> {
+    if legacy {
+        return None;
+    }
+    let (closing, print) = closing_anchor(lines)?;
+    if (0..closing).any(|i| is_entry(&lines[i]))
+        || crate::claude_tui::interrupt_hint_visible(&lines[closing..])
+    {
+        return None;
+    }
+    Some(print)
+}
+
+/// 画面の外の行を足した材料（上から順の「履歴 + 画面」）を判定する（#2181）。
+///
+/// 足した材料の締めの行と通知が見えている形の印（[`offscreen_print`]）と一致するときだけ
+/// [`detect`] を通す。一致しない（読むあいだに会話が動いた・器の画面が見えている画面と違う）
+/// なら止まっていると言わない
+pub fn detect_offscreen(lines: &[String], print: u64) -> NetScreen {
+    match closing_anchor(lines) {
+        Some((_, p)) if p == print => detect(lines),
+        _ => NetScreen::Clear,
+    }
+}
+
+/// 器（tmux / psmux）の履歴の末尾 [`OFFSCREEN_LINES`] 行 + 現画面を読む（#2181）。
+///
+/// **UI スレッドから呼ばない**（器の子プロセスを起こす。待ちは器の口の上限つき）。
+/// 器を持たない直接のペインは外側の端末の履歴をメモリから読む（tako-app 側）
+pub fn capture_offscreen(session: &str) -> Result<Vec<String>, String> {
+    let (session_ref, capture) = crate::reach::detached_capture(session)
+        .ok_or_else(crate::reach::no_detached_capture_note)?;
+    capture
+        .capture_scrollback(&session_ref, OFFSCREEN_LINES)
+        .map_err(|e| short(&e.to_string()))
+}
+
+/// 入力欄の上が「…締めの行 / claude の記号の項目（通知）だけ」の形なら、締めの行の位置と
+/// 印（締めの行と通知の頭の行。上下の空白は落とす）を返す（#2181）。締めの行より下に
+/// 人の発言・ツールの結果がある・締めの行が無いなら None
+fn closing_anchor(lines: &[String]) -> Option<(usize, u64)> {
+    use std::hash::{Hash, Hasher};
+    let input = input_box(lines)?;
+    let mut heads: Vec<&str> = Vec::new();
+    for i in (0..input - 1).rev() {
+        let t = lines[i].trim();
+        if t.is_empty() {
+            continue;
+        }
+        if is_turn_closing(t) {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            t.hash(&mut h);
+            heads.hash(&mut h);
+            return Some((i, h.finish()));
+        }
+        if is_entry(&lines[i]) {
+            if !t.starts_with(SAY_MARKS) {
+                return None;
+            }
+            heads.push(t);
+        }
+        // それ以外は項目の続きの行（折り返し）・帯・ヒント
+    }
+    None
 }
 
 fn detect_with(lines: &[String], legacy: bool) -> NetScreen {
@@ -725,6 +831,198 @@ mod tests {
         ] {
             assert!(!is_turn_closing(t), "{t}");
         }
+    }
+
+    /// pane 2716 で取りこぼした低いペインの画面（2026-10-16 の DNS 断・#2181）の見えている全部。
+    /// 締めの行より上（エラーの項目）は画面の外
+    fn visible_2716() -> String {
+        format!(
+            "\n\n✻ Worked for 2h 11m 43s · done 5:57 PM\n\n{NOTICE_PLUGIN}{}",
+            footer60()
+        )
+    }
+
+    /// 画面の外（器の履歴）に残っている直近の行 + 見えている画面。`entry` は締めの行の上の項目
+    fn with_history(entry: &str, visible: &str) -> String {
+        format!(
+            "⏺ Bash(cargo test)\n  ⎿  test result: ok. 12 passed\n\n❯ 実装を続けて\n\n{entry}\n{visible}"
+        )
+    }
+
+    const ERR_60: &str =
+        "⏺ API Error: Can't reach the API server — check your\n  internet or DNS (ENOTFOUND)";
+
+    #[test]
+    fn issue2181_締めの行より上が画面の外なら画面の外を足して見分ける() {
+        let visible = lines(&visible_2716());
+        // 見えている行だけでは判定できない（#2157 の読み飛ばしでも締めの行の上に項目が無い）
+        assert_eq!(detect_with(&visible, false), NetScreen::Clear);
+        let print = offscreen_print_with(&visible, false).expect("画面の外が要る形");
+        // A/B: 旧（#2181 前）は画面の外を読まない
+        assert_eq!(offscreen_print_with(&visible, true), None);
+        // 画面の外を足すと接続エラーの停止
+        let full = lines(&with_history(ERR_60, &visible_2716()));
+        let NetScreen::Stopped(s) = detect_offscreen(&full, print) else {
+            panic!("画面の外のエラーを見分けられない");
+        };
+        assert_eq!(s.kind, ConnErrorKind::Dns);
+        assert_eq!(
+            s.message,
+            "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+        );
+        // 同じ停止を読み直しても同じ鍵（止まって動かないペインで 2 回送らない）
+        assert!(matches!(
+            detect_offscreen(&full, print),
+            NetScreen::Stopped(t) if t.key == s.key
+        ));
+        // 背の高いペインで同じ停止が全部見えているときと同じ判定・同じ鍵
+        assert!(matches!(
+            detect_with(&full, false),
+            NetScreen::Stopped(t) if t.key == s.key
+        ));
+    }
+
+    /// 通知の無い形（締めの行だけが見え、エラーの頭の行が画面の外・続きの行が見えている）も同じ
+    #[test]
+    fn issue2181_通知の無い形でエラーの頭が画面の外でも見分ける() {
+        let visible = format!(
+            "  internet or DNS (ENOTFOUND)\n\n✻ Worked for 4m 2s · done 5:57 PM\n\n{}",
+            footer60()
+        );
+        assert_eq!(detect_with(&lines(&visible), false), NetScreen::Clear);
+        let print = offscreen_print_with(&lines(&visible), false).expect("画面の外が要る形");
+        let full = format!(
+            "❯ 実装を続けて\n\n⏺ API Error: Can't reach the API server — check your\n{visible}"
+        );
+        assert!(matches!(
+            detect_offscreen(&lines(&full), print),
+            NetScreen::Stopped(s) if s.kind == ConnErrorKind::Dns
+        ));
+    }
+
+    /// 画面の外を足しても「送ってはいけない」ものは従来どおり送らない
+    #[test]
+    fn issue2181_画面の外を足しても送ってはいけない停止は見分けない() {
+        let print = offscreen_print_with(&lines(&visible_2716()), false).unwrap();
+        let cases = [
+            // 締めの行の上が普通の返答（止まっていない）
+            ("普通の返答", "⏺ 実装を終えました。テストは緑です。".to_string()),
+            // サーバー側の失敗（回線では直らない）
+            (
+                "5xx",
+                "⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment."
+                    .to_string(),
+            ),
+            // 同じターンにログイン失効
+            (
+                "ログイン失効",
+                format!("  ⎿  Login expired · Please run /login\n\n{ERR_60}"),
+            ),
+            // 使用制限
+            (
+                "使用制限",
+                "⏺ You've hit your session limit · resets 3am (Asia/Tokyo)".to_string(),
+            ),
+        ];
+        for (name, entry) in cases {
+            let full = lines(&with_history(&entry, &visible_2716()));
+            assert_eq!(detect_offscreen(&full, print), NetScreen::Clear, "{name}");
+        }
+        // 読むあいだに会話が先へ進んだ（器の画面では通知の後に人の発言）= 印が合わない
+        let moved = with_history(
+            ERR_60,
+            &format!(
+                "\n\n✻ Worked for 2h 11m 43s · done 5:57 PM\n\n{NOTICE_PLUGIN}\n❯ つづき\n\n{}",
+                footer60()
+            ),
+        );
+        assert_eq!(detect_offscreen(&lines(&moved), print), NetScreen::Clear);
+        // 読むあいだに締めの行が変わった（次のターンが終わった）= 印が合わない
+        let next = with_history(
+            ERR_60,
+            &visible_2716().replace("2h 11m 43s · done 5:57 PM", "3s · done 6:01 PM"),
+        );
+        assert_eq!(detect_offscreen(&lines(&next), print), NetScreen::Clear);
+        // 画面の外が読めなかった（器の履歴が空）
+        assert_eq!(
+            detect_offscreen(&lines(&visible_2716()), print),
+            NetScreen::Clear
+        );
+    }
+
+    /// 画面の外を読みに行かない形（普段の 2 秒 tick は器を起こさない）
+    #[test]
+    fn issue2181_画面の外が要らない形では読みに行かない() {
+        let no = |screen: &str, name: &str| {
+            assert_eq!(offscreen_print_with(&lines(screen), false), None, "{name}");
+        };
+        // 締めの行の上の項目が見えている（見えている行で判定できる）
+        no(
+            &screen_2670(&format!("{NOTICE_PLUGIN}\n")),
+            "項目が見えている",
+        );
+        no(ENOTFOUND_100, "通知の無い全部見える画面");
+        // 締めの行より下に人の発言・ツールの結果（会話が進んでいる）
+        no(
+            &format!(
+                "\n✻ Worked for 3s · done 5:57 PM\n\n❯ つづき\n\n{}",
+                footer60()
+            ),
+            "締めの後に人の発言",
+        );
+        no(
+            &format!(
+                "\n✻ Worked for 3s · done 5:57 PM\n\n⏺ Bash(ls)\n  ⎿  a.txt\n\n{}",
+                footer60()
+            ),
+            "締めの後にツールの結果",
+        );
+        // 締めの行より下で生成中（中断の案内）
+        no(
+            &visible_2716().replace(
+                "  ⏵⏵ auto mode on (shift+tab to cycle)",
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
+            ),
+            "生成中",
+        );
+        // 締めの行が無い（生成中のスピナー・始めたばかり）・入力欄が無い（ダイアログ）・空
+        no(
+            &format!(
+                "  続きの行\n\n✻ Thinking… (12s · ↓ 3.4k tokens)\n\n{}",
+                footer60()
+            ),
+            "締めの行が無い",
+        );
+        no(
+            "\n✻ Worked for 3s · done 5:57 PM\n\n Select model\n ❯ 1. Default\n",
+            "入力欄が無い",
+        );
+        no("", "空");
+    }
+
+    /// 印は締めの行と通知の頭の行で決まり、帯・ヒント・入力欄・フッターでは変わらない
+    #[test]
+    fn issue2181_形の印は帯や入力欄では変わらず締めの行と通知で変わる() {
+        let print = |s: &str| offscreen_print_with(&lines(s), false).unwrap();
+        let base = print(&visible_2716());
+        let banded = visible_2716().replace(
+            "  hooks/register.ts unchanged; 14 hooks: …)\n",
+            "  hooks/register.ts unchanged; 14 hooks: …)\ntako | tako: worker | タブ 2 [ compact ]\n",
+        );
+        assert_eq!(print(&banded), base, "帯で印が変わった");
+        assert_eq!(
+            print(&visible_2716().replace("❯ \n", "❯ 下書き\n")),
+            base,
+            "入力欄の文字で印が変わった"
+        );
+        assert_ne!(
+            print(&visible_2716().replace("done 5:57 PM", "done 5:58 PM")),
+            base,
+            "締めの行が変わっても同じ印"
+        );
+        let two =
+            visible_2716().replace(NOTICE_PLUGIN, &format!("{NOTICE_PLUGIN}\n{NOTICE_HOOKS}"));
+        assert_ne!(print(&two), base, "通知が増えても同じ印");
     }
 
     #[test]
