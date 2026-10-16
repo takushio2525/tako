@@ -1166,6 +1166,8 @@ tako sessions list                      # 会話カタログ（新しい順）
 tako sessions list --role worker
 tako sessions show <session-id>         # メタ情報と会話冒頭
 tako sessions resume <session-id>       # 記録された cwd で復元（claude のみ）
+
+tako usage                              # 利用制限の観測（ログインごとの 5h / 7d の最新と点数）
 ```
 
 ## 表示・設定のトグル

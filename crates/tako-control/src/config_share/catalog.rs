@@ -202,6 +202,13 @@ pub mod notes {
         "蓋閉じ継続の元値の記録。倒したマシンでしか意味を持たないので共有しない",
         "Saved lid-close action for this machine only; meaningless elsewhere, so it is not shared",
     );
+    /// usage 分析の観測と索引（#2200 / エピック #2192）。**共有すると鍵が壊れる**: ログインの鍵は
+    /// このマシンの `machine_id` で塩付けしたハッシュなので、別のマシンでは同じログインが別の鍵になる
+    pub const USAGE: Note = Note::new(
+        "利用制限の観測とログインの鍵（このマシンの塩で包んだハッシュ）。別のマシンでは鍵が合わないので共有しない",
+        "Rate-limit observations and login keys hashed with this machine's salt; the keys would not match \
+         on another device, so they are not shared",
+    );
     pub const SESSION: Note = Note::new(
         "会話・セッションの記録。分量が大きく秘匿情報を含みうるので共有しない",
         "Conversation and session records: large and potentially sensitive, so they are not shared",
@@ -564,6 +571,15 @@ pub const CATALOG: &[Entry] = &[
         path: "lsp-config/",
         class: Class::Local,
         note: notes::GENERATED,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    // #2200: usage 分析の置き場（limits.jsonl / sessions.jsonl。S2 以降の索引もここ）
+    Entry {
+        root: Root::TakoData,
+        path: "usage/",
+        class: Class::Local,
+        note: notes::USAGE,
         local_fields: &[],
         needs_local_unless: &[],
     },

@@ -3569,13 +3569,14 @@ pub fn tools() -> Vec<Value> {
                 remote_link.next_step / enable_command に従う\
                 （tako_orchestrator_profiles の remote_control: true で起動し直す）。\
                 remote_link.account_label はどの tako アカウント配下か（スマホが別アカウントだと一覧に出ない）。\
-                resume / link は claude のみ（codex / agy は list だけ）。",
+                resume / link は claude のみ（codex / agy は list だけ）。\
+                usage: ログインごとの利用制限（5h / 7d）の最新の観測と点数。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "show", "resume", "link"],
+                        "enum": ["list", "show", "resume", "link", "usage"],
                         "description": "操作種別",
                     },
                     "id": {

@@ -110,6 +110,8 @@ mod test_home;
 #[cfg(test)]
 mod test_write_isolation;
 pub mod transcript;
+/// usage 分析（エピック #2192。S1 #2200 = 利用制限の観測とログインの鍵）
+pub mod usage;
 pub mod user_tasks;
 pub mod welcome;
 /// worker ペインのフォント自動縮小（#1439）
