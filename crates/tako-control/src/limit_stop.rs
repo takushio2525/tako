@@ -15,7 +15,9 @@
 //! —— 座席種別や管理者による無効化は待っても解けないので、ナッジを撃つと
 //! 試行上限まで空撃ちするだけになる（報告は watch / supervisor の担当）
 
-use tako_core::limit_resume::{parse_reset_at, LimitStop, LimitStopKind};
+use tako_core::limit_resume::{
+    is_limit_exhausted_line, notice_digest, parse_reset_at, LimitSeen, LimitStop, LimitStopKind,
+};
 
 use crate::claude_tui::DialogKind;
 use crate::orchestrator::wait::{detect_worker_error, WorkerErrorKind};
@@ -84,6 +86,18 @@ fn detect_limit_stop_from_screen(
     observed_at: i64,
     tz_offset: i32,
 ) -> Option<LimitStop> {
+    let (kind, message) = classify_limit_stop(lines)?;
+    let reset_at = resolve_reset_at(lines, kind, &message, observed_at, tz_offset);
+    Some(LimitStop {
+        kind,
+        message,
+        reset_at,
+    })
+}
+
+/// 上限で止まっているかと、その型・根拠の 1 行（**時刻の基準に依らない**部分。#1710 で
+/// 解除時刻の解決と分けた = 判定は 1 回・解除時刻は告知の検知時刻から 1 回だけ解く）
+fn classify_limit_stop(lines: &[String]) -> Option<(LimitStopKind, String)> {
     // ダイアログが入力欄を奪っているならそちらが優先（idle 判定より確実）。
     // usage_limit 以外のダイアログ（permission / plan 確認 / model 選択）では
     // **何も返さない** = 自動復帰は発動しない
@@ -103,25 +117,105 @@ fn detect_limit_stop_from_screen(
         } else {
             dialog.title.clone()
         };
-        return Some(LimitStop {
-            kind: LimitStopKind::Dialog,
-            message,
-            reset_at: reset_at_from_lines(lines, observed_at, tz_offset),
-        });
+        return Some((LimitStopKind::Dialog, message));
     }
 
     // ダイアログ無し。画面末尾の異常停止パターンから usage_limit だけを拾う
     // （api_error / limit_dialog（codex のモデル切替提案）では発動しない）
     let joined = lines.join("\n");
     match detect_worker_error(&joined) {
-        Some((WorkerErrorKind::UsageLimit, message)) => Some(LimitStop {
-            reset_at: parse_reset_at(&message, observed_at, tz_offset)
-                .or_else(|| reset_at_from_lines(lines, observed_at, tz_offset)),
-            kind: LimitStopKind::Idle,
-            message,
-        }),
+        Some((WorkerErrorKind::UsageLimit, message)) => Some((LimitStopKind::Idle, message)),
         _ => None,
     }
+}
+
+/// 解除時刻を `reference`（告知を観測した時刻）から解く。
+/// ダイアログ型は画面全体から、idle 型は根拠の 1 行 → 画面全体の順に読む
+fn resolve_reset_at(
+    lines: &[String],
+    kind: LimitStopKind,
+    message: &str,
+    reference: i64,
+    tz_offset: i32,
+) -> Option<i64> {
+    match kind {
+        LimitStopKind::Dialog => reset_at_from_lines(lines, reference, tz_offset),
+        LimitStopKind::Idle => parse_reset_at(message, reference, tz_offset)
+            .or_else(|| reset_at_from_lines(lines, reference, tz_offset)),
+    }
+}
+
+/// 告知の検知時刻を基準に解いた上限の停止（#1710。GUI の自動復帰の tick が使う）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedLimit {
+    /// 停止。`reset_at` は**告知を最初に観測した時刻**から解いた値
+    /// （構造化ソースの時刻があればそちら）
+    pub stop: LimitStop,
+    /// この告知の記憶。新しい告知なら `detected_at` = いま。
+    /// 呼び出し側はペインの記憶（`Pane::limit_seen`）と違えば書き戻す
+    pub seen: LimitSeen,
+    /// `stop.reset_at` が構造化ソース（codex の rollout / tako mod）の時刻か
+    pub reset_from_hint: bool,
+}
+
+/// 画面とペインの記憶（[`LimitSeen`]）から、告知の検知時刻を基準に停止を解く（#1710）。
+///
+/// [`detect_limit_stop_with`] は観測時刻（= いま）を基準に解く。GUI を再起動した・追跡を
+/// 作り直した時点で画面に**前日の**告知が残っていると、`resets 7am` が「明日の 7 時」へ
+/// 解けて、解けている上限を翌日まで待つ（9/24 12:31 の週次上限を 9/25 12:43 に解き直して
+/// `reset_at` = 9/26 07:00 になった実例）。ここでは画面の告知がペインの記憶と同じなら
+/// 記憶の時刻（= 告知を最初に見た時刻）を基準にする。記憶が無い / 違う告知なら
+/// いま初めて見たので `now`（= [`detect_limit_stop_with`] と同じ値）。
+///
+/// 判定（上限か・型・根拠）は時刻の基準に依らないので 1 回だけ走らせる
+pub fn observe_limit_stop(
+    lines: &[String],
+    seen: Option<&LimitSeen>,
+    now: i64,
+    tz_offset: i32,
+    hint: Option<&LimitHint>,
+) -> Option<ObservedLimit> {
+    let (kind, message) = classify_limit_stop(lines)?;
+    let notice = notice_key(lines, &message);
+    let detected_at = tako_core::limit_resume::detected_at(seen, &notice, now);
+    let mut stop = LimitStop {
+        reset_at: resolve_reset_at(lines, kind, &message, detected_at, tz_offset),
+        kind,
+        message,
+    };
+    // 構造化ソースの時刻は絶対時刻なので基準に依らない（[`detect_limit_stop_with`] と同じ優先）
+    let hinted = hint.and_then(|h| h.reset_at);
+    if let Some(at) = hinted {
+        stop.reset_at = Some(at);
+    }
+    Some(ObservedLimit {
+        stop,
+        seen: LimitSeen {
+            notice,
+            detected_at,
+        },
+        reset_from_hint: hinted.is_some(),
+    })
+}
+
+/// 告知を見分ける鍵（[`tako_core::limit_resume::notice_digest`]。#1710）。
+///
+/// 画面の**最も下の上限の見出し**（物理行 → 折り返しを結合した論理行の順）の要約。
+/// ダイアログ型の根拠（`What do you want to do?` / 選択肢のラベル）はどのエピソードでも
+/// 同じ文字列なので鍵にならない。見出しで見分けるので、同じエピソードの中でダイアログ型と
+/// idle 型が入れ替わっても鍵は変わらない。見出しがスクロールアウトしていれば根拠の 1 行
+fn notice_key(lines: &[String], message: &str) -> String {
+    let headline = lines
+        .iter()
+        .rev()
+        .find(|l| is_limit_exhausted_line(l))
+        .cloned()
+        .or_else(|| {
+            tako_core::limit_resume::unwrapped_tail(lines, RESET_SCAN_LINES)
+                .into_iter()
+                .find(|l| is_limit_exhausted_line(l))
+        });
+    notice_digest(headline.as_deref().unwrap_or(message))
 }
 
 /// 画面のどこかにあるリセット時刻表記を拾う（下の行ほど新しいので末尾から見る）。

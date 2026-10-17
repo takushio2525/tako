@@ -30,9 +30,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use tako_control::layout::{
-    self, AgentResumeLayout, ChangeKey, LayoutExtras, LayoutFile, NodeLayout, PaneLayout,
-    PaneMetaRef, PreviewLayout, RemoteFolderLayout, ShelvedTabLayout, SshPaneLayout, TabLayout,
-    WindowFrame, WindowLayout, CHANGE_KEY_FIELDS,
+    self, AgentResumeLayout, ChangeKey, LayoutExtras, LayoutFile, LimitSeenLayout, NodeLayout,
+    PaneLayout, PaneMetaRef, PreviewLayout, RemoteFolderLayout, ShelvedTabLayout, SshPaneLayout,
+    TabLayout, WindowFrame, WindowLayout, CHANGE_KEY_FIELDS,
 };
 use tako_core::PaneId;
 
@@ -72,6 +72,7 @@ const LAYOUT_STRUCTS: &[&str] = &[
     "RemoteFolderLayout",
     "SshPaneLayout",
     "ShelvedTabLayout",
+    "LimitSeenLayout",
 ];
 
 /// #916 の指紋スナップショットから layout 側の `(構造体, フィールド)` を読む。
@@ -443,6 +444,22 @@ fn cases() -> Vec<((&'static str, &'static str), Cover)> {
             ("PaneLayout", "spawned_by"),
             Cover::Mutate(|f| leaf(f, 102).spawned_by = Some(101)),
         ),
+        // #1710: 上限の告知の記憶（再起動をまたいで解除時刻の基準にする）
+        (
+            ("PaneLayout", "limit_seen"),
+            Cover::Mutate(|f| leaf(f, 102).limit_seen = None),
+        ),
+        // ---- LimitSeenLayout（#1710）----
+        (
+            ("LimitSeenLayout", "notice"),
+            Cover::Mutate(|f| {
+                leaf(f, 101).limit_seen.as_mut().unwrap().notice = "0123456789abcdef".into()
+            }),
+        ),
+        (
+            ("LimitSeenLayout", "detected_at"),
+            Cover::Mutate(|f| leaf(f, 101).limit_seen.as_mut().unwrap().detected_at += 60),
+        ),
         // ---- SshPaneLayout（#1446）----
         (
             ("SshPaneLayout", "host"),
@@ -672,6 +689,10 @@ fn pane(id: u64, title: &str) -> PaneLayout {
         }),
         // #1946: 復元で 201（実在）へ戻るので「保存 → 復元 → 保存」がバイト一致する
         spawned_by: Some(201),
+        limit_seen: Some(LimitSeenLayout {
+            notice: "fedcba9876543210".into(),
+            detected_at: 1_790_220_660,
+        }),
     }
 }
 

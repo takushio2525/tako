@@ -200,6 +200,9 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
                 // #1446: `SshPaneLayout` は `PaneLayout.ssh` として layout.json へ
                 // 直に serde される永続構造体
                 "SshPaneLayout",
+                // #1710: `LimitSeenLayout` は `PaneLayout.limit_seen` として layout.json へ
+                // 直に serde される永続構造体
+                "LimitSeenLayout",
             ],
         ),
         (

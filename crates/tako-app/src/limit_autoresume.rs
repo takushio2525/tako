@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use tako_control::host::{SessionHost, TmuxHost};
+use tako_control::limit_stop::ObservedLimit;
 use tako_core::limit_resume::{
     self, HoldReason, LimitStop, LimitStopKind, ResumeAction, ResumeDecision, ResumeInput,
 };
@@ -81,11 +82,20 @@ pub(crate) fn scan_codex_limits(
 /// ペイン 1 つぶんの自動復帰の追跡状態（1 エピソード = 上限で止まってから復帰するまで）
 #[derive(Debug, Clone)]
 pub(crate) struct LimitResumeTracker {
-    /// このエピソードで最初に上限停止を観測した時刻（unix 秒）
+    /// このエピソードで最初に上限停止を観測した時刻（unix 秒）。
+    /// GUI の再起動・追跡の作り直しをまたいで**告知を最初に見た時刻**を引き継ぐ
+    /// （ペインの記憶 `Pane::limit_seen`。#1710）
     pub(crate) first_seen: i64,
-    /// エピソード開始時に解決したリセット時刻（unix 秒）。
-    /// **途中で更新しない**（画面に残った古いメッセージで復帰予定が後ろへずれないように）
+    /// この GUI がこのエピソードの追跡を（再）開始した時刻（unix 秒。#1710）。
+    /// 追跡を始めた時点でもう解けていた上限は、ここ + 安全マージンで再開する
+    pub(crate) tracked_since: i64,
+    /// エピソード開始時に解決したリセット時刻（unix 秒）。告知を最初に見た時刻から解く（#1710）。
+    /// **途中で更新しない**（画面に残った古いメッセージで復帰予定が後ろへずれないように）。
+    /// 例外は構造化ソース（codex の rollout / tako mod）の時刻が後から届いたとき（#1710）
     pub(crate) reset_at: Option<i64>,
+    /// `reset_at` が構造化ソースの時刻か（#1710。画面から解いた値は後から届いた構造化ソースの
+    /// 時刻で置き換える = GUI の再起動直後は mod の報告がまだ届いていない）
+    reset_from_hint: bool,
     /// 停止の型（ダイアログ / idle）
     pub(crate) kind: LimitStopKind,
     /// 検知の根拠になった画面上の 1 行
@@ -144,13 +154,18 @@ impl TakoApp {
             if !self.limit_resume.is_empty() {
                 self.limit_resume.clear();
             }
+            if !self.limit_seen_absent.is_empty() {
+                self.limit_seen_absent.clear();
+            }
             return Vec::new();
         }
         // 無効化・消滅したペインの追跡は捨てる（ペイン ID 再利用での取り違え防止）
         self.limit_resume.retain(|id, _| targets.contains(id));
+        self.limit_seen_absent.retain(|id, _| targets.contains(id));
 
         let now = limit_resume::now_unix();
         let tz = limit_resume::local_utc_offset();
+        let seen_legacy = limit_resume::legacy_detected_base();
         let mod_now = std::time::Instant::now();
         let mod_legacy = tako_core::claude_mod::s2_legacy();
         let mut jobs = Vec::new();
@@ -176,9 +191,35 @@ impl TakoApp {
                     (!limits.is_empty())
                         .then(|| tako_control::limit_stop::LimitHint::from_mod(&limits))
                 });
-            let stop =
-                tako_control::limit_stop::detect_limit_stop_with(&lines, now, tz, hint.as_ref());
-            let Some(stop) = stop else {
+            // #1710: 解除時刻は**告知を最初に見た時刻**から解く。記憶はペインの属性
+            // （layout.json に載る）なので GUI の再起動・追跡の作り直しをまたぐ
+            let seen = if seen_legacy {
+                None
+            } else {
+                self.workspace
+                    .pane_anywhere(pane)
+                    .and_then(|p| p.limit_seen())
+                    .cloned()
+            };
+            let observed = tako_control::limit_stop::observe_limit_stop(
+                &lines,
+                seen.as_ref(),
+                now,
+                tz,
+                hint.as_ref(),
+            );
+            if !seen_legacy {
+                // `session`（self.terminals の借用）が生きているのでフィールドを分けて渡す
+                sync_limit_seen(
+                    &mut self.workspace,
+                    &mut self.limit_seen_absent,
+                    pane,
+                    seen.as_ref(),
+                    observed.as_ref(),
+                    now,
+                );
+            }
+            let Some(observed) = observed else {
                 // 上限ではなくなった = エピソード終了。次に止まったら 1 からやり直す
                 if let Some(prev) = self.limit_resume.remove(&pane) {
                     if prev.attempts > 0 {
@@ -194,6 +235,7 @@ impl TakoApp {
                 }
                 continue;
             };
+            let stop = &observed.stop;
             // 入力欄に人間の下書きがあるか。ダイアログ中は入力欄自体が無いので見ない
             let user_draft = matches!(stop.kind, LimitStopKind::Idle)
                 && session
@@ -203,8 +245,8 @@ impl TakoApp {
             let tracker = self
                 .limit_resume
                 .entry(pane)
-                .or_insert_with(|| LimitResumeTracker::new(&stop, now, fingerprint));
-            tracker.observe(&stop, now, fingerprint);
+                .or_insert_with(|| LimitResumeTracker::new(&observed, now, fingerprint));
+            tracker.observe(&observed, now, fingerprint);
             if tracker.in_flight {
                 continue; // バックグラウンドの応答が走っている
             }
@@ -217,6 +259,7 @@ impl TakoApp {
                 stop: Some(&effective),
                 now,
                 first_seen: tracker.first_seen,
+                tracked_since: tracker.tracked_since,
                 stable_since: tracker.stable_since,
                 attempts: tracker.attempts,
                 last_attempt: tracker.last_attempt,
@@ -414,6 +457,7 @@ impl TakoApp {
             "stopped_by_limit": true,
             "kind": t.kind.as_str(),
             "message": t.message,
+            "detected_at": t.first_seen,
             "reset_at": t.reset_at,
             "resume_at": t.due_at(),
             "attempts": t.attempts,
@@ -426,10 +470,14 @@ impl TakoApp {
 }
 
 impl LimitResumeTracker {
-    fn new(stop: &LimitStop, now: i64, fingerprint: u64) -> Self {
+    fn new(observed: &ObservedLimit, now: i64, fingerprint: u64) -> Self {
+        let stop = &observed.stop;
         Self {
-            first_seen: now,
+            // #1710: 告知を最初に見た時刻（記憶が無ければ now = これまでどおり）
+            first_seen: observed.seen.detected_at,
+            tracked_since: now,
             reset_at: stop.reset_at,
+            reset_from_hint: observed.reset_from_hint,
             kind: stop.kind,
             message: stop.message.clone(),
             fingerprint,
@@ -443,12 +491,22 @@ impl LimitResumeTracker {
 
     /// 新しい観測を取り込む。`reset_at` はエピソード中に**動かさない**
     /// （画面に残った古い上限メッセージで復帰予定が後ろへずれるのを防ぐ）。
-    /// ただし最初に解決できていなかった場合だけは、後から読めたものを採る
-    fn observe(&mut self, stop: &LimitStop, now: i64, fingerprint: u64) {
+    /// ただし最初に解決できていなかった場合だけは、後から読めたものを採る。
+    /// 画面から解いた値は、後から届いた構造化ソースの時刻で置き換える（#1710。
+    /// GUI の再起動直後の数 tick は mod の報告がまだ無く、画面の値で追跡が始まる）
+    fn observe(&mut self, observed: &ObservedLimit, now: i64, fingerprint: u64) {
+        let stop = &observed.stop;
         self.kind = stop.kind;
         self.message = stop.message.clone();
         if self.reset_at.is_none() {
             self.reset_at = stop.reset_at;
+            self.reset_from_hint = observed.reset_from_hint;
+        } else if observed.reset_from_hint
+            && !self.reset_from_hint
+            && !limit_resume::legacy_detected_base()
+        {
+            self.reset_at = stop.reset_at;
+            self.reset_from_hint = true;
         }
         if fingerprint == self.fingerprint {
             if self.stable_since.is_none() {
@@ -468,6 +526,8 @@ impl LimitResumeTracker {
     /// 製品コードからは呼ばれないので release の挙動は変わらない
     pub(crate) fn backdate_for_test(&mut self, secs: i64, reset_at: Option<i64>) {
         self.first_seen -= secs;
+        // #1710: 追跡の開始もさかのぼらせる（リセット済みの上限は追跡開始 + マージンで動く）
+        self.tracked_since -= secs;
         self.stable_since = self.stable_since.map(|t| t - secs);
         self.reset_at = reset_at;
     }
@@ -504,9 +564,10 @@ impl LimitResumeTracker {
         }
     }
 
-    /// このエピソードで復帰を試みてよくなる時刻（unix 秒）
+    /// このエピソードで復帰を試みてよくなる時刻（unix 秒）。
+    /// 追跡を始めた時点でもう解けていたら追跡の開始 + マージン（#1710）
     fn due_at(&self) -> i64 {
-        limit_resume::due_at(&self.effective_stop(), self.first_seen)
+        limit_resume::resume_due(&self.effective_stop(), self.first_seen, self.tracked_since)
     }
 }
 
@@ -606,6 +667,38 @@ pub(crate) fn run_limit_resume_job(job: &LimitResumeJob) -> String {
     }
 }
 
+/// 告知の記憶（#1710）をペインへ書き戻す。規則は `limit_resume::step_seen` の 1 実装
+/// （消えたまま 10 分続いたら捨てる）。書き換えはペインの属性なので、同じ tick の
+/// `save_layout` が layout.json へ落とす
+fn sync_limit_seen(
+    workspace: &mut tako_core::Workspace,
+    absent: &mut LimitSeenAbsence,
+    pane: PaneId,
+    current: Option<&limit_resume::LimitSeen>,
+    observed: Option<&ObservedLimit>,
+    now: i64,
+) {
+    let step = limit_resume::step_seen(
+        current,
+        observed.map(|o| &o.seen),
+        absent.get(&pane).copied(),
+        now,
+    );
+    match step.absent_since {
+        Some(since) => {
+            absent.insert(pane, since);
+        }
+        None => {
+            absent.remove(&pane);
+        }
+    }
+    if let Some(write) = step.write {
+        if let Some(p) = workspace.pane_anywhere_mut(pane) {
+            p.set_limit_seen(write);
+        }
+    }
+}
+
 /// 監査記録（`<data_dir>/supervisor.log`。#749 の ctx_handoff_nudge と同じ場所）
 fn audit(worker_id: &str, pane: PaneId, detail: &str) {
     tako_control::orchestrator::supervisor::audit_log(
@@ -634,6 +727,10 @@ fn reset_display(reset_at: Option<i64>) -> String {
 /// 追跡状態の入れ物（TakoApp のフィールド型）
 pub(crate) type LimitResumeTrackers = HashMap<PaneId, LimitResumeTracker>;
 
+/// 告知が画面から消えたのを最初に見た時刻（#1710。TakoApp のフィールド型）。
+/// ペインの記憶を捨てるまでの猶予を数えるためだけの非永続の状態
+pub(crate) type LimitSeenAbsence = HashMap<PaneId, i64>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,16 +743,49 @@ mod tests {
         }
     }
 
+    /// 画面から解いた観測（告知を最初に見た時刻 = `detected_at`）
+    fn seen_at(kind: LimitStopKind, reset_at: Option<i64>, detected_at: i64) -> ObservedLimit {
+        ObservedLimit {
+            stop: stop(kind, reset_at),
+            seen: limit_resume::LimitSeen {
+                notice: "0000000000000001".into(),
+                detected_at,
+            },
+            reset_from_hint: false,
+        }
+    }
+
+    /// 構造化ソース（tako mod / codex の rollout）の時刻つきの観測
+    fn hinted(kind: LimitStopKind, reset_at: i64, detected_at: i64) -> ObservedLimit {
+        ObservedLimit {
+            reset_from_hint: true,
+            ..seen_at(kind, Some(reset_at), detected_at)
+        }
+    }
+
+    fn input(t: &LimitResumeTracker, stop: &LimitStop, now: i64) -> ResumeDecision {
+        limit_resume::decide(&ResumeInput {
+            enabled: true,
+            stop: Some(stop),
+            now,
+            first_seen: t.first_seen,
+            tracked_since: t.tracked_since,
+            stable_since: t.stable_since,
+            attempts: t.attempts,
+            last_attempt: t.last_attempt,
+            user_draft: false,
+        })
+    }
+
     #[test]
     fn issue813_リセット時刻はエピソード中に動かない() {
-        let first = stop(LimitStopKind::Idle, Some(1_000));
-        let mut t = LimitResumeTracker::new(&first, 0, 1);
+        let mut t = LimitResumeTracker::new(&seen_at(LimitStopKind::Idle, Some(1_000), 0), 0, 1);
         // 画面に別の（古い）時刻が出ても最初の解決を保つ
-        t.observe(&stop(LimitStopKind::Idle, Some(90_000)), 10, 1);
+        t.observe(&seen_at(LimitStopKind::Idle, Some(90_000), 0), 10, 1);
         assert_eq!(t.reset_at, Some(1_000));
         // 最初に解決できていなければ後から読めたものを採る
-        let mut t2 = LimitResumeTracker::new(&stop(LimitStopKind::Idle, None), 0, 1);
-        t2.observe(&stop(LimitStopKind::Idle, Some(1_000)), 10, 1);
+        let mut t2 = LimitResumeTracker::new(&seen_at(LimitStopKind::Idle, None, 0), 0, 1);
+        t2.observe(&seen_at(LimitStopKind::Idle, Some(1_000), 0), 10, 1);
         assert_eq!(t2.reset_at, Some(1_000));
     }
 
@@ -664,30 +794,20 @@ mod tests {
     /// 後ろへずれ続け、リセット時刻を過ぎても永遠に発動しない（実測で踏んだ）
     #[test]
     fn issue813_判断は追跡状態のリセット時刻を使う() {
-        let first = stop(LimitStopKind::Idle, Some(1_000));
-        let mut t = LimitResumeTracker::new(&first, 0, 1);
+        let mut t = LimitResumeTracker::new(&seen_at(LimitStopKind::Idle, Some(1_000), 0), 0, 1);
         // 画面からは「まだ先のリセット時刻」が読めても、
-        t.observe(&stop(LimitStopKind::Idle, Some(90_000)), 10, 1);
+        t.observe(&seen_at(LimitStopKind::Idle, Some(90_000), 0), 10, 1);
         // 判断に渡す停止情報は最初に確定した値のまま
         assert_eq!(t.effective_stop().reset_at, Some(1_000));
         assert_eq!(t.due_at(), 1_000 + limit_resume::SAFETY_MARGIN_SECS);
         // 実際に発動できる（画面由来の 90_000 を使っていたら待ち続ける）
-        let decision = limit_resume::decide(&ResumeInput {
-            enabled: true,
-            stop: Some(&t.effective_stop()),
-            now: 2_000,
-            first_seen: t.first_seen,
-            stable_since: t.stable_since,
-            attempts: 0,
-            last_attempt: None,
-            user_draft: false,
-        });
+        let decision = input(&t, &t.effective_stop(), 2_000);
         assert_eq!(decision.action(), Some(ResumeAction::Nudge));
     }
 
     #[test]
     fn issue813_画面が変わると静止時刻がやり直しになる() {
-        let s = stop(LimitStopKind::Dialog, Some(0));
+        let s = seen_at(LimitStopKind::Dialog, Some(0), 100);
         let mut t = LimitResumeTracker::new(&s, 100, 1);
         assert_eq!(t.stable_since, Some(100));
         t.observe(&s, 110, 1);
@@ -698,7 +818,7 @@ mod tests {
 
     #[test]
     fn issue813_試行の記録が状態に残る() {
-        let mut t = LimitResumeTracker::new(&stop(LimitStopKind::Idle, Some(1_000)), 0, 1);
+        let mut t = LimitResumeTracker::new(&seen_at(LimitStopKind::Idle, Some(1_000), 0), 0, 1);
         assert_eq!(t.attempts, 0);
         t.note_attempt(2_000, "nudge queued");
         assert_eq!(t.attempts, 1);
@@ -710,7 +830,7 @@ mod tests {
 
     #[test]
     fn issue813_待ちの理由は残り秒つきで状態に出る() {
-        let mut t = LimitResumeTracker::new(&stop(LimitStopKind::Idle, Some(1_000)), 0, 1);
+        let mut t = LimitResumeTracker::new(&seen_at(LimitStopKind::Idle, Some(1_000), 0), 0, 1);
         t.note_hold(ResumeDecision::Hold {
             reason: HoldReason::WaitingForReset,
             remaining_secs: 42,
@@ -724,5 +844,123 @@ mod tests {
             remaining_secs: 0,
         });
         assert_eq!(t.last_outcome.as_deref(), Some("user_draft"));
+    }
+
+    // --- #1710: 告知の検知時刻と追跡のやり直し ---
+
+    /// 2026-09-25 07:00 JST（Issue の実例の解除時刻）
+    const RESET: i64 = 1_790_287_200;
+    /// 9/24 12:31 JST（上限に当たった = 告知を最初に見た）
+    const DETECTED: i64 = RESET - (18 * 3600 + 29 * 60);
+    /// 9/25 12:43 JST（GUI を再起動して追跡を作り直した）
+    const RESTART: i64 = RESET + 5 * 3600 + 43 * 60;
+
+    /// GUI の再起動で作り直した追跡は、告知の検知時刻（記憶）を引き継ぎ、
+    /// リセット済みなら「作り直した時刻 + マージン」に再開する
+    #[test]
+    fn issue1710_作り直した追跡はリセット済みなら今からマージン後に動く() {
+        // 記憶の時刻から解いた解除時刻 = 9/25 07:00（もう過ぎている）
+        let t = LimitResumeTracker::new(
+            &seen_at(LimitStopKind::Idle, Some(RESET), DETECTED),
+            RESTART,
+            1,
+        );
+        assert_eq!(t.first_seen, DETECTED, "告知の検知時刻を引き継ぐ");
+        assert_eq!(t.tracked_since, RESTART);
+        assert_eq!(
+            t.due_at(),
+            RESTART + limit_resume::SAFETY_MARGIN_SECS,
+            "過去の解除時刻ではなく、作り直した時刻 + マージン"
+        );
+        // 画面の静止（10 秒）を待ってもまだマージンの中
+        assert_eq!(
+            input(&t, &t.effective_stop(), RESTART + limit_resume::STABLE_SECS),
+            ResumeDecision::Hold {
+                reason: HoldReason::WaitingForReset,
+                remaining_secs: limit_resume::SAFETY_MARGIN_SECS - limit_resume::STABLE_SECS,
+            }
+        );
+        // マージンを過ぎたら発動する（翌日まで待たない）
+        assert_eq!(
+            input(
+                &t,
+                &t.effective_stop(),
+                RESTART + limit_resume::SAFETY_MARGIN_SECS
+            )
+            .action(),
+            Some(ResumeAction::Nudge)
+        );
+    }
+
+    /// GUI の再起動直後は mod の報告がまだ届いておらず、画面の値で追跡が始まる。
+    /// 後から届いた構造化ソースの時刻（絶対時刻）は画面の値を置き換える
+    #[test]
+    fn issue1710_後から届いた構造化ソースの時刻は画面の値を置き換える() {
+        // 記憶が無い（告知が GUI の停止中に出た）ので画面は「明日の 7 時」へ解ける
+        let mut t = LimitResumeTracker::new(
+            &seen_at(LimitStopKind::Idle, Some(RESET + 86_400), RESTART),
+            RESTART,
+            1,
+        );
+        assert_eq!(
+            t.due_at(),
+            RESET + 86_400 + limit_resume::SAFETY_MARGIN_SECS
+        );
+        // 15 秒後に mod の報告が届く（resets_at = 9/25 07:00 = もう過ぎている）
+        t.observe(
+            &hinted(LimitStopKind::Idle, RESET, RESTART),
+            RESTART + 15,
+            1,
+        );
+        assert_eq!(t.reset_at, Some(RESET), "構造化ソースの時刻を採る");
+        assert_eq!(
+            t.due_at(),
+            RESTART + limit_resume::SAFETY_MARGIN_SECS,
+            "リセット済みなので追跡の開始 + マージン"
+        );
+        // 一度採った構造化ソースの時刻は、画面の値で上書きしない
+        t.observe(
+            &seen_at(LimitStopKind::Idle, Some(RESET + 86_400), RESTART),
+            RESTART + 17,
+            1,
+        );
+        assert_eq!(t.reset_at, Some(RESET));
+        // 構造化ソースどうしでも途中では動かさない（#813 の「エピソード中に動かない」）
+        t.observe(
+            &hinted(LimitStopKind::Idle, RESET + 3_600, RESTART),
+            RESTART + 19,
+            1,
+        );
+        assert_eq!(t.reset_at, Some(RESET));
+    }
+
+    /// 構造化ソースの時刻で始まった追跡は今までどおり（#985 / #1880 の回帰なし）
+    #[test]
+    fn issue1710_構造化ソースで始まった追跡は動かない() {
+        let future = RESTART + 3_600;
+        let mut t =
+            LimitResumeTracker::new(&hinted(LimitStopKind::Idle, future, RESTART), RESTART, 1);
+        t.observe(
+            &seen_at(LimitStopKind::Idle, Some(RESET), RESTART),
+            RESTART + 2,
+            1,
+        );
+        assert_eq!(t.reset_at, Some(future));
+        assert_eq!(t.due_at(), future + limit_resume::SAFETY_MARGIN_SECS);
+    }
+
+    /// セルフテスト（項目 111）の注入口は追跡の開始もさかのぼらせる。
+    /// さかのぼらせないと「リセット済み」の状態でもマージンぶん待ってしまう
+    #[test]
+    fn issue1710_さかのぼりの注入口は追跡の開始も動かす() {
+        let now = RESTART;
+        let mut t = LimitResumeTracker::new(&seen_at(LimitStopKind::Idle, None, now), now, 1);
+        t.backdate_for_test(3_600, Some(now - 600));
+        assert_eq!(t.tracked_since, now - 3_600);
+        assert!(
+            t.due_at() <= now,
+            "注入した状態で今すぐ動けない: due={} now={now}",
+            t.due_at()
+        );
     }
 }
