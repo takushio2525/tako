@@ -10424,11 +10424,14 @@ fn dispatch_inner(
                 });
             }
 
-            // シェル指定時はコマンドを包む（包み方は宣言されたシェルの方言で決まる。#875）
+            // シェル指定時はコマンドを包む（フラグは宣言されたシェル、本体の引用は実行ペインの
+            // シェルの方言で決まる。#875 / #2286）
             let wrapped = match &plan.shell {
-                Some(shell) => {
-                    tako_core::platform::shell::declared_shell_command(shell, &plan.command)
-                }
+                Some(shell) => tako_core::platform::shell::declared_shell_command(
+                    tako_core::platform::support::Platform::current(),
+                    shell,
+                    &plan.command,
+                ),
                 None => plan.command.clone(),
             };
             // 実行環境の activation（PATH の前置 + `VIRTUAL_ENV` 等）はコマンド文字列の先頭へ
@@ -42801,9 +42804,9 @@ mod tests {
 
     #[test]
     fn runのtako_shell宣言は方言境界で包まれる() {
-        // `# tako:shell: pwsh` は Windows で `pwsh -Command '…'` へ、
-        // それ以外（bash / fish 等）は従来どおり `<shell> -c '…'` へ包まれる。
-        // 直書きの `{shell} -c '{escaped}'` だと Windows で pwsh が `-c` を解さない（#875）
+        // `# tako:shell: pwsh` は `pwsh -Command '…'` へ、それ以外（bash / fish 等）は
+        // `<shell> -c '…'` へ包まれる。直書きの `{shell} -c '{escaped}'` だと Windows で pwsh が
+        // `-c` を解さない（#875）。本体の引用は実行ペインのシェルの方言（#2286）
         let dir = std::env::temp_dir().join(format!(
             "tako-875-declshell-{}-{:?}",
             std::process::id(),
@@ -42841,8 +42844,14 @@ mod tests {
         let pane_id = result["pane"].as_u64().unwrap();
         let opts = host.attached_options.get(&pane_id).expect("options 記録");
         let cmd = opts.command.as_ref().expect("command が設定されている");
-        // 宣言シェルの包み方は OS に依らない（判定は宣言された名前だけで決まる）
-        assert_run_pane_command(cmd, "pwsh -Command 'echo it''s'", pane_id);
+        // フラグは宣言された名前で決まり、本体の引用は実行ペインのシェル（macOS = `/bin/sh`、
+        // Windows = PowerShell）が読む形。#2286 以前は両 OS で `'echo it''s'` で、macOS の
+        // `/bin/sh` は `echo its` を pwsh へ渡していた
+        let want = match tako_core::platform::support::Platform::current() {
+            tako_core::platform::support::Platform::MacOs => r"pwsh -Command 'echo it'\''s'",
+            tako_core::platform::support::Platform::Windows => "pwsh -Command 'echo it''s'",
+        };
+        assert_run_pane_command(cmd, want, pane_id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

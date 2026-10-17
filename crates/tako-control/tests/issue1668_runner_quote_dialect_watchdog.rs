@@ -25,9 +25,9 @@
 //!
 //! ## 対象外
 //!
-//! プロジェクト既定の組み立て（`runner_project.rs`）と `tako:shell` の外側の包み
-//! （`platform::shell::declared_shell_command`）は変数展開を通らずに引用する別の経路で、
-//! #2286 で扱う
+//! プロジェクト既定の組み立て（`runner_project.rs`）・`tako:shell` の外側の包み
+//! （`platform::shell::declared_shell_command`）・宣言の `tako:cwd` は変数展開を通らずに引用する
+//! 別の経路で、番犬 `issue2286_runner_outer_quote_dialect_watchdog` が見張る（#2286）
 //!
 //! ## A/B（検出力の確かめ方）
 //!

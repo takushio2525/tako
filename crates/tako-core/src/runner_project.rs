@@ -20,7 +20,9 @@
 //! `make` は PowerShell 5.1 でもそのまま通る）。差が出るのは Python の解釈系だけで、
 //! それも [`Platform`] を引数で受けて決める（#1616 / #1655 の作法 = 属性の `cfg` を使わず、
 //! macOS の単体から Windows の解決結果まで固定できる形）。相対パスは `/` 区切りで渡す
-//! （どのツールも Windows で `/` を受け付ける）。
+//! （どのツールも Windows で `/` を受け付ける）。コマンドへ埋める名前（相対パス・パッケージ・
+//! script の名前）は実行ペインのシェルの方言で引用する（`arg`。#2286）ので、空白や `'` を
+//! 含む名前だけは OS で形が違う（POSIX = 単引用符 / PowerShell = バッククオート）。
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -29,7 +31,6 @@ use crate::i18n::Lang;
 use crate::platform::support::Platform;
 use crate::project_root::{self, SearchBounds};
 use crate::runner::RuntimeWords;
-use crate::shell::quote_for_shell;
 
 /// 種別 1 つぶんの行
 pub struct ProjectKind {
@@ -59,8 +60,9 @@ pub struct Followup {
     pub note: &'static str,
     /// 実行ファイルへ渡す引数
     pub args: &'static [&'static str],
-    /// 出力（stdout）で案内を詰め直す。読めない出力なら何も変えない
-    pub refine: fn(&mut ProjectNote, &str),
+    /// 出力（stdout）で案内を詰め直す。読めない出力なら何も変えない。
+    /// `Platform` は案内のコマンドへ埋める値を引用する実行ペインの方言を決める（#2286）
+    pub refine: fn(&mut ProjectNote, &str, Platform),
 }
 
 impl ProjectKind {
@@ -184,13 +186,13 @@ impl ProjectMatch {
         self.notes.iter().any(|n| n.id == f.note).then_some(f)
     }
 
-    /// [`Self::followup`] の答えで案内を詰める
-    pub fn apply_followup(&mut self, stdout: &str) {
+    /// [`Self::followup`] の答えで案内を詰める（`platform` は実行ペインの OS = [`detect`] と同じもの）
+    pub fn apply_followup(&mut self, stdout: &str, platform: Platform) {
         let Some(f) = self.followup() else {
             return;
         };
         for note in self.notes.iter_mut().filter(|n| n.id == f.note) {
-            (f.refine)(note, stdout);
+            (f.refine)(note, stdout, platform);
         }
     }
 }
@@ -333,6 +335,16 @@ pub fn detect(
 }
 
 // ─── 共通の小道具 ──────────────────────────────────────────────────────
+
+/// 組み立てるコマンドへ埋める 1 語（ファイルの相対パス・パッケージ・script の名前）を、
+/// **実行ペインのシェルの方言**で引用する（#2286）。Code Runner の変数展開（`${file}` 等）と
+/// 同じ [`ShellDialect::quote_fragment`](crate::platform::shell_dialect::ShellDialect::quote_fragment)
+/// の 1 実装: POSIX は `quote_for_shell`（#2286 以前と 1 バイトも変わらない）、PowerShell は
+/// 特別な文字の前にだけバッククオート。#2286 以前は両 OS で POSIX の単引用符だったので、
+/// Windows では `'` を含む名前が構文エラー、`,` は配列、先頭の `@` は splatting になっていた
+fn arg(platform: Platform, word: &str) -> String {
+    crate::platform::shell::run_pane_dialect_for(platform).quote_fragment(word)
+}
 
 /// `file` の `root` からの相対パスを部品に分ける（`root` の外なら `None`）
 fn rel_parts(root: &Path, file: &Path) -> Option<Vec<String>> {
@@ -692,22 +704,22 @@ fn plan_cargo(p: &Probe<'_>) -> Option<Planned> {
     let pkg_flag = if root.as_path() == pkg_dir {
         String::new()
     } else {
-        format!(" -p {}", quote_for_shell(&pkg_name))
+        format!(" -p {}", arg(p.platform, &pkg_name))
     };
     let bins = bin_names(pkg_dir, &manifest, &pkg_name);
     // `--bin` は曖昧なときだけ付ける（bin が 1 つ / `default-run` の bin なら不要）
     let bin_flag = |name: &Option<String>| match name {
         Some(n) if bins.len() > 1 && manifest.default_run.as_deref() != Some(n.as_str()) => {
-            format!(" --bin {}", quote_for_shell(n))
+            format!(" --bin {}", arg(p.platform, n))
         }
         _ => String::new(),
     };
     let command = match target {
         CargoTarget::Bin(name) => format!("cargo run{pkg_flag}{}", bin_flag(&name)),
-        CargoTarget::Example(n) => format!("cargo run{pkg_flag} --example {}", quote_for_shell(&n)),
-        CargoTarget::Test(n) => format!("cargo test{pkg_flag} --test {}", quote_for_shell(&n)),
+        CargoTarget::Example(n) => format!("cargo run{pkg_flag} --example {}", arg(p.platform, &n)),
+        CargoTarget::Test(n) => format!("cargo test{pkg_flag} --test {}", arg(p.platform, &n)),
         CargoTarget::AllTests => format!("cargo test{pkg_flag}"),
-        CargoTarget::Bench(n) => format!("cargo bench{pkg_flag} --bench {}", quote_for_shell(&n)),
+        CargoTarget::Bench(n) => format!("cargo bench{pkg_flag} --bench {}", arg(p.platform, &n)),
         CargoTarget::BuildScript => format!("cargo build{pkg_flag}"),
         CargoTarget::Module(filter) => {
             if !bins.is_empty() {
@@ -723,7 +735,7 @@ fn plan_cargo(p: &Probe<'_>) -> Option<Planned> {
                 // 「a bin target must be available」で落ちる。走らせる形は
                 // そのモジュールのテストしか無い
                 match filter {
-                    Some(f) => format!("cargo test{pkg_flag} --lib {}", quote_for_shell(&f)),
+                    Some(f) => format!("cargo test{pkg_flag} --lib {}", arg(p.platform, &f)),
                     None => format!("cargo test{pkg_flag} --lib"),
                 }
             } else {
@@ -802,7 +814,7 @@ fn plan_go(p: &Probe<'_>) -> Option<Planned> {
     let verb = if is_test || not_main { "test" } else { "run" };
     Some(Planned::new(
         root.to_path_buf(),
-        format!("go {verb} {}", quote_for_shell(&pkg)),
+        format!("go {verb} {}", arg(p.platform, &pkg)),
     ))
 }
 
@@ -866,14 +878,14 @@ fn plan_npm(p: &Probe<'_>) -> Option<Planned> {
     let rel = rel_parts(root, p.file)?.join("/");
     let command = if let Some(script) = script_running(&pj, &rel) {
         let pm = node_package_manager(&pj, root, p.bounds);
-        format!("{pm} run {}", quote_for_shell(&script))
+        format!("{pm} run {}", arg(p.platform, &script))
     } else {
         // script に載っていないファイルは単体で走らせる。cwd はパッケージのルート
         // （npm scripts と同じ = `.env` や設定ファイルを `process.cwd()` から読む流儀）。
         // 解釈系は拡張子既定と同じ選び方（node は TS / JSX を解さない）
         match file_ext(p.file).as_str() {
-            "js" | "mjs" | "cjs" => format!("node {}", quote_for_shell(&rel)),
-            _ => format!("npx tsx {}", quote_for_shell(&rel)),
+            "js" | "mjs" | "cjs" => format!("node {}", arg(p.platform, &rel)),
+            _ => format!("npx tsx {}", arg(p.platform, &rel)),
         }
     };
     Some(Planned::new(root.to_path_buf(), command))
@@ -964,7 +976,7 @@ fn plan_python(p: &Probe<'_>) -> Option<Planned> {
     let rel_slash = rel.join("/");
     let name = rel.last()?;
     let command = if is_pytest_file(name) {
-        format!("{py} -m pytest {}", quote_for_shell(&rel_slash))
+        format!("{py} -m pytest {}", arg(p.platform, &rel_slash))
     } else {
         // src レイアウト（`src/<pkg>/…`）は `src` の下がモジュールの根
         let module_parts = if rel.len() > 1 && rel[0] == "src" {
@@ -976,7 +988,7 @@ fn plan_python(p: &Probe<'_>) -> Option<Planned> {
             // パッケージの中のファイルを単体で走らせると相対 import が
             // 「attempted relative import with no known parent package」で落ちる
             Some(module) => format!("{py} -m {module}"),
-            None => format!("{py} {}", quote_for_shell(&rel_slash)),
+            None => format!("{py} {}", arg(p.platform, &rel_slash)),
         }
     };
     Some(Planned::new(root.to_path_buf(), command))
@@ -1009,7 +1021,7 @@ fn plan_dotnet(p: &Probe<'_>) -> Option<Planned> {
         || text.contains("<IsTestProject>true</IsTestProject>");
     let verb = if is_test { "test" } else { "run" };
     let command = match chosen {
-        Some(f) => format!("dotnet {verb} --project {}", quote_for_shell(&f)),
+        Some(f) => format!("dotnet {verb} --project {}", arg(p.platform, &f)),
         None => format!("dotnet {verb}"),
     };
     Some(Planned::new(root.to_path_buf(), command))
@@ -1365,7 +1377,7 @@ fn msg_port_not_selected(lang: Lang) -> String {
 /// その FQBN（とポート）に差し替える。複数なら候補を本文に並べるだけ（どれかは人が決める）。
 /// 形（実測 1.2.0 + 公式の JSON 出力）: `{"detected_ports":[{"matching_boards":[{"name","fqbn"}],
 /// "port":{"address", …}}]}`。基板が繋がっていなければ `matching_boards` が無い
-fn refine_board_note(note: &mut ProjectNote, stdout: &str) {
+fn refine_board_note(note: &mut ProjectNote, stdout: &str, platform: Platform) {
     // 読み方は基板の欄（#1952）と同じ 1 実装
     let Some(ports) = crate::sketch_board::parse_board_list(stdout) else {
         return;
@@ -1385,7 +1397,7 @@ fn refine_board_note(note: &mut ProjectNote, stdout: &str) {
             let port = if address.is_empty() {
                 String::new()
             } else {
-                format!("-p {} ", quote_for_shell(address))
+                format!("-p {} ", arg(platform, address))
             };
             // 案内を作った時点の言語の綴りで入っている（どちらでも差し替える）
             for c in &mut note.commands {
@@ -2146,7 +2158,7 @@ mod tests {
         let board = note(&m, "board_not_selected");
         assert!(board.unless_found.is_none() && board.profile.is_none());
         // スケッチのフォルダを名指す（利用者の端末の cwd はスケッチとは限らない）
-        let sketch = quote_for_shell(&s.base.join("Blink").to_string_lossy());
+        let sketch = crate::shell::quote_for_shell(&s.base.join("Blink").to_string_lossy());
         assert_eq!(board.commands.len(), 1);
         let cmd = &board.commands[0];
         assert!(
@@ -2347,7 +2359,7 @@ mod tests {
             {"matching_boards":[{"name":"Arduino Uno","fqbn":"arduino:avr:uno"}],
              "port":{"address":"/dev/cu.usbmodem1101","protocol":"serial"}}]}"#;
         let mut n = board_note();
-        refine_board_note(&mut n, one);
+        refine_board_note(&mut n, one, Platform::MacOs);
         assert_eq!(
             n.commands,
             vec!["arduino-cli board attach -p /dev/cu.usbmodem1101 -b arduino:avr:uno /s/Blink"]
@@ -2356,7 +2368,7 @@ mod tests {
         // 英語の綴りの案内でも差し替わる
         let mut en = board_note();
         en.commands = vec!["arduino-cli board attach -b <board> /s/Blink".to_string()];
-        refine_board_note(&mut en, one);
+        refine_board_note(&mut en, one, Platform::MacOs);
         assert!(
             en.commands[0].contains("-b arduino:avr:uno"),
             "{:?}",
@@ -2378,7 +2390,7 @@ mod tests {
             ("{}", false),
         ] {
             let mut n = board_note();
-            refine_board_note(&mut n, stdout);
+            refine_board_note(&mut n, stdout, Platform::MacOs);
             assert_eq!(n.commands, board_note().commands, "{stdout}");
             assert_eq!(
                 n.message.contains("v:a:a / B = v:b:b"),
@@ -2405,6 +2417,7 @@ mod tests {
         assert_eq!(f.args, &["board", "list", "--format", "json"]);
         m.apply_followup(
             r#"{"detected_ports":[{"matching_boards":[{"name":"U","fqbn":"arduino:avr:uno"}],"port":{"address":"COM3"}}]}"#,
+            Platform::MacOs,
         );
         assert!(
             note(&m, "board_not_selected").commands[0].contains("-p COM3 -b arduino:avr:uno"),
@@ -2439,6 +2452,230 @@ mod tests {
             assert!(!k.disabled_with(|_| Some("0".into())), "{}", k.id);
             assert!(!k.disabled_with(|_| None), "{}", k.id);
         }
+    }
+
+    /// #2286: コマンドへ埋める名前は実行ペインのシェルの方言で引用する（macOS は #2286 以前と
+    /// 同じ POSIX の形、Windows は PowerShell のバッククオート = Code Runner の変数展開と同じ 1 実装）
+    #[test]
+    fn 名前は実行ペインの方言で引用する_両osの形() {
+        let s = Sandbox::new("2286-forms");
+        s.write(
+            "web/package.json",
+            "{\"name\":\"x\",\"scripts\":{\"it's\":\"node main.js\"}}",
+        );
+        s.write("web/main.js", "");
+        s.write("web/my file.js", "");
+        s.write("web/a,b.js", "");
+        s.write("web/@x.js", "");
+        s.write("go/go.mod", "module x\n");
+        s.write("go/cmd/a b'c$d&e/main.go", "package main\n");
+        s.write("dn/A.fsproj", "<Project/>");
+        s.write("dn/-x.csproj", "<Project/>");
+        s.write("dn/Program.cs", "");
+        // (ファイル, macOS, Windows)。#2286 以前の Windows は macOS と同じ形で、`'it'\''s'` は
+        // PowerShell の構文エラー・`a,b.js` は配列・`@x.js` は splatting・`-x.csproj` は 2 語だった
+        let cases: &[(&str, &str, &str)] = &[
+            ("web/main.js", r"npm run 'it'\''s'", "npm run it`'s"),
+            ("web/my file.js", "node 'my file.js'", "node my` file.js"),
+            ("web/a,b.js", "node a,b.js", "node a`,b.js"),
+            ("web/@x.js", "node @x.js", "node `@x.js"),
+            (
+                "go/cmd/a b'c$d&e/main.go",
+                r"go run './cmd/a b'\''c$d&e'",
+                "go run ./cmd/a` b`'c`$d`&e",
+            ),
+            (
+                "dn/Program.cs",
+                "dotnet run --project -x.csproj",
+                "dotnet run --project `-x.csproj",
+            ),
+        ];
+        for (rel, mac, win) in cases {
+            assert_eq!(
+                s.detect(Platform::MacOs, rel).unwrap().command,
+                *mac,
+                "{rel}"
+            );
+            assert_eq!(
+                s.detect(Platform::Windows, rel).unwrap().command,
+                *win,
+                "{rel}"
+            );
+        }
+        // arduino の追いの問い合わせが案内へ入れるポートも同じ 1 実装
+        let stdout = r#"{"detected_ports":[{"matching_boards":[{"name":"U","fqbn":"a:b:c"}],"port":{"address":"my port"}}]}"#;
+        for (platform, want) in [
+            (Platform::MacOs, "-p 'my port' -b a:b:c"),
+            (Platform::Windows, "-p my` port -b a:b:c"),
+        ] {
+            let mut n = board_note();
+            refine_board_note(&mut n, stdout, platform);
+            assert!(
+                n.commands[0].contains(want),
+                "{platform:?}: {:?}",
+                n.commands
+            );
+        }
+    }
+
+    /// #2286 の実物の検査に使う名前（Windows のファイル名に使えるものだけ。`"` `<` `>` `|` `?` `*`
+    /// は NTFS が許さない）
+    const NAMES_2286: &[&str] = &[
+        "my file",
+        "it's",
+        "$HOME",
+        "a&b",
+        "a;b",
+        "a,b",
+        "@x",
+        "-x",
+        "a`b",
+        "x(1)",
+        "{x}",
+        "#x",
+        "%x",
+        "~x",
+        "it\u{2019}s",
+        "全角\u{3000}空白",
+        "データ解析",
+        "a b'c$d&e",
+    ];
+
+    /// 経路 1（`tako:shell` の外側の包み）と経路 2（プロジェクト既定）の行と、実行ペインのシェルが
+    /// 渡すはずの語。経路 1 は宣言したシェルが受け取る語、経路 2 はコマンドの語
+    fn lines_2286(s: &Sandbox, platform: Platform, names: &[&str]) -> Vec<(String, Vec<String>)> {
+        let words = |w: &[&str]| w.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut out = Vec::new();
+        let mut bodies: Vec<String> = names.iter().map(|n| format!("echo {n}")).collect();
+        bodies.push("echo \"hi\" && echo it's".to_string());
+        for body in &bodies {
+            for (shell, flag) in [("bash", "-c"), ("pwsh", "-Command"), ("fish", "-c")] {
+                out.push((
+                    crate::platform::shell::declared_shell_command(platform, shell, body),
+                    words(&[shell, flag, body]),
+                ));
+            }
+        }
+        for (i, name) in names.iter().enumerate() {
+            s.write(&format!("w{i}/package.json"), "{\"name\":\"x\"}");
+            let js = format!("{name}.js");
+            s.write(&format!("w{i}/{js}"), "");
+            let m = s.detect(platform, &format!("w{i}/{js}")).unwrap();
+            out.push((m.command, words(&["node", &js])));
+            s.write(&format!("g{i}/go.mod"), "module x\n");
+            s.write(&format!("g{i}/cmd/{name}/main.go"), "package main\n");
+            let m = s
+                .detect(platform, &format!("g{i}/cmd/{name}/main.go"))
+                .unwrap();
+            out.push((m.command, words(&["go", "run", &format!("./cmd/{name}")])));
+        }
+        out
+    }
+
+    /// #2286: 経路 1・2 の行を **macOS の実行ペインのシェル（`/bin/sh`）の実物**に読ませ、
+    /// 名前が 1 語のまま元の値で届くこと（`printf` が受け取った語を NUL 区切りで返す）
+    #[cfg(unix)]
+    #[test]
+    fn posixの実物で外側の包みとプロジェクト既定の名前が1語のまま届く() {
+        let s = Sandbox::new("2286-posix");
+        let mut names = NAMES_2286.to_vec();
+        names.push("say \"hi\"");
+        for (line, want) in lines_2286(&s, Platform::MacOs, &names) {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            let out = crate::platform::process::no_console_window(&mut cmd)
+                .arg("-c")
+                .arg(format!("printf '%s\\0' {line}"))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&s.base)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{line}: {out:?}");
+            let got: Vec<String> = String::from_utf8(out.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(str::to_string)
+                .collect();
+            assert_eq!(got, want, "/bin/sh が `{line}` を別の語に割った");
+        }
+    }
+
+    /// #2286: 経路 1・2 の行を **PowerShell の実物**（Windows は 5.1 と 7）に読ませ、名前が 1 語の
+    /// まま元の値で届くこと。行の先頭に引数を書き出す関数 `show` を置いて読ませる（コマンド位置の
+    /// 語も引数として届く）。出力は UTF-16 の符号単位の 16 進で比べる（5.1 の標準出力はコード
+    /// ページで化ける = #1668 と同じ）
+    #[test]
+    #[cfg_attr(
+        not(windows),
+        ignore = "PowerShell の実物が要る（#2286。Windows CI で走る。手元は pwsh があれば --ignored）"
+    )]
+    fn powershell_の実物で外側の包みとプロジェクト既定の名前が1語のまま届く() {
+        let s = Sandbox::new("2286-ps");
+        let hex = |w: &str| {
+            w.encode_utf16()
+                .map(|u| format!("{u:04X}"))
+                .collect::<String>()
+        };
+        let report = r"ForEach-Object { '{0:X4}' -f [int]$_ }";
+        let mut script = format!(
+            "$ErrorActionPreference = 'Stop'\n\
+             function show {{ foreach ($a in $args) {{ Write-Output ('A:' + (-join ([char[]]$a | {report}))) }} }}\n"
+        );
+        let mut want = Vec::new();
+        for (i, (line, words)) in lines_2286(&s, Platform::Windows, NAMES_2286)
+            .into_iter()
+            .enumerate()
+        {
+            script.push_str(&format!(
+                "Write-Output 'BEGIN:{i}'\nshow {line}\nWrite-Output 'END:{i}'\n"
+            ));
+            want.push(format!("BEGIN:{i}"));
+            want.extend(words.iter().map(|w| format!("A:{}", hex(w))));
+            want.push(format!("END:{i}"));
+        }
+        // 5.1 は Windows に必ずある。7（pwsh）は GitHub の runner には必ずあるので CI では必須
+        let on_ci = std::env::var_os("GITHUB_ACTIONS").is_some();
+        let programs: Vec<(&str, bool)> = if cfg!(windows) {
+            vec![("powershell", true), ("pwsh", on_ci)]
+        } else {
+            vec![("pwsh", true)]
+        };
+        let encoded = crate::platform::shell::encode_powershell_command(&script);
+        let mut ran = 0;
+        for (program, required) in programs {
+            let mut cmd = std::process::Command::new(program);
+            crate::platform::process::no_console_window(&mut cmd).args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                &encoded,
+            ]);
+            let out = match cmd.output() {
+                Ok(out) => out,
+                Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("{program} が無いので飛ばす");
+                    continue;
+                }
+                Err(e) => panic!("{program} を起動できない: {e}"),
+            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let got: Vec<&str> = stdout
+                .lines()
+                .map(str::trim_end)
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(
+                got,
+                want,
+                "{program}: 行が 1 語のまま元の値で届いていない\n--- script ---\n{script}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "PowerShell を 1 つも走らせていない");
     }
 
     #[test]

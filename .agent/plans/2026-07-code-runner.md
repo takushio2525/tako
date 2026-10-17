@@ -116,7 +116,10 @@ VSCode Code Runner 相当の機能を tako に載せる。プレビューペイ�
 - PowerShell（Windows の実行ペイン）: 特別な文字の前にだけバッククオート（`` main` tool.c ``）。
   値は `-o ${fileNoExt}.exe` のように語の途中にも埋まるので、単引用符で囲む形は使わない
   （語の先頭の `'main tool'.exe` は文字列のメンバー参照 = 空の引数になる）
-- `tako:shell` を宣言したときは、宣言したシェルの方言で囲む
+- `tako:shell` を宣言したときは、値（本体の中身）は宣言したシェルの方言で囲む。本体全体を包む
+  外側（`bash -c '<本体>'`）は実行ペインのシェルが読むので実行ペインの方言（`declared_shell_command`。#2286）
+- プロジェクト既定（#1656）がコマンドへ埋める名前（相対パス・パッケージ・script の名前）も同じ
+  `quote_fragment` を実行ペインの方言で通す（`runner_project::arg`。#2286）
 
 | 変数 | 展開値 | 例（`/Users/a/src/main tool.c` の場合） |
 |---|---|---|
@@ -130,6 +133,10 @@ VSCode Code Runner 相当の機能を tako に載せる。プレビューペイ�
 - 未知の `${...}` は展開せずそのまま残す（エラーにしない。シェルの `${VAR}` と共存させるため）
 - cwd はファイルのディレクトリで実行されるため、コマンド内では通常 `${fileBase}` /
   `${fileNoExt}` だけで足りる（`${file}` はフルパスが要るツール向け）
+- `tako:cwd` の値はシェルへ渡さずパスとして使うので、両 OS とも**引用せずに**展開する
+  （`runner::declared_cwd_value`。#2286）。値全体を単引用符で囲んだ書き方（`tako:cwd: '/a b'`）は
+  展開の前に外す。#2286 以前の macOS は「引用して展開してから外す」形で、`${fileDir}/build` が
+  空白を含むと `/a b/'/a b'/build` になっていた
 
 ### 1.5 各言語の具体例
 
@@ -307,7 +314,8 @@ direction, ratio, cwd, command, title, auto_close)`）へ抽出し、`RunInterac
   ディレクトリを `SpawnOptions.cwd` に明示指定する（`Split` の cwd 明示指定と同型。
   `dispatch.rs:405-419`）
 - **シェル**: `tako:shell` 指定時は、解決済みコマンド全体を `<shell> -c '<エスケープ済み>'`
-  に包んでから既存の wrapped 形へ渡す（無指定なら従来どおりログインシェルが直接解釈）
+  に包んでから既存の wrapped 形へ渡す（無指定なら従来どおりログインシェルが直接解釈）。
+  フラグ（`-c` / `-Command`）は宣言したシェル、`'<エスケープ済み>'` の引用は実行ペインのシェルの方言（#875 / #2286）
 - **タイトル**: `(>) <fileBase>`（既定プロファイル）/ `(>) <fileBase> [<profile>]`。
   role は設定しない（orchestrator の role 検索と干渉させない。
   `dispatch.rs:436-438` の worker 保護は role ベースなので無関係を保つ）

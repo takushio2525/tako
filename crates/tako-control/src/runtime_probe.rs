@@ -761,7 +761,7 @@ fn apply_project_followup_with(
         budget,
     );
     if let Some(o) = out.into_output().filter(|o| o.status.success()) {
-        project.apply_followup(&String::from_utf8_lossy(&o.stdout));
+        project.apply_followup(&String::from_utf8_lossy(&o.stdout), Platform::current());
     }
 }
 

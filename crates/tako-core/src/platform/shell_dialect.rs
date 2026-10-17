@@ -417,6 +417,19 @@ impl ShellDialect {
         }
     }
 
+    /// 1 個の引数として**必ず囲んで**渡す形（中身は展開されない）。`tako:shell` の宣言で
+    /// 内側のシェルへ渡すコマンド本体（`bash -c '<本体>'`。#2286）に使う。
+    ///
+    /// [`Self::quote_arg`] との違いは、囲む必要が無い語も囲むこと。POSIX の `quote_arg`
+    /// （= `quote_for_shell`）は `ls` を素で返すので、`bash -c 'ls'` が `bash -c ls` に変わる
+    /// （#875 以来の見た目を動かさない）。PowerShell は `quote_arg` と同じ単引用符
+    pub fn enclose_arg(self, word: &str) -> String {
+        match self {
+            Self::Posix => format!("'{}'", word.replace('\'', r"'\''")),
+            Self::PowerShell => ps_quote(word),
+        }
+    }
+
     /// コマンド行の**どこへ埋めても 1 語の一部として読まれる**形にする
     /// （Code Runner の `${file}` 等の展開。#1668）。
     ///

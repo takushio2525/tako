@@ -169,7 +169,7 @@ fn resolve_block_with(
     match project.followup() {
         Some(f) if f.args == sb::LIST_ARGS => {
             if let Some(stdout) = &probed.list_stdout {
-                project.apply_followup(stdout);
+                project.apply_followup(stdout, Platform::current());
             }
         }
         Some(_) => other_followup(project),
