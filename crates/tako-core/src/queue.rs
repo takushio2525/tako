@@ -25,6 +25,19 @@
 //!
 //! 機の値が採れない（Windows は #2000 まで）ときは 2・4・6 を飛ばし、同時数だけで決める。
 //!
+//! ## 見込みと「まだ使っていない見込み」（#2254）
+//!
+//! - **見込み**（1 件の木の最大メモリ）は過去の記録（[`HistoryRow`]。調停役が
+//!   `<data_dir>/resources/history.jsonl` に持つ）から引く: 同じコマンドの直近
+//!   [`HISTORY_EXACT_RUNS`] 回の最大 → 無ければ同じ形（cargo の `--test <名前>` 等を伏せた形）の直近
+//!   [`HISTORY_SHAPE_RUNS`] 回の最大（[`HISTORY_SHAPE_MIN`] 回以上あるとき）→ それも無ければ区分の既定
+//!   （[`estimate`]）。小さい `cargo test --test …` に test の既定 7 GB を当てはめない
+//! - 6 の「まだ使っていない見込み」は**走り出してからピークまで**の分（[`RunningJob::pending_mb`]）。
+//!   ピークを過ぎた処理（見込みに届いた / 過去の記録の山の時刻と自分の最大から [`PEAK_GRACE_SECS`] 過ぎた）は
+//!   0 にする。以前は「見込み − 今の使用量」を最後まで押さえ続け、ピーク後に数百 MB しか使っていない
+//!   `cargo test --workspace` が 7 GB 近くを抱えたまま後ろを 30 分止めた（#2254）。空きは実測なので、
+//!   ピーク後に実際に使っている分は空きから既に減っている。メモリ圧・swap・予約の歯止め（2・4・6）は変えない
+//!
 //! ## 追い越し（#2243）
 //!
 //! 2〜6（枠・メモリ）で入れない件があれば**そこで止まり、後ろも待つ**（資源の追い越しは無し）。
@@ -257,6 +270,311 @@ pub fn cargo_target_dir(
     workspace.or(nearest).map(|d| d.join("target"))
 }
 
+// ===== 過去の記録（#2254。置き場と鍵は #1996 の「過去の所要時間」と同じ = 設計書 §6）=====
+
+/// 見込みを引く同じコマンドの記録の数（直近）
+pub const HISTORY_EXACT_RUNS: usize = 5;
+/// 見込みを引く同じ形の記録の数（直近）
+pub const HISTORY_SHAPE_RUNS: usize = 10;
+/// 同じ形の記録から見込みを引くのに要る数（1 回だけだと形の中の軽い 1 本に引きずられる）
+pub const HISTORY_SHAPE_MIN: usize = 2;
+/// 過去の記録から引いた見込みの下限（MiB）。走査の 2 秒より短い処理の最大は数 MB に見える
+pub const HISTORY_FLOOR_MB: u64 = 256;
+/// 過去の記録から引いた見込みの刻み（MiB。切り上げ）
+pub const HISTORY_STEP_MB: u64 = 128;
+
+/// wrapper が送る過去の記録の鍵。**生の argv とパスは持たない**（ハッシュと表示名だけ）
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HistoryKeys {
+    /// 同じコマンド = 「repo の根 + 正規化した argv」のハッシュ（16 桁の 16 進）
+    pub key: String,
+    /// 同じ形 = cargo の `--test <名前>`・テストの絞り込みなど回ごとに変わる語を伏せた argv のハッシュ
+    /// （cargo だけ。シェルスクリプトや node は中身が軽重さまざまなので形でまとめない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+    /// 表示名（プログラム + サブコマンド = `cargo test`。cargo 以外はプログラムの名前だけ）
+    #[serde(default)]
+    pub name: String,
+}
+
+/// `.git` の在り方（[`repo_identity`] の口）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitEntry {
+    /// ディレクトリ（ふつうの clone）
+    Dir,
+    /// ファイル（worktree / submodule。中身は `gitdir: <path>` の 1 行）
+    File(String),
+}
+
+/// 過去の記録の鍵に使う repo の根（純関数。`git_entry` は「そのディレクトリの `.git` の在り方」を返す口 =
+/// テストで差し替える）。cwd から上へ辿って最初に `.git` があるディレクトリ。git の worktree
+/// （`.git` がファイルで `gitdir: <本体>/.git/worktrees/<名前>`）は**本体の根へ寄せる**（worker が Issue ごとに
+/// 作る worktree で記録を引き継ぐため）。git の外なら cwd
+pub fn repo_identity(cwd: &Path, git_entry: impl Fn(&Path) -> Option<GitEntry>) -> PathBuf {
+    for dir in cwd.ancestors() {
+        match git_entry(dir) {
+            Some(GitEntry::Dir) => return dir.to_path_buf(),
+            Some(GitEntry::File(text)) => {
+                return text
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("gitdir:"))
+                    .and_then(|p| worktree_main_root(&dir.join(p.trim())))
+                    .unwrap_or_else(|| dir.to_path_buf());
+            }
+            None => {}
+        }
+    }
+    cwd.to_path_buf()
+}
+
+/// `<本体>/.git/worktrees/<名前>` → `<本体>`（worktree の gitdir でなければ `None`）
+fn worktree_main_root(gitdir: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = gitdir.components().collect();
+    let i = comps
+        .windows(2)
+        .rposition(|w| w[0].as_os_str() == ".git" && w[1].as_os_str() == "worktrees")?;
+    let root: PathBuf = comps[..i].iter().collect();
+    (!root.as_os_str().is_empty()).then_some(root)
+}
+
+/// cargo のオプションのうち値を次の語に取るもの（形を作るときに値を語として数えない）
+const CARGO_VALUE_FLAGS: &[&str] = &[
+    "-p",
+    "--package",
+    "--test",
+    "--bench",
+    "--example",
+    "--bin",
+    "--features",
+    "-F",
+    "--target",
+    "--target-dir",
+    "--manifest-path",
+    "-j",
+    "--jobs",
+    "--profile",
+    "--color",
+    "--message-format",
+    "--config",
+    "-Z",
+    "--exclude",
+];
+
+/// そのうち形では値を伏せるもの（回ごとに変わる名前・パス）。`-p` の値は伏せない
+/// （パッケージで重さが大きく違う = `-p tako-app` と `-p tako-cli` を同じ形にしない）
+const CARGO_MASKED_FLAGS: &[&str] = &[
+    "--test",
+    "--bench",
+    "--example",
+    "--bin",
+    "--target-dir",
+    "--manifest-path",
+    "--config",
+];
+
+/// cargo の引数（サブコマンド以降も含む `cargo` の後ろ全部）の形とサブコマンド。
+/// 値を伏せるオプションの値・2 語目以降の位置引数（テストの絞り込み）・`--` の後ろの位置引数を `*` にする
+fn cargo_shape(args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut sub: Option<String> = None;
+    let mut after_dashdash = false;
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        i += 1;
+        if after_dashdash {
+            out.push(if w.starts_with('-') {
+                w.into()
+            } else {
+                "*".into()
+            });
+            continue;
+        }
+        if w == "--" {
+            after_dashdash = true;
+            out.push(w.into());
+            continue;
+        }
+        if let Some((flag, _)) = w.split_once('=').filter(|_| w.starts_with("--")) {
+            out.push(if CARGO_MASKED_FLAGS.contains(&flag) {
+                format!("{flag}=*")
+            } else {
+                w.into()
+            });
+            continue;
+        }
+        if w.starts_with('-') || w.starts_with('+') {
+            out.push(w.into());
+            if CARGO_VALUE_FLAGS.contains(&w) {
+                if let Some(v) = args.get(i) {
+                    out.push(if CARGO_MASKED_FLAGS.contains(&w) {
+                        "*".into()
+                    } else {
+                        v.clone()
+                    });
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if sub.is_none() {
+            sub = Some(w.into());
+            out.push(w.into());
+        } else {
+            out.push("*".into());
+        }
+    }
+    (out, sub)
+}
+
+fn hash_words<S: AsRef<str>>(repo: &str, words: &[S]) -> String {
+    let mut buf = Vec::with_capacity(repo.len() + words.len() * 16);
+    buf.extend_from_slice(repo.as_bytes());
+    for w in words {
+        buf.push(0);
+        buf.extend_from_slice(w.as_ref().as_bytes());
+    }
+    format!("{:016x}", crate::fnv::fnv1a64(&buf))
+}
+
+/// 過去の記録の鍵（純関数）。`repo` は [`repo_identity`] の値。argv は前置き（`env` / `nice` / `time`）を
+/// 飛ばし、プログラムは basename に畳んでから数える（`/usr/local/bin/cargo` と `cargo` は同じコマンド）。
+/// 走らせるものが無ければ `None`
+pub fn history_keys(argv: &[String], repo: &str) -> Option<HistoryKeys> {
+    let rest: &[String] = &argv[command_start(argv)..];
+    let program = base(rest.first()?);
+    let mut words: Vec<&str> = vec![program];
+    words.extend(rest[1..].iter().map(String::as_str));
+    let key = hash_words(repo, &words);
+    if program != "cargo" {
+        return Some(HistoryKeys {
+            key,
+            shape: None,
+            name: program.into(),
+        });
+    }
+    let (mut shape, sub) = cargo_shape(&rest[1..]);
+    shape.insert(0, program.into());
+    Some(HistoryKeys {
+        key,
+        shape: Some(hash_words(repo, &shape)),
+        name: sub.map_or_else(|| program.to_string(), |s| format!("{program} {s}")),
+    })
+}
+
+/// 過去の記録の 1 行（`<data_dir>/resources/history.jsonl`。調停役が終わった処理ごとに 1 行足す）。
+/// **生の argv とパスは書かない**（鍵はハッシュ、表示名はプログラム + サブコマンドだけ）。
+/// 欄を足すときは serde の default で旧い行を読めるようにする（読めない行は飛ばす）
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HistoryRow {
+    /// 終わった時刻（Unix 秒）
+    #[serde(default)]
+    pub at: u64,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: JobKind,
+    /// 木の最大メモリ（MiB。調停役の 2 秒ごとの走査の最大）
+    pub peak_mb: u64,
+    /// 最大になった時点（走り出してからの秒数）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_at_s: Option<u64>,
+    /// 走った長さ（秒）
+    #[serde(default)]
+    pub ran_s: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// 見込みの出どころ
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EstimateFrom {
+    /// 区分の既定（記録が無い）
+    #[default]
+    Default,
+    /// 同じコマンドの記録
+    History,
+    /// 同じ形の記録
+    Shape,
+}
+
+impl EstimateFrom {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::History => "history",
+            Self::Shape => "shape",
+        }
+    }
+}
+
+/// 1 件の見込み
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Estimate {
+    /// 見込みメモリ（MiB）
+    pub mb: u64,
+    pub from: EstimateFrom,
+    /// 見込みを引いた記録の数（既定なら 0）
+    pub runs: u32,
+    /// 記録の中で最大になった時点の最大（走り出してからの秒数。[`RunningJob::expected_peak_at_s`]）
+    pub peak_at_s: Option<u64>,
+}
+
+impl Estimate {
+    /// 区分の既定
+    pub fn default_for(kind: JobKind) -> Self {
+        Self {
+            mb: kind.default_estimate_mb(),
+            from: EstimateFrom::Default,
+            runs: 0,
+            peak_at_s: None,
+        }
+    }
+}
+
+/// 1 件の見込み（純関数）: 同じコマンドの直近 [`HISTORY_EXACT_RUNS`] 回の最大 → 同じ形の直近
+/// [`HISTORY_SHAPE_RUNS`] 回の最大（[`HISTORY_SHAPE_MIN`] 回以上）→ 区分の既定。
+/// `history` は古い順（ファイルへ足した順）。最大 0 の行（走査の前に終わった）は数えない
+pub fn estimate(kind: JobKind, keys: Option<&HistoryKeys>, history: &[HistoryRow]) -> Estimate {
+    let Some(keys) = keys.filter(|k| !k.key.is_empty()) else {
+        return Estimate::default_for(kind);
+    };
+    let exact: Vec<&HistoryRow> = history
+        .iter()
+        .rev()
+        .filter(|r| r.peak_mb > 0 && r.key == keys.key)
+        .take(HISTORY_EXACT_RUNS)
+        .collect();
+    if !exact.is_empty() {
+        return from_rows(&exact, EstimateFrom::History);
+    }
+    if let Some(shape) = keys.shape.as_deref() {
+        let rows: Vec<&HistoryRow> = history
+            .iter()
+            .rev()
+            .filter(|r| r.peak_mb > 0 && r.shape.as_deref() == Some(shape))
+            .take(HISTORY_SHAPE_RUNS)
+            .collect();
+        if rows.len() >= HISTORY_SHAPE_MIN {
+            return from_rows(&rows, EstimateFrom::Shape);
+        }
+    }
+    Estimate::default_for(kind)
+}
+
+fn from_rows(rows: &[&HistoryRow], from: EstimateFrom) -> Estimate {
+    let peak = rows.iter().map(|r| r.peak_mb).max().unwrap_or(0);
+    Estimate {
+        mb: (peak.div_ceil(HISTORY_STEP_MB) * HISTORY_STEP_MB).max(HISTORY_FLOOR_MB),
+        from,
+        runs: rows.len() as u32,
+        peak_at_s: rows.iter().filter_map(|r| r.peak_at_s).max(),
+    }
+}
+
 // ===== 優先度 =====
 
 /// 優先度（S2 は並びに効くだけ。変更・エイジング・役割の既定は #1996）
@@ -328,6 +646,9 @@ pub struct JobWire {
     /// 子の終了コード（done のとき。シグナルで終わったら 128 + 番号）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// 過去の記録の鍵（#2254。ハッシュと表示名だけ。旧い wrapper は送らない = 区分の既定）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryKeys>,
 }
 
 // ===== 上限 =====
@@ -486,7 +807,7 @@ pub struct MachineView {
 }
 
 /// 実行中の 1 件
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunningJob {
     pub id: u64,
     /// 見込みメモリ（MiB）
@@ -496,6 +817,48 @@ pub struct RunningJob {
     pub target_dir: Option<String>,
     /// 停滞中（枠を返している。同時数とメモリの予約に数えない）
     pub stalled: bool,
+    /// 走り出してからの木の最大（MiB。走査がまだなら 0。#2254）
+    pub peak_mb: u64,
+    /// 走り出してからの秒数（#2254）
+    pub ran_s: u64,
+    /// 自分の最大を最後に更新した時点（走り出してからの秒数。走査がまだなら `None`。#2254）
+    pub peak_seen_s: Option<u64>,
+    /// 過去の記録で最大になった時点（走り出してからの秒数の、記録の中の最大。記録が無ければ `None`。#2254）
+    pub expected_peak_at_s: Option<u64>,
+}
+
+/// ピークを過ぎたとみなすまでの猶予（秒。#2254）。走査は 2 秒ごとなので、過去の山の時刻の揺れと
+/// 取りこぼしを覆う長さにする
+pub const PEAK_GRACE_SECS: u64 = 60;
+
+impl RunningJob {
+    /// ピークを過ぎたか（#2254）: 見込みに届いた、または過去の記録の山の時刻から [`PEAK_GRACE_SECS`] 過ぎて
+    /// 自分の最大の更新からも同じだけ過ぎた（= 過去にその後で山が来た回が無く、自分も伸びていない）。
+    /// 走査がまだ（最大 0）なら過ぎていない
+    pub fn peak_passed(&self) -> bool {
+        if self.peak_mb == 0 {
+            return false;
+        }
+        if self.peak_mb >= self.estimate_mb {
+            return true;
+        }
+        let past_history = self
+            .expected_peak_at_s
+            .is_some_and(|h| self.ran_s >= h.saturating_add(PEAK_GRACE_SECS));
+        let past_own = self
+            .peak_seen_s
+            .is_some_and(|p| self.ran_s >= p.saturating_add(PEAK_GRACE_SECS));
+        past_history && past_own
+    }
+
+    /// まだ使っていない見込み（MiB）: 走り出してからピークまでは「見込み − 今の使用量」、ピークを過ぎたら 0。
+    /// `release_after_peak = false` は修正前（最後まで「見込み − 今の使用量」= #2254 の A/B）
+    pub fn pending_mb(&self, release_after_peak: bool) -> u64 {
+        if release_after_peak && self.peak_passed() {
+            return 0;
+        }
+        self.estimate_mb.saturating_sub(self.used_mb.unwrap_or(0))
+    }
 }
 
 /// 待ちの 1 件
@@ -537,11 +900,15 @@ pub enum WaitReason {
         unmanaged: u32,
         max: u32,
     },
-    /// 空きメモリが足りない
+    /// 空きメモリが足りない（`need_mb` = `pending_mb` + `estimate_mb`）
     Memory {
         available_mb: u64,
         need_mb: u64,
         reserve_mb: u64,
+        /// 実行中の処理がまだ使っていない見込みの合計（#2254）
+        pending_mb: u64,
+        /// この処理の見込み（#2254）
+        estimate_mb: u64,
     },
     /// 自分より前に並んでいる処理の後
     Ahead,
@@ -600,12 +967,26 @@ impl WaitReason {
                 available_mb,
                 need_mb,
                 reserve_mb,
-            } => format!(
-                "空きメモリ不足（空き {}・必要 {}・予約 {}）",
-                gb(*available_mb),
-                gb(*need_mb),
-                gb(*reserve_mb)
-            ),
+                pending_mb,
+                estimate_mb,
+            } => {
+                // 必要の内訳は実行中の分があるときだけ（何が押さえているかを読めるように。#2254）
+                let breakdown = if *pending_mb > 0 {
+                    format!(
+                        " = 実行中のまだ使っていない見込み {} + この処理の見込み {}",
+                        gb(*pending_mb),
+                        gb(*estimate_mb)
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "空きメモリ不足（空き {}・必要 {}{breakdown}・予約 {}）",
+                    gb(*available_mb),
+                    gb(*need_mb),
+                    gb(*reserve_mb)
+                )
+            }
             Self::Ahead => "前に並んでいる処理の後".into(),
             Self::OvertakeLimit { max } => format!(
                 "同じ target dir を待つ処理が追い越しの上限（{max} 件）に達した（その処理が入るまで後ろも待つ）"
@@ -629,6 +1010,9 @@ pub struct AdmitInput<'a> {
     /// target dir 待ちの件を後ろに追い越させる（#2243。`false` = 修正前の「先頭が入れなければ
     /// 後ろも待つ」。調停役は env `TAKO_2243_LEGACY=1` のときだけ `false` にする）
     pub overtake: bool,
+    /// ピークを過ぎた実行中の「まだ使っていない見込み」を 0 にする（#2254。`false` = 修正前の
+    /// 「見込み − 今の使用量」を最後まで押さえる。調停役は env `TAKO_2254_LEGACY=1` のときだけ `false`）
+    pub release_after_peak: bool,
 }
 
 /// [`admit`] の結果
@@ -724,9 +1108,10 @@ fn check(
     }
     if let Some(available) = input.machine.and_then(|m| m.available_mb) {
         // 走り出したばかりでまだ見込みまで使っていない分は、これから空きから減る
+        // （ピークを過ぎた処理は 0 = #2254。今使っている分は空きの実測から既に減っている）
         let pending: u64 = active
             .iter()
-            .map(|r| r.estimate_mb.saturating_sub(r.used_mb.unwrap_or(0)))
+            .map(|r| r.pending_mb(input.release_after_peak))
             .sum();
         let need = pending + head.estimate_mb;
         if available < need + input.limits.reserve_mb {
@@ -734,6 +1119,8 @@ fn check(
                 available_mb: available,
                 need_mb: need,
                 reserve_mb: input.limits.reserve_mb,
+                pending_mb: pending,
+                estimate_mb: head.estimate_mb,
             });
         }
     }
@@ -804,7 +1191,7 @@ pub fn admit(input: &AdmitInput<'_>) -> Admission {
                     estimate_mb: job.estimate_mb,
                     used_mb: None,
                     target_dir: job.target_dir.clone(),
-                    stalled: false,
+                    ..RunningJob::default()
                 });
                 continue;
             }
@@ -902,8 +1289,7 @@ mod tests {
             id,
             estimate_mb: 3 * GIB_MB,
             used_mb: Some(3 * GIB_MB),
-            target_dir: None,
-            stalled: false,
+            ..RunningJob::default()
         }
     }
 
@@ -933,6 +1319,7 @@ mod tests {
             unmanaged,
             regathering: false,
             overtake: true,
+            release_after_peak: true,
         }
     }
 
@@ -1233,6 +1620,8 @@ mod tests {
                 available_mb: 7 * GIB_MB - 1,
                 need_mb: 3 * GIB_MB,
                 reserve_mb: 4 * GIB_MB,
+                pending_mb: 0,
+                estimate_mb: 3 * GIB_MB,
             })
         );
         // 走り出したばかり（まだ 1 GB しか使っていない）の分は空きから引いて見る
@@ -1594,13 +1983,30 @@ mod tests {
             WaitReason::OvertakeLimit { max: 6 }.text(),
             "同じ target dir を待つ処理が追い越しの上限（6 件）に達した（その処理が入るまで後ろも待つ）"
         );
-        assert!(WaitReason::Memory {
-            available_mb: 5 * GIB_MB,
-            need_mb: 3 * GIB_MB,
-            reserve_mb: 4 * GIB_MB
-        }
-        .text()
-        .contains("空き 5.0 GB"));
+        assert_eq!(
+            WaitReason::Memory {
+                available_mb: 5 * GIB_MB,
+                need_mb: 3 * GIB_MB,
+                reserve_mb: 4 * GIB_MB,
+                pending_mb: 0,
+                estimate_mb: 3 * GIB_MB,
+            }
+            .text(),
+            "空きメモリ不足（空き 5.0 GB・必要 3.0 GB・予約 4.0 GB）"
+        );
+        // 実行中が押さえている分があれば、必要の内訳を言う（#2254）
+        assert_eq!(
+            WaitReason::Memory {
+                available_mb: 8 * GIB_MB,
+                need_mb: 14 * GIB_MB,
+                reserve_mb: 4 * GIB_MB,
+                pending_mb: 7 * GIB_MB,
+                estimate_mb: 7 * GIB_MB,
+            }
+            .text(),
+            "空きメモリ不足（空き 8.0 GB・必要 14.0 GB = 実行中のまだ使っていない見込み 7.0 GB + \
+             この処理の見込み 7.0 GB・予約 4.0 GB）"
+        );
     }
 
     #[test]
@@ -1610,5 +2016,370 @@ mod tests {
         assert_eq!(j.priority, Priority::Normal);
         let back = serde_json::to_value(&j).unwrap();
         assert!(back.get("child_pid").is_none(), "空の欄は送らない: {back}");
+        assert!(
+            back.get("history").is_none(),
+            "鍵の無い 1 件は送らない: {back}"
+        );
+        assert_eq!(j.history, None, "旧い wrapper は鍵を送らない = 区分の既定");
+    }
+
+    // ===== #2254: 実行中の予約と過去の記録の見込み =====
+
+    /// 36 GB の機の既定（同時 3・予約 3.6 GB）
+    fn limits_36gb() -> Limits {
+        effective_limits(&LimitSettings::default(), Some(36 * GIB_MB))
+    }
+
+    fn machine_mb(available_mb: u64, pressure: Pressure) -> MachineView {
+        MachineView {
+            total_mb: 36 * GIB_MB,
+            available_mb: Some(available_mb),
+            pressure: Some(pressure),
+            swap_used_mb: Some(0),
+        }
+    }
+
+    /// 10/17 の本番: `cargo test --workspace`（見込み 7 GB）が最大 7.3 GB を過ぎて今 0.3 GB
+    fn past_peak_test(id: u64) -> RunningJob {
+        RunningJob {
+            id,
+            estimate_mb: TEST_ESTIMATE_MB,
+            used_mb: Some(300),
+            peak_mb: 7475,
+            ran_s: 600,
+            peak_seen_s: Some(240),
+            ..RunningJob::default()
+        }
+    }
+
+    fn wait_est(id: u64, at: u64, estimate_mb: u64) -> WaitingJob {
+        WaitingJob {
+            estimate_mb,
+            ..wait(id, at)
+        }
+    }
+
+    fn admit_with(
+        machine: MachineView,
+        running: &[RunningJob],
+        waiting: &[WaitingJob],
+        release_after_peak: bool,
+    ) -> Admission {
+        admit(&AdmitInput {
+            release_after_peak,
+            ..input(Some(machine), limits_36gb(), running, waiting, 0)
+        })
+    }
+
+    #[test]
+    fn issue2254_ピークを過ぎた実行中は見込みを押さえない() {
+        let run = [past_peak_test(1)];
+        // 後ろが test の既定 7 GB のまま: 空き 11 GB で、修正前は「必要 13.7 GB」で待ち・修正後は入る
+        let w = [wait_est(10, 1, TEST_ESTIMATE_MB)];
+        let m = machine_mb(11 * GIB_MB, Pressure::Normal);
+        let legacy = admit_with(m, &run, &w, false);
+        assert!(
+            matches!(
+                legacy.blocked,
+                Some(WaitReason::Memory { need_mb, pending_mb, .. })
+                    if need_mb == 6868 + TEST_ESTIMATE_MB && pending_mb == 6868
+            ),
+            "修正前は見込み − 今の使用量（6.7 GB）を押さえ続ける: {legacy:?}"
+        );
+        assert_eq!(admit_with(m, &run, &w, true).grants, vec![10]);
+        // 後ろが過去の記録の 1.1 GB（小さい cargo test --test …）: 空き 8 GB でも入る
+        let w = [wait_est(10, 1, 1152)];
+        let m = machine_mb(8 * GIB_MB, Pressure::Normal);
+        assert!(admit_with(m, &run, &w, false).grants.is_empty());
+        assert_eq!(admit_with(m, &run, &w, true).grants, vec![10]);
+    }
+
+    #[test]
+    fn issue2254_ピークの前は今まで通り押さえる() {
+        // 走り出したばかり（最大 2 GB・今 1.5 GB・記録なし）: 見込み − 今の使用量を押さえる
+        let ramp = RunningJob {
+            id: 1,
+            estimate_mb: TEST_ESTIMATE_MB,
+            used_mb: Some(1536),
+            peak_mb: 2048,
+            ran_s: 3600,
+            peak_seen_s: Some(10),
+            ..RunningJob::default()
+        };
+        assert!(
+            !ramp.peak_passed(),
+            "記録が無ければ見込みに届くまで過ぎていない"
+        );
+        assert_eq!(ramp.pending_mb(true), TEST_ESTIMATE_MB - 1536);
+        // 走査の前（最大 0）は丸ごと押さえる
+        let fresh = RunningJob {
+            used_mb: None,
+            peak_mb: 0,
+            ..ramp.clone()
+        };
+        assert_eq!(fresh.pending_mb(true), TEST_ESTIMATE_MB);
+        // 見込みに届けば過ぎた（届いた瞬間は修正前も 0）
+        let reached = RunningJob {
+            used_mb: Some(TEST_ESTIMATE_MB),
+            peak_mb: TEST_ESTIMATE_MB,
+            ..ramp.clone()
+        };
+        assert_eq!(
+            (reached.pending_mb(true), reached.pending_mb(false)),
+            (0, 0)
+        );
+        let w = [wait_est(10, 1, 1152)];
+        // 押さえている 5.5 GB + 1.1 GB + 予約 3.6 GB = 10.2 GB > 空き 10 GB → 待つ
+        let a = admit_with(machine_mb(10 * GIB_MB, Pressure::Normal), &[ramp], &w, true);
+        assert!(
+            matches!(a.blocked, Some(WaitReason::Memory { pending_mb, .. }) if pending_mb == TEST_ESTIMATE_MB - 1536),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn issue2254_過去の山の時刻を過ぎて自分も伸びていなければ過ぎた() {
+        // 今回は見込み（記録の最大 7 GB）より小さい山（3 GB）で終わった: 記録の山の時刻（240 秒）と
+        // 自分の最大の更新から 60 秒たつまでは押さえる
+        let job = |ran_s: u64, peak_seen_s: u64| RunningJob {
+            id: 1,
+            estimate_mb: TEST_ESTIMATE_MB,
+            used_mb: Some(400),
+            peak_mb: 3 * GIB_MB,
+            ran_s,
+            peak_seen_s: Some(peak_seen_s),
+            expected_peak_at_s: Some(240),
+            ..RunningJob::default()
+        };
+        assert!(!job(299, 100).peak_passed(), "記録の山の時刻 + 60 秒の手前");
+        assert!(job(300, 100).peak_passed(), "記録の山の時刻 + 60 秒");
+        assert!(
+            !job(400, 350).peak_passed(),
+            "自分の最大がまだ伸びている（更新から 60 秒たっていない）"
+        );
+        assert!(job(410, 350).peak_passed());
+        assert_eq!(job(300, 100).pending_mb(true), 0);
+        assert_eq!(
+            job(300, 100).pending_mb(false),
+            TEST_ESTIMATE_MB - 400,
+            "修正前"
+        );
+        // 記録の山の時刻が無い（区分の既定）なら、時間では過ぎない
+        let no_history = RunningJob {
+            expected_peak_at_s: None,
+            ..job(3600, 10)
+        };
+        assert!(!no_history.peak_passed());
+    }
+
+    #[test]
+    fn issue2254_本当に空きが無ければ修正後も待つ() {
+        let run = [past_peak_test(1)];
+        let w = [wait_est(10, 1, 1152)];
+        // メモリ圧 warn: 実行中が居る間は入れない
+        let a = admit_with(machine_mb(30 * GIB_MB, Pressure::Warn), &run, &w, true);
+        assert_eq!(a.blocked, Some(WaitReason::PressureWarn));
+        // critical
+        let a = admit_with(machine_mb(30 * GIB_MB, Pressure::Critical), &run, &w, true);
+        assert_eq!(a.blocked, Some(WaitReason::PressureCritical));
+        // 空きが実際に足りない: 1.1 GB + 予約 3.6 GB = 4.7 GB > 空き 4 GB
+        let a = admit_with(machine_mb(4 * GIB_MB, Pressure::Normal), &run, &w, true);
+        assert_eq!(
+            a.blocked,
+            Some(WaitReason::Memory {
+                available_mb: 4 * GIB_MB,
+                need_mb: 1152,
+                reserve_mb: default_reserve_mb(Some(36 * GIB_MB)),
+                pending_mb: 0,
+                estimate_mb: 1152,
+            })
+        );
+        // swap が警戒線以上
+        let mut m = machine_mb(30 * GIB_MB, Pressure::Normal);
+        m.swap_used_mb = Some(3 * GIB_MB);
+        let a = admit_with(m, &run, &w, true);
+        assert!(matches!(a.blocked, Some(WaitReason::Swap { .. })), "{a:?}");
+    }
+
+    fn row(key: &str, shape: Option<&str>, peak_mb: u64, peak_at_s: Option<u64>) -> HistoryRow {
+        HistoryRow {
+            key: key.into(),
+            shape: shape.map(str::to_string),
+            name: "cargo test".into(),
+            kind: JobKind::Test,
+            peak_mb,
+            peak_at_s,
+            ..HistoryRow::default()
+        }
+    }
+
+    fn keys(key: &str, shape: Option<&str>) -> HistoryKeys {
+        HistoryKeys {
+            key: key.into(),
+            shape: shape.map(str::to_string),
+            name: "cargo test".into(),
+        }
+    }
+
+    #[test]
+    fn issue2254_見込みは同じコマンドの直近5回の最大() {
+        // 古い順。直近 5 回（2,3,4,5,6 番目）の最大 = 1,500 → 128 MB 刻みへ切り上げて 1,536
+        let h: Vec<HistoryRow> = [9000, 1200, 1500, 900, 1100, 1000]
+            .iter()
+            .enumerate()
+            .map(|(i, mb)| row("k", None, *mb, Some(i as u64 * 10)))
+            .collect();
+        let e = estimate(JobKind::Test, Some(&keys("k", None)), &h);
+        assert_eq!(
+            e,
+            Estimate {
+                mb: 1536,
+                from: EstimateFrom::History,
+                runs: 5,
+                peak_at_s: Some(50),
+            },
+            "6 回前の 9 GB は数えない"
+        );
+        // 最大 0（走査の前に終わった）の行は数えない・下限 256 MB
+        let h = vec![row("k", None, 0, None), row("k", None, 40, Some(1))];
+        let e = estimate(JobKind::Test, Some(&keys("k", None)), &h);
+        assert_eq!((e.mb, e.runs), (HISTORY_FLOOR_MB, 1));
+        // 記録の無いコマンド・鍵を送らない旧い wrapper は区分の既定
+        assert_eq!(
+            estimate(JobKind::Test, Some(&keys("other", None)), &h),
+            Estimate::default_for(JobKind::Test)
+        );
+        assert_eq!(
+            estimate(JobKind::Build, None, &h),
+            Estimate::default_for(JobKind::Build)
+        );
+        // 記録が既定より大きければそちら（見込みは実測に寄せる）
+        let h = vec![row("k", None, 7700, None)];
+        assert_eq!(estimate(JobKind::Test, Some(&keys("k", None)), &h).mb, 7808);
+    }
+
+    #[test]
+    fn issue2254_同じ形の記録は2回からで同じコマンドが優先() {
+        let h = vec![
+            row("a", Some("s"), 1100, Some(30)),
+            row("b", Some("s"), 1400, Some(50)),
+        ];
+        // 初めての `cargo test --test <新しい名前>`: 同じ形の 2 回の最大
+        let e = estimate(JobKind::Test, Some(&keys("new", Some("s"))), &h);
+        assert_eq!(
+            (e.mb, e.from, e.runs, e.peak_at_s),
+            (1408, EstimateFrom::Shape, 2, Some(50))
+        );
+        // 形の記録が 1 回だけなら区分の既定
+        let e = estimate(JobKind::Test, Some(&keys("new", Some("s"))), &h[..1]);
+        assert_eq!(e.from, EstimateFrom::Default);
+        // 同じコマンドの記録があればそれ
+        let e = estimate(JobKind::Test, Some(&keys("a", Some("s"))), &h);
+        assert_eq!((e.mb, e.from), (1152, EstimateFrom::History));
+    }
+
+    fn git(
+        map: &'static [(&'static str, Option<&'static str>)],
+    ) -> impl Fn(&Path) -> Option<GitEntry> {
+        move |dir: &Path| {
+            map.iter()
+                .find(|(d, _)| Path::new(d) == dir)
+                .map(|(_, file)| match file {
+                    Some(text) => GitEntry::File((*text).into()),
+                    None => GitEntry::Dir,
+                })
+        }
+    }
+
+    #[test]
+    fn issue2254_repoの根はworktreeを本体へ寄せる() {
+        let m: &'static [_] = &[
+            ("/u/dev/tako", None),
+            (
+                "/u/dev/tako-wt-2254",
+                Some("gitdir: /u/dev/tako/.git/worktrees/tako-wt-2254\n"),
+            ),
+            ("/u/dev/sub/mod", Some("gitdir: ../.git/modules/mod\n")),
+        ];
+        assert_eq!(
+            repo_identity(Path::new("/u/dev/tako/crates/x"), git(m)),
+            PathBuf::from("/u/dev/tako")
+        );
+        assert_eq!(
+            repo_identity(Path::new("/u/dev/tako-wt-2254/crates"), git(m)),
+            PathBuf::from("/u/dev/tako"),
+            "worktree は本体の根"
+        );
+        assert_eq!(
+            repo_identity(Path::new("/u/dev/sub/mod/src"), git(m)),
+            PathBuf::from("/u/dev/sub/mod"),
+            "worktree でない gitdir（submodule）はそのディレクトリ"
+        );
+        assert_eq!(
+            repo_identity(Path::new("/tmp/x"), git(m)),
+            PathBuf::from("/tmp/x"),
+            "git の外は cwd"
+        );
+    }
+
+    #[test]
+    fn issue2254_鍵は同じコマンドで揃い形は回ごとの名前を伏せる() {
+        let k = |s: &str| history_keys(&argv(s), "/u/dev/tako").unwrap();
+        // 前置きとプログラムのパスは数えない
+        assert_eq!(
+            k("cargo test --workspace").key,
+            k("env CARGO_BUILD_JOBS=4 /x/bin/cargo test --workspace").key
+        );
+        assert_ne!(
+            k("cargo test --workspace").key,
+            k("cargo build --workspace").key
+        );
+        assert_ne!(
+            k("cargo test --workspace").key,
+            history_keys(&argv("cargo test --workspace"), "/u/dev/other")
+                .unwrap()
+                .key,
+            "別の repo は別の鍵"
+        );
+        // 形: --test の名前・テストの絞り込み・--target-dir は伏せ、-p は伏せない
+        let a = k("cargo test -p tako-control --test issue2254_a -- --test-threads=4");
+        let b = k("cargo test -p tako-control --test=issue1994_b -- --test-threads=4");
+        let c = k("cargo test -p tako-control --test issue2243_c -- --test-threads=4");
+        assert_ne!(a.key, c.key);
+        assert_eq!(a.shape, c.shape, "--test の名前だけが違う");
+        assert_ne!(a.shape, b.shape, "--test=名前 は別の書き方（形も別）");
+        assert_ne!(
+            k("cargo test -p tako-app --test x").shape,
+            k("cargo test -p tako-cli --test x").shape,
+            "パッケージで重さが違うので -p は伏せない"
+        );
+        assert_eq!(
+            k("cargo test -p tako-core queue::tests").shape,
+            k("cargo test -p tako-core usage::").shape,
+            "絞り込みは伏せる"
+        );
+        assert_eq!(a.name, "cargo test");
+        assert_eq!(k("cargo +nightly -q t -p a").name, "cargo t");
+        // cargo の外は形でまとめない（スクリプトは中身で重さが違う）
+        let s = k("bash scripts/test-x.sh");
+        assert_eq!((s.shape, s.name.as_str()), (None, "bash"));
+        assert!(history_keys(&[], "/r").is_none());
+        // 鍵に生の argv とパスは載らない（16 桁の 16 進）
+        let v = serde_json::to_string(&a).unwrap();
+        assert!(!v.contains("tako-control") && !v.contains('/'), "{v}");
+        assert_eq!(a.key.len(), 16);
+    }
+
+    #[test]
+    fn issue2254_記録の1行は欄が欠けても読める() {
+        let r: HistoryRow = serde_json::from_str(r#"{"key":"k","peak_mb":5}"#).unwrap();
+        assert_eq!(
+            (r.key.as_str(), r.peak_mb, r.kind),
+            ("k", 5, JobKind::Other)
+        );
+        let full = row("k", Some("s"), 1200, Some(30));
+        let back: HistoryRow =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
     }
 }

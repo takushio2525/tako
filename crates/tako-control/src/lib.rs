@@ -70,6 +70,7 @@ pub mod peer_messaging;
 pub mod platform;
 pub mod protocol;
 pub mod queue;
+pub mod queue_history;
 pub mod queue_wrapper;
 pub mod reach;
 pub mod remote;

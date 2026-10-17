@@ -27,6 +27,8 @@ DeliveryState: Sent, Launched, Delivered, Failed
 DesiredState: since
 Device: id, name, login, node_name, role, created_at, last_seen
 DevicesFile: devices
+HistoryRow: at, key, shape, name, kind, peak_mb, peak_at_s, ran_s, exit_code
+JobKind: Build, Test, Browser, Node, Gui, Other
 KeyFrom: Account, ConfigDir
 LastMessage: id, t, session, model, fast, tokens
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows, shelved_tabs
