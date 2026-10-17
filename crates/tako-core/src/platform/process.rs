@@ -317,17 +317,16 @@ mod tests {
     /// CI の Windows で回るのが実機の証拠になる
     #[test]
     fn issue2275_看取った直後の子はハンドルが残っていても居ない() {
+        // 眠るだけの子（Windows は ping で眠る）。起動は 1 か所で抑止を通す（#628 の番犬の数え方）
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("ping", &["-n", "30", "127.0.0.1"])
+        } else {
+            ("sleep", &["30"])
+        };
         for round in 0..20 {
-            let mut cmd = if cfg!(windows) {
-                let mut c = Command::new("ping");
-                c.args(["-n", "30", "127.0.0.1"]);
-                c
-            } else {
-                let mut c = Command::new("sleep");
-                c.arg("30");
-                c
-            };
-            let mut child = no_console_window(cmd.stdout(std::process::Stdio::null()))
+            let mut cmd = Command::new(program);
+            cmd.args(args).stdout(std::process::Stdio::null());
+            let mut child = no_console_window(&mut cmd)
                 .spawn()
                 .expect("眠るだけの子を起こせる");
             let pid = child.id();
