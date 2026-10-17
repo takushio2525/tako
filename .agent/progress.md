@@ -20,27 +20,6 @@
 
 ---
 
-## 2026-10-16（#2199: 委任台帳の `issue` とカタログの `issues` の先頭を、ラベルに書いた主の Issue にした）
-- `extract_issues` を書いた順へ・A/B `TAKO_2199_LEGACY=1`・`scripts/test-ledger-primary-issue-2199.sh` 26 PASS・フィールド不変。PR #2207
-
-## 2026-10-16（#2200: usage 分析 S1 = tako mod の報告から利用制限の観測を `usage/limits.jsonl` へ・ログインの鍵は accountUuid の塩付きハッシュ・`tako usage`）
-- `scripts/test-usage-limits-2200.sh` 31 PASS・A/B `TAKO_2192_S1_LEGACY=1`・カタログ +91 B。10/17 00:50 に本番へ入れて記録開始を確認。PR #2208
-
-## 2026-10-17（#1790 項目 1: 製品ファイルの理由の無い範囲添字 100 件を仕分け、番犬 `issue1790_byte_index_repo_watchdog` を `crates/*/src/` 全体へ）
-- 判定は `range_index::sites` へ移して #2043 と共有。本番の経路で多バイトで落ちるものは 0 件・偽 LSP の `%xx` の panic を A/B 付きで修正。PR #2210
-
-## 2026-10-17（#2209: ipc の fd 数えテストが 120 秒で落ちる真因は XNU の half-close の起こしの取りこぼし = 46.7 万往復に 1 回）
-- EOF は 500 ms で区切り、来なければ完全に閉じて fd の数で見届ける。A/B `TAKO_2209_LEGACY=1`・製品コード不変。PR #2212
-
-## 2026-10-17（#2201: usage 分析 S2 = 会話記録の使用量の索引 `<data_dir>/usage/` と `tako usage --by/--window`・MCP `tako_sessions` usage の by / window / account）
-- 実データで参照集計とトークン完全一致（37 日）・初回 4.4 GB を 4.1 秒 / RSS 72 MB・カタログ +514 B。PR #2214
-
-## 2026-10-17（#1790 項目 2: `truncate_path_middle` の末尾省略・`trim_detail`・`prompt_head` を固定値テストで固定してから `truncate_chars` へ寄せる）
-- 総当たり A/B の差は「畳んだ後が max + 1 文字ちょうど」の 44 件だけ（同じ幅で原文を返す）・注入で固定値テスト 5 本が落ちる。PR #2215
-
-## 2026-10-17（#2213: #2161 の番犬も XNU の half-close の起こしの取りこぼしで 120 秒落ちうる → FIN 待ちを 500 ms で区切り、新しい接続で往復をやり直す）
-- A/B `TAKO_2213_LEGACY=1`（120 秒で落ちる）・製品コード不変。PR #2216
-
 ## 2026-10-17（#1838: setup の打ち切りテストで probe_timeouts が空の間欠 = 偽の子の初回 exec の検査が 30 秒の上限を食っていた）
 - 偽の子を作った時点で空打ち・A/B `TAKO_1838_LEGACY=1` で修正前 10/10 落ち → 修正後 0/10・製品コード不変。PR #2218
 
@@ -79,3 +58,24 @@
 
 ## 2026-10-17（#2230: persist.log と画面の読めない理由を serde の素の文言から「種類 + 行・列」へ = `load_issue::{json,yaml}_error_reason`・番犬 `issue2230_serde_reason_watchdog`）
 - 型違いの目印の値で A/B `TAKO_2230_LEGACY=1`（settings / profiles / projects.yaml で値の件数 0）。PR #2237
+
+## 2026-10-17（#1905: MCP カタログの折り返しで和文と英字が詰まる形・意味を並べた enum の漏れ（config_share の unlink ほか 5 件）を番犬に、説明文 72 本を圧縮して 203,726 → 194,512 B（残り 10,288 B））
+- PR #2241
+
+## 2026-10-17（#1970: 隔離 GUI の既定で本番の env を落とし・自動リネームを止め・claude の設定 dir を本物へ向けない + 番犬が検証スクリプトの持ち込みを file:line で名指す）
+- 実経路 新 17/0・旧ヘルパ 3/14。番犬が見つけた持ち込み 5 本（verify-claude-mcp ほか）を修正。PR #2242
+
+## 2026-10-17（#2239: 共有のテスト用レジストリへ固定のペイン番号で積むテスト 15 本と layout の 88888 を `unused_id` へ・番犬に `tabs` / `active_tab`）
+- 注入で修正前 15 本中 12 本落ち → 修正後 0 本・製品コード不変。PR #2245
+
+## 2026-10-17（#2243: `tako queue` の先頭が target dir 待ちの間、別の target dir の後ろが空き枠へ先に入る = 枠・メモリでは追い越さない・同じ dir は直列・1 件の待ちの追い越しは累計 同時数 × 2 まで）
+- A/B `TAKO_2243_LEGACY=1`・`scripts/test-queue-head-of-line-2243.sh`・番犬 `issue2243_queue_head_of_line_watchdog`・待ちの理由を件ごとに（status `waiting[].reason`）。PR #2251
+
+## 2026-10-17（#2238: UTF-8 でない settings.json / run-configs.json / ui.json も `LoadIssue::read_failed`（= `quarantine_raw`）でバイトのまま番号付きの退避へ。番犬の `SLOT_KNOWN` は空）
+- A/B `TAKO_2238_LEGACY=1`・`scripts/test-nonutf8-quarantine-2238.sh`（修正前 11 NG → 修正後 46 PASS）・`tako migrate` は言語を `peek_lang_setting` で引く。PR #2253
+
+## 2026-10-17（#2233: 黙った既定落としの残り = 引き継ぎの後任（専用プロファイルが無い / 読めないときも止めない）と `tako solo` は「立てて警告」、self / supervisor status / setup の表示は読むだけで `warnings`、PWA の「+ master」は起動結果に警告を表示）
+- A/B `TAKO_2233_LEGACY=1`・結合 2 本 + 番犬の注入 8 → 23 種・e2e 115 passed・カタログ増 0 B。残りの経路は #2256。PR #2249
+
+## 2026-10-17（#1891: check-health に tako mod の項目 = `claude_mod` 節（`tako mod --json` と同じキー・同じ値・同じ行の関数）・報告の無い理由をコマンド行と起動時の env で 1 つに決める `classify_no_report`）
+- `tako mod` も背景の段で仕上げる（`OffloadJob::ModStatus`）・上限 8 ペイン・A/B `TAKO_1891_LEGACY=1`・実経路 48 PASS・カタログ +74 B。PR #2250
