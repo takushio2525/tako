@@ -314,16 +314,28 @@ pub fn master_corpus() -> String {
 /// プレースホルダはプロファイルで解決するので、prompt に焼かれている値
 /// （引き継ぎ閾値・タブ命名規約）と guide の記述がずれない
 pub fn json(topic: Option<&str>, profile_name: &str) -> Result<Value, String> {
-    let profile = super::load_profile_of(super::ProfileKind::Master, profile_name)
-        .unwrap_or_else(|_| super::Profile::default());
-    match topic.map(str::trim).filter(|t| !t.is_empty()) {
-        None => Ok(json!({
+    // #2256: 読めないプロファイルでも手順書は既定値で引ける（止めない）が、既定で組み立てたことを
+    // `warnings` へ出し、個人ルール（local-rules）は「無い」ではなく「読めない」と返す。
+    // 読むだけ（退避は起動の経路と `tako migrate` が持つ）
+    let (profile, unreadable) = super::read_for_judgment(super::ProfileKind::Master, profile_name);
+    let warning = unreadable.map(|why| {
+        format!(
+            "{why}。手順書の値（引き継ぎの閾値など）はこのファイルではなく組み込み既定で組み立てた。\
+             個人ルールの on-demand 部（local-rules）は読めていない。直すと次の呼び出しから効く"
+        )
+    });
+    let text_of = |g: &Guide| match &warning {
+        Some(w) if g.topic == LOCAL_RULES => local_rules_unreadable(w),
+        _ => profile.render_prompt_placeholders(&g.body_raw(&profile)),
+    };
+    let mut out = match topic.map(str::trim).filter(|t| !t.is_empty()) {
+        None => json!({
             "profile": profile_name,
             "count": GUIDES.len(),
             "topics": GUIDES
                 .iter()
                 .map(|g| {
-                    let text = profile.render_prompt_placeholders(&g.body_raw(&profile));
+                    let text = text_of(g);
                     json!({
                         "topic": g.topic,
                         "title": g.title,
@@ -336,13 +348,13 @@ pub fn json(topic: Option<&str>, profile_name: &str) -> Result<Value, String> {
             "hint": HINT.text(),
             "hint_ja": HINT.ja(),
             "hint_en": HINT.en(),
-        })),
+        }),
         Some(t) => {
             let g = find(t).ok_or_else(|| {
                 format!("未知の topic: {t}（引けるのは {}）", topics().join(" / "))
             })?;
-            let text = profile.render_prompt_placeholders(&g.body_raw(&profile));
-            Ok(json!({
+            let text = text_of(g);
+            json!({
                 "profile": profile_name,
                 "topic": g.topic,
                 "title": g.title,
@@ -350,9 +362,31 @@ pub fn json(topic: Option<&str>, profile_name: &str) -> Result<Value, String> {
                 "lines": text.lines().count(),
                 "est_tokens": budget::estimate_tokens(&text),
                 "text": text,
-            }))
+            })
         }
+    };
+    // 読めたときは載らない（正常時の応答は不変。#2233 の supervisor status と同じ作法）
+    if let Some(w) = warning {
+        out["warnings"] = json!([w]);
     }
+    Ok(out)
+}
+
+/// 個人ルールの on-demand 部の topic 名（#1477）
+const LOCAL_RULES: &str = "local-rules";
+
+/// プロファイルを読めないときの `local-rules` の本文（#2256）。
+///
+/// [`NO_LOCAL_RULES`]（「無い・全部 prompt に載っている」）を返すと、master は on-demand 部の
+/// ルールが**存在しない**と受け取って動く。読めない = 中身が分からない、と本人に伝え、
+/// 推測で埋めずに利用者へ知らせるよう求める
+fn local_rules_unreadable(detail: &str) -> String {
+    format!(
+        "Your operator's local rules could NOT be read, because the profile that holds them is \
+         unreadable. The on-demand part of `prompt_blocks.append` is unknown: do not assume there \
+         are none, and do not guess them. Tell the user in your next reply, quoting the detail \
+         below, and ask them to fix the file.\n\nDetail: {detail}\n"
+    )
 }
 
 #[cfg(test)]

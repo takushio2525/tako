@@ -445,6 +445,10 @@ pub fn git_resolve_agent_started(agent: &str, pane: u64) -> String {
         format!("Started {agent} in pane {pane} (delivering prompt)")
     )
 }
+/// 解消エージェントは立ったが黙らせない理由の 1 行（#2256。本文は dispatch の理由文そのまま）
+pub fn git_resolve_agent_warning(warning: &str) -> String {
+    tr!(format!("警告: {warning}"), format!("Warning: {warning}"))
+}
 
 // --- ユーザー向けタスク（tasks ビュー。#1450 の分割 B2。キー: panel.tasks_*） ---
 

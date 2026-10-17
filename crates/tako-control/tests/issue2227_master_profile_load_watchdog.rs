@@ -31,6 +31,15 @@
 //!    `load_for_display`（**読むだけ** = 退避しない）を通り、理由を `warnings` / 画面の行へ出す。
 //!    `handoff_policy_for`（GUI の周期判定）は出し先が無いので対象外（判断は doc と PR #2233）
 //!
+//! # #2256 で広げた範囲（#2233 の残り）
+//!
+//! 9. worker の spawn・コンフリクト解消エージェント（`resolve_caller_profile_with_role`）が
+//!    `load_caller_profile`（default の起動と同じ退避つきの読み方）で読み、止めずに立てた理由を
+//!    応答の `warnings` と persist.log（`[spawn]` / `[git-resolve]`）へ出す
+//! 10. adopt の起動時プロファイル・`orchestrator guide`・master / solo 本人の自動復帰の既定が
+//!     `read_for_judgment`（**読むだけ** = 退避しない）を通り、理由を応答の `warnings`
+//!     （guide は `local-rules` の本文も「読めない」へ・CLI は `警告:` 行）/ persist.log へ出す
+//!
 //! # 見逃す側へ倒れないための作り
 //!
 //! 窓が採れていることを [`走査が空振りしていない`] で固定し、[`逆戻りを名指しできる`] で
@@ -47,6 +56,7 @@ const ORCH: &str = "crates/tako-control/src/orchestrator/mod.rs";
 const CLI: &str = "crates/tako-cli/src/main.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const SETUP: &str = "crates/tako-cli/src/setup.rs";
+const GUIDE: &str = "crates/tako-control/src/orchestrator/guide.rs";
 
 /// 読み込みで**使ってはいけない**握りつぶし
 const SWALLOWS: &[&str] = &[
@@ -95,6 +105,7 @@ struct Sources {
     cli: String,
     dispatch: String,
     setup: String,
+    guide: String,
 }
 
 fn sources(root: &Path) -> Sources {
@@ -104,6 +115,7 @@ fn sources(root: &Path) -> Sources {
         cli: production(CLI, &read(root, CLI)),
         dispatch: production(DISPATCH, &read(root, DISPATCH)),
         setup: production(SETUP, &read(root, SETUP)),
+        guide: production(GUIDE, &read(root, GUIDE)),
     }
 }
 
@@ -140,6 +152,46 @@ fn lines_with(at: usize, window: &[&str], needle: &str) -> Vec<usize> {
         .filter(|(_, l)| is_code(l) && l.contains(needle))
         .map(|(i, _)| at + i)
         .collect()
+}
+
+/// 関数の窓に要るもの・あってはいけないものの宣言（#2256 の経路で使う）
+struct Rule {
+    fn_needle: &'static str,
+    /// 窓に要るもの（欠けたら関数の宣言行を名指し）と、欠けたときの理由
+    needs: &'static [(&'static str, &'static str)],
+    /// 窓のコード行にあってはいけないもの（あればその行を名指し）と理由
+    bans: &'static [(&'static str, &'static str)],
+}
+
+fn scan_rules(file: &'static str, src: &str, rules: &[Rule], out: &mut Vec<Offender>) {
+    for rule in rules {
+        let Some((at, window)) = fn_window(src, rule.fn_needle) else {
+            out.push(Offender {
+                file,
+                line: 0,
+                why: format!("`{}` が見つからない（走査が空振り）", rule.fn_needle),
+            });
+            continue;
+        };
+        for (need, why) in rule.needs {
+            if !window_has(&window, need) {
+                out.push(Offender {
+                    file,
+                    line: at,
+                    why: (*why).to_string(),
+                });
+            }
+        }
+        for (ban, why) in rule.bans {
+            for line in lines_with(at, &window, ban) {
+                out.push(Offender {
+                    file,
+                    line,
+                    why: (*why).to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// master の起動の入口が直接使ってはいけない読み方（修正前の形）
@@ -324,6 +376,33 @@ fn scan_launch(src: &str) -> Vec<Offender> {
         }
     }
 
+    // 9. master / solo 本人ではないエージェントを立てる経路の読み込み（#2256）
+    let mut rules_out = Vec::new();
+    scan_rules(
+        LAUNCH,
+        src,
+        &[Rule {
+            fn_needle: "pub fn load_caller_profile(",
+            needs: &[
+                (
+                    "profile_base_at(",
+                    "呼び出し元のプロファイルを default の起動と同じ読み方（`profile_base_at` = 退避つき）で \
+                     読んでいない = 読めない中身が保全されず理由も無い（#2256）",
+                ),
+                (
+                    "warning: Some(",
+                    "読めないプロファイルを既定で立てるのに warning を持たない = worker / 解消エージェントが \
+                     黙って組み込み既定で立つ（#2256）",
+                ),
+            ],
+            bans: &[],
+        }],
+        &mut rules_out,
+    );
+    for o in rules_out {
+        push(o.line, o.why);
+    }
+
     // 5. 応答（スマホの「+ master」）に warnings を載せる
     match fn_window(src, "pub fn to_json(") {
         None => push(0, "`to_json` が見つからない（走査が空振り）".into()),
@@ -423,6 +502,71 @@ fn scan_orchestrator(src: &str) -> Vec<Offender> {
             }
         }
     }
+    // 10. 判定・表示の経路の読み込み（#2256）は読むだけで、理由を返す
+    match fn_window(src, "pub fn read_for_judgment(") {
+        None => push(
+            0,
+            "`read_for_judgment` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if !window_has(&window, "read_profile_base_at(") {
+                push(
+                    at,
+                    "判定の経路の読み込みが継承元と同じ判定（`read_profile_base_at`）を通っていない（#2256）"
+                        .into(),
+                );
+            }
+            for (i, line) in window.iter().enumerate() {
+                if !is_code(line) {
+                    continue;
+                }
+                let quarantines = line.contains("quarantine_unreadable(")
+                    || (line.contains("profile_base_at(")
+                        && !line.contains("read_profile_base_at("));
+                if quarantines {
+                    push(
+                        at + i,
+                        "判定の経路が退避つきの読み方を使っている = 判定のたびに書き込む（#2256）"
+                            .into(),
+                    );
+                }
+                if let Some(bad) = SWALLOWS.iter().find(|s| line.contains(**s)) {
+                    push(
+                        at + i,
+                        format!("判定の経路の読み込みで `{bad}` を使っている = 理由を握りつぶす（#2256）"),
+                    );
+                }
+            }
+        }
+    }
+    let mut rules_out = Vec::new();
+    scan_rules(
+        ORCH,
+        src,
+        &[Rule {
+            fn_needle: "pub fn master_pane_limit_resume_decision(",
+            needs: &[(
+                "read_for_judgment(",
+                "自動復帰の既定が判定の読み込み（`read_for_judgment`）を通っていない = 読めない \
+                 プロファイルで全体の既定に落ちたことを黙る（#2256）",
+            )],
+            bans: &[
+                (
+                    "Profile::load(",
+                    "自動復帰の既定が `Profile::load(..)` を直接使っている = 読めないプロファイルを \
+                     黙って既定へ落とす修正前の形（#2256）",
+                ),
+                (
+                    "load_solo_profile(",
+                    "自動復帰の既定が `load_solo_profile(..)` を直接使っている = 修正前の形（#2256）",
+                ),
+            ],
+        }],
+        &mut rules_out,
+    );
+    for o in rules_out {
+        push(o.line, o.why);
+    }
     match fn_window(src, "fn missing_project_profile_reason_from(") {
         None => push(
             0,
@@ -471,6 +615,20 @@ fn scan_cli(src: &str) -> Vec<Offender> {
             });
         }
     }
+    // 10. `tako orchestrator guide`（#2256）は読めない理由を `警告:` 行で画面へ
+    scan_rules(
+        CLI,
+        src,
+        &[Rule {
+            fn_needle: "fn orchestrator_guide_local(",
+            needs: &[(
+                "eprintln!(\"警告: {w}\")",
+                "guide が読めないプロファイルの理由を `警告:` 行で画面へ出していない（#2256）",
+            )],
+            bans: &[],
+        }],
+        &mut out,
+    );
     if let Some((at, window)) = fn_window(src, "fn orchestrator_master(") {
         if !window_has(&window, "eprintln!(\"警告: {w}\")") {
             out.push(Offender {
@@ -542,6 +700,103 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
             }
         }
     }
+    // 9. / 10. #2256 の経路
+    scan_rules(
+        DISPATCH,
+        src,
+        &[
+            Rule {
+                fn_needle: "fn resolve_caller_profile_with_role(",
+                needs: &[(
+                    "master_launch::load_caller_profile(",
+                    "spawn / 解消エージェントの読み込みが `load_caller_profile` を通っていない（#2256）",
+                )],
+                bans: &[(
+                    "Profile::load(",
+                    "呼び出し元のプロファイルを `Profile::load(..)` で直接読んでいる = 読めない default を \
+                     黙って組み込み既定へ落とす修正前の形（#2256）",
+                )],
+            },
+            Rule {
+                fn_needle: "fn dispatch_orchestrator_spawn(",
+                needs: &[
+                    (
+                        "warning: profile_warning",
+                        "spawn が読み込みの warning を受け取っていない（#2256）",
+                    ),
+                    (
+                        "if let Some(w) = profile_warning {",
+                        "spawn が読み込みの warning を出していない（#2256）",
+                    ),
+                    (
+                        "\"profile_unreadable\"",
+                        "spawn が既定で立てた理由を応答の `warnings` へ載せていない = 呼んだ master に \
+                         見えない（#2256）",
+                    ),
+                    (
+                        "persist_log(&format!(\"[spawn]",
+                        "spawn が既定で立てた理由を persist.log へ残していない（#2256）",
+                    ),
+                ],
+                bans: &[],
+            },
+            Rule {
+                fn_needle: "fn dispatch_git_resolve_agent(",
+                needs: &[
+                    (
+                        "warning: profile_warning",
+                        "解消エージェントが読み込みの warning を受け取っていない（#2256）",
+                    ),
+                    (
+                        "v[\"warnings\"] = json!([w]);",
+                        "解消エージェントが既定で立てた理由を応答の `warnings` へ載せていない（#2256）",
+                    ),
+                    (
+                        "persist_log(&format!(\"[git-resolve]",
+                        "解消エージェントが既定で立てた理由を persist.log へ残していない（#2256）",
+                    ),
+                ],
+                bans: &[],
+            },
+            Rule {
+                fn_needle: "fn dispatch_orchestrator_adopt(",
+                needs: &[
+                    (
+                        "read_for_judgment(",
+                        "adopt の起動時プロファイルが判定の読み込み（`read_for_judgment`）を通っていない（#2256）",
+                    ),
+                    (
+                        "warnings.extend(launched_note)",
+                        "adopt が組み込み既定と比べて判断したことを `warnings` へ出していない（#2256）",
+                    ),
+                ],
+                bans: &[(
+                    "Profile::load(&launched_as",
+                    "adopt の起動時プロファイルを `Profile::load(..)` で直接読んでいる = 修正前の形（#2256）",
+                )],
+            },
+            Rule {
+                fn_needle: "fn apply_master_pane_profile_defaults(",
+                needs: &[
+                    (
+                        "master_pane_limit_resume_decision(",
+                        "自動復帰の既定を理由つきの判定（`master_pane_limit_resume_decision`）で \
+                         引いていない（#2256）",
+                    ),
+                    (
+                        "if let Some(note) = unreadable {",
+                        "自動復帰の既定を読めないプロファイルの代わりに既定で決めた理由を persist.log へ \
+                         出していない（#2256）",
+                    ),
+                ],
+                bans: &[(
+                    "master_pane_limit_resume_setting(",
+                    "理由を落とす `master_pane_limit_resume_setting` を使っている = 修正前の形（#2256）",
+                )],
+            },
+        ],
+        &mut out,
+    );
     for fn_needle in [
         "fn dispatch_orchestrator_self(",
         "fn dispatch_orchestrator_supervisor(",
@@ -608,6 +863,46 @@ fn scan_setup(src: &str) -> Vec<Offender> {
     out
 }
 
+/// 10. `orchestrator guide`（#2256）
+fn scan_guide(src: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    scan_rules(
+        GUIDE,
+        src,
+        &[Rule {
+            fn_needle: "pub fn json(",
+            needs: &[
+                (
+                    "read_for_judgment(",
+                    "guide が判定の読み込み（`read_for_judgment`）を通っていない（#2256）",
+                ),
+                (
+                    "local_rules_unreadable(",
+                    "読めないプロファイルの `local-rules` が「無い」を返す = master が個人ルールを \
+                     存在しないと受け取って動く（#2256）",
+                ),
+                (
+                    "out[\"warnings\"]",
+                    "guide が既定で組み立てたことを `warnings` へ出していない（#2256）",
+                ),
+            ],
+            bans: &[
+                (
+                    "load_profile_of(",
+                    "guide がプロファイルを `load_profile_of(..)` で直接読んでいる = 読めないプロファイルを \
+                     黙って既定へ落とす修正前の形（#2256）",
+                ),
+                (
+                    "Profile::default()",
+                    "guide が読めないプロファイルを `Profile::default()` へ黙って落としている（#2256）",
+                ),
+            ],
+        }],
+        &mut out,
+    );
+    out
+}
+
 fn all(s: &Sources) -> Vec<String> {
     scan_launch(&s.launch)
         .iter()
@@ -615,6 +910,7 @@ fn all(s: &Sources) -> Vec<String> {
         .chain(scan_cli(&s.cli).iter())
         .chain(scan_dispatch(&s.dispatch).iter())
         .chain(scan_setup(&s.setup).iter())
+        .chain(scan_guide(&s.guide).iter())
         .map(Offender::report)
         .collect()
 }
@@ -644,6 +940,24 @@ fn 走査が空振りしていない() {
         ),
         (SETUP, &s.setup, "fn print_next_steps("),
         (SETUP, &s.setup, "fn profile_summary_lines("),
+        (LAUNCH, &s.launch, "pub fn load_caller_profile("),
+        (ORCH, &s.orch, "pub fn read_for_judgment("),
+        (ORCH, &s.orch, "pub fn master_pane_limit_resume_decision("),
+        (CLI, &s.cli, "fn orchestrator_guide_local("),
+        (
+            DISPATCH,
+            &s.dispatch,
+            "fn resolve_caller_profile_with_role(",
+        ),
+        (DISPATCH, &s.dispatch, "fn dispatch_orchestrator_spawn("),
+        (DISPATCH, &s.dispatch, "fn dispatch_git_resolve_agent("),
+        (DISPATCH, &s.dispatch, "fn dispatch_orchestrator_adopt("),
+        (
+            DISPATCH,
+            &s.dispatch,
+            "fn apply_master_pane_profile_defaults(",
+        ),
+        (GUIDE, &s.guide, "pub fn json("),
     ] {
         assert!(
             fn_window(src, needle).is_some(),
@@ -657,7 +971,7 @@ fn 現行実装は違反ゼロ() {
     let found = all(&sources(&workspace_root()));
     assert!(
         found.is_empty(),
-        "読めない default.yaml で黙って組み込み既定へ落ちない（#2227 / #2233）の不変条件に違反: \
+        "読めない default.yaml で黙って組み込み既定へ落ちない（#2227 / #2233 / #2256）の不変条件に違反: \
          {found:#?}"
     );
 }
@@ -701,6 +1015,7 @@ fn assert_named(base: &Sources, inj: &Injection) {
         CLI => &mut injected.cli,
         DISPATCH => &mut injected.dispatch,
         SETUP => &mut injected.setup,
+        GUIDE => &mut injected.guide,
         other => panic!("未知のファイル: {other}"),
     };
     *target = replace_in_fn(target, inj.fn_needle, inj.from, inj.to);
@@ -908,6 +1223,143 @@ fn 逆戻りを名指しできる() {
             from: "let (profile, note) = tako_control::orchestrator::load_for_display(",
             to: "let (profile, note) = (Profile::load(\"default\").unwrap_or_default(), None::<String>); let _ = (",
             marker: "Profile::load(\"default\")",
+        },
+        // ── #2256 ──
+        // 注入 24: spawn / 解消エージェントの読み込みが退避つきの読み方を通らない（修正前の黙った既定）
+        Injection {
+            rel: LAUNCH,
+            fn_needle: "pub fn load_caller_profile(",
+            from: "match orchestrator::profile_base_at(kind, &path) {",
+            to: "match Ok::<Profile, String>(Profile::load(name).unwrap_or_default()) {",
+            marker: "pub fn load_caller_profile(",
+        },
+        // 注入 25: 読めないのに warning を持たない
+        Injection {
+            rel: LAUNCH,
+            fn_needle: "pub fn load_caller_profile(",
+            from: "warning: Some(format!(",
+            to: "warning: None, _w: (format!(",
+            marker: "pub fn load_caller_profile(",
+        },
+        // 注入 26: spawn の呼び出し元の解決が修正前そのもの
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn resolve_caller_profile_with_role(",
+            from: "crate::orchestrator::master_launch::load_caller_profile(name, launching)",
+            to: "crate::orchestrator::master_launch::LaunchProfile { profile: crate::orchestrator::Profile::load(name).unwrap_or_default(), warning: None }",
+            marker: "Profile::load(name)",
+        },
+        // 注入 27: spawn が理由を応答へ載せない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_spawn(",
+            from: "\"kind\": \"profile_unreadable\",",
+            to: "\"kind\": \"other\",",
+            marker: "fn dispatch_orchestrator_spawn(",
+        },
+        // 注入 28: spawn が理由を persist.log へ残さない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_spawn(",
+            from: "crate::diag::persist_log(&format!(\"[spawn] pane={}: {w}\", new_id.as_u64()));",
+            to: "let _ = &w;",
+            marker: "fn dispatch_orchestrator_spawn(",
+        },
+        // 注入 29: 解消エージェントが理由を応答へ載せない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_git_resolve_agent(",
+            from: "v[\"warnings\"] = json!([w]);",
+            to: "let _ = w;",
+            marker: "fn dispatch_git_resolve_agent(",
+        },
+        // 注入 30: 解消エージェントが理由を persist.log へ残さない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_git_resolve_agent(",
+            from: "crate::diag::persist_log(&format!(\"[git-resolve] pane={}: {w}\", new_id.as_u64()));",
+            to: "let _ = w;",
+            marker: "fn dispatch_git_resolve_agent(",
+        },
+        // 注入 31: adopt の起動時プロファイルが修正前そのもの
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_adopt(",
+            from: "orchestrator::read_for_judgment(orchestrator::ProfileKind::Master, &launched_as);",
+            to: "(orchestrator::Profile::load(&launched_as).unwrap_or_default(), None::<String>);",
+            marker: "Profile::load(&launched_as)",
+        },
+        // 注入 32: adopt が既定と比べたことを warnings へ出さない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_adopt(",
+            from: "warnings.extend(launched_note);",
+            to: "let _ = launched_note;",
+            marker: "fn dispatch_orchestrator_adopt(",
+        },
+        // 注入 33: 自動復帰の既定が修正前そのもの
+        Injection {
+            rel: ORCH,
+            fn_needle: "pub fn master_pane_limit_resume_decision(",
+            from: "let (profile, why) = read_for_judgment(kind, name);",
+            to: "let (profile, why) = (Profile::load(name).unwrap_or_default(), None::<String>);",
+            marker: "Profile::load(name)",
+        },
+        // 注入 34: 自動復帰の既定を理由を落とす旧 API で引く
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn apply_master_pane_profile_defaults(",
+            from: "crate::orchestrator::master_pane_limit_resume_decision(role);",
+            to: "(crate::orchestrator::master_pane_limit_resume_setting(role), None::<String>);",
+            marker: "master_pane_limit_resume_setting(role)",
+        },
+        // 注入 35: 自動復帰の既定の理由を persist.log へ出さない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn apply_master_pane_profile_defaults(",
+            from: "if let Some(note) = unreadable {",
+            to: "if let Some(note) = None::<String> {",
+            marker: "fn apply_master_pane_profile_defaults(",
+        },
+        // 注入 36: guide が修正前そのもの
+        Injection {
+            rel: GUIDE,
+            fn_needle: "pub fn json(",
+            from: "super::read_for_judgment(super::ProfileKind::Master, profile_name);",
+            to: "(super::load_profile_of(super::ProfileKind::Master, profile_name).unwrap_or_else(|_| super::Profile::default()), None::<String>);",
+            marker: "load_profile_of(",
+        },
+        // 注入 37: 読めないときの local-rules が「無い」を返す
+        Injection {
+            rel: GUIDE,
+            fn_needle: "pub fn json(",
+            from: "Some(w) if g.topic == LOCAL_RULES => local_rules_unreadable(w),",
+            to: "Some(_) if false => String::new(),",
+            marker: "pub fn json(",
+        },
+        // 注入 38: guide が warnings を出さない
+        Injection {
+            rel: GUIDE,
+            fn_needle: "pub fn json(",
+            from: "out[\"warnings\"] = json!([w]);",
+            to: "let _ = w;",
+            marker: "pub fn json(",
+        },
+        // 注入 39: CLI の guide が `警告:` 行を出さない
+        Injection {
+            rel: CLI,
+            fn_needle: "fn orchestrator_guide_local(",
+            from: "eprintln!(\"警告: {w}\");",
+            to: "let _ = w;",
+            marker: "fn orchestrator_guide_local(",
+        },
+        // 注入 40: 判定の経路が退避つきの読み方を使う（判定のたびに書き込む）
+        Injection {
+            rel: ORCH,
+            fn_needle: "pub fn read_for_judgment(",
+            from: "match read_profile_base_at(kind, &path) {",
+            to: "match profile_base_at(kind, &path) {",
+            marker: "match profile_base_at(kind, &path) {",
         },
     ] {
         assert_named(&s, &inj);
