@@ -21,6 +21,16 @@
 //! 5. warning が画面（CLI の `警告:` 行・応答の `warnings`）と master 本人の system prompt
 //!    （`with_startup_warning`）へ届く
 //!
+//! # #2233 で広げた範囲（同じ根の残り）
+//!
+//! 6. 引き継ぎの後任（`dispatch_orchestrator_handoff`）が `load_successor_profile`
+//!    （= `load_profile`）で読み、警告を応答の `warnings` と後任の system prompt へ渡す
+//! 7. `tako solo`（CLI）が `load_solo`（solo の default も `load_default_at` = 退避つき・
+//!    persist.log）で読み、`警告:` 行と solo 本人の system prompt へ渡す
+//! 8. 表示・判定だけの経路（`orchestrator self` / `supervisor status` / `tako setup` の表示）が
+//!    `load_for_display`（**読むだけ** = 退避しない）を通り、理由を `warnings` / 画面の行へ出す。
+//!    `handoff_policy_for`（GUI の周期判定）は出し先が無いので対象外（判断は doc と PR #2233）
+//!
 //! # 見逃す側へ倒れないための作り
 //!
 //! 窓が採れていることを [`走査が空振りしていない`] で固定し、[`逆戻りを名指しできる`] で
@@ -35,6 +45,8 @@ mod production_range;
 const LAUNCH: &str = "crates/tako-control/src/orchestrator/master_launch.rs";
 const ORCH: &str = "crates/tako-control/src/orchestrator/mod.rs";
 const CLI: &str = "crates/tako-cli/src/main.rs";
+const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
+const SETUP: &str = "crates/tako-cli/src/setup.rs";
 
 /// 読み込みで**使ってはいけない**握りつぶし
 const SWALLOWS: &[&str] = &[
@@ -81,6 +93,8 @@ struct Sources {
     launch: String,
     orch: String,
     cli: String,
+    dispatch: String,
+    setup: String,
 }
 
 fn sources(root: &Path) -> Sources {
@@ -88,6 +102,8 @@ fn sources(root: &Path) -> Sources {
         launch: production(LAUNCH, &read(root, LAUNCH)),
         orch: production(ORCH, &read(root, ORCH)),
         cli: production(CLI, &read(root, CLI)),
+        dispatch: production(DISPATCH, &read(root, DISPATCH)),
+        setup: production(SETUP, &read(root, SETUP)),
     }
 }
 
@@ -126,12 +142,17 @@ fn lines_with(at: usize, window: &[&str], needle: &str) -> Vec<usize> {
         .collect()
 }
 
-/// 1. 起動の入口（CLI / `plan`）が共有の読み込みを通り、自前の握りつぶしを持たない
+/// master の起動の入口が直接使ってはいけない読み方（修正前の形）
+const MASTER_BADS: &[&str] = &["Profile::load(", "Profile::default()"];
+
+/// 起動の入口（CLI / `plan` / 引き継ぎの後任 / `tako solo`）が共有の読み込みを通り、
+/// 自前の握りつぶしを持たない（縛る項目の 1. / 6. / 7.）
 fn scan_entry(
     file: &'static str,
     src: &str,
     fn_needle: &str,
     loader: &str,
+    bads: &[&str],
     out: &mut Vec<Offender>,
 ) {
     let Some((at, window)) = fn_window(src, fn_needle) else {
@@ -147,18 +168,18 @@ fn scan_entry(
             file,
             line: at,
             why: format!(
-                "`{loader}` を通っていない = CLI / スマホ / 返答の配送で読み方が食い違う（#2227）"
+                "`{loader}` を通っていない = 起動の経路ごとに読み方が食い違う（#2227 / #2233）"
             ),
         });
     }
-    for bad in ["Profile::load(", "Profile::default()"] {
+    for &bad in bads {
         for line in lines_with(at, &window, bad) {
             out.push(Offender {
                 file,
                 line,
                 why: format!(
                     "起動の入口が `{bad}` を直接使っている = 読めない default.yaml を黙って \
-                     組み込み既定へ落とす修正前の形（#2227）"
+                     組み込み既定へ落とす修正前の形（#2227 / #2233）"
                 ),
             });
         }
@@ -167,8 +188,8 @@ fn scan_entry(
         out.push(Offender {
             file,
             line: at,
-            why: "system prompt に起動時の警告を添えていない = 全画面の TUI に隠れた `警告:` 行の \
-                  ほかに master 本人へ届く道が無い（#2227）"
+            why: "system prompt に起動時の警告を添えていない = 全画面の TUI に隠れた `警告:` 行・ \
+                  前任への応答のほかに、立てた本人へ届く道が無い（#2227 / #2233）"
                 .into(),
         });
     }
@@ -177,7 +198,14 @@ fn scan_entry(
 /// 2. / 3. / 5. 共有の読み込み（`master_launch.rs`）
 fn scan_launch(src: &str) -> Vec<Offender> {
     let mut out = Vec::new();
-    scan_entry(LAUNCH, src, "pub fn plan(", "load_profile(", &mut out);
+    scan_entry(
+        LAUNCH,
+        src,
+        "pub fn plan(",
+        "load_profile(",
+        MASTER_BADS,
+        &mut out,
+    );
     let mut push = |line: usize, why: String| {
         out.push(Offender {
             file: LAUNCH,
@@ -189,10 +217,10 @@ fn scan_launch(src: &str) -> Vec<Offender> {
     match fn_window(src, "pub fn load_default_at(") {
         None => push(0, "`load_default_at` が見つからない（走査が空振り）".into()),
         Some((at, window)) => {
-            if !window_has(&window, "project_profile_base_at(") {
+            if !window_has(&window, "profile_base_at(") {
                 push(
                     at,
-                    "default.yaml を継承元と同じ読み方（`project_profile_base_at` = 退避つき）で \
+                    "default.yaml を継承元と同じ読み方（`profile_base_at` = 退避つき）で \
                      読んでいない = 壊れた中身が保全されない（#916 / #2227）"
                         .into(),
                 );
@@ -247,6 +275,55 @@ fn scan_launch(src: &str) -> Vec<Offender> {
         }
     }
 
+    // 6. 引き継ぎの後任は CLI / スマホと同じ `load_profile` を通る（#2233）
+    match fn_window(src, "pub fn load_successor_profile(") {
+        None => push(
+            0,
+            "`load_successor_profile` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if !window_has(&window, "load_profile(name)") {
+                push(
+                    at,
+                    "後任の読み込みが `load_profile` を通っていない = 後任だけ個人ルールの抜けた \
+                     master が黙って立つ（#2233）"
+                        .into(),
+                );
+            }
+            // 読めなくても引き継ぎは止めないが、既定で立てた理由を warning と persist.log に持つ
+            if !window_has(&window, "warning: Some(") || !window_has(&window, "persist_log(") {
+                push(
+                    at,
+                    "読めない後任のプロファイルを既定で立てるのに warning / persist.log を持たない \
+                     = 黙って組み込み既定の後任が立つ（#2233）"
+                        .into(),
+                );
+            }
+        }
+    }
+
+    // 7. `tako solo` の default も同じ形（退避つきの読み方・persist.log）
+    match fn_window(src, "pub fn load_solo(") {
+        None => push(0, "`load_solo` が見つからない（走査が空振り）".into()),
+        Some((at, window)) => {
+            if !window_has(&window, "load_default_at(") || !window_has(&window, "ProfileKind::Solo")
+            {
+                push(
+                    at,
+                    "solo の default が `load_default_at(ProfileKind::Solo, ..)` を通っていない \
+                     = 読めない中身が退避されず warning も持たない（#2233）"
+                        .into(),
+                );
+            }
+            if !window_has(&window, "persist_log(") {
+                push(
+                    at,
+                    "solo の default の警告を persist.log へ残していない（#2233）".into(),
+                );
+            }
+        }
+    }
+
     // 5. 応答（スマホの「+ master」）に warnings を載せる
     match fn_window(src, "pub fn to_json(") {
         None => push(0, "`to_json` が見つからない（走査が空振り）".into()),
@@ -290,6 +367,62 @@ fn scan_orchestrator(src: &str) -> Vec<Offender> {
             }
         }
     }
+    // 8. 表示だけの経路の読み込みは読むだけ（退避しない）で、理由を返す
+    match fn_window(src, "pub fn load_for_display(") {
+        None => push(
+            0,
+            "`load_for_display` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if !window_has(&window, "load_for_display_at(") {
+                push(
+                    at,
+                    "`load_for_display` が本体（`load_for_display_at`）を通っていない（#2233）"
+                        .into(),
+                );
+            }
+        }
+    }
+    match fn_window(src, "fn load_for_display_at(") {
+        None => push(
+            0,
+            "`load_for_display_at` が見つからない（走査が空振り）".into(),
+        ),
+        Some((at, window)) => {
+            if !window_has(&window, "read_profile_base_at(") {
+                push(
+                    at,
+                    "表示用の読み込みが継承元と同じ判定（`read_profile_base_at`）を通っていない \
+                     = 起動の経路・`migrate status` と「読めない」の基準が食い違う（#2233）"
+                        .into(),
+                );
+            }
+            for (i, line) in window.iter().enumerate() {
+                if !is_code(line) {
+                    continue;
+                }
+                let quarantines = line.contains("quarantine_unreadable(")
+                    || (line.contains("profile_base_at(")
+                        && !line.contains("read_profile_base_at("));
+                if quarantines {
+                    push(
+                        at + i,
+                        "表示だけの経路が退避つきの読み方を使っている = 表示のたびに書き込む \
+                         （退避は起動の経路と `tako migrate` が持つ。#2233）"
+                            .into(),
+                    );
+                }
+                if let Some(bad) = SWALLOWS.iter().find(|s| line.contains(**s)) {
+                    push(
+                        at + i,
+                        format!(
+                            "表示用の読み込みで `{bad}` を使っている = 読めない理由を握りつぶす（#2233）"
+                        ),
+                    );
+                }
+            }
+        }
+    }
     match fn_window(src, "fn missing_project_profile_reason_from(") {
         None => push(
             0,
@@ -317,8 +450,27 @@ fn scan_cli(src: &str) -> Vec<Offender> {
         src,
         "fn orchestrator_master(",
         "master_launch::load_profile(",
+        MASTER_BADS,
         &mut out,
     );
+    // 7. `tako solo`（#2233）。修正前は solo の読み込みを自前で握りつぶしていた
+    scan_entry(
+        CLI,
+        src,
+        "fn orchestrator_solo(",
+        "master_launch::load_solo(",
+        &["load_solo_profile(", "solo_default_profile()"],
+        &mut out,
+    );
+    if let Some((at, window)) = fn_window(src, "fn orchestrator_solo(") {
+        if !window_has(&window, "eprintln!(\"警告: {w}\")") {
+            out.push(Offender {
+                file: CLI,
+                line: at,
+                why: "solo の読み込みの warning を `警告:` 行で画面へ出していない（#2233）".into(),
+            });
+        }
+    }
     if let Some((at, window)) = fn_window(src, "fn orchestrator_master(") {
         if !window_has(&window, "eprintln!(\"警告: {w}\")") {
             out.push(Offender {
@@ -331,11 +483,138 @@ fn scan_cli(src: &str) -> Vec<Offender> {
     out
 }
 
+/// 6. / 8. dispatch（引き継ぎの後任・self・supervisor status）
+fn scan_dispatch(src: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    scan_entry(
+        DISPATCH,
+        src,
+        "fn dispatch_orchestrator_handoff(",
+        "master_launch::load_successor_profile(",
+        MASTER_BADS,
+        &mut out,
+    );
+    // (関数の目印, 窓に要るもの, 欠けたときの理由)
+    let needs: &[(&str, &str, &str)] = &[
+        (
+            "fn dispatch_orchestrator_handoff(",
+            "warnings.extend(load_warning)",
+            "後任を既定で立てた理由を応答の `warnings` へ載せていない = 引き継ぎを呼んだ前任に \
+             見えない（#2233）",
+        ),
+        (
+            "fn dispatch_orchestrator_self(",
+            "load_for_display(",
+            "self が表示用の読み込み（`load_for_display`）を通っていない = 既定値で答えたことを \
+             黙る（#2233）",
+        ),
+        (
+            "fn dispatch_orchestrator_self(",
+            "warnings.extend(profile_note)",
+            "self が読めない理由を `warnings` へ出していない（#2233）",
+        ),
+        (
+            "fn dispatch_orchestrator_supervisor(",
+            "load_for_display(",
+            "supervisor status が表示用の読み込み（`load_for_display`）を通っていない（#2233）",
+        ),
+        (
+            "fn dispatch_orchestrator_supervisor(",
+            "v[\"warnings\"]",
+            "supervisor status が読めない理由を `warnings` へ出していない（#2233）",
+        ),
+    ];
+    for (fn_needle, need, why) in needs {
+        match fn_window(src, fn_needle) {
+            None => out.push(Offender {
+                file: DISPATCH,
+                line: 0,
+                why: format!("`{fn_needle}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) => {
+                if !window_has(&window, need) {
+                    out.push(Offender {
+                        file: DISPATCH,
+                        line: at,
+                        why: (*why).to_string(),
+                    });
+                }
+            }
+        }
+    }
+    for fn_needle in [
+        "fn dispatch_orchestrator_self(",
+        "fn dispatch_orchestrator_supervisor(",
+    ] {
+        if let Some((at, window)) = fn_window(src, fn_needle) {
+            for line in lines_with(at, &window, "Profile::load(") {
+                out.push(Offender {
+                    file: DISPATCH,
+                    line,
+                    why: "表示の経路が `Profile::load(..)` を直接使っている = 読めないプロファイルを \
+                          黙って既定値で答える修正前の形（#2233）"
+                        .into(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// 8. `tako setup` の表示
+fn scan_setup(src: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    match fn_window(src, "fn print_next_steps(") {
+        None => out.push(Offender {
+            file: SETUP,
+            line: 0,
+            why: "`print_next_steps` が見つからない（走査が空振り）".into(),
+        }),
+        Some((at, window)) => {
+            if !window_has(&window, "load_for_display(") {
+                out.push(Offender {
+                    file: SETUP,
+                    line: at,
+                    why: "setup の表示が `load_for_display` を通っていない（#2233）".into(),
+                });
+            }
+            for line in lines_with(at, &window, "Profile::load(") {
+                out.push(Offender {
+                    file: SETUP,
+                    line,
+                    why: "setup の表示が `Profile::load(..)` を直接使っている = 組み込み既定を \
+                          「現在の default」として見せる修正前の形（#2233）"
+                        .into(),
+                });
+            }
+        }
+    }
+    match fn_window(src, "fn profile_summary_lines(") {
+        None => out.push(Offender {
+            file: SETUP,
+            line: 0,
+            why: "`profile_summary_lines` が見つからない（走査が空振り）".into(),
+        }),
+        Some((at, window)) => {
+            if !window_has(&window, "警告: {note}") {
+                out.push(Offender {
+                    file: SETUP,
+                    line: at,
+                    why: "setup の表示が読めない理由を出していない（#2233）".into(),
+                });
+            }
+        }
+    }
+    out
+}
+
 fn all(s: &Sources) -> Vec<String> {
     scan_launch(&s.launch)
         .iter()
         .chain(scan_orchestrator(&s.orch).iter())
         .chain(scan_cli(&s.cli).iter())
+        .chain(scan_dispatch(&s.dispatch).iter())
+        .chain(scan_setup(&s.setup).iter())
         .map(Offender::report)
         .collect()
 }
@@ -351,6 +630,20 @@ fn 走査が空振りしていない() {
         (ORCH, &s.orch, "pub fn missing_project_profile_reason("),
         (ORCH, &s.orch, "fn missing_project_profile_reason_from("),
         (CLI, &s.cli, "fn orchestrator_master("),
+        (LAUNCH, &s.launch, "pub fn load_successor_profile("),
+        (LAUNCH, &s.launch, "pub fn load_solo("),
+        (ORCH, &s.orch, "pub fn load_for_display("),
+        (ORCH, &s.orch, "fn load_for_display_at("),
+        (CLI, &s.cli, "fn orchestrator_solo("),
+        (DISPATCH, &s.dispatch, "fn dispatch_orchestrator_handoff("),
+        (DISPATCH, &s.dispatch, "fn dispatch_orchestrator_self("),
+        (
+            DISPATCH,
+            &s.dispatch,
+            "fn dispatch_orchestrator_supervisor(",
+        ),
+        (SETUP, &s.setup, "fn print_next_steps("),
+        (SETUP, &s.setup, "fn profile_summary_lines("),
     ] {
         assert!(
             fn_window(src, needle).is_some(),
@@ -364,7 +657,8 @@ fn 現行実装は違反ゼロ() {
     let found = all(&sources(&workspace_root()));
     assert!(
         found.is_empty(),
-        "読めない default.yaml で master を黙って立てない（#2227）の不変条件に違反: {found:#?}"
+        "読めない default.yaml で黙って組み込み既定へ落ちない（#2227 / #2233）の不変条件に違反: \
+         {found:#?}"
     );
 }
 
@@ -405,6 +699,8 @@ fn assert_named(base: &Sources, inj: &Injection) {
         LAUNCH => &mut injected.launch,
         ORCH => &mut injected.orch,
         CLI => &mut injected.cli,
+        DISPATCH => &mut injected.dispatch,
+        SETUP => &mut injected.setup,
         other => panic!("未知のファイル: {other}"),
     };
     *target = replace_in_fn(target, inj.fn_needle, inj.from, inj.to);
@@ -465,9 +761,9 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: LAUNCH,
             fn_needle: "pub fn load_default_at(",
-            from: "match orchestrator::project_profile_base_at(path) {",
-            to: "match Ok::<Profile, String>(orchestrator::project_profile_base_at(path).unwrap_or_default()) {",
-            marker: "project_profile_base_at(path).unwrap_or_default()",
+            from: "match orchestrator::profile_base_at(kind, path) {",
+            to: "match Ok::<Profile, String>(orchestrator::profile_base_at(kind, path).unwrap_or_default()) {",
+            marker: "profile_base_at(kind, path).unwrap_or_default()",
         },
         // 注入 6: `-<key>` の「見つからない」に理由を足さない
         Injection {
@@ -492,6 +788,126 @@ fn 逆戻りを名指しできる() {
             from: "check_project_profile_base(),",
             to: "Ok::<(), String>(()),",
             marker: "pub fn missing_project_profile_reason(",
+        },
+        // 注入 9: 引き継ぎの後任が修正前そのもの（自前で読んで黙って組み込み既定）
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_handoff(",
+            from: "} = orchestrator::master_launch::load_successor_profile(profile_name);",
+            to: "} = orchestrator::master_launch::LaunchProfile { profile: orchestrator::Profile::load(profile_name).unwrap_or_default(), warning: None };",
+            marker: "orchestrator::Profile::load(profile_name)",
+        },
+        // 注入 10: 後任の system prompt へ警告を添えない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_handoff(",
+            from: "orchestrator::master_launch::with_startup_warning(",
+            to: "std::convert::identity((",
+            marker: "fn dispatch_orchestrator_handoff(",
+        },
+        // 注入 11: 前任への応答に警告を載せない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_handoff(",
+            from: "warnings.extend(load_warning);",
+            to: "let _ = load_warning;",
+            marker: "fn dispatch_orchestrator_handoff(",
+        },
+        // 注入 12: self が修正前そのもの
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_self(",
+            from: "orchestrator::load_for_display(orchestrator::ProfileKind::Master, profile_name);",
+            to: "(orchestrator::Profile::load(profile_name).unwrap_or_default(), None::<String>);",
+            marker: "orchestrator::Profile::load(profile_name)",
+        },
+        // 注入 13: self が理由を warnings へ出さない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_self(",
+            from: "warnings.extend(profile_note);",
+            to: "let _ = profile_note;",
+            marker: "fn dispatch_orchestrator_self(",
+        },
+        // 注入 14: supervisor status が修正前そのもの
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_supervisor(",
+            from: "let (profile, profile_note) = crate::orchestrator::load_for_display(",
+            to: "let (profile, profile_note) = (crate::orchestrator::Profile::load(\"default\").unwrap_or_default(), None::<String>); let _ = (",
+            marker: "crate::orchestrator::Profile::load(\"default\")",
+        },
+        // 注入 15: supervisor status が理由を warnings へ出さない
+        Injection {
+            rel: DISPATCH,
+            fn_needle: "fn dispatch_orchestrator_supervisor(",
+            from: "v[\"warnings\"] = json!([note]);",
+            to: "let _ = note;",
+            marker: "fn dispatch_orchestrator_supervisor(",
+        },
+        // 注入 16: `tako solo` が修正前そのもの
+        Injection {
+            rel: CLI,
+            fn_needle: "fn orchestrator_solo(",
+            from: "} = orchestrator::master_launch::load_solo(profile_name)?;",
+            to: "} = orchestrator::master_launch::LaunchProfile { profile: orchestrator::load_solo_profile(profile_name).unwrap_or_else(|_| orchestrator::solo_default_profile()), warning: None };",
+            marker: "orchestrator::load_solo_profile(profile_name)",
+        },
+        // 注入 17: `tako solo` が警告を画面へ出さない
+        Injection {
+            rel: CLI,
+            fn_needle: "fn orchestrator_solo(",
+            from: "eprintln!(\"警告: {w}\");",
+            to: "let _ = w;",
+            marker: "fn orchestrator_solo(",
+        },
+        // 注入 18: `tako solo` が solo 本人の prompt へ警告を添えない
+        Injection {
+            rel: CLI,
+            fn_needle: "fn orchestrator_solo(",
+            from: "orchestrator::master_launch::with_startup_warning(",
+            to: "std::convert::identity((",
+            marker: "fn orchestrator_solo(",
+        },
+        // 注入 19: solo の default の警告を persist.log へ残さない
+        Injection {
+            rel: LAUNCH,
+            fn_needle: "pub fn load_solo(",
+            from: "crate::diag::persist_log(&format!(\"[solo] {name}: {w}\"));",
+            to: "let _ = w;",
+            marker: "pub fn load_solo(",
+        },
+        // 注入 20: 後任の読み込みが `load_profile` を通らない
+        Injection {
+            rel: LAUNCH,
+            fn_needle: "pub fn load_successor_profile(",
+            from: "match load_profile(name) {",
+            to: "match Ok::<LaunchProfile, String>(LaunchProfile { profile: Profile::load(name).unwrap_or_default(), warning: None }) {",
+            marker: "pub fn load_successor_profile(",
+        },
+        // 注入 23: 読めない後任のプロファイルを既定で立てるのに warning を持たない
+        Injection {
+            rel: LAUNCH,
+            fn_needle: "pub fn load_successor_profile(",
+            from: "warning: Some(w),",
+            to: "warning: None,",
+            marker: "pub fn load_successor_profile(",
+        },
+        // 注入 21: 表示だけの経路が退避つきの読み方を使う（表示のたびに書き込む）
+        Injection {
+            rel: ORCH,
+            fn_needle: "fn load_for_display_at(",
+            from: "match read_profile_base_at(kind, path) {",
+            to: "match profile_base_at(kind, path) {",
+            marker: "match profile_base_at(kind, path) {",
+        },
+        // 注入 22: setup の表示が修正前そのもの
+        Injection {
+            rel: SETUP,
+            fn_needle: "fn print_next_steps(",
+            from: "let (profile, note) = tako_control::orchestrator::load_for_display(",
+            to: "let (profile, note) = (Profile::load(\"default\").unwrap_or_default(), None::<String>); let _ = (",
+            marker: "Profile::load(\"default\")",
         },
     ] {
         assert_named(&s, &inj);

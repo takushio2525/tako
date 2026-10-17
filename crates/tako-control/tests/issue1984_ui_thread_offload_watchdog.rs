@@ -4305,10 +4305,11 @@ fn 呼び出しグラフが空振りしていない() {
         ),
         "モジュールのパスを末尾の名前だけで照合している（同名の別関数へ繋がる）"
     );
-    // `Type::f(`（`orchestrator::Profile::load`）
+    // `Type::f(`（`orchestrator::Profile::load`）。#2233 で self は表示用の読み込みへ移ったので、
+    // 標本は `Profile::load` を直接呼ぶ採用（adopt）にする
     assert!(
         graph
-            .callees(me)
+            .callees(f("dispatch_orchestrator_adopt"))
             .into_iter()
             .any(|g| graph.fns[g].name == "load"
                 && graph.fns[g].owner == call_graph::Owner::Type("Profile".into())),

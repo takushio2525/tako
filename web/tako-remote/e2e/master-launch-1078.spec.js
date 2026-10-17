@@ -5,6 +5,8 @@
 //   ② opt-in していないプロファイルでは公式リンクが出ず理由が出る
 //   ③ observe / interact role では 403（押す前に理由・押しても理由）
 //   ④ 作られたタブが一覧に出る（Mac 画面側は daemon の `TabNew { focus: true }` が担保）
+//   ⑤ 起動の応答の `warnings`（読めない default.yaml を組み込み既定で代えた等）が画面に出る
+//      （#2227 / #2233。CLI の `警告:` 行と同じ文。無ければ何も出さない）
 //
 // API はすべて `page.route` でモックする。ボディも検証するので
 // 「PWA が daemon の何をどの順で叩くか」まで固定される。
@@ -109,6 +111,8 @@ async function setupMocks(page, opts = {}) {
     connectAfterMs = 2500,
     launchStatus = 200,
     profileState = 'enabled',
+    // 起動の応答の `warnings`（#2233）。`undefined` = 返さない古い daemon
+    warnings = [],
     calls = {},
   } = opts;
   calls.panes = 0;
@@ -135,6 +139,7 @@ async function setupMocks(page, opts = {}) {
       ok: true, tab: 9, pane: 90, profile: 'dev', tab_title: 'master-dev',
       role: 'orchestrator-master:dev', agent: 'claude', model: 'opus 5',
       effort: 'high', cwd: '/Users/dev/tako',
+      warnings,
       remote_control: profileState === 'enabled'
         ? { state: 'enabled', opt_in: true, reason: null, next_step: null, enable_command: null }
         : {
@@ -228,6 +233,8 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     // 起動したタブ・ペインが分かる（Mac 画面で探せる）
     await expect(page.locator('.launch-result-sub')).toContainText('タブ 9');
     await expect(page.locator('.launch-result-sub')).toContainText('ペイン 90');
+    // 警告の無い起動では警告の枠を出さない（#2233）
+    expect(await page.locator('[data-testid="launch-warnings"]').count()).toBe(0);
   });
 
   test('03. 起動したタブが一覧に出る', async ({ page }) => {
@@ -302,5 +309,43 @@ test.describe('#1078 スマホから master を起動 — モバイル', () => {
     await expect(page.locator('.remote-link-reason')).toBeVisible();
     expect(await page.locator('.claude-open').count()).toBe(0);
     await page.screenshot({ path: evidencePath('07-timeout.png') });
+  });
+
+  test('08. 起動の応答に warnings があれば起動結果の先頭に警告を出す（#2233）', async ({ page }) => {
+    // daemon の `master_launch::plan` が返す文（読めない default.yaml を組み込み既定で代えた）
+    const WARNING = '/Users/dev/.tako/orchestrator/profiles/default.yaml を読めない'
+      + '（YAML の構文が壊れている（6 行 1 列））。中身は /Users/dev/.tako/orchestrator/profiles/'
+      + 'default.yaml.unreadable.bak に退避した。default.yaml の個人ルール（prompt_blocks）・'
+      + 'モデルなどの設定を使わず、組み込み既定で master を立てる。default.yaml を直すと次の起動から効く';
+    await setupMocks(page, { profileState: 'off', warnings: [WARNING] });
+    await openLauncher(page);
+    await page.locator('.launch-profile', { hasText: 'default' }).click();
+
+    const box = page.locator('.launch-result [data-testid="launch-warnings"]');
+    await expect(box).toBeVisible();
+    await expect(box).toHaveAttribute('role', 'alert');
+    await expect(box.locator('.launch-warning')).toHaveCount(1);
+    await expect(box.locator('.launch-warning')).toContainText('組み込み既定で master を立てる');
+    await expect(box.locator('.launch-warning')).toContainText('default.yaml を直す');
+    await expect(box.locator('.launch-warning-label')).toHaveText('警告');
+    // 起動結果の見出しの直後（Remote Control の理由より前）に出る = 読み落とさない位置
+    const order = await page.locator('.launch-result').evaluate(el => {
+      const kids = [...el.children].map(c => c.className || c.tagName);
+      return kids;
+    });
+    expect(order[0]).toBe('launch-result-head');
+    expect(order[1]).toBe('launch-warnings');
+    // 長い 1 行でもスマホの幅からはみ出さない（横スクロールを作らない）
+    const overflow = await box.evaluate(el => el.scrollWidth > el.clientWidth);
+    expect(overflow).toBe(false);
+    await page.screenshot({ path: evidencePath('08-warnings.png') });
+  });
+
+  test('09. warnings を返さない古い daemon でも起動結果は従来どおり（#2233）', async ({ page }) => {
+    await setupMocks(page, { profileState: 'off', warnings: undefined });
+    await openLauncher(page);
+    await page.locator('.launch-profile', { hasText: 'default' }).click();
+    await expect(page.locator('.launch-result .remote-link-reason')).toBeVisible();
+    expect(await page.locator('[data-testid="launch-warnings"]').count()).toBe(0);
   });
 });

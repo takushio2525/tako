@@ -5365,11 +5365,15 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         Some(s) => ("default", Some(s)),
     };
 
-    let profile = match orchestrator::load_solo_profile(profile_name) {
-        Ok(p) => p,
-        Err(_) if profile_name == "default" => orchestrator::solo_default_profile(),
-        Err(e) => return Err(e),
-    };
+    // 読み込みは master と同じ形（#2233）。読めない default は solo の組み込み既定で立てるが
+    // 黙らない（`警告:` 行・persist.log・solo 本人の system prompt。中身は退避）
+    let orchestrator::master_launch::LaunchProfile {
+        profile,
+        warning: load_warning,
+    } = orchestrator::master_launch::load_solo(profile_name)?;
+    if let Some(w) = &load_warning {
+        eprintln!("警告: {w}");
+    }
 
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env()?;
@@ -5397,7 +5401,11 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         }
     }
 
-    let prompt_content = profile.build_solo_system_prompt(profile_name);
+    // #2233: 上の `警告:` 行は claude の全画面 TUI に隠れうるので、solo 本人にも渡す
+    let prompt_content = orchestrator::master_launch::with_startup_warning(
+        profile.build_solo_system_prompt(profile_name),
+        load_warning.as_deref(),
+    );
     let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
     let prompt_path = dir.join(format!("_solo_system_prompt_{profile_name}.md"));
     std::fs::write(&prompt_path, &prompt_content)

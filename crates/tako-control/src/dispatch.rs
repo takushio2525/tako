@@ -14155,8 +14155,10 @@ fn dispatch_orchestrator_self(
     let ctx_percent = ctx.percent;
     let mod_limits = crate::claude_mod::account_rate_limits(host, pane_id, now);
 
-    // #749: 閾値はプロファイル → config.yaml → 既定 60 の順で解決し 50〜60 へ丸める
-    let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+    // #749: 閾値はプロファイル → config.yaml → 既定 60 の順で解決し 50〜60 へ丸める。
+    // #2233: 読めなければ既定値で答えるが、その理由を warnings へ出す（読むだけ・退避しない）
+    let (profile, profile_note) =
+        orchestrator::load_for_display(orchestrator::ProfileKind::Master, profile_name);
     let threshold = profile.resolved_ctx_threshold();
     let ctx_threshold = threshold.value;
 
@@ -14246,6 +14248,7 @@ fn dispatch_orchestrator_self(
     });
     // 運用メモが膨らんでいたら肥大の再発なので警告する（#915 要件 3）
     let mut warnings: Vec<String> = migration.warnings.clone();
+    warnings.extend(profile_note);
     warnings.extend(
         memo_content
             .as_deref()
@@ -14929,8 +14932,12 @@ fn dispatch_orchestrator_handoff(
     // #915 / #916: 読む前に旧形式を自動移行する（実行時の差分検出。冪等）
     let migration = orchestrator::handoff_store::ensure_migrated(profile_name);
 
-    // プロファイルの読み込みとエージェント解決
-    let profile = orchestrator::Profile::load(profile_name).unwrap_or_default();
+    // プロファイルの読み込み（#2233: `tako master` と同じ 1 実装。読めなければ組み込み既定で
+    // 立てるが黙らない = 応答の warnings・persist.log・後任の system prompt。引き継ぎは止めない）
+    let orchestrator::master_launch::LaunchProfile {
+        profile,
+        warning: load_warning,
+    } = orchestrator::master_launch::load_successor_profile(profile_name);
 
     // #915: 管轄プロジェクトの解決。明示引数 → プロファイル担当 + 稼働 worker → worker のみ
     let jurisdiction =
@@ -14981,7 +14988,10 @@ fn dispatch_orchestrator_handoff(
     // #761: master の起動コマンドは CLI の `tako master -<profile>` と**同一経路**で作る。
     // worker 用の `resolve_agent_launch`（worker_agents.<agent> を見る）を使っていたため、
     // 後任が worker 用モデルで起動し、master system prompt も付いていなかった
-    let prompt_content = profile.build_system_prompt(profile_name);
+    let prompt_content = orchestrator::master_launch::with_startup_warning(
+        profile.build_system_prompt(profile_name),
+        load_warning.as_deref(),
+    );
     let prompt_path = orchestrator::config_dir()
         .ok_or_else(|| op_err("ホームディレクトリが取得できない"))?
         .join(format!("_system_prompt_{profile_name}.md"));
@@ -15098,6 +15108,7 @@ fn dispatch_orchestrator_handoff(
 
     let handoff_path = orchestrator::handoff_path(profile_name);
     let mut warnings: Vec<String> = migration.warnings.clone();
+    warnings.extend(load_warning);
     warnings.extend(bundle.memo_warning.clone());
     // #1055: 起動フォルダの食い違いは黙らない（後任だけツールが全部拒否される、のような
     // 理由の分からない停止を作らないため）
@@ -23579,19 +23590,27 @@ fn dispatch_orchestrator_supervisor(
 
     match action {
         "status" => {
-            let profile = crate::orchestrator::Profile::load("default").unwrap_or_default();
+            // #2233: 読めなければ既定値を見せるが、その理由を warnings へ出す（読むだけ・退避しない）
+            let (profile, profile_note) = crate::orchestrator::load_for_display(
+                crate::orchestrator::ProfileKind::Master,
+                tako_core::handoff::DEFAULT_PROFILE,
+            );
             let sv_mode = profile
                 .supervisor_mode
                 .unwrap_or(supervisor::SupervisorMode::Auto);
             let auto_dead = profile.auto_resume_dead.unwrap_or(false);
             let retries = profile.supervisor_max_retries.unwrap_or(3);
             let log = supervisor::read_audit_log(lines.unwrap_or(20));
-            Ok(json!({
+            let mut v = json!({
                 "mode": sv_mode.as_str(),
                 "auto_resume_dead": auto_dead,
                 "max_retries": retries,
                 "audit_log": log,
-            }))
+            });
+            if let Some(note) = profile_note {
+                v["warnings"] = json!([note]);
+            }
+            Ok(v)
         }
         "set_mode" => {
             let sv_mode = mode

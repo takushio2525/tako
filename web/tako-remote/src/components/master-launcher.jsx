@@ -21,6 +21,9 @@
 //   待ち続けても繋がらないので、待たずに理由へ切り替える
 // - role が足りない端末では**押す前に**理由を出す（サーバーは 403 を返すが、
 //   押してから断られるより先に分かる方がよい）
+// - 立てたが黙らせない理由（応答の `warnings`。読めない default.yaml を組み込み既定で
+//   代えた等 = #2227 / #2233）は起動結果の先頭に出す。CLI の `警告:` 行と同じ文で、
+//   スマホから立てた利用者が最初に見る場所（master 本人も system prompt で受け取る）
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { createClient } from '../api';
 import { ClaudeOpenLink, RemoteLinkReason } from './remote-link';
@@ -70,6 +73,24 @@ function ProfileRow({ profile, onPick, disabled }) {
         </span>
       )}
     </button>
+  );
+}
+
+/// 起動の応答の `warnings`（#2227 / #2233）。立てはしたが個人ルールが効いていない等を黙らせない。
+/// 文は daemon が返したもの（CLI の `警告:` 行・persist.log と同じ 1 実装）。古い daemon は
+/// `warnings` を返さないので、無い・空なら何も出さない
+function LaunchWarnings({ warnings }) {
+  const list = Array.isArray(warnings) ? warnings.filter(w => typeof w === 'string' && w) : [];
+  if (list.length === 0) return null;
+  return (
+    <div class="launch-warnings" role="alert" data-testid="launch-warnings">
+      {list.map((w, i) => (
+        <p key={i} class="launch-warning">
+          <span class="launch-warning-label">警告</span>
+          {w}
+        </p>
+      ))}
+    </div>
   );
 }
 
@@ -124,6 +145,8 @@ function WaitPanel({ result, onClose, onOpenPane }) {
           {result.model ? ` · ${result.model}` : ''}
         </span>
       </div>
+
+      <LaunchWarnings warnings={result.warnings} />
 
       {connected ? (
         <>

@@ -2558,8 +2558,6 @@ fn print_setup_summary(plan: &SetupPlan) {
 /// オーケストレーションの最短導線とプロファイルの説明を default profile の実値つきで示す。
 /// コマンドは最も簡単な形で案内する（既定で済むものに引数を付けない。`.agent/conventions.md`）
 fn print_next_steps(master_ready: bool, has_remaining: bool) {
-    use tako_control::orchestrator::{Profile, WorkerModelPolicy};
-
     eprintln!();
     eprintln!("次の一歩:");
     if master_ready {
@@ -2578,7 +2576,25 @@ fn print_next_steps(master_ready: bool, has_remaining: bool) {
         eprintln!("  claude または codex を導入してログインし、tako setup を再実行してください");
     }
 
-    let profile = Profile::load("default").unwrap_or_default();
+    // #2233: 読めない default.yaml を「現在の default」として見せない（読むだけ・退避しない）
+    let (profile, note) = tako_control::orchestrator::load_for_display(
+        tako_control::orchestrator::ProfileKind::Master,
+        tako_core::handoff::DEFAULT_PROFILE,
+    );
+    eprintln!();
+    for line in profile_summary_lines(&profile, note.as_deref()) {
+        eprintln!("{line}");
+    }
+}
+
+/// 「次の一歩」のプロファイルの節。`note` = default.yaml を読めない理由（#2233）。
+/// 読めないときは値を「現在の default」と呼ばず、組み込み既定であることと理由を出す
+fn profile_summary_lines(
+    profile: &tako_control::orchestrator::Profile,
+    note: Option<&str>,
+) -> Vec<String> {
+    use tako_control::orchestrator::WorkerModelPolicy;
+
     let master = profile.master_agent.as_deref().unwrap_or("claude");
     let worker = profile.worker_agent.as_deref().unwrap_or(master);
     let policy = match profile.worker_model_policy {
@@ -2586,13 +2602,25 @@ fn print_next_steps(master_ready: bool, has_remaining: bool) {
         WorkerModelPolicy::Fixed => "固定値",
         WorkerModelPolicy::Delegate => "master がタスクごとに判断",
     };
-    eprintln!();
-    eprintln!("プロファイル（master / worker がどのエージェント・モデル・思考量で動くかの設定）:");
-    eprintln!(
-        "  現在の default: master={master} / worker={worker} / effort={} / worker モデルは {policy}",
+    let values = format!(
+        "master={master} / worker={worker} / effort={} / worker モデルは {policy}",
         profile.effort
     );
-    eprintln!("  「品質重視にして」「利用回数を節約して」のような調整は master に日本語で頼めます");
+    let mut lines = vec![
+        "プロファイル（master / worker がどのエージェント・モデル・思考量で動くかの設定）:"
+            .to_string(),
+    ];
+    match note {
+        None => lines.push(format!("  現在の default: {values}")),
+        Some(note) => {
+            lines.push(format!("  警告: {note}"));
+            lines.push(format!("  組み込み既定: {values}"));
+        }
+    }
+    lines.push(
+        "  「品質重視にして」「利用回数を節約して」のような調整は master に日本語で頼めます".into(),
+    );
+    lines
 }
 
 /// 設定共有ステップの決定（Issue #513）。
@@ -3613,6 +3641,30 @@ fn print_context_budget_status() {
 mod tests {
     use super::*;
     use tako_control::setup::SetupConfig;
+
+    /// #2233: 読めない default.yaml の値を「現在の default」として見せない
+    #[test]
+    fn issue2233_読めないdefaultは現在の値として表示しない() {
+        let profile = tako_control::orchestrator::Profile::default();
+        let ok = profile_summary_lines(&profile, None);
+        assert!(ok
+            .iter()
+            .any(|l| l.starts_with("  現在の default: master=claude")));
+        assert!(!ok.iter().any(|l| l.contains("警告")), "{ok:?}");
+
+        let broken = profile_summary_lines(&profile, Some("d.yaml を読めない（r）"));
+        assert!(
+            broken.iter().any(|l| l == "  警告: d.yaml を読めない（r）"),
+            "理由が出ていない: {broken:?}"
+        );
+        assert!(
+            !broken.iter().any(|l| l.contains("現在の default")),
+            "組み込み既定を現在の default と呼んでいる: {broken:?}"
+        );
+        assert!(broken
+            .iter()
+            .any(|l| l.starts_with("  組み込み既定: master=claude")));
+    }
 
     // config.yaml のスキーマ・後方互換のテストは tako_control::setup 側にある（Issue #94）
 

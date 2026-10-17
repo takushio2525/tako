@@ -250,7 +250,12 @@ pub fn resolve_ctx_threshold(profile: &Profile, config_value: Option<u32>) -> Re
 }
 
 /// プロファイル名から「閾値」と「自動通知の有効／無効」をまとめて解決する（#749）。
-/// 読めない環境（$HOME 無し・破損 YAML）でも既定値へフォールバックし、判定を止めない
+/// 読めない環境（$HOME 無し・破損 YAML）でも既定値へフォールバックし、判定を止めない。
+///
+/// **ここでは警告を出さない**（#2233 の判断）: 呼び手は GUI の自動ハンドオフの周期判定で、
+/// 出し先が無く（返すのは閾値と bool だけ）、周期ごとに出すと persist.log を埋める。
+/// 読めないことは、同じ閾値・自動通知を返す `orchestrator self` の `warnings`
+/// （[`load_for_display`]）と、起動時（master / 引き継ぎの後任）の警告が知らせる
 pub fn handoff_policy_for(profile_name: &str) -> (ResolvedCtxThreshold, bool) {
     let profile = Profile::load(profile_name).unwrap_or_default();
     (
@@ -2927,12 +2932,18 @@ fn legacy_project_profile_base() -> Profile {
     load_profile_of(ProfileKind::Master, tako_core::handoff::DEFAULT_PROFILE).unwrap_or_default()
 }
 
-/// [`project_profile_base`] の本体（パス指定。テストは一時 dir で回す）。
-///
-/// 読めない中身は理由を返す前に `<name>.unreadable[.<n>].bak` へ退避する（#916 / #1819 の
-/// 共通口）。default.yaml そのものには触らない
+/// [`project_profile_base`] の本体（パス指定。テストは一時 dir で回す）
 pub fn project_profile_base_at(path: &Path) -> Result<Profile, String> {
-    read_profile_base_at(path).map_err(|why| {
+    profile_base_at(ProfileKind::Master, path)
+}
+
+/// 種別の default.yaml を起動のために読む（パス指定。テストは一時 dir で回す）。
+/// 継承元（#1825）・master の起動（#2227）・`tako solo` の起動（#2233）が同じ 1 実装を通る。
+///
+/// 無い = 種別の組み込み既定・空 = 設定なし・読めない = `Err`。読めない中身は理由を返す前に
+/// `<name>.unreadable[.<n>].bak` へ退避する（#916 / #1819 の共通口）。default.yaml そのものには触らない
+pub fn profile_base_at(kind: ProfileKind, path: &Path) -> Result<Profile, String> {
+    read_profile_base_at(kind, path).map_err(|why| {
         let kept =
             match tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo) {
                 Some(q) => format!("中身は {} に退避した", q.path.display()),
@@ -2942,17 +2953,18 @@ pub fn project_profile_base_at(path: &Path) -> Result<Profile, String> {
     })
 }
 
-/// 継承元を**読むだけ**で判定する（書かない）。退避つきの [`project_profile_base_at`] と
-/// `tako migrate status` の予告（[`check_project_profile_base`]）が同じ判定を通る。
+/// 継承元を**読むだけ**で判定する（書かない）。退避つきの [`profile_base_at`]・
+/// `tako migrate status` の予告（[`check_project_profile_base`]）・表示だけの経路
+/// （[`load_for_display`]）が同じ判定を通る。
 ///
 /// 「読める」の基準は移行の `validate_profile` と同じ（`Profile` として解釈できるか）なので、
 /// 空のファイルは「設定なし」として読める（移行機構の判定と食い違わない）
-fn read_profile_base_at(path: &Path) -> Result<Profile, String> {
+fn read_profile_base_at(kind: ProfileKind, path: &Path) -> Result<Profile, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         // 無い = 継ぐべき個人設定がそもそも無い
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ProfileKind::Master.default_profile())
+            return Ok(kind.default_profile());
         }
         Err(e) => return Err(format!("読み取りに失敗: {e}")),
     };
@@ -2965,9 +2977,46 @@ pub fn check_project_profile_base() -> Result<(), String> {
         return Ok(());
     }
     let path = ProfileKind::Master.path(tako_core::handoff::DEFAULT_PROFILE)?;
-    read_profile_base_at(&path)
+    read_profile_base_at(ProfileKind::Master, &path)
         .map(|_| ())
         .map_err(|why| format!("{} を読めない（{why}）", path.display()))
+}
+
+/// #2233 の A/B。`TAKO_2233_LEGACY=1` で修正前（引き継ぎの後任・`tako solo`・表示だけの経路が
+/// 読めないプロファイルを黙って組み込み既定にする）へ戻す
+pub fn legacy_silent_default_rest() -> bool {
+    std::env::var_os("TAKO_2233_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// 表示・判定だけの経路のプロファイル読み込み（#2233）。
+///
+/// 立てない経路（`orchestrator self` / `supervisor status` / `tako setup` の表示）は、読めない
+/// プロファイルでも従来どおり既定値で答えて止まらないが、**既定値で答えていることを黙らない**
+/// ための理由を返す（応答の `warnings`・画面の行へ出す）。読むだけで退避しない（表示のたびに
+/// 書き込まない。退避は起動の経路と `tako migrate` が持つ）。無い（ゼロコンフィグの初回）・
+/// 読める・名前が不正 = `None`
+pub fn load_for_display(kind: ProfileKind, name: &str) -> (Profile, Option<String>) {
+    match kind.path(name) {
+        Ok(path) => load_for_display_at(kind, &path),
+        Err(_) => (kind.default_profile(), None),
+    }
+}
+
+/// [`load_for_display`] の本体（パス指定。テストは一時 dir で回す）
+fn load_for_display_at(kind: ProfileKind, path: &Path) -> (Profile, Option<String>) {
+    match read_profile_base_at(kind, path) {
+        Ok(profile) => (profile, None),
+        Err(why) => (
+            kind.default_profile(),
+            (!legacy_silent_default_rest()).then(|| {
+                format!(
+                    "{} を読めない（{why}）。表示している値はこのファイルではなく組み込み既定。\
+                     直すと次の呼び出しから効く",
+                    path.display()
+                )
+            }),
+        ),
+    }
 }
 
 /// 継承元を読めずに作らなかったときの理由文（直し方まで言う）
@@ -4452,6 +4501,46 @@ mod tests {
         let dir = tako_core::test_residue::ScratchDir::new("issue1825-absent");
         let base = project_profile_base_at(&dir.path().join("default.yaml")).expect("無い = 既定");
         assert!(base.prompt_blocks.is_none() && base.model.is_none());
+    }
+
+    /// #2233: 表示だけの経路は既定値で答えるが、読めないことを黙らない（読むだけ = 退避しない）。
+    /// 無い・空・読める・名前が不正は従来どおり黙る
+    #[test]
+    fn issue2233_表示用の読み込みは読めない理由を返し退避しない() {
+        for body in [
+            &b"model: m\nprompt_blocks:\n  append: \"P\n  prepend: [\n"[..],
+            &b"model: m\nprompt_blocks:\n  append: [P]\n"[..],
+            &b"model: m\n\xff\xfe\x00broken\n"[..],
+        ] {
+            let (_dir, path) = t1825_base(body);
+            let (profile, note) = load_for_display_at(ProfileKind::Master, &path);
+            let note = note.expect("既定値で答えていることを黙っている");
+            assert!(
+                note.contains(&path.display().to_string()) && note.contains("組み込み既定"),
+                "どのファイルか・何で答えたかが無い: {note}"
+            );
+            assert_eq!(profile.model, None, "既定値で答えていない");
+            assert!(
+                !path.with_file_name("default.yaml.unreadable.bak").exists(),
+                "表示のたびに退避を書いている"
+            );
+            assert_eq!(std::fs::read(&path).expect("元が残る"), body);
+        }
+        let (_d1, good) = t1825_base(b"model: m2233\n");
+        let (profile, note) = load_for_display_at(ProfileKind::Master, &good);
+        assert_eq!((profile.model.as_deref(), note), (Some("m2233"), None));
+        let (_d2, empty) = t1825_base(b"");
+        assert_eq!(load_for_display_at(ProfileKind::Master, &empty).1, None);
+        let absent = tako_core::test_residue::ScratchDir::new("issue2233-absent");
+        let (profile, note) =
+            load_for_display_at(ProfileKind::Solo, &absent.path().join("default.yaml"));
+        assert_eq!(note, None, "無いのは初回の正常な状態");
+        assert_eq!(profile.effort, solo_default_profile().effort, "種別の既定");
+        assert_eq!(
+            load_for_display(ProfileKind::Master, "../x").1,
+            None,
+            "名前が不正"
+        );
     }
 
     #[test]
