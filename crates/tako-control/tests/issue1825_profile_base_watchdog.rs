@@ -139,6 +139,7 @@ fn scan_orchestrator(src: &str) -> Vec<Offender> {
     for needle in [
         "pub fn project_profile_base(",
         "pub fn project_profile_base_at(",
+        "pub fn profile_base_at(",
         "fn read_profile_base_at(",
     ] {
         let Some((at, window)) = fn_window(src, needle) else {
@@ -184,13 +185,30 @@ fn scan_orchestrator(src: &str) -> Vec<Offender> {
         }
     }
 
-    // 2. 読めない中身は退避の共通口を通す
-    if let Some((at, window)) = fn_window(src, "pub fn project_profile_base_at(") {
+    // 2. 読めない中身は退避の共通口を通す（本体は種別つきの `profile_base_at`。#2233 で
+    //    `tako solo` の default と共有するため切り出した。継承元はそこへ委ねる）
+    if let Some((at, window)) = fn_window(src, "pub fn profile_base_at(") {
         if !window_has(&window, "quarantine_unreadable(") {
             push(
                 at,
                 "読めない default.yaml を退避の共通口（`quarantine_unreadable`）へ通していない \
                  = 中身が保全されない（#916 / #1819 / #1825）"
+                    .into(),
+            );
+        }
+    }
+    if let Some((at, window)) = fn_window(src, "pub fn project_profile_base_at(") {
+        // `read_profile_base_at(` も部分一致で当たるので、退避つきの本体の呼び出しだけを数える
+        let delegates = window.iter().any(|l| {
+            is_code(l)
+                && l.contains("profile_base_at(ProfileKind::Master")
+                && !l.contains("read_profile_base_at(")
+        });
+        if !delegates {
+            push(
+                at,
+                "継承元が退避つきの本体（`profile_base_at`）を通っていない = 読めない中身が \
+                 保全されない（#1825 / #2233）"
                     .into(),
             );
         }
@@ -469,9 +487,17 @@ fn 逆戻りを名指しできる() {
         // 注入 3: 読めない中身を退避しない
         Injection {
             rel: ORCH,
-            fn_needle: "pub fn project_profile_base_at(",
+            fn_needle: "pub fn profile_base_at(",
             from: "quarantine_unreadable(",
             to: "quarantine_slot_hint(",
+            marker: "pub fn profile_base_at(",
+        },
+        // 注入 3b: 継承元が退避つきの本体を通らない（読むだけの判定で済ませる）
+        Injection {
+            rel: ORCH,
+            fn_needle: "pub fn project_profile_base_at(",
+            from: "profile_base_at(ProfileKind::Master, path)",
+            to: "read_profile_base_at(ProfileKind::Master, path)",
             marker: "pub fn project_profile_base_at(",
         },
         // 注入 4: projects add が warnings を応答へ載せない

@@ -400,7 +400,7 @@ master は結果を確認してユーザーに報告する。
 （止めると YAML を直せない利用者が master を立てられず、スマホ・返答の配送からの起動も
 失敗する。#916 の「退避して既定値で動き、知らせる」と同じ方針）。その代わり、個人ルール
 （`prompt_blocks`）・モデルが効いていないことと直し方を CLI の `警告:` 行（スマホの起動は応答の
-`warnings`。PWA はまだ表示しない）・persist.log の `[master] default: …` の 1 行・**master 本人の system prompt の末尾**
+`warnings` = PWA の起動結果の先頭に出る。#2233）・persist.log の `[master] default: …` の 1 行・**master 本人の system prompt の末尾**
 （`## Startup warning from tako`）へ出す。CLI の行は claude の全画面 TUI に隠れうるので、
 利用者へ確実に届くのは master の最初の返答になる。壊れた中身は `default.yaml.unreadable.bak`
 へ退避し、default.yaml そのものには触らない。無い（初回）・空（設定なし）は従来どおり黙って立つ。
@@ -409,6 +409,18 @@ master は結果を確認してユーザーに報告する。
 （default.yaml を直すと `tako migrate run` で作られる）を足して止まる。直した後は
 `tako master -<key>` 自身の起動時の差分検出が継承して作って立てる。
 A/B は `TAKO_2227_LEGACY=1`（修正前 = 黙って組み込み既定 / 直し方の無い「見つからない」）。
+
+**引き継ぎの後任・`tako solo`・表示だけの経路も黙らない**（#2233）。同じ根の残りを揃えた:
+
+| 経路 | 種別 | 扱い |
+|---|---|---|
+| 引き継ぎの後任（`tako orchestrator handoff`） | 起動 | `master_launch::load_successor_profile`（= `load_profile`）。読めない default は組み込み既定で立てて、前任への応答の `warnings`・persist.log・**後任の system prompt** へ出す。専用プロファイル（`master:<key>`）が読めなければ**ペインを分割する前に**止める（前任は残る。修正前は組み込み既定の後任を黙って立てていた） |
+| `tako solo` | 起動 | `master_launch::load_solo`。`solo-profiles/default.yaml` が読めなければ solo の組み込み既定で立てて `警告:` 行・persist.log の `[solo] default: …`・solo 本人の system prompt へ出し、中身は退避する |
+| `orchestrator self` / `supervisor status` | 表示 | `orchestrator::load_for_display`（**読むだけ** = 退避しない）。既定値で答えるが、理由を応答の `warnings` へ出す |
+| `tako setup` の「次の一歩」 | 表示 | 同上。組み込み既定を「現在の default」と呼ばず、`警告:` 行と「組み込み既定:」で出す |
+| `handoff_policy_for`（GUI の自動ハンドオフの周期判定） | 判定 | **出さない**: 出し先が無く（返すのは閾値と bool だけ）、周期ごとに出すと persist.log を埋める。同じ値は `self` の `warnings` と起動時の警告が知らせる |
+
+A/B は `TAKO_2233_LEGACY=1`（上の表の経路を修正前の黙った既定落としへ戻す）。
 
 ### `tako orchestrator projects list`
 

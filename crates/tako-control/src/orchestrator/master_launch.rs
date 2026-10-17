@@ -39,10 +39,14 @@
 //! `default` が読めないときは**組み込み既定で立てる**（#916 の「退避して既定値で動き、
 //! 知らせる」と同じ方針。止めると YAML を直せない利用者が master を立てられず、
 //! スマホ・返答の配送からの起動も失敗する）。その代わり、個人ルール・モデルが効いていない
-//! ことを CLI の `警告:` 行（スマホの起動は応答の `warnings`。PWA はまだ表示しない）・
+//! ことを CLI の `警告:` 行（スマホの起動は応答の `warnings` = PWA の起動結果の画面）・
 //! persist.log・master 本人の system prompt（[`with_startup_warning`]）へ出す。CLI の行は
 //! claude の全画面 TUI に隠れうるので、どの経路でも利用者へ確実に届くのは master の最初の返答。
-//! `-<key>` の専用プロファイルが #1825 で作られていないときは、理由と直し方を足して止める
+//! `-<key>` の専用プロファイルが #1825 で作られていないときは、理由と直し方を足して止める。
+//!
+//! 引き継ぎの後任（[`load_successor_profile`]）と `tako solo`（[`load_solo`]）も同じ形で読む
+//! （#2233）。表示・判定だけの経路は立てないので `orchestrator::load_for_display`（読むだけ・
+//! 応答の `warnings` へ理由）を通す
 
 use std::path::{Path, PathBuf};
 
@@ -226,7 +230,10 @@ pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
         });
     }
     if name == tako_core::handoff::DEFAULT_PROFILE {
-        let loaded = load_default_at(&orchestrator::ProfileKind::Master.path(name)?);
+        let loaded = load_default_at(
+            orchestrator::ProfileKind::Master,
+            &orchestrator::ProfileKind::Master.path(name)?,
+        );
         if let Some(w) = &loaded.warning {
             crate::diag::persist_log(&format!("[master] {name}: {w}"));
         }
@@ -248,37 +255,95 @@ pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
     }
 }
 
-/// [`load_profile`] の `default` の本体（パス指定。テストは一時 dir で回す）。
+/// 引き継ぎで立てる後任 master のプロファイルを読む（#2233）。
 ///
-/// 読み方は専用プロファイルの継承元と同じ 1 実装（[`orchestrator::project_profile_base_at`]。
-/// 無い = 組み込み既定・空 = 設定なし・読めない = 退避して `Err`）。`Err` を握りつぶさず
+/// 読み込みは CLI / スマホ / 返答の配送と同じ [`load_profile`]（読めない default は組み込み既定で
+/// 立てて警告・`-<key>` が読めなければ**ペインを分割する前に**止める = 前任は残る）。
+/// 以前は `Profile::load(..).unwrap_or_default()` で、後任だけ個人ルールの抜けた master が
+/// 黙って立っていた（実測）。`TAKO_2233_LEGACY=1` で修正前へ戻す
+pub fn load_successor_profile(name: &str) -> Result<LaunchProfile, String> {
+    if orchestrator::legacy_silent_default_rest() {
+        return Ok(LaunchProfile {
+            profile: Profile::load(name).unwrap_or_default(),
+            warning: None,
+        });
+    }
+    // 前任が読む文なので、どのプロファイルか・前任は残ることまで言う（パース失敗の文には名前が無い）
+    load_profile(name).map_err(|e| {
+        format!(
+            "後任 master のプロファイル '{name}' を読めないので、ペインを分割せずに引き継ぎを止めた\
+             （前任はそのまま）: {e}"
+        )
+    })
+}
+
+/// `tako solo` の起動で使うプロファイルを読む（#2233）。master の [`load_profile`] と同じ形:
+/// `default` が読めないときは solo の組み込み既定で立てるが warning を持ち（中身は退避・
+/// default.yaml には触らない）、persist.log へ 1 行残す。無いだけなら黙る。
+/// `-<名前>` が読めなければ従来どおり止める。`TAKO_2233_LEGACY=1` で修正前（黙って既定）へ戻す
+pub fn load_solo(name: &str) -> Result<LaunchProfile, String> {
+    if orchestrator::legacy_silent_default_rest() {
+        let profile = match orchestrator::load_solo_profile(name) {
+            Ok(p) => p,
+            Err(_) if name == tako_core::handoff::DEFAULT_PROFILE => {
+                orchestrator::solo_default_profile()
+            }
+            Err(e) => return Err(e),
+        };
+        return Ok(LaunchProfile {
+            profile,
+            warning: None,
+        });
+    }
+    if name == tako_core::handoff::DEFAULT_PROFILE {
+        let loaded = load_default_at(
+            orchestrator::ProfileKind::Solo,
+            &orchestrator::ProfileKind::Solo.path(name)?,
+        );
+        if let Some(w) = &loaded.warning {
+            crate::diag::persist_log(&format!("[solo] {name}: {w}"));
+        }
+        return Ok(loaded);
+    }
+    orchestrator::load_solo_profile(name).map(|profile| LaunchProfile {
+        profile,
+        warning: None,
+    })
+}
+
+/// [`load_profile`] / [`load_solo`] の `default` の本体（パス指定。テストは一時 dir で回す）。
+///
+/// 読み方は専用プロファイルの継承元と同じ 1 実装（[`orchestrator::profile_base_at`]。
+/// 無い = 種別の組み込み既定・空 = 設定なし・読めない = 退避して `Err`）。`Err` を握りつぶさず
 /// warning にする
-pub fn load_default_at(path: &Path) -> LaunchProfile {
-    match orchestrator::project_profile_base_at(path) {
+pub fn load_default_at(kind: orchestrator::ProfileKind, path: &Path) -> LaunchProfile {
+    match orchestrator::profile_base_at(kind, path) {
         Ok(profile) => LaunchProfile {
             profile,
             warning: None,
         },
         Err(why) => LaunchProfile {
-            profile: Profile::default(),
+            profile: kind.default_profile(),
             warning: Some(format!(
                 "{why}。default.yaml の個人ルール（prompt_blocks）・モデルなどの設定を使わず、\
-                 組み込み既定で master を立てる。default.yaml を直すと次の起動から効く"
+                 組み込み既定で {} を立てる。default.yaml を直すと次の起動から効く",
+                kind.as_str()
             )),
         },
     }
 }
 
-/// 起動時の警告を master 本人の system prompt の末尾へも添える（#2227）。
+/// 起動時の警告を master / solo 本人の system prompt の末尾へも添える（#2227 / #2233）。
 ///
-/// CLI の `警告:` 行は claude の全画面 TUI に隠れうる。master が最初の返答で利用者へ
-/// 伝えれば、どの起動経路（CLI / スマホ / 返答の配送）でも確実に届く。警告が無ければ不変
+/// CLI の `警告:` 行は claude の全画面 TUI に隠れうる。本人が最初の返答で利用者へ
+/// 伝えれば、どの起動経路（CLI / スマホ / 返答の配送 / 引き継ぎの後任）でも確実に届く。
+/// 警告が無ければ不変
 pub fn with_startup_warning(prompt: String, warning: Option<&str>) -> String {
     match warning {
         None => prompt,
         Some(w) => format!(
             "{prompt}\n\n## Startup warning from tako (#2227)\n\n\
-             This master started on tako's built-in defaults because its profile could not be \
+             This session started on tako's built-in defaults because its profile could not be \
              read, so the user's personal rules (`prompt_blocks`) and model settings from it are \
              NOT in effect. Tell the user this in your first reply, quoting the detail below, \
              and do not guess the missing rules.\n\nDetail: {w}\n"
@@ -359,6 +424,9 @@ pub fn solo_tab_naming(suffix: Option<&str>, dir: Option<&std::path::Path>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const M: orchestrator::ProfileKind = orchestrator::ProfileKind::Master;
+    const S: orchestrator::ProfileKind = orchestrator::ProfileKind::Solo;
 
     /// role とペイン名の語彙は CLI の `-<名前>` 起動と一致していなければならない。
     /// ずれると #761 の事故（後任 / 別経路の master が default 扱いになる）が再来する
@@ -508,7 +576,7 @@ mod tests {
             &b"model: m2227\n\xff\xfe\x00broken\n"[..],
         ] {
             let (_dir, path) = t2227_default(Some(body));
-            let loaded = load_default_at(&path);
+            let loaded = load_default_at(M, &path);
             let w = loaded
                 .warning
                 .as_deref()
@@ -532,15 +600,55 @@ mod tests {
     #[test]
     fn issue2227_読める空無いdefaultは警告しない() {
         let (_d1, good) = t2227_default(Some(b"model: m2227\nprompt_blocks:\n  append: P\n"));
-        let loaded = load_default_at(&good);
+        let loaded = load_default_at(M, &good);
         assert_eq!(loaded.warning, None);
         assert_eq!(loaded.profile.model.as_deref(), Some("m2227"));
         let (_d2, empty) = t2227_default(Some(b""));
-        assert_eq!(load_default_at(&empty).warning, None, "空は設定なし");
+        assert_eq!(load_default_at(M, &empty).warning, None, "空は設定なし");
         let (_d3, absent) = t2227_default(None);
-        let loaded = load_default_at(&absent);
+        let loaded = load_default_at(M, &absent);
         assert_eq!(loaded.warning, None, "無いのは初回の正常な状態");
         assert!(!absent.exists(), "読むだけで作らない");
+    }
+
+    /// #2233: `tako solo` の default も同じ形（solo の組み込み既定で立てて警告・退避・元は不変）。
+    /// 無い / 空は黙って solo の既定（effort が master より低い）
+    #[test]
+    fn issue2233_soloの読めないdefaultはsoloの既定で立てて警告する() {
+        let body = &b"model: m2233\nprompt_blocks:\n  append: \"PERSONAL\n  prepend: [\n"[..];
+        let (_dir, path) = t2227_default(Some(body));
+        let loaded = load_default_at(S, &path);
+        let w = loaded
+            .warning
+            .as_deref()
+            .expect("黙って solo の既定へ落としている");
+        assert!(
+            w.contains(&path.display().to_string()) && w.contains("組み込み既定で solo を立てる"),
+            "どのファイルか・何を立てるかが無い: {w}"
+        );
+        assert_eq!(loaded.profile.model, None);
+        assert_eq!(
+            loaded.profile.effort,
+            orchestrator::solo_default_profile().effort,
+            "solo ではなく master の既定で立てている"
+        );
+        assert!(
+            path.with_file_name("default.yaml.unreadable.bak").is_file(),
+            "中身を退避していない"
+        );
+        assert_eq!(std::fs::read(&path).expect("元が残る"), body);
+
+        let (_d2, absent) = t2227_default(None);
+        let loaded = load_default_at(S, &absent);
+        assert_eq!(loaded.warning, None, "無いのは初回の正常な状態");
+        assert_eq!(
+            loaded.profile.effort,
+            orchestrator::solo_default_profile().effort
+        );
+        let (_d3, good) = t2227_default(Some(b"effort: low\n"));
+        let loaded = load_default_at(S, &good);
+        assert_eq!(loaded.warning, None);
+        assert_eq!(loaded.profile.effort, "low");
     }
 
     #[test]

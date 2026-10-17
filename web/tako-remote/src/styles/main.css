@@ -309,6 +309,15 @@ body {
 }
 .launch-result-actions { display: flex; gap: 8px; margin-top: 12px; }
 .launch-result-actions .btn { flex: 1; }
+/* 起動の応答の warnings（#2227 / #2233）。立てたが利用者に必ず見せる理由 */
+.launch-warnings { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.launch-warning {
+  margin: 0; padding: 9px 12px;
+  background: rgba(232, 178, 62, .08); border: 1px solid rgba(232, 178, 62, .45);
+  border-radius: var(--radius-xs); color: var(--fg); font-size: 12px; line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.launch-warning-label { color: var(--amber); font-weight: 600; margin-right: 6px; }
 
 .filter-row {
   display: flex; gap: 7px; overflow-x: auto;
