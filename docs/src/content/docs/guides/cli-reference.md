@@ -1839,7 +1839,7 @@ tako check-health            # 環境の健全性診断（`tako setup --check` �
 tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・残り作業が入る）
 
 tako queue                   # PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理がどのペインで動いているか
-                             # （順番待ちの実行中・待ち・上限・先頭が待つ理由も）
+                             # （順番待ちの実行中・待ち・上限・待ちごとの理由も）
 tako queue --json            # 生の JSON（tako が起動していなければ機の状態だけを返す）
 tako queue cargo build       # 重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。
                              # 終了コードはコマンドのまま。tako が起動していなければ待たずに走る）

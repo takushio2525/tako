@@ -7724,16 +7724,24 @@ fn print_queue_section(q: &Value) {
     }
     for w in &waiting {
         println!(
-            "  待ち {}  {}  {}{}  {}  待ち {}",
+            "  待ち {}  {}  {}{}  {}  待ち {}{}",
             w["position"],
             w["id"],
             w["label"].as_str().unwrap_or("?"),
             pane(w),
             w["priority"].as_str().unwrap_or("normal"),
-            tako_control::queue_wrapper::human_secs(w["waited_s"].as_u64().unwrap_or(0))
+            tako_control::queue_wrapper::human_secs(w["waited_s"].as_u64().unwrap_or(0)),
+            // 待ちごとの理由（#2243。target dir 待ちの先頭は追い越せるので、先頭の理由だけでは
+            // 後ろが何を待っているか分からない）
+            w["text"]
+                .as_str()
+                .map(|t| format!("  — {t}"))
+                .unwrap_or_default()
         );
     }
-    if let Some(text) = q["blocked"]["text"].as_str() {
+    // 待ちごとの理由を返さない旧い GUI のときだけ、先頭の理由を 1 行で
+    let per_job = waiting.iter().any(|w| w["text"].is_string());
+    if let Some(text) = q["blocked"]["text"].as_str().filter(|_| !per_job) {
         println!("  先頭が待つ理由: {text}");
     }
     if let Some(r) = q["recent"].as_array().and_then(|a| a.first()) {

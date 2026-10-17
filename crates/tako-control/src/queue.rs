@@ -21,7 +21,9 @@
 //! - wrapper が消えたら（pid が居ない / 心拍が [`HEARTBEAT_TIMEOUT`] 途絶えた）次の受け答えで枠を返す
 //!
 //! 番犬: `crates/tako-control/tests/issue1993_resources_ui_thread_watchdog.rs`（受け口の順序）と
-//! `crates/tako-control/tests/issue1994_queue_ui_stall.rs`（UI の受け口を誰も読まなくても割り当てが進む）
+//! `crates/tako-control/tests/issue1994_queue_ui_stall.rs`（UI の受け口を誰も読まなくても割り当てが進む）と
+//! `crates/tako-control/tests/issue2243_queue_head_of_line_watchdog.rs`（target dir 待ちの先頭が空き枠を
+//! 塞がない・同じ dir の直列・追い越しの上限）
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -30,8 +32,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tako_core::queue::{
-    self as q, AdmitInput, JobWire, LimitSettings, Limits, LimitsPatch, MachineView, RunningJob,
-    WaitReason, WaitingJob,
+    self as q, Admission, AdmitInput, JobWire, LimitSettings, Limits, LimitsPatch, MachineView,
+    RunningJob, WaitReason, WaitingJob,
 };
 use tako_core::resources::{Pressure, MIB};
 
@@ -48,6 +50,13 @@ pub const ENV_INJECT: &str = "TAKO_QUEUE_INJECT";
 /// 注入: `ui-stall` なら GUI 無しの調停役が「順番待ち以外の要求」に答えない
 /// （UI スレッドが固まった状態の再現。e2e が「それでも割り当ては進む」を確かめる）
 pub const ENV_INJECT_UI: &str = "TAKO_1994_INJECT";
+/// #2243 の A/B: `TAKO_2243_LEGACY=1` で修正前の割り当て（先頭が target dir 待ちでも後ろを追い越させない
+/// = 先頭詰まり）。調停役のプロセス（GUI / `tako queue serve`）の env で効く
+pub const ENV_LEGACY_2243: &str = "TAKO_2243_LEGACY";
+
+fn legacy_2243() -> bool {
+    std::env::var_os(ENV_LEGACY_2243).is_some_and(|v| v == "1")
+}
 
 /// 立ち上げ直後に誰も入れない長さ（wrapper の繋ぎ直しの間隔は最大 5 秒）
 pub const REGATHER: Duration = Duration::from_secs(6);
@@ -129,6 +138,8 @@ struct Job {
     stalled: bool,
     share: u32,
     granted_at_ms: Option<u64>,
+    /// 待っている間に後ろから追い越された件数（#2243。上限は `q::max_overtaken`）
+    overtaken: u32,
 }
 
 impl Job {
@@ -151,6 +162,7 @@ impl Job {
             low_since: None,
             stalled: false,
             share: 0,
+            overtaken: 0,
         }
     }
 
@@ -172,8 +184,8 @@ struct Arbiter {
     /// 最後に取り込んだ走査の時刻
     usage_at: Option<Instant>,
     unmanaged: u32,
-    /// 直近の判断で先頭が待った理由
-    blocked: Option<WaitReason>,
+    /// 直近の判断（先頭が待った理由・待ちそれぞれの理由・並びを止めた理由）
+    last: Admission,
     /// GUI 無しで立てた（`tako queue serve`）
     headless: bool,
     /// 機の値と論理 CPU 数を固定し、走査の覚えを読まない（**単体テストだけが立てる**。本番は常に
@@ -498,18 +510,7 @@ fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
             stalled: j.stalled,
         })
         .collect();
-    let waiting: Vec<WaitingJob> = a
-        .jobs
-        .values()
-        .filter(|j| j.phase == Phase::Waiting && !j.cancel)
-        .map(|j| WaitingJob {
-            id: j.wire.id,
-            estimate_mb: j.estimate_mb,
-            target_dir: j.wire.target_dir.clone(),
-            priority: j.wire.priority,
-            enqueued_at_ms: j.wire.enqueued_at_ms,
-        })
-        .collect();
+    let waiting = waiting_jobs(a);
     let regather = inj
         .and_then(|i| i.regather_secs)
         .map(Duration::from_secs)
@@ -524,6 +525,7 @@ fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
         waiting: &waiting,
         unmanaged: a.unmanaged,
         regathering,
+        overtake: !legacy_2243(),
     });
     let mut active = running.iter().filter(|r| !r.stalled).count();
     let granted_at = unix_ms();
@@ -535,7 +537,12 @@ fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
             job.granted_at_ms = Some(granted_at);
         }
     }
-    a.blocked = admission.blocked;
+    for (id, n) in &admission.overtaken {
+        if let Some(job) = a.jobs.get_mut(id) {
+            job.overtaken = job.overtaken.saturating_add(*n);
+        }
+    }
+    a.last = admission;
 }
 
 fn current_limits(a: &Arbiter, inj: Option<&Inject>) -> Limits {
@@ -546,10 +553,9 @@ fn current_limits(a: &Arbiter, inj: Option<&Inject>) -> Limits {
     )
 }
 
-/// 待ちの並び（受付番号）
-fn waiting_order(a: &Arbiter) -> Vec<u64> {
-    let waiting: Vec<WaitingJob> = a
-        .jobs
+/// 待ち（取り消した件を除く）を判断の入力の形へ
+fn waiting_jobs(a: &Arbiter) -> Vec<WaitingJob> {
+    a.jobs
         .values()
         .filter(|j| j.phase == Phase::Waiting && !j.cancel)
         .map(|j| WaitingJob {
@@ -558,9 +564,28 @@ fn waiting_order(a: &Arbiter) -> Vec<u64> {
             target_dir: j.wire.target_dir.clone(),
             priority: j.wire.priority,
             enqueued_at_ms: j.wire.enqueued_at_ms,
+            overtaken: j.overtaken,
         })
-        .collect();
-    q::order_waiting(&waiting).iter().map(|w| w.id).collect()
+        .collect()
+}
+
+/// 待ちの並び（受付番号）
+fn waiting_order(a: &Arbiter) -> Vec<u64> {
+    q::order_waiting(&waiting_jobs(a))
+        .iter()
+        .map(|w| w.id)
+        .collect()
+}
+
+/// 待ちの 1 件が待つ理由の 1 文（status 用）。並びが止まって調べなかった件は止めている理由を添える
+fn waiting_text(last: &Admission, id: u64) -> Option<String> {
+    let own = last.reason_of(id)?;
+    match (own, last.holding_of(id)) {
+        (WaitReason::Ahead, Some(hold)) if *hold != WaitReason::Ahead => {
+            Some(format!("{}（{}）", own.text(), hold.text()))
+        }
+        _ => Some(own.text()),
+    }
 }
 
 /// wrapper の poll（受付・待ちの心拍・割り当て後の開始・実行中の心拍を兼ねる upsert）
@@ -608,12 +633,10 @@ fn poll(wire: &JobWire, now: Instant) -> Result<Value, DispatchError> {
             let position = order.iter().position(|x| *x == id).map_or(0, |p| p + 1);
             let limits = current_limits(&a, inj.as_ref());
             let running = a.jobs.values().filter(|j| j.holds_slot()).count();
-            let reason = if position > 1 {
-                WaitReason::Ahead
-            } else {
-                a.blocked.clone().unwrap_or(WaitReason::Ahead)
-            };
-            let head = a.blocked.clone();
+            // 自分の理由（調べる前に並びが止まった件は Ahead）と、自分を実際に止めているもの
+            // （Ahead なら並びを止めた理由）。`head_*` は旧い wrapper が 2 番目以降で読む欄
+            let reason = a.last.reason_of(id).cloned().unwrap_or(WaitReason::Ahead);
+            let head = a.last.holding_of(id).cloned();
             Ok(json!({
                 "state": "waiting",
                 "position": position,
@@ -819,6 +842,9 @@ pub fn status_section() -> Value {
                 "priority": j.wire.priority.as_str(),
                 "pane": j.wire.pane,
                 "waited_s": wall.saturating_sub(j.wire.enqueued_at_ms) / 1000,
+                "reason": a.last.reason_of(j.wire.id).map(WaitReason::code),
+                "text": waiting_text(&a.last, j.wire.id),
+                "overtaken": j.overtaken,
             })
         })
         .collect();
@@ -832,7 +858,7 @@ pub fn status_section() -> Value {
         "limits": limits_json(&limits, &a.settings),
         "running": running,
         "waiting": waiting,
-        "blocked": a.blocked.as_ref().filter(|_| !order.is_empty()).map(|b| json!({
+        "blocked": a.last.blocked.as_ref().filter(|_| !order.is_empty()).map(|b| json!({
             "reason": b.code(),
             "text": b.text(),
         })),
@@ -958,6 +984,69 @@ mod tests {
         assert_eq!(s["recent"][0]["exit_code"], 3);
         assert_eq!(s["running"].as_array().unwrap().len(), 1);
         assert_eq!(s["waiting"][0]["id"], u64::from(pids[2]));
+        for k in &mut kids {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+    }
+
+    #[test]
+    fn issue2243_target_dir待ちの先頭を別のdirの後ろが追い越す() {
+        let _g = serial();
+        reset_for_test(Some(Role::Production));
+        set_limits_in_memory(3);
+        let mut kids = alive_children(4);
+        let pids: Vec<u32> = kids.iter().map(|c| c.id()).collect();
+        let in_dir = |pid: u32, at: u64, dir: &str| JobWire {
+            target_dir: Some(dir.into()),
+            ..wire(pid, at)
+        };
+        let now = Instant::now();
+        assert_eq!(
+            poll(&in_dir(pids[0], 1, "/x"), now).unwrap()["state"],
+            "granted"
+        );
+        let a = poll(&in_dir(pids[1], 2, "/x"), now).unwrap();
+        assert_eq!(
+            (a["position"].as_u64(), a["reason"].as_str()),
+            (Some(1), Some("target_dir")),
+            "{a}"
+        );
+        // 実行 1/3 で空き枠がある: 別の dir の後ろは待たずに入る（修正前は「前に 1 件」で待った）
+        let b = poll(&in_dir(pids[2], 3, "/y"), now).unwrap();
+        assert_eq!(b["state"], "granted", "{b}");
+        // 同じ dir の後ろは先頭の後ろ（自分の理由も target dir）
+        let c = poll(&in_dir(pids[3], 4, "/x"), now).unwrap();
+        assert_eq!(
+            (c["position"].as_u64(), c["reason"].as_str()),
+            (Some(2), Some("target_dir")),
+            "{c}"
+        );
+        let s = status_section();
+        assert_eq!(s["waiting"][0]["id"], u64::from(pids[1]), "{s}");
+        assert_eq!(s["waiting"][0]["reason"], "target_dir");
+        assert_eq!(s["waiting"][0]["overtaken"], 1, "先頭は 1 回追い越された");
+        assert_eq!(
+            s["waiting"][0]["text"],
+            "同じ target dir を使う処理が走っている"
+        );
+        assert_eq!(
+            s["blocked"]["reason"], "target_dir",
+            "先頭が待つ理由は今まで通り"
+        );
+        // 持ち主が終わると先頭が入り、同じ dir の後ろは先頭の後ろで待つ
+        let mut holder = in_dir(pids[0], 1, "/x");
+        holder.child_pid = Some(pids[0]);
+        holder.exit_code = Some(0);
+        done(&holder, now).unwrap();
+        assert_eq!(
+            poll(&in_dir(pids[3], 4, "/x"), now).unwrap()["state"],
+            "waiting"
+        );
+        assert_eq!(
+            poll(&in_dir(pids[1], 2, "/x"), now).unwrap()["state"],
+            "granted"
+        );
         for k in &mut kids {
             let _ = k.kill();
             let _ = k.wait();
