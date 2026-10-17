@@ -20,15 +20,6 @@
 
 ---
 
-## 2026-10-17（#2255: check-health の認証確認を上限つき（既定 10 秒・3 系統を並べて）にし、打ち切りは「認証: 不明（N 秒で応答なし）」）
-- `setup_bootstrap::status_all_within` / `agent_probe::output_within`・A/B `TAKO_2255_LEGACY=1`・番犬 `issue2255_diagnostics_auth_probe_watchdog`（call_graph で collect から辿る）・実経路 41 PASS。残りの上限なし 3 か所は #1533 へ。PR #2259
-
-## 2026-10-17（#2254: tako queue の実行中の予約をピーク後に返し、見込みを過去の記録 `resources/history.jsonl` から引く。諦めた件に押さえていた処理と量を出す）
-- A/B `TAKO_2254_LEGACY=1`・`scripts/test-queue-reservation-2254.sh` PASS=14・番犬 `issue2254_queue_reservation_watchdog`・カタログ +0 B。PR #2258
-
-## 2026-10-17（#2256: 黙った既定落としの残り = worker の spawn・解消エージェントは「立てて警告」（`load_caller_profile`・退避つき）、adopt の起動時プロファイル・guide・自動復帰の既定は読むだけで理由（`read_for_judgment`）。`guide local-rules` は「無い」ではなく「読めない」を返す）
-- A/B `TAKO_2256_LEGACY=1`・結合 2 本 + 番犬の注入 23 → 40 種・カタログ増 0 B。PR #2260
-
 ## 2026-10-17（#2252: 夜間リリースに「検査だけ」の役 = `scripts/nightly-release.sh --role check`。2 台構成でリリースしない PC は mod の検査と footprint の見張りだけ・既定は全部）
 - モック 75 PASS・旧版に当てると 31 FAIL。手元の Mac に `--role check` を設定済み。旧 Mac で検査が回っていない件は #2262。PR #2261
 
@@ -79,3 +70,12 @@
 
 ## 2026-10-18（#2285: verify-setup-multiagent.sh のスタブが #1959 の `claude --version` を対話起動と数えて落ちていた = 製品の回帰ではない。スタブが版に即答し argv を記録・検出力の自己検査・CI の macOS へ登録・番犬 `issue2285_setup_multiagent_ci_watchdog`）
 - 製品の版の問い合わせを引数なしへ注入すると `claude argv=[]` で落ちる（検出力を保持）。初回 setup で mod が入らない件は #2292。PR #2290
+
+## 2026-10-18（#1668: Code Runner の変数展開を実行ペインの方言で引用 = `ShellDialect::quote_fragment`（PowerShell は特別な文字の前にだけバッククオート。単引用符は `-o 'x'.exe` がメンバー参照になるので不採用・about_Parsing））
+- pwsh 7 の構文木で Windows の展開 8,352 件: 修正前 3,239 件食い違い → 0 件・macOS は `tako:shell: pwsh` 以外不変・番犬 `issue1668_runner_quote_dialect_watchdog`・カタログ -18 B。残りの経路は #2286。PR #2289
+
+## 2026-10-18（#1638: worker の宣言 / 実際のモデルを分けて持つ = transcript の最初の応答の model を `model_actual` に・食い違いは workers / worker_status の warnings と persist.log・ledger stats は実際のモデルで・codex / agy は matrix で degraded）
+- A/B `TAKO_1638_LEGACY=1`・実経路 17 PASS・カタログ +479 B。PR #2291
+
+## 2026-10-18（#2292: 新品の HOME の 1 回目の setup で tako mod が入らず、2 回目に入っても「変更なし」と出ていた → mod の段を `~/.claude` を作る指示ファイルの段の後ろへ移し、書いた・外した dir を最終サマリへ積む）
+- 実経路 `scripts/test-setup-mod-first-run-2292.sh` 40 PASS（修正前 10 FAIL）を CI へ・番犬 `issue2292_setup_mod_first_run_watchdog`。PR #2294

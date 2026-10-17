@@ -635,3 +635,6 @@
 - 2026-10-17 #2238: UTF-8 でない settings.json / run-configs.json / ui.json も `LoadIssue::read_failed`（= `quarantine_raw`）でバイトのまま番号付きの退避へ。番犬の `SLOT_KNOWN` は空
 - 2026-10-17 #2233: 黙った既定落としの残り = 引き継ぎの後任（専用プロファイルが無い / 読めないときも止めない）と `tako solo` は「立てて警告」、self / supervisor status / setup の表示は読むだけで `warnings`、PWA の「+ master…
 - 2026-10-17 #1891: check-health に tako mod の項目 = `claude_mod` 節（`tako mod --json` と同じキー・同じ値・同じ行の関数）・報告の無い理由をコマンド行と起動時の env で 1 つに決める `classify_no_report`
+- 2026-10-17 #2255: check-health の認証確認を上限つき（既定 10 秒・3 系統を並べて）にし、打ち切りは「認証: 不明（N 秒で応答なし）」
+- 2026-10-17 #2254: tako queue の実行中の予約をピーク後に返し、見込みを過去の記録 `resources/history.jsonl` から引く。諦めた件に押さえていた処理と量を出す
+- 2026-10-17 #2256: 黙った既定落としの残り = worker の spawn・解消エージェントは「立てて警告」（`load_caller_profile`・退避つき）、adopt の起動時プロファイル・guide・自動復帰の既定は読むだけで理由（`read_for_judgment`）。`guid…
