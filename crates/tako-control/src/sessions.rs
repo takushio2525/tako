@@ -216,7 +216,12 @@ impl SessionCatalog {
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("sessions.yaml の読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| format!("sessions.yaml のパースに失敗: {e}"))
+        serde_yaml::from_str(&content).map_err(|e| {
+            format!(
+                "sessions.yaml のパースに失敗: {}",
+                tako_core::load_issue::yaml_error_reason(&e, &content)
+            )
+        })
     }
 
     pub fn load() -> Result<Self, String> {

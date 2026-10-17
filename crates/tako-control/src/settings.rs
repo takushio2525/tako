@@ -450,7 +450,9 @@ fn load_and_report(path: &std::path::Path) -> (Option<Settings>, Option<String>)
             if !UNREADABLE_SEEN.first_sighting(path, &json) {
                 return (None, None);
             }
-            let line = unreadable_line(path, &e.to_string(), quarantine.as_ref());
+            // 理由は種類と行・列だけ（#2230。serde の素の文言は型が違うと設定の値を引用する）
+            let reason = tako_core::load_issue::json_error_reason(&e);
+            let line = unreadable_line(path, &reason, quarantine.as_ref());
             crate::diag::persist_log(&line);
             (None, Some(line))
         }

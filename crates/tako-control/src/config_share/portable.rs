@@ -197,16 +197,24 @@ pub fn strip_local_fields(
     }
     match format {
         Format::Yaml => {
-            let mut value: serde_yaml::Value =
-                serde_yaml::from_str(content).map_err(|e| format!("YAML のパースに失敗: {e}"))?;
+            let mut value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| {
+                format!(
+                    "YAML のパースに失敗: {}",
+                    tako_core::load_issue::yaml_error_reason(&e, content)
+                )
+            })?;
             for field in fields {
                 yaml_remove(&mut value, &split_field_path(field));
             }
             serde_yaml::to_string(&value).map_err(|e| format!("YAML の出力に失敗: {e}"))
         }
         Format::Json => {
-            let mut value: serde_json::Value =
-                serde_json::from_str(content).map_err(|e| format!("JSON のパースに失敗: {e}"))?;
+            let mut value: serde_json::Value = serde_json::from_str(content).map_err(|e| {
+                format!(
+                    "JSON のパースに失敗: {}",
+                    tako_core::load_issue::json_error_reason(&e)
+                )
+            })?;
             for field in fields {
                 json_remove(&mut value, &split_field_path(field));
             }
@@ -231,8 +239,12 @@ pub fn restore_local_fields(
     };
     match format {
         Format::Yaml => {
-            let mut target: serde_yaml::Value =
-                serde_yaml::from_str(shared).map_err(|e| format!("YAML のパースに失敗: {e}"))?;
+            let mut target: serde_yaml::Value = serde_yaml::from_str(shared).map_err(|e| {
+                format!(
+                    "YAML のパースに失敗: {}",
+                    tako_core::load_issue::yaml_error_reason(&e, shared)
+                )
+            })?;
             let source: serde_yaml::Value = match serde_yaml::from_str(local) {
                 Ok(v) => v,
                 // ローカルが壊れていても取り込みは進める（ローカル値の復元だけ諦める）
@@ -244,8 +256,12 @@ pub fn restore_local_fields(
             serde_yaml::to_string(&target).map_err(|e| format!("YAML の出力に失敗: {e}"))
         }
         Format::Json => {
-            let mut target: serde_json::Value =
-                serde_json::from_str(shared).map_err(|e| format!("JSON のパースに失敗: {e}"))?;
+            let mut target: serde_json::Value = serde_json::from_str(shared).map_err(|e| {
+                format!(
+                    "JSON のパースに失敗: {}",
+                    tako_core::load_issue::json_error_reason(&e)
+                )
+            })?;
             let source: serde_json::Value = match serde_json::from_str(local) {
                 Ok(v) => v,
                 Err(_) => return Ok(shared.to_string()),

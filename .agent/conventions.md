@@ -24,6 +24,9 @@
 
 - `tracing` クレート。レベル: `debug` / `info` / `warn` / `error`
 - **ペイン内容・送信テキスト・`TAKO_TOKEN` をログに書かない**（ユーザーの入力・秘密情報を含むため）
+- **設定・データファイルの値も書かない**: 読めない理由は serde の素の文言を使わず
+  `tako_core::load_issue::{json_error_reason, yaml_error_reason}`（種類と行・列）で組む
+  （個人ルールや鍵らしき値が混じる。#2230。下の「読めない理由にファイルの中身を載せない」）
 
 ## フォーマット / Lint
 
@@ -3330,6 +3333,38 @@ false になり、`status` の予告と `run` の報告が食い違った。
   `crates/tako-control/tests/issue2231_raw_quarantine_ab.rs`（recent は GUI の OpenDir と同じ
   load → push → save、shortcuts は dispatch の本体）・番犬 `issue2231_raw_quarantine_watchdog.rs`・
   実経路 `scripts/test-nonutf8-quarantine-2231.sh`
+
+### 読めない理由にファイルの中身を載せない（Issue #2230）
+
+#1824 の後も、移行の記録（`validate` = `json_ok` / `yaml_ok` → `移行できず:` の行）・settings.json の
+申告・`[projects add]` / `[adopt]` / `[master]` の行（#1825 / #2227。理由は継承元の default.yaml の
+読み手）・引き継ぎの移行の警告（projects.yaml の読み手）が serde の**素の文言**を persist.log へ
+書いていた。素の文言は型が違うと値を、YAML はそこまでのキーの道筋（`projects.<キー>.cwd`）も
+引用する（`bypass_sandbox: <値>` → `invalid type: string "<値>", expected a boolean`）。
+
+- **ファイルの中身を解釈した誤りの理由は、作る所で中身を落とす**: JSON は
+  `tako_core::load_issue::json_error_reason(&e)`、YAML は `yaml_error_reason(&e, text)`
+  （`text` = 解釈しようとした中身。種類の判定に型を問わず読み直す）。形は「種類 + 行・列」:
+  `JSON の形が期待と違う（1 行 23 列）` / `JSON の構文が壊れている` / `JSON が途中で切れている` /
+  `YAML の形が期待と違う（4 行 17 列）` / `YAML の構文が壊れている` / `YAML が空`。
+  位置が無い誤り（YAML の複数の文書など）は種類だけ。読めない（UTF-8 でない・権限）は従来どおり
+  `読み取りに失敗: <io の文言>`（io の文言は中身を含まない）
+- 流れ先（persist.log・応答の `warnings`・CLI の `警告:` 行・`tako migrate` の応答・master の
+  system prompt）で分けずに**画面にも同じ中身なしの理由**を出す。理由の文字列は `FileOutcome` /
+  `ProfileGen` / 引き継ぎの警告を経て画面と記録の両方へ同じ値のまま流れるので、二つ持つと
+  取り違えた方が persist.log へ届く。MCP の応答と system prompt は AI 側の会話記録にも残る。
+  利用者が直す手がかりはパスと行・列で足りる（その位置を開けば値が見える）
+- 素の文言を使ってよいのは**ファイルでない入力**（IPC・HTTP・子プロセスの出力・CLI / MCP の引数・
+  保存前の編集バッファ）だけ。誤りは渡した本人へ返るだけで診断ログへ書かない
+- 番犬 `crates/tako-control/tests/issue2230_serde_reason_watchdog.rs` が本番コードの
+  `serde_json::from_*` / `serde_yaml::from_*` の誤りを `{e}` / `{e:?}` / `e.to_string()` /
+  位置引数で文字列にした所を `file:line` で名指す。ファイルでない入力は同じファイルの許可表
+  `ALLOWED` に理由つきで載せる（使われなくなった許可も落とす）。persist.log へ流れる主な口
+  （`json_ok` / `yaml_ok` / settings の `load_and_report` / `read_profile_base_at`）が中身を落とす
+  関数を呼んでいることも別に見る
+- A/B は `TAKO_2230_LEGACY=1`（素の文言へ戻す）。実経路は
+  `crates/tako-cli/tests/issue2230_persist_log_serde_reason.rs`（settings.json / profiles /
+  projects.yaml に目印の値を入れて persist.log・CLI の行・system prompt で数える）
 
 ### 置き場を変える移行は隔離中に走らせない（Issue #1019）
 

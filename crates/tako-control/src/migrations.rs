@@ -43,18 +43,19 @@ pub enum Mode {
 // --- 検証（今の形式として読めるか） -----------------------------------------
 //
 // 「読めない」を**黙って既定値へ落とさない**ための実装。ここで Err になったものは
-// 退避されて `tako migrate status` の警告行になる。
+// 退避されて `tako migrate status` の警告行になる。理由は**中身を含めない**（#2230。
+// `移行できず:` の行として persist.log へもそのまま載る。serde の素の文言は型が違うと値を引用する）
 
 fn json_ok<T: serde::de::DeserializeOwned>(text: &str) -> Result<(), String> {
     serde_json::from_str::<T>(text)
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| tako_core::load_issue::json_error_reason(&e))
 }
 
 fn yaml_ok<T: serde::de::DeserializeOwned>(text: &str) -> Result<(), String> {
     serde_yaml::from_str::<T>(text)
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| tako_core::load_issue::yaml_error_reason(&e, text))
 }
 
 fn validate_settings(text: &str) -> Result<(), String> {
@@ -208,6 +209,14 @@ fn has_top_level_key(text: &str, key: &str) -> bool {
 /// プロファイルの現在の世代
 const PROFILE_VERSION: u32 = 3;
 
+/// 手順の途中でプロファイルを読めなかった理由（中身を含めない。#2230）
+fn profile_unreadable(e: &serde_yaml::Error, text: &str) -> String {
+    format!(
+        "プロファイルとして読めない: {}",
+        tako_core::load_issue::yaml_error_reason(e, text)
+    )
+}
+
 const PROFILE_V1_TO_V2: Note = Note::new(
     "旧既定モデル claude-opus-4-6[1m] の指定を外す（Pro プランで master が起動できないため。#27）",
     "Drop the legacy default model claude-opus-4-6[1m] (it prevents master from starting on the Pro plan; #27)",
@@ -217,7 +226,7 @@ const PROFILE_V1_TO_V2: Note = Note::new(
 /// コメントも他の設定もそのまま残る（読めなくなる書式だけ serde 経由で作り直す）
 fn strip_legacy_default_model(text: &str) -> Result<Option<String>, String> {
     let profile: crate::orchestrator::Profile =
-        serde_yaml::from_str(text).map_err(|e| format!("プロファイルとして読めない: {e}"))?;
+        serde_yaml::from_str(text).map_err(|e| profile_unreadable(&e, text))?;
     if profile.model.as_deref() != Some(crate::orchestrator::LEGACY_DEFAULT_MODEL) {
         // 既に外れている = 二度目。冪等（何もしない）
         return Ok(None);
@@ -263,7 +272,7 @@ fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, String> {
     }
     // 読めることを確かめてから触る（読めないものは validate 側が退避する）
     serde_yaml::from_str::<crate::orchestrator::Profile>(text)
-        .map_err(|e| format!("プロファイルとして読めない: {e}"))?;
+        .map_err(|e| profile_unreadable(&e, text))?;
     // **行の追記で済ませる**（コメントも書式もそのまま残す。serde で作り直すと
     // 利用者が書いたコメントが消える）
     let mut out = text.to_string();
@@ -274,7 +283,7 @@ fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, String> {
     if serde_yaml::from_str::<crate::orchestrator::Profile>(&out).is_err() {
         // 追記で読めなくなる書式（フロー形式など）は serde で作り直す
         let mut rebuilt: crate::orchestrator::Profile =
-            serde_yaml::from_str(text).map_err(|e| format!("プロファイルとして読めない: {e}"))?;
+            serde_yaml::from_str(text).map_err(|e| profile_unreadable(&e, text))?;
         rebuilt.bypass_sandbox = true;
         return serde_yaml::to_string(&rebuilt)
             .map(Some)

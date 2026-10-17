@@ -10,6 +10,10 @@
 //! 文字として読めない中身（UTF-8 でない・権限で読めない）は文字列の退避口を通れないので、
 //! バイトのまま移す（`migration::quarantine_raw`。#2231）。読み手ごとに書き分けると、
 //! 片方だけ退避を忘れる形が戻る
+//!
+//! 理由の文字列は**ファイルの中身を含めない**（種類と行・列だけ）。serde の素の文言は型が違うと
+//! 読んだ値を引用するので、ファイルを読む口は JSON なら [`json_error_reason`]、YAML なら
+//! [`yaml_error_reason`] で理由を組む（#2230）。
 
 use std::path::Path;
 
@@ -51,6 +55,123 @@ pub fn json_reason(e: &serde_json::Error) -> String {
         Category::Io => "読み取りに失敗",
     };
     format!("{kind}（{} 行 {} 列）", e.line(), e.column())
+}
+
+/// YAML を解釈できなかった理由を**中身を含めずに**言う（#2230。[`json_reason`] の YAML 版）。
+///
+/// serde_yaml の文言は型が違うと `n: invalid type: string "<ファイルの値>"` のように、読んだ値と
+/// そこまでのキーの道筋（`projects.<キー>.cwd`）をそのまま含む（実測）。種類は文言を読まずに、
+/// `text`（解釈しようとした中身）を型を問わずに読み直して決める: 構文として読めない /
+/// 値が無い（空・コメントだけ・`~`）/ 形が違う。位置は serde_yaml の `location()`（1 始まり）で、
+/// 位置を持たない誤り（複数の文書など）は種類だけ
+pub fn yaml_reason(e: &serde_yaml::Error, text: &str) -> String {
+    let kind = if serde_yaml::from_str::<serde::de::IgnoredAny>(text).is_err() {
+        "YAML の構文が壊れている"
+    } else if matches!(
+        serde_yaml::from_str::<serde_yaml::Value>(text),
+        Ok(serde_yaml::Value::Null)
+    ) {
+        "YAML が空"
+    } else {
+        "YAML の形が期待と違う"
+    };
+    match e.location() {
+        Some(at) => format!("{kind}（{} 行 {} 列）", at.line(), at.column()),
+        None => kind.to_string(),
+    }
+}
+
+/// #2230 の A/B。`TAKO_2230_LEGACY=1` で修正前（serde の素の文言 = 型が違うと値を引用する）へ戻す
+pub fn legacy_raw_serde_reason() -> bool {
+    std::env::var_os("TAKO_2230_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// **ファイルの中身**を JSON として解釈できなかった理由（#2230）。中身は [`json_reason`]。
+///
+/// 読む口の理由は persist.log（`migrations::record` / settings の申告）・応答の `warnings`・
+/// CLI の行・master の system prompt へ同じ文字列のまま流れるので、作る所で中身を落とす。
+/// 素の serde の文言を使ってよいのはファイルでない入力（IPC・HTTP・子プロセスの出力）だけで、
+/// 番犬 `issue2230_serde_reason_watchdog` の許可表に理由つきで載せる
+pub fn json_error_reason(e: &serde_json::Error) -> String {
+    if legacy_raw_serde_reason() {
+        return e.to_string();
+    }
+    json_reason(e)
+}
+
+/// [`json_error_reason`] の YAML 版。`text` は解釈しようとした中身（[`yaml_reason`] が読み直す）
+pub fn yaml_error_reason(e: &serde_yaml::Error, text: &str) -> String {
+    if legacy_raw_serde_reason() {
+        return e.to_string();
+    }
+    yaml_reason(e, text)
+}
+
+#[cfg(test)]
+mod yaml_reason_tests {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct S {
+        n: u32,
+        #[serde(default)]
+        map: std::collections::BTreeMap<String, Inner>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Inner {
+        v: u32,
+    }
+
+    fn reason(body: &str) -> String {
+        let e = serde_yaml::from_str::<S>(body).expect_err("読めない");
+        yaml_reason(&e, body)
+    }
+
+    /// 型が違うと serde_yaml の文言は値とキーの道筋を含むが、理由には載せない
+    #[test]
+    fn 理由に中身を載せない() {
+        let nested = "n: 1\nmap:\n  KEY_MARK:\n    v: VALUE_MARK\n";
+        let cases = [
+            ("n: VALUE_MARK\n", "YAML の形が期待と違う（1 行 4 列）"),
+            (nested, "YAML の形が期待と違う（4 行 8 列）"),
+            ("VALUE_MARK\n", "YAML の形が期待と違う（1 行 1 列）"),
+            ("n: 1\nn: 2\n", "YAML の形が期待と違う（1 行 1 列）"),
+            (
+                "n: 1\nmap:\n  k: \"VALUE_MARK\n",
+                "YAML の構文が壊れている（4 行 1 列）",
+            ),
+            ("n: 1\n\tmap: {}\n", "YAML の構文が壊れている（2 行 1 列）"),
+            ("n: 1\n---\nn: 2\n", "YAML の構文が壊れている"),
+            ("", "YAML が空（1 行 1 列）"),
+            ("# VALUE_MARK だけ\n", "YAML が空（2 行 1 列）"),
+        ];
+        for (body, want) in cases {
+            assert_eq!(reason(body), want, "{body:?}");
+        }
+        let raw = serde_yaml::from_str::<S>(nested)
+            .expect_err("読めない")
+            .to_string();
+        assert!(
+            raw.contains("VALUE_MARK") && raw.contains("KEY_MARK"),
+            "前提: 素の文言は値とキーを含む: {raw}"
+        );
+    }
+
+    /// A/B の旧挙動は素の文言（修正前の再現）。既定は中身を含めない
+    #[test]
+    fn 既定は中身を含めない() {
+        let yaml = serde_yaml::from_str::<S>("n: VALUE_MARK\n").expect_err("読めない");
+        let json = serde_json::from_str::<S>(r#"{"n": "VALUE_MARK"}"#).expect_err("読めない");
+        if legacy_raw_serde_reason() {
+            return;
+        }
+        assert!(!yaml_error_reason(&yaml, "n: VALUE_MARK\n").contains("VALUE_MARK"));
+        assert!(!json_error_reason(&json).contains("VALUE_MARK"));
+        assert_eq!(json_error_reason(&json), json_reason(&json));
+    }
 }
 
 impl LoadIssue {
