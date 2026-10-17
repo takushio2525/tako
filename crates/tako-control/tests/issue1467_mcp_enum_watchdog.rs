@@ -718,8 +718,8 @@ fn 逆戻りを名指しできる() {
 
     // (6) 束縛側（agent 3 系統）の 1 site だけが古くなる
     let injected = clean.replace(
-        "                    \"agent\": { \"type\": \"string\", \"enum\": [\"claude\", \"codex\", \"agy\"], \"description\": \"エージェント種別（省略時はプロファイル既定）\" },",
-        "                    \"agent\": { \"type\": \"string\", \"enum\": [\"claude\", \"codex\"], \"description\": \"エージェント種別（省略時はプロファイル既定）\" },",
+        "                    \"agent\": { \"type\": \"string\", \"enum\": [\"claude\", \"codex\", \"agy\"], \"description\": \"エージェント種別（省略はプロファイル既定）\" },",
+        "                    \"agent\": { \"type\": \"string\", \"enum\": [\"claude\", \"codex\"], \"description\": \"エージェント種別（省略はプロファイル既定）\" },",
     );
     expect_hit(&clean, &injected, "の enum が正本とズレた");
 
