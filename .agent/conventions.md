@@ -971,6 +971,25 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
   （`collect_worker_status_ctx(&host, 999_999)`）と JSON の `"pane": N` は見ない（既知の穴）ので、
   この節で縛る
 
+## 自分のテストバイナリを子で起こすなら、目印は行の途中から拾う（Issue #2248）
+
+**子のテスト（`current_exe()` を `--exact <名前> --nocapture` で起こす）が `println!` した目印を、
+親は行頭一致（`strip_prefix("目印")` / `starts_with("目印")`）で読まないこと。**
+直列の libtest（`--test-threads=1`、または親から受け継いだ env `RUST_TEST_THREADS=1`）は
+`test <名前> ... ` を改行せずに出すので、子の 1 行目がその後ろへつながる。
+
+- 実物: issue2035 / issue2048 のテストは CI（env なし = 並列）では緑で、`RUST_TEST_THREADS=1` を
+  渡した全体テストでだけ落ちた（#2248）
+- **書き方**: 目印は `split_once("目印")` で拾い、子は `--test-threads=1` で起こす（出力の形が親の
+  env に依らず 1 つに決まり、直した読み方が毎回の CI で試される）。先例は `ipc.rs` の `run_fd_child`・
+  `test_write_isolation.rs`・`issue2151_git_bin_oncelock.rs`。子の結果をファイルへ書かせる形
+  （LSP の e2e）・`contains("1 passed")` で見る形はこの問題を持たない
+- **番犬**: `crates/tako-control/tests/issue2248_child_marker_watchdog.rs` が、子を起こすファイル
+  （`current_exe()` と `"--exact"` を含む）で、`--exact` で名指しした子のテストの本体が
+  `print!` / `println!` で出す書式文字列の頭を `.strip_prefix("…")` / `.starts_with("…")` で読む行を
+  `file:line` で落とす。本当に行頭に来るなら同じ行か 1 行上に `// 行頭一致安全: <理由>`。
+  子の名前を引数や変数で渡す形と、目印を定数で書く形は見ない（既知の穴）
+
 ## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
 
 **「その pid は生きているか」を自前で書かない。`tako_core::platform::process::pid_alive`
