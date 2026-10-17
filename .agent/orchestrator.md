@@ -414,7 +414,7 @@ A/B は `TAKO_2227_LEGACY=1`（修正前 = 黙って組み込み既定 / 直し�
 
 | 経路 | 種別 | 扱い |
 |---|---|---|
-| 引き継ぎの後任（`tako orchestrator handoff`） | 起動 | `master_launch::load_successor_profile`（= `load_profile`）。読めない default は組み込み既定で立てて、前任への応答の `warnings`・persist.log・**後任の system prompt** へ出す。専用プロファイル（`master:<key>`）が読めなければ**ペインを分割する前に**止める（前任は残る。修正前は組み込み既定の後任を黙って立てていた） |
+| 引き継ぎの後任（`tako orchestrator handoff`） | 起動 | `master_launch::load_successor_profile`（= `load_profile`）。読めない default は組み込み既定で立てて、前任への応答の `warnings`・persist.log・**後任の system prompt** へ出す。専用プロファイル（`master:<key>`）が無い・読めないときも**引き継ぎは止めずに**組み込み既定で立てて同じ 3 か所へ出す（前任は ctx の上限に近いので、止めると人の居ない時間帯に master を失いうる。`tako master -<key>` は人が打つので止めて直させる、と役割が違う。修正前はどちらも黙って立てていた） |
 | `tako solo` | 起動 | `master_launch::load_solo`。`solo-profiles/default.yaml` が読めなければ solo の組み込み既定で立てて `警告:` 行・persist.log の `[solo] default: …`・solo 本人の system prompt へ出し、中身は退避する |
 | `orchestrator self` / `supervisor status` | 表示 | `orchestrator::load_for_display`（**読むだけ** = 退避しない）。既定値で答えるが、理由を応答の `warnings` へ出す |
 | `tako setup` の「次の一歩」 | 表示 | 同上。組み込み既定を「現在の default」と呼ばず、`警告:` 行と「組み込み既定:」で出す |

@@ -290,6 +290,15 @@ fn scan_launch(src: &str) -> Vec<Offender> {
                         .into(),
                 );
             }
+            // 読めなくても引き継ぎは止めないが、既定で立てた理由を warning と persist.log に持つ
+            if !window_has(&window, "warning: Some(") || !window_has(&window, "persist_log(") {
+                push(
+                    at,
+                    "読めない後任のプロファイルを既定で立てるのに warning / persist.log を持たない \
+                     = 黙って組み込み既定の後任が立つ（#2233）"
+                        .into(),
+                );
+            }
         }
     }
 
@@ -784,7 +793,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: DISPATCH,
             fn_needle: "fn dispatch_orchestrator_handoff(",
-            from: "} = orchestrator::master_launch::load_successor_profile(profile_name)\n        .map_err(DispatchError::Operation)?;",
+            from: "} = orchestrator::master_launch::load_successor_profile(profile_name);",
             to: "} = orchestrator::master_launch::LaunchProfile { profile: orchestrator::Profile::load(profile_name).unwrap_or_default(), warning: None };",
             marker: "orchestrator::Profile::load(profile_name)",
         },
@@ -872,8 +881,16 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: LAUNCH,
             fn_needle: "pub fn load_successor_profile(",
-            from: "load_profile(name).map_err(",
-            to: "Ok::<LaunchProfile, String>(LaunchProfile { profile: Profile::load(name).unwrap_or_default(), warning: None }).map_err(",
+            from: "match load_profile(name) {",
+            to: "match Ok::<LaunchProfile, String>(LaunchProfile { profile: Profile::load(name).unwrap_or_default(), warning: None }) {",
+            marker: "pub fn load_successor_profile(",
+        },
+        // 注入 23: 読めない後任のプロファイルを既定で立てるのに warning を持たない
+        Injection {
+            rel: LAUNCH,
+            fn_needle: "pub fn load_successor_profile(",
+            from: "warning: Some(w),",
+            to: "warning: None,",
             marker: "pub fn load_successor_profile(",
         },
         // 注入 21: 表示だけの経路が退避つきの読み方を使う（表示のたびに書き込む）

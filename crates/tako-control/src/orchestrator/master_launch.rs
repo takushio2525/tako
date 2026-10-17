@@ -258,23 +258,37 @@ pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
 /// 引き継ぎで立てる後任 master のプロファイルを読む（#2233）。
 ///
 /// 読み込みは CLI / スマホ / 返答の配送と同じ [`load_profile`]（読めない default は組み込み既定で
-/// 立てて警告・`-<key>` が読めなければ**ペインを分割する前に**止める = 前任は残る）。
+/// 立てて警告）。`load_profile` が止める形（専用プロファイルが無い・読めない）でも、**引き継ぎは
+/// 止めずに組み込み既定で後任を立てて警告する**: 引き継ぎは前任が ctx の上限に近いときの継続の
+/// 仕組みで、止めると人の居ない時間帯に master そのものを失いうる（`tako master -<key>` は
+/// 人が打つので止めて直させる、と役割が違う）。
+///
 /// 以前は `Profile::load(..).unwrap_or_default()` で、後任だけ個人ルールの抜けた master が
 /// 黙って立っていた（実測）。`TAKO_2233_LEGACY=1` で修正前へ戻す
-pub fn load_successor_profile(name: &str) -> Result<LaunchProfile, String> {
+pub fn load_successor_profile(name: &str) -> LaunchProfile {
     if orchestrator::legacy_silent_default_rest() {
-        return Ok(LaunchProfile {
+        return LaunchProfile {
             profile: Profile::load(name).unwrap_or_default(),
             warning: None,
-        });
+        };
     }
-    // 前任が読む文なので、どのプロファイルか・前任は残ることまで言う（パース失敗の文には名前が無い）
-    load_profile(name).map_err(|e| {
-        format!(
-            "後任 master のプロファイル '{name}' を読めないので、ペインを分割せずに引き継ぎを止めた\
-             （前任はそのまま）: {e}"
-        )
-    })
+    match load_profile(name) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            // 前任と後任が読む文なので、どのプロファイルか・何が抜けるかまで言う
+            // （パース失敗の文にはプロファイルの名前が無い）
+            let w = format!(
+                "後任 master のプロファイル '{name}' を読めない（{e}）。引き継ぎは止めずに、\
+                 個人ルール（prompt_blocks）・モデル・アカウントなどの設定を使わない組み込み既定で\
+                 後任を立てる。プロファイルを直すと次の起動から効く"
+            );
+            crate::diag::persist_log(&format!("[master] {name}: {w}"));
+            LaunchProfile {
+                profile: Profile::default(),
+                warning: Some(w),
+            }
+        }
+    }
 }
 
 /// `tako solo` の起動で使うプロファイルを読む（#2233）。master の [`load_profile`] と同じ形:

@@ -14932,14 +14932,12 @@ fn dispatch_orchestrator_handoff(
     // #915 / #916: 読む前に旧形式を自動移行する（実行時の差分検出。冪等）
     let migration = orchestrator::handoff_store::ensure_migrated(profile_name);
 
-    // プロファイルの読み込み（#2233: `tako master` と同じ 1 実装。読めない default は組み込み既定で
-    // 立てるが黙らない = 応答の warnings・persist.log・後任の system prompt。`-<key>` が読めなければ
-    // ペインを分割する前に止める = 前任は残る）
+    // プロファイルの読み込み（#2233: `tako master` と同じ 1 実装。読めなければ組み込み既定で
+    // 立てるが黙らない = 応答の warnings・persist.log・後任の system prompt。引き継ぎは止めない）
     let orchestrator::master_launch::LaunchProfile {
         profile,
         warning: load_warning,
-    } = orchestrator::master_launch::load_successor_profile(profile_name)
-        .map_err(DispatchError::Operation)?;
+    } = orchestrator::master_launch::load_successor_profile(profile_name);
 
     // #915: 管轄プロジェクトの解決。明示引数 → プロファイル担当 + 稼働 worker → worker のみ
     let jurisdiction =

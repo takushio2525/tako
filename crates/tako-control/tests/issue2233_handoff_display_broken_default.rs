@@ -292,27 +292,56 @@ fn successor_good_and_absent_are_quiet() {
     assert!(!case.default_yaml().exists(), "読むだけで作らない");
 }
 
-/// 専用プロファイル（`master:<key>`）が読めないなら、**ペインを分割する前に**止める（前任は残る）。
+/// 専用プロファイル（`master:<key>`）が読めない・無いときも、**引き継ぎは止めずに**組み込み既定で
+/// 後任を立てて警告する（前任は ctx の上限に近いので、止めると master そのものを失いうる）。
 /// 修正前は組み込み既定の後任を黙って立てていた
-fn successor_named_profile_stops_before_split() {
-    for legacy in [false, true] {
+fn successor_named_profile_warns() {
+    for (body, legacy) in [(Some(BROKEN), false), (None, false), (Some(BROKEN), true)] {
         let case = Case::new(Some(GOOD), legacy);
-        std::fs::write(case.profiles().join("p2233.yaml"), BROKEN).expect("p2233.yaml");
+        let named = case.profiles().join("p2233.yaml");
+        if let Some(body) = body {
+            std::fs::write(&named, body).expect("p2233.yaml");
+        }
         std::fs::write(case.handoff_dir().join("p2233.md"), MEMO).expect("運用メモ");
         let mut host = Host::new();
         let before = host.pane_count();
-        let got = handoff(&mut host, "master:p2233");
+        let v = handoff(&mut host, "master:p2233").expect("引き継ぎは止めない");
+        assert_eq!(host.pane_count(), before + 1, "後任のペインが立っていない");
+        let prompt = case.prompt("p2233");
+        assert!(!prompt.contains(RULE), "読めないはずの個人ルールがある");
+        let w = warnings(&v).into_iter().find(|w| w.contains("'p2233'"));
         if legacy {
-            got.expect("修正前は黙って立てる");
-            assert_eq!(host.pane_count(), before + 1);
-            assert!(!case.prompt("p2233").contains(RULE));
+            assert_eq!(w, None, "修正前の再現になっていない: {v:#}");
+            assert!(!prompt.contains("Startup warning"));
+            assert!(!case.persist_log().contains("[master] p2233:"));
+            continue;
+        }
+        let w = w.unwrap_or_else(|| panic!("後任を既定で立てたことを黙っている: {v:#}"));
+        let why = if body.is_some() {
+            "パース"
         } else {
-            let err = got.expect_err("読めない専用プロファイルで後任を立てている");
-            assert!(
-                err.contains("'p2233'") && err.contains("パース") && err.contains("前任はそのまま"),
-                "どれを直すか・前任が残ることが無い: {err}"
+            "見つからない"
+        };
+        assert!(
+            w.contains(why) && w.contains("組み込み既定") && w.contains("引き継ぎは止めずに"),
+            "理由・何で立てたかが無い: {w}"
+        );
+        assert!(
+            prompt.contains("Startup warning") && prompt.contains("'p2233'"),
+            "後任本人へ渡っていない"
+        );
+        assert!(
+            case.persist_log()
+                .lines()
+                .any(|l| l.contains("[master] p2233:") && l.contains("組み込み既定")),
+            "persist.log に残っていない"
+        );
+        if body.is_some() {
+            assert_eq!(
+                std::fs::read_to_string(&named).expect("元が残る"),
+                BROKEN,
+                "p2233.yaml を書き換えた"
             );
-            assert_eq!(host.pane_count(), before, "止めたのにペインが増えた");
         }
     }
 }
@@ -382,7 +411,7 @@ fn issue2233_壊れたdefaultで後任と表示の経路が黙らない() {
     successor_warns();
     successor_legacy_is_silent();
     successor_good_and_absent_are_quiet();
-    successor_named_profile_stops_before_split();
+    successor_named_profile_warns();
     display_paths_warn();
     display_paths_quiet();
 }
