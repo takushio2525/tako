@@ -1200,24 +1200,30 @@ mod tests {
         assert_eq!(result, "py");
     }
 
+    // 引用の形は実行ペインの方言で変わる（#1668）。下の 3 本は POSIX の形を見るので macOS の列で引く
+    // （Windows の列は `パスの変数は実行ペインの方言で引用する_c言語の既定を両osで固定` が見る）
+
     #[test]
     fn 変数展開_空白パスはクオート() {
         let path = PathBuf::from("/Users/a/my project/main tool.c");
-        let result = expand_variables("cc ${fileBase}", &RunVars::for_file(&path));
+        let posix = RunVars::for_file(&path).on(Platform::MacOs);
+        let result = expand_variables("cc ${fileBase}", &posix);
         assert_eq!(result, "cc 'main tool.c'");
     }
 
     #[test]
     fn 変数展開_日本語パス() {
         let path = PathBuf::from("/Users/a/ドキュメント/テスト.py");
-        let result = expand_variables("python3 ${fileBase}", &RunVars::for_file(&path));
+        let posix = RunVars::for_file(&path).on(Platform::MacOs);
+        let result = expand_variables("python3 ${fileBase}", &posix);
         assert_eq!(result, "python3 'テスト.py'");
     }
 
     #[test]
     fn 変数展開_シングルクオート含み() {
         let path = PathBuf::from("/tmp/it's.sh");
-        let result = expand_variables("bash ${fileBase}", &RunVars::for_file(&path));
+        let posix = RunVars::for_file(&path).on(Platform::MacOs);
+        let result = expand_variables("bash ${fileBase}", &posix);
         assert_eq!(result, "bash 'it'\\''s.sh'");
     }
 
@@ -1483,11 +1489,13 @@ mod tests {
             want.push(format!("RAN:{}", hex("ran2")));
             want.push(format!("END:{i}"));
         }
-        let programs: &[(&str, bool)] = if cfg!(windows) {
-            // 5.1 は Windows に必ずある。7（pwsh）は入っている環境だけ（GitHub の runner にはある）
-            &[("powershell", true), ("pwsh", false)]
+        // 5.1 は Windows に必ずある。7（pwsh）は GitHub の runner には必ずあるので CI では必須
+        // （黙って 5.1 だけで緑にしない）、手元では入っている環境だけ
+        let on_ci = std::env::var_os("GITHUB_ACTIONS").is_some();
+        let programs: Vec<(&str, bool)> = if cfg!(windows) {
+            vec![("powershell", true), ("pwsh", on_ci)]
         } else {
-            &[("pwsh", true)]
+            vec![("pwsh", true)]
         };
         let encoded = crate::platform::shell::encode_powershell_command(&script);
         let mut ran = 0;
