@@ -3991,7 +3991,7 @@ pub fn tools() -> Vec<Value> {
                 - `tako:run[name]: <コマンド>` — 名前付きプロファイル（複数可）\n\
                 - `tako:cwd: <dir>` / `tako:cwd[name]: <dir>` — 作業ディレクトリ（相対はファイル基準）\n\
                 - `tako:shell: <シェル>` — コマンドを解釈するシェル\n\
-                \n変数（自動でシングルクオート）: `${file}` = 絶対パス / `${fileDir}` / \
+                \n変数（自動で引用）: `${file}` = 絶対パス / `${fileDir}` / \
                 `${fileBase}` = 拡張子付きの名前 / `${fileNoExt}` / `${ext}`（小文字・ドットなし）/ \
                 `${workspaceRoot}` = プロジェクトのルート（無ければ git → ファイルのディレクトリ）/ `${python}` = 実行環境の python / \
                 `${arduino_cli}`\n\

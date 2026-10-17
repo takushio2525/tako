@@ -21,7 +21,6 @@ use crate::platform::support::Platform;
 use crate::project_root::{self, SearchBounds};
 use crate::runner_project::{self, ProjectMatch};
 use crate::runtime_env;
-use crate::shell::quote_for_shell;
 
 // --- 定数 ---
 
@@ -364,7 +363,9 @@ pub struct RunVars {
     pub runtime: RuntimeWords,
     /// `fallback` の列を引く OS
     pub platform: Platform,
-    /// 実行環境の語を置くシェルの方言（PowerShell は囲んだパスを `&` で起こす）
+    /// 展開した値を置くシェルの方言。パスの変数（`${file}` 等）は
+    /// [`ShellDialect::quote_fragment`] で、実行環境の語は [`ShellDialect::command_words`]
+    /// （PowerShell は囲んだパスを `&` で起こす）で引用する（#1668 / #1730）
     pub dialect: ShellDialect,
     /// `${args}`（実行設定の引数。#1732）。**シェルへそのまま渡る 1 本の文字列**なので引用しない
     /// （`--name "a b"` をシェルが 2 語に割る = JetBrains の Program arguments と同じ）。空 = 引数なし
@@ -440,7 +441,12 @@ fn declared_dialect(shell: &str) -> ShellDialect {
 /// 引数の変数（`${args}`。#1732）
 pub const ARGS_VARIABLE: &str = "${args}";
 
-/// コマンド・cwd の値中の変数を展開。展開値はシングルクオートで自動エスケープ。
+/// コマンド・cwd の値中の変数を展開。展開値は [`RunVars::dialect`] の
+/// [`ShellDialect::quote_fragment`] で自動エスケープする（#1668）。
+///
+/// 値は語の途中にも埋まる（`-o ${fileNoExt}.exe`）ので、方言の「どこへ埋めても 1 語の一部」の形
+/// を使う: POSIX は単引用符（`'my file'.exe`）、PowerShell はバッククオート（`` my` file.exe ``）。
+/// PowerShell で単引用符を使うと、語の先頭では `'my file'.exe` がメンバー参照になって壊れる。
 ///
 /// `${args}` は引用せずにそのまま置く（[`RunVars::args`]）。**空なら直前の空白 1 つごと消す**:
 /// Windows のコンパイル行（`if ($?) { .\a.exe ${args} }`）を引数なしで展開した結果が
@@ -461,7 +467,7 @@ pub fn expand_literal(template: &str, vars: &RunVars) -> String {
 fn expand_with(template: &str, vars: &RunVars, quote: bool) -> String {
     let q = |s: &str| {
         if quote {
-            quote_for_shell(s)
+            vars.dialect.quote_fragment(s)
         } else {
             s.to_string()
         }
@@ -781,9 +787,13 @@ fn resolve_core(
 
             let resolved_cwd = if let Some(cwd_str) = raw_cwd {
                 declared_cwds.insert(decl.name.clone(), cwd_str.to_string());
-                let expanded = expand(cwd_str);
-                // シングルクオート除去（expand_variables がクオートするが cwd はパスとして使う）
-                let cleaned = strip_quotes(&expanded);
+                // cwd はシェルへ渡さずパスとして使う。PowerShell は引用しない展開を使う
+                // （バッククオートは `strip_quotes` で外れない = #1668）。POSIX は
+                // 「引用してから外側の単引用符を外す」#1668 以前の形を 1 バイトも変えない
+                let cleaned = match vars.dialect {
+                    ShellDialect::Posix => strip_quotes(&expand(cwd_str)),
+                    ShellDialect::PowerShell => expand_literal(cwd_str, &vars),
+                };
                 let cwd_path = Path::new(&cleaned);
                 if cwd_path.is_absolute() {
                     cwd_path.to_path_buf()
@@ -1002,6 +1012,7 @@ pub fn read_file_head_for_ui(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::quote_for_shell;
     use std::path::PathBuf;
 
     // --- parse_declarations ---
@@ -1223,6 +1234,298 @@ mod tests {
         let path = PathBuf::from("/Users/a/src/main.c");
         let result = expand_variables("${fileDir}", &RunVars::for_file(&path));
         assert_eq!(result, "/Users/a/src");
+    }
+
+    // --- 実行ペインの方言での引用（#1668）---
+
+    /// 組み込み既定（その OS の表）での解決結果
+    fn builtin_command(platform: Platform, path: &Path) -> String {
+        let defaults = merged_defaults_for(platform, &BTreeMap::new());
+        resolve_for(platform, path, "", &defaults, None, None)
+            .expect("既定がある")
+            .plan
+            .command
+    }
+
+    /// 受け入れ条件: 空白・`'`・`"`・`$`・`&` を含むファイル名で、両 OS の解決結果を固定する。
+    /// macOS は #1668 以前と 1 バイトも変わらない（POSIX の単引用符）。Windows は語の途中に
+    /// 埋まる値（`-o ${fileNoExt}.exe` / `.\${fileNoExt}.exe`）をバッククオートで逃がす。
+    /// 修正前の Windows は `-o 'my file'.exe`（PowerShell では文字列のメンバー参照 = 空の引数）と
+    /// `'it'\''s.c'`（構文エラー）だった
+    #[test]
+    fn パスの変数は実行ペインの方言で引用する_c言語の既定を両osで固定() {
+        let cases: &[(&str, &str, &str)] = &[
+            // (名前, macOS, Windows)
+            (
+                "my file",
+                "cc 'my file.c' -o 'my file' && ./'my file'",
+                r"gcc my` file.c -o my` file.exe; if ($?) { .\my` file.exe }",
+            ),
+            (
+                "it's",
+                r"cc 'it'\''s.c' -o 'it'\''s' && ./'it'\''s'",
+                r"gcc it`'s.c -o it`'s.exe; if ($?) { .\it`'s.exe }",
+            ),
+            (
+                "say \"hi\"",
+                r#"cc 'say "hi".c' -o 'say "hi"' && ./'say "hi"'"#,
+                r#"gcc say` `"hi`".c -o say` `"hi`".exe; if ($?) { .\say` `"hi`".exe }"#,
+            ),
+            (
+                "$HOME",
+                "cc '$HOME.c' -o '$HOME' && ./'$HOME'",
+                r"gcc `$HOME.c -o `$HOME.exe; if ($?) { .\`$HOME.exe }",
+            ),
+            (
+                "a&b",
+                "cc 'a&b.c' -o 'a&b' && ./'a&b'",
+                r"gcc a`&b.c -o a`&b.exe; if ($?) { .\a`&b.exe }",
+            ),
+            (
+                "a b'c\"d$e&f",
+                r#"cc 'a b'\''c"d$e&f.c' -o 'a b'\''c"d$e&f' && ./'a b'\''c"d$e&f'"#,
+                r#"gcc a` b`'c`"d`$e`&f.c -o a` b`'c`"d`$e`&f.exe; if ($?) { .\a` b`'c`"d`$e`&f.exe }"#,
+            ),
+            // 引用の要らない名前はどちらも素のまま（#1668 以前と同じ）
+            (
+                "main",
+                "cc main.c -o main && ./main",
+                r"gcc main.c -o main.exe; if ($?) { .\main.exe }",
+            ),
+        ];
+        for (name, mac, win) in cases {
+            let path = PathBuf::from(format!("/tmp/プロジェクト x/{name}.c"));
+            assert_eq!(
+                builtin_command(Platform::MacOs, &path),
+                *mac,
+                "macOS {name}"
+            );
+            assert_eq!(
+                builtin_command(Platform::Windows, &path),
+                *win,
+                "Windows {name}"
+            );
+        }
+    }
+
+    /// 単独の語（`python ${fileBase}`）と、語どうしを繋ぐ形（`${fileDir}\${fileBase}`）・
+    /// コマンド位置（`${file}`）も、Windows は 1 語のまま元の値に戻る形になる
+    #[test]
+    fn パスの変数は語の先頭にも途中にもコマンド位置にも埋まる() {
+        let path = PathBuf::from("/tmp/my dir/it's.py");
+        assert_eq!(
+            builtin_command(Platform::MacOs, &path),
+            r"python3 'it'\''s.py'"
+        );
+        assert_eq!(
+            builtin_command(Platform::Windows, &path),
+            r"python it`'s.py"
+        );
+        let win = RunVars::for_file(&path).on(Platform::Windows);
+        assert_eq!(
+            expand_variables(r"${fileDir}\${fileBase}", &win),
+            r"/tmp/my` dir\it`'s.py"
+        );
+        assert_eq!(
+            expand_variables("${file} --flag", &win),
+            r"/tmp/my` dir/it`'s.py --flag"
+        );
+        let mac = RunVars::for_file(&path).on(Platform::MacOs);
+        assert_eq!(
+            expand_variables("${fileDir}/${fileBase}", &mac),
+            r"'/tmp/my dir'/'it'\''s.py'"
+        );
+    }
+
+    /// 宣言の `tako:cwd` はシェルへ渡さない（パスとして使う）。Windows はバッククオートが
+    /// 残らない引用なしの展開、macOS は #1668 以前と同じ「引用して外側を外す」
+    #[test]
+    fn 宣言のcwdは方言の引用を残さない() {
+        let path = PathBuf::from("/tmp/my dir/it's.py");
+        let resolve = |platform: Platform, head: &str| {
+            resolve_for(platform, &path, head, &BTreeMap::new(), None, None)
+                .expect("宣言がある")
+                .plan
+                .cwd
+        };
+        let head = "# tako:run: python ${fileBase}\n# tako:cwd: ${fileDir}\n";
+        assert_eq!(resolve(Platform::MacOs, head), PathBuf::from("/tmp/my dir"));
+        assert_eq!(
+            resolve(Platform::Windows, head),
+            PathBuf::from("/tmp/my dir")
+        );
+        let nested = "# tako:run: python ${fileBase}\n# tako:cwd: ${fileDir}/build\n";
+        assert_eq!(
+            resolve(Platform::Windows, nested),
+            PathBuf::from("/tmp/my dir/build")
+        );
+    }
+
+    /// `tako:shell` の宣言は内側のシェルの方言で囲む（Windows の bash は POSIX、macOS の pwsh は
+    /// PowerShell）。実行前コマンドは実行ペインのシェルで走るので実行ペインの方言
+    #[test]
+    fn 宣言のシェルと実行前コマンドの方言() {
+        let sh = PathBuf::from("/tmp/my dir/it's.sh");
+        let head = "# tako:run: bash ${file}\n# tako:shell: bash\n";
+        let win = resolve_for(Platform::Windows, &sh, head, &BTreeMap::new(), None, None).unwrap();
+        assert_eq!(win.plan.command, r"bash '/tmp/my dir/it'\''s.sh'");
+        let ps1 = PathBuf::from("/tmp/my dir/it's.ps1");
+        let head = "# tako:run: & ${file}\n# tako:shell: pwsh\n";
+        let mac = resolve_for(Platform::MacOs, &ps1, head, &BTreeMap::new(), None, None).unwrap();
+        assert_eq!(mac.plan.command, r"& /tmp/my` dir/it`'s.ps1");
+
+        let layer = ConfigLayer {
+            before: Some("echo ${fileBase}".into()),
+            ..ConfigLayer::default()
+        };
+        let py = PathBuf::from("/tmp/x/it's.py");
+        let before = |platform: Platform| {
+            resolve_core(
+                platform,
+                &py,
+                "",
+                &merged_defaults_for(platform, &BTreeMap::new()),
+                &BTreeMap::new(),
+                None,
+                PathBuf::from("/tmp/x"),
+                None,
+                None,
+                &RuntimeWords::new(),
+                &layer,
+            )
+            .unwrap()
+            .before
+        };
+        assert_eq!(
+            before(Platform::MacOs).as_deref(),
+            Some(r"echo 'it'\''s.py'")
+        );
+        assert_eq!(before(Platform::Windows).as_deref(), Some(r"echo it`'s.py"));
+    }
+
+    /// #1668: 展開した行を **PowerShell の実物**（Windows は 5.1 と 7）へ渡し、値が 1 語のまま
+    /// 元の値で届くこと・コマンド位置のパスが `&` なしで起動されることを見る。
+    ///
+    /// 名前は Windows のファイル名に使える文字だけ（`"` `<` `>` `|` `?` `*` は NTFS が許さない。
+    /// `[` を含むスクリプトは PowerShell がワイルドカードとして探すので起動の確認から外す）。
+    /// 出力は UTF-16 の符号単位の 16 進で比べる（5.1 の標準出力はコードページで化ける）
+    #[test]
+    #[cfg_attr(
+        not(windows),
+        ignore = "PowerShell の実物が要る（Windows CI で走る。手元は pwsh があれば --ignored）"
+    )]
+    fn powershell_の実物で展開した値が1語のまま届く() {
+        let names = [
+            "my file",
+            "it's",
+            "$HOME",
+            "a&b",
+            "a;b",
+            "a,b",
+            "@x",
+            "#x",
+            "-x",
+            "a`b",
+            "x(1)",
+            "{x}",
+            "it\u{2019}s",
+            "全角\u{3000}空白",
+            "データ解析",
+            "~x",
+            "%x",
+            "a b'c$d&e",
+        ];
+        let scratch = crate::test_residue::ScratchDir::new("runner-1668-ps");
+        let dir = crate::platform::path::canonicalize(scratch.path()).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let hex = |s: &str| {
+            s.encode_utf16()
+                .map(|u| format!("{u:04X}"))
+                .collect::<String>()
+        };
+        let report = r"ForEach-Object { '{0:X4}' -f [int]$_ }";
+        let mut script = format!(
+            "$ErrorActionPreference = 'Stop'\n\
+             function show {{ foreach ($a in $args) {{ Write-Output ('A:' + (-join ([char[]]$a | {report}))) }} }}\n\
+             Set-Location -LiteralPath {}\n",
+            ShellDialect::PowerShell.quote_arg(&dir.to_string_lossy())
+        );
+        let mut want = Vec::new();
+        let template = format!(
+            "show ${{fileBase}} ${{fileNoExt}}.exe .\\${{fileNoExt}}.exe ${{fileDir}}{sep}${{fileBase}}; \
+             ${{file}} ran; .\\${{fileBase}} ran2"
+        );
+        for (i, name) in names.iter().enumerate() {
+            let path = dir.join(format!("{name}.ps1"));
+            std::fs::write(
+                &path,
+                format!("Write-Output ('RAN:' + (-join ([char[]]$args[0] | {report})))\n"),
+            )
+            .unwrap();
+            // PowerShell へ渡すので PowerShell の方言で展開する（Windows の実行ペインと同じ。
+            // macOS の `Platform::current()` は POSIX = 修正前の形になり、pwsh が構文エラーで拒む）
+            let vars = RunVars::for_file(&path).in_dialect(ShellDialect::PowerShell);
+            let line = expand_variables(&template, &vars);
+            script.push_str(&format!(
+                "Write-Output 'BEGIN:{i}'\n{line}\nWrite-Output 'END:{i}'\n"
+            ));
+            let dir_s = dir.to_string_lossy();
+            want.push(format!("BEGIN:{i}"));
+            for arg in [
+                format!("{name}.ps1"),
+                format!("{name}.exe"),
+                format!(".\\{name}.exe"),
+                format!("{dir_s}{sep}{name}.ps1"),
+            ] {
+                want.push(format!("A:{}", hex(&arg)));
+            }
+            want.push(format!("RAN:{}", hex("ran")));
+            want.push(format!("RAN:{}", hex("ran2")));
+            want.push(format!("END:{i}"));
+        }
+        let programs: &[(&str, bool)] = if cfg!(windows) {
+            // 5.1 は Windows に必ずある。7（pwsh）は入っている環境だけ（GitHub の runner にはある）
+            &[("powershell", true), ("pwsh", false)]
+        } else {
+            &[("pwsh", true)]
+        };
+        let encoded = crate::platform::shell::encode_powershell_command(&script);
+        let mut ran = 0;
+        for (program, required) in programs {
+            let out = match std::process::Command::new(program)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    &encoded,
+                ])
+                .output()
+            {
+                Ok(out) => out,
+                Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("{program} が無いので飛ばす");
+                    continue;
+                }
+                Err(e) => panic!("{program} を起動できない: {e}"),
+            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let got: Vec<&str> = stdout
+                .lines()
+                .map(str::trim_end)
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(
+                got,
+                want,
+                "{program}: 展開した行が 1 語のまま元の値で届いていない\n--- script ---\n{script}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "PowerShell を 1 つも走らせていない");
     }
 
     // --- 実行環境の変数（#1730）---

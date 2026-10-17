@@ -417,6 +417,36 @@ impl ShellDialect {
         }
     }
 
+    /// コマンド行の**どこへ埋めても 1 語の一部として読まれる**形にする
+    /// （Code Runner の `${file}` 等の展開。#1668）。
+    ///
+    /// [`Self::quote_arg`] との違いは置き場所を選ばないこと。Code Runner のテンプレートは
+    /// `-o ${fileNoExt}.exe` / `.\${fileNoExt}.exe` / `${fileDir}\${fileBase}` のように
+    /// 値を語の**途中**へ埋める。
+    ///
+    /// - POSIX: `quote_for_shell`（必要なときだけ単引用符）。引用した片と裸の片が続けば
+    ///   1 語になるので、どこへ埋めても壊れない。#1668 以前と 1 バイトも変えない
+    /// - PowerShell: **特別な文字の前にだけバッククオート**を置く（about_Parsing の
+    ///   「Handling special characters」）。単引用符で囲む形は、語の先頭に来ると壊れる
+    ///   （pwsh 7 の構文木で実測: `-o 'my file'.exe` は文字列のメンバー参照 = 空の引数、
+    ///   `'a b'x` は 2 語に割れる）。引用符で**始まらない**語は最後まで 1 語なので、
+    ///   この形はコマンド位置でも `&` なしでコマンド名として読まれる
+    ///
+    /// PowerShell で逃がす文字: ASCII の英数字と `._-/\:` を除く ASCII のすべて
+    /// （about_Parsing の argument-mode metacharacters ``<space> ' " ` , ; ( ) { } | & < > @ #``
+    /// と `$` を含む）、空白類（全角空白を含む）、引用符・ダッシュとして読まれる
+    /// `‘’‚‛“”„–—―`（about_Quoting_Rules の Smart Quotes）、値の先頭の `-`（引数名として読まれ、
+    /// `-x.mjs` は `-x` と `.mjs` の 2 語に割れる）。それ以外の非 ASCII（日本語など）は
+    /// そのまま。英数字の前には付けない（`` `n `` などは二重引用符の中で制御文字になる）。
+    /// 改行・復帰だけは語の中で表せない（バッククオート + 改行は行継続）ので単引用符へ落とす
+    /// （Windows のファイル名には現れない。NTFS が制御文字を許さない）
+    pub fn quote_fragment(self, word: &str) -> String {
+        match self {
+            Self::Posix => crate::shell::quote_for_shell(word),
+            Self::PowerShell => ps_escape_fragment(word),
+        }
+    }
+
     /// **コマンド位置から始まる語の列**（`[<interpreter>]` / `[<道具>, "run", "python"]`）を
     /// 1 本の文字列にする（Code Runner の `${python}`。#1730）。
     ///
@@ -774,9 +804,52 @@ impl ShellDialect {
 const ECHO_STDIN_LOOP: &str = "while ($true) { $line = [Console]::In.ReadLine(); \
      if ($null -eq $line) { break }; [Console]::Out.WriteLine($line) }";
 
-/// PowerShell の単引用符クオート（中の `'` は `''`）
+/// PowerShell が単引用符として読む文字（about_Quoting_Rules の Smart Quotes）
+const PS_SINGLE_QUOTES: &[char] = &['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
+
+/// 語の中で特別に読まれる非 ASCII（Smart Quotes の単引用符・二重引用符とダッシュ）
+const PS_SPECIAL_NON_ASCII: &[char] = &[
+    '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}', '\u{201C}', '\u{201D}', '\u{201E}', '\u{2013}',
+    '\u{2014}', '\u{2015}',
+];
+
+/// PowerShell の単引用符クオート（中の単引用符は同じ文字を 2 つ重ねる。`'` は `''`、
+/// `’` は `’’`。PowerShell は Smart Quotes も `'` と同じく文字列の終わりとして読む = #1668）
 fn ps_quote(word: &str) -> String {
-    format!("'{}'", word.replace('\'', "''"))
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('\'');
+    for c in word.chars() {
+        if PS_SINGLE_QUOTES.contains(&c) {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// PowerShell の語の一部として埋める形（[`ShellDialect::quote_fragment`] の PowerShell 側）
+fn ps_escape_fragment(word: &str) -> String {
+    if word.is_empty() || word.contains(['\n', '\r']) {
+        return ps_quote(word);
+    }
+    let mut out = String::with_capacity(word.len() + 8);
+    for (i, c) in word.chars().enumerate() {
+        // 先頭の `-` は引数名として読まれ、`-x.mjs` は `-x` と `.mjs` の 2 語に割れる（pwsh 7 で実測）
+        if ps_fragment_needs_escape(c) || (i == 0 && c == '-') {
+            out.push('`');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn ps_fragment_needs_escape(c: char) -> bool {
+    if c.is_ascii() {
+        !(c.is_ascii_alphanumeric() || "._-/\\:".contains(c))
+    } else {
+        c.is_whitespace() || PS_SPECIAL_NON_ASCII.contains(&c)
+    }
 }
 
 /// 退避した値を戻す。**元から無かったなら消す**（`$null` を代入すると
@@ -1191,6 +1264,110 @@ mod tests {
         // 単引用符を含む語も壊れない
         assert_eq!(PS.quote_arg("it's"), "'it''s'");
         assert_eq!(POSIX.quote_arg("it's"), "'it'\\''s'");
+    }
+
+    /// #1668: PowerShell は Smart Quotes（`‘’‚‛`）も単引用符として読むので、同じ文字を重ねる
+    /// （about_Quoting_Rules）。二重引用符側（`“”„`）は単引用符の中では普通の文字
+    #[test]
+    fn 単引用符クオートはsmart_quotesも重ねる() {
+        assert_eq!(PS.quote_arg("it\u{2019}s"), "'it\u{2019}\u{2019}s'");
+        assert_eq!(
+            PS.quote_arg("\u{2018}a\u{201A}b\u{201B}"),
+            "'\u{2018}\u{2018}a\u{201A}\u{201A}b\u{201B}\u{201B}'"
+        );
+        assert_eq!(
+            PS.quote_arg("say \u{201C}hi\u{201D}"),
+            "'say \u{201C}hi\u{201D}'"
+        );
+        // POSIX は普通の文字（#1668 以前と同じ）
+        assert_eq!(POSIX.quote_arg("it\u{2019}s"), "'it\u{2019}s'");
+    }
+
+    /// #1668: Code Runner の `${file}` 等は語の途中へも埋まる。POSIX は `quote_for_shell` と
+    /// 1 バイトも違わず、PowerShell は特別な文字の前にだけバッククオートを置く。
+    /// PowerShell 側の各行は pwsh 7 の構文木（`Parser::ParseInput`）で「1 語・元の値」と
+    /// 読まれることを確かめてある（Windows CI では 5.1 / 7 の実物で
+    /// `runner::tests::powershell_の実物で` が同じことを見る）
+    #[test]
+    fn 語の一部として埋める形は方言ごとに固定() {
+        let cases: &[(&str, &str, &str)] = &[
+            // (値, POSIX, PowerShell)
+            ("main.c", "main.c", "main.c"),
+            (
+                r"C:\Users\a\src\main.c",
+                r"'C:\Users\a\src\main.c'",
+                r"C:\Users\a\src\main.c",
+            ),
+            // 先頭の `-` は PowerShell では引数名になり `.` で割れる（途中の `-` は素のまま）
+            ("-x.mjs", "-x.mjs", "`-x.mjs"),
+            ("a-b", "a-b", "a-b"),
+            ("my file", "'my file'", "my` file"),
+            ("it's", r"'it'\''s'", "it`'s"),
+            ("say \"hi\"", "'say \"hi\"'", "say` `\"hi`\""),
+            ("$HOME", "'$HOME'", "`$HOME"),
+            ("a&b", "'a&b'", "a`&b"),
+            ("a;b", "'a;b'", "a`;b"),
+            ("a,b", "a,b", "a`,b"),
+            ("@x", "@x", "`@x"),
+            ("#x", "'#x'", "`#x"),
+            ("a`b", "'a`b'", "a``b"),
+            ("x(1)", "'x(1)'", "x`(1`)"),
+            ("{x}", "'{x}'", "`{x`}"),
+            ("~x", "'~x'", "`~x"),
+            ("it\u{2019}s", "'it\u{2019}s'", "it`\u{2019}s"),
+            (
+                "\u{201C}x\u{201D}",
+                "'\u{201C}x\u{201D}'",
+                "`\u{201C}x`\u{201D}",
+            ),
+            ("\u{2013}x", "'\u{2013}x'", "`\u{2013}x"),
+            (
+                "全角\u{3000}空白",
+                "'全角\u{3000}空白'",
+                "全角`\u{3000}空白",
+            ),
+            ("データ解析", "'データ解析'", "データ解析"),
+            ("tab\there", "'tab\there'", "tab`\there"),
+            // 空は空の引数（どちらも `''`）
+            ("", "''", "''"),
+            // 改行は語の中で表せない（バッククオート + 改行は行継続）ので単引用符へ落とす
+            ("a\nb", "'a\nb'", "'a\nb'"),
+            ("a'\r", "'a'\\''\r'", "'a''\r'"),
+        ];
+        for (value, posix, ps) in cases {
+            assert_eq!(POSIX.quote_fragment(value), *posix, "POSIX {value:?}");
+            assert_eq!(
+                POSIX.quote_fragment(value),
+                crate::shell::quote_for_shell(value),
+                "POSIX は quote_for_shell と同じ {value:?}"
+            );
+            assert_eq!(PS.quote_fragment(value), *ps, "PowerShell {value:?}");
+        }
+    }
+
+    /// PowerShell の語の一部の形は、英数字の前に逃がしを置かない（`` `n `` `` `t `` `` `0 `` は
+    /// 二重引用符の中で制御文字になる）。非 ASCII の英字も逃がさない（日本語の名前の見た目を守る）
+    #[test]
+    fn powershellの語の一部の形は英数字の前に逃がしを置かない() {
+        let all: String = ('\u{20}'..='\u{7E}').collect::<String>() + "日本語éß";
+        let got = PS.quote_fragment(&all);
+        let chars: Vec<char> = got.chars().collect();
+        for (i, w) in chars.windows(2).enumerate() {
+            if w[0] == '`' && (w[1].is_alphanumeric()) {
+                // 直前も逃がしなら、この `` ` `` は逃がされた文字そのもの（`` `` ``）
+                assert!(
+                    i > 0 && chars[i - 1] == '`',
+                    "英数字の前に逃がしがある: {got:?}"
+                );
+            }
+        }
+        // 逃がしを外すと元の値に戻る（1 文字ずつ）
+        let mut back = String::new();
+        let mut it = got.chars();
+        while let Some(c) = it.next() {
+            back.push(if c == '`' { it.next().unwrap() } else { c });
+        }
+        assert_eq!(back, all);
     }
 
     #[test]

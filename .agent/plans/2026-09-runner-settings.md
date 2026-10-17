@@ -37,7 +37,7 @@
 | 部品 | 場所 | 要点 |
 |---|---|---|
 | 宣言パーサ | `crates/tako-core/src/runner.rs:103` `parse_declarations` | 先頭 64 行 / 16 KiB。キーは `run` / `cwd` / `shell` の 3 種 |
-| 変数展開 | `runner.rs:275` `expand_variables` | `${file}` `${fileDir}` `${fileBase}` `${fileNoExt}` `${ext}`。展開値はシングルクオート。未知の `${…}` は残す |
+| 変数展開 | `runner.rs:275` `expand_variables` | `${file}` `${fileDir}` `${fileBase}` `${fileNoExt}` `${ext}`。展開値は実行ペインの方言で引用（POSIX = シングルクオート / PowerShell = バッククオート。#1668）。未知の `${…}` は残す |
 | 解決器 | `runner.rs:354` `resolve` → `:376` `resolve_for` | 優先順は override → 宣言 → 拡張子既定 → エラー。`RunPlan { profile, command, cwd, shell, source }`（`:53`）。`RunSource` は 3 値（`:42`） |
 | 拡張子既定のマージ | `runner.rs:330` `merged_defaults` / `:335` `merged_defaults_for` | 組み込み表 → `settings.json` の `runner_defaults`。空文字は無効化 |
 | 組み込み既定表 | `crates/tako-core/src/platform/runner_defaults.rs:127` `TABLE` | 41 拡張子 × macOS / Windows。`py` 行は `:155`（macOS `python3` / Windows `python`）。コンパイル系の Windows 行は `; if ($?) { .\x.exe }`（`:167-191`） |
