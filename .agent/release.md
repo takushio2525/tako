@@ -176,7 +176,11 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
 
 - 本体は `scripts/check-claude-mod.sh`（1 実装。手で叩いても同じ）。夜間は
   `--ref origin/main --record` で、**origin/main の mod**（次に出る版）を一時 dir へ取り出し、
-  `claude plugin validate --strict` と `claude plugin test` にかける。合格の条件は終了コード 0 に加えて、
+  `claude plugin validate --strict` と `claude plugin test` にかける。取り出しは `git archive` を
+  **ファイルへ書いてから** `tar -x -f` で開く（#1933。パイプで繋ぐと、tar（bsdtar）が終端の印を読んだ
+  時点で git が後ろへ書くゼロ詰めを読まずに抜け、git の最後の書き込みがそれより遅れると git が SIGPIPE で
+  黙って 141 → pipefail で「mod を取り出せない」が CI の macOS で間欠的に出ていた。A/B は
+  `TAKO_1933_LEGACY=1`）。合格の条件は終了コード 0 に加えて、
   ゲートになるフックの `.catch` 抜け（validate は注記に出すだけで合格させる = 設計書 §5 の規約違反）が
   無いこと・テストが 1 本以上走ったこと
 - **文言一致の自己検査**（#1903）: 上の 2 つは注記の文言（`gating hook without .catch` / `Ran 0 tests`）で
@@ -206,15 +210,27 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
   claude の版と mod の木**を持つ。不合格のときは前回の合格と比べて「Claude Code の更新で壊れた可能性」
   「mod の変更で壊れた可能性」「両方が重なった」を通知とログで出し分ける。夜間のログ
   （`tako-nightly-release.log`）にも毎晩の版と結果が `mod:` の行で残る（履歴はこちら）
-- 終了コード: 0 = 合格 / 1 = 不合格（打ち切り・mod を取り出せないを含む）/ 2 = 引数の誤り / 3 = 未実測
+- **記録が使えなくても結果の行は必ず出す**（#1969）: 記録が読めない（権限・種類）ときは前回の合格と
+  比べずに判定し、結果の行に「前回の記録が読めない」を足して記録を書き直す（合格なら終了コード 0）。
+  書けない（置き場・権限）ときは結果の行に「記録を書けない」を足し、合格なら終了コード 4 = 夜間は
+  WARN と理由つきの通知を出す。検査が結果の行を出さずに止まったら（引数の誤り・シグナル等）、夜間は
+  「途中で止まった（exit N）」で通知する（旧版は本文が空の通知「mod の検査: 」だった）
+- 終了コード: 0 = 合格 / 1 = 不合格（打ち切り・mod を取り出せないを含む）/ 2 = 引数の誤り / 3 = 未実測 /
+  4 = 合格したが記録を書けない
 - **launchd の登録は変えない**（既存の `com.takushio.tako-nightly-release` が install_root の
   nightly-release.sh を叩くので、main を pull すれば翌晩から効く）
 - 検証は `bash scripts/test-nightly-mod-check-1892.sh`（CI の macOS ジョブ。claude・osascript・release.sh は
   スタブ、HOME も隔離。壊れた登録の A/B・claude 無し・固まる claude・止めない実走・変更なしの夜・
-  設定 dir の隔離を見る。実物の claude（下限 2.1.294 以上）があれば本物の mod と壊れた写しも検査し、
-  利用者の設定ファイルの mtime が前後で一致することを見る）。assert が落ちると、その環境の段（夜間 /
-  検査の 1 回の実行）の出力と終了コード・記録ファイル・通知のスタブの記録・claude のスタブの呼び出しが
-  ログに出る（#1933。`TAKO_1933_INJECT=version|validate|test` で Test 2 の注入前の 1 回を落として確かめられる）
+  設定 dir の隔離・記録が読めない / 書けない・検査が途中で止まるを見る。実物の claude（下限 2.1.294
+  以上）があれば本物の mod と壊れた写しも検査し、設定に触らないことを見る。このとき HOME と利用者の
+  設定 dir は**砂場に作る**（#1969。利用者の実ファイルの mtime を比べると、並走中の Claude Code が
+  `.claude.json` を書いて手元だけ揺れた））。assert が落ちると、その環境の段（夜間 / 検査の 1 回の実行）の
+  出力と終了コード・記録ファイル・通知のスタブの記録・claude のスタブの呼び出しがログに出る（#1933。
+  `TAKO_1933_INJECT=version|validate|test` で Test 2 の注入前の 1 回を落として確かめられる。
+  `TAKO_1933_INJECT=archive-late-tail` は git archive の最後の書き込みを遅らせて「取り出せない」を再現する =
+  修正後は緑・`TAKO_1933_LEGACY=1` を足すと落ちる）。上限つきの段で起こすスタブ（claude と、固まる
+  claude の hang / hang-child）は作った時点で `scripts/lib/fake-exec.sh` の `fake_exec_warm` で空打ちする
+  （#2222。作りたての実行ファイルの初回 exec の検査で、Test 5 の上限 2 秒を食わない）
 
 ### footprint の回帰の見張り（#2023 / エピック #2011 の S8）
 

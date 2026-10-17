@@ -484,12 +484,22 @@ run_mod_check() {
     if [[ -n "$line" ]]; then log "  mod: ${line}"; fi
   done <<< "$out"
   summary=$(printf '%s\n' "$out" | sed -n 's/^結果: //p' | tail -1)
+  # 通知の本文は AppleScript の文字列へ入るので " を落とす
   case "$rc" in
     0) ;;
     3) log "mod の検査は未実測（claude が無い）。夜間リリースは続ける" ;;
+    4)
+      log "WARN: mod の検査は合格したが、記録（${HOME}/.claude-orchestrator/state/tako-mod-check）を書けない（exit 4）。夜間リリースは続ける"
+      notify "mod の検査: ${summary//\"/}"
+      ;;
     *)
-      log "ERROR: mod の検査が不合格（exit ${rc}）。夜間リリースは止めずに続ける（記録: ${HOME}/.claude-orchestrator/state/tako-mod-check）"
-      # 通知の本文は AppleScript の文字列へ入るので " を落とす
+      if [[ -n "$summary" ]]; then
+        log "ERROR: mod の検査が不合格（exit ${rc}）。夜間リリースは止めずに続ける（記録: ${HOME}/.claude-orchestrator/state/tako-mod-check）"
+      else
+        # 結果の行が無い = 検査が途中で止まった（#1969。旧版は本文が空の通知「mod の検査: 」を出していた）
+        summary="途中で止まった（exit ${rc}。結果の行が無い = 夜間のログの mod: の行を見る）"
+        log "ERROR: mod の検査が${summary}。夜間リリースは止めずに続ける"
+      fi
       notify "mod の検査: ${summary//\"/}"
       ;;
   esac

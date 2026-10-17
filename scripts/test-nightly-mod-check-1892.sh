@@ -21,10 +21,12 @@
 #   Test 7  変更が無い夜も検査は回る（Claude Code の更新は tako の変更と無関係に来る）
 #   Test 8  check-claude-mod.sh 単体の終了コード（記録しない既定・ref が無い・mod が無い）
 #   Test 9  利用者の Claude Code の設定に触らない（設定 dir は使い捨て・mtime が前後で一致）
-#   Test 10 実物の claude（あれば）: 本物の mod で合格・壊れた写しで不合格・利用者の設定の mtime が一致
-#           （claude が無い CI では「未実測」と出して飛ばす）
+#   Test 10 実物の claude（あれば）: 本物の mod で合格・壊れた写しで不合格・設定に触らない
+#           （HOME と利用者の設定 dir は砂場に作る = 並走中の Claude Code の書き込みで揺れない。#1969。
+#           claude が無い CI では「未実測」と出して飛ばす）
 #   Test 11 文言一致の自己検査（#1903）: validate / test の注記の文言が変わったら落ちる
 #   Test 12 skills-dir（#1959）: setup が置く skills/tako が tako@skills-dir として読まれなくなったら落ちる
+#   Test 13 記録が読めない / 書けない・検査が途中で止まる（#1969）: 結果の行に理由が出て、通知の本文が空にならない
 #
 # 失敗時の手掛かり（#1933）: assert が落ちたら、その環境でまだ出していない段（夜間リリース /
 # 検査スクリプトの 1 回の実行）の出力と終了コード、記録ファイル、通知のスタブの記録、claude の
@@ -32,18 +34,29 @@
 #
 # 使い方: bash scripts/test-nightly-mod-check-1892.sh
 #   TAKO_1933_INJECT=<version|validate|test> を付けると、Test 2 の注入前の 1 回だけその段の claude を
-#   1 回落とす（CI で 1 回だけ出た「注入前の合格が見つからず通知が 2 件」と同じ 5 件の FAIL になる。
+#   1 回落とす（CI で出た「注入前の合格が見つからず通知が 2 件」と同じ 5 件の FAIL になる。
 #   手掛かりが出ることの確認用）
-#   TAKO_1933_INJECT=first-exec-slow を付けると、各環境の claude のスタブの最初の 1 回の起動が 3 秒かかる
-#   （作りたての実行ファイルの初回起動の遅さ）。make_env の温めがそれを吸うので緑のまま。
-#   TAKO_1933_LEGACY=1 を足すと温めないので、Test 5 の上限 2 秒で --version が打ち切られて落ちる（A/B）
+#   TAKO_1933_INJECT=archive-late-tail を付けると、Test 2 の注入前の 1 回だけ、git archive の出力の最後の
+#   512 バイト（終端の印の後ろのゼロ詰め）を 0.5 秒遅れて書く = CI の「mod を取り出せない」の再現。
+#   修正後（ファイルを挟む）は緑のまま。TAKO_1933_LEGACY=1 を足すと検査がパイプで取り出す修正前の形に
+#   なり、同じ 5 件の FAIL になる（A/B）
+#   作りたてのスタブの初回起動の遅さ（#1933 / #2222）は scripts/lib/fake-exec.sh の fake_exec_warm で
+#   make_env が温める。注入は TAKO_2222_INJECT_FIRST_EXEC_MS=3000、温めない A/B は TAKO_2222_LEGACY=1
+#   （Test 5 の上限 2 秒で --version が打ち切られて落ちる）
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD
+# shellcheck source=lib/fake-exec.sh
+. "$REPO_ROOT/scripts/lib/fake-exec.sh"
 PASS=0
 FAIL=0
 UNMEASURED=0
+# 注入の git の包みが呼ぶ本物の git（CI は Homebrew の git、手元は /usr/bin/git）
+REAL_GIT=$(command -v git)
+# 検査の A/B（TAKO_1933_LEGACY）は env -i の向こうの検査スクリプトまで渡す
+AB_ENV=""
+if [[ -n "${TAKO_1933_LEGACY:-}" ]]; then AB_ENV="TAKO_1933_LEGACY=${TAKO_1933_LEGACY}"; fi
 
 assert_eq() {
   if [[ "$2" = "$3" ]]; then
@@ -98,6 +111,8 @@ sandbox_pids() {
 cleanup() {
   local p
   for p in $(sandbox_pids "$SANDBOX"); do kill -9 "$p" 2>/dev/null; done
+  # Test 13 が権限を落とした記録・置き場も消せるように戻してから消す
+  chmod -R u+rwx "$SANDBOX" 2> /dev/null
   rm -rf "$SANDBOX"
 }
 trap cleanup EXIT
@@ -159,7 +174,7 @@ dump_stages() {
     dump_file "記録ファイル（home/.claude-orchestrator/state/tako-mod-check）" "$dir/home/.claude-orchestrator/state/tako-mod-check"
     dump_file "通知のスタブの記録（notify.log）" "$dir/notify.log"
     dump_file "claude のスタブの呼び出し（stub/calls = cwd|設定 dir|自動更新の停止|引数）" "$dir/stub/calls"
-    dump_file "claude のスタブの温め（make_env の初回起動）" "$dir/stub/warm"
+    dump_file "スタブの温め（make_env の fake_exec_warm）" "$dir/stub/warm"
     echo "    ---- claude のスタブの切り替え（stub/*_mode）: $(cd "$dir/stub" 2> /dev/null && for f in *_mode; do [[ -f "$f" ]] && printf '%s=%s ' "$f" "$(cat "$f")"; done)（無ければ既定の auto）"
   fi
   echo "    ==== 手掛かりここまで ===="
@@ -170,7 +185,7 @@ dump_stages() {
 # $1 = 名前 / $2 = 1 なら origin/main をタグと同一にする（変更ゼロの夜）
 
 make_env() {
-  local dir="$SANDBOX/$1" no_change="${2:-0}" stub warm_rc
+  local dir="$SANDBOX/$1" no_change="${2:-0}" stub
   mkdir -p "$dir/home/.local/bin" "$dir/home/.claude" "$dir/repo/scripts/lib" "$dir/stub"
 
   for stub in cargo gh; do
@@ -191,10 +206,6 @@ make_env() {
   # 設定 dir へ .claude.json を書く。<段>_mode が auto（既定）/ fail / hang
   printf '#!/bin/sh\nS="%s/stub"\n' "$dir" > "$dir/home/.local/bin/claude"
   cat >> "$dir/home/.local/bin/claude" <<'STUB'
-# 初回起動の遅さの注入（#1933。TAKO_1933_INJECT=first-exec-slow）: このスタブの最初の 1 回だけ 3 秒かかる
-if [ -f "$S/first_exec_slow" ] && [ ! -f "$S/first_exec_done" ]; then : > "$S/first_exec_done"; /bin/sleep 3; fi
-# make_env が温めるための起動（呼び出しの記録に数えない）
-[ "${1:-}" = --tako-warm ] && exit 0
 printf '%s|%s|%s|%s\n' "$(pwd)" "${CLAUDE_CONFIG_DIR:-}" "${DISABLE_AUTOUPDATER:-}" "$*" >> "$S/calls"
 if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -d "$CLAUDE_CONFIG_DIR" ]; then echo '{}' > "$CLAUDE_CONFIG_DIR/.claude.json"; fi
 mode_of() { cat "$S/$1_mode" 2>/dev/null || echo auto; }
@@ -266,19 +277,20 @@ else
 fi
 exit 0
 STUB
-  chmod +x "$dir/home/.local/bin/claude"
 
-  # 作りたての実行ファイルは macOS の初回起動が遅い（実測: 作った直後の 1 回目は中央 219 ms・最大 711 ms、
-  # 2 回目は 9 ms。負荷下では 2 秒を超え、Test 5 の上限 2 秒で固まらせていない --version が打ち切られた =
-  # #1933）。本番の claude は作りたてではないので、ここで 1 回起動して温め、検査の段の時間に初回の遅さを
-  # 入れない。結果は stub/warm に残して手掛かりに出す（温めが落ちたら stderr にも出す）。
-  # TAKO_1933_LEGACY=1 で温めない（A/B 用）
-  if [[ "${TAKO_1933_INJECT:-}" = first-exec-slow ]]; then : > "$dir/stub/first_exec_slow"; fi
-  if [[ "${TAKO_1933_LEGACY:-}" != 1 ]]; then
-    warm_rc=0
-    "$dir/home/.local/bin/claude" --tako-warm > /dev/null 2>&1 || warm_rc=$?
-    echo "claude --tako-warm: exit ${warm_rc}" > "$dir/stub/warm"
-    if [[ "$warm_rc" -ne 0 ]]; then echo "  WARN: claude のスタブの初回起動が exit ${warm_rc}（#1933 の手掛かり）" >&2; fi
+  # 作りたての実行ファイルは macOS の初回 exec の検査が遅い（実測: 作った直後の 1 回目は中央 219 ms・
+  # 最大 711 ms、2 回目は 9 ms。負荷下では 2 秒を超え、Test 5 の上限 2 秒で固まらせていない --version が
+  # 打ち切られた = #1933）。本番の claude は作りたてではないので、上限つきの段（check-claude-mod.sh の
+  # run_step）で起こるスタブ = claude と、Test 5 で claude が exec する hang・その子の hang-child を
+  # 共通の fake_exec_warm（#2222）で作った時点に空打ちし、段の時間に初回の遅さを入れない。
+  # 上限の無い段のスタブ（cargo / gh / osascript / release.sh）は温めない。警告は stub/warm と stderr へ
+  fake_exec_warm "$dir/home/.local/bin/claude" "$dir/stub/hang" "$dir/stub/hang-child" 2> "$dir/stub/warm"
+  if [[ -s "$dir/stub/warm" ]]; then
+    sed 's/^/  WARN: /' "$dir/stub/warm" >&2
+  elif [[ "${TAKO_2222_LEGACY:-}" = 1 ]]; then
+    echo "TAKO_2222_LEGACY=1 なので空打ちしない（claude / hang / hang-child）" > "$dir/stub/warm"
+  else
+    echo "claude / hang / hang-child を空打ちした（警告なし）" > "$dir/stub/warm"
   fi
 
   # 利用者の Claude Code の設定（触られたら mtime が動く）
@@ -328,8 +340,42 @@ STUB
 run_nightly() {
   local dir="$1"
   shift
-  # shellcheck disable=SC2086 # NIGHTLY_ENV は VAR=値 を空白で並べたもの（空白を含む値は使わない）
-  stage "$dir" env -i HOME="$dir/home" ${NIGHTLY_ENV:-} /bin/bash "$dir/repo/scripts/nightly-release.sh" "$@"
+  # shellcheck disable=SC2086 # NIGHTLY_ENV / AB_ENV は VAR=値 を空白で並べたもの（空白を含む値は使わない）
+  stage "$dir" env -i HOME="$dir/home" ${AB_ENV} ${NIGHTLY_ENV:-} /bin/bash "$dir/repo/scripts/nightly-release.sh" "$@"
+}
+
+# check-claude-mod.sh 単体を launchd と同じ形（/bin/bash + HOME と PATH だけ）で段として走らせる
+run_check() {
+  local dir="$1"
+  shift
+  # shellcheck disable=SC2086 # AB_ENV は VAR=値（空白を含む値は使わない）
+  stage "$dir" env -i HOME="$dir/home" PATH="$dir/home/.local/bin:/usr/bin:/bin" ${AB_ENV} /bin/bash "$dir/repo/scripts/check-claude-mod.sh" "$@"
+}
+
+# 注入（#1933。TAKO_1933_INJECT=archive-late-tail）: git の包みを PATH の先頭（nightly-release.sh も
+# check-claude-mod.sh も ~/.local/bin を先に引く）へ置き、印（stub/archive_late_tail）がある間の
+# `git -C <dir> archive` を 1 回だけ「最後の 512 バイト（終端の印の後ろのゼロ詰め）を 0.5 秒遅れて
+# 書く」形にする。バイト列は本物の git archive と同じで、変えるのは最後の書き込みの時刻だけ
+# = CI で git の最後の書き込みが tar の終了より遅れた形。ほかの git の呼び出しは本物へ素通しする
+inject_archive_late_tail() {
+  local dir="$1"
+  printf '#!/bin/sh\nREAL_GIT="%s"\nS="%s/stub"\n' "$REAL_GIT" "$dir" > "$dir/home/.local/bin/git"
+  cat >> "$dir/home/.local/bin/git" <<'SH'
+if [ "${1:-}" != -C ] || [ "${3:-}" != archive ] || [ ! -e "$S/archive_late_tail" ]; then exec "$REAL_GIT" "$@"; fi
+rm -f "$S/archive_late_tail"
+t="$S/archive.$$.tar"
+"$REAL_GIT" "$@" > "$t" || { rc=$?; rm -f "$t"; exit "$rc"; }
+n=$(wc -c < "$t")
+head -c $((n - 512)) "$t"
+/bin/sleep 0.5
+tail -c 512 "$t"
+rc=$?
+echo "git archive の最後の 512 バイトを 0.5 秒遅れて書いた（exit ${rc}）" >> "$S/archive_late_tail.log"
+rm -f "$t"
+exit "$rc"
+SH
+  fake_exec_warm "$dir/home/.local/bin/git"
+  : > "$dir/stub/archive_late_tail"
 }
 
 state_of() { cat "$1/home/.claude-orchestrator/state/tako-mod-check" 2>/dev/null || true; }
@@ -429,11 +475,18 @@ test_broken_registration() {
   local dir out rc=0 state
   dir=$(make_env t2)
   case "${TAKO_1933_INJECT:-}" in
-    '' | first-exec-slow) ;;
+    '') ;;
     version | validate | test) echo fail-once > "$dir/stub/${TAKO_1933_INJECT}_mode" ;;
-    *) echo "  （TAKO_1933_INJECT=${TAKO_1933_INJECT} は version / validate / test / first-exec-slow のどれか。注入せずに続ける）" ;;
+    archive-late-tail) inject_archive_late_tail "$dir" ;;
+    *) echo "  （TAKO_1933_INJECT=${TAKO_1933_INJECT} は version / validate / test / archive-late-tail のどれか。注入せずに続ける）" ;;
   esac
   out=$(run_nightly "$dir" --dry-run) || rc=$?
+  if [[ "${TAKO_1933_INJECT:-}" = archive-late-tail ]]; then
+    # 注入が効いたこと（git の包みが最後の書き込みを遅らせたこと）と、その書き込みの終了コード
+    # （パイプの形なら tar が先に抜けて 141 = SIGPIPE、ファイルを挟む形なら 0）を出す
+    echo "  （注入: $(cat "$dir/stub/archive_late_tail.log" 2> /dev/null || echo '記録なし')）"
+    assert_contains "(注入) git archive の最後の書き込みを遅らせた" "$(cat "$dir/stub/archive_late_tail.log" 2> /dev/null)" "0.5 秒遅れて書いた"
+  fi
   assert_contains "(A) 注入前は合格" "$out" "mod: 結果: 合格"
 
   break_registration "$dir"
@@ -580,7 +633,7 @@ test_standalone() {
   local dir out rc empty_commit script
   dir=$(make_env t8)
   script="$dir/repo/scripts/check-claude-mod.sh"
-  sa() { stage "$dir" env -i HOME="$dir/home" PATH="$dir/home/.local/bin:/usr/bin:/bin" /bin/bash "$script" "$@"; }
+  sa() { run_check "$dir" "$@"; }
 
   rc=0
   out=$(sa --last) || rc=$?
@@ -638,10 +691,9 @@ test_standalone() {
 test_reworded() {
   echo ""
   echo "Test 11: 文言一致の自己検査 — validate / test の注記の文言が変わったら落ちる（#1903）"
-  local dir out rc script
+  local dir out rc
   dir=$(make_env t11)
-  script="$dir/repo/scripts/check-claude-mod.sh"
-  sa() { stage "$dir" env -i HOME="$dir/home" PATH="$dir/home/.local/bin:/usr/bin:/bin" /bin/bash "$script" "$@"; }
+  sa() { run_check "$dir" "$@"; }
 
   echo reworded > "$dir/stub/validate_mode"
   rc=0
@@ -673,10 +725,9 @@ test_reworded() {
 test_skills_dir() {
   echo ""
   echo "Test 12: skills-dir — setup が置く skills/tako が tako@skills-dir として読まれなくなったら落ちる（#1959）"
-  local dir out rc script mode
+  local dir out rc mode
   dir=$(make_env t12)
-  script="$dir/repo/scripts/check-claude-mod.sh"
-  sa() { env -i HOME="$dir/home" PATH="$dir/home/.local/bin:/usr/bin:/bin" /bin/bash "$script" "$@" 2>&1; }
+  sa() { run_check "$dir" "$@"; }
 
   rc=0
   out=$(sa) || rc=$?
@@ -701,36 +752,51 @@ test_skills_dir() {
 # --- Test 10: 実物の claude（あれば）-------------------------------------------
 test_real_claude() {
   echo ""
-  echo "Test 10: 実物の claude — 本物の mod で合格・壊れた写しで不合格・利用者の設定の mtime が一致"
-  if ! command -v claude > /dev/null 2>&1; then
+  echo "Test 10: 実物の claude — 本物の mod で合格・壊れた写しで不合格・利用者の設定に触らない（HOME は砂場）"
+  local real home ccd before after out rc broken version f
+  real=$(command -v claude 2> /dev/null || true)
+  if [[ -z "$real" ]]; then
     unmeasured "claude が無いので実物の validate / test を飛ばした"
     return
   fi
-  local ccd before after out rc broken real_state state_before version
+  # 利用者の実ファイルは比べない（#1969）: 旧版は利用者の ~/.claude.json と設定 dir の .claude.json の
+  # mtime を前後で比べていたので、並走中の Claude Code がそれを書くと、この検査と無関係に手元だけ
+  # 落ちた。HOME と「利用者の設定 dir」（CLAUDE_CONFIG_DIR）を砂場に作って mtime を固定したファイルを
+  # 置き、実物の claude で回した検査がそれに触らないことを見る（検査の隔離は HOME の値に依らない =
+  # 設定 dir を使い捨てへ差し替える・作業 dir を一時 dir にする、なので見る力は変わらない）
+  home="$SANDBOX/real/home"
+  ccd="$SANDBOX/real/ccd"
+  mkdir -p "$home/.claude" "$ccd" "$SANDBOX/real/probe"
+  for f in "$home/.claude.json" "$home/.claude/settings.json" "$ccd/.claude.json" "$ccd/settings.json"; do
+    echo '{}' > "$f"
+  done
+  touch -t 202601010000 "$home/.claude.json" "$home/.claude/settings.json" "$ccd/.claude.json" "$ccd/settings.json"
   # mod を読める版の下限（FR-2.42.3 の 2.1.294）より古い claude は mod も plugin test も
-  # 持たないので、ランナーに古い claude があっても偽の赤にしない
-  version=$(claude --version 2> /dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  # 持たないので、ランナーに古い claude があっても偽の赤にしない（版の問い合わせも砂場の HOME・
+  # 使い捨ての設定 dir で行い、利用者の設定を読み書きさせない）
+  version=$(env HOME="$home" CLAUDE_CONFIG_DIR="$SANDBOX/real/probe" DISABLE_AUTOUPDATER=1 "$real" --version 2> /dev/null \
+    | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
   if [[ -z "$version" || "$(printf '%s\n' 2.1.294 "$version" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" != 2.1.294 ]]; then
     unmeasured "claude ${version:-（版が読めない）} は mod の下限 2.1.294 未満なので実物の validate / test を飛ばした"
     return
   fi
-  # 利用者の設定 dir（ログインシェルが決める。読むだけ）
-  ccd="$("${SHELL:-/bin/zsh}" -l -c 'printf %s "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"' 2> /dev/null)"
-  [[ -n "$ccd" ]] || ccd="$HOME/.claude"
   snap() {
     local f
-    for f in "$ccd/settings.json" "$ccd/settings.local.json" "$ccd/.claude.json" \
-      "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json" "$HOME/.claude.json"; do
+    for f in "$home/.claude.json" "$home/.claude/settings.json" "$ccd/.claude.json" "$ccd/settings.json"; do
       if [[ -e "$f" ]]; then stat -f '%m' "$f"; else echo -; fi
     done | paste -sd ' ' -
+    echo "HOME: $(command ls -A "$home" | paste -sd ' ' -) / ~/.claude: $(command ls -A "$home/.claude" | paste -sd ' ' -) / 設定 dir: $(command ls -A "$ccd" | paste -sd ' ' -)"
   }
-  real_state="$HOME/.claude-orchestrator/state/tako-mod-check"
-  state_before=$(stat -f '%m' "$real_state" 2> /dev/null || echo -)
   before=$(snap)
+  # 段として走らせる（落ちたら手掛かりに出る）。砂場の HOME・設定 dir と、実物の claude の置き場を渡す
+  real_check() {
+    stage "$SANDBOX/real" env HOME="$home" CLAUDE_CONFIG_DIR="$ccd" TAKO_CLAUDE_BIN="$real" \
+      /bin/bash "$REPO_ROOT/scripts/check-claude-mod.sh" "$@"
+  }
 
   rc=0
-  out=$(stage - /bin/bash "$REPO_ROOT/scripts/check-claude-mod.sh") || rc=$?
-  echo "$out" | sed 's/^/    | /'
+  out=$(real_check) || rc=$?
+  printf '%s\n' "$out" | mask_paths -e 's/^/    | /'
   assert_eq "本物の mod: exit 0" "0" "$rc"
   assert_contains "本物の mod: 合格" "$out" "結果: 合格 — claude "
 
@@ -738,15 +804,71 @@ test_real_claude() {
   cp -R "$REPO_ROOT/crates/tako-core/claude-mod" "$broken"
   printf '{ "modules": ["./missing.ts"] }\n' > "$broken/hooks/hooks.json"
   rc=0
-  out=$(stage - /bin/bash "$REPO_ROOT/scripts/check-claude-mod.sh" --dir "$broken") || rc=$?
+  out=$(real_check --dir "$broken") || rc=$?
   assert_eq "壊れた登録: exit 1" "1" "$rc"
   assert_contains "壊れた登録: validate が不合格" "$out" "validate --strict: 不合格"
   assert_contains "壊れた登録: 実物の claude が名指す" "$out" "missing.ts"
 
   after=$(snap)
-  assert_eq "利用者の Claude Code の設定ファイルの mtime が前後で一致" "$before" "$after"
-  assert_eq "記録（--record なし）は本番の状態ファイルを書かない" "$state_before" "$(stat -f '%m' "$real_state" 2> /dev/null || echo -)"
+  assert_eq "利用者の設定（HOME の .claude.json・~/.claude・設定 dir）の mtime と中身の並びが前後で一致" "$before" "$after"
+  assert_eq "記録（--record なし）は状態ファイルを書かない" "no" "$([[ -e "$home/.claude-orchestrator" ]] && echo yes || echo no)"
   assert_eq "リポジトリの mod に何も書かない（git status）" "" "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- crates/tako-core/claude-mod)"
+}
+
+# --- Test 13: 記録が読めない / 書けない・検査が途中で止まる（#1969）---------------------
+test_record_unusable() {
+  echo ""
+  echo "Test 13: 記録が読めない / 書けない・検査が途中で止まる → 結果の行に理由・通知の本文が空にならない（#1969）"
+  local dir out rc state_dir state_file
+  dir=$(make_env t13)
+  state_dir="$dir/home/.claude-orchestrator/state"
+  state_file="$state_dir/tako-mod-check"
+  run_nightly "$dir" --dry-run > /dev/null
+
+  # 読めない（権限）: 前回の合格と比べずに判定し、理由を結果の行へ足して記録を書き直す
+  # （旧版は sed が読めずに set -e で死に、結果の行が無いまま exit 1 = 本文が空の通知）
+  chmod 000 "$state_file"
+  if [[ -r "$state_file" ]]; then
+    unmeasured "chmod 000 でも記録が読める（root で走っている）ので、記録が読めない形を作れない"
+  else
+    rc=0
+    out=$(run_check "$dir" --last) || rc=$?
+    assert_eq "(読めない) --last: exit 1" "1" "$rc"
+    assert_contains "(読めない) --last: 理由" "$out" "記録が読めない（"
+    rc=0
+    out=$(run_nightly "$dir" --dry-run) || rc=$?
+    assert_eq "(読めない) 夜間リリースは exit 0" "0" "$rc"
+    assert_contains "(読めない) 結果の行に理由が出る" "$out" \
+      "mod: 結果: 合格 — claude 2.1.294（validate --strict・test 3 pass/0 fail・skills-dir）。前回の記録が読めない（権限か種類。前回の合格と比べていない）"
+    assert_eq "(読めない) 合格なので通知しない" "0" "$(mod_notices "$dir")"
+    assert_contains "(読めない) 記録を書き直す（読める形に戻る）" "$(state_of "$dir")" "result=pass"
+  fi
+  chmod 644 "$state_file" 2> /dev/null
+
+  # 書けない（置き場の権限）: 合格でも exit 4 → 夜間は WARN と理由つきの通知を出す
+  chmod 555 "$state_dir"
+  if [[ -w "$state_dir" ]]; then
+    unmeasured "chmod 555 でも記録の置き場に書ける（root で走っている）ので、記録を書けない形を作れない"
+  else
+    rc=0
+    out=$(run_nightly "$dir" --dry-run) || rc=$?
+    assert_eq "(書けない) 夜間リリースは exit 0" "0" "$rc"
+    assert_contains "(書けない) 結果の行に理由が出る" "$out" \
+      "mod: 結果: 合格 — claude 2.1.294（validate --strict・test 3 pass/0 fail・skills-dir）。記録を書けない（~/.claude-orchestrator/state/tako-mod-check の置き場か権限）"
+    assert_contains "(書けない) WARN をログへ出す" "$out" "WARN: mod の検査は合格したが、記録"
+    assert_contains "(書けない) 通知は理由を言う" "$(notices_of "$dir")" "mod の検査: 合格 — claude 2.1.294（validate --strict・test 3 pass/0 fail・skills-dir）。記録を書けない"
+    assert_contains "(書けない) リリースの判定へ進む" "$out" "DRY-RUN: ここで終了"
+  fi
+  chmod 755 "$state_dir"
+
+  # 検査が結果の行を出さずに止まる（引数の誤り = exit 2）: 夜間は「途中で止まった（exit N）」と通知する
+  rc=0
+  out=$(NIGHTLY_ENV="TAKO_MOD_CHECK_TIMEOUT=x" run_nightly "$dir" --dry-run) || rc=$?
+  assert_eq "(途中で止まる) 夜間リリースは exit 0" "0" "$rc"
+  assert_contains "(途中で止まる) ERROR に理由" "$out" "ERROR: mod の検査が途中で止まった（exit 2。結果の行が無い"
+  assert_contains "(途中で止まる) 通知の本文が空でない" "$(notices_of "$dir")" "mod の検査: 途中で止まった（exit 2。"
+  assert_not_contains "(途中で止まる) 本文が空の通知を出さない" "$(notices_of "$dir")" 'notification "mod の検査: " with'
+  assert_contains "(途中で止まる) リリースの判定へ進む" "$out" "DRY-RUN: ここで終了"
 }
 
 test_assert_helpers
@@ -760,6 +882,7 @@ test_runs_on_no_change_night
 test_standalone
 test_reworded
 test_skills_dir
+test_record_unusable
 test_real_claude
 
 echo ""

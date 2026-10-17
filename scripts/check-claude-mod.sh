@@ -16,7 +16,8 @@
 # （scripts/nightly-release.sh）が毎晩これを回し、落ちたら通知する。
 #
 # 終了コード: 0 = 合格 / 1 = 不合格（validate・test の失敗、上限での打ち切り、mod を取り出せない）/
-#             2 = 引数の誤り / 3 = 未実測（claude が無い。#1879 の受け入れ 8 と同じ扱い）
+#             2 = 引数の誤り / 3 = 未実測（claude が無い。#1879 の受け入れ 8 と同じ扱い）/
+#             4 = 合格したが --record の記録を書けない（置き場か権限。#1969）
 #
 # 利用者の Claude Code の設定には触らない:
 #   - 設定 dir（CLAUDE_CONFIG_DIR）は毎回作る使い捨て。claude が書く .claude.json もそこへ入る
@@ -37,6 +38,8 @@
 # 記録（--record）: ~/.claude-orchestrator/state/tako-mod-check（夜間リリースの予約と同じ置き場）。
 # 検査した claude の版・mod の出どころと、最後に合格した claude の版・mod の木を持つ。
 # 不合格のときは前回の合格と比べて「Claude Code の更新で壊れた」「mod の変更で壊れた」を出し分ける。
+# 記録が読めない（権限・種類）ときは前回と比べずに判定して書き直し、書けないときは結果の行に
+# 理由を足す（どちらも結果の行は必ず出す。#1969）。
 #
 # 使う claude は TAKO_CLAUDE_BIN（自動リネームと同じ名前・同じ意味）、無ければ PATH の claude。
 set -euo pipefail
@@ -71,7 +74,12 @@ while [ $# -gt 0 ]; do
       ;;
     --record) RECORD=1; shift ;;
     --last)
-      if [ -f "$STATE_FILE" ]; then cat "$STATE_FILE"; else echo "記録なし（${STATE_FILE}）"; fi
+      if [ ! -e "$STATE_FILE" ]; then
+        echo "記録なし（${STATE_FILE}）"
+      elif ! cat "$STATE_FILE" 2> /dev/null; then
+        echo "記録が読めない（${STATE_FILE}。権限か種類を確かめる）" >&2
+        exit 1
+      fi
       exit 0
       ;;
     -h | --help) usage; exit 0 ;;
@@ -158,9 +166,17 @@ isolated_claude() {
     "$CLAUDE" "$@"
 }
 
+# 記録は 1 回だけ読む。読めない（権限・種類）なら前回の合格と比べずに判定し、理由を結果の行へ足す
+# （#1969。旧版は sed が読めずに set -e で死に、結果の行が無いまま exit 1 = 夜間の通知の本文が空だった）
+STATE_TEXT=""
+STATE_NOTE=""
+if [ -e "$STATE_FILE" ] && ! STATE_TEXT="$(cat "$STATE_FILE" 2> /dev/null)"; then
+  STATE_TEXT=""
+  STATE_NOTE="前回の記録が読めない（権限か種類。前回の合格と比べていない）"
+fi
+
 state_get() {
-  [ -f "$STATE_FILE" ] || return 0
-  sed -n "s/^$1=//p" "$STATE_FILE" | tail -1
+  printf '%s\n' "$STATE_TEXT" | sed -n "s/^$1=//p" | tail -1
 }
 
 # --- 結果の組み立てと記録 ---------------------------------------------------------
@@ -195,42 +211,57 @@ cause_hint() {
   fi
 }
 
+# write_state <result> <結果の本文>: 記録を書く。書けなければ 1（呼び手が結果の行に理由を足す。#1969）
+write_state() {
+  local result="$1" summary="$2" now pass_at pass_ver pass_tree tmp
+  now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  pass_at="$PREV_PASS_AT"
+  pass_ver="$PREV_PASS_VERSION"
+  pass_tree="$PREV_PASS_TREE"
+  if [ "$result" = pass ]; then
+    pass_at="$now"
+    pass_ver="$CLAUDE_VERSION"
+    pass_tree="$MOD_TREE"
+  fi
+  mkdir -p "$(dirname "$STATE_FILE")" 2> /dev/null || return 1
+  tmp="${STATE_FILE}.tmp.$$"
+  if ! {
+    echo "# tako mod の検査（scripts/check-claude-mod.sh --record。Issue #1892）の直近の結果。手で書き換えない"
+    echo "checked_at=${now}"
+    echo "result=${result}"
+    echo "claude_version=${CLAUDE_VERSION}"
+    echo "claude_path=$(printf '%s' "$CLAUDE" | mask)"
+    echo "mod_source=${MOD_SOURCE}"
+    echo "mod_tree=${MOD_TREE}"
+    echo "validate=${VALIDATE}"
+    echo "test=${TEST}"
+    echo "skills_dir=${SKILLS_DIR}"
+    echo "summary=${summary}"
+    echo "last_pass_at=${pass_at}"
+    echo "last_pass_claude_version=${pass_ver}"
+    echo "last_pass_mod_tree=${pass_tree}"
+  } 2> /dev/null > "$tmp" || ! mv -f "$tmp" "$STATE_FILE" 2> /dev/null; then
+    rm -f "$tmp" 2> /dev/null || true
+    return 1
+  fi
+}
+
 # finish <result: pass|fail|unmeasured> <結果の本文>
 finish() {
-  local result="$1" summary="$2" now pass_at pass_ver pass_tree tmp
-  echo "結果: ${summary}"
-  if [ "$RECORD" = 1 ]; then
-    now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    pass_at="$PREV_PASS_AT"
-    pass_ver="$PREV_PASS_VERSION"
-    pass_tree="$PREV_PASS_TREE"
-    if [ "$result" = pass ]; then
-      pass_at="$now"
-      pass_ver="$CLAUDE_VERSION"
-      pass_tree="$MOD_TREE"
-    fi
-    mkdir -p "$(dirname "$STATE_FILE")"
-    tmp="${STATE_FILE}.tmp.$$"
-    {
-      echo "# tako mod の検査（scripts/check-claude-mod.sh --record。Issue #1892）の直近の結果。手で書き換えない"
-      echo "checked_at=${now}"
-      echo "result=${result}"
-      echo "claude_version=${CLAUDE_VERSION}"
-      echo "claude_path=$(printf '%s' "$CLAUDE" | mask)"
-      echo "mod_source=${MOD_SOURCE}"
-      echo "mod_tree=${MOD_TREE}"
-      echo "validate=${VALIDATE}"
-      echo "test=${TEST}"
-      echo "skills_dir=${SKILLS_DIR}"
-      echo "summary=${summary}"
-      echo "last_pass_at=${pass_at}"
-      echo "last_pass_claude_version=${pass_ver}"
-      echo "last_pass_mod_tree=${pass_tree}"
-    } > "$tmp"
-    mv -f "$tmp" "$STATE_FILE"
+  local result="$1" summary="$2" record_failed=0
+  if [ -n "$STATE_NOTE" ]; then
+    summary="${summary}。${STATE_NOTE}"
   fi
+  if [ "$RECORD" = 1 ] && ! write_state "$result" "$summary"; then
+    record_failed=1
+    summary="${summary}。記録を書けない（$(printf '%s' "$STATE_FILE" | mask) の置き場か権限）"
+  fi
+  echo "結果: ${summary}"
   case "$result" in
-    pass) tako_exit 0 ;;
+    pass)
+      if [ "$record_failed" = 1 ]; then exit 4; fi
+      tako_exit 0
+      ;;
     unmeasured) exit 3 ;;
     *) exit 1 ;;
   esac
@@ -265,9 +296,30 @@ case "$MODE" in
       finish fail "不合格 — ${MOD_SOURCE} に ${MOD_PATH} が無い（置き場が変わったならこのスクリプトの MOD_PATH を直す）"
     fi
     mkdir -p "$WORK/mod"
-    if ! git -C "$REPO_ROOT" archive --format=tar "$MOD_TREE" | tar -x -C "$WORK/mod"; then
-      echo "tako mod の検査: ${MOD_SOURCE} の mod を取り出せない（git archive / tar が失敗）"
-      finish fail "不合格 — ${MOD_SOURCE} の mod を取り出せない"
+    # git archive と tar はパイプで繋がず、ファイルを挟む（#1933）。tar（bsdtar）は終端の印（ゼロの
+    # レコード 2 つ）を読んだ時点で、git がその後ろへ書くゼロ詰めを読まずに抜ける。git の最後の書き込みが
+    # それより遅れると、git は SIGPIPE で何も言わずに 141 で終わり、pipefail で「取り出せない」になっていた
+    # （CI の macOS で間欠。mod の tar はパイプの容量より大きいので、最後の書き込みは途中で待たされうる）。
+    # A/B: TAKO_1933_LEGACY=1 でパイプの形（修正前）
+    if [ "${TAKO_1933_LEGACY:-}" = 1 ]; then
+      if ! git -C "$REPO_ROOT" archive --format=tar "$MOD_TREE" | tar -x -C "$WORK/mod"; then
+        echo "tako mod の検査: ${MOD_SOURCE} の mod を取り出せない（git archive / tar が失敗）"
+        finish fail "不合格 — ${MOD_SOURCE} の mod を取り出せない"
+      fi
+    else
+      rc=0
+      git -C "$REPO_ROOT" archive --format=tar "$MOD_TREE" > "$WORK/mod.tar" 2> "$WORK/archive.err" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        echo "tako mod の検査: ${MOD_SOURCE} の mod を取り出せない（git archive が exit ${rc}）"
+        show_tail "$WORK/archive.err" 5
+        finish fail "不合格 — ${MOD_SOURCE} の mod を取り出せない（git archive が exit ${rc}）"
+      fi
+      tar -x -C "$WORK/mod" -f "$WORK/mod.tar" 2> "$WORK/tar.err" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        echo "tako mod の検査: ${MOD_SOURCE} の mod を取り出せない（tar が exit ${rc}）"
+        show_tail "$WORK/tar.err" 5
+        finish fail "不合格 — ${MOD_SOURCE} の mod を取り出せない（tar が exit ${rc}）"
+      fi
     fi
     ;;
   dir)
