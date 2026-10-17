@@ -2770,6 +2770,12 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   個々のテストの成否では落とさず、残骸の件数だけを見る）と、
   `crates/tako-control/tests/test_residue_watchdog.rs` の静的検査。A/B は `TAKO_1312_LEGACY=1`
   （器を修正前 = 作りっぱなしへ戻す。実測 19 件が残る）
+- **固定名の `temp_dir().join("x")` をテストに書かない**（#1666）。TMPDIR はマシンで 1 つなので、
+  別の worktree の `cargo test` が同じテストを同じ名前で走らせると、一方の `remove_dir_all` が
+  他方の fixture を消す（修正前は 2 プロセス同時で 5 回とも片方が落ちた）。名前を引数で受けて
+  `temp_dir().join(引数)` する補助も同じ（呼び手は固定名を渡しがち）。作らない・消さないパスだけは
+  同じ行か 1 行上の `// 固定名安全: <理由>` で通す。番犬は
+  `crates/tako-control/tests/issue1666_fixed_temp_dir_watchdog.rs`（file:line で名指す）
 
 ### 長生きする子を残すテストは、パイプを読むテストと spawn を重ねない（Issue #1748）
 

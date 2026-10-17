@@ -49,7 +49,10 @@ mod tests {
     #[test]
     fn panicしてもhomeは元へ戻る() {
         let before = std::env::var_os("HOME");
-        let tmp = std::env::temp_dir().join("tako-test-home-guard");
+        // 差し替え先は一意な置き場（#1666。固定名の一時パスをテストに置かない。差し替えの間に
+        // 同じプロセスの他のテストが HOME の下へ書いても、置き場ごと消える）
+        let scratch = tako_core::test_residue::ScratchDir::new("home-guard");
+        let tmp = scratch.path().to_path_buf();
         let caught = std::panic::catch_unwind(|| {
             let _guard = HomeGuard::set(&tmp);
             assert_eq!(std::env::var_os("HOME"), Some(tmp.clone().into_os_string()));

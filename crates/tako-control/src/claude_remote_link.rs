@@ -1114,8 +1114,7 @@ mod tests {
     /// 前回の答えを引き継ぐ）
     #[test]
     fn 追記ぶんの走査は完結した行までしか進まない() {
-        let dir = std::env::temp_dir().join("tako-1069-scan-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tako_core::test_residue::ScratchDir::new("remote-link-1069-scan");
         let path = dir.join("t.jsonl");
 
         // 完結した 1 行 + **改行の無い書き込み途中の行**
@@ -1158,8 +1157,6 @@ mod tests {
         let (link3, consumed3) = scan_from(&path, consumed2).unwrap();
         assert_eq!(link3, None, "手がかりが無いのに何か返している");
         assert_eq!(consumed3, grown.len() as u64);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **追記ぶんだけ読む形の効果**（`/api/v2/panes` は PWA がポーリングし、
@@ -1175,8 +1172,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
 
-        let dir = std::env::temp_dir().join("tako-1069-incremental-bench");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tako_core::test_residue::ScratchDir::new("remote-link-1069-bench");
         let path = dir.join("t.jsonl");
         let one = json!({"type": "user", "message": {"role": "user", "content": "x".repeat(300)}})
             .to_string();
@@ -1257,21 +1253,18 @@ mod tests {
         let (found2, consumed3) = scan_from(&path, consumed).unwrap();
         assert_eq!(found2, None);
         assert_eq!(consumed3, appended.len() as u64);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn 読めないファイルは_unknown_になる() {
-        let missing = std::env::temp_dir().join("tako-1069-missing.jsonl");
-        let _ = std::fs::remove_file(&missing);
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-link-1069-missing");
+        let missing = scratch.join("missing.jsonl");
         assert!(read_link_at(&missing).is_err());
     }
 
     #[test]
     fn 実ファイルからも同じ結果になる() {
-        let dir = std::env::temp_dir().join("tako-1069-read-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tako_core::test_residue::ScratchDir::new("remote-link-1069-read");
         let path = dir.join("t.jsonl");
         let body = format!(
             "{}\n{}\n",
@@ -1293,7 +1286,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_link_at(&plain).unwrap(), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- #1077: 開けない理由を PWA へ渡す層 ---

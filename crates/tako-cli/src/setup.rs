@@ -3759,9 +3759,7 @@ mod tests {
 
     #[test]
     fn pending_changes_file_sync() {
-        let tmp = std::env::temp_dir().join("tako-test-pending-sync");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tako_core::test_residue::ScratchDir::new("setup-pending-sync");
         let pending = pending_changes(0).unwrap();
         assert!(!pending.is_empty(), "初期エントリが存在する");
         // 未適用あり → pending-changes.md が書き出される
@@ -3775,7 +3773,6 @@ mod tests {
         assert!(!path.exists());
         // 無い状態での再同期も no-op で成功する
         sync_pending_changes_file(&tmp, &[], 4).unwrap();
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     use tako_control::setup_deps::DepInstaller;

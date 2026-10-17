@@ -267,6 +267,7 @@ fn cwd_tracking(program: &str, dir_name: &str) {
         "初期 cwd が実在するパスでない: {start:?}"
     );
 
+    // 固定名安全: 呼び手が pid 入りの名前を渡す（日本語を打鍵経路へ流すので ScratchDir の整形を通せない）
     let target = std::env::temp_dir().join(dir_name);
     std::fs::create_dir_all(&target).expect("移動先を作れること");
     pane.send_line(&format!("Set-Location '{}'", target.display()));
@@ -654,6 +655,7 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
     // **比べる相手は「書く前の cwd」**にする。書いた後の値を 2 回読んで比べると、
     // 巻き戻っていても両方が巻き戻り先を指すので必ず等しくなり検証にならない
     let cwd_before_foreign = pane.session.cwd().map(Path::to_path_buf);
+    // 固定名安全: 作らない・消さない（別のシェルの OSC 7 の本文に載せる文字列だけ）
     let foreign_home = std::env::temp_dir().join("tako-1199-foreign");
     let foreign = tako_core::osc_sink::writer_sink_path(&data_dir, 1, 999_999);
     let bundle = format!(

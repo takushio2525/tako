@@ -34932,8 +34932,10 @@ mod tests {
         let mut host = MockHost::new();
         let pane = host.root_pane();
 
-        // 一時ディレクトリを作って追加
-        let tmp = std::env::temp_dir().join("tako_test_prune_171");
+        // 一時ディレクトリを作って追加（一意な置き場の子。#1666: 固定名だと並行する
+        // 別の cargo test が作り直し、消失を確かめる前に生き返る）
+        let scratch = tako_core::test_residue::ScratchDir::new("dispatch-prune-171");
+        let tmp = scratch.join("folder");
         std::fs::create_dir_all(&tmp).unwrap();
         dispatch(
             &mut host,

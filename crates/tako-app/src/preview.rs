@@ -4316,12 +4316,17 @@ mod tests {
         assert_eq!(data.release_pages_outside(3..5), 0);
     }
 
-    fn write_test_pdf(dir_name: &str, file: &str, contents: &[&str]) -> PathBuf {
-        let dir = std::env::temp_dir().join(dir_name);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// 一意な置き場（#1666。並行する別の cargo test と名前を取り合わない）へ PDF を書き、
+    /// 置き場ごと返す。置き場はスコープを抜けると（panic でも）消える
+    fn write_test_pdf(
+        tag: &str,
+        file: &str,
+        contents: &[&str],
+    ) -> (tako_core::test_residue::ScratchDir, PathBuf) {
+        let dir = tako_core::test_residue::ScratchDir::new(&format!("pdf-{tag}"));
         let path = dir.join(file);
         std::fs::write(&path, build_test_pdf(contents)).unwrap();
-        path
+        (dir, path)
     }
 
     /// PDF レンダラを持つ環境（macOS / Windows）でだけ意味のある検査。
@@ -4339,8 +4344,8 @@ mod tests {
         if skip_unless_rasterizable() {
             return;
         }
-        let pdf_path = write_test_pdf(
-            "tako_pdf_render_test",
+        let (_dir, pdf_path) = write_test_pdf(
+            "render",
             "render.pdf",
             &[
                 "BT /F1 24 Tf 72 700 Td (Page One) Tj ET 0.2 0.4 0.8 rg 72 400 200 100 re f",
@@ -4379,7 +4384,6 @@ mod tests {
             }
             other => panic!("Pdf になる: {other:?}"),
         }
-        std::fs::remove_dir_all(pdf_path.parent().unwrap()).ok();
     }
 
     /// ズームを上げると実ラスタライズ解像度が上がる（ぼやけた拡大にならない）
@@ -4388,11 +4392,8 @@ mod tests {
         if skip_unless_rasterizable() {
             return;
         }
-        let pdf_path = write_test_pdf(
-            "tako_pdf_zoom_test",
-            "zoom.pdf",
-            &["BT /F1 24 Tf 72 700 Td (Zoom) Tj ET"],
-        );
+        let (_dir, pdf_path) =
+            write_test_pdf("zoom", "zoom.pdf", &["BT /F1 24 Tf 72 700 Td (Zoom) Tj ET"]);
 
         let low = rasterize_pdf(&pdf_path, PdfRasterKey::for_view(1.0, 1.0, 612.0)).unwrap();
         let high = rasterize_pdf(&pdf_path, PdfRasterKey::for_view(1.0, 3.0, 612.0)).unwrap();
@@ -4408,14 +4409,12 @@ mod tests {
         );
         // 論理サイズ（pt）はズームに依らない
         assert_eq!(low.page_sizes[0], high.page_sizes[0]);
-        std::fs::remove_dir_all(pdf_path.parent().unwrap()).ok();
     }
 
     /// 壊れた PDF・0 ページ PDF はパニックせず理由つきの Error になる
     #[test]
     fn 壊れたpdfと0ページpdfはエラーになる() {
-        let dir = std::env::temp_dir().join("tako_pdf_broken_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tako_core::test_residue::ScratchDir::new("pdf-broken");
 
         let broken = dir.join("broken.pdf");
         std::fs::write(&broken, b"%PDF-1.4\nthis is not a valid pdf body").unwrap();
@@ -4445,8 +4444,6 @@ mod tests {
             ),
             "不在ファイルはエラー"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// テキストレイヤ・目次・リンクは取れないプラットフォームがある（#693）。
@@ -4454,8 +4451,8 @@ mod tests {
     #[test]
     fn 取れない付加情報は空で返る() {
         let caps = crate::platform::pdf::capabilities();
-        let pdf_path = write_test_pdf(
-            "tako_pdf_caps_test",
+        let (_dir, pdf_path) = write_test_pdf(
+            "caps",
             "caps.pdf",
             &["BT /F1 14 Tf 72 700 Td (Hello) Tj ET"],
         );
@@ -4473,7 +4470,6 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
-        std::fs::remove_dir_all(pdf_path.parent().unwrap()).ok();
     }
 
     #[test]
@@ -4481,12 +4477,11 @@ mod tests {
     fn pdfテキストレイヤ抽出() {
         // 手動構築 PDF（英語テキストのみ）で extract_text_layers が動くか。
         // T* に使う leading は TL で明示する
-        let pdf_path = write_test_pdf(
-            "tako_pdf_text_test",
+        let (_dir, pdf_path) = write_test_pdf(
+            "text",
             "test_text.pdf",
             &["BT /F1 14 Tf 14 TL 72 700 Td (Hello World) Tj T* (Second Line) Tj ET"],
         );
-        let scratchpad = pdf_path.parent().unwrap().to_path_buf();
 
         let layers = crate::platform::pdf::extract_text_layers(&pdf_path, 1)
             .expect("PDFKit のテキスト抽出は成功する");
@@ -4522,8 +4517,6 @@ mod tests {
                 .any(|(first, second)| first.bbox[1] != second.bbox[1]),
             "2 行の文字矩形は異なる y 座標を持つ"
         );
-
-        std::fs::remove_dir_all(&scratchpad).ok();
     }
 
     #[test]
@@ -4532,8 +4525,8 @@ mod tests {
             return;
         }
         // テキストレイヤのない PDF（灰色矩形のみ）
-        let pdf_path = write_test_pdf(
-            "tako_pdf_notext_test",
+        let (_dir, pdf_path) = write_test_pdf(
+            "notext",
             "notext.pdf",
             &["q 0.8 0.8 0.8 rg 100 600 200 100 re f Q"],
         );
@@ -4549,8 +4542,6 @@ mod tests {
             }
             other => panic!("Pdf になる: {other:?}"),
         }
-
-        std::fs::remove_dir_all(pdf_path.parent().unwrap()).ok();
     }
 
     fn 色数(lines: &[Line]) -> usize {
@@ -4565,8 +4556,8 @@ mod tests {
 
     #[test]
     fn 読み取りと編集で標準言語セットのシンタックスハイライトを使う() {
-        let scratchpad = std::env::temp_dir().join("tako_editor_highlight_test");
-        std::fs::create_dir_all(&scratchpad).ok();
+        // 置き場は一意（#1666。固定名だと並行する別の cargo test の後始末に fixture を消される）
+        let scratchpad = tako_core::test_residue::ScratchDir::new("editor-highlight-1666");
         let fixtures = [
             ("sample.rs", "fn main() { let answer = 42; }\n"),
             (
@@ -4613,8 +4604,6 @@ mod tests {
                 "読み取りと編集で同じ構文判定を使う"
             );
         }
-
-        std::fs::remove_dir_all(&scratchpad).ok();
     }
     // --- #1648: 編集中の再ハイライトを差分化する ----------------------------
 
