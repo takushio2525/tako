@@ -157,10 +157,49 @@ pub const STILL_ACTIVE: u32 = 259;
 /// 同じ pid の別プロセスを死んだと読むことが無いから。
 /// cfg で割れていないので **macOS からも Windows の腕を単体で検証できる**
 pub fn alive_unless_exited(exit_code: Option<u32>, roster: impl FnOnce() -> bool) -> bool {
-    if exit_code.is_some_and(|code| code != STILL_ACTIVE) {
+    if exited(exit_code) {
         return false;
     }
     roster()
+}
+
+/// 終了コードで「終わった」と言えるか（#2275 / #2284 の境界の 1 実装）。
+///
+/// `Some(code)` で `code != STILL_ACTIVE` のときだけ真。`None`（開けない・unix）と
+/// `Some(STILL_ACTIVE)`（走っている。259 で終わったものと区別できない）は言えない。
+/// 根拠は [`alive_unless_exited`] の Microsoft の仕様の節
+pub fn exited(exit_code: Option<u32>) -> bool {
+    exit_code.is_some_and(|code| code != STILL_ACTIVE)
+}
+
+/// **走っている**プロセスの起動時刻（UNIX 秒。#2284）。終了済みなら `None`。
+///
+/// [`super::procinfo::start_time_unix`] は Windows では終了済みでもプロセスオブジェクトが
+/// 残る間（誰かがハンドルを持つ間）は読める。`GetProcessTimes` は終了済みのプロセスにも
+/// 答える API で、`lpExitTime` は「プロセスの終了時刻を受け取る。終わっていなければ未定義」
+/// とされている。「起動時刻が取れた = 生きている」と読む呼び手（蓋閉じ継続の記録の
+/// 所有者の確認 = `tako-control::platform::lid`）はこちらを通す。読み方は
+/// [`started_unless_exited`] の 1 実装。
+///
+/// unix は終了コードを持たない（`exit_code` が `None`）ので
+/// [`super::procinfo::start_time_unix`] と同じ値を返す（振る舞いを変えない）
+pub fn live_start_time_unix(pid: u32) -> Option<u64> {
+    started_unless_exited(super::procinfo::start_time_unix(pid), || {
+        super::procinfo::exit_code(pid)
+    })
+}
+
+/// 読めた起動時刻を、終了コードで「終わった」と言えれば捨てる（**Windows の腕の純粋部分**。#2284）。
+///
+/// 起動時刻を先に読み、終了コードは後に問う（起動時刻が取れたときだけ）。読んだ直後に
+/// 終わったものも捨てられる順で、終了コードの読み方は [`exited`] の 1 実装（#2275 と同じ境界）。
+/// cfg で割れていないので **macOS からも Windows の腕を単体で検証できる**
+pub fn started_unless_exited(
+    started: Option<u64>,
+    exit_code: impl FnOnce() -> Option<u32>,
+) -> Option<u64> {
+    let started = started?;
+    (!exited(exit_code())).then_some(started)
 }
 
 #[cfg(not(windows))]
@@ -308,6 +347,54 @@ mod tests {
         assert!(
             alive_unless_exited(None, || alive_in_snapshot(None, 8)),
             "開けず列挙もできない回は居る側へ倒す（#1597）"
+        );
+    }
+
+    /// **#2284 の名指し**（macOS からも回る）。終了コードが取れた終了済みのプロセスの起動時刻は、
+    /// 読めても「走っている」材料にしない。修正前の `lid::probe_owner` は起動時刻が取れた時点で
+    /// `Alive` と答え、終わったのにオブジェクトが残る pid（Windows）を生きていると読んだ
+    #[test]
+    fn issue2284_終了済みのプロセスオブジェクトの起動時刻は走っている材料にしない() {
+        const STARTED: u64 = 1_700_000_000;
+        assert_eq!(
+            started_unless_exited(Some(STARTED), || Some(0)),
+            None,
+            "0 で終わったのに起動時刻を「走っている」と読んだ（#2284）"
+        );
+        assert_eq!(
+            started_unless_exited(Some(STARTED), || Some(1)),
+            None,
+            "TerminateProcess（1）で終わったものも終了済み"
+        );
+        // 言えない回は読めた起動時刻をそのまま返す（unix はいつもここ = 振る舞いを変えない）
+        assert_eq!(
+            started_unless_exited(Some(STARTED), || Some(STILL_ACTIVE)),
+            Some(STARTED),
+            "走っている"
+        );
+        assert_eq!(
+            started_unless_exited(Some(STARTED), || None),
+            Some(STARTED),
+            "終了コードを開けない回（unix は常に）は起動時刻のまま"
+        );
+        assert_eq!(
+            started_unless_exited(None, || unreachable!(
+                "起動時刻が無ければ終了コードは問わない"
+            )),
+            None
+        );
+        // 境界は #2275 と同じ 1 実装
+        assert!(exited(Some(0)) && exited(Some(1)));
+        assert!(!exited(Some(STILL_ACTIVE)) && !exited(None));
+    }
+
+    /// 自分は走っているので、起動時刻は境界の値そのもの（Windows では終了コードが STILL_ACTIVE）
+    #[test]
+    fn 走っている自分の起動時刻はstart_time_unixと同じ() {
+        let me = std::process::id();
+        assert_eq!(
+            live_start_time_unix(me),
+            super::super::procinfo::start_time_unix(me)
         );
     }
 

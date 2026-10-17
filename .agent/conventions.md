@@ -1012,7 +1012,8 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
 ## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
 
 **「その pid は生きているか」を自前で書かない。`tako_core::platform::process::pid_alive`
-だけが答える**（unix は `kill(pid, 0)`、Windows は `procinfo::snapshot` の在籍）。
+だけが答える**（unix は `kill(pid, 0)`、Windows は終了コード（`procinfo::exit_code`）を先に問い、
+言えなければ `procinfo::snapshot_checked` の在籍 = #2275）。
 
 自前で書くと `#[cfg(not(unix))]` の腕が要り、そこは決まって**無条件 `false` か
 無条件 `true`** になる。どちらも Windows でだけ全件を静かに誤り、macOS の単体テストは
@@ -1029,6 +1030,10 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
 - 走査で何千回も引くなら、境界と**同じ材料**（`procinfo::snapshot_checked`）を 1 度取って
   キャッシュしてよい（`test_residue::OwnerProbe::alive`）。ただし判定を置く場所は
   関数 1 つに保ち、呼び出し側へ `#[cfg]` を撒かない
+- **起動時刻が読めることは生きている証拠にならない**（#2284）。Windows は終わったプロセスでも
+  オブジェクトが残る間（誰かがハンドルを持つ間）は `procinfo::start_time_unix` が答える。
+  「起動時刻が取れた = 生きている」と読むなら `process::live_start_time_unix` を通す
+  （終了コードで終わったと言えれば `None`。読み方は `process::exited` の 1 実装 = #2275 と同じ境界）
 - ゾンビは `pid_alive` では「居る」。**停止の待ち合わせには使わない**
   （`tako_control::platform::process::has_terminated` がゾンビ込みで担う）
 - 番犬: `crates/tako-control/tests/issue1557_pid_alive_boundary_watchdog.rs`
@@ -3664,6 +3669,8 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
   **生きた他プロセスの記録には倒す側も解除側も触らない**（相手が解除した次の tick で取り直す）
 - pid だけでは**pid の再利用**を見分けられない。起動時刻
   （`procinfo::start_time_unix`）と対にして、食い違ったら「所有者は死んだ」と読む。
+  所有者の側の起動時刻は**走っているものだけ**を採る（`process::live_start_time_unix`。
+  Windows は終わった所有者の起動時刻も読めるので、直に読むと死んだ所有者を生きていると読む = #2284）。
   生死を判定できないときは**触らない側**へ倒す（語彙は `test_residue::Owner` の 1 実装）
 - 所有権の判定は**probe を引数で受ける純粋関数**にする（`lid::claim_for`）。
   OS 依存を追い出しておかないと、Windows 実機の無い CI で分岐を 1 つも固定できない
