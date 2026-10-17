@@ -17,7 +17,9 @@
 #   ⑧ 取り消し（待ち = 125）
 #   ⑨ 取り消し（実行中 = 子とその子孫へ SIGTERM・wrapper は 143）
 #   ⑩ 停滞（木の CPU が窓のあいだ 1% 未満）は枠を返して殺さない
-#   ⑪ メモリ圧 critical は止める（0 件でも）・空きメモリの予約で待つ（注入した機の値）
+#   ⑪ メモリ圧 critical は止める（0 件でも）・空きメモリの予約で待つ（注入した機の値）。
+#      見込みは同じコマンドの過去の記録から引く（#2254）ので、予約の待ちはこの段だけのコマンド
+#      （記録が無い = 区分の既定）で確かめ、記録がこのテストの data dir に残ることも見る（#2279）
 #   ⑫ UI の代役が答えない（固まった UI）状態でも割り当ては進む
 #   ⑬ 上限の読み書き（範囲外は弾く・GUI が居なくても設定ファイルへ書ける）
 #   ⑭ scripts/lib/queue.sh の run_heavy（順番待ちへ通す・入れ子と tako の無い環境はそのまま・
@@ -329,14 +331,23 @@ wait "$PA"
 q limits --max-jobs 3 >/dev/null
 inject avail=6000
 reset_log
-enqueue_bg A 3; PA=$LAST_BG
-wait_until 5 started A
-enqueue_bg B 1; PB=$LAST_BG
+# 見込みは同じコマンドの直近の記録の最大から引く（#2254。下限 256 MB）。前の段の `A 3` / `B 1` は
+# 記録が残っていて（走査に 1 度でも掛かった回）、見込みが 256 MB へ下がると B は待たずに入る（#2279）。
+# 予約の待ちはこの段でしか走らせないコマンド（記録が無い = 区分の既定 3.5 GB）で確かめる
+enqueue_bg MA 3; PA=$LAST_BG
+wait_until 5 started MA
+enqueue_bg MB 1; PB=$LAST_BG
 sleep 1.5
-reason="$(status_json | json_get 'v["queue"]["blocked"]["reason"]')"
-if ! started B && [ "$reason" = "memory" ]; then pass "空き 5.9 GB − 見込み 3.5 GB × 2 < 予約 3.6 GB で待つ（理由 = memory）"; else fail "空きメモリ: started B? reason=$reason"; fi
+S="$(status_json)"
+est="$(json_get '" ".join("%s=%s/%s" % (j["label"].split()[2], j["estimate_mb"], j["estimate_from"]) for j in v["queue"]["running"] + v["queue"]["waiting"])' <<<"$S")"
+[ "$est" = "MA=3584/default MB=3584/default" ] && pass "記録の無いコマンドの見込みは区分の既定（${est}）" || fail "見込み: $est"
+reason="$(json_get 'v["queue"]["blocked"]["reason"]' <<<"$S")"
+if ! started MB && [ "$reason" = "memory" ]; then pass "空き 5.9 GB − 見込み 3.5 GB × 2 < 予約 3.6 GB で待つ（理由 = memory）"; else fail "空きメモリ: started MB? reason=$reason 見込み=$est"; fi
 wait "$PA" "$PB"
-started B && pass "1 件目が終われば入る" || fail "B が走らなかった"
+started MB && pass "1 件目が終われば入る" || fail "MB が走らなかった"
+# 記録はこのテストの data dir へ足す（本番の data dir の記録を読み書きしない。読みと書きは同じ置き場 = #2279）
+[ -s "$TAKO_DATA_DIR/resources/history.jsonl" ] && pass "過去の記録はこのテストの data dir に残る" \
+  || fail "過去の記録が $TAKO_DATA_DIR/resources に無い"
 q limits --max-jobs 1 >/dev/null
 inject
 
@@ -347,7 +358,9 @@ start_arbiter env TAKO_1994_INJECT=ui-stall || exit 1
 LIST_PID=$!
 BG_PIDS="$BG_PIDS $LIST_PID"
 reset_log
+# B は A が走り出してから並べる（続けて起こすと B の wrapper の最初の poll が先に届き、空いた枠へ B が先に入る = #2279）
 enqueue_bg A 1; PA=$LAST_BG
+wait_until 5 started A
 enqueue_bg B 1; PB=$LAST_BG
 wait "$PA" "$PB"
 if grep -q "^list-returned" "$LOG"; then fail "UI の代役が答えている（注入が効いていない）"; else pass "UI の代役は答えない（tako list が返らない）"; fi
