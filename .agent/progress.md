@@ -20,24 +20,6 @@
 
 ---
 
-## 2026-10-16（#2182: 返答の配送で起票 master を起こす組み立て（ログインシェルの所在確認）を `OffloadJob::UserTaskLaunch` で UI の外へ・右パネルも同じ）
-- 戻らないログインシェルで最中の IPC 新 45 ms / 旧 14,957 ms・`scripts/test-respond-master-launch-2182.sh` 13 PASS・A/B `TAKO_2182_LEGACY=1`。PR #2190
-
-## 2026-10-16（#2185: issue2151_git_bin_oncelock の結合テストも初回 exec の検査の列で落ちる間欠を #2183 と同じ形で止めた）
-- 8 本同時で修正前 24 本中 9 本落ち → 修正後 0 本・製品コード不変。PR #2191
-
-## 2026-10-16（#1938: セルフテスト項目 154 が止まる真因は、右クリックで立った行の選択が入力欄を閉じても残り、次の Enter がツリーへ吸われていたこと）
-- `close_inline_edit` で選択も畳む（製品 3 行）・セルフテストが `TAKO_APP_SELF_TEST_OK` まで完走・A/B `TAKO_1938_LEGACY=1`。PR #2194
-
-## 2026-10-16（#2192 S0: usage 分析の設計書 `.agent/plans/2026-10-usage-analytics.md` = 区間按分・API 換算の重み・ログイン単位・`tako_sessions` の action・増分索引）
-- 利用制限の % の履歴がどこにも無いことを実測で確認 → S1 を最優先に。台帳の主 Issue の不具合（#2199）を発見。PR #2195
-
-## 2026-10-16（#2196: scroll_mirror のホイール直接注入 e2e の間欠 = 内側の stty 前に注入して tty と perl の echo で 2 回見えていた）
-- アンカーを器のペインの `history_state` へ・列を個数まで比較・A/B `TAKO_2196_LEGACY=1` で CI と同一の画面。PR #2197
-
-## 2026-10-16（#2193: ports の libproc と ps の照合テストの間欠の真因は、ps が改行などを `\012` へ表記し直すこと（時刻差ではない））
-- libproc → ps → libproc で挟んで全件一致・表記し直しは手前の ASCII だけ比べる・テストだけの変更。PR #2198
-
 ## 2026-10-16（#2199: 委任台帳の `issue` とカタログの `issues` の先頭を、ラベルに書いた主の Issue にした）
 - `extract_issues` を書いた順へ・A/B `TAKO_2199_LEGACY=1`・`scripts/test-ledger-primary-issue-2199.sh` 26 PASS・フィールド不変。PR #2207
 
@@ -79,3 +61,21 @@
 
 ## 2026-10-17（#1824: recent / shortcuts の破損を `data_files` 経由で persist.log へ・layout の `.corrupt` rename を番号付きの退避 `stash_unrestorable` へ）
 - A/B `TAKO_1824_LEGACY=1`・`scripts/test-corrupt-quarantine-1824.sh` 16 PASS・理由は `json_reason`（値を載せない）。残りは #2230 / #2231。PR #2226
+
+## 2026-10-17（#2227: 壊れた default.yaml で `tako master` は組み込み既定で立てるが `警告:`・persist.log・system prompt で知らせ、`-<key>` は #1825 の理由と直し方で止まる）
+- CLI と `master_launch::plan` を `load_profile` の 1 実装へ・A/B `TAKO_2227_LEGACY=1`・結合 9 本 + 番犬。残りの経路は #2233。PR #2229
+
+## 2026-10-17（#2204: usage 分析 S5 = codex の rollout の token_count の累積の差分を索引へ・rate_limits を `limits.jsonl` へ `source: codex`・過去の窓まで按分）
+- 実データで 19.41 億トークン完全一致・実経路 32 PASS・MATRIX の codex 2 マスは Degraded（単価表に無い）・auth.json は account_id だけを読む。PR #2234
+
+## 2026-10-17（#2231: UTF-8 でない recent.json / shortcuts.json をバイトのまま番号付きの退避へ = `migration::quarantine_raw`。layout の rename 枝も同じ口へ）
+- A/B `TAKO_2231_LEGACY=1`・`scripts/test-nonutf8-quarantine-2231.sh` 21 PASS・番犬。settings / run-configs / ui.json の同型は #2238。PR #2235
+
+## 2026-10-17（#1868: テストの「存在しない ID」の決め打ち 33 か所を `tako_core::unused_id`（採番器から 1 つ取る）へ寄せ、番犬 `issue1868_stale_id_watchdog` で縛る）
+- `u64::MAX` は採番器が巻き戻るので不採用・全体テスト並列 1 / 2 / 4 で緑。固定番号のレジストリの残りは #2239。PR #2236
+
+## 2026-10-17（#1933 / #1969: 夜間の mod の検査の「取り出せない」の真因は `git archive | tar` で tar が終端で抜けた後の git の SIGPIPE。ファイル経由へ・記録が使えなくても結果の行と通知の本文を出す）
+- 注入 `TAKO_1933_INJECT=archive-late-tail` で修正前は原報告と同じ 5 件 FAIL → 修正後 0・20 回連続 × 2 シェル緑。PR #2240
+
+## 2026-10-17（#2230: persist.log と画面の読めない理由を serde の素の文言から「種類 + 行・列」へ = `load_issue::{json,yaml}_error_reason`・番犬 `issue2230_serde_reason_watchdog`）
+- 型違いの目印の値で A/B `TAKO_2230_LEGACY=1`（settings / profiles / projects.yaml で値の件数 0）。PR #2237
