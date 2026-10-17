@@ -1304,7 +1304,16 @@ mod tests {
         assert_eq!(poll(&wire(pids[1], 2), now).unwrap()["state"], "waiting");
         kids[0].kill().unwrap();
         kids[0].wait().unwrap();
-        assert_eq!(poll(&wire(pids[1], 2), now).unwrap()["state"], "granted");
+        // 「居なくなった」は生存確認（調停役と同じ `pid_alive`）が終わりを映した時点から。
+        // 終わらせた直後の 1 回で決めない（#2275: Windows CI で wait() の直後も居ると読まれ
+        // waiting のまま落ちた）。`now` は据え置くので心拍切れでは外れない
+        assert!(
+            tako_core::platform::process::wait_gone(pids[0], Duration::from_secs(10)),
+            "終わらせた wrapper {} が居なくならない",
+            pids[0]
+        );
+        let got = poll(&wire(pids[1], 2), now).unwrap();
+        assert_eq!(got["state"], "granted", "{got}");
         let s = status_section();
         assert_eq!(s["recent"][0]["lost"], true, "{s}");
         let _ = kids[1].kill();

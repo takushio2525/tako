@@ -55,7 +55,11 @@ pub fn pid_alive(pid: u32) -> bool {
 ///
 /// 「終わったプロセスを生存確認がしばらく居ると読む」形（Windows CI の
 /// `queue::tests::居なくなったwrapperの枠は返る` の間欠）を macOS で再現する。
-/// 負荷は生成しない。製品のバイナリでは [`crate::paths::is_test_process`] で無視する
+/// 負荷は生成しない。製品のバイナリでは [`crate::paths::is_test_process`] で無視する。
+///
+/// 窓は**プロセスごと**に数える。env を継承した子のテストプロセスは、死んで久しい pid でも
+/// 自分が最初に見た時点から n ms は「居る」と読む（`test_data_residue` の掃除役の子など）。
+/// 実物（終わった直後の観測の遅れ）より広く効くので、その形の検査はこの注入では測れない
 pub const ENV_INJECT_2275: &str = "TAKO_2275_INJECT_ALIVE_MS";
 
 fn injected_linger(pid: u32) -> bool {
@@ -85,6 +89,24 @@ fn injected_linger(pid: u32) -> bool {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     seen.entry(pid).or_insert_with(Instant::now).elapsed() < window
+}
+
+/// pid が居なくなるまで待つ（上限つき）。居なくなったら `true`、上限まで居たら `false`。
+///
+/// **終わらせた直後の 1 回の [`pid_alive`] で生死を決めない**ための待ち合わせ（#2275）。
+/// 生存確認の材料が終わりを映すまでに遅れうる経路（在籍の列挙など）があるので、
+/// 「居なくなった」を前提にする検査は状態が変わるまで待ってから進む
+pub fn wait_gone(pid: u32, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if !pid_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// 在籍の列挙 1 枚から 1 件の生死を読む（**Windows の腕の純粋部分**。#1597）。
