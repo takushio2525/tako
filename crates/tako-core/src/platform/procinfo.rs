@@ -184,8 +184,12 @@ pub fn command_line(pid: u32) -> Option<String> {
 /// Windows は `GetProcessTimes` の生成時刻、macOS は libproc
 /// （`proc_pidinfo(PROC_PIDTBSDINFO)` の `pbi_start_tvsec`）。
 /// **それ以外の unix は `None`**（材料が無いときは呼び出し側が見送る側へ倒れる）
+///
+/// **起動時刻が読めることは生きている証拠にならない**（#2284）。Windows は終了済みでも
+/// プロセスオブジェクトが残る間は読める。生存の材料にするなら
+/// [`crate::platform::process::live_start_time_unix`] を通す
 pub fn start_time_unix(pid: u32) -> Option<u64> {
-    imp::start_time_unix(pid)
+    imp::start_time_unix(pid).or_else(|| injected_lingering(pid).then(now_unix_secs))
 }
 
 /// プロセスオブジェクトの終了コード（#2275）。開けない / 問い合わせに失敗したら `None`。
@@ -197,7 +201,35 @@ pub fn start_time_unix(pid: u32) -> Option<u64> {
 ///
 /// unix は `None`（生死は `kill(pid, 0)` が答える）
 pub fn exit_code(pid: u32) -> Option<u32> {
-    imp::exit_code(pid)
+    imp::exit_code(pid).or_else(|| injected_lingering(pid).then_some(0))
+}
+
+/// #2284 の注入: **テストプロセスでだけ**、OS が「居ない」と答えた pid を
+/// 「終了済みなのにプロセスオブジェクトが残っている」（Windows で誰かがハンドルを持つ間の状態）に見せる
+/// （`TAKO_2284_INJECT_LINGERING=1`）。[`start_time_unix`] はいまの時刻を、[`exit_code`] は 0 を返す。
+///
+/// Windows CI の `platform::lid::tests::実プロセスの生死を引ける` の間欠（看取った pid を
+/// `Owner::Alive` と読む）を macOS で再現する。負荷は生成しない。製品のバイナリでは
+/// [`crate::paths::is_test_process`] で無視する
+pub const ENV_INJECT_2284: &str = "TAKO_2284_INJECT_LINGERING";
+
+fn injected_lingering(pid: u32) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var(ENV_INJECT_2284).is_ok_and(|v| v.trim() == "1"));
+    // pid として使われない値は「残ったオブジェクト」にもしない。起動時刻を引けない OS
+    // （macOS 以外の unix）は「読めない = 居ない」と言えないので効かせない
+    on && cfg!(any(windows, target_os = "macos"))
+        && pid != 0
+        && pid <= i32::MAX as u32
+        && crate::paths::is_test_process()
+        && imp::start_time_unix(pid).is_none()
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 名前（拡張子と大文字小文字を無視）が `names` のいずれかに一致するプロセスの詳細。

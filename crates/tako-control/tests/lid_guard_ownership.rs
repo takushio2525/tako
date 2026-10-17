@@ -237,9 +237,32 @@ fn 所有者の判定は注入できる形で書く() {
     let text = product(&text);
     let direct = hits(text, "procinfo::start_time_unix(");
     assert!(
-        direct.len() <= 2,
-        "起動時刻を引く場所が増えている（`probe_owner` と `RecordOwner::current` の\
-         2 か所に留めること）:\n{}",
+        direct.len() <= 1,
+        "起動時刻を直に引く場所が増えている（自分の身元を書く `RecordOwner::current` の\
+         1 か所に留めること。所有者の生死に使う起動時刻は `live_start_time_unix` = #2284）:\n{}",
         direct.join("\n")
+    );
+}
+
+/// 所有者の生死は**走っているプロセスの起動時刻**で決める（#2284）。
+///
+/// Windows は終わったプロセスでもオブジェクトが残る間は起動時刻が読める。`probe_owner` が
+/// `procinfo::start_time_unix` を直に読んで「取れた = Alive」とすると、終了コードを先に問う
+/// `pid_alive`（#2275）を素通りし、死んだ所有者の記録を他人の物として回収しなくなる
+#[test]
+fn 所有者の生死は終了済みの起動時刻で決めない() {
+    let text = source();
+    let text = product(&text);
+    assert_goes_through(
+        text,
+        "probe_owner",
+        "process::live_start_time_unix(",
+        "終わったのにオブジェクトが残る pid（Windows）の起動時刻で `Alive` と読む（#2284）",
+    );
+    let (line, body) = body_of(text, "probe_owner");
+    assert!(
+        !body.contains("procinfo::start_time_unix("),
+        "{SRC}:{line}: fn probe_owner が起動時刻を `procinfo::start_time_unix` から直に読んでいる\
+         （終了済みでも読めるので生存の材料にならない = #2284）"
     );
 }

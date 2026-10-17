@@ -326,12 +326,15 @@ fn probe_owner(pid: u32) -> Owner {
         // pid として使われない値 = 記録が壊れている。触らない
         return Owner::Unknown;
     }
-    if let Some(secs) = tako_core::platform::procinfo::start_time_unix(pid) {
+    // 起動時刻は**走っているものだけ**を採る（#2284）。Windows は終わったプロセスでも
+    // オブジェクトが残る間は起動時刻が読めるので、取れたことを生存の証拠にすると
+    // `pid_alive`（終了コードを先に問う = #2275）を素通りして死んだ所有者を `Alive` と読む
+    if let Some(secs) = tako_core::platform::process::live_start_time_unix(pid) {
         return Owner::Alive {
             started: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
         };
     }
-    // 起動時刻が取れない = 居ない、または読めない。生きているなら起動時刻なしの
+    // 起動時刻が取れない = 居ない・終わった、または読めない。生きているなら起動時刻なしの
     // `Alive` へ倒す（`claim_for` はそれを `Foreign` = 触らない と読む）
     if tako_core::platform::process::pid_alive(pid) {
         Owner::Alive { started: None }
@@ -1100,6 +1103,41 @@ mod tests {
             "看取った pid {pid} が居なくならない"
         );
         pid
+    }
+
+    /// 注入した子で回す [`実プロセスの生死を引ける`] の `--exact` 名
+    const REAL_PROBE_TEST: &str = "platform::lid::tests::実プロセスの生死を引ける";
+
+    /// **#2284 の名指し**: 終わったのにプロセスオブジェクトが残る pid（Windows で誰かが
+    /// ハンドルを持つ間。起動時刻は読める）を `Owner::Alive` と読まない。
+    ///
+    /// 修正前の `probe_owner` は起動時刻を先に読み、取れたら `pid_alive`（終了コードを
+    /// 先に問う = #2275）を通らずに `Alive` を返した。Windows CI では看取った pid に
+    /// 誰かのハンドルが残った回だけ落ちる（間欠）。その状態を注入
+    /// （`TAKO_2284_INJECT_LINGERING=1`）で毎回作った子で [`実プロセスの生死を引ける`] を回す
+    /// = macOS の CI でもこの経路を毎回試す
+    #[test]
+    fn issue2284_終わったのに起動時刻が読めるpidをaliveと読まない() {
+        let scratch = tako_core::test_residue::ScratchDir::new("tako-lid-2284");
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["--exact", REAL_PROBE_TEST, "--test-threads=1"])
+            .env(tako_core::platform::procinfo::ENV_INJECT_2284, "1")
+            .env("TMPDIR", scratch.path())
+            .env("TMP", scratch.path())
+            .env("TEMP", scratch.path());
+        let out = tako_core::platform::process::no_console_window(&mut cmd)
+            .output()
+            .expect("注入した子を起こせる");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "終わったのに起動時刻が読める pid を Alive と読んだ（#2284）:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "子で {REAL_PROBE_TEST} が走っていない（名前の取り違え）:\n{stdout}"
+        );
     }
 
     // --- 記録の入出力（#1373 の症状 2） ---
