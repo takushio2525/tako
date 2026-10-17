@@ -117,9 +117,10 @@ fn issue1499_依存チェックの対話をreviewだけで決めない() {
         "{CLI_SETUP}: その場導入は `setup_deps::offer_and_install`（中で `offer_for`）を\
          通すこと（#1499 / #1524）"
     );
-    // 呼び出しの形（`--review` に依らない本体経路）
+    // 呼び出しの形（`--review` に依らない本体経路）。#1621 で `--answers` の
+    // sleep_guard を 2 つ目の引数で段へ渡すようになったので、1 つ目の引数の形を縛る
     for shape in [
-        "run_dependency_check(DepCheckMode::for_setup(review_mode, assume_yes))",
+        "DepCheckMode::for_setup(review_mode, assume_yes),",
         "stage_installs: true",
     ] {
         assert!(
@@ -138,9 +139,11 @@ fn issue1499_依存チェックの対話をreviewだけで決めない() {
         );
     }
     // **#262 は壊さない**: 設定値（FDA / スリープ）の見直しは `--review` だけが対話になる
+    // （スリープは #1621 で `--answers` の値も受ける。段が 1 度だけ出すことは
+    // `issue1621_setup_sleep_guard_once_watchdog` が縛る）
     for shape in [
         "run_fda_check(mode.review_settings)",
-        "run_sleep_guard_check(mode.review_settings)",
+        "run_sleep_guard_check(mode.review_settings, sleep_guard_answer)",
     ] {
         assert!(
             src.contains(shape),

@@ -390,6 +390,14 @@ jobs:
       # （#1505。#1500 の棚卸し Z19 = `--check` にシェル統合・PATH・更新・remote が無かった）
       - name: 診断の正本が 1 つであることの実経路テスト
         run: TAKO_1505_SKIP_GUI=1 bash scripts/test-setup-check-single-source-1505.sh
+      # `tako setup` の出力でスリープ防止の段が標準 / --check / --yes / --answers（MCP
+      # `tako_setup` と同じ `--yes --answers -`）/ TTY / --review のどれでも 1 度だけ出ることの
+      # 実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH + claude / tmux / brew のスタブで、
+      # 答えは隔離した settings.json へ書くだけなので本番のスリープ設定（pmset）には触らない。
+      # **`--answers` の sleep_guard で「当てる前の値 + 変え方の案内」と `[input]` が
+      # 2 度並ぶ形へ戻ったらここで落ちる**（#1621）
+      - name: setup のスリープ防止の段が 1 度だけ出ることの実経路テスト
+        run: bash scripts/test-setup-sleep-guard-once-1621.sh
       # PR の CI 完了待ちのモックテスト。偽 gh を PATH に挿し、一時ディレクトリの偽リポジトリ
       # （.github/workflows つき）だけを相手にするので本番の PR には触らない。
       # **「出ているチェックが全部 pending でなければ完了」へ戻ったらここで落ちる**
