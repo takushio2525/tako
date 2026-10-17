@@ -75,14 +75,25 @@ pub fn run(cmd: &mut std::process::Command) -> Option<std::process::Output> {
 /// （読み戻しと対なので、ここで字下げや文面を変えない）。
 /// 知らせは戻り値にも入るので、呼び手は診断の JSON へも載せられる
 pub fn output_with_timeout(program: &str, args: &[&str]) -> tako_core::probe::Outcome {
+    output_within(program, args, tako_core::probe::probe_timeout())
+}
+
+/// [`output_with_timeout`] の上限を呼び手が決める版（#2255）。
+///
+/// 環境診断の認証確認（`setup_bootstrap::auth_state_within`）は setup の probe より短い上限
+/// （`probe::auth_probe_timeout`）で打ち切る。門番・知らせの出し方は [`output_with_timeout`] と同じ
+pub fn output_within(
+    program: &str,
+    args: &[&str],
+    budget: std::time::Duration,
+) -> tako_core::probe::Outcome {
     if blocked() {
         return tako_core::probe::Outcome::Failed {
             label: tako_core::probe::label(program, args),
             reason: "検証プロセスからの問い合わせは禁じられています（#1261）".to_string(),
         };
     }
-    let outcome =
-        tako_core::probe::output_with_timeout(program, args, tako_core::probe::probe_timeout());
+    let outcome = tako_core::probe::output_with_timeout(program, args, budget);
     if let Some(notice) = outcome.timeout_notice() {
         eprintln!("  {notice}");
     }

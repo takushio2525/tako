@@ -38,6 +38,13 @@
 //! 12.4 秒だった）。GUI から呼ぶ経路（dispatch の `CheckHealth`）は
 //! `prepare_offload` で background executor へ出すこと。UI スレッドで呼ぶと
 //! そのぶん窓が止まる。
+//!
+//! 認証の問い合わせ（`claude auth status --json` / `codex login status` / `agy models`）は
+//! **上限つきで系統を並べて**聞く（#2255。既定 10 秒 = `probe::auth_probe_timeout`）。
+//! check-health は固まった GUI の切り分けに使う道具なので、返らない CLI 1 つで診断ごと
+//! 固まると切り分けができない。打ち切った系統は「認証: 不明（N 秒で応答なし）」と出し、
+//! `probe_timeouts` にも載せる。番犬 `crates/tako-control/tests/issue2255_diagnostics_auth_probe_watchdog.rs`
+//! が [`collect`] から辿れる関数で上限なしの `agent_probe::run` を呼ぶ形を file:line で落とす
 
 use serde_json::{json, Value};
 
@@ -234,7 +241,18 @@ impl Report {
 pub fn collect() -> Report {
     let mut items = Vec::new();
     let mut probe_timeouts = Vec::new();
-    let bootstrap = crate::setup_bootstrap::status_all();
+    // #2255: 認証の問い合わせは上限つきで、系統を並べて聞く（返らない CLI 1 つで診断ごと
+    // 固まらないため）。A/B の旧経路は setup と同じ上限なしの 1 系統ずつ
+    let bootstrap = if tako_core::probe::issue2255_legacy() {
+        crate::setup_bootstrap::status_all()
+    } else {
+        crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())
+    };
+    probe_timeouts.extend(
+        bootstrap
+            .iter()
+            .filter_map(|(_, state)| state.as_ref().ok()?.auth_timeout.clone()),
+    );
     items.extend(agent_cli_items(&bootstrap));
     items.push(tako_cli_path_item());
     items.push(shell_integration_item());
@@ -266,6 +284,22 @@ type BootstrapStates = [(
     Result<crate::setup_bootstrap::BootstrapState, String>,
 )];
 
+/// 認証を確かめられなかった（問い合わせを上限で打ち切った）系統の 1 句（#2255）。
+/// 未認証と言うと「ログインし直す」へ人を送ってしまうので、**不明**と言い分ける
+fn auth_unknown(state: &crate::setup_bootstrap::BootstrapState) -> Option<String> {
+    state
+        .auth_timeout
+        .as_ref()
+        .map(|notice| format!("認証: 不明（{} 秒で応答なし）", notice.waited_secs))
+}
+
+/// 認証が不明なせいで段が「ログイン」に見えているか（段の判定は認証済みかどうかしか見ない）
+fn auth_step_unknown(state: &crate::setup_bootstrap::BootstrapState) -> Option<String> {
+    (state.step == crate::setup_bootstrap::Step::Auth)
+        .then(|| auth_unknown(state))
+        .flatten()
+}
+
 /// 導入・PATH・ログインの段（`tako setup bootstrap status-all` と同じ材料）
 fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
     use crate::setup_bootstrap::Step;
@@ -275,8 +309,26 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
         .filter(|(_, state)| state.as_ref().is_ok_and(|s| s.step == Step::Ready))
         .map(|(agent, _)| agent.as_str())
         .collect();
+    // ready が無く、認証を確かめられなかった系統がある（#2255）。使えるかどうか分からないので
+    // 「使える系統がありません」とも、導入やログインへの道とも言わない
+    let unknown: Vec<String> = states
+        .iter()
+        .filter_map(|(agent, state)| {
+            let text = auth_step_unknown(state.as_ref().ok()?)?;
+            Some(format!("{} の{text}", agent.as_str()))
+        })
+        .collect();
     // **1 つでも ready なら tako は使える**ので、そこを最初に言う
-    let mut head = if ready.is_empty() {
+    let mut head = if ready.is_empty() && !unknown.is_empty() {
+        Item::new(
+            "agent_cli",
+            Status::Warn,
+            format!(
+                "エージェント CLI の導入: 使える系統を確かめられません（{}）",
+                unknown.join(" / ")
+            ),
+        )
+    } else if ready.is_empty() {
         Item::new(
             "agent_cli",
             Status::Missing,
@@ -294,7 +346,7 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
         )
     };
     // 1 つも使える系統が無いときだけ、**一番短い道**を残り作業にする
-    if ready.is_empty() {
+    if ready.is_empty() && unknown.is_empty() {
         if let Some(remaining) = shortest_bootstrap_remaining(states) {
             head = head.remaining(remaining);
         }
@@ -310,22 +362,31 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
                 format!("{}: 完了", agent.as_str()),
                 &format!("         [OK] {}: 完了", agent.as_str()),
             ),
-            Ok(state) => Item::from_text(
-                key,
-                Status::Missing,
-                format!(
-                    "{}: {} ({})",
-                    agent.as_str(),
-                    state.step_description(),
-                    state.step.as_str()
+            Ok(state) => match auth_step_unknown(state) {
+                // 確かめられなかった（#2255）。「ログイン未完了」と言うと人をログインへ送ってしまう
+                Some(text) => Item::from_text(
+                    key,
+                    Status::Warn,
+                    format!("{}: {text}", agent.as_str()),
+                    &format!("         [警告] {}: {text}", agent.as_str()),
                 ),
-                &format!(
-                    "         [不足] {}: {} ({})",
-                    agent.as_str(),
-                    state.step_description(),
-                    state.step.as_str()
+                None => Item::from_text(
+                    key,
+                    Status::Missing,
+                    format!(
+                        "{}: {} ({})",
+                        agent.as_str(),
+                        state.step_description(),
+                        state.step.as_str()
+                    ),
+                    &format!(
+                        "         [不足] {}: {} ({})",
+                        agent.as_str(),
+                        state.step_description(),
+                        state.step.as_str()
+                    ),
                 ),
-            ),
+            },
             Err(e) => Item::from_text(
                 key,
                 Status::Warn,
@@ -387,21 +448,22 @@ fn agents_detected_item(states: &BootstrapStates) -> Item {
         "  エージェント CLI:",
     );
     for (agent, state) in detected {
-        let auth = if state.authenticated {
-            "認証済み"
-        } else {
-            "未認証"
-        };
-        let plan = state.account_plan.as_deref().unwrap_or("プラン不明");
         let path = state
             .binary
             .as_deref()
             .map(tako_core::paths::shorten_home)
             .unwrap_or_default();
-        item = item.line(format!(
-            "    [検出] {}: {path}（{auth} / {plan}）",
-            agent.as_str()
-        ));
+        // 認証を確かめられなかったら、プランも同じ問い合わせから読むので並べない（#2255）
+        let auth = auth_unknown(state).unwrap_or_else(|| {
+            let auth = if state.authenticated {
+                "認証済み"
+            } else {
+                "未認証"
+            };
+            let plan = state.account_plan.as_deref().unwrap_or("プラン不明");
+            format!("{auth} / {plan}")
+        });
+        item = item.line(format!("    [検出] {}: {path}（{auth}）", agent.as_str()));
     }
     item
 }
@@ -1225,5 +1287,153 @@ mod tests {
         assert_eq!(remaining.detail, vec!["読めません".to_string()]);
         // 空なら 1 件も積まない
         assert!(shortest_bootstrap_remaining(&[]).is_none());
+    }
+
+    /// 段と認証の結果だけを変えた導入状況（パスはホームの外の決め打ち = #927）
+    fn bootstrap_state(
+        agent: AgentKind,
+        step: crate::setup_bootstrap::Step,
+        authenticated: bool,
+        auth_timeout_secs: Option<u64>,
+    ) -> crate::setup_bootstrap::BootstrapState {
+        crate::setup_bootstrap::BootstrapState {
+            agent,
+            binary: Some(format!("/opt/fake/bin/{}", agent.as_str())),
+            authenticated,
+            account_plan: authenticated.then(|| "max".to_string()),
+            launcher_dir: std::path::PathBuf::from("/opt/fake/bin"),
+            launcher_dir_on_path: step != crate::setup_bootstrap::Step::Path,
+            profile: None,
+            profile_has_block: false,
+            shell: None,
+            step,
+            plan: crate::setup_bootstrap::install_plan_for(agent).expect("導入の手順"),
+            auth_timeout: auth_timeout_secs.map(|waited_secs| tako_core::probe::TimeoutNotice {
+                label: tako_core::probe::label(
+                    agent.as_str(),
+                    crate::setup_bootstrap::auth_probe_argv(agent),
+                ),
+                waited_secs,
+            }),
+        }
+    }
+
+    fn line_of(item: &Item) -> String {
+        item.lines.join("\n")
+    }
+
+    /// #2255: 認証の問い合わせを打ち切った系統は「不明」と出し、ログインや導入へ人を送らない
+    #[test]
+    fn 認証を確かめられなかった系統は不明と出してログインへ送らない() {
+        use crate::setup_bootstrap::Step;
+        let states = vec![(
+            AgentKind::Claude,
+            Ok(bootstrap_state(
+                AgentKind::Claude,
+                Step::Auth,
+                false,
+                Some(10),
+            )),
+        )];
+        let items = agent_cli_items(&states);
+        assert_eq!(items[0].status, Status::Warn, "{:?}", items[0]);
+        assert!(
+            items[0]
+                .summary
+                .contains("claude の認証: 不明（10 秒で応答なし）"),
+            "{}",
+            items[0].summary
+        );
+        assert!(
+            items[0].remaining.is_empty(),
+            "不明なのに残り作業（ログイン / 導入）を積んだ: {:?}",
+            items[0].remaining
+        );
+        assert_eq!(items[1].key, "agent_cli.claude");
+        assert_eq!(items[1].status, Status::Warn);
+        assert_eq!(
+            line_of(&items[1]),
+            "         [警告] claude: 認証: 不明（10 秒で応答なし）"
+        );
+        let detected = agents_detected_item(&states);
+        assert!(
+            line_of(&detected).contains(
+                "    [検出] claude: /opt/fake/bin/claude（認証: 不明（10 秒で応答なし））"
+            ),
+            "{}",
+            line_of(&detected)
+        );
+    }
+
+    /// #2255 の回帰なし: 打ち切っていなければ今まで通り（認証済み / 未認証・ログインの残り作業）
+    #[test]
+    fn 打ち切っていなければ認証の行は今まで通り() {
+        use crate::setup_bootstrap::Step;
+        let ready = vec![(
+            AgentKind::Claude,
+            Ok(bootstrap_state(AgentKind::Claude, Step::Ready, true, None)),
+        )];
+        let items = agent_cli_items(&ready);
+        assert_eq!(items[0].status, Status::Ok);
+        assert_eq!(line_of(&items[1]), "         [OK] claude: 完了");
+        assert!(line_of(&agents_detected_item(&ready))
+            .contains("    [検出] claude: /opt/fake/bin/claude（認証済み / max）"));
+
+        let logged_out = vec![(
+            AgentKind::Claude,
+            Ok(bootstrap_state(AgentKind::Claude, Step::Auth, false, None)),
+        )];
+        let items = agent_cli_items(&logged_out);
+        assert_eq!(items[0].status, Status::Missing);
+        assert_eq!(
+            items[0].remaining.first().map(|r| r.kind.clone()),
+            RemainingKind::for_step(Step::Auth, AgentKind::Claude),
+            "未認証ならログインを残り作業にする（今まで通り）"
+        );
+        assert_eq!(items[1].status, Status::Missing);
+        assert!(line_of(&items[1]).contains("[不足] claude:"));
+        assert!(line_of(&agents_detected_item(&logged_out)).contains("（未認証 / プラン不明）"));
+    }
+
+    /// 使える系統が 1 つでもあれば頭は OK のまま。打ち切った系統だけが警告になる。
+    /// PATH の段で止まっている系統は、認証が不明でも PATH の不足を言う（そちらが先に要る手）
+    #[test]
+    fn 打ち切った系統だけが警告になる() {
+        use crate::setup_bootstrap::Step;
+        let states = vec![
+            (
+                AgentKind::Claude,
+                Ok(bootstrap_state(AgentKind::Claude, Step::Ready, true, None)),
+            ),
+            (
+                AgentKind::Codex,
+                Ok(bootstrap_state(
+                    AgentKind::Codex,
+                    Step::Auth,
+                    false,
+                    Some(3),
+                )),
+            ),
+            (
+                AgentKind::Agy,
+                Ok(bootstrap_state(AgentKind::Agy, Step::Path, false, Some(3))),
+            ),
+        ];
+        let items = agent_cli_items(&states);
+        assert_eq!(items[0].status, Status::Ok, "{:?}", items[0]);
+        assert_eq!(items[2].status, Status::Warn);
+        assert_eq!(
+            line_of(&items[2]),
+            "         [警告] codex: 認証: 不明（3 秒で応答なし）"
+        );
+        assert_eq!(items[3].status, Status::Missing, "{:?}", items[3]);
+        assert!(
+            line_of(&items[3]).contains("(path)"),
+            "{}",
+            line_of(&items[3])
+        );
+        let detected = line_of(&agents_detected_item(&states));
+        assert!(detected.contains("codex: /opt/fake/bin/codex（認証: 不明（3 秒で応答なし））"));
+        assert!(detected.contains("agy: /opt/fake/bin/agy（認証: 不明（3 秒で応答なし））"));
     }
 }

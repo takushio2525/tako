@@ -124,6 +124,17 @@ pub const DEFAULT_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 実行環境の問い合わせの上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ（**0 は既定へ**）
 pub const RUNTIME_PROBE_TIMEOUT_ENV: &str = "TAKO_RUN_PROBE_TIMEOUT_SECS";
 
+/// 環境診断（`tako check-health` / `tako setup --check`）が認証を確かめる問い合わせの既定の上限（#2255）。
+///
+/// 根拠（実測）: いちばん遅い認証の問い合わせは `agy models`（ネットワーク取得）の 3.0 秒
+/// （#1505 の 3 系統そろった Mac）。`claude auth status --json` は 0.12〜0.13 秒（上の表）。
+/// 10 秒は `agy models` の約 3 倍で、[`DEFAULT_PROBE_TIMEOUT`] の「いちばん遅い probe の約 3 倍」と
+/// 揃える。3 系統は並べて聞くので、全部が返らなくても認証の確認の全体はこれで終わる
+pub const DEFAULT_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 診断の認証確認の上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ（**0 は既定へ**）
+pub const AUTH_PROBE_TIMEOUT_ENV: &str = "TAKO_AUTH_PROBE_TIMEOUT_SECS";
+
 /// 打ち切りを知らせる 1 行の頭。CLI が出し、dispatch が拾う（**文面は 1 実装**）
 const NOTICE_HEAD: &str = "[確認できません] ";
 const NOTICE_OPEN: char = '（';
@@ -291,6 +302,14 @@ pub fn runtime_probe_timeout() -> Duration {
     parse_timeout_secs(
         std::env::var(RUNTIME_PROBE_TIMEOUT_ENV).ok().as_deref(),
         DEFAULT_RUNTIME_PROBE_TIMEOUT,
+    )
+}
+
+/// 診断の認証確認の上限（env で上書き可。外すことはできない。#2255）
+pub fn auth_probe_timeout() -> Duration {
+    parse_timeout_secs(
+        std::env::var(AUTH_PROBE_TIMEOUT_ENV).ok().as_deref(),
+        DEFAULT_AUTH_PROBE_TIMEOUT,
     )
 }
 
@@ -504,6 +523,21 @@ pub fn issue2182_legacy() -> bool {
     *LEGACY.get_or_init(|| {
         matches!(
             std::env::var("TAKO_2182_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// #2255 の A/B（`TAKO_2255_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// 環境診断（`tako check-health` / `tako setup --check`）の認証確認（`claude auth status --json` /
+/// `codex login status` / `agy models`）を**上限なしで 1 系統ずつ**待つ。返らない CLI が 1 つあると
+/// check-health が返らない（GUI 経由は CLI の応答の上限 300 秒の後、CLI 自身の診断が同じ問い合わせで
+/// また止まる）。**ゲートはこの 1 か所**
+pub fn issue2255_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2255_LEGACY").ok().as_deref(),
             Some("1" | "true" | "on")
         )
     })
