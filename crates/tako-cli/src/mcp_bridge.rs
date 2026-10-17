@@ -163,8 +163,54 @@ fn connected_from_env() -> bool {
     )
 }
 
-/// ブリッジ本体。stdin が閉じるまで 1 行ずつ応答する
+/// ブリッジが途中で終わる理由（#1805）
+enum Stop {
+    /// クライアントが stdout の読み手を閉じた（= 切断）。tako の失敗ではないので、stdin の
+    /// EOF と同じく静かに 0 で終える。#1805 の前は `error: stdout への書き込みに失敗:
+    /// Broken pipe` を出して 1 で終わっていた
+    ClientGone,
+    /// それ以外の失敗（`error: …` を出して 1）
+    Failed(String),
+}
+
+impl Stop {
+    /// stdout への書き込み（flush を含む）の失敗を分ける。読み手が閉じたのは macOS / Linux の
+    /// EPIPE も Windows の `ERROR_NO_DATA` も `ErrorKind::BrokenPipe` で来る
+    fn stdout(e: std::io::Error, what: &str) -> Self {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            Stop::ClientGone
+        } else {
+            Stop::Failed(format!("{what}: {e}"))
+        }
+    }
+}
+
+impl From<String> for Stop {
+    fn from(message: String) -> Self {
+        Stop::Failed(message)
+    }
+}
+
+/// ブリッジ本体。stdin が閉じるまで 1 行ずつ応答する。
+///
+/// 終わり方: stdin の EOF → 0 / クライアントが stdout の読み手を先に閉じた → 0（#1805。
+/// 痕跡は persist.log へ 1 行。stderr も閉じていることが多く、出しても読み手が居ない）/
+/// それ以外の失敗 → `Err`（呼び手が `error: …` を出して 1）
 pub fn serve(catalog: Catalog) -> Result<(), String> {
+    match serve_until_end(catalog) {
+        Ok(()) => Ok(()),
+        Err(Stop::ClientGone) => {
+            tako_control::diag::persist_log(&format!(
+                "mcp serve: クライアントが stdout を閉じたので終わる（切断。pid={}）",
+                std::process::id()
+            ));
+            Ok(())
+        }
+        Err(Stop::Failed(message)) => Err(message),
+    }
+}
+
+fn serve_until_end(catalog: Catalog) -> Result<(), Stop> {
     let connected = connected_from_env();
     // 呼び出し元ペインの決め方は純粋関数で決めてから実行する（#986）
     let plan = caller_pane_plan(caller_pane(), connected, legacy_no_pid_fallback());
@@ -241,10 +287,10 @@ pub fn serve(catalog: Catalog) -> Result<(), String> {
         };
         if let Some(response) = response {
             writeln!(stdout, "{response}")
-                .map_err(|e| format!("stdout への書き込みに失敗: {e}"))?;
+                .map_err(|e| Stop::stdout(e, "stdout への書き込みに失敗"))?;
             stdout
                 .flush()
-                .map_err(|e| format!("stdout の flush に失敗: {e}"))?;
+                .map_err(|e| Stop::stdout(e, "stdout の flush に失敗"))?;
         }
     }
     Ok(())
@@ -258,7 +304,7 @@ fn is_tools_list_request(message: &Value) -> bool {
 
 /// tools/list の応答をカタログ係に作らせ、その行をバイト列のまま流す。
 /// `Ok(false)` = 何も書いていない（呼び手が同じプロセスで作る）
-fn relay_tools_list(line: &str, out: &mut impl Write) -> Result<bool, String> {
+fn relay_tools_list(line: &str, out: &mut impl Write) -> Result<bool, Stop> {
     let Some(mut helper) = spawn_catalog_helper(Some(line)) else {
         return Ok(false);
     };
@@ -289,7 +335,7 @@ fn relay_tools_list(line: &str, out: &mut impl Write) -> Result<bool, String> {
         };
         // 切り出し安全: `[u8]` の窓を read が埋めた長さで切るだけ（文字列ではない）
         out.write_all(&window[..n])
-            .map_err(|e| format!("stdout への書き込みに失敗: {e}"))?;
+            .map_err(|e| Stop::stdout(e, "stdout への書き込みに失敗"))?;
         written += n;
         last = window[n - 1];
     }
@@ -301,13 +347,13 @@ fn relay_tools_list(line: &str, out: &mut impl Write) -> Result<bool, String> {
     if last != b'\n' {
         // 途中で切れた（ここへ来るのはカタログ係が書きかけで落ちたときだけ）。行の区切りは保つ
         out.write_all(b"\n")
-            .map_err(|e| format!("stdout への書き込みに失敗: {e}"))?;
+            .map_err(|e| Stop::stdout(e, "stdout への書き込みに失敗"))?;
     }
     if !matches!(status, Ok(status) if status.success()) {
         log_helper_trouble("tools/list を流した後にカタログ係が失敗で終わった");
     }
     out.flush()
-        .map_err(|e| format!("stdout の flush に失敗: {e}"))?;
+        .map_err(|e| Stop::stdout(e, "stdout の flush に失敗"))?;
     Ok(true)
 }
 

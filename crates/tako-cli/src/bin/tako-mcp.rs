@@ -15,6 +15,11 @@ fn main() -> ExitCode {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**）。`tako` から引き渡されたときも
     // exec で像が入れ替わるので、ここでもう一度名乗る
     tako_core::paths::mark_product_process();
+    // #1805: MCP クライアントが stderr の読み手を閉じていても、ライブラリ側の `eprintln!`
+    // （gate check の `[gate check] command:` 等）で panic せず行を捨てて続ける。
+    // 標準出力の規則は採らない: ブリッジの stdout はプロトコルの通り道で、書き込みの失敗は
+    // ブリッジ自身が `Result` で扱う（ここには巻き戻しを受け止める入口のスレッドも無い）
+    tako_core::stdio::drop_lines_on_closed_stderr();
     // `tako` が引き渡しのときに立てた malloc の設定は、自分の malloc がもう読み終えている。
     // ブリッジが起こす子（カタログ係・受け入れゲートのコマンド）へ渡さないよう消す
     tako_cli::mcp_bridge::forget_malloc_tuning();
