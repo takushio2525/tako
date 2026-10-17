@@ -552,6 +552,17 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool, timeout: Duration) -> Cl
     let Some(status) = status else {
         return ClaudeRun::Failed;
     };
+    // 非ゼロ終了は終了コードだけで決まり、出力は使わない = stdout が閉じるのを待たない（#1705）。
+    // 待つと、パイプを受け継いだ別のプロセス（macOS の並行 spawn の漏れ = #1748）が握っている
+    // あいだ READ_GRACE まで止まったうえ `Failed` に化け、#758 の再試行が走らない
+    if !status.success() {
+        diag(format_args!(
+            "claude が非ゼロ終了: code={:?}（{:.1}s / {flag}）",
+            status.code(),
+            started.elapsed().as_secs_f32()
+        ));
+        return ClaudeRun::NonZero;
+    }
     let Ok(output) = rx.recv_timeout(READ_GRACE) else {
         // claude は終わったのに stdout が閉じない = 孫が握ったまま。従来はここで
         // 命名スレッドが**永久に**止まっていた。ヒューリスティックへ落として先へ進む
@@ -561,21 +572,12 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool, timeout: Duration) -> Cl
         ));
         return ClaudeRun::Failed;
     };
-    if status.success() {
-        diag(format_args!(
-            "claude 応答: {:.1}s / {} バイト / {flag}",
-            started.elapsed().as_secs_f32(),
-            output.len()
-        ));
-        ClaudeRun::Ok(output)
-    } else {
-        diag(format_args!(
-            "claude が非ゼロ終了: code={:?}（{:.1}s / {flag}）",
-            status.code(),
-            started.elapsed().as_secs_f32()
-        ));
-        ClaudeRun::NonZero
-    }
+    diag(format_args!(
+        "claude 応答: {:.1}s / {} バイト / {flag}",
+        started.elapsed().as_secs_f32(),
+        output.len()
+    ));
+    ClaudeRun::Ok(output)
 }
 
 /// プロンプト 1 本（FR-2.12.2。判断・調整はすべてこの文面に閉じる）。
@@ -1111,7 +1113,8 @@ TAIL
 
     /// 上限のテストの孫を止める（#1748）。孫は 30 秒眠るので、止めないとテストプロセスより
     /// 長生きし、生まれた瞬間に受け継いだ fd（並行する別モジュールのテストのパイプ）を
-    /// 30 秒握り続ける。止める相手は偽 claude が書き残した pid だけ（名前一致で撃たない）
+    /// 30 秒握り続ける。止める相手は偽 claude が書き残した pid だけ（名前一致で撃たない）。
+    /// pid は 1 行に 1 つ（偽 claude を 2 回起こすテストは孫も 2 つ残す = #1705）
     #[cfg(unix)]
     struct StopGrandchild(PathBuf);
 
@@ -1119,10 +1122,8 @@ TAIL
     impl Drop for StopGrandchild {
         fn drop(&mut self) {
             // 孫を起こす前に打ち切られた回は pid が無い = 止める相手も居ない
-            let pid = std::fs::read_to_string(&self.0)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok());
-            if let Some(pid) = pid {
+            let pids = std::fs::read_to_string(&self.0).unwrap_or_default();
+            for pid in pids.lines().filter_map(|s| s.trim().parse::<u32>().ok()) {
                 let _ = tako_control::platform::process::terminate(pid, true);
             }
         }
@@ -1241,6 +1242,62 @@ TAIL
             None
         );
         assert_eq!(arg_lines(&log).len(), 2, "起動失敗で再試行している");
+    }
+
+    /// #1705: **非ゼロ終了は終了コードだけで決まる**。stdout の書き込み側を別のプロセスが
+    /// 握ったまま（= 並行する spawn の子へパイプが漏れた状態。#1748）でも、出力が閉じるのを
+    /// 待たずに `NonZero` = 再試行する側へ入る。修正前はここで `READ_GRACE`（10 秒）待って
+    /// `Failed` へ落ち、再試行が走らず引数ログが 1 行になっていた（#1705 の負荷の下の失敗と同じ形）。
+    /// 漏れを負荷で待たず、握る孫を偽 claude 自身に残させて決定的に作る
+    #[test]
+    #[cfg(unix)]
+    fn 出力を握る孫が居ても非ゼロ終了なら再試行する側へ入る() {
+        let _serial = fake_claude_lock();
+        let dir = temp_dir_for("held");
+        let bin = dir.join("claude");
+        let log = dir.join("args.log");
+        let pid_log = dir.join("grandchild.pid");
+        // 孫（`sleep 30`）が stdout を握ったまま、偽 claude 自身はすぐ非ゼロで終わる。
+        // 2 回起こされるので孫の pid は追記で残させる
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\ncat >/dev/null\nsleep 30 &\necho $! >> '{}'\nexit 3\n",
+                log.display(),
+                pid_log.display()
+            ),
+        )
+        .expect("孫を残す偽 claude を書ける");
+        let grandchildren = StopGrandchild(pid_log);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("実行権を付けられる");
+        }
+        let state = AtomicU8::new(StrictMcp::Unknown as u8);
+
+        assert_eq!(
+            run_claude_with(&state, false, &bin, &materials(), Lang::Ja),
+            None
+        );
+        assert_eq!(
+            StrictMcp::load(&state),
+            StrictMcp::Unknown,
+            "失敗で学習しない"
+        );
+        // 起動の記録は偽 claude が終わる前に書かれ、終わったことは `try_wait` で見ている
+        // = 返った時点で 2 行そろっている（時間で待たない）
+        assert_eq!(
+            arg_lines(&log),
+            vec![
+                format!("-p --model {MODEL} {STRICT_MCP_FLAG}"),
+                format!("-p --model {MODEL}"),
+            ],
+            "非ゼロ終了が出力待ちの打ち切り（Failed）に化けて再試行していない"
+        );
+
+        // pid の置き場ごと消す前に孫を止める（`上限に当たった起動は…` と同じ順番）
+        drop(grandchildren);
     }
 
     /// エッジ（#758）: **上限に当たった起動は [`ClaudeRun::Failed`]**（再試行しない側）。
