@@ -980,30 +980,123 @@ fn no_command_hint(platform: Platform, ext: &str) -> String {
     }
 }
 
-/// 宣言の `tako:cwd` の値をパスにする（両 OS で 1 実装。#2286）。
+/// 宣言の `tako:cwd` の値をパスにする（両 OS で 1 実装。#2286 / #2299）。
 ///
 /// cwd はシェルへ渡さずパスとして使うので、変数は**引用せずに**展開する（[`expand_literal`]）。
 /// #2286 以前の macOS は「引用して展開してから、全体が単引用符で囲まれていれば外す」形で、
 /// 値に別の文字が続くと外せなかった（`/tmp/my dir/x.py` + `${fileDir}/build` が
-/// `/tmp/my dir/'/tmp/my dir'/build` になった）。書き手が値全体を単引用符で囲んだ形
-/// （`tako:cwd: '/tmp/my dir'`）は展開の前に外す（#2286 以前の macOS でも通っていた書き方）
+/// `/tmp/my dir/'/tmp/my dir'/build` になった）。書き手が値全体を引用符で囲んだ形
+/// （`tako:cwd: '/tmp/my dir'` / `tako:cwd: "${fileDir}/build"`）は展開の前に外す
+/// （[`strip_quotes`]。二重引用符は #2299 まで外れず、両 OS で `/tmp/my dir/"/tmp/my dir"` の
+/// 相対パスになっていた）
 fn declared_cwd_value(template: &str, vars: &RunVars) -> String {
     expand_literal(&strip_quotes(vars.dialect, template), vars)
 }
 
-/// 値全体を囲む単引用符を外し、中の閉じ直しを実行ペインの方言で戻す
-/// （POSIX = `'\''`、PowerShell = `''`）。囲まれていなければそのまま
+/// 値全体を囲む引用符を外し、中のエスケープを実行ペインの方言の規則で戻す。
+/// 囲まれていなければそのまま（途中で閉じる `'${fileDir}'/build` / `"${fileDir}"/build` も外さない）。
+///
+/// - 単引用符: 中の閉じ直しを戻す（POSIX = `'\''`、PowerShell = `''`。#2286）
+/// - 二重引用符: POSIX は [`posix_double_quoted`]、PowerShell は [`ps_double_quoted`]（#2299）
+///
+/// 外してから変数を展開するので、展開した値（ファイル名）の中の `\` やバッククオートを
+/// 逃がしとして読むことはない
 fn strip_quotes(dialect: ShellDialect, s: &str) -> String {
-    if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-        // 切り出し安全: 両端は直前で確かめた ASCII の `'`
-        let inner = &s[1..s.len() - 1];
-        match dialect {
-            ShellDialect::Posix => inner.replace("'\\''", "'"),
-            ShellDialect::PowerShell => inner.replace("''", "'"),
-        }
-    } else {
-        s.to_string()
+    let enclosed = |q: char| s.strip_prefix(q).and_then(|rest| rest.strip_suffix(q));
+    match (enclosed('\''), enclosed('"'), dialect) {
+        (Some(inner), _, ShellDialect::Posix) => inner.replace("'\\''", "'"),
+        (Some(inner), _, ShellDialect::PowerShell) => inner.replace("''", "'"),
+        (None, Some(inner), ShellDialect::Posix) => posix_double_quoted(inner),
+        (None, Some(inner), ShellDialect::PowerShell) => ps_double_quoted(inner),
+        (None, None, _) => s.to_string(),
     }
+}
+
+/// POSIX の二重引用符の中身（両端の `"` を除いた部分）を戻す（#2299）。
+///
+/// `\` は `$` `` ` `` `"` `\` の前でだけ逃がしで、ほかの前では `\` のまま残る
+/// （`"C:\Program Files"` の `\` も残る。macOS の `/bin/sh` = bash 3.2 の実物で確かめた）。
+/// シェルが中の `$HOME` や `` `…` `` を展開することは真似ない（cwd の値はシェルへ渡さない。
+/// 展開するのは tako の変数だけ = [`expand_literal`]）。シェルが 1 つの文字列として読まない形
+/// （逃がしていない `"`・閉じる `"` を逃がす末尾の `\`）は文字のまま残す
+/// （単引用符の中の閉じ直し以外の `'` を残すのと同じ）
+fn posix_double_quoted(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.as_str().chars().next()) {
+            ('\\', Some(next @ ('$' | '`' | '"' | '\\'))) => {
+                out.push(next);
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// PowerShell の二重引用符の中身（両端の `"` を除いた部分）を戻す（#2299）。
+///
+/// バッククオートが次の 1 文字を逃がし（`` `" `` → `"`・``` `` ``` → `` ` ``・`` `$ `` → `$`）、
+/// `""` も `"` 1 文字（about_Quoting_Rules）。`\` は逃がしではない（`"C:\work"` はそのまま）。
+/// `` `0 `` `` `a `` `` `b `` `` `e `` `` `f `` `` `n `` `` `r `` `` `t `` `` `v `` は制御文字、
+/// `` `u{41} `` は符号位置で、ほかの文字の前（大文字の `` `N `` を含む）はその文字そのもの
+/// （about_Special_Characters。pwsh 7.6 の構文木の `StringConstantExpressionAst.Value` で確かめた）。
+/// 中の `$HOME` / `$(…)` を展開することは真似ず、PowerShell が構文エラーにする形（逃がしていない
+/// `"`・末尾のバッククオート・読めない `` `u{…} ``）は文字のまま残す（[`posix_double_quoted`] と同じ）
+fn ps_double_quoted(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        let rest = chars.as_str();
+        match (c, rest.chars().next()) {
+            ('"', Some('"')) => {
+                out.push('"');
+                chars.next();
+            }
+            ('`', Some('u')) => match rest.strip_prefix('u').and_then(ps_unicode_escape) {
+                Some((ch, after)) => {
+                    out.push(ch);
+                    chars = after.chars();
+                }
+                None => out.push(c),
+            },
+            ('`', Some(next)) => {
+                out.push(ps_escaped_char(next));
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// PowerShell の二重引用符の中の `` `<c> `` が表す文字（大文字小文字を区別する）
+fn ps_escaped_char(c: char) -> char {
+    match c {
+        '0' => '\0',
+        'a' => '\u{7}',
+        'b' => '\u{8}',
+        'e' => '\u{1b}',
+        'f' => '\u{c}',
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'v' => '\u{b}',
+        other => other,
+    }
+}
+
+/// `` `u{XXXX} `` の `{XXXX}`（16 進 1〜6 桁）を読み、文字と残りを返す。読めなければ None
+/// （桁の無い `{}`・7 桁以上・`10FFFF` 超は PowerShell も構文エラー。サロゲートは PowerShell は
+/// 通すが Rust の文字にできないので、どれも文字のまま残す側へ倒す）
+fn ps_unicode_escape(rest: &str) -> Option<(char, &str)> {
+    let (hex, after) = rest.strip_prefix('{')?.split_once('}')?;
+    if hex.is_empty() || hex.len() > 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
+    Some((ch, after))
 }
 
 /// UI 向けの軽量ヘッド読み取り（16 KiB 上限。読み取り失敗は None）
@@ -1353,7 +1446,7 @@ mod tests {
     }
 
     /// 宣言の `tako:cwd` はシェルへ渡さない（パスとして使う）。両 OS とも引用しない展開で、
-    /// 値全体を囲む単引用符だけを外す（#1668 / #2286）
+    /// 値全体を囲む単引用符・二重引用符だけを外す（#1668 / #2286 / #2299）
     #[test]
     fn 宣言のcwdは方言の引用を残さない() {
         let path = PathBuf::from("/tmp/my dir/it's.py");
@@ -1391,6 +1484,24 @@ mod tests {
                 resolve(platform, "build"),
                 PathBuf::from("/tmp/my dir/build")
             );
+            // #2299: 二重引用符の囲みも外す。修正前は両 OS で `/tmp/my dir/"/tmp/my dir"` の
+            // 相対パスになり、実行が「cwd が存在しない」で止まっていた
+            for (cwd, want) in [
+                ("\"${fileDir}\"", "/tmp/my dir"),
+                ("\"${fileDir}/build\"", "/tmp/my dir/build"),
+                ("\"${workspaceRoot}/out\"", "/tmp/my dir/out"),
+                ("\"/srv/lit dir\"", "/srv/lit dir"),
+                ("\"build\"", "/tmp/my dir/build"),
+            ] {
+                assert_eq!(resolve(platform, cwd), PathBuf::from(want), "{platform:?}");
+            }
+            // 途中で閉じる形は値全体の囲みではないので外さない（単引用符の `'${fileDir}'/build` と
+            // 同じ。連結の読みは #2299 の範囲外）
+            assert_eq!(
+                resolve(platform, "\"${fileDir}\"/build"),
+                PathBuf::from("/tmp/my dir/\"/tmp/my dir\"/build"),
+                "{platform:?}"
+            );
         }
         // 中の閉じ直しは実行ペインの方言で戻す
         assert_eq!(
@@ -1401,16 +1512,290 @@ mod tests {
             resolve(Platform::Windows, "'/srv/it''s'"),
             PathBuf::from("/srv/it's")
         );
-        // 引用符の入ったファイル名の段も 1 つのパスのまま
-        let quoted = PathBuf::from("/tmp/it's dir/a.py");
-        for platform in [Platform::MacOs, Platform::Windows] {
-            let head = "# tako:run: python ${fileBase}\n# tako:cwd: ${fileDir}/out\n";
-            let cwd = resolve_for(platform, &quoted, head, &BTreeMap::new(), None, None)
-                .unwrap()
-                .plan
-                .cwd;
-            assert_eq!(cwd, PathBuf::from("/tmp/it's dir/out"), "{platform:?}");
+        // 引用符の入ったファイル名の段も 1 つのパスのまま（展開した値の中の `"` `\` `` ` `` は
+        // 逃がしとして読まない = 外してから展開する）
+        for dir in ["/tmp/it's dir", "/tmp/say \"hi\" a\\b`c$d"] {
+            let quoted = PathBuf::from(format!("{dir}/a.py"));
+            for platform in [Platform::MacOs, Platform::Windows] {
+                for cwd in ["${fileDir}/out", "'${fileDir}/out'", "\"${fileDir}/out\""] {
+                    let head = format!("# tako:run: python ${{fileBase}}\n# tako:cwd: {cwd}\n");
+                    let got = resolve_for(platform, &quoted, &head, &BTreeMap::new(), None, None)
+                        .unwrap()
+                        .plan
+                        .cwd;
+                    assert_eq!(
+                        got,
+                        PathBuf::from(format!("{dir}/out")),
+                        "{platform:?} {cwd}"
+                    );
+                }
+            }
         }
+    }
+
+    /// #2299: 二重引用符の中の逃がしは実行ペインの方言の規則で戻す。「シェルと同じ」の行の期待値は
+    /// 実物で採った（macOS の `/bin/sh` の `printf '%s\0'`・pwsh 7.6 の構文木の
+    /// `StringConstantExpressionAst.Value`）
+    #[test]
+    fn 二重引用符の中の逃がしは実行ペインの方言で戻す() {
+        use ShellDialect::{Posix, PowerShell};
+        // どちらのシェルも 1 つの文字列として読み、何も展開しない値（値, /bin/sh, PowerShell）
+        let same: &[(&str, &str, &str)] = &[
+            (r#""/srv/a b""#, "/srv/a b", "/srv/a b"),
+            (r#""/srv/it's""#, "/srv/it's", "/srv/it's"),
+            (
+                r#""C:\Program Files\x""#,
+                r"C:\Program Files\x",
+                r"C:\Program Files\x",
+            ),
+            (r#""/srv/a\\b""#, r"/srv/a\b", r"/srv/a\\b"),
+            (r#""/srv/a\nb""#, r"/srv/a\nb", r"/srv/a\nb"),
+            (r#""/srv/a\'b""#, r"/srv/a\'b", r"/srv/a\'b"),
+            (r#""/srv/a#b""#, "/srv/a#b", "/srv/a#b"),
+            (r#""/srv/a\\""#, r"/srv/a\", r"/srv/a\\"),
+            (r#""""#, "", ""),
+        ];
+        for (v, sh, ps) in same {
+            assert_eq!(strip_quotes(Posix, v), *sh, "/bin/sh: {v}");
+            assert_eq!(strip_quotes(PowerShell, v), *ps, "PowerShell: {v}");
+        }
+        // 片方のシェルだけが 1 つの文字列として読む値（そのシェルと同じ）
+        for (v, want) in [
+            (r#""/srv/a\"b""#, r#"/srv/a"b"#),
+            (r#""/srv/a\$b""#, "/srv/a$b"),
+            ("\"/srv/a\\`b\"", "/srv/a`b"),
+        ] {
+            assert_eq!(strip_quotes(Posix, v), want, "/bin/sh: {v}");
+        }
+        for (v, want) in [
+            ("\"/srv/a`\"b\"", r#"/srv/a"b"#),
+            (r#""/srv/a""b""#, r#"/srv/a"b"#),
+            (r#""/srv/a""""#, r#"/srv/a""#),
+            ("\"/srv/a``b\"", "/srv/a`b"),
+            ("\"/srv/a`$b\"", "/srv/a$b"),
+            ("\"/srv/a`'b\"", "/srv/a'b"),
+            ("\"/srv/a`xb`N\"", "/srv/axbN"),
+            ("\"/srv/a`nb`t\"", "/srv/a\nb\t"),
+            (
+                "\"/srv/a`0`a`b`e`f`r`v\"",
+                "/srv/a\0\u{7}\u{8}\u{1b}\u{c}\r\u{b}",
+            ),
+            ("\"/srv/a`u{41}b`u{1F600}\"", "/srv/aAb\u{1F600}"),
+            ("\"/srv/a\\`b\"", "/srv/a\\\u{8}"),
+            (r#""/srv/a\""#, r"/srv/a\"),
+        ] {
+            assert_eq!(strip_quotes(PowerShell, v), want, "PowerShell: {v}");
+        }
+        // シェルなら展開する値・構文エラーにする値は文字のまま（cwd の値はシェルへ渡さない）
+        for (dialect, v, want) in [
+            (Posix, r#""/srv/$HOME""#, "/srv/$HOME"),
+            (PowerShell, r#""/srv/$HOME""#, "/srv/$HOME"),
+            (PowerShell, r#""/srv/a$(1+1)""#, "/srv/a$(1+1)"),
+            (Posix, "\"/srv/a`id`\"", "/srv/a`id`"),
+            // /bin/sh は `"/srv/a" "b"` の連結として `/srv/ab` を、閉じる `"` を逃がす `\` で構文エラー
+            (Posix, r#""/srv/a""b""#, r#"/srv/a""b"#),
+            (Posix, r#""/srv/a\""#, r"/srv/a\"),
+            // PowerShell の構文エラー
+            (PowerShell, r#""/srv/a"b""#, r#"/srv/a"b"#),
+            (PowerShell, r#""/srv/a\"b""#, r#"/srv/a\"b"#),
+            (PowerShell, "\"/srv/a`\"", "/srv/a`"),
+            (
+                PowerShell,
+                "\"/srv/a`u{zz}`u{}`u{110000}`u{1234567}`ub\"",
+                "/srv/a`u{zz}`u{}`u{110000}`u{1234567}`ub",
+            ),
+            // サロゲートは PowerShell は通すが Rust の文字にできない
+            (PowerShell, "\"/srv/a`u{D800}\"", "/srv/a`u{D800}"),
+        ] {
+            assert_eq!(strip_quotes(dialect, v), want, "{dialect:?}: {v}");
+        }
+        // 囲みでない値はそのまま
+        for v in [
+            r#""${fileDir}"/build"#,
+            r#"/srv/"a""#,
+            "\"",
+            "'",
+            r#"'/srv/a""#,
+        ] {
+            for dialect in [Posix, PowerShell] {
+                assert_eq!(strip_quotes(dialect, v), v, "{dialect:?}");
+            }
+        }
+    }
+
+    /// #2299 の実物の検査で使う名前（#2286 の 1590 行の表と同じ 20 種）
+    const NAMES_2299: &[&str] = &[
+        "plain",
+        "my file",
+        "it's",
+        "say \"hi\"",
+        "$HOME",
+        "a&b",
+        "a,b",
+        "@x",
+        "-x",
+        "a;b",
+        "x(1)",
+        "{x}",
+        "a`b",
+        "~x",
+        "%x",
+        "#x",
+        "データ",
+        "全角\u{3000}空白",
+        "it\u{2019}s",
+        "a b'c$d&e",
+    ];
+
+    /// `vars` で展開した tako の変数（シェル変数に同じ値を置くため）
+    fn shell_vars_2299(vars: &RunVars) -> [(&'static str, String); 3] {
+        ["fileDir", "workspaceRoot", "fileNoExt"]
+            .map(|n| (n, expand_literal(&format!("${{{n}}}"), vars)))
+    }
+
+    /// #2299: 二重引用符で囲んだ宣言の cwd を **macOS の実行ペインのシェル（`/bin/sh`）の実物**に
+    /// 読ませ、tako の変数と同じ名前のシェル変数に同じ値を置いたときの答えと 1 バイトも違わないこと。
+    /// 二重引用符の中のシェル変数は値を割らず読み直さずに埋まるので、名前に空白・引用符・`$` が
+    /// あってもシェルの答えが正解になる（逃がしは実行ペインの方言の規則で戻っている）。
+    /// このファイルは OS の属性分岐を置かない（#1655）ので、`/bin/sh` の無い OS は ignore で外す
+    #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "/bin/sh の実物が要る（#2299。macOS / Linux の CI で走る）"
+    )]
+    fn posixの実物で二重引用符の宣言のcwdがシェルと同じ値になる() {
+        let templates = [
+            r#""${fileDir}""#,
+            r#""${fileDir}/build""#,
+            r#""${workspaceRoot}/out""#,
+            r#""${fileDir}/${fileNoExt}.d""#,
+            r#""${fileDir}/a\"b\\c\$d\`e""#,
+            r#""${fileDir}/it's\n#x""#,
+        ];
+        for name in NAMES_2299 {
+            let path = PathBuf::from(format!("/tmp/2299/{name}/{name}.py"));
+            let vars = RunVars::for_file(&path).on(Platform::MacOs);
+            let mut script = String::new();
+            for (n, v) in shell_vars_2299(&vars) {
+                script.push_str(&format!("{n}={}\n", ShellDialect::Posix.quote_arg(&v)));
+            }
+            script.push_str(&format!("printf '%s\\0' {}", templates.join(" ")));
+            let mut cmd = std::process::Command::new("/bin/sh");
+            let out = crate::platform::process::no_console_window(&mut cmd)
+                .arg("-c")
+                .arg(&script)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", "/home/tako-2299")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{name}: {out:?}");
+            let got: Vec<String> = String::from_utf8(out.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(str::to_string)
+                .collect();
+            let want: Vec<String> = templates
+                .iter()
+                .map(|t| declared_cwd_value(t, &vars))
+                .collect();
+            assert_eq!(got, want, "/bin/sh と tako で {name:?} の cwd が違う");
+        }
+    }
+
+    /// #2299: 同じことを **PowerShell の実物**（Windows は 5.1 と 7）で見る。`show` が受け取った値を
+    /// UTF-16 の符号単位の 16 進で書き出して比べる（5.1 の標準出力はコードページで化ける = #1668）。
+    /// 逃がしは 5.1 と 7 で同じ読みのものだけ（`` `e `` / `` `u{…} `` は 7 から = 単体で見る）
+    #[test]
+    #[cfg_attr(
+        not(windows),
+        ignore = "PowerShell の実物が要る（#2299。Windows CI で走る。手元は pwsh があれば --ignored）"
+    )]
+    fn powershell_の実物で二重引用符の宣言のcwdがシェルと同じ値になる() {
+        let templates = [
+            r#""${fileDir}""#,
+            r#""${fileDir}/build""#,
+            r#""${workspaceRoot}/out""#,
+            r#""${fileDir}/${fileNoExt}.d""#,
+            r#""${fileDir}\out\a b""#,
+            "\"${fileDir}/a`\"b``c`$d\"\"e`'f`xg\"",
+            r#""${fileDir}/it's#x""#,
+        ];
+        let hex = |s: &str| {
+            s.encode_utf16()
+                .map(|u| format!("{u:04X}"))
+                .collect::<String>()
+        };
+        let report = r"ForEach-Object { '{0:X4}' -f [int]$_ }";
+        let mut script = format!(
+            "$ErrorActionPreference = 'Stop'\n\
+             function show {{ foreach ($a in $args) {{ Write-Output ('A:' + (-join ([char[]]$a | {report}))) }} }}\n"
+        );
+        let mut want = Vec::new();
+        for (i, name) in NAMES_2299.iter().enumerate() {
+            let path = PathBuf::from(format!("/tmp/2299/{name}/{name}.py"));
+            let vars = RunVars::for_file(&path).on(Platform::Windows);
+            for (n, v) in shell_vars_2299(&vars) {
+                script.push_str(&format!(
+                    "${{{n}}} = {}\n",
+                    ShellDialect::PowerShell.quote_arg(&v)
+                ));
+            }
+            script.push_str(&format!(
+                "Write-Output 'BEGIN:{i}'\nshow {}\nWrite-Output 'END:{i}'\n",
+                templates.join(" ")
+            ));
+            want.push(format!("BEGIN:{i}"));
+            want.extend(
+                templates
+                    .iter()
+                    .map(|t| format!("A:{}", hex(&declared_cwd_value(t, &vars)))),
+            );
+            want.push(format!("END:{i}"));
+        }
+        // 5.1 は Windows に必ずある。7（pwsh）は GitHub の runner には必ずあるので CI では必須
+        let on_ci = std::env::var_os("GITHUB_ACTIONS").is_some();
+        let programs: Vec<(&str, bool)> = if cfg!(windows) {
+            vec![("powershell", true), ("pwsh", on_ci)]
+        } else {
+            vec![("pwsh", true)]
+        };
+        let encoded = crate::platform::shell::encode_powershell_command(&script);
+        let mut ran = 0;
+        for (program, required) in programs {
+            let mut cmd = std::process::Command::new(program);
+            crate::platform::process::no_console_window(&mut cmd).args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                &encoded,
+            ]);
+            let out = match cmd.output() {
+                Ok(out) => out,
+                Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("{program} が無いので飛ばす");
+                    continue;
+                }
+                Err(e) => panic!("{program} を起動できない: {e}"),
+            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let got: Vec<&str> = stdout
+                .lines()
+                .map(str::trim_end)
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(
+                got,
+                want,
+                "{program}: 二重引用符の宣言の cwd が tako と違う値になった\n--- script ---\n{script}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "PowerShell を 1 つも走らせていない");
     }
 
     /// `tako:shell` の宣言は内側のシェルの方言で囲む（Windows の bash は POSIX、macOS の pwsh は
