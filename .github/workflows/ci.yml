@@ -304,6 +304,12 @@ jobs:
       # 終了コードが変わる・リリースより先に回る形へ戻ったらここで落ちる**（#2023）
       - name: 夜間の footprint の回帰の見張りのモックテスト
         run: bash scripts/test-nightly-footprint-watch-2023.sh
+      # 夜間の役（2 台構成でリリースしない PC を `--role check` で検査だけにする）のモックテスト。
+      # release.sh・mod の検査・見張り・cargo・gh・launchctl は代役、origin は一時ディレクトリの bare リポ、
+      # HOME も隔離するので本番のタグ・Release・launchd には触らない。**検査だけの PC がビルド・push・
+      # タグ・Release をする・検査が回らない・役を設定しない 1 台の夜間が変わる形へ戻ったらここで落ちる**（#2252）
+      - name: 夜間の役（検査だけ）のモックテスト
+        run: /bin/bash scripts/test-nightly-role-2252.sh
       # 夜間リリースの PATH（先頭 ~/.cargo/bin に順番待ちを知らない古い tako）でも、run_heavy と
       # build-app.sh のリリースビルドが順番待ちを通るモックテスト。tako・cargo は代役で、
       # .app の置き場も偽物へ差し替えるので本物の tako・順番待ち・ビルドには触らない。
