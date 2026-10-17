@@ -6,7 +6,7 @@
 
 ## 現在の対象（2026-10-18）
 
-- main = `07120ec`（#2275 / PR #2277 まで）。10/16〜10/18 の着地は 1 件ずつ progress.md（古いものは progress-archive.md）
+- main = `072d367`（#2285 / PR #2290 まで）。10/16〜10/18 の着地は 1 件ずつ progress.md（古いものは progress-archive.md）
 - **usage 分析（エピック #2192・10/16 ユーザー依頼）**: 設計書 `.agent/plans/2026-10-usage-analytics.md`。S1（利用制限の
   観測 = `<data_dir>/usage/limits.jsonl`・`tako usage`）は 10/17 00:50 から本番で記録中。S2 #2201（索引）・S3 #2202（区間按分・% 列）・S5 #2204（codex）は着地。次は S4 #2203（画面 = GUI が要る）
 - 版は **v0.8.36**（10/17 05:06 の夜間のテスト版）。安定版は `scripts/release.sh --promote <tag>` で昇格する
@@ -46,7 +46,7 @@
 
 ## 次の一手
 
-- 実装中: #1621（setup のスリープ防止の二重案内）/ #1643（`isolated_gui_bins` の feature 上書きと古いバイナリ）/ #2279（test-queue-1992 ⑪）。
+- 実装中: #1668（Code Runner の Windows のクオート）/ #1638（宣言モデルと実モデルの食い違い）/ #2292（初回 setup で mod が入らない）。
   #2247（プレビューの「Finder で表示」）は `tako todo` の確認待ち
 - 次の候補: 蓋が開いているとき = #1701 の GUI 実経路の確認（PR #2276 は単体と番犬で merge 済み）・#2228・#2203（usage S4 の画面）・
   #2013 / #2012（セルフテスト）/ #1837（項目 155 の wry の panic）
