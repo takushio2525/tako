@@ -53,11 +53,9 @@ cleanup() {
 trap cleanup EXIT
 
 # バッジの節（⑧）は feature 付きのビルドにしか無い。CLI / MCP の節も同じバイナリで回す
-(cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
-
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 
 # --- 隔離した環境 -------------------------------------------------------------
 export HOME="$TMP/home"

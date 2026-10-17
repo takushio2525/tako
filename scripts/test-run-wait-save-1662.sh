@@ -53,11 +53,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 呼び出し側がバイナリを差し替えていなければ、いまのソースでビルドする
-if [ -z "${TAKO_BIN:-}" ] && [ -z "${APP_BIN:-}" ]; then
-  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --quiet) || exit 1
-fi
-
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins || exit 1

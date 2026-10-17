@@ -69,9 +69,8 @@ mkdir -p "$STATE_DIR" "$DATA_DIR" "$BIN_DIR" "$TMP/disc"
 echo "== ビルド =="
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-# **この本は毎回ビルドし直す**（`isolated_gui_bins` は無いときだけ作るので、
-# stale な target を掴んだまま「緑」になるのを防ぐ = #432 の罠）
-run_heavy cargo build -q -p tako-app -p tako-cli 2>&1 | tail -3
+# `isolated_gui_bins` は毎回今の木から建てる（#1643）。stale な target を掴んだまま「緑」に
+# ならない（#432 の罠。以前は無いときだけ作ったので、ここで自前に建て直していた）
 isolated_gui_bins || exit 1
 # **リポジトリの target を書き換えない**（③ の注入で serve バイナリを差し替えるため、
 # 検証用の複製を作ってそちらを差し替える）。隔離モードの `serve_binary()` は

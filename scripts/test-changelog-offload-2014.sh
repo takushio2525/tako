@@ -66,10 +66,7 @@ trap cleanup EXIT
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 # HOME を差し替える前にビルドする（後だとツールチェーンを一時 HOME へ取り直す）。
 # visual-test 版は通常の起動もそのままできるので 1 回で両段に使う
-if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test) || exit 1
-fi
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 REAL_GIT="$(command -v git || true)"
 [ -n "$REAL_GIT" ] || { echo "未実測: git が無い"; exit 4; }
 

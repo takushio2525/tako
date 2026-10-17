@@ -59,9 +59,8 @@ trap cleanup EXIT
 export TAKO_LSP_AUTOSTART=1
 
 echo "visual-test 版の tako-app と偽サーバをビルドします…"
-(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test \
-  && run_heavy cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
-isolated_gui_bins || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
+isolated_gui_bins visual-test || exit 1
 FAKE="$(dirname "$TAKO_BIN")/tako-lsp-fake"
 
 export HOME="$TMP/home"

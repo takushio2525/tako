@@ -58,12 +58,13 @@ export TAKO_ISO_PROFILE="${TAKO_ISO_PROFILE:-release}"
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 # ビルドは HOME を差し替える前に（後で呼ぶとツールチェーンとレジストリを一時 HOME へ取り直す）
 isolated_gui_bins || exit 1
-# visual 段は visual-test 版の debug（節は feature 付きのビルドにしか無い）。置き場はヘルパの
-# 1 か所（ISOLATED_GUI_APP_REL）から debug の値で引く（直書きしない = #1490）
-VISUAL_APP="$REPO_ROOT/$(TAKO_ISO_PROFILE=debug TAKO_ISO_APP_REL='' /bin/bash -c '. "$1/scripts/lib/isolated-gui.sh"; printf %s "$ISOLATED_GUI_APP_REL"' _ "$REPO_ROOT")"
+# visual 段は visual-test 版の debug（節は feature 付きのビルドにしか無い）。置き場も建て方もヘルパの
+# 1 実装（isolated_gui_bins）から debug の値で引く（直書き・自前のビルドをしない = #1490 / #1643）。
+# CLI は上の release を差し替えとして渡す = ヘルパは debug の tako-app だけを建てる
+VISUAL_APP=""
 if has_stage visual; then
-  echo "visual-test 版の tako-app をビルドします…"
-  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-app --features visual-test --quiet) || exit 1
+  VISUAL_APP="$(TAKO_BIN="$TAKO_BIN" TAKO_ISO_PROFILE=debug TAKO_ISO_APP_REL='' /bin/bash -c \
+    '. "$1/scripts/lib/isolated-gui.sh" && unset APP_BIN && isolated_gui_bins visual-test >&2 && printf %s "$APP_BIN"' _ "$REPO_ROOT")" || exit 1
 fi
 
 # --- 素材（本番の 8 本に寄せる: 講義スライド風 60 ページ・資料 15 ページ・書類 3 ページ・

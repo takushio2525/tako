@@ -21,8 +21,8 @@
 #      上限（300 ms）未満で緑、旧（`TAKO_2182_LEGACY=1`）は ① で落ちる。所在確認の上限は 5 秒へ縮める
 #
 # 使い方: bash scripts/test-respond-master-launch-2182.sh
-#   STAGES="latency edge deliver visual"（既定は全部）で段を選ぶ。SKIP_BUILD=1 でビルドを飛ばす
-#   （先に `cargo build -p tako-cli -p tako-app --features tako-app/visual-test` を済ませておく。
+#   STAGES="latency edge deliver visual"（既定は全部）で段を選ぶ。tako / tako-app は
+#   isolated_gui_bins が毎回今の木から visual-test 付きで建てる（最新なら cargo は何もしない = #1643。
 #   visual-test 版は通常の起動もそのままできるので 1 回のビルドで全段に使う）。
 #
 # 窓は仮想ディスプレイ tako-vd へ出す（`scripts/lib/isolated-gui.sh` の 1 実装。#1141 / #1490）。
@@ -57,11 +57,7 @@ trap cleanup EXIT
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 
 # ビルドは HOME を差し替える前に（後で呼ぶとツールチェーンとレジストリを一時 HOME へ取り直す）
-if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  echo "visual-test 版の tako-app / tako をビルドします…"
-  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
-fi
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 
 STUB_BIN="$TMP/bin"
 mkdir -p "$STUB_BIN"

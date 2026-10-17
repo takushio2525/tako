@@ -63,10 +63,9 @@ REAL_BEFORE="$(snap_real)"
 
 # --- ビルド -------------------------------------------------------------------------------
 # visual 段のために visual-test 版の GUI を作る（ほかの段もこの版で走る = #1962 と同じ）
-(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app --features visual-test && run_heavy cargo build -q -p tako-cli) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 
 # `/tmp` 直下に短く取る（daemon の待ち受けと tmux が sun_path の上限に当たらない。#1441）
 TMP="$(mktemp -d /tmp/tk2050-XXXXXX)"

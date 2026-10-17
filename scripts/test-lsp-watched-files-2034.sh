@@ -14,7 +14,8 @@
 #      効きうる。リンクを通る根での旧腕のずれは `issue2034_lsp_watched_files` の `--ignored` の実サーバの e2e）
 #
 # 使い方: bash scripts/test-lsp-watched-files-2034.sh
-#   ビルド済みなら TAKO_2034_SKIP_BUILD=1（heavy.sh でビルドしてから回すとき）
+#   偽サーバがビルド済みなら TAKO_2034_SKIP_BUILD=1（heavy.sh でビルドしてから回すとき）。
+#   tako / tako-app は isolated_gui_bins が毎回今の木から建てる（最新なら cargo は何もしない = #1643）
 #
 # 窓は仮想ディスプレイ tako-vd へ出す（`scripts/lib/isolated-gui.sh` の 1 実装。#1141 / #1490）。
 # 落とすのは自分で起こした pid だけ。
@@ -54,9 +55,8 @@ trap cleanup EXIT
 export TAKO_LSP_AUTOSTART=1
 
 if [ "${TAKO_2034_SKIP_BUILD:-0}" != "1" ]; then
-  echo "tako-app と偽サーバをビルドします…"
-  (cd "$REPO_ROOT" && cargo build -q -p tako-cli -p tako-app \
-    && cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
+  echo "偽サーバをビルドします…"
+  (cd "$REPO_ROOT" && cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
 fi
 isolated_gui_bins || exit 1
 FAKE="$(dirname "$TAKO_BIN")/tako-lsp-fake"

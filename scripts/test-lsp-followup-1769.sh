@@ -49,9 +49,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_heavy cargo build -q -p tako-app || exit 1
-run_heavy cargo build -q -p tako-cli -p tako-control --bin tako --bin tako-lsp-fake 2>/dev/null \
-  || run_heavy cargo build -q -p tako-cli -p tako-control || exit 1
+run_heavy cargo build -q -p tako-control --bin tako-lsp-fake || exit 1
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"

@@ -82,7 +82,8 @@
 # 使い方:
 #   . scripts/lib/isolated-gui.sh        # 関数として読む（直接実行はしない）
 #
-#   isolated_gui_bins                    # TAKO_BIN / APP_BIN を決める（無ければビルド）
+#   isolated_gui_bins                    # TAKO_BIN / APP_BIN を決め、今の木から建てる（毎回 cargo に任せる。#1643）
+#   isolated_gui_bins visual-test        # visual-test の節を回すなら feature を求める（自前で cargo build しない）
 #   launch_isolated_gui "$TMP/app.log" || exit $?   # 印と面の指定の判定 → ensure → uuid の突き合わせ → 起動（pid は $ISOLATED_GUI_PID）
 #   wait_isolated_gui                    # `tako list` が通るまで待つ（任意）
 #   stop_isolated_gui                    # 自分で起こした pid だけを落とす
@@ -228,20 +229,53 @@ iso_repo_root() {
     (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 }
 
-# TAKO_BIN（CLI）と APP_BIN（GUI）を決める。無ければビルドする。
-# **呼び出し側の指定を尊重する**（`TAKO_BIN=… bash scripts/test-….sh` で差し替えられる）
+# TAKO_BIN（CLI）と APP_BIN（GUI）を決め、**今の木のソースから、呼び手が求める feature で建てる**（#1643）。
+#
+#   isolated_gui_bins [feature …]    # feature は tako-app の feature 名（例: visual-test）
+#
+# **毎回 cargo build を通す**: 以前は 2 本のどちらかが無いときだけ素のビルドを走らせていたので、
+#   ① 新しい worktree で先に `--features visual-test` の tako-app を建てると、CLI が無いので素のビルドが
+#     それを上書きした（「TAKO_VISUAL_TEST には --features visual-test が必要」で exit 1）
+#   ② 2 本が在ればビルドしないので、rebase や checkout で木を進めたあとも前の版で隔離 GUI が立った
+#     （「修正後」の段まで NG = 偽の FAIL / 偽の PASS）
+#   どちらも「バイナリが在るか」で鮮度と feature を推し量っていたのが原因。鮮度と feature の正本は
+#   cargo の fingerprint（ソース・feature・依存）なので判定は cargo に任せる。最新なら cargo は何も
+#   建てずに返り、feature ごとの成果物は target の deps に別々に残る（素 ↔ visual-test の行き来は
+#   2 回目からリンクの差し替えだけ）。**呼び手は tako-app を自前で建てない**（求める feature は
+#   ここへ渡す。番犬 issue1490_isolated_gui_launch_watchdog が落とす。この入口より前の段で CLI だけを
+#   使うスクリプトが CLI を建てるのは構わない = tako-app に触れない）
+# **呼び出し側が差し替えた TAKO_BIN / APP_BIN は建てない**（`TAKO_BIN=… bash scripts/test-….sh`。
+#   既定の置き場を指していれば建てる）。feature は tako-app を建てるときだけ渡す
+# **ビルドは利用者のホームで回す**: HOME を一時 dir へ差し替えた後に呼ばれても、ツールチェーンと
+#   レジストリを一時 HOME へ取り直さない（iso_real_home が引けなければ HOME のまま）
 isolated_gui_bins() {
-    local root
+    local root cli_default app_default home feature features="" build=""
     root=$(iso_repo_root)
-    TAKO_BIN="${TAKO_BIN:-$root/$ISOLATED_GUI_CLI_REL}"
-    APP_BIN="${APP_BIN:-$root/$ISOLATED_GUI_APP_REL}"
-    if [ ! -x "$TAKO_BIN" ] || [ ! -x "$APP_BIN" ]; then
-        echo "バイナリをビルドします…"
-        if [ "$ISOLATED_GUI_PROFILE" = release ]; then
-            (cd "$root" && run_heavy cargo build --release -p tako-cli -p tako-app --quiet)
-        else
-            (cd "$root" && run_heavy cargo build -p tako-cli -p tako-app --quiet)
-        fi
+    cli_default="$root/$ISOLATED_GUI_CLI_REL"
+    app_default="$root/$ISOLATED_GUI_APP_REL"
+    TAKO_BIN="${TAKO_BIN:-$cli_default}"
+    APP_BIN="${APP_BIN:-$app_default}"
+    local -a build_args=()
+    [ "$ISOLATED_GUI_PROFILE" = release ] && build_args+=(--release)
+    if [ "$TAKO_BIN" = "$cli_default" ]; then
+        build_args+=(-p tako-cli)
+        build=1
+    fi
+    if [ "$APP_BIN" = "$app_default" ]; then
+        build_args+=(-p tako-app)
+        build=1
+        for feature in "$@"; do
+            features="${features:+$features,}tako-app/$feature"
+        done
+        [ -n "$features" ] && build_args+=(--features "$features")
+    fi
+    if [ -n "$build" ]; then
+        echo "バイナリを今の木から建てます（${ISOLATED_GUI_PROFILE}・feature: ${*:-なし}。最新なら cargo は何もしない）…"
+        home=$(iso_real_home) || home=${HOME-}
+        (cd "$root" && HOME="$home" run_heavy cargo build ${build_args[@]+"${build_args[@]}"} --quiet) || {
+            iso_err "cargo build ${build_args[*]+${build_args[*]}} が失敗した"
+            return 1
+        }
     fi
     local b
     for b in "$TAKO_BIN" "$APP_BIN"; do
@@ -579,7 +613,7 @@ stop_isolated_gui() {
 # 呼び出し側のスクリプトが組み立てるもので、ここから出すと中途半端な隔離で本番を触る）
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     echo "使い方: . ${0}   # source して関数を使う（直接実行する口は無い）" >&2
-    echo "  isolated_gui_bins                    TAKO_BIN / APP_BIN を決める（無ければビルド）" >&2
+    echo "  isolated_gui_bins [feature…]         TAKO_BIN / APP_BIN を決め、今の木から求める feature で建てる（毎回 cargo に任せる）" >&2
     echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動（用意できなければ起動せず 4・tako-vd 以外の面の指定と偽の TAKO_ISOLATED と物理画面を指す TAKO_VD_NAME は起動せず 2）" >&2
     echo "  wait_isolated_gui [log] [試行回数]    tako list が通るまで待つ" >&2
     echo "  stop_isolated_gui [pid]              自分で起こした pid だけを落とす" >&2

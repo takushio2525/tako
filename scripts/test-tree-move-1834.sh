@@ -51,14 +51,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_heavy cargo build -q -p tako-app --features visual-test || exit 1
-run_heavy cargo build -q -p tako-cli -p tako-control --bin tako --bin tako-lsp-fake || exit 1
+run_heavy cargo build -q -p tako-control --bin tako-lsp-fake || exit 1
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 # 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
 export TAKO_LSP_AUTOSTART=1
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 FAKE="$(dirname "$APP_BIN")/tako-lsp-fake"
 [ -x "$FAKE" ] || { echo "偽サーバが無い: $FAKE"; exit 1; }
 

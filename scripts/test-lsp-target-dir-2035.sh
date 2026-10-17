@@ -18,7 +18,8 @@
 #      重複ぶんの内訳つき）を測り、その最中に `cargo build -p tako-core` を撃ってロック待ちが出ないこと
 #
 # 使い方: bash scripts/test-lsp-target-dir-2035.sh
-#   ビルド済みなら TAKO_2035_SKIP_BUILD=1。⑤ は ~/dev/.tako-tools/heavy.sh 経由で TAKO_2035_MEASURE_TAKO=1
+#   ⑤ は ~/dev/.tako-tools/heavy.sh 経由で TAKO_2035_MEASURE_TAKO=1
+#   （tako / tako-app は isolated_gui_bins が毎回今の木から建てる。最新なら cargo は何もしない = #1643）
 #
 # 窓は仮想ディスプレイ tako-vd へ出す（`scripts/lib/isolated-gui.sh` の 1 実装。#1141 / #1490）。
 # 落とすのは自分で起こした pid だけ。
@@ -61,10 +62,6 @@ trap cleanup EXIT
 # 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
 export TAKO_LSP_AUTOSTART=1
 
-if [ "${TAKO_2035_SKIP_BUILD:-0}" != "1" ]; then
-  echo "tako-app をビルドします…"
-  (cd "$REPO_ROOT" && cargo build -q -p tako-cli -p tako-app) || exit 1
-fi
 isolated_gui_bins || exit 1
 
 export HOME="$TMP/home"

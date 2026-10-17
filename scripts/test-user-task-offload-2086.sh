@@ -19,7 +19,7 @@
 #
 # 使い方: bash scripts/test-user-task-offload-2086.sh
 #   STAGES="latency edge order"（既定は全部）で段を選ぶ。INJECT_MS（既定 1500）で読みの遅さを変える。
-#   SKIP_BUILD=1 でビルドを飛ばす（先に `cargo build -p tako-cli -p tako-app` を済ませておく）。
+#   tako / tako-app は isolated_gui_bins が毎回今の木から建てる（最新なら cargo は何もしない = #1643）。
 #
 # 窓は仮想ディスプレイ tako-vd へ出す（`scripts/lib/isolated-gui.sh` の 1 実装。#1141 / #1490）。
 # 自動命名は `TAKO_AUTO_RENAME=0` で止める（隔離 GUI でも claude を呼ぶ = #1968 の罠）。
@@ -46,10 +46,6 @@ trap cleanup EXIT
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 
 # ビルドは HOME を差し替える前に（後で呼ぶとツールチェーンとレジストリを一時 HOME へ取り直す）
-if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  echo "tako-app / tako をビルドします…"
-  (cd "$REPO_ROOT" && cargo build -p tako-cli -p tako-app --quiet) || exit 1
-fi
 isolated_gui_bins || exit 1
 
 # claude のスタブ（③ の master。入力欄 `❯` を出し、Enter で受け取った行を画面へ残す）

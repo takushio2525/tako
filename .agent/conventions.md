@@ -4138,7 +4138,7 @@ gpui のシェーダー = metallib）入り、署名の名義（Apple Developmen
 
 ```sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-isolated_gui_bins                     # TAKO_BIN / APP_BIN を決める（無ければビルド）
+isolated_gui_bins visual-test || exit 1   # TAKO_BIN / APP_BIN を決め、今の木から求める feature で建てる（#1643）
 launch_isolated_gui "$TMP/app.log" || exit $?   # 印と面の指定の判定 → ensure → uuid の突き合わせ → 起動（pid は $ISOLATED_GUI_PID）
 wait_isolated_gui "$TMP/app.log"      # `tako list` が通るまで待つ（任意）
 stop_isolated_gui                     # 自分で起こした pid だけを落とす
@@ -4154,6 +4154,16 @@ stop_isolated_gui                     # 自分で起こした pid だけを落�
 置き先の中央 960x600 のまま。窓の実寸を測る検証の実測値を動かさないため）。
 落とすのは `stop_isolated_gui` = **自分で起こした pid だけ**で、
 `pkill -f tako` のような名前一致は本番 GUI と他 worker に当たるので使わない。
+
+**バイナリは `isolated_gui_bins [feature …]` が毎回今の木から建てる**（#1643）。鮮度と feature の
+判定は cargo の fingerprint に任せる（最新なら cargo は何もしない）。以前は 2 本のどちらかが
+**無いときだけ**素のビルドを走らせていたので、① 先に `--features visual-test` で建てた tako-app を
+素のビルドで上書きし ② 2 本が在れば rebase 後も前の版で走った。だから**呼び手は tako-app を
+自前で `cargo build` しない**（求める feature は入口へ渡す。visual-test の節を回すなら
+`isolated_gui_bins visual-test`）。別のバイナリで回すときは `TAKO_BIN` / `APP_BIN` を渡す
+（差し替えたものは建てない）。ビルドは利用者のホームで回すので、HOME を差し替えた後に
+呼んでもツールチェーンを取り直さない。番犬 `issue1490_isolated_gui_launch_watchdog` の
+21〜27 が偽の cargo の砂場と呼び手の走査で落とす。
 
 **面を用意できなければ起動しない**（#1744）。`ensure` が失敗した・成功と言ったのに面が
 OS の一覧に無い（`bounds` で読み戻す）ときは、`launch_isolated_gui` は窓を開かずに

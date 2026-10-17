@@ -55,8 +55,6 @@ cleanup() {
 . "$REPO_ROOT/scripts/lib/exit-guard.sh"
 tako_exit_trap cleanup "usage 分析 S3（#2202）の実経路テスト"
 
-# rebase 後に古いバイナリで回さない（isolated_gui_bins は無いときだけビルドする）
-(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins || exit 1

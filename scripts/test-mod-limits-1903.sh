@@ -76,10 +76,9 @@ cleanup() {
 tako_exit_trap cleanup "tako mod S2 の続き（#1903）の実経路テスト"
 
 # visual-test の節を持つ GUI を作る（実 GUI の段も同じバイナリで回す = 1867 と同じ）
-(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app --features visual-test && run_heavy cargo build -q -p tako-cli) || exit 1
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 caffeinate -d -u -w $$ >/dev/null 2>&1 &
 
 export TAKO_ISOLATED=1

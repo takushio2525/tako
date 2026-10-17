@@ -97,6 +97,28 @@
 //!     断ったら偽の GUI が起きず 2 と理由 1 行。他の失敗は従来どおり 4
 //! 20. [`物理画面で断る終了コードが係とヘルパでそろっている`] — `VD_RC_NOT_VIRTUAL` と
 //!     `ISOLATED_GUI_VD_RC_NOT_VIRTUAL` が同じ番号
+//!
+//! ## #1643: バイナリは今の木から、呼び手が求める feature で建てる
+//!
+//! `isolated_gui_bins` は 2 本のどちらかが**無いときだけ**素の `cargo build` を走らせていた。
+//! ① 新しい worktree で先に `--features visual-test` の tako-app を建てると、CLI が無いので
+//! 素のビルドがそれを上書きし「TAKO_VISUAL_TEST には --features visual-test が必要」で exit 1
+//! （PR #1637 / PR #2040 の worker が踏んだ）② 2 本が在ればビルドしないので、rebase で木を
+//! 進めたあとも前の版で隔離 GUI が立った（10/17 の受け入れで「修正後」の段まで NG）。
+//! 呼び手は回避策（CLI を先に建てる・自前で毎回建てる）を 87 本へ手書きしていた。
+//! いまのヘルパは `isolated_gui_bins [feature …]` で毎回 cargo に判定を任せる。
+//!
+//! 21. [`feature付きで先に建てたtako_appを素のビルドで上書きしない`] — 偽の cargo を置いた砂場で
+//!     ① を再現し、visual-test を求めた入口が visual-test 付きのまま CLI も建てることを見る
+//! 22. [`木を進めたら古いバイナリのまま走らずに建て直す`] — ② を再現し、2 本が在っても今の木から建つ
+//! 23. [`建て方は呼び手の求めと差し替えで決まる`] — 素 / 複数の feature / release / 差し替えた
+//!     TAKO_BIN・APP_BIN は建てない / HOME を差し替えた後でも利用者のホームで建てる
+//! 24. [`ビルドが失敗したら入口も失敗する`] — cargo の失敗・建ったはずのバイナリが無いを素通ししない
+//! 25. [`呼び手はtako_appを自前で建てない`] — ヘルパを source する `scripts/*.sh` に
+//!     tako-app を建てる `cargo build` を置かない（feature のずれた上書きが戻る）
+//! 26. [`visual_testの節を回す呼び手はvisual_testを求める`] — `TAKO_VISUAL_TEST=1` を渡す呼び手は
+//!     `isolated_gui_bins visual-test` を呼ぶ（求めないとヘルパが素で建て直す）
+//! 27. [`自前ビルドとfeatureの求め漏れの検査は実際の形を検出する`] — 25 / 26 の検出力
 
 use std::path::{Path, PathBuf};
 
@@ -1900,5 +1922,639 @@ fn 物理画面で断る終了コードが係とヘルパでそろっている()
     assert!(
         find(&body, "$ISOLATED_GUI_VD_RC_NOT_VIRTUAL").is_some(),
         "{HELPER_REL}:{at}: iso_ensure_display が係の終了コードを ISOLATED_GUI_VD_RC_NOT_VIRTUAL で見ていない（#1783）"
+    );
+}
+
+// --------------------------------------------- 21〜24. 今の木から呼び手の feature で建てる（#1643）
+
+/// 偽の cargo（#1643）。呼ばれた引数を `STUB_CARGO_LOG` へ、そのときの HOME を
+/// `STUB_CARGO_LOG.home` へ 1 行ずつ書き、`-p` ごとに成果物を `target/<profile>/` へ書く。
+/// 成果物の中身は「どの木（cwd の `tree.stamp`）から・どの feature で建ったか」= 本物の
+/// cargo の fingerprint の代わり。`STUB_CARGO_RC` を置けば何も建てずにその終了コードで終わり、
+/// `STUB_CARGO_NOOP` を置けば成功を返すが何も建てない
+#[cfg(unix)]
+const STUB_CARGO: &str = r#"#!/bin/bash
+echo "$*" >> "$STUB_CARGO_LOG"
+echo "$HOME" >> "$STUB_CARGO_LOG.home"
+[ -n "${STUB_CARGO_RC:-}" ] && exit "$STUB_CARGO_RC"
+[ -n "${STUB_CARGO_NOOP:-}" ] && exit 0
+profile=debug
+features=""
+pkgs=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --release) profile=release ;;
+    -p) shift; pkgs="$pkgs $1" ;;
+    --features) shift; features="$1" ;;
+  esac
+  shift
+done
+mkdir -p "target/$profile"
+for p in $pkgs; do
+  case "$p" in
+    tako-cli) out=tako; f="" ;;
+    tako-app) out=tako-app; f="$features" ;;
+    *) continue ;;
+  esac
+  printf 'tree=%s features=%s\n' "$(cat tree.stamp)" "$f" > "target/$profile/$out"
+  chmod +x "target/$profile/$out"
+done
+"#;
+
+/// ヘルパの複製を置いた砂場（#1643）。`isolated_gui_bins` は既定の置き場（= リポジトリの target）へ
+/// 建てるので、**本物の target に触れない**よう、ヘルパと queue.sh を砂場の `scripts/lib/` へ写して
+/// そこから source する（ヘルパはリポジトリルートを自分の置き場から引く）
+#[cfg(unix)]
+struct BinsSandbox {
+    dir: tako_core::test_residue::ScratchDir,
+}
+
+#[cfg(unix)]
+struct BinsRun {
+    rc: i32,
+    /// 偽の cargo が受け取った引数（呼ばれた回数ぶん）
+    calls: Vec<String>,
+    /// そのときの HOME
+    homes: Vec<String>,
+    stdout: String,
+    stderr: String,
+}
+
+#[cfg(unix)]
+impl BinsSandbox {
+    fn new(tag: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tako_core::test_residue::ScratchDir::new(tag);
+        let root = dir.path();
+        let lib = root.join("repo/scripts/lib");
+        std::fs::create_dir_all(&lib).expect("砂場の scripts/lib を作る");
+        for name in ["isolated-gui.sh", "queue.sh"] {
+            std::fs::copy(repo_root().join("scripts/lib").join(name), lib.join(name))
+                .unwrap_or_else(|e| panic!("{name} を砂場へ写す: {e}"));
+        }
+        std::fs::create_dir_all(root.join("bin")).expect("砂場の bin を作る");
+        let cargo = root.join("bin/cargo");
+        std::fs::write(&cargo, STUB_CARGO).expect("偽の cargo を書く");
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        for d in ["home-real", "home-tmp"] {
+            std::fs::create_dir_all(root.join(d)).expect("砂場の HOME を作る");
+        }
+        let sb = BinsSandbox { dir };
+        sb.advance_tree("v1");
+        sb
+    }
+
+    fn repo(&self) -> PathBuf {
+        self.dir.path().join("repo")
+    }
+
+    /// 木を進める（= ソースを変える）。偽の cargo はこの印から建てる
+    fn advance_tree(&self, version: &str) {
+        std::fs::write(self.repo().join("tree.stamp"), version).expect("木の印を書く");
+    }
+
+    /// 前に建てた成果物を置く（`features` は tako-app の feature を cargo の書き方で）
+    fn prebuilt(&self, profile: &str, name: &str, tree: &str, features: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.repo().join("target").join(profile);
+        std::fs::create_dir_all(&dir).expect("砂場の target を作る");
+        let path = dir.join(name);
+        std::fs::write(&path, format!("tree={tree} features={features}\n")).expect("成果物を置く");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// 成果物の中身（無ければ None）
+    fn artifact(&self, profile: &str, name: &str) -> Option<String> {
+        std::fs::read_to_string(self.repo().join("target").join(profile).join(name))
+            .ok()
+            .map(|s| s.trim_end().to_string())
+    }
+
+    /// ヘルパを source して `isolated_gui_bins <features…>` を 1 回呼ぶ（macOS 同梱の bash 3.2 で）
+    fn run(&self, env: &[(&str, &str)], features: &[&str]) -> BinsRun {
+        let root = self.dir.path();
+        let log = root.join("cargo.log");
+        let home_log = root.join("cargo.log.home");
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&home_log);
+        let script = r#"
+. "$SB_REPO/scripts/lib/isolated-gui.sh"
+isolated_gui_bins "$@" || exit $?
+echo "TAKO_BIN=$TAKO_BIN"
+echo "APP_BIN=$APP_BIN"
+"#;
+        let out = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(script)
+            .arg("run_bins")
+            .args(features)
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .env("HOME", root.join("home-real"))
+            // 利用者のホーム（ビルドの HOME）は砂場の中を指す = 本物のホームを見ない
+            .env("ISOLATED_GUI_REAL_HOME", root.join("home-real"))
+            // 順番待ち（本物の tako）へ繋がない
+            .env("TAKO_NO_QUEUE", "1")
+            .env("SB_REPO", self.repo())
+            .env("STUB_CARGO_LOG", &log)
+            .envs(env.iter().copied())
+            .output()
+            .expect("/bin/bash を起こす");
+        let lines = |p: &Path| -> Vec<String> {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        BinsRun {
+            rc: out.status.code().unwrap_or(-1),
+            calls: lines(&log),
+            homes: lines(&home_log),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+}
+
+/// `isolated_gui_bins` の本体の位置（落ちたときに名指す）
+#[cfg(unix)]
+fn bins_at() -> String {
+    let src = read(HELPER_REL);
+    let (_, at) = fn_body(HELPER_REL, &src, "isolated_gui_bins()");
+    format!("{HELPER_REL}:{at}")
+}
+
+#[cfg(unix)]
+#[test]
+fn feature付きで先に建てたtako_appを素のビルドで上書きしない() {
+    let sb = BinsSandbox::new("1643-keep-feature");
+    // 新しい worktree で visual-test の tako-app だけを先に建てた（CLI は無い）
+    sb.prebuilt("debug", "tako-app", "v1", "tako-app/visual-test");
+    let r = sb.run(&[], &["visual-test"]);
+    let at = bins_at();
+    assert_eq!(
+        r.rc, 0,
+        "{at}: isolated_gui_bins visual-test が失敗した:\n{}",
+        r.stderr
+    );
+    let app = sb.artifact("debug", "tako-app").unwrap_or_default();
+    assert!(
+        app.contains("features=tako-app/visual-test"),
+        "{at}: visual-test を求めたのに tako-app が素で建て直された（#1643 の ①。\
+         TAKO_VISUAL_TEST の節が「--features visual-test が必要」で exit 1 になる）: {app}\n\
+         cargo の呼び出し: {:?}",
+        r.calls
+    );
+    assert!(
+        sb.artifact("debug", "tako").is_some(),
+        "{at}: CLI が建っていない（cargo の呼び出し: {:?}）",
+        r.calls
+    );
+    assert_eq!(
+        r.calls.len(),
+        1,
+        "{at}: cargo は 1 回（CLI と tako-app を同じ feature の判定で）: {:?}",
+        r.calls
+    );
+    let call = &r.calls[0];
+    for want in [
+        "-p tako-cli",
+        "-p tako-app",
+        "--features tako-app/visual-test",
+    ] {
+        assert!(
+            call.contains(want),
+            "{at}: cargo へ `{want}` を渡していない: {call}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn 木を進めたら古いバイナリのまま走らずに建て直す() {
+    let sb = BinsSandbox::new("1643-stale");
+    // 2 本とも前の木（v1）から建っている。rebase で木が v2 へ進んだ
+    sb.prebuilt("debug", "tako", "v1", "");
+    sb.prebuilt("debug", "tako-app", "v1", "tako-app/visual-test");
+    sb.advance_tree("v2");
+    let r = sb.run(&[], &["visual-test"]);
+    let at = bins_at();
+    assert_eq!(r.rc, 0, "{at}: isolated_gui_bins が失敗した:\n{}", r.stderr);
+    assert_eq!(
+        r.calls.len(),
+        1,
+        "{at}: 2 本が在ると cargo を呼ばない = 前の木のバイナリで隔離 GUI が立つ（#1643 の ②。\
+         「修正後」の段まで NG になる）: {:?}",
+        r.calls
+    );
+    let app = sb.artifact("debug", "tako-app").unwrap_or_default();
+    let cli = sb.artifact("debug", "tako").unwrap_or_default();
+    assert!(
+        app.starts_with("tree=v2") && app.contains("features=tako-app/visual-test"),
+        "{at}: tako-app が今の木（v2）の visual-test 付きで建っていない: {app}"
+    );
+    assert!(
+        cli.starts_with("tree=v2"),
+        "{at}: CLI が今の木（v2）から建っていない: {cli}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn 建て方は呼び手の求めと差し替えで決まる() {
+    use std::os::unix::fs::PermissionsExt;
+    let at = bins_at();
+
+    // 素の呼び手には feature を渡さない（visual-test の成果物は cargo の deps に別に残る）
+    let sb = BinsSandbox::new("1643-plain");
+    let r = sb.run(&[], &[]);
+    assert_eq!(r.rc, 0, "{at}: 素の呼び出しが失敗した:\n{}", r.stderr);
+    assert_eq!(
+        r.calls.len(),
+        1,
+        "{at}: 素の呼び出しで cargo を呼んでいない: {:?}",
+        r.calls
+    );
+    assert!(
+        !r.calls[0].contains("--features"),
+        "{at}: 求めていない feature を渡している: {}",
+        r.calls[0]
+    );
+
+    // feature は複数でも 1 つの --features に tako-app/ を付けて並べる
+    let r = sb.run(&[], &["visual-test", "extra"]);
+    assert!(
+        r.calls
+            .first()
+            .is_some_and(|c| c.contains("--features tako-app/visual-test,tako-app/extra")),
+        "{at}: 複数の feature の渡し方が崩れている: {:?}",
+        r.calls
+    );
+
+    // release（TAKO_ISO_PROFILE）は --release で、置き場も target/release
+    let sb = BinsSandbox::new("1643-release");
+    let r = sb.run(&[("TAKO_ISO_PROFILE", "release")], &["visual-test"]);
+    assert_eq!(r.rc, 0, "{at}: release の呼び出しが失敗した:\n{}", r.stderr);
+    assert!(
+        r.calls.first().is_some_and(|c| c.contains("--release")),
+        "{at}: release なのに --release を渡していない: {:?}",
+        r.calls
+    );
+    assert!(
+        sb.artifact("release", "tako-app")
+            .is_some_and(|a| a.contains("features=tako-app/visual-test")),
+        "{at}: target/release/tako-app が visual-test 付きで建っていない"
+    );
+    assert!(
+        r.stdout.contains("target/release/tako-app"),
+        "{at}: APP_BIN が target/release を指していない:\n{}",
+        r.stdout
+    );
+
+    // 呼び手が差し替えた APP_BIN は建てない（CLI だけを建てる。feature は tako-app にしか効かない）
+    let sb = BinsSandbox::new("1643-override");
+    let custom = sb.dir.path().join("custom-tako-app");
+    std::fs::write(&custom, "custom\n").expect("差し替えのバイナリを置く");
+    std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let custom_s = custom.display().to_string();
+    let r = sb.run(&[("APP_BIN", custom_s.as_str())], &["visual-test"]);
+    assert_eq!(
+        r.rc, 0,
+        "{at}: APP_BIN を差し替えた呼び出しが失敗した:\n{}",
+        r.stderr
+    );
+    assert_eq!(r.calls.len(), 1, "{at}: CLI を建てていない: {:?}", r.calls);
+    assert!(
+        r.calls[0].contains("-p tako-cli")
+            && !r.calls[0].contains("-p tako-app")
+            && !r.calls[0].contains("--features"),
+        "{at}: 差し替えた APP_BIN があるのに tako-app を建てようとしている: {}",
+        r.calls[0]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&custom).unwrap_or_default(),
+        "custom\n",
+        "{at}: 差し替えたバイナリが書き換わった"
+    );
+
+    // 2 本とも差し替えたら cargo を呼ばない
+    sb.prebuilt("debug", "elsewhere-tako", "v1", "");
+    let cli = sb
+        .repo()
+        .join("target/debug/elsewhere-tako")
+        .display()
+        .to_string();
+    let r = sb.run(
+        &[("APP_BIN", custom_s.as_str()), ("TAKO_BIN", cli.as_str())],
+        &["visual-test"],
+    );
+    assert_eq!(
+        r.rc, 0,
+        "{at}: 2 本を差し替えた呼び出しが失敗した:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.calls.is_empty(),
+        "{at}: 2 本とも差し替えたのに cargo を呼んだ: {:?}",
+        r.calls
+    );
+
+    // HOME を一時 dir へ差し替えた後に呼ばれても、利用者のホームで建てる
+    // （ツールチェーンとレジストリを一時 HOME へ取り直さない）
+    let sb = BinsSandbox::new("1643-home");
+    let tmp_home = sb.dir.path().join("home-tmp").display().to_string();
+    let r = sb.run(&[("HOME", tmp_home.as_str())], &[]);
+    let real = sb
+        .dir
+        .path()
+        .join("home-real")
+        .canonicalize()
+        .expect("利用者のホームの物理パス");
+    assert_eq!(
+        r.homes.first().map(PathBuf::from),
+        Some(real.clone()),
+        "{at}: HOME を差し替えた後の cargo が利用者のホーム（{}）で走っていない: {:?}",
+        real.display(),
+        r.homes
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ビルドが失敗したら入口も失敗する() {
+    let at = bins_at();
+    // cargo の失敗（前の木のバイナリが在っても、それで走らせない）
+    let sb = BinsSandbox::new("1643-fail");
+    sb.prebuilt("debug", "tako", "v1", "");
+    sb.prebuilt("debug", "tako-app", "v1", "");
+    sb.advance_tree("v2");
+    let r = sb.run(&[("STUB_CARGO_RC", "101")], &["visual-test"]);
+    assert_ne!(
+        r.rc, 0,
+        "{at}: cargo build が失敗したのに入口が成功した = 前の木のバイナリで走る:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("cargo build"),
+        "{at}: 失敗の理由（cargo build）を stderr に出していない:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stdout.contains("APP_BIN="),
+        "{at}: 失敗したのに呼び手へ戻っている:\n{}",
+        r.stdout
+    );
+
+    // cargo が成功を返しても建ったはずのバイナリが無ければ失敗
+    let sb = BinsSandbox::new("1643-missing");
+    let r = sb.run(&[("STUB_CARGO_NOOP", "1")], &[]);
+    assert_ne!(r.rc, 0, "{at}: バイナリが無いのに入口が成功した");
+    assert!(
+        r.stderr.contains("バイナリが見つからない"),
+        "{at}: 無いバイナリを名指していない:\n{}",
+        r.stderr
+    );
+}
+
+// --------------------------------------------- 25〜27. 呼び手の書き方（#1643）
+
+/// ヘルパを source する `scripts/*.sh`（lib の中は除く）。走査範囲が空なら FAILED
+fn helper_callers() -> Vec<PathBuf> {
+    let dir = repo_root().join("scripts");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("scripts/ を読む")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "sh"))
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|s| s.contains("lib/isolated-gui.sh")))
+        .collect();
+    out.sort();
+    assert!(
+        out.len() >= 50,
+        "isolated-gui.sh を source するスクリプトが {} 本しか見つからない（走査範囲の取り方が壊れている）",
+        out.len()
+    );
+    out
+}
+
+/// `(開始の行番号, 継続行をつないだ 1 文)`（行コメントは外す）
+fn statements(src: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut start = 0;
+    for (i, line) in src.lines().enumerate() {
+        if cur.is_empty() {
+            if is_comment(line) {
+                continue;
+            }
+            start = i + 1;
+        }
+        match line.trim_end().strip_suffix('\\') {
+            Some(head) => {
+                cur.push_str(head);
+                cur.push(' ');
+            }
+            None => {
+                cur.push_str(line);
+                out.push((start, std::mem::take(&mut cur)));
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push((start, cur));
+    }
+    out
+}
+
+/// 文字列の中か（その位置より前の引用符の数が奇数）
+fn in_quotes(before: &str) -> bool {
+    before.matches('\'').count() % 2 == 1 || before.matches('"').count() % 2 == 1
+}
+
+/// その文が tako-app を自前で建てるか（#1643）。文字列の中・語の途中（`user_cargo build`）の
+/// `cargo build` は数えない。引数は次のコマンドの区切り（`;` `|` `&` `)`）まで
+fn builds_tako_app(stmt: &str) -> bool {
+    let needle = "cargo build";
+    let mut from = 0;
+    while let Some(off) = stmt[from..].find(needle) {
+        let at = from + off;
+        from = at + needle.len();
+        let before = &stmt[..at];
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            continue;
+        }
+        if in_quotes(before) {
+            continue;
+        }
+        let rest = &stmt[from..];
+        let end = rest.find([';', '|', '&', ')']).unwrap_or(rest.len());
+        let args: Vec<&str> = rest[..end].split_whitespace().collect();
+        if args
+            .windows(2)
+            .any(|w| matches!(w[0], "-p" | "--package") && w[1] == "tako-app")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// その文の `isolated_gui_bins` の呼び出しごとの引数（`bash -c '…'` の中の呼び出しも数える）
+fn bins_args(stmt: &str) -> Vec<Vec<String>> {
+    let needle = "isolated_gui_bins";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(off) = stmt[from..].find(needle) {
+        let at = from + off;
+        from = at + needle.len();
+        if stmt[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let rest = &stmt[from..];
+        if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let end = rest
+            .find([';', '|', '&', ')', '\'', '"', '>', '#'])
+            .unwrap_or(rest.len());
+        out.push(rest[..end].split_whitespace().map(str::to_string).collect());
+    }
+    out
+}
+
+/// visual-test の節を回すのに `isolated_gui_bins visual-test` を呼んでいなければ、その節の行番号
+fn visual_test_without_request(src: &str) -> Option<usize> {
+    let stmts = statements(src);
+    let uses = stmts
+        .iter()
+        .find(|(_, s)| s.contains("TAKO_VISUAL_TEST=1"))
+        .map(|(n, _)| *n)?;
+    let requests = stmts
+        .iter()
+        .flat_map(|(_, s)| bins_args(s))
+        .any(|args| args.iter().any(|a| a == "visual-test"));
+    (!requests).then_some(uses)
+}
+
+#[test]
+fn 呼び手はtako_appを自前で建てない() {
+    let mut violations: Vec<String> = Vec::new();
+    for path in helper_callers() {
+        let src = std::fs::read_to_string(&path).expect("読める .sh");
+        for (n, stmt) in statements(&src) {
+            if builds_tako_app(&stmt) {
+                violations.push(format!("{}:{n}: {}", rel_of(&path), stmt.trim()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "隔離 GUI のヘルパを使うスクリプトが tako-app を自前で建てている（#1643）。\n\
+         ヘルパは毎回 cargo に任せて今の木から建てるので、自前のビルドは要らないうえ、\n\
+         feature のずれたビルドが前後すると visual-test 付きを素で上書きする（#1643 の ①）。\n\
+         求める feature は入口へ渡す:\n    isolated_gui_bins visual-test || exit 1\n\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn visual_testの節を回す呼び手はvisual_testを求める() {
+    let mut violations: Vec<String> = Vec::new();
+    for path in helper_callers() {
+        let src = std::fs::read_to_string(&path).expect("読める .sh");
+        if let Some(n) = visual_test_without_request(&src) {
+            violations.push(format!(
+                "{}:{n}: TAKO_VISUAL_TEST=1 を渡すのに isolated_gui_bins visual-test を呼んでいない",
+                rel_of(&path)
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "visual-test の節を回すスクリプトが feature を求めていない（#1643）。\n\
+         求めないとヘルパは素で建て、節が「TAKO_VISUAL_TEST には --features visual-test が必要」で\n\
+         exit 1 になる:\n    isolated_gui_bins visual-test || exit 1\n\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn 自前ビルドとfeatureの求め漏れの検査は実際の形を検出する() {
+    // #1643 で外した回避策の実物の形（戻ってきたら落ちること）
+    for stmt in [
+        r#"run_heavy cargo build -p tako-app --features visual-test --quiet || exit 1"#,
+        r#"(cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1"#,
+        r#"(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-app --features visual-test && run_heavy cargo build -q -p tako-cli) || exit 1"#,
+        r#"run_heavy cargo build -q -p tako-app -p tako-cli 2>&1 | tail -3"#,
+        r#"  (cd "$REPO_ROOT" && cargo build -q -p tako-cli -p tako-app) || exit 1"#,
+        r#"(cd "$REPO_ROOT" && run_heavy cargo build --release -q -p tako-cli -p tako-app) || exit 1"#,
+        r#"tako queue cargo build --package tako-app"#,
+    ] {
+        assert!(
+            builds_tako_app(stmt),
+            "検査が自前のビルドを見逃している: {stmt}"
+        );
+    }
+    // 継続行をまたいでも 1 文として拾う
+    let src = "(cd \"$REPO_ROOT\" && run_heavy cargo build -q -p tako-cli \\\n  -p tako-app --features tako-app/visual-test) || exit 1\n";
+    let stmts = statements(src);
+    assert!(
+        stmts.len() == 1 && builds_tako_app(&stmts[0].1),
+        "継続行をまたいだ自前のビルドを見逃している: {stmts:?}"
+    );
+    // 通すもの: tako-app 以外のビルド・文字列の中・語の途中・コメント
+    for stmt in [
+        r#"run_heavy cargo build -q -p tako-cli || exit 1"#,
+        r#"(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1"#,
+        r#"echo "tako が無い: ${TAKO}（cargo build -p tako-app）""#,
+        r#"LONG='cargo build -p tako-app && ./target/debug/tako list'"#,
+        r#"(cd "$p" && user_cargo build -p tako-app) > "$TMP/build.out""#,
+        r#"run_heavy cargo build -q -p tako-app-extra"#,
+    ] {
+        assert!(
+            !builds_tako_app(stmt),
+            "検査が自前のビルドでない文を誤検出している: {stmt}"
+        );
+    }
+    assert!(
+        statements("# (cd \"$REPO_ROOT\" && cargo build -p tako-app)\n").is_empty(),
+        "コメントの行を文として拾っている"
+    );
+
+    // feature の求め漏れ: 修正前の呼び方と、正しい呼び方（bash -c の中の呼び出しも数える）
+    let missing = "isolated_gui_bins || exit 1\nlaunch_isolated_gui \"$L\" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=x || exit $?\n";
+    assert_eq!(
+        visual_test_without_request(missing),
+        Some(2),
+        "visual-test を求めない呼び手を見逃している"
+    );
+    for ok in [
+        "isolated_gui_bins visual-test || exit 1\nlaunch_isolated_gui \"$L\" TAKO_VISUAL_TEST=1 || exit $?\n",
+        "isolated_gui_bins || exit 1\nV=\"$(/bin/bash -c '. \"$1/x.sh\" && isolated_gui_bins visual-test >&2 && printf %s \"$APP_BIN\"' _ \"$R\")\"\nlaunch_isolated_gui \"$L\" TAKO_VISUAL_TEST=1\n",
+        "isolated_gui_bins || exit 1\nlaunch_isolated_gui \"$L\" TAKO_SELF_TEST=1\n",
+    ] {
+        assert_eq!(
+            visual_test_without_request(ok),
+            None,
+            "正しい呼び方を求め漏れと誤検出している:\n{ok}"
+        );
+    }
+    // 説明の行（コメント）の TAKO_VISUAL_TEST=1 は使っているうちに数えない
+    assert_eq!(
+        visual_test_without_request("# TAKO_VISUAL_TEST=1 の節は…\nisolated_gui_bins || exit 1\n"),
+        None,
+        "コメントの TAKO_VISUAL_TEST=1 を使っていると読んでいる"
     );
 }
