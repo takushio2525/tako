@@ -156,23 +156,36 @@ pub fn output_command(script: &str) -> std::process::Command {
 
 /// `tako:shell` 宣言（`# tako:shell: pwsh`）で指定されたシェルへコマンドを包む。
 ///
-/// **OS ではなく宣言されたシェルで決まる**ので `cfg` を持たない。判定は
-/// [`ShellDialect::from_program`] 1 本に任せ、判定できないシェル（fish / cmd.exe /
-/// Git Bash の `bash` 等）は POSIX 形のままにする — Windows でも POSIX シェルを
-/// 入れて使う人はいるので「知らないシェルは POSIX 扱い」が既定
-pub fn declared_shell_command(shell: &str, command: &str) -> String {
-    match ShellDialect::from_program(shell) {
-        Some(ShellDialect::PowerShell) => {
-            format!(
-                "{shell} -Command {}",
-                ShellDialect::PowerShell.quote_arg(command)
-            )
-        }
-        // 単引用符で包み、中の `'` は `'\''` で閉じ直す（POSIX 形）。
-        // `quote_arg`（= `quote_for_shell`）は「必要なときだけ」引用するので使わない:
-        // `bash -c ls` へ変わって macOS の出力がバイト等価でなくなる
-        _ => format!("{shell} -c '{}'", command.replace('\'', "'\\''")),
-    }
+/// 包んだ 1 行を解釈するのは**実行ペインのシェル**（[`run_pane_dialect_for`]。macOS = `/bin/sh`、
+/// Windows = PowerShell）で、宣言したシェルはその引数を受け取る側。なので層ごとに方言が違う（#2286）:
+///
+/// - **フラグ**（`-c` / `-Command`）は宣言したシェルで決まる。判定は [`ShellDialect::from_program`]
+///   1 本で、判定できないシェル（fish / cmd.exe 等）は `-c`（Windows でも POSIX シェルを入れて
+///   使う人はいるので「知らないシェルは POSIX 扱い」が既定。#875）
+/// - **本体を囲む引用**は実行ペインの方言の [`ShellDialect::enclose_arg`]。#2286 以前は宣言した
+///   シェルの方言で囲んでいたので、macOS の `pwsh -Command 'echo it''s'` は `/bin/sh` が
+///   `echo its` にし、Windows の `bash -c '…'\''…'` は PowerShell の構文エラーだった。
+///   本体の中身（`${file}` 等の展開）は宣言したシェルの方言のまま（`runner::RunVars::in_dialect`）
+/// - **シェルの語**は書いたまま。ただし判定できるシェル 1 本のパスが空白を含むとき
+///   （`C:\Program Files\PowerShell\7\pwsh.exe`）だけ、実行ペインのコマンド位置の形
+///   （[`ShellDialect::command_word`]）で囲む。空白の無い値は囲まない（`~/bin/bash` のチルダ展開や
+///   `bash -l` のような引数つきの書き方を、書いたとおりに実行ペインのシェルへ渡す）
+pub fn declared_shell_command(
+    platform: crate::platform::support::Platform,
+    shell: &str,
+    command: &str,
+) -> String {
+    let outer = run_pane_dialect_for(platform);
+    let declared = ShellDialect::from_program(shell);
+    let program = match declared {
+        Some(_) if shell.chars().any(char::is_whitespace) => outer.command_word(shell),
+        _ => shell.to_string(),
+    };
+    let flag = match declared {
+        Some(ShellDialect::PowerShell) => "-Command",
+        _ => "-c",
+    };
+    format!("{program} {flag} {}", outer.enclose_arg(command))
 }
 
 /// 実行ペイン（[`run_pane_command`]）がコマンド本体を解釈させるシェルの方言。
@@ -1586,25 +1599,52 @@ mod tests {
         assert_eq!(got.args, vec!["-c".to_string(), POSIX_EXPECTED.to_string()]);
     }
 
+    /// macOS の実行ペイン（`/bin/sh`）: 本体はどのシェルを宣言しても POSIX の単引用符で囲む。
+    /// フラグだけが宣言したシェルで決まる（#2286）
     #[test]
-    fn posixのtako_shell宣言は従来どおり単引用符で包む() {
+    fn macosのtako_shell宣言は本体を実行ペインのposixの形で囲む() {
+        use crate::platform::support::Platform::MacOs;
         assert_eq!(
-            declared_shell_command("bash", "echo hi"),
+            declared_shell_command(MacOs, "bash", "echo hi"),
             "bash -c 'echo hi'"
         );
         // 単引用符は `'\''` で閉じ直す（POSIX 形）
         assert_eq!(
-            declared_shell_command("zsh", "echo it's"),
+            declared_shell_command(MacOs, "zsh", "echo it's"),
             r"zsh -c 'echo it'\''s'"
         );
         // 判定できないシェル（fish / cmd.exe）も POSIX 形のまま = 従来どおり
         assert_eq!(
-            declared_shell_command("fish", "echo hi"),
+            declared_shell_command(MacOs, "fish", "echo hi"),
             "fish -c 'echo hi'"
         );
         assert_eq!(
-            declared_shell_command("cmd.exe", "echo hi"),
+            declared_shell_command(MacOs, "cmd.exe", "echo hi"),
             "cmd.exe -c 'echo hi'"
+        );
+        // #2286: pwsh を宣言しても外側は `/bin/sh` が読む。#2286 以前の `'echo it''s'` は
+        // `/bin/sh` が `echo its` にしていた
+        assert_eq!(
+            declared_shell_command(MacOs, "pwsh", "echo it's"),
+            r"pwsh -Command 'echo it'\''s'"
+        );
+        assert_eq!(
+            declared_shell_command(MacOs, "pwsh", "echo hi"),
+            "pwsh -Command 'echo hi'"
+        );
+        // 判定できるシェル 1 本のパスが空白を含むときだけ囲む。空白の無い値と、引数つきの
+        // 書き方（判定できない値）は書いたまま（チルダ展開・`-l` を実行ペインのシェルへ渡す）
+        assert_eq!(
+            declared_shell_command(MacOs, "/opt/my tools/bash", "ls"),
+            "'/opt/my tools/bash' -c 'ls'"
+        );
+        assert_eq!(
+            declared_shell_command(MacOs, "~/bin/bash", "ls"),
+            "~/bin/bash -c 'ls'"
+        );
+        assert_eq!(
+            declared_shell_command(MacOs, "bash -l", "ls"),
+            "bash -l -c 'ls'"
         );
     }
 
@@ -1894,20 +1934,40 @@ mod tests {
         );
     }
 
+    /// Windows の実行ペイン（PowerShell）: 本体はどのシェルを宣言しても PowerShell の単引用符
+    /// （`''` の二重化）で囲む（#2286）
     #[test]
-    fn windowsの宣言シェルはpowershell流に包む() {
+    fn windowsの宣言シェルは本体を実行ペインのpowershellの形で囲む() {
+        use crate::platform::support::Platform::Windows;
         assert_eq!(
-            declared_shell_command("pwsh", "echo it's"),
+            declared_shell_command(Windows, "pwsh", "echo it's"),
             "pwsh -Command 'echo it''s'"
         );
-        // パス表記・大文字表記でも PowerShell と判定される（`ShellDialect` の判定を共有）
+        // パス表記・大文字表記でも PowerShell と判定される（`ShellDialect` の判定を共有）。
+        // 空白を含むパスはコマンド位置の形（`&` + 単引用符）。#2286 以前の素の
+        // `C:\Program Files\…` は PowerShell が `C:\Program` をコマンドと読んでいた
         assert_eq!(
-            declared_shell_command(PWSH, "echo hi"),
-            format!("{PWSH} -Command 'echo hi'")
+            declared_shell_command(Windows, PWSH, "echo hi"),
+            format!("& '{PWSH}' -Command 'echo hi'")
         );
         assert_eq!(
-            declared_shell_command("PowerShell.EXE", "echo hi"),
+            declared_shell_command(Windows, "PowerShell.EXE", "echo hi"),
             "PowerShell.EXE -Command 'echo hi'"
+        );
+        // #2286: bash を宣言しても外側は PowerShell が読む。#2286 以前の
+        // `bash -c 'echo it'\''s'` は PowerShell の構文エラー
+        assert_eq!(
+            declared_shell_command(Windows, "bash", "echo it's"),
+            "bash -c 'echo it''s'"
+        );
+        assert_eq!(
+            declared_shell_command(Windows, r"C:\Program Files\Git\bin\bash.exe", "ls"),
+            r"& 'C:\Program Files\Git\bin\bash.exe' -c 'ls'"
+        );
+        // 空白が無ければ書いたまま（`bash` / `cmd.exe` は従来と同じ）
+        assert_eq!(
+            declared_shell_command(Windows, "bash", "echo hi"),
+            "bash -c 'echo hi'"
         );
     }
 

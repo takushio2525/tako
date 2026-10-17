@@ -787,13 +787,7 @@ fn resolve_core(
 
             let resolved_cwd = if let Some(cwd_str) = raw_cwd {
                 declared_cwds.insert(decl.name.clone(), cwd_str.to_string());
-                // cwd はシェルへ渡さずパスとして使う。PowerShell は引用しない展開を使う
-                // （バッククオートは `strip_quotes` で外れない = #1668）。POSIX は
-                // 「引用してから外側の単引用符を外す」#1668 以前の形を 1 バイトも変えない
-                let cleaned = match vars.dialect {
-                    ShellDialect::Posix => strip_quotes(&expand(cwd_str)),
-                    ShellDialect::PowerShell => expand_literal(cwd_str, &vars),
-                };
+                let cleaned = declared_cwd_value(cwd_str, &vars);
                 let cwd_path = Path::new(&cleaned);
                 if cwd_path.is_absolute() {
                     cwd_path.to_path_buf()
@@ -986,12 +980,27 @@ fn no_command_hint(platform: Platform, ext: &str) -> String {
     }
 }
 
-/// シングルクオートの除去（expand_variables がパスをクオートするが cwd では不要）
-fn strip_quotes(s: &str) -> String {
+/// 宣言の `tako:cwd` の値をパスにする（両 OS で 1 実装。#2286）。
+///
+/// cwd はシェルへ渡さずパスとして使うので、変数は**引用せずに**展開する（[`expand_literal`]）。
+/// #2286 以前の macOS は「引用して展開してから、全体が単引用符で囲まれていれば外す」形で、
+/// 値に別の文字が続くと外せなかった（`/tmp/my dir/x.py` + `${fileDir}/build` が
+/// `/tmp/my dir/'/tmp/my dir'/build` になった）。書き手が値全体を単引用符で囲んだ形
+/// （`tako:cwd: '/tmp/my dir'`）は展開の前に外す（#2286 以前の macOS でも通っていた書き方）
+fn declared_cwd_value(template: &str, vars: &RunVars) -> String {
+    expand_literal(&strip_quotes(vars.dialect, template), vars)
+}
+
+/// 値全体を囲む単引用符を外し、中の閉じ直しを実行ペインの方言で戻す
+/// （POSIX = `'\''`、PowerShell = `''`）。囲まれていなければそのまま
+fn strip_quotes(dialect: ShellDialect, s: &str) -> String {
     if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-        // エスケープされたクオートも元に戻す
         // 切り出し安全: 両端は直前で確かめた ASCII の `'`
-        s[1..s.len() - 1].replace("'\\''", "'")
+        let inner = &s[1..s.len() - 1];
+        match dialect {
+            ShellDialect::Posix => inner.replace("'\\''", "'"),
+            ShellDialect::PowerShell => inner.replace("''", "'"),
+        }
     } else {
         s.to_string()
     }
@@ -1343,28 +1352,65 @@ mod tests {
         );
     }
 
-    /// 宣言の `tako:cwd` はシェルへ渡さない（パスとして使う）。Windows はバッククオートが
-    /// 残らない引用なしの展開、macOS は #1668 以前と同じ「引用して外側を外す」
+    /// 宣言の `tako:cwd` はシェルへ渡さない（パスとして使う）。両 OS とも引用しない展開で、
+    /// 値全体を囲む単引用符だけを外す（#1668 / #2286）
     #[test]
     fn 宣言のcwdは方言の引用を残さない() {
         let path = PathBuf::from("/tmp/my dir/it's.py");
-        let resolve = |platform: Platform, head: &str| {
-            resolve_for(platform, &path, head, &BTreeMap::new(), None, None)
+        let resolve = |platform: Platform, cwd: &str| {
+            let head = format!("# tako:run: python ${{fileBase}}\n# tako:cwd: {cwd}\n");
+            resolve_for(platform, &path, &head, &BTreeMap::new(), None, None)
                 .expect("宣言がある")
                 .plan
                 .cwd
         };
-        let head = "# tako:run: python ${fileBase}\n# tako:cwd: ${fileDir}\n";
-        assert_eq!(resolve(Platform::MacOs, head), PathBuf::from("/tmp/my dir"));
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert_eq!(
+                resolve(platform, "${fileDir}"),
+                PathBuf::from("/tmp/my dir")
+            );
+            // #2286: macOS は `/tmp/my dir/'/tmp/my dir'/build` になっていた
+            assert_eq!(
+                resolve(platform, "${fileDir}/build"),
+                PathBuf::from("/tmp/my dir/build"),
+                "{platform:?}"
+            );
+            assert_eq!(
+                resolve(platform, "'${fileDir}/build'"),
+                PathBuf::from("/tmp/my dir/build"),
+                "{platform:?}"
+            );
+            // 書き手が囲んだ値（#2286 以前の macOS でも通っていた書き方）。Windows は #1668 で
+            // 引用しない展開へ寄せたときに `'` が残って相対パスになっていた
+            assert_eq!(
+                resolve(platform, "'/srv/lit dir'"),
+                PathBuf::from("/srv/lit dir"),
+                "{platform:?}"
+            );
+            assert_eq!(
+                resolve(platform, "build"),
+                PathBuf::from("/tmp/my dir/build")
+            );
+        }
+        // 中の閉じ直しは実行ペインの方言で戻す
         assert_eq!(
-            resolve(Platform::Windows, head),
-            PathBuf::from("/tmp/my dir")
+            resolve(Platform::MacOs, r"'/srv/it'\''s'"),
+            PathBuf::from("/srv/it's")
         );
-        let nested = "# tako:run: python ${fileBase}\n# tako:cwd: ${fileDir}/build\n";
         assert_eq!(
-            resolve(Platform::Windows, nested),
-            PathBuf::from("/tmp/my dir/build")
+            resolve(Platform::Windows, "'/srv/it''s'"),
+            PathBuf::from("/srv/it's")
         );
+        // 引用符の入ったファイル名の段も 1 つのパスのまま
+        let quoted = PathBuf::from("/tmp/it's dir/a.py");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let head = "# tako:run: python ${fileBase}\n# tako:cwd: ${fileDir}/out\n";
+            let cwd = resolve_for(platform, &quoted, head, &BTreeMap::new(), None, None)
+                .unwrap()
+                .plan
+                .cwd;
+            assert_eq!(cwd, PathBuf::from("/tmp/it's dir/out"), "{platform:?}");
+        }
     }
 
     /// `tako:shell` の宣言は内側のシェルの方言で囲む（Windows の bash は POSIX、macOS の pwsh は
