@@ -47,7 +47,44 @@ pub fn no_console_window(cmd: &mut Command) -> &mut Command {
 /// 「終わったか」を待ち合わせる用途には使わないこと（`remote.rs` の `has_terminated` が
 /// ゾンビ判定込みでそれを担う）
 pub fn pid_alive(pid: u32) -> bool {
-    imp::pid_alive(pid)
+    imp::pid_alive(pid) || injected_linger(pid)
+}
+
+/// #2275 の注入: **テストプロセスでだけ**、居なくなった pid を最初に見てから n ミリ秒は
+/// 「居る」と答える（`TAKO_2275_INJECT_ALIVE_MS=<n>`）。
+///
+/// 「終わったプロセスを生存確認がしばらく居ると読む」形（Windows CI の
+/// `queue::tests::居なくなったwrapperの枠は返る` の間欠）を macOS で再現する。
+/// 負荷は生成しない。製品のバイナリでは [`crate::paths::is_test_process`] で無視する
+pub const ENV_INJECT_2275: &str = "TAKO_2275_INJECT_ALIVE_MS";
+
+fn injected_linger(pid: u32) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static WINDOW: OnceLock<Option<Duration>> = OnceLock::new();
+    let window = *WINDOW.get_or_init(|| {
+        std::env::var(ENV_INJECT_2275)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    });
+    let Some(window) = window else {
+        return false;
+    };
+    if !crate::paths::is_test_process() {
+        return false;
+    }
+    static FIRST_GONE: OnceLock<Mutex<HashMap<u32, Instant>>> = OnceLock::new();
+    let mut seen = FIRST_GONE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    seen.entry(pid).or_insert_with(Instant::now).elapsed() < window
 }
 
 /// 在籍の列挙 1 枚から 1 件の生死を読む（**Windows の腕の純粋部分**。#1597）。
