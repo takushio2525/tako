@@ -2081,6 +2081,7 @@ echo "APP_BIN=$APP_BIN"
 }
 
 /// `isolated_gui_bins` の本体の位置（落ちたときに名指す）
+#[cfg(unix)]
 fn bins_at() -> String {
     let src = read(HELPER_REL);
     let (_, at) = fn_body(HELPER_REL, &src, "isolated_gui_bins()");

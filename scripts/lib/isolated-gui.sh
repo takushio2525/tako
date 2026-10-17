@@ -273,7 +273,7 @@ isolated_gui_bins() {
         echo "バイナリを今の木から建てます（${ISOLATED_GUI_PROFILE}・feature: ${*:-なし}。最新なら cargo は何もしない）…"
         home=$(iso_real_home) || home=${HOME-}
         (cd "$root" && HOME="$home" run_heavy cargo build ${build_args[@]+"${build_args[@]}"} --quiet) || {
-            iso_err "cargo build ${build_args[*]} が失敗した"
+            iso_err "cargo build ${build_args[*]+${build_args[*]}} が失敗した"
             return 1
         }
     fi
