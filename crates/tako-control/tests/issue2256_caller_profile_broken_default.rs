@@ -574,6 +574,9 @@ fn limit_resume(variant: Variant) {
     );
 }
 
+/// 経路の名前と、1 通りぶんを確かめる関数
+type Path2256 = (&'static str, fn(Variant));
+
 #[test]
 fn issue2256_壊れたdefaultでspawn_解消_adopt_guide_自動復帰が黙らない() {
     for key in [
@@ -604,7 +607,7 @@ fn issue2256_壊れたdefaultでspawn_解消_adopt_guide_自動復帰が黙ら�
 
     // 経路ごとに結果を集める（1 経路の失敗で残りを見ずに終わらない = 修正前に戻すと
     // 5 経路それぞれが黙ることを 1 回の実行で名指しできる）
-    let paths: [(&str, fn(Variant)); 5] = [
+    let paths: [Path2256; 5] = [
         ("spawn", spawn),
         ("git_resolve", git_resolve),
         ("adopt", adopt),
