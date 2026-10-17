@@ -1801,6 +1801,12 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   `state=running && loading`（`server_loading` は起動中も真）。順序の注入は偽サーバの
   `TAKO_LSP_FAKE_EMPTY_DELAY_MS` / `TAKO_LSP_FAKE_SETTLE_ON_EMPTY` / `TAKO_LSP_FAKE_LOG_DELAY_MS`。
   番犬は同じ `issue1922_lsp_loading_wait_watchdog`
+
+  **相手の返事の取り込み（#2312）**も同じ型。偽サーバのログに didOpen が載った = tako が**送った**で
+  あって、didOpen への診断が tako に**届いた**ではない。tako の受信数（`received_messages`）を基準に
+  取るなら、診断が数に載った（`diagnostics_count`）のを待ってから取る（`issue1678_lsp_e2e.rs` の
+  アイドルの検査が CI で 1 → 2。偽サーバの `--publish-delay-ms 50` で 10 回とも同じ行で落ちる。
+  その e2e は常に渡す）
 - **隔離 GUI の性能は App Nap を分けて読む**（#1916）。隔離 GUI は前面に出ないので、起動から
   約 30 秒で App Nap に間引かれ（`ps -o pri=` が 46 → 4）、CPU を使う処理は E コアへ寄せられて
   2.2〜2.8 倍遅くなる。「回を追うごとに遅くなる」はまずこれを疑う
