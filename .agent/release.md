@@ -129,7 +129,8 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
   #1136 の理由を守るため: HEAD はブランチ main のまま・main のコミットを書き換えも捨てもしない・共有ツリーにコミットを
   作らない。main に origin/main に無いコミットがある（分岐）・untracked が上書きされるので ff できないときは触らず
   WARN と通知（今夜のリリースは止めない）。fetch できなければ手元の origin/main まで追従し、`--dry-run` でも戻すので
-  追従もする。追従するのは戻した夜だけで、ブランチ main のまま古くなった共有ツリーは動かさない。モックは
+  追従もする。追従するのは戻した夜だけで、ブランチ main のまま古くなった共有ツリーは動かさない（誰も pull しない
+  常駐機で夜間・検査のスクリプトが更新されない件は #2264）。モックは
   `/bin/bash scripts/test-nightly-restore-main-2262.sh`（CI の macOS ジョブ。A/B は `TAKO_2262_LEGACY=1`、
   修正前の版に当てるときは `NIGHTLY_UNDER_TEST=<file>`）
 - **中のビルドは順番待ち（#1994）を通る**: `build-app.sh` のリリースビルドは `scripts/lib/queue.sh` の
