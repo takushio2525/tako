@@ -1412,7 +1412,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(windows),
-        ignore = "PowerShell の実物が要る（Windows CI で走る。手元は pwsh があれば --ignored）"
+        ignore = "PowerShell の実物が要る（#1668。Windows CI で走る。手元は pwsh があれば --ignored）"
     )]
     fn powershell_の実物で展開した値が1語のまま届く() {
         let names = [
@@ -1492,18 +1492,17 @@ mod tests {
         let encoded = crate::platform::shell::encode_powershell_command(&script);
         let mut ran = 0;
         for (program, required) in programs {
-            let out = match std::process::Command::new(program)
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-EncodedCommand",
-                    &encoded,
-                ])
-                .output()
-            {
+            let mut cmd = std::process::Command::new(program);
+            crate::platform::process::no_console_window(&mut cmd).args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                &encoded,
+            ]);
+            let out = match cmd.output() {
                 Ok(out) => out,
                 Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => {
                     eprintln!("{program} が無いので飛ばす");
