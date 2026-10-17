@@ -64,7 +64,7 @@ INJECT="race.txt,race-dir,race-mcp.txt"
 # 隔離 GUI を 1 つ起こし、CLI も同じ受け口へ向ける。**回ごとに data / discovery / tmux を分ける**
 # （共有すると 2 回目が前の器を拾う = #2157）。$1 = 回の名前 / 残りは GUI へ渡す追加の env
 start_gui() {
-  local name="$1" rc
+  local name="$1"
   shift
   local base="$TMP/$name"
   mkdir -p "$base/home" "$base/disc" "$base/orch" "$base/data"
@@ -86,9 +86,7 @@ start_gui() {
     TAKO_DISCOVERY_DIR="$TAKO_DISCOVERY_DIR" TAKO_ORCHESTRATOR_DIR="$TAKO_ORCHESTRATOR_DIR" \
     TAKO_SESSIONS_FILE="$TAKO_SESSIONS_FILE" TAKO_PANE_LOG_DIR="$TAKO_PANE_LOG_DIR" \
     TAKO_WORKERS_FILE="$TAKO_WORKERS_FILE" TAKO_TMUX_SOCKET="$TAKO_TMUX_SOCKET" \
-    TAKO_DATA_DIR="$TAKO_DATA_DIR" TAKO_1842_INJECT_RACE="$INJECT" ${1+"$@"}
-  rc=$?
-  [ "$rc" -eq 0 ] || exit "$rc"
+    TAKO_DATA_DIR="$TAKO_DATA_DIR" TAKO_1842_INJECT_RACE="$INJECT" ${1+"$@"} || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$base/gui.log" || exit 1
 }
