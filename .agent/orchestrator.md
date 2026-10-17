@@ -422,6 +422,21 @@ A/B は `TAKO_2227_LEGACY=1`（修正前 = 黙って組み込み既定 / 直し�
 
 A/B は `TAKO_2233_LEGACY=1`（上の表の経路を修正前の黙った既定落としへ戻す）。
 
+**worker の spawn・コンフリクト解消エージェント・adopt・guide・自動復帰の既定も黙らない**（#2256）。
+物差しは #2233 と同じ（人の居ない時間帯に止めると作業ごと止まる経路は止めずに警告・出し先が無く
+周期で出すと persist.log を埋める経路は出さない・立てない経路は読むだけで退避しない）:
+
+| 経路 | 種別 | 扱い |
+|---|---|---|
+| worker の spawn（`spawn_caller_profile`） | 起動 | **立てて警告**: 呼び出し元 master のプロファイルを `master_launch::load_caller_profile`（default の起動と同じ退避つきの読み方）で読む。読めなければ組み込み既定で立て、応答の `warnings`（kind `profile_unreadable`。projects の制限・アカウント・worker のモデルが効かないと言う）と persist.log の `[spawn]` へ出し、中身は退避する（同じ中身なら写しは増えない）。止めない理由: master は人の居ない時間帯にも spawn する。master 自身も同じ組み込み既定で立って起動時に警告している（#2227） |
+| コンフリクト解消エージェント（`tako git resolve` / 右パネルのボタン） | 起動 | **立てて警告**: spawn と同じ読み込み。応答の `warnings`（読めたときは載らない）・persist.log の `[git-resolve]`・退避。GUI のボタンは警告をカードに添えて自動で消さない（4 秒で消える成功の表示では押した人が読めない） |
+| adopt の起動時プロファイル | 判定 | **読むだけで理由を出す**: `orchestrator::read_for_judgment`。採用は止めずに組み込み既定と比べて判断し、そのことを応答の `warnings` へ（断るときは理由に添える。比べた相手が既定なので断る理由そのものが実際と違いうる） |
+| `tako orchestrator guide`（とくに `local-rules`） | 表示 | **読むだけで理由を出す**: 同上。手順書は既定値で組み立てて `warnings`・CLI の `警告:` 行へ。**`local-rules` は「on-demand のルールは無い」ではなく「読めない（推測で埋めず利用者へ伝えよ）」を返す**（無いと返すと master は個人ルールが存在しないと受け取って動く） |
+| master / solo 本人の自動復帰の既定（`master_pane_limit_resume_decision`） | 判定 | **persist.log へ 1 行**: role を貼る瞬間（起動・引き継ぎの後任・会話の再起動・採用）に 1 回だけ通る = 周期ではない。`Request::Title` の応答（Null）には出し先が無いので `[limit-autoresume] … 全体の既定で決めた` を残す。読むだけ |
+
+A/B は `TAKO_2256_LEGACY=1`（上の表の経路を修正前の黙った既定落としへ戻す。判定・表示の経路は
+返す値が修正前と同じなので理由だけを落とす）。
+
 ### `tako orchestrator projects list`
 
 登録済みプロジェクトの一覧を表示する。

@@ -53,6 +53,29 @@ pub(crate) fn git_feedback_text(message: &str) -> String {
     tako_core::text::truncate_chars(&out, GIT_FEEDBACK_MAX_CHARS + 1)
 }
 
+/// 解消エージェントの起動結果のカード（#2256）。応答の `warnings`（呼び出し元のプロファイルを
+/// 読めず組み込み既定で立てた理由）を起動の 1 文の後ろへ添え、**あれば自動で消さない**
+/// （`true` = 閉じるまで残す。4 秒で消える成功の表示では、押した人が読めない）
+pub(crate) fn git_resolve_agent_feedback(
+    agent: &str,
+    pane: u64,
+    reply: &serde_json::Value,
+) -> (String, bool) {
+    let mut msg = crate::ui_text::panel::git_resolve_agent_started(agent, pane);
+    let mut warned = false;
+    for w in reply["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        msg.push('\n');
+        msg.push_str(&crate::ui_text::panel::git_resolve_agent_warning(w));
+        warned = true;
+    }
+    (msg, warned)
+}
+
 /// 末尾 `n` 文字だけを返す（#494。長いメッセージでキャレットを画面内に留めるため）
 pub(crate) fn tail_chars(s: &str, n: usize) -> String {
     let count = s.chars().count();
@@ -5394,8 +5417,8 @@ impl TakoApp {
                 match result {
                     Ok(v) => {
                         let pane_id = v["pane_id"].as_u64().unwrap_or(0);
-                        let msg = crate::ui_text::panel::git_resolve_agent_started(&agent, pane_id);
-                        app.git_set_feedback(msg, false, cx);
+                        let (msg, keep) = git_resolve_agent_feedback(&agent, pane_id, &v);
+                        app.git_set_feedback(msg, keep, cx);
                     }
                     Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
@@ -6309,6 +6332,35 @@ mod tests {
         // サロゲートペア相当でも壊れない
         assert_eq!(tail_chars("a\u{1F600}b", 2), "\u{1F600}b");
         assert_eq!(head_chars("a\u{1F600}b", 2), "a\u{1F600}");
+    }
+
+    /// #2256: 呼び出し元のプロファイルを読めずに立てた解消エージェントは、理由をカードへ添えて
+    /// 自動で消さない。warnings が無い（読めた）ときは従来どおりの 1 文で、4 秒で消える
+    #[test]
+    fn issue2256_解消エージェントの警告はカードに残す() {
+        let plain = serde_json::json!({ "pane_id": 7 });
+        let (msg, keep) = git_resolve_agent_feedback("claude", 7, &plain);
+        assert_eq!(
+            msg,
+            crate::ui_text::panel::git_resolve_agent_started("claude", 7)
+        );
+        assert!(!keep, "警告が無いのに残している");
+        let warned = serde_json::json!({
+            "pane_id": 7,
+            "warnings": ["/tmp/x/default.yaml を読めない（YAML の構文が壊れている（3 行 1 列））"],
+        });
+        let (msg, keep) = git_resolve_agent_feedback("claude", 7, &warned);
+        assert!(keep, "警告を 4 秒で消してしまう");
+        assert!(msg.contains("default.yaml を読めない"), "{msg}");
+        assert!(
+            msg.starts_with(&crate::ui_text::panel::git_resolve_agent_started(
+                "claude", 7
+            )),
+            "起動の 1 文が先頭に無い: {msg}"
+        );
+        // 文字列でない要素・空配列は黙って飛ばす（古い daemon・想定外の形で落ちない）
+        let odd = serde_json::json!({ "pane_id": 7, "warnings": [1, null] });
+        assert!(!git_resolve_agent_feedback("claude", 7, &odd).1);
     }
 
     /// #494: git のエラーは数十行になり得る。カードがパネルを覆わないよう要約する

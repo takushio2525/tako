@@ -7134,6 +7134,12 @@ fn orchestrator_guide_local(
             .to_string()
     });
     let out = tako_control::orchestrator::guide::json(topic, &profile_name)?;
+    // #2256: 読めないプロファイルで既定値から組み立てたことは画面にも出す（本文は stdout のまま）
+    for w in out["warnings"].as_array().into_iter().flatten() {
+        if let Some(w) = w.as_str() {
+            eprintln!("警告: {w}");
+        }
+    }
     if as_json {
         println!("{}", pretty_json(&out));
         return Ok(());

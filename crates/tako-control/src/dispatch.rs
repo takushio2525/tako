@@ -4565,10 +4565,11 @@ fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> 
             if pane.is_none() && tab.is_none() {
                 return Some(ProbeNeeds::default());
             }
-            let (_, profile) = spawn_caller_profile(host, *pane, caller_role.as_deref());
+            // 読めないプロファイルの理由（#2256）は記録しない = 出すのは spawn の dispatch だけ
+            let (_, loaded) = spawn_caller_profile(host, *pane, caller_role.as_deref());
             Some(ProbeNeeds {
                 caller: caller_need(host, *caller_pid),
-                agent: agent_need(profile.resolve_worker_agent(agent.as_deref()).ok()),
+                agent: agent_need(loaded.profile.resolve_worker_agent(agent.as_deref()).ok()),
                 tako_bin: tako_bin_need(),
                 ..ProbeNeeds::default()
             })
@@ -4619,7 +4620,9 @@ fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> 
                 host.workspace(),
                 pane.map(PaneId::from_raw),
                 &None,
-            );
+                CONFLICT_RESOLVER_LABEL,
+            )
+            .profile;
             Some(ProbeNeeds {
                 git_conflict: (!known).then_some(cwd),
                 agent: agent_need(profile.resolve_worker_agent(agent.as_deref()).ok()),
@@ -5027,7 +5030,16 @@ fn apply_master_pane_profile_defaults(
         return;
     };
     let legacy = tako_core::limit_resume_all::legacy();
-    match crate::orchestrator::master_pane_limit_resume_setting(role) {
+    // #2256: プロファイルを読めなければ既定で決めるが、黙らない。role を貼る瞬間に 1 回だけ
+    // 通る（周期ではない）ので persist.log へ 1 行。応答（`Request::Title` は Null）には出し先が無い
+    let (setting, unreadable) = crate::orchestrator::master_pane_limit_resume_decision(role);
+    if let Some(note) = unreadable {
+        crate::diag::persist_log(&format!(
+            "[limit-autoresume] pane={} 発生源 profile:{role}: {note}",
+            pane.id().as_u64()
+        ));
+    }
+    match setting {
         Some(true) => {
             if pane.limit_autoresume() {
                 return;
@@ -12172,7 +12184,10 @@ fn dispatch_orchestrator_adopt(
         .and_then(tako_core::handoff::master_profile_of_any_role)
         .unwrap_or(tako_core::handoff::DEFAULT_PROFILE)
         .to_string();
-    let launched = orchestrator::Profile::load(&launched_as).unwrap_or_default();
+    // #2256: 読めなければ判断は組み込み既定と比べる（止めない）が、その理由を warnings へ出す。
+    // 採用は立てないので読むだけ（退避は起動の経路と `tako migrate` が持つ）
+    let (launched, launched_note) =
+        orchestrator::read_for_judgment(orchestrator::ProfileKind::Master, &launched_as);
 
     // 対象の解決: ① 既存プロファイル → ② projects.yaml のキー（その場で生成）→ ③ エラー
     let target_path = orchestrator::ProfileKind::Master
@@ -12217,13 +12232,24 @@ fn dispatch_orchestrator_adopt(
         name,
         &target,
     );
-    let warnings = match decision {
+    let launched_note = launched_note.map(|why| {
+        format!(
+            "{why}。起動時のプロファイル '{launched_as}' の代わりに組み込み既定と比べて採用を判断した\
+             （system prompt・master の系統の食い違いの判断が実際と違いうる）。直すと次の採用から効く"
+        )
+    });
+    let mut warnings = match decision {
+        // 断る理由も組み込み既定と比べた結果でありうるので、読めない理由を添える
         orchestrator::AdoptDecision::Refused { reason } => {
-            return Err(DispatchError::Operation(reason))
+            return Err(DispatchError::Operation(match &launched_note {
+                Some(note) => format!("{reason}\n{note}"),
+                None => reason,
+            }))
         }
         orchestrator::AdoptDecision::Unchanged => Vec::new(),
         orchestrator::AdoptDecision::Adopt { warnings } => warnings,
     };
+    warnings.extend(launched_note);
 
     let new_role = tako_core::handoff::master_pane_role(name);
     let legacy = orchestrator::legacy_auto_profile();
@@ -15170,6 +15196,9 @@ fn dispatch_orchestrator_handoff(
     }))
 }
 
+/// コンフリクト解消エージェントの呼び名（読めないプロファイルの理由文に入る。#2256）
+const CONFLICT_RESOLVER_LABEL: &str = "コンフリクト解消エージェント";
+
 /// GitResolveAgent — コンフリクト解消エージェントの起動（#496 Part 2）。
 ///
 /// 既存の spawn 基盤（`orchestrator::agent` のコマンド構築 + 事前信頼 + PromptFlow）を
@@ -15193,9 +15222,18 @@ fn dispatch_git_resolve_agent(
         ));
     }
 
-    // エージェント種別はプロファイル既定を土台にし、明示指定で上書きする（新系統を作らない）
+    // エージェント種別はプロファイル既定を土台にし、明示指定で上書きする（新系統を作らない）。
+    // #2256: 読めないプロファイルでも止めずに組み込み既定で立てるが、理由を応答と persist.log へ出す
     let caller_pane = pane.map(PaneId::from_raw);
-    let profile = resolve_caller_profile_with_role(host.workspace(), caller_pane, &None);
+    let orchestrator::master_launch::LaunchProfile {
+        profile,
+        warning: profile_warning,
+    } = resolve_caller_profile_with_role(
+        host.workspace(),
+        caller_pane,
+        &None,
+        CONFLICT_RESOLVER_LABEL,
+    );
     profile.validate_env().map_err(DispatchError::Operation)?;
     let profile_env = profile.resolved_env_plan();
     let worker_agent = profile
@@ -15316,7 +15354,12 @@ fn dispatch_git_resolve_agent(
         .reserve_backend_session(new_id)
         .or_else(|| host.backend_session(new_id));
 
-    Ok(json!({
+    // #2256: 立てた後で 1 回だけ記録する（立てる前に断られたら「立てる」と書かない）
+    if let Some(w) = &profile_warning {
+        crate::diag::persist_log(&format!("[git-resolve] pane={}: {w}", new_id.as_u64()));
+    }
+
+    let mut v = json!({
         "pane_id": new_id.as_u64(),
         "tab_id": tab_id.as_u64(),
         "spawned_by": split_target.as_u64(),
@@ -15344,7 +15387,13 @@ fn dispatch_git_resolve_agent(
             "next_step": b.next_step().text(),
         })),
         "state": conflict_state_json(&repo, &state),
-    }))
+    });
+    // #2256: 呼び出し元のプロファイルを読めず組み込み既定で立てた理由（読めたときは載らない =
+    // 正常時の応答は不変。GUI の「解消エージェント」ボタンもこれを画面へ出す）
+    if let Some(w) = profile_warning {
+        v["warnings"] = json!([w]);
+    }
+    Ok(v)
 }
 
 /// OrchestratorSpawn のパラメータ（Request と 1:1）
@@ -15635,7 +15684,16 @@ fn dispatch_orchestrator_spawn(
     // agent=claude は従来の worker_model_policy 解決を維持し、model が None に解決された
     // 場合は --model を付けず CLI の既定に委ねる（Issue #27）。
     // 検証はペイン分割の**前**に行う（不正 agent でペインだけ生える事故を防ぐ）
-    let (role_suffix, profile) = spawn_caller_profile(host, pane, caller_role);
+    // #2256: 呼び出し元 master のプロファイルを読めなくても止めずに組み込み既定で立てるが、
+    // 理由（projects の制限・アカウント・worker のモデルが効かない）を応答の warnings と
+    // persist.log へ出す（記録は立てた後 = 下の launch_warnings で 1 回だけ）
+    let (
+        role_suffix,
+        orchestrator::master_launch::LaunchProfile {
+            profile,
+            warning: profile_warning,
+        },
+    ) = spawn_caller_profile(host, pane, caller_role);
 
     // Part 2: projects 制限の強制（Issue #500）。プロファイルに projects が設定されている場合、
     // 範囲外のプロジェクトへの spawn を拒否する
@@ -15784,6 +15842,14 @@ fn dispatch_orchestrator_spawn(
     // 致命ではない（tako がダイアログを検出して承諾する）が、そのぶん最初の指示が
     // 届くまで遅くなる。理由と次の一手を応答の warnings へ載せる
     let mut launch_warnings: Vec<Value> = Vec::new();
+    if let Some(w) = profile_warning {
+        crate::diag::persist_log(&format!("[spawn] pane={}: {w}", new_id.as_u64()));
+        launch_warnings.push(json!({
+            "kind": "profile_unreadable",
+            "agent": worker_agent.as_str(),
+            "message": w,
+        }));
+    }
     let pre_trusted =
         orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
             .unwrap_or_else(|e| {
@@ -23027,24 +23093,33 @@ fn spawn_caller_profile(
     host: &dyn ControlHost,
     pane: Option<u64>,
     caller_role: Option<&str>,
-) -> (Option<String>, crate::orchestrator::Profile) {
+) -> (
+    Option<String>,
+    crate::orchestrator::master_launch::LaunchProfile,
+) {
     // caller_role から master suffix を抽出する（#109: pane が stale でも正しい master を特定）
     let role_suffix = caller_role
         .and_then(|r| r.strip_prefix("master:"))
         .map(str::to_string);
-    let profile = resolve_caller_profile_with_role(
+    let loaded = resolve_caller_profile_with_role(
         host.workspace(),
         pane.map(PaneId::from_raw),
         &role_suffix,
+        "worker",
     );
-    (role_suffix, profile)
+    (role_suffix, loaded)
 }
 
+/// 呼び出し元 master のプロファイルを、`launching`（立てるもの）のために読む。
+///
+/// 読み込みは `master_launch::load_caller_profile` の 1 実装（#2256。読めなければ組み込み既定で
+/// 立てるが warning を持つ）。**記録は呼び手の dispatch だけ**（先取りの [`probe_needs`] も通るため）
 fn resolve_caller_profile_with_role(
     workspace: &tako_core::Workspace,
     caller: Option<PaneId>,
     role_suffix: &Option<String>,
-) -> crate::orchestrator::Profile {
+    launching: &str,
+) -> crate::orchestrator::master_launch::LaunchProfile {
     // 旧形式のプロファイル・設定を実行時に検知して直す（#916 の二段構え 2 段目）。
     // 1 プロセス 1 回しか実際には走らないので、この頻繁な経路から呼んでも軽い
     let _ = crate::migrations::ensure_migrated();
@@ -23057,7 +23132,7 @@ fn resolve_caller_profile_with_role(
     } else {
         &suffix
     };
-    crate::orchestrator::Profile::load(name).unwrap_or_default()
+    crate::orchestrator::master_launch::load_caller_profile(name, launching)
 }
 
 /// caller ペインから master の role suffix を検索する。

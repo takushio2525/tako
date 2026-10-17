@@ -46,7 +46,11 @@
 //!
 //! 引き継ぎの後任（[`load_successor_profile`]）と `tako solo`（[`load_solo`]）も同じ形で読む
 //! （#2233）。表示・判定だけの経路は立てないので `orchestrator::load_for_display`（読むだけ・
-//! 応答の `warnings` へ理由）を通す
+//! 応答の `warnings` へ理由）を通す。
+//!
+//! worker の spawn とコンフリクト解消エージェントは呼び出し元 master のプロファイルで立てるので
+//! [`load_caller_profile`]（同じ退避つきの読み方・止めずに警告）を、adopt の起動時プロファイル・
+//! `orchestrator guide`・自動復帰の既定は `orchestrator::read_for_judgment`（読むだけ）を通す（#2256）
 
 use std::path::{Path, PathBuf};
 
@@ -288,6 +292,49 @@ pub fn load_successor_profile(name: &str) -> LaunchProfile {
                 warning: Some(w),
             }
         }
+    }
+}
+
+/// 呼び出し元 master のプロファイルで **master / solo 本人ではないエージェント**を立てる経路
+/// （worker の spawn・コンフリクト解消エージェント）の読み込み（#2256）。`launching` は立てるものの
+/// 名前（「worker」等。理由文に入る）。
+///
+/// 読み方は default の起動・継承元と同じ 1 実装（[`orchestrator::profile_base_at`] = 無い =
+/// 組み込み既定・空 = 設定なし・読めない = 中身を退避して理由）。読めなくても**止めずに**組み込み
+/// 既定で立てる: master は人の居ない時間帯にも spawn するので、止めると作業ごと止まる（master 自身も
+/// 同じ組み込み既定で立ち、起動時に警告している = #2227）。代わりに何が効かないかを warning に持つ。
+///
+/// **ここでは記録しない**: background の先取り（`dispatch::probe_needs`）が同じ解決を通るので、
+/// persist.log と応答の `warnings` へ出すのは立てた dispatch だけにする。
+/// 以前は `Profile::load(..).unwrap_or_default()` で黙っていた。`TAKO_2256_LEGACY=1` で修正前へ戻す
+pub fn load_caller_profile(name: &str, launching: &str) -> LaunchProfile {
+    if orchestrator::legacy_silent_default_2256() {
+        return LaunchProfile {
+            profile: Profile::load(name).unwrap_or_default(),
+            warning: None,
+        };
+    }
+    let kind = orchestrator::ProfileKind::Master;
+    // 名前が不正（修正前も `Profile::load` が断って既定だった）= 読むべきファイルが無い
+    let Ok(path) = kind.path(name) else {
+        return LaunchProfile {
+            profile: kind.default_profile(),
+            warning: None,
+        };
+    };
+    match orchestrator::profile_base_at(kind, &path) {
+        Ok(profile) => LaunchProfile {
+            profile,
+            warning: None,
+        },
+        Err(why) => LaunchProfile {
+            profile: kind.default_profile(),
+            warning: Some(format!(
+                "{why}。呼び出し元 master のプロファイル '{name}' の設定（worker のモデル・effort・\
+                 agent・アカウント・env・projects の制限）を使わず、組み込み既定で {launching} を\
+                 立てる。直すと次から効く"
+            )),
+        },
     }
 }
 

@@ -335,19 +335,37 @@ pub fn master_pane_limit_resume(role: &str) -> bool {
 /// `TAKO_1140_LEGACY=1`）。このときだけ全体の既定が効く。`Some(false)` はプロファイルの
 /// 明示 OFF で、全体の ON より強い（worker の解決順 = [`resolve_worker_limit_resume_in`] と揃える）
 pub fn master_pane_limit_resume_setting(role: &str) -> Option<bool> {
-    let profile = match crate::claude_remote_link::ProfileHint::from_role(role) {
+    master_pane_limit_resume_decision(role).0
+}
+
+/// [`master_pane_limit_resume_setting`] に、プロファイルを読めなかった理由を添えた版（#2256）。
+///
+/// 読めないプロファイルでも判定は止めない（既定へ落ちる）が、**既定で決めたことを黙らない**。
+/// 呼び手は role を貼る瞬間（master / solo の起動・引き継ぎの後任・会話の再起動・採用）に
+/// 1 回だけ呼ぶ = 周期ではないので、理由は persist.log へ 1 行出す（`Request::Title` などの
+/// 応答には出し先が無い）。読むだけで退避しない（退避は起動の経路と `tako migrate` が持つ）。
+/// `TAKO_2256_LEGACY=1` で修正前（黙って既定）へ戻す
+pub fn master_pane_limit_resume_decision(role: &str) -> (Option<bool>, Option<String>) {
+    let (kind, name) = match crate::claude_remote_link::ProfileHint::from_role(role) {
         crate::claude_remote_link::ProfileHint::Master(name) => {
-            Profile::load(name.unwrap_or("default")).unwrap_or_default()
+            (ProfileKind::Master, name.unwrap_or("default"))
         }
         crate::claude_remote_link::ProfileHint::Solo(name) => {
-            load_solo_profile(name.unwrap_or("default")).unwrap_or_else(|_| solo_default_profile())
+            (ProfileKind::Solo, name.unwrap_or("default"))
         }
-        crate::claude_remote_link::ProfileHint::Unknown => return None,
+        crate::claude_remote_link::ProfileHint::Unknown => return (None, None),
     };
+    let (profile, why) = read_for_judgment(kind, name);
     if master_limit_resume_legacy() {
-        return None;
+        return (None, None);
     }
-    profile.limit_resume
+    let note = why.map(|w| {
+        format!(
+            "{w}。このペインの利用上限後の自動復帰（limit_resume）はプロファイルではなく\
+             全体の既定で決めた。直すと次に role を貼るとき（起動・引き継ぎ・再起動）から効く"
+        )
+    });
+    (profile.limit_resume, note)
 }
 
 /// `~` を `$HOME` に展開する
@@ -2986,6 +3004,36 @@ pub fn check_project_profile_base() -> Result<(), String> {
 /// 読めないプロファイルを黙って組み込み既定にする）へ戻す
 pub fn legacy_silent_default_rest() -> bool {
     std::env::var_os("TAKO_2233_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// #2256 の A/B。`TAKO_2256_LEGACY=1` で修正前（worker の spawn・コンフリクト解消エージェント・
+/// adopt の起動時プロファイル・`orchestrator guide`・master / solo 本人の自動復帰の既定が、
+/// 読めないプロファイルを黙って組み込み既定にする）へ戻す
+pub fn legacy_silent_default_2256() -> bool {
+    std::env::var_os("TAKO_2256_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// 判定・表示だけの経路のうち、**既定へ落ちて何が変わるかの言い方が経路で違うもの**の
+/// 読み込み（#2256。adopt の起動時プロファイル・`orchestrator guide`・自動復帰の既定）。
+///
+/// 判定は [`load_for_display`] と同じ [`read_profile_base_at`] の 1 本（読むだけ・退避しない）。
+/// 理由は「`<path>` を読めない（why）」までで、何が既定になったかは呼び手が足す。
+/// 無い（ゼロコンフィグの初回）・読める・名前が不正 = `None`（修正前と同じ既定）。
+///
+/// 返すプロファイルは修正前（`Profile::load(..).unwrap_or_default()` 等）と同じ値なので、
+/// `TAKO_2256_LEGACY=1` は理由だけを落とす（= 修正前の黙った既定落としの再現）
+pub fn read_for_judgment(kind: ProfileKind, name: &str) -> (Profile, Option<String>) {
+    let Ok(path) = kind.path(name) else {
+        return (kind.default_profile(), None);
+    };
+    match read_profile_base_at(kind, &path) {
+        Ok(profile) => (profile, None),
+        Err(why) => (
+            kind.default_profile(),
+            (!legacy_silent_default_2256())
+                .then(|| format!("{} を読めない（{why}）", path.display())),
+        ),
+    }
 }
 
 /// 表示・判定だけの経路のプロファイル読み込み（#2233）。
