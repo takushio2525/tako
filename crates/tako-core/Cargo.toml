@@ -14,6 +14,8 @@ unicode-width.workspace = true
 futures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+# YAML を解釈できなかった理由を中身を含めずに組む（#2230。tako-control と同じ 0.9 = 新しいクレートは増えない）
+serde_yaml.workspace = true
 # 貼り付けの許可リストの指紋（#2050。ワークスペースで既に使っている 0.11 = 新しいクレートは増えない）
 sha2.workspace = true
 thiserror.workspace = true

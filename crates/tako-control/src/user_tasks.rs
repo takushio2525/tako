@@ -49,7 +49,12 @@ pub fn load_from(path: &Path) -> Result<TaskStore, String> {
     if content.trim().is_empty() {
         return Ok(TaskStore::default());
     }
-    serde_yaml::from_str(&content).map_err(|e| format!("user-tasks.yaml のパースに失敗: {e}"))
+    serde_yaml::from_str(&content).map_err(|e| {
+        format!(
+            "user-tasks.yaml のパースに失敗: {}",
+            tako_core::load_issue::yaml_error_reason(&e, &content)
+        )
+    })
 }
 
 pub fn load() -> Result<TaskStore, String> {

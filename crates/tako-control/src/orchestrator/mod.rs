@@ -545,7 +545,12 @@ impl AccountsConfig {
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("accounts.yaml の読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| format!("accounts.yaml のパースに失敗: {e}"))
+        serde_yaml::from_str(&content).map_err(|e| {
+            format!(
+                "accounts.yaml のパースに失敗: {}",
+                tako_core::load_issue::yaml_error_reason(&e, &content)
+            )
+        })
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -713,7 +718,12 @@ impl ProjectsConfig {
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("projects.yaml の読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| format!("projects.yaml のパースに失敗: {e}"))
+        serde_yaml::from_str(&content).map_err(|e| {
+            format!(
+                "projects.yaml のパースに失敗: {}",
+                tako_core::load_issue::yaml_error_reason(&e, &content)
+            )
+        })
     }
 
     /// 保存（アトミック書き込み + 世代バックアップ。#169）。
@@ -1533,7 +1543,12 @@ impl Profile {
         }
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
+        serde_yaml::from_str(&content).map_err(|e| {
+            format!(
+                "プロファイルのパースに失敗: {}",
+                tako_core::load_issue::yaml_error_reason(&e, &content)
+            )
+        })
     }
 
     /// プロファイルを YAML ファイルに保存する（アトミック書き込み + 世代バックアップ。#169）
@@ -1569,7 +1584,12 @@ impl Profile {
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
+        serde_yaml::from_str(&content).map_err(|e| {
+            format!(
+                "プロファイルのパースに失敗: {}",
+                tako_core::load_issue::yaml_error_reason(&e, &content)
+            )
+        })
     }
 
     /// system prompt のパスを解決する。
@@ -2194,7 +2214,12 @@ pub fn load_solo_profile(name: &str) -> Result<Profile, String> {
     }
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
+    serde_yaml::from_str(&content).map_err(|e| {
+        format!(
+            "プロファイルのパースに失敗: {}",
+            tako_core::load_issue::yaml_error_reason(&e, &content)
+        )
+    })
 }
 
 /// solo 用のデフォルトプロファイルを返す（master より effort が低い）
@@ -2692,7 +2717,12 @@ pub fn load_profile_of(kind: ProfileKind, name: &str) -> Result<Profile, String>
     }
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| format!("プロファイルのパースに失敗: {e}"))
+    serde_yaml::from_str(&content).map_err(|e| {
+        format!(
+            "プロファイルのパースに失敗: {}",
+            tako_core::load_issue::yaml_error_reason(&e, &content)
+        )
+    })
 }
 
 /// 指定種別のプロファイルのロック付き read-modify-write（#169）。
@@ -2926,7 +2956,7 @@ fn read_profile_base_at(path: &Path) -> Result<Profile, String> {
         }
         Err(e) => return Err(format!("読み取りに失敗: {e}")),
     };
-    serde_yaml::from_str(&text).map_err(|e| e.to_string())
+    serde_yaml::from_str(&text).map_err(|e| tako_core::load_issue::yaml_error_reason(&e, &text))
 }
 
 /// 継承元が読めるかだけを見る（書かない・退避しない）。`tako migrate status` 用

@@ -261,7 +261,12 @@ impl WorkerRegistry {
     }
 
     fn parse(content: &str) -> Result<Self, String> {
-        serde_yaml::from_str(content).map_err(|e| format!("workers.yaml のパースに失敗: {e}"))
+        serde_yaml::from_str(content).map_err(|e| {
+            format!(
+                "workers.yaml のパースに失敗: {}",
+                tako_core::load_issue::yaml_error_reason(&e, content)
+            )
+        })
     }
 
     pub fn load() -> Result<Self, String> {

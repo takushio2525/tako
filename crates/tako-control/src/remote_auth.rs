@@ -165,8 +165,13 @@ impl DeviceRegistry {
         let audit_path = state_dir.join("audit.log");
         let devices = match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let file: DevicesFile = serde_json::from_str(&content)
-                    .map_err(|e| format!("devices.json の解釈に失敗（{}）: {e}", path.display()))?;
+                let file: DevicesFile = serde_json::from_str(&content).map_err(|e| {
+                    format!(
+                        "devices.json の解釈に失敗（{}）: {}",
+                        path.display(),
+                        tako_core::load_issue::json_error_reason(&e)
+                    )
+                })?;
                 file.devices
                     .into_iter()
                     .map(|d| (d.id.clone(), d))

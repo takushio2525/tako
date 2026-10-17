@@ -80,9 +80,13 @@ pub fn load_state() -> Result<Option<ShareState>, String> {
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("配線状態の読み取りに失敗 ({}): {e}", path.display()))?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|e| format!("配線状態のパースに失敗 ({}): {e}", path.display()))
+    serde_json::from_str(&content).map(Some).map_err(|e| {
+        format!(
+            "配線状態のパースに失敗 ({}): {}",
+            path.display(),
+            tako_core::load_issue::json_error_reason(&e)
+        )
+    })
 }
 
 fn save_state(state: &ShareState) -> Result<(), String> {

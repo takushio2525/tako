@@ -457,8 +457,13 @@ fn ensure_agy_trusted(cwd: &str) -> Result<bool, String> {
 
 fn ensure_agy_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
     let mut root: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s)
-            .map_err(|e| format!("{} を解釈できない: {e}", path.display()))?,
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            format!(
+                "{} を解釈できない: {}",
+                path.display(),
+                tako_core::load_issue::json_error_reason(&e)
+            )
+        })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
     };

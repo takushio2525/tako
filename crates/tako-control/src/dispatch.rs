@@ -17978,9 +17978,10 @@ fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchE
         } else {
             serde_json::from_str(&content).map_err(|e| {
                 DispatchError::Operation(format!(
-                    "{} を JSON として解釈できないので書き換えを中止した（{e}）。\
+                    "{} を JSON として解釈できないので書き換えを中止した（{}）。\
                      内容を直すか退避してからやり直してください",
-                    path.display()
+                    path.display(),
+                    tako_core::load_issue::json_error_reason(&e)
                 ))
             })?
         }

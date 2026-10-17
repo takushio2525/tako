@@ -402,8 +402,9 @@ fn read_from(path: &std::path::Path) -> RecordRead {
                 None => String::new(),
             };
             Err(format!(
-                "蓋閉じ継続の記録を解釈できません（{}）: {e}{where_to}",
-                path.display()
+                "蓋閉じ継続の記録を解釈できません（{}）: {}{where_to}",
+                path.display(),
+                tako_core::load_issue::json_error_reason(&e)
             ))
         }
     }

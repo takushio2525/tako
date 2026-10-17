@@ -665,7 +665,12 @@ pub fn load_config_from(path: &Path) -> Result<SetupConfig, String> {
     }
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("config.yaml の読み取りに失敗: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| format!("config.yaml のパースに失敗: {e}"))
+    serde_yaml::from_str(&content).map_err(|e| {
+        format!(
+            "config.yaml のパースに失敗: {}",
+            tako_core::load_issue::yaml_error_reason(&e, &content)
+        )
+    })
 }
 
 /// 保存（アトミック書き込み + 世代バックアップ。#169）。
@@ -929,8 +934,12 @@ struct ChangesFile {
 }
 
 fn parse_changes(yaml: &str) -> Result<Vec<SetupChange>, String> {
-    let file: ChangesFile =
-        serde_yaml::from_str(yaml).map_err(|e| format!("changes.yaml のパースに失敗: {e}"))?;
+    let file: ChangesFile = serde_yaml::from_str(yaml).map_err(|e| {
+        format!(
+            "changes.yaml のパースに失敗: {}",
+            tako_core::load_issue::yaml_error_reason(&e, yaml)
+        )
+    })?;
     // 未知のプラットフォーム名は黙って無視せず弾く（書き間違いが配信漏れになるため）
     for c in &file.changes {
         if let Some(list) = &c.platforms {
