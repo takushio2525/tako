@@ -15544,19 +15544,11 @@ impl TakoApp {
         }
     }
 
+    /// 選択の写しを編集バッファへ揃える（写し方の正本は `preview::sync_selection_copy`。#1701）
     fn sync_preview_selection_from_editor(&mut self, pane_id: PaneId) {
-        let Some(edit) = self.preview_edits.get(&pane_id) else {
-            return;
-        };
-        let anchor = edit.buffer.anchor().unwrap_or(edit.buffer.cursor());
-        let head = edit.buffer.cursor();
-        self.preview_selections.insert(
-            pane_id,
-            PreviewSelection {
-                anchor: edit.buffer.line_byte_col(anchor),
-                head: edit.buffer.line_byte_col(head),
-            },
-        );
+        if let Some(edit) = self.preview_edits.get(&pane_id) {
+            preview::sync_selection_copy(&mut self.preview_selections, pane_id, edit);
+        }
     }
 
     fn sync_editor_selection_from_preview(&mut self, pane_id: PaneId) {
@@ -16092,61 +16084,20 @@ impl TakoApp {
                 self.preview_edits.insert(pane_id, new_edit);
             }
         }
-        let edit = self
+        // ヒットへ飛ぶのと選択の写しを揃えるのは 1 実装（#1701。検索欄の Enter もここを通る）
+        let jump = preview::search_jump(
+            &mut self.preview_edits,
+            &mut self.preview_selections,
+            pane_id,
+            query,
+            options,
+            direction,
+        )?;
+        if self
             .preview_edits
-            .get_mut(&pane_id)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
-        // #1653: 全文を探すのはクエリか条件が変わったときと、本文が変わった後だけ。
-        // 次へ / 前へは数えたヒットを使い回す（修正前は移動のたびに全文を探し直していた）
-        let conditions_changed = query.is_some() || edit.search_options != options;
-        if let Some(q) = query {
-            edit.search_query = q;
-        }
-        edit.search_options = options;
-        if conditions_changed {
-            edit.refresh_search_hits();
-        } else {
-            edit.ensure_search_hits();
-        }
-        match direction.unwrap_or("next") {
-            "prev" => {
-                if let Some(hit) =
-                    tako_core::text_edit::prev_hit(&edit.search_hits, edit.buffer.cursor()).cloned()
-                {
-                    edit.buffer.set_cursor(hit.start, false);
-                    edit.search_index = edit
-                        .search_hits
-                        .iter()
-                        .position(|h| h.start == hit.start)
-                        .unwrap_or(0);
-                }
-            }
-            _ => {
-                let from = if edit.search_hits.is_empty() {
-                    0
-                } else {
-                    edit.buffer.cursor()
-                        + edit.buffer.text()[edit.buffer.cursor()..]
-                            .chars()
-                            .next()
-                            .map(char::len_utf8)
-                            .unwrap_or(0)
-                };
-                if let Some(hit) = tako_core::text_edit::next_hit(&edit.search_hits, from).cloned()
-                {
-                    edit.buffer.set_cursor(hit.start, false);
-                    edit.search_index = edit
-                        .search_hits
-                        .iter()
-                        .position(|h| h.start == hit.start)
-                        .unwrap_or(0);
-                }
-            }
-        }
-        let total = edit.search_hits.len();
-        let index = if total > 0 { edit.search_index + 1 } else { 0 };
-        let query = edit.search_query.clone();
-        if edit.search_visible {
+            .get(&pane_id)
+            .is_some_and(|edit| edit.search_visible)
+        {
             // #1873: 開いた検索欄の上で探した = 打鍵（`update_search_hits`）と同じく表示を組む
             // （ヒットはエディタの行の上に描く。カーソルの追従もこの中で効く）
             self.refresh_preview_from_editor(pane_id);
@@ -16155,9 +16106,9 @@ impl TakoApp {
             self.follow_preview_cursor(pane_id);
         }
         let mut out = serde_json::json!({
-            "query": query,
-            "total": total,
-            "index": index,
+            "query": jump.query,
+            "total": jump.total,
+            "index": jump.index,
         });
         if let Some(viewport) = self.preview_viewport_json(pane_id) {
             out["viewport"] = viewport;

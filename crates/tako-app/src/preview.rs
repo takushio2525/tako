@@ -744,6 +744,80 @@ impl EditState {
         }
     }
 
+    /// 検索でヒットへ飛ぶ（#1653 / #1701）。カーソルだけを動かし、本文は変えない。
+    ///
+    /// `query` を渡せばクエリを差し替える。全文を探すのはクエリか条件が変わったときと、
+    /// 本文が変わった後だけで、次へ / 前へは数えたヒットを使い回す（修正前は移動のたびに
+    /// 全文を探し直していた = #1653）。`direction` は `"prev"` で前、それ以外（省略を含む）は
+    /// 次で、どちらも端からラップする。選択の写しを揃えるのは呼び手（[`search_jump`]）
+    pub fn jump_to_search_hit(
+        &mut self,
+        query: Option<String>,
+        options: SearchOptions,
+        direction: Option<&str>,
+    ) -> SearchJump {
+        let conditions_changed = query.is_some() || self.search_options != options;
+        if let Some(q) = query {
+            self.search_query = q;
+        }
+        self.search_options = options;
+        if conditions_changed {
+            self.refresh_search_hits();
+        } else {
+            self.ensure_search_hits();
+        }
+        let cursor = self.buffer.cursor();
+        let hit = match direction.unwrap_or("next") {
+            "prev" => tako_core::text_edit::prev_hit(&self.search_hits, cursor),
+            _ => {
+                // 今いるヒットの上で「次へ」なら次のヒットへ進む（1 文字先から探す）
+                let from = if self.search_hits.is_empty() {
+                    0
+                } else {
+                    cursor
+                        + self.buffer.text()[cursor..]
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(0)
+                };
+                tako_core::text_edit::next_hit(&self.search_hits, from)
+            }
+        }
+        .cloned();
+        if let Some(hit) = hit {
+            self.buffer.set_cursor(hit.start, false);
+            self.search_index = self
+                .search_hits
+                .iter()
+                .position(|h| h.start == hit.start)
+                .unwrap_or(0);
+        }
+        let total = self.search_hits.len();
+        SearchJump {
+            query: self.search_query.clone(),
+            total,
+            index: if total > 0 { self.search_index + 1 } else { 0 },
+        }
+    }
+
+    /// 選択の写し（`TakoApp::preview_selections`。選択のハイライトと打鍵の起点）に置く値（#1701）。
+    /// 編集バッファの選択（無ければカーソルの 1 点）を行・桁へ写したもの。
+    ///
+    /// 表示がエディタの行でなければ `None`（描画した Markdown の行・桁は原文の行・桁と違うので
+    /// 写さない = `restore_rendered_preview` が選択を持ち越さないのと同じ線引き）
+    pub(crate) fn selection_copy(&self) -> Option<crate::PreviewSelection> {
+        if !self.shows_editor_lines() {
+            return None;
+        }
+        let head = self.buffer.cursor();
+        let anchor = self.buffer.anchor().unwrap_or(head);
+        Some(crate::PreviewSelection {
+            anchor: self.buffer.line_byte_col(anchor),
+            head: self.buffer.line_byte_col(head),
+        })
+    }
+
     /// #973: このセッションを自動保存の保留へ入れるべきか（保留の重複は呼び出し側が見る）。
     ///
     /// **「編集した人がフラグを立てる」形をやめ、状態から必要性を導く**ための判定。
@@ -777,6 +851,67 @@ where
         .filter(|(pane, edit)| edit.autosave_due() && !pending.contains(pane))
         .map(|(pane, _)| *pane)
         .collect()
+}
+
+/// 検索でヒットへ飛んだ結果（#1701。`PreviewSearch` の応答の `query` / `total` / `index`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchJump {
+    pub query: String,
+    pub total: usize,
+    /// 今のヒットの番号（1 始まり。ヒットが無ければ 0）
+    pub index: usize,
+}
+
+/// 選択の写しを編集バッファの選択へ揃える（#1701）。**カーソルを動かした経路はすべてここを通す**
+/// （本文を組み直す `refresh_preview_from_editor` も、組み直さずにカーソルだけを動かす
+/// 検索のヒットへの移動・定義ジャンプの着地・全選択も）。表示がエディタの行でなければ触らない
+pub(crate) fn sync_selection_copy<K>(
+    selections: &mut std::collections::HashMap<K, crate::PreviewSelection>,
+    pane: K,
+    edit: &EditState,
+) where
+    K: Eq + std::hash::Hash,
+{
+    if let Some(selection) = edit.selection_copy() {
+        selections.insert(pane, selection);
+    }
+}
+
+/// 検索でヒットへ飛ぶ（#1701）。GUI の検索欄の Enter / ⇧Enter と CLI / MCP の `PreviewSearch` の
+/// 1 実装（どちらも `TakoApp::preview_search_local` からここへ来る）。
+///
+/// **飛んだ後の選択の写しもここで揃える**。修正前は写しを揃えるのが本文の組み直し
+/// （検索欄を開いているときだけ通る）の中だけだったので、検索欄を開かない CLI / MCP の検索では
+/// キャレットはヒットへ動くのに選択のハイライトが前の場所に残り、次の打鍵の起点
+/// （打鍵は写しからバッファの選択を組み直す）も前の場所のままだった
+pub(crate) fn search_jump<K>(
+    edits: &mut std::collections::HashMap<K, EditState>,
+    selections: &mut std::collections::HashMap<K, crate::PreviewSelection>,
+    pane: K,
+    query: Option<String>,
+    options: SearchOptions,
+    direction: Option<&str>,
+) -> Result<SearchJump, String>
+where
+    K: Copy + Eq + std::hash::Hash,
+{
+    let edit = edits
+        .get_mut(&pane)
+        .ok_or_else(|| "プレビューペインではない".to_string())?;
+    let jump = edit.jump_to_search_hit(query, options, direction);
+    if !search_selection_legacy() {
+        sync_selection_copy(selections, pane, edit);
+    }
+    Ok(jump)
+}
+
+/// `TAKO_1701_LEGACY=1` で **#1701 前の検索**（ヒットへ飛んでも選択の写しを揃えない）へ戻す
+/// （同一バイナリで A/B を取る入口。検索欄を開いていれば描き直しの経路が揃えるのは修正前と同じ）
+fn search_selection_legacy() -> bool {
+    matches!(
+        std::env::var("TAKO_1701_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
 }
 
 /// 編集中も既存の syntect ハイライト基盤を再利用して、読み取り時と同じ色分けで表示する。
@@ -5223,6 +5358,178 @@ mod tests {
         let mut rs = EditState::open(&load(&rs, PreviewMode::Code)).unwrap();
         rs.editing = false;
         assert!(!rs.search_close_resumes_rendered());
+    }
+
+    // --- #1701: 検索で飛んだあとの選択の写し -------------------------------------
+
+    /// 編集セッション 1 つと、それの選択の写しを 1 ペイン分だけ並べる
+    /// （`TakoApp` の `preview_edits` / `preview_selections` と同じ形）
+    fn search_scene(
+        edit: EditState,
+    ) -> (
+        std::collections::HashMap<u64, EditState>,
+        std::collections::HashMap<u64, crate::PreviewSelection>,
+    ) {
+        let mut selections = std::collections::HashMap::new();
+        sync_selection_copy(&mut selections, 1, &edit);
+        (std::collections::HashMap::from([(1, edit)]), selections)
+    }
+
+    fn copy_of(selections: &std::collections::HashMap<u64, crate::PreviewSelection>) -> Sel {
+        selections.get(&1).map(|s| (s.anchor, s.head))
+    }
+
+    type Sel = Option<((usize, usize), (usize, usize))>;
+
+    /// CLI / MCP の `PreviewSearch`（検索欄は開かない）で飛んだあと、選択の写しがヒットへ揃う。
+    /// 修正前（A/B の旧腕 `TAKO_1701_LEGACY=1`）は写しが前の選択のまま残り、ここが落ちる
+    #[test]
+    fn issue1701_検索で飛んだあとの選択の写しはヒットと一致する() {
+        let dir = tako_core::test_residue::ScratchDir::new("search-selection-1701");
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "alpha beta\ngamma delta\nfoo bar foo\n").unwrap();
+        let mut edit = EditState::open(&load(&path, PreviewMode::Code)).unwrap();
+        // 1 行目の "alpha beta" を選んだ状態（写しも揃っている = ハイライトが出ている）
+        edit.buffer.set_selection(0, 10);
+        let (mut edits, mut selections) = search_scene(edit);
+        assert_eq!(copy_of(&selections), Some(((0, 0), (0, 10))));
+
+        let jump = search_jump(
+            &mut edits,
+            &mut selections,
+            1,
+            Some("foo".into()),
+            SearchOptions::DEFAULT,
+            None,
+        )
+        .unwrap();
+        assert_eq!((jump.query.as_str(), jump.total, jump.index), ("foo", 2, 1));
+        let buffer = &edits[&1].buffer;
+        assert_eq!(
+            buffer.line_byte_col(buffer.cursor()),
+            (2, 0),
+            "最初のヒット"
+        );
+        assert_eq!(buffer.anchor(), None, "飛ぶと選択は外れる");
+        assert_eq!(
+            copy_of(&selections),
+            Some(((2, 0), (2, 0))),
+            "写しもヒットへ揃う（前の選択 = 1 行目のハイライトを残さない）"
+        );
+        // 打鍵は写しからバッファの選択を組み直す（`sync_editor_selection_from_preview`）ので、
+        // 組み直した位置もヒットに一致する（= 次の打鍵が前の場所から始まらない）
+        let head = selections[&1].head;
+        assert_eq!(
+            buffer.offset_for_line_byte_col(head.0, head.1),
+            buffer.cursor()
+        );
+
+        // 次へ / 前へ（クエリ省略 = 今の検索の続き）も同じ口で揃う
+        let jump = search_jump(
+            &mut edits,
+            &mut selections,
+            1,
+            None,
+            SearchOptions::DEFAULT,
+            Some("next"),
+        )
+        .unwrap();
+        assert_eq!((jump.total, jump.index), (2, 2));
+        assert_eq!(copy_of(&selections), Some(((2, 8), (2, 8))));
+        let jump = search_jump(
+            &mut edits,
+            &mut selections,
+            1,
+            None,
+            SearchOptions::DEFAULT,
+            Some("prev"),
+        )
+        .unwrap();
+        assert_eq!((jump.total, jump.index), (2, 1));
+        assert_eq!(copy_of(&selections), Some(((2, 0), (2, 0))));
+    }
+
+    /// ヒットが無ければカーソルも写しも動かない（選択も残る）。プレビューでなければ断る
+    #[test]
+    fn issue1701_ヒットが無い検索は選択を動かさない() {
+        let dir = tako_core::test_residue::ScratchDir::new("search-selection-1701");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "alpha beta\n").unwrap();
+        let mut edit = EditState::open(&load(&path, PreviewMode::Code)).unwrap();
+        edit.buffer.set_selection(6, 10);
+        let (mut edits, mut selections) = search_scene(edit);
+        let jump = search_jump(
+            &mut edits,
+            &mut selections,
+            1,
+            Some("zzz".into()),
+            SearchOptions::DEFAULT,
+            None,
+        )
+        .unwrap();
+        assert_eq!((jump.total, jump.index), (0, 0));
+        assert_eq!(
+            (edits[&1].buffer.anchor(), edits[&1].buffer.cursor()),
+            (Some(6), 10)
+        );
+        assert_eq!(copy_of(&selections), Some(((0, 6), (0, 10))));
+
+        let missing = search_jump(
+            &mut edits,
+            &mut selections,
+            2,
+            Some("alpha".into()),
+            SearchOptions::DEFAULT,
+            None,
+        );
+        assert_eq!(missing, Err("プレビューペインではない".to_string()));
+    }
+
+    /// 閲覧中（編集していない）のコード表示でも写しは揃う。描画中の Markdown は
+    /// 写しが描画の行・桁なので書き換えない（`restore_rendered_preview` と同じ線引き）
+    #[test]
+    fn issue1701_閲覧中のコードは揃え描画中のmarkdownは書き換えない() {
+        let dir = tako_core::test_residue::ScratchDir::new("search-selection-1701");
+        let rs = dir.join("main.rs");
+        std::fs::write(&rs, "fn main() {}\nfn needle() {}\n").unwrap();
+        let mut code = EditState::open(&load(&rs, PreviewMode::Code)).unwrap();
+        code.editing = false;
+        let (mut edits, mut selections) = search_scene(code);
+        search_jump(
+            &mut edits,
+            &mut selections,
+            1,
+            Some("needle".into()),
+            SearchOptions::DEFAULT,
+            None,
+        )
+        .unwrap();
+        assert_eq!(copy_of(&selections), Some(((1, 3), (1, 3))));
+
+        let md = dir.join("note.md");
+        std::fs::write(&md, "# T\n\nneedle\n").unwrap();
+        let mut rendered = EditState::open(&load(&md, PreviewMode::Markdown)).unwrap();
+        rendered.editing = false;
+        assert!(!rendered.shows_editor_lines());
+        let mut edits = std::collections::HashMap::from([(1, rendered)]);
+        // 描画のブロックの行・桁で選んでいる（エディタの行・桁ではない）
+        let mut selections = std::collections::HashMap::from([(
+            1,
+            crate::PreviewSelection {
+                anchor: (0, 0),
+                head: (0, 1),
+            },
+        )]);
+        search_jump(
+            &mut edits,
+            &mut selections,
+            1,
+            Some("needle".into()),
+            SearchOptions::DEFAULT,
+            None,
+        )
+        .unwrap();
+        assert_eq!(copy_of(&selections), Some(((0, 0), (0, 1))));
     }
 
     /// 編集中の目次は本文の版が同じあいだ作り直さない（打鍵ごとに全文を解かない）
