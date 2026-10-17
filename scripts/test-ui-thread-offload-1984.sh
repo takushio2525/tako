@@ -288,7 +288,7 @@ sleep 6
 took="$(timed 10 python3 "$TMP/mcp.py" tako_remote_agents '{}')"
 out="$(cat "$TMP/timed.out")"
 echo "    スマホの一覧: ${took} 秒 / $(printf '%s' "$out" | head -c 120)"
-if ui_ok "$took" && printf '%s' "$out" | grep -q "claude agents --json の実行に失敗"; then
+if ui_ok "$took" && grep -q "claude agents --json の実行に失敗" <<<"$out"; then
   pass "E2 スマホの一覧が理由つきで即座に断る"
 else
   fail "E2 スマホの一覧が即座に断らない（${took}）"
@@ -296,7 +296,7 @@ fi
 took="$(timed 10 "$TAKO_BIN" orchestrator spawn --project k1984 --prompt "hi" --pane "$P1")"
 out="$(cat "$TMP/timed.out")"
 echo "    spawn: ${took} 秒 / $(printf '%s' "$out" | head -1 | head -c 160)"
-if ui_ok "$took" && printf '%s' "$out" | grep -q "claude"; then
+if ui_ok "$took" && grep -q "claude" <<<"$out"; then
   pass "E2 spawn が CLI の不在を理由つきで即座に断る（ペインを作らない）"
 else
   fail "E2 spawn が即座に断らない（${took}）"

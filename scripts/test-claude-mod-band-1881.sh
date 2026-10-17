@@ -277,12 +277,12 @@ phase_static() {
   local cfg="$TMP/ccfg" out
   mkdir -p "$cfg"
   out="$(CLAUDE_CONFIG_DIR="$cfg" claude plugin validate "$REPO_ROOT/crates/tako-core/claude-mod" 2>&1)"
-  if printf '%s' "$out" | grep -q 'Validation passed'; then pass "claude plugin validate"; else fail "claude plugin validate"; printf '%s\n' "$out" | mask | tail -20; fi
+  if grep -q 'Validation passed' <<<"$out"; then pass "claude plugin validate"; else fail "claude plugin validate"; printf '%s\n' "$out" | mask | tail -20; fi
   check_eq "帯・ペイン・/tako の登録がある（validate の申告）" "true" \
-    "$(printf '%s' "$out" | grep -q 'ui.render{component=AbovePrompt}, ui.render{component=Pane, requestId=tako}, command.run{command=tako}' && echo true || echo false)"
-  if printf '%s' "$out" | grep -q 'gating hook without .catch'; then fail "ゲートになるフックに .catch の無いものがある"; else pass "ゲートになるフックはすべて .catch 付き"; fi
+    "$(grep -q 'ui.render{component=AbovePrompt}, ui.render{component=Pane, requestId=tako}, command.run{command=tako}' <<<"$out" && echo true || echo false)"
+  if grep -q 'gating hook without .catch' <<<"$out"; then fail "ゲートになるフックに .catch の無いものがある"; else pass "ゲートになるフックはすべて .catch 付き"; fi
   out="$(CLAUDE_CONFIG_DIR="$cfg" claude plugin test "$REPO_ROOT/crates/tako-core/claude-mod" 2>&1)"
-  if printf '%s' "$out" | grep -q ' 0 fail'; then pass "claude plugin test（$(printf '%s' "$out" | grep -E '^ *[0-9]+ pass' | tr -d ' ')）"; else fail "claude plugin test"; printf '%s\n' "$out" | mask | tail -30; fi
+  if grep -q ' 0 fail' <<<"$out"; then pass "claude plugin test（$(printf '%s' "$out" | grep -E '^ *[0-9]+ pass' | tr -d ' ')）"; else fail "claude plugin test"; printf '%s\n' "$out" | mask | tail -30; fi
   local dirty
   # 未追跡のファイル（型定義 `.claude-plugin/types/` など）を残さない（テストのソースは除く）
   dirty="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- crates/tako-core/claude-mod | grep '^??' | grep -v '/tests/[^/]*\.test\.ts$' | head -1)"

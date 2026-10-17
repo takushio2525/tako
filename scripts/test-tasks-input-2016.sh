@@ -114,7 +114,7 @@ ok = len(lines) == 3 \
   and re.match(r"  返答 \d\d:\d\d \[cli\] answered: $", lines[2])
 print(1 if ok else "")')"
 check "$ORDER" "tako todo show: やりとりが古い順に「返答 時刻 [経路] 判断: 本文」で並ぶ"
-check "$(printf '%s\n' "$SHOW" | grep -qx '      2 回目の 2 行目' && echo 1)" \
+check "$(grep -qx '      2 回目の 2 行目' <<<"$SHOW" && echo 1)" \
   "tako todo show: 複数行の本文の 2 行目以降が字下げで続く"
 
 JSON="$(iso_tako todo show "$ID" --json)"

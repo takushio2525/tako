@@ -31,8 +31,8 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 ok() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 ng() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 assert_eq() { if [ "$2" = "$3" ]; then ok "$1"; else ng "$1 (expected=[$2], actual=[$3])"; fi; }
-assert_contains() { if printf '%s' "$2" | grep -qF -- "$3"; then ok "$1"; else ng "$1 (not found: '$3')"; fi; }
-assert_not_contains() { if printf '%s' "$2" | grep -qF -- "$3"; then ng "$1 (found but should not: '$3')"; else ok "$1"; fi; }
+assert_contains() { if grep -qF -- "$3" <<<"$2"; then ok "$1"; else ng "$1 (not found: '$3')"; fi; }
+assert_not_contains() { if grep -qF -- "$3" <<<"$2"; then ng "$1 (found but should not: '$3')"; else ok "$1"; fi; }
 
 # 計測スクリプトの列は本物から取る（列を足したら自動で追従する）
 HEADER="$(sed -n 's/^HEADER="\(.*\)"$/\1/p' "$REPO_ROOT/scripts/measure-footprint-2011.sh")"

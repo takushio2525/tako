@@ -262,7 +262,7 @@ if has_stage edge; then
   fi
   out=$("$TAKO_BIN" todo expand "u-2086-none" 2>&1)
   rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "見つからない"; then
+  if [ "$rc" -ne 0 ] && grep -q "見つからない" <<<"$out"; then
     pass "無い id の展開は理由つきで失敗する（rc=${rc}）"
   else
     fail "無い id の展開が失敗にならない（rc=${rc}: ${out}）"

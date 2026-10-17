@@ -39,7 +39,7 @@ assert_eq() {
 
 assert_contains() {
   local desc="$1" haystack="$2" needle="$3"
-  if echo "$haystack" | grep -qF -- "$needle"; then
+  if grep -qF -- "$needle" <<<"$haystack"; then
     echo "  PASS: $desc"
     PASS=$((PASS + 1))
   else

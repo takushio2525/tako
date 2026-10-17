@@ -484,7 +484,7 @@ phase_claude() {
   wait_for 90 is_eq self_f "$p" ctx_source mod || true
   local screen_text
   screen_text="$("$TAKO_BIN" read --pane "$p" 2>/dev/null | jf text)"
-  check_eq "2. 画面に ctx の表記が無い（statusLine なし）" "false" "$(printf '%s' "$screen_text" | grep -q -E 'ctx +[0-9]+%|[0-9]+% context' && echo true || echo false)"
+  check_eq "2. 画面に ctx の表記が無い（statusLine なし）" "false" "$(grep -q -E 'ctx +[0-9]+%|[0-9]+% context' <<<"$screen_text" && echo true || echo false)"
   check_eq "1/2. self: ctx_source=mod" "mod" "$(self_f "$p" ctx_source)"
   echo "    （self: ctx $(self_f "$p" ctx_percent)% / 窓 $(self_f "$p" ctx_window) / model $(self_f "$p" ctx_model) / classic_events $(self_f "$p" mod_turn.classic_events) / effort $(self_f "$p" mod_turn.effort)）"
   check_eq "1. worker_status: ctx_source=mod" "mod" "$(status_f "$p" ctx_source)"

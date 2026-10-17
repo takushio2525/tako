@@ -405,7 +405,7 @@ if [ -z "$LEGACY" ]; then
   wait "$E4B"; rb=$?
   staged="$(g diff --cached --name-only | tr '\n' ' ')"
   echo "    stage e: ${ra} / stage f: ${rb} / ステージ済み: ${staged}"
-  if [ "$ra" = "0" ] && [ "$rb" = "0" ] && printf '%s' "$staged" | grep -q "e.txt" && printf '%s' "$staged" | grep -q "f.txt"; then
+  if [ "$ra" = "0" ] && [ "$rb" = "0" ] && grep -q "e.txt" <<<"$staged" && grep -q "f.txt" <<<"$staged"; then
     pass "E4 並べた 2 本はどちらも通る（index.lock を取り合わない = 修正前の UI スレッドの直列と同じ）"
   else
     fail "E4 並べた stage の片方が落ちた: $(head -c 160 "$TMP/e4a.out") / $(head -c 160 "$TMP/e4b.out")"
@@ -460,7 +460,7 @@ else
     sleep 1
     line="$(grep -a "tmux cleanup: 起動時" "$TMP/data/persist.log" 2>/dev/null | tail -1)"
     echo "    起動時の一括回収: ${line:-（記録なし = 対象ゼロ）}"
-    if printf '%s' "$line" | grep -q "other_tako_running"; then
+    if grep -q "other_tako_running" <<<"$line"; then
       echo "  未実測: 起動時の一括回収の注入 A/B（他の tako-app が生きている機では Startup の回収は見送り = 器まで届かない）"
     fi
   fi

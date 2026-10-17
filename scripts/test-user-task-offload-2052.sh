@@ -202,7 +202,7 @@ measure_cli() {
     t0=$(now)
     out=$("$TAKO_BIN" todo done "u-2052-none" 2>&1)
     rc=$?
-    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "見つからない"; then
+    if [ "$rc" -ne 0 ] && grep -q "見つからない" <<<"$out"; then
       pass "[$arm] 無い id の完了は理由つきで失敗する（rc=${rc}・$(ms_since "$t0") ms）"
     else
       fail "[$arm] 無い id の完了が失敗にならない（rc=$rc: ${out}）"

@@ -119,9 +119,9 @@ if want direct; then
   run_arm legacy direct
   line="$(failed_line)"
   # 旧挙動は ①・②b・⑤・⑥b で落ち、②a / ③ / ④ / ⑥a は通る（落ちた段の一覧に「②a」「③」「④」「⑥a」が無い）
-  if [ "$RC" != 0 ] && printf '%s' "$line" | grep -q '①' && printf '%s' "$line" | grep -q '②b' \
-    && printf '%s' "$line" | grep -q '⑤' && printf '%s' "$line" | grep -q '⑥b' \
-    && ! printf '%s' "$line" | grep -q -e '②a' -e '③' -e '④' -e '⑥a'; then
+  if [ "$RC" != 0 ] && grep -q '①' <<<"$line" && grep -q '②b' <<<"$line" \
+    && grep -q '⑤' <<<"$line" && grep -q '⑥b' <<<"$line" \
+    && ! grep -q -e '②a' -e '③' -e '④' -e '⑥a' <<<"$line"; then
     pass "直接ペイン: 旧挙動 #2025（TAKO_2025_LEGACY=1）は ①・②b・⑤・⑥b だけで落ちる = A/B の検出力"
   else
     fail "直接ペイン: 旧挙動 #2025 の落ち方が想定と違う（rc=${RC}・${line:-FAILED 行なし}）"
@@ -129,8 +129,8 @@ if want direct; then
   run_arm legacy2153 direct
   line="$(failed_line)"
   # 下へ送る側だけ旧 = ⑤ と ⑥b だけで落ち、上端（①②）・③④・⑥a は通る
-  if [ "$RC" != 0 ] && printf '%s' "$line" | grep -q '⑤' && printf '%s' "$line" | grep -q '⑥b' \
-    && ! printf '%s' "$line" | grep -q -e '①' -e '②' -e '③' -e '④' -e '⑥a'; then
+  if [ "$RC" != 0 ] && grep -q '⑤' <<<"$line" && grep -q '⑥b' <<<"$line" \
+    && ! grep -q -e '①' -e '②' -e '③' -e '④' -e '⑥a' <<<"$line"; then
     pass "直接ペイン: 旧挙動 #2153（TAKO_2153_LEGACY=1）は ⑤・⑥b だけで落ちる = A/B の検出力"
   else
     fail "直接ペイン: 旧挙動 #2153 の落ち方が想定と違う（rc=${RC}・${line:-FAILED 行なし}）"

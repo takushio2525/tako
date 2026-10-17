@@ -151,7 +151,7 @@ history_count() {
   local name="$1" needle="$2" s text
   for s in $(tmux -L "$TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
     text="$(tmux -L "$TMUX_SOCKET" capture-pane -p -t "$s" -S -300 2>/dev/null)"
-    if printf '%s\n' "$text" | grep -q "fake agent (#2181 $name)"; then
+    if grep -q "fake agent (#2181 $name)" <<<"$text"; then
       printf '%s\n' "$text" | grep -c -e "$needle" || true
       return
     fi

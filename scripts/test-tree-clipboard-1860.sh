@@ -381,7 +381,7 @@ chmod 000 "$E/bad/secret.txt"
 BAD_ERR="$("$TAKO_BIN" file copy "$E/bad" "$E/out" 2>&1)"
 BAD_RC=$?
 echo "  観測: $(printf '%s' "$BAD_ERR" | sed "s#${TMP}#<TMP>#g")"
-if [ "$BAD_RC" -ne 0 ] && printf '%s' "$BAD_ERR" | grep -q '読めない'; then
+if [ "$BAD_RC" -ne 0 ] && grep -q '読めない' <<<"$BAD_ERR"; then
   pass "読めないファイルを含むフォルダは理由つきで断る"
 else
   fail "読めないファイルの断り方が想定と違う（rc=${BAD_RC}）"
@@ -395,7 +395,7 @@ rm -f "$E/gone.txt"
 GONE_ERR="$("$TAKO_BIN" file paste "$E/out" 2>&1)"
 GONE_RC=$?
 echo "  観測: $(printf '%s' "$GONE_ERR" | sed "s#${TMP}#<TMP>#g")"
-if [ "$GONE_RC" -ne 0 ] && printf '%s' "$GONE_ERR" | grep -q '見つからない'; then
+if [ "$GONE_RC" -ne 0 ] && grep -q '見つからない' <<<"$GONE_ERR"; then
   pass "切り取ったあと元を外で消したら理由つきで断る"
 else
   fail "外で消したときの断り方が想定と違う（rc=${GONE_RC}）"
@@ -416,7 +416,7 @@ if hdiutil create -size 4m -fs HFS+ -volname tako1860 "$DMG" -quiet >/dev/null 2
   XDEV_ERR="$("$TAKO_BIN" file paste "$MNT" 2>&1)"
   XDEV_RC=$?
   echo "  観測: $(printf '%s' "$XDEV_ERR" | sed "s#${TMP}#<TMP>#g")"
-  if [ "$XDEV_RC" -ne 0 ] && printf '%s' "$XDEV_ERR" | grep -q '別のボリューム' \
+  if [ "$XDEV_RC" -ne 0 ] && grep -q '別のボリューム' <<<"$XDEV_ERR" \
     && [ -f "$E/vol.txt" ] && [ ! -e "$MNT/vol.txt" ]; then
     pass "別のボリュームへの切り取りの貼り付けは理由つきで断り、元は残る"
   else

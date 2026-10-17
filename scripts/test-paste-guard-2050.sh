@@ -273,7 +273,7 @@ phase_send() {
   printf '%s\n%s\n' "$err" "$out" > "$TMP/send-out${legacy}.txt"
   if [ -z "$legacy" ]; then
     check "$([ "$got" = 1 ] && echo 1)" "CLI: 止めずにペインへ届く"
-    check "$(printf '%s' "$err" | grep -q '\[paste-guard\] verdict=warn github_token ghp_…qrst' && echo 1)" \
+    check "$(grep -q '\[paste-guard\] verdict=warn github_token ghp_…qrst' <<<"$err" && echo 1)" \
       "CLI: 標準エラーに伏せ字の警告 1 行（$(printf '%s' "$err" | grep paste-guard | head -1)）"
     check "$([ "$got_b" = 1 ] && echo 1)" "MCP: 止めずにペインへ届く"
     check_eq "MCP: 応答に paste_guard（warn・anthropic_api_key・伏せ字）" "warn anthropic_api_key sk-ant-…ABCD" \
@@ -282,7 +282,7 @@ phase_send() {
     check "$([ "$(tk paste-guard | jq '.routes.send.warned')" -ge 2 ] && echo 1)" "経路の累計 routes.send.warned が進む"
   else
     check "$([ "$got" = 1 ] && [ "$got_b" = 1 ] && echo 1)" "旧挙動: 届く"
-    check "$(printf '%s' "$err" | grep -q 'paste-guard' || echo 1)" "旧挙動: CLI に警告が出ない（素通し）"
+    check "$(grep -q 'paste-guard' <<<"$err" || echo 1)" "旧挙動: CLI に警告が出ない（素通し）"
     check_eq "旧挙動: MCP の応答に paste_guard が無い" "null" "$(printf '%s' "$out" | jq -r '.paste_guard')"
   fi
 }

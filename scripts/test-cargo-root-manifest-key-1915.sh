@@ -66,7 +66,7 @@ bump_package_version() {
 
 echo "== 指紋の形と決定性（本物の Cargo.toml）"
 base=$(bash "$KEY" "$ROOT/Cargo.toml")
-if printf '%s' "$base" | grep -Eq '^[0-9a-f]{8}$'; then ok "8 桁の 16 進（${base}）"; else ng "8 桁の 16 進ではない（'${base}'）"; fi
+if grep -Eq '^[0-9a-f]{8}$' <<<"$base"; then ok "8 桁の 16 進（${base}）"; else ng "8 桁の 16 進ではない（'${base}'）"; fi
 same "同じ入力から同じ指紋" "$base" "$(bash "$KEY" "$ROOT/Cargo.toml")"
 same "引数を省くとカレントの Cargo.toml" "$base" "$(cd "$ROOT" && bash "$KEY")"
 

@@ -455,8 +455,8 @@ elif [ -z "$SKILLS_ENTRY" ]; then
   echo "  skills-dir: 不合格（skills/tako に置いた写しが plugin list に tako@skills-dir として出ない ="
   echo "    tako setup で入れた mod が効かない。置き場の仕様が変わった可能性。設計書 §9.4）"
   show_tail "$WORK/skills.out" 10
-elif ! printf '%s' "$SKILLS_ENTRY" | grep -q '"enabled":true' \
-  || printf '%s' "$SKILLS_ENTRY" | grep -q '"errors"'; then
+elif ! grep -q '"enabled":true' <<<"$SKILLS_ENTRY" \
+  || grep -q '"errors"' <<<"$SKILLS_ENTRY"; then
   SKILLS_DIR="fail"
   FAILED="${FAILED:+${FAILED}・}skills-dir（読み込みに失敗）"
   echo "  skills-dir: 不合格（tako@skills-dir は見えるが enabled ではないか errors がある）"
