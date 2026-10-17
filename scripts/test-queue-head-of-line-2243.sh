@@ -258,7 +258,7 @@ grep -q "— 同時数の上限（実行 1 / 上限 1）" "$TMP/wrapper-B3.err" 
   || fail "B3 の表示: $(cat "$TMP/wrapper-B3.err")"
 wait "$PR" "$PA" "$PB"
 order="$(start_order)"
-[ "$order" = "R3 A3 B3" ] && pass "R3 が終われば先頭の A3 が先（開始の順 = $order）" || fail "開始の順 = $order"
+[ "$order" = "R3 A3 B3" ] && pass "R3 が終われば先頭の A3 が先（開始の順 = ${order}）" || fail "開始の順 = $order"
 
 echo "== ④ メモリ圧 warn（同時 3 件）=="
 q limits --max-jobs 3 >/dev/null
@@ -293,7 +293,7 @@ for i in 1 2 3 4; do
   wait "$P"
 done
 order="$(start_order)"
-[ "$order" = "R5 O1 O2 O3 O4" ] && pass "上限までの 4 件は A5 を追い越して走った（$order）" || fail "開始の順 = $order"
+[ "$order" = "R5 O1 O2 O3 O4" ] && pass "上限までの 4 件は A5 を追い越して走った（${order}）" || fail "開始の順 = $order"
 over="$(waiting_field "$PA" overtaken)"
 [ "$over" = 4 ] && pass "A5 の overtaken = 4（上限）" || fail "A5 の overtaken = $over"
 : > "$TMP/wrapper-O5.err"
@@ -312,7 +312,7 @@ q limits --max-jobs 1 >/dev/null
 q cancel "$PR" >/dev/null
 wait "$PR" "$PA" "$P5" 2>/dev/null
 order="$(start_order)"
-[ "$order" = "R5 O1 O2 O3 O4 A5 O5" ] && pass "持ち主が終われば先頭の A5 が O5 より先に入る（$order）" || fail "開始の順 = $order"
+[ "$order" = "R5 O1 O2 O3 O4 A5 O5" ] && pass "持ち主が終われば先頭の A5 が O5 より先に入る（${order}）" || fail "開始の順 = $order"
 q limits --max-jobs 3 >/dev/null
 
 echo "== 人が読む表示（同時 1 件で R・A・B を並べた status）=="
