@@ -13,8 +13,7 @@
 //!
 //! ## 割り当ての条件（設計書 §4.3）
 //!
-//! 並びは「優先度の高い順 → 受付の古い順」で、**先頭が入れなければ後ろも待つ**（追い越し無し）。
-//! 先頭について上から順に見る:
+//! 並びは「優先度の高い順 → 受付の古い順」で、並びの先頭から 1 件ずつ上から順に見る:
 //!
 //! 1. 同じ target dir の処理が走っている（停滞中も含む = cargo のロックを持っている）→ 待つ
 //! 2. メモリ圧 critical → 待つ（走っているものは止めない）
@@ -25,6 +24,20 @@
 //! 6. 空き − （走り出したばかりの処理がまだ使っていない見込み）− 見込み < 予約 → 待つ
 //!
 //! 機の値が採れない（Windows は #2000 まで）ときは 2・4・6 を飛ばし、同時数だけで決める。
+//!
+//! ## 追い越し（#2243）
+//!
+//! 2〜6（枠・メモリ）で入れない件があれば**そこで止まり、後ろも待つ**（資源の追い越しは無し）。
+//! 1（target dir）だけで入れない件は、その dir が空くまでどのみち走れないので**後ろに追い越させる**
+//! （以前は先頭が target dir 待ちのあいだ、別の target dir の後ろの処理まで空き枠の前で待っていた）:
+//!
+//! - 追い越す側は自分で 1〜6 をすべて通る（今回入れた分も実行中に数える）
+//! - 追い越された件と同じ target dir の後ろの件は追い越さない（同じ dir の中の順番は保つ）
+//! - 1 件の待ちを追い越せるのは累計 [`max_overtaken`]（同時数の [`OVERTAKE_ROUNDS`] 巡ぶん）まで。
+//!   達したらその件で止まる（= 以前と同じく後ろも待つ）
+//!
+//! 先頭は飢えない: その dir が空いた時点で、先頭は入るか 2〜6 で止まる（= 後ろはもう追い越せない）ので、
+//! 空いた後に先頭より先に入る処理は無い。追い越しで走り出した処理は、先頭が走れない間の空き枠を使うだけ。
 
 use std::path::{Path, PathBuf};
 
@@ -493,6 +506,16 @@ pub struct WaitingJob {
     pub target_dir: Option<String>,
     pub priority: Priority,
     pub enqueued_at_ms: u64,
+    /// これまでに追い越された件数（#2243。調停役がメモリに持つ = 立て直すと 0 から）
+    pub overtaken: u32,
+}
+
+/// 1 件の待ちを追い越せる累計 = 同時数の何巡ぶんか（#2243）
+pub const OVERTAKE_ROUNDS: u32 = 2;
+
+/// 1 件の待ちを追い越せる累計の上限（同時数 × [`OVERTAKE_ROUNDS`]。36 GB の機の既定で 6 件）
+pub fn max_overtaken(limits: &Limits) -> u32 {
+    limits.max_jobs.max(1).saturating_mul(OVERTAKE_ROUNDS)
 }
 
 /// 先頭が待つ理由
@@ -522,6 +545,10 @@ pub enum WaitReason {
     },
     /// 自分より前に並んでいる処理の後
     Ahead,
+    /// target dir 待ちの処理が追い越しの上限に達した（その処理が入るまで後ろも待つ。#2243）
+    OvertakeLimit {
+        max: u32,
+    },
 }
 
 fn gb(mb: u64) -> String {
@@ -539,6 +566,7 @@ impl WaitReason {
             Self::MaxJobs { .. } => "max_jobs",
             Self::Memory { .. } => "memory",
             Self::Ahead => "ahead",
+            Self::OvertakeLimit { .. } => "overtake_limit",
         }
     }
 
@@ -579,6 +607,9 @@ impl WaitReason {
                 gb(*reserve_mb)
             ),
             Self::Ahead => "前に並んでいる処理の後".into(),
+            Self::OvertakeLimit { max } => format!(
+                "同じ target dir を待つ処理が追い越しの上限（{max} 件）に達した（その処理が入るまで後ろも待つ）"
+            ),
         }
     }
 }
@@ -595,6 +626,9 @@ pub struct AdmitInput<'a> {
     pub unmanaged: u32,
     /// 調停役の立ち上げ直後（登録し直しを待つ間は誰も入れない）
     pub regathering: bool,
+    /// target dir 待ちの件を後ろに追い越させる（#2243。`false` = 修正前の「先頭が入れなければ
+    /// 後ろも待つ」。調停役は env `TAKO_2243_LEGACY=1` のときだけ `false` にする）
+    pub overtake: bool,
 }
 
 /// [`admit`] の結果
@@ -602,10 +636,33 @@ pub struct AdmitInput<'a> {
 pub struct Admission {
     /// 今回入れる受付番号（並びの順）
     pub grants: Vec<u64>,
-    /// 入れなかった先頭が待つ理由（全員入れたら `None`）
+    /// 入れなかった先頭（並びの最初の、入れなかった件）が待つ理由（全員入れたら `None`）
     pub blocked: Option<WaitReason>,
     /// 待ちの並び（受付番号。入れた分も含む）
     pub order: Vec<u64>,
+    /// 入れなかった件それぞれが待つ理由（並びの順）。調べた件は自分の理由、並びが止まって
+    /// 調べなかった件は [`WaitReason::Ahead`]
+    pub reasons: Vec<(u64, WaitReason)>,
+    /// 並びを止めた理由（[`WaitReason::Ahead`] の件はこれを待っている）。止まらずに最後まで
+    /// 見たら `None`
+    pub stopped: Option<WaitReason>,
+    /// 今回追い越された件と、その回数（受付番号 → 今回その件を追い越して入った件数）
+    pub overtaken: Vec<(u64, u32)>,
+}
+
+impl Admission {
+    /// 入れなかった件が待つ理由（入れた件・並びに居ない件は `None`）
+    pub fn reason_of(&self, id: u64) -> Option<&WaitReason> {
+        self.reasons.iter().find(|(i, _)| *i == id).map(|(_, r)| r)
+    }
+
+    /// その件を実際に止めているもの: 自分の理由。並びが止まって調べなかった件は並びを止めた理由
+    pub fn holding_of(&self, id: u64) -> Option<&WaitReason> {
+        match self.reason_of(id)? {
+            WaitReason::Ahead => self.stopped.as_ref().or(self.blocked.as_ref()),
+            own => Some(own),
+        }
+    }
 }
 
 /// 待ちを並べる: 優先度の高い順 → 受付の古い順 → 受付番号
@@ -683,7 +740,9 @@ fn check(
     Ok(())
 }
 
-/// 割り当て（純関数。設計書 §4.3）。先頭から入れられるだけ入れ、入れられない先頭で止まる
+/// 割り当て（純関数。設計書 §4.3 と #2243）。並びの先頭から入れられるだけ入れる。
+/// 枠・メモリで入れない件で止まり、target dir だけで入れない件は後ろに追い越させる
+/// （条件と上限はモジュールの説明の「追い越し」）
 pub fn admit(input: &AdmitInput<'_>) -> Admission {
     let order = order_waiting(input.waiting);
     let ids: Vec<u64> = order.iter().map(|w| w.id).collect();
@@ -694,39 +753,86 @@ pub fn admit(input: &AdmitInput<'_>) -> Admission {
         };
     }
     if input.regathering {
+        let reasons = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let r = if i == 0 {
+                    WaitReason::Regather
+                } else {
+                    WaitReason::Ahead
+                };
+                (*id, r)
+            })
+            .collect();
         return Admission {
-            grants: Vec::new(),
             blocked: Some(WaitReason::Regather),
+            stopped: Some(WaitReason::Regather),
             order: ids,
+            reasons,
+            ..Admission::default()
         };
     }
+    let max_over = max_overtaken(&input.limits);
     let mut running: Vec<RunningJob> = input.running.to_vec();
     let mut grants = Vec::new();
-    for head in order {
-        match check(head, &running, input) {
+    let mut reasons: Vec<(u64, WaitReason)> = Vec::new();
+    let mut blocked = None;
+    let mut stopped = None;
+    // 追い越させている件（target dir だけで入れない件）と、今回その件を追い越して入った件数
+    let mut passed: Vec<(&WaitingJob, u32)> = Vec::new();
+    for (i, job) in order.iter().enumerate() {
+        // 前の件が追い越しの上限に達していたら、ここで止める（後ろはその件が入るまで待つ）
+        if passed
+            .iter()
+            .any(|(p, n)| p.overtaken.saturating_add(*n) >= max_over)
+        {
+            reasons.extend(order[i..].iter().map(|w| (w.id, WaitReason::Ahead)));
+            stopped = Some(WaitReason::OvertakeLimit { max: max_over });
+            break;
+        }
+        // 追い越された件と同じ target dir の件は、その dir を持つ実行中が居るので 1 で待つ
+        // （= 同じ dir の中の順番は保たれる）
+        let reason = match check(job, &running, input) {
             Ok(()) => {
-                grants.push(head.id);
+                grants.push(job.id);
+                for (_, n) in passed.iter_mut() {
+                    *n += 1;
+                }
                 running.push(RunningJob {
-                    id: head.id,
-                    estimate_mb: head.estimate_mb,
+                    id: job.id,
+                    estimate_mb: job.estimate_mb,
                     used_mb: None,
-                    target_dir: head.target_dir.clone(),
+                    target_dir: job.target_dir.clone(),
                     stalled: false,
                 });
+                continue;
             }
-            Err(reason) => {
-                return Admission {
-                    grants,
-                    blocked: Some(reason),
-                    order: ids,
-                };
-            }
+            Err(reason) => reason,
+        };
+        blocked.get_or_insert_with(|| reason.clone());
+        reasons.push((job.id, reason.clone()));
+        if input.overtake && reason == WaitReason::TargetDir {
+            passed.push((job, 0));
+            continue;
         }
+        // 枠・メモリで入れない（または修正前の形）: 後ろも待つ
+        reasons.extend(order[i + 1..].iter().map(|w| (w.id, WaitReason::Ahead)));
+        stopped = Some(reason);
+        break;
     }
+    let overtaken = passed
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(p, n)| (p.id, *n))
+        .collect();
     Admission {
         grants,
-        blocked: None,
+        blocked,
         order: ids,
+        reasons,
+        stopped,
+        overtaken,
     }
 }
 
@@ -808,6 +914,7 @@ mod tests {
             target_dir: None,
             priority: Priority::Normal,
             enqueued_at_ms: at,
+            overtaken: 0,
         }
     }
 
@@ -825,6 +932,7 @@ mod tests {
             waiting,
             unmanaged,
             regathering: false,
+            overtake: true,
         }
     }
 
@@ -1158,29 +1266,28 @@ mod tests {
         ));
     }
 
+    fn run_in(id: u64, dir: &str) -> RunningJob {
+        RunningJob {
+            target_dir: Some(dir.into()),
+            ..run(id)
+        }
+    }
+
+    fn wait_in(id: u64, at: u64, dir: &str) -> WaitingJob {
+        WaitingJob {
+            target_dir: Some(dir.into()),
+            ..wait(id, at)
+        }
+    }
+
     #[test]
-    fn 同じtarget_dirは1件ずつで追い越さない() {
+    fn 同じtarget_dirは1件ずつ() {
         let l = limits(4);
         let m = Some(machine(30, Pressure::Normal));
-        let busy = [RunningJob {
-            target_dir: Some("/r/target".into()),
-            ..run(1)
-        }];
-        let ws = [
-            WaitingJob {
-                target_dir: Some("/r/target".into()),
-                ..wait(10, 1)
-            },
-            WaitingJob {
-                target_dir: Some("/other/target".into()),
-                ..wait(11, 2)
-            },
-        ];
+        let busy = [run_in(1, "/r/target")];
+        let ws = [wait_in(10, 1, "/r/target")];
         let a = admit(&input(m, l, &busy, &ws, 0));
-        assert!(
-            a.grants.is_empty(),
-            "先頭が待てば後ろも待つ（追い越し無し）"
-        );
+        assert!(a.grants.is_empty());
         assert_eq!(a.blocked, Some(WaitReason::TargetDir));
         // 停滞中でもロックを持っているので同じ dir は入れない
         let stalled = [RunningJob {
@@ -1192,19 +1299,203 @@ mod tests {
             Some(WaitReason::TargetDir)
         );
         // 同じ回に入れた 2 件が同じ dir なら 2 件目は待つ
-        let both = [
-            WaitingJob {
-                target_dir: Some("/r/target".into()),
-                ..wait(10, 1)
-            },
-            WaitingJob {
-                target_dir: Some("/r/target".into()),
-                ..wait(11, 2)
-            },
-        ];
+        let both = [wait_in(10, 1, "/r/target"), wait_in(11, 2, "/r/target")];
         let a = admit(&input(m, l, &[], &both, 0));
         assert_eq!(a.grants, vec![10]);
         assert_eq!(a.blocked, Some(WaitReason::TargetDir));
+        assert_eq!(a.reason_of(11), Some(&WaitReason::TargetDir));
+    }
+
+    #[test]
+    fn issue2243_target_dir待ちの先頭は別のdirの後ろに追い越させる() {
+        let l = limits(4);
+        let m = Some(machine(30, Pressure::Normal));
+        let busy = [run_in(1, "/r/target")];
+        let ws = [wait_in(10, 1, "/r/target"), wait_in(11, 2, "/other/target")];
+        let a = admit(&input(m, l, &busy, &ws, 0));
+        assert_eq!(a.grants, vec![11], "空き枠へ別の dir の後ろが入る");
+        assert_eq!(
+            a.blocked,
+            Some(WaitReason::TargetDir),
+            "先頭の理由は変わらない"
+        );
+        assert_eq!(a.reason_of(10), Some(&WaitReason::TargetDir));
+        assert_eq!(a.stopped, None, "並びは止まっていない");
+        assert_eq!(a.overtaken, vec![(10, 1)], "先頭は 1 回追い越された");
+        // 修正前（TAKO_2243_LEGACY=1）: 先頭が待てば後ろも待つ
+        let mut legacy = input(m, l, &busy, &ws, 0);
+        legacy.overtake = false;
+        let a = admit(&legacy);
+        assert!(a.grants.is_empty(), "{a:?}");
+        assert_eq!(a.reason_of(11), Some(&WaitReason::Ahead));
+        assert_eq!(a.holding_of(11), Some(&WaitReason::TargetDir));
+        assert!(a.overtaken.is_empty());
+        // target dir を持たない処理（cargo の外）も追い越せる
+        let ws = [wait_in(10, 1, "/r/target"), wait(11, 2)];
+        assert_eq!(admit(&input(m, l, &busy, &ws, 0)).grants, vec![11]);
+        // 持ち主が停滞中（枠を返している）でも dir は空かないので追い越させる。追い越す側は最低限の前進で入る
+        let stalled = [RunningJob {
+            stalled: true,
+            ..busy[0].clone()
+        }];
+        let ws = [wait_in(10, 1, "/r/target"), wait_in(11, 2, "/other/target")];
+        let m_tight = Some(machine(1, Pressure::Normal));
+        assert_eq!(admit(&input(m_tight, l, &stalled, &ws, 5)).grants, vec![11]);
+    }
+
+    #[test]
+    fn issue2243_同じtarget_dirが3本並んでも順番は保つ() {
+        let l = limits(4);
+        let m = Some(machine(30, Pressure::Normal));
+        let busy = [run_in(1, "/r/target")];
+        let ws = [
+            wait_in(10, 1, "/r/target"),
+            wait_in(11, 2, "/r/target"),
+            wait_in(12, 3, "/other/target"),
+            wait_in(13, 4, "/r/target"),
+        ];
+        let a = admit(&input(m, l, &busy, &ws, 0));
+        assert_eq!(a.grants, vec![12]);
+        for id in [10, 11, 13] {
+            assert_eq!(a.reason_of(id), Some(&WaitReason::TargetDir), "{id}");
+        }
+        assert_eq!(
+            a.overtaken,
+            vec![(10, 1), (11, 1)],
+            "後ろの 13 は追い越されていない"
+        );
+        // 持ち主が終わると、同じ dir の中で一番前の 10 だけが入る（11・13 は 10 の後ろ）
+        let ws = [
+            wait_in(10, 1, "/r/target"),
+            wait_in(11, 2, "/r/target"),
+            wait_in(13, 4, "/r/target"),
+        ];
+        let a = admit(&input(m, l, &[run(12)], &ws, 0));
+        assert_eq!(a.grants, vec![10]);
+        assert_eq!(a.reason_of(11), Some(&WaitReason::TargetDir));
+        assert_eq!(a.reason_of(13), Some(&WaitReason::TargetDir));
+    }
+
+    #[test]
+    fn issue2243_枠とメモリでは追い越さない() {
+        let m = Some(machine(30, Pressure::Normal));
+        let busy = [run_in(1, "/r/target")];
+        let ws = [
+            wait_in(10, 1, "/r/target"),
+            wait_in(11, 2, "/a/target"),
+            wait_in(12, 3, "/b/target"),
+            wait(13, 4),
+        ];
+        // 同時 2 件: 11 が空き枠へ入り、12 は枠で止まる → 13 は 12 の後ろ（資源の追い越しは無し）
+        let a = admit(&input(m, limits(2), &busy, &ws, 0));
+        assert_eq!(a.grants, vec![11]);
+        assert!(matches!(a.reason_of(12), Some(WaitReason::MaxJobs { .. })));
+        assert_eq!(a.reason_of(13), Some(&WaitReason::Ahead));
+        assert!(matches!(a.stopped, Some(WaitReason::MaxJobs { .. })));
+        assert!(matches!(a.holding_of(13), Some(WaitReason::MaxJobs { .. })));
+        assert_eq!(a.holding_of(10), Some(&WaitReason::TargetDir));
+        // 枠が全部埋まっている: 誰も入れず、後ろの理由は枠
+        let a = admit(&input(m, limits(1), &busy, &ws, 0));
+        assert!(a.grants.is_empty());
+        assert!(matches!(a.reason_of(11), Some(WaitReason::MaxJobs { .. })));
+        // メモリ圧 warn（実行中が居る）/ critical: 追い越す側も止まる
+        for (p, want) in [
+            (Pressure::Warn, WaitReason::PressureWarn),
+            (Pressure::Critical, WaitReason::PressureCritical),
+        ] {
+            let a = admit(&input(Some(machine(30, p)), limits(4), &busy, &ws, 0));
+            assert!(a.grants.is_empty(), "{p:?}");
+            assert_eq!(a.reason_of(11), Some(&want));
+            assert_eq!(a.stopped, Some(want));
+        }
+        // 空きメモリ不足（空き 6 GB < 見込み 3 + 予約 4）: 追い越す側も自分の見込みで止まる
+        let a = admit(&input(
+            Some(machine(6, Pressure::Normal)),
+            limits(4),
+            &busy,
+            &ws,
+            0,
+        ));
+        assert!(a.grants.is_empty());
+        assert!(matches!(a.reason_of(11), Some(WaitReason::Memory { .. })));
+    }
+
+    #[test]
+    fn issue2243_追い越しの上限に達したら先頭が先に入る() {
+        let l = limits(3);
+        let cap = max_overtaken(&l);
+        assert_eq!(cap, 6, "同時数 3 × 2 巡");
+        let m = Some(machine(30, Pressure::Normal));
+        let busy = [run_in(1, "/r/target")];
+        let head = |overtaken| WaitingJob {
+            overtaken,
+            ..wait_in(10, 1, "/r/target")
+        };
+        // あと 1 回で上限: 11 は入り、12 は 10 の後ろで待つ
+        let ws = [head(cap - 1), wait_in(11, 2, "/a"), wait_in(12, 3, "/b")];
+        let a = admit(&input(m, l, &busy, &ws, 0));
+        assert_eq!(a.grants, vec![11]);
+        assert_eq!(a.reason_of(12), Some(&WaitReason::Ahead));
+        assert_eq!(a.stopped, Some(WaitReason::OvertakeLimit { max: cap }));
+        assert_eq!(
+            a.holding_of(12),
+            Some(&WaitReason::OvertakeLimit { max: cap })
+        );
+        assert_eq!(a.overtaken, vec![(10, 1)]);
+        // 上限に達した後: 枠が空いていても後ろは入らない
+        let ws = [head(cap), wait_in(12, 3, "/b")];
+        let a = admit(&input(m, l, &busy, &ws, 0));
+        assert!(a.grants.is_empty());
+        assert_eq!(a.reason_of(10), Some(&WaitReason::TargetDir));
+        assert_eq!(a.reason_of(12), Some(&WaitReason::Ahead));
+        // dir が空けば先頭が先に入る（同時 1 件でも後ろより先）
+        let a = admit(&input(m, limits(1), &[], &ws, 0));
+        assert_eq!(a.grants, vec![10]);
+        assert!(matches!(a.reason_of(12), Some(WaitReason::MaxJobs { .. })));
+    }
+
+    /// 長く走る処理が dir を持ち続け、別の dir の短い処理が次々に来る流れを回す。
+    /// 上限までは空き枠へ入り、上限の後は誰も入らず、dir が空いたら先頭が最初に入る
+    #[test]
+    fn issue2243_先頭は追い越され続けて飢えない() {
+        let l = limits(3);
+        let cap = max_overtaken(&l);
+        let m = Some(machine(30, Pressure::Normal));
+        let holder = run_in(1, "/r/target");
+        let mut head = wait_in(10, 1, "/r/target");
+        let mut others: Vec<WaitingJob> = Vec::new();
+        let mut running_others: Vec<RunningJob> = Vec::new();
+        let mut granted_others = 0;
+        for step in 0..30u64 {
+            // 走っていた追い越し組は 1 手で終わり、新しい処理が 1 件来る
+            running_others.clear();
+            others.push(wait_in(100 + step, 2 + step, &format!("/o{step}")));
+            let mut running = vec![holder.clone()];
+            running.extend(running_others.iter().cloned());
+            let mut ws = vec![head.clone()];
+            ws.extend(others.iter().cloned());
+            let a = admit(&input(m, l, &running, &ws, 0));
+            for (id, n) in &a.overtaken {
+                assert_eq!(*id, 10);
+                head.overtaken += n;
+            }
+            for id in &a.grants {
+                others.retain(|w| w.id != *id);
+                running_others.push(run(*id));
+                granted_others += 1;
+            }
+            assert!(
+                head.overtaken <= cap,
+                "上限を超えて追い越された: {}",
+                head.overtaken
+            );
+        }
+        assert_eq!(granted_others, cap, "追い越せたのは上限ちょうど");
+        // dir が空いた: 待っていた後ろの処理より先に先頭が入る
+        let mut ws = vec![head.clone()];
+        ws.extend(others.iter().cloned());
+        let a = admit(&input(m, l, &running_others, &ws, 0));
+        assert_eq!(a.grants.first(), Some(&10), "{a:?}");
     }
 
     #[test]
@@ -1236,6 +1527,13 @@ mod tests {
         assert!(a.grants.is_empty());
         assert_eq!(a.blocked, Some(WaitReason::Regather));
         assert_eq!(a.order, vec![10]);
+        let w = [wait(10, 1), wait(11, 2)];
+        let mut i = input(Some(machine(30, Pressure::Normal)), limits(3), &[], &w, 0);
+        i.regathering = true;
+        let a = admit(&i);
+        assert_eq!(a.reason_of(10), Some(&WaitReason::Regather));
+        assert_eq!(a.reason_of(11), Some(&WaitReason::Ahead));
+        assert_eq!(a.holding_of(11), Some(&WaitReason::Regather));
     }
 
     #[test]
@@ -1292,6 +1590,10 @@ mod tests {
             "同時数の上限（実行 3 + tako の外 1 / 上限 3）"
         );
         assert_eq!(WaitReason::Regather.code(), "regather");
+        assert_eq!(
+            WaitReason::OvertakeLimit { max: 6 }.text(),
+            "同じ target dir を待つ処理が追い越しの上限（6 件）に達した（その処理が入るまで後ろも待つ）"
+        );
         assert!(WaitReason::Memory {
             available_mb: 5 * GIB_MB,
             need_mb: 3 * GIB_MB,

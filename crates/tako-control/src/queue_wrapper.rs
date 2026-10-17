@@ -132,7 +132,11 @@ pub fn waiting_line(resp: &Value, waited: Duration) -> String {
         head.push_str(&format!("・tako の外 {}", n("unmanaged")));
     }
     head.push_str(&format!("・{}）", human_secs(waited.as_secs())));
-    let why = if position > 1 {
+    // 前の処理の後ろで待っている（並びが止まっている）ときだけ「前に N 件」。target dir 待ちの先頭を
+    // 追い越せる件（#2243）は 2 番目以降でも自分の理由（枠・メモリ…）で待っているので、それを出す。
+    // 旧い調停役は 2 番目以降を常に ahead で返す
+    let behind = resp["reason"].as_str().is_none_or(|r| r == "ahead");
+    let why = if position > 1 && behind {
         match resp["head_text"].as_str() {
             Some(t) => format!("前に {} 件（先頭: {t}）", position - 1),
             None => format!("前に {} 件", position - 1),
@@ -646,6 +650,22 @@ mod tests {
         });
         assert!(waiting_line(&behind, Duration::from_secs(5))
             .ends_with("— 前に 2 件（先頭: メモリ圧 warn（実行中が終わってから 1 件ずつ））"));
+        // #2243: 先頭が target dir 待ちで、2 番目の自分は空き枠の無さで待っている → 自分の理由を出す
+        // （「先頭: 同じ target dir …」と出すと、追い越せる先頭の後ろで待っているように読める）
+        let own = json!({
+            "position": 2, "waiting": 2, "running": 3, "max_jobs": 3,
+            "reason": "max_jobs", "text": "同時数の上限（実行 3 / 上限 3）",
+            "head_reason": "max_jobs", "head_text": "同時数の上限（実行 3 / 上限 3）",
+        });
+        assert!(waiting_line(&own, Duration::from_secs(5))
+            .ends_with("— 同時数の上限（実行 3 / 上限 3）"));
+        // 追い越しの上限に達した先頭の後ろ
+        let held = json!({
+            "position": 2, "waiting": 2, "running": 1, "max_jobs": 3,
+            "reason": "ahead", "text": "前に並んでいる処理の後",
+            "head_reason": "overtake_limit", "head_text": "上限",
+        });
+        assert!(waiting_line(&held, Duration::from_secs(5)).ends_with("— 前に 1 件（先頭: 上限）"));
     }
 
     #[test]
