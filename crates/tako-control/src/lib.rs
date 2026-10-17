@@ -26,6 +26,11 @@
 // スキーマを 1 リテラルのまま読める形に保つため、上限だけ上げる（実行時コストは無い）
 #![recursion_limit = "512"]
 
+// 出力マクロ（`eprintln!` 等）を std の版から差し替える。**他の `mod` より先に置く**
+// （マクロは宣言より後ろにしか効かない。理由は `tako_core::stdio` の先頭 = #1758 / #1805）
+#[macro_use]
+mod stdio;
+
 pub mod acceptance_gates;
 pub mod agent_mcp;
 pub mod agent_models;

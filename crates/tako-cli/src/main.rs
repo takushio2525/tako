@@ -4513,6 +4513,11 @@ fn main() -> ExitCode {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**。`cli_main` のスレッドより前）。
     // これが無いプロセスは置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
     tako_core::paths::mark_product_process();
+    // #1758 / #1805: 読み手が先に閉じたパイプへの出力で panic しない（標準出力 → 静かに 0 /
+    // 標準エラー → 行を捨てて続ける）。tako-core / tako-control の出力も同じ口を通るので、
+    // CLI の経路で走るライブラリ側の `eprintln!` にも効く（`cli_main` のスレッドより前）
+    tako_core::stdio::stop_quietly_on_closed_stdout();
+    tako_core::stdio::drop_lines_on_closed_stderr();
     // #2151: git の場所の解決（`tako open-in repo` 等が CLI のプロセスで git を起こす）が
     // ログインシェル等を締め切りで打ち切ったら、理由を persist.log へ
     tako_core::bin_resolve::set_notice_sink(tako_control::diag::persist_log);
@@ -4539,7 +4544,7 @@ fn main() -> ExitCode {
         .expect("メインスレッドを起動できない")
         .join();
     // 標準出力の読み手が先に閉じた（`tako … | head -1`）のは失敗ではないので静かに 0（#1758）
-    if matches!(&joined, Err(payload) if payload.is::<stdio::StdoutClosed>()) {
+    if matches!(&joined, Err(payload) if payload.is::<tako_core::stdio::StdoutClosed>()) {
         return ExitCode::SUCCESS;
     }
     joined.expect("メインスレッドが異常終了した")

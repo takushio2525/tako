@@ -810,38 +810,70 @@ psmux は入力送出を持たないので、**tako-app が保持していない
   通ってしまうので、**実 CLI でディスクの中身が変わるところまで**見る（セルフテスト項目 141。
   dispatch を直接叩くと消化する側を検証できない）
 
-## CLI の出力はパイプの切断で panic させない（Issue #1758）
+## CLI の出力はパイプの切断で panic させない（Issue #1758 / #1805）
 
-**tako-cli の `println!` / `print!` / `eprintln!` / `eprint!` は std の版ではなく、
-`crates/tako-cli/src/stdio.rs` の同名マクロを指す。** Rust は SIGPIPE を無視した状態で
-main に入るので、std の版は読み手が先に閉じたパイプへの書き込み（EPIPE）で panic する。
+**tako-core / tako-control / tako-cli の `println!` / `print!` / `eprintln!` / `eprint!` は
+std の版ではなく、各クレートの根の `#[macro_use] mod stdio;` が定義する同名マクロを指し、
+実体はどれも `tako_core::stdio` の 1 実装（`out` / `err`）。** Rust は SIGPIPE を無視した
+状態で main に入るので、std の版は読み手が先に閉じたパイプへの書き込み（EPIPE）で panic する。
 修正前の実測: `tako agent-support --json | head -1` で panic メッセージ 2 つ
 （`failed printing to stdout: Broken pipe` + `メインスレッドが異常終了した`）と終了コード 101。
 93 バイトしか出さない `agent-support --agent claude --status unsupported` でも `| head -0` なら同じ。
 Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind::BrokenPipe` の Err で返る。
+#1758 は tako-cli の出力だけを直したので、CLI の経路で走るライブラリ側の出力は残っていた
+（#1805 の実測: stderr の読み手が閉じていると `tako task gate check` が
+`acceptance_gates.rs` の `[gate check] command:` で panic し、終了コード 101・結果は stdout へ
+1 バイトも出ない。同じ panic で `tako mcp serve` も `tools/call tako_task_gate_check` に
+応答せず 101 で落ちていた）。
 
 - **標準出力の切断 → そこで打ち切って終了コード 0**（ripgrep と同じ）。`resume_unwind` で
   巻き戻すので panic メッセージは出ず、`Drop` は panic のときと同じく走る。`main` が印
-  （`stdio::StdoutClosed`）を見て 0 を返す
+  （`tako_core::stdio::StdoutClosed`）を見て 0 を返す
 - **標準エラーの切断 → その行を捨てて続ける**。打ち切ると `error: …` の後の 1 が 0 に化ける
 - それ以外の書き込みエラー（書き先のディスクが一杯 等）は std と同じく panic
+- **規則はプロセスの入口が採ったときだけ効く**: `tako` の main は両方
+  （`stop_quietly_on_closed_stdout` / `drop_lines_on_closed_stderr`）、`tako-mcp` は標準エラーだけ
+  （ブリッジの stdout はプロトコルの通り道で、書き込みの失敗はブリッジ自身が `Result` で扱う）。
+  **GUI（tako-app）とテストのビルドは採らないので std の版と同じ**（GUI のプロセスで走る
+  ライブラリの出力は 1 バイトも変わらない・テストハーネスの出力の捕捉もそのまま効く）
 - **SIGPIPE を既定へ戻す案は採らない**: Windows に効かない / 同じバイナリの
   `tako remote serve`（起動情報を読んだ親が stdio のパイプを捨てる daemon）が 1 行の出力で
-  プロセスごと死ぬ / `tako mcp serve` の終わり方が「エラー終了」から「シグナル死」へ変わる
+  プロセスごと死ぬ / `tako mcp serve` の終わり方が「シグナル死」になる
+
+### `tako mcp serve` の終わり方（#1805 で決めた）
+
+stdin の EOF → 0 / **クライアントが stdout の読み手を先に閉じた → 静かに 0**（痕跡は
+persist.log へ `mcp serve: クライアントが stdout を閉じたので終わる` の 1 行。中身は書かない）/
+それ以外の失敗 → `error: …` を出して 1。#1805 の前は読み手が閉じると
+`error: stdout への書き込みに失敗: Broken pipe (os error 32)` を出して 1 だった。
+クライアントの切断は tako の失敗ではないので、stdin の EOF と同じ扱いにそろえた。
+
+クライアント側に影響が無い根拠（2026-10-18 の実測。接続の閉じ方を記録する偽 MCP サーバで）:
+claude 2.1.301 のヘルスチェック（`claude mcp get`）は `tools/list` の直後に **SIGINT**、
+codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッションの終わりに **stdin を先に
+閉じる**（stdout はまだ書ける = 修正前後とも EOF の経路で 0）。どのクライアントも
+「生きたまま stdout だけを閉じて終了コードを読む」閉じ方をしない。この経路に入るのは
+クライアントが落ちた / 殺されたとき（stdin と stdout が同時に閉じる）で、そのときは
+終了コードを読む親がもう居ない。
 
 ### 書くときの決まり
 
-- `std::println!` と綴って差し替えを迂回しない。`#[macro_use] mod stdio;` は `main.rs` の
-  **最初の `mod` 宣言**に置く（マクロは宣言より後ろにしか効かず、順を崩すと前にある
-  `mod setup;` が黙って std の版へ戻る）。番犬は `crates/tako-cli/tests/issue1758_broken_pipe.rs`
-  の `出力マクロの宣言が他のmodより先にある`
-- `tako-main` 以外のスレッドから出力するなら、その join 側でも `StdoutClosed` を見る
+- `std::println!` / `std::eprintln!` と綴って差し替えを迂回しない（実体の `tako_core::stdio`
+  だけが例外）。`#[macro_use] mod stdio;` は `tako-cli/src/main.rs`・`tako-cli/src/lib.rs`・
+  `tako-control/src/lib.rs`・`tako-core/src/lib.rs` の**最初の `mod` 宣言**に置く（マクロは
+  宣言より後ろにしか効かず、順を崩すと前にあるモジュールが黙って std の版へ戻る）。
+  `src/bin/` の実行ファイルの根は lib の差し替えが届かない別のクレートなので、素の出力マクロを
+  使わない（`tako-mcp` は `writeln!` で書いて失敗を捨てる）。番犬は
+  `crates/tako-cli/tests/issue1758_broken_pipe.rs` の `出力マクロの宣言が他のmodより先にある` と
+  `crates/tako-cli/tests/issue1805_lib_stdio.rs` の `ライブラリ側でstdの出力マクロを名指さない`
+  （どちらも `file:line` で名指す。tako-app と `tako-lsp-fake` は対象外）
+- 入口のスレッド（`tako-main`）以外から標準出力へ出すなら、その join 側でも `StdoutClosed` を見る
   （見ずに `expect` するとそこで panic メッセージが出る）
-- `stdout()` を自分で握って書く経路（`mcp serve` の `writeln!`）は従来どおり `Result` で返す。
-  `mcp serve` の終わり方（stdin の EOF → 0 / 読み手が先に閉じる → `error: stdout への書き込みに失敗` で 1）は変えていない
-- 単体テストのビルドでは std の経路へ流す（テストハーネスの出力の捕捉は std の `print!` にしか
-  効かない）。切断の扱いは実バイナリを起こす同じ統合テストが、**子を起こす前に読み手を
-  閉じたパイプ**（最初の書き込みで必ず EPIPE）と、パイプの容量を超える出力の 1 行読みで見る
+- `stdout()` を自分で握って書く経路（`mcp serve` の `writeln!`）は従来どおり `Result` で返し、
+  `BrokenPipe` だけを切断として扱う（`mcp_bridge::Stop`）
+- 切断の扱いは実バイナリを起こす統合テスト（`issue1758_broken_pipe.rs` / `issue1805_lib_stdio.rs`）が、
+  **子を起こす前に読み手を閉じたパイプ**（最初の書き込みで必ず EPIPE）と、パイプの容量を超える
+  出力の 1 行読みで見る
 
 ## 外部コマンドを待つときは上限を持つ（Issue #1503）
 

@@ -134,26 +134,36 @@ fn 標準エラーも閉じていても_終了コードはそのまま() {
 }
 
 /// 差し替えのマクロは宣言より後ろにしか効かない。`mod stdio;` が他の `mod` より
-/// 後ろへ動くと、それより前に宣言したモジュール（`setup.rs`）は黙って std の版へ戻る
+/// 後ろへ動くと、それより前に宣言したモジュール（`setup.rs`）は黙って std の版へ戻る。
+///
+/// #1805 で CLI の経路で走るライブラリ側（tako-core / tako-control）と tako-cli の lib
+/// （MCP ブリッジ・IPC クライアント）の根にも同じ差し替えを置いたので、4 つの根を同じ規則で見る
 #[test]
 fn 出力マクロの宣言が他のmodより先にある() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs");
-    let src = std::fs::read_to_string(path).expect("src/main.rs を読めない");
-    let lines: Vec<&str> = src.lines().collect();
-    let first = lines
-        .iter()
-        .position(|l| l.starts_with("mod "))
-        .expect("src/main.rs に mod 宣言が無い");
-    assert_eq!(
-        lines[first],
-        "mod stdio;",
-        "src/main.rs:{} が最初の mod 宣言。`#[macro_use] mod stdio;` を先頭へ戻す",
-        first + 1
-    );
-    assert_eq!(
-        lines.get(first.wrapping_sub(1)).copied(),
-        Some("#[macro_use]"),
-        "src/main.rs:{} の `mod stdio;` に `#[macro_use]` が無い（マクロが外へ出ない）",
-        first + 1
-    );
+    let crates = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    for root in [
+        "tako-cli/src/main.rs",
+        "tako-cli/src/lib.rs",
+        "tako-control/src/lib.rs",
+        "tako-core/src/lib.rs",
+    ] {
+        let src = std::fs::read_to_string(format!("{crates}/{root}"))
+            .unwrap_or_else(|e| panic!("crates/{root} を読めない: {e}"));
+        let lines: Vec<&str> = src.lines().collect();
+        let first = lines
+            .iter()
+            .position(|l| l.starts_with("mod ") || l.starts_with("pub mod "))
+            .unwrap_or_else(|| panic!("crates/{root} に mod 宣言が無い"));
+        assert!(
+            matches!(lines[first], "mod stdio;" | "pub mod stdio;"),
+            "crates/{root}:{} が最初の mod 宣言。`#[macro_use] mod stdio;` を先頭へ戻す",
+            first + 1
+        );
+        assert_eq!(
+            lines.get(first.wrapping_sub(1)).copied(),
+            Some("#[macro_use]"),
+            "crates/{root}:{} の `mod stdio;` に `#[macro_use]` が無い（マクロが外へ出ない）",
+            first + 1
+        );
+    }
 }

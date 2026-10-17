@@ -3,6 +3,11 @@
 //! Workspace / Tab / PaneTree / Pane / TerminalSession / Theme / Screen を提供する。
 //! GPUI への依存はここに置かない（GPUI 破壊的変更リスクの防波堤。`.agent/architecture.md`）。
 
+// 出力マクロ（`eprintln!` 等）を std の版から差し替える。**他の `mod` より先に置く**
+// （マクロは宣言より後ろにしか効かない。理由は `stdio.rs` の先頭 = #1758 / #1805）
+#[macro_use]
+pub mod stdio;
+
 pub mod acceptance_gate;
 pub mod agent_resume;
 pub mod agent_support;
