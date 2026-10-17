@@ -529,3 +529,35 @@ jobs:
       # これでは「直したら次が出る」を 1 PR 1 往復でしか進められない
       - name: テスト（#1278 で blocking 化。全数を採るため --no-fail-fast）
         run: cargo test --workspace --no-fail-fast
+
+  # THIRD-PARTY-LICENSES.md（両 OS の配布物に同梱するライセンス本文。#1709 / #1845）が、今の
+  # Cargo.lock から作り直した物と一致するか（#1851）。依存を足し引き・更新して作り直しを忘れると
+  # 配布物の表記が実態とずれる（着手時点の main では LSP の依存 4 クレートが載っていなかった）。
+  #   - ubuntu で 1 回だけ: cargo-about は about.toml の targets（aarch64-apple-darwin /
+  #     x86_64-pc-windows-msvc）で依存グラフを絞るので、走らせる OS に依らず両 OS ぶんが出る。
+  #     macOS / Windows のジョブに足すと最長の列がその分だけ伸びる
+  #   - キャッシュは持たない: Actions のキャッシュは既に約 11.8 GB（2026-10-18 実測）あり、増やすと
+  #     macOS / Windows のビルドキャッシュが追い出されやすくなる。依存のソースは毎回 cargo fetch で取る
+  #   - cargo-about は配布バイナリを install-action で入れる（sha256 を照合。数秒）。cargo install は
+  #     毎回数分のコンパイルになる。版はスクリプトの CARGO_ABOUT_VERSION と揃える（違えば落ちる）
+  #   - docs だけの変更では依存も一覧も変わらないので、macOS / Windows と同じく判定で skip する
+  licenses:
+    name: ライセンス一覧が依存と一致（#1851）
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      # 検査の診断（載っていない / 余分なクレートの名指し・作り直しのコマンド・CRLF の揃え・
+      # 版違い）のモックテスト。偽の cargo とテンポラリの偽リポジトリだけで数秒
+      - name: ライセンス一覧の検査のモックテスト（#1851）
+        run: bash scripts/test-third-party-licenses-1851.sh
+      - name: THIRD-PARTY-LICENSES.md が今の依存と一致する（#1851）
+        run: bash scripts/third-party-licenses.sh --check

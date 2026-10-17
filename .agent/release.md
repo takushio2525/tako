@@ -58,7 +58,24 @@ GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、�
   までを行い、**Release へは添付しない**。ログの「zip の tako/ の中身」「インストール先の中身」が
   生成物の一覧になる
 - `THIRD-PARTY-LICENSES.md` の中身は `cargo about`（`about.toml` / `about.hbs`）で生成する。
-  依存が変わったときの再生成は手動（自動化は未着手）
+  **作り直しは `bash scripts/third-party-licenses.sh` の 1 本**。依存を足し引き・更新した PR では
+  一緒に作り直してコミットする
+- **鮮度の検査（#1851）**: CI の `licenses` ジョブ（ubuntu・docs だけの変更では skip）が `--check` で
+  今の Cargo.lock から作り直した物と突き合わせ、ずれていれば載っていない / 余分なクレートと
+  作り直しのコマンドを出して落ちる（着手時点の main では LSP の依存 4 クレートが抜けていた）
+  - ubuntu 1 本で足りるのは、cargo-about が `about.toml` の `targets`（aarch64-apple-darwin /
+    x86_64-pc-windows-msvc）で依存グラフを絞り、走らせる OS に依らず両 OS ぶんを出すため
+    （macOS で作り直した物が ubuntu の検査で一致する）
+  - cargo-about は install-action の配布バイナリ（sha256 を照合。`cargo install` は毎回数分の
+    コンパイル）。キャッシュは持たない（Actions のキャッシュの容量を増やさない）。版は
+    スクリプトの `CARGO_ABOUT_VERSION` と ci.yml の `tool: cargo-about@<版>` の 2 か所で、
+    違えばスクリプトが入れ直しのコマンドを出して落ちる
+  - **罠**: オンラインの cargo-about は LICENSE を同梱しないクレートの本文を上流の git から
+    取りに行くので、上流の変更で出力が揺れうる。スクリプトは先に `cargo fetch --locked` で
+    ソースを揃え、`--frozen` で走らせる（2026-10-18 の実測ではオンラインの出力と改行コード以外は同一）。
+    クレートが同梱する LICENSE の CRLF（lebe ほか）は git が eol=lf で揃えるので、スクリプトが
+    LF へ揃えてから書く（揃えないと作業ツリーとインデックスで改行が食い違う）
+  - 診断のモックテストは `bash scripts/test-third-party-licenses-1851.sh`（同じジョブで先に走る）
 
 ## 配布物に個人情報を入れない（#1848）
 

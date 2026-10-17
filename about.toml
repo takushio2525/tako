@@ -1,6 +1,6 @@
 # cargo-about の設定（Issue #1709）。配布バイナリへ静的リンクされる依存の
-# ライセンス本文と著作権表示を THIRD-PARTY-LICENSES.html へ書き出す。
-# 再生成: cargo about generate --fail about.hbs -o THIRD-PARTY-LICENSES.html
+# ライセンス本文と著作権表示を THIRD-PARTY-LICENSES.md へ書き出す（書式は about.hbs）。
+# 再生成: bash scripts/third-party-licenses.sh（CI が --check で依存とのずれを落とす。#1851）
 #
 # accepted は「選べるときに優先するライセンス」の順。どれも GPL-3.0-or-later の
 # 配布物へ取り込めるもの（FSF の互換ライセンス一覧で確認した）だけを並べる。
