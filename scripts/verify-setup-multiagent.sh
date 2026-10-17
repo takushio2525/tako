@@ -55,6 +55,19 @@ make_login_shell() {
     chmod +x "$path"
 }
 
+# 対話起動の検出（#2285）: スタブは setup が使う**非対話の問い合わせ**（版・認証・MCP 登録）に
+# 即答し、答えなかった呼び出し（引数なしの `claude`・プロンプトつきの起動など）だけを対話起動として
+# argv ごと $HOME/unexpected-agent-launch へ残す。#1959 で setup が `claude --version`（mod の版の
+# 下限の判定）を呼ぶようになったのに答えておらず、版の問い合わせを対話起動と数えていた
+assert_no_agent_launch() {
+    home=$1
+    message=$2
+    [ -e "$home/unexpected-agent-launch" ] || return 0
+    printf '[FAILED] %s。スタブが答えなかった呼び出し:\n' "$message" >&2
+    sed 's/^/    /' "$home/unexpected-agent-launch" >&2
+    exit 1
+}
+
 make_claude() {
     path=$1
     mkdir -p "$(dirname -- "$path")"
@@ -62,6 +75,11 @@ make_claude() {
         '#!/bin/sh' \
         'state=pro' \
         'if [ -f "$HOME/claude-state" ]; then IFS= read -r state <"$HOME/claude-state"; fi' \
+        '# 版の問い合わせ（#1959 の mod の版の下限の判定）。本物と同じ形で下限 2.1.294 以上を返す' \
+        'if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then' \
+        '  printf '\''2.1.301 (Claude Code)\n'\''' \
+        '  exit 0' \
+        'fi' \
         'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then' \
         '  case "$state" in' \
         '    pro|max|free) printf '\''{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"%s"}\n'\'' "$state"; exit 0 ;;' \
@@ -73,7 +91,7 @@ make_claude() {
         '  printf '\''tako\n'\''' \
         '  exit 0' \
         'fi' \
-        'printf '\''claude\n'\'' >"$HOME/unexpected-agent-launch"' \
+        'printf '\''claude argv=[%s]\n'\'' "$*" >>"$HOME/unexpected-agent-launch"' \
         'exit 0' >"$path"
     chmod +x "$path"
 }
@@ -83,11 +101,12 @@ make_real_claude_proxy() {
     mkdir -p "$(dirname -- "$path")"
     printf '%s\n' \
         '#!/bin/sh' \
-        'if { [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; } ||' \
+        'if { [ "$#" -eq 1 ] && [ "$1" = "--version" ]; } ||' \
+        '   { [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; } ||' \
         '   { [ "${1:-}" = "mcp" ] && [ "${2:-}" = "list" ]; }; then' \
         '  exec /usr/bin/env HOME="$TAKO_REAL_HOME" PATH="$TAKO_REAL_PATH" "$TAKO_REAL_CLAUDE_BIN" "$@"' \
         'fi' \
-        'printf '\''claude\n'\'' >"$HOME/unexpected-agent-launch"' \
+        'printf '\''claude argv=[%s]\n'\'' "$*" >>"$HOME/unexpected-agent-launch"' \
         'exit 0' >"$path"
     chmod +x "$path"
 }
@@ -100,7 +119,7 @@ make_codex() {
         'if [ "${1:-}" = "login" ] && [ "${2:-}" = "status" ]; then exit 0; fi' \
         '# MCP 登録の照会・追加は #979 で setup の通常経路になった（対話起動ではない）' \
         'if [ "${1:-}" = "mcp" ]; then exit 0; fi' \
-        'printf '\''codex\n'\'' >"$HOME/unexpected-agent-launch"' \
+        'printf '\''codex argv=[%s]\n'\'' "$*" >>"$HOME/unexpected-agent-launch"' \
         'exit 0' >"$path"
     chmod +x "$path"
 }
@@ -113,7 +132,7 @@ make_agy() {
         'if [ "${1:-}" = "models" ]; then exit 0; fi' \
         '# 同上（#979）' \
         'if [ "${1:-}" = "mcp" ]; then exit 0; fi' \
-        'printf '\''agy\n'\'' >"$HOME/unexpected-agent-launch"' \
+        'printf '\''agy argv=[%s]\n'\'' "$*" >>"$HOME/unexpected-agent-launch"' \
         'exit 0' >"$path"
     chmod +x "$path"
 }
@@ -174,6 +193,23 @@ run_real_setup() {
 
 [ -x "$TAKO_BIN" ] || fail "tako CLI が未ビルドです: cargo build -p tako-cli"
 
+# 0. スタブの検出力の自己検査（#2285）: setup が使う非対話の問い合わせは数えず、対話起動
+#    （引数なし・プロンプトつき・フラグだけ）は数える。ここが崩れると下の「対話起動していない」が素通りになる
+STUB_HOME="$TMP/stub-home"
+STUB_BIN="$TMP/stub-bin"
+prepare_home "$STUB_HOME" "$STUB_BIN" pro
+env -i HOME="$STUB_HOME" PATH=/usr/bin:/bin "$STUB_BIN/claude" --version >"$TMP/stub-version.out"
+env -i HOME="$STUB_HOME" PATH=/usr/bin:/bin "$STUB_BIN/claude" auth status --json >/dev/null
+env -i HOME="$STUB_HOME" PATH=/usr/bin:/bin "$STUB_BIN/claude" mcp list >/dev/null
+assert_contains "$TMP/stub-version.out" '^2\.1\.[0-9]+ \(Claude Code\)$' "スタブが版の問い合わせに本物の形で答えない"
+assert_no_agent_launch "$STUB_HOME" "スタブが非対話の問い合わせを対話起動と数えた"
+env -i HOME="$STUB_HOME" PATH=/usr/bin:/bin "$STUB_BIN/claude" </dev/null
+env -i HOME="$STUB_HOME" PATH=/usr/bin:/bin "$STUB_BIN/claude" 'hello' </dev/null
+env -i HOME="$STUB_HOME" PATH=/usr/bin:/bin "$STUB_BIN/claude" --model opus </dev/null
+STUB_LAUNCHES=$(grep -c '^claude argv=' "$STUB_HOME/unexpected-agent-launch" 2>/dev/null || true)
+[ "${STUB_LAUNCHES:-0}" -eq 3 ] || fail "スタブが対話起動を検出しない: expected=3 actual=${STUB_LAUNCHES:-0}"
+printf '[OK] stub=claude non-interactive=3 ignored interactive=3 detected\n'
+
 # 1. 初回: 認証済み Claude Pro 単独。標準入力は /dev/null で、人間のキー入力は 0 回。
 FIRST_HOME="$TMP/first-home"
 FIRST_BIN="$TMP/first-bin"
@@ -190,7 +226,7 @@ assert_contains "$FIRST_CONFIG" '^  selected_agent: claude$' "初回 config の 
 assert_contains "$FIRST_PROFILE" '^master_agent: claude$' "初回 profile の master_agent が claude でない"
 assert_contains "$FIRST_PROFILE" '^effort: high$' "Claude Pro の effort 推奨が high でない"
 assert_contains "$FIRST_HOME/.claude/CLAUDE.md" '^# 開発ルール$' "初回の既定指示が生成されない"
-[ ! -e "$FIRST_HOME/unexpected-agent-launch" ] || fail "標準 setup が対話 agent を起動した"
+assert_no_agent_launch "$FIRST_HOME" "標準 setup が対話 agent を起動した"
 printf '[MEASURE] scenario=first before_keys=5+ after_keys=0 prompts=0 source=detected:claude/pro result=complete\n'
 
 # 2. 2 回目: 入力 0 回、前回値を維持し config.yaml も byte-for-byte 不変。
@@ -202,7 +238,7 @@ assert_contains "$TMP/second.out" '\[previous\] 前回の設定を引き継ぎ�
 assert_contains "$TMP/second.out" '\[previous\] 既存の default プロファイルを維持' "2 回目に profile が維持されない"
 assert_contains "$TMP/second.out" 'セットアップ結果: 変更なし' "2 回目が変更なしにならない"
 [ "$FIRST_SUM" = "$SECOND_SUM" ] || fail "2 回目に config.yaml が不要更新された"
-[ ! -e "$FIRST_HOME/unexpected-agent-launch" ] || fail "2 回目に対話 agent を起動した"
+assert_no_agent_launch "$FIRST_HOME" "2 回目に対話 agent を起動した"
 printf '[MEASURE] scenario=second before_keys=5+ after_keys=0 prompts=0 source=detected+previous result=idempotent\n'
 
 # --check / --changes / FDA / 依存チェック / revision 追従の非退行。
@@ -223,6 +259,7 @@ run_setup "$YES_HOME" "$YES_BIN" "$TMP/yes.out" --yes
 assert_prompt_count "$TMP/yes.out" 0 "--yes"
 assert_contains "$TMP/yes.out" '\[default\] 非対話モード' "--yes の非対話表示がない"
 assert_contains "$TMP/yes.out" 'セットアップが完了しました' "--yes が完走しない"
+assert_no_agent_launch "$YES_HOME" "--yes の setup が対話 agent を起動した"
 printf '[MEASURE] scenario=yes before_keys=unsupported after_keys=0 prompts=0 source=detected+default result=complete\n'
 
 # 4. 未認証: 質問せず、誤った既定（プラン）を書かず、**残り作業として脇に置いて完走**する。
@@ -241,7 +278,7 @@ UNAUTH_CONFIG="$UNAUTH_HOME/Library/Application Support/tako/orchestrator/config
 [ -e "$UNAUTH_CONFIG" ] || fail "未認証でも書ける設定を書いていない（#1501）"
 # 未認証プロバイダのプランは「検出できないもの」なので既定値を捏造しない（#262 方針 A）
 assert_not_contains "$UNAUTH_CONFIG" '^    claude: ' "未認証プロバイダのプランを既定で書いた"
-[ ! -e "$UNAUTH_HOME/unexpected-agent-launch" ] || fail "未認証の CLI を対話起動した"
+assert_no_agent_launch "$UNAUTH_HOME" "未認証の CLI を対話起動した"
 printf '[MEASURE] scenario=unauthenticated before_keys=1 after_keys=0 prompts=0 source=unavailable result=continue-with-remaining\n'
 
 # 検出不能でも安全なプランは unknown を採用し、質問しない。
@@ -252,6 +289,7 @@ run_setup "$UNKNOWN_HOME" "$UNKNOWN_BIN" "$TMP/unknown.out"
 assert_prompt_count "$TMP/unknown.out" 0 "プラン検出不能"
 assert_contains "$TMP/unknown.out" '\[default\] Claude プラン: unknown' "検出不能プランの default source がない"
 assert_contains "$UNKNOWN_HOME/Library/Application Support/tako/orchestrator/config.yaml" '^    claude: unknown$' "unknown プランが保存されない"
+assert_no_agent_launch "$UNKNOWN_HOME" "プラン検出不能の setup が対話 agent を起動した"
 printf '[EDGE] plan=undetectable keys=0 source=default:unknown result=complete\n'
 
 # 前回 pro と再検出 free の不一致は detected を優先し、差異を通知する。
@@ -260,6 +298,7 @@ run_setup "$FIRST_HOME" "$FIRST_BIN" "$TMP/conflict.out"
 assert_prompt_count "$TMP/conflict.out" 0 "検出値競合"
 assert_contains "$TMP/conflict.out" '\[detected\] Claude プラン: free（previous: pro。検出値を優先）' "検出値優先の通知がない"
 assert_contains "$FIRST_CONFIG" '^    claude: free$' "競合時に detected 値が保存されない"
+assert_no_agent_launch "$FIRST_HOME" "検出値競合の setup が対話 agent を起動した"
 printf '[EDGE] conflict=previous:pro/detected:free keys=0 winner=detected result=updated\n'
 
 # config.yaml 破損時は検出・書き込み前に停止し、破損内容を維持する。
@@ -294,6 +333,7 @@ assert_contains "$ANSWERS_PROFILE" '^effort: max$' "answers の profile が未�
 assert_contains "$ANSWERS_PROJECTS" '^  app:$' "answers の projects が未反映"
 assert_contains "$ANSWERS_HOME/.claude/CLAUDE.md" '^# AI setup rules$' "answers の指示内容が未反映"
 assert_contains "$ANSWERS_HOME/Library/Application Support/tako/settings.json" '"sleep_guard_power": "always"' "answers の sleep_guard が未反映"
+assert_no_agent_launch "$ANSWERS_HOME" "--answers の setup が対話 agent を起動した"
 printf '[E2E] interface=answers-stdin keys=0 fields=agent,plans,instructions,profile,projects,orchestrator,sleep_guard result=complete\n'
 
 # 旧 #226 の複数 CLI/JWT 検出も質問ゼロで維持する。
@@ -312,7 +352,7 @@ assert_contains "$TMP/multi.out" '\[detected\] GPT / ChatGPT プラン: plus' "C
 assert_contains "$TMP/multi.out" '\[default\] Google プラン: unknown' "agy の安全な既定値がない"
 assert_contains "$MULTI_PROFILE" '^worker_model_policy: delegate$' "複数 CLI の delegate 推奨がない"
 assert_contains "$MULTI_PROFILE" '^  codex:$' "複数 CLI の codex worker がない"
-[ ! -e "$MULTI_HOME/unexpected-agent-launch" ] || fail "複数 CLI の標準 setup が対話 agent を起動した"
+assert_no_agent_launch "$MULTI_HOME" "複数 CLI の標準 setup が対話 agent を起動した"
 printf '[OK] regression=multi-agent,codex-jwt,agy,delegate keys=0\n'
 
 # 任意: 実ユーザー認証は読み取り専用、書き込み先だけスクラッチ HOME にして実測する。
@@ -329,7 +369,7 @@ if [ -n "${TAKO_REAL_CLAUDE_BIN:-}" ] &&
     assert_contains "$TMP/real-auth.out" '\[検出\] claude: .*認証済み / [a-z0-9-]+' "実 Claude の認証・プランを検出できない"
     assert_contains "$TMP/real-auth.out" '\[detected\] Claude プラン: [a-z0-9-]+' "実 Claude の検出採用ログがない"
     assert_contains "$TMP/real-auth.out" 'セットアップが完了しました' "実 Claude 認証ケースが完走しない"
-    [ ! -e "$REAL_HOME/unexpected-agent-launch" ] || fail "実認証ケースが対話 agent を起動した"
+    assert_no_agent_launch "$REAL_HOME" "実認証ケースが対話 agent を起動した"
     printf '[MEASURE] scenario=real-claude-auth before_keys=5+ after_keys=0 prompts=0 source=detected result=complete\n'
 fi
 
