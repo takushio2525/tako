@@ -177,7 +177,7 @@ pane_gone() { ! "$TAKO_BIN" list 2>/dev/null | python3 -c 'import json,sys
 d = json.load(sys.stdin)
 ids = [p["id"] for t in d["tabs"] for p in t["panes"]]
 sys.exit(0 if int(sys.argv[1]) in ids else 1)' "$1"; }
-screen_has() { screen_of "$1" | grep -qF -- "$2"; }
+screen_has() { local screen; screen="$(screen_of "$1")" && grep -qF -- "$2" <<<"$screen"; }
 # 外側の締め切りつきで走らせる。打ち切ったら 125（124 は CLI の「上限で打ち切った」なので使わない）
 #   run_deadline <秒> <出力ファイル> <コマンド…>
 run_deadline() {

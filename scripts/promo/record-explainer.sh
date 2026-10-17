@@ -225,13 +225,13 @@ promo_type_verified() {
         swiftc -O -o "$ocr" "$SCRIPT_DIR/ocr-frames.swift" 2>/dev/null || {
             echo "ERROR: ocr-frames.swift のコンパイルに失敗" >&2; return 1; }
     fi
-    local attempt
+    local attempt seen
     for attempt in 1 2; do
         "$PROMO_KEYTYPE" "$PROMO_APP_PID" "$text" --per-char-ms 60 --backspaces 80 >/dev/null || return 1
         sleep 1.5
         rm -f "$shot"
         screencapture -x -o -l"$PROMO_WID" "$shot" 2>/dev/null || true
-        if [ -s "$shot" ] && "$ocr" "$shot" 2>/dev/null | grep -q -- "$needle"; then
+        if [ -s "$shot" ] && seen="$("$ocr" "$shot" 2>/dev/null)" && grep -q -- "$needle" <<<"$seen"; then
             "$PROMO_KEYTYPE" "$PROMO_APP_PID" "" --return >/dev/null || return 1
             echo "   入力を確認して送信（試行 ${attempt}）"
             rm -f "$shot"
@@ -575,7 +575,7 @@ PROFILE_YAML
         "worker を 3 体、tako_orchestrator_spawn で同時に立てて（tako_orchestrator_run は使わない）。project は awesome-app。担当は 'api' / 'ui' / 'docs' で、各 worker へのプロンプトは「bash scripts/task.sh <担当名> を実行して、出力の最終行を報告して」でよい。確認は不要、すぐ spawn して。worker のペインは閉じないでそのまま残して。3 体の報告が揃ったら結果を 3 行でまとめて。" \
         >/dev/null 2>&1 || true
     # worker ペインが出そろうまで待つ（最大 240s。spawn は 1 体 40 秒前後 = 実測）
-    local i n=0
+    local i n=0 ui orch
     for i in $(seq 1 48); do
         n=$(tko list 2>/dev/null | /usr/bin/python3 -c \
             'import json,sys
@@ -597,7 +597,7 @@ print(sum(len(t["panes"]) for t in d["tabs"]))' 2>/dev/null || echo 0)
     # claude ペインがチャット表示へ切り替わるまで待つ（判定は agents 走査に乗るので数秒〜30 秒）
     for i in $(seq 1 8); do
         sleep 4
-        tko ui-mode 2>/dev/null | grep -q '"chat"' && break
+        ui="$(tko ui-mode 2>/dev/null)" && grep -q '"chat"' <<<"$ui" && break
     done
     echo "   pane_display: $(tko ui-mode 2>/dev/null | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("pane_display"))' 2>/dev/null)"
     sleep 16
@@ -607,7 +607,7 @@ print(sum(len(t["panes"]) for t in d["tabs"]))' 2>/dev/null || echo 0)
     promo_beat report
     # master の検収・報告（idle へ戻る）を待つ。残り尺を超えない範囲で
     for i in $(seq 1 30); do
-        tko orchestrator status --pane "$base" 2>/dev/null | grep -q '"status": *"idle"' && break
+        orch="$(tko orchestrator status --pane "$base" 2>/dev/null)" && grep -q '"status": *"idle"' <<<"$orch" && break
         sleep 5
     done
     promo_beat report_done

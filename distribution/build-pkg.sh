@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD
 DIST="$REPO_ROOT/dist"
 APP="$DIST/tako.app"
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | sed -n 1p)
 IDENTIFIER="dev.takushio.tako"
 
 SIGN=0
@@ -75,7 +75,7 @@ productbuild \
 if [[ $SIGN -eq 1 ]]; then
   # Developer ID Installer 証明書を自動検出
   INSTALLER_IDENTITY=$(security find-identity -p basic -v 2>/dev/null \
-    | sed -n 's/^ *[0-9]*) \([0-9A-F]\{40\}\) "Developer ID Installer:.*/\1/p' | head -1)
+    | sed -n 's/^ *[0-9]*) \([0-9A-F]\{40\}\) "Developer ID Installer:.*/\1/p' | sed -n 1p)
 
   if [[ -z "$INSTALLER_IDENTITY" ]]; then
     echo "エラー: Developer ID Installer 証明書が見つからない" >&2

@@ -201,7 +201,7 @@ WAIT=$((CONTROL_SECS * 2))
 sleep "$WAIT"
 check_eq "① 既定では ${WAIT} 秒たっても偽の claude は 0 回（対照の倍以上待った）" "0" \
   "$(talk_calls)"
-if tk default read --pane "$P" | grep -q 'tako proj-b %'; then
+if screen="$(tk default read --pane "$P")" && grep -q 'tako proj-b %' <<<"$screen"; then
   pass "③ ペインのプロンプトが既定の .zshrc の固定の形（tako proj-b %）"
 else
   # 画面は出さない（固定の形でないプロンプトには実ユーザー名・ホスト名が写る = #927）

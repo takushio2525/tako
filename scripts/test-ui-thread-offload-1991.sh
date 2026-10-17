@@ -304,7 +304,7 @@ if [ -z "$LEGACY" ]; then
   echo c > "$REPO/c.txt"
   if "$TAKO_BIN" git stage c.txt --pane "$P" > "$TMP/stage.json" 2>&1 \
     && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("staged") is True and d.get("paths") == ["c.txt"] else 1)' "$TMP/stage.json" \
-    && g diff --cached --name-only | grep -qx c.txt; then
+    && cached="$(g diff --cached --name-only)" && grep -qx c.txt <<<"$cached"; then
     pass "応答は従来の形（staged / paths）で、リポジトリに実際にステージされている"
   else
     fail "stage の応答 / 実体が想定外: $(head -c 200 "$TMP/stage.json")"
@@ -387,7 +387,7 @@ if [ -z "$LEGACY" ]; then
   ui_ok "$took" && pass "E3 git の最中でもペインを閉じられる（${took} 秒）" || fail "E3 git の最中にペインを閉じられない（${took}）"
   if [ "$e3rc" = "0" ] \
     && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("staged") is True else 1)' "$TMP/e3.out" \
-    && g diff --cached --name-only | grep -qx d.txt; then
+    && cached="$(g diff --cached --name-only)" && grep -qx d.txt <<<"$cached"; then
     pass "E3 閉じたペインの要求も結果が届き、リポジトリに効いている（落ちない・宙に浮かない）"
   else
     fail "E3 閉じたペインの要求の結末が想定外（終了コード ${e3rc}）"
@@ -453,7 +453,7 @@ else
     fail "R 返らない show-environment で起動が止まった（武装を解くまで ${disarm_at} 秒立たない）"
   fi
   if [ -n "$ready" ]; then
-    "$TAKO_BIN" list 2>/dev/null | grep -q '"tako-orphan1991"' \
+    tree="$("$TAKO_BIN" list 2>/dev/null)" && grep -q '"tako-orphan1991"' <<<"$tree" \
       && pass "R 孤児は「復帰」タブへ戻る（上限で打ち切った口があっても復帰は続く）" \
       || fail "R 孤児が復帰していない"
     # 起動時の一括回収（FR-2.16.11）: 他の tako-app が生きていれば見送る（#1187 の Startup の規則）

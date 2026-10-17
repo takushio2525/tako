@@ -501,7 +501,7 @@ phase_claude() {
   if [ "$limits" = null ] || [ "$limits" = absent ]; then
     unmeasured "使用制限が報告に無い（API キー利用など。rate_limits は null）"
   else
-    check_eq "使用制限の解除時刻は unix 秒（mod の ISO を読んだ値）" "true" "$(self_f "$p" rate_limits.windows.0.resets_at | grep -q -E '^[0-9]{10}$' && echo true || echo false)"
+    check_eq "使用制限の解除時刻は unix 秒（mod の ISO を読んだ値）" "true" "$(v="$(self_f "$p" rate_limits.windows.0.resets_at)" && grep -q -E '^[0-9]{10}$' <<<"$v" && echo true || echo false)"
   fi
 
   # 権限ダイアログ（ask ルール = classic_events に依らず mod が拾える）

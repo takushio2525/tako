@@ -200,7 +200,7 @@ old_main="$(sha "$D" main)"
 assert_eq "前提: 共有ツリーは前夜のリリースのコミットで detached" "(detached)" "$(head_of "$D")"
 assert_contains "前提: その先端は旧版が作った v0.8.40" "$(git -C "$D/repo" log -1 --format=%s)" "[リリース] v0.8.40"
 assert_eq "前提: ローカル main は origin/main より古い（旧版の夜間のまま）" "old" \
-  "$(git -C "$D/repo" show main:scripts/nightly-release.sh | grep -q OLD_NIGHTLY_STUB && echo old || echo new)"
+  "$(body="$(git -C "$D/repo" show main:scripts/nightly-release.sh)" && grep -q OLD_NIGHTLY_STUB <<<"$body" && echo old || echo new)"
 NIGHTS=""
 tip1="$(origin_sha "$D")"
 run_night "$D" 1

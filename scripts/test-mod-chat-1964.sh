@@ -243,7 +243,7 @@ reporting() { [ "$(row_field "$1" '.state')" = reporting ]; }
 not_reporting() { [ "$(row_field "$1" '.state')" != reporting ]; }
 mod_dir() { mod_json | jq -r '.plugin_dir'; }
 read_pane() { tk read --pane "$1" 2>/dev/null; }
-screen_has() { read_pane "$1" | grep -Eq -- "$2"; }
+screen_has() { local screen; screen="$(read_pane "$1")" && grep -Eq -- "$2" <<<"$screen"; }
 # 吹き出し = `╮` で終わる行と `╰` の行の間（枠の中）に発話と `│`（他の mod の行が中に包まれていても見つける）
 has_bubble() { read_pane "$1" | awk -v said="$2" '/╮ *$/ { inside = 1; next } /╰/ { inside = 0 } inside && index($0, said) && /│/ { found = 1 } END { exit !found }'; }
 display_of() { tk ui-mode 2>/dev/null | jq -r --arg p "$1" '"\(.pane_display[$p])/\(.pane_display_reason[$p].reason // "-")"'; }
@@ -487,7 +487,7 @@ start_tmux_claude() {
   tmx set-option -g set-clipboard off >/dev/null 2>&1
 }
 tcap() { tmx capture-pane -p -t "=$1:" 2>/dev/null; }
-tscreen_has() { tcap "$1" | grep -Eq -- "$2"; }
+tscreen_has() { local screen; screen="$(tcap "$1")" && grep -Eq -- "$2" <<<"$screen"; }
 tkey() {
   tmx send-keys -t "=$1:" "$2"
   sleep 0.6
@@ -552,7 +552,7 @@ phase_tmux() {
         "$(printf '%s' "$copied" | wc -m | tr -d ' ') $(printf '%s' "$copied" | tr -cd '\n' | wc -c | tr -d ' ')"
       wait_for 5 sh -c "'$TAKO_BIN' mod --json | jq -e '.panes[] | select(.pane == $p) | .report.last_press.kind == \"code_copy\"' >/dev/null" || true
       check_eq "報告の last_press は code_copy で成功（本文は載せない）" "code_copy/true/false" \
-        "$(row_field "$p" '.report.last_press | "\(.kind)/\(.ok)"')/$(mod_json | grep -q 'cargo build' && echo true || echo false)"
+        "$(row_field "$p" '.report.last_press | "\(.kind)/\(.ok)"')/$(j="$(mod_json)" && grep -q 'cargo build' <<<"$j" && echo true || echo false)"
     fi
     tmx kill-session -t "=$s" >/dev/null 2>&1
     wait_for 30 not_reporting "$p" || true

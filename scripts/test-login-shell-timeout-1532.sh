@@ -343,7 +343,7 @@ phase_cli() {
   expect_text "眠る rc（tako CLI の PATH）" "$TMP/out/sleeps-health.out" "tako CLI の PATH: 確認できません（ログインシェルが 2 秒で応答なし）"
   expect_other_items "眠る rc" "$TMP/out/ok-health.out" "$TMP/out/sleeps-health.out"
   echo "    probe_timeouts: $(labels_of "$TMP/out/sleeps-health.out")"
-  if labels_of "$TMP/out/sleeps-health.out" | grep -q "fakesh -l -c command -v claude"; then
+  if labels="$(labels_of "$TMP/out/sleeps-health.out")" && grep -q "fakesh -l -c command -v claude" <<<"$labels"; then
     pass "眠る rc: probe_timeouts に何を待ったか（fakesh -l -c command -v claude）が載る"
   else
     fail "眠る rc: probe_timeouts に claude の検出が無い"

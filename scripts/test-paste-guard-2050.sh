@@ -166,7 +166,7 @@ fresh_pane() {
   after="$(pane_ids)"
   comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1
 }
-pane_has() { tk read --pane "$1" 2>/dev/null | grep -q -- "$2"; }
+pane_has() { local screen; screen="$(tk read --pane "$1" 2>/dev/null)" && grep -q -- "$2" <<<"$screen"; }
 wait_for() {
   local limit="$1" i
   shift
@@ -435,7 +435,7 @@ start_claude() {
     claude --model haiku
 }
 cap() { tmx capture-pane -p -t "=$1:" 2>/dev/null; }
-screen_has() { cap "$1" | grep -q -- "$2"; }
+screen_has() { local screen; screen="$(cap "$1")" && grep -q -- "$2" <<<"$screen"; }
 type_line() {
   tmx send-keys -t "=$1:" -l "$2"
   sleep 1
@@ -444,7 +444,10 @@ type_line() {
 key() { tmx send-keys -t "=$1:" "$2"; }
 marked_count() { grep -c '"marked":true' "$FAKE_LOG" | tr -d ' '; }
 reporting() { [ "$(tk mod --json 2>/dev/null | jq -r --argjson p "$1" '.panes[] | select(.pane == $p) | .state')" = reporting ]; }
-dialog_up() { cap "$1" | grep -q 'ghp_…qrst' && cap "$1" | grep -Eq "Don't send|やめる"; }
+dialog_up() {
+  local screen
+  screen="$(cap "$1")" && grep -q 'ghp_…qrst' <<<"$screen" && grep -Eq "Don't send|やめる" <<<"$screen"
+}
 CAP_DIR="$TMP/capture"
 mkdir -p "$CAP_DIR"
 
@@ -487,10 +490,10 @@ phase_mod() {
   cap "$s" | mask > "$CAP_DIR/mod-dropped.txt"
   check_eq "やめると偽 API へ 1 回も届かない（marked の数が増えない）" "$before" "$(marked_count)"
   screen_has "$s" '⏺ DROPPED' && fail "やめたのに答えが出た" || pass "やめた送信の答えは出ない"
-  check "$(cap "$s" | grep -Eq 'not sent because|送りませんでした' && echo 1)" "やめた理由が画面に出る"
+  check "$(screen="$(cap "$s")" && grep -Eq 'not sent because|送りませんでした' <<<"$screen" && echo 1)" "やめた理由が画面に出る"
   # やめた文は入力欄へ戻る（落とした文は会話に残らないので、画面に残っていれば入力欄。
   # 入力欄の ❯ の後ろは普通の空白ではないので、文の頭から見る）
-  check "$(cap "$s" | grep -q 'Reply with exactly one word: DROPPED key' && echo 1)" \
+  check "$(screen_has "$s" 'Reply with exactly one word: DROPPED key' && echo 1)" \
     "やめた文が入力欄へ戻る（鍵を消して送り直せる）"
   # 戻った下書きを消す（Ctrl+U）
   key "$s" C-u

@@ -313,7 +313,7 @@ if grep -q "pane=${P_DIALOG} 見送り reason=dialog" <<<"$LOGTXT" &&
 else
   fail "⑧ 見送りの理由の行が無い"
 fi
-if persist_log | grep -q "API Error\|ENOTFOUND\|自動通知\|auto-notice"; then
+if log_text="$(persist_log)" && grep -q "API Error\|ENOTFOUND\|自動通知\|auto-notice" <<<"$log_text"; then
   fail "⑧ persist.log に画面の文字か送った文が出ている"
 else
   pass "⑧ persist.log に画面の文字・送った文が出ない（種別の slug だけ）"

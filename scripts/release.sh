@@ -51,7 +51,7 @@ cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD
 DIST="$REPO_ROOT/dist"
 APP="$DIST/tako.app"
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | sed -n 1p)
 TAG="v${VERSION}"
 
 # アセット命名規則の写し（正は crates/tako-core/src/platform/release_assets.rs。
@@ -595,7 +595,7 @@ copy_commit_identity() {
 
 # cask_field <file> <version|sha256|url> — cask の `version "…"` 等の値（無ければ空）
 cask_field() {
-  sed -n 's/^[[:space:]]*'"$2"' "\(.*\)"[[:space:]]*$/\1/p' "$1" 2>/dev/null | head -1
+  sed -n 's/^[[:space:]]*'"$2"' "\(.*\)"[[:space:]]*$/\1/p' "$1" 2>/dev/null | sed -n 1p
 }
 
 # cask_rewrite <file> <version> <sha256> — version / sha256 の行だけを書き換える（字下げは保つ）
@@ -745,7 +745,7 @@ update_docs_stable_label() {
   fi
   # 日付はその版の CHANGELOG の節の日付（無ければ今日）
   date=$(sed -n "s/^## \[${version//./\\.}\] - \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*/\1/p" \
-    "$wt/CHANGELOG.md" 2>/dev/null | head -1)
+    "$wt/CHANGELOG.md" 2>/dev/null | sed -n 1p)
   [[ -n "$date" ]] || date=$(date +%F)
   # 書き換えと検査は番犬（docs の CI と同じスクリプト）の 1 実装に任せる
   if ! node "$wt/docs/scripts/check-releases-page.mjs" --set-stable="$version" --date="$date"; then

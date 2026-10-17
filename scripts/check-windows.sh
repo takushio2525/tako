@@ -18,7 +18,8 @@ cd "$REPO_ROOT"
 
 missing=()
 
-if ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
+installed="$(rustup target list --installed 2>/dev/null)" || installed=""
+if ! grep -qx "$TARGET" <<<"$installed"; then
   missing+=("rustup target add $TARGET")
 fi
 

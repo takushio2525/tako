@@ -109,6 +109,13 @@ for line in open(sys.argv[1]):
 PY
 }
 
+# 知らせの一覧にその行があるか（$1 = ログ・$2 = パターン）。受け取ってから探す（pipefail の下の
+# `| grep -q` は左辺が書き終わる前に抜けると偽になる。#2272）
+changes_has() {
+  local c
+  c="$(changes "$1")" && grep -q -- "$2" <<<"$c"
+}
+
 # 偽サーバの本文の模型（--doc-log）に、その中身の文書が載ったか（$1 = ログ・$2 = 中身のファイル）
 doc_has() {
   python3 - "$1" "$2" <<'PY' 2>/dev/null
@@ -222,7 +229,7 @@ run_arm() {
   if [ "$legacy" != 1 ]; then
     # 温め: 監視が流れ出すまで書き続ける（実時間で待たない）
     local n=0
-    while ! changes "$log" | grep -q "warm.rs "; do
+    while ! changes_has "$log" "warm.rs "; do
       printf '// warm %s\n' "$n" > "$p/src/warm.rs"
       n=$((n + 1))
       [ "$n" -lt 100 ] || { fail "$arm: 温めの知らせが届かない"; break; }
@@ -238,7 +245,7 @@ run_arm() {
   # cargo fmt 相当: util.rs の宣言の前に 3 行
   printf '//! 整形で増えた行\n\n#[inline]\npub fn target() {}\n' > "$p/src/util.rs"
   if [ "$legacy" != 1 ]; then
-    wait_cond 'changes "$log" | grep -q "util.rs "' 10 || fail "$arm: util.rs の知らせが届かない"
+    wait_cond 'changes_has "$log" "util.rs "' 10 || fail "$arm: util.rs の知らせが届かない"
   else
     sleep 2
   fi
@@ -253,7 +260,7 @@ run_arm() {
   printf 'fn more() {\n    crate::util::target();\n}\n' > "$p/src/added.rs"
   rm -f "$p/src/gone.rs"
   if [ "$legacy" != 1 ]; then
-    wait_cond 'changes "$log" | grep -q "gone.rs 3" && changes "$log" | grep -q "added.rs 1"' 10 \
+    wait_cond 'changes_has "$log" "gone.rs 3" && changes_has "$log" "added.rs 1"' 10 \
       || fail "$arm: 差し替えの知らせが揃わない（$(changes "$log" | tr '\n' ' ')）"
   else
     sleep 2

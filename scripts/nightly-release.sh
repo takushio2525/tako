@@ -749,7 +749,7 @@ fi
 
 git fetch origin --tags --quiet
 
-LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1)
+LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | sed -n 1p)
 if [[ -z "$LATEST_TAG" ]]; then
   log "ERROR: v* タグが 1 つも見つからない"
   exit 1
@@ -762,7 +762,7 @@ if [[ "$COMMITS" -eq 0 ]]; then
   tako_exit 0
 fi
 
-CUR_VERSION=$(git show origin/main:Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+CUR_VERSION=$(git show origin/main:Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | sed -n 1p)
 TAG_VERSION="${LATEST_TAG#v}"
 if [[ "$CUR_VERSION" != "$TAG_VERSION" ]]; then
   log "SKIP: Cargo.toml version (${CUR_VERSION}) ≠ 最新タグ (${TAG_VERSION})。手動リリース進行中とみなす${RESERVE_KEPT}"

@@ -90,7 +90,8 @@ promo_require() {
 # 画面がロックされていないか調べる（ロック中は screencapture が一切動かない）。
 # ロック中なら 1 を返す
 promo_screen_locked() {
-    ioreg -n Root -d1 -r 2>/dev/null | grep -q '"CGSSessionScreenIsLocked"=Yes'
+    local reg
+    reg="$(ioreg -n Root -d1 -r 2>/dev/null)" && grep -q '"CGSSessionScreenIsLocked"=Yes' <<<"$reg"
 }
 
 # 収録可能な状態か事前に検査する。ロック・権限のどちらで止まっているかを切り分ける

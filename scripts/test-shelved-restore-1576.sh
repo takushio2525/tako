@@ -235,9 +235,9 @@ bg_state_after_enter() {
 }
 # 画面に目印が出るまで待つ（attach 直後の再描画を待つ）
 read_has() {
-  local pane="$1" mark="$2" i
+  local pane="$1" mark="$2" i screen
   for i in $(seq 1 30); do
-    if T read --pane "$pane" 2>/dev/null | grep -q "$mark"; then echo yes; return; fi
+    if screen="$(T read --pane "$pane" 2>/dev/null)" && grep -q "$mark" <<<"$screen"; then echo yes; return; fi
     sleep 0.2
   done
   echo no

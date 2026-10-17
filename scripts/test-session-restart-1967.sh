@@ -437,7 +437,7 @@ YAML
   grep -q "セッション再起動: 打ち直し pane=${master}" "$TAKO_DATA_DIR/persist.log" &&
     grep -q "セッション再起動: 結果=失敗 pane=${master} 理由=agent_exited 終了コード=1 試行=2" "$TAKO_DATA_DIR/persist.log"
   check "$([ $? -eq 0 ] && echo 1 || echo 0)" "persist.log に打ち直しと失敗の理由が残る"
-  check "$(restart_field "$master" last_restart.message | grep -q 'tako session-restart --mode harness' && echo 1 || echo 0)" \
+  check "$(m="$(restart_field "$master" last_restart.message)" && grep -q 'tako session-restart --mode harness' <<<"$m" && echo 1 || echo 0)" \
     "応答（last_restart.message）に次の一手が出る"
 
   # ---- 4. エージェントが居ないペインの引き継ぎは断り、harness で戻せる ----

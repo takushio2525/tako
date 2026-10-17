@@ -175,7 +175,7 @@ launch_solo_tab() {
   local dir="$1"
   shift
   (cd "$dir" && "$TAKO_BIN" solo "$@" --tab) > "$LAUNCH_LOG" 2>&1 || { cat "$LAUNCH_LOG"; return 1; }
-  grep -o 'ペイン [0-9]*' "$LAUNCH_LOG" | head -1 | grep -o '[0-9]*'
+  grep -o 'ペイン [0-9]*' "$LAUNCH_LOG" | sed -n 1p | grep -o '[0-9]*'
 }
 # <dir> で開いたタブのシェルからインラインで `tako solo` を打ち、そのタブ ID を返す。
 # `$2` はコマンドの前に置く env（①で `TAKO_2120_LEGACY=1`）。GUI へは渡さない:
@@ -259,7 +259,7 @@ check_eq "手で付けた名前" "自分の名前" "$(tab_field "$L_USR" title)"
 L_NOSOLO="$(new_tab --title solo)"
 check_eq "solo のいないタブの solo は手動名" "manual" "$(tab_field "$L_NOSOLO" title_source)"
 # master（#2120 の規則で付いた名前）
-M_PANE="$("$TAKO_BIN" master -d2127 --tab 2>&1 | grep -o 'ペイン [0-9]*' | head -1 | grep -o '[0-9]*')"
+M_PANE="$("$TAKO_BIN" master -d2127 --tab 2>&1 | grep -o 'ペイン [0-9]*' | sed -n 1p | grep -o '[0-9]*')"
 M_TAB="$(tab_of_pane "$M_PANE")"
 check_eq "master のタブは管轄プロジェクトの自動名（#2120）" "p2127/auto" \
   "$(tab_field "$M_TAB" title)/$(tab_field "$M_TAB" title_source)"

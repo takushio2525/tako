@@ -183,7 +183,7 @@ YAML
   [ -f "$TMP/launches.log" ] && sed 's/^/    /' "$TMP/launches.log"
   if [ "$arm" = new ]; then
     check "$([ "$n" = 1 ] && echo 1 || echo 0)" "起動先は 1 回だけ起動する（実測 ${n} 回）"
-    check "$(grep -c -- '--permission-mode auto$' "$TMP/launches.log" 2>/dev/null | grep -qx 1 && echo 1 || echo 0)" \
+    check "$([ "$(grep -c -- '--permission-mode auto$' "$TMP/launches.log" 2>/dev/null)" = 1 ] && echo 1 || echo 0)" \
       "正しい引数（--permission-mode auto）で起動する"
     check "$(grep -q 'autoexport' "$TMP/launches.log" 2>/dev/null && echo 0 || echo 1)" \
       "化けた引数（autoexport）が無い"

@@ -394,9 +394,10 @@ phase_tmux() {
   tmux -L "$TMUX_SOCKET" send-keys -t "=${session}:" "Reply with exactly one word: pong" 2>/dev/null
   sleep 1
   tmux -L "$TMUX_SOCKET" send-keys -t "=${session}:" Enter 2>/dev/null
-  local seen=no i
+  local seen=no i screen
   for i in $(seq 1 90); do
-    if tmux -L "$TMUX_SOCKET" capture-pane -p -t "=${session}:" 2>/dev/null | grep -q -E '(⏺|●) pong'; then seen=yes; break; fi
+    if screen="$(tmux -L "$TMUX_SOCKET" capture-pane -p -t "=${session}:" 2>/dev/null)" \
+      && grep -q -E '(⏺|●) pong' <<<"$screen"; then seen=yes; break; fi
     sleep 1
   done
   check_eq "tako を止めた状態でも claude が応答する" "yes" "$seen"

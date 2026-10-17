@@ -73,7 +73,7 @@ setup_git() {
 # tap の main にある cask の 1 項目
 tap_cask_field() {
   git --git-dir="$D/tap.git" show "main:Casks/tako.rb" 2>/dev/null |
-    sed -n 's/^[[:space:]]*'"$1"' "\(.*\)"[[:space:]]*$/\1/p' | head -1
+    sed -n 's/^[[:space:]]*'"$1"' "\(.*\)"[[:space:]]*$/\1/p' | sed -n 1p
 }
 
 # origin の main にある releases.md
@@ -536,7 +536,7 @@ test_real_page_rewritable() {
   local tmp cur series out rc=0
   tmp=$(mktemp -d)
   /bin/cp -f docs/src/content/docs/releases.md "$tmp/releases.md"
-  cur=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+  cur=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | sed -n 1p)
   series="${cur%.*}"
   out=$(node docs/scripts/check-releases-page.mjs --releases="$tmp/releases.md" \
         --set-stable="${series}.999" --date=2099-12-31 2>&1) || rc=$?

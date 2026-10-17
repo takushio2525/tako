@@ -299,7 +299,7 @@ wait_diags() { # wait_diags <ペイン> <秒>
 echo "== 前提 =="
 echo "  Arduino IDE の同梱: $([ "$HAVE_IDE" = 1 ] && echo "あり（$("$IDE_DIR/arduino-cli" version 2>/dev/null | head -1 | sed "s#$TMP#<tmp>#g")・$("$IDE_DIR/clangd" --version 2>/dev/null | head -1)）" || echo 無い)"
 echo "  arduino:avr のコア: $([ "$HAVE_CORE" = 1 ] && echo 一時 HOME へ複製した || echo 無い)"
-echo "  旧の行の clangd: $([ "$HAVE_CLANGD" = 1 ] && /usr/bin/clangd --version 2>/dev/null | head -1 || echo 無い)"
+echo "  旧の行の clangd: $([ "$HAVE_CLANGD" = 1 ] && /usr/bin/clangd --version 2>/dev/null | sed -n 1p || echo 無い)"
 
 echo
 echo "== ⓪ GUI を除いた tako の実経路で新旧を比べる（manager + 既定の解決。旧 = TAKO_2113_LEGACY=1） =="
