@@ -13,6 +13,9 @@
 //! 会話の行（`⏺` / `●` / `⎿` / `❯`）が**最後の会話の項目**で、それが接続系の
 //! `API Error` なら止まっている。折り返しは項目の続きの行を結合して 1 論理行に戻す。
 //!
+//! #1847 から `detect_worker_error` も、窓で外れたときの段（3'）でこの [`detect`] を通す
+//! （worker_status の `api_error` と再開の判定が同じ 1 実装になる）。
+//!
 //! # 止まっていると言わないもの
 //!
 //! - 生成中・再試行中（中断の案内 `esc to interrupt` が見えている）
@@ -542,11 +545,15 @@ mod tests {
             .join("\n");
         let screen = format!("{ENOTFOUND_32}\n{footer}");
         assert!(stopped(&screen).is_some());
-        // 対比: 既存の末尾 15 行の判定ではこの画面を api_error と読めない
+        // #1847: 末尾 15 行の窓で外れても、同じ錨の判定（段 3'）で api_error と読む
+        // （#1847 前はここが None = status が idle のまま。A/B は `issue1847_status_detection`）
         assert_eq!(
             crate::orchestrator::wait::detect_worker_error(&screen),
-            None,
-            "既存の窓の判定が変わったなら #1847 の記述を見直す"
+            Some((
+                crate::orchestrator::wait::WorkerErrorKind::ApiError,
+                "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+                    .to_string()
+            ))
         );
     }
 

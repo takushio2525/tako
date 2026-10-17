@@ -1995,14 +1995,34 @@ pub fn screen_is_collapsed(output: &str) -> bool {
 /// 代わりに、対処ダイアログの**選択肢構造**は `worker_status` / watch の
 /// `choice_dialog` に載るので、master は WORKER_ERROR を受けた後 respond で確定できる
 pub fn detect_worker_error(output: &str) -> Option<(WorkerErrorKind, String)> {
-    detect_worker_error_in(output, legacy_757())
+    detect_worker_error_at(output, None, legacy_757())
 }
 
-/// [`detect_worker_error`] の本体。`legacy_login_expired` に true を渡すと
-/// #757 前（失効を `api_error` / 検知なしへ落とす）へ戻る（A/B 用。
-/// 公開関数は [`legacy_757`] を渡すだけなので、env が唯一の差になる）
+/// [`detect_worker_error`] に**画面全体**を添える形（worker_status 用。#1847）。
+///
+/// 窓（末尾 15 / 30 行）で見る規則は `output`（worker_status の `recent_output` = 末尾 30 行）の
+/// まま変えず、入力欄を錨にした接続エラーの判定（段 3'）だけを `whole_screen` で行う。
+/// 背の高いペインでは会話とフッターのあいだが空行で埋まり、エラーの頭の行が末尾 30 行の外へ出る
+pub fn detect_worker_error_on(
+    output: &str,
+    whole_screen: Option<&str>,
+) -> Option<(WorkerErrorKind, String)> {
+    detect_worker_error_at(output, whole_screen, legacy_757())
+}
+
+/// [`detect_worker_error`] の A/B 用の入口。`legacy_login_expired` に true を渡すと
+/// #757 前（失効を `api_error` / 検知なしへ落とす）へ戻る
+/// （公開関数は [`legacy_757`] を渡すだけなので、env が唯一の差になる）
 pub fn detect_worker_error_in(
     output: &str,
+    legacy_login_expired: bool,
+) -> Option<(WorkerErrorKind, String)> {
+    detect_worker_error_at(output, None, legacy_login_expired)
+}
+
+fn detect_worker_error_at(
+    output: &str,
+    whole_screen: Option<&str>,
     legacy_login_expired: bool,
 ) -> Option<(WorkerErrorKind, String)> {
     // tail_lines は新しい行が先頭 = 最初のマッチが画面最下部に最も近い
@@ -2140,6 +2160,25 @@ pub fn detect_worker_error_in(
     for l in &tail15 {
         if l.contains("API Error") {
             return Some((WorkerErrorKind::ApiError, l.trim().to_string()));
+        }
+    }
+
+    // 3'. 末尾 15 行の窓の外へ押し出された**接続系の**エラー（#1847）。狭いペインではエラーの
+    //    行もフッター（区切り線・入力欄・ステータスライン・帯）も折り返して増え、締めの行が
+    //    2 行に割れたり通知行（#2157）が挟まったりすると、エラーの頭の行が 15 行の外へ出る
+    //    （status が idle・recommended_action が null のまま = 9/29 の回線断で 7 体を朝まで放置）。
+    //    ネット復帰の再開（#2112）と**同じ判定**（入力欄を錨に上へ辿る `net_stop::detect`）を通し、
+    //    止まっていると言えるとき（生成中でない・最後の項目が人の発言でない・同じターンに
+    //    失効 / 上限 / 阻害の行が無い）だけ採る。これで status と再開の判定が食い違わない。
+    //    錨で辿るので窓は要らず、材料は画面全体（`whole_screen`）があればそれを使う
+    if !tako_core::dialog::legacy_1847() {
+        let screen: Vec<String> = whole_screen
+            .unwrap_or(output)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if let crate::net_stop::NetScreen::Stopped(stop) = crate::net_stop::detect(&screen) {
+            return Some((WorkerErrorKind::ApiError, stop.message));
         }
     }
 
@@ -2344,10 +2383,24 @@ pub fn detect_model_switched(output: &str) -> Option<(String, String)> {
 pub const CONTEXT_HIGH_THRESHOLD: u32 = 60;
 
 /// worker_status の応答から events 配列を構築する（#243）。
-/// dispatch の finish_worker_status から呼ばれる
+/// 画面の末尾（`recent_output`）だけでダイアログも判定する形（テスト・単体の呼び出し用）
 pub fn collect_worker_events(
     status: &str,
     recent_output: Option<&str>,
+    ctx_percent: Option<u32>,
+) -> Vec<WorkerEvent> {
+    collect_worker_events_on(status, recent_output, recent_output, ctx_percent)
+}
+
+/// [`collect_worker_events`] の本体。dispatch の finish_worker_status から呼ばれる。
+///
+/// 選択肢ダイアログだけは `dialog_screen`（画面全体）で判定する（#1847）。狭いペインの
+/// ダイアログは末尾 30 行に収まらず、`choice_dialog` フィールドは画面全体で見つけたのに
+/// events は見つけない、という食い違いを作らないため。質問・モデル切替は従来どおり末尾で見る
+pub fn collect_worker_events_on(
+    status: &str,
+    recent_output: Option<&str>,
+    dialog_screen: Option<&str>,
     ctx_percent: Option<u32>,
 ) -> Vec<WorkerEvent> {
     let mut events = Vec::new();
@@ -2359,7 +2412,7 @@ pub fn collect_worker_events(
     // question パターンにも必ず掛かる）
     // #748: 種別つきで 1 回だけ検知する（permission / それ以外を同じ構造検知から出す）
     let dialog = if stopped {
-        recent_output.and_then(|out| {
+        dialog_screen.and_then(|out| {
             let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
             crate::claude_tui::detect_choice_dialog(&lines)
         })
