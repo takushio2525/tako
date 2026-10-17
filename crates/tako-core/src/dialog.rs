@@ -396,6 +396,11 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
         .rev()
         .find(|&i| cursor_content(lines[i]).is_some())
     else {
+        // 経路 5: 選択カーソルが走査の窓より上にある背の高いダイアログ（#1847）。
+        // カーソルと全選択肢が採れるので、経路 3 より先に見る
+        if let Some(list) = numbered_above_scan(lines, scan_from, bottom) {
+            return Some(list);
+        }
         // 経路 3: 選択カーソルが 1 つも描かれていない（#1143）
         return detect_cursorless_numbered(lines, bottom);
     };
@@ -690,6 +695,44 @@ fn dialog_reaches_input_box(lines: &[&str], last_row: usize, input_row: usize) -
 fn legacy_input_box_below() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1263_LEGACY").is_some())
+}
+
+/// 経路 5: 選択カーソルが**走査の窓（下端から [`SCAN_ROWS`] 行）より上**にある
+/// 番号つきダイアログを拾う（#1847）。
+///
+/// 狭いペインの AskUserQuestion は説明の折り返しで選択肢 1 つが 6〜10 行になり、
+/// 4 択で箱が 45 行を超える（実採取: claude 2.1.280 / 2.1.301・32 桁。60 桁なら 20 行台）。
+/// ダイアログがペインより高いと claude は**選択カーソルを画面の最上段に**残して下を描くので、
+/// カーソルは窓の外・箱の上端の罫線は画面の外になり、経路 1 も経路 3（罫線か 2 列が要る）も
+/// 外れて検知なしだった（status は waiting なのに respond / read_pane が見つけない = #1847）。
+///
+/// 窓を広げるのではなく、窓より上で最も下の選択カーソル行を起点に**番号つきの並び**を組み、
+/// 並びの最後から画面の下端までが**ダイアログの一部だけ**（空行・説明の折り返し・確定キーの
+/// 案内・罫線）で、案内が 1 行はあるときだけ採る（判定は経路 4 と同じ
+/// [`dialog_reaches_input_box`]。入力欄の代わりに画面の下端までを見る）。窓の中に
+/// 選択カーソル（空の入力欄を含む）が 1 つでもある画面はここへ来ないので、会話ログへ流れた
+/// 解決済みのダイアログ（下に入力欄がある）を拾うことはない
+fn numbered_above_scan(lines: &[&str], scan_from: usize, bottom: usize) -> Option<ChoiceList> {
+    if legacy_1847() {
+        return None;
+    }
+    let cursor_row = (0..scan_from)
+        .rev()
+        .find(|&i| cursor_content(lines[i]).is_some())?;
+    numbered_choice(cursor_content(lines[cursor_row])?)?;
+    let numbered = numbered_block(lines, bottom, cursor_row);
+    if numbered.len() < 2 || !dialog_reaches_input_box(lines, *numbered.last()?, bottom) {
+        return None;
+    }
+    Some(numbered_list(lines, &numbered, cursor_row))
+}
+
+/// #1847 の A/B。`TAKO_1847_LEGACY=1` で #1847 **前**へ戻す（走査の窓より上の選択カーソルを
+/// 拾わない・worker_status がダイアログを末尾 30 行で判定する・`detect_worker_error` が
+/// 末尾 15 行の窓の外の接続エラーを見ない）。tako-control の 2 か所もこの 1 つを読む
+pub fn legacy_1847() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1847_LEGACY").is_ok_and(|v| v == "1"))
 }
 
 // --- 2 列レイアウトとカーソルなしの検知（#1143） ---

@@ -16549,14 +16549,27 @@ fn finish_worker_status(
     }
 
     // ペインの最近の出力（pane のライブ画面 → tmux session フォールバック）
-    let recent_output = live_tail.or_else(|| {
+    let captured = || -> Option<Vec<String>> {
         let ts = tmux_session?;
         if !crate::reach::session_alive(ts) {
             return None;
         }
         let (session, capture) = crate::reach::detached_capture(ts)?;
-        Some(tail_join(capture.capture_screen(&session).ok()?))
-    });
+        capture.capture_screen(&session).ok()
+    };
+    // フォールバックでも画面全体を `full_screen` に残す（#1847。選択肢ダイアログと錨の判定の
+    // 材料 = `apply_worker_status_corrections` の `whole_screen`。respond / read_pane の器越しの
+    // 経路は元から画面全体を見ている。GUI のペインと同じく折りたたみの検出にも効く）
+    let (recent_output, full_screen) = match live_tail {
+        Some(tail) => (Some(tail), full_screen),
+        None => match captured() {
+            Some(lines) => {
+                let full = (!tako_core::dialog::legacy_1847()).then(|| lines.join("\n"));
+                (Some(tail_join(lines)), full)
+            }
+            None => (None, full_screen),
+        },
+    };
 
     // #1880: tako mod の報告が新鮮ならターン状態の一次ソース（`claude agents --json` より先）。
     // permission / question は承認後もツールが返るまで残るので、画面が生成中なら busy を採る
@@ -16919,6 +16932,17 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         }
     }
 
+    // 選択肢ダイアログの検知と、入力欄を錨にした接続エラーの判定は**画面全体**を材料にする
+    // （#1847）。狭いペインの AskUserQuestion は 30 行を超え、末尾 30 行では選択カーソルも
+    // 箱の罫線も窓の外へ落ちる（read_pane / respond は元から画面全体で見ていたので、
+    // status だけが null を返して食い違った）。エラーの頭の行も、背の高いペインで会話と
+    // フッターのあいだが空行で埋まると末尾 30 行の外になる
+    let whole_screen = if tako_core::dialog::legacy_1847() {
+        recent_output.clone()
+    } else {
+        full_screen.clone().or_else(|| recent_output.clone())
+    };
+
     // #224 折りたたみ検出: TUI が「N new messages (click) ↓」で折りたたまれている。
     // **#1273 の判定より前に要る**（折りたたみ中は画面本文が欠けるので画面を根拠にしない）
     let collapsed = full_screen
@@ -17005,7 +17029,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // （`detect_permission_dialog`）を一次の根拠にする。ダイアログは入力欄を
     // 奪っている（= 応答するまで先へ進めない）ので、agents / 画面推定が
     // どちらの状態を出していても停止側が正
-    let permission_dialog = recent_output
+    let permission_dialog = whole_screen
         .as_deref()
         .and_then(crate::orchestrator::wait::permission_dialog_json);
     // #748: permission 以外の選択肢ダイアログ（usage limit の対処選択・モデル選択・
@@ -17013,7 +17037,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // どの種別でも**入力欄を奪っている = 応答するまで先へ進めない**ので waiting へ格上げする。
     // 旧実装は permission だけを見ており、それ以外は idle（= 完了）として通知されていた
     // （#748 の観測 2。master は WORKER_IDLE を受けて報告を待ち続ける）
-    let choice_dialog = recent_output
+    let choice_dialog = whole_screen
         .as_deref()
         .and_then(crate::orchestrator::wait::choice_dialog_json);
     // usage limit の対処ダイアログだけは waiting へ格上げしない（#748）。
@@ -17145,10 +17169,9 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     }
 
     if status == "idle" && error_info.is_none() {
-        if let Some((kind, detail)) = recent_output
-            .as_ref()
-            .and_then(|out| crate::orchestrator::wait::detect_worker_error(out))
-        {
+        if let Some((kind, detail)) = recent_output.as_ref().and_then(|out| {
+            crate::orchestrator::wait::detect_worker_error_on(out, whole_screen.as_deref())
+        }) {
             status = "error".to_string();
             let mut info = json!({
                 "kind": kind.as_str(),
@@ -17195,9 +17218,11 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     }
 
     // #243: events 配列（question / model_switched / context_high / permission_dialog）
-    let mut events: Vec<Value> = crate::orchestrator::wait::collect_worker_events(
+    // ダイアログの判定は上の `choice_dialog` と同じ材料（画面全体。#1847）
+    let mut events: Vec<Value> = crate::orchestrator::wait::collect_worker_events_on(
         &status,
         recent_output.as_deref(),
+        whole_screen.as_deref(),
         ctx_percent,
     )
     .iter()
@@ -35715,6 +35740,79 @@ mod tests {
         assert_eq!(v["status"], "gone");
         assert_eq!(v["status_source"], "none");
         assert!(v["recent_output"].is_null());
+    }
+
+    /// 画面（上から順の行）から、GUI のペインと同じ材料の ctx を組む
+    /// （`collect_worker_status_ctx` と同じく末尾 30 行 + 画面全体）
+    fn screen_ctx_1847(screen: &str) -> WorkerStatusCtx {
+        let lines: Vec<String> = screen.lines().map(str::to_string).collect();
+        WorkerStatusCtx {
+            pane_id: 0,
+            pane_exists: true,
+            backend_session: None,
+            full_screen: Some(lines.join("\n")),
+            live_tail: Some(tail_join(lines)),
+            input_style: None,
+            has_running_children: false,
+            limit_resume: Value::Null,
+            mod_state: Default::default(),
+        }
+    }
+
+    /// #1847 の 2 つ目の症状: 32 桁の AskUserQuestion は 30 行を超え、末尾 30 行では
+    /// `choice_dialog` が null だった（read_pane / respond は画面全体で見つける = 食い違い）
+    #[test]
+    fn issue1847_status_の_choice_dialog_を画面全体で判定する() {
+        const ASK: &str =
+            include_str!("../../tako-core/tests/fixtures/issue1847-ask-32x70-long.txt");
+        let v = finish_worker_status(screen_ctx_1847(ASK), None, None).unwrap();
+        assert_eq!(v["status"], "waiting", "{v}");
+        let dialog = &v["choice_dialog"];
+        assert_eq!(dialog["kind"], "select", "{v}");
+        assert_eq!(dialog["highlighted"], 0);
+        assert_eq!(dialog["options"].as_array().map(Vec::len), Some(6));
+        // 番号は respond が送るキー
+        assert_eq!(dialog["options"][0]["number"], 1);
+        let kinds: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"choice_dialog"), "{kinds:?}");
+        assert!(!kinds.contains(&"question"), "{kinds:?}");
+        // read_pane / respond と同じ答え（同じ関数 = 同じ JSON）
+        assert_eq!(
+            *dialog,
+            crate::orchestrator::wait::choice_dialog_json(ASK).unwrap()
+        );
+    }
+
+    /// #1847 の 1 つ目の症状: 32 桁でエラーの頭の行が末尾 15 行（と 30 行）の外へ出た
+    /// ENOTFOUND の停止を error / api_error / resume と読む
+    #[test]
+    fn issue1847_status_が窓の外の接続エラーを_api_error_と読む() {
+        const STOP: &str = include_str!("../tests/fixtures/issue1847-enotfound-32x40.txt");
+        // 実画面 + 現実に足される 2 行（tmux の focus-events の案内・tako mod の帯）
+        let lines: Vec<&str> = STOP.lines().collect();
+        let rule = lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with('❯'))
+            .unwrap()
+            - 1;
+        let screen = format!(
+            "{}\n  tmux focus-events off · add…\n  tako | worker-1847\n{}",
+            lines[..rule].join("\n"),
+            lines[rule..].join("\n")
+        );
+        let v = finish_worker_status(screen_ctx_1847(&screen), None, None).unwrap();
+        assert_eq!(v["status"], "error", "{v}");
+        assert_eq!(v["error"]["kind"], "api_error");
+        assert_eq!(v["error"]["recommended_action"], "resume");
+        assert_eq!(
+            v["error"]["detail"],
+            "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+        );
     }
 
     #[test]
