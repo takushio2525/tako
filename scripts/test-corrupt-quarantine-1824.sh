@@ -118,11 +118,11 @@ for arm in legacy fixed; do
   shortcuts "$D" "$arm"
   check_eq "空ファイル: 記録 1 行" 1 "$(records "$D")"
 
-  # UTF-8 でない中身（文字として読めない = 退避はできないが、読めなかったことは残す）
+  # UTF-8 でない中身（文字として読めない = バイトのまま退避へ移り、退避先つきで残す。#2231）
   D=$(fresh "$arm-binary")
   printf '\377\376{' > "$D/remote/shortcuts.json"
   shortcuts "$D" "$arm"
-  check_eq "UTF-8 でない中身: 記録 1 行（移行を中止の形）" 1 "$(records "$D")"
+  check_eq "UTF-8 でない中身: 記録 1 行" 1 "$(records "$D")"
 
   # 権限で読めないファイル（root で走らせると読めてしまうので見ない）
   D=$(fresh "$arm-perm")
@@ -134,7 +134,8 @@ for arm in legacy fixed; do
     shortcuts "$D" "$arm"
     check_eq "権限で読めないファイル: 記録 1 行" 1 "$(records "$D")"
   fi
-  chmod 600 "$D/remote/shortcuts.json"
+  # 修正後は退避へ移って表に無い（#2231）
+  chmod 600 "$D/remote/shortcuts.json" 2>/dev/null
   if [ "$arm" = legacy ]; then
     # 修正前の NG は総合判定の失敗に数えず、A/B が取れたかだけを見る
     LEGACY_NG=$((FAIL - ARM_FAIL))

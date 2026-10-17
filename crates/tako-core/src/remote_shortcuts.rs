@@ -203,7 +203,7 @@ impl ShortcutsFile {
     pub fn load_from_checked(path: &Path) -> (Self, Option<LoadIssue>) {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(e) => return (Self::default(), LoadIssue::from_read_error(&e)),
+            Err(e) => return (Self::default(), LoadIssue::read_failed(path, &e)),
         };
         match serde_json::from_str::<Self>(&text) {
             Ok(mut file) => {
@@ -214,15 +214,7 @@ impl ShortcutsFile {
                 }
                 (file, None)
             }
-            Err(e) => {
-                let quarantine =
-                    crate::migration::quarantine_unreadable(path, &crate::migration::FsIo);
-                let issue = LoadIssue::Unparsable {
-                    reason: crate::load_issue::json_reason(&e),
-                    quarantine,
-                };
-                (Self::default(), Some(issue))
-            }
+            Err(e) => (Self::default(), Some(LoadIssue::unparsable(path, &e))),
         }
     }
 
