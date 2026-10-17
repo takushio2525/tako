@@ -1215,7 +1215,13 @@ impl DepCheckMode {
 ///
 /// 戻り値は検出したエージェントと、チェック後も欠けている必須依存を
 /// **人へ残る作業として並べたもの**（#1501。ここで setup を止めない）。
-fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<Remaining>) {
+///
+/// `sleep_guard_answer` = `--answers` の sleep_guard を今の設定へ重ねた値（#1621）。
+/// スリープ防止の段はこの中の 1 か所だけが出す
+fn run_dependency_check(
+    mode: DepCheckMode,
+    sleep_guard_answer: Option<SleepGuardValues>,
+) -> (Vec<DetectedAgent>, Vec<Remaining>) {
     let (agents, unconfirmed) = detect_agents();
     eprintln!("  エージェント CLI:");
     for agent in &agents {
@@ -1313,7 +1319,7 @@ fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<Remainin
         run_fda_check(mode.review_settings);
     }
     // スリープ防止の設定案内
-    run_sleep_guard_check(mode.review_settings);
+    run_sleep_guard_check(mode.review_settings, sleep_guard_answer);
     (agents, missing_required)
 }
 
@@ -1504,20 +1510,83 @@ fn review_mod_ui() -> Option<tako_core::claude_mod_ui::UiAnswers> {
     (!answers.is_empty()).then_some(answers)
 }
 
+/// スリープ防止の mode / power の組
+type SleepGuardValues = (
+    tako_control::sleep_guard::SleepGuardMode,
+    tako_control::sleep_guard::PowerCondition,
+);
+
+/// `--answers` の sleep_guard を今の値へ重ねる（#1621）。答えが無い・中身が空なら `None`。
+///
+/// 段の表示（[`run_sleep_guard_check`]）と書き込み（[`apply_sleep_guard_answers`]）が
+/// **同じこの値**を使うので、表示した値と書いた値がずれない
+fn sleep_guard_from_answers(
+    current: SleepGuardValues,
+    answers: Option<&tako_control::setup::SetupSleepGuardAnswers>,
+) -> Result<Option<SleepGuardValues>, String> {
+    let Some(answers) = answers.filter(|a| a.mode.is_some() || a.power.is_some()) else {
+        return Ok(None);
+    };
+    let (mut mode, mut power) = current;
+    if let Some(value) = answers.mode.as_deref() {
+        mode = tako_control::sleep_guard::SleepGuardMode::from_str_opt(value)
+            .ok_or_else(|| format!("不正な sleep_guard.mode: {value}"))?;
+    }
+    if let Some(value) = answers.power.as_deref() {
+        power = tako_control::sleep_guard::PowerCondition::from_str_opt(value)
+            .ok_or_else(|| format!("不正な sleep_guard.power: {value}"))?;
+    }
+    Ok(Some((mode, power)))
+}
+
+/// スリープ防止の段の見出し（対話の前まで）。`answered` は `--answers` を重ねた値。
+///
+/// **setup の出力でスリープ防止の状態を出すのはここだけ**（#1621）。#1621 前は
+/// `--answers` に sleep_guard があると、この段が当てる前の値と「設定変更:」の案内を出し、
+/// 後段の書き込みが `[input]` の行をもう 1 度出していた（MCP `tako_setup` も同じ経路）
+fn sleep_guard_stage_lines(
+    current: SleepGuardValues,
+    answered: Option<SleepGuardValues>,
+    interactive: bool,
+) -> Vec<String> {
+    if let Some((mode, power)) = answered {
+        return vec![
+            String::new(),
+            format!(
+                "  [input] スリープ防止: mode={}, power={}",
+                mode.as_str(),
+                power.as_str()
+            ),
+        ];
+    }
+    let (mode, power) = current;
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "  スリープ防止: mode={}, power={}",
+            mode.as_str(),
+            power.as_str()
+        ),
+    ];
+    if !interactive {
+        lines.push(
+            "      設定変更: tako sleep-guard set --mode <mode> --power <condition>".to_string(),
+        );
+    }
+    lines
+}
+
 /// スリープ防止（Issue #173）の設定案内。
-/// L0〜L3 の段階式で、ユーザーの利用スタイルに合わせたスリープ防止を設定する
-fn run_sleep_guard_check(interactive: bool) {
+/// L0〜L3 の段階式で、ユーザーの利用スタイルに合わせたスリープ防止を設定する。
+/// `--answers` で値が決まっているときは、その値を出すだけで聞かない（答えが正。#1621）
+fn run_sleep_guard_check(interactive: bool, answered: Option<SleepGuardValues>) {
     let settings = tako_control::settings::load();
     let mode = settings.sleep_guard_mode;
     let power = settings.sleep_guard_power;
-    eprintln!();
-    eprintln!(
-        "  スリープ防止: mode={}, power={}",
-        mode.as_str(),
-        power.as_str()
-    );
-    if !interactive {
-        eprintln!("      設定変更: tako sleep-guard set --mode <mode> --power <condition>");
+    for line in sleep_guard_stage_lines((mode, power), answered, interactive) {
+        eprintln!("{line}");
+    }
+    if !interactive || answered.is_some() {
         return;
     }
     eprintln!("      エージェントが長時間動いている間に PC がスリープすると作業が止まります。");
@@ -2945,28 +3014,17 @@ fn report_instruction_coverage(content: &str) -> InstructionCoverage {
     coverage
 }
 
-fn apply_sleep_guard_answers(
-    answers: Option<&tako_control::setup::SetupSleepGuardAnswers>,
-) -> Result<(), String> {
-    let Some(answers) = answers else {
+/// `--answers` の sleep_guard を書く。**書くだけで何も出さない**（#1621）:
+/// 値は依存チェック段の [`run_sleep_guard_check`] が `[input]` として出し済み
+fn apply_sleep_guard_answers(answered: Option<SleepGuardValues>) -> Result<(), String> {
+    let Some((mode, power)) = answered else {
         return Ok(());
     };
     let mut settings = tako_control::settings::load();
-    if let Some(mode) = answers.mode.as_deref() {
-        settings.sleep_guard_mode = tako_control::sleep_guard::SleepGuardMode::from_str_opt(mode)
-            .ok_or_else(|| format!("不正な sleep_guard.mode: {mode}"))?;
-    }
-    if let Some(power) = answers.power.as_deref() {
-        settings.sleep_guard_power = tako_control::sleep_guard::PowerCondition::from_str_opt(power)
-            .ok_or_else(|| format!("不正な sleep_guard.power: {power}"))?;
-    }
+    settings.sleep_guard_mode = mode;
+    settings.sleep_guard_power = power;
     tako_control::settings::save(&settings)
         .map_err(|e| format!("スリープ防止設定の保存に失敗: {e}"))?;
-    eprintln!(
-        "  [input] スリープ防止: mode={}, power={}",
-        settings.sleep_guard_mode.as_str(),
-        settings.sleep_guard_power.as_str()
-    );
     Ok(())
 }
 
@@ -3185,8 +3243,19 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // **未検出の CLI 依存だけは例外**で、`--review` かどうかに関わらず
     // 「何を・どこへ入れるか」を見せて [y/N] を聞く（#1499。`--yes` は同意扱い、
     // 非 TTY は案内だけで素通り）。FDA・スリープ設定の見直しは従来どおり
-    // `--review` だけが対話になる
-    let (agents, missing) = run_dependency_check(DepCheckMode::for_setup(review_mode, assume_yes));
+    // `--review` だけが対話になる。
+    // `--answers` の sleep_guard は**ここで値を決めて段へ渡す**（#1621）。表示は段の 1 回だけで、
+    // 書き込み（後段の `apply_sleep_guard_answers`）は同じ値を黙って書く
+    let current_sleep_guard = {
+        let settings = tako_control::settings::load();
+        (settings.sleep_guard_mode, settings.sleep_guard_power)
+    };
+    let sleep_guard_answer =
+        sleep_guard_from_answers(current_sleep_guard, answers.sleep_guard.as_ref())?;
+    let (agents, missing) = run_dependency_check(
+        DepCheckMode::for_setup(review_mode, assume_yes),
+        sleep_guard_answer,
+    );
     remaining.extend(missing);
     setup_remaining::legacy_stop(&remaining)?;
     let (selected, selected_source) = if let Some(answer) = answers.selected_agent.as_deref() {
@@ -3487,7 +3556,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         eprintln!("{line}");
     }
     let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
-    apply_sleep_guard_answers(answers.sleep_guard.as_ref())?;
+    apply_sleep_guard_answers(sleep_guard_answer)?;
 
     let dir = setup_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
@@ -3743,6 +3812,89 @@ mod tests {
         assert!(broken
             .iter()
             .any(|l| l.starts_with("  組み込み既定: master=claude")));
+    }
+
+    /// #1621: `--answers` の sleep_guard は今の値へ重ね、空の答えは「答えなし」
+    #[test]
+    fn issue1621_sleep_guardの答えは今の値へ重ね空なら答えなし() {
+        use tako_control::setup::SetupSleepGuardAnswers;
+        use tako_control::sleep_guard::{PowerCondition, SleepGuardMode};
+
+        let current = (SleepGuardMode::WhileAgentsRunning, PowerCondition::AcOnly);
+        let answer = |mode: Option<&str>, power: Option<&str>| SetupSleepGuardAnswers {
+            mode: mode.map(str::to_string),
+            power: power.map(str::to_string),
+        };
+        assert_eq!(sleep_guard_from_answers(current, None), Ok(None));
+        assert_eq!(
+            sleep_guard_from_answers(current, Some(&answer(None, None))),
+            Ok(None),
+            "中身の無い sleep_guard を [input] として出さない"
+        );
+        assert_eq!(
+            sleep_guard_from_answers(current, Some(&answer(Some("off"), None))),
+            Ok(Some((SleepGuardMode::Off, PowerCondition::AcOnly))),
+            "答えの無い power は今の値のまま"
+        );
+        assert_eq!(
+            sleep_guard_from_answers(current, Some(&answer(None, Some("always")))),
+            Ok(Some((
+                SleepGuardMode::WhileAgentsRunning,
+                PowerCondition::Always
+            )))
+        );
+        assert!(sleep_guard_from_answers(current, Some(&answer(Some("nope"), None))).is_err());
+    }
+
+    /// #1621: スリープ防止の段の見出しは、どの経路でも状態の行が 1 行だけ
+    #[test]
+    fn issue1621_スリープ防止の段は状態を1度だけ出す() {
+        use tako_control::sleep_guard::{PowerCondition, SleepGuardMode};
+
+        let current = (SleepGuardMode::WhileAgentsRunning, PowerCondition::AcOnly);
+        let state_lines = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|l| l.contains("スリープ防止: mode="))
+                .count()
+        };
+        // 標準 setup（非対話）: 今の値 + 変え方
+        let standard = sleep_guard_stage_lines(current, None, false);
+        assert_eq!(state_lines(&standard), 1, "{standard:?}");
+        assert!(standard
+            .iter()
+            .any(|l| l == "  スリープ防止: mode=while-agents-running, power=ac-only"));
+        assert!(standard
+            .iter()
+            .any(|l| l.contains("設定変更: tako sleep-guard set")));
+        // `--review`: 今の値のあとに対話が続く（変え方の行は対話が兼ねる）
+        let review = sleep_guard_stage_lines(current, None, true);
+        assert_eq!(state_lines(&review), 1, "{review:?}");
+        assert!(
+            !review.iter().any(|l| l.contains("設定変更:")),
+            "{review:?}"
+        );
+        // `--answers`（MCP `tako_setup` も同じ）: 当てる値を [input] で 1 度だけ。
+        // 当てる前の値も「設定変更:」の案内も出さない（#1621 前はどちらも出ていた）
+        for interactive in [false, true] {
+            let answered = sleep_guard_stage_lines(
+                current,
+                Some((SleepGuardMode::Off, PowerCondition::AcOnly)),
+                interactive,
+            );
+            assert_eq!(state_lines(&answered), 1, "{answered:?}");
+            assert!(answered
+                .iter()
+                .any(|l| l == "  [input] スリープ防止: mode=off, power=ac-only"));
+            assert!(
+                !answered.iter().any(|l| l.contains("while-agents-running")),
+                "当てる前の値を出している: {answered:?}"
+            );
+            assert!(
+                !answered.iter().any(|l| l.contains("設定変更:")),
+                "{answered:?}"
+            );
+        }
     }
 
     // config.yaml のスキーマ・後方互換のテストは tako_control::setup 側にある（Issue #94）
