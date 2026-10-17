@@ -1,0 +1,70 @@
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+────────────────────────────────
+ ☐ Order
+
+Which one should we fix first?
+Both help the master.
+
+❯ 1. Fix the status detection
+     first (Recommended)
+     Replace the tail window
+     with the input anchor so a
+     long footer does not hide
+     the error line.
+  2. Fix dialogs
+     Join wrapped options and
+     key hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one
+     change, but the diff gets
+     larger.
+  4. Investigate only
+     Check each symptom on main
+     and close what is already
+     fixed.
+  5. Type something.
+────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

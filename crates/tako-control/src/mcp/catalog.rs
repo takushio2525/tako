@@ -2233,7 +2233,7 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-        // 出自: #319 / #748 / #1143
+        // 出自: #319 / #748 / #1143 / #2302
         json!({
             "name": "tako_orchestrator_respond",
             "description": "worker の**選択肢ダイアログ**に応答する（ツール承認・usage limit の対処・/model・\
@@ -2243,7 +2243,8 @@ pub fn tools() -> Vec<Value> {
                 options[number, label, highlighted, label_truncated] / numbered / cursor_visible / \
                 labels_truncated（choice_dialog も同じ形）。ダイアログが無ければエラー。\
                 番号つきは番号キーで確定、番号なしは矢印移動 + ラベル一致検証 + Enter。\
-                **labels_truncated=true ならラベルが `…` で打ち切られているので番号でのみ確定できる**\
+                **labels_truncated=true ならラベルが `…` で打ち切られているか説明との境目が読めないので\
+                番号でのみ確定できる**\
                 （ラベル指定はエラー）。cursor_visible=false はカーソルが画面外（highlighted も null。\
                 番号キーは効く）。応答は persist.log に監査記録される。危険なコマンド（rm -rf / \
                 本番 DB 操作等）の承認と、課金・モデル変更を伴う選択肢はユーザーに確認する。",

@@ -17661,7 +17661,8 @@ const NAV_ATTEMPTS: u32 = 3;
 /// `/model` セレクタのように TUI 自身がラベルを打ち切っている画面では、画面に
 /// 残っている文字列は選択肢の識別子ではない（`1. Defaul…` と `2. Opus (…` の
 /// どちらも「Opus 5 の 1M」でありうる）。一致したように見えても**別の選択肢を
-/// 確定してしまう**ので、番号での指定を要求する
+/// 確定してしまう**ので、番号での指定を要求する。狭いペインで**ラベルと説明の境目が
+/// 読めない**選択肢（#2302。画面の `label` はラベルの 1 行目だけ）も同じ扱い
 fn resolve_choice_index(
     dialog: &crate::claude_tui::ChoiceDialog,
     choice: &str,
@@ -17686,7 +17687,7 @@ fn resolve_choice_index(
     let by_label = |i: usize| -> Result<usize, DispatchError> {
         if dialog.options[i].label_truncated {
             return Err(DispatchError::Operation(format!(
-                "選択肢 {} のラベルは画面上で切り詰められている（`{}`）ため、\
+                "選択肢 {} のラベルは画面上で切り詰められているか説明との境目が読めない（`{}`）ため、\
                  ラベル指定では確定できない。番号（--choice {}）で指定する。選択肢: {}",
                 i + 1,
                 dialog.options[i].label,
@@ -17751,7 +17752,7 @@ fn resolve_choice_index(
     // 切り詰められたラベルがある画面では「一致しなかった」も確定的ではない
     // （消えた部分に一致していたかもしれない）ので、番号を促す（#1143）
     let truncated_note = if dialog.labels_truncated() {
-        "（この画面はラベルが切り詰められているので、ラベルでは確定できない。番号で指定する）"
+        "（この画面はラベルが切り詰められているか説明との境目が読めないので、ラベルでは確定できない。番号で指定する）"
     } else {
         ""
     };
@@ -37708,6 +37709,43 @@ mod tests {
         assert!(!dialog.labels_truncated());
         assert_eq!(resolve_choice_index(&dialog, "don't ask again").unwrap(), 1);
         assert_eq!(resolve_choice_index(&dialog, "yes").unwrap(), 0);
+    }
+
+    /// #2302: 32 桁の AskUserQuestion（実採取。claude 2.1.301）。選択肢 1 のラベル
+    /// `status の判定を先に直す（推奨）` は 2 行に割れ、続きと説明が同じ桁に並ぶ
+    const ASK_32X46_2302: &str =
+        include_str!("../../tako-core/tests/fixtures/issue1847-ask-32x46.txt");
+
+    #[test]
+    fn issue2302_境目が読めないラベルはラベル指定で確定させず番号は効く() {
+        let dialog = dialog_of(ASK_32X46_2302);
+        assert!(dialog.labels_truncated());
+        // 1 行目に一致しても確定しない（続きがラベルか説明か画面から分からない）
+        let err = resolve_choice_index(&dialog, "status")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("説明との境目") && err.contains("--choice 1"),
+            "{err}"
+        );
+        // 本来のラベル（60 桁で採った同じダイアログ）でも一致させない
+        let err = resolve_choice_index(&dialog, "status の判定を先に直す")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("番号で指定する"), "{err}");
+        // 説明の文言でほかの選択肢を掴まない（修正前は選択肢 3 のラベルに説明が丸ごと
+        // 混ざっていて、`判定の材料` で選択肢 3 を確定していた）
+        assert!(resolve_choice_index(&dialog, "判定の材料").is_err());
+        // 番号は効く・境目が読めた選択肢はラベルで選べる
+        assert_eq!(resolve_choice_index(&dialog, "1").unwrap(), 0);
+        assert_eq!(
+            resolve_choice_index(&dialog, "両方を 1 つの PR で直す").unwrap(),
+            2
+        );
+        assert_eq!(
+            resolve_choice_index(&dialog, "今回は調査だけにする").unwrap(),
+            3
+        );
     }
 
     #[test]
