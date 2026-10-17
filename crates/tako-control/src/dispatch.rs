@@ -42520,10 +42520,12 @@ mod tests {
         let v = run_1730(&mut host, &file);
         let command = v["command"].as_str().unwrap().to_string();
         assert!(command.ends_with(" x 'y z'"), "{command}");
+        // 引用は実行ペインの方言（#1668。macOS = 単引用符・Windows = バッククオート）
         assert!(
-            command.contains(&tako_core::shell::quote_for_shell(
-                &file.display().to_string()
-            )),
+            command.contains(
+                &tako_core::platform::shell::run_pane_dialect()
+                    .quote_fragment(&file.display().to_string())
+            ),
             "移った先から引けるよう絶対パス: {command}"
         );
         assert_eq!(v["cwd"], base.join("sub").display().to_string().as_str());
