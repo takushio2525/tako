@@ -2376,24 +2376,37 @@ mod tests {
     ///
     /// #390 の不変条件（ペインが消えても worker は生きている）を、呼び出し側の
     /// 取り違えから守る二重の防御。`mark_closed_by_origin` は `registry_path()` を
-    /// 見るので、共有の一時レジストリ（`#[cfg(test)]` ではプロセス固有）へ登録して測る
+    /// 見るので、共有の一時レジストリ（`#[cfg(test)]` ではプロセス固有）へ登録して測る。
+    ///
+    /// 共有ファイルは並列の他のテストも書くので、比べるのは**このテストのエントリだけ**（#2248）。
+    /// 書き手は 2 種類: 別のペインの登録（spawn のテストの `record_spawn`）と、一覧の GC
+    /// （`issue390_workersリストがdispatchで返る` の `sweep_dead` = 見えないペインの active へ
+    /// `dead_since` を刻む）。`dead_since` は GC の欄で close の経路は触らないので、比べる前に外す
     #[test]
     fn pty死亡はmark_closed_by_originで倒さない() {
         let shared = registry_path().unwrap();
         // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
         let pane = tako_core::unused_id::pane().as_u64();
         let id = record_spawn(sample_record(pane)).expect("共有レジストリへ登録できる");
-        let before = std::fs::read_to_string(&shared).unwrap();
+        let own = || {
+            let mut entry = WorkerRegistry::load_from(&shared).unwrap().workers[&id].clone();
+            entry.dead_since = None;
+            entry
+        };
+        let before = own();
+        // 並列の書き手の 2 種類をここで必ず挟む（ファイル全体を比べる形へ戻すと毎回落ちる = #2248）
+        let other = record_spawn(sample_record(tako_core::unused_id::pane().as_u64()))
+            .expect("並列のテストの登録");
+        WorkerRegistry::mutate_at(&shared, |reg| {
+            // GC の初観測と同じ書き込み（`sweep_dead_at` の mark）
+            reg.workers.get_mut(&id).unwrap().dead_since = Some(crate::sessions::now_iso());
+        })
+        .unwrap();
 
         mark_closed_by_origin(pane, CloseOrigin::ProcessExit, None).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&shared).unwrap(),
-            before,
-            "PTY 死亡でファイルを書き換えてはいけない"
-        );
-        let reg = WorkerRegistry::load_from(&shared).unwrap();
+        assert_eq!(own(), before, "PTY 死亡でエントリを書き換えてはいけない");
         assert!(
-            reg.workers[&id].is_active(),
+            own().is_active(),
             "PTY 死亡で active を倒してはいけない（#390）"
         );
 
@@ -2408,6 +2421,7 @@ mod tests {
         // 後始末（共有ファイルなので自分のエントリだけ消す）
         let _ = WorkerRegistry::mutate_at(&shared, |reg| {
             reg.workers.remove(&id);
+            reg.workers.remove(&other);
         });
     }
 }

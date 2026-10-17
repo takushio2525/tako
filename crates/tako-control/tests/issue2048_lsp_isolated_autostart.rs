@@ -261,7 +261,14 @@ fn env_の読みを出す子プロセス() {
 /// 関係する env を全部外し、`vars` だけを立てた子プロセスで読みを測る
 fn probe(vars: &[(&str, &str)]) -> (bool, bool) {
     let mut command = Command::new(std::env::current_exe().unwrap());
-    command.args(["--exact", "env_の読みを出す子プロセス", "--nocapture"]);
+    // `--test-threads=1`: 子の出力の形を親の env（`RUST_TEST_THREADS`）に依らず 1 つに決める。
+    // 直列の libtest は `test <名前> ... ` を改行せずに出すので、子の 1 行目はその後ろへつながる（#2248）
+    command.args([
+        "--exact",
+        "env_の読みを出す子プロセス",
+        "--test-threads=1",
+        "--nocapture",
+    ]);
     for key in [
         "TAKO_ISOLATED",
         "TAKO_SELF_TEST",
@@ -275,9 +282,10 @@ fn probe(vars: &[(&str, &str)]) -> (bool, bool) {
     command.env(PROBE_ENV, "1").envs(vars.iter().copied());
     let output = command.output().expect("子プロセスを起こせる");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // 目印は行頭とは限らない（上の `--test-threads=1` で `test <名前> ... ` の後ろへ続く）
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("TAKO_2048_PROBE "))
+        .find_map(|l| l.split_once("TAKO_2048_PROBE ").map(|(_, rest)| rest))
         .unwrap_or_else(|| panic!("子プロセスが読みを出さない: {stdout}"));
     let flag = |name: &str| line.contains(&format!("{name}=true"));
     (flag("autostart"), flag("fetch"))

@@ -329,9 +329,12 @@ fn 本番の口で送った値を出す子プロセス() {
 fn probe(scratch: &Scratch, mode: &str, vars: &[(&str, &str)]) -> Value {
     let _ = std::fs::remove_file(scratch.log());
     let mut command = Command::new(std::env::current_exe().unwrap());
+    // `--test-threads=1`: 子の出力の形を親の env（`RUST_TEST_THREADS`）に依らず 1 つに決める。
+    // 直列の libtest は `test <名前> ... ` を改行せずに出すので、子の 1 行目はその後ろへつながる（#2248）
     command.args([
         "--exact",
         "本番の口で送った値を出す子プロセス",
+        "--test-threads=1",
         "--nocapture",
     ]);
     for key in [
@@ -355,9 +358,10 @@ fn probe(scratch: &Scratch, mode: &str, vars: &[(&str, &str)]) -> Value {
         .envs(vars.iter().copied());
     let output = command.output().expect("子プロセスを起こせる");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // 目印は行頭とは限らない（上の `--test-threads=1` で `test <名前> ... ` の後ろへ続く）
     let line = stdout
         .lines()
-        .find_map(|l| l.strip_prefix("TAKO_2035_PROBE sent="))
+        .find_map(|l| l.split_once("TAKO_2035_PROBE sent=").map(|(_, rest)| rest))
         .unwrap_or_else(|| {
             panic!(
                 "子プロセスが値を出さない: {stdout}\n{}",
