@@ -122,6 +122,16 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
   `trap` で撤去する。ビルド中に origin/main が進んだら**何も作らず中止**する（旧版はここで
   push が拒否されて無言で死に、未 push のリリースコミットごと detached を残していた =
   同じ版が別 SHA で 2 本できる原因）。多重起動ロックは HOME 単位 + **リポジトリ単位**の 2 段
+- **戻した main は origin/main へ追従させる（#2262）**: 旧版が残した detached（先端が夜間リリースのコミット・clean）は
+  main へ戻し、その main が origin/main より古ければ **fast-forward できるときだけ**追従させる。launchd が翌夜に読むのは
+  共有ツリーの nightly-release.sh なので、戻すだけだと翌夜は古い main の夜間が走り、旧版と新版が 1 日おきに入れ替わる
+  （旧 Mac の実例 = 下の「今の 2 台」）。戻し先を origin/main にしない（`checkout -B main origin/main` / detach）のは
+  #1136 の理由を守るため: HEAD はブランチ main のまま・main のコミットを書き換えも捨てもしない・共有ツリーにコミットを
+  作らない。main に origin/main に無いコミットがある（分岐）・untracked が上書きされるので ff できないときは触らず
+  WARN と通知（今夜のリリースは止めない）。fetch できなければ手元の origin/main まで追従し、`--dry-run` でも戻すので
+  追従もする。追従するのは戻した夜だけで、ブランチ main のまま古くなった共有ツリーは動かさない。モックは
+  `/bin/bash scripts/test-nightly-restore-main-2262.sh`（CI の macOS ジョブ。A/B は `TAKO_2262_LEGACY=1`、
+  修正前の版に当てるときは `NIGHTLY_UNDER_TEST=<file>`）
 - **中のビルドは順番待ち（#1994）を通る**: `build-app.sh` のリリースビルドは `scripts/lib/queue.sh` の
   `run_heavy` を通り、env の `TAKO_QUEUE_PRIORITY=low` / `TAKO_QUEUE_MAX_WAIT=3h` で人や worker の後ろへ並ぶ
   （3 時間で諦めた `tako queue` は 75 で返り、その夜のリリースは失敗として通知される）。launchd の PATH は先頭が
@@ -333,7 +343,10 @@ push の直前に「ビルド中に origin/main が進んだ」（= 旧 Mac が 
     （10/12・10/14・10/16 の WARN）。footprint の見張り（v0.8.35 から）も同じ理由で飛ぶ
   - 翌夜は launchd がその古い main の nightly-release.sh（#1136 / #1892 / #2023 より前 = 共有ツリーをその場で detach して
     リリースする版）を読むので検査が無く、共有ツリーをまたリリースのコミットで detached のまま残す
-  - `restore_detached_head` がローカルの main の鮮度を見ないことと旧 Mac の共有ツリーの状態の問題で、#2252 の範囲外（別 Issue）
+  - 真因は `restore_detached_head` がローカルの main の鮮度を見なかったことで、**#2262 で直した**（上の「夜間リリース」の節の
+    「戻した main は origin/main へ追従させる」）。旧 Mac には修正が origin/main に入れば自力で届く: 古い版の夜は共有ツリーを
+    最新の origin/main（修正入り）のリリースのコミットで detach し、翌夜の新しい版が main へ戻して追従させる（2〜3 晩で揃う）。
+    旧 Mac の main に独自のコミットがあるとそこで WARN と通知が出て止まるので、そのときだけ管轄の master と調整する
 
 ## 安定版への昇格（#403 / #1853 / #1592）
 

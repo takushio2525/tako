@@ -310,6 +310,12 @@ jobs:
       # タグ・Release をする・検査が回らない・役を設定しない 1 台の夜間が変わる形へ戻ったらここで落ちる**（#2252）
       - name: 夜間の役（検査だけ）のモックテスト
         run: /bin/bash scripts/test-nightly-role-2252.sh
+      # 夜間が戻した共有ツリーの main を origin/main へ追従させる（fast-forward できるときだけ）モックテスト。
+      # origin は一時ディレクトリの bare リポ、旧版の夜間・release.sh・検査の 2 つ・cargo・gh は代役、HOME も
+      # 隔離するので本番のタグ・Release・launchd には触らない。**ローカル main が古い共有ツリーで旧版と新版の
+      # 夜間が 1 日おきに入れ替わる・独自のコミットのある main を動かす形へ戻ったらここで落ちる**（#2262）
+      - name: 夜間の共有ツリーの main の追従のモックテスト
+        run: /bin/bash scripts/test-nightly-restore-main-2262.sh
       # 夜間リリースの PATH（先頭 ~/.cargo/bin に順番待ちを知らない古い tako）でも、run_heavy と
       # build-app.sh のリリースビルドが順番待ちを通るモックテスト。tako・cargo は代役で、
       # .app の置き場も偽物へ差し替えるので本物の tako・順番待ち・ビルドには触らない。
