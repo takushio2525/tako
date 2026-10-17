@@ -349,6 +349,20 @@ mod tests {
         }
     }
 
+    /// `wait_gone` の両端: 居続ける pid は上限で諦めて `false`、居ない pid は待たずに `true`
+    #[test]
+    fn wait_goneは居続けるpidを上限で諦め居ないpidは待たない() {
+        use std::time::Duration;
+        assert!(
+            !wait_gone(std::process::id(), Duration::from_millis(30)),
+            "自分は居なくならない"
+        );
+        assert!(
+            wait_gone(u32::MAX, Duration::ZERO),
+            "居ない pid は上限 0 でも 1 回目で true"
+        );
+    }
+
     #[test]
     fn no_console_windowを通しても子プロセスの結果は変わらない() {
         // 境界が「ウィンドウを出さない」以外の副作用を持たないことの回帰テスト。
