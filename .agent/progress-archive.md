@@ -615,3 +615,9 @@
 - 2026-10-17 #2201: usage 分析 S2 = 会話記録の使用量の索引 `<data_dir>/usage/` と `tako usage --by/--window`・MCP `tako_sessions` usage の by / window / account
 - 2026-10-17 #1790 項目 2: `truncate_path_middle` の末尾省略・`trim_detail`・`prompt_head` を固定値テストで固定してから `truncate_chars` へ寄せる
 - 2026-10-17 #2213: #2161 の番犬も XNU の half-close の起こしの取りこぼしで 120 秒落ちうる → FIN 待ちを 500 ms で区切り、新しい接続で往復をやり直す
+- 2026-10-17 #1838: setup の打ち切りテストで probe_timeouts が空の間欠 = 偽の子の初回 exec の検査が 30 秒の上限を食っていた
+- 2026-10-17 #2217: 右パネルの `git_feedback_text` の文字数の切り詰めを固定値テストで固定してから `truncate_chars(…, max + 1)` へ寄せる
+- 2026-10-17 #2202: usage 分析 S3 = 観測した利用制限の % の増分を区間の使用量の比で段へ配る `tako_core::usage::share`・5h / 7d の % 列・tako の外・推定
+- 2026-10-17 #1829: serde_json の `preserve_order` をワークスペースの依存で全メンバーへ有効にし、CLI の JSON の並びを単独ビルドと配布形で揃えた
+- 2026-10-17 #1825: 壊れた default.yaml では専用プロファイルを作らず、`projects add` は登録だけ成功させて warnings / persist.log に理由・中身は `.unreadable.bak` へ
+- 2026-10-17 #2222: 作りたての偽の実行ファイルを短い上限で待つテストを洗い出し、空打ちの共通の補助 `tako_core::fake_exec` / `scripts/lib/fake-exec.sh` へ通した

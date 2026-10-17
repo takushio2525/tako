@@ -20,24 +20,6 @@
 
 ---
 
-## 2026-10-17（#1838: setup の打ち切りテストで probe_timeouts が空の間欠 = 偽の子の初回 exec の検査が 30 秒の上限を食っていた）
-- 偽の子を作った時点で空打ち・A/B `TAKO_1838_LEGACY=1` で修正前 10/10 落ち → 修正後 0/10・製品コード不変。PR #2218
-
-## 2026-10-17（#2217: 右パネルの `git_feedback_text` の文字数の切り詰めを固定値テストで固定してから `truncate_chars(…, max + 1)` へ寄せる）
-- 総当たり A/B 33,230 件の差は「行を落とさず 601 文字ちょうど」の 324 件だけ・行数の切り詰めは不変。PR #2219
-
-## 2026-10-17（#2202: usage 分析 S3 = 観測した利用制限の % の増分を区間の使用量の比で段へ配る `tako_core::usage::share`・5h / 7d の % 列・tako の外・推定）
-- 合成データでキーの誤差 1 pt 以内・実データで 7d の合計 = 観測・実経路 26 PASS・mod の無いログインは `available: false`・カタログ +32 B。PR #2221
-
-## 2026-10-17（#1829: serde_json の `preserve_order` をワークスペースの依存で全メンバーへ有効にし、CLI の JSON の並びを単独ビルドと配布形で揃えた）
-- tako-core の lib.rs 末尾にコンパイル時の番犬（`Map::shift_insert`）・`scripts/test-cli-json-key-order-1829.sh` 修正前 27/8 → 後 35/0・配布物の出力は不変。PR #2220
-
-## 2026-10-17（#1825: 壊れた default.yaml では専用プロファイルを作らず、`projects add` は登録だけ成功させて warnings / persist.log に理由・中身は `.unreadable.bak` へ）
-- 直したら `tako migrate run` で継承して作る。A/B `TAKO_1825_LEGACY=1`・結合テスト 5 本 + 番犬。`tako master` 側の残りは #2227。PR #2224
-
-## 2026-10-17（#2222: 作りたての偽の実行ファイルを短い上限で待つテストを洗い出し、空打ちの共通の補助 `tako_core::fake_exec` / `scripts/lib/fake-exec.sh` へ通した）
-- Rust 11 ファイル・CI のシェル 2 本・A/B `TAKO_2222_LEGACY=1`（#2218 の `TAKO_1838_LEGACY` を統合）・20 回 240/240 緑。残りは #2228。PR #2225
-
 ## 2026-10-17（#1824: recent / shortcuts の破損を `data_files` 経由で persist.log へ・layout の `.corrupt` rename を番号付きの退避 `stash_unrestorable` へ）
 - A/B `TAKO_1824_LEGACY=1`・`scripts/test-corrupt-quarantine-1824.sh` 16 PASS・理由は `json_reason`（値を載せない）。残りは #2230 / #2231。PR #2226
 
@@ -79,3 +61,21 @@
 
 ## 2026-10-17（#1891: check-health に tako mod の項目 = `claude_mod` 節（`tako mod --json` と同じキー・同じ値・同じ行の関数）・報告の無い理由をコマンド行と起動時の env で 1 つに決める `classify_no_report`）
 - `tako mod` も背景の段で仕上げる（`OffloadJob::ModStatus`）・上限 8 ペイン・A/B `TAKO_1891_LEGACY=1`・実経路 48 PASS・カタログ +74 B。PR #2250
+
+## 2026-10-17（#2255: check-health の認証確認を上限つき（既定 10 秒・3 系統を並べて）にし、打ち切りは「認証: 不明（N 秒で応答なし）」）
+- `setup_bootstrap::status_all_within` / `agent_probe::output_within`・A/B `TAKO_2255_LEGACY=1`・番犬 `issue2255_diagnostics_auth_probe_watchdog`（call_graph で collect から辿る）・実経路 41 PASS。残りの上限なし 3 か所は #1533 へ。PR #2259
+
+## 2026-10-17（#2254: tako queue の実行中の予約をピーク後に返し、見込みを過去の記録 `resources/history.jsonl` から引く。諦めた件に押さえていた処理と量を出す）
+- A/B `TAKO_2254_LEGACY=1`・`scripts/test-queue-reservation-2254.sh` PASS=14・番犬 `issue2254_queue_reservation_watchdog`・カタログ +0 B。PR #2258
+
+## 2026-10-17（#2256: 黙った既定落としの残り = worker の spawn・解消エージェントは「立てて警告」（`load_caller_profile`・退避つき）、adopt の起動時プロファイル・guide・自動復帰の既定は読むだけで理由（`read_for_judgment`）。`guide local-rules` は「無い」ではなく「読めない」を返す）
+- A/B `TAKO_2256_LEGACY=1`・結合 2 本 + 番犬の注入 23 → 40 種・カタログ増 0 B。PR #2260
+
+## 2026-10-17（#2252: 夜間リリースに「検査だけ」の役 = `scripts/nightly-release.sh --role check`。2 台構成でリリースしない PC は mod の検査と footprint の見張りだけ・既定は全部）
+- モック 75 PASS・旧版に当てると 31 FAIL。手元の Mac に `--role check` を設定済み。旧 Mac で検査が回っていない件は #2262。PR #2261
+
+## 2026-10-17（#2248: 子のテストバイナリの目印を `split_once` で拾い子を `--test-threads=1` で起こす = issue2035 / issue2048・番犬 `issue2248_child_marker_watchdog`。registry のテストは共有 workers.yaml の自分のエントリだけを `dead_since` を外して比べる）
+- `RUST_TEST_THREADS=1` で修正前 2 本落ち → 修正後 0・並列の書き手の注入でファイル全体の比較は落ちる・全体テスト並列 1 / 2 / 4 で緑。PR #2263
+
+## 2026-10-17（#2262: 夜間が戻した共有ツリーの main を origin/main へ fast-forward で追従 = `follow_origin_main`。独自のコミット / untracked で ff できないときは触らず WARN と通知・A/B `TAKO_2262_LEGACY=1`）
+- モック `scripts/test-nightly-restore-main-2262.sh` 79 PASS（修正前は 3 晩が 新 / 旧 / 新 で 22 FAIL）。戻した夜以外の追従は #2264。PR #2265
