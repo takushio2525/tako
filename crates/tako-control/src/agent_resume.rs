@@ -76,6 +76,14 @@ fn conversation_id_for_pid(agent: Agent, pid: u32) -> Option<String> {
 /// 候補が複数あれば**いちばん新しいもの**（pid の大きいもの）を採る
 /// （`codex_session::resolve_thread_ids_with` と同じ選び方）
 pub fn agent_pid_in(probe: &PaneProbe, snap: &ProcessSnapshot) -> Option<(Agent, u32)> {
+    pane_pids_newest_first(probe, snap)
+        .into_iter()
+        .find_map(|pid| Some((agent_of_command(snap.argv(pid)?)?, pid)))
+}
+
+/// ペイン配下のプロセスの pid（**新しいもの = pid の大きいものから**。純粋関数）。
+/// [`agent_pid_in`] と、報告の無い claude を探す `claude_mod`（#1891）が同じ辿り方を使う
+pub fn pane_pids_newest_first(probe: &PaneProbe, snap: &ProcessSnapshot) -> Vec<u32> {
     // **ペインのプロセスそのものも見る**（`descendants_with_root`）。器のペインは
     // ふつうログインシェルでエージェントはその子だが、コマンドを直接起動した
     // ペイン（`tako run` / 器へ直に流し込んだ場合）ではエージェントがペイン
@@ -88,13 +96,12 @@ pub fn agent_pid_in(probe: &PaneProbe, snap: &ProcessSnapshot) -> Option<(Agent,
             .flat_map(|pid| snap.descendants_with_root(pid))
             .collect(),
         (None, Some(pid)) => snap.descendants_with_root(pid),
-        (None, None) => return None,
+        (None, None) => return Vec::new(),
     };
-    pids.dedup();
     pids.sort_unstable();
+    pids.dedup();
     pids.reverse();
-    pids.into_iter()
-        .find_map(|pid| Some((agent_of_command(snap.argv(pid)?)?, pid)))
+    pids
 }
 
 /// ペインごとの (系統, 会話 ID) を採る。
