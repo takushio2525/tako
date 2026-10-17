@@ -698,7 +698,8 @@ mod tests {
         assert_eq!(extract_version_from_path(&path_new), "2.1.220");
 
         // パスに版が無く、実体も無いので CLI フォールバックも空を返す
-        let unknown = std::env::temp_dir().join("tako-936-no-such-claude");
+        let scratch = tako_core::test_residue::ScratchDir::new("stale-binary-936");
+        let unknown = scratch.join("no-such-claude");
         assert_eq!(extract_version_from_path(&unknown), "");
     }
 

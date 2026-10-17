@@ -1061,7 +1061,9 @@ mod tests {
     /// （呼び出し側は `claude --version` へ落ちる）まで含めて実環境で確かめる
     #[test]
     fn 版リソースは取れないときnoneを返す() {
-        let missing = std::env::temp_dir().join("tako-936-does-not-exist.exe");
+        // 一意な置き場の、作っていない子（#1666。固定名の一時パスをテストに置かない）
+        let scratch = crate::test_residue::ScratchDir::new("exe-936");
+        let missing = scratch.join("does-not-exist.exe");
         assert_eq!(file_version(&missing), None);
         if !cfg!(windows) {
             let name = find("sh").expect("sh を解決できない");

@@ -395,7 +395,10 @@ mod tests {
     #[test]
     fn prune_dead_folders_は実体消失エントリを除去する() {
         let mut tab = Tab::new("t", Pane::new(PaneOrigin::User));
-        let tmp = std::env::temp_dir().join("tako_test_prune_tab_171");
+        // 消えるフォルダは一意な置き場の子にする（#1666。固定名だと並行する別の
+        // cargo test が同じフォルダを作り直し、消失を確かめる前に生き返る）
+        let scratch = crate::test_residue::ScratchDir::new("prune-tab-171");
+        let tmp = scratch.join("pinned");
         std::fs::create_dir_all(&tmp).unwrap();
         tab.add_pinned_folder(tmp.clone());
         assert_eq!(tab.pinned_folders().len(), 1);

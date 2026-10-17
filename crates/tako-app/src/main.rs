@@ -97642,10 +97642,8 @@ mod git_ancestor_tests {
 
     #[test]
     fn 一時ディレクトリで_false() {
-        let dir = std::env::temp_dir().join("tako-test-no-git");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tako_core::test_residue::ScratchDir::new("no-git");
         assert!(!has_git_ancestor(&dir));
-        let _ = std::fs::remove_dir(&dir);
     }
 }
 

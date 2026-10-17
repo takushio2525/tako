@@ -1075,19 +1075,12 @@ TAIL
         (bin, log)
     }
 
-    /// テスト用の一時ディレクトリ（本番の data dir・ホームには触らない）
+    /// テスト用の一時ディレクトリ（本番の data dir・ホームには触らない）。
+    /// スコープを抜けると panic でも消える（#1312 の器。手書きの後始末は assert が
+    /// 落ちた回に届かず `tako-758-…` が残っていた = #1666）
     #[cfg(unix)]
-    fn temp_dir_for(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tako-758-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
-        dir
+    fn temp_dir_for(name: &str) -> tako_core::test_residue::ScratchDir {
+        tako_core::test_residue::ScratchDir::new(&format!("autorename-758-{name}"))
     }
 
     #[cfg(unix)]
@@ -1174,8 +1167,6 @@ TAIL
             !calls[2].contains(STRICT_MCP_FLAG),
             "学習後に付け直さない: {calls:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 受け入れ 2（#758）: フラグを受け付ける CLI では 2 回目以降もフラグ付きのままで、
@@ -1212,8 +1203,6 @@ TAIL
             !legacy_calls[3].contains(STRICT_MCP_FLAG),
             "legacy でフラグを付けている: {legacy_calls:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// エッジ（#758）: claude が何をしても失敗する（リミット・認証切れ相当）なら
@@ -1252,8 +1241,6 @@ TAIL
             None
         );
         assert_eq!(arg_lines(&log).len(), 2, "起動失敗で再試行している");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// エッジ（#758）: **上限に当たった起動は [`ClaudeRun::Failed`]**（再試行しない側）。
@@ -1305,9 +1292,9 @@ TAIL
         let calls = arg_lines(&log);
         assert!(calls.len() <= 1, "打ち切りなのに再試行している: {calls:?}");
 
-        // pid の置き場ごと消す前に孫を止める
+        // pid の置き場ごと消す前に孫を止める（置き場の `dir` はスコープの終わりで消える。
+        // panic の巻き戻しでも後に宣言した `grandchild` が先に落ちるので順番は同じ）
         drop(grandchild);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `run_learning_strict` を偽の起動結果で回し、(結果, 渡した strict の並び) を返す

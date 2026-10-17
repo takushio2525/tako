@@ -748,10 +748,8 @@ mod tests {
 
     #[test]
     fn ポリシー判定は読めないファイルでは何も言わない() {
-        let dir = std::env::temp_dir().join("tako-1068-policy-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = tako_core::test_residue::ScratchDir::new("remote-1068-policy");
         let missing = dir.join("missing.json");
-        let _ = std::fs::remove_file(&missing);
         assert_eq!(policy_blocker_at(&missing), None);
 
         let broken = dir.join("broken.json");
@@ -769,7 +767,6 @@ mod tests {
             Some(on.display().to_string()),
             "true のときだけ断る"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 不適格の種別を足したら文言も足す。**`kind()` の match 腕をソースから採る**ので、

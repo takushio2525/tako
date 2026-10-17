@@ -5151,9 +5151,7 @@ mod tests {
 
     #[test]
     fn profile_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("tako-test-profiles");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tako_core::test_residue::ScratchDir::new("orchestrator-profiles");
         let name = "test-roundtrip";
         let path = tmp.join(format!("{name}.yaml"));
         let p = Profile {
@@ -5168,7 +5166,6 @@ mod tests {
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.model.as_deref(), Some("test-model"));
         assert_eq!(loaded.projects.as_ref().unwrap(), &["a"]);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

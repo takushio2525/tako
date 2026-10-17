@@ -810,10 +810,9 @@ mod tests {
     #[test]
     #[ignore = "Finder を操作しファイルをゴミ箱へ移すため手動確認用（cargo test -- --ignored）"]
     fn ゴミ箱移動は悪意あるファイル名を安全に扱う() {
-        let dir = std::env::temp_dir().join(format!("tako_trash_e2e_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let marker = std::env::temp_dir().join("tako_trash_e2e_pwned");
-        let _ = std::fs::remove_file(&marker);
+        // 置き場も目印も一意な dir の中（#1666。固定名の目印は並行する別の実行と取り合う）
+        let dir = tako_core::test_residue::ScratchDir::new("trash-e2e");
+        let marker = dir.join("pwned");
 
         // 改行 / " / \ / do shell script を含むファイル名（/ と NUL 以外は macOS で合法）
         let evil_name = "ev\"il\n `do shell script` \\ .txt";
@@ -825,7 +824,6 @@ mod tests {
 
         assert!(!evil.exists(), "ファイルが削除されていない");
         assert!(!marker.exists(), "インジェクションの副作用が発生した");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 通知は「出せたか」を返す（#617）。出せない環境で黙って消えるのを防ぐため、

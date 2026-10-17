@@ -724,8 +724,7 @@ mod tests {
     #[test]
     fn ページサイズはptへ正規化される() {
         // MediaBox 16x16 pt の最小 PDF
-        let dir = std::env::temp_dir().join("tako_pdf_win_size_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tako_core::test_residue::ScratchDir::new("pdf-win-size");
         let path = dir.join("minimal.pdf");
         std::fs::write(&path, minimal_pdf()).unwrap();
 
@@ -737,14 +736,12 @@ mod tests {
             (w - 16.0).abs() < 0.01 && (h - 16.0).abs() < 0.01,
             "pt へ正規化されている: got {w}x{h}（px のままなら 21.33）"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 壊れた PDF・不在・空はパニックせず理由つきの Err になる
     #[test]
     fn 異常なpdfはエラーになる() {
-        let dir = std::env::temp_dir().join("tako_pdf_win_error_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tako_core::test_residue::ScratchDir::new("pdf-win-error");
         let key = PdfRasterKey::for_view(1.0, 1.0, 612.0);
 
         let missing = dir.join("no-such.pdf");
@@ -763,8 +760,6 @@ mod tests {
         let full = minimal_pdf();
         std::fs::write(&truncated, &full[..full.len() / 2]).unwrap();
         assert!(render_all_pages(&truncated, key).is_err(), "切り詰め");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// テキストレイヤは取れないが Err ではなく空を返す
@@ -777,8 +772,7 @@ mod tests {
     /// 壊れた PDF や不在ファイルでリンク・アウトラインはパニックせず空を返す
     #[test]
     fn 異常なpdfでリンクとアウトラインは空で返る() {
-        let dir = std::env::temp_dir().join("tako_pdf_win_link_error_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tako_core::test_residue::ScratchDir::new("pdf-win-link-error");
 
         let missing = dir.join("no-such.pdf");
         assert!(extract_links(&missing, 1).unwrap().is_empty());
@@ -788,15 +782,12 @@ mod tests {
         std::fs::write(&broken, b"not a pdf").unwrap();
         assert!(extract_links(&broken, 1).unwrap().is_empty());
         assert!(extract_outline(&broken, 1).unwrap().is_empty());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// リンク入り PDF を自前生成し、lopdf で URI リンクと内部リンクの両方が読めることを検証
     #[test]
     fn リンク注釈を抽出できる() {
-        let dir = std::env::temp_dir().join("tako_pdf_win_links_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tako_core::test_residue::ScratchDir::new("pdf-win-links");
         let path = dir.join("with_links.pdf");
         std::fs::write(&path, pdf_with_links()).unwrap();
 
@@ -836,15 +827,12 @@ mod tests {
             assert!(link.bbox[2] > 0.0, "幅 > 0");
             assert!(link.bbox[3] > 0.0, "高さ > 0");
         }
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// アウトライン入り PDF でしおりが読めることを検証
     #[test]
     fn アウトラインを抽出できる() {
-        let dir = std::env::temp_dir().join("tako_pdf_win_outline_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tako_core::test_residue::ScratchDir::new("pdf-win-outline");
         let path = dir.join("with_outline.pdf");
         std::fs::write(&path, pdf_with_outline()).unwrap();
 
@@ -860,8 +848,6 @@ mod tests {
         if let PreviewOutlineTarget::PdfPage { page } = &items[1].target {
             assert_eq!(*page, 2);
         }
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// リンク注釈を含む 2 ページ PDF を生成。

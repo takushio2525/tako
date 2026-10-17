@@ -1007,7 +1007,9 @@ mod tests {
     /// 読めないディレクトリを渡しても落ちない（走査は空を返す）
     #[test]
     fn 走査できない置き場では空を返す() {
-        let missing = std::env::temp_dir().join("tako-1296-unit-missing-このパスは存在しない");
+        // 一意な置き場の、作っていない子（#1666。固定名の一時パスをテストに置かない）
+        let scratch = ScratchDir::new("residue-unit-missing");
+        let missing = scratch.join("このパスは存在しない");
         let (items, outcome) = sweep_in(
             &missing,
             &["tako-test-data-"],
