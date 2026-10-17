@@ -2029,88 +2029,21 @@ pub struct Loaded {
 /// `migration::quarantine_raw`。recent / shortcuts と同じ口。#2238）。以前は 1 本目が空いて
 /// いるときだけ写していたので、別の中身で 2 回目に壊れると次の変更の操作の書き込みが消していた
 pub fn load_from(path: &Path) -> Loaded {
-    if crate::load_issue::legacy_2238() {
-        return legacy_2238_load_from(path);
-    }
-    match std::fs::read_to_string(path) {
-        Ok(text) => from_text(path, &text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded {
-            config: UiConfig::default(),
-            state: LoadState::Absent,
-        },
-        Err(e) => unreadable_bytes(path, &e),
-    }
-}
-
-/// 文字として読めなかった中身をバイトのまま移して既定で動く（#2238）
-fn unreadable_bytes(path: &Path, e: &std::io::Error) -> Loaded {
-    let quarantine = crate::load_issue::LoadIssue::read_failed(path, e)
-        .and_then(|issue| issue.quarantine().cloned());
-    let utf8 = e.kind() == std::io::ErrorKind::InvalidData;
-    let state = match quarantine {
-        // 移せなかった権限の誤りは従来どおり（移せないのは置き場へ書けないときで、
-        // そのときは変更の操作の書き込みも失敗する = 元は消えない）
-        None if !utf8 => LoadState::ReadError {
-            reason: e.kind().to_string(),
-        },
-        quarantine => LoadState::Repaired {
-            problems: vec![if utf8 {
-                "UTF-8 として読めない".into()
-            } else {
-                format!("読み取りに失敗（{}）", e.kind())
-            }],
-            quarantine,
-        },
+    let read = if crate::load_issue::legacy_2238() {
+        legacy_2238_read(path)
+    } else {
+        read_text(path)
     };
-    Loaded {
-        config: UiConfig::default(),
-        state,
-    }
-}
-
-/// #2238 の修正前（`TAKO_2238_LEGACY=1`）: UTF-8 でない中身は 1 本目が空いているときだけ写す
-/// （2 回目に別の中身で壊れると写らない）。権限で読めないファイルは退避しない
-fn legacy_2238_load_from(path: &Path) -> Loaded {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    let text = match read {
+        Ok(text) => text,
+        Err(state) => {
             return Loaded {
                 config: UiConfig::default(),
-                state: LoadState::Absent,
-            }
-        }
-        Err(e) => {
-            return Loaded {
-                config: UiConfig::default(),
-                state: LoadState::ReadError {
-                    reason: e.kind().to_string(),
-                },
+                state,
             }
         }
     };
-    let Ok(text) = String::from_utf8(bytes) else {
-        let slot = crate::migration::quarantine_slot_path(path, 1);
-        if !slot.exists() {
-            let _ = std::fs::copy(path, &slot);
-        }
-        return Loaded {
-            config: UiConfig::default(),
-            state: LoadState::Repaired {
-                problems: vec!["UTF-8 として読めない".into()],
-                quarantine: slot.exists().then_some(crate::migration::Quarantine {
-                    path: slot,
-                    copied: true,
-                    evicted: false,
-                }),
-            },
-        };
-    };
-    from_text(path, &text)
-}
-
-/// 文字として読めた中身を寛容に読む（壊れた部分があれば元を文字列の退避口へ写す）
-fn from_text(path: &Path, text: &str) -> Loaded {
-    let parsed = parse_lenient(text);
+    let parsed = parse_lenient(&text);
     if parsed.is_future() {
         return Loaded {
             config: parsed.config,
@@ -2133,6 +2066,62 @@ fn from_text(path: &Path, text: &str) -> Loaded {
             quarantine,
         },
     }
+}
+
+/// 文字として読む。読めなければ既定で動く様子を返す（不在 / 文字として読めない中身を
+/// バイトのまま退避へ移した。#2238）
+fn read_text(path: &Path) -> Result<String, LoadState> {
+    let e = match std::fs::read_to_string(path) {
+        Ok(text) => return Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(LoadState::Absent),
+        Err(e) => e,
+    };
+    let quarantine = crate::load_issue::LoadIssue::read_failed(path, &e)
+        .and_then(|issue| issue.quarantine().cloned());
+    let utf8 = e.kind() == std::io::ErrorKind::InvalidData;
+    Err(match quarantine {
+        // 移せなかった権限の誤りは従来どおり（移せないのは置き場へ書けないときで、
+        // そのときは変更の操作の書き込みも失敗する = 元は消えない）
+        None if !utf8 => LoadState::ReadError {
+            reason: e.kind().to_string(),
+        },
+        quarantine => LoadState::Repaired {
+            problems: vec![if utf8 {
+                "UTF-8 として読めない".into()
+            } else {
+                format!("読み取りに失敗（{}）", e.kind())
+            }],
+            quarantine,
+        },
+    })
+}
+
+/// #2238 の修正前（`TAKO_2238_LEGACY=1`）: UTF-8 でない中身は 1 本目が空いているときだけ写す
+/// （2 回目に別の中身で壊れると写らない）。権限で読めないファイルは退避しない
+fn legacy_2238_read(path: &Path) -> Result<String, LoadState> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(LoadState::Absent),
+        Err(e) => {
+            return Err(LoadState::ReadError {
+                reason: e.kind().to_string(),
+            })
+        }
+    };
+    String::from_utf8(bytes).map_err(|_| {
+        let slot = crate::migration::quarantine_slot_path(path, 1);
+        if !slot.exists() {
+            let _ = std::fs::copy(path, &slot);
+        }
+        LoadState::Repaired {
+            problems: vec!["UTF-8 として読めない".into()],
+            quarantine: slot.exists().then_some(crate::migration::Quarantine {
+                path: slot,
+                copied: true,
+                evicted: false,
+            }),
+        }
+    })
 }
 
 /// 書く（同じ dir の一時ファイルへ書いてから差し替える = 途中の中身が他のプロセスから見えない）

@@ -181,17 +181,29 @@ fn sources() -> Vec<(String, String)> {
         walk(&entry.path().join("src"), &mut files);
     }
     files.sort();
-    let out: Vec<(String, String)> = files
+    let rels: Vec<String> = files
         .iter()
         .map(|p| {
-            let rel = p
-                .strip_prefix(&root)
+            p.strip_prefix(&root)
                 .unwrap_or(p)
                 .to_string_lossy()
-                .replace('\\', "/");
-            (rel, std::fs::read_to_string(p).unwrap_or_default())
+                .replace('\\', "/")
         })
         .collect();
+    // `#[cfg(test)] mod tests;` で読むファイル丸ごとのテスト（`run_configs/tests.rs` など）は見ない
+    let test_only = production_range::test_only_files(&rels);
+    let out: Vec<(String, String)> = rels
+        .into_iter()
+        .filter(|rel| !test_only.contains(rel))
+        .map(|rel| {
+            let src = std::fs::read_to_string(root.join(&rel)).unwrap_or_default();
+            (rel, src)
+        })
+        .collect();
+    assert!(
+        test_only.contains("crates/tako-control/src/run_configs/tests.rs"),
+        "ファイル丸ごとのテストの見分けが効いていない: {test_only:?}"
+    );
     assert!(
         out.len() > 100,
         "走査が壊れている（*.rs が {} 件しか見つからない）",
@@ -388,8 +400,8 @@ fn 本物の読み手へ植えた回帰を名指せる() {
         // ui.json: UTF-8 を自前で判定して 1 本目へ写す（#2238 以前の形を legacy の外へ戻す）
         (
             "crates/tako-core/src/claude_mod_ui.rs",
-            "Err(e) => unreadable_bytes(path, &e),",
-            "Err(_) => { let b = std::fs::read(path).unwrap(); let _ = String::from_utf8(b); let _ = crate::migration::quarantine_slot_path(path, 1); unreachable!() }",
+            "read_text(path)",
+            "{ let b = std::fs::read(path).unwrap(); let _ = crate::migration::quarantine_slot_path(path, 1); String::from_utf8(b).map_err(|_| LoadState::Absent) }",
             "crates/tako-core/src/claude_mod_ui.rs:",
         ),
     ];
