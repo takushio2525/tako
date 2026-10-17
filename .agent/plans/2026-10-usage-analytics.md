@@ -437,8 +437,8 @@ usage            [今の 7d ▾] [プロジェクト ▾]
 
 | キー（新設） | claude | codex | agy | local |
 |---|---|---|---|---|
-| `usage_tokens`（使用量の索引と内訳） | Supported（S2） | **Pending**（S5。rollout の `token_count` に累積値がある = 道は開いている） | **Pending**（会話は SQLite の `gen_metadata`。ccusage は読んでいるが、tako は SQLite の依存を持たない = #984。S6 で依存の可否を調べる） | Unsupported に倒さず Pending（ローカル LLM のトークン数の出口は未調査） |
-| `usage_limit_share`（利用制限の % の按分） | Supported（S3。観測は S1 から） | **Pending**（S5。rollout が `rate_limits` の履歴を持つので、claude より過去へ遡れる） | **Unsupported**（窓つきの利用上限が無く前払いのクレジット = 既存の注記 `AGY_NO_LIMIT_RESET` と同じ根拠 #985） | **Unsupported**（`NO_LOCAL_USAGE_LIMIT` = 利用上限という概念が無い） |
+| `usage_tokens`（使用量の索引と内訳） | Supported（S2） | **Degraded**（S5 で着地。API 換算が無い = モデルが単価表に無い・rollout はログインを持たない） | **Pending**（会話は SQLite の `gen_metadata`。ccusage は読んでいるが、tako は SQLite の依存を持たない = #984。S6 で依存の可否を調べる） | Unsupported に倒さず Pending（ローカル LLM のトークン数の出口は未調査） |
+| `usage_limit_share`（利用制限の % の按分） | Supported（S3。観測は S1 から） | **Degraded**（S5 で着地。過去の窓まで配れるが、重みは生トークン・ログインは今の auth.json へ寄せる） | **Unsupported**（窓つきの利用上限が無く前払いのクレジット = 既存の注記 `AGY_NO_LIMIT_RESET` と同じ根拠 #985） | **Unsupported**（`NO_LOCAL_USAGE_LIMIT` = 利用上限という概念が無い） |
 
 - claude 列は常に Supported の決まり（番犬 `claudeは基準系なので全て対応済み`）なので、マスは claude 側の実装が入るスライスの
   PR で足す: **`usage_tokens` は S2、`usage_limit_share` は S3**。Pending のマスに付ける Issue 番号は起票後の S5 / S6
@@ -578,6 +578,29 @@ S7 スマホ（PWA の #/usage）                   （S4 の後。[提案]）
   `limits.jsonl` へ（`source: codex`）。過去の rollout も取り込む。MATRIX の codex を Supported へ
 - 受け入れ条件: 手元の rollout で、累積の差分の和が最後の累積値と一致する。rate_limits の列から区間按分ができる（過去分）
 - 依存: S2 / S3
+- 着地（#2204）: FR-2.44.11〜12。実物で確かめたこと（2026-10-17・この機の `~/.codex/sessions` の写し 264 本・631 MB。
+  最後の使用は 9/11。本文は読まず、キー名と数だけを見た）:
+  - 行の種類: `token_count` 16,573 行（`info` が null = rate_limits だけの行が 3）。**累積が下がった行は 0・同じ累積の
+    重複は 127**。`token_usage_record`（応答ごとの使用量と `response_id`。新しい版だけ・199 本）もあるが、全版にある
+    `token_count` の累積を正にした（ccusage が `token_usage_record` を使うのは compaction の照合だけ）
+  - `input_tokens` は `cached_input_tokens` を含み、`total_tokens` = 入力 + 出力（`cache_write_input_tokens` は全行 0）
+  - **`primary` が週の枠のプランがある**（prolite・free は primary = 10080 分だけ。plus は primary = 300 / secondary = 10080）
+    → 枠は `window_minutes` で決める。`limit_id: codex_bengalfox`（モデル別の別の枠・22 行）は観測にしない
+  - 解除時刻は報告ごとに秒単位で揺れ、同じログインの別の会話の低い値（別の窓）が最大 298 秒ずれて混ざる。一方で
+    **週の枠が前の窓の解除より前に新しく始まる**（解除時刻が 1.5〜3.9 日ずれて続く。プランの切り替え・早い解除）ので、
+    claude の「長さの半分」で寄せると 5 つの窓が 1 つに束なった → codex は 1 時間で寄せ、開始を前の窓の最後の点で切る
+  - **サブエージェントの rollout 95 本は親の履歴を写していなかった**（最初の使用量は `session_meta` の 6.8 秒以上後・
+    最初の累積 = その回の使用量）。写しの見分け（1 秒以内の束）は ccusage の実測に合わせた予防
+  - 照合（tako とは別実装の python。rollout ごとの最後の累積の和）: **19.41 億トークンで完全一致**（会話 262 本すべて一致）。
+    観測は「枠・解除時刻・%」の値が参照と同じ 1,296 個で、それぞれのいちばん早い時刻も一致（行は 1,394 = 64 MB ごとの
+    書き出しの後で別のファイルから見つかった、より早い同じ値の書き足し 98 行を含む）
+  - 按分（`--window all`）: 5h は 11 窓で延べ 478% = 段 478.00 + tako の外 0、7d は 17 窓で 718% = 段 718.00 + 0
+    （窓ごとの最大の % の和を rollout から独立に出しても 478 / 718）。**claude と同じ推定を当てると 5h の推定が延べ
+    15 万 % になった**（週の枠だけのプランの期間の使用量を 5h の係数で割る）→ codex は推定しない
+  - 初回の取り込みは debug の CLI で 631 MB を 5.1 秒・最大 RSS 65 MB
+  - 判断: MATRIX は 2 マスとも Degraded（Supported にしない）。API 換算が無い（gpt-* / `codex-auto-review` は単価表に無く、
+    単価の出どころを確かめられない）・rollout がログインを持たない（過去の分も今の `auth.json` のログインへ寄せる。
+    この機でも plan_type が free → plus → prolite と変わっていた）。新しい MCP ツール・引数は足していない（カタログ +0 B）
 
 ### S6 agy の調査
 

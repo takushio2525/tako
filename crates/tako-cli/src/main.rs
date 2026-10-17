@@ -6823,6 +6823,16 @@ fn usage_share_footer(kinds: &[Value]) -> String {
                 None => line.push('）'),
             }
         }
+        // codex など単価表に無いモデルだけのログインは 1% あたりの生トークン（S5 #2204）
+        if k["coefficient"]["usd_per_percent"].is_null() {
+            if let Some(per) = k["coefficient"]["tokens_per_percent"].as_f64() {
+                line.push_str(&format!(
+                    "・1% あたり トークン {}（区間 {} 本）",
+                    usage_tokens(per.max(0.0) as u64),
+                    k["coefficient"]["intervals"].as_u64().unwrap_or(0)
+                ));
+            }
+        }
         if let Some(usd) = k["unestimated_usd"].as_f64().filter(|v| *v > 0.0) {
             line.push_str(&format!("・% へ直せない API 換算 ${usd:.2}"));
         }
@@ -6849,7 +6859,7 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
         }
     };
     let mut out = String::from(
-        "利用制限の観測（tako mod の報告。% か解除時刻が変わったときだけ記録）と使用量の内訳\n",
+        "利用制限の観測（tako mod の報告と codex の rollout。% か解除時刻が変わったときだけ記録）と使用量の内訳\n",
     );
     if p["recording"] == Value::Bool(false) {
         out.push_str(&format!(
@@ -6877,8 +6887,13 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
         } else {
             format!("・会話 {} 本", l["sessions"].as_u64().unwrap_or(0))
         };
+        // S5 #2204: codex のログインは系統を添える（claude は既定なので書かない）
+        let agent = match l["agent"].as_str() {
+            Some("codex") => "codex・",
+            _ => "",
+        };
         out.push_str(&format!(
-            "  ログイン {}（鍵 {}{from}）  観測 {} 点{sessions}\n",
+            "  ログイン {}（{agent}鍵 {}{from}）  観測 {} 点{sessions}\n",
             l["label"].as_str().unwrap_or("-"),
             l["login"].as_str().unwrap_or("-"),
             l["observations"].as_u64().unwrap_or(0),
@@ -15984,6 +15999,52 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("  まだ観測が無い\n"), "{text}");
+    }
+
+    /// #2204: codex のログインは系統を添え、単価表に無いモデルの按分は 1% あたりのトークンで要約する
+    #[test]
+    fn usageの既定出力はcodexのログインを名指す() {
+        let at = 1_791_856_920;
+        let amount = serde_json::json!({
+            "api_usd": 0.0, "total_tokens": 2_000_000u64, "tokens": {"output": 30_000},
+            "responses": 4, "sessions": 1, "unpriced_tokens": 2_000_000u64,
+        });
+        let mut group = amount.clone();
+        group["name"] = serde_json::json!("alpha");
+        group["limit_share"] = serde_json::json!({"seven_day": {"percent": 12.0}});
+        let payload = serde_json::json!({
+            "recording": true, "window": "7d", "by": "project",
+            "index": {"enabled": true},
+            "observations": 2,
+            "logins": [{
+                "label": "C", "login": "c0dexc0dex12", "key_from": "account", "agent": "codex",
+                "observations": 2, "sessions": 0, "windows": [],
+                "usage": {
+                    "range": {"basis": "observed", "from": at - 3_600, "to": at, "resets_at": at + 600},
+                    "total": amount,
+                    "groups": [group],
+                    "limit_share": [
+                        {"kind": "five_hour", "available": false},
+                        {"kind": "seven_day", "available": true, "scope": "current_window",
+                         "latest_percent": 12.0, "observed": 12.0, "allocated": 12.0,
+                         "outside": 0.0, "estimated": 0.0,
+                         "coefficient": {"tokens_per_percent": 166_667.0, "intervals": 3, "recent": true}},
+                    ],
+                },
+            }],
+        });
+        let text = usage_text(&payload, at, 9 * 3_600);
+        assert!(
+            text.contains("  ログイン C（codex・鍵 c0dexc0dex12）  観測 2 点\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "    7d の按分: 今の窓 12.0% = 段 12.0 + tako の外 0.0・1% あたり トークン 16.7 万（区間 3 本）\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("1% あたり API 換算"), "{text}");
     }
 
     /// Windows の出力（CRLF）・末尾 5 行の抜粋・120 文字での切り詰めを通っても字下げが揃う

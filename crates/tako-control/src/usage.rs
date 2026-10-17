@@ -127,6 +127,35 @@ impl LoginResolver {
         );
         key
     }
+
+    /// codex のログインの鍵（S5 #2204）: `<CODEX_HOME>/auth.json` の `tokens.account_id`。
+    /// 無い・読めない（API キーでのログイン等）ときは `CODEX_HOME` の鍵へ落とす。
+    /// **rollout はどのログインで使ったかを持たないので、過去の rollout も今のログインへ寄せる**
+    pub(crate) fn codex_login_for(&mut self, codex_home: &Path, salt: &str) -> LoginKey {
+        let cred = codex_home.join("auth.json");
+        let stamp = std::fs::metadata(&cred)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| (m.modified().unwrap_or(UNIX_EPOCH), m.len()));
+        if let Some(cached) = self.keys.get(&cred) {
+            if stamp.is_some() && cached.stamp == stamp {
+                return cached.key.clone();
+            }
+        }
+        let key = stamp
+            .and_then(|_| std::fs::read_to_string(&cred).ok())
+            .and_then(|text| core::codex_account_id_from_json(&text))
+            .map(|id| core::codex_account_key(salt, &id))
+            .unwrap_or_else(|| core::codex_home_key(salt, codex_home));
+        self.keys.insert(
+            cred,
+            CachedKey {
+                stamp,
+                key: key.clone(),
+            },
+        );
+        key
+    }
 }
 
 /// 観測の記録器（プロセスに 1 つ。GUI は [`record_for_gui`] の中の 1 つを使う）
@@ -505,8 +534,33 @@ fn round_usd_in(v: &mut Value) {
     }
 }
 
+/// ログインごとのエージェントの系統（S5 #2204）: codex の観測（`source: codex`）か codex の会話の鍵が
+/// あれば `codex`、それ以外は `claude`
+fn login_agents(
+    observations: &[LimitObservation],
+    keys: &BTreeMap<String, tako_core::usage::index::SessionKeys>,
+) -> BTreeMap<String, &'static str> {
+    let mut out: BTreeMap<String, &'static str> = BTreeMap::new();
+    for o in observations {
+        if o.source == core::SOURCE_CODEX {
+            out.insert(o.login.clone(), "codex");
+        }
+    }
+    for k in keys.values() {
+        if k.agent == "codex" {
+            out.insert(k.login.clone(), "codex");
+        }
+    }
+    out
+}
+
 /// 区間按分（S3）の読み方の注記
-fn share_notes(b: &report::Breakdown, summary: &core::Summary, notes: &mut Vec<String>) {
+fn share_notes(
+    b: &report::Breakdown,
+    summary: &core::Summary,
+    agents: &BTreeMap<String, &'static str>,
+    notes: &mut Vec<String>,
+) {
     let kinds = || b.logins.iter().flat_map(|l| l.limit_share.iter());
     if kinds().any(|k| k.available) {
         let scope = if kinds().any(|k| k.scope == report::ShareScope::Period) {
@@ -524,10 +578,11 @@ fn share_notes(b: &report::Breakdown, summary: &core::Summary, notes: &mut Vec<S
                 .to_string(),
         );
     }
+    let is_codex = |login: &str| agents.get(login) == Some(&"codex");
     let missing: Vec<String> = b
         .logins
         .iter()
-        .filter(|l| l.limit_share.iter().any(|k| !k.available))
+        .filter(|l| !is_codex(&l.login) && l.limit_share.iter().any(|k| !k.available))
         .map(|l| {
             let kinds: Vec<&str> = l
                 .limit_share
@@ -548,6 +603,40 @@ fn share_notes(b: &report::Breakdown, summary: &core::Summary, notes: &mut Vec<S
             "観測の無いログインと枠は % を出していない: {}。tako mod の効いた claude のペインが利用制限を報告すると記録が始まる",
             missing.join("・")
         ));
+    }
+    // codex（S5）: 観測は rollout の rate_limits。枠の無いプラン（週の枠だけ）がある
+    let codex_missing: Vec<String> = b
+        .logins
+        .iter()
+        .filter(|l| is_codex(&l.login) && l.limit_share.iter().any(|k| !k.available))
+        .map(|l| {
+            let kinds: Vec<&str> = l
+                .limit_share
+                .iter()
+                .filter(|k| !k.available)
+                .map(|k| if k.kind == "five_hour" { "5h" } else { "7d" })
+                .collect();
+            let label = summary
+                .logins
+                .iter()
+                .find(|s| s.login == l.login)
+                .map_or(l.login.as_str(), |s| s.label.as_str());
+            format!("ログイン {label}（{}）", kinds.join(" / "))
+        })
+        .collect();
+    if !codex_missing.is_empty() {
+        notes.push(format!(
+            "codex のログインで rollout の rate_limits にその枠が出ていないものは % を出していない: {}（プランが週の枠だけ等）",
+            codex_missing.join("・")
+        ));
+    }
+    if b.logins.iter().any(|l| is_codex(&l.login)) {
+        notes.push(
+            "codex は rollout の token_count の累積の差分を使用量に、rate_limits を観測にして過去の分まで配る。\
+             codex のモデルは単価表に無いので API 換算は出ず、% は生トークンの比で配る。rollout はどのログインで\
+             使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる"
+                .to_string(),
+        );
     }
     if kinds().any(|k| k.unestimated_usd > 0.0 || k.unestimated_tokens > 0) {
         notes.push(
@@ -571,10 +660,12 @@ pub fn payload_in(
     let (by, window) = query.parsed().unwrap_or((By::Project, Window::SevenDay));
     let mut extra = Vec::new();
     let mut breakdown = None;
+    let mut agents: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut bad_index = 0usize;
     let mut keyed_sessions = 0usize;
     if !s2_legacy {
         let (keys, bad_keys) = index::read_keys(dir);
+        agents = login_agents(&observations, &keys);
         let mut mods: BTreeMap<String, (String, KeyFrom)> = BTreeMap::new();
         for row in &sessions {
             mods.insert(row.session_id.clone(), (row.login.clone(), row.key_from));
@@ -608,8 +699,17 @@ pub fn payload_in(
             v[format!("{key}_iso")] = json!(crate::diag::format_utc(secs));
         }
     };
+    if s2_legacy {
+        agents = login_agents(&observations, &BTreeMap::new());
+    }
     if let Some(logins) = out["logins"].as_array_mut() {
         for login in logins {
+            // S5: どのエージェントのログインか（codex の観測・会話の鍵があれば codex）
+            let agent = login["login"]
+                .as_str()
+                .and_then(|k| agents.get(k).copied())
+                .unwrap_or("claude");
+            login["agent"] = json!(agent);
             // 解除時刻は unix 秒と ISO の両方（`rate_limits` の応答 = #1880 と同じ並び）
             if let Some(windows) = login["windows"].as_array_mut() {
                 for w in windows {
@@ -674,7 +774,7 @@ pub fn payload_in(
                  API 換算・応答数・会話数）と、利用制限の 5h / 7d の % を観測の増分の区間按分で段へ配った値\
                  （limit_share）"
             );
-            share_notes(b, &summary, &mut notes);
+            share_notes(b, &summary, &agents, &mut notes);
             let mut index = json!({
                 "enabled": true,
                 "sessions": keyed_sessions,
@@ -754,6 +854,8 @@ static GUI_TICK: Mutex<GuiTick> = Mutex::new(GuiTick {
         pending_bytes: 0,
         stopped: None,
         elapsed_ms: 0,
+        codex_files: 0,
+        codex_observations: 0,
     },
     runs: 0,
     logged_catch_up: false,

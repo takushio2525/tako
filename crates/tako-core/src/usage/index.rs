@@ -332,13 +332,13 @@ pub struct Batch {
 }
 
 impl Batch {
-    fn add(&mut self, key: BucketKey, tokens: &Tokens, responses: u32) {
+    pub(crate) fn add(&mut self, key: BucketKey, tokens: &Tokens, responses: u32) {
         let entry = self.buckets.entry(key).or_default();
         entry.0.add(tokens);
         entry.1 += responses;
     }
 
-    fn touch(&mut self, session: &str, at: i64, cwd: Option<&str>) {
+    pub(crate) fn touch(&mut self, session: &str, at: i64, cwd: Option<&str>) {
         let entry = self.sessions.entry(session.to_string()).or_default();
         entry.first_at = Some(entry.first_at.map_or(at, |f| f.min(at)));
         if entry.cwd.is_none() {
@@ -521,6 +521,9 @@ pub struct CursorRow {
     /// 書いた時刻（epoch ms）
     #[serde(default)]
     pub at: u64,
+    /// codex の rollout の読みの状態（S5 #2204。claude の transcript では無し = 旧い行もそのまま読める）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<super::codex::CodexCursor>,
 }
 
 /// 同じ鍵（刻み・会話・モデル・fast）の行を足し合わせる

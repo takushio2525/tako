@@ -8,8 +8,9 @@
 //! | `cursor.jsonl` | transcript ごとの読み位置（[`CursorRow`]。置き場はパスのハッシュで、パスそのものは書かない）と、新しく数えた応答の鍵 | 追記・後ろの行が正。行が増えたら生きているファイルの分だけへ書き直す |
 //! | `buckets/<YYYY-MM>.jsonl` | 5 分刻み × 会話 × モデルの 5 成分と応答数（[`BucketRow`]） | 追記。育ったら同じ鍵を合わせて書き直す。35 日より古い月は日単位へ・365 日より古い月は消す |
 //! | `keys.jsonl` | 会話 → 帰属の鍵（[`SessionKeys`]。取り込んだ時点で写す = §3.3） | 追記・後ろの行が正（良くなったときだけ足す） |
+//! | `limits.jsonl` | codex の rollout の `rate_limits`（S5 #2204。`source: codex`。claude の観測は S1 の記録器が書く） | 追記（同じ枠・解除時刻・% はいちばん早い観測の 1 行だけ） |
 //!
-//! 書く順は「鍵 → 集約 → 読み位置」。読み位置を最後に書くので、途中で落ちても行の無い読み位置は
+//! 書く順は「鍵 → 集約 → codex の観測 → 読み位置」。読み位置を最後に書くので、途中で落ちても行の無い読み位置は
 //! 残らない（落ちた分は次の更新で読み直す。集約を書いた直後に落ちたときだけ、その回の分を二重に
 //! 数えうる）。更新は `cursor.jsonl.lock` の排他 flock で 1 本にする（GUI と CLI が同時に書かない）。
 //!
@@ -18,6 +19,11 @@
 //! 設定 dir（[`roots`]）の `projects/` の下の `*.jsonl`（サブエージェントの `<sessionId>/subagents/` も）。
 //! **assistant 行の使用量のメタデータだけ**を読み（本文は serde が読み飛ばす）、診断ログには
 //! 件数・所要・バイト数だけを出す（cwd・label・Issue 番号・トークンの内訳を出さない = §6）。
+//!
+//! codex（S5 #2204）は `CODEX_HOME`（[`codex_homes`]）の `sessions/**/rollout-*.jsonl` と
+//! `archived_sessions/` の `token_count`（累積の差分）と `rate_limits` を読む（`tako_core::usage::codex`）。
+//! 読み位置の鍵はファイル名（`sessions/` から `archived_sessions/` へ移っても続きから読む）、
+//! ログインは `<CODEX_HOME>/auth.json` の `tokens.account_id` の塩付きハッシュ。
 //!
 //! # 負荷（§5.3）
 //!
@@ -30,13 +36,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tako_core::usage::codex::{
+    self as core_codex, CodexCursor, CodexLimit, CodexProgress, CodexRead,
+};
 use tako_core::usage::index::{
     self as core_index, Batch, BucketRow, CursorRow, FileProgress, LastMessage, ProjectFrom,
     SessionKeys,
 };
-use tako_core::usage::LoginKey;
+use tako_core::usage::{LimitObservation, LoginKey, SOURCE_CODEX};
 
-use super::{append_rows, load_or_create_salt, read_all, LoginResolver};
+use super::{append_rows, load_or_create_salt, read_all, LoginResolver, LIMITS_FILE};
 
 /// 読み位置
 pub const CURSOR_FILE: &str = "cursor.jsonl";
@@ -48,6 +57,8 @@ pub const BUCKETS_DIR: &str = "buckets";
 const COMPACTED_FILE: &str = "compacted.json";
 /// 読む設定 dir を差し替える（検証用。OS のパス区切りで並べる）。無ければ [`roots`] の既定
 pub const CONFIG_DIRS_ENV: &str = "TAKO_USAGE_CONFIG_DIRS";
+/// 読む `CODEX_HOME` を差し替える（検証用。OS のパス区切りで並べる）。無ければ [`codex_homes`] の既定
+pub const CODEX_HOMES_ENV: &str = "TAKO_USAGE_CODEX_HOMES";
 
 /// 1 回に読む大きさ
 const CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -64,6 +75,8 @@ const RETAIN_DAYS: i64 = 365;
 const MAINTAIN_EVERY_MS: u64 = 24 * 3600 * 1000;
 /// `projects/` の下を辿る深さ（`<slug>/<sid>/subagents/agent-*.jsonl` = 4）
 const MAX_DEPTH: usize = 4;
+/// codex の `sessions/` の下を辿る深さ（`<YYYY>/<MM>/<DD>/rollout-*.jsonl` = 3。余裕を 1 つ）
+const CODEX_MAX_DEPTH: usize = 4;
 /// 走査に出なくなったファイルの読み位置の行を残す期間（transcript の保持 30 日 + 余裕）
 const GONE_KEEP_MS: u64 = 40 * 24 * 3600 * 1000;
 
@@ -131,6 +144,40 @@ pub fn roots() -> Vec<Root> {
         }
     }
     out
+}
+
+/// 読む `CODEX_HOME`（S5 #2204）: `CODEX_HOME`（codex 自身と同じく env を先に見る）→ `<ホーム>/.codex`。
+///
+/// **検証プロセスでは検証用のホームの `.codex` へ倒し、本物の `~/.codex` も `CODEX_HOME` も読まない**
+/// （[`roots`] と同じ理由）。差し替えは [`CODEX_HOMES_ENV`]
+pub fn codex_homes() -> Vec<PathBuf> {
+    if let Some(list) = std::env::var_os(CODEX_HOMES_ENV).filter(|v| !v.is_empty()) {
+        return std::env::split_paths(&list)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| normalize(&p))
+            .collect();
+    }
+    if tako_core::paths::is_verification_process() {
+        return crate::orchestrator::agent_config_home()
+            .map(|h| vec![normalize(&h.join(".codex"))])
+            .unwrap_or_default();
+    }
+    crate::codex_session::codex_home()
+        .map(|h| vec![normalize(&h)])
+        .unwrap_or_default()
+}
+
+/// codex の「アカウント名」（tako の accounts.yaml は claude の設定 dir なので、`CODEX_HOME` の名前で代える。
+/// 既定の `~/.codex` は `codex`）
+fn codex_account_name(home: &Path) -> String {
+    let name = home
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    match name.as_str() {
+        "" | ".codex" => "codex".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// accounts.yaml の（名前, 設定 dir。inherit は `None`）。壊れたエントリは飛ばす
@@ -304,7 +351,7 @@ impl Sources {
 fn fresh_keys(
     session: &str,
     seen: &core_index::SessionSeen,
-    login: &LoginKey,
+    (login, agent): (&LoginKey, &str),
     account: Option<String>,
     sources: &Sources,
     now_ms: u64,
@@ -334,7 +381,7 @@ fn fresh_keys(
         session_id: session.to_string(),
         login: login.key.clone(),
         key_from: login.from,
-        agent: "claude".to_string(),
+        agent: agent.to_string(),
         account,
         role: cat.and_then(|c| c.kind.clone()),
         project,
@@ -363,6 +410,8 @@ struct FileState {
     ids: Vec<u64>,
     /// 最後に行を書いた時刻（epoch ms。走査に出なくなったファイルの行を残す期間の起点）
     at: u64,
+    /// codex の rollout の読みの状態（S5）
+    codex: Option<CodexCursor>,
 }
 
 /// ファイルの同一性（更新時刻・大きさ・inode が同じ間は読み直さない）
@@ -393,6 +442,28 @@ fn dev_of(m: &std::fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn dev_of(_: &std::fs::Metadata) -> u64 {
     0
+}
+
+/// `dir` の下（深さ `max_depth` まで）の `*.jsonl` を `visit` へ渡す
+fn walk_jsonl(dir: &Path, max_depth: usize, visit: &mut dyn FnMut(PathBuf, &std::fs::Metadata)) {
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                if depth < max_depth {
+                    stack.push((path, depth + 1));
+                }
+            } else if ft.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                let Ok(meta) = entry.metadata() else { continue };
+                visit(path, &meta);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -444,6 +515,10 @@ pub struct UpdateOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<&'static str>,
     pub elapsed_ms: u64,
+    /// 見つけた codex の rollout の数（`files` の内数。S5）
+    pub codex_files: usize,
+    /// codex の rollout から `limits.jsonl` へ足した観測
+    pub codex_observations: usize,
 }
 
 /// 更新の決まり
@@ -457,11 +532,20 @@ pub struct UpdateOptions {
     pub try_lock: bool,
 }
 
+/// どこの置き場のファイルか
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// claude の設定 dir（[`Indexer::roots`] の添字）
+    Claude(usize),
+    /// `CODEX_HOME`（[`Indexer::codex_homes`] の添字）
+    Codex(usize),
+}
+
 /// 見つけた transcript 1 本
 struct Found {
     path: PathBuf,
     key: String,
-    root: usize,
+    origin: Origin,
     len: u64,
     dev: u64,
     ino: u64,
@@ -472,6 +556,11 @@ pub struct Indexer {
     dir: PathBuf,
     salt_file: PathBuf,
     roots: Vec<Root>,
+    /// 読む `CODEX_HOME`（S5）
+    codex_homes: Vec<PathBuf>,
+    /// codex の観測の重複除去（ログイン・枠・解除時刻・% → 書いたいちばん早い観測時刻）。
+    /// 最初に書く直前に `limits.jsonl` の codex の行から作る
+    codex_seen: Option<HashMap<(String, String, i64, u64), u64>>,
     logins: LoginResolver,
     salt: Option<String>,
     loaded: Option<Loaded>,
@@ -492,6 +581,8 @@ impl Indexer {
             dir,
             salt_file,
             roots,
+            codex_homes: Vec::new(),
+            codex_seen: None,
             logins: LoginResolver::new(home),
             salt: None,
             loaded: None,
@@ -502,15 +593,24 @@ impl Indexer {
         }
     }
 
-    /// 本物の置き場（`<data_dir>/usage/` と [`roots`]）
+    /// 本物の置き場（`<data_dir>/usage/` と [`roots`] と [`codex_homes`]）
     pub fn for_process() -> Option<Self> {
         let data = tako_core::paths::data_dir()?;
-        Some(Self::new(
-            data.join("usage"),
-            data.join("machine_id"),
-            roots(),
-            crate::orchestrator::agent_config_home(),
-        ))
+        Some(
+            Self::new(
+                data.join("usage"),
+                data.join("machine_id"),
+                roots(),
+                crate::orchestrator::agent_config_home(),
+            )
+            .with_codex_homes(codex_homes()),
+        )
+    }
+
+    /// 読む `CODEX_HOME` を決める（S5）
+    pub fn with_codex_homes(mut self, homes: Vec<PathBuf>) -> Self {
+        self.codex_homes = homes;
+        self
     }
 
     /// 帰属の材料を固定する（テスト）
@@ -566,6 +666,7 @@ impl Indexer {
             state.offset = row.offset;
             state.last = row.last;
             state.at = row.at;
+            state.codex = row.codex;
             for id in row.ids.iter().filter_map(|s| core_index::parse_hex64(s)) {
                 if loaded.seen.insert(id) {
                     state.ids.push(id);
@@ -579,37 +680,54 @@ impl Indexer {
         self.loaded = Some(loaded);
     }
 
-    /// transcript を探す（`projects/` の下の `*.jsonl`。並びはパス順 = 写しの数え先が毎回同じ）
+    /// transcript を探す（`projects/` の下の `*.jsonl` と、codex の `sessions/` / `archived_sessions/` の
+    /// `rollout-*.jsonl`。並びはパス順 = 写しの数え先が毎回同じ）
     fn walk(&self) -> Vec<Found> {
         let mut out = Vec::new();
         for (i, root) in self.roots.iter().enumerate() {
-            let mut stack = vec![(root.dir.join("projects"), 0usize)];
-            while let Some((dir, depth)) = stack.pop() {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let Ok(ft) = entry.file_type() else { continue };
-                    let path = entry.path();
-                    if ft.is_dir() {
-                        if depth < MAX_DEPTH {
-                            stack.push((path, depth + 1));
+            walk_jsonl(&root.dir.join("projects"), MAX_DEPTH, &mut |path, meta| {
+                let key =
+                    core_index::hex64(core_index::fnv64(&["transcript", &path.to_string_lossy()]));
+                out.push(Found {
+                    len: meta.len(),
+                    dev: dev_of(meta),
+                    ino: ino_of(meta),
+                    path,
+                    key,
+                    origin: Origin::Claude(i),
+                });
+            });
+        }
+        if !core_codex::s5_legacy() {
+            for (i, home) in self.codex_homes.iter().enumerate() {
+                // 鍵はファイル名（会話の id 入り）: `sessions/` から `archived_sessions/` へ移っても同じ読み位置。
+                // 両方にあれば `sessions/` を正にする（先に見たほう）
+                let mut keys: HashSet<String> = HashSet::new();
+                for (sub, depth) in [("sessions", CODEX_MAX_DEPTH), ("archived_sessions", 1)] {
+                    walk_jsonl(&home.join(sub), depth, &mut |path, meta| {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if !name.starts_with("rollout-") {
+                            return;
                         }
-                    } else if ft.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
-                        let Ok(meta) = entry.metadata() else { continue };
                         let key = core_index::hex64(core_index::fnv64(&[
-                            "transcript",
-                            &path.to_string_lossy(),
+                            "codex",
+                            &home.to_string_lossy(),
+                            &name,
                         ]));
-                        out.push(Found {
-                            len: meta.len(),
-                            dev: dev_of(&meta),
-                            ino: ino_of(&meta),
-                            path,
-                            key,
-                            root: i,
-                        });
-                    }
+                        if keys.insert(key.clone()) {
+                            out.push(Found {
+                                len: meta.len(),
+                                dev: dev_of(meta),
+                                ino: ino_of(meta),
+                                path,
+                                key,
+                                origin: Origin::Codex(i),
+                            });
+                        }
+                    });
                 }
             }
         }
@@ -642,6 +760,10 @@ impl Indexer {
         let found = self.walk();
         let mut outcome = UpdateOutcome {
             files: found.len(),
+            codex_files: found
+                .iter()
+                .filter(|f| matches!(f.origin, Origin::Codex(_)))
+                .count(),
             ..UpdateOutcome::default()
         };
         // 読むもの（読み位置より大きい・縮んだ・置き換わった）
@@ -723,12 +845,13 @@ impl Indexer {
     ) -> Result<bool, String> {
         let loaded = self.loaded.as_mut().expect("ensure_loaded の後");
         let state = loaded.files.entry(f.key.clone()).or_default();
-        // 縮んだ・置き換わった: 最初から読み直す（数え済みの応答は鍵で飛ばす）
+        // 縮んだ・置き換わった: 最初から読み直す（数え済みの応答は鍵で飛ばす。codex は数え済みの累積を持ち越す）
         let mut reset = false;
         if state.ino != f.ino || state.dev != f.dev || f.len < state.offset {
-            reset = state.offset > 0 || state.last.is_some();
+            reset = state.offset > 0 || state.last.is_some() || state.codex.is_some();
             state.offset = 0;
             state.last = None;
+            state.codex = state.codex.as_ref().map(CodexCursor::restarted);
             state.dev = f.dev;
             state.ino = f.ino;
         }
@@ -747,6 +870,12 @@ impl Indexer {
         let mut buf = vec![0u8; CHUNK_BYTES];
         let mut new_ids = Vec::new();
         let mut file_batch = Batch::default();
+        let mut codex_read = CodexRead::default();
+        // codex の今の cwd（鍵の材料。読み位置には書かない）
+        let mut codex_cwd: Option<String> = None;
+        if matches!(f.origin, Origin::Codex(_)) && state.codex.is_none() {
+            state.codex = Some(CodexCursor::default());
+        }
         let mut finished = true;
         let start_offset = state.offset;
         loop {
@@ -756,16 +885,28 @@ impl Indexer {
                 Err(_) => break,
             };
             carry.extend_from_slice(&buf[..n]);
-            let consumed = core_index::ingest_lines(
-                &carry,
-                FileProgress {
-                    last: &mut state.last,
-                    seen: &mut loaded.seen,
-                    new_ids: &mut new_ids,
-                    fallback_session: &fallback,
-                },
-                &mut file_batch,
-            );
+            let consumed = match (f.origin, state.codex.as_mut()) {
+                (Origin::Codex(_), Some(codex)) => core_codex::ingest_codex_lines(
+                    &carry,
+                    CodexProgress {
+                        state: codex,
+                        fallback_session: &fallback,
+                        cwd: &mut codex_cwd,
+                    },
+                    &mut file_batch,
+                    &mut codex_read,
+                ),
+                _ => core_index::ingest_lines(
+                    &carry,
+                    FileProgress {
+                        last: &mut state.last,
+                        seen: &mut loaded.seen,
+                        new_ids: &mut new_ids,
+                        fallback_session: &fallback,
+                    },
+                    &mut file_batch,
+                ),
+            };
             carry.drain(..consumed);
             state.offset += consumed as u64;
             if let Some(budget) = opts.budget {
@@ -794,9 +935,15 @@ impl Indexer {
             last: state.last.clone(),
             ids: new_ids.iter().map(|id| core_index::hex64(*id)).collect(),
             at: state.at,
+            codex: state.codex.clone(),
         };
         for sid in file_batch.sessions.keys() {
-            pending.session_root.entry(sid.clone()).or_insert(f.root);
+            pending.session_root.entry(sid.clone()).or_insert(f.origin);
+        }
+        if let Origin::Codex(home) = f.origin {
+            pending
+                .codex_limits
+                .extend(codex_read.limits.drain(..).map(|l| (home, l)));
         }
         pending.bytes += read;
         pending.batch.absorb(file_batch);
@@ -811,12 +958,13 @@ impl Indexer {
         outcome: &mut UpdateOutcome,
         touched_months: &mut BTreeSet<String>,
     ) -> Result<(), String> {
-        if pending.cursor.is_empty() && pending.batch.is_empty() {
+        if pending.cursor.is_empty() && pending.batch.is_empty() && pending.codex_limits.is_empty()
+        {
             return Ok(());
         }
         let p = std::mem::take(pending);
         outcome.responses += p.batch.responses;
-        // 1. 鍵（触った会話の鍵を今の材料で引き、良くなったものだけ足す）
+        // 1. 鍵（触った会話の鍵を今の材料で引き、良くなったものだけ足す）。順は「鍵 → 集約 → 観測 → 読み位置」
         let key_rows = if p.batch.sessions.is_empty() {
             Vec::new()
         } else {
@@ -842,7 +990,17 @@ impl Indexer {
             append_rows(&buckets, &buckets.join(format!("{month}.jsonl")), rows)?;
             touched_months.insert(month.clone());
         }
-        // 3. 読み位置
+        // 3. codex の利用制限の観測（`limits.jsonl`。読み位置より先に書く = 落ちても次の読み直しで足りる分は足す）
+        if !p.codex_limits.is_empty() {
+            let rows = self.codex_limit_rows(p.codex_limits)?;
+            if let Err(e) = append_rows(&self.dir, &self.dir.join(LIMITS_FILE), &rows) {
+                // 覚えだけ進んで行が無い状態にしない（次の読み直しの前にファイルから作り直す）
+                self.codex_seen = None;
+                return Err(e);
+            }
+            outcome.codex_observations += rows.len();
+        }
+        // 4. 読み位置
         append_rows(&self.dir, &self.cursor_path(), &p.cursor)?;
         if let Some(loaded) = self.loaded.as_mut() {
             loaded.cursor_rows += p.cursor.len();
@@ -853,7 +1011,7 @@ impl Indexer {
     fn key_rows(
         &mut self,
         batch: &Batch,
-        session_root: &HashMap<String, usize>,
+        session_root: &HashMap<String, Origin>,
     ) -> Result<Vec<SessionKeys>, String> {
         let salt = self.salt()?;
         if self.run_sources.is_none() {
@@ -867,17 +1025,32 @@ impl Indexer {
         let now = now_ms();
         let mut rows = Vec::new();
         for (sid, seen) in &batch.sessions {
-            let Some(root) = session_root
-                .get(sid)
-                .and_then(|i| self.roots.get(*i))
-                .cloned()
-            else {
-                continue;
+            let (login, agent, account) = match session_root.get(sid) {
+                Some(Origin::Claude(i)) => {
+                    let Some(root) = self.roots.get(*i).cloned() else {
+                        continue;
+                    };
+                    let config_dir =
+                        (!root.is_default).then(|| root.dir.to_string_lossy().to_string());
+                    (
+                        self.logins.login_for(config_dir.as_deref(), &salt),
+                        "claude",
+                        account_for(&root, &sources.accounts),
+                    )
+                }
+                Some(Origin::Codex(i)) => {
+                    let Some(home) = self.codex_homes.get(*i).cloned() else {
+                        continue;
+                    };
+                    (
+                        self.logins.codex_login_for(&home, &salt),
+                        "codex",
+                        Some(codex_account_name(&home)),
+                    )
+                }
+                None => continue,
             };
-            let config_dir = (!root.is_default).then(|| root.dir.to_string_lossy().to_string());
-            let login = self.logins.login_for(config_dir.as_deref(), &salt);
-            let account = account_for(&root, &sources.accounts);
-            let fresh = fresh_keys(sid, seen, &login, account, sources, now);
+            let fresh = fresh_keys(sid, seen, (&login, agent), account, sources, now);
             let old = self.loaded.as_ref().and_then(|l| l.keys.get(sid));
             match old {
                 None => rows.push(fresh),
@@ -885,6 +1058,67 @@ impl Indexer {
             }
         }
         Ok(rows)
+    }
+
+    /// codex の観測へログインを付け、書いていないもの（同じログイン・枠・解除時刻・% のいちばん早い観測）だけを
+    /// 行にする。同じログインの会話は同じ値を何度も報告し、読み直しでも同じ行が来るので、値ごとに 1 行へ絞る
+    /// （窓の切り方は値の上がった最初の点しか使わない = `tako_core::usage::share::windows_for`）
+    fn codex_limit_rows(
+        &mut self,
+        mut limits: Vec<(usize, CodexLimit)>,
+    ) -> Result<Vec<LimitObservation>, String> {
+        let salt = self.salt()?;
+        if self.codex_seen.is_none() {
+            let (rows, _) = read_all::<LimitObservation>(&self.dir.join(LIMITS_FILE));
+            let mut seen: HashMap<(String, String, i64, u64), u64> = HashMap::new();
+            for o in rows.into_iter().filter(|o| o.source == SOURCE_CODEX) {
+                let Some(r) = o.resets_at else { continue };
+                let entry = seen
+                    .entry((o.login, o.kind, r, o.percent.to_bits()))
+                    .or_insert(o.observed_at);
+                *entry = (*entry).min(o.observed_at);
+            }
+            self.codex_seen = Some(seen);
+        }
+        limits.sort_by_key(|(_, l)| l.observed_at);
+        let now = now_ms();
+        let mut logins: HashMap<usize, LoginKey> = HashMap::new();
+        let mut out = Vec::new();
+        for (home, l) in limits {
+            let login = match logins.get(&home) {
+                Some(login) => login.clone(),
+                None => {
+                    let Some(path) = self.codex_homes.get(home).cloned() else {
+                        continue;
+                    };
+                    let login = self.logins.codex_login_for(&path, &salt);
+                    logins.insert(home, login.clone());
+                    login
+                }
+            };
+            let key = (
+                login.key.clone(),
+                l.kind.to_string(),
+                l.resets_at,
+                l.percent.to_bits(),
+            );
+            let seen = self.codex_seen.get_or_insert_with(HashMap::new);
+            if seen.get(&key).is_some_and(|at| *at <= l.observed_at) {
+                continue;
+            }
+            seen.insert(key, l.observed_at);
+            out.push(LimitObservation {
+                login: login.key,
+                key_from: login.from,
+                kind: l.kind.to_string(),
+                percent: l.percent,
+                resets_at: Some(l.resets_at),
+                observed_at: l.observed_at,
+                recorded_at: now,
+                source: SOURCE_CODEX.to_string(),
+            });
+        }
+        Ok(out)
     }
 
     /// `cursor.jsonl` の行が残すファイルの 2 倍 + 500 を超えたら、1 ファイル 1 行へ書き直す。
@@ -916,6 +1150,7 @@ impl Indexer {
                 last: s.last.clone(),
                 ids: s.ids.iter().map(|id| core_index::hex64(*id)).collect(),
                 at: s.at,
+                codex: s.codex.clone(),
             })
             .collect();
         rows.sort_by(|a, b| a.file.cmp(&b.file));
@@ -1007,8 +1242,10 @@ impl Indexer {
 struct Pending {
     batch: Batch,
     cursor: Vec<CursorRow>,
-    /// 会話 → どの設定 dir の transcript で見たか
-    session_root: HashMap<String, usize>,
+    /// 会話 → どの置き場（設定 dir / `CODEX_HOME`）のファイルで見たか
+    session_root: HashMap<String, Origin>,
+    /// codex の利用制限の観測（`CODEX_HOME` の添字つき。ログインは書くときに付ける）
+    codex_limits: Vec<(usize, CodexLimit)>,
     bytes: u64,
 }
 
@@ -1522,6 +1759,7 @@ mod tests {
             last: None,
             ids: vec![core_index::hex64(id)],
             at,
+            codex: None,
         };
         let mut rows = vec![
             gone("recent-gone", now - 3_600_000, 0xaaaa),
@@ -1601,5 +1839,304 @@ mod tests {
         let stamp = stamp_of(&month_file(old));
         env.update(&mut ix);
         assert_eq!(stamp_of(&month_file(old)), stamp);
+    }
+
+    // --- codex（S5 #2204）-------------------------------------------------------------------------
+
+    const CODEX_ACCOUNT: &str = "codex-account-2204";
+
+    impl Env {
+        fn codex_home(&self) -> PathBuf {
+            self.root.join("codexhome")
+        }
+        fn codex_indexer(&self) -> Indexer {
+            self.indexer()
+                .with_sources(self.sources())
+                .with_codex_homes(vec![self.codex_home()])
+        }
+        fn rollout(&self, sub: &str, name: &str) -> PathBuf {
+            let path = self.codex_home().join(sub).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        }
+        fn salt(&self) -> String {
+            std::fs::read_to_string(self.root.join("data/machine_id"))
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+    }
+
+    fn iso(secs: i64) -> String {
+        crate::diag::format_utc(secs)
+    }
+
+    fn codex_meta(id: &str, at: i64) -> String {
+        format!(
+            r#"{{"timestamp":"{t}","type":"session_meta","payload":{{"id":"{id}","timestamp":"{t}","cwd":"{ALPHA}/crates","originator":"codex_cli_rs","cli_version":"0.150.1","source":"cli","base_instructions":{{"text":"{BODY} 指示"}},"git":{{"branch":"feat/{BODY}"}}}}}}"#,
+            t = iso(at)
+        )
+    }
+
+    fn codex_turn(at: i64, model: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{}","type":"turn_context","payload":{{"turn_id":"t","cwd":"{ALPHA}","model":"{model}","effort":"high","user_instructions":"{BODY}"}}}}"#,
+            iso(at)
+        )
+    }
+
+    fn codex_body(at: i64) -> String {
+        format!(
+            r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{BODY} \"type\":\"token_count\""}}]}}}}"#,
+            iso(at)
+        )
+    }
+
+    /// 累積（入力・読み出し・出力）と週の枠の観測を載せた token_count
+    fn codex_tc(at: i64, total: [u64; 3], pct: f64, resets: i64) -> String {
+        let [i, c, o] = total;
+        format!(
+            r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{i},"cached_input_tokens":{c},"cache_write_input_tokens":0,"output_tokens":{o},"reasoning_output_tokens":0,"total_tokens":{}}},"last_token_usage":{{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}},"model_context_window":258400}},"rate_limits":{{"limit_id":"codex","limit_name":null,"primary":{{"used_percent":{pct},"window_minutes":10080,"resets_at":{resets}}},"secondary":null,"credits":null,"plan_type":"plus","rate_limit_reached_type":null}}}}}}"#,
+            iso(at),
+            i + o
+        )
+    }
+
+    fn codex_rows(env: &Env) -> Vec<LimitObservation> {
+        read_all::<LimitObservation>(&env.usage().join(LIMITS_FILE)).0
+    }
+
+    /// 受け入れ 1（索引の側）: 累積の差分の和が最後の累積に一致し、rate_limits は値ごとにいちばん早い
+    /// 観測の 1 行だけが limits.jsonl へ入る。追記分だけを読み、archived_sessions へ移っても数え直さない
+    #[test]
+    fn codexのrolloutは累積の差分を索引へ_観測をlimitsへ入れる() {
+        let env = Env::new("codex-ingest");
+        std::fs::create_dir_all(env.codex_home()).unwrap();
+        std::fs::write(
+            env.codex_home().join("auth.json"),
+            format!(
+                r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{{"id_token":"{BODY}","access_token":"{BODY}","refresh_token":"{BODY}","account_id":"{CODEX_ACCOUNT}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let now = (now_ms() / 1000) as i64;
+        let start = now - 2 * 86_400;
+        let r7 = start + 7 * 86_400;
+        let path = env.rollout(
+            "sessions/2026/10/16",
+            "rollout-2026-10-16T00-00-00-thread-a.jsonl",
+        );
+        write(
+            &path,
+            &[
+                codex_meta("thread-a", start),
+                codex_turn(start + 1, "gpt-5.5"),
+                codex_body(start + 2),
+                codex_tc(start + 60, [1000, 400, 50], 1.0, r7),
+                // 同じ累積の重複行・同じ値の観測（別の会話の報告と同じ）
+                codex_tc(start + 61, [1000, 400, 50], 1.0, r7),
+                codex_tc(start + 3600, [5000, 3000, 300], 3.0, r7 + 1),
+            ],
+            "",
+        );
+        let mut ix = env.codex_indexer();
+        let out = env.update(&mut ix);
+        assert_eq!((out.files, out.codex_files), (1, 1));
+        assert_eq!(out.responses, 2);
+        let totals = env.totals();
+        let (tokens, n) = totals
+            .get(&("thread-a".to_string(), "gpt-5.5".to_string()))
+            .copied()
+            .unwrap();
+        assert_eq!(
+            tokens.total(),
+            5000 + 300,
+            "差の和 = 最後の累積の total_tokens"
+        );
+        assert_eq!(
+            (tokens.input, tokens.cache_read, tokens.output),
+            (2000, 3000, 300)
+        );
+        assert_eq!(n, 2);
+        // 鍵: codex・プロジェクト（cwd の最長前方一致）・ログイン = auth.json の account_id の塩付きハッシュ
+        let (keys, _) = read_keys(&env.usage());
+        let k = keys.get("thread-a").unwrap();
+        assert_eq!(k.agent, "codex");
+        assert_eq!(k.project.as_deref(), Some("alpha"));
+        assert_eq!(k.account.as_deref(), Some("codexhome"));
+        let want = tako_core::usage::codex_account_key(&env.salt(), CODEX_ACCOUNT);
+        assert_eq!(
+            (k.login.as_str(), k.key_from),
+            (want.key.as_str(), want.from)
+        );
+        // 観測: 1.0（解除時刻 r7）と 3.0（r7 + 1）の 2 行。同じ値の 2 回目は書かない
+        let rows = codex_rows(&env);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows
+            .iter()
+            .all(|r| r.source == SOURCE_CODEX && r.login == want.key));
+        assert_eq!(rows[0].observed_at, ((start + 60) * 1000) as u64);
+        assert_eq!(out.codex_observations, 2);
+
+        // 2 回目: 何も増えない（読み位置・観測の重複除去）
+        let again = env.update(&mut env.codex_indexer());
+        assert_eq!(
+            (again.bytes_read, again.responses, again.codex_observations),
+            (0, 0, 0)
+        );
+        // 追記分だけ: 累積 7000 + 500 → 差 2200
+        append(
+            &path,
+            &(codex_tc(start + 7200, [7000, 4000, 500], 5.0, r7) + "\n"),
+        );
+        let more = env.update(&mut env.codex_indexer());
+        assert_eq!((more.responses, more.codex_observations), (1, 1));
+        let (tokens, _) = env.totals()[&("thread-a".to_string(), "gpt-5.5".to_string())];
+        assert_eq!(tokens.total(), 7500);
+        // archived_sessions へ移った（同じ inode）: 数え直さない。続きの追記は差だけ
+        let moved = env.rollout(
+            "archived_sessions",
+            "rollout-2026-10-16T00-00-00-thread-a.jsonl",
+        );
+        std::fs::rename(&path, &moved).unwrap();
+        let after = env.update(&mut env.codex_indexer());
+        assert_eq!((after.files, after.responses), (1, 0));
+        append(
+            &moved,
+            &(codex_tc(start + 7300, [7100, 4000, 510], 5.0, r7) + "\n"),
+        );
+        env.update(&mut env.codex_indexer());
+        let (tokens, _) = env.totals()[&("thread-a".to_string(), "gpt-5.5".to_string())];
+        assert_eq!(tokens.total(), 7610);
+        // 置き換わった（中身を写した別の inode）: 最初から読み直しても数え済みの累積は数えない
+        let text = std::fs::read_to_string(&moved).unwrap();
+        std::fs::remove_file(&moved).unwrap();
+        std::fs::write(&moved, text).unwrap();
+        let replaced = env.update(&mut env.codex_indexer());
+        assert_eq!((replaced.responses, replaced.codex_observations), (0, 0));
+        assert_eq!(
+            env.totals()[&("thread-a".to_string(), "gpt-5.5".to_string())]
+                .0
+                .total(),
+            7610
+        );
+        // A/B: 旧挙動は codex を読まない
+        std::env::set_var(core_codex::S5_LEGACY_ENV, "1");
+        let found = env.codex_indexer().walk().len();
+        std::env::remove_var(core_codex::S5_LEGACY_ENV);
+        assert_eq!(found, 0);
+        // 本文・指示・ツール・cwd・ブランチ・トークンの値が索引のどこにも出ない
+        for file in files_under(&env.usage()) {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            for needle in [BODY, ALPHA, CODEX_ACCOUNT] {
+                assert!(!text.contains(needle), "{} に {needle:?}", file.display());
+            }
+        }
+    }
+
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        walk_all(dir, &mut out);
+        out
+    }
+
+    fn walk_all(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk_all(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+    }
+
+    /// 受け入れ 1（按分の側）: 過去の rollout の rate_limits だけから、窓ごとに段 + tako の外 = 最新の観測で
+    /// 配れる（早く始まった窓は別の窓・ローカルの使用量の無い区間は tako の外）
+    #[test]
+    fn codexの過去の観測から窓ごとに区間按分できる() {
+        let env = Env::new("codex-share");
+        let now = (now_ms() / 1000) as i64;
+        // 窓 A（20 日前に開始）と、A の解除を待たずに始まった窓 B（17 日前に開始）。
+        // token_count はターンの終わりに来るので、時刻は刻みの頭から 50 秒ずらす
+        let s_a = core_index::bucket_of(now - 20 * 86_400);
+        let r_a = s_a + 7 * 86_400;
+        let s_b = s_a + 3 * 86_400;
+        let r_b = s_b + 7 * 86_400;
+        let alpha = env.rollout("sessions/a", "rollout-a-thread-alpha.jsonl");
+        write(
+            &alpha,
+            &[
+                codex_meta("thread-alpha", s_a),
+                codex_turn(s_a, "gpt-5.5"),
+                codex_tc(s_a + 650, [1000, 0, 0], 2.0, r_a),
+                codex_tc(s_a + 1850, [4000, 0, 0], 8.0, r_a + 1),
+                codex_tc(s_b + 1250, [7000, 0, 0], 20.0, r_b),
+            ],
+            "",
+        );
+        let beta = env.rollout("sessions/b", "rollout-b-thread-beta.jsonl");
+        write(
+            &beta,
+            &[
+                format!(
+                    r#"{{"timestamp":"{t}","type":"session_meta","payload":{{"id":"thread-beta","timestamp":"{t}","cwd":"/home/testuser/dev/beta","source":"cli"}}}}"#,
+                    t = iso(s_b)
+                ),
+                codex_turn(s_b, "gpt-5.5").replace(ALPHA, "/home/testuser/dev/beta"),
+                codex_tc(s_b + 950, [1000, 0, 0], 15.0, r_b),
+                codex_tc(s_b + 7200, [1000, 0, 0], 26.0, r_b),
+                // 使用量の増えないまま 4% 増えた（区間にローカルの使用量が無い = tako の外）
+                codex_tc(s_b + 20_000, [1000, 0, 0], 30.0, r_b),
+            ],
+            "",
+        );
+        env.update(&mut env.codex_indexer());
+        let query = crate::usage::UsageQuery {
+            by: Some("project".into()),
+            window: Some("all".into()),
+            ..Default::default()
+        };
+        let p = crate::usage::payload_in(&env.usage(), &query, None, now, 0);
+        let login = &p["logins"][0];
+        assert_eq!(login["agent"], "codex", "{p}");
+        let kind = |name: &str| {
+            login["usage"]["limit_share"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|k| k["kind"] == name)
+                .unwrap()
+                .clone()
+        };
+        let ks = kind("seven_day");
+        assert_eq!(ks["available"], true, "{p}");
+        assert_eq!(ks["scope"], "period");
+        // 延べ = 窓 A の 8% + 窓 B の 30%（claude の寄せ方なら 1 つに束ねて 30% しか残らない）
+        assert_eq!(ks["observed"].as_f64(), Some(38.0), "{ks}");
+        assert_eq!(ks["outside"].as_f64(), Some(4.0), "{ks}");
+        // codex は使用量と観測が同じ行に載るので推定しない（窓 A の最後の観測より後の alpha の使用も配らない）
+        assert_eq!(ks["estimated"].as_f64(), Some(0.0), "{ks}");
+        let share = |name: &str| {
+            login["usage"]["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g["name"] == name)
+                .and_then(|g| g["limit_share"]["seven_day"]["percent"].as_f64())
+                .unwrap_or(0.0)
+        };
+        // 手計算: alpha = 2 + 6（窓 A）+ 5 × 500 / 1333（窓 B の 2 本目の区間）+ 6 = 15.875、
+        // beta = 15 + 5 × 833 / 1333 = 18.125（区間に重なる刻みの時間の比 × 生トークン）
+        assert!((share("alpha") - 15.875).abs() < 0.01, "{}", share("alpha"));
+        assert!((share("beta") - 18.125).abs() < 0.01, "{}", share("beta"));
+        assert!((share("alpha") + share("beta") + 4.0 - 38.0).abs() < 0.02);
+        // 5h の枠は rollout に無いので % を出さない
+        assert_eq!(kind("five_hour")["available"], false);
+        let notes = p["notes"].to_string();
+        assert!(notes.contains("codex は rollout の token_count"), "{notes}");
+        assert!(notes.contains("プランが週の枠だけ"), "{notes}");
     }
 }

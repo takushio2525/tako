@@ -76,7 +76,7 @@ tako orchestrator spawn --agent codex --model <モデル名> --project app --pro
 
 ## Claude Code との差分
 
-現時点で 63 件中 36 件が「対応」です（一部対応 4 件・未対応 20 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 63 件中 36 件が「対応」です（一部対応 6 件・未対応 18 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent codex
@@ -88,4 +88,4 @@ tako agent-support --agent codex
 - **tako 側からアカウントを切り替えられません**。設定ファイルの置き場が固定のためです（[#975](https://github.com/takushio2525/tako/issues/975)）
 - **ワークスペースのクレジットが尽きたときは自動で再開しません**。5 時間 / 週の枠は解除を待って自分で再開しますが、クレジット切れには「待つ」出口が無いので tako は何も選ばずに止まります
 
-利用制限の残量はステータスバーに表示されます（[#985](https://github.com/takushio2525/tako/issues/985) で 5 時間枠と週枠の実データを読むようになりました）。
+利用制限の残量はステータスバーに表示されます（[#985](https://github.com/takushio2525/tako/issues/985) で 5 時間枠と週枠の実データを読むようになりました）。どのプロジェクトが利用制限をどれだけ使ったかは `tako usage` で見られ、codex が残す記録から**過去の分まで**さかのぼれます（[#2204](https://github.com/takushio2525/tako/issues/2204)。codex のモデルは API 換算の単価表に無いので、% はトークン数の比で配ります）。

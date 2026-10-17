@@ -743,7 +743,13 @@ fn login_shares(
             kinds.push(ks);
             continue;
         }
-        let alloc = share::allocate(&slices, &windows, now);
+        // codex（S5）は観測の区間の外を推定しない（使用量と観測が同じ行に載る = share の冒頭）
+        let alloc = share::allocate_with(
+            &slices,
+            &windows,
+            now,
+            !share::codex_only(observations, login, kind),
+        );
         let (lo, hi) = (from.unwrap_or(i64::MIN), to);
         let mut unestimated_tokens = 0.0;
         for piece in &alloc.pieces {
