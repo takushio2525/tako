@@ -271,7 +271,7 @@ if has_stage latency; then
     reason=$(eval "echo \${REASON_$arm:-}")
     before=$(eval "echo \${TABS_BEFORE_$arm:-x}")
     after=$(eval "echo \${TABS_AFTER_$arm:-y}")
-    if [ "$state" = "failed" ] && printf '%s' "$reason" | grep -q "master を起動できない" && [ "$before" = "$after" ]; then
+    if [ "$state" = "failed" ] && grep -q "master を起動できない" <<<"$reason" && [ "$before" = "$after" ]; then
       pass "[$arm] 組み立てが打ち切られた返答は空のタブを残さず失敗として記録される（タブ ${before} → ${after}）"
     else
       fail "[$arm] 打ち切りの記録が想定と違う（state=${state}・理由=${reason}・タブ ${before} → ${after}）"
@@ -306,7 +306,7 @@ if has_stage edge; then
   out=$("$TAKO_BIN" todo respond "$oid" --decision approve --via pwa --json 2>&1)
   took=$(ms_since "$t0")
   if [ "$(printf '%s' "$out" | json_get delivery.state)" = "failed" ] \
-    && printf '%s' "$(printf '%s' "$out" | json_get delivery.reason)" | grep -q "宛先不明" \
+    && grep -q "宛先不明" <<<"$(printf '%s' "$out" | json_get delivery.reason)" \
     && [ "$took" -lt 5000 ]; then
     pass "起票元が解けない返答は起こそうとせず宛先不明で記録される（${took} ms）"
   else

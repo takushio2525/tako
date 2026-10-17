@@ -334,7 +334,7 @@ if hdiutil create -size 4m -fs HFS+ -volname tako1834 "$DMG" -quiet >/dev/null 2
   XDEV_ERR="$("$TAKO_BIN" file move "$A/src/c.txt" "$MNT" 2>&1)"
   XDEV_RC=$?
   echo "  観測: $(printf '%s' "$XDEV_ERR" | normalize_text "$A" | sed "s#${TMP}#<TMP>#g")"
-  if [ "$XDEV_RC" -ne 0 ] && printf '%s' "$XDEV_ERR" | grep -q '別のボリューム'; then
+  if [ "$XDEV_RC" -ne 0 ] && grep -q '別のボリューム' <<<"$XDEV_ERR"; then
     pass "別のボリュームへは理由つきで断る（EXDEV）"
   else
     fail "別のボリュームの断り方が想定と違う（rc=${XDEV_RC}）"

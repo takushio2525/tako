@@ -500,7 +500,12 @@ if [[ $NOTES_ONLY -eq 1 ]]; then
     [[ -n "$n" ]] && DRY_NAMES+=("$n")
   done < <(collect_dist_asset_names "$TAG")
   # まだビルドしていなくても、これから作る macOS zip は必ず含まれる
-  if ! printf '%s\n' "${DRY_NAMES[@]+"${DRY_NAMES[@]}"}" | grep -qx "$ZIP_NAME"; then
+  # （grep -q へパイプすると pipefail の下で偽の「無い」になり 2 行出るので、1 つずつ比べる = #1633）
+  HAS_ZIP=0
+  for dry_name in ${DRY_NAMES[@]+"${DRY_NAMES[@]}"}; do
+    if [[ "$dry_name" == "$ZIP_NAME" ]]; then HAS_ZIP=1; fi
+  done
+  if [[ $HAS_ZIP -eq 0 ]]; then
     DRY_NAMES+=("$ZIP_NAME")
   fi
   build_release_notes "$TAG" "$VERSION" "${DRY_NAMES[@]+"${DRY_NAMES[@]}"}"

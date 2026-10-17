@@ -302,13 +302,13 @@ if [ -n "$GOT" ]; then pass "⑥ ON に戻すと、通っている回線です�
 echo "== ⑧ persist.log =="
 LOGTXT="$(persist_log | grep '\[net-resume\]')"
 echo "$LOGTXT" | sed 's/^/    /' | tail -14
-if echo "$LOGTXT" | grep -q "回線の復帰を検知 .*再開 3 本 .*見送り 2 本 \[${P_DRAFT}:user_draft, ${P_DIALOG}:dialog\]"; then
+if grep -q "回線の復帰を検知 .*再開 3 本 .*見送り 2 本 \[${P_DRAFT}:user_draft, ${P_DIALOG}:dialog\]" <<<"$LOGTXT"; then
   pass "⑧ 再開した本数と見送りの理由が出る"
 else
   fail "⑧ 再開の 1 行が見つからない"
 fi
-if echo "$LOGTXT" | grep -q "pane=${P_DIALOG} 見送り reason=dialog" &&
-  echo "$LOGTXT" | grep -q "pane=${P_DRAFT} 見送り reason=user_draft"; then
+if grep -q "pane=${P_DIALOG} 見送り reason=dialog" <<<"$LOGTXT" &&
+  grep -q "pane=${P_DRAFT} 見送り reason=user_draft" <<<"$LOGTXT"; then
   pass "⑧ ペインごとの見送りの理由が出る"
 else
   fail "⑧ 見送りの理由の行が無い"

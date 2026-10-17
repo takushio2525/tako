@@ -183,7 +183,7 @@ wait_state() { # wait_state <ルート> <状態の正規表現> <秒>
   local n=0 st
   while [ "$n" -lt $(($3 * 10)) ]; do
     st="$(server_field "$1" '.get("state")')"
-    if printf '%s' "$st" | grep -Eq "^($2)\$"; then return 0; fi
+    if grep -Eq "^($2)\$" <<<"$st"; then return 0; fi
     sleep 0.1
     n=$((n + 1))
   done

@@ -274,7 +274,7 @@ calls=$(( $(count "$TMP/fake-shell-cmdv.calls") - before ))
 echo "    spawn: ${took} 秒 / 所在確認のシェル ${calls} 回 / $(printf '%s' "$out" | head -1 | head -c 140)"
 if [ "$calls" -lt 1 ]; then
   fail "⑭ 所在確認のシェルが一度も起きていない（注入が効いていない = 判定できない）"
-elif [ "$took" != "timeout" ] && printf '%s' "$out" | grep -q "上限時間内に確かめられませんでした"; then
+elif [ "$took" != "timeout" ] && grep -q "上限時間内に確かめられませんでした" <<<"$out"; then
   pass "⑭ spawn が ${took} 秒で返り、「確かめられなかった」と理由つきで断る（見つからないとは言わない）"
 else
   fail "⑭ spawn が上限で返らない（${took}）= 所在確認を上限なしで待っている"
@@ -336,7 +336,7 @@ P1="$(first_pane)"
 took="$(timed "$UI_REPLY_LIMIT" "$TAKO_BIN" git resolve --agent claude --pane "$P1")"
 out="$(cat "$TMP/timed.out")"
 echo "    解消エージェント: ${took} 秒 / $(printf '%s' "$out" | head -1 | head -c 120)"
-if ui_ok "$took" && printf '%s' "$out" | grep -q "git リポジトリが見つかりません"; then
+if ui_ok "$took" && grep -q "git リポジトリが見つかりません" <<<"$out"; then
   pass "E4 git が無ければ理由つきで即座に断る"
 else
   fail "E4 git が無いときの結末が想定外（${took}）"

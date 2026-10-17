@@ -121,11 +121,11 @@ reset_home
 check "$([ "$(markers)" = "0" ] && echo 1 || echo 0)" "A1 .zprofile に tako のブロックが無い"
 check "$(login_shell_lacks_tako)" "A2 新しいログインシェルから tako が引けない"
 out=$(run setup --check)
-check "$(echo "$out" | grep -q '\[不足\] tako CLI の PATH' && echo 1 || echo 0)" \
+check "$(grep -q '\[不足\] tako CLI の PATH' <<<"$out" && echo 1 || echo 0)" \
       "A3 setup --check が tako CLI の PATH を [不足] と報告する"
-check "$(echo "$out" | grep -q 'tako setup bootstrap path で設置できます' && echo 1 || echo 0)" \
+check "$(grep -q 'tako setup bootstrap path で設置できます' <<<"$out" && echo 1 || echo 0)" \
       "A4 次の一手（最簡形の 1 コマンド）を出す"
-check "$(echo "$out" | grep -q '\[OK\] エージェント CLI の導入: 使える系統 claude' && echo 1 || echo 0)" \
+check "$(grep -q '\[OK\] エージェント CLI の導入: 使える系統 claude' <<<"$out" && echo 1 || echo 0)" \
       "A5 claude は ready（= エージェントの PATH 段は走らない前提）"
 
 # --- B. tako setup（受け入れ条件 1）----------------------------------------
@@ -133,7 +133,7 @@ section "B. tako setup --yes（受け入れ条件 1）"
 out=$(run setup --yes)
 rc=$?
 check "$([ $rc -eq 0 ] && echo 1 || echo 0)" "B1 setup が exit 0 で完走する"
-check "$(echo "$out" | grep -q '\[設置\] tako CLI' && echo 1 || echo 0)" "B2 設置したことを 1 行で伝える"
+check "$(grep -q '\[設置\] tako CLI' <<<"$out" && echo 1 || echo 0)" "B2 設置したことを 1 行で伝える"
 check "$([ "$(markers)" = "1" ] && echo 1 || echo 0)" "B3 マーカーブロックがちょうど 1 個"
 check "$(grep -q '\$HOME/\.local/bin' "$ISO_HOME/.zprofile" && echo 1 || echo 0)" \
       "B4 ブロックが \$HOME/.local/bin を通す（home 相対）"
@@ -163,12 +163,12 @@ else
 fi
 check "$([ "$(readlink "$ISO_HOME/.local/bin/tako")" = "$ISO_TAKO" ] && echo 1 || echo 0)" \
       "C3 symlink も張り直されていない"
-check "$(echo "$out" | grep -q '\[OK\] tako CLI' && echo 1 || echo 0)" "C4 2 回目は [OK] と出る（設置済み）"
+check "$(grep -q '\[OK\] tako CLI' <<<"$out" && echo 1 || echo 0)" "C4 2 回目は [OK] と出る（設置済み）"
 
 # --- D. --check（受け入れ条件 4 の前半）------------------------------------
 section "D. setup --check（受け入れ条件 4）"
 out=$(run setup --check)
-check "$(echo "$out" | grep -q '\[OK\] tako CLI の PATH: 外部ターミナルからも使えます' && echo 1 || echo 0)" \
+check "$(grep -q '\[OK\] tako CLI の PATH: 外部ターミナルからも使えます' <<<"$out" && echo 1 || echo 0)" \
       "D1 設置後は [OK] と報告する"
 
 # --- E. undo-path（受け入れ条件 3）-----------------------------------------
@@ -192,7 +192,7 @@ mkdir -p "$MOVED"; mv "$ISO_TAKO" "$MOVED/tako"; rm -rf "$TMP/A"
 check "$([ ! -e "$ISO_HOME/.local/bin/tako" ] && echo 1 || echo 0)" "F2 移動でリンクが切れる（前提）"
 ISO_TAKO="$MOVED/tako"
 out=$(run setup --check)
-check "$(echo "$out" | grep -q 'リンクの指す先が消えています' && echo 1 || echo 0)" \
+check "$(grep -q 'リンクの指す先が消えています' <<<"$out" && echo 1 || echo 0)" \
       "F3 --check が「指す先が消えた」と名指しする（PATH には在るので cli_in_path では拾えない）"
 run setup bootstrap path > /dev/null
 check "$([ "$(readlink "$ISO_HOME/.local/bin/tako")" = "$MOVED/tako" ] && echo 1 || echo 0)" \
@@ -225,7 +225,7 @@ chmod 444 "$ISO_HOME/.zprofile"
 out=$(run setup --yes); rc=$?
 chmod 644 "$ISO_HOME/.zprofile"
 check "$([ $rc -eq 0 ] && echo 1 || echo 0)" "G6 profile へ書けなくても setup は止まらない"
-check "$(echo "$out" | grep -q '\[警告\] tako CLI の PATH 設置を見送りました' && echo 1 || echo 0)" \
+check "$(grep -q '\[警告\] tako CLI の PATH 設置を見送りました' <<<"$out" && echo 1 || echo 0)" \
       "G7 黙らず理由と次の一手を出す"
 check "$(grep -q 'user own first line' "$ISO_HOME/.zprofile" && echo 1 || echo 0)" "G8 読めないファイルを壊さない"
 
@@ -264,13 +264,13 @@ check "$ready" "H1 隔離 GUI が立つ"
 if [ "$ready" = "1" ]; then
     health=$(run check-health --json)
     echo "$health" > "$TMP/health.json"
-    check "$(echo "$health" | grep -q '"link_state": "correct"' && echo 1 || echo 0)" \
+    check "$(grep -q '"link_state": "correct"' <<<"$health" && echo 1 || echo 0)" \
           "H2 check-health の tako_cli_path.link_state = correct"
-    check "$(echo "$health" | grep -q '"usable": true' && echo 1 || echo 0)" \
+    check "$(grep -q '"usable": true' <<<"$health" && echo 1 || echo 0)" \
           "H3 tako_cli_path.usable = true（外部ターミナルから打てる）"
-    check "$(echo "$health" | grep -q '"check": "cli_in_path"' && echo 0 || echo 1)" \
+    check "$(grep -q '"check": "cli_in_path"' <<<"$health" && echo 0 || echo 1)" \
           "H4 cli_in_path の issue が出ない"
-    check "$(echo "$health" | grep -q '"check": "tako_cli_link"' && echo 0 || echo 1)" \
+    check "$(grep -q '"check": "tako_cli_link"' <<<"$health" && echo 0 || echo 1)" \
           "H5 tako_cli_link の issue が出ない"
     # 起動時の自動修復（#1502）: .app を移すとリンクが切れるが、次の起動で張り直る
     stop_isolated_gui "$GUI_PID"; GUI_PID=""

@@ -128,7 +128,7 @@ TOTAL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["total"
 SEARCHED="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["files_searched"], d["skipped"]["binary"], d["stopped"])' "$TMP/one.json" 2>/dev/null)"
 echo "    所要 ${SECS}s・件数 ${TOTAL}・探したファイル / バイナリ / 打ち切り = $SEARCHED"
 check "$([ "$TOTAL" = "$EXPECTED" ] && echo 1)" "件数が生成した答え（${EXPECTED}）と一致（.gitignore の配下 500 行を数えない）"
-check "$(echo "$SEARCHED" | grep -q ' 1 None$' && echo 1)" "バイナリ 1 つを探さず、最後まで探した"
+check "$(grep -q ' 1 None$' <<<"$SEARCHED" && echo 1)" "バイナリ 1 つを探さず、最後まで探した"
 
 echo "--- ② 検索のあいだ UI が止まらない（別の要求の応答時間）"
 # 一致しない正規表現で全ファイルを読み切る。1 万ファイルの走査は素の検索語なら 0.1 秒で終わって

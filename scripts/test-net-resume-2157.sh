@@ -276,14 +276,14 @@ run_round() {
   plog="$(grep '\[net-resume\]' "$TAKO_DATA_DIR/persist.log" 2>/dev/null)"
   echo "$plog" | sed 's/^/    /' | tail -12
   if [ "$label" = new ]; then
-    if echo "$plog" | grep -q "pane=$P_NOTICE 接続エラーで停止 kind=dns"; then
+    if grep -q "pane=$P_NOTICE 接続エラーで停止 kind=dns" <<<"$plog"; then
       pass "⑤ [new] 通知行の画面の停止の検知が出る"
     else
       fail "⑤ [new] 通知行の画面の停止の検知が無い"
     fi
     check_eq "⑤ [new] 止まり直しの検知が 4 行（3 回届けて 4 回目は見送り）" "4" \
       "$(echo "$plog" | grep -c "pane=$P_AGAIN 接続エラーで停止")"
-    if echo "$plog" | grep -q "pane=$P_AGAIN 見送り reason=too_many_resumes"; then
+    if grep -q "pane=$P_AGAIN 見送り reason=too_many_resumes" <<<"$plog"; then
       pass "⑤ [new] 打ち切りの見送りの理由が出る"
     else
       fail "⑤ [new] 打ち切りの見送りの行が無い"

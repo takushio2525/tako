@@ -590,11 +590,11 @@ JSON
 promo_pane_has_pii() {
     local pane=$1 text
     text=$(tko read --pane "$pane" 2>/dev/null || true)
-    if printf '%s' "$text" | grep -Eq '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'; then
+    if grep -Eq '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' <<<"$text"; then
         echo "   PII 検出（メールアドレス）: pane $pane" >&2
         return 0
     fi
-    if printf '%s' "$text" | grep -q "$HOME"; then
+    if grep -q "$HOME" <<<"$text"; then
         echo "   PII 検出（実ホームパス）: pane $pane" >&2
         return 0
     fi

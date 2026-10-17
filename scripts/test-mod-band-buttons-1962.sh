@@ -318,9 +318,9 @@ phase_static() {
   /bin/cp -R "$REPO_ROOT/crates/tako-core/claude-mod" "$m"
   rm -rf "$m/.claude-plugin/types"
   out="$(cd "$TMP" && env CLAUDE_CONFIG_DIR="$cfg" DISABLE_AUTOUPDATER=1 claude plugin validate --strict "$m" 2>&1)"
-  if printf '%s' "$out" | grep -q 'Validation passed'; then pass "validate --strict"; else fail "validate --strict"; printf '%s\n' "$out" | mask | tail -15; fi
+  if grep -q 'Validation passed' <<<"$out"; then pass "validate --strict"; else fail "validate --strict"; printf '%s\n' "$out" | mask | tail -15; fi
   out="$(cd "$TMP" && env CLAUDE_CONFIG_DIR="$cfg" DISABLE_AUTOUPDATER=1 claude plugin test "$m" 2>&1)"
-  if printf '%s' "$out" | grep -Eq '^ *0 fail'; then
+  if grep -Eq '^ *0 fail' <<<"$out"; then
     pass "claude plugin test（$(printf '%s' "$out" | grep -E '^ *[0-9]+ pass' | tr -d ' ')。s7.test.ts は terminal / desktop の両 surface）"
   else
     fail "claude plugin test"

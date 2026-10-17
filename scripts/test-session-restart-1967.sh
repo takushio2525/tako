@@ -353,7 +353,7 @@ YAML
     # 重ねて押す（本番では 2 回目の押下が立ち上がったばかりの claude を終了させた疑い）
     local again
     again="$("$TAKO_BIN" session-restart --mode harness --pane "$master" 2>&1)"
-    check "$(printf '%s' "$again" | grep -q '建て直しがまだ終わっていない' && echo 1 || echo 0)" \
+    check "$(grep -q '建て直しがまだ終わっていない' <<<"$again" && echo 1 || echo 0)" \
       "建て直しの最中に重ねた再起動は理由つきで断る"
   fi
   phase="$(wait_restart_settled "$master")"
@@ -380,9 +380,9 @@ YAML
     check "$([ -s "$TAKO_ORCHESTRATOR_DIR/_system_prompt_st1967.md" ] && echo 1 || echo 0)" \
       "消えていた system prompt のファイルを書き直してから起動した"
   else
-    check "$(printf '%s' "$line2" | grep -q -- '--append-system-prompt-file' && echo 0 || echo 1)" \
+    check "$(grep -q -- '--append-system-prompt-file' <<<"$line2" && echo 0 || echo 1)" \
       "旧挙動で system prompt が落ちる（対照）"
-    check "$(printf '%s' "$line2" | grep -q -- '--effort' && echo 0 || echo 1)" \
+    check "$(grep -q -- '--effort' <<<"$line2" && echo 0 || echo 1)" \
       "旧挙動で effort が落ちる（対照）"
     if [ "$shape" = short ]; then
       check "$([ "$(launch_count "$TMP/launches.log")" -ge $((n + 2)) ] && grep -q -- "--resume ${SID}export" "$TMP/launches.log" && echo 1 || echo 0)" \
@@ -410,7 +410,7 @@ YAML
   mv "$TMP/cfg/projects/-tmp-st1967/$SID.jsonl" "$TMP/moved.jsonl"
   n="$(launch_count "$TMP/launches.log")"
   resp="$("$TAKO_BIN" session-restart --mode harness --pane "$master" 2>&1)"
-  check "$(printf '%s' "$resp" | grep -q '記録' && echo 1 || echo 0)" \
+  check "$(grep -q '記録' <<<"$resp" && echo 1 || echo 0)" \
     "記録が無い会話は応答に理由が出る: $(printf '%s' "$resp" | head -c 160)"
   grep -q "セッション再起動: 断った pane=${master} mode=harness 理由=conversation_missing" \
     "$TAKO_DATA_DIR/persist.log"
@@ -442,7 +442,7 @@ YAML
 
   # ---- 4. エージェントが居ないペインの引き継ぎは断り、harness で戻せる ----
   resp="$("$TAKO_BIN" session-restart --mode handoff --pane "$master" 2>&1)"
-  check "$(printf '%s' "$resp" | grep -q -- '--mode harness' && echo 1 || echo 0)" \
+  check "$(grep -q -- '--mode harness' <<<"$resp" && echo 1 || echo 0)" \
     "エージェントが居ないペインの handoff は断り、harness を案内する"
   rm -f "$TMP/fail-resume"
   check "$([ "$(restart_field "$master" shell_idle)" = True ] && echo 1 || echo 0)" \
@@ -471,7 +471,7 @@ YAML
   check "$([ "$(json_field "$resp" applied)" = True ] && echo 1 || echo 0)" \
     "前景で claude 以外が動く master ペインの handoff は従来どおり依頼を積む（pane=${other} state=$(pane_state "$other")）"
   resp="$("$TAKO_BIN" session-restart --mode harness --pane "$other" 2>&1)"
-  check "$(printf '%s' "$resp" | grep -q 'ハーネス更新できない' && echo 1 || echo 0)" \
+  check "$(grep -q 'ハーネス更新できない' <<<"$resp" && echo 1 || echo 0)" \
     "同じペインの harness は終了させる相手も会話も無いので理由つきで断る"
   "$TAKO_BIN" close --pane "$other" >/dev/null 2>&1
 
