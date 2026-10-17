@@ -443,6 +443,39 @@ impl Graph {
         out
     }
 
+    /// 関数の本体のうち、入れ子の関数と **A/B の旧経路の腕だけ**を除いた範囲（#1533）。
+    ///
+    /// [`Self::live_ranges`] と違い、別スレッドへ渡すクロージャ・先取りの外側の腕は**含める**。
+    /// 「UI スレッドで走るか」ではなく「製品の既定の経路で走るか」を問う番犬のための眺め
+    /// （ログインシェルを上限なしで待つ形は、どのスレッドで待っても呼び手が固まる）
+    pub fn product_ranges(&self, f: usize) -> Vec<(usize, usize)> {
+        let def = &self.fns[f];
+        let code = self.sources[def.file].code.as_bytes();
+        let (start, end) = (def.body.0, def.body.1 + 1);
+        let mut holes: Vec<(usize, usize)> = self.fns[self.file_fns[def.file].clone()]
+            .iter()
+            .filter(|g| g.body.0 > def.body.0 && g.body.1 < def.body.1)
+            .map(|g| (g.body.0, g.body.1 + 1))
+            .collect();
+        let text = std::str::from_utf8(&code[start..end]).unwrap_or("");
+        for (i, _) in text.match_indices("legacy()") {
+            holes.extend(legacy_region(code, start, start + i, end));
+        }
+        holes.sort();
+        let mut out = Vec::new();
+        let mut cursor = start;
+        for (s, e) in holes {
+            if s > cursor {
+                out.push((cursor, s));
+            }
+            cursor = cursor.max(e);
+        }
+        if cursor < end {
+            out.push((cursor, end));
+        }
+        out
+    }
+
     /// 関数の生きた範囲の呼び出し
     fn calls(&self, f: usize) -> Vec<Call> {
         let def = &self.fns[f];

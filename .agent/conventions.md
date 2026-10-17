@@ -620,6 +620,10 @@ CI ジョブでしか分からない値になり、壊れたことに気づく�
   `has_executable_extension`）に置き、**macOS 上で走るテストで固定する**。
   整合テスト（`find` の戻り値が必ず `is_executable_file` を満たす）は
   パス指定の経路まで含めて拘束する
+- **unix も同じ契約**（#1533 から）。`find` はログインシェルの `command -v` の答えのうち
+  **実行できる絶対パスの行だけ**を採る（`pick_found_path`）。修正前は出力を丸ごと返していたので、
+  シェルの組み込み（`command -v printf` → `printf`）・別名の定義・rc の挨拶文が「見つかった」に化けた。
+  パス（`/` を含む名前）はシェルへ渡さずにその場で `is_executable_file` で確かめる
 
 ## OS に何かを「開かせる」前に形を確かめる（Issue #1376 / #1371）
 
@@ -887,6 +891,21 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
   persist.log の書き手を持たないので、受け口は tako-app / tako CLI の main が
   `bin_resolve::set_notice_sink` で渡す（番犬 `crates/tako-control/tests/issue2151_bin_resolve_watchdog.rs`、
   実経路 `bash scripts/test-bin-resolve-timeout-2151.sh`、A/B `TAKO_2151_LEGACY=1`）
+- **ログインシェル（`$SHELL -l -c …`）に尋ねるときは境界 B16 の 1 実装を通す**（#1532 / #1533）。
+  実行ファイルの検出（`platform::exe::find`）とログインシェルの PATH の読み取りが上限なしの
+  `.output()` で、`.zprofile` などが入力を待つ・眠り続けると setup・check-health・GUI の CLI 検出・
+  stale binary・自動命名などの呼び手が無言で固まった。尋ねる口は `platform::exe::ask_login_shell`
+  の 1 つだけで、`find` / `find_bounded` / `find_with_timeout` / `login_shell_path` / `bin_resolve` が
+  そこを通る。上限は `probe::login_shell_timeout()`（既定 5 秒・`TAKO_LOGIN_SHELL_TIMEOUT_SECS`。外せない）。
+  ログインシェルは**自分のプロセスグループ**で起こし（`probe::group_output_with_timeout`）、打ち切ったら
+  rc が起こした孫ごと畳む（直接の子だけを kill すると `sleep` / `read` の孫が残る）。
+  **打ち切ったら「見つからない / 未導入 / PATH に無い」と言わない**: 表示する呼び手（setup・
+  `--check`・check-health・依存の検出）は `find_bounded` / `LoginShellPath` の `timeout` を受け取り、
+  「確認できません（ログインシェルが N 秒で応答なし）」と言い分け、導入や PATH の書き込みへ進まない
+  （`BootstrapState::step_unconfirmed` / `DepStatus::unconfirmed`）。`Option` しか返さない `find` は
+  打ち切りを persist.log へ名前ごとに 1 行残す（受け口は `bin_resolve::set_notice_sink`）。番犬
+  `crates/tako-control/tests/issue1533_login_shell_timeout_watchdog.rs`、実経路
+  `bash scripts/test-login-shell-timeout-1532.sh`、A/B `TAKO_1532_LEGACY=1`
 - **子プロセスでない相手を聞き直して待つときも同じ**（#1662）。`tako run --wait` は実行ペインの
   終わりを IPC で 2 秒ごとに聞き直す無限ループで、サーバーを走らせると永久に返らなかった。
   聞き直しは `tako_core::probe::poll_with_timeout` の 1 実装を通す（眠りは残り時間で頭打ち・

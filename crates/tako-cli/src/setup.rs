@@ -98,8 +98,16 @@ fn display_home_relative(path: &Path) -> String {
 /// ここで `$SHELL -l -c "command -v"` を直書きすると Windows では**必ず失敗**する（#525）。
 /// macOS 側の解決手順（ログインシェル経由 = `.app` の痩せた PATH でも Homebrew を引ける）は
 /// 境界の内側にそのまま移してあるので、macOS の挙動は変わらない
-fn find_command(name: &str) -> Option<String> {
-    tako_core::platform::exe::find(name)
+///
+/// 探索（unix はログインシェルの `command -v`）は上限つき（#1533）。打ち切ったら
+/// **無言にしない**: `command_output` と同じ 1 行（`[確認できません] …`）を出す
+/// （dispatch はこの行を `probe::parse_notices` で拾って応答 JSON へ載せる）
+fn find_command(name: &str) -> tako_core::platform::exe::BoundedFind {
+    let found = tako_core::platform::exe::find_bounded(name);
+    if let Some(notice) = &found.timeout {
+        eprintln!("  {notice}");
+    }
+    found
 }
 
 /// setup を進行できるエージェント CLI。agy はオーケストレーターでは worker 専用だが、
@@ -247,29 +255,42 @@ fn command_output(path: &str, args: &[&str]) -> Option<std::process::Output> {
 /// **入れた直後は PATH 経由で引けないことがある**（profile へ書いても、判定できない
 /// シェルや書き込み失敗では届かない）。その場合でもインストーラが置く場所を見て拾う。
 /// ここで拾えないと「入れたのに見つかりません」で setup が止まる（#868）
-fn find_agent_command(kind: SetupAgent) -> Option<String> {
+fn find_agent_command(kind: SetupAgent) -> tako_core::platform::exe::BoundedFind {
     // #989 までここは claude 専用で、codex / agy は `_ => None` だった。
     // 入れた直後は profile へ書いた PATH がまだ届かないので、
-    // **3 系統ともインストーラの置き場所を見る**
-    find_command(kind.as_str()).or_else(|| setup_bootstrap::resolve_binary_for(kind.install_kind()))
+    // **3 系統ともインストーラの置き場所を見る**。
+    // PATH の探索は `find_command` で済んでいるので、残りはインストーラの置き場所だけを見る
+    // （`resolve_binary_for` を呼ぶと同じ問い合わせのログインシェルをもう一度起こす = #1533）
+    let mut found = find_command(kind.as_str());
+    if found.path.is_none() {
+        found.path = setup_bootstrap::installed_launcher_for(kind.install_kind());
+    }
+    found
 }
 
-fn detect_agents() -> Vec<DetectedAgent> {
-    SetupAgent::ALL
-        .into_iter()
-        .filter_map(|kind| {
-            let path = find_agent_command(kind)?;
-            // 認証とプランの問い合わせは正本 1 実装（#1505）。ここで別に CLI を
-            // 起こすと `tako setup --check` が 3 系統ぶんを 2 度ずつ叩くことになる
-            let auth = setup_bootstrap::auth_state_for(kind.install_kind(), &path);
-            Some(DetectedAgent {
-                kind,
-                path,
-                authenticated: auth.authenticated,
-                plan: auth.plan,
-            })
-        })
-        .collect()
+/// 検出できた系統と、検出（ログインシェル）を上限で打ち切って**確かめられなかった**系統（#1533）
+fn detect_agents() -> (Vec<DetectedAgent>, Vec<(SetupAgent, u64)>) {
+    let mut detected = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for kind in SetupAgent::ALL {
+        let found = find_agent_command(kind);
+        let Some(path) = found.path else {
+            if let Some(notice) = found.timeout {
+                unconfirmed.push((kind, notice.waited_secs));
+            }
+            continue;
+        };
+        // 認証とプランの問い合わせは正本 1 実装（#1505）。ここで別に CLI を
+        // 起こすと `tako setup --check` が 3 系統ぶんを 2 度ずつ叩くことになる
+        let auth = setup_bootstrap::auth_state_for(kind.install_kind(), &path);
+        detected.push(DetectedAgent {
+            kind,
+            path,
+            authenticated: auth.authenticated,
+            plan: auth.plan,
+        });
+    }
+    (detected, unconfirmed)
 }
 
 // --- モデル一覧の実取得とピッカー（Issue #1002）---
@@ -571,6 +592,10 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
             let agent = value["agent"].as_str().unwrap_or("?");
             eprintln!("エージェント CLI の導入状況");
             eprintln!("─────────────────────────");
+            if value["next_step_unconfirmed"].is_object() {
+                print_bootstrap_agent_line(value);
+                return;
+            }
             eprintln!(
                 "  {agent}: {}",
                 value["binary"]
@@ -634,6 +659,14 @@ fn print_bootstrap_agent_line(state: &serde_json::Value) {
     let agent = state["agent"].as_str().unwrap_or("?");
     if let Some(error) = state["error"].as_str() {
         eprintln!("  {agent}: 状態を確認できません（{error}）");
+        return;
+    }
+    // 段がログインシェルの打ち切りで決まっている（#1532 / #1533）。未導入・PATH に無いとは言わない
+    if let Some(secs) = state["next_step_unconfirmed"]["waited_secs"].as_u64() {
+        eprintln!("  [警告] {agent}: 確認できません（ログインシェルが {secs} 秒で応答なし）");
+        eprintln!(
+            "        .zprofile などのログインシェルの設定が入力を待っていないか確かめてください"
+        );
         return;
     }
     let binary = state["binary"].as_str().map_or("未導入".to_string(), |p| {
@@ -834,6 +867,29 @@ fn run_bootstrap_stage(assume_yes: bool) -> BootstrapOutcome {
         .any(|(_, state)| state.as_ref().is_ok_and(|s| s.step == Step::Ready))
     {
         return BootstrapOutcome::default();
+    }
+    // ログインシェルが上限内に答えず、導入済みか / PATH に在るかを確かめられない系統がある
+    // （#1532 / #1533）。「未導入」と見なして導入（`--yes` なら確認なし）へ進むと、入っているものを
+    // 入れ直しうるので進まない。理由をその場で出し、状態の確認を残り作業にして先へ進む（#1501）
+    let unconfirmed: Vec<String> = states
+        .iter()
+        .filter_map(|(agent, state)| {
+            let notice = state.as_ref().ok()?.step_unconfirmed()?;
+            Some(format!(
+                "{}: 確認できません（ログインシェルが {} 秒で応答なし）",
+                agent.as_str(),
+                notice.waited_secs
+            ))
+        })
+        .collect();
+    if !unconfirmed.is_empty() {
+        for line in &unconfirmed {
+            eprintln!("  [警告] {line}");
+        }
+        eprintln!(
+            "  .zprofile などのログインシェルの設定が入力を待っていないか確かめてから、tako setup をやり直してください"
+        );
+        return BootstrapOutcome::stuck(None, RemainingKind::AgentStatusUnknown, unconfirmed);
     }
     // 全滅の理由が「状態を読めない」なら、**それを残り作業として置いて先へ進む**（#1501）。
     // 読めないだけで設定の書き出し（指示ファイル / プロファイル / テンプレ）は通る
@@ -1160,7 +1216,7 @@ impl DepCheckMode {
 /// 戻り値は検出したエージェントと、チェック後も欠けている必須依存を
 /// **人へ残る作業として並べたもの**（#1501。ここで setup を止めない）。
 fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<Remaining>) {
-    let agents = detect_agents();
+    let (agents, unconfirmed) = detect_agents();
     eprintln!("  エージェント CLI:");
     for agent in &agents {
         let auth = if agent.authenticated {
@@ -1175,7 +1231,19 @@ fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<Remainin
             display_home_relative(Path::new(&agent.path))
         );
     }
-    let mut missing_required: Vec<Remaining> = if agents.is_empty() {
+    for (kind, secs) in &unconfirmed {
+        eprintln!(
+            "    [警告] {}: 確かめられません（ログインシェルが {secs} 秒で応答なし）",
+            kind.as_str()
+        );
+    }
+    let mut missing_required: Vec<Remaining> = if agents.is_empty() && !unconfirmed.is_empty() {
+        // 見つからないのではなく確かめられなかった（#1533）。導入の案内へ人を送らない
+        eprintln!(
+            "      .zprofile などのログインシェルの設定が入力を待っていないか確かめてください"
+        );
+        vec![Remaining::new(RemainingKind::AgentStatusUnknown)]
+    } else if agents.is_empty() {
         eprintln!("    [不足] claude / codex / agy のいずれも見つかりません");
         for kind in SetupAgent::ALL {
             eprintln!("      {}: {}", kind.as_str(), kind.install_hint());
@@ -1188,6 +1256,12 @@ fn run_dependency_check(mode: DepCheckMode) -> (Vec<DetectedAgent>, Vec<Remainin
         let dep = state.dep;
         if let Some(path) = &state.found {
             eprintln!("  [OK] {}: {path}", dep.bin);
+            continue;
+        }
+        // 検出を上限で打ち切った（#1533）。入っているかもしれないので導入へ進まず、残り作業にもしない
+        if let (Some(text), Some(notice)) = (state.unconfirmed_text(), state.unconfirmed()) {
+            eprintln!("  [警告] {text}");
+            eprintln!("  {notice}");
             continue;
         }
         let (mark, kind) = if dep.required {
@@ -1288,6 +1362,11 @@ fn print_deps_human(action: &str, value: &serde_json::Value) {
         eprintln!("─────────────────");
         for dep in value["deps"].as_array().into_iter().flatten() {
             let bin = dep["bin"].as_str().unwrap_or("?");
+            // 検出を上限で打ち切った（#1533）。見つからないとも導入方法とも言わない
+            if let Some(secs) = dep["lookup_timeout"]["waited_secs"].as_u64() {
+                eprintln!("  [警告] {bin}: 確認できません（ログインシェルが {secs} 秒で応答なし）");
+                continue;
+            }
             match dep["found"].as_str() {
                 Some(path) => eprintln!("  [OK] {bin}: {path}"),
                 None => {

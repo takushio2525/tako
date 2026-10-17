@@ -201,29 +201,35 @@ fn ブロックは何ディレクトリでも一組のまま() {
 fn 通っているかの判定がプロセスのpathへ戻っていない() {
     let rel = "crates/tako-control/src/setup_bootstrap.rs";
     let text = read(rel);
+    // ログインシェルの PATH を読む口（#1502 で分けた 1 実装）は #1532 で上限つきにして境界 B16 へ移した
+    let exe = "crates/tako-core/src/platform/exe.rs";
+    let exe_text = read(exe);
 
-    // ログインシェルの PATH を読む口が在ること（#1502 で分けた 1 実装）
+    // ログインシェルの PATH を読む口が在ること
     assert!(
-        text.contains("fn login_shell_path()"),
-        "{rel}: `login_shell_path()` が消えている。\n\
+        exe_text.contains("pub fn login_shell_path() -> LoginShellPath")
+            && exe_text.contains("fn login_shell_path_in("),
+        "{exe}: `login_shell_path()` / `login_shell_path_in` が消えている。\n\
          「新しいターミナルが見る PATH」を読む口が無いと、判定が自分のプロセスの \
          PATH へ戻る（#601 の注入で必ず「通っている」に見える = #1502 の症状）"
     );
     // その口が PATH を launchd の既定へ戻してから起こすこと（継承したままだと
-    // macOS の path_helper が親の PATH を引き継いで答えが濁る）
-    let starts = hits_in_fn(&text, ".env(\"PATH\", DEFAULT_LOGIN_PATH)");
+    // macOS の path_helper が親の PATH を引き継いで答えが濁る）。起こすのは尋ねる口の 1 実装
+    let passes = hits_in_fn(&exe_text, "Some(DEFAULT_LOGIN_PATH)");
+    let sets = hits_in_fn(&exe_text, "command.env(\"PATH\", path)");
     assert!(
-        starts.iter().any(|(_, f)| f == "login_shell_path"),
-        "{rel}: `login_shell_path()` がログインシェルへ既定の PATH を渡していない。\n\
+        passes.iter().any(|(_, f)| f == "login_shell_path_in")
+            && sets.iter().any(|(_, f)| f == "ask_login_shell"),
+        "{exe}: `login_shell_path_in` がログインシェルへ既定の PATH を渡していない。\n\
          継承したまま起こすと `/etc/zprofile` の path_helper が親の PATH を引き継ぐので、\n\
          答えが「新しいターミナルの PATH」ではなく「この親の PATH」になる（#1502 の実測）"
     );
-    // 書くかどうかの判定が `login_shell_path()` を第一候補にしていること
-    let decides = hits_in_fn(&text, "login_shell_path()");
+    // 書くかどうかの判定がログインシェルの PATH を第一候補にしていること
+    let decides = hits_in_fn(&text, "tako_core::platform::exe::login_shell_path()");
     assert!(
         decides.iter().any(|(_, f)| f == "ensure_dirs_on_path"),
         "{rel}: `ensure_dirs_on_path` が「通っているか」をプロセスの PATH で決めている。\n\
-         見つかった `login_shell_path()` の呼び出し: {}",
+         見つかった `exe::login_shell_path()` の呼び出し: {}",
         decides
             .iter()
             .map(|(line, f)| format!("{rel}:{line}（{f}）"))

@@ -18637,14 +18637,30 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     // 言っているのと同じ地平で測る。#898 より前は `which` をプロセス PATH で叩いていたので
     // Dock 起動では常に「無い」に見え、Windows では `which` 自体が無く必ず失敗していた。
     // 「tako 内のシェルから打てるか」は別物（そちらは `injected_cli_dir` が答える。#601）
-    let cli_path = which("tako");
+    // #1533: 探索（ログインシェル）を上限で打ち切ったら「PATH に無い」ではなく「確かめられない」と言う
+    let cli_found = tako_core::platform::exe::find_bounded("tako");
+    let cli_in_path_unconfirmed = cli_found
+        .timeout
+        .clone()
+        .filter(|_| cli_found.path.is_none());
+    let cli_path = cli_found.path;
     let cli_in_path = cli_path.is_some();
     // #601: tako が開くシェルへ自動注入している CLI ディレクトリ（解決できなければ null）
     let injected_cli_dir = tako_core::shell_integration::cli_dir();
     // #1502: 外部ターミナル向けの設置（FR-2.14.5）の実測。判定の正本は
     // `setup_bootstrap::tako_cli_path_json`（`tako setup --check` も同じ材料を読む）
     let tako_cli_path = crate::setup_bootstrap::tako_cli_path_json();
-    if !cli_in_path {
+    if let Some(notice) = &cli_in_path_unconfirmed {
+        issues.push(json!({
+            "level": "warning",
+            "check": "cli_in_path",
+            "message": format!(
+                "tako CLI が PATH に在るかを確かめられない（ログインシェルが {} 秒で応答しない）。\
+                 .zprofile などのログインシェルの設定が入力を待っていないか確かめること（#1533）",
+                notice.waited_secs
+            ),
+        }));
+    } else if !cli_in_path {
         // 注入が効いていれば tako の中では打てる = 致命ではない。外部ターミナルでも
         // 使いたい人向けの案内に落とす（level を下げても対処法は示し続ける）。
         // #1502 からは**手順ではなく 1 コマンド**を出す（#322 の最簡形）
@@ -18685,15 +18701,29 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         }));
     }
 
-    // CLI バージョンとアプリバージョンの一致
+    // CLI バージョンとアプリバージョンの一致。`tako --version` も上限つきで待つ（#1533 の check-health の
+    // 経路の残り。PATH の先の tako が固まっていても診断ごと止まらない）
+    let mut cli_version_timeout = None;
     let cli_version = cli_path
         .as_ref()
         .and_then(|path| {
-            // #586: GUI プロセス経由の診断でもコンソールウィンドウを出させない
-            tako_core::platform::process::no_console_window(&mut std::process::Command::new(path))
+            if tako_core::probe::issue1532_legacy() {
+                // #586: GUI プロセス経由の診断でもコンソールウィンドウを出させない
+                return tako_core::platform::process::no_console_window(
+                    &mut std::process::Command::new(path),
+                )
                 .arg("--version")
                 .output()
-                .ok()
+                .ok();
+            }
+            // コンソールウィンドウの抑止（#586）は `output_with_timeout` が持つ
+            let outcome = tako_core::probe::output_with_timeout(
+                path,
+                &["--version"],
+                tako_core::probe::probe_timeout(),
+            );
+            cli_version_timeout = outcome.timeout_notice();
+            outcome.into_output()
         })
         .and_then(|out| {
             String::from_utf8(out.stdout)
@@ -18701,7 +18731,16 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
                 .and_then(|s| s.split_whitespace().last().map(|v| v.to_string()))
         });
     let version_match = cli_version.as_deref() == Some(&app_version);
-    if cli_in_path && !version_match {
+    if let Some(notice) = &cli_version_timeout {
+        issues.push(json!({
+            "level": "warning",
+            "check": "version_match",
+            "message": format!(
+                "CLI バージョンを確かめられない（`{}` が {} 秒で応答しない）",
+                notice.label, notice.waited_secs
+            ),
+        }));
+    } else if cli_in_path && !version_match {
         issues.push(json!({
             "level": "warning",
             "check": "version_match",
@@ -18815,6 +18854,16 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         "app_version": app_version,
         "cli_version": cli_version,
         "cli_in_path": cli_in_path,
+        // #1533: tako CLI の探索 / `tako --version` を上限で打ち切った（null = 確かめた答え。
+        // 立っているときの `cli_in_path: false` / `cli_version: null` は確かめられなかったもの）
+        "cli_in_path_unconfirmed": cli_in_path_unconfirmed.as_ref().map(|n| json!({
+            "label": n.label,
+            "waited_secs": n.waited_secs,
+        })),
+        "cli_version_unconfirmed": cli_version_timeout.as_ref().map(|n| json!({
+            "label": n.label,
+            "waited_secs": n.waited_secs,
+        })),
         // tako 内のシェルへ自動で PATH 追加している CLI ディレクトリ（#601）
         "injected_cli_dir": injected_cli_dir.map(|d| d.display().to_string()),
         // #1502: 外部ターミナル向けの設置（symlink の置き場所・指す先・状態・PATH の有無）。

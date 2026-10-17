@@ -9,6 +9,13 @@
 //! 最小構成（`/usr/bin:/bin:…`）になり、Homebrew や `~/.local/bin` のコマンドが
 //! 一切見つからない。ログインシェルを経由して初めてユーザーの PATH で解決できる。
 //!
+//! ログインシェルは rc（`.zprofile` など）次第でいくらでも待ちうる子なので、**待ちには上限を持つ**
+//! （#1532 / #1533）。尋ねる口は [`ask_login_shell`] の 1 つだけで、[`find`] / [`find_bounded`] /
+//! [`find_with_timeout`] / [`login_shell_path`] / git・tmux の場所の解決（`bin_resolve`）がそこを通る。
+//! 打ち切ったら「見つからない」ではなく「確かめられなかった」を [`BoundedFind::timeout`] /
+//! [`LoginShellPath::timeout`] で呼び手へ運ぶ。上限なしで待つ形へ戻すと番犬
+//! `issue1533_login_shell_timeout_watchdog` が file:line で落とす。
+//!
 //! 一方 **Windows には `$SHELL` も `command -v` も無い**ので、この実装は例外なく
 //! `None` を返す。実測（2026-07-27・Windows 11）では claude / git が導入済みでも
 //! `tako setup` が「claude / codex / agy のいずれも見つかりません」で停止した。
@@ -48,9 +55,164 @@
 ///
 /// 返り値はそのまま [`std::process::Command::new`] に渡せる
 /// （Windows の `.cmd` / `.bat` シムも Rust 標準ライブラリが解釈する）。
-/// 返り値は必ず [`is_executable_file`] を満たす（#1372）
+/// 返り値は必ず [`is_executable_file`] を満たす（#1372）。
+///
+/// unix はログインシェルの `command -v` を**上限つきで**聞く（[`find_bounded`]。#1533）。
+/// 打ち切ったら `None` を返し、理由を persist.log へ 1 行残す（名前ごとに 1 回）。
+/// 「見つからない」と「確かめられなかった」を言い分けて表示する呼び手（setup・環境診断・
+/// 依存の検出）は [`find_bounded`] を使う
 pub fn find(name: &str) -> Option<String> {
-    imp::find(name)
+    #[cfg(unix)]
+    {
+        let found = find_bounded(name);
+        if let Some(notice) = &found.timeout {
+            report_find_timeout(name, notice);
+        }
+        found.path
+    }
+    #[cfg(not(unix))]
+    {
+        imp::find(name)
+    }
+}
+
+/// [`find`] の打ち切りを**呼び手まで運ぶ**版（#1532 / #1533）。
+///
+/// 上限は `probe::login_shell_timeout()`（既定 5 秒・env で変えられるが外せない）。
+/// 打ち切ったら [`BoundedFind::timeout`] が立つ = 未導入ではなく**確かめられなかった**。
+/// パス（`/` を含む）はシェルに聞かずにその場で確かめる（`command -v ./x` と同じ答え）。
+/// Windows は PATH の走査だけ（子プロセスを起こさない）なので [`find`] と同じ答えで、打ち切りは無い
+pub fn find_bounded(name: &str) -> BoundedFind {
+    #[cfg(unix)]
+    {
+        if crate::probe::issue1532_legacy() {
+            return BoundedFind {
+                path: imp::find_legacy(name),
+                timeout: None,
+            };
+        }
+        if name.contains('/') {
+            return BoundedFind {
+                path: is_executable_file(std::path::Path::new(name)).then(|| name.to_string()),
+                timeout: None,
+            };
+        }
+        find_with_timeout(name, crate::probe::login_shell_timeout())
+    }
+    #[cfg(not(unix))]
+    {
+        BoundedFind {
+            path: imp::find(name),
+            timeout: None,
+        }
+    }
+}
+
+/// [`find`] が打ち切ったことを persist.log へ残す（名前ごとに 1 回 = 定期の呼び手で埋めない）。
+///
+/// tako-core は persist.log の書き手を持たないので、git / tmux の場所の解決（#2151）と同じ受け口
+/// （`bin_resolve::set_notice_sink`）を通す。名札は実行ファイル名と引数だけ（#927）
+#[cfg(unix)]
+fn report_find_timeout(name: &str, notice: &crate::probe::TimeoutNotice) {
+    static REPORTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut reported) = REPORTED.lock() else {
+        return;
+    };
+    if reported.iter().any(|n| n == name) || reported.len() >= 64 {
+        return;
+    }
+    reported.push(name.to_string());
+    drop(reported);
+    crate::bin_resolve::notify(&format!(
+        "実行ファイルの検出（#1533）: `{}` が {} 秒で戻らないので打ち切り、{name} は見つからないとして扱う。\
+         ログインシェルの rc（.zprofile など）が入力を待っていないか確かめること。\
+         上限は {} で変えられる",
+        notice.label,
+        notice.waited_secs,
+        crate::probe::LOGIN_SHELL_TIMEOUT_ENV
+    ));
+}
+
+/// [`login_shell_path`] の結果
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoginShellPath {
+    /// ログインシェルが答えた PATH（Windows・起こせない・失敗・打ち切りは `None`）
+    pub value: Option<String>,
+    /// 上限を超えて打ち切った（= 読めなかったのではなく**確かめられなかった**）
+    pub timeout: Option<crate::probe::TimeoutNotice>,
+}
+
+/// 新しいターミナル（launchd → ログインシェル）が profile を読む**前**に持っている PATH。
+/// macOS / Linux の慣習値で、`/etc/zprofile` の `path_helper` はここから組み直す
+pub const DEFAULT_LOGIN_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// ログインシェルの PATH を読む問い合わせ（[`login_shell_path`] が尋ねる 1 行）
+#[cfg(unix)]
+const PATH_QUERY: &str = "printf %s \"$PATH\"";
+
+/// 「**新しく開いたターミナルが見る PATH**」= ログインシェルの PATH（#1502 の判定の材料）。
+///
+/// **PATH を launchd の既定（[`DEFAULT_LOGIN_PATH`]）へ戻してから起こす**（#1502 の実測）。
+/// 継承したまま起こすと macOS の `/etc/zprofile` が呼ぶ `path_helper` が親の PATH を引き継ぐので、
+/// 答えが「新しいターミナルが見る PATH」ではなく「この親の PATH」になる。
+///
+/// 待ちは上限つき（`probe::login_shell_timeout()`。#1532）で、打ち切ったら
+/// [`LoginShellPath::timeout`] が立つ。Windows の PATH はレジストリ由来でシェル profile 由来では
+/// ないので、ここは常に空を返す（判定は `platform::user_path` = 境界 B23 が持つ）
+pub fn login_shell_path() -> LoginShellPath {
+    #[cfg(unix)]
+    {
+        if crate::probe::issue1532_legacy() {
+            return LoginShellPath {
+                value: imp::login_shell_path_legacy(),
+                timeout: None,
+            };
+        }
+        login_shell_path_in(&user_shell(), crate::probe::login_shell_timeout())
+    }
+    #[cfg(not(unix))]
+    {
+        LoginShellPath::default()
+    }
+}
+
+/// [`login_shell_path`] の本体（シェルと上限を差し替えてテストで固定するために分けてある）
+#[cfg(unix)]
+pub(crate) fn login_shell_path_in(shell: &str, budget: std::time::Duration) -> LoginShellPath {
+    let outcome = ask_login_shell(shell, PATH_QUERY, Some(DEFAULT_LOGIN_PATH), budget);
+    let timeout = outcome.timeout_notice();
+    let value = outcome
+        .into_output()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    LoginShellPath { value, timeout }
+}
+
+/// ログインシェルに 1 行を尋ねる（**ログインシェルを待つ 1 実装**。#1532 / #1533）。
+///
+/// 実行ファイルの検出（[`login_shell_find`]）と PATH の読み取り（[`login_shell_path_in`]）が
+/// ここを通る。待ちは `probe::group_output_with_timeout`（自分のプロセスグループで起こし、
+/// 打ち切ったら rc が起こした孫ごと畳む）。`path` を渡すと子の PATH をその値で起こす。
+/// 番犬 `issue1533_login_shell_timeout_watchdog` が、ここ以外でログインシェルを上限なしで
+/// 待つ形を file:line で落とす
+#[cfg(unix)]
+fn ask_login_shell(
+    shell: &str,
+    script: &str,
+    path: Option<&str>,
+    budget: std::time::Duration,
+) -> crate::probe::Outcome {
+    let args = ["-l", "-c", script];
+    let mut command = std::process::Command::new(shell);
+    command.args(args);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    crate::probe::group_output_with_timeout(
+        &mut command,
+        &crate::probe::label(shell, &args),
+        budget,
+    )
 }
 
 /// [`find_with_timeout`] の結果
@@ -66,10 +228,11 @@ pub struct BoundedFind {
 /// 上限を持つ（Issue #1503）」）。
 ///
 /// unix の [`find`] はログインシェルを起こして `command -v` を聞く = rc ファイル次第で
-/// いくらでも待ちうる子プロセスで、待ちに上限が無い。Code Runner の実行環境の検出
-/// （Tier P）と言語サーバの解決（#1769。`lsp::manager::default_launch`）はここを通し、
-/// 待ちは `probe::output_with_timeout` の 1 実装に掛ける（profile が入力を待つ形でも
-/// 呼び手が固まらず、打ち切ったことを [`BoundedFind::timeout`] で知らせる）。
+/// いくらでも待ちうる子プロセス。Code Runner の実行環境の検出（Tier P）と言語サーバの解決
+/// （#1769。`lsp::manager::default_launch`）は自分の上限を渡してここを通す（[`find`] /
+/// [`find_bounded`] は `probe::login_shell_timeout()` を渡してここを通す = #1533）。
+/// 待ちは [`ask_login_shell`] の 1 実装に掛ける（profile が入力を待つ形でも呼び手が固まらず、
+/// 打ち切ったことを [`BoundedFind::timeout`] で知らせる）。
 /// Windows は PATH の走査だけ（子プロセスを起こさない）なので [`find`] と同じ。
 ///
 /// `name` はコマンド名だけを受ける（`[A-Za-z0-9._+-]`。シェルへ文字列として渡すため、
@@ -109,7 +272,7 @@ pub(crate) fn login_shell_find(
     budget: std::time::Duration,
 ) -> BoundedFind {
     let lookup = format!("command -v {name}");
-    let outcome = crate::probe::output_with_timeout(shell, &["-l", "-c", &lookup], budget);
+    let outcome = ask_login_shell(shell, &lookup, None, budget);
     let timeout = outcome.timeout_notice();
     let path = outcome
         .into_output()
@@ -147,9 +310,10 @@ pub fn file_version(path: &std::path::Path) -> Option<String> {
 
 #[cfg(unix)]
 mod imp {
-    /// ログインシェル経由で探す。`.app`（Dock 起動）の痩せた PATH でも
-    /// ユーザーの PATH で解決できるようにするため（この経路を外すと Homebrew が全滅する）
-    pub fn find(name: &str) -> Option<String> {
+    /// #1533 前の探索（**上限なし**。A/B の再現アーム = `TAKO_1532_LEGACY=1` のときだけ通る）。
+    /// ログインシェル経由で探すのは `.app`（Dock 起動）の痩せた PATH でもユーザーの PATH で
+    /// 解決できるようにするため（この経路を外すと Homebrew が全滅する）
+    pub fn find_legacy(name: &str) -> Option<String> {
         let output = std::process::Command::new(user_shell())
             .args(["-l", "-c", &format!("command -v {name}")])
             .stdin(std::process::Stdio::null())
@@ -163,7 +327,22 @@ mod imp {
         (!path.is_empty()).then_some(path)
     }
 
-    /// [`find`] と同じ問い合わせを `probe::output_with_timeout`（待ちの 1 実装）で行う
+    /// #1532 前のログインシェルの PATH の読み取り（**上限なし**。`TAKO_1532_LEGACY=1` のときだけ通る）
+    pub fn login_shell_path_legacy() -> Option<String> {
+        let output = std::process::Command::new(user_shell())
+            .args(["-l", "-c", super::PATH_QUERY])
+            .env("PATH", super::DEFAULT_LOGIN_PATH)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// [`super::find`] と同じ問い合わせを上限つき（[`super::ask_login_shell`]）で行う
     pub fn find_with_timeout(name: &str, budget: std::time::Duration) -> super::BoundedFind {
         super::login_shell_find(&user_shell(), name, budget)
     }
@@ -470,6 +649,117 @@ mod tests {
         // 打ち切りの知らせが返ったこと自体が「上限で打ち切った」の証拠
         let got = login_shell_find(&shell, "x", std::time::Duration::from_millis(300));
         assert!(got.timeout.is_some() && got.path.is_none(), "{got:?}");
+    }
+
+    /// `dir/<file>` に書かれた pid の子が居なくなるまで待つ（外側の締め切り 10 秒は「残っている」を
+    /// 落ちとして見るためのもの = 実時間の比較はしない）。pid を書く前に打ち切られたら見届ける子は無い
+    #[cfg(unix)]
+    fn assert_gone(dir: &std::path::Path, file: &str) {
+        let raw = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
+        let raw = raw.trim();
+        if raw.is_empty() {
+            eprintln!("偽のシェルは {file} を書く前に打ち切られた（見届ける子は無い）");
+            return;
+        }
+        let pid: u32 = raw.parse().expect("pid");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::platform::process::pid_alive(pid) {
+            assert!(
+                std::time::Instant::now() < until,
+                "打ち切った後に {file} の子 {pid} が残っている（#1532 の受け入れ条件 2）"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// #1532 / #1533: rc が**孫を起こして**眠る形（`exec` しない = 直接の子を kill しても孫が残る）でも、
+    /// 打ち切ったらグループごと畳む（受け入れ条件 2）。孫はパイプの書き手として残らない
+    #[cfg(unix)]
+    #[test]
+    fn rcが起こした孫も打ち切りでグループごと畳む() {
+        let dir = crate::test_residue::ScratchDir::new("exe-lookup-grandchild");
+        let grandchild = dir.path().join("grandchild");
+        let shell = fake_shell(
+            dir.path(),
+            "rc-sleeps",
+            &format!("sleep 600 &\necho $! > '{}'\nwait", grandchild.display()),
+        );
+        let got = login_shell_find(&shell, "x", std::time::Duration::from_millis(500));
+        assert!(got.timeout.is_some() && got.path.is_none(), "{got:?}");
+        assert_gone(dir.path(), "grandchild");
+    }
+
+    /// #1532: ログインシェルの PATH の読み取りも上限で打ち切り、「確かめられなかった」を返す。
+    /// 入力を待つ rc（誰も書かない FIFO を読む = `read` が返らない）の形
+    #[cfg(unix)]
+    #[test]
+    fn ログインシェルのpathの読み取りは上限で打ち切る() {
+        let dir = crate::test_residue::ScratchDir::new("exe-login-path-timeout");
+        let fifo = dir.path().join("tty");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo を起こせる");
+        assert!(made.success(), "mkfifo が成功する");
+        let shell = fake_shell(
+            dir.path(),
+            "rc-reads",
+            &format!(
+                "echo $$ > '{}'\nread line < '{}'\nprintf %s \"$PATH\"",
+                dir.path().join("pid").display(),
+                fifo.display()
+            ),
+        );
+        let got = login_shell_path_in(&shell, std::time::Duration::from_millis(500));
+        assert!(got.timeout.is_some() && got.value.is_none(), "{got:?}");
+        assert!(
+            got.timeout
+                .as_ref()
+                .is_some_and(|n| n.label.starts_with("rc-reads -l -c printf")),
+            "名札は実行ファイル名と引数だけ（#927）: {got:?}"
+        );
+        assert_gone(dir.path(), "pid");
+    }
+
+    /// #1532: 普通のログインシェルは今まで通り PATH を答える。子の PATH は launchd の既定から起こす（#1502）
+    #[cfg(unix)]
+    #[test]
+    fn ログインシェルのpathは既定のpathから起こして読む() {
+        let dir = crate::test_residue::ScratchDir::new("exe-login-path-ok");
+        let shell = fake_shell(dir.path(), "plain", "printf %s \"$PATH\"");
+        let got = login_shell_path_in(&shell, std::time::Duration::from_secs(10));
+        assert_eq!(
+            got,
+            LoginShellPath {
+                value: Some(DEFAULT_LOGIN_PATH.to_string()),
+                timeout: None,
+            }
+        );
+        // 失敗したシェルは「読めない」（打ち切りではない）
+        let shell = fake_shell(dir.path(), "fails", "exit 3");
+        assert_eq!(
+            login_shell_path_in(&shell, std::time::Duration::from_secs(10)),
+            LoginShellPath::default()
+        );
+    }
+
+    /// #1533: パス（`/` を含む名前）はシェルへ渡さずにその場で確かめる（`command -v ./x` と同じ答え）
+    #[cfg(unix)]
+    #[test]
+    fn パスの名前はシェルに聞かずに確かめる() {
+        assert_eq!(
+            find_bounded("/bin/sh"),
+            BoundedFind {
+                path: Some("/bin/sh".into()),
+                timeout: None,
+            }
+        );
+        assert_eq!(
+            find_bounded("/nonexistent/tako-1533"),
+            BoundedFind::default()
+        );
+        // ディレクトリは実行ファイルではない
+        assert_eq!(find_bounded("/bin"), BoundedFind::default());
     }
 
     /// #1769: 見つかったことにするのは実行できるファイルだけ（エイリアス・失敗・空は見つからない）。

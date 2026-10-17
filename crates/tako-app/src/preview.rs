@@ -1439,25 +1439,11 @@ fn resolve_media_bin(name: &str, env_var: &str, known_paths: &[&str]) -> String 
             return (*candidate).into();
         }
     }
+    // ログインシェルの `command -v` は境界 B16 の上限つきの 1 実装（#1533。ここで直に起こすと
+    // rc が入力を待つ形でプレビューの解決が返らない）。Windows は上の `-version` が PATH を見ている
     #[cfg(unix)]
-    {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        if let Ok(output) = std::process::Command::new(&shell)
-            .args(["-l", "-c", &format!("command -v {name}")])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() && std::path::Path::new(&path).is_file() {
-                    return path;
-                }
-            }
-        }
+    if let Some(path) = tako_core::platform::exe::find(name) {
+        return path;
     }
     name.into()
 }

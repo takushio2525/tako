@@ -307,8 +307,14 @@ fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
 }
 
 fn detect_gh() -> GhStatus {
-    let Some(bin) = find_gh() else {
-        return GhStatus::Missing;
+    let found = find_gh();
+    let Some(bin) = found.path else {
+        // 探索（ログインシェル）を上限で打ち切った = 入っていないのではなく確かめられなかった（#1533）
+        return if found.timeout.is_some() {
+            GhStatus::Unknown
+        } else {
+            GhStatus::Missing
+        };
     };
     match run_status(&bin, &["auth", "status"], GH_TIMEOUT) {
         Some(true) => GhStatus::Authenticated,
@@ -317,31 +323,16 @@ fn detect_gh() -> GhStatus {
     }
 }
 
-fn find_gh() -> Option<String> {
+fn find_gh() -> tako_core::platform::exe::BoundedFind {
     if command_succeeds("gh", &["--version"]) {
-        return Some("gh".to_string());
+        return tako_core::platform::exe::BoundedFind {
+            path: Some("gh".to_string()),
+            timeout: None,
+        };
     }
-    // GUI 起動や Homebrew の PATH 差異に対応（setup の find_command と同じ手口）
-    #[cfg(unix)]
-    {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
-        let output = std::process::Command::new(shell)
-            .args(["-l", "-c", "command -v gh"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && Path::new(&path).is_file() {
-                return Some(path);
-            }
-        }
-    }
-    None
+    // GUI 起動や Homebrew の PATH 差異に対応（setup の find_command と同じ手口）。
+    // 探索は境界 B16 の上限つきの 1 実装（#1533。ここでログインシェルを直に起こすと上限が消える）
+    tako_core::platform::exe::find_bounded("gh")
 }
 
 fn command_succeeds(bin: &str, args: &[&str]) -> bool {

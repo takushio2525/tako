@@ -596,10 +596,13 @@ pub fn claude_health() -> (bool, bool) {
 
 /// [`claude_health`] に**打ち切りの知らせ**（#1503）を添えた口。
 ///
-/// 実行ファイルの解決はここ 1 か所（呼び手が `exe::find("claude")` を書き直さない）
+/// 実行ファイルの解決はここ 1 か所（呼び手が `exe::find("claude")` を書き直さない）。
+/// 解決（unix はログインシェルの `command -v`）を上限で打ち切ったら、その知らせを返す
+/// （= 未登録ではなく**確かめられなかった**。#1533）
 pub fn claude_health_now() -> (bool, bool, Option<tako_core::probe::TimeoutNotice>) {
-    let Some(binary) = tako_core::platform::exe::find("claude") else {
-        return (false, false, None);
+    let found = tako_core::platform::exe::find_bounded("claude");
+    let Some(binary) = found.path else {
+        return (false, false, found.timeout);
     };
     claude_health_probe(&binary)
 }

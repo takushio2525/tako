@@ -571,14 +571,8 @@ fn 実行ファイルの探索がログインシェル経由で境界の外に�
              するので Windows でも `.exe` なら解決できる（PATHEXT とユーザー導入先を見ないので \
              `.cmd` シムには届かない = B16 より弱い）",
         ),
-        (
-            "crates/tako-app/src/preview.rs",
-            "resolve_bin() と同型のヘルパー。理由も同じ（素の名前へフォールバックする = `.exe` 限定）",
-        ),
-        (
-            "crates/tako-control/src/config_share/env.rs",
-            "find_gh(): `gh --version`（素の名前 = `.exe` 限定）を先に試し、シェル経路は #[cfg(unix)] の中",
-        ),
+        // tako-app の preview.rs（ffprobe）と config_share/env.rs（gh）は #1533 で境界 B16 の
+        // 上限つきの口（`exe::find` / `exe::find_bounded`）へ寄せたので許可から外した
     ];
 
     let root = repo_root();
@@ -863,11 +857,6 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             "Launch Services ヘルパのモックテスト（macOS 限定。#837）",
         ),
         (
-            "crates/tako-app/src/preview.rs",
-            1,
-            "ffmpeg / ffprobe をログインシェル経由で探す経路（`#[cfg(unix)]`）",
-        ),
-        (
             "crates/tako-app/src/update_checker.rs",
             2,
             "macOS 限定の `ditto`（zip 展開）1 箇所。Windows インストーラーの起動は \
@@ -905,8 +894,8 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-control/src/config_share/env.rs",
-            2,
-            "ログインシェル経由の探索（`#[cfg(unix)]`）とテストモジュールの `git init`",
+            1,
+            "テストモジュールの `git init`（gh のログインシェル経由の探索は #1533 で境界 B16 へ寄せた）",
         ),
         (
             "crates/tako-control/src/dispatch.rs",
@@ -976,8 +965,10 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-core/src/platform/exe.rs",
-            1,
-            "境界 B16 の unix 実装（ログインシェル経由）。Windows 実装は子プロセスを起こさない",
+            4,
+            "境界 B16 の unix 実装（ログインシェルへ尋ねる口 `ask_login_shell` と、#1532 の A/B の再現アーム \
+             `find_legacy` / `login_shell_path_legacy`。どれも `#[cfg(unix)]`）と `#[cfg(unix)]` の単体テストの \
+             `mkfifo`。Windows 実装は子プロセスを起こさない",
         ),
         (
             "crates/tako-core/src/platform/fd_inherit.rs",
