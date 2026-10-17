@@ -23,6 +23,8 @@ use tako_core::claude_mod_install::{
     self as core, Action, Blocked, CopyState, Expected, Inspection, Outcome, State,
 };
 
+use crate::setup::{SetupPlan, SetupValueSource};
+
 /// 置く先の出どころ
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -480,13 +482,62 @@ pub fn refine_injection(
     }
 }
 
+/// 写しの中身の見出し（setup の最終サマリの前後の値）。置き直し・外す対象（tako の写し）だけ
+fn copy_label(copy: &CopyState, expected: &Expected) -> Option<String> {
+    match copy {
+        // 版が同じでも中身が違えば置き直す（前後が同じ文字列だとサマリが変化を捨てる）
+        CopyState::Managed(m)
+            if m.tako_version == expected.version && m.content_hash != expected.hash =>
+        {
+            Some(format!("tako mod {} の写し（中身が違う）", m.tako_version))
+        }
+        CopyState::Managed(m) => Some(format!("tako mod {} の写し", m.tako_version)),
+        CopyState::MarkUnreadable => Some("印の読めない tako の写し".into()),
+        _ => None,
+    }
+}
+
+/// 書いた・外した設定 dir を setup の最終サマリへ積む（#2292。積まないと「変更なし」と出る）。
+/// `before` は同じ置く先の dry-run（[`sync_targets`] は置く先の順を保つ）
+fn record_changes(
+    summary: &mut SetupPlan,
+    before: &[TargetResult],
+    results: &[TargetResult],
+    expected: &Expected,
+) {
+    for (prev, r) in before.iter().zip(results) {
+        let key = short(&core::copy_dir(&r.target.dir));
+        let was = copy_label(&prev.inspection.copy, expected);
+        let after = match &r.outcome {
+            Ok(Outcome::Written) => format!("tako mod {} の写し", expected.version),
+            Ok(Outcome::Removed) => format!(
+                "外した（{}）",
+                state_message(r.state, &r.inspection, r.blocked.as_ref())
+                    .unwrap_or_else(|| r.state.code().into())
+            ),
+            _ => continue,
+        };
+        summary.push_if_changed(key, was.as_deref(), after, SetupValueSource::Default);
+    }
+}
+
 /// `tako setup` の段。**止めない**（入れられなくても tako は env の注入と画面の読み取りで動く）。
-/// 初めて置くときだけ「何をどこへ」を出してから置く（#262 の質問ゼロ。FR-2.14.14 と同じ作法）
-pub fn run_setup_stage(claude_version: Option<String>) -> Vec<String> {
+/// 初めて置くときだけ「何をどこへ」を出してから置く（#262 の質問ゼロ。FR-2.14.14 と同じ作法）。
+/// 書いた・外した設定 dir は `summary`（setup の最終サマリ）へ積む（#2292）
+pub fn run_setup_stage(claude_version: Option<String>, summary: &mut SetupPlan) -> Vec<String> {
     let ctx = Context::from_env(claude_version);
-    let expected = Expected::current();
     let targets = collect_targets(&target_inputs(&[]));
-    let plan = sync_targets(&targets, &ctx, &expected, true);
+    setup_stage_for(&targets, &ctx, &Expected::current(), summary)
+}
+
+/// [`run_setup_stage`] の本体（置く先と tako 側の事情を受け取る = 一時 dir で同じ経路を検査できる）
+fn setup_stage_for(
+    targets: &[Target],
+    ctx: &Context,
+    expected: &Expected,
+    summary: &mut SetupPlan,
+) -> Vec<String> {
+    let plan = sync_targets(targets, ctx, expected, true);
     let mut lines = Vec::new();
     let first = plan
         .iter()
@@ -509,7 +560,8 @@ pub fn run_setup_stage(claude_version: Option<String>) -> Vec<String> {
         ));
         lines.push("    戻し方: tako mod uninstall".into());
     }
-    let results = sync_targets(&targets, &ctx, &expected, false);
+    let results = sync_targets(targets, ctx, expected, false);
+    record_changes(summary, &plan, &results, expected);
     for line in log_lines(&results, Some("setup")) {
         crate::diag::persist_log(&line);
     }
@@ -698,5 +750,133 @@ mod tests {
         let results = uninstall_targets(&targets, &ctx(), &expected, false);
         assert_eq!(results[0].action, Action::Keep);
         assert!(!outside.exists());
+    }
+
+    /// サマリの (キー, 前, 後)
+    fn changes(summary: &SetupPlan) -> Vec<(String, Option<String>, String)> {
+        summary
+            .changes()
+            .iter()
+            .map(|c| (c.key.clone(), c.before.clone(), c.after.clone()))
+            .collect()
+    }
+
+    fn override_target(dir: &Path) -> Target {
+        Target {
+            dir: dir.to_path_buf(),
+            sources: vec![Source::Override],
+        }
+    }
+
+    #[test]
+    fn issue2292_setupの段は書いた外した設定dirだけを最終サマリへ積む() {
+        let a = scratch("2292-a");
+        let missing = scratch("2292-missing");
+        let missing_dir = missing.join("never-created");
+        let user = scratch("2292-user");
+        // 利用者の skills/tako（印なし）= 触らない
+        std::fs::create_dir_all(user.join("skills/tako")).unwrap();
+        let targets = vec![
+            override_target(&a),
+            override_target(&missing_dir),
+            override_target(&user),
+        ];
+        let key = short(&core::copy_dir(&a));
+        let v1 = Expected::for_version("1.0.0");
+
+        // 1 回目: 在る設定 dir にだけ置き、それだけがサマリに載る（無い dir は作らない）
+        let mut summary = SetupPlan::default();
+        let lines = setup_stage_for(&targets, &ctx(), &v1, &mut summary);
+        assert_eq!(
+            changes(&summary),
+            vec![(key.clone(), None, "tako mod 1.0.0 の写し".to_string())],
+            "{lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[ok] tako mod を Claude Code へ入れた")));
+        assert!(!missing_dir.exists(), "無い設定 dir を作った（FR-2.42.25）");
+
+        // 2 回目: 中身が同じなら何も積まない = 「変更なし」
+        let mut summary = SetupPlan::default();
+        let lines = setup_stage_for(&targets, &ctx(), &v1, &mut summary);
+        assert!(
+            summary.is_empty(),
+            "変化が無いのに積んだ: {:?}",
+            changes(&summary)
+        );
+        assert!(lines.iter().any(|l| l.contains("は最新")), "{lines:?}");
+
+        // 版が上がった: 置き直しを前後の版で積む
+        let v2 = Expected::for_version("1.0.1");
+        let mut summary = SetupPlan::default();
+        setup_stage_for(&targets, &ctx(), &v2, &mut summary);
+        assert_eq!(
+            changes(&summary),
+            vec![(
+                key.clone(),
+                Some("tako mod 1.0.0 の写し".to_string()),
+                "tako mod 1.0.1 の写し".to_string()
+            )]
+        );
+
+        // 版が同じで中身だけ違う（開発版の作り直し）: 前後が同じ文字列で変化を捨てない
+        let mut files = v2.files.clone();
+        files[0].1.push_str("\n// 2292\n");
+        let hash = core::content_hash(files.iter().map(|(rel, body)| (*rel, body.as_bytes())));
+        let v2b = Expected {
+            version: v2.version.clone(),
+            files,
+            hash,
+        };
+        let mut summary = SetupPlan::default();
+        setup_stage_for(&targets, &ctx(), &v2b, &mut summary);
+        assert_eq!(
+            changes(&summary),
+            vec![(
+                key.clone(),
+                Some("tako mod 1.0.1 の写し（中身が違う）".to_string()),
+                "tako mod 1.0.1 の写し".to_string()
+            )]
+        );
+
+        // 同名の衝突で退いた: 外したことを理由つきで積む
+        let other = a.join("skills/my-tako/.claude-plugin");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("plugin.json"), r#"{"name":"tako"}"#).unwrap();
+        let mut summary = SetupPlan::default();
+        setup_stage_for(&targets, &ctx(), &v2b, &mut summary);
+        let got = changes(&summary);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, key);
+        assert_eq!(got[0].1.as_deref(), Some("tako mod 1.0.1 の写し"));
+        assert!(got[0].2.starts_with("外した（"), "{got:?}");
+        assert!(!core::copy_dir(&a).exists());
+    }
+
+    #[test]
+    fn issue2292_入れない条件ではサマリに何も積まない() {
+        let a = scratch("2292-blocked");
+        let targets = vec![override_target(&a)];
+        let v = Expected::for_version("1.0.0");
+        for (why, claude_version) in [
+            ("claude が無い（版が分からない）", None),
+            ("claude の版が下限未満", Some("2.1.200".to_string())),
+        ] {
+            let ctx = Context {
+                claude_version,
+                ..ctx()
+            };
+            let mut summary = SetupPlan::default();
+            let lines = setup_stage_for(&targets, &ctx, &v, &mut summary);
+            assert!(summary.is_empty(), "{why}: {:?}", changes(&summary));
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("[skip] tako mod を Claude Code へ入れない")),
+                "{why}: {lines:?}"
+            );
+            assert!(!core::copy_dir(&a).exists(), "{why}: 置いた");
+        }
     }
 }

@@ -226,6 +226,10 @@ assert_contains "$FIRST_CONFIG" '^  selected_agent: claude$' "初回 config の 
 assert_contains "$FIRST_PROFILE" '^master_agent: claude$' "初回 profile の master_agent が claude でない"
 assert_contains "$FIRST_PROFILE" '^effort: high$' "Claude Pro の effort 推奨が high でない"
 assert_contains "$FIRST_HOME/.claude/CLAUDE.md" '^# 開発ルール$' "初回の既定指示が生成されない"
+# 新品の HOME の 1 回目で tako mod が入り、最終サマリに載る（#2292。条件の網羅は
+# scripts/test-setup-mod-first-run-2292.sh）
+[ -f "$FIRST_HOME/.claude/skills/tako/.tako-managed" ] || fail "初回で tako mod が ~/.claude/skills/tako へ入らない（#2292）"
+assert_contains "$TMP/first.out" '\.claude/skills/tako: \(未設定\) -> tako mod ' "初回の最終サマリに tako mod の導入が無い（#2292）"
 assert_no_agent_launch "$FIRST_HOME" "標準 setup が対話 agent を起動した"
 printf '[MEASURE] scenario=first before_keys=5+ after_keys=0 prompts=0 source=detected:claude/pro result=complete\n'
 

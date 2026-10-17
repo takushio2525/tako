@@ -398,6 +398,14 @@ jobs:
       # 2 度並ぶ形へ戻ったらここで落ちる**（#1621）
       - name: setup のスリープ防止の段が 1 度だけ出ることの実経路テスト
         run: bash scripts/test-setup-sleep-guard-once-1621.sh
+      # 新品の HOME（`~/.claude` が無い）の 1 回目の `tako setup` が tako mod を設定 dir の
+      # `skills/tako` へ入れて最終サマリに出し、2 回目は「変更なし」・版の置き直しもサマリに出る・
+      # 入れない条件（claude が無い / 版が下限未満 / 設定 dir が無い）では入れないことの実経路テスト。
+      # 隔離 HOME / TAKO_DATA_DIR / PATH + claude / codex / tmux のスタブで本番に触らない。
+      # **mod の段が `~/.claude` を作る指示ファイルの段より前へ戻る、または段の結果を最終サマリへ
+      # 積まない形へ戻ったらここで落ちる**（#2292）
+      - name: 新品の HOME の 1 回目の setup で tako mod が入りサマリに出ることの実経路テスト
+        run: bash scripts/test-setup-mod-first-run-2292.sh
       # 標準 / 2 回目 / --yes / 未認証 / プラン検出不能 / 検出値競合 / 破損 config / --answers /
       # 複数 CLI の `tako setup` が質問ゼロで完走し、agent を対話起動しないことの実経路テスト
       # （#262 の setup UX）。スクラッチ HOME / PATH + claude / codex / agy のスタブで、書くのは
