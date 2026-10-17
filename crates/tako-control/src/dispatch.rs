@@ -35085,19 +35085,20 @@ mod tests {
     #[test]
     fn issue2041_clearの後はレジストリの会話idが報告で更新され以後は走査しない() {
         use crate::orchestrator::registry::{self, RegisterSpawn, WorkerRegistry};
-        // 共有の一時レジストリ（`#[cfg(test)]` ではプロセス固有）。他のテストと混ざらないペイン番号
-        const PANE: u64 = 20_411;
-        const BACKEND: &str = "tako-s20411";
         const OLD: &str = "2041aaaa-0000-4000-8000-0000000000a1";
         const NEW: &str = "2041bbbb-0000-4000-8000-0000000000b2";
+        // 共有の一時レジストリ（`#[cfg(test)]` ではプロセス固有）。鍵のペインは採番器から取る
+        // （spawn のテストが採番したペインと重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let backend = format!("tako-s{pane}");
         let id = registry::record_spawn(RegisterSpawn {
             agent: "claude".into(),
-            pane: PANE,
-            tmux_session: Some(BACKEND.into()),
+            pane,
+            tmux_session: Some(backend.clone()),
             ..Default::default()
         })
         .expect("共有レジストリへ登録できる");
-        registry::record_session_detected(BACKEND, OLD).unwrap();
+        registry::record_session_detected(&backend, OLD).unwrap();
         let recorded = || {
             WorkerRegistry::load().unwrap().workers[&id]
                 .session_id
@@ -35106,8 +35107,8 @@ mod tests {
         };
         assert_eq!(recorded(), OLD, "前提: レジストリは spawn 直後の会話");
         let ctx = || WorkerStatusCtx {
-            pane_id: PANE,
-            backend_session: Some(BACKEND.into()),
+            pane_id: pane,
+            backend_session: Some(backend.clone()),
             // 注入: `/clear` の後の mod の報告（同じ claude が新しい会話 ID を運ぶ）
             ..mod_ctx_1880(
                 "done\n❯ ",
@@ -35115,7 +35116,7 @@ mod tests {
             )
         };
         // 監視の入口と同じく、名指しはレジストリから補う
-        let query = || resolve_worker_query(Some(PANE), None, None, None).unwrap();
+        let query = || resolve_worker_query(Some(pane), None, None, None).unwrap();
 
         let q = query();
         assert_eq!(q.session_id.as_deref(), Some(OLD));
@@ -35147,8 +35148,9 @@ mod tests {
         );
 
         // 呼び出し側が記録と違う会話を明示したら、その会話について走査が答える（#2017 のまま）
-        let (v, consults) =
-            scan_consults_2017(|| finish_worker_status(ctx(), Some(OLD), Some(BACKEND)).unwrap());
+        let (v, consults) = scan_consults_2017(|| {
+            finish_worker_status(ctx(), Some(OLD), Some(backend.as_str())).unwrap()
+        });
         assert!(consults >= 1, "{v}");
         assert_eq!(
             v["agents_scan"],
@@ -35166,20 +35168,22 @@ mod tests {
     #[test]
     fn issue2041_古い報告ではレジストリを書き換えない() {
         use crate::orchestrator::registry::{self, RegisterSpawn, WorkerRegistry};
-        const PANE: u64 = 20_412;
-        const BACKEND: &str = "tako-s20412";
         const OLD: &str = "2041cccc-0000-4000-8000-0000000000c3";
+        // 共有の一時レジストリ（`#[cfg(test)]` ではプロセス固有）。鍵のペインは採番器から取る
+        // （spawn のテストが採番したペインと重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let backend = format!("tako-s{pane}");
         let id = registry::record_spawn(RegisterSpawn {
             agent: "claude".into(),
-            pane: PANE,
-            tmux_session: Some(BACKEND.into()),
+            pane,
+            tmux_session: Some(backend.clone()),
             ..Default::default()
         })
         .expect("共有レジストリへ登録できる");
-        registry::record_session_detected(BACKEND, OLD).unwrap();
+        registry::record_session_detected(&backend, OLD).unwrap();
         let ctx = WorkerStatusCtx {
-            pane_id: PANE,
-            backend_session: Some(BACKEND.into()),
+            pane_id: pane,
+            backend_session: Some(backend.clone()),
             ..mod_ctx_1880(
                 "done\n❯ ",
                 mod_snapshot_2017(
@@ -35189,8 +35193,9 @@ mod tests {
                 ),
             )
         };
-        let (v, consults) =
-            scan_consults_2017(|| finish_worker_status(ctx, Some(OLD), Some(BACKEND)).unwrap());
+        let (v, consults) = scan_consults_2017(|| {
+            finish_worker_status(ctx, Some(OLD), Some(backend.as_str())).unwrap()
+        });
         assert!(consults >= 1, "{v}");
         assert_eq!(
             v["agents_scan"],
@@ -43888,14 +43893,21 @@ mod tests {
     fn issue390_resolve_worker_queryが解決と補完をする() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let (id, tmux, sid) = (
+            format!("q{pane}"),
+            format!("tako-q{pane}"),
+            format!("sid-{pane}"),
+        );
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.next_id += 1;
             reg.workers.insert(
-                "q7701".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 7701,
-                    tmux_session: Some("tako-q7701".into()),
-                    session_id: Some("sid-7701".into()),
+                    pane,
+                    tmux_session: Some(tmux.clone()),
+                    session_id: Some(sid.clone()),
                     agent: "claude".into(),
                     status: "active".into(),
                     spawned_at: crate::sessions::now_iso(),
@@ -43906,20 +43918,21 @@ mod tests {
         .unwrap();
 
         // worker 指定: pane / session / tmux をレジストリから解決
-        let q = resolve_worker_query(None, Some("q7701"), None, None).unwrap();
-        assert_eq!(q.pane_id, 7701);
-        assert_eq!(q.session_id.as_deref(), Some("sid-7701"));
-        assert_eq!(q.tmux_session.as_deref(), Some("tako-q7701"));
+        let q = resolve_worker_query(None, Some(&id), None, None).unwrap();
+        assert_eq!(q.pane_id, pane);
+        assert_eq!(q.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(q.tmux_session.as_deref(), Some(tmux.as_str()));
 
         // pane 指定: 欠けたキーだけ補完、明示指定は優先
-        let q = resolve_worker_query(Some(7701), None, Some("explicit-sid".into()), None).unwrap();
-        assert_eq!(q.pane_id, 7701);
+        let q = resolve_worker_query(Some(pane), None, Some("explicit-sid".into()), None).unwrap();
+        assert_eq!(q.pane_id, pane);
         assert_eq!(q.session_id.as_deref(), Some("explicit-sid"));
-        assert_eq!(q.tmux_session.as_deref(), Some("tako-q7701"));
+        assert_eq!(q.tmux_session.as_deref(), Some(tmux.as_str()));
 
         // 未登録 pane: 補完なしでそのまま
-        let q = resolve_worker_query(Some(60660), None, None, None).unwrap();
-        assert_eq!(q.pane_id, 60660);
+        let unregistered = tako_core::unused_id::pane().as_u64();
+        let q = resolve_worker_query(Some(unregistered), None, None, None).unwrap();
+        assert_eq!(q.pane_id, unregistered);
         assert!(q.session_id.is_none() && q.tmux_session.is_none());
 
         // どちらも無し / 未知 worker はエラー
@@ -43931,12 +43944,15 @@ mod tests {
     fn issue390_finish_worker_statusがprompt未達を検知する() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         // spawn から十分経過（猶予 240 秒超）した claude worker。session_id 未検出
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q7801".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 7801,
+                    pane,
                     agent: "claude".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -43949,7 +43965,7 @@ mod tests {
         // idle 画面（welcome のまま）→ prompt_undelivered イベント発火
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 7801,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("Welcome to Claude Code\n❯ ".into()),
@@ -43963,7 +43979,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(v["worker_id"], "q7801");
+        assert_eq!(v["worker_id"], id.as_str());
         assert_eq!(v["prompt_delivery"], "undelivered");
         let kinds: Vec<&str> = v["events"]
             .as_array()
@@ -43979,7 +43995,7 @@ mod tests {
         // busy 画面なら発火しない（誤検知防止: 検出遅延の可能性）
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 7801,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
@@ -44010,14 +44026,14 @@ mod tests {
         // ない（起動直後に付く）ので delivered へは倒さない。猶予を過ぎて到達の記録が
         // 無ければ「未確認」（自動再送は撃たない）
         WorkerRegistry::mutate_at(&path, |reg| {
-            if let Some(e) = reg.workers.get_mut("q7801") {
-                e.tmux_session = Some("tako-q7801".into());
+            if let Some(e) = reg.workers.get_mut(&id) {
+                e.tmux_session = Some(format!("tako-q{pane}"));
             }
         })
         .unwrap();
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 7801,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("done\n❯ ".into()),
@@ -44033,7 +44049,7 @@ mod tests {
         .unwrap();
         assert_eq!(v["prompt_delivery"], "unverified");
         let reg = WorkerRegistry::load().unwrap();
-        let entry = &reg.workers["q7801"];
+        let entry = &reg.workers[&id];
         assert_eq!(
             entry.session_id.as_deref(),
             Some("sid-7801-detected"),
@@ -44052,11 +44068,14 @@ mod tests {
     fn issue1940_起動に失敗したworkerへ再送の引き金を出さない() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q19401".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 19401,
+                    pane,
                     agent: "claude".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -44072,7 +44091,7 @@ mod tests {
         .unwrap();
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 19401,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("error: option invalid\n[test@host:work]$ ".into()),
@@ -44117,16 +44136,26 @@ mod tests {
         let legacy = tako_core::prompt_delivery::legacy_undelivered();
         let path = registry_path().unwrap();
 
-        // 「送ったかもしれない」で決着した claude worker（pane 12941）と、
-        // 本当に未達だった worker（pane 12942）を並べて A/B する
+        // 「送ったかもしれない」で決着した claude worker と、本当に未達だった worker を
+        // 並べて A/B する。共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let (stalled, unreflected) = (
+            tako_core::unused_id::pane().as_u64(),
+            tako_core::unused_id::pane().as_u64(),
+        );
+        let ids = (format!("q{stalled}"), format!("q{unreflected}"));
         let cases: [(u64, &str, &str, &str); 2] = [
             (
-                12941,
-                "q12941",
+                stalled,
+                ids.0.as_str(),
                 tako_core::prompt_delivery::Stall::PeerSendStalled.code(),
                 "unverified",
             ),
-            (12942, "q12942", "paste_not_reflected", "undelivered"),
+            (
+                unreflected,
+                ids.1.as_str(),
+                "paste_not_reflected",
+                "undelivered",
+            ),
         ];
         WorkerRegistry::mutate_at(&path, |reg| {
             for (pane, id, reason, _) in cases {
@@ -44234,12 +44263,15 @@ mod tests {
     fn issue983_観測手段の無い系統でも送達判定が黙らない() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         // 猶予（240 秒）を大きく超えた agy worker。agy は送達の一次シグナルを持たない
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q9831".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 9831,
+                    pane,
                     agent: "agy".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -44252,7 +44284,7 @@ mod tests {
         // 入力待ちの画面 → 「未確認」を言う（旧実装は n/a = 何も言わなかった）
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 9831,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("agy\n> ".into()),
@@ -44298,7 +44330,7 @@ mod tests {
         // 画面が busy なら「未確認」も言わない（動いているものを疑わない）
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 9831,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
@@ -44333,12 +44365,15 @@ mod tests {
     fn issue1015_背景ターミナル待ちのcodexをidleと報告しない() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         // 猶予（240 秒）を大きく超えた codex worker。実発生は spawn 後 779 秒
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q10151".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 10151,
+                    pane,
                     agent: "codex".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -44350,7 +44385,7 @@ mod tests {
 
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 10151,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some(CODEX_BG_WAIT_NARROW_1015.into()),
@@ -44388,11 +44423,14 @@ mod tests {
     fn issue1015_rolloutを読めないcodexは未達と断定しない() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q10152".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 10152,
+                    pane,
                     agent: "codex".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -44406,7 +44444,7 @@ mod tests {
         // codex の thread が解決できないので rollout を 1 行も読めていない
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 10152,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("• You have 1 usage limit reset available.\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /private/tmp/probe".into()),
@@ -44452,11 +44490,14 @@ mod tests {
     fn issue983_起動失敗を分類してerrorにする() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q9832".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 9832,
+                    pane,
                     agent: "codex".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -44469,7 +44510,7 @@ mod tests {
         // CLI が無い環境で起動コマンドが流れた画面（#983 の無言死そのもの）
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 9832,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some(
@@ -44502,7 +44543,7 @@ mod tests {
         // 未認証の画面も分類される
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 9832,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("Not logged in\n".into()),
@@ -44525,14 +44566,14 @@ mod tests {
         // 作業が始まっている worker の scrollback にある command not found は
         // 起動失敗ではない（session 検出済み = 一度は走った）
         WorkerRegistry::mutate_at(&path, |reg| {
-            if let Some(e) = reg.workers.get_mut("q9832") {
+            if let Some(e) = reg.workers.get_mut(&id) {
                 e.prompt_delivered_at = Some(crate::sessions::now_iso());
             }
         })
         .unwrap();
         let v = finish_worker_status(
             WorkerStatusCtx {
-                pane_id: 9832,
+                pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
                 live_tail: Some("zsh: command not found: codex\n".into()),
@@ -44553,12 +44594,15 @@ mod tests {
     fn issue1034_送達後に実行を断られた画面をerrorにする() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         // **送達済み**の agy worker（#983 のゲートの外 = 旧実装では idle に見えていた形）
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q10341".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 10341,
+                    pane,
                     agent: "agy".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -44574,7 +44618,7 @@ mod tests {
         let refused = |screen: &str| {
             finish_worker_status(
                 WorkerStatusCtx {
-                    pane_id: 10341,
+                    pane_id: pane,
                     pane_exists: true,
                     backend_session: None,
                     live_tail: Some(screen.into()),
@@ -44624,7 +44668,7 @@ mod tests {
         // この経路と重なって見えない（パターンを持つ agy は一次シグナルも持つ）ので、
         // ゲートの形そのものは番犬 `agy_execution_refused_watchdog` が固定する
         WorkerRegistry::mutate_at(&path, |reg| {
-            if let Some(e) = reg.workers.get_mut("q10341") {
+            if let Some(e) = reg.workers.get_mut(&id) {
                 e.agent = "local".into();
             }
         })
@@ -44681,12 +44725,15 @@ mod tests {
     fn issue1295_claudeの正常完了を実行拒否へ落とさない() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         // **送達済みで正常に働いた** claude worker
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q12951".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 12951,
+                    pane,
                     agent: "claude".into(),
                     status: "active".into(),
                     spawned_at: "2026-01-01T00:00:00Z".into(),
@@ -44705,7 +44752,7 @@ mod tests {
         let status_of = || {
             finish_worker_status(
                 WorkerStatusCtx {
-                    pane_id: 12951,
+                    pane_id: pane,
                     pane_exists: true,
                     backend_session: None,
                     live_tail: Some(screen.clone()),
@@ -44749,7 +44796,7 @@ mod tests {
         // **系統が解決できない worker** は修正前のゲートでも分類しない
         // （マトリクスを引けないので「見えないだけ」と区別できない）
         WorkerRegistry::mutate_at(&path, |reg| {
-            if let Some(e) = reg.workers.get_mut("q12951") {
+            if let Some(e) = reg.workers.get_mut(&id) {
                 e.agent = "gemini".into();
             }
         })
@@ -44767,12 +44814,15 @@ mod tests {
     fn issue390_agent突然死をagent_deadイベントで検知しresumeを提示する() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = format!("q{pane}");
         // session_id 記録済み（= 一度は走った）claude worker
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q7802".into(),
+                id.clone(),
                 WorkerEntry {
-                    pane: 7802,
+                    pane,
                     agent: "claude".into(),
                     status: "active".into(),
                     session_id: Some("sid-7802".into()),
@@ -44785,7 +44835,7 @@ mod tests {
         .unwrap();
 
         let dead_ctx = |has_children: bool| WorkerStatusCtx {
-            pane_id: 7802,
+            pane_id: pane,
             pane_exists: true,
             backend_session: None,
             // SIGSEGV 後のシェルプロンプト画面（claude TUI の ❯ ではない）
@@ -44877,11 +44927,17 @@ mod tests {
     fn issue390_workersリストがdispatchで返る() {
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let (active, closed) = (
+            tako_core::unused_id::pane().as_u64(),
+            tako_core::unused_id::pane().as_u64(),
+        );
+        let (active_id, closed_id) = (format!("q{active}"), format!("q{closed}"));
         WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.insert(
-                "q7901".into(),
+                active_id.clone(),
                 WorkerEntry {
-                    pane: 7901,
+                    pane: active,
                     agent: "claude".into(),
                     status: "active".into(),
                     spawned_at: crate::sessions::now_iso(),
@@ -44889,9 +44945,9 @@ mod tests {
                 },
             );
             reg.workers.insert(
-                "q7902".into(),
+                closed_id.clone(),
                 WorkerEntry {
-                    pane: 7902,
+                    pane: closed,
                     agent: "claude".into(),
                     status: "closed".into(),
                     spawned_at: crate::sessions::now_iso(),
@@ -44914,8 +44970,8 @@ mod tests {
             .iter()
             .filter_map(|w| w["worker_id"].as_str())
             .collect();
-        assert!(ids.contains(&"q7901"));
-        assert!(!ids.contains(&"q7902"), "closed は既定で出ない");
+        assert!(ids.contains(&active_id.as_str()));
+        assert!(!ids.contains(&closed_id.as_str()), "closed は既定で出ない");
         // all = true で closed も
         let v = dispatch(
             &mut host,
@@ -44929,13 +44985,13 @@ mod tests {
             .iter()
             .filter_map(|w| w["worker_id"].as_str())
             .collect();
-        assert!(ids.contains(&"q7901") && ids.contains(&"q7902"));
+        assert!(ids.contains(&active_id.as_str()) && ids.contains(&closed_id.as_str()));
         // GUI にペインが無いので pane_alive = false（レジストリ追跡は継続）
         let w = v["workers"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|w| w["worker_id"] == "q7901")
+            .find(|w| w["worker_id"] == active_id.as_str())
             .unwrap();
         assert_eq!(w["pane_alive"], false);
     }

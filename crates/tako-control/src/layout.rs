@@ -2323,11 +2323,13 @@ mod tests {
     fn 複数ウィンドウの壊れた保存値は単一ウィンドウへ縮退する() {
         let ws = sample_workspace();
         let mut layout = capture(&ws, &|_| PaneMeta::default(), None);
-        // 実在しないタブだけを指すウィンドウ割当（継ぎ接ぎ・部分破損を想定)
+        // 実在しないタブだけを指すウィンドウ割当（継ぎ接ぎ・部分破損を想定)。
+        // 決め打ちの 88888 は採番器しだいで実在しうるので採番器から取る（#1868 / #2239）
+        let ghost_tab = tako_core::unused_id::tab().as_u64();
         layout.windows = vec![WindowLayout {
             id: 900,
-            tabs: vec![88888],
-            active_tab: 88888,
+            tabs: vec![ghost_tab],
+            active_tab: ghost_tab,
             frame: None,
         }];
         let (restored_ws, _) = restore(&layout).unwrap();

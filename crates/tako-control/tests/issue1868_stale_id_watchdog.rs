@@ -28,8 +28,9 @@
 //! 4. **無いもの用の数字の形**: 同じ数字が 3 桁以上並ぶもの（`999` / `9_999` / `88888`）
 //!
 //! ID の位置 = `PaneId::from_raw(N)` / `TabId::from_raw(N)` / `WindowId::from_raw(N)` と、
-//! 欄 [`ID_FIELDS`] の `N` / `Some(N)`。欄 `window` は tmux の window 番号（採番器と無関係）にも
-//! 使われるので 4. だけで見る。
+//! 欄 [`ID_FIELDS`] の `N` / `Some(N)`、欄 [`ID_LIST_FIELDS`] の `vec![N, …]` の要素
+//! （ウィンドウの `tabs` / `active_tab` は #2239 で足した）。欄 `window` は tmux の window 番号
+//! （採番器と無関係）にも使われるので 4. だけで見る。
 //!
 //! 直し方は `tako_core::unused_id::{pane, tab, window}`。`u64::MAX` 系の定数は使わない
 //! （`TabId::from_raw` / `WindowId::from_raw` が採番器を `fetch_max(id + 1)` で進めるので、
@@ -115,7 +116,7 @@ fn test_sources() -> Vec<String> {
 const MARK: &str = "固定 ID 安全:";
 
 /// ID を入れる欄（`window` は別扱い = 4. だけで見る）
-const ID_FIELDS: [&str; 11] = [
+const ID_FIELDS: [&str; 12] = [
     "pane",
     "tab",
     "group_tab",
@@ -127,7 +128,11 @@ const ID_FIELDS: [&str; 11] = [
     "caller_pane",
     "master_pane",
     "preview",
+    "active_tab",
 ];
+
+/// ID の並びを入れる欄（`tabs: vec![N, …]` / `tabs: [N, …]`。ウィンドウの持つタブ = #2239）
+const ID_LIST_FIELDS: [&str; 1] = ["tabs"];
 
 /// tmux の window 番号にも使われる欄（同じ数字の並びだけを見る）
 const WINDOW_FIELD: &str = "window";
@@ -208,7 +213,7 @@ enum Kind {
 impl Kind {
     fn of_field(name: &str) -> Kind {
         match name {
-            "tab" | "group_tab" | "tab_id" | "TabId" | "Tab" => Kind::Tab,
+            "tab" | "group_tab" | "tab_id" | "active_tab" | "tabs" | "TabId" | "Tab" => Kind::Tab,
             "window" | "window_id" | "WindowId" | "Window" => Kind::Window,
             _ => Kind::Pane,
         }
@@ -232,6 +237,71 @@ struct IdLiteral {
     window_field: bool,
 }
 
+/// 欄 `name: …` の値の書き出しの位置（`:` の後の空白を飛ばした所）。`x.name` / `other_name` /
+/// `name::` は欄ではないので数えない
+fn field_values(code_line: &str, name: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(hit) = code_line[from..].find(name) {
+        let at = from + hit;
+        from = at + name.len();
+        if code_line[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| is_ident(c) || c == '.')
+        {
+            continue;
+        }
+        let i = skip_spaces(code_line, at + name.len());
+        if code_line.as_bytes().get(i) != Some(&b':') || code_line[i..].starts_with("::") {
+            continue;
+        }
+        out.push(skip_spaces(code_line, i + 1));
+    }
+    out
+}
+
+/// `[` の直後から、同じ行で閉じる `]` までの要素のうち、整数リテラルそのものの要素
+/// （`vec![t1, 88888]` の `88888`。式の要素は飛ばす）
+fn list_int_literals(code_line: &str, open: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, open);
+    for (k, ch) in code_line[open..].char_indices() {
+        let k = open + k;
+        let close = match ch {
+            '(' | '[' | '{' => {
+                depth += 1;
+                false
+            }
+            ')' | '}' => {
+                depth -= 1;
+                false
+            }
+            ']' if depth == 0 => true,
+            ']' => {
+                depth -= 1;
+                false
+            }
+            ',' => depth == 0,
+            _ => false,
+        };
+        if !close {
+            continue;
+        }
+        let elem = code_line[start..k].trim();
+        if let Some((digits, end)) = int_literal(elem, 0) {
+            if end == elem.len() {
+                out.push(digits);
+            }
+        }
+        if ch == ']' {
+            break;
+        }
+        start = k + 1;
+    }
+    out
+}
+
 fn id_literals(code_line: &str) -> Vec<IdLiteral> {
     let mut out = Vec::new();
     // 欄 `name: N` / `name: Some(N)`
@@ -240,22 +310,7 @@ fn id_literals(code_line: &str) -> Vec<IdLiteral> {
         .map(|f| (*f, false))
         .chain([(WINDOW_FIELD, true)])
     {
-        let mut from = 0;
-        while let Some(hit) = code_line[from..].find(name) {
-            let at = from + hit;
-            from = at + name.len();
-            if code_line[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| is_ident(c) || c == '.')
-            {
-                continue;
-            }
-            let mut i = skip_spaces(code_line, at + name.len());
-            if code_line.as_bytes().get(i) != Some(&b':') || code_line[i..].starts_with("::") {
-                continue;
-            }
-            i = skip_spaces(code_line, i + 1);
+        for mut i in field_values(code_line, name) {
             if code_line[i..].starts_with("Some(") {
                 i = skip_spaces(code_line, i + "Some(".len());
             }
@@ -264,6 +319,24 @@ fn id_literals(code_line: &str) -> Vec<IdLiteral> {
                     digits,
                     kind: Kind::of_field(name),
                     window_field,
+                });
+            }
+        }
+    }
+    // 欄 `tabs: vec![N, …]` / `tabs: [N, …]` / `tabs: &[N, …]`
+    for name in ID_LIST_FIELDS {
+        for i in field_values(code_line, name) {
+            let Some(head) = ["vec![", "&[", "["]
+                .iter()
+                .find(|h| code_line[i..].starts_with(**h))
+            else {
+                continue;
+            };
+            for digits in list_int_literals(code_line, i + head.len()) {
+                out.push(IdLiteral {
+                    digits,
+                    kind: Kind::of_field(name),
+                    window_field: false,
                 });
             }
         }
@@ -732,7 +805,7 @@ fn 走査が空振りしていない() {
 fn 修正前の形を実際に落とす() {
     let tests = |body: &str| format!("#[cfg(test)]\nmod tests {{\n{body}}}\n");
     // (名前, 本文, 名指しされる行)
-    let bad: [(&str, String, usize); 12] = [
+    let bad: [(&str, String, usize); 15] = [
         (
             "#1860 の 1 本目（文の直上のコメントで stale と言う）",
             tests(
@@ -797,6 +870,21 @@ fn 修正前の形を実際に落とす() {
             "fn t() {\n    let ghost = WindowId::from_raw(88888);\n}\n".to_string(),
             2,
         ),
+        (
+            "#2239: ウィンドウの tabs 欄の並び（layout.rs の修正前の形）",
+            tests("    fn t() {\n        // 実在しないタブだけを指すウィンドウ割当\n        layout.windows = vec![WindowLayout {\n            id: 900,\n            tabs: vec![88888],\n            frame: None,\n        }];\n    }\n"),
+            7,
+        ),
+        (
+            "#2239: tabs 欄の 2 つ目の要素（式の要素は飛ばす）",
+            tests("    fn t() {\n        let w = WindowLayout {\n            tabs: vec![t1, 77_777],\n        };\n    }\n"),
+            5,
+        ),
+        (
+            "#2239: ウィンドウの active_tab 欄",
+            tests("    fn t() {\n        let w = WindowLayout {\n            active_tab: 66666,\n        };\n    }\n"),
+            5,
+        ),
     ];
     for (name, src, line) in &bad {
         let whole = !src.starts_with("#[cfg(test)]");
@@ -815,7 +903,7 @@ fn 修正前の形を実際に落とす() {
     )
     .is_empty());
 
-    let ok: [(&str, String); 9] = [
+    let ok: [(&str, String); 10] = [
         (
             "目印つきの純粋な表",
             tests("    fn t() {\n        // 固定 ID 安全: 純粋関数へ渡す表は a / b だけ\n        let gone = WindowId::from_raw(9003);\n    }\n"),
@@ -851,6 +939,10 @@ fn 修正前の形を実際に落とす() {
         (
             "文字列とコメントの中は見ない",
             tests("    fn t() {\n        // let ghost = TabId::from_raw(9999);\n        let s = \"pane: Some(9999)\";\n    }\n"),
+        ),
+        (
+            "#2239: 実在するタブの tabs / active_tab（layout_reconcile の表）と、タブを並べた別の欄",
+            tests("    fn t() {\n        let w = WindowLayout {\n            tabs: vec![1, 4],\n            active_tab: 1,\n        };\n        let open_tabs: vec![999] = x;\n        let n = Counts { tabs: 999 };\n    }\n"),
         ),
     ];
     for (name, src) in &ok {
@@ -896,6 +988,16 @@ fn 直した実ファイルを直書きへ戻すと名指しする() {
             "crates/tako-control/tests/issue1679_lsp_diagnostics.rs",
             "host.preview = tako_core::unused_id::pane();",
             "host.preview = PaneId::from_raw(9_999);",
+        ),
+        (
+            "crates/tako-control/src/layout.rs",
+            "tabs: vec![ghost_tab],",
+            "tabs: vec![88888],",
+        ),
+        (
+            "crates/tako-control/src/layout.rs",
+            "active_tab: ghost_tab,",
+            "active_tab: 88888,",
         ),
     ];
     for (rel, now, before) in reverts {
