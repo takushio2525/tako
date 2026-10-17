@@ -955,6 +955,12 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
   spawn のテストがその番号を採番した回だけ取り違える（「無いもの」ではないので番犬は見ない）。
   鍵のペインは `unused_id::pane()` で取り、worker ID・tmux 名もそこから組む（`format!("q{pane}")`）。
   専用の一時ファイル（`temp_registry_file` + `*_at`）で測るテストは固定値のままでよい
+- **共有のテスト用レジストリで比べるのは自分のエントリだけ（#2248）**: 同じファイルへ並列の
+  テストが別のペインを登録し、一覧のテスト（`issue390_workersリストがdispatchで返る`）の GC
+  （`sweep_dead`）が見えないペインの active へ `dead_since` を刻む。ファイル全体の前後比較は
+  その回だけ落ちる。積んだエントリを引いて比べ、GC の欄 `dead_since` は外す
+  （`pty死亡はmark_closed_by_originで倒さない` が両方の書き手を毎回挟んで確かめる）。
+  ファイルへ書かないこと自体を測るなら、専用の一時ファイル（`*_at`）の入口で測る
 - **番犬**: `crates/tako-control/tests/issue1868_stale_id_watchdog.rs` が、テストの領域
   （`production_range` と同じ読み）で ID の位置（`PaneId::from_raw(N)` 等と `pane` / `tab` /
   `group_tab` / `preview` / `active_tab` … の欄と `tabs: vec![N, …]` の要素）にある整数リテラルのうち、
