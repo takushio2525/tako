@@ -209,7 +209,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_links",
             "description": format!("ターミナル画面の**リンク**（{lc}で開けるもの）を列挙する。\
-                GUI の{lc}と同じ判定を通すので、クリック無しに「この画面のこのパスはリンクになるのか」を\
+                GUI の {lc}と同じ判定を通すので、クリック無しに「この画面のこのパスはリンクになるのか」を\
                 確かめられる。links[] は kind（url / path）・target（解決済みの絶対パス or URL）・\
                 text（画面に見えている文字列 = 下線が付く範囲）・spans（[row, start_col, end_col]）。\
                 kind=path には open（{lc}の行き先: terminal / code / markdown / image / pdf / video）と \
@@ -245,7 +245,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_tmux_list",
-            "description": "実行中の全 tmux セッションを一覧する。各セッションの\
+            "description": "実行中の全 tmux セッションを一覧する。各セッションの \
                 window 一覧・作成日時・attach 状態に加え、attach クライアントが tako の\
                 どのタブ・ペインに表示されているか（pane / tab が null なら tako 外の\
                 ターミナル由来）を返す。消し忘れて裏で動き続ける tmux の発見に使う。\
@@ -415,7 +415,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_focus_pane",
-            "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か\
+            "description": "ペインへフォーカスを移す。pane（ID 指定。別タブならタブも切り替わる）か \
                 direction（アクティブタブ内の隣接移動）のどちらか一方を指定する。\
                 ユーザーに見てほしいペインへ注意を向ける用途にも使う。",
             "inputSchema": {
@@ -606,7 +606,7 @@ pub fn tools() -> Vec<Value> {
             "description": "アプリメニュー（ファイル / 編集 / 表示 / ウインドウ / ヘルプ）の操作。\
                 action: list = メニュー構成と開閉状態を取得（項目のアクション名とショートカットつき）、\
                 open = メニューを開く、close = 閉じる、invoke = 項目を実行。\
-                open / close は Windows の in-window メニューバーだけで使える（macOS はメニューが\
+                open / close は Windows の in-window メニューバーだけで使える（macOS はメニューが \
                 OS のメニューバーに載るため tako から開閉できない）。invoke は両 OS で使える。\
                 メニューに実在する項目だけが対象。",
             "inputSchema": {
@@ -1124,7 +1124,7 @@ pub fn tools() -> Vec<Value> {
                 呼び出し階層・型階層のツリー（根を 1 段開いた形）を返し、問い合わせたペインの結果として保持する（show で右パネルにも出す）。\
                 応答の items[] / nodes[] の id を item に渡し、action=open-result でその位置を開く（定義ジャンプと同じ着地）・\
                 expand / collapse でノードを開閉・results で読み直す（retained = 保持件数）・clear-results で消す。\
-                action=rename はその位置の名前を new_name へ変える（既定は書き換えず files・edits を返す。confirm で\
+                action=rename はその位置の名前を new_name へ変える（既定は書き換えず files・edits を返す。confirm で \
                 pane の編集バッファへ当てる = undo 1 回。別のファイルに及ぶと当てない）。\
                 位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）。", link_click()),
             "inputSchema": {
@@ -1153,7 +1153,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_preview_save",
-            "description": "コードプレビューの未保存編集をファイルへ書き戻す。読み込み後に外部変更があれば競合として拒否し、上書きしない\
+            "description": "コードプレビューの未保存編集をファイルへ書き戻す（action 省略 = save）。読み込み後に外部変更があれば競合として拒否し、上書きしない\
                 （応答 conflict に state=changed|deleted）。競合の抜け方は action: overwrite = 自分の変更で上書き（消されていれば作り直す）/ \
                 reload = 自分の変更を捨ててディスクから読み直す（tako_preview_undo 1 回で戻せる）/ diff = ディスク→編集中の unified diff を返すだけ。",
             "inputSchema": {
@@ -1296,7 +1296,7 @@ pub fn tools() -> Vec<Value> {
                 trash = ゴミ箱へ移動（復元できる）/ open_default = デフォルトアプリで開く /\n\
                 open_with = name のアプリで開く /\n\
                 open_in_tako = tako の中で開く（ファイル = プレビューペイン / ディレクトリ = そこのシェル。\
-                ターミナル内のパスリンクの{lc}・修飾 + 右クリックメニューと同じ動作）/\n\
+                ターミナル内のパスリンクの {lc}・修飾 + 右クリックメニューと同じ動作）/\n\
                 move = dest のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る。\
                 開いているペインは新しいパスへ付け替わる）/\n\
                 copy = dest のフォルダへ複製（フォルダは中身ごと。同名は上書きせず「名前 のコピー」等の別名。\
@@ -1609,7 +1609,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_background_pane",
             "description": "ペインまたはタブをバックグラウンドへ送る。プロセスは生きたまま\
-                画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインは\
+                画面から外す。邪魔なペインやタブを画面外へ送るのに使う。バックグラウンドのペインは \
                 tako_background_list で確認でき、tako_foreground_pane で画面に戻せる。\
                 tab 指定時は**タブ 1 単位**で退避する（分割ツリー・比率・並び位置を保ったまま。\
                 pane と tab は排他）。戻すときは tako_foreground_pane の tab を使う。",
@@ -1642,8 +1642,8 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "tako_background_list",
-            "description": "バックグラウンドのペイン一覧を取得する。各ペインの\
-                ID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）と\
+            "description": "バックグラウンドのペイン一覧を取得する。各ペインの \
+                ID / title / role / state / cwd に加え、由来タブ（origin_tab / origin_tab_title）と \
                 surface（常に background = 裏で実行中）を返す。バックグラウンドペインはこの由来タブで\
                 グループ分けして表示され、tako_foreground_pane で由来タブへ戻せる。\
                 tabs には**タブ単位で退避されたタブ**（tab / title / origin_window / panes / tree）が並ぶ。\
@@ -2947,7 +2947,7 @@ pub fn tools() -> Vec<Value> {
                 （profiles / projects / accounts / local-rules / settings）と claude のグローバル指示\
                 （CLAUDE.md / snippets / commands / templates）を 1 つの git リポジトリでデバイス間共有する。\
                 action: status（既定）= 配線状態と push / pull 待ちの差分 / init = 共有リポジトリを作って配線 / \
-                link = 既存リポジトリ（パスか git URL）へ配線 / push = 実体 → リポジトリ + commit（+ push）/ \
+                link = 既存リポジトリ（パスか git URL）へ配線 / unlink = 配線を外す（リポジトリは残る）/ push = 実体 → リポジトリ + commit（+ push）/ \
                 pull = リポジトリ → 実体（世代バックアップつき）/ list = 共有 / 非共有の分類表。\
                 秘匿情報（token / credentials / .claude.json）とマシンローカル状態（layout.json / \
                 sessions.yaml / workers.yaml）は除外され、未分類のファイルも共有しない。\
@@ -3527,12 +3527,12 @@ pub fn tools() -> Vec<Value> {
                     "action": {
                         "type": "string",
                         "enum": ["add", "remove", "list", "git-status", "selection"],
-                        "description": "操作（list = 追加済み一覧）"
+                        "description": "操作（add / remove = フォルダの追加・削除、list = 追加済み一覧）"
                     },
                     "key": {
                         "type": "string",
                         "enum": ["up", "down", "left", "right", "enter", "extend_up", "extend_down", "extend_top", "extend_bottom"],
-                        "description": "selection: left / right = 畳む・親へ / 開く・子へ、enter = 開く、extend_* = 範囲（top / bottom = 端まで）"
+                        "description": "selection: up / down = 上下、left / right = 畳む・親へ / 開く・子へ、enter = 開く、extend_* = 範囲（top / bottom = 端まで）"
                     },
                     "path": {
                         "type": "string",
@@ -3854,7 +3854,7 @@ pub fn tools() -> Vec<Value> {
                     "action": {
                         "type": "string",
                         "enum": ["add", "list", "show", "update", "done", "dismiss", "respond", "expand", "collapse"],
-                        "description": "省略時 list。expand = その 1 件を PC の右パネルで開いて見せる\
+                        "description": "省略時 list。add = 起票 / show = 1 件 / update = 書き換え / done = 完了 / dismiss = 取り下げ / respond = 返答（decision・comment）/ expand = その 1 件を PC の右パネルで開いて見せる\
                             （「これを見てほしい」とき）/ collapse = 畳む",
                     },
                     "id": { "type": "string", "description": "対象のタスク id（u-N。show / update / done / dismiss / respond / expand で必須）" },

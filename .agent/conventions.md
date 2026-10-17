@@ -3642,6 +3642,19 @@ OS のシェルに食われてユーザーはリンクへ到達できない（#7
 説明文から外した根拠・仕組み・経緯・例は捨てずに `.agent/mcp-catalog-notes.md` へ
 ツールごとに原文で残す（#1711 で 156 本中 47 本、#1896 で 160 本中 38 本を短くしたときの置き場）。
 
+### 書き方の番犬（Issue #1905）
+
+- **行末 `\` の継ぎ目の前に半角空白を置く**: Rust の文字列の継続は次の行の先頭の空白を捨てるので、
+  `…を返す\` + 改行 + `pane_id …` は「…を返すpane_id」になる（英字どうしなら語そのものが繋がる）。
+  番犬は `crates/tako-control/tests/mcp_catalog_snapshot.rs` の
+  `catalogの折り返しで和文と英字が空白なしに繋がらない`（catalog.rs の継ぎ目を `file:line` で名指す）と
+  `mcp説明文で和文と英字が空白なしに隣り合わない`（他のファイルの正本から生成した案内文も含めた全文）
+- **値ごとの意味を並べたら、enum の値を全部出す**: `status = … / init = … / link = …` のように
+  `値 = 意味` / `値: 意味` を 2 つ以上並べた説明から 1 つ漏れると、AI はその値の使いどころを知れない
+  （`tako_config_share` の `unlink` がそうだった）。並べていない自明な語（方向の right / down 等）は
+  inputSchema の enum だけでよい。番犬は `crates/tako-control/tests/mcp_param_reachability.rs` の
+  `意味を並べたenumの値はすべて説明に出る`（`extend_*` のような接頭辞 + `*` は挙げたものと数える）
+
 ### `next_step` を返すなら説明に読み方を書く
 
 dispatch が `next_step` / `degraded` を返す経路は、**そのまま実行できる手順**を
