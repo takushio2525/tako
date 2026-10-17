@@ -50,6 +50,7 @@ const NL_32: &str = include_str!("fixtures/issue2302-nl-32x70.txt");
 const LEGACY_ENV: &str = "TAKO_2302_LEGACY";
 const LEGACY_TEST: &str = "issue2302_legacyで境目の崩れが戻る";
 
+#[track_caller]
 fn detect(name: &str, screen: &str) -> ChoiceList {
     let rows: Vec<&str> = screen.lines().collect();
     detect_choice_list(&rows).unwrap_or_else(|| panic!("{name}: 選択肢ダイアログを検知できない"))
@@ -69,6 +70,7 @@ fn expect(rows: &[(&str, bool)]) -> Vec<(String, bool)> {
 
 /// 受け入れ条件 2 の形: 狭い画面の各選択肢は、広い画面で採った同じダイアログのラベルと
 /// 一致するか、`label_truncated` を立てる（広い画面では立てない）
+#[track_caller]
 fn assert_matches_wide(name: &str, narrow: &ChoiceList, wide: &ChoiceList) {
     let numbers = |l: &ChoiceList| l.options.iter().map(|o| o.number).collect::<Vec<_>>();
     assert_eq!(numbers(narrow), numbers(wide), "{name}: 番号の並びが違う");
@@ -245,6 +247,42 @@ fn issue2302_説明の改行は1行に流れるので1段落として読む() {
             ("Type something.", false),
             ("Chat about this", false),
         ])
+    );
+}
+
+#[test]
+fn issue2302_結合の上限を超えるラベルは申告する() {
+    if std::env::var_os(LEGACY_ENV).is_some() {
+        return;
+    }
+    // 合成: 選択肢 1 のラベルが 10 行に割れ（どの行も次の語が入らない = 折り返し）、
+    // `zz` の後ろの `Qq` は前の行に入る = そこから説明。結合は上限（8 行）までしか
+    // 繋がらないので、ラベルは途中まで = 申告が要る
+    let mut lines: Vec<String> = vec!["❯ 1. wwww wwwwww".into()];
+    lines.extend((0..8).map(|_| "     wwwww wwwww".to_string()));
+    lines.push("     zz".into());
+    // 説明の行もラベルと同じ右端（16 桁）に収める（広い行があると右端の実測が広がり、
+    // `zz` も 8 行目の後ろに入る = 境目が 8 行目に来てしまう）
+    lines.push("     Qq is the".into());
+    lines.push("     desc here".into());
+    lines.push("  2. Short".into());
+    lines.push("     Desc of two".into());
+    lines.push(String::new());
+    lines.push("Enter to select · ↑/↓ to navigate · Esc to cancel".into());
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let list = detect_choice_list(&refs).expect("検知できる");
+    assert!(list.options[0].label_truncated, "{:?}", list.options[0]);
+    assert!(
+        !list.options[0].label.contains("Qq"),
+        "説明が混ざった: {:?}",
+        list.options[0].label
+    );
+    assert_eq!(
+        (
+            list.options[1].label.as_str(),
+            list.options[1].label_truncated
+        ),
+        ("Short", false)
     );
 }
 

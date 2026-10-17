@@ -17513,10 +17513,12 @@ pub fn respond_via(
         result["pane_id"] = json!(pane_id);
         result["responded"] = json!(false);
         result["hint"] = json!(if dialog.labels_truncated() {
-            // #1143: 画面上のラベルが `…` で打ち切られている = 一致で選べない
+            // #1143 / #2302: 画面上のラベルが `…` で打ち切られている、または説明との
+            // 境目が読めない = 一致で選べない
             format!(
                 "応答するには choice に番号（1-{}）を渡す\
-                 （この画面はラベルが切り詰められているのでラベル指定は受け付けない）",
+                 （この画面はラベルが切り詰められているか説明との境目が読めないので\
+                 ラベル指定は受け付けない）",
                 dialog.options.len()
             )
         } else {

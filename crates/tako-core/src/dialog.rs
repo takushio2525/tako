@@ -1290,13 +1290,14 @@ fn label_ends(
         return ends;
     }
     let cut = |i: usize| at_wrap_edge.get(i).copied().unwrap_or(false);
+    let two_column = |r: usize| desc_col.is_some() && column_gap(lines[r]) == desc_col;
     let screen = lines.iter().map(|l| display_width(l)).max().unwrap_or(0);
     for chain in numbered_chains(lines, rows) {
         // 2 列レイアウト（#1143）と副画面つき（#1447）の選択肢は従来どおり（説明列 /
         // 副画面の縁で折り返すので、並びの右端の考え方が当たらない）
         let members: Vec<(usize, Vec<usize>)> = chain
             .into_iter()
-            .filter(|&r| !cut(r) && !(desc_col.is_some() && column_gap(lines[r]) == desc_col))
+            .filter(|&r| !cut(r) && !two_column(r))
             .map(|r| (r, wrap_block(lines, r)))
             .collect();
         let edge = members
@@ -1325,6 +1326,11 @@ fn label_ends(
             }
             ends.decided[*r] = true;
             ends.join[*r] = match brk {
+                // 結合の上限を超えるラベルは途中までしか繋がらない = 申告する
+                Some(k) if *k > MAX_WRAP_JOIN_LINES => {
+                    ends.undecided[*r] = true;
+                    *k
+                }
                 Some(k) => *k,
                 None if long_start || block.len() == 1 => 0,
                 None => {
