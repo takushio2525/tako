@@ -1062,8 +1062,9 @@ mod tests {
     fn 検出を確かめられなかった依存は導入へ進まない() {
         let brew = DepInstaller::Brew { pkg: "tailscale" };
         let mut state = fake_status(Some(brew), Some("/opt/homebrew/bin/brew"));
+        let lookup = "command -v tailscale";
         state.lookup_timeout = Some(tako_core::probe::TimeoutNotice {
-            label: tako_core::probe::label("zsh", &["-l", "-c", "command -v tailscale"]),
+            label: tako_core::probe::label("zsh", &["-l", "-c", lookup]),
             waited_secs: 5,
         });
         let yes = DepOfferContext {

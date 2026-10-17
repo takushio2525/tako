@@ -60,6 +60,9 @@ mod production_range;
 #[path = "common/call_graph.rs"]
 mod call_graph;
 
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 const EXE: &str = "crates/tako-core/src/platform/exe.rs";
 const PROBE: &str = "crates/tako-core/src/probe.rs";
 const SETUP_BOOTSTRAP: &str = "crates/tako-control/src/setup_bootstrap.rs";
@@ -168,12 +171,10 @@ fn login_shell_args(text: &str, from: usize, to: usize) -> Vec<usize> {
     let slice = &text[from..to];
     let mut out = Vec::new();
     for (i, _) in slice.match_indices("\"-l\"") {
-        let rest = &slice[i..];
-        let mut end = rest.find(';').unwrap_or(rest.len()).min(120);
-        while !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        if rest[..end].contains("\"-c\"") {
+        // 端は文字境界まで広げる（日本語のコメントの途中で切らない = #2043）。文の終わりで止める
+        let window = byte_window::head(&slice[i..], 120);
+        let window = window.split(';').next().unwrap_or(window);
+        if window.contains("\"-c\"") {
             out.push(from + i);
         }
     }
