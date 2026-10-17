@@ -56,6 +56,29 @@
 #   起こさなかった器は「止めた」に置かれ `tako lsp restart` で起きる。LSP を検証するスクリプトは
 #   `TAKO_LSP_AUTOSTART=1`（取るところまで見るなら `TAKO_LSP_AUTO_FETCH=1` も）を export するか並べる
 #
+# **隔離 GUI は本物の claude・本番の tako へ届かない既定で起こす**（#1970）: 検証用 GUI は
+#   本番 tako のペイン（= worker の claude の中）から起こされるので、何もしなければ本番の env を
+#   丸ごと受け継ぐ。#1966 の worker はそれで 3 件踏んだ: ① 自動リネームが本物の claude（既定の設定 dir =
+#   本物の認証と会話記録）を `claude -p` で起こした ② 本番の mod の env（`CLAUDE_CODE_PLUGIN_DIRS` /
+#   `TAKO_CLI`）が一時の claude に載り、本番 tako へ報告を送りうる形になった ③ zsh の初回設定メニューが
+#   `tako send` の入力を食った（#1945）。いまは起動ごとに次を既定にする（**呼び出し側が並べた `VAR=VAL` が
+#   常に勝つ** = 下の既定はすべて上書きできる）:
+#   - 本番 tako と呼び出し元の claude がペインへ配る env（ISOLATED_GUI_DROP_ENV）を GUI へ渡さない。
+#     GUI の子（ペイン・自動リネーム・mod）はすべて GUI の env を継ぐので、ここで落とせば全部へ効く
+#   - 自動リネームは止める（`TAKO_AUTO_RENAME=0`。命名を見る検証は `TAKO_AUTO_RENAME=1` を並べ、
+#     `TAKO_CLAUDE_BIN=<偽の claude>` も並べる。export された値も尊重する）
+#   - `CLAUDE_CONFIG_DIR` は本物へ向けない。**export された値は使わない**（worker の env の値は本物の
+#     設定 dir）。GUI の HOME が一時の dir なら外すだけ（claude はその HOME の `.claude` を使う）、HOME が
+#     利用者のホームのままならログの置き場の隣の一時 dir（ISOLATED_GUI_CLAUDE_CONFIG_DIR）。本物の認証で
+#     実物の claude を動かす検証だけが `CLAUDE_CONFIG_DIR="$CCD"` を並べて明示する。
+#     **HOME を本物のままにするとペインのシェルは利用者の rc を読む**ので、rc が `CLAUDE_CONFIG_DIR` を
+#     export していればペインの claude は本物の設定 dir を使う（GUI の env では止められない）。
+#     ペインの claude まで隔離するなら一時の HOME か ZDOTDIR を並べる
+#   - GUI の HOME（か ZDOTDIR）が利用者のホームの外で、zsh の rc が 1 つも無ければ既定の `.zshrc`
+#     （固定プロンプト。実ユーザー名・ホスト名を画面へ出さない = #927）を置く。**利用者のホームの中には書かない**
+#   クリップボードはここでは守れない（GUI のコピーは OS の汎用ペーストボードへ直に書く）ので、
+#   Copy を押す確認は隔離 tmux（`set-clipboard off`）で行う（#1963）
+#
 # 使い方:
 #   . scripts/lib/isolated-gui.sh        # 関数として読む（直接実行はしない）
 #
@@ -66,6 +89,11 @@
 #
 #   起動ごとに env を足したいときは `VAR=VAL` を並べる（`export` を汚さない）:
 #   launch_isolated_gui "$TMP/app-legacy.log" TAKO_1487_LEGACY=1
+#
+#   既定（#1970）を外すのも並べる形だけ（並べた値が既定に勝つ）:
+#   launch_isolated_gui "$TMP/app.log" TAKO_AUTO_RENAME=1 TAKO_CLAUDE_BIN="$FAKE/claude"   # 自動命名を見る
+#   launch_isolated_gui "$TMP/app.log" CLAUDE_CONFIG_DIR="$CCD"   # 本物の認証で実物の claude を動かす
+#   （GUI へ渡した設定 dir は $ISOLATED_GUI_CLAUDE_CONFIG_DIR に残る。空なら一時の HOME の .claude）
 #
 # **落とすのは自分で起こした pid だけ**（`pkill -f tako` / `killall tako-app` は
 #   本番 `/Applications/tako.app` にも他 worker の隔離インスタンスにも当たる。
@@ -152,6 +180,46 @@ ISOLATED_GUI_NOT_VIRTUAL_REASON=""
 
 # 直前の `iso_display_allowed` が面の指定を通さなかった理由（1 行。通したら空）
 ISOLATED_GUI_FOREIGN_REASON=""
+
+# GUI へ渡さない env（#1970）。**本番 tako がペインへ配るもの**と**呼び出し元の claude の
+# セッションの印**。GUI の子（ペイン・自動リネームの `claude -p`・mod）は GUI の env を継ぐので、
+# 残すと検証の claude / tako が本番の GUI・本番の mod・呼び出し元の会話へ繋がる。
+# 呼び出し側が `VAR=VAL` を並べたものは落とさない（並べた値が届く）。
+# **本番側で注入する env を増やしたら、ここにも足す**（番犬 verification_isolation_watchdog が
+# tako-app の spawn_session と tako-core の表から突き合わせて落とす）
+ISOLATED_GUI_DROP_ENV=(
+    # 制御プレーン（tako-app の spawn_session が積む）
+    TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_PANE_ID TAKO_TAB_ID
+    # 器の中のシェルへ渡すもの（tako_core::backend::PANE_SCOPED_ENV）
+    TAKO_OSC_SINK TAKO_BACKEND_SOCKET
+    # tako mod（tako_core::claude_mod::INJECTED_KEYS）
+    CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI
+    # orchestrator の役割（launch_cmd が起動コマンドへ前置きする）
+    TAKO_ORCHESTRATOR_ROLE
+    # シェル統合の控え（tako_core::shell_integration::INJECTED_KEYS のうち tako 固有のもの。
+    # ZDOTDIR / PROMPT_COMMAND / XDG_DATA_DIRS は利用者も使う名前で、隔離 GUI が自分の値を積み直す）
+    TAKO_ORIG_ZDOTDIR
+    # 呼び出し元の claude のセッションの印（子セッション扱いで transcript を保存しない・
+    # 呼び出し元の会話の連絡口へ繋がる。AGENTS.md の実 claude の e2e と同じ）
+    CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENTRYPOINT
+    CLAUDE_CODE_EXECPATH CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
+    CLAUDE_CODE_BRIDGE_SESSION_ID CLAUDE_CODE_SESSION_ATTENDED CLAUDE_PID
+)
+
+# 直前の `launch_isolated_gui` が GUI へ渡した `CLAUDE_CONFIG_DIR`（#1970。呼び出し側が並べたならその値。
+# 空 = 外した = GUI の一時の HOME の `.claude` を claude が使う）
+ISOLATED_GUI_CLAUDE_CONFIG_DIR=""
+
+# 利用者のホーム（既定の `.zshrc` を書かない範囲。#1970）。**差し替えは番犬のモックのためだけ**
+# （空 = パスワードの登録から引く。$HOME は検証スクリプトが差し替えていることがあるので使わない）
+ISOLATED_GUI_REAL_HOME=${ISOLATED_GUI_REAL_HOME:-}
+
+# 既定の `.zshrc` の中身（#1970）。固定プロンプトは既存の検証スクリプトが手で置いていた形と同じ
+# （実ユーザー名・ホスト名を画面に出さない = #927）
+ISOLATED_GUI_ZSHRC="# isolated-gui.sh が置いた既定の .zshrc（#1970）。zsh の初回設定メニューを出さず、
+# 画面へ実ユーザー名・ホスト名を出さない（#927）
+PROMPT='tako %1~ %% '
+RPROMPT=''"
 
 iso_err() { echo "ERROR: $*" >&2; }
 
@@ -304,6 +372,75 @@ iso_isolated_allowed() {
     return 1
 }
 
+# 実在する dir の物理パス（シンボリックリンクを解く。/tmp → /private/tmp 等）。無ければ非ゼロ
+iso_phys_dir() {
+    [ -d "${1-}" ] || return 1
+    (cd "$1" 2>/dev/null && pwd -P)
+}
+
+# 利用者のホームの物理パス（#1970）。**$HOME は使わない**（検証スクリプトが一時 dir へ差し替えている）。
+# パスワードの登録から引き、引けなければ非ゼロ（= 既定の .zshrc を書かない側へ倒す）
+iso_real_home() {
+    local user home
+    if [ -n "$ISOLATED_GUI_REAL_HOME" ]; then
+        iso_phys_dir "$ISOLATED_GUI_REAL_HOME"
+        return
+    fi
+    user=$(id -un 2>/dev/null) || return 1
+    # eval へ渡すのはユーザー名の形の文字だけ（チルダ展開 = getpwnam を使うため）
+    case "$user" in '' | *[!A-Za-z0-9._-]*) return 1 ;; esac
+    eval "home=~$user"
+    case "$home" in '~'*) return 1 ;; esac
+    iso_phys_dir "$home"
+}
+
+# dir が実在し、利用者のホーム（とその中）の外にあれば 0（#1970）。確かめられなければ非ゼロ
+# （= 「利用者のホームかもしれない」側へ倒す）
+iso_outside_real_home() {
+    local dir real
+    dir=$(iso_phys_dir "${1-}") || return 1
+    real=$(iso_real_home) || return 1
+    case "$dir/" in "$real"/*) return 1 ;; esac
+    return 0
+}
+
+# GUI へ届く値（#1970）: 並べた `NAME=…` の最後 → export された値。名前は HOME / ZDOTDIR だけ
+iso_gui_env() {
+    local name="$1" value="" arg
+    shift
+    case "$name" in
+        HOME) value=${HOME-} ;;
+        ZDOTDIR) value=${ZDOTDIR-} ;;
+        *) return 1 ;;
+    esac
+    for arg in "$@"; do
+        case "$arg" in "$name"=*) value=${arg#"$name"=} ;; esac
+    done
+    printf '%s' "$value"
+}
+
+# GUI のシェルが rc を読む dir に既定の `.zshrc` を置く（#1970）。
+#
+#   iso_default_zshrc [VAR=VAL …]   （launch_isolated_gui の引数をそのまま渡す）
+#
+# 読む dir は GUI へ届く `ZDOTDIR`、無ければ `HOME`（どちらも iso_gui_env の順）。
+# tako のシェル統合は `.zshenv` で ZDOTDIR を呼び出し側の値へ戻すので、zsh が rc を探すのはここ。
+# 書くのは **dir が実在し・利用者のホームの外で・zsh の rc（.zshenv / .zprofile / .zshrc / .zlogin）が
+# 1 つも無い**ときだけ（1 つでもあれば zsh の初回設定メニューは出ない。呼び出し側の rc を上書きしない）。
+# 書いたら 0、書かなかったら 1（理由は問わない）
+iso_default_zshrc() {
+    local dir f
+    dir=$(iso_gui_env ZDOTDIR "$@")
+    [ -n "$dir" ] || dir=$(iso_gui_env HOME "$@")
+    iso_outside_real_home "$dir" || return 1
+    dir=$(iso_phys_dir "$dir") || return 1
+    for f in .zshenv .zprofile .zshrc .zlogin; do
+        [ -e "$dir/$f" ] && return 1
+    done
+    printf '%s\n' "$ISOLATED_GUI_ZSHRC" > "$dir/.zshrc" || return 1
+    return 0
+}
+
 # 隔離 GUI を起こす。pid は $ISOLATED_GUI_PID へ置く（**`$( )` で受けない**:
 # 副シェルの子になると呼び出し側の `wait` が「子ではない」で失敗する）。
 #
@@ -360,13 +497,47 @@ launch_isolated_gui() {
         iso_refuse_display "$display"
         return "$ISOLATED_GUI_RC_FOREIGN_DISPLAY"
     fi
+    # 本番 tako と呼び出し元の claude の env は GUI へ渡さない（#1970）。`env -u` は代入より先に
+    # 効くので、呼び出し側が同じ名前を `VAR=VAL` で並べればその値が届く
+    local -a drop_args=()
+    local key
+    for key in ${ISOLATED_GUI_DROP_ENV[@]+"${ISOLATED_GUI_DROP_ENV[@]}"}; do
+        drop_args+=(-u "$key")
+    done
+
     local -a env_args=()
     [ -n "$ISOLATED_GUI_BOUNDS" ] && \
         env_args+=("TAKO_WINDOW_BOUNDS=${TAKO_WINDOW_BOUNDS:-$ISOLATED_GUI_BOUNDS}")
+    # 自動リネームは既定で止める（#1970。本物の claude を `claude -p` で起こす経路）。export された値は尊重する
+    env_args+=("TAKO_AUTO_RENAME=${TAKO_AUTO_RENAME:-0}")
+
+    # claude の設定 dir は本物へ向けない（#1970）。**export された値は使わない**（worker の env の値は
+    # 本物の設定 dir）: 並べた値 → GUI の HOME が利用者のホームの外（一時の HOME）なら外すだけ
+    # （claude はその HOME の .claude / .claude.json を使う = 一時の HOME に会話や資格情報を置く
+    # 検証の形をそのまま保つ）→ HOME が利用者のホームのままならログの置き場の隣の一時 dir
+    local claude_config="" claude_config_set=""
+    for arg in "$@"; do
+        case "$arg" in CLAUDE_CONFIG_DIR=*) claude_config=${arg#CLAUDE_CONFIG_DIR=}; claude_config_set=1 ;; esac
+    done
+    if [ -z "$claude_config_set" ]; then
+        if iso_outside_real_home "$(iso_gui_env HOME "$@")"; then
+            drop_args+=(-u CLAUDE_CONFIG_DIR)
+        else
+            local log_dir
+            log_dir=$(iso_phys_dir "$(dirname "$log")") || { iso_err "ログの置き場の dir が無い: $log"; return 1; }
+            claude_config="$log_dir/isolated-claude-config"
+            mkdir -p "$claude_config" || { iso_err "一時の claude の設定 dir を作れない: $claude_config"; return 1; }
+            env_args+=("CLAUDE_CONFIG_DIR=${claude_config}")
+        fi
+    fi
+    ISOLATED_GUI_CLAUDE_CONFIG_DIR=$claude_config
+
+    # zsh の初回設定メニューが入力を食わないよう、一時の HOME へ既定の .zshrc（#1970 / #1945）
+    iso_default_zshrc "$@" || true
     # 呼び出し側が並べた `VAR=VAL` は既定より後ろ = そちらが勝つ。
     # 検証用 GUI の印と面の指定だけは最後に置く = GUI へ届くのは必ず `TAKO_ISOLATED=1` と
     # 判定を通った面の指定（判定をすり抜ける道が増えても、印を偽にして届ける道は無い。#1760 / #1784）
-    env ${env_args[@]+"${env_args[@]}"} "$@" "TAKO_ISOLATED=1" "TAKO_DISPLAY=${display}" "$APP_BIN" > "$log" 2>&1 &
+    env ${drop_args[@]+"${drop_args[@]}"} ${env_args[@]+"${env_args[@]}"} "$@" "TAKO_ISOLATED=1" "TAKO_DISPLAY=${display}" "$APP_BIN" > "$log" 2>&1 &
     ISOLATED_GUI_PID=$!
     return 0
 }

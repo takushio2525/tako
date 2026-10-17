@@ -193,7 +193,8 @@ launch_solo_inline() {
 start_gui() {
   local log="$1"
   shift
-  launch_isolated_gui "$log" TAKO_PERSIST=1 TAKO_CLAUDE_BIN="$FAIL_BIN/claude" ${1+"$@"} || exit $?
+  # 自動命名が動くことを確かめる段がある（失敗する偽の claude で名前を付けさせる）ので明示で入れる（既定は止める = #1970）
+  launch_isolated_gui "$log" TAKO_PERSIST=1 TAKO_AUTO_RENAME=1 TAKO_CLAUDE_BIN="$FAIL_BIN/claude" ${1+"$@"} || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$log" || { tail -20 "$log"; exit 1; }
 }
