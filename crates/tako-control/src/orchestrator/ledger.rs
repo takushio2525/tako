@@ -52,8 +52,13 @@ pub struct LedgerEntry {
     pub issue: Option<String>,
     /// 統制語彙のタスク種別
     pub task_type: String,
-    /// 使用モデル
+    /// spawn が宣言したモデル（CLI の既定に委ねたら `(default)`）
     pub model: String,
+    /// 実際に使われたモデル（#1638。worker レジストリが transcript で確かめたときに書く）。
+    /// 未確定・観測しない系統（codex / agy）は None で、集計は宣言の `model` へ倒す。
+    /// #1638 前のファイルには無い = serde の default で None として読める（移行は要らない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_actual: Option<String>,
     /// 使用 effort
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -155,8 +160,18 @@ impl Ledger {
         self.entries.iter_mut().find(|e| e.id == id)
     }
 
-    /// task_type × model の集計
+    /// task_type × model の集計。
+    ///
+    /// #1638: model は**実際に使われたモデル**（`model_actual`）で数える。未確定・観測しない系統の
+    /// エントリは宣言の `model` で数え、行を分ける（`model_source` = actual / declared）。同じ名前でも
+    /// 「確かめた」行と「宣言のまま」の行を混ぜると、宣言が嘘だった分が実態の行へ紛れ込むため。
+    /// `mismatched` は宣言と違うモデルで動いた件数（宣言 5.5 → 実際 5 なら実際 5 の行に数える）
     pub fn stats(&self) -> Vec<StatRow> {
+        self.stats_with(super::registry::legacy_1638())
+    }
+
+    /// [`Ledger::stats`] の A/B を引数で受ける版（`legacy` = 宣言のモデルで数える修正前）
+    pub fn stats_with(&self, legacy: bool) -> Vec<StatRow> {
         use std::collections::BTreeMap;
         #[derive(Default)]
         struct Acc {
@@ -165,13 +180,24 @@ impl Ledger {
             rework: u32,
             fail: u32,
             post_issue: u32,
+            mismatched: u32,
             durations: Vec<u64>,
         }
-        let mut map: BTreeMap<(String, String), Acc> = BTreeMap::new();
+        let mut map: BTreeMap<(String, String, &'static str), Acc> = BTreeMap::new();
         for e in &self.entries {
-            let key = (e.task_type.clone(), e.model.clone());
+            let (model, source) = match e.model_actual.as_deref().filter(|_| !legacy) {
+                Some(actual) => (actual.to_string(), "actual"),
+                None => (e.model.clone(), "declared"),
+            };
+            let mismatched = source == "actual"
+                && tako_core::model_check::check(Some(&e.model), Some(&model))
+                    == tako_core::model_check::ModelCheck::Mismatch;
+            let key = (e.task_type.clone(), model, source);
             let acc = map.entry(key).or_default();
             acc.total += 1;
+            if mismatched {
+                acc.mismatched += 1;
+            }
             match e.outcome.as_deref() {
                 Some("pass") => acc.pass += 1,
                 Some("rework") => acc.rework += 1,
@@ -186,7 +212,7 @@ impl Ledger {
             }
         }
         map.into_iter()
-            .map(|((task_type, model), acc)| {
+            .map(|((task_type, model, model_source), acc)| {
                 let avg_duration = if acc.durations.is_empty() {
                     None
                 } else {
@@ -196,6 +222,8 @@ impl Ledger {
                 StatRow {
                     task_type,
                     model,
+                    model_source,
+                    mismatched: acc.mismatched,
                     total: acc.total,
                     pass: acc.pass,
                     rework: acc.rework,
@@ -235,7 +263,12 @@ impl Ledger {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatRow {
     pub task_type: String,
+    /// 実際に使われたモデル（`model_source` = actual）か、確かめられなかった宣言（declared）
     pub model: String,
+    /// `model` の出どころ（#1638）。actual = transcript で確かめた / declared = 宣言のまま
+    pub model_source: &'static str,
+    /// 宣言と違うモデルで動いた件数（#1638。actual の行だけが持ちうる）
+    pub mismatched: u32,
     pub total: u32,
     pub pass: u32,
     pub rework: u32,
@@ -324,6 +357,7 @@ pub fn record_spawn(
         issue: issue.map(str::to_string),
         task_type: task_type.to_string(),
         model: model.to_string(),
+        model_actual: None,
         effort: effort.map(str::to_string),
         agent: agent.map(str::to_string),
         duration_seconds: None,
@@ -337,6 +371,31 @@ pub fn record_spawn(
     };
     Ledger::mutate(|l| l.append(entry))?;
     Ok(id)
+}
+
+/// 実際に使われたモデルを書く（#1638。worker レジストリが transcript で確かめたとき 1 回だけ呼ぶ）。
+/// 既に書いてあれば変えない（spawn 時の解決先を残す）。エントリが無ければ何もしない
+pub fn record_model_actual(id: &str, actual: &str) -> Result<(), String> {
+    let path = ledger_path().ok_or("ホームディレクトリが取得できない")?;
+    record_model_actual_at(&path, id, actual)
+}
+
+/// [`record_model_actual`] のパス指定版
+pub fn record_model_actual_at(path: &Path, id: &str, actual: &str) -> Result<(), String> {
+    // 書く必要が無ければロックも書き込みもしない（台帳が無い / 該当なし / 確定済み）
+    let wants = |l: &Ledger| {
+        l.entries
+            .iter()
+            .any(|e| e.id == id && e.model_actual.is_none())
+    };
+    if !wants(&Ledger::load_from(path)?) {
+        return Ok(());
+    }
+    Ledger::mutate_at(path, |l| {
+        if let Some(entry) = l.find_mut(id).filter(|e| e.model_actual.is_none()) {
+            entry.model_actual = Some(actual.to_string());
+        }
+    })
 }
 
 /// outcome の検証
@@ -486,6 +545,7 @@ mod tests {
             issue: Some("#292".into()),
             task_type: "bugfix-rooted".into(),
             model: "claude-opus-4-6".into(),
+            model_actual: None,
             effort: Some("max".into()),
             agent: Some("claude".into()),
             duration_seconds: Some(120),
@@ -522,6 +582,7 @@ mod tests {
                 issue: None,
                 task_type: "bugfix-rooted".into(),
                 model: "opus".into(),
+                model_actual: None,
                 effort: None,
                 agent: None,
                 duration_seconds: Some(100),
@@ -541,6 +602,7 @@ mod tests {
                 issue: None,
                 task_type: "bugfix-rooted".into(),
                 model: "opus".into(),
+                model_actual: None,
                 effort: None,
                 agent: None,
                 duration_seconds: Some(200),
@@ -560,6 +622,7 @@ mod tests {
                 issue: None,
                 task_type: "docs".into(),
                 model: "sonnet".into(),
+                model_actual: None,
                 effort: None,
                 agent: None,
                 duration_seconds: None,
@@ -607,6 +670,7 @@ mod tests {
                 issue: None,
                 task_type: "docs".into(),
                 model: "m".into(),
+                model_actual: None,
                 effort: None,
                 agent: None,
                 duration_seconds: None,
@@ -630,6 +694,7 @@ mod tests {
                 issue: None,
                 task_type: "review".into(),
                 model: "m".into(),
+                model_actual: None,
                 effort: None,
                 agent: None,
                 duration_seconds: None,
@@ -663,6 +728,7 @@ mod tests {
                 issue: None,
                 task_type: "docs".into(),
                 model: "m".into(),
+                model_actual: None,
                 effort: None,
                 agent: None,
                 duration_seconds: None,
@@ -705,6 +771,7 @@ mod tests {
                     issue: None,
                     task_type: "docs".into(),
                     model: "m".into(),
+                    model_actual: None,
                     effort: None,
                     agent: None,
                     duration_seconds: None,
@@ -724,6 +791,7 @@ mod tests {
                     issue: None,
                     task_type: "docs".into(),
                     model: "m".into(),
+                    model_actual: None,
                     effort: None,
                     agent: None,
                     duration_seconds: None,
@@ -765,6 +833,7 @@ mod tests {
             issue: None,
             task_type: "docs".into(),
             model: "m".into(),
+            model_actual: None,
             effort: None,
             agent: None,
             duration_seconds: None,
@@ -825,5 +894,95 @@ mod tests {
         assert_eq!(loaded.entries[0].project, "real-project");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 宣言 `declared`・実際 `actual` の 1 件（#1638）
+    fn entry_1638(id: &str, declared: &str, actual: Option<&str>, outcome: &str) -> LedgerEntry {
+        LedgerEntry {
+            task_type: "bugfix-rooted".into(),
+            model: declared.into(),
+            model_actual: actual.map(str::to_string),
+            outcome: Some(outcome.into()),
+            ..make_entry(id, "tako")
+        }
+    }
+
+    /// 受け入れ条件 2: stats は実際のモデルで数える。実際のモデルが取れないものは宣言で数えて
+    /// 行を分ける（model_source = declared）。宣言と違ったものは mismatched に数える
+    #[test]
+    fn statsは実際のモデルで集計する_1638() {
+        let ledger = Ledger {
+            entries: vec![
+                // 宣言 5.5 → 実際 5（無言のフォールバック）が 2 件
+                entry_1638("a", "claude-opus-5-5", Some("claude-opus-5"), "pass"),
+                entry_1638("b", "claude-opus-5-5", Some("claude-opus-5"), "rework"),
+                // 宣言どおり 5 が 1 件
+                entry_1638("c", "claude-opus-5", Some("claude-opus-5"), "pass"),
+                // 実際を確かめられなかった 5.5（#1638 前の記録・codex / agy）
+                entry_1638("d", "claude-opus-5-5", None, "pass"),
+                // CLI の既定に委ねた（宣言なし）→ 実際のモデルの行へ。食い違いには数えない
+                entry_1638("e", "(default)", Some("claude-opus-5"), "fail"),
+            ],
+        };
+        let rows = ledger.stats_with(false);
+        let row = |model: &str, source: &str| {
+            rows.iter()
+                .find(|r| r.model == model && r.model_source == source)
+                .unwrap_or_else(|| panic!("{model} / {source} の行が無い: {rows:?}"))
+        };
+        let actual5 = row("claude-opus-5", "actual");
+        assert_eq!(actual5.total, 4, "実際に 5 で動いた 4 件");
+        assert_eq!(actual5.mismatched, 2, "宣言 5.5 だった 2 件");
+        assert_eq!((actual5.pass, actual5.rework, actual5.fail), (2, 1, 1));
+        let declared55 = row("claude-opus-5-5", "declared");
+        assert_eq!(declared55.total, 1);
+        assert_eq!(declared55.mismatched, 0);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.model == "claude-opus-5-5" && r.model_source == "actual"),
+            "5.5 で動いた記録は無い: {rows:?}"
+        );
+        // A/B（TAKO_1638_LEGACY=1 相当）: 修正前は宣言で数える = 5.5 の行に 3 件が載る嘘
+        let legacy = ledger.stats_with(true);
+        let l55 = legacy
+            .iter()
+            .find(|r| r.model == "claude-opus-5-5")
+            .unwrap();
+        assert_eq!((l55.total, l55.model_source), (3, "declared"));
+        // JSON の形（MCP / CLI の stats がそのまま出す）
+        let v = serde_json::to_value(actual5).unwrap();
+        assert_eq!(v["model_source"], "actual");
+        assert_eq!(v["mismatched"], 2);
+    }
+
+    /// 実際のモデルは 1 回だけ書く（確定済みは変えない）。旧ファイル（キー無し）はそのまま読める
+    #[test]
+    fn 実際のモデルを1回だけ書き旧ファイルも読める_1638() {
+        let dir = tako_core::test_residue::ScratchDir::new("ledger-1638");
+        let path = dir.path().join("ledger.yaml");
+        std::fs::write(
+            &path,
+            "entries:\n- id: spawn_1\n  ts: t\n  project: tako\n  task_type: docs\n  model: claude-opus-5-5\n",
+        )
+        .unwrap();
+        let before = Ledger::load_from(&path).unwrap();
+        assert_eq!(
+            before.entries[0].model_actual, None,
+            "旧ファイルは None で読める"
+        );
+        record_model_actual_at(&path, "spawn_1", "claude-opus-5").unwrap();
+        record_model_actual_at(&path, "spawn_1", "claude-sonnet-5").unwrap();
+        // 該当の無い ID・台帳の無いパスは何もしない
+        record_model_actual_at(&path, "spawn_x", "claude-opus-5").unwrap();
+        record_model_actual_at(&dir.path().join("無い.yaml"), "spawn_1", "m").unwrap();
+        assert!(!dir.path().join("無い.yaml").exists());
+        let after = Ledger::load_from(&path).unwrap();
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.entries[0].model, "claude-opus-5-5", "宣言は残す");
+        assert_eq!(
+            after.entries[0].model_actual.as_deref(),
+            Some("claude-opus-5")
+        );
     }
 }

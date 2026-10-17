@@ -5084,6 +5084,9 @@ fn finish_workers_list(
         .into_iter()
         .map(|s| s.session.into_string())
         .collect();
+    // #1638: 実際のモデルが未確定の worker を transcript で確かめてから並べる（GUI の定期スキャンを
+    // 待たずに一覧が実態を返す。未確定の worker が居なければ transcript には触らない）
+    registry::observe_pending_models();
     let reg = if sweep {
         // GC の失敗（ロック競合・書き込み不能）で一覧まで落とさない。読むだけへ縮退する
         registry::sweep_dead(&live_backends, live_panes).or_else(|e| {
@@ -16652,6 +16655,30 @@ fn finish_worker_status(
         )
     });
 
+    // #1638: 宣言 / 実際のモデル。未確定ならここで transcript を確かめる（tako mod の報告の設定 dir を
+    // 手がかりにする = accounts.yaml に無い設定 dir でも探せる）。確定済みならレジストリの値を
+    // 返すだけで transcript には触らない（判定は `registry::model_check` の 1 実装）
+    let registry_model = registry_worker.as_ref().map(|(id, entry)| {
+        let mut entry = entry.clone();
+        let hint = mod_view
+            .as_ref()
+            .ok()
+            .and_then(|s| s.report.config_dir.as_deref())
+            .map(Path::new);
+        if let Some(obs) =
+            orchestrator::registry::observe_worker_model(id, &entry, resolved_sid.as_deref(), hint)
+        {
+            entry.model_actual = Some(obs.actual);
+            entry.model_actual_account = obs.account;
+        }
+        RegistryModel {
+            check: orchestrator::registry::model_check(&entry).as_str(),
+            warning: orchestrator::registry::model_warning(&entry),
+            declared: entry.model,
+            actual: entry.model_actual,
+        }
+    });
+
     // #757: ログイン失効を検知したときだけ「どのアカウントか」を逆引きする。
     // 逆引きは transcript の所在を読む（= ディレクトリ走査）ので、**失敗経路でしか
     // 呼ばれない閉包**として渡す。毎ポーリング（watch は 5 秒ごと）に走らせない。
@@ -16682,6 +16709,7 @@ fn finish_worker_status(
         registry_session_detected,
         registry_resume_command,
         registry_launch_failure,
+        registry_model,
         agent_process_alive,
         limit_resume,
         codex_rate_limits,
@@ -16700,6 +16728,15 @@ fn finish_worker_status(
             None => monitor.to_json(),
         },
     })
+}
+
+/// worker の宣言 / 実際のモデル（#1638。`worker_status` の `model_declared` / `model_actual` /
+/// `model_check` と、食い違いなら `warnings` の 1 行）
+struct RegistryModel {
+    declared: Option<String>,
+    actual: Option<String>,
+    check: &'static str,
+    warning: Option<String>,
 }
 
 /// `apply_worker_status_corrections` への入力（agents / screen 解決後の初期状態）
@@ -16734,6 +16771,8 @@ struct ResolvedWorkerStatus {
     /// 起動に失敗した worker へは依頼文の再送（`prompt_undelivered`）を撃たせない
     /// （エージェントが居ないので、再送はシェルへ打ち込まれる）
     registry_launch_failure: Option<(String, Option<i32>)>,
+    /// #1638: 宣言 / 実際のモデル（レジストリ登録済み worker のみ）
+    registry_model: Option<RegistryModel>,
     /// #390: エージェントプロセスの生存シグナル（突然死判定専用。pane 消失中は
     /// tmux フォールバックで再計算済み。busy / stalled 補正には使わない）
     agent_process_alive: bool,
@@ -16794,6 +16833,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         registry_session_detected,
         registry_resume_command,
         registry_launch_failure,
+        registry_model,
         agent_process_alive,
         limit_resume,
         login_account_resolver,
@@ -17020,6 +17060,8 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         }
     }
     warnings.extend(ctx.as_ref().and_then(crate::claude_ctx::window_warning));
+    // #1638: 宣言と違うモデルで動いている（アカウントの entitlement・モデルの廃止）
+    warnings.extend(registry_model.as_ref().and_then(|m| m.warning.clone()));
 
     // 停止（idle）した worker の画面に既知のエラーパターン（API エラー・usage limit・
     // rate limit ダイアログ）があれば error へ細分類する（#157）。busy 中は判定しない
@@ -17333,6 +17375,11 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         // #1940: 起動の失敗（`tako orchestrator workers` の launch_failure と同じ値）
         "launch_failure": registry_launch_failure.as_ref().map(|(r, _)| r.as_str()),
         "launch_exit_code": registry_launch_failure.as_ref().and_then(|(_, c)| *c),
+        // #1638: 宣言したモデル / 実際に使われたモデル（未確定は null）/ 突き合わせ
+        // （`tako orchestrator workers` と同じ語彙。未登録ペインは 3 つとも null）
+        "model_declared": registry_model.as_ref().and_then(|m| m.declared.clone()),
+        "model_actual": registry_model.as_ref().and_then(|m| m.actual.clone()),
+        "model_check": registry_model.as_ref().map(|m| m.check),
         "resume_command": registry_resume_command,
         // #813: 利用上限後の自動復帰（enabled = ペインのオプトイン / state = 実行状態）
         "limit_resume": limit_resume,
@@ -45114,6 +45161,191 @@ mod tests {
             }
         );
         assert_eq!(calls, 2, "2 回連続観測で確定（単発の取りこぼし誤爆を防ぐ）");
+    }
+
+    /// #1638 の受け入れ条件 1（dispatch = CLI と MCP が同じ Request で通る経路）。
+    ///
+    /// 偽の transcript（一時 dir の設定 dir）で「宣言 claude-opus-5-5・実際 claude-opus-5」を作ると、
+    /// worker_status と workers が宣言 / 実際を分けて返し、warnings に食い違いの 1 行が出る。
+    /// 一致なら warnings は出ず、まだ応答の無い worker は null / pending。偽の mod の報告は宣言どおりの
+    /// モデルを言う（`$.session.model()` が宣言を返す場合）が、実際のモデルは transcript から採るので
+    /// 食い違いを一致と言わない
+    #[test]
+    fn issue1638_宣言と実際のモデルをworker_statusとworkersが分けて返す() {
+        use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
+        let scratch = tako_core::test_residue::ScratchDir::new("dispatch-1638");
+        let config_dir = scratch.path().join("claude-univ");
+        let project = config_dir.join("projects").join("-tmp-work");
+        std::fs::create_dir_all(&project).unwrap();
+        let user = r#"{"type":"user","message":{"content":"依頼文"}}"#;
+        let answer = |model: &str| {
+            format!(
+                "{user}\n{{\"type\":\"assistant\",\"message\":{{\"model\":\"{model}\",\"content\":[]}}}}\n"
+            )
+        };
+        // 3 件: 食い違い / 一致 / まだ応答が無い（spawn 直後）
+        let panes: Vec<u64> = (0..3)
+            .map(|_| tako_core::unused_id::pane().as_u64())
+            .collect();
+        let sids: Vec<String> = panes.iter().map(|p| format!("sid-1638-{p}")).collect();
+        let ids: Vec<String> = panes.iter().map(|p| format!("m{p}")).collect();
+        std::fs::write(
+            project.join(format!("{}.jsonl", sids[0])),
+            answer("claude-opus-5"),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(format!("{}.jsonl", sids[1])),
+            answer("claude-opus-5"),
+        )
+        .unwrap();
+        std::fs::write(project.join(format!("{}.jsonl", sids[2])), user).unwrap();
+        let declared = ["claude-opus-5-5", "claude-opus-5", "claude-opus-5-5"];
+        let path = registry_path().unwrap();
+        WorkerRegistry::mutate_at(&path, |reg| {
+            for i in 0..3 {
+                reg.workers.insert(
+                    ids[i].clone(),
+                    WorkerEntry {
+                        pane: panes[i],
+                        agent: "claude".into(),
+                        model: Some(declared[i].into()),
+                        session_id: Some(sids[i].clone()),
+                        status: "active".into(),
+                        spawned_at: crate::sessions::now_iso(),
+                        ..Default::default()
+                    },
+                );
+            }
+        })
+        .unwrap();
+        let status_of = |i: usize| {
+            let report = tako_core::claude_mod::parse_report(json!({
+                "schema": 1, "mod_version": "t", "at": 1, "turn": "idle",
+                "session_id": sids[i], "model": declared[i],
+                "config_dir": config_dir.display().to_string(),
+            }))
+            .unwrap();
+            let mut ctx = mod_ctx_1880(
+                "done\n❯ ",
+                crate::claude_mod::ModSnapshot::with_report(
+                    tako_core::claude_mod::StoredReport {
+                        report,
+                        received: std::time::Instant::now(),
+                        count: 1,
+                        prev_received: None,
+                    },
+                    Vec::new(),
+                ),
+            );
+            ctx.pane_id = panes[i];
+            finish_worker_status(ctx, Some(&sids[i]), None).unwrap()
+        };
+
+        let v = status_of(0);
+        assert_eq!(v["worker_id"], ids[0].as_str(), "{v}");
+        assert_eq!(v["model_declared"], "claude-opus-5-5");
+        assert_eq!(
+            v["model_actual"], "claude-opus-5",
+            "transcript の解決後の名前: {v}"
+        );
+        assert_eq!(v["model_check"], "mismatch");
+        let warned = |v: &Value| {
+            v["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|w| w.as_str())
+                .filter(|w| w.contains("モデルの食い違い"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let lines = warned(&v);
+        assert_eq!(lines.len(), 1, "{v}");
+        assert!(
+            lines[0].contains("宣言 claude-opus-5-5 → 実際 claude-opus-5"),
+            "{lines:?}"
+        );
+        // 一致: warnings は出ない
+        let v = status_of(1);
+        assert_eq!(
+            (v["model_actual"].as_str(), v["model_check"].as_str()),
+            (Some("claude-opus-5"), Some("match"))
+        );
+        assert!(warned(&v).is_empty(), "{v}");
+        // まだ応答が無い: 未確定を null / pending で返し、warnings は出さない
+        let v = status_of(2);
+        assert_eq!(v["model_declared"], "claude-opus-5-5");
+        assert_eq!(v["model_actual"], Value::Null);
+        assert_eq!(v["model_check"], "pending");
+        assert!(warned(&v).is_empty(), "{v}");
+
+        // workers（CLI `tako orchestrator workers` / MCP `tako_orchestrator_workers` の Request）
+        let mut host = MockHost::new();
+        let v = dispatch(
+            &mut host,
+            Request::OrchestratorWorkers { all: None },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let item = |id: &str| {
+            v["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["worker_id"] == id)
+                .unwrap_or_else(|| panic!("{id} が一覧に無い"))
+                .clone()
+        };
+        let w = item(&ids[0]);
+        assert_eq!(
+            (
+                w["model_declared"].as_str(),
+                w["model_actual"].as_str(),
+                w["model_check"].as_str()
+            ),
+            (
+                Some("claude-opus-5-5"),
+                Some("claude-opus-5"),
+                Some("mismatch")
+            )
+        );
+        assert_eq!(item(&ids[1])["model_check"], "match");
+        assert_eq!(item(&ids[2])["model_check"], "pending");
+        let mine: Vec<&str> = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w.as_str())
+            .filter(|w| {
+                ids.iter()
+                    .any(|id| w.starts_with(&format!("worker {id}（")))
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "食い違いの 1 件だけ: {mine:?}");
+        assert!(mine[0].starts_with(&format!("worker {}（pane {}）", ids[0], panes[0])));
+
+        // worker_status を worker ID で引く（ペインが無い・mod の報告も無い = 記録した値を返す）
+        let v = dispatch(
+            &mut host,
+            Request::OrchestratorWorkerStatus {
+                pane_id: None,
+                session_id: None,
+                tmux_session: None,
+                worker: Some(ids[0].clone()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["model_actual"], "claude-opus-5", "{v}");
+        assert_eq!(warned(&v).len(), 1, "{v}");
+
+        // 後始末（共有ファイルなので自分のエントリだけ消す）
+        let _ = WorkerRegistry::mutate_at(&path, |reg| {
+            for id in &ids {
+                reg.workers.remove(id);
+            }
+        });
     }
 
     #[test]

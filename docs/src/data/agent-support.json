@@ -1240,6 +1240,30 @@
       }
     },
     {
+      "key": "worker_model_actual",
+      "summary_ja": "worker が実際に使ったモデルを確かめ、宣言との食い違いを知らせる（#1638）",
+      "evidence": "source",
+      "evidence_detail": "orchestrator/registry.rs の model_actual は claude の transcript（最初の assistant 行の message.model）からだけ埋まる（observe_pending_models / observe_worker_model）。codex の rollout・agy の実況 JSONL からモデルを読む配線は無いので、宣言だけを返し model_check は not_observed になる",
+      "agents": {
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "degraded",
+          "note_ja": "宣言したモデルだけを返す。実際に使われたモデルは読まない（`model_actual` は null・`model_check` は not_observed）ので、CLI が別のモデルへ解決しても食い違いの警告は出ず、ledger も宣言のモデルで集計される"
+        },
+        "agy": {
+          "status": "degraded",
+          "note_ja": "宣言したモデルだけを返す。実際に使われたモデルは読まない（`model_actual` は null・`model_check` は not_observed）ので、CLI が別のモデルへ解決しても食い違いの警告は出ず、ledger も宣言のモデルで集計される"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 990
+        }
+      }
+    },
+    {
       "key": "worker_model_default_inherit",
       "summary_ja": "claude 語彙で書かれたモデル / effort の既定（プロファイルの worker_model / アカウントの default_model）を worker へ継承する（#1013）",
       "evidence": "measured",

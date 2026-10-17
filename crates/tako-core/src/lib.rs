@@ -45,6 +45,7 @@ pub mod lsp;
 pub mod master_tab;
 pub mod md_links;
 pub mod migration;
+pub mod model_check;
 pub mod monotonic;
 pub mod mouse_forward;
 pub mod net_resume;

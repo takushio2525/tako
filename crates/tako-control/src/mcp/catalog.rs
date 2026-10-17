@@ -1974,7 +1974,8 @@ pub fn tools() -> Vec<Value> {
                 agents-auto（claude agents --json）/ screen（画面推定。codex / agy は常に screen）。\
                 ctx_source / ctx_mod_reason / mod_turn / rate_limits は tako_orchestrator_self と同じ。\
                 ほかに recent_output（直近 30 行）/ prompt_delivery / launch_failure（起動失敗。再送しない）/ \
-                events / background_work / resume_command / resolved_session_id。\
+                events / background_work / resume_command / resolved_session_id / \
+                model_declared・model_actual・model_check（tako_orchestrator_workers と同じ）。\
                 **次の一手は recommended_action に従う**（resume / wait_reset / respond_dialog / \
                 fix_launch / needs_human / relogin / verify_then_resend）。\
                 error.kind = api_error / usage_limit / limit_dialog / launch_failed（内訳 error.launch_problem = \
@@ -2018,7 +2019,10 @@ pub fn tools() -> Vec<Value> {
                 agent_exited / peer_send_stalled / peer_unconfirmed。peer_* は unverified）/ \
                 launch（failed / started / pending）+ launch_failure（agent_exited = 起動直後に終了。\
                 launch_exit_code / command_flow_timeout）/ resend_command（未達だけ・起動失敗は除く）/ \
-                resume_command（claude worker の突然死からの復旧）。all=true で closed も含める。\
+                resume_command（claude worker の突然死からの復旧）/ model_declared（spawn の宣言）・\
+                model_actual（transcript で確かめた実際のモデル。未確定は null）・model_check（match / \
+                mismatch = warnings に 1 行 / pending / undeclared / unverifiable / not_observed = codex・agy）。\
+                all=true で closed も含める。\
                 ペインも tmux も 5 分以上観測できない active は closed（close_reason = gone）へ倒す\
                 （resume_command / report は closed でも引ける）。",
             "inputSchema": {
@@ -2163,7 +2167,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_orchestrator_ledger",
             "description": "委任台帳を操作する。list = 一覧（project / task_type で絞り、limit 件）/ stats = task_type x model の\
-                集計（成功率・差し戻し率・平均所要時間・未評価数）/ record = 検収結果の記録\
+                集計（model は実際のモデル。確かめられないものは宣言で別の行 = model_source: declared。\
+                mismatched = 宣言と違った件数。成功率・差し戻し率・平均所要時間・未評価数）/ record = 検収結果の記録\
                 （id + outcome + rounds + note）/ amend = 事後修正（検収 pass 後に問題発覚。id + note）/ \
                 prune = project 前方一致でエントリを除去（project 必須。selftest 混入等の掃除）。\
                 spawn / run で task_type を指定すると自動記録される。",
