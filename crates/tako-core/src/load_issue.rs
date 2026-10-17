@@ -9,7 +9,8 @@
 //! 退避も理由と同じ所（[`LoadIssue::read_failed`] / [`LoadIssue::unparsable`]）で済ませる。
 //! 文字として読めない中身（UTF-8 でない・権限で読めない）は文字列の退避口を通れないので、
 //! バイトのまま移す（`migration::quarantine_raw`。#2231）。読み手ごとに書き分けると、
-//! 片方だけ退避を忘れる形が戻る
+//! 片方だけ退避を忘れる形が戻る。settings.json・run-configs.json・claude-mod/ui.json の
+//! 読み手も同じ [`LoadIssue::read_failed`] を通る（#2238）
 //!
 //! 理由の文字列は**ファイルの中身を含めない**（種類と行・列だけ）。serde の素の文言は型が違うと
 //! 読んだ値を引用するので、ファイルを読む口は JSON なら [`json_error_reason`]、YAML なら
@@ -39,6 +40,14 @@ pub enum LoadIssue {
 /// 既定値へ落とす = 呼び手の次の保存が元の中身を上書きする）
 pub fn legacy_2231() -> bool {
     std::env::var_os("TAKO_2231_LEGACY").is_some()
+}
+
+/// #2238 の A/B。`TAKO_2238_LEGACY=1` で settings.json / run-configs.json / claude-mod/ui.json の
+/// 読み手を修正前へ戻す（settings / run-configs は文字として読めない中身を退避せずに既定値へ
+/// 落とす = 次の保存が消す。ui.json は UTF-8 でない中身を 1 本目が空いているときだけ写す =
+/// 2 回目の中身が残らない）
+pub fn legacy_2238() -> bool {
+    std::env::var_os("TAKO_2238_LEGACY").is_some()
 }
 
 /// JSON を解釈できなかった理由を**中身を含めずに**言う（#1824）。
@@ -210,6 +219,23 @@ impl LoadIssue {
         Self::Unparsable {
             reason: json_reason(e),
             quarantine,
+        }
+    }
+
+    /// 落とした理由（中身を含まない。#2230）
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Unparsable { reason, .. } | Self::ReadFailed { reason, .. } => reason,
+        }
+    }
+
+    /// 退避の結果（退避できなければ `None`）。読み手が自分の形で記録・応答を組むのに使う
+    /// （型を組み直さずに読める口。#2238）
+    pub fn quarantine(&self) -> Option<&Quarantine> {
+        match self {
+            Self::Unparsable { quarantine, .. } | Self::ReadFailed { quarantine, .. } => {
+                quarantine.as_ref()
+            }
         }
     }
 }

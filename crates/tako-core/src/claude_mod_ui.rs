@@ -13,6 +13,8 @@
 //!   （[`UiError`]）。軽いモデルが叩いても、語彙の外の値はファイルへ届かない
 //! - **読めない・一部だけ壊れた ui.json**: 読める部分は使い、壊れた部分だけ既定へ落とす（[`parse_lenient`]）。
 //!   元の中身は `.unreadable.bak` へ保全する（#916 の機構 = [`crate::migration::quarantine_unreadable`]）。
+//!   文字として読めない中身（UTF-8 でない・権限で読めない）はバイトのまま番号付きの退避へ移す
+//!   （[`crate::load_issue::LoadIssue::read_failed`] = `migration::quarantine_raw`。#2238）。
 //!   新しい tako が書いた形（`schema_version` が大きい）は読める範囲で使い、**書き換えない**
 //! - **帯のトグルの正本**（S3 #1881 の `$.store` から移した）: `band.hidden` と `band.toggled_at`（epoch ms）。
 //!   mod の報告の `band.toggled_at` の方が新しければ取り込む（[`import_band`]）。mod へは応答の
@@ -2019,8 +2021,56 @@ pub struct Loaded {
 }
 
 /// 読む。壊れていれば読める部分を使い、**元の中身を `.unreadable.bak` へ保全する**（#916。
-/// 同じ中身なら写しを増やさない）。ファイルは書き換えない（書くのは変更の操作だけ）
+/// 同じ中身なら写しを増やさない）。解釈できない部分があるだけならファイルは書き換えない
+/// （書くのは変更の操作だけ）。
+///
+/// 文字として読めない中身（UTF-8 でない・権限で読めない）は文字列の退避口を通れないので、
+/// **バイトのまま番号付きの退避へ移して**既定で動く（`LoadIssue::read_failed` =
+/// `migration::quarantine_raw`。recent / shortcuts と同じ口。#2238）。以前は 1 本目が空いて
+/// いるときだけ写していたので、別の中身で 2 回目に壊れると次の変更の操作の書き込みが消していた
 pub fn load_from(path: &Path) -> Loaded {
+    if crate::load_issue::legacy_2238() {
+        return legacy_2238_load_from(path);
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => from_text(path, &text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded {
+            config: UiConfig::default(),
+            state: LoadState::Absent,
+        },
+        Err(e) => unreadable_bytes(path, &e),
+    }
+}
+
+/// 文字として読めなかった中身をバイトのまま移して既定で動く（#2238）
+fn unreadable_bytes(path: &Path, e: &std::io::Error) -> Loaded {
+    let quarantine = crate::load_issue::LoadIssue::read_failed(path, e)
+        .and_then(|issue| issue.quarantine().cloned());
+    let utf8 = e.kind() == std::io::ErrorKind::InvalidData;
+    let state = match quarantine {
+        // 移せなかった権限の誤りは従来どおり（移せないのは置き場へ書けないときで、
+        // そのときは変更の操作の書き込みも失敗する = 元は消えない）
+        None if !utf8 => LoadState::ReadError {
+            reason: e.kind().to_string(),
+        },
+        quarantine => LoadState::Repaired {
+            problems: vec![if utf8 {
+                "UTF-8 として読めない".into()
+            } else {
+                format!("読み取りに失敗（{}）", e.kind())
+            }],
+            quarantine,
+        },
+    };
+    Loaded {
+        config: UiConfig::default(),
+        state,
+    }
+}
+
+/// #2238 の修正前（`TAKO_2238_LEGACY=1`）: UTF-8 でない中身は 1 本目が空いているときだけ写す
+/// （2 回目に別の中身で壊れると写らない）。権限で読めないファイルは退避しない
+fn legacy_2238_load_from(path: &Path) -> Loaded {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2039,7 +2089,6 @@ pub fn load_from(path: &Path) -> Loaded {
         }
     };
     let Ok(text) = String::from_utf8(bytes) else {
-        // UTF-8 でない中身は文字列の退避口を通らないので、そのままの写しを 1 本目の置き場へ
         let slot = crate::migration::quarantine_slot_path(path, 1);
         if !slot.exists() {
             let _ = std::fs::copy(path, &slot);
@@ -2056,7 +2105,12 @@ pub fn load_from(path: &Path) -> Loaded {
             },
         };
     };
-    let parsed = parse_lenient(&text);
+    from_text(path, &text)
+}
+
+/// 文字として読めた中身を寛容に読む（壊れた部分があれば元を文字列の退避口へ写す）
+fn from_text(path: &Path, text: &str) -> Loaded {
+    let parsed = parse_lenient(text);
     if parsed.is_future() {
         return Loaded {
             config: parsed.config,
@@ -2699,6 +2753,104 @@ mod tests {
         let loaded = load_from(&raw);
         assert_eq!(loaded.state.code(), "repaired");
         assert!(crate::migration::quarantine_slot_path(&raw, 1).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2238: UTF-8 でない中身はバイトのまま番号付きの退避へ移す。別の中身の 2 回目も残り
+    /// （以前は 1 本目が既にあると写さず、変更の操作の書き込みが消していた）、同じ中身は積まない
+    #[test]
+    fn utf8でない中身はバイトのまま番号付きの退避へ移す() {
+        if crate::load_issue::legacy_2238() {
+            return;
+        }
+        let dir = tmp_dir("nonutf8");
+        assert!(dir.starts_with(std::env::temp_dir()), "一時 dir の中だけ");
+        let path = dir.join(FILENAME);
+        let slot = |n| crate::migration::quarantine_slot_path(&path, n);
+        let one: &[u8] = b"\xff\xfe MARK_ONE \xff";
+        let two: &[u8] = b"\xfe\xff MARK_TWO \x80";
+
+        std::fs::write(&path, one).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.config, UiConfig::default());
+        let LoadState::Repaired {
+            problems,
+            quarantine: Some(q),
+        } = &loaded.state
+        else {
+            panic!("{:?}", loaded.state)
+        };
+        assert_eq!(problems, &["UTF-8 として読めない".to_string()]);
+        assert_eq!(
+            (q.path.clone(), q.copied, q.evicted),
+            (slot(1), true, false)
+        );
+        assert!(!path.exists(), "表から外す（次の書き込みが消さない）");
+        assert_eq!(std::fs::read(slot(1)).unwrap(), one);
+
+        // 別の中身の 2 回目は変更の操作の中で移してから既定の形を書く
+        std::fs::write(&path, two).unwrap();
+        let up = update_at(&path, &[UiOp::Reset], 5).unwrap();
+        assert!(up.written);
+        assert_eq!(up.before.code(), "repaired");
+        assert_eq!(std::fs::read(slot(1)).unwrap(), one, "1 回目を上書きしない");
+        assert_eq!(std::fs::read(slot(2)).unwrap(), two);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            UiConfig::default().to_text()
+        );
+
+        // 同じ中身の 3 回目は積まない（元を外すだけ）
+        std::fs::write(&path, two).unwrap();
+        let loaded = load_from(&path);
+        let LoadState::Repaired {
+            quarantine: Some(q),
+            ..
+        } = &loaded.state
+        else {
+            panic!("{:?}", loaded.state)
+        };
+        assert_eq!((q.path.clone(), q.copied), (slot(2), false));
+        assert!(!slot(3).exists() && !path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2238: 権限で読めない ui.json も移す（以前は ReadError のまま変更の操作が上書きしていた）
+    #[cfg(unix)]
+    #[test]
+    fn 権限で読めない中身もバイトのまま移す() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::load_issue::legacy_2238() {
+            return;
+        }
+        let dir = tmp_dir("perm");
+        assert!(dir.starts_with(std::env::temp_dir()), "一時 dir の中だけ");
+        let path = dir.join(FILENAME);
+        std::fs::write(&path, "{\"schema_version\": 1}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // root では権限で読めなくならない
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let loaded = load_from(&path);
+        let LoadState::Repaired {
+            problems,
+            quarantine: Some(q),
+        } = &loaded.state
+        else {
+            panic!("{:?}", loaded.state)
+        };
+        assert_eq!(
+            problems,
+            &["読み取りに失敗（permission denied）".to_string()]
+        );
+        assert!(q.copied && !path.exists());
+        std::fs::set_permissions(&q.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&q.path).unwrap(),
+            "{\"schema_version\": 1}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

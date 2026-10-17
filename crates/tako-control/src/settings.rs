@@ -423,12 +423,30 @@ pub fn load() -> Settings {
         .unwrap_or_default()
 }
 
+/// 表示言語の設定だけを引く。**settings.json に触らない**（退避も記録もしない）。
+///
+/// [`load`] は文字として読めない settings.json を退避へ移す（#2238）。移行の様子を見せる口
+/// （`tako migrate` / `tako setup`）が言語を決めるためだけに [`load`] を呼ぶと、移行が見る前に
+/// ファイルが表から外れ、報告から settings.json が消える。読めなければ既定（system）
+pub fn peek_lang_setting() -> tako_core::i18n::LangSetting {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+        .map(|s| s.lang_setting())
+        .unwrap_or_default()
+}
+
 /// 指定パスから設定を読む（不在・破損は None）。
 ///
 /// **破損していたら既定値へ落とす前に退避する**（#916）。settings.json は
 /// theme_colors / theme_presets / runner_defaults のようにユーザーが手で書く
 /// 情報を持つのに、旧実装は破損を黙って既定値扱いし、直後の [`save`] が
-/// 元の内容を上書きして復元不能にしていた
+/// 元の内容を上書きして復元不能にしていた。
+///
+/// 文字として読めない中身（UTF-8 でない・権限で読めない）は文字列の退避口を通れないので、
+/// **バイトのまま番号付きの退避へ移して**から既定値へ落とす（`LoadIssue::read_failed` =
+/// `migration::quarantine_raw`。recent / shortcuts と同じ口。#2238）。以前は退避せずに落ち、
+/// 次の保存（`tako telemetry off` など）が元の中身を消していた
 pub fn load_from(path: &std::path::Path) -> Option<Settings> {
     load_and_report(path).0
 }
@@ -436,8 +454,9 @@ pub fn load_from(path: &std::path::Path) -> Option<Settings> {
 /// [`load_from`] の本体。破損を persist.log へ申告したら、その 1 行も返す
 /// （「実行中に何度壊れても毎回記録される」をテストが配線ごと確かめる口。#1819）
 fn load_and_report(path: &std::path::Path) -> (Option<Settings>, Option<String>) {
-    let Ok(json) = std::fs::read_to_string(path) else {
-        return (None, None);
+    let json = match std::fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(e) => return (None, report_read_failed(path, &e)),
     };
     match serde_json::from_str(&json) {
         Ok(settings) => {
@@ -452,11 +471,31 @@ fn load_and_report(path: &std::path::Path) -> (Option<Settings>, Option<String>)
             }
             // 理由は種類と行・列だけ（#2230。serde の素の文言は型が違うと設定の値を引用する）
             let reason = tako_core::load_issue::json_error_reason(&e);
-            let line = unreadable_line(path, &reason, quarantine.as_ref());
+            let line = unreadable_line(UNPARSABLE_HEAD, path, &reason, quarantine.as_ref());
             crate::diag::persist_log(&line);
             (None, Some(line))
         }
     }
+}
+
+/// 文字として読めなかった settings.json をバイトのまま退避へ移し、persist.log へ 1 行（#2238）。
+/// 不在は何もしない（既定値が正しい答え）。記録の規則は recent / shortcuts（`data_files`）と同じ:
+/// 移した回ごとに 1 行（元は表から外れるので同じ中身を読み直さない）・同じバイト列の退避が
+/// 既にあった回は書かない・移せなかったときはプロセス内で理由ごとに 1 回
+fn report_read_failed(path: &std::path::Path, e: &io::Error) -> Option<String> {
+    if tako_core::load_issue::legacy_2238() {
+        return None;
+    }
+    let issue = tako_core::load_issue::LoadIssue::read_failed(path, e)?;
+    match issue.quarantine() {
+        Some(q) if !q.copied => return None,
+        Some(_) => {}
+        None if !UNREADABLE_SEEN.first_sighting(path, issue.reason()) => return None,
+        None => {}
+    }
+    let line = unreadable_line(READ_FAILED_HEAD, path, issue.reason(), issue.quarantine());
+    crate::diag::persist_log(&line);
+    Some(line)
 }
 
 /// 破損の申告の重複除け（#1819）。**壊れた中身ごとに 1 回**申告する。
@@ -498,8 +537,14 @@ impl UnreadableSeen {
     }
 }
 
+/// 解釈できなかった settings.json の申告の頭
+const UNPARSABLE_HEAD: &str = "settings.json を解釈できないので既定値で動く";
+/// 文字として読めなかった（UTF-8 でない・権限で読めない）settings.json の申告の頭（#2238）
+const READ_FAILED_HEAD: &str = "settings.json を読めないので既定値で動く";
+
 /// 破損の申告の 1 行（退避先と、押し出しが起きたならその旨も載せる）
 fn unreadable_line(
+    head: &str,
     path: &std::path::Path,
     reason: &str,
     quarantine: Option<&tako_core::migration::Quarantine>,
@@ -513,10 +558,7 @@ fn unreadable_line(
         Some(q) => q.path.display().to_string(),
         None => "（退避できず）".to_string(),
     };
-    format!(
-        "settings.json を解釈できないので既定値で動く: {}（{reason}・退避 {where_to}）",
-        path.display()
-    )
+    format!("{head}: {}（{reason}・退避 {where_to}）", path.display())
 }
 
 /// 読めない色の上書きを無視した行の頭（起動時・読み直しで共通。#1756 / #1763）
@@ -688,6 +730,48 @@ mod tests {
             load_and_report(&path).1.is_some(),
             "直ってから壊れた回も申告する"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2238: 文字として読めない（UTF-8 でない）settings.json はバイトのまま番号付きの退避へ移し、
+    /// 呼び出し側の保存（load → 既定値 → save）が上書きしても中身が残る。別の中身の 2 回目も残り、
+    /// 同じ中身は積まない（申告もしない）
+    #[test]
+    fn utf8でない設定はバイトのまま退避へ移してから既定値になる() {
+        if tako_core::load_issue::legacy_2238() || tako_core::load_issue::legacy_2231() {
+            return;
+        }
+        let path = temp_path("nonutf8");
+        let dir = path.parent().expect("親がある").to_path_buf();
+        assert!(dir.starts_with(std::env::temp_dir()), "一時 dir の中だけ");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("作れる");
+        let slot = |n| tako_core::migration::quarantine_slot_path(&path, n);
+        let bodies: [&[u8]; 2] = [b"\xff\xfe{\"theme\": \"light\"}\xff", b"\xfe\xff MARK \x80"];
+        for (i, body) in bodies.iter().enumerate() {
+            std::fs::write(&path, body).expect("書ける");
+            let (loaded, line) = load_and_report(&path);
+            assert!(loaded.is_none(), "{} 回目: 読めないので None", i + 1);
+            let line = line.unwrap_or_else(|| panic!("{} 回目も申告する", i + 1));
+            assert!(line.starts_with(READ_FAILED_HEAD), "{line}");
+            assert!(line.contains(&slot(i + 1).display().to_string()), "{line}");
+            assert!(!line.contains("MARK"), "中身を載せない: {line}");
+            assert!(!path.exists(), "表から外す");
+            save_to(&path, &Settings::default()).expect("保存できる");
+            assert_eq!(std::fs::read(slot(i + 1)).expect("退避が読める"), *body);
+        }
+        assert_eq!(
+            std::fs::read(slot(1)).expect("読める"),
+            bodies[0],
+            "1 本目を上書きしない"
+        );
+        // 同じ中身の 3 回目は積まない・申告しない
+        std::fs::write(&path, bodies[1]).expect("書ける");
+        let (loaded, line) = load_and_report(&path);
+        assert!(loaded.is_none() && line.is_none(), "{line:?}");
+        assert!(!slot(3).exists() && !path.exists());
+        // 不在は申告しない
+        assert_eq!(load_and_report(&path).1, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
