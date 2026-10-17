@@ -49,7 +49,8 @@ pub const RESOLVE_TIMEOUT_ENV: &str = "TAKO_BIN_RESOLVE_TIMEOUT_SECS";
 /// 既知の場所の段を飛ばす注入（検証専用）
 pub const INJECT_ENV: &str = "TAKO_2151_INJECT";
 
-/// 渡される前に溜めておく知らせの上限（1 プロセスで解決するのは git と tmux の 2 つだけ）
+/// 渡される前に溜めておく知らせの上限（1 プロセスで解決するのは git と tmux の 2 つだけ。
+/// 実行ファイルの検出の打ち切り = #1533 も同じ口へ来るが、名前ごとに 1 回なので溜まっても数行）
 const PENDING_MAX: usize = 8;
 
 /// 解決の上限（env で上書き可。外すことはできない）
@@ -63,9 +64,15 @@ pub fn resolve_timeout() -> Duration {
 /// 打ち切りの知らせの受け口を渡す（tako-app / tako CLI の main から 1 回）。
 ///
 /// 受け口は persist.log へ 1 行書く関数（`diag::persist_log` 相当）。最初に渡されたものだけを使い、
-/// それまでに溜まっていた行はここで流す
+/// それまでに溜まっていた行はここで流す。実行ファイルの検出（`platform::exe::find`）の打ち切り
+/// （#1533）も同じ受け口へ流れる
 pub fn set_notice_sink(sink: fn(&str)) {
     NOTICES.install(sink);
+}
+
+/// tako-core の打ち切りの知らせを persist.log の受け口へ 1 行流す（受け口が来る前は溜める）
+pub(crate) fn notify(line: &str) {
+    NOTICES.emit(line);
 }
 
 /// どの段で決まったか

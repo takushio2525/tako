@@ -251,10 +251,17 @@ fn 孫がパイプを握ってもtailscaleの待ちは上限で返る() {
     );
 }
 
-/// **3**: `fn resolve` は tailscale を PATH より先に正本へ回し、正本の答えだけで決める
+/// **3**: `fn resolve` は tailscale を PATH より先に正本へ回し、正本の答えだけで決める。
+/// 判定の本体は #1533 で PATH の探索の打ち切りを運ぶ `fn resolve_bounded` へ移った（`resolve` はそこへ委ねる）
 #[test]
 fn 依存段のtailscaleは検出の正本を通る() {
-    let (resolve, base) = fn_body(SETUP_DEPS, "resolve");
+    let (outer, outer_base) = fn_body(SETUP_DEPS, "resolve");
+    assert!(
+        outer.contains("resolve_bounded(dep)"),
+        "{SETUP_DEPS}:{outer_base}: `fn resolve` が判定の本体 `resolve_bounded` へ委ねていない\
+         （検出と導入後の再確認が別の規則になる = #1499 / #1797）"
+    );
+    let (resolve, base) = fn_body(SETUP_DEPS, "resolve_bounded");
     let branch = resolve.find("resolve_tailscale()").unwrap_or_else(|| {
         panic!(
             "{SETUP_DEPS}:{base}: `fn resolve` が tailscale を `resolve_tailscale()` へ回していない。\n\
@@ -262,7 +269,7 @@ fn 依存段のtailscaleは検出の正本を通る() {
              `--yes` で brew 版まで入れる（2 系統の同居 = #1038。#1797）"
         )
     });
-    if let Some(path_lookup) = resolve.find("exe::find(") {
+    if let Some(path_lookup) = resolve.find("exe::find") {
         assert!(
             branch < path_lookup,
             "{SETUP_DEPS}:{}: `fn resolve` が tailscale の分岐より前に PATH を引いている（#1797）",

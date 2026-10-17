@@ -76,6 +76,16 @@
 //! （カーネルの中で止まった子は SIGKILL でも出てくるまで終わらない。`reap_in_background`）。
 //! 速いコマンドの待ちが伸びないよう、`try_wait` の間隔は 1ms から倍々で 20ms まで伸ばす。
 //! A/B は `issue1979_legacy`（`TAKO_1979_LEGACY=1`）の 1 か所
+//!
+//! ## ログインシェルに尋ねる待ち（Issue #1532 / #1533）
+//!
+//! 実行ファイルの検出（`platform::exe::find`）とログインシェルの PATH の読み取り
+//! （`platform::exe::login_shell_path`）は `$SHELL -l -c …` を起こす。rc（`.zprofile` など）が
+//! 入力を待つ・眠り続けると子が返らないので、上限は [`login_shell_timeout`]（既定
+//! [`DEFAULT_LOGIN_SHELL_TIMEOUT`]）。rc が起こした孫（`sleep` / `read` を待つ子）は直接の子を
+//! kill しても残るので、ログインシェルは**自分のプロセスグループ**で起こし、打ち切ったら
+//! グループごと畳む（[`group_output_with_timeout`]）。A/B は `issue1532_legacy`
+//! （`TAKO_1532_LEGACY=1`）の 1 か所
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -134,6 +144,18 @@ pub const DEFAULT_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 診断の認証確認の上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ（**0 は既定へ**）
 pub const AUTH_PROBE_TIMEOUT_ENV: &str = "TAKO_AUTH_PROBE_TIMEOUT_SECS";
+
+/// ログインシェルに 1 つ尋ねる（`command -v <名前>` / `printf %s "$PATH"`）1 回あたりの既定の上限
+/// （#1532 / #1533）。
+///
+/// 根拠（実測 2026-10-16・macOS・zsh。`bin_resolve` の冒頭と同じ表）: `zsh -l -c 'command -v git'` が
+/// 0.14〜0.16 秒、対話の rc まで読む `-l -i` でも 0.34〜0.35 秒（#1730）。5 秒はその 15 倍弱で、
+/// 同じ種類の問い合わせ（git / tmux の場所の解決 = `bin_resolve::DEFAULT_RESOLVE_TIMEOUT`、
+/// Code Runner の実行環境の検出 = [`DEFAULT_RUNTIME_PROBE_TIMEOUT`]）と揃える
+pub const DEFAULT_LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// ログインシェルの問い合わせの上限の上書き（秒）。扱いは [`PROBE_TIMEOUT_ENV`] と同じ（**0 は既定へ**）
+pub const LOGIN_SHELL_TIMEOUT_ENV: &str = "TAKO_LOGIN_SHELL_TIMEOUT_SECS";
 
 /// 打ち切りを知らせる 1 行の頭。CLI が出し、dispatch が拾う（**文面は 1 実装**）
 const NOTICE_HEAD: &str = "[確認できません] ";
@@ -310,6 +332,14 @@ pub fn auth_probe_timeout() -> Duration {
     parse_timeout_secs(
         std::env::var(AUTH_PROBE_TIMEOUT_ENV).ok().as_deref(),
         DEFAULT_AUTH_PROBE_TIMEOUT,
+    )
+}
+
+/// ログインシェルの問い合わせの上限（env で上書き可。外すことはできない。#1532 / #1533）
+pub fn login_shell_timeout() -> Duration {
+    parse_timeout_secs(
+        std::env::var(LOGIN_SHELL_TIMEOUT_ENV).ok().as_deref(),
+        DEFAULT_LOGIN_SHELL_TIMEOUT,
     )
 }
 
@@ -543,6 +573,21 @@ pub fn issue2255_legacy() -> bool {
     })
 }
 
+/// #1532 / #1533 の A/B（`TAKO_1532_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// ログインシェルに尋ねる問い合わせ（実行ファイルの検出 `platform::exe::find` の unix 実装・
+/// setup / 環境診断のログインシェルの PATH の読み取り）と check-health の `tako --version` を
+/// **上限なしで**待ち、打ち切りの知らせも「確認できない」の区別も出さない。**ゲートはこの 1 か所**で、
+/// tako-control / tako-app もここを読む
+pub fn issue1532_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1532_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。
@@ -613,6 +658,56 @@ pub fn command_output_with_timeout(
     }
 }
 
+/// **組み立て済みの** `Command` を**自分のプロセスグループで**起こし、上限つきで待つ（#1532 / #1533）。
+///
+/// ログインシェル（`$SHELL -l -c …`）のための口。rc が起こした孫（`sleep` / 入力を待つ `read` /
+/// パスフレーズを聞く `ssh-add`）は直接の子を kill しても残り、パイプの書き手として居座る。
+/// 打ち切ったら**グループごと** SIGKILL を送るので、孫も残らない。
+///
+/// グループを分けるので、rc が端末（`/dev/tty`）を読もうとするとバックグラウンドの読み取りとして
+/// 止められる（SIGTTIN）。利用者の打鍵を横取りせず、止まったまま上限で畳まれる。
+/// 普通に終わったときは何も畳まない（rc が意図して残す常駐 = `ssh-agent` 等は従来どおり残る）。
+/// Windows はグループを分けない（ログインシェルを起こさない）= [`command_output_with_timeout`] と同じ
+pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Duration) -> Outcome {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match command.spawn() {
+        // グループごと畳むのは待ちの 1 実装の打ち切りの kill（`kill_on_timeout`）が、
+        // 子がグループを率いていることを見て決める
+        Ok(child) => wait_with_timeout(child, label, budget),
+        Err(e) => Outcome::Failed {
+            label: label.to_string(),
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// 打ち切りの kill。子が**自分のプロセスグループを率いている**（[`group_output_with_timeout`] で
+/// 起こした）ならグループごと SIGKILL を送る（rc が起こした孫も残さない = #1532）。
+/// それ以外の子（親のグループに居る）は直接の子だけ（孫は残る = モジュール冒頭の「分かっている限界」）。
+///
+/// グループへ送るのは子がまだ刈り取られていないとき（`try_wait` が `None` を返した直後）だけなので、
+/// 番号が別のグループへ使い回されていることは無い
+fn kill_on_timeout(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: プロセスの属性を読み、負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
 /// 起こし済みの子を上限つきで待つ（**待ちの 1 実装**）。
 ///
 /// `stdout` / `stderr` がパイプなら吸い出す。呼び手が既に `take()` していても動く
@@ -651,7 +746,7 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
             }
             Ok(None) => {
                 if start.elapsed() >= budget {
-                    let _ = child.kill();
+                    kill_on_timeout(&mut child);
                     // 刈り取り（`wait`）は**ここで待たない**（#1979）。カーネルの中で止まった
                     // 子は SIGKILL を受けても出てくるまで終わらず、ここで `wait` すると
                     // 上限そのものが意味を失う。刈り取り係へ渡して呼び手には今すぐ返す

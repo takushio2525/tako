@@ -240,12 +240,30 @@ pub struct BootstrapState {
     /// 認証の問い合わせを上限で打ち切った（= 未認証ではなく**確かめられなかった**。#2255）。
     /// 上限を持つのは環境診断の経路（[`status_all_within`]）だけで、setup の経路は常に `None`
     pub auth_timeout: Option<tako_core::probe::TimeoutNotice>,
+    /// 実行ファイルの検出（ログインシェルの `command -v`）を上限で打ち切った（#1533）。
+    /// 立っていて `binary` が無ければ、未導入ではなく**導入済みかを確かめられなかった**
+    pub locate_timeout: Option<tako_core::probe::TimeoutNotice>,
+    /// ログインシェルの PATH の読み取りを上限で打ち切った（#1532）。
+    /// 立っていて `launcher_dir_on_path` が false なら、PATH に無いのではなく**確かめられなかった**
+    pub path_timeout: Option<tako_core::probe::TimeoutNotice>,
 }
 
 impl BootstrapState {
     /// この状態の段の 1 行説明（**自分の系統で**組む。#989）
     pub fn step_description(&self) -> String {
         self.step.describe_for(self.agent)
+    }
+
+    /// 段（未導入 / PATH に無い）がログインシェルの打ち切りのせいで決まっているときの知らせ
+    /// （#1532 / #1533）。`Some` なら、その段は**確かめられなかった**のであって事実ではない。
+    /// 呼び手はそれを「未導入」「PATH に無い」と言わず、導入や PATH の書き込みへ進まない。
+    /// 認証の打ち切り（[`Self::auth_timeout`]）は段の判定とは別に読む（#2255）
+    pub fn step_unconfirmed(&self) -> Option<&tako_core::probe::TimeoutNotice> {
+        match self.step {
+            Step::Install => self.locate_timeout.as_ref(),
+            Step::Path => self.path_timeout.as_ref().or(self.locate_timeout.as_ref()),
+            Step::Auth | Step::Ready => None,
+        }
     }
 
     pub fn to_json(&self) -> Value {
@@ -263,11 +281,18 @@ impl BootstrapState {
             "shell": self.shell.map(ShellKind::as_str),
             "next_step": self.step.as_str(),
             "next_step_description": self.step_description(),
+            // #1532 / #1533: 段がログインシェルの打ち切りで決まっている（null = 確かめた答え）
+            "next_step_unconfirmed": self.step_unconfirmed().map(timeout_json),
             "install_plan": self.plan.to_json(),
             "deps": deps_json(),
             "homebrew": homebrew_json(),
         })
     }
+}
+
+/// 打ち切りの知らせの JSON（環境診断の `probe_timeouts` と同じ形）
+fn timeout_json(notice: &tako_core::probe::TimeoutNotice) -> Value {
+    json!({ "label": notice.label, "waited_secs": notice.waited_secs })
 }
 
 /// ホームディレクトリ。**取得できない環境では何も書かない**
@@ -662,12 +687,15 @@ fn status_with(
     let home = home_dir()?;
     let r = recipe_for(agent);
     let plan = plan_from(&r, &home);
-    let binary = resolve_binary_for(agent);
+    // [`resolve_binary_for`] と同じ順（PATH → インストーラの置き場所）。PATH の探索の答えは
+    // PATH の判定でもう一度使う（同じ問い合わせのログインシェルを 2 度起こさない。#1533）
+    let found = tako_core::platform::exe::find_bounded(agent.as_str());
+    let binary = found.path.clone().or_else(|| installed_launcher_for(agent));
     // 認証とプランは 1 回の問い合わせから読む（#1505）
     let (auth, auth_timeout) = binary.as_deref().map(auth).unwrap_or_default();
     let authenticated = auth.authenticated;
     let launcher_dir = r.launcher_dir_in(&home);
-    let on_path = launcher_dir_on_path(agent, &launcher_dir);
+    let (on_path, path_timeout) = launcher_dir_on_path(&launcher_dir, &found);
     let (shell, profile) = shell_target();
     let profile_has_block = profile
         .as_deref()
@@ -696,6 +724,8 @@ fn status_with(
         step,
         plan,
         auth_timeout,
+        locate_timeout: found.timeout,
+        path_timeout,
     })
 }
 
@@ -791,27 +821,45 @@ pub fn status_all_json() -> Value {
 /// Windows は PATH をレジストリで持つので、そちらを直接見る（境界 B23）。
 ///
 /// unix は `exe::find` がログインシェルの `command -v` なので PATH の実態を
-/// そのまま反映する（`.app` の痩せた PATH 対策として必要）＝従来のまま
-fn launcher_dir_on_path(agent: AgentKind, dir: &Path) -> bool {
+/// そのまま反映する（`.app` の痩せた PATH 対策として必要）＝従来のまま。
+/// `found` は呼び手が済ませた PATH の探索（[`tako_core::platform::exe::find_bounded`]）の答えで、
+/// 同じ問い合わせのログインシェルをもう一度起こさないために受け取る（#1533）。
+///
+/// 戻り値の 2 つ目は、ログインシェルの PATH の読み取りを上限で打ち切った知らせ（#1532）。
+/// PATH の探索がいま打ち切られたなら PATH は読みに行かない（同じログインシェルへ尋ねても上限まで
+/// 待つだけ）。そのときの「確かめられなかった」は [`BootstrapState::step_unconfirmed`] が探索の
+/// 知らせから読む
+fn launcher_dir_on_path(
+    dir: &Path,
+    found: &tako_core::platform::exe::BoundedFind,
+) -> (bool, Option<tako_core::probe::TimeoutNotice>) {
     let path_var = std::env::var("PATH").unwrap_or_default();
     if user_path::is_supported() && !legacy_mode() {
-        return user_path::contains_entry(&path_var, dir)
+        let on_path = user_path::contains_entry(&path_var, dir)
             || user_path::read()
                 .map(|value| user_path::contains_entry(&value.raw, dir))
                 .unwrap_or(false);
+        return (on_path, None);
     }
-    shell_profile::path_contains(&path_var, dir)
-        || login_shell_sees(dir)
-        || tako_core::platform::exe::find(agent.as_str()).is_some()
+    // どれか 1 つで「在る」（判定の順は答えを変えない）。ログインシェルを起こす段を最後に置く
+    if shell_profile::path_contains(&path_var, dir) || found.path.is_some() {
+        return (true, None);
+    }
+    if found.timeout.is_some() {
+        return (false, None);
+    }
+    login_shell_sees(dir)
 }
 
-/// ログインシェルの PATH に `dir` が入っているか（`.app` の痩せた PATH 対策）
+/// ログインシェルの PATH に `dir` が入っているか（`.app` の痩せた PATH 対策）。
+/// 戻り値の 2 つ目は読み取りを上限で打ち切った知らせ（#1532。立っていたら false は「確かめられなかった」）
 ///
 /// # これは意図的に unix 専用（B21 へ機械的に寄せないこと）
 ///
-/// `$SHELL -l -c` を直に起こしているので、#877 が片付けている
-/// 「`$SHELL -l -c` の直書きの一族」に見える。**だが意図が違う**ので
-/// [`tako_core::platform::child_cmd::user_env_cli`]（境界 B21）へは寄せられない。
+/// ログインシェルを起こすので、#877 が片付けている「`$SHELL -l -c` の直書きの一族」に見える。
+/// **だが意図が違う**ので [`tako_core::platform::child_cmd::user_env_cli`]（境界 B21）へは寄せられない。
+/// 読み取りそのものは境界 B16 の [`tako_core::platform::exe::login_shell_path`]（上限つきの 1 実装。
+/// #1532）が持つ。
 ///
 /// | | 一族（agents 走査など） | ここ |
 /// |---|---|---|
@@ -819,57 +867,18 @@ fn launcher_dir_on_path(agent: AgentKind, dir: &Path) -> bool {
 /// | Windows の対応物 | PATH で解決した実体を直接起動 | **無い** |
 ///
 /// Windows の PATH は**レジストリ由来でシェル profile 由来ではない**ため、
-/// 「ログインシェルの PATH」という概念そのものが存在しない。`user_env_cli` は
-/// Windows 側に `program` / `args` を要求するが、ここには渡せるものが無い。
-///
-/// なので Windows は false を返して先に落とし、判定は
-/// [`tako_core::platform::exe::find`]（境界 B16。PATH + ユーザーが入れがちな場所を走査）と
-/// [`resolve_binary`]（インストーラの置き場所を直接見る）に任せる。
-/// **壊れている経路ではなく、Windows には要らない経路**。
-///
-/// 番犬（`agents走査がposixシェルの直起動へ戻っていない`）の走査範囲が
-/// `tako-control/src/orchestrator/` から広がってここが引っかかるようになったら、
-/// 寄せるのではなく**理由つきの許可**にするか、B21 側へ
-/// 「ログインシェルの PATH を読む」専用の口（Windows は `None`）を足すこと（#868 / #877）
-fn login_shell_sees(dir: &Path) -> bool {
-    login_shell_path().is_some_and(|path| shell_profile::path_contains(&path, dir))
+/// 「ログインシェルの PATH」という概念そのものが存在しない（`login_shell_path` は Windows で常に空）。
+/// 判定は [`tako_core::platform::exe::find`]（境界 B16。PATH + ユーザーが入れがちな場所を走査）と
+/// [`resolve_binary_for`]（インストーラの置き場所を直接見る）に任せる。
+/// **壊れている経路ではなく、Windows には要らない経路**（#868 / #877）
+fn login_shell_sees(dir: &Path) -> (bool, Option<tako_core::probe::TimeoutNotice>) {
+    let read = tako_core::platform::exe::login_shell_path();
+    let sees = read
+        .value
+        .as_deref()
+        .is_some_and(|path| shell_profile::path_contains(path, dir));
+    (sees, read.timeout)
 }
-
-/// ログインシェルの PATH そのもの（読めなければ `None`）。
-///
-/// [`login_shell_sees`] と**同じ 1 実装**。「入っているか」だけでなく値そのものが
-/// 要る場面（#1502 の「書くべきか」の判定）があるので、ここから分けてある
-fn login_shell_path() -> Option<String> {
-    if cfg!(windows) {
-        return None;
-    }
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
-    let output =
-        tako_core::platform::process::no_console_window(&mut std::process::Command::new(shell))
-            .args(["-l", "-c", "printf %s \"$PATH\""])
-            // **PATH を launchd の既定へ戻してから起こす**（#1502 の実測）。
-            // 継承したまま起こすと macOS の `/etc/zprofile` が呼ぶ `path_helper` が
-            // 親の PATH を引き継ぐので、答えが「新しいターミナルが見る PATH」ではなく
-            // 「この親の PATH」になる。tako のペインは #601 で CLI ディレクトリを
-            // 注入済みなので、そのまま測ると「もう通っている」と誤答して設置が丸ごと飛ぶ
-            .env("PATH", DEFAULT_LOGIN_PATH)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// 新しいターミナル（launchd → ログインシェル）が profile を読む**前**に持っている PATH。
-/// macOS / Linux の慣習値で、`/etc/zprofile` の `path_helper` はここから組み直す
-const DEFAULT_LOGIN_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 // --- インストール実行 ---
 
@@ -1205,7 +1214,7 @@ pub fn tako_cli_path_json() -> Value {
         .link
         .as_deref()
         .map(|link| tako_cli_path::link_state(link, &plan.source));
-    let on_path = dir_on_path(&plan.dir);
+    let (on_path, unconfirmed) = dir_on_path(&plan.dir);
     json!({
         "resolved": true,
         "dir": plan.dir.display().to_string(),
@@ -1217,26 +1226,33 @@ pub fn tako_cli_path_json() -> Value {
         // symlink を張らない形（Windows / 実体が置き場所そのものに居る）は null
         "link_state": state.as_ref().map(tako_cli_path::LinkState::as_str),
         "dir_on_path": on_path,
+        // #1532: ログインシェルの PATH の読み取りを上限で打ち切った（null = 確かめた答え）。
+        // 立っているときの `dir_on_path` はこのプロセスの PATH で代わりに答えたもの
+        "dir_on_path_unconfirmed": unconfirmed.as_ref().map(timeout_json),
         // 外部ターミナルから `tako` が打てるか（= PATH に在り、その場所の tako が使える）
         "usable": on_path && state.as_ref().map(|s| s.usable()).unwrap_or(true),
     })
 }
 
-/// `dir` が「新しく開いたターミナルが見る PATH」に在るか（OS 差は既存の判定を使う）
-fn dir_on_path(dir: &Path) -> bool {
+/// `dir` が「新しく開いたターミナルが見る PATH」に在るか（OS 差は既存の判定を使う）。
+/// 戻り値の 2 つ目はログインシェルの PATH の読み取りを上限で打ち切った知らせ（#1532）
+fn dir_on_path(dir: &Path) -> (bool, Option<tako_core::probe::TimeoutNotice>) {
     if user_path::is_supported() {
         let path_var = std::env::var("PATH").unwrap_or_default();
-        return user_path::contains_entry(&path_var, dir)
+        let on_path = user_path::contains_entry(&path_var, dir)
             || user_path::read()
                 .map(|value| user_path::contains_entry(&value.raw, dir))
                 .unwrap_or(false);
+        return (on_path, None);
     }
     // **ログインシェルが見るか**を優先して答える（外部ターミナルの話をしているので、
     // いま走っているプロセスの PATH は答えにならない）。読めないときだけ自分の PATH へ戻す
-    match login_shell_path() {
+    let read = tako_core::platform::exe::login_shell_path();
+    let on_path = match read.value {
         Some(path) => shell_profile::path_contains(&path, dir),
         None => shell_profile::path_contains(&std::env::var("PATH").unwrap_or_default(), dir),
-    }
+    };
+    (on_path, read.timeout)
 }
 
 /// tako CLI を外部ターミナルから打てるようにする（冪等。FR-2.14.5 / #1502）。
@@ -1323,6 +1339,17 @@ pub fn tako_cli_path_check_line() -> String {
         );
     }
     let dir = state["dir_display"].as_str().unwrap_or("?");
+    // ログインシェルの PATH を上限内に読めなかった（#1532）。このプロセスの PATH で代わりに答えた
+    // 「使える / 入っていない」を言うと外部ターミナルの話にならないので、確かめられないと言う
+    // （リンクが切れているのは PATH と関係なく確かな不足なので、下の理由へ進む）
+    if let Some(secs) = state["dir_on_path_unconfirmed"]["waited_secs"].as_u64() {
+        if state["link_state"].as_str() != Some("dangling") {
+            return format!(
+                "  [警告] tako CLI の PATH: 確認できません（ログインシェルが {secs} 秒で応答なし）\n\
+                 \x20        .zprofile などが入力を待っていないか確かめてください"
+            );
+        }
+    }
     if state["usable"].as_bool().unwrap_or(false) {
         return format!("  [OK] tako CLI の PATH: 外部ターミナルからも使えます（{dir}）");
     }
@@ -1368,13 +1395,21 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, String> {
     // 「書かなくてよいか」は**新しく開いたターミナルが見る PATH**で判定する（#1502）。
     // プロセスの PATH は親から受け継いだだけで、ログインシェルが同じとは限らない
     // （tako 内のペインは #601 で CLI ディレクトリを注入済み / `.app` は逆に痩せている）。
-    // ログインシェルを起こせない環境（`$SHELL` が壊れている等）はプロセスの PATH へ戻す
-    let path_var = login_shell_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-    let outcome = shell_profile::ensure_dirs_on_path_in(home, shell, dirs, Some(&path_var))?;
+    // ログインシェルを起こせない環境（`$SHELL` が壊れている等）はプロセスの PATH へ戻す。
+    // 上限で打ち切った（#1532）ときは PATH を判定に使わない = 目印のブロックの有無だけで決める
+    // （冪等。プロセスの PATH へ戻すと、#601 で注入済みの tako のペインでは「もう通っている」と誤答する）
+    let read = tako_core::platform::exe::login_shell_path();
+    let path_var = match (&read.value, &read.timeout) {
+        (Some(path), _) => Some(path.clone()),
+        (None, Some(_)) => None,
+        (None, None) => Some(std::env::var("PATH").unwrap_or_default()),
+    };
+    let outcome = shell_profile::ensure_dirs_on_path_in(home, shell, dirs, path_var.as_deref())?;
     // 実際にログインシェルから引けるようになったかを**確かめてから**返す。
-    // 「書いたはず」で終わらせない（.zshrc へ書いて届かなかった類の失敗を検出する）
+    // 「書いたはず」で終わらせない（.zshrc へ書いて届かなかった類の失敗を検出する）。
+    // 読み取りが打ち切られたなら尋ね直さない（同じログインシェルを上限まで待つだけ）
     let verified = outcome.change == PathChange::AlreadyOnPath
-        || outcome.dirs.iter().all(|d| login_shell_sees(d));
+        || (read.timeout.is_none() && outcome.dirs.iter().all(|d| login_shell_sees(d).0));
     Ok(json!({
         "shell": shell.as_str(),
         "profile": outcome.profile.display().to_string(),
@@ -1384,6 +1419,8 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, String> {
         "change": outcome.change.as_str(),
         "wrote": outcome.change.wrote(),
         "verified": verified,
+        // #1532: ログインシェルの PATH の読み取りを上限で打ち切った（`verified` は確かめていない）
+        "login_shell_timeout": read.timeout.as_ref().map(timeout_json),
     }))
 }
 

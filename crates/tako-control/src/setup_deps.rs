@@ -191,6 +191,10 @@ pub struct DepStatus {
     /// `exe::find` はログインシェルを起こすので、依存ごとに何度も引くと
     /// `tako setup` が目に見えて遅くなる。表示・判断・実行が同じ値を見る）
     installer_found: Option<String>,
+    /// 検出（ログインシェルの `command -v`）を上限で打ち切った（#1533）。
+    /// 立っていて `found` が無ければ、未導入ではなく**導入済みかを確かめられなかった**
+    /// = 導入へは進まない（入っているかもしれないものを `--yes` で入れ直さない）
+    pub lookup_timeout: Option<tako_core::probe::TimeoutNotice>,
 }
 
 impl DepStatus {
@@ -209,6 +213,28 @@ impl DepStatus {
                 .installer_path()
                 .and_then(|program| installer.and_then(|i| install_dir(i, program))),
             "hint": self.dep.hint,
+            // #1533: 検出を上限で打ち切った（null = 確かめた答え。立っていて found が null なら不明）
+            "lookup_timeout": self.unconfirmed().map(|n| json!({
+                "label": n.label,
+                "waited_secs": n.waited_secs,
+            })),
+        })
+    }
+
+    /// 見つからないのが検出の打ち切りのせい（= 確かめられなかった）ならその知らせ（#1533）
+    pub fn unconfirmed(&self) -> Option<&tako_core::probe::TimeoutNotice> {
+        self.lookup_timeout
+            .as_ref()
+            .filter(|_| self.found.is_none())
+    }
+
+    /// 打ち切りのときに人へ出す 1 句（`tako setup` / `--check` / `tako remote setup` が同じ文面を出す）
+    pub fn unconfirmed_text(&self) -> Option<String> {
+        self.unconfirmed().map(|n| {
+            format!(
+                "{}: 確認できません（ログインシェルが {} 秒で応答なし）",
+                self.dep.bin, n.waited_secs
+            )
         })
     }
 
@@ -359,14 +385,21 @@ fn resolve_container() -> Option<String> {
 /// tailscale は PATH を見ない（#1797）。答えは remote と同じ検出の正本
 /// （[`resolve_tailscale`]）だけから出す
 pub fn resolve(dep: &ExternalDep) -> Option<String> {
+    resolve_bounded(dep).0
+}
+
+/// [`resolve`] の、PATH の探索の打ち切り（#1533）を呼び手まで運ぶ版。
+/// 器（tmux / psmux）は PATH で見つからなくても tako が実際に使う器の答えへ落ちる
+/// （打ち切っても、器の解決 = `bin_resolve` が答えたなら見つかったことにする）
+fn resolve_bounded(dep: &ExternalDep) -> (Option<String>, Option<tako_core::probe::TimeoutNotice>) {
     if is_tailscale(dep) {
-        return resolve_tailscale();
+        return (resolve_tailscale(), None);
     }
-    let found = tako_core::platform::exe::find(dep.bin);
-    if found.is_some() || !is_container(dep) {
-        return found;
+    let found = tako_core::platform::exe::find_bounded(dep.bin);
+    if found.path.is_some() || !is_container(dep) {
+        return (found.path, found.timeout);
     }
-    resolve_container()
+    (resolve_container(), found.timeout)
 }
 
 /// tailscale は **remote が使う検出**（`tailscale::detect_tailscale`）の答えを返す（#1797）。
@@ -398,7 +431,11 @@ fn display_path(path: String) -> String {
 
 /// 依存の検出（読み取りだけ）
 pub fn status() -> Vec<DepStatus> {
-    current_deps().into_iter().map(probe).collect()
+    let mut installers = InstallerMemo::default();
+    current_deps()
+        .into_iter()
+        .map(|dep| probe(dep, &mut installers))
+        .collect()
 }
 
 /// 依存 1 件だけを検出する（#1509）。
@@ -408,19 +445,44 @@ pub fn status() -> Vec<DepStatus> {
 /// （`tako remote setup` は tailscale しか見ない）はこちらを通す。
 /// 名前がこの環境の依存表に無ければ `None`（推測で作らない）
 pub fn status_of(bin: &str) -> Option<DepStatus> {
-    current_deps().into_iter().find(|d| d.bin == bin).map(probe)
+    current_deps()
+        .into_iter()
+        .find(|d| d.bin == bin)
+        .map(|dep| probe(dep, &mut InstallerMemo::default()))
 }
 
-/// 依存 1 件の検出（`status` / `status_of` が共有する 1 実装）
-fn probe(dep: ExternalDep) -> DepStatus {
-    let found = resolve(&dep);
+/// 1 回の検出の中で引いた導入器（`brew` 等）の場所。依存が同じ導入器を使うので、
+/// unix でログインシェルを依存の数だけ起こさない（固まる rc では 1 回ごとに上限まで待つ = #1533）
+#[derive(Default)]
+struct InstallerMemo(Vec<(&'static str, Option<String>)>);
+
+impl InstallerMemo {
+    fn find(&mut self, program: &'static str) -> Option<String> {
+        if let Some((_, found)) = self.0.iter().find(|(p, _)| *p == program) {
+            return found.clone();
+        }
+        let found = tako_core::platform::exe::find(program);
+        self.0.push((program, found.clone()));
+        found
+    }
+}
+
+/// 依存 1 件の検出（`status` / `status_of` が共有する 1 実装）。
+///
+/// 検出を上限で打ち切った依存は導入へ進まないので、導入器も引かない（同じログインシェルを
+/// もう一度上限まで待つだけ = #1533）
+fn probe(dep: ExternalDep, installers: &mut InstallerMemo) -> DepStatus {
+    let (found, lookup_timeout) = resolve_bounded(&dep);
+    let unconfirmed = found.is_none() && lookup_timeout.is_some();
     let installer_found = dep
         .installer
-        .and_then(|i| tako_core::platform::exe::find(i.program()));
+        .filter(|_| !unconfirmed)
+        .and_then(|i| installers.find(i.program()));
     DepStatus {
         dep,
         found,
         installer_found,
+        lookup_timeout,
     }
 }
 
@@ -477,6 +539,17 @@ pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, Stri
                 "bin": state.dep.bin,
                 "reason": "already_installed",
                 "detail": format!("{} は導入済みです（{path}）", state.dep.bin),
+            }));
+            continue;
+        }
+        // 導入済みかを確かめられなかった（#1533）。入っているかもしれないものを入れ直さない
+        if let Some(text) = state.unconfirmed_text() {
+            skipped.push(json!({
+                "bin": state.dep.bin,
+                "reason": "unconfirmed",
+                "detail": format!(
+                    "{text}。.zprofile などが入力を待っていないか確かめてから、もう一度実行してください"
+                ),
             }));
             continue;
         }
@@ -684,6 +757,15 @@ pub fn offer_and_install(
     io: &mut DepPromptIo<'_>,
 ) -> Result<DepOutcome, String> {
     let dep = state.dep;
+    // 導入済みかを確かめられなかった（#1533）。「見つかりません」「インストールしますか」とは言わない
+    if let Some(text) = state.unconfirmed_text() {
+        say(io, &text)?;
+        say(
+            io,
+            ".zprofile などのログインシェルの設定が入力を待っていないか確かめてください（入れずに進みます）",
+        )?;
+        return Ok(DepOutcome::NotInstalled);
+    }
     match offer_for(state.can_tako_install(), ctx) {
         DepOffer::Guide(GuideReason::CannotRun) => {
             say(io, &manual_hint_line(state))?;
@@ -944,6 +1026,7 @@ mod tests {
             },
             found: None,
             installer_found: installer_found.map(str::to_string),
+            lookup_timeout: None,
         }
     }
 
@@ -971,6 +1054,37 @@ mod tests {
             stdin_is_terminal: true,
             legacy: false,
         }
+    }
+
+    /// #1533: 検出を上限で打ち切った依存は、`--yes` でも導入へ進まず「確認できません」と言う
+    /// （入っているかもしれないものを入れ直さない）。JSON も打ち切りを載せる
+    #[test]
+    fn 検出を確かめられなかった依存は導入へ進まない() {
+        let brew = DepInstaller::Brew { pkg: "tailscale" };
+        let mut state = fake_status(Some(brew), Some("/opt/homebrew/bin/brew"));
+        state.lookup_timeout = Some(tako_core::probe::TimeoutNotice {
+            label: tako_core::probe::label("zsh", &["-l", "-c", "command -v tailscale"]),
+            waited_secs: 5,
+        });
+        let yes = DepOfferContext {
+            assume_yes: true,
+            ..ask_ctx()
+        };
+        let (outcome, text) = run_offer(&state, yes, "");
+        assert!(matches!(outcome, DepOutcome::NotInstalled), "{text}");
+        assert!(
+            text.contains("tailscale: 確認できません（ログインシェルが 5 秒で応答なし）"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("インストールします") && !text.contains("インストールしますか"),
+            "確かめられないのに導入へ進んだ: {text}"
+        );
+        assert_eq!(state.to_json()["lookup_timeout"]["waited_secs"], 5);
+        // 見つかっていれば打ち切りの知らせがあっても「確認できない」ではない
+        state.found = Some("/opt/homebrew/bin/tailscale".into());
+        assert!(state.unconfirmed().is_none());
+        assert!(state.to_json()["lookup_timeout"].is_null());
     }
 
     /// 聞く前に「何を・どの導入器で・どこへ」を出す

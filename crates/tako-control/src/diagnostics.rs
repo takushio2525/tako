@@ -253,6 +253,19 @@ pub fn collect() -> Report {
             .iter()
             .filter_map(|(_, state)| state.as_ref().ok()?.auth_timeout.clone()),
     );
+    // #1532 / #1533: ログインシェル（実行ファイルの検出・PATH の読み取り）の打ち切りも載せる。
+    // PATH の読み取りは 3 系統とも同じ問い合わせなので、同じ名札は 1 件にまとめる
+    for (_, state) in bootstrap.iter() {
+        let Ok(state) = state else { continue };
+        for notice in [&state.locate_timeout, &state.path_timeout]
+            .into_iter()
+            .flatten()
+        {
+            if !probe_timeouts.contains(notice) {
+                probe_timeouts.push(notice.clone());
+            }
+        }
+    }
     items.extend(agent_cli_items(&bootstrap));
     items.push(tako_cli_path_item());
     items.push(shell_integration_item());
@@ -300,6 +313,25 @@ fn auth_step_unknown(state: &crate::setup_bootstrap::BootstrapState) -> Option<S
         .flatten()
 }
 
+/// 段が「確かめられなかった」せいで決まっているときの 1 句。認証（#2255）に加えて、
+/// ログインシェルの打ち切り（実行ファイルの検出 = #1533・PATH の読み取り = #1532）で
+/// 「未導入」「PATH に無い」に見えている段も**不明**と言い分ける（導入や PATH の設定へ人を送らない）
+fn step_unknown(state: &crate::setup_bootstrap::BootstrapState) -> Option<String> {
+    use crate::setup_bootstrap::Step;
+    if let Some(notice) = state.step_unconfirmed() {
+        let what = if state.step == Step::Install {
+            "導入"
+        } else {
+            "PATH"
+        };
+        return Some(format!(
+            "{what}: 不明（ログインシェルが {} 秒で応答なし）",
+            notice.waited_secs
+        ));
+    }
+    auth_step_unknown(state)
+}
+
 /// 導入・PATH・ログインの段（`tako setup bootstrap status-all` と同じ材料）
 fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
     use crate::setup_bootstrap::Step;
@@ -309,12 +341,12 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
         .filter(|(_, state)| state.as_ref().is_ok_and(|s| s.step == Step::Ready))
         .map(|(agent, _)| agent.as_str())
         .collect();
-    // ready が無く、認証を確かめられなかった系統がある（#2255）。使えるかどうか分からないので
-    // 「使える系統がありません」とも、導入やログインへの道とも言わない
+    // ready が無く、認証（#2255）・導入・PATH（#1532 / #1533）を確かめられなかった系統がある。
+    // 使えるかどうか分からないので「使える系統がありません」とも、導入やログインへの道とも言わない
     let unknown: Vec<String> = states
         .iter()
         .filter_map(|(agent, state)| {
-            let text = auth_step_unknown(state.as_ref().ok()?)?;
+            let text = step_unknown(state.as_ref().ok()?)?;
             Some(format!("{} の{text}", agent.as_str()))
         })
         .collect();
@@ -362,8 +394,9 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
                 format!("{}: 完了", agent.as_str()),
                 &format!("         [OK] {}: 完了", agent.as_str()),
             ),
-            Ok(state) => match auth_step_unknown(state) {
-                // 確かめられなかった（#2255）。「ログイン未完了」と言うと人をログインへ送ってしまう
+            Ok(state) => match step_unknown(state) {
+                // 確かめられなかった（#2255 / #1532 / #1533）。「ログイン未完了」「未導入」と言うと
+                // 人をログインや導入へ送ってしまう
                 Some(text) => Item::from_text(
                     key,
                     Status::Warn,
@@ -428,6 +461,37 @@ fn agents_detected_item(states: &BootstrapStates) -> Item {
         .filter_map(|(agent, state)| state.as_ref().ok().map(|s| (*agent, s)))
         .filter(|(_, state)| state.binary.is_some())
         .collect();
+    // 実行ファイルの検出を上限で打ち切った系統（#1533）。見つからなかったのではなく確かめられなかった
+    let unconfirmed: Vec<(AgentKind, u64)> = states
+        .iter()
+        .filter_map(|(agent, state)| {
+            let state = state.as_ref().ok()?;
+            let notice = state.locate_timeout.as_ref()?;
+            state
+                .binary
+                .is_none()
+                .then_some((*agent, notice.waited_secs))
+        })
+        .collect();
+    if detected.is_empty() && !unconfirmed.is_empty() {
+        let names: Vec<&str> = unconfirmed.iter().map(|(a, _)| a.as_str()).collect();
+        let secs = unconfirmed
+            .iter()
+            .map(|(_, s)| *s)
+            .max()
+            .unwrap_or_default();
+        let text = format!(
+            "{} を確かめられません（ログインシェルが {secs} 秒で応答なし）",
+            names.join(" / ")
+        );
+        return Item::from_text(
+            "agents_detected",
+            Status::Warn,
+            text.clone(),
+            &format!("  エージェント CLI:\n    [警告] {text}"),
+        )
+        .line("      .zprofile などのログインシェルの設定が入力を待っていないか確かめてください");
+    }
     if detected.is_empty() {
         let mut item = Item::from_text(
             "agents_detected",
@@ -464,6 +528,12 @@ fn agents_detected_item(states: &BootstrapStates) -> Item {
             format!("{auth} / {plan}")
         });
         item = item.line(format!("    [検出] {}: {path}（{auth}）", agent.as_str()));
+    }
+    for (agent, secs) in unconfirmed {
+        item = item.line(format!(
+            "    [警告] {}: 確かめられません（ログインシェルが {secs} 秒で応答なし）",
+            agent.as_str()
+        ));
     }
     item
 }
@@ -566,6 +636,12 @@ fn dep_items() -> Vec<Item> {
             if let Some(path) = &state.found {
                 return Item::new(key, Status::Ok, format!("{}: {path}", dep.bin));
             }
+            // 検出を上限で打ち切った（#1533）。「見つかりません」とも導入の案内とも言わない
+            if let Some(text) = state.unconfirmed_text() {
+                return Item::new(key, Status::Warn, text).line(
+                    "      .zprofile などのログインシェルの設定が入力を待っていないか確かめてください",
+                );
+            }
             let (mark, kind) = if dep.required {
                 (Status::Missing, "必須")
             } else {
@@ -666,8 +742,11 @@ fn mcp_items(states: &BootstrapStates) -> (Vec<Item>, Vec<tako_core::probe::Time
     if installed(AgentKind::Claude) {
         // 打ち切りの知らせも受け取る（#1503。確認できなかったことを黙らせない）
         let (registered, healthy, notice) = crate::agent_mcp::claude_health_now();
-        timeouts.extend(notice);
         let key = "mcp.claude";
+        // 問い合わせ（実行ファイルの検出 = #1533 / `claude mcp list` = #1503）を打ち切って
+        // 登録を読めなかった。未登録ではなく確かめられなかったので、登録し直しへ人を送らない
+        let unconfirmed = notice.clone().filter(|_| !registered);
+        timeouts.extend(notice);
         let item = if registered && healthy {
             Item::new(key, Status::Ok, "Claude MCP: tako が登録済み")
         } else if registered {
@@ -680,6 +759,15 @@ fn mcp_items(states: &BootstrapStates) -> (Vec<Item>, Vec<tako_core::probe::Time
                 item = item.line(format!("         登録パス: {cmd}"));
             }
             item.line("         tako setup または tako setup-mcp で修復できます")
+        } else if let Some(n) = &unconfirmed {
+            Item::new(
+                key,
+                Status::Warn,
+                format!(
+                    "Claude MCP: 登録状態を確認できません（{} が {} 秒で応答なし）",
+                    n.label, n.waited_secs
+                ),
+            )
         } else {
             Item::new(
                 key,
@@ -687,7 +775,7 @@ fn mcp_items(states: &BootstrapStates) -> (Vec<Item>, Vec<tako_core::probe::Time
                 "Claude MCP: tako が未登録（tako setup-mcp で登録できます）",
             )
         };
-        items.push(if registered && healthy {
+        items.push(if (registered && healthy) || unconfirmed.is_some() {
             item
         } else {
             item.remaining(Remaining::new(RemainingKind::Mcp {
@@ -1315,6 +1403,16 @@ mod tests {
                 ),
                 waited_secs,
             }),
+            locate_timeout: None,
+            path_timeout: None,
+        }
+    }
+
+    /// ログインシェルの打ち切りの知らせ（名札は実行ファイル名と引数だけ = #927）
+    fn login_shell_notice(script: &str, waited_secs: u64) -> tako_core::probe::TimeoutNotice {
+        tako_core::probe::TimeoutNotice {
+            label: tako_core::probe::label("zsh", &["-l", "-c", script]),
+            waited_secs,
         }
     }
 
@@ -1435,5 +1533,77 @@ mod tests {
         let detected = line_of(&agents_detected_item(&states));
         assert!(detected.contains("codex: /opt/fake/bin/codex（認証: 不明（3 秒で応答なし））"));
         assert!(detected.contains("agy: /opt/fake/bin/agy（認証: 不明（3 秒で応答なし））"));
+    }
+
+    /// #1533: 実行ファイルの検出（ログインシェル）を打ち切った系統は「未導入」と言わず、導入の残り作業も積まない
+    #[test]
+    fn 検出を確かめられなかった系統は未導入と言わない() {
+        use crate::setup_bootstrap::Step;
+        let mut claude = bootstrap_state(AgentKind::Claude, Step::Install, false, None);
+        claude.binary = None;
+        claude.locate_timeout = Some(login_shell_notice("command -v claude", 5));
+        let states = vec![(AgentKind::Claude, Ok(claude))];
+        let items = agent_cli_items(&states);
+        assert_eq!(items[0].status, Status::Warn, "{:?}", items[0]);
+        assert!(
+            items[0]
+                .summary
+                .contains("claude の導入: 不明（ログインシェルが 5 秒で応答なし）"),
+            "{}",
+            items[0].summary
+        );
+        assert!(
+            items[0].remaining.is_empty(),
+            "確かめられないのに導入を残り作業にした: {:?}",
+            items[0].remaining
+        );
+        assert_eq!(
+            line_of(&items[1]),
+            "         [警告] claude: 導入: 不明（ログインシェルが 5 秒で応答なし）"
+        );
+        let detected = agents_detected_item(&states);
+        assert_eq!(detected.status, Status::Warn, "{detected:?}");
+        assert!(
+            detected.remaining.is_empty(),
+            "確かめられないのに「エージェント CLI が無い」を残り作業にした"
+        );
+        assert!(
+            line_of(&detected)
+                .contains("[警告] claude を確かめられません（ログインシェルが 5 秒で応答なし）"),
+            "{}",
+            line_of(&detected)
+        );
+        assert!(!line_of(&detected).contains("いずれも見つかりません"));
+    }
+
+    /// #1532: ログインシェルの PATH の読み取りを打ち切った系統は「PATH に無い」と言わない。
+    /// 検出で打ち切って PATH を読みに行かなかったときも同じ（検出の知らせから読む）
+    #[test]
+    fn pathを確かめられなかった系統はpathに無いと言わない() {
+        use crate::setup_bootstrap::Step;
+        let mut read_timeout = bootstrap_state(AgentKind::Claude, Step::Path, false, None);
+        read_timeout.path_timeout = Some(login_shell_notice("printf %s \"$PATH\"", 2));
+        let mut locate_timeout = bootstrap_state(AgentKind::Codex, Step::Path, false, None);
+        locate_timeout.locate_timeout = Some(login_shell_notice("command -v codex", 2));
+        let states = vec![
+            (AgentKind::Claude, Ok(read_timeout)),
+            (AgentKind::Codex, Ok(locate_timeout)),
+        ];
+        let items = agent_cli_items(&states);
+        assert_eq!(items[0].status, Status::Warn, "{:?}", items[0]);
+        for (i, agent) in [(1, "claude"), (2, "codex")] {
+            assert_eq!(
+                line_of(&items[i]),
+                format!("         [警告] {agent}: PATH: 不明（ログインシェルが 2 秒で応答なし）")
+            );
+        }
+        // 打ち切っていない Path の段は今まで通り不足（回帰なし）
+        let plain = vec![(
+            AgentKind::Claude,
+            Ok(bootstrap_state(AgentKind::Claude, Step::Path, false, None)),
+        )];
+        let items = agent_cli_items(&plain);
+        assert_eq!(items[1].status, Status::Missing);
+        assert!(line_of(&items[1]).contains("(path)"));
     }
 }
