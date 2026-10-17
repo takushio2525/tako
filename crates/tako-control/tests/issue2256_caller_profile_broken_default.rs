@@ -451,11 +451,87 @@ fn adopt(variant: Variant) {
     } else {
         assert_eq!(w, None, "{variant:?}: {v:#}");
     }
+    // 断る経路（master の系統が食い違う）でも、比べた相手が既定だったことを理由に添える
+    // （断る理由そのものが組み込み既定との比較の結果でありうる。修正前は黙って断った）
+    std::fs::write(case.profiles().join("p2256x.yaml"), "master_agent: codex\n").expect("採用先");
+    let mut other = Host::new();
+    other.set_root_role("orchestrator-master");
+    let root = other.root();
+    let err = dispatch(
+        &mut other,
+        Request::OrchestratorAdopt {
+            name: "p2256x".into(),
+            pane: Some(root),
+            caller_role: Some("master".into()),
+            caller_pid: None,
+        },
+    )
+    .expect_err("系統が食い違う相手は断る");
+    assert!(err.contains("系統が食い違う"), "{err}");
+    assert_eq!(
+        err.contains("組み込み既定と比べて採用を判断した"),
+        variant.warns(),
+        "{variant:?}: 断る理由に読めない理由が添わない / 余計に添う: {err}"
+    );
     case.assert_quarantine(false);
     assert!(
         case.log_lines("").is_empty(),
         "判定の経路が persist.log を埋めている"
     );
+}
+
+/// ①' 専用プロファイル（`master:<key>`）が読めないときの spawn も同じ読み込みで黙らない
+/// （default が読めても・無くても。修正前の A/B だけ黙る）。中身は退避する
+fn spawn_named(variant: Variant) {
+    let case = Case::new(variant);
+    let named = case.profiles().join("pnamed.yaml");
+    std::fs::write(&named, BROKEN).expect("pnamed.yaml");
+    let mut host = Host::new();
+    host.set_root_role("orchestrator-master:pnamed");
+    let root = host.root();
+    let v = dispatch(
+        &mut host,
+        Request::OrchestratorSpawn {
+            project: PROJECT.into(),
+            prompt: "2256".into(),
+            label: None,
+            model: None,
+            effort: None,
+            pane: Some(root),
+            tab: None,
+            caller_role: Some("master:pnamed".into()),
+            agent: None,
+            caller_pid: None,
+            task_type: None,
+            account: None,
+            limit_resume: None,
+        },
+    )
+    .unwrap_or_else(|e| {
+        panic!("{variant:?}: 専用プロファイルが読めなくても spawn は止めない: {e}")
+    });
+    let found = v["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["kind"] == "profile_unreadable")
+        .and_then(|w| w["message"].as_str().map(str::to_string));
+    let quarantine = case.profiles().join("pnamed.yaml.unreadable.bak");
+    if variant.legacy() {
+        assert_eq!(found, None, "修正前の再現になっていない: {v:#}");
+        assert!(!quarantine.exists(), "修正前は退避しない");
+    } else {
+        let w = found.unwrap_or_else(|| panic!("{variant:?}: 専用プロファイルで黙っている: {v:#}"));
+        assert!(
+            w.contains(&named.display().to_string()) && w.contains("'pnamed'"),
+            "どのプロファイルかを言っていない: {w}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&quarantine).expect("退避がある"),
+            BROKEN
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&named).expect("元が残る"), BROKEN);
 }
 
 /// ④ guide（表示）: 既定値で答えるが warnings へ。local-rules は「無い」ではなく「読めない」
@@ -607,8 +683,9 @@ fn issue2256_壊れたdefaultでspawn_解消_adopt_guide_自動復帰が黙ら�
 
     // 経路ごとに結果を集める（1 経路の失敗で残りを見ずに終わらない = 修正前に戻すと
     // 5 経路それぞれが黙ることを 1 回の実行で名指しできる）
-    let paths: [Path2256; 5] = [
+    let paths: [Path2256; 6] = [
         ("spawn", spawn),
+        ("spawn_named", spawn_named),
         ("git_resolve", git_resolve),
         ("adopt", adopt),
         ("guide", guide),
