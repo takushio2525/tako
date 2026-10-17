@@ -316,6 +316,12 @@ jobs:
       # 夜間が 1 日おきに入れ替わる・独自のコミットのある main を動かす形へ戻ったらここで落ちる**（#2262）
       - name: 夜間の共有ツリーの main の追従のモックテスト
         run: /bin/bash scripts/test-nightly-restore-main-2262.sh
+      # リリースする役の夜間が、ブランチ main のまま古い共有ツリーを毎晩 origin/main へ追従させるモックテスト。
+      # origin は一時ディレクトリの bare リポ、release.sh・検査の 2 つ・cargo・gh は代役、HOME も隔離するので本番には
+      # 触らない。**誰も pull しない常駐機で夜間・検査の手順が更新されない・検査だけの PC の共有ツリーを動かす・
+      # 独自のコミットのある main を動かす形へ戻ったらここで落ちる**（#2264）
+      - name: 夜間の共有ツリーの main の毎晩の追従のモックテスト
+        run: /bin/bash scripts/test-nightly-follow-main-2264.sh
       # 夜間リリースの PATH（先頭 ~/.cargo/bin に順番待ちを知らない古い tako）でも、run_heavy と
       # build-app.sh のリリースビルドが順番待ちを通るモックテスト。tako・cargo は代役で、
       # .app の置き場も偽物へ差し替えるので本物の tako・順番待ち・ビルドには触らない。

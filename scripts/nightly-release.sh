@@ -20,6 +20,9 @@
 #
 # 動作（1 回の実行）:
 #   1. 多重起動ロック（~/.claude-orchestrator/locks/）を取得。取れなければ即終了
+#   1.4 共有ツリーの main を origin/main へ fast-forward で追従させる（#2262 / #2264）: 旧版が残した
+#      detached を main へ戻した夜は役に依らず、リリースする役（全部 = 既定）では毎晩。検査だけの役は
+#      戻した夜だけ（誰も pull しない常駐機でも夜間・検査の手順の修正が届くようにする）
 #   1.5 tako mod の検査（#1892）: origin/main の mod を `claude plugin validate --strict` /
 #      `claude plugin test` にかけ、落ちたら通知する。**リリースの有無に依らず毎晩**回し、
 #      **結果でリリースを止めない**（理由は run_mod_check の注記。claude が無ければ未実測）
@@ -61,7 +64,9 @@
 #   という 2 つの実害があった（2026-09-04 の v0.8.5 が実例）。
 #   旧版が残した detached は main へ戻し、その main が origin/main より古ければ fast-forward で
 #   追従させる（#2262）。戻すだけだと翌夜の launchd が古い main の夜間を読み、旧版と新版が
-#   1 日おきに入れ替わる（旧 Mac の実例）。独自のコミットがある main は動かさず WARN と通知
+#   1 日おきに入れ替わる（旧 Mac の実例）。独自のコミットがある main は動かさず WARN と通知。
+#   リリースする役では戻した夜以外も毎晩追従させる（#2264。追従しないと常駐機の main が戻した夜の
+#   版で止まる）。どちらも HEAD はブランチ main のまま・コミットを作らない・捨てない
 #
 # 次回バージョンの予約（#1005）:
 #   節目のリリース（minor / major の繰り上げ）を夜間発火に乗せるための仕組み。
@@ -419,6 +424,8 @@ HELD_LOCKS=()
 WORKTREE=""
 WORKTREE_PARENT=""
 HEAD_REF_AT_START=""
+# 共有ツリーの main の追従を、この実行で判断し終えたか（#2262 の戻した夜 / #2264 の毎晩で 1 度だけ）
+MAIN_FOLLOW_TRIED=0
 # ロックを取った（= この実行が夜間の本体になった）後だけ 1 にする。多重起動で抜ける・dry-run・
 # シグナルで中止した実行からは見張りを回さない（#2023）
 FOOTPRINT_WATCH_ARMED=0
@@ -562,7 +569,11 @@ acquire_lock "$LOCK_DIR" "HOME 単位" || tako_exit 0
 #   - main のコミットを書き換えも捨てもしない（独自のコミットがあれば触らず WARN と通知）
 #   - 共有ツリーにコミットを作らない（未 push のリリースコミットを残す経路を作らない）
 # A/B は TAKO_2262_LEGACY=1（追従しない = 修正前。launchd の env には入らない）
+# 引数 dry は動かさずに「追従させるか」だけをログへ出す（毎晩の追従を --dry-run で見るとき。#2264）
 follow_origin_main() {
+  local mode="${1:-apply}"
+  # 1 回の実行で 1 度だけ判断する（戻した夜は毎晩の追従 = #2264 で同じ判断と fetch を繰り返さない）
+  MAIN_FOLLOW_TRIED=1
   [[ "${TAKO_2262_LEGACY:-0}" == 1 ]] && return 0
   local behind ahead before after err
   # 比べる先は最新の origin/main。取れなければ手元の origin/main と比べて続ける
@@ -581,8 +592,12 @@ follow_origin_main() {
     notify "main が古いまま: 独自のコミット ${ahead} 件があるので追従させない"
     return 0
   fi
+  if [[ "$mode" == dry ]]; then
+    log "DRY-RUN: main は origin/main より ${behind} コミット古い。夜間なら fast-forward で追従させる（--dry-run なので動かさない。#2264）"
+    return 0
+  fi
   before=$(git -C "$REPO_ROOT" rev-parse --short main)
-  # 作業ツリーの tracked の変更は無い（戻す前に clean を確かめてある）。untracked が上書きされる
+  # 作業ツリーの tracked の変更は無い（呼ぶ前に clean を確かめてある）。untracked が上書きされる
   # ときだけ git が断る。そのときは古い main のまま続ける（今夜のリリースは使い捨ての worktree）
   if err=$(git -C "$REPO_ROOT" merge --ff-only --quiet refs/remotes/origin/main 2>&1); then
     after=$(git -C "$REPO_ROOT" rev-parse --short main)
@@ -614,6 +629,41 @@ restore_detached_head() {
   return 0
 }
 restore_detached_head
+
+# ---- 共有ツリーの main を毎晩 origin/main へ追従させる（#2264。リリースする役だけ）------
+# #2262 は戻した夜だけ追従させていた。共有ツリーを誰も pull しない常駐機（旧 Mac）では、その後の
+# 共有ツリーの main が戻した夜の origin/main で止まり、launchd が読む nightly-release.sh・scripts/lib と、
+# 共有ツリーから呼ぶ mod の検査・footprint の見張りの手順が二度と更新されない（#2262 の交互が固定に
+# 変わるだけ）。そこでリリースする役（全部 = 既定）の夜間は、共有ツリーがブランチ main・clean のとき毎晩
+# follow_origin_main を通す（fast-forward できるときだけ。独自のコミット・untracked の上書きは触らず
+# WARN と通知）。mod の検査より前に置くので、その夜の検査から新しい手順で回る。
+#   - 検査だけの役（--role check）は追従させない: その PC は master が pull するので古くならず、5:00 に
+#     共有ツリーが書き換わって master のビルドと混ざる余地も避ける。#2262 の「戻した夜の追従」は #1136 の
+#     残骸の後始末なので役に依らず行う（戻すだけだと翌夜は古い main の夜間 = --role を知らない版が走りうる）
+#   - dirty（人の作業中。後段の SKIP が知らせる）・main 以外のブランチ・detached は触らない
+#   - --dry-run は動かさず、追従させるかどうかだけをログへ出す
+# A/B は TAKO_2264_LEGACY=1（戻した夜だけ追従 = 修正前。launchd の env には入らない）
+follow_main_nightly() {
+  [[ "$NIGHTLY_ROLE" == full ]] || return 0
+  [[ "${TAKO_2264_LEGACY:-0}" == 1 ]] && return 0
+  [[ "$MAIN_FOLLOW_TRIED" == 1 ]] && return 0
+  local branch
+  branch=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+  if [[ "$branch" != main ]]; then
+    if [[ -n "$branch" ]]; then
+      log "共有ツリーはブランチ ${branch}（main ではない）なので main の追従はしない（#2264）"
+    fi
+    return 0
+  fi
+  [[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no)" ]] || return 0
+  if [[ $DRY_RUN -eq 1 ]]; then
+    follow_origin_main dry
+  else
+    follow_origin_main
+  fi
+  return 0
+}
+follow_main_nightly
 HEAD_REF_AT_START=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
 
 # ---- tako mod の検査（#1892）------------------------------------------------

@@ -129,10 +129,23 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
   #1136 の理由を守るため: HEAD はブランチ main のまま・main のコミットを書き換えも捨てもしない・共有ツリーにコミットを
   作らない。main に origin/main に無いコミットがある（分岐）・untracked が上書きされるので ff できないときは触らず
   WARN と通知（今夜のリリースは止めない）。fetch できなければ手元の origin/main まで追従し、`--dry-run` でも戻すので
-  追従もする。追従するのは戻した夜だけで、ブランチ main のまま古くなった共有ツリーは動かさない（誰も pull しない
-  常駐機で夜間・検査のスクリプトが更新されない件は #2264）。モックは
-  `/bin/bash scripts/test-nightly-restore-main-2262.sh`（CI の macOS ジョブ。A/B は `TAKO_2262_LEGACY=1`、
-  修正前の版に当てるときは `NIGHTLY_UNDER_TEST=<file>`）
+  追従もする。モックは `/bin/bash scripts/test-nightly-restore-main-2262.sh`（CI の macOS ジョブ。A/B は
+  `TAKO_2262_LEGACY=1`、修正前の版に当てるときは `NIGHTLY_UNDER_TEST=<file>`）
+- **リリースする役は毎晩 main を追従させる（#2264）**: 戻した夜だけだと、共有ツリーを誰も pull しない常駐機（旧 Mac）では
+  その後の main が戻した夜の origin/main で止まり、launchd が読む nightly-release.sh・`scripts/lib/` と、共有ツリーから呼ぶ
+  mod の検査・footprint の見張りの手順が二度と更新されない（交互が固定に変わるだけ）。そこで**全部の役（既定）の夜間は、
+  共有ツリーがブランチ main・clean のとき毎晩**同じ判断（fast-forward できるときだけ・独自のコミット / untracked の上書きは
+  触らず WARN と通知）を通す。mod の検査より前に置くので、その夜の検査から新しい手順で回る
+  - **検査だけの役（`--role check`）は追従させない**（共有ツリーの HEAD も作業ツリーも動かさない）。その PC は master が
+    pull するので古くならず、5:00 に共有ツリーが書き換わって master のビルドと混ざる余地も避ける。ただし旧版が残した
+    detached を戻した夜の追従（#2262）は #1136 の後始末なので役に依らず行う（戻すだけだと翌夜は古い main の夜間 =
+    `--role` を知らない版が走り、検査だけの PC がリリースしうる）
+  - dirty（人の作業中。後段の SKIP が知らせる）・main 以外のブランチ（ログに 1 行）・detached は触らない。
+    戻した夜は判断と fetch を 1 度だけにする。`--dry-run` は動かさず「夜間なら追従させる」とだけ出す
+  - 1 台の利用者（役を設定しない = 全部）では、共有ツリーがブランチ main・clean のとき毎朝 `git pull --ff-only` と
+    同じことが起きる（人の作業中 = dirty・別ブランチ・独自のコミットには触らない）
+  - モックは `/bin/bash scripts/test-nightly-follow-main-2264.sh`（CI の macOS ジョブ。A/B は `TAKO_2264_LEGACY=1`、
+    修正前の版に当てるときは `NIGHTLY_UNDER_TEST=<file>`。古い版と新しい版は検査の代役の版 v1 / v2 で見分ける）
 - **中のビルドは順番待ち（#1994）を通る**: `build-app.sh` のリリースビルドは `scripts/lib/queue.sh` の
   `run_heavy` を通り、env の `TAKO_QUEUE_PRIORITY=low` / `TAKO_QUEUE_MAX_WAIT=3h` で人や worker の後ろへ並ぶ
   （3 時間で諦めた `tako queue` は 75 で返り、その夜のリリースは失敗として通知される）。launchd の PATH は先頭が
@@ -307,8 +320,8 @@ push の直前に「ビルド中に origin/main が進んだ」（= 旧 Mac が 
 
 | 役 | 設定 | 回るもの |
 |---|---|---|
-| 全部（既定） | 何もしない | 変更検知 → 版数 → ビルド → push → タグ → GitHub Release と、mod の検査・footprint の見張り |
-| 検査だけ | `scripts/nightly-release.sh --role check` | mod の検査（#1892）と footprint の見張り（#2023）だけ |
+| 全部（既定） | 何もしない | 変更検知 → 版数 → ビルド → push → タグ → GitHub Release と、mod の検査・footprint の見張り。共有ツリーの main を毎晩 origin/main へ追従させる（#2264） |
+| 検査だけ | `scripts/nightly-release.sh --role check` | mod の検査（#1892）と footprint の見張り（#2023）だけ。共有ツリーは動かさない |
 
 - **ゼロコンフィグ**: 役を設定しない 1 台の利用者は今までどおり全部やる（夜間のログも変わらない）。
   確認は引数なしの `--role`、既定へ戻すのは `--role full`（状態ファイルを消す = 何も設定していない 1 台と同じ）
@@ -348,6 +361,9 @@ push の直前に「ビルド中に origin/main が進んだ」（= 旧 Mac が 
     「戻した main は origin/main へ追従させる」）。旧 Mac には修正が origin/main に入れば自力で届く: 古い版の夜は共有ツリーを
     最新の origin/main（修正入り）のリリースのコミットで detach し、翌夜の新しい版が main へ戻して追従させる（2〜3 晩で揃う）。
     旧 Mac の main に独自のコミットがあるとそこで WARN と通知が出て止まるので、そのときだけ管轄の master と調整する
+  - 戻した夜の後も古くならないよう、リリースする役（旧 Mac）は毎晩追従させる（#2264）。ただし毎晩の追従は**走る夜間の版に
+    入っていて初めて効く**: 戻した夜に揃う main（その夜の origin/main）に #2264 が入っていなければ、旧 Mac はその版で
+    止まる（その版は毎晩の追従を持たない）。そうなったら人が旧 Mac の main を揃える（管轄の master と調整）
 
 ## 安定版への昇格（#403 / #1853 / #1592）
 
