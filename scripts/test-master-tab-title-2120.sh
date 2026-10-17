@@ -168,7 +168,7 @@ LAUNCH_LOG="$TMP/launch-last.log"
 LAUNCH_ENV=""
 launch_master() {
   env $LAUNCH_ENV "$TAKO_BIN" master "$@" --tab > "$LAUNCH_LOG" 2>&1 || { cat "$LAUNCH_LOG"; return 1; }
-  grep -o 'ペイン [0-9]*' "$LAUNCH_LOG" | head -1 | grep -o '[0-9]*'
+  grep -o 'ペイン [0-9]*' "$LAUNCH_LOG" | sed -n 1p | grep -o '[0-9]*'
 }
 
 start_gui() {

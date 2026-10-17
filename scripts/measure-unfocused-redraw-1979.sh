@@ -101,7 +101,8 @@ run_arm() {
   r1="$("$TAKO_BIN" redraw-limit | python3 -c 'import json,sys; d=json.load(sys.stdin)["flushes"]; print(d["focused"] + d["unfocused"])')"
   b1="$("$TAKO_BIN" redraw-limit | python3 -c 'import json,sys; print(json.load(sys.stdin)["body_renders"])')"
   drawable="描画可能"
-  "$REPO_ROOT/scripts/lib/virtual-display.sh" status 2>/dev/null | head -1 | grep -q '眠っている' && drawable="眠っていた"
+  vd_status="$("$REPO_ROOT/scripts/lib/virtual-display.sh" status 2>/dev/null)" \
+    && [[ "$(sed -n 1p <<<"$vd_status")" == *"眠っている"* ]] && drawable="眠っていた"
   kill "$caff" 2>/dev/null
   python3 -c "
 cpu = ($c1 - $c0) / $SECS * 100

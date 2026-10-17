@@ -143,7 +143,7 @@ check "$([ "$(readlink "$ISO_HOME/.local/bin/tako")" = "$ISO_TAKO" ] && echo 1 |
 found=$(login_shell 'command -v tako')
 check "$([ "$found" = "$ISO_HOME/.local/bin/tako" ] && echo 1 || echo 0)" \
       "B7 新しいログインシェルで tako が見つかる（${found}）"
-check "$(login_shell 'tako --version' | grep -q '^tako ' && echo 1 || echo 0)" \
+check "$(v="$(login_shell 'tako --version')" && grep -q '^tako ' <<<"$v" && echo 1 || echo 0)" \
       "B8 そこから実際に tako が動く"
 # 実体のディレクトリ（同居物ごと）を PATH へ出していない = #1502 の設計の芯
 check "$(grep -q "$APP_MACOS" "$ISO_HOME/.zprofile" && echo 0 || echo 1)" \

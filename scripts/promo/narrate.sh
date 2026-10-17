@@ -45,7 +45,7 @@ VV_SPEAKER=${TAKO_PROMO_VV_SPEAKER:-3}
 
 case "$TTS" in
 say)
-    say -v '?' | grep -q "^${VOICE} " || {
+    voices="$(say -v '?')" && grep -q "^${VOICE} " <<<"$voices" || {
         echo "ERROR: 音声 ${VOICE} が無い（say -v '?' で確認）" >&2; exit 1; }
     backend_desc="macOS say -v ${VOICE} -r ${RATE}"
     ;;
@@ -79,7 +79,7 @@ normalize_to_wav() {
     ffmpeg -nostdin -v error -y -i "$raw" \
         -af "adelay=250|250,apad=pad_dur=0.2" -ar 48000 -ac 2 "$flat"
     measured=$(ffmpeg -nostdin -hide_banner -i "$flat" -af volumedetect -f null - 2>&1 \
-        | sed -n 's/.*max_volume: \(-*[0-9.]*\) dB.*/\1/p' | head -1)
+        | sed -n 's/.*max_volume: \(-*[0-9.]*\) dB.*/\1/p' | sed -n 1p)
     [ -n "$measured" ] || { echo "ERROR: ${flat} のピークを測れない" >&2; return 1; }
     delta=$(/usr/bin/python3 -c "print(f'{${PEAK_DB} - (${measured}):.2f}')")
     ffmpeg -nostdin -v error -y -i "$flat" -af "volume=${delta}dB" "$wav"

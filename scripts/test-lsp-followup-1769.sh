@@ -153,7 +153,7 @@ echo "== ① サーバの解決のキャッシュ（1 回目 / 2 回目 / 合図
 # 最初のプロンプトの cwd の知らせ（OSC 7）も「PATH が変わりうる出来事」として数えるので、
 # プロンプトが出て落ち着いてから測る（途中で出ると 2 回目が正しく引き直してしまう）
 for _ in $(seq 1 100); do
-  "$TAKO_BIN" read --pane "$ROOT" 2>/dev/null | grep -q 'tako ' && break
+  screen="$("$TAKO_BIN" read --pane "$ROOT" 2>/dev/null)" && grep -q 'tako ' <<<"$screen" && break
   sleep 0.1
 done
 sleep 1

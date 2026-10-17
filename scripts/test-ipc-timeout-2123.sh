@@ -222,7 +222,8 @@ TAKO_QUEUE_SOCKET="$SOCK" TAKO_QUEUE_INJECT="$INJECT" "$TAKO" queue serve 2>>"$T
 ARB_PID=$!
 up=no
 for i in $(seq 1 50); do
-  if TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue --json 2>/dev/null | grep -q '"arbiter": true'; then up=yes; break; fi
+  if st="$(TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue --json 2>/dev/null)" \
+    && grep -q '"arbiter": true' <<<"$st"; then up=yes; break; fi
   sleep 0.1
 done
 [ "$up" = yes ] || { echo "  調停役が立たない（$TMP/arb.log）"; exit 1; }

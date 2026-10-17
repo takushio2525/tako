@@ -89,7 +89,7 @@ PANE="$("$TAKO_BIN" list | python3 -c 'import json,sys; d=json.load(sys.stdin); 
 echo "  ペイン: $PANE"
 # シェルのプロンプトが出るまで待つ
 for _ in $(seq 1 100); do
-  "$TAKO_BIN" read --pane "$PANE" 2>/dev/null | grep -q '%' && break
+  screen="$("$TAKO_BIN" read --pane "$PANE" 2>/dev/null)" && grep -q '%' <<<"$screen" && break
   sleep 0.2
 done
 "$TAKO_BIN" send --pane "$PANE" "PATH=$TMP/bin:\$PATH cargo 600 &" >/dev/null

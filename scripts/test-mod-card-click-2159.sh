@@ -228,7 +228,7 @@ reporting() { [ "$(row_field "$1" '.state')" = reporting ]; }
 not_reporting() { [ "$(row_field "$1" '.state')" != reporting ]; }
 mod_dir() { mod_json | jq -r '.plugin_dir'; }
 read_pane() { tk read --pane "$1" 2>/dev/null; }
-screen_has() { read_pane "$1" | grep -q -- "$2"; }
+screen_has() { local screen; screen="$(read_pane "$1")" && grep -q -- "$2" <<<"$screen"; }
 cards_json() { tk show-command --list --pane "$1" 2>/dev/null; }
 card_owner() { cards_json "$1" | jq -r --argjson c "$2" '.cards[] | select(.id == $c) | "\(.owner.drawn_by)/\(.owner.reason)"'; }
 owner_is() { [ "$(card_owner "$1" "$2")" = "$3" ]; }

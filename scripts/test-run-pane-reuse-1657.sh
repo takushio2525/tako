@@ -218,7 +218,7 @@ if [ -n "$SESSIONS" ]; then
   N=0
   for s in $SESSIONS; do
     N=$((N + 1))
-    if tmux -L "$TMUX_SOCKET" capture-pane -p -t "$s" 2>/dev/null | grep -q '__TAKO_EXIT='; then
+    if screen="$(tmux -L "$TMUX_SOCKET" capture-pane -p -t "$s" 2>/dev/null)" && grep -q '__TAKO_EXIT=' <<<"$screen"; then
       LEAK=$((LEAK + 1))
     fi
   done

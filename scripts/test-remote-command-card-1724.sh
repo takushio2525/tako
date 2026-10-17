@@ -301,7 +301,7 @@ check_eq "同じタブに 1 枚増える" "$((BEFORE + 1))" "$(tab_panes)"
 check_eq "フォーカスは動かない（手元のペインに触らない）" "$FOCUS_BEFORE" "$(focused_pane)"
 SAW=""
 for _ in $(seq 1 150); do
-  if "$TAKO_BIN" read --pane "$RUN_PANE" 2>/dev/null | grep -q "^$MARKER"; then SAW=1; break; fi
+  if screen="$("$TAKO_BIN" read --pane "$RUN_PANE" 2>/dev/null)" && grep -q "^$MARKER" <<<"$screen"; then SAW=1; break; fi
   sleep 0.2
 done
 check_eq "実行ペインの画面にコマンドの出力が出る" "1" "$SAW"

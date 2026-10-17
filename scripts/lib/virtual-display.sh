@@ -447,7 +447,7 @@ vd_cleanup_gate() {
 # 枝番付きも同名として拾う（増えていても座標は読める = 検証は続けられる）
 vd_row() {
     local row
-    row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
+    row=$(vd_screens | vd_rows_named "$VD_NAME" | sed -n 1p)
     [ -n "$row" ] || return 1
     printf '%s\n' "$row" | awk -F'\t' '{print $2, $3, $4, $5}'
 }
@@ -456,7 +456,7 @@ vd_row() {
 # NSScreen に居る かつ CoreGraphics から描画可能（= GPUI に見える）なら 0
 vd_row_drawable() {
     local row did
-    row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
+    row=$(vd_screens | vd_rows_named "$VD_NAME" | sed -n 1p)
     [ -n "$row" ] || return 1
     did=$(printf '%s\n' "$row" | awk -F'\t' '{print $6}')
     vd_drawable | vd_id_drawable "$did"
@@ -503,9 +503,9 @@ vd_backend_ready() {
         echo "   BetterDisplay を起動します（仮想ディスプレイの器）"
         open -g -a "$VD_BD_APP" || return 1
     fi
-    local i
+    local i ids
     for i in $(seq 1 30); do
-        vd_bd get -identifiers | grep -q deviceType && return 0
+        ids="$(vd_bd get -identifiers)" && grep -q deviceType <<<"$ids" && return 0
         sleep 1
     done
     vd_err "BetterDisplay の CLI が応答しない（メニューバーにアイコンが出ているか確認）"
@@ -585,7 +585,7 @@ vd_ensure_drawable() {
 vd_record_uuid() {
     local f row did uuid tmp
     f=$(vd_record_file) || return 0
-    row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
+    row=$(vd_screens | vd_rows_named "$VD_NAME" | sed -n 1p)
     [ -n "$row" ] || return 0
     did=$(printf '%s\n' "$row" | awk -F'\t' '{print $6}')
     uuid=$(vd_display_uuid "$did" | tr '[:upper:]' '[:lower:]')
@@ -609,7 +609,7 @@ vd_record_uuid() {
 vd_record_note() {
     local rec row did cur
     rec=$(vd_recorded_uuid 2>/dev/null) || { echo "なし（ensure で残る）"; return 0; }
-    row=$(vd_screens | vd_rows_named "$VD_NAME" | head -1)
+    row=$(vd_screens | vd_rows_named "$VD_NAME" | sed -n 1p)
     did=$(printf '%s\n' "$row" | awk -F'\t' '{print $6}')
     cur=$(vd_display_uuid "$did" 2>/dev/null | tr '[:upper:]' '[:lower:]')
     if [ -z "$cur" ]; then
@@ -824,7 +824,8 @@ vd_tako_window_env() {
 
 # その pid が tako の窓を持つプロセスか（AX で触らせないための判定。#1442）
 vd_is_tako_process() {
-    ps -p "$1" -o comm= 2>/dev/null | grep -qi 'tako'
+    local comm
+    comm="$(ps -p "$1" -o comm= 2>/dev/null)" && grep -qi 'tako' <<<"$comm"
 }
 
 # 窓を仮想ディスプレイへ移す（System Events の AX 経由。GPUI の窓にも効く = 実測）。

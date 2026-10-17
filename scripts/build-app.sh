@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 REPO_ROOT=$PWD
 DIST="$REPO_ROOT/dist"
 APP="$DIST/tako.app"
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | sed -n 1p)
 
 # Launch Services の登録は共有ライブラリに集約する（Issue #837。実測値と不変条件は
 # scripts/lib/launch-services.sh の冒頭コメントが正）。release.sh も同じものを使う
@@ -296,7 +296,9 @@ if [[ $VERIFY -eq 1 ]]; then
   echo "==> バンドル版セルフテスト（TAKO_* 注入 / IPC / MCP を含む全項目）"
   # セルフテストはペイン内から実 tako CLI（同梱版が exe 隣に居る）を叩く e2e を含む。
   # cargo build を内部で呼ぶためリポジトリ内から実行すること
-  if TAKO_SELF_TEST=1 "$APP/Contents/MacOS/tako-app" | grep -q "TAKO_APP_SELF_TEST_OK"; then
+  # 出力は受け取ってから探す（パイプの grep -q が先に抜けると、OK を出したのに pipefail で失敗になる。#2272）
+  if self_test_out="$(TAKO_SELF_TEST=1 "$APP/Contents/MacOS/tako-app")" \
+    && grep -q "TAKO_APP_SELF_TEST_OK" <<<"$self_test_out"; then
     echo "==> セルフテスト OK"
   else
     echo "エラー: バンドル版セルフテストが失敗" >&2

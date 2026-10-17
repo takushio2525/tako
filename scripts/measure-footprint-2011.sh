@@ -168,15 +168,19 @@ make_tabs() {
 # 中身: 3000 行（日本語を含む）を流してスクロールバックへ積む。最後の行の印で入ったかを確かめる
 fill() { "$TAKO_BIN" send --pane "$1" "seq -f '%g tako 計測用の行 lorem ipsum dolor sit amet' 1 3000; echo FP-DONE" >/dev/null 2>&1; }
 filled_count() {
-  local n=0 p
+  local n=0 p screen
   for p in $ALL_TERMS; do
-    "$TAKO_BIN" read --pane "$p" 2>/dev/null | grep -q '^FP-DONE' && n=$((n + 1))
+    screen="$("$TAKO_BIN" read --pane "$p" 2>/dev/null)" && grep -q '^FP-DONE' <<<"$screen" && n=$((n + 1))
   done
   echo "$n"
 }
-lid_state() { ioreg -r -k AppleClamshellState -d 1 2>/dev/null | grep -q '"AppleClamshellState" = Yes' && echo "閉" || echo "開"; }
+lid_state() { local reg; reg="$(ioreg -r -k AppleClamshellState -d 1 2>/dev/null)" && grep -q '"AppleClamshellState" = Yes' <<<"$reg" && echo "閉" || echo "開"; }
 # 画面がロックされている間はフレームが組まれない（描画の値が未実測になる）ので行に残す
-lock_state() { ioreg -n Root -d1 -a 2>/dev/null | grep -A1 CGSSessionScreenIsLocked | grep -q '<true/>' && echo "ロック" || echo "-"; }
+lock_state() {
+  local reg
+  reg="$(ioreg -n Root -d1 -a 2>/dev/null)" && reg="$(grep -A1 CGSSessionScreenIsLocked <<<"$reg")" \
+    && grep -q '<true/>' <<<"$reg" && echo "ロック" || echo "-"
+}
 # footprint を 1 回で採る: 本体 + 器のときは tmux のクライアント（本体の子）とサーバー
 measure_fp() {
   local pid="$1" fp_args c srv

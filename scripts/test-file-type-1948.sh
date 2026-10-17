@@ -148,9 +148,9 @@ open_ft() { # open_ft <file> [引数…] → "file_type=… syntax=… mode=…"
 
 # 読み取り表示の塗りが戻るまで待つ（`tako edit status` から `highlighting` が消える = #1916）
 wait_painted() {
-  local i
+  local i st
   for i in $(seq 1 100); do
-    if ! "$TAKO_BIN" edit status --pane "$PREVIEW" 2>/dev/null | grep -q '"highlighting"'; then
+    if ! { st="$("$TAKO_BIN" edit status --pane "$PREVIEW" 2>/dev/null)" && grep -q '"highlighting"' <<<"$st"; }; then
       return 0
     fi
     sleep 0.2

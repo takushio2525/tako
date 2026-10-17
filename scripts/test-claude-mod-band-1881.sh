@@ -248,7 +248,7 @@ type_line() {
 }
 key() { tmx send-keys -t "=$1:" "$2"; }
 save_cap() { cap "$1" | mask > "$2"; }
-screen_has() { cap "$1" | grep -q -- "$2"; }
+screen_has() { local screen; screen="$(cap "$1")" && grep -q -- "$2" <<<"$screen"; }
 
 # claude の起動を待つ（そのペインの報告が届き、帯の材料が返るまで）
 wait_claude() {
@@ -418,8 +418,8 @@ phase_widths() {
   if wait_for 20 screen_has band "w1-question"; then
     pass "/tako でサイドバーが開き、worker が並ぶ"
     save_cap band "$CAP_NEW/sidebar.txt"
-    check_eq "サイドバーに要注意（質問待ち）が出る" "true" "$(cap band | grep -q '質問待ち' && echo true || echo false)"
-    check_eq "サイドバーのトグルは「帯を出す」（隠しているので）" "true" "$(cap band | grep -q '帯を出す' && echo true || echo false)"
+    check_eq "サイドバーに要注意（質問待ち）が出る" "true" "$(screen_has band '質問待ち' && echo true || echo false)"
+    check_eq "サイドバーのトグルは「帯を出す」（隠しているので）" "true" "$(screen_has band '帯を出す' && echo true || echo false)"
     key band Escape
   else
     fail "/tako でサイドバーが開かない"
@@ -488,8 +488,8 @@ lim = (row.get("report") or {}).get("rate_limits") or []
 print("true" if any(l.get("percent_used", 0) >= 80 for l in lim) else "false")' "$p")"
   check_eq "ctx が閾値未満なら帯に ctx が無い（閾値以上なら有る）" "$expect_ctx" "$(contains "$line" "ctx ")"
   check_eq "使用制限が閾値未満なら帯に 5h / 7d が無い（閾値以上なら有る）" "$expect_limit" \
-    "$( (contains "$line" "5h "; contains "$line" "7d ") | grep -q true && echo true || echo false)"
-  check_eq "worker 0 本なら帯に worker 数を出さない" "false" "$( (contains "$line" "worker"; contains "$line" "workers") | grep -q true && echo true || echo false)"
+    "$([[ "$line" == *"5h "* || "$line" == *"7d "* ]] && echo true || echo false)"
+  check_eq "worker 0 本なら帯に worker 数を出さない" "false" "$([[ "$line" == *"worker"* || "$line" == *"workers"* ]] && echo true || echo false)"
 
   # 2 つ目の設定 dir（組織 / 個人）でも描かれるか
   if [ -n "$CCD2" ] && [ "$CCD2" != "$CCD" ]; then

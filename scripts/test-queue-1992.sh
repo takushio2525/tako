@@ -110,9 +110,9 @@ chmod +x "$TMP/fake.sh"
 start_arbiter() {
   TAKO_QUEUE_SOCKET="$SOCK" TAKO_QUEUE_INJECT="$INJECT" "$@" "$TAKO" queue serve 2>>"$TMP/arb.log" &
   ARB_PID=$!
-  local i
+  local i st
   for i in $(seq 1 50); do
-    if TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue --json 2>/dev/null | grep -q '"arbiter": true'; then
+    if st="$(TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue --json 2>/dev/null)" && grep -q '"arbiter": true' <<<"$st"; then
       return 0
     fi
     sleep 0.1

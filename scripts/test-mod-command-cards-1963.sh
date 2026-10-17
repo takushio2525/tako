@@ -237,7 +237,7 @@ reporting() { [ "$(row_field "$1" '.state')" = reporting ]; }
 not_reporting() { [ "$(row_field "$1" '.state')" != reporting ]; }
 mod_dir() { mod_json | jq -r '.plugin_dir'; }
 read_pane() { tk read --pane "$1" 2>/dev/null; }
-screen_has() { read_pane "$1" | grep -q -- "$2"; }
+screen_has() { local screen; screen="$(read_pane "$1")" && grep -q -- "$2" <<<"$screen"; }
 cards_json() { tk show-command --list --pane "$1" 2>/dev/null; }
 card_owner() { cards_json "$1" | jq -r --argjson c "$2" '.cards[] | select(.id == $c) | "\(.owner.drawn_by)/\(.owner.reason)"'; }
 owner_is() { [ "$(card_owner "$1" "$2")" = "$3" ]; }
@@ -511,7 +511,7 @@ phase_place() {
   sleep 3
   save_pane "$p" "$CAP_NEW/place-tako.txt"
   check_eq "持ち主は tako（place_tako）" "tako/place_tako" "$(card_owner "$p" "$CARD")"
-  check_eq "帯に card を描かない" "false" "$(read_pane "$p" | grep 'tako | ' | grep -q 'card ' && echo true || echo false)"
+  check_eq "帯に card を描かない" "false" "$(band="$(read_pane "$p")" && band="$(grep 'tako | ' <<<"$band")" && grep -q 'card ' <<<"$band" && echo true || echo false)"
   check_eq "会話の行をカードに描き替えない" "false" "$(screen_has "$p" "tako *card ${CARD}" && echo true || echo false)"
   check_eq "報告に renders.cards を載せない（描かせていない）" "null" "$(row_field "$p" '.report.renders.cards')"
   tk show-command --dismiss --pane "$p" >/dev/null 2>&1
@@ -535,7 +535,7 @@ start_tmux_claude() {
   tmx set-option -t "=$name" remain-on-exit off >/dev/null 2>&1
 }
 tcap() { tmx capture-pane -p -t "=$1:" 2>/dev/null; }
-tscreen_has() { tcap "$1" | grep -q -- "$2"; }
+tscreen_has() { local screen; screen="$(tcap "$1")" && grep -q -- "$2" <<<"$screen"; }
 tkey() {
   tmx send-keys -t "=$1:" "$2"
   sleep 0.6

@@ -49,7 +49,7 @@ out=$(claude -p "tako の MCP ツール tako_split_pane で右に新しいペイ
   --mcp-config "{\"mcpServers\":{\"tako\":{\"type\":\"http\",\"url\":\"$TAKO_MCP_URL\",\"headers\":{\"Authorization\":\"Bearer $TAKO_TOKEN\",\"X-Tako-Pane\":\"$TAKO_PANE_ID\"}}}}" \
   --allowedTools "mcp__tako__tako_split_pane" 2>&1) || fail "claude の実行（http）: $out"
 # 分割が実際に起きたかをホスト側の状態（tako list のツリー）で確認する
-"$TAKO" list | grep -q '"type": "split"' || fail "HTTP 経由の split がツリーに反映されていない"
+tree="$("$TAKO" list)" && grep -q '"type": "split"' <<<"$tree" || fail "HTTP 経由の split がツリーに反映されていない"
 echo "OK: Streamable HTTP で split が通った（claude の応答: $(head -1 <<<"$out")）"
 
 echo "VERIFY_CLAUDE_MCP_OK"

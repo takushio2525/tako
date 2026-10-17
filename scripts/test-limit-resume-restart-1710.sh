@@ -282,7 +282,7 @@ for i in $(seq 1 15); do
   sleep 1
 done
 check_eq "再開予定を過ぎたら 1 回目の試行をする" "1" "$(sv attempts)"
-if grep "action=limit_autoresume" "$AUDIT" 2>/dev/null | grep -q "nudge queued"; then
+if rows="$(grep "action=limit_autoresume" "$AUDIT" 2>/dev/null)" && grep -q "nudge queued" <<<"$rows"; then
   pass "supervisor.log に nudge queued が残る"
 else
   fail "supervisor.log に nudge queued が無い: $(tail -3 "$AUDIT" 2>/dev/null)"

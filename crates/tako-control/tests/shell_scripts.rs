@@ -6,7 +6,7 @@
 //! 「シェルスクリプトは macOS 同梱の bash 3.2 で通す（Issue #1499 / #1518）」に
 //! 書いてある規約の機械化（同じ節の「`set -e` と EXIT trap を併用するなら番人を通す」= #1864 と
 //! 「`"$( … )"` の中のダブルクォートに `{…,…}` を置かない」= #1924・
-//! 「pipefail の下で `echo` / `printf` の出力を `grep -q` へパイプしない」= #1633 も）。
+//! 「pipefail の下で早く抜ける読み手（`grep -q` / `head`）へパイプしない」= #1633 / #2272 も）。
 
 use std::path::{Path, PathBuf};
 
@@ -1026,8 +1026,9 @@ enum CaseState {
 /// クォートされた語のヒアドキュメント（`<<'X'`）の本文は読まない。素の `<<X` の本文は
 /// 語ではない（展開されるが波括弧展開はかからない）が、中の `$( … )` は読む。
 ///
-/// ついでに**パイプライン**（`|` / `|&` で繋がった単純コマンドの並び）も深さごとに集める
-/// （#1633 の `echo` / `printf` | `grep -q` の検査が使う）。
+/// ついでに**パイプライン**（`|` / `|&` で繋がった単純コマンドの並び）も深さごとに集め、
+/// その終了コードの行き先（条件・`&&` / `||`・素の文・`x=$( … )` の代入・引数の中の `$( … )`）を
+/// 添える（#1633 / #2272 の「早く抜ける読み手」の検査が使う）。
 struct WordLexer {
     c: Vec<char>,
     i: usize,
@@ -1036,7 +1037,49 @@ struct WordLexer {
     /// 読んでいる最中の `list` の深さごとのパイプライン（`$( … )` / `( … )` で 1 段積む）
     levels: Vec<PipeLevel>,
     /// 読み終えた、2 段以上のパイプライン
-    pipelines: Vec<Vec<LexCommand>>,
+    pipelines: Vec<LexPipeline>,
+    /// 読んでいる最中の語の始まりと、それがコマンドの先頭（代入を置ける位置）か。
+    /// `x=$( … )` の置換が素の代入の値かを `cmdsub` が判じるのに使う（`list` の間は None）
+    word_ctx: Option<(usize, bool)>,
+}
+
+/// パイプラインの終わり方（終了コードを誰が見るか）
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PipeEnd {
+    /// `;` / 改行 / `)` / 終端（素の文。`set -e` ならその非 0 でスクリプトが止まる）
+    #[default]
+    Plain,
+    /// `&&` の左辺
+    And,
+    /// `||` の左辺。`discard` は右辺が `true` / `:` だけ（= 終了コードを捨てる）
+    Or { discard: bool },
+    /// `&`（終了コードは誰も見ない）
+    Background,
+}
+
+/// パイプラインが置かれた list の種類
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ListKind {
+    /// ファイル直下・関数の本体・`( … )`
+    #[default]
+    Statement,
+    /// `$( … )`。`assign` はその置換が素の代入（`x=$( … )` / `x="$( … )"`）の値か。
+    /// `local x=$( … )` や引数の中の置換は false（終了コードは捨てられる）
+    CmdSub { assign: bool },
+    /// `<( … )` / `>( … )`（終了コードは誰も見ない）
+    ProcSub,
+}
+
+/// 読み終えたパイプライン（2 段以上）と、その終了コードの行き先
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LexPipeline {
+    stages: Vec<LexCommand>,
+    kind: ListKind,
+    /// 先頭に `if` / `elif` / `while` / `until` / `!` がある（= 条件・否定）
+    cond: bool,
+    end: PipeEnd,
+    /// `kind` が `CmdSub { assign: true }` のとき、その代入のコマンドの (cond, end)
+    outer: Option<(bool, PipeEnd)>,
 }
 
 /// パイプラインの 1 段 = 単純コマンド 1 つ（語は原文のまま）
@@ -1054,6 +1097,10 @@ struct PipeLevel {
     stages: Vec<LexCommand>,
     /// 直前が `|`（その後の改行は同じパイプラインの続き）
     after_pipe: bool,
+    kind: ListKind,
+    /// いまのコマンドの `x=$( … )` の中で読み終えたパイプライン（`pipelines` の添字）。
+    /// このコマンドの終わり方が決まったら `outer` へ写す
+    assign_inner: Vec<usize>,
 }
 
 const WORD_END: &[char] = &[' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>'];
@@ -1067,6 +1114,7 @@ impl WordLexer {
             pending: Vec::new(),
             levels: Vec::new(),
             pipelines: Vec::new(),
+            word_ctx: None,
         }
     }
 
@@ -1098,7 +1146,7 @@ impl WordLexer {
     }
 
     /// `;` / `&` / `&&` / `||` / `)` / 改行 / 終端: パイプラインを閉じる
-    fn pipe_end(&mut self) {
+    fn pipe_end(&mut self, end: PipeEnd) {
         let Some(lv) = self.levels.last_mut() else {
             return;
         };
@@ -1107,8 +1155,34 @@ impl WordLexer {
         }
         lv.after_pipe = false;
         let stages = std::mem::take(&mut lv.stages);
+        let kind = lv.kind;
+        let cond = stages.first().is_some_and(|s| {
+            s.words
+                .iter()
+                .take_while(|w| LEADING_KEYWORDS.contains(&w.as_str()))
+                .any(|w| matches!(w.as_str(), "if" | "elif" | "while" | "until" | "!"))
+        });
+        // このコマンドの `x=$( … )` の中のパイプラインは、このコマンドの終わり方に従う
+        for k in std::mem::take(&mut lv.assign_inner) {
+            if let Some(p) = self.pipelines.get_mut(k) {
+                p.outer = Some((cond, end));
+            }
+        }
         if stages.len() >= 2 {
-            self.pipelines.push(stages);
+            let k = self.pipelines.len();
+            self.pipelines.push(LexPipeline {
+                stages,
+                kind,
+                cond,
+                end,
+                outer: None,
+            });
+            if kind == (ListKind::CmdSub { assign: true }) {
+                let parent = self.levels.len().checked_sub(2);
+                if let Some(parent) = parent.and_then(|d| self.levels.get_mut(d)) {
+                    parent.assign_inner.push(k);
+                }
+            }
         }
     }
 
@@ -1119,8 +1193,22 @@ impl WordLexer {
             .last()
             .is_some_and(|lv| lv.cur.is_none() && lv.after_pipe);
         if !continues {
-            self.pipe_end();
+            self.pipe_end(PipeEnd::Plain);
         }
+    }
+
+    /// `||` の直後（空白を飛ばした次の語）が `true` / `:` だけか = 左辺の終了コードを捨てる
+    fn or_discards_status(&self) -> bool {
+        let mut k = 0;
+        while matches!(self.peek(k), Some(' ' | '\t')) {
+            k += 1;
+        }
+        let mut w = String::new();
+        while let Some(c) = self.peek(k).filter(|c| !WORD_END.contains(c)) {
+            w.push(c);
+            k += 1;
+        }
+        w == "true" || w == ":"
     }
 
     fn peek(&self, k: usize) -> Option<char> {
@@ -1135,9 +1223,19 @@ impl WordLexer {
 
     /// コマンドの並び。`until_close` なら対応する `)` を食べて戻る（`$( … )` / `( … )`）
     fn list(&mut self, until_close: bool) {
-        self.levels.push(PipeLevel::default());
+        self.list_of(until_close, ListKind::Statement);
+    }
+
+    fn list_of(&mut self, until_close: bool, kind: ListKind) {
+        self.levels.push(PipeLevel {
+            kind,
+            ..PipeLevel::default()
+        });
+        // list の中は語の外（ヒアドキュメントの本文の `$( … )` を外の語の代入と取り違えない）
+        let saved = self.word_ctx.take();
         self.list_body(until_close);
-        self.pipe_end();
+        self.pipe_end(PipeEnd::Plain);
+        self.word_ctx = saved;
         self.levels.pop();
     }
 
@@ -1176,22 +1274,26 @@ impl WordLexer {
                         self.i += 1;
                     }
                     cmd_start = true;
-                    self.pipe_end();
+                    self.pipe_end(PipeEnd::Plain);
                 }
                 '&' | '|' => {
                     // `|` / `|&` は段の区切り。`||` / `&&` / `&` はパイプラインを閉じる
                     if self.at("|&") {
                         self.i += 2;
                         self.pipe_stage();
-                    } else if self.at("||") || self.at("&&") {
+                    } else if self.at("||") {
                         self.i += 2;
-                        self.pipe_end();
+                        let discard = self.or_discards_status();
+                        self.pipe_end(PipeEnd::Or { discard });
+                    } else if self.at("&&") {
+                        self.i += 2;
+                        self.pipe_end(PipeEnd::And);
                     } else {
                         self.i += 1;
                         if ch == '|' {
                             self.pipe_stage();
                         } else {
-                            self.pipe_end();
+                            self.pipe_end(PipeEnd::Background);
                         }
                     }
                     cmd_start = true;
@@ -1203,7 +1305,7 @@ impl WordLexer {
                     } else if case.last() == Some(&CaseState::Pattern) {
                         *case.last_mut().expect("case") = CaseState::Body;
                         cmd_start = true;
-                        self.pipe_end();
+                        self.pipe_end(PipeEnd::Plain);
                     } else if until_close {
                         return;
                     }
@@ -1222,7 +1324,7 @@ impl WordLexer {
                         self.i += 1;
                         self.list(true);
                         if fn_def {
-                            self.pipe_end();
+                            self.pipe_end(PipeEnd::Plain);
                         }
                     }
                     cmd_start = false;
@@ -1235,7 +1337,7 @@ impl WordLexer {
                         self.heredoc_op();
                     } else if self.at("<(") || self.at(">(") {
                         self.i += 2;
-                        self.list(true);
+                        self.list_of(true, ListKind::ProcSub);
                     } else {
                         self.i += 1;
                         while matches!(self.peek(0), Some('>' | '&' | '|')) {
@@ -1311,6 +1413,7 @@ impl WordLexer {
     fn word(&mut self, cmd_start: bool) -> bool {
         let start = self.i;
         let mut array = false;
+        let saved = self.word_ctx.replace((start, cmd_start));
         while let Some(ch) = self.peek(0) {
             match ch {
                 '\\' => self.i += 2,
@@ -1338,6 +1441,7 @@ impl WordLexer {
         }
         // 末尾の `\` や閉じていないクォートで読み過ぎても、語の切り出しで落ちない
         self.i = self.i.min(self.c.len());
+        self.word_ctx = saved;
         array
     }
 
@@ -1429,8 +1533,12 @@ impl WordLexer {
             self.i += 1;
             self.arith();
         } else {
+            // コマンドの先頭の `x=` / `x="` に続く置換 = 素の代入の値（終了コードが代入の結果になる）
+            let assign = self.word_ctx.is_some_and(|(ws, cmd_start)| {
+                cmd_start && is_assignment_word(&self.c[ws..self.i].iter().collect::<String>())
+            });
             self.i += 2;
-            self.list(true);
+            self.list_of(true, ListKind::CmdSub { assign });
         }
     }
 
@@ -1948,7 +2056,7 @@ fn 語の字句解析は代入と展開されない文脈を読み分ける() {
 }
 
 // ---------------------------------------------------------------------------
-// pipefail の下の `echo` / `printf` | `grep -q`（Issue #1633）
+// pipefail の下の `X | grep -q` / 終了コードを見る `X | head`（Issue #1633 / #2272）
 // ---------------------------------------------------------------------------
 
 /// `set` の 1 コマンドが `-o <name>`（`set -euo pipefail` のように短い名前の束の末尾の `o` を含む）を入れるか
@@ -2038,13 +2146,80 @@ fn pipefail_exception(lines: &[&str], line_no: usize) -> bool {
     at(line_no).is_some_and(has) || at(line_no.wrapping_sub(1)).is_some_and(has)
 }
 
+/// パイプラインの終了コードが判定に効くか（効くならその理由）。
+///
+/// `head` の出力は左辺が SIGPIPE で死んでも正しい（先頭の N 行は読めている）。壊れるのは
+/// **終了コードだけ**なので、それを誰かが見る位置だけが問題になる:
+/// 条件（`if` / `while` / `!`）・`&&` / `||` の左辺（右辺が `true` / `:` だけなら捨てる）・
+/// `set -e` の下の素の文・`x=$( … )` の素の代入（代入の終了コード = 置換の終了コード）。
+/// 引数の中の `$( … )`（`echo "…$(X | head -1)"`・`local x=$( … )`）と `<( … )`・`&` は誰も見ない。
+fn status_matters(p: &LexPipeline, errexit: bool) -> Option<&'static str> {
+    // (条件, &&・||, 素の文) のそれぞれの理由
+    type Why = (&'static str, &'static str, Option<&'static str>);
+    let by = |cond: bool, end: PipeEnd, why: Why| match end {
+        PipeEnd::Or { discard: true } | PipeEnd::Background => None,
+        _ if cond => Some(why.0),
+        PipeEnd::And | PipeEnd::Or { .. } => Some(why.1),
+        PipeEnd::Plain => why.2,
+    };
+    let own = ("条件", "&& / || の左辺", None);
+    match p.kind {
+        ListKind::Statement => by(
+            p.cond,
+            p.end,
+            (own.0, own.1, errexit.then_some("set -e の下の文")),
+        ),
+        // 置換の中の判定（`$(X | grep -q y && echo 1)`）。置換の中は `set -e` を継がない（bash の既定）
+        ListKind::CmdSub { .. } | ListKind::ProcSub if by(p.cond, p.end, own).is_some() => {
+            by(p.cond, p.end, own)
+        }
+        // 素の文 = 置換の終了コード。素の代入の値なら、その代入のコマンドの終わり方に従う
+        ListKind::CmdSub { assign: true } if p.end == PipeEnd::Plain => {
+            let (cond, end) = p.outer?;
+            by(
+                cond,
+                end,
+                (
+                    "x=$( … ) が条件",
+                    "x=$( … ) が && / || の左辺",
+                    errexit.then_some("set -e の下の x=$( … )"),
+                ),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// 読むのを途中でやめて抜ける読み手の種類
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EarlyQuit {
+    /// `grep -q` / `--quiet` / `--silent`（終了コードそのものが目的 = いつも判定）
+    GrepQ,
+    /// `head`（出力は正しい。終了コードを誰かが見るときだけ判定に効く）
+    Head,
+}
+
+/// 段が早く抜ける読み手か
+fn early_quit(stage: &LexCommand) -> Option<EarlyQuit> {
+    let (k, name) = stage_command_name(&stage.words)?;
+    match name {
+        "grep" | "egrep" | "fgrep" if grep_quits_early(&stage.words[k + 1..]) => {
+            Some(EarlyQuit::GrepQ)
+        }
+        "head" => Some(EarlyQuit::Head),
+        _ => None,
+    }
+}
+
 /// 1 ファイルぶんの違反（file:line で名指しする文言）。
 ///
-/// `grep -q` は最初の一致で抜ける。左辺の `echo` / `printf` が書き終わる前にパイプが閉じると
-/// 書き込みが EPIPE（または SIGPIPE 死）になり、`pipefail` がその非 0 をパイプライン全体の
-/// 結果にする = **含まれているのに「無い」**（`!` や assert_not_contains では偽の合格）。
-/// 本文がパイプの容量を超えたとき・書き込みが割れたときだけ出るので、手元では緑・負荷下で赤になる。
-fn pipefail_grep_violations(rel: &str, src: &str) -> Vec<String> {
+/// `grep -q` は最初の一致で、`head` は N 行（N バイト）で読むのをやめて抜ける。左辺が書き終わる前に
+/// パイプが閉じると書き込みが EPIPE（または SIGPIPE 死 = 141）になり、`pipefail` がその非 0 を
+/// パイプライン全体の結果にする。`grep -q` なら**含まれているのに「無い」**（`!` や
+/// assert_not_contains では偽の合格）、`head` なら `set -e` の下の `x=$(X | head -1)` で
+/// スクリプトが止まる・`if` の条件が偽になる。左辺の出力がパイプの容量（64 KB）を超えたとき・
+/// 書き込みが割れたときだけ出るので、手元では緑・負荷下や大きい出力で赤になる（#1633 / #2272）。
+fn pipefail_early_quit_violations(rel: &str, src: &str) -> Vec<String> {
     if !(declares_pipefail(src) || is_sourced_library(rel)) {
         return Vec::new();
     }
@@ -2053,6 +2228,8 @@ fn pipefail_grep_violations(rel: &str, src: &str) -> Vec<String> {
     } else {
         "pipefail を宣言した側から source される"
     };
+    // ライブラリは呼び手の `set -e` も継ぐ
+    let errexit = is_sourced_library(rel) || declares_errexit(src, &shell_commands(src));
     let chars: Vec<char> = src.chars().collect();
     let lines: Vec<&str> = src.lines().collect();
     let line_of = |pos: usize| {
@@ -2065,27 +2242,32 @@ fn pipefail_grep_violations(rel: &str, src: &str) -> Vec<String> {
     let mut lx = WordLexer::new(src);
     lx.list(false);
     let mut out = Vec::new();
-    for stages in &lx.pipelines {
-        let Some((_, producer)) = stage_command_name(&stages[0].words) else {
+    for p in &lx.pipelines {
+        let quits: Vec<EarlyQuit> = p.stages[1..].iter().filter_map(early_quit).collect();
+        let (what, hint) = if quits.contains(&EarlyQuit::GrepQ) {
+            (
+                "grep -q".to_string(),
+                "out=$(X) && grep -q … <<<\"$out\" か [[ \"$out\" == *\"…\"* ]]",
+            )
+        } else if quits.contains(&EarlyQuit::Head) {
+            let Some(why) = status_matters(p, errexit) else {
+                continue;
+            };
+            (
+                format!("head・{why}"),
+                "最後まで読む sed -n '1,Np' か out=$(X) の後で切る",
+            )
+        } else {
             continue;
         };
-        if producer != "echo" && producer != "printf" {
-            continue;
-        }
-        let quits = stages[1..].iter().any(|s| {
-            stage_command_name(&s.words).is_some_and(|(k, name)| {
-                matches!(name, "grep" | "egrep" | "fgrep") && grep_quits_early(&s.words[k + 1..])
-            })
-        });
-        if !quits {
-            continue;
-        }
-        let line_no = line_of(stages[0].start);
+        let line_no = line_of(p.stages[0].start);
         if pipefail_exception(&lines, line_no) {
             continue;
         }
+        // `( … )` / `{ … }` / `while … done` が左辺のときは段の語にコマンド名が無い
+        let producer = stage_command_name(&p.stages[0].words).map_or("複合コマンド", |(_, n)| n);
         out.push(format!(
-            "{rel}:{line_no}: {producer} … | grep -q（{how}）→ grep … <<<\"$x\" か [[ \"$x\" == *\"…\"* ]]: {}",
+            "{rel}:{line_no}: {producer} … | {what}（{how}）→ {hint}: {}",
             lines.get(line_no - 1).map_or("", |l| l.trim())
         ));
     }
@@ -2093,7 +2275,7 @@ fn pipefail_grep_violations(rel: &str, src: &str) -> Vec<String> {
 }
 
 #[test]
-fn pipefailの下でechoとprintfの出力をgrep_qへパイプしない() {
+fn pipefailの下で早く抜ける読み手へパイプしない() {
     let root = repo_root();
     let mut violations: Vec<String> = Vec::new();
     for path in shell_scripts() {
@@ -2103,29 +2285,31 @@ fn pipefailの下でechoとprintfの出力をgrep_qへパイプしない() {
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        violations.extend(pipefail_grep_violations(&rel, &src));
+        violations.extend(pipefail_early_quit_violations(&rel, &src));
     }
     assert!(
         violations.is_empty(),
-        "`set -o pipefail` の下の `echo/printf \"$x\" | grep -q …` は、grep が最初の一致で抜けた後に\n\
-         左辺の書き込みが EPIPE で落ち、pipefail でパイプライン全体が非 0 になる\n\
-         （含まれているのに「無い」。本文がパイプの容量を超えたときだけ出る間欠。#1633）。\n\
-         固定文字列なら `[[ \"$x\" == *\"$needle\"* ]]`、grep の意味（正規表現・-x・-E）が要るなら\n\
-         ヒアストリング `grep -q … <<<\"$x\"` にすること（どちらも bash 3.2 で通る）\n\
+        "`set -o pipefail` の下の `X | grep -q …` / 終了コードを見る `X | head …` は、読み手が途中で\n\
+         抜けた後に左辺の書き込みが EPIPE（SIGPIPE = 141）で落ち、pipefail でパイプライン全体が非 0 になる\n\
+         （含まれているのに「無い」・set -e の下の x=$(X | head -1) で止まる。左辺の出力がパイプの容量を\n\
+         超えたときだけ出る間欠。#1633 / #2272）。grep -q は `out=$(X) && grep -q … <<<\"$out\"`\n\
+         （固定文字列なら `[[ \"$out\" == *\"$needle\"* ]]`）、head は最後まで読む `sed -n '1,Np'` か\n\
+         `out=$(X)` の後で切ること（どれも bash 3.2 で通る）\n\
          （.agent/conventions.md「シェルスクリプトは macOS 同梱の bash 3.2 で通す」節。\n\
-         監査して確かめた箇所だけ、その行か直前の行に `# tako:pipefail-ok <理由>` で外せる）:\n{}",
+         出力が小さいと監査して確かめた箇所だけ、その行か直前の行に `# tako:pipefail-ok <理由>` で外せる）:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn 番犬はpipefailの下のecho_printfとgrep_qをfile_lineで名指しする() {
+fn 番犬はpipefailの下のgrep_qを左辺を問わずfile_lineで名指しする() {
     let hits = |body: &str| {
-        pipefail_grep_violations("scripts/x.sh", &format!("set -euo pipefail\n{body}\n")).len()
+        pipefail_early_quit_violations("scripts/x.sh", &format!("set -euo pipefail\n{body}\n"))
+            .len()
     };
 
     // #1633 で CI を赤にした行そのもの（test-release-retry.sh の assert_contains）
-    let v = pipefail_grep_violations(
+    let v = pipefail_early_quit_violations(
         "scripts/x.sh",
         "set -euo pipefail\n\nf() {\n  if echo \"$haystack\" | grep -qF -- \"$needle\"; then\n    :\n  fi\n}\n",
     );
@@ -2173,6 +2357,37 @@ fn 番犬はpipefailの下のecho_printfとgrep_qをfile_lineで名指しする(
     // 素のヒアドキュメントの本文の `$( … )` は囲む側が展開する（= 囲む側の pipefail で動く）
     assert_eq!(hits("cat <<X\n$(echo \"$a\" | grep -q y && echo 1)\nX"), 1);
 
+    // 左辺が echo / printf 以外でも同じ（#2272。#2272 の棚卸しで直した形そのもの）
+    let v = pipefail_early_quit_violations(
+        "scripts/x.sh",
+        "set -euo pipefail\nif TAKO_SELF_TEST=1 \"$APP/tako-app\" | grep -q \"OK\"; then :; fi\n",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(
+        v[0].starts_with("scripts/x.sh:2: tako-app\" … | grep -q（pipefail を宣言）"),
+        "{v:?}"
+    );
+    assert_eq!(hits(r#"cat f | grep -q x"#), 1);
+    assert_eq!(hits(r#"echo "$(cat f | grep -q x)""#), 1);
+    assert_eq!(hits(r#""$TAKO" list | grep -q '"split"' || fail "x""#), 1);
+    assert_eq!(hits(r#"screen_has() { cap "$1" | grep -q -- "$2"; }"#), 1);
+    assert_eq!(
+        hits(r#"ioreg -d1 | grep -A1 Locked | grep -q '<true/>'"#),
+        1
+    );
+    assert_eq!(hits(r#"x | head -1 | grep -q y"#), 1); // head と grep -q で 1 件
+    let group = pipefail_early_quit_violations(
+        "scripts/x.sh",
+        "set -euo pipefail\nok=\"$( (c a; c b) | grep -q true && echo 1)\"\n",
+    );
+    assert_eq!(group.len(), 1, "{group:?}");
+    assert!(
+        group[0].starts_with("scripts/x.sh:2: 複合コマンド … | grep -q"),
+        "{group:?}"
+    );
+    assert_eq!(hits("{ a; b; } | grep -q x"), 1);
+    assert_eq!(hits("while read -r l; do :; done < f | grep -q x"), 1);
+
     // 名指さない形（過大申告しない）
     assert_eq!(hits(r#"grep -qF -- "$n" <<<"$h""#), 0); // 直したあとの形
     assert_eq!(hits(r#"[[ "$h" == *"$n"* ]]"#), 0);
@@ -2186,8 +2401,6 @@ fn 番犬はpipefailの下のecho_printfとgrep_qをfile_lineで名指しする(
     assert_eq!(hits("echo \"$a\"\ngrep -q x f"), 0);
     assert_eq!(hits(r#"echo "$a | grep -q x""#), 0); // 文字列の中
     assert_eq!(hits(r#"# echo "$a" | grep -q x"#), 0); // コメント
-    assert_eq!(hits(r#"cat f | grep -q x"#), 0); // 左辺が echo / printf でない（#1633 の範囲外）
-    assert_eq!(hits(r#"echo "$(cat f | grep -q x)""#), 0);
     assert_eq!(
         hits("cat > stub <<X\nif printf '%s' \"\\$*\" | grep -q y; then :; fi\nX"),
         0
@@ -2198,10 +2411,12 @@ fn 番犬はpipefailの下のecho_printfとgrep_qをfile_lineで名指しする(
 
     // pipefail を宣言しないファイルは対象外（終了コードは grep のものになる）
     assert!(
-        pipefail_grep_violations("scripts/x.sh", "set -eu\necho \"$a\" | grep -q x\n").is_empty()
+        pipefail_early_quit_violations("scripts/x.sh", "set -eu\necho \"$a\" | grep -q x\n")
+            .is_empty()
     );
     // ライブラリは自分で宣言しなくても対象（呼び手の pipefail を継ぐ）
-    let lib = pipefail_grep_violations("scripts/lib/z.sh", "f() {\n  echo \"$a\" | grep -q x\n}\n");
+    let lib =
+        pipefail_early_quit_violations("scripts/lib/z.sh", "f() {\n  echo \"$a\" | grep -q x\n}\n");
     assert_eq!(lib.len(), 1, "{lib:?}");
     assert!(lib[0].starts_with(
         "scripts/lib/z.sh:2: echo … | grep -q（pipefail を宣言した側から source される）"
@@ -2224,8 +2439,85 @@ fn 番犬はpipefailの下のecho_printfとgrep_qをfile_lineで名指しする(
         "printf x \\",
         "a=(x 'y",
     ] {
-        let _ = pipefail_grep_violations("scripts/lib/x.sh", broken);
+        let _ = pipefail_early_quit_violations("scripts/lib/x.sh", broken);
     }
+}
+
+#[test]
+fn 番犬はpipefailの下で終了コードを見るheadだけを名指しする() {
+    let with = |set: &str, body: &str| {
+        pipefail_early_quit_violations("scripts/x.sh", &format!("{set}\n{body}\n"))
+    };
+    let e = |body: &str| with("set -euo pipefail", body).len();
+    let no_e = |body: &str| with("set -uo pipefail", body).len();
+
+    // #2272 で直した形そのもの（nightly-release.sh の最新タグ: タグが増えると git が書き終わる前に head が抜ける）
+    let v = with(
+        "set -euo pipefail",
+        "LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1)",
+    );
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(
+        v[0].starts_with("scripts/x.sh:2: git … | head・set -e の下の x=$( … )（pipefail を宣言）"),
+        "{v:?}"
+    );
+
+    // 名指す形 = 終了コードを誰かが見る
+    assert_eq!(e(r#"x="$(X | head -1)""#), 1);
+    assert_eq!(e("a=1 b=$(X | head -1)"), 1);
+    assert_eq!(e("local x; x=$(X | head -1)"), 1);
+    assert_eq!(e("X | head -1"), 1); // set -e の下の素の文
+    assert_eq!(e("f() { X | sed -n 's/a/b/p' | head -1; }"), 1); // 関数の終了コード
+    assert_eq!(e("X | head -5 | while read -r l; do :; done"), 1);
+    assert_eq!(no_e("if X | head -1; then :; fi"), 1);
+    assert_eq!(no_e("while ! X | head -1; do :; done"), 1);
+    assert_eq!(no_e("if x=$(X | head -1); then :; fi"), 1);
+    assert_eq!(no_e("x=$(X | head -1) && y"), 1);
+    assert_eq!(no_e("x=$(X | head -1) || return 1"), 1);
+    assert_eq!(no_e("X | head -1 || fail x"), 1);
+    assert_eq!(
+        no_e(r#"echo "$([ -x c ] && c --version | head -1 || echo 無い)""#),
+        1
+    );
+    let cond = with("set -uo pipefail", "if x=$(X | head -1); then :; fi");
+    assert!(cond[0].contains("| head・x=$( … ) が条件"), "{cond:?}");
+
+    // 名指さない形（過大申告しない）: 出力は正しく、終了コードを誰も見ない
+    assert_eq!(e("x=$(X | sed -n 1p)"), 0); // 直したあとの形（最後まで読む）
+    assert_eq!(no_e("x=$(X | head -1)"), 0); // set -e が無ければ代入の終了コードは捨てられる
+    assert_eq!(no_e("X | head -1"), 0);
+    assert_eq!(e("x=$(X | head -1) || true"), 0);
+    assert_eq!(e("x=$(X | head -1) || :"), 0);
+    assert_eq!(e("x=$(X | head -1 || true)"), 0);
+    assert_eq!(e("X | head -1 || true"), 0);
+    assert_eq!(e("X | head -1 &"), 0);
+    assert_eq!(e("local x=$(X | head -1)"), 0); // local の終了コード
+    assert_eq!(e(r#"echo "失敗: $(X | head -c 300)""#), 0); // 引数の中の置換
+    assert_eq!(
+        e(r#"fail "x: $(grep -o 'FAILED: .*' "$log" | head -1)""#),
+        0
+    );
+    assert_eq!(e(r#"[ "$(X | head -1)" = y ]"#), 0);
+    assert_eq!(e(r#"case "$(X | head -1)" in y) : ;; esac"#), 0);
+    assert_eq!(e(r#"x="$(f "$(X | head -1)")""#), 0); // 置換の中の引数の置換
+    assert_eq!(e("while read -r l; do :; done < <(X | head -5)"), 0);
+    assert_eq!(e("head -1 f | grep x"), 0); // head が先頭の段（前に死ぬ段が無い）
+    assert_eq!(e("y=$(cat <<X\n$(X | head -1)\nX\n)"), 0); // ヒアドキュメントの本文の置換は代入の値ではない
+    assert_eq!(e("cat > stub <<'X'\nx=$(X | head -1)\nX"), 0); // 別スクリプトの本文
+
+    // ライブラリは呼び手の set -e を継ぐ
+    let lib = pipefail_early_quit_violations("scripts/lib/z.sh", "f() {\n  r=$(X | head -1)\n}\n");
+    assert_eq!(lib.len(), 1, "{lib:?}");
+    assert!(lib[0].starts_with(
+        "scripts/lib/z.sh:2: X … | head・set -e の下の x=$( … )（pipefail を宣言した側から source される）"
+    ));
+
+    // 例外宣言は理由つきのときだけ効く
+    assert_eq!(
+        e("# tako:pipefail-ok 左辺は 1 行で 1 度に書く\nx=$(X | head -1)"),
+        0
+    );
+    assert_eq!(e("# tako:pipefail-ok\nx=$(X | head -1)"), 1);
 }
 
 #[test]

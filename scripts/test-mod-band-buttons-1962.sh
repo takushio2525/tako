@@ -283,7 +283,7 @@ stop_claude() {
 not_reporting() { [ "$(row_field "$1" '.state')" != reporting ]; }
 cap() { tmx capture-pane -p -t "=$1:" 2>/dev/null; }
 save_cap() { cap "$1" | mask > "$2"; }
-screen_has() { cap "$1" | grep -q -- "$2"; }
+screen_has() { local screen; screen="$(cap "$1")" && grep -q -- "$2" <<<"$screen"; }
 key() { tmx send-keys -t "=$1:" "$2"; }
 type_line() {
   tmx send-keys -t "=$1:" -l "$2"
@@ -299,7 +299,7 @@ one_turn() {
 band_lines() { cap "$1" | grep -c 'tako | ' | tr -d ' '; }
 band_line() { cap "$1" | grep 'tako | ' | head -1; }
 # バー（`<ラベル> <棒> <N>%`）が画面に出ているか
-bar_on_screen() { cap "$1" | grep -Eq '(5h|7d|ctx) [▁▂▃▄▅▆▇█] [0-9]+%'; }
+bar_on_screen() { local screen; screen="$(cap "$1")" && grep -Eq '(5h|7d|ctx) [▁▂▃▄▅▆▇█] [0-9]+%' <<<"$screen"; }
 bar_gone() { ! bar_on_screen "$1"; }
 wait_claude() {
   local session="$1" pane="$2"
@@ -356,7 +356,7 @@ phase_widths() {
     check_eq "${w} 桁: tako の行は 1 本" "1" "$(band_lines "$s")"
     check_eq "${w} 桁: ボタン（[ compact ]）が tako の行と同じ行にある" "true" "$(contains "$line" '[ compact ]')"
     check_eq "${w} 桁: 帯が畳まれていない（↓ N more が無い）" "false" \
-      "$(cap "$s" | grep -q 'more' && echo true || echo false)"
+      "$(screen_has "$s" 'more' && echo true || echo false)"
     if [ "$cells" -le "$w" ]; then pass "${w} 桁: 行の桁 ${cells} ≤ ${w}"; else fail "${w} 桁: 行の桁 ${cells} > ${w}"; fi
     echo "    観測: $(printf '%s' "$line" | mask | cut -c1-200)"
     echo "    報告: band=$(row_field "$p" '.report.band | {columns, segments}' | tr -d '\n ') renders=$(row_field "$p" '.report.renders' | tr -d '\n ')"
@@ -517,7 +517,8 @@ gui_claude() {
   tk send --pane "$pane" "cd '$WORK' && clear && env CLAUDE_CONFIG_DIR='$ccd' ANTHROPIC_BASE_URL='$API_URL' ANTHROPIC_API_KEY='$API_KEY' DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude --model haiku" >/dev/null
 }
 read_pane() { tk read --pane "$1" 2>/dev/null; }
-gui_bar() { read_pane "$1" | grep -Eq '(5h|7d|ctx) [▁▂▃▄▅▆▇█] [0-9]+%'; }
+gui_bar() { local screen; screen="$(read_pane "$1")" && grep -Eq '(5h|7d|ctx) [▁▂▃▄▅▆▇█] [0-9]+%' <<<"$screen"; }
+gui_has() { local screen; screen="$(read_pane "$1")" && grep -q -- "$2" <<<"$screen"; }
 phase_status() {
   echo "== 5. statusLine で ctx を出している構成ではバーを描かない（隔離 GUI の直接ペイン）"
   local p q r s
@@ -548,7 +549,7 @@ phase_status() {
     case "$label" in
       statusline)
         check_eq "${label}: 報告の status_line" "true" "$s"
-        check_eq "${label}: 画面に statusLine の数値（ctx 45%）" "true" "$(read_pane "$q" | grep -q 'ctx 45%' && echo true || echo false)"
+        check_eq "${label}: 画面に statusLine の数値（ctx 45%）" "true" "$(gui_has "$q" 'ctx 45%' && echo true || echo false)"
         check_eq "${label}: バーを描かない（renders.usage_bar）" "none" "$r"
         check_eq "${label}: 画面にバーが無い" "false" "$(gui_bar "$q" && echo true || echo false)"
         ;;

@@ -198,7 +198,7 @@ same_bytes() { # same_bytes <名前> <ファイル> <正解>
 }
 
 echo "== 前提 =="
-echo "  Arduino IDE の同梱: $([ "$HAVE_IDE" = 1 ] && "$REAL_CLI" version 2>/dev/null | head -1 || echo 無い)"
+echo "  Arduino IDE の同梱: $([ "$HAVE_IDE" = 1 ] && "$REAL_CLI" version 2>/dev/null | sed -n 1p || echo 無い)"
 echo "  arduino:avr のコア: $([ "$HAVE_CORE" = 1 ] && echo '一時 HOME へ複製した（renesas_uno は写さない）' || echo 無い)"
 echo "  正解の sketch.yaml（arduino-cli の直書き）: $(tr '\n' '|' < "$S/Ref/sketch.yaml" 2>/dev/null)"
 if [ "$HAVE_IDE" != 1 ] || [ "$HAVE_CORE" != 1 ] || [ ! -f "$S/Ref/sketch.yaml" ]; then
