@@ -168,3 +168,233 @@ fn issue番号の拾い方が桁でぶれない() {
     // 1 桁は拾わない（見出しの `#` や色指定と紛れる）／5 桁以上も拾わない
     assert!(issue_refs("#5 / #12345 / # 123 / abc#x").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// 行の折り返しで語が空白なしに繋がる（Issue #1905）
+// ---------------------------------------------------------------------------
+//
+// catalog.rs の説明文は Rust の文字列の行末 `\` で折り返す。`\` の継続は**次の行の先頭の
+// 空白を捨てる**ので、`…を返す\` + 改行 + `    pane_id …` は「…を返すpane_id」になる。
+// 説明文は和文と英字の間に半角空白を置いて書いている（「を JSON で返す」）ので、
+// 継ぎ目だけ詰まった形はソースを読んでも気づけない（#1904 で 8 か所直した後にも残っていた）。
+// 英字どうしの継ぎ目は語そのものが繋がる（`foo\` + `bar` = 「foobar」）のでなお悪い。
+
+const CATALOG_SOURCE: &str = "src/mcp/catalog.rs";
+
+/// 和文の文字（ひらがな・カタカナ・漢字）。中黒「・」と全角の約物は含めない
+/// （「（tab と排他）」「・pane」のように約物と英字は空白なしで並べる）
+fn is_wabun(c: char) -> bool {
+    matches!(c,
+        '\u{3041}'..='\u{309F}'
+        | '\u{30A0}'..='\u{30FA}'
+        | '\u{30FC}'..='\u{30FF}'
+        | '\u{3400}'..='\u{4DBF}'
+        | '\u{4E00}'..='\u{9FFF}'
+        | '々')
+}
+
+/// 英字の語の文字（キー名・引数名・値に使う字）
+fn is_eiji(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// 継ぎ目の左右が空白なしに並んではいけない組か
+fn glued(left: char, right: char) -> bool {
+    (is_wabun(left) && is_eiji(right))
+        || (is_eiji(left) && is_wabun(right))
+        || (is_eiji(left) && is_eiji(right))
+}
+
+/// ソースの行末 `\`（文字列の継続）の継ぎ目で、前の行の最後の文字と次の行の最初の文字が
+/// 空白なしに繋がる箇所を `(行番号, 継ぎ目の前後)` で返す。1 つ目は見た継ぎ目の数
+/// （走査が空振りしていないことを確かめる）
+fn glued_continuations(source: &str) -> (usize, Vec<(usize, String)>) {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut checked = 0usize;
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let Some(body) = line.strip_suffix('\\') else {
+            continue;
+        };
+        // `\\` で終わる行は継続ではなく、エスケープした `\` そのもの
+        if body.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 {
+            continue;
+        }
+        let mut rev = body.chars().rev();
+        let Some(left) = rev.next() else {
+            continue;
+        };
+        checked += 1;
+        // 直前の文字がエスケープの一部（`\n` / `\"` …）なら、描かれるのはその英字ではない
+        if rev.take_while(|c| *c == '\\').count() % 2 == 1 {
+            continue;
+        }
+        // Rust は継続の後ろの空白（改行も）をすべて捨てる = 次に空白でない文字が継ぎ目の右
+        let Some((next, right)) = lines[i + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(k, l)| l.trim_start().chars().next().map(|c| (i + 1 + k, c)))
+        else {
+            continue;
+        };
+        if !glued(left, right) {
+            continue;
+        }
+        let head: String = body
+            .chars()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let tail: String = lines[next].trim_start().chars().take(12).collect();
+        out.push((i + 1, format!("「…{head}」+「{tail}…」")));
+    }
+    (checked, out)
+}
+
+fn catalog_source() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(CATALOG_SOURCE);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("catalog.rs を読めない {}: {e}", path.display()))
+}
+
+#[test]
+fn catalogの折り返しで和文と英字が空白なしに繋がらない() {
+    let (checked, glued) = glued_continuations(&catalog_source());
+    // 走査が空振りすれば無意味に緑になる（説明文の継ぎ目は 800 を超える）
+    assert!(checked > 500, "継ぎ目を {checked} 個しか見つけられていない");
+    let lines: Vec<String> = glued
+        .iter()
+        .map(|(line, at)| format!("  crates/tako-control/{CATALOG_SOURCE}:{line}: {at}"))
+        .collect();
+    assert!(
+        lines.is_empty(),
+        "行末 `\\` の継ぎ目で語が空白なしに繋がる箇所が {} 個ある。継続は次の行の先頭の空白を\
+         捨てるので、前の行の `\\` の直前に半角空白を置く（Issue #1905）:\n{}",
+        lines.len(),
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn 折り返しの繋がりを行番号で名指せる() {
+    let src = concat!(
+        "        \"description\": \"返り値を返す\\\n", // 2: 和文 + 英字
+        "            pane_id と tab を返す。tab\\\n",  // 3: 英字 + 和文
+        "            から読む。foo\\\n",               // 4: 英字 + 英字
+        "            bar を見る。改行は\\n\\\n",       // 5: `\n` の後は改行（拾わない）
+        "            next を見る。空白を置く \\\n",    // 6: 空白あり（拾わない）
+        "            pane（括弧）\\\n",                // 7: 約物 + 英字（拾わない）
+        "            tab・\\\n",                       // 8: 中黒 + 英字（拾わない）
+        "            pane と\\\n",                     // 9: 空行を挟んでも次の文字が右
+        "\n",
+        "            tab を返す\\\\\n", // 11: `\\` で終わる = 継続ではない
+        "            x\",\n",
+        "        // コメントの行末は見ない\\\n",
+        "        y\n",
+    );
+    let src = format!("\n{src}");
+    let (checked, glued) = glued_continuations(&src);
+    let lines: Vec<usize> = glued.iter().map(|(line, _)| *line).collect();
+    assert_eq!(lines, vec![2, 3, 4, 9], "{glued:?}");
+    assert_eq!(checked, 8, "継ぎ目の数え方が変わった: {glued:?}");
+    assert!(
+        glued[0].1.contains("返り値を返す") && glued[0].1.contains("pane_id"),
+        "{glued:?}"
+    );
+
+    // 実物への注入: catalog.rs の空白つきの継ぎ目 1 つから空白を抜くと、その行で名指す
+    let real = catalog_source();
+    let mut lines: Vec<String> = real.lines().map(str::to_string).collect();
+    let at = lines
+        .iter()
+        .position(|l| {
+            !l.trim_start().starts_with("//")
+                && l.strip_suffix(" \\")
+                    .and_then(|body| body.chars().next_back())
+                    .is_some_and(is_wabun)
+        })
+        .expect("和文 + 空白 + `\\` で終わる継ぎ目が catalog.rs に 1 つも無い");
+    let next_is_eiji = lines[at + 1..]
+        .iter()
+        .find_map(|l| l.trim_start().chars().next())
+        .is_some_and(is_eiji);
+    if !next_is_eiji {
+        // 次の行を英字で始める形へ寄せる（注入の形を固定するため）
+        lines.insert(at + 1, "                pane_id を返す\\".into());
+    }
+    let stripped = lines[at]
+        .strip_suffix(" \\")
+        .expect("空白つきの継ぎ目")
+        .to_string();
+    lines[at] = format!("{stripped}\\");
+    let (_, glued) = glued_continuations(&(lines.join("\n") + "\n"));
+    assert_eq!(
+        glued.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
+        vec![at + 1],
+        "注入した継ぎ目（{}:{}）を名指せない: {glued:?}",
+        CATALOG_SOURCE,
+        at + 1
+    );
+}
+
+/// 実行 OS で変わる語を両方の OS の表記へ置き換えた全文（リンクの打鍵は macOS = `⌘+クリック` /
+/// Windows = `Ctrl+クリック`）。「パスリンクの{打鍵}」は macOS では「の⌘」で通り、Windows でだけ
+/// 「のCtrl」と詰まるので、どちらの OS で走らせても両方の形を見る
+fn platform_variants(s: &str) -> Vec<String> {
+    use tako_core::platform::keys::link_click;
+    use tako_core::platform::support::Platform;
+    let current = link_click(Platform::current());
+    [Platform::MacOs, Platform::Windows]
+        .into_iter()
+        .map(|p| s.replace(&current, &link_click(p)))
+        .collect()
+}
+
+/// 和文と英字が空白なしに隣り合う 2 文字を返す
+fn adjacent_wabun_eiji(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .windows(2)
+        .filter(|w| (is_wabun(w[0]) && is_eiji(w[1])) || (is_eiji(w[0]) && is_wabun(w[1])))
+        .map(|w| format!("{}{}", w[0], w[1]))
+        .collect()
+}
+
+/// 描かれた全文でも和文と英字が空白なしに隣り合わない（継ぎ目以外 = 1 行の中に直書きした形や、
+/// 他のファイルの正本から生成した案内文も見る）。バッククオートは英字に数えない
+/// （「`ラベル=本文`」のようなコードの中の和文は詰めて書く）
+#[test]
+fn mcp説明文で和文と英字が空白なしに隣り合わない() {
+    let mut problems = Vec::new();
+    for tool in mcp::tools() {
+        let name = tool["name"].as_str().unwrap_or("?").to_string();
+        let mut strings = Vec::new();
+        collect_strings(&tool, &mut strings);
+        for s in strings {
+            let mut found: Vec<String> = platform_variants(&s)
+                .iter()
+                .flat_map(|v| adjacent_wabun_eiji(v))
+                .collect();
+            found.sort();
+            found.dedup();
+            problems.extend(
+                found
+                    .into_iter()
+                    .map(|pair| format!("  {name}: 「{pair}」")),
+            );
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "MCP カタログの説明文で和文と英字が空白なしに隣り合う箇所が {} 個ある\
+         （和文と英字の間は半角空白。Issue #1905）:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}

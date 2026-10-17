@@ -334,3 +334,70 @@
 ### tako_todo / tako_orchestrator_run
 - todo の「生成物の」レビュー・「宣伝」投稿 /「（master が閉じていれば起動して初回メッセージで渡す）」→「閉じていれば起動して渡す」/ expand の「tasks ビューで展開して」「（パネルが閉じていれば開く）」
 - orchestrator_run の「MCP 呼び出しが中断されても worker は孤児化せず」/「（完了判定は）バックグラウンドで繰り返し」/ sync の「（後方互換）」
+
+## #1905 で外した記述（2026-10-17）
+
+#1896 の後、usage 分析・Code Runner の実行設定・IDE の対応形式などの口が足されて 203,726 バイト（162 本。
+`tako context-budget` の実測）まで戻ったので、同じ方針で 72 本の説明文を短くした（194,512 バイトへ = 空き 10,288 バイト。
+ツールの増減・引数・型・enum・必須・既定値は不変 = description を落とした JSON が前後で一致）。全体の言い換えとして「省略時は」→「省略は」（206 か所）、
+「対象プレビューペイン ID」「対象ペイン ID」の「対象」と「操作種別」の「種別」を落とした。以下はツールごとに
+外した記述（「→」の後は在り処）。言い換えだけで情報が減っていないものは載せていない。
+
+### tako_lsp
+- 「pane で絞り・省略で全文書」「severity でその重大度以上に絞る」「pane の省略は呼び出し元」→ `pane` / `severity` の引数説明
+- 「位置は tako_preview_edit_range と同じ（行 1 始まり・桁 0 始まりの UTF-8 バイト）」→ `line` / `column` の引数説明
+- `line` / `column` の「定義ジャンプ / 補完 / menu / ホバー / 参照・階層 / rename: … 必須」→ description 末尾の 1 文
+- completion の「（GUI の打鍵中の一覧と同じ絞り込み）」/ open-result の「（定義ジャンプと同じ着地）」/ end_line の「（4 つそろえて範囲の整形）」→ description
+- format-on-save の「既定 false」/「自動保存では整形しない」→「明示的な保存だけで効く」/ show・focus の「（既定 false）」
+### tako_orchestrator_self / tako_orchestrator_worker_status / tako_orchestrator_respond
+- self の「auto_handoff が有効なら閾値超過で」→「（auto_handoff）」/ legacy の「節分離前。」/「master / solo でなければ pane_id はそのまま返しつつ」
+- worker_status の「（項目と番号縛りは tako_orchestrator_respond の説明）」「tako_send_input でなく」→ respond の説明 /「返るものは」の並びから recommended_action を外して次の文へ
+- respond の「events の choice_dialog には dialog_kind が付く」→ worker_status の events
+### tako_run / tako_file_op / tako_run_interactive
+- run の「tako:run 宣言・プロジェクト既定・拡張子既定のコマンドで」→ 解決順 / 変数の言い換え（`${fileDir}` = ディレクトリ / `${fileNoExt}` = 拡張子なし / `${ext}` = 拡張子 / `${workspaceRoot}` = プロジェクトのルート / `${arduino_cli}` = arduino-cli。名前で分かる）/「（コマンド・cwd 内。」/「プロジェクトの」.venv
+- file_op の open_in_tako「ターミナル内の … ・修飾 + 右クリックメニューと同じ動作」/ move の「ツリーの D&D と同じ」/ clipboard_copy の「のでファイルマネージャへ貼れる」
+- run_interactive の「AI が直接入力できないもの」/「アトミックに」/「exit code 回収マーカーでラップされるので」/「流れ: ペインを開く → … → 自動 close」
+### tako_sessions / tako_persist / tako_setup / tako_orchestrator_spawn
+- sessions の「繋がっていなければ url は無く」/「（codex / agy は list だけ）」（codex の usage が入ったので古い）
+- persist の「tmux の有無に関わらず」/「設定は永続化される」
+- setup の「ユーザーが日本語で伝えた好みを answers に変換して」→「ユーザーの好みを引数へ写して」。「instructions」は実在の引数名 `instruction_content` へ直した
+- spawn の「（status / watch は pane_id だけで足りる）」
+### tako_send_input / tako_read_pane / tako_limit_resume / tako_sleep_guard
+- send_input の click「GUI のクリックと同じ経路」/「顛末は応答と」
+- read_pane の choice_dialog「tako_send_input でなく」
+- limit_resume の「layout.json に永続化され」→「残る」/「ラベル一致で」「構造的に」/ 一括の対象の列挙「master / worker / solo / 手起動の claude 等」/「（ステータスバーのボタンと同じ）」
+- sleep_guard の「蓋閉じ継続は既定で AC 接続時のみ。」→ `lid_power_condition` の引数説明（既定 ac-only）
+### tako_remote_* / tako_open_remote
+- remote_start の「daemon は」/「（承認・role 変更は Mac の GUI 限定で AI からは行えない）」→「承認・role の昇格は Mac の GUI だけ」
+- remote_status の「接続時の認証は機器ペアリングが行う」
+- remote_devices の「（機器ペアリング認証）」/「（role に現在より弱いものを渡す）」→ `role` の引数説明 /「（セキュリティ境界のため AI には昇格経路を提供しない）」→「（セキュリティ境界）」/ `action` の引数説明（list = 端末一覧 / …）→ description
+- remote_shortcuts の「PWA・CLI（tako remote shortcuts）とこのツールが同じ 1 実装を通るのでどこから足しても同じ一覧になる」→「PWA・CLI と同じ一覧」/ `action` の引数説明 → description
+- remote_setup の「（既定のループバック TCP では」/ remote_folder の terminal「後から ssh-pane でも繋げる」
+- open_remote の「HostName / User / Port 等を」
+### tako_setup_* / tako_migrate / tako_context_budget / tako_lsp_server
+- setup_bootstrap の path「unix は profile、Windows はユーザー環境変数」
+- setup_models の「「実取得ではない」ことを明示する」/ failure.kind の言い換え（not_authenticated = 未ログイン / no_list_command = 一覧コマンドが無い）
+- setup_mcp の「env_vars は変数名だけで」/「旧版が ~/.claude/settings.json に書いた無効な設定は自動で掃除する」
+- migrate の「の差分検出で」/「schema で種別を 1 つに絞れる」→ `schema` の引数説明
+- context_budget の「dry_run=true で移送予定だけ返す」→ `dry_run` の引数説明
+- lsp_server の list「（解決はキャッシュ。restart で引き直す）」→ restart の「検出も引き直す」/ fetch.cleanup の「表の版を上げた後の」
+### tako_orchestrator_guide / tako_orchestrator_adopt / tako_orchestrator_handoffs / tako_orchestrator_report / tako_orchestrator_workers / tako_orchestrator_supervisor
+- guide の「system prompt には「いつ引くか」だけを置き、手順の全文は … ここから取得する」/「プロファイルと利用者のファイルから組み立てるので」
+- adopt の「・コンテキスト」/ handoffs の「（冪等）」
+- report の「可視画面だけでなくスクロールバック履歴を遡るので長い出力も取れる」→「履歴も遡る」/「（レジストリ ID）」
+- workers の unverified「・起動したが到達未確認」/「既定は active のみ」
+- supervisor は言い換えだけ（action=status 等の `action=` を外した）
+### tako_list_panes / tako_background_list / tako_pin_preview / tako_tmux_* / tako_session_restart / tako_stale_binary
+- list_panes の「エージェントや dev サーバーの実行状況の把握に使える。」/ backend_windows の「（右パネルの表示状態に関わらず）」「[..] = window 全件」
+- background_list の「バックグラウンドペインはこの由来タブでグループ分けして表示され」/ pin_preview の「サイドバー tmux ビューの」
+- tmux_cleanup の「killed が空でも「対象無し」と「見送り」を区別できる」/ servers の「既定は dry-run」→「apply 無しは一覧と判定理由だけ」
+- tmux_open の「（省略は右）」→ `direction` の引数説明
+- session_restart の「（tako_agent_support の session_restart_harness / _handoff）」→ tako_agent_support の表
+- stale_binary の「claude CLI は symlink 張り替えで更新されるが」（仕組み）
+### その他
+- agent_support の「tako は claude を基準に実装してきたため、系統によって使えない操作がある。」/ platform の「tako は macOS 先行で開発して Windows へ反映していくため、環境によって使えない操作がある。」（経緯）
+- chat_copy の「UI のコピーボタンと同じ経路。」/ test_residue の「（pid の再利用はプロセスの起動時刻と dir の作成時刻の比較で見分け、見送る）」（仕組み）
+- menu の「（macOS はメニューが OS のメニューバーに載るため tako から開閉できない）」→ 短縮 / web の「macOS の WKWebView」/ search の「（行を押すのと同じ）」
+- move_pane_to_tab の「同タブ内の並べ替え = ペインタイトルバーの」/ preview_cursor の「範囲編集は位置を自分で持つので」
+- ui_mode・scrollback の「settings.json へ」/ autosuggest の「ヒントはゴーストの直後に薄く出る案内で」「自動的に」/ scrollback の「軽量運用では下げる」
+- preview_edit_range の「丸めず」/ links の「GUI の{打鍵}と同じ判定を通すので」→「GUI と同じ判定」
