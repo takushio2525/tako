@@ -17,9 +17,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/queue.sh # run_heavy = 重い処理を順番待ちへ（#1994）
 
-if [ -z "${TAKO_SOCKET:-}" ]; then
-  # 外側: ビルドして example ホスト内で自分を再実行する
+# 外側か内側（example ホストの中で再実行された側）かは専用の印で見分ける（#1970）。
+# TAKO_SOCKET は本番 tako のペインにもあるので印にならない（それで見分けていた頃は、本番のペインから
+# 回すと外側を飛ばし、本物の claude が本番 tako の MCP でペインを分割しうる形だった）
+if [ -z "${TAKO_VERIFY_CLAUDE_MCP_INNER:-}" ]; then
+  # 外側: ビルドし、本番 tako の env（ホストが注入しない mod の env も）を落としてから
+  # example ホスト内で自分を再実行する
   run_heavy cargo build -p tako-cli --quiet
+  unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_CLI TAKO_MCP_URL CLAUDE_CODE_PLUGIN_DIRS \
+    TAKO_ORCHESTRATOR_ROLE
+  export TAKO_VERIFY_CLAUDE_MCP_INNER=1
   exec cargo run -p tako-control --example mcp_host --quiet -- bash "$0"
 fi
 

@@ -9,6 +9,9 @@
 # 使い方: bash scripts/test-serve-watch.sh
 set -euo pipefail
 
+# 本番 tako のペインから回しても CLI が本番の GUI へ繋がないよう、本番が配る env を落とす（#1970）
+unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 PASS=0
