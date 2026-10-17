@@ -3544,18 +3544,22 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     // 検出値・既定値だけの標準ケースは確認を挟まず適用する（Issue #262 要件 D）。
     remaining.extend(configure_agent_mcp(&agents));
+    let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
     // tako mod を Claude Code の設定 dir ごとの skills/tako へ（FR-2.42.25 / #1959）。
     // claude を検出した**後**に置く（版の下限を見るため。未検出なら版の判定も回さない）。
-    // 実装・文面の正本は tako-control 側で、**止めない**（入れられなくても env の注入で動く）
+    // **指示ファイルの段の後**に置く（#2292）: 置くのは在る設定 dir だけ（tako は設定 dir を
+    // 作らない）で、新品の HOME の `~/.claude` は直前の段が CLAUDE.md と一緒に作る。前に置くと
+    // 1 回目は黙って入らず、2 回目に入っても最終サマリが「変更なし」と言っていた。
+    // 書いた・外した dir はサマリ（`plan`）へ積む。実装・文面の正本は tako-control 側で、
+    // **止めない**（入れられなくても env の注入で動く）
     let claude_version = agents
         .iter()
         .any(|agent| agent.kind == SetupAgent::Claude)
         .then(tako_control::stale_binary::bounded_claude_version)
         .flatten();
-    for line in tako_control::claude_mod_install::run_setup_stage(claude_version) {
+    for line in tako_control::claude_mod_install::run_setup_stage(claude_version, &mut plan) {
         eprintln!("{line}");
     }
-    let instruction_coverage = apply_instruction(selected, answers.instruction_content.as_deref())?;
     apply_sleep_guard_answers(sleep_guard_answer)?;
 
     let dir = setup_dir()?;
