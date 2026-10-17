@@ -7,6 +7,9 @@
 #   scripts/nightly-release.sh --reserve           # 次回バージョンの予約を表示
 #   scripts/nightly-release.sh --reserve 0.8.0     # 次回バージョンを予約（1 回で消費）
 #   scripts/nightly-release.sh --unreserve         # 予約を取消
+#   scripts/nightly-release.sh --role              # この PC の夜間の役を表示（既定は全部）
+#   scripts/nightly-release.sh --role check        # 検査だけの役にする（2 台構成のリリースしない側。#2252）
+#   scripts/nightly-release.sh --role full         # 既定（全部）へ戻す
 #   scripts/nightly-release.sh --install-launchd   # launchd ジョブ（毎日 5:00）を登録
 #   scripts/nightly-release.sh --uninstall-launchd # launchd ジョブを解除
 #
@@ -20,6 +23,8 @@
 #   1.5 tako mod の検査（#1892）: origin/main の mod を `claude plugin validate --strict` /
 #      `claude plugin test` にかけ、落ちたら通知する。**リリースの有無に依らず毎晩**回し、
 #      **結果でリリースを止めない**（理由は run_mod_check の注記。claude が無ければ未実測）
+#   1.6 この PC の役が「検査だけ」（--role check。#2252）ならここで抜ける。2〜7 のリリースの段は
+#      飛ばし、8 の footprint の見張りだけが EXIT trap から回る（役の注記は「夜間の役」の節）
 #   2. worktree が clean か確認（dirty = 人間の作業中 → スキップ）
 #   3. git fetch → 最新タグ vs origin/main。差分ゼロなら「変更なしスキップ」
 #   4. Cargo.toml の version == 最新タグのときのみ bump する
@@ -148,6 +153,7 @@ show_reservation() {
   fi
   echo "予約ファイル: $(nightly_reserve_file)"
   echo "操作: --reserve <X.Y.Z> で予約 / --unreserve で取消"
+  warn_reserve_on_check_role
 }
 
 reserve_version() {
@@ -164,6 +170,7 @@ reserve_version() {
   echo "予約しました: ${version}（現行 ${current} → 次回の夜間リリースは v${version}・$(nightly_bump_label_ja "${kind}")繰り上げ）"
   echo "予約ファイル: $(nightly_reserve_file)"
   echo "取消: scripts/nightly-release.sh --unreserve"
+  warn_reserve_on_check_role
 }
 
 unreserve_version() {
@@ -175,6 +182,80 @@ unreserve_version() {
   else
     echo "予約はありません（変更なし）"
   fi
+}
+
+# ---- 夜間の役（#2252）------------------------------------------------------
+# 夜間を 2 台で回すとき、リリースを出すのは 1 台だけにする。2026-10-17 に手元の Mac と旧 Mac の
+# 2 台が同じ時刻に同じ版をビルドしていると分かった（遅れた側は「ビルド中に origin/main が進んだ」で
+# 毎朝ビルドぶんを捨て、同じタグを取り合う競りもありうる）。リリースしない側は「検査だけ」の役にして、
+# その PC の claude と仮想ディスプレイが要る mod の検査（#1892）と footprint の見張り（#2023）だけを回す。
+#   - full（既定）: 全部。**何も設定しない 1 台の利用者は今までどおり**（ゼロコンフィグ）
+#   - check: 検査だけ。変更検知・版数・ビルド・push・タグ・GitHub Release・予約の消費をしない
+# 役は予約と同じくリポジトリの外の状態ファイル 1 か所に持つ（PC ごとの設定・worktree を dirty に
+# しない・--install-launchd で plist を作り直しても消えない・launchctl の読み直しが要らない）
+nightly_role_file() {
+  printf '%s\n' "${HOME}/.claude-orchestrator/state/tako-nightly-role"
+}
+
+# 設定値を読む（無ければ何も出さない）。書式は予約ファイルと同じ（# から行末はコメント・最初の非空行）
+nightly_role_read() {
+  local file
+  file=$(nightly_role_file)
+  [[ -f "$file" ]] || return 0
+  awk '{ gsub(/\r/, ""); sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") { print; exit } }' "$file"
+}
+
+nightly_role_label() {
+  case "$1" in
+    check) echo "検査だけ（mod の検査と footprint の見張りだけを回し、ビルド・push・タグ・GitHub Release はしない）" ;;
+    *) echo "全部（リリースと、mod の検査・footprint の見張り）" ;;
+  esac
+}
+
+show_role() {
+  local role
+  role=$(nightly_role_read)
+  case "$role" in
+    "") echo "役: $(nightly_role_label full)。既定" ;;
+    check) echo "役: $(nightly_role_label check)" ;;
+    *) echo "役: **無効な値** ${role} → 夜間は既定の全部で回る" ;;
+  esac
+  echo "役の設定ファイル: $(nightly_role_file)"
+  echo "操作: --role check で検査だけ / --role full で既定（全部）へ戻す"
+}
+
+set_role() {
+  local role="$1" file tmp
+  file=$(nightly_role_file)
+  case "$role" in
+    check)
+      mkdir -p "$(dirname "$file")"
+      tmp="${file}.tmp.$$"
+      {
+        echo "# tako 夜間リリース: この PC の夜間の役（#2252）"
+        echo "# 設定日時: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# 既定（全部）へ戻す: scripts/nightly-release.sh --role full"
+        echo "check"
+      } > "$tmp"
+      mv "$tmp" "$file"
+      ;;
+    # 既定へ戻す = ファイルを消す（何も設定していない 1 台と同じ状態にする）
+    full) rm -f "$file" ;;
+    *)
+      echo "ERROR: 役は check（検査だけ）か full（全部）: ${role}" >&2
+      exit 2
+      ;;
+  esac
+  echo "役を設定しました: $(nightly_role_label "$role")"
+  echo "次の夜間（毎日 5:00）から効く。確認: scripts/nightly-release.sh --role"
+}
+
+# 予約はリリースする PC の夜間だけが読む（置き場は PC ごと）。検査だけの PC で打っても使われない
+warn_reserve_on_check_role() {
+  if [[ "$(nightly_role_read)" == check ]]; then
+    echo "注意: この PC の夜間は検査だけの役（--role）なので、ここの予約は使われない。予約はリリースする PC で打つ"
+  fi
+  return 0
 }
 
 # ---- launchd 登録 / 解除 ------------------------------------------------
@@ -245,6 +326,8 @@ PLIST_END
   launchctl load "$PLIST"
   echo "登録完了: ${LABEL}（毎日 5:00、対象リポ: ${install_root}）"
   echo "確認: launchctl list | grep tako-nightly"
+  # 役は plist ではなく状態ファイルに持つので、作り直しても変わらない（#2252）
+  echo "この PC の役: $(nightly_role_label "$(nightly_role_read)")（変更: scripts/nightly-release.sh --role）"
 }
 
 uninstall_launchd() {
@@ -253,7 +336,7 @@ uninstall_launchd() {
   echo "解除完了: $LABEL"
 }
 
-ARG_HINT="--dry-run / --reserve [<X.Y.Z>] / --unreserve / --install-launchd / --uninstall-launchd"
+ARG_HINT="--dry-run / --reserve [<X.Y.Z>] / --unreserve / --role [check|full] / --install-launchd / --uninstall-launchd"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)            DRY_RUN=1; shift ;;
@@ -270,6 +353,16 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     --unreserve)          unreserve_version; exit 0 ;;
+    # 引数なしで現在値（--reserve と同じ形）
+    --role)
+      shift
+      if [[ $# -gt 0 && "$1" != --* ]]; then
+        set_role "$1"
+      else
+        show_role
+      fi
+      exit 0
+      ;;
     *) echo "不明な引数: ${1}（${ARG_HINT}）" >&2; exit 2 ;;
   esac
 done
@@ -285,6 +378,20 @@ if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   notify "失敗: git リポジトリが無効"
   exit 1
 fi
+
+# ---- この PC の役（#2252）---------------------------------------------------
+NIGHTLY_ROLE=$(nightly_role_read)
+case "$NIGHTLY_ROLE" in
+  "" | full) NIGHTLY_ROLE=full ;;
+  check) ;;
+  *)
+    # 手で書き壊した値。止めずに既定（全部）で回し、気づけるよう知らせる。全部へ倒しても、
+    # リリースする PC が先に出していれば push の前の先端の照合で何も作らずに中止する（害はビルドの負荷だけ）
+    log "WARN: 夜間の役の値が読めない（${NIGHTLY_ROLE}）。既定の全部で回す（設定: $(nightly_role_file)。直すのは scripts/nightly-release.sh --role check か --role full）"
+    notify "役の値が読めない: 既定の全部で回す"
+    NIGHTLY_ROLE=full
+    ;;
+esac
 
 # ---- 前提チェック --------------------------------------------------------
 
@@ -506,6 +613,19 @@ run_mod_check() {
   return 0
 }
 run_mod_check || log "WARN: mod の検査が途中で失敗した。夜間リリースは続ける"
+
+# ---- 検査だけの役はここまで（#2252）------------------------------------------
+# 変更検知・版数・ビルド・push・タグ・GitHub Release・予約の消費へは進まない（dirty の判定も
+# リリースの段の一部なので見ない）。footprint の見張りはロックを取った時点で仕掛け済みなので、
+# この後の EXIT trap から全部の役と同じ順で回る
+if [[ "$NIGHTLY_ROLE" == check ]]; then
+  log "役: 検査だけ → リリースの段（ビルド・push・タグ・GitHub Release）は飛ばす（リリースは別の PC の夜間が出す。設定: $(nightly_role_file)）"
+  RESERVED=$(nightly_reserve_read)
+  if [[ -n "$RESERVED" ]]; then
+    log "WARN: この PC に次回バージョンの予約 ${RESERVED} があるが、検査だけの役なので使わない（予約はリリースする PC で打つ）"
+  fi
+  tako_exit 0
+fi
 
 # ---- 次回バージョン予約の読み取り（この時点では消費しない）------------------
 # 「リリースに至ったときだけ消費する」ため、以降のスキップ経路では保持したまま抜ける

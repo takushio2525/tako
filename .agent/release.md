@@ -2,7 +2,7 @@
 
 > `AGENTS.md`「リリース運用」節の**詳細**。両 OS 同時リリースの仕組み・配布物に同梱する
 > ライセンス・配布物に個人情報を入れない仕組み・夜間リリース・次回バージョンの予約・
-> footprint の回帰の見張り・安定版への昇格（Homebrew cask と docs の追従）はここにある。**毎ターンは読まない** —
+> footprint の回帰の見張り・2 台構成と夜間の役・安定版への昇格（Homebrew cask と docs の追従）はここにある。**毎ターンは読まない** —
 > リリースを打つ直前・機構を触る直前にその節だけ Read する。
 
 ## 両 OS 同時リリース（#965）
@@ -285,6 +285,55 @@ tako mod（`crates/tako-core/claude-mod`）の API は early access で、Claude
 - 検証は `bash scripts/test-nightly-footprint-watch-2023.sh`（CI の macOS ジョブ。計測・tako・cargo・release.sh は
   代役、HOME も隔離。判定の単体・見張りの通し・夜間のフックの終了コードを見る）
 - **launchd の登録は変えない**（install_root の nightly-release.sh が呼ぶので、main を pull すれば翌晩から効く）
+
+### 2 台構成と夜間の役（#2252）
+
+LaunchAgent は PC ごとに登録するので、2 台に入れると**同じ時刻に同じ版を 2 台がビルドする**。2026-10-17 に
+手元の Mac と旧 Mac（常駐機）の 2 台で動いていると分かった。公開していたのは旧 Mac で、手元は毎朝 7.5 分ビルドしてから
+push の直前に「ビルド中に origin/main が進んだ」（= 旧 Mac が push したリリースのコミット）で中止していた。push の前の
+先端の照合とタグの有無の検査（#1136）があるので同じ版が 2 本できることは無いが、ビルドの負荷が毎朝無駄になり、
+同じタグを取り合う競りの余地も残る。そこで**リリースを出すのは 1 台だけにし、もう 1 台は「検査だけ」の役にする**。
+
+| 役 | 設定 | 回るもの |
+|---|---|---|
+| 全部（既定） | 何もしない | 変更検知 → 版数 → ビルド → push → タグ → GitHub Release と、mod の検査・footprint の見張り |
+| 検査だけ | `scripts/nightly-release.sh --role check` | mod の検査（#1892）と footprint の見張り（#2023）だけ |
+
+- **ゼロコンフィグ**: 役を設定しない 1 台の利用者は今までどおり全部やる（夜間のログも変わらない）。
+  確認は引数なしの `--role`、既定へ戻すのは `--role full`（状態ファイルを消す = 何も設定していない 1 台と同じ）
+- 役は予約と同じ置き場の状態ファイル `~/.claude-orchestrator/state/tako-nightly-role` の **1 か所**に持つ
+  （PC ごとの設定・リポジトリの外なので worktree を dirty にしない・`--install-launchd` で plist を作り直しても
+  消えない・launchctl の読み直しが要らない = 次の 5:00 から効く）。launchd が叩くのは install_root の
+  nightly-release.sh なので、**main を pull してから** `--role` を打つ（古い版は `--role` を知らない）
+- 検査だけの役は **mod の検査の直後で抜ける**: 変更検知・dirty の判定・版数・使い捨ての worktree・ビルド・push・
+  タグ・Release・予約の消費のどれにも入らない（cargo も gh も呼ばない）。footprint の見張りはロックを取った時点で
+  仕掛け済みなので、全部の役と同じく EXIT trap の最後に回る。多重起動・`--dry-run`・`TAKO_NIGHTLY_FOOTPRINT=0` の
+  扱いも全部の役と同じ
+- **予約はリリースする PC で打つ**（予約ファイルも PC ごと）。検査だけの PC にある予約は使わず消費もせず、
+  夜間のログに WARN、`--reserve` の表示に注意を出す
+- 状態ファイルの値が読めない（手で書き壊した）ときは止めずに**既定の全部で回し**、WARN と通知で知らせる
+  （リリースする PC が先に出していれば push の前の照合で何も作らずに止まるので、害はビルドの負荷だけ）
+- mod の検査は claude、footprint の見張りは仮想ディスプレイ（tako-vd）が要る。どちらの記録
+  （`~/.claude-orchestrator/state/` の `tako-mod-check` / `tako-footprint/`）も PC ごとに持つ
+- 検証は `bash scripts/test-nightly-role-2252.sh`（CI の macOS ジョブ。release.sh・mod の検査・footprint の見張り・
+  cargo・gh・osascript・launchctl は呼ばれたことを記録する代役、origin は一時ディレクトリの bare リポ、HOME も隔離。
+  役なしで全部の段が走る / 検査だけで origin の main とタグが動かず検査 2 つが走る / 同じ環境で `--role full` へ
+  戻すとリリースする / タグが無い・dirty・予約あり・dry-run・多重起動 / 不正な値と壊れた値 / plist が役で変わらない、を見る）
+
+#### 今の 2 台（2026-10-17 に旧 Mac を読み取りだけで確認）
+
+- **旧 Mac = 全部**（リリースを出す側。2026-10-17 にユーザーが「夜間は旧 Mac で続ける」と決めた）/
+  **手元の Mac = 検査だけ**（#2252 の merge 後に master が `--role check` を打つ）
+- **旧 Mac では mod の検査も footprint の見張りも回っていない**: `~/.claude-orchestrator/state/` に両方の記録が無く、
+  夜間のログにも `mod:` / `footprint:` の行が 1 行も無い。手元を検査だけにしても検査は失われない（今は手元でしか回っていない）
+- 原因は旧 Mac の共有ツリーが **1 日おきに 2 つの版を行き来している**こと（リリース自体は毎晩出ている）:
+  - 前夜のリリースのコミットで detached の夜は新しい版が走り、`restore_detached_head`（#1136）が共有ツリーを
+    **ローカルの main** へ戻す。旧 Mac のローカルの main は 2026-08-14 で止まっていて（origin/main より 688 コミット古い）、
+    `scripts/check-claude-mod.sh` も `nightly-footprint-watch.sh` も無いので、mod の検査は「無いので飛ばす」
+    （10/12・10/14・10/16 の WARN）。footprint の見張り（v0.8.35 から）も同じ理由で飛ぶ
+  - 翌夜は launchd がその古い main の nightly-release.sh（#1136 / #1892 / #2023 より前 = 共有ツリーをその場で detach して
+    リリースする版）を読むので検査が無く、共有ツリーをまたリリースのコミットで detached のまま残す
+  - `restore_detached_head` がローカルの main の鮮度を見ないことと旧 Mac の共有ツリーの状態の問題で、#2252 の範囲外（別 Issue）
 
 ## 安定版への昇格（#403 / #1853 / #1592）
 
