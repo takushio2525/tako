@@ -15,7 +15,10 @@
 //!    `arg`（= `run_pane_dialect_for(platform).quote_fragment`）の 1 本
 //! 3. 宣言の `tako:cwd`（`runner.rs`）を macOS だけ「引用して展開 → 全体が単引用符なら外す」で
 //!    作っていたので、`${fileDir}/build` が `/tmp/my dir/'/tmp/my dir'/build` になった。正しい形は
-//!    両 OS で `declared_cwd_value`（引用しない展開 `expand_literal`）の 1 本
+//!    両 OS で `declared_cwd_value`（引用しない展開 `expand_literal`）の 1 本。値全体を
+//!    **二重引用符**で囲んだ `tako:cwd: "${fileDir}"` は #2299 まで外す対象に無く、両 OS で
+//!    `/tmp/my dir/"/tmp/my dir"` の相対パスになっていた。単引用符と同じ `strip_quotes` が外し、
+//!    中のエスケープは実行ペインの方言の規則（`posix_double_quoted` / `ps_double_quoted`）で戻す
 //!
 //! 規則（**落ちるときは file:line で名指し**）:
 //!
@@ -25,8 +28,10 @@
 //! - 規則 2: `declared_shell_command` が `run_pane_dialect_for(platform)` と `.enclose_arg(` を通り、
 //!   方言を決め打ちした引用・手書きの `'\''`・`quote_for_shell` を置かない
 //! - 規則 3: `resolve_core` の宣言の cwd は `declared_cwd_value(` を通り（`strip_quotes(` を直に
-//!   呼ばない）、`declared_cwd_value` は `expand_literal(` で展開する（引用する展開を使わない）
-//! - 規則 4（実挙動）: 3 経路それぞれの両 OS の形
+//!   呼ばない）、`declared_cwd_value` は `expand_literal(` で展開する（引用する展開を使わない）。
+//!   `strip_quotes` は二重引用符（`'"'`）も見て、POSIX と PowerShell それぞれの規則
+//!   （`posix_double_quoted(` / `ps_double_quoted(`）へ渡す（#2299）
+//! - 規則 4（実挙動）: 3 経路それぞれの両 OS の形（経路 3 は二重引用符の囲みを含む）
 //!
 //! ## 眺めの選び方
 //!
@@ -37,7 +42,8 @@
 //! ## A/B（検出力の確かめ方）
 //!
 //! `注入した違反をfile_lineで名指しする` が、3 経路それぞれへ方言を見ない引用を戻した写しで
-//! 対応する規則が落ち、`<file>:<行>` を名指すことを確かめる
+//! 対応する規則が落ち、`<file>:<行>` を名指すことを確かめる（経路 3 は #2299 の二重引用符を
+//! 見ない形・片方の方言の規則で両方を読む形を含む）
 
 #[path = "common/production_range.rs"]
 mod production_range;
@@ -216,6 +222,41 @@ fn 作業ディレクトリの展開を調べる(src: &str, rel: &str) -> Vec<St
         }
         Err(e) => hits.push(e),
     }
+    // #2299: 二重引用符の囲みも同じ `strip_quotes` で外し、中は実行ペインの方言の規則で戻す
+    match 関数の範囲(&view, src, rel, "fn strip_quotes(") {
+        Ok((s, e)) => {
+            let body = &view[s..e];
+            for (need, why) in [
+                (
+                    "'\"'",
+                    "二重引用符の囲みを見ていない（`tako:cwd: \"${fileDir}\"` が \
+                     `/tmp/my dir/\"/tmp/my dir\"` の相対パスになる）",
+                ),
+                (
+                    "posix_double_quoted(",
+                    "POSIX の実行ペインの二重引用符の規則（`\\\"` → `\"`）へ渡していない",
+                ),
+                (
+                    "ps_double_quoted(",
+                    "PowerShell の実行ペインの二重引用符の規則（`` `\" `` / `\"\"` → `\"`）へ渡していない",
+                ),
+            ] {
+                if !body.contains(need) {
+                    hits.push(format!(
+                        "{rel}:{}: `strip_quotes` が {why}。値全体を囲む二重引用符は単引用符と同じ 1 か所で\
+                         外し、中は実行ペインの方言の規則で戻す（Issue #2299）",
+                        行番号(src, s)
+                    ));
+                }
+            }
+        }
+        Err(e) => hits.push(e),
+    }
+    for sig in ["fn posix_double_quoted(", "fn ps_double_quoted("] {
+        if let Err(e) = 関数の範囲(&view, src, rel, sig) {
+            hits.push(e);
+        }
+    }
     hits
 }
 
@@ -293,6 +334,39 @@ fn 三経路の両osの形() {
             resolve(platform, &py, head, None).cwd,
             PathBuf::from("/tmp/my dir/build"),
             "{RUNNER}: {platform:?} の宣言の cwd が 1 つのパスになっていない"
+        );
+    }
+
+    // 経路 3（#2299）: 値全体を二重引用符で囲んだ宣言。名前に空白・引用符があっても 1 つの絶対パス
+    for dir in ["/tmp/my dir", "/tmp/say \"hi\" it's"] {
+        let py = PathBuf::from(format!("{dir}/x.py"));
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for (cwd, want) in [
+                ("\"${fileDir}\"", dir.to_string()),
+                ("\"${fileDir}/build\"", format!("{dir}/build")),
+            ] {
+                let head = format!("# tako:run: python ${{fileBase}}\n# tako:cwd: {cwd}\n");
+                assert_eq!(
+                    resolve(platform, &py, &head, None).cwd,
+                    PathBuf::from(&want),
+                    "{RUNNER}: {platform:?} の `tako:cwd: {cwd}` が二重引用符の残った相対パスになった\
+                     （Issue #2299）"
+                );
+            }
+        }
+    }
+    // 中のエスケープは実行ペインの方言で戻す: macOS（/bin/sh）は `\"`、Windows（PowerShell）は
+    // `` `" `` と `""`（`\` は逃がさない）
+    for (platform, cwd, want) in [
+        (Platform::MacOs, r#""/srv/a\"b""#, r#"/srv/a"b"#),
+        (Platform::Windows, r#""/srv/a`"b""#, r#"/srv/a"b"#),
+        (Platform::Windows, r#""/srv/a""b""#, r#"/srv/a"b"#),
+    ] {
+        let head = format!("# tako:run: python ${{fileBase}}\n# tako:cwd: {cwd}\n");
+        assert_eq!(
+            resolve(platform, &py, &head, None).cwd,
+            PathBuf::from(want),
+            "{RUNNER}: {platform:?} の `tako:cwd: {cwd}` の中を実行ペインの方言で戻していない（Issue #2299）"
         );
     }
 }
@@ -380,6 +454,28 @@ fn 注入した違反をfile_lineで名指しする() {
             "fn declared_cwd_value(",
             "expand_literal(&strip_quotes",
             "expand_variables(&strip_quotes",
+            作業ディレクトリの展開を調べる,
+        ),
+        // #2299: 二重引用符の囲みを見ない形（#2299 以前）・片方の方言の規則で両方を読む形
+        (
+            RUNNER,
+            "fn strip_quotes(",
+            "enclosed('\"')",
+            "None::<&str>",
+            作業ディレクトリの展開を調べる,
+        ),
+        (
+            RUNNER,
+            "fn strip_quotes(",
+            "ps_double_quoted(inner)",
+            "posix_double_quoted(inner)",
+            作業ディレクトリの展開を調べる,
+        ),
+        (
+            RUNNER,
+            "fn strip_quotes(",
+            "posix_double_quoted(inner)",
+            "ps_double_quoted(inner)",
             作業ディレクトリの展開を調べる,
         ),
     ] {
