@@ -57,7 +57,7 @@ tako orchestrator spawn --agent agy --project app --prompt "テストを通し�
 完了検知は claude と同じ速さです（[#1033](https://github.com/takushio2525/tako/issues/1033) で画面推定をやめ、agy が書く実況ログを一次シグナルとして読むようになりました）。報告も会話ログから取れます。
 
 :::note[思考の深さも指定できます]
-agy にも `--effort low|medium|high` があるので、tako からの effort 指定はそのまま届きます。モデル名に `(High)` のような表記を含むモデルでも同じです。使えるモデルは `tako setup models --agent agy` で実際の一覧を引けます。
+agy にも `--effort low|medium|high` があるので、tako からの effort 指定はそのまま届きます。モデル名に `(High)` のような表記を含むモデルでも同じです。使えるモデルは `tako setup models --agent agy` で実際の一覧を引けます。なお tako は agy が**実際に**どのモデルで動いたかを読まないので、指定と違うモデルで動いていても警告は出ません（`tako orchestrator workers` の `model_check` は `not_observed`。[#1638](https://github.com/takushio2525/tako/issues/1638)）。
 :::
 
 ## master には使えません
@@ -85,7 +85,7 @@ agy だけが入っている環境でも `tako setup` は完了しますが、`t
 
 ## Claude Code との差分
 
-現時点で 63 件中 24 件が「対応」です（一部対応 4 件・未対応 24 件・対象外 11 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 64 件中 24 件が「対応」です（一部対応 5 件・未対応 24 件・対象外 11 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent agy

@@ -72,11 +72,13 @@ tako orchestrator spawn --agent codex --model <モデル名> --project app --pro
 ```
 
 指定しなければ codex CLI の既定モデルが使われます。選べるモデルは `tako setup models --agent codex` で実際の一覧を引けます。
+
+tako は codex が**実際に**どのモデルで動いたかを読みません（`tako orchestrator workers` の `model_actual` は空・`model_check` は `not_observed`）。claude の worker のように「指定したモデルと違うモデルで動いている」という警告は出ません（[#1638](https://github.com/takushio2525/tako/issues/1638)）。
 :::
 
 ## Claude Code との差分
 
-現時点で 63 件中 36 件が「対応」です（一部対応 6 件・未対応 18 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 64 件中 36 件が「対応」です（一部対応 7 件・未対応 18 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent codex
