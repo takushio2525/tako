@@ -20,18 +20,6 @@
 
 ---
 
-## 2026-10-17（#1824: recent / shortcuts の破損を `data_files` 経由で persist.log へ・layout の `.corrupt` rename を番号付きの退避 `stash_unrestorable` へ）
-- A/B `TAKO_1824_LEGACY=1`・`scripts/test-corrupt-quarantine-1824.sh` 16 PASS・理由は `json_reason`（値を載せない）。残りは #2230 / #2231。PR #2226
-
-## 2026-10-17（#2227: 壊れた default.yaml で `tako master` は組み込み既定で立てるが `警告:`・persist.log・system prompt で知らせ、`-<key>` は #1825 の理由と直し方で止まる）
-- CLI と `master_launch::plan` を `load_profile` の 1 実装へ・A/B `TAKO_2227_LEGACY=1`・結合 9 本 + 番犬。残りの経路は #2233。PR #2229
-
-## 2026-10-17（#2204: usage 分析 S5 = codex の rollout の token_count の累積の差分を索引へ・rate_limits を `limits.jsonl` へ `source: codex`・過去の窓まで按分）
-- 実データで 19.41 億トークン完全一致・実経路 32 PASS・MATRIX の codex 2 マスは Degraded（単価表に無い）・auth.json は account_id だけを読む。PR #2234
-
-## 2026-10-17（#2231: UTF-8 でない recent.json / shortcuts.json をバイトのまま番号付きの退避へ = `migration::quarantine_raw`。layout の rename 枝も同じ口へ）
-- A/B `TAKO_2231_LEGACY=1`・`scripts/test-nonutf8-quarantine-2231.sh` 21 PASS・番犬。settings / run-configs / ui.json の同型は #2238。PR #2235
-
 ## 2026-10-17（#1868: テストの「存在しない ID」の決め打ち 33 か所を `tako_core::unused_id`（採番器から 1 つ取る）へ寄せ、番犬 `issue1868_stale_id_watchdog` で縛る）
 - `u64::MAX` は採番器が巻き戻るので不採用・全体テスト並列 1 / 2 / 4 で緑。固定番号のレジストリの残りは #2239。PR #2236
 
@@ -79,3 +67,15 @@
 
 ## 2026-10-17（#2262: 夜間が戻した共有ツリーの main を origin/main へ fast-forward で追従 = `follow_origin_main`。独自のコミット / untracked で ff できないときは触らず WARN と通知・A/B `TAKO_2262_LEGACY=1`）
 - モック `scripts/test-nightly-restore-main-2262.sh` 79 PASS（修正前は 3 晩が 新 / 旧 / 新 で 22 FAIL）。戻した夜以外の追従は #2264。PR #2265
+
+## 2026-10-17（#1532 / #1533: ログインシェルへの問い合わせを `platform::exe::ask_login_shell` の 1 実装（上限 5 秒・`TAKO_LOGIN_SHELL_TIMEOUT_SECS`・孫ごと畳む）へ寄せ、打ち切りを「確認できません」として setup / check-health / 依存の検出まで運ぶ）
+- 番犬 `issue1533_login_shell_timeout_watchdog`・A/B `TAKO_1532_LEGACY=1`・実経路 62 PASS・関係スクリプト 17 本緑・カタログ増 0 B。提案は #2269。PR #2266
+
+## 2026-10-17（#2264: リリースする役の夜間は共有ツリーの main を毎晩 origin/main へ fast-forward で追従 = `follow_main_nightly`。検査だけの役は動かさない・独自のコミット / untracked は触らず WARN と通知・A/B `TAKO_2264_LEGACY=1`）
+- モック `scripts/test-nightly-follow-main-2264.sh` 83 PASS（修正前は 2 晩とも古い版で 18 FAIL）。PR #2268
+
+## 2026-10-17（#1710: 自動復帰が前日の告知をいまから解き直していた = 告知を最初に見た時刻を layout.json の `limit_seen` に持ってそこから解き、追跡の再開始の時点で解けていたら「その時刻 + 2 分」で再開・後から届いた mod / codex の時刻も採る）
+- A/B `TAKO_1710_LEGACY=1`・番犬 `issue1710_limit_reset_detected_base`・実経路 `scripts/test-limit-resume-restart-1710.sh` 22 PASS。PR #2270
+
+## 2026-10-17（#1666: テストの固定名の一時 dir 22 か所と名前を引数で受ける `write_test_pdf`・autorename の `temp_dir_for` を `ScratchDir` へ。番犬 `issue1666_fixed_temp_dir_watchdog` が固定名と引数そのままの join を file:line で名指す）
+- 修正前は 2 プロセス同時で 5 回とも片方が落ち → 修正後 10/10 緑・残骸 0。PR #2271
