@@ -59,6 +59,9 @@
 #   古いバイナリができる）②ビルド中に origin/main が進んで push が拒否された夜は、
 #   未 push のリリースコミットごと放置され、同じ版が別 SHA でもう 1 本作られる、
 #   という 2 つの実害があった（2026-09-04 の v0.8.5 が実例）。
+#   旧版が残した detached は main へ戻し、その main が origin/main より古ければ fast-forward で
+#   追従させる（#2262）。戻すだけだと翌夜の launchd が古い main の夜間を読み、旧版と新版が
+#   1 日おきに入れ替わる（旧 Mac の実例）。独自のコミットがある main は動かさず WARN と通知
 #
 # 次回バージョンの予約（#1005）:
 #   節目のリリース（minor / major の繰り上げ）を夜間発火に乗せるための仕組み。
@@ -545,7 +548,51 @@ acquire_lock "$LOCK_DIR" "HOME 単位" || tako_exit 0
 
 # ---- 共有ツリーに残った detached HEAD を戻す（#1136 の後始末）---------------
 # 旧版が残していった detached（先端が夜間リリースのコミット・かつ clean）だけを
-# main へ戻す。人間が意図して detach している場合まで動かさないよう条件を絞る
+# main へ戻す。人間が意図して detach している場合まで動かさないよう条件を絞る。
+# --dry-run でも戻す（残骸の後始末は判定の前提）ので、続く main の追従（#2262）も同じく行う
+
+# 戻した main を origin/main へ追従させる（#2262）。launchd が翌夜に読むのは共有ツリーの
+# nightly-release.sh なので、戻した先のローカル main が古いと翌夜はその古い版の夜間が走る。
+# 旧 Mac ではローカル main が 2026-08-14 で止まっていて（origin/main より約 690 コミット古い）、
+# 古い版（共有ツリーをその場で detach してリリースする #1136 より前の版）と新しい版が 1 日おきに
+# 入れ替わり、mod の検査（#1892）も footprint の見張り（#2023）も一度も回っていなかった。
+# 戻し先を origin/main にする（`checkout -B main origin/main` / detach）のではなく fast-forward に
+# 限るのは、#1136 の理由を壊さないため:
+#   - HEAD はブランチ main のまま（master / worker の `git pull --ff-only` はそのまま通る）
+#   - main のコミットを書き換えも捨てもしない（独自のコミットがあれば触らず WARN と通知）
+#   - 共有ツリーにコミットを作らない（未 push のリリースコミットを残す経路を作らない）
+# A/B は TAKO_2262_LEGACY=1（追従しない = 修正前。launchd の env には入らない）
+follow_origin_main() {
+  [[ "${TAKO_2262_LEGACY:-0}" == 1 ]] && return 0
+  local behind ahead before after err
+  # 比べる先は最新の origin/main。取れなければ手元の origin/main と比べて続ける
+  git -C "$REPO_ROOT" fetch origin --quiet 2>/dev/null \
+    || log "WARN: git fetch に失敗。手元の origin/main と比べて main の追従を判断する"
+  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+    log "WARN: origin/main が無いので main の追従を飛ばす（${REPO_ROOT}）"
+    return 0
+  fi
+  behind=$(git -C "$REPO_ROOT" rev-list --count main..refs/remotes/origin/main 2>/dev/null || echo 0)
+  ahead=$(git -C "$REPO_ROOT" rev-list --count refs/remotes/origin/main..main 2>/dev/null || echo 0)
+  # 古くない（同じ / origin/main を含んで先にいる）なら翌夜も新しい版が走るので触らない
+  [[ "$behind" -gt 0 ]] || return 0
+  if [[ "$ahead" -gt 0 ]]; then
+    log "WARN: ローカルの main が origin/main より ${behind} コミット古いが、origin/main に無いコミットが ${ahead} 件あるので追従させない（翌夜はこの main の nightly-release.sh が走る。直すのは ${REPO_ROOT} で main を origin/main と揃える。#2262）"
+    notify "main が古いまま: 独自のコミット ${ahead} 件があるので追従させない"
+    return 0
+  fi
+  before=$(git -C "$REPO_ROOT" rev-parse --short main)
+  # 作業ツリーの tracked の変更は無い（戻す前に clean を確かめてある）。untracked が上書きされる
+  # ときだけ git が断る。そのときは古い main のまま続ける（今夜のリリースは使い捨ての worktree）
+  if err=$(git -C "$REPO_ROOT" merge --ff-only --quiet refs/remotes/origin/main 2>&1); then
+    after=$(git -C "$REPO_ROOT" rev-parse --short main)
+    log "main を origin/main へ追従させた（${before} → ${after}・${behind} コミット。翌夜も新しい版の夜間が走る。#2262）"
+  else
+    log "WARN: main を origin/main へ追従させられなかった（${behind} コミット古いまま。翌夜はこの main の nightly-release.sh が走る。#2262）: $(printf '%s\n' "$err" | head -1)"
+    notify "main が古いまま: origin/main へ追従させられなかった"
+  fi
+  return 0
+}
 
 restore_detached_head() {
   git -C "$REPO_ROOT" symbolic-ref --quiet HEAD >/dev/null 2>&1 && return 0
@@ -559,8 +606,11 @@ restore_detached_head() {
   git -C "$REPO_ROOT" rev-parse --verify --quiet main >/dev/null 2>&1 || return 0
   log "WARN: 共有ツリーが detached HEAD（$(git -C "$REPO_ROOT" rev-parse --short HEAD) / ${subject}）。main へ戻す（#1136 の残骸）"
   # 別 worktree が main を掴んでいると checkout は失敗する。そこで死なせない
-  git -C "$REPO_ROOT" checkout --quiet main \
-    || log "WARN: main へ戻せなかった（別 worktree が main を掴んでいる可能性）: ${REPO_ROOT}"
+  if git -C "$REPO_ROOT" checkout --quiet main; then
+    follow_origin_main
+  else
+    log "WARN: main へ戻せなかった（別 worktree が main を掴んでいる可能性）: ${REPO_ROOT}"
+  fi
   return 0
 }
 restore_detached_head
