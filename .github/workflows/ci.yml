@@ -398,6 +398,15 @@ jobs:
       # 2 度並ぶ形へ戻ったらここで落ちる**（#1621）
       - name: setup のスリープ防止の段が 1 度だけ出ることの実経路テスト
         run: bash scripts/test-setup-sleep-guard-once-1621.sh
+      # 標準 / 2 回目 / --yes / 未認証 / プラン検出不能 / 検出値競合 / 破損 config / --answers /
+      # 複数 CLI の `tako setup` が質問ゼロで完走し、agent を対話起動しないことの実経路テスト
+      # （#262 の setup UX）。スクラッチ HOME / PATH + claude / codex / agy のスタブで、書くのは
+      # スクラッチ HOME の中だけ。スタブは setup の非対話の問い合わせ（版・認証・MCP 登録）に
+      # 即答し、答えなかった呼び出しを argv ごと残す。**setup が claude を対話起動する形へ
+      # 変わったら、またはスタブが新しい問い合わせを対話起動と数える形へ戻ったらここで落ちる**
+      # （#2285。CI に無かったので #1959 の `claude --version` で落ちたまま気付かれなかった）
+      - name: setup が質問ゼロで完走し agent を対話起動しないことの実経路テスト
+        run: /bin/bash scripts/verify-setup-multiagent.sh
       # PR の CI 完了待ちのモックテスト。偽 gh を PATH に挿し、一時ディレクトリの偽リポジトリ
       # （.github/workflows つき）だけを相手にするので本番の PR には触らない。
       # **「出ているチェックが全部 pending でなければ完了」へ戻ったらここで落ちる**
