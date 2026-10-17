@@ -358,7 +358,7 @@ phase_main() {
   p3="$(split_new "$p1" down)"
   p4="$(split_new "$p2" down)"
   if [ -z "$p2" ] || [ -z "$p3" ] || [ -z "$p4" ]; then
-    fail "ペインを分割できない（$p1 / $p2 / $p3 / $p4）"
+    fail "ペインを分割できない（${p1} / ${p2} / ${p3} / ${p4}）"
     stop_app
     return
   fi
