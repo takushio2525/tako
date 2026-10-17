@@ -6,6 +6,9 @@
 # 本番の ~/Library/Application Support/tako は一切触らない（HOME ごと差し替える）。
 set -uo pipefail
 
+# 本番 tako のペインから回しても CLI が本番の GUI へ繋がないよう、本番が配る env を落とす（#1970）
+unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"
 FIXTURE="$ROOT/crates/tako-control/tests/fixtures/prompt_append_oversized.md"

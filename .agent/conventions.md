@@ -4074,6 +4074,42 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 `ensure` 自体が物理画面の名前で断ることは `crates/tako-control/tests/virtual_display_watchdog.rs` が
 本物の `virtual-display.sh` を画面と器のスタブの下で走らせて見る。
 
+**隔離 GUI は本物の claude・本番の tako へ届かない既定で起こす**（#1970）。検証は本番 tako のペイン
+（= worker の claude の中）から起こされるので、何もしなければ GUI は本番の env を丸ごと受け継ぎ、
+その子（ペイン・自動リネームの `claude -p`・mod）へ配る。#1966 の worker は、自動リネームが本物の claude
+（既定の設定 dir = 本物の認証と会話記録）を起こし、本番の mod の env が一時の claude に載る形を踏んだ。
+`launch_isolated_gui` は起動ごとに次を既定にする（**呼び出し側が並べた `VAR=VAL` が常に勝つ**）:
+
+| 既定 | 中身 | 外す・変える書き方 |
+|---|---|---|
+| 本番の env を渡さない | `ISOLATED_GUI_DROP_ENV` を `env -u` する。制御プレーン（`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_MCP_URL` / `TAKO_PANE_ID` / `TAKO_TAB_ID`）・器（`TAKO_OSC_SINK` / `TAKO_BACKEND_SOCKET`）・mod（`CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_CLI`）・`TAKO_ORCHESTRATOR_ROLE`・`TAKO_ORIG_ZDOTDIR`・呼び出し元の claude のセッションの印（`CLAUDECODE` / `CLAUDE_CODE_SESSION_ID` など） | 同じ名前を並べればその値が届く |
+| 自動リネームを止める | `TAKO_AUTO_RENAME=0`（export された値は尊重する） | `TAKO_AUTO_RENAME=1 TAKO_CLAUDE_BIN=<偽の claude>` を並べる（`test-solo-tab-title-2127.sh`） |
+| 本物の claude の設定 dir を使わせない | export された `CLAUDE_CONFIG_DIR` は使わない。GUI の HOME が一時の dir なら外すだけ（claude はその HOME の `.claude`）、利用者のホームのままならログの置き場の隣の一時 dir（`$ISOLATED_GUI_CLAUDE_CONFIG_DIR`） | 本物の認証で実物の claude を動かす検証だけが `CLAUDE_CONFIG_DIR="$CCD"` を並べる（`test-claude-mod-1879.sh` ほか mod の 4 本） |
+| 既定の `.zshrc` | GUI の ZDOTDIR（無ければ HOME）が利用者のホームの外で、zsh の rc が 1 つも無ければ固定プロンプト（`tako %1~ %% `）の `.zshrc` を置く。zsh の初回設定メニューが `tako send` の入力を食う（#1945）・画面に実ユーザー名を出さない（#927） | 自分の rc を先に置けば書かない |
+
+- **HOME を本物のままにした起動では、ペインのシェルが利用者の rc を読む**。rc が `CLAUDE_CONFIG_DIR` を
+  export していれば、ペインで打った claude は本物の設定 dir を使う（GUI の env では止められない）。
+  ペインの claude まで隔離するなら一時の HOME か ZDOTDIR を並べる（既存の検証の大半はそうしている）
+- **クリップボードはヘルパでは守れない**。GUI のコピー（OSC 52・mod の `$.ui.copy`・コピーボタン）は
+  OS の汎用ペーストボードへ直に書くので、Copy を押す確認は隔離 tmux（`set-clipboard off`）で行う（#1963）
+- **偽のエージェント（`sleep` の代わり）はシンボリックリンクで作る**。`/bin/sleep` などシステムの実行ファイルの
+  写しは macOS の署名検査で起動直後に kill される
+- 検証スクリプトが**自分のプロセスで** claude / tako を起こすときは、先に本番の env を落とす（ヘルパが
+  落とすのは GUI の env だけ）。claude なら Issue の 8 個（`TAKO_SOCKET` / `TAKO_PANE_ID` / `TAKO_TAB_ID` /
+  `TAKO_TOKEN` / `TAKO_CLI` / `TAKO_MCP_URL` / `CLAUDE_CODE_PLUGIN_DIRS` / `TAKO_ORCHESTRATOR_ROLE`）、
+  tako CLI なら `TAKO_SOCKET` / `TAKO_PANE_ID`。先頭の `unset` か、その行の `env -u …` で落とす
+  （`claude --version` の版の問い合わせは対象外）。「example ホストの中で再実行された側か」のような判定を
+  `TAKO_SOCKET` の有無でしない（本番のペインにもある。`verify-claude-mcp.sh` は専用の印に直した）
+
+番犬は `crates/tako-control/tests/verification_isolation_watchdog.rs`。落とす一覧に、本番がペインへ配る名前
+（tako-app の `spawn_session` が積む `TAKO_*`・`backend::PANE_SCOPED_ENV`・`claude_mod::INJECTED_KEYS`・
+シェル統合の `TAKO_*`）が欠けたら落ちる。ヘルパを `/bin/bash` で偽の GUI へ起こし、受け取った env・
+設定 dir・`.zshrc` も見る。`scripts/test-*.sh` / `measure-*.sh` / `verify-*.sh` のうち、落とさずに
+claude / tako を起こす行は file:line で名指す（引用符の中 = ペインへ送る文字列と、ヒアドキュメントの
+本文は数えない。`"$BIN/claude"` のようにパスで起こす claude も数え、そのスクリプトが `>` で書き出した
+偽の claude だけを外す）。実経路は `scripts/test-isolated-gui-defaults-1970.sh`（`TAKO_1970_LEGACY_HELPER=<旧ヘルパ>`
+で A/B）。
+
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
 `virtual-display.sh status` が「眠っている」に変わる（蓋閉じで内蔵が居ない機なら
 落ちるのは `tako-vd` だけ）。`virtual-display.sh` に眠らせる口は**作っていない**:

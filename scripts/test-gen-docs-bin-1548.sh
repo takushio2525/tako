@@ -13,6 +13,9 @@
 # 本物のバイナリは JSON の採取（fixtures）と最後のツリー実測にだけ読み取りで使う。
 set -uo pipefail
 
+# 本番 tako のペインから回しても CLI が本番の GUI へ繋がないよう、本番が配る env を落とす（#1970）
+unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"
 PASS=0; FAIL=0; SKIP=0

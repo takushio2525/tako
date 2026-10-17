@@ -2,6 +2,9 @@
 # Issue #262: setup UX A〜E をスクラッチ HOME / PATH で実測する。
 set -eu
 
+# 本番 tako のペインから回しても CLI が本番の GUI へ繋がないよう、本番が配る env を落とす（#1970）
+unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TAKO_BIN=${TAKO_BIN:-"$ROOT/target/debug/tako"}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/tako-setup-262.XXXXXX")

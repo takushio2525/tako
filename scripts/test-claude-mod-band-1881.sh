@@ -147,7 +147,8 @@ backup_stores
 start_app() {
   local name="$1"
   shift
-  launch_isolated_gui "$TMP/app-${name}.log" ${@+"$@"} || exit $?
+  # 本物の認証で実物の claude を動かすので設定 dir を明示する（ヘルパの既定は一時の dir = #1970）
+  launch_isolated_gui "$TMP/app-${name}.log" CLAUDE_CONFIG_DIR="$CCD" ${@+"$@"} || exit $?
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$TMP/app-${name}.log" || exit 1
 }
