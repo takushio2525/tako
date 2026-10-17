@@ -2395,9 +2395,7 @@ fn builds_tako_app(stmt: &str) -> bool {
             continue;
         }
         let rest = &stmt[from..];
-        let end = rest
-            .find(|c| matches!(c, ';' | '|' | '&' | ')'))
-            .unwrap_or(rest.len());
+        let end = rest.find([';', '|', '&', ')']).unwrap_or(rest.len());
         let args: Vec<&str> = rest[..end].split_whitespace().collect();
         if args
             .windows(2)
@@ -2429,7 +2427,7 @@ fn bins_args(stmt: &str) -> Vec<Vec<String>> {
             continue;
         }
         let end = rest
-            .find(|c| matches!(c, ';' | '|' | '&' | ')' | '\'' | '"' | '>' | '#'))
+            .find([';', '|', '&', ')', '\'', '"', '>', '#'])
             .unwrap_or(rest.len());
         out.push(rest[..end].split_whitespace().map(str::to_string).collect());
     }
