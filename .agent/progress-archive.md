@@ -625,3 +625,7 @@
 - 2026-10-17 #2227: 壊れた default.yaml で `tako master` は組み込み既定で立てるが `警告:`・persist.log・system prompt で知らせ、`-<key>` は #1825 の理由と直し方で止まる
 - 2026-10-17 #2204: usage 分析 S5 = codex の rollout の token_count の累積の差分を索引へ・rate_limits を `limits.jsonl` へ `source: codex`・過去の窓まで按分
 - 2026-10-17 #2231: UTF-8 でない recent.json / shortcuts.json をバイトのまま番号付きの退避へ = `migration::quarantine_raw`。layout の rename 枝も同じ口へ
+- 2026-10-17 #1868: テストの「存在しない ID」の決め打ち 33 か所を `tako_core::unused_id`（採番器から 1 つ取る）へ寄せ、番犬 `issue1868_stale_id_watchdog` で縛る
+- 2026-10-17 #1933 / #1969: 夜間の mod の検査の「取り出せない」の真因は `git archive | tar` で tar が終端で抜けた後の git の SIGPIPE。ファイル経由へ・記録が使えなくても結果の行と通知の本文を出す
+- 2026-10-17 #2230: persist.log と画面の読めない理由を serde の素の文言から「種類 + 行・列」へ = `load_issue::{json,yaml}_error_reason`・番犬 `issue2230_serde_reason_watchdog`
+- 2026-10-17 #1905: MCP カタログの折り返しで和文と英字が詰まる形・意味を並べた enum の漏れ（config_share の unlink ほか 5 件）を番犬に、説明文 72 本を圧縮して 203,726 → 194,512 B（残り 10,288 B）
