@@ -54,12 +54,23 @@
 #   「器が作った仮想ディスプレイか」を確かめ（vd_assert_virtual）、物理画面なら
 #   終了コード VD_RC_NOT_VIRTUAL と理由 1 行で断る。確かめられないときも通さない。
 #
+# 器に作らせる・繋がせるのは常設の 1 枚だけ（#1817）:
+#   以前の ensure は、OS の一覧に居ない名前なら**どんな名前でも**器に仮想スクリーンを作らせて
+#   繋いでいた（存在しない名前・打ち間違い・蓋閉じで一覧に居ない内蔵の名前でも）。作る・繋ぐ道は
+#   **器に触る前に**名前が VD_DEFAULT_NAME と完全一致かを確かめ（vd_assert_creatable）、
+#   違えば VD_RC_NOT_VIRTUAL で断る。また bounds / status / move-window も締めと同じ判定
+#   （vd_virtual_verdict）を通し、物理画面の名前には座標も「使用可」も返さない（座標は窓の
+#   置き場に使われる）。こちらは読むだけなので器を起こさない（--no-launch）。
+#
 # いまの実装は BetterDisplay の仮想スクリーン。他の実装（DeskPad 等）へ広げるときは
 # vd_backend_* だけを差し替える（表に出る ensure / bounds / status は変えない）。
 
 set -uo pipefail
 
-VD_NAME=${TAKO_VD_NAME:-tako-vd}
+# 常設の仮想ディスプレイの名前。**器に作らせる・繋がせてよいのはこの名前（完全一致）だけ**（#1817）。
+# Rust の DEFAULT_VIRTUAL_DISPLAY_NAME と同じ綴り（番犬が突き合わせる）
+VD_DEFAULT_NAME=tako-vd
+VD_NAME=${TAKO_VD_NAME:-$VD_DEFAULT_NAME}
 VD_BD_APP=${TAKO_VD_BETTERDISPLAY_APP:-/Applications/BetterDisplay.app}
 VD_BD_BIN="${VD_BD_APP}/Contents/MacOS/BetterDisplay"
 # 仮想ディスプレイの左上からこれだけ内側へ窓を置く（move-window 用・ポイント）
@@ -74,7 +85,8 @@ VD_RECORD_DIR=${TAKO_VD_RECORD_DIR:-}
 if [ -z "$VD_RECORD_DIR" ] && [ -n "${HOME:-}" ]; then
     VD_RECORD_DIR="$HOME/Library/Caches/tako/virtual-display"
 fi
-# 名指しされた面が物理画面だったときの ensure の終了コード（#1783）。**1 とは分ける**:
+# 名指しされた面が物理画面だった（#1783）・OS の一覧に居ない常設以外の名前だった（#1817）ときの
+# 終了コード。ensure / bounds / status / move-window が同じ番号で返す。**1 とは分ける**:
 # 1 は「面を用意できない = 環境が揃わない」、こちらは TAKO_VD_NAME の渡し方の誤り。
 # isolated-gui.sh はこの番号を見て「使い方の誤り」（2）として断る（番犬が番号を突き合わせる）
 VD_RC_NOT_VIRTUAL=3
@@ -340,6 +352,26 @@ vd_virtual_verdict() {
     return 1
 }
 
+# OS の一覧に居ない面を器に作らせて・繋がせてよい名前か（純関数。#1817）。
+# $1 は名指しされた名前、$2 は常設の名前（VD_DEFAULT_NAME）。出力は 1 行:
+#   ok              作ってよい・繋いでよい（終了 0）
+#   refuse <理由>   作らない・繋がない（終了 1）
+#
+# **常設の名前と完全一致のときだけ**（大文字小文字・前後の空白も区別する）。ここを広げると、
+# 名前の取り違え 1 つ（存在しない名前・打ち間違い・蓋閉じで一覧に居ない内蔵の名前）で器に
+# 仮想スクリーンが増える。増えた面は孤児になって器から消せないし（#1150）、tako は面の名前を
+# 大文字小文字を無視して当てるので、`TAKO-VD` を作ると tako-vd と取り違える。
+# 器が作って繋いである別名の面を使うのは止めない（それは締めの vd_virtual_verdict が判定する）
+vd_create_verdict() {
+    local want=${1-} base=${2-}
+    if [ -n "$base" ] && [ "$want" = "$base" ]; then
+        echo ok
+        return 0
+    fi
+    echo "refuse 器（BetterDisplay）に作らせる・繋がせるのは常設の ${base} だけ"
+    return 1
+}
+
 # その displayID が描画可能か（純関数。$1 = displayID、stdin = vd_drawable の出力）。
 #   0 = 置ける（active=1 / **判定材料が無い**）
 #   1 = 置けない（active=0 と読めた / 一覧に居ない）
@@ -512,6 +544,16 @@ vd_backend_ready() {
     return 1
 }
 
+# 器が**いま**応答するか（起こさない・待たない。#1817）。status / bounds / move-window は読むだけなので
+# BetterDisplay を起動して状態を変えない。器が走っていなければ CLI は応答せず固まる（癖 ①）ので、
+# 走っていることを先に確かめてから 1 回だけ聞く
+vd_backend_responding() {
+    local ids
+    [ -x "$VD_BD_BIN" ] || return 1
+    pgrep -x BetterDisplay >/dev/null 2>&1 || return 1
+    ids="$(vd_bd get -identifiers)" && grep -q deviceType <<<"$ids"
+}
+
 # 同名が 2 枚以上に増えていないか（#1150）。増えていたら理由を出して非ゼロ。
 # 「無いから作る」の判定と違って**増えたことは自分では直せない**（器の管理外へ
 # 外れた面は器から消せない = 実測）ので、黙って進まずここで止める
@@ -621,17 +663,35 @@ vd_record_note() {
     fi
 }
 
-# 名指しされた面（VD_NAME）が器の作った仮想ディスプレイであることを確かめる（#1783）。
-# 物理画面なら理由を 1 行出して VD_RC_NOT_VIRTUAL、確かめられなければ 1。
-# 器に聞くのは内蔵で決まらないときだけ（内蔵の名前を渡されたら器を起こさずに断る）
-vd_assert_virtual() {
-    local table verdict rc list=""
+# 名指しされた面（VD_NAME）が器の作った仮想ディスプレイかを判定して 1 行出す（#1783 / #1817）。
+# 出力と終了コードは vd_virtual_verdict と同じ（virtual 0 / physical 1 / unknown 2）。
+# 器に聞くのは内蔵で決まらないときだけ（内蔵の名前を渡されたら器に触らずに決まる）。
+# `--no-launch` は器を起こさない（status / bounds / move-window 用。走っていなければ unknown）
+vd_check_virtual() {
+    local table verdict rc list reachable=0
     table=$(vd_screens)
     verdict=$(printf '%s\n' "$table" | vd_virtual_verdict "$VD_NAME" "" 0); rc=$?
-    if [ "$rc" = 2 ] && vd_backend_ready >/dev/null; then
+    if [ "$rc" = 2 ]; then
+        if [ "${1:-}" = --no-launch ]; then
+            vd_backend_responding && reachable=1
+        else
+            vd_backend_ready >/dev/null && reachable=1
+        fi
+    fi
+    if [ "$reachable" = 1 ]; then
         list=$(vd_backend_list)
         verdict=$(printf '%s\n' "$table" | vd_virtual_verdict "$VD_NAME" "$list" 1); rc=$?
     fi
+    printf '%s\n' "$verdict"
+    return "$rc"
+}
+
+# 名指しされた面（VD_NAME）が器の作った仮想ディスプレイであることを確かめる（#1783）。
+# 物理画面なら理由を 1 行出して VD_RC_NOT_VIRTUAL、確かめられなければ 1。
+# 引数は vd_check_virtual へそのまま渡す（ensure の締めは器を起こす = 引数なし）
+vd_assert_virtual() {
+    local verdict rc
+    verdict=$(vd_check_virtual "$@"); rc=$?
     case $rc in
         0) return 0 ;;
         1)
@@ -641,6 +701,16 @@ vd_assert_virtual() {
     esac
     vd_err "${VD_NAME} が仮想ディスプレイか確かめられないので使わない: ${verdict#unknown }（#1783）"
     return 1
+}
+
+# OS の一覧に居ない面を器に作らせる・繋がせる前に、名前が常設の 1 枚かを確かめる（#1817）。
+# 違えば理由を 1 行出して VD_RC_NOT_VIRTUAL（TAKO_VD_NAME の渡し方の誤り）。
+# **器に触る前に**呼ぶ（BetterDisplay の起動も一覧の読み出しもしないで断る）
+vd_assert_creatable() {
+    local verdict
+    verdict=$(vd_create_verdict "$VD_NAME" "$VD_DEFAULT_NAME") && return 0
+    vd_err "${VD_NAME} は仮想ディスプレイではない（OS のディスプレイ一覧に居ない）ので作らない・繋がない: ${verdict#refuse }（TAKO_VD_NAME の取り違えで器に仮想スクリーンを増やさない = #1817）"
+    return "$VD_RC_NOT_VIRTUAL"
 }
 
 # 用意できた直後に必ず通す締め（#1150 / #1160 / #1697 / #1783）。
@@ -663,6 +733,8 @@ vd_ensure() {
         vd_finish_ensure
         return $?
     fi
+    # ここから先は器に面を作らせる・繋がせる道。器に触る前に名前を確かめる（#1817）
+    vd_assert_creatable || return $?
     vd_backend_ready || return 1
     local tag i
     tag=$(vd_backend_tag)
@@ -707,31 +779,57 @@ vd_settle() {
     done
 }
 
-# "x y w h" を出す（用意できていなければ非ゼロ）
+# "x y w h" を出す（用意できていなければ非ゼロ）。
+# **座標は窓の置き場に使われるので、仮想ディスプレイと確かめられた面にだけ返す**（#1817）。
+# 物理画面なら VD_RC_NOT_VIRTUAL、確かめられなければ 1（器は起こさない）
 vd_bounds() {
-    vd_row || { vd_err "仮想ディスプレイ ${VD_NAME} が見つからない（先に ensure すること）"; return 1; }
+    local r
+    r=$(vd_row) || { vd_err "仮想ディスプレイ ${VD_NAME} が見つからない（先に ensure すること）"; return 1; }
+    vd_assert_virtual --no-launch || return $?
+    printf '%s\n' "$r"
 }
 
+# 状態を 1 行 + 付帯情報 1 行。終了コードは 0 = 使用可 / 1 = 眠っている・未接続・確かめられない /
+# VD_RC_NOT_VIRTUAL = 仮想ディスプレイではない（#1817）
 vd_status() {
-    local r plan clamshell main_note sleeping rc=0
+    local r plan clamshell main_note sleeping verdict vrc found=0 virtual=0 rc=0
     if r=$(vd_row); then
-        if vd_row_drawable; then
-            echo "${VD_NAME}: 使用可（${r}）"
+        found=1
+        # ensure の締めと同じ判定（#1817）。物理画面に「使用可」と言うと、それを見た検証が
+        # その面へ窓を出しうる。読むだけなので器は起こさない
+        verdict=$(vd_check_virtual --no-launch); vrc=$?
+        if [ "$vrc" = 0 ]; then
+            virtual=1
+            if vd_row_drawable; then
+                echo "${VD_NAME}: 使用可（${r}）"
+            else
+                # #1160: 「在る」と「置ける」は別。ここを黙ると、面が見えているのに
+                # 検証用 GUI が窓を開かない理由が分からなくなる
+                echo "${VD_NAME}: 眠っている（${r}。NSScreen には居るが描画可能でない = tako から見えない。ensure で起こす）"
+                rc=1
+            fi
+        elif [ "$vrc" = 1 ]; then
+            echo "${VD_NAME}: 仮想ディスプレイではない（${verdict#physical }。窓の置き場に使わない。TAKO_VD_NAME に物理画面の名前を渡していないか = #1817）"
+            rc=$VD_RC_NOT_VIRTUAL
         else
-            # #1160: 「在る」と「置ける」は別。ここを黙ると、面が見えているのに
-            # 検証用 GUI が窓を開かない理由が分からなくなる
-            echo "${VD_NAME}: 眠っている（${r}。NSScreen には居るが描画可能でない = tako から見えない。ensure で起こす）"
+            echo "${VD_NAME}: 仮想ディスプレイか確かめられない（${verdict#unknown }。窓の置き場に使わない = #1817）"
             rc=1
         fi
     else
         echo "${VD_NAME}: 未接続（ensure で用意する）"
         rc=1
     fi
-    plan=$(vd_screens | vd_main_protection_plan "$VD_NAME")
-    case $plan in
-        restore*) main_note="要（内蔵 $(printf '%s' "$plan" | cut -d' ' -f3-) へ戻す）" ;;
-        *) main_note="不要（${plan#noop }）" ;;
-    esac
+    if [ "$found" = 1 ] && [ "$virtual" = 0 ]; then
+        # 物理画面の名前を仮想と読むと、Main 保護の判定が「内蔵へ戻す」と言い出す（ensure の締めは
+        # 仮想と確かめた後でしか Main 保護へ進まない = 同じ順番にそろえる）
+        main_note="判定しない（${VD_NAME} を仮想ディスプレイと確かめられない）"
+    else
+        plan=$(vd_screens | vd_main_protection_plan "$VD_NAME")
+        case $plan in
+            restore*) main_note="要（内蔵 $(printf '%s' "$plan" | cut -d' ' -f3-) へ戻す）" ;;
+            *) main_note="不要（${plan#noop }）" ;;
+        esac
+    fi
     clamshell=$(vd_clamshell_state "$(vd_clamshell_raw)")
     sleeping=$(vd_screens | vd_sleeping_names "$(vd_drawable)")
     echo "  Main 保護: ${main_note} / 蓋: ${clamshell} / 器の実体: $(vd_backend_instances) / 眠っている面: ${sleeping:-なし} / 記録 uuid: $(vd_record_note)"
@@ -844,6 +942,8 @@ vd_move_window() {
         return 1
     fi
     r=$(vd_row) || { vd_err "仮想ディスプレイ ${VD_NAME} が見つからない"; return 1; }
+    # bounds と同じく、物理画面の名前の面へは窓を動かさない（#1817）
+    vd_assert_virtual --no-launch || return $?
     x=$(( $(echo "$r" | awk '{print $1}') + VD_PAD_X ))
     y=$(( $(echo "$r" | awk '{print $2}') + VD_PAD_Y ))
     osascript -e "tell application \"System Events\" to tell (first application process whose unix id is ${pid}) to set position of window 1 to {${x}, ${y}}" >/dev/null 2>&1 || {
@@ -876,9 +976,9 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             ;;
         *)
             echo "使い方: ${0} {ensure|bounds|status [--snapshot]|recorded-uuid|move-window <pid>|window-env <w> <h> [x] [y]|cleanup-orphans [--apply]}" >&2
-            echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意し、眠っていれば起こす（冪等・消す機能は無い。物理画面の名前なら ${VD_RC_NOT_VIRTUAL} で断る）" >&2
-            echo "  bounds           \"x y w h\"（Quartz グローバル・ポイント）" >&2
-            echo "  status           状態を 1 行（眠っている面も出る。--snapshot は前後比較用の機械可読な現況）" >&2
+            echo "  ensure           仮想ディスプレイ ${VD_NAME} を用意し、眠っていれば起こす（冪等・消す機能は無い。作る・繋ぐのは ${VD_DEFAULT_NAME} だけ。物理画面の名前・一覧に居ない別の名前なら ${VD_RC_NOT_VIRTUAL} で断る）" >&2
+            echo "  bounds           \"x y w h\"（Quartz グローバル・ポイント。仮想ディスプレイでない面には返さず ${VD_RC_NOT_VIRTUAL}）" >&2
+            echo "  status           状態を 1 行（眠っている面も出る。仮想ディスプレイでない面は「仮想ディスプレイではない」。--snapshot は前後比較用の機械可読な現況）" >&2
             echo "  recorded-uuid    ensure が残した面の uuid（tako が名前を読めないときに当てる。#1697）" >&2
             echo "  move-window      その pid の窓を仮想ディスプレイへ移す（**tako には使えない** = #1442）" >&2
             echo "  window-env       tako の窓を置く env を作る: window-env <w> <h> [x] [y]（#1442）" >&2

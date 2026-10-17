@@ -4256,6 +4256,33 @@ stderr へ「ERROR: TAKO_DISPLAY=… は通さない…」を 1 行出す（4 = 
 「ERROR: TAKO_VD_NAME=… は仮想ディスプレイではない…」を 1 行出す。`TAKO_VD_NAME` を上書きしてよいのは
 器が作る（作った）仮想ディスプレイの名前だけ。
 
+**器に作らせる・繋がせるのは常設の `tako-vd` だけ。`bounds` / `status` も物理画面を断る**（#1817）。
+以前の `ensure` は、OS の一覧に居ない名前なら**どんな名前でも**器に仮想スクリーンを作らせて繋いでいた
+（存在しない名前・打ち間違い・大文字違い・蓋閉じで一覧に居ない内蔵の名前でも。作った面は器の一覧に
+載るので #1783 の判定も通って成功した）。作る・繋ぐ道は**器に触る前に**名前が `VD_DEFAULT_NAME`
+（= `tako-vd`。Rust の `DEFAULT_VIRTUAL_DISPLAY_NAME` と同じ綴り）と**完全一致**かを確かめ
+（純関数 `vd_create_verdict`）、違えば BetterDisplay を起動もせずに**終了コード 3** と理由 1 行で断る
+（ヘルパ経由なら #1783 と同じく 2）。器がすでに作って繋いである別名の面を使うのは止めない
+（締めの判定が見る）が、**繋がっていない別名の面を繋ぐこともしない**（繋ぐと画面構成が変わる）。
+接頭辞（`tako-vd-…`）を許さないのは、一時の名前の面は孤児になって器から消せない（下の #1150 の項）うえ、
+番犬が「本物の係へ落ちても実機に触れない」ために使う実在しない名前（`tako-vd-watchdog-*-absent`）まで
+作らせてしまうため。呼び手の名前（2026-10-18 の grep）:
+
+| 呼び手 | `TAKO_VD_NAME` | 扱い |
+|---|---|---|
+| `isolated-gui.sh` / 手で 1 回起こす / セルフテスト / `promo/lib.sh`（`TAKO_PROMO_VD_NAME` の既定） | `tako-vd`（既定） | 作る・繋ぐ（従来どおり） |
+| `issue1490_isolated_gui_launch_watchdog` / `verification_isolation_watchdog` | `tako-vd-watchdog-1744-absent` / `-1970-absent` | 作らない（偽の係を注入する番犬。本物へ落ちても器に触らず 3） |
+| 手で器に作った別名の面（収録の別舞台など） | 任意 | 繋がっていれば使う。作る・繋ぐのは手で（`DISPLAY CHANGE` を宣言して） |
+
+`bounds` / `status` / `move-window` も締めと同じ判定（`vd_virtual_verdict`）を通す。座標は検証
+スクリプトが窓の置き場に使うので、物理画面の名前には**座標を返さず終了コード 3**（`bounds` /
+`move-window`）、`status` は「`<名前>`: 仮想ディスプレイではない（理由）」と出して 3（Main 保護も
+「判定しない」）。確かめられないとき（器が走っていない・応答しない）は「確かめられない」で 1。
+この 3 つは読むだけ（と当座の AX）なので**器を起動しない**（`--no-launch`。走っていれば 1 回だけ聞く）。
+番犬は `crates/tako-control/tests/virtual_display_watchdog.rs` の 11・12（本物の `virtual-display.sh` を
+`/bin/bash` で走らせ、画面・器・AX をスタブにして見る）+ `scripts/test-virtual-display-guard.sh` の
+Test 23〜25。
+
 **検証用 GUI の印（`TAKO_ISOLATED`）は偽にできない**（#1784）。`launch_isolated_gui` は GUI へ常に
 `TAKO_ISOLATED=1` を渡し、`TAKO_DISPLAY` と同じく呼び出し側の `VAR=VAL` より後ろに置く（以前は
 既定を前に置いていたので、呼び出し側の `TAKO_ISOLATED=0` がそのまま届いて検証用 GUI として扱われず、
