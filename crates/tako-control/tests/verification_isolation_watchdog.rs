@@ -377,6 +377,8 @@ struct Launch {
     line: usize,
     /// "claude" か "tako"
     what: &'static str,
+    /// 起こすコマンドの単語（引用符つきのまま。`"$BIN/claude"` 等）
+    cmd: String,
     /// 同じコマンドの `env -u K`（`env -i` なら全部）で落としている名前
     env_drops: Vec<String>,
     env_clear: bool,
@@ -412,9 +414,16 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
     loop {
         let Some(w) = words.get(i) else { return };
         let bare = unquote(w);
-        if is_assignment(w) || matches!(bare.as_str(), "exec" | "nohup" | "time" | "!") {
-            i += 1;
-        } else if bare == "command" && !words.get(i + 1).is_some_and(|n| n.starts_with('-')) {
+        // 前置き（代入・exec 等）は読み飛ばす。`command -v` は在るかの確認なので読み飛ばさない
+        let lookup = bare == "command" && words.get(i + 1).is_some_and(|n| n.starts_with('-'));
+        // 後ろに単語が続く配列の展開（`${extra[@]+"${extra[@]}"} "$BIN/claude"`）は前置きの
+        // `VAR=VAL` の束として読み飛ばす（コマンドは後ろの単語）
+        let spread = bare.starts_with("${") && bare.contains("[@]") && words.len() > i + 1;
+        if is_assignment(w)
+            || matches!(bare.as_str(), "exec" | "nohup" | "time" | "!")
+            || (bare == "command" && !lookup)
+            || spread
+        {
             i += 1;
         } else if bare == "env" {
             i += 1;
@@ -441,8 +450,8 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
             break;
         }
     }
-    let Some(cmd) = words.get(i) else { return };
-    let cmd = unquote(cmd);
+    let Some(raw) = words.get(i) else { return };
+    let cmd = unquote(raw);
     if cmd == "unset" {
         scan.unset.extend(
             words[i + 1..]
@@ -452,7 +461,8 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
         );
         return;
     }
-    let what = if cmd == "claude" {
+    // パスで起こす claude（`"$BIN/claude"` = 実物を PATH の外から symlink で置く形）も数える
+    let what = if cmd == "claude" || cmd.ends_with("/claude") {
         // 版の問い合わせは会話も mod も MCP も起こさない（mod の下限の判定で使う）
         if words
             .get(i + 1)
@@ -473,6 +483,7 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
     scan.launches.push(Launch {
         line,
         what,
+        cmd: raw.clone(),
         env_drops,
         env_clear,
     });
@@ -739,6 +750,15 @@ fn scan_script(src: &str) -> ScriptScan {
             }
         }
     }
+    // パスで起こす claude のうち、このスクリプトが `>` で書き出したもの（偽の claude のスタブ）は
+    // 本物ではないので数えない。symlink で置いた実物（`ln -s`）は書き出さないので残る
+    scan.launches.retain(|l| {
+        l.what != "claude"
+            || unquote(&l.cmd) == "claude"
+            || ![">", ">>", "> ", ">> "]
+                .iter()
+                .any(|redirect| src.contains(&format!("{redirect}{}", l.cmd)))
+    });
     scan
 }
 
@@ -838,6 +858,9 @@ fn 走査は実際の持ち込みを検出する() {
         ("在るかの確認", "command -v claude >/dev/null || exit 0\n", 0),
         ("版の問い合わせ", "v=$(claude --version 2>/dev/null)\n", 0),
         ("版の後の会話", "v=$(claude --version)\nclaude -p hi\n", 1),
+        ("symlink で置いた実物", "ln -sf \"$(command -v claude)\" \"$BIN/claude\"\n\"$BIN/claude\" plugin list\n", 1),
+        ("書き出した偽の claude", "cat > \"$BIN/claude\" <<'EOF'\nexit 0\nEOF\n\"$BIN/claude\" --warm\n", 0),
+        ("配列の展開の後ろの claude", "env -u TAKO_SOCKET HOME=\"$H\" ${extra[@]+\"${extra[@]}\"} \"$BIN/claude\" plugin list\n", 1),
         ("内側の印で分ける", "if [ -z \"${INNER:-}\" ]; then\n  unset TAKO_SOCKET TAKO_PANE_ID\n  exec cargo run -- bash \"$0\"\nfi\n\"$TAKO\" list\n", 0),
         ("case のパターン", "case \"$a\" in\n  claude) echo c ;;\nesac\n", 0),
         ("引用符の中の説明", "echo \"claude を起こす\"\n", 0),

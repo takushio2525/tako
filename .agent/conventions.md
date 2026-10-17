@@ -4057,7 +4057,8 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 シェル統合の `TAKO_*`）が欠けたら落ちる。ヘルパを `/bin/bash` で偽の GUI へ起こし、受け取った env・
 設定 dir・`.zshrc` も見る。`scripts/test-*.sh` / `measure-*.sh` / `verify-*.sh` のうち、落とさずに
 claude / tako を起こす行は file:line で名指す（引用符の中 = ペインへ送る文字列と、ヒアドキュメントの
-本文は数えない）。実経路は `scripts/test-isolated-gui-defaults-1970.sh`（`TAKO_1970_LEGACY_HELPER=<旧ヘルパ>`
+本文は数えない。`"$BIN/claude"` のようにパスで起こす claude も数え、そのスクリプトが `>` で書き出した
+偽の claude だけを外す）。実経路は `scripts/test-isolated-gui-defaults-1970.sh`（`TAKO_1970_LEGACY_HELPER=<旧ヘルパ>`
 で A/B）。
 
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
