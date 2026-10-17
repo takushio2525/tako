@@ -2375,10 +2375,12 @@ mod tests {
     #[test]
     fn pty死亡はmark_closed_by_originで倒さない() {
         let shared = registry_path().unwrap();
-        let id = record_spawn(sample_record(43_221)).expect("共有レジストリへ登録できる");
+        // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
+        let pane = tako_core::unused_id::pane().as_u64();
+        let id = record_spawn(sample_record(pane)).expect("共有レジストリへ登録できる");
         let before = std::fs::read_to_string(&shared).unwrap();
 
-        mark_closed_by_origin(43_221, CloseOrigin::ProcessExit, None).unwrap();
+        mark_closed_by_origin(pane, CloseOrigin::ProcessExit, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(&shared).unwrap(),
             before,
@@ -2391,7 +2393,7 @@ mod tests {
         );
 
         // 明示 close なら同じ入口で倒れる（ガードが全部を止めていない検出力）
-        mark_closed_by_origin(43_221, CloseOrigin::TabButton, None).unwrap();
+        mark_closed_by_origin(pane, CloseOrigin::TabButton, None).unwrap();
         let reg = WorkerRegistry::load_from(&shared).unwrap();
         assert_eq!(reg.workers[&id].status, "closed");
         assert_eq!(

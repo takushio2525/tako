@@ -945,9 +945,17 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
   「無いもの」は、`unused_id` の値が表の小さい固定値（`PaneId::from_raw(2)`）と重なりうる
   （プロセスの最初の方は採番器も小さい）。表に無い固定値を使い、同じ行か 1 行上に
   `// 固定 ID 安全: <理由>` を書く
+- **共有のテスト用レジストリへ積むペイン番号も採番器から取る（#2239）**: `orchestrator::registry`
+  の `registry_path()` は `#[cfg(test)]` ではプロセスに 1 つの一時ファイルで、spawn のテストも
+  採番したペインをそこへ登録する。`record_spawn` は同じペインの active を `superseded` へ倒し、
+  `find_active_by_pane` は新しい方を返すので、決め打ちの番号（`7801` 等）を鍵に積むと、
+  spawn のテストがその番号を採番した回だけ取り違える（「無いもの」ではないので番犬は見ない）。
+  鍵のペインは `unused_id::pane()` で取り、worker ID・tmux 名もそこから組む（`format!("q{pane}")`）。
+  専用の一時ファイル（`temp_registry_file` + `*_at`）で測るテストは固定値のままでよい
 - **番犬**: `crates/tako-control/tests/issue1868_stale_id_watchdog.rs` が、テストの領域
   （`production_range` と同じ読み）で ID の位置（`PaneId::from_raw(N)` 等と `pane` / `tab` /
-  `group_tab` / `preview` … の欄）にある整数リテラルのうち、「無いもの」の文脈にあるものを
+  `group_tab` / `preview` / `active_tab` … の欄と `tabs: vec![N, …]` の要素）にある整数リテラルのうち、
+  「無いもの」の文脈にあるものを
   `file:line` で落とす。文脈 = assert / `matches!` の中の `PaneNotFound(N)` 等・`stale` / `ghost` /
   `gone` / `missing` などの名前で束ねる・同じ行か文の直上のコメントの「存在しない」「stale」等・
   同じ数字が 3 桁以上並ぶ形（`9_999`）。**引数の位置だけで ID と分かる形**
