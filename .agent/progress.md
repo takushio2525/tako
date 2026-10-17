@@ -20,24 +20,6 @@
 
 ---
 
-## 2026-10-17（#1970: 隔離 GUI の既定で本番の env を落とし・自動リネームを止め・claude の設定 dir を本物へ向けない + 番犬が検証スクリプトの持ち込みを file:line で名指す）
-- 実経路 新 17/0・旧ヘルパ 3/14。番犬が見つけた持ち込み 5 本（verify-claude-mcp ほか）を修正。PR #2242
-
-## 2026-10-17（#2239: 共有のテスト用レジストリへ固定のペイン番号で積むテスト 15 本と layout の 88888 を `unused_id` へ・番犬に `tabs` / `active_tab`）
-- 注入で修正前 15 本中 12 本落ち → 修正後 0 本・製品コード不変。PR #2245
-
-## 2026-10-17（#2243: `tako queue` の先頭が target dir 待ちの間、別の target dir の後ろが空き枠へ先に入る = 枠・メモリでは追い越さない・同じ dir は直列・1 件の待ちの追い越しは累計 同時数 × 2 まで）
-- A/B `TAKO_2243_LEGACY=1`・`scripts/test-queue-head-of-line-2243.sh`・番犬 `issue2243_queue_head_of_line_watchdog`・待ちの理由を件ごとに（status `waiting[].reason`）。PR #2251
-
-## 2026-10-17（#2238: UTF-8 でない settings.json / run-configs.json / ui.json も `LoadIssue::read_failed`（= `quarantine_raw`）でバイトのまま番号付きの退避へ。番犬の `SLOT_KNOWN` は空）
-- A/B `TAKO_2238_LEGACY=1`・`scripts/test-nonutf8-quarantine-2238.sh`（修正前 11 NG → 修正後 46 PASS）・`tako migrate` は言語を `peek_lang_setting` で引く。PR #2253
-
-## 2026-10-17（#2233: 黙った既定落としの残り = 引き継ぎの後任（専用プロファイルが無い / 読めないときも止めない）と `tako solo` は「立てて警告」、self / supervisor status / setup の表示は読むだけで `warnings`、PWA の「+ master」は起動結果に警告を表示）
-- A/B `TAKO_2233_LEGACY=1`・結合 2 本 + 番犬の注入 8 → 23 種・e2e 115 passed・カタログ増 0 B。残りの経路は #2256。PR #2249
-
-## 2026-10-17（#1891: check-health に tako mod の項目 = `claude_mod` 節（`tako mod --json` と同じキー・同じ値・同じ行の関数）・報告の無い理由をコマンド行と起動時の env で 1 つに決める `classify_no_report`）
-- `tako mod` も背景の段で仕上げる（`OffloadJob::ModStatus`）・上限 8 ペイン・A/B `TAKO_1891_LEGACY=1`・実経路 48 PASS・カタログ +74 B。PR #2250
-
 ## 2026-10-17（#2255: check-health の認証確認を上限つき（既定 10 秒・3 系統を並べて）にし、打ち切りは「認証: 不明（N 秒で応答なし）」）
 - `setup_bootstrap::status_all_within` / `agent_probe::output_within`・A/B `TAKO_2255_LEGACY=1`・番犬 `issue2255_diagnostics_auth_probe_watchdog`（call_graph で collect から辿る）・実経路 41 PASS。残りの上限なし 3 か所は #1533 へ。PR #2259
 
@@ -79,3 +61,21 @@
 
 ## 2026-10-18（#2275: Windows の `pid_alive` が終了状態を見ず在籍表だけで読み、`wait()` 直後の終わったプロセスを「居る」と答えていた → 先に `GetExitCodeProcess` を問う `alive_unless_exited`・テストは `wait_gone` で待つ（同型 3 か所も））
 - 注入 `TAKO_2275_INJECT_ALIVE_MS`・Windows CI 緑・カタログ +0 B。PR #2277
+
+## 2026-10-18（#2279: test-queue-1992 の ⑪ は #2254 で見込みが過去の記録から引かれるようになったのにテストが既定 3.5 GB を前提にしていた（製品は FR-2.43.9 どおり）・⑫ の受付の競走（BA）も直した）
+- 修正前 ⑪ 6 回中 5 回 NG → 修正後 5/5 PASS=50・製品コード不変。PR #2282
+
+## 2026-10-18（#1643: `isolated_gui_bins [feature …]` が毎回 cargo に任せて今の木から建てる = visual-test 付きを素で上書きせず・rebase 後の古いバイナリで走らない。呼び手 87 本の回避策を外し `SKIP_BUILD` は廃止・番犬 issue1490 に規則 21〜27）
+- 実物の cargo で ① 上書き ② 古いバイナリの A/B・注入で 6 規則 FAILED。PR #2283
+
+## 2026-10-18（#1621: `tako setup --answers` の sleep_guard でスリープ防止の段が 2 度出ていた → 依存チェック段の 1 か所が `[input]` の 1 行で出し、書き込みは黙る。番犬 `issue1621_setup_sleep_guard_once_watchdog`）
+- 実経路 `scripts/test-setup-sleep-guard-once-1621.sh` 33 PASS を CI の macOS へ。PR #2281
+
+## 2026-10-18（#1705: 自動命名の `spawn_claude` が非ゼロ終了でも stdout の EOF を `READ_GRACE` まで待ち、漏れたパイプ（#1748）で `Failed` に化けて再試行を落としていた → 終了コードだけで `NonZero`）
+- 孫に stdout を握らせる再現テストで修正前 FAILED → 修正後 ok・queue 経由 20/20・カタログ +0 B。PR #2287
+
+## 2026-10-18（#2284: 蓋閉じ継続の `probe_owner` が終わったプロセスの起動時刻（Windows はオブジェクトが残る間は読める）を生存の証拠にし #2277 を素通りしていた → `process::live_start_time_unix`（終了コードは `exited` の 1 実装）を通す）
+- 注入 `TAKO_2284_INJECT_LINGERING` で lid.rs:1068 を再現・番犬 `lid_guard_ownership`・カタログ +0 B。PR #2288
+
+## 2026-10-18（#2285: verify-setup-multiagent.sh のスタブが #1959 の `claude --version` を対話起動と数えて落ちていた = 製品の回帰ではない。スタブが版に即答し argv を記録・検出力の自己検査・CI の macOS へ登録・番犬 `issue2285_setup_multiagent_ci_watchdog`）
+- 製品の版の問い合わせを引数なしへ注入すると `claude argv=[]` で落ちる（検出力を保持）。初回 setup で mod が入らない件は #2292。PR #2290
