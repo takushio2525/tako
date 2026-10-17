@@ -7,7 +7,7 @@
 # （vd_clamshell_raw）・器の実体数（vd_backend_instances）をすべてスタブへ差し替え、
 # 一時ディレクトリのテーブルだけを相手にする。CI（ランナーに画面が無い）でも走る。
 #
-# 見ているのは 7 点:
+# 見ているのは 9 点:
 #   1. 同名の面が 2 枚以上になったら ensure が理由つきで止まる（#1150 の増殖）
 #   2. Main 保護は「内蔵あり かつ Main が仮想」のときだけ器へ main を撃つ
 #   3. 孤児の後片付けは実行条件（内蔵が NSScreen に居る + 蓋開き）を満たすまで拒否する
@@ -19,6 +19,10 @@
 #      uuid で当てる材料で、読めなくても ensure は失敗させない・同じ値なら書かない
 #   7. 名指しされた面が物理画面なら ensure が断る（#1783）。TAKO_VD_NAME に内蔵・外部モニタの
 #      名前を渡しても tako-vd と見なさない（uuid の記録・Main 保護へ進む前に止まる）
+#   8. ensure が器に作らせる・繋がせるのは常設の tako-vd だけ（#1817）。OS の一覧に居ない別の名前
+#      （存在しない名前・蓋閉じの内蔵の名前・大文字違い）では器に触らずに断る
+#   9. bounds / status / move-window も ensure と同じ判定を通す（#1817）。物理画面の名前には座標も
+#      「使用可」も返さない。読むだけなので器を起こさない
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PASS=0
@@ -72,22 +76,44 @@ vd_backend_strays() { printf '%s' "${STUB_STRAYS:-}"; }
 READY_LOG="$TMP/ready.log"
 : > "$READY_LOG"
 vd_backend_ready() { echo ready >> "$READY_LOG"; [ -z "${STUB_BACKEND_DOWN:-}" ]; }
+# 器を起こさずに聞けるか（#1817。status / bounds の道）。聞いた回数を数え、STUB_BACKEND_DOWN で「器が走っていない」
+RESP_LOG="$TMP/responding.log"
+: > "$RESP_LOG"
+vd_backend_responding() { echo responding >> "$RESP_LOG"; [ -z "${STUB_BACKEND_DOWN:-}" ]; }
 # 器の仮想スクリーン一覧（#1783。tagID<TAB>displayID<TAB>name）。既定は「tako-vd が器の仮想
-# スクリーン」。STUB_BACKEND_LIST を立てればそれが答えになる（空文字なら「仮想スクリーンが 0 枚」）
+# スクリーン」。STUB_BACKEND_LIST を立てればそれが答えになる（空文字なら「仮想スクリーンが 0 枚」）。
+# $TMP/bd.list を置けばそれが答えになり、偽の器の create / connect がそこを書き換える（#1817）
 vd_backend_list() {
     if [ -n "${STUB_BACKEND_LIST+x}" ]; then printf '%s' "$STUB_BACKEND_LIST"; return 0; fi
+    if [ -f "$TMP/bd.list" ]; then cat "$TMP/bd.list"; return 0; fi
     printf '17\t13\ttako-vd\n'
 }
 # 器へ渡した引数を記録し、「効いた後」のテーブルへ差し替える（応答文ではなく
-# 読み戻しで確かめる本物の作法を、スタブ側でも再現する）
+# 読み戻しで確かめる本物の作法を、スタブ側でも再現する）。
+# create はその名前を $TMP/bd.list へ足し、tagID 指定の connected=on はその面を OS のテーブルへ足す（#1817）
 vd_bd() {
-    printf '%s\n' "$*" >> "$BD_LOG"
-    case "$*" in
+    local all="$*" name tag
+    printf '%s\n' "$all" >> "$BD_LOG"
+    case "$all" in
         *-main=on*) [ -f "$TMP/table.after-main" ] && cp "$TMP/table.after-main" "$TABLE" ;;
         *restartApp*) [ -f "$TMP/table.after-restart" ] && cp "$TMP/table.after-restart" "$TABLE" ;;
+        create*-virtualScreenName=*)
+            name=${all#*-virtualScreenName=}; name=${name%% -aspectWidth*}
+            printf '90\t\t%s\n' "$name" >> "$TMP/bd.list"
+            ;;
+        *-tagID=*-connected=on*)
+            tag=${all#*-tagID=}; tag=${tag%% *}
+            name=$(awk -F'\t' -v t="$tag" '$1 == t { print $3; exit }' "$TMP/bd.list" 2>/dev/null)
+            [ -n "$name" ] && printf '%s\t9000\t0\t2560\t1440\t77\t0\t0\n' "$name" >> "$TABLE"
+            ;;
     esac
     return 0
 }
+# AX で窓を動かす経路（move-window）は本物の System Events へ届かせない
+OSA_LOG="$TMP/osascript.log"
+: > "$OSA_LOG"
+osascript() { echo "osascript $*" >> "$OSA_LOG"; return 0; }
+vd_is_tako_process() { return 1; }
 # 待ちは要らない（判定は全部スタブで確定している）
 sleep() { :; }
 
@@ -95,12 +121,14 @@ set_table() { printf '%s\n' "$1" > "$TABLE"; }
 set_clamshell() { printf '  |   "AppleClamshellState" = %s\n' "$1" > "$CLAMSHELL"; }
 no_clamshell() { : > "$CLAMSHELL"; }
 reset_bd() {
-    : > "$BD_LOG"; : > "$WAKE_LOG"; : > "$READY_LOG"
-    rm -f "$TMP/table.after-main" "$TMP/table.after-restart" "$TMP/drawable" "$TMP/drawable.after-wake"
+    : > "$BD_LOG"; : > "$WAKE_LOG"; : > "$READY_LOG"; : > "$RESP_LOG"; : > "$OSA_LOG"
+    rm -f "$TMP/table.after-main" "$TMP/table.after-restart" "$TMP/drawable" "$TMP/drawable.after-wake" \
+        "$TMP/bd.list"
 }
 bd_log() { cat "$BD_LOG"; }
 wake_count() { grep -c . "$WAKE_LOG" 2>/dev/null || true; }
 ready_count() { grep -c . "$READY_LOG" 2>/dev/null || true; }
+responding_count() { grep -c . "$RESP_LOG" 2>/dev/null || true; }
 # 眠っている状態を作る（$1 = 起きている id を列挙。省略なら全部眠っている）
 set_drawable() { printf '%s\n' "$1" > "$TMP/drawable"; }
 
@@ -474,6 +502,129 @@ assert_eq "その面の uuid は記録する" "$(ls "$VD_RECORD_DIR" 2>/dev/null
 unset STUB_BACKEND_LIST
 VD_NAME=tako-vd
 rm -rf "$VD_RECORD_DIR"
+
+echo "== Test 23: 器に作らせてよい名前の判定（純関数。#1817）=="
+v=$(vd_create_verdict tako-vd tako-vd); rc=$?
+assert_eq "常設の名前は ok（終了 0）" "$v/$rc" "ok/0"
+assert_eq "既定名は Rust と同じ tako-vd" "$VD_DEFAULT_NAME" "tako-vd"
+for name in "TAKO-VD" " tako-vd" "tako-vd " "tako-vd-watchdog-1970-absent" "tako-vd-ab1141" "Color LCD" "no-such-vd" ""; do
+    v=$(vd_create_verdict "$name" tako-vd); rc=$?
+    assert_eq "「${name}」は作らない（終了 1）" "$rc" "1"
+done
+assert_has "理由に作ってよい名前を書く" "常設の tako-vd だけ" "$v"
+v=$(vd_create_verdict tako-vd ""); rc=$?
+assert_eq "常設の名前が空なら何も作らない" "$rc" "1"
+
+# 蓋閉じ（内蔵は OS の一覧に居ない）で tako-vd だけが見えている構成
+FIX_LID_CLOSED=$(t 'tako-vd\t0\t0\t2560\t1440\t6\t0\t1')
+echo "== Test 24: ensure が器に作らせる・繋がせるのは常設の tako-vd だけ（#1817 の ①）=="
+for name in "Color LCD" "no-such-vd" "TAKO-VD" "tako-vd-watchdog-1970-absent"; do
+    reset_bd; set_table "$FIX_LID_CLOSED"; set_drawable "$(t '6\t1\t0')"; rm -rf "$VD_RECORD_DIR"
+    printf '17\t6\ttako-vd\n' > "$TMP/bd.list"
+    VD_NAME=$name
+    out=$(vd_ensure 2>&1); rc=$?
+    assert_eq "「${name}」は終了コード VD_RC_NOT_VIRTUAL（3）" "$rc" "$VD_RC_NOT_VIRTUAL"
+    assert_eq "「${name}」の理由は 1 行" "$(printf '%s\n' "$out" | grep -c .)" "1"
+    assert_has "「${name}」の理由は「仮想ディスプレイではない…作らない・繋がない」" \
+        "ERROR: ${name} は仮想ディスプレイではない（OS のディスプレイ一覧に居ない）ので作らない・繋がない" "$out"
+    assert_has "「${name}」の理由に #1817" "#1817" "$out"
+    assert_lacks "「${name}」で器に作らせない" "create" "$(bd_log)"
+    assert_lacks "「${name}」で器に繋がせない" "connected=on" "$(bd_log)"
+    assert_eq "「${name}」で器を起こさない（BetterDisplay の起動もしない）" "$(ready_count)/$(responding_count)" "0/0"
+    assert_eq "「${name}」で記録を残さない" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" ""
+done
+# 器に在るが繋がっていない別名の面も繋がない（繋ぐと利用者の画面構成が変わる）
+reset_bd; set_table "$FIX_LID_CLOSED"; set_drawable "$(t '6\t1\t0')"
+printf '17\t6\ttako-vd\n18\t\t検証 用 vd\n' > "$TMP/bd.list"
+VD_NAME="検証 用 vd"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "器に在る未接続の別名の面も 3" "$rc" "3"
+assert_lacks "未接続の別名の面へ connected=on を撃たない" "connected=on" "$(bd_log)"
+# 対照: 常設の tako-vd は従来どおり作って繋ぐ（偽の器が一覧と OS のテーブルを書き換える）
+reset_bd; set_table "$(t 'Color LCD\t0\t0\t1512\t982\t1\t1\t1')"; rm -rf "$VD_RECORD_DIR"
+: > "$TMP/bd.list"
+VD_NAME=tako-vd
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "器に無い tako-vd は作って繋いで 0" "$rc" "0"
+assert_has "作る（16:9 / HiDPI）" "create -type=VirtualScreen -virtualScreenName=tako-vd -aspectWidth=16 -aspectHeight=9 -virtualScreenHiDPI=on" "$(bd_log)"
+assert_has "作った面を tagID で繋ぐ" "set -tagID=90 -connected=on" "$(bd_log)"
+assert_eq "作った tako-vd の uuid を記録する" "$(ls "$VD_RECORD_DIR" 2>/dev/null)" "tako-vd.uuid"
+reset_bd; set_table "$(t 'Color LCD\t0\t0\t1512\t982\t1\t1\t1')"
+printf '17\t\ttako-vd\n' > "$TMP/bd.list"
+out=$(vd_ensure 2>&1); rc=$?
+assert_eq "器に在る未接続の tako-vd は繋いで 0" "$rc" "0"
+assert_lacks "器に在れば作らない" "create" "$(bd_log)"
+assert_has "tagID で 1 回だけ繋ぐ" "set -tagID=17 -connected=on" "$(bd_log)"
+assert_eq "繋ぐのは 1 回" "$(bd_log | grep -c 'connected=on')" "1"
+rm -rf "$VD_RECORD_DIR"
+
+echo "== Test 25: bounds / status / move-window も同じ判定を通す（#1817 の ②）=="
+reset_bd; set_table "$FIX_EXTERNAL_MAIN"; set_clamshell No; set_drawable "$(t '1\t1\t0\n7\t1\t0\n13\t1\t0')"
+VD_NAME="Color LCD"
+b=$(vd_bounds 2>"$TMP/err"); rc=$?; err=$(cat "$TMP/err")
+assert_eq "内蔵の名前の bounds は 3" "$rc" "3"
+assert_eq "内蔵の名前に座標を返さない" "$b" ""
+assert_has "理由は「仮想ディスプレイではない」" "ERROR: Color LCD は仮想ディスプレイではない" "$err"
+assert_eq "内蔵は器に聞かずに決まる" "$(ready_count)/$(responding_count)" "0/0"
+VD_NAME="External 4K"
+b=$(vd_bounds 2>"$TMP/err"); rc=$?; err=$(cat "$TMP/err")
+assert_eq "外部モニタの名前の bounds は 3" "$rc" "3"
+assert_eq "外部モニタの名前に座標を返さない" "$b" ""
+assert_has "理由は器の一覧に無いこと" "仮想スクリーン一覧に External 4K が無い" "$err"
+assert_eq "bounds は器を起こさない（聞くのは起こさない口だけ）" "$(ready_count)/$(responding_count)" "0/1"
+VD_NAME=tako-vd
+b=$(vd_bounds 2>&1); rc=$?
+assert_eq "tako-vd の bounds は座標を返す" "$b/$rc" "5352 0 2560 1440/0"
+assert_eq "tako-vd の bounds も器を起こさない" "$(ready_count)" "0"
+STUB_BACKEND_DOWN=1
+b=$(vd_bounds 2>"$TMP/err"); rc=$?; err=$(cat "$TMP/err")
+assert_eq "器が走っていなければ確かめられない = 1" "$rc" "1"
+assert_eq "確かめられないときも座標を返さない" "$b" ""
+assert_has "確かめられないと言う" "確かめられないので使わない" "$err"
+unset STUB_BACKEND_DOWN
+VD_NAME="no-such-vd"
+reset_bd
+b=$(vd_bounds 2>"$TMP/err"); rc=$?; err=$(cat "$TMP/err")
+assert_eq "一覧に居ない名前の bounds は従来どおり 1" "$rc" "1"
+assert_has "見つからないと言う（従来の文言）" "見つからない（先に ensure すること）" "$err"
+assert_eq "見つからない名前では器に聞かない" "$(responding_count)" "0"
+# status: 物理画面の名前に「使用可」と言わない。Main 保護の判定も仮想と確かめてから
+reset_bd; set_table "$FIX_OK"; set_drawable "$(t '1\t1\t0\n13\t1\t0')"
+VD_NAME="Color LCD"
+out=$(vd_status 2>&1); rc=$?
+assert_eq "内蔵の名前の status は 3" "$rc" "3"
+assert_has "1 行目は「仮想ディスプレイではない」" "Color LCD: 仮想ディスプレイではない（Color LCD は内蔵ディスプレイ" "$(printf '%s\n' "$out" | sed -n 1p)"
+assert_lacks "内蔵の名前に使用可と言わない" "使用可" "$out"
+assert_lacks "内蔵を仮想と読んで「内蔵へ戻す」と言わない" "要（内蔵" "$out"
+assert_has "Main 保護は判定しない" "Main 保護: 判定しない" "$out"
+reset_bd; set_table "$FIX_EXTERNAL_MAIN"; set_drawable "$(t '1\t1\t0\n7\t1\t0\n13\t1\t0')"
+VD_NAME="External 4K"
+out=$(vd_status 2>&1); rc=$?
+assert_eq "外部モニタの名前の status は 3" "$rc" "3"
+assert_has "外部モニタも「仮想ディスプレイではない」" "External 4K: 仮想ディスプレイではない（器（BetterDisplay）の仮想スクリーン一覧に External 4K が無い" "$out"
+assert_lacks "外部モニタの名前に使用可と言わない" "使用可" "$out"
+assert_eq "status は器を起こさない" "$(ready_count)" "0"
+VD_NAME=tako-vd
+out=$(vd_status 2>&1); rc=$?
+assert_eq "tako-vd の status は 0" "$rc" "0"
+assert_has "tako-vd は使用可" "tako-vd: 使用可（5352 0 2560 1440）" "$out"
+assert_eq "tako-vd の status も器を起こさない" "$(ready_count)" "0"
+STUB_BACKEND_DOWN=1
+out=$(vd_status 2>&1); rc=$?
+assert_eq "器が走っていなければ status は 1" "$rc" "1"
+assert_has "確かめられないと出す" "tako-vd: 仮想ディスプレイか確かめられない" "$out"
+assert_lacks "確かめられない面に使用可と言わない" "使用可" "$out"
+unset STUB_BACKEND_DOWN
+# move-window: 物理画面の名前の面へ窓を動かさない（System Events へ届かない）
+reset_bd; set_table "$FIX_OK"; set_drawable "$(t '1\t1\t0\n13\t1\t0')"
+VD_NAME="Color LCD"
+out=$(vd_move_window 12345 2>&1); rc=$?
+assert_eq "内蔵の名前の move-window は 3" "$rc" "3"
+assert_eq "内蔵の名前の面へ窓を動かさない" "$(cat "$OSA_LOG")" ""
+VD_NAME=tako-vd
+out=$(vd_move_window 12345 2>&1); rc=$?
+assert_eq "tako-vd の move-window は従来どおり 0" "$rc" "0"
+assert_has "tako-vd の内側（+40,+60）へ動かす" "{1552, 60}" "$(cat "$OSA_LOG")"
 
 echo
 echo "PASS=${PASS} FAIL=${FAIL}"

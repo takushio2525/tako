@@ -1,6 +1,6 @@
-//! 仮想ディスプレイまわりの番犬（#1141 / #1150 / #1160 / #1697）
+//! 仮想ディスプレイまわりの番犬（#1141 / #1150 / #1160 / #1697 / #1783 / #1817）
 //!
-//! 守りたい不変条件は 10 個。どれも「壊れても動いているように見える」ので、
+//! 守りたい不変条件は 12 個。どれも「壊れても動いているように見える」ので、
 //! 人間の記憶ではなくテストで固定する。
 //!
 //! 1. **ヘルパは消す機能を持たない**。`tako-vd` は常設で、検証のたびに作り直さない
@@ -29,6 +29,12 @@
 //!     「器が作った仮想ディスプレイか」を確かめ、物理画面（内蔵 / 器の一覧に無い面）なら
 //!     終了コード `VD_RC_NOT_VIRTUAL` で断る。後ろに置くと物理画面の uuid を記録し、
 //!     内蔵なら Main 保護が器へ main を撃つ（`TAKO_VD_NAME` の取り違え 1 つで起きる）
+//! 11. **器に作らせる・繋がせるのは常設の `tako-vd` だけ**（#1817）。OS の一覧に居ない名前を
+//!     何でも作らせると、存在しない名前・打ち間違い・蓋閉じで一覧に居ない内蔵の名前で器に
+//!     仮想スクリーンが増える（孤児は器から消せない = #1150）。名前の判定は器に触る前
+//! 12. **`bounds` / `status` / `move-window` も締めと同じ判定を通す**（#1817）。座標は窓の置き場に
+//!     使われるので、物理画面の名前に座標や「使用可」を返すとユーザーの画面へ窓を出しうる。
+//!     読むだけの口なので器（BetterDisplay）を起動しない
 
 use std::path::{Path, PathBuf};
 
@@ -101,12 +107,18 @@ fn ヘルパは必要なサブコマンドをそろえている() {
 fn 既定の仮想ディスプレイ名がrustとシェルでそろっている() {
     let name = tako_core::platform::display::DEFAULT_VIRTUAL_DISPLAY_NAME;
     let src = helper_source();
-    // シェル側の既定値（TAKO_VD_NAME の :- 右辺）
+    // シェル側の既定値（VD_DEFAULT_NAME。#1817 から器に作らせてよい唯一の名前も兼ねる）
     let shell_default = src
         .lines()
-        .find_map(|l| l.trim().strip_prefix("VD_NAME=${TAKO_VD_NAME:-"))
-        .and_then(|rest| rest.strip_suffix('}'))
+        .find_map(|l| l.trim().strip_prefix("VD_DEFAULT_NAME="))
         .map(str::to_string);
+    assert!(
+        src.lines()
+            .any(|l| l.trim() == "VD_NAME=${TAKO_VD_NAME:-$VD_DEFAULT_NAME}"),
+        "scripts/lib/virtual-display.sh:{}: TAKO_VD_NAME の既定が VD_DEFAULT_NAME を指していない（#1817）。\n\
+         → 既定名と「器に作らせてよい名前」が 2 か所に分かれると、片方だけ直したときにずれる",
+        line_of(&src, "VD_NAME=${TAKO_VD_NAME:-")
+    );
     assert_eq!(
         shell_default.as_deref(),
         Some(name),
@@ -746,5 +758,392 @@ vd_ensure 2>"$STUB_ERR"
     assert!(
         err.trim().is_empty(),
         "{REL}:{at}: 本物の tako-vd で余計な出力: {err}"
+    );
+}
+
+// ── #1817: 器に作らせるのは常設の 1 枚だけ・座標と状態も物理画面を断る ──────────────
+
+/// `VD_RC_NOT_VIRTUAL=<数>` の値（ヘルパと番犬で番号をずらさない）
+fn rc_not_virtual(src: &str) -> i32 {
+    src.lines()
+        .find_map(|l| l.strip_prefix("VD_RC_NOT_VIRTUAL="))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| {
+            panic!("scripts/lib/virtual-display.sh: `VD_RC_NOT_VIRTUAL=<数>` が見つからない")
+        })
+}
+
+/// 抜けるとき（assert で落ちたときも）一時 dir を消す。**消す前に一時 dir の下であることを確かめる**
+#[cfg(unix)]
+struct VdScratch(PathBuf);
+
+#[cfg(unix)]
+impl VdScratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("tako-1817-vd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時 dir を作る");
+        Self(dir)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for VdScratch {
+    fn drop(&mut self) {
+        if self.0.starts_with(std::env::temp_dir()) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+/// 本物の `virtual-display.sh` を source し、画面の列挙・器・AX をスタブにしたうえで
+/// サブコマンドを 1 つ走らせる **スクリプト**（`/bin/bash` = macOS 同梱の 3.2 で走らせる）。
+/// 偽の器は `create` で一覧へ足し、tagID 指定の `connected=on` でその面を OS のテーブルへ足す
+/// （本物の作法 = 応答文ではなく読み戻しで確かめる、をスタブ側でも再現する）。
+/// **実ディスプレイ・本物の BetterDisplay・System Events に一切触らない**
+#[cfg(unix)]
+const VD_STUBBED_RUN: &str = r#"
+. "$HELPER"
+vd_screens() { cat "$STUB_DIR/table"; }
+vd_drawable() { awk -F'\t' 'NF { printf "%s\t1\t0\n", $6 }' "$STUB_DIR/table"; }
+vd_display_uuid() { printf 'AAAAAAAA-0000-4000-8000-%012d' "${1:-0}"; }
+vd_wake_displays() { echo wake >> "$STUB_DIR/log"; }
+vd_backend_ready() { echo ready >> "$STUB_DIR/log"; return 0; }
+vd_backend_responding() { echo responding >> "$STUB_DIR/log"; return 0; }
+vd_backend_list() { cat "$STUB_DIR/list"; }
+vd_backend_instances() { echo 1; }
+vd_clamshell_raw() { :; }
+vd_is_tako_process() { return 1; }
+osascript() { echo "osascript $*" >> "$STUB_DIR/log"; }
+vd_bd() {
+    local all="$*" name tag
+    echo "bd $all" >> "$STUB_DIR/log"
+    case "$all" in
+        create*-virtualScreenName=*)
+            name=${all#*-virtualScreenName=}; name=${name%% -aspectWidth*}
+            printf '90\t\t%s\n' "$name" >> "$STUB_DIR/list" ;;
+        *-tagID=*-connected=on*)
+            tag=${all#*-tagID=}; tag=${tag%% *}
+            name=$(awk -F'\t' -v t="$tag" '$1 == t { print $3; exit }' "$STUB_DIR/list")
+            [ -n "$name" ] && printf '%s\t9000\t0\t2560\t1440\t77\t0\t0\n' "$name" >> "$STUB_DIR/table" ;;
+    esac
+    return 0
+}
+sleep() { :; }
+case "$SUB" in
+    ensure) vd_ensure ;;
+    bounds) vd_bounds ;;
+    status) vd_status ;;
+    move-window) vd_move_window 12345 ;;
+    *) exit 99 ;;
+esac
+"#;
+
+#[cfg(unix)]
+struct VdRun {
+    rc: i32,
+    stdout: String,
+    stderr: String,
+    /// 器・起こす手立て・AX へ撃ったもの（1 行 1 件）
+    log: String,
+}
+
+/// `VD_STUBBED_RUN` を 1 場面ぶん走らせる。`table` は OS に見えている面
+/// （name<TAB>x<TAB>y<TAB>w<TAB>h<TAB>displayID<TAB>builtin<TAB>main）、`list` は器の仮想スクリーン一覧
+#[cfg(unix)]
+fn run_vd_stubbed(scratch: &VdScratch, name: &str, sub: &str, table: &str, list: &str) -> VdRun {
+    let case = scratch
+        .0
+        .join(format!("{sub}-{}", name.replace([' ', '/'], "_")));
+    let _ = std::fs::remove_dir_all(&case);
+    std::fs::create_dir_all(&case).expect("場面の dir を作る");
+    std::fs::write(case.join("table"), table).expect("テーブルを書く");
+    std::fs::write(case.join("list"), list).expect("器の一覧を書く");
+    let out = std::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(VD_STUBBED_RUN)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &case)
+        .env("HELPER", repo_root().join("scripts/lib/virtual-display.sh"))
+        .env("TAKO_VD_NAME", name)
+        .env("TAKO_VD_RECORD_DIR", case.join("record"))
+        .env(
+            "TAKO_VD_BETTERDISPLAY_APP",
+            case.join("NoBetterDisplay.app"),
+        )
+        .env("STUB_DIR", &case)
+        .env("SUB", sub)
+        .output()
+        .expect("/bin/bash を起こす");
+    VdRun {
+        rc: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        log: std::fs::read_to_string(case.join("log")).unwrap_or_default(),
+    }
+}
+
+/// `ensure` が器に作らせる・繋がせるのは**常設の `tako-vd`（完全一致）だけ**（#1817）。
+///
+/// 以前は OS の一覧に居ない名前なら何でも器に作らせて繋いでいた（存在しない名前・打ち間違い・
+/// 大文字違い・蓋閉じで一覧に居ない内蔵の名前でも）。作られた面は締めの判定（#1783）から見ると
+/// 「器が作った仮想スクリーン」なので ensure は成功し、器には孤児が残る（#1150: 器から消せない）。
+/// 名前の判定は**器に触る前**（BetterDisplay の起動も一覧の読み出しもしない）
+#[cfg(unix)]
+#[test]
+fn ensureが器に作らせるのは常設の名前だけ() {
+    const REL: &str = "scripts/lib/virtual-display.sh";
+    let src = helper_source();
+    let rc_nv = rc_not_virtual(&src);
+    let at = line_of(&src, "vd_ensure() {");
+    let cat = line_of(&src, "vd_create_verdict() {");
+
+    // ① 作る・繋ぐ道の頭で名前を確かめる（器を起こす・作る・繋ぐより前）
+    let body = code_only(&shell_fn_body(&src, "vd_ensure"));
+    let gate = body.find("vd_assert_creatable || return $?").unwrap_or_else(|| {
+        panic!(
+            "{REL}:{at}: vd_ensure の作る・繋ぐ道が名前の確認（`vd_assert_creatable || return $?`）を通っていない（#1817）。\n\
+             → OS の一覧に居ない名前なら何でも器に仮想スクリーンを作らせて繋ぐ"
+        )
+    });
+    for later in [
+        "vd_backend_ready",
+        "create -type=VirtualScreen",
+        "-connected=on",
+    ] {
+        let pos = body
+            .find(later)
+            .unwrap_or_else(|| panic!("{REL}:{at}: vd_ensure に {later} が見つからない"));
+        assert!(
+            gate < pos,
+            "{REL}:{at}: 名前の確認が {later} より後ろに在る（#1817）。\n\
+             → 器に触ってから断ると、BetterDisplay の起動・作成・接続のどれかが先に走る"
+        );
+    }
+    let assert_body = code_only(&shell_fn_body(&src, "vd_assert_creatable"));
+    assert!(
+        assert_body.contains("vd_create_verdict")
+            && assert_body.contains("$VD_DEFAULT_NAME")
+            && assert_body.contains("return \"$VD_RC_NOT_VIRTUAL\""),
+        "{REL}:{}: vd_assert_creatable が判定（vd_create_verdict \"$VD_NAME\" \"$VD_DEFAULT_NAME\"）を通して \
+         VD_RC_NOT_VIRTUAL で断る形になっていない（#1817）",
+        line_of(&src, "vd_assert_creatable() {")
+    );
+
+    // ② 判定は純関数で、通すのは常設の名前の完全一致だけ（大文字小文字・空白・接頭辞を広げない）
+    let verdict = code_only(&shell_fn_body(&src, "vd_create_verdict"));
+    for banned in ["vd_bd", "vd_screens", "vd_backend", "osascript", "pgrep"] {
+        assert!(
+            !verdict.contains(banned),
+            "{REL}:{cat}: 作ってよい名前の判定（vd_create_verdict）が {banned} を呼んでいる（#1817）。\n\
+             → 引数だけを見る純関数のままにする（器に触る前に決まる）"
+        );
+    }
+    let names = [
+        "tako-vd",
+        "TAKO-VD",
+        "Tako-Vd",
+        " tako-vd",
+        "tako-vd ",
+        "tako-vd（1）",
+        "tako-vd-ab1141",
+        "tako-vd-watchdog-1817-absent",
+        "Color LCD",
+        "no-such-vd",
+        "",
+    ];
+    let probe = std::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(r#". "$HELPER"; for n in "$@"; do vd_create_verdict "$n" "$VD_DEFAULT_NAME" >/dev/null && printf '[%s]\n' "$n"; done; exit 0"#)
+        .arg("probe")
+        .args(names)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HELPER", repo_root().join(REL))
+        .output()
+        .expect("/bin/bash を起こす");
+    let allowed = String::from_utf8_lossy(&probe.stdout).into_owned();
+    assert_eq!(
+        allowed.trim(),
+        "[tako-vd]",
+        "{REL}:{cat}: 器に作らせてよい名前が常設の tako-vd（完全一致）だけになっていない（#1817）。\n\
+         → 試した名前: {names:?}"
+    );
+
+    // ③ 実際に走らせる: 蓋閉じ（内蔵は OS の一覧に居ない）で tako-vd だけが見えている構成
+    let scratch = VdScratch::new("create");
+    let lid_closed = "tako-vd\t0\t0\t2560\t1440\t6\t0\t1\n";
+    let list = "17\t6\ttako-vd\n";
+    for name in [
+        "Color LCD",
+        "no-such-vd",
+        "TAKO-VD",
+        "tako-vd-watchdog-1817-absent",
+    ] {
+        let r = run_vd_stubbed(&scratch, name, "ensure", lid_closed, list);
+        assert_eq!(
+            r.rc, rc_nv,
+            "{REL}:{at}: TAKO_VD_NAME={name}（OS の一覧に居ない常設以外の名前）で ensure が \
+             VD_RC_NOT_VIRTUAL（{rc_nv}）で断らない（#1817）\nstderr: {}\n器へ撃ったもの:\n{}",
+            r.stderr, r.log
+        );
+        for shot in ["bd create", "connected=on", "ready", "responding"] {
+            assert!(
+                !r.log.contains(shot),
+                "{REL}:{at}: TAKO_VD_NAME={name} で器に触った（{shot}。#1817。名前の確認より先に器へ進んでいる）\n{}",
+                r.log
+            );
+        }
+        let lines: Vec<&str> = r.stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(
+            lines.len() == 1
+                && lines[0].starts_with(&format!("ERROR: {name} は仮想ディスプレイではない"))
+                && lines[0].contains("#1817"),
+            "{REL}:{}: TAKO_VD_NAME={name} の理由が「ERROR: {name} は仮想ディスプレイではない…#1817」の 1 行ではない: {lines:?}",
+            line_of(&src, "vd_assert_creatable() {")
+        );
+    }
+
+    // 対照: 常設の tako-vd は従来どおり器に作らせて繋ぐ
+    let r = run_vd_stubbed(
+        &scratch,
+        "tako-vd",
+        "ensure",
+        "Color LCD\t0\t0\t1512\t982\t1\t1\t1\n",
+        "",
+    );
+    assert_eq!(
+        r.rc, 0,
+        "{REL}:{at}: 器に無い tako-vd で ensure が失敗した（#1817 で常設の面の作成を壊した）: {}\n{}",
+        r.stderr, r.log
+    );
+    for shot in [
+        "bd create -type=VirtualScreen -virtualScreenName=tako-vd",
+        "bd set -tagID=90 -connected=on",
+    ] {
+        assert!(
+            r.log.contains(shot),
+            "{REL}:{at}: 器に無い tako-vd で {shot} を撃っていない（#1817 で常設の面の作成を壊した）\n{}",
+            r.log
+        );
+    }
+}
+
+/// `bounds` / `status` / `move-window` も締めと同じ判定（`vd_virtual_verdict`）を通す（#1817）。
+///
+/// 以前の 3 つは名前で面を引くだけで、`TAKO_VD_NAME` に物理画面の名前を渡すと座標・「使用可」を返し、
+/// 窓をその面へ動かした。座標は検証スクリプトが窓の置き場に使うので、ユーザーの画面へ窓が出うる。
+/// 3 つは読むだけ（と当座の AX）なので**器（BetterDisplay）を起動しない**（`--no-launch`）
+#[cfg(unix)]
+#[test]
+fn boundsとstatusとmove_windowも物理画面を断る() {
+    const REL: &str = "scripts/lib/virtual-display.sh";
+    let src = helper_source();
+    let rc_nv = rc_not_virtual(&src);
+
+    for func in ["vd_bounds", "vd_status", "vd_move_window"] {
+        let at = line_of(&src, &format!("{func}() {{"));
+        let body = code_only(&shell_fn_body(&src, func));
+        assert!(
+            body.contains("vd_assert_virtual --no-launch")
+                || body.contains("vd_check_virtual --no-launch"),
+            "{REL}:{at}: {func} が仮想ディスプレイかの判定（vd_assert_virtual / vd_check_virtual --no-launch）を通っていない（#1817）。\n\
+             → 物理画面の名前に座標・使用可を返す / その面へ窓を動かす"
+        );
+        assert!(
+            !body.contains("vd_backend_ready"),
+            "{REL}:{at}: {func} が器を起こしている（vd_backend_ready。#1817）。読むだけの口は BetterDisplay を起動しない"
+        );
+    }
+    let responding = code_only(&shell_fn_body(&src, "vd_backend_responding"));
+    assert!(
+        responding.contains("pgrep") && !responding.contains("open "),
+        "{REL}:{}: vd_backend_responding が「走っていれば 1 回聞く」だけになっていない（#1817。器を起動しない・\
+         走っていない器の CLI は応答せず固まる = 癖 ①）",
+        line_of(&src, "vd_backend_responding() {")
+    );
+    let check = code_only(&shell_fn_body(&src, "vd_check_virtual"));
+    assert!(
+        check.contains("--no-launch") && check.contains("vd_backend_responding"),
+        "{REL}:{}: vd_check_virtual の --no-launch が器を起こさない口（vd_backend_responding）へ分かれていない（#1817）",
+        line_of(&src, "vd_check_virtual() {")
+    );
+
+    // 実際に走らせる: 蓋を開けた MacBook + 外部モニタ + tako-vd
+    let scratch = VdScratch::new("read");
+    let table = "Color LCD\t0\t0\t1512\t982\t1\t1\t1\n\
+                 External 4K\t1512\t0\t3840\t2160\t7\t0\t0\n\
+                 tako-vd\t5352\t0\t2560\t1440\t13\t0\t0\n";
+    let list = "17\t13\ttako-vd\n";
+    for name in ["Color LCD", "External 4K"] {
+        let at = line_of(&src, "vd_bounds() {");
+        let r = run_vd_stubbed(&scratch, name, "bounds", table, list);
+        assert!(
+            r.rc == rc_nv && r.stdout.trim().is_empty(),
+            "{REL}:{at}: TAKO_VD_NAME={name}（物理画面）で bounds が座標を返した / VD_RC_NOT_VIRTUAL（{rc_nv}）で断らない（#1817）\n\
+             rc={} stdout={:?} stderr={:?}",
+            r.rc, r.stdout, r.stderr
+        );
+        assert!(
+            r.stderr.contains(&format!("{name} は仮想ディスプレイではない")),
+            "{REL}:{at}: TAKO_VD_NAME={name} の bounds が「仮想ディスプレイではない」と言わない: {:?}",
+            r.stderr
+        );
+
+        let at = line_of(&src, "vd_status() {");
+        let r = run_vd_stubbed(&scratch, name, "status", table, list);
+        let first = r.stdout.lines().next().unwrap_or_default().to_string();
+        assert!(
+            r.rc == rc_nv
+                && first.starts_with(&format!("{name}: 仮想ディスプレイではない"))
+                && !r.stdout.contains("使用可")
+                && !r.stdout.contains("要（内蔵"),
+            "{REL}:{at}: TAKO_VD_NAME={name}（物理画面）の status が「仮想ディスプレイではない」で \
+             VD_RC_NOT_VIRTUAL（{rc_nv}）にならない / 使用可・Main 保護の「要」を言う（#1817）\nrc={} stdout={:?}",
+            r.rc, r.stdout
+        );
+
+        let at = line_of(&src, "vd_move_window() {");
+        let r = run_vd_stubbed(&scratch, name, "move-window", table, list);
+        assert!(
+            r.rc == rc_nv && !r.log.contains("osascript"),
+            "{REL}:{at}: TAKO_VD_NAME={name}（物理画面）で move-window が窓を動かした / 断らない（#1817）\nrc={} log={:?}",
+            r.rc, r.log
+        );
+    }
+    // 器を起こさない（内蔵は器に聞かずに決まり、外部モニタは起こさない口で聞く）
+    for sub in ["bounds", "status", "move-window"] {
+        let r = run_vd_stubbed(&scratch, "External 4K", sub, table, list);
+        assert!(
+            !r.log.lines().any(|l| l == "ready"),
+            "{REL}:{}: {sub} が器を起こした（vd_backend_ready。#1817。読むだけの口は BetterDisplay を起動しない）\n{}",
+            line_of(&src, "vd_check_virtual() {"),
+            r.log
+        );
+    }
+
+    // 対照: 本物の tako-vd は従来どおり座標・使用可を返し、窓を動かす
+    let r = run_vd_stubbed(&scratch, "tako-vd", "bounds", table, list);
+    assert_eq!(
+        (r.rc, r.stdout.trim()),
+        (0, "5352 0 2560 1440"),
+        "{REL}:{}: 本物の tako-vd で bounds が座標を返さない（#1817 で既定の道を壊した）: {:?}",
+        line_of(&src, "vd_bounds() {"),
+        r.stderr
+    );
+    let r = run_vd_stubbed(&scratch, "tako-vd", "status", table, list);
+    assert!(
+        r.rc == 0 && r.stdout.starts_with("tako-vd: 使用可（5352 0 2560 1440）"),
+        "{REL}:{}: 本物の tako-vd で status が使用可を返さない（#1817 で既定の道を壊した）: {:?}",
+        line_of(&src, "vd_status() {"),
+        r.stdout
+    );
+    let r = run_vd_stubbed(&scratch, "tako-vd", "move-window", table, list);
+    assert!(
+        r.rc == 0 && r.log.contains("{5392, 60}"),
+        "{REL}:{}: 本物の tako-vd で move-window が窓を内側（+40,+60）へ動かさない（#1817 で既定の道を壊した）: {:?}",
+        line_of(&src, "vd_move_window() {"),
+        r.log
     );
 }
