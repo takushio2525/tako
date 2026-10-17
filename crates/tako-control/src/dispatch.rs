@@ -26566,17 +26566,18 @@ mod tests {
         // 中身は `issue1945_*` が見る
 
         // 存在しないペインはエラー
+        let stale = tako_core::unused_id::pane().as_u64();
         let missing = dispatch(
             &mut host,
             Request::LimitResume {
-                pane: Some(9999),
+                pane: Some(stale),
                 enabled: Some(true),
                 all: None,
                 network: None,
             },
             PaneOrigin::Cli,
         );
-        assert!(matches!(missing, Err(DispatchError::PaneNotFound(9999))));
+        assert!(matches!(missing, Err(DispatchError::PaneNotFound(id)) if id == stale));
     }
 
     /// #1945 の作業場: 表示中に master / シェル / 手起動の claude（検出のみ）、
@@ -26769,17 +26770,18 @@ mod tests {
             .unwrap()
             .limit_autoresume());
         // 存在しないペインは従来どおりエラー
+        let stale = tako_core::unused_id::pane().as_u64();
         let missing = dispatch(
             &mut host,
             Request::LimitResume {
-                pane: Some(9999),
+                pane: Some(stale),
                 enabled: Some(true),
                 all: None,
                 network: None,
             },
             PaneOrigin::Cli,
         );
-        assert!(matches!(missing, Err(DispatchError::PaneNotFound(9999))));
+        assert!(matches!(missing, Err(DispatchError::PaneNotFound(id)) if id == stale));
     }
 
     /// #1945（master の実測 2026-10-09）: 表で ON にした worker を退避すると
@@ -27785,17 +27787,18 @@ mod tests {
         .expect("退避タブはピン留めできる");
         assert_eq!(pinned["group_tab"].as_u64(), Some(t1.as_u64()));
         // 実在しないタブは従来どおり拒む（検証が素通りになっていない）
+        let stale_tab = tako_core::unused_id::tab().as_u64();
         let err = dispatch(
             &mut host,
             Request::Pin {
                 pane: None,
-                group_tab: Some(99999),
+                group_tab: Some(stale_tab),
                 pinned: Some(true),
             },
             PaneOrigin::Cli,
         )
         .unwrap_err();
-        assert!(matches!(err, DispatchError::TabNotFound(99999)));
+        assert!(matches!(err, DispatchError::TabNotFound(id) if id == stale_tab));
     }
 
     #[test]
@@ -27820,7 +27823,7 @@ mod tests {
             &mut host,
             Request::Background {
                 pane: None,
-                tab: Some(99999),
+                tab: Some(tako_core::unused_id::tab().as_u64()),
             },
             PaneOrigin::Cli,
         );
@@ -27982,16 +27985,17 @@ mod tests {
     fn pinのgroup_tabはバックグラウンドの由来が無いと弾く() {
         // 閉じたタブグループのピンは、その由来を持つバックグラウンドペインが居るときだけ通る
         let mut host = MockHost::new();
+        let stale_tab = tako_core::unused_id::tab().as_u64();
         let err = dispatch(
             &mut host,
             Request::Pin {
                 pane: None,
-                group_tab: Some(9999),
+                group_tab: Some(stale_tab),
                 pinned: Some(true),
             },
             PaneOrigin::Cli,
         );
-        assert!(matches!(err, Err(DispatchError::TabNotFound(9999))));
+        assert!(matches!(err, Err(DispatchError::TabNotFound(id)) if id == stale_tab));
     }
 
     #[test]
@@ -29265,7 +29269,7 @@ mod tests {
         assert_eq!(out["status"], json!("unsupported"));
         assert!(host.xref.is_empty());
         let mut gone = failed.clone();
-        gone.source_pane = PaneId::from_raw(987_654);
+        gone.source_pane = tako_core::unused_id::pane();
         gone.answer = Some(Ok(crate::lsp::XrefAnswer::List {
             server: "fake",
             items: vec![xref_place(&main, 1)],
@@ -31549,7 +31553,7 @@ mod tests {
         let missing = dispatch(
             &mut host,
             Request::PaneClick {
-                pane: Some(9_999),
+                pane: Some(tako_core::unused_id::pane().as_u64()),
                 row: 0,
                 col: 0,
             },
@@ -33969,24 +33973,26 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, DispatchError::NoTargetPane);
+        let stale = tako_core::unused_id::pane().as_u64();
         let err = dispatch(
             &mut host,
             Request::Close {
-                pane: Some(99999),
+                pane: Some(stale),
                 force: false,
                 caller_role: None,
             },
             PaneOrigin::Cli,
         )
         .unwrap_err();
-        assert_eq!(err, DispatchError::PaneNotFound(99999));
+        assert_eq!(err, DispatchError::PaneNotFound(stale));
+        let stale_tab = tako_core::unused_id::tab().as_u64();
         let err = dispatch(
             &mut host,
-            Request::TabSelect { tab: 99999 },
+            Request::TabSelect { tab: stale_tab },
             PaneOrigin::Cli,
         )
         .unwrap_err();
-        assert_eq!(err, DispatchError::TabNotFound(99999));
+        assert_eq!(err, DispatchError::TabNotFound(stale_tab));
     }
 
     // --- #109: 複数 master 並行時の caller_role による正しい master 特定 ---
@@ -34033,7 +34039,7 @@ mod tests {
 
     const TEST_PROJECT: &str = "_tako_test_109_";
 
-    /// caller_role 系テストの共通 SpawnParams（stale pane 99999 + effort 明示）
+    /// caller_role 系テストの共通 SpawnParams（存在しない pane + effort 明示）
     fn test_spawn_params<'a>(prompt: &'a str, caller_role: Option<&'a str>) -> SpawnParams<'a> {
         SpawnParams {
             project: TEST_PROJECT,
@@ -34041,7 +34047,7 @@ mod tests {
             label: None,
             model: None,
             effort: Some("high"),
-            pane: Some(99999),
+            pane: Some(tako_core::unused_id::pane().as_u64()),
             tab: None,
             caller_role,
             agent: None,
@@ -34800,7 +34806,7 @@ mod tests {
         assert_eq!(ctx.backend_session, None);
         assert!(ctx.live_tail.is_none());
         // 存在しないペイン
-        let gone = collect_worker_status_ctx(&host, 999_999);
+        let gone = collect_worker_status_ctx(&host, tako_core::unused_id::pane().as_u64());
         assert!(!gone.pane_exists);
     }
 
@@ -38047,15 +38053,16 @@ mod tests {
         )
         .unwrap();
 
+        let stale = tako_core::unused_id::pane().as_u64();
         let err = dispatch(
             &mut host,
-            Request::orchestrator_self_with(Some(99_999), None, None, None, false),
+            Request::orchestrator_self_with(Some(stale), None, None, None, false),
             PaneOrigin::Cli,
         )
         .expect_err("名指しが解けないのでエラー");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("99999"),
+            msg.contains(&stale.to_string()),
             "名指しした ID を名指しで返すこと: {msg}"
         );
     }
@@ -39667,8 +39674,8 @@ mod tests {
         )
         .unwrap();
 
-        // orphan 復元で旧 pane 99999 → 実 pane へのマッピングを登録
-        let stale_id = 99999_u64;
+        // orphan 復元で旧 pane → 実 pane へのマッピングを登録（旧 ID はどのペインにも無いもの）
+        let stale_id = tako_core::unused_id::pane().as_u64();
         host.stale_pane_map
             .insert(PaneId::from_raw(stale_id), PaneId::from_raw(actual_pane));
 
@@ -39714,7 +39721,7 @@ mod tests {
     fn resolve_pane_stale_mapで新idへ読み替える() {
         let mut host = MockHost::new();
         let actual = host.root_pane();
-        let stale_id = 99999_u64;
+        let stale_id = tako_core::unused_id::pane().as_u64();
         host.stale_pane_map
             .insert(PaneId::from_raw(stale_id), PaneId::from_raw(actual));
 
@@ -39737,30 +39744,12 @@ mod tests {
         assert_eq!(result["requested"].as_u64(), Some(stale_id));
     }
 
-    /// このホストのワークスペースに**無いと保証された**ペイン ID（stale ID の代役）。
-    ///
-    /// ペイン ID は `PANE_ID_COUNTER`（プロセス全体で共有）で採番されるので、`305` のような
-    /// 決め打ちは**同じテストバイナリの他のテストが何枚ペインを作ったか**で実在しうる。
-    /// 並び順しだいでテストのペインがちょうど 305 を引くと、stale のつもりの ID が解けて
-    /// しまう（#1860 でテストが増えた後、CI の 3 並列で毎回落ちたのを実測）
-    fn absent_pane_id(host: &MockHost) -> u64 {
-        let max = host
-            .ws
-            .tabs()
-            .iter()
-            .flat_map(|t| t.tree().panes())
-            .map(|p| p.id().as_u64())
-            .max()
-            .unwrap_or(0);
-        max + 1_000_000
-    }
-
     #[test]
     fn resolve_pane_解決不能でもエラーにせずnullを返す() {
         let mut host = MockHost::new();
         // stale map に登録の無い旧 ID（#567 の実事象: ペイン 305 は既に存在しない）。
         // 値は決め打ちせず、このワークスペースに無いものを使う
-        let stale = absent_pane_id(&host);
+        let stale = tako_core::unused_id::pane().as_u64();
         let result = dispatch(
             &mut host,
             Request::ResolvePane {
@@ -39836,7 +39825,7 @@ mod tests {
             )
             .unwrap();
 
-            let stale_id = 88888_u64;
+            let stale_id = tako_core::unused_id::pane().as_u64();
             host.stale_pane_map
                 .insert(PaneId::from_raw(stale_id), PaneId::from_raw(master_pane));
 
@@ -40208,7 +40197,8 @@ mod tests {
         assert_eq!(v["released_panes"].as_array().unwrap().len(), 0);
         assert!(host.starter_released.is_empty());
         // 対象ペインを解決できないときはエラー（黙って別ペインへ効かせない）
-        assert!(release(&mut host, "release", Some(9999)).is_err());
+        let stale = tako_core::unused_id::pane().as_u64();
+        assert!(release(&mut host, "release", Some(stale)).is_err());
         assert!(release(&mut host, "release", None).is_err());
     }
 
@@ -40999,7 +40989,7 @@ mod tests {
         // ケース 2: pane env が stale（現存しない ID 305）→ stale map もなし →
         // role 検索に落ちるが、同一 role が 3 体あるため曖昧エラーになる
         // （旧実装では先頭の master_b を黙って返していた = 実事故の再現）
-        let stale = absent_pane_id(&host);
+        let stale = tako_core::unused_id::pane().as_u64();
         let result_stale = dispatch(
             &mut host,
             Request::OrchestratorSelf {
@@ -42502,7 +42492,7 @@ mod tests {
         // 相対パスの基準（ペインの cwd）を取れないペインはエラーで返る（offload へ出さない）
         let bad = Request::RunResolve {
             path: "a.py".into(),
-            pane: Some(999_999),
+            pane: Some(tako_core::unused_id::pane().as_u64()),
             refresh: false,
             boards: None,
         };
@@ -43418,7 +43408,7 @@ mod tests {
         assert!(dispatch(
             &mut host,
             Request::WindowMinimize {
-                window: Some(9_999)
+                window: Some(tako_core::unused_id::window().as_u64())
             },
             PaneOrigin::Cli,
         )
@@ -43508,7 +43498,7 @@ mod tests {
             },
             // 存在しないウィンドウ ID
             Request::WindowMove {
-                window: Some(9_999),
+                window: Some(tako_core::unused_id::window().as_u64()),
                 x: 0.0,
                 y: 0.0,
             },
@@ -43780,7 +43770,9 @@ mod tests {
         // 存在しないウィンドウはエラー / 最後の 1 ウィンドウは閉じられない
         assert!(dispatch(
             &mut host,
-            Request::WindowFocus { window: 99999 },
+            Request::WindowFocus {
+                window: tako_core::unused_id::window().as_u64()
+            },
             PaneOrigin::Cli
         )
         .is_err());
@@ -45881,13 +45873,14 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err}").contains("見つからない"), "{err}");
         // 存在しないペインへの show
+        let stale = tako_core::unused_id::pane().as_u64();
         let err = dispatch(
             &mut host,
-            show_command_req("show", &["echo hi"], Some(999_999)),
+            show_command_req("show", &["echo hi"], Some(stale)),
             PaneOrigin::Mcp,
         )
         .unwrap_err();
-        assert!(matches!(err, DispatchError::PaneNotFound(999_999)));
+        assert!(matches!(err, DispatchError::PaneNotFound(id) if id == stale));
     }
 
     // --- #1132: worker ペインの最小幅の保証 ---
@@ -47813,14 +47806,15 @@ mod tests {
         )
         .is_some());
         // 解けないペインは計画を組む前に断られるので同期の腕（同じエラーを返す）
+        let stale = tako_core::unused_id::pane().as_u64();
         let gone = Request::SessionRestart {
-            pane: Some(999_999),
+            pane: Some(stale),
             mode: None,
         };
         assert!(prepare_offload(&mut host, &gone).is_none());
         assert_eq!(
             dispatch(&mut host, gone, PaneOrigin::Cli).unwrap_err(),
-            DispatchError::PaneNotFound(999_999)
+            DispatchError::PaneNotFound(stale)
         );
         // 子プロセスに触れない要求は対象外
         assert!(prepare_offload(&mut host, &Request::WindowList).is_none());
@@ -48154,7 +48148,9 @@ mod tests {
             }
         }
         // 居ないペインは準備（メモリ）の段で同期の腕と同じエラー
-        let gone = Request::GitPush { pane: Some(9_999) };
+        let gone = Request::GitPush {
+            pane: Some(tako_core::unused_id::pane().as_u64()),
+        };
         let Some(Err(e)) = prepare_offload(&mut host, &gone) else {
             panic!("居ないペインは準備の段で断る");
         };
@@ -49703,22 +49699,29 @@ mod tests {
     fn modの報告は旧pane_idを読み替え知らないidは断る() {
         let mut host = MockHost::new();
         let pane = host.root_pane();
+        let (old, unknown) = (
+            tako_core::unused_id::pane().as_u64(),
+            tako_core::unused_id::pane().as_u64(),
+        );
         host.stale_pane_map
-            .insert(PaneId::from_raw(99_999), PaneId::from_raw(pane));
+            .insert(PaneId::from_raw(old), PaneId::from_raw(pane));
         let out = dispatch(
             &mut host,
-            mod_request("report", Some(mod_report_body("busy")), Some(99_999)),
+            mod_request("report", Some(mod_report_body("busy")), Some(old)),
             PaneOrigin::Cli,
         )
         .unwrap();
         assert_eq!(out["pane"], pane);
         let err = dispatch(
             &mut host,
-            mod_request("report", Some(mod_report_body("busy")), Some(12_345)),
+            mod_request("report", Some(mod_report_body("busy")), Some(unknown)),
             PaneOrigin::Cli,
         )
         .unwrap_err();
-        assert!(matches!(err, DispatchError::PaneNotFound(12_345)), "{err}");
+        assert!(
+            matches!(err, DispatchError::PaneNotFound(id) if id == unknown),
+            "{err}"
+        );
         let err = dispatch(
             &mut host,
             mod_request("report", Some(mod_report_body("busy")), None),
@@ -51111,7 +51114,7 @@ mod tests {
             Request::TreeSelection {
                 path: None,
                 key: None,
-                tab: Some(9999),
+                tab: Some(tako_core::unused_id::tab().as_u64()),
             },
             PaneOrigin::Mcp,
         )

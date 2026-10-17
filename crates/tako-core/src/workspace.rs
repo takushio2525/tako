@@ -38,7 +38,7 @@ pub struct WindowId(u64);
 static WINDOW_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl WindowId {
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         WindowId(WINDOW_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -1920,6 +1920,7 @@ mod tests {
     fn 退避タブの復帰先は純粋関数が決める() {
         let a = WindowId::from_raw(9001);
         let b = WindowId::from_raw(9002);
+        // 固定 ID 安全: 純粋関数へ渡す表は a / b だけで、採番したウィンドウと突き合わせない
         let gone = WindowId::from_raw(9003);
         // 由来ウィンドウが健在 → そこへ。位置はそのまま
         assert_eq!(unshelve_tab_placement(a, 1, &[a, b], b, 3), (a, 1));
@@ -2099,7 +2100,7 @@ mod tests {
     #[test]
     fn タブの並べ替え_存在しないタブ() {
         let mut ws = Workspace::new("t1", pane());
-        let ghost = TabId::from_raw(9999);
+        let ghost = crate::unused_id::tab();
         assert_eq!(
             ws.move_tab(ghost, 0),
             Err(WorkspaceError::TabNotFound(ghost))
@@ -2147,7 +2148,7 @@ mod tests {
         assert_eq!(ws.active_tab_id(), t1);
         ws.activate_window(w2).unwrap();
         assert_eq!(ws.active_tab_id(), t2);
-        let ghost = WindowId::from_raw(9999);
+        let ghost = crate::unused_id::window();
         assert_eq!(
             ws.activate_window(ghost),
             Err(WorkspaceError::WindowNotFound(ghost))
@@ -2303,7 +2304,7 @@ mod tests {
         assert_eq!(ws.active_tab_id(), t2);
         // w1 の表示タブは新タブに切り替わる
         assert_eq!(ws.get_window(w1).unwrap().active_tab(), t3);
-        let ghost = WindowId::from_raw(88888);
+        let ghost = crate::unused_id::window();
         assert_eq!(
             ws.create_tab_in_window("x", pane(), ghost),
             Err(WorkspaceError::WindowNotFound(ghost))
@@ -2340,7 +2341,7 @@ mod tests {
         let t1 = Tab::new("t1", pane());
         let t2 = Tab::new("t2", pane());
         let (i1, i2) = (t1.id(), t2.id());
-        let ghost = TabId::from_raw(77777);
+        let ghost = crate::unused_id::tab();
         // 存在しないタブだけのウィンドウ・二重割当・未割当タブ・存在しない表示タブが混在
         let ws = Workspace::restore_with_windows(
             vec![t1, t2],

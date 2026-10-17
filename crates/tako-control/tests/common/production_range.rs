@@ -35,6 +35,9 @@
 // 取り込む番犬ごとに使う関数が違う（片方しか使わないファイルがある）
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
 // 位置決めだけに使う（コメント・文字列の中の `#[cfg(test)]` や `}` を数えないため）。
 // 取り込む側から**二重に宣言させない**ため公開する（`clippy::duplicate_mod`）
 #[path = "code_view.rs"]
@@ -354,4 +357,161 @@ fn to_text(out: Vec<u8>) -> String {
 /// バイト位置の行番号（1 始まり）
 fn line_at(view: &str, offset: usize) -> usize {
     view[..offset.min(view.len())].matches('\n').count() + 1
+}
+
+// --------------------------------------------------------------- ファイル単位の境界
+
+// 以下は `#[cfg(test)] mod x;` で読む**ファイル丸ごとのテスト**を見分ける。ファイルの中に
+// `#[cfg(test)]` が無いので、[`tests_only`] だけでは本番コードとして扱ってしまう。
+// #1790 の番犬が持っていた 1 実装を、テスト側を走査する番犬（#1868）と共有するために移した
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("リポジトリルート")
+}
+
+fn read(rel: &str) -> String {
+    std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("{rel} が読める: {e}"))
+}
+
+/// `crates/*/src/` の `.rs` を再帰で列挙する（リポジトリルートからの相対パス。並びは固定）
+pub fn product_sources() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{} が読める: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("ディレクトリ項目").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = repo_root();
+    let mut files = Vec::new();
+    let crates = std::fs::read_dir(root.join("crates")).expect("crates/ が読める");
+    for entry in crates {
+        let src = entry.expect("crate の項目").path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut files);
+        }
+    }
+    let mut rels: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&root)
+                .expect("リポジトリ内")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    rels.sort();
+    rels
+}
+
+// --------------------------------------------------------------- テスト専用のファイル
+
+/// `mod NAME;`（外のファイルを読む宣言）なら NAME
+fn out_of_line_mod(line: &str) -> Option<&str> {
+    let mut t = line.trim();
+    for vis in ["pub(crate) ", "pub(super) ", "pub "] {
+        if let Some(rest) = t.strip_prefix(vis) {
+            t = rest;
+            break;
+        }
+    }
+    let name = t.strip_prefix("mod ")?.strip_suffix(';')?.trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
+}
+
+/// 宣言の直前の属性行にある `#[path = "…"]` の値（コメント行と他の属性は飛ばす）
+fn path_attr<'a>(raw_lines: &[&'a str], decl: usize) -> Option<&'a str> {
+    for l in raw_lines[..decl].iter().rev() {
+        let t = l.trim();
+        if let Some(rest) = t.strip_prefix("#[path = \"") {
+            return rest.strip_suffix("\"]");
+        }
+        if !(t.starts_with("#[") || t.starts_with("//")) {
+            return None;
+        }
+    }
+    None
+}
+
+/// `parent` が `mod name;` で読むファイル（リポジトリルートからの相対パス）
+fn resolve_mod(parent: &str, name: &str, path: Option<&str>) -> String {
+    let dir = Path::new(parent).parent().expect("親のディレクトリ");
+    let file = Path::new(parent)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+    let is_mod_rs = matches!(file, "main.rs" | "lib.rs" | "mod.rs")
+        || dir.file_name().is_some_and(|d| d == "bin");
+    let candidates: Vec<PathBuf> = match path {
+        Some(p) => vec![dir.join(p)],
+        None => {
+            let base = if is_mod_rs {
+                dir.to_path_buf()
+            } else {
+                dir.join(file.trim_end_matches(".rs"))
+            };
+            vec![
+                base.join(format!("{name}.rs")),
+                base.join(name).join("mod.rs"),
+            ]
+        }
+    };
+    let root = repo_root();
+    for c in &candidates {
+        let normalized = root.join(c);
+        if normalized.is_file() {
+            let canon = normalized.canonicalize().expect("実在するファイル");
+            return canon
+                .strip_prefix(&root)
+                .expect("リポジトリ内")
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
+    }
+    panic!(
+        "{parent} の `mod {name};` が読むファイルが見つからない（候補 {candidates:?}）。\
+         インラインの mod の中の宣言なら、この番犬の解決を足す"
+    );
+}
+
+/// ファイル全体がテスト専用のもの（`#[cfg(test)] mod x;` で読むファイルと、その子孫）
+pub fn test_only_files(files: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut frontier: Vec<String> = Vec::new();
+    for rel in files {
+        let raw = read(rel);
+        let raw_lines: Vec<&str> = raw.lines().collect();
+        let tests = code_view::code_view(&tests_only(&raw));
+        for (k, l) in tests.lines().enumerate() {
+            if let Some(name) = out_of_line_mod(l) {
+                let child = resolve_mod(rel, name, path_attr(&raw_lines, k));
+                if out.insert(child.clone()) {
+                    frontier.push(child);
+                }
+            }
+        }
+    }
+    // テスト専用のファイルが読む子は、cfg が付いていなくてもテスト専用
+    while let Some(rel) = frontier.pop() {
+        let raw = read(&rel);
+        let raw_lines: Vec<&str> = raw.lines().collect();
+        let code = code_view::code_view(&raw);
+        for (k, l) in code.lines().enumerate() {
+            if let Some(name) = out_of_line_mod(l) {
+                let child = resolve_mod(&rel, name, path_attr(&raw_lines, k));
+                if out.insert(child.clone()) {
+                    frontier.push(child);
+                }
+            }
+        }
+    }
+    out
 }

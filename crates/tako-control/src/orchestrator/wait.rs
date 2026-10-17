@@ -2458,6 +2458,7 @@ mod tests {
         registry.entries.insert(
             "running".into(),
             RunEntry {
+                // 固定 ID 安全: 実行の台帳（RunRegistry）の削減だけを見るテストで、ペインを引かない
                 pane_id: 999,
                 spawned_by: 0,
                 tmux_session: None,

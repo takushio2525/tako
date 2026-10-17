@@ -447,7 +447,7 @@ fn 名指しと引数の検査() {
         host.try_diagnostics(Some(pane), Some("warn")),
         Err(DispatchError::InvalidParams(_))
     ));
-    host.preview = PaneId::from_raw(9_999);
+    host.preview = tako_core::unused_id::pane();
     let real = host.workspace.active_tab().tree().focused().as_u64();
     assert!(matches!(
         host.try_diagnostics(Some(real), None),
