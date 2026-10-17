@@ -810,7 +810,7 @@ tako file copy-path src/main.rs        # 絶対パスを出力（--relative で�
 tako file reveal src/main.rs           # Finder で表示
 tako file open-terminal ~/Documents/webapp  # ペイン内で cd
 tako file rename old.txt new.txt
-tako file move notes.md docs          # 別のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る）
+tako file move notes.md docs          # 別のフォルダへ移す（ツリーの D&D と同じ。同名・自分の配下・別のボリュームは断る。最近使った項目のフォルダも追う）
 tako file move a.md b.md docs         # まとめて移す（最後が移動先。1 件でも断られたら終了コード 1）
 tako file copy notes.md src docs      # 複製（最後が貼り付け先。同名は「名前 のコピー」等の別名で置き上書きしない。複数でも 1 つのコピー）
 tako file clipboard copy notes.md     # ツリーのコピーと同じ（Finder / エクスプローラーへも貼れる）

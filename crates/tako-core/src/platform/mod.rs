@@ -19,6 +19,8 @@ pub mod exe;
 pub mod fd_inherit;
 pub mod font;
 pub mod fs_copy;
+/// 上書きしない移動（境界 B28 の core 分。#1842）
+pub mod fs_move;
 pub mod ime;
 pub mod install_info;
 pub mod keys;

@@ -93,6 +93,10 @@ impl ProgressCtx<'_> {
     }
 }
 
+/// 長いパスでも通るワイド文字列（Windows の写す口と移す口 `fs_move` で共有する。#1842）
+#[cfg(windows)]
+pub(in crate::platform) use file_imp::wide;
+
 #[cfg(target_os = "macos")]
 mod file_imp {
     use std::ffi::CString;
@@ -293,8 +297,9 @@ mod file_imp {
         ) -> Bool;
     }
 
-    /// 長いパス（`MAX_PATH` 超え）でも通る形（`\\?\` の verbatim）の NUL 終端ワイド文字列
-    fn wide(path: &Path) -> std::io::Result<Vec<u16>> {
+    /// 長いパス（`MAX_PATH` 超え）でも通る形（`\\?\` の verbatim）の NUL 終端ワイド文字列。
+    /// 上書きしない移動（`platform::fs_move`。#1842）も同じ形で渡す
+    pub(in crate::platform) fn wide(path: &Path) -> std::io::Result<Vec<u16>> {
         let abs = std::path::absolute(path)?;
         let text = abs.as_os_str().encode_wide().collect::<Vec<u16>>();
         let starts = |prefix: &str| {

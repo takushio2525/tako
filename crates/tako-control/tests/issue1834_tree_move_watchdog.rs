@@ -1,9 +1,9 @@
 //! **#1834 の番犬**: ファイルツリーの D&D による移動（FR-3.32）の要所が外れないようにする。
 //!
-//! ## ここで止める 6 つ
+//! ## ここで止める 9 つ（7〜9 は #1842 で足した）
 //!
 //! 1. [`同名は上書きせずに断る`] — `rename(2)` は既存のファイルや空のフォルダを**黙って
-//!    置き換える**ので、段取りと実行の直前の 2 回、リンクを辿らずに見る
+//!    置き換える**ので、段取りでリンクを辿らずに見る（実行側は 7）
 //! 2. [`自分自身と配下へは実体の形で断る`] — 字面で比べると `..`・シンボリックリンク・
 //!    Windows の大文字小文字で素通りし、フォルダが自分の中へ消える
 //! 3. [`付け替え先は移す前に決め後始末は1回`] — 移した後に照合すると実体の形が引けない
@@ -13,6 +13,13 @@
 //! 5. [`移動の口はdispatchの1つでcliとmcpとguiが1対1`] — 設計原則 5（UI だけの移動を作らない）
 //! 6. [`ツリーの受け口はドラッグ中だけ付ける`] — gpui の `on_drag_move` は全リスナーへ届くので、
 //!    常時付けると行数ぶんのリスナーがマウス移動のたびに走る
+//! 7. [`実行は上書きしないrenameを通る`] — 「見てから `std::fs::rename`」の 2 段は、見てから
+//!    rename までの隙間に別のプロセスが作った同名を上書きする（#1842 の本体）。`std::fs::rename`
+//!    は A/B の旧形の 1 か所だけ
+//! 8. [`上書きしないrenameはosごとの排他の口を呼ぶ`] — macOS `RENAME_EXCL` / Linux
+//!    `RENAME_NOREPLACE` / Windows `MoveFileExW` のフラグ 0（`MOVEFILE_REPLACE_EXISTING` 無し）
+//! 9. [`移したあと最近使った場所を付け替える`] — 付け替えないと、移したフォルダは
+//!    「最近使った項目」から開けなくなる（#1842）。読めない一覧を空で上書きしない
 //!
 //! 各規則は `Result` を返す検査関数で、本物のソースに当てる本体と、要所を消した写しに当てて
 //! **file:line で名指すか**を確かめる注入（`注入_*`）を同じ関数で回す
@@ -35,6 +42,8 @@ mod production_range;
 use production_range::code_view::{code_view, without_comments_checked};
 
 const CORE: &str = "crates/tako-core/src/file_move.rs";
+const FS_MOVE: &str = "crates/tako-core/src/platform/fs_move.rs";
+const DATA_FILES: &str = "crates/tako-control/src/data_files.rs";
 const TEXT_EDIT: &str = "crates/tako-core/src/text_edit.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const MCP_REQUEST: &str = "crates/tako-control/src/mcp/request.rs";
@@ -229,12 +238,6 @@ fn rule_name_taken(core: &Source) -> Check {
          黙って置き換えるので、同名があれば `NameTaken` で断ること（#1834）",
     )?;
     plan.must_contain("MoveRefusal::NameTaken", "同名を理由として返していない")?;
-    let execute = core.body("execute")?;
-    execute.must_order(
-        "if exists_no_follow(&plan.to) {",
-        "std::fs::rename(",
-        "実行の直前に同名を見直していない（段取りから実行までに作られたものを上書きする）",
-    )?;
     core.body("exists_no_follow")?.must_contain(
         "symlink_metadata(",
         "同名の検査がリンクを辿っている（壊れたリンクの上へ黙って上書きする）",
@@ -411,6 +414,106 @@ fn rule_drag_live(sidebar: &Source) -> Check {
     )
 }
 
+/// 7（#1842）: 実行は上書きしない rename を通り、`std::fs::rename` は A/B の旧形の 1 か所だけ
+fn rule_noreplace(core: &Source) -> Check {
+    core.body("execute")?.must_contain(
+        "execute_with(plan, inject_race)",
+        "実行が隙間の注入口（`TAKO_1842_INJECT_RACE`）を通っていない（実経路の A/B が取れない）",
+    )?;
+    let run = core.body("execute_with")?;
+    let why =
+        "見てから `std::fs::rename` する 2 段は、見てから rename までの隙間に別のプロセスが\n\
+               作った同名を黙って上書きする。実行は `platform::fs_move::rename_noreplace`\n\
+               （OS の上書きしない rename）で行うこと（#1842）";
+    run.must_contain("rename_noreplace(&plan.from, &plan.to)", why)?;
+    run.must_order("if issue1842_legacy() {", "std::fs::rename(", why)?;
+    run.must_order("std::fs::rename(", "rename_noreplace(", why)?;
+    // 1 つ目は旧形の枝（上の must_order で確かめた）。2 つ目以降を名指す
+    let lines: Vec<usize> = core
+        .view
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("std::fs::rename("))
+        .map(|(i, _)| i + 1)
+        .collect();
+    if lines.len() != 1 {
+        return Err(format!(
+            "{}:{} `std::fs::rename(` が {} か所ある（行 {:?}。A/B の旧形の 1 か所だけ）。\n{why}",
+            core.rel,
+            lines.get(1).copied().unwrap_or(1),
+            lines.len(),
+            lines
+        ));
+    }
+    core.body("classify_io")?.must_contain(
+        "std::io::ErrorKind::AlreadyExists => MoveRefusal::NameTaken",
+        "上書きしない rename が同名で断った失敗（EEXIST / ERROR_ALREADY_EXISTS）を\n\
+         「同じ名前がある」へ読んでいない（「OS が断った」の生の文面になる）",
+    )
+}
+
+/// 8（#1842）: 上書きしない rename は OS ごとの排他の口を呼ぶ
+fn rule_noreplace_platform(fs_move: &Source) -> Check {
+    let near = "fn rename_excl";
+    fs_move.must_have(
+        "libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL)",
+        near,
+        "macOS が `renamex_np` の `RENAME_EXCL` を使っていない",
+    )?;
+    fs_move.must_have(
+        "libc::RENAME_NOREPLACE",
+        near,
+        "Linux が `renameat2` の `RENAME_NOREPLACE` を使っていない",
+    )?;
+    fs_move.must_have(
+        "MoveFileExW(from.as_ptr(), to.as_ptr(), NO_REPLACE)",
+        near,
+        "Windows が `MoveFileExW` を上書きしないフラグで呼んでいない",
+    )?;
+    fs_move.must_have(
+        "const NO_REPLACE: u32 = 0;",
+        "MoveFileExW(",
+        "Windows のフラグが 0 ではない（`MOVEFILE_REPLACE_EXISTING` = 1 は上書きする・\n\
+         `MOVEFILE_COPY_ALLOWED` = 2 は別のボリュームへコピーして元を消す）",
+    )?;
+    fs_move.must_not_have(
+        "MOVEFILE_REPLACE_EXISTING",
+        "Windows の移動に上書きのフラグを使っている",
+    )?;
+    let entry = fs_move.body("rename_noreplace")?;
+    entry.must_order(
+        "imp::rename_excl(from, to)",
+        "rename_checked(from, to)",
+        "排他の rename を先に試していない",
+    )?;
+    entry.must_contain(
+        "if imp::unsupported(&e) => rename_checked(from, to)",
+        "従来の形（見てから rename）へ落ちるのが「排他の rename を持たない」ときに限られていない",
+    )
+}
+
+/// 9（#1842）: 移したあと最近使った場所（recent.json）を付け替える
+fn rule_recent_follow(dispatch: &Source, data_files: &Source) -> Check {
+    let run = dispatch.body("run_file_move")?;
+    let why = "移したフォルダ（と配下）を「最近使った項目」から開けなくなる（#1842）";
+    run.must_order(
+        "file_move::execute(",
+        "crate::data_files::follow_recent_move(",
+        why,
+    )?;
+    run.must_contain("file_move::moved_path(&plan, path)", why)?;
+    run.must_contain(
+        "file_move::issue1842_legacy()",
+        "A/B の入口（`TAKO_1842_LEGACY=1`）が付け替えを外していない",
+    )?;
+    let at = data_files.body("follow_recent_move_at")?;
+    at.must_order(
+        "if count > 0 {",
+        "list.save_to(path)",
+        "1 件も付け替えないのに書いている（読めなかった一覧は空で返るので、空で上書きする）",
+    )
+}
+
 // --- 本体 ---------------------------------------------------------------------------
 
 fn ok(check: Check) {
@@ -458,6 +561,21 @@ fn 移動の口はdispatchの1つでcliとmcpとguiが1対1() {
 #[test]
 fn ツリーの受け口はドラッグ中だけ付ける() {
     ok(rule_drag_live(&source(SIDEBAR)));
+}
+
+#[test]
+fn 実行は上書きしないrenameを通る() {
+    ok(rule_noreplace(&source(CORE)));
+}
+
+#[test]
+fn 上書きしないrenameはosごとの排他の口を呼ぶ() {
+    ok(rule_noreplace_platform(&source(FS_MOVE)));
+}
+
+#[test]
+fn 移したあと最近使った場所を付け替える() {
+    ok(rule_recent_follow(&source(DISPATCH), &source(DATA_FILES)));
 }
 
 /// 走査で得たリポジトリ相対パスを、定数と同じ `/` 区切りへ揃える。
@@ -554,12 +672,98 @@ fn 注入_同名の検査を外すと名指す() {
         "    if false && exists_no_follow_x(&to) {",
     );
     must_name(rule_name_taken(&core), CORE, "fn plan");
+}
+
+/// #1842: 実行を修正前の「見てから `std::fs::rename`」へ戻した写しを名指す
+#[test]
+fn 注入_実行を見てからのrenameへ戻すと名指す() {
     let core = injected(
         CORE,
-        "    if exists_no_follow(&plan.to) {",
-        "    if false {",
+        "    rename_noreplace(&plan.from, &plan.to).map_err(|e| classify_io(&e))",
+        "    std::fs::rename(&plan.from, &plan.to).map_err(|e| classify_io(&e))",
     );
-    must_name(rule_name_taken(&core), CORE, "fn execute");
+    must_name(rule_noreplace(&core), CORE, "fn execute_with");
+    // 旧形の枝の外へ 2 つ目の `std::fs::rename` を足した写し
+    let core = injected(
+        CORE,
+        "    before_rename(plan);\n    rename_noreplace(",
+        "    before_rename(plan);\n    let _ = std::fs::rename(&plan.from, &plan.to);\n    rename_noreplace(",
+    );
+    let err = rule_noreplace(&core).expect_err("2 つ目の std::fs::rename を見逃した");
+    let planted = core
+        .view
+        .lines()
+        .position(|l| l.trim() == "let _ = std::fs::rename(&plan.from, &plan.to);")
+        .expect("注入した行")
+        + 1;
+    assert!(
+        err.starts_with(&format!("{CORE}:{planted} ")) && err.contains("2 か所"),
+        "足した行（{planted}）を名指していない: {err}"
+    );
+    let core = injected(
+        CORE,
+        "        std::io::ErrorKind::AlreadyExists => MoveRefusal::NameTaken,\n",
+        "",
+    );
+    must_name(rule_noreplace(&core), CORE, "fn classify_io");
+    let core = injected(
+        CORE,
+        "    execute_with(plan, inject_race)",
+        "    execute_with(plan, |_| {})",
+    );
+    must_name(rule_noreplace(&core), CORE, "fn execute");
+}
+
+#[test]
+fn 注入_上書きのフラグで移すと名指す() {
+    let fs_move = injected(
+        FS_MOVE,
+        "const NO_REPLACE: u32 = 0;",
+        "const NO_REPLACE: u32 = 1;",
+    );
+    let err = rule_noreplace_platform(&fs_move).expect_err("上書きのフラグを見逃した");
+    assert!(err.starts_with(&format!("{FS_MOVE}:")), "{err}");
+    let fs_move = injected(
+        FS_MOVE,
+        "libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL)",
+        "libc::renamex_np(from.as_ptr(), to.as_ptr(), 0)",
+    );
+    let err = rule_noreplace_platform(&fs_move).expect_err("RENAME_EXCL の欠落を見逃した");
+    assert!(err.starts_with(&format!("{FS_MOVE}:")), "{err}");
+    let fs_move = injected(
+        FS_MOVE,
+        "        Err(e) if imp::unsupported(&e) => rename_checked(from, to),\n        other => other,",
+        "        _ => rename_checked(from, to),",
+    );
+    must_name(
+        rule_noreplace_platform(&fs_move),
+        FS_MOVE,
+        "fn rename_noreplace",
+    );
+}
+
+#[test]
+fn 注入_最近使った場所を付け替えないと名指す() {
+    let dispatch = injected(
+        DISPATCH,
+        "        crate::data_files::follow_recent_move(|path| file_move::moved_path(&plan, path))",
+        "        0",
+    );
+    must_name(
+        rule_recent_follow(&dispatch, &source(DATA_FILES)),
+        DISPATCH,
+        "fn run_file_move",
+    );
+    let data_files = injected(
+        DATA_FILES,
+        "    if count > 0 {\n        list.save_to(path);\n    }",
+        "    list.save_to(path);",
+    );
+    must_name(
+        rule_recent_follow(&source(DISPATCH), &data_files),
+        DATA_FILES,
+        "fn follow_recent_move_at",
+    );
 }
 
 #[test]

@@ -19855,8 +19855,13 @@ fn dir_of(path: &std::path::Path) -> std::path::PathBuf {
 /// [`crate::host::PreviewHost::file_moved`] の 1 本。**付け替え先は移す前に決める**
 /// （実体の形で照合できるのは元の場所にあるうちだけ）。
 ///
+/// 移した後は最近使った場所（`recent.json`）のうち移したフォルダ（と配下）も移動先へ
+/// 付け替える（#1842。付け替えは移した後 = 元の場所はもう無いので `moved_path` は字面と
+/// 段取りで引いた実体の形だけで照合する）。
+///
 /// 応答は `moved`（移したか）/ `from` / `to` / `kind`（`file` / `dir` / `symlink`）/
-/// `followed`（付け替えたペイン）。断ったときはエラー文に理由を載せる
+/// `followed`（付け替えたペイン）/ `recent_followed`（付け替えた最近使った場所の件数。
+/// 1 件以上のときだけ載せる）。断ったときはエラー文に理由を載せる
 /// （GUI の通知欄・CLI・MCP が同じ文面を出す）
 fn run_file_move(
     host: &mut dyn ControlHost,
@@ -19900,7 +19905,14 @@ fn run_file_move(
     };
     file_move::execute(&plan).map_err(refused)?;
     host.file_moved(&plan.from, &plan.to, &follows);
-    Ok(json!({
+    // A/B（`TAKO_1842_LEGACY=1`）: 最近使った場所を付け替えない（移したフォルダは
+    // 「最近使った項目」から開けなくなる = 修正前）
+    let recent = if file_move::issue1842_legacy() {
+        0
+    } else {
+        crate::data_files::follow_recent_move(|path| file_move::moved_path(&plan, path))
+    };
+    let mut out = json!({
         "moved": true,
         "from": plan.from.display().to_string(),
         "to": plan.to.display().to_string(),
@@ -19913,7 +19925,11 @@ fn run_file_move(
                 "to": f.to.display().to_string(),
             }))
             .collect::<Vec<_>>(),
-    }))
+    });
+    if recent > 0 {
+        out["recent_followed"] = json!(recent);
+    }
+    Ok(out)
 }
 
 /// ファイル・フォルダを 1 つ写した結果（background から UI スレッドへ運ぶ。#1860）
