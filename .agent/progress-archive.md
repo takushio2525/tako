@@ -608,3 +608,10 @@
 - 2026-10-16 #2192 S0: usage 分析の設計書 `.agent/plans/2026-10-usage-analytics.md` = 区間按分・API 換算の重み・ログイン単位・`tako_sessions` の action・増分索引
 - 2026-10-16 #2196: scroll_mirror のホイール直接注入 e2e の間欠 = 内側の stty 前に注入して tty と perl の echo で 2 回見えていた
 - 2026-10-16 #2193: ports の libproc と ps の照合テストの間欠の真因は、ps が改行などを `\012` へ表記し直すこと（時刻差ではない）
+- 2026-10-16 #2199: 委任台帳の `issue` とカタログの `issues` の先頭を、ラベルに書いた主の Issue にした
+- 2026-10-16 #2200: usage 分析 S1 = tako mod の報告から利用制限の観測を `usage/limits.jsonl` へ・ログインの鍵は accountUuid の塩付きハッシュ・`tako usage`
+- 2026-10-17 #1790 項目 1: 製品ファイルの理由の無い範囲添字 100 件を仕分け、番犬 `issue1790_byte_index_repo_watchdog` を `crates/*/src/` 全体へ
+- 2026-10-17 #2209: ipc の fd 数えテストが 120 秒で落ちる真因は XNU の half-close の起こしの取りこぼし = 46.7 万往復に 1 回
+- 2026-10-17 #2201: usage 分析 S2 = 会話記録の使用量の索引 `<data_dir>/usage/` と `tako usage --by/--window`・MCP `tako_sessions` usage の by / window / account
+- 2026-10-17 #1790 項目 2: `truncate_path_middle` の末尾省略・`trim_detail`・`prompt_head` を固定値テストで固定してから `truncate_chars` へ寄せる
+- 2026-10-17 #2213: #2161 の番犬も XNU の half-close の起こしの取りこぼしで 120 秒落ちうる → FIN 待ちを 500 ms で区切り、新しい接続で往復をやり直す
