@@ -157,6 +157,11 @@ fn エージェントcliの問い合わせ起動は正本の門番を通る() {
             "crates/tako-control/src/setup_bootstrap.rs",
             "auth_state_for",
         ),
+        // 環境診断の経路の上限つき版（#2255。上限を引数に取る `agent_probe::output_within` を通る）
+        (
+            "crates/tako-control/src/setup_bootstrap.rs",
+            "auth_state_within",
+        ),
         // claude の MCP 登録の読み取り（#1505 で CLI から移った）。
         // こちらは上限つきの口（`agent_probe::output_with_timeout`）を通る
         // （`claude_health_with` / `claude_health_now` はここへ委譲するだけ）
@@ -174,8 +179,10 @@ fn エージェントcliの問い合わせ起動は正本の門番を通る() {
         let body =
             fn_body(&text, func).unwrap_or_else(|| panic!("{rel}: fn {func} が見つからない"));
         assert!(
-            body.contains("agent_probe::run") || body.contains("agent_probe::output_with_timeout"),
-            "{rel}: {func} が正本の門番（agent_probe::run / output_with_timeout）を\
+            body.contains("agent_probe::run")
+                || body.contains("agent_probe::output_with_timeout")
+                || body.contains("agent_probe::output_within"),
+            "{rel}: {func} が正本の門番（agent_probe::run / output_with_timeout / output_within）を\
              通っていない。テストプロセスから実 claude / codex / agy が起きる（#1261）"
         );
         assert!(

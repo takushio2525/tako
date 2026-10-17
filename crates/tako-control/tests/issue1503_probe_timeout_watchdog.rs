@@ -188,16 +188,26 @@ fn mcpの健全性確認もcommand_outputを通る() {
     );
     // 寄せ先そのものが上限を持っている（素通しになると上の検査は緑のまま症状が戻る）
     let probe = production(AGENT_PROBE);
-    let gate = fn_body(AGENT_PROBE, &probe, "output_with_timeout");
+    let entry = fn_body(AGENT_PROBE, &probe, "output_with_timeout");
     assert!(
-        gate.iter()
+        entry
+            .iter()
             .any(|(_, line)| is_code(line) && line.contains("probe::probe_timeout()")),
         "{AGENT_PROBE} の `output_with_timeout` が既定の上限を渡していない（#1503）"
     );
+    // #2255 から門番と知らせは上限を引数に取る `output_within` が持つ（`output_with_timeout` は
+    // 既定の上限を渡して委ねるだけ）。委ね先が変わったら以下の検査も追うこと
+    assert!(
+        entry
+            .iter()
+            .any(|(_, line)| is_code(line) && line.contains("output_within(")),
+        "{AGENT_PROBE} の `output_with_timeout` が `output_within` へ委ねていない（#2255）"
+    );
+    let gate = fn_body(AGENT_PROBE, &probe, "output_within");
     assert!(
         gate.iter()
             .any(|(_, line)| is_code(line) && line.contains("blocked()")),
-        "{AGENT_PROBE} の `output_with_timeout` が #1261 の門番を通っていない"
+        "{AGENT_PROBE} の `output_within` が #1261 の門番を通っていない"
     );
     // **打ち切ったら知らせる**（#1503 の契約は「無言にしない」）。
     // ここが落ちると `tako setup` / `--check` は固まらなくなるが、
@@ -205,7 +215,7 @@ fn mcpの健全性確認もcommand_outputを通る() {
     assert!(
         gate.iter()
             .any(|(_, line)| is_code(line) && line.contains("timeout_notice()")),
-        "{AGENT_PROBE} の `output_with_timeout` が打ち切りを知らせていない（#1503）。\n\
+        "{AGENT_PROBE} の `output_within` が打ち切りを知らせていない（#1503）。\n\
          `[確認できません] <label>（N 秒応答なし）。打ち切って次へ進みます` を stderr へ\n\
          出すこと（dispatch / MCP は `probe::parse_notices` でこの行を読み戻す）。"
     );

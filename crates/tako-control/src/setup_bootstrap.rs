@@ -237,6 +237,9 @@ pub struct BootstrapState {
     pub shell: Option<ShellKind>,
     pub step: Step,
     pub plan: InstallPlan,
+    /// 認証の問い合わせを上限で打ち切った（= 未認証ではなく**確かめられなかった**。#2255）。
+    /// 上限を持つのは環境診断の経路（[`status_all_within`]）だけで、setup の経路は常に `None`
+    pub auth_timeout: Option<tako_core::probe::TimeoutNotice>,
 }
 
 impl BootstrapState {
@@ -460,15 +463,38 @@ pub fn is_authenticated_for(agent: AgentKind, binary: &str) -> bool {
     auth_state_for(agent, binary).authenticated
 }
 
-/// 認証の有無とプラン名（**外部 CLI への問い合わせはここ 1 か所**）
+/// 認証の有無とプラン名（上限なしで待つ = setup の経路。出力の解釈は `auth_state_from` の 1 か所）。
+///
+/// 環境診断（`tako check-health` / `tako setup --check`）からは呼ばない。返らない CLI が
+/// 1 つあると診断ごと固まる（#2255）ので、あちらは [`auth_state_within`] を通す
 pub fn auth_state_for(agent: AgentKind, binary: &str) -> AuthState {
     // #1261: 問い合わせの起動は正本の門番を通す。テストプロセスでは 1 つも起こさない
     // （実 CLI は起動しただけで `~/.gemini` / `~/.codex/tmp` / `~/.claude.json` を作る）
-    let Some(output) = crate::agent_probe::run(
+    let output = crate::agent_probe::run(
         std::process::Command::new(binary)
             .args(auth_probe_argv(agent))
             .stdin(std::process::Stdio::null()),
-    ) else {
+    );
+    auth_state_from(agent, output)
+}
+
+/// [`auth_state_for`] の**待ちに上限を持つ**版（環境診断の経路。#2255）。
+///
+/// 上限を超えたら子を kill して「確かめられなかった」を返す（戻り値の 2 つ目。未認証とは区別する）。
+/// 門番（#1261）と打ち切りの知らせ（#1503）は `agent_probe::output_within` が持つ
+pub fn auth_state_within(
+    agent: AgentKind,
+    binary: &str,
+    budget: std::time::Duration,
+) -> (AuthState, Option<tako_core::probe::TimeoutNotice>) {
+    let outcome = crate::agent_probe::output_within(binary, auth_probe_argv(agent), budget);
+    let timeout = outcome.timeout_notice();
+    (auth_state_from(agent, outcome.into_output()), timeout)
+}
+
+/// 問い合わせの出力の解釈（上限の有無で 2 つに割らない）。取れなかったら未認証
+fn auth_state_from(agent: AgentKind, output: Option<std::process::Output>) -> AuthState {
+    let Some(output) = output else {
         return AuthState::default();
     };
     if !output.status.success() {
@@ -613,17 +639,32 @@ fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
     (kind, profile)
 }
 
-/// いまの導入状況を調べる（読み取りだけ。副作用なし）
+/// いまの導入状況を調べる（読み取りだけ。副作用なし）。認証の問い合わせは上限なしで待つ
+/// （setup の経路。環境診断は [`status_for_within`]）
 pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
+    status_with(agent, |binary| (auth_state_for(agent, binary), None))
+}
+
+/// [`status_for`] の認証の問い合わせを `budget` で打ち切る版（環境診断の経路。#2255）
+pub fn status_for_within(
+    agent: AgentKind,
+    budget: std::time::Duration,
+) -> Result<BootstrapState, String> {
+    status_with(agent, |binary| auth_state_within(agent, binary, budget))
+}
+
+/// 導入状況の組み立て。認証の問い合わせ方（上限の有無）は呼び手が `auth` で渡す
+/// （ここに両方の口を並べると、診断の経路から上限なしの口へ字面で届く = #2255 の番犬が名指す）
+fn status_with(
+    agent: AgentKind,
+    auth: impl FnOnce(&str) -> (AuthState, Option<tako_core::probe::TimeoutNotice>),
+) -> Result<BootstrapState, String> {
     let home = home_dir()?;
     let r = recipe_for(agent);
     let plan = plan_from(&r, &home);
     let binary = resolve_binary_for(agent);
     // 認証とプランは 1 回の問い合わせから読む（#1505）
-    let auth = binary
-        .as_deref()
-        .map(|b| auth_state_for(agent, b))
-        .unwrap_or_default();
+    let (auth, auth_timeout) = binary.as_deref().map(auth).unwrap_or_default();
     let authenticated = auth.authenticated;
     let launcher_dir = r.launcher_dir_in(&home);
     let on_path = launcher_dir_on_path(agent, &launcher_dir);
@@ -654,6 +695,7 @@ pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
         shell,
         step,
         plan,
+        auth_timeout,
     })
 }
 
@@ -698,6 +740,31 @@ pub fn status_all() -> Vec<(AgentKind, Result<BootstrapState, String>)> {
         .into_iter()
         .map(|agent| (agent, status_for(agent)))
         .collect()
+}
+
+/// [`status_all`] の環境診断版（#2255）: 認証の問い合わせを `budget` で打ち切り、**系統を並べて**聞く。
+///
+/// 1 系統ずつ待つと、返らない CLI が 3 つあれば上限の 3 倍待つ。並べれば全部が返らなくても
+/// 認証の確認の全体は `budget`（+ 起動と後始末）で終わる。並びは [`bootstrap_agents`] のまま返す
+pub fn status_all_within(
+    budget: std::time::Duration,
+) -> Vec<(AgentKind, Result<BootstrapState, String>)> {
+    let agents = bootstrap_agents();
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = agents
+            .into_iter()
+            .map(|agent| (agent, scope.spawn(move || status_for_within(agent, budget))))
+            .collect();
+        probes
+            .into_iter()
+            .map(|(agent, probe)| {
+                let state = probe.join().unwrap_or_else(|_| {
+                    Err("導入状況の確認の途中で落ちました（#2255）".to_string())
+                });
+                (agent, state)
+            })
+            .collect()
+    })
 }
 
 /// 3 系統ぶんの状況を JSON へ（CLI / MCP が同じ内容を見る）
