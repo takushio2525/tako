@@ -125,9 +125,12 @@ codex / agy の `--model` へ流すと存在しないモデル名で起動して
 `worker_model_default_inherit` = 対象外）が持つ。codex / agy のモデルは
 `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI 既定に委ねる。
 
-spawn の応答は `model`（実際に使う値。`null` = CLI 既定に委ねた）と `model_source`
+spawn の応答は `model`（`--model` に**宣言した**値。`null` = CLI 既定に委ねた）と `model_source`
 （`explicit` / `account` / `agent_config` / `profile_policy` / `cli_default`）を返すので、
 `--model` が付かない理由が読み取れる（`effort` / `effort_source` も同じ形）。
+宣言どおりのモデルで動いているとは限らない（アカウントの entitlement・モデルの廃止で claude が
+無言で別のモデルへ解決する = #1638）。実際のモデルは spawn の時点では分からないので、
+`workers` / `worker_status` の `model_actual` を見る（下の `workers` 節）。
 
 ### master のエージェント種別（claude / codex。Issue #127）
 
@@ -646,6 +649,20 @@ persist.log / ペインログを文字列一致で突き合わせられる（正
 会話の検出（`session_id`。`claude agents --json` は依頼文が届く前の起動直後に返す）は
 「起動した」証拠に留め、猶予内は `pending`・猶予後も到達の記録が無ければ `unverified`。
 旧実装は会話の検出で `delivered` を返し、送達フローが諦めた後に `undelivered` へ反転していた。
+
+**宣言したモデルと実際のモデル（#1638）**: `model_declared`（= 従来の `model`。spawn の宣言）と
+`model_actual`（実際に使われたモデル）を分けて返す。`model_actual` は claude の transcript の
+**最初の assistant 行の `message.model`**（API が返した解決後の名前）で、GUI の定期スキャン
+（spawn 直後は即時）・`workers`・`worker_status` のどれかが見つけた時点で確定し、以後は書き換えない。
+`model_check` = `match` / `mismatch`（`warnings` に「宣言 X → 実際 Y（アカウント A の
+entitlement…）」の 1 行。persist.log にも `[orchestrator] worker=… pane=…` で 1 行）/ `pending`
+（まだ最初の応答が無い = spawn 直後。`model_actual` は null）/ `undeclared`（宣言なし = CLI 既定）/
+`unverifiable`（`opusplan` 等で比べられない）/ `not_observed`（codex / agy。マトリクスの
+`worker_model_actual` が degraded = 宣言だけ）。tako mod の `$.session.model()` は「宣言を返すのか
+解決後を返すのか」が確かめられていないので使わない（mod の報告からは transcript の置き場 =
+設定 dir だけを借りる）。委任台帳（ledger）にも同じ値を `model_actual` として書き、`stats` は実際の
+モデルで数える（確かめられなかったものは宣言で別の行 = `model_source: declared`、宣言と違った件数は
+`mismatched`）。A/B は `TAKO_1638_LEGACY=1`（実際のモデルを採らず、宣言で集計する修正前）。
 
 GC は `workers` の列挙のついでに走る（別コマンドは要らない）。**1 回の観測では倒さない**
 ——器の列挙が一時的に失敗した・アプリ再起動直後でペインがまだ揃っていない、といった

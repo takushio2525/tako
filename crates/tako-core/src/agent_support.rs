@@ -351,6 +351,8 @@ pub mod keys {
     pub const WORKER_LOGIN_EXPIRED_DETECT: &str = "worker_login_expired_detect";
     /// worker からの MCP 接続
     pub const WORKER_MCP: &str = "worker_mcp";
+    /// worker が実際に使ったモデルを確かめ、宣言との食い違いを知らせる（#1638）
+    pub const WORKER_MODEL_ACTUAL: &str = "worker_model_actual";
     /// claude 語彙で書かれたモデル / effort の既定（プロファイルの `worker_model` /
     /// アカウントの `default_model`）を worker へ継承する（#1013）
     pub const WORKER_MODEL_DEFAULT_INHERIT: &str = "worker_model_default_inherit";
@@ -573,6 +575,12 @@ pub mod notes {
     pub const MODEL_NAME_NOT_PORTABLE: Note = Note::new(
         "モデル名はベンダー固有の語彙なので claude 用の既定を渡せない（渡すと存在しないモデル名で起動する）。この系統のモデルは `worker_agents.<agent>.model` か spawn の明示指定で決め、無ければ CLI の既定に委ねる",
         "Model names are vendor-specific vocabulary, so a claude default cannot be handed to this agent (doing so launches it with a non-existent model name). Set this agent's model in `worker_agents.<agent>.model` or explicitly at spawn time; otherwise tako leaves it to the CLI default",
+    );
+
+    /// #1638: 実際に使われたモデルを読む配線が claude の transcript にしか無い
+    pub const MODEL_ACTUAL_NOT_OBSERVED: Note = Note::new(
+        "宣言したモデルだけを返す。実際に使われたモデルは読まない（`model_actual` は null・`model_check` は not_observed）ので、CLI が別のモデルへ解決しても食い違いの警告は出ず、ledger も宣言のモデルで集計される",
+        "Only the declared model is reported. The model actually used is not read (`model_actual` is null, `model_check` is not_observed), so no mismatch warning appears if the CLI resolves to another model, and the ledger aggregates by the declared model",
     );
 }
 
@@ -1716,6 +1724,23 @@ pub const MATRIX: &[AgentFeature] = &[
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#986 の実測（2026-09-09 / 隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）:              **codex** = spawn の起動コマンドへ master と同じ `-c mcp_servers.tako.*` を一時注入する              （正本は orchestrator::agent::codex_mcp_args の 1 実装）。実 worker が              `tako.tako_list_panes({})` を呼び、**pane を省略した** `tako_set_title` が              自分のペインへ当たった。効いているのが一時注入だと分かるのは env の指紋で、             MCP 子プロセスの初期環境は一時注入の 5 個（TAKO_TAB_ID を含む）に対し、             `TAKO_986_LEGACY=1` の旧アームでは恒久登録（#979）の 4 個（TAKO_TAB_ID 無し）だった。             **agy** = per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27: -c / --mcp-config なし）ので              恒久登録（#979）に委ねる。agy は親 env をそのまま渡す（実測: MCP 子が TAKO_* を 15 個受け取る              = claude と同じ形）ため、実 worker から pane 省略の `tako_set_title` が自分のペインへ当たった。             `TAKO_PANE_ID` が届かない系統でも解けるよう、caller_pane は **pid 祖先辿り**へ落ちる              （`tako mcp serve` が `Request::ResolvePane` で問う。#288 / #567 と同じ 1 実装）",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_MODEL_ACTUAL,
+        summary: Note::new(
+            "worker が実際に使ったモデルを確かめ、宣言との食い違いを知らせる（#1638）",
+            "The model a worker actually runs on is confirmed, and a mismatch with the declared one is reported (#1638)",
+        ),
+        claude: S::Supported,
+        codex: degraded(notes::MODEL_ACTUAL_NOT_OBSERVED),
+        agy: degraded(notes::MODEL_ACTUAL_NOT_OBSERVED),
+        local: local_pending(),
+        evidence: AgentEvidence::Source(
+            "orchestrator/registry.rs の model_actual は claude の transcript（最初の assistant 行の \
+             message.model）からだけ埋まる（observe_pending_models / observe_worker_model）。\
+             codex の rollout・agy の実況 JSONL からモデルを読む配線は無いので、宣言だけを返し \
+             model_check は not_observed になる",
         ),
     },
     AgentFeature {

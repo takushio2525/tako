@@ -33,7 +33,7 @@ KeyFrom: Account, ConfigDir
 LastMessage: id, t, session, model, fast, tokens
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows, shelved_tabs
 Ledger: entries
-LedgerEntry: id, ts, project, label, issue, task_type, model, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
+LedgerEntry: id, ts, project, label, issue, task_type, model, model_actual, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
 LimitObservation: login, key_from, kind, percent, resets_at, observed_at, recorded_at, source
 LimitSeenLayout: notice, detected_at
 LimitSettings: max_jobs, reserve_gb, swap_guard_gb, max_wait_min
@@ -92,7 +92,7 @@ UserTask: id, title, body, kind, status, created_by, project, attachments, copy_
 Via: Pc, Pwa, Cli, Mcp
 WindowFrame: x, y, width, height, state
 WindowLayout: id, tabs, active_tab, frame
-WorkerEntry: label, project, agent, model, effort, pane, tab, tmux_session, session_id, issues, ledger_id, cwd, prompt_head, spawned_at, status, closed_at, close_reason, prompt_delivered_at, dead_since, prompt_delivery_failed_at, prompt_delivery_failure, launch_failed_at, launch_failure, launch_exit_code
+WorkerEntry: label, project, agent, model, model_actual, model_actual_at, model_actual_account, effort, pane, tab, tmux_session, session_id, issues, ledger_id, cwd, prompt_head, spawned_at, status, closed_at, close_reason, prompt_delivered_at, dead_since, prompt_delivery_failed_at, prompt_delivery_failure, launch_failed_at, launch_failure, launch_exit_code
 WorkerRegistry: workers, next_id
 
 version settings: v1 steps=0

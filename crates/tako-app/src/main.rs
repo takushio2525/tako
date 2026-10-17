@@ -6252,6 +6252,10 @@ impl TakoApp {
                                     );
                                 }
                             }
+                            // #1638: 会話の分かった worker の実際のモデルを transcript で確かめる
+                            // （spawn 直後はこの走査が即時に回る）。食い違いは persist.log へ 1 行。
+                            // 未確定の worker が居なければ transcript には触らない
+                            tako_control::orchestrator::registry::observe_pending_models();
                         })
                         .await;
                 } else {

@@ -95,8 +95,22 @@ pub struct WorkerEntry {
     /// エージェント種別（claude / codex / agy）。prompt 未達検知は claude のみ対象
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent: String,
+    /// spawn が**宣言した**モデル（`--model` に渡した値。CLI の既定に委ねたら None）。
+    /// 実際に使われたモデルは `model_actual`（#1638）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// 実際に使われたモデル（#1638。claude の transcript の最初の assistant 行の `message.model`）。
+    /// 確定するまで None。**一度確定したら書き換えない**（spawn 時の解決先を残す）。
+    /// #1638 前のファイルには無い = serde の default で None として読める（移行は要らない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_actual: Option<String>,
+    /// `model_actual` を確定した時刻
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_actual_at: Option<String>,
+    /// `model_actual` を読んだ transcript が属したアカウント名（accounts.yaml の逆引き。
+    /// 既定の設定 dir / 登録の無い dir は None）。食い違いの警告文に名前を出すため
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_actual_account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// spawn 時のペイン ID（tako 再起動後も layout 復元で同一 ID が維持される）
@@ -384,6 +398,9 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
                 project: record.project.clone(),
                 agent: record.agent.clone(),
                 model: record.model.clone(),
+                model_actual: None,
+                model_actual_at: None,
+                model_actual_account: None,
                 effort: record.effort.clone(),
                 pane: record.pane,
                 tab: record.tab,
@@ -631,6 +648,251 @@ pub fn launch_state(entry: &WorkerEntry) -> &'static str {
         "started"
     } else {
         "pending"
+    }
+}
+
+// ─────────────── 宣言したモデルと実際のモデル（Issue #1638） ───────────────
+//
+// spawn は `--model` を宣言するだけで、claude CLI はアカウントの entitlement やモデルの廃止で
+// **無言で**別のモデルへ解決することがある（2026-09-23 実測: 別アカウントの worker で 5.5 → 5）。宣言（`model`）と
+// 実際（`model_actual`）を分けて持ち、食い違えば `workers` / `worker_status` の warnings と
+// persist.log へ出し、ledger は実際のモデルで集計する。
+//
+// 実際のモデルの出どころは **transcript の最初の assistant 行の `message.model`**（API が返した名前）。
+// tako mod の `$.session.model()` は「宣言を返すのか解決後を返すのか」が確かめられていないので
+// 使わない（宣言を返すなら食い違いを一致と言ってしまう）。mod の報告からは transcript の置き場の
+// 手がかり（設定 dir）だけを借りる。どの系統が観測できるかの正本は
+// `agent_support` の `worker_model_actual`（codex / agy は degraded = 宣言だけ）
+
+/// #1638 の A/B。`TAKO_1638_LEGACY=1` で**同一バイナリのまま**修正前（実際のモデルを採らず、
+/// ledger を宣言のモデルで集計する）へ戻す
+pub fn legacy_1638() -> bool {
+    std::env::var_os("TAKO_1638_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// この worker の実際のモデルを観測する系統か（マトリクスの `worker_model_actual` が Supported）。
+/// 知らない agent 名は観測しない側へ倒す（観測していないのに一致と言わない）
+pub fn observes_model_actual(entry: &WorkerEntry) -> bool {
+    use tako_core::agent_support::{keys, support_for, Agent, AgentSupport};
+    Agent::parse(&entry.agent).is_some_and(|agent| {
+        support_for(agent, keys::WORKER_MODEL_ACTUAL) == Some(AgentSupport::Supported)
+    })
+}
+
+/// 宣言と実際の突き合わせ（`workers` / `worker_status` の `model_check`）
+pub fn model_check(entry: &WorkerEntry) -> tako_core::model_check::ModelCheck {
+    if !observes_model_actual(entry) {
+        return tako_core::model_check::ModelCheck::NotObserved;
+    }
+    tako_core::model_check::check(entry.model.as_deref(), entry.model_actual.as_deref())
+}
+
+/// 食い違いの 1 行（一致・未確定・比べられないなら None）
+pub fn model_warning(entry: &WorkerEntry) -> Option<String> {
+    if model_check(entry) != tako_core::model_check::ModelCheck::Mismatch {
+        return None;
+    }
+    Some(tako_core::model_check::mismatch_warning(
+        entry.model.as_deref()?,
+        entry.model_actual.as_deref()?,
+        entry.model_actual_account.as_deref(),
+    ))
+}
+
+/// 実際のモデルを 1 件確定した結果（#1638）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelObservation {
+    pub worker_id: String,
+    pub pane: u64,
+    pub declared: Option<String>,
+    pub actual: String,
+    pub account: Option<String>,
+    pub ledger_id: Option<String>,
+}
+
+impl ModelObservation {
+    pub fn check(&self) -> tako_core::model_check::ModelCheck {
+        tako_core::model_check::check(self.declared.as_deref(), Some(&self.actual))
+    }
+
+    /// 食い違いなら warnings / persist.log に出す 1 行
+    pub fn warning(&self) -> Option<String> {
+        (self.check() == tako_core::model_check::ModelCheck::Mismatch).then(|| {
+            tako_core::model_check::mismatch_warning(
+                self.declared.as_deref().unwrap_or_default(),
+                &self.actual,
+                self.account.as_deref(),
+            )
+        })
+    }
+}
+
+/// 会話 ID から「最初の応答のモデル, 所属アカウント名」を引く手段（テストは偽の transcript を渡す）
+pub type ModelProbe<'a> = dyn Fn(&str) -> Option<(String, Option<String>)> + 'a;
+
+/// 実際のモデルがまだ確定していない、観測できる系統の active worker か
+fn awaits_model_actual(entry: &WorkerEntry) -> bool {
+    entry.is_active() && entry.model_actual.is_none() && observes_model_actual(entry)
+}
+
+/// 本番の探し方: `hint`（tako mod の報告の設定 dir）があれば先に見て、無ければ全設定 dir
+/// （既定 + accounts.yaml。`transcript::claude_config_dirs`）を走査する。
+/// まだ transcript が無い・応答がまだなら None（= 未確定のまま。次の観測でまた探す）
+pub fn probe_transcript_model(
+    session_id: &str,
+    hint: Option<&Path>,
+) -> Option<(String, Option<String>)> {
+    let default_dir = super::claude_default_config_dir();
+    let location = hint
+        .and_then(|dir| {
+            crate::transcript::locate_transcript_in(
+                &[dir.to_path_buf()],
+                default_dir.as_deref(),
+                session_id,
+            )
+        })
+        .or_else(|| crate::transcript::locate_transcript(session_id))?;
+    let model = crate::transcript::first_assistant_model_at(&location.path)?;
+    // 既定の設定 dir は `CLAUDE_CONFIG_DIR` 未設定 = inherit のアカウント（#512）
+    let key = (!location.is_default).then(|| location.config_dir.display().to_string());
+    let account = super::AccountsConfig::load()
+        .ok()
+        .and_then(|cfg| super::account_name_for_config_dir(&cfg, key.as_deref()));
+    Some((model, account))
+}
+
+/// 実際のモデルを記録する。**未確定のエントリだけ**を書き、別の会話へ移ったものは触らない。
+/// 書いたら `Some`（呼び出し側が [`publish_observation`] へ流す）
+fn record_model_actual_at(
+    path: &Path,
+    worker_id: &str,
+    session_id: &str,
+    actual: &str,
+    account: Option<String>,
+) -> Result<Option<ModelObservation>, String> {
+    let fits = |e: &WorkerEntry| {
+        awaits_model_actual(e) && e.session_id.as_deref().is_none_or(|s| s == session_id)
+    };
+    // 変化が無いなら書かない（読み取りは中身で比べる使い回し = #1968）
+    if !WorkerRegistry::load_from(path)?
+        .workers
+        .get(worker_id)
+        .is_some_and(fits)
+    {
+        return Ok(None);
+    }
+    let now = crate::sessions::now_iso();
+    WorkerRegistry::mutate_at(path, |reg| {
+        let entry = reg.workers.get_mut(worker_id).filter(|e| fits(e))?;
+        entry.model_actual = Some(actual.to_string());
+        entry.model_actual_at = Some(now);
+        entry.model_actual_account = account.clone();
+        Some(ModelObservation {
+            worker_id: worker_id.to_string(),
+            pane: entry.pane,
+            declared: entry.model.clone(),
+            actual: actual.to_string(),
+            account,
+            ledger_id: entry.ledger_id.clone(),
+        })
+    })
+}
+
+/// 確定した観測を外へ流す: 食い違いなら persist.log へ 1 行、委任台帳へ実際のモデルを書く。
+/// 1 件につき 1 回だけ通る（記録は未確定のエントリにしか書かない）
+fn publish_observation(obs: &ModelObservation) {
+    if let Some(line) = obs.warning() {
+        crate::diag::persist_log(&format!(
+            "[orchestrator] worker={} pane={} {line}",
+            obs.worker_id, obs.pane
+        ));
+    }
+    if let Some(id) = obs.ledger_id.as_deref() {
+        if let Err(e) = super::ledger::record_model_actual(id, &obs.actual) {
+            eprintln!("warning: 委任台帳へ実際のモデルを書けない: {e}");
+        }
+    }
+}
+
+/// 会話 ID の分かっている active worker のうち、実際のモデルが未確定のものを transcript で
+/// 確かめて記録する（#1638）。GUI の定期スキャン（spawn 直後は即時）と `workers` 一覧が呼ぶ。
+/// 未確定の worker が居なければレジストリを読むだけで transcript には触らない
+pub fn observe_pending_models() -> Vec<ModelObservation> {
+    let Some(path) = registry_path() else {
+        return Vec::new();
+    };
+    observe_pending_models_at(&path, &|sid| probe_transcript_model(sid, None))
+}
+
+/// [`observe_pending_models`] のパス・探し方を指定する版（テスト用。実体はこちら）
+pub fn observe_pending_models_at(path: &Path, probe: &ModelProbe) -> Vec<ModelObservation> {
+    if legacy_1638() || !path.is_file() {
+        return Vec::new();
+    }
+    let Ok(registry) = WorkerRegistry::load_from(path) else {
+        return Vec::new();
+    };
+    let targets: Vec<(String, String)> = registry
+        .workers
+        .iter()
+        .filter(|(_, e)| awaits_model_actual(e))
+        .filter_map(|(id, e)| Some((id.clone(), e.session_id.clone()?)))
+        .collect();
+    let mut found = Vec::new();
+    for (id, sid) in targets {
+        let Some((actual, account)) = probe(&sid) else {
+            continue;
+        };
+        match record_model_actual_at(path, &id, &sid, &actual, account) {
+            Ok(Some(obs)) => {
+                publish_observation(&obs);
+                found.push(obs);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("warning: worker レジストリへ実際のモデルを書けない: {e}"),
+        }
+    }
+    found
+}
+
+/// `worker_status` の 1 件版。会話 ID はレジストリに未記録でも照会で解決できていれば渡せる。
+/// `hint` は tako mod の報告の設定 dir（accounts.yaml に無い設定 dir の claude でも探せる）。
+/// 確定済み・観測しない系統なら何もしない
+pub fn observe_worker_model(
+    worker_id: &str,
+    entry: &WorkerEntry,
+    session_id: Option<&str>,
+    hint: Option<&Path>,
+) -> Option<ModelObservation> {
+    let path = registry_path()?;
+    observe_worker_model_at(&path, worker_id, entry, session_id, &|sid| {
+        probe_transcript_model(sid, hint)
+    })
+}
+
+/// [`observe_worker_model`] のパス・探し方を指定する版
+pub fn observe_worker_model_at(
+    path: &Path,
+    worker_id: &str,
+    entry: &WorkerEntry,
+    session_id: Option<&str>,
+    probe: &ModelProbe,
+) -> Option<ModelObservation> {
+    if legacy_1638() || !awaits_model_actual(entry) {
+        return None;
+    }
+    let sid = session_id.or(entry.session_id.as_deref())?;
+    let (actual, account) = probe(sid)?;
+    match record_model_actual_at(path, worker_id, sid, &actual, account) {
+        Ok(Some(obs)) => {
+            publish_observation(&obs);
+            Some(obs)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("warning: worker レジストリへ実際のモデルを書けない: {e}");
+            None
+        }
     }
 }
 
@@ -1027,6 +1289,8 @@ pub fn list_payload(
 ) -> Value {
     let now_epoch = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap_or(0);
     let mut items: Vec<Value> = Vec::new();
+    // #1638: 宣言と実際のモデルの食い違い（worker ごとに 1 行。空 = 何も無い）
+    let mut warnings: Vec<String> = Vec::new();
     let mut entries: Vec<(&String, &WorkerEntry)> = registry
         .workers
         .iter()
@@ -1037,12 +1301,20 @@ pub fn list_payload(
     for (id, e) in entries {
         let (pane_alive, tmux_alive) = liveness(e, live_backends, live_panes);
         let delivery = prompt_delivery_assessment(e, now_epoch);
+        if let Some(line) = model_warning(e) {
+            warnings.push(format!("worker {id}（pane {}）: {line}", e.pane));
+        }
         items.push(json!({
             "worker_id": id,
             "label": e.label,
             "project": e.project,
             "agent": e.agent,
+            // #1638: `model` は従来どおり宣言（読み手の互換）。宣言 / 実際を分けたのが
+            // `model_declared` / `model_actual`（未確定は null）、突き合わせが `model_check`
             "model": e.model,
+            "model_declared": e.model,
+            "model_actual": e.model_actual,
+            "model_check": model_check(e).as_str(),
             "effort": e.effort,
             "pane": e.pane,
             "tab": e.tab,
@@ -1083,7 +1355,7 @@ pub fn list_payload(
             },
         }));
     }
-    json!({ "workers": items, "count": items.len() })
+    json!({ "workers": items, "count": items.len(), "warnings": warnings })
 }
 
 #[cfg(test)]
@@ -1171,6 +1443,9 @@ mod tests {
                     project: record.project.clone(),
                     agent: record.agent.clone(),
                     model: record.model.clone(),
+                    model_actual: None,
+                    model_actual_at: None,
+                    model_actual_account: None,
                     effort: record.effort.clone(),
                     pane: record.pane,
                     tab: record.tab,
@@ -2423,5 +2698,258 @@ mod tests {
             reg.workers.remove(&id);
             reg.workers.remove(&other);
         });
+    }
+
+    // ─── #1638: 宣言したモデルと実際のモデル ───
+
+    /// テスト 1 本ぶんのレジストリに worker を 1 件置く（宣言 `model`・会話 ID・系統を指定）
+    fn put_worker(
+        path: &Path,
+        id: &str,
+        agent: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        status: &str,
+    ) {
+        WorkerRegistry::mutate_at(path, |reg| {
+            reg.workers.insert(
+                id.to_string(),
+                WorkerEntry {
+                    pane: 7000 + id.len() as u64,
+                    agent: agent.into(),
+                    model: model.map(str::to_string),
+                    session_id: session_id.map(str::to_string),
+                    status: status.into(),
+                    spawned_at: crate::sessions::now_iso(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+    }
+
+    /// 偽の transcript（会話 ID → 最初の応答のモデル）。呼ばれた会話 ID を控える
+    fn fake_probe<'a>(
+        table: &'a [(&'a str, &'a str)],
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str) -> Option<(String, Option<String>)> + 'a {
+        move |sid: &str| {
+            asked.borrow_mut().push(sid.to_string());
+            table
+                .iter()
+                .find(|(s, _)| *s == sid)
+                .map(|(_, m)| (m.to_string(), Some("univ".to_string())))
+        }
+    }
+
+    /// 受け入れ条件 1: 宣言 claude-opus-5-5・実際 claude-opus-5 なら両方を返し、warnings に 1 行。
+    /// 一致なら warnings は出ない。まだ応答の無い worker は null / pending
+    #[test]
+    fn 宣言と実際のモデルを分けて持ち食い違いをwarningsに出す_1638() {
+        let path = temp_registry_file("model-actual-1638");
+        put_worker(
+            &path,
+            "1",
+            "claude",
+            Some("claude-opus-5-5"),
+            Some("sid-a"),
+            "active",
+        );
+        put_worker(
+            &path,
+            "22",
+            "claude",
+            Some("claude-opus-5"),
+            Some("sid-b"),
+            "active",
+        );
+        put_worker(
+            &path,
+            "333",
+            "claude",
+            Some("claude-opus-5-5"),
+            Some("sid-c"),
+            "active",
+        );
+        let asked = std::cell::RefCell::new(Vec::new());
+        let table = [("sid-a", "claude-opus-5"), ("sid-b", "claude-opus-5")];
+        let found = observe_pending_models_at(&path, &fake_probe(&table, &asked));
+        assert_eq!(found.len(), 2, "応答のある 2 件だけ確定する: {found:?}");
+        let a = found.iter().find(|o| o.worker_id == "1").unwrap();
+        assert_eq!(a.check(), tako_core::model_check::ModelCheck::Mismatch);
+        assert!(a.warning().unwrap().contains("アカウント univ の"));
+
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(
+            reg.workers["1"].model.as_deref(),
+            Some("claude-opus-5-5"),
+            "宣言は残す"
+        );
+        assert_eq!(
+            reg.workers["1"].model_actual.as_deref(),
+            Some("claude-opus-5")
+        );
+        assert!(reg.workers["1"].model_actual_at.is_some());
+        assert_eq!(
+            reg.workers["1"].model_actual_account.as_deref(),
+            Some("univ")
+        );
+
+        let v = list_payload(&reg, &[], &[], &[], false);
+        let item = |id: &str| {
+            v["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["worker_id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let a = item("1");
+        assert_eq!(
+            a["model"], "claude-opus-5-5",
+            "従来の model は宣言のまま（互換）"
+        );
+        assert_eq!(a["model_declared"], "claude-opus-5-5");
+        assert_eq!(a["model_actual"], "claude-opus-5");
+        assert_eq!(a["model_check"], "mismatch");
+        assert_eq!(item("22")["model_check"], "match");
+        // spawn 直後（まだ応答が無い）= 未確定を null と pending で表す
+        let c = item("333");
+        assert_eq!(c["model_actual"], Value::Null);
+        assert_eq!(c["model_check"], "pending");
+        let warnings = v["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "食い違いの 1 件だけ: {warnings:?}");
+        let line = warnings[0].as_str().unwrap();
+        assert!(line.starts_with("worker 1（pane "), "{line}");
+        assert!(
+            line.contains(
+                "宣言 claude-opus-5-5 → 実際 claude-opus-5（アカウント univ の entitlement"
+            ),
+            "{line}"
+        );
+
+        // 確定したものは二度と探さない（transcript に触らない）。未確定の 1 件だけをまた探す
+        asked.borrow_mut().clear();
+        let again = observe_pending_models_at(&path, &fake_probe(&table, &asked));
+        assert!(again.is_empty());
+        assert_eq!(*asked.borrow(), vec!["sid-c".to_string()]);
+        // 後から応答が来たら確定する。確定済みの値はその後の観測で書き換えない
+        let later = [("sid-c", "claude-opus-5-5"), ("sid-a", "claude-sonnet-5")];
+        let found = observe_pending_models_at(&path, &fake_probe(&later, &asked));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].check(), tako_core::model_check::ModelCheck::Match);
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(
+            reg.workers["1"].model_actual.as_deref(),
+            Some("claude-opus-5")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 観測しない系統（codex / agy = マトリクスの degraded）・closed・会話 ID 未検出は探さない
+    #[test]
+    fn 観測しない系統と閉じたworkerは探さない_1638() {
+        let path = temp_registry_file("model-actual-skip-1638");
+        put_worker(
+            &path,
+            "1",
+            "codex",
+            Some("gpt-5.5"),
+            Some("sid-a"),
+            "active",
+        );
+        put_worker(&path, "22", "agy", None, Some("sid-b"), "active");
+        put_worker(
+            &path,
+            "333",
+            "claude",
+            Some("claude-opus-5-5"),
+            Some("sid-c"),
+            "closed",
+        );
+        put_worker(
+            &path,
+            "4444",
+            "claude",
+            Some("claude-opus-5-5"),
+            None,
+            "active",
+        );
+        let asked = std::cell::RefCell::new(Vec::new());
+        let table = [
+            ("sid-a", "claude-opus-5"),
+            ("sid-b", "claude-opus-5"),
+            ("sid-c", "claude-opus-5"),
+        ];
+        assert!(observe_pending_models_at(&path, &fake_probe(&table, &asked)).is_empty());
+        assert!(
+            asked.borrow().is_empty(),
+            "transcript を探しに行かない: {asked:?}"
+        );
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let v = list_payload(&reg, &[], &[], &[], true);
+        let check = |id: &str| {
+            v["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["worker_id"] == id)
+                .unwrap()["model_check"]
+                .clone()
+        };
+        assert_eq!(check("1"), "not_observed");
+        assert_eq!(check("22"), "not_observed");
+        assert_eq!(check("333"), "pending");
+        assert_eq!(check("4444"), "pending");
+        assert_eq!(v["warnings"], json!([]));
+        // 1 件版（worker_status）も同じ: 照会で会話 ID が分かっても観測しない系統は探さない
+        let codex = reg.workers["1"].clone();
+        assert!(observe_worker_model_at(
+            &path,
+            "1",
+            &codex,
+            Some("sid-a"),
+            &fake_probe(&table, &asked)
+        )
+        .is_none());
+        // claude でレジストリに会話 ID が無くても、照会で解決した会話 ID で確定できる
+        let claude = reg.workers["4444"].clone();
+        let late = [("sid-d", "claude-opus-5")];
+        let obs = observe_worker_model_at(
+            &path,
+            "4444",
+            &claude,
+            Some("sid-d"),
+            &fake_probe(&late, &asked),
+        )
+        .expect("照会の会話 ID で確定する");
+        assert_eq!(obs.actual, "claude-opus-5");
+        assert_eq!(asked.borrow().as_slice(), ["sid-d".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1638 前の workers.yaml（model_actual 系のキーが無い）はそのまま読める = 移行は要らない
+    #[test]
+    fn 実際のモデルのキーが無い旧ファイルを読める_1638() {
+        let path = temp_registry_file("model-actual-old-1638");
+        std::fs::write(
+            &path,
+            "workers:\n  '1':\n    agent: claude\n    model: claude-opus-5-5\n    pane: 3\n    \
+             session_id: sid-a\n    status: active\nnext_id: 1\n",
+        )
+        .unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        assert_eq!(reg.workers["1"].model_actual, None);
+        assert_eq!(
+            model_check(&reg.workers["1"]),
+            tako_core::model_check::ModelCheck::Pending
+        );
+        // 書き戻しても空のキーは出さない（旧版の tako が読んでも同じ形）
+        WorkerRegistry::mutate_at(&path, |_| {}).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("model_actual"));
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -296,6 +296,47 @@ fn usage_from_line(line: &str) -> Option<tako_core::ctx_usage::TranscriptCtx> {
     })
 }
 
+// ─────────────── 実際に使われたモデル（Issue #1638） ───────────────
+
+/// 最初の応答を探すときに先頭から読む上限。最初の assistant 行は依頼文の直後に来るので
+/// 通常は数 KB で見つかる。画像つきの依頼文でも収まる大きさにして、それを超えたら諦める
+/// （次の照会でまた探す = 書き足されるのを待つ）
+const FIRST_MODEL_SCAN_BYTES: u64 = 8 << 20;
+
+/// 会話の**最初の** assistant 行の `message.model`（API が返した実際のモデル。#1638）。
+///
+/// `--model` の宣言が無言で別のモデルへ解決されても、ここには解決後の名前が載る
+/// （2026-09-23 の実測: 宣言 `claude-opus-5-5` の worker の transcript は全行 `claude-opus-5`）。
+/// サブエージェント（isSidechain）・手元で作った応答（`<synthetic>`）は数えない。
+/// まだ応答が無ければ `None`（呼び出し側は「未確定」として扱う）。
+///
+/// **モデル id だけを返す**（発話・ツールの中身は読み捨てる = 診断の絶対ルール）
+pub fn first_assistant_model_at(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file.take(FIRST_MODEL_SCAN_BYTES));
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| assistant_model_from_line(&line))
+}
+
+/// transcript の 1 行から本筋の assistant 行のモデルを読む（該当しなければ `None`）
+fn assistant_model_from_line(line: &str) -> Option<String> {
+    // JSON パースの前に安い篩をかける（依頼文・ツール結果の大きな行を解釈しない）
+    if !line.contains("\"assistant\"") || !line.contains("\"model\"") {
+        return None;
+    }
+    let obj: Value = serde_json::from_str(line).ok()?;
+    if obj["type"].as_str() != Some("assistant") || obj["isSidechain"].as_bool() == Some(true) {
+        return None;
+    }
+    obj["message"]["model"]
+        .as_str()
+        .filter(|m| tako_core::model_check::is_real_model(m))
+        .map(str::to_string)
+}
+
 /// システム通知エントリ（`role: "system"`。#715）を落とした複製を返す。
 ///
 /// リモート PWA のチャットは role が `user` 以外を全てエージェント発話として描くので、
@@ -1793,5 +1834,44 @@ mod tests {
         assert!(msgs[1]["approval"].is_null());
         // tool 表示情報は維持
         assert_eq!(msgs[1]["tools"][0]["name"], "Edit");
+    }
+
+    /// #1638: 実際のモデルは最初の本筋の assistant 行から採る（サブエージェント・手元の応答は数えない）
+    #[test]
+    fn 最初のassistant行のモデルを実際のモデルとして読む_1638() {
+        let scratch = tako_core::test_residue::ScratchDir::new("transcript-1638");
+        let path = scratch.path().join("s.jsonl");
+        let raw = [
+            r#"{"type":"user","message":{"content":"依頼文 \"assistant\" \"model\""}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5","content":[]}}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","content":[]}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5","content":[{"type":"text","text":"x"}]}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","content":[]}}"#,
+        ];
+        std::fs::write(&path, raw.join("\n")).unwrap();
+        assert_eq!(
+            first_assistant_model_at(&path).as_deref(),
+            Some("claude-opus-5")
+        );
+        // まだ応答が無い（依頼文だけ）= 未確定
+        std::fs::write(&path, raw[0]).unwrap();
+        assert_eq!(first_assistant_model_at(&path), None);
+        // ファイルが無い / 空 = 未確定
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(first_assistant_model_at(&path), None);
+        assert_eq!(
+            first_assistant_model_at(&scratch.path().join("無い.jsonl")),
+            None
+        );
+        // 壊れた行は読み飛ばして次を見る
+        std::fs::write(
+            &path,
+            format!("{{\"type\":\"assistant\",\"model\"\n{}", raw[3]),
+        )
+        .unwrap();
+        assert_eq!(
+            first_assistant_model_at(&path).as_deref(),
+            Some("claude-opus-5")
+        );
     }
 }
