@@ -3256,7 +3256,7 @@ false になり、`status` の予告と `run` の報告が食い違った。
 `ShortcutsFile::load_from` / `lid.rs` の `read_from`）と、復元に使えない layout.json の後始末
 （`layout::stash_unrestorable`。#1824）が全員ここを通る。文字として読めない中身は
 `migration::quarantine_raw` がバイトのまま同じ番号へ移す（下の「文字として読めない中身も
-バイトのまま残す」。#2231）。
+バイトのまま残す」。#2231。settings.json / run-configs.json / ui.json も同じ口 = #2238）。
 
 以前は退避先（`<name>.unreadable.bak`）が既にあると**何も写さずそのパスを返していた**ので、
 実行中にもう一度別の中身で壊れると 2 回目の中身はどこにも残らず、呼び出し側の保存
@@ -3333,14 +3333,47 @@ false になり、`status` の予告と `run` の報告が食い違った。
   1 行（元は表から外れるので同じ中身を読み直さない）、同じバイト列の退避が既にあった回は書かない。
   移せなかったときは従来どおり `移行を中止: …`（プロセス内で理由ごとに 1 回）
 - BOM 付きの JSON は UTF-8 として読めるので従来の文字列の退避（BOM ごとバイト一致で残る）
-- **範囲外で同じ穴が残っているもの**: `settings.json` / `run-configs.json` の読み手は文字列で
-  読めないと既定値へ落ちて退避しない。ui.json（#1960）は UTF-8 でない中身を 1 本目へ写すだけで、
-  1 本目が既にあると 2 回目の中身を写さない（番犬 `issue2231_raw_quarantine_watchdog.rs` の
-  `SLOT_KNOWN` に既知の 1 か所として載せてある。寄せたら外す）
+- settings.json / run-configs.json / ui.json に残っていた同じ穴は #2238 で寄せた（次の節）
 - A/B は `TAKO_2231_LEGACY=1`（文字として読めない中身を移さない）。検査は
   `crates/tako-control/tests/issue2231_raw_quarantine_ab.rs`（recent は GUI の OpenDir と同じ
   load → push → save、shortcuts は dispatch の本体）・番犬 `issue2231_raw_quarantine_watchdog.rs`・
   実経路 `scripts/test-nonutf8-quarantine-2231.sh`
+
+### settings.json / run-configs.json / ui.json も同じ口へ（Issue #2238）
+
+#2231 の後も 3 つの読み手が文字として読めない中身（UTF-8 でない・権限で読めない）を取りこぼしていた
+（修正前の CLI で実測）。settings.json は `tako telemetry off` の 1 回で、run-configs.json は
+`tako run-config` の保存で元の中身がどこにも残らなかった。ui.json は 1 本目が空いているときだけ
+写していたので、別の中身の 2 回目は `tako mod ui set` が消し、persist.log には 1 本目を退避先と
+偽った行が残った。
+
+- 3 つとも理由を `LoadIssue::read_failed` で組み、退避まで済ませる（バイトのまま番号付きの退避へ
+  移す = `quarantine_raw`）。run-configs は解釈の誤りも `LoadIssue::unparsable` を通る。読み手が
+  `String::from_utf8(` で UTF-8 を自前で判定する形も番犬が名指す
+- 記録の形は読み手ごとに従来のまま: settings は `settings.json を読めないので既定値で動く: <パス>
+  （読み取りに失敗: …・退避 <先>）`、ui.json は `claude-mod/ui.json の読めない部分を既定で動かす: …
+  （UTF-8 として読めない・退避 <先>）`、run-configs は recent と同じ `移行できず: run_configs …
+  （…・発生源 load）`（run_configs.rs は値を診断ログへ出さない番犬 #1732 の範囲なので、書くのは
+  `data_files::report`）。規則は #2231 と同じ（移した回ごとに 1 行・同じバイト列は書かない）。
+  ui.json の重複除けの鍵は、元が表から外れた回は退避の中身で数える（元を読むと空になり、別の中身の
+  2 回目を同じ破損と見て落としていた）
+- ui.json は「読むだけでは書き換えない」の例外になる（文字として読めない中身は読んだ時点で退避へ
+  移る。解釈できない部分があるだけなら従来どおり元のまま）。記録を通らない core の読み
+  （`tako_core::claude_mod_ui::load_from`）を tako-control から直に呼ばない（移した記録が残らない。
+  帯の取り込みの先読みも `claude_mod_ui::load` へ寄せた）。`tako mod ui set` の応答は移した様子
+  （`state: repaired`・`quarantine`）を返す
+- 起動時の移行（`ensure_migrated` / `tako migrate run`）は文字として読めない中身を退避しない
+  （`移行を中止: … 読み取りに失敗` の 1 行）ので、移行の後に読み手が移しても**退避は 1 本**。
+  記録は移行の中止と読み手の退避の 2 行になる（recent / shortcuts と同じ形）
+- settings.json は**読んだ時点で移る**ので、移行の様子を見せる口（`tako migrate` / `tako setup`）は
+  表示言語を `settings::peek_lang_setting`（ファイルに触らない読み）で引く。`settings::load` で
+  引くと、見るだけの `tako migrate status` が settings.json を退避へ移し、報告では「不在」になる
+- 番犬 `issue2231_raw_quarantine_watchdog.rs` の `SLOT_KNOWN` は空。A/B の旧挙動は `fn legacy_…` に
+  閉じ込め、その本体だけ走査から外す（`legacy_` の外へ漏れた形は名指す）
+- A/B は `TAKO_2238_LEGACY=1`。検査は `crates/tako-control/tests/issue2238_nonutf8_quarantine_ab.rs`
+  （settings は `tako telemetry off` と同じ load → save、run-configs は `tako run-config` / MCP の本体
+  `run_configs::handle`、ui.json は `claude_mod_ui::run`。移行を先に通す呼び順も見る）・
+  実経路 `scripts/test-nonutf8-quarantine-2238.sh`
 
 ### 読めない理由にファイルの中身を載せない（Issue #2230）
 

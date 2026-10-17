@@ -174,6 +174,10 @@ fn settings_jsonの型違いの値をpersist_logへ載せない() {
         let env = Env::new();
         env.put("settings.json", body.as_bytes());
         let report = env.migrate("run", legacy);
+        // settings の申告は settings.json を読む CLI が出す（`tako migrate` は表示言語を
+        // ファイルに触らない読みで引くので申告しない = #2238）
+        let out = env.tako(&["telemetry", "status"], legacy);
+        assert_eq!(out.code, 0, "tako telemetry status が失敗: {}", out.stderr);
         let log = env.persist_log();
         let screen = reason_of(&report, "settings");
         if legacy {

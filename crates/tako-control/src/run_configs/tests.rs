@@ -123,6 +123,47 @@ fn 読めない内容は退避してから空で始める() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #2238: 文字として読めない（UTF-8 でない）内容はバイトのまま番号付きの退避へ移してから空で始める。
+/// 直後の書き込み（`update_at`）が上書きしても中身が残り、別の中身の 2 回目も残る。同じ中身は積まない
+#[test]
+fn utf8でない内容はバイトのまま退避へ移してから空で始める() {
+    if tako_core::load_issue::legacy_2238() || tako_core::load_issue::legacy_2231() {
+        return;
+    }
+    let dir = sandbox("nonutf8");
+    let path = dir.join(FILENAME);
+    let slot = |n| tako_core::migration::quarantine_slot_path(&path, n);
+    let bodies: [&[u8]; 2] = [b"\xff\xfe{\"version\": 1}\xff", b"\xfe\xff MARK \x80"];
+    let set = Edit {
+        args: Some((RunScope::File, "--flag".into())),
+        ..Edit::default()
+    };
+    for (i, body) in bodies.iter().enumerate() {
+        std::fs::write(&path, body).unwrap();
+        let (_, store) = update_at(&path, |st| st.apply("/p/a.py", "/p", &set, "T1")).unwrap();
+        assert_eq!(store.files["/p/a.py"].args.as_deref(), Some("--flag"));
+        assert_eq!(std::fs::read(slot(i + 1)).unwrap(), *body, "{} 回目", i + 1);
+    }
+    assert_eq!(
+        std::fs::read(slot(1)).unwrap(),
+        bodies[0],
+        "1 本目を上書きしない"
+    );
+    // 同じ中身の 3 回目は積まない（元を外すだけ）
+    std::fs::write(&path, bodies[1]).unwrap();
+    let (file, issue) = load_checked(&path);
+    assert_eq!(file, RunConfigsFile::default());
+    let q = issue
+        .as_ref()
+        .and_then(|i| i.quarantine())
+        .expect("退避の結果");
+    assert_eq!((q.path.clone(), q.copied), (slot(2), false));
+    assert!(!slot(3).exists() && !path.exists());
+    // 不在は理由にしない
+    assert_eq!(load_checked(&path), (RunConfigsFile::default(), None));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn 書き換えはresetからsetの順で空になった項目は消える() {
     let dir = sandbox("update");

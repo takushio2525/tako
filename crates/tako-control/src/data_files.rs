@@ -5,7 +5,8 @@
 //! `migration::quarantine_raw` へ。#2231）が、診断ログ（persist.log）へは書けない。
 //! 以前は 1 回目の破損でも何も残らず、「いつ壊れていたか」を後から追えなかった。
 //! ここが core の読み手から理由（[`LoadIssue`]）を受け取り、**移行の記録と同じ形の 1 行**
-//! （`移行できず: <種別> <パス>（理由・退避先・発生源 load）`）で残す。
+//! （`移行できず: <種別> <パス>（理由・退避先・発生源 load）`）で残す。run-configs.json の
+//! 読み手（`run_configs::load_from`）も同じ口で記録する（#2238）。
 //!
 //! 記録は**壊れた中身ごとに 1 回**（settings.json / ui.json と同じ規則。#1819）:
 //!
@@ -68,8 +69,10 @@ pub fn load_remote_shortcuts() -> ShortcutsFile {
     file
 }
 
-/// 落とした理由を persist.log へ。書いた 1 行を返す（テストが配線ごと確かめる口）
-fn report(
+/// 落とした理由を persist.log へ。書いた 1 行を返す（テストが配線ごと確かめる口）。
+/// run-configs.json の読み手（`run_configs::load_from`）もここで記録する（#2238。あちらは
+/// 値を診断ログへ出さない番犬の範囲なので、ログの呼び出しを自分で持たない）
+pub(crate) fn report(
     id: SchemaId,
     path: &Path,
     issue: Option<&LoadIssue>,

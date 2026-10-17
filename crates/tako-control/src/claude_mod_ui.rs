@@ -3,7 +3,8 @@
 //! 型・語彙・既定・検証・操作の正本は `tako_core::claude_mod_ui`。ここが持つのは
 //!
 //! - 置き場の排他（`config_io::lock_exclusive`）と読み書き（core の `update_at`）
-//! - 壊れた ui.json の persist.log への記録（**壊れた中身ごとに 1 回**。退避は core が #916 の機構で行う）
+//! - 壊れた ui.json の persist.log への記録（**壊れた中身ごとに 1 回**。退避は core が #916 の機構で行い、
+//!   文字として読めない中身はバイトのまま番号付きの退避へ移す = #2238）
 //! - 応答の JSON（CLI `tako mod ui` と MCP `tako_mod` の `action=ui` が**同じもの**を返す）
 //! - setup の段（標準は 1 行の表示・`--answers` の `mod_ui`・`--review` の対話の受け皿）
 //! - mod の報告の帯のトグルの取り込み（S3 の `$.store` から正本を移した = [`import_band`]）
@@ -61,7 +62,16 @@ fn record(path: &Path, state: &LoadState) {
             if quarantine.as_ref().is_some_and(|q| !q.copied) {
                 return;
             }
-            let body = std::fs::read(path).unwrap_or_default();
+            // 鍵は壊れた中身。バイトのまま移した回（#2238）は元が表から外れているので退避から読む
+            // （元を読むと中身によらず空になり、別の中身の 2 回目を同じ破損と見て記録を落とす）
+            let body = std::fs::read(path)
+                .ok()
+                .or_else(|| {
+                    quarantine
+                        .as_ref()
+                        .and_then(|q| std::fs::read(&q.path).ok())
+                })
+                .unwrap_or_default();
             let key = format!(
                 "{}\n{}",
                 problems.join("\n"),
@@ -123,12 +133,20 @@ fn apply_ops(path: &Path, ops: &[UiOp]) -> Result<Value, RunError> {
     // 読み → 当て → 書き を他のプロセス（GUI の取り込み・別の CLI）と直列にする
     let _lock = crate::config_io::lock_exclusive(path).map_err(RunError::Refused)?;
     match core::update_at(path, ops, crate::claude_mod::epoch_ms()) {
-        Ok(updated) => Ok(response(
-            path,
-            &updated.config,
-            &updated.before,
-            Some((updated.changed, updated.written)),
-        )),
+        Ok(updated) => {
+            // 文字として読めない中身は先の `load` が退避へ移したので、書く前の読みは「不在」になる。
+            // 応答には移した様子（退避先）を返す（#2238。以前は元が残っていて repaired だった）
+            let before = match (&updated.before, &loaded.state) {
+                (LoadState::Absent, LoadState::Repaired { .. }) => &loaded.state,
+                (before, _) => before,
+            };
+            Ok(response(
+                path,
+                &updated.config,
+                before,
+                Some((updated.changed, updated.written)),
+            ))
+        }
         Err(core::UpdateError::Invalid(e)) => Err(RunError::Invalid(e.message())),
         Err(e) => Err(RunError::Refused(e.message())),
     }
@@ -185,8 +203,9 @@ pub fn import_band(path: &Path, band: &ModBand) {
     let Some(at) = band.toggled_at else {
         return;
     };
-    // 安い先読み（ほとんどの報告は取り込むものが無い = ロックを取らない）
-    let current = core::load_from(path);
+    // 安い先読み（ほとんどの報告は取り込むものが無い = ロックを取らない）。記録つきの口で読む:
+    // 文字として読めない中身はここで退避へ移る（#2238）ので、記録を通らない読みだと残らない
+    let current = load(path);
     if current
         .config
         .band

@@ -26,6 +26,7 @@
 //! `config_io` の排他ロック + tmp → rename（#169 の 3 層防御のうち 2 つ）。読む側はロックしない
 //! （rename なので常に完全な内容が見える）。解釈できない内容は既定値へ落とす前に
 //! `.unreadable.bak` へ退避する（#916。退避しないと直後の書き込みが元の内容を消す）。
+//! 文字として読めない中身（UTF-8 でない・権限で読めない）はバイトのまま番号付きの退避へ移す（#2238）。
 //!
 //! ## A/B
 //!
@@ -40,7 +41,8 @@
 //!
 //! 環境変数の値・引数・実行前コマンドはユーザーデータ（AGENTS.md の絶対ルール）。
 //! このモジュールは persist.log / perf.log / stderr へ何も書かない
-//! （番犬 `tests/issue1732_run_config_log_watchdog.rs`）
+//! （番犬 `tests/issue1732_run_config_log_watchdog.rs`）。壊れたファイルの記録（パス・理由・
+//! 退避先だけ。中身は載せない）は読み手の共通の口 `data_files::report` が書く（#2238）
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -116,17 +118,46 @@ pub fn load() -> RunConfigsFile {
     store_path().map(|p| load_from(&p)).unwrap_or_default()
 }
 
-/// 指定パスから読む。**解釈できない内容は空へ落とす前に退避する**（#916）
+/// 読み手の記録の重複除け（`data_files` の規則 = 壊れた中身ごとに 1 回）
+static UNREADABLE_SEEN: crate::settings::UnreadableSeen = crate::settings::UnreadableSeen::new();
+
+/// 指定パスから読む。**読めない・解釈できない内容は空へ落とす前に退避する**（#916）。
+///
+/// 文字として読めない中身（UTF-8 でない・権限で読めない）は文字列の退避口を通れないので、
+/// **バイトのまま番号付きの退避へ移す**（`LoadIssue::read_failed` = `migration::quarantine_raw`。
+/// recent / shortcuts と同じ口。#2238）。以前は退避せずに空へ落ち、直後の [`update_at`] の
+/// 書き込みが元の内容を消していた。落とした理由は `data_files` の口が persist.log へ 1 行残す
+/// （パス・理由・退避先だけ。中身は載せない）
 pub fn load_from(path: &Path) -> RunConfigsFile {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return RunConfigsFile::default();
+    let (file, issue) = load_checked(path);
+    crate::data_files::report(
+        tako_core::migration::SchemaId::RunConfigs,
+        path,
+        issue.as_ref(),
+        &UNREADABLE_SEEN,
+    );
+    file
+}
+
+/// [`load_from`] の本体（記録はしない）。既定値へ落とした理由も返す
+fn load_checked(path: &Path) -> (RunConfigsFile, Option<tako_core::load_issue::LoadIssue>) {
+    use tako_core::load_issue::{legacy_2238, LoadIssue};
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // #2238 の修正前: 文字として読めない中身を退避せずに空へ落とす
+        Err(_) if legacy_2238() => return (RunConfigsFile::default(), None),
+        Err(e) => return (RunConfigsFile::default(), LoadIssue::read_failed(path, &e)),
     };
     match serde_json::from_str(&text) {
-        Ok(file) => file,
-        Err(_) => {
+        Ok(file) => (file, None),
+        Err(_) if legacy_2238() => {
             let _ = tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo);
-            RunConfigsFile::default()
+            (RunConfigsFile::default(), None)
         }
+        Err(e) => (
+            RunConfigsFile::default(),
+            Some(LoadIssue::unparsable(path, &e)),
+        ),
     }
 }
 

@@ -4553,8 +4553,10 @@ fn cli_main() -> ExitCode {
         Command::Mcp(McpCommand::Serve) => mcp_bridge::serve(mcp_bridge::Catalog::InProcess),
         Command::Setup(ref args) => {
             // setup も表示言語を settings.json から解決する（#435。移行の説明文など
-            // Note ベースの文言がここを通るので、設定が ja なら日本語で出る）
-            tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+            // Note ベースの文言がここを通るので、設定が ja なら日本語で出る）。
+            // ファイルに触らない読みにする: 読めない settings.json を移行の表示より先に
+            // 退避へ移すと、画面の移行の行から消える（#2238）
+            tako_core::i18n::set_lang(tako_control::settings::peek_lang_setting().resolve());
             if let Some(SetupCommand::Models { ref agent, json }) = args.command {
                 setup::run_models(agent.as_deref(), json)
             } else if let Some(SetupCommand::Bootstrap {
@@ -6611,8 +6613,10 @@ fn shell_integration_local(args: &ShellIntegrationArgs) -> Result<(), String> {
 
 /// `tako migrate`（Issue #916）。GUI 無しで動くローカル処理
 fn migrate_local(args: &MigrateArgs) -> Result<(), String> {
-    // CLI 単独で走るので表示言語を settings.json から解決する（platform と同じ。#435）
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    // CLI 単独で走るので表示言語を settings.json から解決する（platform と同じ。#435）。
+    // ファイルに触らない読みにする: 見るだけの status が読めない settings.json を退避へ移すと、
+    // 報告に出るはずの settings.json が「不在」になる（#2238）
+    tako_core::i18n::set_lang(tako_control::settings::peek_lang_setting().resolve());
     let action = args.action.as_deref().unwrap_or("status");
     let result = tako_control::migrations::report_json(action, args.schema.as_deref())?;
     println!("{}", pretty_json(&result));
