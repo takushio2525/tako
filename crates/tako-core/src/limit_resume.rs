@@ -90,8 +90,12 @@ pub struct ResumeInput<'a> {
     pub stop: Option<&'a LimitStop>,
     /// 現在時刻（unix 秒。テストで注入する）
     pub now: i64,
-    /// このエピソードで最初に上限停止を観測した時刻（unix 秒）
+    /// このエピソードで最初に上限停止を観測した時刻（unix 秒）。
+    /// GUI の再起動・追跡の作り直しをまたいで告知の初観測時刻を引き継ぐ（[`LimitSeen`]。#1710）
     pub first_seen: i64,
+    /// この GUI がこのエピソードの追跡を（再）開始した時刻（unix 秒。#1710）。
+    /// 追跡を始めた時点でもう解けていた上限は、ここ + 安全マージンで再開する（[`resume_due`]）
+    pub tracked_since: i64,
     /// 画面が変化しなくなった時刻（unix 秒）。None = まだ動いている
     pub stable_since: Option<i64>,
     /// このエピソードでの試行回数
@@ -190,6 +194,142 @@ pub fn due_at(stop: &LimitStop, first_seen: i64) -> i64 {
     }
 }
 
+/// 追跡を（再）開始した時刻を下限にした再開予定（unix 秒。#1710）。
+///
+/// [`due_at`] はリセット時刻 + 安全マージンだが、**追跡を始めた時点でもう解けていた**上限
+/// （GUI を再起動したら前日の告知が画面に残っていた・スリープ明けに追跡を作り直した・
+/// 構造化ソースの時刻が過去だった）は、過去の時刻ではなく `tracked_since` + マージンに置く。
+/// TUI 側の解除反映や回線の戻りを待つ余裕は「解けた瞬間」ではなく「tako が見始めた瞬間」から
+/// 要るため。通常の検知（検知 = 追跡の開始・リセットは未来）では [`due_at`] と一致する
+pub fn resume_due(stop: &LimitStop, first_seen: i64, tracked_since: i64) -> i64 {
+    resume_due_in(stop, first_seen, tracked_since, legacy_detected_base())
+}
+
+/// [`resume_due`] の本体（`legacy` = #1710 前 = [`due_at`] そのまま。テストは env に触らない）
+pub fn resume_due_in(stop: &LimitStop, first_seen: i64, tracked_since: i64, legacy: bool) -> i64 {
+    let due = due_at(stop, first_seen);
+    if legacy {
+        return due;
+    }
+    due.max(tracked_since + SAFETY_MARGIN_SECS)
+}
+
+// --- 告知の検知時刻（#1710） ---
+
+/// 上限の告知を最初に観測した時刻の記憶（#1710）。
+///
+/// 日付の無い表記（`resets 7am`）は「**告知が出た時刻から見て**次の 7 時」なので、解く基準は
+/// いまではなく告知を最初に見た時刻でなければならない。GUI の追跡状態はメモリにしか無く、
+/// 再起動・追跡の作り直しで消える（9/24 12:31 の週次上限を 9/25 12:43 の再起動後に解き直し、
+/// 解けている上限を 9/26 07:00 まで待った）。そこでペインの属性として layout.json へ残す
+/// （`Pane::limit_seen`）。告知は**本文を残さず要約（[`notice_digest`]）だけ**で見分ける
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitSeen {
+    /// 告知の要約（[`notice_digest`]）
+    pub notice: String,
+    /// その告知を最初に観測した時刻（unix 秒）
+    pub detected_at: i64,
+}
+
+/// 告知が画面から消えたまま、この秒数続いたら記憶を捨てる（#1710）。
+///
+/// GUI の再起動直後・スリープ明け・幅の変更では画面が数秒だけ描き直し中になり、告知が
+/// 見えない tick が挟まる。そこで捨てると再起動をまたぐ意味が無くなるので、「作業が再開して
+/// 告知が流れた」と言える長さを置く。同じ文面の告知が別のエピソードで出るには解除時刻が
+/// 1 周（24 時間）する必要があるので、この長さで取り違えは起きない
+pub const SEEN_FORGET_SECS: i64 = 600;
+
+/// 告知の検知時刻（unix 秒。#1710）。記憶が同じ告知ならその時刻、記憶が無い / 違う告知なら
+/// `now`（いま初めて見た）。時計が戻っていても `now` より先にはしない
+pub fn detected_at(seen: Option<&LimitSeen>, notice: &str, now: i64) -> i64 {
+    detected_at_in(seen, notice, now, legacy_detected_base())
+}
+
+/// [`detected_at`] の本体（`legacy` = #1710 前 = 常に `now`）
+pub fn detected_at_in(seen: Option<&LimitSeen>, notice: &str, now: i64, legacy: bool) -> i64 {
+    match seen {
+        Some(s) if !legacy && s.notice == notice => s.detected_at.min(now),
+        _ => now,
+    }
+}
+
+/// 告知の見出し 1 行の要約（#1710）。
+///
+/// 行頭の目印（`⎿` / `⏺` / `●`）と空白の揺れ（狭いペインで折り返された見出しは #1123 の結合で
+/// 空白 1 つにつながる）を落としてから FNV-1a 64 を取る。安定なハッシュなので版をまたいでも
+/// 同じ告知は同じ値になり、layout.json に画面の文字列を書かずに済む
+pub fn notice_digest(headline: &str) -> String {
+    let mut words = headline.split_whitespace().peekable();
+    while words.peek().is_some_and(|w| NOTICE_MARKERS.contains(w)) {
+        words.next();
+    }
+    let normalized = words.collect::<Vec<_>>().join(" ");
+    format!("{:016x}", crate::fnv::fnv1a64(normalized.as_bytes()))
+}
+
+/// 見出しの行頭に付く塊の目印（`BLOCK_MARKERS` のうち告知の前に来るもの）
+const NOTICE_MARKERS: [&str; 3] = ["⎿", "⏺", "●"];
+
+/// 記憶を捨てる時期か（#1710）。`absent_since` = 告知が画面から消えたのを最初に見た時刻
+pub fn seen_expired(absent_since: i64, now: i64) -> bool {
+    now - absent_since >= SEEN_FORGET_SECS
+}
+
+/// 告知の記憶の 1 tick ぶんの更新（#1710 の [`step_seen`] の結果）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenStep {
+    /// ペインへ書く値。`None` = 変えない / `Some(None)` = 捨てる
+    pub write: Option<Option<LimitSeen>>,
+    /// 告知が画面から消えたのを最初に見た時刻（次の tick へ持ち越す。消えていなければ `None`）
+    pub absent_since: Option<i64>,
+}
+
+/// 告知の記憶を 1 tick ぶん進める（#1710。純関数）。
+///
+/// - 告知が見えている: 観測した記憶（[`detected_at`] で解いた値）と違えば書く
+///   （新しい告知 = いまの時刻で書く / 同じ告知 = 記憶の時刻のまま = 書かない）
+/// - 告知が見えない: すぐには捨てない。消えたまま [`SEEN_FORGET_SECS`] 続いたら捨てる
+///   （再起動直後・スリープ明けの描き直しの数秒で記憶を失わない）
+pub fn step_seen(
+    current: Option<&LimitSeen>,
+    observed: Option<&LimitSeen>,
+    absent_since: Option<i64>,
+    now: i64,
+) -> SeenStep {
+    match (observed, current) {
+        (Some(seen), _) => SeenStep {
+            write: (current != Some(seen)).then(|| Some(seen.clone())),
+            absent_since: None,
+        },
+        (None, None) => SeenStep {
+            write: None,
+            absent_since: None,
+        },
+        (None, Some(_)) => {
+            let since = absent_since.unwrap_or(now);
+            if seen_expired(since, now) {
+                SeenStep {
+                    write: Some(None),
+                    absent_since: None,
+                }
+            } else {
+                SeenStep {
+                    write: None,
+                    absent_since: Some(since),
+                }
+            }
+        }
+    }
+}
+
+/// `TAKO_1710_LEGACY=1` で #1710 前へ戻す（A/B 用）。告知の検知時刻を持たず
+/// （記憶を読まない・書かない）、リセット時刻を追跡を作るたびに「いま」から解き、
+/// 追跡の（再）開始を再開予定の下限にせず、後から届いた構造化ソースの時刻も採らない
+pub fn legacy_detected_base() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1710_LEGACY").is_some())
+}
+
 /// 自動復帰を発動するかを決める（純関数）。
 ///
 /// 判定順は「安いもの・確実に止めるものから」。無効なペインでは最初の 1 行で抜けるので、
@@ -216,7 +356,7 @@ pub fn decide(input: &ResumeInput) -> ResumeDecision {
     if stable_for < STABLE_SECS {
         return ResumeDecision::wait(HoldReason::ScreenUnstable, STABLE_SECS - stable_for);
     }
-    let due = due_at(stop, input.first_seen);
+    let due = resume_due(stop, input.first_seen, input.tracked_since);
     if input.now < due {
         return ResumeDecision::wait(HoldReason::WaitingForReset, due - input.now);
     }
@@ -737,7 +877,9 @@ const RESET_ANCHORS: [&str; 4] = ["will reset at ", "try again at ", "resets at 
 /// 画面テキストからリセット時刻（unix 秒）を解決する。
 ///
 /// `reference` は「そのメッセージを観測した時刻」（unix 秒）。時刻表記は日付を持たない
-/// ので、**観測時刻から見て次に来る同じ時刻**として解釈する。`tz_offset` は
+/// ので、**観測時刻から見て次に来る同じ時刻**として解釈する。GUI の自動復帰は
+/// 告知を**最初に**観測した時刻（[`LimitSeen`]）を渡す —— 画面に残った前日の告知を
+/// いまから解くと、解けた上限を翌日まで待つ（#1710）。`tz_offset` は
 /// ローカルタイムの UTC からのずれ（秒。日本なら +32400）
 pub fn parse_reset_at(text: &str, reference: i64, tz_offset: i32) -> Option<i64> {
     let lower = text.to_lowercase();
@@ -1169,6 +1311,7 @@ mod tests {
             stop: s,
             now,
             first_seen: 0,
+            tracked_since: 0,
             stable_since: Some(0),
             attempts: 0,
             last_attempt: None,
@@ -2497,6 +2640,161 @@ mod tests {
         assert_eq!(
             unwrapped_tail(&lines, 2),
             vec!["⏺ c".to_string(), "⏺ b".into()]
+        );
+    }
+
+    // --- #1710: 告知の検知時刻 ---
+
+    fn seen(notice: &str, detected_at: i64) -> LimitSeen {
+        LimitSeen {
+            notice: notice.to_string(),
+            detected_at,
+        }
+    }
+
+    #[test]
+    fn issue1710_追跡開始の時点で解けていた上限は開始からマージン後() {
+        let s = stop(LimitStopKind::Idle, Some(1_000));
+        // 通常の検知（検知 = 追跡の開始・リセットは未来）は #813 と同じ値
+        assert_eq!(resume_due_in(&s, 0, 0, false), due_at(&s, 0));
+        assert_eq!(resume_due_in(&s, 0, 0, false), 1_000 + SAFETY_MARGIN_SECS);
+        // 追跡を作り直した時点（50_000）でもう解けていた → 作り直した時刻 + マージン
+        assert_eq!(
+            resume_due_in(&s, 0, 50_000, false),
+            50_000 + SAFETY_MARGIN_SECS
+        );
+        // #1710 前（legacy）は過去の時刻のまま
+        assert_eq!(
+            resume_due_in(&s, 0, 50_000, true),
+            1_000 + SAFETY_MARGIN_SECS
+        );
+        // 時刻不明（初観測 + 15 分）も同じ下限に従う
+        let unknown = stop(LimitStopKind::Idle, None);
+        assert_eq!(
+            resume_due_in(&unknown, 0, 50_000, false),
+            50_000 + SAFETY_MARGIN_SECS
+        );
+        assert_eq!(
+            resume_due_in(&unknown, 49_990, 50_000, false),
+            49_990 + UNKNOWN_RESET_FALLBACK_SECS,
+            "猶予がまだ残っていれば猶予のほう"
+        );
+    }
+
+    #[test]
+    fn issue1710_判断は追跡開始の下限を使う() {
+        let s = stop(LimitStopKind::Idle, Some(1_000));
+        let mut i = input(true, Some(&s), 50_000);
+        i.tracked_since = 50_000;
+        i.stable_since = Some(50_000 - STABLE_SECS);
+        assert_eq!(
+            decide(&i),
+            ResumeDecision::Hold {
+                reason: HoldReason::WaitingForReset,
+                remaining_secs: SAFETY_MARGIN_SECS,
+            }
+        );
+        i.now = 50_000 + SAFETY_MARGIN_SECS;
+        assert_eq!(decide(&i).action(), Some(ResumeAction::Nudge));
+    }
+
+    #[test]
+    fn issue1710_同じ告知なら記憶の時刻を基準にする() {
+        let n = notice_digest("You've hit your weekly limit · resets 7am (Asia/Tokyo)");
+        let m = seen(&n, 1_000);
+        assert_eq!(detected_at_in(Some(&m), &n, 90_000, false), 1_000);
+        // 違う告知 = いま初めて見た
+        let other = notice_digest("You've hit your session limit · resets 7:50pm (Asia/Tokyo)");
+        assert_eq!(detected_at_in(Some(&m), &other, 90_000, false), 90_000);
+        // 記憶が無い
+        assert_eq!(detected_at_in(None, &n, 90_000, false), 90_000);
+        // 時計が戻っていても未来の検知時刻は使わない
+        assert_eq!(
+            detected_at_in(Some(&seen(&n, 95_000)), &n, 90_000, false),
+            90_000
+        );
+        // #1710 前（legacy）は常にいま
+        assert_eq!(detected_at_in(Some(&m), &n, 90_000, true), 90_000);
+    }
+
+    #[test]
+    fn issue1710_告知の要約は目印と空白の揺れに依らず本文を残さない() {
+        let wide = notice_digest("  ⎿  You've hit your weekly limit · resets 7am (Asia/Tokyo)");
+        // 狭いペインの折り返しを #1123 で結合した形（空白 1 つでつながる）
+        let joined = notice_digest("⎿ You've hit your weekly limit · resets 7am (Asia/Tokyo)");
+        let bare = notice_digest("You've hit your weekly limit · resets 7am (Asia/Tokyo)");
+        assert_eq!(wide, joined);
+        assert_eq!(wide, bare);
+        // 解除時刻が違えば別の告知
+        assert_ne!(
+            bare,
+            notice_digest("You've hit your weekly limit · resets 8am (Asia/Tokyo)")
+        );
+        // 16 桁の 16 進だけ（画面の文字列を layout.json に書かない）
+        assert_eq!(bare.len(), 16);
+        assert!(bare.chars().all(|c| c.is_ascii_hexdigit()), "{bare}");
+        // 版をまたいで同じ値（FNV-1a 64 の固定値。変わると再起動後に記憶が当たらない）
+        assert_eq!(
+            notice_digest(""),
+            format!("{:016x}", 0xcbf2_9ce4_8422_2325_u64)
+        );
+    }
+
+    #[test]
+    fn issue1710_記憶は見えている間は保ち新しい告知で書き換える() {
+        let a = seen("aaaaaaaaaaaaaaaa", 1_000);
+        // 記憶と同じ観測 = 書かない
+        assert_eq!(
+            step_seen(Some(&a), Some(&a), None, 2_000),
+            SeenStep {
+                write: None,
+                absent_since: None
+            }
+        );
+        // 新しい告知 = 書く
+        let b = seen("bbbbbbbbbbbbbbbb", 2_000);
+        assert_eq!(
+            step_seen(Some(&a), Some(&b), Some(1_500), 2_000),
+            SeenStep {
+                write: Some(Some(b.clone())),
+                absent_since: None
+            }
+        );
+        // 記憶が無いところへ初めての告知 = 書く
+        assert_eq!(step_seen(None, Some(&b), None, 2_000).write, Some(Some(b)));
+    }
+
+    #[test]
+    fn issue1710_描き直しの数秒では記憶を捨てず消えたまま続けば捨てる() {
+        let a = seen("aaaaaaaaaaaaaaaa", 1_000);
+        // 再起動直後・スリープ明けの描き直し（告知が見えない tick）
+        let s1 = step_seen(Some(&a), None, None, 5_000);
+        assert_eq!(s1.write, None, "1 tick 見えないだけで捨てない");
+        assert_eq!(s1.absent_since, Some(5_000));
+        let s2 = step_seen(
+            Some(&a),
+            None,
+            s1.absent_since,
+            5_000 + SEEN_FORGET_SECS - 1,
+        );
+        assert_eq!(s2.write, None);
+        assert_eq!(s2.absent_since, Some(5_000), "消えた時刻は持ち越す");
+        // 戻ってきたら猶予はやり直し
+        assert_eq!(
+            step_seen(Some(&a), Some(&a), s2.absent_since, 5_010).absent_since,
+            None
+        );
+        // 消えたまま SEEN_FORGET_SECS 続いた = 作業が再開して告知が流れた
+        let s3 = step_seen(Some(&a), None, Some(5_000), 5_000 + SEEN_FORGET_SECS);
+        assert_eq!(s3.write, Some(None));
+        assert_eq!(s3.absent_since, None);
+        // 記憶が無ければ何もしない
+        assert_eq!(
+            step_seen(None, None, None, 5_000),
+            SeenStep {
+                write: None,
+                absent_since: None
+            }
         );
     }
 }

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tako_core::limit_resume::LimitSeen;
 use tako_core::{
     BackgroundPane, Pane, PaneId, PaneNode, PaneOrigin, PaneTree, Tab, TabId, TitleSource,
     Workspace,
@@ -284,6 +285,37 @@ pub struct PaneLayout {
     /// 後方互換**（移行 Step は不要）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<u64>,
+    /// 上限の告知を最初に観測した時刻（#1710）。自動復帰（#813）の追跡はメモリにしか無く、
+    /// GUI を再起動すると画面に残った前日の告知を「いま」から解き直していた。
+    /// **旧ファイルには無いので serde default で後方互換**（移行 Step は不要）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_seen: Option<LimitSeenLayout>,
+}
+
+/// 上限の告知の記憶（#1710。`tako_core::limit_resume::LimitSeen` の保存形）。
+/// **告知の本文は保存しない**（画面の文字列を layout.json に書かない。要約だけ）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitSeenLayout {
+    /// 告知の見出しの要約（`tako_core::limit_resume::notice_digest`）
+    pub notice: String,
+    /// その告知を最初に観測した時刻（unix 秒）
+    pub detected_at: i64,
+}
+
+impl LimitSeenLayout {
+    fn capture(seen: Option<&LimitSeen>) -> Option<Self> {
+        seen.map(|s| Self {
+            notice: s.notice.clone(),
+            detected_at: s.detected_at,
+        })
+    }
+
+    fn restore(&self) -> LimitSeen {
+        LimitSeen {
+            notice: self.notice.clone(),
+            detected_at: self.detected_at,
+        }
+    }
 }
 
 /// SSH ペインの再接続材料（#1446）。
@@ -406,6 +438,7 @@ pub fn capture(
                     limit_autoresume: pane.limit_autoresume(),
                     ssh: m.ssh,
                     spawned_by: pane.spawned_by().map(|p| p.as_u64()),
+                    limit_seen: LimitSeenLayout::capture(pane.limit_seen()),
                 }
             })
             .collect(),
@@ -495,6 +528,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 limit_autoresume: pane.limit_autoresume(),
                 ssh: m.ssh,
                 spawned_by: pane.spawned_by().map(|p| p.as_u64()),
+                limit_seen: LimitSeenLayout::capture(pane.limit_seen()),
             }))
         }
         PaneNode::Split {
@@ -749,6 +783,10 @@ pub const CHANGE_KEY_FIELDS: &[(&str, &str)] = &[
     ("PaneLayout", "limit_autoresume"),
     ("PaneLayout", "ssh"),
     ("PaneLayout", "spawned_by"),
+    ("PaneLayout", "limit_seen"),
+    // LimitSeenLayout（#1710）
+    ("LimitSeenLayout", "notice"),
+    ("LimitSeenLayout", "detected_at"),
     // SshPaneLayout（#1446）
     ("SshPaneLayout", "host"),
     ("SshPaneLayout", "reconnect_line"),
@@ -911,6 +949,18 @@ fn feed_pane<'a>(pane: &Pane, meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>, h: &mut 
     pane.limit_autoresume().hash(h);
     // PaneLayout.spawned_by（#1946）
     pane.spawned_by().map(|p| p.as_u64()).hash(h);
+    // PaneLayout.limit_seen（#1710）。網羅的な分解: 足したらここがコンパイルできない
+    match pane.limit_seen() {
+        None => 0u8.hash(h),
+        Some(LimitSeen {
+            notice,
+            detected_at,
+        }) => {
+            1u8.hash(h);
+            notice.hash(h);
+            detected_at.hash(h);
+        }
+    }
     meta(pane.id()).feed(h);
 }
 
@@ -1043,6 +1093,8 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
             p.limit_autoresume,
         );
         pane.set_spawned_by(p.spawned_by.map(PaneId::from_raw));
+        // #1710: 告知の記憶を戻す（再起動後も前日の告知をその時刻から解く）
+        pane.set_limit_seen(p.limit_seen.as_ref().map(LimitSeenLayout::restore));
         restored.push(RestoredPane {
             pane: p.id,
             session: p.session.clone(),
@@ -1279,6 +1331,8 @@ fn restore_node(
             );
             // #1946: spawn 元を戻す（親 master ごとのまとまりを再起動で崩さない）
             pane.set_spawned_by(p.spawned_by.map(PaneId::from_raw));
+            // #1710: 告知の記憶を戻す（再起動後も前日の告知をその時刻から解く）
+            pane.set_limit_seen(p.limit_seen.as_ref().map(LimitSeenLayout::restore));
             let id = pane.id();
             restored.push(RestoredPane {
                 pane: p.id,
@@ -1762,6 +1816,89 @@ mod tests {
         assert!(
             restored.iter().all(|r| r.ssh.is_none()),
             "旧ファイルは追跡なしとして読む（serde default）"
+        );
+    }
+
+    /// #1710: 上限の告知の記憶（検知時刻）が再起動をまたいで残る。表のペインも退避中の
+    /// ペインも同じ経路で戻り、記憶の無いペインには出さず、旧ファイル（欄無し）も読める
+    #[test]
+    fn issue1710_告知の記憶が保存復元され旧ファイルと後方互換() {
+        use tako_core::limit_resume::{notice_digest, LimitSeen};
+        let root = Pane::new(PaneOrigin::User);
+        let root_id = root.id();
+        let mut ws = Workspace::new("1", root);
+        let worker = Pane::new(PaneOrigin::Cli);
+        let worker_id = worker.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Right, worker)
+            .unwrap();
+        let bg = Pane::new(PaneOrigin::Cli);
+        let bg_id = bg.id();
+        ws.active_tab_mut()
+            .tree_mut()
+            .split(root_id, SplitDirection::Down, bg)
+            .unwrap();
+        let headline = "You've hit your weekly limit · resets 7am (Asia/Tokyo)";
+        let memo = LimitSeen {
+            notice: notice_digest(headline),
+            detected_at: 1_790_220_660,
+        };
+        for id in [worker_id, bg_id] {
+            ws.active_tab_mut()
+                .tree_mut()
+                .get_mut(id)
+                .unwrap()
+                .set_limit_seen(Some(memo.clone()));
+        }
+        ws.shelve_pane(bg_id).expect("退避できる");
+
+        let layout = capture(&ws, &|_| PaneMeta::default(), None);
+        let json = serde_json::to_string(&layout).unwrap();
+        assert_eq!(
+            json.matches("\"limit_seen\"").count(),
+            2,
+            "記憶のあるペインぶんだけ出力される: {json}"
+        );
+        assert!(
+            !json.contains("weekly limit") && !json.contains("resets 7am"),
+            "告知の本文を layout.json に書いている: {json}"
+        );
+
+        let back: LayoutFile = serde_json::from_str(&json).unwrap();
+        let (restored_ws, _) = restore(&back).expect("復元できる");
+        let tree = restored_ws.tabs()[0].tree();
+        assert_eq!(
+            tree.get(PaneId::from_raw(worker_id.as_u64()))
+                .unwrap()
+                .limit_seen(),
+            Some(&memo),
+            "表のペインの記憶が戻らない"
+        );
+        assert_eq!(
+            tree.get(PaneId::from_raw(root_id.as_u64()))
+                .unwrap()
+                .limit_seen(),
+            None,
+            "記憶の無いペインに記憶が生えた"
+        );
+        assert_eq!(
+            restored_ws.shelved_panes()[0].pane().limit_seen(),
+            Some(&memo),
+            "退避中のペインの記憶が戻らない"
+        );
+
+        // 旧ファイル（`limit_seen` を知らない世代）は**移行なしで**そのまま読める
+        let old = json.replace("\"limit_seen\":", "\"_limit_seen_unknown\":");
+        assert_ne!(old, json, "置換の対象が無い（テストが何も見ていない）");
+        let back: LayoutFile = serde_json::from_str(&old).expect("旧ファイルが読める");
+        let (restored_ws, _) = restore(&back).expect("復元できる");
+        assert!(
+            restored_ws
+                .all_panes()
+                .iter()
+                .all(|p| p.limit_seen().is_none()),
+            "旧ファイルは記憶なしとして読む（serde default）"
         );
     }
 
@@ -2460,6 +2597,7 @@ mod tests {
                 limit_autoresume: false,
                 ssh: None,
                 spawned_by: None,
+                limit_seen: None,
             }))
         }
         let mut tree = pane(1);
@@ -2523,6 +2661,7 @@ mod tests {
             limit_autoresume: false,
             ssh: None,
             spawned_by: None,
+            limit_seen: None,
         });
         assert_eq!(layout.pane_count(), 4);
         assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-bg"]);
@@ -2622,6 +2761,7 @@ mod tests {
                 limit_autoresume: false,
                 ssh: None,
                 spawned_by: None,
+                limit_seen: None,
             }))
         }
         let mut id = 1u64;
@@ -2721,6 +2861,7 @@ mod tests {
             limit_autoresume: false,
             ssh: None,
             spawned_by: None,
+            limit_seen: None,
         });
         assert!(
             !loses_backend_session(&base, &shelved),

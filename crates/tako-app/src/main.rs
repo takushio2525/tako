@@ -2592,6 +2592,8 @@ struct TakoApp {
     /// 利用上限後の自動復帰の追跡状態（Issue #813）。オプトイン自体は Pane 属性
     /// （layout.json 永続化）で、ここは揮発する実行状態だけを持つ
     limit_resume: limit_autoresume::LimitResumeTrackers,
+    /// 上限の告知が画面から消えたのを最初に見た時刻（#1710。ペインの記憶を捨てる猶予）
+    limit_seen_absent: limit_autoresume::LimitSeenAbsence,
     /// 自動復帰の全体の既定（Issue #1945。settings.json の `limit_resume_all`）。
     /// 以後にエージェントになったペインが最初に採る値で、一括ボタンが書く
     limit_resume_all: bool,
@@ -5018,6 +5020,7 @@ impl TakoApp {
             handoff_nudges: HashMap::new(),
             handoff_policy_cache: HashMap::new(),
             limit_resume: HashMap::new(),
+            limit_seen_absent: HashMap::new(),
             limit_resume_all: tako_control::settings::load().limit_resume_all,
             limit_resume_summary: Default::default(),
             net_resume: net_autoresume::NetResumeState::new(

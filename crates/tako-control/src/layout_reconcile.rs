@@ -620,6 +620,7 @@ mod tests {
             limit_autoresume: false,
             ssh: None,
             spawned_by: None,
+            limit_seen: None,
         }
     }
 

@@ -107,6 +107,11 @@ pub struct Pane {
     /// （[`Self::adopt_limit_resume_default`]）。**個別に切ったペインを後から全体の既定で
     /// 上書きしない**ための印
     limit_autoresume_decided: bool,
+    /// 上限の告知を最初に観測した時刻の記憶（#1710）。自動復帰（#813）の追跡はメモリにしか
+    /// 無いので、GUI の再起動・追跡の作り直しをまたいで「告知がいつ出たか」をここへ残し、
+    /// リセット時刻をその時刻から解く。layout.json に保存する（告知は本文ではなく要約だけ）。
+    /// 箱に入れるのは `PaneNode::Leaf` を太らせないため（clippy の large_enum_variant）
+    limit_seen: Option<Box<crate::limit_resume::LimitSeen>>,
 }
 
 impl Pane {
@@ -122,6 +127,7 @@ impl Pane {
             exit_file: None,
             limit_autoresume: false,
             limit_autoresume_decided: false,
+            limit_seen: None,
         }
     }
 
@@ -149,6 +155,8 @@ impl Pane {
             // 復元したペインの「決定済み」は呼び出し側（復元の後にエージェントかを
             // 知っている GUI）が [`Self::mark_limit_resume_decided`] で立てる
             limit_autoresume_decided: false,
+            // 告知の記憶（#1710）は呼び出し側が [`Self::set_limit_seen`] で戻す
+            limit_seen: None,
         }
     }
 
@@ -266,6 +274,16 @@ impl Pane {
         }
         self.limit_autoresume = true;
         true
+    }
+
+    /// 上限の告知を最初に観測した時刻の記憶（#1710。無ければ `None`）
+    pub fn limit_seen(&self) -> Option<&crate::limit_resume::LimitSeen> {
+        self.limit_seen.as_deref()
+    }
+
+    /// 告知の記憶を差し替える（#1710。GUI の自動復帰の tick と layout の復元が通る）
+    pub fn set_limit_seen(&mut self, seen: Option<crate::limit_resume::LimitSeen>) {
+        self.limit_seen = seen.map(Box::new);
     }
 }
 
