@@ -23,7 +23,8 @@
 - 待ち合わせ: `release.sh` は Windows の添付を待ってから、実アセットを読み直して
   ノートを作り直す（ダウンロード表 / 動作要件 / Windows 手順 / Known limitations が揃う）
 - 片肺の検出: `release.sh` の終了コード **3**（= Release は作られたが揃っていない）。
-  公開済みリリースは `scripts/release.sh --check-assets [tag]` でいつでも検査できる。
+  公開済みリリースは `scripts/release.sh --check-assets [tag]` でいつでも検査できる
+  （zip の中のライセンスも見る = 次の節。#1850）。
   判定の正は `tako-core::platform::release_assets`（`missing_platforms` / `is_complete`）で、
   シェル側の写しは同期テストが拘束する。モックテスト `scripts/test-release-retry.sh` は
   **CI の macOS ジョブで走る**（片肺の検出が壊れたらそこで落ちる。docs だけの PR では skip = #2084）
@@ -31,10 +32,11 @@
   `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion` との一致を
   テストが検証する（ノートの要件と配布物の実際の下限がズレない）
 
-## 配布物に同梱するライセンス（#1709 / #1845）
+## 配布物に同梱するライセンス（#1709 / #1845 / #1850）
 
 GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、バイナリの受け取り手へ
 本文と著作権表示を渡すことを求める。**両 OS の配布物が同じ 3 本を持つ**のが正常な状態。
+同梱表の正本は `scripts/lib/license-bundle.txt`（下の表は説明用。番犬と公開後の検査はこの 1 つを読む）。
 
 | 元ファイル（リポジトリ直下） | macOS（`tako.app/Contents/Resources/`） | Windows（zip の `tako/`・インストール先） |
 |---|---|---|
@@ -46,12 +48,19 @@ GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、�
   `installer/windows/build-installer.ps1` / Windows のインストーラー = `installer/windows/tako.iss`
   の `[Files]`。**3 か所とも 1 本ずつ明示で並べる**（まとめて glob にしない）
 - 番犬: `crates/tako-control/tests/license_bundle_watchdog.rs` が組み立ての全箇所と
-  リリース検査の表を 1 つの表へ突き合わせ、抜けたら置くべき場所の file:line を名指しして落ちる
+  リリース検査の表を同梱表へ突き合わせ、抜けたら置くべき場所の file:line を名指しして落ちる。
+  `release.sh` / `scripts/lib/license-bundle.sh` に名前を直書き（2 か所目の表）しても落ちる
 - 実物の検査: `installer/windows/lib/verify-assets.ps1` の `$TakoLicenseBundle` が同梱表。
   zip は `Test-TakoWindowsAssets` が展開してリポジトリの元ファイルとのバイト一致を見る
   （CI・実機の両経路）。インストール先は `Test-TakoInstalledPayload` が**使い捨ての CI
   ランナーでだけ**無人インストールして見る（実機で走らせると同じ AppId の実インストールの
   登録を上書きするので、`release-windows.ps1` からは呼ばない。番犬もこれを固定する）
+- **公開後の検査**（#1850）: `scripts/release.sh --check-assets [tag]` が Release の zip（両 OS）を
+  一時 dir へ取得し（`gh release download` の読み取りだけ・確かめたら消す）、同梱表の全部が入って
+  **そのタグのファイルと**バイト一致するかを見る。zip の中の置き場は macOS =
+  `tako.app/Contents/Resources/`・Windows = `tako/`（v0.8.37 の実物で確認）。`.exe` は開けないので
+  見ない。v0.8.25（同梱前）は Windows の zip の 2 本の欠けで exit 1、v0.8.37 は通る。
+  モックは `scripts/test-release-retry.sh` の Test 9〜13
 - **Windows の配布物のドライラン**: PR の CI は Windows の配布物を組まない（タグ push 時だけ）。
   組み立てを変えた PR は `gh workflow run release-windows.yml --ref <ブランチ>` で確かめる。
   タグ以外の ref では Cargo.toml の版数で組み立て・検査・artifact 保存（`tako-windows-dryrun-<run id>`）

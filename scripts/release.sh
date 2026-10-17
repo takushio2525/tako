@@ -11,7 +11,8 @@
 #                                            # Homebrew cask と docs の「最新の安定版」も追従させる（#403 / #1853）
 #   scripts/release.sh --notes-only # リリースノートを生成して表示するだけ（ビルド・公開しない）
 #   scripts/release.sh --update-notes [tag]  # 公開済みリリースのノートを実アセットから作り直す
-#   scripts/release.sh --check-assets [tag]  # 両 OS の配布物が揃っているかを検査（#965）
+#   scripts/release.sh --check-assets [tag]  # 両 OS の配布物が揃っているか（#965）と、zip に
+#                                            # ライセンスが入りタグのファイルと一致するか（#1850）を検査
 #   scripts/release.sh --publish --no-wait-windows  # Windows 版を待たずに macOS 版だけ出す
 #
 # 前提:
@@ -67,7 +68,12 @@ source "$REPO_ROOT/scripts/lib/launch-services.sh"
 # shellcheck source=lib/bundle-privacy.sh
 source "$REPO_ROOT/scripts/lib/bundle-privacy.sh"
 
-# set -e と EXIT trap の併用で終了コードが 0 に化けるのを塞ぐ番人（#1864。--promote の後始末で使う）
+# 配布物に同梱するライセンスの表の読み手と zip の検査（#1850。--check-assets で使う）。
+# 表の正本は scripts/lib/license-bundle.txt。ここに名前を並べない
+# shellcheck source=lib/license-bundle.sh
+source "$REPO_ROOT/scripts/lib/license-bundle.sh"
+
+# set -e と EXIT trap の併用で終了コードが 0 に化けるのを塞ぐ番人（#1864。--promote / --check-assets の後始末で使う）
 # shellcheck source=lib/exit-guard.sh
 source "$REPO_ROOT/scripts/lib/exit-guard.sh"
 
@@ -369,6 +375,70 @@ report_release_completeness() {
   return 1
 }
 
+# report_release_licenses <tag> <work_dir> — 公開済みの zip にライセンスが入っているかを表示（#1850）。
+# 組み立て時の検査（build-app.sh / verify-assets.ps1）と番犬は「CI が組んだ物」しか見ないので、
+# Release に上がった実物を取得して、表（scripts/lib/license-bundle.txt）の全部が入り、
+# **タグ <tag> の元ファイルとバイト一致する**かを見る。1 本でも崩れていれば非 0。
+# Release へは読み取り（gh release download）だけで、取得物は <work_dir> の中で 1 個ずつ消す
+report_release_licenses() {
+  local tag="$1" work="$2" names=() n platform label checked ng=0 bundle_rows
+  local dl="$work/download"
+  bundle_rows=$(tako_license_bundle "$REPO_ROOT") || return 1
+  echo "==> ライセンスの同梱の検査: ${tag}（表 ${TAKO_LICENSE_BUNDLE_TABLE} の $(( $(wc -l <<< "$bundle_rows") )) 本 / 照合先はタグ ${tag} のファイル）"
+
+  # 照合先のタグ。ローカルに無ければ origin から 1 本だけ取る（読み取りのみ・Release には触らない）
+  if ! git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null; then
+    echo "    タグ ${tag} がローカルに無い → origin から取得する"
+    GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" fetch --quiet --no-tags origin \
+      "refs/tags/${tag}:refs/tags/${tag}" >/dev/null 2>&1 || true
+    if ! git -C "$REPO_ROOT" rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null; then
+      echo "    [NG] タグ ${tag} を読めないので照合できない（git fetch --tags の後で再実行する）"
+      return 1
+    fi
+  fi
+
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && names+=("$n")
+  done < <(gh_release_asset_names "$tag")
+
+  mkdir -p "$dl"
+  for platform in $TAKO_ASSET_PLATFORMS; do
+    label=$(tako_asset_label "$platform")
+    checked=0
+    for n in ${names[@]+"${names[@]}"}; do
+      tako_asset_is_for "$n" "$platform" || continue
+      if [[ "$n" != *.zip ]]; then
+        echo "    ${label}: ${n} — インストーラーは中身を見ない（インストール先は CI の Test-TakoInstalledPayload が見る）"
+        continue
+      fi
+      checked=$((checked + 1))
+      echo "    ${label}: ${n}"
+      if ! gh release download "$tag" --pattern "$n" --dir "$dl" >/dev/null 2>&1 || [[ ! -f "$dl/$n" ]]; then
+        echo "      [NG] Release から取得できない（gh release download）"
+        ng=$((ng + 1))
+        continue
+      fi
+      tako_license_check_zip "$dl/$n" "$platform" "$tag" "$REPO_ROOT" "$work/extract" || ng=$((ng + 1))
+      # 数十 MB あるので確かめたらすぐ消す
+      rm -f "${dl:?}/${n:?}"
+    done
+    if [[ $checked -eq 0 ]]; then
+      echo "    [NG] ${label}: zip が無いので中身を確かめられない"
+      ng=$((ng + 1))
+    fi
+  done
+
+  if [[ $ng -eq 0 ]]; then
+    echo "    両 OS の zip にライセンスが揃い、タグ ${tag} のファイルと一致している"
+    return 0
+  fi
+  echo "" >&2
+  echo "警告: ライセンスの同梱が崩れている（${tag}）— 上の [NG] の zip・OS が ${ng} 個" >&2
+  echo "  受け取り手へ本文と著作権表示が渡っていない（GPL-3.0 第 4 条ほか。#1845）。" >&2
+  echo "  組み立ての全箇所は crates/tako-control/tests/license_bundle_watchdog.rs が表と突き合わせる" >&2
+  return 1
+}
+
 # refresh_release_notes <tag> — 実アセットを読み直してノートを作り直す
 refresh_release_notes() {
   local tag="$1" version="${1#v}" names=() notes n
@@ -455,15 +525,22 @@ wait_for_windows_assets() {
   return 0
 }
 
-# --- 公開済みリリースのアセットが両 OS 揃っているかの検査（--check-assets）---
+# --- 公開済みリリースの検査（--check-assets）---
+# 両 OS の配布物が揃っているか（#965）と、zip にライセンスが入っているか（#1850）。
+# どちらかが崩れていれば exit 1。片方が崩れていても、もう片方も最後まで見て報告する
 if [[ -n "$CHECK_ASSETS_TAG" ]]; then
   require_gh
   if ! gh release view "$CHECK_ASSETS_TAG" >/dev/null 2>&1; then
     echo "エラー: リリース $CHECK_ASSETS_TAG が見つからない" >&2
     exit 1
   fi
-  report_release_completeness "$CHECK_ASSETS_TAG"
-  exit $?
+  CHECK_ASSETS_RC=0
+  report_release_completeness "$CHECK_ASSETS_TAG" || CHECK_ASSETS_RC=1
+  echo ""
+  CHECK_ASSETS_WORK=$(mktemp -d "${TMPDIR:-/tmp}/tako-check-assets.XXXXXX")
+  tako_exit_trap 'rm -rf "${CHECK_ASSETS_WORK:?}"' "公開済みリリースの検査（--check-assets）"
+  report_release_licenses "$CHECK_ASSETS_TAG" "$CHECK_ASSETS_WORK" || CHECK_ASSETS_RC=1
+  tako_exit "$CHECK_ASSETS_RC"
 fi
 
 # --- 公開済みリリースのノートを実アセットから作り直す（--update-notes）---
@@ -490,7 +567,8 @@ if [[ -n "$UPDATE_NOTES_TAG" ]]; then
   echo "==> ノートを更新した: $UPDATE_NOTES_TAG"
   # 片肺のまま気付かず終わらないよう、更新のついでに完全性も報告する（#965。exit は変えない）
   report_release_completeness "$UPDATE_NOTES_TAG" || true
-  exit 0
+  # 上の --check-assets が tako_exit_trap を張るので、この後の 0 は印付きで抜ける（#1864 / #1850）
+  tako_exit 0
 fi
 
 # --- ノート生成のドライラン（--notes-only）---
@@ -509,7 +587,7 @@ if [[ $NOTES_ONLY -eq 1 ]]; then
     DRY_NAMES+=("$ZIP_NAME")
   fi
   build_release_notes "$TAG" "$VERSION" "${DRY_NAMES[@]+"${DRY_NAMES[@]}"}"
-  exit 0
+  tako_exit 0
 fi
 
 # --- 昇格（--promote）: テスト版 / 夜間の素のタグを安定版にする（#403 / #1853）----------

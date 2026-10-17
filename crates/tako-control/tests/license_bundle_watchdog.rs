@@ -4,7 +4,7 @@
 //! 本文と著作権表示を渡すことを求める。配布物は OS ごとに別々の場所で組み立てるので、
 //! 1 か所で 1 本抜けても残りは緑のまま出荷される（v0.8.24 がそうだった: macOS の .app は
 //! #1713 で 3 本入ったが、Windows の zip は `LICENSE.txt` だけ）。そこで組み立ての全箇所を
-//! ここで 1 つの表 [`BUNDLE`] へ突き合わせる:
+//! ここで 1 つの表 [`TABLE`]（`scripts/lib/license-bundle.txt`）へ突き合わせる:
 //!
 //! - macOS: `scripts/build-app.sh` が `tako.app/Contents/Resources/` へ**署名より前に**置く
 //!   （リリース zip・Homebrew cask・アプリ内更新はすべてこの .app を配る）
@@ -12,35 +12,67 @@
 //! - Windows のポータブル zip: `installer/windows/build-installer.ps1` が zip の `tako/` へ置く
 //! - Windows のリリース検査: `installer/windows/lib/verify-assets.ps1` の `$TakoLicenseBundle`
 //!   （zip の展開とインストーラーの無人インストールで、3 本が元ファイルと一致するかを見る表）
+//! - 公開後の検査（#1850）: `scripts/release.sh --check-assets` が Release の zip を取得し、
+//!   同じ表を `scripts/lib/license-bundle.sh` 経由で読んで確かめる。**表はこの 1 か所だけ**で、
+//!   シェル側に名前を並べ直すと file:line で名指しして落ちる
 //!
 //! 抜けたときは、置くべき場所の file:line を名指しして落ちる。
 //! 実物の中身は、リリースの作業流れ（`.github/workflows/release-windows.yml`。ブランチから
-//! dispatch するとドライラン）が zip の展開と無人インストールで確かめる。
+//! dispatch するとドライラン）が zip の展開と無人インストールで確かめ、公開後は
+//! `scripts/release.sh --check-assets` が Release の zip で確かめる。
+//!
+//! 表を Rust の定数ではなくデータファイルに置くのは、シェルの検査と番犬が同じ 1 つを読むため
+//! （シェルが Rust のソースを解析すると rustfmt の整形で壊れうるうえ、それを番犬から確かめる
+//! には Windows の CI でも bash を起こす必要がある。データファイルなら両側とも数行で読める）。
 
 use std::path::{Path, PathBuf};
 
+/// 同梱表の正本（1 行 1 本: 元ファイル / Windows での名前）
+const TABLE: &str = "scripts/lib/license-bundle.txt";
+
 /// 同梱する 1 本。`source` はリポジトリ直下の元ファイルで、macOS の .app へはこの名前のまま置く
 struct Entry {
-    source: &'static str,
+    source: String,
     /// Windows の配布物（zip の `tako/`・インストール先の `{app}`）での名前
-    windows_name: &'static str,
+    windows_name: String,
+    /// 表の行（1 始まり。名指しに使う）
+    line: usize,
 }
 
-/// 同梱する 3 本（正本）。LICENSE は Windows ではメモ帳で開けるよう `.txt` を付ける
-const BUNDLE: &[Entry] = &[
-    Entry {
-        source: "LICENSE",
-        windows_name: "LICENSE.txt",
-    },
-    Entry {
-        source: "THIRD-PARTY-NOTICES.md",
-        windows_name: "THIRD-PARTY-NOTICES.md",
-    },
-    Entry {
-        source: "THIRD-PARTY-LICENSES.md",
-        windows_name: "THIRD-PARTY-LICENSES.md",
-    },
-];
+/// 表 [`TABLE`] を読む。崩れた行・重複は file:line で名指しして落ちる
+fn bundle() -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    for (i, raw) in read(TABLE).lines().enumerate() {
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = t.split_whitespace().collect();
+        let [source, windows_name] = cols.as_slice() else {
+            panic!(
+                "{TABLE}:{}: 「元ファイル Windows での名前」の 2 列になっていない: {t}",
+                i + 1
+            );
+        };
+        if let Some(dup) = entries
+            .iter()
+            .find(|e| e.source == *source || e.windows_name == *windows_name)
+        {
+            panic!(
+                "{TABLE}:{}: {source} / {windows_name} が {TABLE}:{} と重なっている",
+                i + 1,
+                dup.line
+            );
+        }
+        entries.push(Entry {
+            source: source.to_string(),
+            windows_name: windows_name.to_string(),
+            line: i + 1,
+        });
+    }
+    assert!(!entries.is_empty(), "{TABLE} に 1 本も無い");
+    entries
+}
 
 const BUILD_APP: &str = "scripts/build-app.sh";
 const ISS: &str = "installer/windows/tako.iss";
@@ -48,6 +80,8 @@ const BUILD_INSTALLER: &str = "installer/windows/build-installer.ps1";
 const VERIFY_ASSETS: &str = "installer/windows/lib/verify-assets.ps1";
 const RELEASE_WINDOWS_PS1: &str = "installer/windows/release-windows.ps1";
 const RELEASE_WINDOWS_YML: &str = ".github/workflows/release-windows.yml";
+const RELEASE_SH: &str = "scripts/release.sh";
+const LICENSE_LIB: &str = "scripts/lib/license-bundle.sh";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -100,7 +134,7 @@ fn unquote(s: &str) -> &str {
 fn assert_no_problems(problems: Vec<String>) {
     assert!(
         problems.is_empty(),
-        "ライセンスの同梱が崩れている（Issue #1845）:\n{}",
+        "ライセンスの同梱が崩れている（Issue #1845 / #1850）:\n{}",
         problems.join("\n")
     );
 }
@@ -108,12 +142,13 @@ fn assert_no_problems(problems: Vec<String>) {
 #[test]
 fn 同梱する3本がリポジトリ直下にある() {
     let mut problems = Vec::new();
-    for e in BUNDLE {
-        let path = repo_root().join(e.source);
+    for e in &bundle() {
+        let path = repo_root().join(&e.source);
+        let at = format!("{TABLE}:{}", e.line);
         match std::fs::metadata(&path) {
             Ok(m) if m.is_file() && m.len() > 0 => {}
-            Ok(_) => problems.push(format!("{}: 空、またはファイルではない", e.source)),
-            Err(err) => problems.push(format!("{}: 読めない（{err}）", e.source)),
+            Ok(_) => problems.push(format!("{at}: {} が空、またはファイルではない", e.source)),
+            Err(err) => problems.push(format!("{at}: {} を読めない（{err}）", e.source)),
         }
     }
     assert_no_problems(problems);
@@ -131,7 +166,7 @@ fn macosのappが3本をresourcesへ署名より前に置く() {
         .unwrap_or_else(|| panic!("{BUILD_APP} に codesign が無い"));
 
     let mut problems = Vec::new();
-    for e in BUNDLE {
+    for e in &bundle() {
         let dest_file = format!("$APP/Contents/Resources/{}", e.source);
         let placed = find_line(&lines, |l| {
             let words: Vec<&str> = l.split_whitespace().collect();
@@ -193,7 +228,7 @@ fn windowsのインストーラーが3本をappへ置く() {
         .unwrap_or(lines.len());
 
     let mut problems = Vec::new();
-    for e in BUNDLE {
+    for e in &bundle() {
         let want_source = format!("{{#RepoRoot}}\\{}", e.source);
         let hit = (section..section_end).find_map(|i| {
             let params = iss_params(&lines[i]);
@@ -215,7 +250,7 @@ fn windowsのインストーラーが3本をappへ置く() {
             continue;
         };
         let get = |key: &str| iss_param(&params, key);
-        let name = get("destname").unwrap_or(e.source);
+        let name = get("destname").unwrap_or(e.source.as_str());
         if get("destdir") != Some("{app}") || name != e.windows_name {
             problems.push(format!(
                 "{ISS}:{n}: {src} の置き先が違う（期待: DestDir \"{{app}}\" / 名前 {want}。\
@@ -249,7 +284,7 @@ fn windowsのzipが3本をtakoへ置く() {
         .unwrap_or_else(|| panic!("{BUILD_INSTALLER} に Compress-Archive が無い"));
 
     let mut problems = Vec::new();
-    for e in BUNDLE {
+    for e in &bundle() {
         let from = format!("(Join-Path $repoRoot '{}')", e.source);
         let to = format!("-Destination (Join-Path $payload '{}')", e.windows_name);
         let copies = |l: &str| l.contains("Copy-Item") && l.contains(&from);
@@ -308,25 +343,29 @@ fn windowsのリリース検査の表が3本と一致する() {
         }
         table.push((i + 1, k.to_string(), v.to_string()));
     }
-    for e in BUNDLE {
-        match table.iter().find(|(_, k, _)| k == e.windows_name) {
+    let entries = bundle();
+    for e in &entries {
+        match table.iter().find(|(_, k, _)| *k == e.windows_name) {
             None => problems.push(format!(
-                "{VERIFY_ASSETS}:{anchor}: $TakoLicenseBundle に '{name}' = '{src}' が無い",
+                "{VERIFY_ASSETS}:{anchor}: $TakoLicenseBundle に '{name}' = '{src}' が無い\
+                 （{TABLE}:{line} の行）",
                 name = e.windows_name,
-                src = e.source
+                src = e.source,
+                line = e.line
             )),
-            Some((n, _, v)) if v != e.source => problems.push(format!(
-                "{VERIFY_ASSETS}:{n}: '{name}' の元ファイルが {v}（期待 {src}）",
+            Some((n, _, v)) if *v != e.source => problems.push(format!(
+                "{VERIFY_ASSETS}:{n}: '{name}' の元ファイルが {v}（期待 {src} = {TABLE}:{line}）",
                 name = e.windows_name,
-                src = e.source
+                src = e.source,
+                line = e.line
             )),
             Some(_) => {}
         }
     }
     for (n, k, _) in &table {
-        if !BUNDLE.iter().any(|e| e.windows_name == k) {
+        if !entries.iter().any(|e| e.windows_name == *k) {
             problems.push(format!(
-                "{VERIFY_ASSETS}:{n}: '{k}' はこの番犬の表 BUNDLE に無い（足すなら BUNDLE と組み立ての全箇所へ）"
+                "{VERIFY_ASSETS}:{n}: '{k}' は同梱表 {TABLE} に無い（足すなら表と組み立ての全箇所へ）"
             ));
         }
     }
@@ -363,4 +402,125 @@ fn windowsのリリース検査の表が3本と一致する() {
         ));
     }
     assert_no_problems(problems);
+}
+
+/// `name` が 1 語として現れるか（前後がファイル名の文字ではない。`TAKO_LICENSE_…` や
+/// `THIRD-PARTY-LICENSES.md` の中の `LICENSE` は数えない）
+fn has_name_token(line: &str, name: &str) -> bool {
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let step = name.chars().next().map_or(1, char::len_utf8);
+    let mut from = 0;
+    while let Some(off) = line[from..].find(name) {
+        let start = from + off;
+        let end = start + name.len();
+        let before = line[..start].chars().next_back();
+        let after = line[end..].chars().next();
+        if !before.is_some_and(name_char) && !after.is_some_and(name_char) {
+            return true;
+        }
+        from = start + step;
+    }
+    false
+}
+
+/// `start` 行（1 始まり）から始まる塊の終わり（行頭が `end` の最初の行。1 始まり）
+fn block_end(lines: &[String], start: usize, end: &str) -> usize {
+    (start..lines.len())
+        .find(|&i| lines[i].trim_end() == end)
+        .map_or(lines.len(), |i| i + 1)
+}
+
+#[test]
+fn 公開後のzipの検査は同じ表を読み名前を直書きしない() {
+    let entries = bundle();
+    let mut problems = Vec::new();
+
+    // 読み手が表 TABLE を指している
+    let lib = code_lines(LICENSE_LIB, "#");
+    let quoted_table = format!("\"{TABLE}\"");
+    if find_line(&lib, |l| l.contains(&quoted_table)).is_none() {
+        problems.push(format!(
+            "{LICENSE_LIB}:1: 同梱表 {TABLE} を読んでいない（TAKO_LICENSE_BUNDLE_TABLE={quoted_table} が無い）"
+        ));
+    }
+
+    // 2 か所目の表を作らない: シェル側のコード（コメントを除く）に名前を直書きしない
+    for rel in [LICENSE_LIB, RELEASE_SH] {
+        for (i, l) in code_lines(rel, "#").iter().enumerate() {
+            for e in &entries {
+                let mut names = vec![e.source.as_str()];
+                if e.windows_name != e.source {
+                    names.push(e.windows_name.as_str());
+                }
+                for name in names {
+                    if has_name_token(l, name) {
+                        problems.push(format!(
+                            "{rel}:{}: 同梱するライセンスの名前 {name} を直書きしている。表は {TABLE}:{} の 1 か所だけ\
+                             （tako_license_bundle で読む）: {}",
+                            i + 1,
+                            e.line,
+                            l.trim()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // release.sh --check-assets が読み手を source し、公開済みの zip の検査を呼んでいる
+    let rel = code_lines(RELEASE_SH, "#");
+    if find_line(&rel, |l| {
+        l.trim_start().starts_with("source ") && l.contains("scripts/lib/license-bundle.sh")
+    })
+    .is_none()
+    {
+        problems.push(format!(
+            "{RELEASE_SH}:1: {LICENSE_LIB} を source していない"
+        ));
+    }
+    match find_line(&rel, |l| l.contains("if [[ -n \"$CHECK_ASSETS_TAG\" ]]")) {
+        None => problems.push(format!("{RELEASE_SH}:1: --check-assets の分岐が無い")),
+        Some(start) => {
+            let end = block_end(&rel, start, "fi");
+            if !rel[start..end]
+                .iter()
+                .any(|l| l.contains("report_release_licenses"))
+            {
+                problems.push(format!(
+                    "{RELEASE_SH}:{start}: --check-assets が公開済みの zip のライセンス検査（report_release_licenses）を呼んでいない"
+                ));
+            }
+        }
+    }
+    match find_line(&rel, |l| l.starts_with("report_release_licenses()")) {
+        None => problems.push(format!(
+            "{RELEASE_SH}:1: report_release_licenses が定義されていない"
+        )),
+        Some(start) => {
+            let end = block_end(&rel, start, "}");
+            if !rel[start..end]
+                .iter()
+                .any(|l| l.contains("tako_license_check_zip"))
+            {
+                problems.push(format!(
+                    "{RELEASE_SH}:{start}: report_release_licenses が zip を表と照合していない（tako_license_check_zip）"
+                ));
+            }
+        }
+    }
+    assert_no_problems(problems);
+}
+
+#[test]
+fn 語の照合はファイル名の一部を数えない() {
+    assert!(has_name_token("cp LICENSE \"$x\"", "LICENSE"));
+    assert!(has_name_token(
+        "x=$APP/Contents/Resources/LICENSE",
+        "LICENSE"
+    ));
+    assert!(has_name_token("'LICENSE.txt'", "LICENSE.txt"));
+    assert!(!has_name_token("TAKO_LICENSE_BUNDLE_TABLE=x", "LICENSE"));
+    assert!(!has_name_token("THIRD-PARTY-LICENSES.md", "LICENSE"));
+    assert!(!has_name_token("LICENSE.txt", "LICENSE"));
+    assert!(!has_name_token("LICENSES", "LICENSE"));
 }
