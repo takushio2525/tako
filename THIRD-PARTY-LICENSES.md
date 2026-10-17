@@ -1,7 +1,7 @@
 # サードパーティのライセンス / Third-Party Licenses
 
 <!-- このファイルは生成物。手で直さない（Issue #1709）。
-     再生成: cargo about generate --fail about.hbs -o THIRD-PARTY-LICENSES.md
+     再生成: bash scripts/third-party-licenses.sh（CI が --check で依存とのずれを落とす。#1851）
      設定は about.toml（対象: aarch64-apple-darwin / x86_64-pc-windows-msvc、
      dev / build 依存は除外）。 -->
 
@@ -21,7 +21,7 @@ are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 | ライセンス / License | 件数 / Count |
 |---|---|
-| MIT License | 481 |
+| MIT License | 485 |
 | Apache License 2.0 | 30 |
 | Unicode License v3 | 19 |
 | ISC License | 18 |
@@ -8791,6 +8791,36 @@ SOFTWARE.
 
 使用しているクレート / Used by:
 
+- [fluent-uri 0.1.4](https://github.com/yescallop/fluent-uri-rs)
+
+```text
+MIT License
+
+Copyright (c) 2021 Scallop Ye
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### MIT License
+
+使用しているクレート / Used by:
+
 - [flume 0.11.1](https://github.com/zesterer/flume)
 - [rustc-hash 2.1.3](https://github.com/rust-lang/rustc-hash)
 
@@ -8879,6 +8909,7 @@ DEALINGS IN THE SOFTWARE.
 - [serde_derive_internals 0.29.1](https://github.com/serde-rs/serde)
 - [serde_json 1.0.150](https://github.com/serde-rs/json)
 - [serde_json_lenient 0.2.4](https://github.com/google/serde_json_lenient)
+- [serde_repr 0.1.20](https://github.com/dtolnay/serde-repr)
 - [serde_yaml 0.9.34+deprecated](https://github.com/dtolnay/serde-yaml)
 - [smol 2.0.2](https://github.com/smol-rs/smol)
 - [smol_str 0.3.6](https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str)
@@ -9181,6 +9212,7 @@ THE SOFTWARE.
 - [byteorder-lite 0.1.0](https://github.com/image-rs/byteorder-lite)
 - [byteorder 1.5.0](https://github.com/BurntSushi/byteorder)
 - [globset 0.4.18](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset)
+- [ignore 0.4.26](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore)
 - [memchr 2.8.3](https://github.com/BurntSushi/memchr)
 - [walkdir 2.5.0](https://github.com/BurntSushi/walkdir)
 
@@ -9524,6 +9556,38 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+```
+
+### MIT License
+
+使用しているクレート / Used by:
+
+- [lsp-types 0.97.0](https://github.com/gluon-lang/lsp-types)
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2016 Markus Westerlind
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
 
 ```
 

@@ -13,7 +13,8 @@
 #      取りに行く・取れないとき / 想定外のイベントは走らせる側
 #   C. docs を読む番犬の拾い方（コメントだけの言及は拾わない・錨が拾えなければ止まる）
 #   D. ci.yml の配線（docs の検査は毎回走る docs ジョブにだけある・macOS / Windows は
-#      rust=true のときだけ・番犬ジョブは毎回 ubuntu で）
+#      rust=true のときだけ・番犬ジョブは毎回 ubuntu で・ライセンス一覧の検査は rust=true の
+#      ときだけ ubuntu で = #1851）
 #   E. 本物の ci.yml から scripts/wait-pr-checks.sh が導く期待名に新しいジョブが入る
 # 検出力: 判定・配線を壊した写しを作り、同じ検査が落ちることも確かめる
 set -uo pipefail
@@ -280,11 +281,16 @@ job_ids() {
 # 配線の検査。問題を 1 行 1 件で出す（何も出なければ合格）
 wiring_problems() {
   local yml="$1" body id step
-  for id in macos windows; do
+  for id in macos windows licenses; do
     body="$(job_body "${yml}" "${id}")"
     grep -qE '^    needs: changes[ \t]*$' <<<"${body}" || echo "${id}: needs: changes が無い"
     grep -qF "if: needs.changes.outputs.rust == 'true'" <<<"${body}" || echo "${id}: rust=true のときだけ走る if が無い"
   done
+  # ライセンス一覧の検査は ubuntu で 1 回（cargo-about は about.toml の targets で両 OS ぶんを出す。
+  # macOS / Windows の列に足すと最長の列が伸びる）。#1851
+  body="$(job_body "${yml}" licenses)"
+  grep -qE '^    runs-on: ubuntu-latest[ \t]*$' <<<"${body}" || echo "licenses: ubuntu で走らない（macOS / Windows の列に並ぶ）"
+  grep -qF 'bash scripts/third-party-licenses.sh --check' <<<"${body}" || echo "licenses: third-party-licenses.sh --check を呼んでいない"
   # docs を読む番犬は毎回・ubuntu（macOS の列に並ばない / Linux で組めることをコードの PR で守る）
   body="$(job_body "${yml}" docs-watchdogs)"
   grep -qE '^    (if|needs):' <<<"${body}" && echo "docs-watchdogs: 判定で止まる（if / needs がある）"
@@ -312,7 +318,7 @@ wiring_problems() {
 }
 probs="$(wiring_problems "${CI_YML}")"
 assert_eq "本物の ci.yml の配線に問題が無い" "${probs}" ""
-assert_eq "job は changes / docs / docs-watchdogs / macos / windows" "$(job_ids "${CI_YML}" | tr '\n' ' ')" "changes docs docs-watchdogs macos windows "
+assert_eq "job は changes / docs / docs-watchdogs / macos / windows / licenses" "$(job_ids "${CI_YML}" | tr '\n' ' ')" "changes docs docs-watchdogs macos windows licenses "
 
 echo "== D 検出力: 壊した写しを配線の検査が名指しする =="
 # macOS ジョブの if を消す
@@ -346,16 +352,22 @@ probs="$(wiring_problems "${TMP}/ci-dw-macos.yml")"
 assert_has "（注入）番犬ジョブが判定で止まることを名指しする" "docs-watchdogs: 判定で止まる" "${probs}"
 assert_has "（注入）番犬ジョブが macOS の列に並ぶことを名指しする" "docs-watchdogs: ubuntu で走らない" "${probs}"
 
+# ライセンス一覧の検査を外す（#1851 の前の形）
+grep -vF 'bash scripts/third-party-licenses.sh --check' "${CI_YML}" > "${TMP}/ci-nolicenses.yml"
+probs="$(wiring_problems "${TMP}/ci-nolicenses.yml")"
+assert_has "（注入）ライセンス一覧の検査が無いことを名指しする" "licenses: third-party-licenses.sh --check を呼んでいない" "${probs}"
+
 echo "== E: 本物の ci.yml から待ちスクリプトが導く期待名 =="
 mkdir -p "${TMP}/ghbin"
 printf '#!/usr/bin/env bash\necho "no checks reported on the '"'"'x'"'"' branch" >&2\nexit 1\n' > "${TMP}/ghbin/gh"
 chmod +x "${TMP}/ghbin/gh"
 out="$(PATH="${TMP}/ghbin:${PATH}" bash "${REPO_ROOT}/scripts/wait-pr-checks.sh" 2084 --timeout 0 --interval 1 2>&1)"
 for name in "変更範囲の判定（#2084）" "docs（ビルド + 検査）" "docs / .agent を読む Rust の番犬（ubuntu。#2084）" \
-  "macOS（build + lint + test）" "Windows（build + test スモーク）" "Cloudflare Pages"; do
+  "macOS（build + lint + test）" "Windows（build + test スモーク）" "ライセンス一覧が依存と一致（#1851）" \
+  "Cloudflare Pages"; do
   assert_has "期待名: ${name}" "期待: ${name}" "${out}"
 done
-assert_eq "期待は 6 本" "$(grep -c '^  期待: ' <<<"${out}" | tr -d ' ')" "6"
+assert_eq "期待は 7 本" "$(grep -c '^  期待: ' <<<"${out}" | tr -d ' ')" "7"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="

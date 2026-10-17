@@ -3298,6 +3298,9 @@ Windows（約 30 分）を回した。macOS のランナーは同時に数本し
 - **docs の検査（astro build・OG・内部リンク・SEO・転送と配信ヘッダ・追跡先の Issue・
   リリースノートのページ）は毎回走る `docs` ジョブ（ubuntu）にだけ置く**。macOS ジョブへ
   戻すと docs だけの PR で一緒に skip される
+- ライセンス一覧の検査（`licenses` ジョブ・ubuntu。#1851）は macOS / Windows と同じく判定で skip する。
+  依存（`Cargo.*`）も `THIRD-PARTY-LICENSES.md` も docs/ と .agent/ の外なので、触れば必ず走る。
+  仕組みは `.agent/release.md`「配布物に同梱するライセンス」
 - push（main）も同じ判定で skip する。docs だけのコミットは直前の main と Rust の入力が同じ
   なので、full を回しても新しく見るものが無い（docs の検査と番犬は main でも走る）
 - 検証は `bash scripts/test-ci-change-scope-2084.sh`（`changes` ジョブの最初のステップ。
