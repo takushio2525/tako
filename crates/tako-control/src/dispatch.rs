@@ -2935,6 +2935,11 @@ pub enum OffloadJob {
     /// 環境の健全性診断（#1441 / #1505）。workspace の要約と DPI だけ UI スレッドで採り、
     /// **エージェント CLI への問い合わせ（実測 10.8 秒）は background へ出す**
     CheckHealth { ctx: CheckHealthCtx },
+    /// `tako mod`（status）（#1891）。ペインの行までは UI スレッドで組み、設定 dir ごとの skills/tako の
+    /// 読みと報告の無い claude の調べ（コマンド行と起動時の env）は background で行う
+    ModStatus {
+        ctx: Box<crate::claude_mod::StatusCtx>,
+    },
     /// ファイルツリーの git ステータス（#1009）。
     /// ルートの解決は UI スレッドで済ませ、`git` の実行だけをここへ出す
     TreeGitStatus {
@@ -3416,6 +3421,17 @@ pub fn prepare_offload(
         Request::CheckHealth => Some(Ok(OffloadJob::CheckHealth {
             ctx: collect_check_health_ctx(host),
         })),
+        // #1891: `tako mod`（status）の skills の読みと報告の無い claude の調べを UI スレッドで待たない。
+        // A/B の `TAKO_1891_LEGACY=1` は修正前と同じく同期の腕（調べない）
+        Request::Mod { action, .. }
+            if matches!(action.as_deref(), None | Some("status"))
+                && !tako_core::claude_mod::no_report_legacy() =>
+        {
+            Some(
+                crate::claude_mod::status_ctx(host)
+                    .map(|ctx| OffloadJob::ModStatus { ctx: Box::new(ctx) }),
+            )
+        }
         // #1979: `tako list` の器の採り直し（`tmux list-windows -a`）を UI スレッドで待たない。
         // 採り直しが要らない（使い回せる・器のペインが無い）ときは `None` = 同期の腕で組む
         // （そのときの腕は子プロセスを起こさない）。A/B の `TAKO_1979_LEGACY=1` は修正前と同じ
@@ -3953,6 +3969,9 @@ impl OffloadJob {
             OffloadJob::GitDiff { cwd, target } => run_git_diff(&cwd, target.as_deref()),
             OffloadJob::GitShow { cwd, hash, file } => run_git_show(&cwd, &hash, file.as_deref()),
             OffloadJob::CheckHealth { ctx } => Ok(finish_check_health(&ctx)),
+            OffloadJob::ModStatus { ctx } => {
+                Ok(crate::claude_mod::finish_status_in_background(*ctx))
+            }
             OffloadJob::TreeGitStatus { tab, roots, limit } => {
                 Ok(tree_git_status_payload(tab, &roots, limit))
             }
@@ -18223,6 +18242,9 @@ pub struct CheckHealthCtx {
     /// ペインごとの文字コード固定の記録（#2092。門を持つペイン = Windows だけ）。
     /// 記録の写しを採るだけ（ロック 1 回）で、いまのコードページの読み直しは background で行う
     encoding_pins: Vec<(u64, tako_core::encoding_pin::PinReport)>,
+    /// tako mod の材料（#1891。`tako mod` と同じ UI スレッドの段 = `claude_mod::status_ctx`）。
+    /// `Err` は mod を扱わない tako の理由、`None` は A/B（`TAKO_1891_LEGACY=1` = 節を載せない）
+    claude_mod: Option<Result<Box<crate::claude_mod::StatusCtx>, String>>,
 }
 
 /// `tako lsp` / MCP `tako_lsp_server` の action（#1678）。CLI と MCP はこの綴りを共有する
@@ -18522,6 +18544,11 @@ fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
                 Some((pane.id().as_u64(), report))
             })
             .collect(),
+        claude_mod: (!tako_core::claude_mod::no_report_legacy()).then(|| {
+            crate::claude_mod::status_ctx(host)
+                .map(Box::new)
+                .map_err(|e| e.to_string())
+        }),
     }
 }
 
@@ -18694,6 +18721,22 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         tako_core::platform::console::read_pane_code_pages,
     );
 
+    // tako mod（#1891）: 注入の可否と理由・報告の無い claude のペインと理由・設定 dir ごとの skills/tako。
+    // **判定は持たない**: `tako mod`（status）と同じ 2 段（`status_ctx` → `finish_status_in_background`）の
+    // 応答から同じキーを写す（`health_section`）。mod を扱わない tako は理由つきの不明
+    let claude_mod = ctx.claude_mod.as_ref().map(|prepared| match prepared {
+        Ok(status) => crate::claude_mod::health_section(
+            &crate::claude_mod::finish_status_in_background((**status).clone()),
+        ),
+        Err(reason) => crate::claude_mod::health_unavailable(reason),
+    });
+    issues.extend(
+        claude_mod
+            .as_ref()
+            .map(crate::claude_mod::health_issues)
+            .unwrap_or_default(),
+    );
+
     // ワークスペースの状態サマリ（UI スレッドで採った値）
     let tab_count = ctx.tabs;
     let pane_count = ctx.panes;
@@ -18739,6 +18782,9 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         // `items[].key` が安定した機械キーで、`items[].lines` は `--check` が
         // そのまま表示する行。`remaining` は人の手が要る残り作業
         "diagnostics": diagnostics.to_json(),
+        // #1891: tako mod（`tako mod --json` と同じキー。行は報告の中身を除く）。
+        // `available=false` なら `reason.message` が分からない理由
+        "claude_mod": claude_mod,
         "workspace": {
             "tabs": tab_count,
             "panes": pane_count,

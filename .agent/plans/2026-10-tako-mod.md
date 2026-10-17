@@ -630,6 +630,14 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   消えていた」になる。`tako mod status` / `check-health` に「claude を起動したのに 60 秒報告が
   無い」ペインを出す（S1）。validate / test は夜間リリースの前段で毎晩回し、落ちたら通知する
   （#1892。前回合格した claude の版と比べて「Claude Code の更新で壊れた」かを出し分ける）
+  - **#1891 で着地**（S1 では `tako mod` だけだった）: `check-health` の `claude_mod` 節は `tako mod --json` と
+    同じキー・同じ値で、判定は `tako mod`（status）の 2 段（UI スレッドの `status_ctx` → 背景の
+    `finish_status_in_background`）から写すだけ（FR-2.42.54）。報告の無いペインの理由は候補の羅列をやめ、
+    背景の段がペインの claude のコマンド行と起動時の env を調べて 1 つに決める（`reason.cause` =
+    `safe_mode` / `bare` / `before_injection` / `not_loaded` / `undetermined`。上限 8 ペイン・macOS だけ）。
+    10/9 の実測（GUI 再起動直後の既存ペインがすべて 5 択）は env に印が無いので `before_injection` になる。
+    `disableAllHooks` と組織の `allowManagedModsOnly` は見分けない（設定の層が cwd に依る・後者は未実測 = §9.9）ので
+    `not_loaded` にまとめる
 - 版 2.1.287〜2.1.293 は未実測（下限を 2.1.294 にした理由）
 - Windows の Claude Code で mod（と `CLAUDE_CODE_PLUGIN_DIRS` の `;` 区切り）が動くかは未実測
 - desktop / VS Code 拡張 / Remote Control の surface は未実測（tako のペインは terminal だけなので

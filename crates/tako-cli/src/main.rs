@@ -7423,6 +7423,12 @@ fn check_health_cli(json: bool) -> Result<(), String> {
             // #1505: 届かなくても**環境診断は答えられる**（項目の正本は tako-control 側で、
             // GUI を要らない）。ここで黙ると「tako が起動していないと何も分からない」に戻る
             let diagnostics = tako_control::diagnostics::collect();
+            // #1891: tako mod の項目は GUI のメモリにしか無いので、理由つきの不明（A/B では載せない）
+            let claude_mod = (!tako_core::claude_mod::no_report_legacy()).then(|| {
+                tako_control::claude_mod::health_unavailable(&format!(
+                    "tako アプリへ届かない（{reason}）"
+                ))
+            });
             if json {
                 println!(
                     "{}",
@@ -7431,6 +7437,7 @@ fn check_health_cli(json: bool) -> Result<(), String> {
                         "reason": reason,
                         "ipc": local,
                         "diagnostics": diagnostics.to_json(),
+                        "claude_mod": claude_mod,
                     }))
                 );
             } else {
@@ -7438,6 +7445,9 @@ fn check_health_cli(json: bool) -> Result<(), String> {
                 print_ipc_section(&local);
                 for line in diagnostics.lines() {
                     println!("{line}");
+                }
+                if let Some(section) = &claude_mod {
+                    print_check_health_mod(section);
                 }
             }
             Err("tako アプリへ届かない（上の ipc 節が受け口の実測）".into())
@@ -7973,6 +7983,10 @@ fn print_check_health(result: &Value) {
     {
         println!("{line}");
     }
+    // #1891: tako mod の項目（`tako mod` と同じ関数で同じ字面。A/B では節が無い）
+    if let Some(section) = result.get("claude_mod").filter(|v| v.is_object()) {
+        print_check_health_mod(section);
+    }
     for issue in result["issues"].as_array().into_iter().flatten() {
         println!(
             "[{}] {}: {}",
@@ -7980,6 +7994,24 @@ fn print_check_health(result: &Value) {
             issue["check"].as_str().unwrap_or("?"),
             issue["message"].as_str().unwrap_or(""),
         );
+    }
+}
+
+/// `tako check-health` の tako mod の項目（#1891）。行はすべて `tako mod` が出す行と同じ字面
+/// （1 行目・設定 dir ごとの skills/tako・報告が届いていないペインの理由）
+fn print_check_health_mod(section: &Value) {
+    println!(
+        "{}",
+        tako_control::claude_mod::text::injection_line(section)
+    );
+    if section["skills"]["targets"].is_array() {
+        println!("Claude Code の設定 dir（skills/tako）:");
+        print_mod_skills(&section["skills"]);
+    }
+    for row in section["panes"].as_array().into_iter().flatten() {
+        if let Some(line) = tako_control::claude_mod::text::reason_line(row) {
+            println!("{line}");
+        }
     }
 }
 
@@ -8760,12 +8792,8 @@ fn print_mod(args: &ModArgs, result: &Value) {
         println!("{result}");
         return;
     }
-    let reason = result["reason"]["message"].as_str();
-    match (result["injecting"].as_bool(), reason) {
-        (Some(true), _) => println!("tako mod: 新しく作るペインへ注入する"),
-        (_, Some(reason)) => println!("tako mod: 注入しない（{reason}）"),
-        _ => println!("tako mod: 注入しない"),
-    }
+    // #1891: 1 行目と理由の行は `tako check-health` と同じ関数（字面が一致する）
+    println!("{}", tako_control::claude_mod::text::injection_line(result));
     println!(
         "claude {}（下限 {}）/ mod {} / 展開 {}",
         result["claude_version"].as_str().unwrap_or("未判定"),
@@ -8865,8 +8893,12 @@ fn print_mod(args: &ModArgs, result: &Value) {
                 report["model"].as_str().unwrap_or("-"),
                 report["age_ms"].as_u64().unwrap_or(0) / 1000,
             );
-        } else if let Some(reason) = row["reason"]["message"].as_str() {
-            println!("  pane {pane}  {state}  {reason}");
+            // #1891: 報告はあるが失効した・休眠した行は、理由も `tako check-health` と同じ字面で出す
+            if let Some(line) = tako_control::claude_mod::text::reason_line(row) {
+                println!("{line}");
+            }
+        } else if let Some(line) = tako_control::claude_mod::text::reason_line(row) {
+            println!("{line}");
         } else {
             println!("  pane {pane}  {state}");
         }

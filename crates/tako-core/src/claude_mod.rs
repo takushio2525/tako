@@ -36,6 +36,9 @@
 //!   チャットを mod が持つと決まれば（[`chat_owner`]）GPUI のチャットビューの代わりにターミナル表示
 //!   （= mod の描いた本物の Claude Code）を出す。`chat.place = auto` の GUI モードでの持ち主は
 //!   **判断点**（#1964 の受け入れ 4）が決まるまで tako（[`AUTO_CHAT_OWNER_GUI`]）
+//! - **報告の無い claude の理由（#1891）**: [`classify_no_report`] が材料（[`NoReportEvidence`] =
+//!   ペインの claude のコマンド行と起動時の env）から候補を並べずに 1 つに決める。材料は `tako mod` と
+//!   `tako check-health` の背景の段が同じ 1 実装で採る（tako-control の `claude_mod`）
 //!
 //! このモジュールは**純関数と素のデータだけ**を持つ（GUI 非依存。判断はここで閉じ、
 //! tako-app は値を渡して結果を env へ足すだけにする）。
@@ -89,6 +92,9 @@ pub const MONITOR_LEGACY_ENV: &str = "TAKO_2017_LEGACY";
 /// #2041 の A/B（同一バイナリで修正前 = GUI モードのチャット表示は mod の報告の有無にかかわらず
 /// 全アカウントを走査し、worker_status はレジストリの古い会話 ID を名指しして走査し続ける）
 pub const SESSION_LEGACY_ENV: &str = "TAKO_2041_LEGACY";
+/// #1891 の A/B（同一バイナリで修正前 = 報告の無い claude のペインを調べず候補を並べ、
+/// `tako check-health` に mod の節を載せない）
+pub const NO_REPORT_LEGACY_ENV: &str = "TAKO_1891_LEGACY";
 /// 報告の契約の版（`register.ts` / `types/index.d.ts` の `schema`）
 pub const SCHEMA: u32 = 1;
 /// 帯・サイドバーを描かない A/B の入口（S3 #1881）。報告の受け取りと一次ソース化（S1 / S2）は
@@ -480,6 +486,11 @@ pub fn monitor_legacy() -> bool {
 /// #2041 の A/B（[`SESSION_LEGACY_ENV`]）が立っているか
 pub fn session_legacy() -> bool {
     std::env::var_os(SESSION_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// #1891 の A/B（[`NO_REPORT_LEGACY_ENV`]）が立っているか
+pub fn no_report_legacy() -> bool {
+    std::env::var_os(NO_REPORT_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
 /// 一覧の 1 項目が tako の mod の置き場か（どのインスタンスの data dir でも）。
@@ -911,6 +922,119 @@ impl ModUnavailable {
             ModUnavailable::NotInjected(reason) => reason.describe(),
         }
     }
+}
+
+// --- 報告の無い claude の理由（#1891） -------------------------------------------
+
+/// 報告の無い claude を調べるペインの上限（#1891）。調べるのは `tako mod` / `check-health` の背景の段で、
+/// 1 回の走査（プロセスの表 + 器の `list-panes -a`）を共有してペインごとに argv と起動時の env を読む。
+/// 上限は「固まった GUI の切り分けにも使う `check-health` を、ペインの多い機で遅くしない」ため
+pub const NO_REPORT_PROBE_LIMIT: usize = 8;
+
+/// 報告の無い claude を調べた材料（#1891。背景の段が実プロセスから採る）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NoReportEvidence {
+    /// ペインの claude のコマンド行（空白で繋いだもの。見つからない・読めない環境では `None`）
+    pub argv: Option<String>,
+    /// claude の**起動時**の env に、この tako の展開先を含む [`PLUGIN_DIRS_ENV`] があったか。
+    /// 読めない（claude のプロセスが見つからない・Apple のプラットフォームバイナリ・macOS 以外）なら `None`
+    pub injected_env: Option<bool>,
+}
+
+/// 報告の無い claude の理由（#1891。候補を並べず、材料から 1 つに決める）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoReportCause {
+    /// `claude --safe-mode`（mod を読まない）
+    SafeMode,
+    /// `claude --bare`（mod を読まない）
+    Bare,
+    /// 起動時の env に注入の印が無い = 注入より前から動いていた claude（tako の再起動前から等）
+    BeforeInjection,
+    /// 注入は届いているのに報告が無い（設定・組織のポリシー・mod の読み込みの失敗のどれか）
+    NotLoaded,
+    /// 調べられなかった（上限の外・A/B・claude のプロセスが見つからない・macOS 以外）
+    Undetermined,
+}
+
+impl NoReportCause {
+    pub fn code(self) -> &'static str {
+        match self {
+            NoReportCause::SafeMode => "safe_mode",
+            NoReportCause::Bare => "bare",
+            NoReportCause::BeforeInjection => "before_injection",
+            NoReportCause::NotLoaded => "not_loaded",
+            NoReportCause::Undetermined => "undetermined",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            NoReportCause::SafeMode => {
+                "claude が --safe-mode で起動されていて mod を読まない（--safe-mode を外して起動し直せば載る）"
+            }
+            NoReportCause::Bare => {
+                "claude が --bare で起動されていて mod を読まない（--bare を外して起動し直せば載る）"
+            }
+            NoReportCause::BeforeInjection => {
+                "注入より前から動いていた claude（起動時の環境に tako の注入の印が無い）。\
+                 新しいペインで claude を起動すれば載る"
+            }
+            NoReportCause::NotLoaded => {
+                "claude には注入が届いているが mod から報告が無い。disableAllHooks / 組織の \
+                 allowManagedModsOnly で mod が読まれていないか、mod の読み込みに失敗した"
+            }
+            NoReportCause::Undetermined => {
+                "claude は動いているが mod から報告が無い。--safe-mode / --bare / \
+                 disableAllHooks / 組織の allowManagedModsOnly で mod が読まれていないか、\
+                 注入より前から動いていた claude"
+            }
+        }
+    }
+}
+
+/// 報告の無い claude の理由を材料から 1 つに決める（#1891。**判定はこの 1 本**。純関数）。
+///
+/// 順は「確実なものから」: コマンド行のフラグは注入の有無に関係なく mod を止めるので先に見る。
+/// フラグは `--` より前の語だけを見る（プロンプトの本文の中の `--bare` を拾わない）
+pub fn classify_no_report(evidence: Option<&NoReportEvidence>) -> NoReportCause {
+    let Some(evidence) = evidence else {
+        return NoReportCause::Undetermined;
+    };
+    let flag = |name: &str| {
+        evidence.argv.as_deref().is_some_and(|argv| {
+            argv.split_whitespace()
+                .skip(1)
+                .take_while(|w| *w != "--")
+                .any(|w| w == name)
+        })
+    };
+    if flag("--safe-mode") {
+        return NoReportCause::SafeMode;
+    }
+    if flag("--bare") {
+        return NoReportCause::Bare;
+    }
+    match evidence.injected_env {
+        Some(false) => NoReportCause::BeforeInjection,
+        Some(true) => NoReportCause::NotLoaded,
+        None => NoReportCause::Undetermined,
+    }
+}
+
+/// 起動時の env（`names` に [`PLUGIN_DIRS_ENV`] と `PATH` を挙げて読んだもの）に、この tako の
+/// 展開先が載っていたか（#1891。純関数）。
+///
+/// `PATH` も無い = env をそもそも読めていない（Apple のプラットフォームバイナリは 0 キーで返る）
+/// ので `None`。展開先が分からなければ判定しない
+pub fn env_has_injection(env: &HashMap<String, String>, plugin_dir: Option<&Path>) -> Option<bool> {
+    let plugin_dir = plugin_dir?;
+    if !env.contains_key("PATH") {
+        return None;
+    }
+    Some(
+        env.get(PLUGIN_DIRS_ENV)
+            .is_some_and(|dirs| dirs.split(LIST_SEP).any(|d| Path::new(d) == plugin_dir)),
+    )
 }
 
 /// ペイン 1 つぶんの報告を一次ソースとして引き当てる（S2 #1880。**引き当てはこの 1 本**）。
@@ -4482,5 +4606,111 @@ mod tests {
         );
         assert_eq!(ChatReread::Same(5).seq(), Some(5));
         assert_eq!(ChatReread::Stamp.seq(), None);
+    }
+
+    // --- #1891: 報告の無い claude の理由 ---
+
+    fn evidence(argv: Option<&str>, injected_env: Option<bool>) -> NoReportEvidence {
+        NoReportEvidence {
+            argv: argv.map(str::to_string),
+            injected_env,
+        }
+    }
+
+    #[test]
+    fn 報告の無いclaudeの理由は材料から1つに決まる() {
+        use NoReportCause::*;
+        let cases: &[(Option<NoReportEvidence>, NoReportCause)] = &[
+            // 調べていない（上限の外・A/B・macOS 以外）
+            (None, Undetermined),
+            // フラグは注入の有無に関係なく先に効く
+            (
+                Some(evidence(Some("claude --safe-mode"), Some(true))),
+                SafeMode,
+            ),
+            (
+                Some(evidence(Some("claude --model x --safe-mode"), Some(false))),
+                SafeMode,
+            ),
+            (
+                Some(evidence(Some("/x/claude/versions/2.1.294 --bare"), None)),
+                Bare,
+            ),
+            // フラグが無ければ起動時の env の印で分ける
+            (Some(evidence(Some("claude"), Some(false))), BeforeInjection),
+            (
+                Some(evidence(Some("claude --resume abc"), Some(true))),
+                NotLoaded,
+            ),
+            (Some(evidence(Some("claude"), None)), Undetermined),
+            // claude のプロセスが見つからない（SSH 先 等）= 材料なし
+            (Some(evidence(None, None)), Undetermined),
+            // argv[0] とプロンプトの本文（`--` の後）の語はフラグと読まない
+            (Some(evidence(Some("--safe-mode"), Some(true))), NotLoaded),
+            (
+                Some(evidence(Some("claude -- --bare"), Some(false))),
+                BeforeInjection,
+            ),
+            // 似た綴りのフラグは別物
+            (
+                Some(evidence(Some("claude --safe-mode-x"), Some(true))),
+                NotLoaded,
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(classify_no_report(input.as_ref()), *want, "{input:?}");
+        }
+        // 語彙は重ならない（`tako mod` / `check-health` の `reason.cause`）
+        let codes: BTreeSet<&str> = [SafeMode, Bare, BeforeInjection, NotLoaded, Undetermined]
+            .iter()
+            .map(|c| c.code())
+            .collect();
+        assert_eq!(codes.len(), 5);
+        // 判別できなかったときは S1 の候補の文言のまま（`--safe-mode` を含む）
+        assert!(Undetermined.describe().contains("--safe-mode"));
+        assert!(BeforeInjection
+            .describe()
+            .contains("新しいペインで claude を起動すれば載る"));
+    }
+
+    #[test]
+    fn 起動時のenvの印はこのtakoの展開先だけを数える() {
+        let dir = Path::new("/data/claude-mod/tako");
+        let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        let sep = LIST_SEP.to_string();
+        let ours = format!("/user/mods{sep}/data/claude-mod/tako/");
+        assert_eq!(
+            env_has_injection(
+                &env(&[("PATH", "/bin"), (PLUGIN_DIRS_ENV, &ours)]),
+                Some(dir)
+            ),
+            Some(true)
+        );
+        // 別のインスタンスの展開先だけ = この tako の注入は届いていない
+        assert_eq!(
+            env_has_injection(
+                &env(&[
+                    ("PATH", "/bin"),
+                    (PLUGIN_DIRS_ENV, "/other/claude-mod/tako")
+                ]),
+                Some(dir)
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            env_has_injection(&env(&[("PATH", "/bin")]), Some(dir)),
+            Some(false)
+        );
+        // env を読めていない（0 キー）・展開先が分からない = 判定しない
+        assert_eq!(env_has_injection(&env(&[]), Some(dir)), None);
+        assert_eq!(
+            env_has_injection(&env(&[("PATH", "/bin"), (PLUGIN_DIRS_ENV, &ours)]), None),
+            None
+        );
     }
 }
