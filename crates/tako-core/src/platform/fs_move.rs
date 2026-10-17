@@ -7,7 +7,7 @@
 //! 「上書きしない rename」を直に呼び、**同名の有無の判定と移動を 1 つの操作**にする:
 //!
 //! - macOS: `renamex_np(2)` + `RENAME_EXCL`
-//! - Linux: `renameat2(2)` + `RENAME_NOREPLACE`
+//! - Linux: `renameat2(2)`（システムコール番号で呼ぶ）+ `RENAME_NOREPLACE`
 //! - Windows: `MoveFileExW` を `MOVEFILE_REPLACE_EXISTING` を付けずに（フラグ 0。
 //!   `MOVEFILE_COPY_ALLOWED` も付けないので、別のボリュームは `ERROR_NOT_SAME_DEVICE` で断られる）
 //!
@@ -81,9 +81,12 @@ mod imp {
 
     pub(super) fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
         let (from, to) = (c_path(from)?, c_path(to)?);
+        // libc の `renameat2` ラッパーは musl 向けに無い版がある（0.2.186）ので、
+        // gnu / musl のどちらでも在るシステムコール番号で呼ぶ
         // SAFETY: どちらも NUL 終端の C 文字列で、呼び出しのあいだ生きている
         let rc = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 from.as_ptr(),
                 libc::AT_FDCWD,
