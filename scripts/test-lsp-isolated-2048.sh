@@ -43,9 +43,8 @@ trap cleanup EXIT
 
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 echo "visual-test 版の tako-app と偽サーバをビルドします…"
-(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app --features tako-app/visual-test \
-  && run_heavy cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
-isolated_gui_bins || exit 1
+(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-control --bin tako-lsp-fake) || exit 1
+isolated_gui_bins visual-test || exit 1
 FAKE="$(dirname "$TAKO_BIN")/tako-lsp-fake"
 DUMP_NEW="${DUMP_NEW:-$TMP/dump-new}"
 DUMP_OLD="${DUMP_OLD:-$TMP/dump-legacy}"

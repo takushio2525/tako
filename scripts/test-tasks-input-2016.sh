@@ -32,11 +32,7 @@ check() { if [ "$1" = "1" ]; then pass "$2"; else bad "$2"; fi; }
 
 # visual 段は visual-test 版の tako-app が要る（素のビルドだと「未知の節」で exit 1）。
 # バイナリを渡された A/B ではビルドしない。HOME を差し替える前に済ませる（ツールチェーンを取り直さない）
-if [ -z "${APP_BIN:-}" ]; then
-  echo "visual-test 版の tako / tako-app をビルドします…"
-  (cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
-fi
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 
 # ペインの中から走らせても本番へ届かないように、継承した接続情報を落とす
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL TAKO_ORCHESTRATOR_ROLE

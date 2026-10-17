@@ -52,15 +52,14 @@ REAL_RA="$(command -v rust-analyzer 2>/dev/null || true)"
 REAL_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 REAL_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 
-run_heavy cargo build -q -p tako-app --features visual-test || exit 1
-run_heavy cargo build -q -p tako-cli -p tako-control --bin tako --bin tako-lsp-fake || exit 1
+run_heavy cargo build -q -p tako-control --bin tako-lsp-fake || exit 1
 FAKE="$REPO_ROOT/target/debug/tako-lsp-fake"
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 # 隔離 GUI は言語サーバを自動では起こさない（#2048）。この検証は起こす前提なので明示する
 export TAKO_LSP_AUTOSTART=1
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 
 mkdir -p "$TMP/home" "$TMP/zdot" "$TMP/disc" "$TMP/orch" "$TMP/tmpdir"
 # 証拠ログに実ユーザー名・実ホスト名を写さない（#927）

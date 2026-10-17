@@ -80,7 +80,6 @@ esac
 export TAKO_ISO_PROFILE=release
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-(cd "$REPO_ROOT" && run_heavy cargo build --release -q -p tako-cli -p tako-app) || exit 1
 isolated_gui_bins || exit 1
 ISOLATED_GUI_BOUNDS="$BOUNDS"
 

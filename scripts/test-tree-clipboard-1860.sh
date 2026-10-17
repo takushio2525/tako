@@ -112,12 +112,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_heavy cargo build -q -p tako-app --features visual-test || exit 1
-run_heavy cargo build -q -p tako-cli -p tako-control --bin tako || exit 1
-
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 
 mkdir -p "$TMP/home" "$TMP/zdot" "$TMP/disc" "$TMP/orch"
 # 証拠ログに実ユーザー名・実ホスト名を写さない（#927）

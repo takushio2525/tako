@@ -67,9 +67,7 @@ chmod +x "$FAIL_BIN/claude"
 
 # --- 対象バイナリ（visual-test の節を使うので feature 付きで組む）------------------
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-echo "visual-test 版の tako-app と tako をビルドします…"
-(cd "$REPO_ROOT" && run_heavy cargo build -p tako-cli -p tako-app --features tako-app/visual-test --quiet) || exit 1
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 # タブが 10 枚前後並ぶので、窓を横に広く取る（タブバーの画像に全部収める）
 ISOLATED_GUI_BOUNDS=${TAKO_2127_BOUNDS:-2400,900}
 

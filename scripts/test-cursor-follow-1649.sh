@@ -29,11 +29,9 @@ PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); printf '  OK   %s\n' "$1"; }
 fail() { FAIL=$((FAIL+1)); printf '  NG   %s\n' "$1"; }
 
-run_heavy cargo build -p tako-app --features visual-test --quiet || exit 1
-
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-isolated_gui_bins || exit 1
+isolated_gui_bins visual-test || exit 1
 trap 'stop_isolated_gui' EXIT
 
 # 証拠ログに実ユーザー名・実ホスト名を写さない（#927）

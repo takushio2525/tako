@@ -61,7 +61,6 @@ trap cleanup EXIT
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
-(cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli -p tako-app) || exit 1
 isolated_gui_bins || exit 1
 REAL_TMUX="$(command -v tmux || true)"
 [ -n "$REAL_TMUX" ] || { echo "未実測: tmux が無い（器のペインが作れない）"; exit 4; }
