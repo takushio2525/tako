@@ -188,6 +188,18 @@ pub fn start_time_unix(pid: u32) -> Option<u64> {
     imp::start_time_unix(pid)
 }
 
+/// プロセスオブジェクトの終了コード（#2275）。開けない / 問い合わせに失敗したら `None`。
+///
+/// Windows は `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess`。
+/// 走っている間は `STILL_ACTIVE`（259）が返る。**終了済みでも誰かがハンドルを持つ間は
+/// プロセスオブジェクトと pid が残る**（`ExitProcess` の仕様）ので、開けたことは
+/// 生きている証拠にならない。読み方は [`crate::platform::process::alive_unless_exited`] が持つ。
+///
+/// unix は `None`（生死は `kill(pid, 0)` が答える）
+pub fn exit_code(pid: u32) -> Option<u32> {
+    imp::exit_code(pid)
+}
+
 /// 名前（拡張子と大文字小文字を無視）が `names` のいずれかに一致するプロセスの詳細。
 ///
 /// 取得手段が無いプラットフォームでは空を返す
@@ -526,6 +538,7 @@ mod imp {
 
     #[link(name = "kernel32")]
     extern "system" {
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
         fn GetProcessTimes(
             process: Handle,
             creation: *mut FileTime,
@@ -600,6 +613,24 @@ mod imp {
             }
             let units = std::slice::from_raw_parts(us.buffer, len / 2);
             Some(String::from_utf16_lossy(units))
+        }
+    }
+
+    pub(super) fn exit_code(pid: u32) -> Option<u32> {
+        if pid == 0 {
+            return None;
+        }
+        // SAFETY: OpenProcess の戻りは null を検査し、復帰経路すべてで CloseHandle する。
+        // 出力はローカル変数 1 つで、API はそれ以上書き込まない
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            (ok != 0).then_some(code)
         }
     }
 
@@ -900,6 +931,12 @@ mod imp {
     /// 他プロセスのコマンドラインを引く用途が unix にはまだ無い（#1282 の器の列挙は
     /// ソケットファイル走査で足りる）。読めない = 呼び出し側は見送る
     pub(super) fn command_line(_pid: u32) -> Option<String> {
+        None
+    }
+
+    /// 生死は `kill(pid, 0)` が答える（`platform::process::pid_alive` の unix の腕）。
+    /// 他プロセスの終了コードを引く用途は unix に無い
+    pub(super) fn exit_code(_pid: u32) -> Option<u32> {
         None
     }
 

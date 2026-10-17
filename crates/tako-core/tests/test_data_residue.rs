@@ -189,9 +189,10 @@ fn reaped_pid(scratch: &Path) -> u32 {
         .expect("子を起こせる");
     let pid = child.id();
     wait_with_deadline(&mut child, "看取り用の子");
+    // 看取った直後の 1 回の観測で決めない（#2275）
     assert!(
-        !tako_core::platform::process::pid_alive(pid),
-        "看取った pid {pid} が生きている"
+        tako_core::platform::process::wait_gone(pid, CHILD_DEADLINE),
+        "看取った pid {pid} が居なくならない"
     );
     pid
 }

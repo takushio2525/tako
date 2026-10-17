@@ -395,7 +395,11 @@ fn dead_pid() -> u32 {
         .expect("偽サーバを起こす");
     let pid = child.id();
     child.wait().expect("刈り取る");
-    assert!(!tako_core::platform::process::pid_alive(pid));
+    // 刈り取った直後の 1 回の観測で決めない（#2275）
+    assert!(
+        tako_core::platform::process::wait_gone(pid, Duration::from_secs(10)),
+        "刈り取った pid {pid} が居なくならない"
+    );
     pid
 }
 
