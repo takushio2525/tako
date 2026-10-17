@@ -20,27 +20,6 @@
 
 ---
 
-## 2026-10-17（#2252: 夜間リリースに「検査だけ」の役 = `scripts/nightly-release.sh --role check`。2 台構成でリリースしない PC は mod の検査と footprint の見張りだけ・既定は全部）
-- モック 75 PASS・旧版に当てると 31 FAIL。手元の Mac に `--role check` を設定済み。旧 Mac で検査が回っていない件は #2262。PR #2261
-
-## 2026-10-17（#2248: 子のテストバイナリの目印を `split_once` で拾い子を `--test-threads=1` で起こす = issue2035 / issue2048・番犬 `issue2248_child_marker_watchdog`。registry のテストは共有 workers.yaml の自分のエントリだけを `dead_since` を外して比べる）
-- `RUST_TEST_THREADS=1` で修正前 2 本落ち → 修正後 0・並列の書き手の注入でファイル全体の比較は落ちる・全体テスト並列 1 / 2 / 4 で緑。PR #2263
-
-## 2026-10-17（#2262: 夜間が戻した共有ツリーの main を origin/main へ fast-forward で追従 = `follow_origin_main`。独自のコミット / untracked で ff できないときは触らず WARN と通知・A/B `TAKO_2262_LEGACY=1`）
-- モック `scripts/test-nightly-restore-main-2262.sh` 79 PASS（修正前は 3 晩が 新 / 旧 / 新 で 22 FAIL）。戻した夜以外の追従は #2264。PR #2265
-
-## 2026-10-17（#1532 / #1533: ログインシェルへの問い合わせを `platform::exe::ask_login_shell` の 1 実装（上限 5 秒・`TAKO_LOGIN_SHELL_TIMEOUT_SECS`・孫ごと畳む）へ寄せ、打ち切りを「確認できません」として setup / check-health / 依存の検出まで運ぶ）
-- 番犬 `issue1533_login_shell_timeout_watchdog`・A/B `TAKO_1532_LEGACY=1`・実経路 62 PASS・関係スクリプト 17 本緑・カタログ増 0 B。提案は #2269。PR #2266
-
-## 2026-10-17（#2264: リリースする役の夜間は共有ツリーの main を毎晩 origin/main へ fast-forward で追従 = `follow_main_nightly`。検査だけの役は動かさない・独自のコミット / untracked は触らず WARN と通知・A/B `TAKO_2264_LEGACY=1`）
-- モック `scripts/test-nightly-follow-main-2264.sh` 83 PASS（修正前は 2 晩とも古い版で 18 FAIL）。PR #2268
-
-## 2026-10-17（#1710: 自動復帰が前日の告知をいまから解き直していた = 告知を最初に見た時刻を layout.json の `limit_seen` に持ってそこから解き、追跡の再開始の時点で解けていたら「その時刻 + 2 分」で再開・後から届いた mod / codex の時刻も採る）
-- A/B `TAKO_1710_LEGACY=1`・番犬 `issue1710_limit_reset_detected_base`・実経路 `scripts/test-limit-resume-restart-1710.sh` 22 PASS。PR #2270
-
-## 2026-10-17（#1666: テストの固定名の一時 dir 22 か所と名前を引数で受ける `write_test_pdf`・autorename の `temp_dir_for` を `ScratchDir` へ。番犬 `issue1666_fixed_temp_dir_watchdog` が固定名と引数そのままの join を file:line で名指す）
-- 修正前は 2 プロセス同時で 5 回とも片方が落ち → 修正後 10/10 緑・残骸 0。PR #2271
-
 ## 2026-10-17（#1633: pipefail の下の `echo/printf | grep -q` を 31 本・76 箇所で here-string / 配列の比較へ・番犬 `pipefailの下でechoとprintfの出力をgrep_qへパイプしない`（例外 `# tako:pipefail-ok`））
 - 4 MB の注入で旧 100/100 偽 → 新 0/100（3.2 / 5）。残り（echo/printf 以外の左辺・`| head`）は #2272。PR #2273
 
@@ -79,3 +58,24 @@
 
 ## 2026-10-18（#2292: 新品の HOME の 1 回目の setup で tako mod が入らず、2 回目に入っても「変更なし」と出ていた → mod の段を `~/.claude` を作る指示ファイルの段の後ろへ移し、書いた・外した dir を最終サマリへ積む）
 - 実経路 `scripts/test-setup-mod-first-run-2292.sh` 40 PASS（修正前 10 FAIL）を CI へ・番犬 `issue2292_setup_mod_first_run_watchdog`。PR #2294
+
+## 2026-10-18（#1805: CLI の経路で走るライブラリ側の出力もパイプの切断で panic させない = 書き込み口を `tako_core::stdio` の 1 実装へ寄せ、tako-core / tako-control / tako-cli lib の根でも差し替え・規則は `tako` / `tako-mcp` の入口だけが採る（GUI は std と同じ）。`mcp serve` はクライアントが stdout を閉じたら静かに 0）
+- 修正前 gate check 101・mcp serve の gate check 101 / 切断 1 → 修正後 0。番犬 `ライブラリ側でstdの出力マクロを名指さない`・宣言順を 4 つの根へ。カタログ +0 B
+
+## 2026-10-18（#2286: Code Runner の変数展開以外の引用 3 経路 = `tako:shell` の外側・プロジェクト既定・宣言の `tako:cwd` を実行ペインの方言の 1 実装へ。番犬 `issue2286_runner_outer_quote_dialect_watchdog`）
+- 全件 1590 行の前後突き合わせで動いていた行が壊れた行 0・macOS で変わった 170 行はすべて修正前に壊れていた行・カタログ +0 B。PR #2297
+
+## 2026-10-18（#1847: 狭いペインの ENOTFOUND の停止を status が api_error と読む = `detect_worker_error` の段 3' が `net_stop::detect` を通す・背の高い AskUserQuestion を経路 5 `numbered_above_scan` で拾い worker_status はダイアログを画面全体で判定）
+- 実物の claude 2.1.280 / 2.1.301 の 32 / 60 桁の fixture・A/B `TAKO_1847_LEGACY=1`・隔離 GUI の e2e 新旧 11 PASS・カタログ +0 B
+
+## 2026-10-18（#1851: THIRD-PARTY-LICENSES.md の作り直しを `scripts/third-party-licenses.sh` の 1 本へ（cargo-about 0.9.2 を `--frozen`・CRLF を LF へ）し、CI の `licenses` ジョブ（ubuntu）が `--check` で依存とのずれを落とす。main で抜けていた LSP の依存 4 クレートを作り直しで足した）
+- A/B: 依存を足す → 名指しで赤 → 作り直して緑・消す → 余分を名指し。モック 35 PASS・配線 95 PASS。PR #2300
+
+## 2026-10-18（#1850: `release.sh --check-assets` が公開済み Release の zip（両 OS）を取得し、同梱表 `scripts/lib/license-bundle.txt`（番犬と共有の 1 か所）の全部が入りタグのファイルとバイト一致するかを見る）
+- 実物 v0.8.25 は Windows の zip の 2 本の欠けで exit 1・v0.8.37 は exit 0・モック 131 PASS（3.2 / 5.3。main の release.sh では 41 FAIL）・番犬に直書きの検出。PR #2303
+
+## 2026-10-18（#1817: `virtual-display.sh ensure` が器に作らせる・繋がせるのは `tako-vd` の完全一致だけ = `vd_create_verdict` を器に触る前に。`bounds` / `status` / `move-window` も `vd_virtual_verdict` を通し物理画面に座標・使用可を返さない（3・器を起こさない））
+- 修正前は存在しない名前・大文字違い・蓋閉じの内蔵の名前で作成 + 接続して rc=0 → 修正後 rc=3・作成 0。注入 7 通りで番犬が file:line を名指し・モック 243 PASS（3.2 / 5.3）
+
+## 2026-10-18（#2299: Code Runner の宣言 `tako:cwd` の値全体を囲む二重引用符も `strip_quotes` で外し、中の逃がしを実行ペインの方言の規則で戻す = `posix_double_quoted` / `ps_double_quoted`。番犬 `issue2286_runner_outer_quote_dialect_watchdog` に規則と行）
+- 1590 行の表で変わったのは `"${fileDir}"` の 40 行だけ（すべて 壊れ → 直る）・隔離 GUI の実物で修正前は `cwd が存在しない`・`/bin/sh` と PowerShell の実物と一致・カタログ +0 B。PR #2310
