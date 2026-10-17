@@ -368,6 +368,14 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             &["CompactedState", "CompactedMonth"],
         ),
         (
+            // #2254: 順番待ちの過去の記録 `<data_dir>/resources/history.jsonl` の行（終わった処理 1 件 = 1 行）。
+            // 追記だけのファイルで版数の番地は持たない（共有しない Local。旧い行は serde の default で読む・
+            // 読めない行は飛ばす）が、欄を増減・改名したら旧い行が読めるかをここで選ばせる。
+            // 行に入る区分の語（enum）も載せる
+            "crates/tako-core/src/queue.rs",
+            &["HistoryRow", "JobKind"],
+        ),
+        (
             // #2204: codex の rollout の読みの状態（`cursor.jsonl` の行の `codex`。claude の行には無い =
             // serde の default で旧い行がそのまま読める）
             "crates/tako-core/src/usage/codex.rs",

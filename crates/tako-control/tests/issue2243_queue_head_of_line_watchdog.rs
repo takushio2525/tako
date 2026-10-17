@@ -43,7 +43,7 @@ fn running(id: u64, dir: &str) -> RunningJob {
         estimate_mb: 3 * GIB,
         used_mb: Some(3 * GIB),
         target_dir: Some(dir.into()),
-        stalled: false,
+        ..RunningJob::default()
     }
 }
 
@@ -68,6 +68,7 @@ fn input<'a>(l: Limits, run: &'a [RunningJob], wait: &'a [WaitingJob]) -> AdmitI
         unmanaged: 0,
         regathering: false,
         overtake: true,
+        release_after_peak: true,
     }
 }
 

@@ -25,7 +25,10 @@
 //!   切る（子の終わり・シグナル・自分の終了を固まった GUI に待たせない）
 //! - 実行中に調停役が居なくなっても子は止めない（繋がったら子の pid で登録し直す）
 //! - 待ちの上限（既定 30 分・`--max-wait`）で 75、待ちの取り消しで 125、Ctrl+C / 親の SIGTERM で
-//!   128 + 番号（待ちから外れて終わる）。実行中のシグナルは子へ転送する
+//!   128 + 番号（待ちから外れて終わる）。実行中のシグナルは子へ転送する。待ちの上限で諦めたときは
+//!   待っていた理由と、枠とメモリを押さえていた処理（[`gave_up_lines`]）を出す（#2254）
+//! - 受付で過去の記録の鍵（`HistoryKeys`。repo の根 + 正規化した argv のハッシュ）を送る。
+//!   調停役はそれで見込みメモリを引く（#2254）
 //! - 実行中の取り消しは子とその子孫へ SIGTERM → 10 秒で SIGKILL（Windows は子の kill。#2000 で Job Object）
 //!
 //! 送受信（IPC の 1 往復）は呼び手（tako-cli の transport）が閉包で渡す。ここは状態の進め方と
@@ -148,6 +151,66 @@ pub fn waiting_line(resp: &Value, waited: Duration) -> String {
     format!("{head}— {why}")
 }
 
+/// MiB → 人が読む GB / MB
+pub fn human_mb(mb: u64) -> String {
+    if mb >= 1024 {
+        format!("{:.1} GB", mb as f64 / 1024.0)
+    } else {
+        format!("{mb} MB")
+    }
+}
+
+/// 待ちの上限で諦めたときの説明（純関数。#2254）: 待っていた理由と、枠とメモリを押さえていた処理
+/// （最後の poll の `holders`。旧い調停役は返さない = 理由だけ）
+pub fn gave_up_lines(resp: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let behind = resp["reason"].as_str().is_none_or(|r| r == "ahead");
+    let why = if behind {
+        resp["head_text"]
+            .as_str()
+            .map(|t| format!("前に並んでいる処理の後（先頭: {t}）"))
+    } else {
+        resp["text"].as_str().map(str::to_string)
+    };
+    if let Some(why) = why {
+        out.push(format!("待っていた理由: {why}"));
+    }
+    for h in resp["holders"].as_array().into_iter().flatten() {
+        let mut parts = vec![match h["memory_mb"].as_u64() {
+            Some(m) => format!("使用 {}", human_mb(m)),
+            None => "使用 未計測".to_string(),
+        }];
+        if let Some(p) = h["peak_mb"].as_u64() {
+            parts.push(format!("最大 {}", human_mb(p)));
+        }
+        let pending = h["pending_mb"].as_u64().unwrap_or(0);
+        if pending > 0 {
+            parts.push(format!("まだ使っていない見込み {}", human_mb(pending)));
+        }
+        if let Some(e) = h["estimate_mb"].as_u64() {
+            let from = match h["estimate_from"].as_str() {
+                Some("history") => "過去の記録",
+                Some("shape") => "同じ形の記録",
+                _ => "区分の既定",
+            };
+            parts.push(format!("見込み {}（{from}）", human_mb(e)));
+        }
+        if h["peak_passed"] == true {
+            parts.push("ピーク後".into());
+        }
+        if h["stalled"] == true {
+            parts.push("停滞".into());
+        }
+        out.push(format!(
+            "押さえていた処理: {} {}（{}）",
+            h["id"],
+            h["label"].as_str().unwrap_or("?"),
+            parts.join("・")
+        ));
+    }
+    out
+}
+
 /// 秒 → 「1 分 12 秒」
 pub fn human_secs(secs: u64) -> String {
     if secs >= 3600 {
@@ -186,7 +249,18 @@ pub fn build_wire(argv: &[String], opts: &Options, cwd: &Path) -> JobWire {
                 .to_string_lossy()
                 .into_owned()
         });
+    // 過去の記録の鍵（#2254）: worktree は本体の根へ寄せる（Issue ごとの worktree で記録を引き継ぐ）
+    let repo = q::repo_identity(cwd, |dir| {
+        let git = dir.join(".git");
+        let meta = std::fs::metadata(&git).ok()?;
+        if meta.is_dir() {
+            Some(q::GitEntry::Dir)
+        } else {
+            std::fs::read_to_string(&git).ok().map(q::GitEntry::File)
+        }
+    });
     JobWire {
+        history: q::history_keys(argv, &repo.to_string_lossy()),
         id: u64::from(std::process::id()),
         enqueued_at_ms: unix_ms(),
         label: opts
@@ -399,12 +473,17 @@ fn run_with(
         }
         if wait_start.elapsed() >= max_wait {
             display.finish(None);
+            // 諦めたことを調停役へ知らせる（押さえていた処理を `recent` に残す。#2254）
+            wire.exit_code = Some(q::EXIT_MAX_WAIT);
             withdraw(send, &wire);
             let n = resp["waiting"].as_u64().unwrap_or(0);
             note(&format!(
                 "{n} 件待ちのまま {} たったので諦める。空いたらもう一度（`tako queue` で状況）",
                 human_secs(max_wait.as_secs())
             ));
+            for line in gave_up_lines(&resp) {
+                note(&line);
+            }
             return q::EXIT_MAX_WAIT;
         }
         // 見失った時刻は「失敗した往復を始めた時刻」（応答しない調停役は 1 往復が上限まで
@@ -863,13 +942,13 @@ mod tests {
     #[test]
     fn 待ちの上限で75() {
         let argv: Vec<String> = ["true"].iter().map(|s| s.to_string()).collect();
-        let mut done = false;
+        let mut done = None;
         let mut send = |req: Request| -> Result<Value, SendError> {
-            let Request::Queue { action, .. } = &req else {
+            let Request::Queue { action, job, .. } = &req else {
                 panic!()
             };
             if action.as_deref() == Some("done") {
-                done = true;
+                done = job.as_ref().map(|j| j.exit_code);
             }
             Ok(
                 json!({ "state": "waiting", "position": 1, "waiting": 1, "running": 1, "max_jobs": 1 }),
@@ -883,6 +962,47 @@ mod tests {
             run_with(&argv, &opts, &mut send, false, &|_| false),
             q::EXIT_MAX_WAIT
         );
-        assert!(done, "外れるときに done");
+        assert_eq!(
+            done,
+            Some(Some(q::EXIT_MAX_WAIT)),
+            "外れるときに done（諦めた = 75 を載せる。調停役が押さえていた処理を残す。#2254）"
+        );
+    }
+
+    /// #2254: 諦めたときに、待っていた理由と押さえていた処理と量を出す
+    #[test]
+    fn 諦めたときは押さえていた処理と量を出す() {
+        let resp = json!({
+            "state": "waiting", "position": 1, "reason": "memory",
+            "text": "空きメモリ不足（空き 8.0 GB・必要 13.7 GB = 実行中のまだ使っていない見込み 6.7 GB + この処理の見込み 7.0 GB・予約 3.6 GB）",
+            "holders": [{
+                "id": 4242, "label": "cargo test --workspace", "memory_mb": 300, "peak_mb": 2048,
+                "estimate_mb": 7168, "estimate_from": "default", "pending_mb": 6868,
+                "peak_passed": false, "stalled": false,
+            }, {
+                "id": 4343, "label": "cargo build", "memory_mb": null, "estimate_mb": 3584,
+                "estimate_from": "history", "pending_mb": 0, "peak_passed": true, "stalled": true,
+            }],
+        });
+        assert_eq!(
+            gave_up_lines(&resp),
+            vec![
+                "待っていた理由: 空きメモリ不足（空き 8.0 GB・必要 13.7 GB = 実行中のまだ使っていない見込み 6.7 GB + \
+                 この処理の見込み 7.0 GB・予約 3.6 GB）"
+                    .to_string(),
+                "押さえていた処理: 4242 cargo test --workspace（使用 300 MB・最大 2.0 GB・まだ使っていない見込み 6.7 GB・\
+                 見込み 7.0 GB（区分の既定））"
+                    .to_string(),
+                "押さえていた処理: 4343 cargo build（使用 未計測・見込み 3.5 GB（過去の記録）・ピーク後・停滞）"
+                    .to_string(),
+            ]
+        );
+        // 並びが止まって調べなかった件は先頭の理由・旧い調停役（holders なし）は理由だけ
+        let behind = json!({ "reason": "ahead", "head_text": "同時数の上限（実行 3 / 上限 3）" });
+        assert_eq!(
+            gave_up_lines(&behind),
+            vec!["待っていた理由: 前に並んでいる処理の後（先頭: 同時数の上限（実行 3 / 上限 3））"]
+        );
+        assert!(gave_up_lines(&json!({})).is_empty());
     }
 }

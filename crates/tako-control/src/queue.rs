@@ -23,17 +23,27 @@
 //! 番犬: `crates/tako-control/tests/issue1993_resources_ui_thread_watchdog.rs`（受け口の順序）と
 //! `crates/tako-control/tests/issue1994_queue_ui_stall.rs`（UI の受け口を誰も読まなくても割り当てが進む）と
 //! `crates/tako-control/tests/issue2243_queue_head_of_line_watchdog.rs`（target dir 待ちの先頭が空き枠を
-//! 塞がない・同じ dir の直列・追い越しの上限）
+//! 塞がない・同じ dir の直列・追い越しの上限）と
+//! `crates/tako-control/tests/issue2254_queue_reservation_watchdog.rs`（ピークを過ぎた実行中が見込みを
+//! 押さえ続けない・見込みは過去の記録から・本当に空きが無ければ待つ）
+//!
+//! ## 見込みと過去の記録（#2254）
+//!
+//! 受付のときに wrapper が送る鍵（[`q::HistoryKeys`]）で過去の記録（[`crate::queue_history`]）から見込みを
+//! 引き（[`q::estimate`]）、終わった処理の木の最大と最大になった時点を 1 行足す。実行中の「まだ使っていない
+//! 見込み」はピークを過ぎたら 0（[`q::RunningJob::pending_mb`]）。待ちの上限で諦めた件は、そのとき枠と
+//! メモリを押さえていた処理を `recent` に残す（`gave_up` / `holders`）
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tako_core::queue::{
-    self as q, Admission, AdmitInput, JobWire, LimitSettings, Limits, LimitsPatch, MachineView,
-    RunningJob, WaitReason, WaitingJob,
+    self as q, Admission, AdmitInput, Estimate, HistoryRow, JobWire, LimitSettings, Limits,
+    LimitsPatch, MachineView, RunningJob, WaitReason, WaitingJob,
 };
 use tako_core::resources::{Pressure, MIB};
 
@@ -56,6 +66,15 @@ pub const ENV_LEGACY_2243: &str = "TAKO_2243_LEGACY";
 
 fn legacy_2243() -> bool {
     std::env::var_os(ENV_LEGACY_2243).is_some_and(|v| v == "1")
+}
+
+/// #2254 の A/B: `TAKO_2254_LEGACY=1` で修正前の見込み（区分の既定だけ・過去の記録を引かない）と予約
+/// （実行中は最後まで「見込み − 今の使用量」を押さえる）。調停役のプロセスの env で効く。
+/// 記録は修正前でも足す（振る舞いは変えない）
+pub const ENV_LEGACY_2254: &str = "TAKO_2254_LEGACY";
+
+fn legacy_2254() -> bool {
+    std::env::var_os(ENV_LEGACY_2254).is_some_and(|v| v == "1")
 }
 
 /// 立ち上げ直後に誰も入れない長さ（wrapper の繋ぎ直しの間隔は最大 5 秒）
@@ -129,9 +148,12 @@ struct Job {
     phase: Phase,
     last_seen: Instant,
     cancel: bool,
-    estimate_mb: u64,
+    /// 見込み（受付のときに過去の記録から決める。#2254）
+    estimate: Estimate,
     used_mb: Option<u64>,
     peak_mb: u64,
+    /// 最大を最後に更新した時刻（Unix ミリ秒。走り出してからの秒数を出すので wrapper の開始と同じ物差し）
+    peak_raised_ms: Option<u64>,
     cpu_percent: Option<f64>,
     /// 木の CPU が下限未満になった時刻（調停役の単調ミリ秒）
     low_since: Option<u64>,
@@ -143,14 +165,19 @@ struct Job {
 }
 
 impl Job {
-    fn new(wire: JobWire, now: Instant) -> Self {
+    fn new(wire: JobWire, now: Instant, history: &[HistoryRow]) -> Self {
         let phase = if wire.child_pid.is_some() {
             Phase::Running
         } else {
             Phase::Waiting
         };
+        let estimate = if legacy_2254() {
+            Estimate::default_for(wire.kind)
+        } else {
+            q::estimate(wire.kind, wire.history.as_ref(), history)
+        };
         Self {
-            estimate_mb: wire.kind.default_estimate_mb(),
+            estimate,
             granted_at_ms: wire.started_at_ms,
             wire,
             phase,
@@ -158,6 +185,7 @@ impl Job {
             cancel: false,
             used_mb: None,
             peak_mb: 0,
+            peak_raised_ms: None,
             cpu_percent: None,
             low_since: None,
             stalled: false,
@@ -169,6 +197,48 @@ impl Job {
     /// 枠を持っているか（割り当て済み・実行中）
     fn holds_slot(&self) -> bool {
         matches!(self.phase, Phase::Granted | Phase::Running)
+    }
+
+    /// 走り出した時刻（Unix ミリ秒。子が起きる前は割り当ての時刻）
+    fn started_ms(&self) -> Option<u64> {
+        self.wire.started_at_ms.or(self.granted_at_ms)
+    }
+
+    /// 割り当ての判断の入力の形（`wall` = いまの Unix ミリ秒）
+    fn running_view(&self, wall: u64) -> RunningJob {
+        let start = self.started_ms();
+        let secs_since = |ms: u64| start.map_or(0, |s| ms.saturating_sub(s) / 1000);
+        RunningJob {
+            id: self.wire.id,
+            estimate_mb: self.estimate.mb,
+            used_mb: self.used_mb,
+            target_dir: self.wire.target_dir.clone(),
+            stalled: self.stalled,
+            peak_mb: self.peak_mb,
+            ran_s: secs_since(wall),
+            peak_seen_s: self.peak_raised_ms.map(secs_since),
+            expected_peak_at_s: self.estimate.peak_at_s,
+        }
+    }
+
+    /// 終わった処理の過去の記録の 1 行（鍵が無い = 旧い wrapper・走査の前に終わった = 最大 0 は残さない）
+    fn history_row(&self, exit_code: Option<i32>, wall: u64) -> Option<HistoryRow> {
+        let keys = self.wire.history.as_ref().filter(|k| !k.key.is_empty())?;
+        if self.peak_mb == 0 || self.phase != Phase::Running {
+            return None;
+        }
+        let view = self.running_view(wall);
+        Some(HistoryRow {
+            at: wall / 1000,
+            key: keys.key.clone(),
+            shape: keys.shape.clone(),
+            name: keys.name.clone(),
+            kind: self.wire.kind,
+            peak_mb: self.peak_mb,
+            peak_at_s: view.peak_seen_s,
+            ran_s: view.ran_s,
+            exit_code,
+        })
     }
 }
 
@@ -191,6 +261,10 @@ struct Arbiter {
     /// 機の値と論理 CPU 数を固定し、走査の覚えを読まない（**単体テストだけが立てる**。本番は常に
     /// `None`。機の実際の状態で判断が揺れないように）
     fixed_machine: Option<(Option<MachineView>, u32)>,
+    /// 過去の記録（古い順。#2254）
+    history: Vec<HistoryRow>,
+    /// 記録の置き場（`<data_dir>/resources`。`None` = 足さない = 単体テスト・data dir が決まらない）
+    history_dir: Option<PathBuf>,
 }
 
 fn arbiter() -> &'static Mutex<Arbiter> {
@@ -221,6 +295,13 @@ pub fn enable(role: Role) {
     let mut a = lock();
     if a.role.is_none() {
         a.enabled_at = Some(Instant::now());
+        // 過去の記録は最初の 1 回だけ読む（以後は足した行をメモリにも積む）
+        a.history_dir = crate::queue_history::dir();
+        a.history = a
+            .history_dir
+            .as_deref()
+            .map(crate::queue_history::load)
+            .unwrap_or_default();
     }
     a.role = Some(role);
     a.settings = crate::settings::load().resources;
@@ -270,6 +351,17 @@ struct Inject {
     stall_secs: Option<u64>,
     /// 立ち上げ直後に誰も入れない長さ（秒）
     regather_secs: Option<u64>,
+    /// 実行中の木の使用量・最大（走査の値を置き換える。表示名に `label` を含む件。#2254）
+    #[serde(default)]
+    jobs: Vec<InjectJob>,
+}
+
+/// 注入: 実行中の 1 件の木の値（MiB）
+#[derive(Debug, Default, Deserialize)]
+struct InjectJob {
+    label: String,
+    used_mb: Option<u64>,
+    peak_mb: Option<u64>,
 }
 
 fn inject(role: Option<Role>) -> Option<Inject> {
@@ -472,13 +564,14 @@ fn refresh_usage(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
             .unwrap_or(q::STALL_AFTER_SECS)
             * 1000;
         let t = mono_ms();
+        let wall = unix_ms();
         for (id, job) in a.jobs.iter_mut() {
             if !job.holds_slot() {
                 continue;
             }
             let usage = view.jobs.get(id).copied();
             job.used_mb = usage.map(|u| u.memory / MIB);
-            job.peak_mb = job.peak_mb.max(job.used_mb.unwrap_or(0));
+            raise_peak(job, job.used_mb.unwrap_or(0), wall);
             job.cpu_percent = usage.and_then(|u| u.cpu_percent);
             if job.phase == Phase::Running {
                 job.low_since = q::track_low_cpu(job.low_since, job.cpu_percent, t);
@@ -489,6 +582,31 @@ fn refresh_usage(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
     if let Some(n) = inj.and_then(|i| i.unmanaged) {
         a.unmanaged = n;
     }
+    // 実行中の木の値の注入（#2254 の e2e。負荷は生成しない）
+    let wall = unix_ms();
+    for ij in inj.map(|i| i.jobs.as_slice()).unwrap_or_default() {
+        for job in a.jobs.values_mut() {
+            if !job.holds_slot() || !job.wire.label.contains(&ij.label) {
+                continue;
+            }
+            if let Some(used) = ij.used_mb {
+                job.used_mb = Some(used);
+            }
+            raise_peak(
+                job,
+                ij.peak_mb.unwrap_or(0).max(job.used_mb.unwrap_or(0)),
+                wall,
+            );
+        }
+    }
+}
+
+/// 最大を更新する（伸びたときだけ時刻を残す = ピークを過ぎたかの判定に使う。#2254）
+fn raise_peak(job: &mut Job, mb: u64, wall: u64) {
+    if mb > job.peak_mb {
+        job.peak_mb = mb;
+        job.peak_raised_ms = Some(wall);
+    }
 }
 
 /// 割り当てを判断して、入れた件を割り当て済みにする
@@ -498,17 +616,12 @@ fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
         &a.settings,
         machine_view.map(|m| m.total_mb).filter(|t| *t > 0),
     );
+    let wall = unix_ms();
     let running: Vec<RunningJob> = a
         .jobs
         .values()
         .filter(|j| j.holds_slot())
-        .map(|j| RunningJob {
-            id: j.wire.id,
-            estimate_mb: j.estimate_mb,
-            used_mb: j.used_mb,
-            target_dir: j.wire.target_dir.clone(),
-            stalled: j.stalled,
-        })
+        .map(|j| j.running_view(wall))
         .collect();
     let waiting = waiting_jobs(a);
     let regather = inj
@@ -526,6 +639,7 @@ fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
         unmanaged: a.unmanaged,
         regathering,
         overtake: !legacy_2243(),
+        release_after_peak: !legacy_2254(),
     });
     let mut active = running.iter().filter(|r| !r.stalled).count();
     let granted_at = unix_ms();
@@ -560,7 +674,7 @@ fn waiting_jobs(a: &Arbiter) -> Vec<WaitingJob> {
         .filter(|j| j.phase == Phase::Waiting && !j.cancel)
         .map(|j| WaitingJob {
             id: j.wire.id,
-            estimate_mb: j.estimate_mb,
+            estimate_mb: j.estimate.mb,
             target_dir: j.wire.target_dir.clone(),
             priority: j.wire.priority,
             enqueued_at_ms: j.wire.enqueued_at_ms,
@@ -606,7 +720,7 @@ fn poll(wire: &JobWire, now: Instant) -> Result<Value, DispatchError> {
             }
         }
         None => {
-            let job = Job::new(wire.clone(), now);
+            let job = Job::new(wire.clone(), now, &a.history);
             a.jobs.insert(id, job);
         }
     }
@@ -649,6 +763,9 @@ fn poll(wire: &JobWire, now: Instant) -> Result<Value, DispatchError> {
                 "head_reason": head.as_ref().map(WaitReason::code),
                 "head_text": head.as_ref().map(WaitReason::text),
                 "max_wait_ms": u64::from(limits.max_wait_min) * 60_000,
+                "estimate_mb": job.estimate.mb,
+                // 枠とメモリを押さえている処理（諦めたときに wrapper が出す。#2254）
+                "holders": holders(&a),
             }))
         }
     }
@@ -677,15 +794,88 @@ fn done(wire: &JobWire, now: Instant) -> Result<Value, DispatchError> {
         return Ok(json!({ "state": "done", "known": false }));
     };
     let peak = job.peak_mb;
+    let mut history_write = None;
     if job.holds_slot() {
         push_recent(&mut a, &job, wire.exit_code, false);
+        if let Some(row) = job.history_row(wire.exit_code, unix_ms()) {
+            a.history.push(row.clone());
+            crate::queue_history::trim(&mut a.history);
+            history_write = a.history_dir.clone().map(|dir| (dir, row));
+        }
+    } else if wire.exit_code == Some(q::EXIT_MAX_WAIT) {
+        // 待ちの上限で諦めた: そのとき枠とメモリを押さえていた処理を残す（#2254）
+        let reason = a.last.holding_of(job.wire.id).cloned();
+        let holders = holders(&a);
+        push_gave_up(&mut a, &job, reason.as_ref(), holders);
     }
     prune(&mut a, now);
+    drop(a);
+    // 記録の追記はロックの外で（ファイルの書き込みを他の受け答えに待たせない）
+    if let Some((dir, row)) = history_write {
+        if let Err(e) = crate::queue_history::append(&dir, &row) {
+            crate::diag::persist_log(&format!("[queue] 過去の記録を足せない（{e}）"));
+        }
+    }
     Ok(json!({
         "state": "done",
         "known": true,
         "peak_mb": (peak > 0).then_some(peak),
     }))
+}
+
+/// 枠とメモリを押さえている処理（実行中・割り当て済み。まだ使っていない見込みの多い順。#2254）
+fn holders(a: &Arbiter) -> Vec<Value> {
+    let wall = unix_ms();
+    let release = !legacy_2254();
+    let mut rows: Vec<(u64, Value)> = a
+        .jobs
+        .values()
+        .filter(|j| j.holds_slot())
+        .map(|j| {
+            let view = j.running_view(wall);
+            let pending = if view.stalled {
+                0
+            } else {
+                view.pending_mb(release)
+            };
+            (
+                pending,
+                json!({
+                    "id": j.wire.id,
+                    "label": j.wire.label,
+                    "kind": j.wire.kind.as_str(),
+                    "pane": j.wire.pane,
+                    "memory_mb": j.used_mb,
+                    "peak_mb": (j.peak_mb > 0).then_some(j.peak_mb),
+                    "estimate_mb": j.estimate.mb,
+                    "estimate_from": j.estimate.from.as_str(),
+                    "pending_mb": pending,
+                    "peak_passed": view.peak_passed(),
+                    "stalled": j.stalled,
+                }),
+            )
+        })
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    rows.into_iter().map(|(_, v)| v).collect()
+}
+
+/// 待ちの上限で諦めた件を `recent` に残す（#2254）
+fn push_gave_up(a: &mut Arbiter, job: &Job, reason: Option<&WaitReason>, holders: Vec<Value>) {
+    a.recent.push_front(json!({
+        "id": job.wire.id,
+        "label": job.wire.label,
+        "kind": job.wire.kind.as_str(),
+        "exit_code": q::EXIT_MAX_WAIT,
+        "lost": false,
+        "gave_up": true,
+        "waited_s": unix_ms().saturating_sub(job.wire.enqueued_at_ms) / 1000,
+        "estimate_mb": job.estimate.mb,
+        "reason": reason.map(WaitReason::code),
+        "text": reason.map(WaitReason::text),
+        "holders": holders,
+    }));
+    a.recent.truncate(RECENT_KEEP);
 }
 
 /// 取り消し（待ち = 次の poll で wrapper が 125 で終わる / 実行中 = 次の心拍で wrapper が子を止める）
@@ -799,11 +989,18 @@ pub fn status_section() -> Value {
     let inj = inject(a.role);
     let limits = current_limits(&a, inj.as_ref());
     let wall = unix_ms();
+    let release = !legacy_2254();
     let running: Vec<Value> = a
         .jobs
         .values()
         .filter(|j| j.holds_slot())
         .map(|j| {
+            let view = j.running_view(wall);
+            let pending = if view.stalled {
+                0
+            } else {
+                view.pending_mb(release)
+            };
             json!({
                 "id": j.wire.id,
                 "label": j.wire.label,
@@ -814,6 +1011,11 @@ pub fn status_section() -> Value {
                 "share": j.share,
                 "memory_mb": j.used_mb,
                 "peak_mb": (j.peak_mb > 0).then_some(j.peak_mb),
+                // 見込みとまだ使っていない見込み（後ろの空きメモリの判定で押さえている分。#2254）
+                "estimate_mb": j.estimate.mb,
+                "estimate_from": j.estimate.from.as_str(),
+                "pending_mb": pending,
+                "peak_passed": view.peak_passed(),
                 "cpu_percent": j.cpu_percent.map(|c| (c * 10.0).round() / 10.0),
                 "stalled": j.stalled,
                 "cancel": j.cancel,
@@ -845,6 +1047,8 @@ pub fn status_section() -> Value {
                 "reason": a.last.reason_of(j.wire.id).map(WaitReason::code),
                 "text": waiting_text(&a.last, j.wire.id),
                 "overtaken": j.overtaken,
+                "estimate_mb": j.estimate.mb,
+                "estimate_from": j.estimate.from.as_str(),
             })
         })
         .collect();
@@ -1159,5 +1363,239 @@ mod tests {
             handle("cancel", None, None, None),
             Err(DispatchError::InvalidParams(_))
         ));
+    }
+
+    // ===== #2254: 実行中の予約・過去の記録・諦めた件 =====
+
+    /// 36 GB の機（予約 3.6 GB・同時 3）を固定する
+    fn fix_machine(available_mb: u64, pressure: Pressure) {
+        lock().fixed_machine = Some((
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(available_mb),
+                pressure: Some(pressure),
+                swap_used_mb: Some(0),
+            }),
+            8,
+        ));
+    }
+
+    fn keys(key: &str) -> q::HistoryKeys {
+        q::HistoryKeys {
+            key: key.into(),
+            shape: None,
+            name: "cargo test".into(),
+        }
+    }
+
+    /// `cargo test --workspace`（見込み 7 GB = 記録なし）を走らせ、走り出してから 600 秒たった形にする
+    fn start_big(pid: u32, now: Instant) -> JobWire {
+        let mut big = JobWire {
+            kind: JobKind::Test,
+            label: "cargo test --workspace".into(),
+            history: Some(keys("big")),
+            ..wire(pid, 1)
+        };
+        assert_eq!(poll(&big, now).unwrap()["state"], "granted");
+        big.child_pid = Some(pid);
+        big.started_at_ms = Some(unix_ms() - 600_000);
+        assert_eq!(poll(&big, now).unwrap()["state"], "running");
+        big
+    }
+
+    /// 実行中の木の値を置く（走査の代わり。`peak_at_s` = 走り出してから何秒で最大になったか）
+    fn set_usage(pid: u32, used_mb: u64, peak_mb: u64, peak_at_s: u64) {
+        let mut a = lock();
+        let job = a.jobs.get_mut(&u64::from(pid)).expect("実行中");
+        let start = job.started_ms().expect("走り出している");
+        job.used_mb = Some(used_mb);
+        job.peak_mb = peak_mb;
+        job.peak_raised_ms = Some(start + peak_at_s * 1000);
+    }
+
+    fn small(pid: u32) -> JobWire {
+        JobWire {
+            kind: JobKind::Test,
+            label: "cargo test --test small".into(),
+            history: Some(keys("small")),
+            ..wire(pid, 2)
+        }
+    }
+
+    fn kill_all(kids: &mut [std::process::Child]) {
+        for k in kids {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+    }
+
+    #[test]
+    fn issue2254_ピークを過ぎた実行中は後ろの小さい処理を止めない() {
+        let _g = serial();
+        reset_for_test(Some(Role::Production));
+        // 小さい処理の過去の記録（最大 1.1 GB）
+        lock().history = vec![HistoryRow {
+            key: "small".into(),
+            kind: JobKind::Test,
+            peak_mb: 1100,
+            ..HistoryRow::default()
+        }];
+        let mut kids = alive_children(2);
+        let pids: Vec<u32> = kids.iter().map(|c| c.id()).collect();
+        let now = Instant::now();
+        fix_machine(8 * 1024, Pressure::Normal);
+        start_big(pids[0], now);
+        // 最大 7.3 GB（見込み 7 GB に届いた）を 240 秒で過ぎて、今 0.3 GB
+        set_usage(pids[0], 300, 7475, 240);
+        // 本当に空きが無い（1.1 + 予約 3.6 > 空き 4 GB）→ 待つ
+        fix_machine(4 * 1024, Pressure::Normal);
+        let s = poll(&small(pids[1]), now).unwrap();
+        assert_eq!(
+            (s["state"].as_str(), s["reason"].as_str()),
+            (Some("waiting"), Some("memory")),
+            "{s}"
+        );
+        assert_eq!(
+            s["estimate_mb"], 1152,
+            "見込みは過去の記録（1.1 GB を 128 MB 刻みへ）"
+        );
+        // メモリ圧 warn → 待つ
+        fix_machine(30 * 1024, Pressure::Warn);
+        let s = poll(&small(pids[1]), now).unwrap();
+        assert_eq!(s["reason"], "pressure_warn", "{s}");
+        // 空き 8 GB・normal: 修正前は「6.7 GB + 7 GB」を要して待った形。今はピーク後なので入る
+        fix_machine(8 * 1024, Pressure::Normal);
+        let s = poll(&small(pids[1]), now).unwrap();
+        assert_eq!(s["state"], "granted", "{s}");
+        let st = status_section();
+        let big = st["running"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["label"] == "cargo test --workspace")
+            .cloned()
+            .unwrap_or_else(|| panic!("実行中に居ない: {st}"));
+        assert_eq!(
+            (
+                big["pending_mb"].as_u64(),
+                big["peak_passed"].as_bool(),
+                big["estimate_from"].as_str()
+            ),
+            (Some(0), Some(true), Some("default")),
+            "{big}"
+        );
+        kill_all(&mut kids);
+    }
+
+    #[test]
+    fn issue2254_終わった処理の最大を記録して次の見込みに使う() {
+        let _g = serial();
+        reset_for_test(Some(Role::Production));
+        let mut kids = alive_children(2);
+        let pids: Vec<u32> = kids.iter().map(|c| c.id()).collect();
+        let now = Instant::now();
+        let mut big = start_big(pids[0], now);
+        set_usage(pids[0], 300, 7475, 240);
+        big.exit_code = Some(0);
+        done(&big, now).unwrap();
+        let row = lock().history.last().cloned().expect("記録を足した");
+        assert_eq!(
+            (
+                row.key.as_str(),
+                row.peak_mb,
+                row.peak_at_s,
+                row.ran_s,
+                row.exit_code
+            ),
+            ("big", 7475, Some(240), 600, Some(0)),
+            "{row:?}"
+        );
+        assert_eq!(row.name, "cargo test");
+        // 同じコマンドの次の回: 見込みは記録の最大（7,475 MB を 128 MB 刻みへ）・山の時刻 240 秒
+        let next = JobWire {
+            kind: JobKind::Test,
+            history: Some(keys("big")),
+            ..wire(pids[1], 3)
+        };
+        assert_eq!(poll(&next, now).unwrap()["state"], "granted");
+        let job = lock().jobs.get(&u64::from(pids[1])).cloned().unwrap();
+        assert_eq!(
+            (job.estimate.mb, job.estimate.from, job.estimate.peak_at_s),
+            (7552, q::EstimateFrom::History, Some(240))
+        );
+        // 鍵を送らない旧い wrapper・走査の前に終わった件は記録しない
+        let mut old = wire(pids[1], 3);
+        old.child_pid = Some(pids[1]);
+        let n = lock().history.len();
+        assert_eq!(poll(&old, now).unwrap()["state"], "running");
+        old.exit_code = Some(0);
+        done(&old, now).unwrap();
+        assert_eq!(lock().history.len(), n, "鍵の無い件は記録しない");
+        kill_all(&mut kids);
+    }
+
+    #[test]
+    fn issue2254_待ちの上限で諦めた件は押さえていた処理を残す() {
+        let _g = serial();
+        reset_for_test(Some(Role::Production));
+        lock().history = vec![HistoryRow {
+            key: "small".into(),
+            peak_mb: 1100,
+            ..HistoryRow::default()
+        }];
+        let mut kids = alive_children(2);
+        let pids: Vec<u32> = kids.iter().map(|c| c.id()).collect();
+        let now = Instant::now();
+        fix_machine(8 * 1024, Pressure::Normal);
+        start_big(pids[0], now);
+        // まだピークの前（最大 2 GB・今 0.3 GB・記録なし）: 7 GB − 0.3 GB を押さえる
+        set_usage(pids[0], 300, 2048, 30);
+        let mut w = small(pids[1]);
+        let s = poll(&w, now).unwrap();
+        assert_eq!(s["reason"], "memory", "{s}");
+        assert!(
+            s["text"]
+                .as_str()
+                .unwrap()
+                .contains("実行中のまだ使っていない見込み 6.7 GB + この処理の見込み 1.1 GB"),
+            "{s}"
+        );
+        assert_eq!(s["holders"][0]["pending_mb"], 7168 - 300, "{s}");
+        // 諦める（wrapper は終了コード 75 を載せて外れる）
+        w.exit_code = Some(q::EXIT_MAX_WAIT);
+        done(&w, now).unwrap();
+        let st = status_section();
+        let r = &st["recent"][0];
+        assert_eq!(
+            (r["gave_up"].as_bool(), r["reason"].as_str()),
+            (Some(true), Some("memory")),
+            "{r}"
+        );
+        let h = &r["holders"][0];
+        assert_eq!(
+            (
+                h["label"].as_str(),
+                h["pending_mb"].as_u64(),
+                h["memory_mb"].as_u64(),
+                h["estimate_mb"].as_u64()
+            ),
+            (
+                Some("cargo test --workspace"),
+                Some(7168 - 300),
+                Some(300),
+                Some(7168)
+            ),
+            "{r}"
+        );
+        assert!(st["waiting"].as_array().unwrap().is_empty());
+        // 取り消し・シグナルで外れた待ち（75 以外）は残さない
+        let w2 = JobWire {
+            exit_code: Some(130),
+            ..small(pids[1])
+        };
+        poll(&small(pids[1]), now).unwrap();
+        done(&w2, now).unwrap();
+        assert_eq!(status_section()["recent"].as_array().unwrap().len(), 1);
+        kill_all(&mut kids);
     }
 }

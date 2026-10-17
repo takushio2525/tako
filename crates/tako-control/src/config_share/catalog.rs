@@ -209,6 +209,13 @@ pub mod notes {
         "Rate-limit observations and login keys hashed with this machine's salt; the keys would not match \
          on another device, so they are not shared",
     );
+    /// 順番待ちの過去の記録（#2254）。**共有すると鍵が合わない**: 鍵は repo の根のパスを含むハッシュなので、
+    /// 別のマシン（別のホームパス）では同じコマンドが別の鍵になる。最大メモリもこのマシンの実測
+    pub const QUEUE_HISTORY: Note = Note::new(
+        "順番待ちの過去の記録（処理ごとの最大メモリ・所要時間。鍵は repo の場所を含むハッシュ）。このマシンの実測で、別のマシンでは鍵が合わないので共有しない",
+        "Heavy-job queue history (peak memory and duration per command, keyed by a hash that includes the repo \
+         location). Measured on this machine and keyed to its paths, so it is not shared",
+    );
     pub const SESSION: Note = Note::new(
         "会話・セッションの記録。分量が大きく秘匿情報を含みうるので共有しない",
         "Conversation and session records: large and potentially sensitive, so they are not shared",
@@ -580,6 +587,15 @@ pub const CATALOG: &[Entry] = &[
         path: "usage/",
         class: Class::Local,
         note: notes::USAGE,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    // #2254: 順番待ちの過去の記録（history.jsonl / history.1.jsonl。#1996 の所要時間もここ）
+    Entry {
+        root: Root::TakoData,
+        path: "resources/",
+        class: Class::Local,
+        note: notes::QUEUE_HISTORY,
         local_fields: &[],
         needs_local_unless: &[],
     },

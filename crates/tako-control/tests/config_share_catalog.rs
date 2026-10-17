@@ -236,6 +236,9 @@ fn 動的に名前が決まるファイルも分類されている() {
         ("tako", "orchestrator/handoff/default.md", Class::Local),
         // ペインごとの平文ログ
         ("tako", "pane-logs/pane-42.log", Class::Local),
+        // 順番待ちの過去の記録と回した古い方（#2254）
+        ("tako", "resources/history.jsonl", Class::Local),
+        ("tako", "resources/history.1.jsonl", Class::Local),
         // プロファイル定義（宣言的設定なので共有する）
         ("tako", "orchestrator/profiles/takodev.yaml", Class::Shared),
         (

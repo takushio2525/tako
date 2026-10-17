@@ -7722,6 +7722,18 @@ fn print_queue_section(q: &Value) {
             (Some(m), None) => format!("  {}", human_mb(m)),
             _ => String::new(),
         };
+        // 後ろの空きメモリの判定で押さえている分（ピーク前の「まだ使っていない見込み」。#2254）
+        let pending = r["pending_mb"]
+            .as_u64()
+            .filter(|p| *p > 0)
+            .map(|p| {
+                format!(
+                    "  まだ使っていない見込み {}（見込み {}）",
+                    human_mb(p),
+                    human_mb(r["estimate_mb"].as_u64().unwrap_or(0))
+                )
+            })
+            .unwrap_or_default();
         let mut flags = Vec::new();
         if r["stalled"] == true {
             flags.push("停滞（枠を返した）");
@@ -7730,12 +7742,13 @@ fn print_queue_section(q: &Value) {
             flags.push("取り消し中");
         }
         println!(
-            "  実行  {}  {}{}  {}{}  取り分 {}{}",
+            "  実行  {}  {}{}  {}{}{}  取り分 {}{}",
             r["id"],
             r["label"].as_str().unwrap_or("?"),
             pane(r),
             tako_control::queue_wrapper::human_secs(r["ran_s"].as_u64().unwrap_or(0)),
             mem,
+            pending,
             r["share"],
             if flags.is_empty() {
                 String::new()
@@ -7766,7 +7779,9 @@ fn print_queue_section(q: &Value) {
     if let Some(text) = q["blocked"]["text"].as_str().filter(|_| !per_job) {
         println!("  先頭が待つ理由: {text}");
     }
-    if let Some(r) = q["recent"].as_array().and_then(|a| a.first()) {
+    let recent = q["recent"].as_array().cloned().unwrap_or_default();
+    // 直近に終わった件（諦めた待ちは下の「直近の諦め」で出す）
+    if let Some(r) = recent.iter().find(|r| r["gave_up"] != true) {
         let end = if r["lost"] == true {
             "wrapper が消えた".to_string()
         } else {
@@ -7784,16 +7799,29 @@ fn print_queue_section(q: &Value) {
                 .unwrap_or_default()
         );
     }
-}
-
-/// MiB → 人が読む GB / MB
-fn human_mb(mb: u64) -> String {
-    if mb >= 1024 {
-        format!("{:.1} GB", mb as f64 / 1024.0)
-    } else {
-        format!("{mb} MB")
+    // 待ちの上限で諦めた直近の件と、そのとき押さえていた処理（#2254）
+    if let Some(r) = recent.iter().find(|r| r["gave_up"] == true) {
+        println!(
+            "  直近の諦め: {}  {}  待ち {}{}",
+            r["id"],
+            r["label"].as_str().unwrap_or("?"),
+            tako_control::queue_wrapper::human_secs(r["waited_s"].as_u64().unwrap_or(0)),
+            r["text"]
+                .as_str()
+                .map(|t| format!("  — {t}"))
+                .unwrap_or_default()
+        );
+        let lines = tako_control::queue_wrapper::gave_up_lines(&serde_json::json!({
+            "holders": r["holders"],
+        }));
+        for line in lines {
+            println!("    {line}");
+        }
     }
 }
+
+// MiB → 人が読む GB / MB（wrapper の諦めたときの表示と同じ 1 実装。#2254）
+use tako_control::queue_wrapper::human_mb;
 
 /// 誰の処理か（ペインなら番号・タブ・役割、外なら起点のアプリ）
 fn queue_owner_text(v: &Value) -> String {
