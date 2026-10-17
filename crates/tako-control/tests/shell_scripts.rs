@@ -2438,7 +2438,7 @@ fn bash32_outputs(bash: &str, lines: &[String], brace: bool) -> Result<Vec<Strin
         .map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut outputs = Vec::with_capacity(lines.len());
-    for i in 0..lines.len() {
+    for (i, line) in lines.iter().enumerate() {
         let (start, end) = (format!("\n@@{i}@@\n"), format!("\n@@{}@@\n", i + 1));
         let body = stdout
             .split_once(&start)
@@ -2446,9 +2446,8 @@ fn bash32_outputs(bash: &str, lines: &[String], brace: bool) -> Result<Vec<Strin
             .map(|(body, _)| body.to_string())
             .ok_or_else(|| {
                 format!(
-                    "{}行目（{}）の出力の区切りが無い（bash が途中で終わった？ 終了コード {}）",
+                    "{}行目（{line}）の出力の区切りが無い（bash が途中で終わった？ 終了コード {}）",
                     i + 1,
-                    lines[i],
                     out.status
                 )
             })?;
