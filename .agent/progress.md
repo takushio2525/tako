@@ -20,18 +20,6 @@
 
 ---
 
-## 2026-10-17（#1868: テストの「存在しない ID」の決め打ち 33 か所を `tako_core::unused_id`（採番器から 1 つ取る）へ寄せ、番犬 `issue1868_stale_id_watchdog` で縛る）
-- `u64::MAX` は採番器が巻き戻るので不採用・全体テスト並列 1 / 2 / 4 で緑。固定番号のレジストリの残りは #2239。PR #2236
-
-## 2026-10-17（#1933 / #1969: 夜間の mod の検査の「取り出せない」の真因は `git archive | tar` で tar が終端で抜けた後の git の SIGPIPE。ファイル経由へ・記録が使えなくても結果の行と通知の本文を出す）
-- 注入 `TAKO_1933_INJECT=archive-late-tail` で修正前は原報告と同じ 5 件 FAIL → 修正後 0・20 回連続 × 2 シェル緑。PR #2240
-
-## 2026-10-17（#2230: persist.log と画面の読めない理由を serde の素の文言から「種類 + 行・列」へ = `load_issue::{json,yaml}_error_reason`・番犬 `issue2230_serde_reason_watchdog`）
-- 型違いの目印の値で A/B `TAKO_2230_LEGACY=1`（settings / profiles / projects.yaml で値の件数 0）。PR #2237
-
-## 2026-10-17（#1905: MCP カタログの折り返しで和文と英字が詰まる形・意味を並べた enum の漏れ（config_share の unlink ほか 5 件）を番犬に、説明文 72 本を圧縮して 203,726 → 194,512 B（残り 10,288 B））
-- PR #2241
-
 ## 2026-10-17（#1970: 隔離 GUI の既定で本番の env を落とし・自動リネームを止め・claude の設定 dir を本物へ向けない + 番犬が検証スクリプトの持ち込みを file:line で名指す）
 - 実経路 新 17/0・旧ヘルパ 3/14。番犬が見つけた持ち込み 5 本（verify-claude-mcp ほか）を修正。PR #2242
 
@@ -79,3 +67,15 @@
 
 ## 2026-10-17（#1666: テストの固定名の一時 dir 22 か所と名前を引数で受ける `write_test_pdf`・autorename の `temp_dir_for` を `ScratchDir` へ。番犬 `issue1666_fixed_temp_dir_watchdog` が固定名と引数そのままの join を file:line で名指す）
 - 修正前は 2 プロセス同時で 5 回とも片方が落ち → 修正後 10/10 緑・残骸 0。PR #2271
+
+## 2026-10-17（#1633: pipefail の下の `echo/printf | grep -q` を 31 本・76 箇所で here-string / 配列の比較へ・番犬 `pipefailの下でechoとprintfの出力をgrep_qへパイプしない`（例外 `# tako:pipefail-ok`））
+- 4 MB の注入で旧 100/100 偽 → 新 0/100（3.2 / 5）。残り（echo/printf 以外の左辺・`| head`）は #2272。PR #2273
+
+## 2026-10-17（#1701 / #1674: CLI / MCP の検索で飛んだあと選択の写しもヒットへ揃える = `preview::search_jump` の 1 実装・番犬 `issue1701_search_selection_watchdog`。全置換のあとのカーソルは最後の置換の末尾・undo で置換前へ = FR-3.5）
+- A/B `TAKO_1701_LEGACY=1` / `TAKO_1674_LEGACY=1`・単体 7 本・GUI の実経路は蓋閉じで未実測・カタログ +0 B。PR #2276
+
+## 2026-10-17（#2272: pipefail の下の `X | grep -q`（左辺を問わず 62 箇所）と終了コードを見る `X | head`（20 箇所）+ eval 文字列 2 行をパイプ無しへ・番犬 `pipefailの下で早く抜ける読み手へパイプしない`）
+- A/B 248 KB の左辺で旧 0/20・新 20/20（3.2 / 5.3）・例外宣言 0。既存の落ち test-queue-1992 ⑪ は #2279。PR #2278
+
+## 2026-10-18（#2275: Windows の `pid_alive` が終了状態を見ず在籍表だけで読み、`wait()` 直後の終わったプロセスを「居る」と答えていた → 先に `GetExitCodeProcess` を問う `alive_unless_exited`・テストは `wait_gone` で待つ（同型 3 か所も））
+- 注入 `TAKO_2275_INJECT_ALIVE_MS`・Windows CI 緑・カタログ +0 B。PR #2277
