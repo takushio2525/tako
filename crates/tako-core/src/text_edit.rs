@@ -934,6 +934,15 @@ fn legacy_1869() -> bool {
     )
 }
 
+/// `TAKO_1674_LEGACY=1` で **#1674 前の全置換のカーソル**へ戻す（同一バイナリで A/B を取る入口。
+/// 編集前の位置を置換後の長さで切り詰めるだけなので、先頭付近を置換すると置き場がずれる）
+fn legacy_1674() -> bool {
+    matches!(
+        std::env::var("TAKO_1674_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 並べた書き換えを 1 か所の置き換えへまとめる（#1683）。最初の始まりから最後の終わりまでを、
 /// あいだの本文を挟んだ置換後の文字列で置き換える。**#1869 前の当て方で、今は A/B の旧腕
 /// （[`legacy_1869`]）だけが使う**（10 MB の文書では 1 回で undo の予算を超える）
@@ -1793,8 +1802,8 @@ impl TextBuffer {
         self.auto_pairs.follow(splices);
         self.splice_text(splices);
         // 編集後の本文で丸める。丸めずに持つと、その位置が差分へ記録されて
-        // **undo / redo のたびに再現される**（`replace_all` は編集前のカーソルを
-        // 長さで切り詰めるだけなので、多バイト文字の途中を指しうる = 次の編集で panic）
+        // **undo / redo のたびに再現される**（#1674 前の `replace_all` = A/B の旧腕は編集前の
+        // カーソルを長さで切り詰めるだけなので、多バイト文字の途中を指しうる = 次の編集で panic）
         let cursor = snap_cursor(&self.text, cursor.min(self.text.len()));
         let delta = EditDelta {
             spans,
@@ -2132,7 +2141,11 @@ impl TextBuffer {
         1
     }
 
-    /// 全置換。戻り値は置換件数
+    /// 全置換。戻り値は置換件数。
+    ///
+    /// 置換のあとのカーソルは**最後の置換の末尾**（#1674。1 件置換 = [`Self::replace_range`] の
+    /// 「置き換えた箇所の末尾」と同じ規則）で、選択は外れる。0 件なら本文もカーソルも動かない。
+    /// undo 1 回で本文とカーソル・選択が置換前へ戻る（差分が編集前後のカーソルを持つ = #1651）
     pub fn replace_all(&mut self, query: &str, replacement: &str, options: SearchOptions) -> usize {
         let hits = self.find_all(query, options);
         if hits.is_empty() {
@@ -2151,8 +2164,14 @@ impl TextBuffer {
             prev = hit.end;
         }
         let count = hits.len();
-        let new_len = self.text.len() - (end - start) + after.len();
-        let cursor = self.cursor.min(new_len);
+        // `after` は最後のヒットの置換で終わる（その後ろの本文は触る範囲の外）ので、
+        // 触る範囲の始まり + 置換後の長さ = 置換後の本文での最後の置換の末尾
+        let cursor = if legacy_1674() {
+            let new_len = self.text.len() - (end - start) + after.len();
+            self.cursor.min(new_len)
+        } else {
+            start + after.len()
+        };
         self.apply_edit(Edit {
             splices: &[Splice::new(start..end, &after)],
             cursor,
@@ -3456,6 +3475,103 @@ mod tests {
         assert_eq!(buffer.text(), "aYYbYYcYY");
         assert!(buffer.undo());
         assert_eq!(buffer.text(), "aXbXcX");
+    }
+
+    /// #1674: 全置換のあとのカーソルは最後の置換の末尾（1 件置換と同じ規則）で、選択は外れる。
+    /// 修正前は編集前の位置を置換後の長さで切り詰めていたので、先頭付近の置換で置き場がずれた
+    /// （A/B の旧腕 `TAKO_1674_LEGACY=1` で走らせるとここが落ちる）
+    #[test]
+    fn issue1674_replace_allのカーソルは最後の置換の末尾() {
+        // (本文, 置換前のカーソル, 探す語, 置き換える語, 置換後の本文, 置換後のカーソル)
+        let cases = [
+            // 先頭: 末尾にいたカーソルを新しい長さへ切り詰めず、置き換えた語の末尾へ
+            ("foo bar baz", 11, "foo", "x", "x bar baz", 1),
+            // 中央: 先頭にいたカーソルが先頭に残らない
+            ("aa foo bb", 0, "foo", "QQQQ", "aa QQQQ bb", 7),
+            // 末尾
+            ("aa bb foo", 0, "foo", "z", "aa bb z", 7),
+            // 複数件: 最後の 1 件の末尾（最初のヒットではない）
+            ("x1x2x3", 0, "x", "YY", "YY1YY2YY3", 8),
+            // 本文が短くなる: 編集前の位置（末尾）を新しい長さで切り詰めた位置ではない
+            (
+                "hello world hello tail",
+                22,
+                "hello",
+                "h",
+                "h world h tail",
+                9,
+            ),
+            // 空へ置き換える（消す）: 最後に消した箇所
+            ("a-b-c", 0, "-", "", "abc", 2),
+            // 多バイト: 文字の途中を指さない
+            (
+                "あいうあい",
+                0,
+                "い",
+                "うえ",
+                "あうえうあうえ",
+                "あうえうあうえ".len(),
+            ),
+        ];
+        for (text, cursor, query, replacement, expected, expected_cursor) in cases {
+            let mut buffer = TextBuffer::from_text(path("replace-all-cursor-1674"), text.into());
+            buffer.set_cursor(cursor, false);
+            assert!(buffer.replace_all(query, replacement, SearchOptions::DEFAULT) > 0);
+            assert_eq!(buffer.text(), expected, "{text:?}");
+            assert_eq!(
+                buffer.cursor(),
+                expected_cursor,
+                "{text:?} の {query:?} → {replacement:?} のあとのカーソル"
+            );
+            assert_eq!(buffer.anchor(), None, "置換で選択は外れる: {text:?}");
+        }
+    }
+
+    /// #1674: 0 件なら本文もカーソルも選択も動かない（版も進まない = undo に積まない）
+    #[test]
+    fn issue1674_replace_allが0件ならカーソルも選択も動かない() {
+        let mut buffer = TextBuffer::from_text(path("replace-all-none-1674"), "abc def".into());
+        buffer.set_selection(1, 5);
+        let version = buffer.version();
+        assert_eq!(buffer.replace_all("zzz", "y", SearchOptions::DEFAULT), 0);
+        assert_eq!(buffer.text(), "abc def");
+        assert_eq!((buffer.anchor(), buffer.cursor()), (Some(1), 5));
+        assert_eq!(buffer.version(), version);
+        assert!(!buffer.undo(), "何も積んでいない");
+    }
+
+    /// #1674: undo 1 回で本文とカーソル・選択が置換前へ戻り、redo で最後の置換の末尾へ戻る
+    /// （差分が編集前後のカーソルと選択を持つ = #1651）
+    #[test]
+    fn issue1674_replace_allのundoでカーソルと選択も戻る() {
+        let mut buffer =
+            TextBuffer::from_text(path("replace-all-undo-1674"), "foo bar foo baz".into());
+        // "bar" を選んだまま全置換する（anchor 4・カーソル 7）
+        buffer.set_selection(4, 7);
+        assert_eq!(buffer.replace_all("foo", "quux", SearchOptions::DEFAULT), 2);
+        assert_eq!(buffer.text(), "quux bar quux baz");
+        assert_eq!((buffer.anchor(), buffer.cursor()), (None, 13));
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "foo bar foo baz");
+        assert_eq!(
+            (buffer.anchor(), buffer.cursor()),
+            (Some(4), 7),
+            "選択ごと置換前へ戻る"
+        );
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "quux bar quux baz");
+        assert_eq!((buffer.anchor(), buffer.cursor()), (None, 13));
+    }
+
+    /// #1674: 置換文字列の改行をバッファの流儀（CRLF）へ揃えた後の長さで末尾を決める
+    #[test]
+    fn issue1674_crlfへ改行を含む全置換のカーソル() {
+        let mut buffer =
+            TextBuffer::from_text(path("replace-all-crlf-1674"), "Q\r\nQ\r\nend".into());
+        assert_eq!(buffer.replace_all("Q", "1\n2", SearchOptions::DEFAULT), 2);
+        assert_eq!(buffer.text(), "1\r\n2\r\n1\r\n2\r\nend");
+        assert_eq!(buffer.cursor(), "1\r\n2\r\n1\r\n2".len());
+        assert_eq!(buffer.line_byte_col(buffer.cursor()), (3, 1));
     }
 
     /// #1659: 外部変更を検知した後の 2 択（上書き / 読み直し）の往復
