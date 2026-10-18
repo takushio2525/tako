@@ -1,13 +1,15 @@
-# 配布物に同梱するライセンスの表（正本。Issue #1845 / #1850）
+# 配布物に同梱するライセンスの表（正本。Issue #1845 / #1850 / #2305）
 #
 # GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務のため、両 OS の配布物が
 # 同じ本数を持つ。1 行 1 本で「元ファイル（リポジトリ直下）」「Windows の配布物での名前」を並べる。
 # macOS の .app（Contents/Resources/）へは元ファイルの名前のまま置く。
 # LICENSE は Windows ではメモ帳で開けるよう .txt を付ける。
 #
-# この表を読むのは次の 2 つだけ。ほかの場所に名前を並べ直さない（2 か所目の表を作らない）:
+# この表を読むのは次の 3 つだけ。ほかの場所に名前を並べ直さない（2 か所目の表を作らない）:
 #   - crates/tako-control/tests/license_bundle_watchdog.rs … 組み立ての全箇所（build-app.sh /
-#     tako.iss / build-installer.ps1 / verify-assets.ps1 の $TakoLicenseBundle）と突き合わせる番犬
+#     tako.iss / build-installer.ps1）と突き合わせ、検査する側が表を読んでいるかを見る番犬
+#   - installer/windows/lib/verify-assets.ps1 … Get-TakoLicenseBundle。Windows のリリース検査
+#     （zip とインストール先）が配布物の中身を確かめる
 #   - scripts/lib/license-bundle.sh … scripts/release.sh --check-assets が公開済みの zip を検査する
 LICENSE                  LICENSE.txt
 THIRD-PARTY-NOTICES.md   THIRD-PARTY-NOTICES.md

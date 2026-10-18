@@ -32,11 +32,11 @@
   `tako.iss` の `MinVersion` と `build-app.sh` の `LSMinimumSystemVersion` との一致を
   テストが検証する（ノートの要件と配布物の実際の下限がズレない）
 
-## 配布物に同梱するライセンス（#1709 / #1845 / #1850）
+## 配布物に同梱するライセンス（#1709 / #1845 / #1850 / #2305）
 
 GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、バイナリの受け取り手へ
 本文と著作権表示を渡すことを求める。**両 OS の配布物が同じ 3 本を持つ**のが正常な状態。
-同梱表の正本は `scripts/lib/license-bundle.txt`（下の表は説明用。番犬と公開後の検査はこの 1 つを読む）。
+同梱表の正本は `scripts/lib/license-bundle.txt`（下の表は説明用。番犬・Windows のリリース検査・公開後の検査はこの 1 つを読む）。
 
 | 元ファイル（リポジトリ直下） | macOS（`tako.app/Contents/Resources/`） | Windows（zip の `tako/`・インストール先） |
 |---|---|---|
@@ -47,10 +47,14 @@ GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、�
 - 組み立て: macOS = `scripts/build-app.sh`（署名より前に置く）/ Windows の zip =
   `installer/windows/build-installer.ps1` / Windows のインストーラー = `installer/windows/tako.iss`
   の `[Files]`。**3 か所とも 1 本ずつ明示で並べる**（まとめて glob にしない）
-- 番犬: `crates/tako-control/tests/license_bundle_watchdog.rs` が組み立ての全箇所と
-  リリース検査の表を同梱表へ突き合わせ、抜けたら置くべき場所の file:line を名指しして落ちる。
-  `release.sh` / `scripts/lib/license-bundle.sh` に名前を直書き（2 か所目の表）しても落ちる
-- 実物の検査: `installer/windows/lib/verify-assets.ps1` の `$TakoLicenseBundle` が同梱表。
+- 番犬: `crates/tako-control/tests/license_bundle_watchdog.rs` が組み立ての全箇所を
+  同梱表へ突き合わせ、抜けたら置くべき場所の file:line を名指しして落ちる。検査する側
+  （`verify-assets.ps1` / `release.sh` / `scripts/lib/license-bundle.sh`）に名前を直書き（2 か所目の表）しても落ちる。
+  pwsh があれば `verify-assets.ps1` の読み手を実際に動かし、表どおりに読むこと・表が無い / 空 / 崩れた行 /
+  置き場に無いを名指しで落ちることを確かめる（CI の macOS / Windows で走る）
+- 実物の検査: `installer/windows/lib/verify-assets.ps1` の `Get-TakoLicenseBundle` が同梱表を読む
+  （写しを持たない。#2305）。表が無い・1 本も無い・2 列でない行は表の file:line を名指しして throw する
+  （空の表のまま素通りさせない）。
   zip は `Test-TakoWindowsAssets` が展開してリポジトリの元ファイルとのバイト一致を見る
   （CI・実機の両経路）。インストール先は `Test-TakoInstalledPayload` が**使い捨ての CI
   ランナーでだけ**無人インストールして見る（実機で走らせると同じ AppId の実インストールの

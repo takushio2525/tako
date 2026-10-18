@@ -14,8 +14,8 @@
       3. インストーラーの FileVersion がタグの数値部分と一致する
       4. zip を展開でき、中の tako-app.exe / tako.exe の FileVersion も一致する
          （= Windows ホストでビルドされている。クロスビルドではリソースが埋まらない）
-      5. zip にライセンス本文と第三者の告知（$TakoLicenseBundle の 3 本）が入り、
-         リポジトリの元ファイルとバイト一致する（Issue #1845）
+      5. zip にライセンス本文と第三者の告知（同梱表 scripts/lib/license-bundle.txt の全部）が入り、
+         リポジトリの元ファイルとバイト一致する（Issue #1845 / #2305）
 
     インストーラーがインストール先へ置く中身は、実際にインストールしないと分からないので
     Test-TakoInstalledPayload が別に見る。こちらは CI の使い捨てランナー専用
@@ -35,16 +35,12 @@ $TakoMinAssetBytes = 5MB
 # リポジトリのルート（このファイルは installer/windows/lib/ にある）
 $TakoRepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 
-# 配布物へ同梱するライセンス本文と第三者の告知（Issue #1845）。
-# キーは配布物の中の名前、値はリポジトリ直下の元ファイル。LICENSE は .txt を付けて
-# メモ帳で開けるようにする。組み立て側（build-installer.ps1 の zip・tako.iss の [Files]）と
-# macOS の scripts/build-app.sh がこの 3 本を置いていることは
-# crates/tako-control/tests/license_bundle_watchdog.rs が検査する
-$TakoLicenseBundle = [ordered]@{
-    'LICENSE.txt'             = 'LICENSE'
-    'THIRD-PARTY-NOTICES.md'  = 'THIRD-PARTY-NOTICES.md'
-    'THIRD-PARTY-LICENSES.md' = 'THIRD-PARTY-LICENSES.md'
-}
+# 配布物へ同梱するライセンス本文と第三者の告知の表（Issue #1845 / #2305。リポジトリのルートからの相対パス）。
+# **正本はこの表の 1 か所**で、ここに名前を並べ直さない（2 か所目の表を作らない）。同じ表を
+# crates/tako-control/tests/license_bundle_watchdog.rs（組み立ての全箇所 = build-installer.ps1 の zip・
+# tako.iss の [Files]・macOS の scripts/build-app.sh との突き合わせ）と scripts/lib/license-bundle.sh
+# （release.sh --check-assets の公開後の検査）が読む
+$TakoLicenseBundleTable = 'scripts/lib/license-bundle.txt'
 
 # タグ形式（v0.6.0 / v0.6.0-rc1 / v0.7.9-win.1）から数値部分だけを取り出す。
 # 埋め込みリソースの FileVersion は数値しか持てないのでこちらと突き合わせる
@@ -65,7 +61,41 @@ function Test-TakoSameVersion([string]$a, [string]$b) {
 
 <#
 .SYNOPSIS
-    展開した配布物の置き場 Dir に $TakoLicenseBundle の 3 本が入り、リポジトリの元ファイルと
+    同梱表 $TakoLicenseBundleTable を読み、1 本ずつ Source（リポジトリ直下の元ファイル）/
+    WindowsName（配布物の中の名前。LICENSE はメモ帳で開けるよう .txt を付ける）/ Line（表の行）を返す。
+
+.DESCRIPTION
+    表が無い・1 本も無い・「元ファイル Windows での名前」の 2 列でない行があれば、表の file:line を
+    名指しして throw する（空の表のまま検査を素通りさせない）。行の読み方は
+    scripts/lib/license-bundle.sh の tako_license_bundle と同じ（# で始まる行と空行は飛ばす）。
+    PowerShell 5.1 でも動く書き方にする（?? や三項演算子を使わない）
+#>
+function Get-TakoLicenseBundle {
+    $table = Join-Path $TakoRepoRoot $TakoLicenseBundleTable
+    if (-not (Test-Path -LiteralPath $table -PathType Leaf)) {
+        throw "ライセンスの同梱表 $TakoLicenseBundleTable が無い（$table）"
+    }
+    $entries = @()
+    $n = 0
+    foreach ($raw in @(Get-Content -LiteralPath $table -Encoding UTF8)) {
+        $n++
+        $t = ([string]$raw).Trim()
+        if ($t -eq '' -or $t.StartsWith('#')) { continue }
+        $cols = @($t -split '\s+')
+        if ($cols.Count -ne 2) {
+            throw "${TakoLicenseBundleTable}:${n}: 「元ファイル Windows での名前」の 2 列になっていない: $t"
+        }
+        $entries += [PSCustomObject]@{ Source = $cols[0]; WindowsName = $cols[1]; Line = $n }
+    }
+    if ($entries.Count -eq 0) {
+        throw "ライセンスの同梱表 $TakoLicenseBundleTable に 1 本も無い（$table）"
+    }
+    $entries
+}
+
+<#
+.SYNOPSIS
+    展開した配布物の置き場 Dir に同梱表（Get-TakoLicenseBundle）の全部が入り、リポジトリの元ファイルと
     バイト一致することを確かめる。欠け・空・食い違いは throw する。Label は案内に出す名前。
 #>
 function Test-TakoLicenseBundle {
@@ -75,20 +105,24 @@ function Test-TakoLicenseBundle {
         [Parameter(Mandatory = $true)][string]$Label
     )
 
-    foreach ($entry in $TakoLicenseBundle.GetEnumerator()) {
-        $p = Join-Path $Dir $entry.Key
+    foreach ($entry in @(Get-TakoLicenseBundle)) {
+        $at = "${TakoLicenseBundleTable}:$($entry.Line)"
+        $src = Join-Path $TakoRepoRoot $entry.Source
+        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+            throw "リポジトリに $($entry.Source) が無く $Label の $($entry.WindowsName) と照合できない（$at の行）"
+        }
+        $p = Join-Path $Dir $entry.WindowsName
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
-            throw "$Label に $($entry.Key) が入っていない（リポジトリの $($entry.Value) を同梱すること。Issue #1845）"
+            throw "$Label に $($entry.WindowsName) が入っていない（リポジトリの $($entry.Source) を同梱すること。$at の行。Issue #1845）"
         }
         $size = (Get-Item -LiteralPath $p).Length
-        if ($size -le 0) { throw "$Label の $($entry.Key) が空" }
-        $src = Join-Path $TakoRepoRoot $entry.Value
+        if ($size -le 0) { throw "$Label の $($entry.WindowsName) が空" }
         $got = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash
         $want = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash
         if ($got -ne $want) {
-            throw "$Label の $($entry.Key) がリポジトリの $($entry.Value) と一致しない（SHA-256 $got / 期待 $want）"
+            throw "$Label の $($entry.WindowsName) がリポジトリの $($entry.Source) と一致しない（SHA-256 $got / 期待 $want）"
         }
-        Write-Host ("   [OK] {0} の {1,-24} {2,10:N0} bytes（リポジトリの {3} と一致）" -f $Label, $entry.Key, $size, $entry.Value)
+        Write-Host ("   [OK] {0} の {1,-24} {2,10:N0} bytes（リポジトリの {3} と一致）" -f $Label, $entry.WindowsName, $size, $entry.Source)
     }
 }
 
@@ -166,7 +200,7 @@ function Test-TakoWindowsAssets {
     tako.iss の [Files] が実際にインストール先へ何を置くかは、インストーラーを動かさないと
     確かめられない（Inno Setup の出力は中身を一覧できる形式ではない）。そこで CI の windows
     ランナー（使い捨て）で /VERYSILENT のインストールを 1 回走らせ、exe 2 本と
-    $TakoLicenseBundle の 3 本が置かれたことを見る。
+    同梱表（Get-TakoLicenseBundle）の全部が置かれたことを見る。
 
     **実機では呼ばない**（release-windows.ps1 からも呼んでいない）。同じ AppId の
     実インストールの登録（HKCU のアンインストール情報）を上書きするため。
