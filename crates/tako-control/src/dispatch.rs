@@ -2873,6 +2873,37 @@ pub fn lsp_results(
     Ok(out)
 }
 
+/// `tako theme colors` / MCP `tako_theme colors` の応答（#1830。CLI / MCP 共通）。
+///
+/// 色の値・出どころ・`warnings` はどれも settings.json を解いた 1 回ぶん（[`resolve_theme`] と
+/// 同じ上書きの表）から組む。読めずに既定の色へ戻した色は `source: "ignored"`。`warnings` は
+/// status と同じ `<キー>: <理由>`（未知のキーはここにだけ出る）で、無いときはキーごと出さない
+/// （応答は #1830 以前とバイト一致）。status の `warnings` は GUI の帳簿から引くが、ここは
+/// hex と同じ出どころに揃える（帳簿から引くと、手で直して未反映の値で hex と食い違う）
+///
+/// [`resolve_theme`]: crate::settings::Settings::resolve_theme
+fn theme_colors_response(settings: &crate::settings::Settings) -> Value {
+    use tako_core::theme::{ColorSource, Theme};
+    let (theme, warnings) = settings.resolve_theme();
+    let empty = std::collections::BTreeMap::new();
+    let overrides = settings.active_theme_overrides().unwrap_or(&empty);
+    let colors: serde_json::Map<String, Value> = Theme::COLOR_KEYS
+        .iter()
+        .map(|&k| {
+            let entry = serde_json::json!({
+                "hex": theme.color(k).map(|c| c.to_hex()).unwrap_or_default(),
+                "source": ColorSource::of(overrides, k).as_str(),
+            });
+            (k.to_string(), entry)
+        })
+        .collect();
+    let mut out = serde_json::json!({ "theme": settings.theme, "colors": colors });
+    if !warnings.is_empty() {
+        out["warnings"] = serde_json::json!(warnings);
+    }
+    out
+}
+
 /// リクエストを実行し、成功時の `result` 値を返す。
 /// `origin` は新規生成ペインの生成主体（Layer 1 CLI なら `Cli`、Phase 3 の MCP なら `Mcp`）
 /// dispatch は UI スレッド（GPUI のイベントループ）で実行されるため、ここでの遅延は
@@ -9143,25 +9174,7 @@ fn dispatch_inner(
                     }
                     Ok(status)
                 }
-                "colors" => {
-                    let settings = crate::settings::load();
-                    let (theme, _) = settings.resolve_theme();
-                    let empty = std::collections::BTreeMap::new();
-                    let overrides = match settings.theme_presets.get(&settings.theme) {
-                        Some(p) => &p.colors,
-                        None => settings.theme_colors.get(&settings.theme)
-                            .or_else(|| settings.theme_colors.get(host.theme_mode().as_str()))
-                            .unwrap_or(&empty),
-                    };
-                    let colors: serde_json::Value = Theme::COLOR_KEYS.iter().map(|&k| {
-                        let source = if overrides.contains_key(k) { "override" } else { "builtin" };
-                        (k.to_string(), serde_json::json!({
-                            "hex": theme.color(k).map(|c| c.to_hex()).unwrap_or_default(),
-                            "source": source,
-                        }))
-                    }).collect::<serde_json::Map<String, serde_json::Value>>().into();
-                    Ok(serde_json::json!({ "theme": settings.theme, "colors": colors }))
-                }
+                "colors" => Ok(theme_colors_response(&crate::settings::load())),
                 "set-color" => {
                     let k = key.as_deref().ok_or_else(|| {
                         DispatchError::InvalidParams("set-color には key が必要".into())
@@ -40376,6 +40389,112 @@ mod tests {
                 "{action}: 帳簿の警告がそのまま順に載る"
             );
         }
+    }
+
+    /// #1830: `tako theme colors` は、読めずに既定の色へ戻した色を `source: "ignored"` で返し、
+    /// `warnings` に理由を載せる（以前は override のままで、応答だけを見ると上書きが効いて
+    /// 見えた）。上書きの表は `resolve_theme` と同じ規則で選ぶ（ライトなら dark の上書きを
+    /// 出どころにしない）。警告が無いときの応答のキーは従来の 2 つ
+    #[test]
+    fn theme_colorsは読めない上書きをignoredで返す() {
+        use crate::settings::{Settings, ThemePreset};
+        use tako_core::theme::Theme;
+        let table = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let field = |v: &serde_json::Value, key: &str, name: &str| {
+            v["colors"][key][name]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let builtin = Theme::default_dark();
+
+        let mut s = Settings::default();
+        s.theme_colors.insert(
+            "dark".into(),
+            table(&[
+                ("accent", "#赤色"),
+                ("red", "#12345"),
+                ("green", "#00ff00"),
+                ("nosuch", "#000000"),
+            ]),
+        );
+        let v = theme_colors_response(&s);
+        assert_eq!(field(&v, "accent", "source"), "ignored", "{v}");
+        assert_eq!(field(&v, "accent", "hex"), builtin.accent.to_hex());
+        assert_eq!(field(&v, "red", "source"), "ignored");
+        assert_eq!(field(&v, "red", "hex"), builtin.red.to_hex());
+        assert_eq!(field(&v, "green", "source"), "override");
+        assert_eq!(field(&v, "green", "hex"), "#00ff00");
+        assert_eq!(field(&v, "background", "source"), "builtin");
+        assert_eq!(
+            v["colors"].as_object().map(|m| m.len()),
+            Some(Theme::COLOR_KEYS.len())
+        );
+        // warnings は resolve_theme の警告（persist.log の行の本体と同じ形）そのもの
+        assert_eq!(v["warnings"], serde_json::json!(s.resolve_theme().1));
+        let warnings: Vec<&str> = v["warnings"]
+            .as_array()
+            .expect("warnings がある")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.starts_with("accent: ")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("red: ")),
+            "{warnings:?}"
+        );
+        assert!(warnings.contains(&"未知の色キー: nosuch"), "{warnings:?}");
+
+        // ライト: dark の上書きは読まない = 全色 builtin・warnings はキーごと出さない
+        s.theme = "light".into();
+        let v = theme_colors_response(&s);
+        for &key in Theme::COLOR_KEYS {
+            assert_eq!(field(&v, key, "source"), "builtin", "{key}: {v}");
+        }
+        assert!(v.get("warnings").is_none(), "{v}");
+
+        // プリセット: プリセットの colors だけを見る
+        s.theme = "ocean".into();
+        s.theme_presets.insert(
+            "ocean".into(),
+            ThemePreset {
+                base: "dark".into(),
+                colors: table(&[("accent", "#xyz"), ("teal", "#0000ff")]),
+            },
+        );
+        let v = theme_colors_response(&s);
+        assert_eq!(field(&v, "accent", "source"), "ignored", "{v}");
+        assert_eq!(field(&v, "teal", "source"), "override");
+        assert_eq!(
+            field(&v, "red", "source"),
+            "builtin",
+            "dark の上書きをプリセットへ混ぜない"
+        );
+        assert_eq!(v["warnings"].as_array().map(Vec::len), Some(1), "{v}");
+
+        // 読める値だけなら応答のキーは従来の 2 つ（#1830 以前とバイト一致）
+        s.theme = "dark".into();
+        s.theme_colors
+            .insert("dark".into(), table(&[("accent", "#FF0000")]));
+        let v = theme_colors_response(&s);
+        let keys: Vec<&str> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["theme", "colors"]);
+        assert_eq!(field(&v, "accent", "source"), "override");
+        assert_eq!(field(&v, "accent", "hex"), "#ff0000");
     }
 
     /// #1756: 色の値は文字単位で検査する。6 バイトの非 ASCII（`#赤色`）がバイト長の検査を

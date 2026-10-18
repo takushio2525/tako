@@ -13220,10 +13220,7 @@ impl TakoApp {
                     return if q.is_empty() {
                         items
                     } else {
-                        items
-                            .into_iter()
-                            .filter(|item| item.label().to_lowercase().contains(&q))
-                            .collect()
+                        items.into_iter().filter(|item| item.matches(&q)).collect()
                     };
                 }
                 PaletteMode::RecentItems(entries) => {
@@ -13234,10 +13231,7 @@ impl TakoApp {
                     return if q.is_empty() {
                         items
                     } else {
-                        items
-                            .into_iter()
-                            .filter(|item| item.label().to_lowercase().contains(&q))
-                            .collect()
+                        items.into_iter().filter(|item| item.matches(&q)).collect()
                     };
                 }
                 // #919: ホスト選択（選んだらフォルダ選択へ進む）
@@ -13249,10 +13243,7 @@ impl TakoApp {
                     return if q.is_empty() {
                         items
                     } else {
-                        items
-                            .into_iter()
-                            .filter(|item| item.label().to_lowercase().contains(&q))
-                            .collect()
+                        items.into_iter().filter(|item| item.matches(&q)).collect()
                     };
                 }
                 // #919: フォルダ選択。先頭が「ここを開く」で、以下がディレクトリ
@@ -13276,10 +13267,7 @@ impl TakoApp {
                     return if q.is_empty() {
                         items
                     } else {
-                        items
-                            .into_iter()
-                            .filter(|item| item.label().to_lowercase().contains(&q))
-                            .collect()
+                        items.into_iter().filter(|item| item.matches(&q)).collect()
                     };
                 }
                 PaletteMode::Normal => {}
@@ -13367,10 +13355,7 @@ impl TakoApp {
         if q.is_empty() {
             return items;
         }
-        items
-            .into_iter()
-            .filter(|item| item.label().to_lowercase().contains(&q))
-            .collect()
+        items.into_iter().filter(|item| item.matches(&q)).collect()
     }
 
     /// コマンドパレットのキー入力処理（#217）。true = 消費した
@@ -28797,6 +28782,13 @@ impl PaletteItem {
             }
             PaletteItem::RemoteFolderDescend(_, _, label) => label.clone(),
         }
+    }
+
+    /// 絞り込みの判定（大文字小文字を問わない部分一致。`q` は小文字化済み）。
+    /// パレットのどのモードもこの 1 本を通る。表記を変えた項目が旧来の打ち方でも
+    /// 引けるかを、単体テストが同じ判定で見る（#1830）
+    fn matches(&self, q: &str) -> bool {
+        self.label().to_lowercase().contains(q)
     }
 }
 
@@ -98130,6 +98122,113 @@ mod app_menu_tests {
             "メニューの名前に `/` がある（`tako menu invoke` のパス区切りと衝突して名指しできない。\
              2 つを並べるなら「・」で書く。#1820）:\n  {}",
             offenders.into_iter().collect::<Vec<_>>().join("\n  ")
+        );
+    }
+
+    /// `ui_text/palette.rs` の中で、そのラベルのリテラル（無ければ id の行）がある位置
+    fn palette_label_at(source: &str, id: &str, label: &str) -> String {
+        let literal = format!("\"{label}\"");
+        let arm = format!("\"{id}\" =>");
+        let line = source
+            .lines()
+            .position(|l| l.contains(&literal))
+            .or_else(|| source.lines().position(|l| l.contains(&arm)))
+            .map_or(0, |i| i + 1);
+        format!("crates/tako-app/src/ui_text/palette.rs:{line}")
+    }
+
+    /// **パレットのテーマ / 表示言語の項目はメニューと同じ表記**（#1830）。
+    ///
+    /// #1820 でメニューの項目名から `/` を外した（「テーマを切替（ライト・ダーク）」
+    /// 「表示言語を切替（日本語・English）」）が、同じ操作のパレットの項目は旧の表記
+    /// （「テーマをライト/ダーク切替」「（日本語 / English）」）のまま残っていた。パレットは
+    /// パス解決を通らないので実害は無いが、同じ操作が場所によって別の名前になる。
+    /// 日本語は一字一句、英語はパレットの書き方（文頭だけ大文字）なので大小を問わずに比べ、
+    /// 食い違いは `ui_text/palette.rs` の行で名指す
+    #[test]
+    fn パレットのテーマと表示言語はメニューと同じ表記() {
+        use tako_core::i18n::Lang;
+        let source = include_str!("ui_text/palette.rs");
+        let offenders = std::cell::RefCell::new(Vec::new());
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let lang = tako_core::i18n::lang();
+            // メニューの文言は言語を固定したこの区間の中で引く（#1274）
+            for (id, want) in [
+                ("toggle-theme", crate::ui_text::menu::toggle_theme()),
+                ("toggle-language", crate::ui_text::menu::switch_language()),
+            ] {
+                let label = crate::ui_text::palette::cmd_label(id);
+                let same = match lang {
+                    Lang::Ja => label == want,
+                    Lang::En => label.to_lowercase() == want.to_lowercase(),
+                };
+                if !same {
+                    offenders.borrow_mut().push(format!(
+                        "{}: {id}（{lang:?}）= {label:?} / メニュー = {want:?}",
+                        palette_label_at(source, id, label)
+                    ));
+                }
+            }
+        });
+        let offenders = offenders.into_inner();
+        assert!(
+            offenders.is_empty(),
+            "パレットの項目がメニューと別の表記になっている（#1830）:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// **表記を揃えた後も、旧来の打ち方でパレットから引ける**（#1830）。
+    ///
+    /// 絞り込みは `PaletteItem::matches`（大文字小文字を問わない部分一致）の 1 本で、
+    /// `palette_items` と同じく問い合わせを小文字にしてから渡す。旧の表記を覚えた人が
+    /// 打ちそうな語（テーマ・ライト・ダーク・言語・English …）を表示言語ごとに並べ、
+    /// その項目が候補に残ることを見る
+    #[test]
+    fn パレットのテーマと表示言語は旧来の打ち方で引ける() {
+        use tako_core::i18n::Lang;
+        let source = include_str!("ui_text/palette.rs");
+        let cases: [(Lang, &str, &[&str]); 4] = [
+            (
+                Lang::Ja,
+                "toggle-theme",
+                &["テーマ", "ライト", "ダーク", "切替"],
+            ),
+            (
+                Lang::Ja,
+                "toggle-language",
+                &["言語", "表示言語", "日本語", "English", "english", "切替"],
+            ),
+            (
+                Lang::En,
+                "toggle-theme",
+                &["theme", "Theme", "light", "Dark", "toggle"],
+            ),
+            (
+                Lang::En,
+                "toggle-language",
+                &["language", "Language", "日本語", "english", "switch"],
+            ),
+        ];
+        let mut misses = Vec::new();
+        for (lang, id, queries) in cases {
+            crate::ui_text::tests_support::with_lang(lang, || {
+                let label = crate::ui_text::palette::cmd_label(id);
+                let item = PaletteItem::Command(label, id);
+                for q in queries {
+                    if !item.matches(&q.to_lowercase()) {
+                        misses.push(format!(
+                            "{}: {id}（{lang:?}）= {label:?} が {q:?} で引けない",
+                            palette_label_at(source, id, label)
+                        ));
+                    }
+                }
+            });
+        }
+        assert!(
+            misses.is_empty(),
+            "パレットの項目が旧来の打ち方で引けない（#1830）:\n  {}",
+            misses.join("\n  ")
         );
     }
 

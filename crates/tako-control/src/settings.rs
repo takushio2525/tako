@@ -343,21 +343,15 @@ impl Settings {
     /// 優先順: プリセット名 → ビルトイン名 + theme_colors 上書き → ダークフォールバック
     pub fn resolve_theme(&self) -> (tako_core::theme::Theme, Vec<String>) {
         use tako_core::theme::{Theme, ThemeMode};
-        let (mut theme, warnings) = if let Some(preset) = self.theme_presets.get(&self.theme) {
-            let mode = ThemeMode::parse(&preset.base).unwrap_or_default();
-            let mut t = Theme::for_mode(mode);
-            let w = t.apply_overrides(&preset.colors);
-            (t, w)
-        } else {
-            let mode = ThemeMode::parse(&self.theme).unwrap_or_default();
-            let mut t = Theme::for_mode(mode);
-            let w = if let Some(overrides) = self.theme_colors.get(mode.as_str()) {
-                t.apply_overrides(overrides)
-            } else {
-                Vec::new()
-            };
-            (t, w)
+        let mode = match self.theme_presets.get(&self.theme) {
+            Some(preset) => ThemeMode::parse(&preset.base).unwrap_or_default(),
+            None => self.theme_mode(),
         };
+        let mut theme = Theme::for_mode(mode);
+        let warnings = self
+            .active_theme_overrides()
+            .map(|overrides| theme.apply_overrides(overrides))
+            .unwrap_or_default();
         if let Some(ref family) = self.font_family {
             theme.font_family = family.clone();
         }
@@ -368,6 +362,21 @@ impl Settings {
         }
         (theme, warnings)
     }
+
+    /// 今の theme に重ねる色の上書き（プリセットならその colors、ビルトインなら
+    /// `theme_colors` のそのモードの表）。
+    ///
+    /// [`Self::resolve_theme`] と `tako theme colors` の `source` が同じ表を引く（#1830）。
+    /// 以前の `colors` は表を別の規則（theme の名前 → GUI のモードへのフォールバック）で選び、
+    /// settings.json がライトで GUI がダークのとき、ライトの既定の色に dark の上書きの
+    /// 出どころを付けて返していた
+    pub fn active_theme_overrides(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        match self.theme_presets.get(&self.theme) {
+            Some(preset) => Some(&preset.colors),
+            None => self.theme_colors.get(self.theme_mode().as_str()),
+        }
+    }
+
     /// ペインログ設定を tako-core の設定型へ解決する（Issue #112）
     pub fn pane_log_config(&self) -> tako_core::pane_log::PaneLogConfig {
         tako_core::pane_log::PaneLogConfig {

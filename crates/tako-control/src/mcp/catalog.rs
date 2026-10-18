@@ -2649,9 +2649,9 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_theme",
             "description": "UI テーマの状態確認・切替・色設定・プリセット・フォント。action: status（既定）= 現在のテーマ + \
                 プリセット一覧 / set = mode へ切替 / toggle = ダーク / ライト反転 / colors = 58 色キーの現在値と\
-                ソース / set-color = key を value へ / reset-color = key の上書きを削除 / reset-colors = \
+                ソース（読めない上書きは ignored） / set-color = key を value へ / reset-color = key の上書きを削除 / reset-colors = \
                 全上書きを削除 / save-preset = 現在の色を name で保存 / delete-preset / set-font = \
-                フォントファミリー・サイズ。status / set / toggle は読めない色を無視したとき warnings\
+                フォントファミリー・サイズ。status / set / toggle / colors は読めない色を無視したとき warnings\
                 （キー: 理由）も返す。",
             "inputSchema": {
                 "type": "object",

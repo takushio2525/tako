@@ -2448,6 +2448,17 @@ GUI が**適用中のテーマ**の帳簿（`ThemeWarningLog::current` → `Cont
 settings.json を読み直した値ではない（監視は無いので、手で直して未反映の値を応答にだけ
 出すと persist.log と食い違う）。警告が無いときはキーごと出さない（応答は #1820 以前と
 バイト一致）。実経路は `scripts/test-menu-theme-1820.sh`。
+**`colors` も応答だけで見分けられる形にする**（#1830）: `tako theme colors` / MCP `tako_theme colors`
+の各色の `source` は `builtin`（上書き無し）/ `override`（上書きが効いている）/ `ignored`（上書きは
+あるが読めず、既定の色を使っている）。以前は上書きの有無だけで決めていたので、読めない色も
+`override` と答えていた（hex は既定の色なので、応答だけを見ると上書きが効いて見える）。
+判定は `apply_overrides` と同じ `parse_hex_color` を通す `tako_core::theme::ColorSource::of`、
+上書きの表は `resolve_theme` と同じ `Settings::active_theme_overrides` の 1 本で、応答は
+`dispatch::theme_colors_response` が組む（CLI / MCP 共通）。`warnings` も status と同じ
+`<キー>: <理由>` で載せる（未知のキーはここにだけ出る）が、引くのは hex と同じ settings.json の
+解決で、GUI の帳簿ではない（`colors` の hex はもともと settings.json から解いている。帳簿から
+引くと、手で直して未反映の値で hex と warnings が食い違う）。無いときはキーごと出さない
+（応答は #1830 以前とバイト一致）。実経路は `scripts/test-theme-colors-ignored-1830.sh`。
 
 ### FR-4.7 プロファイルの GUI 編集（Issue #721。✅ 2026-08-01）
 
