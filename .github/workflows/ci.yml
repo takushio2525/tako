@@ -340,6 +340,12 @@ jobs:
       # **器を再起動してよい条件の判定が壊れたらここで落ちる**（#1150）
       - name: 仮想ディスプレイの見張りのモックテスト
         run: bash scripts/test-virtual-display-guard.sh
+      # CPU の測定スクリプト（measure-unfocused-redraw-1979.sh）が面の眠りを読めることのモックテスト。
+      # 本物の virtual-display.sh の status を、画面の列挙・器の口だけ差し替えて走らせるので、
+      # 画面の無いランナーでも走り実機には触らない。
+      # **status の終了コードの成功を前提に眠りを読む形へ戻ったらここで落ちる**（#2313）
+      - name: 測定スクリプトが面の眠りを読めることのモックテスト
+        run: /bin/bash scripts/test-measure-vd-sleep-2313.sh
       # テスト由来の事前信頼エントリを掃除するスクリプトのモックテスト。偽の HOME に
       # 作った .claude.json だけを相手にするので本番の ~/.claude.json には触らない。
       # **実プロジェクトを巻き添えで消す形へ変わったらここで落ちる**（#1030 / #1022）

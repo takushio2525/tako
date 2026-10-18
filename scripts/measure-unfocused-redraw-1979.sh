@@ -60,6 +60,27 @@ for p in parts: s = s * 60 + p
 print(f"{s:.2f}")'
 }
 
+# 測り終えた時点の面の状態を 1 語で出す（描画可能 / 眠っていた / 確かめられない。#2313）。
+# `virtual-display.sh status` は使用可のときだけ 0 を返し、眠っている・未接続・確かめられないときは
+# 1（物理画面の名前なら 3）を返す。なので終了コードの成功を前提にすると眠っていた回を読めない
+# （#1979 からこの行は「描画可能」しか出していなかった）。**終了コードは見ずに 1 行目の文言で読み**、
+# 使用可・眠っている以外は「確かめられない」と出す（描画可能と言わない = 偽の緑にしない）。
+# 語は下の python の文字列へ埋めるので固定の 3 語だけを返し、1 行目そのものは stderr へ出す。
+# モックテストは scripts/test-measure-vd-sleep-2313.sh（この関数を名前で抜き出して走らせる）
+vd_drawable_word() {
+  local out line
+  out="$("$REPO_ROOT/scripts/lib/virtual-display.sh" status 2>/dev/null)"
+  line="$(sed -n 1p <<<"$out")"
+  case "$line" in
+    *": 使用可（"*) echo "描画可能" ;;
+    *": 眠っている（"*) echo "眠っていた" ;;
+    *)
+      echo "確かめられない"
+      echo "    面の状態を確かめられない（virtual-display.sh status: ${line:-何も出さない}）" >&2
+      ;;
+  esac
+}
+
 GEN_LINES='python3 -u -c "import time,itertools
 for i in itertools.count():
     print(i, time.time(), flush=True); time.sleep(0.01)"'
@@ -99,9 +120,7 @@ run_arm() {
   c1="$(cpu_secs "$ISOLATED_GUI_PID")"
   r1="$("$TAKO_BIN" redraw-limit | python3 -c 'import json,sys; d=json.load(sys.stdin)["flushes"]; print(d["focused"] + d["unfocused"])')"
   b1="$("$TAKO_BIN" redraw-limit | python3 -c 'import json,sys; print(json.load(sys.stdin)["body_renders"])')"
-  drawable="描画可能"
-  vd_status="$("$REPO_ROOT/scripts/lib/virtual-display.sh" status 2>/dev/null)" \
-    && [[ "$(sed -n 1p <<<"$vd_status")" == *"眠っている"* ]] && drawable="眠っていた"
+  drawable="$(vd_drawable_word)"
   kill "$caff" 2>/dev/null
   python3 -c "
 cpu = ($c1 - $c0) / $SECS * 100
