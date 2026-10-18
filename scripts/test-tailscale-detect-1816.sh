@@ -92,7 +92,7 @@ EOF
 }
 
 mkenv(){
-  rm -rf "$BIN" "$HOMEDIR" "$DATADIR" "$LOGINBIN" "$SANDBOX/Applications"
+  rm -rf "$BIN" "$HOMEDIR" "$DATADIR" "$LOGINBIN" "${SANDBOX:?}/Applications"
   mkdir -p "$BIN" "$HOMEDIR" "$DATADIR" "$LOGINBIN"
   : > "$SANDBOX/ts.log"; : > "$SANDBOX/brew.log"
   # 既定: ログインシェルも隔離 PATH のまま（`-l` を剥ぐ）
