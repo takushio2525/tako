@@ -172,6 +172,13 @@
 //! - `--log-delay-ms <ms>`（`TAKO_LSP_FAKE_LOG_DELAY_MS`）: 受けたメッセージを `--log` へ書く前に
 //!   待つ（manager が「送った」ものがログに「届いた」と載るのが遅れる = #1930 の 1684 の形）
 //!
+//! ## 診断の遅れの注入（#2312）
+//!
+//! - `--publish-delay-ms <ms>`（`TAKO_LSP_FAKE_PUBLISH_DELAY_MS`）: didOpen / didChange を `--log`
+//!   へ書いた**後**、それへの診断を送る前に待つ（テストがログで didOpen を見た時点では、診断が
+//!   まだ tako に届いていない形。CI の遅い機で `issue1678_lsp_e2e.rs` のアイドルの検査が受信数
+//!   1 → 2 で落ちた順序を、どの機でも起こす）
+//!
 //! `TAKO_LSP_FAKE_ARGV_LOG=<ファイル>`（#1951）: 起動のたびに自分の起動引数（0 番 = 実行ファイルを含む）を
 //! 1 行 1 JSON の配列で追記する。知らない引数は読み飛ばすので、検出表の行が組んだ引数（`-cli <パス>` 等）を
 //! そのまま受けて、何が並んだかを e2e が読める（env だけで指定する = 起動引数を汚さない）
@@ -973,6 +980,8 @@ fn main() {
     // #1930: 答えの順序を入れ替える注入（冒頭の説明）
     let empty_delay = delay_of("--empty-delay-ms", "TAKO_LSP_FAKE_EMPTY_DELAY_MS");
     let log_delay = delay_of("--log-delay-ms", "TAKO_LSP_FAKE_LOG_DELAY_MS");
+    // #2312: didOpen / didChange をログへ書いた後、診断を送るまでの遅延（冒頭の説明）
+    let publish_delay = delay_of("--publish-delay-ms", "TAKO_LSP_FAKE_PUBLISH_DELAY_MS");
     let settle_on_empty = arg_or_env(&args, "--settle-on-empty", "TAKO_LSP_FAKE_SETTLE_ON_EMPTY");
     let settle_before = settle_on_empty.as_deref() == Some("before");
     let settle_after = settle_on_empty.as_deref() == Some("after");
@@ -1003,6 +1012,7 @@ fn main() {
         let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = message.get("id").cloned();
         if matches!(method, "textDocument/didOpen" | "textDocument/didChange") {
+            pause(publish_delay);
             let params = &message["params"];
             if let Some(uri) = apply_document(&mut docs, breaks, method, params) {
                 let text = docs.get(&uri).cloned().unwrap_or_default();
