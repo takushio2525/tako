@@ -58,7 +58,12 @@ impl Drop for Scratch {
 }
 
 fn config(scratch: &Scratch, scenario: &str) -> LspConfig {
-    let args = vec![
+    config_with(scratch, scenario, &[])
+}
+
+/// `extra` は偽サーバへ足す引数（順序の注入など）
+fn config_with(scratch: &Scratch, scenario: &str, extra: &[&str]) -> LspConfig {
+    let mut args = vec![
         "--scenario".to_string(),
         scenario.to_string(),
         "--log".to_string(),
@@ -66,6 +71,7 @@ fn config(scratch: &Scratch, scenario: &str) -> LspConfig {
         "--spawns".to_string(),
         scratch.spawns().display().to_string(),
     ];
+    args.extend(extra.iter().map(|a| a.to_string()));
     LspConfig {
         table: servers::SERVERS,
         launcher: Arc::new(move |_spec: &ServerSpec| Launch::Found {
@@ -447,15 +453,28 @@ fn アイドル中は1行も送らない() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     let scratch = Scratch::new("idle");
-    let manager = LspManager::new(config(&scratch, "normal"));
+    // #2312: 偽サーバは didOpen を受けて診断を 1 件返す。ログで didOpen を見ただけでは、その診断は
+    // まだ届いていないことがある（CI の遅い機で基準 1 → アイドル中に届いて 2）。診断を状態待ちの
+    // 周期（20ms）より遅らせて送らせる = 待ちを抜けば**どの機でも必ず**落ちる順序を常に演じる
+    let manager = LspManager::new(config_with(
+        &scratch,
+        "normal",
+        &["--publish-delay-ms", "50"],
+    ));
     let mut link = DocLink::default();
     let path = scratch.file();
     open(&manager, &mut link, &path, "fn main() {}\n", 0);
-    wait_until("didOpen", Duration::from_secs(10), || {
-        methods(&scratch).contains(&"textDocument/didOpen".to_string())
-    });
+    // 基準は相手の返事まで揃ってから取る: 診断が数に載った = reader は届いた順に 1 本で処理するので
+    // それより前の受信（握手の応答）も数え済み。偽サーバは didOpen をログへ書いてから診断を送るので
+    // ログにも didOpen が載っている
+    wait_until(
+        "didOpen への診断の受信",
+        Duration::from_secs(10),
+        || manager.diagnostics_count(&path) == 1,
+    );
     let before = received(&scratch).len();
     let ours_before = server_status(&manager)["received_messages"].clone();
+    assert_eq!(ours_before, json!(2), "基準は握手の応答 + didOpen への診断");
     // 編集はしていないが、再描画のたびに同期は呼ばれる（同じ版なら何も送らない）
     let deadline = Instant::now() + Duration::from_secs(idle);
     while Instant::now() < deadline {
