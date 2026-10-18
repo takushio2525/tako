@@ -19,7 +19,12 @@ pub fn cmd_label(id: &str) -> &'static str {
         // #616: アップデート画面（下部バーから撤去したぶんの入口）
         "open-update" => tr!("アップデートを開く", "Open update screen"),
         "new-tab" => tr!("新しいタブ", "New tab"),
-        "toggle-theme" => tr!("テーマをライト/ダーク切替", "Toggle light/dark theme"),
+        // #1830: メニュー（ui_text::menu::toggle_theme）と同じ表記。英語はパレットの書き方
+        // （文頭だけ大文字）
+        "toggle-theme" => tr!(
+            "テーマを切替（ライト・ダーク）",
+            "Toggle theme (light, dark)"
+        ),
         // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）
         "toggle-ui-mode" => tr!(
             "表示モードを切り替え（かんたん / ターミナル）",
@@ -49,10 +54,11 @@ pub fn cmd_label(id: &str) -> &'static str {
             "Find in files (search the whole workspace)"
         ),
         // 言語切替は両言語でネイティブ表記を併記（切替先を字面で探せるように）。
-        // 英語側に「日本語」を含む意図的な例外のため、訳し漏れ検査の対象外
+        // 英語側に「日本語」を含む意図的な例外のため、訳し漏れ検査の対象外。
+        // #1830: メニュー（ui_text::menu::switch_language）と同じ表記
         "toggle-language" => tr!(
-            "表示言語を切替（日本語 / English）",
-            "Switch language (日本語 / English)"
+            "表示言語を切替（日本語・English）",
+            "Switch language (日本語, English)"
         ),
         _ => "",
     }
