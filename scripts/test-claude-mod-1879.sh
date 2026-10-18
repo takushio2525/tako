@@ -87,7 +87,7 @@ WORKDIR="${CLAUDE_WORKDIR:-$(git -C "$REPO_ROOT" worktree list --porcelain | awk
 cleanup() {
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
   # テストが作らせた空 dir だけ消す（前からあったものには触らない）
   if [ "$INLINE_EXISTED" = 0 ] && [ -d "$INLINE_DATA" ]; then
     rmdir "$INLINE_DATA" 2>/dev/null || true

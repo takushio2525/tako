@@ -158,7 +158,7 @@ sandbox_env() {
     "PATH=$SANDBOX_PATH" "FAKE_DIR=$FAKE_DIR"
 }
 set_hang() {
-  rm -f "$FAKE_DIR"/hang-*
+  rm -f "${FAKE_DIR:?}"/hang-*
   local name
   for name in "$@"; do : > "$FAKE_DIR/hang-$name"; done
 }

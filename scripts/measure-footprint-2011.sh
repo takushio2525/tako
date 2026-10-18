@@ -189,7 +189,7 @@ measure_fp() {
   done
   srv="$(tmux -L "$SOCK_NAME" display -p '#{pid}' 2>/dev/null)"
   [ -n "$srv" ] && fp_args="$fp_args -p $srv"
-  rm -f "$TMP/fp.json"
+  rm -f "${TMP:?}/fp.json"
   # shellcheck disable=SC2086
   footprint -j "$TMP/fp.json" $fp_args >/dev/null 2>&1
   python3 "$TMP/fp.py" "$TMP/fp.json" "$pid" 2>/dev/null || echo "- - - - -"

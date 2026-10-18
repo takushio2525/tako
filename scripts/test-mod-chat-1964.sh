@@ -104,7 +104,7 @@ cleanup() {
   [ -n "$APP_PID" ] && stop_isolated_gui "$APP_PID"
   tmx kill-server >/dev/null 2>&1 || true
   tmux -L "$TMUX_SOCKET-gui" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET" "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET-gui"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}" "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET-gui"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: $TMP を残した）"; else rm -rf "$TMP"; fi
 }
@@ -443,7 +443,7 @@ phase_term_gui() {
     fail "claude を終えても mod の描画のまま（$(display_of "$p")）"
   fi
   wait_for 30 not_reporting "$p" || true
-  rm -f "$TAKO_ORCHESTRATOR_DIR/accounts.yaml"
+  rm -f "${TAKO_ORCHESTRATOR_DIR:?}/accounts.yaml"
   tk mod ui reset >/dev/null 2>&1
   tk ui-mode terminal >/dev/null 2>&1
 }
@@ -527,7 +527,7 @@ phase_tmux() {
       # 帯の「最新のコードをコピー」をキーで → 最新の返答（RUN-DONE）にはコードが無いので、もう一度コードの返答を出す
       tsay "$s" "Reply with code blocks"
       wait_for 40 sh -c "tmux -u -L '$TMUX_SOCKET' capture-pane -p -t '=$s:' | grep -Eq 'o: (最後のコードをコピー|copy last code)'" || true
-      rm -f "$TMP/pbcopy.out"
+      rm -f "${TMP:?}/pbcopy.out"
       tkey "$s" Escape
       tkey "$s" C-x
       tkey "$s" Tab
@@ -538,7 +538,7 @@ phase_tmux() {
       # 会話の行の Copy 1 を SGR のクリックで押す（描かれて 300 ms 以内のクリックは捨てられるので待ってから）
       sleep 1
       row="$(tcap "$s" | grep -nE '(コピー|Copy) 1 bash' | tail -1 | cut -d: -f1)"
-      rm -f "$TMP/pbcopy.out"
+      rm -f "${TMP:?}/pbcopy.out"
       if [ -n "$row" ]; then
         tmx send-keys -t "=$s:" -l $'\e[<0;6;'"$row"'M'
         sleep 0.1

@@ -34,7 +34,7 @@ BIN="$SANDBOX/bin"
 # $1 = brew の振る舞い（ok / fail / noop / none）
 # $2 = tailscale を最初から置くか（installed なら置く）
 mkstubs(){
-  rm -rf "$BIN" "$SANDBOX/home" "$SANDBOX/d"
+  rm -rf "$BIN" "${SANDBOX:?}/home" "${SANDBOX:?}/d"
   mkdir -p "$BIN" "$SANDBOX/home" "$SANDBOX/d"
   # exe::find は `$SHELL -l -c "command -v X"`。`-l` が /etc/profile を読んで
   # 実機の PATH へ戻すので、`-l` を剥ぐラッパへ差し替えて隔離 PATH に閉じ込める

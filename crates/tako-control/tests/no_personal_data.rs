@@ -350,11 +350,12 @@ fn find_home_prefix(line: &str, from: usize) -> Option<(usize, usize)> {
 
 /// 前置きの**直前**が識別子の一部なら、それはパスの先頭ではない
 /// （例: `"$PROMO_DEMO/home/Library"` は偽のホームではなく変数の続き）。
+/// 波括弧で括った展開の閉じ `}` も同じ（`"${dir:?}/home/.cache"`。rm は #2306 でこの形に揃えた）
 fn starts_a_path(line: &str, prefix_start: usize) -> bool {
     line[..prefix_start]
         .chars()
         .next_back()
-        .map(|c| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-'))
+        .map(|c| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '}'))
         .unwrap_or(true)
 }
 
@@ -558,6 +559,8 @@ fn 判定はプレースホルダと実名らしい語を見分ける() {
         "/Users/<name>/dev",
         "/Users/$USER/dev",
         "\"$PROMO_DEMO/home/Library/Preferences\"", // 変数の続き = ホームではない
+        "\"${PROMO_DEMO}/home/Library/Preferences\"",
+        "rm -f \"${dir:?}/home/.claude-orchestrator/logs/x.log\"", // #2306 の形
     ] {
         assert!(
             offending_segments(ok).is_empty(),
@@ -571,6 +574,8 @@ fn 判定はプレースホルダと実名らしい語を見分ける() {
         (joined("/Users/", fake, "/dev/tako"), fake),
         (joined(r"HOME(Process)=C:\Users\", fake, ""), fake),
         (joined("/home/", fake, "/.cargo"), fake),
+        // 展開の閉じの後ろでも、区切り（`"` / 空白 / `=`）を挟めばパスの先頭
+        (joined("${HOME_ROOT:?} \"/home/", fake, "/.cargo\""), fake),
         (joined("/Users/", prefixed, "/dev"), prefixed),
         (joined("file:///C%3A%5CUsers%5C", fake, "/a.md"), fake),
         // Rust の文字列リテラル形（区切りが 2 個）でも拾う

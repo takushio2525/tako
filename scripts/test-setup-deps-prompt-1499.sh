@@ -39,7 +39,7 @@ BIN="$SANDBOX/bin"
 
 # --- スタブを置く -----------------------------------------------------------
 mkstubs(){                       # $1 = brew の振る舞い（ok / fail / noop / none）
-  rm -rf "$BIN" "$SANDBOX/home" "$SANDBOX/d"
+  rm -rf "$BIN" "${SANDBOX:?}/home" "${SANDBOX:?}/d"
   mkdir -p "$BIN" "$SANDBOX/home" "$SANDBOX/d"
   # exe::find のログインシェル経由の解決を隔離 PATH に閉じ込める
   printf '#!/bin/sh\nif [ "$1" = "-l" ]; then shift; fi\nexec /bin/sh "$@"\n' > "$BIN/isosh"

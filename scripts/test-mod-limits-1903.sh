@@ -65,7 +65,7 @@ DUMP_OLD="${TAKO_1903_DUMP_DIR:-$TMP/dump}/legacy"
 cleanup() {
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
   if [ "$INLINE_EXISTED" = 0 ] && [ -d "$INLINE_DATA" ]; then
     rmdir "$INLINE_DATA" 2>/dev/null || true
   fi

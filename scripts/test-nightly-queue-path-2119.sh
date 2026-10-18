@@ -159,7 +159,7 @@ out="$(TK_NAME=local heavy "$NIGHTLY_PATH" sh -c "$JOB")"
 expect_eq "順番待ちを通る" "job=42" "$out"
 expect_has "PATH の順で ~/.local/bin の tako で並ぶ" "queue local" "$(cat "$LOG")"
 expect_has "知らせる行は ~/.local/bin/tako を名指す" "を飛ばして ~/.local/bin/tako で並ぶ" "$(cat "$ERR")"
-rm -f "$H/.local/bin/tako"
+rm -f "${H:?}/.local/bin/tako"
 
 echo "== ③ PATH の先頭が知っている tako（今までどおり）=="
 cp "$T/new-tako" "$T/head/tako" && fake_exec_warm "$T/head/tako"
@@ -264,7 +264,7 @@ else
   TAKO_QUEUE_PROBE_TIMEOUT=1 TAKO_QUEUE_FALLBACKS="$T/hang/tako" build_app || rc=$?
   expect_eq "応答しない tako: 直に走って cargo まで進む（86）" "86" "$rc"
   expect_has "応答しない tako: 枠の外で走る" "cargo job=none build --release" "$(cat "$LOG")"
-  rm -f "$H/.cargo/bin/cargo"
+  rm -f "${H:?}/.cargo/bin/cargo"
 fi
 
 echo

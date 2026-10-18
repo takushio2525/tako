@@ -345,7 +345,7 @@ YAML
 
   # ---- 1. ハーネス更新（会話を保って再起動）----
   # system prompt のファイルが消えていても、再開は `tako master` と同じく書き直してから起動する
-  [ "$arm" = new ] && rm -f "$TAKO_ORCHESTRATOR_DIR/_system_prompt_st1967.md"
+  [ "$arm" = new ] && rm -f "${TAKO_ORCHESTRATOR_DIR:?}/_system_prompt_st1967.md"
   n="$(launch_count "$TMP/launches.log")"
   resp="$("$TAKO_BIN" session-restart --mode harness --pane "$master" 2>&1)"
   echo "  harness: applied=$(json_field "$resp" applied) recipe=$(json_field "$resp" recipe) profile=$(json_field "$resp" profile)"
@@ -444,7 +444,7 @@ YAML
   resp="$("$TAKO_BIN" session-restart --mode handoff --pane "$master" 2>&1)"
   check "$(grep -q -- '--mode harness' <<<"$resp" && echo 1 || echo 0)" \
     "エージェントが居ないペインの handoff は断り、harness を案内する"
-  rm -f "$TMP/fail-resume"
+  rm -f "${TMP:?}/fail-resume"
   check "$([ "$(restart_field "$master" shell_idle)" = True ] && echo 1 || echo 0)" \
     "シェルだけが残ったペインは shell_idle=true"
   n="$(launch_count "$TMP/launches.log")"

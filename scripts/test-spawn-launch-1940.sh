@@ -231,7 +231,7 @@ for t in json.load(sys.stdin)["tabs"]:
       "起動に失敗した worker へ依頼文の再送を案内しない"
     grep -q "起動失敗: pane=${pane} 理由=agent_exited" "$TAKO_DATA_DIR/persist.log" 2>/dev/null
     check "$([ $? -eq 0 ] && echo 1 || echo 0)" "persist.log に起動失敗の 1 行が残る"
-    rm -f "$TMP/fail"
+    rm -f "${TMP:?}/fail"
   fi
 
   stop_isolated_gui "$ISOLATED_GUI_PID"

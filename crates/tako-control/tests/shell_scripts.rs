@@ -6,7 +6,8 @@
 //! 「シェルスクリプトは macOS 同梱の bash 3.2 で通す（Issue #1499 / #1518）」に
 //! 書いてある規約の機械化（同じ節の「`set -e` と EXIT trap を併用するなら番人を通す」= #1864 と
 //! 「`"$( … )"` の中のダブルクォートに `{…,…}` を置かない」= #1924・
-//! 「pipefail の下で早く抜ける読み手（`grep -q` / `head`）へパイプしない」= #1633 / #2272 も）。
+//! 「pipefail の下で早く抜ける読み手（`grep -q` / `head`）へパイプしない」= #1633 / #2272 も）と
+//! 「変数を使う rm は空で止める（Issue #2306）」。
 
 use std::path::{Path, PathBuf};
 
@@ -1038,6 +1039,8 @@ struct WordLexer {
     levels: Vec<PipeLevel>,
     /// 読み終えた、2 段以上のパイプライン
     pipelines: Vec<LexPipeline>,
+    /// 読み終えた**すべての**単純コマンド（1 段のものも。#2306 の rm の検査が使う）
+    commands: Vec<LexCommand>,
     /// 読んでいる最中の語の始まりと、それがコマンドの先頭（代入を置ける位置）か。
     /// `x=$( … )` の置換が素の代入の値かを `cmdsub` が判じるのに使う（`list` の間は None）
     word_ctx: Option<(usize, bool)>,
@@ -1088,6 +1091,8 @@ struct LexCommand {
     /// 先頭の語のファイル先頭からの文字位置
     start: usize,
     words: Vec<String>,
+    /// `words` と同じ並びで、その語がリダイレクトの行き先（`> "$f"` / `2>/dev/null` の右）か
+    redirects: Vec<bool>,
 }
 
 /// 1 つの深さで組み立て中のパイプライン
@@ -1114,21 +1119,21 @@ impl WordLexer {
             pending: Vec::new(),
             levels: Vec::new(),
             pipelines: Vec::new(),
+            commands: Vec::new(),
             word_ctx: None,
         }
     }
 
-    /// 組み立て中の単純コマンドへ語を足す
-    fn pipe_word(&mut self, start: usize, text: &str) {
+    /// 組み立て中の単純コマンドへ語を足す（`redirect` = リダイレクトの行き先の語）
+    fn pipe_word(&mut self, start: usize, text: &str, redirect: bool) {
         if let Some(lv) = self.levels.last_mut() {
             lv.after_pipe = false;
-            lv.cur
-                .get_or_insert_with(|| LexCommand {
-                    start,
-                    words: Vec::new(),
-                })
-                .words
-                .push(text.to_string());
+            let cmd = lv.cur.get_or_insert_with(|| LexCommand {
+                start,
+                ..LexCommand::default()
+            });
+            cmd.words.push(text.to_string());
+            cmd.redirects.push(redirect);
         }
     }
 
@@ -1138,7 +1143,7 @@ impl WordLexer {
         if let Some(lv) = self.levels.last_mut() {
             let cmd = lv.cur.take().unwrap_or(LexCommand {
                 start: at,
-                words: Vec::new(),
+                ..LexCommand::default()
             });
             lv.stages.push(cmd);
             lv.after_pipe = true;
@@ -1168,6 +1173,8 @@ impl WordLexer {
                 p.outer = Some((cond, end));
             }
         }
+        self.commands
+            .extend(stages.iter().filter(|s| !s.words.is_empty()).cloned());
         if stages.len() >= 2 {
             let k = self.pipelines.len();
             self.pipelines.push(LexPipeline {
@@ -1244,6 +1251,7 @@ impl WordLexer {
         let mut dbl_bracket = false;
         let mut dbl_paren = 0usize; // `[[ … ]]` の中の `( … )`（サブシェルではない）
         let mut next_exempt = false;
+        let mut next_redirect = false; // 直前がリダイレクトの演算子（次の語はその行き先）
         let mut case: Vec<CaseState> = Vec::new();
         while let Some(ch) = self.peek(0) {
             match ch {
@@ -1333,25 +1341,29 @@ impl WordLexer {
                     if self.at("<<<") {
                         self.i += 3;
                         next_exempt = true; // ヒアストリングは波括弧展開されない
+                        next_redirect = true;
                     } else if self.at("<<") {
                         self.heredoc_op();
                     } else if self.at("<(") || self.at(">(") {
                         self.i += 2;
+                        next_redirect = false;
                         self.list_of(true, ListKind::ProcSub);
                     } else {
                         self.i += 1;
                         while matches!(self.peek(0), Some('>' | '&' | '|')) {
                             self.i += 1;
                         }
+                        next_redirect = true;
                     }
                 }
                 _ => {
                     let start = self.i;
                     let array = self.word(cmd_start);
                     let text: String = self.c[start..self.i].iter().collect();
+                    let redirect = std::mem::take(&mut next_redirect);
                     // 腕のパターン・配列代入はパイプラインの段の語ではない
                     if !array && case.last() != Some(&CaseState::Pattern) {
-                        self.pipe_word(start, &text);
+                        self.pipe_word(start, &text, redirect);
                     }
                     let mut expanded = true;
                     if next_exempt {
@@ -3211,4 +3223,501 @@ fn pipefailの宣言を読み分ける() {
     assert!(!declares_pipefail("echo 'set -o pipefail'\n"));
     assert!(!declares_pipefail("# set -euo pipefail\n"));
     assert!(!declares_pipefail("cat <<'X'\nset -euo pipefail\nX\n"));
+}
+
+// ---------------------------------------------------------------------------
+// 変数を使う rm（Issue #2306）
+// ---------------------------------------------------------------------------
+
+/// rm の引数（原文の 1 語）を展開の単位で切った 1 片
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RmPiece {
+    /// 展開されない文字（クォートの中の文字も）
+    Lit(char),
+    /// クォートの外の `*` / `?` / `[`（パス名展開）
+    Glob(char),
+    /// `/`（クォートの中でもパスの区切り）
+    Slash,
+    /// 変数展開・コマンド置換の原文。`may_be_empty` = 空になりうる
+    /// （`${v:?}` / `${v:-/tmp}` / `$$` / `$#` / `${#v}` / `$(( … ))` は false）
+    Expansion { text: String, may_be_empty: bool },
+}
+
+/// `c[i]`（`$`）から始まる展開の終わり（含まない）と、空になりうるか。展開でなければ None
+fn rm_expansion_at(c: &[char], i: usize) -> Option<(usize, bool)> {
+    // 対応する閉じ（`open` の入れ子と、中のクォートを数える）
+    let close = |from: usize, open: char, shut: char| -> usize {
+        let (mut depth, mut k, mut q) = (1usize, from, None::<char>);
+        while k < c.len() {
+            let ch = c[k];
+            match q {
+                Some(qc) if ch == qc => q = None,
+                Some(_) if ch == '\\' => k += 1,
+                Some(_) => {}
+                None if ch == '\\' => k += 1,
+                None if ch == '\'' || ch == '"' => q = Some(ch),
+                None if ch == open => depth += 1,
+                None if ch == shut => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return k + 1;
+                    }
+                }
+                None => {}
+            }
+            k += 1;
+        }
+        c.len()
+    };
+    match c.get(i + 1).copied()? {
+        '(' if c.get(i + 2) == Some(&'(') => Some((close(i + 2, '(', ')'), false)),
+        '(' => Some((close(i + 2, '(', ')'), true)),
+        '{' => {
+            let end = close(i + 2, '{', '}');
+            let inner: String = c[i + 2..end.saturating_sub(1).max(i + 2)].iter().collect();
+            Some((end, param_may_be_empty(&inner)))
+        }
+        n if n.is_ascii_alphabetic() || n == '_' => {
+            let mut k = i + 1;
+            while c
+                .get(k)
+                .is_some_and(|x| x.is_ascii_alphanumeric() || *x == '_')
+            {
+                k += 1;
+            }
+            Some((k, true))
+        }
+        '$' | '#' | '?' | '-' | '0' => Some((i + 2, false)),
+        n if n.is_ascii_digit() || matches!(n, '!' | '@' | '*') => Some((i + 2, true)),
+        _ => None, // ただの `$`
+    }
+}
+
+/// `${ … }` の中身から、その展開が空になりうるか
+fn param_may_be_empty(inner: &str) -> bool {
+    // `${#v}`（長さ）/ `${#}`（引数の数）は数字
+    if inner.starts_with('#') && !inner.starts_with("#:") {
+        return false;
+    }
+    let name_end = inner
+        .char_indices()
+        .find(|&(k, ch)| {
+            !(ch == '_' || ch.is_ascii_alphanumeric() || (k == 0 && "$#?-!@*".contains(ch)))
+        })
+        .map_or(inner.len(), |(k, _)| k);
+    let name = &inner[..name_end];
+    let mut rest = &inner[name_end..];
+    if rest.starts_with('[') {
+        rest = rest.find(']').map_or("", |e| &rest[e + 1..]);
+    }
+    if rest.is_empty() {
+        return !matches!(name, "$" | "#" | "?" | "-" | "0");
+    }
+    if rest.starts_with(":?") {
+        return false; // 空なら止まる
+    }
+    if let Some(word) = rest.strip_prefix(":-").or_else(|| rest.strip_prefix(":=")) {
+        // 既定値が字面で空でない（`${TMUX_TMPDIR:-/tmp}`）。既定値も展開なら空になりうる
+        let word = word.trim_start_matches(['"', '\'']);
+        return word.is_empty() || word.starts_with('$') || word.starts_with('`');
+    }
+    true // `${v}` / `${v:+…}` / `${v-…}`（空の値は素通り）/ `${v#…}` などの加工
+}
+
+/// rm の引数の原文を片へ切る（クォートは外し、`/` は中でも区切りとして数える）
+fn rm_pieces(word: &str) -> Vec<RmPiece> {
+    let c: Vec<char> = word.chars().collect();
+    let lit = |ch: char| {
+        if ch == '/' {
+            RmPiece::Slash
+        } else {
+            RmPiece::Lit(ch)
+        }
+    };
+    let mut out = Vec::new();
+    let mut dq = false;
+    let mut i = 0usize;
+    while i < c.len() {
+        let ch = c[i];
+        match ch {
+            '\\' => {
+                if let Some(&n) = c.get(i + 1) {
+                    out.push(lit(n));
+                }
+                i += 2;
+            }
+            '\'' if !dq => {
+                i += 1;
+                while i < c.len() && c[i] != '\'' {
+                    out.push(lit(c[i]));
+                    i += 1;
+                }
+                i += 1;
+            }
+            '"' => {
+                dq = !dq;
+                i += 1;
+            }
+            '`' => {
+                let end = c[i + 1..]
+                    .iter()
+                    .position(|&x| x == '`')
+                    .map_or(c.len(), |p| i + 1 + p + 1);
+                out.push(RmPiece::Expansion {
+                    text: c[i..end].iter().collect(),
+                    may_be_empty: true,
+                });
+                i = end;
+            }
+            '$' => match rm_expansion_at(&c, i) {
+                Some((end, may_be_empty)) => {
+                    out.push(RmPiece::Expansion {
+                        text: c[i..end].iter().collect(),
+                        may_be_empty,
+                    });
+                    i = end;
+                }
+                None => {
+                    out.push(RmPiece::Lit('$'));
+                    i += 1;
+                }
+            },
+            '*' | '?' | '[' if !dq => {
+                out.push(RmPiece::Glob(ch));
+                i += 1;
+            }
+            _ => {
+                out.push(lit(ch));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// rm の 1 つの引数のうち、**空になると別の（広い）場所を指す**展開の原文と、そのときの行き先。
+///
+/// 空で危ないのは、展開だけでできたパスの 1 段（`"$d/x"` → `/x`・`"$HOME/.cache/$n"` →
+/// `$HOME/.cache/`・`"$d/"` → `/`）と、展開の直後の glob（`"$p"*` → `*`）。展開だけの語
+/// （`"$f"` / `"${files[@]}"`）は空なら `rm ""`（何も消さない）なので対象外。
+/// 字の混じった段（`"$TMP/out-$i.txt"` の `$i`）も空で行き先が広がらないので対象外
+fn rm_operand_risks(word: &str) -> (Vec<String>, String) {
+    let pieces = rm_pieces(word);
+    let multi = pieces
+        .iter()
+        .any(|p| matches!(p, RmPiece::Slash | RmPiece::Glob(_)));
+    let mut risky = vec![false; pieces.len()];
+    if multi {
+        let mut seg_start = 0usize;
+        for k in 0..=pieces.len() {
+            if k < pieces.len() && pieces[k] != RmPiece::Slash {
+                continue;
+            }
+            let seg = &pieces[seg_start..k];
+            let solid = seg.iter().any(|p| {
+                matches!(
+                    p,
+                    RmPiece::Lit(_)
+                        | RmPiece::Expansion {
+                            may_be_empty: false,
+                            ..
+                        }
+                )
+            });
+            if !solid {
+                for (j, p) in seg.iter().enumerate() {
+                    if matches!(
+                        p,
+                        RmPiece::Expansion {
+                            may_be_empty: true,
+                            ..
+                        }
+                    ) {
+                        risky[seg_start + j] = true;
+                    }
+                }
+            }
+            seg_start = k + 1;
+        }
+    }
+    let mut risks = Vec::new();
+    let mut emptied = String::new();
+    for (p, r) in pieces.iter().zip(&risky) {
+        match p {
+            RmPiece::Lit(ch) | RmPiece::Glob(ch) => emptied.push(*ch),
+            RmPiece::Slash => emptied.push('/'),
+            RmPiece::Expansion { text, .. } if *r => risks.push(text.clone()),
+            RmPiece::Expansion { text, .. } => emptied.push_str(text),
+        }
+    }
+    (risks, emptied)
+}
+
+/// クォートを外した文字列（`trap '…' EXIT` の後始末を 1 本のスクリプトとして読み直すため）
+fn shell_unquote(raw: &str) -> String {
+    let c: Vec<char> = raw.chars().collect();
+    let mut out = String::new();
+    let mut dq = false;
+    let mut i = 0usize;
+    while i < c.len() {
+        match c[i] {
+            '\\' if !dq || matches!(c.get(i + 1), Some('"' | '\\' | '$' | '`')) => {
+                if let Some(&n) = c.get(i + 1) {
+                    out.push(n);
+                }
+                i += 2;
+            }
+            '\'' if !dq => {
+                i += 1;
+                while i < c.len() && c[i] != '\'' {
+                    out.push(c[i]);
+                    i += 1;
+                }
+                i += 1;
+            }
+            '"' => {
+                dq = !dq;
+                i += 1;
+            }
+            ch => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// rm の単純コマンドを（行, リダイレクトの行き先を除いた引数の原文）で集める。
+/// `trap` / `tako_exit_trap` に渡した後始末の文字列の中の rm も読む（後始末は必ず走る）
+fn rm_commands(src: &str) -> Vec<(usize, Vec<String>)> {
+    let chars: Vec<char> = src.chars().collect();
+    let line_of = |pos: usize| {
+        chars[..pos.min(chars.len())]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count()
+            + 1
+    };
+    let mut lx = WordLexer::new(src);
+    lx.list(false);
+    let mut out = Vec::new();
+    for cmd in &lx.commands {
+        let Some((k, name)) = stage_command_name(&cmd.words) else {
+            continue;
+        };
+        let line = line_of(cmd.start);
+        let mut args = cmd
+            .words
+            .iter()
+            .zip(&cmd.redirects)
+            .skip(k + 1)
+            .filter(|(_, redirect)| !**redirect)
+            .map(|(w, _)| w.clone())
+            .peekable();
+        match name {
+            "rm" => out.push((line, args.collect())),
+            "trap" | "tako_exit_trap" => {
+                if name == "trap" && args.peek().is_some_and(|a| a == "--") {
+                    args.next();
+                }
+                if let Some(action) = args.next() {
+                    for (l, a) in rm_commands(&shell_unquote(&action)) {
+                        out.push((line + l - 1, a));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 監査済みの例外宣言 `# tako:rm-var-ok <理由>`（違反行か直前の行。理由の無い宣言は無効）
+fn rm_var_exception(lines: &[&str], line_no: usize) -> bool {
+    let has = |l: &str| {
+        l.split("tako:rm-var-ok")
+            .nth(1)
+            .is_some_and(|reason| !reason.trim().is_empty())
+    };
+    let at = |n: usize| n.checked_sub(1).and_then(|i| lines.get(i)).copied();
+    at(line_no).is_some_and(has) || at(line_no.wrapping_sub(1)).is_some_and(has)
+}
+
+/// 1 ファイルぶんの違反（file:line で名指しする文言）
+fn rm_var_violations(rel: &str, src: &str) -> Vec<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (line_no, args) in rm_commands(src) {
+        if rm_var_exception(&lines, line_no) {
+            continue;
+        }
+        for w in &args {
+            let (risks, emptied) = rm_operand_risks(w);
+            if risks.is_empty() {
+                continue;
+            }
+            out.push(format!(
+                "{rel}:{line_no}: rm の {w} は {} が空だと {emptied} を指す → ${{var:?}} で書く: {}",
+                risks.join(" と "),
+                lines.get(line_no - 1).map_or("", |l| l.trim())
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn rmの引数で空になると広い場所を指す変数はvar_qで止める() {
+    let root = repo_root();
+    let mut violations: Vec<String> = Vec::new();
+    for path in shell_scripts() {
+        let src = std::fs::read_to_string(&path).expect("読める .sh");
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        violations.extend(rm_var_violations(&rel, &src));
+    }
+    assert!(
+        violations.is_empty(),
+        "rm の引数の変数が空のまま走ると、別の（広い）場所を消す（`rm -rf \"$dir/tmp\"` は $dir が空なら\n\
+         /tmp を消す。`set -u` は未定義しか止めず、空の値は素通りする。#2306）。空で止まる\n\
+         `${{var:?}}` で書くこと（`rm -rf \"${{dir:?}}/tmp\"`。値があるときの振る舞いは同じ。コマンド置換は\n\
+         変数へ受けてから）。`\"$f\"` だけの引数は空なら何も消さないので対象外\n\
+         （.agent/conventions.md「変数を使う rm は空で止める」節。\n\
+         監査して確かめた箇所だけ、その行か直前の行に `# tako:rm-var-ok <理由>` で外せる）:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn 番犬は空で広い場所を指すrmの引数をfile_lineで名指しする() {
+    let v = |body: &str| rm_var_violations("scripts/x.sh", body);
+    let one = |body: &str| -> String {
+        let got = v(body);
+        assert_eq!(got.len(), 1, "{body:?} → {got:?}");
+        got[0].clone()
+    };
+    // 文言: file:line・引数の原文・空になる展開・そのときの行き先
+    assert!(one("set -u\nrm -rf \"$dir/tmp\"\n").starts_with(
+        "scripts/x.sh:2: rm の \"$dir/tmp\" は $dir が空だと /tmp を指す → ${var:?} で書く"
+    ));
+    assert!(one("rm -rf \"$d/\"\n").contains("は $d が空だと / を指す"));
+    assert!(one("rm -rf \"$HOME/.cache/$name\"\n")
+        .contains("は $HOME と $name が空だと /.cache/ を指す"));
+    assert!(one("rm -f \"$p\"*\n").contains("は $p が空だと * を指す"));
+    assert!(one("rm -f \"$FAKE_DIR\"/hang-*\n").contains("は $FAKE_DIR が空だと /hang-* を指す"));
+    assert!(one("rm -f \"/tmp/$n\"\n").contains("は $n が空だと /tmp/ を指す"));
+    // 展開の書き方を問わない（素・波括弧・位置パラメータ・コマンド置換・加工・`-` の既定値）
+    for body in [
+        "rm -rf ${D}/x",
+        "rm -rf $D/x",
+        "f() { rm -rf \"$1/x\"; }",
+        "rm -rf \"${1}/x\"",
+        "rm -rf \"$(git rev-parse --show-toplevel)/target\"",
+        "rm -rf \"`pwd`/target\"",
+        "rm -rf \"${x:+$x}/y\"",
+        "rm -rf \"${x-}/y\"",
+        "rm -rf \"${x?}/y\"",
+        "rm -rf \"${d:-$e}/x\"",
+        "rm -rf \"${arr[0]}/x\"",
+    ] {
+        one(body);
+    }
+    // どこに書いても rm なら読む（前置・条件・`||` の右・関数・複数行・後始末の文字列）
+    for body in [
+        "command rm -f \"$d/x\"",
+        "/bin/rm -f \"$d/x\"",
+        "if rm -f \"$d/x\"; then :; fi",
+        "cp a b || rm -f \"$d/x\"",
+        "X=1 rm -f \"$d/x\"",
+        "trap 'rm -rf \"$D/x\"' EXIT",
+        "trap -- 'rm -rf \"$D/x\"; exit 0' TERM",
+        "tako_exit_trap 'rm -rf \"$D/x\"' \"後始末\"",
+        "x=\"$(rm -f \"$d/x\")\"",
+    ] {
+        one(body);
+    }
+    let multi = v("rm -f \"${T:?}/a\" \\\n  \"$T/b\"\n");
+    assert_eq!(multi.len(), 1, "{multi:?}");
+    assert!(
+        multi[0].starts_with("scripts/x.sh:1: rm の \"$T/b\""),
+        "{multi:?}"
+    );
+    // 1 つの rm に 2 つあれば 2 つとも
+    assert_eq!(v("rm -rf \"$A/x\" \"$B/y\"\n").len(), 2);
+
+    // 名指さない形: 空で止まる・空にならない・空でも何も消さない・字の混じった段
+    for body in [
+        "rm -rf \"${dir:?}/tmp\"",
+        "rm -rf \"${dir:?dir が空}/tmp\"",
+        "rm -rf \"${PAUSE_DIR:?}/${P_B:?}\"",
+        "rm -f \"$f\"",
+        "rm -f $f",
+        "rm -rf \"${files[@]}\"",
+        "rm -f \"$a$b\"",
+        "rm -f \"${TMP:?}/out-$i.txt\"",
+        "rm -f \"${TAKO_ORCHESTRATOR_DIR:?}/profiles/${GOV_PROFILE}b.yaml\"",
+        "rm -f \"/tmp/tako-$$\"",
+        "rm -f \"$$/x\"",
+        "rm -f \"${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${s:?}\"",
+        "rm -rf \"${d:-/tmp}/x\"",
+        "rm -rf \"$((n + 1))/x\"",
+        "rm -rf \"${#a}/x\"",
+        "rm -rf '$d/x'",
+        "rm -rf \"\\$d/x\"",
+        "rm -rf ./x \"$f\"",
+    ] {
+        assert_eq!(v(body), Vec::<String>::new(), "{body}");
+    }
+    // rm ではない・rm の引数ではない（リダイレクトの行き先・文字列・コメント・ヒアドキュメントの本文）
+    for body in [
+        "rm -f \"${x:?}\" 2>\"$d/err\"",
+        "rm -f \"${x:?}\" >\"$d/out\" 2>&1",
+        "echo rm -rf \"$d/x\"",
+        "echo 'rm -rf \"$d/x\"'",
+        "# rm -rf \"$d/x\"",
+        "cat > f <<'X'\nrm -rf \"$d/x\"\nX",
+        "cp \"$d/x\" \"$d/y\"",
+        "trap - EXIT",
+    ] {
+        assert_eq!(v(body), Vec::<String>::new(), "{body}");
+    }
+
+    // 例外宣言は理由つきのときだけ効く（その行か直前の行）
+    assert!(v("# tako:rm-var-ok d は直前の mktemp -d で必ず埋まる\nrm -rf \"$d/x\"\n").is_empty());
+    assert!(v("rm -rf \"$d/x\" # tako:rm-var-ok d は直前の mktemp -d で必ず埋まる\n").is_empty());
+    assert_eq!(v("# tako:rm-var-ok\nrm -rf \"$d/x\"\n").len(), 1);
+}
+
+#[test]
+fn 字句解析は単純コマンドとリダイレクトの行き先を読み分ける() {
+    let mut lx = WordLexer::new("rm -f \"$a\" 2>\"$b\" >&2\nx=$(rm \"$c\" < in)\n");
+    lx.list(false);
+    let got: Vec<(Vec<String>, Vec<bool>)> = lx
+        .commands
+        .iter()
+        .map(|c| (c.words.clone(), c.redirects.clone()))
+        .collect();
+    let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        vec![
+            (
+                w(&["rm", "-f", "\"$a\"", "2", "\"$b\"", "2"]),
+                vec![false, false, false, false, true, true]
+            ),
+            (w(&["rm", "\"$c\"", "in"]), vec![false, false, true]),
+            (w(&["x=$(rm \"$c\" < in)"]), vec![false]),
+        ]
+    );
+    // 展開の読み: 空になりうるか
+    let risks = |w: &str| rm_operand_risks(w).0;
+    assert_eq!(risks("\"$a/$b\""), vec!["$a", "$b"]);
+    assert_eq!(risks("\"${a:?}/$b\""), vec!["$b"]);
+    assert_eq!(risks("\"$a/x-$b\""), vec!["$a"]);
+    assert!(risks("\"$a\"").is_empty());
+    assert_eq!(rm_operand_risks("\"$a/x-$b\"").1, "/x-$b");
 }

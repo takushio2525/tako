@@ -51,7 +51,7 @@ cleanup() {
     case "$VHOME" in */tako-agent-config-*) rm -rf "$VHOME" ;; esac
   fi
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: $TMP を残した）"; else rm -rf "$TMP"; fi
 }
 # shellcheck source=lib/exit-guard.sh

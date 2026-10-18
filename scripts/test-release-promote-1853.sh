@@ -194,7 +194,7 @@ EOF
   setup_git -C "$D/tap-src" add -A
   setup_git -C "$D/tap-src" commit --quiet -m "cask 99.1.2"
   setup_git -C "$D/tap-src" push --quiet "$D/tap.git" main 2>/dev/null
-  rm -rf "$D/tap-src"
+  rm -rf "${D:?}/tap-src"
 
   write_gh_stub
 }
@@ -410,7 +410,7 @@ test_cask_failures() {
   echo ""
   echo "--- Test 3a: macOS のアセットが無い -> exit 4 ---"
   make_env
-  rm -f "$D/rel/v99.1.3/assets/tako-v99.1.3-macos-arm64.zip"
+  rm -f "${D:?}/rel/v99.1.3/assets/tako-v99.1.3-macos-arm64.zip"
   run_promote v99.1.3
   expect_followup_failure "アセットが無い" "公開アセット tako-v99.1.3-macos-arm64.zip を落とせない"
   assert_contains "失敗した段を名指し" "$OUT" "後続が終わっていない: Homebrew cask"

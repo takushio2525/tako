@@ -159,7 +159,7 @@ sandbox_env() {
 }
 # rc の振る舞いを決める（引数の印だけを置く。無ければ普通のログインシェル）
 set_rc() {
-  rm -f "$FAKE_DIR"/rc-* "$FAKE_DIR"/hang-*
+  rm -f "${FAKE_DIR:?}"/rc-* "${FAKE_DIR:?}"/hang-*
   local name
   for name in "$@"; do : > "$FAKE_DIR/$name"; done
 }

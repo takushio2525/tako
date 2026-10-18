@@ -108,7 +108,7 @@ mk_script "$FIX/venvproj"
 mk_script "$FIX/novenv"
 mk_script "$FIX/broken"
 "$SYS_PY" -m venv "$FIX/broken/.venv" >/dev/null 2>&1
-rm -f "$FIX/broken/.venv/bin/python"
+rm -f "${FIX:?}/broken/.venv/bin/python"
 JP="$FIX/日本語 プロジェクト"
 mk_script "$JP"
 "$SYS_PY" -m venv "$JP/.venv" || { echo "空白と日本語のパスに venv を作れない"; exit 1; }

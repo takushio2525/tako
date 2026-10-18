@@ -258,7 +258,7 @@ run_arm() {
   printf '\n\npub fn target() {}\n' > "$p/src/.util.rs.tmp"
   mv "$p/src/.util.rs.tmp" "$p/src/util.rs"
   printf 'fn more() {\n    crate::util::target();\n}\n' > "$p/src/added.rs"
-  rm -f "$p/src/gone.rs"
+  rm -f "${p:?}/src/gone.rs"
   if [ "$legacy" != 1 ]; then
     wait_cond 'changes_has "$log" "gone.rs 3" && changes_has "$log" "added.rs 1"' 10 \
       || fail "$arm: 差し替えの知らせが揃わない（$(changes "$log" | tr '\n' ' ')）"

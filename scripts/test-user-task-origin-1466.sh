@@ -278,11 +278,11 @@ printf 'projects:\n  - %s\n' "_iso1466none_" > "$TAKO_ORCHESTRATOR_DIR/profiles/
 todo_add_cli "$ORPHAN_PANE" "worker:_iso1466none_:x" "管轄が曖昧なときの起票"
 show_json u-7
 check_eq "管轄が曖昧なら宛先不明のまま" "" "$(shown origin profile)"
-rm -f "$TAKO_ORCHESTRATOR_DIR/profiles/${GOV_PROFILE}b.yaml"
+rm -f "${TAKO_ORCHESTRATOR_DIR:?}/profiles/${GOV_PROFILE}b.yaml"
 todo_add_cli "$ORPHAN_PANE" "worker:_iso1466none_:x" "管轄が一意になった後の起票"
 show_json u-8
 check_eq "管轄が一意になれば解ける" "${GOV_PROFILE}a" "$(shown origin profile)"
-rm -f "$TAKO_ORCHESTRATOR_DIR/profiles/${GOV_PROFILE}a.yaml"
+rm -f "${TAKO_ORCHESTRATOR_DIR:?}/profiles/${GOV_PROFILE}a.yaml"
 
 echo "=== Test 6: A/B（TAKO_1466_LEGACY=1）で修正前を再現する ==="
 stop_app

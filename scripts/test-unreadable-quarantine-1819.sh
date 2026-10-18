@@ -168,7 +168,7 @@ check_eq "同じ中身の 2 回目も申告は 1 行（壊れた事実を落と�
 
 echo
 echo "== ③ 人が settings.json.unreadable.bak を消したあとにまた壊す =="
-rm -f "$DATA/settings.json.unreadable.bak"
+rm -f "${DATA:?}/settings.json.unreadable.bak"
 break_settings MARK_D
 touch_settings_via_gui "d" "cat"
 show_state
@@ -207,7 +207,7 @@ fi
 
 echo
 echo "== ⑤ 上限（10 本）を超えて壊し続ける =="
-rm -f "$DATA"/settings.json.unreadable*.bak
+rm -f "${DATA:?}"/settings.json.unreadable*.bak
 n=0
 while [ "$n" -lt 13 ]; do
   n=$((n + 1))

@@ -431,9 +431,9 @@ fi
 # tako のペインでは気づけない）。使い捨ての設定 dir に写しを置き、`claude plugin list --json` に
 # tako@skills-dir が読み込み済み（enabled: true・errors なし）で出ることを見る
 mkdir -p "$WORK/config/skills"
-rm -rf "$WORK/config/skills/tako"
+rm -rf "${WORK:?}/config/skills/tako"
 cp -R "$WORK/mod" "$WORK/config/skills/tako"
-rm -rf "$WORK/config/skills/tako/tests"
+rm -rf "${WORK:?}/config/skills/tako/tests"
 printf '%s\n' '{"schema":1,"managed_by":"tako","tako_version":"check","content_hash":"","files":[]}' \
   > "$WORK/config/skills/tako/.tako-managed"
 rc=0

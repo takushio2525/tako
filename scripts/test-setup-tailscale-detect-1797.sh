@@ -103,7 +103,7 @@ EOF
 #   noop     = 成功と言うが何も置かない
 # どちらも呼ばれた引数を $SANDBOX/brew.log へ 1 行ずつ残す
 mkenv(){
-  rm -rf "$BIN" "$HOMEDIR" "$DATADIR" "$SANDBOX/Applications" "$SANDBOX/brew.log"
+  rm -rf "$BIN" "$HOMEDIR" "$DATADIR" "${SANDBOX:?}/Applications" "${SANDBOX:?}/brew.log"
   mkdir -p "$BIN" "$HOMEDIR" "$DATADIR"
   : > "$SANDBOX/brew.log"
   # exe::find のログインシェル経由の解決を隔離 PATH に閉じ込める（`-l` を剥ぐ）

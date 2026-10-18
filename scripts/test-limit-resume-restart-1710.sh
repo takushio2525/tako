@@ -58,7 +58,7 @@ TMUX_SOCKET="tako-1710-$$"
 cleanup() {
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
   rm -rf "$TMP"
 }
 trap cleanup EXIT

@@ -196,7 +196,7 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 check_eq "ペインでコマンドを実行したら引き直して見つかる" "(True, False)" "$GOT"
-rm -f "$TMP/bin/pyright-langserver"
+rm -f "${TMP:?}/bin/pyright-langserver"
 "$TAKO_BIN" lsp restart >/dev/null
 check_eq "restart の後は引き直す（消したので見つからない・cached=false）" "(False, False)" \
   "$("$TAKO_BIN" lsp servers --json | json '[(r["installed"], r["cached"]) for r in d["servers"] if r["id"] == "pyright"][0]')"

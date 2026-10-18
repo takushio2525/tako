@@ -874,7 +874,7 @@ promote_cleanup() {
     git -C "$REPO_ROOT" worktree remove --force "$PROMOTE_TMPDIR/docs" >/dev/null 2>&1 || true
   fi
   if [[ -n "${PROMOTE_TMPDIR:-}" ]]; then
-    rm -rf "$PROMOTE_TMPDIR"
+    rm -rf "${PROMOTE_TMPDIR:?}"
   fi
   git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
 }
@@ -1055,7 +1055,7 @@ check_bundle_privacy "$APP" || exit 1
 
 # --- zip 生成 ---
 echo "==> zip 生成: $ZIP_NAME"
-rm -f "$ZIP_PATH"
+rm -f "${ZIP_PATH:?}"
 # ditto はリソースフォーク・拡張属性を保持する macOS 推奨のアーカイバ
 ditto -c -k --keepParent "$APP" "$ZIP_PATH"
 ZIP_SIZE=$(du -h "$ZIP_PATH" | cut -f1 | xargs)
@@ -1124,14 +1124,14 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
           ${UPLOAD_PATHS[@]+"${UPLOAD_PATHS[@]}"} 2>"$GH_STDERR_FILE" || GH_EXIT=$?
 
       if [[ $GH_EXIT -eq 0 ]]; then
-        rm -f "$GH_STDERR_FILE"
+        rm -f "${GH_STDERR_FILE:?}"
         RELEASE_CREATED=1
         break
       fi
 
       echo "    gh release create 失敗（exit ${GH_EXIT}）。gh stderr:" >&2
       cat "$GH_STDERR_FILE" >&2
-      rm -f "$GH_STDERR_FILE"
+      rm -f "${GH_STDERR_FILE:?}"
 
       if [[ $ATTEMPT -lt $MAX_RETRIES ]]; then
         # 部分成功（Release は作られたがアセット添付で失敗等）への対処

@@ -190,7 +190,7 @@ EDGE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["to
 echo "    読めない 1 + ループ: 件数 / 読めない / 打ち切り = $EDGE"
 check "$([ "$EDGE" = "$((EXPECTED - 1)) 1 None" ] && echo 1)" "読めないファイルは数えて飛ばし、ループは辿らず重複しない"
 chmod 644 "$TREE/d000/f000.rs"
-rm -f "$TREE/d001/loop"
+rm -f "${TREE:?}/d001/loop"
 # 検索中の再検索: 前の出す検索は取り消され（shown=false / stopped=cancelled）、後ろが右パネルに残る
 "$TAKO_BIN" search "$SLOW_Q" --regex --path "$TREE" --show --json --limit 1 > "$TMP/first.json" 2>&1 &
 FIRST=$!

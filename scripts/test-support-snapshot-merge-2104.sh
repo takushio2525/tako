@@ -48,7 +48,7 @@ mkdir -p "${REPO}/scripts/lib" "${REPO}/docs/scripts" "${REPO}/docs/src/data" \
 # 生成器を偽のリポジトリへ置く。GEN_REF があればその版のものを git から取る
 put() { # $1=リポジトリ内のパス。その版に無ければ置かない
   if [ -n "${GEN_REF}" ]; then
-    git -C "${ROOT}" show "${GEN_REF}:$1" > "${REPO}/$1" 2>/dev/null || rm -f "${REPO}/$1"
+    git -C "${ROOT}" show "${GEN_REF}:$1" > "${REPO}/$1" 2>/dev/null || rm -f "${REPO:?}/${1:?}"
   else
     [ -f "${ROOT}/$1" ] && cp "${ROOT}/$1" "${REPO}/$1"
   fi

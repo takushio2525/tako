@@ -80,7 +80,7 @@ for d in "$HOME" "$TAKO_DATA_DIR" "$TAKO_ORCHESTRATOR_DIR"; do
     *) echo "隔離されていないディレクトリ: $d"; exit 1 ;;
   esac
 done
-rm -rf "$SHOT_DIR/new" "$SHOT_DIR/legacy"
+rm -rf "${SHOT_DIR:?}/new" "${SHOT_DIR:?}/legacy"
 mkdir -p "$SHOT_DIR/new" "$SHOT_DIR/legacy"
 
 # visual-test を 1 回走らせて終わるまで待つ（ログ・画像の置き場・追加の env）
