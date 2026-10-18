@@ -10,22 +10,27 @@
 //!   （リリース zip・Homebrew cask・アプリ内更新はすべてこの .app を配る）
 //! - Windows のインストーラー: `installer/windows/tako.iss` の `[Files]` が `{app}` へ置く
 //! - Windows のポータブル zip: `installer/windows/build-installer.ps1` が zip の `tako/` へ置く
-//! - Windows のリリース検査: `installer/windows/lib/verify-assets.ps1` の `$TakoLicenseBundle`
-//!   （zip の展開とインストーラーの無人インストールで、3 本が元ファイルと一致するかを見る表）
+//!
+//! 検査する側は表を**読む**（写しを持たない。**表はこの 1 か所だけ**）。名前を並べ直すと
+//! file:line で名指しして落ちる:
+//!
+//! - Windows のリリース検査（#2305）: `installer/windows/lib/verify-assets.ps1` の
+//!   `Get-TakoLicenseBundle` が表を読み、zip の展開とインストーラーの無人インストールで
+//!   全部が元ファイルと一致するかを見る。pwsh があれば読み手を実際に動かして確かめる
 //! - 公開後の検査（#1850）: `scripts/release.sh --check-assets` が Release の zip を取得し、
-//!   同じ表を `scripts/lib/license-bundle.sh` 経由で読んで確かめる。**表はこの 1 か所だけ**で、
-//!   シェル側に名前を並べ直すと file:line で名指しして落ちる
+//!   同じ表を `scripts/lib/license-bundle.sh` 経由で読んで確かめる
 //!
 //! 抜けたときは、置くべき場所の file:line を名指しして落ちる。
 //! 実物の中身は、リリースの作業流れ（`.github/workflows/release-windows.yml`。ブランチから
 //! dispatch するとドライラン）が zip の展開と無人インストールで確かめ、公開後は
 //! `scripts/release.sh --check-assets` が Release の zip で確かめる。
 //!
-//! 表を Rust の定数ではなくデータファイルに置くのは、シェルの検査と番犬が同じ 1 つを読むため
-//! （シェルが Rust のソースを解析すると rustfmt の整形で壊れうるうえ、それを番犬から確かめる
-//! には Windows の CI でも bash を起こす必要がある。データファイルなら両側とも数行で読める）。
+//! 表を Rust の定数ではなくデータファイルに置くのは、シェル・PowerShell の検査と番犬が同じ 1 つを
+//! 読むため（シェルが Rust のソースを解析すると rustfmt の整形で壊れうるうえ、それを番犬から
+//! 確かめるには Windows の CI でも bash を起こす必要がある。データファイルならどの側も数行で読める）。
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// 同梱表の正本（1 行 1 本: 元ファイル / Windows での名前）
 const TABLE: &str = "scripts/lib/license-bundle.txt";
@@ -319,64 +324,78 @@ fn windowsのzipが3本をtakoへ置く() {
     assert_no_problems(problems);
 }
 
+/// PowerShell の `function <name>` の行（1 始まり）と、本体の終わり（行頭の `}`。1 始まり）
+fn ps_function(lines: &[String], name: &str) -> Option<(usize, usize)> {
+    let start = find_line(lines, |l| {
+        l.trim_start()
+            .strip_prefix("function ")
+            .and_then(|rest| rest.split_whitespace().next())
+            == Some(name)
+    })?;
+    Some((start, block_end(lines, start, "}")))
+}
+
 #[test]
-fn windowsのリリース検査の表が3本と一致する() {
-    let lines = code_lines(VERIFY_ASSETS, "#");
-    let anchor = find_line(&lines, |l| {
-        l.trim_start().starts_with("$TakoLicenseBundle =")
-    })
-    .unwrap_or_else(|| panic!("{VERIFY_ASSETS} に $TakoLicenseBundle の定義が無い"));
-    let close = (anchor..lines.len())
-        .find(|&i| lines[i].trim() == "}")
-        .unwrap_or_else(|| panic!("{VERIFY_ASSETS}:{anchor}: $TakoLicenseBundle が閉じていない"));
-
-    let mut problems = Vec::new();
-    // 表の中身: `'配布物の中の名前' = '元ファイル'`
-    let mut table: Vec<(usize, String, String)> = Vec::new();
-    for (i, line) in lines.iter().enumerate().take(close).skip(anchor) {
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let (k, v) = (unquote(k), unquote(v));
-        if k.is_empty() {
-            continue;
-        }
-        table.push((i + 1, k.to_string(), v.to_string()));
-    }
+fn windowsのリリース検査は同じ表を読み名前を直書きしない() {
     let entries = bundle();
-    for e in &entries {
-        match table.iter().find(|(_, k, _)| *k == e.windows_name) {
-            None => problems.push(format!(
-                "{VERIFY_ASSETS}:{anchor}: $TakoLicenseBundle に '{name}' = '{src}' が無い\
-                 （{TABLE}:{line} の行）",
-                name = e.windows_name,
-                src = e.source,
-                line = e.line
-            )),
-            Some((n, _, v)) if *v != e.source => problems.push(format!(
-                "{VERIFY_ASSETS}:{n}: '{name}' の元ファイルが {v}（期待 {src} = {TABLE}:{line}）",
-                name = e.windows_name,
-                src = e.source,
-                line = e.line
-            )),
-            Some(_) => {}
-        }
-    }
-    for (n, k, _) in &table {
-        if !entries.iter().any(|e| e.windows_name == *k) {
-            problems.push(format!(
-                "{VERIFY_ASSETS}:{n}: '{k}' は同梱表 {TABLE} に無い（足すなら表と組み立ての全箇所へ）"
-            ));
-        }
-    }
+    let lines = code_lines(VERIFY_ASSETS, "#");
+    let mut problems = Vec::new();
 
-    // 表が検査に繋がっていること: zip は Test-TakoWindowsAssets が（実機・CI の両経路）、
+    // 表を指している（リポジトリのルートからの相対パス）
+    let quoted_table = format!("'{TABLE}'");
+    if find_line(&lines, |l| {
+        l.trim_start().starts_with("$TakoLicenseBundleTable =") && l.contains(&quoted_table)
+    })
+    .is_none()
+    {
+        problems.push(format!(
+            "{VERIFY_ASSETS}:1: 同梱表 {TABLE} を読んでいない\
+             （$TakoLicenseBundleTable = {quoted_table} が無い）"
+        ));
+    }
+    // 読み手が表を読み、検査が読み手を通す
+    match ps_function(&lines, "Get-TakoLicenseBundle") {
+        None => problems.push(format!(
+            "{VERIFY_ASSETS}:1: 同梱表の読み手 Get-TakoLicenseBundle が無い"
+        )),
+        Some((start, end)) => {
+            if !lines[start..end]
+                .iter()
+                .any(|l| l.contains("$TakoLicenseBundleTable"))
+            {
+                problems.push(format!(
+                    "{VERIFY_ASSETS}:{start}: Get-TakoLicenseBundle が $TakoLicenseBundleTable を読んでいない"
+                ));
+            }
+        }
+    }
+    match ps_function(&lines, "Test-TakoLicenseBundle") {
+        None => problems.push(format!(
+            "{VERIFY_ASSETS}:1: 同梱の検査 Test-TakoLicenseBundle が無い"
+        )),
+        Some((start, end)) => {
+            if !lines[start..end]
+                .iter()
+                .any(|l| l.contains("Get-TakoLicenseBundle"))
+            {
+                problems.push(format!(
+                    "{VERIFY_ASSETS}:{start}: Test-TakoLicenseBundle が同梱表を読まずに検査している\
+                     （Get-TakoLicenseBundle を通すこと）"
+                ));
+            }
+        }
+    }
+    // 2 か所目の表を作らない
+    problems.extend(hardcoded_names(
+        VERIFY_ASSETS,
+        &entries,
+        "Get-TakoLicenseBundle",
+    ));
+
+    // 検査が配布物の検査に繋がっていること: zip は Test-TakoWindowsAssets が（実機・CI の両経路）、
     // インストール先は CI だけが見る
-    let assets_fn = find_line(&lines, |l| l.contains("function Test-TakoWindowsAssets"))
+    let (assets_fn, assets_end) = ps_function(&lines, "Test-TakoWindowsAssets")
         .unwrap_or_else(|| panic!("{VERIFY_ASSETS} に Test-TakoWindowsAssets が無い"));
-    let assets_end = (assets_fn..lines.len())
-        .find(|&i| lines[i].starts_with('}'))
-        .unwrap_or(lines.len());
     if !lines[assets_fn..assets_end]
         .iter()
         .any(|l| l.contains("Test-TakoLicenseBundle"))
@@ -401,6 +420,210 @@ fn windowsのリリース検査の表が3本と一致する() {
             "{RELEASE_WINDOWS_PS1}:{n}: 実機の経路が無人インストールの検査を呼んでいる（実インストールを上書きする）"
         ));
     }
+    assert_no_problems(problems);
+}
+
+/// PowerShell の単引用符の文字列（中の `'` は `''`）
+fn ps_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+/// `verify-assets.ps1` の読み手を pwsh で実際に動かす（#2305）。
+///
+/// 静的な検査だけでは「表のパスは書いてあるが読み方が違う」（列の取り違え・コメント行の扱い）や
+/// 「表が無い・空のとき空の表のまま素通りする」を見逃す。1 つの pwsh で次を確かめる:
+///
+/// 1. 本物の表を読んだ行が [`bundle`] と同じ（元ファイル / Windows での名前 / 表の行）で、
+///    表どおりの置き場なら `Test-TakoLicenseBundle` が通る
+/// 2. 表が無い・コメントだけ・3 列の行 → 表を名指しして throw する
+/// 3. 表に 1 行足して置き場に無い → その名前と表の行を名指しして throw する（置き場に足せば通る）
+///
+/// pwsh が無い環境（素の Linux コンテナ等）ではスキップする。macOS の CI ランナーと Windows には
+/// pwsh があるので CI では必ず走る。Windows PowerShell 5.1 は起こさない（installer の .ps1 は
+/// BOM の無い UTF-8 で日本語を含み、5.1 は ANSI として読む。リリースの経路はすべて pwsh 7）
+#[test]
+fn windowsのリリース検査の読み手が表どおりに読み崩れを名指しで落ちる() {
+    // 表に足す架空の 1 本（本物の表に入りうる名前と重ならない合成名）
+    const EXTRA: &str = "TAKO-WATCHDOG-2305-EXTRA.md";
+    let entries = bundle();
+    let scratch = tako_core::test_residue::ScratchDir::new("license-bundle-pwsh");
+    let root = scratch.path();
+
+    let mut real_table = read(TABLE);
+    if !real_table.ends_with('\n') {
+        real_table.push('\n');
+    }
+    // 本物の表の後ろへ足した行の行番号
+    let next_line = real_table.lines().count() + 1;
+    let comments_only: String = real_table
+        .lines()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect();
+
+    // リポジトリに無い元ファイルは写さない（無いことは 同梱する3本がリポジトリ直下にある と
+    // 下の real ケースが表の行を名指しする。ここで panic すると名指しにならない）
+    let present: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| repo_root().join(&e.source).is_file())
+        .collect();
+
+    // 偽のリポジトリ（表と元ファイル）。table が None なら表を置かない
+    let fake_repo = |name: &str, table: Option<&str>| -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("scripts/lib")).expect("偽のリポジトリを作る");
+        if let Some(t) = table {
+            std::fs::write(dir.join(TABLE), t).expect("偽の表を書く");
+        }
+        for e in &present {
+            std::fs::copy(repo_root().join(&e.source), dir.join(&e.source))
+                .expect("元ファイルを写す");
+        }
+        std::fs::write(dir.join(EXTRA), "extra\n").expect("足す元ファイルを書く");
+        dir
+    };
+    let missing = fake_repo("missing", None);
+    let comments = fake_repo("comments", Some(&comments_only));
+    let three = fake_repo("three", Some(&format!("{real_table}A B C\n")));
+    let extra = fake_repo("extra", Some(&format!("{real_table}{EXTRA} {EXTRA}\n")));
+
+    // 置き場（zip を展開した tako/ 相当）: 本物の表どおりのもの と、足した 1 本も入れたもの
+    let payload = root.join("payload");
+    let payload_extra = root.join("payload-extra");
+    for dir in [&payload, &payload_extra] {
+        std::fs::create_dir_all(dir).expect("置き場を作る");
+        for e in &present {
+            std::fs::copy(repo_root().join(&e.source), dir.join(&e.windows_name))
+                .expect("置き場へ写す");
+        }
+    }
+    std::fs::write(payload_extra.join(EXTRA), "extra\n").expect("置き場へ足す");
+
+    // スクリプトはファイルにして -File で渡す（-Command の引数にすると Windows のコマンドラインの
+    // 引用符の解釈に左右される。pwsh 7 は BOM の無いファイルを UTF-8 として読む）
+    let set_root = |dir: &Path| format!("$TakoRepoRoot = {}\n", ps_quote(dir));
+    let mut script = String::from(
+        "$ErrorActionPreference = 'Stop'\n\
+         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n",
+    );
+    // canonicalize しない（Windows では `\\?\` 付きになり、pwsh の $PSScriptRoot から組む
+    // リポジトリのルートがずれうる。release_assets.rs の pwsh の検証と同じ組み方）
+    let verify_assets = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(VERIFY_ASSETS);
+    script.push_str(&format!(". {}\n", ps_quote(&verify_assets)));
+    script.push_str(
+        "function Show-TakoCase([string]$Name, [scriptblock]$Body) {\n\
+         \x20   try { & $Body | Out-Null; Write-Output ('CASE {0} OK' -f $Name) }\n\
+         \x20   catch { Write-Output ('CASE {0} THROW {1}' -f $Name, $_.Exception.Message) }\n\
+         }\n\
+         foreach ($e in @(Get-TakoLicenseBundle)) { Write-Output ('ROW {0} {1} {2}' -f $e.Source, $e.WindowsName, $e.Line) }\n",
+    );
+    let label = "-Label 'zip'";
+    script.push_str(&format!(
+        "Show-TakoCase real {{ Test-TakoLicenseBundle -Dir {} {label} }}\n",
+        ps_quote(&payload)
+    ));
+    for (name, dir) in [
+        ("missing", &missing),
+        ("comments", &comments),
+        ("three", &three),
+    ] {
+        script.push_str(&set_root(dir));
+        script.push_str(&format!(
+            "Show-TakoCase {name} {{ Get-TakoLicenseBundle }}\n"
+        ));
+    }
+    script.push_str(&set_root(&extra));
+    script.push_str(&format!(
+        "Show-TakoCase extra-absent {{ Test-TakoLicenseBundle -Dir {} {label} }}\n\
+         Show-TakoCase extra-present {{ Test-TakoLicenseBundle -Dir {} {label} }}\n",
+        ps_quote(&payload),
+        ps_quote(&payload_extra)
+    ));
+    let script_path = root.join("cases.ps1");
+    std::fs::write(&script_path, &script).expect("スクリプトを書く");
+
+    // pwsh のキャッシュをユーザーのホームへ撒かない（#944 と同じ倒し方）
+    let cache = root.join("pwsh-cache");
+    let out = match Command::new("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(&script_path)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("LOCALAPPDATA", &cache)
+        .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
+        .env("POWERSHELL_UPDATECHECK", "Off")
+        // 落ちたときの stderr に色の制御文字を混ぜない
+        .env("NO_COLOR", "1")
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("pwsh が無いので {VERIFY_ASSETS} の読み手の実行検証をスキップ（静的な検査は実施済み）");
+            return;
+        }
+        Err(e) => panic!("pwsh を起こせない: {e}"),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let context = format!("\n--- stdout\n{stdout}\n--- stderr\n{stderr}");
+    assert!(
+        out.status.success(),
+        "pwsh が失敗した（{}）{context}",
+        out.status
+    );
+
+    let rows: Vec<(String, String, usize)> = stdout
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("ROW "))
+        .map(|r| {
+            let cols: Vec<&str> = r.split_whitespace().collect();
+            let line = cols.get(2).and_then(|n| n.parse().ok()).unwrap_or(0);
+            (
+                cols[0].to_string(),
+                cols.get(1).unwrap_or(&"").to_string(),
+                line,
+            )
+        })
+        .collect();
+    let want: Vec<(String, String, usize)> = entries
+        .iter()
+        .map(|e| (e.source.clone(), e.windows_name.clone(), e.line))
+        .collect();
+    assert_eq!(
+        rows, want,
+        "{VERIFY_ASSETS} の Get-TakoLicenseBundle が {TABLE} と違う行を返した{context}"
+    );
+
+    let case = |name: &str| -> String {
+        let prefix = format!("CASE {name} ");
+        stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(&prefix).map(str::to_string))
+            .unwrap_or_else(|| panic!("ケース {name} の結果が無い{context}"))
+    };
+    let mut problems = Vec::new();
+    let mut check = |name: &str, want_ok: bool, needles: &[&str]| {
+        let got = case(name);
+        let ok = got == "OK";
+        if ok != want_ok || !needles.iter().all(|n| got.contains(n)) {
+            problems.push(format!(
+                "{VERIFY_ASSETS}: ケース {name} の期待は {} {needles:?}、実際は {got}",
+                if want_ok {
+                    "通る"
+                } else {
+                    "名指しで落ちる"
+                }
+            ));
+        }
+    };
+    let added_at = format!("{TABLE}:{next_line}");
+    check("real", true, &[]);
+    check("missing", false, &[TABLE]);
+    check("comments", false, &[TABLE]);
+    check("three", false, &[&format!("{added_at}:")]);
+    check("extra-absent", false, &[EXTRA, &added_at]);
+    check("extra-present", true, &[]);
     assert_no_problems(problems);
 }
 
@@ -430,6 +653,32 @@ fn block_end(lines: &[String], start: usize, end: &str) -> usize {
         .map_or(lines.len(), |i| i + 1)
 }
 
+/// 検査する側のコード（コメントを除く）に同梱するライセンスの名前を直書きした行（= 2 か所目の表）を
+/// file:line で集める。`reader` は直し方として案内する表の読み手
+fn hardcoded_names(rel: &str, entries: &[Entry], reader: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (i, l) in code_lines(rel, "#").iter().enumerate() {
+        for e in entries {
+            let mut names = vec![e.source.as_str()];
+            if e.windows_name != e.source {
+                names.push(e.windows_name.as_str());
+            }
+            for name in names {
+                if has_name_token(l, name) {
+                    problems.push(format!(
+                        "{rel}:{}: 同梱するライセンスの名前 {name} を直書きしている。表は {TABLE}:{} の 1 か所だけ\
+                         （{reader} で読む）: {}",
+                        i + 1,
+                        e.line,
+                        l.trim()
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
 #[test]
 fn 公開後のzipの検査は同じ表を読み名前を直書きしない() {
     let entries = bundle();
@@ -446,25 +695,7 @@ fn 公開後のzipの検査は同じ表を読み名前を直書きしない() {
 
     // 2 か所目の表を作らない: シェル側のコード（コメントを除く）に名前を直書きしない
     for rel in [LICENSE_LIB, RELEASE_SH] {
-        for (i, l) in code_lines(rel, "#").iter().enumerate() {
-            for e in &entries {
-                let mut names = vec![e.source.as_str()];
-                if e.windows_name != e.source {
-                    names.push(e.windows_name.as_str());
-                }
-                for name in names {
-                    if has_name_token(l, name) {
-                        problems.push(format!(
-                            "{rel}:{}: 同梱するライセンスの名前 {name} を直書きしている。表は {TABLE}:{} の 1 か所だけ\
-                             （tako_license_bundle で読む）: {}",
-                            i + 1,
-                            e.line,
-                            l.trim()
-                        ));
-                    }
-                }
-            }
-        }
+        problems.extend(hardcoded_names(rel, &entries, "tako_license_bundle"));
     }
 
     // release.sh --check-assets が読み手を source し、公開済みの zip の検査を呼んでいる
