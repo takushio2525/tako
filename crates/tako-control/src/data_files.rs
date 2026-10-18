@@ -53,6 +53,33 @@ pub fn load_recent() -> RecentList {
     list
 }
 
+/// ファイル・フォルダの移動（#1842）に合わせて、最近使った場所のうち移したもの（と
+/// その配下）を移した後のパスへ付け替える。`moved` は `file_move::moved_path` を渡す。
+/// 付け替えた件数を返す
+pub fn follow_recent_move(moved: impl FnMut(&Path) -> Option<std::path::PathBuf>) -> usize {
+    let Some(path) = tako_core::recent::recent_path() else {
+        return 0;
+    };
+    follow_recent_move_at(&path, moved)
+}
+
+/// [`follow_recent_move`] の本体（置き場を受ける = テストは一時 dir の中だけで回す）。
+///
+/// **1 件も付け替えなければ書かない**（触っていない一覧を書き直さない。読めなかった一覧は
+/// 空として返ってくるので、ここで書くと空で上書きしてしまう = #916 の退避より後に消える）
+pub fn follow_recent_move_at(
+    path: &Path,
+    moved: impl FnMut(&Path) -> Option<std::path::PathBuf>,
+) -> usize {
+    let (mut list, issue) = RecentList::load_from_checked(path);
+    report(SchemaId::Recent, path, issue.as_ref(), &RECENT_SEEN);
+    let count = list.retarget(moved);
+    if count > 0 {
+        list.save_to(path);
+    }
+    count
+}
+
 /// リモート閲覧のショートカット（`<data_dir>/remote/shortcuts.json`）を読む。
 /// 壊れていれば登録分なし（既定のショートカットだけ）で、記録は [`load_recent`] と同じ
 pub fn load_remote_shortcuts() -> ShortcutsFile {
@@ -316,6 +343,46 @@ mod tests {
             report_line(SchemaId::Recent, &path, ok.as_ref(), &seen),
             None
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1842: 移したフォルダの項目を付け替えて書き、当たらなければ書かない。
+    /// 読めない一覧は空で上書きしない（中身はそのまま残る）
+    #[test]
+    fn 移動に合わせて最近使った場所を付け替え当たらなければ書かない() {
+        use tako_core::recent::RecentEntry;
+        let dir = tmp("1842-follow");
+        let path = dir.join("recent.json");
+        let ws = dir.join("ws");
+        let mut list = RecentList::default();
+        list.push(RecentEntry::Directory {
+            path: ws.join("other").to_string_lossy().into_owned(),
+        });
+        list.push(RecentEntry::Repository {
+            path: ws.join("proj").to_string_lossy().into_owned(),
+        });
+        list.save_to(&path);
+        let (from, to) = (ws.join("proj"), ws.join("dst").join("proj"));
+        let moved = |p: &Path| tako_core::file_move::remap(p, &from, &to);
+
+        assert_eq!(follow_recent_move_at(&path, moved), 1);
+        let after = RecentList::load_from_checked(&path).0;
+        assert_eq!(after.entries[0].label(), to.to_string_lossy());
+        assert_eq!(after.entries[1].label(), ws.join("other").to_string_lossy());
+
+        // 当たらない移動は書かない（中身を書き換えておき、そのまま残るかで確かめる）
+        std::fs::write(&path, "{\"entries\": []}").expect("書ける");
+        let unrelated = |p: &Path| tako_core::file_move::remap(p, &ws.join("x"), &ws.join("y"));
+        assert_eq!(follow_recent_move_at(&path, unrelated), 0);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("読める"),
+            "{\"entries\": []}"
+        );
+
+        // 読めない一覧（空として返る）は空で上書きしない
+        std::fs::write(&path, "[こわれた").expect("書ける");
+        assert_eq!(follow_recent_move_at(&path, |_| Some(to.clone())), 0);
+        assert_eq!(std::fs::read_to_string(&path).expect("読める"), "[こわれた");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

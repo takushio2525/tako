@@ -9,7 +9,10 @@
 //! ## 断るもの（黙って上書きしない・壊さない）
 //!
 //! - 移動先に**同じ名前**がある（[`MoveRefusal::NameTaken`]）。`rename(2)` は既存の
-//!   ファイルや空のフォルダを黙って置き換えるので、呼ぶ前に必ず見る
+//!   ファイルや空のフォルダを黙って置き換えるので、段取り（[`plan`]）で見たうえで、
+//!   実行（[`execute`]）は OS の**上書きしない rename**（`platform::fs_move::rename_noreplace`。
+//!   #1842）で行う。見てから rename するまでのあいだに別のプロセスが同名を作っても、
+//!   OS が原子的に断る（どちらの中身も残る）
 //! - フォルダを**自分自身・自分の配下**へ（[`MoveRefusal::IntoSelf`] /
 //!   [`MoveRefusal::IntoDescendant`]）。比較は実体の形（`canonicalize`）で行い、
 //!   `..`・シンボリックリンク・Windows の大文字小文字の違いで素通りさせない
@@ -23,9 +26,13 @@
 //! [`follows`] が返す新しいパスへ付け替える。**移す前に**呼ぶこと（実体の形を
 //! 引けるのは元の場所にあるうちだけ）。付け替えないと、ディスクの監視がそのファイルを
 //! 「外で削除された」（#1659）と読み、未保存の変更が競合の帯の向こうへ閉じ込められる。
+//!
+//! 記録されたパス（最近使った場所 `recent.json` など。**元の場所はもう無い**）は、
+//! 移した後に [`moved_path`] で付け替え先を引く（#1842）。
 
 use std::path::{Path, PathBuf};
 
+use crate::platform::fs_move::rename_noreplace;
 use crate::platform::path::canonicalize;
 
 /// 移せない理由
@@ -215,6 +222,9 @@ pub struct MovePlan {
     /// = リンクそのもの）。開いているファイルの照合で、字面が食い違うとき
     /// （`/tmp` と `/private/tmp`、macOS / Windows の大文字小文字）に使う
     from_real: PathBuf,
+    /// 移した後のパスの実体の形（移動先のフォルダの実体の形 + 元の名前）。
+    /// 実体の形で記録されたパス（最近使った場所 = #970）の付け替え先（[`moved_path`]）
+    to_real: PathBuf,
 }
 
 /// 移す項目の種別（応答の `kind`）
@@ -295,26 +305,85 @@ pub fn plan(src: &Path, dest_dir: &Path) -> Result<Planned, MoveRefusal> {
         to,
         kind,
         from_real,
+        to_real: dest_real.join(name),
     }))
 }
 
-/// 移す（`rename` 1 回）。直前にもう一度同名を見る（[`plan`] から実行までの間に
-/// 作られたものを上書きしない。同じ UI スレッドの続きなので隙間は小さい）
+/// 移す（`rename` 1 回）。**上書きしない rename**（`platform::fs_move::rename_noreplace`）
+/// なので、[`plan`] が同名を見てから実行までのあいだに別のプロセスが同名を作っても、
+/// OS が原子的に断って [`MoveRefusal::NameTaken`] を返す（#1842。どちらの中身も残る）
 pub fn execute(plan: &MovePlan) -> Result<(), MoveRefusal> {
-    if exists_no_follow(&plan.to) {
-        return Err(MoveRefusal::NameTaken);
+    execute_with(plan, inject_race)
+}
+
+/// [`execute`] の本体。`before_rename` は**最後の確認の後・rename の直前**に呼ばれる
+/// （隙間に同名を作る注入口。単体テストは閉包を、実経路は `TAKO_1842_INJECT_RACE` を渡す）
+fn execute_with(plan: &MovePlan, before_rename: impl FnOnce(&MovePlan)) -> Result<(), MoveRefusal> {
+    if issue1842_legacy() {
+        // 修正前（#1834）の形: 見てから rename する = 隙間に作られた同名を黙って置き換える
+        if exists_no_follow(&plan.to) {
+            return Err(MoveRefusal::NameTaken);
+        }
+        before_rename(plan);
+        return std::fs::rename(&plan.from, &plan.to).map_err(|e| classify_io(&e));
     }
-    std::fs::rename(&plan.from, &plan.to).map_err(|e| classify_io(&e))
+    before_rename(plan);
+    rename_noreplace(&plan.from, &plan.to).map_err(|e| classify_io(&e))
 }
 
 /// `rename` の失敗を理由へ読み替える（EXDEV / `ERROR_NOT_SAME_DEVICE` は std が
-/// どちらも `CrossesDevices` へ寄せる）
+/// どちらも `CrossesDevices` へ寄せる。上書きしない rename が同名で断った
+/// EEXIST / `ERROR_ALREADY_EXISTS` は `AlreadyExists` へ寄る = #1842）
 pub fn classify_io(error: &std::io::Error) -> MoveRefusal {
-    if error.kind() == std::io::ErrorKind::CrossesDevices {
-        MoveRefusal::CrossDevice
-    } else {
-        MoveRefusal::Io(error.to_string())
+    match error.kind() {
+        std::io::ErrorKind::CrossesDevices => MoveRefusal::CrossDevice,
+        std::io::ErrorKind::AlreadyExists => MoveRefusal::NameTaken,
+        _ => MoveRefusal::Io(error.to_string()),
     }
+}
+
+/// `TAKO_1842_LEGACY=1` で修正前の形に戻す（#1842 の A/B）: 実行は「見てから
+/// `std::fs::rename`」（隙間に作られた同名を上書きする）、移動のあとに最近使った場所を
+/// 付け替えない（dispatch がこれを見る）
+pub fn issue1842_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1842_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// 注入（#1842）: `TAKO_1842_INJECT_RACE=<名前>[,<名前>…]` を立てると、移した後の名前が
+/// そのどれかに当たる移動で、**最後の確認の後・rename の直前**に移動先へ同名を作る
+/// （ファイルを移すなら中身 `tako-1842-race` のファイル、フォルダなら空のフォルダ =
+/// どちらも `rename(2)` が黙って置き換える形）。別のプロセスが隙間に同名を作るのを、
+/// 負荷をかけずに毎回同じ所で起こす
+fn inject_race(plan: &MovePlan) {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        std::env::var("TAKO_1842_INJECT_RACE")
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let hit = plan
+        .to
+        .file_name()
+        .is_some_and(|n| names.iter().any(|want| n == want.as_str()));
+    if hit {
+        create_racer(plan);
+    }
+}
+
+/// 隙間に割り込む同名を作る（注入とその単体テストが使う 1 実装）
+fn create_racer(plan: &MovePlan) {
+    let _ = if plan.kind == EntryKind::Dir {
+        std::fs::create_dir(&plan.to)
+    } else {
+        std::fs::write(&plan.to, "tako-1842-race\n")
+    };
 }
 
 /// リンクを辿らずに「その名前の何かがあるか」（壊れたリンクも「ある」）
@@ -341,6 +410,16 @@ pub fn remap(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
     } else {
         to.join(rest)
     })
+}
+
+/// 記録されたパス（最近使った場所など）が移したもの（またはその配下）なら、移した後の
+/// パスを返す（#1842）。**移した後に**呼べる（ファイルシステムを読まない）。
+///
+/// 字面 → 実体の形の順に照合する。記録は実体の形で残っているのが普通なので（#970）、
+/// 実体の形で当たったら付け替え先も実体の形にする（`/tmp` 経由で移しても
+/// `/private/tmp/…` の記録が `/private/tmp/…` のまま追う）
+pub fn moved_path(plan: &MovePlan, path: &Path) -> Option<PathBuf> {
+    remap(path, &plan.from, &plan.to).or_else(|| remap(path, &plan.from_real, &plan.to_real))
 }
 
 /// 移した後に付け替えるペインと新しいパス（**移す前に**呼ぶ）。
@@ -616,6 +695,110 @@ mod tests {
             std::fs::read_to_string(base.join("dst/b.txt")).unwrap(),
             "割り込み"
         );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// #1842 の本体: 最後の確認の後・rename の直前（= 確認から実行までの隙間）に別のプロセスが
+    /// 同名を作っても、上書きせずに断り、元のファイルも割り込んだ同名も中身が残る。
+    /// 修正前（`TAKO_1842_LEGACY=1` = 見てから `std::fs::rename`）はここで上書きする
+    #[test]
+    fn 確認の直後に同名ができても上書きせずに断る() {
+        let base = scratch("race");
+        touch(&base.join("src/a.txt"), "元の中身");
+        std::fs::create_dir_all(base.join("src/d/inner")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+
+        let Ok(Planned::Move(p)) = plan(&base.join("src/a.txt"), &base.join("dst")) else {
+            panic!("ファイルを移す段取りが立たない");
+        };
+        assert_eq!(
+            execute_with(&p, create_racer),
+            Err(MoveRefusal::NameTaken),
+            "確認の直後にできた同名のファイルを上書きした（#1842）"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("src/a.txt"))
+                .ok()
+                .as_deref(),
+            Some("元の中身"),
+            "元のファイルが元の場所に残っていない"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("dst/a.txt"))
+                .ok()
+                .as_deref(),
+            Some("tako-1842-race\n"),
+            "割り込んだ同名のファイルの中身が残っていない"
+        );
+
+        // フォルダを空のフォルダの上へ（`rename(2)` は黙って置き換える）
+        let Ok(Planned::Move(p)) = plan(&base.join("src/d"), &base.join("dst")) else {
+            panic!("フォルダを移す段取りが立たない");
+        };
+        assert_eq!(
+            execute_with(&p, create_racer),
+            Err(MoveRefusal::NameTaken),
+            "確認の直後にできた同名の空のフォルダを置き換えた（#1842）"
+        );
+        assert!(base.join("src/d/inner").is_dir(), "元のフォルダが残る");
+        assert!(
+            base.join("dst/d").is_dir() && !base.join("dst/d/inner").exists(),
+            "割り込んだ空のフォルダがそのまま残る"
+        );
+
+        // 割り込みが無ければ同じ経路で移る
+        std::fs::remove_file(base.join("dst/a.txt")).unwrap();
+        let Ok(Planned::Move(p)) = plan(&base.join("src/a.txt"), &base.join("dst")) else {
+            panic!("段取りが立たない");
+        };
+        execute_with(&p, |_| {}).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("dst/a.txt")).unwrap(),
+            "元の中身"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 上書きしない移動が同名で断った失敗は同名の理由へ読む() {
+        let taken = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert_eq!(classify_io(&taken), MoveRefusal::NameTaken);
+        assert!(classify_io(&taken).reason().contains("同じ名前"));
+    }
+
+    /// #1842: 記録されたパス（最近使った場所など）は、移した後でも字面・実体の形の
+    /// どちらで記録されていても付け替え先が引ける。実体の形の記録は実体の形のまま追う
+    #[test]
+    fn 記録されたパスは移した後に字面でも実体の形でも付け替え先が引ける() {
+        let base = scratch("recorded");
+        std::fs::create_dir_all(base.join("folder/inner")).unwrap();
+        std::fs::create_dir_all(base.join("dst")).unwrap();
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        // 字面に `..` を挟んで名指す（`/tmp` と `/private/tmp` の違いと同じ = 字面と実体がずれる）
+        let via = |name: &str| base.join("sub").join("..").join(name);
+        let named = via("folder");
+        let Ok(Planned::Move(p)) = plan(&named, &via("dst")) else {
+            panic!("段取りが立たない");
+        };
+        execute(&p).unwrap();
+        assert_eq!(
+            moved_path(&p, &base.join("folder")),
+            Some(base.join("dst").join("folder")),
+            "実体の形の記録が付け替わらない"
+        );
+        assert_eq!(
+            moved_path(&p, &base.join("folder").join("inner")),
+            Some(base.join("dst").join("folder").join("inner")),
+            "配下の記録が付け替わらない"
+        );
+        assert_eq!(
+            moved_path(&p, &named),
+            Some(via("dst").join("folder")),
+            "字面の記録は字面のまま付け替わる"
+        );
+        assert_eq!(moved_path(&p, &base.join("folder2")), None, "成分単位");
+        assert_eq!(moved_path(&p, &base.join("dst")), None);
+        assert!(base.join("dst/folder/inner").is_dir());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
