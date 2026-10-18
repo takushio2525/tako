@@ -3681,7 +3681,7 @@
           "type": "string"
         },
         "target": {
-          "description": "色操作の対象（省略 = 現在の theme）",
+          "description": "色操作・colors の対象: dark / light / プリセット名（省略 = 現在の theme）",
           "type": "string"
         },
         "value": {

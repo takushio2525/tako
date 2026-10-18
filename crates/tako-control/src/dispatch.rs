@@ -2881,12 +2881,35 @@ pub fn lsp_results(
 /// （応答は #1830 以前とバイト一致）。status の `warnings` は GUI の帳簿から引くが、ここは
 /// hex と同じ出どころに揃える（帳簿から引くと、手で直して未反映の値で hex と食い違う）
 ///
+/// `target`（"dark" / "light" / プリセット名）を渡すと、いまのテーマ（settings.json の theme・
+/// GUI のモード）に依らず、そのテーマの色・出どころ・`warnings` を同じ規則で組み、`theme` も
+/// そのテーマの名前になる（#2321。以前は target を読み捨て、常にいまのテーマを返していた）。
+/// 知らない名前はエラーで返す（黙ってダークへ落とすと、別のテーマの色を答えてしまう）。
+/// 省略したときの応答は #2321 以前とバイト一致
+///
 /// [`resolve_theme`]: crate::settings::Settings::resolve_theme
-fn theme_colors_response(settings: &crate::settings::Settings) -> Value {
+fn theme_colors_response(
+    settings: &crate::settings::Settings,
+    target: Option<&str>,
+) -> Result<Value, DispatchError> {
     use tako_core::theme::{ColorSource, Theme};
-    let (theme, warnings) = settings.resolve_theme();
+    let name = match target {
+        None => settings.theme.clone(),
+        Some(t) => settings.known_theme_name(t).ok_or_else(|| {
+            let presets: Vec<&str> = settings.theme_presets.keys().map(String::as_str).collect();
+            let presets = if presets.is_empty() {
+                "なし".to_string()
+            } else {
+                presets.join(" / ")
+            };
+            DispatchError::InvalidParams(format!(
+                "未知のテーマ: {t:?}（target は dark / light / プリセット名。プリセット: {presets}）"
+            ))
+        })?,
+    };
+    let (theme, warnings) = settings.resolve_theme_named(&name);
     let empty = std::collections::BTreeMap::new();
-    let overrides = settings.active_theme_overrides().unwrap_or(&empty);
+    let overrides = settings.theme_overrides_named(&name).unwrap_or(&empty);
     let colors: serde_json::Map<String, Value> = Theme::COLOR_KEYS
         .iter()
         .map(|&k| {
@@ -2897,11 +2920,11 @@ fn theme_colors_response(settings: &crate::settings::Settings) -> Value {
             (k.to_string(), entry)
         })
         .collect();
-    let mut out = serde_json::json!({ "theme": settings.theme, "colors": colors });
+    let mut out = serde_json::json!({ "theme": name, "colors": colors });
     if !warnings.is_empty() {
         out["warnings"] = serde_json::json!(warnings);
     }
-    out
+    Ok(out)
 }
 
 /// リクエストを実行し、成功時の `result` 値を返す。
@@ -9174,7 +9197,8 @@ fn dispatch_inner(
                     }
                     Ok(status)
                 }
-                "colors" => Ok(theme_colors_response(&crate::settings::load())),
+                // #2321: target（CLI の --target / MCP の target）のテーマの色を返す
+                "colors" => theme_colors_response(&crate::settings::load(), target.as_deref()),
                 "set-color" => {
                     let k = key.as_deref().ok_or_else(|| {
                         DispatchError::InvalidParams("set-color には key が必要".into())
@@ -40423,7 +40447,7 @@ mod tests {
                 ("nosuch", "#000000"),
             ]),
         );
-        let v = theme_colors_response(&s);
+        let v = theme_colors_response(&s, None).unwrap();
         assert_eq!(field(&v, "accent", "source"), "ignored", "{v}");
         assert_eq!(field(&v, "accent", "hex"), builtin.accent.to_hex());
         assert_eq!(field(&v, "red", "source"), "ignored");
@@ -40456,7 +40480,7 @@ mod tests {
 
         // ライト: dark の上書きは読まない = 全色 builtin・warnings はキーごと出さない
         s.theme = "light".into();
-        let v = theme_colors_response(&s);
+        let v = theme_colors_response(&s, None).unwrap();
         for &key in Theme::COLOR_KEYS {
             assert_eq!(field(&v, key, "source"), "builtin", "{key}: {v}");
         }
@@ -40471,7 +40495,7 @@ mod tests {
                 colors: table(&[("accent", "#xyz"), ("teal", "#0000ff")]),
             },
         );
-        let v = theme_colors_response(&s);
+        let v = theme_colors_response(&s, None).unwrap();
         assert_eq!(field(&v, "accent", "source"), "ignored", "{v}");
         assert_eq!(field(&v, "teal", "source"), "override");
         assert_eq!(
@@ -40485,7 +40509,7 @@ mod tests {
         s.theme = "dark".into();
         s.theme_colors
             .insert("dark".into(), table(&[("accent", "#FF0000")]));
-        let v = theme_colors_response(&s);
+        let v = theme_colors_response(&s, None).unwrap();
         let keys: Vec<&str> = v
             .as_object()
             .expect("object")
@@ -40495,6 +40519,216 @@ mod tests {
         assert_eq!(keys, ["theme", "colors"]);
         assert_eq!(field(&v, "accent", "source"), "override");
         assert_eq!(field(&v, "accent", "hex"), "#ff0000");
+    }
+
+    /// #2321: `colors` の `target` は、いまのテーマ（settings.json の theme）に依らず、
+    /// そのテーマの色・出どころ・`warnings` を返す（以前は target を読み捨て、常にいまの
+    /// テーマを返していた）。いまのテーマを 4 通り（dark / light / プリセット / 知らない名前）に
+    /// 変えても、target ごとの応答は「そのテーマがいまのテーマのときの応答」とバイト一致する
+    #[test]
+    fn issue2321_theme_colorsはtargetのテーマの色を返す() {
+        use crate::settings::{Settings, ThemePreset};
+        use tako_core::theme::Theme;
+        let table = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let field = |v: &serde_json::Value, key: &str, name: &str| {
+            v["colors"][key][name]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let warning_keys = |v: &serde_json::Value| -> Vec<String> {
+            v["warnings"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(|w| w.split(':').next().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut s = Settings::default();
+        s.theme_colors.insert(
+            "dark".into(),
+            table(&[("accent", "#赤色"), ("green", "#00ff00")]),
+        );
+        s.theme_colors.insert(
+            "light".into(),
+            table(&[("accent", "#ff0000"), ("red", "#xyz")]),
+        );
+        s.theme_presets.insert(
+            "ocean".into(),
+            ThemePreset {
+                base: "light".into(),
+                colors: table(&[("teal", "#0000ff"), ("mauve", "#12345")]),
+            },
+        );
+        // そのテーマが「いまのテーマ」のときの応答（target 省略 = #2321 以前から変わらない経路）
+        let current = |theme: &str| {
+            let mut s = s.clone();
+            s.theme = theme.into();
+            serde_json::to_string(&theme_colors_response(&s, None).unwrap()).unwrap()
+        };
+        let (want_dark, want_light, want_ocean) =
+            (current("dark"), current("light"), current("ocean"));
+        let light = Theme::default_light();
+        let dark = Theme::default_dark();
+
+        for now in ["dark", "light", "ocean", "nosuch"] {
+            s.theme = now.into();
+            let get = |t: &str| theme_colors_response(&s, Some(t)).unwrap();
+
+            let v = get("light");
+            assert_eq!(v["theme"], "light", "いま {now}: {v}");
+            assert_eq!(
+                field(&v, "background", "hex"),
+                light.background.to_hex(),
+                "いま {now}"
+            );
+            assert_eq!(field(&v, "accent", "hex"), "#ff0000", "いま {now}");
+            assert_eq!(field(&v, "accent", "source"), "override", "いま {now}");
+            assert_eq!(field(&v, "red", "hex"), light.red.to_hex(), "いま {now}");
+            assert_eq!(field(&v, "red", "source"), "ignored", "いま {now}");
+            assert_eq!(
+                (field(&v, "green", "hex"), field(&v, "green", "source")),
+                (light.green.to_hex(), "builtin".to_string()),
+                "いま {now}: dark の上書きを light へ混ぜない"
+            );
+            assert_eq!(warning_keys(&v), ["red"], "いま {now}: {v}");
+            assert_eq!(serde_json::to_string(&v).unwrap(), want_light, "いま {now}");
+
+            let v = get("dark");
+            assert_eq!(v["theme"], "dark", "いま {now}: {v}");
+            assert_eq!(
+                field(&v, "background", "hex"),
+                dark.background.to_hex(),
+                "いま {now}"
+            );
+            assert_eq!(field(&v, "accent", "source"), "ignored", "いま {now}");
+            assert_eq!(field(&v, "green", "source"), "override", "いま {now}");
+            assert_eq!(warning_keys(&v), ["accent"], "いま {now}: {v}");
+            assert_eq!(serde_json::to_string(&v).unwrap(), want_dark, "いま {now}");
+
+            let v = get("ocean");
+            assert_eq!(v["theme"], "ocean", "いま {now}: {v}");
+            assert_eq!(
+                field(&v, "background", "hex"),
+                light.background.to_hex(),
+                "いま {now}"
+            );
+            assert_eq!(field(&v, "teal", "source"), "override", "いま {now}");
+            assert_eq!(field(&v, "mauve", "source"), "ignored", "いま {now}");
+            assert_eq!(
+                field(&v, "accent", "source"),
+                "builtin",
+                "いま {now}: light の表をプリセットへ混ぜない"
+            );
+            assert_eq!(warning_keys(&v), ["mauve"], "いま {now}: {v}");
+            assert_eq!(serde_json::to_string(&v).unwrap(), want_ocean, "いま {now}");
+
+            // ビルトイン名は大小・前後の空白を問わない（ThemeMode::parse と同じ）。theme は正規の名前
+            for spelled in ["LIGHT", " light "] {
+                assert_eq!(
+                    serde_json::to_string(&get(spelled)).unwrap(),
+                    want_light,
+                    "いま {now}: {spelled:?}"
+                );
+            }
+
+            // 知らない名前は黙ってダークへ落とさずエラー（理由に名前とプリセットの一覧）
+            for unknown in ["nosuch", "", "Ocean"] {
+                match theme_colors_response(&s, Some(unknown)) {
+                    Err(DispatchError::InvalidParams(msg)) => {
+                        assert!(msg.contains(&format!("{unknown:?}")), "{msg}");
+                        assert!(msg.contains("ocean"), "{msg}");
+                    }
+                    other => panic!("いま {now}: {unknown:?} はエラーのはず: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// #2321: dispatch（CLI の経路）と MCP の `tako_theme colors` が `target` を
+    /// `theme_colors_response` へ渡す。以前は CLI も MCP も target を載せて送るのに、dispatch の
+    /// `colors` が読み捨てていた。GUI のモード（host）にも依らない
+    #[test]
+    fn issue2321_dispatchとmcpのcolorsはtargetを渡す() {
+        use tako_core::theme::{Theme, ThemeMode};
+        let colors = |target: &str| Request::Theme {
+            action: Some("colors".into()),
+            mode: None,
+            target: Some(target.into()),
+            key: None,
+            value: None,
+            name: None,
+            font_family: None,
+            font_size: None,
+        };
+        // 色が上書き無し（builtin）なら hex はそのモードの既定色（テストの data dir の
+        // settings.json に上書きがあっても偽の赤にならないよう、builtin のときだけ比べる）
+        let check = |v: &serde_json::Value, target: &str, via: &str| {
+            assert_eq!(v["theme"], target, "{via}: target={target} の theme: {v}");
+            let mode = ThemeMode::parse(target).expect("ビルトイン名");
+            if v["colors"]["background"]["source"] == "builtin" {
+                assert_eq!(
+                    v["colors"]["background"]["hex"],
+                    Theme::for_mode(mode).background.to_hex(),
+                    "{via}: target={target} の background"
+                );
+            }
+        };
+        let mut host = MockHost::new();
+        for gui in [ThemeMode::Dark, ThemeMode::Light] {
+            host.set_theme_mode(gui);
+            for target in ["light", "dark"] {
+                let v = dispatch(&mut host, colors(target), PaneOrigin::Cli)
+                    .unwrap_or_else(|e| panic!("CLI: target={target}: {e}"));
+                check(&v, target, &format!("CLI（GUI={}）", gui.as_str()));
+            }
+        }
+        match dispatch(&mut host, colors("nosuch"), PaneOrigin::Cli) {
+            Err(DispatchError::InvalidParams(msg)) => assert!(msg.contains("nosuch"), "{msg}"),
+            other => panic!("CLI: 知らない名前はエラーのはず: {other:?}"),
+        }
+
+        // MCP: tools/call tako_theme → 同じ dispatch
+        let mut exec = |req: Request| -> Result<serde_json::Value, String> {
+            dispatch(&mut host, req, PaneOrigin::Mcp).map_err(|e| e.to_string())
+        };
+        let mut session = crate::mcp::McpSession {
+            caller_pane: None,
+            caller_role: None,
+            connected: true,
+            exec: &mut exec,
+        };
+        let mut call = |target: &str| {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "tako_theme",
+                    "arguments": { "action": "colors", "target": target },
+                },
+            });
+            crate::mcp::handle_message(&msg, &mut session).expect("応答がある")
+        };
+        for target in ["light", "dark"] {
+            let response = call(target);
+            assert_ne!(response["result"]["isError"], true, "{response}");
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("本文がある");
+            let v: serde_json::Value = serde_json::from_str(text).expect("本文は JSON");
+            check(&v, target, "MCP");
+        }
+        let response = call("nosuch");
+        assert_eq!(response["result"]["isError"], true, "{response}");
     }
 
     /// #1756: 色の値は文字単位で検査する。6 バイトの非 ASCII（`#赤色`）がバイト長の検査を

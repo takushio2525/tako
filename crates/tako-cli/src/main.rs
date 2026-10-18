@@ -3830,7 +3830,7 @@ struct ThemeArgs {
     name_or_key: Option<String>,
     /// set-color の #RRGGBB / preset delete
     value_or_action: Option<String>,
-    /// 色操作の対象
+    /// 色操作・colors の対象（dark / light / プリセット名。省略 = 現在のテーマ）
     #[arg(long)]
     target: Option<String>,
     /// reset（reset-color 用）

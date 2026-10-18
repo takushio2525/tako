@@ -2662,7 +2662,7 @@ pub fn tools() -> Vec<Value> {
                         "description": "操作（省略は status）",
                     },
                     "mode": { "type": "string", "description": "テーマ: dark / light / プリセット名（set 時に必須）" },
-                    "target": { "type": "string", "description": "色操作の対象（省略 = 現在の theme）" },
+                    "target": { "type": "string", "description": "色操作・colors の対象: dark / light / プリセット名（省略 = 現在の theme）" },
                     "key": { "type": "string", "description": "色キー名（set-color / reset-color 時に必須）" },
                     "value": { "type": "string", "description": "#RRGGBB（set-color 時に必須）" },
                     "name": { "type": "string", "description": "プリセット名（save-preset / delete-preset 時に必須）" },

@@ -2459,6 +2459,14 @@ settings.json を読み直した値ではない（監視は無いので、手で
 解決で、GUI の帳簿ではない（`colors` の hex はもともと settings.json から解いている。帳簿から
 引くと、手で直して未反映の値で hex と warnings が食い違う）。無いときはキーごと出さない
 （応答は #1830 以前とバイト一致）。実経路は `scripts/test-theme-colors-ignored-1830.sh`。
+**`colors` の `target` はそのテーマを引く**（#2321）: `tako theme colors --target <dark|light|プリセット名>` /
+MCP `tako_theme colors` の `target` は、いまのテーマ（settings.json の theme・GUI のモード）に依らず、
+そのテーマの色・出どころ・`warnings` を返し、`theme` もそのテーマの名前（ビルトインは正規形の
+`dark` / `light`）になる。以前は CLI も MCP も target を送るのに dispatch が読み捨て、常にいまの
+テーマを返していた。解決は `Settings::resolve_theme_named` / `theme_overrides_named`（名前で引く 1 本。
+`resolve_theme` / `active_theme_overrides` はいまの theme を渡す薄い包み）で、応答は同じ
+`theme_colors_response`。知らない名前は黙ってダークへ落とさずエラー（理由にプリセットの一覧）。
+target を省いた応答は #2321 以前とバイト一致。実経路は `scripts/test-theme-colors-target-2321.sh`。
 
 ### FR-4.7 プロファイルの GUI 編集（Issue #721。✅ 2026-08-01）
 
