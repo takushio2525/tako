@@ -103,7 +103,7 @@ echo "$(date +%s) ROLE=${TAKO_ORCHESTRATOR_ROLE:-} ARGS=$*" >> "$FAKE_DIR/launch
 [ -n "$sid" ] || exit 0
 mkdir -p "$FAKE_DIR/agents"
 echo "$sid" > "$FAKE_DIR/agents/$$"
-trap 'rm -f "$FAKE_DIR/agents/$$"; exit 0' TERM INT HUP
+trap 'rm -f "${FAKE_DIR:?}/agents/$$"; exit 0' TERM INT HUP
 echo "FAKECLAUDE-2020 $sid"
 while :; do sleep 5; done
 FAKE

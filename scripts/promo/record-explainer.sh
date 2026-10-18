@@ -389,7 +389,7 @@ scene_setup() {
     promo_make_demo_env
     promo_make_demo_home
     # 前半は「Claude Code が入っていない環境」を演出する: デモ PATH から claude を外す
-    rm -f "$PROMO_DEMO/bin/claude"
+    rm -f "${PROMO_DEMO:?}/bin/claude"
     PROMO_EXTRA_ENV=(
         "HOME=$PROMO_DEMO/home"
         "PATH=$PROMO_DEMO/bin:/usr/bin:/bin:/usr/sbin:/sbin"

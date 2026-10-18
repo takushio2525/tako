@@ -323,7 +323,7 @@ awesome-app  Design Notes
    scripts/build.sh compiles and bundles the app.
 TXT
     cupsfilter -i text/plain "$PROMO_DEMO/awesome-app/docs/spec.txt" \
-        > "$PROMO_DEMO/awesome-app/docs/spec.pdf" 2>/dev/null || rm -f "$PROMO_DEMO/awesome-app/docs/spec.pdf"
+        > "$PROMO_DEMO/awesome-app/docs/spec.pdf" 2>/dev/null || rm -f "${PROMO_DEMO:?}/awesome-app/docs/spec.pdf"
 
     cat > "$PROMO_DEMO/awesome-app/src/api.py" <<'PY'
 """awesome-app: JSON API helpers."""
@@ -416,7 +416,7 @@ LOG
 #   - PATH  … /private/tmp/tako-demo/bin（必要なコマンドの symlink だけ）
 # に差し替えて撮る。画面に出るパスはすべて /private/tmp 配下になる。
 promo_make_demo_home() {
-    rm -rf "$PROMO_DEMO/home" "$PROMO_DEMO/bin"
+    rm -rf "${PROMO_DEMO:?}/home" "${PROMO_DEMO:?}/bin"
     mkdir -p "$PROMO_DEMO/home" "$PROMO_DEMO/bin"
     # tako は収録に使う実体（バンドル内バイナリ）へリンクする
     ln -sf "$PROMO_CLI" "$PROMO_DEMO/bin/tako"

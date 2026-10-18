@@ -162,7 +162,7 @@ run_night() {
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   : > "$dir/home/calls.log"
-  rm -f "$dir/home/.claude-orchestrator/logs/tako-nightly-release.log"
+  rm -f "${dir:?}/home/.claude-orchestrator/logs/tako-nightly-release.log"
   RC=0
   env -i HOME="$dir/home" ${envs[@]+"${envs[@]}"} /bin/bash "$dir/repo/scripts/nightly-release.sh" ${1+"$@"} > "$dir/night$n.out" 2>&1 || RC=$?
   command cp -f "$dir/home/calls.log" "$dir/night$n.calls"

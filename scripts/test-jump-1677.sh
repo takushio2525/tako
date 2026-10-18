@@ -232,7 +232,7 @@ case "$OUT" in *開き直した*) fail "付け替えた後にまた開き直し�
 echo
 echo "== ⑤ 消えたファイルの項目は読み飛ばす =="
 "$TAKO_BIN" open "$FIX/c.rs" --pane "$ROOT" --line 5 >/dev/null 2>&1
-rm -f "$FIX/b.rs"
+rm -f "${FIX:?}/b.rs"
 OUT="$("$TAKO_BIN" jump back --pane "$ROOT" 2>&1)"
 echo "  back: $OUT"
 check_contains "消えたファイルは読み飛ばしたと知らせる" "読み飛ばした（ファイルが無い）" "$OUT"

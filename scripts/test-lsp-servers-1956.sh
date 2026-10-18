@@ -352,7 +352,7 @@ check_eq "編集はそのまま続けられる（editing・dirty）" "(True, Tru
 echo
 echo "== ⑤ 取れない行の未導入（PATH に dart が無い） =="
 # ③ の GUI のまま。この GUI ではまだ誰も dart を引いていないので、外してから開けば未導入から始まる
-rm -f "$TMP/rbin/dart"
+rm -f "${TMP:?}/rbin/dart"
 pane="$(open_edit "$P/dart/main.dart")"
 for _ in $(seq 1 300); do
   [ "$(server_field dart '["state"]')" = "not_installed" ] && break

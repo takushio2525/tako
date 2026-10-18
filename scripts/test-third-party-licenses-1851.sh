@@ -146,7 +146,7 @@ contains "足したクレートを名指しする" "    gamma 0.3.4" "${OUTLOG}"
 check "書き込んだ一覧は LF だけ（CRLF を残さない）" "$(cmp -s "${FIX}/added.md" "${FAKE}/THIRD-PARTY-LICENSES.md" && echo same)" "same"
 run "${FIX}/added-crlf.md"
 contains "2 回目は一致" "は今の依存と一致しています（5 クレート" "${OUTLOG}"
-rm -f "${FAKE}/THIRD-PARTY-LICENSES.md"
+rm -f "${FAKE:?}/THIRD-PARTY-LICENSES.md"
 run "${FIX}/base.md" --check
 check "一覧が無ければ --check は 1" "${RC}" "1"
 contains "全クレートを載っていない側に数える" "載っていないクレート（依存にあるのに一覧に無い）: 4 件" "${OUTLOG}"

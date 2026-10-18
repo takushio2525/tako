@@ -241,7 +241,7 @@ print(ids[0] if ids else "")' "g1991-$1" 2>/dev/null
 run_case() {
   local label="$1"; shift
   local before took waits rc after
-  rm -f "$TMP/bg.out" "$TMP/bg.rc"
+  rm -f "${TMP:?}/bg.out" "${TMP:?}/bg.rc"
   before="$(count "$TMP/fake-git.calls")"
   : > "$ARM_GIT"
   ( perl -e 'alarm shift; exec @ARGV' 90 "$@" > "$TMP/bg.out" 2>&1; echo $? > "$TMP/bg.rc" ) &
@@ -427,7 +427,7 @@ else
   echo "== R 起動時の自動復帰の show-environment が返らない / $r_arm"
   "$REAL_TMUX" -L "$TAKO_TMUX_SOCKET" new-session -d -s "tako-orphan1991" -x 80 -y 24 >/dev/null 2>&1 \
     || fail "R 器の孤児を作れない"
-  rm -f "$TMP/data/layout.json"
+  rm -f "${TMP:?}/data/layout.json"
   : > "$ARM_TMUX"
   launch_isolated_gui "$TMP/app-r.log" TAKO_AUTO_RENAME=0 TAKO_PERSIST=1 "TAKO_TMUX_BIN=$TMP/faketmux/tmux" \
     ${r_env[@]+"${r_env[@]}"} || exit $?

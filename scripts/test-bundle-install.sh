@@ -66,7 +66,7 @@ fixed_replace() { install_bundle_in_place "$1/new/tako.app" "$1/Applications/tak
 # 観測できる幅の窓（50ms）を明示的に作る。dummy .app は小さくコピーが一瞬で終わるため、
 # 窓を作らないと「旧手順でも 0 回」になり、対照が対照にならない
 legacy_replace_with_window() {
-  rm -rf "$1/Applications/tako.app"
+  rm -rf "${1:?}/Applications/tako.app"
   sleep 0.05
   cp -R "$1/new/tako.app" "$1/Applications/tako.app"
 }

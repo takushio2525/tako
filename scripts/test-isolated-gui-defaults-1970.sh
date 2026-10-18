@@ -164,7 +164,7 @@ stop_arm
 echo
 echo "=== ① ② ③ 既定（一時の HOME）==="
 : > "$FAKE_LOG"
-rm -f "$HOME/.zshrc" # 対照の腕が置いたものを消す（この起動が置くことを見る）
+rm -f "${HOME:?}/.zshrc" # 対照の腕が置いたものを消す（この起動が置くことを見る）
 start_arm default
 P="$(first_pane default)"
 GUI_ENV="$(ps eww -o command= -p "$APP_PID")"

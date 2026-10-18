@@ -143,7 +143,7 @@ check "$SAME" "tako todo show --json と MCP tako_todo show が同じやりと�
 
 stop_isolated_gui "$APP_PID"
 APP_PID=""
-rm -f "$TAKO_ORCHESTRATOR_DIR/user-tasks.yaml"
+rm -f "${TAKO_ORCHESTRATOR_DIR:?}/user-tasks.yaml"
 
 # ---------------------------------------------------------------------------
 run_visual() {
@@ -169,7 +169,7 @@ check "$(grep -q "TAKO_VISUAL_TEST_OK" "$TMP/visual-fixed.log" && echo 1)" \
   "visual: IME・折り返し・上限・送信の間・履歴・エッジがすべて通る"
 
 echo "--- ③ visual-test tasks-input（TAKO_2016_LEGACY=1 = 修正前の欄と送信）"
-rm -f "$TAKO_ORCHESTRATOR_DIR/user-tasks.yaml"
+rm -f "${TAKO_ORCHESTRATOR_DIR:?}/user-tasks.yaml"
 run_visual legacy TAKO_2016_LEGACY=1
 check "$(grep -q "TAKO_APP_SELF_TEST_FAILED: tasks-input \[legacy\]" "$TMP/visual-legacy.log" && echo 1)" \
   "visual（旧）: 修正前の欄は同じ判定で落ちる（A/B）"

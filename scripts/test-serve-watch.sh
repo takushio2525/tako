@@ -133,8 +133,8 @@ print("null" if cur is None else (str(cur).lower() if isinstance(cur,bool) else 
 start_daemon() {
   echo '{}' > "$TMP/serve.json"
   echo '{}' > "$TMP/serve-b.json"
-  rm -f "$TMP/flip" "$TMP/gone"
-  rm -f "$TAKO_REMOTE_STATE_DIR"/tako-remote.* 2>/dev/null || true
+  rm -f "${TMP:?}/flip" "${TMP:?}/gone"
+  rm -f "${TAKO_REMOTE_STATE_DIR:?}"/tako-remote.* 2>/dev/null || true
   # **本番と同じ起動経路**（`remote start` = spawn_daemon）を使う。
   # spawn_daemon は起動情報 JSON を読んだあと子の stdout / stderr の pipe を閉じるので、
   # 以後 daemon が println! / eprintln! を呼ぶと EPIPE で panic する（#1049 では実際に
@@ -309,7 +309,7 @@ sleep 6
 check_eq "serve_ok=false" "false" "$(status_field serve_ok)"
 check_eq "状態は node_missing" "node_missing" "$(status_field serve_state)"
 check_contains "理由にノード名が出る" "$(status_field degraded.reason)" "fake-1049.tailfake"
-rm -f "$TMP/gone"
+rm -f "${TMP:?}/gone"
 stop_daemon
 
 echo

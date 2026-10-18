@@ -248,7 +248,7 @@ check_eq "④ ID なら選べる" "$MONO/.venv" "$(field runtime.key "$R4")"
 
 echo
 echo "== ⑤ 保存した env2 を消すと自動へ落ちずにエラー =="
-rm -rf "$PROJ/env2"
+rm -rf "${PROJ:?}/env2"
 N0="$(pane_count)"
 E5="$("$TAKO_BIN" run "$PROJ/a.py" --pane "$ROOT" 2>&1)"; RC5=$?
 echo "  tako run: rc=$RC5 $(oneline "$E5" | head -c 300)"

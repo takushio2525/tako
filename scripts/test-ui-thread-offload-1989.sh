@@ -205,7 +205,7 @@ print(d["tabs"][0]["panes"][0]["id"])' 2>/dev/null
 run_case() {
   local label="$1" arms="$2" calls_file="$3"; shift 3
   local before took waits rc after a
-  rm -f "$TMP/bg.out" "$TMP/bg.rc"
+  rm -f "${TMP:?}/bg.out" "${TMP:?}/bg.rc"
   before="$(count "$calls_file")"
   for a in $arms; do : > "$a"; done
   ( perl -e 'alarm shift; exec @ARGV' 90 "$@" > "$TMP/bg.out" 2>&1; echo $? > "$TMP/bg.rc" ) &

@@ -388,7 +388,7 @@ chmod 644 "$E/bad/secret.txt"
 
 printf 'gone\n' > "$E/gone.txt"
 "$TAKO_BIN" file clipboard cut "$E/gone.txt" >/dev/null
-rm -f "$E/gone.txt"
+rm -f "${E:?}/gone.txt"
 GONE_ERR="$("$TAKO_BIN" file paste "$E/out" 2>&1)"
 GONE_RC=$?
 echo "  観測: $(printf '%s' "$GONE_ERR" | sed "s#${TMP}#<TMP>#g")"
@@ -409,7 +409,7 @@ if hdiutil create -size 4m -fs HFS+ -volname tako1860 "$DMG" -quiet >/dev/null 2
     fail "別のボリュームへコピーできない"
   fi
   "$TAKO_BIN" file clipboard cut "$E/vol.txt" >/dev/null
-  rm -f "$MNT/vol.txt"
+  rm -f "${MNT:?}/vol.txt"
   XDEV_ERR="$("$TAKO_BIN" file paste "$MNT" 2>&1)"
   XDEV_RC=$?
   echo "  観測: $(printf '%s' "$XDEV_ERR" | sed "s#${TMP}#<TMP>#g")"

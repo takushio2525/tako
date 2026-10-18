@@ -358,7 +358,7 @@ assert_eq "ロックを残さない" "no" "$([ -d "$B/home/.claude-orchestrator/
 assert_not_contains "ログにホームの実パスを出さない" "$(cat "$B/out.txt")" "$B/home"
 
 echo "B2: 同じコミットの夜 → 測り済みで飛ばす（計測を起こさない）"
-rm -f "$B/measure.pid"
+rm -f "${B:?}/measure.pid"
 night
 assert_eq "終了コード 0" "0" "$WATCH_RC"
 assert_contains "測り済み" "$(cat "$B/out.txt")" "測り済み"
@@ -413,7 +413,7 @@ assert_eq "計測のプロセスは残らない" "gone" "$(kill -0 "$pid" 2>/dev
 assert_eq "worktree を残さない" "1" "$(wt_count)"
 
 echo "B8: ビルドが上限に届く → 未実測（計測を起こさない）"
-rm -f "$B/measure.pid"
+rm -f "${B:?}/measure.pid"
 new_commit n9; night FAKE_CARGO_SLEEP=5 TAKO_FOOTPRINT_WATCH_BUILD_TIMEOUT=1
 assert_eq "終了コード 3" "3" "$WATCH_RC"
 assert_contains "ビルドの時間切れ" "$(cat "$B/out.txt")" "ビルドが上限に届いた"
@@ -465,7 +465,7 @@ env -i HOME="$B/home" PATH="$B/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/b
 assert_contains "PWA と cargo build を tako queue 経由で走らせた" "$(cat "$B/tako.log")" "cargo build --release -q -p tako-cli -p tako-app"
 assert_contains "並んだのは queue" "$(cat "$B/tako.log")" "queue /bin/bash -c"
 assert_eq "古い tako には並ばせない" "" "$(cat "$B/old-tako.log" 2>/dev/null)"
-rm -f "$B/bin/tako"
+rm -f "${B:?}/bin/tako"
 
 echo "B14: 別の見張りが走っている間は飛ばす（ロック）"
 mkdir -p "$B/home/.claude-orchestrator/locks/tako-footprint-watch.lock"
@@ -475,7 +475,7 @@ echo "$holder" > "$B/home/.claude-orchestrator/locks/tako-footprint-watch.lock/p
 new_commit n15; night
 assert_contains "飛ばす" "$(cat "$B/out.txt")" "別の実行"
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
-rm -rf "$B/home/.claude-orchestrator/locks/tako-footprint-watch.lock"
+rm -rf "${B:?}/home/.claude-orchestrator/locks/tako-footprint-watch.lock"
 
 # ============================================================================
 echo
@@ -600,7 +600,7 @@ assert_eq "多重起動では回らない" "not-called" "$(marker "$D")"
 
 echo "C6: 見張りのスクリプトが無い install_root（古い main）→ 飛ばして 0"
 D="$TMP_ROOT/c6"; make_nightly_env "$D" 0 1
-rm -f "$D/repo/scripts/nightly-footprint-watch.sh"
+rm -f "${D:?}/repo/scripts/nightly-footprint-watch.sh"
 run_nightly_c "$D"
 assert_eq "夜間の終了コード 0" "0" "$NIGHT_RC"
 assert_contains "飛ばすと言う" "$(cat "$D/out.txt")" "見張りを飛ばす"

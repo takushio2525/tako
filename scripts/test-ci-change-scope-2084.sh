@@ -255,7 +255,7 @@ assert_has "-- の後ろをテストバイナリへ渡す" "-- --test-threads=4"
 assert_hasnt "拾わなかったものは渡さない" "comment_only" "${args}"
 assert_has "走らせる本数を言う" "docs / .agent を読む番犬 7 本を走らせる" "${out}"
 
-rm "${T}/context_budget.rs"
+rm "${T:?}/context_budget.rs"
 out="$(TAKO_DOCS_WATCHDOGS_ROOT="${FAKE}" bash "${WATCHDOGS_SH}" --list 2>&1)"
 rc=$?
 assert_eq "錨が拾えなければ 1（黙って通さない）" "${rc}" "1"

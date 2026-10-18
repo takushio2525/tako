@@ -51,7 +51,7 @@ FAIL=0
 run_mode() { # run_mode <mode> [追加の引数...]
   local mode="$1"
   shift
-  rm -rf "$TMP/work"
+  rm -rf "${TMP:?}/work"
   mkdir -p "$TMP/work"
   /usr/bin/python3 -I "$DRIVER" --tako "$TAKO_BIN" --env-file "$TMP/env" --work "$TMP/work" \
     --mode "$mode" ${1+"$@"}

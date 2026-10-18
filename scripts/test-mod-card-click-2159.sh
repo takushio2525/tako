@@ -106,7 +106,7 @@ cleanup() {
   [ -n "$APP_PID" ] && stop_isolated_gui "$APP_PID"
   tmx kill-server >/dev/null 2>&1 || true
   tmux -L "$TMUX_SOCKET-gui" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET" "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET-gui"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}" "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET-gui"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
   if [ -n "${KEEP:-}" ] || [ -n "${OUT_DIR:-}" ]; then echo "（$TMP を残した）"; else rm -rf "$TMP"; fi
 }
@@ -331,7 +331,7 @@ phase_static() {
   local cfg="$TMP/cfg-static" m="$TMP/mod-static" out
   mkdir -p "$cfg"
   /bin/cp -R "$REPO_ROOT/crates/tako-core/claude-mod" "$m"
-  rm -rf "$m/.claude-plugin/types"
+  rm -rf "${m:?}/.claude-plugin/types"
   out="$(cd "$TMP" && env CLAUDE_CONFIG_DIR="$cfg" DISABLE_AUTOUPDATER=1 claude plugin validate --strict "$m" 2>&1)"
   if grep -q 'Validation passed' <<<"$out"; then pass "validate --strict"; else fail "validate --strict"; printf '%s\n' "$out" | mask | tail -15; fi
   out="$(cd "$TMP" && env CLAUDE_CONFIG_DIR="$cfg" DISABLE_AUTOUPDATER=1 claude plugin test "$m" 2>&1)"

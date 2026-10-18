@@ -66,7 +66,7 @@ cleanup() {
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   # サーバーが落ちてもソケットファイルが残ることがある（自分の名前の 1 本だけ消す）
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
   rm -rf "$TMP"
 }
 trap cleanup EXIT

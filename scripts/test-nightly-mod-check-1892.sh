@@ -211,7 +211,7 @@ if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -d "$CLAUDE_CONFIG_DIR" ]; then echo '{}
 mode_of() { cat "$S/$1_mode" 2>/dev/null || echo auto; }
 if [ "$1" = "--version" ]; then
   [ "$(mode_of version)" = hang ] && exec "$S/hang"
-  if [ "$(mode_of version)" = fail-once ]; then rm -f "$S/version_mode"; echo "✘ forced failure once (--version)"; exit 1; fi
+  if [ "$(mode_of version)" = fail-once ]; then rm -f "${S:?}/version_mode"; echo "✘ forced failure once (--version)"; exit 1; fi
   echo "$(cat "$S/version") (Claude Code)"
   exit 0
 fi
@@ -243,7 +243,7 @@ dir="$1"
 case "$(mode_of "$sub")" in
   hang) exec "$S/hang" ;;
   fail) echo "✘ forced failure ($sub)"; exit 1 ;;
-  fail-once) rm -f "$S/${sub}_mode"; echo "✘ forced failure once ($sub)"; exit 1 ;;
+  fail-once) rm -f "${S:?}/${sub}_mode"; echo "✘ forced failure once ($sub)"; exit 1 ;;
   # 実物の validate はゲートの .catch 抜けを注記に出すだけで合格させる（2.1.294 で実測）
   nocatch) printf '  ❯ ./register.ts gating hook with .catch: classic.Stop\n  ❯ ./register.ts gating hook without .catch: tool.call\n✔ Validation passed\n'; exit 0 ;;
   zero) printf ' 0 pass\n 0 fail\nRan 0 tests across 0 files.\n'; exit 0 ;;
@@ -315,7 +315,7 @@ STUB
   # 本物の mod（Claude Code が書く型定義は除く）
   mkdir -p "$dir/repo/crates/tako-core"
   cp -R "$REPO_ROOT/crates/tako-core/claude-mod" "$dir/repo/crates/tako-core/"
-  rm -rf "$dir/repo/crates/tako-core/claude-mod/.claude-plugin/types"
+  rm -rf "${dir:?}/repo/crates/tako-core/claude-mod/.claude-plugin/types"
 
   printf '/target\n/dist\n' > "$dir/repo/.gitignore"
   printf '[workspace.package]\nversion = "0.7.10"\n' > "$dir/repo/Cargo.toml"
@@ -362,7 +362,7 @@ inject_archive_late_tail() {
   printf '#!/bin/sh\nREAL_GIT="%s"\nS="%s/stub"\n' "$REAL_GIT" "$dir" > "$dir/home/.local/bin/git"
   cat >> "$dir/home/.local/bin/git" <<'SH'
 if [ "${1:-}" != -C ] || [ "${3:-}" != archive ] || [ ! -e "$S/archive_late_tail" ]; then exec "$REAL_GIT" "$@"; fi
-rm -f "$S/archive_late_tail"
+rm -f "${S:?}/archive_late_tail"
 t="$S/archive.$$.tar"
 "$REAL_GIT" "$@" > "$t" || { rc=$?; rm -f "$t"; exit "$rc"; }
 n=$(wc -c < "$t")
@@ -586,7 +586,7 @@ test_timeout() {
   assert_contains "記録: validate=timeout" "$state" "validate=timeout"
   assert_contains "記録: test=skipped" "$state" "test=skipped"
 
-  rm -f "$dir/stub/validate_mode"
+  rm -f "${dir:?}/stub/validate_mode"
   echo hang > "$dir/stub/version_mode"
   out=$(NIGHTLY_ENV="TAKO_MOD_CHECK_TIMEOUT=2" run_nightly "$dir" --dry-run)
   assert_contains "--version が固まっても打ち切る" "$out" "mod:   claude --version: 2 秒で返らないので打ち切った（validate / test は飛ばした）"
@@ -678,13 +678,13 @@ test_standalone() {
   out=$(sa) || rc=$?
   assert_eq "ゲートの .catch 抜け: exit 1" "1" "$rc"
   assert_contains "ゲートの .catch 抜け: 理由" "$out" "ゲートになるフックに .catch の無いものがある"
-  rm -f "$dir/stub/validate_mode"
+  rm -f "${dir:?}/stub/validate_mode"
   echo zero > "$dir/stub/test_mode"
   rc=0
   out=$(sa) || rc=$?
   assert_eq "テストが 1 本も走らない: exit 1" "1" "$rc"
   assert_contains "テストが 1 本も走らない: 理由" "$out" "テストが 1 本も走らなかった"
-  rm -f "$dir/stub/test_mode"
+  rm -f "${dir:?}/stub/test_mode"
 }
 
 # --- Test 11: 文言一致の自己検査（#1903）------------------------------------------
@@ -702,7 +702,7 @@ test_reworded() {
   assert_contains "validate の文言が変わった: 理由" "$out" "『gating hook with .catch:』の行が無い"
   assert_contains "validate の文言が変わった: 直す場所" "$out" "scripts/check-claude-mod.sh の文言一致を直す"
   assert_contains "validate の文言が変わった: 結果の行" "$out" "で validate（注記の文言が変わった） が落ちた"
-  rm -f "$dir/stub/validate_mode"
+  rm -f "${dir:?}/stub/validate_mode"
 
   echo reworded > "$dir/stub/test_mode"
   rc=0
@@ -710,7 +710,7 @@ test_reworded() {
   assert_eq "test の文言が変わった: exit 1" "1" "$rc"
   assert_contains "test の文言が変わった: 理由" "$out" "要約行『Ran N tests』が読めない"
   assert_contains "test の文言が変わった: 結果の行" "$out" "で test（要約行の文言が変わった） が落ちた"
-  rm -f "$dir/stub/test_mode"
+  rm -f "${dir:?}/stub/test_mode"
 
   # 1 本だけのときの単数形（`Ran 1 test`）は文言の変化ではない
   echo one > "$dir/stub/test_mode"
@@ -718,7 +718,7 @@ test_reworded() {
   out=$(sa) || rc=$?
   assert_eq "Ran 1 test（単数形）: exit 0" "0" "$rc"
   assert_contains "Ran 1 test（単数形）: 合格" "$out" "test: 合格（1 pass/0 fail）"
-  rm -f "$dir/stub/test_mode"
+  rm -f "${dir:?}/stub/test_mode"
 }
 
 # --- Test 12: skills-dir から読まれる（#1959）-------------------------------------
@@ -745,7 +745,7 @@ test_skills_dir() {
   echo missing > "$dir/stub/list_mode"
   out=$(sa) || true
   assert_contains "読まれない: 理由" "$out" "tako setup で入れた mod が効かない"
-  rm -f "$dir/stub/list_mode"
+  rm -f "${dir:?}/stub/list_mode"
   assert_eq "利用者の設定 dir に skills/ を作らない" "no" "$([ -e "$dir/home/.claude/skills" ] && echo yes || echo no)"
 }
 

@@ -105,7 +105,7 @@ exit 0
 STUB
     chmod +x "$ISO_HOME/.local/bin/claude"
     printf '# user own first line\nexport TAKO_1502_USER_LINE=1\n' > "$ISO_HOME/.zprofile"
-    rm -rf "$TMP/d"
+    rm -rf "${TMP:?}/d"
 }
 
 mkdir -p "$APP_MACOS"
@@ -188,7 +188,7 @@ run setup bootstrap path > /dev/null
 check "$([ "$(readlink "$ISO_HOME/.local/bin/tako")" = "$ISO_TAKO" ] && echo 1 || echo 0)" \
       "F1 bootstrap path 単体でも設置できる（CLI / MCP と 1:1）"
 MOVED="$TMP/B/tako.app/Contents/MacOS"
-mkdir -p "$MOVED"; mv "$ISO_TAKO" "$MOVED/tako"; rm -rf "$TMP/A"
+mkdir -p "$MOVED"; mv "$ISO_TAKO" "$MOVED/tako"; rm -rf "${TMP:?}/A"
 check "$([ ! -e "$ISO_HOME/.local/bin/tako" ] && echo 1 || echo 0)" "F2 移動でリンクが切れる（前提）"
 ISO_TAKO="$MOVED/tako"
 out=$(run setup --check)
@@ -205,7 +205,7 @@ APP_MACOS="$MOVED"
 # --- G. エッジ --------------------------------------------------------------
 section "G. エッジ"
 # G1-G2: .zprofile が無い
-reset_home; rm -f "$ISO_HOME/.zprofile"
+reset_home; rm -f "${ISO_HOME:?}/.zprofile"
 run setup bootstrap path > /dev/null
 check "$([ -f "$ISO_HOME/.zprofile" ] && echo 1 || echo 0)" "G1 .zprofile が無ければ作る"
 check "$([ "$(markers)" = "1" ] && echo 1 || echo 0)" "G2 作ったファイルにブロックは 1 個"

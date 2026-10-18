@@ -104,7 +104,7 @@ cleanup() {
   [ -n "$APP_PID" ] && stop_isolated_gui "$APP_PID"
   tmx kill-server >/dev/null 2>&1 || true
   tmux -L "$TMUX_SOCKET-gui" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET" "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET-gui"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}" "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET-gui"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: $TMP を残した）"; else rm -rf "$TMP"; fi
 }
@@ -328,7 +328,7 @@ phase_static() {
   local cfg="$TMP/cfg-static" m="$TMP/mod-static" out
   mkdir -p "$cfg"
   /bin/cp -R "$REPO_ROOT/crates/tako-core/claude-mod" "$m"
-  rm -rf "$m/.claude-plugin/types"
+  rm -rf "${m:?}/.claude-plugin/types"
   out="$(cd "$TMP" && env CLAUDE_CONFIG_DIR="$cfg" DISABLE_AUTOUPDATER=1 claude plugin validate --strict "$m" 2>&1)"
   if grep -q 'Validation passed' <<<"$out"; then pass "validate --strict"; else fail "validate --strict"; printf '%s\n' "$out" | mask | tail -15; fi
   out="$(cd "$TMP" && env CLAUDE_CONFIG_DIR="$cfg" DISABLE_AUTOUPDATER=1 claude plugin test "$m" 2>&1)"
@@ -558,7 +558,7 @@ phase_copy() {
     tcap "$s" | mask | tail -8 | sed 's/^/      | /'
     return 1
   fi
-  rm -f "$TMP/pbcopy.out"
+  rm -f "${TMP:?}/pbcopy.out"
   tband_press "$s" y
   wait_for 10 test -f "$TMP/pbcopy.out" || true
   copied="$(cat "$TMP/pbcopy.out" 2>/dev/null)"
@@ -577,7 +577,7 @@ phase_copy() {
     fail "（拒む mod と同居）帯に card $CARD が出ない"
     return 1
   fi
-  rm -f "$TMP/pbcopy.out"
+  rm -f "${TMP:?}/pbcopy.out"
   tband_press "$s" y
   wait_for 10 test -s "$GATE_LOG" || true
   check_eq "拒まれたら show-command --copy --card N --index 1 を叩く" "show-command --copy --card $CARD --index 1" "$(tail -1 "$GATE_LOG" 2>/dev/null)"

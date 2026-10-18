@@ -65,7 +65,7 @@ cleanup() {
   [ -n "$LOAD_PID" ] && kill "$LOAD_PID" 2>/dev/null
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: <tmp> を残した）"; else rm -rf "$TMP"; fi
 }
@@ -377,7 +377,7 @@ if want aging || want nomod; then
         acct-b=*,default=*, | default=*,acct-b=*,) pass "走査は止まった claude のアカウント + 既定だけ（12 秒で ${1} 本: ${2}）" ;;
         *) fail "走査先がおかしい（12 秒で ${1} 本: ${2:-なし}。期待 = acct-b と default だけ）" ;;
       esac
-      rm -f "$PAUSE_DIR/$P_B"
+      rm -f "${PAUSE_DIR:?}/${P_B:?}"
       if wait_for 30 reason_is "$P_B" mod_fresh; then pass "報告が戻ると走査しない（mod_fresh）"; else fail "mod_fresh へ戻らない（$(scan_reason "$P_B")）"; fi
       sleep 6
       scan_log_reset

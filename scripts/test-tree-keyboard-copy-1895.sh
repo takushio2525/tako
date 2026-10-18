@@ -377,7 +377,7 @@ echo "== ④ A/B: TAKO_1895_LEGACY=1（#1895 の前）では 2 つのジョブ�
 # LEGACY の写し方（std::fs::copy）は 1 つのファイルの途中で止まらず一瞬で終わるので、#1867 の
 # 項目ごとの遅延で「走っているジョブ」を観測できるようにする（途中のバイトは注入しても進まない）
 start_gui "$TMP/data-legacy-gui" "$TMP/gui-legacy.log" TAKO_1895_LEGACY=1 TAKO_1867_COPY_DELAY_MS=1500
-rm -rf "$BIG/dst"
+rm -rf "${BIG:?}/dst"
 mkdir -p "$BIG/dst"
 TAKO_1895_LEGACY=1 "$TAKO_BIN" file copy "$BIG/one.bin" "$BIG/two.bin" "$BIG/dst" > /dev/null 2>&1 &
 BG_PID=$!

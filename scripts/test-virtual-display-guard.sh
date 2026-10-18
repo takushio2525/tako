@@ -122,8 +122,8 @@ set_clamshell() { printf '  |   "AppleClamshellState" = %s\n' "$1" > "$CLAMSHELL
 no_clamshell() { : > "$CLAMSHELL"; }
 reset_bd() {
     : > "$BD_LOG"; : > "$WAKE_LOG"; : > "$READY_LOG"; : > "$RESP_LOG"; : > "$OSA_LOG"
-    rm -f "$TMP/table.after-main" "$TMP/table.after-restart" "$TMP/drawable" "$TMP/drawable.after-wake" \
-        "$TMP/bd.list"
+    rm -f "${TMP:?}/table.after-main" "${TMP:?}/table.after-restart" "${TMP:?}/drawable" "${TMP:?}/drawable.after-wake" \
+        "${TMP:?}/bd.list"
 }
 bd_log() { cat "$BD_LOG"; }
 wake_count() { grep -c . "$WAKE_LOG" 2>/dev/null || true; }

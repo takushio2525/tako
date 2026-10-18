@@ -215,7 +215,7 @@ fi
 stop_isolated_gui "$ISOLATED_GUI_PID"; ISOLATED_GUI_PID=""
 
 echo "== ② tako list の器の採り直し: 孫がパイプを握る tmux / $arm"
-rm -f "$TMP/fake-tmux.calls"
+rm -f "${TMP:?}/fake-tmux.calls"
 start_gui "$TMP/app-tmux.log" "TAKO_TMUX_BIN=$TMP/faketmux/tmux" ${legacy_env[@]+"${legacy_env[@]}"}
 # 起動直後の採取（2 秒 tick 等）と重ならないよう、採り直しの使い回し窓（0.5 秒）を待つ
 sleep 1

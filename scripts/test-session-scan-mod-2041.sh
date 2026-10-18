@@ -66,7 +66,7 @@ cleanup() {
   [ -n "$LOAD_PID" ] && kill "$LOAD_PID" 2>/dev/null
   stop_isolated_gui "$APP_PID"
   tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$TMUX_SOCKET"
+  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: <tmp> を残した）"; else rm -rf "$TMP"; fi
 }

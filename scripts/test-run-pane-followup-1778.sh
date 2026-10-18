@@ -451,7 +451,7 @@ fi
 echo
 echo "== ⑤ エッジ: 側路を用意できない（退避路 = 画面のマーカーで伝わる）=="
 # 置き場を「ファイル」にしてディレクトリを作れなくする（prepare が None を返す）
-rm -rf "$TAKO_DATA_DIR/run-exit"
+rm -rf "${TAKO_DATA_DIR:?}/run-exit"
 : > "$TAKO_DATA_DIR/run-exit"
 FSP="$("$TAKO_BIN" split --pane "$ROOT" --down -- /bin/sh -c 'exit 6' 2>/dev/null | tr -dc '0-9')"
 if [ -n "$FSP" ] && wait_until 20 is_exited "$FSP"; then
@@ -467,7 +467,7 @@ check_eq "側路が無くても tako run --wait は止まらず rc=1" "1" "$RC"
 check_eq "その exit_code は 1" "1" "$(field exit_code "$(python3 -c "$PY_LAST" < "$TMP/fallback.log")")"
 FBP="$(pane_of_wait_log "$TMP/fallback.log")"
 [ -n "$FBP" ] && "$TAKO_BIN" close --pane "$FBP" >/dev/null 2>&1
-rm -f "$TAKO_DATA_DIR/run-exit"
+rm -f "${TAKO_DATA_DIR:?}/run-exit"
 
 echo
 echo "== 結果: ${PASS} PASS / ${FAIL} FAIL =="
