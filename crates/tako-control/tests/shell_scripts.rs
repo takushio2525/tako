@@ -1712,14 +1712,22 @@ fn top_level_unquoted(word: &[char]) -> Vec<bool> {
 }
 
 /// bash 3.2 の `brace_gobbler`（braces.c）の写し: `from` から `satisfy` を探す。
+/// `start` = いま展開している文字列の先頭（3.2 の `brace_expand` は対の後ろを新しい文字列として
+/// 再帰するので、「空白で囲まれた `{`」の判定の先頭（`!i`）はそこ。読み直しの位置ではない）。
 ///
 /// **3.2 は `"…"` の中を「次の `"` まで」としか見ず、`$( … )` の入れ子を知らない**。
 /// だから `"$(f "{a,b}")"` は内側の `"` で外側のクォートが閉じたと読み、`{a,b}` を
 /// クォートの外と取り違える（4.0 以降は `"` の中の `$(` を読み飛ばすので起きない）。
-fn gobble32(t: &[char], from: usize, satisfy: char) -> Option<usize> {
-    let ws = |c: Option<&char>| matches!(c, Some(' ' | '\t' | '\n'));
+///
+/// 閉じの `}` を探すときは、深さ 0 の区切り（`,` か、直後が `}` でない `..`）を見るまで `}` を
+/// 閉じにしない（braces.c の `commas`。#2301）。だから 3.2 は `{x}` の `}` を読み飛ばし、
+/// 後ろの `,` と `}` まで 1 つの対にする（`"$(g "{\"a\":1}" "x,y}")"` が割れる）
+fn gobble32(t: &[char], start: usize, from: usize, satisfy: char) -> Option<usize> {
+    // braces.c の `brace_whitespace`（文字列の終わりも空白に数える）
+    let ws = |c: Option<&char>| matches!(c, None | Some(' ' | '\t' | '\n'));
     let mut level = 0usize;
     let mut quoted: Option<char> = None;
+    let mut commas = usize::from(satisfy != '}');
     let mut i = from;
     while i < t.len() {
         let c = t[i];
@@ -1728,8 +1736,8 @@ fn gobble32(t: &[char], from: usize, satisfy: char) -> Option<usize> {
             continue;
         }
         if c == '$' && t.get(i + 1) == Some(&'{') && quoted != Some('\'') {
-            // 3.2 は `${` の次の 1 文字も読み飛ばす
-            i += 3;
+            // `${` は `\{` と同じく 2 文字を読み飛ばし、クォートの外なら深さを上げる
+            i += 2;
             if quoted.is_none() {
                 level += 1;
             }
@@ -1758,10 +1766,10 @@ fn gobble32(t: &[char], from: usize, satisfy: char) -> Option<usize> {
             i = lx.i;
             continue;
         }
-        if c == satisfy && level == 0 {
+        if c == satisfy && level == 0 && commas > 0 {
             // 空白で囲まれた `{`（と `{}`）は波括弧展開の始まりと見ない
             let lone = c == '{'
-                && (i == from || ws(t.get(i - 1)))
+                && (i == start || ws(t.get(i - 1)))
                 && (ws(t.get(i + 1)) || t.get(i + 1) == Some(&'}'));
             if !lone {
                 return Some(i);
@@ -1770,14 +1778,50 @@ fn gobble32(t: &[char], from: usize, satisfy: char) -> Option<usize> {
             level += 1;
         } else if c == '}' && level > 0 {
             level -= 1;
+        } else if satisfy == '}'
+            && level == 0
+            && (c == ',' || (c == '.' && t.get(i + 1) == Some(&'.') && t.get(i + 2) != Some(&'}')))
+        {
+            commas += 1;
         }
         i += 1;
     }
     None
 }
 
-/// 3.2 がこの中身（`{` と `}` の間）を展開するか: エスケープされていない `,` があるか、
-/// 連番（`1..3` / `a..c`。3.2 は刻み `1..5..2` を知らない）
+/// 3.2 の `legal_number`（general.c）: `strtoimax` が読める整数（先頭の空白・符号を許す）の後ろに
+/// 空白（` ` / タブ）しか無い。何も読めなくても空白だけなら通る（3.2 の実装どおり）
+fn legal_number32(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while b
+        .get(i)
+        .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+    {
+        i += 1;
+    }
+    let mut j = i;
+    if b.get(j).is_some_and(|c| matches!(c, b'+' | b'-')) {
+        j += 1;
+    }
+    let digits = j;
+    while b.get(j).is_some_and(u8::is_ascii_digit) {
+        j += 1;
+    }
+    if j > digits && s[i..j].parse::<i64>().is_err() {
+        return false; // 桁あふれ（errno）
+    }
+    // 数字が 1 つも無ければ strtoimax は何も読まない（読み終わりの位置 = 先頭）
+    let mut end = if j > digits { j } else { 0 };
+    while b.get(end).is_some_and(|c| matches!(c, b' ' | b'\t')) {
+        end += 1;
+    }
+    !s.is_empty() && end == b.len()
+}
+
+/// 3.2 がこの中身（`{` と `}` の間）を展開するか（braces.c の `brace_expand`）: エスケープされて
+/// いない `,` があるか、連番（最初の `..` で左右に分け、左右とも整数か英字 1 文字。3.2 は刻み
+/// `1..5..2` を知らない）
 fn amble_expands32(amble: &[char]) -> bool {
     let mut i = 0;
     while i < amble.len() {
@@ -1791,36 +1835,72 @@ fn amble_expands32(amble: &[char]) -> bool {
     let Some((a, b)) = s.split_once("..") else {
         return false;
     };
-    let int = |x: &str| {
-        let d = x.strip_prefix('-').unwrap_or(x);
-        !d.is_empty() && d.chars().all(|c| c.is_ascii_digit())
-    };
-    let letter = |x: &str| x.chars().count() == 1 && x.chars().all(|c| c.is_ascii_alphabetic());
-    (int(a) && int(b)) || (letter(a) && letter(b))
+    let letter = |x: &str| x.len() == 1 && x.bytes().all(|c| c.is_ascii_alphabetic());
+    !a.is_empty()
+        && !b.is_empty()
+        && ((legal_number32(a) && legal_number32(b)) || (letter(a) && letter(b)))
 }
 
-/// 語の中で、**bash 3.2 だけが**波括弧展開してしまう `{` の位置（語の中の文字位置）。
+/// 語の中で bash 3.2 が波括弧展開する対（`{` と `}` の語の中の文字位置。いちばん外側の対だけ）。
+/// クォートの外の意図した `{a,b}` も含む（実の `/bin/bash` との突き合わせ = #1931 が全体を見る）。
 ///
-/// 3.2 が展開する `{` のうち、正しく読めばクォートかコマンド置換の中に在るものだけを返す
-/// （クォートの外の `{a,b}` は意図した展開なので返さない = 過大申告しない）。
-fn brace32_misreads(word: &str) -> Vec<usize> {
+/// braces.c の `brace_expand` の写し: 閉じの見つかる最初の `{` を対とし、展開できる対なら
+/// その後ろを新しい文字列として続きを探す。**展開できない対（`,` も正しい連番も無い）に
+/// 当たったら、3.2 は語の残りを一切展開しない**（#2301。`"S{1..5..2}" "{a,b}"` の `{a,b}` は割れない）
+fn brace32_pairs(word: &str) -> Vec<(usize, usize)> {
+    let t: Vec<char> = word.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    'text: loop {
+        // 閉じの無い `{` は読み飛ばして次の `{` を探す（3.2 の do-while）
+        let mut i = start;
+        let (open, close) = loop {
+            let Some(open) = gobble32(&t, start, i, '{') else {
+                break 'text;
+            };
+            match gobble32(&t, start, open + 1, '}') {
+                Some(close) => break (open, close),
+                None => i = open + 1,
+            }
+        };
+        if !amble_expands32(&t[open + 1..close]) {
+            break;
+        }
+        out.push((open, close));
+        start = close + 1;
+    }
+    out
+}
+
+/// 語の中で、**bash 3.2 だけが**波括弧展開してしまう対（語の中の文字位置）。
+///
+/// 3.2 が展開する対のうち、正しく読めば `{` か `}` がクォートかコマンド置換の中に在るものだけを
+/// 返す（クォートの外の `{a,b}` は意図した展開なので返さない = 過大申告しない。
+/// `{x}"…,…}"` のようにクォートの外の `{` からクォートの中の `}` までを対にするものは返す）。
+fn brace32_misreads(word: &str) -> Vec<(usize, usize)> {
     let t: Vec<char> = word.chars().collect();
     let top = top_level_unquoted(&t);
-    let mut out = Vec::new();
-    let mut i = 0;
-    while let Some(open) = gobble32(&t, i, '{') {
-        let Some(close) = gobble32(&t, open + 1, '}') else {
-            i = open + 1;
-            continue;
-        };
-        if amble_expands32(&t[open + 1..close]) {
-            if !top[open] {
-                out.push(open);
-            }
-            i = close + 1;
+    brace32_pairs(word)
+        .into_iter()
+        .filter(|&(open, close)| !top[open] || !top[close])
+        .collect()
+}
+
+/// ファイルの中で、波括弧展開を受ける語（コマンド置換の中の語も）に bash 3.2 が展開する対
+/// （ファイル先頭からの文字位置）。`misread_only` なら 3.2 だけが展開するもの = 番犬が名指すもの
+fn brace32_file_pairs(src: &str, misread_only: bool) -> std::collections::BTreeSet<(usize, usize)> {
+    let mut out = std::collections::BTreeSet::new();
+    for w in raw_words(src).into_iter().filter(|w| w.brace_expanded) {
+        let found = if misread_only {
+            brace32_misreads(&w.text)
         } else {
-            i = open + 1;
-        }
+            brace32_pairs(&w.text)
+        };
+        out.extend(
+            found
+                .into_iter()
+                .map(|(open, close)| (w.start + open, w.start + close)),
+        );
     }
     out
 }
@@ -1830,26 +1910,23 @@ fn brace32_violations(rel: &str, src: &str) -> Vec<String> {
     let chars: Vec<char> = src.chars().collect();
     let lines: Vec<&str> = src.lines().collect();
     let line_of = |pos: usize| chars[..pos].iter().filter(|&&c| c == '\n').count() + 1;
-    let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    for w in raw_words(src).into_iter().filter(|w| w.brace_expanded) {
-        for p in brace32_misreads(&w.text) {
-            let pos = w.start + p;
-            if !seen.insert(pos) {
-                continue;
-            }
-            let line_no = line_of(pos);
-            let exempt = lines.get(line_no - 1).is_some_and(|l| audited_exception(l))
-                || line_no
-                    .checked_sub(2)
-                    .and_then(|k| lines.get(k))
-                    .is_some_and(|l| audited_exception(l));
-            if !exempt {
-                out.push(format!(
-                    "{rel}:{line_no}: \"$( … \"{{…,…}}\" … )\" の波括弧（`{{…,…}}` / `{{a..c}}`）を 3.2 が展開する: {}",
-                    lines.get(line_no - 1).map_or("", |l| l.trim())
-                ));
-            }
+    let opens: std::collections::BTreeSet<usize> = brace32_file_pairs(src, true)
+        .into_iter()
+        .map(|(open, _)| open)
+        .collect();
+    for pos in opens {
+        let line_no = line_of(pos);
+        let exempt = lines.get(line_no - 1).is_some_and(|l| audited_exception(l))
+            || line_no
+                .checked_sub(2)
+                .and_then(|k| lines.get(k))
+                .is_some_and(|l| audited_exception(l));
+        if !exempt {
+            out.push(format!(
+                "{rel}:{line_no}: \"$( … \"{{…,…}}\" … )\" の波括弧（`{{…,…}}` / `{{a..c}}`）を 3.2 が展開する: {}",
+                lines.get(line_no - 1).map_or("", |l| l.trim())
+            ));
         }
     }
     out
@@ -1919,6 +1996,10 @@ fn 検査はbash32が割る形だけを違反とする() {
     assert_eq!(hits(r#"echo "$(show "{a..c}")""#), 1);
     assert_eq!(hits(r#"echo "$(show "{ a,b }")""#), 1);
     assert_eq!(hits("cat <<X\n$(printf '%s' \"$(show \"{a,b}\")\")\nX"), 1);
+    // 3.2 は区切り（`,` / `..`）を見るまで `}` を閉じにしないので、`{x}` の `}` を読み飛ばして
+    // 後ろの `,` と `}` まで 1 つの対にする（#2301。bash 5 はどちらも割れない）
+    assert_eq!(hits(r#"f "$(show "{x}" ",}")""#), 1);
+    assert_eq!(hits(r#"f "$(show "{\"a\":1}" "x,y}")""#), 1);
 
     // 3.2 でも割れない形（過大申告しない）
     assert_eq!(hits(r#"x="$(show "{a,b}")""#), 0); // 素の代入は波括弧展開されない
@@ -1947,6 +2028,7 @@ fn 検査はbash32が割る形だけを違反とする() {
     assert_eq!(hits(r#"echo "$(show "{\"a\":1}")""#), 0);
     assert_eq!(hits(r#"echo "$(show "[{\"a\":1},{\"b\":2}]")""#), 0); // `,` が波括弧の外
     assert_eq!(hits(r#"echo "$(show "{1..5..2}")""#), 0); // 刻みつきの連番は 3.2 が知らない
+    assert_eq!(hits(r#"f "$(show "S{1..5..2}" "{a,b}")""#), 0); // その対で語の残りも止まる（#2301）
     assert_eq!(hits(r#"echo "$(show "\{a,b}")""#), 0);
     assert_eq!(hits(r#"echo "$(show "{a\,b}")""#), 0);
     assert_eq!(hits(r#"echo "$(show "${U:-{a,b}}")""#), 0);
@@ -2053,6 +2135,601 @@ fn 語の字句解析は代入と展開されない文脈を読み分ける() {
         words("cat <<X\n\"q\" $(f)\nX\necho y\n"),
         vec![w("cat", true), w("f", true), w("echo", true), w("y", true)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// 波括弧の写しを実の bash 3.2 と突き合わせる（Issue #1931）
+// ---------------------------------------------------------------------------
+//
+// 上の写し（`raw_words` / `gobble32` / `amble_expands32` / `brace32_pairs` / `top_level_unquoted`）は
+// 3.2 の `braces.c` を読んで書いたもので、PR #1929 では乱数の語 48,000 通りを実の `/bin/bash` に通して
+// 確かめた。その差分試験の常設版: 固定の種で組んだ語を `/bin/bash`（3.2）へ `set +B`（波括弧展開
+// なし）と `set -B` の 2 回通し、波括弧ごとの目印が出力から消えたか（= 3.2 が展開したか）を
+// 写しの読みと 1 つずつ比べる。bash 5 は要らない（正しい読みは語を組むときに分かっている）。
+
+/// 突き合わせに使う bash 3.2 の場所を差し替える env（既定 `/bin/bash`）。
+/// 3.2 を自分で建てた環境で回す・「3.2 が無い」を注入して門を確かめるときに使う
+const BASH32_ENV: &str = "TAKO_TEST_BASH32";
+
+/// 突き合わせの門の判定
+#[derive(Debug, PartialEq, Eq)]
+enum Bash32Gate {
+    Run,
+    /// 3.2 の bash が無い OS（Linux / Windows）。理由を出して飛ばす
+    Skip(String),
+    /// macOS なのに 3.2 が使えない。黙って緑にせず落とす
+    Fail(String),
+}
+
+/// 門（純関数）。`probe` = `bash` の `$BASH_VERSION`、または起動できなかった理由。
+/// macOS は `/bin/bash` 3.2 を必ず同梱する（SIP の下で差し替えられない）ので、使えなければ
+/// 飛ばさずに落とす。CI の macOS で突き合わせが黙って消えないため（#2106 の門と同じ考え）
+fn bash32_gate(on_macos: bool, bash: &str, probe: Result<String, String>) -> Bash32Gate {
+    let reason = match probe {
+        Ok(v) if v.starts_with("3.2.") => return Bash32Gate::Run,
+        Ok(v) => format!("{bash} は bash {v}（3.2 ではない）"),
+        Err(e) => format!("{bash} を起動できない（{e}）"),
+    };
+    if on_macos {
+        Bash32Gate::Fail(format!(
+            "波括弧の写しを実の bash 3.2 と突き合わせられない: {reason}。macOS は /bin/bash 3.2 を\n\
+             同梱するので飛ばさない（#1931）。別の 3.2 を使うなら {BASH32_ENV}=<path> で指す"
+        ))
+    } else {
+        Bash32Gate::Skip(format!(
+            "{reason}。3.2 の bash が無い OS なので波括弧の写しの突き合わせを飛ばす\n\
+             （macOS の CI で回る。3.2 を建てたなら {BASH32_ENV}=<path> で指す。#1931）"
+        ))
+    }
+}
+
+/// 起動ファイル（`BASH_ENV`）・利用者のロケール・HOME を持ち込まない bash
+fn clean_bash(bash: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(bash);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
+fn bash_version(bash: &str) -> Result<String, String> {
+    let out = clean_bash(bash)
+        .args(["-c", "printf %s \"$BASH_VERSION\""])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let v = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() {
+        return Err(format!("終了コード {}", out.status));
+    }
+    if v.is_empty() {
+        return Err("$BASH_VERSION が空（bash ではない）".to_string());
+    }
+    Ok(v)
+}
+
+/// 突き合わせる波括弧の種類
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BraceKind {
+    Comma,
+    TrailingComma,
+    LeadingComma,
+    NoComma,
+    EscapedComma,
+    /// `{ a,b }`（空白で囲まれた `{` は展開の始まりにならない。クォートの中にだけ置く）
+    Spaced,
+    SeqNum,
+    SeqAlpha,
+    /// 刻みつき（3.2 は知らない）
+    SeqStep,
+    SeqNeg,
+}
+
+const BRACE_KINDS: &[BraceKind] = &[
+    BraceKind::Comma,
+    BraceKind::TrailingComma,
+    BraceKind::LeadingComma,
+    BraceKind::NoComma,
+    BraceKind::EscapedComma,
+    BraceKind::Spaced,
+    BraceKind::SeqNum,
+    BraceKind::SeqAlpha,
+    BraceKind::SeqStep,
+    BraceKind::SeqNeg,
+];
+
+impl BraceKind {
+    /// (原文, 原文の中の `{` の位置, 目印)。`k` = 語の中の通し番号（1〜9。目印を語の中で一意に
+    /// する）。目印は展開されなければ出力にそのまま残り、展開されれば消える部分文字列
+    fn atom(self, k: usize) -> (String, usize, String) {
+        use BraceKind::*;
+        assert!((1..=9).contains(&k), "目印の番号は 1 桁（{k}）");
+        let comma = |text: String, witness: String| (text, 0, witness);
+        let seq = |amble: &str| (format!("S{k}{{{amble}}}"), 2, format!("S{k}{{"));
+        match self {
+            Comma => comma(format!("{{Q{k},R{k}}}"), format!("{{Q{k}")),
+            TrailingComma => comma(format!("{{Q{k},}}"), format!("{{Q{k}")),
+            LeadingComma => comma(format!("{{,Q{k}}}"), format!("{{,Q{k}")),
+            NoComma => comma(format!("{{Q{k}}}"), format!("{{Q{k}")),
+            EscapedComma => comma(format!("{{Q{k}\\,R{k}}}"), format!("{{Q{k}")),
+            Spaced => comma(format!("{{ Q{k},R{k} }}"), format!("{{ Q{k}")),
+            SeqNum => seq("1..3"),
+            SeqAlpha => seq("a..c"),
+            SeqStep => seq("1..5..2"),
+            SeqNeg => seq("-1..1"),
+        }
+    }
+}
+
+/// 語の中の差し込み口の文脈（正しく読んだとき）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    /// 外側の語のクォートの外（`f @`）。引数なら波括弧展開を受け、代入の値なら受けない
+    Outer,
+    /// コマンド置換の中のコマンドの語のクォートの外（`"$(show @)"`）。いつも受ける
+    Inner,
+    /// ダブルクォートの中（入れ子の深さを問わない）
+    Dq,
+    /// 単一引用符の中
+    Sq,
+    /// `$'…'` の中。3.2 の構文解析は `$'…'` のエスケープを波括弧展開より前に解いて `'…'` へ
+    /// 置き換える（`$'\\{'` は `'\{'`）が、写しはまだそれを知らない（#2304）ので `\` の飾りは置かない
+    AnsiC,
+    /// クォートの外の `${U:-@}`（`${` が波括弧展開を止める）
+    Param,
+    /// `"${U:-@}"`
+    DqParam,
+    /// バッククォートの中のダブルクォート（`` `show "@"` ``）。バッククォートの中は `\` を 1 段
+    /// 外してから読むので、`\` の飾りは置かない（`\\"` が閉じのクォートを食う）
+    BacktickDq,
+}
+
+impl Slot {
+    /// 波括弧の前後に置く飾り（3.2 の読み違えの入口: クォート・`\`・`${`・`$(`・空白）。
+    /// その文脈で構文を壊さないものだけ。末尾の `\` は閉じのクォートを食うので後ろには置かない
+    fn fillers(self, before: bool) -> &'static [&'static str] {
+        use Slot::*;
+        match (self, before) {
+            (Outer | Inner, true) => &["", "x", "\\\"", "${U}", "$(show z)", "\\\\", "\\", "\\ "],
+            (Outer | Inner, false) => &["", "y", "\\\"", "${U}", "$(show z)", "\\\\"],
+            (Dq, true) => &[
+                "",
+                "x",
+                " ",
+                "it's ",
+                "\\\"",
+                "${U}",
+                "$(show z)",
+                "\\\\",
+                "\\",
+            ],
+            (Dq, false) => &["", "y", " ", " it's", "\\\"", "${U}", "$(show z)", "\\\\"],
+            (Sq, true) => &["", "x", " ", "\\\"", "${U}", "\\\\", "\\"],
+            (Sq, false) => &["", "y", " ", "\\\"", "${U}"],
+            (AnsiC, true) => &["", "x", " ", "${U}"],
+            (AnsiC, false) => &["", "y", " ", "${U}"],
+            (Param, true) => &["", "x", "${U}", "$(show z)"],
+            (Param, false) => &["", "y", "${U}"],
+            (DqParam, true) => &["", "x", " ", "${U}", "$(show z)"],
+            (DqParam, false) => &["", "y", " "],
+            (BacktickDq, true) => &["", "x", " ", "it's ", "${U}", "$(show z)"],
+            (BacktickDq, false) => &["", "y", " ", " it's", "${U}", "$(show z)"],
+        }
+    }
+
+    /// 空白を含む波括弧（`{ a,b }`）を置けるか（クォートの外では空白で語が割れる）
+    fn allows(self, kind: BraceKind) -> bool {
+        kind != BraceKind::Spaced
+            || matches!(
+                self,
+                Slot::Dq | Slot::Sq | Slot::AnsiC | Slot::DqParam | Slot::BacktickDq
+            )
+    }
+}
+
+/// 語の形（`@` が差し込み口。並び順に `Slot` が対応する）。#1924 の表の文脈と、3.2 の
+/// `brace_gobbler` の分かれ道（`"` / `'` / `` ` `` / `\` / `${` / クォートの外の `$(`）を一通り
+const BRACE_SHAPES: &[(&str, &[Slot])] = {
+    use Slot::*;
+    &[
+        ("@", &[Outer]),
+        ("@\"$(show \"x\")\"", &[Outer]),
+        ("\"@\"", &[Dq]),
+        ("'@'", &[Sq]),
+        ("$'@'", &[AnsiC]),
+        ("\"$(show \"@\")\"", &[Dq]),
+        ("\"$(show '@')\"", &[Sq]),
+        ("\"$(show @)\"", &[Inner]),
+        ("$(show \"@\")", &[Dq]),
+        ("$(show @)", &[Inner]),
+        ("\"$(show $(show \"@\"))\"", &[Dq]),
+        ("\"$(show \"x\" \"@\")\"", &[Dq]),
+        ("\"$(show \"it's @\")\"", &[Dq]),
+        ("\"$(show \"`show z`@\")\"", &[Dq]),
+        ("\"${U:-@}\"", &[DqParam]),
+        ("${U:-@}", &[Param]),
+        ("`show \"@\"`", &[BacktickDq]),
+        ("\"$(show \\\"@\\\")\"", &[Inner]),
+        ("\"$(show \"$U\"@)\"", &[Inner]),
+        ("\"${U:-$(show \"@\")}\"", &[Dq]),
+        ("\"$(show \"$(show \"@\")\")\"", &[Dq]),
+        ("\"$(show \"@\" \"@\")\"", &[Dq, Dq]),
+        ("\"$(show \"@\" @)\"", &[Dq, Inner]),
+        ("\"$(show \"@\")$(show \"@\")\"", &[Dq, Dq]),
+        ("\"$(show \"@\"'@')\"", &[Dq, Sq]),
+    ]
+};
+
+/// 突き合わせの 1 行に置いた波括弧
+#[derive(Debug)]
+struct OracleBrace {
+    /// 行の中の `{` の位置（文字位置）
+    pos: usize,
+    witness: String,
+    /// 正しく読んだとき波括弧展開を受ける位置か（クォート・`${…}`・代入の値の外）
+    eligible: bool,
+}
+
+/// 突き合わせの 1 行（`f <語>` か `x=<語>; f "$x"`）
+#[derive(Debug)]
+struct OracleCase {
+    line: String,
+    braces: Vec<OracleBrace>,
+}
+
+/// 決定的な擬似乱数（xorshift64。種を固定して毎回同じ語を組む）
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn below(&mut self, n: usize) -> usize {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x % n as u64) as usize
+    }
+
+    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+        xs[self.below(xs.len())]
+    }
+}
+
+/// 突き合わせる行の表。形 × 波括弧の種類の総当たり（1 つ目の差し込み口）に、形を 2〜3 個
+/// つないだ語（3.2 がクォートの数え違いを次の形へ持ち越す読み）を固定の種で足す。
+/// 4 行に 1 行は代入の値（`x=<語>`。外側の語は波括弧展開を受けない）にする
+fn bash32_oracle_cases() -> Vec<OracleCase> {
+    /// 語を組む途中
+    struct Word {
+        text: String,
+        /// (語の中の `{` の位置, 目印, 文脈, 直前の飾りの `\` が `{` をエスケープしているか)
+        braces: Vec<(usize, String, Slot, bool)>,
+    }
+    fn push_shape(
+        w: &mut Word,
+        rng: &mut Xorshift,
+        (template, slots): (&str, &[Slot]),
+        first: Option<BraceKind>,
+    ) {
+        let mut parts = template.split('@');
+        w.text.push_str(parts.next().unwrap_or(""));
+        for (n, (part, &slot)) in parts.zip(slots).enumerate() {
+            let kind = match first {
+                Some(kind) if n == 0 => kind,
+                _ => loop {
+                    let kind = rng.pick(BRACE_KINDS);
+                    if slot.allows(kind) {
+                        break kind;
+                    }
+                },
+            };
+            let (atom, open, witness) = kind.atom(w.braces.len() + 1);
+            let before = rng.pick(slot.fillers(true));
+            w.text.push_str(before);
+            let at = w.text.chars().count() + open;
+            w.text.push_str(&atom);
+            w.text.push_str(rng.pick(slot.fillers(false)));
+            w.text.push_str(part);
+            w.braces
+                .push((at, witness, slot, before == "\\" && open == 0));
+        }
+    }
+
+    let mut rng = Xorshift(0x1931_2026_1018_0001);
+    let mut words = Vec::new();
+    for &shape in BRACE_SHAPES {
+        for &kind in BRACE_KINDS.iter().filter(|&&k| shape.1[0].allows(k)) {
+            let mut w = Word {
+                text: String::new(),
+                braces: Vec::new(),
+            };
+            push_shape(&mut w, &mut rng, shape, Some(kind));
+            words.push(w);
+        }
+    }
+    for _ in 0..240 {
+        let mut w = Word {
+            text: String::new(),
+            braces: Vec::new(),
+        };
+        for _ in 0..2 + rng.below(2) {
+            let shape = rng.pick(BRACE_SHAPES);
+            if w.braces.len() + shape.1.len() > 9 {
+                break;
+            }
+            push_shape(&mut w, &mut rng, shape, None);
+        }
+        words.push(w);
+    }
+    words
+        .into_iter()
+        .enumerate()
+        .map(|(n, w)| {
+            let assign = n % 4 == 3;
+            let (head, tail) = if assign {
+                ("x=", "; f \"$x\"")
+            } else {
+                ("f ", "")
+            };
+            let shift = head.chars().count();
+            OracleCase {
+                line: format!("{head}{}{tail}", w.text),
+                braces: w
+                    .braces
+                    .into_iter()
+                    .map(|(at, witness, slot, escaped)| OracleBrace {
+                        pos: shift + at,
+                        witness,
+                        eligible: !escaped
+                            && (slot == Slot::Inner || (slot == Slot::Outer && !assign)),
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// 行ごとの出力。`brace` = 波括弧展開をするか（`set -B` / `set +B`）。
+/// 1 つの bash で全行を `eval` する（構文の誤りはその行だけで止まる）。
+/// `show` / `f` は引数を空白 1 つでつないで出す（クォートの外で割れた `{ Q1,R1 }` も目印
+/// `{ Q1` の形に戻る）。`set -f` はクォートの外の展開結果をファイル名に当てないため。
+/// 出力の区切りが揃わない（途中で bash が終わった）ときは Err
+fn bash32_outputs(bash: &str, lines: &[String], brace: bool) -> Result<Vec<String>, String> {
+    let mut script = format!(
+        "set -f {}B\nshow() {{ printf '%s ' \"$@\"; }}\nf() {{ printf '%s ' \"$@\"; }}\n",
+        if brace { '-' } else { '+' }
+    );
+    for (i, line) in lines.iter().enumerate() {
+        script.push_str(&format!(
+            "printf '\\n@@{i}@@\\n'; eval '{}'\n",
+            line.replace('\'', "'\\''")
+        ));
+    }
+    script.push_str(&format!("printf '\\n@@{}@@\\n'\n", lines.len()));
+    let out = clean_bash(bash)
+        .args(["-c", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut outputs = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let (start, end) = (format!("\n@@{i}@@\n"), format!("\n@@{}@@\n", i + 1));
+        let body = stdout
+            .split_once(&start)
+            .and_then(|(_, rest)| rest.split_once(&end))
+            .map(|(body, _)| body.to_string())
+            .ok_or_else(|| {
+                format!(
+                    "{}行目（{line}）の出力の区切りが無い（bash が途中で終わった？ 終了コード {}）",
+                    i + 1,
+                    out.status
+                )
+            })?;
+        outputs.push(body);
+    }
+    Ok(outputs)
+}
+
+#[test]
+fn 波括弧の写しは実のbash32と食い違わない() {
+    let bash = std::env::var(BASH32_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/bin/bash".to_string());
+    match bash32_gate(cfg!(target_os = "macos"), &bash, bash_version(&bash)) {
+        Bash32Gate::Run => {}
+        Bash32Gate::Skip(reason) => {
+            eprintln!("skip: {reason}");
+            return;
+        }
+        Bash32Gate::Fail(reason) => panic!("{reason}"),
+    }
+
+    let cases = bash32_oracle_cases();
+    let lines: Vec<String> = cases.iter().map(|c| c.line.clone()).collect();
+    // 展開なし（目印がそのまま出ることの確かめ）と展開ありを並べて回す
+    let (plain, braced) = std::thread::scope(|s| {
+        let plain = s.spawn(|| bash32_outputs(&bash, &lines, false));
+        let braced = bash32_outputs(&bash, &lines, true);
+        (plain.join().expect("set +B の bash"), braced)
+    });
+    let (plain, braced) = (
+        plain.expect("set +B の出力"),
+        braced.expect("set -B の出力"),
+    );
+
+    let says = |b: bool| if b { "展開する" } else { "展開しない" };
+    let mut problems = Vec::new();
+    // 波括弧展開なし（set +B）でも目印が出ない = 表の組み方の誤り（その語は突き合わせに使えない）
+    let mut table_errors = Vec::new();
+    // [3.2 だけが展開した, 意図どおり展開した, 展開しなかった]（表の検出力の自己検査）
+    let mut tally = [0usize; 3];
+    // 写しが「クォートや別の波括弧をまたぐ対」を読んだ行の数
+    let mut tangled_lines = 0usize;
+    for (i, case) in cases.iter().enumerate() {
+        let chars: Vec<char> = case.line.chars().collect();
+        let pairs = brace32_file_pairs(&case.line, false);
+        let opens: std::collections::BTreeSet<usize> = pairs.iter().map(|&(o, _)| o).collect();
+        let misread: std::collections::BTreeSet<usize> = brace32_file_pairs(&case.line, true)
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
+        // 対の中身にクォート・`$`・括弧・波括弧が入る = 3.2 がクォートや別の波括弧をまたいで組んだ対
+        // （`{x}` の `}` を読み飛ばす = #2301）。展開後の語は構文が崩れ、行の出力がどう壊れるか
+        // （行ごと失敗することもある）は写しの外なので、その行は「開きの目印が消える」ことだけを見る
+        let tangled = pairs.iter().any(|&(o, c)| {
+            chars[o + 1..c]
+                .iter()
+                .any(|ch| matches!(ch, '"' | '\'' | '`' | '$' | '(' | ')' | '{' | '}'))
+        });
+        tangled_lines += usize::from(tangled);
+        for &p in &opens {
+            if !case.braces.iter().any(|b| b.pos == p) {
+                problems.push(format!(
+                    "{}\n  写しが目印の無い `{{`（{p} 文字目）を 3.2 が展開すると読んだ",
+                    case.line
+                ));
+            }
+        }
+        for b in &case.braces {
+            if !plain[i].contains(&b.witness) {
+                table_errors.push(format!(
+                    "{}\n  目印 `{}` / set +B の出力: {:?}",
+                    case.line, b.witness, plain[i]
+                ));
+                continue;
+            }
+            let real = !braced[i].contains(&b.witness);
+            let real_misread = real && !b.eligible;
+            let copy = opens.contains(&b.pos);
+            let copy_misread = misread.contains(&b.pos);
+            if tangled {
+                if copy && !real {
+                    problems.push(format!(
+                        "{}\n  目印 `{}`（{} 文字目）: 写しは 3.2 がここから対を組んで展開すると読んだが、\n  \
+                         実の 3.2 の出力に目印が残った\n  set -B の出力: {:?}",
+                        case.line, b.witness, b.pos, braced[i]
+                    ));
+                }
+                continue;
+            }
+            if real != copy || real_misread != copy_misread {
+                problems.push(format!(
+                    "{}\n  目印 `{}`（{} 文字目）: 実の 3.2 は{}・写しは{}（3.2 だけが展開する = 番犬が\n  \
+                     名指すべき: 実 {real_misread} / 写し {copy_misread}）\n  set -B の出力: {:?}",
+                    case.line,
+                    b.witness,
+                    b.pos,
+                    says(real),
+                    says(copy),
+                    braced[i]
+                ));
+            }
+            tally[if real_misread {
+                0
+            } else if real {
+                1
+            } else {
+                2
+            }] += 1;
+        }
+    }
+    assert!(
+        table_errors.is_empty(),
+        "表の誤り: 波括弧展開なし（set +B）でも目印が出ない語が {} 個（飾りがその文脈の構文を\n\
+         壊している。BRACE_SHAPES / Slot::fillers を直す）:\n{}",
+        table_errors.len(),
+        table_errors.join("\n")
+    );
+    eprintln!(
+        "突き合わせ（{bash}）: {} 行・波括弧 {} 個（3.2 だけが展開 {} / 意図どおり展開 {} / 展開しない {}）・\
+         またぐ対の行 {tangled_lines}",
+        cases.len(),
+        tally.iter().sum::<usize>(),
+        tally[0],
+        tally[1],
+        tally[2]
+    );
+    assert!(
+        tally.iter().all(|&n| n > 0),
+        "表の検出力が無い（3.2 だけが展開 / 意図どおり展開 / 展開しない = {tally:?}）。\n\
+         どれかが 0 なら語の組み方か show / f の定義が壊れている"
+    );
+    // またぐ対の行は開きしか見ないので、写しが壊れてそれを乱発すると突き合わせが空になる
+    assert!(
+        tangled_lines * 10 <= cases.len(),
+        "写しがクォートや別の波括弧をまたぐ対を {tangled_lines} 行（全 {} 行）で読んだ。多すぎる\n\
+         （その行は開きの目印しか確かめないので、突き合わせが空洞になる）",
+        cases.len()
+    );
+    assert!(
+        problems.is_empty(),
+        "波括弧の写し（shell_scripts.rs の gobble32 / amble_expands32 / brace32_pairs /\n\
+         top_level_unquoted / raw_words）が実の bash 3.2（{bash}）と {} 箇所で食い違う（{} 行・波括弧 {} 個のうち）。\n\
+         写しを直して #1924 の番犬の読みを実物へ合わせること（.agent/conventions.md の #1924 / #1931）:\n{}",
+        problems.len(),
+        cases.len(),
+        tally.iter().sum::<usize>(),
+        problems
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn bash32の突き合わせはmacosでは飛ばさない() {
+    let v32 = || Ok("3.2.57(1)-release".to_string());
+    assert_eq!(bash32_gate(true, "/bin/bash", v32()), Bash32Gate::Run);
+    assert_eq!(bash32_gate(false, "/bin/bash", v32()), Bash32Gate::Run);
+    // macOS で 3.2 が使えなければ落とす（飛ばさない）
+    let missing = || Err("No such file or directory (os error 2)".to_string());
+    let v5 = || Ok("5.3.15(1)-release".to_string());
+    for probe in [missing(), v5()] {
+        match bash32_gate(true, "/bin/bash", probe) {
+            Bash32Gate::Fail(reason) => assert!(reason.contains("飛ばさない"), "{reason}"),
+            other => panic!("macOS で 3.2 が無いのに {other:?}"),
+        }
+    }
+    // macOS 以外は理由を出して飛ばす
+    match bash32_gate(false, "/bin/bash", missing()) {
+        Bash32Gate::Skip(reason) => {
+            assert!(reason.contains("起動できない"), "{reason}");
+            assert!(reason.contains(BASH32_ENV), "{reason}");
+        }
+        other => panic!("macOS 以外で {other:?}"),
+    }
+    match bash32_gate(false, "/bin/bash", v5()) {
+        Bash32Gate::Skip(reason) => assert!(reason.contains("3.2 ではない"), "{reason}"),
+        other => panic!("macOS 以外で {other:?}"),
+    }
+}
+
+#[test]
+fn 突き合わせの表は決定的で波括弧の位置が原文と合う() {
+    let a = bash32_oracle_cases();
+    let b = bash32_oracle_cases();
+    assert_eq!(
+        a.iter().map(|c| &c.line).collect::<Vec<_>>(),
+        b.iter().map(|c| &c.line).collect::<Vec<_>>(),
+        "種が固定なので毎回同じ表"
+    );
+    for case in &a {
+        let chars: Vec<char> = case.line.chars().collect();
+        for br in &case.braces {
+            assert_eq!(chars.get(br.pos), Some(&'{'), "{}: {br:?}", case.line);
+            // 目印は `{` から始まる（`{Q1`）か `{` で終わる（`S1{`）
+            let from: String = chars[br.pos..].iter().collect();
+            let upto: String = chars[..=br.pos].iter().collect();
+            assert!(
+                from.starts_with(&br.witness) || upto.ends_with(&br.witness),
+                "目印は `{{` にかかる: {}: {br:?}",
+                case.line
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
