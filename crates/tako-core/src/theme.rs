@@ -272,6 +272,42 @@ pub fn parse_hex_color(s: &str) -> Result<Rgb, HexColorError> {
     Ok(Rgb::from_hex(value))
 }
 
+/// 色キー 1 つの値の出どころ（#1830。`tako theme colors` の `source`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorSource {
+    /// 上書きが無く、テーマの既定の色
+    Builtin,
+    /// 上書きを読んで使っている
+    Override,
+    /// 上書きはあるが読めず、既定の色を使っている（[`Theme::apply_overrides`] が警告を返した色）
+    Ignored,
+}
+
+impl ColorSource {
+    /// 応答の語（`builtin` / `override` / `ignored`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Override => "override",
+            Self::Ignored => "ignored",
+        }
+    }
+
+    /// `overrides` を重ねたとき、色キー `key` の値がどこから来るか。
+    ///
+    /// 読めるかは [`Theme::apply_overrides`] と同じ [`parse_hex_color`] で決める。以前は
+    /// 上書きの有無だけで決めていたので、読めずに既定の色へ戻した色も override と答えていた
+    /// （hex は既定の色なのに、応答だけを見ると上書きが効いて見える）。`key` は
+    /// [`Theme::COLOR_KEYS`] の 1 つを渡す（未知のキーは色を持たないので問わない）
+    pub fn of(overrides: &std::collections::BTreeMap<String, String>, key: &str) -> Self {
+        match overrides.get(key) {
+            None => Self::Builtin,
+            Some(hex) if parse_hex_color(hex).is_ok() => Self::Override,
+            Some(_) => Self::Ignored,
+        }
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self::default_dark()
@@ -1065,6 +1101,69 @@ mod tests {
         assert_eq!(t.accent, Rgb::new(255, 0, 0));
         assert_ne!(t.background, Rgb::from_hex(0x000000)); // 不正 hex は適用されない
         assert_eq!(warnings.len(), 2);
+    }
+
+    /// #1830: 出どころの判定は `apply_overrides` と食い違わない。全 58 色について、
+    /// ignored = 警告が出て既定の色のまま / override = 上書きの値 / builtin = 既定の色
+    #[test]
+    fn color_sourceはapply_overridesと同じ判定を返す() {
+        let mut overrides = std::collections::BTreeMap::new();
+        for (key, hex) in [
+            ("accent", "#赤色"),
+            ("red", "#12345"),
+            ("ansi_red", "#ｆｆ００００"),
+            ("cursor", "#+f+f+f"),
+            ("mauve", ""),
+            ("green", "#00FF00"),
+            ("teal", " 0000ff "),
+            ("nosuch", "#000000"),
+        ] {
+            overrides.insert(key.to_string(), hex.to_string());
+        }
+        let builtin = Theme::default_dark();
+        let mut applied = Theme::default_dark();
+        let warnings = applied.apply_overrides(&overrides);
+        let mut ignored = Vec::new();
+        for &key in Theme::COLOR_KEYS {
+            let source = ColorSource::of(&overrides, key);
+            let warned = warnings.iter().any(|w| w.starts_with(&format!("{key}: ")));
+            let value = applied.color(key);
+            match source {
+                ColorSource::Ignored => {
+                    assert!(warned, "{key}: ignored なのに警告が無い");
+                    assert_eq!(
+                        value,
+                        builtin.color(key),
+                        "{key}: ignored なのに既定の色ではない"
+                    );
+                    ignored.push(key);
+                }
+                ColorSource::Override => {
+                    assert!(!warned, "{key}: override なのに警告がある");
+                    assert_eq!(value, parse_hex_color(&overrides[key]).ok(), "{key}");
+                }
+                ColorSource::Builtin => {
+                    assert!(!warned, "{key}: builtin なのに警告がある");
+                    assert_eq!(value, builtin.color(key), "{key}");
+                }
+            }
+        }
+        assert_eq!(ignored, ["cursor", "ansi_red", "accent", "red", "mauve"]);
+        assert_eq!(
+            ColorSource::of(&overrides, "background"),
+            ColorSource::Builtin
+        );
+        assert_eq!(ColorSource::of(&overrides, "green"), ColorSource::Override);
+        assert_eq!(ColorSource::of(&overrides, "teal"), ColorSource::Override);
+        assert_eq!(
+            ["builtin", "override", "ignored"],
+            [
+                ColorSource::Builtin,
+                ColorSource::Override,
+                ColorSource::Ignored
+            ]
+            .map(ColorSource::as_str)
+        );
     }
 
     #[test]

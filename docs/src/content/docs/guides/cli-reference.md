@@ -1296,7 +1296,7 @@ tako theme preset save mytheme   # 現在の配色をプリセットとして保
 
 `tako theme --help` に色キー・プリセット・フォント指定の全オプションが出ます。
 
-settings.json の色の上書きに読めない値（`#赤色` など）があると、その色だけ既定へ戻して使います。そのあいだは `tako theme`（`dark` / `light` / `toggle` も）の応答に `warnings` が載り、無視した色と理由が `"accent: 不正な色値: …"` の形で並びます。persist.log に残る行と同じ内容です。
+settings.json の色の上書きに読めない値（`#赤色` など）があると、その色だけ既定へ戻して使います。そのあいだは `tako theme`（`dark` / `light` / `toggle` も）の応答に `warnings` が載り、無視した色と理由が `"accent: 不正な色値: …"` の形で並びます。persist.log に残る行と同じ内容です。`tako theme colors` では、その色の `source` が `ignored`（既定の色を使っている）になり、同じ形の `warnings` も載ります。上書きの無い色は `builtin`、効いている上書きは `override` です。
 
 ### tako lang
 
