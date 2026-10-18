@@ -1,0 +1,60 @@
+
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Haiku 5.5 · API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:full
+────────────────────────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first?
+
+❯ 1. Rewrite both in a single PR
+     Shared inputs mean one change, but the diff gets
+     larger.
+  2. Fix the status anchor first
+     Replace the tail window so a long footer does not hide
+     the error line.
+  3. Investigate the main branch
+     Check each symptom and close what is already fixed.
+  4. Type something.
+────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

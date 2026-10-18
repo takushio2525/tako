@@ -37766,6 +37766,35 @@ mod tests {
         );
     }
 
+    /// #2320: 32 桁の AskUserQuestion（実採取。claude 2.1.301）。どのラベルも右端まで埋まり
+    /// 説明の最初の語が入らないので、段落の切れ目が並びのどこにも出ない
+    const ASK_FULL_32_2320: &str =
+        include_str!("../../tako-core/tests/fixtures/issue2320-full-32x90.txt");
+
+    #[test]
+    fn issue2320_説明の語のラベル指定で選択肢を確定させず番号は効く() {
+        let dialog = dialog_of(ASK_FULL_32_2320);
+        assert!(dialog.labels_truncated());
+        // 修正前は選択肢 2 のラベルに説明が丸ごと混ざっていて、説明の語 `error line` で
+        // 選択肢 2 を確定していた（実物の claude の器越しで再現）
+        let err = resolve_choice_index(&dialog, "error line")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("番号で指定する"), "{err}");
+        assert!(resolve_choice_index(&dialog, "Shared inputs").is_err());
+        // ラベルの 1 行目に当たっても、次の行が続きか説明か分からないので確定しない
+        let err = resolve_choice_index(&dialog, "Fix the status anchor first")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("説明との境目") && err.contains("--choice 2"),
+            "{err}"
+        );
+        // 番号は効く・自由入力は従来どおりラベルで選べる
+        assert_eq!(resolve_choice_index(&dialog, "2").unwrap(), 1);
+        assert_eq!(resolve_choice_index(&dialog, "type something").unwrap(), 3);
+    }
+
     #[test]
     fn issue748_番号なしダイアログはラベルで選べる() {
         let dialog = dialog_of(MCP_LIST_748);

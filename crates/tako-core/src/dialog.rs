@@ -1266,7 +1266,11 @@ struct LabelEnds {
 ///
 /// 1. 並びのどこにも段落の切れ目が無い = 説明の証拠が無い。従来（#1131）の結合のまま
 ///    （permission / 上限ダイアログ / 確認ダイアログはここ）。ただし結合が「右端まで埋まった
-///    区切りの無い長い語」の行を飲むときは、説明を飲んだかもしれないので境目を読めない扱い
+///    区切りの無い長い語」の行を飲むときは、説明を飲んだかもしれないので境目を読めない扱い。
+///    **説明を必ず持つと分かる並び**（[`carries_descriptions`]。#2320）では、従来の結合が
+///    続きの行を飲むならラベルは 1 行目だけ + 境目を読めない扱い、続きが 1 行ならそれが説明
+///    （どのラベルも右端近くまで届き説明の最初の語が入らないと、切れ目が並びのどこにも出ない。
+///    実採取 32〜37 桁で説明が丸ごとラベルへ混ざっていた）
 /// 2. 説明つきの並び（切れ目が 1 つでもある）では選択肢ごとに:
 ///    - 段落の切れ目があれば、その手前までがラベル
 ///    - 続きの 1 行目が右端まで埋まった区切りの無い長い語なら、そこから説明（簡潔なラベルは
@@ -1293,6 +1297,7 @@ fn label_ends(
     let two_column = |r: usize| desc_col.is_some() && column_gap(lines[r]) == desc_col;
     let screen = lines.iter().map(|l| display_width(l)).max().unwrap_or(0);
     for chain in numbered_chains(lines, rows) {
+        let carries = carries_descriptions(lines, &chain);
         // 2 列レイアウト（#1143）と副画面つき（#1447）の選択肢は従来どおり（説明列 /
         // 副画面の縁で折り返すので、並びの右端の考え方が当たらない）
         let members: Vec<(usize, Vec<usize>)> = chain
@@ -1318,10 +1323,17 @@ fn label_ends(
             let long_start = long_word_start(lines, block, edge, screen);
             if !described {
                 // 1: 従来の結合のまま。長い語の行を飲むときだけ境目を読めない扱い
-                ends.undecided[*r] = long_start
-                    && open_line(lines[*r], *r, at_wrap_edge).is_some_and(|o| {
-                        !starts_new_dialog_block(lines[block[0]], lines[*r], &o, usable)
-                    });
+                let joins = open_line(lines[*r], *r, at_wrap_edge).is_some_and(|o| {
+                    !starts_new_dialog_block(lines[block[0]], lines[*r], &o, usable)
+                });
+                if carries && joins {
+                    // #2320: 説明は必ずある。従来の結合が飲む行は「入らなかったラベルの続き」とも
+                    // 「説明の 1 行目」とも取れる = 1 行目だけ + 申告。続きが 1 行だけならそれが説明
+                    ends.join[*r] = 0;
+                    ends.undecided[*r] = block.len() > 1;
+                    continue;
+                }
+                ends.undecided[*r] = long_start && joins;
                 continue;
             }
             ends.decided[*r] = true;
@@ -1341,6 +1353,32 @@ fn label_ends(
         }
     }
     ends
+}
+
+/// AskUserQuestion の自由入力の選択肢（#2320）。claude は質問の選択肢の後ろへ必ず足す
+/// （実採取: 2.1.301 の 24〜80 桁の全採取と、それより前の既存 fixture `ASK_USER_QUESTION`）
+const FREE_TEXT_LABEL: &str = "Type something.";
+
+/// 並び `chain` が**選択肢ごとに説明を持つ**と分かるか（#2320）。
+///
+/// 自由入力の選択肢（[`FREE_TEXT_LABEL`]）がある並びは AskUserQuestion で、その選択肢は
+/// 説明を必ず持つ（tool の schema が `description` を required にしている）。説明は色
+/// （256 色の 246）で描き分けられているが、検知器が受け取る画面テキスト（GUI のグリッド・
+/// `capture-pane -p`）には残らないので、並びの側のこの手がかりを使う。
+/// 無ければ説明を持つと分からない = 従来の結合のまま（permission 等を変えない）
+fn carries_descriptions(lines: &[&str], chain: &[usize]) -> bool {
+    !legacy_2320()
+        && chain.iter().any(|&r| {
+            numbered_choice(cursor_content(lines[r]).unwrap_or_else(|| strip_indent(lines[r])))
+                .is_some_and(|(_, label)| label.trim() == FREE_TEXT_LABEL)
+        })
+}
+
+/// `TAKO_2320_LEGACY=1` で #2320 前（段落の切れ目が並びのどこにも無ければ、説明を持つ並びでも
+/// 従来の結合のまま）へ戻す（A/B 用）
+fn legacy_2320() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2320_LEGACY").is_ok_and(|v| v == "1"))
 }
 
 /// 番号つき行を「同じ並び」（[`numbered_follows`]）ごとに分ける。`rows` は昇順
