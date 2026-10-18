@@ -20,27 +20,6 @@
 
 ---
 
-## 2026-10-17（#1633: pipefail の下の `echo/printf | grep -q` を 31 本・76 箇所で here-string / 配列の比較へ・番犬 `pipefailの下でechoとprintfの出力をgrep_qへパイプしない`（例外 `# tako:pipefail-ok`））
-- 4 MB の注入で旧 100/100 偽 → 新 0/100（3.2 / 5）。残り（echo/printf 以外の左辺・`| head`）は #2272。PR #2273
-
-## 2026-10-17（#1701 / #1674: CLI / MCP の検索で飛んだあと選択の写しもヒットへ揃える = `preview::search_jump` の 1 実装・番犬 `issue1701_search_selection_watchdog`。全置換のあとのカーソルは最後の置換の末尾・undo で置換前へ = FR-3.5）
-- A/B `TAKO_1701_LEGACY=1` / `TAKO_1674_LEGACY=1`・単体 7 本・GUI の実経路は蓋閉じで未実測・カタログ +0 B。PR #2276
-
-## 2026-10-17（#2272: pipefail の下の `X | grep -q`（左辺を問わず 62 箇所）と終了コードを見る `X | head`（20 箇所）+ eval 文字列 2 行をパイプ無しへ・番犬 `pipefailの下で早く抜ける読み手へパイプしない`）
-- A/B 248 KB の左辺で旧 0/20・新 20/20（3.2 / 5.3）・例外宣言 0。既存の落ち test-queue-1992 ⑪ は #2279。PR #2278
-
-## 2026-10-18（#2275: Windows の `pid_alive` が終了状態を見ず在籍表だけで読み、`wait()` 直後の終わったプロセスを「居る」と答えていた → 先に `GetExitCodeProcess` を問う `alive_unless_exited`・テストは `wait_gone` で待つ（同型 3 か所も））
-- 注入 `TAKO_2275_INJECT_ALIVE_MS`・Windows CI 緑・カタログ +0 B。PR #2277
-
-## 2026-10-18（#2279: test-queue-1992 の ⑪ は #2254 で見込みが過去の記録から引かれるようになったのにテストが既定 3.5 GB を前提にしていた（製品は FR-2.43.9 どおり）・⑫ の受付の競走（BA）も直した）
-- 修正前 ⑪ 6 回中 5 回 NG → 修正後 5/5 PASS=50・製品コード不変。PR #2282
-
-## 2026-10-18（#1643: `isolated_gui_bins [feature …]` が毎回 cargo に任せて今の木から建てる = visual-test 付きを素で上書きせず・rebase 後の古いバイナリで走らない。呼び手 87 本の回避策を外し `SKIP_BUILD` は廃止・番犬 issue1490 に規則 21〜27）
-- 実物の cargo で ① 上書き ② 古いバイナリの A/B・注入で 6 規則 FAILED。PR #2283
-
-## 2026-10-18（#1621: `tako setup --answers` の sleep_guard でスリープ防止の段が 2 度出ていた → 依存チェック段の 1 か所が `[input]` の 1 行で出し、書き込みは黙る。番犬 `issue1621_setup_sleep_guard_once_watchdog`）
-- 実経路 `scripts/test-setup-sleep-guard-once-1621.sh` 33 PASS を CI の macOS へ。PR #2281
-
 ## 2026-10-18（#1705: 自動命名の `spawn_claude` が非ゼロ終了でも stdout の EOF を `READ_GRACE` まで待ち、漏れたパイプ（#1748）で `Failed` に化けて再試行を落としていた → 終了コードだけで `NonZero`）
 - 孫に stdout を握らせる再現テストで修正前 FAILED → 修正後 ok・queue 経由 20/20・カタログ +0 B。PR #2287
 
@@ -79,3 +58,24 @@
 
 ## 2026-10-18（#2299: Code Runner の宣言 `tako:cwd` の値全体を囲む二重引用符も `strip_quotes` で外し、中の逃がしを実行ペインの方言の規則で戻す = `posix_double_quoted` / `ps_double_quoted`。番犬 `issue2286_runner_outer_quote_dialect_watchdog` に規則と行）
 - 1590 行の表で変わったのは `"${fileDir}"` の 40 行だけ（すべて 壊れ → 直る）・隔離 GUI の実物で修正前は `cwd が存在しない`・`/bin/sh` と PowerShell の実物と一致・カタログ +0 B。PR #2310
+
+## 2026-10-18（#1842: 移動の実行を OS の上書きしない rename（`platform::fs_move::rename_noreplace` = renamex_np RENAME_EXCL / renameat2 RENAME_NOREPLACE / MoveFileExW フラグ 0）へ載せ替え、移したフォルダの recent.json の項目を移動先へ付け替える・A/B `TAKO_1842_LEGACY=1`・注入 `TAKO_1842_INJECT_RACE`）
+- 単体の A/B で修正前は file_move.rs:714 で上書きを名指して落ちる・実経路 `scripts/test-move-noreplace-1842.sh` 31 PASS（CLI / MCP で隙間の同名を断る・recent の付け替え・LEGACY で上書き）・Windows CI は単体が根拠（実機は未実測）。PR #2311
+
+## 2026-10-18（#1931 / #2301: 番犬の bash 3.2 波括弧展開の写しを実の /bin/bash と突き合わせる常設テスト（483 行・約 1.5 秒・macOS は 3.2 が無ければ落とす）と、それで見つかった braces.c との 2 規則の食い違い（閉じの `}` は区切りの後だけ・展開できない対で語の残りを止める）の修正）
+- 修正前 13 箇所で赤 → 0・注入 A/B（規則を 1 つずつ戻す）で 17 / 7 箇所を名指して落ちる・全 .sh の名指しは前後とも 0 行。表を広げて見つけた `$'…'` の置き換えの食い違いは #2304
+
+## 2026-10-18（#2313: `measure-unfocused-redraw-1979.sh` が面の眠りを `status` の rc の成功を前提に読み、#1979 から常に「描画可能」と出ていた → `vd_drawable_word` が 1 行目の文言で 描画可能 / 眠っていた / 確かめられない を返す。同型は 1 か所だけ）
+- モック `scripts/test-measure-vd-sleep-2313.sh` 22 PASS（3.2 / 5.3。修正前の形を注入すると 11 FAIL）を CI の macOS へ。カタログ +0 B
+
+## 2026-10-18（#2312: LSP e2e のアイドルの検査が didOpen への診断の到着前に受信数の基準を取っていた → `diagnostics_count == 1` を待ってから取り、偽サーバの `--publish-delay-ms 50` を常に渡す。製品は不変）
+- 修正前 + 注入 0/10（CI と同じ :468 の 2/1）→ 修正後 10/10・30 回 × 並列 1 / 4 で 30/30・カタログ +0 B
+
+## 2026-10-18（#2302: 狭いペインの AskUserQuestion でラベルと説明の境目を表示幅で読む = `dialog::label_ends`（段落の切れ目・説明つきの並びの判定）。読めない選択肢はラベルの 1 行目だけ + `label_truncated`、respond のラベル指定は拒否・番号は効く）
+- 実物の claude 2.1.301 の fixture 9 本・注入 7 通り・器越しの e2e 新旧（旧は説明の文言で選択肢 3 を確定）・A/B `TAKO_2302_LEGACY=1`・カタログ +36 B
+
+## 2026-10-18（#1830: `tako theme colors` の読めない色を `source: "ignored"` + `warnings` で返す（`ColorSource::of` / `active_theme_overrides` の 1 本・ライトに dark の上書きの出どころを付けていた食い違いも）・パレットのテーマ / 表示言語をメニューの表記へ）
+- 実経路 `scripts/test-theme-colors-ignored-1830.sh` 修正前 14 PASS 12 FAIL → 修正後 26 PASS・カタログ +47 B
+
+## 2026-10-18（#2306: 変数を使う rm の引数で空になると行き先が広がる形（`"$d/x"`・`"/tmp/$n"`・`"$p"*`）を番犬 `rmの引数で空になると広い場所を指す変数はvar_qで止める` が名指し、67 本・117 か所 + 偽 CLI 4 行 + release.sh 4 か所を `${var:?}` へ（例外 `# tako:rm-var-ok`））
+- 空にする注入で旧 `rm -rf /home /bin` 相当 → 新は exit で止まる・main に当てると 115 件（rebase 後の main の新規 2 件も直した）・test-release-retry 131 PASS（3.2 / 5.3）・カタログ +0 B

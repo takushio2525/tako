@@ -4,13 +4,6 @@
 
 ---
 
-- 2026-07-19 #371: タブ D&D 挿入位置インジケータの実装
-- 2026-07-19 #378: タブ名の自動命名 — source パラメータ + 命名規則設定 + プロンプト追記
-- 2026-07-19 #375: Web dock URL 入力欄のフォーカス不在を修正
-- 2026-07-19 #369 + #374: orchestrator 改善 — probe 一括化 + report --messages
-- 2026-07-19 #372: sleep-guard busy_agents 漏れの根治
-- 2026-07-19 #391: setup 対話 agent の既定起動を復元
-- 2026-07-19 #381: 赤ボタン close → Dock 復帰の TakoApp 二重生成による全タブ消失を根治
 - 2026-07-21 #380 完了: タブバーの全ウィンドウ共有化
 - 2026-07-21 #390: worker レジストリ — ペイン消失・突然死後の追跡継続
 - 2026-07-22 #413: タブ D&D インジケータが右端固定になる回帰を修正
@@ -645,3 +638,10 @@
 - 2026-10-17 #2264: リリースする役の夜間は共有ツリーの main を毎晩 origin/main へ fast-forward で追従 = `follow_main_nightly`。検査だけの役は動かさない・独自のコミット / untracked は触らず WARN と通知・A/B `TAKO_…
 - 2026-10-17 #1710: 自動復帰が前日の告知をいまから解き直していた = 告知を最初に見た時刻を layout.json の `limit_seen` に持ってそこから解き、追跡の再開始の時点で解けていたら「その時刻 + 2 分」で再開・後から届いた mod / codex の時刻も採る
 - 2026-10-17 #1666: テストの固定名の一時 dir 22 か所と名前を引数で受ける `write_test_pdf`・autorename の `temp_dir_for` を `ScratchDir` へ。番犬 `issue1666_fixed_temp_dir_watchdog` が固定名と引数…
+- 2026-10-17 #1633: pipefail の下の `echo/printf | grep -q` を 31 本・76 箇所で here-string / 配列の比較へ・番犬 `pipefailの下でechoとprintfの出力をgrep_qへパイプしない`（例外 `# tako:pipefail-ok…
+- 2026-10-17 #1701 / #1674: CLI / MCP の検索で飛んだあと選択の写しもヒットへ揃える = `preview::search_jump` の 1 実装・番犬 `issue1701_search_selection_watchdog`。全置換のあとのカーソルは最後の置換の末尾・undo…
+- 2026-10-17 #2272: pipefail の下の `X | grep -q`（左辺を問わず 62 箇所）と終了コードを見る `X | head`（20 箇所）+ eval 文字列 2 行をパイプ無しへ・番犬 `pipefailの下で早く抜ける読み手へパイプしない`
+- 2026-10-18 #2275: Windows の `pid_alive` が終了状態を見ず在籍表だけで読み、`wait()` 直後の終わったプロセスを「居る」と答えていた → 先に `GetExitCodeProcess` を問う `alive_unless_exited`・テストは `wait_gone`…
+- 2026-10-18 #2279: test-queue-1992 の ⑪ は #2254 で見込みが過去の記録から引かれるようになったのにテストが既定 3.5 GB を前提にしていた（製品は FR-2.43.9 どおり）・⑫ の受付の競走（BA）も直した
+- 2026-10-18 #1643: `isolated_gui_bins [feature …]` が毎回 cargo に任せて今の木から建てる = visual-test 付きを素で上書きせず・rebase 後の古いバイナリで走らない。呼び手 87 本の回避策を外し `SKIP_BUILD` は廃止・番犬 is…
+- 2026-10-18 #1621: `tako setup --answers` の sleep_guard でスリープ防止の段が 2 度出ていた → 依存チェック段の 1 か所が `[input]` の 1 行で出し、書き込みは黙る。番犬 `issue1621_setup_sleep_guard_once_wa…
