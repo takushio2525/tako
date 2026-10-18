@@ -2766,7 +2766,7 @@ rm -rf "$(git rev-parse --show-toplevel)/target"   # ✗ コマンド置換は�
 なので読まない。`find … -delete` / `xargs rm` も対象外。監査して確かめた箇所だけ、その行か直前の行に
 `# tako:rm-var-ok <理由>` で外せる（理由の無い宣言は無効）。
 
-#2306 の棚卸しは 66 本・101 行で 115 か所（例外宣言 0。ヒアドキュメントの本文の 4 行も同じ形へ直した）。
+#2306 の棚卸しは 67 本・103 行で 117 か所（例外宣言 0。ヒアドキュメントの本文の 4 行も同じ形へ直した）。
 テスト以外は夜間の mod の検査 `check-claude-mod.sh`・`measure-footprint-2011.sh`・収録の
 `promo/lib.sh` / `record-explainer.sh`（`promo_make_demo_home` は `$PROMO_DEMO` が空なら `/home` と
 `/bin` を消す形だった）。`release.sh` の 4 か所は展開だけの引数（空でも何も消さない）で番犬は求めないが、

@@ -112,11 +112,11 @@ set_table "$TABLE_VD"; awake; touch "$STUB_DIR/backend-down"
 judge
 assert_eq "器が応答しない（面は起きていても）" "$word" "確かめられない"
 assert_has "理由に status の 1 行目を出す" "仮想ディスプレイか確かめられない" "$err"
-rm -f "$STUB_DIR/backend-down"
+rm -f "${STUB_DIR:?}/backend-down"
 asleep; touch "$STUB_DIR/backend-down"
 judge
 assert_eq "器が応答しない（面は眠っている）" "$word" "確かめられない"
-rm -f "$STUB_DIR/backend-down"
+rm -f "${STUB_DIR:?}/backend-down"
 : > "$STUB_DIR/table"; awake
 judge
 assert_eq "未接続" "$word" "確かめられない"
