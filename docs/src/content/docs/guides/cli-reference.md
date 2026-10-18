@@ -201,7 +201,7 @@ tako setup --reset
 
 `tako setup` は**シェル統合**（ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測）の配置も自分で行います。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効くので設定ファイルには何も書かず、状態が 1 行出るだけです。**Windows は PowerShell のプロファイル（`$PROFILE`）への追記が必要**なので、どのファイルへ何を書くか（置くのは tako の管理ブロック 1 個だけで既存の行はそのまま残ること・`tako shell-integration uninstall` で元に戻せること）を表示してから配置します。2 回目以降は差分がなければ何も書きません。配置できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します。状態だけ見たいときは `tako shell-integration` または `tako setup --check` です。
 
-`tako setup` の最後には、**スマホから使えるか**を `スマホからの接続: …` の 1 行で出します。Tailscale の導入・ログイン・証明書・公開の状態を**読むだけ**で（何も入れず何も起動しません）、その状態で次に打つコマンドを添えます。Tailscale が未導入なら `tako setup deps install`（依存チェックの段で出るものと同じ案内）、入っていて途中まで済んでいるなら `tako remote setup`、公開まで済んでいれば接続先の URL です。Tailscale が応答しないときは `[確認できません] tailscale status --json（10 秒応答なし）` と出して先へ進むので、setup が止まることはありません。
+`tako setup` の最後には、**スマホから使えるか**を `スマホからの接続: …` の 1 行で出します。Tailscale の導入・ログイン・証明書・公開の状態を**読むだけ**で（何も入れず何も起動しません）、その状態で次に打つコマンドを添えます。Tailscale が未導入なら `tako setup deps install`（依存チェックの段で出るものと同じ案内）、入っていて途中まで済んでいるなら `tako remote setup`、公開まで済んでいれば接続先の URL です。Tailscale が入っているのに実行できないときは「未導入」とは言わず `Tailscale を実行できませんでした` と出します。Tailscale が応答しないときは `[確認できません] tailscale status --json（10 秒応答なし）` と出して先へ進むので、setup が止まることはありません。
 
 `tako setup --check` が出す診断の項目は `tako check-health` と**同じ 1 つの実装**から出ています。人が読むなら `tako setup --check`、AI や監視から読むなら `tako check-health --json`（`diagnostics.items[].key` が安定した項目名、`diagnostics.remaining` が人の操作が要るぶん）で、どちらも同じ状態には同じ答えを返します。
 
@@ -269,6 +269,8 @@ tako setup deps install --dry-run  # 何を入れるかだけ表示
 ```
 
 導入済みのものには触りません（何度実行しても同じ結果になります）。導入を代行できるのは macOS の Homebrew（`brew install`）で、Windows は打つべき `winget` のコマンドを表示します。
+
+Tailscale は入っているのに応答しない（`tailscale --version` が返らない・失敗する）ときは `[OK]` ではなく `[警告] tailscale: 在りますが実行できません` と出し、入れ直しは勧めません（2 つ目の Tailscale を入れると、リモート接続がつながらなくなることがあります）。Dock から起動した tako でも、ログインシェルの PATH にある Tailscale（MacPorts や nix で入れたもの）を見つけます。
 
 標準の `tako setup` は質問をしないので、足りないツールがあっても状態と `tako setup deps install` の 1 行だけを表示します。1 つずつ「今すぐ入れますか？」と聞いてほしいときは `tako setup --review` を使ってください。
 

@@ -633,6 +633,12 @@ fn dep_items() -> Vec<Item> {
         .map(|state| {
             let dep = state.dep;
             let key = format!("dep.{}", dep.bin);
+            // 在るが動かない（tailscale の `--version` が固まる / 非 0。#1816）= 壊れている。
+            // 任意依存なので残り作業には数えない（`tako setup` の依存段と同じ文面・同じ扱い）
+            if let Some(text) = state.unrunnable_text() {
+                return Item::new(key, Status::Warn, text)
+                    .line(format!("      {}", crate::tailscale::UNRUNNABLE_HINT));
+            }
             if let Some(path) = &state.found {
                 return Item::new(key, Status::Ok, format!("{}: {path}", dep.bin));
             }
