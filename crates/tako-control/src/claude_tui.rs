@@ -114,14 +114,14 @@ impl ChoiceDialog {
             "auto_accepted": self.kind.auto_accepted(),
             // #1143: 狭いペインでは選択カーソルが画面外へ出る（null = 描かれていない）
             "cursor_visible": self.cursor_visible,
-            // #1143: 1 つでもラベルが `…` で切り詰められているか
-            // （true なら master は**番号で** respond する）
+            // #1143 / #2302: 1 つでもラベルが `…` で切り詰められているか、説明との境目が
+            // 読めないか（true なら master は**番号で** respond する）
             "labels_truncated": self.labels_truncated(),
             "options": self.options.iter().map(|o| json!({
                 "number": o.number,
                 "label": o.label,
                 "highlighted": o.highlighted,
-                // #1143: 元のラベルは画面に残っていない（ラベル一致で選ばない）
+                // #1143 / #2302: 元のラベルを画面から確定できない（ラベル一致で選ばない）
                 "label_truncated": o.label_truncated,
             })).collect::<Vec<_>>(),
         })
@@ -132,7 +132,7 @@ impl ChoiceDialog {
         self.options.iter().map(|o| o.label.clone()).collect()
     }
 
-    /// 1 つでもラベルが切り詰められているか（#1143）
+    /// 1 つでもラベルが切り詰められているか、説明との境目が読めないか（#1143 / #2302）
     pub fn labels_truncated(&self) -> bool {
         self.options.iter().any(|o| o.label_truncated)
     }

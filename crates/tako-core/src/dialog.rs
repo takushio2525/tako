@@ -74,10 +74,14 @@ pub struct ChoiceOption {
     pub label: String,
     /// 選択カーソル（`❯` / `›` / `>`）が指しているか
     pub highlighted: bool,
-    /// ラベルが TUI 自身に切り詰められているか（`…` を含む。#1143）。
+    /// ラベルが画面から確定できないか。2 つの形がある:
     ///
-    /// **true なら元のラベルは画面のどこにも残っていない**（折り返しと違って
-    /// 結合では戻せない）。ラベル一致でこの選択肢を確定してはいけない
+    /// - TUI 自身に切り詰められている（`…` を含む。#1143）。元のラベルは画面の
+    ///   どこにも残っていない（折り返しと違って結合では戻せない）
+    /// - 狭いペインで**ラベルと説明の境目が読めない**（#2302）。ラベルの折り返しと
+    ///   説明が同じ桁へ字下げされ、どちらとも取れる。`label` は確実にラベルの 1 行目だけ
+    ///
+    /// どちらもラベル一致でこの選択肢を確定してはいけない
     /// = `respond` は番号での指定を要求する
     pub label_truncated: bool,
 }
@@ -230,13 +234,14 @@ pub fn detect_choice_list(lines: &[&str]) -> Option<ChoiceList> {
 /// `at_wrap_edge` は「その行が折り返しの縁で切られている」ことの印（#1447。
 /// 空スライス = 印なし）。`detect_choice_list` が副画面を剥がしたときだけ立つ
 fn detect_choice_list_wrapped(lines: &[&str], at_wrap_edge: &[bool]) -> Option<ChoiceList> {
-    let raw = detect_choice_list_in(lines);
-    let unwrapped = unwrap_dialog_lines_at(lines, at_wrap_edge);
+    // 境目が読めない行（#2302）は結合の前後で行番号が同じなので、両方の組み立てに渡す
+    let (unwrapped, undecided) = unwrap_dialog_lines_at(lines, at_wrap_edge);
+    let raw = detect_choice_list_in(lines, &undecided);
     if unwrapped.iter().zip(lines).all(|(a, b)| a == b) {
         return raw; // 結合が起きていない = 判定材料が同一
     }
     let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
-    match (detect_choice_list_in(&refs), raw) {
+    match (detect_choice_list_in(&refs, &undecided), raw) {
         // 結合後のほうが選択肢を取りこぼしていなければそちらを採る
         // （ラベルが 1 本に戻っているのはこちらだけ）
         (Some(joined), Some(raw)) if joined.options.len() >= raw.options.len() => Some(joined),
@@ -388,8 +393,11 @@ fn legacy_side_panel() -> bool {
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_1447_LEGACY").is_some())
 }
 
-/// [`detect_choice_list`] の本体（渡された行をそのまま材料にする）
-fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
+/// [`detect_choice_list`] の本体（渡された行をそのまま材料にする）。
+///
+/// `undecided` は行ごとの「ラベルと説明の境目が読めない」印（#2302。[`label_ends`]。
+/// 空スライス = 印なし）。番号つき選択肢の `label_truncated` へ載る
+fn detect_choice_list_in(lines: &[&str], undecided: &[bool]) -> Option<ChoiceList> {
     let bottom = lines.iter().rposition(|l| !l.trim().is_empty())? + 1;
     let scan_from = bottom.saturating_sub(SCAN_ROWS);
     let Some(cursor_row) = (scan_from..bottom)
@@ -398,11 +406,11 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
     else {
         // 経路 5: 選択カーソルが走査の窓より上にある背の高いダイアログ（#1847）。
         // カーソルと全選択肢が採れるので、経路 3 より先に見る
-        if let Some(list) = numbered_above_scan(lines, scan_from, bottom) {
+        if let Some(list) = numbered_above_scan(lines, undecided, scan_from, bottom) {
             return Some(list);
         }
         // 経路 3: 選択カーソルが 1 つも描かれていない（#1143）
-        return detect_cursorless_numbered(lines, bottom);
+        return detect_cursorless_numbered(lines, undecided, bottom);
     };
     let content = cursor_content(lines[cursor_row])?;
 
@@ -410,7 +418,7 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
     if numbered_choice(content).is_some() {
         let numbered = numbered_block(lines, bottom, cursor_row);
         if numbered.len() >= 2 {
-            return Some(numbered_list(lines, &numbered, cursor_row));
+            return Some(numbered_list(lines, undecided, &numbered, cursor_row));
         }
     }
 
@@ -418,7 +426,7 @@ fn detect_choice_list_in(lines: &[&str]) -> Option<ChoiceList> {
     if content.trim().is_empty() {
         // 空のカーソル行 = 空の入力欄。**入力欄はダイアログの外**なので、その上に
         // 番号つきダイアログが在れば拾う（経路 4。#1263）
-        return numbered_above_empty_input(lines, scan_from, cursor_row);
+        return numbered_above_empty_input(lines, undecided, scan_from, cursor_row);
     }
     let indent = content_column(lines[cursor_row])?;
     if framed_as_input_box(lines, cursor_row, indent, scan_from, bottom) {
@@ -522,13 +530,7 @@ fn numbered_block(lines: &[&str], to: usize, anchor: usize) -> Vec<usize> {
     let Some(pos) = all.iter().position(|&i| i == anchor) else {
         return Vec::new();
     };
-    let follows = |upper: usize, lower: usize| {
-        numbered_gap_ok(lines, upper, lower)
-            && matches!(
-                (numbered_value(lines[upper]), numbered_value(lines[lower])),
-                (Some(a), Some(b)) if a + 1 == b
-            )
-    };
+    let follows = |upper: usize, lower: usize| numbered_follows(lines, upper, lower);
     let mut above: Vec<usize> = Vec::new();
     let mut cur = anchor;
     for &i in all[..pos].iter().rev() {
@@ -550,6 +552,16 @@ fn numbered_block(lines: &[&str], to: usize, anchor: usize) -> Vec<usize> {
         cur = i;
     }
     block
+}
+
+/// 番号つき行 `upper` の次に `lower` が**同じ並び**として続くか（#1293）。
+/// あいだがダイアログの一部だけで、番号が 1 ずつ増えること
+fn numbered_follows(lines: &[&str], upper: usize, lower: usize) -> bool {
+    numbered_gap_ok(lines, upper, lower)
+        && matches!(
+            (numbered_value(lines[upper]), numbered_value(lines[lower])),
+            (Some(a), Some(b)) if a + 1 == b
+        )
 }
 
 /// ダイアログの行のあいだに挟まってよい行の種類（#1263 / #1293 の共通判定）
@@ -611,8 +623,13 @@ fn legacy_numbered_block() -> bool {
 }
 
 /// 番号つきの行から `ChoiceList` を組む（経路 1 と経路 4 の共通部）
-fn numbered_list(lines: &[&str], numbered: &[usize], cursor_row: usize) -> ChoiceList {
-    let options = numbered_options(lines, numbered, Some(cursor_row));
+fn numbered_list(
+    lines: &[&str],
+    undecided: &[bool],
+    numbered: &[usize],
+    cursor_row: usize,
+) -> ChoiceList {
+    let options = numbered_options(lines, undecided, numbered, Some(cursor_row));
     let highlighted = options.iter().position(|o| o.highlighted);
     ChoiceList {
         options,
@@ -645,6 +662,7 @@ fn numbered_list(lines: &[&str], numbered: &[usize], cursor_row: usize) -> Choic
 /// 番号キーを送る）のほうが重いので安全側に倒してある
 fn numbered_above_empty_input(
     lines: &[&str],
+    undecided: &[bool],
     scan_from: usize,
     input_row: usize,
 ) -> Option<ChoiceList> {
@@ -662,7 +680,7 @@ fn numbered_above_empty_input(
     if !dialog_reaches_input_box(lines, *numbered.last()?, input_row) {
         return None;
     }
-    Some(numbered_list(lines, &numbered, cursor_row))
+    Some(numbered_list(lines, undecided, &numbered, cursor_row))
 }
 
 /// 番号つきの並びと**空の入力欄のあいだ**が、ダイアログの一部だけでできているか（#1263）。
@@ -712,7 +730,12 @@ fn legacy_input_box_below() -> bool {
 /// [`dialog_reaches_input_box`]。入力欄の代わりに画面の下端までを見る）。窓の中に
 /// 選択カーソル（空の入力欄を含む）が 1 つでもある画面はここへ来ないので、会話ログへ流れた
 /// 解決済みのダイアログ（下に入力欄がある）を拾うことはない
-fn numbered_above_scan(lines: &[&str], scan_from: usize, bottom: usize) -> Option<ChoiceList> {
+fn numbered_above_scan(
+    lines: &[&str],
+    undecided: &[bool],
+    scan_from: usize,
+    bottom: usize,
+) -> Option<ChoiceList> {
     if legacy_1847() {
         return None;
     }
@@ -724,7 +747,7 @@ fn numbered_above_scan(lines: &[&str], scan_from: usize, bottom: usize) -> Optio
     if numbered.len() < 2 || !dialog_reaches_input_box(lines, *numbered.last()?, bottom) {
         return None;
     }
-    Some(numbered_list(lines, &numbered, cursor_row))
+    Some(numbered_list(lines, undecided, &numbered, cursor_row))
 }
 
 /// #1847 の A/B。`TAKO_1847_LEGACY=1` で #1847 **前**へ戻す（走査の窓より上の選択カーソルを
@@ -754,9 +777,11 @@ fn label_is_truncated(label: &str) -> bool {
 
 /// 番号つき選択肢の行から `ChoiceOption` を組む（経路 1 / 経路 3 の共通部）。
 ///
-/// 2 列レイアウトなら説明列を切り落とす（[`description_column`]）
+/// 2 列レイアウトなら説明列を切り落とす（[`description_column`]）。
+/// ラベルと説明の境目が読めない行（`undecided`。#2302）は `label_truncated` にする
 fn numbered_options(
     lines: &[&str],
+    undecided: &[bool],
     rows: &[usize],
     cursor_row: Option<usize>,
 ) -> Vec<ChoiceOption> {
@@ -772,7 +797,8 @@ fn numbered_options(
             let label = label.trim().to_string();
             ChoiceOption {
                 number: Some(number),
-                label_truncated: label_is_truncated(&label),
+                label_truncated: label_is_truncated(&label)
+                    || undecided.get(i).copied().unwrap_or(false),
                 label,
                 highlighted: Some(i) == cursor_row,
             }
@@ -874,7 +900,11 @@ fn label_before_column<'a>(line: &str, label: &'a str, col: usize) -> Option<&'a
 ///   選択肢が**2 列レイアウト**（[`description_column`]）で描かれている
 /// - 連なりのあとに続くのは空行・キー案内・罫線・**より深い字下げ**（説明列の
 ///   折り返し）だけ = 画面が選択肢一覧の途中で尽きている
-fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceList> {
+fn detect_cursorless_numbered(
+    lines: &[&str],
+    undecided: &[bool],
+    bottom: usize,
+) -> Option<ChoiceList> {
     if legacy_cursorless_dialog() {
         return None;
     }
@@ -936,7 +966,7 @@ fn detect_cursorless_numbered(lines: &[&str], bottom: usize) -> Option<ChoiceLis
         return None;
     }
 
-    let options = numbered_options(lines, &rows, None);
+    let options = numbered_options(lines, undecided, &rows, None);
     Some(ChoiceList {
         options,
         highlighted: None,
@@ -979,6 +1009,11 @@ struct OpenLine {
     /// この行が**折り返しの縁で切られている**か（#1447 の副画面の左端）。
     /// 縁に達しているのは構造から分かっているので、幅の見積もりは使わない
     at_wrap_edge: bool,
+    /// ラベルの終わりを [`label_ends`] が表示幅の実測で決めた行か（#2302）。
+    /// 決めた行数（`limit`）だけ結合し、char 数の見積もりは使わない
+    decided: bool,
+    /// 結合してよい行数の上限（[`label_ends`] の `join`。決めていない行は無制限）
+    limit: usize,
 }
 
 /// その行が**新しい要素**を始めるか（= 直前の行の折り返しの続きではないか）。
@@ -1026,8 +1061,10 @@ fn starts_new_dialog_block(line: &str, prev: &str, open: &OpenLine, usable: usiz
     // ラベルと同じ桁で並ぶ）。桁は表示幅ではなく char 数で数えるので、
     // 全角の行では**控えめ**に見積もる = 結合しない側へ倒れる（安全側）。
     // **副画面の縁で切られた行は見積もりを使わない**（#1447）: 折り返し位置は
-    // 画面幅ではなく副画面の左端で決まっており、char 数では測れない
-    if !open.at_wrap_edge {
+    // 画面幅ではなく副画面の左端で決まっており、char 数では測れない。
+    // **説明つきの並びの選択肢も使わない**（#2302）: どこまでがラベルかは
+    // [`label_ends`] が表示幅で決めてあり、全角の char 数はその判定を崩す
+    if !open.at_wrap_edge && !open.decided {
         let first_word = stripped
             .split(' ')
             .next()
@@ -1089,6 +1126,8 @@ fn needs_join_space(head: &str, tail: &str, at_wrap_edge: bool) -> bool {
 ///
 /// 続きの判定は [`starts_new_dialog_block`]。**同じ桁の行は次の選択肢**なので、
 /// 番号なしの並び（`/mcp` のサーバー一覧）を 1 個へ畳んでしまうことはない。
+/// 番号つき選択肢の続きがラベルの折り返しか説明か（AskUserQuestion は同じ桁に並ぶ）は
+/// [`label_ends`] が表示幅で決める（#2302）。
 ///
 /// **2 列レイアウトの選択肢は結合しない**（#1143）。`/model` のように
 /// 「ラベル列 + 説明列」で描かれる一覧では、選択肢の下に続くのは**説明列の
@@ -1097,14 +1136,17 @@ fn needs_join_space(head: &str, tail: &str, at_wrap_edge: bool) -> bool {
 /// 空白で継ぐと `1M co ntext` という壊れた語がラベルに入る。
 /// 列の判定は [`description_column`]
 pub fn unwrap_dialog_lines(lines: &[&str]) -> Vec<String> {
-    unwrap_dialog_lines_at(lines, &[])
+    unwrap_dialog_lines_at(lines, &[]).0
 }
 
 /// [`unwrap_dialog_lines`] の本体。`at_wrap_edge` は行ごとの
-/// 「副画面の縁で切られている」印（#1447。空スライス = 印なし）
-fn unwrap_dialog_lines_at(lines: &[&str], at_wrap_edge: &[bool]) -> Vec<String> {
+/// 「副画面の縁で切られている」印（#1447。空スライス = 印なし）。
+///
+/// 番号つき選択肢の続きをどこまでラベルへ結合するかは [`label_ends`] が決める（#2302）。
+/// 戻りの 2 つ目はその「ラベルと説明の境目が読めない」行の印（行番号と 1:1）
+fn unwrap_dialog_lines_at(lines: &[&str], at_wrap_edge: &[bool]) -> (Vec<String>, Vec<bool>) {
     if legacy_wrapped_dialog() {
-        return lines.iter().map(|l| (*l).to_string()).collect();
+        return (lines.iter().map(|l| (*l).to_string()).collect(), Vec::new());
     }
     // 画面の幅（罫線がペイン幅いっぱいに引かれるので最長行がそれに当たる）。
     // 右端の余白ぶんを引いた値が本文の折り返し位置になる（実採取で 3 桁）
@@ -1115,20 +1157,16 @@ fn unwrap_dialog_lines_at(lines: &[&str], at_wrap_edge: &[bool]) -> Vec<String> 
         .unwrap_or(0)
         .saturating_sub(DIALOG_RIGHT_PAD);
     // 2 列レイアウトの説明列（#1143）。画面全体の番号つき行から 1 つだけ決める
-    let numbered_rows: Vec<usize> = (0..lines.len())
-        .filter(|&i| {
-            numbered_choice(cursor_content(lines[i]).unwrap_or_else(|| strip_indent(lines[i])))
-                .is_some()
-        })
-        .collect();
+    let numbered_rows = numbered_rows(lines, lines.len());
     let desc_col = description_column(lines, &numbered_rows);
+    let ends = label_ends(lines, at_wrap_edge, &numbered_rows, desc_col, usable);
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     // 続きを受け付けている論理行。None = 受け付けない
     let mut open: Option<OpenLine> = None;
     let mut joined = 0usize;
     for line in lines {
         if let Some(state) = open {
-            if joined < MAX_WRAP_JOIN_LINES
+            if joined < MAX_WRAP_JOIN_LINES.min(state.limit)
                 && !starts_new_dialog_block(line, &out[state.row], &state, usable)
             {
                 let tail = line.trim();
@@ -1157,20 +1195,250 @@ fn unwrap_dialog_lines_at(lines: &[&str], at_wrap_edge: &[bool]) -> Vec<String> 
         // 2 列レイアウトの選択肢は続きを受け付けない（下に来るのは説明列の折り返し）
         let two_column = is_numbered && desc_col.is_some() && column_gap(line) == desc_col;
         let row = out.len();
-        open = if two_column {
+        open = if two_column || ends.join[row] == 0 {
             None
         } else {
-            content_start_column(line).map(|indent| OpenLine {
-                row,
-                indent,
-                floor: wrap_indent_floor(line).unwrap_or(indent),
-                numbered: is_numbered,
-                at_wrap_edge: at_wrap_edge.get(row).copied().unwrap_or(false),
+            open_line(line, row, at_wrap_edge).map(|o| OpenLine {
+                decided: ends.decided[row],
+                limit: ends.join[row],
+                ..o
             })
         };
         out.push((*line).to_string());
     }
-    out
+    (out, ends.undecided)
+}
+
+/// `line`（`row` 行目）が続きを受け付けるときの状態。結合（[`unwrap_dialog_lines_at`]）と
+/// 境目の判定（[`label_ends`]）が同じ状態から [`starts_new_dialog_block`] を呼ぶための 1 実装
+fn open_line(line: &str, row: usize, at_wrap_edge: &[bool]) -> Option<OpenLine> {
+    let numbered =
+        numbered_choice(cursor_content(line).unwrap_or_else(|| strip_indent(line))).is_some();
+    content_start_column(line).map(|indent| OpenLine {
+        row,
+        indent,
+        floor: wrap_indent_floor(line).unwrap_or(indent),
+        numbered,
+        at_wrap_edge: at_wrap_edge.get(row).copied().unwrap_or(false),
+        decided: false,
+        limit: usize::MAX,
+    })
+}
+
+// --- ラベルと説明の境目（#2302） ---
+
+/// 番号つき選択肢ごとの「どこまでがラベルか」（[`label_ends`] の戻り。行番号と 1:1）
+struct LabelEnds {
+    /// 続きを何行までラベルへ結合するか（`usize::MAX` = 従来どおり構造と上限まで・0 = 結合しない）
+    join: Vec<usize>,
+    /// 表示幅の実測で決めた行か（[`OpenLine::decided`]）
+    decided: Vec<bool>,
+    /// ラベルの終わりが画面から確定できない（`label_truncated` へ載せる）
+    undecided: Vec<bool>,
+}
+
+/// 番号つき選択肢の下に続く行が**ラベルの折り返しか説明か**を決める（#2302）。
+///
+/// # 実測（claude 2.1.301。AskUserQuestion と permission を 25 / 32 / 40 / 80 桁で採取）
+///
+/// ```text
+/// 32 桁:  ❯ 1. Fix the status detection    ← ラベル
+///              first (Recommended)         ← ラベルの折り返し
+///              Replace the tail window     ← 説明（同じ桁・同じ右端で語単位に折り返す）
+///              with the input anchor so a
+///           2. Fix dialogs
+///              Join wrapped options and    ← `Join` は前の行に入る = 折り返しではない
+/// ```
+///
+/// - ラベルの折り返しと説明は**同じ桁へ字下げされ、同じ右端で語単位に折り返す**ので、
+///   字下げでは見分けられない。#1131 の結合は説明をラベルへ飲み、char 数の見積もりは
+///   全角の続きを「まだ入る」と読んでラベルの続きを落としていた
+/// - 説明の中の改行は改行として描かれない（U+FFFD で 1 行に流れる）。ラベルも説明も
+///   1 段落なので、1 つの選択肢の下で**前の行に入る語が次の行へ回った境目**（以下
+///   「段落の切れ目」）はラベルと説明の境目の 1 か所しかない
+/// - AskUserQuestion の選択肢は説明を必ず持つ（tool の schema が `description` を required にしている）
+/// - permission（説明なし）は右端に余白があり、並びの行は画面の端まで届かない
+///
+/// # 判定
+///
+/// 段落の切れ目は**表示幅**で測る。右端は並びの行が実際に届いた桁（= 本当の端の下限）なので、
+/// 前の行に次の行の最初の語が入るなら、どの折り返し方でもその行は折り返しではない。
+///
+/// 1. 並びのどこにも段落の切れ目が無い = 説明の証拠が無い。従来（#1131）の結合のまま
+///    （permission / 上限ダイアログ / 確認ダイアログはここ）。ただし結合が「右端まで埋まった
+///    区切りの無い長い語」の行を飲むときは、説明を飲んだかもしれないので境目を読めない扱い
+/// 2. 説明つきの並び（切れ目が 1 つでもある）では選択肢ごとに:
+///    - 段落の切れ目があれば、その手前までがラベル
+///    - 続きの 1 行目が右端まで埋まった区切りの無い長い語なら、そこから説明（簡潔なラベルは
+///      行幅を超える語を続けない。日本語の説明は語の区切りが少なく、広いペインでもここに当たる）
+///    - 続きが 1 行だけならそれが説明（説明は必ずある）
+///    - それ以外は境目が読めない: ラベルは 1 行目だけ・`label_truncated`
+fn label_ends(
+    lines: &[&str],
+    at_wrap_edge: &[bool],
+    rows: &[usize],
+    desc_col: Option<usize>,
+    usable: usize,
+) -> LabelEnds {
+    let n = lines.len();
+    let mut ends = LabelEnds {
+        join: vec![usize::MAX; n],
+        decided: vec![false; n],
+        undecided: vec![false; n],
+    };
+    if legacy_2302() {
+        return ends;
+    }
+    let cut = |i: usize| at_wrap_edge.get(i).copied().unwrap_or(false);
+    let two_column = |r: usize| desc_col.is_some() && column_gap(lines[r]) == desc_col;
+    let screen = lines.iter().map(|l| display_width(l)).max().unwrap_or(0);
+    for chain in numbered_chains(lines, rows) {
+        // 2 列レイアウト（#1143）と副画面つき（#1447）の選択肢は従来どおり（説明列 /
+        // 副画面の縁で折り返すので、並びの右端の考え方が当たらない）
+        let members: Vec<(usize, Vec<usize>)> = chain
+            .into_iter()
+            .filter(|&r| !cut(r) && !two_column(r))
+            .map(|r| (r, wrap_block(lines, r)))
+            .collect();
+        let edge = members
+            .iter()
+            .flat_map(|(r, block)| std::iter::once(*r).chain(block.iter().copied()))
+            .map(|i| display_width(lines[i]))
+            .max()
+            .unwrap_or(0);
+        let breaks: Vec<Option<usize>> = members
+            .iter()
+            .map(|(r, block)| paragraph_break(lines, at_wrap_edge, *r, block, edge))
+            .collect();
+        let described = breaks.iter().any(Option::is_some);
+        for ((r, block), brk) in members.iter().zip(&breaks) {
+            if block.is_empty() {
+                continue;
+            }
+            let long_start = long_word_start(lines, block, edge, screen);
+            if !described {
+                // 1: 従来の結合のまま。長い語の行を飲むときだけ境目を読めない扱い
+                ends.undecided[*r] = long_start
+                    && open_line(lines[*r], *r, at_wrap_edge).is_some_and(|o| {
+                        !starts_new_dialog_block(lines[block[0]], lines[*r], &o, usable)
+                    });
+                continue;
+            }
+            ends.decided[*r] = true;
+            ends.join[*r] = match brk {
+                // 結合の上限を超えるラベルは途中までしか繋がらない = 申告する
+                Some(k) if *k > MAX_WRAP_JOIN_LINES => {
+                    ends.undecided[*r] = true;
+                    *k
+                }
+                Some(k) => *k,
+                None if long_start || block.len() == 1 => 0,
+                None => {
+                    ends.undecided[*r] = true;
+                    0
+                }
+            };
+        }
+    }
+    ends
+}
+
+/// 番号つき行を「同じ並び」（[`numbered_follows`]）ごとに分ける。`rows` は昇順
+fn numbered_chains(lines: &[&str], rows: &[usize]) -> Vec<Vec<usize>> {
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    for &r in rows {
+        match chains.last_mut() {
+            Some(chain) if chain.last().is_some_and(|&p| numbered_follows(lines, p, r)) => {
+                chain.push(r)
+            }
+            _ => chains.push(vec![r]),
+        }
+    }
+    chains
+}
+
+/// 選択肢 `r` の下に続く「折り返しの続きでありうる行」の連なり（字下げが下限以上で、
+/// 選択カーソル / 番号つき選択肢 / 案内 / 罫線ではない行）。[`starts_new_dialog_block`] の
+/// 構造の条件と同じ
+fn wrap_block(lines: &[&str], r: usize) -> Vec<usize> {
+    let Some(floor) = wrap_indent_floor(lines[r]) else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .enumerate()
+        .skip(r + 1)
+        .take_while(|(_, line)| {
+            let stripped = line.trim_start();
+            !stripped.is_empty()
+                && cursor_content(line).is_none()
+                && !is_key_hint(line)
+                && !is_rule_line(stripped)
+                && numbered_choice(strip_indent(line)).is_none()
+                && line.chars().take_while(|c| *c == ' ').count() >= floor
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 選択肢 `r` の続き `block` の中の**段落の切れ目**（前の行に入る語が次の行へ回った位置）。
+/// 返すのは切れ目の後ろの行の `block` 内の添字（0 = 選択肢の行の直後から説明）。
+/// 副画面の縁で切られた行（#1447）からの境目は幅で測れないので見ない。
+///
+/// **右端ちょうどまで埋まった行の次の行は 1 桁狭い**（実採取 25 桁: `long footer does not`
+/// （25 桁）の次の `hide the error`（19 桁）に `line.` が入らず、`Join wrapped options`（25 桁）
+/// の次の `and key hints` に `before` が入らない）。折り返し器がその行の頭に空白を 1 つ置いて
+/// 幅を数え、表示では落としている形なので、前々行が右端に届いていれば前の行を 1 桁広く見積もる
+/// （= 切れ目と言い切らない側。外すと説明の途中を切れ目と読む）
+fn paragraph_break(
+    lines: &[&str],
+    at_wrap_edge: &[bool],
+    r: usize,
+    block: &[usize],
+    edge: usize,
+) -> Option<usize> {
+    let mut before: Option<usize> = None;
+    let mut prev = r;
+    for (k, &i) in block.iter().enumerate() {
+        let first_word = lines[i].trim_start().split(' ').next().unwrap_or_default();
+        let measurable = !at_wrap_edge.get(prev).copied().unwrap_or(false);
+        let hidden_space = usize::from(before.is_some_and(|b| display_width(lines[b]) >= edge));
+        if measurable
+            && display_width(lines[prev]) + hidden_space + 1 + display_width(first_word) <= edge
+        {
+            return Some(k);
+        }
+        before = Some(prev);
+        prev = i;
+    }
+    None
+}
+
+/// 続きの 1 行目が**右端まで埋まった区切りの無い長い語**か（#2302）。
+///
+/// 行が端まで埋まり（全角 1 文字ぶんの余りを許す）、語の区切りが無く、次の行へ続いている =
+/// 行幅を超える 1 語を割った途中。並びの行が画面の端まで届いていない画面（右端に余白のある
+/// ダイアログ = permission）では「埋まった」を測れないので当てない
+fn long_word_start(lines: &[&str], block: &[usize], edge: usize, screen: usize) -> bool {
+    let Some(&first) = block.first() else {
+        return false;
+    };
+    block.len() >= 2
+        && edge + 1 >= screen
+        && !lines[first].trim().contains(' ')
+        && display_width(lines[first]) + 1 >= edge
+}
+
+/// 行の表示幅（行末の余白を落とす。全角は 2 桁）
+fn display_width(line: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(line.trim_end())
+}
+
+/// `TAKO_2302_LEGACY=1` で #2302 前（番号つき選択肢の続きを char 数の見積もりだけで結合し、
+/// 境目が読めない印を立てない）へ戻す（A/B 用）
+fn legacy_2302() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2302_LEGACY").is_ok_and(|v| v == "1"))
 }
 
 /// その行の「マーカーが始まる桁」（行頭空白 + 縦罫線 + 選択カーソルを除いた位置）。

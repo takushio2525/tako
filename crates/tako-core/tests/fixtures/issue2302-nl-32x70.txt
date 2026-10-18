@@ -1,0 +1,70 @@
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:nl
+────────────────────────────────
+ ☐ Plan
+
+Which plan?
+
+❯ 1. Rewrite both in a single PR
+     Pros: one change.�Cons: the
+     diff gets larger.
+  2. Fix dialogs
+     Line one.�Line two
+     continues here.
+  3. Type something.
+────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
