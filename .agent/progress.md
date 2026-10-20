@@ -20,18 +20,6 @@
 
 ---
 
-## 2026-10-18（#1705: 自動命名の `spawn_claude` が非ゼロ終了でも stdout の EOF を `READ_GRACE` まで待ち、漏れたパイプ（#1748）で `Failed` に化けて再試行を落としていた → 終了コードだけで `NonZero`）
-- 孫に stdout を握らせる再現テストで修正前 FAILED → 修正後 ok・queue 経由 20/20・カタログ +0 B。PR #2287
-
-## 2026-10-18（#2284: 蓋閉じ継続の `probe_owner` が終わったプロセスの起動時刻（Windows はオブジェクトが残る間は読める）を生存の証拠にし #2277 を素通りしていた → `process::live_start_time_unix`（終了コードは `exited` の 1 実装）を通す）
-- 注入 `TAKO_2284_INJECT_LINGERING` で lid.rs:1068 を再現・番犬 `lid_guard_ownership`・カタログ +0 B。PR #2288
-
-## 2026-10-18（#2285: verify-setup-multiagent.sh のスタブが #1959 の `claude --version` を対話起動と数えて落ちていた = 製品の回帰ではない。スタブが版に即答し argv を記録・検出力の自己検査・CI の macOS へ登録・番犬 `issue2285_setup_multiagent_ci_watchdog`）
-- 製品の版の問い合わせを引数なしへ注入すると `claude argv=[]` で落ちる（検出力を保持）。初回 setup で mod が入らない件は #2292。PR #2290
-
-## 2026-10-18（#1668: Code Runner の変数展開を実行ペインの方言で引用 = `ShellDialect::quote_fragment`（PowerShell は特別な文字の前にだけバッククオート。単引用符は `-o 'x'.exe` がメンバー参照になるので不採用・about_Parsing））
-- pwsh 7 の構文木で Windows の展開 8,352 件: 修正前 3,239 件食い違い → 0 件・macOS は `tako:shell: pwsh` 以外不変・番犬 `issue1668_runner_quote_dialect_watchdog`・カタログ -18 B。残りの経路は #2286。PR #2289
-
 ## 2026-10-18（#1638: worker の宣言 / 実際のモデルを分けて持つ = transcript の最初の応答の model を `model_actual` に・食い違いは workers / worker_status の warnings と persist.log・ledger stats は実際のモデルで・codex / agy は matrix で degraded）
 - A/B `TAKO_1638_LEGACY=1`・実経路 17 PASS・カタログ +479 B。PR #2291
 
@@ -79,3 +67,15 @@
 
 ## 2026-10-18（#2306: 変数を使う rm の引数で空になると行き先が広がる形（`"$d/x"`・`"/tmp/$n"`・`"$p"*`）を番犬 `rmの引数で空になると広い場所を指す変数はvar_qで止める` が名指し、67 本・117 か所 + 偽 CLI 4 行 + release.sh 4 か所を `${var:?}` へ（例外 `# tako:rm-var-ok`））
 - 空にする注入で旧 `rm -rf /home /bin` 相当 → 新は exit で止まる・main に当てると 115 件（rebase 後の main の新規 2 件も直した）・test-release-retry 131 PASS（3.2 / 5.3）・カタログ +0 B
+
+## 2026-10-18（#2305: Windows のリリース検査 `verify-assets.ps1` の同梱ライセンス表の写しを消し、`Get-TakoLicenseBundle` が `scripts/lib/license-bundle.txt` を読む（無い・空・崩れは表の file:line を名指し）。番犬は「表を読んでいること」の静的検査 + pwsh での実行検査へ）
+- 修正前は表に 1 行足す / 消す / 空でも 4 通りとも通った → 修正後はすべて名指しで落ちる・表に 1 行足す注入で番犬は組み立て 3 か所を名指し・カタログ +0 B。PR #2325
+
+## 2026-10-20（#2321: `tako theme colors --target` / MCP `target` を dispatch が読み捨てていた → 指定のテーマの色・出どころ・warnings を返す（`resolve_theme_named` / `theme_overrides_named` の 1 本・知らない名前はエラー・省略時はバイト一致））
+- 実経路 `scripts/test-theme-colors-target-2321.sh` 修正前 12 PASS 20 FAIL → 修正後 32 PASS・注入 4 通り・カタログ +45 B。書き込み側の同型は #2331。PR #2328
+
+## 2026-10-20（#2320: 段落の切れ目が並びのどこにも出ない AskUserQuestion で説明がラベルへ丸ごと混ざっていた → 自由入力の `Type something.` がある並びは説明を必ず持つと読み、従来の結合が続きを飲む選択肢はラベルの 1 行目だけ + `label_truncated`（続き 1 行なら説明）= `dialog::carries_descriptions`）
+- 実物の claude 2.1.301 の 5 種 × 24 幅の採取・fixture 7 本・注入 4 通り・器越しの e2e 新旧・A/B `TAKO_2320_LEGACY=1`・カタログ +0 B。残りは #2324。PR #2327
+
+## 2026-10-20（#1816: tailscale の検出の続き = `check_status` の tailscale 項目を ok / unrunnable / missing / unknown の 4 通りに・setup は依存段の検出を末尾まで使い回す・依存段は在るが動かない CLI を `[警告]` に・正本は最後にログインシェルの PATH を上限つきで引く）
+- `--version` が固まる CLI で setup 33.0 → 10.7 秒（検出 3 → 1 回）・ログインシェルにだけ在る CLI で brew 1 → 0 回。実経路 46 PASS（修正前 25 FAIL）・カタログ +0 B。PR #2323
