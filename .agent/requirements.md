@@ -2468,6 +2468,16 @@ MCP `tako_theme colors` の `target` は、いまのテーマ（settings.json �
 `resolve_theme` / `active_theme_overrides` はいまの theme を渡す薄い包み）で、応答は同じ
 `theme_colors_response`。知らない名前は黙ってダークへ落とさずエラー（理由にプリセットの一覧）。
 target を省いた応答は #2321 以前とバイト一致。実経路は `scripts/test-theme-colors-target-2321.sh`。
+**書き込みの `target` も同じ解決を通す**（#2331）: `tako theme color <キー> <値> --target <名前>` /
+`tako theme color <キー> --reset --target <名前>` / `tako theme reset-colors --target <名前>`（MCP `tako_theme` の
+set-color / reset-color / reset-colors の `target`）は、colors と同じ `dispatch::theme_target_name`
+（`Settings::known_theme_name` で解く 1 本）で書く表のテーマを決め、プリセットならその colors、ビルトインなら
+`theme_colors` のそのモードの表へ書く。知らない名前は**何も書かずに** colors と同じ文言のエラー（CLI は非 0・
+MCP は isError）で断る。以前は書き込みだけ別の経路で、知らない名前を GUI のいまのモードの表へ落とし、
+打ち間違えた名前でいまのテーマの上書きを書き換え・消していた。表への当て方は `dispatch::apply_color_write` の
+1 本で、保存しない経路（セルフテスト）でも知らない名前は断る。target を省いたら従来どおり settings.json の
+theme の表（theme が知らない名前なら GUI のモードの表）で、応答と書いた結果は #2331 以前とバイト一致。
+実経路は `scripts/test-theme-write-target-2331.sh`。
 
 ### FR-4.7 プロファイルの GUI 編集（Issue #721。✅ 2026-08-01）
 
