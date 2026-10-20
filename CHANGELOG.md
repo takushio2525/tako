@@ -8,6 +8,16 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [0.8.39] - 2026-10-21
+
+Nightly patch release (automated). Changes since v0.8.38:
+夜間パッチリリース（自動）。v0.8.38 以降の変更:
+
+- [ドキュメント] 作業ログに 10/18〜10/20 の 4 件（#2305 / #2321 / #2320 / #1816）を足し、現在状態を更新 (#2332)
+- [改善] tailscale の検出の続き: 在るが動かない CLI を全経路で言い分け、setup は検出を使い回し、ログインシェルの PATH も見る (#1816) (#2323)
+- [修正] 狭いペインの AskUserQuestion で段落の切れ目が並びに無いとき説明がラベルへ混ざるのを、自由入力の選択肢を手がかりに申告へ倒す (#2320) (#2327)
+- [修正] tako theme colors --target が無視され常にいまのテーマを返していたのを、指定のテーマの色・出どころ・warnings を返すようにする (#2321) (#2328)
+
 ## [0.8.38] - 2026-10-19
 
 Nightly patch release (automated). Changes since v0.8.37:
