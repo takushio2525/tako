@@ -342,14 +342,21 @@ impl Settings {
     /// theme 値からテーマ実体を解決する（Issue #459）。
     /// 優先順: プリセット名 → ビルトイン名 + theme_colors 上書き → ダークフォールバック
     pub fn resolve_theme(&self) -> (tako_core::theme::Theme, Vec<String>) {
+        self.resolve_theme_named(&self.theme)
+    }
+
+    /// テーマの名前（"dark" / "light" / プリセット名）からテーマ実体を解決する。
+    /// 規則は [`Self::resolve_theme`] と同じで、いまの theme ではなく `name` を引く
+    /// （`tako theme colors --target` が、いまのテーマに依らず指定のテーマの色を返す。#2321）
+    pub fn resolve_theme_named(&self, name: &str) -> (tako_core::theme::Theme, Vec<String>) {
         use tako_core::theme::{Theme, ThemeMode};
-        let mode = match self.theme_presets.get(&self.theme) {
+        let mode = match self.theme_presets.get(name) {
             Some(preset) => ThemeMode::parse(&preset.base).unwrap_or_default(),
-            None => self.theme_mode(),
+            None => ThemeMode::parse(name).unwrap_or_default(),
         };
         let mut theme = Theme::for_mode(mode);
         let warnings = self
-            .active_theme_overrides()
+            .theme_overrides_named(name)
             .map(|overrides| theme.apply_overrides(overrides))
             .unwrap_or_default();
         if let Some(ref family) = self.font_family {
@@ -371,10 +378,31 @@ impl Settings {
     /// settings.json がライトで GUI がダークのとき、ライトの既定の色に dark の上書きの
     /// 出どころを付けて返していた
     pub fn active_theme_overrides(&self) -> Option<&std::collections::BTreeMap<String, String>> {
-        match self.theme_presets.get(&self.theme) {
+        self.theme_overrides_named(&self.theme)
+    }
+
+    /// 名前のテーマに重ねる色の上書き（[`Self::active_theme_overrides`] と同じ表の選び方で、
+    /// いまの theme ではなく `name` を引く。#2321）
+    pub fn theme_overrides_named(
+        &self,
+        name: &str,
+    ) -> Option<&std::collections::BTreeMap<String, String>> {
+        use tako_core::theme::ThemeMode;
+        match self.theme_presets.get(name) {
             Some(preset) => Some(&preset.colors),
-            None => self.theme_colors.get(self.theme_mode().as_str()),
+            None => self
+                .theme_colors
+                .get(ThemeMode::parse(name).unwrap_or_default().as_str()),
         }
+    }
+
+    /// `name` をテーマとして解決したときの正規の名前（プリセット名はそのまま、ビルトインは
+    /// "dark" / "light"）。どちらでもない名前は `None`（黙ってダークへ落とさない。#2321）
+    pub fn known_theme_name(&self, name: &str) -> Option<String> {
+        if self.theme_presets.contains_key(name) {
+            return Some(name.to_string());
+        }
+        tako_core::theme::ThemeMode::parse(name).map(|m| m.as_str().to_string())
     }
 
     /// ペインログ設定を tako-core の設定型へ解決する（Issue #112）
