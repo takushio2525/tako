@@ -78,6 +78,7 @@ mod text_field;
 mod ui_text;
 mod update_checker;
 mod update_window;
+mod usage_panel;
 mod video_player;
 mod view_cache;
 mod webview;
@@ -455,9 +456,10 @@ impl ScrollCtl {
 // dispatch 経路で規則を食い違わせないため、tako-app 側に定数を持たない
 
 /// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）。最小幅は条件つきのタブが
-/// 3 本とも出た 7 本 + 3 桁のバッジがアイコンだけの段で収まる幅（#1694 で 220 → 240）
+/// 4 本とも出た 8 本 + 3 桁のバッジがアイコンだけの段で収まる幅（#1694 で 220 → 240、
+/// #2203 の usage タブで 240 → 264。要 246.5px + 両側の 16px）
 const PANEL_DEFAULT_WIDTH: f32 = 320.0;
-const PANEL_MIN_WIDTH: f32 = 240.0;
+const PANEL_MIN_WIDTH: f32 = 264.0;
 
 /// ペイン上部タイトルバーの高さ（px。デザインスペック: 30px）
 const PANE_TITLE_BAR: f32 = 32.0;
@@ -517,6 +519,8 @@ enum PanelView {
     References,
     /// ワークスペース横断検索（#1694）。タブは結果があるか、このビューを選んでいるときだけ出す
     Search,
+    /// 利用制限の使い道（#2203）。タブはこのビューを選んでいるか、このセッションで開いたときだけ出す
+    Usage,
 }
 
 /// プレビューヘッダから開くナビゲーションドロップダウン（Issue #232）。
@@ -2538,6 +2542,8 @@ struct TakoApp {
     git_commit_input_focused: bool,
     /// 右パネル tasks ビューの画面状態（#1450 B2。**正本ではない** = 読んだ結果のキャッシュ）
     user_tasks: crate::tasks_panel::TasksPanel,
+    /// #2203: 右パネルの usage ビュー（掘り下げの段・届いた答え。画面の一時状態）
+    usage: crate::usage_panel::UsagePanel,
     /// ブランチ操作の事前提示カード（#496。承諾するまで実行しない）
     git_branch_confirm: Option<GitBranchConfirm>,
     /// 新規ブランチ名の入力欄（#496。`Some` の間はキー入力をここへ吸う）
@@ -4999,6 +5005,7 @@ impl TakoApp {
             text_input_caret_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             git_commit_input_focused: false,
             user_tasks: crate::tasks_panel::TasksPanel::default(),
+            usage: crate::usage_panel::UsagePanel::default(),
             git_branch_confirm: None,
             git_branch_input: None,
             git_agent_menu_open: false,
@@ -5829,7 +5836,7 @@ impl TakoApp {
                     std::env::var("TAKO_OFFLOAD").ok().as_deref(),
                     Some("0" | "false" | "off")
                 );
-                let offload = this.update(cx, |app: &mut TakoApp, _| {
+                let offload = this.update(cx, |app: &mut TakoApp, cx| {
                     if offload_enabled {
                         // #1968: 準備（UI スレッド部）も測る。ここが子プロセスを待っていても
                         // 計測区間の外だったので perf.log に出ず、UI ストールが「再開経路側の
@@ -5838,7 +5845,11 @@ impl TakoApp {
                             "offload_prepare:{}",
                             incoming.request.kind_name()
                         ));
-                        tako_control::prepare_offload(app, &incoming.request)
+                        let prepared = tako_control::prepare_offload(app, &incoming.request);
+                        // #2203: 準備の段で開いた usage ビュー（`tako usage --show`）の読みを出す
+                        // （background へ出す要求は `after_dispatch` を通らない）
+                        app.drain_usage_pending(cx);
+                        prepared
                     } else {
                         None
                     }
@@ -6608,6 +6619,8 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:user_tasks");
                         app.tick_user_tasks(wcx);
                     }
+                    // #2203: usage ビューの読み直し（見ている間だけ。読みは background）
+                    app.tick_usage_panel(wcx);
                     let git_selected = app.git_selected_commit.clone();
                     // サイドバー表示中はブランチ + 変更サマリの軽量 git 取得（#217）
                     let sidebar_git_cwd = if app.filetree.visible {
@@ -7568,6 +7581,8 @@ impl TakoApp {
         if std::mem::take(&mut self.user_tasks.list_poll.pending) {
             self.spawn_user_tasks_list(cx);
         }
+        // #2203: dispatch の内側（`tako panel --view usage` / 同期の `show`）で頼まれた usage の読み直し
+        self.drain_usage_pending(cx);
         // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
         for (pane, data) in std::mem::take(&mut self.pending_writes) {
             if let Some(session) = self.terminals.get(&pane) {
@@ -13335,6 +13350,8 @@ impl TakoApp {
             "panel-git",
             // #1450 B2: 人がやること（ユーザー向けタスク）
             "panel-tasks",
+            // #2203: 利用制限の使い道
+            "panel-usage",
             "split-right",
             "split-down",
             "pin-tab-title",
@@ -13438,6 +13455,7 @@ impl TakoApp {
                 "panel-orch" => self.toggle_panel_view(PanelView::Orch, cx),
                 "panel-git" => self.toggle_panel_view(PanelView::Git, cx),
                 "panel-tasks" => self.toggle_panel_view(PanelView::Tasks, cx),
+                "panel-usage" => self.toggle_panel_view(PanelView::Usage, cx),
                 "split-right" => self.split(SplitDirection::Right, cx),
                 "split-down" => self.split(SplitDirection::Down, cx),
                 // #552 案 4: いまのタブ名を固定する（ピン印と同じ操作）
@@ -25515,8 +25533,24 @@ impl UiStateHost for TakoApp {
             PanelView::Diagnostics => tako_control::protocol::PanelViewWire::Diagnostics,
             PanelView::References => tako_control::protocol::PanelViewWire::References,
             PanelView::Search => tako_control::protocol::PanelViewWire::Search,
+            PanelView::Usage => tako_control::protocol::PanelViewWire::Usage,
         };
         (self.panel_visible, self.panel_width, view)
+    }
+
+    /// #2203: `tako usage --show` / MCP `tako_sessions` の `show`。段を置いてパネルを開くだけ
+    /// （読みは呼び手の後処理 = `drain_usage_pending` が background へ出す）
+    fn show_usage_view(&mut self, query: &crate::usage_panel::UsageQuery) -> bool {
+        self.usage.show(query);
+        self.panel_visible = true;
+        self.panel_view = PanelView::Usage;
+        true
+    }
+
+    /// #2203: usage ビューで開いている段（まだ開いていなければ None）
+    fn usage_view_state(&self) -> Option<serde_json::Value> {
+        (self.panel_view == PanelView::Usage || !self.usage.levels.is_empty())
+            .then(|| self.usage.state_json())
     }
 
     /// #1694: 横断検索の結果の置き場（右パネルの search ビューが読むのと同じ 1 つ）
@@ -25584,6 +25618,7 @@ impl UiStateHost for TakoApp {
                 tako_control::protocol::PanelViewWire::Diagnostics => PanelView::Diagnostics,
                 tako_control::protocol::PanelViewWire::References => PanelView::References,
                 tako_control::protocol::PanelViewWire::Search => PanelView::Search,
+                tako_control::protocol::PanelViewWire::Usage => PanelView::Usage,
             };
         }
         // #503: パネルが非表示になったらテキスト入力フラグをクリア
@@ -25593,6 +25628,10 @@ impl UiStateHost for TakoApp {
         // tmux ビューを開いたら一覧を即時更新する（描画通知は dispatch ループが行う）
         if self.panel_visible && self.panel_view == PanelView::Fleet {
             self.refresh_tmux_data();
+        }
+        // #2203: usage を開いたら読み直す（タブ・パレットと同じ。読みは `after_dispatch` が background へ）
+        if self.panel_visible && self.panel_view == PanelView::Usage && view.is_some() {
+            self.usage.pending = true;
         }
         // #2052: tasks を開いたら一覧を引き直す（パレット・タブのクリックと同じ）。background の
         // ジョブには Context が要るので、dispatch の後処理（`after_dispatch`）が消化する
@@ -31740,6 +31779,12 @@ mod self_test {
     use rename_1686::{rename_1686_real_visual, rename_1686_visual};
     #[cfg(feature = "visual-test")]
     use run_dropdown_1733::run_dropdown_1733_visual;
+    /// #2203: 右パネルの usage ビュー（ステータスバーの 7d から開く・プロジェクト → Issue → 会話・
+    /// 同じ関数の答えと字面一致・空 / 壊れた索引 / 数万会話）（visual-test `usage-panel-2203`）
+    #[cfg(feature = "visual-test")]
+    mod usage_panel_2203;
+    #[cfg(feature = "visual-test")]
+    use usage_panel_2203::usage_panel_2203_visual;
     /// #1952: ドロップダウンの基板とポートの欄（実の arduino-cli で sketch.yaml・言語サーバの起き直し）
     /// （visual-test `run-board-1952`）
     #[cfg(feature = "visual-test")]
@@ -46447,6 +46492,12 @@ mod self_test {
                 // #1686: 同じ手順を実の rust-analyzer で（無ければ SKIPPED）
                 "rename-1686-real" => {
                     rename_1686_real_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
+                // #2203: 右パネルの usage ビュー（素材は scripts/test-usage-panel-2203.sh）
+                "usage-panel-2203" => {
+                    usage_panel_2203_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }

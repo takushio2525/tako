@@ -185,11 +185,13 @@ pub enum PanelViewWire {
     References,
     /// ワークスペース横断検索（#1694。検索欄・結果の一覧。行を押すとその位置へ）
     Search,
+    /// 利用制限の使い道（#2203。ログイン → プロジェクト → Issue → 会話と掘る。数値は `tako usage` と同じ）
+    Usage,
 }
 
 impl PanelViewWire {
     /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
-    pub const VALUES: [&'static str; 7] = [
+    pub const VALUES: [&'static str; 8] = [
         "fleet",
         "orch",
         "git",
@@ -197,6 +199,7 @@ impl PanelViewWire {
         "diagnostics",
         "references",
         "search",
+        "usage",
     ];
     /// 後方互換のみで受理する旧称と現行値の対応（#553）
     pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
@@ -210,6 +213,7 @@ impl PanelViewWire {
             PanelViewWire::Diagnostics => "diagnostics",
             PanelViewWire::References => "references",
             PanelViewWire::Search => "search",
+            PanelViewWire::Usage => "usage",
         }
     }
 
@@ -223,6 +227,7 @@ impl PanelViewWire {
             "diagnostics" => Some(PanelViewWire::Diagnostics),
             "references" => Some(PanelViewWire::References),
             "search" => Some(PanelViewWire::Search),
+            "usage" => Some(PanelViewWire::Usage),
             _ => None,
         }
     }
@@ -243,6 +248,7 @@ impl PanelViewWire {
             PanelViewWire::Diagnostics => "言語サーバの診断（エラー・警告）の一覧",
             PanelViewWire::References => "参照・呼び出し階層・型階層の結果（一覧 / ツリー）",
             PanelViewWire::Search => "ワークスペース横断検索の検索欄と結果の一覧",
+            PanelViewWire::Usage => "利用制限の使い道（プロジェクト → Issue → 会話）",
         }
     }
 
@@ -2217,7 +2223,9 @@ pub enum Request {
     /// - "usage": 利用制限（5h / 7d）の観測の要約（ログインごとの最新の % と観測の点数。
     ///   usage 分析 S1 #2200）と、期間の中の使用量の内訳（トークン 5 成分・API 換算・応答数・会話数を
     ///   `by` の段で束ねる。S2 #2201。`window` は期間、`account` / `project` は絞り込み、`limit` は段の上位）。
-    ///   `tako_control::usage::usage_payload` の 1 実装 = CLI `tako usage` と同じ
+    ///   `tako_control::usage::usage_payload` の 1 実装 = CLI `tako usage` と同じ。
+    ///   `issue` は主の Issue の絞り込み、`show: true` は同じ段・期間・絞り込みで右パネルの
+    ///   usage ビューを開く（#2203。答えは同じ内訳 + `shown`）
     Sessions {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2243,6 +2251,12 @@ pub enum Request {
         /// usage の tako アカウントの絞り込み（#2201）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
+        /// usage の主の Issue の絞り込み（`2203` / `#2203` / `none`。#2203）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issue: Option<String>,
+        /// usage を右パネルの usage ビューでも開く（#2203）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show: Option<bool>,
     },
     /// ペインの平文ターミナルログの参照・設定（Issue #112 B）。
     /// `action`:

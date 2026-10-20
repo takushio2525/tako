@@ -403,6 +403,17 @@ pub trait UiStateHost {
         _view: Option<crate::protocol::PanelViewWire>,
     ) {
     }
+    /// 右パネルの usage ビューをその段・期間・絞り込みで開く（#2203。`tako usage --show` /
+    /// MCP `tako_sessions` の `show`）。**状態を置くだけ**で集計はしない（読みは background）。
+    /// 開けたら `true`（画面の無い host は `false`）
+    fn show_usage_view(&mut self, _query: &crate::usage::UsageQuery) -> bool {
+        false
+    }
+    /// usage ビューで開いている段（`tako panel` の応答の `usage`。画面の無い host・まだ開いて
+    /// いなければ `None` = 嘘をつかない）
+    fn usage_view_state(&self) -> Option<serde_json::Value> {
+        None
+    }
     /// ワークスペース横断検索の結果の置き場（#1694。右パネルの search ビューもこれを読む）。
     /// 持たない実装（セカンダリ等）は `None` で、`tako search --show` / `--results` / `--open` /
     /// `--clear` は「使えない」と答える（出さない検索は置き場が無くても答える）

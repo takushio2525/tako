@@ -847,6 +847,110 @@ pub fn search_close() -> &'static str {
     tr!("この結果を閉じる", "Close these results")
 }
 
+// --- usage ビュー（キー: panel.usage_*。#2203） ---
+
+pub fn usage_title() -> &'static str {
+    tr!("利用制限の使い道", "Usage limits breakdown")
+}
+pub fn usage_loading() -> &'static str {
+    tr!("集計しています…", "Loading…")
+}
+pub fn usage_updating() -> &'static str {
+    tr!("更新中", "Updating")
+}
+pub fn usage_refresh() -> &'static str {
+    tr!("読み直す", "Refresh")
+}
+/// 掘り下げの最上段（プロジェクトの一覧）
+pub fn usage_root() -> &'static str {
+    tr!("プロジェクト", "Projects")
+}
+/// 期間の切り替えの名前（`5h` / `7d` は枠の名前のまま）
+pub fn usage_window(window: &str) -> &'static str {
+    match window {
+        "5h" => "5h",
+        "day" => tr!("今日", "Today"),
+        "week" => tr!("今週", "This week"),
+        "month" => tr!("今月", "This month"),
+        "all" => tr!("全期間", "All"),
+        _ => "7d",
+    }
+}
+pub fn usage_login(label: &str) -> String {
+    tr!(format!("ログイン {label}"), format!("Login {label}"))
+}
+pub fn usage_resets(stamp: &str) -> String {
+    tr!(format!("解除 {stamp}"), format!("resets {stamp}"))
+}
+pub fn usage_unclassified() -> &'static str {
+    tr!("未分類", "Unclassified")
+}
+pub fn usage_profile(name: &str) -> String {
+    tr!(format!("プロファイル: {name}"), format!("Profile: {name}"))
+}
+pub fn usage_no_issue() -> &'static str {
+    tr!("Issue なし", "No issue")
+}
+pub fn usage_manual() -> &'static str {
+    tr!("手動", "manual")
+}
+/// 段の行の量（API 換算・トークン・会話）
+pub fn usage_amount(usd: &str, tokens: &str, sessions: u64) -> String {
+    tr!(
+        format!("API 換算 {usd} · {tokens} トークン · 会話 {sessions}"),
+        format!("API equiv. {usd} · {tokens} tokens · {sessions} sessions")
+    )
+}
+pub fn usage_outside() -> &'static str {
+    tr!("tako の外", "Outside tako")
+}
+pub fn usage_estimated() -> &'static str {
+    tr!(
+        "推定（最後の観測より後）",
+        "Estimated (after the last observation)"
+    )
+}
+pub fn usage_unavailable(kind: &str) -> String {
+    tr!(
+        format!("{kind} は観測が無いので % を出していません"),
+        format!("No {kind} observations, so no percentages")
+    )
+}
+pub fn usage_more(n: u64) -> String {
+    tr!(format!("ほか {n} 件"), format!("{n} more"))
+}
+pub fn usage_show_more() -> &'static str {
+    tr!("さらに表示", "Show more")
+}
+pub fn usage_period_empty() -> &'static str {
+    tr!("この期間の使用量はありません", "No usage in this period")
+}
+pub fn usage_empty() -> &'static str {
+    tr!(
+        "まだ観測も使用量もありません。tako mod の効いた claude のペインが利用制限を報告すると記録が始まります",
+        "No observations or usage yet. Recording starts when a claude pane with tako mod reports its usage limits"
+    )
+}
+pub fn usage_failed(reason: &str) -> String {
+    tr!(
+        format!("読めませんでした: {reason}"),
+        format!("Could not load: {reason}")
+    )
+}
+pub fn usage_unreadable(n: u64) -> String {
+    tr!(
+        format!("読めない行 {n} 行を飛ばしました（書きかけ・壊れた行）"),
+        format!("Skipped {n} unreadable lines (partial or broken)")
+    )
+}
+pub fn usage_notes(n: usize) -> String {
+    tr!(format!("注記（{n}）"), format!("Notes ({n})"))
+}
+/// ステータスバーの 5h / 7d のツールチップ・サービスのメニューの項目
+pub fn usage_open() -> &'static str {
+    tr!("利用制限の使い道を開く", "Open usage limits breakdown")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;
@@ -1021,6 +1125,34 @@ mod tests {
                 search_failed("x"),
                 search_more(5),
                 search_close().to_string(),
+                // #2203: usage ビュー
+                usage_title().to_string(),
+                usage_loading().to_string(),
+                usage_updating().to_string(),
+                usage_refresh().to_string(),
+                usage_root().to_string(),
+                usage_window("day").to_string(),
+                usage_window("week").to_string(),
+                usage_window("month").to_string(),
+                usage_window("all").to_string(),
+                usage_login("A"),
+                usage_resets("10/21 22:00"),
+                usage_unclassified().to_string(),
+                usage_profile("tako"),
+                usage_no_issue().to_string(),
+                usage_manual().to_string(),
+                usage_amount("$1.00", "1.2 万", 3),
+                usage_outside().to_string(),
+                usage_estimated().to_string(),
+                usage_unavailable("5h"),
+                usage_more(3),
+                usage_show_more().to_string(),
+                usage_period_empty().to_string(),
+                usage_empty().to_string(),
+                usage_failed("x"),
+                usage_unreadable(2),
+                usage_notes(2),
+                usage_open().to_string(),
             ]
             .into_iter()
             .chain(

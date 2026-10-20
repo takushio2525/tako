@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::index::{BucketRow, ProjectFrom, SessionKeys, Tokens};
 use super::share::{self, Current, ObservedWindow, UsageSlice};
@@ -389,8 +389,10 @@ pub struct KindShare {
 /// `KindShare::windows` に載せる窓の上限
 pub const MAX_WINDOW_FITS: usize = 10;
 
-/// 束ねる鍵（段に要る欄だけが埋まる）
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// 束ねる鍵（段に要る欄だけが埋まる）。応答の `groups[].key` から読み戻せる（右パネルの掘り下げが
+/// 押した行の鍵から [`ProjectFilter::spec_of`] / [`IssueFilter::spec_of`] で次の段の絞り込みを作る = #2203）
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GroupKey {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub day: Option<String>,
@@ -461,6 +463,136 @@ pub struct Breakdown {
     pub price_table_as_of: &'static str,
 }
 
+/// プロジェクトの絞り込み（#2203）。名前だけの形は S2 からの既定（プロジェクトか同名のプロファイル）。
+/// 段の行を 1 つだけ選び直す形（右パネルの掘り下げ = [`ProjectFilter::spec_of`]）は前置きで書く
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectFilter<'a> {
+    /// `<名前>`: そのプロジェクトか、同名のプロファイル（master / solo）
+    Named(&'a str),
+    /// `project:<キー>`: プロジェクトだけ（同名のプロファイルを含めない）
+    Project(&'a str),
+    /// `profile:<名前>`: master / solo のプロファイルだけ
+    Profile(&'a str),
+    /// `none`: 未分類（プロジェクトもプロファイルも付いていない会話）
+    Unclassified,
+}
+
+impl<'a> ProjectFilter<'a> {
+    /// 未分類を表す値（`project:none` と書けば「none」という名前のプロジェクト）
+    pub const UNCLASSIFIED: &'static str = "none";
+
+    /// 引数の文字列を読む（空・前置きの後ろが空は `None` = 呼び手が断る）
+    pub fn parse(s: &'a str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if s == Self::UNCLASSIFIED {
+            return Some(Self::Unclassified);
+        }
+        let named = |rest: &'a str| Some(rest.trim()).filter(|r| !r.is_empty());
+        if let Some(rest) = s.strip_prefix("project:") {
+            return named(rest).map(Self::Project);
+        }
+        if let Some(rest) = s.strip_prefix("profile:") {
+            return named(rest).map(Self::Profile);
+        }
+        Some(Self::Named(s))
+    }
+
+    /// 会話の鍵がこの絞り込みに当たるか（鍵の無い会話は未分類 = 段の行と同じ切り方）
+    pub fn matches(self, keys: Option<&SessionKeys>) -> bool {
+        let project = keys.and_then(|k| k.project.as_deref());
+        let is_profile = keys.is_some_and(|k| k.project_from == Some(ProjectFrom::Profile));
+        match self {
+            Self::Named(p) => project == Some(p),
+            Self::Project(p) => project == Some(p) && !is_profile,
+            Self::Profile(p) => project == Some(p) && is_profile,
+            Self::Unclassified => project.is_none(),
+        }
+    }
+
+    /// 段の行（`project` / `issue` / `session`）を 1 つだけ選び直す絞り込みの文字列。
+    /// 右パネルの掘り下げと `tako usage --project` が同じ値を使う
+    pub fn spec_of(key: &GroupKey) -> String {
+        match (&key.project, &key.profile) {
+            (Some(p), _) => format!("project:{p}"),
+            (None, Some(p)) => format!("profile:{p}"),
+            (None, None) => Self::UNCLASSIFIED.to_string(),
+        }
+    }
+}
+
+/// Issue の絞り込み（#2203）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueFilter {
+    /// `<番号>`（`#` は付けても付けなくてもよい）: その主の Issue の会話
+    Number(u32),
+    /// `none`: 主の Issue が無い会話（「Issue なし」の行）
+    Missing,
+}
+
+impl IssueFilter {
+    /// 「Issue なし」を表す値
+    pub const MISSING: &'static str = "none";
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s == Self::MISSING {
+            return Some(Self::Missing);
+        }
+        let digits = s.strip_prefix('#').unwrap_or(s);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok().map(Self::Number)
+    }
+
+    pub fn matches(self, keys: Option<&SessionKeys>) -> bool {
+        let issue = keys.and_then(|k| k.issue);
+        match self {
+            Self::Number(n) => issue == Some(n),
+            Self::Missing => issue.is_none(),
+        }
+    }
+
+    /// 段の行を選び直す絞り込みの文字列（[`ProjectFilter::spec_of`] と対）
+    pub fn spec_of(key: &GroupKey) -> String {
+        key.issue
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| Self::MISSING.to_string())
+    }
+}
+
+/// 掘り下げの次の段（#2203）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drill {
+    pub by: By,
+    /// `--project` に渡す値（[`ProjectFilter::spec_of`]）
+    pub project: Option<String>,
+    /// `--issue` に渡す値（[`IssueFilter::spec_of`]）
+    pub issue: Option<String>,
+}
+
+/// 段の行を押したときの次の段と絞り込み（右パネルの usage ビューの 1 実装）。プロジェクト → Issue →
+/// 会話の順に掘り、会話とそのほかの段（モデル・日・種別など）は行き止まり（`None`）。
+/// 同じ段は `tako usage --by <by> --project <project> --issue <issue>` で CLI / MCP からも開ける
+pub fn drill(by: By, key: &GroupKey) -> Option<Drill> {
+    match by {
+        By::Project => Some(Drill {
+            by: By::Issue,
+            project: Some(ProjectFilter::spec_of(key)),
+            issue: None,
+        }),
+        By::Issue => Some(Drill {
+            by: By::Session,
+            project: Some(ProjectFilter::spec_of(key)),
+            issue: Some(IssueFilter::spec_of(key)),
+        }),
+        _ => None,
+    }
+}
+
 /// 問い合わせ
 #[derive(Debug, Clone, Copy)]
 pub struct Query<'a> {
@@ -468,10 +600,19 @@ pub struct Query<'a> {
     pub window: Window,
     /// tako のアカウント名で絞る
     pub account: Option<&'a str>,
-    /// プロジェクト（またはプロファイル）で絞る
-    pub project: Option<&'a str>,
+    /// プロジェクト（またはプロファイル・未分類）で絞る
+    pub project: Option<ProjectFilter<'a>>,
+    /// 主の Issue で絞る（#2203）
+    pub issue: Option<IssueFilter>,
     /// 段の上位の件数
     pub limit: usize,
+}
+
+impl Query<'_> {
+    /// 絞り込みがあるか（あるときは当たる行の無いログイン・観測だけのログインを出さない）
+    fn filtered(&self) -> bool {
+        self.account.is_some() || self.project.is_some() || self.issue.is_some()
+    }
 }
 
 /// 会話のログイン（mod の報告 = S1 の対応が正、無ければ置き場から推した鍵）
@@ -653,7 +794,7 @@ impl Acc {
     }
 }
 
-/// 段の絞り込み（`account` / `project`）に通るか
+/// 段の絞り込み（`account` / `project` / `issue`）に通るか
 fn passes(query: &Query<'_>, keys: Option<&SessionKeys>) -> bool {
     if let Some(account) = query.account {
         if keys.and_then(|k| k.account.as_deref()) != Some(account) {
@@ -661,7 +802,12 @@ fn passes(query: &Query<'_>, keys: Option<&SessionKeys>) -> bool {
         }
     }
     if let Some(project) = query.project {
-        if keys.and_then(|k| k.project.as_deref()) != Some(project) {
+        if !project.matches(keys) {
+            return false;
+        }
+    }
+    if let Some(issue) = query.issue {
+        if !issue.matches(keys) {
             return false;
         }
     }
@@ -873,7 +1019,7 @@ pub fn breakdown(
         }
     }
     // 使用量が無くても観測のあるログイン（claude.ai だけで使った等 = すべて tako の外）。絞り込みの無いときだけ
-    if query.account.is_none() && query.project.is_none() {
+    if !query.filtered() {
         for o in observations {
             if !logins.contains_key(&o.login) {
                 let entry = new_login(&o.login, o.key_from);
@@ -902,7 +1048,7 @@ pub fn breakdown(
             );
             let has_usage = p.total.responses > 0 || !p.total.tokens.is_zero();
             // 絞り込みのあるときは絞った後の分だけで決める（絞り込みに当たる行の無いログインは出さない）
-            let filtered = query.account.is_some() || query.project.is_some();
+            let filtered = query.filtered();
             let has_share = limit_share.iter().any(|k| {
                 k.estimated > 0.0
                     || if filtered {
@@ -1048,6 +1194,7 @@ mod tests {
             window,
             account: None,
             project: None,
+            issue: None,
             limit: 10,
         }
     }
@@ -1120,7 +1267,7 @@ mod tests {
             .name
             .starts_with("s1 worker tako #2201"));
         let mut q = query(By::Project, Window::All);
-        q.project = Some("tako");
+        q.project = Some(ProjectFilter::Named("tako"));
         let b = breakdown(&rows, &keys, &BTreeMap::new(), &[], &q, NOW, 0);
         assert_eq!(b.logins[0].total.sessions, 2);
     }
@@ -1289,7 +1436,7 @@ mod tests {
 
         // 絞り込み: tako の % は絞らないときと同じ（区間の Δ を独り占めしない）。当たらないログインは出さない
         let mut q = query(By::Project, Window::SevenDay);
-        q.project = Some("tako");
+        q.project = Some(ProjectFilter::Named("tako"));
         let b = breakdown(&rows, &keys, &BTreeMap::new(), &observations, &q, NOW, 0);
         assert_eq!(
             b.logins
@@ -1332,5 +1479,158 @@ mod tests {
             assert_eq!(Window::parse(w.as_str()), Some(w));
         }
         assert_eq!(Window::parse("7D"), Some(Window::SevenDay));
+    }
+
+    #[test]
+    fn 絞り込みの文字列を読む() {
+        use ProjectFilter as P;
+        assert_eq!(P::parse("tako"), Some(P::Named("tako")));
+        assert_eq!(P::parse(" project:tako "), Some(P::Project("tako")));
+        assert_eq!(P::parse("profile:default"), Some(P::Profile("default")));
+        assert_eq!(P::parse("none"), Some(P::Unclassified));
+        assert_eq!(
+            P::parse("project:none"),
+            Some(P::Project("none")),
+            "none という名前のプロジェクトは前置きで書く"
+        );
+        for bad in ["", "  ", "project:", "profile: "] {
+            assert_eq!(P::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(IssueFilter::parse("2203"), Some(IssueFilter::Number(2203)));
+        assert_eq!(IssueFilter::parse("#2203"), Some(IssueFilter::Number(2203)));
+        assert_eq!(IssueFilter::parse("none"), Some(IssueFilter::Missing));
+        for bad in ["", "#", "abc", "-1", "22a", "99999999999"] {
+            assert_eq!(IssueFilter::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    /// #2203: 段の行の鍵から作った絞り込み（`spec_of`）はその行だけを選び直す。同名のプロジェクトと
+    /// プロファイルを混ぜず、未分類・Issue なしも選べる（右パネルの掘り下げと `tako usage` が同じ値を使う）
+    #[test]
+    fn 段の行から作った絞り込みはその行だけを選ぶ() {
+        let (mut rows, mut keys) = fixture();
+        // s5: プロファイル default と同名のプロジェクト default（カタログ）
+        rows.push(row(NOW - 300, "s5", "claude-opus-5-5", 2_000_000));
+        let k = self::keys("s5", "L1", Some(("default", ProjectFrom::Catalog)), None);
+        keys.insert(k.session_id.clone(), k);
+        let r7 = NOW + 3 * 86_400;
+        let observations = vec![
+            limit("L1", "seven_day", 10.0, r7, 7200),
+            limit("L1", "seven_day", 14.0, r7, 1800),
+            limit("L1", "seven_day", 20.0, r7, 120),
+            limit("L2", "seven_day", 5.0, NOW + 86_400, 100),
+        ];
+        let run =
+            |q: &Query<'_>| breakdown(&rows, &keys, &BTreeMap::new(), &observations, q, NOW, 0);
+        let top = run(&query(By::Project, Window::SevenDay));
+        let mut checked = 0;
+        for login in &top.logins {
+            for g in &login.groups {
+                let spec = ProjectFilter::spec_of(&g.key);
+                let next = drill(By::Project, &g.key).expect("プロジェクトの行は掘れる");
+                assert_eq!(
+                    (next.by, next.project.as_deref(), next.issue),
+                    (By::Issue, Some(spec.as_str()), None)
+                );
+                let mut q = query(By::Issue, Window::SevenDay);
+                q.project = ProjectFilter::parse(&spec);
+                q.limit = 100;
+                let child = run(&q);
+                let l = child
+                    .logins
+                    .iter()
+                    .find(|c| c.login == login.login)
+                    .unwrap_or_else(|| panic!("{spec}: ログイン {} が消えた", login.login));
+                assert_eq!(l.total, g.totals, "{spec}: 掘った先の合計 = 押した行の量");
+                let pct = |gs: &Option<GroupShares>| {
+                    gs.and_then(|s| s.seven_day).map_or(0.0, |s| s.percent)
+                };
+                let sum: f64 = l.groups.iter().map(|c| pct(&c.limit_share)).sum();
+                assert!(
+                    (sum - pct(&g.limit_share)).abs() < 0.011 * l.groups.len() as f64,
+                    "{spec}: 子の % の和 {sum} = 行の % {}",
+                    pct(&g.limit_share)
+                );
+                // さらに Issue の行から会話へ
+                for c in &l.groups {
+                    let next = drill(By::Issue, &c.key).expect("Issue の行は掘れる");
+                    assert_eq!(next.by, By::Session);
+                    assert_eq!(
+                        next.project.as_deref(),
+                        Some(spec.as_str()),
+                        "Issue の行の鍵も同じプロジェクト"
+                    );
+                    let mut q = query(By::Session, Window::SevenDay);
+                    q.project = next.project.as_deref().and_then(ProjectFilter::parse);
+                    q.issue = next.issue.as_deref().and_then(IssueFilter::parse);
+                    q.limit = 100;
+                    let leaf = run(&q);
+                    let l = leaf.logins.iter().find(|x| x.login == login.login).unwrap();
+                    assert_eq!(
+                        l.total, c.totals,
+                        "{spec} {:?}: 会話の段の合計 = Issue の行",
+                        c.key.issue
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 4,
+            "tako / default（プロファイル）/ default（プロジェクト）/ 未分類: {checked}"
+        );
+        // 会話・ほかの段は行き止まり
+        for by in [
+            By::Session,
+            By::Model,
+            By::Day,
+            By::TaskType,
+            By::Account,
+            By::Role,
+            By::Login,
+        ] {
+            assert_eq!(drill(by, &GroupKey::default()), None, "{by:?}");
+        }
+        // 同名の 3 通り
+        let sessions_of = |p: &str| {
+            let mut q = query(By::Session, Window::All);
+            q.project = ProjectFilter::parse(p);
+            run(&q)
+                .logins
+                .iter()
+                .flat_map(|l| l.groups.iter().filter_map(|g| g.key.session.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut named = sessions_of("default");
+        named.sort();
+        assert_eq!(
+            named,
+            ["s3", "s5"],
+            "名前だけは S2 と同じ（プロジェクトか同名のプロファイル）"
+        );
+        assert_eq!(sessions_of("project:default"), ["s5"]);
+        assert_eq!(sessions_of("profile:default"), ["s3"]);
+        assert_eq!(sessions_of("none"), ["s4"]);
+        // Issue なし
+        let mut q = query(By::Session, Window::All);
+        q.issue = Some(IssueFilter::Missing);
+        let mut missing: Vec<String> = run(&q)
+            .logins
+            .iter()
+            .flat_map(|l| l.groups.iter().filter_map(|g| g.key.session.clone()))
+            .collect();
+        missing.sort();
+        assert_eq!(missing, ["s3", "s4", "s5"]);
+        // 絞り込みに当たる行の無いログイン・観測だけのログインは出さない
+        let mut q = query(By::Project, Window::SevenDay);
+        q.issue = Some(IssueFilter::Number(2201));
+        let b = run(&q);
+        assert_eq!(
+            b.logins
+                .iter()
+                .map(|l| l.login.as_str())
+                .collect::<Vec<_>>(),
+            ["L1"]
+        );
     }
 }

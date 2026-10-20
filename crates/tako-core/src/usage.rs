@@ -39,6 +39,7 @@
 //! `<CODEX_HOME>/auth.json` の `tokens.account_id` の塩付きハッシュ（[`codex_account_key`]）。
 
 pub mod codex;
+pub mod display;
 pub mod index;
 pub mod price;
 pub mod report;

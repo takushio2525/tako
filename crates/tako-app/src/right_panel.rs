@@ -5608,13 +5608,17 @@ impl TakoApp {
         // #1694: search タブも同じく条件つき（結果・走っている検索・失敗の理由を持っているか、
         // そのビューを選んでいるとき）。⇧⌘F でビューごと開くので、使っていない人の画面は変えない
         let search_tab = view == PanelView::Search || !self.workspace_search.is_empty();
+        // #2203: usage タブも同じく条件つき（このビューを選んでいるか、このセッションで開いたとき）。
+        // 入口はステータスバーの 5h / 7d・パレット・`tako panel --view usage` / `tako usage --show`
+        let usage_tab = self.usage_tab_visible();
         // 幅の見積りは先頭から数える（条件つきのタブは diagnostics → references → search の順に
         // ラベルが短くなるので、間のタブを出さずに後ろだけ出すときは前のラベルで見積もる
         // = 長い側へ倒れる = 溢れない）
         let tabs = PANEL_BASE_TABS
             + usize::from(diagnostics_tab)
             + usize::from(references_tab)
-            + usize::from(search_tab);
+            + usize::from(search_tab)
+            + usize::from(usage_tab);
         let density = if legacy_tabs {
             // A/B: 幅を見ない（= 直す前）
             PanelTabDensity::Full
@@ -5868,6 +5872,21 @@ impl TakoApp {
                                 )),
                             )
                         })
+                        .when(usage_tab, |row| {
+                            row.child(
+                                tab_button(
+                                    PANEL_TAB_LABELS[PANEL_BASE_TABS + 3],
+                                    crate::file_icons::ui_icon::TREND,
+                                    PanelView::Usage,
+                                    view == PanelView::Usage,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.open_usage_view(None, cx);
+                                    },
+                                )),
+                            )
+                        })
                         .child(div().flex_grow(1.0).min_w(px(0.0)))
                         .child(
                             div()
@@ -5898,6 +5917,7 @@ impl TakoApp {
                     PanelView::Diagnostics => self.render_diagnostics_view(cx).into_any_element(),
                     PanelView::References => self.render_references_view(cx).into_any_element(),
                     PanelView::Search => self.render_search_view(cx).into_any_element(),
+                    PanelView::Usage => self.render_usage_view(cx).into_any_element(),
                 })
                 .child(
                     // 左端のリサイズハンドル（ドラッグで幅調整）
@@ -5952,9 +5972,9 @@ pub(crate) fn legacy_1479() -> bool {
 }
 
 /// タブ列に並ぶラベル（**並び順そのもの**。描画も幅の見積りもここを読む）。
-/// 末尾の `diagnostics`（#1679）・`references`（#1685）・`search`（#1694）は条件つきで、
-/// 先頭の [`PANEL_BASE_TABS`] 本が常設
-pub(crate) const PANEL_TAB_LABELS: [&str; 7] = [
+/// 末尾の `diagnostics`（#1679）・`references`（#1685）・`search`（#1694）・`usage`（#2203）は
+/// 条件つきで、先頭の [`PANEL_BASE_TABS`] 本が常設
+pub(crate) const PANEL_TAB_LABELS: [&str; 8] = [
     "fleet",
     "orch",
     "git",
@@ -5962,6 +5982,7 @@ pub(crate) const PANEL_TAB_LABELS: [&str; 7] = [
     "diagnostics",
     "references",
     "search",
+    "usage",
 ];
 /// 常設のタブの数（fleet / orch / git / tasks）
 pub(crate) const PANEL_BASE_TABS: usize = 4;
@@ -6111,19 +6132,22 @@ mod tests {
 
     /// **選んだ段は必ず収まる**（= バッジが欠けない）。
     ///
-    /// `PANEL_MIN_WIDTH`（240px。#1694 で 220 から上げた）から 900px まで 1px 刻み × 代表的な件数で、
+    /// `PANEL_MIN_WIDTH`（264px。#1694 で 220 → 240、#2203 で 264 へ上げた）から 900px まで 1px 刻み ×
+    /// 代表的な件数で、
     /// [`panel_tab_density`] が返した段の要求幅が使える幅を超えないことを見る。
     /// #1479 の受け入れ条件（240 / 320 / 480 / 600 px × 0 / 9 / 22 / 150 件）を
     /// **全域で**含む
     #[test]
     fn 選んだ段はどの幅でも収まる() {
         // #1679: diagnostics タブが出ている 5 本でも同じ。#1685: references も出ている 6 本でも同じ。
-        // #1694: search も出ている 7 本でも同じ
+        // #1694: search も出ている 7 本でも同じ。#2203: usage も出ている 8 本でも同じ
+        assert_eq!(PANEL_TAB_LABELS[PANEL_BASE_TABS + 3], "usage");
         for tabs in [
             PANEL_BASE_TABS,
             PANEL_BASE_TABS + 1,
             PANEL_BASE_TABS + 2,
             PANEL_BASE_TABS + 3,
+            PANEL_BASE_TABS + 4,
         ] {
             for w in (crate::PANEL_MIN_WIDTH as u32)..=900 {
                 let panel_width = w as f32;

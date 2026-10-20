@@ -34,7 +34,7 @@ use tako_core::usage::{
 pub mod index;
 
 use index::{Indexer, UpdateOptions, UpdateOutcome};
-use tako_core::usage::report::{self, By, Window};
+use tako_core::usage::report::{self, By, IssueFilter, ProjectFilter, Window};
 use tako_core::usage::KeyFrom;
 
 /// 観測の履歴
@@ -414,8 +414,11 @@ pub struct UsageQuery {
     pub window: Option<String>,
     /// tako のアカウント名で絞る
     pub account: Option<String>,
-    /// プロジェクト（master はプロファイル名）で絞る
+    /// プロジェクト（master はプロファイル名）で絞る。`project:<キー>` / `profile:<名前>` / `none`（未分類）は
+    /// 段の行を 1 つだけ選ぶ形（#2203。[`report::ProjectFilter`]）
     pub project: Option<String>,
+    /// 主の Issue で絞る（`2203` / `#2203` / `none` = Issue なし。#2203）
+    pub issue: Option<String>,
     /// 段の上位の件数
     pub limit: Option<usize>,
 }
@@ -462,7 +465,34 @@ impl UsageQuery {
                 )
             })?,
         };
+        self.filters()?;
         Ok((by, window))
+    }
+
+    /// 絞り込み（`project` / `issue`）を読む（空は「絞らない」。読めない値は書き方つきで断る）
+    pub fn filters(&self) -> Result<(Option<ProjectFilter<'_>>, Option<IssueFilter>), String> {
+        fn set(v: &Option<String>) -> Option<&str> {
+            v.as_deref().filter(|s| !s.trim().is_empty())
+        }
+        let project = match set(&self.project) {
+            None => None,
+            Some(s) => Some(ProjectFilter::parse(s).ok_or_else(|| {
+                format!(
+                    "読めない project: {s:?}（<キー> / project:<キー> / profile:<名前> / {}）",
+                    ProjectFilter::UNCLASSIFIED
+                )
+            })?),
+        };
+        let issue = match set(&self.issue) {
+            None => None,
+            Some(s) => Some(IssueFilter::parse(s).ok_or_else(|| {
+                format!(
+                    "読めない issue: {s:?}（番号 / #番号 / {}）",
+                    IssueFilter::MISSING
+                )
+            })?),
+        };
+        Ok((project, issue))
     }
 }
 
@@ -658,6 +688,7 @@ pub fn payload_in(
     let (sessions, bad_sessions) = read_all::<SessionLogin>(&dir.join(SESSIONS_FILE));
     let s2_legacy = tako_core::usage::index::s2_legacy();
     let (by, window) = query.parsed().unwrap_or((By::Project, Window::SevenDay));
+    let (project_filter, issue_filter) = query.filters().unwrap_or((None, None));
     let mut extra = Vec::new();
     let mut breakdown = None;
     let mut agents: BTreeMap<String, &'static str> = BTreeMap::new();
@@ -685,7 +716,8 @@ pub fn payload_in(
                 by,
                 window,
                 account: query.account.as_deref(),
-                project: query.project.as_deref(),
+                project: project_filter,
+                issue: issue_filter,
                 limit: query.limit.unwrap_or(DEFAULT_LIMIT),
             },
             now_secs,
@@ -754,6 +786,20 @@ pub fn payload_in(
         Some(b) => {
             out["by"] = json!(b.by);
             out["window"] = json!(b.window);
+            // #2203: 効いた絞り込み（右パネルの掘り下げと照合できる。絞らない問い合わせには出さない）
+            let mut filter = serde_json::Map::new();
+            for (name, v) in [
+                ("account", &query.account),
+                ("project", &query.project),
+                ("issue", &query.issue),
+            ] {
+                if let Some(v) = v.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                    filter.insert(name.to_string(), json!(v));
+                }
+            }
+            if !filter.is_empty() {
+                out["filter"] = Value::Object(filter);
+            }
             out["price_table_as_of"] = json!(b.price_table_as_of);
             out["unpriced_models"] = json!(b.unpriced_models);
             if b.unkeyed_tokens > 0 {
@@ -1378,6 +1424,47 @@ mod tests {
         assert_eq!(u["total"]["sessions"], 2);
         assert_eq!(u["groups"].as_array().unwrap().len(), 1);
         assert_eq!(u["more_groups"], 1);
+        assert!(p.get("filter").is_some_and(|f| f["project"] == "tako"));
+        // #2203: Issue で絞る・段の行から選び直す形（右パネルの掘り下げと同じ値）
+        let q = UsageQuery {
+            by: Some("session".into()),
+            window: Some("all".into()),
+            project: Some("project:tako".into()),
+            issue: Some("#2201".into()),
+            ..UsageQuery::default()
+        };
+        let p = payload_in(&dir, &q, None, now, 0);
+        let u = &p["logins"][0]["usage"];
+        assert_eq!(u["total"]["sessions"], 1);
+        assert_eq!(u["groups"][0]["key"]["session"], "s1");
+        assert_eq!(p["filter"]["issue"], "#2201");
+        let q = UsageQuery {
+            by: Some("session".into()),
+            window: Some("all".into()),
+            issue: Some("none".into()),
+            ..UsageQuery::default()
+        };
+        let p = payload_in(&dir, &q, None, now, 0);
+        assert_eq!(p["logins"][0]["usage"]["groups"][0]["key"]["session"], "s2");
+        // 絞らない問い合わせには filter を出さない（空の値も絞らない）
+        let q = UsageQuery {
+            project: Some(" ".into()),
+            ..UsageQuery::default()
+        };
+        assert!(payload_in(&dir, &q, None, now, 0).get("filter").is_none());
+        // 読めない絞り込みは書き方つきで断る
+        for (project, issue, want) in [
+            (Some("project:"), None, "project:<キー>"),
+            (None, Some("abc"), "#番号"),
+        ] {
+            let bad = UsageQuery {
+                project: project.map(str::to_string),
+                issue: issue.map(str::to_string),
+                ..UsageQuery::default()
+            };
+            let e = bad.parsed().unwrap_err();
+            assert!(e.contains(want), "{e}");
+        }
         // 知らない段・期間は候補つきで断る
         let bad = UsageQuery {
             by: Some("branch".into()),

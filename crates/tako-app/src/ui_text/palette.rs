@@ -37,6 +37,11 @@ pub fn cmd_label(id: &str) -> &'static str {
         "panel-git" => tr!("git パネルを開く", "Open git panel"),
         // #1450 B2: 人がやること（ユーザー向けタスク）の一覧
         "panel-tasks" => tr!("tasks パネルを開く", "Open tasks panel"),
+        // #2203: 利用制限の使い道（ステータスバーの 5h / 7d と同じ画面）
+        "panel-usage" => tr!(
+            "usage パネルを開く（利用制限の使い道）",
+            "Open usage panel (usage limits breakdown)"
+        ),
         "split-right" => tr!("ペインを右に分割", "Split pane right"),
         "split-down" => tr!("ペインを下に分割", "Split pane down"),
         // #552: いまのタブ名を固定して自動リネームの上書きを止める
@@ -89,6 +94,7 @@ mod tests {
                 cmd_label("panel-orch").to_string(),
                 cmd_label("panel-git").to_string(),
                 cmd_label("panel-tasks").to_string(),
+                cmd_label("panel-usage").to_string(),
                 cmd_label("split-right").to_string(),
                 cmd_label("split-down").to_string(),
                 cmd_label("pin-tab-title").to_string(),

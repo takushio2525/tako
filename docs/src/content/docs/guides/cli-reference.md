@@ -1173,6 +1173,9 @@ tako sessions resume <session-id>       # 記録された cwd で復元（claude
 tako usage                              # ログインごとの 5h / 7d と、今の 7d の窓のプロジェクトの上位（7d / 5h の % つき）
 tako usage --by issue                   # Issue ごと（ほかに task-type / session / model / account / day / role）
 tako usage --window 5h                  # 期間（ほかに day / week / month / all）
+tako usage --project tako --by issue    # そのプロジェクトの Issue ごと
+tako usage --issue 2203 --by session    # その Issue の会話ごと（Issue なしは --issue none）
+tako usage --show                       # 同じ内容を右パネルの usage ビューでも開く
 ```
 
 `tako usage` は claude の会話記録から**使用量のメタデータだけ**（トークン数・モデル・時刻）を読んで索引を作り、
@@ -1188,6 +1191,13 @@ tako usage --window 5h                  # 期間（ほかに day / week / month 
 - **tako の外** — 観測の間にこの PC の会話記録の使用が無いのに % が増えた分（claude.ai・別の PC など）
 - **+ の付いた値（推定）** — 最後の観測より後や、観測の無い窓の使用量を、直近 7 日の「1% あたりの API 換算」で
   割った目安です。観測が無いログイン（tako mod の報告が無い）は % を出しません
+
+同じものは画面でも見られます。ステータスバーの 5h / 7d のメーターを押すと、右パネルの **usage ビュー**がその期間で
+開きます（mod が Claude Code の画面にバーを描いていてメーターが出ていないときは、サービス名を押したメニューの
+「利用制限の使い道を開く」から）。行を押すと「プロジェクト → Issue → 会話」と掘り下げられ、上のパンくずを押すと
+戻れます。数値は `tako usage` と同じ計算・同じ書式です。いま画面に出ている段は `tako usage` の `--by` / `--project` /
+`--issue` に 1:1 で対応し、`--show` を付けるとその段を画面で開けます（`--project` の `project:<キー>` /
+`profile:<名前>` / `none` は、同じ名前のプロジェクトとプロファイル・未分類を分けて選ぶ書き方です）。
 
 codex を使っていれば、codex のログインも同じ形で並びます（見出しに `codex・` が付きます）。codex が PC に残す
 rollout（`~/.codex/sessions/`）から、トークン数の累積と利用制限の % を**過去の分まで**読むので、tako mod の
@@ -1206,6 +1216,7 @@ tako panel --view tasks          # tasks = 人がやること（承認・レビ�
 tako panel --view diagnostics    # diagnostics = 言語サーバの診断（LSP の文書があるときだけタブが出る）
 tako panel --view references     # references = 参照・呼び出し階層・型階層の結果（ふだんは結果があるときだけタブが出る）
 tako panel --view search         # search = ワークスペース横断検索（⇧⌘F と同じ。ふだんは結果があるときだけタブが出る）
+tako panel --view usage          # usage = 利用制限の使い道（ステータスバーの 5h / 7d と同じ。ふだんは開いたときだけタブが出る）
 tako panel --hide
 tako panel --filetree on         # 左のファイルツリー
 tako panel --width 360

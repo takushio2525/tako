@@ -192,7 +192,7 @@ tako/
 | **tmux への再接続が止まったペインを繋ぎ直す（#1857）** | `tako persist reattach --pane N` |
 | **再起動後にエージェントが戻らないとき（#1076 / #1238 / #1554）** | `<data_dir>/persist.log` の「復元の内訳」 |
 | セッションカタログ（会話の発見・復元。#112 / #1069） | `tako sessions list [--role r] [--project p]` |
-| **利用制限の観測と使用量の内訳（ログイン → プロジェクト → Issue → 会話。#2200 / #2201）** | `tako usage [--by issue] [--window 5h]` |
+| **利用制限の観測と使用量の内訳（ログイン → プロジェクト → Issue → 会話。画面はステータスバーの 5h / 7d。#2200 / #2201 / #2203）** | `tako usage [--by issue] [--window 5h] [--show]` |
 | ペインの平文ログ（ペイン死亡後も出力を遡る。#112） | `tako logs list` |
 | **スクロールバック保持上限（直接ペインの RAM。#818）** | `tako scrollback [lines]` |
 | **フォーカスの無いペインの再描画の上限（CPU。#1979）** | `tako redraw-limit [fps]` |
@@ -215,7 +215,7 @@ tako/
 | Windows 対応状況ページのデータの生成（ページは docs のビルドが組む。#591 / #2104） | `cargo build -p tako-cli && node scripts/gen-windows-support-docs.mjs` |
 | **THIRD-PARTY-LICENSES.md を今の依存から作り直す（CI が --check でずれを落とす。#1851）** | `bash scripts/third-party-licenses.sh` |
 | **Windows のウインドウを実測する（#1063）** | `pwsh -File scripts/windows/measure-window.ps1 -TakoPid <pid>` |
-| 右パネルのビュー切替 | `tako panel --show --view <fleet\|orch\|git\|tasks\|diagnostics\|references\|search>` |
+| 右パネルのビュー切替 | `tako panel --show --view <fleet\|orch\|git\|tasks\|diagnostics\|references\|search\|usage>` |
 | Code Runner でファイル実行（#453） | `tako run <file> [--profile <name>]` |
 | 拡張子既定コマンド設定 | `tako run-default [ext] [command]` |
 | **実行環境・プロファイルを選んで覚える（ファイル / プロジェクト単位。#1731）** | `tako run-config <file> [--runtime <候補>]` |

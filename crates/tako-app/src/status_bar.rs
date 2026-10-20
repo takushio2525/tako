@@ -454,13 +454,63 @@ impl TakoApp {
             // 利用リミットメーター（Issue #321: サービス切替ドロップダウン + 「7d」表記）
             .child({
                 let has_data = limit_5h.is_some() || limit_week.is_some();
+                // #2203: 5h / 7d のメーターを押すと右パネルの usage ビューがその期間で開く
+                // （サービス名の側を押すと従来どおり切り替えのメニュー）
+                let tip_theme = theme.clone();
+                let probe_bounds = self.panel_click_probe_bounds.clone();
                 let meter = |label: &'static str, v: u32| {
                     let color = limit_color(v);
+                    // codex の P（primary）は 5h、S（secondary）は 7d の枠として開く
+                    let window = if matches!(label, "5h" | "P") {
+                        "5h"
+                    } else {
+                        "7d"
+                    };
+                    let tip_theme = tip_theme.clone();
+                    let probe = probe_bounds.clone();
+                    let probe_key = format!("statusbar-limit-{window}");
                     div()
+                        .id(SharedString::from(format!("statusbar-limit-{label}")))
+                        .relative()
                         .flex()
                         .flex_row()
                         .items_center()
                         .gap(px(5.0))
+                        .px(px(3.0))
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                        // 親（サービスの切り替えメニュー）と同じく押した瞬間に開く。親へは伝えない
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.limit_service_menu_open = false;
+                                this.limit_service_menu_anchor = None;
+                                this.open_usage_view(Some(window), cx);
+                            }),
+                        )
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                crate::tab_bar::HintTooltip::new(
+                                    crate::ui_text::panel::usage_open().to_string(),
+                                    tip_theme.clone(),
+                                )
+                            })
+                            .into()
+                        })
+                        .child(
+                            gpui::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| {
+                                    probe.borrow_mut().insert(probe_key.clone(), bounds);
+                                },
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        )
                         .child(div().text_color(hsla(theme.text_muted)).child(label))
                         .child(
                             div()
@@ -1026,6 +1076,56 @@ impl TakoApp {
                                     false,
                                 ))
                                 .child(row(LimitService::Agy, None, None, "5h", "7d", true)),
+                        )
+                        // #2203: 何に使ったかの内訳（右パネルの usage ビュー）。mod がバーを描いていて
+                        // ステータスバーに 5h / 7d が出ていないときも、ここから開ける
+                        .child(
+                            div()
+                                .id("limit-open-usage")
+                                .relative()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .mx(px(4.0))
+                                .mb(px(4.0))
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .border_t_1()
+                                .border_color(hsla(theme.border_subtle))
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.text_secondary))
+                                .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.limit_service_menu_open = false;
+                                    this.limit_service_menu_anchor = None;
+                                    this.open_usage_view(Some("7d"), cx);
+                                }))
+                                .child(
+                                    svg()
+                                        .path(ui_icon::TREND)
+                                        .size(px(12.0))
+                                        .text_color(hsla(theme.teal)),
+                                )
+                                .child(crate::ui_text::panel::usage_open())
+                                .child({
+                                    let probe = self.panel_click_probe_bounds.clone();
+                                    gpui::canvas(
+                                        |_, _, _| (),
+                                        move |bounds, _, _, _| {
+                                            probe
+                                                .borrow_mut()
+                                                .insert("limit-open-usage".to_string(), bounds);
+                                        },
+                                    )
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                }),
                         ),
                 )
                 .into_any_element(),
@@ -1285,6 +1385,11 @@ impl TakoApp {
             // 読みは background）。A/B の `TAKO_2052_LEGACY=1` は修正前と同じ引き直さない形
             if view == PanelView::Tasks && !tako_core::probe::issue2052_legacy() {
                 self.spawn_user_tasks_list(cx);
+            }
+            // #2203: usage は開いた瞬間に読み直す（読みは background）
+            if view == PanelView::Usage {
+                self.usage.pending = true;
+                self.drain_usage_pending(cx);
             }
         }
         cx.notify();
