@@ -119,11 +119,8 @@ fn 詰まる段は止められる型を返さない() {
         ("run_bootstrap_stage", "-> BootstrapOutcome", "Result"),
         ("run_bootstrap_for", "-> Vec<Remaining>", "Result"),
         ("configure_agent_mcp", "-> Vec<Remaining>", "Result"),
-        (
-            "run_dependency_check",
-            "(Vec<DetectedAgent>, Vec<Remaining>)",
-            "Vec<String>",
-        ),
+        // #1816 で検出結果（Tailscale）も運ぶ構造体へ。必須依存の不足は `missing: Vec<Remaining>`
+        ("run_dependency_check", "-> DepCheckOutcome", "Result"),
     ];
     for (name, want, forbid) in expectations {
         let head = text

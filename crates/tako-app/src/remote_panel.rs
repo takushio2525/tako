@@ -195,7 +195,10 @@ pub fn popover_position(
 ///
 /// `serve` だけ扱いが違う: 未設定（`not_configured`）は daemon 起動時に tako が自分で
 /// 設定するので不足ではない。`conflict` / `error`（tako 管理外の設定が既にある）は
-/// 起動が失敗するので不足として扱う（`remote::establish_tailscale_serve` と同じ判定）
+/// 起動が失敗するので不足として扱う（`remote::establish_tailscale_serve` と同じ判定）。
+///
+/// それ以外は `ok` でなければ不足（`missing` に加え、tailscale の `unrunnable` = 在るが動かない /
+/// `unknown` = 確かめられない も起動を妨げる。#1816）。言い分けは [`setup_item_status`] を読んだラベルが担う
 pub fn setup_blockers(setup: &Value) -> Vec<String> {
     let Some(items) = setup["items"].as_array() else {
         return Vec::new();
@@ -208,11 +211,22 @@ pub fn setup_blockers(setup: &Value) -> Vec<String> {
             let blocking = if item == "serve" {
                 matches!(status, "conflict" | "error")
             } else {
-                status == "missing"
+                status != "ok"
             };
             blocking.then(|| item.to_string())
         })
         .collect()
+}
+
+/// `check_status` の JSON で item `item` の `status`（無ければ空。不足項目のラベルの言い分けに使う = #1816）
+pub fn setup_item_status<'a>(setup: &'a Value, item: &str) -> &'a str {
+    setup["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["item"].as_str() == Some(item))
+        .and_then(|entry| entry["status"].as_str())
+        .unwrap_or("")
 }
 
 /// admin state を JSON から取り込む（background 取得結果を UI へ反映する）
@@ -1074,8 +1088,14 @@ impl TakoApp {
                     ),
             );
             for item in &blockers {
+                // tailscale は在るが動かない / 確かめられないを「未導入」と言い分ける（#1816）
+                let status = self
+                    .remote
+                    .setup
+                    .as_ref()
+                    .map_or("", |setup| setup_item_status(setup, item));
                 // 未知の item キーでも黙って消さず、キーをそのまま出す
-                let label = match text::setup_item_label(item) {
+                let label = match text::setup_item_label(item, status) {
                     "" => item.clone(),
                     l => l.to_string(),
                 };
@@ -1799,6 +1819,26 @@ mod tests {
         assert_eq!(setup_blockers(&conflict), vec!["serve"]);
         // items が無い / 壊れた JSON でも panic しない
         assert!(setup_blockers(&json!({})).is_empty());
+    }
+
+    /// 在るが動かない / 確かめられない tailscale も起動を妨げ、ラベルは「未導入」と言い分ける（#1816）
+    #[test]
+    fn setup_blockersは在るが動かないtailscaleを未導入と言い分ける() {
+        for (status, must_not) in [("unrunnable", "未導入"), ("unknown", "未導入")] {
+            let setup = json!({
+                "ready": false,
+                "items": [{ "item": "tailscale", "status": status, "detail": "/x/tailscale" }],
+            });
+            assert_eq!(setup_blockers(&setup), vec!["tailscale"], "{status}");
+            assert_eq!(setup_item_status(&setup, "tailscale"), status);
+            crate::ui_text::tests_support::for_each_lang(|| {
+                let label = crate::ui_text::remote::setup_item_label("tailscale", status);
+                assert!(!label.is_empty(), "{status}");
+                assert!(!label.contains(must_not), "{status}: {label}");
+            });
+        }
+        // 無い項目の status は空（ラベルは既定の文面へ落ちる）
+        assert_eq!(setup_item_status(&json!({}), "tailscale"), "");
     }
 
     #[test]

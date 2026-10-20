@@ -9,8 +9,9 @@
 //!
 //! ## この形
 //!
-//! 末尾は `remote_setup::setup_summary_lines()` の 1 実装が出す:
-//! `remote_setup::check_status()`（読み取りだけ）の JSON から `phone_readiness` が状態を決め、
+//! 末尾は `remote_setup::setup_summary_lines` の 1 実装が出す:
+//! `remote_setup::check_status`（読み取りだけ。#1816 から依存段の検出結果を `check_status_with` へ
+//! 渡して使い回す）の JSON から `phone_readiness` が状態を決め、
 //! `phone_readiness_line` が 1 行にする。Tailscale が未導入なら次の一手は依存の導入口
 //! （`setup_deps::next_step_line` = #1499 / #1524 の 1 実装）から引く。待ちは tailscale 側の
 //! 上限で打ち切られ、打ち切りは #1503 の文面で知らせる。
@@ -138,10 +139,11 @@ fn setupは状態を見ない固定文を出さない() {
 #[test]
 fn setupの末尾は状態の1実装を呼ぶ() {
     let view = non_comment(SETUP);
-    let calls = view.matches("remote_setup::setup_summary_lines()").count();
+    // #1816 から依存段の検出結果を引数で渡す（`setup_summary_lines(tailscale.as_ref())`）
+    let calls = view.matches("remote_setup::setup_summary_lines(").count();
     assert_eq!(
         calls, 1,
-        "{SETUP}: `remote_setup::setup_summary_lines()` の呼び出しが {calls} 件（期待 1）。\n\
+        "{SETUP}: `remote_setup::setup_summary_lines` の呼び出しが {calls} 件（期待 1）。\n\
          setup の末尾のリモート状態の行はこの 1 実装から出す（#1507）"
     );
 }
@@ -150,7 +152,10 @@ fn setupの末尾は状態の1実装を呼ぶ() {
 #[test]
 fn 要約はcheck_statusの結果だけから組む() {
     let (body, base) = fn_body(REMOTE_SETUP, "setup_summary_lines");
+    // #1816 から依存段の検出結果は `check_status_with` へ渡す（引き直さない）。依存表に
+    // Tailscale が無いときだけ `check_status()` で引く
     for needle in [
+        "check_status_with(",
         "check_status()",
         "phone_readiness(&status)",
         "phone_readiness_line(",
@@ -174,10 +179,11 @@ fn 要約はcheck_statusの結果だけから組む() {
 /// **4**: 未導入のときの次の一手は依存の導入口から引く（導入の案内を 2 か所で組まない）
 #[test]
 fn 未導入の次の一手は依存の導入口から引く() {
-    let (step, base) = fn_body(REMOTE_SETUP, "tailscale_install_step");
+    // #1816 で導入口の判定（旧 `tailscale_install_step`）は依存段の答えを使う `setup_summary_lines` の中へ
+    let (step, base) = fn_body(REMOTE_SETUP, "setup_summary_lines");
     assert!(
-        step.contains("setup_deps::next_step_line("),
-        "{REMOTE_SETUP}:{base}: `tailscale_install_step` が `setup_deps::next_step_line` を\
+        step.contains("setup_deps::next_step_line"),
+        "{REMOTE_SETUP}:{base}: `setup_summary_lines` が `setup_deps::next_step_line` を\
          通っていない。未導入の案内は依存チェック段と同じ文面にする（#1499 / #1524 / #1507）"
     );
     let (line, base) = fn_body(REMOTE_SETUP, "phone_readiness_line");
@@ -221,11 +227,12 @@ fn 打ち切りを未起動へ畳まない() {
         "{TAILSCALE}:{base}: `setup_status_on` が打ち切りを `timed_out` へ残していない。\n\
          残さないと setup の末尾が打ち切りを「起動していません」と言い切る（#1507）"
     );
-    let (check, base) = fn_body(REMOTE_SETUP, "check_status");
+    // #1816 で本体は検出の答えを受け取る `check_status_with` へ（`check_status` は検出 1 回を渡すだけ）
+    let (check, base) = fn_body(REMOTE_SETUP, "check_status_with");
     for needle in ["\"timeouts\"", "status.timed_out", "RunError::TimedOut("] {
         assert!(
             check.contains(needle),
-            "{REMOTE_SETUP}:{base}: `check_status` が `{needle}` を持っていない。\n\
+            "{REMOTE_SETUP}:{base}: `check_status_with` が `{needle}` を持っていない。\n\
              打ち切りは `timeouts` へ載せる（GUI / MCP からも読める = 設計原則 5。#1507）"
         );
     }

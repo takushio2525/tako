@@ -225,24 +225,16 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String>
         tailscale_reason: None,
     };
 
-    // Step 1: Tailscale 検出
-    let status = tailscale::setup_status();
-    if status.cli_path.is_none() {
-        result.steps.push(SetupStepResult {
-            step: "tailscale_detect",
-            status: "missing",
-            message: MissingItem::CliNotFound.describe(),
-        });
-        return Ok(serde_json::to_value(&result).unwrap());
-    }
+    // Step 1: Tailscale 検出（`status` は `check_status` の tailscale 項目と同じ語彙 = #1816）
+    let detection = tailscale::detect_tailscale();
     result.steps.push(SetupStepResult {
         step: "tailscale_detect",
-        status: "ok",
-        message: format!(
-            "Tailscale を検出: {}",
-            status.cli_path.as_deref().unwrap_or("?")
-        ),
+        status: detection.slug(),
+        message: detect_step_message(&detection),
     });
+    if !matches!(detection, tailscale::Detection::Runnable(_)) {
+        return Ok(serde_json::to_value(&result).unwrap());
+    }
 
     // Step 1.5: 使う Tailscale 系統を決める（#1038: GUI 版 / standalone が同居しうる）
     let decision = decide_variant(answers.tailscale.as_deref())?;
@@ -340,6 +332,29 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String>
     Ok(serde_json::to_value(&result).unwrap())
 }
 
+/// 検出の段（`tailscale_detect`）の 1 行（MCP `tako_remote_setup` の `run`。#1816）。
+/// 「在るが動かない」「確かめられない」を「未導入」と言わない（言うと 2 系統目を入れさせる）
+fn detect_step_message(detection: &tailscale::Detection) -> String {
+    match detection {
+        tailscale::Detection::Runnable(path) => format!("Tailscale を検出: {path}"),
+        tailscale::Detection::Unrunnable(path) => format!(
+            "Tailscale は入っていますが実行できません（{path}）。{}",
+            tailscale::UNRUNNABLE_HINT
+        ),
+        tailscale::Detection::Absent => MissingItem::CliNotFound.describe(),
+        tailscale::Detection::Unconfirmed(notice) => unconfirmed_message(notice),
+    }
+}
+
+/// 無いと確かめられなかった（ログインシェルを打ち切った = #1816）ときの 1 行
+fn unconfirmed_message(notice: &tako_core::probe::TimeoutNotice) -> String {
+    format!(
+        "Tailscale が入っているかを確かめられません（ログインシェルが {} 秒で応答なし）。\
+         .zprofile などのログインシェルの設定が入力を待っていないか確かめてください",
+        notice.waited_secs
+    )
+}
+
 /// スマホ側のセットアップ手順（導線 B。ウィザード末尾と docs で同じ文面を使う）
 pub fn phone_setup_instructions(ts_url: &str) -> String {
     format!(
@@ -416,48 +431,56 @@ pub fn run_interactive(
     writeln!(writer, "==================").map_err(|e| e.to_string())?;
     writeln!(writer).map_err(|e| e.to_string())?;
 
-    // Step 1: Tailscale 検出
+    // Step 1: Tailscale 検出（引くのは 1 回 = #1816。`--version` が固まる CLI で上限 10 秒を 2 度待たない）
     write!(writer, "[1/5] Tailscale を検出中... ").map_err(|e| e.to_string())?;
     let _ = writer.flush();
-    let status = tailscale::setup_status();
-
-    if status.cli_path.is_none() {
+    match tailscale::detect_tailscale() {
+        tailscale::Detection::Runnable(path) => {
+            writeln!(writer, "OK ({path})").map_err(|e| e.to_string())?;
+        }
         // 在るが実行できない（`--version` が固まる / 非 0）は「未導入」と言わず、入れ直させない。
         // 依存の導入口は「在る」ものを導入済みとして飛ばすので、そのまま渡すと
         // 「確認を省略してインストールします」と言ったまま何もせずに終わる（#1797）
-        if let tailscale::Detection::Unrunnable(path) = tailscale::detect_tailscale() {
+        tailscale::Detection::Unrunnable(path) => {
             writeln!(writer, "実行できません ({path})").map_err(|e| e.to_string())?;
             writeln!(
                 writer,
-                "  Tailscale は入っていますが応答しません。入れ直す前に、Tailscale の起動し直しか更新を試してください。"
+                "  Tailscale は入っていますが応答しません。{}。",
+                tailscale::UNRUNNABLE_HINT
             )
             .map_err(|e| e.to_string())?;
             return Err("Tailscale を実行できません".into());
         }
-        writeln!(writer, "未導入").map_err(|e| e.to_string())?;
-        writeln!(writer).map_err(|e| e.to_string())?;
-        match install_tailscale(auto_yes, writer)? {
-            Some(path) => {
-                writeln!(writer, "  導入しました: {path}").map_err(|e| e.to_string())?;
+        // 無いと確かめられなかった（ログインシェルを打ち切った = #1816）。入っているかも
+        // しれないものを入れ直さない（#1533 と同じ扱い）
+        tailscale::Detection::Unconfirmed(notice) => {
+            writeln!(writer, "確認できません").map_err(|e| e.to_string())?;
+            writeln!(writer, "  {}", unconfirmed_message(&notice)).map_err(|e| e.to_string())?;
+            return Err("Tailscale を確かめられません".into());
+        }
+        tailscale::Detection::Absent => {
+            writeln!(writer, "未導入").map_err(|e| e.to_string())?;
+            writeln!(writer).map_err(|e| e.to_string())?;
+            match install_tailscale(auto_yes, writer)? {
+                Some(path) => {
+                    writeln!(writer, "  導入しました: {path}").map_err(|e| e.to_string())?;
+                }
+                None => {
+                    writeln!(
+                        writer,
+                        "インストール後に再度 `tako remote setup` を実行してください。"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    return Err("Tailscale が未導入".into());
+                }
             }
-            None => {
-                writeln!(
-                    writer,
-                    "インストール後に再度 `tako remote setup` を実行してください。"
-                )
-                .map_err(|e| e.to_string())?;
-                return Err("Tailscale が未導入".into());
+            // 導入できたと言えるかは**この先の段が引けるか**で決まる。`setup_deps` の
+            // 再検出は「在るか」（動かない CLI も導入済みと答える = #1797）なので、
+            // ここでもう一度「実行できるか」（`find_tailscale`）で確かめる
+            if tailscale::find_tailscale().is_none() {
+                return Err("インストール後も Tailscale を検出できません。".into());
             }
         }
-        // 導入できたと言えるかは**この先の段が引けるか**で決まる。`setup_deps` の
-        // 再検出は「在るか」（動かない CLI も導入済みと答える = #1797）なので、
-        // ここでもう一度「実行できるか」（`find_tailscale`）で確かめる
-        if tailscale::setup_status().cli_path.is_none() {
-            return Err("インストール後も Tailscale を検出できません。".into());
-        }
-    } else {
-        writeln!(writer, "OK ({})", status.cli_path.as_deref().unwrap_or("?"))
-            .map_err(|e| e.to_string())?;
     }
 
     // Step 1.5: 使う Tailscale 系統を決める（#1038）
@@ -661,17 +684,38 @@ fn install_tailscale(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Optio
 /// dispatch `RemoteSetup { action: "check" }` が同じこれを読む。
 ///
 /// 待ちは tailscale 側の上限（1 回 10 秒）で打ち切られ、打ち切ったものは `timeouts`
-/// （`label` / `waited_secs`。#1503 の知らせと同じ形）へ載る。空なら全部を確かめられた
+/// （`label` / `waited_secs`。#1503 の知らせと同じ形）へ載る。空なら全部を確かめられた。
+///
+/// `tailscale` 項目の `status` は検出の正本の答えをそのまま言い分ける（#1816）:
+/// `ok`（動く）/ `unrunnable`（在るが `--version` が固まる・非 0 = 入れ直させない）/
+/// `missing`（無い）/ `unknown`（ログインシェルを打ち切り、無いと確かめられなかった。
+/// 打ち切りは `timeouts` にも載る）。`detail` は在るならそのパス
 pub fn check_status() -> Value {
-    let status = tailscale::setup_status();
+    check_status_with(tailscale::detect_tailscale())
+}
+
+/// 検出の答えを受け取る [`check_status`]（#1816。`tako setup` は依存段で引いた答えを渡し、
+/// 上限 10 秒の検出を 1 回の実行で何度も待たない）
+pub fn check_status_with(detection: tailscale::Detection) -> Value {
+    let status = tailscale::setup_status_with(detection.clone().into_runnable());
     let mut items = Vec::new();
-    let mut timeouts: Vec<tako_core::probe::TimeoutNotice> =
-        status.timed_out.iter().cloned().collect();
+    let mut timeouts: Vec<tako_core::probe::TimeoutNotice> = detection
+        .unconfirmed()
+        .into_iter()
+        .chain(status.timed_out.iter())
+        .cloned()
+        .collect();
 
     items.push(json!({
         "item": "tailscale",
-        "status": if status.cli_path.is_some() { "ok" } else { "missing" },
-        "detail": status.cli_path.as_deref().unwrap_or("未導入"),
+        "status": detection.slug(),
+        "detail": match &detection {
+            tailscale::Detection::Runnable(path) | tailscale::Detection::Unrunnable(path) => {
+                path.as_str()
+            }
+            tailscale::Detection::Absent => "未導入",
+            tailscale::Detection::Unconfirmed(_) => "確認できません",
+        },
     }));
     items.push(json!({
         "item": "daemon",
@@ -755,6 +799,8 @@ pub enum PhoneReadiness {
     Unknown,
     /// Tailscale が見つからない
     TailscaleMissing,
+    /// Tailscale は在るが実行できない（`--version` が固まる / 非 0。#1797 / #1816）= 導入を勧めない
+    TailscaleUnrunnable,
     /// tailscaled に繋がらない
     DaemonNotRunning,
     /// 未ログイン（BackendState = NeedsLogin）
@@ -785,9 +831,12 @@ pub fn phone_readiness(status: &Value) -> PhoneReadiness {
             .flatten()
             .find(|entry| entry["item"].as_str() == Some(key))
     };
-    let is_ok = |key: &str| item(key).and_then(|e| e["status"].as_str()) == Some("ok");
-    if !is_ok("tailscale") {
-        return PhoneReadiness::TailscaleMissing;
+    let status_of = |key: &str| item(key).and_then(|e| e["status"].as_str());
+    let is_ok = |key: &str| status_of(key) == Some("ok");
+    match status_of("tailscale") {
+        Some("ok") => {}
+        Some("unrunnable") => return PhoneReadiness::TailscaleUnrunnable,
+        _ => return PhoneReadiness::TailscaleMissing,
     }
     if !is_ok("daemon") {
         return PhoneReadiness::DaemonNotRunning;
@@ -841,9 +890,13 @@ pub fn phone_readiness_line(readiness: &PhoneReadiness, install_step: Option<&st
         PhoneReadiness::Unknown => format!("状態を確認できませんでした。{RECHECK}"),
         PhoneReadiness::TailscaleMissing => match install_step {
             Some(step) => format!("Tailscale が未導入です。{step}"),
-            // 在るが実行できない（`--version` が固まる / 非 0。#1797）= 導入を勧めない
-            None => format!("Tailscale を実行できませんでした。{RECHECK}"),
+            // 依存表に導入口が無い = 導入はウィザード（[1/5] が案内する）へ任せる
+            None => format!("Tailscale が未導入です。{SETUP}"),
         },
+        // 在るが実行できない（`--version` が固まる / 非 0。#1797 / #1816）= 導入を勧めない
+        PhoneReadiness::TailscaleUnrunnable => {
+            format!("Tailscale を実行できませんでした。{RECHECK}")
+        }
         PhoneReadiness::DaemonNotRunning => format!("Tailscale が起動していません。{SETUP}"),
         PhoneReadiness::NotLoggedIn => format!("Tailscale にログインしていません。{SETUP}"),
         PhoneReadiness::BackendNotRunning(state) => {
@@ -876,12 +929,31 @@ pub fn phone_readiness_line(readiness: &PhoneReadiness, install_step: Option<&st
 /// 3. 最後に [`PHONE_LINE_HEAD`] で始まる 1 行
 ///
 /// Tailscale の導入を**勧める・聞く**のは依存チェック段の 1 回だけ（#1499 / #1524）。
-/// ここで聞き直すと同じ実行で 2 度聞くことになるので、未導入なら導入口を指すだけにする
-pub fn setup_summary_lines() -> Vec<String> {
-    let status = check_status();
+/// ここで聞き直すと同じ実行で 2 度聞くことになるので、未導入なら導入口を指すだけにする。
+///
+/// `tailscale_dep` = 依存段が引いた Tailscale の検出結果（#1816）。**検出を引き直さずに使い回す**
+/// （上限 10 秒の検出が 1 回の実行で 3 回走り、`--version` が固まる CLI で setup が 3 倍に延びていた）。
+/// `None` ならここで 1 回だけ引く
+pub fn setup_summary_lines(tailscale_dep: Option<&setup_deps::DepStatus>) -> Vec<String> {
+    let fresh;
+    let state = match tailscale_dep {
+        Some(state) => Some(state),
+        None => {
+            fresh = setup_deps::status_of(TAILSCALE_DEP);
+            fresh.as_ref()
+        }
+    };
+    let status = match state.and_then(|s| s.detection.clone()) {
+        Some(detection) => check_status_with(detection),
+        // 依存表に Tailscale が無い（推測で作らない = `status_of`）ときだけ、ここで引く
+        None => check_status(),
+    };
     let readiness = phone_readiness(&status);
+    // 未導入のときの「次に打つ 1 行」は依存表の同じ答えから作る（導入口 = #1499 / #1524 の 1 実装）
     let install_step = match readiness {
-        PhoneReadiness::TailscaleMissing => tailscale_install_step(),
+        PhoneReadiness::TailscaleMissing => state
+            .filter(|s| s.found.is_none())
+            .map(setup_deps::next_step_line),
         _ => None,
     };
     status_timeouts(&status)
@@ -892,19 +964,6 @@ pub fn setup_summary_lines() -> Vec<String> {
             install_step.as_deref(),
         )))
         .collect()
-}
-
-/// Tailscale が未導入のときの「次に打つ 1 行」（依存表の側でも見つからないときだけ）。
-///
-/// 依存表の検出（`setup_deps::status_of`）と `check_status` は同じ正本
-/// （`tailscale::detect_tailscale`）を読む（#1797）。こちらで見つかるのに `check_status` が
-/// 未導入と言うのは「在るが実行できない」ときだけで、そのときは入れ直させない
-fn tailscale_install_step() -> Option<String> {
-    let state = setup_deps::status_of(TAILSCALE_DEP)?;
-    state
-        .found
-        .is_none()
-        .then(|| setup_deps::next_step_line(&state))
 }
 
 #[cfg(test)]
@@ -1066,13 +1125,97 @@ mod tests {
         assert!(status_timeouts(&json!({ "timeouts": [{ "label": 1 }] })).is_empty());
     }
 
-    /// 未導入なのに導入口が引けない（在るが実行できない = #1797）ときは導入を勧めない
+    /// 依存表に導入口が無ければ導入コマンドを組み立てず、ウィザードへ任せる
     #[test]
     fn 導入口が無ければ導入を勧めない() {
         let status = status_json(Some("tailscale"), "", None);
         assert_eq!(
             phone_readiness_line(&phone_readiness(&status), None),
+            "スマホからの接続: Tailscale が未導入です。設定する: tako remote setup"
+        );
+    }
+
+    /// 在るが実行できない（`check_status` の tailscale 項目が `unrunnable` = #1797 / #1816）ときは
+    /// 導入口を渡されても導入を勧めない（入れ直すと 2 系統目になる）
+    #[test]
+    fn 在るが動かないcliには導入を勧めない() {
+        let mut status = status_json(Some("tailscale"), "", None);
+        status["items"][0]["status"] = json!("unrunnable");
+        assert_eq!(
+            phone_readiness(&status),
+            PhoneReadiness::TailscaleUnrunnable
+        );
+        assert_eq!(
+            line_of(&status),
             "スマホからの接続: Tailscale を実行できませんでした。確かめ直す: tako remote setup"
+        );
+    }
+
+    /// `check_status` の tailscale 項目は検出の答えを 4 通りで言い分ける（#1816）。
+    /// 検出を引かずに答えを渡す（`check_status_with`）ので、実機の Tailscale は 1 度も起こさない
+    #[test]
+    fn check_statusはtailscaleの検出を4通りで言い分ける() {
+        let notice = tako_core::probe::TimeoutNotice {
+            label: "zsh -l -c command -v tailscale".into(),
+            waited_secs: 5,
+        };
+        // 実行できない置き場（動く CLI を渡すと `status --json` を本当に聞きに行くので渡さない）
+        let cases = [
+            (
+                tailscale::Detection::Unrunnable("/x/tailscale".into()),
+                "unrunnable",
+                "/x/tailscale",
+                PhoneReadiness::TailscaleUnrunnable,
+            ),
+            (
+                tailscale::Detection::Absent,
+                "missing",
+                "未導入",
+                PhoneReadiness::TailscaleMissing,
+            ),
+            (
+                tailscale::Detection::Unconfirmed(notice.clone()),
+                "unknown",
+                "確認できません",
+                PhoneReadiness::Unknown,
+            ),
+        ];
+        for (detection, status, detail, readiness) in cases {
+            let value = check_status_with(detection.clone());
+            let item = &value["items"][0];
+            assert_eq!(item["item"], "tailscale", "{detection:?}: {value}");
+            assert_eq!(item["status"], status, "{detection:?}: {value}");
+            assert_eq!(item["detail"], detail, "{detection:?}: {value}");
+            assert_eq!(value["ready"], false, "{detection:?}: {value}");
+            assert_eq!(phone_readiness(&value), readiness, "{detection:?}: {value}");
+        }
+        // 打ち切りは `timeouts` にも載る（末尾の 1 行が「確認できませんでした」と言う材料）
+        let value = check_status_with(tailscale::Detection::Unconfirmed(notice.clone()));
+        assert_eq!(status_timeouts(&value), vec![notice]);
+    }
+
+    /// `run`（MCP `tako_remote_setup`）の検出の段も「未導入」と言い分ける（#1816）
+    #[test]
+    fn 検出の段は在るが動かないcliを未導入と言わない() {
+        let unrunnable =
+            detect_step_message(&tailscale::Detection::Unrunnable("/x/tailscale".into()));
+        assert!(unrunnable.contains("/x/tailscale"), "{unrunnable}");
+        assert!(
+            unrunnable.contains(tailscale::UNRUNNABLE_HINT),
+            "{unrunnable}"
+        );
+        assert!(!unrunnable.contains("未導入"), "{unrunnable}");
+        let unknown = detect_step_message(&tailscale::Detection::Unconfirmed(
+            tako_core::probe::TimeoutNotice {
+                label: "zsh -l -c command -v tailscale".into(),
+                waited_secs: 5,
+            },
+        ));
+        assert!(!unknown.contains("未導入"), "{unknown}");
+        assert!(unknown.contains("5 秒"), "{unknown}");
+        assert_eq!(
+            detect_step_message(&tailscale::Detection::Absent),
+            MissingItem::CliNotFound.describe()
         );
     }
 
@@ -1082,6 +1225,7 @@ mod tests {
         let all = [
             PhoneReadiness::Unknown,
             PhoneReadiness::TailscaleMissing,
+            PhoneReadiness::TailscaleUnrunnable,
             PhoneReadiness::DaemonNotRunning,
             PhoneReadiness::NotLoggedIn,
             PhoneReadiness::BackendNotRunning("Stopped".into()),

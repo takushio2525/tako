@@ -195,6 +195,16 @@ pub struct DepStatus {
     /// 立っていて `found` が無ければ、未導入ではなく**導入済みかを確かめられなかった**
     /// = 導入へは進まない（入っているかもしれないものを `--yes` で入れ直さない）
     pub lookup_timeout: Option<tako_core::probe::TimeoutNotice>,
+    /// 検出の正本の答えそのもの（**tailscale だけ**。他は `None`）。
+    /// 「在るが動かない」を言い分ける材料で、`tako setup` の末尾の 1 行もこれを使い回す
+    /// （検出を引き直さない = #1816）
+    pub detection: Option<crate::tailscale::Detection>,
+}
+
+/// 「在るが動かない」依存の 1 句（[`DepStatus::unrunnable_text`] と、JSON から組み直す
+/// `tako setup deps` の表示が通す 1 実装。#1816）
+pub fn unrunnable_line(bin: &str, path: &str) -> String {
+    format!("{bin}: 在りますが実行できません（{path}）")
 }
 
 impl DepStatus {
@@ -218,7 +228,31 @@ impl DepStatus {
                 "label": n.label,
                 "waited_secs": n.waited_secs,
             })),
+            // #1816: 起動して確かめた答え（true = 動く / false = 在るが動かない /
+            // null = 確かめていない・無い。確かめるのは tailscale だけ）
+            "runnable": match &self.detection {
+                Some(crate::tailscale::Detection::Runnable(_)) => json!(true),
+                Some(crate::tailscale::Detection::Unrunnable(_)) => json!(false),
+                _ => Value::Null,
+            },
         })
+    }
+
+    /// 在るが動かない（`--version` が上限内に正常終了しない）か。確かめるのは tailscale だけ（#1797 / #1816）
+    pub fn unrunnable(&self) -> bool {
+        matches!(
+            self.detection,
+            Some(crate::tailscale::Detection::Unrunnable(_))
+        )
+    }
+
+    /// 在るが動かないときに人へ出す 1 句（`tako setup` の依存段・`--check` が同じ文面を出す。#1816）。
+    /// `[OK]` とは言わない: 在るので入れ直させないが、remote は使えない
+    pub fn unrunnable_text(&self) -> Option<String> {
+        self.found
+            .as_deref()
+            .filter(|_| self.unrunnable())
+            .map(|path| unrunnable_line(self.dep.bin, path))
     }
 
     /// 見つからないのが検出の打ち切りのせい（= 確かめられなかった）ならその知らせ（#1533）
@@ -385,21 +419,44 @@ fn resolve_container() -> Option<String> {
 /// tailscale は PATH を見ない（#1797）。答えは remote と同じ検出の正本
 /// （[`resolve_tailscale`]）だけから出す
 pub fn resolve(dep: &ExternalDep) -> Option<String> {
-    resolve_bounded(dep).0
+    resolve_bounded(dep).found
+}
+
+/// 依存 1 件の解決結果（[`resolve_bounded`] の答え）
+struct Resolved {
+    found: Option<String>,
+    /// 探索（ログインシェルの `command -v`）を上限で打ち切った（#1533）
+    timeout: Option<tako_core::probe::TimeoutNotice>,
+    /// 検出の正本の答え（tailscale だけ。#1816）
+    detection: Option<crate::tailscale::Detection>,
 }
 
 /// [`resolve`] の、PATH の探索の打ち切り（#1533）を呼び手まで運ぶ版。
 /// 器（tmux / psmux）は PATH で見つからなくても tako が実際に使う器の答えへ落ちる
 /// （打ち切っても、器の解決 = `bin_resolve` が答えたなら見つかったことにする）
-fn resolve_bounded(dep: &ExternalDep) -> (Option<String>, Option<tako_core::probe::TimeoutNotice>) {
+fn resolve_bounded(dep: &ExternalDep) -> Resolved {
     if is_tailscale(dep) {
-        return (resolve_tailscale(), None);
+        let detection = resolve_tailscale();
+        return Resolved {
+            found: detection.clone().into_present().map(display_path),
+            // ログインシェルを打ち切って無いと確かめられなかった（#1816）= 他の依存の #1533 と同じ扱い
+            timeout: detection.unconfirmed().cloned(),
+            detection: Some(detection),
+        };
     }
     let found = tako_core::platform::exe::find_bounded(dep.bin);
     if found.path.is_some() || !is_container(dep) {
-        return (found.path, found.timeout);
+        return Resolved {
+            found: found.path,
+            timeout: found.timeout,
+            detection: None,
+        };
     }
-    (resolve_container(), found.timeout)
+    Resolved {
+        found: resolve_container(),
+        timeout: found.timeout,
+        detection: None,
+    }
 }
 
 /// tailscale は **remote が使う検出**（`tailscale::detect_tailscale`）の答えを返す（#1797）。
@@ -411,11 +468,10 @@ fn resolve_bounded(dep: &ExternalDep) -> (Option<String>, Option<tako_core::prob
 /// 正本を通すので、依存段だけが食い違っていた。
 ///
 /// 「在るが動かない」（`--version` が固まる / 非 0）も**導入済み**と答える（入れ直させない）。
-/// 末尾の 1 行はこの答えを見て「実行できませんでした」と言い分ける（`tailscale_install_step`）
-fn resolve_tailscale() -> Option<String> {
+/// 依存段は `[OK]` と言わず `[警告]` で言い分け（[`DepStatus::unrunnable_text`]）、末尾の 1 行は
+/// この答えを使い回して「実行できませんでした」と言う（#1816）
+fn resolve_tailscale() -> crate::tailscale::Detection {
     crate::tailscale::detect_tailscale()
-        .into_present()
-        .map(display_path)
 }
 
 /// 正本が素の名前（PATH の `tailscale`）で答えたときだけ、表示用に絶対パスへ直す。
@@ -472,17 +528,18 @@ impl InstallerMemo {
 /// 検出を上限で打ち切った依存は導入へ進まないので、導入器も引かない（同じログインシェルを
 /// もう一度上限まで待つだけ = #1533）
 fn probe(dep: ExternalDep, installers: &mut InstallerMemo) -> DepStatus {
-    let (found, lookup_timeout) = resolve_bounded(&dep);
-    let unconfirmed = found.is_none() && lookup_timeout.is_some();
+    let resolved = resolve_bounded(&dep);
+    let unconfirmed = resolved.found.is_none() && resolved.timeout.is_some();
     let installer_found = dep
         .installer
         .filter(|_| !unconfirmed)
         .and_then(|i| installers.find(i.program()));
     DepStatus {
         dep,
-        found,
+        found: resolved.found,
         installer_found,
-        lookup_timeout,
+        lookup_timeout: resolved.timeout,
+        detection: resolved.detection,
     }
 }
 
@@ -1014,6 +1071,36 @@ mod tests {
     // 導入まで通す検査は実経路テスト `scripts/test-remote-setup-deps-1509.sh`
     // （隔離 HOME + brew スタブ）の担当
 
+    /// 在るが動かない tailscale は `found` を持っても `[OK]` の材料にせず、1 句と JSON で言い分ける（#1816）
+    #[test]
+    fn 在るが動かない依存を言い分ける() {
+        use crate::tailscale::Detection;
+        let mut state = fake_status(None, None);
+        state.found = Some("/x/tailscale".into());
+        state.detection = Some(Detection::Unrunnable("/x/tailscale".into()));
+        assert!(state.unrunnable());
+        assert_eq!(
+            state.unrunnable_text().as_deref(),
+            Some("tailscale: 在りますが実行できません（/x/tailscale）")
+        );
+        assert_eq!(state.to_json()["runnable"], false);
+        assert!(
+            state.unconfirmed().is_none(),
+            "在るので「確認できません」ではない"
+        );
+
+        state.detection = Some(Detection::Runnable("/x/tailscale".into()));
+        assert!(state.unrunnable_text().is_none());
+        assert_eq!(state.to_json()["runnable"], true);
+
+        // 確かめていない依存（tmux / git）と無い依存は null（「動く」とも「動かない」とも言わない）
+        state.detection = None;
+        assert!(state.to_json()["runnable"].is_null());
+        state.found = None;
+        state.detection = Some(Detection::Absent);
+        assert!(state.to_json()["runnable"].is_null());
+    }
+
     /// 検出結果を組み立てる（導入器の解決結果まで指定できるのはこのモジュールだけ）
     fn fake_status(installer: Option<DepInstaller>, installer_found: Option<&str>) -> DepStatus {
         DepStatus {
@@ -1027,6 +1114,7 @@ mod tests {
             found: None,
             installer_found: installer_found.map(str::to_string),
             lookup_timeout: None,
+            detection: None,
         }
     }
 

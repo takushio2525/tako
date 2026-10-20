@@ -388,6 +388,13 @@ jobs:
       # **導入が `setup_deps` を通らない形（brew の直叩き）へ戻ったらここで落ちる**（#1509）
       - name: remote setup の依存導入の実経路テスト
         run: bash scripts/test-remote-setup-deps-1509.sh
+      # tailscale の検出（#1816）の実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH + tailscale /
+      # brew / ログインシェルのスタブで、`TAKO_TAILSCALE_BIN` を隔離側へ向けるので実機の
+      # Tailscale にも tailnet にも触らない。**「在るが動かない」CLI を `[OK]` / 「未導入」と言う形・
+      # `tako setup` が検出を 3 回待つ形・ログインシェルの PATH にだけ在る CLI を見落として
+      # `--yes` で brew 版を重ねて入れる形へ戻ったらここで落ちる**（#1816）
+      - name: tailscale の検出の実経路テスト
+        run: bash scripts/test-tailscale-detect-1816.sh
       # `tako setup --check` と `tako check-health` が**同じ 1 実装**から項目を出すことの
       # 実経路テスト。隔離 HOME / TAKO_DATA_DIR / PATH + claude / codex / agy / tmux /
       # git / tailscale のスタブで、本番の設定にも GUI にも触らない（CI では GUI を

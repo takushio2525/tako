@@ -1209,7 +1209,17 @@ impl DepCheckMode {
     }
 }
 
-/// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` で表示し、
+/// 依存チェック段の結果。**詰まっても止めない**（#1501）
+struct DepCheckOutcome {
+    /// 検出したエージェント
+    agents: Vec<DetectedAgent>,
+    /// チェック後も欠けている必須依存（人へ残る作業）
+    missing: Vec<Remaining>,
+    /// Tailscale の検出結果（段を終えた後の状態）。末尾の 1 行が検出を引き直さずに使う（#1816）
+    tailscale: Option<setup_deps::DepStatus>,
+}
+
+/// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` / `[警告]` で表示し、
 /// 未導入の CLI 依存は「何を・どの導入器で・どこへ入れるか」を見せて
 /// `[y/N]` を聞く（#1499。`--yes` は同意扱い・非 TTY は案内だけで素通り）。
 ///
@@ -1221,7 +1231,7 @@ impl DepCheckMode {
 fn run_dependency_check(
     mode: DepCheckMode,
     sleep_guard_answer: Option<SleepGuardValues>,
-) -> (Vec<DetectedAgent>, Vec<Remaining>) {
+) -> DepCheckOutcome {
     let (agents, unconfirmed) = detect_agents();
     eprintln!("  エージェント CLI:");
     for agent in &agents {
@@ -1258,8 +1268,18 @@ fn run_dependency_check(
     } else {
         Vec::new()
     };
-    for state in setup_deps::status() {
+    let states = setup_deps::status();
+    let mut installed_bins = Vec::new();
+    for state in &states {
         let dep = state.dep;
+        // 在るが動かない（tailscale の `--version` が固まる / 非 0 = #1797）。在るので入れ直させないが、
+        // 動かないので `[OK]` とも言わない（#1816）。任意依存なので残り作業にも数えない（tako は動く =
+        // FR-2.41 の「残り N 件は整わないと tako が動かない詰まりだけ」の線引き）
+        if let Some(text) = state.unrunnable_text() {
+            eprintln!("  [警告] {text}");
+            eprintln!("      {}", tako_control::tailscale::UNRUNNABLE_HINT);
+            continue;
+        }
         if let Some(path) = &state.found {
             eprintln!("  [OK] {}: {path}", dep.bin);
             continue;
@@ -1290,7 +1310,7 @@ fn run_dependency_check(
         let mut reader = stdin.lock();
         let mut stderr = std::io::stderr();
         let outcome = setup_deps::offer_and_install(
-            &state,
+            state,
             mode.offer,
             &mut setup_deps::DepPromptIo {
                 writer: &mut stderr,
@@ -1304,6 +1324,7 @@ fn run_dependency_check(
         match outcome {
             setup_deps::DepOutcome::Installed(path) => {
                 eprintln!("  [OK] {}: {path}（インストール完了）", dep.bin);
+                installed_bins.push(dep.bin);
             }
             setup_deps::DepOutcome::NotInstalled if dep.required => {
                 missing_required.push(Remaining::new(RemainingKind::Dep {
@@ -1313,6 +1334,18 @@ fn run_dependency_check(
             setup_deps::DepOutcome::NotInstalled => {}
         }
     }
+    // Tailscale の検出結果は末尾の 1 行が使い回す（#1816。上限 10 秒の検出を 1 回の実行で
+    // 引き直さない）。この段で入れたときだけ、入れた後の状態を引き直す
+    let tailscale = states
+        .into_iter()
+        .find(|state| state.detection.is_some())
+        .map(|state| {
+            if installed_bins.contains(&state.dep.bin) {
+                setup_deps::status_of(state.dep.bin).unwrap_or(state)
+            } else {
+                state
+            }
+        });
     // FDA チェック（macOS のみ。任意だが強く推奨）
     #[cfg(target_os = "macos")]
     {
@@ -1320,7 +1353,11 @@ fn run_dependency_check(
     }
     // スリープ防止の設定案内
     run_sleep_guard_check(mode.review_settings, sleep_guard_answer);
-    (agents, missing_required)
+    DepCheckOutcome {
+        agents,
+        missing: missing_required,
+        tailscale,
+    }
 }
 
 /// `tako setup deps [install]`。MCP `tako_setup_deps` と 1:1（#88 / #1057）
@@ -1371,6 +1408,12 @@ fn print_deps_human(action: &str, value: &serde_json::Value) {
             // 検出を上限で打ち切った（#1533）。見つからないとも導入方法とも言わない
             if let Some(secs) = dep["lookup_timeout"]["waited_secs"].as_u64() {
                 eprintln!("  [警告] {bin}: 確認できません（ログインシェルが {secs} 秒で応答なし）");
+                continue;
+            }
+            // 在るが動かない（#1816）。`[OK]` と言わず、入れ直しも勧めない（依存段と同じ文面）
+            if let (Some(false), Some(path)) = (dep["runnable"].as_bool(), dep["found"].as_str()) {
+                eprintln!("  [警告] {}", setup_deps::unrunnable_line(bin, path));
+                eprintln!("      {}", tako_control::tailscale::UNRUNNABLE_HINT);
                 continue;
             }
             match dep["found"].as_str() {
@@ -3252,7 +3295,11 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     };
     let sleep_guard_answer =
         sleep_guard_from_answers(current_sleep_guard, answers.sleep_guard.as_ref())?;
-    let (agents, missing) = run_dependency_check(
+    let DepCheckOutcome {
+        agents,
+        missing,
+        tailscale,
+    } = run_dependency_check(
         DepCheckMode::for_setup(review_mode, assume_yes),
         sleep_guard_answer,
     );
@@ -3642,8 +3689,9 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // スマホから使えるかを 1 行（#1507）。状態は `remote_setup::check_status` の読み取り
     // だけで決め、ここでは導入も起動もしない（Tailscale の導入を勧めるのは依存チェック段の
     // 1 回 = #1499 / #1524。同じ実行で 2 度聞かない）。待ちは tailscale 側の上限で打ち切られ、
-    // 打ち切ったら #1503 の文面で知らせてから締める = `--yes` / 非 TTY / `--answers` でも止まらない
-    for line in tako_control::remote_setup::setup_summary_lines() {
+    // 打ち切ったら #1503 の文面で知らせてから締める = `--yes` / 非 TTY / `--answers` でも止まらない。
+    // Tailscale の検出は依存段の答えを使い回す（#1816。`--version` が固まる CLI で上限 10 秒を何度も待たない）
+    for line in tako_control::remote_setup::setup_summary_lines(tailscale.as_ref()) {
         eprintln!("{line}");
     }
 

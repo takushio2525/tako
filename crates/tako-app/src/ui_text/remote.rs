@@ -141,30 +141,39 @@ pub fn setup_missing_header() -> &'static str {
         "Setup required before starting:"
     )
 }
-/// 不足項目 1 件の説明（キーは `remote_setup::check_status` の item。言語非依存）
-pub fn setup_item_label(item: &str) -> &'static str {
-    match item {
-        "tailscale" => tr!(
+/// 不足項目 1 件の説明（キーは `remote_setup::check_status` の item と status。言語非依存）。
+/// tailscale は status で言い分ける（#1816。在るのに「未導入」と言うと 2 系統目を入れさせる）
+pub fn setup_item_label(item: &str, status: &str) -> &'static str {
+    match (item, status) {
+        ("tailscale", "unrunnable") => tr!(
+            "Tailscale は入っているが応答しない（入れ直す前に Tailscale の起動し直しか更新を試す）",
+            "Tailscale is installed but does not respond (restart or update Tailscale before reinstalling)"
+        ),
+        ("tailscale", "unknown") => tr!(
+            "Tailscale が入っているかを確かめられない（ログインシェルが応答しない。.zprofile などを確認）",
+            "Could not check whether Tailscale is installed (the login shell did not respond; check .zprofile etc.)"
+        ),
+        ("tailscale", _) => tr!(
             "Tailscale が未導入（App Store 版アプリ または brew install tailscale）",
             "Tailscale is not installed (App Store app or brew install tailscale)"
         ),
-        "daemon" => tr!(
+        ("daemon", _) => tr!(
             "Tailscale が起動していない（Tailscale アプリを起動）",
             "Tailscale is not running (launch the Tailscale app)"
         ),
-        "login" => tr!(
+        ("login", _) => tr!(
             "Tailscale にログインしていない（tailscale up でブラウザ認証）",
             "Not logged in to Tailscale (run tailscale up to authenticate)"
         ),
-        "https" => tr!(
+        ("https", _) => tr!(
             "tailnet の HTTPS 証明書が未有効（管理画面で MagicDNS と HTTPS Certificates を有効化）",
             "tailnet HTTPS certificates are off (enable MagicDNS and HTTPS Certificates in the admin console)"
         ),
-        "dns_name" => tr!(
+        ("dns_name", _) => tr!(
             "MagicDNS 名を取得できない（tailnet の DNS 設定を確認）",
             "Cannot resolve the MagicDNS name (check the tailnet DNS settings)"
         ),
-        "serve" => tr!(
+        ("serve", _) => tr!(
             "tailscale serve に tako 管理外の設定がある（tailscale serve status で確認）",
             "tailscale serve has a non-tako configuration (check tailscale serve status)"
         ),
@@ -311,12 +320,14 @@ mod tests {
                 setup_checking().to_string(),
                 setup_ready().to_string(),
                 setup_missing_header().to_string(),
-                setup_item_label("tailscale").to_string(),
-                setup_item_label("daemon").to_string(),
-                setup_item_label("login").to_string(),
-                setup_item_label("https").to_string(),
-                setup_item_label("dns_name").to_string(),
-                setup_item_label("serve").to_string(),
+                setup_item_label("tailscale", "missing").to_string(),
+                setup_item_label("tailscale", "unrunnable").to_string(),
+                setup_item_label("tailscale", "unknown").to_string(),
+                setup_item_label("daemon", "missing").to_string(),
+                setup_item_label("login", "missing").to_string(),
+                setup_item_label("https", "missing").to_string(),
+                setup_item_label("dns_name", "missing").to_string(),
+                setup_item_label("serve", "conflict").to_string(),
                 setup_hint().to_string(),
                 start_failed().to_string(),
                 url_label().to_string(),
@@ -341,6 +352,8 @@ mod tests {
     #[test]
     fn setup_item_labelは未知キーで空を返す() {
         // 言語依存の関数はヘルパの区間の中で呼ぶ（#1274）
-        tests_support::for_each_lang(|| assert!(setup_item_label("unknown_item").is_empty()));
+        tests_support::for_each_lang(|| {
+            assert!(setup_item_label("unknown_item", "missing").is_empty())
+        });
     }
 }

@@ -12,6 +12,7 @@
 #   - PATH 外 / PATH 内 / 未導入 / 両系統が見える の各状態で、依存段の判定と末尾の 1 行が揃う
 #   - 導入済みのものへ brew（スタブ）を**呼ばない**（brew の呼び出しを記録して数える）
 #   - `--version` が固まる / 非 0 で終わる CLI も「在る」と扱い、入れ直させない
+#     （依存段は `[OK]` と言わず `[警告] … 在りますが実行できません` で言い分ける = #1816）
 #   - `status --json` が固まる・孫がパイプを握ったまま残る tailscale でも上限内に返り、
 #     打ち切りは #1503 の文面で知らせる（待ちを `tako_core::probe` の 1 実装へ寄せた = #1797）
 #   - `tako setup --check` / `tako setup deps` も同じ答えを返す
@@ -37,8 +38,9 @@ contains(){ if grep -qF -- "$2" "$3" 2>/dev/null; then ok "$1"; else ng "$1 ('$2
 absent(){ if grep -qF -- "$2" "$3" 2>/dev/null; then ng "$1 ('$2' が出ている)"; else ok "$1"; fi; }
 # 末尾の 1 行（`スマホからの接続: ` で始まる行）。無ければ空
 phone_line(){ grep -F "スマホからの接続: " "$1" 2>/dev/null | tail -1 | tr -d '\r'; }
-# 依存段の tailscale の行（`[OK] tailscale: …` か `[任意] tailscale: 見つかりません…`）
-dep_line(){ grep -E '^  \[(OK|任意|不足)\] tailscale: ' "$1" 2>/dev/null | head -1; }
+# 依存段の tailscale の行（`[OK] tailscale: …` / `[任意] tailscale: 見つかりません…` /
+# `[警告] tailscale: 在りますが実行できません（…）` = #1816）
+dep_line(){ grep -E '^  \[(OK|任意|不足|警告)\] tailscale: ' "$1" 2>/dev/null | head -1; }
 # brew スタブが `install tailscale` で呼ばれた回数
 brew_ts_calls(){ grep -cx "install tailscale" "$SANDBOX/brew.log" 2>/dev/null || true; }
 
@@ -178,6 +180,8 @@ L_MISSING="スマホからの接続: Tailscale が未導入です。いま入れ
 # `Tailscale`（大文字）なので、PATH 外の置き場ではその名で出る
 NOTICE="  [確認できません] Tailscale status --json（10 秒応答なし）。打ち切って次へ進みます"
 NOT_FOUND="[任意] tailscale: 見つかりません"
+# 在るが動かない CLI の依存段の行（#1816。`[OK]` とは言わない）
+unrunnable_line(){ echo "  [警告] tailscale: 在りますが実行できません（$1）"; }
 
 echo "#1797: setup の依存段が tailscale を remote と同じ検出で探す — sandbox: $SANDBOX"
 echo
@@ -219,10 +223,10 @@ check    "末尾は導入口を指す"                         "$(phone_line "$S
 echo "== 4) PATH 外 + --version が固まる: 在るものとして扱い、入れ直させない =="
 mkenv noop; write_tailscale "$APPS_TS" hang-version
 run "$SANDBOX/4.log" "$APPS_TS" setup --yes
-echo "  [実測] 所要 ${ELAPSED} 秒（--version の上限 10 秒 × 依存段 1 回 + 末尾 2 回 = check_status と導入口の判定）"
+echo "  [実測] 所要 ${ELAPSED} 秒（--version の上限 10 秒 × 依存段の 1 回。末尾は依存段の答えを使い回す = #1816）"
 check    "締め切りに掛からない"                      "$KILLED" "0"
 check    "終了コード 0"                               "$RC" "0"
-check    "依存段は導入済みと言う"                     "$(dep_line "$SANDBOX/4.log")" "  [OK] tailscale: $APPS_TS"
+check    "依存段は在るが動かないと言う"               "$(dep_line "$SANDBOX/4.log")" "$(unrunnable_line "$APPS_TS")"
 check    "brew install tailscale を呼ばない"         "$(brew_ts_calls)" "0"
 check    "末尾は「実行できませんでした」"            "$(phone_line "$SANDBOX/4.log")" "$L_UNRUNNABLE"
 if [ -n "$LEFTOVERS" ]; then ng "打ち切った子が残っている（${LEFTOVERS}）"; else ok "打ち切った子は残らない"; fi
@@ -231,7 +235,7 @@ echo "== 5) PATH 外 + --version が非 0: 在るものとして扱い、入れ�
 mkenv noop; write_tailscale "$APPS_TS" broken
 run "$SANDBOX/5.log" "$APPS_TS" setup --yes
 check    "終了コード 0"                               "$RC" "0"
-check    "依存段は導入済みと言う"                     "$(dep_line "$SANDBOX/5.log")" "  [OK] tailscale: $APPS_TS"
+check    "依存段は在るが動かないと言う"               "$(dep_line "$SANDBOX/5.log")" "$(unrunnable_line "$APPS_TS")"
 check    "brew install tailscale を呼ばない"         "$(brew_ts_calls)" "0"
 check    "末尾は「実行できませんでした」"            "$(phone_line "$SANDBOX/5.log")" "$L_UNRUNNABLE"
 
