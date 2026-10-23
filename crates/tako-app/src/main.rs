@@ -32656,6 +32656,82 @@ mod self_test {
             .map(Duration::from_millis)
     }
 
+    /// #2355 の A/B。`TAKO_2355_LEGACY=1` で項目 154 の流す出力と E4 を修正前へ戻す
+    /// （ループを包まない + ctrl-c の直後に打って固定 15 秒で 1 回だけ見る）
+    fn legacy_2355() -> bool {
+        std::env::var("TAKO_2355_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// #2355 の注入（`TAKO_2355_INJECT`）。どちらも POSIX のループだけに効く
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum St2355Inject {
+        None,
+        /// `lostint`: 1 周ごとの子が SIGINT を受けると**正常終了**する（0.2 秒眠る）。
+        /// 対話シェルは「子が SIGINT で死んだ」ときだけループを止めるので、^C が子に当たると
+        /// 素のループは止まらない = 隙間に落ちた ^C（#2355 の真因）を毎回作る。サブシェルで
+        /// 包んだループはサブシェル自身が SIGINT を受けて止まる（zsh の実測。bash の
+        /// サブシェルは「子が正常終了した = 子が処理した」と読んで続ける
+        /// = wait-and-cooperative-exit なので、この注入の A/B は zsh で取る）
+        LostInt,
+        /// `never`: ループが SIGINT を無視する（検出力。新旧どちらも E4 で落ちるのが正しい）。
+        /// 自然に終わって通らないよう周回を桁違いに伸ばす
+        Never,
+    }
+
+    fn st2355_inject() -> St2355Inject {
+        match std::env::var("TAKO_2355_INJECT").as_deref() {
+            Ok("lostint") => St2355Inject::LostInt,
+            Ok("never") => St2355Inject::Never,
+            _ => St2355Inject::None,
+        }
+    }
+
+    /// 項目 154 の 2・3 巡目にターミナルへ流す出力（純粋関数。#1725 / #2355）。
+    ///
+    /// #2355 の真因: 対話シェルが**自分で回す**ループ（`while …; do printf …; sleep 0.010; done`）は、
+    /// 周ごとの `sleep` を前景のジョブとして別のプロセスグループで起こす。`sleep` が終わってから
+    /// シェルが端末を取り戻すまでの隙間に ^C が届くと、前景のグループに生きたプロセスが居ないので
+    /// SIGINT はどこにも届かず、ループは止まらない（tako を通さない素の zsh + 隔離 tmux で
+    /// 450 回中 9 回。混んだ機ほど隙間が伸びる）。E4 はその ^C の直後に打った行が 15 秒以内に
+    /// 実行されるのを見ていたので、出力が流れ続けたまま「打鍵が見えない入力欄に吸われる」と
+    /// 製品のせいに見える文言で落ちていた（打鍵は端末へ届いていた。項目 155 が Ctrl-C で
+    /// 止める形をやめて自然に終わる長さにしたのも同じ理由）。
+    ///
+    /// POSIX はループを `( … )` で包む: サブシェルがループのあいだずっと前景のグループに居るので、
+    /// ^C は必ずループの持ち主へ届く（ループが走り出してから送る同じ測り方で 0 / 150）。
+    /// PowerShell のループはプロセスの中で回る（周ごとに子を起こさない）ので包まず、
+    /// 注入も効かせない
+    pub(crate) fn st2355_flow_command(
+        sh: tako_core::platform::shell_dialect::ShellDialect,
+        legacy: bool,
+        inject: St2355Inject,
+    ) -> String {
+        use tako_core::platform::shell_dialect::ShellDialect;
+        let count = if inject == St2355Inject::Never {
+            100_000
+        } else {
+            4000
+        };
+        let lines = sh.emit_numbered_lines("ST1725TICK", count, 10);
+        if sh == ShellDialect::PowerShell {
+            return lines;
+        }
+        match inject {
+            St2355Inject::None if legacy => lines,
+            St2355Inject::None => format!("( {lines} )"),
+            St2355Inject::LostInt => {
+                let child = lines.replace("sleep 0.010", "sh -c 'trap \"exit 0\" INT; sleep 0.2'");
+                if legacy {
+                    child
+                } else {
+                    format!("( {child} )")
+                }
+            }
+            // 対話シェル自身に trap を残さないよう、新旧どちらもサブシェルの中で無視させる
+            St2355Inject::Never => format!("( trap '' INT; {lines} )"),
+        }
+    }
+
     /// 項目 154 の道具: 実 OS マウスと同じ `PlatformInput` 経路で 1 回押す（#1725）。
     /// 動かしてから 1 フレーム描くのは `click_at`（#738 / #496）と同じ理由
     /// （hover はフレーム構築時のヒットテストで決まるので、動かしただけでは届かない）
@@ -32796,6 +32872,10 @@ mod self_test {
     /// （#1860）ので、Esc / 確定で閉じても選択が残ると、閉じた直後の Enter（#1908 で行を開く）が
     /// ターミナルへ届かず、2 巡目の前提（出力が流れ始める）が窓の長さに関係なく成立しなかった。
     /// 前提の上限は [`st1938_flow_budget`]。A/B は `TAKO_1938_LEGACY=1`（選択を残す + 固定 20 秒の窓）
+    ///
+    /// #2355: 流す出力は E4 の ctrl-c で必ず止まる形（[`st2355_flow_command`]）にし、E4 は
+    /// 「入力欄が閉じた / 流れが止まった（状態待ち）/ 打った行が実行された」の 3 本に割った。
+    /// A/B は `TAKO_2355_LEGACY=1`、注入は `TAKO_2355_INJECT=lostint|never`（[`St2355Inject`]）
     async fn st1725_tree_inline_input(
         any: AnyWindowHandle,
         window: WindowHandle<TakoApp>,
@@ -32906,16 +32986,27 @@ mod self_test {
         let mut opened_total = 0usize;
         let mut created: Vec<std::path::PathBuf> = Vec::new();
         let mut busy_ticks: Option<(u64, u64)> = None;
+        let tick_now = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| -> u64 {
+            st1725_pane_text(window, cx, origin)
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("ST1725TICK"))
+                .filter_map(|n| n.parse::<u64>().ok())
+                .max()
+                .unwrap_or(0)
+        };
+        let legacy_flow = legacy_2355();
+        let inject_flow = st2355_inject();
         for round in 1..=ROUNDS {
             if round == 2 {
                 // ターミナルへ出力を流し始める（2・3 巡目のあいだ流れ続ける長さ）。
                 // 打つ Enter は `handle_key` を通るので、1 巡目で閉じた入力欄が打鍵をペインへ
                 // 戻していなければここで止まる（#1938 の真因 = 右クリックで立った行の選択が
-                // 残り、Enter がツリーへ向いてコマンドが確定しない。待っても成立しない）
+                // 残り、Enter がツリーへ向いてコマンドが確定しない。待っても成立しない）。
+                // ループは E4 の ctrl-c で必ず止まる形で流す（#2355。`st2355_flow_command`）
                 type_text(
                     any,
                     cx,
-                    &sh.emit_numbered_lines("ST1725TICK", 4000, 10),
+                    &st2355_flow_command(sh, legacy_flow, inject_flow),
                     true,
                 );
                 let inject = st1938_inject_window();
@@ -32949,14 +33040,6 @@ mod self_test {
                     "項目 154: ターミナルへ出力が流れ始める（前提。#1725 / #1938）",
                 );
             }
-            let tick_now = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| -> u64 {
-                st1725_pane_text(window, cx, origin)
-                    .lines()
-                    .filter_map(|l| l.trim().strip_prefix("ST1725TICK"))
-                    .filter_map(|n| n.parse::<u64>().ok())
-                    .max()
-                    .unwrap_or(0)
-            };
             let tick_before = tick_now(window, cx);
             for (entry, row) in entries.iter() {
                 let row = if *entry == "file" {
@@ -33337,7 +33420,11 @@ mod self_test {
         press(any, cx, "escape");
         let _ = window.update(cx, |app, _, _| app.remote_notice = None);
         // E4: 入力欄を出したままツリーを閉じる → 見えない入力欄は打鍵を奪わない
-        //（打った行がそのままターミナルで実行される = 画面に結果が出る）
+        //（閉じた直後の ctrl-c がターミナルへ届いて流れが止まり、打った行がそのまま
+        // ターミナルで実行される = 画面に結果が出る）。
+        // #2355: 打つ前に「シェルがコマンドを受け付ける」を状態で待ち、3 つの判定を割る。
+        // 旧は ctrl-c の直後に打って固定 15 秒で 1 回だけ見ていたので、ループが ^C を
+        // 取りこぼした回（`st2355_flow_command` の doc）を「入力欄に吸われる」と読み違えた
         if let Err(e) = st1725_open(any, window, cx, &base, "new-file") {
             fail(&format!("項目 154: E4: {e} (#1725)"));
         }
@@ -33345,16 +33432,114 @@ mod self_test {
             app.filetree.visible = false;
             cx.notify();
         });
+        let flow_state = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| {
+            window
+                .update(cx, |app, _, _| {
+                    app.terminals.get(&origin).map(|s| s.command_state())
+                })
+                .ok()
+                .flatten()
+        };
+        let state_before = flow_state(window, cx);
+        let ticks_before = tick_now(window, cx);
         press(any, cx, "ctrl-c");
-        type_text(any, cx, &sh.echo(&sh.marker("ST1725H", 1700, 25)), true);
-        let e4 = wait_for_focused_text(window, cx, "ST1725H1725", Duration::from_secs(15)).await;
         let e4_closed = window
             .update(cx, |app, _, _| app.inline_edit.is_none())
             .unwrap_or(false);
-        check(
-            e4 && e4_closed,
-            &format!("項目 154: E4 ツリーを閉じたのに打鍵が見えない入力欄に吸われる: echoed={e4} closed={e4_closed} (#1725)"),
-        );
+        let typed = sh.marker("ST1725H", 1700, 25);
+        // 判定に使った材料そのもの（#796）。`typed_in_terminal` = 打った行が端末に出ている
+        // （= 打鍵は見えない入力欄ではなくターミナルへ届いた。止まらないループの最中なら
+        // tty のエコー）。狭いペインでは `^C` の直後に続くエコーが折り返すので、空白と改行を
+        // 落として比べる（`squash_ws`）。`cols` はそのときのペインの桁数。
+        // `backend` = 器（tmux）越しのペインか。器越しだと tako のグリッドには器の画面しか
+        // 残らない（`history` が増えない）ので、画面の外へ流れた行は `typed_in_terminal` /
+        // `other_lines` に出ない = 偽でも「届かなかった」とは読めない
+        let e4_diag = |window: WindowHandle<TakoApp>,
+                       cx: &mut AsyncApp,
+                       stopped: Option<bool>,
+                       waited: Option<f32>,
+                       echoed: Option<bool>| {
+            let state_after = flow_state(window, cx);
+            let ticks_after = tick_now(window, cx);
+            let pane_text = st1725_pane_text(window, cx, origin);
+            let typed_in_terminal = squash_ws(&pane_text).contains(&squash_ws(&typed));
+            let (cols, history, backend) = window
+                .update(cx, |app, _, _| {
+                    (
+                        app.terminals.get(&origin).map(|s| s.size().0),
+                        app.terminals.get(&origin).map(|s| s.history_size()),
+                        app.backend_session(origin).is_some(),
+                    )
+                })
+                .unwrap_or((None, None, false));
+            // 流した出力以外の行（`^C` のエコー・打った行・プロンプト）の末尾 8 行
+            let others: Vec<&str> = pane_text
+                .lines()
+                .map(str::trim_end)
+                .filter(|l| {
+                    !l.is_empty()
+                        && !l
+                            .strip_prefix("ST1725TICK")
+                            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+                })
+                .collect();
+            let others = others[others.len().saturating_sub(8)..].join(" | ");
+            println!(
+                "TAKO_SELF_TEST_2355: E4 legacy={legacy_flow} inject={inject_flow:?} closed={e4_closed} \
+                 state_before={state_before:?} state_after={state_after:?} stopped={stopped:?} \
+                 waited={waited:?} ticks={ticks_before}->{ticks_after} \
+                 typed_in_terminal={typed_in_terminal} cols={cols:?} history={history:?} \
+                 backend={backend} echoed={echoed:?} other_lines={others:?} {}",
+                env_line()
+            );
+        };
+        if legacy_flow {
+            type_text(any, cx, &sh.echo(&typed), true);
+            let e4 =
+                wait_for_focused_text(window, cx, "ST1725H1725", Duration::from_secs(15)).await;
+            e4_diag(window, cx, None, None, Some(e4));
+            check(
+                e4 && e4_closed,
+                &format!("項目 154: E4 ツリーを閉じたのに打鍵が見えない入力欄に吸われる: echoed={e4} closed={e4_closed} (#1725)"),
+            );
+        } else {
+            // ① 見えない入力欄は閉じた直後の打鍵（ctrl-c）を握らない
+            check(
+                e4_closed,
+                "項目 154: E4 ツリーを閉じたのに見えない入力欄が打鍵（ctrl-c）を握り、ターミナルへ届かない (#1725)",
+            );
+            // ② 前提: ctrl-c でシェルが流れを止め、コマンドを受け付ける（OSC 133 が Running を抜ける）
+            let budget = state_wait_budget(Duration::from_secs(15), machine_busy());
+            let started = std::time::Instant::now();
+            let stopped = wait_for_app_state(
+                window,
+                cx,
+                "項目 154 E4: ctrl-c でターミナルの出力が止まる (#2355)",
+                budget,
+                |app| {
+                    app.terminals
+                        .get(&origin)
+                        .is_some_and(|s| s.command_state() != tako_core::CommandState::Running)
+                },
+            )
+            .await;
+            let waited = started.elapsed().as_secs_f32();
+            if !stopped {
+                e4_diag(window, cx, Some(false), Some(waited), None);
+            }
+            check(
+                stopped,
+                &format!("項目 154: E4 ctrl-c でターミナルの出力が止まらない（シェルが割り込みを受けていない。{waited:.1}s / 上限 {:.1}s） (#2355)", budget.as_secs_f32()),
+            );
+            // ③ 打った行がそのままターミナルで実行される
+            type_text(any, cx, &sh.echo(&typed), true);
+            let echoed = wait_for_focused_text(window, cx, "ST1725H1725", budget).await;
+            e4_diag(window, cx, Some(true), Some(waited), Some(echoed));
+            check(
+                echoed,
+                "項目 154: E4 ツリーを閉じたあとに打った行がターミナルで実行されない (#1725)",
+            );
+        }
 
         // --- 漏れの判定（アンカーつきの否定検査。#796）---
         // E4 のアンカーが出たあとで、入力欄へ打った印・日本語がターミナル（履歴まで）に 1 つも無い
@@ -97686,6 +97871,87 @@ mod self_test_wait_budget_tests {
         // #1165 が観測した混み具合（load 12.9 / 12 コア ≒ 1.08）でさらに伸びる
         let (busy, _, _) = resolve_text_wait(budget, Some(1.08), false);
         assert!(busy > idle, "混んだ機で伸びていない");
+    }
+}
+
+/// 項目 154 が流す出力の形（純粋関数。#2355）。
+///
+/// 真因は「対話シェルが自分で回すループは、周ごとの子が終わってからシェルが端末を取り戻す
+/// までの隙間に ^C が落ちると止まらない」こと。直し方は POSIX のループをサブシェルで包む
+/// （^C が必ずループの持ち主へ届く）なので、形をここで固定する
+#[cfg(test)]
+mod self_test_flow_2355_tests {
+    use super::self_test::{st2355_flow_command, St2355Inject};
+    use tako_core::platform::shell_dialect::ShellDialect;
+
+    /// 包んだ中身が丸ごとループであること（一部だけ包むと ^C が外側へ落ちる）
+    fn wrapped(cmd: &str) -> Option<&str> {
+        cmd.strip_prefix("( ")?.strip_suffix(" )")
+    }
+
+    #[test]
+    fn posixのループはサブシェルで包み旧経路は素のまま() {
+        let plain = ShellDialect::Posix.emit_numbered_lines("ST1725TICK", 4000, 10);
+        let new = st2355_flow_command(ShellDialect::Posix, false, St2355Inject::None);
+        assert_eq!(
+            wrapped(&new),
+            Some(plain.as_str()),
+            "新経路が素のループを包んでいない: {new}"
+        );
+        assert_eq!(
+            st2355_flow_command(ShellDialect::Posix, true, St2355Inject::None),
+            plain,
+            "旧経路（TAKO_2355_LEGACY=1）が修正前の形でない"
+        );
+    }
+
+    #[test]
+    fn powershellはプロセス内のループなので包まず注入も効かない() {
+        let plain = ShellDialect::PowerShell.emit_numbered_lines("ST1725TICK", 4000, 10);
+        for legacy in [false, true] {
+            for inject in [St2355Inject::None, St2355Inject::LostInt] {
+                assert_eq!(
+                    st2355_flow_command(ShellDialect::PowerShell, legacy, inject),
+                    plain,
+                    "legacy={legacy} inject={inject:?}"
+                );
+            }
+        }
+    }
+
+    /// `lostint` は周ごとの子が SIGINT を正常終了へ変える（隙間に落ちた ^C を毎回作る）。
+    /// 包むかどうかは経路で分かれる = 同じ注入で旧は止まらず新は止まる
+    #[test]
+    fn lostintは周ごとの子へ入り包み方は経路に従う() {
+        let child = "sh -c 'trap \"exit 0\" INT; sleep 0.2'";
+        let legacy = st2355_flow_command(ShellDialect::Posix, true, St2355Inject::LostInt);
+        assert!(legacy.contains(child), "子が差し替わっていない: {legacy}");
+        assert!(
+            !legacy.contains("sleep 0.010"),
+            "元の sleep が残っている: {legacy}"
+        );
+        assert!(wrapped(&legacy).is_none(), "旧経路を包んでいる: {legacy}");
+        let new = st2355_flow_command(ShellDialect::Posix, false, St2355Inject::LostInt);
+        assert_eq!(
+            wrapped(&new),
+            Some(legacy.as_str()),
+            "新経路が包んでいない: {new}"
+        );
+    }
+
+    /// `never` は新旧どちらも止まらない（検出力）。対話シェルに trap を残さないよう
+    /// どちらもサブシェルの中で無視させ、上限の内に自然に終わらない長さにする
+    #[test]
+    fn neverは新旧どちらもサブシェルの中で割り込みを無視する() {
+        for legacy in [false, true] {
+            let cmd = st2355_flow_command(ShellDialect::Posix, legacy, St2355Inject::Never);
+            let inner = wrapped(&cmd).unwrap_or_else(|| panic!("包んでいない: {cmd}"));
+            assert!(
+                inner.starts_with("trap '' INT; "),
+                "割り込みを無視していない: {cmd}"
+            );
+            assert!(inner.contains("-lt 100000 "), "周回が伸びていない: {cmd}");
+        }
     }
 }
 
