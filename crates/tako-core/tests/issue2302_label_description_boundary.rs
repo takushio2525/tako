@@ -189,16 +189,27 @@ fn issue2302_説明の証拠が無い日本語の並びは説明を飲むとき�
     let wide = detect("cjk-80", CJK_80);
     let narrow = detect("cjk-32", CJK_32);
     assert_matches_wide("cjk-32", &narrow, &wide);
-    // 選択肢 1 は従来の結合のまま（1 行目だけ）。選択肢 2 は従来の結合が「右端まで埋まった
-    // 区切りの無い長い語」の行を飲む = 説明を飲んだかもしれないので申告する
+    // 選択肢 1 は申告する（#2324 で期待を直した）: 次の行の最初の語 `32` は表示幅では 1 行目
+    // （31 桁）の後ろに入らない = 段落の切れ目ではなく、ラベルの続きとも説明の 1 行目とも取れる。
+    // 旧期待（申告なし）は char 数の見積もりが「入る = 別の要素」と読んだ偶然の一致で、同じ形で
+    // ラベルの続きを申告なしで落とす実採取がある（`issue2324_narrow_cjk_label` の `sp` 31〜39 桁）
     assert_eq!(
         (
             narrow.options[0].label.as_str(),
             narrow.options[0].label_truncated
         ),
-        ("ダイアログの検知を先に直す", false)
+        ("ダイアログの検知を先に直す", true)
     );
-    assert!(narrow.options[1].label_truncated, "{:?}", narrow.options[1]);
+    // 選択肢 2 は申告しない（#2324 で期待を直した。旧期待は「長い語の行を飲むかもしれない」で
+    // 申告）: 続きの 2 行目が `）` で始まる = 1 行目 `判定の材料（画面の末尾の窓` は字の間で割った
+    // 長い語の途中 = 説明の始まり（32x46 の選択肢 3 と同じ証拠）。ラベルは 80 桁と同じ
+    assert_eq!(
+        (
+            narrow.options[1].label.as_str(),
+            narrow.options[1].label_truncated
+        ),
+        ("両方を 1 つの PR で直す", false)
+    );
     // 80 桁: 選択肢 2 の続きは 1 行だけ = 説明（説明つきの並びでは説明が必ずある）
     assert_eq!(
         labels(&wide),
