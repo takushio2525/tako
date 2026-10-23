@@ -2,6 +2,13 @@
 mod tests {
     use super::*;
 
+    /// 前段の断り（#2365 で表示言語に従う）が日英どちらかの形で `text` に含まれるか
+    fn says(text: &str, reason: &Reason) -> bool {
+        [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| text.contains(&reason.text_in(lang)))
+    }
+
     /// #2086: `tako_todo` の返答で経路を省いたら `mcp` と明示して送る（修正前の既定と同じ値。
     /// 省いたままだと受け口の準備の段が呼び出し元を知らず、返答が UI スレッドの同期の腕に残る）
     #[test]
@@ -182,7 +189,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("配列"), "{err}");
+        assert!(says(&err, &Reason::NotStringArray("paths".into())), "{err}");
     }
 
     /// #1679: `tako_lsp` は CLI `tako lsp diagnostics` と同じ要求になる。
@@ -1166,7 +1173,13 @@ mod tests {
             true,
         );
         assert!(requests.is_empty(), "{requests:?}");
-        assert!(format!("{response:?}").contains("同時に"), "{response:?}");
+        assert!(
+            says(
+                &format!("{response:?}"),
+                &Reason::NotTogether("command", "enabled")
+            ),
+            "{response:?}"
+        );
     }
 
     /// #1759: `command: "type"` + `text` は文字の打鍵、`auto_close` は括弧の自動閉じの設定へ写す
@@ -1201,14 +1214,26 @@ mod tests {
                 enabled: Some(false)
             }]
         );
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
         for (args, reason) in [
-            (json!({ "command": "type", "auto_close": true }), "同時に"),
-            (json!({ "auto_close": true, "enabled": true }), "同時に"),
-            (json!({ "text": "x" }), "command=type"),
+            (
+                json!({ "command": "type", "auto_close": true }),
+                Some(Reason::NotTogether("command", "auto_close")),
+            ),
+            (
+                json!({ "auto_close": true, "enabled": true }),
+                Some(Reason::NotTogether("auto_close", "enabled")),
+            ),
+            (json!({ "text": "x" }), None),
         ] {
             let (response, requests) = run(call("tako_preview_edit", args.clone()), Some(7), true);
             assert!(requests.is_empty(), "{args}: {requests:?}");
-            assert!(format!("{response:?}").contains(reason), "{args}: {response:?}");
+            let text = format!("{response:?}");
+            let ok = match &reason {
+                Some(reason) => says(&text, reason),
+                None => text.contains("command=type"),
+            };
+            assert!(ok, "{args}: {response:?}");
         }
         // command の enum に type が載る（綴りは tako-core の名前表）
         let tools = crate::mcp::catalog::tools();

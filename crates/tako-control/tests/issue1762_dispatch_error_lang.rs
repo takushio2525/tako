@@ -872,7 +872,9 @@ fn 理由の文の境界() {
     // 理由の文の `TabNotFound` は dispatch の `TabNotFound` と同じ文（写しを持たない）
     for lang in [Lang::Ja, Lang::En] {
         assert_eq!(
+            // 固定 ID 安全: 文の表を比べるだけで、タブを採番も探索もしない
             Reason::TabNotFound(7).text_in(lang),
+            // 固定 ID 安全: 同上
             E::TabNotFound(7).text_in(lang)
         );
     }

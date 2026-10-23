@@ -3985,8 +3985,9 @@ fn 逆戻りを名指しできる() {
     // (58) UI スレッドの準備がリポジトリまで解決する（`git rev-parse` を UI で待つ）
     let d = inject(
         &s.dispatch,
-        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    let (path, _) = host.preview_state(target).ok_or_else(|| {",
-        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    let _ = tako_core::git::file_history(Path::new(\".\"), 1, tako_core::git::changelog_timeout());\n    let (path, _) = host.preview_state(target).ok_or_else(|| {",
+        // #2365 で断りが `Reason` になり、rustfmt がこの行を 3 行に折った（置換元はその綴り）
+        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    let (path, _) = host\n        .preview_state(target)",
+        "    let (_, target) = resolve_pane(host.workspace(), pane)?;\n    let _ = tako_core::git::file_history(Path::new(\".\"), 1, tako_core::git::changelog_timeout());\n    let (path, _) = host\n        .preview_state(target)",
         "(58)",
     );
     expect_named(
