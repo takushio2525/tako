@@ -18,17 +18,20 @@ pub fn cmd_label(id: &str) -> &'static str {
         "open-remote-folder" => tr!("リモートからフォルダを開く", "Open remote folder"),
         // #616: アップデート画面（下部バーから撤去したぶんの入口）
         "open-update" => tr!("アップデートを開く", "Open update screen"),
-        "new-tab" => tr!("新しいタブ", "New tab"),
+        // #2322: メニュー（ui_text::menu::new_tab）と同じ表記
+        "new-tab" => tr!("新規タブ", "New tab"),
         // #1830: メニュー（ui_text::menu::toggle_theme）と同じ表記。英語はパレットの書き方
         // （文頭だけ大文字）
         "toggle-theme" => tr!(
             "テーマを切替（ライト・ダーク）",
             "Toggle theme (light, dark)"
         ),
-        // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）
+        // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）。
+        // #2322: 見出しはメニュー（ui_text::menu::toggle_ui_mode）と同じ表記で、括弧に
+        // 2 つのモードの名前を足す（テーマの「（ライト・ダーク）」と同じ並べ方）
         "toggle-ui-mode" => tr!(
-            "表示モードを切り替え（かんたん / ターミナル）",
-            "Switch view mode (simple / terminal)"
+            "表示モードを切替（かんたん・ターミナル）",
+            "Toggle display mode (simple, terminal)"
         ),
         "toggle-files" => tr!("ファイルツリーを開閉", "Toggle file tree"),
         "toggle-drawer" => tr!("バックグラウンドドロワーを開閉", "Toggle background drawer"),

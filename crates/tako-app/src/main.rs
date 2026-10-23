@@ -13328,42 +13328,8 @@ impl TakoApp {
                 ));
             }
         }
-        // 固定コマンド（表示ラベルは ui_text::palette が言語別に解決）。
-        // #549: 初期設定・オーケストレーションの導線を先頭に置く。パレットが
-        // 「機能の一覧」でもある以上、tako の目玉機能への入口はここに要る
-        const COMMANDS: &[&str] = &[
-            "run-setup",
-            "run-master",
-            "open-settings",
-            // #919: リモートからフォルダを開く（ファイルメニューと同じ入口）
-            "open-remote-folder",
-            "open-update",
-            "new-tab",
-            "toggle-theme",
-            // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）
-            "toggle-ui-mode",
-            "toggle-language",
-            "toggle-files",
-            "toggle-drawer",
-            "panel-fleet",
-            "panel-orch",
-            "panel-git",
-            // #1450 B2: 人がやること（ユーザー向けタスク）
-            "panel-tasks",
-            // #2203: 利用制限の使い道
-            "panel-usage",
-            "split-right",
-            "split-down",
-            "pin-tab-title",
-            // #1683: 言語サーバの整形（編集メニューと同じ）
-            "format-document",
-            "format-selection",
-            // #1681: カーソル位置のホバー情報（編集メニューと同じ）
-            "show-hover",
-            // #1694: ワークスペース横断検索（編集メニューと同じ）
-            "find-in-files",
-        ];
-        for id in COMMANDS {
+        // 固定コマンド（表示ラベルは ui_text::palette が言語別に解決）
+        for id in PALETTE_COMMANDS {
             items.push(PaletteItem::Command(
                 crate::ui_text::palette::cmd_label(id),
                 id,
@@ -28767,6 +28733,44 @@ enum PaletteMode {
         entries: Vec<tako_core::remote_fs::RemoteEntry>,
     },
 }
+
+/// コマンドパレットの固定コマンド（並び順のまま候補に出る。表示ラベルは `ui_text::palette`）。
+/// #549: 初期設定・オーケストレーションの導線を先頭に置く。パレットが
+/// 「機能の一覧」でもある以上、tako の目玉機能への入口はここに要る。
+/// 足したら、同じ操作のメニュー項目との対（無ければその理由）を `app_menu_tests` の
+/// 表へ書く（#2322。表記はメニューを正とする）
+const PALETTE_COMMANDS: &[&str] = &[
+    "run-setup",
+    "run-master",
+    "open-settings",
+    // #919: リモートからフォルダを開く（ファイルメニューと同じ入口）
+    "open-remote-folder",
+    "open-update",
+    "new-tab",
+    "toggle-theme",
+    // #694: GUI ライク表示 ⇔ ターミナル表示（タブバーのトグルと同じ操作）
+    "toggle-ui-mode",
+    "toggle-language",
+    "toggle-files",
+    "toggle-drawer",
+    "panel-fleet",
+    "panel-orch",
+    "panel-git",
+    // #1450 B2: 人がやること（ユーザー向けタスク）
+    "panel-tasks",
+    // #2203: 利用制限の使い道
+    "panel-usage",
+    "split-right",
+    "split-down",
+    "pin-tab-title",
+    // #1683: 言語サーバの整形（編集メニューと同じ）
+    "format-document",
+    "format-selection",
+    // #1681: カーソル位置のホバー情報（編集メニューと同じ）
+    "show-hover",
+    // #1694: ワークスペース横断検索（編集メニューと同じ）
+    "find-in-files",
+];
 
 /// コマンドパレットの候補 1 件（#217）
 enum PaletteItem {
@@ -98176,46 +98180,166 @@ mod app_menu_tests {
         );
     }
 
-    /// `ui_text/palette.rs` の中で、そのラベルのリテラル（無ければ id の行）がある位置
-    fn palette_label_at(source: &str, id: &str, label: &str) -> String {
-        let literal = format!("\"{label}\"");
+    /// `ui_text/palette.rs` の中で、その id の腕（`"id" =>`）がある位置
+    fn palette_arm_at(source: &str, id: &str) -> String {
         let arm = format!("\"{id}\" =>");
         let line = source
             .lines()
-            .position(|l| l.contains(&literal))
-            .or_else(|| source.lines().position(|l| l.contains(&arm)))
+            .position(|l| l.contains(&arm))
             .map_or(0, |i| i + 1);
         format!("crates/tako-app/src/ui_text/palette.rs:{line}")
     }
 
-    /// **パレットのテーマ / 表示言語の項目はメニューと同じ表記**（#1830）。
+    /// `ui_text/palette.rs` の中で、そのラベルのリテラル（無ければ id の腕）がある位置
+    fn palette_label_at(source: &str, id: &str, label: &str) -> String {
+        let literal = format!("\"{label}\"");
+        match source.lines().position(|l| l.contains(&literal)) {
+            Some(i) if !label.is_empty() => {
+                format!("crates/tako-app/src/ui_text/palette.rs:{}", i + 1)
+            }
+            _ => palette_arm_at(source, id),
+        }
+    }
+
+    /// パレットの固定コマンドのうち、**同じ操作のメニュー項目があるもの**の対（#1830 / #2322）。
+    /// 表記はメニューを正とする（規則は [`palette_follows_menu`]）。メニューの文言は言語を
+    /// 固定した区間の中で引く（#1274）ので、表は関数で組む
+    fn palette_menu_twins() -> Vec<(&'static str, &'static str)> {
+        use crate::ui_text::menu as m;
+        vec![
+            (
+                "open-remote-folder",
+                crate::ui_text::remote_folder::menu_open_remote_folder(),
+            ),
+            ("new-tab", m::new_tab()),
+            ("toggle-theme", m::toggle_theme()),
+            ("toggle-ui-mode", m::toggle_ui_mode()),
+            ("toggle-language", m::switch_language()),
+            ("toggle-files", m::toggle_sidebar()),
+            ("toggle-drawer", m::toggle_drawer()),
+            ("split-right", m::split_right()),
+            ("split-down", m::split_down()),
+            ("format-document", m::format_document()),
+            ("format-selection", m::format_selection()),
+            ("show-hover", m::show_hover()),
+            ("find-in-files", m::find_in_files()),
+        ]
+    }
+
+    /// メニューに対を持たない固定コマンドと、その理由（#2322）。
+    /// 同じ操作のメニュー項目があっても、わざと別の表記にしてあるものはここに理由を書く
+    const PALETTE_WITHOUT_MENU_TWIN: &[(&str, &str)] = &[
+        (
+            "run-setup",
+            "メニューに項目が無い（ウェルカムバナーと同じ入口。FR-2.14.11）",
+        ),
+        (
+            "run-master",
+            "メニューに項目が無い（ウェルカムバナーと同じ入口。FR-2.14.11）",
+        ),
+        (
+            "open-settings",
+            "ウェルカムバナーのボタン「設定を開く」と同じ表記に揃えてある（FR-2.14.11）。\
+             メニューの「設定…」はアプリメニューの定型",
+        ),
+        (
+            "open-update",
+            "メニューの「アップデートを確認…」は確認も走らせる別の操作（パレットは画面を開くだけ）",
+        ),
+        (
+            "panel-fleet",
+            "メニューは「パネル」の下の「fleet ビュー」で、親の名前が文脈を持つ。パレットは階層が\
+             無いので、パネルの 5 項目を「X パネルを開く」で揃える（tasks / usage はメニューに無い）",
+        ),
+        ("panel-orch", "panel-fleet と同じ"),
+        ("panel-git", "panel-fleet と同じ"),
+        ("panel-tasks", "メニューに項目が無い"),
+        ("panel-usage", "メニューに項目が無い"),
+        (
+            "pin-tab-title",
+            "メニューに項目が無い（タブのピン印と同じ操作）",
+        ),
+    ];
+
+    /// パレットのラベルがメニューの表記に沿っているか（#1830 / #2322）。
+    ///
+    /// メニューの末尾の「…」（別の窓・続きの入力がある印）は外して比べる。パレットは
+    /// その後ろに補足を 1 つ足してよい（日本語は「（…）」・英語は「 (…)」。例:
+    /// 「ホバー情報を表示（カーソル位置の型・doc）」）。日本語は一字一句、英語は
+    /// パレットの書き方（文頭だけ大文字）なので大小を問わない
+    fn palette_follows_menu(label: &str, menu: &str, lang: tako_core::i18n::Lang) -> bool {
+        use tako_core::i18n::Lang;
+        let base = menu.trim_end_matches('…');
+        let (label, base, open, close) = match lang {
+            Lang::Ja => (label.to_string(), base.to_string(), "（", "）"),
+            Lang::En => (label.to_lowercase(), base.to_lowercase(), " (", ")"),
+        };
+        label.strip_prefix(base.as_str()).is_some_and(|rest| {
+            rest.is_empty()
+                || rest
+                    .strip_prefix(open)
+                    .and_then(|inner| inner.strip_suffix(close))
+                    .is_some_and(|inner| !inner.is_empty())
+        })
+    }
+
+    /// **パレットの固定コマンドは、メニューの対か理由つきの例外のどちらかに 1 回だけ載る**（#2322）。
+    ///
+    /// 表記の番犬（`パレットの項目はメニューと同じ表記`）が見るのは対の表だけなので、
+    /// どちらにも載らない固定コマンドは食い違っても誰も気づかない。#1830 の表は
+    /// テーマ・表示言語の 2 件だけで、「表示モードを切り替え（かんたん / ターミナル）」は
+    /// 載っていなかった。固定コマンドを足したら、ここでどちらかへ分類させる
+    #[test]
+    fn パレットの固定コマンドはメニューの対か例外に分類されている() {
+        let source = include_str!("ui_text/palette.rs");
+        let twins: Vec<&str> = palette_menu_twins().into_iter().map(|(id, _)| id).collect();
+        let others: Vec<&str> = PALETTE_WITHOUT_MENU_TWIN
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        let mut problems = Vec::new();
+        for id in PALETTE_COMMANDS {
+            let n = twins.iter().chain(&others).filter(|x| *x == id).count();
+            if n != 1 {
+                problems.push(format!(
+                    "{}: {id} が対の表と例外の表に {n} 回載っている（どちらかに 1 回だけ載せる）",
+                    palette_arm_at(source, id)
+                ));
+            }
+        }
+        for id in twins.iter().chain(&others) {
+            if !PALETTE_COMMANDS.contains(id) {
+                problems.push(format!("{id} は PALETTE_COMMANDS に無い（表から消す）"));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "パレットの固定コマンドの分類が合っていない（#2322）:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// **パレットの項目はメニューと同じ表記**（#1830 / #2322）。
     ///
     /// #1820 でメニューの項目名から `/` を外した（「テーマを切替（ライト・ダーク）」
     /// 「表示言語を切替（日本語・English）」）が、同じ操作のパレットの項目は旧の表記
-    /// （「テーマをライト/ダーク切替」「（日本語 / English）」）のまま残っていた。パレットは
-    /// パス解決を通らないので実害は無いが、同じ操作が場所によって別の名前になる。
-    /// 日本語は一字一句、英語はパレットの書き方（文頭だけ大文字）なので大小を問わずに比べ、
-    /// 食い違いは `ui_text/palette.rs` の行で名指す
+    /// （「テーマをライト/ダーク切替」「（日本語 / English）」）のまま残っていた（#1830）。
+    /// 表が 2 件だけだったので、「表示モードを切り替え（かんたん / ターミナル）」
+    /// （メニューは「表示モードを切替」）と「新しいタブ」（メニューは「新規タブ」）も
+    /// 残っていた（#2322）。パレットはパス解決を通らないので実害は無いが、同じ操作が
+    /// 場所によって別の名前になる。対の表の全件を両言語で見て、食い違いは
+    /// `ui_text/palette.rs` の行で名指す
     #[test]
-    fn パレットのテーマと表示言語はメニューと同じ表記() {
-        use tako_core::i18n::Lang;
+    fn パレットの項目はメニューと同じ表記() {
         let source = include_str!("ui_text/palette.rs");
         let offenders = std::cell::RefCell::new(Vec::new());
         crate::ui_text::tests_support::for_each_lang(|| {
             let lang = tako_core::i18n::lang();
-            // メニューの文言は言語を固定したこの区間の中で引く（#1274）
-            for (id, want) in [
-                ("toggle-theme", crate::ui_text::menu::toggle_theme()),
-                ("toggle-language", crate::ui_text::menu::switch_language()),
-            ] {
+            for (id, menu) in palette_menu_twins() {
                 let label = crate::ui_text::palette::cmd_label(id);
-                let same = match lang {
-                    Lang::Ja => label == want,
-                    Lang::En => label.to_lowercase() == want.to_lowercase(),
-                };
-                if !same {
+                if !palette_follows_menu(label, menu, lang) {
                     offenders.borrow_mut().push(format!(
-                        "{}: {id}（{lang:?}）= {label:?} / メニュー = {want:?}",
+                        "{}: {id}（{lang:?}）= {label:?} / メニュー = {menu:?}",
                         palette_label_at(source, id, label)
                     ));
                 }
@@ -98224,22 +98348,53 @@ mod app_menu_tests {
         let offenders = offenders.into_inner();
         assert!(
             offenders.is_empty(),
-            "パレットの項目がメニューと別の表記になっている（#1830）:\n  {}",
+            "パレットの項目がメニューと別の表記になっている（メニューの表記か、その後ろに\
+             括弧の補足を 1 つ足した形にする。#1830 / #2322）:\n  {}",
             offenders.join("\n  ")
         );
     }
 
-    /// **表記を揃えた後も、旧来の打ち方でパレットから引ける**（#1830）。
+    /// **パレットの項目名は空でなく、2 つを並べるのに `/` を使わない**（#2322）。
+    ///
+    /// メニューは `/` がパス区切りと衝突するので「・」で書く（#1820）。パレットは
+    /// パス解決を通らないが、同じ操作の名前を揃える以上、並べ方も揃える
+    /// （「（かんたん / ターミナル）」が残っていた）。空のラベルは id の書き違い
+    /// （`cmd_label` の `_ => ""`）で、パレットに空の行が出る
+    #[test]
+    fn パレットの項目名は空でなくスラッシュを使わない() {
+        let source = include_str!("ui_text/palette.rs");
+        let offenders = std::cell::RefCell::new(Vec::new());
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let lang = tako_core::i18n::lang();
+            for id in PALETTE_COMMANDS {
+                let label = crate::ui_text::palette::cmd_label(id);
+                if label.is_empty() || label.contains('/') {
+                    offenders.borrow_mut().push(format!(
+                        "{}: {id}（{lang:?}）= {label:?}",
+                        palette_label_at(source, id, label)
+                    ));
+                }
+            }
+        });
+        let offenders = offenders.into_inner();
+        assert!(
+            offenders.is_empty(),
+            "パレットの項目名が空か `/` を含む（2 つを並べるなら「・」/「, 」で書く。#2322）:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// **表記を揃えた後も、旧来の打ち方でパレットから引ける**（#1830 / #2322）。
     ///
     /// 絞り込みは `PaletteItem::matches`（大文字小文字を問わない部分一致）の 1 本で、
     /// `palette_items` と同じく問い合わせを小文字にしてから渡す。旧の表記を覚えた人が
-    /// 打ちそうな語（テーマ・ライト・ダーク・言語・English …）を表示言語ごとに並べ、
-    /// その項目が候補に残ることを見る
+    /// 打ちそうな語（テーマ・ライト・ダーク・言語・English・表示・かんたん …）を
+    /// 表示言語ごとに並べ、その項目が候補に残ることを見る
     #[test]
-    fn パレットのテーマと表示言語は旧来の打ち方で引ける() {
+    fn パレットの項目は旧来の打ち方で引ける() {
         use tako_core::i18n::Lang;
         let source = include_str!("ui_text/palette.rs");
-        let cases: [(Lang, &str, &[&str]); 4] = [
+        let cases: [(Lang, &str, &[&str]); 7] = [
             (
                 Lang::Ja,
                 "toggle-theme",
@@ -98260,6 +98415,20 @@ mod app_menu_tests {
                 "toggle-language",
                 &["language", "Language", "日本語", "english", "switch"],
             ),
+            // #2322: 旧「表示モードを切り替え（かんたん / ターミナル）」
+            (
+                Lang::Ja,
+                "toggle-ui-mode",
+                &["表示", "モード", "表示モード", "かんたん", "ターミナル"],
+            ),
+            // #2322: 旧「Switch view mode (simple / terminal)」
+            (
+                Lang::En,
+                "toggle-ui-mode",
+                &["mode", "Mode", "simple", "terminal", "Terminal"],
+            ),
+            // #2322: 旧「新しいタブ」
+            (Lang::Ja, "new-tab", &["タブ", "新"]),
         ];
         let mut misses = Vec::new();
         for (lang, id, queries) in cases {
@@ -98278,8 +98447,64 @@ mod app_menu_tests {
         }
         assert!(
             misses.is_empty(),
-            "パレットの項目が旧来の打ち方で引けない（#1830）:\n  {}",
+            "パレットの項目が旧来の打ち方で引けない（#1830 / #2322）:\n  {}",
             misses.join("\n  ")
+        );
+    }
+
+    /// **スターターが出ない理由の「次の一手」は、表示メニューの項目名をそのまま書く**（#2322）。
+    ///
+    /// `tako_ui_mode` の `pane_display_reason.next_step` は tako-core（ui_text の外）で組むので、
+    /// メニューの表記を変えても追従しない。メニューが「表示モードを切替」なのに
+    /// 「表示モードを切り替え」と書いていて、案内どおりに探しても `tako menu invoke` に
+    /// 渡しても見つからなかった。両言語・両プラットフォームで、メニュー名と項目名を
+    /// そのままの形（日本語「表示メニューの「…」」・英語 `View menu > "…"`）で含むことを見る
+    #[test]
+    fn 表示モードの案内はメニューの項目名をそのまま書く() {
+        use tako_core::i18n::Lang;
+        use tako_core::platform::support::Platform;
+        use tako_core::ui_mode::TerminalReason;
+        let core = include_str!("../../tako-core/src/ui_mode.rs");
+        let at = |needle: &str| {
+            let line = core
+                .lines()
+                .position(|l| l.contains(needle))
+                .map_or(0, |i| i + 1);
+            format!("crates/tako-core/src/ui_mode.rs:{line}")
+        };
+        let mut problems = Vec::new();
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let step = TerminalReason::ModeTerminal
+                .next_step_for(platform)
+                .expect("ModeTerminal には次の一手がある");
+            for lang in [Lang::Ja, Lang::En] {
+                let mut want = String::new();
+                crate::ui_text::tests_support::with_lang(lang, || {
+                    let (view, item) = (
+                        crate::ui_text::menu::view(),
+                        crate::ui_text::menu::toggle_ui_mode(),
+                    );
+                    want = match lang {
+                        Lang::Ja => format!("{view}メニューの「{item}」"),
+                        Lang::En => format!("{view} menu > \"{item}\""),
+                    };
+                });
+                let text = step.text_in(lang);
+                if !text.contains(&want) {
+                    let line = at(match lang {
+                        Lang::Ja => "メニューの「",
+                        Lang::En => " menu > ",
+                    });
+                    problems.push(format!(
+                        "{line}: {platform:?} {lang:?} = {text:?} に {want:?} が無い"
+                    ));
+                }
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "表示モードの案内がメニューの項目名と違う（#2322）:\n  {}",
+            problems.join("\n  ")
         );
     }
 
