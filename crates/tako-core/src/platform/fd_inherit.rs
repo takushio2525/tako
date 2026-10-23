@@ -47,6 +47,15 @@
 //! 親だけで走る `mod arming` に閉じる。番犬 `issue1768_fd_inherit_watchdog.rs` が
 //! 子で走る側に確保・ロックの字面が生えたら名指す。
 //!
+//! ## PTY の子へは起動時の fd 上限を渡す（#2359）
+//!
+//! GUI は起動時に `RLIMIT_NOFILE` の soft を引き上げる（`fd_limit`）。PTY の子
+//! （ペインのシェル・tmux の attach クライアントと、それが起こす器の tmux サーバー）は、
+//! 同じ fork の子ハンドラで掃除の後に `fd_limit::restore_for_child` を呼び、起動時の soft へ
+//! 戻してから exec する（ユーザーのシェルの `ulimit -n` を修正前と同じに保つ）。
+//! daemon の `pre_exec` は戻さない（裏方は引き上げた値を受け継ぐ）。子ハンドラを置けない
+//! 環境（親で掃く逃げ道）では戻せず、子は引き上げた値を受け継ぐ
+//!
 //! ## Windows は掃かない
 //!
 //! Windows のハンドルは既定で継承されない。PTY（alacritty の ConPTY）は
@@ -165,12 +174,14 @@ mod sys {
     }
 
     /// `pthread_atfork` の子ハンドラ。構えたスレッドが起こした fork の子でだけ掃く
-    /// （fork 後の子のスレッドは fork したスレッドの写しなので `pthread_self` が一致する）
+    /// （fork 後の子のスレッドは fork したスレッドの写しなので `pthread_self` が一致する）。
+    /// 掃いた後に fd 上限を起動時の値へ戻す（#2359。引き上げていなければ何もしない）
     #[cfg(target_os = "macos")]
     pub(super) unsafe extern "C" fn on_fork_child() {
         let armed = ARMED.load(std::sync::atomic::Ordering::Acquire);
         if armed != 0 && armed == current_thread() {
             seal_all();
+            crate::platform::fd_limit::restore_for_child();
         }
     }
 

@@ -17,6 +17,7 @@ pub mod dpi;
 pub mod editor_keys;
 pub mod exe;
 pub mod fd_inherit;
+pub mod fd_limit;
 pub mod font;
 pub mod fs_copy;
 /// 上書きしない移動（境界 B28 の core 分。#1842）

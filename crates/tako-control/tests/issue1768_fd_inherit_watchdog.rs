@@ -19,6 +19,8 @@
 //! 2. [`pre_execは掃除を通す`] — 新しい fork + exec の子が掃除を通らない
 //! 3. [`掃除の本体は確保しない`] — fork 後・exec 前の子で走る本体（`pre_exec` と
 //!    fork の子ハンドラから呼ぶ）が async-signal-safe でなくなる（確保・ロック・出力）
+//! 4. [`fd上限を戻す本体も確保しない`] — 同じ fork の子ハンドラで走る fd 上限の戻し
+//!    （#2359。`fd_limit` の `mod child`）が async-signal-safe でなくなる
 
 use std::path::{Path, PathBuf};
 
@@ -33,6 +35,8 @@ const WRAP: &str = "spawn_sealed(";
 /// 包みの開きから `tty::new` までに許す行数（`spawn_sealed(|| {` の次の行に置く形）
 const WRAP_REACH: usize = 3;
 const FD_INHERIT: &str = "crates/tako-core/src/platform/fd_inherit.rs";
+/// fork の子で fd 上限を起動時の値へ戻す本体の置き場（#2359）
+const FD_LIMIT: &str = "crates/tako-core/src/platform/fd_limit.rs";
 
 /// `pre_exec` の中で使ってはいけない字面（確保・ロック・出力）
 const NOT_SIGNAL_SAFE: &[&str] = &[
@@ -178,6 +182,37 @@ fn unsafe_in_seal_body(rel: &str, code: &str) -> Vec<String> {
     out
 }
 
+/// 規則 4（#2359）: fd 上限を戻す本体（macOS の `mod child {` から列 0 の `}` まで）に
+/// 確保・ロック・出力の字面が無いか
+fn unsafe_in_restore_body(rel: &str, code: &str) -> Vec<String> {
+    let lines: Vec<&str> = code.lines().collect();
+    let Some(s) = (1..lines.len()).find(|&j| {
+        // 属性の文字列（"macos"）は眺めで潰れるので、cfg の形だけで macOS 側を選ぶ
+        lines[j].starts_with("mod child {")
+            && lines[j - 1].contains("cfg(target_os")
+            && !lines[j - 1].contains("not(")
+    }) else {
+        return vec![format!(
+            "{rel}: fd 上限を戻す本体（#[cfg(target_os = \"macos\")] mod child）が見つからない"
+        )];
+    };
+    let e = (s..lines.len()).find(|&j| lines[j] == "}").unwrap_or(s);
+    lines
+        .iter()
+        .enumerate()
+        .take(e + 1)
+        .skip(s)
+        .filter_map(|(j, line)| {
+            NOT_SIGNAL_SAFE.iter().find(|w| line.contains(**w)).map(|word| {
+                format!(
+                    "{rel}:{}: fork 後の子で fd 上限を戻す本体に `{word}` がある（async-signal-safe でない。#2359）",
+                    j + 1
+                )
+            })
+        })
+        .collect()
+}
+
 fn fail_if_any(what: &str, violations: Vec<String>) {
     assert!(
         violations.is_empty(),
@@ -229,6 +264,15 @@ fn 掃除の本体は確保しない() {
 }
 
 #[test]
+fn fd上限を戻す本体も確保しない() {
+    let src = std::fs::read_to_string(repo_root().join(FD_LIMIT)).expect("fd_limit.rs を読める");
+    fail_if_any(
+        "fd 上限を戻す本体が fork 後の子の中で呼べない",
+        unsafe_in_restore_body(FD_LIMIT, &code_of(FD_LIMIT, &src)),
+    );
+}
+
+#[test]
 fn 検査は実際の違反を検出する() {
     // 規則 1: 掃除を通さない PTY の起動を名指す / 通していれば黙る
     let bare = "fn spawn() {\n    let x = 1;\n    let pty = tty::new(&o, w, 0);\n}\n";
@@ -263,4 +307,13 @@ fn 検査は実際の違反を検出する() {
     assert!(found[0].starts_with("t.rs:7: "), "{found:?}");
     // 本体が見つからない形（名前が変わった）も黙らない
     assert_eq!(unsafe_in_seal_body("t.rs", "fn other() {}\n").len(), 1);
+
+    // 規則 4（#2359）: fd 上限を戻す本体に確保が生えたら名指す / 素の形は黙る
+    let restore = "#[cfg(target_os = \"macos\")]\nmod child {\n    pub fn restore() {\n        let s = format!(\"x\");\n    }\n}\n#[cfg(not(target_os = \"macos\"))]\nmod child {\n    pub fn restore() { let v = Vec::new(); }\n}\n";
+    let found = unsafe_in_restore_body("t.rs", restore);
+    assert_eq!(found.len(), 1, "macOS 側だけを見る: {found:?}");
+    assert!(found[0].starts_with("t.rs:4: "), "{found:?}");
+    let clean = "#[cfg(target_os = \"macos\")]\nmod child {\n    pub fn restore() {\n        unsafe { libc::setrlimit(0, std::ptr::null()) };\n    }\n}\n";
+    assert!(unsafe_in_restore_body("t.rs", clean).is_empty());
+    assert_eq!(unsafe_in_restore_body("t.rs", "fn other() {}\n").len(), 1);
 }

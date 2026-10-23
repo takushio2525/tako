@@ -31919,6 +31919,12 @@ fn main() {
             note.text(),
         ));
     }
+    // #2359: fd の上限（RLIMIT_NOFILE）の soft を min(hard, OPEN_MAX, kern.maxfilesperproc) へ
+    // 引き上げる。Finder 起動は launchd の既定 256 を受け継ぎ、約 60 ペインで枯渇して IPC が
+    // 「繋がるが送信で ENOTCONN」になっていた。**最初の PTY より前**に置く（ペインの子へ
+    // 起動時の値を戻す構えもここで決まる）。persist.log の置き場は上の隔離の env で決まるので
+    // その後。上げられなくても起動は続ける（記録だけ。A/B は `TAKO_2359_LEGACY=1`）
+    persist_diag(&tako_core::platform::fd_limit::raise_at_startup().log_line());
     // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
     {
         let settings = tako_control::settings::load();
