@@ -521,9 +521,10 @@ fn dispatch_route(
             (200, value)
         }
         // status は `app_dispatch` の分類（400 = 頼み方が悪い / 500 = 内部 / 503 = app 不在）。
-        // 「見つからない」だけは 404 へ寄せる（**無いもの**と**壊れた頼み方**を画面が区別できる）
+        // 「見つからない」だけは 404 へ寄せる（**無いもの**と**壊れた頼み方**を画面が区別できる）。
+        // 表示言語で日英どちらにもなる（#1762）ので、読み方は 1 実装を通す
         Err((status, message)) => {
-            let status = if message.contains("見つからない") {
+            let status = if crate::dispatch::DispatchError::says_not_found(&message) {
                 404
             } else {
                 status
