@@ -1,3 +1,6 @@
+#Requires -Version 7.0
+# pwsh 7 専用（#2329）。Windows PowerShell 5.1 は BOM の無い UTF-8 の日本語を ANSI として読み構文が崩れるので、1 行目の #Requires で理由を出して止める
+
 # release-assets.ps1 — リリースアセット命名規則の PowerShell 側の写し（#594 / #595 / #587）
 #
 # **判定ロジックの正は crates/tako-core/src/platform/release_assets.rs**。

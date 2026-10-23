@@ -119,8 +119,12 @@ fn 計測スクリプトはdpi認識を自分で宣言する() {
         path.display()
     );
     // PowerShell 5.1 は BOM の無い .ps1 を CP932 として読む。非 ASCII を混ぜると
-    // 行が食われて**構文エラーも出さずに次の行が消える**（このセッションで実際に踏んだ）
+    // 行が食われて**構文エラーも出さずに次の行が消える**（このセッションで実際に踏んだ）。
+    // いまは BOM 付きで保存してある（#2329。番犬 powershell51_watchdog）が、エディタが BOM を
+    // 落としても化けないよう ASCII も保つ。先頭の BOM はこの検査の外
     let non_ascii: Vec<(usize, &str)> = src
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&src)
         .lines()
         .enumerate()
         .filter(|(_, l)| !l.is_ascii())

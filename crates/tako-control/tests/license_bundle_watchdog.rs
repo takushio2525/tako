@@ -440,7 +440,7 @@ fn ps_quote(path: &Path) -> String {
 ///
 /// pwsh が無い環境（素の Linux コンテナ等）ではスキップする。macOS の CI ランナーと Windows には
 /// pwsh があるので CI では必ず走る。Windows PowerShell 5.1 は起こさない（installer の .ps1 は
-/// BOM の無い UTF-8 で日本語を含み、5.1 は ANSI として読む。リリースの経路はすべて pwsh 7）
+/// BOM の無い UTF-8 で日本語を含み pwsh 7 必須。5.1 では 1 行目の #Requires で止まる = #2329）
 #[test]
 fn windowsのリリース検査の読み手が表どおりに読み崩れを名指しで落ちる() {
     // 表に足す架空の 1 本（本物の表に入りうる名前と重ならない合成名）

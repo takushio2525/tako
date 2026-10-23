@@ -567,6 +567,45 @@ CI ジョブでしか分からない値になり、壊れたことに気づく�
   なければ同梱の `powershell.exe`（5.1）へ落ちる。`&&` は pwsh 7 専用なので
   `;` + `if ($?) { … }` で書き、パスは `./` ではなく `.\`、生成物は `.exe` を付ける
 
+## リポジトリの .ps1 は「5.1 で読める」か「理由を出して止まる」かを先頭で決める（Issue #2329）
+
+Windows に最初から入っているのは Windows PowerShell 5.1 だけで、5.1 は **BOM の無い `.ps1` を
+ANSI コードページ**（英語版 = CP1252 / 日本語版 = CP932）として読む。BOM の無い UTF-8 で日本語を
+書くと、文字列やコメントの境目が崩れて構文エラーになる（CP932 では改行まで食われ、構文エラーも
+出さずに次の行が消えることもある）。#2329 の着手時は installer の 5 本がすべてそうだった
+（`verify-assets.ps1` は CP1252 で 22 件 / CP932 で 27 件）。リリースの経路は pwsh 7 だけなので
+気づけない。そこで `.ps1` / `.psm1` はどれも次のどちらかにする:
+
+- **(A) 5.1 でも読める = UTF-8 with BOM で保存する**。利用者（tako をインストールする人）が
+  自分の手で走らせうるものはこちら。5.1（.NET Framework 4.x）に無い API も呼ばない
+  （例: `[System.IO.Path]::GetRelativePath` は .NET Core 2.0 から。番犬が綴りで名指しする）
+- **(B) pwsh 7 必須 = 1 行目を `#Requires -Version 7.0` にする**。開発者・CI・リリース作業だけが
+  走らせるものはこちら。5.1 は構文解析のエラーより先に #Requires を確かめ、
+  `ScriptRequiresUnmatchedPSVersion` で理由を出して止まる。**1 行目**に置くのは、それより前に
+  非 ASCII があると ANSI の復号で行ごと食われうるため（2 行目以降の #Requires は番犬が認めない）。
+  #Requires の塊と `<# .SYNOPSIS … #>` の間には**空行を 1 行**置く（行コメントが help の直前に
+  隣接すると Get-Help が help を拾わず構文だけを返す。`# tako:run:` の行も同じ）
+- どちらか迷ったら (A) に倒す。例外は番犬の `EXEMPT` の表だけ（理由を必ず書く）
+
+| ファイル | 走らせる人（根拠） | 判断 |
+|---|---|---|
+| `installer/windows/build-installer.ps1` | CI（`release-windows.yml` の `pwsh -File`）と `release-windows.ps1`・`commands.md` の `pwsh -File` | (B) |
+| `installer/windows/release-windows.ps1` | CI が使えないときのリリース作業（`AGENTS.md` / `release.sh` / `nightly-release.sh` の案内が `pwsh -File`） | (B) |
+| `installer/windows/make-icon.ps1` | 開発者（`.ico` はコミット済み。`commands.md` の `pwsh -File`） | (B) |
+| `installer/windows/lib/release-assets.ps1` | 上の 3 本と `verify-assets.ps1` が dot-source・`release_assets.rs` のテストが pwsh で | (B) |
+| `installer/windows/lib/verify-assets.ps1` | CI（`shell: pwsh` で dot-source）と `release-windows.ps1`・`license_bundle_watchdog` が pwsh で | (B) |
+| `scripts/windows/measure-window.ps1` | 開発者の実機計測。本文の Usage が `powershell -File`（5.1）で、もともと 5.1 向けに ASCII で書いてある | (A) |
+| `scripts/windows/check-powershell51.ps1` | CI の windows ジョブが `shell: powershell`（5.1）で走らせる | (A) |
+| `crates/tako-core/shell-integration/tako.ps1` | 利用者の `$PROFILE` から読む（5.1 を含む）。リポジトリの写しは `include_str!` のテンプレートで ASCII（番犬あり）、配置時に BOM を付けて書く | 例外（`EXEMPT`） |
+
+- 番犬 `crates/tako-control/tests/powershell51_watchdog.rs` が全 `.ps1` を走査し、どちらでもない
+  ファイルを名指しして落とす（新しく足したものにも当たる）。pwsh があれば
+  `scripts/windows/check-powershell51.ps1` を走らせ、5.1 の読み方を写して（BOM が無ければ CP1252 と
+  CP932 で復号して構文解析）宣言どおりかを見る
+- 5.1 の実物での確認は CI の windows ジョブの段（`shell: powershell`）。(B) は一時 dir へ写した複製を
+  `powershell.exe -File` で起こし、理由を出して止まるところまで見る。手元で同じことを見るには
+  `pwsh -File scripts/windows/check-powershell51.ps1`（5.1 の読み方の写し）
+
 ## 器の中のシェルへ渡す前提は「名前の推測」に頼らない（Issue #1105）
 
 器（tmux / psmux）のサーバーは**最初のクライアントの環境を引き継ぎ**、後続の

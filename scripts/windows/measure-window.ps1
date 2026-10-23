@@ -1,4 +1,4 @@
-# Measure a tako window on Windows in TRUE PHYSICAL pixels (#1063). ASCII only.
+﻿# Measure a tako window on Windows in TRUE PHYSICAL pixels (#1063). ASCII only.
 #
 # Why this script exists
 # ----------------------
@@ -14,7 +14,8 @@
 # So: always measure with this script, or with something that declares PerMonitorV2 and
 # verifies that the declaration took effect. It refuses to run if it cannot.
 #
-# PowerShell 5.1 reads a BOM-less .ps1 as the system code page, so keep this file ASCII.
+# Saved as UTF-8 with a BOM so Windows PowerShell 5.1 reads it as UTF-8 (#2329). Keep it
+# ASCII anyway: if an editor drops the BOM, 5.1 reads it as the system code page again.
 #
 # Usage (run it in the interactive session -- see .agent/plans/2026-08-windows-main-merge-wip.md):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File measure-window.ps1 `

@@ -1,3 +1,6 @@
+#Requires -Version 7.0
+# pwsh 7 専用（#2329）。Windows PowerShell 5.1 は BOM の無い UTF-8 の日本語を ANSI として読み構文が崩れるので、1 行目の #Requires で理由を出して止める
+
 <#
 .SYNOPSIS
     Windows 配布物のスモーク検査（#587 / #965）。
@@ -68,7 +71,6 @@ function Test-TakoSameVersion([string]$a, [string]$b) {
     表が無い・1 本も無い・「元ファイル Windows での名前」の 2 列でない行があれば、表の file:line を
     名指しして throw する（空の表のまま検査を素通りさせない）。行の読み方は
     scripts/lib/license-bundle.sh の tako_license_bundle と同じ（# で始まる行と空行は飛ばす）。
-    PowerShell 5.1 でも動く書き方にする（?? や三項演算子を使わない）
 #>
 function Get-TakoLicenseBundle {
     $table = Join-Path $TakoRepoRoot $TakoLicenseBundleTable
