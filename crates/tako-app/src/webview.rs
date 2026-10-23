@@ -20,20 +20,39 @@ use std::sync::{Arc, Mutex};
 use tako_core::PaneId;
 
 /// GPUI ウィンドウの生ハンドルを保持して wry の親にするラッパー。
-/// `gpui::Window` は render 中しか触れないため、初回 render で採取した
+/// `gpui::Window` は render 中しか触れないため、render で採取した
 /// `RawWindowHandle` を保持し、dispatch（IPC / MCP）からの webview 生成でも使う。
 ///
-/// SAFETY: tako は単一ウィンドウ構成で、ウィンドウ破棄 = アプリ終了。
-/// ハンドル（macOS では NSView ポインタ）はアプリ生存中ずっと有効
-pub struct WindowHandleBox(raw_window_handle::RawWindowHandle);
+/// **採った窓が閉じたら採り直す**（#1837）。以前は「tako は単一ウィンドウ構成で、
+/// ウィンドウ破棄 = アプリ終了」を前提に初回 render で 1 度だけ採っていたが、
+/// 複数ウィンドウ（#339 で最初の窓を閉じる）と macOS の Dock 復帰（#381 で最後の窓を
+/// 閉じて開き直す）でこの前提は崩れていた。閉じた窓の描画ビューを親にすると、wry は
+/// 親の NSWindow を `ns_view.window().unwrap()`（wkwebview/mod.rs:392）で引くので、
+/// 窓が解放されていれば **panic でプロセスごと落ちる**。解放されていなければ
+/// 閉じた窓の中に見えない Web ビューを作る。採り直しの判定は呼び出し側
+/// （`TakoApp::refresh_webview_parent`）が [`Self::owner`] と [`Self::attached`] で行う
+pub struct WindowHandleBox {
+    raw: raw_window_handle::RawWindowHandle,
+    /// 採った GPUI の窓（#1837。この窓が閉じたら採り直す）
+    owner: gpui::AnyWindowHandle,
+}
 
 impl WindowHandleBox {
     pub fn from_window(window: &gpui::Window) -> Option<Self> {
         // gpui::Window には同名の inherent メソッド（AnyWindowHandle を返す）があるため、
         // raw-window-handle の trait メソッドを明示的に呼ぶ
-        raw_window_handle::HasWindowHandle::window_handle(window)
-            .ok()
-            .map(|h| Self(h.as_raw()))
+        let raw = raw_window_handle::HasWindowHandle::window_handle(window)
+            .ok()?
+            .as_raw();
+        let handle = Self {
+            raw,
+            owner: window.window_handle(),
+        };
+        // 描画ビューを tako も retain する（#1837）。gpui は窓を閉じると描画ビューを
+        // 窓ごと手放すので、持っていないと採り直すまでのあいだ解放済みのポインタになり、
+        // 「窓に載っているか」を問うこと自体ができない（Drop で release する）
+        key_monitor::retain_view(handle.ns_view_ptr());
+        Some(handle)
     }
 
     /// wry の親ビュー（macOS では gpui の描画ビュー `GPUIView` の NSView）。
@@ -41,11 +60,44 @@ impl WindowHandleBox {
     fn ns_view_ptr(&self) -> *const std::ffi::c_void {
         #[cfg(target_os = "macos")]
         {
-            if let raw_window_handle::RawWindowHandle::AppKit(h) = &self.0 {
+            if let raw_window_handle::RawWindowHandle::AppKit(h) = &self.raw {
                 return h.ns_view.as_ptr() as *const std::ffi::c_void;
             }
         }
         std::ptr::null()
+    }
+
+    /// 親を言い分ける値（macOS = 描画ビュー / Windows = HWND。#1837）。
+    /// Web ビューが「いまの親の子か」を突き合わせるのに使う
+    pub fn key(&self) -> usize {
+        match &self.raw {
+            raw_window_handle::RawWindowHandle::AppKit(h) => h.ns_view.as_ptr() as usize,
+            raw_window_handle::RawWindowHandle::Win32(h) => h.hwnd.get() as usize,
+            _ => 0,
+        }
+    }
+
+    /// 採った GPUI の窓（#1837）
+    pub fn owner(&self) -> gpui::AnyWindowHandle {
+        self.owner
+    }
+
+    /// 親がいまも窓に載っているか（#1837。macOS = 描画ビューの `window` が nil でない /
+    /// Windows = HWND が生きている）。偽のまま wry へ渡すと macOS は panic する
+    pub fn attached(&self) -> bool {
+        match &self.raw {
+            raw_window_handle::RawWindowHandle::AppKit(_) => {
+                key_monitor::view_has_window(self.ns_view_ptr())
+            }
+            raw_window_handle::RawWindowHandle::Win32(h) => win32_window_alive(h.hwnd.get()),
+            _ => true,
+        }
+    }
+}
+
+impl Drop for WindowHandleBox {
+    fn drop(&mut self) {
+        key_monitor::release_view(self.ns_view_ptr());
     }
 }
 
@@ -53,9 +105,35 @@ impl raw_window_handle::HasWindowHandle for WindowHandleBox {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        // SAFETY: 上記のとおり単一ウィンドウでアプリと同寿命
-        unsafe { Ok(raw_window_handle::WindowHandle::borrow_raw(self.0)) }
+        // SAFETY: 描画ビューは from_window で retain しているので、このラッパーが
+        // 生きているあいだは解放されない（窓から外れていることはある = 呼び出し側が
+        // `attached` を見てから wry へ渡す。#1837）
+        unsafe { Ok(raw_window_handle::WindowHandle::borrow_raw(self.raw)) }
     }
+}
+
+/// HWND が生きているか（Windows。#1837）
+#[cfg(windows)]
+fn win32_window_alive(hwnd: isize) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsWindow(hwnd: isize) -> i32;
+    }
+    // SAFETY: IsWindow は任意の値を受け取り、窓でなければ 0 を返すだけ
+    unsafe { IsWindow(hwnd) != 0 }
+}
+
+#[cfg(not(windows))]
+fn win32_window_alive(_hwnd: isize) -> bool {
+    true
+}
+
+/// 親が窓に載っていないので Web ビューを作らない理由（#1837。CLI / MCP の応答と
+/// persist.log の同じ 1 文）
+pub fn detached_parent_error() -> String {
+    "Web ビューの親（tako の窓）が閉じているので Web ビューを作れない。\
+     tako の窓を開いてから開き直す（#1837）"
+        .to_string()
 }
 
 /// フレーム同期をルート render で行う新経路（#838）を切る逃げ道
@@ -161,17 +239,22 @@ pub struct WebViewEntry {
     pub(crate) bounds_sets: u64,
     /// eval トークン採番
     next_eval_token: u64,
+    /// いまの親（[`WindowHandleBox::key`]。#1837）。親を採り直したら
+    /// [`Self::adopt_parent`] がこれと突き合わせて付け替える
+    parent: usize,
 }
 
 impl WebViewEntry {
     /// wry WebView を GPUI ウィンドウの子ビューとして生成する。
     /// 生成直後は不可視（次フレームの `sync_frame` で表示位置が決まる）
-    pub fn build(
-        window: &impl raw_window_handle::HasWindowHandle,
-        id: WebViewId,
-        url: &str,
-    ) -> Result<Self, String> {
+    pub fn build(window: &WindowHandleBox, id: WebViewId, url: &str) -> Result<Self, String> {
         validate_url(url)?;
+        // 親が窓に載っていなければ wry へ渡さない（#1837。#334 と同じく、wry の unwrap に
+        // 届く前に断る = tako 全体を落とさない）。macOS の wry は親の NSWindow を
+        // `ns_view.window().unwrap()` で引くので、渡すと panic する
+        if !window.attached() {
+            return Err(detached_parent_error());
+        }
         let track_nav = should_track_nav(url);
         let shared = Arc::new(Mutex::new(WebShared {
             url: url.to_string(),
@@ -251,13 +334,98 @@ impl WebViewEntry {
             visible_flips: 0,
             bounds_sets: 0,
             next_eval_token: 1,
+            parent: window.key(),
         })
+    }
+
+    /// いまの親（`parent`）の子か（#1837。`tako web list` の `attached`）
+    pub fn parented_to(&self, parent: &WindowHandleBox) -> bool {
+        self.parent == parent.key()
+    }
+
+    /// 親を採り直したとき、閉じた窓の描画ビューの子のままの Web ビューを新しい親へ
+    /// 付け替える（#1837）。付け替えたら true。
+    ///
+    /// macOS は描画ビューへ `addSubview:` する（AppKit が古い親から外す）。wry の
+    /// `reparent` は窓の `contentView` へ足すので使わない: キー入力の宛先を戻す先は
+    /// WKWebView の superview = gpui の描画ビューでなければならない（#326 / #1481）。
+    /// Windows は親の HWND が壊れると子の WebView2 の窓も壊れるので付け替えられない
+    /// （窓を閉じた時点でそのページは失われる。生成と位置合わせは落ちない）
+    pub fn adopt_parent(&mut self, parent: &WindowHandleBox) -> bool {
+        if self.parented_to(parent) || !parent.attached() {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use wry::WebViewExtMacOS;
+            let wk = self.view.webview();
+            let wk_ptr = &*wk as *const _ as *const std::ffi::c_void;
+            if !key_monitor::add_subview(parent.ns_view_ptr(), wk_ptr) {
+                return false;
+            }
+            self.parent = parent.key();
+            // 窓が変わると寸法・倍率も変わりうるので、次のフレームで必ず張り直す
+            self.bounds_now = None;
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// WKWebView がいま窓に載っているか（#1837。macOS の wry は位置合わせ・focus で
+    /// `webview.window().unwrap()` を引くので、偽のまま呼ぶと panic する）
+    fn in_window(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use wry::WebViewExtMacOS;
+            let wk = self.view.webview();
+            key_monitor::view_has_window(&*wk as *const _ as *const std::ffi::c_void)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
+
+    /// キー入力の宛先を親（**いまの** superview = gpui の描画ビュー）へ返す（#1837）。
+    ///
+    /// wry の `focus_parent` は**生成時の**親ビューを宛先にする（wry が retain した `ns_view`）。
+    /// 親を付け替えた後にそれを使うと、窓に居ないビューを first responder にしようとして
+    /// 失敗し、**NSWindow 自身**が宛先になる（実測: その状態で #1481 の宛先読みが
+    /// first responder へ `superview` を送り、NSWindow は応答しないので unrecognized
+    /// selector の例外で abort した）。「WKWebView の superview が常に正しい宛先」（#1481）を
+    /// その場で AppKit に聞く。付け替えていない Web ビューでは wry と同じ宛先になる
+    fn focus_parent(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            use wry::WebViewExtMacOS;
+            let wk = self.view.webview();
+            key_monitor::focus_superview(&*wk as *const _ as *const std::ffi::c_void);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = self.view.focus_parent();
+        }
+    }
+
+    /// ページへキー入力の宛先を渡す（#1481）。窓に載っていなければ渡さない（#1837）
+    pub fn focus(&self) -> Result<(), String> {
+        if !self.in_window() {
+            return Err(detached_parent_error());
+        }
+        self.view.focus().map_err(|e| e.to_string())
     }
 
     /// フレーム同期: 表示すべきなら bounds（論理 px）を渡し、隠すなら None。
     /// 実際の AppKit / Win32 呼び出しは値が変わったときだけ行う
     pub fn sync_frame(&mut self, bounds: Option<(f64, f64, f64, f64)>) {
         match bounds {
+            // 窓に載っていない Web ビューは置けない（#1837。wry の set_bounds が
+            // `webview.window().unwrap()` で panic する）。親を採り直して付け替えれば
+            // 次のフレームで置かれる
+            Some(_) if !self.in_window() => {}
             Some((x, y, w, h)) => {
                 if self.bounds_now != Some((x, y, w, h)) {
                     let _ = self.view.set_bounds(wry::Rect {
@@ -277,7 +445,7 @@ impl WebViewEntry {
                 if self.visible_now {
                     // 隠す前にフォーカスを親（GPUI ウィンドウ）へ返す。
                     // 返さないとキー入力が不可視 webview に吸われ続ける
-                    let _ = self.view.focus_parent();
+                    self.focus_parent();
                     let _ = self.view.set_visible(false);
                     self.visible_now = false;
                     self.visible_flips = self.visible_flips.saturating_add(1);
@@ -639,6 +807,12 @@ mod key_monitor {
         if f_bool(first_resp, ik_sel, wk_cls) {
             return Some(first_resp);
         }
+        // first responder は NSView とは限らない（宛先が無いと **NSWindow 自身**になる）。
+        // NSView でないものへ `superview` を送ると unrecognized selector の例外で落ちる（#1837）
+        let view_cls = cls("NSView");
+        if view_cls.is_null() || !f_bool(first_resp, ik_sel, view_cls) {
+            return None;
+        }
         let parent = f_id(first_resp, sel("superview"));
         if !parent.is_null() && f_bool(parent, ik_sel, wk_cls) {
             return Some(parent);
@@ -692,6 +866,67 @@ mod key_monitor {
     /// キー入力の宛先を `view`（gpui の描画ビュー）へ戻す。戻したら true
     pub(super) fn return_to_app(view: *const c_void) -> bool {
         unsafe { restore_from_window(window_of_view(view), view) }
+    }
+
+    // ── wry の親（gpui の描画ビュー）の生存と付け替え（#1837） ──
+
+    /// `retain` / `release` を送る（null なら何もしない）
+    fn send_void(obj: *const c_void, selector: &str) {
+        if obj.is_null() {
+            return;
+        }
+        unsafe {
+            let f: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            f(obj, sel(selector));
+        }
+    }
+
+    /// 親ビューを tako も持つ（窓が閉じても解放済みのポインタにしない）
+    pub(super) fn retain_view(view: *const c_void) {
+        send_void(view, "retain");
+    }
+
+    /// [`retain_view`] の対
+    pub(super) fn release_view(view: *const c_void) {
+        send_void(view, "release");
+    }
+
+    /// NSView がいま窓に載っているか（`window` が nil でない）
+    pub(super) fn view_has_window(view: *const c_void) -> bool {
+        unsafe { !window_of_view(view).is_null() }
+    }
+
+    /// `view` の superview を、その窓のキー入力の宛先にする（#1837）。宛先にできたら true
+    pub(super) fn focus_superview(view: *const c_void) -> bool {
+        unsafe {
+            let window = window_of_view(view);
+            if window.is_null() {
+                return false;
+            }
+            let f_id: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let f_mk: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> bool =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let parent = f_id(view, sel("superview"));
+            if parent.is_null() {
+                return false;
+            }
+            f_mk(window, sel("makeFirstResponder:"), parent)
+        }
+    }
+
+    /// `child` を `parent` の子へ移す（AppKit が古い親から外す）。送ったら true
+    pub(super) fn add_subview(parent: *const c_void, child: *const c_void) -> bool {
+        if parent.is_null() || child.is_null() {
+            return false;
+        }
+        unsafe {
+            let f: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            f(parent, sel("addSubview:"), child);
+        }
+        true
     }
 
     /// NSEvent local monitor のコールバック。
@@ -790,6 +1025,12 @@ mod key_monitor {
     }
     pub(super) fn return_to_app(_view: *const c_void) -> bool {
         false
+    }
+    /// 親ビューの retain は macOS だけ（#1837。Windows の親は HWND で、生存は IsWindow で見る）
+    pub(super) fn retain_view(_view: *const c_void) {}
+    pub(super) fn release_view(_view: *const c_void) {}
+    pub(super) fn view_has_window(_view: *const c_void) -> bool {
+        true
     }
 }
 
@@ -967,5 +1208,86 @@ mod tests {
         assert!(!s.can_go_back);
         assert!(!s.can_go_forward);
         assert!(s.pending_new_window_urls.is_empty());
+    }
+
+    /// `src` の中の関数 `sig` の本文（次の同じ深さの `fn` の手前まで）
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("{sig} が見つからない"));
+        let rest = &src[start + sig.len()..];
+        let end = [
+            "\n    pub fn ",
+            "\n    fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(super) fn ",
+            "\n    unsafe fn ",
+        ]
+        .iter()
+        .filter_map(|next| rest.find(next))
+        .min()
+        .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// 本文の中で `guard` が `call` より前に出るか（どちらも無ければ偽）
+    fn guarded(body: &str, guard: &str, call: &str) -> bool {
+        matches!((body.find(guard), body.find(call)), (Some(g), Some(c)) if g < c)
+    }
+
+    /// **wry の `window().unwrap()` に届く前に、親・自分が窓に載っているかを見る**（#1837）。
+    ///
+    /// macOS の wry は生成（wkwebview/mod.rs:392 / 607）・位置合わせ（:1013）・focus（:1039）で
+    /// 親や WKWebView の NSWindow を `unwrap()` で引くので、窓から外れたまま呼ぶと panic で
+    /// tako 全体が落ちる（セルフテスト項目 79 → 155 の実測）。#334 と同じく、tako 側で
+    /// 先に断る形を固定する。どれかの検査を消すと落ちる
+    #[test]
+    fn issue1837_wryのunwrapに届く前に窓に載っているかを見る() {
+        let src = include_str!("webview.rs");
+        let build = fn_body(src, "pub fn build(");
+        assert!(
+            guarded(build, "window.attached()", ".build_as_child("),
+            "WebViewEntry::build が親の生存を見ずに wry へ渡している（#1837）"
+        );
+        let sync = fn_body(src, "pub fn sync_frame(");
+        assert!(
+            guarded(sync, "self.in_window()", "self.view.set_bounds("),
+            "sync_frame が窓に載っているかを見ずに set_bounds を呼んでいる（#1837）"
+        );
+        let focus = fn_body(src, "pub fn focus(&self)");
+        assert!(
+            guarded(focus, "self.in_window()", "self.view.focus()"),
+            "focus が窓に載っているかを見ずに wry の focus を呼んでいる（#1837）"
+        );
+        // 隠すときの宛先の戻しは wry の focus_parent（生成時の親）ではなく、いまの superview へ
+        assert!(
+            !sync.contains("self.view.focus_parent()"),
+            "sync_frame が wry の focus_parent を直に呼んでいる。付け替えた後は生成時の親が\
+             窓に居ないので NSWindow 自身が宛先になる（#1837）。self.focus_parent() を通すこと"
+        );
+        // first responder へ superview を送る前に NSView かを見る
+        let holding = fn_body(src, "unsafe fn webview_holding_focus(");
+        assert!(
+            guarded(holding, "cls(\"NSView\")", "sel(\"superview\")"),
+            "webview_holding_focus が NSView か確かめずに first responder へ superview を送っている。\
+             宛先が NSWindow 自身のとき unrecognized selector の例外で落ちる（#1837）"
+        );
+        // 呼び出し側は wry の focus / set_bounds を直に呼ばない（上の検査を素通りする）
+        let main = include_str!("main.rs");
+        for direct in [".view.focus()", ".view.set_bounds(", ".view.focus_parent()"] {
+            assert!(
+                !main.contains(direct),
+                "main.rs が `{direct}` を直に呼んでいる。WebViewEntry の focus / sync_frame を通すこと（#1837）"
+            );
+        }
+    }
+
+    /// 親が閉じているときの理由は CLI / MCP の応答と persist.log で同じ 1 文（#1837）
+    #[test]
+    fn issue1837_親が閉じているときの理由は何をすればよいかを言う() {
+        let reason = detached_parent_error();
+        assert!(reason.contains("Web ビューの親"));
+        assert!(reason.contains("窓を開いて"));
+        assert!(reason.contains("#1837"));
     }
 }
