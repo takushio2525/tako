@@ -364,7 +364,12 @@ pub fn split_pane_died_dump(probe: crate::tmux::PaneLogProbe, text: &str) -> Opt
 /// `session` の書き出しを読んで消す（#2085）。無ければ None。
 ///
 /// 1 つのセッションが消えるのは 1 回なので普通は 1 つしか無い。複数あれば
-/// 新しいものを読み、残りも消す（読まれない書き出しを溜めない）
+/// 新しいものを読み、残りも消す（読まれない書き出しを溜めない）。
+///
+/// **器が消えた後に呼ぶ**（#2357）。フックは書き終えてから `kill-pane` するので、消えた後なら
+/// 書き終わっている。書きかけ（履歴に足りない）を読むと壊れた書き出しとして消し、残りの
+/// 書き込みは名前の無いファイルへ行く = 書き出しが失われる。製品は attach クライアントが
+/// 終わった後（`CloseOrigin::ProcessExit`）にだけ呼ぶ
 pub fn take_pane_died_dump(dir: &Path, session: &str) -> Option<PaneDiedDump> {
     let mut found: Vec<(std::time::SystemTime, PathBuf, crate::tmux::PaneLogProbe)> =
         std::fs::read_dir(dir)
@@ -1060,7 +1065,7 @@ mod tests {
     /// 状態待ちが予算切れしたときの材料（#1252）。
     /// 規約どおり「**何を待っていたか** / **実際に何が届いたか**」を必ず持つ
     #[cfg(unix)]
-    struct WaitTimeout {
+    pub(super) struct WaitTimeout {
         /// 診断行の見出し（CI ログを Issue 番号で grep できるようにする）。
         /// 既定は #1252 で、呼び出し側が [`WaitTimeout::tagged`] で名乗り直す
         tag: &'static str,
@@ -1076,13 +1081,13 @@ mod tests {
     impl WaitTimeout {
         /// 観測材料を後から載せる。待ちのあいだ `session` を可変で借りている
         /// 呼び出し側でも、`wait_for_state` から戻ったあとなら画面を読める
-        fn observed(mut self, observed: impl Into<String>) -> Self {
+        pub(super) fn observed(mut self, observed: impl Into<String>) -> Self {
             self.observed = observed.into();
             self
         }
 
         /// 診断行の見出しを呼び出し側の Issue 番号にする（#1265）
-        fn tagged(mut self, tag: &'static str) -> Self {
+        pub(super) fn tagged(mut self, tag: &'static str) -> Self {
             self.tag = tag;
             self
         }
@@ -1115,9 +1120,10 @@ mod tests {
     /// 固定の回数上限は持たない。予算切れなら診断つきの [`WaitTimeout`] を返す。
     ///
     /// `step` は**毎周期の駆動**（イベントの取り込み・ホイールの打ち直し）も担う
-    /// = 「1 回だけ打って待つ」形を作れないようにしてある
+    /// = 「1 回だけ打って待つ」形を作れないようにしてある。
+    /// 器の死の書き出しのテスト（`pane_died_tests`。#2357）も同じ 1 実装で待つ
     #[cfg(unix)]
-    fn wait_for_state<T>(
+    pub(super) fn wait_for_state<T>(
         what: &str,
         base: std::time::Duration,
         tick: std::time::Duration,
@@ -3983,32 +3989,76 @@ mod pane_died_tests {
         assert!(r.status.success(), "{r:?}");
     }
 
+    /// 器の死・消滅を待つ上限の基準（#2357）。止まったときの保険で、合図は状態
+    /// （混み具合で `wait_budget::state_wait_budget` が伸ばす）
+    #[cfg(unix)]
+    const VESSEL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// 器が消えたと**確かめられる**まで待つ（#2357）。上限で偽 + 診断を stderr へ。
+    ///
+    /// 消えたの判定は製品の `backend_reattach::probe_session`（セッションが無い・
+    /// サーバーごと無い）。`has_session` の偽は打ち切り・起動失敗でも偽なので使わない
     #[cfg(unix)]
     fn wait_gone(socket: &str, name: &str) -> bool {
-        for _ in 0..100 {
-            if !crate::tmux::has_session(Some(socket), name) {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        false
+        use crate::backend_reattach::{probe_session, SessionProbe};
+        let mut last = SessionProbe::Unknown;
+        super::tests::wait_for_state(
+            &format!("器 {name} が消える"),
+            VESSEL_WAIT,
+            std::time::Duration::from_millis(100),
+            || {
+                last = probe_session(socket, name);
+                matches!(last, SessionProbe::SessionGone | SessionProbe::ServerGone).then_some(())
+            },
+        )
+        .map_err(|e| {
+            eprintln!(
+                "{}",
+                e.observed(format!("{last:?}")).tagged("TAKO_2357_WAIT")
+            )
+        })
+        .is_ok()
     }
 
-    /// 書き出しが現れるまで待って読む（最大 20 秒）。
+    /// 器が消えたと確かめてから、その死の書き出しを読む（#2357）。無ければ名指しで落とす。
     ///
-    /// 書き出しは器のペインが死んだときにしか作られないので、これが「死んだ」の合図。
-    /// `has_session` の偽は合図にしない: `TerminalSession::spawn` は器を非同期に起こすので
-    /// 起きる前の問い合わせも偽になり、`has_session` は打ち切り・起動失敗でも偽を返す
-    /// （全体の並列実行で、書き出しの前に読みに行って落ちたのを実測）
+    /// tmux は `pane-died` フックの中で `save-buffer`（fopen → fwrite → fclose。書き終わるまで
+    /// 後ろのコマンドを待たせる）を終えてから `kill-pane` するので、**器が消えた時点で
+    /// 書き出しは書き終わっている**。製品も同じ順で読む（attach クライアントが終わった =
+    /// 器が消えた後。tako-app の `finish_backend_pane_log_exit`）。
+    ///
+    /// 修正前は「書き出しの出現」を合図に [`take_pane_died_dump`] を 100 ms ごとに呼んでいた。
+    /// 書きかけ（履歴に足りない）を読むと壊れた書き出しとして**消す**ので、残りの書き込みは
+    /// 名前の無いファイルへ行き、書き出しは二度と現れない（CI の「tako-m5 の書き出しが無い」。
+    /// 書き出しを 2 回に分けて間を空ける注入で同じ文言を再現した）。
+    ///
+    /// [`new_vessel`] の器専用（器を同期に起こすので、消えた = 起きた後に死んだ）。
+    /// `TerminalSession::spawn` の器は非同期に起きるので、先に attach クライアントの終わりを待つ
     #[cfg(unix)]
-    fn wait_dump(dir: &Path, session: &str) -> Option<PaneDiedDump> {
-        for _ in 0..200 {
-            if let Some(dump) = take_pane_died_dump(dir, session) {
-                return Some(dump);
+    fn wait_dump(socket: &str, dir: &Path, session: &str) -> PaneDiedDump {
+        assert!(
+            wait_gone(socket, session),
+            "{session} の書き出しが無い: 器が消えない（死なない・死んだペインが残っている）"
+        );
+        take_dump_after_gone(dir, session)
+    }
+
+    /// 消えた器の書き出しを 1 回だけ読む（#2357）。無い・壊れているなら名指しで落とす
+    #[cfg(unix)]
+    fn take_dump_after_gone(dir: &Path, session: &str) -> PaneDiedDump {
+        let named: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| parse_pane_died_name(n, session).is_some())
+            .collect();
+        take_pane_died_dump(dir, session).unwrap_or_else(|| {
+            if named.is_empty() {
+                panic!("{session} の書き出しが無い: 器は消えたのにフックが書いていない")
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        None
+            panic!("{session} の書き出しが壊れている（履歴の行数に足りない）: {named:?}")
+        })
     }
 
     /// 番号つきの行の並び（`<接頭辞><番号>` の行だけを拾う）
@@ -4043,13 +4093,35 @@ mod pane_died_tests {
             env: vec![],
             scrollback_lines: None,
         };
-        let (client, _rx) =
+        let (mut client, mut rx) =
             crate::TerminalSession::spawn(80, 24, wrap_options(options, &socket, session))
                 .expect("tmux クライアントを spawn できる");
-        let dir = pane_died_dir().expect("テストのデータディレクトリ");
-        let dump = wait_dump(&dir, session).expect("書き出しがある");
+        // 製品が書き出しを読む合図（attach クライアントの終わり = `CloseOrigin::ProcessExit`）を
+        // 待つ。器は非同期に起きるので「器が無い」は合図にならない（起きる前も無い。#2357）。
+        // 端末のイベントは UI 層と同じく流す（tmux の端末クエリへの応答）
+        super::tests::wait_for_state(
+            "attach クライアントが終わる",
+            VESSEL_WAIT,
+            std::time::Duration::from_millis(100),
+            || {
+                let mut exited = false;
+                while let Ok(event) = rx.try_recv() {
+                    exited |= matches!(
+                        client.process_event(event),
+                        Some(crate::SessionNotice::Exited)
+                    );
+                }
+                exited.then_some(())
+            },
+        )
+        .unwrap_or_else(|e| {
+            let screen = client.visible_lines().join("\n");
+            panic!("{}", e.observed(screen).tagged("TAKO_2357_WAIT"))
+        });
         assert!(wait_gone(&socket, session), "書き出した後に器が消えない");
         drop(client);
+        let dir = pane_died_dir().expect("テストのデータディレクトリ");
+        let dump = take_dump_after_gone(&dir, session);
         let mut all = dump.history.clone();
         all.extend(dump.screen.iter().cloned());
         assert_eq!(
@@ -4105,11 +4177,11 @@ mod pane_died_tests {
             "tako-alt",
             "printf '\\033[?1049h'; seq 1 30",
         );
-        let dump = wait_dump(&tmp.0, "tako-alt").expect("書き出しがある");
         assert!(
             wait_gone(&socket, "tako-alt"),
             "alt screen のまま死んだペインが残る"
         );
+        let dump = take_dump_after_gone(&tmp.0, "tako-alt");
         assert!(dump.probe.alternate, "alt screen の印: {:?}", dump.probe);
         // alt screen の画面（履歴の無い面）の最後の行まで、番号が続いて入る
         let shown = numbers(&dump.screen, "");
@@ -4208,14 +4280,8 @@ mod pane_died_tests {
         // 器の外のセッション（`tako-` で始まらない）は書き出さない（kill-pane だけ）
         new_vessel(&socket, &conf, "other", "seq 1 5");
         let dumps: Vec<PaneDiedDump> = (1..=5)
-            .map(|i| {
-                wait_dump(&tmp.0, &format!("tako-m{i}"))
-                    .unwrap_or_else(|| panic!("tako-m{i} の書き出しが無い"))
-            })
+            .map(|i| wait_dump(&socket, &tmp.0, &format!("tako-m{i}")))
             .collect();
-        for i in 1..=5 {
-            assert!(wait_gone(&socket, &format!("tako-m{i}")));
-        }
         assert!(wait_gone(&socket, "other"));
         for (i, dump) in (1..=5).zip(dumps) {
             let mut all = dump.history.clone();
@@ -4236,6 +4302,74 @@ mod pane_died_tests {
         assert!(
             left.is_empty(),
             "器の外のセッションまで書き出した: {left:?}"
+        );
+    }
+
+    /// 書き出しが分割されて間が空いても・器が即座に死んでも、書き終わった書き出しを読む（#2357）。
+    ///
+    /// tmux の `save-buffer` は fopen → fwrite → fclose の 1 回だが、書きかけ（作られた直後・
+    /// 途中まで）は外から見える。ここでは `tako-split` の書き出しを「履歴の最後の 1 行の
+    /// 手前まで → 1 秒あけて → 残りを追記」に分けて、その窓を広げる。書き出しの出現を
+    /// 合図に読む修正前の待ち方は書きかけを壊れた書き出しとして消し、追記は末尾だけの
+    /// 新しいファイルになってそれも消し、「書き出しが無い」で落ちた
+    #[test]
+    #[cfg(unix)]
+    fn 実tmux_書き出しが分割されて遅れても器が即座に死んでも書き終わってから読む() {
+        if !crate::tmux_test_gate::container() {
+            return;
+        }
+        let socket = format!("tako-coretest-{}-2357split", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        let tmp = TempDir::new("split");
+        let caps = tmux_caps();
+        let original = pane_died_conf(&caps, Some(&tmp.0), false);
+        let save = original
+            .lines()
+            .find(|l| l.contains("save-buffer"))
+            .expect("製品の conf の save-buffer の行");
+        let path = save
+            .split_once("-b tako-pane-died ")
+            .expect("save-buffer の書き先")
+            .1;
+        let split = original.replacen(
+            save,
+            &format!(
+                "    if -F '#{{==:#{{session_name}},tako-split}}' {{
+      capture-pane -b tako-2357-head -S - -E -2
+      save-buffer -b tako-2357-head {path}
+      run-shell 'sleep 1'
+      capture-pane -b tako-2357-tail -S -1 -E -
+      save-buffer -a -b tako-2357-tail {path}
+      delete-buffer -b tako-2357-head
+      delete-buffer -b tako-2357-tail
+    }} {{
+  {save}
+    }}"
+            ),
+            1,
+        );
+        assert_ne!(split, original);
+        let conf = tmp.0.join("tmux.conf");
+        std::fs::write(&conf, backend_conf(&caps) + &split).unwrap();
+        start_server(&socket, &conf);
+        new_vessel(&socket, &conf, "tako-split", "seq -f 'S-%g' 1 300");
+        new_vessel(&socket, &conf, "tako-instant", "echo I-1");
+        let dump = wait_dump(&socket, &tmp.0, "tako-split");
+        let mut all = dump.history.clone();
+        all.extend(dump.screen.iter().cloned());
+        assert_eq!(
+            numbers(&all, "S-"),
+            (1..=300).collect::<Vec<_>>(),
+            "分割された書き出しの全体"
+        );
+        assert_eq!(dump.history.len(), 300 + 1 - 20, "tako-split の行数");
+        let instant = wait_dump(&socket, &tmp.0, "tako-instant");
+        assert_eq!(instant.probe.history, 0, "{:?}", instant.probe);
+        assert_eq!(
+            numbers(&instant.screen, "I-"),
+            vec![1],
+            "{:?}",
+            instant.screen
         );
     }
 
