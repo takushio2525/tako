@@ -1,3 +1,6 @@
+#Requires -Version 7.0
+# pwsh 7 専用（#2329）。Windows PowerShell 5.1 は BOM の無い UTF-8 の日本語を ANSI として読み構文が崩れるので、1 行目の #Requires で理由を出して止める
+
 <#
 .SYNOPSIS
     tako の Windows 配布物（インストーラー + ポータブル zip）を作る。

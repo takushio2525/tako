@@ -466,6 +466,14 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+      # リポジトリの .ps1 が Windows PowerShell 5.1 の実物で「読める」か「理由を出して止まる」か
+      # （#2329）。他の段はすべて pwsh 7 なので、BOM の無い UTF-8 の日本語が 5.1 で化けても
+      # ここ以外では気づけない。`shell: powershell` = 5.1。数十秒で終わるので重いビルドより前に置く
+      - name: .ps1 が Windows PowerShell 5.1 で読めるか理由を出して止まる（#2329）
+        shell: powershell
+        run: |
+          & ./scripts/windows/check-powershell51.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # gpui の Windows ビルドは Spectre-mitigated libs が前提（無いとリンクエラー）。
       # ランナーの VS には既定で入っていないため VS インストーラーで追加する
       - name: Spectre-mitigated libs をインストール

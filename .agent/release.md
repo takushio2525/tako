@@ -16,6 +16,9 @@
   実機依存を避けるためこの順で、実機経路（`installer/windows/release-windows.ps1`）は
   CI が使えないときの代替として残す。配布物の検査は
   `installer/windows/lib/verify-assets.ps1` の 1 実装を両経路が共有する
+- `installer/windows/` の .ps1 は **pwsh 7 必須**（1 行目の `#Requires -Version 7.0`。#2329）。
+  実機経路も `pwsh -File` で走らせる。Windows PowerShell 5.1 で起こすと理由を出して止まる
+  （BOM の無い UTF-8 の日本語を 5.1 は ANSI として読むため。規則は `.agent/conventions.md` の #2329 の節）
 - Windows の配布物のビルド（`release-windows.yml`）はビルドキャッシュ（rust-cache）を使わず、
   毎回コールドで組む（#1921。PR / main の CI の `ci.yml` は使う）。
   タグの run は別のタグのキャッシュを読めないので一度も当たらず、保存が main / PR の
