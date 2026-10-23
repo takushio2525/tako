@@ -74,6 +74,18 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   切替」が実際に invoke できなかった）。2 つを並べるときは「・」で書く。番犬は
   `app_menu_tests::メニューの名前にパス区切りが無い`（両 OS の文言を file:line で名指し）と
   `全項目がtako_menu_invokeで名指しできる`（実メニューの全項目を日英で `resolve_menu_item` へ通す）
+- **パレットの固定コマンドの表記はメニューを正とする**（日英とも。#1830 / #2322）。同じ操作の
+  メニュー項目があるなら、そのラベル（末尾の「…」を除く）か、その後ろに括弧の補足を 1 つ足した形
+  （「表示モードを切替（かんたん・ターミナル）」）にし、2 つを並べるときは `/` ではなく「・」/「, 」で書く。
+  固定コマンド（`main.rs` の `PALETTE_COMMANDS`）を足したら、`app_menu_tests` の対の表
+  （`palette_menu_twins`）か、理由つきの例外の表（`PALETTE_WITHOUT_MENU_TWIN`）のどちらかへ載せる。
+  番犬は `パレットの固定コマンドはメニューの対か例外に分類されている` /
+  `パレットの項目はメニューと同じ表記` / `パレットの項目名は空でなくスラッシュを使わない` /
+  `パレットの項目は旧来の打ち方で引ける`（食い違いは `ui_text/palette.rs` の行で名指す）。
+  ui_text の外でメニューの項目名を写す案内（tako-core の `next_step`）は
+  `表示モードの案内はメニューの項目名をそのまま書く`、docs のパレットの再現と地の文の
+  「表示モードを…」は `crates/tako-control/tests/issue2322_palette_docs_watchdog.rs`
+  （ui_text のソースを読む形。docs だけの PR でも `docs-watchdogs` が拾う = #2084）が見る
 - **対象は「画面に描画される文字列」のみ**。診断ログ（eprintln / persist.log）・
   dispatch / CLI / MCP のエラーメッセージ・AI へのプロンプトは対象外（現状維持 = 日本語可）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は

@@ -347,11 +347,14 @@ impl TerminalReason {
     /// Windows では Win キー = `Win+K` は OS のキャスト。#585 / #1203）
     pub fn next_step_for(self, platform: Platform) -> Option<Text> {
         match self {
+            // メニューの項目名は tako-app の `ui_text::menu::toggle_ui_mode` と一字一句同じに書く
+            // （tako-core からは引けないので写す。食い違いは tako-app の
+            // `app_menu_tests::表示モードの案内はメニューの項目名をそのまま書く` が名指す。#2322）
             Self::ModeTerminal => {
                 let palette = keys::command_palette(platform);
                 Some(Text::new(
-                    format!("`tako ui-mode gui` / 表示メニューの「表示モードを切り替え」/ {palette} パレットのいずれかで切り替える"),
-                    format!("Switch it with `tako ui-mode gui`, View menu > \"Toggle display mode\", or the {palette} command palette"),
+                    format!("`tako ui-mode gui` / 表示メニューの「表示モードを切替」/ {palette} パレットのいずれかで切り替える"),
+                    format!("Switch it with `tako ui-mode gui`, View menu > \"Toggle Display Mode\", or the {palette} command palette"),
                 ))
             }
             Self::Released => Some(Note::new(
