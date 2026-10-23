@@ -9257,11 +9257,15 @@ fn absolutize(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// `--pane` 指定が無ければ呼び出し元へフォールバックする（FR-2.2.7）
+/// `--pane` 指定が無ければ呼び出し元へフォールバックする（FR-2.2.7）。
+///
+/// 断りは GUI へ送る前に手元で出すので、表示言語は `local_dispatch_err` と同じく設定から
+/// 解決する（#2358。表示言語を初期化していない枝で英語に倒れないように）
 fn target_pane(explicit: Option<u64>) -> Result<Option<u64>, String> {
     explicit.or_else(caller_pane).map(Some).ok_or_else(|| {
-        "対象ペインを特定できない（--pane を指定するか、tako アプリ内のターミナルで実行する）"
-            .into()
+        tako_control::NoTargetPaneAt::Cli
+            .text_in(tako_control::settings::peek_lang_setting().resolve())
+            .to_string()
     })
 }
 
@@ -15413,7 +15417,11 @@ mod tests {
             // tako の外（CI）: 送らずに何を渡せばよいかを言う
             None => {
                 let err = pane_of(&["tako", "show-command", "echo a"]).unwrap_err();
-                assert!(err.contains("対象ペインを特定できない"), "{err}");
+                // 断りの文は設定の表示言語に従う（#2358）。どちらの言語でも同じ断りであればよい
+                let said = [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                    .into_iter()
+                    .any(|lang| err == tako_control::NoTargetPaneAt::Cli.text_in(lang));
+                assert!(said, "{err}");
             }
         }
         assert_eq!(
