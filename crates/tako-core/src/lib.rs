@@ -38,6 +38,7 @@ pub mod fnv;
 pub mod git;
 pub mod git_tree;
 pub mod handoff;
+pub mod handoff_guard;
 pub mod header_layout;
 pub mod i18n;
 pub mod ipc_socket;

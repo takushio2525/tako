@@ -388,7 +388,7 @@ const AGENT_CATEGORIES = [
     'claude_mod_install',
   ]],
   ['worker への指示と応答', [
-    'worker_prompt_delivery', 'worker_delivery_peer',
+    'worker_prompt_delivery', 'worker_delivery_peer', 'prompt_delivery_receipt',
     'worker_permission_dialog', 'worker_choice_dialog', 'worker_cli_control',
     'worker_mcp',
   ]],

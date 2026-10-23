@@ -87,6 +87,26 @@
      You do not close your own pane, and you do not need to keep working after
      the successor reports "handoff complete" — answer anything the user asks in
      the meantime and let the successor retire you.
+   - **If the successor looks like it did not get the handoff, check before you
+     close anything.** Do not close the successor to start over. A narrow pane
+     can hide the start of a long prompt inside the input box, so the screen
+     alone is not proof; tako checks the successor's transcript before giving
+     up and reports `delivered` with outcome `received` when the text is there.
+     1. Read the successor with `tako_read_pane`: `delivery` (state / outcome),
+        `mod_turn` (`busy` = it is working), and the screen (is it calling
+        `tako_orchestrator_workers` / `tako_list_panes`, has it replied?).
+     2. Read it again a little later. Steps 1–3 of its prompt take a while.
+     3. Only if it is idle with nothing in its conversation, send the handoff
+        text again with `tako_send_input`. Still do not close it.
+
+     Closing each other is how the tab lost its master on 2026-10-18 (#2330):
+     the predecessor closed a successor that had received the handoff, while
+     the successor closed the predecessor as instructed. tako now refuses both
+     shapes even with `force` — closing a successor that has received the
+     handoff, and any other master-to-master close that would leave the tab
+     with no master of this profile (a successor closing its own predecessor
+     always goes through, even from another tab). If a close is refused,
+     follow the reason in the response instead of looking for a way around it.
    - **Do not wait until context is exhausted.** Hand off while you can still
      write a coherent handoff file. A late handoff produces a useless one.
 

@@ -359,9 +359,15 @@ pub enum Request {
         force: bool,
         /// 呼び出し元の role（Issue #566。MCP は接続時の `TAKO_ORCHESTRATOR_ROLE`、
         /// CLI は同名の環境変数から埋める）。ペインログのクローズマーカーへ
-        /// 「どのエージェントが閉じたか」を残す監査情報で、close の可否には影響しない
+        /// 「どのエージェントが閉じたか」を残す監査情報。#2330 からは master のペインを閉じる
+        /// close の守り（最後の master・受領済みの後任）の判断にも使う
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_role: Option<String>,
+        /// 呼び出し元のペイン（Issue #2330。MCP は接続時の `TAKO_PANE_ID` / `X-Tako-Pane`、
+        /// CLI は `TAKO_PANE_ID` から埋める）。master が自分を閉じる close と、別の master を
+        /// 閉じる close を見分ける。分からなければ None（守りは別の master からの close として扱う）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_pane: Option<u64>,
     },
     /// フォーカス移動（FR-2.5.5）。`direction` 指定時はアクティブタブ内の方向移動
     Focus {
@@ -3649,6 +3655,7 @@ mod tests {
                 pane: None,
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             Request::TabSelect { tab: 1 },
             Request::WindowMaximize { window: None },

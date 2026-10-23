@@ -425,7 +425,9 @@ pub fn tools() -> Vec<Value> {
                 役目を終えた作業ペインはこのツールで片付けること。\
                 タブ最後の 1 ペインならタブごと閉じる（最後のタブの最後のペインは閉じられない）。\
                 orchestrator-worker role のペインは busy 時に close が拒否される。\
-                強制 close するには force: true を指定する。",
+                強制 close するには force: true を指定する。\
+                master が別の master を閉じる close は、タブにそのプロファイルの master が残らない・\
+                受領済みの後任を閉じる場合 force でも拒否（理由を返す）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

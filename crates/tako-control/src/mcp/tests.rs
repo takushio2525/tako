@@ -2697,6 +2697,8 @@ mod tests {
                             pane: Some(42),
                             force: false,
                             caller_role: None,
+                            // #2330: 呼び出し元のペインも運ぶ（自己片付けと master 同士の close を分ける）
+                            caller_pane: Some(42),
                         },
                         "X-Tako-Pane が呼び出し元として使われる"
                     );

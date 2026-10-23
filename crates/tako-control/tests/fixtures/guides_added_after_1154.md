@@ -346,3 +346,26 @@ call it with `TAKO_ORCHESTRATOR_ROLE=master:<profile>` so the reply has an addre
    with its project's name, and a generic master's tab gets it on `adopt`.
    Do not use profile names or role names as tab titles — those are already
    visible elsewhere. `source: "auto"` never overwrites a name the user set.
+
+<!-- #2330: 引き継ぎで前任と後任が互いを閉じ合わない。handoff の手順へ「後任に届いていないように -->
+<!-- 見えるとき、閉じ直す前に確かめること」と、tako が断る 2 つの形を足した本文をそのまま貼る。 -->
+   - **If the successor looks like it did not get the handoff, check before you
+     close anything.** Do not close the successor to start over. A narrow pane
+     can hide the start of a long prompt inside the input box, so the screen
+     alone is not proof; tako checks the successor's transcript before giving
+     up and reports `delivered` with outcome `received` when the text is there.
+     1. Read the successor with `tako_read_pane`: `delivery` (state / outcome),
+        `mod_turn` (`busy` = it is working), and the screen (is it calling
+        `tako_orchestrator_workers` / `tako_list_panes`, has it replied?).
+     2. Read it again a little later. Steps 1–3 of its prompt take a while.
+     3. Only if it is idle with nothing in its conversation, send the handoff
+        text again with `tako_send_input`. Still do not close it.
+
+     Closing each other is how the tab lost its master on 2026-10-18 (#2330):
+     the predecessor closed a successor that had received the handoff, while
+     the successor closed the predecessor as instructed. tako now refuses both
+     shapes even with `force` — closing a successor that has received the
+     handoff, and any other master-to-master close that would leave the tab
+     with no master of this profile (a successor closing its own predecessor
+     always goes through, even from another tab). If a close is refused,
+     follow the reason in the response instead of looking for a way around it.

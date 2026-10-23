@@ -886,6 +886,7 @@ pub(super) async fn click_forward_claude_visual(
                 pane: Some(split.as_u64()),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
         );
     }
@@ -984,6 +985,7 @@ pub(super) async fn click_forward_claude_visual(
                 pane: Some(run_pane.as_u64()),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
         );
     }

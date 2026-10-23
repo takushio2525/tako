@@ -78,7 +78,7 @@ tako は codex が**実際に**どのモデルで動いたかを読みません�
 
 ## Claude Code との差分
 
-現時点で 64 件中 36 件が「対応」です（一部対応 7 件・未対応 18 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 65 件中 36 件が「対応」です（一部対応 8 件・未対応 18 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent codex

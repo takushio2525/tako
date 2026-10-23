@@ -229,6 +229,7 @@ pub(super) async fn extra_syntax_visual(
                         pane: Some(target.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     PaneOrigin::Cli,
                 );

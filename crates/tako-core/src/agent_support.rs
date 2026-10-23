@@ -286,6 +286,8 @@ pub mod keys {
     pub const MASTER_SYSTEM_PROMPT: &str = "master_system_prompt";
     /// 回線が戻ったら、接続エラーで止まったセッションをすぐ再開する（#2112）
     pub const NETWORK_AUTORESUME: &str = "network_autoresume";
+    /// 画面で確かめられない送達を受け手の会話記録で確かめる（#2330）
+    pub const PROMPT_DELIVERY_RECEIPT: &str = "prompt_delivery_receipt";
     /// ベンダー公式のリモート操作（スマホアプリ / Web）への会話の委譲
     pub const REMOTE_CONTROL: &str = "remote_control";
     /// PC 再起動（tmux サーバーごと消える）後の復元で、会話ごと戻せるか（#1238）
@@ -1127,6 +1129,26 @@ pub const MATRIX: &[AgentFeature] = &[
              低いペインで締めの行より上が画面の外の停止（#2181）は、画面の外の直近の行（器の履歴 / 外側の端末の履歴）を\
              足して同じ判定を通す（scripts/test-net-resume-2181.sh が器のペイン・直接のペインの両方で見る）。\
              codex / agy は接続エラーで止まった実画面を採れていない（推測の文言を置かない = #1034 と同じ作法）",
+        ),
+    },
+    AgentFeature {
+        key: keys::PROMPT_DELIVERY_RECEIPT,
+        summary: Note::new(
+            "画面で確かめられない送達を、諦める前に受け手の会話記録で確かめる（#2330）",
+            "A delivery the screen cannot confirm is checked against the recipient's transcript before giving up (#2330)",
+        ),
+        claude: S::Supported,
+        codex: degraded(notes::NOT_WIRED),
+        agy: degraded(notes::NOT_WIRED),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#2330（2026-10-20 / claude 2.1.301）: 狭いペイン（54 桁）の claude は入力欄の高さに上限があり、\
+             長い本文の先頭と先頭の `❯` 行が画面から流れる。修正前は transcript に本文が入っていても \
+             `gave_up / paste_not_reflected`（mod_turn は busy）だった。送達フローは諦める前に \
+             tako_control::delivery_receipt で transcript の利用者の発話 / キュー投函を照合する \
+             （scripts/test-handoff-close-2330.sh の deliver 段が実物で delivered / received を見る）。\
+             codex / agy は送達そのものは従来どおり通るが、画面で確かめられないときは gave_up のまま \
+             （照合は claude の transcript の形だけ）",
         ),
     },
     AgentFeature {

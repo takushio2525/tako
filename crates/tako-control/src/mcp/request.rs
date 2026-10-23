@@ -124,6 +124,8 @@ pub(super) fn build_request(
             // #566: 「どのエージェントが閉じたか」をペインログへ残すための監査情報。
             // ツール引数ではなく接続時の role を使う（呼び出し側が名乗り直せない）
             caller_role: caller_role.map(str::to_string),
+            // #2330: master が自分を閉じるのか別の master を閉じるのかを見分ける（接続時のペイン）
+            caller_pane: caller,
         },
         "tako_resize_pane" => Request::Resize {
             pane: Some(target_pane(args, caller)?),

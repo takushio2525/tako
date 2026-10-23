@@ -9409,10 +9409,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
             pane: target_pane(args.pane)?,
             force: args.force,
             // #566: エージェントのペインから `tako close` を叩いたとき
-            // 「どの role が閉じたか」をペインログへ残す（監査情報。close の可否には影響しない）
+            // 「どの role が閉じたか」をペインログへ残す監査情報。#2330 からは master のペインを
+            // 閉じる close の守り（最後の master・受領済みの後任）の判断にも使う
             caller_role: std::env::var("TAKO_ORCHESTRATOR_ROLE")
                 .ok()
                 .filter(|r| !r.trim().is_empty()),
+            // #2330: master が自分を閉じるのか別の master を閉じるのかを見分ける
+            caller_pane: caller_pane(),
         },
         Command::Title(args) => Request::Title {
             pane: target_pane(args.pane)?,

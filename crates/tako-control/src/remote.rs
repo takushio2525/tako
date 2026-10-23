@@ -4629,6 +4629,7 @@ fn dispatch_close(
         pane: Some(pid),
         force: false,
         caller_role: None,
+        caller_pane: None,
     });
     match result {
         Ok(v) => Ok(v),

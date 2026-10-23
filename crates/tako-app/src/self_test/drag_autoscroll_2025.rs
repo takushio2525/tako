@@ -267,6 +267,7 @@ fn close(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) {
             pane: Some(pane.as_u64()),
             force: true,
             caller_role: None,
+            caller_pane: None,
         },
     );
 }
