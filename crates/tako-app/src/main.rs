@@ -35333,6 +35333,201 @@ mod self_test {
         None
     }
 
+    /// background の仕事の今（#1902。#1890 の `HighlightWait` を塗り以外へ広げたもの）。
+    /// [`wait_for_background_state`] の `probe` が毎周期返す
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum BackgroundWait {
+        /// 揃った
+        Landed,
+        /// まだ background で走っている（相手が「走っている」を言えないときもこれ）
+        Running,
+        /// 走り終えたのに揃っていない = 待っても揃わない
+        Settled,
+    }
+
+    /// 「走り終えたのに揃っていない」をその場の失敗と読むまでに見る周期の数（#1902）。
+    /// background が戻った周期の描画でキャッシュは揃うので 1 で足りるが、キャッシュした
+    /// ビュー（#786）の組み直しが 1 フレーム遅れても偽にしないよう少し持たせる。
+    /// **時間ではなく周期**なので、ビルドや混み具合で長さが変わらない
+    pub(crate) const BACKGROUND_SETTLE_POLLS: u32 = 3;
+
+    /// 1 周期の観測から「ここで止めるか」を決める（純粋関数。#1902）。止めるなら結末を返す。
+    /// `settled` は Settled が続いた周期の数（この周期を含む）・`spent` は上限に届いたか
+    pub(crate) fn background_wait_verdict(
+        now: BackgroundWait,
+        settled: u32,
+        spent: bool,
+        legacy: bool,
+    ) -> Option<BackgroundWait> {
+        match now {
+            BackgroundWait::Landed => Some(now),
+            // 旧の窓は「揃ったか」だけを見ていた（戻ったのに揃っていなくても窓の終わりまで回す）
+            BackgroundWait::Settled if !legacy && settled >= BACKGROUND_SETTLE_POLLS => Some(now),
+            _ if spent => Some(now),
+            _ => None,
+        }
+    }
+
+    /// **#1902 の A/B の口**: `TAKO_1902_LEGACY` が `item` を指していれば旧の回数の窓へ戻す。
+    /// `1` / `all` で全部、カンマ区切りで項目ごと（`check` は 1 つ目の失敗でプロセスごと
+    /// 止まるので、全部戻すといちばん早い待ちしか観測できない = #1375 と同じ理由）
+    fn legacy_1902(item: &str) -> bool {
+        std::env::var("TAKO_1902_LEGACY").is_ok_and(|value| {
+            value == "1" || value == "all" || value.split(',').any(|p| p.trim() == item)
+        })
+    }
+
+    /// **#1902 の注入口**: background の戻りの**観測だけ**を遅らせる（相手は前へ進む）。
+    /// `late` = 旧の窓 + 5 秒（旧の腕だけが落ちる）/ `never` = ずっと観測しない（新でも
+    /// 上限で落ちるのが正しい）。書式は `<種別>[:<項目,項目…>]`（[`inject_1180_mode`] で解く）
+    fn inject_1902(item: &str, legacy_window: Duration) -> Option<Duration> {
+        let spec = std::env::var("TAKO_1902_INJECT").unwrap_or_default();
+        match inject_1180_mode(&spec, item) {
+            "late" => Some(inject_1180_delay(legacy_window)),
+            "never" => Some(INJECT_1180_FOREVER),
+            _ => None,
+        }
+    }
+
+    /// **background の仕事が戻るのを状態で待つ 1 実装**（#1902。#1890 の
+    /// `wait_for_background_highlight` を塗り以外へ一般化したもの）。
+    ///
+    /// 旧実装は `for _ in 0..N { 描く; M ms 待つ; 読む }` = **回数の窓**で、窓の長さ（N × M）は
+    /// release の速さだけを見て決めていた。debug（visual-test 入り）や混んだ機では background
+    /// （塗り・読み込み・ラスタライズ・送信・一覧の読み直し）が戻る前に窓を使い切る。
+    ///
+    /// - `probe` が [`BackgroundWait::Running`] を返す間は待つ。上限は止まったときの保険
+    ///   （[`state_wait_budget`] = 混み具合で伸ばすだけ・4 倍で打ち切り）
+    /// - [`BackgroundWait::Settled`] が [`BACKGROUND_SETTLE_POLLS`] 周期続いたら**その場で偽**
+    ///   （戻ったのに揃わない = 待っても揃わない。検出力は回数の窓より強い）
+    /// - `draw` が真なら毎周期 1 フレーム描く（描画でしか進まないキャッシュを待つとき。#786）
+    /// - A/B は `TAKO_1902_LEGACY=<item>`（旧の窓 = `budget.legacy_window`）、
+    ///   注入は `TAKO_1902_INJECT=late|never[:<item>…]`
+    /// - 毎回 `TAKO_SELF_TEST_1902` を 1 行、上限で諦めたら `TAKO_SELF_TEST_STATE_TIMEOUT` を加える
+    async fn wait_for_background_state<P>(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        item: &str,
+        budget: TextWaitBudget,
+        draw: bool,
+        probe: P,
+    ) -> bool
+    where
+        P: Fn(&TakoApp) -> BackgroundWait,
+    {
+        let legacy = legacy_1902(item);
+        let busy = machine_busy();
+        let limit = if legacy {
+            budget.legacy_window
+        } else {
+            state_wait_budget(budget.base, busy)
+        };
+        let hold = inject_1902(item, budget.legacy_window);
+        let started = std::time::Instant::now();
+        let (mut polls, mut settled) = (0u32, 0u32);
+        let outcome = loop {
+            if draw {
+                notify_and_draw(any, window, cx);
+            }
+            let seen = window
+                .update(cx, |app, _, _| probe(app))
+                .unwrap_or(BackgroundWait::Settled);
+            // 注入は**観測だけ**を遅らせる（#1180 と同じ約束。相手は前へ進む）
+            let now = if hold.is_some_and(|h| started.elapsed() < h) {
+                BackgroundWait::Running
+            } else {
+                seen
+            };
+            settled = if now == BackgroundWait::Settled {
+                settled + 1
+            } else {
+                0
+            };
+            let spent = started.elapsed() >= limit;
+            if let Some(outcome) = background_wait_verdict(now, settled, spent, legacy) {
+                break outcome;
+            }
+            polls += 1;
+            cx.background_executor().timer(budget.legacy_poll).await;
+        };
+        let waited = started.elapsed().as_secs_f32();
+        println!(
+            "TAKO_SELF_TEST_1902: item={item} outcome={outcome:?} waited={waited:.1}s \
+             budget={:.1}s polls={polls} legacy={legacy} capped={} inject={:?} {}",
+            limit.as_secs_f32(),
+            budget_capped(busy),
+            hold.map(|h| h.as_secs_f32()),
+            env_line()
+        );
+        if outcome == BackgroundWait::Running {
+            println!(
+                "TAKO_SELF_TEST_STATE_TIMEOUT: label={item:?} waited={waited:.1}s legacy={legacy} {}",
+                env_line()
+            );
+        }
+        outcome == BackgroundWait::Landed
+    }
+
+    /// ペインのプレビューに background の仕事（読み込み・構文の塗り・PDF のラスタライズ）が
+    /// まだ走っているか（#1902。[`wait_for_background_state`] の「走っている」の材料）。
+    ///
+    /// **積んだだけの仕事は走っていない**: 読み込みと塗りの待ち行列（`pending_preview_loads` /
+    /// `pending_md_resumes` / `pending_highlights`）は描画では流れず、UI 経路・IPC の受信ループ・
+    /// 検証側の `drain_pending_*` が流す（#826）。積まれたまま待つのは流し忘れなので、
+    /// 上限まで待たずにその場で偽にする（`Loading` でも積まれたままなら走っていない）
+    fn preview_background_running(app: &TakoApp, pane: PaneId) -> bool {
+        let queued = app.pending_preview_loads.iter().any(|(p, _, _)| *p == pane)
+            || app.pending_md_resumes.iter().any(|(p, _, _, _)| *p == pane);
+        let loading = matches!(
+            app.previews.get(&pane).map(|s| &s.content),
+            Some(preview::PreviewContent::Loading)
+        );
+        (loading && !queued)
+            || app
+                .view_highlights_running
+                .get(&pane)
+                .is_some_and(|n| *n > 0)
+            || app.pending_pdf_rasters.contains_key(&pane)
+            || app.active_pdf_rasters.contains(&pane)
+    }
+
+    /// 揃っていなければ、background が走っている間は Running・走り終えていれば Settled（#1902）
+    fn preview_wait_state(app: &TakoApp, pane: PaneId, landed: bool) -> BackgroundWait {
+        if landed {
+            BackgroundWait::Landed
+        } else if preview_background_running(app, pane) {
+            BackgroundWait::Running
+        } else {
+            BackgroundWait::Settled
+        }
+    }
+
+    /// preview の座標キャッシュが揃ったか（[`wait_for_preview_maps`] の判定）
+    fn preview_maps_ready(app: &TakoApp, pane: PaneId, pdf: bool) -> bool {
+        let has_text = app
+            .preview_line_texts
+            .get(&pane)
+            .is_some_and(|texts| !texts.is_empty());
+        if pdf {
+            has_text
+                && app
+                    .preview_line_bounds
+                    .get(&pane)
+                    .is_some_and(|bounds| !bounds.is_empty())
+                && app
+                    .preview_pdf_char_bounds
+                    .get(&pane)
+                    .is_some_and(|bounds| !bounds.is_empty())
+        } else {
+            has_text
+                && app
+                    .preview_text_layouts
+                    .get(&pane)
+                    .is_some_and(|layouts| layouts.iter().any(Option::is_some))
+        }
+    }
+
     /// preview の次の paint で座標キャッシュが揃うまで待つ。
     /// `set_preview` が旧キャッシュを破棄するため、存在確認は新しい内容の描画完了を表す。
     async fn wait_for_preview_maps(
@@ -35342,44 +35537,19 @@ mod self_test {
         pane: PaneId,
         pdf: bool,
     ) -> bool {
-        // PDF は background ラスタライズ待ち = 実時間依存。同じ実行の中で前の節が
-        // 重い（#680 でフレーム採取が増えた等）だけで落ちる余地を残さないよう、
-        // 上限は余裕を持たせる（判定内容は不変。揃わなければ結局 false になる）
-        for _ in 0..80 {
-            // typed WindowHandle<TakoApp>::update の内側で draw すると TakoApp の二重借用に
-            // なる。root entity を借用しない AnyWindowHandle 境界から描画する。
-            notify_and_draw(any, window, cx);
-            cx.background_executor()
-                .timer(Duration::from_millis(50))
-                .await;
-            let ready = window
-                .update(cx, |app, _, _| {
-                    let has_text = app
-                        .preview_line_texts
-                        .get(&pane)
-                        .is_some_and(|texts| !texts.is_empty());
-                    if pdf {
-                        has_text
-                            && app
-                                .preview_line_bounds
-                                .get(&pane)
-                                .is_some_and(|bounds| !bounds.is_empty())
-                            && app
-                                .preview_pdf_char_bounds
-                                .get(&pane)
-                                .is_some_and(|bounds| !bounds.is_empty())
-                    } else {
-                        has_text
-                            && app
-                                .preview_text_layouts
-                                .get(&pane)
-                                .is_some_and(|layouts| layouts.iter().any(Option::is_some))
-                    }
-                })
-                .unwrap_or(false);
-            if ready {
-                return true;
-            }
+        // PDF は background ラスタライズ待ち = 実時間依存。読み込み・塗り・ラスタライズが
+        // 走っている間だけ待ち、走り終えたのに揃わなければその場で偽（#1902。旧は 80 回 × 50ms
+        // の回数の窓で、窓の長さがビルドの速さと混み具合に追従しなかった）。
+        // typed WindowHandle<TakoApp>::update の内側で draw すると TakoApp の二重借用に
+        // なるので、描画は待ちの 1 実装が AnyWindowHandle 境界から行う
+        let budget = text_wait_budget(80, 50, 30);
+        let ready =
+            wait_for_background_state(any, window, cx, "preview-maps", budget, true, |app| {
+                preview_wait_state(app, pane, preview_maps_ready(app, pane, pdf))
+            })
+            .await;
+        if ready {
+            return true;
         }
         // 揃わなかったときは「何が揃っていないか」を残す（#826。器の違いで
         // 待ち条件が空振りしたのか、そもそも描かれていないのかを切り分けるため）
@@ -35411,69 +35581,55 @@ mod self_test {
     }
 
     /// PDF 選択の最前面 canvas が実際に paint_quad を発行するまで、draw 完了を条件に待つ。
+    /// ラスタライズが走っている間だけ待つ（#1902。旧は 40 回 × 50ms の回数の窓）
     async fn wait_for_pdf_highlight_paint(
         any: AnyWindowHandle,
         window: WindowHandle<TakoApp>,
         cx: &mut AsyncApp,
         pane: PaneId,
     ) -> bool {
-        for _ in 0..40 {
-            notify_and_draw(any, window, cx);
-            cx.background_executor()
-                .timer(Duration::from_millis(50))
-                .await;
-            if window
-                .update(cx, |app, _, _| {
-                    app.preview_pdf_highlight_paint_count
-                        .get(&pane)
-                        .copied()
-                        .unwrap_or(0)
-                        > 0
-                })
-                .unwrap_or(false)
-            {
-                return true;
-            }
-        }
-        false
+        let budget = text_wait_budget(40, 50, 30);
+        wait_for_background_state(any, window, cx, "pdf-paint", budget, true, |app| {
+            let painted = app
+                .preview_pdf_highlight_paint_count
+                .get(&pane)
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            preview_wait_state(app, pane, painted)
+        })
+        .await
     }
 
     /// background syntect の完了と、その色付き内容を使った TextLayout の paint を待つ。
+    /// 塗りが走っている間だけ待ち、戻ったのに色が付いていなければその場で偽（#1902。
+    /// 旧は 80 回 × 50ms の回数の窓 = #1890 と同じ型。塗りの遅れは `TAKO_1890_INJECT` で作れる）
     async fn wait_for_preview_highlight(
         any: AnyWindowHandle,
         window: WindowHandle<TakoApp>,
         cx: &mut AsyncApp,
         pane: PaneId,
     ) -> bool {
-        for _ in 0..80 {
-            notify_and_draw(any, window, cx);
-            cx.background_executor()
-                .timer(Duration::from_millis(50))
-                .await;
-            let ready = window
-                .update(cx, |app, _, _| {
-                    let color_count = match app.previews.get(&pane).map(|state| &state.content) {
-                        Some(preview::PreviewContent::Code(lines)) => lines
-                            .iter()
-                            .flat_map(|line| line.iter())
-                            .filter_map(|span| span.color)
-                            .map(|color| (color.r, color.g, color.b))
-                            .collect::<std::collections::HashSet<_>>()
-                            .len(),
-                        _ => 0,
-                    };
-                    color_count > 1
-                        && app
-                            .preview_text_layouts
-                            .get(&pane)
-                            .is_some_and(|layouts| layouts.iter().any(Option::is_some))
-                })
-                .unwrap_or(false);
-            if ready {
-                return true;
-            }
-        }
-        false
+        let budget = text_wait_budget(80, 50, 60);
+        wait_for_background_state(any, window, cx, "preview-highlight", budget, true, |app| {
+            let color_count = match app.previews.get(&pane).map(|state| &state.content) {
+                Some(preview::PreviewContent::Code(lines)) => lines
+                    .iter()
+                    .flat_map(|line| line.iter())
+                    .filter_map(|span| span.color)
+                    .map(|color| (color.r, color.g, color.b))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                _ => 0,
+            };
+            let painted = color_count > 1
+                && app
+                    .preview_text_layouts
+                    .get(&pane)
+                    .is_some_and(|layouts| layouts.iter().any(Option::is_some));
+            preview_wait_state(app, pane, painted)
+        })
+        .await
     }
 
     /// Metal の最終 scene を直接 RGBA へ読み戻す。画面収録権限やウィンドウ前面化に
@@ -36510,22 +36666,47 @@ mod self_test {
 
     /// 右パネル tasks の一覧更新（background のジョブ。#2031）と完了・却下の書き換え
     /// （#2052）が着き切るまで待つ。どちらも background へ出すので、直後に一覧を読む検査は
-    /// これを挟む。着けば真（上限 10 秒。置き場の読みは ms 単位なので、届かなければ着地の取りこぼし）
+    /// これを挟む。着けば真。ジョブが走っている間だけ待ち、上限は止まったときの保険
+    /// （#1902。旧は 1000 回 × 10ms = 固定 10 秒の回数の窓）
     async fn settle_user_tasks(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> bool {
-        for _ in 0..1000 {
-            let idle = window
-                .update(cx, |app: &mut TakoApp, _, _| {
-                    app.user_tasks.list_poll.inflight == 0 && app.user_tasks.status_inflight == 0
-                })
-                .unwrap_or(true);
-            if idle {
-                return true;
+        let budget = text_wait_budget(1000, 10, 30);
+        wait_for_background_state(
+            window.into(),
+            window,
+            cx,
+            "user-tasks",
+            budget,
+            false,
+            |app| {
+                if app.user_tasks.list_poll.inflight == 0 && app.user_tasks.status_inflight == 0 {
+                    BackgroundWait::Landed
+                } else {
+                    BackgroundWait::Running
+                }
+            },
+        )
+        .await
+    }
+
+    /// 返答の送り出し（background。`user_tasks.sending`）が掃けるまで待つ（#1902。旧は呼び出し
+    /// ごとの `legacy_polls` 回 × `poll_ms` の回数の窓）。結果の判定は呼び出し側の後続の検査が行う
+    async fn wait_user_tasks_sent(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        item: &str,
+        (legacy_polls, poll_ms): (u32, u64),
+        draw: bool,
+    ) -> bool {
+        let budget = text_wait_budget(legacy_polls, poll_ms, 30);
+        wait_for_background_state(any, window, cx, item, budget, draw, |app| {
+            if app.user_tasks.sending.is_empty() {
+                BackgroundWait::Landed
+            } else {
+                BackgroundWait::Running
             }
-            cx.background_executor()
-                .timer(Duration::from_millis(10))
-                .await;
-        }
-        false
+        })
+        .await
     }
 
     /// **時間ではなく状態を待つ**（#796）。フォーカス中ペインの画面に `needle` が
@@ -50592,23 +50773,24 @@ mod self_test {
             return;
         };
 
-        // サムネイルは背景で読む。**描画を止めない**代わりに、載るまで少し待つ
-        let mut thumb_ready = false;
-        for _ in 0..40 {
-            notify_and_draw(any, window, cx);
-            wait(cx, 100).await;
-            thumb_ready = window
-                .update(cx, |app: &mut TakoApp, _, _| {
-                    matches!(
-                        app.user_tasks.thumbs.get(&png1472.display().to_string()),
-                        Some(crate::tasks_panel::ThumbState::Ready(_))
-                    )
-                })
-                .unwrap_or(false);
-            if thumb_ready {
-                break;
-            }
-        }
+        // サムネイルは背景で読む。**描画を止めない**代わりに、読んでいる間だけ待つ
+        // （#1902。旧は 40 回 × 100ms の回数の窓。行が描かれれば描画の中で読み始めるので、
+        // 描いても読み始めない・出さないと決めた = 待っても載らない）
+        let thumb_key = png1472.display().to_string();
+        let thumb_ready = wait_for_background_state(
+            any,
+            window,
+            cx,
+            "task-thumb",
+            text_wait_budget(40, 100, 30),
+            true,
+            |app| match app.user_tasks.thumbs.get(&thumb_key) {
+                Some(crate::tasks_panel::ThumbState::Ready(_)) => BackgroundWait::Landed,
+                Some(crate::tasks_panel::ThumbState::Loading) => BackgroundWait::Running,
+                Some(crate::tasks_panel::ThumbState::Skipped) | None => BackgroundWait::Settled,
+            },
+        )
+        .await;
         check(thumb_ready, "151: 画像の添付にサムネイルが載る (#1472)");
         // **画像だけ**（動画は ffmpeg が要るので一覧の描画に混ぜない・消えたものは読まない）
         let only_images1472 = window
@@ -53099,16 +53281,24 @@ mod self_test {
             hover_move(any, cx, away);
             notify_and_draw(any, window, cx);
         }
-        // 背景の問い合わせが返り切るのを状態で待つ
-        for _ in 0..200 {
-            if held(cx).0 == 0 {
-                break;
-            }
-            notify_and_draw(any, window, cx);
-            cx.background_executor()
-                .timer(Duration::from_millis(20))
-                .await;
-        }
+        // 背景の問い合わせが返り切るのを状態で待つ（走っている数が 0 になるまで。#1902 で
+        // 旧の 200 回 × 20ms の回数の窓から寄せた。返り切ったかの判定は下の保持件数の検査）
+        let _ = wait_for_background_state(
+            any,
+            window,
+            cx,
+            "hover-inflight",
+            text_wait_budget(200, 20, 30),
+            true,
+            |app| {
+                if app.lsp_hover.inflight == 0 {
+                    BackgroundWait::Landed
+                } else {
+                    BackgroundWait::Running
+                }
+            },
+        )
+        .await;
         let after = held(cx);
         std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
         println!(
@@ -55372,24 +55562,31 @@ mod self_test {
             &format!("visual-test large-file-decor {label}: 編集開始後も対象の行を描く"),
         );
         if diagnostics {
-            let mut arrived = false;
-            for _ in 0..2000 {
-                arrived = window
-                    .update(cx, |app, _, _| {
-                        app.preview_edits
-                            .get(&pane)
-                            .and_then(|e| e.diagnostics.as_ref())
-                            .is_some_and(|d| !d.items.is_empty())
-                    })
-                    .unwrap_or(false);
-                if arrived {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(10))
-                    .await;
-                notify_and_draw(any, window, cx);
-            }
+            // 偽サーバ（別プロセス）は「走っている」を言えないので、届くまでを状態で待つ。
+            // 旧は 2000 回 × 10ms の回数の窓（#1890 と同じ型。#1902）。10 MB の didOpen を
+            // 送って答えを読むので、debug は素の上限を広く採る
+            let budget = text_wait_budget(2000, 10, if cfg!(debug_assertions) { 600 } else { 120 });
+            let arrived = wait_for_background_state(
+                any,
+                window,
+                cx,
+                "decor-diagnostics",
+                budget,
+                true,
+                |app| {
+                    let arrived = app
+                        .preview_edits
+                        .get(&pane)
+                        .and_then(|e| e.diagnostics.as_ref())
+                        .is_some_and(|d| !d.items.is_empty());
+                    if arrived {
+                        BackgroundWait::Landed
+                    } else {
+                        BackgroundWait::Running
+                    }
+                },
+            )
+            .await;
             check(
                 arrived,
                 &format!("visual-test large-file-decor {label}: 偽サーバの診断が届く"),
@@ -67237,27 +67434,31 @@ mod self_test {
                     (base, pane, code_ok, md_open_ok)
                 })
                 .unwrap_or((0, 0, false, false));
-            let mut md_ok = false;
-            for _ in 0..30 {
-                wait(cx, 100).await;
-                md_ok = md_open_ok
-                    && window
-                        .update(cx, |app, _, _| {
-                            app.previews.values().next().is_some_and(|state| {
-                                matches!(
-                                    &state.content,
-                                    preview::PreviewContent::Markdown(blocks)
-                                        if matches!(blocks.first().map(|b| &b.kind),
-                                            Some(preview::MdBlockKind::Heading { level: 1, .. }))
-                                ) && state.outline.items.len() == 1
-                                    && state.outline.items[0].title == "Title"
-                            })
-                        })
-                        .unwrap_or(false);
-                if md_ok {
-                    break;
-                }
-            }
+            // md の読み込み（background）が走っている間だけ待つ（#1902。旧は 30 回 × 100ms の
+            // 回数の窓）。読み終えたのに見出しが無ければその場で偽
+            let md_pane = PaneId::from_raw(pane);
+            let md_ok = md_open_ok
+                && wait_for_background_state(
+                    any,
+                    window,
+                    cx,
+                    "selftest-md",
+                    text_wait_budget(30, 100, 30),
+                    false,
+                    |app| {
+                        let landed = app.previews.values().next().is_some_and(|state| {
+                            matches!(
+                                &state.content,
+                                preview::PreviewContent::Markdown(blocks)
+                                    if matches!(blocks.first().map(|b| &b.kind),
+                                        Some(preview::MdBlockKind::Heading { level: 1, .. }))
+                            ) && state.outline.items.len() == 1
+                                && state.outline.items[0].title == "Title"
+                        });
+                        preview_wait_state(app, md_pane, landed)
+                    },
+                )
+                .await;
             let outline_md_opened = window
                 .update(cx, |app, _, cx| {
                     let opened = selftest_open(
@@ -67431,28 +67632,31 @@ mod self_test {
                      text_layer を持たない。#693）"
                 );
             }
-            let mut pdf_ok = false;
-            for _ in 0..30 {
-                wait(cx, 200).await;
-                pdf_ok = pdf_open_ok
-                    && window
-                        .update(cx, |app, _, _| {
-                            matches!(
-                                app.previews.values().next().map(|p| &p.content),
-                                Some(preview::PreviewContent::Pdf(data))
-                                    if !data.pages.is_empty()
-                                        && (!pdf_text_layer
-                                            || (!data.text_layers.is_empty()
-                                                && data.text_layers[0].len() >= 2
-                                                && data.text_layers[0][0].char_boxes.len()
-                                                    == data.text_layers[0][0].text.chars().count()))
-                            )
-                        })
-                        .unwrap_or(false);
-                if pdf_ok {
-                    break;
-                }
-            }
+            // ラスタライズ（background）が走っている間だけ待つ（#1902。旧は 30 回 × 200ms の
+            // 回数の窓）。読み終えたのにページ / 文字矩形が無ければその場で偽
+            let pdf_ok = pdf_open_ok
+                && wait_for_background_state(
+                    any,
+                    window,
+                    cx,
+                    "selftest-pdf",
+                    text_wait_budget(30, 200, 60),
+                    false,
+                    |app| {
+                        let landed = matches!(
+                            app.previews.values().next().map(|p| &p.content),
+                            Some(preview::PreviewContent::Pdf(data))
+                                if !data.pages.is_empty()
+                                    && (!pdf_text_layer
+                                        || (!data.text_layers.is_empty()
+                                            && data.text_layers[0].len() >= 2
+                                            && data.text_layers[0][0].char_boxes.len()
+                                                == data.text_layers[0][0].text.chars().count()))
+                        );
+                        preview_wait_state(app, md_pane, landed)
+                    },
+                )
+                .await;
             let outlined_pdf_opened = window
                 .update(cx, |app, _, cx| {
                     let opened = selftest_open(
@@ -71188,26 +71392,28 @@ mod self_test {
                     .flatten();
                 let mut pdf_ok = false;
                 if let Some(pane_id) = pdf_pane {
-                    for _ in 0..30 {
-                        wait(cx, 200).await;
-                        pdf_ok = window
-                            .update(cx, |app, _, _| {
-                                app.previews.iter().any(|(pid, p)| {
-                                    pid.as_u64() == pane_id
-                                        && matches!(
-                                            &p.content,
-                                            preview::PreviewContent::Pdf(d)
-                                                if d.total_pages == 1
-                                                    && d.pages.len() == 1
-                                                    && !d.pages[0].is_empty()
-                                        )
-                                })
-                            })
-                            .unwrap_or(false);
-                        if pdf_ok {
-                            break;
-                        }
-                    }
+                    // ラスタライズ（background）が走っている間だけ待つ（#1902。旧は 30 回 ×
+                    // 200ms の回数の窓）
+                    let pdf_pane_id = PaneId::from_raw(pane_id);
+                    pdf_ok = wait_for_background_state(
+                        any,
+                        window,
+                        cx,
+                        "selftest-pdf-render",
+                        text_wait_budget(30, 200, 60),
+                        false,
+                        |app| {
+                            let landed = matches!(
+                                app.previews.get(&pdf_pane_id).map(|p| &p.content),
+                                Some(preview::PreviewContent::Pdf(d))
+                                    if d.total_pages == 1
+                                        && d.pages.len() == 1
+                                        && !d.pages[0].is_empty()
+                            );
+                            preview_wait_state(app, pdf_pane_id, landed)
+                        },
+                    )
+                    .await;
                     let _ = window.update(cx, |app, _, _| {
                         let _ = tako_control::dispatch(
                             app,
@@ -91720,15 +91926,7 @@ mod self_test {
                     app.task_comment_insert("サムネの字を大きく", cx);
                     app.user_task_respond(&id150, cx);
                 });
-                for _ in 0..500 {
-                    let pending = window
-                        .update(cx, |app: &mut TakoApp, _, _| app.user_tasks.sending.len())
-                        .unwrap_or(0);
-                    if pending == 0 {
-                        break;
-                    }
-                    wait(cx, 10).await;
-                }
+                let _ = wait_user_tasks_sent(any, window, cx, "150-sent", (500, 10), false).await;
                 let responded150 = window
                     .update(cx, |app: &mut TakoApp, _, _| {
                         app.refresh_user_tasks();
@@ -91786,15 +91984,7 @@ mod self_test {
                         app.user_task_respond(&id150, cx);
                     }
                 });
-                for _ in 0..1000 {
-                    let pending = window
-                        .update(cx, |app: &mut TakoApp, _, _| app.user_tasks.sending.len())
-                        .unwrap_or(0);
-                    if pending == 0 {
-                        break;
-                    }
-                    wait(cx, 10).await;
-                }
+                let _ = wait_user_tasks_sent(any, window, cx, "150-sent-long", (1000, 10), false).await;
                 let long150 = window
                     .update(cx, |app: &mut TakoApp, _, _| {
                         app.user_tasks.expanded = Some(id150.clone());
@@ -97151,6 +97341,62 @@ mod selftest_pty_enter_watchdog {
     }
 }
 
+/// background の仕事の戻りを待つ 1 実装の止め方（純粋関数。#1902）。
+///
+/// 走っている間は止めない・揃ったら止める・走り終えたのに揃わないのは周期が揃ってから止める
+/// （その場の失敗）・上限に届いたら止める。旧の腕（`TAKO_1902_LEGACY`）は「揃ったか」だけを見る
+#[cfg(test)]
+mod self_test_background_wait_tests {
+    use super::self_test::{background_wait_verdict, BackgroundWait, BACKGROUND_SETTLE_POLLS};
+    use BackgroundWait::{Landed, Running, Settled};
+
+    #[test]
+    fn 揃ったらその場で止まり走っている間は上限まで待つ() {
+        assert_eq!(
+            background_wait_verdict(Landed, 0, false, false),
+            Some(Landed)
+        );
+        assert_eq!(
+            background_wait_verdict(Landed, 0, false, true),
+            Some(Landed)
+        );
+        assert_eq!(background_wait_verdict(Running, 0, false, false), None);
+        assert_eq!(
+            background_wait_verdict(Running, 0, true, false),
+            Some(Running)
+        );
+    }
+
+    #[test]
+    fn 走り終えたのに揃わなければ周期が揃った時点で上限を待たずに偽() {
+        for settled in 1..BACKGROUND_SETTLE_POLLS {
+            assert_eq!(
+                background_wait_verdict(Settled, settled, false, false),
+                None
+            );
+        }
+        assert_eq!(
+            background_wait_verdict(Settled, BACKGROUND_SETTLE_POLLS, false, false),
+            Some(Settled)
+        );
+        // 周期が揃う前に上限へ届けばそこで止まる
+        assert_eq!(
+            background_wait_verdict(Settled, 1, true, false),
+            Some(Settled)
+        );
+    }
+
+    #[test]
+    fn 旧の腕は戻ったのに揃わなくても窓の終わりまで回す() {
+        let many = BACKGROUND_SETTLE_POLLS * 10;
+        assert_eq!(background_wait_verdict(Settled, many, false, true), None);
+        assert_eq!(
+            background_wait_verdict(Settled, many, true, true),
+            Some(Settled)
+        );
+    }
+}
+
 /// 状態待ちの上限の決め方（純粋関数。#1162）。
 ///
 /// 固定窓（`for _ in 0..20 { wait(cx, 300) }` = 6 秒）で落ちていた項目 102 を
@@ -101550,30 +101796,46 @@ mod selftest_wait_watchdog {
         assert!(fixed_window_then_growth_read(&good).is_empty());
     }
 
-    /// **表示種別の判定（`pane_display_for`）を固定回数の窓で待っていない**（#2013）。
+    /// **回数の窓で待っていない**（#1902。#2013 の「表示種別の判定を固定窓で待っていない」を
+    /// 待つ相手を問わない形へ一般化したもの）。
     ///
-    /// 項目 93 (c)（#694 の判定表）は「素のシェルペインがスターターになる」を
-    /// `for _ in 0..40 { 読む; if 成立 { break } wait(cx, 100).await; }` = **固定 4 秒窓**で
-    /// 待っていた。成立の材料（OSC 133 の Idle・`busy_children` の 2 秒 tick・生成直後の
-    /// 猶予 #720）はどれも時間で解けるので、混んだ機では窓が切れた直後に
-    /// `state=Idle busy=false` を読んで落ちる（#1991 の worker の実測）。
+    /// `for _ in 0..N { …; 成立なら break / return; 待つ }` は「N 回 × 待ち」の**固定の予算**で、
+    /// 窓の長さがビルド（debug は桁で遅い）と混み具合に追従しない。#1890 の `large-file-decor` は
+    /// 窓を release の塗りだけで決めていたので、入った時点から debug では一度も通っていなかった。
+    /// #2013 の項目 93 (c) は固定 4 秒窓が混んだ機で切れ、窓が切れた直後に `state=Idle busy=false`
+    /// （= 待てば着いていた）を読んで落ちた。
     ///
-    /// なぜ既存の番犬をすり抜けたか: `fixed_window_loop_bodies`（#1162 / #1153 / #1165）は
-    /// **`for` の直後の行が `wait`** の形だけを見る。この形は「読む → 抜ける → 待つ」の順で
-    /// 待ちがループの末尾にある。本文はインデントで閉じ括弧まで採り（#771 / #1180 と同じ）、
-    /// `wait(cx, ` と `break`（= 待ちの結果を判定に使っている印）と `pane_display_for(` を
-    /// すべて持つループを名指しする。
+    /// 待っている相手（background の塗り・読み込み・送信・PTY・別プロセス・描画）が何であれ同じ穴
+    /// なので、判定式の needle（#1162 / #1153 / #1165 / #2013）ではなく**形**で名指しする:
+    /// 本文（インデントで閉じ括弧まで。#771 / #1180 と同じ）に**待ち**（`wait(cx, ` / `.timer(` /
+    /// `sleep(cx, ` / `thread::sleep(`）と**抜け**（`break` / `return` = 待ちの結果を判定に使って
+    /// いる印）を両方持つ固定回数（`for … in 0..`）のループ。待ちの結果で抜けないループ
+    /// （片付けの叩き込み・描くだけの周回）は対象外。
     ///
-    /// 正しい形は `wait_for_app_state`（状態待ち + `state_wait_budget` の上限）。
-    /// キーは**ループの後**の最初の `check` のラベル（行番号は編集でずれる。ループの頭から
-    /// 数えると、本文の長いループでは 60 行の範囲に `check` が入らない）。
-    /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
-    fn fixed_window_then_display_read(src: &str) -> Vec<(usize, String)> {
+    /// 範囲はセルフテスト / visual-test のコード = main.rs の `mod self_test` と
+    /// `src/self_test/*.rs`（製品コードの取り直しは対象外）。正しい形は状態待ち
+    /// （`wait_for_background_state` / `wait_for_app_state` 等 + `state_wait_budget`）。
+    ///
+    /// キーは「ファイル名: ループの後の最初の `check(` / `fail(` のラベル」、ラベルが 60 行の
+    /// 範囲に無ければ「ファイル名: fn <囲む関数>」（行番号は編集でずれる）。同じキーが続けば
+    /// 2 つ目から ` #2` … を付ける
+    fn count_windows(file: &str, src: &str, range: std::ops::Range<usize>) -> Vec<(usize, String)> {
         let lines: Vec<&str> = src.lines().collect();
-        let wait_call = concat!("wait(cx", ", ");
-        let display_read = concat!("pane_display", "_for(");
+        let end_of_range = range.end.min(lines.len());
+        let waits = [
+            concat!("wait(cx", ", "),
+            concat!(".timer", "("),
+            concat!("sleep(cx", ", "),
+            concat!("thread::", "sleep("),
+        ];
+        let mut enclosing = "";
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut hits = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
+        for index in range.start..end_of_range {
+            let line = lines[index];
+            if let Some(name) = tako_core::source_scan::fn_head_name(line.trim_start()) {
+                enclosing = name;
+            }
             let trimmed = line.trim();
             if !(trimmed.starts_with("for ")
                 && trimmed.contains(" in 0..")
@@ -101581,88 +101843,514 @@ mod selftest_wait_watchdog {
             {
                 continue;
             }
-            let body = loop_body_by_indent(&lines, index, lines.len());
-            if !(body.contains(wait_call) && body.contains("break") && body.contains(display_read))
-            {
+            let body = loop_body_by_indent(&lines, index, end_of_range);
+            let exits = has_word(&body, "break") || has_word(&body, "return");
+            if !(exits && waits.iter().any(|w| body.contains(w))) {
                 continue;
             }
             let indent = line.len() - line.trim_start().len();
             let end = lines
                 .iter()
                 .enumerate()
+                .take(end_of_range)
                 .skip(index + 1)
                 .find(|(_, l)| {
                     let t = l.trim_start();
                     !t.is_empty() && l.len() - t.len() == indent && t.starts_with('}')
                 })
                 .map_or(index, |(at, _)| at);
-            hits.push((index + 1, first_check_label(&lines, end)));
+            let label = first_check_or_fail_label(&lines, end + 1);
+            let base = if label.is_empty() {
+                format!("{file}: fn {enclosing}")
+            } else {
+                format!("{file}: {label}")
+            };
+            let count = seen.entry(base.clone()).or_default();
+            *count += 1;
+            let key = if *count == 1 {
+                base
+            } else {
+                format!("{base} #{count}")
+            };
+            hits.push((index + 1, key));
         }
         hits
     }
 
-    /// **「固定窓で表示種別の判定を待つ」の既知リスト**（#2013 で番犬を入れた時点の残り）。
+    /// `word` が語として現れるか（`breakpoint` / `returned` のような語の一部は数えない）
+    fn has_word(text: &str, word: &str) -> bool {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        text.match_indices(word).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + word.len()..].chars().next();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+    }
+
+    /// `at` 行から 60 行の範囲で最初の `check(` / `fail(` の文字列ラベル（無ければ空）。
+    /// `check(条件, ラベル)` は条件の中の文字列（`x.starts_with("a/true")`）を拾わないよう、
+    /// 括弧の深さ 0 の最初の `,` より後ろから採る
+    fn first_check_or_fail_label(lines: &[&str], at: usize) -> String {
+        let joined = lines
+            .iter()
+            .skip(at)
+            .take(60)
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (from, is_check) = match (joined.find("check("), joined.find("fail(")) {
+            (Some(c), Some(f)) if f < c => (f + "fail(".len(), false),
+            (Some(c), _) => (c + "check(".len(), true),
+            (None, Some(f)) => (f + "fail(".len(), false),
+            (None, None) => return String::new(),
+        };
+        let mut rest = &joined[from..];
+        if is_check {
+            let Some(comma) = top_level_comma(rest) else {
+                return String::new();
+            };
+            rest = &rest[comma + 1..];
+        }
+        let Some(open) = rest.find('"') else {
+            return String::new();
+        };
+        let mut label = String::new();
+        let (mut escaped, mut continued) = (false, false);
+        for ch in rest[open + 1..].chars() {
+            if continued && ch == ' ' {
+                continue;
+            }
+            continued = false;
+            if escaped {
+                // 行末の `\` は改行と次の行の字下げを食べる（Rust の文字列の継続）。行は空白
+                // 1 つで繋いであるので、`\` の直後の空白から先の空白を飛ばす
+                if ch == ' ' {
+                    continued = true;
+                } else {
+                    label.push(ch);
+                }
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                break;
+            } else {
+                label.push(ch);
+            }
+        }
+        label
+    }
+
+    /// 引数の並び（`(` の直後から）で、括弧の深さ 0 の最初の `,` の位置（文字列の中は数えない）。
+    /// 並びが閉じるまでに無ければ `None`
+    fn top_level_comma(args: &str) -> Option<usize> {
+        let (mut depth, mut in_str, mut escaped) = (0i32, false, false);
+        for (i, ch) in args.char_indices() {
+            if in_str {
+                match ch {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => return None,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// セルフテスト / visual-test のコード全部の回数の窓（main.rs の `mod self_test` +
+    /// `src/self_test/*.rs`）。返り値は `(ファイル:行, キー)`
+    fn self_test_count_windows() -> Vec<(String, String)> {
+        let main = include_str!("main.rs");
+        let lines: Vec<&str> = main.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| *l == "mod self_test {")
+            .expect("main.rs に `mod self_test {` が無い（改名したならこの番犬も直す）");
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, l)| **l == "}")
+            .map_or(lines.len(), |(at, _)| at);
+        let mut hits: Vec<(String, String)> = count_windows("main.rs", main, start..end)
+            .into_iter()
+            .map(|(line, key)| (format!("main.rs:{line}"), key))
+            .collect();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{} を読めない: {e}", dir.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "{} に .rs が無い", dir.display());
+        for path in files {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let rel = format!("self_test/{name}");
+            let total = src.lines().count();
+            hits.extend(
+                count_windows(&rel, &src, 0..total)
+                    .into_iter()
+                    .map(|(line, key)| (format!("src/{rel}:{line}"), key)),
+            );
+        }
+        hits
+    }
+
+    /// 回数の窓の理由の分類（#1902 の棚卸しの表と同じ言葉）
+    const BG: &str = "background の仕事（未移送）";
+    const PTY: &str = "PTY / シェルの出力・状態";
+    const PROC: &str = "別プロセス（言語サーバ・tmux・git・daemon・実 claude）の往復";
+    const UI: &str = "UI の状態（窓・描画・クリックの着地）";
+    const QUIET: &str = "画面の静止を撮り直して待つ";
+    const MEASURE: &str = "計測の周回（所要を測る。判定は後段の検査）";
+
+    /// **「回数の窓」の既知リスト**（#1902 で番犬を入れた時点の残り。キーと分類）。
     ///
-    /// #2013 で直したのは項目 93 (c) だけで、同じ形が項目 94（#702 の alt screen）と
-    /// 項目 97（#720 の過渡期。新規ペインの準備中 → スターター / master 起動の前後）に残っている
-    /// （#2013 の範囲外）。番犬を先に入れて**新規の混入を止め**、残りはここで段階導入にする
-    /// （#1353 → #1375 の `KNOWN_FIXED_CLI_WAITS` と同じ運用）。
+    /// #1902 で寄せたのは background の完了を待つ箇所（プレビューの座標・塗り・PDF の描画、
+    /// tasks の一覧更新・送信、hover の問い合わせ、診断・サムネイル）。残りは待つ相手ごとに
+    /// 寄せ先が違う（PTY は `type_until_focused_text` / `wait_for_cli_state`、別プロセスは
+    /// `wait_for_backend_state`、background は `wait_for_background_state`）ので、番犬を先に
+    /// 入れて**新規の混入を止め**、ここで段階導入にする（#1353 → #1375 の `KNOWN_FIXED_CLI_WAITS`・
+    /// #2013 の `KNOWN_FIXED_DISPLAY_WAITS` と同じ運用。#2013 の 3 件もここへ移した）。
     ///
     /// リストは**減る方向にしか動かさない**（下のテストが、直したのに残っているエントリを落とす）。
-    /// 新しく混入した形はここへ足さずに `wait_for_app_state` へ移すこと。キーは `check` のラベル
-    const KNOWN_FIXED_DISPLAY_WAITS: &[&str] = &[
-        "alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)",
-        "新規ペインは準備中 → スターターで、生ターミナルを一度も見せない (#720)",
-        "master 起動の過渡期は生ターミナルを見せない (#720)",
+    /// 新しく混入した形はここへ足さずに状態待ちへ移すこと
+    const KNOWN_COUNT_WINDOWS: &[(&str, &str)] = &[
+        ("main.rs: visual-test #738: 設定ウィンドウが開かない", UI),
+        ("main.rs: visual-test 端末グリッド: fixture 12 行が画面に出る (#787)", PTY),
+        ("main.rs: visual-test 端末グリッド: 実 claude の TUI が起動する (#787)", PROC),
+        ("main.rs: visual-test screen-lines: ホバー前フレーム採取", PTY),
+        ("main.rs: visual-test screen-lines: 画面が静止しない", QUIET),
+        ("main.rs: visual-test ime-preedit: 画面が静止しない（シェルの出力が続いている）", QUIET),
+        ("main.rs: visual-test ime-preedit: 変換中にサイズを変えても実描画が追従する                          (#940。font {}->{fs} 期待比={want:.3} 幅 {}->{w} 実比={got:.3})", QUIET),
+        ("main.rs: visual-test 診断: 座標キャッシュが揃う", BG),
+        ("main.rs: visual-test 診断: 右パネルの diagnostics ビューに 1 件 1 行で並ばない", UI),
+        ("main.rs: fn settled_rows", MEASURE),
+        ("main.rs: visual-test スターター: 素のシェルがアイドルになる (#694)", PTY),
+        ("main.rs: 151: 画像の添付行の実クリックで image プレビューが開く (#1472。{opened:?})", UI),
+        ("main.rs: 151: 動画の添付行の実クリックで video プレビューが開く (#1472。{opened:?})", UI),
+        ("main.rs: fn completion_wait_popup", PROC),
+        ("main.rs: visual-test completion: ↓ ↓ で 3 つ目を選ぶ ({two:?})", PROC),
+        ("main.rs: visual-test completion: c0999 は 1 件に絞れる ({tab_popup:?})", PROC),
+        ("main.rs: visual-test completion: cz にも答えが来る", PROC),
+        ("main.rs: visual-test completion-real: 実サーバの候補の一覧が出る (#1682)", PROC),
+        ("main.rs: fn hover_wait_card", PROC),
+        ("main.rs: visual-test hover: 2 行目の total の位置を採れない (#1681)", PROC),
+        ("main.rs: visual-test external-change: 外部変更を競合として検知する (#1659)", BG),
+        ("main.rs: visual-test md-edit-resume: 編集ボタンが描かれない（{step}）(#1661)", BG),
+        ("main.rs: visual-test md-find-restore: 描画表示で開いて目次が 3 件 (#1873)", BG),
+        ("main.rs: visual-test tree-move ⑨: 移す前に言語サーバが文書を開く（前提。#1834）", PROC),
+        ("main.rs: visual-test tree-move ⑨: 言語サーバへ旧 URI の didClose と新 URI の didOpen が届く (#1834。tail={tail:.300})", PROC),
+        ("main.rs: visual-test tree-move ⑫: ターミナルの中央へ落とすとパスが入る・移さない（FR-3.13 の非回帰）", PTY),
+        ("main.rs: ⑥ 幽霊のカードの × が窓の外のまま（x={:.0} / 窓 {viewport_w:.0}） (#1946)", UI),
+        ("main.rs: 109: 使い捨てリポのコンフリクトを git パネルが認識する (#496)", PTY),
+        ("main.rs: 109: 使い捨てリポのコンフリクトを git パネルが認識する (#496) #2", PROC),
+        ("main.rs: 109: 3 択「{agent}」の実クリックで解消エージェントのペインが立つ (#496)", UI),
+        ("main.rs: ANSI 赤の解決", PTY),
+        ("main.rs: MCP theme set light（GUI 反映）", UI),
+        ("main.rs: MCP theme toggle（dark へ復帰）", UI),
+        ("main.rs: split/close で fd が漏れない（before={fd_before}, after={fd_after}）", PTY),
+        ("main.rs: 実行中コマンドが running", PTY),
+        ("main.rs: 失敗コマンドで failed（プロンプト後も保持）", PTY),
+        ("main.rs: 失敗コマンドで failed（プロンプト後も保持） #2", PTY),
+        ("main.rs: 全角行のクリックが正しいセルに解決", PTY),
+        ("main.rs: listen ポート検知（nc -l）", PROC),
+        ("main.rs: fn run", BG),
+        ("main.rs: fn run #2", UI),
+        ("main.rs: PDF 150% の再ラスタライズ後も文字座標が画像へ追従する", BG),
+        ("main.rs: タブ内全ペインの cwd がワークスペースフォルダとして並ぶ", PTY),
+        ("main.rs: 半角消失の根因が実在（グリッド幅シェイプで折り返し発生）", PTY),
+        ("main.rs: リンク検証テキストを実 PTY 画面へ表示", PTY),
+        ("main.rs: ペインログ: クローズマーカーに発生源（kbd / gui / dispatch）が残る（#566）", PTY),
+        ("main.rs: 末尾で自動停止し、再生ボタンで先頭から再開する (#484)", BG),
+        ("main.rs: IME 経路: blur 後の focus 自己修復 (#332)", UI),
+        ("main.rs: fn spawn_req", UI),
+        ("main.rs: {label}. IME 下線: カーソル非表示ペインでもアンカーが解決する (#497)", UI),
+        ("main.rs: {label}. IME 下線: カーソル非表示ペインでもアンカーが解決する (#497) #2", UI),
+        ("main.rs: git タブのセクション順が 変更 → コミット → ブランチ → リモート → diff (#551): {order:?}", PROC),
+        ("main.rs: 停止中のクリックで起動パネルが開き Tailscale 状態を取得する (#590)", PROC),
+        ("main.rs: 停止の確認実行で daemon が止まりインジケータが停止表示へ戻る (#590 / #615)", PROC),
+        ("main.rs: 外部から daemon を止めてもポーリングで停止表示へ戻る (#590): running2={running2} pid={pid:?}", PROC),
+        ("main.rs: 外部から daemon を止めてもポーリングで停止表示へ戻る (#590): running2={running2} pid={pid:?} #2", PROC),
+        ("main.rs: fn spawn_req #2", UI),
+        ("main.rs: ペイン矩形の計算値が実描画のコンテナ矩形と一致する (#684)", UI),
+        ("main.rs: MCP ui_mode toggle → 応答と GUI 状態が一致 (#694)", UI),
+        ("main.rs: スターターが組む行は実シェルで実際に実行される (#899)", PTY),
+        ("main.rs: fn spawn_req #3", PTY),
+        ("main.rs: alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)", PROC),
+        ("main.rs: #721: 設定ウィンドウが開かない", UI),
+        ("main.rs: プロファイルタブ: モデル一覧は押して初めて取り、チップから保存できる (#1002)", PROC),
+        ("main.rs: 新規ペインは準備中 → スターターで、生ターミナルを一度も見せない (#720)", PTY),
+        ("main.rs: master 起動の過渡期は生ターミナルを見せない (#720)", PTY),
+        ("main.rs: master 起動の過渡期は生ターミナルを見せない (#720) #2", PTY),
+        ("main.rs: ▾ から選んだプロファイルで `tako master -<name>` が届き、選択後は閉じる (#739)", PTY),
+        ("main.rs: #737: 合成した入力ボックスが画面に出ない", UI),
+        ("main.rs: #737({label}): 前提のチャット表示になっている", UI),
+        ("main.rs: #749: 検証用ペインが消えた（器が内側コマンドの起動を拒否した疑い。#906）", PROC),
+        ("main.rs: #772: 検証用 tmux セッションを作れない", PROC),
+        ("main.rs: 103: 検証用の偽 claude がペイン内で見える (#772)", PTY),
+        ("main.rs: 104: 検証用タブがターミナル 2 + プレビュー 1 で組めた (#770)", PTY),
+        ("main.rs: 105: worker が busy な全画面状態になる (#778)", PTY),
+        ("main.rs: fn set_role", UI),
+        ("main.rs: fn set_role #2", PTY),
+        ("main.rs: #813: idle 型ペインの作成", PTY),
+        ("main.rs: #727: 設定ウィンドウが開かない", UI),
+        ("main.rs: #727: スリープ防止の状態（sleep-guard status）を取れない", PROC),
+        ("main.rs: 133: 取得が終わると読み込み中が消えて理由が出る (#1010。cleared={cleared} notice={notice:?})", PROC),
+        ("main.rs: 133: 接続失敗は消えずに理由へ置き換わる (#1010。{failed:?})", PROC),
+        ("main.rs: 137: 接続が成立したら見張りへ移る (#1040。ここが false だと切断を拾えない)", PROC),
+        ("main.rs: 137: 切断を検知したら自動再接続へ入る (#1040。{reconnecting1040:?})", PROC),
+        ("main.rs: 137: バックオフが明けたら打ち直しが送達確認つき経路へ積まれる (#1040 / #640)", PROC),
+        ("main.rs: 137: 繋がり直したら見張りへ戻り進行状況を出さない (#1040 / #1446)", PROC),
+        ("main.rs: 137: 認証・ホスト鍵の失敗は繰り返さず理由だけ残す (#1040。phase={:?} tail={:?})", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION}: dispatch が通らない", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ①: 遡っても Jump to bottom が出ない。画面: {:?}", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ③: 帯に split right が無い。画面: {:?}", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ③: split right のボタンを押してもペインが増えない（{before_panes} のまま・行き先 {}）", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ③: 報告の last_press が tako / 成功でない: {press_split:?}", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ④: 帯にカードの r: run が無い。画面: {:?}", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ④: カードの Run を押しても走らない（ペイン {before_run} → {after_run}・last_press {card_press:?}・行き先 {}）", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ④: カードの Run を押しても走らない（ペイン {before_run} → {after_run}・last_press {card_press:?}・行き先 {}） #2", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ④: 帯にカードの x: close が無い。画面: {:?}", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ④: カードの「閉じる」を押しても畳まれない（last_press {dismiss_press:?}・行き先 {}）", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ②: 帯に compact が無い。画面: {:?}", PROC),
+        ("self_test/click_forward_1961.rs: visual-test {SECTION_CLAUDE} ②: 報告の last_press が slash / 成功でない: {press_compact:?}", PROC),
+        ("self_test/lsp_servers_1956.rs: visual-test {LABEL} {id}: ホバーの答えに中身がある", PROC),
+        ("self_test/master_tab_title_2120.rs: visual-test {SECTION}: 復元したタブが {tabs} 枚（{expect} 枚を待った）", PROC),
+        ("self_test/net_resume_2112.rs: visual-test {SECTION}: 設定ウィンドウが開かない", UI),
+        ("self_test/paste_guard_2046.rs: fn draw_until_dialog", UI),
+        ("self_test/paste_guard_2046.rs: visual-test {SECTION} ⑩: 設定ウィンドウが開かない", UI),
+        ("self_test/paste_guard_2046.rs: visual-test {SECTION} ⑫: 出した後のフレームを撮れない", UI),
+        ("self_test/preview_memory_2009.rs: visual-test {SECTION}: タブ A が無い", QUIET),
+        ("self_test/show_command_caller_1958.rs: visual-test {SECTION}: 出した後のフレームを撮れない", UI),
+        ("self_test/syntax_alias_1953.rs: ④ 手掛かりの無い draft.m は Objective-C のまま・編集モードに入れる（{before_edit:?} / {editing}）", BG),
+        ("self_test/tasks_input_2016.rs: tasks-input: フレーム採取", MEASURE),
+        ("self_test/tasks_input_2016.rs: tasks-input: フレーム採取 #2", MEASURE),
     ];
 
     #[test]
-    fn 表示種別の判定を固定窓で待っていない() {
-        let src = include_str!("main.rs");
-        let hits = fixed_window_then_display_read(src);
+    fn 回数の窓で待っていない() {
+        let hits = self_test_count_windows();
         let unknown: Vec<String> = hits
             .iter()
-            .filter(|(_, label)| !KNOWN_FIXED_DISPLAY_WAITS.contains(&label.as_str()))
-            .map(|(line, label)| format!("main.rs:{line}（{label}）"))
+            .filter(|(_, key)| !KNOWN_COUNT_WINDOWS.iter().any(|(k, _)| k == key))
+            .map(|(at, key)| format!("{at}（{key}）"))
             .collect();
         assert!(
             unknown.is_empty(),
-            "{unknown:?} が「表示種別の判定（スターター / チャット / 準備中）を固定回数の窓で\
-             待つ」形で書かれている。成立の材料（OSC 133 の Idle・子プロセスの 2 秒 tick・\
-             生成直後の猶予 #720）は時間で解けるので、混んだ機では窓が切れた直後に落ち、\
-             **その項目以降が 1 つも走らなくなる**（#2013 の項目 93 (c) は固定 4 秒窓で\
-             `state=Idle busy=false` を読んで落ちた）。`wait_for_app_state`（状態待ち + \
-             `state_wait_budget` の上限）を使うこと"
+            "{unknown:?} が「固定回数のループで待ち、成立したら抜ける」= **回数の窓**で待っている。\
+             窓の長さ（回数 × 待ち）がビルドと混み具合に追従しないので、debug や混んだ機では\
+             相手が戻る前に使い切り、**その項目以降が 1 つも走らなくなる**（#1890 の \
+             large-file-decor は入った時点から debug で一度も通っていなかった）。状態で待つこと: \
+             background なら `wait_for_background_state`（走っている間だけ待つ）、それ以外は \
+             `wait_for_app_state` 等 + `state_wait_budget`（#1902）"
         );
-        let stale: Vec<&str> = KNOWN_FIXED_DISPLAY_WAITS
+        let stale: Vec<&str> = KNOWN_COUNT_WINDOWS
             .iter()
-            .copied()
-            .filter(|known| !hits.iter().any(|(_, label)| label == known))
+            .map(|(k, _)| *k)
+            .filter(|known| !hits.iter().any(|(_, key)| key == known))
             .collect();
         assert!(
             stale.is_empty(),
-            "KNOWN_FIXED_DISPLAY_WAITS の {stale:?} はもう違反していない。\
-             既知リストは減る方向にしか動かさないので、直したらエントリを消すこと（#2013）"
+            "KNOWN_COUNT_WINDOWS の {stale:?} はもう回数の窓ではない。\
+             既知リストは減る方向にしか動かさないので、直したらエントリを消すこと（#1902）"
+        );
+        let mut keys: Vec<&str> = KNOWN_COUNT_WINDOWS.iter().map(|(k, _)| *k).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(
+            before,
+            keys.len(),
+            "KNOWN_COUNT_WINDOWS に同じキーが 2 度ある"
         );
     }
 
-    /// 検出力の担保: 番犬自身が空振りしないこと（#2013 で直した形そのものを与える）
+    /// `text` の中の整数の字句（`_` 区切りを許す。識別子の一部の数字は数えない）を並びの順で全部
+    fn integer_literals(text: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut digits = String::new();
+        let mut in_ident = false;
+        for ch in text.chars().chain(std::iter::once(' ')) {
+            if !in_ident && (ch.is_ascii_digit() || (ch == '_' && !digits.is_empty())) {
+                digits.push(ch);
+                continue;
+            }
+            if !digits.is_empty() {
+                if let Ok(n) = digits.replace('_', "").parse() {
+                    out.push(n);
+                }
+                digits.clear();
+            }
+            in_ident = ch.is_alphanumeric() || ch == '_';
+        }
+        out
+    }
+
+    /// 引数の並び（`(` の直後から）を深さ 0 の `,` で割る（閉じ括弧まで）
+    fn split_args(args: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = args;
+        while let Some(comma) = top_level_comma(rest) {
+            out.push(rest[..comma].trim());
+            rest = &rest[comma + 1..];
+        }
+        let (mut depth, mut end) = (0i32, rest.len());
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        out.push(rest[..end].trim());
+        out
+    }
+
+    /// `text_wait_budget(回数, 間隔, 上限)` の引数から（旧の窓のミリ秒, 素の上限の秒）。
+    /// 上限が `if cfg!(…) { a } else { b }` なら小さい方。字句で読めなければ `None`
+    fn budget_args(args: &str) -> Option<(u64, u64)> {
+        let args = split_args(args);
+        let times = *integer_literals(args.first()?).first()?;
+        let every = *integer_literals(args.get(1)?).first()?;
+        let base = integer_literals(args.get(2)?).into_iter().min()?;
+        Some((times * every, base))
+    }
+
+    /// #1902 の待ちの予算（場所・旧の窓のミリ秒・新の素の上限の秒）を**ソースから**採る。
+    /// `wait_for_background_state(` の呼び出しは直前 3 行（`let budget = …`）か直後 10 行の
+    /// `text_wait_budget(…)`、`wait_user_tasks_sent(…, (回数, 間隔), …)` は素の上限を
+    /// ヘルパーの本体の 1 か所から採る
+    fn background_wait_budgets() -> Vec<(String, u64, u64)> {
+        let main = include_str!("main.rs");
+        let head = concat!("text_wait", "_budget(");
+        let sent = concat!("wait_user", "_tasks_sent(");
+        let sent_base = main
+            .find(&format!("async fn {sent}"))
+            .and_then(|at| {
+                let body = &main[at..];
+                let call = body.find(head)?;
+                integer_literals(split_args(&body[call + head.len()..]).get(2)?)
+                    .into_iter()
+                    .min()
+            })
+            .expect("wait_user_tasks_sent の素の上限を読めない（形を変えたならこの番犬も直す）");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        let mut sources = vec![("main.rs".to_string(), main.to_string())];
+        for entry in std::fs::read_dir(&dir).expect("src/self_test").flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|x| x == "rs") {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                sources.push((format!("self_test/{name}"), src));
+            }
+        }
+        let join = |lines: &[&str]| lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+        let mut out = Vec::new();
+        for (file, src) in &sources {
+            let lines: Vec<&str> = src.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if line.contains("fn ") {
+                    continue;
+                }
+                let at = format!("{file}:{}", index + 1);
+                if line.contains(concat!("wait_for_background", "_state(")) {
+                    let back = join(&lines[index.saturating_sub(3)..=index]);
+                    let fwd = join(&lines[index..lines.len().min(index + 10)]);
+                    let args = match (back.rfind(head), fwd.find(head)) {
+                        (Some(b), _) => back[b + head.len()..].to_string(),
+                        (None, Some(f)) => fwd[f + head.len()..].to_string(),
+                        (None, None) => continue,
+                    };
+                    if let Some((legacy_ms, base)) = budget_args(&args) {
+                        out.push((at, legacy_ms, base));
+                    }
+                } else if line.contains(sent) {
+                    let fwd = join(&lines[index..lines.len().min(index + 6)]);
+                    let Some(open) = fwd.find(", (") else {
+                        continue;
+                    };
+                    let pair = split_args(&fwd[open + 3..]);
+                    let (Some(&times), Some(&every)) = (
+                        integer_literals(pair.first().copied().unwrap_or_default()).first(),
+                        integer_literals(pair.get(1).copied().unwrap_or_default()).first(),
+                    ) else {
+                        continue;
+                    };
+                    out.push((at, times * every, sent_base));
+                }
+            }
+        }
+        out
+    }
+
+    /// A/B が成り立つ幅（#1902）: 注入 `late` の遅れ（`inject_1180_delay` = 旧の窓 + 5 秒）は
+    /// **旧の窓より長く**（旧の腕だけが落ちる）、**新の素の上限より短い**（新の腕は待って通る）。
+    /// 呼び出しは**ソースから採る**（手で並べた表は移送のたびにずれる = #1375 と同じ理由）
     #[test]
-    fn 番犬は固定窓の表示判定を見逃さず状態待ちは許す() {
-        let read = format!(
-            "                        .update(cx, |app, _, _| app.{}base) == Starter)",
-            concat!("pane_display", "_for(")
+    fn 背景待ちの注入の遅れは旧の窓を超えて新の上限に収まる() {
+        let budgets = background_wait_budgets();
+        assert!(
+            budgets.len() >= 15,
+            "#1902 の待ちの呼び出しを {} 件しか採れない（形を変えたならこの番犬も直す）: {budgets:?}",
+            budgets.len()
         );
+        for (at, legacy_ms, base_s) in &budgets {
+            let legacy = std::time::Duration::from_millis(*legacy_ms);
+            let delay = super::self_test::inject_1180_delay(legacy);
+            assert!(delay > legacy, "{at}: 注入の遅れが旧の窓を超えない");
+            assert!(
+                delay < std::time::Duration::from_secs(*base_s),
+                "{at}: 注入の遅れ {delay:?} が新の素の上限 {base_s} 秒を超える = 新の腕でも上限で\
+                 諦めて A/B にならない（#1902）。素の上限を旧の窓 + 5 秒より広く採る"
+            );
+        }
+        // 字句の読み取りそのもの（cfg! の分岐は小さい方・識別子の数字は数えない）
+        assert_eq!(
+            budget_args("2000, 10, if cfg!(debug_assertions) { 600 } else { 120 })"),
+            Some((20_000, 120))
+        );
+        assert_eq!(budget_args("legacy_polls, poll_ms, 30)"), None);
+        assert_eq!(integer_literals("item150 (1_000, 10)"), vec![1000, 10]);
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#2013 / #1890 で直した形そのものを与える）
+    #[test]
+    fn 番犬は回数の窓を見逃さず状態待ちは許す() {
+        let scan = |src: &str| count_windows("t.rs", src, 0..src.lines().count());
         let wait = format!(
             "                    {}",
             concat!("wait(cx", ", 100).await;")
         );
-        // 項目 93 (c) の旧実装そのもの（読む → 抜ける → 待つ。待ちが末尾）
+        // #2013 の項目 93 (c) の旧実装そのもの（読む → 抜ける → 待つ。待ちが末尾）
         let bad = [
+            "            async fn item93(cx: &mut AsyncApp) {",
             "                let mut idle_starter = false;",
             "                for _ in 0..40 {",
             "                    idle_starter = window",
-            read.as_str(),
+            "                        .update(cx, |app, _, _| starter(app))",
             "                        .unwrap_or(false);",
             "                    if idle_starter {",
             "                        break;",
@@ -101670,31 +102358,82 @@ mod selftest_wait_watchdog {
             wait.as_str(),
             "                }",
             "                check(idle_starter, \"判定表 (#694)\");",
+            "            }",
         ]
         .join("\n");
-        assert_eq!(
-            fixed_window_then_display_read(&bad),
-            vec![(2, "判定表 (#694)".to_string())]
-        );
-        // 待ちが先頭でも同じ（#702 の形）
+        assert_eq!(scan(&bad), vec![(3, "t.rs: 判定表 (#694)".to_string())]);
+        // 待ちが先頭でも同じ（#702 の形）・抜けが `return` でも同じ（ヘルパーの形）
         let head = bad.replace(
             "                    idle_starter = window",
             &format!("{wait}\n                    idle_starter = window"),
         );
-        assert_eq!(fixed_window_then_display_read(&head).len(), 1);
-        // `break` を持たない = 待ちの結果を判定に使っていない（片付けの叩き込み等）は対象外
+        assert_eq!(scan(&head).len(), 1);
+        let returns = bad.replace("break;", "return true;");
+        assert_eq!(scan(&returns).len(), 1);
+        // #1890 の形（timer で待って描く・ラベルが無ければ囲む関数の名前がキー）
+        let timer = [
+            "    async fn wait_paint(cx: &mut AsyncApp) -> bool {",
+            "        for _ in 0..3000 {",
+            "            if painted(cx) {",
+            "                return true;",
+            "            }",
+            "            cx.background_executor()",
+            &format!(
+                "                {}",
+                concat!(".timer", "(Duration::from_millis(10))")
+            ),
+            "                .await;",
+            "            notify_and_draw(any, window, cx);",
+            "        }",
+            "        false",
+            "    }",
+        ]
+        .join("\n");
+        assert_eq!(scan(&timer), vec![(2, "t.rs: fn wait_paint".to_string())]);
+        // self_test/*.rs の `sleep(cx, ms)` の形
+        let sleep = bad.replace(concat!("wait(cx", ", 100)"), concat!("sleep(cx", ", 100)"));
+        assert_eq!(scan(&sleep).len(), 1);
+        // キーは `check` の条件の中の文字列ではなくラベル（深さ 0 の `,` の後ろ）
+        let cond = bad.replace(
+            "check(idle_starter, ",
+            "check(\n                    last.starts_with(\"a/true\") && f(x, y),\n                    ",
+        );
+        assert_eq!(scan(&cond), vec![(3, "t.rs: 判定表 (#694)".to_string())]);
+        // 行末の `\` で続けたラベルは改行と次の行の字下げを詰める（Rust の文字列の継続）
+        let continued = bad.replace(
+            "\"判定表 (#694)\"",
+            "\"判定\\\n                     表 (#694)\"",
+        );
+        assert_eq!(
+            scan(&continued),
+            vec![(3, "t.rs: 判定表 (#694)".to_string())]
+        );
+        // 同じキーが 2 度なら 2 つ目に ` #2`
+        let twice = format!("{bad}\n{bad}");
+        assert_eq!(
+            scan(&twice).into_iter().map(|(_, k)| k).collect::<Vec<_>>(),
+            vec!["t.rs: 判定表 (#694)", "t.rs: 判定表 (#694) #2"]
+        );
+        // `break` / `return` を持たない = 待ちの結果を判定に使っていない（描くだけの周回）は対象外
         let no_break = bad.replace("                        break;\n", "");
-        assert!(fixed_window_then_display_read(&no_break).is_empty());
-        // 表示種別を読まないループは別の番犬の担当
-        let other = bad.replace(concat!("pane_display", "_for("), "focused_pane(");
-        assert!(fixed_window_then_display_read(&other).is_empty());
+        assert!(scan(&no_break).is_empty());
+        // 語の一部（`breakpoint`）は抜けではない
+        let word = no_break.replace("if idle_starter {", "if idle_starter { breakpoint();");
+        assert!(scan(&word).is_empty());
+        // 待ちを持たないループ（描画の往復だけ）は対象外
+        let no_wait = bad.replace(
+            wait.as_str(),
+            "                    notify_and_draw(any, window, cx);",
+        );
+        assert!(scan(&no_wait).is_empty());
         // 状態待ちへ寄せた形は許す
         let good = format!(
-            "                let idle_starter = {}(window, cx, label, budget, |app| app.{}base) == Starter).await;\n                check(idle_starter, \"判定表 (#694)\");",
+            "                let idle_starter = {}(window, cx, label, budget, |app| starter(app)).await;\n                check(idle_starter, \"判定表 (#694)\");",
             concat!("wait_for_app", "_state"),
-            concat!("pane_display", "_for(")
         );
-        assert!(fixed_window_then_display_read(&good).is_empty());
+        assert!(scan(&good).is_empty());
+        // 範囲の外は見ない（製品コードの取り直し）
+        assert!(count_windows("t.rs", &bad, 0..2).is_empty());
     }
 
     /// **プレビューの状態待ちの上限を固定値で書いていない**（#1837）。

@@ -1457,10 +1457,42 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   へ寄せ、旧の窓は A/B の腕として**予算の値**で残す（`TAKO_2013_LEGACY=1`。注入は
   `TAKO_2013_INJECT=late|never`、診断行は `TAKO_SELF_TEST_2013`）。この形（「読む → 抜ける →
   待つ」で待ちがループの末尾にある）は `for` の直後の行が `wait` の形だけを見る既存の番犬を
-  すり抜けていたので、番犬 `表示種別の判定を固定窓で待っていない` が `pane_display_for` を
-  本文に持つ固定回数ループを名指しで落とす。#2013 の時点で残っている項目 94（#702）/
-  97（#720）の 4 か所は既知リスト `KNOWN_FIXED_DISPLAY_WAITS` で段階導入（減る方向にしか
-  動かさない）
+  すり抜けていたので、#2013 は `pane_display_for` を本文に持つ固定回数ループを名指しする番犬を
+  入れた（項目 94（#702）/ 97（#720）の残りは既知リストで段階導入）。**#1902 でこの番犬を
+  下の「回数の窓で待たない」へ一般化し、既知リストもそちらへ移した**
+- **回数の窓で待たない**（#1902。#1890 と #2013 の一般化）。`for _ in 0..N { …; 成立なら
+  break / return; 待つ }` は「N 回 × 待ち」の**固定の予算**で、窓の長さがビルド（debug は桁で
+  遅い）と混み具合に追従しない。#1890 の `large-file-decor` は窓を release の塗りだけで決めて
+  いたので、入った時点から debug では一度も通っていなかった。**待っている相手が何であれ同じ穴**
+  なので、判定式の needle ではなく形で見る。
+  - **background の仕事を待つなら `wait_for_background_state` の 1 実装**: `probe` が
+    `BackgroundWait::{Landed, Running, Settled}` を返し、**走っている間だけ**待つ（上限は止まった
+    ときの保険 = `state_wait_budget`）。**走り終えたのに揃わなければ**（`Settled` が
+    `BACKGROUND_SETTLE_POLLS` 周期続けば）上限まで待たずにその場で偽 = 検出力は回数の窓より強い。
+    「走っている」は製品が既に持つ印から採る（プレビューは `preview_background_running` =
+    `Loading`・`view_highlights_running`・PDF の `pending_pdf_rasters` / `active_pdf_rasters`、
+    tasks は `list_poll.inflight` / `status_inflight` / `sending`、hover は `lsp_hover.inflight`）。
+    **積んだだけの仕事は走っていない**: 読み込みと塗りの待ち行列（`pending_preview_loads` /
+    `pending_highlights` 等）は描画では流れない（#826）ので、流し忘れは `Settled` で即座に落ちる。
+    相手が別プロセスで「走っている」を言えないとき（偽サーバの診断）は `Landed` / `Running`
+    だけを返す（= 状態待ち + 伸びる上限）
+  - A/B は `TAKO_1902_LEGACY=<項目>`（旧の回数の窓 = 予算の値 `text_wait_budget(回数, 間隔, 素の上限)`
+    で残す）、注入は `TAKO_1902_INJECT=late|never[:<項目>…]`（**観測だけ**を遅らせる）、診断行は
+    `TAKO_SELF_TEST_1902`（`item=` / `outcome=` / `waited=` / `budget=` / `polls=` / `legacy=` /
+    `capped=` / `inject=`）。塗りそのものの遅れは製品側の `TAKO_1890_INJECT=slow:<ms>`、塗りを
+    捨てるのは `drop`。実経路は `scripts/test-background-wait-1902.sh`（`TAKO_ISO_PROFILE=debug|release`）。
+    不等式（旧の窓 < 注入の遅れ = 旧の窓 + 5 秒 < 新の素の上限）は
+    `背景待ちの注入の遅れは旧の窓を超えて新の上限に収まる` が**ソースから採った全呼び出し**に対して検査する
+  - 番犬 `回数の窓で待っていない` が、main.rs の `mod self_test` と `src/self_test/*.rs` の
+    固定回数（`for … in 0..`）のループのうち、本文（インデントで閉じ括弧まで）に**待ち**
+    （`wait(cx, ` / `.timer(` / `sleep(cx, ` / `thread::sleep(`）と**抜け**（`break` / `return`）を
+    両方持つものを `ファイル:行（キー）` で名指しする。キーは「ファイル名: ループの後の最初の
+    `check(` / `fail(` のラベル」（無ければ「ファイル名: fn <囲む関数>」）。#1902 の時点の残りは
+    既知リスト `KNOWN_COUNT_WINDOWS`（キーと分類 = PTY / 別プロセス / UI / 画面の静止 / 計測 /
+    background の未移送）で段階導入する（減る方向にしか動かさない）。#1162 / #1153 / #1165 /
+    #1180 / #771 の needle 別の番犬はそれぞれの寄せ先を案内するために残す（形の番犬が上位）
+  - **上限が固定値の状態待ち**（`wait_for_preview_state(…, Duration::from_secs(3), …)`）は
+    回数の窓ではないのでこの番犬には当たらない = 下の #1837 の番犬の担当（形が違うので並べる）
 - **状態待ちの関数でも上限を固定値で渡さない**（#1837）。「巨大ファイル後に通常表示へ復帰」
   （#1660）は `wait_for_preview_state` で状態を待っていたが、**上限が固定 3 秒**で混み具合に
   伸びないので、load 30〜50 の機ではファイルの監視 → 読み込み → 差し替えが 3 秒の外へ出て
