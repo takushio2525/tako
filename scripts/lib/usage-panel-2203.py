@@ -43,6 +43,8 @@ def line(msg_id, sid, now, minutes, output, cache_read, cwd, model="claude-opus-
             "uuid": "u-" + msg_id,
         },
         ensure_ascii=False,
+        # Claude Code の記録と同じ詰めた区切り（索引の読み手は `"type":"assistant"` の部分一致で先に絞る）
+        separators=(",", ":"),
     )
 
 
@@ -132,7 +134,8 @@ def limits(login, now, mode):
                 "observed_at": at,
                 "recorded_at": at,
                 "source": "mod",
-            }
+            },
+            separators=(",", ":"),
         )
 
     r7 = now + 3 * 86400

@@ -84,28 +84,24 @@ fn show_meters(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) {
 }
 
 /// メーターを実マウスで押して usage ビューを開く（定期処理がメーターを消した瞬間に当たったら押し直す）
-/// 返り値は押した操作（mouse down → 開く → 読みを頼む）にかかった時間（ms）。読みを UI スレッドの
-/// 同期の dispatch でしていれば（A/B の `TAKO_1984_LEGACY=1`）ここが集計の間ずっと止まる
 fn open_from_meter(
     any: AnyWindowHandle,
     window: WindowHandle<TakoApp>,
     cx: &mut AsyncApp,
     meter: &str,
     step: &str,
-) -> u128 {
+) {
     for _ in 0..5 {
         show_meters(window, cx);
         notify_and_draw(any, window, cx);
-        let started = std::time::Instant::now();
         click_probe(any, window, cx, &format!("statusbar-limit-{meter}"), step);
-        let took = started.elapsed().as_millis();
         let opened = window
             .update(cx, |app, _, _| {
                 app.panel_visible && app.panel_view == PanelView::Usage
             })
             .unwrap_or(false);
         if opened {
-            return took;
+            return;
         }
         // 切り替えのメニューへ落ちていたら閉じて押し直す
         let _ = window.update(cx, |app, _, _| {
@@ -164,6 +160,25 @@ async fn wait_result(
     }
 }
 
+/// いまの段を読み直す操作そのものの所要（ms。UI スレッドの占有 = 旧経路ならここで集計する）と、
+/// 答えを待つ間の描画の最大の間隔・所要
+async fn timed_refetch(
+    any: AnyWindowHandle,
+    window: WindowHandle<TakoApp>,
+    cx: &mut AsyncApp,
+    limit: Duration,
+    step: &str,
+) -> (u128, u128, u128) {
+    let started = std::time::Instant::now();
+    let _ = window.update(cx, |app, _, cx| {
+        app.usage.pending = true;
+        app.drain_usage_pending(cx);
+    });
+    let call = started.elapsed().as_millis();
+    let (gap, took) = wait_result(any, window, cx, limit, step).await;
+    (call, gap, took)
+}
+
 /// いまの段の問い合わせと描いた行
 fn snapshot(
     window: WindowHandle<TakoApp>,
@@ -184,13 +199,19 @@ fn snapshot(
 
 /// 段の行を 1 行ずつ出す（スクリプトが CLI と照合する）
 fn print_rows(step: &str, query: &UsageQuery, views: &[UsageLoginView]) {
+    // 空の欄は `-`（シェルの `read` はタブの連続を 1 つの区切りに潰す）
+    let field = |v: &Option<String>| {
+        v.clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into())
+    };
     println!(
         "TAKO_USAGE_QUERY\t{step}\t{}\t{}\t{}\t{}\t{}",
-        query.by.as_deref().unwrap_or(""),
-        query.window.as_deref().unwrap_or(""),
-        query.project.as_deref().unwrap_or(""),
-        query.issue.as_deref().unwrap_or(""),
-        query.limit.unwrap_or(0),
+        field(&query.by),
+        field(&query.window),
+        field(&query.project),
+        field(&query.issue),
+        query.limit.unwrap_or(crate::usage_panel::USAGE_ROWS),
     );
     for (li, v) in views.iter().enumerate() {
         println!(
@@ -277,16 +298,15 @@ pub(super) async fn usage_panel_2203_visual(
 
     if case != "main" {
         dump(any, window, cx, &format!("{case}-before"));
-        let click = open_from_meter(any, window, cx, "7d", "①");
+        open_from_meter(any, window, cx, "7d", "①");
         let _ = window.update(cx, |app, _, cx| {
             app.panel_width = 480.0;
             cx.notify();
         });
-        let (gap, took) = wait_result(any, window, cx, wait_limit, &case).await;
-        // UI スレッドが止まった最大の時間 = 押した操作の所要と、待つ間の描画の間隔の大きい方
-        let gap = gap.max(click);
+        wait_result(any, window, cx, wait_limit, &case).await;
+        let (call, gap, took) = timed_refetch(any, window, cx, wait_limit, &case).await;
         println!(
-            "TAKO_USAGE_2203_WAIT\t{case}\tmax_draw_gap_ms={gap}\tclick_ms={click}\tanswer_ms={took}"
+            "TAKO_USAGE_2203_WAIT\t{case}\tfetch_call_ms={call}\tmax_draw_gap_ms={gap}\tanswer_ms={took}"
         );
         let (query, rendered, payload, _) = snapshot(window, cx);
         print_rows(&case, &query, &rendered);
@@ -302,13 +322,11 @@ pub(super) async fn usage_panel_2203_visual(
         // 数万の会話: 掘った先（Issue → 会話 = 1 プロジェクトに数百の会話）でも同じ
         if case == "huge" {
             for (step, row) in [("huge-issue", "②"), ("huge-session", "③")] {
-                let started = std::time::Instant::now();
                 click_probe(any, window, cx, "usage-row-0", row);
-                let click = started.elapsed().as_millis();
-                let (gap, took) = wait_result(any, window, cx, wait_limit, step).await;
-                let gap = gap.max(click);
+                wait_result(any, window, cx, wait_limit, step).await;
+                let (call, gap, took) = timed_refetch(any, window, cx, wait_limit, step).await;
                 println!(
-                    "TAKO_USAGE_2203_WAIT\t{step}\tmax_draw_gap_ms={gap}\tclick_ms={click}\tanswer_ms={took}"
+                    "TAKO_USAGE_2203_WAIT\t{step}\tfetch_call_ms={call}\tmax_draw_gap_ms={gap}\tanswer_ms={took}"
                 );
                 let (query, rendered, _, _) = snapshot(window, cx);
                 print_rows(step, &query, &rendered);
@@ -321,7 +339,7 @@ pub(super) async fn usage_panel_2203_visual(
     // ① ステータスバーの 7d → 最上段（プロジェクト）
     show_meters(window, cx);
     dump(any, window, cx, "statusbar");
-    let _ = open_from_meter(any, window, cx, "7d", "①");
+    open_from_meter(any, window, cx, "7d", "①");
     let _ = window.update(cx, |app, _, cx| {
         app.panel_width = 520.0;
         cx.notify();

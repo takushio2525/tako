@@ -1141,7 +1141,8 @@ mod tests {
                 usage_profile("tako"),
                 usage_no_issue().to_string(),
                 usage_manual().to_string(),
-                usage_amount("$1.00", "1.2 万", 3),
+                // 数の書式（万・億）は CLI と同じ `tako_core::usage::display` の側なので、見本は単位の無い値
+                usage_amount("$1.00", "9999", 3),
                 usage_outside().to_string(),
                 usage_estimated().to_string(),
                 usage_unavailable("5h"),

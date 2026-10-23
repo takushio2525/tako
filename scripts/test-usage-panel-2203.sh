@@ -194,9 +194,10 @@ CLI_DIR="$TMP/cli"
 mkdir -p "$CLI_DIR"
 while IFS=$'\t' read -r tag step by window project issue limit; do
   [ "$tag" = "TAKO_USAGE_QUERY" ] || continue
+  # 空の欄は `-`（read はタブの連続を 1 つに潰すので visual-test が埋めて出す）
   args=(--by "$by" --window "$window" --limit "$limit")
-  [ -n "$project" ] && args+=(--project "$project")
-  [ -n "$issue" ] && args+=(--issue "$issue")
+  [ "$project" != "-" ] && args+=(--project "$project")
+  [ "$issue" != "-" ] && args+=(--issue "$issue")
   "$TAKO_BIN" usage --json ${args[@]+"${args[@]}"} > "$CLI_DIR/$step.json" 2>/dev/null
   "$TAKO_BIN" usage ${args[@]+"${args[@]}"} > "$CLI_DIR/$step.txt" 2>/dev/null
   echo "    ${step}: tako usage ${args[*]+${args[*]}}"
@@ -212,8 +213,11 @@ echo "== 3. tako usage --show / MCP の show / tako_panel の usage（IPC の実
 use_case show
 reuse_main
 OUT="$("$TAKO_BIN" usage --show 2>&1)"
-check_eq "tako が動いていなければ --show は理由を言って止まる" \
-  "tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）" "$(printf '%s' "$OUT" | tail -1)"
+RC=$?
+case "$RC:$OUT" in
+  1:*"tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）"*) pass "tako が動いていなければ --show は理由を言って止まる（終了コード 1）" ;;
+  *) fail "tako が動いていないときの --show（終了コード ${RC}）: $OUT" ;;
+esac
 if launch_isolated_gui "$TMP/app-show.log"; then
   APP_PID="$ISOLATED_GUI_PID"
   remember_vhome "$APP_PID"
@@ -284,23 +288,25 @@ python3 -I "$PY" limits "$HLOGIN" "$NOW" huge > "$TAKO_DATA_DIR/usage/limits.jso
 echo "    生成 $(perl -e "printf '%.1f', $T1 - $T0") 秒・CLI の索引作り（debug）$(perl -e "printf '%.1f', $T2 - $T1") 秒"
 HS="$("$TAKO_BIN" usage --json --window all --by login 2>/dev/null | jf logins.0.usage.total.sessions)"
 check_eq "索引の会話の数" "$HUGE" "$HS"
-gap_of() { grep "^TAKO_USAGE_2203_WAIT" "$1" | sed -n 's/.*max_draw_gap_ms=\([0-9]*\).*/\1/p' | sort -n | tail -1; }
+# 段ごとの最大（$2 = fetch_call_ms / max_draw_gap_ms）
+max_of() { grep "^TAKO_USAGE_2203_WAIT" "$1" | sed -n "s/.*${2}=\([0-9]*\).*/\1/p" | sort -n | tail -1; }
 if run_visual huge "$TMP/visual-huge.log"; then
-  GAP="$(gap_of "$TMP/visual-huge.log")"
+  CALL="$(max_of "$TMP/visual-huge.log" fetch_call_ms)"
+  GAP="$(max_of "$TMP/visual-huge.log" max_draw_gap_ms)"
   grep "^TAKO_USAGE_2203_WAIT" "$TMP/visual-huge.log" | sed 's/^/    /'
-  if [ -n "$GAP" ] && [ "$GAP" -le 500 ]; then
-    pass "数万の会話でも待つ間の描画の最大の間隔 ${GAP} ms（≤ 500 ms = UI が固まらない）"
+  if [ -n "$CALL" ] && [ "$CALL" -le 100 ] && [ -n "$GAP" ] && [ "$GAP" -le 500 ]; then
+    pass "数万の会話でも読みを頼む操作は ${CALL} ms・待つ間の描画の最大の間隔 ${GAP} ms（UI スレッドで集計しない）"
   else
-    fail "数万の会話で描画が ${GAP:-?} ms 止まった"
+    fail "数万の会話で UI スレッドが止まった（読みを頼む操作 ${CALL:-?} ms・描画の間隔 ${GAP:-?} ms）"
   fi
   echo "    A/B: TAKO_1984_LEGACY=1（読みを UI スレッドの同期の dispatch へ戻す）"
   run_visual huge "$TMP/visual-huge-legacy.log" TAKO_1984_LEGACY=1 >/dev/null 2>&1
-  LGAP="$(gap_of "$TMP/visual-huge-legacy.log")"
+  LCALL="$(max_of "$TMP/visual-huge-legacy.log" fetch_call_ms)"
   grep "^TAKO_USAGE_2203_WAIT" "$TMP/visual-huge-legacy.log" | sed 's/^/    legacy /'
-  if [ -n "$LGAP" ] && [ -n "$GAP" ] && [ "$LGAP" -gt "$GAP" ]; then
-    pass "A/B: 旧経路は描画が ${LGAP} ms 止まる（新 ${GAP} ms）"
+  if [ -n "$LCALL" ] && [ -n "$CALL" ] && [ "$LCALL" -ge 200 ] && [ "$LCALL" -gt $((CALL * 5)) ]; then
+    pass "A/B: 旧経路は読みを頼む操作の中で ${LCALL} ms UI スレッドが止まる（新 ${CALL} ms）"
   else
-    fail "A/B の差が出ない（旧 ${LGAP:-?} ms / 新 ${GAP:-?} ms）"
+    fail "A/B の差が出ない（旧 ${LCALL:-?} ms / 新 ${CALL:-?} ms）"
   fi
 else
   fail "visual-test huge が通らない（$(grep -m1 "TAKO_APP_SELF_TEST_FAILED" "$TMP/visual-huge.log" | mask)）"
