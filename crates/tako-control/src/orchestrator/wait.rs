@@ -632,6 +632,7 @@ pub fn run_worker(
             pane: Some(pane_id),
             force: true,
             caller_role: None,
+            caller_pane: None,
         })
         .is_ok()
     } else {
@@ -1015,6 +1016,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
             pane: Some(pane_id),
             force: true,
             caller_role: None,
+            caller_pane: None,
         })
         .is_ok()
     } else {
@@ -2721,6 +2723,7 @@ mod tests {
                 pane: Some(9),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             }
         )));
     }

@@ -333,6 +333,7 @@ pub(super) async fn syntax_alias_visual(
                     pane: Some(draft_pane.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );

@@ -669,6 +669,10 @@ enum PromptFlowState {
     /// Enter 送信済み。入力欄が空へ戻った（= 送信された）ことを検証し、
     /// 残っていれば Enter を単独再送する
     VerifySubmitted,
+    /// 画面では送達を確かめられず諦める直前に、受け手の会話記録（transcript）で
+    /// 受領の証拠を待つ（#2330。狭いペインで本文の先頭が入力欄から流れても、届いたものを
+    /// 届いていないと言わない）。証拠が無いまま窓を過ぎたら控えていた顛末で諦める
+    ConfirmReceipt,
     /// 完了
     Done,
 }
@@ -803,6 +807,14 @@ struct PromptFlow {
     hold_started_at: Option<std::time::Instant>,
     /// 入力欄を描けない短いペインで、peer 送達を次に試し直す時刻（#1940）
     peer_retry_at: Option<std::time::Instant>,
+    /// 受領の証拠を探す材料（#2330）。keys 経路で最初に貼り付ける直前に控える
+    receipt: Option<tako_control::delivery_receipt::ReceiptProbe>,
+    /// 受け手の transcript の所在（#2330。一度引けたら覚える = 毎 tick 走査しない）
+    receipt_path: Option<std::path::PathBuf>,
+    /// 貼り付けの後に最初の Enter を送った時刻（#2330。mod のターン遷移の判定に使う）
+    enter_at: Option<std::time::Instant>,
+    /// 受領の証拠を待つあいだ控えておく「諦めるなら」の顛末と待っていた理由（#2330）
+    held_give_up: Option<(&'static str, Option<tako_core::prompt_delivery::Stall>)>,
 }
 
 /// peer 送達の背景試行と UI スレッドの受け渡し口（#790 + #1259）。
@@ -932,6 +944,10 @@ impl PromptFlow {
             journal: tako_core::prompt_delivery::Journal::default(),
             hold_started_at: None,
             peer_retry_at: None,
+            receipt: None,
+            receipt_path: None,
+            enter_at: None,
+            held_give_up: None,
         }
     }
 
@@ -9231,6 +9247,17 @@ impl TakoApp {
                                     reason,
                                 );
                             }
+                            // #2330: 画面で確かめられなかったときに受け手の会話記録を
+                            // 読むための材料を、貼り付けの**前**に控える（送信後の追記だけを見る）
+                            if flow.receipt.is_none() && !tako_core::handoff_guard::legacy() {
+                                flow.receipt_path = self.receipt_transcript(flow.pane);
+                                flow.receipt =
+                                    Some(tako_control::delivery_receipt::ReceiptProbe::capture(
+                                        &flow.prompt,
+                                        flow.receipt_path.as_deref(),
+                                        self.receipt_report(flow.pane),
+                                    ));
+                            }
                             Self::paste_prompt(&flow, session, &backend_for_flow);
                             flow.state = PromptFlowState::WaitTextInInput;
                             flow.state_entered_at = now;
@@ -9285,6 +9312,7 @@ impl TakoApp {
                         // （貼り付けバーストに混ざると「次の行」と解釈される）
                         flow.paste_reflected = true;
                         session.write(b"\r".to_vec());
+                        flow.enter_at.get_or_insert(now);
                         flow.state = PromptFlowState::VerifySubmitted;
                         flow.state_entered_at = now;
                         flow.stall = None;
@@ -9312,6 +9340,7 @@ impl TakoApp {
                             // この経路を通った送達は「確認済み」にしない（#530）
                             flow.unverified_reason = Some("paste_not_reflected");
                             session.write(b"\r".to_vec());
+                            flow.enter_at.get_or_insert(now);
                             flow.state = PromptFlowState::VerifySubmitted;
                             flow.state_entered_at = now;
                         }
@@ -9356,12 +9385,15 @@ impl TakoApp {
                                 let reason =
                                     flow.unverified_reason.unwrap_or("paste_not_reflected");
                                 let stall = flow.stall;
-                                Self::report_prompt_delivery(&flow, reason);
-                                Self::finish_flow(
-                                    &mut flow,
-                                    Status::gave_up(reason, stall, elapsed),
-                                    &mut states,
-                                );
+                                // #2330: 画面では確かめられなかった。諦める前に受け手の会話記録を見る
+                                if !Self::hold_for_receipt(&mut flow, reason, stall, now) {
+                                    Self::report_prompt_delivery(&flow, reason);
+                                    Self::finish_flow(
+                                        &mut flow,
+                                        Status::gave_up(reason, stall, elapsed),
+                                        &mut states,
+                                    );
+                                }
                             }
                         } else if flow.enter_retries_left > 0 {
                             // Enter が「送信」と解釈されず残留 → Enter を単独再送
@@ -9375,17 +9407,74 @@ impl TakoApp {
                                 flow.pane.as_u64()
                             );
                             flow.state = PromptFlowState::Done;
-                            Self::report_prompt_delivery(&flow, "residual_after_retries");
-                            Self::finish_flow(
+                            // #2330: 画面の読み違いでも届いていれば会話記録に入る。諦める前に見る
+                            if !Self::hold_for_receipt(
                                 &mut flow,
-                                Status::gave_up(
-                                    "residual_after_retries",
-                                    Some(Stall::EnterResend),
-                                    elapsed,
-                                ),
-                                &mut states,
-                            );
+                                "residual_after_retries",
+                                Some(Stall::EnterResend),
+                                now,
+                            ) {
+                                Self::report_prompt_delivery(&flow, "residual_after_retries");
+                                Self::finish_flow(
+                                    &mut flow,
+                                    Status::gave_up(
+                                        "residual_after_retries",
+                                        Some(Stall::EnterResend),
+                                        elapsed,
+                                    ),
+                                    &mut states,
+                                );
+                            }
                         }
+                    }
+                }
+                PromptFlowState::ConfirmReceipt => {
+                    // #2330: 受け手の会話記録（引けなければ mod のターン遷移）に受領の証拠を探す
+                    let (reason, stall) = flow
+                        .held_give_up
+                        .unwrap_or(("paste_not_reflected", Some(Stall::PasteNotReflected)));
+                    if flow.receipt_path.is_none() {
+                        flow.receipt_path = self.receipt_transcript(flow.pane);
+                    }
+                    let evidence = flow.receipt.as_ref().and_then(|probe| {
+                        probe.check(
+                            flow.receipt_path.as_deref(),
+                            self.receipt_report(flow.pane),
+                            flow.enter_at,
+                        )
+                    });
+                    let elapsed = flow.created_at.elapsed().as_secs() as u32;
+                    if let Some(evidence) = evidence {
+                        flow.state = PromptFlowState::Done;
+                        tako_control::delivery_receipt::log_received(flow.pane.as_u64(), evidence);
+                        Self::report_prompt_delivery_ok_as(
+                            &flow,
+                            tako_core::prompt_delivery::RECEIVED,
+                        );
+                        Self::finish_flow(
+                            &mut flow,
+                            Status::delivered(
+                                "keys",
+                                tako_core::prompt_delivery::RECEIVED,
+                                elapsed,
+                            ),
+                            &mut states,
+                        );
+                    } else if flow.state_entered_at.elapsed()
+                        >= std::time::Duration::from_secs(
+                            tako_control::delivery_receipt::CONFIRM_WINDOW_SECS,
+                        )
+                    {
+                        flow.state = PromptFlowState::Done;
+                        Self::report_prompt_delivery(&flow, reason);
+                        Self::finish_flow(
+                            &mut flow,
+                            Status::gave_up(reason, stall, elapsed),
+                            &mut states,
+                        );
+                    } else {
+                        // 待っている理由は諦める直前のまま（応答の語彙を増やさない）
+                        flow.stall = stall;
                     }
                 }
                 PromptFlowState::Done => {}
@@ -9449,7 +9538,59 @@ impl TakoApp {
         states: &mut Vec<(PaneId, tako_core::prompt_delivery::Status)>,
     ) {
         flow.stall = None;
+        // #2330: 届いた送達は引き継ぎの帳面へ（後任なら受領済み = 前任からは閉じない）。
+        // 「送ったかもしれない」（peer_unconfirmed 等）を受領にしない判断は note_delivered の中
+        if let (tako_core::prompt_delivery::State::Delivered, Some(outcome)) =
+            (status.state, status.outcome.as_deref())
+        {
+            tako_control::handoff_guard::note_delivered(flow.pane.as_u64(), outcome);
+        }
         Self::note_flow(flow, status, states);
+    }
+
+    /// 画面では送達を確かめられずに諦める直前、受け手の会話記録で受領を確かめる窓へ入る（#2330）。
+    /// 入ったら true（呼び出し側は諦めない）。材料が無い（keys 経路で貼っていない・Enter 単独の
+    /// 送達）・`TAKO_2330_LEGACY=1` のときは false = 従来どおりその場で諦める
+    fn hold_for_receipt(
+        flow: &mut PromptFlow,
+        reason: &'static str,
+        stall: Option<tako_core::prompt_delivery::Stall>,
+        now: std::time::Instant,
+    ) -> bool {
+        if flow.enter_only || flow.receipt.is_none() || tako_core::handoff_guard::legacy() {
+            return false;
+        }
+        flow.held_give_up = Some((reason, stall));
+        flow.state = PromptFlowState::ConfirmReceipt;
+        flow.state_entered_at = now;
+        flow.stall = stall;
+        true
+    }
+
+    /// 受領の証拠を探す transcript の所在（#2330）。tako mod の報告の会話 ID（設定 dir の
+    /// 手がかりつき）→ 走査で覚えた会話 ID の順に引く。引けなければ None
+    fn receipt_transcript(&self, pane: PaneId) -> Option<std::path::PathBuf> {
+        if let Some(stored) = self.receipt_report(pane) {
+            if let Some(id) = stored.report.session_id.as_deref() {
+                let hint = stored
+                    .report
+                    .config_dir
+                    .as_deref()
+                    .map(std::path::Path::new);
+                if let Some(path) = tako_control::transcript::find_transcript_hinted(id, hint) {
+                    return Some(path);
+                }
+            }
+        }
+        let id = self.claude_resume_sessions.get(pane)?;
+        tako_control::transcript::find_transcript(id)
+    }
+
+    /// 受領の証拠に使う tako mod の報告（新鮮なものだけ。#2330）
+    fn receipt_report(&self, pane: PaneId) -> Option<&tako_core::claude_mod::StoredReport> {
+        self.claude_mod
+            .lookup(pane.as_u64(), std::time::Instant::now())
+            .ok()
     }
 
     /// peer 送達（#790）の 1 tick ぶんの前進。
@@ -9651,6 +9792,10 @@ impl TakoApp {
     /// TUI 側は通常の連続入力として受け取る（実測で入力欄へ反映される）。
     /// 迂回しない / 失敗した場合は従来どおり `paste`（挙動据え置き）
     fn paste_prompt(flow: &PromptFlow, session: &TerminalSession, backend: &Option<String>) {
+        // #2330 の検証用の注入: 貼り付けを捨てる（TUI が吸った = 本当に届かない送信を作る）
+        if tako_control::delivery_receipt::inject_drop_paste() {
+            return;
+        }
         match tako_control::delivery::inject_non_ascii(backend.as_deref(), &flow.prompt) {
             Ok(true) => {}
             _ => session.paste(&flow.prompt),
@@ -9684,12 +9829,17 @@ impl TakoApp {
 
     /// 送達を確認できた場合の記録（Issue #530）
     fn report_prompt_delivery_ok(flow: &PromptFlow) {
+        Self::report_prompt_delivery_ok_as(flow, tako_core::prompt_delivery::VERIFIED);
+    }
+
+    /// 送達を確認できた場合の記録（顛末コードつき。画面で確かめた `verified` /
+    /// 会話記録で確かめた `received` = #2330）
+    fn report_prompt_delivery_ok_as(flow: &PromptFlow, reason: &'static str) {
         if flow.enter_only {
             return;
         }
         let pane = flow.pane.as_u64();
         let delivery_flow = flow.delivery_flow;
-        let reason = tako_core::prompt_delivery::VERIFIED;
         std::thread::spawn(move || {
             if let Err(e) = tako_control::orchestrator::registry::record_prompt_delivery(
                 pane,
@@ -9901,6 +10051,7 @@ impl TakoApp {
                 pane: Some(pane.as_u64()),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::User,
         );
@@ -11421,6 +11572,8 @@ impl TakoApp {
     /// セッションは生きているか他インスタンスが引き継いでいる。残骸は起動時の
     /// orphan クリーンアップ（FR-2.16.11）と tmux ビューの「kill漏れ?」表示が拾う）
     fn drop_backend_session_with(&mut self, pane_id: PaneId, reason: CloseReason) {
+        // #2330: 引き継ぎの帳面から消す（画面から閉じた前任 = 引き継ぎの完了も含む）
+        tako_control::handoff_guard::forget(pane_id.as_u64());
         self.claude_resume_sessions.remove(pane_id);
         self.agent_resume_sessions.remove(pane_id);
         if reason.is_explicit() {
@@ -33517,6 +33670,7 @@ mod self_test {
                         pane: Some(web_pane.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -38839,6 +38993,7 @@ mod self_test {
                     pane: Some(md_pane.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );
@@ -39731,6 +39886,7 @@ mod self_test {
                         pane: Some(md_pane.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -41017,6 +41173,7 @@ mod self_test {
                             pane: Some(side.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -42543,6 +42700,7 @@ mod self_test {
                         pane: Some(pane.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -43154,6 +43312,7 @@ mod self_test {
                     pane: Some(pane.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );
@@ -43558,6 +43717,7 @@ mod self_test {
                         pane: Some(pane.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -43713,6 +43873,7 @@ mod self_test {
                             pane: Some(pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -47331,6 +47492,7 @@ mod self_test {
                             pane: Some(pdf_pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -51626,6 +51788,7 @@ mod self_test {
                     pane: Some(pane.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );
@@ -53085,6 +53248,7 @@ mod self_test {
                     pane: Some(preview.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );
@@ -53746,6 +53910,7 @@ mod self_test {
                     pane: Some(pane.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );
@@ -54256,6 +54421,7 @@ mod self_test {
                     pane: Some(pane.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );
@@ -54982,6 +55148,7 @@ mod self_test {
                     pane: Some(pane.as_u64()),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             );
@@ -55104,6 +55271,7 @@ mod self_test {
                         pane: Some(pane.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -55700,6 +55868,7 @@ mod self_test {
                         pane: Some(pane.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     PaneOrigin::Cli,
                 );
@@ -61697,6 +61866,7 @@ mod self_test {
                                                 pane: Some(target.as_u64()),
                                                 force: true,
                                                 caller_role: None,
+                                                caller_pane: None,
                                             },
                                             PaneOrigin::Cli,
                                         );
@@ -67061,7 +67231,7 @@ mod self_test {
                     // close で片付く（previews からも消える）
                     let closed = tako_control::dispatch(
                         app,
-                        tako_control::protocol::Request::Close { pane: Some(pane), force: true, caller_role: None },
+                        tako_control::protocol::Request::Close { pane: Some(pane), force: true, caller_role: None, caller_pane: None },
                         PaneOrigin::Cli,
                     )
                     .is_ok()
@@ -68586,6 +68756,7 @@ mod self_test {
                                 pane: Some(pane.as_u64()),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -68681,6 +68852,7 @@ mod self_test {
                             pane: Some(temp_pane),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -68812,6 +68984,7 @@ mod self_test {
                             pane: Some(opened_pane),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -69215,6 +69388,7 @@ mod self_test {
                             pane: Some(view_pane_raw),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -69828,6 +70002,7 @@ mod self_test {
                             pane: Some(dlg_pane),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -69889,7 +70064,7 @@ mod self_test {
                     for pane in [first, second["pane"].as_u64().unwrap_or(0)] {
                         let _ = tako_control::dispatch(
                             app,
-                            tako_control::protocol::Request::Close { pane: Some(pane), force: true, caller_role: None },
+                            tako_control::protocol::Request::Close { pane: Some(pane), force: true, caller_role: None, caller_pane: None },
                             PaneOrigin::Cli,
                         );
                     }
@@ -69963,7 +70138,7 @@ mod self_test {
                     // 後片付け: 一時ペインを閉じて 1 ペイン構成へ戻す
                     let _ = tako_control::dispatch(
                         app,
-                        tako_control::protocol::Request::Close { pane: Some(p2), force: true, caller_role: None },
+                        tako_control::protocol::Request::Close { pane: Some(p2), force: true, caller_role: None, caller_pane: None },
                         PaneOrigin::Cli,
                     );
                     moved
@@ -70046,6 +70221,7 @@ mod self_test {
                             pane: Some(pane_id),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -70435,6 +70611,7 @@ mod self_test {
                                     pane: Some(preview.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -70469,6 +70646,7 @@ mod self_test {
                                     pane: Some(pane.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -70572,6 +70750,7 @@ mod self_test {
                                 pane: Some(pane_id),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -71563,6 +71742,7 @@ mod self_test {
                                 pane: Some(w2),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Mcp,
                         )
@@ -71798,6 +71978,7 @@ mod self_test {
                                         pane: Some(out_pane),
                                         force: true,
                                         caller_role: None,
+                                        caller_pane: None,
                                     },
                                     PaneOrigin::Mcp,
                                 )
@@ -74001,6 +74182,7 @@ mod self_test {
                                     pane: Some(pane.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -74203,6 +74385,7 @@ mod self_test {
                                     pane: Some(pane.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -77188,6 +77371,7 @@ mod self_test {
                                 pane: Some(pane.as_u64()),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -77944,6 +78128,7 @@ mod self_test {
                                     pane: Some(pane.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -78502,6 +78687,7 @@ mod self_test {
                                 pane: Some(chat_pane.as_u64()),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         )
@@ -78517,6 +78703,7 @@ mod self_test {
                                 pane: Some(pane.as_u64()),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -79389,6 +79576,7 @@ mod self_test {
                                     pane: Some(e2e_pane.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             )
@@ -79405,6 +79593,7 @@ mod self_test {
                                 pane: Some(pane.as_u64()),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -79954,6 +80143,7 @@ mod self_test {
                             pane: Some(chat_pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -80246,6 +80436,7 @@ mod self_test {
                             pane: Some(starter_pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -80822,6 +81013,7 @@ mod self_test {
                             pane: Some(chat_pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -81411,6 +81603,7 @@ mod self_test {
                             pane: Some(new_pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         cx,
                     );
@@ -81435,6 +81628,7 @@ mod self_test {
                             pane: Some(pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         cx,
                     );
@@ -81722,6 +81916,7 @@ mod self_test {
                             pane: Some(pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         cx,
                     );
@@ -81858,6 +82053,7 @@ mod self_test {
                             pane: Some(pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         cx,
                     );
@@ -81868,6 +82064,7 @@ mod self_test {
                             pane: Some(pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         cx,
                     );
@@ -82106,6 +82303,7 @@ mod self_test {
                             pane: Some(probe_pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -82452,6 +82650,7 @@ mod self_test {
                         pane: Some(busy_pane.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     cx,
                 );
@@ -84597,6 +84796,7 @@ mod self_test {
                                             pane: Some(id.as_u64()),
                                             force: true,
                                             caller_role: None,
+                                            caller_pane: None,
                                         },
                                         PaneOrigin::Cli,
                                     );
@@ -84656,6 +84856,7 @@ mod self_test {
                                             pane: Some(again.as_u64()),
                                             force: true,
                                             caller_role: None,
+                                            caller_pane: None,
                                         },
                                         PaneOrigin::Cli,
                                     );
@@ -84886,6 +85087,7 @@ mod self_test {
                                     pane: Some(pane.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -85187,6 +85389,7 @@ mod self_test {
                                     pane: Some(pane.as_u64()),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -85562,6 +85765,7 @@ mod self_test {
                             pane: Some(pane830.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );
@@ -85735,6 +85939,7 @@ mod self_test {
                                 pane: Some(pane),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -85938,6 +86143,7 @@ mod self_test {
                                     pane: Some(*p),
                                     force: true,
                                     caller_role: None,
+                                    caller_pane: None,
                                 },
                                 PaneOrigin::Cli,
                             );
@@ -86530,6 +86736,7 @@ mod self_test {
                                 pane: Some(pane),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -87212,6 +87419,7 @@ mod self_test {
                         pane: Some(prev.as_u64()),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     cx,
                 );
@@ -87258,6 +87466,7 @@ mod self_test {
                             pane: Some(pane.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         cx,
                     );
@@ -93519,6 +93728,7 @@ mod self_test {
                                 pane: Some(pane),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             PaneOrigin::Cli,
                         );
@@ -94834,6 +95044,7 @@ mod self_test {
                                 pane: Some(p),
                                 force: true,
                                 caller_role: None,
+                                caller_pane: None,
                             },
                             cx,
                         );
@@ -94846,6 +95057,7 @@ mod self_test {
                         pane: Some(master149),
                         force: true,
                         caller_role: None,
+                        caller_pane: None,
                     },
                     cx,
                 );
@@ -95069,6 +95281,7 @@ mod self_test {
                             pane: Some(pane1676.as_u64()),
                             force: true,
                             caller_role: None,
+                            caller_pane: None,
                         },
                         PaneOrigin::Cli,
                     );

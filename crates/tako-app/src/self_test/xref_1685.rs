@@ -302,6 +302,7 @@ pub(super) async fn xref_1685_visual(
                 pane: Some(pane.as_u64()),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )

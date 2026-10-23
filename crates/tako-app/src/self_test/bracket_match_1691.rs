@@ -368,6 +368,7 @@ pub(super) async fn bracket_match_visual(
                 pane: Some(pane.as_u64()),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         );

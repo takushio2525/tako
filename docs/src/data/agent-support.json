@@ -517,6 +517,30 @@
       }
     },
     {
+      "key": "prompt_delivery_receipt",
+      "summary_ja": "画面で確かめられない送達を、諦める前に受け手の会話記録で確かめる（#2330）",
+      "evidence": "measured",
+      "evidence_detail": "#2330（2026-10-20 / claude 2.1.301）: 狭いペイン（54 桁）の claude は入力欄の高さに上限があり、長い本文の先頭と先頭の `❯` 行が画面から流れる。修正前は transcript に本文が入っていても `gave_up / paste_not_reflected`（mod_turn は busy）だった。送達フローは諦める前に tako_control::delivery_receipt で transcript の利用者の発話 / キュー投函を照合する （scripts/test-handoff-close-2330.sh の deliver 段が実物で delivered / received を見る）。codex / agy は送達そのものは従来どおり通るが、画面で確かめられないときは gave_up のまま （照合は claude の transcript の形だけ）",
+      "agents": {
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "degraded",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い"
+        },
+        "agy": {
+          "status": "degraded",
+          "note_ja": "tako の実装が claude 専用で、この系統への配線がまだ無い"
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
       "key": "remote_control",
       "summary_ja": "会話をベンダー公式のリモート操作（スマホアプリ / Web）へ委譲できる（#1068）",
       "evidence": "measured",

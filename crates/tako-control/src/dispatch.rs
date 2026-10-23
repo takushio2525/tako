@@ -5690,8 +5690,28 @@ fn dispatch_inner(
             pane,
             force,
             caller_role,
+            caller_pane,
         } => {
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
+
+            // #2330: master のペインを閉じる close の守り（タブの最後の master・引き継ぎを
+            // 受け取った後任）。force でも断る（force は busy な worker を閉じる口で、
+            // master の消失を許す口ではない）。判断は tako_core::handoff_guard::decide
+            if let Err(refusal) = crate::handoff_guard::check_close(
+                host.workspace(),
+                tab,
+                target,
+                caller_pane,
+                caller_role.as_deref(),
+            ) {
+                crate::diag::persist_log(&format!(
+                    "close を断った（pane={} 理由={} 呼び出し元={} force={force}。#2330）",
+                    target.as_u64(),
+                    refusal.code(),
+                    caller_pane.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                ));
+                return Err(DispatchError::Operation(refusal.note().text().to_string()));
+            }
 
             // worker 保護: orchestrator-worker role のペインが busy なら拒否
             let target_pane = host
@@ -5760,6 +5780,8 @@ fn dispatch_inner(
             ) {
                 eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
             }
+            // #2330: 引き継ぎの帳面から消す（前任なら引き継ぎの完了・後任ならやり直し）
+            crate::handoff_guard::forget(target.as_u64());
             Ok(json!({ "closed": target.as_u64() }))
         }
 
@@ -15189,6 +15211,10 @@ fn dispatch_orchestrator_handoff(
     pane_obj.set_title(Some(window_title));
     pane_obj.set_spawned_by(Some(split_target));
     pane_obj.set_role(Some(new_role.clone()));
+    // #2330: 引き継ぎの帳面へ（後任が受け取ったら、前任からは後任を閉じない）
+    if let Some(prev) = previous_pane {
+        crate::handoff_guard::note_issued(new_id.as_u64(), prev.as_u64());
+    }
     // #1140: 後任 master も本人のペイン。**前任の設定ではなくプロファイル既定から
     // 決める**（同プロファイルで立て直すのが引き継ぎの約束 = #1055 の cwd と同じ流儀）
     apply_master_pane_profile_defaults(pane_obj, Some(new_role.as_str()), all_default);
@@ -27376,6 +27402,7 @@ mod tests {
                 pane: Some(new_id),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -27399,6 +27426,7 @@ mod tests {
                 pane: Some(cli_pane),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -27416,6 +27444,7 @@ mod tests {
                 pane: Some(mcp_pane),
                 force: false,
                 caller_role: Some("orchestrator-master:takodev".into()),
+                caller_pane: None,
             },
             PaneOrigin::Mcp,
         )
@@ -27671,6 +27700,7 @@ mod tests {
                 pane: Some(root),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -27689,6 +27719,7 @@ mod tests {
                 pane: Some(root),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -29125,6 +29156,7 @@ mod tests {
                 pane: Some(p1),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -29546,6 +29578,7 @@ mod tests {
                 pane: Some(source),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Mcp,
         )
@@ -34289,6 +34322,7 @@ mod tests {
                 pane: None,
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -34301,6 +34335,7 @@ mod tests {
                 pane: Some(stale),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -43600,6 +43635,7 @@ mod tests {
                 pane: Some(pane),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -43861,6 +43897,7 @@ mod tests {
                 pane: Some(root.as_u64()),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -44656,6 +44693,7 @@ mod tests {
                     pane: Some(worker_pane),
                     force: true,
                     caller_role: None,
+                    caller_pane: None,
                 },
                 PaneOrigin::Cli,
             )
@@ -46251,6 +46289,7 @@ mod tests {
                 pane: Some(new_pane),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -46534,6 +46573,7 @@ mod tests {
                 pane: Some(run_pane),
                 force: false,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Cli,
         )
@@ -48384,6 +48424,152 @@ mod tests {
         assert_eq!(plan.predicted_cols, Some(124));
     }
 
+    /// #2330 のテスト用: タブに master のペイン（role つき）を足す。前任を右分割して立てる
+    /// （dispatch の handoff と同じ形 = spawned_by = 前任）
+    fn issue2330_add_master(host: &mut MockHost, of: u64, role: &str, successor: bool) -> u64 {
+        let tab = host.ws.find_tab_of_pane(PaneId::from_raw(of)).unwrap();
+        let tree = host.ws.get_tab_mut(tab).unwrap().tree_mut();
+        let pane = Pane::new(PaneOrigin::Mcp);
+        let id = pane.id();
+        tree.split(PaneId::from_raw(of), tako_core::SplitDirection::Right, pane)
+            .unwrap();
+        let p = tree.get_mut(id).unwrap();
+        p.set_role(Some(role.into()));
+        if successor {
+            p.set_spawned_by(Some(PaneId::from_raw(of)));
+        }
+        id.as_u64()
+    }
+
+    fn issue2330_close(
+        host: &mut MockHost,
+        pane: u64,
+        caller_pane: Option<u64>,
+        caller_role: Option<&str>,
+    ) -> Result<Value, DispatchError> {
+        dispatch(
+            host,
+            Request::Close {
+                pane: Some(pane),
+                force: true,
+                caller_role: caller_role.map(str::to_string),
+                caller_pane,
+            },
+            PaneOrigin::Mcp,
+        )
+    }
+
+    fn issue2330_alive(host: &MockHost, pane: u64) -> bool {
+        host.ws.pane_anywhere(PaneId::from_raw(pane)).is_some()
+    }
+
+    /// #2330: 10/18 の形。後任は引き継ぎを受け取っていたのに前任が閉じ直し、同時に後任は
+    /// 手順どおり前任を閉じた。修正後は「前任 → 受領済みの後任」を断り、「後任 → 前任」は通し、
+    /// 閉じられた前任の名乗りで残った後任を閉じる 2 本目は「最後の master」で断る（force でも）
+    #[test]
+    fn issue2330_引き継ぎの相互closeは片方しか通らない() {
+        let mut host = MockHost::new();
+        let other = host.root_pane();
+        let a = split(&mut host, other);
+        let tab = host.ws.find_tab_of_pane(PaneId::from_raw(a)).unwrap();
+        host.ws
+            .get_tab_mut(tab)
+            .unwrap()
+            .tree_mut()
+            .get_mut(PaneId::from_raw(a))
+            .unwrap()
+            .set_role(Some("orchestrator-master:p1".into()));
+        let b = issue2330_add_master(&mut host, a, "orchestrator-master:p1", true);
+        crate::handoff_guard::note_issued(b, a);
+        crate::handoff_guard::note_delivered(b, tako_core::prompt_delivery::RECEIVED);
+
+        // 前任 → 受領済みの後任: 断る（理由に後任・前任・証拠が出る）
+        let err = issue2330_close(&mut host, b, Some(a), Some("master:p1")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("pane {b}")) && msg.contains(&format!("pane {a}")),
+            "{msg}"
+        );
+        assert!(msg.contains("received"), "受領の証拠が出ない: {msg}");
+        assert!(issue2330_alive(&host, b), "受領済みの後任が閉じられた");
+
+        // 後任 → 前任: 通る（引き継ぎの完了）
+        issue2330_close(&mut host, a, Some(b), Some("master:p1")).unwrap();
+        assert!(!issue2330_alive(&host, a));
+        assert!(
+            crate::handoff_guard::handoff_of(b).is_none(),
+            "完了した引き継ぎが帳面に残る"
+        );
+
+        // 閉じられた前任の名乗りで、タブに残った最後の master を閉じる: 断る
+        let err = issue2330_close(&mut host, b, Some(a), Some("master:p1")).unwrap_err();
+        assert!(err.to_string().contains("p1"), "{err}");
+        assert!(
+            issue2330_alive(&host, b),
+            "タブの最後の master が閉じられた"
+        );
+    }
+
+    /// #2330: 受け取る前の後任は前任が閉じ直せる（やり直しの道は残す）。
+    /// 境界: 同じタブ・同じプロファイルに 2 人目が残る close は通る
+    #[test]
+    fn issue2330_受領前の後任は前任が閉じ直せる() {
+        let mut host = MockHost::new();
+        let other = host.root_pane();
+        let a = split(&mut host, other);
+        let tab = host.ws.find_tab_of_pane(PaneId::from_raw(a)).unwrap();
+        host.ws
+            .get_tab_mut(tab)
+            .unwrap()
+            .tree_mut()
+            .get_mut(PaneId::from_raw(a))
+            .unwrap()
+            .set_role(Some("orchestrator-master:p1".into()));
+        let b = issue2330_add_master(&mut host, a, "orchestrator-master:p1", true);
+        crate::handoff_guard::note_issued(b, a);
+        // 「送ったかもしれない」は受領ではない
+        crate::handoff_guard::note_delivered(b, tako_core::prompt_delivery::PEER_UNCONFIRMED);
+        issue2330_close(&mut host, b, Some(a), Some("master:p1")).unwrap();
+        assert!(!issue2330_alive(&host, b));
+        assert!(issue2330_alive(&host, a));
+    }
+
+    /// #2330: 守りは master 同士の close だけ。自分で自分を閉じる・人の CLI（role なし）・
+    /// worker を閉じる close は従来どおり
+    #[test]
+    fn issue2330_master同士でないcloseは従来どおり() {
+        let mut host = MockHost::new();
+        let other = host.root_pane();
+        let a = split(&mut host, other);
+        let tab = host.ws.find_tab_of_pane(PaneId::from_raw(a)).unwrap();
+        host.ws
+            .get_tab_mut(tab)
+            .unwrap()
+            .tree_mut()
+            .get_mut(PaneId::from_raw(a))
+            .unwrap()
+            .set_role(Some("orchestrator-master:p1".into()));
+        let c = issue2330_add_master(&mut host, a, "orchestrator-master:p2", false);
+        // p2 の master が p1 の最後の master を閉じる: 断る（CLI も MCP も同じ dispatch）
+        let err = dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(a),
+                force: true,
+                caller_role: Some("master:p2".into()),
+                caller_pane: Some(c),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("p1"), "{err}");
+        // 自分で自分を閉じる（最後の p2 でも）
+        issue2330_close(&mut host, c, Some(c), Some("master:p2")).unwrap();
+        // 人の CLI（role を名乗らない）は最後の master でも従来どおり閉じられる
+        issue2330_close(&mut host, a, None, None).unwrap();
+        assert!(!issue2330_alive(&host, a));
+    }
+
     /// #2133: dispatch の Close で引き継ぎの前任 master を閉じると、前任の worker の spawn 元が
     /// 後任へ移る。後任からの spawn の見積もりは右の worker 領域を見て（後任を割る見積もりに
     /// ならない）、worker を閉じたときのリフローも後任の領域で効く
@@ -48421,6 +48607,7 @@ mod tests {
                 pane: Some(a.as_u64()),
                 force: false,
                 caller_role: Some("orchestrator-master:dev".into()),
+                caller_pane: None,
             },
             PaneOrigin::Mcp,
         )
@@ -48455,6 +48642,7 @@ mod tests {
                 pane: Some(w0.as_u64()),
                 force: true,
                 caller_role: None,
+                caller_pane: None,
             },
             PaneOrigin::Mcp,
         )

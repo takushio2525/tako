@@ -228,6 +228,15 @@ pub const PEER_UNCONFIRMED: &str = "peer_unconfirmed";
 pub const VERIFIED: &str = "verified";
 /// peer 送達で受信まで確認できたときの顛末コード
 pub const DELIVERED: &str = "delivered";
+/// keys 経路で画面からは反映を確かめられなかったが、**受け手の会話記録**（transcript）に
+/// 送った本文が入ったのを確かめたときの顛末コード（#2330）。
+///
+/// 狭いペインの claude は入力欄の高さに上限があり、長い本文はカーソル（末尾）へ
+/// スクロールして描く。`❯` は見えている最初の行に付くので、本文の先頭も `❯` の行も
+/// 画面から消え、画面だけで判定すると届いたのに `paste_not_reflected` で諦めていた
+/// （10/18 の引き継ぎ・10/20 の追試で実測）。画面で確かめられないときだけ、諦める前に
+/// 会話記録を見る（`tako_control::delivery_receipt`）
+pub const RECEIVED: &str = "received";
 
 /// 送達の記録に載せる**確からしさ**（Issue #1294）。
 ///
@@ -277,7 +286,7 @@ impl Confidence {
 /// 記録側（`record_prompt_delivery`）と読み出し側
 /// （`prompt_delivery_assessment_with`）が同じ関数を引くので食い違わない
 pub fn outcome_confidence(outcome: &str) -> Confidence {
-    if outcome == VERIFIED || outcome == DELIVERED {
+    if outcome == VERIFIED || outcome == DELIVERED || outcome == RECEIVED {
         return Confidence::Delivered;
     }
     // 書き込みが始まった後に確認が取れなかった 2 系統。届いた可能性がある
@@ -931,7 +940,7 @@ mod tests {
 
     #[test]
     fn 送達できた顛末は届いた側() {
-        for code in [VERIFIED, DELIVERED] {
+        for code in [VERIFIED, DELIVERED, RECEIVED] {
             assert_eq!(outcome_confidence(code), Confidence::Delivered, "{code}");
             assert!(
                 !outcome_confidence(code).may_auto_resend(),
