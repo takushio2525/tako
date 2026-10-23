@@ -1579,6 +1579,11 @@ impl WordLexer {
         while let Some(ch) = self.peek(0) {
             match ch {
                 '\\' => self.i += 2,
+                // `${U:-$'it\'s'}` の `\'` で閉じない（#2304）
+                '$' if !in_dquote && self.peek(1) == Some('\'') => {
+                    self.i += 1;
+                    self.ansi_c();
+                }
                 '\'' if !in_dquote => self.single(),
                 '"' => self.dquote(),
                 '`' => self.backtick(),
@@ -1721,6 +1726,283 @@ fn top_level_unquoted(word: &[char]) -> Vec<bool> {
         }
     }
     top
+}
+
+/// bash 3.2 の構文解析が語へかける `$'…'`（ANSI-C クォート）の置き換え（Issue #2304）。
+///
+/// 3.2 は `$'…'` を**波括弧展開より前に**、エスケープを解いた中身へ置き換える。波括弧展開
+/// （`gobble32`）が見るのは置き換えた後の語なので、写しもそれを読む。どの文脈で置き換わり、
+/// どう包まれるかは `/bin/bash` 3.2.57 の `declare -f`（保存された語）で 1 つずつ確かめた:
+/// - 語の地・`${ … }` / `$( … )` の中: 単一引用符で包む（中の `'` は `'\''`。`$'\\{'` は `'\{'`）
+/// - `"…"` の中の `${ … }`（その中の `$( … )` も）: 包まずに中身だけ（`"${U:-$'\"'}"` は `"${U:-"}"`）。
+///   その中でも `"…"` に入ってからの `$( … )` は包む側へ戻る
+/// - `"…"` の地・バッククォートの中・単一引用符の中: 置き換えない
+///
+/// 3.2 の読み方の癖も写す（`parse_matched_pair` の数え方）: 語の地の `$$` は 2 文字で読み飛ばす
+/// （`$$'x'` は置き換えない）。`$( … )` は中の `${` を、`${ … }` は中の `$(` と `$` の付かない `{` を
+/// 知らない（閉じの `)` / `}` を最初に見たところで閉じる）。`#` からのコメントは語の地の
+/// `$( … )` の中でだけ読む。`$"…"` は 3.2 が `$` を落とすだけで、波括弧の読みは変わらないので写さない。
+struct ParsedWord32 {
+    c: Vec<char>,
+    i: usize,
+    out: Vec<char>,
+    /// `out` の各文字の、原文の語の中での位置（名指しを原文の file:line へ戻す）
+    origin: Vec<usize>,
+}
+
+impl ParsedWord32 {
+    /// 語の原文を、3.2 の波括弧展開が見る文字列と各文字の原文の位置へ
+    fn parse(word: &str) -> (String, Vec<usize>) {
+        let mut p = ParsedWord32 {
+            c: word.chars().collect(),
+            i: 0,
+            out: Vec::new(),
+            origin: Vec::new(),
+        };
+        p.word();
+        (p.out.into_iter().collect(), p.origin)
+    }
+
+    fn peek(&self, k: usize) -> Option<char> {
+        self.c.get(self.i + k).copied()
+    }
+
+    /// 原文の `n` 文字をそのまま写す
+    fn copy(&mut self, n: usize) {
+        for _ in 0..n {
+            if let Some(&ch) = self.c.get(self.i) {
+                self.out.push(ch);
+                self.origin.push(self.i);
+                self.i += 1;
+            }
+        }
+    }
+
+    /// 語の地（`read_token_word`）
+    fn word(&mut self) {
+        while let Some(ch) = self.peek(0) {
+            match (ch, self.peek(1)) {
+                ('\\', _) | ('$', Some('$')) => self.copy(2),
+                ('\'', _) => self.single(),
+                ('"', _) => self.dquote(),
+                ('`', _) => self.backtick(),
+                ('$', Some('\'')) => self.ansi_c(true),
+                ('$', Some(open @ ('(' | '{' | '['))) => {
+                    self.copy(2);
+                    self.group(open, false, open == '(');
+                }
+                _ => self.copy(1),
+            }
+        }
+    }
+
+    /// `'…'`（中の `\` はただの文字）
+    fn single(&mut self) {
+        self.copy(1);
+        while let Some(ch) = self.peek(0) {
+            self.copy(1);
+            if ch == '\'' {
+                return;
+            }
+        }
+    }
+
+    /// `"…"`。`$'` はただの文字。`$( … )` は包む側、`${ … }` / `$[ … ]` は包まない側
+    fn dquote(&mut self) {
+        self.copy(1);
+        while let Some(ch) = self.peek(0) {
+            match (ch, self.peek(1)) {
+                ('\\', _) => self.copy(2),
+                ('"', _) => {
+                    self.copy(1);
+                    return;
+                }
+                ('`', _) => self.backtick(),
+                ('$', Some(open @ ('(' | '{' | '['))) => {
+                    self.copy(2);
+                    self.group(open, open != '(', false);
+                }
+                _ => self.copy(1),
+            }
+        }
+    }
+
+    /// `` `…` ``（中は置き換えない）
+    fn backtick(&mut self) {
+        self.copy(1);
+        while let Some(ch) = self.peek(0) {
+            match ch {
+                '\\' => self.copy(2),
+                '`' => {
+                    self.copy(1);
+                    return;
+                }
+                _ => self.copy(1),
+            }
+        }
+    }
+
+    /// `$(` / `${` / `$[` の中（開きは写してある）。`raw` = `$'…'` を包まずに置き換える。
+    /// `comments` = 空白・改行の直後（と先頭）の `#` から行末までをコメントとして読む
+    fn group(&mut self, open: char, raw: bool, comments: bool) {
+        let close = match open {
+            '(' => ')',
+            '{' => '}',
+            _ => ']',
+        };
+        let body = self.out.len();
+        let mut depth = 1usize;
+        let mut comment = false;
+        while let Some(ch) = self.peek(0) {
+            if comment {
+                comment = ch != '\n';
+                self.copy(1);
+                continue;
+            }
+            match (ch, self.peek(1)) {
+                ('#', _)
+                    if comments
+                        && (self.out.len() == body
+                            || matches!(self.out.last(), Some(' ' | '\t' | '\n'))) =>
+                {
+                    comment = true;
+                    self.copy(1);
+                }
+                ('\\', _) => self.copy(2),
+                (c, _) if c == close => {
+                    self.copy(1);
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                // `${ … }` は `$` の付かない `{` を数えない（3.2 の P_FIRSTCLOSE）
+                (c, _) if c == open && open != '{' => {
+                    self.copy(1);
+                    depth += 1;
+                }
+                ('$', Some('{')) if open == '{' => {
+                    self.copy(2);
+                    depth += 1;
+                }
+                ('\'', _) => self.single(),
+                ('"', _) => self.dquote(),
+                ('`', _) => self.backtick(),
+                ('$', Some('\'')) => self.ansi_c(!raw),
+                _ => self.copy(1),
+            }
+        }
+    }
+
+    /// `$'…'`（`self.i` が `$`）。中身のエスケープを解き、`quote` なら単一引用符で包む。
+    /// 閉じていなければ（3.2 では構文エラー）原文のまま写す
+    fn ansi_c(&mut self, quote: bool) {
+        let dollar = self.i;
+        let mut end = dollar + 2;
+        loop {
+            match self.c.get(end) {
+                None => {
+                    self.copy(self.c.len() - self.i);
+                    return;
+                }
+                // `\` はどの文字も 1 つ連れる（`\'` で閉じない）
+                Some('\\') => end += 2,
+                Some('\'') => break,
+                Some(_) => end += 1,
+            }
+        }
+        let body = ansi_c_decode32(&self.c[dollar + 2..end], dollar + 2);
+        if quote {
+            self.out.push('\'');
+            self.origin.push(dollar);
+        }
+        for (ch, at) in body {
+            if quote && ch == '\'' {
+                self.out.extend(['\'', '\\', '\'', '\'']);
+                self.origin.extend([at; 4]);
+            } else {
+                self.out.push(ch);
+                self.origin.push(at);
+            }
+        }
+        if quote {
+            self.out.push('\'');
+            self.origin.push(end);
+        }
+        self.i = end + 1;
+    }
+}
+
+/// bash 3.2 の `ansicstr`（strtrans.c）の写し: `$'…'` の中身のエスケープを解く。各文字に原文の
+/// 位置（エスケープなら `\` の位置）を添える。`/bin/bash` 3.2.57 で 1 つずつ確かめた: 3.2 に `\u` は
+/// 無く、知らない `\X`（`\{` / `\$` / `\u` / `\8`）と数字の無い `\x` は `\` ごと残る。`\xHH` は 2 桁まで・
+/// 8 進は 3 桁まで（下 8 ビット）。`\cX` は次の 1 文字を生で取る（`\c` で終われば `\` だけ）。
+/// NUL（`\0` / `\x00` / `\400` / `\c@`）で残りが切れる
+fn ansi_c_decode32(body: &[char], base: usize) -> Vec<(char, usize)> {
+    let digits = |k: &mut usize, radix: u32, max: usize| -> Option<u32> {
+        let mut v: Option<u32> = None;
+        for _ in 0..max {
+            let Some(d) = body.get(*k).and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            v = Some(v.unwrap_or(0) * radix + d);
+            *k += 1;
+        }
+        v
+    };
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < body.len() {
+        let at = base + k;
+        let ch = body[k];
+        k += 1;
+        let Some(&e) = body.get(k).filter(|_| ch == '\\') else {
+            out.push((ch, at));
+            continue;
+        };
+        k += 1;
+        let code = match e {
+            'a' => 0x07,
+            'b' => 0x08,
+            'e' | 'E' => 0x1b,
+            'f' => 0x0c,
+            'n' => 0x0a,
+            'r' => 0x0d,
+            't' => 0x09,
+            'v' => 0x0b,
+            '\\' | '\'' | '"' | '?' => u32::from(e),
+            '0'..='7' => {
+                k -= 1;
+                digits(&mut k, 8, 3).unwrap_or(0) & 0xff
+            }
+            'x' => match digits(&mut k, 16, 2) {
+                Some(v) => v,
+                None => {
+                    out.extend([('\\', at), ('x', at + 1)]);
+                    continue;
+                }
+            },
+            'c' => match body.get(k) {
+                Some(&x) => {
+                    k += 1;
+                    u32::from(x.to_ascii_uppercase()) & 0x1f
+                }
+                None => {
+                    out.push(('\\', at));
+                    continue;
+                }
+            },
+            _ => {
+                out.extend([('\\', at), (e, at + 1)]);
+                continue;
+            }
+        };
+        if code == 0 {
+            break;
+        }
+        out.push((char::from_u32(code).unwrap_or('\u{fffd}'), at));
+    }
+    out
 }
 
 /// bash 3.2 の `brace_gobbler`（braces.c）の写し: `from` から `satisfy` を探す。
@@ -1884,37 +2166,86 @@ fn brace32_pairs(word: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/// 語の中で、**bash 3.2 だけが**波括弧展開してしまう対（語の中の文字位置）。
-///
-/// 3.2 が展開する対のうち、正しく読めば `{` か `}` がクォートかコマンド置換の中に在るものだけを
-/// 返す（クォートの外の `{a,b}` は意図した展開なので返さない = 過大申告しない。
-/// `{x}"…,…}"` のようにクォートの外の `{` からクォートの中の `}` までを対にするものは返す）。
-fn brace32_misreads(word: &str) -> Vec<(usize, usize)> {
-    let t: Vec<char> = word.chars().collect();
-    let top = top_level_unquoted(&t);
-    brace32_pairs(word)
-        .into_iter()
-        .filter(|&(open, close)| !top[open] || !top[close])
-        .collect()
-}
-
 /// ファイルの中で、波括弧展開を受ける語（コマンド置換の中の語も）に bash 3.2 が展開する対
-/// （ファイル先頭からの文字位置）。`misread_only` なら 3.2 だけが展開するもの = 番犬が名指すもの
+/// （ファイル先頭からの文字位置）。`misread_only` なら **3.2 だけが**展開するもの = 番犬が名指すもの:
+/// 3.2 が展開する対のうち、正しく読めば `{` か `}` がクォートかコマンド置換の中に在るもの
+/// （クォートの外の `{a,b}` は意図した展開なので返さない = 過大申告しない。`{x}"…,…}"` のように
+/// クォートの外の `{` からクォートの中の `}` までを対にするものは返す）
 fn brace32_file_pairs(src: &str, misread_only: bool) -> std::collections::BTreeSet<(usize, usize)> {
+    let words = raw_words(src);
+    // 原文の各文字が、それを含むいちばん内側の語の中でクォートの外に在るか（正しく読んだとき）
+    let top = misread_only.then(|| {
+        let mut top = vec![false; src.chars().count()];
+        let mut by_span = words.clone();
+        by_span.sort_by_key(|w| std::cmp::Reverse(w.text.chars().count()));
+        for w in &by_span {
+            let chars: Vec<char> = w.text.chars().collect();
+            for (k, t) in top_level_unquoted(&chars).into_iter().enumerate() {
+                top[w.start + k] = t;
+            }
+        }
+        top
+    });
     let mut out = std::collections::BTreeSet::new();
-    for w in raw_words(src).into_iter().filter(|w| w.brace_expanded) {
-        let found = if misread_only {
-            brace32_misreads(&w.text)
-        } else {
-            brace32_pairs(&w.text)
-        };
-        out.extend(
-            found
-                .into_iter()
-                .map(|(open, close)| (w.start + open, w.start + close)),
-        );
+    for w in outermost_words(words) {
+        let at: Vec<usize> = (w.start..w.start + w.text.chars().count()).collect();
+        brace32_word_pairs(&w, &at, top.as_deref(), &mut out);
     }
     out
+}
+
+/// 語の並びのうち、他の語の中（コマンド置換の中の語）に無いもの
+fn outermost_words(mut words: Vec<RawWord>) -> Vec<RawWord> {
+    words.sort_by_key(|w| (w.start, std::cmp::Reverse(w.text.chars().count())));
+    let mut end = 0;
+    words.retain(|w| {
+        let outer = w.start >= end;
+        if outer {
+            end = w.start + w.text.chars().count();
+        }
+        outer
+    });
+    words
+}
+
+/// 1 語を 3.2 と同じ順に読む（#2304）: 構文解析が `$'…'` を置き換えた語（`ParsedWord32`）で対を探し、
+/// 中のコマンド置換の語は、実行時と同じく**置き換えた後の**文字列から読み直して、同じことをする
+/// （読み直しでもまた置き換わる）。`"${U:-$(show $'{a,b}')}"` は包まずに置き換わるので、実行時に
+/// `show {a,b}` と読まれて割れる（`/bin/bash` 3.2.57 で確かめた。bash 5 は割らない）。
+/// `at` = 語の各文字のファイル先頭からの位置（対の位置を原文へ戻す）。`misread_top` を渡すと
+/// 3.2 だけが展開する対に絞る: 置き換えた語の中か、原文（`misread_top` = いちばん内側の語の中で
+/// クォートの外か）のどちらかで `{` か `}` がクォートの外に無いもの（`$'{a,b}'` の中身が読み直しで
+/// 語の地に出ても、原文ではクォートの中）
+fn brace32_word_pairs(
+    w: &RawWord,
+    at: &[usize],
+    misread_top: Option<&[bool]>,
+    out: &mut std::collections::BTreeSet<(usize, usize)>,
+) {
+    let (text, origin) = ParsedWord32::parse(&w.text);
+    let at: Vec<usize> = origin.iter().map(|&k| at[k]).collect();
+    if w.brace_expanded {
+        let mut found = brace32_pairs(&text);
+        if let Some(top) = misread_top {
+            let here = top_level_unquoted(&text.chars().collect::<Vec<char>>());
+            found.retain(|&(o, c)| !here[o] || !here[c] || !top[at[o]] || !top[at[c]]);
+        }
+        out.extend(found.into_iter().map(|(open, close)| (at[open], at[close])));
+    }
+    // 中の語 = 置き換えた語を読み直した語のうち、この語そのもの（外側の語）を除いたもの
+    let words = raw_words(&text);
+    let outer: Vec<(usize, String)> = outermost_words(words.clone())
+        .into_iter()
+        .map(|w| (w.start, w.text))
+        .collect();
+    let nested = words
+        .into_iter()
+        .filter(|w| !outer.iter().any(|(s, t)| *s == w.start && *t == w.text))
+        .collect();
+    for iw in outermost_words(nested) {
+        let span = iw.start..iw.start + iw.text.chars().count();
+        brace32_word_pairs(&iw, &at[span], misread_top, out);
+    }
 }
 
 /// 1 ファイルぶんの違反（file:line で名指しする文言）
@@ -2012,6 +2343,18 @@ fn 検査はbash32が割る形だけを違反とする() {
     // 後ろの `,` と `}` まで 1 つの対にする（#2301。bash 5 はどちらも割れない）
     assert_eq!(hits(r#"f "$(show "{x}" ",}")""#), 1);
     assert_eq!(hits(r#"f "$(show "{\"a\":1}" "x,y}")""#), 1);
+    // 3.2 は `$'…'` を波括弧展開より前に解いて `'…'` へ置き換える（#2304 の 4 行。`it's` の `'` で
+    // 単一引用符へ入り、`$'` の `'` で閉じる = 置き換えた中身をクォートの外として読む）
+    assert_eq!(hits(r#"f "$(show "it's")"$'\\{ Q3,R3 }'"#), 0); // `'\{ Q3,R3 }'` の `\{` で割れない
+    assert_eq!(hits(r#"f "$(show "it's")"$'{Q3,R3}'"#), 1);
+    assert_eq!(hits(r#"f "$(show "it's")"$'\"{Q3,}y'"#), 0); // `'"{Q3,}y'` の `"` で割れない
+    assert_eq!(hits(r#"f "$(show "it's")"$'{Q3,}y'"#), 1);
+    // `"…"` の中の `${ … }` では包まずに置き換わる。`$( … )` の中身は実行時に読み直されて割れる
+    // （`show {a,b}`。bash 5 は割らない）・置き換えた `"` で外側の語が割れる（bash 5 も割る）
+    assert_eq!(hits(r#"f "${U:-$(show $'{a,b}')}""#), 1);
+    assert_eq!(hits(r#"f "${U:-$'\"{a,b}\"'}""#), 1);
+    assert_eq!(hits(r#"f "${U:-$'{a,b}'}""#), 0);
+    assert_eq!(hits(r#"f "$(show $'{a,b}')""#), 0); // `$( … )` の中は包まれる
 
     // 3.2 でも割れない形（過大申告しない）
     assert_eq!(hits(r#"x="$(show "{a,b}")""#), 0); // 素の代入は波括弧展開されない
@@ -2061,6 +2404,21 @@ fn 番犬は波括弧の取り違えをfile_lineで名指しする() {
     for broken in ["echo \"$(show \"{a,b}", "echo x\\", "a=(x 'y", "x=${a"] {
         let _ = brace32_violations("scripts/x.sh", broken);
     }
+    // `$'…'` の置き換えで文字数と改行が変わっても、原文の位置を名指す（#2304。置き換えた後の
+    // 位置で数えると、`$'\n…\n'` が `'…'` へ 7 文字縮んだぶん 2 行目へずれる）
+    let src = "set -u\necho \"$(show $'\\n\\n\\n\\n\\n\\n'x\n\"{a,b}\")\"\n";
+    let v = brace32_violations("scripts/x.sh", src);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].starts_with("scripts/x.sh:3: "), "{v:?}");
+    let src = "f $'\\x41\\n'\"$(show \"{a,b}\")\"\n";
+    let open = src.chars().position(|c| c == '{').expect("{");
+    let close = src.chars().position(|c| c == '}').expect("}");
+    assert_eq!(
+        brace32_file_pairs(src, true)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![(open, close)]
+    );
     // 1 行に 2 つあれば 2 件
     let v = brace32_violations(
         "scripts/x.sh",
@@ -2143,18 +2501,106 @@ fn 語の字句解析は代入と展開されない文脈を読み分ける() {
         words(r"echo $'it\'s' x"),
         vec![w("echo", true), w(r"$'it\'s'", true), w("x", true)]
     );
+    // `${ … }` の中の $'…' も（#2304）
+    assert_eq!(
+        words(r#"echo ${U:-$'it\'s'}"$(f "a b")" x"#),
+        vec![
+            w("echo", true),
+            w("f", true),
+            w(r#""a b""#, true),
+            w(r#"${U:-$'it\'s'}"$(f "a b")""#, true),
+            w("x", true)
+        ]
+    );
     assert_eq!(
         words("cat <<X\n\"q\" $(f)\nX\necho y\n"),
         vec![w("cat", true), w("f", true), w("echo", true), w("y", true)]
     );
 }
 
+#[test]
+fn ansi_cクォートの置き換えはbash32の構文解析を写す() {
+    // (語の原文, 3.2 が保存する語)。`/bin/bash` 3.2.57 の `g() { f <語>; }; declare -f g` で 1 つずつ採った
+    let cases: &[(&str, &str)] = &[
+        // 語の地: 解いて単一引用符で包む（中の `'` は `'\''`）
+        (r"$'a\'b'", r"'a'\''b'"),
+        (r"$'\\{'", r"'\{'"),
+        (r#"$'\"'"#, r#"'"'"#),
+        ("$''", "''"),
+        ("$'\\n'x", "'\n'x"),
+        (r"$'a\0b{c,d}'", "'a'"), // NUL で切れる
+        (r"$'z\x7b,\x7d'", "'z{,}'"),
+        (r"$'\c\''", "'\u{1c}'\\'''"),
+        (r"$'\q\u\x\8\cI\101\x41g'", "'\\q\\u\\x\\8\tAAg'"), // 知らないエスケープは `\` ごと残る
+        // 語の地の `$$` は 2 文字で読み飛ばす・`\$` は置き換えない
+        (r#"$$'\"'"#, r#"$$'\"'"#),
+        (r#"$$$'\"'"#, r#"$$'"'"#),
+        (r#"\$'\"'"#, r#"\$'\"'"#),
+        // `${ … }` / `$( … )` の中も包む（`$( … )` の中の `$$` は読み飛ばさない）
+        (r#"${U:-$'\"'}"#, r#"${U:-'"'}"#),
+        (r#""$(show $'a\'b' $'\"')""#, r#""$(show 'a'\''b' '"')""#),
+        (r#""$(show $$'\"' \$'\"')""#, r#""$(show $'"' \$'\"')""#),
+        (r"$(( $'1' + 1 ))", "$(( '1' + 1 ))"),
+        (r"$[1+$'\x32']", "$[1+'2']"),
+        (r#""$(show $[1+$'\x32'])""#, r#""$(show $[1+'2'])""#),
+        (r#""$( (show $'\"') )""#, r#""$( (show '"') )""#),
+        (
+            r#""$(show 'it'"'"'s' $'\"')""#,
+            r#""$(show 'it'"'"'s' '"')""#,
+        ),
+        // `"…"` の地・バッククォートの中は置き換えない
+        (r#""x$'\"'y""#, r#""x$'\"'y""#),
+        (r#""$(show "$'\"'")""#, r#""$(show "$'\"'")""#),
+        (r#"`show $'\"'`"#, r#"`show $'\"'`"#),
+        (r#""${U:-"$'\"'"}""#, r#""${U:-"$'\"'"}""#),
+        // `"…"` の中の `${ … }`（その中の `$( … )` も）は包まない。`"…"` に入ってからの `$(` は包む
+        (r#""${U:-$'\"'}""#, r#""${U:-"}""#),
+        (r#""$[1+$'\x32']""#, r#""$[1+2]""#),
+        (r#""${U:-$'\''}""#, r#""${U:-'}""#),
+        (r#""${U:-$'\"'$'\"'}""#, r#""${U:-""}""#),
+        (r#""$(show "${U:-$'\"'}")""#, r#""$(show "${U:-"}")""#),
+        (r#""${U:-$(show $'\"')}""#, r#""${U:-$(show ")}""#),
+        (r#""${U:-${V:-x}$'\"'}""#, r#""${U:-${V:-x}"}""#),
+        (r#""${U:-"$(show $'\"')"}""#, r#""${U:-"$(show '"')"}""#),
+        // `${ … }` は `$` の付かない `{` と `$(` を、`$( … )` は `${` を知らない（最初の閉じで閉じる）
+        (r#""${U:-{a}$'\"'}""#, r#""${U:-{a}$'\"'}""#),
+        (r#""${U:-$(echo })$'\"'}""#, r#""${U:-$(echo })$'\"'}""#),
+        (r#""$(echo ${U:-)}$'\"')""#, r#""$(echo ${U:-)}$'\"')""#),
+        // コメントは語の地の `$( … )` の中で、先頭か空白・改行の直後の `#` から
+        (
+            "$(show x\n  # it's $'\\\"' (x\n  $'\\\"')",
+            "$(show x\n  # it's $'\\\"' (x\n  '\"')",
+        ),
+        ("$(# $'\\\"'\nshow $'\\\"')", "$(# $'\\\"'\nshow '\"')"),
+        (r#"$(show x#y $'\"')"#, r#"$(show x#y '"')"#),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(word, want)| {
+            let (got, origin) = ParsedWord32::parse(word);
+            assert_eq!(origin.len(), got.chars().count(), "{word}");
+            (got != want).then(|| format!("{word:?}\n  3.2: {want:?}\n  写し: {got:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+    // 各文字の原文の位置（解いた文字はエスケープの `\`・包む `'` は `$` と閉じの `'`）
+    let (got, origin) = ParsedWord32::parse(r"$'a\'b'{x}");
+    assert_eq!(got, r"'a'\''b'{x}");
+    assert_eq!(origin, vec![0, 2, 3, 3, 3, 3, 5, 6, 7, 8, 9]);
+    // 閉じていない `$'…'`（3.2 では構文エラー）は原文のまま・panic しない
+    for broken in [r"$'abc", r"$'a\'", "\"${U:-$'x", "$(show $'"] {
+        assert_eq!(ParsedWord32::parse(broken).0, broken);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 波括弧の写しを実の bash 3.2 と突き合わせる（Issue #1931）
 // ---------------------------------------------------------------------------
 //
-// 上の写し（`raw_words` / `gobble32` / `amble_expands32` / `brace32_pairs` / `top_level_unquoted`）は
-// 3.2 の `braces.c` を読んで書いたもので、PR #1929 では乱数の語 48,000 通りを実の `/bin/bash` に通して
+// 上の写し（`raw_words` / `ParsedWord32` / `gobble32` / `amble_expands32` / `brace32_pairs` /
+// `top_level_unquoted`）は 3.2 の `braces.c` を読んで書いたもので（`$'…'` の置き換え = `ParsedWord32` は
+// 実物の `declare -f` で確かめた。#2304）、PR #1929 では乱数の語 48,000 通りを実の `/bin/bash` に通して
 // 確かめた。その差分試験の常設版: 固定の種で組んだ語を `/bin/bash`（3.2）へ `set +B`（波括弧展開
 // なし）と `set -B` の 2 回通し、波括弧ごとの目印が出力から消えたか（= 3.2 が展開したか）を
 // 写しの読みと 1 つずつ比べる。bash 5 は要らない（正しい読みは語を組むときに分かっている）。
@@ -2284,9 +2730,16 @@ enum Slot {
     Dq,
     /// 単一引用符の中
     Sq,
-    /// `$'…'` の中。3.2 の構文解析は `$'…'` のエスケープを波括弧展開より前に解いて `'…'` へ
-    /// 置き換える（`$'\\{'` は `'\{'`）が、写しはまだそれを知らない（#2304）ので `\` の飾りは置かない
+    /// `$'…'` の中（語の地・`${ … }` / `$( … )` の中 = 3.2 は解いて単一引用符で包む。`$'\\{'` は
+    /// `'\{'`）。`\` の飾りは 3.2 の置き換え（`ParsedWord32`）を確かめるために置く（#2304）
     AnsiC,
+    /// `"${U:-$'@'}"` の `$'…'` の中（3.2 は解くが包まない。`$'\"'` は `"`）。解いた `"` / `'` /
+    /// 末尾の `\`（`}` を食う）と、`$( … )` の中の改行（コマンドの区切り）は実行時の `${ … }` を
+    /// 壊すので飾りに置かない
+    AnsiCDq,
+    /// `"${U:-$'\"@\"'}"` の対の `\"` の内側（3.2 は解いた `"` で外側の `"` を閉じたと読む）。
+    /// `"…"` の中なので `'` と改行は置ける
+    AnsiCDqPair,
     /// クォートの外の `${U:-@}`（`${` が波括弧展開を止める）
     Param,
     /// `"${U:-@}"`
@@ -2318,8 +2771,14 @@ impl Slot {
             (Dq, false) => &["", "y", " ", " it's", "\\\"", "${U}", "$(show z)", "\\\\"],
             (Sq, true) => &["", "x", " ", "\\\"", "${U}", "\\\\", "\\"],
             (Sq, false) => &["", "y", " ", "\\\"", "${U}"],
-            (AnsiC, true) => &["", "x", " ", "${U}"],
-            (AnsiC, false) => &["", "y", " ", "${U}"],
+            (AnsiC, true) => &[
+                "", "x", " ", "${U}", "\\\\", "\\\"", "\\'", "\\n", "\\t", "\\", "\\x22", "\\047",
+            ],
+            (AnsiC, false) => &["", "y", " ", "${U}", "\\\\", "\\\"", "\\'", "\\n", "\\x22"],
+            (AnsiCDq, true) => &["", "x", " ", "${U}", "\\\\", "\\t", "\\"],
+            (AnsiCDq, false) => &["", "y", " ", "${U}"],
+            (AnsiCDqPair, true) => &["", "x", " ", "${U}", "\\\\", "\\t", "\\", "\\'", "\\n"],
+            (AnsiCDqPair, false) => &["", "y", " ", "${U}", "\\'", "\\n"],
             (Param, true) => &["", "x", "${U}", "$(show z)"],
             (Param, false) => &["", "y", "${U}"],
             (DqParam, true) => &["", "x", " ", "${U}", "$(show z)"],
@@ -2334,7 +2793,13 @@ impl Slot {
         kind != BraceKind::Spaced
             || matches!(
                 self,
-                Slot::Dq | Slot::Sq | Slot::AnsiC | Slot::DqParam | Slot::BacktickDq
+                Slot::Dq
+                    | Slot::Sq
+                    | Slot::AnsiC
+                    | Slot::AnsiCDq
+                    | Slot::AnsiCDqPair
+                    | Slot::DqParam
+                    | Slot::BacktickDq
             )
     }
 }
@@ -2369,6 +2834,19 @@ const BRACE_SHAPES: &[(&str, &[Slot])] = {
         ("\"$(show \"@\" @)\"", &[Dq, Inner]),
         ("\"$(show \"@\")$(show \"@\")\"", &[Dq, Dq]),
         ("\"$(show \"@\"'@')\"", &[Dq, Sq]),
+        // `$'…'` の置き換えの文脈（#2304）。1 つ目は Issue の形（`it's` の `'` で 3.2 が単一引用符へ
+        // 入り、`$'` の `'` で閉じる = 置き換えた中身をクォートの外として読む）
+        ("\"$(show \"it's\")\"$'@'", &[AnsiC]),
+        ("\"$(show $'@')\"", &[AnsiC]),
+        ("${U:-$'@'}", &[AnsiC]),
+        // `${ … }` の中の `$'…'` を `\'` で閉じたと読むと、後ろの語の地の波括弧をクォートの中と取り違える
+        ("${U:-$'\\'@'}x@", &[AnsiC, Outer]),
+        ("\"$'@'\"", &[Dq]), // `"…"` の地の `$'` はただの文字
+        ("\"${U:-$'@'}\"", &[AnsiCDq]),
+        ("\"${U:-$'\\\"@\\\"'}\"", &[AnsiCDqPair]),
+        ("\"$(show \"${U:-$'@'}\")\"", &[AnsiCDq]),
+        // 包まずに置き換わった `$( … )` の中身は実行時に読み直される（`show {Q1,R1}` で割れる）
+        ("\"${U:-$(show $'@')}\"", &[AnsiCDq]),
     ]
 };
 
@@ -2677,7 +3155,7 @@ fn 波括弧の写しは実のbash32と食い違わない() {
     assert!(
         problems.is_empty(),
         "波括弧の写し（shell_scripts.rs の gobble32 / amble_expands32 / brace32_pairs /\n\
-         top_level_unquoted / raw_words）が実の bash 3.2（{bash}）と {} 箇所で食い違う（{} 行・波括弧 {} 個のうち）。\n\
+         top_level_unquoted / raw_words / ParsedWord32）が実の bash 3.2（{bash}）と {} 箇所で食い違う（{} 行・波括弧 {} 個のうち）。\n\
          写しを直して #1924 の番犬の読みを実物へ合わせること（.agent/conventions.md の #1924 / #1931）:\n{}",
         problems.len(),
         cases.len(),
