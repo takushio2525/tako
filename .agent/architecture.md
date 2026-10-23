@@ -469,6 +469,23 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      どちらも負荷が引けば戻る。**戻らない refused を作ったのは「同じパスを別の受け口が
      作り直して閉じた」形だけ**（GUI の accept スレッドは `__accept` で待機・CPU 0%）。
      Windows の named pipe はパスに実体が無いので対象外
+  7. **fd の上限を起動時に引き上げる**（#2359 / FR-2.2.14）。上の a2 の形（上限に届くと
+     接続を受けても `spawn_conn` の `try_clone` が EMFILE で落ちてすぐ閉じ、CLI は送信の
+     ENOTCONN / EPIPE / EINVAL か「応答が返らなかった」）を、Finder 起動の soft 256 では
+     約 60 ペインで踏む（GUI は 1 ペインで fd 4 本 = PTY の master・kqueue・UnixStream の対。
+     IPC の接続は 1 本で 2 本 = 読み書き）。
+     tako-app の main が最初の PTY より前に `platform::fd_limit::raise_at_startup` を呼び、
+     soft を `min(hard, OPEN_MAX = 10240, kern.maxfilesperproc)` へ上げる（hard は触らない・
+     失敗しても続行・persist.log に 1 行）。**ペインの PTY の子には起動時の soft を戻す**
+     （`fd_inherit` の fork の子ハンドラが掃除の後に `restore_for_child` = async-signal-safe。
+     tmux 3.6b は上限を変えないので、attach が起こす器の tmux サーバーと器のペインのシェルも
+     起動時の値になる = ユーザーのシェルの `ulimit -n` は修正前と同じ）。std の `Command`
+     （posix_spawn）で起こす裏方は引き上げた値を受け継ぐ。使用数は
+     `proc_pidinfo(PROC_PIDLISTFDS)`（fd を開かずに数える = 枯渇の直前でも読める）で、
+     `check_health` の `fd_limit` 節と 80% 以上の warning が読む。**残る天井**: 器の tmux
+     サーバー自身も起動時の soft（Finder 起動なら 256）で動き、1 ペインで fd 3 本
+     （+ 基礎 6 本）なので約 80 ペインで詰まる（本番 28 ペインで 90 本）。
+     Windows は対象外（ハンドルは 1 プロセス 2^24 本まで）
 - **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
   `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。
   実装時の検討事項:

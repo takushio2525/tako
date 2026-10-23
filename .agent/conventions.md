@@ -4624,6 +4624,15 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   `TAKO_IPC_WATCH_MS=<ミリ秒>`（下限 50）を `launch_isolated_gui` に並べる。生きた別の受け口が
   パスを握っている間は奪わない（`ipc.watch.state = foreign_live`）。**本番の `tako.sock` で
   試さない**。注入の形と A/B は `scripts/test-ipc-listener-recover-2002.sh`
+- **fd の上限を測る検証は GUI にだけ `ulimit` を掛けて起こす**（#2359）。worker のシェルは
+  claude が上げた soft（1048576）を持っているので、そのまま隔離 GUI を起こすと引き上げも枯渇も
+  起きない（`startup.outcome = already_enough`）。Finder 起動を模すなら soft 256、枯渇は soft 160 +
+  IPC へ 200 本繋いで握る（#2002 の a2）。**握った接続 1 本は GUI の fd 2 本**（読み書きの
+  `try_clone`）で、check-health は自分の探針に数十本使うので、警告を見る注入は上限の 80% 台に
+  止めて余白を残す（hard 500 + 200 本 = 413 本）。スクリプトのシェルの hard は下げると戻せないので、
+  `APP_BIN` を「`ulimit` を掛けて本物を exec する包み」に替えて GUI にだけ掛ける。
+  A/B は `TAKO_2359_LEGACY=1`、失敗の注入は `TAKO_2359_INJECT=setrlimit-fail`。
+  形は `scripts/test-nofile-limit-2359.sh`
 - **面を指定するのは `TAKO_DISPLAY=<名前 | UUID | index>`**。`TAKO_ISOLATED` /
   `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST` のどれかが立っていれば**未指定でも** `tako-vd` を狙う
 - **名前が読めない瞬間がある**（#1697）。名前の出どころ（`system_profiler`）が読めない起動では

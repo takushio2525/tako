@@ -1855,7 +1855,7 @@ tako telemetry off
 tako stale-binary            # 稼働中セッションの claude バイナリの鮮度確認・張り直し
 
 tako check-health            # 環境の健全性診断（`tako setup --check` と同じ項目）
-tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・残り作業が入る）
+tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・残り作業、`fd_limit` に fd の使用数と上限が入る）
 
 tako queue                   # PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理がどのペインで動いているか
                              # （順番待ちの実行中・待ち・上限・待ちごとの理由も）

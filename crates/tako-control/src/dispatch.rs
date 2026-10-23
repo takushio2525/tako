@@ -19178,6 +19178,11 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     {
         issues.push(issue);
     }
+    // #2359: fd の使用数と上限。上限に届くと IPC の接続を受けてもすぐ閉じる（接続ごとの
+    // try_clone が EMFILE）ので CLI / MCP は届かない（= この診断も届かない）。届くうちに申告する
+    let fd_startup = tako_core::platform::fd_limit::startup_report();
+    let fd_usage = tako_core::platform::fd_limit::usage();
+    issues.extend(fd_limit_issues(fd_startup, fd_usage));
 
     // ペインの文字コード固定（#2092。Windows だけ記録を持つ）。諦めたペインは
     // UTF-8 のバイト列で書く子の出力が化けるので、ペインを名指しで申告する
@@ -19250,6 +19255,14 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         // #1441: IPC の受け口の実測。`bound=false` なら CLI / MCP は届かない
         // （`kind=shortened` は深い data dir を短いパスへ逃がした正常な状態）
         "ipc": ipc.as_ref().map(ipc_describe),
+        // #2359: fd の使用数（`open`）と上限（`soft` / `hard`）・起動時の引き上げ（`startup`）。
+        // `near_exhaustion=true` なら上限の `warn_percent` % 以上を使っている。Windows は
+        // `applicable=false`（小さい既定の上限が無い）
+        "fd_limit": fd_limit_describe(
+            tako_core::platform::fd_limit::APPLICABLE,
+            fd_startup,
+            fd_usage,
+        ),
         // #2092: ペインの文字コード固定（Windows）。`panes[].state` が `gave_up` のペインは
         // UTF-8 のバイト列で書く子の出力が化ける。`targets[].code_pages` はいまの値の読み直し、
         // `hold` は固定の決着まで入力を預かった記録（`release=limit` なら決着を待たずに流した）
@@ -19337,6 +19350,94 @@ fn ipc_watch_issue(watch: &tako_core::ipc_socket::IpcWatch) -> Option<Value> {
         "check": "ipc",
         "message": message,
     }))
+}
+
+/// `check_health` の `fd_limit` 節（#2359）。起動時の記録といまの使用数から組むだけ
+/// （GUI を立てずに検査できる形 = `ipc_describe` と同じ作法）
+fn fd_limit_describe(
+    applicable: bool,
+    startup: Option<&tako_core::platform::fd_limit::Report>,
+    usage: Option<tako_core::platform::fd_limit::Usage>,
+) -> Value {
+    use tako_core::platform::fd_limit::{FDS_PER_PANE, NOT_APPLICABLE_REASON, WARN_PERCENT};
+    if !applicable {
+        return json!({
+            "applicable": false,
+            "reason": NOT_APPLICABLE_REASON,
+        });
+    }
+    json!({
+        "applicable": true,
+        "open": usage.map(|u| u.open),
+        "soft": usage.map(|u| u.soft),
+        // null = 無制限（`hard_unlimited`）か読めない
+        "hard": usage.and_then(|u| u.hard),
+        "hard_unlimited": usage.map(|u| u.hard.is_none()),
+        "percent": usage.map(|u| u.percent()),
+        "remaining": usage.map(|u| u.remaining()),
+        "warn_percent": WARN_PERCENT,
+        "near_exhaustion": usage.is_some_and(|u| u.near_exhaustion()),
+        "fds_per_pane": FDS_PER_PANE,
+        // 起動時の引き上げ（null = GUI 以外のホスト）。`children_soft` はペインのシェルへ渡す値
+        "startup": startup.map(|r| json!({
+            "outcome": r.outcome.as_str(),
+            "soft_at_launch": r.soft_at_launch,
+            "target": r.target,
+            "max_per_proc": r.max_per_proc,
+            "children_soft": r.children_soft(),
+            "error": r.error,
+        })),
+    })
+}
+
+/// fd の上限の申告（#2359）: 使用が上限の `WARN_PERCENT` % 以上・起動時に引き上げられなかった
+fn fd_limit_issues(
+    startup: Option<&tako_core::platform::fd_limit::Report>,
+    usage: Option<tako_core::platform::fd_limit::Usage>,
+) -> Vec<Value> {
+    use tako_core::platform::fd_limit::{Outcome, FDS_PER_PANE};
+    let mut out = Vec::new();
+    if let Some(report) = startup.filter(|r| r.outcome == Outcome::Failed) {
+        out.push(json!({
+            "level": "warning",
+            "check": "fd_limit",
+            "message": format!(
+                "起動時にファイル記述子（fd）の上限を引き上げられなかった（{}）。soft {} のまま動いているので、\
+                 ペインが増えると tako CLI / MCP が届かなくなる。tako を再起動しても直らなければ \
+                 launchctl limit maxfiles で上限を確かめる（#2359）",
+                report.error.as_deref().unwrap_or("理由不明"),
+                report.soft.map_or_else(|| "?".to_string(), |s| s.to_string()),
+            ),
+        }));
+    }
+    if let Some(u) = usage.filter(|u| u.near_exhaustion()) {
+        let mut message = format!(
+            "ファイル記述子（fd）の使用が上限に近い: {} / {} 本（{}%・残り {} 本）。上限に達すると \
+             tako CLI / MCP が届かなくなり（繋がっても GUI がすぐ閉じる）、新しいペインも開けない。\
+             使っていないペイン・タブを閉じること（1 ペインで約 {FDS_PER_PANE} 本）",
+            u.open,
+            u.soft,
+            u.percent(),
+            u.remaining(),
+        );
+        if let Some(report) =
+            startup.filter(|r| !matches!(r.outcome, Outcome::Raised | Outcome::AlreadyEnough))
+        {
+            message.push_str(&format!(
+                "。起動時に上限を引き上げていない（{}）",
+                report.outcome.as_str()
+            ));
+        }
+        message.push_str(
+            "。ペインの数に比べて多すぎるなら漏れの疑いがあるので persist.log を添えて報告する（#2359）",
+        );
+        out.push(json!({
+            "level": "warning",
+            "check": "fd_limit",
+            "message": message,
+        }));
+    }
+    out
 }
 
 /// `check_health` の `encoding_pin` 節（#2092）。記録（UI スレッドで採った写し）に、
@@ -53234,5 +53335,119 @@ mod issue2002_tests {
             "{message}"
         );
         assert!(message.contains("10 秒ごとにやり直す"), "{message}");
+    }
+}
+
+/// #2359: `check_health` の `fd_limit` 節と、枯渇が近い・引き上げられなかったときの申告
+#[cfg(test)]
+mod issue2359_tests {
+    use super::*;
+    use tako_core::platform::fd_limit::{raise_with, Outcome, Report, Usage, OPEN_MAX};
+
+    fn raised() -> Report {
+        let soft = std::cell::Cell::new(256);
+        raise_with(
+            false,
+            || Ok((soft.get(), None)),
+            |v| {
+                soft.set(v);
+                Ok(())
+            },
+            Some(138_240),
+        )
+    }
+
+    fn usage(open: u64, soft: u64) -> Usage {
+        Usage {
+            open,
+            soft,
+            hard: None,
+        }
+    }
+
+    #[test]
+    fn 節は使用数と上限と起動時の引き上げを出す() {
+        let report = raised();
+        let section = fd_limit_describe(true, Some(&report), Some(usage(121, OPEN_MAX)));
+        assert_eq!(section["applicable"], true);
+        assert_eq!(section["open"], 121);
+        assert_eq!(section["soft"], OPEN_MAX);
+        assert_eq!(section["hard"], Value::Null);
+        assert_eq!(section["hard_unlimited"], true);
+        assert_eq!(section["percent"], 1);
+        assert_eq!(section["remaining"], OPEN_MAX - 121);
+        assert_eq!(section["near_exhaustion"], false);
+        assert_eq!(section["warn_percent"], 80);
+        assert_eq!(section["fds_per_pane"], 4);
+        assert_eq!(section["startup"]["outcome"], "raised");
+        assert_eq!(section["startup"]["soft_at_launch"], 256);
+        assert_eq!(section["startup"]["children_soft"], 256);
+        assert_eq!(section["startup"]["target"], OPEN_MAX);
+        assert!(fd_limit_issues(Some(&report), Some(usage(121, OPEN_MAX))).is_empty());
+    }
+
+    #[test]
+    fn 上限の無いosは理由だけを出す() {
+        let section = fd_limit_describe(false, None, None);
+        assert_eq!(section["applicable"], false);
+        assert!(section["reason"].as_str().unwrap().contains("2^24"));
+        assert_eq!(section.get("open"), None);
+    }
+
+    #[test]
+    fn 枯渇が近いと次の一手つきで申告する() {
+        // hard が 200 で上げられない機で 170 本（85%）
+        let capped = raise_with(
+            false,
+            || Ok((200, Some(200))),
+            |_| panic!("書かない"),
+            Some(138_240),
+        );
+        assert_eq!(capped.outcome, Outcome::HardCapped);
+        let issues = fd_limit_issues(Some(&capped), Some(usage(170, 200)));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0]["level"], "warning");
+        assert_eq!(issues[0]["check"], "fd_limit");
+        let message = issues[0]["message"].as_str().unwrap();
+        for want in [
+            "170 / 200 本（85%・残り 30 本）",
+            "繋がっても GUI がすぐ閉じる",
+            "使っていないペイン・タブを閉じること（1 ペインで約 4 本）",
+            "起動時に上限を引き上げていない（hard_capped）",
+            "persist.log を添えて報告する（#2359）",
+        ] {
+            assert!(message.contains(want), "{want} が無い: {message}");
+        }
+        // 境目: 79% は黙る・80% から申告する
+        assert!(fd_limit_issues(Some(&capped), Some(usage(159, 200))).is_empty());
+        assert_eq!(
+            fd_limit_issues(Some(&capped), Some(usage(160, 200))).len(),
+            1
+        );
+        // 引き上げた後に近づいたなら「引き上げていない」は付けない
+        let issues = fd_limit_issues(Some(&raised()), Some(usage(9000, OPEN_MAX)));
+        let message = issues[0]["message"].as_str().unwrap();
+        assert!(!message.contains("引き上げていない"), "{message}");
+    }
+
+    #[test]
+    fn 引き上げに失敗したら枯渇していなくても申告する() {
+        let failed = raise_with(
+            false,
+            || Ok((256, None)),
+            |_| Err(std::io::Error::from_raw_os_error(22)),
+            Some(138_240),
+        );
+        let issues = fd_limit_issues(Some(&failed), Some(usage(30, 256)));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let message = issues[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("引き上げられなかった（setrlimit(10240): "),
+            "{message}"
+        );
+        assert!(message.contains("soft 256 のまま"), "{message}");
+        assert!(message.contains("launchctl limit maxfiles"), "{message}");
+        // 使用数を読めない・記録が無い（GUI 以外のホスト）なら申告しない
+        assert!(fd_limit_issues(None, None).is_empty());
     }
 }

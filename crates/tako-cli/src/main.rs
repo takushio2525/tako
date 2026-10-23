@@ -8083,6 +8083,9 @@ fn print_check_health(result: &Value) {
     if let Some(ipc) = result.get("ipc").filter(|v| !v.is_null()) {
         print_ipc_section(ipc);
     }
+    if let Some(line) = result.get("fd_limit").and_then(fd_limit_line) {
+        println!("{line}");
+    }
     // #1505: 環境診断の項目。**`tako setup --check` と同じ行**（正本が組んだ文字列を
     // そのまま出すので、2 つのコマンドの答えが字面まで一致する）
     for line in result["diagnostics"]["items"]
@@ -8124,6 +8127,51 @@ fn print_check_health_mod(section: &Value) {
             println!("{line}");
         }
     }
+}
+
+/// `check-health` の fd の 1 行（#2359）。使用数 / 上限と起動時の引き上げ。
+/// 上限の無い OS（`applicable=false`）・節の無い旧版の応答は None（何も出さない）
+fn fd_limit_line(fd: &Value) -> Option<String> {
+    if fd["applicable"].as_bool() != Some(true) {
+        return None;
+    }
+    let num = |v: &Value| {
+        v.as_u64()
+            .map_or_else(|| "?".to_string(), |n| n.to_string())
+    };
+    let mut line = format!(
+        "fd: {} / {} 本（{}%）",
+        num(&fd["open"]),
+        num(&fd["soft"]),
+        num(&fd["percent"]),
+    );
+    let startup = &fd["startup"];
+    let launch = num(&startup["soft_at_launch"]);
+    let note = match startup["outcome"].as_str() {
+        Some("raised") => Some(format!(
+            "起動時 {launch} → {} に引き上げ（ペインのシェルには {launch}）",
+            num(&fd["soft"])
+        )),
+        Some("already_enough") => Some(format!("起動時から {launch}（引き上げは不要）")),
+        Some("hard_capped") => Some(format!(
+            "hard が {} で引き上げられない（起動時のまま）",
+            num(&fd["hard"])
+        )),
+        Some("failed") => Some(format!(
+            "引き上げに失敗（{}）",
+            startup["error"].as_str().unwrap_or("理由不明")
+        )),
+        Some("legacy") => Some(format!(
+            "引き上げない（{}）",
+            tako_core::platform::fd_limit::LEGACY_ENV
+        )),
+        _ => None,
+    };
+    if let Some(note) = note {
+        line.push('・');
+        line.push_str(&note);
+    }
+    Some(line)
 }
 
 /// IPC の受け口 1 行（アプリ経由・ローカル診断のどちらも同じ形で出す）
@@ -13744,6 +13792,52 @@ mod tests {
         );
         // A/B（`gui` 節が無い = 修正前）では何も足さない
         assert!(ipc_recovery_lines(&serde_json::json!({ "gui": null })).is_empty());
+    }
+
+    /// #2359: fd の 1 行は使用数 / 上限と起動時の引き上げを出す。上限の無い OS・旧版は出さない
+    #[test]
+    fn check_healthのfdの行は使用数と起動時の引き上げを出す() {
+        let section = |outcome: &str, open: u64, soft: u64, hard: Value| {
+            serde_json::json!({
+                "applicable": true,
+                "open": open,
+                "soft": soft,
+                "hard": hard,
+                "percent": open * 100 / soft,
+                "startup": { "outcome": outcome, "soft_at_launch": 256, "error": "setrlimit(10240): Invalid argument (os error 22)" },
+            })
+        };
+        assert_eq!(
+            fd_limit_line(&section("raised", 121, 10240, Value::Null)).as_deref(),
+            Some(
+                "fd: 121 / 10240 本（1%）・起動時 256 → 10240 に引き上げ（ペインのシェルには 256）"
+            )
+        );
+        assert_eq!(
+            fd_limit_line(&section("hard_capped", 170, 200, serde_json::json!(200))).as_deref(),
+            Some("fd: 170 / 200 本（85%）・hard が 200 で引き上げられない（起動時のまま）")
+        );
+        assert_eq!(
+            fd_limit_line(&section("failed", 121, 256, Value::Null)).as_deref(),
+            Some("fd: 121 / 256 本（47%）・引き上げに失敗（setrlimit(10240): Invalid argument (os error 22)）")
+        );
+        assert_eq!(
+            fd_limit_line(&section("legacy", 121, 256, Value::Null)).as_deref(),
+            Some("fd: 121 / 256 本（47%）・引き上げない（TAKO_2359_LEGACY）")
+        );
+        // GUI 以外のホスト（起動時の記録が無い）は使用数だけ
+        let mut bare = section("raised", 11, 10240, Value::Null);
+        bare["startup"] = Value::Null;
+        assert_eq!(
+            fd_limit_line(&bare).as_deref(),
+            Some("fd: 11 / 10240 本（0%）")
+        );
+        assert_eq!(
+            fd_limit_line(&serde_json::json!({ "applicable": false, "reason": "x" })),
+            None,
+            "Windows は出さない"
+        );
+        assert_eq!(fd_limit_line(&Value::Null), None, "節の無い旧版の応答");
     }
 
     /// #2002: 届いたときは GUI 側の見張りと最後の張り直しを 1 行で出す
