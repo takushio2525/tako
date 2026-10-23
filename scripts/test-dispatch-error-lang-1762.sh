@@ -10,8 +10,13 @@
 #      pane      見つからないペイン
 #      tab       見つからない退避タブ
 #      nosession ターミナルセッションの無いペイン（プレビュー）
-#   対象ペインの未指定（NoTargetPane）は CLI も MCP も dispatch へ届く前に手元の文言で断る
-#   （CLI の「対象ペインを特定できない」・MCP の引数の組み立て。#1762 の外）ので、単体テストで見る
+#   #2358 で次も足した（tako-core の断りの理由の文と、dispatch へ届く前の手元の断り）:
+#      noresize   分割の無いペインのリサイズ（PaneTreeError::NoResizableSplit）
+#      lasttab    最後のタブの最後のペインを閉じる（WorkspaceError::LastTab）
+#      ontoself   ペインを自分自身の隣へ移す（WorkspaceError::MoveOntoSelf）
+#      lastwindow 最後のウィンドウを閉じる（WorkspaceError::LastWindow）
+#      notarget   対象ペインの未指定（CLI は `--pane` も TAKO_PANE_ID も無い・MCP は `pane` も
+#                 呼び出し元も無い。どちらも dispatch へ送らずに手元で断る）
 #   ① 英語表示: どの出力にも日本語（かな・漢字）が混ざらない
 #   ② 日本語表示: 日本語の前置きで返る（修正前とのバイト一致は TAKO_1762_KEEP の出力を突き合わせる）
 #   ③ GUI を経由しない CLI の直呼び（`tako orchestrator layout`）も、前置きは settings.json の表示言語
@@ -20,7 +25,7 @@
 #      （ここでは TAKO_LANG=en で英語へ解決させ、① と同じく日本語が混ざらないことを見る）
 #
 # A/B: 修正前のバイナリを `TAKO_BIN=… APP_BIN=… bash scripts/test-dispatch-error-lang-1762.sh` で渡すと
-# ① と ③ の英語が NG になる（#1762 の症状）。`TAKO_1762_KEEP=<dir>` を渡すと全出力を
+# ① と ③ の英語が NG になる（#1762 の症状。#2358 より前なら #2358 の 5 種も NG）。`TAKO_1762_KEEP=<dir>` を渡すと全出力を
 # `<dir>/<言語>/<名前>.(cli|mcp|rc)` へ残す（修正前後のバイト一致の突き合わせ用）。
 #
 # **本番の tako / 設定には一切触らない**（data / HOME は mktemp 配下、tmux は専用ソケット、
@@ -171,10 +176,31 @@ run_lang() {
   cli_case invalid theme color accent '#zz'
   cli_case pane scroll --pane 999999 --to 0
   cli_case tab foreground --tab 999999
-  # セッションの無いペイン = プレビュー。開く前のペインの集合との差で新しいペインを取る
   "$TAKO_BIN" list > "$DIR/list-before.json" 2>&1
   first="$(python3 -c 'import json,sys
 print(json.load(open(sys.argv[1]))["tabs"][0]["panes"][0]["id"])' "$DIR/list-before.json" 2>/dev/null)"
+  # #2358: tako-core の断り。タブ 1 つ・ペイン 1 つ・ウィンドウ 1 つのうちに撃つ（どれも断られて何も変わらない）
+  "$TAKO_BIN" window list > "$DIR/windows.json" 2>&1
+  window="$(python3 -c 'import json,sys
+print(json.load(open(sys.argv[1]))["windows"][0]["id"])' "$DIR/windows.json" 2>/dev/null)"
+  cli_case noresize resize --pane "${first:-0}" --dx 0.1
+  cli_case lasttab close --pane "${first:-0}"
+  cli_case ontoself tab move-pane --pane "${first:-0}" --target "${first:-0}"
+  cli_case lastwindow window close "${window:-0}"
+  # #2358: ペイン未指定（--pane も TAKO_PANE_ID も無い。TAKO_PANE_ID は冒頭で落としてある）
+  cli_case notarget scroll --to 0
+  mcp="$(mcp_call tako_resize_pane "{\"pane\":${first:-0},\"axis\":\"x\",\"delta\":0.1}" "$DIR/noresize.mcp")"
+  echo "$mcp" > "$DIR/noresize.mcperr"
+  mcp="$(mcp_call tako_close_pane "{\"pane\":${first:-0}}" "$DIR/lasttab.mcp")"
+  echo "$mcp" > "$DIR/lasttab.mcperr"
+  mcp="$(mcp_call tako_move_pane_to_tab "{\"pane\":${first:-0},\"target\":${first:-0}}" "$DIR/ontoself.mcp")"
+  echo "$mcp" > "$DIR/ontoself.mcperr"
+  mcp="$(mcp_call tako_window "{\"action\":\"close\",\"window\":${window:-0}}" "$DIR/lastwindow.mcp")"
+  echo "$mcp" > "$DIR/lastwindow.mcperr"
+  # MCP のペイン未指定（`pane` も呼び出し元も無い = このシェルは tako のペインではない）
+  mcp="$(mcp_call tako_scroll_pane '{"to":0}' "$DIR/notarget.mcp")"
+  echo "$mcp" > "$DIR/notarget.mcperr"
+  # セッションの無いペイン = プレビュー。開く前のペインの集合との差で新しいペインを取る
   "$TAKO_BIN" open "$base/note.md" --pane "${first:-0}" --right > "$DIR/open.json" 2>&1
   "$TAKO_BIN" list > "$DIR/list-after.json" 2>&1
   preview="$(python3 -c 'import json,sys
@@ -220,7 +246,10 @@ judge() {
   local label="$1" expect="$2" f name kind ch
   DIR="$TMP/$label/out"
   for f in "$DIR"/invalid.cli "$DIR"/pane.cli "$DIR"/tab.cli "$DIR"/nosession.cli \
-    "$DIR"/local.cli "$DIR"/invalid.mcp "$DIR"/pane.mcp "$DIR"/tab.mcp "$DIR"/nosession.mcp; do
+    "$DIR"/local.cli "$DIR"/invalid.mcp "$DIR"/pane.mcp "$DIR"/tab.mcp "$DIR"/nosession.mcp \
+    "$DIR"/noresize.cli "$DIR"/lasttab.cli "$DIR"/ontoself.cli "$DIR"/lastwindow.cli \
+    "$DIR"/notarget.cli "$DIR"/noresize.mcp "$DIR"/lasttab.mcp "$DIR"/ontoself.mcp \
+    "$DIR"/lastwindow.mcp "$DIR"/notarget.mcp; do
     name="$(basename "$f")"
     [ -f "$f" ] || { fail "$label $name が無い"; continue; }
     echo "      $label $name: $(head -c 240 "$f" | tr '\n' ' ')"
@@ -246,7 +275,9 @@ judge() {
       fi
     else
       case "$(cat "$f")" in
-        *"無効なパラメータ: "* | *"が見つからない"* | *"ターミナルセッションがない"*)
+        *"無効なパラメータ: "* | *"が見つからない"* | *"ターミナルセッションがない"* \
+          | *"リサイズできる分割がない"* | *"は閉じられない"* | *"自分自身の隣へは移動できない"* \
+          | *"対象ペインを特定できない"*)
           pass "$label $name は日本語の前置き" ;;
         *) fail "$label $name に日本語の前置きが無い" ;;
       esac

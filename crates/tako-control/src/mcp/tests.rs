@@ -1967,7 +1967,11 @@ mod tests {
         );
         assert!(requests.is_empty(), "呼び出し元も pane も無い show は送らない");
         let text = response.unwrap().to_string();
-        assert!(text.contains("対象ペインを特定できない"), "{text}");
+        // 断りの文は表示言語に従う（#2358）。言語のグローバルは並列のテストと共有なので両方を許す
+        let said = [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| text.contains(crate::dispatch::NoTargetPaneAt::Mcp.text_in(lang)));
+        assert!(said, "{text}");
         assert!(text.contains("X-Tako-Pane"), "{text}");
         // card 指定の copy は呼び出し元が無くても通る（ペイン指定なしの CLI と同じ）
         assert_eq!(pane_of(json!({ "action": "copy", "card": 5 }), None), None);

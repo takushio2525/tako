@@ -119,6 +119,13 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   GUI を経由せず CLI が dispatch を直呼びする枝は表示言語を初期化していないことがあるので、
   断りは `to_string()` ではなく `local_dispatch_err`（tako-cli）で文字列にする。断りの文から
   「見つからない」を読む呼び手（リモートの 404 への寄せ）は `DispatchError::says_not_found` を通す
+- 同じ形を **tako-core の `PaneTreeError` / `WorkspaceError`**（dispatch が `op_err` で理由の文に
+  そのまま載せる）と、**dispatch へ届く前のペイン未指定の断り**（CLI の `--pane` も
+  TAKO_PANE_ID も無い・MCP の `pane` も呼び出し元も無い）にも広げた（#2358）。前者は各型の
+  `text_in`、後者は口ごとに文が違うので `tako_control::NoTargetPaneAt::{Cli, Mcp}::text_in` が
+  日英の対の 1 か所。CLI は手元で `peek_lang_setting().resolve()` を引き、MCP は
+  `i18n::lang()`（stdio ブリッジは呼び出し元ペインが決まらないときだけ設定から表示言語を決める =
+  #2021 の軽さを崩さない）。番犬は同じ `issue1762_dispatch_error_lang.rs`
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

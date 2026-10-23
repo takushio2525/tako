@@ -90,14 +90,50 @@ pub enum PaneNode {
     },
 }
 
-#[derive(Debug, PartialEq, thiserror::Error)]
+/// ペイン分割ツリーの操作の断り。表示（`Display`）は表示言語に従う（#2358。日英の正本は
+/// [`Self::text_in`]）。dispatch はこの表示をそのまま CLI / MCP の応答文にする
+#[derive(Debug, PartialEq)]
 pub enum PaneTreeError {
-    #[error("ペイン {0} が見つからない")]
     PaneNotFound(PaneId),
-    #[error("最後の 1 ペインは閉じられない（タブごと閉じる操作は Workspace 側で行う）")]
     LastPane,
-    #[error("ペイン {0} には {1:?} 軸でリサイズできる分割がない")]
     NoResizableSplit(PaneId, SplitAxis),
+}
+
+impl std::fmt::Display for PaneTreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for PaneTreeError {}
+
+impl PaneTreeError {
+    /// 表示言語を明示しての文言（#2358。`DispatchError::text_in` = #1762 と同じ形）。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2358 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::PaneNotFound(id), Ja) => format!("ペイン {id} が見つからない"),
+            (Self::PaneNotFound(id), En) => format!("pane {id} not found"),
+            (Self::LastPane, Ja) => {
+                "最後の 1 ペインは閉じられない（タブごと閉じる操作は Workspace 側で行う）"
+                    .to_string()
+            }
+            (Self::LastPane, En) => {
+                "the last pane cannot be closed (closing the whole tab is up to the workspace)"
+                    .to_string()
+            }
+            (Self::NoResizableSplit(id, axis), Ja) => {
+                format!("ペイン {id} には {axis:?} 軸でリサイズできる分割がない")
+            }
+            (Self::NoResizableSplit(id, axis), En) => {
+                format!("pane {id} has no split that can be resized along the {axis:?} axis")
+            }
+        }
+    }
 }
 
 /// 分割比率のクランプ範囲。極端な比率でペインが潰れるのを防ぐ

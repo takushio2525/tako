@@ -119,6 +119,50 @@ impl DispatchError {
     }
 }
 
+/// dispatch へ届く前に対象ペインを決められず、手元で断った口（#2358）。
+///
+/// CLI / MCP の引数の組み立ては、ペインの指定も呼び出し元ペインも無いとき要求を送らずに断る。
+/// 次の一手が口ごとに違う（CLI は `--pane` かアプリ内のターミナル・MCP は `pane` か
+/// TAKO_PANE_ID / X-Tako-Pane）ので [`DispatchError::NoTargetPane`] とは別の文のまま、
+/// 日英の対をここ 1 か所に置く（形は [`DispatchError::text_in`] と同じ）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoTargetPaneAt {
+    Cli,
+    Mcp,
+}
+
+impl std::fmt::Display for NoTargetPaneAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl NoTargetPaneAt {
+    /// 表示言語を明示しての文言。(口, 言語) の網羅 match なので、口を足すと日英の両方を
+    /// 書くまでコンパイルが通らない。日本語は #2358 より前の固定文とバイト一致
+    /// （`tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(self, lang: tako_core::i18n::Lang) -> &'static str {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Cli, Ja) => {
+                "対象ペインを特定できない（--pane を指定するか、tako アプリ内のターミナルで実行する）"
+            }
+            (Self::Cli, En) => {
+                "cannot determine the target pane (pass --pane, \
+                 or run it in a terminal inside the tako app)"
+            }
+            (Self::Mcp, Ja) => {
+                "対象ペインを特定できない（pane を指定する。\
+                 呼び出し元ペインの自動特定には TAKO_PANE_ID / X-Tako-Pane が必要）"
+            }
+            (Self::Mcp, En) => {
+                "cannot determine the target pane (pass pane; \
+                 finding the calling pane automatically needs TAKO_PANE_ID / X-Tako-Pane)"
+            }
+        }
+    }
+}
+
 /// 拡張子からプレビュー種別（ワイヤ表現）を決める。
 ///
 /// 対応表の正本は `tako_core::open_plan`（#1283）。ここは列挙の写しを作らずに

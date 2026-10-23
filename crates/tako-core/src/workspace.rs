@@ -12,22 +12,58 @@ use crate::pane::{Pane, PaneId};
 use crate::pane_tree::{PaneTree, PaneTreeError, SplitDirection};
 use crate::tab::{Tab, TabId};
 
-#[derive(Debug, PartialEq, thiserror::Error)]
+/// タブ・ウィンドウの操作の断り。表示（`Display`）は表示言語に従う（#2358。日英の正本は
+/// [`Self::text_in`]）。dispatch はこの表示をそのまま CLI / MCP の応答文にする
+#[derive(Debug, PartialEq)]
 pub enum WorkspaceError {
-    #[error("タブ {0} が見つからない")]
     TabNotFound(TabId),
-    #[error("ペイン {0} が見つからない")]
     PaneNotFound(PaneId),
-    #[error("最後の 1 タブは閉じられない（アプリ終了は UI 層の責務）")]
     LastTab,
-    #[error("ペイン {0} は既にタブ {1} にある")]
     AlreadyInTab(PaneId, TabId),
-    #[error("ペイン {0} を自分自身の隣へは移動できない")]
     MoveOntoSelf(PaneId),
-    #[error("ウィンドウ {0} が見つからない")]
     WindowNotFound(WindowId),
-    #[error("最後の 1 ウィンドウは閉じられない")]
     LastWindow,
+}
+
+impl fmt::Display for WorkspaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for WorkspaceError {}
+
+impl WorkspaceError {
+    /// 表示言語を明示しての文言（#2358。`DispatchError::text_in` = #1762 と同じ形）。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2358 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::TabNotFound(id), Ja) => format!("タブ {id} が見つからない"),
+            (Self::TabNotFound(id), En) => format!("tab {id} not found"),
+            (Self::PaneNotFound(id), Ja) => format!("ペイン {id} が見つからない"),
+            (Self::PaneNotFound(id), En) => format!("pane {id} not found"),
+            (Self::LastTab, Ja) => {
+                "最後の 1 タブは閉じられない（アプリ終了は UI 層の責務）".to_string()
+            }
+            (Self::LastTab, En) => {
+                "the last tab cannot be closed (quitting the app is up to the UI layer)".to_string()
+            }
+            (Self::AlreadyInTab(pane, tab), Ja) => format!("ペイン {pane} は既にタブ {tab} にある"),
+            (Self::AlreadyInTab(pane, tab), En) => format!("pane {pane} is already in tab {tab}"),
+            (Self::MoveOntoSelf(pane), Ja) => {
+                format!("ペイン {pane} を自分自身の隣へは移動できない")
+            }
+            (Self::MoveOntoSelf(pane), En) => format!("pane {pane} cannot be moved next to itself"),
+            (Self::WindowNotFound(id), Ja) => format!("ウィンドウ {id} が見つからない"),
+            (Self::WindowNotFound(id), En) => format!("window {id} not found"),
+            (Self::LastWindow, Ja) => "最後の 1 ウィンドウは閉じられない".to_string(),
+            (Self::LastWindow, En) => "the last window cannot be closed".to_string(),
+        }
+    }
 }
 
 /// 論理ウィンドウ ID（Issue #339）。GPUI 非依存の連番で、OS ウィンドウとの対応は

@@ -266,7 +266,8 @@ for route in http stdio; do
   check "$(jq_py "$LINK" '1 if v["pane"] == int("'"$A"'") else ""')" \
     "${route}: sessions link（id・pane 省略）は呼び出し元 A の会話を引く（フォーカスの B ではない）"
   NC="$(val "$OUT" no_caller)"
-  check "$(jq_py "$NC" '1 if v["rpc_error"] and "対象ペインを特定できない" in v["rpc_error"] else ""')" \
+  # 断りの文は表示言語に従う（#2358）。日英どちらでも「特定できない」を言っていればよい
+  check "$(jq_py "$NC" '1 if v["rpc_error"] and ("対象ペインを特定できない" in v["rpc_error"] or "cannot determine the target pane" in v["rpc_error"]) else ""')" \
     "${route}: 呼び出し元が無い show は送らず、渡すものを言って断る"
 done
 
@@ -277,7 +278,7 @@ check "$(jq_py "$(val "$OUT" show)" '1 if v["rc"] == 0 and v["pane"] == int("'"$
   "cli: --pane を省いた tako show-command が呼び出し元 A へ出る"
 check "$(jq_py "$(val "$OUT" link)" '1 if v["rc"] == 0 and v["pane"] == int("'"$A"'") else ""')" \
   "cli: --pane を省いた tako sessions link は呼び出し元 A の会話を引く"
-check "$(jq_py "$(val "$OUT" no_caller)" '1 if v["rc"] != 0 and "対象ペインを特定できない" in v["stderr"] else ""')" \
+check "$(jq_py "$(val "$OUT" no_caller)" '1 if v["rc"] != 0 and ("対象ペインを特定できない" in v["stderr"] or "cannot determine the target pane" in v["stderr"]) else ""')" \
   "cli: TAKO_PANE_ID も --pane も無い show は送らず、渡すものを言って断る"
 
 echo "--- GUI の保管庫（画面のカード帯の描き元）"

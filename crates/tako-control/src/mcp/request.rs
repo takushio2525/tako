@@ -1579,13 +1579,14 @@ fn todo_via(args: &Value) -> Result<Option<String>, String> {
     Ok(via.or_else(|| respond.then(|| "mcp".to_string())))
 }
 
-/// `pane` 引数（省略時は呼び出し元へフォールバック。FR-2.3.3 のデフォルトスコープ）
+/// `pane` 引数（省略時は呼び出し元へフォールバック。FR-2.3.3 のデフォルトスコープ）。
+///
+/// 断りの文は表示言語に従う（#2358）。GUI の HTTP 経路は GUI の表示言語、stdio ブリッジは
+/// 呼び出し元ペインが決まらないときに設定から決めた表示言語（`tako-cli::mcp_bridge`）
 fn target_pane(args: &Value, caller: Option<u64>) -> Result<u64, String> {
-    u64_arg(args, "pane")?.or(caller).ok_or_else(|| {
-        "対象ペインを特定できない（pane を指定する。\
-         呼び出し元ペインの自動特定には TAKO_PANE_ID / X-Tako-Pane が必要）"
-            .into()
-    })
+    u64_arg(args, "pane")?
+        .or(caller)
+        .ok_or_else(|| crate::dispatch::NoTargetPaneAt::Mcp.to_string())
 }
 
 /// ツール名 → 許可パラメータ名（`inputSchema.properties` のキー）の表（#227）。
