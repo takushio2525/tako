@@ -3565,13 +3565,18 @@ struct CharInfo {
 }
 
 /// ペインごとのイベント配送状態（#816）。`hidden` は最後の可視判定の申し送りで、
-/// 2 本のカウンタは「渡した / 省いた」の実測用（#782 の `term_redraw_skipped` と
-/// 同じ役割。あちらはメインスレッドに入ってからの回数、こちらは入る前の回数）
+/// 3 本のカウンタは「渡した / 必ず渡した / 省いた」の実測用（#782 の `term_redraw_skipped` と
+/// 同じ役割。あちらはメインスレッドに入ってからの回数、こちらは入る前の回数）。
+/// 外からは `tako redraw-limit` の `delivery` で読める（#2344）
 #[derive(Default)]
 struct PaneDelivery {
     hidden: std::sync::atomic::AtomicBool,
     /// メインスレッドへ渡った回数
     hops: std::sync::atomic::AtomicU64,
+    /// `hops` のうち、描き直しの合図ではない（可視性に依らず必ず渡す）イベントが
+    /// 乗っていた回数（#2344）。画面に出ていないペインでこれが出力の数に比例して
+    /// 増えるなら、ゲートを素通りするイベントがある
+    forced: std::sync::atomic::AtomicU64,
     /// 見えないので渡さなかった回数
     skipped: std::sync::atomic::AtomicU64,
     /// Wakeup でメインスレッドへ渡る最小間隔（ミリ秒。#1979）。`hidden` と同じく
@@ -3750,6 +3755,11 @@ async fn batch_term_events(
         delivery
             .hops
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !events.is_empty() {
+            delivery
+                .forced
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // グリッドを読む直前にゲートを倒す（#816）
         release_wakeup_gate(gate);
         let applied = this.update(cx, |app: &mut TakoApp, cx| {
@@ -10440,6 +10450,11 @@ impl TakoApp {
                 delivery
                     .hops
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !wakeup_only {
+                    delivery
+                        .forced
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 // グリッドを読む直前にゲートを倒す（#816）
                 release_wakeup_gate(&gate);
                 // 1 件目は即処理（打鍵の反応 = レイテンシ優先）
@@ -24941,6 +24956,22 @@ impl SessionHost for TakoApp {
             unfocused_flushes: self.unfocused_flushes,
             body_renders: self.pane_body_renders,
             legacy: tako_core::probe::issue1979_legacy(),
+            delivery: {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut rows: Vec<_> = self
+                    .pane_delivery
+                    .iter()
+                    .map(|(pane, d)| tako_core::redraw_limit::PaneDeliveryStat {
+                        pane: pane.as_u64(),
+                        hops: d.hops.load(Relaxed),
+                        forced: d.forced.load(Relaxed),
+                        skipped: d.skipped.load(Relaxed),
+                        hidden: d.hidden.load(Relaxed),
+                    })
+                    .collect();
+                rows.sort_by_key(|r| r.pane);
+                rows
+            },
         }
     }
 

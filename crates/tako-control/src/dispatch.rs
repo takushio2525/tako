@@ -20953,9 +20953,24 @@ fn pinned_json(host: &dyn ControlHost) -> Value {
 /// タイトルの出どころの文字列表現（list / MCP 公開用。FR-2.12.1）
 /// フォーカスの無いペインの再描画の上限の応答（#1979。`tako redraw-limit` / MCP
 /// `tako_scrollback` の `unfocused_redraw`）。`flushes` は起動からの累計の再描画回数で、
-/// 2 回読んだ差を経過時間で割ると実際の fps になる（上限が効いているかを外から確かめる口）
+/// 2 回読んだ差を経過時間で割ると実際の fps になる（上限が効いているかを外から確かめる口）。
+/// `delivery` はペインごとの出力イベントの配送の記録（#816 / #2344）で、同じく 2 回読んだ差で
+/// 「画面に出ていないペインの出力がメインスレッドを何回起こしているか」を外から測る
 fn redraw_limit_json(status: &tako_core::redraw_limit::RedrawLimitStatus) -> Value {
     use tako_core::redraw_limit as rl;
+    let delivery: Vec<Value> = status
+        .delivery
+        .iter()
+        .map(|d| {
+            json!({
+                "pane": d.pane,
+                "hops": d.hops,
+                "forced": d.forced,
+                "skipped": d.skipped,
+                "hidden": d.hidden,
+            })
+        })
+        .collect();
     json!({
         "fps": status.unfocused_fps,
         "default_fps": rl::DEFAULT_UNFOCUSED_FPS,
@@ -20968,6 +20983,7 @@ fn redraw_limit_json(status: &tako_core::redraw_limit::RedrawLimitStatus) -> Val
         },
         "body_renders": status.body_renders,
         "legacy": status.legacy,
+        "delivery": delivery,
     })
 }
 
@@ -25233,7 +25249,7 @@ mod tests {
             self.scrollback.lines = tako_core::scrollback::clamp_lines(lines);
         }
         fn redraw_limit_status(&self) -> tako_core::redraw_limit::RedrawLimitStatus {
-            self.redraw_limit
+            self.redraw_limit.clone()
         }
         fn set_unfocused_redraw_fps(&mut self, fps: u32) {
             self.redraw_limit.unfocused_fps = tako_core::redraw_limit::clamp_fps(fps);
@@ -31561,6 +31577,45 @@ mod tests {
     }
 
     /// #1979: 同じ口（CLI `tako redraw-limit` / MCP `tako_scrollback` の `unfocused_fps`）で
+    /// #2344: ペインごとの配送の記録が CLI / MCP の応答へそのまま載る
+    /// （画面に出ていないペインの出力がメインスレッドを何回起こしているかを外から測る口）
+    #[test]
+    fn issue2344_配送の記録はペインごとにredraw_limitの応答へ載る() {
+        let mut host = MockHost::new();
+        let req = || Request::Scrollback {
+            lines: None,
+            unfocused_fps: None,
+            mouse_forward: None,
+        };
+        let empty = dispatch(&mut host, req(), PaneOrigin::Cli).unwrap();
+        assert_eq!(empty["unfocused_redraw"]["delivery"], json!([]));
+
+        host.redraw_limit.delivery = vec![
+            tako_core::redraw_limit::PaneDeliveryStat {
+                pane: 3,
+                hops: 13,
+                forced: 2,
+                skipped: 83,
+                hidden: true,
+            },
+            tako_core::redraw_limit::PaneDeliveryStat {
+                pane: 7,
+                hops: 40,
+                forced: 0,
+                skipped: 5,
+                hidden: false,
+            },
+        ];
+        let out = dispatch(&mut host, req(), PaneOrigin::Mcp).unwrap();
+        assert_eq!(
+            out["unfocused_redraw"]["delivery"],
+            json!([
+                {"pane": 3, "hops": 13, "forced": 2, "skipped": 83, "hidden": true},
+                {"pane": 7, "hops": 40, "forced": 0, "skipped": 5, "hidden": false},
+            ])
+        );
+    }
+
     /// フォーカスの無いペインの再描画の上限を読み書きでき、範囲外は理由つきで弾く。
     /// 片方だけ範囲外のとき、もう片方だけ効いた状態を作らない
     #[test]

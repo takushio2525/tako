@@ -56,7 +56,7 @@ pub fn interval(fps: u32) -> Duration {
 }
 
 /// 再描画の上限の現在状態（CLI / MCP の応答の材料）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedrawLimitStatus {
     /// フォーカスの無いペインの上限（fps）
     pub unfocused_fps: u32,
@@ -69,6 +69,26 @@ pub struct RedrawLimitStatus {
     pub body_renders: u64,
     /// A/B（`TAKO_1979_LEGACY=1`）で上限を設けていないか
     pub legacy: bool,
+    /// ペインごとの出力イベントの配送の記録（#816 / #2344。ペイン ID 順）
+    pub delivery: Vec<PaneDeliveryStat>,
+}
+
+/// 1 ペインぶんの出力イベントの配送の記録（#816 / #2344。どれも起動からの累計）。
+///
+/// 2 回読んだ差を経過時間で割ると、そのペインの出力がメインスレッドを何回起こしているかを
+/// 外から測れる（画面に出ていないペインは `hops` が再確認の間隔 = 200ms に 1 回と
+/// `forced` の和に収まるのが正しい形）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneDeliveryStat {
+    pub pane: u64,
+    /// メインスレッドへ渡った回数
+    pub hops: u64,
+    /// そのうち、描き直しの合図ではない（可視性に依らず必ず渡す）イベントが乗っていた回数
+    pub forced: u64,
+    /// 描き直しの合図を渡さずに省いた回数（画面に出ていない / 再描画の間隔に満たない）
+    pub skipped: u64,
+    /// 最後の可視判定で画面のどこにも出ていなかったか
+    pub hidden: bool,
 }
 
 impl Default for RedrawLimitStatus {
@@ -79,6 +99,7 @@ impl Default for RedrawLimitStatus {
             unfocused_flushes: 0,
             body_renders: 0,
             legacy: false,
+            delivery: Vec::new(),
         }
     }
 }
