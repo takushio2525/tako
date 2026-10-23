@@ -72,6 +72,33 @@ pub fn cmd_label(id: &str) -> &'static str {
     }
 }
 
+/// 固定コマンドの**検索だけに効く別名**（キー: palette.alias_<id>。#2340）。表示はしない。
+///
+/// 表記をメニューに揃えたとき（#1830 / #2322）に外れた**旧表記の全文**を置く。絞り込みは
+/// 部分一致なので、旧表記で引けていた打ち方（「切り替え」「view」「ライト/ダーク」、旧表記を
+/// 頭から打ちかけた「表示モードを切り」）がそのまま引ける。旧表記もその言語のラベルだったので
+/// 表示言語ごとに引く。足してよいのは「どの PR で外れたか」を言える旧表記だけで、
+/// `app_menu_tests` の表（`PALETTE_OLD_LABELS`）と食い違うと番犬が落ちる
+pub fn cmd_aliases(id: &str) -> &'static [&'static str] {
+    match id {
+        // #1830（PR #2319）
+        "toggle-theme" => tr!(&["テーマをライト/ダーク切替"], &["Toggle light/dark theme"]),
+        // #1830（PR #2319）
+        "toggle-language" => tr!(
+            &["表示言語を切替（日本語 / English）"],
+            &["Switch language (日本語 / English)"]
+        ),
+        // #2322（PR #2337）
+        "toggle-ui-mode" => tr!(
+            &["表示モードを切り替え（かんたん / ターミナル）"],
+            &["Switch view mode (simple / terminal)"]
+        ),
+        // #2322（PR #2337）。英語の "New tab" は変わっていない
+        "new-tab" => tr!(&["新しいタブ"], &[]),
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests_support;

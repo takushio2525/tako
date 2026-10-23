@@ -13375,8 +13375,6 @@ impl TakoApp {
 
     /// コマンドパレットの候補（#217。query の部分一致で絞り込み済み）
     fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
-        let q = query.to_lowercase();
-
         // SSH ホスト選択モード
         if let Some(ref palette) = self.command_palette {
             match &palette.mode {
@@ -13385,22 +13383,14 @@ impl TakoApp {
                         .iter()
                         .map(|h| PaletteItem::SshHost(h.clone(), *into_pane))
                         .collect();
-                    return if q.is_empty() {
-                        items
-                    } else {
-                        items.into_iter().filter(|item| item.matches(&q)).collect()
-                    };
+                    return filter_palette_items(items, query);
                 }
                 PaletteMode::RecentItems(entries) => {
                     let items: Vec<PaletteItem> = entries
                         .iter()
                         .map(|e| PaletteItem::Recent(e.clone()))
                         .collect();
-                    return if q.is_empty() {
-                        items
-                    } else {
-                        items.into_iter().filter(|item| item.matches(&q)).collect()
-                    };
+                    return filter_palette_items(items, query);
                 }
                 // #919: ホスト選択（選んだらフォルダ選択へ進む）
                 PaletteMode::RemoteFolderHost(hosts) => {
@@ -13408,11 +13398,7 @@ impl TakoApp {
                         .iter()
                         .map(|h| PaletteItem::RemoteFolderHost(h.clone()))
                         .collect();
-                    return if q.is_empty() {
-                        items
-                    } else {
-                        items.into_iter().filter(|item| item.matches(&q)).collect()
-                    };
+                    return filter_palette_items(items, query);
                 }
                 // #919: フォルダ選択。先頭が「ここを開く」で、以下がディレクトリ
                 PaletteMode::RemoteFolderDir { host, cwd, entries } => {
@@ -13432,11 +13418,7 @@ impl TakoApp {
                             format!("{}/", e.name),
                         ));
                     }
-                    return if q.is_empty() {
-                        items
-                    } else {
-                        items.into_iter().filter(|item| item.matches(&q)).collect()
-                    };
+                    return filter_palette_items(items, query);
                 }
                 PaletteMode::Normal => {}
             }
@@ -13482,16 +13464,8 @@ impl TakoApp {
             }
         }
         // 固定コマンド（表示ラベルは ui_text::palette が言語別に解決）
-        for id in PALETTE_COMMANDS {
-            items.push(PaletteItem::Command(
-                crate::ui_text::palette::cmd_label(id),
-                id,
-            ));
-        }
-        if q.is_empty() {
-            return items;
-        }
-        items.into_iter().filter(|item| item.matches(&q)).collect()
+        items.extend(palette_command_items());
+        filter_palette_items(items, query)
     }
 
     /// コマンドパレットのキー入力処理（#217）。true = 消費した
@@ -28982,10 +28956,37 @@ impl PaletteItem {
 
     /// 絞り込みの判定（大文字小文字を問わない部分一致。`q` は小文字化済み）。
     /// パレットのどのモードもこの 1 本を通る。表記を変えた項目が旧来の打ち方でも
-    /// 引けるかを、単体テストが同じ判定で見る（#1830）
+    /// 引けるかを、単体テストが同じ判定で見る（#1830）。
+    ///
+    /// 固定コマンドは、表示ラベルに加えて検索だけに効く別名（`ui_text::palette::cmd_aliases`
+    /// = 表記を揃えたときに外れた旧表記）にも当てる（#2340）。どちらに当たっても候補は 1 件
     fn matches(&self, q: &str) -> bool {
         self.label().to_lowercase().contains(q)
+            || match self {
+                PaletteItem::Command(_, id) => crate::ui_text::palette::cmd_aliases(id)
+                    .iter()
+                    .any(|alias| alias.to_lowercase().contains(q)),
+                _ => false,
+            }
     }
+}
+
+/// パレットの固定コマンドの候補（並びは `PALETTE_COMMANDS` のまま。表示ラベルは
+/// `ui_text::palette` が言語別に解決する）
+fn palette_command_items() -> impl Iterator<Item = PaletteItem> {
+    PALETTE_COMMANDS
+        .iter()
+        .map(|id| PaletteItem::Command(crate::ui_text::palette::cmd_label(id), id))
+}
+
+/// 候補を問い合わせで絞る（#217）。パレットのどのモードもこの 1 本を通る。
+/// 空の問い合わせは全件。1 件の候補は当たり方（ラベル・別名）によらず高々 1 回残る（#2340）
+fn filter_palette_items(items: Vec<PaletteItem>, query: &str) -> Vec<PaletteItem> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return items;
+    }
+    items.into_iter().filter(|item| item.matches(&q)).collect()
 }
 
 /// GPUI の Keystroke を端末入力バイト列へ変換する
@@ -32108,6 +32109,12 @@ mod self_test {
     mod changelog_expand_2150;
     #[cfg(feature = "visual-test")]
     use changelog_expand_2150::changelog_expand_visual;
+    /// #2340: パレットが表記を揃える前の旧表記（検索だけに効く別名）でも引ける
+    /// （visual-test `palette-alias`）
+    #[cfg(feature = "visual-test")]
+    mod palette_alias_2340;
+    #[cfg(feature = "visual-test")]
+    use palette_alias_2340::palette_alias_visual;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -47003,6 +47010,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2340: パレットが旧表記（検索だけに効く別名）でも引け、表示はいまのラベル
+                "palette-alias" => {
+                    palette_alias_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 other => {
                     eprintln!(
                         "TAKO_VISUAL_ONLY: 未知の節 '{other}'（使えるのは \
@@ -47019,7 +47032,7 @@ mod self_test {
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
-                         changelog-offload / changelog-expand / tasks-launch-2182）"
+                         changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias）"
                     );
                     std::process::exit(1);
                 }
@@ -98659,7 +98672,8 @@ mod app_menu_tests {
     /// 絞り込みは `PaletteItem::matches`（大文字小文字を問わない部分一致）の 1 本で、
     /// `palette_items` と同じく問い合わせを小文字にしてから渡す。旧の表記を覚えた人が
     /// 打ちそうな語（テーマ・ライト・ダーク・言語・English・表示・かんたん …）を
-    /// 表示言語ごとに並べ、その項目が候補に残ることを見る
+    /// 表示言語ごとに並べ、その項目が候補に残ることを見る。いまのラベルからは外れ、
+    /// 検索だけに効く別名で引く語（「切り替え」「view」…）は `PALETTE_OLD_LABELS`（#2340）
     #[test]
     fn パレットの項目は旧来の打ち方で引ける() {
         use tako_core::i18n::Lang;
@@ -98719,6 +98733,384 @@ mod app_menu_tests {
             misses.is_empty(),
             "パレットの項目が旧来の打ち方で引けない（#1830 / #2322）:\n  {}",
             misses.join("\n  ")
+        );
+    }
+
+    /// 表記を揃えたときに外れた旧表記（#2340）。検索だけに効く別名
+    /// （`ui_text::palette::cmd_aliases`。表示はしない）は**この表の旧表記だけ**を持つ。
+    /// 列は (id, 言語, 外れた Issue と PR, 旧表記の全文, 旧表記でだけ引けていた打ち方)。
+    /// 打ち方の列は「いまのラベルだけでは引けない」語に限る（ラベルで引ける語は
+    /// `パレットの項目は旧来の打ち方で引ける` の表へ書く）。パレットの項目の表記を
+    /// 変えたら、旧表記をここと `cmd_aliases` の両方へ足す
+    const PALETTE_OLD_LABELS: &[(&str, tako_core::i18n::Lang, &str, &str, &[&str])] = {
+        use tako_core::i18n::Lang::{En, Ja};
+        &[
+            (
+                "toggle-theme",
+                Ja,
+                "#1830（PR #2319）",
+                "テーマをライト/ダーク切替",
+                &["ライト/ダーク", "テーマをライト", "ダーク切替"],
+            ),
+            (
+                "toggle-theme",
+                En,
+                "#1830（PR #2319）",
+                "Toggle light/dark theme",
+                &["light/dark", "Toggle light", "dark theme"],
+            ),
+            (
+                "toggle-language",
+                Ja,
+                "#1830（PR #2319）",
+                "表示言語を切替（日本語 / English）",
+                &["日本語 / English", "日本語 /"],
+            ),
+            (
+                "toggle-language",
+                En,
+                "#1830（PR #2319）",
+                "Switch language (日本語 / English)",
+                &["日本語 / English", "(日本語 /"],
+            ),
+            (
+                "toggle-ui-mode",
+                Ja,
+                "#2322（PR #2337）",
+                "表示モードを切り替え（かんたん / ターミナル）",
+                &[
+                    "切り替え",
+                    "切り",
+                    "表示モードを切り",
+                    "かんたん / ターミナル",
+                ],
+            ),
+            (
+                "toggle-ui-mode",
+                En,
+                "#2322（PR #2337）",
+                "Switch view mode (simple / terminal)",
+                &["switch", "view", "Switch view mode", "simple / terminal"],
+            ),
+            (
+                "new-tab",
+                Ja,
+                "#2322（PR #2337）",
+                "新しいタブ",
+                &["新しい", "新しいタブ"],
+            ),
+        ]
+    };
+
+    /// `ui_text/palette.rs` の `cmd_aliases` の行範囲（0 起点。関数の頭の行, 閉じの `}` の行）
+    fn palette_alias_fn_span(source: &str) -> (usize, usize) {
+        let lines: Vec<&str> = source.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.contains("pub fn cmd_aliases("))
+            .expect("ui_text/palette.rs に cmd_aliases が無い（読み方を直す）");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map_or(lines.len(), |i| start + i);
+        (start, end)
+    }
+
+    /// `cmd_aliases` の中で `needle` を含む最初の行（無ければ関数の頭 = 足す場所）の位置
+    fn palette_alias_line(source: &str, needle: &str) -> String {
+        let (start, end) = palette_alias_fn_span(source);
+        let line = source
+            .lines()
+            .enumerate()
+            .take(end)
+            .skip(start)
+            .find(|(_, l)| l.contains(needle))
+            .map_or(start, |(i, _)| i);
+        format!("crates/tako-app/src/ui_text/palette.rs:{}", line + 1)
+    }
+
+    /// `cmd_aliases` の中で、その id の腕（無ければ関数の頭）の位置
+    fn palette_alias_at(source: &str, id: &str) -> String {
+        palette_alias_line(source, &format!("\"{id}\" =>"))
+    }
+
+    /// `cmd_aliases` の中で、その別名のリテラル（無ければ id の腕）の位置
+    fn palette_alias_literal_at(source: &str, id: &str, alias: &str) -> String {
+        let (start, end) = palette_alias_fn_span(source);
+        let literal = format!("\"{alias}\"");
+        let found = source
+            .lines()
+            .take(end)
+            .skip(start)
+            .any(|l| l.contains(&literal));
+        if found && !alias.is_empty() {
+            palette_alias_line(source, &literal)
+        } else {
+            palette_alias_at(source, id)
+        }
+    }
+
+    /// `cmd_aliases` に腕がある id（`_ =>` を除く）
+    fn palette_alias_arm_ids(source: &str) -> Vec<String> {
+        let (start, end) = palette_alias_fn_span(source);
+        source
+            .lines()
+            .take(end)
+            .skip(start)
+            .filter_map(|l| {
+                let (id, _) = l.trim_start().strip_prefix('"')?.split_once("\" =>")?;
+                Some(id.to_string())
+            })
+            .collect()
+    }
+
+    /// `PALETTE_OLD_LABELS` の中で、その旧表記の行の位置
+    fn palette_old_label_row_at(old: &str) -> String {
+        let main = include_str!("main.rs");
+        let literal = format!("\"{old}\"");
+        let start = main
+            .lines()
+            .position(|l| l.contains(concat!("const PALETTE_OLD", "_LABELS")))
+            .unwrap_or(0);
+        let line = main
+            .lines()
+            .enumerate()
+            .skip(start)
+            .find(|(_, l)| l.contains(&literal))
+            .map_or(start, |(i, _)| i);
+        format!("crates/tako-app/src/main.rs:{}", line + 1)
+    }
+
+    /// **パレットの別名は、表記を揃えたときに外れた旧表記の表と一致する**（#2340）。
+    ///
+    /// 別名は旧来の語を戻すためだけにあり、思いつきで増やさない。`cmd_aliases` の全件を
+    /// 両言語で `PALETTE_OLD_LABELS` と突き合わせ、表にあるのに別名が無い（外す注入）・
+    /// 別名にあるのに表に無い（根拠の無い別名）のどちらも `ui_text/palette.rs` の行で名指す
+    #[test]
+    fn パレットの別名は外れた旧表記の表と一致する() {
+        let source = include_str!("ui_text/palette.rs");
+        let problems = std::cell::RefCell::new(Vec::new());
+        for (id, _, _, old, _) in PALETTE_OLD_LABELS {
+            if !PALETTE_COMMANDS.contains(id) {
+                problems.borrow_mut().push(format!(
+                    "{}: {id} は PALETTE_COMMANDS に無い（表から消す）",
+                    palette_old_label_row_at(old)
+                ));
+            }
+        }
+        for id in palette_alias_arm_ids(source) {
+            if !PALETTE_COMMANDS.contains(&id.as_str()) {
+                problems.borrow_mut().push(format!(
+                    "{}: {id} は PALETTE_COMMANDS に無い（別名の腕を消す）",
+                    palette_alias_at(source, &id)
+                ));
+            }
+        }
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let lang = tako_core::i18n::lang();
+            for id in PALETTE_COMMANDS {
+                let have = crate::ui_text::palette::cmd_aliases(id);
+                let rows: Vec<_> = PALETTE_OLD_LABELS
+                    .iter()
+                    .filter(|(row_id, row_lang, ..)| row_id == id && *row_lang == lang)
+                    .collect();
+                for (_, _, origin, old, _) in &rows {
+                    if !have.contains(old) {
+                        problems.borrow_mut().push(format!(
+                            "{}: {id}（{lang:?}）の別名に旧表記 {old:?}（{origin} で外れた）が無い",
+                            palette_alias_at(source, id)
+                        ));
+                    }
+                }
+                for alias in have {
+                    if !rows.iter().any(|(.., old, _)| old == alias) {
+                        problems.borrow_mut().push(format!(
+                            "{}: {id}（{lang:?}）の別名 {alias:?} が PALETTE_OLD_LABELS に無い\
+                             （どの PR で外れた旧表記かを表に書く）",
+                            palette_alias_literal_at(source, id, alias)
+                        ));
+                    }
+                }
+            }
+        });
+        let problems = problems.into_inner();
+        assert!(
+            problems.is_empty(),
+            "パレットの別名が外れた旧表記の表と食い違う（#2340）:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// **パレットの別名は空でなく、ラベルにもほかの別名にも含まれない**（#2340）。
+    ///
+    /// 絞り込みは部分一致なので、ラベル（大小を問わない）に含まれる別名は無くても引ける
+    /// = 余計。同じ項目のほかの別名に含まれる別名も同じ。空の別名はどの問い合わせにも
+    /// 当たって絞り込みが効かなくなる
+    #[test]
+    fn パレットの別名は空でなくラベルとほかの別名に含まれない() {
+        let source = include_str!("ui_text/palette.rs");
+        let offenders = std::cell::RefCell::new(Vec::new());
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let lang = tako_core::i18n::lang();
+            for id in PALETTE_COMMANDS {
+                let label = crate::ui_text::palette::cmd_label(id);
+                let aliases = crate::ui_text::palette::cmd_aliases(id);
+                for (i, alias) in aliases.iter().enumerate() {
+                    let at = palette_alias_literal_at(source, id, alias);
+                    let lower = alias.to_lowercase();
+                    if alias.trim().is_empty() {
+                        offenders
+                            .borrow_mut()
+                            .push(format!("{at}: {id}（{lang:?}）の別名が空"));
+                    } else if label.to_lowercase().contains(&lower) {
+                        offenders.borrow_mut().push(format!(
+                            "{at}: {id}（{lang:?}）の別名 {alias:?} はラベル {label:?} に含まれる（余計）"
+                        ));
+                    } else if let Some(other) = aliases
+                        .iter()
+                        .enumerate()
+                        .find(|(j, o)| *j != i && o.to_lowercase().contains(&lower))
+                        .map(|(_, o)| o)
+                    {
+                        offenders.borrow_mut().push(format!(
+                            "{at}: {id}（{lang:?}）の別名 {alias:?} はほかの別名 {other:?} に含まれる（余計）"
+                        ));
+                    }
+                }
+            }
+        });
+        let offenders = offenders.into_inner();
+        assert!(
+            offenders.is_empty(),
+            "パレットの別名が余計か空（#2340）:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// **表記を揃える前の打ち方でも、パレットから引ける**（#2340）。
+    ///
+    /// `PALETTE_OLD_LABELS` の打ち方は「いまのラベルだけでは引けない」語（= 別名が無いと
+    /// 引けない。#1830 / #2322 の後に実際に引けなくなっていた）で、それぞれが旧表記に
+    /// 含まれること（表の行の整合）と、`PaletteItem::matches` で引けることを見る。
+    /// 別名を外すと、引けない語を `ui_text/palette.rs` の `cmd_aliases` の行で名指す
+    #[test]
+    fn パレットの項目は表記を揃える前の打ち方でも引ける() {
+        let source = include_str!("ui_text/palette.rs");
+        let mut problems = Vec::new();
+        for (id, lang, origin, old, queries) in PALETTE_OLD_LABELS {
+            crate::ui_text::tests_support::with_lang(*lang, || {
+                let label = crate::ui_text::palette::cmd_label(id);
+                let item = PaletteItem::Command(label, id);
+                for q in *queries {
+                    let q_lower = q.to_lowercase();
+                    if !old.to_lowercase().contains(&q_lower) {
+                        problems.push(format!(
+                            "{}: {id}（{lang:?}）の打ち方 {q:?} が旧表記 {old:?} に無い（表の行を直す）",
+                            palette_old_label_row_at(old)
+                        ));
+                    }
+                    if label.to_lowercase().contains(&q_lower) {
+                        problems.push(format!(
+                            "{}: {id}（{lang:?}）の打ち方 {q:?} はいまのラベル {label:?} で引ける\
+                             （`パレットの項目は旧来の打ち方で引ける` の表へ移す）",
+                            palette_old_label_row_at(old)
+                        ));
+                    }
+                    if !item.matches(&q_lower) {
+                        problems.push(format!(
+                            "{}: {id}（{lang:?}）= {label:?} が旧表記 {old:?}（{origin} で外れた）\
+                             の打ち方 {q:?} で引けない",
+                            palette_alias_at(source, id)
+                        ));
+                    }
+                }
+            });
+        }
+        assert!(
+            problems.is_empty(),
+            "パレットの項目が表記を揃える前の打ち方で引けない（#2340）:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// **別名とラベルの両方に当たる語でも、候補は 1 件だけ出る**（#2340）。
+    ///
+    /// 本物の絞り込み（`filter_palette_items` + `palette_command_items`）を通す。別名は
+    /// 候補を増やさず、当たり方の判定を広げるだけ。空の問い合わせは全件を並びのまま、
+    /// どこにも当たらない語は 0 件
+    #[test]
+    fn パレットの絞り込みは別名とラベルの両方に当たっても1件だけ出す() {
+        use tako_core::i18n::Lang;
+        let count = |items: &[PaletteItem], want: &str| {
+            items
+                .iter()
+                .filter(|item| matches!(item, PaletteItem::Command(_, id) if *id == want))
+                .count()
+        };
+        // (言語, 問い合わせ, 項目, ラベルにも当たる)
+        let cases = [
+            (Lang::Ja, "表示モード", "toggle-ui-mode", true),
+            (Lang::Ja, "かんたん", "toggle-ui-mode", true),
+            (Lang::Ja, "テーマ", "toggle-theme", true),
+            (Lang::Ja, "タブ", "new-tab", true),
+            (Lang::En, "Mode", "toggle-ui-mode", true),
+            (Lang::En, "theme", "toggle-theme", true),
+            (Lang::En, "english", "toggle-language", true),
+            (Lang::Ja, "切り替え", "toggle-ui-mode", false),
+            (Lang::En, "VIEW", "toggle-ui-mode", false),
+        ];
+        let problems = std::cell::RefCell::new(Vec::new());
+        for (lang, query, id, on_label) in cases {
+            crate::ui_text::tests_support::with_lang(lang, || {
+                let label = crate::ui_text::palette::cmd_label(id);
+                let q = query.to_lowercase();
+                let on_alias = crate::ui_text::palette::cmd_aliases(id)
+                    .iter()
+                    .any(|a| a.to_lowercase().contains(&q));
+                let label_hit = label.to_lowercase().contains(&q);
+                if label_hit != on_label || !on_alias {
+                    problems.borrow_mut().push(format!(
+                        "{id}（{lang:?}）の {query:?} の前提が崩れた（ラベル {label:?} に当たる = \
+                         {label_hit}（期待 {on_label}）・別名に当たる = {on_alias}（期待 true））"
+                    ));
+                }
+                let hits = filter_palette_items(palette_command_items().collect(), query);
+                let n = count(&hits, id);
+                if n != 1 {
+                    problems
+                        .borrow_mut()
+                        .push(format!("{id}（{lang:?}）が {query:?} で {n} 回出た"));
+                }
+            });
+        }
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let lang = tako_core::i18n::lang();
+            let all = filter_palette_items(palette_command_items().collect(), "");
+            let ids: Vec<&str> = all
+                .iter()
+                .filter_map(|item| match item {
+                    PaletteItem::Command(_, id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if ids != PALETTE_COMMANDS {
+                problems.borrow_mut().push(format!(
+                    "空の問い合わせ（{lang:?}）で全件が並びのまま 1 回ずつ出ない: {ids:?}"
+                ));
+            }
+            let none = filter_palette_items(palette_command_items().collect(), "zzz-2340");
+            if !none.is_empty() {
+                problems.borrow_mut().push(format!(
+                    "どこにも当たらない語（{lang:?}）で {} 件出た",
+                    none.len()
+                ));
+            }
+        });
+        let problems = problems.into_inner();
+        assert!(
+            problems.is_empty(),
+            "パレットの絞り込みの候補の数が合わない（別名は候補を増やさず、当たり方だけを広げる。#2340）:\n  {}",
+            problems.join("\n  ")
         );
     }
 
