@@ -187,7 +187,8 @@ show_log() { grep -E "$1" "$PLOG" 2>/dev/null | sed -e "s#$TMP#<TMP>#g" -e 's/^/
 stop_and_fill_a() {
   local i
   kill -STOP "$A_PID"
-  probe fill "$SOCK" 300 > "$ARM_DIR/fill.txt" &
+  # 関数（probe）を `&` で背景にすると $! は副シェルの pid になり、kill が perl へ届かない
+  perl "$TMP/probe.pl" fill "$SOCK" 300 > "$ARM_DIR/fill.txt" &
   FILL=$!
   SIDE_PIDS="$SIDE_PIDS $FILL"
   for i in $(seq 1 100); do
