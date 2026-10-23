@@ -524,6 +524,165 @@ pub fn watch() -> Option<IpcWatch> {
     WATCH.lock().ok().and_then(|s| s.clone())
 }
 
+// ---------------------------------------------------------------------------
+// ソケットのパスの先客の判定（#2360）
+//
+// 直した症状: 起動時の生存確認が `connect` 1 回だけで、繋がらなければ `bind` がパスを
+// unlink して張り直していた。生きた GUI の受け口が一時的に満杯（backlog あふれ = macOS の
+// unix ソケットは ECONNREFUSED を返す。#2002 の段 1 の注入 a1 で 300 本中 27 本）の瞬間に、
+// 同じ data dir の 2 つ目の tako-app が多重起動のガード（#113 の control.json の pid）を
+// すり抜けて起動すると（control.json が無い・壊れている）、生きた受け口を「死んだ残骸」と
+// 読んで奪った。奪われた側は生きたままパスから切り離され、そのペインのシェル
+// （TAKO_SOCKET = 固定パス）の CLI / MCP は 2 つ目へ届く（#2002 の「同じパスへ別の受け口が
+// 作り直した」の候補の 1 つ）。
+//
+// いまは「繋がらない」を残骸と読む前に、接続情報（control.json と instances/）に
+// そのパスの持ち主として載った生きた tako-app が居ないかを見て、居なければ間を置いて
+// 繋ぎ直す。判定は [`judge_occupant`] の 1 実装（IO は tako-control::ipc が持つ）で、
+// 起動時の置き場の決定・明示パスの受け口（#1994）・#2002 の見張りが同じものを呼ぶ。
+// ---------------------------------------------------------------------------
+
+/// 繋がらなかったときに繋ぎ直す間（ミリ秒・合計 350 ms）。満杯の受け口は accept スレッドが
+/// 追いつけば数 ms で空くので、一斉接続の山（#2002 の a1）はこの間に引く。
+/// 残骸のときだけ起動がこの分遅れる（落ちた後の初回起動だけ）
+pub const LIVENESS_RETRY_DELAYS_MS: [u64; 3] = [50, 100, 200];
+
+/// #2360 の A/B。`TAKO_2360_LEGACY=1` で修正前の生存確認（connect 1 回だけ・持ち主を見ない・
+/// 繋ぎ直さない・生きた先客が居てもセカンダリにしない）へ戻す
+pub fn legacy_2360() -> bool {
+    std::env::var("TAKO_2360_LEGACY").is_ok_and(|v| !v.is_empty())
+}
+
+/// ソケットのパスの先客（#2360）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Occupant {
+    /// ファイルが無い（そのまま張る）
+    Vacant,
+    /// 繋がった = 生きた受け口（奪わない）
+    Live,
+    /// 繋がらないが、接続情報にこのパスの持ち主として載った生きた tako-app が居る
+    /// （受け口が一時的に満杯・詰まっている）= 奪わない
+    Busy { pid: u32 },
+    /// 繋ぎ直しても繋がらず、生きた持ち主の記録も無い = 残骸（消して張る）
+    Dead,
+}
+
+impl Occupant {
+    /// 生きた受け口が握っているか（奪わない側）
+    pub fn holds(self) -> bool {
+        matches!(self, Occupant::Live | Occupant::Busy { .. })
+    }
+
+    /// 機械キー（`check_health` の `ipc.fixed_path.state`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Occupant::Vacant => "vacant",
+            Occupant::Live => "live",
+            Occupant::Busy { .. } => "busy",
+            Occupant::Dead => "dead",
+        }
+    }
+
+    /// 持ち主の pid（`Busy` だけ）
+    pub fn pid(self) -> Option<u32> {
+        match self {
+            Occupant::Busy { pid } => Some(pid),
+            _ => None,
+        }
+    }
+
+    /// 人が読む理由（persist.log・check-health）
+    pub fn reason(self) -> String {
+        match self {
+            Occupant::Vacant => "ソケットファイルが無い".into(),
+            Occupant::Live => "繋がった（生きた受け口が居る）".into(),
+            Occupant::Busy { pid } => format!(
+                "繋がらないが、接続情報の持ち主（pid {pid}）が生きている（受け口が一時的に満杯か詰まっている）"
+            ),
+            Occupant::Dead => format!(
+                "{} 回繋いでも繋がらず、生きた持ち主の記録も無い（残骸）",
+                LIVENESS_RETRY_DELAYS_MS.len() + 1
+            ),
+        }
+    }
+
+    /// 起動時の判定の 1 行（persist.log。**パスは載せない** = 種別だけ）。`Vacant` は書かない
+    pub fn startup_log_line(self, kind: SocketPathKind) -> Option<String> {
+        match self {
+            Occupant::Vacant => None,
+            Occupant::Live | Occupant::Busy { .. } => Some(format!(
+                "IPC の固定パスに生きた受け口が居るので奪わずに一時パスで立てる（#2360）: {}・kind={}",
+                self.reason(),
+                kind.as_str(),
+            )),
+            Occupant::Dead => Some(format!(
+                "IPC の固定パスの残骸を消して張り直す（#2360）: {}・kind={}",
+                self.reason(),
+                kind.as_str(),
+            )),
+        }
+    }
+}
+
+/// パスの先客を判定する（**判定の 1 実装**。IO は呼び出し側）。
+///
+/// - `exists`: パスにファイルがあるか
+/// - `connect`: 1 本繋いで受け口が受けたか（呼ぶたびに 1 回繋ぐ）
+/// - `live_owner`: 接続情報にこのパスの持ち主として載った、自分以外の生きた tako-app の pid
+/// - `wait`: 繋ぎ直す前の間（テストは時計を進めない）
+/// - `legacy`: A/B（[`legacy_2360`]）。修正前の connect 1 回だけの判定
+pub fn judge_occupant(
+    exists: bool,
+    mut connect: impl FnMut() -> bool,
+    live_owner: impl FnOnce() -> Option<u32>,
+    mut wait: impl FnMut(std::time::Duration),
+    legacy: bool,
+) -> Occupant {
+    if !exists {
+        return Occupant::Vacant;
+    }
+    if connect() {
+        return Occupant::Live;
+    }
+    if legacy {
+        return Occupant::Dead;
+    }
+    // 生きた持ち主が載っていれば、受け口は満杯か詰まっているだけ（繋ぎ直しで待たない）
+    if let Some(pid) = live_owner() {
+        return Occupant::Busy { pid };
+    }
+    // 記録の無い受け口（接続情報が消えた・別の置き場）でも、一時的な満杯ならこの間に空く
+    for ms in LIVENESS_RETRY_DELAYS_MS {
+        wait(std::time::Duration::from_millis(ms));
+        if connect() {
+            return Occupant::Live;
+        }
+    }
+    Occupant::Dead
+}
+
+/// 起動時に固定パス（置き場の決め方が選んだパス）で見た先客（#2360。`Vacant` は置かない）
+static FIXED_PATH: std::sync::Mutex<Option<Occupant>> = std::sync::Mutex::new(None);
+
+/// 起動時の判定を置く。**[`status`] の受け口と同じ endpoint のときだけ**置く
+/// （後発ウィンドウ・順番待ちの受け口で本体の記録を上書きしない = [`record_watch`] と同じ）
+pub fn record_fixed_path(endpoint: &str, occupant: Occupant) {
+    let recorded = status()
+        .and_then(|s| s.endpoint)
+        .is_some_and(|e| e == endpoint);
+    if !recorded || occupant == Occupant::Vacant {
+        return;
+    }
+    if let Ok(mut slot) = FIXED_PATH.lock() {
+        *slot = Some(occupant);
+    }
+}
+
+/// 起動時に固定パスで見た先客（確かめていない・ファイルが無かったなら `None`）
+pub fn fixed_path() -> Option<Occupant> {
+    FIXED_PATH.lock().ok().and_then(|s| *s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,8 +796,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 記録（[`STATUS`] / [`FIXED_PATH`]）はプロセスで 1 つなので、触るテストを直列にする
+    static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn 記録は最初の成功を保つ() {
+        let _guard = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_status_for_test();
         let failed = IpcStatus {
             endpoint: None,
@@ -727,5 +890,153 @@ mod tests {
         assert!(watch.healthy());
         watch.last = Some(ListenerCheck::ForeignLive);
         assert!(!watch.healthy(), "奪われたまま = 正常ではない");
+    }
+
+    /// [`judge_occupant`] を台本どおりに動かす（繋いだ結果を順に返し、回数と待った合計を数える）
+    struct Script {
+        answers: Vec<bool>,
+        connects: usize,
+        owner_asked: bool,
+        waited_ms: u64,
+    }
+
+    fn judge(answers: &[bool], owner: Option<u32>, legacy: bool) -> (Occupant, Script) {
+        let script = std::cell::RefCell::new(Script {
+            answers: answers.to_vec(),
+            connects: 0,
+            owner_asked: false,
+            waited_ms: 0,
+        });
+        let occupant = judge_occupant(
+            true,
+            || {
+                let mut s = script.borrow_mut();
+                let i = s.connects;
+                s.connects += 1;
+                s.answers.get(i).copied().unwrap_or(false)
+            },
+            || {
+                script.borrow_mut().owner_asked = true;
+                owner
+            },
+            |d| script.borrow_mut().waited_ms += d.as_millis() as u64,
+            legacy,
+        );
+        (occupant, script.into_inner())
+    }
+
+    #[test]
+    fn issue2360_ファイルが無ければ繋がない() {
+        let occupant = judge_occupant(
+            false,
+            || panic!("無いパスへは繋がない"),
+            || panic!("持ち主も見ない"),
+            |_| panic!("待たない"),
+            false,
+        );
+        assert_eq!(occupant, Occupant::Vacant);
+        assert!(!occupant.holds());
+        assert_eq!(occupant.startup_log_line(SocketPathKind::WellKnown), None);
+    }
+
+    #[test]
+    fn issue2360_繋がれば生きた受け口() {
+        let (occupant, s) = judge(&[true], None, false);
+        assert_eq!(occupant, Occupant::Live);
+        assert!(occupant.holds());
+        assert_eq!((s.connects, s.owner_asked, s.waited_ms), (1, false, 0));
+    }
+
+    #[test]
+    fn issue2360_一時的に繋がらなくても生きた持ち主が居れば奪わない() {
+        // 修正前はここで残骸と読んで奪っていた（#2360 の症状）
+        let (occupant, s) = judge(&[false], Some(4242), false);
+        assert_eq!(occupant, Occupant::Busy { pid: 4242 });
+        assert!(occupant.holds(), "満杯の生きた受け口を奪わない");
+        assert_eq!(occupant.pid(), Some(4242));
+        assert_eq!(
+            (s.connects, s.waited_ms),
+            (1, 0),
+            "持ち主が生きていれば繋ぎ直しで待たない"
+        );
+        let line = occupant
+            .startup_log_line(SocketPathKind::WellKnown)
+            .unwrap();
+        assert!(
+            line.contains("奪わず") && line.contains("pid 4242"),
+            "{line}"
+        );
+        assert!(!line.contains('/'), "パスを載せている: {line}");
+    }
+
+    #[test]
+    fn issue2360_記録の無い受け口も繋ぎ直しの間に空けば生きている() {
+        // 1 回目は満杯で refused、2 回目（50 ms 後）に繋がる = 一斉接続の山が引いた
+        let (occupant, s) = judge(&[false, true], None, false);
+        assert_eq!(occupant, Occupant::Live);
+        assert!(s.owner_asked, "繋ぎ直す前に持ち主を見る");
+        assert_eq!((s.connects, s.waited_ms), (2, LIVENESS_RETRY_DELAYS_MS[0]));
+        // 最後の 1 回で繋がっても生きている
+        let n = LIVENESS_RETRY_DELAYS_MS.len();
+        let mut answers = vec![false; n];
+        answers.push(true);
+        let (occupant, s) = judge(&answers, None, false);
+        assert_eq!(occupant, Occupant::Live);
+        assert_eq!(s.connects, n + 1);
+    }
+
+    #[test]
+    fn issue2360_繋ぎ直しても繋がらず持ち主も居なければ残骸() {
+        let (occupant, s) = judge(&[], None, false);
+        assert_eq!(occupant, Occupant::Dead);
+        assert!(!occupant.holds());
+        assert_eq!(s.connects, LIVENESS_RETRY_DELAYS_MS.len() + 1);
+        assert_eq!(s.waited_ms, LIVENESS_RETRY_DELAYS_MS.iter().sum::<u64>());
+        assert_eq!(s.waited_ms, 350, "残骸のときに起動が遅れる上限");
+        let line = occupant
+            .startup_log_line(SocketPathKind::WellKnown)
+            .unwrap();
+        assert!(
+            line.contains("残骸") && line.contains("4 回繋いでも"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn issue2360_旧挙動はconnect1回で残骸と読む() {
+        // A/B（TAKO_2360_LEGACY=1）: 持ち主を見ず、繋ぎ直さない = 修正前の判定
+        let (occupant, s) = judge(&[false, true], Some(4242), true);
+        assert_eq!(occupant, Occupant::Dead);
+        assert_eq!((s.connects, s.owner_asked, s.waited_ms), (1, false, 0));
+        let (occupant, _) = judge(&[true], None, true);
+        assert_eq!(occupant, Occupant::Live, "繋がれば旧挙動でも奪わない");
+    }
+
+    #[test]
+    fn issue2360_起動時の判定は本体の受け口の分だけ置く() {
+        let _guard = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_status_for_test();
+        if let Ok(mut slot) = FIXED_PATH.lock() {
+            *slot = None;
+        }
+        record(IpcStatus {
+            endpoint: Some("/tmp/tako-2360.sock".into()),
+            kind: SocketPathKind::Temp,
+            bound: true,
+            path_bytes: 19,
+            limit: MAC,
+            well_known_bytes: 0,
+            error: None,
+        });
+        record_fixed_path("/tmp/other.sock", Occupant::Live);
+        assert_eq!(fixed_path(), None, "別の受け口の判定で上書きしない");
+        record_fixed_path("/tmp/tako-2360.sock", Occupant::Vacant);
+        assert_eq!(fixed_path(), None, "ファイルが無かったことは置かない");
+        record_fixed_path("/tmp/tako-2360.sock", Occupant::Busy { pid: 7 });
+        assert_eq!(fixed_path(), Some(Occupant::Busy { pid: 7 }));
+        reset_status_for_test();
+        if let Ok(mut slot) = FIXED_PATH.lock() {
+            *slot = None;
+        }
     }
 }

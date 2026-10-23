@@ -445,9 +445,26 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      なのは 1 の性質を短縮パスでも保つため。`$TMPDIR` 自体が深い機のために `/tmp` も候補
   3. **symlink では解決しない**（`sun_path` の上限は繋ぐ側が `connect()` へ渡すパスに
      掛かるので、長いパスの symlink を置いてもクライアントが同じ上限で弾かれる）
-  4. 生きた先客が居るパスは奪わない（`exists() && connect().is_ok()` なら pid 入り
-     一時パスへ逃げる）。短縮パスは data dir ごとに安定 = 取り合いが起きうるので、
-     固定パスと同じ判定を掛ける
+  4. 生きた先客が居るパスは奪わない（先客が居れば pid 入り一時パスへ逃げる）。短縮パスは
+     data dir ごとに安定 = 取り合いが起きうるので、固定パスと同じ判定を掛ける。
+     **「繋がらない」を残骸と読む前に確かめる**（#2360 / FR-2.2.15）: 判定は
+     `ipc_socket::judge_occupant` の 1 実装で、1 本繋いで受ければ生きている（`live`）。
+     繋がらなければ接続情報（control.json と instances/）にそのパスの持ち主として載った
+     自分以外の生きた tako-app（`discovery::live_owner_of`。pid の再利用はプロセス名で外す）を
+     探し、居れば満杯か詰まっているだけ（`busy`）。居なければ 50 / 100 / 200 ms の間を置いて
+     繋ぎ直し、最後まで繋がらなければ残骸（`dead`）として消して張る（落ちた後の初回起動だけ
+     最大 350 ms 遅れる）。修正前は connect 1 回だけで、生きた GUI の受け口が満杯
+     （backlog あふれ = macOS は ECONNREFUSED）の瞬間に control.json の無い 2 つ目の
+     tako-app が起動すると、生きた受け口を unlink して奪った（#2002 の「同じパスを別の受け口が
+     作り直した」の候補）。同じ判定を明示パスの受け口（#1994）と 6 の見張りの「別の実体の
+     生死」も通る（番犬 `issue2360_socket_liveness_watchdog` が判定の外の connect を名指す）。
+     奪わずに一時パスへ逃げたら、tako-app はそれを**多重起動の第三のガード**として読み、
+     セカンダリで起動する（#113 の control.json の pid・#177 の tmux クライアントが盲目でも、
+     固定パスを握る生きた受け口は同じ data dir の別の tako）。判定は persist.log に
+     `[pid N]` つきで 1 行、`check_health` の `ipc.fixed_path`（`state` = live / busy / dead・
+     `pid`・`reason_text`）へ。A/B は `TAKO_2360_LEGACY=1`（connect 1 回・第三のガード無し）。
+     **残る穴**: 接続情報に載っていない受け口（記録ごと消えた・別の置き場）が 350 ms を超えて
+     accept しない（止まっている）ときは残骸と読む
   5. bind の成否は `ipc_socket::record` で 1 回記録し、`check_health` の `ipc` 節と
      GUI の通知欄（`notify_ipc_unavailable`）が読む。**立たなかったら黙らない**
      （旧実装は `eprintln!` 1 行だけで GUI を普通に立て、CLI / MCP から一切操作できない

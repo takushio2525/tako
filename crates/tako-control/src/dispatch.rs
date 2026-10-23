@@ -19296,6 +19296,19 @@ fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus) -> Value {
         "error": status.error,
         // #2002: 受け口の見張り（null = 見張っていない = windows / A/B）
         "watch": tako_core::ipc_socket::watch().as_ref().map(|w| ipc_watch_describe(w, unix_ms_now())),
+        // #2360: 起動時に固定パスで見た先客（null = 確かめていない・ファイルが無かった）
+        "fixed_path": tako_core::ipc_socket::fixed_path().map(ipc_fixed_path_describe),
+    })
+}
+
+/// `ipc.fixed_path` 節（#2360）。`state` は `live` / `busy`（奪わずに一時パスで立てた）か
+/// `dead`（残骸を消して固定パスで立てた）、`pid` は `busy` の持ち主
+fn ipc_fixed_path_describe(occupant: tako_core::ipc_socket::Occupant) -> Value {
+    json!({
+        "state": occupant.as_str(),
+        "held": occupant.holds(),
+        "pid": occupant.pid(),
+        "reason_text": occupant.reason(),
     })
 }
 

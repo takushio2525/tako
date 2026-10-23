@@ -109,6 +109,40 @@ pub fn live_primary_pid() -> Option<u32> {
         .then_some(info.pid)
 }
 
+/// このソケットのパスの持ち主として接続情報（control.json と instances/）に載った、
+/// 自分以外の生きた tako-app の pid（#2360）。
+///
+/// 起動時の生存確認と #2002 の見張りが「繋がらない = 残骸」と読む前に引く。
+/// **control.json だけでは足りない**: control.json は最後に起動したプライマリが上書きするので、
+/// 消えた・壊れた・別のインスタンスに上書きされたときも instances/ に元の持ち主が残っている。
+/// 生死は [`live_primary_pid`] と同じ「生きた tako-app か」（pid の再利用はプロセス名で外す）
+pub fn live_owner_of(socket: &str) -> Option<u32> {
+    let mut infos: Vec<ControlInfo> = read().into_iter().collect();
+    if let Some(dir) = instances_dir() {
+        infos.extend(list_instances(&dir));
+    }
+    owner_among(
+        &infos,
+        socket,
+        std::process::id(),
+        tako_core::ports::is_live_tako_app,
+    )
+}
+
+/// [`live_owner_of`] の判定（IO 抜き）。同じソケットを指す記録のうち、自分以外で `alive` な最初の pid
+fn owner_among(
+    infos: &[ControlInfo],
+    socket: &str,
+    me: u32,
+    alive: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    infos
+        .iter()
+        .filter(|info| info.socket == socket && info.pid != me)
+        .map(|info| info.pid)
+        .find(|&pid| alive(pid))
+}
+
 /// 明示終了時のクリーンアップ（アプリの Quit 経路から呼ぶ）。
 /// 自分のインスタンスファイルを消し、current が自分を指していたらそれも消す
 /// （死んだ接続先を新規 CLI に掴ませない）。クラッシュ時は呼ばれないが、
@@ -286,6 +320,29 @@ mod tests {
             token: format!("token-{pid}"),
             mcp_url: None,
         }
+    }
+
+    #[test]
+    fn issue2360_持ち主は同じソケットを指す自分以外の生きたpid() {
+        let fixed = "/tmp/tk2360/d/tako.sock";
+        let alive = |pid: u32| matches!(pid, 10 | 20 | 99);
+        // control.json が別のパスを指していても、instances/ の持ち主を引く
+        let infos = vec![
+            info(20, "/tmp/tako-20-0.sock"),
+            info(30, fixed),
+            info(10, fixed),
+        ];
+        assert_eq!(owner_among(&infos, fixed, 99, alive), Some(10));
+        // 自分は持ち主に数えない（#2002 の見張りが自分の記録で奪い返しを止めない）
+        assert_eq!(owner_among(&[info(99, fixed)], fixed, 99, alive), None);
+        // 死んだ pid・再利用された pid（生きた tako-app ではない）は持ち主ではない
+        assert_eq!(owner_among(&[info(30, fixed)], fixed, 99, alive), None);
+        // 記録が無い・別のパスだけ
+        assert_eq!(owner_among(&[], fixed, 99, alive), None);
+        assert_eq!(
+            owner_among(&[info(20, "/tmp/other.sock")], fixed, 99, alive),
+            None
+        );
     }
 
     #[test]

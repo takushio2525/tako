@@ -4624,6 +4624,15 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   `TAKO_IPC_WATCH_MS=<ミリ秒>`（下限 50）を `launch_isolated_gui` に並べる。生きた別の受け口が
   パスを握っている間は奪わない（`ipc.watch.state = foreign_live`）。**本番の `tako.sock` で
   試さない**。注入の形と A/B は `scripts/test-ipc-listener-recover-2002.sh`
+- **同じ data dir で 2 つ目の GUI を立てる検証は、2 つ目がセカンダリ・一時パスになる前提で書く**（#2360）。
+  2 つ目は固定パスへ 1 本繋ぎ、繋がらなければ接続情報（control.json と instances/）にそのパスの
+  持ち主として載った生きた tako-app を探し、居なければ 50 / 100 / 200 ms の間を置いて繋ぎ直す。
+  生きた受け口（満杯で一時的に繋がらないだけのものも）が握っていれば奪わずに一時パスで立ち、
+  多重起動の第三のガードとしてセカンダリになる（persist.log に `奪わずに一時パスで立てる（#2360）`）。
+  **残骸（持ち主の pid が死んでいる）のときは起動が最大 350 ms 遅れる**。修正前の connect 1 回の判定を
+  見たい検証は 2 つ目にだけ `TAKO_2360_LEGACY=1` を並べる。生きた受け口を満杯にする注入は
+  「A を SIGSTOP → perl で backlog（macOS は 128 本）を埋めて握る」（負荷は作らない）。
+  形は `scripts/test-ipc-liveness-2360.sh`
 - **fd の上限を測る検証は GUI にだけ `ulimit` を掛けて起こす**（#2359）。worker のシェルは
   claude が上げた soft（1048576）を持っているので、そのまま隔離 GUI を起こすと引き上げも枯渇も
   起きない（`startup.outcome = already_enough`）。Finder 起動を模すなら soft 256、枯渇は soft 160 +

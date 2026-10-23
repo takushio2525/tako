@@ -129,6 +129,8 @@ pub struct IpcServer {
     #[cfg(unix)]
     #[cfg_attr(not(test), allow(dead_code))]
     watch: std::sync::Arc<std::sync::Mutex<tako_core::ipc_socket::IpcWatch>>,
+    /// 起動時に固定パスを生きた受け口が握っていたので一時パスで立てたなら、その先客（#2360）
+    fixed_path_holder: Option<tako_core::ipc_socket::Occupant>,
 }
 
 impl IpcServer {
@@ -179,6 +181,20 @@ impl IpcServer {
     /// IPC エンドポイント（unix: ソケットパス、windows: パイプ名）
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// 起動時に固定パス（`<data_dir>/tako.sock` か短縮パス）を生きた受け口が握っていたので
+    /// 奪わずに一時パスで立てたなら、その先客（#2360。`Live` / `Busy`）。
+    ///
+    /// 固定パスは data dir ごとに決まるので、先客は**同じ data dir の生きた tako**。GUI は
+    /// これを多重起動の第三のガード（#113 の control.json の pid・#177 の tmux クライアントが
+    /// 盲目なときの最後の手がかり）として読み、セカンダリで起動する。A/B
+    /// （`TAKO_2360_LEGACY=1`）・セカンダリ・テスト・Windows では常に `None`
+    pub fn fixed_path_holder(&self) -> Option<tako_core::ipc_socket::Occupant> {
+        if tako_core::ipc_socket::legacy_2360() {
+            return None;
+        }
+        self.fixed_path_holder
     }
 
     /// 見張りの記録の写し（#2002 のテスト用）
@@ -517,6 +533,8 @@ mod windows_imp {
             endpoint: name,
             pointer: None,
             accept,
+            // 名前付きパイプは先客を OS が弾く（`first_pipe_instance`）= 生存確認を持たない
+            fixed_path_holder: None,
         })
     }
 }
@@ -531,8 +549,8 @@ mod unix_imp {
 
     use futures::channel::mpsc::UnboundedSender;
     use tako_core::ipc_socket::{
-        IpcStatus, IpcWatch, ListenerCheck, PathObservation, Rebind, SocketFileId, SocketPathKind,
-        SocketPlan,
+        IpcStatus, IpcWatch, ListenerCheck, Occupant, PathObservation, Rebind, SocketFileId,
+        SocketPathKind, SocketPlan,
     };
 
     use super::{accept_stop_pair, conn, IncomingRequest, IpcServer};
@@ -556,23 +574,56 @@ mod unix_imp {
     ///   （他インスタンスと衝突回避・プライマリの固定ソケットを乗っ取らない）
     /// - 通常起動: [`tako_core::ipc_socket::plan`] の決め方（浅い data dir なら
     ///   `<data_dir>/tako.sock` のまま。深ければ短いパスへ逃がす = #1441）
-    /// - 別インスタンスが生きている: フォールバックで一時パス
+    /// - 別インスタンスが生きている: フォールバックで一時パス（先客の判定は [`occupant`]。
+    ///   一時的に繋がらないだけの生きた受け口も奪わない = #2360）
     ///
     /// **置き場の決め方をここへ書かない**（#1441）。同じ規則は繋ぐ側の診断
     /// （`tako check-health` のオフライン経路）も引くので、1 実装に保つ
-    fn preferred_socket_path(prefer_temp: bool) -> SocketPlan {
+    fn preferred_socket_path(prefer_temp: bool) -> (SocketPlan, Option<FixedProbe>) {
         if prefer_temp || cfg!(test) || std::env::var_os("TAKO_SELF_TEST").is_some() {
-            return temp_socket_path();
+            return (temp_socket_path(), None);
         }
         let Some(plan) = tako_core::ipc_socket::plan() else {
-            return temp_socket_path();
+            return (temp_socket_path(), None);
         };
         // 生きた先客が居るパスは奪わない。**短縮パスにも同じ判定を掛ける**
         // （短縮パスは data dir ごとに安定 = 別インスタンスと同じ値になりうる）
-        if plan.path.exists() && UnixStream::connect(&plan.path).is_ok() {
-            return temp_socket_path();
+        let probe = FixedProbe {
+            kind: plan.kind,
+            occupant: occupant(&plan.path),
+        };
+        if probe.occupant.holds() {
+            return (temp_socket_path(), Some(probe));
         }
-        plan
+        (plan, Some(probe))
+    }
+
+    /// 起動時に固定パスで見た先客（#2360）
+    #[derive(Clone, Copy)]
+    struct FixedProbe {
+        /// 固定パスの種別（一時パスへ逃げた後も、persist.log には見たパスの種別を書く）
+        kind: SocketPathKind,
+        occupant: Occupant,
+    }
+
+    /// パスの先客（#2360。判定は `tako_core::ipc_socket::judge_occupant` の 1 実装）。
+    ///
+    /// **奪うかどうかを決める生存確認の connect はここだけ**（起動時の置き場・明示パス・
+    /// #2002 の見張りが呼ぶ。connect 1 回で「繋がらない = 残骸」と読む形を他所へ戻さない =
+    /// 番犬 `issue2360_socket_liveness_watchdog` が file:line で名指す）
+    fn occupant(path: &Path) -> Occupant {
+        occupant_with(path, tako_core::ipc_socket::legacy_2360())
+    }
+
+    /// [`occupant`] の本体（A/B を引数で受ける = env を共有する並列のテストからも旧判定を測れる）
+    pub(super) fn occupant_with(path: &Path, legacy: bool) -> Occupant {
+        tako_core::ipc_socket::judge_occupant(
+            path.exists(),
+            || UnixStream::connect(path).is_ok(),
+            || crate::discovery::live_owner_of(&path.display().to_string()),
+            std::thread::sleep,
+            legacy,
+        )
     }
 
     pub(super) fn start(
@@ -580,12 +631,13 @@ mod unix_imp {
         token: String,
         prefer_temp_socket: bool,
     ) -> std::io::Result<IpcServer> {
-        let plan = preferred_socket_path(prefer_temp_socket);
+        let (plan, probe) = preferred_socket_path(prefer_temp_socket);
         match bind(&plan) {
             Ok(listener) => {
+                let endpoint = plan.path.display().to_string();
                 // #1441: 立った受け口を記録する（`check_health` / 通知欄が読む）
                 tako_core::ipc_socket::record(IpcStatus {
-                    endpoint: Some(plan.path.display().to_string()),
+                    endpoint: Some(endpoint.clone()),
                     kind: plan.kind,
                     bound: true,
                     path_bytes: plan.path_bytes(),
@@ -593,6 +645,16 @@ mod unix_imp {
                     well_known_bytes: plan.well_known_bytes,
                     error: None,
                 });
+                // #2360: 固定パスで見た先客を記録（`check_health` の `ipc.fixed_path`）と
+                // persist.log へ（奪わなかった・残骸を作り直したの両方。**パスは載せない**）。
+                // 同じ data dir を 2 つの tako が使うので、どちらが書いたかを pid で残す。
+                // A/B（修正前の判定）は理由の文が当たらないので記録しない（修正前と同じく黙る）
+                if let Some(probe) = probe.filter(|_| !tako_core::ipc_socket::legacy_2360()) {
+                    tako_core::ipc_socket::record_fixed_path(&endpoint, probe.occupant);
+                    if let Some(line) = probe.occupant.startup_log_line(probe.kind) {
+                        crate::diag::persist_log(&format!("{line} [pid {}]", std::process::id()));
+                    }
+                }
                 // data dir 側には実体への参照だけ残す（診断の手がかり）。
                 // 書けなかったら drop で消す対象にも入れない（他所が書いた物を消さない）
                 let pointer = match tako_core::ipc_socket::write_pointer(&plan) {
@@ -601,7 +663,9 @@ mod unix_imp {
                 };
                 // #2002: 本体の受け口だけが記録と persist.log へ出す（単体テストは出さない）
                 let watch = WatchConfig::from_env(plan.kind, !cfg!(test));
-                serve(listener, tx, token, plan.path, pointer, watch)
+                let mut server = serve(listener, tx, token, plan.path, pointer, watch)?;
+                server.fixed_path_holder = probe.map(|p| p.occupant).filter(|o| o.holds());
+                Ok(server)
             }
             Err(e) => {
                 // #1441: 立たなかった理由も記録する。**黙って縮退させない**
@@ -619,14 +683,14 @@ mod unix_imp {
         }
     }
 
-    /// 明示したパスで張る（#1994）。生きた先客が居れば奪わない
+    /// 明示したパスで張る（#1994）。生きた先客が居れば奪わない（一時的に繋がらないだけでも = #2360）
     pub(super) fn start_at(
         tx: UnboundedSender<IncomingRequest>,
         token: String,
         path: &str,
     ) -> std::io::Result<IpcServer> {
         let path = std::path::PathBuf::from(path);
-        if path.exists() && UnixStream::connect(&path).is_ok() {
+        if occupant(&path).holds() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 format!("{} には生きた受け口が居る", path.display()),
@@ -803,8 +867,10 @@ mod unix_imp {
                 }
                 return None;
             };
+            // 別の実体の生死は起動時と同じ判定（#2360: 一時的に繋がらないだけの生きた
+            // 受け口を残骸と読んで奪い返さない）
             let check = tako_core::ipc_socket::classify(ours, observe(&self.path), || {
-                UnixStream::connect(&self.path).is_ok()
+                occupant(&self.path).holds()
             });
             let (fresh, line) = self.apply(check, stopping);
             if self.config.publish {
@@ -985,6 +1051,8 @@ mod unix_imp {
             accept,
             file_id,
             watch,
+            // 起動時の先客は `start` が置く（明示パス・テストの受け口は持たない）
+            fixed_path_holder: None,
         })
     }
 }
@@ -2199,6 +2267,157 @@ mod tests {
         assert_eq!(watch.rebinds, 0, "正常な受け口を張り直した: {watch:?}");
         assert_eq!(file_id(&endpoint), before);
         assert!(watch.healthy(), "{watch:?}");
+    }
+
+    // ---- #2360: 一時的に繋がらない生きた受け口を残骸と読まない ----
+
+    /// 一時パス（テストごとに別）
+    fn issue2360_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("tk2360-{}-{name}.sock", std::process::id()))
+    }
+
+    /// accept しない受け口の backlog を埋める（次の connect は ECONNREFUSED = #2002 の a1 の形）。
+    /// 握った接続を返す（落とすと空きができる）。**macOS だけ**: Linux の unix ソケットは満杯の
+    /// backlog への connect を ECONNREFUSED で返さずに待つ
+    #[cfg(target_os = "macos")]
+    fn fill_backlog(path: &std::path::Path) -> Vec<UnixStream> {
+        let mut held = Vec::new();
+        loop {
+            match UnixStream::connect(path) {
+                Ok(stream) => held.push(stream),
+                Err(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
+                    break;
+                }
+            }
+            assert!(held.len() < 4096, "backlog が埋まらない");
+        }
+        held
+    }
+
+    /// `after` の後に 1 本ずつ受け続ける（accept スレッドが追いついた形）
+    #[cfg(target_os = "macos")]
+    fn drain_after(
+        listener: std::os::unix::net::UnixListener,
+        after: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            listener.set_nonblocking(true).unwrap();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < until {
+                if listener.accept().is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn issue2360_満杯の生きた受け口を残骸と読まない() {
+        let path = issue2360_path("full");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let held = fill_backlog(&path);
+        // 修正前の判定（connect 1 回）はここで残骸と読み、起動時の bind が unlink して奪っていた
+        assert_eq!(
+            unix_imp::occupant_with(&path, true),
+            tako_core::ipc_socket::Occupant::Dead,
+            "旧判定で満杯の受け口を残骸と読む（#2360 の症状）が再現しない"
+        );
+        let drain = drain_after(listener, std::time::Duration::from_millis(80));
+        let started = std::time::Instant::now();
+        let occupant = unix_imp::occupant_with(&path, false);
+        let took = started.elapsed();
+        assert_eq!(
+            occupant,
+            tako_core::ipc_socket::Occupant::Live,
+            "満杯で一時的に繋がらない生きた受け口を残骸と読んだ（#2360。{took:?}）"
+        );
+        assert!(
+            took >= std::time::Duration::from_millis(50),
+            "繋ぎ直さずに判定した: {took:?}"
+        );
+        drop(held);
+        drain.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn issue2360_誰も受けない残骸は繋ぎ直した後に残骸と読む() {
+        let path = issue2360_path("dead");
+        let _ = std::fs::remove_file(&path);
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let started = std::time::Instant::now();
+        let occupant = unix_imp::occupant_with(&path, false);
+        let took = started.elapsed();
+        assert_eq!(occupant, tako_core::ipc_socket::Occupant::Dead);
+        assert!(
+            took >= std::time::Duration::from_millis(350),
+            "繋ぎ直しの間を置かずに残骸と読んだ: {took:?}"
+        );
+        // 旧判定は待たない
+        let started = std::time::Instant::now();
+        assert_eq!(
+            unix_imp::occupant_with(&path, true),
+            tako_core::ipc_socket::Occupant::Dead
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            unix_imp::occupant_with(&path, false),
+            tako_core::ipc_socket::Occupant::Vacant
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn issue2360_明示パスの受け口は満杯の先客から奪わない() {
+        let path = issue2360_path("explicit");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let before = file_id(path.to_str().unwrap());
+        let held = fill_backlog(&path);
+        let drain = drain_after(listener, std::time::Duration::from_millis(80));
+        let (tx, _rx) = unbounded::<IncomingRequest>();
+        let result = IpcServer::start_at(tx, TEST_TOKEN.into(), path.to_str().unwrap());
+        let err = result
+            .err()
+            .expect("満杯の先客から明示パスを奪った（#2360）");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        assert_eq!(
+            file_id(path.to_str().unwrap()),
+            before,
+            "先客のファイルを触った"
+        );
+        drop(held);
+        drain.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn issue2360_見張りは満杯の生きた別の受け口から奪い返さない() {
+        let server = watched_server(Some(WATCH_EVERY));
+        let endpoint = server.endpoint().to_string();
+        std::fs::remove_file(&endpoint).unwrap();
+        let foreign = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        let foreign_id = file_id(&endpoint);
+        // 次の確認の前に満杯にし、少し後に空ける（相手の accept スレッドが追いつく形）
+        let held = fill_backlog(std::path::Path::new(&endpoint));
+        let drain = drain_after(foreign, std::time::Duration::from_millis(120));
+        std::thread::sleep(WATCH_EVERY * 10);
+        let watch = server.watch_snapshot();
+        assert_eq!(
+            watch.rebinds, 0,
+            "一時的に繋がらない生きた別の受け口から奪い返した（#2360）: {watch:?}"
+        );
+        assert_eq!(file_id(&endpoint), foreign_id, "相手のファイルを触った");
+        drop(held);
+        drain.join().unwrap();
+        drop(server);
+        let _ = std::fs::remove_file(&endpoint);
     }
 }
 
