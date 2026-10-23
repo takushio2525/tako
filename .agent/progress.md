@@ -20,18 +20,6 @@
 
 ---
 
-## 2026-10-18（#1638: worker の宣言 / 実際のモデルを分けて持つ = transcript の最初の応答の model を `model_actual` に・食い違いは workers / worker_status の warnings と persist.log・ledger stats は実際のモデルで・codex / agy は matrix で degraded）
-- A/B `TAKO_1638_LEGACY=1`・実経路 17 PASS・カタログ +479 B。PR #2291
-
-## 2026-10-18（#2292: 新品の HOME の 1 回目の setup で tako mod が入らず、2 回目に入っても「変更なし」と出ていた → mod の段を `~/.claude` を作る指示ファイルの段の後ろへ移し、書いた・外した dir を最終サマリへ積む）
-- 実経路 `scripts/test-setup-mod-first-run-2292.sh` 40 PASS（修正前 10 FAIL）を CI へ・番犬 `issue2292_setup_mod_first_run_watchdog`。PR #2294
-
-## 2026-10-18（#1805: CLI の経路で走るライブラリ側の出力もパイプの切断で panic させない = 書き込み口を `tako_core::stdio` の 1 実装へ寄せ、tako-core / tako-control / tako-cli lib の根でも差し替え・規則は `tako` / `tako-mcp` の入口だけが採る（GUI は std と同じ）。`mcp serve` はクライアントが stdout を閉じたら静かに 0）
-- 修正前 gate check 101・mcp serve の gate check 101 / 切断 1 → 修正後 0。番犬 `ライブラリ側でstdの出力マクロを名指さない`・宣言順を 4 つの根へ。カタログ +0 B
-
-## 2026-10-18（#2286: Code Runner の変数展開以外の引用 3 経路 = `tako:shell` の外側・プロジェクト既定・宣言の `tako:cwd` を実行ペインの方言の 1 実装へ。番犬 `issue2286_runner_outer_quote_dialect_watchdog`）
-- 全件 1590 行の前後突き合わせで動いていた行が壊れた行 0・macOS で変わった 170 行はすべて修正前に壊れていた行・カタログ +0 B。PR #2297
-
 ## 2026-10-18（#1847: 狭いペインの ENOTFOUND の停止を status が api_error と読む = `detect_worker_error` の段 3' が `net_stop::detect` を通す・背の高い AskUserQuestion を経路 5 `numbered_above_scan` で拾い worker_status はダイアログを画面全体で判定）
 - 実物の claude 2.1.280 / 2.1.301 の 32 / 60 桁の fixture・A/B `TAKO_1847_LEGACY=1`・隔離 GUI の e2e 新旧 11 PASS・カタログ +0 B
 
@@ -79,3 +67,15 @@
 
 ## 2026-10-20（#1816: tailscale の検出の続き = `check_status` の tailscale 項目を ok / unrunnable / missing / unknown の 4 通りに・setup は依存段の検出を末尾まで使い回す・依存段は在るが動かない CLI を `[警告]` に・正本は最後にログインシェルの PATH を上限つきで引く）
 - `--version` が固まる CLI で setup 33.0 → 10.7 秒（検出 3 → 1 回）・ログインシェルにだけ在る CLI で brew 1 → 0 回。実経路 46 PASS（修正前 25 FAIL）・カタログ +0 B。PR #2323
+
+## 2026-10-23（#2331: `tako theme` の色の書き込み 3 操作（set-color / reset-color / reset-colors）が知らない `--target` を GUI のいまのモードの表へ落としていた → colors と同じ `theme_target_name` で断る・表の選び方は `apply_color_write` の 1 本）
+- 実経路 `scripts/test-theme-write-target-2331.sh` 修正前 14 PASS 35 FAIL → 修正後 49 PASS・省略と知っている名前は修正前とバイト一致・注入 3 通り・カタログ +0 B。PR #2333
+
+## 2026-10-23（#2203: usage 分析 S4 = 右パネルの usage ビュー。ステータスバーの 5h / 7d から開き、プロジェクト → Issue → 会話と掘る。読みは CLI と同じ `Request::Sessions` を `dispatch_off_ui` で・書式は `usage::display` を共有・`--issue` / `project:` / `profile:` / `none` / `--show`）
+- 実経路 `scripts/test-usage-panel-2203.sh` 22 PASS・CLI との照合 13 行一致・3 万会話で UI 占有 15 ms（A/B 旧 546 ms）・カタログ +355 B。PR #2336
+
+## 2026-10-23（#2329: リポジトリの .ps1 を 5.1 に対して (A) BOM で読める / (B) 1 行目の #Requires -Version 7.0 で止まる のどちらかへ = installer 5 本は (B)・measure-window.ps1 は (A)・tako.ps1 は例外表。番犬 `powershell51_watchdog` と checker `scripts/windows/check-powershell51.ps1`、CI の windows ジョブに 5.1 の実物の段）
+- 修正前 main は 5 本が broken（verify-assets.ps1 は CP1252 22 件 / CP932 27 件）→ 0 本・カタログ +0 B。PR #2335
+
+## 2026-10-23（#2330: 狭いペインで本文の先頭と `❯` 行が入力欄から流れ、届いた送達を gave_up にしていた → 諦める前に transcript で受領を確かめ `received`。master 同士の close は受領済みの後任・タブのそのプロファイルの最後の master を force でも断る（別タブの後任が前任を閉じる close は通す）・guide handoff に確かめ方）
+- 実経路 `scripts/test-handoff-close-2330.sh` 修正前 gave_up + 相互 close で master 0 人 → 修正後 PASS=24・注入 A/B で番犬が file:line を名指し・カタログ +193 B。PR #2334
