@@ -15202,6 +15202,18 @@ fn dispatch_orchestrator_handoff(
         tako_core::handoff::successor_prompt(&successor, previous_pane.map(PaneId::as_u64));
     host.queue_prompt_flow(new_id, handoff_prompt.clone());
 
+    // #2330: 引き継ぎの帳面に書く前任。同じタブの前任（後任へ close を指示する相手）に加え、
+    // `--tab` で別のタブへ後任を立てた呼び出し元の master も前任として書く（後任がその前任を
+    // 閉じる close を「タブの最後の master」で断って幽霊を残さないため）
+    let book_predecessor = previous_pane.or_else(|| {
+        caller.map(|(_, p)| p).filter(|p| {
+            host.workspace()
+                .pane_anywhere(*p)
+                .and_then(|pane| pane.role())
+                .is_some_and(|r| tako_core::handoff::master_profile_of_any_role(r).is_some())
+        })
+    });
+
     // タイトルと role 設定
     let window_title = format!("master-{profile_name}");
     let all_default = host.limit_resume_default();
@@ -15211,8 +15223,9 @@ fn dispatch_orchestrator_handoff(
     pane_obj.set_title(Some(window_title));
     pane_obj.set_spawned_by(Some(split_target));
     pane_obj.set_role(Some(new_role.clone()));
-    // #2330: 引き継ぎの帳面へ（後任が受け取ったら、前任からは後任を閉じない）
-    if let Some(prev) = previous_pane {
+    // #2330: 引き継ぎの帳面へ（後任が受け取ったら前任からは後任を閉じない・後任が前任を
+    // 閉じる close はタブの人数に関係なく通す）
+    if let Some(prev) = book_predecessor {
         crate::handoff_guard::note_issued(new_id.as_u64(), prev.as_u64());
     }
     // #1140: 後任 master も本人のペイン。**前任の設定ではなくプロファイル既定から
@@ -39071,6 +39084,61 @@ mod tests {
                 .map(|(_, text)| text.clone())
                 .unwrap();
             assert!(!prompt.contains("tako_close_pane"), "{prompt}");
+            // #2330: master でない呼び出し元は引き継ぎの帳面に書かない
+            assert!(crate::handoff_guard::handoff_of(new_pane).is_none());
+        });
+    }
+
+    /// #2330: `--tab` で別のタブへ後任を立てた引き継ぎも帳面に書く（前任 = 呼び出し元の master）。
+    /// 書かないと、後任が前任を閉じる close を「前任のタブの最後の master」で断り前任が幽霊になる。
+    /// master でない呼び出し元（上のテストの形）は帳面に書かない
+    #[test]
+    fn issue2330_別タブへの引き継ぎも帳面に書き後任は前任を閉じられる() {
+        let profile = "_tako_2330_tab_";
+        with_handoff_file(profile, "state", || {
+            let mut host = MockHost::new();
+            let p = host.root_pane();
+            let _plain = split(&mut host, p);
+            host.ws
+                .pane_anywhere_mut(PaneId::from_raw(p))
+                .unwrap()
+                .set_role(Some(format!("orchestrator-master:{profile}")));
+            let tab2 = dispatch(
+                &mut host,
+                Request::TabNew {
+                    title: None,
+                    focus: None,
+                    cwd: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap()["tab"]
+                .as_u64()
+                .unwrap();
+            let result = dispatch(
+                &mut host,
+                Request::OrchestratorHandoff {
+                    pane: Some(p),
+                    caller_role: Some(format!("master:{profile}")),
+                    tab: Some(tab2),
+                    caller_pid: None,
+                    projects: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("別タブへの引き継ぎは成功する");
+            let s = result["new_master_pane_id"].as_u64().unwrap();
+            assert_eq!(result["new_master_tab_id"].as_u64(), Some(tab2));
+            assert_eq!(
+                crate::handoff_guard::handoff_of(s).map(|h| h.predecessor),
+                Some(p),
+                "別タブへの引き継ぎが帳面に書かれていない"
+            );
+            issue2330_close(&mut host, p, Some(s), Some(&format!("master:{profile}"))).unwrap();
+            assert!(
+                !issue2330_alive(&host, p),
+                "後任が前任を閉じられない（幽霊が残る）"
+            );
         });
     }
 
@@ -48507,6 +48575,49 @@ mod tests {
         assert!(
             issue2330_alive(&host, b),
             "タブの最後の master が閉じられた"
+        );
+    }
+
+    /// #2330: 後任が別のタブに立った引き継ぎ（`--tab` / 後から別タブへ動かした後任）。
+    /// 前任のタブには同じプロファイルの master が残らないが、帳面の後任が前任を閉じる close は通す
+    /// （断ると前任が幽霊として残る）。帳面に無い別タブの master は従来どおり「最後の master」で断る
+    #[test]
+    fn issue2330_別タブの後任は前任を閉じられる() {
+        let mut host = MockHost::new();
+        let p = host.root_pane();
+        let _plain = split(&mut host, p);
+        let set_role = |host: &mut MockHost, pane: u64, role: &str| {
+            host.ws
+                .pane_anywhere_mut(PaneId::from_raw(pane))
+                .unwrap()
+                .set_role(Some(role.into()));
+        };
+        set_role(&mut host, p, "orchestrator-master:p1");
+        let tab2 = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: None,
+                cwd: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let s = tab2["pane"].as_u64().unwrap();
+        set_role(&mut host, s, "orchestrator-master:p1");
+        let m = split(&mut host, s);
+        set_role(&mut host, m, "orchestrator-master:p1");
+        crate::handoff_guard::note_issued(s, p);
+
+        // 帳面に無い別タブの master（同じプロファイル）: 前任のタブの最後の master なので断る
+        let err = issue2330_close(&mut host, p, Some(m), Some("master:p1")).unwrap_err();
+        assert!(err.to_string().contains("p1"), "{err}");
+        assert!(issue2330_alive(&host, p));
+        // 帳面の後任（別タブ）が前任を閉じる: 通る
+        issue2330_close(&mut host, p, Some(s), Some("master:p1")).unwrap();
+        assert!(
+            !issue2330_alive(&host, p),
+            "別タブの後任が前任を閉じられない（幽霊が残る）"
         );
     }
 

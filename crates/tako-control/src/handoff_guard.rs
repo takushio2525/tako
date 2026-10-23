@@ -99,6 +99,8 @@ pub fn check_close(
             .is_some_and(|r| tako_core::handoff::master_profile_of_any_role(r).is_some());
         alive.then_some((h.predecessor, evidence))
     });
+    // 呼び出し元が誰かの後任なら、その前任（対象が同じなら「後任が前任を閉じる」= 完了の close）
+    let caller_predecessor = caller_pane.and_then(handoff_of).map(|h| h.predecessor);
     core::decide(&CloseQuery {
         target: target.as_u64(),
         target_role,
@@ -107,5 +109,6 @@ pub fn check_close(
         caller_role,
         caller_pane_role,
         received_from,
+        caller_predecessor,
     })
 }

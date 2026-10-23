@@ -11,6 +11,8 @@
 #   close   3.     役だけ master にしたペイン 3 枚で、同じタブに 2 人目が居る close は通る / 最後の 1 人を
 #                  閉じる close は CLI・MCP とも force でも断り理由を返す / 自分で自分を閉じるのは通す /
 #                  role を名乗らない呼び出し（人の CLI）は従来どおり
+#   crosstab 3.    `--tab` で後任を別のタブに立てた実際の引き継ぎ: 帳面に無い別タブの master が前任を閉じる
+#                  close は「最後の master」で断り、後任が前任を閉じる close は通す（前任を幽霊にしない）
 #   miss    2.     注入 `TAKO_2330_INJECT_DROP_PASTE=1`（貼り付けを捨てる = 本当に届かない）では
 #                  transcript に何も入らず、送達は従来どおり gave_up（受領の証拠を作らない）
 #   legacy         同じバイナリの `TAKO_2330_LEGACY=1` では ① gave_up / ② ③ の close が通る（修正前）
@@ -18,7 +20,7 @@
 # **本物の設定 dir（~/.claude*）・本番の tako には触らない**: claude の設定 dir と HOME は一時 dir
 # （認証は写さず、偽 API とダミーの API キー）、data dir・orchestrator dir・tmux は一時 dir と専用ソケット。
 #
-# 使い方: bash scripts/test-handoff-close-2330.sh   （ONLY=deliver|handoff|close|miss|legacy[-deliver|-handoff] で 1 段だけ）
+# 使い方: bash scripts/test-handoff-close-2330.sh   （ONLY=deliver|handoff|close|crosstab|miss|legacy[-deliver|-handoff] で 1 段だけ）
 #   修正前のバイナリで測るなら TAKO_BIN=<tako> APP_BIN=<tako-app> を並べる（その木で cargo build 済みのもの）
 # **CI には登録しない**（実物の claude と仮想ディスプレイが要る）。CI 側の担保は Rust の単体
 # （tako-core::handoff_guard / prompt_delivery・dispatch の close）と番犬 issue2330_handoff_close_watchdog。
@@ -393,6 +395,40 @@ phase_close() {
   stop_app
 }
 
+# --- crosstab: 後任が別のタブに立った引き継ぎ -----------------------------------------------
+phase_crosstab() {
+  echo "== 3. --tab で別のタブへ後任を立てた引き継ぎ（後任は前任を閉じられる・帳面に無い master は断る）"
+  start_app crosstab
+  local a t2 m s out closed
+  a="$(root_pane)"
+  tk send --pane "$a" "cd '$WORK'" >/dev/null 2>&1
+  tk title --pane "$a" --role "orchestrator-master:p1" >/dev/null 2>&1
+  split_new "$a" down >/dev/null
+  out="$(tk tab new 2>/dev/null)"
+  t2="$(printf '%s' "$out" | jget '.tab')"
+  m="$(printf '%s' "$out" | jget '.pane')"
+  out="$(env TAKO_ORCHESTRATOR_ROLE=master:p1 TAKO_PANE_ID="$a" "$TAKO_BIN" orchestrator handoff --pane "$a" --tab "$t2" 2>&1)"
+  s="$(printf '%s' "$out" | jget '.new_master_pane_id')"
+  if [ -z "$s" ] || [ "$s" = "null" ]; then
+    fail "別タブへの引き継ぎを撃てない: $(printf '%s' "$out" | head -3)"
+    stop_app
+    return 1
+  fi
+  check_eq "後任は別のタブに立つ" "$t2" "$(printf '%s' "$out" | jget '.new_master_tab_id')"
+  echo "    前任 pane=${a}（タブ 1）/ 後任 pane=${s}（タブ ${t2}）"
+  # 帳面に無い別タブの master（同じプロファイル）が前任を閉じる → 前任のタブの最後の master なので断る
+  tk title --pane "$m" --role "orchestrator-master:p1" >/dev/null 2>&1
+  out="$(env TAKO_ORCHESTRATOR_ROLE=master:p1 TAKO_PANE_ID="$m" "$TAKO_BIN" close --pane "$a" --force 2>&1)"
+  if pane_alive "$a"; then closed=0; else closed=1; fi
+  check_eq "帳面に無い別タブの master が前任を閉じる close（CLI・force）は断る" "0" "$closed"
+  # 後任が手順どおり前任を閉じる（MCP・force）→ タブの人数に関係なく通る
+  out="$(mcp_call tako_close_pane "{\"pane\":$a,\"force\":true}" "$s" "master:p1")"
+  if pane_alive "$a"; then closed=0; else closed=1; fi
+  check_eq "別タブの後任が前任を閉じる close（MCP・force）は通る（前任を幽霊にしない）" "1" "$closed"
+  [ "$closed" = 1 ] || echo "    応答: $(printf '%s' "$out" | jget .text | head -1 | cut -c1-160)"
+  stop_app
+}
+
 # --- miss: 本当に届かない送信は gave_up のまま ------------------------------------------------
 phase_miss() {
   echo "== 2. 貼り付けを捨てる注入（本当に届かない）では受領の証拠が無く gave_up のまま"
@@ -417,6 +453,7 @@ phase_miss() {
 want deliver && phase_deliver
 want handoff && phase_handoff
 want close && phase_close
+want crosstab && phase_crosstab
 want miss && phase_miss
 want legacy-deliver && phase_deliver legacy
 want legacy-handoff && phase_handoff legacy

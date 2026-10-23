@@ -25,6 +25,12 @@
 //!
 //! - 呼び出し元が master でない close（人がシェルで打つ CLI・スマホ・worker・role なし）
 //! - master が自分のペインを閉じる close（自己片付け。master 同士の close ではない）
+//! - **後任が自分の前任を閉じる close**（帳面に前任 → 後任があり、呼び出し元がその後任の生きた
+//!   master のペイン）。タブの人数は見ない: 後任が別のタブに立った引き継ぎ（`--tab`・後から
+//!   別タブへ動かした後任）では前任のタブに同じプロファイルの master が残らないが、後任自身が
+//!   そのプロファイルの master として残る。断ると前任が幽霊として残る。受領は条件にしない
+//!   （前任を閉じに来たこと自体が引き継ぎ文を読んだ証拠で、受領の検知が外れた系統で幽霊を作らない）。
+//!   帳面が空（GUI の再起動後）なら従来どおり「最後の master」を見る
 //! - 対象が master でない close
 //! - 人が画面から閉じる経路（タブ / ペインの × ・⌘W）。dispatch を通らないので守りも掛からない。
 //!   人の明示の操作であり、守りが AI を止めたときの逃げ道でもあるので止めない
@@ -115,6 +121,9 @@ pub struct CloseQuery<'a> {
     pub caller_pane_role: Option<&'a str>,
     /// 対象が「受領済みの後任」なら、その前任（生きている master のペイン）と受領の証拠
     pub received_from: Option<(u64, &'a str)>,
+    /// 帳面で**呼び出し元を後任とする**引き継ぎの前任（呼び出し元が誰の後任か）。
+    /// 対象がこれと同じなら「後任が自分の前任を閉じる close」
+    pub caller_predecessor: Option<u64>,
 }
 
 /// close を断る理由
@@ -195,6 +204,15 @@ pub fn decide(q: &CloseQuery<'_>) -> Result<(), Refusal> {
     if q.caller_pane == Some(q.target) {
         return Ok(()); // 自己片付け
     }
+    // 後任が自分の前任を閉じる（引き継ぎの完了）。呼び出し元のペインが生きた master のとき
+    // だけ（閉じられた後任の名乗りで前任を閉じる 10/18 の 2 本目はここを通さない）
+    let caller_alive_master = q
+        .caller_pane_role
+        .and_then(master_profile_of_any_role)
+        .is_some();
+    if caller_alive_master && q.caller_predecessor == Some(q.target) {
+        return Ok(());
+    }
     if let Some((predecessor, evidence)) = q.received_from {
         return Err(Refusal::ReceivedSuccessor {
             pane: q.target,
@@ -233,6 +251,7 @@ mod tests {
             caller_role: Some("master:p1"),
             caller_pane_role: Some(M1),
             received_from: None,
+            caller_predecessor: None,
         }
     }
 
@@ -353,6 +372,32 @@ mod tests {
             ..query(M1, vec![Some(M1)])
         };
         assert_eq!(decide(&q), Ok(()));
+    }
+
+    /// 後任が別のタブに立った引き継ぎ（`--tab`・後から動かした後任）: 前任のタブには同じ
+    /// プロファイルの master が残らないが、後任が前任を閉じる close は通す（断ると前任が幽霊になる）
+    #[test]
+    fn 別タブの後任が自分の前任を閉じるcloseは通す() {
+        let q = CloseQuery {
+            caller_predecessor: Some(10),
+            ..query(M1, vec![None])
+        };
+        assert_eq!(decide(&q), Ok(()));
+        // 帳面に無い別タブの master（誰の後任でもない / 別の前任の後任）は従来どおり最後の master
+        for other in [None, Some(99)] {
+            let q = CloseQuery {
+                caller_predecessor: other,
+                ..query(M1, vec![None])
+            };
+            assert_eq!(decide(&q).unwrap_err().code(), "last_master", "{other:?}");
+        }
+        // 閉じられた後任（ペインが無い = role が引けない）の名乗りでは通さない（10/18 の 2 本目）
+        let q = CloseQuery {
+            caller_pane_role: None,
+            caller_predecessor: Some(10),
+            ..query(M1, vec![None])
+        };
+        assert_eq!(decide(&q).unwrap_err().code(), "last_master");
     }
 
     /// 帳面: 発行 → 受領 → 前任を閉じる（完了）/ 後任を閉じる

@@ -103,9 +103,10 @@
      the predecessor closed a successor that had received the handoff, while
      the successor closed the predecessor as instructed. tako now refuses both
      shapes even with `force` — closing a successor that has received the
-     handoff, and any master-to-master close that would leave the tab with no
-     master of this profile. If a close is refused, follow the reason in the
-     response instead of looking for a way around it.
+     handoff, and any other master-to-master close that would leave the tab
+     with no master of this profile (a successor closing its own predecessor
+     always goes through, even from another tab). If a close is refused,
+     follow the reason in the response instead of looking for a way around it.
    - **Do not wait until context is exhausted.** Hand off while you can still
      write a coherent handoff file. A late handoff produces a useless one.
 
