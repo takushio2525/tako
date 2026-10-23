@@ -37433,6 +37433,36 @@ mod self_test {
         std::env::var("TAKO_1153_INJECT").unwrap_or_default()
     }
 
+    /// **#2013 の A/B の口**: 項目 93 (c)（#694 の判定表）を旧の固定 4 秒窓へ戻す。
+    ///
+    /// 旧の腕は「旧の形」（固定回数のループ）ではなく**旧の予算の値**で表す
+    /// （#1375 の `cli_state_budget` と同じ = 待ち方の差だけを A/B にする）
+    fn legacy_2013() -> bool {
+        std::env::var_os("TAKO_2013_LEGACY").is_some()
+    }
+
+    /// 項目 93 (c) の旧の固定窓（40 × 100ms。#2013）
+    const DISPLAY_694C_LEGACY_WINDOW: Duration = Duration::from_millis(4000);
+
+    /// **#2013 の注入口**。観測だけを遅らせる（相手 = シェルの起動と子プロセスの tick は前へ進む）。
+    ///
+    /// - `late` = 旧の固定窓 + 2 秒まで成立を見せない（混んだ機でシェルの準備が窓の外へ
+    ///   出た状態。`TAKO_2013_LEGACY=1` と組むと旧の腕が確定で落ちる / 新の腕は待って通る）
+    /// - `never` = 成立を見せない（検出力。待ちを伸ばしても**本物の回帰は隠れない** =
+    ///   新の腕でも上限まで待って FAILED になるのが正しい）
+    fn inject_2013() -> String {
+        std::env::var("TAKO_2013_INJECT").unwrap_or_default()
+    }
+
+    /// [`inject_2013`] の値 → 成立を見せない長さ（`None` = 注入なし）
+    fn hold_2013(inject: &str) -> Option<Duration> {
+        match inject {
+            "late" => Some(DISPLAY_694C_LEGACY_WINDOW + Duration::from_secs(2)),
+            "never" => Some(Duration::MAX),
+            _ => None,
+        }
+    }
+
     /// 1 ペインの表示種別 + 理由 + 材料（#1058）。
     ///
     /// **CLI / MCP が読むのと同じ入口**（`UiStateHost::pane_displays`）を通すので、
@@ -76927,18 +76957,45 @@ mod self_test {
 
                 // (c) 判定表: 素のシェルペインは GUI モードでスターター、
                 // terminal モードでは同じペインがターミナル表示になる
-                let mut idle_starter = false;
-                for _ in 0..40 {
-                    idle_starter = window
-                        .update(cx, |app, _, _| {
-                            app.pane_display_for(base) == PaneDisplay::Starter
-                        })
-                        .unwrap_or(false);
-                    if idle_starter {
-                        break;
-                    }
-                    wait(cx, 100).await;
-                }
+                //
+                // **スターターに着くまで状態で待つ**（#2013。#1153 / #1165 と同じ型）。
+                // 旧実装は 40 × 100ms の固定 4 秒窓だった。着く条件（`is_idle_shell`）の
+                // 材料はどれも時間で解ける: シェルの起動（OSC 133 の Idle）・
+                // `busy_children`（sleep_guard の 2 秒 tick）・生成直後の猶予（#720 の
+                // Preparing）。混んだ機では窓が切れた直後の診断が `state=Idle busy=false`
+                // （= 待てば着いていた）で落ちていた（#1991 の worker の実測）
+                let c_legacy = legacy_2013();
+                let c_budget = if c_legacy {
+                    DISPLAY_694C_LEGACY_WINDOW
+                } else {
+                    state_wait_budget(Duration::from_secs(15), machine_busy())
+                };
+                let c_inject = inject_2013();
+                let c_hold = hold_2013(&c_inject);
+                let c_started = std::time::Instant::now();
+                let idle_starter = wait_for_app_state(
+                    window,
+                    cx,
+                    "694(c): 素のシェルペインがスターターになる",
+                    c_budget,
+                    move |app| {
+                        // 注入（`late` / `never`）は観測だけを遅らせる（相手は前へ進む）
+                        app.pane_display_for(base) == PaneDisplay::Starter
+                            && c_hold.is_none_or(|hold| c_started.elapsed() >= hold)
+                    },
+                )
+                .await;
+                // **判定に使った材料と、実際にどれだけ待ったかを毎回出す**（#796 / #1153）
+                let c_diag = window
+                    .update(cx, |app, _, _| pane_display_diag(app, base))
+                    .unwrap_or_default();
+                println!(
+                    "TAKO_SELF_TEST_2013: ok={idle_starter} waited={:.1}s budget={:.1}s \
+                     legacy={c_legacy} inject={c_inject:?} {c_diag} {}",
+                    c_started.elapsed().as_secs_f32(),
+                    c_budget.as_secs_f32(),
+                    env_line()
+                );
                 // 落ちたときに材料が見えるように、判定の入力をそのまま出す
                 if !idle_starter {
                     let note = window
@@ -100320,6 +100377,153 @@ mod selftest_wait_watchdog {
             concat!("wait_for_app", "_state")
         );
         assert!(fixed_window_then_growth_read(&good).is_empty());
+    }
+
+    /// **表示種別の判定（`pane_display_for`）を固定回数の窓で待っていない**（#2013）。
+    ///
+    /// 項目 93 (c)（#694 の判定表）は「素のシェルペインがスターターになる」を
+    /// `for _ in 0..40 { 読む; if 成立 { break } wait(cx, 100).await; }` = **固定 4 秒窓**で
+    /// 待っていた。成立の材料（OSC 133 の Idle・`busy_children` の 2 秒 tick・生成直後の
+    /// 猶予 #720）はどれも時間で解けるので、混んだ機では窓が切れた直後に
+    /// `state=Idle busy=false` を読んで落ちる（#1991 の worker の実測）。
+    ///
+    /// なぜ既存の番犬をすり抜けたか: `fixed_window_loop_bodies`（#1162 / #1153 / #1165）は
+    /// **`for` の直後の行が `wait`** の形だけを見る。この形は「読む → 抜ける → 待つ」の順で
+    /// 待ちがループの末尾にある。本文はインデントで閉じ括弧まで採り（#771 / #1180 と同じ）、
+    /// `wait(cx, ` と `break`（= 待ちの結果を判定に使っている印）と `pane_display_for(` を
+    /// すべて持つループを名指しする。
+    ///
+    /// 正しい形は `wait_for_app_state`（状態待ち + `state_wait_budget` の上限）。
+    /// キーは**ループの後**の最初の `check` のラベル（行番号は編集でずれる。ループの頭から
+    /// 数えると、本文の長いループでは 60 行の範囲に `check` が入らない）。
+    /// パターンは `concat!` で分割して書く（番犬自身のソース行が検査対象に入るため）
+    fn fixed_window_then_display_read(src: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let wait_call = concat!("wait(cx", ", ");
+        let display_read = concat!("pane_display", "_for(");
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if !(trimmed.starts_with("for ")
+                && trimmed.contains(" in 0..")
+                && trimmed.ends_with('{'))
+            {
+                continue;
+            }
+            let body = loop_body_by_indent(&lines, index, lines.len());
+            if !(body.contains(wait_call) && body.contains("break") && body.contains(display_read))
+            {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(index + 1)
+                .find(|(_, l)| {
+                    let t = l.trim_start();
+                    !t.is_empty() && l.len() - t.len() == indent && t.starts_with('}')
+                })
+                .map_or(index, |(at, _)| at);
+            hits.push((index + 1, first_check_label(&lines, end)));
+        }
+        hits
+    }
+
+    /// **「固定窓で表示種別の判定を待つ」の既知リスト**（#2013 で番犬を入れた時点の残り）。
+    ///
+    /// #2013 で直したのは項目 93 (c) だけで、同じ形が項目 94（#702 の alt screen）と
+    /// 項目 97（#720 の過渡期。新規ペインの準備中 → スターター / master 起動の前後）に残っている
+    /// （#2013 の範囲外）。番犬を先に入れて**新規の混入を止め**、残りはここで段階導入にする
+    /// （#1353 → #1375 の `KNOWN_FIXED_CLI_WAITS` と同じ運用）。
+    ///
+    /// リストは**減る方向にしか動かさない**（下のテストが、直したのに残っているエントリを落とす）。
+    /// 新しく混入した形はここへ足さずに `wait_for_app_state` へ移すこと。キーは `check` のラベル
+    const KNOWN_FIXED_DISPLAY_WAITS: &[&str] = &[
+        "alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)",
+        "新規ペインは準備中 → スターターで、生ターミナルを一度も見せない (#720)",
+        "master 起動の過渡期は生ターミナルを見せない (#720)",
+    ];
+
+    #[test]
+    fn 表示種別の判定を固定窓で待っていない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_window_then_display_read(src);
+        let unknown: Vec<String> = hits
+            .iter()
+            .filter(|(_, label)| !KNOWN_FIXED_DISPLAY_WAITS.contains(&label.as_str()))
+            .map(|(line, label)| format!("main.rs:{line}（{label}）"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "{unknown:?} が「表示種別の判定（スターター / チャット / 準備中）を固定回数の窓で\
+             待つ」形で書かれている。成立の材料（OSC 133 の Idle・子プロセスの 2 秒 tick・\
+             生成直後の猶予 #720）は時間で解けるので、混んだ機では窓が切れた直後に落ち、\
+             **その項目以降が 1 つも走らなくなる**（#2013 の項目 93 (c) は固定 4 秒窓で\
+             `state=Idle busy=false` を読んで落ちた）。`wait_for_app_state`（状態待ち + \
+             `state_wait_budget` の上限）を使うこと"
+        );
+        let stale: Vec<&str> = KNOWN_FIXED_DISPLAY_WAITS
+            .iter()
+            .copied()
+            .filter(|known| !hits.iter().any(|(_, label)| label == known))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_FIXED_DISPLAY_WAITS の {stale:?} はもう違反していない。\
+             既知リストは減る方向にしか動かさないので、直したらエントリを消すこと（#2013）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#2013 で直した形そのものを与える）
+    #[test]
+    fn 番犬は固定窓の表示判定を見逃さず状態待ちは許す() {
+        let read = format!(
+            "                        .update(cx, |app, _, _| app.{}base) == Starter)",
+            concat!("pane_display", "_for(")
+        );
+        let wait = format!(
+            "                    {}",
+            concat!("wait(cx", ", 100).await;")
+        );
+        // 項目 93 (c) の旧実装そのもの（読む → 抜ける → 待つ。待ちが末尾）
+        let bad = [
+            "                let mut idle_starter = false;",
+            "                for _ in 0..40 {",
+            "                    idle_starter = window",
+            read.as_str(),
+            "                        .unwrap_or(false);",
+            "                    if idle_starter {",
+            "                        break;",
+            "                    }",
+            wait.as_str(),
+            "                }",
+            "                check(idle_starter, \"判定表 (#694)\");",
+        ]
+        .join("\n");
+        assert_eq!(
+            fixed_window_then_display_read(&bad),
+            vec![(2, "判定表 (#694)".to_string())]
+        );
+        // 待ちが先頭でも同じ（#702 の形）
+        let head = bad.replace(
+            "                    idle_starter = window",
+            &format!("{wait}\n                    idle_starter = window"),
+        );
+        assert_eq!(fixed_window_then_display_read(&head).len(), 1);
+        // `break` を持たない = 待ちの結果を判定に使っていない（片付けの叩き込み等）は対象外
+        let no_break = bad.replace("                        break;\n", "");
+        assert!(fixed_window_then_display_read(&no_break).is_empty());
+        // 表示種別を読まないループは別の番犬の担当
+        let other = bad.replace(concat!("pane_display", "_for("), "focused_pane(");
+        assert!(fixed_window_then_display_read(&other).is_empty());
+        // 状態待ちへ寄せた形は許す
+        let good = format!(
+            "                let idle_starter = {}(window, cx, label, budget, |app| app.{}base) == Starter).await;\n                check(idle_starter, \"判定表 (#694)\");",
+            concat!("wait_for_app", "_state"),
+            concat!("pane_display", "_for(")
+        );
+        assert!(fixed_window_then_display_read(&good).is_empty());
     }
 
     /// **固定窓のあいだに器（tmux）・外のプロセスの往復を待っていない**（#1180）。
