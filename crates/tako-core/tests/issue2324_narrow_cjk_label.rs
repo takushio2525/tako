@@ -66,11 +66,6 @@ const KINDS: &[(&str, &str)] = &[
     ("sp2", include_str!("fixtures/issue2324-sp2.txt")),
 ];
 
-/// 選択肢として検知できないことが分かっている画面（この Issue とは別の原因）。
-/// 24 桁では確定キーの案内が 3 行に折れて最後の `cancel` が案内として読めず、カーソルが走査の窓の
-/// 外にある背の高いダイアログの経路 5（#1847）が「ダイアログの外の行がある」と判断する
-const KNOWN_UNDETECTED: &[(&str, u32)] = &[("huge", 24)];
-
 const LEGACY_ENV: &str = "TAKO_2324_LEGACY";
 const LEGACY_TEST: &str = "issue2324_legacyで形1と形2が戻る";
 
@@ -134,10 +129,9 @@ fn issue2324_全採取で60桁と一致するか申告する() {
     for (kind, text) in KINDS {
         let wide = detect_at(kind, 60);
         for (width, screen) in sections(text) {
+            // 24 桁の huge（案内が 3 行に折れる）も #2343 から検知する = 除外は無い
             let Some(narrow) = detect(&screen) else {
-                if !KNOWN_UNDETECTED.contains(&(kind, width)) {
-                    violations.push(format!("{kind}-{width}: 検知できない"));
-                }
+                violations.push(format!("{kind}-{width}: 検知できない"));
                 continue;
             };
             let numbers = |l: &ChoiceList| l.options.iter().map(|o| o.number).collect::<Vec<_>>();
@@ -168,8 +162,8 @@ fn issue2324_全採取で60桁と一致するか申告する() {
         violations.len(),
         violations.join("\n")
     );
-    // 8 種 × 24 幅（検知できない 1 画面を除く）の選択肢をすべて見た
-    assert_eq!(checked, 978, "見た選択肢の数が採取と合わない");
+    // 8 種 × 24 幅の選択肢をすべて見た（#2343 前は huge-24 の 6 択を除いた 978）
+    assert_eq!(checked, 984, "見た選択肢の数が採取と合わない");
 }
 
 #[test]
