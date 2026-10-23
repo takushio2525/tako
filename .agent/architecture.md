@@ -499,10 +499,26 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      起動時の値になる = ユーザーのシェルの `ulimit -n` は修正前と同じ）。std の `Command`
      （posix_spawn）で起こす裏方は引き上げた値を受け継ぐ。使用数は
      `proc_pidinfo(PROC_PIDLISTFDS)`（fd を開かずに数える = 枯渇の直前でも読める）で、
-     `check_health` の `fd_limit` 節と 80% 以上の warning が読む。**残る天井**: 器の tmux
-     サーバー自身も起動時の soft（Finder 起動なら 256）で動き、1 ペインで fd 3 本
-     （+ 基礎 6 本）なので約 80 ペインで詰まる（本番 28 ペインで 90 本）。
+     `check_health` の `fd_limit` 節と 80% 以上の warning が読む。
      Windows は対象外（ハンドルは 1 プロセス 2^24 本まで）
+  8. **器の tmux サーバーにも引き上げた値を渡す**（#2367 / FR-2.2.16）。7 のままだと器のサーバーも
+     起動時の soft で動き、1 ペインで fd 3 本（+ 基礎 6 本）なので soft 256 では約 80 ペインで詰まる
+     （上限に届くと新しいペインは `fork failed: Too many open files`、器への問い合わせはすべて
+     `server exited unexpectedly`）。**戻す場所を 1 段ずらす**: 器の attach クライアントだけ fork の
+     子ハンドラで戻さず（`fd_limit::with_children_raised`。`TerminalSession::spawn` が引数の並びに
+     段があるときだけ構える = 段を通らないシェルへ引き上げた値が届く形を作らない）、器の中のペインの
+     子は tmux の残余引数（2 語以上 = `execvp`）に置いた GUI 自身の実行ファイル
+     （`__tako-container-exec <起動時の soft>`）を通す。段は soft を下げて fd 3 以上へ CLOEXEC を
+     立て、tmux の `spawn.c` が自分で起こすはずだった形（`$SHELL` を `-<名前>` でログイン起動 /
+     `$SHELL -c <コマンド>`。`SHELL` は tmux が子の env に置いた default-shell）を exec する。
+     採らなかった案: `zsh -f -c 'ulimit -Sn …; exec -a …'`（`SHLVL` が 1 段ずれ・`/etc/zshenv` を
+     読む）・シェル統合で戻す（統合の無いシェル・明示コマンドに効かない）・tako が先に
+     `new-session -d` でサーバーを起こす（初期寸法と `-A` の作り方が変わる）。段に CLI ではなく
+     GUI の実行ファイルを使うのは版ずれが起きないため（exec の上乗せは debug ビルドで約 11 ms・同じフレームワークをリンクした空の実行ファイルで約 3 ms）。走っている間に
+     実行ファイルが置き換わったら（置いたときの dev / inode と違う）段を使わない: 印を知らない古い版の
+     GUI は印を無視して窓を開いてしまうので、その間の器のペインは修正前の形で起こす。
+     既に走っているサーバーの上限は変わらない（`fd_limit.container.limit = predates`）
+
 - **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
   `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。
   実装時の検討事項:

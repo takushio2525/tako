@@ -19183,6 +19183,26 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     let fd_startup = tako_core::platform::fd_limit::startup_report();
     let fd_usage = tako_core::platform::fd_limit::usage();
     issues.extend(fd_limit_issues(fd_startup, fd_usage));
+    // #2367: 器の tmux サーバーの fd の使用数と上限。上限に届くと器に新しいペインを作れず、
+    // 器への問い合わせ（画面の読み取り・生死の確認）もすべて返らなくなる。macOS の tmux の器だけ
+    // （psmux は上限の仕組みが無い・器なしは null）。問い合わせは 1〜2 回（サーバーは起こさない）。
+    // テストのプロセスは隔離のソケットを明示したときだけ問い合わせる（`health_probe_socket`）
+    let fd_container_legacy = tako_core::platform::fd_limit::container_legacy();
+    let fd_container = (tako_core::platform::fd_limit::APPLICABLE
+        && tako_core::backend::choice() == tako_core::backend::Choice::Tmux)
+        .then(tako_core::tmux_backend::health_probe_socket)
+        .flatten()
+        .map(|socket| {
+            let probe = tako_core::tmux_backend::server_nofile(&socket);
+            (socket, probe)
+        });
+    if let Some((_, probe)) = &fd_container {
+        issues.extend(fd_limit_container_issues(
+            probe,
+            fd_startup,
+            fd_container_legacy,
+        ));
+    }
 
     // ペインの文字コード固定（#2092。Windows だけ記録を持つ）。諦めたペインは
     // UTF-8 のバイト列で書く子の出力が化けるので、ペインを名指しで申告する
@@ -19207,6 +19227,21 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
             .map(crate::claude_mod::health_issues)
             .unwrap_or_default(),
     );
+
+    // #2359 / #2367: fd の節（器の tmux サーバーは `container`。上限の仕組みが無い OS には置かない）
+    let mut fd_limit_section = fd_limit_describe(
+        tako_core::platform::fd_limit::APPLICABLE,
+        fd_startup,
+        fd_usage,
+    );
+    if tako_core::platform::fd_limit::APPLICABLE {
+        fd_limit_section["container"] =
+            fd_container
+                .as_ref()
+                .map_or(Value::Null, |(socket, probe)| {
+                    fd_limit_container_describe(socket, probe, fd_startup, fd_container_legacy)
+                });
+    }
 
     // ワークスペースの状態サマリ（UI スレッドで採った値）
     let tab_count = ctx.tabs;
@@ -19257,12 +19292,10 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         "ipc": ipc.as_ref().map(ipc_describe),
         // #2359: fd の使用数（`open`）と上限（`soft` / `hard`）・起動時の引き上げ（`startup`）。
         // `near_exhaustion=true` なら上限の `warn_percent` % 以上を使っている。Windows は
-        // `applicable=false`（小さい既定の上限が無い）
-        "fd_limit": fd_limit_describe(
-            tako_core::platform::fd_limit::APPLICABLE,
-            fd_startup,
-            fd_usage,
-        ),
+        // `applicable=false`（小さい既定の上限が無い）。
+        // #2367: `container` は器の tmux サーバーの使用数と上限（`state` = running / not_running /
+        // unreachable・`limit` = 上限がどう決まったか。null = tmux の器ではない）
+        "fd_limit": fd_limit_section,
         // #2092: ペインの文字コード固定（Windows）。`panes[].state` が `gave_up` のペインは
         // UTF-8 のバイト列で書く子の出力が化ける。`targets[].code_pages` はいまの値の読み直し、
         // `hold` は固定の決着まで入力を預かった記録（`release=limit` なら決着を待たずに流した）
@@ -19451,6 +19484,158 @@ fn fd_limit_issues(
         }));
     }
     out
+}
+
+/// `check_health` の `fd_limit.container` 節（#2367）。器の tmux サーバーへの問い合わせの結果から
+/// 組むだけ（GUI を立てずに検査できる形 = `fd_limit_describe` と同じ作法）
+fn fd_limit_container_describe(
+    socket: &str,
+    probe: &tako_core::tmux_backend::ServerNofile,
+    startup: Option<&tako_core::platform::fd_limit::Report>,
+    legacy: bool,
+) -> Value {
+    use tako_core::platform::fd_limit::{
+        classify_container, Report, CONTAINER_FDS_PER_PANE, WARN_PERCENT,
+    };
+    use tako_core::tmux_backend::{server_pane_capacity, ServerNofile};
+    let mut out = match probe {
+        ServerNofile::NotRunning => json!({ "state": "not_running" }),
+        ServerNofile::Running(limits) => {
+            let mut v = fd_container_limits_json(limits);
+            v["state"] = json!("running");
+            v
+        }
+        ServerNofile::Unreachable { reason, last } => {
+            // `last_known=true` なら pid と上限はこのプロセスが前に読めた値（使用数は数え直した）
+            let mut v = last
+                .as_ref()
+                .map_or_else(|| json!({}), fd_container_limits_json);
+            v["state"] = json!("unreachable");
+            v["reason"] = json!(reason);
+            v["last_known"] = json!(last.is_some());
+            v
+        }
+    };
+    let soft = match probe {
+        ServerNofile::Running(l) => l.soft,
+        ServerNofile::Unreachable { last, .. } => last.and_then(|l| l.soft),
+        ServerNofile::NotRunning => None,
+    };
+    out["backend"] = json!("tmux");
+    out["socket"] = json!(socket);
+    // raised / predates / legacy / launch_value（`classify_container`）
+    out["limit"] = json!(soft.map(|s| classify_container(s, startup, legacy).as_str()));
+    // soft の上限で持てる器のペインのおおよその数
+    out["pane_capacity"] = json!(soft.map(server_pane_capacity));
+    out["fds_per_pane"] = json!(CONTAINER_FDS_PER_PANE);
+    out["warn_percent"] = json!(WARN_PERCENT);
+    // 器のペインのシェルへ渡す soft（null = GUI 以外のホスト）
+    out["children_soft"] = json!(startup.and_then(Report::children_soft));
+    out
+}
+
+fn fd_container_limits_json(limits: &tako_core::tmux_backend::ServerLimits) -> Value {
+    let usage = fd_container_usage(limits);
+    json!({
+        "pid": limits.pid,
+        "open": limits.open,
+        "soft": limits.soft,
+        // null = 無制限（`hard_unlimited`）か読めない
+        "hard": limits.hard,
+        "hard_unlimited": limits.hard_unlimited,
+        "percent": usage.map(|u| u.percent()),
+        "remaining": usage.map(|u| u.remaining()),
+        "near_exhaustion": usage.is_some_and(|u| u.near_exhaustion()),
+    })
+}
+
+/// 器の tmux サーバーの使用数と上限（どちらかが読めなければ None）
+fn fd_container_usage(
+    limits: &tako_core::tmux_backend::ServerLimits,
+) -> Option<tako_core::platform::fd_limit::Usage> {
+    Some(tako_core::platform::fd_limit::Usage {
+        open: limits.open?,
+        soft: limits.soft?,
+        hard: limits.hard,
+    })
+}
+
+/// 器の tmux サーバーの fd の申告（#2367）: 使用が上限の `WARN_PERCENT` % 以上・問い合わせが届かない
+fn fd_limit_container_issues(
+    probe: &tako_core::tmux_backend::ServerNofile,
+    startup: Option<&tako_core::platform::fd_limit::Report>,
+    legacy: bool,
+) -> Vec<Value> {
+    use tako_core::platform::fd_limit::{
+        classify_container, ContainerLimit, CONTAINER_FDS_PER_PANE, CONTAINER_LEGACY_ENV,
+    };
+    use tako_core::tmux_backend::{server_pane_capacity, ServerNofile};
+    let issue = |message: String| {
+        json!({
+            "level": "warning",
+            "check": "fd_limit",
+            "message": message,
+        })
+    };
+    match probe {
+        ServerNofile::NotRunning => Vec::new(),
+        ServerNofile::Running(limits) => {
+            let Some(u) = fd_container_usage(limits).filter(|u| u.near_exhaustion()) else {
+                return Vec::new();
+            };
+            let mut message = format!(
+                "器の tmux サーバー（pid {}）のファイル記述子（fd）の使用が上限に近い: {} / {} 本\
+                 （{}%・残り {} 本）。上限に達すると器に新しいペインを作れず（create window failed: \
+                 fork failed: Too many open files）、器への問い合わせ（画面の読み取り・生死の確認）も\
+                 すべて返らなくなる。使っていないペインを閉じること（器の 1 ペインで約 \
+                 {CONTAINER_FDS_PER_PANE} 本）",
+                limits.pid,
+                u.open,
+                u.soft,
+                u.percent(),
+                u.remaining(),
+            );
+            match classify_container(u.soft, startup, legacy) {
+                ContainerLimit::Raised => {}
+                ContainerLimit::Predates => message.push_str(&format!(
+                    "。このサーバーは fd の上限の引き上げより前に起きたので起動時の {} のまま\
+                     （約 {} ペインで詰まる）。上がるのは次にサーバーが起きたとき（器のセッションが\
+                     すべて終わった後。tako を再起動しても器は残るので上がらない）",
+                    u.soft,
+                    server_pane_capacity(u.soft),
+                )),
+                ContainerLimit::Legacy => message.push_str(&format!(
+                    "。{CONTAINER_LEGACY_ENV} のため引き上げた値を渡していない"
+                )),
+                ContainerLimit::LaunchValue => message.push_str(&format!(
+                    "。tako 自身が起動時に上限を引き上げていない（{}）ので器も起動時の値のまま",
+                    startup.map_or("記録なし", |r| r.outcome.as_str()),
+                )),
+            }
+            message.push_str("（#2367）");
+            vec![issue(message)]
+        }
+        ServerNofile::Unreachable { reason, last } => {
+            let mut message = format!(
+                "器の tmux サーバーに問い合わせが届かない（{reason}）。fd の上限に届いたサーバーは\
+                 生きたまま、すべての問い合わせをこう返す（tmux 3.6b）"
+            );
+            if let Some(l) = last {
+                let num = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
+                message.push_str(&format!(
+                    "。前に読めたサーバー（pid {}）は soft {}・いまの使用数は {} 本",
+                    l.pid,
+                    num(l.soft),
+                    num(l.open),
+                ));
+            }
+            message.push_str(&format!(
+                "。上限に届いているなら、使っていないペインを閉じると戻る（器の 1 ペインで約 \
+                 {CONTAINER_FDS_PER_PANE} 本）（#2367）"
+            ));
+            vec![issue(message)]
+        }
+    }
 }
 
 /// `check_health` の `encoding_pin` 節（#2092）。記録（UI スレッドで採った写し）に、
@@ -53462,5 +53647,161 @@ mod issue2359_tests {
         assert!(message.contains("launchctl limit maxfiles"), "{message}");
         // 使用数を読めない・記録が無い（GUI 以外のホスト）なら申告しない
         assert!(fd_limit_issues(None, None).is_empty());
+    }
+}
+
+/// #2367: `check_health` の `fd_limit.container`（器の tmux サーバー）と、枯渇が近い・届かないときの申告
+#[cfg(test)]
+mod issue2367_tests {
+    use super::*;
+    use tako_core::platform::fd_limit::{raise_with, Report, OPEN_MAX};
+    use tako_core::tmux_backend::{ServerLimits, ServerNofile};
+
+    fn raised() -> Report {
+        let soft = std::cell::Cell::new(256);
+        raise_with(
+            false,
+            || Ok((soft.get(), None)),
+            |v| {
+                soft.set(v);
+                Ok(())
+            },
+            Some(138_240),
+        )
+    }
+
+    fn running(open: u64, soft: u64) -> ServerNofile {
+        ServerNofile::Running(ServerLimits {
+            pid: 4242,
+            soft: Some(soft),
+            hard: None,
+            hard_unlimited: true,
+            open: Some(open),
+        })
+    }
+
+    #[test]
+    fn 節は器のサーバーの使用数と上限と決まり方を出す() {
+        let report = raised();
+        let c = fd_limit_container_describe("tako", &running(90, OPEN_MAX), Some(&report), false);
+        assert_eq!(c["state"], "running");
+        assert_eq!(c["backend"], "tmux");
+        assert_eq!(c["socket"], "tako");
+        assert_eq!(c["pid"], 4242);
+        assert_eq!(c["open"], 90);
+        assert_eq!(c["soft"], OPEN_MAX);
+        assert_eq!(c["hard"], Value::Null);
+        assert_eq!(c["hard_unlimited"], true);
+        assert_eq!(c["percent"], 0);
+        assert_eq!(c["remaining"], OPEN_MAX - 90);
+        assert_eq!(c["near_exhaustion"], false);
+        assert_eq!(c["limit"], "raised");
+        assert_eq!(c["children_soft"], 256, "器のペインのシェルへ渡す値");
+        assert_eq!(c["pane_capacity"], 3411);
+        assert_eq!(c["fds_per_pane"], 3);
+        assert_eq!(c["warn_percent"], 80);
+        assert!(fd_limit_container_issues(&running(90, OPEN_MAX), Some(&report), false).is_empty());
+        let off =
+            fd_limit_container_describe("tako", &ServerNofile::NotRunning, Some(&report), false);
+        assert_eq!(off["state"], "not_running");
+        assert_eq!(off["limit"], Value::Null);
+        assert!(
+            fd_limit_container_issues(&ServerNofile::NotRunning, Some(&report), false).is_empty()
+        );
+    }
+
+    #[test]
+    fn 器のサーバーの枯渇が近いと決まり方ごとの次の一手つきで申告する() {
+        let report = raised();
+        // 引き上げより前に起きたサーバー（soft 256）で 210 本（82%）
+        let issues = fd_limit_container_issues(&running(210, 256), Some(&report), false);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0]["level"], "warning");
+        assert_eq!(issues[0]["check"], "fd_limit");
+        let message = issues[0]["message"].as_str().unwrap();
+        for want in [
+            "器の tmux サーバー（pid 4242）のファイル記述子（fd）の使用が上限に近い: 210 / 256 本（82%・残り 46 本）",
+            "create window failed: fork failed: Too many open files",
+            "器への問い合わせ（画面の読み取り・生死の確認）もすべて返らなくなる",
+            "使っていないペインを閉じること（器の 1 ペインで約 3 本）",
+            "引き上げより前に起きたので起動時の 256 のまま（約 83 ペインで詰まる）",
+            "tako を再起動しても器は残るので上がらない",
+            "（#2367）",
+        ] {
+            assert!(message.contains(want), "{want} が無い: {message}");
+        }
+        // 境目: 79% は黙る・80% から申告する
+        assert!(fd_limit_container_issues(&running(204, 256), Some(&report), false).is_empty());
+        assert_eq!(
+            fd_limit_container_issues(&running(205, 256), Some(&report), false).len(),
+            1
+        );
+        let legacy = fd_limit_container_issues(&running(210, 256), Some(&report), true);
+        assert!(legacy[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("TAKO_2367_LEGACY のため"));
+        let capped = raise_with(
+            false,
+            || Ok((256, Some(256))),
+            |_| panic!("書かない"),
+            Some(138_240),
+        );
+        let launch = fd_limit_container_issues(&running(210, 256), Some(&capped), false);
+        assert!(
+            launch[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tako 自身が起動時に上限を引き上げていない（hard_capped）"),
+            "{launch:?}"
+        );
+        // 引き上げた値で近づいたなら決まり方の注記は付けない
+        let raised_near = fd_limit_container_issues(&running(9000, OPEN_MAX), Some(&report), false);
+        let message = raised_near[0]["message"].as_str().unwrap();
+        assert!(!message.contains("起動時の"), "{message}");
+    }
+
+    #[test]
+    fn 器のサーバーに届かないと前に読めた値を添えて申告する() {
+        let report = raised();
+        let probe = ServerNofile::Unreachable {
+            reason: "server exited unexpectedly".to_string(),
+            last: Some(ServerLimits {
+                pid: 4242,
+                soft: Some(256),
+                hard: None,
+                hard_unlimited: true,
+                open: Some(256),
+            }),
+        };
+        let c = fd_limit_container_describe("tako", &probe, Some(&report), false);
+        assert_eq!(c["state"], "unreachable");
+        assert_eq!(c["reason"], "server exited unexpectedly");
+        assert_eq!(c["last_known"], true);
+        assert_eq!(c["open"], 256);
+        assert_eq!(c["near_exhaustion"], true);
+        assert_eq!(c["limit"], "predates");
+        let issues = fd_limit_container_issues(&probe, Some(&report), false);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let message = issues[0]["message"].as_str().unwrap();
+        for want in [
+            "器の tmux サーバーに問い合わせが届かない（server exited unexpectedly）",
+            "前に読めたサーバー（pid 4242）は soft 256・いまの使用数は 256 本",
+            "使っていないペインを閉じると戻る",
+        ] {
+            assert!(message.contains(want), "{want} が無い: {message}");
+        }
+        let bare = ServerNofile::Unreachable {
+            reason: "3 秒待っても応答が返らない".to_string(),
+            last: None,
+        };
+        let c = fd_limit_container_describe("tako", &bare, Some(&report), false);
+        assert_eq!(c["last_known"], false);
+        assert_eq!(c["open"], Value::Null);
+        let message = fd_limit_container_issues(&bare, Some(&report), false)[0]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!message.contains("前に読めた"), "{message}");
     }
 }

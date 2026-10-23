@@ -4520,6 +4520,9 @@ fn main() -> ExitCode {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**。`cli_main` のスレッドより前）。
     // これが無いプロセスは置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
     tako_core::paths::mark_product_process();
+    // #2367: 器（tmux）の中のペインの子を起動時の fd 上限へ戻す段（製品が段に使うのは GUI 自身。
+    // CLI でも同じ段が動くのは、実 tmux のテストが段を実物の実行ファイルで通すため）
+    tako_core::platform::fd_limit::exec_container_child_if_requested();
     // #1758 / #1805: 読み手が先に閉じたパイプへの出力で panic しない（標準出力 → 静かに 0 /
     // 標準エラー → 行を捨てて続ける）。tako-core / tako-control の出力も同じ口を通るので、
     // CLI の経路で走るライブラリ側の `eprintln!` にも効く（`cli_main` のスレッドより前）
@@ -8086,6 +8089,9 @@ fn print_check_health(result: &Value) {
     if let Some(line) = result.get("fd_limit").and_then(fd_limit_line) {
         println!("{line}");
     }
+    if let Some(line) = result.get("fd_limit").and_then(fd_container_line) {
+        println!("{line}");
+    }
     // #1505: 環境診断の項目。**`tako setup --check` と同じ行**（正本が組んだ文字列を
     // そのまま出すので、2 つのコマンドの答えが字面まで一致する）
     for line in result["diagnostics"]["items"]
@@ -8165,6 +8171,51 @@ fn fd_limit_line(fd: &Value) -> Option<String> {
             "引き上げない（{}）",
             tako_core::platform::fd_limit::LEGACY_ENV
         )),
+        _ => None,
+    };
+    if let Some(note) = note {
+        line.push('・');
+        line.push_str(&note);
+    }
+    Some(line)
+}
+
+/// `check-health` の器の tmux サーバーの 1 行（#2367）。使用数 / 上限と上限がどう決まったか。
+/// 器が tmux でない（`container=null`）・節の無い旧版の応答は None（何も出さない）
+fn fd_container_line(fd: &Value) -> Option<String> {
+    let c = fd.get("container").filter(|c| c.is_object())?;
+    let num = |v: &Value| {
+        v.as_u64()
+            .map_or_else(|| "?".to_string(), |n| n.to_string())
+    };
+    let head = "器の tmux サーバー: ";
+    let mut line = match c["state"].as_str() {
+        Some("not_running") => return Some(format!("{head}起きていない")),
+        Some("unreachable") => format!(
+            "{head}問い合わせが届かない（{}）",
+            c["reason"].as_str().unwrap_or("理由不明")
+        ),
+        _ => format!(
+            "{head}{} / {} 本（{}%）",
+            num(&c["open"]),
+            num(&c["soft"]),
+            num(&c["percent"]),
+        ),
+    };
+    let note = match c["limit"].as_str() {
+        Some("raised") => Some(format!(
+            "引き上げた値を受け継いだ（器のペインのシェルには {}）",
+            num(&c["children_soft"])
+        )),
+        Some("predates") => Some(format!(
+            "引き上げより前に起きたので起動時のまま（約 {} ペインで詰まる。次にサーバーが起きたとき上がる）",
+            num(&c["pane_capacity"])
+        )),
+        Some("legacy") => Some(format!(
+            "引き上げない（{}）",
+            tako_core::platform::fd_limit::CONTAINER_LEGACY_ENV
+        )),
+        Some("launch_value") => Some("tako が引き上げていないので起動時のまま".to_string()),
         _ => None,
     };
     if let Some(note) = note {
@@ -13851,6 +13902,63 @@ mod tests {
             "Windows は出さない"
         );
         assert_eq!(fd_limit_line(&Value::Null), None, "節の無い旧版の応答");
+    }
+
+    /// #2367: 器の tmux サーバーの 1 行は使用数 / 上限と決まり方を出す。器が tmux でない・旧版は出さない
+    #[test]
+    fn check_healthの器のtmuxサーバーの行は使用数と決まり方を出す() {
+        let section = |limit: &str, open: u64, soft: u64| {
+            serde_json::json!({
+                "applicable": true,
+                "container": {
+                    "state": "running",
+                    "open": open,
+                    "soft": soft,
+                    "percent": open * 100 / soft,
+                    "limit": limit,
+                    "children_soft": 256,
+                    "pane_capacity": (soft - 6) / 3,
+                },
+            })
+        };
+        assert_eq!(
+            fd_container_line(&section("raised", 90, 10240)).as_deref(),
+            Some("器の tmux サーバー: 90 / 10240 本（0%）・引き上げた値を受け継いだ（器のペインのシェルには 256）")
+        );
+        assert_eq!(
+            fd_container_line(&section("predates", 210, 256)).as_deref(),
+            Some("器の tmux サーバー: 210 / 256 本（82%）・引き上げより前に起きたので起動時のまま（約 83 ペインで詰まる。次にサーバーが起きたとき上がる）")
+        );
+        assert_eq!(
+            fd_container_line(&section("legacy", 90, 256)).as_deref(),
+            Some("器の tmux サーバー: 90 / 256 本（35%）・引き上げない（TAKO_2367_LEGACY）")
+        );
+        assert_eq!(
+            fd_container_line(&section("launch_value", 90, 256)).as_deref(),
+            Some("器の tmux サーバー: 90 / 256 本（35%）・tako が引き上げていないので起動時のまま")
+        );
+        assert_eq!(
+            fd_container_line(&serde_json::json!({ "container": { "state": "not_running" } }))
+                .as_deref(),
+            Some("器の tmux サーバー: 起きていない")
+        );
+        assert_eq!(
+            fd_container_line(&serde_json::json!({ "container": {
+                "state": "unreachable", "reason": "server exited unexpectedly", "limit": "predates", "pane_capacity": 83,
+            } }))
+            .as_deref(),
+            Some("器の tmux サーバー: 問い合わせが届かない（server exited unexpectedly）・引き上げより前に起きたので起動時のまま（約 83 ペインで詰まる。次にサーバーが起きたとき上がる）")
+        );
+        assert_eq!(
+            fd_container_line(&serde_json::json!({ "applicable": true, "container": null })),
+            None,
+            "器が tmux でない"
+        );
+        assert_eq!(
+            fd_container_line(&serde_json::json!({ "applicable": true })),
+            None,
+            "節の無い旧版の応答"
+        );
     }
 
     /// #2002: 届いたときは GUI 側の見張りと最後の張り直しを 1 行で出す

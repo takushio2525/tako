@@ -10431,6 +10431,8 @@ impl TakoApp {
         // 直接ではなく専用サーバーのセッションとして spawn する。`new-session -A` なので
         // 復元時（既存セッション名）は attach、新規ペインは作成と、同じ経路で済む
         let mut backend_session = None;
+        // #2367: 器の新しいペイン（`new-session -A`）を起こしたか（器の tmux サーバーの上限を記録する）
+        let mut container_spawn = false;
         // #1857: 再 attach は attach 専用のクライアント（セッションが終わっていたら作らずに
         // 失敗する）。既存のセッションへ繋ぎ直すだけなので、persist の設定を後から OFF に
         // していても器を持つペインなら張り替える（設定は以後のペインの作り方 = FR-5.5）
@@ -10458,6 +10460,7 @@ impl TakoApp {
                 &name,
             );
             backend_session = Some(name);
+            container_spawn = true;
         } else {
             self.backend_sessions.remove(&pane_id);
         }
@@ -10474,6 +10477,14 @@ impl TakoApp {
             .and_then(tako_core::encoding_pin::ContainerPin::for_session);
         let (session, mut rx) =
             TerminalSession::spawn_in(INITIAL_COLS, INITIAL_ROWS, options, container_pin)?;
+        // #2367: 器の tmux サーバーの fd の上限を persist.log へ（サーバーが変わったときだけ 1 行。
+        // 読むのは裏のスレッド = UI スレッドは止めない）
+        if container_spawn {
+            tako_core::tmux_backend::note_server_nofile(
+                &tako_core::tmux_backend::socket_name(),
+                persist_diag,
+            );
+        }
         // #1657: 実行ペインは終了コードが届くまで出力のたびに側路を見る（バッジをすぐ出す）
         let running_run_pane = self
             .workspace
@@ -31814,6 +31825,9 @@ fn main() {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**）。これが無いプロセスは
     // 置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
     tako_core::paths::mark_product_process();
+    // #2367: 器（tmux）の中のペインの子を起動時の fd 上限へ戻す段として起きたなら、soft を下げて
+    // シェルを exec する（戻らない）。**ほかの初期化より前**（段はスレッドも窓も持たない）
+    tako_core::platform::fd_limit::exec_container_child_if_requested();
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
     // #782: ここ（GUI プロセスのメインスレッド）を基準に、以後 perf_span は
@@ -31950,6 +31964,12 @@ fn main() {
     // 起動時の値を戻す構えもここで決まる）。persist.log の置き場は上の隔離の env で決まるので
     // その後。上げられなくても起動は続ける（記録だけ。A/B は `TAKO_2359_LEGACY=1`）
     persist_diag(&tako_core::platform::fd_limit::raise_at_startup().log_line());
+    // #2367: 器の tmux サーバーにも引き上げた値を渡す。器の中のペインの子はこの実行ファイル
+    // 自身（main の 2 文目の段）を通して起動時の値へ戻すので、自分を段として置く。
+    // 置けなければ（実行ファイルの場所が読めない）器は修正前どおり起動時の値で起きる
+    if let Ok(exe) = std::env::current_exe() {
+        tako_core::platform::fd_limit::register_container_exec(exe);
+    }
     // テレメトリ初期化: settings.json から ON/OFF を読み、panic ハンドラを設置する
     {
         let settings = tako_control::settings::load();

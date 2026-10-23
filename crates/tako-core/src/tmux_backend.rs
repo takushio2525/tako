@@ -595,8 +595,19 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     // するので、直接 spawn 時と同じく統合が効く。
     // 明示コマンドは残余引数が空白連結 + sh -c されるため、各語をクォートして 1 引数で渡す。
     // **第 1 語の書き方だけは器によって違う**ので組み立ては backend 側の 1 か所へ（#881）
-    if let Some(inner) = &options.command {
-        args.push(crate::backend::inner_command_line(inner));
+    let mut inner = None;
+    if let Some(command) = &options.command {
+        inner = Some(crate::backend::inner_command_line(command));
+    }
+    // #2367: GUI が fd 上限を引き上げたなら、器の中のペインの子は起動時の値へ戻す段
+    // （GUI 自身の実行ファイル）を通す。残余引数が 2 個以上だと tmux は `execvp` で直に起こし
+    // （シェルの -c を挟まない = 上の .zshenv の問題は起きない）、段は soft を下げてから tmux が
+    // 自分で起こすはずだった形（ログインシェル / `$SHELL -c <inner>`）を exec し直す。
+    // このクライアントには引き上げた値が渡り（`TerminalSession::spawn` が並びを見て決める）、
+    // それが起こす器の tmux サーバーが受け継ぐ。段を通さないなら従来どおり（A/B は TAKO_2367_LEGACY=1）
+    match crate::platform::fd_limit::container_child_argv(inner.as_deref()) {
+        Some(argv) => args.extend(argv),
+        None => args.extend(inner),
     }
     SpawnOptions {
         command: Some(SpawnCommand {
@@ -854,6 +865,302 @@ pub fn cleanup_orphans_with(
         killed.push(row.name);
     }
     killed
+}
+
+/// 器の tmux サーバーの fd の上限と使用数（#2367。`check_health` の `fd_limit.container` と
+/// persist.log が読む）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerNofile {
+    /// サーバーが居ない（`no server running`・ソケットが無い・死んだサーバーのソケットが残っている）
+    NotRunning,
+    /// 問い合わせが届かない。fd の上限に届いたサーバーは接続を受けても客の fd を受け取れず、
+    /// 生きたまま**すべての問い合わせ**を `server exited unexpectedly` で返す（tmux 3.6b の実測）。
+    /// `last` はこのプロセスが前に読めた同じソケットのサーバー（pid が生きていれば使用数を数え直す）
+    Unreachable {
+        reason: String,
+        last: Option<ServerLimits>,
+    },
+    Running(ServerLimits),
+}
+
+/// 器の tmux サーバー 1 つの上限と使用数
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerLimits {
+    pub pid: u32,
+    /// soft（`run-shell` の子が受け継ぐ値 = サーバーの値。tmux は自分の上限を変えない）。読めなければ None
+    pub soft: Option<u64>,
+    /// hard（None = 無制限か読めない。[`ServerLimits::hard_unlimited`] で分ける）
+    pub hard: Option<u64>,
+    pub hard_unlimited: bool,
+    /// 開いている fd の本数（`proc_pidinfo`。fd を開かずに数える = 上限に届いていても読める）
+    pub open: Option<u64>,
+}
+
+/// 器の tmux サーバーへの問い合わせの上限（打ち切りは [`ServerNofile::Unreachable`]）
+pub const SERVER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 器の tmux サーバーが居ても器のペインが 0 本のときに開いている fd（tmux 3.6b の lsof の実測。
+/// 器の 1 ペインごとに [`crate::platform::fd_limit::CONTAINER_FDS_PER_PANE`] 本ずつ増える）
+pub const SERVER_BASE_FDS: u64 = 6;
+
+/// soft の器の tmux サーバーが持てる器のペインのおおよその数（約 80 ペイン = soft 256 の目安）
+pub fn server_pane_capacity(soft: u64) -> u64 {
+    soft.saturating_sub(SERVER_BASE_FDS) / crate::platform::fd_limit::CONTAINER_FDS_PER_PANE
+}
+
+/// `display-message -p '#{pid}'` の結果を読む（純粋関数）。pid が読めれば Ok、読めなければ
+/// サーバーが居ない / 届かない。エラーの字面は tmux 3.6b の実測（[`crate::backend_reattach::classify_probe`] と同じ）
+pub fn parse_server_pid(success: bool, stdout: &str, stderr: &str) -> Result<u32, ServerNofile> {
+    if let Some(pid) = stdout
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .filter(|p| *p > 0)
+    {
+        return Ok(pid);
+    }
+    let err = stderr.trim();
+    if err.starts_with("no server running")
+        || (err.starts_with("error connecting to")
+            && (err.contains("No such file or directory") || err.contains("Connection refused")))
+    {
+        return Err(ServerNofile::NotRunning);
+    }
+    let reason = err
+        .lines()
+        .next()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if success {
+                "応答に pid が無い".to_string()
+            } else {
+                "エラーの字面なしで失敗した".to_string()
+            }
+        });
+    Err(ServerNofile::Unreachable { reason, last: None })
+}
+
+/// `run-shell 'ulimit -Sn; ulimit -Hn'` の出力を読む（純粋関数）: (soft, hard, hard が無制限か)
+pub fn parse_server_limits(stdout: &str) -> (Option<u64>, Option<u64>, bool) {
+    let mut lines = stdout.lines().map(str::trim);
+    let soft = lines.next().and_then(|l| l.parse::<u64>().ok());
+    let hard_line = lines.next();
+    (
+        soft,
+        hard_line.and_then(|l| l.parse::<u64>().ok()),
+        hard_line == Some("unlimited"),
+    )
+}
+
+/// このプロセスが最後に読めた器の tmux サーバー（ソケット名つき。上限の読み直しを省く・届かないときの手がかり）
+static LAST_SERVER: std::sync::Mutex<Option<(String, ServerLimits)>> = std::sync::Mutex::new(None);
+
+/// 器へ 1 回だけ問い合わせる（上限 [`SERVER_PROBE_TIMEOUT`]）。Ok は (成功したか, stdout, stderr)、
+/// Err は打ち切り・起動失敗の理由
+fn server_probe(socket: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+    use std::process::Stdio;
+    let mut command = crate::tmux::tmux_command(Some(socket));
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command
+        .spawn()
+        .map_err(|e| format!("tmux を起こせない: {e}"))?;
+    match crate::probe::wait_with_timeout(child, &format!("tmux {}", args[0]), SERVER_PROBE_TIMEOUT)
+    {
+        crate::probe::Outcome::Done {
+            status,
+            stdout,
+            stderr,
+        } => Ok((
+            status.success(),
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )),
+        crate::probe::Outcome::TimedOut { waited, .. } => Err(format!(
+            "{} が {} 秒待っても返らない",
+            args[0],
+            waited.as_secs()
+        )),
+        crate::probe::Outcome::Failed { reason, .. } => Err(reason),
+    }
+}
+
+/// 器の tmux サーバーの fd の上限と使用数を読む（#2367）。サーバーは起こさない
+/// （`display-message` も `run-shell` も起動の命令ではない）。
+///
+/// 2 段に分ける: pid は `display-message` だけで読み、上限は同じサーバー（同じ pid）で 1 度読めたら
+/// 覚えておく（tmux は自分の上限を変えない）。上限を読む `run-shell` は `/bin/sh -c` で走る
+/// （利用者の rc を読まない）サーバーの子で、サーバーの上限をそのまま受け継ぐが、fork とパイプが要るので
+/// **上限の間際では返らない**（soft 64 のサーバーが 62 本のとき 3 秒の打ち切りまで返らなかった実測）。
+/// 分けておけば、間際でも pid と使用数（`proc_pidinfo`）と覚えた上限で枯渇を申告できる。
+/// UI スレッドから呼ばない（問い合わせ 1〜2 回。それぞれ上限 [`SERVER_PROBE_TIMEOUT`]）
+pub fn server_nofile(socket: &str) -> ServerNofile {
+    let pid = match server_probe(socket, &["display-message", "-p", "#{pid}"])
+        .map_err(|reason| ServerNofile::Unreachable { reason, last: None })
+        .and_then(|(ok, out, err)| parse_server_pid(ok, &out, &err))
+    {
+        Ok(pid) => pid,
+        Err(ServerNofile::Unreachable { reason, .. }) => {
+            let last = LAST_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+            return ServerNofile::Unreachable {
+                reason,
+                last: last
+                    .as_ref()
+                    .filter(|(s, l)| s == socket && crate::ports::process_alive(l.pid))
+                    .map(|(_, l)| ServerLimits {
+                        open: crate::platform::fd_limit::open_fds_of(l.pid),
+                        ..*l
+                    }),
+            };
+        }
+        Err(other) => return other,
+    };
+    let known = LAST_SERVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(s, l)| s == socket && l.pid == pid && l.soft.is_some())
+        .map(|(_, l)| (l.soft, l.hard, l.hard_unlimited));
+    let (soft, hard, hard_unlimited) = known.unwrap_or_else(|| {
+        server_probe(socket, &["run-shell", "ulimit -Sn; ulimit -Hn"])
+            .map(|(_, out, _)| parse_server_limits(&out))
+            .unwrap_or((None, None, false))
+    });
+    let limits = ServerLimits {
+        pid,
+        soft,
+        hard,
+        hard_unlimited,
+        open: crate::platform::fd_limit::open_fds_of(pid),
+    };
+    if soft.is_some() {
+        *LAST_SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some((socket.to_string(), limits));
+    }
+    ServerNofile::Running(limits)
+}
+
+/// `check_health` が上限を問い合わせる器のソケット（#2367）。テストのプロセスは隔離のソケット
+/// （[`SOCKET_ENV`]）を明示したときだけ問い合わせる = 既定の `-L tako`（本番の器）へ run-shell を投げない
+pub fn health_probe_socket() -> Option<String> {
+    (!crate::paths::is_test_process() || std::env::var_os(SOCKET_ENV).is_some()).then(socket_name)
+}
+
+/// persist.log へ置く 1 行（#2367。中身に利用者のデータは無い）
+pub fn server_nofile_log_line(
+    socket: &str,
+    limits: &ServerLimits,
+    limit: Option<crate::platform::fd_limit::ContainerLimit>,
+    children_soft: Option<u64>,
+) -> String {
+    use crate::platform::fd_limit::{ContainerLimit, CONTAINER_LEGACY_ENV};
+    let head = format!(
+        "器の tmux サーバー（ソケット {socket}・pid {}）",
+        limits.pid
+    );
+    let (Some(soft), Some(limit)) = (limits.soft, limit) else {
+        return format!("{head}: fd の上限を読めなかった（#2367）");
+    };
+    let hard = match (limits.hard, limits.hard_unlimited) {
+        (_, true) => "無制限".to_string(),
+        (Some(h), false) => h.to_string(),
+        (None, false) => "?".to_string(),
+    };
+    let capacity = server_pane_capacity(soft);
+    let note = match limit {
+        ContainerLimit::Raised => format!(
+            "GUI が引き上げた値を受け継いだ。器のペインのシェルには {} を渡す",
+            children_soft.map_or_else(|| "?".to_string(), |s| s.to_string())
+        ),
+        ContainerLimit::Predates => format!(
+            "引き上げより前に起きたサーバーなので起動時の値のまま。上がるのは次にサーバーが起きたとき。\
+             器の 1 ペインで fd 約 {} 本 = 約 {capacity} ペインで詰まる",
+            crate::platform::fd_limit::CONTAINER_FDS_PER_PANE
+        ),
+        ContainerLimit::Legacy => {
+            format!("{CONTAINER_LEGACY_ENV} のため引き上げた値を渡さない。約 {capacity} ペインで詰まる")
+        }
+        ContainerLimit::LaunchValue => format!(
+            "tako 自身が起動時に引き上げていないので起動時の値のまま。約 {capacity} ペインで詰まる"
+        ),
+    };
+    format!(
+        "{head}: fd の上限 soft {soft}・hard {hard}（{}: {note}）（#2367）",
+        limit.as_str()
+    )
+}
+
+/// 器の tmux サーバーが起きるのを待つ上限（attach クライアントが非同期に起こす）
+const NOTE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 前の記録からこの間は読みに行かない（復元で器のペインを何十本も起こしても問い合わせは 1 回）
+const NOTE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 器のペインを起こした直後に呼ぶ: 器の tmux サーバーの上限を persist.log（`sink`）へ 1 行残す
+/// （#2367）。書くのはサーバーが変わったとき（pid が前回の記録と違う）だけ。
+///
+/// 裏のスレッドで読む（UI スレッドを止めない）。読みに行くのは同時に 1 本で、前回から
+/// [`NOTE_INTERVAL`] 以内なら行かない
+pub fn note_server_nofile(socket: &str, sink: fn(&str)) {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    static NOTED_PID: AtomicU32 = AtomicU32::new(0);
+    static NOTED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if !crate::platform::fd_limit::APPLICABLE {
+        return;
+    }
+    {
+        let at = NOTED_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if at.is_some_and(|t| t.elapsed() < NOTE_INTERVAL) {
+            return;
+        }
+    }
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let socket = socket.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("tako-tmux-nofile-note".into())
+        .spawn(move || {
+            let start = std::time::Instant::now();
+            let mut nap = std::time::Duration::from_millis(50);
+            let limits = loop {
+                match server_nofile(&socket) {
+                    ServerNofile::Running(limits) => break Some(limits),
+                    _ if start.elapsed() >= NOTE_WAIT => break None,
+                    _ => {
+                        std::thread::sleep(nap);
+                        nap = (nap * 2).min(std::time::Duration::from_millis(400));
+                    }
+                }
+            };
+            *NOTED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+            if let Some(limits) = limits {
+                if NOTED_PID.swap(limits.pid, Ordering::AcqRel) != limits.pid {
+                    let startup = crate::platform::fd_limit::startup_report();
+                    let limit = limits.soft.map(|soft| {
+                        crate::platform::fd_limit::classify_container(
+                            soft,
+                            startup,
+                            crate::platform::fd_limit::container_legacy(),
+                        )
+                    });
+                    sink(&server_nofile_log_line(
+                        &socket,
+                        &limits,
+                        limit,
+                        startup.and_then(crate::platform::fd_limit::Report::children_soft),
+                    ));
+                }
+            }
+            BUSY.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        BUSY.store(false, Ordering::Release);
+    }
 }
 
 /// バックエンドサーバーごと落とす（セルフテストの後片付け用）
@@ -4401,5 +4708,197 @@ mod pane_died_tests {
         );
         new_vessel(&socket, &conf, "tako-nohook", "seq 1 5");
         assert!(wait_gone(&socket, "tako-nohook"));
+    }
+}
+
+/// #2367: 器の tmux サーバーの fd の上限と使用数の読み・persist.log の 1 行
+#[cfg(test)]
+mod nofile_tests {
+    use super::*;
+    use crate::platform::fd_limit::ContainerLimit;
+
+    fn limits(soft: Option<u64>) -> ServerLimits {
+        ServerLimits {
+            pid: 4242,
+            soft,
+            hard: None,
+            hard_unlimited: true,
+            open: Some(90),
+        }
+    }
+
+    #[test]
+    fn 応答からpidと上限を読む() {
+        assert_eq!(parse_server_pid(true, "4242\n", ""), Ok(4242));
+        assert_eq!(
+            parse_server_limits("256\nunlimited\n"),
+            (Some(256), None, true)
+        );
+        assert_eq!(
+            parse_server_limits("10240\n10240\n"),
+            (Some(10240), Some(10240), false),
+            "hard が数（launchctl limit maxfiles で絞った機）"
+        );
+        assert_eq!(
+            parse_server_limits(""),
+            (None, None, false),
+            "run-shell が返らなかった（上限の間際）なら上限は不明"
+        );
+    }
+
+    #[test]
+    fn 居ないサーバーと届かないサーバーを分ける() {
+        for err in [
+            "no server running on /private/tmp/tmux-501/tako\n",
+            "error connecting to /private/tmp/tmux-501/tako (No such file or directory)\n",
+            "error connecting to /private/tmp/tmux-501/tako (Connection refused)\n",
+        ] {
+            assert_eq!(
+                parse_server_pid(false, "", err),
+                Err(ServerNofile::NotRunning),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            parse_server_pid(false, "", "server exited unexpectedly\n"),
+            Err(ServerNofile::Unreachable {
+                reason: "server exited unexpectedly".to_string(),
+                last: None,
+            }),
+            "上限に届いたサーバーの字面（tmux 3.6b の実測）"
+        );
+        assert!(matches!(
+            parse_server_pid(false, "", ""),
+            Err(ServerNofile::Unreachable { .. })
+        ));
+        assert!(matches!(
+            parse_server_pid(true, "0\n", ""),
+            Err(ServerNofile::Unreachable { .. })
+        ));
+    }
+
+    #[test]
+    fn 器のペインの数の目安() {
+        assert_eq!(
+            server_pane_capacity(256),
+            83,
+            "Finder 起動の soft 256 = 約 80 ペイン"
+        );
+        assert_eq!(server_pane_capacity(10240), 3411);
+        assert_eq!(
+            server_pane_capacity(4),
+            0,
+            "基礎の本数に届かなくても負にならない"
+        );
+    }
+
+    #[test]
+    fn persist_logの1行は上限の決まり方ごとに組める() {
+        let raised = server_nofile_log_line(
+            "tako",
+            &limits(Some(10240)),
+            Some(ContainerLimit::Raised),
+            Some(256),
+        );
+        assert_eq!(
+            raised,
+            "器の tmux サーバー（ソケット tako・pid 4242）: fd の上限 soft 10240・hard 無制限\
+             （raised: GUI が引き上げた値を受け継いだ。器のペインのシェルには 256 を渡す）（#2367）"
+        );
+        let predates = server_nofile_log_line(
+            "tako",
+            &limits(Some(256)),
+            Some(ContainerLimit::Predates),
+            Some(256),
+        );
+        assert!(
+            predates.contains("引き上げより前に起きたサーバーなので起動時の値のまま")
+                && predates.contains("約 83 ペインで詰まる"),
+            "{predates}"
+        );
+        let legacy = server_nofile_log_line(
+            "tako",
+            &limits(Some(256)),
+            Some(ContainerLimit::Legacy),
+            Some(256),
+        );
+        assert!(legacy.contains("TAKO_2367_LEGACY のため"), "{legacy}");
+        let launch = server_nofile_log_line(
+            "tako",
+            &limits(Some(256)),
+            Some(ContainerLimit::LaunchValue),
+            None,
+        );
+        assert!(
+            launch.contains("tako 自身が起動時に引き上げていない"),
+            "{launch}"
+        );
+        assert_eq!(
+            server_nofile_log_line("tako", &limits(None), None, None),
+            "器の tmux サーバー（ソケット tako・pid 4242）: fd の上限を読めなかった（#2367）"
+        );
+    }
+
+    /// 実 tmux: 居なければ起こさない・soft を絞って起こしたサーバーの soft / hard / 使用数を読む
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn issue2367_実tmuxのサーバーの上限と使用数を読みサーバーは起こさない() {
+        if !crate::tmux_test_gate::container() {
+            return;
+        }
+        let socket = format!("tako-coretest-{}-nofile2367", std::process::id());
+        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
+        assert_eq!(server_nofile(&socket), ServerNofile::NotRunning);
+        assert!(
+            !socket_file_present(&socket),
+            "探針（display-message ; run-shell）はサーバーを起こさない"
+        );
+        // soft だけ 200 に絞ったシェルからサーバーを起こす（hard は触らない）
+        let mut sh = std::process::Command::new("/bin/sh");
+        crate::platform::process::no_console_window(&mut sh);
+        let start = sh
+            .arg("-c")
+            .arg(format!(
+                "ulimit -Sn 200 && exec {} -L {} -f /dev/null new-session -d -s n1 'sleep 600'",
+                crate::shell::quote_for_shell(crate::tmux::tmux_bin()),
+                crate::shell::quote_for_shell(&socket),
+            ))
+            .status()
+            .expect("sh を起こせる");
+        assert!(start.success(), "絞った soft でサーバーを起こせる");
+        let ServerNofile::Running(first) = server_nofile(&socket) else {
+            panic!("起きたサーバーを読める: {:?}", server_nofile(&socket));
+        };
+        assert_eq!(
+            first.soft,
+            Some(200),
+            "run-shell の子はサーバーの soft を受け継ぐ"
+        );
+        assert!(
+            first.hard_unlimited || first.hard.is_some_and(|h| h >= 200),
+            "{first:?}"
+        );
+        let open = first.open.expect("proc_pidinfo で数えられる");
+        assert!(open >= 3, "{first:?}");
+        // 器のペイン（detached = クライアント無し）を 5 本足すと 5 本増える
+        for _ in 0..5 {
+            let out = crate::tmux::tmux_command(Some(&socket))
+                .args(["new-window", "-d", "sleep 600"])
+                .output()
+                .expect("new-window");
+            assert!(out.status.success());
+        }
+        let ServerNofile::Running(later) = server_nofile(&socket) else {
+            panic!("読める");
+        };
+        assert_eq!(later.pid, first.pid);
+        assert_eq!(
+            later.soft,
+            Some(200),
+            "同じサーバーの上限は覚えた値（run-shell を投げ直さない）"
+        );
+        // 問い合わせた客の接続はサーバーが EOF を読むまで 1 本残ることがある（どちらの読みにも）
+        let grew = later.open.expect("数えられる").saturating_sub(open);
+        assert!((4..=6).contains(&grew), "{first:?} → {later:?}");
     }
 }

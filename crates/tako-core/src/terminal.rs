@@ -610,6 +610,12 @@ impl TerminalSession {
         // PTY へ渡す起動 cwd をセッションにも保持し、相対パス解決やファイルツリーが
         // TUI 起動直後から同じ基準ディレクトリを使えるようにする。
         let working_directory = options.cwd.or_else(default_home_dir);
+        // #2367: 器の中のペインの子を起動時の fd 上限へ戻す段に通す attach クライアントか
+        // （下の spawn で、そのクライアントにだけ引き上げた値を渡す）
+        let keep_raised_fd_limit = options
+            .command
+            .as_ref()
+            .is_some_and(|c| crate::platform::fd_limit::routes_container_children(&c.args));
         let mut tty_options = tty::Options {
             // command 未指定なら既定シェルを明示解決する（login ラッパ回避。`default_shell`）
             shell: options
@@ -629,10 +635,16 @@ impl TerminalSession {
         // GUI が CLOEXEC 無しで開いた fd（Metal のシェーダキャッシュ・並行 spawn のパイプ）を
         // 子へ渡さない（#1768）。alacritty の PTY は fork + exec で起き、`pre_exec` を足す口が
         // 無いので、包んでいるあいだだけ fork の子ハンドラが構え、exec の前に子の中で掃く。
-        // OS 差（Windows はハンドルを継承しない）は境界の中だけが知る
-        let mut pty =
-            crate::platform::fd_inherit::spawn_sealed(|| tty::new(&tty_options, window_size, 0))
-                .map_err(SessionError::Pty)?;
+        // OS 差（Windows はハンドルを継承しない）は境界の中だけが知る。
+        // #2367: 同じ子ハンドラは fd 上限を起動時の値へ戻す（#2359）が、上の attach クライアント
+        // だけは戻さない（それが起こす器の tmux サーバーが引き上げた値を受け継ぐ。器の中の
+        // ペインの子は段が起動時の値へ戻す。段を通らない子へは今までどおり起動時の値）
+        let mut pty = crate::platform::fd_inherit::spawn_sealed(|| {
+            crate::platform::fd_limit::with_children_raised(keep_raised_fd_limit, || {
+                tty::new(&tty_options, window_size, 0)
+            })
+        })
+        .map_err(SessionError::Pty)?;
         // PTY スレーブの tty 名（/dev/ttysNNN）。tmux クライアントとの対応付けに使う（FR-2.13.2）
         let tty_name = slave_tty_name(&mut pty);
         // 疑似コンソールの文字コードを UTF-8 に固定する（#655。Windows のみ実体を持つ）。
