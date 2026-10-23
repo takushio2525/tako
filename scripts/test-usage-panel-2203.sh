@@ -197,9 +197,9 @@ while IFS=$'\t' read -r tag step by window project issue limit; do
   args=(--by "$by" --window "$window" --limit "$limit")
   [ -n "$project" ] && args+=(--project "$project")
   [ -n "$issue" ] && args+=(--issue "$issue")
-  "$TAKO_BIN" usage --json "${args[@]}" > "$CLI_DIR/$step.json" 2>/dev/null
-  "$TAKO_BIN" usage "${args[@]}" > "$CLI_DIR/$step.txt" 2>/dev/null
-  echo "    $step: tako usage ${args[*]}"
+  "$TAKO_BIN" usage --json ${args[@]+"${args[@]}"} > "$CLI_DIR/$step.json" 2>/dev/null
+  "$TAKO_BIN" usage ${args[@]+"${args[@]}"} > "$CLI_DIR/$step.txt" 2>/dev/null
+  echo "    ${step}: tako usage ${args[*]+${args[*]}}"
 done < <(grep "^TAKO_USAGE_QUERY" "$TMP/visual-main.log" 2>/dev/null)
 if python3 -I "$PY" check "$TMP/visual-main.log" "$CLI_DIR" > "$TMP/check.txt"; then
   pass "画面の行（%・API 換算・トークン・会話）が CLI の JSON と既定出力の行に一致（$(grep CHECKED "$TMP/check.txt")）"

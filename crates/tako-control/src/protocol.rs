@@ -3504,6 +3504,7 @@ mod tests {
         assert_eq!(PanelViewWire::Diagnostics.as_str(), "diagnostics");
         assert_eq!(PanelViewWire::References.as_str(), "references");
         assert_eq!(PanelViewWire::Search.as_str(), "search");
+        assert_eq!(PanelViewWire::Usage.as_str(), "usage");
         // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
         assert_eq!(
             PanelViewWire::VALUES,
@@ -3514,7 +3515,8 @@ mod tests {
                 "tasks",
                 "diagnostics",
                 "references",
-                "search"
+                "search",
+                "usage"
             ]
         );
         assert!(!PanelViewWire::VALUES.contains(&"tmux"));
@@ -3540,6 +3542,8 @@ mod tests {
         );
         // #1694: ワークスペース横断検索のビュー
         assert_eq!(PanelViewWire::parse("search"), Some(PanelViewWire::Search));
+        // #2203: 利用制限の使い道のビュー
+        assert_eq!(PanelViewWire::parse("usage"), Some(PanelViewWire::Usage));
         assert_eq!(PanelViewWire::parse("task"), None);
         assert_eq!(PanelViewWire::parse("fleets"), None);
         assert_eq!(PanelViewWire::parse(""), None);
@@ -3566,7 +3570,7 @@ mod tests {
         let hint = PanelViewWire::values_hint();
         assert_eq!(
             hint,
-            "fleet | orch | git | tasks | diagnostics | references | search。tmux は fleet の旧称"
+            "fleet | orch | git | tasks | diagnostics | references | search | usage。tmux は fleet の旧称"
         );
     }
 
@@ -3594,6 +3598,7 @@ mod tests {
                 "diagnostics",
                 "references",
                 "search",
+                "usage",
                 "tmux"
             ]
         );

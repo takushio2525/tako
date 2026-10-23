@@ -285,7 +285,7 @@ fn 修正前の形を名指しできる() {
     );
     assert_eq!(
         missing_examples(&found, ENUMERATING[0]),
-        ["references", "search"],
+        ["references", "search", "usage"],
         "例の列挙から抜けた値を名指しできていない"
     );
 
