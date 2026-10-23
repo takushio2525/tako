@@ -29713,6 +29713,13 @@ impl Render for TakoApp {
             .on_action(cx.listener(|this, _: &ShowGitPanel, _, cx| {
                 this.toggle_panel_view(PanelView::Git, cx)
             }))
+            // #2341: パレットの panel-tasks / panel-usage と同じ実体（開いた瞬間の読み直しも同じ）
+            .on_action(cx.listener(|this, _: &ShowTasksPanel, _, cx| {
+                this.toggle_panel_view(PanelView::Tasks, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowUsagePanel, _, cx| {
+                this.toggle_panel_view(PanelView::Usage, cx)
+            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 // blur（外部 a11y 等）からの自動復元（#332）: focus が無いと
                 // input handler が未登録になり日本語 IM の printable キーが IME を
@@ -30542,10 +30549,15 @@ fn view_menu() -> gpui::Menu {
         MenuItem::separator(),
         MenuItem::action(m::toggle_sidebar(), ToggleSidebar),
         MenuItem::action(m::toggle_drawer(), ToggleDrawer),
+        // 並びは `PanelViewWire::VALUES` の順。置かないビューとその理由は
+        // `app_menu_tests` の `PANEL_VIEW_ENTRIES`（#2341）
         MenuItem::submenu(Menu::new(m::panel()).items(vec![
             MenuItem::action(m::panel_fleet(), ShowFleetPanel),
             MenuItem::action(m::panel_orch(), ShowOrchPanel),
             MenuItem::action(m::panel_git(), ShowGitPanel),
+            // #2341: tasks（#1450）と usage（#2203）はパレットにだけあった
+            MenuItem::action(m::panel_tasks(), ShowTasksPanel),
+            MenuItem::action(m::panel_usage(), ShowUsagePanel),
         ])),
         MenuItem::separator(),
         MenuItem::action(m::zoom_in(), ZoomIn),
@@ -98532,12 +98544,13 @@ mod app_menu_tests {
         (
             "panel-fleet",
             "メニューは「パネル」の下の「fleet ビュー」で、親の名前が文脈を持つ。パレットは階層が\
-             無いので、パネルの 5 項目を「X パネルを開く」で揃える（tasks / usage はメニューに無い）",
+             無いので、パネルの 5 項目を「X パネルを開く」で揃える（ビューごとのメニューと\
+             パレットの対は `PANEL_VIEW_ENTRIES`。#2341）",
         ),
         ("panel-orch", "panel-fleet と同じ"),
         ("panel-git", "panel-fleet と同じ"),
-        ("panel-tasks", "メニューに項目が無い"),
-        ("panel-usage", "メニューに項目が無い"),
+        ("panel-tasks", "panel-fleet と同じ"),
+        ("panel-usage", "panel-fleet と同じ"),
         (
             "pin-tab-title",
             "メニューに項目が無い（タブのピン印と同じ操作）",
@@ -98598,6 +98611,287 @@ mod app_menu_tests {
         assert!(
             problems.is_empty(),
             "パレットの固定コマンドの分類が合っていない（#2322）:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// 右パネルのビュー 1 つぶんの入口の片側（#2341）
+    enum ViewEntry {
+        /// メニューのアクション名（`tako::ShowTasksPanel`）/ パレットの固定コマンドの id（`panel-tasks`）
+        Item(&'static str),
+        /// 置かない理由
+        Without(&'static str),
+    }
+
+    /// **右パネルのビュー（`PanelViewWire::VALUES`）ごとの、表示メニューの「パネル」の項目と
+    /// パレットの固定コマンド**（#2341）。列は (ビューの値, メニュー, パレット) で、並びは
+    /// `VALUES` の順（メニューとパレットもこの順に並べる）。
+    ///
+    /// tasks（#1450）と usage（#2203）はパレットにだけ足され、メニューから辿る人には
+    /// 見つからなかった。ビューを足したら、両方の入口を足すか、置かない理由をここへ書く
+    const PANEL_VIEW_ENTRIES: &[(&str, ViewEntry, ViewEntry)] = {
+        use ViewEntry::{Item, Without};
+        &[
+            ("fleet", Item("tako::ShowFleetPanel"), Item("panel-fleet")),
+            ("orch", Item("tako::ShowOrchPanel"), Item("panel-orch")),
+            ("git", Item("tako::ShowGitPanel"), Item("panel-git")),
+            ("tasks", Item("tako::ShowTasksPanel"), Item("panel-tasks")),
+            (
+                "diagnostics",
+                Without(
+                    "編集中の文書の診断で、入口は言語サーバにつながった文書があるときに出る\
+                     右パネルのタブ（#1679）。文書が無いときに開いても空の一覧になるので、\
+                     いつも出ている入口は置かない",
+                ),
+                Without("メニューと同じ"),
+            ),
+            (
+                "references",
+                Without(
+                    "参照・呼び出し階層・型階層の結果の置き場で、結果を出す操作は位置が要る\
+                     （本文の右クリックの「参照を検索」など。#1685）。結果が出るとタブが出る。\
+                     結果が無いときに開いても空なので、いつも出ている入口は置かない",
+                ),
+                Without("メニューと同じ"),
+            ),
+            (
+                "search",
+                Without(
+                    "編集メニューの「ファイル横断検索…」（tako::FindInFiles）が同じビューを\
+                     検索欄にフォーカスして開く（#1694）。パネルの下に開閉だけの項目を並べると、\
+                     同じビューへの入口が 2 つになる",
+                ),
+                Without(
+                    "find-in-files（編集メニューの「ファイル横断検索…」と同じ）が同じビューを開く",
+                ),
+            ),
+            ("usage", Item("tako::ShowUsagePanel"), Item("panel-usage")),
+        ]
+    };
+
+    /// `PANEL_VIEW_ENTRIES` のメニュー / パレットの列のうち、入口を置いたもの（表の並び）
+    fn panel_view_items(palette: bool) -> Vec<(&'static str, &'static str)> {
+        PANEL_VIEW_ENTRIES
+            .iter()
+            .filter_map(|(view, menu, pal)| {
+                let entry = if palette { pal } else { menu };
+                match entry {
+                    ViewEntry::Item(item) => Some((*view, *item)),
+                    ViewEntry::Without(_) => None,
+                }
+            })
+            .collect()
+    }
+
+    /// ビューの値から、それを開く `PanelView` の変種名（`tasks` → `Tasks`）
+    fn panel_view_variant(view: &str) -> String {
+        tako_control::protocol::PanelViewWire::parse(view)
+            .map(|wire| format!("{wire:?}"))
+            .unwrap_or_else(|| format!("（{view} は PanelViewWire に無い）"))
+    }
+
+    /// `main.rs` の中で、その文字列が最初に出る行（無ければ表の行）
+    fn main_rs_at(source: &str, needle: &str) -> String {
+        let line = source
+            .find(needle)
+            .or_else(|| source.find("const PANEL_VIEW_ENTRIES"))
+            .map_or(0, |at| source[..at].matches('\n').count() + 1);
+        format!("crates/tako-app/src/main.rs:{line}")
+    }
+
+    /// **右パネルのビューは、メニューとパレットの入口か置かない理由のどちらかで表に 1 回だけ載る**（#2341）。
+    ///
+    /// ビューの語彙の正本は `PanelViewWire::VALUES` で、CLI / MCP は追加の分岐なしで追従する
+    /// （FR-2.40.9）が、メニューとパレットは手で足す。tasks と usage はパレットにだけ足され、
+    /// メニューの「パネル」は fleet / orch / git のまま残っていた。値を足したら、ここで
+    /// 入口を足すか理由を書くかを決めさせる（食い違いは `VALUES` の行で名指す）
+    #[test]
+    fn 右パネルのビューはメニューとパレットの入口か理由に載っている() {
+        use tako_control::protocol::PanelViewWire;
+        let source = include_str!("main.rs");
+        let protocol = include_str!("../../tako-control/src/protocol.rs");
+        // `VALUES` の中のその値の行（無ければ `VALUES` の宣言の行）
+        let value_at = |view: &str| {
+            let start = protocol
+                .lines()
+                .position(|l| l.contains("pub const VALUES"))
+                .unwrap_or(0);
+            let literal = format!("\"{view}\",");
+            let line = protocol
+                .lines()
+                .enumerate()
+                .skip(start)
+                .find(|(_, l)| l.trim() == literal)
+                .map_or(start, |(i, _)| i);
+            format!("crates/tako-control/src/protocol.rs:{}", line + 1)
+        };
+        let table = main_rs_at(source, "const PANEL_VIEW_ENTRIES");
+        let mut problems = Vec::new();
+        for view in PanelViewWire::VALUES {
+            let n = PANEL_VIEW_ENTRIES
+                .iter()
+                .filter(|(v, ..)| *v == view)
+                .count();
+            if n != 1 {
+                problems.push(format!(
+                    "{}: {view} が {table} の PANEL_VIEW_ENTRIES に {n} 回載っている（表示メニューの\
+                     「パネル」とパレットへ入口を足すか、置かない理由を書いて 1 回だけ載せる）",
+                    value_at(view)
+                ));
+            }
+        }
+        for (view, menu, palette) in PANEL_VIEW_ENTRIES {
+            if !PanelViewWire::VALUES.contains(view) {
+                problems.push(format!(
+                    "{table}: {view} は PanelViewWire::VALUES に無い（表から消す）"
+                ));
+            }
+            for (column, entry) in [("メニュー", menu), ("パレット", palette)] {
+                if let ViewEntry::Without(why) = entry {
+                    if why.trim().is_empty() {
+                        problems.push(format!("{table}: {view} の{column}の理由が空"));
+                    }
+                }
+            }
+        }
+        let order: Vec<&str> = PANEL_VIEW_ENTRIES
+            .iter()
+            .map(|(v, ..)| *v)
+            .filter(|v| PanelViewWire::VALUES.contains(v))
+            .collect();
+        let known: Vec<&str> = PanelViewWire::VALUES
+            .iter()
+            .copied()
+            .filter(|v| order.contains(v))
+            .collect();
+        if order != known {
+            problems.push(format!(
+                "{table}: 表の並び {order:?} が PanelViewWire::VALUES の順 {known:?} と違う"
+            ));
+        }
+        assert!(
+            problems.is_empty(),
+            "右パネルのビューの入口が表に分類されていない（#2341）:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// **表示メニューの「パネル」は表の項目だけを表の並びで持ち、各項目はそのビューを開く**（#2341）。
+    ///
+    /// 両言語の実メニューから「パネル」の直下のアクションを集めて表と比べ、各アクションの
+    /// `on_action` が `toggle_panel_view(PanelView::<そのビュー>, cx)` を呼ぶことをソースで見る
+    /// （パレットの `panel-*` と同じ実体 = 開いた瞬間の読み直しも同じ）。置かない理由が
+    /// 別のメニューの項目（`tako::FindInFiles`）を名指すなら、その項目が実在することも見る
+    #[test]
+    fn メニューのパネルの項目はビューの表と同じ並びでそのビューを開く() {
+        let source = include_str!("main.rs");
+        let table = main_rs_at(source, "const PANEL_VIEW_ENTRIES");
+        let want: Vec<&str> = panel_view_items(false).iter().map(|(_, a)| *a).collect();
+        let problems = std::cell::RefCell::new(Vec::new());
+        crate::ui_text::tests_support::for_each_lang(|| {
+            let lang = tako_core::i18n::lang();
+            let panel = crate::ui_text::menu::panel();
+            let menus = app_menus();
+            let all = all_actions(&menus);
+            let got: Vec<String> = menus
+                .iter()
+                .flat_map(|menu| menu.items.iter())
+                .find_map(|item| match item {
+                    MenuItem::Submenu(sub) if sub.name == panel => Some(
+                        sub.items
+                            .iter()
+                            .filter_map(|i| match i {
+                                MenuItem::Action { action, .. } => Some(action.name().to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if got != want {
+                problems.borrow_mut().push(format!(
+                    "{table}: [{lang:?}] 「{panel}」の項目 {got:?} が表の並び {want:?} と違う"
+                ));
+            }
+            for (view, menu, _) in PANEL_VIEW_ENTRIES {
+                let ViewEntry::Without(why) = menu else {
+                    continue;
+                };
+                for named in why.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':')) {
+                    if named.starts_with("tako::") && !all.iter().any(|(_, a)| a == named) {
+                        problems.borrow_mut().push(format!(
+                            "{table}: [{lang:?}] {view} の理由が名指す {named} がメニューに無い"
+                        ));
+                    }
+                }
+            }
+        });
+        let mut problems = problems.into_inner();
+        for (view, action) in panel_view_items(false) {
+            let short = action.strip_prefix("tako::").unwrap_or(action);
+            let handler = format!("_: &{short}, _, cx|");
+            let opens = format!(
+                "toggle_panel_view(PanelView::{}, cx)",
+                panel_view_variant(view)
+            );
+            let body = source.find(&handler).map(|at| {
+                let rest = &source[at..];
+                &rest[..rest.find("}))").unwrap_or(rest.len())]
+            });
+            match body {
+                Some(body) if body.contains(&opens) => {}
+                Some(_) => problems.push(format!(
+                    "{}: {action} のハンドラが {view} を開かない（{opens} が無い）",
+                    main_rs_at(source, &handler)
+                )),
+                None => problems.push(format!(
+                    "{table}: {action} の on_action ハンドラが無い（{opens} を呼ぶハンドラを足す）"
+                )),
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "表示メニューの「パネル」が右パネルのビューの表と合っていない（#2341）:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// **パレットの `panel-*` は表の項目だけを表の並びで持ち、各項目はそのビューを開く**（#2341）。
+    ///
+    /// `PALETTE_COMMANDS` の `panel-` で始まる id を表と比べ、パレットの実行の腕
+    /// （id の腕がそのビューの `toggle_panel_view` を呼ぶか）をソースで見る。
+    /// この説明に腕の形をそのまま書かない（ソースの走査がここに当たって番犬が効かなくなる）
+    #[test]
+    fn パレットのパネルの項目はビューの表と同じ並びでそのビューを開く() {
+        let source = include_str!("main.rs");
+        let table = main_rs_at(source, "const PANEL_VIEW_ENTRIES");
+        let want: Vec<&str> = panel_view_items(true).iter().map(|(_, id)| *id).collect();
+        let got: Vec<&str> = PALETTE_COMMANDS
+            .iter()
+            .copied()
+            .filter(|id| id.starts_with("panel-"))
+            .collect();
+        let mut problems = Vec::new();
+        if got != want {
+            problems.push(format!(
+                "{}: PALETTE_COMMANDS の panel-* {got:?} が表の並び {want:?} と違う（{table}）",
+                main_rs_at(source, "const PALETTE_COMMANDS")
+            ));
+        }
+        for (view, id) in panel_view_items(true) {
+            let arm = format!("\"{id}\" => self.toggle_panel_view(PanelView::");
+            let opens = format!("{arm}{}, cx)", panel_view_variant(view));
+            if !source.contains(&opens) {
+                problems.push(format!(
+                    "{}: パレットの {id} が {view} を開かない（{opens} が無い）",
+                    main_rs_at(source, &arm)
+                ));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "パレットの panel-* が右パネルのビューの表と合っていない（#2341）:\n  {}",
             problems.join("\n  ")
         );
     }

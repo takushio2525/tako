@@ -66,6 +66,9 @@ actions!(
         ShowFleetPanel,
         ShowOrchPanel,
         ShowGitPanel,
+        // #2341: 表示メニューの「パネル」の tasks / usage（パレットにだけあった）
+        ShowTasksPanel,
+        ShowUsagePanel,
         OpenDocumentation,
         ReportIssue,
         // #1677: ジャンプ履歴の戻る / 進む（割当と理由は `jump_bindings`）
