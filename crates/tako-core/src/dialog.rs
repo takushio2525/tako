@@ -687,7 +687,8 @@ fn numbered_above_empty_input(
 ///
 /// 通すのは 4 種だけ: 空行 / 選択肢の説明列の折り返し（ラベル列以降へ字下げされた行。
 /// 実採取: `❯ 1. そのまま変更する（推奨）` の続きが同じ画面で 5 桁 = ラベル列）/
-/// 確定キーの案内 / 罫線（入力ボックスの上端）。**そのうえで案内が 1 行は要る**。
+/// 確定キーの案内（狭いペインで折れた続きの行を含む = [`WrappedHint`]。#2343）/
+/// 罫線（入力ボックスの上端）。**そのうえで案内が 1 行は要る**。
 ///
 /// これが「そのダイアログが**生きている**」ことの根拠になる。会話ログへ流れた
 /// **解決済みの**ダイアログは字面が同じなので、案内の有無だけでは区別できない。
@@ -698,8 +699,23 @@ fn numbered_above_empty_input(
 fn dialog_reaches_input_box(lines: &[&str], last_row: usize, input_row: usize) -> bool {
     let content_col = wrap_indent_floor(lines[last_row]).unwrap_or(0);
     let mut hint = false;
+    // 途中で折れた確定キーの案内（#2343）。続きを待っているあいだだけ Some
+    let mut wrapped: Option<WrappedHint> = None;
     for line in lines.get(last_row + 1..input_row).unwrap_or_default() {
-        match gap_line_kind(line, content_col) {
+        let mut kind = gap_line_kind(line, content_col);
+        let continued = match (kind, &wrapped) {
+            (GapLine::Foreign, Some(open)) => open.continued_by(line),
+            _ => None,
+        };
+        if continued.is_some() {
+            kind = GapLine::KeyHint;
+        }
+        wrapped = match continued {
+            Some(next) => next.open(),
+            None if kind == GapLine::KeyHint => WrappedHint::start(line),
+            None => None,
+        };
+        match kind {
             // ダイアログの一部でない行が挟まっている（= 会話ログの残骸）
             GapLine::Foreign => return false,
             GapLine::KeyHint => hint = true,
@@ -707,6 +723,138 @@ fn dialog_reaches_input_box(lines: &[&str], last_row: usize, input_row: usize) -
         }
     }
     hint
+}
+
+/// 確定キーの案内が**途中で折れている**ときの、ここまでの文（#2343）。
+///
+/// 狭いペインでは案内そのものが折り返される。行ごとの [`is_key_hint`] は 1 行目
+/// （`Enter to select · ↑/↓ to`）しか読めず、続きの行（`navigate · Esc to` / `cancel`）は
+/// 「ダイアログの外の行」になって経路 4 / 5 が採らなかった（24 桁の背の高い AskUserQuestion。
+/// 実採取 claude 2.1.301）。
+///
+/// 案内は `<キー> to <動詞>` を ` · ` で並べた 1 文（[`hint_shape`]）なので、**繋いだ文が
+/// その形のままで、まだ文が終わっていない**（最後の区切りに動詞が無い）あいだだけ、直下の
+/// 同じ桁の行を続きとして読む。行の字面ではなく文の形で読むので、`cancel` の 1 語だけの行も
+/// 前の行が `Esc to` で切れていれば案内と分かり、文が終わった後の行・形の崩れる行
+/// （会話の本文）は従来どおりダイアログの外になる
+#[derive(Debug, Clone)]
+struct WrappedHint {
+    /// ここまでの案内を空白 1 つで繋いだ文
+    text: String,
+    /// 案内の 1 行目の字下げ（折り返しの続きは同じ桁から始まる）
+    indent: usize,
+}
+
+impl WrappedHint {
+    /// 案内の行 `line` から始める。文が終わっていれば `None`（続きを待たない）
+    fn start(line: &str) -> Option<Self> {
+        if legacy_2343() {
+            return None;
+        }
+        WrappedHint {
+            text: line.trim().to_string(),
+            indent: line.chars().take_while(|c| *c == ' ').count(),
+        }
+        .open()
+    }
+
+    /// 文が途中なら続きを待つ状態として残す
+    fn open(self) -> Option<Self> {
+        (hint_shape(&self.text) == Some(HintShape::Open)).then_some(self)
+    }
+
+    /// `line` がこの案内の続きなら、繋いだ後の状態
+    fn continued_by(&self, line: &str) -> Option<Self> {
+        let t = line.trim();
+        let element =
+            cursor_content(line).is_some() || numbered_choice(strip_indent(line)).is_some();
+        if t.is_empty() || element || line.chars().take_while(|c| *c == ' ').count() != self.indent
+        {
+            return None;
+        }
+        let text = format!("{} {t}", self.text);
+        hint_shape(&text).map(|_| WrappedHint {
+            text,
+            indent: self.indent,
+        })
+    }
+}
+
+/// 確定キーの案内の文の形（[`hint_shape`] の戻り）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintShape {
+    /// すべての区切りが `<キー> to <動詞>` で閉じている
+    Closed,
+    /// 最後の区切りが途中（`Esc` / `Esc to` / 末尾の `·`）= 次の行へ続く
+    Open,
+}
+
+/// 区切りのキーに置ける語の数（実採取: claude の `Enter` / `↑/↓` / `ctrl+e` / `n`・
+/// codex の `Press enter`）
+const HINT_KEY_WORDS: usize = 2;
+
+/// 区切りの動詞に置ける語の数（実採取: `cancel` / `add notes`）
+const HINT_VERB_WORDS: usize = 2;
+
+/// `text` が確定キーの案内の文（`<キー> to <動詞>` を ` · ` で並べたもの）の形か（#2343）。
+///
+/// 実採取の案内はすべてこの形: claude 2.1.301 の AskUserQuestion の
+/// `Enter to select · ↑/↓ to navigate · Esc to cancel`（preview つきは
+/// `… · n to add notes · Esc to cancel`）、permission の `Esc to cancel · Tab to amend`、
+/// claude v2.1.220 の permission の `Esc to cancel · Tab to amend · ctrl+e to explain`
+/// （下の tests の `PERMISSION`）。動詞は小文字の英単語だけ（会話の本文が混ざれば形が崩れる）。
+/// 形でなければ `None`
+fn hint_shape(text: &str) -> Option<HintShape> {
+    let segments: Vec<&str> = text.split('·').map(str::trim).collect();
+    let (last, closed) = segments.split_last()?;
+    for seg in closed {
+        if hint_segment(seg)? != HintShape::Closed {
+            return None; // 途中の区切りが閉じていない = 案内の文ではない
+        }
+    }
+    // 末尾の `·`（次の区切りが次の行へ回った）
+    if last.is_empty() {
+        return (!closed.is_empty()).then_some(HintShape::Open);
+    }
+    hint_segment(last)
+}
+
+/// 区切り 1 つ（`<キー> to <動詞>`）の形。`to` か動詞がまだ無ければ [`HintShape::Open`]。
+///
+/// キーの語は ASCII と矢印だけ（実採取のキーはすべてそう）。キーだけの区切りも「途中」と
+/// 読むので、ここを緩めると `·` で折れた案内の下の短い本文（`了解です`）を続きと読む
+fn hint_segment(seg: &str) -> Option<HintShape> {
+    let words: Vec<&str> = seg.split_whitespace().collect();
+    let to = words.iter().position(|w| *w == "to");
+    let key = to.unwrap_or(words.len());
+    let key_word = |w: &&str| {
+        w.chars()
+            .all(|c| c.is_ascii_graphic() || "↑↓←→".contains(c))
+    };
+    if key == 0 || key > HINT_KEY_WORDS || !words[..key].iter().all(key_word) {
+        return None;
+    }
+    let Some(to) = to else {
+        return Some(HintShape::Open); // キーだけ（`Esc` で折れた）
+    };
+    let verb = &words[to + 1..];
+    if verb.len() > HINT_VERB_WORDS
+        || !verb
+            .iter()
+            .all(|w| w.chars().all(|c| c.is_ascii_lowercase()))
+    {
+        return None;
+    }
+    Some(match verb.is_empty() {
+        true => HintShape::Open,
+        false => HintShape::Closed,
+    })
+}
+
+/// `TAKO_2343_LEGACY=1` で #2343 前（確定キーの案内を 1 行ずつしか読まない）へ戻す（A/B 用）
+fn legacy_2343() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2343_LEGACY").is_ok_and(|v| v == "1"))
 }
 
 /// `TAKO_1263_LEGACY=1` で #1263 前（空の入力欄で打ち切る）へ戻す（A/B 用）
@@ -729,7 +877,11 @@ fn legacy_input_box_below() -> bool {
 /// 案内・罫線）で、案内が 1 行はあるときだけ採る（判定は経路 4 と同じ
 /// [`dialog_reaches_input_box`]。入力欄の代わりに画面の下端までを見る）。窓の中に
 /// 選択カーソル（空の入力欄を含む）が 1 つでもある画面はここへ来ないので、会話ログへ流れた
-/// 解決済みのダイアログ（下に入力欄がある）を拾うことはない
+/// 解決済みのダイアログ（下に入力欄がある）を拾うことはない。
+///
+/// 24 桁では案内そのものが 3 行に折れる（`Enter to select · ↑/↓ to` / `navigate · Esc to` /
+/// `cancel`）。続きの行は [`WrappedHint`] が案内の文の形で読む（#2343。それまでは 2 行目以降が
+/// ダイアログの外の行になり、背の高い並びを 24 桁でだけ拾えなかった）
 fn numbered_above_scan(
     lines: &[&str],
     undecided: &[bool],
@@ -3692,6 +3844,74 @@ Antigravity CLI requires permission to read, edit, and execute files here.
                 Some(want),
                 "{name}: 本文の先頭が変わった: {:?}",
                 list.header
+            );
+        }
+    }
+
+    // --- #2343: 狭いペインで折れた確定キーの案内 ---
+
+    #[test]
+    fn issue2343_案内の文の形() {
+        use HintShape::{Closed, Open};
+        for (text, want) in [
+            // 実採取の 1 行の案内（閉じている）
+            (
+                "Enter to select · ↑/↓ to navigate · Esc to cancel",
+                Some(Closed),
+            ),
+            (
+                "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel",
+                Some(Closed),
+            ),
+            (
+                "Esc to cancel · Tab to amend · ctrl+e to explain",
+                Some(Closed),
+            ),
+            ("Press enter to continue", Some(Closed)),
+            // 実採取の折れ目（途中 = 次の行へ続く）
+            ("Enter to select · ↑/↓ to", Some(Open)),
+            ("Enter to select · ↑/↓ to navigate · Esc to", Some(Open)),
+            ("Enter to select · ↑/↓ to navigate · Esc", Some(Open)),
+            ("Enter to select · ↑/↓ to navigate ·", Some(Open)),
+            // 形が崩れる = 案内ではない（会話の本文が混ざった）
+            ("Enter to select · ↑/↓ to ⏺ 了解です", None),
+            ("Enter to select · 了解です", None),
+            ("Esc to cancel the operation now", None),
+            ("Esc to Cancel", None),
+            ("Enter to · Esc to cancel", None),
+            ("· Esc to cancel", None),
+            // agy の案内は `to` の無い形 = 続きを待たない（1 行の判定は従来どおり is_key_hint）
+            ("↑/↓ Navigate · enter Confirm", None),
+        ] {
+            assert_eq!(hint_shape(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn issue2343_auto_modeの確認で折れた案内も入力欄の上で読む() {
+        // #1263 の実採取画面の案内を、狭い幅の折れ方（`Esc to` / `cancel`）へ置き換えた合成。
+        // 修正前は 2 行目の `cancel` がダイアログの外の行になり、経路 4 が採らなかった
+        let wrapped = TEACH_AUTO_MODE.replace(
+            "  Enter to confirm · Esc to cancel\n",
+            "  Enter to confirm · Esc to\n  cancel\n",
+        );
+        let list = detect_choice_list(&rows(&wrapped)).expect("折れた案内でも検知される");
+        let full = detect_choice_list(&rows(TEACH_AUTO_MODE)).expect("実採取");
+        assert_eq!(options_of(&list), options_of(&full));
+        // 続きの行が案内の桁から外れる / 文が終わった後に本文が続くなら従来どおり拾わない
+        for (name, tail) in [
+            // 0 桁 = 案内（2 桁）とも説明の折り返し（5 桁以上）とも違う桁
+            ("桁違い", "  Enter to confirm · Esc to\ncancel\n"),
+            (
+                "本文",
+                "  Enter to confirm · Esc to\n  cancel\n  了解です\n",
+            ),
+            ("本文だけ", "  Enter to confirm · Esc to\n  了解です\n"),
+        ] {
+            let screen = TEACH_AUTO_MODE.replace("  Enter to confirm · Esc to cancel\n", tail);
+            assert!(
+                detect_choice_list(&rows(&screen)).is_none(),
+                "{name}: 案内の続きでない行を案内と読んだ"
             );
         }
     }
