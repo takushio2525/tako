@@ -353,9 +353,18 @@ fn ps_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
 
-/// `check-powershell51.ps1` を pwsh で起こし、`PS51 <判定> <パス> …` の行を (パス, 判定) で返す。
-/// pwsh が無ければ None
-fn run_checker(args: &[PathBuf], cache: &Path) -> Option<(bool, Vec<(String, String)>, String)> {
+/// `check-powershell51.ps1` を 1 回走らせた結果
+struct CheckerRun {
+    /// 終了コードが 0 か（broken が 1 本でもあれば 1）
+    ok: bool,
+    /// `PS51 <判定> <パス> …` の行の (パス, 判定)
+    rows: Vec<(String, String)>,
+    /// 落ちたときに添える stdout / stderr
+    context: String,
+}
+
+/// `check-powershell51.ps1` を pwsh で起こす。pwsh が無ければ None
+fn run_checker(args: &[PathBuf], cache: &Path) -> Option<CheckerRun> {
     // canonicalize しない（Windows では `\\?\` 付きになり、$PSScriptRoot から組むルートとずれうる）
     let checker = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -391,7 +400,11 @@ fn run_checker(args: &[PathBuf], cache: &Path) -> Option<(bool, Vec<(String, Str
         })
         .collect();
     let context = format!("{CHECKER}\n--- stdout\n{stdout}\n--- stderr\n{stderr}");
-    Some((out.status.success(), rows, context))
+    Some(CheckerRun {
+        ok: out.status.success(),
+        rows,
+        context,
+    })
 }
 
 /// 実際の読み方: 5.1 の読み方を写して（BOM が無ければ CP1252 と CP932 で復号して）構文解析し、
@@ -407,7 +420,7 @@ fn ps1を5_1の読み方で読むと読めるか理由を出して止まる() {
     let root = scratch.path();
     let cache = root.join("pwsh-cache");
 
-    let Some((ok, rows, context)) = run_checker(&[], &cache) else {
+    let Some(CheckerRun { ok, rows, context }) = run_checker(&[], &cache) else {
         eprintln!("pwsh が無いので {CHECKER} の実行検証をスキップ（静的な検査は実施済み）");
         return;
     };
@@ -461,7 +474,8 @@ fn ps1を5_1の読み方で読むと読めるか理由を出して止まる() {
     cases.push((without_bom, "broken"));
 
     let args: Vec<PathBuf> = cases.iter().map(|(p, _)| p.clone()).collect();
-    let (ok, rows, context) = run_checker(&args, &cache).expect("pwsh は上で見つかった");
+    let CheckerRun { ok, rows, context } =
+        run_checker(&args, &cache).expect("pwsh は上で見つかった");
     let mut problems = Vec::new();
     for (path, want) in &cases {
         let name = path
