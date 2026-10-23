@@ -3605,6 +3605,15 @@ fn release_wakeup_gate(gate: &std::sync::atomic::AtomicBool) {
     gate.store(false, std::sync::atomic::Ordering::Release);
 }
 
+/// **#2344 の検出力の注入**（`TAKO_2344_INJECT=nogate`）: 画面に出ていないペインの
+/// 描き直しの合図を省かない（= #816 のゲートを外す。見えているペインと同じ間引きだけになる）。
+/// セルフテスト項目 113 がこれで落ちること = 判定が偽の緑でないことの実測に使う。
+/// 製品の既定は常に省く
+fn inject_2344_nogate() -> bool {
+    static NOGATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NOGATE.get_or_init(|| std::env::var("TAKO_2344_INJECT").is_ok_and(|v| v == "nogate"))
+}
+
 /// background の結果を UI スレッドで着地させ、先取りの答えが足りなければもう一巡
 /// background へ出す（#1984）。IPC の受け口と GUI のボタン（[`TakoApp::dispatch_off_ui`]）が通る。
 ///
@@ -3677,11 +3686,13 @@ enum OffloadLanded {
 /// 端末イベントを 4ms 窓でまとめて 1 回にする（Issue #782。zed の
 /// `Terminal::subscribe` と同じ方式）。
 ///
-/// `TermEvent::Wakeup` は「画面が変わったので描き直して」以上の意味を持たない
-/// no-op（`process_event` が None を返す）なので、窓内に何件届いても 1 件に畳める。
-/// それ以外（タイトル変更・OSC・PTY 書き込み・終了）は順序どおり全件処理する。
+/// 描き直しの合図（`TermEvent::Wakeup` と、tako では何もしない `CursorBlinkingChange` /
+/// `MouseCursorDirty`。分類の正本は [`tako_core::SessionEvent::is_redraw_hint`]。#2344）は
+/// 「画面が変わったので描き直して」以上の意味を持たない no-op なので、窓内に何件届いても
+/// 1 件の Wakeup に畳める。それ以外（タイトル変更・OSC・PTY 書き込み・終了）は順序どおり
+/// 全件処理する。
 ///
-/// #816: 窓の中身が Wakeup だけで、しかもそのペインが画面のどこにも映っていない
+/// #816: 窓の中身が合図だけで、しかもそのペインが画面のどこにも映っていない
 /// （`delivery.hidden` が立っている）なら、メインスレッドへ渡らずに外側の待ちへ戻る。
 /// 判定の正は従来どおり `on_term_event` の `pane_visibility` で、ここはその申し送りを
 /// 読むだけ。申し送りが古い場合の上限は外側の再確認間隔
@@ -3701,6 +3712,7 @@ async fn batch_term_events(
     // #816: 再描画の間隔（16ms）に満たないうちに来た Wakeup は持ち越す。
     // 捨てるのではなく次の窓へ繰り越すので、出力が止まっても最後の 1 枚は必ず描かれる
     let mut carried_wakeup = false;
+    let gate_on = !inject_2344_nogate();
     loop {
         let mut events: Vec<tako_core::SessionEvent> = Vec::new();
         let mut wakeup = carried_wakeup;
@@ -3713,7 +3725,7 @@ async fn batch_term_events(
                 _ = timer => break,
                 event = rx.next() => match event {
                     Some(event) => {
-                        if matches!(event, tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup)) {
+                        if event.is_redraw_hint() {
                             wakeup = true;
                         } else {
                             events.push(event);
@@ -3730,8 +3742,11 @@ async fn batch_term_events(
         if events.is_empty() && !wakeup {
             return Ok(()); // 窓のあいだ静かだった → 外側の待ちへ戻る
         }
-        if events.is_empty() && delivery.hidden.load(std::sync::atomic::Ordering::Relaxed) {
-            // #816: 画面に出ないペインの Wakeup だけ → 往復せず外側の待ちへ戻す。
+        if events.is_empty()
+            && gate_on
+            && delivery.hidden.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // #816: 画面に出ないペインの描き直しの合図だけ → 往復せず外側の待ちへ戻す。
             // ゲートは倒しておく（倒さないと PTY 側が次の Wakeup を送らず、
             // 外側の再確認そのものが起きなくなる）
             release_wakeup_gate(gate);
@@ -3741,7 +3756,7 @@ async fn batch_term_events(
             return Ok(());
         }
         if events.is_empty() && last_hop.elapsed() < delivery.hop_interval() {
-            // #816: Wakeup だけの窓で、まだ次の再描画時刻に達していない。
+            // #816: 描き直しの合図だけの窓で、まだ次の再描画時刻に達していない。
             // いま渡しても `on_term_event` は遅延フラッシュを積むだけなので、
             // 持ち越して窓をもう 1 周する（描かれる時刻は変わらない）
             carried_wakeup = true;
@@ -10411,12 +10426,15 @@ impl TakoApp {
             // `d` 未満で panic する）。`batch_term_events` が `&mut Instant` を受けるので
             // 型は変えない。窓は 200ms なので飽和しても取りこぼしは起きない
             let mut last_hop = tako_core::monotonic::rewound(TakoApp::HIDDEN_WAKEUP_RECHECK);
+            let gate_on = !inject_2344_nogate();
             while let Some(event) = rx.next().await {
-                let wakeup_only = matches!(
-                    event,
-                    tako_core::SessionEvent::Term(tako_core::TermEvent::Wakeup)
-                );
-                if wakeup_only
+                // #2344: 描き直しの合図（Wakeup と、tako では何もしない
+                // CursorBlinkingChange / MouseCursorDirty）だけがゲートに載る。tmux の器越しの
+                // ペインは描き直しのたびに `\e[?12l` が来るので、Wakeup だけを見ていると
+                // 不可視のペインでも描き直しのたびにメインスレッドへ渡っていた
+                let redraw_hint = event.is_redraw_hint();
+                if redraw_hint
+                    && gate_on
                     && delivery.hidden.load(std::sync::atomic::Ordering::Relaxed)
                     && last_hop.elapsed() < TakoApp::HIDDEN_WAKEUP_RECHECK
                 {
@@ -10438,7 +10456,7 @@ impl TakoApp {
                 // 変わらない**（従来もデバウンスで同じ境界まで遅延していた）し、
                 // 待っているあいだに届いた分は次の窓でまとめて処理される。
                 // 静かなペインへの打鍵（= 直前の往復が 16ms 以上前）は即時のまま
-                if wakeup_only {
+                if redraw_hint {
                     let since = last_hop.elapsed();
                     // #1979: フォーカスの無いペインは再描画の上限の間隔まで待つ
                     let interval = delivery.hop_interval();
@@ -10450,7 +10468,7 @@ impl TakoApp {
                 delivery
                     .hops
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if !wakeup_only {
+                if !redraw_hint {
                     delivery
                         .forced
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -32349,6 +32367,77 @@ mod self_test {
             && delta.app_notify == 0
             && delta.fallback == 0
             && delta.clock == 0
+    }
+
+    /// 項目 113（#816 / #2344）の材料 = 測る窓のあいだの差分
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct HiddenDeliveryDelta {
+        /// 窓の長さ
+        pub(crate) window_ms: u64,
+        /// メインスレッドへ渡った回数
+        pub(crate) hops: u64,
+        /// そのうち描き直しの合図ではない（必ず渡す）イベントが乗っていた回数
+        pub(crate) forced: u64,
+        /// 合図を渡さずに省いた回数
+        pub(crate) skipped: u64,
+        /// 窓のあいだに進んだ行数
+        pub(crate) grew: u64,
+    }
+
+    /// 項目 113 の判定（純粋関数。#2344）。3 本に割ってあり、どれで落ちたかが出力から決まる
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct HiddenDeliveryVerdict {
+        /// 合図の往復（`hops − forced`）の上限 = 窓 / 再確認の間隔 + 2
+        pub(crate) bound: u64,
+        pub(crate) hint_hops: u64,
+        /// 窓のあいだに届いた合図（合図の往復 + 省いた数）
+        pub(crate) reached: u64,
+        /// 必ず渡す往復の上限 = 進んだ行数 / 4
+        pub(crate) forced_limit: u64,
+        /// ① 合図の往復が再確認の間隔で頭打ちになっている
+        pub(crate) gated: bool,
+        /// ② 検出力: 届いた合図が ① の上限を超えている（= ゲートが無ければ ① が破れる量が流れた）
+        pub(crate) powered: bool,
+        /// ③ 必ず渡す往復が出力の数に比例しない
+        pub(crate) forced_rare: bool,
+    }
+
+    /// 画面に出ていないペインの配送を判定する（#816 / #2344）。
+    ///
+    /// **① は負荷に依らず構成上成り立つ**: 不可視のペインで合図が往復するのは
+    /// 「直前の往復から再確認の間隔が経った後の最初の合図」だけなので、長さ W の窓に入る
+    /// 合図の往復は `W / 再確認 + 1` 回まで（窓の端の位相）。もう 1 回は可視判定が届く前の
+    /// 最初の 1 件（申し送りの既定は「見えている」）。必ず渡る往復は直前の往復の時刻を
+    /// 進めるだけで、合図の往復を増やさない。ゲートを外すと合図は再描画の間隔（16 / 33ms）で
+    /// 渡るので、1 行の間隔が再確認の間隔より短い限り ① が破れる。
+    ///
+    /// ② はその前提（ゲートが無ければ ① が破れるだけの合図が届いた）が立っていることの確認。
+    /// 出力が再確認の間隔より遅いと ① はゲートの有無に依らず通るので、偽の緑にしない。
+    ///
+    /// ③ は分類の確認（#2344）: 必ず渡すイベントは器の問い合わせ（DA / OSC 10・11 への応答）の
+    /// ような 1 回きりのものだけで、出力の行に比例して増えるなら合図であるべきものが
+    /// ゲートを素通りしている（`TAKO_2344_LEGACY=1` = `CursorBlinkingChange` が 1 行ごとに渡る形）。
+    ///
+    /// 旧判定（「省いた数 ≥ 渡した数」）は比で、1 行の間隔と描き直しに制御列が付く割合で
+    /// 割れていた（#2344 の実測: 4 回中 3 回）
+    pub(crate) fn hidden_delivery_verdict(
+        d: HiddenDeliveryDelta,
+        recheck: Duration,
+    ) -> HiddenDeliveryVerdict {
+        let recheck_ms = (recheck.as_millis() as u64).max(1);
+        let bound = d.window_ms / recheck_ms + 2;
+        let hint_hops = d.hops.saturating_sub(d.forced);
+        let reached = hint_hops + d.skipped;
+        let forced_limit = d.grew / 4;
+        HiddenDeliveryVerdict {
+            bound,
+            hint_hops,
+            reached,
+            forced_limit,
+            gated: hint_hops <= bound,
+            powered: reached > bound,
+            forced_rare: d.forced <= forced_limit,
+        }
     }
 
     /// 項目 154 の 2 巡目の前提（ターミナルへ出力が流れ始める）を待つ上限（純粋関数。#1938）。
@@ -85017,10 +85106,17 @@ mod self_test {
             // `on_term_event`（= 渡った後）で効くので、渡る回数は減っていなかった。
             //
             // 観測点はペインごとの配送カウンタ（`PaneDelivery`）。ゲート前は
-            // 出力のバーストごとに `hops` が増えるが、ゲート後は
+            // 出力のバーストごとに `hops` が増えるが、ゲート後は描き直しの合図の往復が
             // `HIDDEN_WAKEUP_RECHECK` ごとの再確認ぶんしか増えない。
             // ペインはシェルへ打ち込むのではなく**コマンド付きで起動**するので、
-            // プロンプトの立ち上がり待ちに依存しない
+            // プロンプトの立ち上がり待ちに依存しない。
+            //
+            // #2344: 判定は「省いた数 ≥ 渡した数」（比）をやめた。比は 1 行の間隔と
+            // 「描き直しにカーソルの制御列が付く割合」で決まる量で、tmux の器越しでは
+            // 1 行ごとに来る `CursorBlinkingChange`（当時は必ず渡っていた）が往復と
+            // 省いた数を 1 対 1 で積むので、4 回中 3 回落ちていた。いまは
+            // ① 合図の往復が再確認の間隔で頭打ち ② その検出力が立っている
+            // ③ 必ず渡す往復（`forced`）が出力の数に比例しない、の 3 本で見る
             #[cfg(unix)]
             {
                 let hidden816 = window
@@ -85041,7 +85137,18 @@ mod self_test {
                         for (id, mut options) in std::mem::take(&mut app.pending_attach) {
                             // 検出力の注入 `noflow` は出力なしで起こす（= 流れない）
                             if id == pane && inject_1153() != "noflow" {
-                                let emit = sh.emit_numbered_lines("l", 150, 20);
+                                // #2344: 1 行ごとにカーソルの形を 2（ブロック）↔ 6（バー）で
+                                // 切り替える（DECSCUSR）。端末は受けるたびに
+                                // `CursorBlinkingChange` を送るので、これが描き直しの合図から
+                                // 外れると（`TAKO_2344_LEGACY=1`）必ず渡る往復が行数に比例して
+                                // 増え、③ で確定で落ちる。tmux も xterm 系の外側へ形の変化を
+                                // 伝える（実測: 60 行で外側の DECSCUSR 85 回）ので、器の有無にも
+                                // tmux の描き直し具合にも依らない。項目 113 は unix だけなので
+                                // POSIX の書き方で組む
+                                let emit = "i=0; while [ $i -lt 300 ]; do \
+                                            printf '\\033[%d ql%d\\n' $((2 + i % 2 * 4)) $i; \
+                                            sleep 0.020; i=$((i+1)); done"
+                                    .to_string();
                                 // 遅れの再現 `lateflow`: 出力の**開始**を遅らせる
                                 // （1 行の間隔は変えない = バーストの密度は同じまま
                                 // 「固定 2500ms 窓では 40 行に届かない」だけを作る）
@@ -85090,27 +85197,25 @@ mod self_test {
                                 })
                                 .unwrap_or(0)
                         };
+                        // (hops, forced, skipped, 最後の行)
                         let snap = |cx: &mut gpui::AsyncApp| {
                             window
                                 .update(cx, |app: &mut TakoApp, _, _| {
+                                    use std::sync::atomic::Ordering::Relaxed;
                                     let d = app.pane_delivery.get(&pane);
                                     (
-                                        d.map(|d| d.hops.load(std::sync::atomic::Ordering::Relaxed))
-                                            .unwrap_or(0),
-                                        d.map(|d| {
-                                            d.skipped.load(std::sync::atomic::Ordering::Relaxed)
-                                        })
-                                        .unwrap_or(0),
+                                        d.map_or(0, |d| d.hops.load(Relaxed)),
+                                        d.map_or(0, |d| d.forced.load(Relaxed)),
+                                        d.map_or(0, |d| d.skipped.load(Relaxed)),
                                         last_line(app),
                                     )
                                 })
-                                .unwrap_or((0, 0, 0))
+                                .unwrap_or((0, 0, 0, 0))
                         };
-                        let (hop0, _, line0) = snap(cx);
+                        let (hop0, forced0, skip0, line0) = snap(cx);
                         let window_started = std::time::Instant::now();
-                        // 最低窓は据え置く（従来と同じ 2.5 秒）。`skipped` は
-                        // 「バーストのうち渡さずに省いた回数」なので、蓄積には
-                        // 出力が流れている時間そのものが要る
+                        // 最低窓は据え置く（従来と同じ 2.5 秒）。再確認の上限（②の比べる相手）は
+                        // 窓の長さに比例するので、出力が流れている時間そのものが要る
                         wait(cx, 2500).await;
                         // **「40 行増える」は固定窓ではなく状態で待つ**（#1153）。
                         //
@@ -85137,20 +85242,20 @@ mod self_test {
                             .await;
                             ok.then(|| window_started.elapsed())
                         };
-                        let (hop1, skip1, line1) = snap(cx);
-                        let hops = hop1.saturating_sub(hop0);
+                        let (hop1, forced1, skip1, line1) = snap(cx);
                         let grew = line1.saturating_sub(line0);
                         // 窓を伸ばしたぶんは再確認（`HIDDEN_WAKEUP_RECHECK`）の回数も
-                        // 増えるので、往復の上限は**窓の長さに対する率**で持つ
-                        // （2.5 秒のときは従来と同じ 80）。ゲート前は「出力 1 件ごとに渡る」
-                        // = 出力の数に比例して増えるので、窓が伸びても検出力は落ちない
+                        // 増えるので、合図の往復の上限は**窓の長さに対する率**で持つ（#1153）
                         let window_ms = window_started.elapsed().as_millis() as u64;
-                        let hops_bound = if legacy_1153() {
-                            80
-                        } else {
-                            80 + window_ms.saturating_sub(2500)
-                                / (TakoApp::HIDDEN_WAKEUP_RECHECK.as_millis() as u64)
+                        let delta = HiddenDeliveryDelta {
+                            window_ms,
+                            hops: hop1.saturating_sub(hop0),
+                            forced: forced1.saturating_sub(forced0),
+                            skipped: skip1.saturating_sub(skip0),
+                            grew,
                         };
+                        let verdict =
+                            hidden_delivery_verdict(delta, TakoApp::HIDDEN_WAKEUP_RECHECK);
                         let diag = window
                             .update(cx, |app: &mut TakoApp, _, _| {
                                 let s = app.terminals.get(&pane);
@@ -85168,30 +85273,44 @@ mod self_test {
                             })
                             .unwrap_or_default();
                         println!(
-                            "TAKO_SELF_TEST_816: hidden hops={hops}/{hops_bound} skipped={skip1} \
-                             lines+={grew} ({line0}->{line1}) recheck_ms={} window_ms={window_ms} \
-                             budget={:.1}s waited={:?} legacy={} {diag} {}",
+                            "TAKO_SELF_TEST_816: hidden hops={} hint={}/{} forced={}/{} \
+                             reached={} skipped+={} lines+={grew} ({line0}->{line1}) \
+                             recheck_ms={} window_ms={window_ms} budget={:.1}s waited={:?} \
+                             legacy={} legacy_2344={} inject_2344={} {diag} {}",
+                            delta.hops,
+                            verdict.hint_hops,
+                            verdict.bound,
+                            delta.forced,
+                            verdict.forced_limit,
+                            verdict.reached,
+                            delta.skipped,
                             TakoApp::HIDDEN_WAKEUP_RECHECK.as_millis(),
                             grow_budget.as_secs_f32(),
                             grow_waited.map(|d| format!("{:.1}s", d.as_secs_f32())),
                             legacy_1153(),
+                            tako_core::terminal::issue2344_legacy(),
+                            std::env::var("TAKO_2344_INJECT").unwrap_or_default(),
                             env_line()
                         );
                         // 出力が実際に流れていること（流れていなければ hops が少なくて当然）
                         check(grew >= 40, "113: 裏タブのペインで出力が実際に流れる (#816)");
-                        // ゲート前は「届いた Wakeup の数だけ渡る」ので skipped は 0 のまま。
-                        // ゲート後は渡した回数より省いた回数の方が多くなる
-                        // （hops に載る残りは Wakeup 以外 = タイトル等、常に渡すもの）
+                        // ③ を最初に見る: 分類を戻す（`TAKO_2344_LEGACY=1`）と 1 行ごとの
+                        // CursorBlinkingChange が必ず渡り、対の Wakeup もその往復に相乗りして
+                        // 省かれる合図が 0 になる（実測 `forced=85 skipped+=0`）= ② も巻き込んで
+                        // 破れるので、先に見ないと落ちた理由を検出力の不足と読み違える
                         check(
-                            skip1 >= hops && skip1 >= 20,
-                            "113: 不可視ペインの Wakeup は渡すより省く方が多い (#816)",
+                            verdict.forced_rare,
+                            "113: 不可視ペインで必ず渡すイベントが出力の数に比例しない (#2344)",
                         );
-                        // 2.5 秒 / 200ms = 13 回 + Wakeup 以外のぶん。ゲート前は
-                        // 出力 1 件ごとに渡るので 100 回超になる
-                        // （窓を伸ばした回は上限も同じ率で伸ばす = `hops_bound`）
+                        // ② 検出力（① より先に見る: 立っていなければ ① の合否に意味が無い）
                         check(
-                            hops <= hops_bound,
-                            "113: 不可視ペインへの往復が出力の数に比例しない (#816)",
+                            verdict.powered,
+                            "113: 再確認の上限を超える数の描き直しの合図が届いている（検出力。#816）",
+                        );
+                        // ① ゲートを外す（`TAKO_2344_INJECT=nogate`）と合図が 16 / 33ms ごとに渡って破れる
+                        check(
+                            verdict.gated,
+                            "113: 不可視ペインの描き直しの合図は再確認の間隔でしか渡らない (#816)",
                         );
                         // 表へ出したら申し送りが落ち、次の出力は普通に届く
                         let resumed = window
@@ -85216,11 +85335,23 @@ mod self_test {
                             resumed,
                             "113: 表へ出すと可視に戻り申し送りも落ちる (#816)",
                         );
-                        let (hop2, _, _) = snap(cx);
-                        wait(cx, 600).await;
-                        let (hop3, _, _) = snap(cx);
+                        // 固定 600ms 窓ではなく状態で待つ（#2344。fixture は 300 行 =
+                        // 表へ出した後も流れ続けるので、待てば必ず届く）
+                        let (hop2, _, _, _) = snap(cx);
+                        let resumed_hop = wait_for_app_state(
+                            window,
+                            cx,
+                            "816: 表へ出した後の往復",
+                            state_wait_budget(Duration::from_secs(5), machine_busy()),
+                            |app| {
+                                app.pane_delivery.get(&pane).is_some_and(|d| {
+                                    d.hops.load(std::sync::atomic::Ordering::Relaxed) > hop2
+                                })
+                            },
+                        )
+                        .await;
                         check(
-                            hop3 > hop2,
+                            resumed_hop,
                             "113: 表へ出した後は出力がメインスレッドへ届く (#816)",
                         );
                         let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
@@ -97366,6 +97497,94 @@ mod self_test_handoff_evidence_tests {
         assert!(is_handoff_done_text("Handoff complete; closing the pane"));
         assert!(is_handoff_done_text("HANDOFF COMPLETE"));
         assert!(!is_handoff_done_text("Handoff verification in progress"));
+    }
+}
+
+/// **項目 113 の判定**（#816 / #2344）。数値は隔離のセルフテスト（tako-vd）の実測から取った。
+/// 判定は純粋関数なので、負荷や tmux の描き方の偶然を待たずに「どの腕が通り・どの腕が落ちるか」を
+/// 固定できる
+#[cfg(test)]
+mod self_test_hidden_delivery_tests {
+    use super::self_test::{hidden_delivery_verdict, HiddenDeliveryDelta};
+    use std::time::Duration;
+
+    const RECHECK: Duration = Duration::from_millis(200);
+
+    fn verdict(
+        window_ms: u64,
+        hops: u64,
+        forced: u64,
+        skipped: u64,
+        grew: u64,
+    ) -> super::self_test::HiddenDeliveryVerdict {
+        hidden_delivery_verdict(
+            HiddenDeliveryDelta {
+                window_ms,
+                hops,
+                forced,
+                skipped,
+                grew,
+            },
+            RECHECK,
+        )
+    }
+
+    /// 修正前の分類で tmux の器越し（#2344 の計数入りの実測 d1: 窓 3.2 秒・43 行。往復 27 のうち
+    /// CursorBlinkingChange 23・器の問い合わせの塊 2 = 必ず渡す 25）は ③ で落ちる。
+    /// 旧判定（省いた 42 ≥ 渡した 27）はこの回は通っていた = 比では捕まえきれない
+    #[test]
+    fn 修正前の分類はカーソルの制御列が必ず渡るので落ちる() {
+        let v = verdict(3225, 27, 25, 42, 43);
+        assert!(v.powered && v.gated, "{v:?}");
+        assert!(!v.forced_rare, "{v:?}");
+    }
+
+    /// 1 行ごとに形を切り替える fixture で分類を戻す（`TAKO_2344_LEGACY=1`。実測 s6b:
+    /// 窓 3.3 秒・40 行・往復 85 がすべて必ず渡す往復）と、対の Wakeup も相乗りして省かれる
+    /// 合図が 0 になり ② も破れる。項目 113 が ③ を先に見るのはこのため（落ちた理由を
+    /// 検出力の不足と読み違えない）
+    #[test]
+    fn 分類を戻すと必ず渡す往復が合図を巻き込んで落ちる() {
+        let v = verdict(3341, 85, 85, 0, 40);
+        assert!(!v.forced_rare, "{v:?}");
+        assert!(!v.powered, "{v:?}");
+    }
+
+    /// 直接ペイン（E3: 窓 2.56 秒・95 行・往復 13 はすべて再確認）と、
+    /// 修正後の tmux の器越し（E4: 窓 3.3 秒・41 行・往復 8 のうち器の問い合わせ 1）は 3 本とも通る
+    #[test]
+    fn 修正後と直接ペインは3本とも通る() {
+        for v in [verdict(2559, 13, 0, 83, 95), verdict(3338, 8, 1, 57, 41)] {
+            assert!(v.powered && v.gated && v.forced_rare, "{v:?}");
+        }
+    }
+
+    /// ゲートを外す（`TAKO_2344_INJECT=nogate`）と合図が再描画の間隔（33ms）で渡るので、
+    /// 1 行の間隔が再確認より短い限り ① が破れる
+    #[test]
+    fn ゲートが無ければ合図の往復が上限を超えて落ちる() {
+        // 2.5 秒・60 行・合図は 33ms ごとに渡る
+        let v = verdict(2500, 76, 1, 30, 60);
+        assert!(v.powered, "{v:?}");
+        assert!(!v.gated, "{v:?}");
+    }
+
+    /// 出力が遅くても（1 行 150ms・窓 6 秒で 40 行）ゲートが効いていれば通る
+    /// = 旧判定（比）のように混み具合で割れない
+    #[test]
+    fn 出力が遅くてもゲートが効いていれば通る() {
+        let v = verdict(6000, 30, 0, 50, 40);
+        assert!(v.powered && v.gated && v.forced_rare, "{v:?}");
+    }
+
+    /// 出力が再確認の間隔より遅いと、ゲートの有無で往復の数が変わらない。① の合否に意味が
+    /// 無いので ② で落とす（偽の緑にしない）
+    #[test]
+    fn 出力が再確認より遅いと検出力が立たず落ちる() {
+        // 1 行 400ms・窓 16 秒・40 行: 1 行ごとに合図 2 件（形の切替 + Wakeup）のうち 1 件が渡る
+        let v = verdict(16000, 40, 0, 40, 40);
+        assert!(v.gated, "{v:?}");
+        assert!(!v.powered, "{v:?}");
     }
 }
 

@@ -41,6 +41,72 @@ pub enum SessionEvent {
     EncodingPin(crate::encoding_pin::PinLogEvent),
 }
 
+impl SessionEvent {
+    /// 「描き直しの合図」か（#816 / #2344）。真なら配送のゲート（画面に出ていなければ
+    /// メインスレッドへ渡さない・見えていても再描画の間隔より細かく渡さない）に載る。
+    /// 偽のイベントは可視性に依らず必ず渡る。判定の正本は [`redraw_hint`]
+    pub fn is_redraw_hint(&self) -> bool {
+        redraw_hint(self, issue2344_legacy())
+    }
+}
+
+/// 配送の分類（#2344）: メインスレッドへ渡さなくても失うものが無い「描き直しの合図」か。
+///
+/// | イベント | tako での処理 | 分類 |
+/// |---|---|---|
+/// | `Wakeup` | 描き直すだけ | 合図 |
+/// | `CursorBlinkingChange` | 何もしない（tako はカーソルを点滅させない = #932。形は描画のたびに Term から読む） | 合図（#2344） |
+/// | `MouseCursorDirty` | 何もしない（ペイン本体のポインタはマウス要求で変えない。要求の有無は転送の判断が Term のモードを読む） | 合図（#2344） |
+/// | `Bell` | 何もしない | 渡す（出来事であって描き直しの合図ではない。頻度も低い） |
+/// | `ColorRequest` / `TextAreaSizeRequest` / `ClipboardLoad` | 何もしない（応答していない） | 渡す（問い合わせ。応答を足すときに合図へ紛れて省かれないように） |
+/// | `PtyWrite` / `Title` / `ResetTitle` / `ClipboardStore` / `ChildExit` / `Exit` | 処理する | 渡す |
+/// | `Osc` / `EncodingPin` | 処理する | 渡す |
+///
+/// **2 つを合図へ寄せても描き直しは失わない**: alacritty はこれらを read の解析の途中で送り、
+/// PTY 側（`pty_loop`）は同じ read の終わりに必ず `Wakeup` を立てる（ゲートが立っていれば、
+/// 先に立った `Wakeup` がまだ配送待ち）。実 PTY のテスト
+/// `カーソルとマウスの切替は必ずwakeupと対で届く` が固定する。
+///
+/// 寄せないと何が起きるか: tmux の器越しのペインでは、tmux が画面が埋まってからの描き直しの
+/// 7〜8 割（行を流し続けるプログラムでは全部）に `\e[?25l … \e[?12l\e[?25h` を付け、
+/// `\e[?12l` のたびに `CursorBlinkingChange` が届く。合図でないので不可視のペインでも
+/// 描き直しのたびにメインスレッドへ渡り、#816 のゲートがほとんど効いていなかった（#2344 の
+/// 実測: 1 行 30ms で流し続ける裏タブのペインが 1 行ごとに 1 往復 = 33.4 回/秒 → 寄せて 4.8 回/秒）。
+///
+/// `legacy`（`TAKO_2344_LEGACY=1`）は #2344 前の分類（`Wakeup` だけが合図）。
+/// alacritty が種類を足したらここがコンパイルで止まる（網羅の match）ので、分類を決めて足す
+pub fn redraw_hint(event: &SessionEvent, legacy: bool) -> bool {
+    let SessionEvent::Term(event) = event else {
+        return false;
+    };
+    match event {
+        TermEvent::Wakeup => true,
+        TermEvent::CursorBlinkingChange | TermEvent::MouseCursorDirty => !legacy,
+        TermEvent::Bell
+        | TermEvent::ColorRequest(..)
+        | TermEvent::TextAreaSizeRequest(_)
+        | TermEvent::ClipboardLoad(..)
+        | TermEvent::PtyWrite(_)
+        | TermEvent::Title(_)
+        | TermEvent::ResetTitle
+        | TermEvent::ClipboardStore(..)
+        | TermEvent::ChildExit(_)
+        | TermEvent::Exit => false,
+    }
+}
+
+/// #2344 の A/B（`TAKO_2344_LEGACY=1`）。同一バイナリのまま配送の分類を修正前の形
+/// （`Wakeup` だけが描き直しの合図）へ戻す。**ゲートはこの 1 か所**（tako-app もここを読む）
+pub fn issue2344_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2344_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// OSC 133 マークから導出するコマンド実行状態（FR-2.1.4 の表示・list の公開元）。
 /// シェル統合が無いペインは Unknown のまま
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2504,6 +2570,144 @@ mod tests {
             }
         }
         assert!(resumed, "ゲートを倒しても Wakeup が再開しない");
+    }
+
+    /// #2344: 描き直しの合図の分類が表のとおり。`legacy`（`TAKO_2344_LEGACY=1`）は
+    /// #2344 前の分類（`Wakeup` だけ）。合図ではないイベントはどちらでも必ず渡る
+    #[test]
+    fn 描き直しの合図の分類は表のとおり() {
+        use alacritty_terminal::term::ClipboardType;
+        use alacritty_terminal::vte::ansi::Rgb;
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let term = |e: TermEvent| SessionEvent::Term(e);
+        for (event, new, legacy) in [
+            (term(TermEvent::Wakeup), true, true),
+            (term(TermEvent::CursorBlinkingChange), true, false),
+            (term(TermEvent::MouseCursorDirty), true, false),
+            (term(TermEvent::Bell), false, false),
+            (
+                term(TermEvent::ColorRequest(
+                    11,
+                    Arc::new(|_: Rgb| String::new()),
+                )),
+                false,
+                false,
+            ),
+            (
+                term(TermEvent::TextAreaSizeRequest(Arc::new(|_: WindowSize| {
+                    String::new()
+                }))),
+                false,
+                false,
+            ),
+            (
+                term(TermEvent::ClipboardLoad(
+                    ClipboardType::Clipboard,
+                    Arc::new(|_: &str| String::new()),
+                )),
+                false,
+                false,
+            ),
+            (term(TermEvent::PtyWrite("\x1b[0n".into())), false, false),
+            (term(TermEvent::Title("t".into())), false, false),
+            (term(TermEvent::ResetTitle), false, false),
+            (
+                term(TermEvent::ClipboardStore(
+                    ClipboardType::Clipboard,
+                    "x".into(),
+                )),
+                false,
+                false,
+            ),
+            (
+                term(TermEvent::ChildExit(std::process::ExitStatus::from_raw(0))),
+                false,
+                false,
+            ),
+            (term(TermEvent::Exit), false, false),
+            (
+                SessionEvent::Osc(OscEvent::CwdChanged(PathBuf::from("/tmp"))),
+                false,
+                false,
+            ),
+        ] {
+            assert_eq!(redraw_hint(&event, false), new, "既定の分類: {event:?}");
+            assert_eq!(
+                redraw_hint(&event, true),
+                legacy,
+                "LEGACY の分類: {event:?}"
+            );
+        }
+    }
+
+    /// #2344: カーソルの形（DECSCUSR）・点滅（?12）・マウス要求（?1000）の切替は、本文を
+    /// 伴わなくても**同じ read の `Wakeup` と対で届く**。だから `CursorBlinkingChange` /
+    /// `MouseCursorDirty` を描き直しの合図として畳んで省いても、描き直しは失わない
+    /// （省いた合図の代わりに対の `Wakeup` が同じ描き直しを起こす）。
+    ///
+    /// 受け手は `Wakeup` を受けたらすぐゲートを倒す（配送タスクと同じ）。ゲートが立ったまま
+    /// 次の切替が来た場合は、先に立った `Wakeup` がまだ配送待ちで、それを処理するときには
+    /// グリッドは切替の後になっている（このテストは切替の間隔を 100ms 空けてその形を作らない）
+    #[cfg(unix)]
+    #[test]
+    fn カーソルとマウスの切替は必ずwakeupと対で届く() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let script = "for s in '\\033[6 q' '\\033[?12l' '\\033[?1000h' '\\033[?1000l' \
+                      '\\033[2 q' '\\033[?12h' '\\033[?1000h' '\\033[?1000l'; do \
+                      printf \"$s\"; sleep 0.1; done";
+        let (session, mut rx) = TerminalSession::spawn(
+            40,
+            8,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        let gate = session.wakeup_gate();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (mut blink, mut mouse) = (0, 0);
+        // 合図を受けてから対の Wakeup をまだ受けていないか
+        let mut unpaired = false;
+        let mut exited = false;
+        while Instant::now() < deadline && !exited {
+            match rx.try_recv() {
+                Ok(SessionEvent::Term(TermEvent::Wakeup)) => {
+                    unpaired = false;
+                    gate.store(false, Ordering::Release);
+                }
+                Ok(SessionEvent::Term(TermEvent::CursorBlinkingChange)) => {
+                    blink += 1;
+                    unpaired = true;
+                }
+                Ok(SessionEvent::Term(TermEvent::MouseCursorDirty)) => {
+                    mouse += 1;
+                    unpaired = true;
+                }
+                Ok(SessionEvent::Term(TermEvent::ChildExit(_) | TermEvent::Exit)) => {
+                    exited = true;
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        assert!(exited, "スクリプトが終わらない");
+        // 形 2 回 + 点滅 2 回 = 4、マウス要求の切替 4 回
+        assert!(blink >= 4, "CursorBlinkingChange が足りない: {blink}");
+        assert!(mouse >= 4, "MouseCursorDirty が足りない: {mouse}");
+        assert!(
+            !unpaired,
+            "合図の後に対の Wakeup が来ないまま終わった（blink={blink} mouse={mouse}）"
+        );
     }
 
     /// **#818**: スクロールバック上限は `SpawnOptions` で決まり、その行数で履歴が
