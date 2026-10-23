@@ -30,23 +30,69 @@ pub use crate::host::{
 // 旧 trait 定義（74 メソッド）は 8 つのサブトレイトへ分割された。
 // dispatch のシグネチャ（&mut dyn ControlHost）は不変
 
-#[derive(Debug, PartialEq, thiserror::Error)]
+/// dispatch の断り。表示（`Display`）は表示言語に従う（#1762。日英の正本は [`Self::text_in`]）。
+///
+/// CLI / MCP の応答文はこの表示そのもの（IPC の受け口が `to_string()` して返す）なので、
+/// 前置きを片方の言語で固定すると、表示言語で書かれた理由の文と混ざる
+/// （英語表示の「無効なパラメータ: Invalid color value: …」）
+#[derive(Debug, PartialEq)]
 pub enum DispatchError {
-    #[error("ペイン {0} が見つからない")]
     PaneNotFound(u64),
-    #[error("タブ {0} が見つからない")]
     TabNotFound(u64),
-    #[error("対象ペインが未指定（--pane 指定か TAKO_PANE_ID が必要）")]
     NoTargetPane,
-    #[error("ペイン {0} にはターミナルセッションがない")]
     NoSession(u64),
-    #[error("無効なパラメータ: {0}")]
     InvalidParams(String),
-    #[error("{0}")]
     Operation(String),
 }
 
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 表示言語は ui_text の `tr!` と同じグローバル（tako_core::i18n）。読むのは 1 回（#608）
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
 impl DispatchError {
+    /// 表示言語を明示しての文言（#1762）。日英の対はここ 1 か所に置く。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #1762 より前の固定文とバイト一致
+    /// （`tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）。
+    /// 理由の文（`InvalidParams` / `Operation` の中身）は作った側が表示言語で書くもので、
+    /// ここでは触らない
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::PaneNotFound(id), Ja) => format!("ペイン {id} が見つからない"),
+            (Self::PaneNotFound(id), En) => format!("pane {id} not found"),
+            (Self::TabNotFound(id), Ja) => format!("タブ {id} が見つからない"),
+            (Self::TabNotFound(id), En) => format!("tab {id} not found"),
+            (Self::NoTargetPane, Ja) => {
+                "対象ペインが未指定（--pane 指定か TAKO_PANE_ID が必要）".to_string()
+            }
+            (Self::NoTargetPane, En) => {
+                "no target pane (pass --pane or set TAKO_PANE_ID)".to_string()
+            }
+            (Self::NoSession(id), Ja) => format!("ペイン {id} にはターミナルセッションがない"),
+            (Self::NoSession(id), En) => format!("pane {id} has no terminal session"),
+            (Self::InvalidParams(reason), Ja) => format!("無効なパラメータ: {reason}"),
+            (Self::InvalidParams(reason), En) => format!("invalid parameter: {reason}"),
+            // 前置きの無い理由の文だけ。言語に依らずそのまま返す
+            (Self::Operation(reason), Ja) | (Self::Operation(reason), En) => reason.clone(),
+        }
+    }
+
+    /// 応答の文（IPC の向こうでは文言しか残らない）が「対象が見つからない」を言っているか（#1762）。
+    ///
+    /// リモートの HTTP 層は GUI の dispatch の断りを文字列で受け取り、「見つからない」を
+    /// 404 などへ寄せる。前置きが表示言語に従うようになったので、日英どちらの形も
+    /// この 1 か所で読む（日本語は #1762 より前と同じ「見つからない」の部分一致）
+    pub fn says_not_found(message: &str) -> bool {
+        message.contains("見つからない") || message.contains(" not found")
+    }
+
     /// JSON-RPC エラーコードへの対応付け
     pub fn code(&self) -> i64 {
         match self {

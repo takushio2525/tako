@@ -301,7 +301,7 @@ fn 逆戻りを名指しできる() {
         CLI_FN,
         "            let res =\n                \
          tako_control::dispatch::dispatch_orchestrator_projects(\"list\", None, None, None)\n                    \
-         .map_err(|e| e.to_string())?;\n            \
+         .map_err(local_dispatch_err)?;\n            \
          let projects = res[\"projects\"].as_array().cloned().unwrap_or_default();",
         "            let config = orchestrator::ProjectsConfig::load()?;\n            \
          let projects = config.list_resolved();",

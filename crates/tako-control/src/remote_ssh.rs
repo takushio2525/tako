@@ -314,9 +314,9 @@ fn request_via_app(
 ///
 /// 判定材料は `PaneSshBlock::message` が必ず添える次の一手（`target=split`）と、
 /// ペイン解決の失敗。文言に依存するのでゆるく見て、外れたら 502 側（安全側 =
-/// 接続を張り直す）へ倒れる
+/// 接続を張り直す）へ倒れる。ペイン解決の失敗は表示言語で日英どちらにもなる（#1762）
 fn is_refusal(err: &str) -> bool {
-    err.contains("target=split") || err.contains("見つからない")
+    err.contains("target=split") || crate::dispatch::DispatchError::says_not_found(err)
 }
 
 #[cfg(test)]
@@ -552,5 +552,10 @@ mod tests {
         ));
         assert!(is_refusal("ペイン 42 が見つからない"));
         assert!(!is_refusal("接続が切断された"));
+        // #1762: ペイン解決の失敗は表示言語で日英どちらにもなる。どちらも拒否として読む
+        for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
+            let err = crate::dispatch::DispatchError::PaneNotFound(42).text_in(lang);
+            assert!(is_refusal(&err), "{err}");
+        }
     }
 }

@@ -326,7 +326,8 @@ rm -f "$ARM_SHELL"
 wait "$E3_JOB" 2>/dev/null
 e3rc="$(cat "$TMP/e3.rc" 2>/dev/null || echo '?')"
 echo "    再起動の下見: 終了コード ${e3rc} / $(head -c 160 "$TMP/e3.out")"
-if [ "$e3rc" != "0" ] && [ "$e3rc" != "142" ] && grep -q "ペイン ${P2} が見つからない" "$TMP/e3.out"; then
+# ペインの不在の文は表示言語で日英どちらにもなる（#1762）
+if [ "$e3rc" != "0" ] && [ "$e3rc" != "142" ] && grep -q "ペイン ${P2} が見つからない\|pane ${P2} not found" "$TMP/e3.out"; then
   pass "E3 着いた答えはペインの不在で断る（落ちない・固まらない）"
 else
   fail "E3 閉じたペインの下見の結末が想定外（終了コード ${e3rc}）"

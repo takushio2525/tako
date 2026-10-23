@@ -110,6 +110,15 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `パレットのパネルの項目はビューの表と同じ並びでそのビューを開く`
 - **対象は「画面に描画される文字列」のみ**。診断ログ（eprintln / persist.log）・
   dispatch / CLI / MCP のエラーメッセージ・AI へのプロンプトは対象外（現状維持 = 日本語可）
+- **例外: dispatch の断りの前置き（`DispatchError` の表示）は表示言語に従う**（#1762）。
+  CLI / MCP の応答文はその表示そのものなので、前置きを日本語で固定すると表示言語で書かれた
+  理由の文と混ざる（英語表示の「無効なパラメータ: Invalid color value: …」）。日英の対は
+  `DispatchError::text_in` の (バリアント, 言語) の網羅 match 1 か所で、`Display` は
+  `i18n::lang()` でそこを引く（バリアントを足したら日英の両方を書く。番犬は
+  `crates/tako-control/tests/issue1762_dispatch_error_lang.rs`）。理由の文の日英化は作る側の任意のまま。
+  GUI を経由せず CLI が dispatch を直呼びする枝は表示言語を初期化していないことがあるので、
+  断りは `to_string()` ではなく `local_dispatch_err`（tako-cli）で文字列にする。断りの文から
+  「見つからない」を読む呼び手（リモートの 404 への寄せ）は `DispatchError::says_not_found` を通す
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

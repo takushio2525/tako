@@ -4706,7 +4706,7 @@ fn cli_main() -> ExitCode {
                 profile.as_deref(),
                 content.as_deref(),
             )
-            .map_err(|e| e.to_string())
+            .map_err(local_dispatch_err)
             .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Layout {
@@ -4727,7 +4727,7 @@ fn cli_main() -> ExitCode {
                 auto_shrink_font,
                 min_worker_font_scale,
             )
-            .map_err(|e| e.to_string())
+            .map_err(local_dispatch_err)
             .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Accounts(ref sub)) => {
@@ -4769,7 +4769,7 @@ fn cli_main() -> ExitCode {
                 default_model,
                 default_effort,
             )
-            .map_err(|e| e.to_string())
+            .map_err(local_dispatch_err)
             .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Respond { pane, ref choice }) => {
@@ -4965,7 +4965,7 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     // GUI が動いていなくても登録できる必要があるのでローカル処理（IPC を張らない）。
     // 対象の選び方・分類済みエラーは dispatch 側の 1 実装（MCP / CLI で同一）
     let resp = tako_control::dispatch::setup_mcp_agents(args.agent.as_deref(), &scope, scope_label)
-        .map_err(|e| e.to_string())?;
+        .map_err(local_dispatch_err)?;
     print_setup_mcp_report(&resp);
     println!("{}", pretty_json(&resp));
     Ok(())
@@ -5787,7 +5787,7 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
         ProjectsCommand::List => {
             let res =
                 tako_control::dispatch::dispatch_orchestrator_projects("list", None, None, None)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(local_dispatch_err)?;
             let projects = res["projects"].as_array().cloned().unwrap_or_default();
             if projects.is_empty() {
                 eprintln!("登録済みプロジェクトはありません。");
@@ -5817,7 +5817,7 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                 Some(cwd.clone()),
                 description.clone(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(local_dispatch_err)?;
             eprintln!("追加しました: {key} → {cwd}");
             // #1825: 黙らせてはいけない理由（default を継承できなかった等）。
             // 同じ文が profile_note にも載るので、そちらは重ねて出さない
@@ -5849,7 +5849,7 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                 None,
                 None,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(local_dispatch_err)?;
             eprintln!("削除しました: {key}");
             Ok(())
         }
@@ -5976,7 +5976,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             remote_control: *remote_control,
         },
     };
-    let result = dispatch_orchestrator_profiles(params).map_err(|e| e.to_string())?;
+    let result = dispatch_orchestrator_profiles(params).map_err(local_dispatch_err)?;
     if let Some(warnings) = result["warnings"].as_array() {
         for w in warnings {
             if let Some(text) = w.as_str() {
@@ -6108,7 +6108,7 @@ fn remote_shortcuts(command: Option<RemoteShortcutsCommand>) -> Result<(), Strin
     // dispatch と**同一関数**を共用する（IPC 不要 = GUI が動いていなくても効く）
     let result =
         tako_control::dispatch::dispatch_remote_shortcuts(action, path.as_deref(), name.as_deref())
-            .map_err(|e| e.to_string())?;
+            .map_err(local_dispatch_err)?;
     println!("{}", pretty_json(&result));
     Ok(())
 }
@@ -6277,7 +6277,7 @@ fn config_share_local(args: &ConfigArgs) -> Result<(), String> {
     let result = tako_control::dispatch::dispatch_config_share(
         action, target, path, remote, message, no_push,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(local_dispatch_err)?;
     if args.json {
         println!("{}", pretty_json(&result));
         return Ok(());
@@ -7622,7 +7622,7 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
             let result = match queue_send(request) {
                 Ok(v) => v,
                 Err(SendError::Unreachable(_) | SendError::Timeout(_)) => {
-                    tako_control::queue::limits_offline(patch).map_err(|e| e.to_string())?
+                    tako_control::queue::limits_offline(patch).map_err(local_dispatch_err)?
                 }
                 Err(SendError::Rejected(m)) => return Err(m),
             };
@@ -8701,7 +8701,7 @@ fn lsp_server_local(request: &Request) -> Result<Value, String> {
         value["local"] = Value::Bool(true);
         value
     })
-    .map_err(|e| e.to_string())
+    .map_err(local_dispatch_err)
 }
 
 /// `tako mod report` の stdin（mod が組んだ報告の JSON。#1879）
@@ -12048,6 +12048,17 @@ fn find_git_root_cli(dir: &std::path::Path) -> Option<String> {
 
 fn pretty_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+/// GUI を経由せず手元で dispatch を直呼びした枝の断りを、表示言語で文字列にする（#1762）。
+///
+/// GUI 経由の断りは GUI のプロセスが表示言語で文字列にして返す。手元の枝は表示言語を
+/// 初期化していないことがあり（静的既定は英語）、そのまま `to_string()` すると、日本語表示の
+/// 人へ前置き（「無効なパラメータ: 」）だけ英語で出る。前置きの言語はここで設定から解決する
+/// （解決は他の枝と同じ `LangSetting::resolve`。settings.json には触らない = #2238。
+/// 理由の文は作られた時点のまま）
+fn local_dispatch_err(e: tako_control::DispatchError) -> String {
+    e.text_in(tako_control::settings::peek_lang_setting().resolve())
 }
 
 /// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）

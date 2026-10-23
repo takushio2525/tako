@@ -400,7 +400,9 @@ pub fn classify_error(status: u16, message: &str) -> (u16, &'static str) {
     if message.contains(tako_core::command_card::STILL_RUNNING_MARK) {
         return (409, "still_running");
     }
-    if message.contains("見つからない") || message.contains("表示中のコマンドカードが無い")
+    // 「見つからない」は表示言語で日英どちらにもなる（#1762）ので、読み方は 1 実装を通す
+    if crate::dispatch::DispatchError::says_not_found(message)
+        || message.contains("表示中のコマンドカードが無い")
     {
         return (404, "not_found");
     }
@@ -486,6 +488,11 @@ mod tests {
             classify_error(400, "ペイン 12 が見つからない"),
             (404, "not_found")
         );
+        // #1762: 英語表示の GUI はペインの不在を英語で返す。同じく 404 へ寄せる
+        for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
+            let err = crate::dispatch::DispatchError::PaneNotFound(12).text_in(lang);
+            assert_eq!(classify_error(400, &err), (404, "not_found"), "{err}");
+        }
         assert_eq!(
             classify_error(400, "このペインに表示中のコマンドカードが無い"),
             (404, "not_found")
