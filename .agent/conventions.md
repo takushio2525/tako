@@ -1397,7 +1397,18 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   （#1153 / #1124 の実測。`prune_pane_settle` の 2 秒 tick が追いつく前に読むと踏む）。
   **混み具合と単調に対応しない**（load 1.63 の静かな機でも落ちた）ので、待ちの長さでは
   なく状態で待つ。診断行には材料そのもの（`pane_display_diag` = `display` / `reason` /
-  `state` / `has_role` / `busy_children` / `released` / `settling`）と `waited=` を毎回出す
+  `state` / `has_role` / `busy_children` / `released` / `settling`）と `waited=` を毎回出す。
+  **作ったばかりのペインがスターターに着くのを待つ場面も同じ**（#2013）: 項目 93 (c)（#694 の
+  判定表）は 40 × 100ms の固定 4 秒窓で、混んだ機ではシェルの起動（OSC 133 の Idle）と
+  `busy_children` の 2 秒 tick が窓に収まらず、窓が切れた直後の診断が `state=Idle busy=false`
+  （= 待てば着いていた）で落ちていた。`wait_for_app_state` + `state_wait_budget`（素の上限 15 秒）
+  へ寄せ、旧の窓は A/B の腕として**予算の値**で残す（`TAKO_2013_LEGACY=1`。注入は
+  `TAKO_2013_INJECT=late|never`、診断行は `TAKO_SELF_TEST_2013`）。この形（「読む → 抜ける →
+  待つ」で待ちがループの末尾にある）は `for` の直後の行が `wait` の形だけを見る既存の番犬を
+  すり抜けていたので、番犬 `表示種別の判定を固定窓で待っていない` が `pane_display_for` を
+  本文に持つ固定回数ループを名指しで落とす。#2013 の時点で残っている項目 94（#702）/
+  97（#720）の 4 か所は既知リスト `KNOWN_FIXED_DISPLAY_WAITS` で段階導入（減る方向にしか
+  動かさない）
 - **画面のエコーを固定窓で待たない**（#1165）。`for _ in 0..8 { wait(cx, 800).await;
   ok = focused_contains(…) }` は「リトライループで延ばしてある」ように見えて**予算が
   固定**（8 × 800ms = 6.4 秒）で、混み具合に追従しない。項目 1b（TERM / COLORTERM 注入）が
