@@ -37459,6 +37459,133 @@ mod self_test {
         }
     }
 
+    /// **#2012 の A/B の口**: 項目 111 のステータスバーの 5h を、tako mod の報告ごと読む
+    /// 旧経路へ戻す（= 実アカウントの mod が報告している機では #1903 の優先順位で落ちる）
+    fn legacy_2012() -> bool {
+        std::env::var_os("TAKO_2012_LEGACY").is_some()
+    }
+
+    /// **#2012 の注入口**。実アカウントの報告を待たずに同じ状態を作る（報告は fixture）。
+    ///
+    /// - `report` = 判定の前に、新鮮な mod の報告（5h 26%）を検証用ペインへ入れる
+    ///   （#2016 の worker が観測した状態。`TAKO_2012_LEGACY=1` と組むと旧の腕が確定で落ちる /
+    ///   新の腕は報告を退けて読むので通る）
+    /// - `leak` = 報告を退けた**内側**へ同じ報告を入れる（検出力。退けても値が mod へ
+    ///   差し替わったら判定が落ちる = 退け方が判定を骨抜きにしていないことの確認）
+    fn inject_2012() -> String {
+        std::env::var("TAKO_2012_INJECT").unwrap_or_default()
+    }
+
+    /// `inject_2012` が入れる fixture の報告（実アカウントの値ではない。5h 26% / 7d 9%）
+    fn mod_report_fixture_2012() -> tako_core::claude_mod::StoredReport {
+        let report = tako_core::claude_mod::parse_report(serde_json::json!({
+            "schema": 1, "mod_version": "st2012", "at": 1, "turn": "idle",
+            "config_dir": "selftest-2012",
+            "rate_limits": [
+                {"kind": "five_hour", "percent_used": 26.0, "resets_at": "2030-01-01T00:00:00.000Z", "observed_at": 1},
+                {"kind": "seven_day", "percent_used": 9.0, "resets_at": "2030-01-05T00:00:00.000Z", "observed_at": 1},
+            ],
+        }))
+        .unwrap_or_else(|e| fail(&format!("#2012: fixture の報告を組めない: {e}")));
+        tako_core::claude_mod::StoredReport {
+            report,
+            received: std::time::Instant::now(),
+            count: 1,
+            prev_received: None,
+        }
+    }
+
+    /// **項目 111 のステータスバーの 5h を「tako mod の報告が無い」前提で読む**（#2012）。
+    ///
+    /// 項目 111 のメーター判定（#1093 / #1123）が見たいのは「上限の見出しから埋めた画面の
+    /// 100% がステータスバーまで届く」ことで、前提は**どのペインにも mod の使用制限が無い**
+    /// こと。#1903 からステータスバーは mod の報告（アカウント単位）を先に見るので、
+    /// 実アカウントの mod が報告している機では fixture が 100% でもバーは実際の使用量
+    /// （8% / 26%）になり、**製品は正しいのに判定が落ちていた**。
+    ///
+    /// 直し方は「試験側で報告を空にする」: 前提は**その判定のあいだだけ**自分で作る
+    /// （`.agent/conventions.md`「セルフテストの待ち条件の書き方」の 95c / 97c と同じ形）。
+    /// 退けて → 組み直して → 読んで → 戻して → 組み直す、を **1 回の `window.update` の中**で
+    /// 行うので、あいだに IPC の報告や 2 秒 tick は割り込めない。製品の優先順位（#1903）にも、
+    /// 隔離起動の挙動にも触らない。
+    ///
+    /// `pane` は測っている検証用ペイン（注入の fixture の報告はこのペインのものとして置く =
+    /// ワークスペースに居るペインの報告でないとバーへ載らない）。
+    /// 返すのは `(ステータスバーの 5h, 退けた報告の数, バーの値の出どころ)`
+    fn statusbar_5h_without_mod(
+        app: &mut TakoApp,
+        pane: PaneId,
+        item: &str,
+    ) -> (Option<u32>, usize, Option<&'static str>) {
+        let inject = inject_2012();
+        let legacy = legacy_2012();
+        if inject == "report" {
+            // 実アカウントの報告と同じく、判定の時点でバーへ載る報告を 1 つ置く
+            // （`accept` は通さない: 設定 dir の配置・usage の観測へ副作用を残さない）
+            app.claude_mod
+                .reports
+                .insert(pane.as_u64(), mod_report_fixture_2012());
+        }
+        // 退ける報告の出どころ（落ちたときに「どのペインの mod が」を切り分ける材料。
+        // 値・設定 dir は出さない = アカウントを特定する情報をログへ残さない）
+        let in_workspace: std::collections::HashSet<u64> = app
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes().into_iter().map(|p| p.id().as_u64()))
+            .collect();
+        let mut origins: Vec<String> = app
+            .claude_mod
+            .reports
+            .iter()
+            .filter(|(_, s)| !s.report.rate_limits.is_empty())
+            .map(|(p, _)| {
+                let at = if in_workspace.contains(p) {
+                    "pane"
+                } else {
+                    "gone"
+                };
+                format!("{p}:{at}")
+            })
+            .collect();
+        origins.sort();
+        let held = if legacy {
+            std::collections::HashMap::new()
+        } else {
+            std::mem::take(&mut app.claude_mod.reports)
+        };
+        let masked = held.len();
+        if inject == "leak" {
+            app.claude_mod
+                .reports
+                .insert(pane.as_u64(), mod_report_fixture_2012());
+        }
+        app.refresh_agent_metrics();
+        let read = (
+            app.agent_metrics.limit_5h,
+            masked,
+            app.claude_limit_source.map(|s| s.as_str()),
+        );
+        if !legacy {
+            // 退けた報告を戻す（`leak` の fixture はここで上書きされて消える）
+            app.claude_mod.reports = held;
+        }
+        if inject == "report" || inject == "leak" {
+            app.claude_mod.reports.remove(&pane.as_u64());
+        }
+        // 実際の状態（実アカウントの報告を含む）で組み直しておく = 後続の項目は普段どおり
+        app.refresh_agent_metrics();
+        println!(
+            "TAKO_SELF_TEST_2012: item={item} statusbar={:?} masked={} with_limits=[{}] \
+             source={:?} legacy={legacy} inject={inject:?}",
+            read.0,
+            read.1,
+            origins.join(" "),
+            read.2,
+        );
+        read
+    }
+
     /// 1 ペインの表示種別 + 理由 + 材料（#1058）。
     ///
     /// **CLI / MCP が読むのと同じ入口**（`UiStateHost::pane_displays`）を通すので、
@@ -84066,7 +84193,9 @@ mod self_test {
                     "111: `resets 7:50pm (Asia/Tokyo)` から解除時刻を解決する (#1093)",
                 );
                 // ステータスバーのメーターが `--`（データ無し）にならない。
-                // 上限中はフッターが数値を出さないので、見出しから 100% を埋める
+                // 上限中はフッターが数値を出さないので、見出しから 100% を埋める。
+                // バーは**tako mod の報告が無い**前提で読む（#2012。実アカウントの mod が
+                // 報告している機では、#1903 の優先順位でバーが実際の使用量になるのが正しい）
                 let meter1093 = window
                     .update(cx, |app, _, _| {
                         let pane_level = app
@@ -84074,8 +84203,9 @@ mod self_test {
                             .get(&session_pane)
                             .and_then(|s| s.agent_metrics())
                             .and_then(|m| m.limit_5h);
-                        app.refresh_agent_metrics();
-                        (pane_level, app.agent_metrics.limit_5h)
+                        let (statusbar, _, _) =
+                            statusbar_5h_without_mod(app, session_pane, "1093");
+                        (pane_level, statusbar)
                     })
                     .unwrap_or((None, None));
                 println!(
@@ -84455,7 +84585,8 @@ mod self_test {
                     reset_wrapped.is_some(),
                     "111: 別の行へ割れた `resets 5:50am` から解除時刻を解決する (#1123)",
                 );
-                // ステータスバーの 5h メーターも同じ規則を通る（#1093 と同じ受け入れ条件）
+                // ステータスバーの 5h メーターも同じ規則を通る（#1093 と同じ受け入れ条件。
+                // 前提も同じく tako mod の報告が無いこと = #2012）
                 let meter1123 = window
                     .update(cx, |app, _, _| {
                         let pane_level = app
@@ -84463,8 +84594,9 @@ mod self_test {
                             .get(&wrapped_pane)
                             .and_then(|s| s.agent_metrics())
                             .and_then(|m| m.limit_5h);
-                        app.refresh_agent_metrics();
-                        (pane_level, app.agent_metrics.limit_5h)
+                        let (statusbar, _, _) =
+                            statusbar_5h_without_mod(app, wrapped_pane, "1123");
+                        (pane_level, statusbar)
                     })
                     .unwrap_or((None, None));
                 println!(
