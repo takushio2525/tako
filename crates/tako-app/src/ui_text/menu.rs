@@ -164,6 +164,12 @@ pub fn panel_orch() -> &'static str {
 pub fn panel_git() -> &'static str {
     tr!("git ビュー", "Git View")
 }
+pub fn panel_tasks() -> &'static str {
+    tr!("tasks ビュー", "Tasks View")
+}
+pub fn panel_usage() -> &'static str {
+    tr!("usage ビュー", "Usage View")
+}
 pub fn zoom_in() -> &'static str {
     tr!("文字を大きく", "Zoom In")
 }
@@ -290,6 +296,8 @@ mod tests {
                 panel_fleet().to_string(),
                 panel_orch().to_string(),
                 panel_git().to_string(),
+                panel_tasks().to_string(),
+                panel_usage().to_string(),
                 zoom_in().to_string(),
                 zoom_out().to_string(),
                 reset_zoom().to_string(),
