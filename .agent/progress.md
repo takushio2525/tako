@@ -20,24 +20,6 @@
 
 ---
 
-## 2026-10-18（#1847: 狭いペインの ENOTFOUND の停止を status が api_error と読む = `detect_worker_error` の段 3' が `net_stop::detect` を通す・背の高い AskUserQuestion を経路 5 `numbered_above_scan` で拾い worker_status はダイアログを画面全体で判定）
-- 実物の claude 2.1.280 / 2.1.301 の 32 / 60 桁の fixture・A/B `TAKO_1847_LEGACY=1`・隔離 GUI の e2e 新旧 11 PASS・カタログ +0 B
-
-## 2026-10-18（#1851: THIRD-PARTY-LICENSES.md の作り直しを `scripts/third-party-licenses.sh` の 1 本へ（cargo-about 0.9.2 を `--frozen`・CRLF を LF へ）し、CI の `licenses` ジョブ（ubuntu）が `--check` で依存とのずれを落とす。main で抜けていた LSP の依存 4 クレートを作り直しで足した）
-- A/B: 依存を足す → 名指しで赤 → 作り直して緑・消す → 余分を名指し。モック 35 PASS・配線 95 PASS。PR #2300
-
-## 2026-10-18（#1850: `release.sh --check-assets` が公開済み Release の zip（両 OS）を取得し、同梱表 `scripts/lib/license-bundle.txt`（番犬と共有の 1 か所）の全部が入りタグのファイルとバイト一致するかを見る）
-- 実物 v0.8.25 は Windows の zip の 2 本の欠けで exit 1・v0.8.37 は exit 0・モック 131 PASS（3.2 / 5.3。main の release.sh では 41 FAIL）・番犬に直書きの検出。PR #2303
-
-## 2026-10-18（#1817: `virtual-display.sh ensure` が器に作らせる・繋がせるのは `tako-vd` の完全一致だけ = `vd_create_verdict` を器に触る前に。`bounds` / `status` / `move-window` も `vd_virtual_verdict` を通し物理画面に座標・使用可を返さない（3・器を起こさない））
-- 修正前は存在しない名前・大文字違い・蓋閉じの内蔵の名前で作成 + 接続して rc=0 → 修正後 rc=3・作成 0。注入 7 通りで番犬が file:line を名指し・モック 243 PASS（3.2 / 5.3）
-
-## 2026-10-18（#2299: Code Runner の宣言 `tako:cwd` の値全体を囲む二重引用符も `strip_quotes` で外し、中の逃がしを実行ペインの方言の規則で戻す = `posix_double_quoted` / `ps_double_quoted`。番犬 `issue2286_runner_outer_quote_dialect_watchdog` に規則と行）
-- 1590 行の表で変わったのは `"${fileDir}"` の 40 行だけ（すべて 壊れ → 直る）・隔離 GUI の実物で修正前は `cwd が存在しない`・`/bin/sh` と PowerShell の実物と一致・カタログ +0 B。PR #2310
-
-## 2026-10-18（#1842: 移動の実行を OS の上書きしない rename（`platform::fs_move::rename_noreplace` = renamex_np RENAME_EXCL / renameat2 RENAME_NOREPLACE / MoveFileExW フラグ 0）へ載せ替え、移したフォルダの recent.json の項目を移動先へ付け替える・A/B `TAKO_1842_LEGACY=1`・注入 `TAKO_1842_INJECT_RACE`）
-- 単体の A/B で修正前は file_move.rs:714 で上書きを名指して落ちる・実経路 `scripts/test-move-noreplace-1842.sh` 31 PASS（CLI / MCP で隙間の同名を断る・recent の付け替え・LEGACY で上書き）・Windows CI は単体が根拠（実機は未実測）。PR #2311
-
 ## 2026-10-18（#1931 / #2301: 番犬の bash 3.2 波括弧展開の写しを実の /bin/bash と突き合わせる常設テスト（483 行・約 1.5 秒・macOS は 3.2 が無ければ落とす）と、それで見つかった braces.c との 2 規則の食い違い（閉じの `}` は区切りの後だけ・展開できない対で語の残りを止める）の修正）
 - 修正前 13 箇所で赤 → 0・注入 A/B（規則を 1 つずつ戻す）で 17 / 7 箇所を名指して落ちる・全 .sh の名指しは前後とも 0 行。表を広げて見つけた `$'…'` の置き換えの食い違いは #2304
 
@@ -79,3 +61,21 @@
 
 ## 2026-10-23（#2330: 狭いペインで本文の先頭と `❯` 行が入力欄から流れ、届いた送達を gave_up にしていた → 諦める前に transcript で受領を確かめ `received`。master 同士の close は受領済みの後任・タブのそのプロファイルの最後の master を force でも断る（別タブの後任が前任を閉じる close は通す）・guide handoff に確かめ方）
 - 実経路 `scripts/test-handoff-close-2330.sh` 修正前 gave_up + 相互 close で master 0 人 → 修正後 PASS=24・注入 A/B で番犬が file:line を名指し・カタログ +193 B。PR #2334
+
+## 2026-10-23（#2322: パレットの「表示モードを切り替え（かんたん / ターミナル）」→「表示モードを切替（かんたん・ターミナル）」・「新しいタブ」→「新規タブ」・tako-core の案内文の項目名も揃え、#1830 の番犬を全固定コマンドの分類（対 13 / 例外 10）へ広げた）
+- 修正前 4 本赤 → 修正後 72 passed・注入で palette.rs:33/34・GuiModeToggle.astro:68/86 を名指し・カタログ +0 B。PR #2337
+
+## 2026-10-23（#2324: 狭いペインの全角ラベルの折り返しを `dialog::seam` が画面の証拠で決め、決まらなければ確実な先頭 + `label_truncated`。長い語の規則は `long_word_evidence` のときだけ説明と読む）
+- 実物の claude 2.1.301 の 8 種 × 24 幅（978 選択肢）で食い違い申告なし 92 → 0・注入 9 通り・A/B `TAKO_2324_LEGACY=1`・カタログ +0 B。PR #2339
+
+## 2026-10-23（#2013: セルフテスト項目 93 (c)（#694 の判定表）を固定 4 秒窓から `wait_for_app_state` + `state_wait_budget` へ・番犬 `表示種別の判定を固定窓で待っていない`。#2012 は今の main で未再現のため閉じた）
+- 旧 + 注入 late で FAILED → 新 + late で通過・never で FAILED・カタログ +0 B。PR #2342
+
+## 2026-10-23（#2340: パレットの固定コマンドに検索だけに効く別名 = 外れた旧表記の全文（`ui_text::palette::cmd_aliases`）・絞り込みは `filter_palette_items` の 1 本・番犬は根拠の表 `PALETTE_OLD_LABELS`・visual-test `palette-alias`）
+- 別名を外す注入で 20 語が引けず `palette.rs:82` を名指し・カタログ +0 B。PR #2345
+
+## 2026-10-23（#2343: 24 桁で 3 行に折れた確定キーの案内を `dialog::WrappedHint` が `<キー> to <動詞>` の文の形で繋いで読み、背の高い AskUserQuestion を検知する）
+- 全 fixture 214 画面 + 変種 2140 画面で変わったのは未検知 → 検知だけ（悪化 0）・注入 4 通り・A/B `TAKO_2343_LEGACY=1`・カタログ +0 B。PR #2346
+
+## 2026-10-23（#2341: 表示メニューの「パネル」に tasks / usage のビューを足し、`app_menu_tests::PANEL_VIEW_ENTRIES` でビューの値ごとのメニューとパレットの入口か置かない理由を表にした）
+- 実経路 `scripts/test-menu-panel-views-2341.sh` 修正前 9 PASS 16 FAIL → 修正後 25 PASS・注入で番犬が file:line を名指し・カタログ +0 B。PR #2347
