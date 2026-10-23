@@ -1492,6 +1492,16 @@ fn window_quit_guard_enabled() -> bool {
     )
 }
 
+/// 多重起動の第三のガード（#2360）の理由文（`復元スキップ: {理由}のためセカンダリモードで起動`）。
+/// 固定ソケットは data dir ごとに決まるので、そこを握る生きた受け口は同じ data dir の別の tako。
+/// 繋がらないが接続情報の持ち主が生きていた（`Busy`）ときはその pid を添える
+fn fixed_path_guard_reason(holder: tako_core::ipc_socket::Occupant) -> String {
+    match holder.pid() {
+        Some(pid) => format!("固定ソケットを別の生きた tako（pid {pid}）が使用中（#2360）"),
+        None => "固定ソケットを別の生きた tako が使用中（#2360）".into(),
+    }
+}
+
 /// 復元強奪ガード（#177）: これから復元 attach しようとする tmux セッションに
 /// **生きた別 tako-app 配下のクライアント**が attach 中なら、そのセッション群は
 /// 別インスタンスが表示中なのでセカンダリ降格の理由を返す。
@@ -4659,11 +4669,13 @@ impl TakoApp {
         // 実行中セッションを kill する三段連鎖が起きる（2026-07-08 実機: 19→13 ペイン消失）。
         // - プロセス内: NewWindow で 2 つ目以降の TakoApp（最初の 1 つだけがプライマリ）
         // - プロセス間: control.json の主がまだ生きた tako-app（SIGKILL 残骸は pid 死亡で除外）
+        // - 固定ソケット: 上の 2 つが盲目でも、固定ソケットを生きた受け口が握っていれば
+        //   同じ data dir の別の tako が居る（第三のガード。IPC を立てた後に決まる = #2360）
         // TAKO_FORCE_PRIMARY=1 は検証・緊急脱出用の明示オーバーライド（多重復元の保護も切れる）
         let in_process_secondary = PRIMARY_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst);
-        let secondary_reason: Option<String> = if std::env::var_os("TAKO_SELF_TEST").is_some()
-            || std::env::var_os("TAKO_FORCE_PRIMARY").is_some()
-        {
+        let guard_overridden = std::env::var_os("TAKO_SELF_TEST").is_some()
+            || std::env::var_os("TAKO_FORCE_PRIMARY").is_some();
+        let mut secondary_reason: Option<String> = if guard_overridden {
             None
         } else if in_process_secondary {
             Some("同一プロセスの先行ウィンドウがプライマリ".into())
@@ -4675,7 +4687,6 @@ impl TakoApp {
                 .map(|pid| format!("別の tako プロセス（pid {pid}）が稼働中"))
                 .or_else(foreign_client_guard)
         };
-        let secondary = secondary_reason.is_some();
 
         // IPC（Layer 1）と MCP（Layer 2）の受け口。最初のセッション起動より前に立てて
         // ルートペインのシェルにも TAKO_SOCKET / TAKO_MCP_URL / TAKO_TOKEN を注入できるようにする。
@@ -4689,7 +4700,11 @@ impl TakoApp {
             }
         };
         let ipc = token.as_ref().and_then(|token| {
-            match IpcServer::start_with(control_tx.clone(), token.clone(), secondary) {
+            match IpcServer::start_with(
+                control_tx.clone(),
+                token.clone(),
+                secondary_reason.is_some(),
+            ) {
                 Ok(server) => Some(server),
                 Err(e) => {
                     // #1441: `eprintln!` は GUI では誰も読めないので**黙って縮退させない**。
@@ -4700,6 +4715,16 @@ impl TakoApp {
                 }
             }
         });
+        // 第三のガード（#2360）: 固定ソケットを生きた受け口が握っていた（IPC は奪わずに一時パスで
+        // 立った）= 同じ data dir の別の tako が居る。control.json が無い・壊れているときもここで
+        // 気づき、復元・保存・tmux・control.json を奪わない。`secondary` はここで確定する
+        // （ここより前に読むのは上の `start_with` だけ）
+        if secondary_reason.is_none() && !guard_overridden {
+            if let Some(holder) = ipc.as_ref().and_then(IpcServer::fixed_path_holder) {
+                secondary_reason = Some(fixed_path_guard_reason(holder));
+            }
+        }
+        let secondary = secondary_reason.is_some();
         let mcp = token.as_ref().and_then(|token| {
             match McpServer::start(control_tx.clone(), token.clone()) {
                 Ok(server) => Some(server),

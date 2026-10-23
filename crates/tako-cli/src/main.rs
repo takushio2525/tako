@@ -8222,6 +8222,19 @@ fn ipc_recovery_lines(ipc: &Value) -> Vec<String> {
             lines.push(format!("  張り直せない理由: {error}"));
         }
     }
+    // #2360: 起動時に固定パスで見た先客（奪わずに一時パスで立てた・残骸を作り直した）
+    let fixed = &ipc["fixed_path"];
+    if fixed.is_object() {
+        let reason = fixed["reason_text"].as_str().unwrap_or("?");
+        lines.push(if fixed["held"].as_bool().unwrap_or(false) {
+            format!(
+                "  固定パス: 生きた受け口が居たので奪わずに一時パスで立てた（{reason}）。\
+                 同じデータディレクトリの別の tako が動いている = このウィンドウはセカンダリ（#2360）"
+            )
+        } else {
+            format!("  固定パス: 起動時に残骸を消して張り直した（{reason}）（#2360）")
+        });
+    }
     // 届かないときの GUI の生死（届かない原因と次の一手を分ける）
     let gui = &ipc["gui"];
     if gui.is_object() {
@@ -13856,6 +13869,27 @@ mod tests {
             ipc_recovery_lines(&ipc),
             ["  見張り: 10 秒ごと・確認 7 回・張り直し 1 回（最後: 3 秒前・ソケットファイルが消えていた）"]
         );
+    }
+
+    /// #2360: 起動時に固定パスで見た先客を 1 行で出す（奪わなかった・残骸を作り直した）
+    #[test]
+    fn issue2360_起動時の固定パスの先客を1行で出す() {
+        let held = serde_json::json!({
+            "fixed_path": { "state": "busy", "held": true, "pid": 42, "reason_text": "繋がらないが、接続情報の持ち主（pid 42）が生きている" }
+        });
+        assert_eq!(
+            ipc_recovery_lines(&held),
+            ["  固定パス: 生きた受け口が居たので奪わずに一時パスで立てた（繋がらないが、接続情報の持ち主（pid 42）が生きている）。同じデータディレクトリの別の tako が動いている = このウィンドウはセカンダリ（#2360）"]
+        );
+        let dead = serde_json::json!({
+            "fixed_path": { "state": "dead", "held": false, "pid": null, "reason_text": "4 回繋いでも繋がらず、生きた持ち主の記録も無い（残骸）" }
+        });
+        assert_eq!(
+            ipc_recovery_lines(&dead),
+            ["  固定パス: 起動時に残骸を消して張り直した（4 回繋いでも繋がらず、生きた持ち主の記録も無い（残骸））（#2360）"]
+        );
+        // 節が無い（確かめていない・旧版の応答）なら何も足さない
+        assert!(ipc_recovery_lines(&serde_json::json!({ "fixed_path": null })).is_empty());
     }
 
     /// #1962: mod の帯のボタン（tako の操作 9 つと shell）が叩く引数を、この CLI が要求へ組める
