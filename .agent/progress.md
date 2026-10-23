@@ -20,39 +20,6 @@
 
 ---
 
-## 2026-10-18（#1931 / #2301: 番犬の bash 3.2 波括弧展開の写しを実の /bin/bash と突き合わせる常設テスト（483 行・約 1.5 秒・macOS は 3.2 が無ければ落とす）と、それで見つかった braces.c との 2 規則の食い違い（閉じの `}` は区切りの後だけ・展開できない対で語の残りを止める）の修正）
-- 修正前 13 箇所で赤 → 0・注入 A/B（規則を 1 つずつ戻す）で 17 / 7 箇所を名指して落ちる・全 .sh の名指しは前後とも 0 行。表を広げて見つけた `$'…'` の置き換えの食い違いは #2304
-
-## 2026-10-18（#2313: `measure-unfocused-redraw-1979.sh` が面の眠りを `status` の rc の成功を前提に読み、#1979 から常に「描画可能」と出ていた → `vd_drawable_word` が 1 行目の文言で 描画可能 / 眠っていた / 確かめられない を返す。同型は 1 か所だけ）
-- モック `scripts/test-measure-vd-sleep-2313.sh` 22 PASS（3.2 / 5.3。修正前の形を注入すると 11 FAIL）を CI の macOS へ。カタログ +0 B
-
-## 2026-10-18（#2312: LSP e2e のアイドルの検査が didOpen への診断の到着前に受信数の基準を取っていた → `diagnostics_count == 1` を待ってから取り、偽サーバの `--publish-delay-ms 50` を常に渡す。製品は不変）
-- 修正前 + 注入 0/10（CI と同じ :468 の 2/1）→ 修正後 10/10・30 回 × 並列 1 / 4 で 30/30・カタログ +0 B
-
-## 2026-10-18（#2302: 狭いペインの AskUserQuestion でラベルと説明の境目を表示幅で読む = `dialog::label_ends`（段落の切れ目・説明つきの並びの判定）。読めない選択肢はラベルの 1 行目だけ + `label_truncated`、respond のラベル指定は拒否・番号は効く）
-- 実物の claude 2.1.301 の fixture 9 本・注入 7 通り・器越しの e2e 新旧（旧は説明の文言で選択肢 3 を確定）・A/B `TAKO_2302_LEGACY=1`・カタログ +36 B
-
-## 2026-10-18（#1830: `tako theme colors` の読めない色を `source: "ignored"` + `warnings` で返す（`ColorSource::of` / `active_theme_overrides` の 1 本・ライトに dark の上書きの出どころを付けていた食い違いも）・パレットのテーマ / 表示言語をメニューの表記へ）
-- 実経路 `scripts/test-theme-colors-ignored-1830.sh` 修正前 14 PASS 12 FAIL → 修正後 26 PASS・カタログ +47 B
-
-## 2026-10-18（#2306: 変数を使う rm の引数で空になると行き先が広がる形（`"$d/x"`・`"/tmp/$n"`・`"$p"*`）を番犬 `rmの引数で空になると広い場所を指す変数はvar_qで止める` が名指し、67 本・117 か所 + 偽 CLI 4 行 + release.sh 4 か所を `${var:?}` へ（例外 `# tako:rm-var-ok`））
-- 空にする注入で旧 `rm -rf /home /bin` 相当 → 新は exit で止まる・main に当てると 115 件（rebase 後の main の新規 2 件も直した）・test-release-retry 131 PASS（3.2 / 5.3）・カタログ +0 B
-
-## 2026-10-18（#2305: Windows のリリース検査 `verify-assets.ps1` の同梱ライセンス表の写しを消し、`Get-TakoLicenseBundle` が `scripts/lib/license-bundle.txt` を読む（無い・空・崩れは表の file:line を名指し）。番犬は「表を読んでいること」の静的検査 + pwsh での実行検査へ）
-- 修正前は表に 1 行足す / 消す / 空でも 4 通りとも通った → 修正後はすべて名指しで落ちる・表に 1 行足す注入で番犬は組み立て 3 か所を名指し・カタログ +0 B。PR #2325
-
-## 2026-10-20（#2321: `tako theme colors --target` / MCP `target` を dispatch が読み捨てていた → 指定のテーマの色・出どころ・warnings を返す（`resolve_theme_named` / `theme_overrides_named` の 1 本・知らない名前はエラー・省略時はバイト一致））
-- 実経路 `scripts/test-theme-colors-target-2321.sh` 修正前 12 PASS 20 FAIL → 修正後 32 PASS・注入 4 通り・カタログ +45 B。書き込み側の同型は #2331。PR #2328
-
-## 2026-10-20（#2320: 段落の切れ目が並びのどこにも出ない AskUserQuestion で説明がラベルへ丸ごと混ざっていた → 自由入力の `Type something.` がある並びは説明を必ず持つと読み、従来の結合が続きを飲む選択肢はラベルの 1 行目だけ + `label_truncated`（続き 1 行なら説明）= `dialog::carries_descriptions`）
-- 実物の claude 2.1.301 の 5 種 × 24 幅の採取・fixture 7 本・注入 4 通り・器越しの e2e 新旧・A/B `TAKO_2320_LEGACY=1`・カタログ +0 B。残りは #2324。PR #2327
-
-## 2026-10-20（#1816: tailscale の検出の続き = `check_status` の tailscale 項目を ok / unrunnable / missing / unknown の 4 通りに・setup は依存段の検出を末尾まで使い回す・依存段は在るが動かない CLI を `[警告]` に・正本は最後にログインシェルの PATH を上限つきで引く）
-- `--version` が固まる CLI で setup 33.0 → 10.7 秒（検出 3 → 1 回）・ログインシェルにだけ在る CLI で brew 1 → 0 回。実経路 46 PASS（修正前 25 FAIL）・カタログ +0 B。PR #2323
-
-## 2026-10-23（#2331: `tako theme` の色の書き込み 3 操作（set-color / reset-color / reset-colors）が知らない `--target` を GUI のいまのモードの表へ落としていた → colors と同じ `theme_target_name` で断る・表の選び方は `apply_color_write` の 1 本）
-- 実経路 `scripts/test-theme-write-target-2331.sh` 修正前 14 PASS 35 FAIL → 修正後 49 PASS・省略と知っている名前は修正前とバイト一致・注入 3 通り・カタログ +0 B。PR #2333
-
 ## 2026-10-23（#2203: usage 分析 S4 = 右パネルの usage ビュー。ステータスバーの 5h / 7d から開き、プロジェクト → Issue → 会話と掘る。読みは CLI と同じ `Request::Sessions` を `dispatch_off_ui` で・書式は `usage::display` を共有・`--issue` / `project:` / `profile:` / `none` / `--show`）
 - 実経路 `scripts/test-usage-panel-2203.sh` 22 PASS・CLI との照合 13 行一致・3 万会話で UI 占有 15 ms（A/B 旧 546 ms）・カタログ +355 B。PR #2336
 
@@ -79,3 +46,36 @@
 
 ## 2026-10-23（#2341: 表示メニューの「パネル」に tasks / usage のビューを足し、`app_menu_tests::PANEL_VIEW_ENTRIES` でビューの値ごとのメニューとパレットの入口か置かない理由を表にした）
 - 実経路 `scripts/test-menu-panel-views-2341.sh` 修正前 9 PASS 16 FAIL → 修正後 25 PASS・注入で番犬が file:line を名指し・カタログ +0 B。PR #2347
+
+## 2026-10-23（#2344: 項目 113 の真因は製品 = tmux の器越しで 1 行ごとに来る CursorBlinkingChange が #816 のゲートを素通り → `redraw_hint` で CBC / MouseCursorDirty も描き直しの合図に・`tako redraw-limit` に `delivery`・項目 113 は 3 本の判定）
+- 不可視ペインの往復 33.4 → 4.8 回/秒・見えているペインの再描画は修正前と一致・LEGACY は ③・nogate は ① で FAILED・カタログ +0 B。PR #2349
+
+## 2026-10-23（#2304: #1924 の番犬の bash 3.2 波括弧の写しに `$'…'` の構文解析時の置き換え（`ParsedWord32`）と、包まずに置き換わった `$( … )` の中身の実行時の読み直し（3.2 だけが割る見逃しの向き）を入れた）
+- Issue の 4 行で食い違い 2 → 0・表を広げて 5,730 / 11,260 行で 0・注入 4 通り・リポジトリの名指しは前後とも 0・カタログ +0 B。行継続の残りは #2352。PR #2351
+
+## 2026-10-24（#1837: 項目 155 の panic は製品 = wry の親を初回 render で 1 度しか採らず、窓を閉じた後の Web ビューの生成が `mod.rs:392` で落ちる → render で採り直して付け替え・渡す前に窓を見て理由つきのエラー・`web list` の `attached`・巨大ファイル後の復帰は伸びる上限へ）
+- 修正前 4 回中 1 回 panic → 修正後 5 回完走・A/B `TAKO_1837_LEGACY=web|wait`・実経路 10 PASS・カタログ +0 B。PR #2353
+
+## 2026-10-24（#1762: `DispatchError` の表示を `text_in(Lang)` の日英の網羅 match から引く・CLI の直呼び 12 か所は `local_dispatch_err`・リモートの「見つからない」は `says_not_found`）
+- 実経路 修正前 9 PASS 18 FAIL → 修正後 27 PASS・日本語表示 18 ファイルはバイト一致・カタログ +0 B。PR #2354
+
+## 2026-10-24（#2002: IPC の受け口がパスから切り離されたら GUI が張り直す = accept を poll + 10 秒で `lstat` の実体を確かめる・奪われていたら奪わない・check-health が「GUI は動いているのに受け口が応答しない」を分ける）
+- 段 1 で「同じパスへ別の受け口が作り直して閉じた」形を再現・実経路 PASS=26（張り直し 3.9 秒）・A/B は refused のまま・カタログ +0 B。申し送り #2359 / #2360 / #2361。PR #2356
+
+## 2026-10-24（#2358: `PaneTreeError` / `WorkspaceError` とペイン未指定の断り（`NoTargetPaneAt::{Cli, Mcp}`）を #1762 と同じ形で表示言語に従わせた）
+- 英語表示で日本語入りの出力 11 → 1 本・日本語は 38 本バイト一致・実経路 PASS=57・カタログ +0 B。残りのエラー型は #2365。PR #2362
+
+## 2026-10-24（#1902: セルフテストの回数の窓 126 か所のうち background を待つ 16 か所を `wait_for_background_state` へ寄せ、番犬 `回数の窓で待っていない`（#2013 の番犬を統合・残り 110 は `KNOWN_COUNT_WINDOWS`）を置いた）
+- 実経路 debug / release 各 32 PASS・隔離セルフテスト両方緑・旧の窓 + 遅れで名指しの FAILED・カタログ +0 B。Issue は開けたまま分類ごとに移す。PR #2363
+
+## 2026-10-24（#2359: GUI の fd 上限を起動時に min(hard, 10240, kern.maxfilesperproc) へ上げ、ペインの PTY の子には起動時の値を戻す・check-health に `fd_limit` 節と 80% の warning）
+- 本番 28 ペインで 121 / 256 本（4 本 / ペイン）→ 再起動後 10240・枯渇の注入で修正前 0/5 → 修正後 5/5 通る・カタログ +0 B。器の tmux の天井は #2367。PR #2364
+
+## 2026-10-24（#2357: 実 tmux のテストの間欠の真因はテスト = 「読むと消す」`take_pane_died_dump` を書き出しの出現で叩き、書きかけを消していた → 器が消えたと `probe_session` で確かめてから 1 回読む・同型 4 か所も）
+- 注入で main は CI と同文言で FAILED → 修正後 ok・30 回 × 並列 1 / 4 で全通過・カタログ +0 B。PR #2366
+
+## 2026-10-24（#2360: 起動時の IPC ソケットの生存確認が connect 1 回で、control.json の無い 2 つ目が満杯の生きた受け口を奪っていた → `ipc_socket::judge_occupant` が持ち主の pid と繋ぎ直しまで見る・奪わなかった 2 つ目はセカンダリ・`ipc.fixed_path`）
+- 実経路 修正前 27 PASS 22 FAIL → 修正後 49 PASS・A/B `TAKO_2360_LEGACY=1`・カタログ +0 B。net_stop の間欠は #2369。PR #2368
+
+## 2026-10-24（#2355: 項目 154 の E4 の間欠の真因はテスト = 流していたシェルのループが ^C を取りこぼす（素の zsh で 450 回中 9 回）→ ループをサブシェルで包み、止まったことを状態で待つ）
+- A/B `TAKO_2355_LEGACY=1` + 注入 `lostint` で旧は FAILED・新は通過・5 回完走・カタログ +0 B。漏れの判定の偽の緑は #2371。PR #2370
