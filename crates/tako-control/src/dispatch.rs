@@ -2873,6 +2873,117 @@ pub fn lsp_results(
     Ok(out)
 }
 
+/// `target`（CLI の `--target` / MCP の `target`）を、色を読み書きするテーマの名前へ解く（#2321 / #2331）。
+///
+/// 省いたらいまの theme（settings.json の値そのまま）。渡したら [`known_theme_name`] で正規の名前
+/// （プリセット名 / "dark" / "light"）へ解き、知らない名前はエラー（黙ってダークや GUI のモードへ
+/// 落とすと、別のテーマの表を読む・書く）。colors と色の書き込み（[`apply_color_write`]）が
+/// この 1 本を通るので、断る規則も文言も同じ
+///
+/// [`known_theme_name`]: crate::settings::Settings::known_theme_name
+fn theme_target_name(
+    settings: &crate::settings::Settings,
+    target: Option<&str>,
+) -> Result<String, DispatchError> {
+    let Some(t) = target else {
+        return Ok(settings.theme.clone());
+    };
+    settings.known_theme_name(t).ok_or_else(|| {
+        let presets: Vec<&str> = settings.theme_presets.keys().map(String::as_str).collect();
+        let presets = if presets.is_empty() {
+            "なし".to_string()
+        } else {
+            presets.join(" / ")
+        };
+        DispatchError::InvalidParams(format!(
+            "未知のテーマ: {t:?}（target は dark / light / プリセット名。プリセット: {presets}）"
+        ))
+    })
+}
+
+/// 色の上書きへの書き込み 1 回（`tako theme color` / `reset-colors`・MCP `tako_theme` の
+/// set-color / reset-color / reset-colors。#459 / #2331）
+#[derive(Debug, Clone, Copy)]
+enum ColorWrite<'a> {
+    /// `key` を `value` へ（値は呼び手が検査済み）
+    Set { key: &'a str, value: &'a str },
+    /// `key` の上書きを消す
+    Reset { key: &'a str },
+    /// 表の上書きを全部消す
+    ResetAll,
+}
+
+/// `settings` の色の上書きへ `write` を当てる（#2331）。
+///
+/// 書く表は `target` を [`theme_target_name`]（colors と同じ規則）で解いたテーマのもの: プリセットなら
+/// その colors、ビルトインなら `theme_colors` のそのモードの表。知らない `target` は**何も書かずに**
+/// colors と同じ文言で断る（以前は書き込みだけが知らない名前を GUI のモードの表へ落とし、打ち間違えた
+/// 名前でいまのテーマの上書きを書き換え・消していた）。`target` を省いたら settings.json の theme の表で、
+/// theme が知らない名前なら GUI のモード（`gui`）の表（#2331 以前と同じ）
+fn apply_color_write(
+    settings: &mut crate::settings::Settings,
+    target: Option<&str>,
+    gui: tako_core::theme::ThemeMode,
+    write: ColorWrite<'_>,
+) -> Result<(), DispatchError> {
+    let name = theme_target_name(settings, target)?;
+    if let Some(preset) = settings.theme_presets.get_mut(&name) {
+        match write {
+            ColorWrite::Set { key, value } => {
+                preset.colors.insert(key.to_string(), value.to_string());
+            }
+            ColorWrite::Reset { key } => {
+                preset.colors.remove(key);
+            }
+            ColorWrite::ResetAll => preset.colors.clear(),
+        }
+        return Ok(());
+    }
+    let mode = tako_core::theme::ThemeMode::parse(&name)
+        .unwrap_or(gui)
+        .as_str();
+    match write {
+        ColorWrite::Set { key, value } => {
+            settings
+                .theme_colors
+                .entry(mode.to_string())
+                .or_default()
+                .insert(key.to_string(), value.to_string());
+        }
+        ColorWrite::Reset { key } => {
+            if let Some(table) = settings.theme_colors.get_mut(mode) {
+                table.remove(key);
+            }
+        }
+        ColorWrite::ResetAll => {
+            settings.theme_colors.remove(mode);
+        }
+    }
+    Ok(())
+}
+
+/// 色の書き込み 3 操作の dispatch 側（#2331）: settings.json を読んで [`apply_color_write`] を当て、
+/// 保存して GUI のテーマを読み直す。知らない `target` は保存しない経路（セルフテスト・単体テスト）
+/// でも断り、断ったら読み直さない。`target` を省いて保存もしないときは settings.json を読まない
+/// （#2331 以前と同じ）
+fn theme_color_write(
+    host: &mut dyn ControlHost,
+    target: Option<&str>,
+    should_save: bool,
+    write: ColorWrite<'_>,
+) -> Result<(), DispatchError> {
+    if should_save || target.is_some() {
+        let mut settings = crate::settings::load();
+        apply_color_write(&mut settings, target, host.theme_mode(), write)?;
+        if should_save {
+            crate::settings::save(&settings)
+                .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+        }
+    }
+    host.reload_theme();
+    Ok(())
+}
+
 /// `tako theme colors` / MCP `tako_theme colors` の応答（#1830。CLI / MCP 共通）。
 ///
 /// 色の値・出どころ・`warnings` はどれも settings.json を解いた 1 回ぶん（[`resolve_theme`] と
@@ -2893,20 +3004,7 @@ fn theme_colors_response(
     target: Option<&str>,
 ) -> Result<Value, DispatchError> {
     use tako_core::theme::{ColorSource, Theme};
-    let name = match target {
-        None => settings.theme.clone(),
-        Some(t) => settings.known_theme_name(t).ok_or_else(|| {
-            let presets: Vec<&str> = settings.theme_presets.keys().map(String::as_str).collect();
-            let presets = if presets.is_empty() {
-                "なし".to_string()
-            } else {
-                presets.join(" / ")
-            };
-            DispatchError::InvalidParams(format!(
-                "未知のテーマ: {t:?}（target は dark / light / プリセット名。プリセット: {presets}）"
-            ))
-        })?,
-    };
+    let name = theme_target_name(settings, target)?;
     let (theme, warnings) = settings.resolve_theme_named(&name);
     let empty = std::collections::BTreeMap::new();
     let overrides = settings.theme_overrides_named(&name).unwrap_or(&empty);
@@ -9213,59 +9311,22 @@ fn dispatch_inner(
                     parse_hex_color(v).map_err(|e| {
                         DispatchError::InvalidParams(e.message(v).text().to_string())
                     })?;
-                    if should_save {
-                        let mut settings = crate::settings::load();
-                        let tgt = target.as_deref().unwrap_or(&settings.theme).to_string();
-                        if settings.theme_presets.contains_key(&tgt) {
-                            settings.theme_presets.get_mut(&tgt).unwrap().colors.insert(k.to_string(), v.to_string());
-                        } else {
-                            let mode_key = ThemeMode::parse(&tgt).unwrap_or(host.theme_mode()).as_str().to_string();
-                            settings.theme_colors.entry(mode_key).or_default().insert(k.to_string(), v.to_string());
-                        }
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
-                    }
-                    host.reload_theme();
+                    // #2331: 書く表は colors と同じ解決（知らない target は書かずに断る）
+                    let write = ColorWrite::Set { key: k, value: v };
+                    theme_color_write(host, target.as_deref(), should_save, write)?;
                     Ok(serde_json::json!({ "ok": true, "key": k, "value": v }))
                 }
                 "reset-color" => {
                     let k = key.as_deref().ok_or_else(|| {
                         DispatchError::InvalidParams("reset-color には key が必要".into())
                     })?;
-                    if should_save {
-                        let mut settings = crate::settings::load();
-                        let tgt = target.as_deref().unwrap_or(&settings.theme).to_string();
-                        if let Some(p) = settings.theme_presets.get_mut(&tgt) {
-                            p.colors.remove(k);
-                        } else {
-                            let mode_key = ThemeMode::parse(&tgt).unwrap_or(host.theme_mode()).as_str().to_string();
-                            if let Some(m) = settings.theme_colors.get_mut(&mode_key) {
-                                m.remove(k);
-                            }
-                        }
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
-                    }
-                    host.reload_theme();
+                    let write = ColorWrite::Reset { key: k };
+                    theme_color_write(host, target.as_deref(), should_save, write)?;
                     Ok(serde_json::json!({ "ok": true, "key": k }))
                 }
                 "reset-colors" => {
-                    if should_save {
-                        let mut settings = crate::settings::load();
-                        let tgt = target.as_deref().unwrap_or(&settings.theme).to_string();
-                        if let Some(p) = settings.theme_presets.get_mut(&tgt) {
-                            p.colors.clear();
-                        } else {
-                            let mode_key = ThemeMode::parse(&tgt).unwrap_or(host.theme_mode()).as_str().to_string();
-                            settings.theme_colors.remove(&mode_key);
-                        }
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
-                    }
-                    host.reload_theme();
+                    let write = ColorWrite::ResetAll;
+                    theme_color_write(host, target.as_deref(), should_save, write)?;
                     Ok(serde_json::json!({ "ok": true }))
                 }
                 "save-preset" => {
@@ -40758,6 +40819,293 @@ mod tests {
         }
         let response = call("nosuch");
         assert_eq!(response["result"]["isError"], true, "{response}");
+    }
+
+    /// #2331 の単体テストの settings: いまはダーク・dark と light の表とプリセット ocean に上書き
+    fn issue2331_settings() -> crate::settings::Settings {
+        let table = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let mut s = crate::settings::Settings {
+            theme: "dark".into(),
+            ..Default::default()
+        };
+        s.theme_colors.insert(
+            "dark".into(),
+            table(&[("accent", "#111111"), ("green", "#00ff00")]),
+        );
+        s.theme_colors
+            .insert("light".into(), table(&[("accent", "#ff0000")]));
+        s.theme_presets.insert(
+            "ocean".into(),
+            crate::settings::ThemePreset {
+                base: "light".into(),
+                colors: table(&[("teal", "#0000ff")]),
+            },
+        );
+        s
+    }
+
+    /// #2331: 色の書き込み（set-color / reset-color / reset-colors）の `target` は colors と同じ
+    /// `theme_target_name` で解き、知らない名前は**何も書かずに** colors と同じ文言で断る。
+    /// 以前は書き込みだけが知らない名前を GUI のモードの表へ落とし、打ち間違えた `--target` で
+    /// いまのテーマの上書きを書き換え・消していた。いまのテーマ（settings.json の theme）と GUI の
+    /// モードのどの組でも、settings は 1 バイトも変わらない（シリアライズした JSON の一致で見る）
+    #[test]
+    fn issue2331_色の書き込みは知らないtargetを書かずに断る() {
+        use tako_core::theme::ThemeMode;
+        let writes = [
+            ColorWrite::Set {
+                key: "accent",
+                value: "#123456",
+            },
+            ColorWrite::Reset { key: "green" },
+            ColorWrite::ResetAll,
+        ];
+        for now in ["dark", "light", "ocean", "solarized"] {
+            let mut s = issue2331_settings();
+            s.theme = now.into();
+            let before = serde_json::to_string(&s).unwrap();
+            for gui in [ThemeMode::Dark, ThemeMode::Light] {
+                // 空文字・大文字や前後に空白のあるプリセット名も知らない名前（colors と同じ）
+                for unknown in ["nosuch", "", "OCEAN", " ocean"] {
+                    let want = match theme_colors_response(&s, Some(unknown)) {
+                        Err(DispatchError::InvalidParams(msg)) => msg,
+                        other => panic!("colors は {unknown:?} を断るはず: {other:?}"),
+                    };
+                    for write in writes {
+                        let mut after = s.clone();
+                        match apply_color_write(&mut after, Some(unknown), gui, write) {
+                            Err(DispatchError::InvalidParams(msg)) => assert_eq!(
+                                msg, want,
+                                "いま {now}・GUI {gui:?}・{write:?}: colors と同じ文言で断る"
+                            ),
+                            other => panic!(
+                                "いま {now}・GUI {gui:?}・{write:?}: {unknown:?} は断るはず: {other:?}"
+                            ),
+                        }
+                        assert_eq!(
+                            serde_json::to_string(&after).unwrap(),
+                            before,
+                            "いま {now}・GUI {gui:?}・{write:?}: {unknown:?} で settings が変わった"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2331: 知っている名前（大小・前後の空白を問わないビルトイン名 / プリセット名）の `target` は
+    /// いまのテーマ・GUI のモードに依らず、そのテーマの表へ書く・表から消す。`target` を省いたら
+    /// settings.json の theme の表で、theme が知らない名前なら GUI のモードの表（#2331 以前と同じ）
+    #[test]
+    fn issue2331_色の書き込みは知っているtargetと省略を従来の表へ当てる() {
+        use crate::settings::Settings;
+        use tako_core::theme::ThemeMode;
+        let set = |key: &'static str, value: &'static str| ColorWrite::Set { key, value };
+        // `edit` を当てた期待値と `apply_color_write` の結果を JSON で突き合わせる
+        let check = |now: &str,
+                     gui: ThemeMode,
+                     target: Option<&str>,
+                     write: ColorWrite<'_>,
+                     edit: &dyn Fn(&mut Settings)| {
+            let mut s = issue2331_settings();
+            s.theme = now.into();
+            let mut want = s.clone();
+            edit(&mut want);
+            apply_color_write(&mut s, target, gui, write).unwrap_or_else(|e| {
+                panic!("いま {now}・GUI {gui:?}・target {target:?}・{write:?}: {e}")
+            });
+            assert_eq!(
+                serde_json::to_string(&s).unwrap(),
+                serde_json::to_string(&want).unwrap(),
+                "いま {now}・GUI {gui:?}・target {target:?}・{write:?}"
+            );
+        };
+        for now in ["dark", "light", "ocean", "solarized"] {
+            for gui in [ThemeMode::Dark, ThemeMode::Light] {
+                for spelled in ["light", "LIGHT", " Light "] {
+                    check(now, gui, Some(spelled), set("accent", "#123456"), &|s| {
+                        let t = s.theme_colors.get_mut("light").unwrap();
+                        t.insert("accent".into(), "#123456".into());
+                    });
+                }
+                check(now, gui, Some("ocean"), set("mauve", "#abcdef"), &|s| {
+                    let p = s.theme_presets.get_mut("ocean").unwrap();
+                    p.colors.insert("mauve".into(), "#abcdef".into());
+                });
+                check(
+                    now,
+                    gui,
+                    Some("ocean"),
+                    ColorWrite::Reset { key: "teal" },
+                    &|s| {
+                        let p = s.theme_presets.get_mut("ocean").unwrap();
+                        p.colors.remove("teal");
+                    },
+                );
+                check(
+                    now,
+                    gui,
+                    Some("Dark"),
+                    ColorWrite::Reset { key: "accent" },
+                    &|s| {
+                        s.theme_colors.get_mut("dark").unwrap().remove("accent");
+                    },
+                );
+                check(now, gui, Some("light"), ColorWrite::ResetAll, &|s| {
+                    s.theme_colors.remove("light");
+                });
+                check(now, gui, Some("ocean"), ColorWrite::ResetAll, &|s| {
+                    s.theme_presets.get_mut("ocean").unwrap().colors.clear();
+                });
+            }
+        }
+
+        // target 省略: settings.json の theme の表（GUI のモードに依らない）
+        for gui in [ThemeMode::Dark, ThemeMode::Light] {
+            check("dark", gui, None, set("red", "#222222"), &|s| {
+                let t = s.theme_colors.get_mut("dark").unwrap();
+                t.insert("red".into(), "#222222".into());
+            });
+            check("ocean", gui, None, set("red", "#444444"), &|s| {
+                let p = s.theme_presets.get_mut("ocean").unwrap();
+                p.colors.insert("red".into(), "#444444".into());
+            });
+            check("light", gui, None, ColorWrite::ResetAll, &|s| {
+                s.theme_colors.remove("light");
+            });
+        }
+        // theme が知らない名前（手で書いた・プリセットを消した）なら GUI のモードの表
+        check(
+            "solarized",
+            ThemeMode::Light,
+            None,
+            set("red", "#333333"),
+            &|s| {
+                let t = s.theme_colors.get_mut("light").unwrap();
+                t.insert("red".into(), "#333333".into());
+            },
+        );
+        check(
+            "solarized",
+            ThemeMode::Dark,
+            None,
+            ColorWrite::Reset { key: "green" },
+            &|s| {
+                s.theme_colors.get_mut("dark").unwrap().remove("green");
+            },
+        );
+
+        // 表の無いモードへの reset-color は表を作らない・set-color は作る（#2331 以前と同じ）
+        let mut no_light = issue2331_settings();
+        no_light.theme_colors.remove("light");
+        let mut got = no_light.clone();
+        let reset = ColorWrite::Reset { key: "accent" };
+        apply_color_write(&mut got, Some("light"), ThemeMode::Dark, reset).unwrap();
+        assert_eq!(got, no_light, "表の無いモードへの reset-color が表を作った");
+        let write = set("accent", "#010203");
+        apply_color_write(&mut got, Some("light"), ThemeMode::Dark, write).unwrap();
+        assert_eq!(
+            got.theme_colors["light"].get("accent").map(String::as_str),
+            Some("#010203")
+        );
+    }
+
+    /// #2331: dispatch（CLI の経路）と MCP の `tako_theme` の書き込み 3 操作も、知らない `target` を
+    /// colors と同じ文言で断る。単体テストは保存しない経路（`should_save` が偽）を通るので、ここが
+    /// 断れるのは検証が保存の前段にあるから。知っている名前・省略は従来どおりの応答で成功する
+    #[test]
+    fn issue2331_dispatchとmcpの色の書き込みは知らないtargetを断る() {
+        let theme = |action: &str, target: Option<&str>| Request::Theme {
+            action: Some(action.into()),
+            mode: None,
+            target: target.map(str::to_string),
+            key: matches!(action, "set-color" | "reset-color").then(|| "accent".to_string()),
+            value: (action == "set-color").then(|| "#123456".to_string()),
+            name: None,
+            font_family: None,
+            font_size: None,
+        };
+        let mut host = MockHost::new();
+        for target in ["nosuch", "", "OCEAN"] {
+            let want = match dispatch(&mut host, theme("colors", Some(target)), PaneOrigin::Cli) {
+                Err(DispatchError::InvalidParams(msg)) => msg,
+                other => panic!("colors は {target:?} を断るはず: {other:?}"),
+            };
+            for action in ["set-color", "reset-color", "reset-colors"] {
+                match dispatch(&mut host, theme(action, Some(target)), PaneOrigin::Cli) {
+                    Err(DispatchError::InvalidParams(msg)) => {
+                        assert_eq!(msg, want, "CLI: {action} --target {target:?}")
+                    }
+                    other => panic!("CLI: {action} --target {target:?} は断るはず: {other:?}"),
+                }
+            }
+        }
+        // 知っている名前と省略は従来どおりの応答
+        for target in [Some("light"), Some(" DARK "), None] {
+            let ok = |host: &mut MockHost, action: &str| {
+                dispatch(host, theme(action, target), PaneOrigin::Cli)
+                    .unwrap_or_else(|e| panic!("CLI: {action} target={target:?}: {e}"))
+            };
+            assert_eq!(
+                ok(&mut host, "set-color"),
+                serde_json::json!({ "ok": true, "key": "accent", "value": "#123456" })
+            );
+            assert_eq!(
+                ok(&mut host, "reset-color"),
+                serde_json::json!({ "ok": true, "key": "accent" })
+            );
+            assert_eq!(
+                ok(&mut host, "reset-colors"),
+                serde_json::json!({ "ok": true })
+            );
+        }
+
+        // MCP: tools/call tako_theme → 同じ dispatch。本文は colors の断りと同じ
+        let mut exec = |req: Request| -> Result<serde_json::Value, String> {
+            dispatch(&mut host, req, PaneOrigin::Mcp).map_err(|e| e.to_string())
+        };
+        let mut session = crate::mcp::McpSession {
+            caller_pane: None,
+            caller_role: None,
+            connected: true,
+            exec: &mut exec,
+        };
+        let mut call = |arguments: serde_json::Value| {
+            let msg = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "tako_theme", "arguments": arguments },
+            });
+            crate::mcp::handle_message(&msg, &mut session).expect("応答がある")
+        };
+        let text = |response: &serde_json::Value| {
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let colors = call(serde_json::json!({ "action": "colors", "target": "nosuch" }));
+        assert_eq!(colors["result"]["isError"], true, "{colors}");
+        for arguments in [
+            serde_json::json!({ "action": "set-color", "key": "accent", "value": "#123456", "target": "nosuch" }),
+            serde_json::json!({ "action": "reset-color", "key": "accent", "target": "nosuch" }),
+            serde_json::json!({ "action": "reset-colors", "target": "nosuch" }),
+        ] {
+            let response = call(arguments.clone());
+            assert_eq!(
+                response["result"]["isError"], true,
+                "MCP {arguments}: {response}"
+            );
+            assert_eq!(text(&response), text(&colors), "MCP {arguments}");
+        }
+        let response = call(serde_json::json!({ "action": "reset-colors", "target": "light" }));
+        assert_ne!(response["result"]["isError"], true, "{response}");
     }
 
     /// #1756: 色の値は文字単位で検査する。6 バイトの非 ASCII（`#赤色`）がバイト長の検査を

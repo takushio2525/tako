@@ -1999,7 +1999,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
         /// 色操作の対象: "dark" / "light" / プリセット名（省略 = 現在の theme）。
-        /// colors もこのテーマの色を返す（いまのテーマに依らない。#2321）
+        /// colors もこのテーマの色を返す（いまのテーマに依らない。#2321）。知らない名前は
+        /// colors も書き込みも同じ文言のエラーで、書き込みは何も書かない（#2331）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
         /// set-color / reset-color の色名（58 キー）

@@ -1303,6 +1303,8 @@ settings.json の色の上書きに読めない値（`#赤色` など）があ�
 
 `tako theme colors --target <dark|light|プリセット名>` は、いまのテーマに依らず、そのテーマの色と出どころ・`warnings` を返します（応答の `theme` もそのテーマの名前）。ダークで使いながらライトの配色を確かめる、といった使い方ができます。知らない名前はエラーになります。
 
+色の上書きを書く `tako theme color <キー> <値> --target <名前>`・`tako theme color <キー> --reset --target <名前>`・`tako theme reset-colors --target <名前>` も同じ名前を受け取ります。知らない名前は何も書かずにエラーになるので、打ち間違えた名前でいまのテーマの色が書き換わることはありません。
+
 ### tako lang
 
 ```bash
