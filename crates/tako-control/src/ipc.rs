@@ -2357,13 +2357,12 @@ mod tests {
             took >= std::time::Duration::from_millis(350),
             "繋ぎ直しの間を置かずに残骸と読んだ: {took:?}"
         );
-        // 旧判定は待たない
-        let started = std::time::Instant::now();
+        // 旧判定も残骸と読む（待たないことは tako-core の台本のテストが待ちの合計 0 で固定する。
+        // ここで実時間の上限を測ると負荷で反転する = test_timing_watchdog）
         assert_eq!(
             unix_imp::occupant_with(&path, true),
             tako_core::ipc_socket::Occupant::Dead
         );
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             unix_imp::occupant_with(&path, false),

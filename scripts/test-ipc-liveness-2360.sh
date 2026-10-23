@@ -147,9 +147,13 @@ stop_b() { [ -n "$B_PID" ] && stop_isolated_gui "$B_PID"; B_PID=""; }
 
 # 固定パスの CLI（A のペインのシェルが使う TAKO_SOCKET と同じ口）。トークンは data dir の共有ファイル
 via_fixed() { TAKO_SOCKET="$SOCK" TAKO_TOKEN="$(cat "$TAKO_DATA_DIR/token")" "$TAKO_BIN" list 2>&1; }
-fixed_answers_a() { via_fixed | grep -q 'MARK-A' && echo 1; }
+fixed_answers_a() { local out; out=$(via_fixed); [[ "$out" == *MARK-A* ]] && echo 1; }
 # その pid が固定パスの名前で張った受け口を持っているか（lsof の unix ソケットの名前）
-holds_fixed() { lsof -nP -a -p "$1" -U -F n 2>/dev/null | sed -n 's/^n//p' | grep -qxF "$SOCK" && echo 1; }
+holds_fixed() {
+  local names
+  names=$(lsof -nP -a -p "$1" -U -F n 2>/dev/null | sed -n 's/^n//p')
+  grep -qxF "$SOCK" <<<"$names" && echo 1
+}
 # MCP の stdio ブリッジ（`tako mcp serve`）を固定パスへ繋ぎ、tako_list_panes に印が見えれば 1
 mcp_answers_a() {
   {
