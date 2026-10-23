@@ -1094,9 +1094,9 @@ fn starts_new_dialog_block(line: &str, prev: &str, open: &OpenLine, usable: usiz
 /// `権限を許可して私が流す（ 推奨）` という壊れた語になる（#1447 の実採取）ので、
 /// 境界の両側が非 ASCII なら挟まない。
 ///
-/// **副画面が無い画面の結合は従来どおり**（#1131 の実装を変えない）。狭いペインの
-/// 全角ラベルにも同じ理屈は当たるが、そちらを変えると #1131 が固定した期待値
-/// （`はい、ぜんぶ進めますよ つづき`）が変わるので、この Issue の範囲では触らない
+/// **副画面が無い画面の番号つき選択肢の繋ぎ目は [`seam`] が表示幅の証拠で決める**（#2324）。
+/// ここへ来るのはそれ以外（副画面の縁で切られた行・番号なしの並び・`TAKO_2324_LEGACY=1`）で、
+/// 副画面が無ければ従来どおり空白を挟む
 fn needs_join_space(head: &str, tail: &str, at_wrap_edge: bool) -> bool {
     if !at_wrap_edge || legacy_side_panel() {
         return true;
@@ -1164,7 +1164,7 @@ fn unwrap_dialog_lines_at(lines: &[&str], at_wrap_edge: &[bool]) -> (Vec<String>
     // 続きを受け付けている論理行。None = 受け付けない
     let mut open: Option<OpenLine> = None;
     let mut joined = 0usize;
-    for line in lines {
+    for (i, line) in lines.iter().enumerate() {
         if let Some(state) = open {
             if joined < MAX_WRAP_JOIN_LINES.min(state.limit)
                 && !starts_new_dialog_block(line, &out[state.row], &state, usable)
@@ -1176,7 +1176,10 @@ fn unwrap_dialog_lines_at(lines: &[&str], at_wrap_edge: &[bool]) -> (Vec<String>
                     // 空白で埋まることがあり、そのまま繋ぐとラベルの途中に空白の塊が残って
                     // `respond` のラベル一致検証が外れる（#1131 が直したかったものと同じ形）
                     last.truncate(last.trim_end().len());
-                    if needs_join_space(last, tail, state.at_wrap_edge) {
+                    // 番号つき選択肢の繋ぎ目は表示幅の証拠で決めてある（#2324）
+                    let space = ends.space[i]
+                        .unwrap_or_else(|| needs_join_space(last, tail, state.at_wrap_edge));
+                    if space {
                         last.push(' ');
                     }
                     last.push_str(tail);
@@ -1235,6 +1238,9 @@ struct LabelEnds {
     decided: Vec<bool>,
     /// ラベルの終わりが画面から確定できない（`label_truncated` へ載せる）
     undecided: Vec<bool>,
+    /// 続きの行を前の行へ繋ぐとき空白を挟むか（#2324。[`seam`] が決めた行だけ。
+    /// None = 従来の規則 = [`needs_join_space`]）
+    space: Vec<Option<bool>>,
 }
 
 /// 番号つき選択肢の下に続く行が**ラベルの折り返しか説明か**を決める（#2302）。
@@ -1267,16 +1273,24 @@ struct LabelEnds {
 /// 1. 並びのどこにも段落の切れ目が無い = 説明の証拠が無い。従来（#1131）の結合のまま
 ///    （permission / 上限ダイアログ / 確認ダイアログはここ）。ただし結合が「右端まで埋まった
 ///    区切りの無い長い語」の行を飲むときは、説明を飲んだかもしれないので境目を読めない扱い。
-///    **説明を必ず持つと分かる並び**（[`carries_descriptions`]。#2320）では、従来の結合が
-///    続きの行を飲むならラベルは 1 行目だけ + 境目を読めない扱い、続きが 1 行ならそれが説明
+///    **説明を必ず持つと分かる並び**（[`carries_descriptions`]。#2320）では、続きが 2 行以上なら
+///    ラベルは 1 行目だけ + 境目を読めない扱い、続きが 1 行ならそれが説明
 ///    （どのラベルも右端近くまで届き説明の最初の語が入らないと、切れ目が並びのどこにも出ない。
-///    実採取 32〜37 桁で説明が丸ごとラベルへ混ざっていた）
+///    実採取 32〜37 桁で説明が丸ごとラベルへ混ざっていた）。従来の結合（char 数の見積もり）が
+///    続きを「別の要素」と読んでも同じ扱い（#2324: 全角の続きは表示幅では前の行に入らないのに
+///    char 数では入ると読まれ、ラベルの続きが申告なしで落ちていた）。続きの 1 行目が長い語の
+///    証拠（[`long_word_evidence`]）を持てば、そこから説明
 /// 2. 説明つきの並び（切れ目が 1 つでもある）では選択肢ごとに:
 ///    - 段落の切れ目があれば、その手前までがラベル
-///    - 続きの 1 行目が右端まで埋まった区切りの無い長い語なら、そこから説明（簡潔なラベルは
+///    - 続きの 1 行目が右端まで埋まった区切りの無い長い語で、**それがラベルの続きではありえない
+///      証拠**（[`long_word_evidence`]。#2324）があれば、そこから説明（簡潔なラベルは
 ///      行幅を超える語を続けない。日本語の説明は語の区切りが少なく、広いペインでもここに当たる）
 ///    - 続きが 1 行だけならそれが説明（説明は必ずある）
 ///    - それ以外は境目が読めない: ラベルは 1 行目だけ・`label_truncated`
+///
+/// 最後に、ラベルへ繋ぐ行ごとに**繋ぎ目で空白を挟むか**を [`seam`] で決める（#2324）。
+/// 決まらない繋ぎ目があればその手前で結合を止め、`label_truncated` にする
+/// （`label` は確実に分かっている先頭部分だけ = 本当のラベルの接頭辞）
 fn label_ends(
     lines: &[&str],
     at_wrap_edge: &[bool],
@@ -1289,10 +1303,12 @@ fn label_ends(
         join: vec![usize::MAX; n],
         decided: vec![false; n],
         undecided: vec![false; n],
+        space: vec![None; n],
     };
     if legacy_2302() {
         return ends;
     }
+    let legacy = legacy_2324();
     let cut = |i: usize| at_wrap_edge.get(i).copied().unwrap_or(false);
     let two_column = |r: usize| desc_col.is_some() && column_gap(lines[r]) == desc_col;
     let screen = lines.iter().map(|l| display_width(l)).max().unwrap_or(0);
@@ -1321,38 +1337,183 @@ fn label_ends(
                 continue;
             }
             let long_start = long_word_start(lines, block, edge, screen);
+            // #2324: 長い語の形だけでは「ラベルの最後の語がちょうど行を埋めた」形と見分けられない
+            // （実採取: 27 桁の `3. Issue` + `を閉じて調査だけにする`）。ラベルの続きではありえない
+            // 証拠があるときだけ説明の始まりと読む
+            let long_desc = long_start && (legacy || long_word_evidence(lines, block));
+            // 従来の結合（char 数の見積もり）が続きの 1 行目を飲むか
+            let joins = open_line(lines[*r], *r, at_wrap_edge)
+                .is_some_and(|o| !starts_new_dialog_block(lines[block[0]], lines[*r], &o, usable));
             if !described {
-                // 1: 従来の結合のまま。長い語の行を飲むときだけ境目を読めない扱い
-                let joins = open_line(lines[*r], *r, at_wrap_edge).is_some_and(|o| {
-                    !starts_new_dialog_block(lines[block[0]], lines[*r], &o, usable)
-                });
-                if carries && joins {
-                    // #2320: 説明は必ずある。従来の結合が飲む行は「入らなかったラベルの続き」とも
-                    // 「説明の 1 行目」とも取れる = 1 行目だけ + 申告。続きが 1 行だけならそれが説明
+                if carries && (joins || !legacy) {
+                    // #2320: 説明は必ずある。続きは「入らなかったラベルの続き」とも「説明の 1 行目」
+                    // とも取れる = 1 行目だけ + 申告。続きが 1 行だけならそれが説明。
+                    // #2324: 見積もりが「別の要素」と読んでも表示幅では切れ目が無い = 同じ扱い。
+                    // 続きの 1 行目が長い語の証拠を持てば、そこから説明
                     ends.join[*r] = 0;
-                    ends.undecided[*r] = block.len() > 1;
+                    ends.undecided[*r] = block.len() > 1 && (legacy || !long_desc);
                     continue;
                 }
+                // 1: 従来の結合のまま。長い語の行を飲むときだけ境目を読めない扱い
                 ends.undecided[*r] = long_start && joins;
+            } else {
+                ends.decided[*r] = true;
+                ends.join[*r] = match brk {
+                    // 結合の上限を超えるラベルは途中までしか繋がらない = 申告する
+                    Some(k) if *k > MAX_WRAP_JOIN_LINES => {
+                        ends.undecided[*r] = true;
+                        *k
+                    }
+                    Some(k) => *k,
+                    None if long_desc || block.len() == 1 => 0,
+                    None => {
+                        ends.undecided[*r] = true;
+                        0
+                    }
+                };
+            }
+            if legacy {
                 continue;
             }
-            ends.decided[*r] = true;
-            ends.join[*r] = match brk {
-                // 結合の上限を超えるラベルは途中までしか繋がらない = 申告する
-                Some(k) if *k > MAX_WRAP_JOIN_LINES => {
-                    ends.undecided[*r] = true;
-                    *k
+            // #2324: ラベルへ繋ぐ行ごとに繋ぎ目の空白を決める。決まらない繋ぎ目の手前で止めて申告する
+            let joined = match ends.join[*r] {
+                usize::MAX if joins => block.len(),
+                usize::MAX => 0,
+                k => k.min(block.len()),
+            }
+            .min(MAX_WRAP_JOIN_LINES);
+            for k in 0..joined {
+                let prev = if k == 0 { *r } else { block[k - 1] };
+                let before = k
+                    .checked_sub(1)
+                    .map(|j| if j == 0 { *r } else { block[j - 1] });
+                match seam(lines, before, prev, block[k], edge) {
+                    Seam::Space => ends.space[block[k]] = Some(true),
+                    Seam::Joined => ends.space[block[k]] = Some(false),
+                    Seam::Unknown => {
+                        ends.join[*r] = k;
+                        ends.undecided[*r] = true;
+                        break;
+                    }
                 }
-                Some(k) => *k,
-                None if long_start || block.len() == 1 => 0,
-                None => {
-                    ends.undecided[*r] = true;
-                    0
-                }
-            };
+            }
         }
     }
     ends
+}
+
+/// 折り返しの繋ぎ目（[`seam`] の判定。#2324）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// 空白で折り返した（語の途中では割っていない）= 空白を戻す
+    Space,
+    /// 1 つの語の途中で割った = 空白を挟まない
+    Joined,
+    /// 画面からは決まらない
+    Unknown,
+}
+
+/// ラベルの続きの行 `next` を前の行 `prev` へ繋ぐとき、繋ぎ目に空白があったか（#2324）。
+///
+/// # 実測（claude 2.1.301。AskUserQuestion を 24〜44・50・60・80 桁で採取）
+///
+/// claude は空白で折り返すと空白を消し、空白の無い語は**行幅を超えるときだけ**字の間で割る
+/// （行幅に収まる語は次の行へ丸ごと送る。日本語は空白が無いので 1 つの長い語として割られる）。
+///
+/// ```text
+/// 28 桁:  ❯ 1. ダイアログの検知を先に   ← 語の途中で割った（空白なし）
+///              直す
+/// 28 桁:  ❯ 1. はい、ぜんぶ進めますよ   ← 空白で折り返した（本当のラベルは `…よ つづきも見る`）
+///              つづきも見る
+/// ```
+///
+/// 上の 2 つは字面が同じ形（前の行が右端まで埋まり、全角どうしで繋がる）なので、前の行の
+/// 埋まり方だけでは決まらない（全採取の全角どうしの繋ぎ目で、埋まった 40 か所のうち 2 か所が
+/// 空白あり）。そこで次の証拠があるときだけ決め、無ければ [`Seam::Unknown`]（推測で繋がない）:
+///
+/// 1. 前の行に次の行の 1 文字目がまだ入る = 字で割るなら入れていた → 空白
+///    （前々行が右端に届いた行は 1 桁狭い = [`paragraph_break`] と同じ見積もり）
+/// 2. 次の行が行頭に来ない字（閉じ括弧・句読点。[`cannot_begin_element`]）で始まる → 語の途中
+/// 3. 繋ぎ目をまたぐ語（前の行の最後の空白より後ろ + 次の行の最初の空白まで）が行幅に収まる
+///    = 1 語なら次の行へ丸ごと送られていた → 空白（英語の折り返しはほぼここで決まる）
+fn seam(lines: &[&str], before: Option<usize>, prev: usize, next: usize, edge: usize) -> Seam {
+    let head = lines[next].trim();
+    let Some(first) = head.chars().next() else {
+        return Seam::Space;
+    };
+    let hidden_space = usize::from(before.is_some_and(|b| display_width(lines[b]) >= edge));
+    if display_width(lines[prev]) + hidden_space + char_width(first) <= edge {
+        return Seam::Space;
+    }
+    if cannot_begin_element(first) {
+        return Seam::Joined;
+    }
+    let tail = lines[prev]
+        .trim_end()
+        .rsplit(' ')
+        .next()
+        .unwrap_or_default();
+    let lead = head.split(' ').next().unwrap_or_default();
+    let indent = lines[next].chars().take_while(|c| *c == ' ').count();
+    if display_width(tail) + display_width(lead) <= edge.saturating_sub(indent) {
+        return Seam::Space;
+    }
+    Seam::Unknown
+}
+
+/// 行頭に来ない字（#2324）。閉じ括弧・句読点・小書きの仮名・長音は語の先頭にならないので、
+/// 行頭に出ていれば 1 つの語を字の間で割った続き（ラベルや説明の始まりではない）。
+/// 語の先頭になりうる字（`.env` の `.`・箇条書きの `・` など）は入れない
+const NO_LINE_START: &[char] = &[
+    '）', '」', '』', '】', '〕', '〉', '》', '］', '｝', ')', ']', '}', '、', '。', '，', '．',
+    '：', '；', '！', '？', ',', 'ー', 'ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ', 'っ', 'ゃ', 'ゅ', 'ょ', 'ゎ',
+    'ァ', 'ィ', 'ゥ', 'ェ', 'ォ', 'ッ', 'ャ', 'ュ', 'ョ', 'ヮ', 'ヵ', 'ヶ', '々',
+];
+
+/// `c` が行頭に来ない字か（[`NO_LINE_START`]）
+fn cannot_begin_element(c: char) -> bool {
+    NO_LINE_START.contains(&c)
+}
+
+/// 1 文字の表示幅（全角は 2 桁）
+fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// ラベルに入る空白の無い語の幅の上限（表示幅。#2324）。AskUserQuestion の schema は label を
+/// 「concise (1-5 words)」と指示しており（claude 2.1.301 の実文字列）、全角 20 字を超える
+/// 空白の無い語はラベルに来ない前提で、[`long_word_evidence`] の 2 つ目の証拠に使う
+const LABEL_WORD_MAX: usize = 40;
+
+/// 長い語の形（[`long_word_start`]）の続きの 1 行目が、**ラベルの続きではありえない**証拠を
+/// 持つか（#2324）。
+///
+/// 形だけでは「行幅を超える長い語の途中」と「ラベルの最後の語がちょうど行を埋めた」が
+/// 見分けられない（実採取: 27 桁の `3. Issue` + `を閉じて調査だけにする`（22 桁 = 行幅
+/// ちょうど）+ 説明。修正前は説明の始まりと読んでラベルの続きを申告なしで落とした）。証拠は:
+///
+/// 1. 2 行目が行頭に来ない字で始まる（[`cannot_begin_element`]）= 1 行目は字の間で割られた
+///    長い語の途中（実採取 32 桁: `判定の材料（画面の末尾の窓` + `）が共通なので…`）
+/// 2. 1 行目の語がラベルに入る語の幅（[`LABEL_WORD_MAX`]）を超える = 広いペインで説明が
+///    区切りの無い長い語で始まる形（実採取 60 桁: `判定の材料（画面の末尾の窓）が共通なので、
+///    窓の取り方を`（54 桁））
+fn long_word_evidence(lines: &[&str], block: &[usize]) -> bool {
+    let (Some(&first), Some(&second)) = (block.first(), block.get(1)) else {
+        return false;
+    };
+    lines[second]
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(cannot_begin_element)
+        || display_width(lines[first].trim()) > LABEL_WORD_MAX
+}
+
+/// `TAKO_2324_LEGACY=1` で #2324 前（長い語の形だけで説明の始まりと読み、続きの繋ぎ目に
+/// 必ず空白を挟み、説明を持つ並びで見積もりが「別の要素」と読んだ続きを申告しない）へ戻す（A/B 用）
+fn legacy_2324() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2324_LEGACY").is_ok_and(|v| v == "1"))
 }
 
 /// AskUserQuestion の自由入力の選択肢（#2320）。claude は質問の選択肢の後ろへ必ず足す
@@ -2755,8 +2916,18 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         let list = detect_choice_list(&lines).expect("末尾空白つきでも検知される");
         assert!(list.numbered);
         assert_eq!(list.options.len(), 2, "{:?}", list.options);
-        // 折り返しの続きは結合され、繋ぎ目に余白の塊が残らない
-        assert_eq!(list.options[0].label, "はい、ぜんぶ進めますよ つづき");
+        // #2324: 1 行目は右端まで埋まり（表示幅 30 = 画面で最も広い行）、全角どうしで繋がる。
+        // この字面は「語の途中で割った（空白なし）」とも「空白で折り返した」とも取れる
+        // （実採取 claude 2.1.301 の 28 桁で両方が同じ形に出る = `issue2324_narrow_cjk_label`）。
+        // 旧期待の `はい、ぜんぶ進めますよ つづき` は空白ありと推測していたので、確実な先頭だけ +
+        // 申告へ直した（respond のラベル指定は拒否・番号は効く）
+        assert_eq!(
+            (
+                list.options[0].label.as_str(),
+                list.options[0].label_truncated
+            ),
+            ("はい、ぜんぶ進めますよ", true)
+        );
         assert_eq!(list.options[1].label, "いいえ");
         for o in &list.options {
             assert!(
@@ -2765,6 +2936,51 @@ Antigravity CLI requires permission to read, edit, and execute files here.
                 o.label
             );
         }
+        // 繋ぎ目が決まる形（繋ぎ目をまたぐ語 `進めますよ` + `つづき` が行幅に収まる = 1 語なら
+        // 次の行へ丸ごと送られていた = 空白で折り返した）は、行末の余白を落としてから繋ぎ、
+        // 余白の塊を残さない（この test の本来の観点を保つ）
+        let owned = [
+            "▔".repeat(25),
+            pad("   このダイアログは？"),
+            String::new(),
+            pad("   ❯ 1. はい、ぜんぶ 進めますよ"),
+            pad("        つづき"),
+            pad("     2. いいえ"),
+        ];
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let list = detect_choice_list(&lines).expect("末尾空白つきでも検知される");
+        assert_eq!(
+            (
+                list.options[0].label.as_str(),
+                list.options[0].label_truncated
+            ),
+            ("はい、ぜんぶ 進めますよ つづき", false)
+        );
+    }
+
+    #[test]
+    fn issue2324_閉じ括弧で始まる続きは語の途中として空白なしで繋ぐ() {
+        // 合成: `確認だけ先に済ませておく（推奨）`（32 桁）が `（推奨` と `）` の間で割れた形。
+        // 1 行目は右端まで埋まり（`）` が入らない）、行頭の `）` は語の先頭にならない = 1 つの語を
+        // 字の間で割った（`seam` の規則 2）。次の `説明の文。` は `）` の後ろに入る = 説明の始まり
+        let lines = rows(
+            "❯ 1. 確認だけ先に済ませておく（推奨\n     ）\n     説明の文。\n  2. やめる\n     説明。\n  3. Type something.\n\nEnter to select · ↑/↓ to navigate · Esc to cancel",
+        );
+        let list = detect_choice_list(&lines).expect("検知できる");
+        assert_eq!(
+            (
+                list.options[0].label.as_str(),
+                list.options[0].label_truncated
+            ),
+            ("確認だけ先に済ませておく（推奨）", false)
+        );
+        assert_eq!(
+            (
+                list.options[1].label.as_str(),
+                list.options[1].label_truncated
+            ),
+            ("やめる", false)
+        );
     }
 
     // --- #1143: カーソルが画面外の番号つき一覧 / 切り詰められたラベル / 説明列 ---

@@ -1,0 +1,904 @@
+=== 24
+
+           Claude Code
+           v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage
+ ▝▝   ▝▝   Billing
+           /…/work
+
+
+❯ ASK:ascii
+────────────────────────
+ ☐ Order
+
+Which one should we fix
+first? Both help the
+master.
+
+❯ 1. Fix the status
+     detection first
+     (Recommended)
+     Replace the tail
+     window with the
+     input anchor so a
+     long footer does
+     not hide the error
+     line.
+  2. Fix dialogs
+     Join wrapped
+     options and key
+     hints before
+     deciding.
+  3. Rewrite both in a
+     single PR
+     Shared inputs mean
+     one change, but the
+     diff gets larger.
+  4. Investigate only
+     Check each symptom
+     on main and close
+     what is already
+     fixed.
+  5. Type something.
+────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to
+cancel
+=== 25
+
+           Claude Code
+           v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage
+ ▝▝   ▝▝   Billing
+           /…/work
+           k
+
+
+❯ ASK:ascii
+─────────────────────────
+ ☐ Order
+
+Which one should we fix
+first? Both help the
+master.
+
+❯ 1. Fix the status
+     detection first
+     (Recommended)
+     Replace the tail
+     window with the
+     input anchor so a
+     long footer does not
+     hide the error
+     line.
+  2. Fix dialogs
+     Join wrapped options
+     and key hints
+     before deciding.
+  3. Rewrite both in a
+     single PR
+     Shared inputs mean
+     one change, but the
+     diff gets larger.
+  4. Investigate only
+     Check each symptom
+     on main and close
+     what is already
+     fixed.
+  5. Type something.
+─────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 26
+
+           Claude Code
+           v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage
+ ▝▝   ▝▝   Billing
+           /…/work
+
+
+❯ ASK:ascii
+──────────────────────────
+ ☐ Order
+
+Which one should we fix
+first? Both help the
+master.
+
+❯ 1. Fix the status
+     detection first
+     (Recommended)
+     Replace the tail
+     window with the input
+     anchor so a long
+     footer does not hide
+     the error line.
+  2. Fix dialogs
+     Join wrapped options
+     and key hints before
+     deciding.
+  3. Rewrite both in a
+     single PR
+     Shared inputs mean
+     one change, but the
+     diff gets larger.
+  4. Investigate only
+     Check each symptom on
+     main and close what
+     is already fixed.
+  5. Type something.
+──────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 27
+
+           Claude Code
+           v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage
+ ▝▝   ▝▝   Billing
+           /…/work
+
+
+❯ ASK:ascii
+───────────────────────────
+ ☐ Order
+
+Which one should we fix
+first? Both help the
+master.
+
+❯ 1. Fix the status
+     detection first
+     (Recommended)
+     Replace the tail
+     window with the input
+     anchor so a long
+     footer does not hide
+     the error line.
+  2. Fix dialogs
+     Join wrapped options
+     and key hints before
+     deciding.
+  3. Rewrite both in a
+     single PR
+     Shared inputs mean one
+     change, but the diff
+     gets larger.
+  4. Investigate only
+     Check each symptom on
+     main and close what is
+     already fixed.
+  5. Type something.
+───────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 28
+
+           Claude Code
+ ▐▛███▛█   v2.1.301
+▝▜██████▀  Haiku 5.5
+ ▝▝   ▝▝   API Usage Billing
+           /…/work
+
+
+❯ ASK:ascii
+────────────────────────────
+ ☐ Order
+
+Which one should we fix
+first? Both help the master.
+
+❯ 1. Fix the status
+     detection first
+     (Recommended)
+     Replace the tail window
+     with the input anchor
+     so a long footer does
+     not hide the error
+     line.
+  2. Fix dialogs
+     Join wrapped options
+     and key hints before
+     deciding.
+  3. Rewrite both in a
+     single PR
+     Shared inputs mean one
+     change, but the diff
+     gets larger.
+  4. Investigate only
+     Check each symptom on
+     main and close what is
+     already fixed.
+  5. Type something.
+────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 29
+
+           Claude Code
+ ▐▛███▛█   v2.1.301
+▝▜██████▀  Haiku 5.5
+ ▝▝   ▝▝   API Usage Billing
+           /…/work
+
+
+❯ ASK:ascii
+─────────────────────────────
+ ☐ Order
+
+Which one should we fix
+first? Both help the master.
+
+❯ 1. Fix the status detection
+     first (Recommended)
+     Replace the tail window
+     with the input anchor so
+     a long footer does not
+     hide the error line.
+  2. Fix dialogs
+     Join wrapped options and
+     key hints before
+     deciding.
+  3. Rewrite both in a single
+     PR
+     Shared inputs mean one
+     change, but the diff
+     gets larger.
+  4. Investigate only
+     Check each symptom on
+     main and close what is
+     already fixed.
+  5. Type something.
+─────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 30
+
+           Claude Code
+ ▐▛███▛█   v2.1.301
+▝▜██████▀  Haiku 5.5
+ ▝▝   ▝▝   API Usage Billing
+           /…/work
+
+
+❯ ASK:ascii
+──────────────────────────────
+ ☐ Order
+
+Which one should we fix first?
+Both help the master.
+
+❯ 1. Fix the status detection
+     first (Recommended)
+     Replace the tail window
+     with the input anchor so
+     a long footer does not
+     hide the error line.
+  2. Fix dialogs
+     Join wrapped options and
+     key hints before
+     deciding.
+  3. Rewrite both in a single
+     PR
+     Shared inputs mean one
+     change, but the diff gets
+     larger.
+  4. Investigate only
+     Check each symptom on
+     main and close what is
+     already fixed.
+  5. Type something.
+──────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 31
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+───────────────────────────────
+ ☐ Order
+
+Which one should we fix first?
+Both help the master.
+
+❯ 1. Fix the status detection
+     first (Recommended)
+     Replace the tail window
+     with the input anchor so a
+     long footer does not hide
+     the error line.
+  2. Fix dialogs
+     Join wrapped options and
+     key hints before deciding.
+  3. Rewrite both in a single
+     PR
+     Shared inputs mean one
+     change, but the diff gets
+     larger.
+  4. Investigate only
+     Check each symptom on main
+     and close what is already
+     fixed.
+  5. Type something.
+───────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 32
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+────────────────────────────────
+ ☐ Order
+
+Which one should we fix first?
+Both help the master.
+
+❯ 1. Fix the status detection
+     first (Recommended)
+     Replace the tail window
+     with the input anchor so a
+     long footer does not hide
+     the error line.
+  2. Fix dialogs
+     Join wrapped options and
+     key hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one
+     change, but the diff gets
+     larger.
+  4. Investigate only
+     Check each symptom on main
+     and close what is already
+     fixed.
+  5. Type something.
+────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel
+=== 33
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+─────────────────────────────────
+ ☐ Order
+
+Which one should we fix first?
+Both help the master.
+
+❯ 1. Fix the status detection
+     first (Recommended)
+     Replace the tail window with
+     the input anchor so a long
+     footer does not hide the
+     error line.
+  2. Fix dialogs
+     Join wrapped options and key
+     hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one
+     change, but the diff gets
+     larger.
+  4. Investigate only
+     Check each symptom on main
+     and close what is already
+     fixed.
+  5. Type something.
+─────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate
+· Esc to cancel
+=== 34
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+──────────────────────────────────
+ ☐ Order
+
+Which one should we fix first?
+Both help the master.
+
+❯ 1. Fix the status detection
+     first (Recommended)
+     Replace the tail window with
+     the input anchor so a long
+     footer does not hide the
+     error line.
+  2. Fix dialogs
+     Join wrapped options and key
+     hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one
+     change, but the diff gets
+     larger.
+  4. Investigate only
+     Check each symptom on main
+     and close what is already
+     fixed.
+  5. Type something.
+──────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate
+· Esc to cancel
+=== 35
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+───────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both
+help the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with
+     the input anchor so a long
+     footer does not hide the error
+     line.
+  2. Fix dialogs
+     Join wrapped options and key
+     hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change,
+     but the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and
+     close what is already fixed.
+  5. Type something.
+───────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel
+=== 36
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both
+help the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with
+     the input anchor so a long
+     footer does not hide the error
+     line.
+  2. Fix dialogs
+     Join wrapped options and key
+     hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change,
+     but the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and
+     close what is already fixed.
+  5. Type something.
+────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel
+=== 37
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+─────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both
+help the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the
+     input anchor so a long footer
+     does not hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key
+     hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change,
+     but the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and
+     close what is already fixed.
+  5. Type something.
+─────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel
+=== 38
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+──────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both
+help the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the
+     input anchor so a long footer
+     does not hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key
+     hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change,
+     but the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and
+     close what is already fixed.
+  5. Type something.
+──────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel
+=== 39
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+───────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both
+help the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the
+     input anchor so a long footer does
+     not hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints
+     before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but
+     the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and
+     close what is already fixed.
+  5. Type something.
+───────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc
+to cancel
+=== 40
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help
+the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the
+     input anchor so a long footer does
+     not hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints
+     before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but
+     the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and
+     close what is already fixed.
+  5. Type something.
+────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc
+to cancel
+=== 41
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+─────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help
+the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the
+     input anchor so a long footer does
+     not hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints
+     before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but
+     the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and close
+     what is already fixed.
+  5. Type something.
+─────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc
+to cancel
+=== 42
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+──────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help
+the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the
+     input anchor so a long footer does
+     not hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints
+     before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but
+     the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and close
+     what is already fixed.
+  5. Type something.
+──────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+cancel
+=== 43
+
+           Claude Code v2.1.301
+ ▐▛███▛█   Haiku 5.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+───────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help
+the master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the input
+     anchor so a long footer does not hide
+     the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints
+     before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but the
+     diff gets larger.
+  4. Investigate only
+     Check each symptom on main and close
+     what is already fixed.
+  5. Type something.
+───────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+cancel
+=== 44
+
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Haiku 5.5 · API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+────────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help the
+master.
+
+❯ 1. Fix the status detection first
+     (Recommended)
+     Replace the tail window with the input
+     anchor so a long footer does not hide
+     the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints
+     before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but the
+     diff gets larger.
+  4. Investigate only
+     Check each symptom on main and close
+     what is already fixed.
+  5. Type something.
+────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+cancel
+=== 50
+
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Haiku 5.5 · API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+──────────────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help the
+master.
+
+❯ 1. Fix the status detection first (Recommended)
+     Replace the tail window with the input anchor
+     so a long footer does not hide the error
+     line.
+  2. Fix dialogs
+     Join wrapped options and key hints before
+     deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but the diff
+     gets larger.
+  4. Investigate only
+     Check each symptom on main and close what is
+     already fixed.
+  5. Type something.
+──────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+=== 60
+
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Haiku 5.5 · API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+────────────────────────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help the master.
+
+❯ 1. Fix the status detection first (Recommended)
+     Replace the tail window with the input anchor so a long
+     footer does not hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but the diff gets
+     larger.
+  4. Investigate only
+     Check each symptom on main and close what is already
+     fixed.
+  5. Type something.
+────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+=== 80
+
+ ▐▛███▛█   Claude Code v2.1.301
+▝▜██████▀  Haiku 5.5 · API Usage Billing
+ ▝▝   ▝▝   /…/work
+
+
+❯ ASK:ascii
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Order
+
+Which one should we fix first? Both help the master.
+
+❯ 1. Fix the status detection first (Recommended)
+     Replace the tail window with the input anchor so a long footer does not
+     hide the error line.
+  2. Fix dialogs
+     Join wrapped options and key hints before deciding.
+  3. Rewrite both in a single PR
+     Shared inputs mean one change, but the diff gets larger.
+  4. Investigate only
+     Check each symptom on main and close what is already fixed.
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
