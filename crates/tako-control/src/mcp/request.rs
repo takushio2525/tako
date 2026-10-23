@@ -3,7 +3,18 @@
 use serde_json::Value;
 
 use super::tools;
+use crate::dispatch::Reason;
 use crate::protocol::{Axis, Direction, Request};
+
+/// 前段の断りの文（#2365）。表示言語に従う（日英の正本は [`Reason::text_in`]）。
+/// GUI の HTTP 経路は GUI の表示言語、stdio ブリッジは起動時に設定から決めた表示言語
+fn missing(key: &str) -> String {
+    Reason::Missing(key.to_string()).to_string()
+}
+
+fn required(key: &str) -> String {
+    Reason::Required(key.to_string()).to_string()
+}
 
 /// ツール呼び出しを操作プロトコル（[`Request`]）へ写す。エラーは引数バリデーション失敗
 pub(super) fn build_request(
@@ -34,7 +45,7 @@ pub(super) fn build_request(
         // #1961: `click` を渡すと文字の代わりに左クリック（ツールは増やさない）
         "tako_send_input" if args.get("click").is_some() => {
             if args.get("text").is_some() {
-                return Err("click と text は同時に指定しない".into());
+                return Err(Reason::NotTogether("click", "text").to_string());
             }
             let click = args
                 .get("click")
@@ -55,7 +66,7 @@ pub(super) fn build_request(
         }
         "tako_send_input" => Request::Send {
             pane: Some(required_u64(args, "pane")?),
-            text: str_arg(args, "text")?.ok_or("text を指定する")?,
+            text: str_arg(args, "text")?.ok_or_else(|| missing("text"))?,
             newline: bool_arg(args, "newline")?.unwrap_or(true),
             tmux_session: str_arg(args, "tmux_session")?,
             await_prompt: bool_arg(args, "await_prompt")?.unwrap_or(false),
@@ -83,12 +94,12 @@ pub(super) fn build_request(
         },
         "tako_tmux_kill" => Request::TmuxKill {
             socket: str_arg(args, "socket")?,
-            session: str_arg(args, "session")?.ok_or("session を指定する")?,
+            session: str_arg(args, "session")?.ok_or_else(|| missing("session"))?,
             window: u64_arg(args, "window")?.map(|n| n as u32),
         },
         "tako_tmux_resize" => Request::TmuxResize {
             socket: str_arg(args, "socket")?,
-            session: str_arg(args, "session")?.ok_or("session を指定する")?,
+            session: str_arg(args, "session")?.ok_or_else(|| missing("session"))?,
             window: u64_arg(args, "window")?.map(|n| n as u32).unwrap_or(0),
             cols: u64_arg(args, "cols")?.map(|n| n as u32),
             rows: u64_arg(args, "rows")?.map(|n| n as u32),
@@ -96,11 +107,11 @@ pub(super) fn build_request(
         },
         "tako_tmux_select_window" => Request::TmuxSelectWindow {
             pane: Some(target_pane(args, caller)?),
-            window: u64_arg(args, "window")?.ok_or("window を指定する")? as u32,
+            window: u64_arg(args, "window")?.ok_or_else(|| missing("window"))? as u32,
         },
         "tako_tmux_open" => Request::TmuxOpen {
             socket: str_arg(args, "socket")?,
-            session: str_arg(args, "session")?.ok_or("session を指定する")?,
+            session: str_arg(args, "session")?.ok_or_else(|| missing("session"))?,
             window: u64_arg(args, "window")?.map(|n| n as u32),
             pane: Some(target_pane(args, caller)?),
             direction: direction_arg(args)?,
@@ -163,7 +174,7 @@ pub(super) fn build_request(
                     None
                 },
                 tab,
-                title: str_arg(args, "title")?.ok_or("title を指定する")?,
+                title: str_arg(args, "title")?.ok_or_else(|| missing("title"))?,
                 source: str_arg(args, "source")?,
             }
         }
@@ -316,7 +327,7 @@ pub(super) fn build_request(
         }
         "tako_open_file" => Request::OpenFile {
             pane: Some(target_pane(args, caller)?),
-            path: str_arg(args, "path")?.ok_or("path を指定する")?,
+            path: str_arg(args, "path")?.ok_or_else(|| missing("path"))?,
             mode: match str_arg(args, "mode")?.as_deref() {
                 None => None,
                 Some("code") => Some(crate::protocol::PreviewModeWire::Code),
@@ -357,7 +368,7 @@ pub(super) fn build_request(
         },
         "tako_preview_follow_link" => Request::PreviewFollowLink {
             pane: Some(target_pane(args, caller)?),
-            index: u64_arg(args, "index")?.ok_or("index を指定する")? as usize,
+            index: u64_arg(args, "index")?.ok_or_else(|| missing("index"))? as usize,
         },
         "tako_preview_copy_code" => Request::PreviewCopyCode {
             pane: Some(target_pane(args, caller)?),
@@ -387,10 +398,12 @@ pub(super) fn build_request(
         // #1654: `command` を渡すと Tab / Shift+Tab / Enter と同じ編集（ツールは増やさない）。
         // #1759: `command: "type"` + `text` は文字の打鍵、`auto_close` は括弧の自動閉じの設定
         "tako_preview_edit" => match (str_arg(args, "command")?, bool_arg(args, "auto_close")?) {
-            (Some(_), Some(_)) => return Err("command と auto_close は同時に指定しない".into()),
+            (Some(_), Some(_)) => {
+                return Err(Reason::NotTogether("command", "auto_close").to_string())
+            }
             (Some(command), None) => {
                 if bool_arg(args, "enabled")?.is_some() {
-                    return Err("command と enabled は同時に指定しない".into());
+                    return Err(Reason::NotTogether("command", "enabled").to_string());
                 }
                 Request::PreviewEditCommand {
                     pane: Some(target_pane(args, caller)?),
@@ -401,7 +414,7 @@ pub(super) fn build_request(
             }
             (None, Some(enabled)) => {
                 if bool_arg(args, "enabled")?.is_some() {
-                    return Err("auto_close と enabled は同時に指定しない".into());
+                    return Err(Reason::NotTogether("auto_close", "enabled").to_string());
                 }
                 Request::PreviewAutoClose {
                     enabled: Some(enabled),
@@ -419,7 +432,7 @@ pub(super) fn build_request(
         },
         "tako_preview_apply" => Request::PreviewApply {
             pane: Some(target_pane(args, caller)?),
-            text: str_arg(args, "text")?.ok_or("text を指定する")?,
+            text: str_arg(args, "text")?.ok_or_else(|| missing("text"))?,
         },
         "tako_preview_edit_range" => Request::PreviewEditRange {
             pane: Some(target_pane(args, caller)?),
@@ -427,7 +440,7 @@ pub(super) fn build_request(
             start_col: u64_arg(args, "start_col")?.unwrap_or(0) as usize,
             end_line: required_u64(args, "end_line")? as usize,
             end_col: u64_arg(args, "end_col")?.unwrap_or(0) as usize,
-            text: str_arg(args, "text")?.ok_or("text を指定する")?,
+            text: str_arg(args, "text")?.ok_or_else(|| missing("text"))?,
             expected_version: u64_arg(args, "expected_version")?,
         },
         "tako_preview_cursor" => Request::PreviewCursor {
@@ -440,13 +453,13 @@ pub(super) fn build_request(
         },
         "tako_preview_move" => Request::PreviewMove {
             pane: Some(target_pane(args, caller)?),
-            movement: str_arg(args, "movement")?.ok_or("movement を指定する")?,
+            movement: str_arg(args, "movement")?.ok_or_else(|| missing("movement"))?,
             select: bool_arg(args, "select")?.unwrap_or(false),
             expected_version: u64_arg(args, "expected_version")?,
         },
         "tako_preview_delete" => Request::PreviewDelete {
             pane: Some(target_pane(args, caller)?),
-            motion: str_arg(args, "motion")?.ok_or("motion を指定する")?,
+            motion: str_arg(args, "motion")?.ok_or_else(|| missing("motion"))?,
             expected_version: u64_arg(args, "expected_version")?,
         },
         // #1659: ツールを増やさず action で外部変更の後の逃げ道を表す
@@ -496,8 +509,8 @@ pub(super) fn build_request(
         },
         "tako_preview_replace" => Request::PreviewReplace {
             pane: Some(target_pane(args, caller)?),
-            query: str_arg(args, "query")?.ok_or("query を指定する")?,
-            replacement: str_arg(args, "replacement")?.ok_or("replacement を指定する")?,
+            query: str_arg(args, "query")?.ok_or_else(|| missing("query"))?,
+            replacement: str_arg(args, "replacement")?.ok_or_else(|| missing("replacement"))?,
             all: bool_arg(args, "all")?,
             case_sensitive: bool_arg(args, "case_sensitive")?,
             whole_word: bool_arg(args, "whole_word")?,
@@ -513,7 +526,7 @@ pub(super) fn build_request(
             expand: str_arg(args, "expand")?,
         },
         "tako_file_op" => {
-            let op_str = str_arg(args, "op")?.ok_or("op を指定する")?;
+            let op_str = str_arg(args, "op")?.ok_or_else(|| missing("op"))?;
             let op = match op_str.as_str() {
                 "copy_absolute_path" => crate::protocol::FileOpKind::CopyAbsolutePath,
                 "copy_relative_path" => crate::protocol::FileOpKind::CopyRelativePath,
@@ -578,12 +591,12 @@ pub(super) fn build_request(
         },
         "tako_git_show" => Request::GitShow {
             pane: Some(target_pane(args, caller)?),
-            hash: str_arg(args, "hash")?.ok_or("hash を指定する")?,
+            hash: str_arg(args, "hash")?.ok_or_else(|| missing("hash"))?,
             file: str_arg(args, "file")?,
         },
         "tako_git_commit" => Request::GitCommit {
             pane: Some(target_pane(args, caller)?),
-            message: str_arg(args, "message")?.ok_or("message を指定する")?,
+            message: str_arg(args, "message")?.ok_or_else(|| missing("message"))?,
             all: bool_arg(args, "all")?.unwrap_or(false),
         },
         "tako_git_pull" => Request::GitPull {
@@ -602,18 +615,18 @@ pub(super) fn build_request(
         },
         "tako_git_checkout" => Request::GitCheckout {
             pane: Some(target_pane(args, caller)?),
-            branch: str_arg(args, "branch")?.ok_or("branch を指定する")?,
+            branch: str_arg(args, "branch")?.ok_or_else(|| missing("branch"))?,
             confirm: bool_arg(args, "confirm")?.unwrap_or(false),
         },
         "tako_git_branch_create" => Request::GitBranchCreate {
             pane: Some(target_pane(args, caller)?),
-            name: str_arg(args, "name")?.ok_or("name を指定する")?,
+            name: str_arg(args, "name")?.ok_or_else(|| missing("name"))?,
             start_point: str_arg(args, "start_point")?,
             checkout: bool_arg(args, "checkout")?,
         },
         "tako_git_merge" => Request::GitMerge {
             pane: Some(target_pane(args, caller)?),
-            branch: str_arg(args, "branch")?.ok_or("branch を指定する")?,
+            branch: str_arg(args, "branch")?.ok_or_else(|| missing("branch"))?,
             confirm: bool_arg(args, "confirm")?.unwrap_or(false),
             no_ff: bool_arg(args, "no_ff")?.unwrap_or(false),
         },
@@ -715,15 +728,15 @@ pub(super) fn build_request(
         },
         "tako_video_playback" => Request::VideoPlayback {
             pane: Some(target_pane(args, caller)?),
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            action: str_arg(args, "action")?.ok_or_else(|| missing("action"))?,
         },
         "tako_video_seek" => Request::VideoSeek {
             pane: Some(target_pane(args, caller)?),
-            seconds: f64_arg(args, "seconds")?.ok_or("seconds を指定する")?,
+            seconds: f64_arg(args, "seconds")?.ok_or_else(|| missing("seconds"))?,
         },
         "tako_video_volume" => Request::VideoVolume {
             pane: Some(target_pane(args, caller)?),
-            volume: f64_arg(args, "volume")?.ok_or("volume を指定する")?,
+            volume: f64_arg(args, "volume")?.ok_or_else(|| missing("volume"))?,
         },
         "tako_orchestrator_projects" => Request::OrchestratorProjects {
             action: str_arg(args, "action")?.unwrap_or_else(|| "list".into()),
@@ -784,7 +797,7 @@ pub(super) fn build_request(
             remote_control: bool_arg(args, "remote_control")?,
         },
         "tako_orchestrator_accounts" => Request::OrchestratorAccounts {
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            action: str_arg(args, "action")?.ok_or_else(|| missing("action"))?,
             name: str_arg(args, "name")?,
             config_dir: str_arg(args, "config_dir")?,
             inherit: bool_arg(args, "inherit")?,
@@ -821,7 +834,7 @@ pub(super) fn build_request(
             },
         },
         "tako_orchestrator_handoffs" => Request::OrchestratorHandoffFiles {
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            action: str_arg(args, "action")?.ok_or_else(|| missing("action"))?,
             project: str_arg(args, "project")?,
             profile: str_arg(args, "profile")?,
             content: str_arg(args, "content")?,
@@ -838,11 +851,11 @@ pub(super) fn build_request(
             };
             let resolved_tab = if pane.is_some() { None } else { tab };
             if resolved_pane.is_none() && resolved_tab.is_none() {
-                return Err("pane または tab を指定してください".into());
+                return Err(Reason::EitherOf("pane", "tab").to_string());
             }
             Request::OrchestratorSpawn {
-                project: str_arg(args, "project")?.ok_or("project を指定する")?,
-                prompt: str_arg(args, "prompt")?.ok_or("prompt を指定する")?,
+                project: str_arg(args, "project")?.ok_or_else(|| missing("project"))?,
+                prompt: str_arg(args, "prompt")?.ok_or_else(|| missing("prompt"))?,
                 label: str_arg(args, "label")?,
                 model: str_arg(args, "model")?,
                 effort: str_arg(args, "effort")?,
@@ -875,7 +888,7 @@ pub(super) fn build_request(
             run_id: str_arg(args, "run_id")?,
         },
         "tako_orchestrator_run_result" => Request::OrchestratorRunResult {
-            run_id: str_arg(args, "run_id")?.ok_or("run_id を指定する")?,
+            run_id: str_arg(args, "run_id")?.ok_or_else(|| missing("run_id"))?,
         },
         "tako_orchestrator_respond" => Request::OrchestratorRespond {
             pane_id: required_u64(args, "pane_id")?,
@@ -884,14 +897,14 @@ pub(super) fn build_request(
             caller_role: caller_role.map(str::to_string),
         },
         "tako_orchestrator_supervisor" => Request::OrchestratorSupervisor {
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            action: str_arg(args, "action")?.ok_or_else(|| missing("action"))?,
             mode: str_arg(args, "mode")?,
             auto_resume_dead: bool_arg(args, "auto_resume_dead")?,
             max_retries: u64_arg(args, "max_retries")?.map(|v| v as u32),
             lines: u64_arg(args, "lines")?.map(|v| v as usize),
         },
         "tako_orchestrator_ledger" => Request::OrchestratorLedger {
-            action: str_arg(args, "action")?.ok_or("action を指定する")?,
+            action: str_arg(args, "action")?.ok_or_else(|| missing("action"))?,
             id: str_arg(args, "id")?,
             outcome: str_arg(args, "outcome")?,
             rounds: u64_arg(args, "rounds")?.map(|v| v as u32),
@@ -907,7 +920,7 @@ pub(super) fn build_request(
         "tako_remote_status" => Request::RemoteStatus,
         "tako_remote_agents" => Request::RemoteAgents,
         "tako_remote_messages" => Request::RemoteMessages {
-            session_id: str_arg(args, "session_id")?.ok_or("session_id を指定する")?,
+            session_id: str_arg(args, "session_id")?.ok_or_else(|| missing("session_id"))?,
             tail: u64_arg(args, "tail")?.map(|n| n as usize),
         },
         "tako_remote_devices" => Request::RemoteDevices {
@@ -1023,12 +1036,14 @@ pub(super) fn build_request(
         },
         "tako_remote_scrollback" => Request::RemoteScrollback {
             pane_id: str_arg(args, "pane_id")?
-                .ok_or("pane_id を指定する")?
+                .ok_or_else(|| missing("pane_id"))?
                 .to_string(),
             lines: u64_arg(args, "lines")?.map(|n| n as u32),
         },
         "tako_web" => {
-            let action = str_arg(args, "action")?.ok_or("action は必須")?.to_string();
+            let action = str_arg(args, "action")?
+                .ok_or_else(|| required("action"))?
+                .to_string();
             // 分割系（open / show）だけ、基準ペイン省略時に呼び出し元を分割元とする。
             // 対象指定系で caller を埋めると「AI 自身のペイン」を対象と誤解するため埋めない
             let pane = match action.as_str() {
@@ -1280,7 +1295,7 @@ pub(super) fn build_request(
         }
         "tako_tree_folder" => Request::TreeFolder {
             action: str_arg(args, "action")?
-                .ok_or("action を指定する")?
+                .ok_or_else(|| missing("action"))?
                 .to_string(),
             path: str_arg(args, "path")?.map(|s| s.to_string()),
             tab: u64_arg(args, "tab")?,
@@ -1288,7 +1303,7 @@ pub(super) fn build_request(
             limit: u64_arg(args, "limit")?.map(|v| v as usize),
         },
         "tako_sessions" => {
-            let action = str_arg(args, "action")?.ok_or("action を指定する")?;
+            let action = str_arg(args, "action")?.ok_or_else(|| missing("action"))?;
             Request::Sessions {
                 // resume はペイン省略時に呼び出し元（master 自身の隣）へ分割する。
                 // #1958: link も id・pane 省略時は呼び出し元の会話（埋めないと dispatch が
@@ -1316,7 +1331,7 @@ pub(super) fn build_request(
         }
         "tako_logs" => Request::Logs {
             action: str_arg(args, "action")?
-                .ok_or("action を指定する")?
+                .ok_or_else(|| missing("action"))?
                 .to_string(),
             // read はペイン・セッション未指定なら呼び出し元ペインのログを引く
             pane: match (u64_arg(args, "pane")?, str_arg(args, "session_id")?) {
@@ -1331,11 +1346,15 @@ pub(super) fn build_request(
             total_max_mb: u64_arg(args, "total_max_mb")?,
         },
         "tako_open_dir" => Request::OpenDir {
-            path: str_arg(args, "path")?.ok_or("path を指定する")?.to_string(),
+            path: str_arg(args, "path")?
+                .ok_or_else(|| missing("path"))?
+                .to_string(),
             focus: bool_arg(args, "focus")?,
         },
         "tako_open_remote" => Request::OpenRemote {
-            host: str_arg(args, "host")?.ok_or("host を指定する")?.to_string(),
+            host: str_arg(args, "host")?
+                .ok_or_else(|| missing("host"))?
+                .to_string(),
             focus: bool_arg(args, "focus")?,
             remote_dir: str_arg(args, "remote_dir")?.map(|s| s.to_string()),
             // #1006: 語彙の正本は `tako_core::remote_open`（CLI / GUI と同じ表）
@@ -1357,7 +1376,7 @@ pub(super) fn build_request(
         "tako_ssh_hosts" => Request::SshHosts,
         "tako_remote_folder" => Request::RemoteFolder {
             action: str_arg(args, "action")?
-                .ok_or("action を指定する")?
+                .ok_or_else(|| missing("action"))?
                 .to_string(),
             host: str_arg(args, "host")?.map(|s| s.to_string()),
             path: str_arg(args, "path")?.map(|s| s.to_string()),
@@ -1370,7 +1389,7 @@ pub(super) fn build_request(
         },
         "tako_recent" => Request::RecentItems {
             action: str_arg(args, "action")?
-                .ok_or("action を指定する")?
+                .ok_or_else(|| missing("action"))?
                 .to_string(),
         },
         "tako_todo" => Request::UserTask {
@@ -1454,7 +1473,7 @@ pub(super) fn build_request(
             caller_role: caller_role.map(String::from),
         },
         "tako_task_gate" => {
-            let criteria_val = args.get("criteria").ok_or("criteria を指定する")?;
+            let criteria_val = args.get("criteria").ok_or_else(|| missing("criteria"))?;
             let criteria_json = serde_json::to_string(criteria_val)
                 .map_err(|e| format!("criteria の JSON 変換に失敗: {e}"))?;
             Request::TaskGate {
@@ -1484,7 +1503,7 @@ pub(super) fn build_request(
                     Some(target_pane(args, caller)?)
                 },
                 tab,
-                command: str_arg(args, "command")?.ok_or("command を指定する")?,
+                command: str_arg(args, "command")?.ok_or_else(|| missing("command"))?,
                 input_hint: str_arg(args, "input_hint")?,
                 direction: direction_arg(args)?,
                 ratio: f32_arg(args, "ratio")?,
@@ -1498,7 +1517,7 @@ pub(super) fn build_request(
         "tako_run" => {
             let tab = u64_arg(args, "tab")?;
             Request::Run {
-                path: str_arg(args, "path")?.ok_or("path を指定する")?,
+                path: str_arg(args, "path")?.ok_or_else(|| missing("path"))?,
                 pane: if tab.is_some() {
                     None
                 } else {
@@ -1515,7 +1534,7 @@ pub(super) fn build_request(
             }
         }
         "tako_run_resolve" => Request::RunResolve {
-            path: str_arg(args, "path")?.ok_or("path を指定する")?,
+            path: str_arg(args, "path")?.ok_or_else(|| missing("path"))?,
             pane: u64_arg(args, "pane")?.or(caller),
             refresh: bool_arg(args, "refresh")?.unwrap_or(false),
             // #1952: `.ino` の基板を探す語（空 = 全部）
@@ -1543,7 +1562,7 @@ pub(super) fn build_request(
             // #1734: 実行先（reuse / new）
             target: str_arg(args, "target")?,
         },
-        _ => return Err(format!("不明なツール: {name}")),
+        _ => return Err(Reason::UnknownTool(name.to_string()).to_string()),
     })
 }
 
@@ -1659,23 +1678,16 @@ pub(super) fn validate_known_params(tool_name: &str, args: &Value) -> Result<(),
     if let Some(obj) = args.as_object() {
         let unknown: Vec<&String> = obj.keys().filter(|k| !allowed.contains(*k)).collect();
         if !unknown.is_empty() {
+            let mut sorted: Vec<String> = allowed.iter().cloned().collect();
+            sorted.sort_unstable();
             return Err((
                 -32602,
-                format!(
-                    "未知のパラメータ: {}（{tool_name} が受け付けるのは {} のみ）",
-                    unknown
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if allowed.is_empty() {
-                        "引数なし".to_string()
-                    } else {
-                        let mut sorted: Vec<&str> = allowed.iter().map(String::as_str).collect();
-                        sorted.sort_unstable();
-                        sorted.join(", ")
-                    },
-                ),
+                Reason::UnknownParams {
+                    tool: tool_name.to_string(),
+                    unknown: unknown.into_iter().cloned().collect(),
+                    allowed: sorted,
+                }
+                .to_string(),
             ));
         }
     }
@@ -1683,12 +1695,12 @@ pub(super) fn validate_known_params(tool_name: &str, args: &Value) -> Result<(),
 }
 
 fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
-    u64_arg(args, key)?.ok_or_else(|| format!("{key} を指定する"))
+    u64_arg(args, key)?.ok_or_else(|| missing(key))
 }
 
 /// 必須の数値引数（#1442 の `window move` / `resize`）
 fn required_f32(args: &Value, key: &str) -> Result<f32, String> {
-    f32_arg(args, key)?.ok_or_else(|| format!("{key} を指定する"))
+    f32_arg(args, key)?.ok_or_else(|| missing(key))
 }
 
 pub(super) fn u64_arg(args: &Value, key: &str) -> Result<Option<u64>, String> {
@@ -1697,7 +1709,7 @@ pub(super) fn u64_arg(args: &Value, key: &str) -> Result<Option<u64>, String> {
         Some(v) => v
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("{key} は非負整数で指定する")),
+            .ok_or_else(|| Reason::NotNonNegInt(key.to_string()).to_string()),
     }
 }
 
@@ -1707,7 +1719,7 @@ fn i64_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
         Some(v) => v
             .as_i64()
             .map(Some)
-            .ok_or_else(|| format!("{key} は整数で指定する")),
+            .ok_or_else(|| Reason::NotInteger(key.to_string()).to_string()),
     }
 }
 
@@ -1717,7 +1729,7 @@ fn f32_arg(args: &Value, key: &str) -> Result<Option<f32>, String> {
         Some(v) => v
             .as_f64()
             .map(|f| Some(f as f32))
-            .ok_or_else(|| format!("{key} は数値で指定する")),
+            .ok_or_else(|| Reason::NotNumber(key.to_string()).to_string()),
     }
 }
 
@@ -1727,7 +1739,7 @@ fn f64_arg(args: &Value, key: &str) -> Result<Option<f64>, String> {
         Some(v) => v
             .as_f64()
             .map(Some)
-            .ok_or_else(|| format!("{key} は数値で指定する")),
+            .ok_or_else(|| Reason::NotNumber(key.to_string()).to_string()),
     }
 }
 
@@ -1737,7 +1749,7 @@ pub(super) fn str_arg(args: &Value, key: &str) -> Result<Option<String>, String>
         Some(v) => v
             .as_str()
             .map(|s| Some(s.to_string()))
-            .ok_or_else(|| format!("{key} は文字列で指定する")),
+            .ok_or_else(|| Reason::NotString(key.to_string()).to_string()),
     }
 }
 
@@ -1747,7 +1759,7 @@ pub(super) fn bool_arg(args: &Value, key: &str) -> Result<Option<bool>, String> 
         Some(v) => v
             .as_bool()
             .map(Some)
-            .ok_or_else(|| format!("{key} は真偽値で指定する")),
+            .ok_or_else(|| Reason::NotBool(key.to_string()).to_string()),
     }
 }
 
@@ -1763,10 +1775,10 @@ fn command_array_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
             .map(|v| {
                 v.as_str()
                     .map(|s| s.to_string())
-                    .ok_or_else(|| format!("{key} の要素は文字列で指定する"))
+                    .ok_or_else(|| Reason::ElementNotString(key.to_string()).to_string())
             })
             .collect(),
-        Some(_) => Err(format!("{key} は文字列の配列で指定する")),
+        Some(_) => Err(Reason::NotStringArray(key.to_string()).to_string()),
     }
 }
 
@@ -1787,9 +1799,7 @@ fn direction_arg(args: &Value) -> Result<Option<Direction>, String> {
         Some("down") => Ok(Some(Direction::Down)),
         Some("left") => Ok(Some(Direction::Left)),
         Some("up") => Ok(Some(Direction::Up)),
-        Some(other) => Err(format!(
-            "direction が不正: {other}（right / down / left / up のいずれか）"
-        )),
+        Some(other) => Err(Reason::InvalidDirection(other.to_string()).to_string()),
     }
 }
 
@@ -1806,11 +1816,15 @@ fn env_map_arg(
             .map(|(k, v)| match v {
                 Value::String(s) => Ok((k.clone(), Some(s.clone()))),
                 Value::Null => Ok((k.clone(), None)),
-                _ => Err(format!("{key} の値は文字列か null で指定する（{k}）")),
+                _ => Err(Reason::EnvValueNotString {
+                    key: key.to_string(),
+                    name: k.clone(),
+                }
+                .to_string()),
             })
             .collect::<Result<_, _>>()
             .map(Some),
-        Some(_) => Err(format!("{key} は object（名前 → 値）で指定する")),
+        Some(_) => Err(Reason::NotObject(key.to_string()).to_string()),
     }
 }
 
@@ -1822,10 +1836,10 @@ fn str_vec_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
             .map(|v| {
                 v.as_str()
                     .map(String::from)
-                    .ok_or_else(|| format!("{key} は文字列の配列で指定する"))
+                    .ok_or_else(|| Reason::NotStringArray(key.to_string()).to_string())
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        Some(_) => Err(format!("{key} は文字列の配列で指定する")),
+        Some(_) => Err(Reason::NotStringArray(key.to_string()).to_string()),
     }
 }

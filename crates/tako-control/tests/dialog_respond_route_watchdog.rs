@@ -76,10 +76,17 @@ fn respondの入口はin_processを先に見る() {
         .next()
         .expect("split は必ず 1 つ以上返す")
         .to_string();
+    // 断りの文は #2365 で `Reason::BackendSessionNotFound`（日英）へ移った。旧の綴りも見る
     assert!(
-        !outside_ab.contains("バックエンドセッションが見つからない"),
+        !outside_ab.contains("バックエンドセッションが見つからない")
+            && !outside_ab.contains("Reason::BackendSessionNotFound"),
         "respond がバックエンドセッション名を必須にしている（#1200。\
          tako-app が保持しているペインには器が無くても応答できる）"
+    );
+    // 番犬自身の検査: A/B の入口の中には今もその断りがある（綴りが変わって空振りしていない）
+    assert!(
+        fn_body(&src, "dispatch_orchestrator_respond").contains("Reason::BackendSessionNotFound("),
+        "A/B の入口の断りの綴りが変わった。この番犬の照合も直すこと"
     );
 }
 

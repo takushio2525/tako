@@ -17,15 +17,28 @@
 #      lastwindow 最後のウィンドウを閉じる（WorkspaceError::LastWindow）
 #      notarget   対象ペインの未指定（CLI は `--pane` も TAKO_PANE_ID も無い・MCP は `pane` も
 #                 呼び出し元も無い。どちらも dispatch へ送らずに手元で断る）
+#   #2365 で次も足した（dispatch と前段が自分で組む理由の文・orchestrator layout の値の断り）:
+#      nowindow   見つからないウィンドウ（dispatch の find_window）
+#      notpreview プレビューではないペインへのプレビュー操作（Reason::NotPreviewPane）
+#      nodir      存在しないフォルダをツリーへ足す（Reason::DirNotFound）
+#      noscroll   CLI の scroll に --to も --delta も無い（CLI の前段 = Reason::ScrollTarget）
+#      noquery    CLI の search に検索語が無い（CLI の前段 = Reason::SearchQuery）
+#      policy     GUI を経由しない直呼びの layout の不明なポリシー（tako_core::LayoutParamError）
+#      noproject  GUI を経由しない直呼びの projects remove の見つからないキー（Reason::ProjectNotFound）
+#      unknownparam / badtype / unknowntool / together   MCP の前段（未知のパラメータ・型・
+#                 不明なツール・同時に指定できない 2 つ）
+#      badtype-caller  MCP の前段の型の断りを、呼び出し元ペインが決まっているブリッジで引き出す
+#                 （#2358 のブリッジは呼び出し元が決まると表示言語を設定から決めなかった）
 #   ① 英語表示: どの出力にも日本語（かな・漢字）が混ざらない
 #   ② 日本語表示: 日本語の前置きで返る（修正前とのバイト一致は TAKO_1762_KEEP の出力を突き合わせる）
-#   ③ GUI を経由しない CLI の直呼び（`tako orchestrator layout`）も、前置きは settings.json の表示言語
-#      （この理由の文は日本語だけなので、英語表示では前置きだけを見る）
+#   ③ GUI を経由しない CLI の直呼び（`tako orchestrator layout` / `projects remove`）も、前置きと
+#      理由の文（#2365）が settings.json の表示言語
 #   ④ 表示言語の設定が無い（system）ときは既存の解決（TAKO_LANG → ロケール → OS）に従う
 #      （ここでは TAKO_LANG=en で英語へ解決させ、① と同じく日本語が混ざらないことを見る）
 #
 # A/B: 修正前のバイナリを `TAKO_BIN=… APP_BIN=… bash scripts/test-dispatch-error-lang-1762.sh` で渡すと
-# ① と ③ の英語が NG になる（#1762 の症状。#2358 より前なら #2358 の 5 種も NG）。`TAKO_1762_KEEP=<dir>` を渡すと全出力を
+# ① と ③ の英語が NG になる（#1762 の症状。#2358 より前なら #2358 の 5 種も、#2365 より前なら #2365 の
+# ケースも NG）。`TAKO_1762_KEEP=<dir>` を渡すと全出力を
 # `<dir>/<言語>/<名前>.(cli|mcp|rc)` へ残す（修正前後のバイト一致の突き合わせ用）。
 #
 # **本番の tako / 設定には一切触らない**（data / HOME は mktemp 配下、tmux は専用ソケット、
@@ -108,7 +121,8 @@ JSONL
     echo "is_error=__NO_DISCOVERY__"
     return
   fi
-  env TAKO_SOCKET="$sock" TAKO_TOKEN="$token" \
+  # MCP_CALLER を渡すと呼び出し元ペイン（TAKO_PANE_ID）が決まったブリッジになる（#2365）
+  env TAKO_SOCKET="$sock" TAKO_TOKEN="$token" ${MCP_CALLER:+TAKO_PANE_ID="$MCP_CALLER"} \
     "$TAKO_BIN" mcp serve < "$TMP/mcp-in.jsonl" > "$TMP/mcp-out.jsonl" 2> "$TMP/mcp-err.log"
   python3 - "$TMP/mcp-out.jsonl" "$out" <<'PY'
 import json, sys
@@ -219,6 +233,29 @@ if new:
   fi
   # ③ GUI を経由しない直呼び（config.yaml だけの操作）
   cli_case local orchestrator layout --master-ratio 7
+  # #2365: dispatch と前段が自分で組む理由の文（どれも断られて何も変わらない）。
+  # 出力にランダムな一時パスを入れない（修正前後のバイト一致を比べるため固定のパスを使う）
+  cli_case nowindow window close 999999
+  cli_case notpreview preview-outline --pane "${first:-0}"
+  cli_case nodir tree add /nonexistent-tako-2365
+  cli_case noscroll scroll --pane "${first:-0}"
+  cli_case noquery search
+  cli_case policy orchestrator layout --policy golden
+  cli_case noproject orchestrator projects remove --key nope-2365
+  mcp="$(mcp_call tako_window '{"action":"close","window":999999}' "$DIR/nowindow.mcp")"
+  echo "$mcp" > "$DIR/nowindow.mcperr"
+  mcp="$(mcp_call tako_preview_outline "{\"pane\":${first:-0}}" "$DIR/notpreview.mcp")"
+  echo "$mcp" > "$DIR/notpreview.mcperr"
+  mcp="$(mcp_call tako_scroll_pane "{\"pane\":${first:-0},\"to\":0,\"bogus\":1}" "$DIR/unknownparam.mcp")"
+  echo "$mcp" > "$DIR/unknownparam.mcperr"
+  mcp="$(mcp_call tako_scroll_pane '{"pane":"x","to":0}' "$DIR/badtype.mcp")"
+  echo "$mcp" > "$DIR/badtype.mcperr"
+  mcp="$(mcp_call tako_nope_2365 '{}' "$DIR/unknowntool.mcp")"
+  echo "$mcp" > "$DIR/unknowntool.mcperr"
+  mcp="$(mcp_call tako_send_input "{\"pane\":${first:-0},\"click\":{\"row\":0,\"col\":0},\"text\":\"x\"}" "$DIR/together.mcp")"
+  echo "$mcp" > "$DIR/together.mcperr"
+  mcp="$(MCP_CALLER="${first:-0}" mcp_call tako_scroll_pane '{"pane":"x","to":0}' "$DIR/badtype-caller.mcp")"
+  echo "$mcp" > "$DIR/badtype-caller.mcperr"
 
   mcp="$(mcp_call tako_theme '{"action":"set-color","key":"accent","value":"#zz"}' "$DIR/invalid.mcp")"
   echo "$mcp" > "$DIR/invalid.mcperr"
@@ -249,7 +286,11 @@ judge() {
     "$DIR"/local.cli "$DIR"/invalid.mcp "$DIR"/pane.mcp "$DIR"/tab.mcp "$DIR"/nosession.mcp \
     "$DIR"/noresize.cli "$DIR"/lasttab.cli "$DIR"/ontoself.cli "$DIR"/lastwindow.cli \
     "$DIR"/notarget.cli "$DIR"/noresize.mcp "$DIR"/lasttab.mcp "$DIR"/ontoself.mcp \
-    "$DIR"/lastwindow.mcp "$DIR"/notarget.mcp; do
+    "$DIR"/lastwindow.mcp "$DIR"/notarget.mcp \
+    "$DIR"/nowindow.cli "$DIR"/notpreview.cli "$DIR"/nodir.cli "$DIR"/noscroll.cli \
+    "$DIR"/noquery.cli "$DIR"/policy.cli "$DIR"/noproject.cli "$DIR"/nowindow.mcp \
+    "$DIR"/notpreview.mcp "$DIR"/unknownparam.mcp "$DIR"/badtype.mcp "$DIR"/unknowntool.mcp \
+    "$DIR"/together.mcp "$DIR"/badtype-caller.mcp; do
     name="$(basename "$f")"
     [ -f "$f" ] || { fail "$label $name が無い"; continue; }
     echo "      $label $name: $(head -c 240 "$f" | tr '\n' ' ')"
@@ -262,13 +303,8 @@ judge() {
       *) fail "$label $name が断りで返っていない（${kind}）"; continue ;;
     esac
     if [ "$expect" = en ]; then
-      if [ "$name" = local.cli ]; then
-        # 直呼びの理由の文は日本語だけのもの（#1762 の外）。見るのは前置きだけ
-        case "$(cat "$f")" in
-          "error: invalid parameter: "*) pass "$label $name の前置きは英語" ;;
-          *) fail "$label $name の前置きが英語でない" ;;
-        esac
-      elif ch="$(has_japanese "$f")"; then
+      # #2365 から直呼びの layout の理由の文も表示言語に従うので、どの出力も丸ごと見る
+      if ch="$(has_japanese "$f")"; then
         fail "$label $name に日本語が混ざる（${ch}）"
       else
         pass "$label $name に日本語が混ざらない"
@@ -277,7 +313,9 @@ judge() {
       case "$(cat "$f")" in
         *"無効なパラメータ: "* | *"が見つからない"* | *"ターミナルセッションがない"* \
           | *"リサイズできる分割がない"* | *"は閉じられない"* | *"自分自身の隣へは移動できない"* \
-          | *"対象ペインを特定できない"*)
+          | *"対象ペインを特定できない"* | *"プレビューペインではない"* | *"ディレクトリが存在しない"* \
+          | *"を指定する"* | *"未知のパラメータ"* | *"で指定する"* | *"不明なツール"* \
+          | *"同時に指定しない"*)
           pass "$label $name は日本語の前置き" ;;
         *) fail "$label $name に日本語の前置きが無い" ;;
       esac

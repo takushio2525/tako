@@ -632,8 +632,14 @@ mod tests {
                 continue;
             }
             let result = build_request(name, &json!({}), Some(1), None);
+            // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+            let unknown = |message: &String| {
+                [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                    .into_iter()
+                    .any(|lang| *message == Reason::UnknownTool(name.into()).text_in(lang))
+            };
             assert!(
-                !matches!(&result, Err(message) if message == &format!("不明なツール: {name}")),
+                !matches!(&result, Err(message) if unknown(message)),
                 "{name} はカタログにあるが Request 変換が無い"
             );
         }
@@ -2563,12 +2569,13 @@ mod tests {
         );
         assert!(requests.is_empty());
         let error = &response.unwrap()["error"];
+        // 断りの文は表示言語に従う（#2365）
+        let message = error["message"].as_str().unwrap();
         assert!(
-            error["message"]
-                .as_str()
-                .unwrap()
-                .contains("pane または tab"),
-            "pane も tab も無い場合はエラー"
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| message == Reason::EitherOf("pane", "tab").text_in(lang)),
+            "pane も tab も無い場合はエラー: {message}"
         );
     }
 

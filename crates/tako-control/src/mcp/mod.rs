@@ -30,6 +30,7 @@ pub use request::{set_params_table_source, ParamsTable};
 
 use serde_json::{json, Value};
 
+use crate::dispatch::Reason;
 use crate::orchestrator::wait;
 use crate::protocol::Request;
 use request::{bool_arg, build_request, str_arg, u64_arg, validate_known_params};
@@ -162,7 +163,7 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
     let name = params
         .get("name")
         .and_then(Value::as_str)
-        .ok_or((-32602, "ツール名（name）が無い".to_string()))?;
+        .ok_or_else(|| (-32602, Reason::NoToolName.to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     // 未知パラメータの検出（#227: タイポが黙って無視される事故を防ぐ）
@@ -174,7 +175,7 @@ fn call_tool(params: &Value, session: &mut McpSession) -> Result<Value, (i64, St
         let task_id = args
             .get("task_id")
             .and_then(Value::as_str)
-            .ok_or((-32602, "task_id を指定する".to_string()))?;
+            .ok_or_else(|| (-32602, Reason::Missing("task_id".into()).to_string()))?;
         let sync = args
             .get("sync_checkpoint")
             .and_then(Value::as_bool)
@@ -279,10 +280,10 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
     // --- パラメータ解析 ---
     let project = str_arg(args, "project")
         .map_err(map_err)?
-        .ok_or((-32602, "project を指定する".to_string()))?;
+        .ok_or_else(|| (-32602, Reason::Missing("project".into()).to_string()))?;
     let prompt = str_arg(args, "prompt")
         .map_err(map_err)?
-        .ok_or((-32602, "prompt を指定する".to_string()))?;
+        .ok_or_else(|| (-32602, Reason::Missing("prompt".into()).to_string()))?;
     let label = str_arg(args, "label").map_err(map_err)?;
     let pane_raw = u64_arg(args, "pane").map_err(map_err)?;
     let tab = u64_arg(args, "tab").map_err(map_err)?;
@@ -295,7 +296,7 @@ fn orchestrator_run(args: &Value, session: &mut McpSession) -> Result<Value, (i6
     };
     let tab = if pane_raw.is_some() { None } else { tab };
     if pane.is_none() && tab.is_none() {
-        return Err((-32602, "pane または tab を指定してください".into()));
+        return Err((-32602, Reason::EitherOf("pane", "tab").to_string()));
     }
     let timeout_secs = u64_arg(args, "timeout_seconds")
         .map_err(map_err)?

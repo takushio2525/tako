@@ -242,12 +242,11 @@ fn serve_until_end(catalog: Catalog) -> Result<(), Stop> {
         }
         CallerPanePlan::Unresolved => None,
     };
-    if caller.is_none() {
-        // ペイン未指定の断り（`pane` も呼び出し元も無い）はこのプロセスが組むので、その文の
-        // 表示言語を設定から決める（#2358）。呼び出し元が決まっていればこの断りは起きないので
-        // 設定を読まない（常駐の軽さ = #2021 を崩さない）
-        tako_core::i18n::set_lang(tako_control::settings::peek_lang_setting().resolve());
-    }
+    // 前段の断り（ペイン未指定 = #2358・引数の型や不足・未知のパラメータ = #2365）は
+    // このプロセスが組むので、その文の表示言語を設定から決める。#2358 は呼び出し元が
+    // 決まっていれば読まなかったが、#2365 で引数の断りも日英になり、呼び出し元の有無に
+    // 依らず起きるようになった。読むのは起動時の 1 回だけ（settings.json の言語の欄）
+    tako_core::i18n::set_lang(tako_control::settings::peek_lang_setting().resolve());
     let caller_role = std::env::var("TAKO_ORCHESTRATOR_ROLE").ok();
     if catalog == Catalog::Helper {
         // 未知パラメータの検出（#227）の表も常駐プロセスで組まない

@@ -403,7 +403,7 @@ check_eq "移せたものは移す（1 件）・断ったものは failed（1 �
 [ -f "$E/locked/l.txt" ] && [ -f "$E/dst/a.txt" ] && pass "断ったものは元の場所・移せたものは移動先" || fail "権限エラーの後の状態が想定と違う"
 chmod 755 "$E/locked"
 OUT="$("$TAKO_BIN" file clipboard copy "$E/src/nope" "$E/dst" 2>&1)"
-case "$OUT" in *パスが存在しない*) pass "無いパスが混ざったまとめたコピーは置かない" ;; *) fail "無いパス: $OUT" ;; esac
+case "$OUT" in *パスが存在しない* | *"path does not exist"*) pass "無いパスが混ざったまとめたコピーは置かない" ;; *) fail "無いパス: $OUT" ;; esac
 OUT="$(mcp_call "{\"op\":\"trash\",\"paths\":[]}")"
 case "$OUT" in *"1 つ以上"*) pass "MCP: 空の paths は断る（0 件）" ;; *) fail "空の paths: $OUT" ;; esac
 OUT="$(mcp_call "{\"op\":\"copy_cancel\",\"name\":\"abc\"}")"

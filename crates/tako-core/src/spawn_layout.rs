@@ -20,13 +20,11 @@ pub enum SpawnLayoutPolicy {
 }
 
 impl SpawnLayoutPolicy {
-    pub fn parse(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, LayoutParamError> {
         match s {
             "master-reserved" => Ok(Self::MasterReserved),
             "legacy" => Ok(Self::Legacy),
-            other => Err(format!(
-                "不明なレイアウトポリシー: {other}（master-reserved / legacy）"
-            )),
+            other => Err(LayoutParamError::UnknownPolicy(other.to_string())),
         }
     }
 
@@ -49,11 +47,11 @@ pub enum WorkerLayoutAlgorithm {
 }
 
 impl WorkerLayoutAlgorithm {
-    pub fn parse(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, LayoutParamError> {
         match s {
             "grid" => Ok(Self::Grid),
             "spiral" => Ok(Self::Spiral),
-            other => Err(format!("不明な配置アルゴリズム: {other}（grid / spiral）")),
+            other => Err(LayoutParamError::UnknownAlgorithm(other.to_string())),
         }
     }
 
@@ -61,6 +59,74 @@ impl WorkerLayoutAlgorithm {
         match self {
             Self::Grid => "grid",
             Self::Spiral => "spiral",
+        }
+    }
+}
+
+/// worker spawn のレイアウト設定（`tako orchestrator layout` / MCP `tako_orchestrator_layout`）の
+/// 値の断り。表示（`Display`）は表示言語に従う（#2365。日英の正本は [`Self::text_in`]）。
+/// dispatch はこの表示を「無効なパラメータ: 」の後ろへそのまま載せる
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayoutParamError {
+    /// `policy` が master-reserved / legacy のどちらでもない
+    UnknownPolicy(String),
+    /// `algorithm` が grid / spiral のどちらでもない
+    UnknownAlgorithm(String),
+    /// `master_ratio` が 0.1〜0.9 の外（非有限値を含む）
+    MasterRatio(f32),
+    /// `min_worker_cols` が 0 でも [`MIN_WORKER_COLS_FLOOR`]〜[`MIN_WORKER_COLS_MAX`] でもない
+    MinWorkerCols(u16),
+    /// `min_worker_font_scale` が [`WORKER_FONT_SCALE_MIN`]〜[`WORKER_FONT_SCALE_MAX`] の外
+    MinWorkerFontScale(f32),
+}
+
+impl std::fmt::Display for LayoutParamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for LayoutParamError {}
+
+impl LayoutParamError {
+    /// 表示言語を明示しての文言（#2365。`PaneTreeError::text_in` = #2358 と同じ形）。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::UnknownPolicy(other), Ja) => {
+                format!("不明なレイアウトポリシー: {other}（master-reserved / legacy）")
+            }
+            (Self::UnknownPolicy(other), En) => {
+                format!("unknown layout policy: {other} (master-reserved / legacy)")
+            }
+            (Self::UnknownAlgorithm(other), Ja) => {
+                format!("不明な配置アルゴリズム: {other}（grid / spiral）")
+            }
+            (Self::UnknownAlgorithm(other), En) => {
+                format!("unknown placement algorithm: {other} (grid / spiral)")
+            }
+            (Self::MasterRatio(r), Ja) => {
+                format!("master_ratio は 0.1〜0.9 で指定してください（指定値: {r}）")
+            }
+            (Self::MasterRatio(r), En) => {
+                format!("master_ratio must be between 0.1 and 0.9 (given: {r})")
+            }
+            (Self::MinWorkerCols(c), Ja) => format!(
+                "min_worker_cols は 0（保証しない）か {MIN_WORKER_COLS_FLOOR}〜{MIN_WORKER_COLS_MAX} で指定してください（指定値: {c}）"
+            ),
+            (Self::MinWorkerCols(c), En) => format!(
+                "min_worker_cols must be 0 (no guarantee) or between {MIN_WORKER_COLS_FLOOR} and {MIN_WORKER_COLS_MAX} (given: {c})"
+            ),
+            (Self::MinWorkerFontScale(s), Ja) => format!(
+                "min_worker_font_scale は {WORKER_FONT_SCALE_MIN}〜{WORKER_FONT_SCALE_MAX} で指定してください（指定値: {s}）"
+            ),
+            (Self::MinWorkerFontScale(s), En) => format!(
+                "min_worker_font_scale must be between {WORKER_FONT_SCALE_MIN} and {WORKER_FONT_SCALE_MAX} (given: {s})"
+            ),
         }
     }
 }

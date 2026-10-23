@@ -4719,6 +4719,7 @@ fn cli_main() -> ExitCode {
         }) => {
             // config.yaml のみの操作のため IPC 不要。dispatch と同一関数を共用する
             // （MCP `tako_orchestrator_layout` と 1:1。二重実装を作らない）
+            init_local_lang();
             tako_control::dispatch_orchestrator_layout(
                 policy.as_deref(),
                 master_ratio,
@@ -4733,6 +4734,7 @@ fn cli_main() -> ExitCode {
         Command::Orchestrator(OrchestratorCommand::Accounts(ref sub)) => {
             // accounts.yaml のみの操作のため IPC 不要。dispatch と同一関数を共用する
             // （MCP `tako_orchestrator_accounts` と 1:1。二重実装を作らない。#548）
+            init_local_lang();
             let (action, name, config_dir, inherit, description, default_model, default_effort) =
                 match sub {
                     AccountsCommand::List => ("list", None, None, None, None, None, None),
@@ -5142,7 +5144,9 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             // 切り出し安全: 直前の starts_with('-') で先頭 1 バイトは ASCII の `-`
             let name = &s[1..];
             if name.is_empty() {
-                return Err("プロファイル名が空です（例: tako master -2）".into());
+                return Err(front_err(tako_control::Reason::EmptyProfileName(
+                    "tako master -2",
+                )));
             }
             (name, Some(name))
         }
@@ -5370,7 +5374,9 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             // 切り出し安全: 直前の starts_with('-') で先頭 1 バイトは ASCII の `-`
             let name = &s[1..];
             if name.is_empty() {
-                return Err("プロファイル名が空です（例: tako solo -fast）".into());
+                return Err(front_err(tako_control::Reason::EmptyProfileName(
+                    "tako solo -fast",
+                )));
             }
             (name, Some(name))
         }
@@ -5748,7 +5754,7 @@ fn orchestrator_run(
     };
     let tab_resolved = if pane.is_some() { None } else { tab };
     if pane_resolved.is_none() && tab_resolved.is_none() {
-        return Err("--pane または --tab を指定してください".into());
+        return Err(front_err(tako_control::Reason::EitherOf("--pane", "--tab")));
     }
     let opts = wait::RunOptions {
         project: project.to_string(),
@@ -5779,6 +5785,7 @@ fn orchestrator_run(
 
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
 fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
+    init_local_lang();
     match sub {
         // list も読み取りだが MCP と同じ 1 本を通す。#1544 まで CLI 側だけ
         // 設定ファイルの直読みが残っていた。出力は一致していたが、**同じ関数に
@@ -5976,6 +5983,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
             remote_control: *remote_control,
         },
     };
+    init_local_lang();
     let result = dispatch_orchestrator_profiles(params).map_err(local_dispatch_err)?;
     if let Some(warnings) = result["warnings"].as_array() {
         for w in warnings {
@@ -6499,7 +6507,9 @@ fn mod_install_local(args: &ModArgs) -> Result<(), String> {
     // 位置引数は #1960 で `rest`（band の on / off・ui の操作）、ui の button add は
     // --label / --hotkey / --id になった。install / uninstall はどれも取らない
     if !args.rest.is_empty() || args.label.is_some() || args.hotkey.is_some() || args.id.is_some() {
-        return Err(format!("{action} は on / off や ui の引数を取らない"));
+        return Err(front_err(tako_control::Reason::ModTakesNoArgs(
+            action.to_string(),
+        )));
     }
     let ctx = tako_control::claude_mod_install::Context::from_env(
         tako_control::stale_binary::bounded_claude_version(),
@@ -9569,7 +9579,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 _ => None,
             };
             if direction.is_none() && args.pane.is_none() {
-                return Err("フォーカス先のペイン ID か方向（--left 等）を指定する".into());
+                return Err(front_err(tako_control::Reason::FocusTarget));
             }
             Request::Focus {
                 pane: args.pane,
@@ -9584,7 +9594,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         },
         Command::Scroll(args) => {
             if args.to.is_none() && args.delta.is_none() {
-                return Err("--to（絶対位置。0 = 最下部）か --delta（相対行数）を指定する".into());
+                return Err(front_err(tako_control::Reason::ScrollTarget));
             }
             Request::Scroll {
                 pane: target_pane(args.pane)?,
@@ -9740,10 +9750,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 );
             }
             if args.value.is_some() != (action == Some("rule")) {
-                return Err("規則の切替は `tako paste-guard rule <規則名> on|off`".into());
+                return Err(front_err(tako_control::Reason::PasteGuardRuleUsage));
             }
             if args.pane.is_some() && action != Some("check") {
-                return Err("--pane は `tako paste-guard check` だけ".into());
+                return Err(front_err(tako_control::Reason::PasteGuardPaneOnlyCheck));
             }
             let rules = match (action, args.text.as_deref(), args.value.as_deref()) {
                 (Some("rule"), Some(name), Some(on)) => Some(std::collections::BTreeMap::from([(
@@ -9751,7 +9761,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     on == "on",
                 )])),
                 (Some("rule"), ..) => {
-                    return Err("規則の切替は `tako paste-guard rule <規則名> on|off`".into());
+                    return Err(front_err(tako_control::Reason::PasteGuardRuleUsage));
                 }
                 _ => None,
             };
@@ -9809,7 +9819,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Search(args) => {
             let action = args.action();
             if action == "search" && args.query.is_none() {
-                return Err("検索語を指定する（tako search <検索語>）".into());
+                return Err(front_err(tako_control::Reason::SearchQuery));
             }
             Request::WorkspaceSearch {
                 action: action.into(),
@@ -10151,10 +10161,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }) => {
             // 方向フラグは --target 指定時のみ有効（黙って無視せず明示エラーにする）
             if (*right || *down || *up || *left) && target.is_none() {
-                return Err("--right/--down/--up/--left は --target と併用する".into());
+                return Err(front_err(tako_control::Reason::DirectionNeedsTarget));
             }
             if !new && tab.is_none() && target.is_none() {
-                return Err("tab か --target か --new のいずれかを指定する".into());
+                return Err(front_err(tako_control::Reason::MoveDestination));
             }
             Request::MovePane {
                 pane: target_pane(*pane)?,
@@ -10881,7 +10891,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             };
             let tab_resolved = if pane.is_some() { None } else { *tab };
             if pane_resolved.is_none() && tab_resolved.is_none() {
-                return Err("--pane または --tab を指定してください".into());
+                return Err(front_err(tako_control::Reason::EitherOf("--pane", "--tab")));
             }
             Request::OrchestratorSpawn {
                 project: project.clone(),
@@ -11788,7 +11798,9 @@ fn run_config_env(
     }
     for k in unset {
         if map.contains_key(k) {
-            return Err(format!("{k} を --env と --unset-env の両方に渡している"));
+            return Err(front_err(tako_control::Reason::EnvAndUnsetEnv(
+                k.to_string(),
+            )));
         }
         map.insert(k.clone(), None);
     }
@@ -12080,7 +12092,7 @@ fn build_criteria_json(
     customs: &[String],
 ) -> Result<String, String> {
     if commands.is_empty() && pr_merged.is_empty() && customs.is_empty() {
-        return Err("少なくとも 1 つの述語を指定する（--command / --pr-merged / --custom）".into());
+        return Err(front_err(tako_control::Reason::GatePredicate));
     }
     let mut criteria = Vec::new();
     for (i, cmd) in commands.iter().enumerate() {
@@ -12110,7 +12122,9 @@ fn parse_direction(s: &str) -> Result<Direction, String> {
         "down" | "d" => Ok(Direction::Down),
         "left" | "l" => Ok(Direction::Left),
         "up" | "u" => Ok(Direction::Up),
-        _ => Err(format!("不正な方向: {s}（right / down / left / up）")),
+        _ => Err(front_err(tako_control::Reason::CliInvalidDirection(
+            s.to_string(),
+        ))),
     }
 }
 
@@ -12246,6 +12260,20 @@ fn pretty_json(v: &Value) -> String {
 /// 理由の文は作られた時点のまま）
 fn local_dispatch_err(e: tako_control::DispatchError) -> String {
     e.text_in(tako_control::settings::peek_lang_setting().resolve())
+}
+
+/// GUI を経由せず手元で dispatch を直呼びする枝の、理由の文の表示言語を決める（#2365）。
+///
+/// dispatch は理由の文（`tako_control::Reason` / `tako_core::LayoutParamError`）を
+/// 組んだ時点の表示言語で文字列にする。前置き（[`local_dispatch_err`]）と同じ解決で
+/// **呼ぶ前に**決めておかないと、日本語表示の人へ理由の文だけ英語（静的既定）で出る
+fn init_local_lang() {
+    tako_core::i18n::set_lang(tako_control::settings::peek_lang_setting().resolve());
+}
+
+/// dispatch へ送る前に CLI が手元で断る文（#2365）。表示言語は [`local_dispatch_err`] と同じ解決
+fn front_err(reason: tako_control::Reason) -> String {
+    reason.text_in(tako_control::settings::peek_lang_setting().resolve())
 }
 
 /// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）

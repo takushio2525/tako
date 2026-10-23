@@ -124,8 +124,20 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   TAKO_PANE_ID も無い・MCP の `pane` も呼び出し元も無い）にも広げた（#2358）。前者は各型の
   `text_in`、後者は口ごとに文が違うので `tako_control::NoTargetPaneAt::{Cli, Mcp}::text_in` が
   日英の対の 1 か所。CLI は手元で `peek_lang_setting().resolve()` を引き、MCP は
-  `i18n::lang()`（stdio ブリッジは呼び出し元ペインが決まらないときだけ設定から表示言語を決める =
-  #2021 の軽さを崩さない）。番犬は同じ `issue1762_dispatch_error_lang.rs`
+  `i18n::lang()`。番犬は同じ `issue1762_dispatch_error_lang.rs`
+- さらに **dispatch と前段（CLI / MCP の引数の組み立て）が自分で組む理由の文**と
+  **`orchestrator layout` の値の断り**にも広げた（#2365。利用者が目にする頻度の高いものから。
+  残りは #2365 の続き）。日英の対は `tako_control::Reason::text_in`（引数の不足・型・未知の
+  パラメータ・不明なツール・「見つからない」系・プレビューペインの種別・パスの存在・git・CLI の
+  前段）と `tako_core::LayoutParamError::text_in` の 1 か所ずつ。dispatch は
+  `Reason::X.invalid()` / `.operation()` で `InvalidParams` / `Operation` に載せる。理由の文は
+  **組んだ時点の表示言語**で文字列になるので、GUI を経由せず dispatch を直呼びする CLI の枝は
+  呼ぶ前に `init_local_lang()`（tako-cli）で表示言語を決め、CLI の前段の断りは `front_err`
+  （同じ解決）で文字列にする。MCP の stdio ブリッジは前段の断りを自分で組むので、呼び出し元
+  ペインの有無に依らず起動時に設定から表示言語を決める（#2358 は呼び出し元が無いときだけだった）。
+  「見つからない」系は英語にも ` not found` を含め（`says_not_found` の当たり方を日英でそろえる）、
+  ダイアログ不在の読み（リモートの承認応答の 409）は `Reason::says_no_choice_dialog` を通す。
+  番犬は同じ `issue1762_dispatch_error_lang.rs`（落ちたら日英の対を書いた行を `file:line` で名指す）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
