@@ -30,14 +30,19 @@ pub(super) async fn palette_alias_visual(
             Lang::Ja => "ja",
             Lang::En => "en",
         };
-        let old = crate::ui_text::palette::cmd_aliases("toggle-theme")
-            .first()
-            .copied()
-            .unwrap_or_default();
+        // 人が打つ語なので別名の表からは引かない（別名を外したら ② で落ちるように）。
+        // #1830 より前のラベルそのまま
+        let old = match lang {
+            Lang::Ja => "テーマをライト/ダーク切替",
+            Lang::En => "Toggle light/dark theme",
+        };
         let label = crate::ui_text::palette::cmd_label("toggle-theme");
         check(
-            !old.is_empty() && old != label,
-            &format!("visual-test {SECTION}（{tag}）: テーマの旧表記が無い（別名 {old:?}）"),
+            !label.to_lowercase().contains(&old.to_lowercase()),
+            &format!(
+                "visual-test {SECTION}（{tag}）: 旧表記 {old:?} がいまのラベル {label:?} で引けてしまう\
+                 （別名の検査にならない）"
+            ),
         );
 
         // ① 開いて旧表記を入れる
