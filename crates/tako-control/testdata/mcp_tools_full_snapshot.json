@@ -832,7 +832,7 @@
     "name": "tako_auto_rename"
   },
   {
-    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答、view=diagnostics は言語サーバの診断（エラー・警告）の一覧、view=references は参照・呼び出し階層・型階層の結果（一覧 / ツリー）、view=search はワークスペース横断検索の検索欄と結果の一覧。状況を見せたいとき表示し、邪魔なら隠す。",
+    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答、view=diagnostics は言語サーバの診断（エラー・警告）の一覧、view=references は参照・呼び出し階層・型階層の結果（一覧 / ツリー）、view=search はワークスペース横断検索の検索欄と結果の一覧、view=usage は利用制限の使い道（プロジェクト → Issue → 会話）。状況を見せたいとき表示し、邪魔なら隠す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -850,7 +850,7 @@
           "type": "number"
         },
         "view": {
-          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks | diagnostics | references | search。tmux は fleet の旧称）",
+          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks | diagnostics | references | search | usage。tmux は fleet の旧称）",
           "enum": [
             "fleet",
             "orch",
@@ -859,6 +859,7 @@
             "diagnostics",
             "references",
             "search",
+            "usage",
             "tmux"
           ],
           "type": "string"
@@ -4614,6 +4615,10 @@
           "description": "session_id（前方一致可。show / resume で必須。link では pane と排他の任意指定）",
           "type": "string"
         },
+        "issue": {
+          "description": "usage の主の Issue 絞り込み（番号 / none）",
+          "type": "string"
+        },
         "limit": {
           "description": "list の最大件数（既定 30）/ usage の段の上位（既定 10）",
           "type": "integer"
@@ -4623,7 +4628,7 @@
           "type": "integer"
         },
         "project": {
-          "description": "list / usage のプロジェクト絞り込み",
+          "description": "list / usage のプロジェクト絞り込み（usage は project:<キー> / profile:<名前> / none も）",
           "type": "string"
         },
         "role": {
@@ -4635,6 +4640,10 @@
             "pane"
           ],
           "type": "string"
+        },
+        "show": {
+          "description": "usage を右パネルの usage ビューでも開く",
+          "type": "boolean"
         },
         "tab": {
           "description": "resume の分割先タブ ID（そのタブのフォーカスペインの隣）",

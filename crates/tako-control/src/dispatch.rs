@@ -3152,6 +3152,11 @@ pub enum OffloadJob {
     /// S2 #2201）。`<data_dir>/usage/` のファイルは記録が続くほど育ち、答える前に索引を最大 10 秒
     /// 読み進めるので、UI スレッドで読まない（workspace に触らないのでそのまま background から応答する）
     UsageSummary(crate::usage::UsageQuery),
+    /// `UsageSummary` + 右パネルの usage ビューを開いた（#2203。`shown` は画面のある host で開けたか）
+    UsageShow {
+        query: crate::usage::UsageQuery,
+        shown: bool,
+    },
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -3495,6 +3500,7 @@ fn usage_query(request: &Request) -> crate::usage::UsageQuery {
             window,
             account,
             project,
+            issue,
             limit,
             ..
         } => crate::usage::UsageQuery {
@@ -3502,6 +3508,7 @@ fn usage_query(request: &Request) -> crate::usage::UsageQuery {
             window: window.clone(),
             account: account.clone(),
             project: project.clone(),
+            issue: issue.clone(),
             limit: *limit,
         },
         _ => crate::usage::UsageQuery::default(),
@@ -3960,6 +3967,20 @@ pub fn prepare_offload(
         Request::RemoteAgents if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::RemoteAgents))
         }
+        // #2203: `show` は同じ段・期間・絞り込みで右パネルの usage ビューを開いてから、答えは同じ
+        // background のジョブで返す（UI スレッドで行うのは引数の確かめと画面の段を置くことだけ）
+        Request::Sessions {
+            action,
+            show: Some(true),
+            ..
+        } if action == "usage" => {
+            let query = usage_query(request);
+            if let Err(e) = query.parsed() {
+                return Some(Err(DispatchError::InvalidParams(e)));
+            }
+            let shown = host.show_usage_view(&query);
+            Some(Ok(OffloadJob::UsageShow { query, shown }))
+        }
         Request::Sessions { action, .. } if action == "usage" => {
             Some(Ok(OffloadJob::UsageSummary(usage_query(request))))
         }
@@ -4140,6 +4161,15 @@ impl OffloadJob {
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
             )
+            .map_err(DispatchError::Operation),
+            OffloadJob::UsageShow { query, shown } => crate::usage::usage_payload(
+                &query,
+                crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
+            )
+            .map(|mut out| {
+                out["shown"] = json!(shown);
+                out
+            })
             .map_err(DispatchError::Operation),
             OffloadJob::StaleStatus { ctx } => Ok(finish_stale_status(&ctx)),
             OffloadJob::TmuxWrite(request) => match *request {
@@ -6907,6 +6937,8 @@ fn dispatch_inner(
                 "sidebar_width_max": host.sidebar_width_max(),
                 "sidebar_width_min": tako_core::sidebar::MIN_WIDTH,
                 "show_hidden": host.filetree_show_hidden(),
+                // #2203: usage ビューで開いている段（画面の無い host・まだ開いていなければ null）
+                "usage": host.usage_view_state(),
             }))
         }
 
@@ -9739,6 +9771,8 @@ fn dispatch_inner(
             by,
             window,
             account,
+            issue,
+            show,
         } => match action.as_str() {
             "list" => crate::sessions::list_payload(
                 role.as_deref(),
@@ -9761,17 +9795,32 @@ fn dispatch_inner(
             // #2200 / #2201: 観測の要約と使用量の内訳（IPC / MCP は prepare_offload が background へ
             // 出し、そちらは答える前に索引を読み進める。ここはテスト・直呼びの同期の腕なので
             // 会話記録は読まず、今ある索引で答える。本体は同じ 1 実装）
-            "usage" => crate::usage::usage_payload(
-                &crate::usage::UsageQuery {
+            "usage" => {
+                let query = crate::usage::UsageQuery {
                     by,
                     window,
                     account,
                     project,
+                    issue,
                     limit,
-                },
-                crate::usage::Refresh::Skip,
-            )
-            .map_err(DispatchError::Operation),
+                };
+                // #2203: 開くのは引数を確かめてから（読めない段で画面を動かさない）
+                let shown = match show {
+                    Some(true) => {
+                        query.parsed().map_err(DispatchError::InvalidParams)?;
+                        Some(host.show_usage_view(&query))
+                    }
+                    _ => None,
+                };
+                crate::usage::usage_payload(&query, crate::usage::Refresh::Skip)
+                    .map(|mut out| {
+                        if let Some(shown) = shown {
+                            out["shown"] = json!(shown);
+                        }
+                        out
+                    })
+                    .map_err(DispatchError::Operation)
+            }
             other => Err(DispatchError::InvalidParams(format!(
                 "不明な action: {other:?}（list / show / resume / link / usage のいずれか）"
             ))),

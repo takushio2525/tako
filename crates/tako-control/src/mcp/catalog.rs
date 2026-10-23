@@ -3498,7 +3498,7 @@ pub fn tools() -> Vec<Value> {
                     },
                     "project": {
                         "type": "string",
-                        "description": "list / usage のプロジェクト絞り込み",
+                        "description": "list / usage のプロジェクト絞り込み（usage は project:<キー> / profile:<名前> / none も）",
                     },
                     "limit": {
                         "type": "integer",
@@ -3517,6 +3517,14 @@ pub fn tools() -> Vec<Value> {
                     "account": {
                         "type": "string",
                         "description": "usage の tako アカウント絞り込み",
+                    },
+                    "issue": {
+                        "type": "string",
+                        "description": "usage の主の Issue 絞り込み（番号 / none）",
+                    },
+                    "show": {
+                        "type": "boolean",
+                        "description": "usage を右パネルの usage ビューでも開く",
                     },
                     "pane": {
                         "type": "integer",

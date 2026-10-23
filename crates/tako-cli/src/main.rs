@@ -3931,12 +3931,19 @@ struct UsageArgs {
     /// tako のアカウント名で絞る
     #[arg(long)]
     account: Option<String>,
-    /// プロジェクト（master はプロファイル名）で絞る
+    /// プロジェクト（master はプロファイル名）で絞る。段の行を 1 つだけ選ぶときは
+    /// project:<キー> / profile:<名前> / none（未分類）
     #[arg(long)]
     project: Option<String>,
+    /// 主の Issue で絞る（番号 / none = Issue なし）
+    #[arg(long)]
+    issue: Option<String>,
     /// 段の上位の件数（既定 10）
     #[arg(long)]
     limit: Option<usize>,
+    /// 同じ段・期間・絞り込みで右パネルの usage ビューも開く（tako が動いていること）
+    #[arg(long)]
+    show: bool,
     /// 生の JSON で出力する（MCP `tako_sessions` の `action: "usage"` と同じ形）
     #[arg(long)]
     json: bool,
@@ -6645,9 +6652,40 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
         window: args.window.clone(),
         account: args.account.clone(),
         project: args.project.clone(),
+        issue: args.issue.clone(),
         limit: args.limit,
     };
-    let payload = tako_control::usage::usage_payload(&query, tako_control::usage::Refresh::Full)?;
+    // #2203: `--show` は画面を動かすので tako へ送る（答えは同じ `usage_payload`。索引は GUI の
+    // 背景と同じく上限つきで読み進める）。届かなければ開けない理由を言って止まる
+    let payload =
+        if args.show {
+            query.parsed()?;
+            let request = Request::Sessions {
+                action: "usage".into(),
+                id: None,
+                role: None,
+                project: query.project.clone(),
+                limit: query.limit,
+                pane: None,
+                tab: None,
+                direction: None,
+                by: query.by.clone(),
+                window: query.window.clone(),
+                account: query.account.clone(),
+                issue: query.issue.clone(),
+                show: Some(true),
+            };
+            match send_request_classified(request, None) {
+                Ok(value) => value,
+                Err(SendFailure::Unreachable(_)) => return Err(
+                    "tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）"
+                        .into(),
+                ),
+                Err(e) => return Err(e.message()),
+            }
+        } else {
+            tako_control::usage::usage_payload(&query, tako_control::usage::Refresh::Full)?
+        };
     let update = &payload["index"]["update"];
     if update["bytes_read"].as_u64().unwrap_or(0) >= 256 * 1024 * 1024 {
         eprintln!(
@@ -6667,22 +6705,16 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// トークン数の表記（万・億）
+/// トークン数の表記（万・億。右パネルの usage ビューと同じ 1 実装 = #2203）
 fn usage_tokens(n: u64) -> String {
-    if n >= 100_000_000 {
-        format!("{:.2} 億", n as f64 / 100_000_000.0)
-    } else if n >= 10_000 {
-        format!("{:.1} 万", n as f64 / 10_000.0)
-    } else {
-        n.to_string()
-    }
+    tako_core::usage::display::tokens(n)
 }
 
 /// 量の 1 行（API 換算・トークン・応答・会話）
 fn usage_amount(t: &Value) -> String {
     let mut out = format!(
-        "API 換算 ${:.2}・トークン {}（出力 {}）・応答 {}・会話 {}",
-        t["api_usd"].as_f64().unwrap_or(0.0),
+        "API 換算 {}・トークン {}（出力 {}）・応答 {}・会話 {}",
+        tako_core::usage::display::api_usd(t["api_usd"].as_f64().unwrap_or(0.0)),
         usage_tokens(t["total_tokens"].as_u64().unwrap_or(0)),
         usage_tokens(t["tokens"]["output"].as_u64().unwrap_or(0)),
         t["responses"].as_u64().unwrap_or(0),
@@ -6694,34 +6726,9 @@ fn usage_amount(t: &Value) -> String {
     out
 }
 
-/// 期間の表記
+/// 期間の表記（右パネルの usage ビューと同じ 1 実装 = #2203）
 fn usage_range(window: &str, r: &Value, now: i64, utc_offset: i32) -> String {
-    let stamp = |v: &Value| {
-        v.as_i64()
-            .map(|t| tako_core::user_task::response_stamp(t, now, utc_offset))
-            .unwrap_or_else(|| "-".into())
-    };
-    let length = match window {
-        "5h" => "5 時間",
-        _ => "7 日",
-    };
-    match r["basis"].as_str() {
-        Some("observed") => format!(
-            "今の {window} の窓（{} 〜・解除 {}）",
-            stamp(&r["from"]),
-            stamp(&r["resets_at"])
-        ),
-        Some("rolling") => format!("直近 {length}（観測した今の窓が無い）"),
-        Some("calendar") => {
-            let name = match window {
-                "day" => "今日",
-                "week" => "今週",
-                _ => "今月",
-            };
-            format!("{name}（{} 〜）", stamp(&r["from"]))
-        }
-        _ => "索引のすべて".to_string(),
-    }
+    tako_core::usage::display::range_label(window, r, now, utc_offset)
 }
 
 /// 利用制限の % の列に出す枠（主の枠 = `--window 5h` なら 5h、それ以外は 7d を左に）
@@ -6750,12 +6757,13 @@ fn usage_share_cell(available: bool, share: &Value) -> String {
     }
     let percent = share["percent"].as_f64().unwrap_or(0.0);
     let estimated = share["estimated"].as_f64().unwrap_or(0.0);
-    let est = if estimated >= 0.05 {
-        format!(" +{estimated:<4.1}")
-    } else {
-        String::new()
-    };
-    format!("{:>6}{est:6}", format!("{percent:.1}%"))
+    let est = tako_core::usage::display::estimated(estimated)
+        .map(|e| format!(" {e:<5}"))
+        .unwrap_or_default();
+    format!(
+        "{:>6}{est:6}",
+        tako_core::usage::display::share_percent(percent)
+    )
 }
 
 fn usage_share_cells(kinds: &[Value], share: &Value) -> String {
@@ -11053,6 +11061,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 by: None,
                 window: None,
                 account: None,
+                issue: None,
+                show: None,
             },
             SessionsCommand::Link { pane, id, .. } => Request::Sessions {
                 action: "link".into(),
@@ -11072,6 +11082,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 by: None,
                 window: None,
                 account: None,
+                issue: None,
+                show: None,
             },
             SessionsCommand::Show { id } => Request::Sessions {
                 action: "show".to_string(),
@@ -11085,6 +11097,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 by: None,
                 window: None,
                 account: None,
+                issue: None,
+                show: None,
             },
             SessionsCommand::Resume {
                 id,
@@ -11110,6 +11124,8 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 by: None,
                 window: None,
                 account: None,
+                issue: None,
+                show: None,
             },
         },
         Command::Logs(sub) => match sub {

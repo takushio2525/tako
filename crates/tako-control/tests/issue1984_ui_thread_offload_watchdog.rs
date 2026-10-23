@@ -2570,6 +2570,21 @@ const GRAPH_LEAVES: &[(&str, &str)] = &[
         "find_with_timeout(",
         "ログインシェルの `command -v` を上限つきで待つ",
     ),
+    // #2203: 使用量の索引と利用制限の観測のファイル（会話記録が育つほど大きい）。右パネルの usage
+    // ビューも CLI / MCP と同じく `prepare_offload` の background のジョブ（`OffloadJob::UsageSummary` /
+    // `UsageShow`）でしか読まない。UI スレッドの入口から届いたら名指す（設計書 §9 S4）
+    (
+        "usage::usage_payload(",
+        "使用量の索引と観測のファイルを読んで集計する（#2203。UI スレッドで集計しない）",
+    ),
+    (
+        "index::read_rows(",
+        "使用量の索引の 5 分刻みの行を読む（#2203）",
+    ),
+    (
+        "index::read_keys(",
+        "使用量の索引の会話の鍵を読む（#2203）",
+    ),
 ];
 
 /// 葉の一覧（`raw` = 直書きの口の一覧 + [`GRAPH_LEAVES`]）
@@ -4991,4 +5006,42 @@ fn 包んだ口を名指しできる() {
         "let _ = crate::agents::list_agents();",
         "`list_agents`",
     );
+}
+
+/// #2203: `tako usage --show` / MCP `show` の準備の段（`prepare_offload` の腕 = UI スレッド）が画面の段を
+/// 置くだけでなく索引を読んで集計し始めたら、15 節が file:line で名指す（包んだ口 `summary_payload` も辿る）
+#[test]
+fn usageの集計をuiスレッドの準備へ戻すと名指す() {
+    let s = Sources::load();
+    assert!(s.offenders().is_empty(), "前提: 現行は緑");
+    let from = "            let shown = host.show_usage_view(&query);";
+    for (label, to, why) in [
+        (
+            "(U1) 準備の段で集計する",
+            "            let shown = host.show_usage_view(&query) && crate::usage::usage_payload(&query, crate::usage::Refresh::Skip).is_ok();",
+            "usage::usage_payload(",
+        ),
+        (
+            "(U2) 包んだ口（`summary_payload` → `usage_payload` → `payload_in`）",
+            "            let shown = host.show_usage_view(&query) && crate::usage::summary_payload().is_ok();",
+            "`summary_payload`",
+        ),
+    ] {
+        let d = s.dispatch.replacen(from, to, 1);
+        assert_ne!(d, s.dispatch, "注入「{label}」の置換元がある");
+        let mut injected = s.clone();
+        injected.dispatch = d.clone();
+        let graph = injected.graph();
+        let named = scan_call_graph(&graph, &graph_leaves(RAW), &graph_known_edges(&graph));
+        let line = line_in(&d, "pub fn prepare_offload(", to.trim());
+        let hit = named
+            .iter()
+            .find(|o| o.file == DISPATCH && o.line == line && o.why.contains(why));
+        assert!(
+            hit.is_some(),
+            "注入「{label}」を 15 節が {DISPATCH}:{line} で名指せない: {:?}",
+            named.iter().map(Offender::report).collect::<Vec<_>>()
+        );
+        eprintln!("注入「{label}」→ {}", hit.unwrap().report());
+    }
 }

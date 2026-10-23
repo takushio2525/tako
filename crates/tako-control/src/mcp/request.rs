@@ -1308,6 +1308,8 @@ pub(super) fn build_request(
                 by: str_arg(args, "by")?,
                 window: str_arg(args, "window")?,
                 account: str_arg(args, "account")?,
+                issue: str_arg(args, "issue")?,
+                show: bool_arg(args, "show")?,
             }
         }
         "tako_logs" => Request::Logs {

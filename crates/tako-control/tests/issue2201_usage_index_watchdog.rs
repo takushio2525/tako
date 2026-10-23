@@ -34,6 +34,7 @@ fn workspace_root() -> PathBuf {
 
 const CORE_INDEX: &str = "crates/tako-core/src/usage/index.rs";
 const MAIN: &str = "crates/tako-app/src/main.rs";
+const USAGE_PANEL: &str = "crates/tako-app/src/usage_panel.rs";
 
 /// 偽の transcript に入れる印（どこかに出たら名指す）
 const BODY: &str = "usage-index-watchdog-body";
@@ -249,10 +250,55 @@ fn app_violations(main: &str) -> Vec<String> {
     out
 }
 
+/// 右パネルの usage ビュー（#2203）の違反を集める: 索引・観測の読みの口を直に呼ばず、CLI / MCP と同じ
+/// 要求（`Request::Sessions` の usage）を `dispatch_off_ui` で投げる（= `prepare_offload` の background）
+fn panel_violations(panel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, l) in panel.lines().enumerate() {
+        let code = l.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        for word in [
+            "usage_payload",
+            "payload_in",
+            "summary_payload",
+            "usage::index",
+            "Indexer",
+            "drive_for_gui",
+            "record_for_gui",
+            "read_rows",
+            "read_keys",
+        ] {
+            if code.contains(word) {
+                out.push(format!(
+                    "{USAGE_PANEL}:{}: usage ビューが索引・観測の読みの口を直に呼んでいる（{word}）:                      `Request::Sessions` の usage を dispatch_off_ui で投げる（描画・UI スレッドで集計しない。#2203）",
+                    i + 1
+                ));
+            }
+        }
+    }
+    let fetch = panel
+        .split("pub(crate) fn spawn_usage_fetch(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    pub(crate) fn ").next())
+        .unwrap_or("");
+    if !(fetch.contains("tako_control::protocol::Request::Sessions {")
+        && fetch.contains("self.dispatch_off_ui(request"))
+    {
+        out.push(format!(
+            "{USAGE_PANEL}: spawn_usage_fetch が `Request::Sessions` を dispatch_off_ui で投げていない              （CLI と同じ関数を background で通す経路が消えた。#2203）"
+        ));
+    }
+    out
+}
+
 /// 3: tako-app は索引を直に触らない・最初の更新は起動から 60 秒以上後
 #[test]
 fn guiは背景のdrive_for_guiだけを通し起動の段では読まない() {
     let v = app_violations(&read(MAIN));
+    assert!(v.is_empty(), "{}", v.join("\n"));
+    let v = panel_violations(&read(USAGE_PANEL));
     assert!(v.is_empty(), "{}", v.join("\n"));
     assert!(
         tako_control::usage::GUI_FIRST_DELAY >= std::time::Duration::from_secs(60),
@@ -302,5 +348,32 @@ fn 逆戻りを名指しできる() {
     assert!(
         v.iter().any(|m| m.contains("usage_payload")),
         "注入 (3) を名指せない: {v:?}"
+    );
+    // (4) usage ビュー（#2203）が描画の中で直に集計する
+    let panel = read(USAGE_PANEL);
+    let injected = panel.replacen(
+        "        let views = login_views(&payload, &level, result.at_unix, offset);",
+        "        let _ = tako_control::usage::usage_payload(&self.usage.query(), tako_control::usage::Refresh::Skip);\n        let views = login_views(&payload, &level, result.at_unix, offset);",
+        1,
+    );
+    assert_ne!(injected, panel, "注入 (4) の足場が無い");
+    let v = panel_violations(&injected);
+    assert!(
+        v.iter()
+            .any(|m| m.starts_with(USAGE_PANEL) && m.contains("usage_payload")),
+        "注入 (4) を名指せない: {v:?}"
+    );
+    // (5) 読みを dispatch の経路から外す（同期の dispatch で UI スレッドに集計させる）
+    let injected = panel.replacen(
+        "self.dispatch_off_ui(request",
+        "self.dispatch_sync_for_test(request",
+        1,
+    );
+    assert_ne!(injected, panel, "注入 (5) の足場が無い");
+    let v = panel_violations(&injected);
+    assert!(
+        v.iter()
+            .any(|m| m.contains("dispatch_off_ui で投げていない")),
+        "注入 (5) を名指せない: {v:?}"
     );
 }
