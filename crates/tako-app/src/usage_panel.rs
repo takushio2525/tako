@@ -222,6 +222,8 @@ pub(crate) struct UsageLoginView {
     pub(crate) range: Option<String>,
     pub(crate) total: Option<String>,
     pub(crate) rows: Vec<UsageRowView>,
+    /// 棒の満杯に当たる %（主の枠で観測した % = 段の合計 + tako の外。観測が無ければ段の最大）
+    pub(crate) bar_scale: f64,
     pub(crate) more: u64,
     pub(crate) outside: Option<String>,
     pub(crate) estimated: Option<String>,
@@ -367,12 +369,17 @@ pub(crate) fn login_views(
             range: None,
             total: None,
             rows: Vec::new(),
+            bar_scale: 0.0,
             more: 0,
             outside: None,
             estimated: None,
             unavailable: Vec::new(),
         };
         if usage.is_object() {
+            // 観測した今の窓なら期間の行が解除時刻まで言うので、解除の行は重ねて出さない
+            if usage["range"]["basis"] == "observed" {
+                view.resets = None;
+            }
             view.range = Some(display::range_label(
                 window,
                 &usage["range"],
@@ -426,6 +433,20 @@ pub(crate) fn login_views(
                 });
             }
             view.more = usage["more_groups"].as_u64().unwrap_or(0);
+            let observed = kinds
+                .iter()
+                .find(|k| k["kind"] == main_kind && k["available"] == Value::Bool(true))
+                .map_or(0.0, |k| f(&k["observed"]) + f(&k["estimated"]));
+            let max_row = view
+                .rows
+                .iter()
+                .map(|r| r.main_value)
+                .fold(0.0_f64, f64::max);
+            view.bar_scale = if observed > 0.0 {
+                observed.max(max_row)
+            } else {
+                max_row
+            };
             if let Some(k) = kinds.iter().find(|k| k["kind"] == main_kind) {
                 if k["available"] == Value::Bool(true) {
                     view.outside = Some(display::share_percent(f(&k["outside"])));
@@ -835,12 +856,9 @@ impl TakoApp {
             if view.range.is_some() && view.rows.is_empty() {
                 body = body.child(note(crate::ui_text::panel::usage_period_empty().into()));
             }
-            // 段の行（主の枠の % の大きい順 = 応答の並び）。棒は段の中で最大の行を幅いっぱいにする
-            let max = view
-                .rows
-                .iter()
-                .map(|r| r.main_value)
-                .fold(0.0_f64, f64::max);
+            // 段の行（主の枠の % の大きい順 = 応答の並び）。棒はその枠で観測した % に占める割合
+            // （段の中の最大を満杯にすると、極小の値が並んだときに全部満杯に見える）
+            let max = view.bar_scale;
             for (ri, row) in view.rows.iter().enumerate() {
                 let index = row_index;
                 row_index += 1;

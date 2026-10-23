@@ -66,7 +66,9 @@ isolated_gui_bins visual-test || exit 1
 caffeinate -d -u -w $$ >/dev/null 2>&1 &
 # 画像が読める大きさ（右パネル 520px + ペイン）
 ISOLATED_GUI_BOUNDS="${ISOLATED_GUI_BOUNDS:-40,40,1280,820}"
-mkdir -p "$DUMP_DIR"
+mkdir -p "$DUMP_DIR" "$TMP/zdot"
+# 画像にユーザー名・ホスト名が写らないよう固定のプロンプト（#927）
+printf "PROMPT='tako %%1~ %%%% '\nRPROMPT=''\n" > "$TMP/zdot/.zshrc"
 
 # ケースごとに置き場とソケットを分ける（2 回目の GUI が前の器を拾わない = #2157）
 use_case() {
@@ -146,7 +148,7 @@ run_visual() {
   local case_name="$1" log="$2"
   shift 2
   if ! launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=usage-panel-2203 \
-    TAKO_VISUAL_DUMP_DIR="$DUMP_DIR" TAKO_2203_CASE="$case_name" "$@"; then
+    TAKO_VISUAL_DUMP_DIR="$DUMP_DIR" TAKO_2203_CASE="$case_name" ZDOTDIR="$TMP/zdot" "$@"; then
     return 4
   fi
   APP_PID="$ISOLATED_GUI_PID"
@@ -218,7 +220,7 @@ case "$RC:$OUT" in
   1:*"tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）"*) pass "tako が動いていなければ --show は理由を言って止まる（終了コード 1）" ;;
   *) fail "tako が動いていないときの --show（終了コード ${RC}）: $OUT" ;;
 esac
-if launch_isolated_gui "$TMP/app-show.log"; then
+if launch_isolated_gui "$TMP/app-show.log" ZDOTDIR="$TMP/zdot"; then
   APP_PID="$ISOLATED_GUI_PID"
   remember_vhome "$APP_PID"
   wait_isolated_gui "$TMP/app-show.log" || exit 1
