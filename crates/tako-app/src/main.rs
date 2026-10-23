@@ -362,6 +362,69 @@ fn legacy_2153() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_2153_LEGACY").as_deref() == Ok("1"))
 }
 
+/// #1837 の A/B。`TAKO_1837_LEGACY` に `1` / `all` / 部分名のカンマ区切りを渡すと、
+/// **同一バイナリのまま**その部分だけ修正前へ戻す（`check` が 1 つ目の失敗で止まるので
+/// 部分ごとに戻せるようにする = #1353 の `legacy_cli_wait` と同じ理由）。
+/// - `web` = wry の親を初回 render の 1 度だけ採る（採った窓が閉じても採り直さない）。
+///   生成前の検査は残るので、閉じた窓を親にする代わりに理由つきのエラーになる
+/// - `wait` = セルフテストの「巨大ファイル後に通常表示へ復帰」を固定 3 秒の上限で待つ
+fn legacy_1837(part: &str) -> bool {
+    // render から毎フレーム引かれうるので env は 1 度だけ読む
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    legacy_1837_matches(
+        VALUE
+            .get_or_init(|| std::env::var("TAKO_1837_LEGACY").ok())
+            .as_deref(),
+        part,
+    )
+}
+
+/// [`legacy_1837`] の値の解き方（純粋関数。単体テスト用に env から切り離す）
+fn legacy_1837_matches(value: Option<&str>, part: &str) -> bool {
+    value.is_some_and(|v| {
+        v.split(',')
+            .map(str::trim)
+            .any(|p| p == "1" || p == "all" || p == part)
+    })
+}
+
+/// Web ビューの親の採り直し・断った理由を残す（#1837）。`persist_diag` はセルフテスト中は
+/// 黙るので、そのときは窓の close の記録（#872）と同じく stdout へ出す
+fn webview_parent_diag(line: &str) {
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        println!("TAKO_SELF_TEST_1837: {line}");
+    }
+    persist_diag(line);
+}
+
+/// wry の親（`window_raw_handle`）をこのフレームでどう扱うか（#1837）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebviewParentStep {
+    /// まだ採っていない: 採って復元待ちの Web ビューを開き直す（従来の初回 render）
+    Capture,
+    /// いまの親のまま（生きている / 採り直さない腕 / この窓からは採れない）
+    Keep,
+    /// 採った窓が閉じている: いま描いている窓から採り直し、Web ビューを付け替える
+    Refresh,
+}
+
+/// [`WebviewParentStep`] を決める（純粋関数。#1837）。`drawing_viewport` = いま描いている
+/// 窓がビューポート対応表に載っているか（開いた直後の対応付け前の窓からは採らない）
+fn webview_parent_step(
+    has_handle: bool,
+    live: bool,
+    legacy: bool,
+    drawing_viewport: bool,
+) -> WebviewParentStep {
+    if !has_handle {
+        WebviewParentStep::Capture
+    } else if live || legacy || !drawing_viewport {
+        WebviewParentStep::Keep
+    } else {
+        WebviewParentStep::Refresh
+    }
+}
+
 /// PDF プレビュー用: 速度係数（0.0..1.0）を 1 ティック分のスクロールピクセル数（正）に変換する（#309）
 const DRAG_SCROLL_MIN_PX_PER_SEC: f32 = 40.0;
 const DRAG_SCROLL_MAX_PX_PER_SEC: f32 = 600.0;
@@ -11004,7 +11067,7 @@ impl TakoApp {
                 // フォーカスを移した）は取り違えなので、フォーカス側のページへ寄せ直す。
                 // 宛先が tako のときはここへ来ない（上で抜けている）ので、
                 // 「ペインを選んだだけでページに打鍵を渡す」ことにはならない
-                let _ = self.webviews[idx].view.focus();
+                let _ = self.webviews[idx].focus();
                 return;
             }
         }
@@ -22216,12 +22279,79 @@ impl TakoApp {
             .window_raw_handle
             .as_ref()
             .ok_or("ウィンドウ初期化前のため Web ビューを作れない（直後に再試行）")?;
+        // 閉じた窓の描画ビューを親にしない（#1837）。採り直しは render でしか
+        // できないので、窓が 1 枚も無い（macOS で最後の窓を閉じた）あいだや、
+        // 採り直さない腕（`TAKO_1837_LEGACY=web`）ではここで理由つきで断る
+        if !self.webview_parent_live() {
+            let reason = webview::detached_parent_error();
+            webview_parent_diag(&reason);
+            return Err(reason);
+        }
         let id = webview::WebViewId(self.webview_next_id);
         let entry = webview::WebViewEntry::build(handle, id, url)?;
         self.webview_next_id += 1;
         self.webviews.push(entry);
         webview::set_has_webview(true);
         Ok(id)
+    }
+
+    /// wry の親（[`Self::window_raw_handle`]）がいま開いている tako の窓のものか（#1837）。
+    ///
+    /// 「採った窓がビューポート対応表に残っている」と「描画ビューが窓に載っている」の
+    /// 両方を見る。後者だけだと、閉じたがまだ解放されていない窓（`tako window close` の
+    /// 直後に実測）を生きていると読み、見えない窓の中に Web ビューを作る
+    fn webview_parent_live(&self) -> bool {
+        self.window_raw_handle
+            .as_ref()
+            .is_some_and(|h| self.viewports.iter().any(|(_, w)| *w == h.owner()) && h.attached())
+    }
+
+    /// 親を採り直す（#1837。render の冒頭から毎フレーム呼ぶ = 冪等）。
+    ///
+    /// 初回は従来どおり採って復元待ちの Web ビューを開き直す。2 回目以降は、採った窓が
+    /// 閉じていたら（`webview_parent_live` が偽）**いま描いている tako の窓**から採り直し、
+    /// 閉じた窓の描画ビューの子のままの Web ビューを付け替える。旧実装は初回の 1 度だけ
+    /// 採っていたので、最初の窓を閉じる（#339）・最後の窓を閉じて Dock から開き直す
+    /// （#381）と、次の Web ビューの生成が wry の `ns_view.window().unwrap()` で panic
+    /// してプロセスごと落ちた（セルフテスト項目 79 → 155 の実測）
+    fn refresh_webview_parent(&mut self, window: &Window) {
+        let has_handle = self.window_raw_handle.is_some();
+        let live = has_handle && self.webview_parent_live();
+        let step = webview_parent_step(
+            has_handle,
+            live,
+            !live && legacy_1837("web"),
+            self.viewport_of(window).is_some(),
+        );
+        match step {
+            WebviewParentStep::Keep => return,
+            WebviewParentStep::Capture => {
+                self.window_raw_handle = webview::WindowHandleBox::from_window(window);
+                if self.window_raw_handle.is_some() {
+                    self.restore_webviews();
+                }
+                return;
+            }
+            WebviewParentStep::Refresh => {}
+        }
+        let Some(fresh) = webview::WindowHandleBox::from_window(window) else {
+            return;
+        };
+        if !fresh.attached() {
+            return;
+        }
+        let moved = self
+            .webviews
+            .iter_mut()
+            .filter_map(|e| e.adopt_parent(&fresh).then_some(()))
+            .count();
+        let prev = self.window_raw_handle.replace(fresh).map(|h| h.owner());
+        webview_parent_diag(&format!(
+            "Web ビューの親を採り直した: 窓 {:?} → {:?}・付け替え {moved}/{} 枚 (#1837)",
+            prev.map(|w| w.window_id()),
+            window.window_handle().window_id(),
+            self.webviews.len(),
+        ));
     }
 
     /// render を待たずに webview を可視化する（#442）。
@@ -27404,6 +27534,13 @@ impl WebViewHost for TakoApp {
                         "visible": e.visible_now,
                         "visible_flips": e.visible_flips,
                         "bounds_sets": e.bounds_sets,
+                        // #1837: いま開いている tako の窓の子か（偽 = 閉じた窓に取り残されて
+                        // いて、表示しても見えない）
+                        "attached": self.webview_parent_live()
+                            && self
+                                .window_raw_handle
+                                .as_ref()
+                                .is_some_and(|h| e.parented_to(h)),
                     })
                 })
                 .collect(),
@@ -29104,13 +29241,9 @@ impl Render for TakoApp {
         self.drain_preview_image_evictions(window, cx);
         self.preview_device_scale = window.scale_factor();
         // Web ビュー（FR-3.8）: wry の親にするウィンドウハンドルは render でしか
-        // 採取できないため、初回 render で保存し、復元待ちの Web ビューを開き直す
-        if self.window_raw_handle.is_none() {
-            self.window_raw_handle = webview::WindowHandleBox::from_window(window);
-            if self.window_raw_handle.is_some() {
-                self.restore_webviews();
-            }
-        }
+        // 採取できないため、初回 render で保存し、復元待ちの Web ビューを開き直す。
+        // 採った窓が閉じていたら採り直して付け替える（#1837）
+        self.refresh_webview_parent(window);
         let cell = self.measure_cell(window);
         {
             let pane_ids: Vec<PaneId> = self.pane_font_sizes.keys().copied().collect();
@@ -33721,14 +33854,56 @@ mod self_test {
                         },
                         PaneOrigin::Cli,
                     )
-                    .ok()
-                    .and_then(|v| v["pane"].as_u64())
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| {
+                        let id = v["id"].as_u64();
+                        let pane = v["pane"].as_u64();
+                        id.zip(pane)
+                            .ok_or_else(|| format!("応答に id / pane が無い: {v}"))
+                    })
+                })
+                .unwrap_or_else(|e| Err(e.to_string()));
+            // 開けなかった理由をそのまま出す（#1837。採り直さない腕では
+            // 「Web ビューの親（tako の窓）が閉じている…」が出る = panic ではなくエラー）
+            let (web_id, web_pane) = match opened {
+                Ok((id, pane)) => (id, PaneId::from_raw(pane)),
+                Err(e) => fail(&format!("項目 155: Web ビューを開けない (#1750): {e}")),
+            };
+            // #1837: 項目 79 / 79b で窓を閉じて Dock 復帰で開き直した後でも、Web ビューは
+            // **いま開いている窓**の子になる（CLI / MCP の `web list` と同じ入口で読む）。
+            // 旧実装は初回に採った（= 閉じた）窓の描画ビューを親にし、生成そのものが
+            // wry の `ns_view.window().unwrap()` で panic していた
+            let attached = window
+                .update(cx, |app, _, _| {
+                    let list = tako_control::dispatch(
+                        app,
+                        Req::Web {
+                            action: "list".into(),
+                            url: None,
+                            id: None,
+                            pane: None,
+                            direction: None,
+                            to: None,
+                            js: None,
+                            token: None,
+                            focus: None,
+                        },
+                        PaneOrigin::Cli,
+                    )
+                    .unwrap_or_default();
+                    list.as_array().and_then(|all| {
+                        all.iter()
+                            .find(|e| e["id"].as_u64() == Some(web_id))
+                            .map(|e| e["attached"].clone())
+                    })
                 })
                 .ok()
                 .flatten();
-            let Some(web_pane) = opened.map(PaneId::from_raw) else {
-                fail("項目 155: Web ビューを開けない (#1750)");
-            };
+            println!("TAKO_SELF_TEST_1837: item=155-webview id={web_id} attached={attached:?}");
+            check(
+                attached == Some(serde_json::Value::Bool(true)),
+                "項目 155: 窓を閉じて開き直した後の Web ビューがいま開いている窓の子になる (#1837)",
+            );
             let read_addr: fn(&TakoApp) -> Option<String> = |app| {
                 let pane = app.web_address_bar_editing()?;
                 app.webview_address_bar
@@ -37599,6 +37774,44 @@ mod self_test {
             "late" => Some(DISPLAY_694C_LEGACY_WINDOW + Duration::from_secs(2)),
             "never" => Some(Duration::MAX),
             _ => None,
+        }
+    }
+
+    /// 「巨大ファイル後に通常表示へ復帰」（#1660）の旧の固定上限（#1837）。
+    /// 旧の腕（`TAKO_1837_LEGACY=wait`）は**旧の予算の値**で表す（#2013 と同じ = 待ち方の差だけを A/B にする）
+    const RESTORE_1660_LEGACY_WINDOW: Duration = Duration::from_secs(3);
+
+    /// 同じ項目の新しい上限の素の値（#1837）。[`state_wait_budget`] で混み具合に応じて伸ばす
+    const RESTORE_1660_BASE: Duration = Duration::from_secs(10);
+
+    /// **#1837 の注入口**。観測だけを遅らせる（相手 = ファイルの監視 → 読み込み → 差し替えは前へ進む）。
+    ///
+    /// - `late` = 旧の固定上限 + 2 秒まで成立を見せない（混んだ機で差し替えが 3 秒の外へ出た状態。
+    ///   `TAKO_1837_LEGACY=wait` と組むと旧の腕が確定で落ちる / 新の腕は待って通る）
+    /// - `never` = 成立を見せない（検出力。上限を伸ばしても**本物の回帰は隠れない** =
+    ///   新の腕でも上限まで待って FAILED になるのが正しい）
+    ///
+    /// **混み具合そのものは再現しない**（CPU を焼く負荷生成は使わない。#1837 の受け入れ条件）
+    fn inject_1837() -> String {
+        std::env::var("TAKO_1837_INJECT").unwrap_or_default()
+    }
+
+    /// [`inject_1837`] の値 → 成立を見せない長さ（`None` = 注入なし）
+    fn hold_1837(inject: &str) -> Option<Duration> {
+        match inject {
+            "late" => Some(RESTORE_1660_LEGACY_WINDOW + Duration::from_secs(2)),
+            "never" => Some(Duration::MAX),
+            _ => None,
+        }
+    }
+
+    /// 「巨大ファイル後に通常表示へ復帰」の上限（純粋関数。#1837）。
+    /// 新の腕は素の値を [`state_wait_budget`] で伸ばす（伸ばすだけ・4 倍で打ち切り）
+    pub(crate) fn restore_1660_budget(legacy: bool, busy: Option<f64>) -> Duration {
+        if legacy {
+            RESTORE_1660_LEGACY_WINDOW
+        } else {
+            state_wait_budget(RESTORE_1660_BASE, busy)
         }
     }
 
@@ -68678,19 +68891,41 @@ mod self_test {
             .await
             .unwrap_or_else(|| fail("巨大ファイルを省略表示"));
             std::fs::write(&note_path, "# Restored\n").expect("通常サイズへ戻せる");
-            wait_for_preview_state(window, cx, Duration::from_secs(3), |app| {
-                matches!(
-                    app.previews.get(&reload_pane).map(|state| &state.content),
-                    Some(preview::PreviewContent::Markdown(blocks))
-                        if blocks.iter().any(|block| matches!(
-                            &block.kind,
-                            preview::MdBlockKind::Heading { spans, .. }
-                                if spans.iter().any(|span| span.text == "Restored")
-                        ))
-                )
+            // **通常表示へ戻るまで状態で待つ**（#1837。#1353 / #2013 と同じ型）。旧実装は
+            // 固定 3 秒の上限で、混んだ機（load 30〜50）では巨大ファイルの省略表示から戻る前に
+            // 上限を使い切って落ちていた（#1835 の worker の実測。main でも再現 = 回帰ではない）。
+            // 戻らなければ上限まで待って偽なので、検出力は固定の上限と同じか強い
+            let restore_legacy = legacy_1837("wait");
+            let restore_budget = restore_1660_budget(restore_legacy, machine_busy());
+            let restore_inject = inject_1837();
+            let restore_hold = hold_1837(&restore_inject);
+            let restore_started = std::time::Instant::now();
+            let restored = wait_for_preview_state(window, cx, restore_budget, move |app| {
+                // 注入（`late` / `never`）は観測だけを遅らせる（相手は前へ進む）
+                restore_hold.is_none_or(|hold| restore_started.elapsed() >= hold)
+                    && matches!(
+                        app.previews.get(&reload_pane).map(|state| &state.content),
+                        Some(preview::PreviewContent::Markdown(blocks))
+                            if blocks.iter().any(|block| matches!(
+                                &block.kind,
+                                preview::MdBlockKind::Heading { spans, .. }
+                                    if spans.iter().any(|span| span.text == "Restored")
+                            ))
+                    )
             })
-            .await
-            .unwrap_or_else(|| fail("巨大ファイル後に通常表示へ復帰"));
+            .await;
+            // **実際にどれだけ待ったかを毎回出す**（#796。上限の見直しの材料）
+            println!(
+                "TAKO_SELF_TEST_1837: item=huge-restore ok={} waited={:.1}s budget={:.1}s \
+                 legacy={restore_legacy} inject={restore_inject:?} {}",
+                restored.is_some(),
+                restore_started.elapsed().as_secs_f32(),
+                restore_budget.as_secs_f32(),
+                env_line()
+            );
+            if restored.is_none() {
+                fail("巨大ファイル後に通常表示へ復帰");
+            }
 
             // 編集モード中の外部変更（FR-3.15 → FR-3.5）。#1659: **未編集ならディスクへ追従**し、
             // 未保存の変更があれば上書きせず、競合として 1 回だけ知らせる。
@@ -71378,7 +71613,7 @@ mod self_test {
                                 app.webviews
                                     .iter()
                                     .find(|e| e.id.as_u64() == id)
-                                    .map(|e| e.view.focus().is_ok())
+                                    .map(|e| e.focus().is_ok())
                                     .unwrap_or(false)
                             })
                             .unwrap_or(false);
@@ -101462,6 +101697,203 @@ mod selftest_wait_watchdog {
         assert!(fixed_window_then_display_read(&good).is_empty());
     }
 
+    /// **プレビューの状態待ちの上限を固定値で書いていない**（#1837）。
+    ///
+    /// 「巨大ファイル後に通常表示へ復帰」（#1660）は状態待ち（`wait_for_preview_state`）の
+    /// **上限に固定 3 秒**を渡していた。待ち方は状態待ちでも上限が混み具合で伸びないので、
+    /// load 30〜50 の機では差し替えが 3 秒の外へ出て落ちた（#1835 の worker の実測）。
+    ///
+    /// なぜ既存の番犬をすり抜けたか: 既存の番犬は「`wait` の直後に 1 回読む」「固定回数の
+    /// ループ」の形を見る。この形は**状態待ちの関数の引数**に固定の上限があるので、どちらにも
+    /// 当たらない。呼び出しの引数（クロージャの `|` の手前まで。改行をまたぐ呼び出しは 6 行まで）に
+    /// `Duration::from_secs(` / `Duration::from_millis(` を書いた呼び出しを名指しする。
+    /// 正しい形は上限を `state_wait_budget`（を通す関数）で決めて変数で渡す。
+    ///
+    /// キーは呼び出しの後 60 行以内の最初の `fail(` / `check(` のラベル、無ければ束縛した
+    /// 変数名（行番号は編集でずれる）。パターンは `concat!` で分割して書く
+    /// （番犬自身のソース行が検査対象に入るため）
+    fn fixed_preview_wait_budgets(src: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let call = concat!("wait_for_preview", "_state(");
+        let fixed = [
+            concat!("Duration::", "from_secs("),
+            concat!("Duration::", "from_millis("),
+        ];
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains(call) || line.trim_start().starts_with("//") {
+                continue;
+            }
+            let args = lines[index..lines.len().min(index + 6)]
+                .iter()
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let Some(start) = args.find(call).map(|at| at + call.len()) else {
+                continue;
+            };
+            let end = args[start..].find('|').map_or(args.len(), |at| start + at);
+            if !fixed.iter().any(|f| args[start..end].contains(f)) {
+                continue;
+            }
+            hits.push((index + 1, wait_call_key(&lines, index)));
+        }
+        hits
+    }
+
+    /// [`fixed_preview_wait_budgets`] のキー: 後続の最初の `fail(` / `check(` のラベル、
+    /// 無ければ `let <名前> =` の名前
+    fn wait_call_key(lines: &[&str], at: usize) -> String {
+        let joined = lines
+            .iter()
+            .skip(at)
+            .take(60)
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let from = [joined.find("fail(\""), joined.find("check(")]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(from) = from {
+            let rest = &joined[from..];
+            if let Some(open) = rest.find('"') {
+                let mut label = String::new();
+                let mut escaped = false;
+                for ch in rest[open + 1..].chars() {
+                    if escaped {
+                        label.push(ch);
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        break;
+                    } else {
+                        label.push(ch);
+                    }
+                }
+                return label;
+            }
+        }
+        lines[at]
+            .trim()
+            .strip_prefix("let ")
+            .and_then(|rest| rest.split([' ', '=']).next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// **「プレビューの状態待ちを固定の上限で待つ」の既知リスト**（#1837 で番犬を入れた時点の残り）。
+    ///
+    /// #1837 で直したのは「巨大ファイル後に通常表示へ復帰」だけで、同じ形が下の 18 か所に
+    /// 残っている（#1837 の範囲外の項目）。番犬を先に入れて**新規の混入を止め**、残りはここで
+    /// 段階導入にする（#2013 の `KNOWN_FIXED_DISPLAY_WAITS` と同じ運用）。
+    ///
+    /// リストは**減る方向にしか動かさない**（下のテストが、直したのに残っているエントリを落とす）。
+    /// 新しく混入した形はここへ足さずに上限を `state_wait_budget` で決めること
+    const KNOWN_FIXED_PREVIEW_WAITS: &[&str] = &[
+        "visual-test #745: プレビュー側に表がロードされる",
+        "visual-test md: 表を含む本文がロードされる",
+        "visual-test md ストレス: 表 4 本を含む本文がロードされる",
+        "#821 bench: 本文がロードされる",
+        "outline_md_loaded",
+        "no_heading_ok",
+        "outlined_pdf_loaded",
+        "plain_pdf_outline_ok",
+        "スクロール保持用の基準 Markdown を反映",
+        "連続 write の最終内容が 3 秒以内に反映",
+        "削除 / rename 後に Error 表示へなる",
+        "rename 元のパス復帰後に再読み込み",
+        "巨大ファイルを省略表示",
+        "未編集の編集セッションはディスクへ追従する (#1659)",
+        "編集中の外部変更を Conflict 通知",
+        "PNG のライブリロード",
+        "PDF 初回ラスタライズ",
+        "PDF のライブ再ラスタライズ",
+    ];
+
+    #[test]
+    fn プレビューの状態待ちを固定の上限で待っていない() {
+        let src = include_str!("main.rs");
+        let hits = fixed_preview_wait_budgets(src);
+        let unknown: Vec<String> = hits
+            .iter()
+            .filter(|(_, key)| !KNOWN_FIXED_PREVIEW_WAITS.contains(&key.as_str()))
+            .map(|(line, key)| format!("main.rs:{line}（{key}）"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "{unknown:?} がプレビューの状態待ちの上限を固定値で渡している。待ち方が状態待ちでも\
+             上限が混み具合で伸びないので、混んだ機ではファイルの監視 → 読み込み → 差し替えが\
+             上限の外へ出て落ち、**その項目以降が 1 つも走らなくなる**（#1837 の「巨大ファイル後に\
+             通常表示へ復帰」は固定 3 秒で load 30〜50 の機で落ちた）。上限は \
+             `state_wait_budget` で決めて変数で渡すこと"
+        );
+        let stale: Vec<&str> = KNOWN_FIXED_PREVIEW_WAITS
+            .iter()
+            .copied()
+            .filter(|known| !hits.iter().any(|(_, key)| key == known))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_FIXED_PREVIEW_WAITS の {stale:?} はもう違反していない。\
+             既知リストは減る方向にしか動かさないので、直したらエントリを消すこと（#1837）"
+        );
+    }
+
+    /// 検出力の担保: 番犬自身が空振りしないこと（#1837 で直した形そのものを与える）
+    #[test]
+    fn 番犬は固定の上限のプレビュー待ちを見逃さず伸びる上限は許す() {
+        let call = concat!("wait_for_preview", "_state(");
+        let fixed = concat!("Duration::", "from_secs(3)");
+        // 「巨大ファイル後に通常表示へ復帰」の旧実装そのもの（1 行に収まる呼び出し）
+        let bad = format!(
+            "            {call}window, cx, {fixed}, |app| {{\n\
+             \x20               restored(app)\n\
+             \x20           }})\n\
+             \x20           .await\n\
+             \x20           .unwrap_or_else(|| fail(\"巨大ファイル後に通常表示へ復帰\"));"
+        );
+        assert_eq!(
+            fixed_preview_wait_budgets(&bad),
+            vec![(1, "巨大ファイル後に通常表示へ復帰".to_string())]
+        );
+        // 引数が改行をまたぐ形・束縛して後で check する形（ラベルは check の方）
+        let multiline = format!(
+            "            let loaded = {call}\n\
+             \x20               window,\n\
+             \x20               cx,\n\
+             \x20               {fixed},\n\
+             \x20               |app| ready(app),\n\
+             \x20           )\n\
+             \x20           .await;\n\
+             \x20           check(loaded.is_some(), \"本文がロードされる\");"
+        );
+        assert_eq!(
+            fixed_preview_wait_budgets(&multiline),
+            vec![(1, "本文がロードされる".to_string())]
+        );
+        // check が 60 行の外なら束縛した変数名がキー
+        let far = multiline.replace(
+            "            check(",
+            &format!("{}            check(", "            x;\n".repeat(70)),
+        );
+        assert_eq!(
+            fixed_preview_wait_budgets(&far),
+            vec![(1, "loaded".to_string())]
+        );
+        // クロージャの中の Duration（判定の材料）は上限ではないので対象外
+        let in_closure =
+            format!("            {call}window, cx, budget, |app| app.age() > {fixed}).await;");
+        assert!(fixed_preview_wait_budgets(&in_closure).is_empty());
+        // 上限を変数で渡す形（state_wait_budget で決めた値）は許す
+        let good = bad.replace(fixed, "restore_budget");
+        assert!(fixed_preview_wait_budgets(&good).is_empty());
+        // コメントの中の呼び出しは対象外
+        let comment = format!("            // {call}window, cx, {fixed}, |app| …)");
+        assert!(fixed_preview_wait_budgets(&comment).is_empty());
+    }
+
     /// **固定窓のあいだに器（tmux）・外のプロセスの往復を待っていない**（#1180）。
     ///
     /// `for _ in 0..25 { wait(cx, 400).await; … }` = 「25 回 × 400ms = **固定 10 秒**」の
@@ -103189,5 +103621,54 @@ mod pane_menu_items_tests {
         }
         // 渡し先は ⌘クリック・編集メニューと同じ入口（dispatch の 3 段）
         assert!(run.contains("start_lsp_goto_request(") && run.contains("format_preview_request("));
+    }
+}
+
+#[cfg(test)]
+mod issue1837_tests {
+    use super::{legacy_1837_matches, webview_parent_step, WebviewParentStep};
+    use std::time::Duration;
+
+    #[test]
+    fn issue1837_旧の腕は部分ごとに戻せる() {
+        assert!(!legacy_1837_matches(None, "web"));
+        assert!(legacy_1837_matches(Some("1"), "web"));
+        assert!(legacy_1837_matches(Some("all"), "wait"));
+        assert!(legacy_1837_matches(Some("web"), "web"));
+        assert!(!legacy_1837_matches(Some("web"), "wait"));
+        assert!(legacy_1837_matches(Some("wait, web"), "web"));
+        assert!(!legacy_1837_matches(Some(""), "web"));
+        assert!(!legacy_1837_matches(Some("webview"), "web"));
+    }
+
+    #[test]
+    fn issue1837_親は初回に採り閉じた窓なら描いている窓から採り直す() {
+        use WebviewParentStep::*;
+        // 初回は窓の対応付けに関係なく採る（従来どおり）
+        assert_eq!(webview_parent_step(false, false, false, false), Capture);
+        assert_eq!(webview_parent_step(false, false, false, true), Capture);
+        // 生きている親は採り直さない（毎フレーム呼ばれても AppKit を往復しない）
+        assert_eq!(webview_parent_step(true, true, false, true), Keep);
+        // 採った窓が閉じた: 描いている窓がビューポートなら採り直す
+        assert_eq!(webview_parent_step(true, false, false, true), Refresh);
+        // 対応付け前の窓からは採らない（採った瞬間に古くなる）
+        assert_eq!(webview_parent_step(true, false, false, false), Keep);
+        // 採り直さない腕（`TAKO_1837_LEGACY=web`）は修正前と同じく初回の 1 度だけ
+        assert_eq!(webview_parent_step(true, false, true, true), Keep);
+    }
+
+    #[test]
+    fn issue1837_巨大ファイル後の復帰の上限は伸ばすだけで旧の腕は固定3秒() {
+        use super::self_test::restore_1660_budget;
+        assert_eq!(restore_1660_budget(true, None), Duration::from_secs(3));
+        assert_eq!(restore_1660_budget(true, Some(8.0)), Duration::from_secs(3));
+        let base = restore_1660_budget(false, None);
+        assert_eq!(base, Duration::from_secs(10));
+        // 混んでいれば伸ばす・空いていても縮めない・4 倍で打ち切る
+        assert!(restore_1660_budget(false, Some(3.0)) > base);
+        assert_eq!(restore_1660_budget(false, Some(0.0)), base);
+        assert_eq!(restore_1660_budget(false, Some(100.0)), base * 4);
+        // 新の腕は旧の腕より常に長い（固定 3 秒で落ちた差し替えを待てる）
+        assert!(base > restore_1660_budget(true, None));
     }
 }

@@ -276,7 +276,12 @@ fn scan_single_appkit_impl(src: &str) -> Vec<Offender> {
     out
 }
 
-/// 5: 隠すときに宛先を返す既存経路が消えていない
+/// 5: 隠すときに宛先を返す既存経路が消えていない。
+///
+/// #1837 から戻しは `WebViewEntry::focus_parent`（**いまの** superview へ返す）を通す。
+/// wry の `focus_parent` は生成時の親を宛先にするので、親を付け替えた後は窓に居ない
+/// ビューを宛先にしようとして失敗し、NSWindow 自身が宛先になる。自前の戻しが
+/// superview へ返していること（`focus_superview`）まで見る
 fn scan_hide_returns_focus(src: &str) -> Vec<Offender> {
     let Some((at, window)) = fn_window(src, "pub fn sync_frame(&mut self") else {
         return vec![Offender {
@@ -285,6 +290,26 @@ fn scan_hide_returns_focus(src: &str) -> Vec<Offender> {
             why: "`sync_frame` が見つからない（走査が空振り）".into(),
         }];
     };
+    if window.contains("self.focus_parent()") {
+        let Some((own_at, own)) = fn_window(src, "fn focus_parent(&self)") else {
+            return vec![Offender {
+                file: WEBVIEW,
+                line: at,
+                why: "`self.focus_parent()` を呼ぶのに `fn focus_parent(&self)` が無い（#1837）"
+                    .into(),
+            }];
+        };
+        if own.contains("focus_superview(") {
+            return Vec::new();
+        }
+        return vec![Offender {
+            file: WEBVIEW,
+            line: own_at,
+            why: "隠すときの宛先の戻しが WKWebView のいまの superview へ返していない\
+                  （#1837。生成時の親へ返すと、付け替えた後は NSWindow 自身が宛先になる）"
+                .into(),
+        }];
+    }
     if window.contains("self.view.focus_parent()") {
         return Vec::new();
     }
@@ -543,8 +568,18 @@ fn 逆戻りを名指しできる() {
 
     // (6) 隠すときの戻しを外す
     let mut s = Sources::load(&root);
-    s.webview = s.webview.replace("let _ = self.view.focus_parent();", "");
+    s.webview = s
+        .webview
+        .replace("                    self.focus_parent();\n", "");
     expect_hit(&s, WEBVIEW, "隠す前に宛先を親へ返していない");
+
+    // (6b) 戻し先を superview から外す（#1837。生成時の親へ返す形へ戻す）
+    let mut s = Sources::load(&root);
+    s.webview = s.webview.replace(
+        "            key_monitor::focus_superview(&*wk as *const _ as *const std::ffi::c_void);",
+        "            let _ = (wk, self.view.focus_parent());",
+    );
+    expect_hit(&s, WEBVIEW, "いまの superview へ返していない");
 
     // (7) 移動より前にクリアへ入る（古いフォーカスで判定する）
     let mut s = Sources::load(&root);

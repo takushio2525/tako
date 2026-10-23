@@ -1046,6 +1046,24 @@ Windows = WebView2）で実装した。CDP ミラー方式 PoC（ヘッドレス
   `wry::WebViewBuilder::build_as_child()` にそのまま渡せる。初回 render で
   `WindowHandleBox` に採取し、dispatch（IPC / MCP）からの生成でも使う
   （gpui-component の GPUI × wry 統合と同構成）
+- **親は採った窓が閉じたら採り直す（#1837）**: 親（GPUI の描画ビュー）は窓ごとに別物なので、
+  最初の窓を閉じる（#339）・macOS で最後の窓を閉じて Dock から開き直す（#381）と、初回に
+  採った親は閉じた窓のものになる。macOS の wry は親や WKWebView の NSWindow を
+  `window().unwrap()` で引く（生成 = wkwebview/mod.rs:392・位置合わせ = :1013・focus = :1039）ので、
+  閉じた窓が解放されていれば **panic でプロセスごと落ちる**（セルフテスト項目 79 → 155 の実測）。
+  解放されていなければ閉じた窓の中に見えない Web ビューを作る（`tako window close` の直後の実測）。
+  そこで ① render の冒頭（`refresh_webview_parent`）で「採った窓がビューポート対応表に残り、
+  描画ビューが窓に載っている」かを見て、偽ならいま描いている窓から採り直し、閉じた窓の
+  描画ビューの子のままの Web ビューを新しい描画ビューへ `addSubview:` で付け替える
+  （wry の `reparent` は `contentView` へ足すので使わない = キー入力の宛先の戻し先は
+  WKWebView の superview = 描画ビューでなければならない。#326 / #1481）②採り直せない
+  あいだ（窓が 1 枚も無い等）の生成は wry へ渡す前に理由つきで断る（CLI / MCP の応答と
+  persist.log に同じ 1 文。#334 と同じく wry の unwrap に届かせない）③位置合わせと focus は
+  WKWebView が窓に載っていなければ呼ばない。描画ビューは `WindowHandleBox` が retain するので
+  解放済みのポインタにはならない。`tako web list` の `attached` = いま開いている窓の子か。
+  A/B は `TAKO_1837_LEGACY=web`（採り直さない = ②だけが効く）、実経路は
+  `bash scripts/test-webview-parent-1837.sh [legacy]`。Windows は親の HWND が壊れると子の
+  WebView2 の窓も壊れるので付け替えない（生成前の検査は `IsWindow`）
 - **bounds 追従**: render_webview_pane が pane_text_areas と同じ絶対論理座標を
   `set_bounds`（Logical）へ渡す。差分呼び出しで AppKit 往復を抑制
 - **入力**: OS がネイティブ webview へ直接配送（クリック・スクロール・キー・IME）。
