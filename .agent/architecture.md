@@ -452,6 +452,23 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      GUI の通知欄（`notify_ipc_unavailable`）が読む。**立たなかったら黙らない**
      （旧実装は `eprintln!` 1 行だけで GUI を普通に立て、CLI / MCP から一切操作できない
      状態が無言で始まっていた = #1441 の症状）
+  6. **立った後にパスから切り離されたら張り直す**（#2002 / FR-2.2.13）。accept スレッドは
+     `poll` + 時間切れ（既定 10 秒・`TAKO_IPC_WATCH_MS`）で待ち、時間切れのたびにパスの
+     `lstat` の (dev, ino) を bind した時の値と比べる（判定は `ipc_socket::classify` の
+     1 実装）。消えていた・誰も受けない別の実体に替わっていた → 同じパスへ張り直して
+     persist.log に 1 行。生きた別の受け口が握っている・ソケットではないファイルがある →
+     奪わない / 触らない（状態の変わり目に 1 行）。置き場の dir が消えていたら作り直さない。
+     張り直した listener は accept スレッド自身が差し替える（別スレッドから fd を触らない）。
+     drop は**自分の実体のときだけ**ファイルを消し、起こす 1 本もパスが自分のときだけ繋ぐ
+     （相手のファイルを消すと今度は相手が切り離される）。終了の最中は張り直さない。
+     記録は `ipc_socket::record_watch` → `check_health` の `ipc.watch`（間隔・確認回数・
+     張り直し回数・最後の理由）と、切り離されたままなら `issues` の warning。
+     A/B は `TAKO_2002_LEGACY=1`（見張らない = 接続が来るまで眠る修正前の待ち）。
+     段 1 の切り分け（2026-10-24）: 一斉接続（300 本）は一時的な refused だけ、
+     fd の上限（launchd の既定 256 を模して 160）は「繋がるが送信で ENOTCONN」で、
+     どちらも負荷が引けば戻る。**戻らない refused を作ったのは「同じパスを別の受け口が
+     作り直して閉じた」形だけ**（GUI の accept スレッドは `__accept` で待機・CPU 0%）。
+     Windows の named pipe はパスに実体が無いので対象外
 - **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
   `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。
   実装時の検討事項:

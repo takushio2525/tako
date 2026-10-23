@@ -121,6 +121,14 @@ pub struct IpcServer {
     pointer: Option<std::path::PathBuf>,
     /// accept スレッドを止める口（#2136）
     accept: AcceptStop,
+    /// いまの受け口のソケットファイルの実体（#2002。張り直しで替わる）。drop はこれと同じ
+    /// 実体のときだけファイルを消す（パスを別の受け口に奪われていたら、それは相手のもの）
+    #[cfg(unix)]
+    file_id: unix_imp::SharedFileId,
+    /// 受け口の見張りの記録（#2002。accept スレッドが確かめるたびに書く）
+    #[cfg(unix)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    watch: std::sync::Arc<std::sync::Mutex<tako_core::ipc_socket::IpcWatch>>,
 }
 
 impl IpcServer {
@@ -172,16 +180,32 @@ impl IpcServer {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
+
+    /// 見張りの記録の写し（#2002 のテスト用）
+    #[cfg(all(test, unix))]
+    fn watch_snapshot(&self) -> tako_core::ipc_socket::IpcWatch {
+        self.watch.lock().map(|w| w.clone()).unwrap_or_default()
+    }
 }
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
+        // #2002: パスがいまも自分の受け口のものか（奪われていたら、起こす 1 本も消すファイルも相手のもの）
+        #[cfg(unix)]
+        let owns = unix_imp::owns_path(&self.endpoint, &self.file_id);
+        #[cfg(windows)]
+        let owns = true;
         // 受け口を閉じるのが先（起こす 1 本はソケットファイルを通って繋ぐ = 消す前に）
         if !legacy_2136() {
-            self.accept.close(&self.endpoint);
+            self.accept.close(&self.endpoint, owns);
         }
         #[cfg(unix)]
         {
+            // 消すのは自分の受け口のファイルだけ（別の受け口に奪われていたパスを
+            // 終了のついでに消すと、今度は相手の受け口がパスから切り離される）
+            if !owns {
+                return;
+            }
             let _ = std::fs::remove_file(&self.endpoint);
             // 死んだ実体を指す参照を残さない（#1441）
             if let Some(pointer) = &self.pointer {
@@ -244,11 +268,14 @@ impl AcceptGuard {
 }
 
 impl AcceptStop {
-    fn close(&self, endpoint: &str) {
+    /// `wake` = false はパスを通って起こさない（#2002: パスが別の受け口のものになっている =
+    /// 繋ぐと相手へ 1 本迷い込む）。旗だけ立て、スレッドは見張りの次の時間切れで抜ける
+    fn close(&self, endpoint: &str, wake: bool) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         // 起こせなかった（ソケットファイルを外から消された・スレッドが既に抜けた）なら待たない。
-        // drop を固めないのが優先で、そのときスレッドは修正前と同じく残る
-        if wake_accept(endpoint) {
+        // drop を固めないのが優先で、そのときスレッドは見張りの次の時間切れで抜ける
+        // （見張らない A/B では修正前と同じく残る）
+        if wake && wake_accept(endpoint) {
             // 送る者は居ないので、返るのは「切れた」（= 閉じた）か上限だけ
             let _ = self.done.recv_timeout(ACCEPT_STOP_WAIT);
         }
@@ -498,9 +525,15 @@ mod windows_imp {
 mod unix_imp {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use futures::channel::mpsc::UnboundedSender;
-    use tako_core::ipc_socket::{IpcStatus, SocketPathKind, SocketPlan};
+    use tako_core::ipc_socket::{
+        IpcStatus, IpcWatch, ListenerCheck, PathObservation, Rebind, SocketFileId, SocketPathKind,
+        SocketPlan,
+    };
 
     use super::{accept_stop_pair, conn, IncomingRequest, IpcServer};
 
@@ -566,7 +599,9 @@ mod unix_imp {
                     Ok(()) => plan.pointer,
                     Err(_) => None,
                 };
-                serve(listener, tx, token, plan.path, pointer)
+                // #2002: 本体の受け口だけが記録と persist.log へ出す（単体テストは出さない）
+                let watch = WatchConfig::from_env(plan.kind, !cfg!(test));
+                serve(listener, tx, token, plan.path, pointer, watch)
             }
             Err(e) => {
                 // #1441: 立たなかった理由も記録する。**黙って縮退させない**
@@ -605,7 +640,27 @@ mod unix_imp {
             well_known_bytes: 0,
         };
         let listener = bind(&plan)?;
-        serve(listener, tx, token, path, None)
+        // 順番待ちの隔離の受け口も張り直すが、本体の記録・persist.log へは出さない
+        let watch = WatchConfig::from_env(SocketPathKind::Temp, false);
+        serve(listener, tx, token, path, None, watch)
+    }
+
+    /// 単体テスト用: 一時パスで、指定した間隔で見張る受け口を立てる（#2002。
+    /// env は並列のテストで共有されるので、間隔と A/B は引数で渡す）
+    #[cfg(test)]
+    pub(super) fn start_watched(
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+        interval: Option<Duration>,
+    ) -> std::io::Result<IpcServer> {
+        let plan = temp_socket_path();
+        let listener = bind(&plan)?;
+        let watch = WatchConfig {
+            interval,
+            publish: false,
+            kind: SocketPathKind::Temp,
+        };
+        serve(listener, tx, token, plan.path, None, watch)
     }
 
     /// ソケットを張る（親ディレクトリ作成 → 残骸除去 → bind → 0600）
@@ -623,41 +678,300 @@ mod unix_imp {
         Ok(listener)
     }
 
-    /// accept スレッドを立てる
+    /// いまの受け口のファイルの実体（accept スレッドが張り直しで書き、drop が読む）
+    pub(super) type SharedFileId = Arc<Mutex<Option<SocketFileId>>>;
+
+    /// 見張りの設定（#2002）
+    pub(super) struct WatchConfig {
+        /// 確かめる間隔（`None` = 見張らない = A/B の旧挙動）
+        interval: Option<Duration>,
+        /// 記録（`check_health` の `ipc.watch`）と persist.log へ出すか（本体の受け口だけ）
+        publish: bool,
+        /// persist.log へ出す置き場の種別（パスは出さない）
+        kind: SocketPathKind,
+    }
+
+    impl WatchConfig {
+        fn from_env(kind: SocketPathKind, publish: bool) -> Self {
+            WatchConfig {
+                interval: tako_core::ipc_socket::watch_interval_ms().map(Duration::from_millis),
+                publish,
+                kind,
+            }
+        }
+    }
+
+    /// パスの 1 回ぶんの見え方（`lstat` = パスの最後の要素は辿らない）
+    fn observe(path: &Path) -> PathObservation {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_socket() => PathObservation::Socket(SocketFileId {
+                dev: m.dev(),
+                ino: m.ino(),
+            }),
+            Ok(_) => PathObservation::Other,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathObservation::Missing,
+            // 読めない（権限など）= 判断できないので触らない側へ倒す
+            Err(_) => PathObservation::Other,
+        }
+    }
+
+    fn socket_id(path: &Path) -> Option<SocketFileId> {
+        match observe(path) {
+            PathObservation::Socket(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// drop がこのパスのファイルを消してよいか（#2002）。自分の実体のときだけ真。
+    /// 実体を控えられなかった受け口と A/B（`TAKO_2002_LEGACY=1`）は修正前と同じく消す
+    pub(super) fn owns_path(path: &str, file_id: &SharedFileId) -> bool {
+        if tako_core::ipc_socket::legacy_2002() {
+            return true;
+        }
+        let Some(ours) = file_id.lock().ok().and_then(|g| *g) else {
+            return true;
+        };
+        socket_id(Path::new(path)) == Some(ours)
+    }
+
+    /// 受け口が読める（接続が来た）か、時間切れまで待つ。`None` は待ち続ける
+    /// （見張らない = 修正前の accept と同じ眠り方）
+    fn wait_readable(listener: &UnixListener, timeout: Option<Duration>) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut fds = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // ミリ秒へは切り上げる（切り捨てると 1 ms 未満の残りで poll(0) が空回りする）
+        let ms = timeout.map_or(-1, |d| {
+            d.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int
+        });
+        // SAFETY: 1 要素の pollfd を渡し、listener はこの呼び出しの間生きている
+        let n = unsafe { libc::poll(&mut fds, 1, ms) };
+        if n < 0 {
+            // EINTR は時間切れと同じ扱い。それ以外の失敗で空回りしない
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                std::thread::sleep(POLL_ERROR_BACKOFF);
+            }
+            return false;
+        }
+        if n > 0 && fds.revents & libc::POLLIN == 0 {
+            // 読めないのに起きた（POLLERR / POLLNVAL。起きない想定）= 空回りで CPU を焼かない
+            std::thread::sleep(POLL_ERROR_BACKOFF);
+            return false;
+        }
+        n > 0
+    }
+
+    /// poll が失敗した・読めないのに起きたときの間（起きない想定の安全弁）
+    const POLL_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+    /// 受け口の見張り（#2002）。accept スレッドの中で回る = 張り直した listener を
+    /// そのまま次の待ちへ渡せる（別スレッドから fd を差し替えない）
+    struct Watcher {
+        path: PathBuf,
+        config: WatchConfig,
+        next: Option<Instant>,
+        file_id: SharedFileId,
+        watch: Arc<Mutex<IpcWatch>>,
+    }
+
+    impl Watcher {
+        /// 次の確認までの残り（見張らないなら `None` = 待ち続ける）
+        fn timeout(&self) -> Option<Duration> {
+            self.next
+                .map(|at| at.saturating_duration_since(Instant::now()))
+        }
+
+        /// 期限が来ていればパスを確かめ、張り直したら新しい listener を返す
+        fn tick(&mut self, stopping: &dyn Fn() -> bool) -> Option<UnixListener> {
+            let (Some(next), Some(interval)) = (self.next, self.config.interval) else {
+                return None;
+            };
+            let now = Instant::now();
+            if now < next {
+                return None;
+            }
+            self.next = Some(now + interval);
+            let ours = self.file_id.lock().ok().and_then(|g| *g);
+            let Some(ours) = ours else {
+                // bind 直後に実体を控えられなかった（起きない想定）。今の実体を控え直す
+                if let Ok(mut slot) = self.file_id.lock() {
+                    *slot = socket_id(&self.path);
+                }
+                return None;
+            };
+            let check = tako_core::ipc_socket::classify(ours, observe(&self.path), || {
+                UnixStream::connect(&self.path).is_ok()
+            });
+            let (fresh, line) = self.apply(check, stopping);
+            if self.config.publish {
+                if let Some(line) = line {
+                    crate::diag::persist_log(&line);
+                }
+                if let Ok(watch) = self.watch.lock() {
+                    tako_core::ipc_socket::record_watch(&self.path.display().to_string(), &watch);
+                }
+            }
+            fresh
+        }
+
+        /// 判定を記録へ反映し、要るなら張り直す。persist.log の 1 行は状態の変わり目だけ返す
+        /// （同じ状態が続く間は 1 行も増えない）
+        fn apply(
+            &mut self,
+            check: ListenerCheck,
+            stopping: &dyn Fn() -> bool,
+        ) -> (Option<UnixListener>, Option<String>) {
+            let Ok(mut watch) = self.watch.lock() else {
+                return (None, None);
+            };
+            watch.checks += 1;
+            let previous = watch.last.replace(check);
+            let previous_error = watch.error.take();
+            if !check.needs_rebind() {
+                let line = (previous != Some(check) && check != ListenerCheck::Ours)
+                    .then(|| format!("IPC の受け口を張り直さない（#2002）: {}", check.reason()));
+                return (None, line);
+            }
+            // 終了の最中は張り直さない（drop が閉じにかかっている）
+            if stopping() {
+                return (None, None);
+            }
+            match rebind(&self.path) {
+                Ok(listener) => {
+                    let id = socket_id(&self.path);
+                    if stopping() {
+                        // 終了と行き違った: 作ったファイルを片付けて受け口は渡さない
+                        drop(listener);
+                        if id.is_some() && socket_id(&self.path) == id {
+                            let _ = std::fs::remove_file(&self.path);
+                        }
+                        return (None, None);
+                    }
+                    if let Ok(mut slot) = self.file_id.lock() {
+                        *slot = id;
+                    }
+                    watch.rebinds += 1;
+                    watch.last = Some(ListenerCheck::Ours);
+                    watch.last_rebind = Some(Rebind {
+                        at_unix_ms: unix_ms(),
+                        reason: check,
+                    });
+                    let line = watch.rebind_log_line(check, self.config.kind);
+                    (Some(listener), Some(line))
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    let line = (previous_error.as_deref() != Some(message.as_str())).then(|| {
+                        format!(
+                            "IPC の受け口を張り直せない（#2002）: {}・{message}（次の確認でやり直す）",
+                            check.reason()
+                        )
+                    });
+                    watch.error = Some(message);
+                    (None, line)
+                }
+            }
+        }
+    }
+
+    fn unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// 同じパスへ張り直す（#2002）。起動時の [`bind`] と違い、**置き場のディレクトリは
+    /// 作り直さない**（data dir ごと片付けられた後に GUI が残っていても、消えた dir を蘇らせない）。
+    /// 判定から今までに生きた受け口が来ていたら奪わずに失敗する
+    fn rebind(path: &Path) -> std::io::Result<UnixListener> {
+        if !path.parent().is_some_and(Path::is_dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "ソケットの置き場のディレクトリが無い",
+            ));
+        }
+        if UnixStream::connect(path).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "別の受け口が同じパスで受けている",
+            ));
+        }
+        // 誰も受けない残骸を消す（消えていたなら何も無い）
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
+    }
+
+    /// 受けた 1 本を接続ごとのスレッドへ渡す
+    fn spawn_conn(stream: UnixStream, tx: &UnboundedSender<IncomingRequest>, token: &str) {
+        let tx = tx.clone();
+        let token = token.to_string();
+        let result = std::thread::Builder::new()
+            .name("tako-ipc-conn".into())
+            .spawn(move || match stream.try_clone() {
+                Ok(read_half) => conn::handle_connection(read_half, stream, &token, &tx),
+                Err(e) => tracing::warn!("IPC 接続の複製に失敗: {e}"),
+            });
+        if let Err(e) = result {
+            tracing::warn!("IPC 接続スレッドを起動できない: {e}");
+        }
+    }
+
+    /// accept スレッドを立てる。待ちは poll + 時間切れで、時間切れのたびに見張りが
+    /// パスの実体を確かめる（#2002。見張らないなら修正前と同じく接続が来るまで眠る）
     fn serve(
         listener: UnixListener,
         tx: UnboundedSender<IncomingRequest>,
         token: String,
-        path: std::path::PathBuf,
-        pointer: Option<std::path::PathBuf>,
+        path: PathBuf,
+        pointer: Option<PathBuf>,
+        config: WatchConfig,
     ) -> std::io::Result<IpcServer> {
         let accept_token = token;
         let (accept, guard) = accept_stop_pair();
+        let file_id: SharedFileId = Arc::new(Mutex::new(socket_id(&path)));
+        let interval = config.interval;
+        let watch = Arc::new(Mutex::new(IpcWatch::new(
+            interval.map_or(0, |d| d.as_millis() as u64),
+        )));
+        if config.publish && interval.is_some() {
+            if let Ok(w) = watch.lock() {
+                tako_core::ipc_socket::record_watch(&path.display().to_string(), &w);
+            }
+        }
+        let mut watcher = Watcher {
+            path: path.clone(),
+            next: interval.map(|d| Instant::now() + d),
+            config,
+            file_id: file_id.clone(),
+            watch: watch.clone(),
+        };
         std::thread::Builder::new()
             .name("tako-ipc-accept".into())
             .spawn(move || {
-                for stream in listener.incoming() {
-                    // #2136: drop が起こした（受けたのは起こすための 1 本 = 捨てて抜ける）
+                let mut listener = listener;
+                loop {
+                    let ready = wait_readable(&listener, watcher.timeout());
+                    // #2136: drop が起こした（来ているのは起こすための 1 本 = 受けずに抜ける）。
+                    // 起こせなかった（パスから切り離されていた）ときも次の時間切れで抜ける
                     if guard.stopping() {
                         break;
                     }
-                    match stream {
-                        Ok(stream) => {
-                            let tx = tx.clone();
-                            let token = accept_token.clone();
-                            let result = std::thread::Builder::new()
-                                .name("tako-ipc-conn".into())
-                                .spawn(move || match stream.try_clone() {
-                                    Ok(read_half) => {
-                                        conn::handle_connection(read_half, stream, &token, &tx)
-                                    }
-                                    Err(e) => tracing::warn!("IPC 接続の複製に失敗: {e}"),
-                                });
-                            if let Err(e) = result {
-                                tracing::warn!("IPC 接続スレッドを起動できない: {e}");
-                            }
+                    if ready {
+                        match listener.accept() {
+                            Ok((stream, _)) => spawn_conn(stream, &tx, &accept_token),
+                            Err(e) => tracing::warn!("IPC accept に失敗: {e}"),
                         }
-                        Err(e) => tracing::warn!("IPC accept に失敗: {e}"),
+                    }
+                    if let Some(fresh) = watcher.tick(&|| guard.stopping()) {
+                        // 切り離された古い受け口を閉じて、張り直した受け口で待つ
+                        listener = fresh;
                     }
                 }
                 // listener（受け口の fd）を閉じてから drop へ知らせる
@@ -669,6 +983,8 @@ mod unix_imp {
             endpoint: path.display().to_string(),
             pointer,
             accept,
+            file_id,
+            watch,
         })
     }
 }
@@ -1689,6 +2005,200 @@ mod tests {
         let after = ask(2);
         assert_eq!(after.id, 2);
         assert_eq!(after.result.expect("応答が返る")["pong"], json!(true));
+    }
+
+    // ---- #2002: 受け口の見張りと張り直し ----
+
+    /// 見張りの間隔（テストでは縮める。本番の既定は 10 秒）
+    const WATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// 張り直しを待つ上限（間隔の 60 倍。負荷の高い CI でも足りる幅）
+    const REBIND_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// 見張る受け口 + 応答する係を立てる。`interval = None` は見張らない（A/B の旧挙動）
+    fn watched_server(interval: Option<std::time::Duration>) -> IpcServer {
+        let (tx, mut rx) = unbounded::<IncomingRequest>();
+        let server = unix_imp::start_watched(tx, TEST_TOKEN.into(), interval)
+            .expect("IPC サーバーを起動できる");
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(Ok(json!({ "pong": true })));
+            }
+        });
+        server
+    }
+
+    /// 1 往復できるか（繋げない・応答が無ければ偽）
+    fn ping(endpoint: &str) -> bool {
+        let Ok(stream) = UnixStream::connect(endpoint) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let Ok(mut writer) = stream.try_clone() else {
+            return false;
+        };
+        let envelope = RequestEnvelope::new(1, TEST_TOKEN.to_string(), Request::List);
+        if writeln!(writer, "{}", serde_json::to_string(&envelope).unwrap()).is_err() {
+            return false;
+        }
+        let mut line = String::new();
+        if BufReader::new(stream).read_line(&mut line).is_err() {
+            return false;
+        }
+        serde_json::from_str::<ResponseEnvelope>(&line)
+            .ok()
+            .and_then(|r| r.result)
+            .is_some_and(|v| v["pong"] == json!(true))
+    }
+
+    /// 上限まで 1 往復を試し続ける。通るまでの時間を返す（通らなければ `None`）
+    fn wait_ping(endpoint: &str, limit: std::time::Duration) -> Option<std::time::Duration> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < limit {
+            if ping(endpoint) {
+                return Some(started.elapsed());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    fn file_id(path: &str) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    }
+
+    /// 同じパスへ別の受け口を張って閉じる（ファイルは残る = 落ちたプロセスの残骸の形）
+    fn leave_dead_socket(path: &str) -> (u64, u64) {
+        std::fs::remove_file(path).expect("ソケットファイルを消せる");
+        drop(std::os::unix::net::UnixListener::bind(path).expect("同じパスへ張れる"));
+        file_id(path).expect("残骸が残る")
+    }
+
+    #[test]
+    fn issue2002_ソケットファイルを消されたら張り直して繋がる() {
+        let server = watched_server(Some(WATCH_EVERY));
+        let endpoint = server.endpoint().to_string();
+        assert!(ping(&endpoint), "張った直後に往復できない");
+        std::fs::remove_file(&endpoint).unwrap();
+        let took = wait_ping(&endpoint, REBIND_WAIT);
+        let watch = server.watch_snapshot();
+        assert!(
+            took.is_some(),
+            "ソケットファイルを消されたまま {REBIND_WAIT:?} 張り直さない（#2002。見張り: {watch:?}）"
+        );
+        assert_eq!(watch.rebinds, 1, "{watch:?}");
+        assert_eq!(
+            watch.last_rebind.as_ref().map(|r| r.reason),
+            Some(tako_core::ipc_socket::ListenerCheck::Missing),
+            "{watch:?}"
+        );
+        println!("#2002 消された受け口の張り直し: {took:?}");
+    }
+
+    #[test]
+    fn issue2002_誰も受けない残骸に置き換えられたら張り直す() {
+        let server = watched_server(Some(WATCH_EVERY));
+        let endpoint = server.endpoint().to_string();
+        let dead = leave_dead_socket(&endpoint);
+        // 修正前の症状: ファイルはあるのに refused
+        let refused = UnixStream::connect(&endpoint).map(|_| ()).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        let took = wait_ping(&endpoint, REBIND_WAIT);
+        let watch = server.watch_snapshot();
+        assert!(
+            took.is_some(),
+            "誰も受けない残骸に置き換わったまま {REBIND_WAIT:?} 張り直さない（#2002。見張り: {watch:?}）"
+        );
+        assert_eq!(
+            watch.last_rebind.as_ref().map(|r| r.reason),
+            Some(tako_core::ipc_socket::ListenerCheck::ReplacedDead),
+            "{watch:?}"
+        );
+        assert_ne!(file_id(&endpoint), Some(dead), "残骸のまま");
+        println!("#2002 残骸からの張り直し: {took:?}");
+    }
+
+    #[test]
+    fn issue2002_生きた別の受け口からは奪わずそれが消えたら張り直す() {
+        let server = watched_server(Some(WATCH_EVERY));
+        let endpoint = server.endpoint().to_string();
+        std::fs::remove_file(&endpoint).unwrap();
+        let foreign = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        let foreign_id = file_id(&endpoint);
+        // 何回も確かめる間を置く（間隔の 10 倍）
+        std::thread::sleep(WATCH_EVERY * 10);
+        let watch = server.watch_snapshot();
+        assert_eq!(watch.rebinds, 0, "生きた別の受け口から奪った: {watch:?}");
+        assert_eq!(
+            watch.last,
+            Some(tako_core::ipc_socket::ListenerCheck::ForeignLive),
+            "{watch:?}"
+        );
+        assert_eq!(file_id(&endpoint), foreign_id, "相手のファイルを触った");
+        // 相手が後始末して去ったら張り直す
+        drop(foreign);
+        std::fs::remove_file(&endpoint).unwrap();
+        assert!(
+            wait_ping(&endpoint, REBIND_WAIT).is_some(),
+            "相手が去った後に張り直さない: {:?}",
+            server.watch_snapshot()
+        );
+    }
+
+    #[test]
+    fn issue2002_dropは奪われたパスのファイルを消さない() {
+        let server = watched_server(Some(WATCH_EVERY));
+        let endpoint = server.endpoint().to_string();
+        std::fs::remove_file(&endpoint).unwrap();
+        let foreign = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        let foreign_id = file_id(&endpoint);
+        drop(server);
+        assert_eq!(
+            file_id(&endpoint),
+            foreign_id,
+            "終了のついでに別の受け口のソケットファイルを消した（#2002）"
+        );
+        assert!(
+            UnixStream::connect(&endpoint).is_ok(),
+            "別の受け口が繋がらなくなった"
+        );
+        drop(foreign);
+        let _ = std::fs::remove_file(&endpoint);
+    }
+
+    /// A/B: 見張らない（`TAKO_2002_LEGACY=1` と同じ）と、消されたまま戻らない = 修正前の症状
+    #[test]
+    fn issue2002_見張らなければ張り直さない() {
+        let server = watched_server(None);
+        let endpoint = server.endpoint().to_string();
+        let _dead = leave_dead_socket(&endpoint);
+        std::thread::sleep(WATCH_EVERY * 10);
+        assert!(!ping(&endpoint), "見張っていないのに戻った");
+        let watch = server.watch_snapshot();
+        assert_eq!((watch.checks, watch.rebinds), (0, 0), "{watch:?}");
+        drop(server);
+        // 旧挙動の drop は実体を確かめずに消すので、ここでは自分で片付ける
+        let _ = std::fs::remove_file(&endpoint);
+    }
+
+    /// 正常な間は張り直さない（誤検知で受け口を壊さない）
+    #[test]
+    fn issue2002_正常な間は張り直さない() {
+        let server = watched_server(Some(WATCH_EVERY));
+        let endpoint = server.endpoint().to_string();
+        let before = file_id(&endpoint);
+        for _ in 0..10 {
+            assert!(ping(&endpoint));
+            std::thread::sleep(WATCH_EVERY);
+        }
+        let watch = server.watch_snapshot();
+        assert!(watch.checks >= 3, "見張りが回っていない: {watch:?}");
+        assert_eq!(watch.rebinds, 0, "正常な受け口を張り直した: {watch:?}");
+        assert_eq!(file_id(&endpoint), before);
+        assert!(watch.healthy(), "{watch:?}");
     }
 }
 

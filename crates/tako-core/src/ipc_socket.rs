@@ -320,6 +320,210 @@ pub fn reset_status_for_test() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 受け口の見張り（#2002）
+//
+// 直した症状: GUI は生きていて accept スレッドも accept で待っているのに、CLI / MCP が
+// `Connection refused` のまま戻らなかった（2026-10-12 の本番）。段 1 の切り分けで
+// 再現したのは「同じパスへ別の受け口が作り直し、その受け口が後から消えた」形 = GUI の
+// 受け口の fd はパスから切り離され、パスには誰も受けない残骸だけが残る。GUI 自身は
+// 何も気づかないので、再起動するまで戻らない。
+//
+// いまは accept スレッドが間隔ごとにパスの実体（dev / ino）を bind した時の値と比べ、
+// 消えていた・誰も受けない別の実体に替わっていたら同じパスへ張り直す。
+// 判定は [`classify`] の 1 実装（IO は tako-control::ipc が持つ）。
+// ---------------------------------------------------------------------------
+
+/// 確かめる間隔の既定（#2002）。正常な間は時間切れのたびに `lstat` を 1 回打つだけ
+/// （接続は作らない）ので、CPU / 電力の上で測れる差にならない
+pub const WATCH_INTERVAL_MS_DEFAULT: u64 = 10_000;
+
+/// 間隔の下限（`TAKO_IPC_WATCH_MS` で縮めても、これより短い周期にはしない）
+pub const WATCH_INTERVAL_MS_MIN: u64 = 50;
+
+/// #2002 の A/B。`TAKO_2002_LEGACY=1` で受け口を見張らない（修正前 = パスから切り離されても
+/// accept で待ち続け、終了時はパスの実体を確かめずに消す）。CLI の届かないときの診断も
+/// 修正前の表示へ戻す（両側が同じ env を読む）
+pub fn legacy_2002() -> bool {
+    std::env::var("TAKO_2002_LEGACY").is_ok_and(|v| !v.is_empty())
+}
+
+/// 見張る間隔。`None` = 見張らない（A/B の旧挙動）。
+/// `TAKO_IPC_WATCH_MS` は検証で縮めるための口（既定 [`WATCH_INTERVAL_MS_DEFAULT`]）
+pub fn watch_interval_ms() -> Option<u64> {
+    if legacy_2002() {
+        return None;
+    }
+    let ms = std::env::var("TAKO_IPC_WATCH_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(WATCH_INTERVAL_MS_DEFAULT);
+    Some(ms.max(WATCH_INTERVAL_MS_MIN))
+}
+
+/// ソケットファイルの実体（`lstat` の dev / ino）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketFileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// パスの 1 回ぶんの見え方（IO は呼び出し側）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathObservation {
+    /// ファイルが無い
+    Missing,
+    /// ソケットファイルがある
+    Socket(SocketFileId),
+    /// ソケットではないファイルがある（または読めない）
+    Other,
+}
+
+/// 見張りの 1 回の判定（#2002）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerCheck {
+    /// パスが自分の受け口を指している（何もしない）
+    Ours,
+    /// ファイルが消えていた → 張り直す
+    Missing,
+    /// 別の実体に替わり、誰も受けていない（落ちたプロセスの残骸）→ 消して張り直す
+    ReplacedDead,
+    /// 別の実体に替わり、生きた受け口が居る → 奪わない（消えたら次の確認で張り直す）
+    ForeignLive,
+    /// ソケットではないファイルが置かれた → 触らない
+    NotSocket,
+}
+
+impl ListenerCheck {
+    /// 機械キー（`check_health` の `ipc.watch`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListenerCheck::Ours => "ok",
+            ListenerCheck::Missing => "missing",
+            ListenerCheck::ReplacedDead => "replaced_dead",
+            ListenerCheck::ForeignLive => "foreign_live",
+            ListenerCheck::NotSocket => "not_socket",
+        }
+    }
+
+    /// 張り直すか
+    pub fn needs_rebind(self) -> bool {
+        matches!(self, ListenerCheck::Missing | ListenerCheck::ReplacedDead)
+    }
+
+    /// 人が読む理由（persist.log・check-health）
+    pub fn reason(self) -> &'static str {
+        match self {
+            ListenerCheck::Ours => "受け口はパスに繋がっている",
+            ListenerCheck::Missing => "ソケットファイルが消えていた",
+            ListenerCheck::ReplacedDead => {
+                "ソケットファイルが別の実体に置き換わり、誰も受けていなかった"
+            }
+            ListenerCheck::ForeignLive => {
+                "ソケットファイルが別の受け口に置き換わっている（生きているので奪わずに待つ）"
+            }
+            ListenerCheck::NotSocket => {
+                "ソケットのパスにソケットではないファイルがある（触らずに待つ）"
+            }
+        }
+    }
+}
+
+/// パスの見え方から判定する（**判定の 1 実装**）。`foreign_alive` は別の実体に
+/// 替わっていたときだけ呼ぶ（そのパスへ 1 本繋いで生きた受け口かを確かめる係）
+pub fn classify(
+    ours: SocketFileId,
+    seen: PathObservation,
+    foreign_alive: impl FnOnce() -> bool,
+) -> ListenerCheck {
+    match seen {
+        PathObservation::Socket(id) if id == ours => ListenerCheck::Ours,
+        PathObservation::Missing => ListenerCheck::Missing,
+        PathObservation::Other => ListenerCheck::NotSocket,
+        PathObservation::Socket(_) => {
+            if foreign_alive() {
+                ListenerCheck::ForeignLive
+            } else {
+                ListenerCheck::ReplacedDead
+            }
+        }
+    }
+}
+
+/// 最後に張り直した記録
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebind {
+    /// 張り直した時刻（UNIX ミリ秒）
+    pub at_unix_ms: u64,
+    pub reason: ListenerCheck,
+}
+
+/// 受け口の見張りの記録（`check_health` の `ipc.watch`）
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IpcWatch {
+    /// 確かめる間隔（ミリ秒）
+    pub interval_ms: u64,
+    /// 確かめた回数
+    pub checks: u64,
+    /// 張り直した回数
+    pub rebinds: u64,
+    /// 最後の判定（まだ確かめていなければ `None`）
+    pub last: Option<ListenerCheck>,
+    pub last_rebind: Option<Rebind>,
+    /// 張り直しに失敗した理由（次の成功で消える）
+    pub error: Option<String>,
+}
+
+impl IpcWatch {
+    pub fn new(interval_ms: u64) -> Self {
+        IpcWatch {
+            interval_ms,
+            ..IpcWatch::default()
+        }
+    }
+
+    /// 正常か（張り直した後に戻っていれば正常）
+    pub fn healthy(&self) -> bool {
+        self.error.is_none()
+            && !matches!(
+                self.last,
+                Some(ListenerCheck::ForeignLive | ListenerCheck::NotSocket)
+            )
+    }
+
+    /// 張り直した 1 行（persist.log。**パスは載せない** = 種別と回数だけ）
+    pub fn rebind_log_line(&self, reason: ListenerCheck, kind: SocketPathKind) -> String {
+        format!(
+            "IPC の受け口を張り直した（#2002）: {}・kind={}・張り直し {} 回目",
+            reason.reason(),
+            kind.as_str(),
+            self.rebinds,
+        )
+    }
+}
+
+/// 見張りの記録（[`STATUS`] に載った受け口の分だけ）
+static WATCH: std::sync::Mutex<Option<IpcWatch>> = std::sync::Mutex::new(None);
+
+/// 見張りの記録を置く。**[`status`] の受け口と同じ endpoint のときだけ**置く
+/// （後発ウィンドウの一時パス・順番待ちの受け口の見張りで本体の記録を上書きしない）
+pub fn record_watch(endpoint: &str, watch: &IpcWatch) {
+    let recorded = status()
+        .and_then(|s| s.endpoint)
+        .is_some_and(|e| e == endpoint);
+    if !recorded {
+        return;
+    }
+    if let Ok(mut slot) = WATCH.lock() {
+        *slot = Some(watch.clone());
+    }
+}
+
+/// 見張りの記録（見張っていなければ `None`）
+pub fn watch() -> Option<IpcWatch> {
+    WATCH.lock().ok().and_then(|s| s.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +670,62 @@ mod tests {
             "後発ウィンドウの一時パスで成功を上書きしない"
         );
         reset_status_for_test();
+    }
+
+    const OURS: SocketFileId = SocketFileId { dev: 1, ino: 100 };
+
+    #[test]
+    fn issue2002_同じ実体なら何もしない() {
+        let check = classify(OURS, PathObservation::Socket(OURS), || {
+            panic!("自分の実体なら繋いで確かめない")
+        });
+        assert_eq!(check, ListenerCheck::Ours);
+        assert!(!check.needs_rebind());
+    }
+
+    #[test]
+    fn issue2002_消えていたら張り直す() {
+        let check = classify(OURS, PathObservation::Missing, || {
+            panic!("無いパスへは繋がない")
+        });
+        assert_eq!(check, ListenerCheck::Missing);
+        assert!(check.needs_rebind());
+    }
+
+    #[test]
+    fn issue2002_誰も受けない別の実体なら張り直し生きていれば奪わない() {
+        let other = PathObservation::Socket(SocketFileId { dev: 1, ino: 101 });
+        let dead = classify(OURS, other, || false);
+        assert_eq!(dead, ListenerCheck::ReplacedDead);
+        assert!(dead.needs_rebind());
+        let live = classify(OURS, other, || true);
+        assert_eq!(live, ListenerCheck::ForeignLive);
+        assert!(!live.needs_rebind(), "生きた別の受け口から奪わない");
+        // dev が違えば ino が同じでも別の実体
+        let other_dev = PathObservation::Socket(SocketFileId { dev: 2, ino: 100 });
+        assert_eq!(
+            classify(OURS, other_dev, || false),
+            ListenerCheck::ReplacedDead
+        );
+    }
+
+    #[test]
+    fn issue2002_ソケットではないファイルには触らない() {
+        let check = classify(OURS, PathObservation::Other, || panic!("繋がない"));
+        assert_eq!(check, ListenerCheck::NotSocket);
+        assert!(!check.needs_rebind());
+    }
+
+    #[test]
+    fn issue2002_張り直しの1行はパスを載せない() {
+        let mut watch = IpcWatch::new(10_000);
+        watch.rebinds = 1;
+        let line = watch.rebind_log_line(ListenerCheck::ReplacedDead, SocketPathKind::WellKnown);
+        assert!(line.contains("張り直し 1 回目"), "{line}");
+        assert!(line.contains("kind=well_known"), "{line}");
+        assert!(!line.contains('/'), "パスを載せている: {line}");
+        assert!(watch.healthy());
+        watch.last = Some(ListenerCheck::ForeignLive);
+        assert!(!watch.healthy(), "奪われたまま = 正常ではない");
     }
 }
