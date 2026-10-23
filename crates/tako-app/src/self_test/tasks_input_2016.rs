@@ -296,6 +296,16 @@ fn median(v: &mut [f64]) -> f64 {
     v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
+/// 項目 `target` のやりとりの件数（一覧の写しから読む）
+fn responses_in(app: &TakoApp, target: &str) -> usize {
+    app.user_tasks
+        .snapshot
+        .tasks
+        .iter()
+        .find(|t| t.id == target)
+        .map_or(0, |t| t.responses.len())
+}
+
 fn todo_request(action: &str, id: Option<String>) -> tako_control::protocol::Request {
     tako_control::protocol::Request::UserTask {
         action: action.to_string(),
@@ -863,12 +873,23 @@ pub(super) async fn tasks_input_visual(
         app.user_tasks.decision = Some("answered".to_string());
         app.user_task_respond(&target, cx);
     });
-    for _ in 0..400 {
-        if responses_of(cx) > before {
-            break;
-        }
-        wait(cx, 5).await;
-    }
+    // 積む → 運ぶ → 記録 → 読み直しを状態で待つ（#1902。旧は 400 回 × 5ms の回数の窓）
+    let _ = wait_for_background_state(
+        any,
+        window,
+        cx,
+        "tasks-input-bare",
+        text_wait_budget(400, 5, 30),
+        false,
+        |app| {
+            if responses_in(app, &target) > before {
+                BackgroundWait::Landed
+            } else {
+                BackgroundWait::Running
+            }
+        },
+    )
+    .await;
     let bare_ok = responses_of(cx) == before + 1;
     // (b) 送信中にパネルを閉じる（落ちない・閉じたままでも積まれる・開けば読める）
     let before = responses_of(cx);
@@ -890,16 +911,7 @@ pub(super) async fn tasks_input_visual(
         );
         cx.notify();
     });
-    for _ in 0..400 {
-        let sending = window
-            .update(cx, |app, _, _| app.user_tasks.sending.len())
-            .unwrap_or(0);
-        if sending == 0 {
-            break;
-        }
-        notify_and_draw(any, window, cx);
-        wait(cx, 5).await;
-    }
+    let _ = wait_user_tasks_sent(any, window, cx, "tasks-input-closed", (400, 5), true).await;
     let _ = window.update(cx, |app, _, cx| {
         let _ = tako_control::dispatch(
             app,
@@ -927,15 +939,7 @@ pub(super) async fn tasks_input_visual(
             app.user_task_respond(&target, cx);
         }
     });
-    for _ in 0..600 {
-        let sending = window
-            .update(cx, |app, _, _| app.user_tasks.sending.len())
-            .unwrap_or(0);
-        if sending == 0 {
-            break;
-        }
-        wait(cx, 5).await;
-    }
+    let _ = wait_user_tasks_sent(any, window, cx, "tasks-input-burst", (600, 5), false).await;
     let burst: Vec<String> = window
         .update(cx, |app, _, _| {
             app.user_tasks
@@ -969,15 +973,7 @@ pub(super) async fn tasks_input_visual(
             app.user_task_respond(&target, cx);
         });
         let cleared_at_once = comment(cx).is_empty();
-        for _ in 0..400 {
-            let sending = window
-                .update(cx, |app, _, _| app.user_tasks.sending.len())
-                .unwrap_or(0);
-            if sending == 0 {
-                break;
-            }
-            wait(cx, 5).await;
-        }
+        let _ = wait_user_tasks_sent(any, window, cx, "tasks-input-restore", (400, 5), false).await;
         let (back, decision, notice) = window
             .update(cx, |app, _, _| {
                 (
