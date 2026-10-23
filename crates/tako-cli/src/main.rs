@@ -7998,7 +7998,71 @@ fn local_ipc_report() -> Value {
         "connect_ok": exists && tako_control::discovery::socket_alive(&socket.to_string_lossy()),
         "pointer": tako_core::ipc_socket::read_pointer(&data_dir)
             .map(|p| p.display().to_string()),
+        // #2002: 届かないのは GUI が居ないからか、居るのに受け口が応答しないからか
+        "gui": (!tako_core::ipc_socket::legacy_2002()).then(local_gui_report).flatten(),
     })
+}
+
+/// 接続情報ファイルの GUI が生きているか・その受け口へ繋がるか（#2002）。
+/// 接続情報ファイルが無ければ `None`（GUI を起動したことが無い・片付けられた）
+fn local_gui_report() -> Option<Value> {
+    let info = tako_control::discovery::read()?;
+    let alive = if cfg!(target_os = "macos") {
+        tako_core::ports::is_live_tako_app(info.pid)
+    } else {
+        tako_core::platform::process::pid_alive(info.pid)
+    };
+    let (connect, error) = probe_socket(&info.socket);
+    let state = match (alive, connect) {
+        (false, _) => "not_running",
+        (true, "ok") => "reachable",
+        (true, _) => "alive_unreachable",
+    };
+    let next = match state {
+        "not_running" => Some("tako を起動する".to_string()),
+        "alive_unreachable" => Some(format!(
+            "tako は受け口を {} 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。\
+             戻らなければ tako を再起動する（#2002）",
+            tako_core::ipc_socket::WATCH_INTERVAL_MS_DEFAULT / 1000
+        )),
+        _ => None,
+    };
+    Some(serde_json::json!({
+        "pid": info.pid,
+        "alive": alive,
+        "socket": info.socket,
+        "connect": connect,
+        "connect_error": error,
+        "state": state,
+        "next": next,
+    }))
+}
+
+/// 受け口へ 1 本繋いでみる（認証はしない）。`ok` / `refused`（ファイルはあるが誰も受けない）/
+/// `missing`（ファイルが無い）/ `error`
+fn probe_socket(socket: &str) -> (&'static str, Option<String>) {
+    #[cfg(unix)]
+    {
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(_) => ("ok", None),
+            Err(e) => (
+                match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused => "refused",
+                    std::io::ErrorKind::NotFound => "missing",
+                    _ => "error",
+                },
+                Some(e.to_string()),
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tako_control::discovery::socket_alive(socket) {
+            ("ok", None)
+        } else {
+            ("error", None)
+        }
+    }
 }
 
 /// 人が読む要約（`--json` 無しのとき）
@@ -8078,6 +8142,64 @@ fn print_ipc_section(ipc: &Value) {
     if let Some(error) = ipc["error"].as_str() {
         println!("  理由: {error}");
     }
+    for line in ipc_recovery_lines(ipc) {
+        println!("{line}");
+    }
+}
+
+/// `ipc` 節の #2002 の行（GUI 側の見張り・届かないときの GUI の生死と次の一手）。
+/// 行を組むだけにしてある（単体テストが字面を固定する）
+fn ipc_recovery_lines(ipc: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    // GUI 側の見張り（届いたときだけある）
+    let watch = &ipc["watch"];
+    if watch.is_object() {
+        let mut line = format!(
+            "  見張り: {} 秒ごと・確認 {} 回・張り直し {} 回",
+            watch["interval_ms"].as_u64().unwrap_or(0) / 1000,
+            watch["checks"].as_u64().unwrap_or(0),
+            watch["rebinds"].as_u64().unwrap_or(0),
+        );
+        if let Some(last) = watch["last_rebind"].as_object() {
+            line.push_str(&format!(
+                "（最後: {} 秒前・{}）",
+                last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
+                last.get("reason_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+            ));
+        }
+        lines.push(line);
+        if let Some(error) = watch["error"].as_str() {
+            lines.push(format!("  張り直せない理由: {error}"));
+        }
+    }
+    // 届かないときの GUI の生死（届かない原因と次の一手を分ける）
+    let gui = &ipc["gui"];
+    if gui.is_object() {
+        let pid = gui["pid"].as_u64().unwrap_or(0);
+        match gui["state"].as_str() {
+            Some("alive_unreachable") => lines.push(format!(
+                "  GUI: 動いている（pid {pid}）のに受け口が応答しない（{}）",
+                match gui["connect"].as_str() {
+                    Some("refused") => "ソケットファイルはあるが誰も受けていない",
+                    Some("missing") => "ソケットファイルが無い",
+                    _ => gui["connect_error"].as_str().unwrap_or("繋がらない"),
+                }
+            )),
+            Some("not_running") => lines.push(format!(
+                "  GUI: 動いていない（接続情報の pid {pid} は居ない）"
+            )),
+            Some("reachable") => lines.push(format!(
+                "  GUI: 動いている（pid {pid}）・受け口にも繋がる（届かない理由は「接続:」の行）"
+            )),
+            _ => {}
+        }
+        if let Some(next) = gui["next"].as_str() {
+            lines.push(format!("  次の一手: {next}"));
+        }
+    }
+    lines
 }
 
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
@@ -13583,6 +13705,59 @@ mod tests {
     fn 引数定義が壊れていない() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// #2002: 届かないとき、GUI が生きているのに受け口が応答しないなら、そう言って次の一手を出す
+    #[test]
+    fn issue2002_生きたguiの受け口が応答しないと区別して次の一手を出す() {
+        let ipc = serde_json::json!({
+            "gui": {
+                "pid": 42,
+                "alive": true,
+                "connect": "refused",
+                "state": "alive_unreachable",
+                "next": "tako は受け口を 10 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2002）",
+            }
+        });
+        let lines = ipc_recovery_lines(&ipc);
+        assert_eq!(
+            lines,
+            [
+                "  GUI: 動いている（pid 42）のに受け口が応答しない（ソケットファイルはあるが誰も受けていない）",
+                "  次の一手: tako は受け口を 10 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2002）",
+            ]
+        );
+        // GUI が居ないなら起動を案内する（区別できている）
+        let down = serde_json::json!({
+            "gui": { "pid": 42, "alive": false, "connect": "refused", "state": "not_running", "next": "tako を起動する" }
+        });
+        assert_eq!(
+            ipc_recovery_lines(&down),
+            [
+                "  GUI: 動いていない（接続情報の pid 42 は居ない）",
+                "  次の一手: tako を起動する",
+            ]
+        );
+        // A/B（`gui` 節が無い = 修正前）では何も足さない
+        assert!(ipc_recovery_lines(&serde_json::json!({ "gui": null })).is_empty());
+    }
+
+    /// #2002: 届いたときは GUI 側の見張りと最後の張り直しを 1 行で出す
+    #[test]
+    fn issue2002_見張りの記録を1行で出す() {
+        let ipc = serde_json::json!({
+            "watch": {
+                "interval_ms": 10_000,
+                "checks": 7,
+                "rebinds": 1,
+                "last_rebind": { "secs_ago": 3, "reason_text": "ソケットファイルが消えていた" },
+                "error": null,
+            }
+        });
+        assert_eq!(
+            ipc_recovery_lines(&ipc),
+            ["  見張り: 10 秒ごと・確認 7 回・張り直し 1 回（最後: 3 秒前・ソケットファイルが消えていた）"]
+        );
     }
 
     /// #1962: mod の帯のボタン（tako の操作 9 つと shell）が叩く引数を、この CLI が要求へ組める

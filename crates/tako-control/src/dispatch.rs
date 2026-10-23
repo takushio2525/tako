@@ -19127,6 +19127,13 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     if let Some(issue) = ipc.as_ref().and_then(ipc_health_issue) {
         issues.push(issue);
     }
+    // #2002: 立った後にパスから切り離されたまま（奪われている・張り直せない）
+    if let Some(issue) = tako_core::ipc_socket::watch()
+        .as_ref()
+        .and_then(ipc_watch_issue)
+    {
+        issues.push(issue);
+    }
 
     // ペインの文字コード固定（#2092。Windows だけ記録を持つ）。諦めたペインは
     // UTF-8 のバイト列で書く子の出力が化けるので、ペインを名指しで申告する
@@ -19230,7 +19237,62 @@ fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus) -> Value {
         "limit": status.limit,
         "well_known_bytes": status.well_known_bytes,
         "error": status.error,
+        // #2002: 受け口の見張り（null = 見張っていない = windows / A/B）
+        "watch": tako_core::ipc_socket::watch().as_ref().map(|w| ipc_watch_describe(w, unix_ms_now())),
     })
+}
+
+/// `ipc.watch` 節（#2002）。`state` はいまの判定（`ok` / `foreign_live` / `not_socket` /
+/// 張り直しに失敗したままなら `missing` / `replaced_dead`）、`last_rebind` は最後に張り直した記録
+fn ipc_watch_describe(watch: &tako_core::ipc_socket::IpcWatch, now_ms: u64) -> Value {
+    json!({
+        "interval_ms": watch.interval_ms,
+        "checks": watch.checks,
+        "rebinds": watch.rebinds,
+        "state": watch.last.map(|c| c.as_str()),
+        "healthy": watch.healthy(),
+        "last_rebind": watch.last_rebind.as_ref().map(|r| json!({
+            "reason": r.reason.as_str(),
+            "reason_text": r.reason.reason(),
+            "at_unix_ms": r.at_unix_ms,
+            "secs_ago": now_ms.saturating_sub(r.at_unix_ms) / 1000,
+        })),
+        "error": watch.error,
+    })
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 見張りが「パスが自分の受け口を指していない」と見たままのときの申告（#2002）。
+/// 張り直せた・正常なら黙る
+fn ipc_watch_issue(watch: &tako_core::ipc_socket::IpcWatch) -> Option<Value> {
+    if watch.healthy() {
+        return None;
+    }
+    let reason = watch.last.map(|c| c.reason()).unwrap_or("理由不明");
+    let message = match &watch.error {
+        Some(error) => format!(
+            "IPC の受け口がソケットのパスから切り離されている（tako CLI / MCP の stdio は届かない）: \
+             {reason}・張り直せない（{error}）。{} 秒ごとにやり直す。戻らなければ tako を再起動する（#2002）",
+            watch.interval_ms / 1000,
+        ),
+        None => format!(
+            "IPC の受け口がソケットのパスから切り離されている（tako CLI / MCP の stdio は届かない）: \
+             {reason}。同じデータディレクトリで別の tako が動いていないか確かめる。\
+             そのファイルが消えれば {} 秒以内に張り直す（#2002）",
+            watch.interval_ms / 1000,
+        ),
+    };
+    Some(json!({
+        "level": "warning",
+        "check": "ipc",
+        "message": message,
+    }))
 }
 
 /// `check_health` の `encoding_pin` 節（#2092）。記録（UI スレッドで採った写し）に、
@@ -53078,5 +53140,55 @@ mod tests {
         assert_eq!(empty["needed"], cfg!(windows));
         assert_eq!(empty["panes"], json!([]));
         assert!(encoding_pin_issues(&[]).is_empty());
+    }
+}
+
+/// #2002: `check_health` の `ipc.watch` 節と、切り離されたままのときの申告
+#[cfg(test)]
+mod issue2002_tests {
+    use super::*;
+    use tako_core::ipc_socket::{IpcWatch, ListenerCheck, Rebind};
+
+    #[test]
+    fn 張り直した後は正常と読み理由と経過秒を出す() {
+        let mut watch = IpcWatch::new(10_000);
+        watch.checks = 5;
+        watch.rebinds = 1;
+        watch.last = Some(ListenerCheck::Ours);
+        watch.last_rebind = Some(Rebind {
+            at_unix_ms: 1_000_000,
+            reason: ListenerCheck::ReplacedDead,
+        });
+        let v = ipc_watch_describe(&watch, 1_007_500);
+        assert_eq!(v["state"], json!("ok"));
+        assert_eq!(v["healthy"], json!(true));
+        assert_eq!(v["rebinds"], json!(1));
+        assert_eq!(v["last_rebind"]["reason"], json!("replaced_dead"));
+        assert_eq!(v["last_rebind"]["secs_ago"], json!(7));
+        assert!(ipc_watch_issue(&watch).is_none(), "戻ったら申告しない");
+    }
+
+    #[test]
+    fn 奪われたまま_張り直せないままなら申告する() {
+        let mut foreign = IpcWatch::new(10_000);
+        foreign.last = Some(ListenerCheck::ForeignLive);
+        let issue = ipc_watch_issue(&foreign).expect("奪われたままは申告する");
+        assert_eq!(issue["check"], json!("ipc"));
+        assert_eq!(issue["level"], json!("warning"));
+        let message = issue["message"].as_str().unwrap();
+        assert!(message.contains("別の tako が動いていないか"), "{message}");
+
+        let mut failed = IpcWatch::new(10_000);
+        failed.last = Some(ListenerCheck::Missing);
+        failed.error = Some("ソケットの置き場のディレクトリが無い".into());
+        let message = ipc_watch_issue(&failed).expect("張り直せないままは申告する")["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("張り直せない（ソケットの置き場のディレクトリが無い）"),
+            "{message}"
+        );
+        assert!(message.contains("10 秒ごとにやり直す"), "{message}");
     }
 }

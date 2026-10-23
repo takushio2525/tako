@@ -4578,6 +4578,13 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   `kind` / `path_bytes` / `limit`）で読める。**アプリへ届かないときもローカル診断が出る**
   ので、`tako list` が「接続情報が無い」と言ったら `tako check-health` を打つ。
   置き場の決め方は `tako_core::ipc_socket` の 1 実装（A/B は `TAKO_1441_LEGACY=1`）
+- **隔離 GUI のソケットを消す・差し替える検証は、GUI が 10 秒以内に張り直す前提で書く**（#2002）。
+  GUI は accept スレッドの時間切れごとにパスの実体を確かめ、消えていた・誰も受けない別の
+  実体に替わっていたら同じパスへ張り直す（persist.log に `IPC の受け口を張り直した（#2002）`）。
+  「消したら繋がらない」を保ちたい検証は `TAKO_2002_LEGACY=1`、張り直しを速く見たい検証は
+  `TAKO_IPC_WATCH_MS=<ミリ秒>`（下限 50）を `launch_isolated_gui` に並べる。生きた別の受け口が
+  パスを握っている間は奪わない（`ipc.watch.state = foreign_live`）。**本番の `tako.sock` で
+  試さない**。注入の形と A/B は `scripts/test-ipc-listener-recover-2002.sh`
 - **面を指定するのは `TAKO_DISPLAY=<名前 | UUID | index>`**。`TAKO_ISOLATED` /
   `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST` のどれかが立っていれば**未指定でも** `tako-vd` を狙う
 - **名前が読めない瞬間がある**（#1697）。名前の出どころ（`system_profiler`）が読めない起動では
