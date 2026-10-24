@@ -72,6 +72,7 @@ my @all = (
     [ 'osc4_1',   "\e]4;1;?\a" ],
     [ 'osc4_200', "\e]4;200;?\a" ],
     [ 'osc11st',  "\e]11;?\e\\" ],
+    [ 'dsr996',   "\e[?996n" ],
     [ 'osc52',    "\e]52;c;?\a" ],
     [ 'osc4_bad', "\e]4;999;?\a" ],
     [ 'osc11_bad', "\e]11;nope\a" ],
@@ -178,15 +179,39 @@ theme_rgb() {
     print "rgb:$r$r/$g$g/$b$b";' "$1"
 }
 health_json() { "$TAKO_BIN" check-health --json 2>/dev/null; }
-# check-health の terminal_queries の値を 1 つ読む（例: answered.osc11 / legacy）
+# check-health の terminal_queries の値を 1 つ読む。`legacy` / `color_scheme_panes` のような節の値か、
+# `osc11.answered` / `osc52_read.by` のような種類ごとの値（kinds[] の kind で引く）
 tq_field() {
   perl -MJSON::PP -0e '
+    binmode STDOUT, ":encoding(UTF-8)";
     my $j = eval { decode_json(<STDIN>) } or do { print "unreadable"; exit };
-    my $v = $j->{terminal_queries};
-    for my $k (split /\./, $ARGV[0]) { $v = ref $v eq "HASH" ? $v->{$k} : undef }
+    my $t = $j->{terminal_queries} // do { print "null"; exit };
+    my ($head, @rest) = split /\./, $ARGV[0];
+    my ($row) = grep { $_->{kind} eq $head } @{ $t->{kinds} // [] };
+    my $v = $row ? $row : $t->{$head};
+    for my $k (@rest) { $v = ref $v eq "HASH" ? $v->{$k} : undef }
     print !defined $v ? "null"
       : JSON::PP::is_bool($v) ? ($v ? 1 : 0)
       : ref $v ? JSON::PP->new->canonical->encode($v) : $v;' "$1"
+}
+# MCP の stdio ブリッジ（`tako mcp serve`）から tako_check_health を 1 回呼び、terminal_queries の要点を返す
+mcp_terminal_queries() {
+  local sock tok
+  sock=$(perl -MJSON::PP -0e 'print decode_json(<>)->{socket}' "$TAKO_DISCOVERY_DIR/control.json")
+  tok=$(perl -MJSON::PP -0e 'print decode_json(<>)->{token}' "$TAKO_DISCOVERY_DIR/control.json")
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t2350","version":"0"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tako_check_health","arguments":{}}}'
+    sleep 10
+  } | TAKO_SOCKET="$sock" TAKO_TOKEN="$tok" "$TAKO_BIN" mcp serve 2>/dev/null | perl -MJSON::PP -ne '
+    my $m = eval { decode_json($_) } or next;
+    next unless ($m->{id} // 0) == 2;
+    binmode STDOUT, ":encoding(UTF-8)";
+    my $t = $m->{result}{content}[0]{text} // ""; my $h = eval { JSON::PP->new->decode($t) } or do { print "isError: $t\n"; next };
+    my $q = $h->{terminal_queries} // {};
+    print map { "$_->{kind}: by=$_->{by} answered=" . ($_->{answered} // "null") . "\n" } @{ $q->{kinds} // [] };
+    print "summary: $q->{summary}\n";'
 }
 mask() { sed -e "s#$TMP#<TMP>#g" -e "s#$REPO_ROOT#<REPO>#g"; }
 
@@ -194,7 +219,7 @@ mask() { sed -e "s#$TMP#<TMP>#g" -e "s#$REPO_ROOT#<REPO>#g"; }
 print_probe() {
   local f="$1" k
   echo "    寸法（TIOCGWINSZ rows cols xpix ypix）: $(winsize_of "$f")"
-  for k in osc10 osc11 osc11st osc12 osc4_1 osc4_200 csi14t csi18t osc52 osc4_bad osc11_bad; do
+  for k in osc10 osc11 osc11st osc12 osc4_1 osc4_200 dsr996 csi14t csi18t osc52 osc4_bad osc11_bad; do
     printf '    %-10s %-44s %s\n' "$k" "[$(reply_of "$f" "$k")]" "$(sed -n "s/^R:$k=\[.*\] //p" "$f")"
   done
 }
@@ -249,27 +274,101 @@ run_case() {
   return 0
 }
 
+
+# 明暗の答え（CSI ? 996 n → CSI ? 997 ; 1 = ダーク / 2 = ライト）
+check_scheme() {
+  check "${2}: CSI ? 996 n の答えが ${3}（997;${4}）" "$( [ "$(reply_of "$1" dsr996)" = "^[[?997;${4}n" ] && echo 1)"
+}
+# 修正前の形: tako が答える種類はどれも空（CSI 18 t だけは端末が答える）
+check_legacy_silent() {
+  local f="$1" what="$2" k silent=1
+  for k in osc10 osc11 osc11st osc12 osc4_1 dsr996; do
+    [ -z "$(reply_of "$f" "$k")" ] || silent=0
+  done
+  check "${what}: 色（OSC 10 / 11 / 12 / 4）と明暗（CSI ? 996 n）に答えない" "$silent"
+}
+# ペインを下へ分割して高さを変え、変わった寸法で CSI 14 t / 18 t が答えるかを見る（境界: 寸法が変わった直後）
+check_after_split() {
+  local what="$1" before after p2
+  before=$(winsize_of "$F")
+  p2=$("$TAKO_BIN" split --pane "$PANE" --down 2>/dev/null | perl -MJSON::PP -0e 'my $j = eval { decode_json(<STDIN>) } or exit; print $j->{pane} // $j->{pane_id} // ""')
+  F=$(run_probe "$PANE")
+  [ -n "$F" ] || { fail "${what}: 分割の後のプローブの結果が読めない"; return; }
+  after=$(winsize_of "$F")
+  echo "    分割（新ペイン ${p2:-?}）の前の寸法: ${before} → 後: ${after}"
+  check "${what}: 分割でペインの寸法が変わった（前提）" "$( [ "$before" != "$after" ] && echo 1)"
+  check_sizes "$F" "${what}（分割の直後）"
+}
+
 if [ "$MODE" = measure ]; then
   run_case direct "直接のペイン（TAKO_PERSIST なし）" && stop_gui
   run_case persist "器越しのペイン（TAKO_PERSIST=1）" TAKO_PERSIST=1 && stop_gui
   exit 0
 fi
 
-if [ "$MODE" = theme ]; then
-  run_case persist "器越しのペイン（TAKO_PERSIST=1）" TAKO_PERSIST=1 || exit 1
-  "$TAKO_BIN" theme light >/dev/null 2>&1
-  echo "    -- tako theme light の後"
-  F=$(run_probe "$PANE") && print_probe "$F"
-  stop_gui
-  exit 0
-fi
+# ---------------------------------------------------------------------------------------------
+run_case legacy-direct "① 修正前（TAKO_2350_LEGACY=1）: 直接のペイン" TAKO_2350_LEGACY=1 || exit 1
+check_legacy_silent "$F" "①"
+check "①: CSI 14 t にも答えない" "$( [ -z "$(reply_of "$F" csi14t)" ] && echo 1)"
+check "①: CSI 18 t は端末（alacritty の Term）が修正前から答える" "$(grep -q '^R:csi18t=\[^\[\[8;' "$F" && echo 1)"
+H=$(health_json)
+echo "    check-health: legacy=$(tq_field legacy <<<"$H") osc11.by=$(tq_field osc11.by <<<"$H")"
+check "①: check-health の terminal_queries が legacy で osc11 は declined" "$( [ "$(tq_field legacy <<<"$H")" = 1 ] && [ "$(tq_field osc11.by <<<"$H")" = declined ] && echo 1)"
+stop_gui
 
-if [ "$MODE" = theme997 ]; then
-  run_case persist "器越しのペイン（TAKO_PERSIST=1）" TAKO_PERSIST=1 || exit 1
-  "$TAKO_BIN" theme light >/dev/null 2>&1
-  "$TAKO_BIN" send --no-newline --pane "$PANE" "$(printf '\033[?997;2n')" >/dev/null 2>&1
-  echo "    -- tako theme light + DSR 997;2 の後"
-  F=$(run_probe "$PANE") && print_probe "$F"
-  stop_gui
-  exit 0
+run_case legacy-persist "② 修正前（TAKO_2350_LEGACY=1）: 器越しのペイン" TAKO_PERSIST=1 TAKO_2350_LEGACY=1 || exit 1
+check "②: 器越しも OSC 10 / 11 に答えが無い（tmux が tako から色を学べない）" "$( [ -z "$(reply_of "$F" osc10)" ] && [ -z "$(reply_of "$F" osc11)" ] && echo 1)"
+H=$(health_json)
+check "②: mode 2031 の購読を覚えない（color_scheme_panes が空）" "$( [ "$(tq_field color_scheme_panes <<<"$H")" = '[]' ] && echo 1)"
+stop_gui
+
+run_case direct "③ 修正後: 直接のペイン" || exit 1
+check_colors "$F" "③" direct
+check_scheme "$F" "③" ダーク 1
+check_sizes "$F" "③"
+check_declines "$F" "③"
+H=$(health_json)
+echo "    check-health: legacy=$(tq_field legacy <<<"$H") osc11=$(tq_field osc11.answered <<<"$H") osc52_read.declined=$(tq_field osc52_read.declined <<<"$H") color_scheme_panes=$(tq_field color_scheme_panes <<<"$H")"
+check "③: check-health が答えた回数を数える（osc11 は BEL / ST の 2 回以上・osc52_read は断り 1 回以上・csi18t は emulator）" "$( [ "$(tq_field legacy <<<"$H")" = 0 ] && [ "$(tq_field osc11.answered <<<"$H")" -ge 2 ] && [ "$(tq_field osc52_read.declined <<<"$H")" -ge 1 ] && [ "$(tq_field osc52_read.by <<<"$H")" = declined ] && [ "$(tq_field csi18t.by <<<"$H")" = emulator ] && echo 1)"
+HT=$("$TAKO_BIN" check-health 2>/dev/null | grep '^端末の問い合わせ: ')
+echo "    CLI: $HT"
+check "③: 人が読む出力に要約 1 行" "$(grep -q '^端末の問い合わせ: 色（OSC 10 / 11 / 12 / 4）.*OSC 52 の読み出しには答えない（起動から応答 [0-9]* 回' <<<"$HT" && echo 1)"
+M=$(mcp_terminal_queries)
+echo "$M" | sed 's/^/    MCP: /'
+check "③: MCP（stdio ブリッジ）の tako_check_health にも同じ表" "$(grep -q '^osc11: by=tako answered=[1-9]' <<<"$M" && grep -q '^osc52_read: by=declined' <<<"$M" && grep -q '^summary: 端末の問い合わせ: ' <<<"$M" && echo 1)"
+"$TAKO_BIN" theme light >/dev/null 2>&1
+F=$(run_probe "$PANE")
+if [ -n "$F" ]; then
+  print_probe "$F"
+  check_colors "$F" "③ ライトへ切り替えた後" direct
+  check_scheme "$F" "③ ライトへ切り替えた後" ライト 2
+else
+  fail "③: テーマを切り替えた後のプローブの結果が読めない"
 fi
+check_after_split "③"
+stop_gui
+
+run_case persist "④ 修正後: 器越しのペイン" TAKO_PERSIST=1 || exit 1
+check_colors "$F" "④"
+check_scheme "$F" "④" ダーク 1
+check_sizes "$F" "④"
+H=$(health_json)
+echo "    check-health: color_scheme_panes=$(tq_field color_scheme_panes <<<"$H")（このペイン ${PANE}）"
+check "④: 器（tmux）のペインが mode 2031 の購読者に並ぶ" "$(perl -MJSON::PP -e 'exit !(grep { $_ == $ARGV[1] } @{ decode_json($ARGV[0]) })' "$(tq_field color_scheme_panes <<<"$H")" "$PANE" 2>/dev/null && echo 1)"
+"$TAKO_BIN" theme light >/dev/null 2>&1
+F=$(run_probe "$PANE")
+if [ -n "$F" ]; then
+  print_probe "$F"
+  check_colors "$F" "④ ライトへ切り替えた後（tmux が問い合わせ直した値）"
+  check_scheme "$F" "④ ライトへ切り替えた後" ライト 2
+else
+  fail "④: テーマを切り替えた後のプローブの結果が読めない"
+fi
+H=$(health_json)
+check "④: テーマの切り替えの通知を数える（scheme_notices ≥ 1）" "$( [ "$(tq_field scheme_notices <<<"$H")" -ge 1 ] 2>/dev/null && echo 1)"
+check_after_split "④"
+stop_gui
+
+echo
+echo "結果: PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" = 0 ]
