@@ -31,6 +31,11 @@ use tako_core::lsp::servers::{Arg, DocumentKind, InstallHint, RootScope, ServerS
 use tako_core::lsp::state::{RestartPolicy, ServerState};
 use tako_core::platform::child_cmd::ChildCmd;
 
+#[path = "common/closed_port.rs"]
+mod closed_port;
+
+use closed_port::closed_port;
+
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 const ID: &str = "fake-fetch";
 const INSTALL_COMMAND: &str = "install-fake-fetch-yourself";
@@ -662,11 +667,9 @@ fn ハッシュ不一致の理由は取得物を捨てたと言う() {
 #[test]
 fn オフラインの後は開き直しても取り直さず_install_で取り直すと待っていた文書が起きる() {
     let scratch = Scratch::new("offline");
-    // 閉じたポート = 接続できない（オフライン）
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    // 閉じたポート = 接続できない（オフライン。#2373）
+    let offline = closed_port();
+    let port = offline.port;
     let base = format!("http://127.0.0.1:{port}");
     let spec = spec_for(&scratch, "fake.gz", fake_gz(), fake_gz().len() as u64);
     let m = manager(&scratch, spec, Arc::default(), &base, true);
@@ -677,6 +680,7 @@ fn オフラインの後は開き直しても取り直さず_install_で取り�
     let mut second = open(&m, &scratch.file(2));
     assert!(matches!(second, DocLink::Declined { .. }), "{second:?}");
     // ネットワークが戻った（同じポートに配布元が立った）→ install（画面の「もう一度取得」と同じ口）
+    drop(offline);
     let origin = Origin::start_at(&format!("127.0.0.1:{port}"));
     origin.route("fake.gz", Serve::Bytes(fake_gz().to_vec()));
     assert_eq!(origin.hits(), 0, "失敗の後に自動で取り直していない");
