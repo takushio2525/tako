@@ -31,6 +31,7 @@ const OPEN_EXISTING: u32 = 3;
 const ERROR_PIPE_CONNECTED: i32 = 535;
 const ERROR_PIPE_BUSY: i32 = 231;
 const ERROR_SEM_TIMEOUT: i32 = 121;
+const ERROR_NO_SYSTEM_RESOURCES: i32 = 1450;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -89,6 +90,9 @@ impl Drop for ServerInstance {
 /// （同名で別プロセスが待ち受け中なら AccessDenied で失敗し、呼び出し側が
 /// 一時名へフォールバックする。unix の「固定ソケット生存 → 一時パス」に相当）
 pub fn create_server_instance(name: &str, first: bool) -> io::Result<ServerInstance> {
+    if take_injected_failure(name) {
+        return Err(io::Error::from_raw_os_error(ERROR_NO_SYSTEM_RESOURCES));
+    }
     let mode = PIPE_ACCESS_DUPLEX
         | if first {
             FILE_FLAG_FIRST_PIPE_INSTANCE
@@ -111,6 +115,62 @@ pub fn create_server_instance(name: &str, first: bool) -> io::Result<ServerInsta
         return Err(io::Error::last_os_error());
     }
     Ok(ServerInstance { handle })
+}
+
+/// インスタンスの作成へ注入した失敗（#2361。名前ごと）
+struct InjectedFailures {
+    name: String,
+    /// これから失敗させる回数
+    remaining: u32,
+    /// 作成が試みられて失敗させた回数
+    taken: u32,
+}
+
+static INJECTED: std::sync::Mutex<Vec<InjectedFailures>> = std::sync::Mutex::new(Vec::new());
+
+/// この名前のインスタンスの作成を次の `count` 回失敗させる（#2361 の検証）。
+///
+/// 本番と同じ [`create_server_instance`] の入口で効く（呼び出し側の accept ループはそのまま
+/// 通る = テスト専用の別実装にしない）。失敗は資源不足（`ERROR_NO_SYSTEM_RESOURCES`）の形で返す
+pub fn inject_create_failures(name: &str, count: u32) {
+    let Ok(mut injected) = INJECTED.lock() else {
+        return;
+    };
+    match injected.iter_mut().find(|i| i.name == name) {
+        Some(entry) => entry.remaining = count,
+        None => injected.push(InjectedFailures {
+            name: name.to_string(),
+            remaining: count,
+            taken: 0,
+        }),
+    }
+}
+
+/// 注入した失敗のうち、作成が試みられて実際に失敗させた回数（#2361）
+pub fn injected_failures_taken(name: &str) -> u32 {
+    INJECTED
+        .lock()
+        .ok()
+        .and_then(|injected| injected.iter().find(|i| i.name == name).map(|i| i.taken))
+        .unwrap_or(0)
+}
+
+/// 注入した失敗が残っていれば 1 回ぶん使う
+fn take_injected_failure(name: &str) -> bool {
+    let Ok(mut injected) = INJECTED.lock() else {
+        return false;
+    };
+    match injected
+        .iter_mut()
+        .find(|i| i.name == name && i.remaining > 0)
+    {
+        Some(entry) => {
+            entry.remaining -= 1;
+            entry.taken += 1;
+            true
+        }
+        None => false,
+    }
 }
 
 impl ServerInstance {

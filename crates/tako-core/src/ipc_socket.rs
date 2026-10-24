@@ -683,6 +683,279 @@ pub fn fixed_path() -> Option<Occupant> {
     FIXED_PATH.lock().ok().and_then(|s| *s)
 }
 
+// ---------------------------------------------------------------------------
+// Windows の名前付きパイプの待ち受けの作り直し（#2361）
+//
+// 直した症状（コードと注入で再現。Windows の実機では未確認）: Windows の受け口は名前付き
+// パイプで、accept スレッドは 1 本受けるたびに次のインスタンスを作って待つ。その作成
+// （`CreateNamedPipeW`）が 1 回でも失敗すると accept ループが `break` してスレッドごと終わり、
+// 待ち受けのインスタンスが 1 つも残らなかった。以後の CLI / MCP（stdio）は届かず、GUI は
+// 何も気づかないので再起動するまで戻らない（#2002 と同じ「GUI は生きているのに受け口が
+// 応答しない」の Windows 側）。
+//
+// いまは作れなければ間を置いて（倍々・上限つき）作り直し、作れたら受け口が戻る。続いた失敗は
+// 1 回の途切れとして persist.log に始まりと戻りの 2 行（短い間に続く途切れは畳んで数だけ残す）、
+// 記録は `check_health` の `ipc.pipe`。間の決め方と記録は [`create_with_retry`] /
+// [`PipeInstances`] の 1 実装（IO = 作成・眠り・時計は tako-control::ipc が渡す）。
+// ---------------------------------------------------------------------------
+
+/// 作り直すまでの間の初め（ミリ秒）。失敗が続くたびに倍にする
+pub const PIPE_RETRY_BASE_MS: u64 = 100;
+
+/// 作り直すまでの間の上限（ミリ秒）。失敗が続いても作成はこの間に 1 回まで（CPU を食わない）。
+/// 作れるようになってから受け口が戻るまでの遅れもこの間まで
+pub const PIPE_RETRY_MAX_MS: u64 = 5_000;
+
+/// persist.log の畳みの窓（ミリ秒）。前に書いた途切れの始まりからこの間に始まった途切れは
+/// 書かずに数え、次に書く 1 行へ「畳んだ N 回」として載せる（途切れが続けて起きても
+/// この窓に 2 行まで）
+pub const PIPE_LOG_FOLD_MS: u64 = 60_000;
+
+/// #2361 の A/B。`TAKO_2361_LEGACY=1` で修正前（待ち受けのインスタンスを作れないと
+/// accept ループが止まる・記録しない）へ戻す
+pub fn legacy_2361() -> bool {
+    std::env::var("TAKO_2361_LEGACY").is_ok_and(|v| !v.is_empty())
+}
+
+/// 検証用の注入（`TAKO_2361_INJECT=<回数>`）。本体の受け口が 1 本受けた後に作るインスタンスを
+/// その回数だけ失敗させる（Windows の実機で途切れと戻りを観察する口。未設定・不正なら `None`）
+pub fn inject_2361() -> Option<u32> {
+    std::env::var("TAKO_2361_INJECT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// 作り直すまでの間の決め方（#2361）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipeRetryPolicy {
+    pub base_ms: u64,
+    pub max_ms: u64,
+}
+
+impl PipeRetryPolicy {
+    pub const DEFAULT: PipeRetryPolicy = PipeRetryPolicy {
+        base_ms: PIPE_RETRY_BASE_MS,
+        max_ms: PIPE_RETRY_MAX_MS,
+    };
+
+    /// 連続 `streak` 回目（1 始まり）の失敗の後に待つ間 = base × 2^(streak-1) を上限で切る。
+    /// 0 は返さない（空回りしない）
+    pub fn delay_ms(self, streak: u32) -> u64 {
+        let base = self.base_ms.max(1);
+        let shift = streak.saturating_sub(1).min(32);
+        base.saturating_mul(1u64 << shift)
+            .min(self.max_ms.max(base))
+    }
+}
+
+/// 待ち受けが戻った記録（#2361）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipeRecovery {
+    /// 戻った時刻（UNIX ミリ秒）
+    pub at_unix_ms: u64,
+    /// 戻るまでに続いた失敗の回数
+    pub failures: u32,
+    /// 待ち受けが無かった長さ（ミリ秒）
+    pub down_ms: u64,
+    /// 最後の失敗の理由
+    pub error: String,
+}
+
+/// 名前付きパイプの待ち受けの記録（#2361。`check_health` の `ipc.pipe`）
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PipeInstances {
+    pub retry_base_ms: u64,
+    pub retry_max_ms: u64,
+    /// 待ち受けのインスタンスを作れなかった回数（累計）
+    pub failures: u64,
+    /// いま続いている失敗の回数（0 = 待ち受けている）
+    pub streak: u32,
+    /// 待ち受けが途切れた回数（続いた失敗をまとめて 1 回）
+    pub outages: u64,
+    /// 作り直すまでに待った合計（ミリ秒）
+    pub waited_ms: u64,
+    /// 次に作り直すまでの間（失敗が続いている間だけ）
+    pub retry_ms: Option<u64>,
+    /// 待ち受けが途切れた時刻（失敗が続いている間だけ。UNIX ミリ秒）
+    pub down_since_unix_ms: Option<u64>,
+    /// いま続いている失敗の最後の理由（戻ったら消える）
+    pub error: Option<String>,
+    pub last_recovery: Option<PipeRecovery>,
+    /// persist.log へ書かずに畳んだ途切れの回数（累計）
+    pub folded_outages: u64,
+    /// 最後に persist.log へ書いた途切れの始まり（UNIX ミリ秒）
+    logged_outage_at_ms: Option<u64>,
+    /// いまの途切れの始まりを persist.log へ書いたか（書いた途切れだけ戻りも書く）
+    outage_logged: bool,
+    /// 前に書いてから畳んだ途切れの回数（次に書く 1 行へ載せて 0 に戻す）
+    folded_since_log: u64,
+}
+
+impl PipeInstances {
+    pub fn new(policy: PipeRetryPolicy) -> Self {
+        PipeInstances {
+            retry_base_ms: policy.base_ms,
+            retry_max_ms: policy.max_ms,
+            ..PipeInstances::default()
+        }
+    }
+
+    fn policy(&self) -> PipeRetryPolicy {
+        PipeRetryPolicy {
+            base_ms: self.retry_base_ms,
+            max_ms: self.retry_max_ms,
+        }
+    }
+
+    /// いま待ち受けているか（失敗が続いていない）
+    pub fn healthy(&self) -> bool {
+        self.streak == 0
+    }
+
+    /// 作れなかった 1 回を記録する。返すのは作り直すまでの間（ミリ秒）と persist.log の 1 行
+    /// （途切れの始まりで、畳まないときだけ。**パイプ名は載せない** = ユーザー名を含む）
+    pub fn on_failure(&mut self, error: &str, now_ms: u64) -> (u64, Option<String>) {
+        self.failures += 1;
+        self.streak = self.streak.saturating_add(1);
+        let delay = self.policy().delay_ms(self.streak);
+        self.retry_ms = Some(delay);
+        self.waited_ms = self.waited_ms.saturating_add(delay);
+        self.error = Some(error.to_string());
+        if self.streak > 1 {
+            return (delay, None);
+        }
+        // 途切れの始まり
+        self.outages += 1;
+        self.down_since_unix_ms = Some(now_ms);
+        let fold = self
+            .logged_outage_at_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) < PIPE_LOG_FOLD_MS);
+        if fold {
+            self.outage_logged = false;
+            self.folded_outages += 1;
+            self.folded_since_log += 1;
+            return (delay, None);
+        }
+        self.outage_logged = true;
+        self.logged_outage_at_ms = Some(now_ms);
+        let mut line = format!(
+            "IPC の名前付きパイプの待ち受けを作れない（#2361）: {error}（間を置いて作り直す。\
+             間は最長 {}）・途切れ {} 回目",
+            duration_text(self.retry_max_ms),
+            self.outages,
+        );
+        let folded = std::mem::take(&mut self.folded_since_log);
+        if folded > 0 {
+            line.push_str(&format!("（前の 1 行から {folded} 回の途切れを畳んだ）"));
+        }
+        (delay, Some(line))
+    }
+
+    /// 作れた 1 回。失敗が続いた後なら戻った記録を置き、persist.log の 1 行（その途切れの
+    /// 始まりを書いたときだけ）を返す。失敗が続いていなければ何もしない
+    pub fn on_created(&mut self, now_ms: u64) -> Option<String> {
+        if self.streak == 0 {
+            return None;
+        }
+        let failures = std::mem::take(&mut self.streak);
+        let down_ms = self
+            .down_since_unix_ms
+            .take()
+            .map_or(0, |at| now_ms.saturating_sub(at));
+        self.retry_ms = None;
+        self.last_recovery = Some(PipeRecovery {
+            at_unix_ms: now_ms,
+            failures,
+            down_ms,
+            error: self.error.take().unwrap_or_default(),
+        });
+        std::mem::take(&mut self.outage_logged).then(|| {
+            format!(
+                "IPC の名前付きパイプの待ち受けが戻った（#2361）: {failures} 回続けて作れなかった後・\
+                 途切れていた長さ {}",
+                duration_text(down_ms),
+            )
+        })
+    }
+}
+
+/// ミリ秒を人が読む長さへ（1 秒未満は ms、それ以上は秒）
+fn duration_text(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else if ms.is_multiple_of(1_000) {
+        format!("{} 秒", ms / 1_000)
+    } else {
+        format!("{:.1} 秒", ms as f64 / 1_000.0)
+    }
+}
+
+/// 待ち受けの次のインスタンスを作る（#2361 の 1 実装）。作れなければ `record` に記録して
+/// [`PipeRetryPolicy::delay_ms`] の間だけ眠り、作れるまでやり直す。眠った後に `stopping` が
+/// 真なら（drop が止めにかかった）作らずに `None`。
+///
+/// `publish` は記録が変わるたびに呼ぶ（persist.log の 1 行があれば添える）。IO（作成・眠り・
+/// 時計）は呼び出し側が渡す = 回数と間をテストが実時間なしで確かめられる
+pub fn create_with_retry<T, E: std::fmt::Display>(
+    record: &mut PipeInstances,
+    mut create: impl FnMut() -> Result<T, E>,
+    mut sleep: impl FnMut(std::time::Duration),
+    stopping: impl Fn() -> bool,
+    now_ms: impl Fn() -> u64,
+    mut publish: impl FnMut(&PipeInstances, Option<String>),
+) -> Option<T> {
+    loop {
+        match create() {
+            Ok(instance) => {
+                if record.streak > 0 {
+                    let line = record.on_created(now_ms());
+                    publish(record, line);
+                }
+                return Some(instance);
+            }
+            Err(e) => {
+                let (delay, line) = record.on_failure(&e.to_string(), now_ms());
+                publish(record, line);
+                sleep(std::time::Duration::from_millis(delay));
+                if stopping() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// いまの UNIX ミリ秒（[`create_with_retry`] へ渡す時計）
+pub fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 名前付きパイプの待ち受けの記録（[`STATUS`] に載った受け口の分だけ）
+static PIPE: std::sync::Mutex<Option<PipeInstances>> = std::sync::Mutex::new(None);
+
+/// 待ち受けの記録を置く。**[`status`] の受け口と同じ endpoint のときだけ**置く
+/// （後発ウィンドウ・順番待ちの受け口で本体の記録を上書きしない = [`record_watch`] と同じ）
+pub fn record_pipe(endpoint: &str, pipe: &PipeInstances) {
+    let recorded = status()
+        .and_then(|s| s.endpoint)
+        .is_some_and(|e| e == endpoint);
+    if !recorded {
+        return;
+    }
+    if let Ok(mut slot) = PIPE.lock() {
+        *slot = Some(pipe.clone());
+    }
+}
+
+/// 名前付きパイプの待ち受けの記録（Windows の本体の受け口だけ。それ以外は `None`）
+pub fn pipe() -> Option<PipeInstances> {
+    PIPE.lock().ok().and_then(|s| s.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,6 +1309,208 @@ mod tests {
         assert_eq!(fixed_path(), Some(Occupant::Busy { pid: 7 }));
         reset_status_for_test();
         if let Ok(mut slot) = FIXED_PATH.lock() {
+            *slot = None;
+        }
+    }
+
+    #[test]
+    fn issue2361_作り直しの間は倍々で上限に張り付く() {
+        let policy = PipeRetryPolicy::DEFAULT;
+        let delays: Vec<u64> = (1..=10).map(|n| policy.delay_ms(n)).collect();
+        assert_eq!(
+            delays,
+            [100, 200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000, 5_000]
+        );
+        assert_eq!(
+            policy.delay_ms(u32::MAX),
+            PIPE_RETRY_MAX_MS,
+            "桁あふれしない"
+        );
+        let zero = PipeRetryPolicy {
+            base_ms: 0,
+            max_ms: 0,
+        };
+        assert_eq!(zero.delay_ms(1), 1, "0 の間で空回りしない");
+        assert_eq!(zero.delay_ms(40), 1);
+    }
+
+    /// [`create_with_retry`] を台本どおりに動かした結果（実時間は使わない = 眠りは時計を進めるだけ）
+    struct RetryRun {
+        result: Option<u32>,
+        attempts: u32,
+        sleeps: Vec<u64>,
+        published: u32,
+        lines: Vec<String>,
+        record: PipeInstances,
+    }
+
+    /// 最初の `failures` 回は作れず、その後は作れる。`stop_after_sleeps` 回眠ったら止めにかかる
+    fn run_retry(failures: u32, stop_after_sleeps: Option<usize>) -> RetryRun {
+        let clock = std::cell::Cell::new(1_000_000u64);
+        let attempts = std::cell::Cell::new(0u32);
+        let sleeps = std::cell::RefCell::new(Vec::new());
+        let mut published = 0;
+        let mut lines = Vec::new();
+        let mut record = PipeInstances::new(PipeRetryPolicy::DEFAULT);
+        let result = create_with_retry(
+            &mut record,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= failures {
+                    Err("Insufficient system resources exist (os error 1450)")
+                } else {
+                    Ok(attempts.get())
+                }
+            },
+            |d: std::time::Duration| {
+                sleeps.borrow_mut().push(d.as_millis() as u64);
+                clock.set(clock.get() + d.as_millis() as u64);
+            },
+            || stop_after_sleeps.is_some_and(|n| sleeps.borrow().len() >= n),
+            || clock.get(),
+            |_, line| {
+                published += 1;
+                lines.extend(line);
+            },
+        );
+        RetryRun {
+            result,
+            attempts: attempts.get(),
+            sleeps: sleeps.into_inner(),
+            published,
+            lines,
+            record,
+        }
+    }
+
+    #[test]
+    fn issue2361_作れるまで間を置いてやり直し作れたら戻る() {
+        let run = run_retry(10, None);
+        assert_eq!(run.result, Some(11), "11 回目に作れたインスタンスを返す");
+        assert_eq!(
+            run.attempts, 11,
+            "作成は失敗の数 + 1 回だけ（空回りしない）"
+        );
+        assert_eq!(
+            run.sleeps,
+            [100, 200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000, 5_000],
+            "失敗 1 回ごとに 1 回だけ、上限つきの間を置く"
+        );
+        let r = &run.record;
+        assert_eq!((r.failures, r.streak, r.outages), (10, 0, 1));
+        assert_eq!(r.waited_ms, run.sleeps.iter().sum::<u64>());
+        assert!(r.healthy());
+        assert_eq!(
+            (r.retry_ms, r.down_since_unix_ms, &r.error),
+            (None, None, &None)
+        );
+        let recovery = r.last_recovery.as_ref().expect("戻った記録");
+        assert_eq!(recovery.failures, 10);
+        assert_eq!(
+            recovery.down_ms, r.waited_ms,
+            "途切れていた長さ = 待った合計"
+        );
+        assert!(recovery.error.contains("os error 1450"), "{recovery:?}");
+        assert_eq!(run.published, 11, "失敗 10 回 + 戻り 1 回で記録を出す");
+        assert_eq!(
+            run.lines.len(),
+            2,
+            "persist.log は始まりと戻りの 2 行: {:?}",
+            run.lines
+        );
+        assert!(
+            run.lines[0].contains("作れない（#2361）") && run.lines[0].contains("os error 1450"),
+            "{}",
+            run.lines[0]
+        );
+        assert!(run.lines[0].contains("間は最長 5 秒"), "{}", run.lines[0]);
+        assert!(
+            run.lines[1].contains("戻った（#2361）: 10 回続けて")
+                && run.lines[1].contains("26.3 秒"),
+            "{}",
+            run.lines[1]
+        );
+    }
+
+    #[test]
+    fn issue2361_初回で作れたら何も記録しない() {
+        let run = run_retry(0, None);
+        assert_eq!((run.result, run.attempts, run.published), (Some(1), 1, 0));
+        assert!(run.sleeps.is_empty());
+        assert_eq!(run.record, PipeInstances::new(PipeRetryPolicy::DEFAULT));
+    }
+
+    #[test]
+    fn issue2361_止めにかかったら作り直さずに抜ける() {
+        let run = run_retry(u32::MAX, Some(3));
+        assert_eq!(run.result, None);
+        assert_eq!(run.attempts, 3, "止めにかかった後は作らない");
+        assert_eq!(run.sleeps, [100, 200, 400]);
+        assert_eq!(run.record.streak, 3);
+        assert!(!run.record.healthy(), "途切れたまま（drop の最中）");
+    }
+
+    #[test]
+    fn issue2361_途切れが続けて起きても畳みの窓に2行まで() {
+        let mut pipe = PipeInstances::new(PipeRetryPolicy::DEFAULT);
+        let outage = |pipe: &mut PipeInstances, at: u64| {
+            let (_, start) = pipe.on_failure("boom", at);
+            let (_, again) = pipe.on_failure("boom", at + 100);
+            assert_eq!(again, None, "続いた失敗は書かない");
+            let end = pipe.on_created(at + 300);
+            (start, end)
+        };
+        let (start, end) = outage(&mut pipe, 0);
+        assert!(start.is_some_and(|l| l.contains("途切れ 1 回目")));
+        assert!(end.is_some(), "書いた途切れは戻りも書く");
+        for at in [1_000, 30_000, 59_999] {
+            assert_eq!(
+                outage(&mut pipe, at),
+                (None, None),
+                "{at} ms の途切れは畳む"
+            );
+        }
+        let (start, end) = outage(&mut pipe, 60_000);
+        let start = start.expect("窓を過ぎた途切れは書く");
+        assert!(start.contains("途切れ 5 回目"), "{start}");
+        assert!(
+            start.contains("前の 1 行から 3 回の途切れを畳んだ"),
+            "{start}"
+        );
+        assert!(end.is_some());
+        assert_eq!(
+            (pipe.outages, pipe.folded_outages, pipe.failures),
+            (5, 3, 10)
+        );
+        // 畳んだ数は 1 行へ載せた後に 0 へ戻る
+        let (start, _) = outage(&mut pipe, 200_000);
+        assert!(!start.expect("書く").contains("畳んだ"));
+    }
+
+    #[test]
+    fn issue2361_待ち受けの記録は本体の受け口の分だけ置く() {
+        let _guard = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_status_for_test();
+        if let Ok(mut slot) = PIPE.lock() {
+            *slot = None;
+        }
+        record(IpcStatus {
+            endpoint: Some(r"\\.\pipe\tako-testuser".into()),
+            kind: SocketPathKind::NamedPipe,
+            bound: true,
+            path_bytes: 0,
+            limit: 0,
+            well_known_bytes: 0,
+            error: None,
+        });
+        let mut pipe = PipeInstances::new(PipeRetryPolicy::DEFAULT);
+        pipe.on_failure("boom", 5);
+        record_pipe(r"\\.\pipe\tako-testuser-42-0", &pipe);
+        assert_eq!(super::pipe(), None, "後発・順番待ちの受け口で上書きしない");
+        record_pipe(r"\\.\pipe\tako-testuser", &pipe);
+        assert_eq!(super::pipe().map(|p| p.streak), Some(1));
+        reset_status_for_test();
+        if let Ok(mut slot) = PIPE.lock() {
             *slot = None;
         }
     }
