@@ -334,7 +334,11 @@ check_eq "2 回目でペインが増えない" "$PANES_NOW" "$(tab_panes)"
 if "$TAKO_BIN" show-command --run --card "$LONG" > "$TMP/pcrun.out" 2>&1; then
   fail "PC 側からの 2 回目も断られる（通ってしまった）"
 else
-  check_contains "PC 側からの 2 回目も同じ理由で断られる" "$(cat "$TMP/pcrun.out")" "まだ実行中"
+  # 断りの文は表示言語に従う（#2365）ので英語表示の目印も受ける
+  case "$(cat "$TMP/pcrun.out")" in
+    *"まだ実行中"*|*"still running"*) pass "PC 側からの 2 回目も同じ理由で断られる" ;;
+    *) fail "PC 側からの 2 回目も同じ理由で断られる（'まだ実行中' を含まない）" ;;
+  esac
 fi
 "$TAKO_BIN" close --pane "$LONG_PANE" --force > /dev/null 2>&1
 api GET "/api/cards?pane=$PANE" >/dev/null

@@ -315,12 +315,40 @@ pub fn observed_termchk(screen: &str) -> Option<String> {
     found
 }
 
-#[derive(Debug, thiserror::Error)]
+/// ペインのターミナルを起こせなかった理由。表示（`Display`）は表示言語に従う
+/// （#2365。日英の正本は [`Self::text_in`]）
+#[derive(Debug)]
 pub enum SessionError {
-    #[error("PTY の生成に失敗した")]
-    Pty(#[source] std::io::Error),
-    #[error("PTY IO スレッドの起動に失敗した")]
-    EventLoop(#[source] std::io::Error),
+    Pty(std::io::Error),
+    EventLoop(std::io::Error),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pty(e) | Self::EventLoop(e) => Some(e),
+        }
+    }
+}
+
+impl SessionError {
+    /// 表示言語を明示しての文言（#2365。`TextEditError::text_in` と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致（原因の io エラーは `source` で辿る）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Pty(_), Ja) => "PTY の生成に失敗した".to_string(),
+            (Self::Pty(_), En) => "failed to create the PTY".to_string(),
+            (Self::EventLoop(_), Ja) => "PTY IO スレッドの起動に失敗した".to_string(),
+            (Self::EventLoop(_), En) => "failed to start the PTY I/O thread".to_string(),
+        }
+    }
 }
 
 /// `process_event` が UI 層へ返す通知（再描画以外の対応が必要なもの）

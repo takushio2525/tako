@@ -54,44 +54,132 @@ impl fmt::Display for CommandCardId {
     }
 }
 
-/// カードの操作エラー。文言は dispatch のエラーメッセージへそのまま流す
-/// （UI 表示ではないので日本語で可。`.agent/conventions.md`「UI 文字列の i18n」）
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+/// カードの操作エラー。文言は dispatch のエラーメッセージへそのまま流すので、表示
+/// （`Display`）は表示言語に従う（#2365。日英の正本は [`Self::text_in`]）
+#[derive(Debug, PartialEq, Eq)]
 pub enum CommandCardError {
-    #[error("コマンドが 1 件も指定されていない")]
     NoCommands,
-    #[error("空のコマンドは提示できない（{index} 件目）")]
-    EmptyCommand { index: usize },
-    #[error("コマンドが長すぎる（{index} 件目: {len} バイト > 上限 {max}）")]
+    EmptyCommand {
+        index: usize,
+    },
     CommandTooLong {
         index: usize,
         len: usize,
         max: usize,
     },
-    #[error("コマンドに制御文字が含まれている（{index} 件目。改行とタブ以外は不可）")]
-    ControlCharacter { index: usize },
-    #[error("1 カードに載せられるコマンドは {max} 件まで（指定: {len} 件）")]
-    TooManyCommands { len: usize, max: usize },
-    #[error("ラベルが長すぎる（{len} 文字 > 上限 {max}）")]
-    LabelTooLong { len: usize, max: usize },
-    #[error("カードが見つからない（id={id}）")]
-    CardNotFound { id: u64 },
-    #[error("コマンド番号が範囲外（指定: {index}、このカードは 1〜{len}）")]
-    IndexOutOfRange { index: usize, len: usize },
+    ControlCharacter {
+        index: usize,
+    },
+    TooManyCommands {
+        len: usize,
+        max: usize,
+    },
+    LabelTooLong {
+        len: usize,
+        max: usize,
+    },
+    CardNotFound {
+        id: u64,
+    },
+    IndexOutOfRange {
+        index: usize,
+        len: usize,
+    },
     /// 同じコマンドの前回の実行がまだ終わっていない（#1724）。
-    /// 文言の先頭は [`STILL_RUNNING_MARK`] で固定する（remote が 409 へ分ける目印）
-    #[error(
-        "{mark}（{index} 件目・ペイン {pane}）。終わるか、そのペインを閉じてからもう一度実行する",
-        mark = STILL_RUNNING_MARK
-    )]
-    StillRunning { index: usize, pane: u64 },
+    /// 文言の先頭は [`still_running_mark`] で固定する（remote が 409 へ分ける目印）
+    StillRunning {
+        index: usize,
+        pane: u64,
+    },
 }
 
-/// [`CommandCardError::StillRunning`] の文言の目印（#1724）。
-///
-/// dispatch のエラーは IPC を越えると文字列になるので、remote daemon は
-/// この目印で「実行中なので断った（409）」と「頼み方が悪い（400）」を分ける
-pub const STILL_RUNNING_MARK: &str = "このコマンドはまだ実行中";
+impl fmt::Display for CommandCardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for CommandCardError {}
+
+impl CommandCardError {
+    /// 表示言語を明示しての文言（#2365。`PaneTreeError::text_in` = #2358 と同じ形）。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）。
+    /// 「見つからない」系は英語にも ` not found` を含める（remote の 404 寄せ = `says_not_found`）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoCommands, Ja) => "コマンドが 1 件も指定されていない".to_string(),
+            (Self::NoCommands, En) => "no command was given".to_string(),
+            (Self::EmptyCommand { index }, Ja) => {
+                format!("空のコマンドは提示できない（{index} 件目）")
+            }
+            (Self::EmptyCommand { index }, En) => {
+                format!("an empty command cannot be shown (command {index})")
+            }
+            (Self::CommandTooLong { index, len, max }, Ja) => {
+                format!("コマンドが長すぎる（{index} 件目: {len} バイト > 上限 {max}）")
+            }
+            (Self::CommandTooLong { index, len, max }, En) => {
+                format!("command is too long (command {index}: {len} bytes > limit {max})")
+            }
+            (Self::ControlCharacter { index }, Ja) => format!(
+                "コマンドに制御文字が含まれている（{index} 件目。改行とタブ以外は不可）"
+            ),
+            (Self::ControlCharacter { index }, En) => format!(
+                "command contains a control character (command {index}; only newlines and tabs are allowed)"
+            ),
+            (Self::TooManyCommands { len, max }, Ja) => {
+                format!("1 カードに載せられるコマンドは {max} 件まで（指定: {len} 件）")
+            }
+            (Self::TooManyCommands { len, max }, En) => {
+                format!("a card can hold up to {max} commands (given: {len})")
+            }
+            (Self::LabelTooLong { len, max }, Ja) => {
+                format!("ラベルが長すぎる（{len} 文字 > 上限 {max}）")
+            }
+            (Self::LabelTooLong { len, max }, En) => {
+                format!("label is too long ({len} characters > limit {max})")
+            }
+            (Self::CardNotFound { id }, Ja) => format!("カードが見つからない（id={id}）"),
+            (Self::CardNotFound { id }, En) => format!("card not found (id={id})"),
+            (Self::IndexOutOfRange { index, len }, Ja) => {
+                format!("コマンド番号が範囲外（指定: {index}、このカードは 1〜{len}）")
+            }
+            (Self::IndexOutOfRange { index, len }, En) => {
+                format!("command number out of range (given: {index}; this card has 1 to {len})")
+            }
+            (Self::StillRunning { index, pane }, Ja) => format!(
+                "{}（{index} 件目・ペイン {pane}）。終わるか、そのペインを閉じてからもう一度実行する",
+                still_running_mark(Ja)
+            ),
+            (Self::StillRunning { index, pane }, En) => format!(
+                "{} (command {index}, pane {pane}). Wait for it to finish or close that pane, then run it again",
+                still_running_mark(En)
+            ),
+        }
+    }
+
+    /// 断りの文が「前回の実行がまだ終わっていない」か（#1724）。日英どちらの表示にも当たる
+    /// （#2365。dispatch のエラーは IPC を越えると文字列になるので、remote daemon は
+    /// これで「実行中なので断った（409）」と「頼み方が悪い（400）」を分ける）
+    pub fn says_still_running(message: &str) -> bool {
+        [crate::i18n::Lang::Ja, crate::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| message.contains(still_running_mark(lang)))
+    }
+}
+
+/// [`CommandCardError::StillRunning`] の文言の先頭に置く目印（#1724。表示言語ごとに 1 つ = #2365）。
+/// 読む側は [`CommandCardError::says_still_running`] を通す（片方の言語だけを見ない）
+pub fn still_running_mark(lang: crate::i18n::Lang) -> &'static str {
+    match lang {
+        crate::i18n::Lang::Ja => "このコマンドはまだ実行中",
+        crate::i18n::Lang::En => "this command is still running",
+    }
+}
 
 /// コマンド 1 件の実行の顛末（#1724）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -735,8 +823,12 @@ mod tests {
                 pane: first.as_u64()
             }
         );
-        // remote が 409 へ分ける目印が文言の先頭に居る
-        assert!(err.to_string().starts_with(STILL_RUNNING_MARK), "{err}");
+        // remote が 409 へ分ける目印が文言の先頭に居る（日英とも。#2365）
+        for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+            let text = err.text_in(lang);
+            assert!(text.starts_with(still_running_mark(lang)), "{text}");
+            assert!(CommandCardError::says_still_running(&text), "{text}");
+        }
 
         // 終了コードで確定 → 再実行できる。回数は 2 へ進み、状態は実行中へ戻る
         assert!(cards.settle_run(id, 1, first, CardRunState::Exited(0)));

@@ -74,19 +74,19 @@ impl SessionRef {
         if name.is_empty() {
             return Err(BackendError::InvalidSession {
                 name,
-                reason: "セッション名が空",
+                reason: InvalidSessionReason::Empty,
             });
         }
         if name.contains(':') {
             return Err(BackendError::InvalidSession {
                 name,
-                reason: "tmux のターゲット式（session:window.pane）はセッション名として使えない",
+                reason: InvalidSessionReason::TargetExpression,
             });
         }
         if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err(BackendError::InvalidSession {
                 name,
-                reason: "セッション名に空白・制御文字は使えない",
+                reason: InvalidSessionReason::Whitespace,
             });
         }
         Ok(Self(name))
@@ -453,16 +453,88 @@ pub struct ScrollProbe {
     pub alternate: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+/// 器の操作を断った理由。表示（`Display`）は表示言語に従う（#2365。日英の正本は
+/// [`Self::text_in`]。`Unsupported` / `Operation` は作り手が組んだ文をそのまま出す）
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendError {
     /// この backend には該当の能力が無い。`note` はサポートマトリクス由来の文字列を入れる
     /// （UI・エラー・system prompt で二重管理しない。architecture.md T5「診断一致」）
-    #[error("{note}")]
-    Unsupported { note: String },
-    #[error("セッション名として不正（{name}）: {reason}")]
-    InvalidSession { name: String, reason: &'static str },
-    #[error("{0}")]
+    Unsupported {
+        note: String,
+    },
+    InvalidSession {
+        name: String,
+        reason: InvalidSessionReason,
+    },
     Operation(String),
+}
+
+/// [`BackendError::InvalidSession`] の理由（#428。日英の文は [`Self::text_in`] = #2365）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidSessionReason {
+    /// 空文字
+    Empty,
+    /// tmux のターゲット式（`session:window.pane`）
+    TargetExpression,
+    /// 空白・制御文字を含む
+    Whitespace,
+    /// tako が作った器ではない（接頭辞が一致しない）
+    NotOurs,
+}
+
+impl InvalidSessionReason {
+    /// 表示言語を明示しての文言（#2365）。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Empty, Ja) => "セッション名が空",
+            (Self::Empty, En) => "the session name is empty",
+            (Self::TargetExpression, Ja) => {
+                "tmux のターゲット式（session:window.pane）はセッション名として使えない"
+            }
+            (Self::TargetExpression, En) => {
+                "a tmux target expression (session:window.pane) cannot be used as a session name"
+            }
+            (Self::Whitespace, Ja) => "セッション名に空白・制御文字は使えない",
+            (Self::Whitespace, En) => {
+                "a session name cannot contain whitespace or control characters"
+            }
+            (Self::NotOurs, Ja) => "tako が作った器ではない（接頭辞が一致しない）",
+            (Self::NotOurs, En) => "not a session tako created (the prefix does not match)",
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidSessionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for BackendError {}
+
+impl BackendError {
+    /// 表示言語を明示しての文言（#2365。`PaneTreeError::text_in` = #2358 と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Unsupported { note }, _) => note.clone(),
+            (Self::InvalidSession { name, reason }, Ja) => {
+                format!("セッション名として不正（{name}）: {}", reason.text_in(Ja))
+            }
+            (Self::InvalidSession { name, reason }, En) => {
+                format!("invalid session name ({name}): {}", reason.text_in(En))
+            }
+            (Self::Operation(message), _) => message.clone(),
+        }
+    }
 }
 
 /// 役割 A: 生存の器
@@ -1337,7 +1409,12 @@ mod tests {
         // `=session:0.0:` になり can't find pane で無音失敗していた
         let err = SessionRef::new("tako-abc:0.0").unwrap_err();
         assert!(matches!(err, BackendError::InvalidSession { .. }));
-        assert!(err.to_string().contains("ターゲット式"));
+        // 理由の文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        assert!([crate::i18n::Lang::Ja, crate::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| err
+                .to_string()
+                .contains(InvalidSessionReason::TargetExpression.text_in(lang))));
 
         assert!(SessionRef::new("").is_err());
         assert!(SessionRef::new("tako abc").is_err());
