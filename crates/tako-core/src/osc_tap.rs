@@ -7,6 +7,11 @@
 //!
 //! 既知の制約: DCS パススルー（tmux の `ESC P tmux; ESC ESC ] ... ESC \`）内の OSC も
 //! 拾う。tmux パススルーは「外側ターミナルへ届けたい」意図のシーケンスなので許容する。
+//!
+//! #2350 から、同じ理由で vte が捨てる**ライト / ダークの通知**（mode 2031。
+//! `CSI ? 2031 h / l` の購読と `CSI ? 996 n` の問い合わせ）も拾う。追うのは `ESC [ ?` で
+//! 始まる列だけで、SGR などそれ以外の CSI は `ESC [` の次の 1 バイトで Ground へ戻る
+//! （走査の仕事は増えない）。
 
 use std::io;
 use std::path::PathBuf;
@@ -28,6 +33,11 @@ pub enum OscEvent {
     CwdChanged(PathBuf),
     /// OSC 133: プロンプト/コマンド境界マーク（FinalTerm 系シェル統合）
     Mark(PromptMark),
+    /// `CSI ? 2031 h / l`: ライト / ダークが変わったら知らせて（`CSI ? 997 ; 1|2 n`）ほしいか
+    /// （#2350。tmux は外側の端末へ attach 時に購読する）
+    ColorSchemeUpdates(bool),
+    /// `CSI ? 996 n`: 今ライトかダークか（答えは `CSI ? 997 ; 1|2 n`。#2350）
+    ColorSchemeQuery,
 }
 
 /// OSC 133 のマーク種別
@@ -44,7 +54,8 @@ pub enum PromptMark {
 }
 
 /// 分割読みに耐える最小 OSC スキャナ。
-/// OSC = `ESC ]` payload (`BEL` | `ESC \`)。対象コード（7 / 133）以外は捨てる
+/// OSC = `ESC ]` payload (`BEL` | `ESC \`)。対象コード（7 / 133）以外は捨てる。
+/// `ESC [ ?` の列は mode 2031 の購読と問い合わせ（#2350）だけを拾う
 #[derive(Debug, Default)]
 pub struct OscScanner {
     state: ScanState,
@@ -52,6 +63,9 @@ pub struct OscScanner {
     /// MAX_OSC_LEN 超過中（終端まで読み捨てる）
     overflow: bool,
 }
+
+/// `CSI ?` の引数の最大長（`2031;2004;1049` 程度で足りる。超えたら読み捨てる）
+const MAX_CSI_PARAMS: usize = 64;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ScanState {
@@ -63,6 +77,11 @@ enum ScanState {
     Osc,
     /// payload 中に ESC が来た（次が `\` なら ST 終端）
     OscEsc,
+    /// `ESC [` 直後（次が `?` のときだけ追う）
+    Csi,
+    /// `ESC [ ?` の中（引数を `buf` へ蓄積中。#2350）。`skip` は対象外の形
+    /// （中間バイト `$` 等・長すぎる引数）と分かったので終端まで読み捨てる
+    CsiPrivate { skip: bool },
 }
 
 impl OscScanner {
@@ -112,8 +131,44 @@ impl OscScanner {
                     self.overflow = false;
                     self.state = ScanState::Osc;
                 }
+                b'[' => self.state = ScanState::Csi,
                 0x1b => {} // ESC 連打は Esc のまま
                 _ => self.state = ScanState::Ground,
+            },
+            ScanState::Csi => match b {
+                b'?' => {
+                    self.buf.clear();
+                    self.state = ScanState::CsiPrivate { skip: false };
+                }
+                0x1b => self.state = ScanState::Esc,
+                // `ESC [ ?` 以外の CSI（SGR・カーソル移動など）は追わない
+                _ => self.state = ScanState::Ground,
+            },
+            ScanState::CsiPrivate { skip } => match b {
+                b'0'..=b'9' | b';' => {
+                    if self.buf.len() < MAX_CSI_PARAMS {
+                        self.buf.push(b);
+                    } else {
+                        self.state = ScanState::CsiPrivate { skip: true };
+                    }
+                }
+                // 中間バイト（DECRQM の `$` 等）・引数の途中の私用の印は対象外の形
+                0x20..=0x2f | b':' | b'<'..=b'?' => {
+                    self.state = ScanState::CsiPrivate { skip: true };
+                }
+                0x40..=0x7e => {
+                    if !skip {
+                        parse_private_csi(&self.buf, b, out);
+                    }
+                    self.buf.clear();
+                    self.state = ScanState::Ground;
+                }
+                0x1b => {
+                    self.buf.clear();
+                    self.state = ScanState::Esc;
+                }
+                // CSI の途中の制御文字（C0）は vte も実行して列を続ける = 状態はそのまま
+                _ => {}
             },
             ScanState::Osc => match b {
                 0x07 => self.finish(out), // BEL 終端
@@ -161,6 +216,26 @@ fn parse_osc(payload: &[u8]) -> Option<OscEvent> {
         parse_mark(mark)
     } else {
         None
+    }
+}
+
+/// `CSI ? 引数 終端` から対象イベントを取り出す（#2350）。`h` / `l` は引数のどれかが
+/// 2031 なら購読の切替（`CSI ? 2031 ; 2004 h` のようなまとめ書きも拾う）、`n` は引数が
+/// ちょうど 996 のときだけ問い合わせ
+fn parse_private_csi(params: &[u8], fin: u8, out: &mut Vec<OscEvent>) {
+    let mut params = params.split(|&b| b == b';');
+    match fin {
+        b'h' | b'l' => {
+            if params.any(|p| p == b"2031") {
+                out.push(OscEvent::ColorSchemeUpdates(fin == b'h'));
+            }
+        }
+        b'n' => {
+            if params.next() == Some(b"996") && params.next().is_none() {
+                out.push(OscEvent::ColorSchemeQuery);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -494,6 +569,9 @@ mod tests {
             b"\x1b\x1b\x1b]133;A\x07".to_vec(),
             b"\x1b]133;A\x1b]7;file:///a\x07".to_vec(),
             b"\x1b[31mred\x1b[0m\x1b]0;title\x07".to_vec(),
+            // #2350: mode 2031 の購読 / 問い合わせと、拾わない形（DECRQM・SGR・長すぎる引数）
+            b"\x1b[?2031h\x1b[?996n\x1b[?2031$p\x1b[38;5;1mx\x1b[?1049;2031l".to_vec(),
+            b"\x1b[?25l\x1b[?2031\x1b[?2031h\x1b[?99999999999999999999999999999999999999999999999999999999999999999999999;2031h".to_vec(),
             b"\x1b]133;D;0;aid=3\x1b\\".to_vec(),
             long,
             // 全角・非 ASCII バイトが Ground に混ざっても取りこぼさない
@@ -516,6 +594,60 @@ mod tests {
             want.extend(chunk.iter().flat_map(|b| slow.scan(&[*b])));
         }
         assert_eq!(got, want);
+    }
+
+    /// #2350: mode 2031（ライト / ダークの通知）の購読・解除・問い合わせを拾う。
+    /// tmux は attach 時に `ESC [ ? 2031 h ESC [ ? 996 n` を 1 度に書く
+    #[test]
+    fn mode2031の購読と問い合わせを拾う() {
+        let mut s = OscScanner::new();
+        assert_eq!(
+            s.scan(b"\x1b[?2031h\x1b[?996n"),
+            vec![
+                OscEvent::ColorSchemeUpdates(true),
+                OscEvent::ColorSchemeQuery
+            ]
+        );
+        assert_eq!(
+            s.scan(b"\x1b[?2031l"),
+            vec![OscEvent::ColorSchemeUpdates(false)]
+        );
+        // まとめ書き（どの位置でも）
+        assert_eq!(
+            s.scan(b"\x1b[?1049;2031;2004h"),
+            vec![OscEvent::ColorSchemeUpdates(true)]
+        );
+        // 分割読み（1 バイトずつ）でも同じ
+        let events = scan_all(&mut s, &[b"\x1b", b"[", b"?", b"20", b"31", b"h"]);
+        assert_eq!(events, vec![OscEvent::ColorSchemeUpdates(true)]);
+    }
+
+    #[test]
+    fn mode2031でない形は拾わない() {
+        let mut s = OscScanner::new();
+        for bytes in [
+            &b"\x1b[2031h"[..],     // `?` が無い（ANSI のモード）
+            b"\x1b[?20310h",        // 別の番号
+            b"\x1b[?2031$p",        // DECRQM（問い合わせは alacritty が答える）
+            b"\x1b[?2031;2$y",      // DECRPM
+            b"\x1b[?996;1n",        // 引数つき
+            b"\x1b[?997;1n",        // 答えの形（子が書いても問い合わせではない）
+            b"\x1b[?6n",            // DECXCPR
+            b"\x1b[?2031m",         // 別の終端
+            b"\x1b[38;5;2031m",     // SGR
+            b"\x1b[?20\x1b[31m31h", // 途中で ESC が来たら列は切れる
+        ] {
+            assert_eq!(s.scan(bytes), vec![], "{bytes:?}");
+        }
+        let mut long = b"\x1b[?".to_vec();
+        long.extend(std::iter::repeat_n(b'9', MAX_CSI_PARAMS + 5));
+        long.extend(b";2031h");
+        assert_eq!(s.scan(&long), vec![], "長すぎる引数は読み捨てる");
+        // 読み捨ての後も次の列を拾える
+        assert_eq!(
+            s.scan(b"\x1b[?2031h"),
+            vec![OscEvent::ColorSchemeUpdates(true)]
+        );
     }
 
     #[test]
