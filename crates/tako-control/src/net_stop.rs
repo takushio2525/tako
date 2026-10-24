@@ -1032,18 +1032,48 @@ mod tests {
         assert_ne!(print(&two), base, "通知が増えても同じ印");
     }
 
+    /// 閉じたポート（#2369）: 繋いだソケットの手元側の番号を、繋いだまま握って返す。
+    /// listener を drop した番号は使わない。macOS の std は socket() の後で CLOEXEC を立てるので、
+    /// その間に並列のテストが子を spawn すると listener が子に残り、drop しても待ち受けが閉じない。
+    /// 手元側の番号は一度も listen していないので子に残っても受け口にならず、握っている間は
+    /// connect の送信元にも配られない（自己接続しない）。どのソケットにも当たらない SYN は拒否（RST）で返る。
+    /// listen せず bind だけしたソケットは macOS では SYN を黙って捨て、拒否ではなく時間切れになるので使わない
+    struct ClosedPort {
+        port: u16,
+        _held: (std::net::TcpListener, std::net::TcpStream),
+    }
+
+    fn closed_port() -> ClosedPort {
+        let anchor = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let near = std::net::TcpStream::connect(anchor.local_addr().unwrap()).unwrap();
+        ClosedPort {
+            port: near.local_addr().unwrap().port(),
+            _held: (anchor, near),
+        }
+    }
+
     #[test]
     fn issue2112_到達確認は閉じたポートで失敗し_開いたポートで通る() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let target = ProbeTarget {
+        let target = |port| ProbeTarget {
             host: "127.0.0.1".into(),
             port,
             source: tako_core::net_resume::ProbeSource::Override,
         };
-        assert!(probe(&target, Duration::from_secs(2)).is_ok());
-        drop(listener);
-        assert!(probe(&target, Duration::from_secs(2)).is_err());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = target(listener.local_addr().unwrap().port());
+        assert!(probe(&open, Duration::from_secs(2)).is_ok());
+        let closed = closed_port();
+        assert!(probe(&target(closed.port), Duration::from_secs(2)).is_err());
+        // 時間切れではなく拒否で落ちている（黙って捨てる宛先では閉じたポートの検査にならない）。
+        // 10 秒は待ちではなく天井（拒否は macOS ではすぐ返り、Windows は RST の後に SYN を送り直してから返る）
+        let refused = std::net::TcpStream::connect_timeout(
+            &([127, 0, 0, 1], closed.port).into(),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            refused.map(|_| ()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::ConnectionRefused)
+        );
         // 名前解決できない名前（.invalid は解決されないことが保証された TLD）
         let bad = ProbeTarget {
             host: "tako-net-2112.invalid".into(),
