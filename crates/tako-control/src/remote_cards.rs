@@ -494,6 +494,16 @@ mod tests {
             let err = crate::dispatch::DispatchError::PaneNotFound(12).text_in(lang);
             assert_eq!(classify_error(400, &err), (404, "not_found"), "{err}");
         }
+        // #2365: カードの断りも表示言語に従う。実行中・不在・範囲外の分け方は日英で同じ
+        for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
+            use tako_core::CommandCardError as C;
+            let running = C::StillRunning { index: 1, pane: 9 }.text_in(lang);
+            assert_eq!(classify_error(400, &running), (409, "still_running"));
+            let gone = C::CardNotFound { id: 4 }.text_in(lang);
+            assert_eq!(classify_error(400, &gone), (404, "not_found"), "{gone}");
+            let range = C::IndexOutOfRange { index: 5, len: 1 }.text_in(lang);
+            assert_eq!(classify_error(400, &range), (400, "rejected"), "{range}");
+        }
         assert_eq!(
             classify_error(400, "このペインに表示中のコマンドカードが無い"),
             (404, "not_found")

@@ -286,7 +286,7 @@ if new:
   cli_case cardempty show-command --pane "${first:-0}" "   "
   mcp="$(mcp_call tako_show_command "{\"pane\":${first:-0},\"commands\":[]}" "$DIR/nocmds.mcp")"
   echo "$mcp" > "$DIR/nocmds.mcperr"
-  cli_case norun run "$base/norun.zzz2365"
+  cli_case norun run "$base/norun.zzz2365" --pane "${first:-0}"
 
   mcp="$(mcp_call tako_theme '{"action":"set-color","key":"accent","value":"#zz"}' "$DIR/invalid.mcp")"
   echo "$mcp" > "$DIR/invalid.mcperr"
