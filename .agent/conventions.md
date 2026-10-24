@@ -4651,6 +4651,16 @@ env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
   `APP_BIN` を「`ulimit` を掛けて本物を exec する包み」に替えて GUI にだけ掛ける。
   A/B は `TAKO_2359_LEGACY=1`、失敗の注入は `TAKO_2359_INJECT=setrlimit-fail`。
   形は `scripts/test-nofile-limit-2359.sh`
+- **器の tmux サーバーの fd の上限を測る検証は、soft を絞った GUI（`NOFILE_SOFT=64`）+ 器（`TAKO_PERSIST=1`）で
+  起こし、器のサーバーへ detached の window（`tmux -L <隔離ソケット> new-window -d 'sleep 600'`）を足して
+  埋める**（#2367。window 1 本でサーバーの fd 1 本・負荷は作らない）。サーバーの soft は tmux の中から
+  `tmux -L <隔離ソケット> run-shell 'ulimit -Sn'`（サーバーの子が受け継ぐ値）で読む。器のペインの子は
+  GUI 自身の実行ファイル（`__tako-container-exec`）を通って起きるので、器のペインのシェルの `ulimit -n`・
+  `$0`・`SHLVL`・`SHELL` を A/B（`TAKO_2367_LEGACY=1`）と並べて比べる。**既に起きているサーバーの上限は
+  変わらない**ので、A/B は起動ごとにソケットを分ける（`prepare_dirs`）。上限に届いたサーバーは生きたまま
+  すべての問い合わせを `server exited unexpectedly` で返す（後片付けの `kill-server` も届かない = 自分の
+  attach クライアントを先に落としてから）。形は `scripts/test-tmux-server-nofile-2367.sh`、cargo の実経路は
+  `crates/tako-cli/tests/issue2367_tmux_server_nofile.rs`（CLI の実行ファイルを段に置く）
 - **面を指定するのは `TAKO_DISPLAY=<名前 | UUID | index>`**。`TAKO_ISOLATED` /
   `TAKO_SELF_TEST` / `TAKO_VISUAL_TEST` のどれかが立っていれば**未指定でも** `tako-vd` を狙う
 - **名前が読めない瞬間がある**（#1697）。名前の出どころ（`system_profiler`）が読めない起動では
