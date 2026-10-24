@@ -29,9 +29,12 @@ use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
 use tako_core::test_residue::ScratchDir;
 
+#[path = "common/closed_port.rs"]
+mod closed_port;
 #[path = "common/lsp_fake_e2e.rs"]
 mod lsp_fake_e2e;
 
+use closed_port::closed_port;
 use lsp_fake_e2e::{stop_and_settle, wait_running};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
@@ -417,11 +420,8 @@ fn path_の古い版は確かめに落ちて信じない() {
 #[test]
 fn 確かめに落ちた後に取得も失敗したら理由と導入コマンドが残る() {
     let scratch = Scratch::new("broken");
-    // 閉じたポート = 接続できない（オフライン）
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    // 閉じたポート = 接続できない（オフライン。#2373）。取得が終わるまで握る
+    let offline = closed_port();
     let mut config = config(&scratch, Arc::default());
     config.launcher = Arc::new(|spec: &ServerSpec| Launch::Broken {
         program_path: format!("/opt/old/{}", spec.program),
@@ -429,7 +429,7 @@ fn 確かめに落ちた後に取得も失敗したら理由と導入コマン�
     });
     let fetch = FetchConfig::with_root(
         scratch.path("lsp-servers"),
-        Some(format!("http://127.0.0.1:{port}")),
+        Some(format!("http://127.0.0.1:{}", offline.port)),
     );
     let manager = LspManager::with_fetch(config, Some(fetch));
     let spec = servers::find_in(servers::SERVERS, "texlab").unwrap();
