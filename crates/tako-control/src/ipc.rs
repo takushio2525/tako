@@ -2525,4 +2525,70 @@ mod windows_tests {
             "drop したサーバー（{name}）へ繋がった"
         );
     }
+
+    /// 受け口へ 1 本繋いで `List` を 1 往復する（#2361）
+    fn list_over(name: &str) -> std::io::Result<String> {
+        let stream = named_pipe::connect_client(name, 3_000)?;
+        let mut writer = stream.try_clone()?;
+        let envelope = RequestEnvelope::new(1, TEST_TOKEN.to_string(), Request::List);
+        writeln!(writer, "{}", serde_json::to_string(&envelope).unwrap())?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        Ok(line)
+    }
+
+    /// ダミーの dispatch（何を受けても空の成功を返す）
+    fn spawn_echo(mut rx: futures::channel::mpsc::UnboundedReceiver<IncomingRequest>) {
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.reply.send(Ok(json!({})));
+            }
+        });
+    }
+
+    /// 条件が立つまで待つ（立たないまま上限を過ぎたら false）
+    fn wait_until(limit: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// #2361: 待ち受けのインスタンスを作れない間を挟んでも、作れるようになれば受け口が戻る。
+    /// 修正前は accept ループが最初の失敗で `break` し、注入が尽きても待ち受けが戻らなかった
+    /// （GUI は生きているのに CLI / MCP が届かない）
+    #[test]
+    fn issue2361_インスタンスを作れない間を挟んでも受け口が戻る() {
+        const INJECTED: u32 = 5;
+        let (tx, rx) = unbounded::<IncomingRequest>();
+        let server = IpcServer::start(tx, TEST_TOKEN.into()).unwrap();
+        spawn_echo(rx);
+        let name = server.endpoint().to_string();
+        // 1 本目は起動時に作ったインスタンスが受ける。受けた直後に作る次のインスタンスから失敗する
+        named_pipe::inject_create_failures(&name, INJECTED);
+        let first = list_over(&name).expect("1 本目は起動時のインスタンスが受ける");
+        assert!(!first.is_empty(), "1 本目の応答が空");
+        // 注入した失敗をすべて試み終える（= ループが作り直し続けている）
+        let taken = || named_pipe::injected_failures_taken(&name);
+        assert!(
+            wait_until(std::time::Duration::from_secs(20), || taken() >= INJECTED),
+            "注入した {INJECTED} 回のうち {} 回で作成を試みなくなった（accept ループが止まった）",
+            taken()
+        );
+        // 作れるようになったら待ち受けが戻り、2 本目が届く
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || {
+                named_pipe::probe_alive(&name)
+            }),
+            "作れるようになっても待ち受けが戻らない"
+        );
+        let second = list_over(&name).expect("戻った受け口へ 2 本目が届く");
+        assert!(!second.is_empty(), "2 本目の応答が空");
+    }
 }
