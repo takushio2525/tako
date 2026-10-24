@@ -20,21 +20,6 @@
 
 ---
 
-## 2026-10-23（#2203: usage 分析 S4 = 右パネルの usage ビュー。ステータスバーの 5h / 7d から開き、プロジェクト → Issue → 会話と掘る。読みは CLI と同じ `Request::Sessions` を `dispatch_off_ui` で・書式は `usage::display` を共有・`--issue` / `project:` / `profile:` / `none` / `--show`）
-- 実経路 `scripts/test-usage-panel-2203.sh` 22 PASS・CLI との照合 13 行一致・3 万会話で UI 占有 15 ms（A/B 旧 546 ms）・カタログ +355 B。PR #2336
-
-## 2026-10-23（#2329: リポジトリの .ps1 を 5.1 に対して (A) BOM で読める / (B) 1 行目の #Requires -Version 7.0 で止まる のどちらかへ = installer 5 本は (B)・measure-window.ps1 は (A)・tako.ps1 は例外表。番犬 `powershell51_watchdog` と checker `scripts/windows/check-powershell51.ps1`、CI の windows ジョブに 5.1 の実物の段）
-- 修正前 main は 5 本が broken（verify-assets.ps1 は CP1252 22 件 / CP932 27 件）→ 0 本・カタログ +0 B。PR #2335
-
-## 2026-10-23（#2330: 狭いペインで本文の先頭と `❯` 行が入力欄から流れ、届いた送達を gave_up にしていた → 諦める前に transcript で受領を確かめ `received`。master 同士の close は受領済みの後任・タブのそのプロファイルの最後の master を force でも断る（別タブの後任が前任を閉じる close は通す）・guide handoff に確かめ方）
-- 実経路 `scripts/test-handoff-close-2330.sh` 修正前 gave_up + 相互 close で master 0 人 → 修正後 PASS=24・注入 A/B で番犬が file:line を名指し・カタログ +193 B。PR #2334
-
-## 2026-10-23（#2322: パレットの「表示モードを切り替え（かんたん / ターミナル）」→「表示モードを切替（かんたん・ターミナル）」・「新しいタブ」→「新規タブ」・tako-core の案内文の項目名も揃え、#1830 の番犬を全固定コマンドの分類（対 13 / 例外 10）へ広げた）
-- 修正前 4 本赤 → 修正後 72 passed・注入で palette.rs:33/34・GuiModeToggle.astro:68/86 を名指し・カタログ +0 B。PR #2337
-
-## 2026-10-23（#2324: 狭いペインの全角ラベルの折り返しを `dialog::seam` が画面の証拠で決め、決まらなければ確実な先頭 + `label_truncated`。長い語の規則は `long_word_evidence` のときだけ説明と読む）
-- 実物の claude 2.1.301 の 8 種 × 24 幅（978 選択肢）で食い違い申告なし 92 → 0・注入 9 通り・A/B `TAKO_2324_LEGACY=1`・カタログ +0 B。PR #2339
-
 ## 2026-10-23（#2013: セルフテスト項目 93 (c)（#694 の判定表）を固定 4 秒窓から `wait_for_app_state` + `state_wait_budget` へ・番犬 `表示種別の判定を固定窓で待っていない`。#2012 は今の main で未再現のため閉じた）
 - 旧 + 注入 late で FAILED → 新 + late で通過・never で FAILED・カタログ +0 B。PR #2342
 
@@ -79,3 +64,18 @@
 
 ## 2026-10-24（#2355: 項目 154 の E4 の間欠の真因はテスト = 流していたシェルのループが ^C を取りこぼす（素の zsh で 450 回中 9 回）→ ループをサブシェルで包み、止まったことを状態で待つ）
 - A/B `TAKO_2355_LEGACY=1` + 注入 `lostint` で旧は FAILED・新は通過・5 回完走・カタログ +0 B。漏れの判定の偽の緑は #2371。PR #2370
+
+## 2026-10-24（#2369: net_stop の到達確認のテストが listener を drop した番号を「閉じたポート」に使い、並列の spawn が fd を子へ持ち出すと繋がっていた → 繋いだソケットの手元側の番号を握って使い、`ConnectionRefused` で落ちることも確かめる）
+- 持ち出しの注入で修正前 FAILED → 修正後 ok・全体と並列 30/30・カタログ +0 B。同型の LSP テスト 2 本は #2373、CLOEXEC の非原子性は #1788 へ。PR #2374
+
+## 2026-10-24（#2367: 器の tmux サーバーへ引き上げた fd 上限を渡す = attach クライアントだけ戻さず、器のペインの子は GUI 自身の段 `__tako-container-exec` で起動時の値へ戻してから tmux と同じ形で exec。check-health の `fd_limit.container`・FR-2.2.16）
+- 実経路 22 PASS（修正前は soft 64 で window 53 本・新しいペインが消える → 修正後は 10240・器のシェルは 64 のまま）・カタログ +0 B。17:45 に install・本番の器は soft 2560。PR #2376
+
+## 2026-10-24（#2352: 番犬の 3.2 の写しが行継続を 3.2 と同じ文脈で取り除いてから読む = `join_continuations32`。波括弧・pipefail・rm の 3 本が通す・表に行継続の飾り）
+- 突き合わせ 修正前 63 箇所 → 0・注入で 63 に戻る・リポジトリの名指しは前後とも 0・カタログ +0 B。申し送り #2378。PR #2375
+
+## 2026-10-24（#2365 の 1 本目: dispatch と前段（CLI / MCP）の理由の文と orchestrator layout の値の断りを `tako_control::Reason` / `tako_core::LayoutParamError` の日英の網羅 match へ。MCP の stdio ブリッジは設定から表示言語を決める）
+- 実経路 修正前 PASS=69 FAIL=30 → 修正後 PASS=99・日本語表示 66 本バイト一致・注入 4 通りで file:line を名指し・カタログ +0 B。残りは #2365 の続き。PR #2379
+
+## 2026-10-24（#2361: Windows の accept ループがパイプのインスタンスを作れないと break して止まっていた → `ipc_socket::create_with_retry` が 100 ms から倍々・最長 5 秒の間で作り直す・persist.log は途切れの始まりと戻りの 2 行・check-health に `ipc.pipe`）
+- Windows CI で修正前 FAILED → 修正後緑・番犬の注入で ipc.rs:498 を名指し・カタログ +0 B。Windows 実機は未確認（manual-checks に手順）。PR #2380
