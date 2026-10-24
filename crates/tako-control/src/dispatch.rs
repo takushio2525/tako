@@ -19178,6 +19178,15 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     {
         issues.push(issue);
     }
+    // #2361: Windows の名前付きパイプの待ち受けを作れないまま（作り直しを待っている）。
+    // この間は名前付きパイプ越し（CLI / MCP の stdio）には届かないので、読めるのは
+    // HTTP の MCP と GUI 自身の診断。戻った後は `ipc.pipe` の記録で読む
+    if let Some(issue) = tako_core::ipc_socket::pipe()
+        .as_ref()
+        .and_then(ipc_pipe_issue)
+    {
+        issues.push(issue);
+    }
     // #2359: fd の使用数と上限。上限に届くと IPC の接続を受けてもすぐ閉じる（接続ごとの
     // try_clone が EMFILE）ので CLI / MCP は届かない（= この診断も届かない）。届くうちに申告する
     let fd_startup = tako_core::platform::fd_limit::startup_report();
@@ -19329,6 +19338,8 @@ fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus) -> Value {
         "error": status.error,
         // #2002: 受け口の見張り（null = 見張っていない = windows / A/B）
         "watch": tako_core::ipc_socket::watch().as_ref().map(|w| ipc_watch_describe(w, unix_ms_now())),
+        // #2361: 名前付きパイプの待ち受けの作り直し（null = windows 以外 / A/B）
+        "pipe": tako_core::ipc_socket::pipe().as_ref().map(|p| ipc_pipe_describe(p, unix_ms_now())),
         // #2360: 起動時に固定パスで見た先客（null = 確かめていない・ファイルが無かった）
         "fixed_path": tako_core::ipc_socket::fixed_path().map(ipc_fixed_path_describe),
     })
@@ -19362,6 +19373,49 @@ fn ipc_watch_describe(watch: &tako_core::ipc_socket::IpcWatch, now_ms: u64) -> V
         })),
         "error": watch.error,
     })
+}
+
+/// `ipc.pipe` 節（#2361）。`listening=false` ならいま待ち受けのインスタンスを作れず
+/// （`streak` 回続けて失敗・`retry_ms` 後に作り直す）、名前付きパイプ越しの CLI / MCP は届かない。
+/// `last_recovery` は最後に戻った記録、`folded_outages` は persist.log へ書かずに畳んだ途切れ
+fn ipc_pipe_describe(pipe: &tako_core::ipc_socket::PipeInstances, now_ms: u64) -> Value {
+    json!({
+        "listening": pipe.healthy(),
+        "failures": pipe.failures,
+        "streak": pipe.streak,
+        "outages": pipe.outages,
+        "folded_outages": pipe.folded_outages,
+        "retry_ms": pipe.retry_ms,
+        "retry_max_ms": pipe.retry_max_ms,
+        "down_secs": pipe.down_since_unix_ms.map(|at| now_ms.saturating_sub(at) / 1000),
+        "error": pipe.error,
+        "last_recovery": pipe.last_recovery.as_ref().map(|r| json!({
+            "failures": r.failures,
+            "down_ms": r.down_ms,
+            "error": r.error,
+            "at_unix_ms": r.at_unix_ms,
+            "secs_ago": now_ms.saturating_sub(r.at_unix_ms) / 1000,
+        })),
+    })
+}
+
+/// 名前付きパイプの待ち受けを作れないままのときの申告（#2361）。作れていれば黙る
+fn ipc_pipe_issue(pipe: &tako_core::ipc_socket::PipeInstances) -> Option<Value> {
+    if pipe.healthy() {
+        return None;
+    }
+    let message = format!(
+        "IPC の名前付きパイプの待ち受けを作れていない（tako CLI / MCP の stdio は届かない）: {}・\
+         {} 回続けて失敗。間を置いて（最長 {} 秒ごとに）作り直している。戻らなければ tako を再起動する（#2361）",
+        pipe.error.as_deref().unwrap_or("理由不明"),
+        pipe.streak,
+        pipe.retry_max_ms / 1000,
+    );
+    Some(json!({
+        "level": "warning",
+        "check": "ipc",
+        "message": message,
+    }))
 }
 
 fn unix_ms_now() -> u64 {
@@ -53533,6 +53587,54 @@ mod issue2002_tests {
             "{message}"
         );
         assert!(message.contains("10 秒ごとにやり直す"), "{message}");
+    }
+}
+
+/// #2361: `check_health` の `ipc.pipe` 節と、待ち受けを作れないままのときの申告
+#[cfg(test)]
+mod issue2361_tests {
+    use super::*;
+    use tako_core::ipc_socket::{PipeInstances, PipeRetryPolicy};
+
+    #[test]
+    fn 作れないままなら申告し戻れば黙って記録を出す() {
+        let mut pipe = PipeInstances::new(PipeRetryPolicy::DEFAULT);
+        assert!(ipc_pipe_issue(&pipe).is_none(), "何も起きていなければ黙る");
+        let v = ipc_pipe_describe(&pipe, 0);
+        assert_eq!(v["listening"], json!(true));
+        assert_eq!(v["failures"], json!(0));
+        assert_eq!(v["retry_max_ms"], json!(5_000));
+        assert_eq!(v["last_recovery"], Value::Null);
+
+        let error = "Insufficient system resources exist (os error 1450)";
+        pipe.on_failure(error, 1_000_000);
+        pipe.on_failure(error, 1_000_100);
+        let v = ipc_pipe_describe(&pipe, 1_004_000);
+        assert_eq!(v["listening"], json!(false));
+        assert_eq!(v["streak"], json!(2));
+        assert_eq!(v["retry_ms"], json!(200));
+        assert_eq!(v["down_secs"], json!(4));
+        assert_eq!(v["error"], json!(error));
+        let issue = ipc_pipe_issue(&pipe).expect("作れないままは申告する");
+        assert_eq!(issue["check"], json!("ipc"));
+        assert_eq!(issue["level"], json!("warning"));
+        let message = issue["message"].as_str().unwrap();
+        assert!(message.contains("os error 1450"), "{message}");
+        assert!(message.contains("2 回続けて失敗"), "{message}");
+        assert!(message.contains("最長 5 秒ごと"), "{message}");
+
+        pipe.on_created(1_005_000);
+        assert!(ipc_pipe_issue(&pipe).is_none(), "戻ったら申告しない");
+        let v = ipc_pipe_describe(&pipe, 1_012_000);
+        assert_eq!(v["listening"], json!(true));
+        assert_eq!(
+            (v["failures"].clone(), v["outages"].clone()),
+            (json!(2), json!(1))
+        );
+        assert_eq!(v["last_recovery"]["failures"], json!(2));
+        assert_eq!(v["last_recovery"]["down_ms"], json!(5_000));
+        assert_eq!(v["last_recovery"]["secs_ago"], json!(7));
+        assert_eq!(v["last_recovery"]["error"], json!(error));
     }
 }
 

@@ -129,6 +129,10 @@ pub struct IpcServer {
     #[cfg(unix)]
     #[cfg_attr(not(test), allow(dead_code))]
     watch: std::sync::Arc<std::sync::Mutex<tako_core::ipc_socket::IpcWatch>>,
+    /// 名前付きパイプの待ち受けの記録（#2361。accept スレッドが作り直すたびに書く）
+    #[cfg(windows)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pipe: std::sync::Arc<std::sync::Mutex<tako_core::ipc_socket::PipeInstances>>,
     /// 起動時に固定パスを生きた受け口が握っていたので一時パスで立てたなら、その先客（#2360）
     fixed_path_holder: Option<tako_core::ipc_socket::Occupant>,
 }
@@ -201,6 +205,12 @@ impl IpcServer {
     #[cfg(all(test, unix))]
     fn watch_snapshot(&self) -> tako_core::ipc_socket::IpcWatch {
         self.watch.lock().map(|w| w.clone()).unwrap_or_default()
+    }
+
+    /// 名前付きパイプの待ち受けの記録の写し（#2361 のテスト用）
+    #[cfg(all(test, windows))]
+    fn pipe_snapshot(&self) -> tako_core::ipc_socket::PipeInstances {
+        self.pipe.lock().map(|p| p.clone()).unwrap_or_default()
     }
 }
 
@@ -389,7 +399,10 @@ mod conn {
 
 #[cfg(windows)]
 mod windows_imp {
+    use std::sync::{Arc, Mutex};
+
     use futures::channel::mpsc::UnboundedSender;
+    use tako_core::ipc_socket::{PipeInstances, PipeRetryPolicy};
 
     use super::{accept_stop_pair, conn, IncomingRequest, IpcServer};
     use crate::platform::named_pipe;
@@ -462,8 +475,13 @@ mod windows_imp {
             well_known_bytes: 0,
             error: None,
         });
+        // #2361: 検証用の注入（1 本受けた後に作るインスタンスを N 回失敗させる）
+        if let Some(count) = tako_core::ipc_socket::inject_2361() {
+            named_pipe::inject_create_failures(&name, count);
+        }
 
-        serve(first, name, tx, token)
+        // #2361: 本体の受け口だけが記録と persist.log へ出す（単体テストは出さない）
+        serve(first, name, tx, token, PipeConfig::from_env(!cfg!(test)))
     }
 
     /// 明示したパイプ名で張る（#1994。先客が居れば失敗する）
@@ -473,7 +491,52 @@ mod windows_imp {
         name: &str,
     ) -> std::io::Result<IpcServer> {
         let first = named_pipe::create_server_instance(name, true)?;
-        serve(first, name.to_string(), tx, token)
+        // 順番待ちの隔離の受け口も作り直すが、本体の記録・persist.log へは出さない
+        serve(
+            first,
+            name.to_string(),
+            tx,
+            token,
+            PipeConfig::from_env(false),
+        )
+    }
+
+    /// 単体テスト用: 一時名で、作り直しの間の決め方と A/B を指定して立てる（#2361。
+    /// env は並列のテストで共有されるので引数で渡す）
+    #[cfg(test)]
+    pub(super) fn start_with_retry(
+        tx: UnboundedSender<IncomingRequest>,
+        token: String,
+        policy: PipeRetryPolicy,
+        legacy: bool,
+    ) -> std::io::Result<IpcServer> {
+        let name = temp_pipe_name();
+        let first = named_pipe::create_server_instance(&name, true)?;
+        let config = PipeConfig {
+            policy,
+            legacy,
+            publish: false,
+        };
+        serve(first, name, tx, token, config)
+    }
+
+    /// 待ち受けの作り直しの設定（#2361）
+    struct PipeConfig {
+        policy: PipeRetryPolicy,
+        /// 修正前（作れないと accept ループが止まる）の A/B（`TAKO_2361_LEGACY=1`）
+        legacy: bool,
+        /// 記録（`check_health` の `ipc.pipe`）と persist.log へ出すか（本体の受け口だけ）
+        publish: bool,
+    }
+
+    impl PipeConfig {
+        fn from_env(publish: bool) -> Self {
+            PipeConfig {
+                policy: PipeRetryPolicy::DEFAULT,
+                legacy: tako_core::ipc_socket::legacy_2361(),
+                publish,
+            }
+        }
     }
 
     fn serve(
@@ -481,25 +544,56 @@ mod windows_imp {
         name: String,
         tx: UnboundedSender<IncomingRequest>,
         token: String,
+        config: PipeConfig,
     ) -> std::io::Result<IpcServer> {
         let accept_name = name.clone();
         let accept_token = token;
         let (accept, guard) = accept_stop_pair();
+        let pipe = Arc::new(Mutex::new(PipeInstances::new(config.policy)));
+        // 待ち受けを作り直す受け口だと `check_health` に出す（A/B の修正前は記録しない）
+        if config.publish && !config.legacy {
+            tako_core::ipc_socket::record_pipe(&name, &PipeInstances::new(config.policy));
+        }
+        let shared = pipe.clone();
         std::thread::Builder::new()
             .name("tako-ipc-accept".into())
             .spawn(move || {
                 let mut next = Some(first);
+                let mut record = PipeInstances::new(config.policy);
                 loop {
                     let instance = match next.take() {
                         Some(instance) => instance,
-                        None => match named_pipe::create_server_instance(&accept_name, false) {
-                            Ok(instance) => instance,
-                            Err(e) => {
-                                tracing::warn!("IPC パイプインスタンスを作れない: {e}");
-                                break;
+                        // #2361 の A/B: 修正前は 1 回作れないと止まった（待ち受けが残らない）
+                        None if config.legacy => {
+                            match named_pipe::create_server_instance(&accept_name, false) {
+                                Ok(instance) => instance,
+                                Err(e) => {
+                                    tracing::warn!("IPC パイプインスタンスを作れない: {e}");
+                                    break;
+                                }
                             }
-                        },
+                        }
+                        // #2361: 作れなければ間を置いて作り直す（止まらない）
+                        None => {
+                            let created = tako_core::ipc_socket::create_with_retry(
+                                &mut record,
+                                || named_pipe::create_server_instance(&accept_name, false),
+                                std::thread::sleep,
+                                || guard.stopping(),
+                                tako_core::ipc_socket::unix_now_ms,
+                                |rec, line| publish_pipe(&shared, &accept_name, &config, rec, line),
+                            );
+                            match created {
+                                Some(instance) => instance,
+                                None => break,
+                            }
+                        }
                     };
+                    // 作り直しの間に drop が止めにかかっていた（待ち受けが無かったので、起こす
+                    // 1 本は繋がらずに終わっている）。ここで待つと誰も起こさないので待たずに抜ける
+                    if guard.stopping() {
+                        break;
+                    }
                     let waited = instance.wait_client();
                     // #2136: drop が起こした。次のインスタンスを作らずに抜ける（= 待ち受けが消える）
                     if guard.stopping() {
@@ -533,9 +627,35 @@ mod windows_imp {
             endpoint: name,
             pointer: None,
             accept,
+            pipe,
             // 名前付きパイプは先客を OS が弾く（`first_pipe_instance`）= 生存確認を持たない
             fixed_path_holder: None,
         })
+    }
+
+    /// 待ち受けの記録が変わった（#2361）。テスト用の写しを更新し、本体の受け口なら
+    /// `check_health` の記録と persist.log（途切れの始まりと戻りの 1 行。**パイプ名は載せない**
+    /// = ユーザー名を含む）へ出す
+    fn publish_pipe(
+        shared: &Mutex<PipeInstances>,
+        name: &str,
+        config: &PipeConfig,
+        record: &PipeInstances,
+        line: Option<String>,
+    ) {
+        if let Ok(mut slot) = shared.lock() {
+            *slot = record.clone();
+        }
+        if let Some(line) = &line {
+            tracing::warn!("{line}");
+        }
+        if !config.publish {
+            return;
+        }
+        if let Some(line) = line {
+            crate::diag::persist_log(&format!("{line} [pid {}]", std::process::id()));
+        }
+        tako_core::ipc_socket::record_pipe(name, record);
     }
 }
 
@@ -2590,5 +2710,110 @@ mod windows_tests {
         );
         let second = list_over(&name).expect("戻った受け口へ 2 本目が届く");
         assert!(!second.is_empty(), "2 本目の応答が空");
+    }
+
+    /// テスト用の作り直しの間（1 ms から倍々で 4 ms まで = 実時間をほぼ使わない）
+    const FAST: tako_core::ipc_socket::PipeRetryPolicy = tako_core::ipc_socket::PipeRetryPolicy {
+        base_ms: 1,
+        max_ms: 4,
+    };
+
+    /// accept スレッドが終わったか（終わると `done` の送り手が落ちる）
+    fn accept_ended(server: &IpcServer) -> bool {
+        matches!(
+            server.accept.done.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        )
+    }
+
+    /// #2361: 作り直しの回数と間は上限つきで記録に残り、受け口は戻る（実時間ではなく回数・状態で見る）
+    #[test]
+    fn issue2361_作り直しの回数と間は上限つきで記録に残る() {
+        const INJECTED: u32 = 6;
+        let (tx, rx) = unbounded::<IncomingRequest>();
+        let server = windows_imp::start_with_retry(tx, TEST_TOKEN.into(), FAST, false).unwrap();
+        spawn_echo(rx);
+        let name = server.endpoint().to_string();
+        named_pipe::inject_create_failures(&name, INJECTED);
+        list_over(&name).expect("1 本目は起動時のインスタンスが受ける");
+        assert!(
+            wait_until(std::time::Duration::from_secs(20), || server
+                .pipe_snapshot()
+                .last_recovery
+                .is_some()),
+            "戻らない: {:?}",
+            server.pipe_snapshot()
+        );
+        let pipe = server.pipe_snapshot();
+        assert_eq!(named_pipe::injected_failures_taken(&name), INJECTED);
+        assert_eq!(
+            (pipe.failures, pipe.streak, pipe.outages),
+            (u64::from(INJECTED), 0, 1),
+            "{pipe:?}"
+        );
+        // 失敗 1 回ごとに 1 回だけ眠り、間は 1 → 2 → 4 ms で上限に張り付く
+        assert_eq!(pipe.waited_ms, 1 + 2 + 4 + 4 + 4 + 4, "{pipe:?}");
+        let recovery = pipe.last_recovery.as_ref().unwrap();
+        assert_eq!(recovery.failures, INJECTED);
+        assert!(recovery.error.contains("1450"), "{recovery:?}");
+        assert!(!accept_ended(&server), "accept スレッドは生きている");
+        list_over(&name).expect("戻った受け口へ 2 本目が届く");
+    }
+
+    /// #2361 の A/B: 修正前（`legacy`）は 1 回作れないと accept スレッドが終わり、注入が尽きても
+    /// 待ち受けが戻らない（上の 2 本のテストはこの形で落ちる）
+    #[test]
+    fn issue2361_修正前は作れないと待ち受けが止まったまま戻らない() {
+        let (tx, rx) = unbounded::<IncomingRequest>();
+        let server = windows_imp::start_with_retry(tx, TEST_TOKEN.into(), FAST, true).unwrap();
+        spawn_echo(rx);
+        let name = server.endpoint().to_string();
+        named_pipe::inject_create_failures(&name, 1);
+        list_over(&name).expect("1 本目は起動時のインスタンスが受ける");
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || accept_ended(&server)),
+            "修正前の accept ループが止まらなかった"
+        );
+        assert_eq!(named_pipe::injected_failures_taken(&name), 1);
+        // 注入は尽きている（作れば作れる）のに、もう誰も作らない
+        assert!(!named_pipe::probe_alive(&name), "待ち受けが残っている");
+        assert!(
+            named_pipe::connect_client(&name, 200).is_err(),
+            "止まった受け口へ繋がった"
+        );
+        assert_eq!(server.pipe_snapshot().failures, 0, "修正前は記録しない");
+    }
+
+    /// #2361: 作り直しを待っている最中に止めにかかったら、作らずに抜ける（待ち受けを残さない）
+    #[test]
+    fn issue2361_作り直しの最中に止めると待ち受けを残さず抜ける() {
+        let (tx, rx) = unbounded::<IncomingRequest>();
+        let server = windows_imp::start_with_retry(tx, TEST_TOKEN.into(), FAST, false).unwrap();
+        spawn_echo(rx);
+        let name = server.endpoint().to_string();
+        named_pipe::inject_create_failures(&name, u32::MAX);
+        list_over(&name).expect("1 本目は起動時のインスタンスが受ける");
+        assert!(
+            wait_until(std::time::Duration::from_secs(10), || server
+                .pipe_snapshot()
+                .streak
+                >= 2),
+            "作り直しが続かない"
+        );
+        // drop と同じ止め方（待ち受けが無いので起こす 1 本は繋がらない = 待たずに戻る）
+        server.accept.close(&name, true);
+        assert_eq!(
+            server
+                .accept
+                .done
+                .recv_timeout(std::time::Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "作り直しの最中に止めても accept スレッドが終わらない"
+        );
+        named_pipe::inject_create_failures(&name, 0);
+        assert!(
+            !named_pipe::probe_alive(&name),
+            "止めた後に待ち受けを作った"
+        );
     }
 }

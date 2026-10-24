@@ -485,7 +485,7 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      fd の上限（launchd の既定 256 を模して 160）は「繋がるが送信で ENOTCONN」で、
      どちらも負荷が引けば戻る。**戻らない refused を作ったのは「同じパスを別の受け口が
      作り直して閉じた」形だけ**（GUI の accept スレッドは `__accept` で待機・CPU 0%）。
-     Windows の named pipe はパスに実体が無いので対象外
+     Windows の named pipe はパスに実体が無いので対象外（Windows の「戻らない」は 9）
   7. **fd の上限を起動時に引き上げる**（#2359 / FR-2.2.14）。上の a2 の形（上限に届くと
      接続を受けても `spawn_conn` の `try_clone` が EMFILE で落ちてすぐ閉じ、CLI は送信の
      ENOTCONN / EPIPE / EINVAL か「応答が返らなかった」）を、Finder 起動の soft 256 では
@@ -518,6 +518,22 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      実行ファイルが置き換わったら（置いたときの dev / inode と違う）段を使わない: 印を知らない古い版の
      GUI は印を無視して窓を開いてしまうので、その間の器のペインは修正前の形で起こす。
      既に走っているサーバーの上限は変わらない（`fd_limit.container.limit = predates`）
+  9. **Windows の名前付きパイプの待ち受けを作れなくても止まらない**（#2361 / FR-2.2.17）。
+     accept スレッドは 1 本受けるたびに次のインスタンスを作って待つ。修正前はその作成が
+     1 回失敗すると `break` してスレッドごと終わり、待ち受けが 1 つも残らなかった
+     （GUI は生きているのに CLI / MCP の stdio が届かない。コードと注入で再現・実機は未確認）。
+     いまは `ipc_socket::create_with_retry` が作れるまで 100 ms から倍々で最長 5 秒の間を置いて
+     作り直す（失敗 1 回に眠り 1 回 = 作成は最長 5 秒に 1 回まで。眠りは accept スレッドの中）。
+     眠った後に drop が止めにかかっていれば作らずに抜け、作った直後にも止めを見てから待つ
+     （待ち受けが無い間は drop の起こす 1 本が繋がらないので、待つと誰も起こさない）。
+     続いた失敗は 1 回の途切れとして `PipeInstances` に数え、persist.log へ始まりと戻りの 2 行
+     （60 秒以内に続く途切れは畳んで数だけ残す・パイプ名は載せない）、`check_health` の
+     `ipc.pipe` と作れないままの warning。A/B は `TAKO_2361_LEGACY=1`、注入は
+     `TAKO_2361_INJECT=<回数>`（`named_pipe::create_server_instance` の入口で効く。
+     テストは名前ごとの `named_pipe::inject_create_failures`）。
+     **残る穴**: 1 本受けてから次のインスタンスを作るまでの一瞬は待ち受けが無く、その間に繋いだ
+     クライアントは `ERROR_FILE_NOT_FOUND` で即座に失敗する（修正前からある窓。作り直しの間は
+     この窓が最長 5 秒に伸びる）
 
 - **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
   `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。

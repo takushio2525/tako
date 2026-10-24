@@ -7975,6 +7975,42 @@ fn print_queue_status(v: &Value) {
     print_queue_section(&v["queue"]);
 }
 
+/// `ipc.pipe` の 1 行（#2361。節が無ければ `None` = windows 以外・旧版の応答）
+fn pipe_line(pipe: &Value) -> Option<String> {
+    if !pipe.is_object() {
+        return None;
+    }
+    let max_secs = pipe["retry_max_ms"].as_u64().unwrap_or(0) / 1000;
+    if pipe["listening"].as_bool() == Some(false) {
+        return Some(format!(
+            "  パイプの待ち受け: 作れていない（{} 回続けて失敗・{}）。{} ms 後に作り直す（最長 {max_secs} 秒ごと）。\
+             この間は tako CLI / MCP の stdio が届かない（#2361）",
+            pipe["streak"].as_u64().unwrap_or(0),
+            pipe["error"].as_str().unwrap_or("理由不明"),
+            pipe["retry_ms"].as_u64().unwrap_or(0),
+        ));
+    }
+    let outages = pipe["outages"].as_u64().unwrap_or(0);
+    if outages == 0 {
+        return Some(format!(
+            "  パイプの待ち受け: 正常（作れなければ最長 {max_secs} 秒ごとに作り直す）"
+        ));
+    }
+    let mut line = format!(
+        "  パイプの待ち受け: 正常・これまでに途切れ {outages} 回（作れなかった {} 回）",
+        pipe["failures"].as_u64().unwrap_or(0),
+    );
+    if let Some(last) = pipe["last_recovery"].as_object() {
+        line.push_str(&format!(
+            "（最後: {} 秒前に {} 回続けて作れなかった後に戻った・{}）",
+            last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
+            last.get("failures").and_then(Value::as_u64).unwrap_or(0),
+            last.get("error").and_then(Value::as_str).unwrap_or("?"),
+        ));
+    }
+    Some(line)
+}
+
 /// 繋ぐ側からの受け口の診断（#1441）。置き場の決め方は
 /// `tako_core::ipc_socket` の 1 実装を通す（bind 側と同じ規則で引く）
 fn local_ipc_report() -> Value {
@@ -8023,11 +8059,7 @@ fn local_gui_report() -> Option<Value> {
     };
     let next = match state {
         "not_running" => Some("tako を起動する".to_string()),
-        "alive_unreachable" => Some(format!(
-            "tako は受け口を {} 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。\
-             戻らなければ tako を再起動する（#2002）",
-            tako_core::ipc_socket::WATCH_INTERVAL_MS_DEFAULT / 1000
-        )),
+        "alive_unreachable" => Some(alive_unreachable_next(cfg!(windows))),
         _ => None,
     };
     Some(serde_json::json!({
@@ -8039,6 +8071,24 @@ fn local_gui_report() -> Option<Value> {
         "state": state,
         "next": next,
     }))
+}
+
+/// GUI は動いているのに受け口が応答しないときの次の一手（#2002 / #2361）。
+/// 立て直し方が OS で違う（unix = パスの見張りと張り直し・windows = パイプの待ち受けの作り直し）
+fn alive_unreachable_next(windows: bool) -> String {
+    if windows {
+        format!(
+            "tako はパイプの待ち受けを作れなければ最長 {} 秒ごとに作り直す。少し待って tako check-health をもう一度。\
+             戻らなければ tako を再起動する（#2361）",
+            tako_core::ipc_socket::PIPE_RETRY_MAX_MS / 1000
+        )
+    } else {
+        format!(
+            "tako は受け口を {} 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。\
+             戻らなければ tako を再起動する（#2002）",
+            tako_core::ipc_socket::WATCH_INTERVAL_MS_DEFAULT / 1000
+        )
+    }
 }
 
 /// 受け口へ 1 本繋いでみる（認証はしない）。`ok` / `refused`（ファイルはあるが誰も受けない）/
@@ -8272,6 +8322,10 @@ fn ipc_recovery_lines(ipc: &Value) -> Vec<String> {
         if let Some(error) = watch["error"].as_str() {
             lines.push(format!("  張り直せない理由: {error}"));
         }
+    }
+    // #2361: Windows の名前付きパイプの待ち受け（作れない間は間を置いて作り直す）
+    if let Some(line) = pipe_line(&ipc["pipe"]) {
+        lines.push(line);
     }
     // #2360: 起動時に固定パスで見た先客（奪わずに一時パスで立てた・残骸を作り直した）
     let fixed = &ipc["fixed_path"];
@@ -13998,6 +14052,50 @@ mod tests {
         );
         // 節が無い（確かめていない・旧版の応答）なら何も足さない
         assert!(ipc_recovery_lines(&serde_json::json!({ "fixed_path": null })).is_empty());
+    }
+
+    /// #2361: Windows の名前付きパイプの待ち受けを 1 行で出す（作れていない・正常・途切れの後に戻った）
+    #[test]
+    fn issue2361_パイプの待ち受けを1行で出す() {
+        let down = serde_json::json!({
+            "pipe": { "listening": false, "streak": 3, "error": "Insufficient system resources exist (os error 1450)", "retry_ms": 400, "retry_max_ms": 5000 }
+        });
+        assert_eq!(
+            ipc_recovery_lines(&down),
+            ["  パイプの待ち受け: 作れていない（3 回続けて失敗・Insufficient system resources exist (os error 1450)）。400 ms 後に作り直す（最長 5 秒ごと）。この間は tako CLI / MCP の stdio が届かない（#2361）"]
+        );
+        let quiet = serde_json::json!({
+            "pipe": { "listening": true, "outages": 0, "failures": 0, "retry_max_ms": 5000, "last_recovery": null }
+        });
+        assert_eq!(
+            ipc_recovery_lines(&quiet),
+            ["  パイプの待ち受け: 正常（作れなければ最長 5 秒ごとに作り直す）"]
+        );
+        let recovered = serde_json::json!({
+            "pipe": {
+                "listening": true, "outages": 2, "failures": 7, "retry_max_ms": 5000,
+                "last_recovery": { "secs_ago": 12, "failures": 5, "error": "os error 1450" }
+            }
+        });
+        assert_eq!(
+            ipc_recovery_lines(&recovered),
+            ["  パイプの待ち受け: 正常・これまでに途切れ 2 回（作れなかった 7 回）（最後: 12 秒前に 5 回続けて作れなかった後に戻った・os error 1450）"]
+        );
+        // 節が無い（windows 以外・旧版の応答）なら何も足さない
+        assert!(ipc_recovery_lines(&serde_json::json!({ "pipe": null })).is_empty());
+    }
+
+    /// #2361: アプリへ届かないときの次の一手は OS の立て直し方に合わせる（unix の文は #2002 のまま）
+    #[test]
+    fn issue2361_届かないときの次の一手はosの立て直し方に合わせる() {
+        assert_eq!(
+            alive_unreachable_next(false),
+            "tako は受け口を 10 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2002）"
+        );
+        assert_eq!(
+            alive_unreachable_next(true),
+            "tako はパイプの待ち受けを作れなければ最長 5 秒ごとに作り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2361）"
+        );
     }
 
     /// #1962: mod の帯のボタン（tako の操作 9 つと shell）が叩く引数を、この CLI が要求へ組める
