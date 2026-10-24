@@ -143,9 +143,9 @@ first_pane() {
 # 出る前に送った行は器の attach の途中で落ちることがあり、送り直すとプローブの読みに
 # 打鍵が混ざる（raw の端末から読むので）。だから「出てから 1 回だけ送る」
 wait_prompt() {
-  local pane="$1" i
+  local pane="$1" i screen
   for i in $(seq 1 300); do
-    "$TAKO_BIN" read --pane "$pane" 2>/dev/null | grep -q '^tako [^ ]* %' && return 0
+    screen=$("$TAKO_BIN" read --pane "$pane" 2>/dev/null) && grep -q '^tako [^ ]* %' <<<"$screen" && return 0
     sleep 0.1
   done
   return 1
