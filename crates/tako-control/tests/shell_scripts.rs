@@ -1044,6 +1044,9 @@ struct WordLexer {
     /// 読んでいる最中の語の始まりと、それがコマンドの先頭（代入を置ける位置）か。
     /// `x=$( … )` の置換が素の代入の値かを `cmdsub` が判じるのに使う（`list` の間は None）
     word_ctx: Option<(usize, bool)>,
+    /// 読んだ中で 3.2 が取り除く行継続（`\` + 改行）の `\` の位置と、取り除いても後ろの読みが
+    /// 変わらないか（`join_continuations32` が使う。#2352）
+    joins: Vec<(usize, bool)>,
 }
 
 /// パイプラインの終わり方（終了コードを誰が見るか）
@@ -1121,7 +1124,23 @@ impl WordLexer {
             pipelines: Vec::new(),
             commands: Vec::new(),
             word_ctx: None,
+            joins: Vec::new(),
         }
+    }
+
+    /// `self.i` が行継続（`\` + 改行）なら、3.2 が取り除くものとして控える。`safe` = 取り除いても
+    /// 後ろの読みが変わらない（変わるなら `join_continuations32` が取り除いてから読み直す）
+    fn note_join(&mut self, safe: bool) {
+        if self.peek(0) == Some('\\') && self.peek(1) == Some('\n') {
+            self.joins.push((self.i, safe));
+        }
+    }
+
+    /// クォートや `${ … }` の中の行継続は、直前が `$` でなければ取り除いても読みが変わらない
+    /// （`"$\⏎(…)"` は取り除くと `$(` になる）
+    fn note_join_in_quote(&mut self) {
+        let safe = self.i == 0 || self.c[self.i - 1] != '$';
+        self.note_join(safe);
     }
 
     /// 組み立て中の単純コマンドへ語を足す（`redirect` = リダイレクトの行き先の語）
@@ -1262,10 +1281,27 @@ impl WordLexer {
                     self.heredoc_bodies();
                 }
                 ' ' | '\t' => self.i += 1,
-                '\\' if self.peek(1) == Some('\n') => self.i += 2, // 行末の `\` = 続き
+                // 行末の `\` = 続き。演算子の直後のものは取り除くと読みが変わる（`;\⏎;` は `;;`）
+                '\\' if self.peek(1) == Some('\n') => {
+                    let safe = self.i == 0
+                        || !matches!(self.c[self.i - 1], ';' | '&' | '|' | '<' | '>' | '(');
+                    self.note_join(safe);
+                    self.i += 2;
+                }
                 '#' => {
-                    while self.peek(0).is_some_and(|c| c != '\n') {
-                        self.i += 1;
+                    // `$( … )` / `<( … )` の中のコメントは、3.2 の構文解析が行継続を取り除くので
+                    // 次の行まで続く。それ以外（`( … )` の中も）は行末で終わる（#2352）
+                    let joined = self
+                        .levels
+                        .iter()
+                        .any(|lv| matches!(lv.kind, ListKind::CmdSub { .. } | ListKind::ProcSub));
+                    while let Some(c) = self.peek(0).filter(|&c| c != '\n') {
+                        if joined && c == '\\' && self.peek(1) == Some('\n') {
+                            self.note_join(true);
+                            self.i += 2;
+                        } else {
+                            self.i += 1;
+                        }
                     }
                 }
                 ';' => {
@@ -1428,7 +1464,11 @@ impl WordLexer {
         let saved = self.word_ctx.replace((start, cmd_start));
         while let Some(ch) = self.peek(0) {
             match ch {
-                '\\' => self.i += 2,
+                // 語の途中の行継続は、取り除くと予約語・代入・`$` の先読みが変わりうる（`i\⏎f` は `if`）
+                '\\' => {
+                    self.note_join(false);
+                    self.i += 2;
+                }
                 '\'' => self.single(),
                 '$' if self.peek(1) == Some('\'') => {
                     self.i += 1;
@@ -1466,6 +1506,10 @@ impl WordLexer {
                     return;
                 }
                 ' ' | '\t' | '\n' => self.i += 1,
+                '\\' if self.peek(1) == Some('\n') => {
+                    self.note_join(true);
+                    self.i += 2;
+                }
                 '#' => {
                     while self.peek(0).is_some_and(|c| c != '\n') {
                         self.i += 1;
@@ -1514,7 +1558,10 @@ impl WordLexer {
         self.i += 1;
         while let Some(ch) = self.peek(0) {
             match ch {
-                '\\' => self.i += 2,
+                '\\' => {
+                    self.note_join_in_quote();
+                    self.i += 2;
+                }
                 '"' => {
                     self.i += 1;
                     return;
@@ -1527,14 +1574,20 @@ impl WordLexer {
         }
     }
 
+    /// `` `…` ``。中の行継続は `'…'` の中のものも取り除く（3.2 はバッククォートの中の `'` を数えない）
     fn backtick(&mut self) {
         self.i += 1;
         while let Some(ch) = self.peek(0) {
-            self.i += 1;
             match ch {
-                '\\' => self.i += 1,
-                '`' => return,
-                _ => {}
+                '\\' => {
+                    self.note_join(true);
+                    self.i += 2;
+                }
+                '`' => {
+                    self.i += 1;
+                    return;
+                }
+                _ => self.i += 1,
             }
         }
     }
@@ -1558,6 +1611,7 @@ impl WordLexer {
     fn arith(&mut self) {
         let mut depth = 0usize;
         while let Some(ch) = self.peek(0) {
+            self.note_join(true);
             self.i += 1;
             match ch {
                 '(' => depth += 1,
@@ -1576,15 +1630,27 @@ impl WordLexer {
     fn param(&mut self, in_dquote: bool) {
         self.i += 2;
         let mut depth = 1usize;
+        // `"${ … }"` の中の `'` は語の読みではただの文字だが、3.2 の構文解析は単一引用符として読み、
+        // その中の行継続を取り除かない（`"${U:+'a\⏎b'}"` は保存された語に `\` + 改行が残る。#2352）
+        let mut sq = false;
         while let Some(ch) = self.peek(0) {
             match ch {
-                '\\' => self.i += 2,
+                '\\' => {
+                    if !sq {
+                        self.note_join_in_quote();
+                    }
+                    self.i += 2;
+                }
                 // `${U:-$'it\'s'}` の `\'` で閉じない（#2304）
                 '$' if !in_dquote && self.peek(1) == Some('\'') => {
                     self.i += 1;
                     self.ansi_c();
                 }
                 '\'' if !in_dquote => self.single(),
+                '\'' => {
+                    sq = !sq;
+                    self.i += 1;
+                }
                 '"' => self.dquote(),
                 '`' => self.backtick(),
                 '$' if self.peek(1) == Some('(') => self.cmdsub(),
@@ -1615,7 +1681,12 @@ impl WordLexer {
             self.i += 1;
         }
         let start = self.i;
-        while self.peek(0).is_some_and(|c| !WORD_END.contains(&c)) {
+        while let Some(c) = self.peek(0).filter(|c| !WORD_END.contains(c)) {
+            // `<<E\⏎OF` の区切りは `EOF`（取り除いてから読み直す）
+            if c == '\\' && self.peek(1) == Some('\n') {
+                self.note_join(false);
+                self.i += 1;
+            }
             self.i += 1;
         }
         let raw: String = self.c[start..self.i].iter().collect();
@@ -1653,11 +1724,15 @@ impl WordLexer {
                     self.i = (end + 1).min(self.c.len());
                     continue;
                 }
-                // 本文は語ではない（`"` もただの文字）が、中の `$( … )` は語へ分ける
+                // 本文は語ではない（`"` もただの文字）が、中の `$( … )` は語へ分ける。行継続は取り除く
+                // （次の行と 1 行になるので、その行は区切りと比べない）
                 while let Some(ch) = self.peek(0) {
                     match ch {
                         '\n' => break,
-                        '\\' => self.i += 2,
+                        '\\' => {
+                            self.note_join_in_quote();
+                            self.i += 2;
+                        }
                         '`' => self.backtick(),
                         '$' if self.peek(1) == Some('(') => self.cmdsub(),
                         '$' if self.peek(1) == Some('{') => self.param(true),
@@ -1694,6 +1769,56 @@ fn raw_words(src: &str) -> Vec<RawWord> {
     let mut lx = WordLexer::new(src);
     lx.list(false);
     lx.words
+}
+
+/// bash 3.2 が語を読む前に取り除く行継続（`\` + 改行）を除いた原文と、その各文字の原文の位置（Issue #2352）。
+///
+/// 3.2 の `shell_getc` は文字を読む段で `\` + 改行を読み飛ばすので、語の途中の継続は語を割らず
+/// （`x\⏎{ a,b }` の `{` の前は空白ではない・`{1..\⏎3}` は `{1..3}`）、構文も継続を除いてから決まる
+/// （`$\⏎(` は `$(`・`$\⏎'` は `$'`・`<\⏎<` は `<<`）。どこで取り除くかは `/bin/bash` 3.2.57 の
+/// `declare -f`（保存された語）と実行結果で 1 つずつ確かめた:
+/// - 取り除く: 語の地・`"…"` / `${ … }` / `$( … )` / バッククォートの中（バッククォートの中は `'…'` の中も）・
+///   クォートされていないヒアドキュメントの本文・`$( … )` / `<( … )` の中のコメント（次の行までコメントになる）
+/// - 残す: `'…'`（`"${ … }"` の中のものも）と `$'…'` の中（`$'a\⏎b'` は `\` と改行のまま解かれる）・
+///   それ以外のコメント（`( … )` の中も行末で終わる）・クォートされたヒアドキュメントの本文・`\\` の直後の改行
+///
+/// 文脈は字句（`WordLexer`）が読む。取り除くと後ろの読みが変わる継続（語の途中・`$` や演算子の直後）は、
+/// そこまでを取り除いてから読み直す（変わらないものはまとめて取り除く）。
+fn join_continuations32(src: &str) -> (String, Vec<usize>) {
+    let mut c: Vec<char> = src.chars().collect();
+    let mut origin: Vec<usize> = (0..c.len()).collect();
+    if !src.contains("\\\n") {
+        return (src.to_string(), origin);
+    }
+    loop {
+        let mut lx = WordLexer {
+            c: c.clone(),
+            ..WordLexer::new("")
+        };
+        lx.list(false);
+        let mut joins = lx.joins;
+        joins.sort_unstable();
+        joins.dedup_by_key(|j| j.0);
+        if joins.is_empty() {
+            break;
+        }
+        let upto = joins
+            .iter()
+            .position(|&(_, safe)| !safe)
+            .map_or(joins.len(), |k| k + 1);
+        let drop: std::collections::BTreeSet<usize> = joins[..upto]
+            .iter()
+            .flat_map(|&(p, _)| [p, p + 1])
+            .collect();
+        (c, origin) = c
+            .into_iter()
+            .zip(origin)
+            .enumerate()
+            .filter(|(k, _)| !drop.contains(k))
+            .map(|(_, kept)| kept)
+            .unzip();
+    }
+    (c.into_iter().collect(), origin)
 }
 
 /// 正しい構文で読んだとき、語の中のその位置が**どのクォートにもコマンド置換にも入っていない**か
@@ -1737,6 +1862,9 @@ fn top_level_unquoted(word: &[char]) -> Vec<bool> {
 /// - `"…"` の中の `${ … }`（その中の `$( … )` も）: 包まずに中身だけ（`"${U:-$'\"'}"` は `"${U:-"}"`）。
 ///   その中でも `"…"` に入ってからの `$( … )` は包む側へ戻る
 /// - `"…"` の地・バッククォートの中・単一引用符の中: 置き換えない
+///
+/// 語は行継続（`\` + 改行）を取り除いた後のもの（`join_continuations32`。#2352）。残っている継続は
+/// `'…'` / `$'…'` の中のもので、`'…'` はそのまま、`$'…'` は `\` と改行のまま解く（3.2 と同じ）。
 ///
 /// 3.2 の読み方の癖も写す（`parse_matched_pair` の数え方）: 語の地の `$$` は 2 文字で読み飛ばす
 /// （`$$'x'` は置き換えない）。`$( … )` は中の `${` を、`${ … }` は中の `$(` と `$` の付かない `{` を
@@ -2172,7 +2300,9 @@ fn brace32_pairs(word: &str) -> Vec<(usize, usize)> {
 /// （クォートの外の `{a,b}` は意図した展開なので返さない = 過大申告しない。`{x}"…,…}"` のように
 /// クォートの外の `{` からクォートの中の `}` までを対にするものは返す）
 fn brace32_file_pairs(src: &str, misread_only: bool) -> std::collections::BTreeSet<(usize, usize)> {
-    let words = raw_words(src);
+    // 語は行継続を取り除いてから読む（#2352）。位置はすべて原文の位置で持つ
+    let (text, origin) = join_continuations32(src);
+    let words = raw_words(&text);
     // 原文の各文字が、それを含むいちばん内側の語の中でクォートの外に在るか（正しく読んだとき）
     let top = misread_only.then(|| {
         let mut top = vec![false; src.chars().count()];
@@ -2181,14 +2311,14 @@ fn brace32_file_pairs(src: &str, misread_only: bool) -> std::collections::BTreeS
         for w in &by_span {
             let chars: Vec<char> = w.text.chars().collect();
             for (k, t) in top_level_unquoted(&chars).into_iter().enumerate() {
-                top[w.start + k] = t;
+                top[origin[w.start + k]] = t;
             }
         }
         top
     });
     let mut out = std::collections::BTreeSet::new();
     for w in outermost_words(words) {
-        let at: Vec<usize> = (w.start..w.start + w.text.chars().count()).collect();
+        let at: Vec<usize> = origin[w.start..w.start + w.text.chars().count()].to_vec();
         brace32_word_pairs(&w, &at, top.as_deref(), &mut out);
     }
     out
@@ -2232,7 +2362,11 @@ fn brace32_word_pairs(
         }
         out.extend(found.into_iter().map(|(open, close)| (at[open], at[close])));
     }
-    // 中の語 = 置き換えた語を読み直した語のうち、この語そのもの（外側の語）を除いたもの
+    // 中の語 = 置き換えた語を読み直した語のうち、この語そのもの（外側の語）を除いたもの。
+    // 実行時の読み直しも行継続を取り除く（`"${U:-$(show $'{1..\⏎3}')}"` は包まずに置き換わった
+    // `\` + 改行が `show {1..3}` と読まれる。#2352）
+    let (text, joined) = join_continuations32(&text);
+    let at: Vec<usize> = joined.iter().map(|&k| at[k]).collect();
     let words = raw_words(&text);
     let outer: Vec<(usize, String)> = outermost_words(words.clone())
         .into_iter()
@@ -2594,14 +2728,233 @@ fn ansi_cクォートの置き換えはbash32の構文解析を写す() {
     }
 }
 
+/// 実の bash でその本文を関数にして `declare -f` で保存された形（構文の誤りなら None）
+fn bash_declare(bash: &str, body: &str) -> Option<String> {
+    let out = clean_bash(bash)
+        .args(["-c", &format!("g() {{\n{body}\n}}\ndeclare -f g")])
+        .output()
+        .ok()?;
+    let saved = String::from_utf8_lossy(&out.stdout).into_owned();
+    (out.status.success() && !saved.is_empty()).then_some(saved)
+}
+
+#[test]
+fn 行継続はbash32が語を読む前に取り除く() {
+    // (原文, 3.2 が行継続を取り除いた後)。`/bin/bash` 3.2.57 の `declare -f` と実行結果で 1 つずつ確かめた
+    let cases: &[(&str, &str)] = &[
+        // 取り除く: 語の地・`"…"`・`$( … )`・`${ … }`・バッククォートの中（その中の `'…'` も）
+        ("f a\\\nb", "f ab"),
+        ("f \"a\\\nb\"", "f \"ab\""),
+        ("f $(echo a\\\nb)", "f $(echo ab)"),
+        ("f \"$(echo a\\\nb)\"", "f \"$(echo ab)\""),
+        ("f ${U:-a\\\nb}", "f ${U:-ab}"),
+        ("f \"${U:+a\\\nb}\"", "f \"${U:+ab}\""),
+        ("f `echo a\\\nb`", "f `echo ab`"),
+        ("f `echo 'a\\\nb'`", "f `echo 'ab'`"),
+        ("f \"$(f \"it's \\\nx\")\"", "f \"$(f \"it's x\")\""),
+        ("x=a\\\nb", "x=ab"),
+        ("a=(x\\\ny \"p\\\nq\")", "a=(xy \"pq\")"),
+        ("f $(( 1 +\\\n2 ))", "f $(( 1 +2 ))"),
+        // 残す: `'…'`（`$( … )` / `${ … }` / `"${ … }"` の中も）と `$'…'` の中・`\\` の直後の改行
+        ("f 'a\\\nb'", "f 'a\\\nb'"),
+        ("f $'a\\\nb'", "f $'a\\\nb'"),
+        ("f $(echo 'a\\\nb')", "f $(echo 'a\\\nb')"),
+        ("f \"$(echo 'a\\\nb')\"", "f \"$(echo 'a\\\nb')\""),
+        ("f $(echo $'a\\\nb')", "f $(echo $'a\\\nb')"),
+        ("f ${U:+'a\\\nb'}", "f ${U:+'a\\\nb'}"),
+        ("f \"${U:+'a\\\nb'}\"", "f \"${U:+'a\\\nb'}\""),
+        ("f \"${U:+$'a\\\nb'}\"", "f \"${U:+$'a\\\nb'}\""),
+        ("f a\\\\\nf b", "f a\\\\\nf b"),
+        // 取り除くと構文が変わる: `$\⏎(` は `$(`・`$\⏎{` は `${`・`$\⏎'` は `$'`・演算子・予約語
+        ("f $\\\n(echo x)", "f $(echo x)"),
+        ("f $\\\n{U}", "f ${U}"),
+        ("f $\\\n'a\\tb'", "f $'a\\tb'"),
+        ("case a in a) f A ;\\\n; esac", "case a in a) f A ;; esac"),
+        ("true &\\\n& f and", "true && f and"),
+        ("i\\\nf true; then f kw; fi", "if true; then f kw; fi"),
+        ("f x\\\n#y", "f x#y"), // 語の途中の `#` はコメントではない
+        // …取り除いた後の文脈で残りを読む（素朴にすべて取り除くと `'…'` の中のものまで消える）
+        ("f $\\\n'a\\\nb'", "f $'a\\\nb'"),
+        ("f \"$\\\n(echo 'a\\\nb')\"", "f \"$(echo 'a\\\nb')\""),
+        // コメント: `$( … )` / `<( … )` の中は次の行まで続く・それ以外は行末で終わる
+        ("f $(echo a # c \\\necho b)", "f $(echo a # c echo b)"),
+        ("f <(echo a # c \\\necho b)", "f <(echo a # c echo b)"),
+        ("f a # c \\\nf b", "f a # c \\\nf b"),
+        ("( echo a # c \\\necho b )", "( echo a # c \\\necho b )"),
+        ("{ echo a # c \\\necho b; }", "{ echo a # c \\\necho b; }"),
+        ("f x \\\n#y\nf z", "f x #y\nf z"),
+        // ヒアドキュメント: クォートされていない本文は取り除く（次の行は区切りと比べない）
+        ("cat <<X\nab\\\ncd\nX", "cat <<X\nabcd\nX"),
+        ("cat <<X\nab\\\nX\nX", "cat <<X\nabX\nX"),
+        ("cat <<'X'\nab\\\ncd\nX", "cat <<'X'\nab\\\ncd\nX"),
+        ("cat <\\\n<X\nab\\\ncd\nX", "cat <<X\nabcd\nX"),
+        ("cat <\\\n<'X'\nab\\\ncd\nX", "cat <<'X'\nab\\\ncd\nX"),
+        ("cat <<E\\\nOF\nab\\\ncd\nEOF", "cat <<EOF\nabcd\nEOF"),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(src, want)| {
+            let (got, origin) = join_continuations32(src);
+            // 各文字の原文の位置は、原文のその文字を指す
+            let chars: Vec<char> = src.chars().collect();
+            assert_eq!(origin.len(), got.chars().count(), "{src:?}");
+            assert!(
+                got.chars().zip(&origin).all(|(ch, &k)| chars[k] == ch),
+                "{src:?} → {origin:?}"
+            );
+            (got != want).then(|| format!("{src:?}\n  3.2: {want:?}\n  写し: {got:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // 継続が無ければ原文のまま・閉じていないクォートや末尾の `\` でも panic しない
+    assert_eq!(
+        join_continuations32("echo \"$(show \"{a,b}\")\"\n").0,
+        "echo \"$(show \"{a,b}\")\"\n"
+    );
+    for broken in ["echo \"a\\\n", "echo 'a\\\n", "echo $(a\\\n", "x\\", "\\\n"] {
+        let _ = join_continuations32(broken);
+    }
+
+    // 実の 3.2 で、表の「取り除いた後」が原文と同じ形で保存されることを確かめる。残す継続は、
+    // 素朴にすべて取り除いたものとは保存の形が変わる（= 3.2 が本当に残している）ことも確かめる
+    let bash = std::env::var(BASH32_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/bin/bash".to_string());
+    match bash32_gate(cfg!(target_os = "macos"), &bash, bash_version(&bash)) {
+        Bash32Gate::Run => {}
+        Bash32Gate::Skip(reason) => {
+            eprintln!("skip: {reason}");
+            return;
+        }
+        Bash32Gate::Fail(reason) => panic!("{reason}"),
+    }
+    let mut differ = Vec::new();
+    for &(src, want) in cases {
+        let saved = bash_declare(&bash, src);
+        if saved != bash_declare(&bash, want) {
+            differ.push(format!("{src:?}: 取り除いた後 {want:?} と保存の形が違う"));
+        }
+        let naive = src.replace("\\\n", "");
+        if naive != want && saved == bash_declare(&bash, &naive) {
+            differ.push(format!(
+                "{src:?}: 残すはずの継続を取り除いた {naive:?} と保存の形が同じ"
+            ));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "表が実の bash 3.2（{bash}）と食い違う:\n{}",
+        differ.join("\n")
+    );
+}
+
+#[test]
+fn 番犬は行継続を取り除いた語をfile_lineで名指しする() {
+    // (番犬, 本文, 名指しの先頭 = 無ければ None)。3.2 は行継続を取り除いてから読む（`/bin/bash` 3.2.57 で
+    // 確かめた）ので、番犬も取り除いた語で判じ、名指すのは原文の行
+    type Check = fn(&str, &str) -> Vec<String>;
+    let brace: Check = brace32_violations;
+    let pipe: Check = pipefail_early_quit_violations;
+    let rm: Check = rm_var_violations;
+    let cases: &[(Check, &str, Option<&str>)] = &[
+        // 波括弧（#1924）: `{` の前は `x`（空白ではない）・連番・`$\⏎(` は `$(`
+        (
+            brace,
+            "echo \"$(show \"x\\\n{ a,b }\")\"\n",
+            Some("scripts/x.sh:2: "),
+        ),
+        (
+            brace,
+            "echo \"$(show \"\\\n{ a,b }\")\"\n",
+            Some("scripts/x.sh:2: "),
+        ),
+        (
+            brace,
+            "echo \"$(show \"{1..\\\n3}\")\"\n",
+            Some("scripts/x.sh:1: "),
+        ),
+        (
+            brace,
+            "echo \"$\\\n(show \"{a,b}\")\"\n",
+            Some("scripts/x.sh:2: "),
+        ),
+        // 包まずに置き換わった `$'…'` の中の継続は、実行時の読み直しで取り除かれる（`show {1..3}`）
+        (
+            brace,
+            "f \"${U:-$(show $'{1..\\\n3}')}\"\n",
+            Some("scripts/x.sh:1: "),
+        ),
+        (
+            brace,
+            "set -u\necho \\\n  \"$(show \\\n  \"x\\\n{ a,b }\")\"\n",
+            Some("scripts/x.sh:5: "),
+        ),
+        // `'…'` / `$'…'` の中の継続は残る（`{` の前は改行 = 空白なので展開の始まりにならない）
+        (brace, "f \"$(show \"it's\")\"'x\\\n{ a,b }'\n", None),
+        (brace, "f \"$(show \"it's\")\"$'x\\\n{ a,b }'\n", None),
+        // pipefail（#1633 / #2272）: 段のコマンド名（`head\⏎  -1` は head）
+        (
+            pipe,
+            "set -euo pipefail\n# c\nx=$(cmd \\\n  | head\\\n  -1)\n",
+            Some("scripts/x.sh:3: cmd … | head・set -e の下の x=$( … )"),
+        ),
+        (
+            pipe,
+            "set -o pipefail\nif cmd | grep\\\n  -q x; then :; fi\n",
+            Some("scripts/x.sh:2: cmd … | grep -q"),
+        ),
+        // rm（#2306）: コマンド名と引数。後始末の文字列（`'…'` の中で残った継続）は trap が走るときの
+        // 読み直しで取り除かれる
+        (
+            rm,
+            "set -u\nrm\\\n  -rf \"$d/x\"\n",
+            Some("scripts/x.sh:2: rm の \"$d/x\" は $d が空だと /x を指す"),
+        ),
+        (
+            rm,
+            "set -u\n\nrm -rf \"$d\\\n/x\"\n",
+            Some("scripts/x.sh:3: rm の \"$d/x\" は $d が空だと /x を指す"),
+        ),
+        (
+            rm,
+            "trap 'rm -rf \"$D\\\n/x\"' EXIT\n",
+            Some("scripts/x.sh:1: rm の \"$D/x\" は $D が空だと /x を指す"),
+        ),
+        (rm, "rm -rf '$d\\\n/x'\n", None),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(check, body, want)| {
+            let got = check("scripts/x.sh", body);
+            let ok = match want {
+                Some(head) => got.len() == 1 && got[0].starts_with(head),
+                None => got.is_empty(),
+            };
+            (!ok).then(|| {
+                format!(
+                    "{body:?}\n  名指すべき: {}\n  名指した: {got:?}",
+                    want.map_or("（なし）".to_string(), |h| format!("{h}…"))
+                )
+            })
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "行継続を取り除いて読んだ名指しと合わない（join_continuations32 を通す番犬。#2352）:\n{}",
+        wrong.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 波括弧の写しを実の bash 3.2 と突き合わせる（Issue #1931）
 // ---------------------------------------------------------------------------
 //
-// 上の写し（`raw_words` / `ParsedWord32` / `gobble32` / `amble_expands32` / `brace32_pairs` /
-// `top_level_unquoted`）は 3.2 の `braces.c` を読んで書いたもので（`$'…'` の置き換え = `ParsedWord32` は
-// 実物の `declare -f` で確かめた。#2304）、PR #1929 では乱数の語 48,000 通りを実の `/bin/bash` に通して
-// 確かめた。その差分試験の常設版: 固定の種で組んだ語を `/bin/bash`（3.2）へ `set +B`（波括弧展開
+// 上の写し（`join_continuations32` / `raw_words` / `ParsedWord32` / `gobble32` / `amble_expands32` /
+// `brace32_pairs` / `top_level_unquoted`）は 3.2 の `braces.c` を読んで書いたもので（`$'…'` の置き換え =
+// `ParsedWord32` と行継続の取り除き = `join_continuations32` は実物の `declare -f` で確かめた。
+// #2304 / #2352）、PR #1929 では乱数の語 48,000 通りを実の `/bin/bash` に通して確かめた。
+// その差分試験の常設版: 固定の種で組んだ語を `/bin/bash`（3.2）へ `set +B`（波括弧展開
 // なし）と `set -B` の 2 回通し、波括弧ごとの目印が出力から消えたか（= 3.2 が展開したか）を
 // 写しの読みと 1 つずつ比べる。bash 5 は要らない（正しい読みは語を組むときに分かっている）。
 
@@ -2681,6 +3034,8 @@ enum BraceKind {
     /// 刻みつき（3.2 は知らない）
     SeqStep,
     SeqNeg,
+    /// 連番の中の行継続（`{1..\⏎3}`。3.2 は取り除いてから `{1..3}` と読む。#2352）
+    SeqSplit,
 }
 
 const BRACE_KINDS: &[BraceKind] = &[
@@ -2694,6 +3049,7 @@ const BRACE_KINDS: &[BraceKind] = &[
     BraceKind::SeqAlpha,
     BraceKind::SeqStep,
     BraceKind::SeqNeg,
+    BraceKind::SeqSplit,
 ];
 
 impl BraceKind {
@@ -2715,6 +3071,7 @@ impl BraceKind {
             SeqAlpha => seq("a..c"),
             SeqStep => seq("1..5..2"),
             SeqNeg => seq("-1..1"),
+            SeqSplit => seq("1..\\\n3"),
         }
     }
 }
@@ -2751,12 +3108,36 @@ enum Slot {
 
 impl Slot {
     /// 波括弧の前後に置く飾り（3.2 の読み違えの入口: クォート・`\`・`${`・`$(`・空白）。
-    /// その文脈で構文を壊さないものだけ。末尾の `\` は閉じのクォートを食うので後ろには置かない
+    /// その文脈で構文を壊さないものだけ。末尾の `\` は閉じのクォートを食うので後ろには置かない。
+    /// `\` + 改行（行継続）は 3.2 が語を読む前に取り除く（#2352）: `x\⏎{ a,b }` の `{` の前は空白ではなく、
+    /// `$\⏎{U}` は `${U}`、`$\⏎(show z)` は `$(show z)`。`'…'` / `$'…'` の中では取り除かずに残る
     fn fillers(self, before: bool) -> &'static [&'static str] {
         use Slot::*;
         match (self, before) {
-            (Outer | Inner, true) => &["", "x", "\\\"", "${U}", "$(show z)", "\\\\", "\\", "\\ "],
-            (Outer | Inner, false) => &["", "y", "\\\"", "${U}", "$(show z)", "\\\\"],
+            (Outer | Inner, true) => &[
+                "",
+                "x",
+                "\\\"",
+                "${U}",
+                "$(show z)",
+                "\\\\",
+                "\\",
+                "\\ ",
+                "\\\n",
+                "x\\\n",
+                "$\\\n{U}",
+                "$\\\n(show z)",
+            ],
+            (Outer | Inner, false) => &[
+                "",
+                "y",
+                "\\\"",
+                "${U}",
+                "$(show z)",
+                "\\\\",
+                "\\\n",
+                "\\\ny",
+            ],
             (Dq, true) => &[
                 "",
                 "x",
@@ -2767,24 +3148,44 @@ impl Slot {
                 "$(show z)",
                 "\\\\",
                 "\\",
+                "\\\n",
+                "x\\\n",
+                "$\\\n{U}",
+                "$\\\n(show z)",
             ],
-            (Dq, false) => &["", "y", " ", " it's", "\\\"", "${U}", "$(show z)", "\\\\"],
-            (Sq, true) => &["", "x", " ", "\\\"", "${U}", "\\\\", "\\"],
-            (Sq, false) => &["", "y", " ", "\\\"", "${U}"],
+            (Dq, false) => &[
+                "",
+                "y",
+                " ",
+                " it's",
+                "\\\"",
+                "${U}",
+                "$(show z)",
+                "\\\\",
+                "\\\n",
+                "\\\ny",
+            ],
+            (Sq, true) => &["", "x", " ", "\\\"", "${U}", "\\\\", "\\", "\\\n", "x\\\n"],
+            (Sq, false) => &["", "y", " ", "\\\"", "${U}", "\\\n"],
             (AnsiC, true) => &[
                 "", "x", " ", "${U}", "\\\\", "\\\"", "\\'", "\\n", "\\t", "\\", "\\x22", "\\047",
+                "\\\n", "x\\\n",
             ],
-            (AnsiC, false) => &["", "y", " ", "${U}", "\\\\", "\\\"", "\\'", "\\n", "\\x22"],
-            (AnsiCDq, true) => &["", "x", " ", "${U}", "\\\\", "\\t", "\\"],
+            (AnsiC, false) => &[
+                "", "y", " ", "${U}", "\\\\", "\\\"", "\\'", "\\n", "\\x22", "\\\n",
+            ],
+            (AnsiCDq, true) => &["", "x", " ", "${U}", "\\\\", "\\t", "\\", "\\\n", "x\\\n"],
             (AnsiCDq, false) => &["", "y", " ", "${U}"],
-            (AnsiCDqPair, true) => &["", "x", " ", "${U}", "\\\\", "\\t", "\\", "\\'", "\\n"],
+            (AnsiCDqPair, true) => &[
+                "", "x", " ", "${U}", "\\\\", "\\t", "\\", "\\'", "\\n", "\\\n", "x\\\n",
+            ],
             (AnsiCDqPair, false) => &["", "y", " ", "${U}", "\\'", "\\n"],
-            (Param, true) => &["", "x", "${U}", "$(show z)"],
-            (Param, false) => &["", "y", "${U}"],
-            (DqParam, true) => &["", "x", " ", "${U}", "$(show z)"],
-            (DqParam, false) => &["", "y", " "],
-            (BacktickDq, true) => &["", "x", " ", "it's ", "${U}", "$(show z)"],
-            (BacktickDq, false) => &["", "y", " ", " it's", "${U}", "$(show z)"],
+            (Param, true) => &["", "x", "${U}", "$(show z)", "\\\n", "$\\\n{U}"],
+            (Param, false) => &["", "y", "${U}", "\\\n"],
+            (DqParam, true) => &["", "x", " ", "${U}", "$(show z)", "\\\n", "x\\\n"],
+            (DqParam, false) => &["", "y", " ", "\\\n"],
+            (BacktickDq, true) => &["", "x", " ", "it's ", "${U}", "$(show z)", "\\\n", "x\\\n"],
+            (BacktickDq, false) => &["", "y", " ", " it's", "${U}", "$(show z)", "\\\n"],
         }
     }
 
@@ -2847,6 +3248,13 @@ const BRACE_SHAPES: &[(&str, &[Slot])] = {
         ("\"$(show \"${U:-$'@'}\")\"", &[AnsiCDq]),
         // 包まずに置き換わった `$( … )` の中身は実行時に読み直される（`show {Q1,R1}` で割れる）
         ("\"${U:-$(show $'@')}\"", &[AnsiCDq]),
+        // 行継続を取り除くと語の形が変わる（#2352）: `$\⏎(` は `$(`・`$\⏎'` は `$'`・`$\⏎{` は `${`。
+        // `x\⏎#` の `#` は語の途中なのでコメントではない
+        ("\"$\\\n(show \"@\")\"", &[Dq]),
+        ("$\\\n'@'", &[AnsiC]),
+        ("\"$(show \"it's\")\"$\\\n'@'", &[AnsiC]),
+        ("\"$\\\n{U:-$'@'}\"", &[AnsiCDq]),
+        ("$(show x\\\n#@)", &[Inner]),
     ]
 };
 
@@ -3155,7 +3563,7 @@ fn 波括弧の写しは実のbash32と食い違わない() {
     assert!(
         problems.is_empty(),
         "波括弧の写し（shell_scripts.rs の gobble32 / amble_expands32 / brace32_pairs /\n\
-         top_level_unquoted / raw_words / ParsedWord32）が実の bash 3.2（{bash}）と {} 箇所で食い違う（{} 行・波括弧 {} 個のうち）。\n\
+         top_level_unquoted / raw_words / ParsedWord32 / join_continuations32）が実の bash 3.2（{bash}）と {} 箇所で食い違う（{} 行・波括弧 {} 個のうち）。\n\
          写しを直して #1924 の番犬の読みを実物へ合わせること（.agent/conventions.md の #1924 / #1931）:\n{}",
         problems.len(),
         cases.len(),
@@ -3406,7 +3814,9 @@ fn pipefail_early_quit_violations(rel: &str, src: &str) -> Vec<String> {
             .count()
             + 1
     };
-    let mut lx = WordLexer::new(src);
+    // 行継続を取り除いてから読む（`X | head\⏎  -1` の段は `head`。#2352）。名指す行は原文の行
+    let (text, origin) = join_continuations32(src);
+    let mut lx = WordLexer::new(&text);
     lx.list(false);
     let mut out = Vec::new();
     for p in &lx.pipelines {
@@ -3427,7 +3837,12 @@ fn pipefail_early_quit_violations(rel: &str, src: &str) -> Vec<String> {
         } else {
             continue;
         };
-        let line_no = line_of(p.stages[0].start);
+        let line_no = line_of(
+            origin
+                .get(p.stages[0].start)
+                .copied()
+                .unwrap_or(chars.len()),
+        );
         if pipefail_exception(&lines, line_no) {
             continue;
         }
@@ -3977,14 +4392,16 @@ fn rm_commands(src: &str) -> Vec<(usize, Vec<String>)> {
             .count()
             + 1
     };
-    let mut lx = WordLexer::new(src);
+    // 行継続を取り除いてから読む（`rm\⏎  -rf "$d/x"` も rm。#2352）。行は原文の行
+    let (text, origin) = join_continuations32(src);
+    let mut lx = WordLexer::new(&text);
     lx.list(false);
     let mut out = Vec::new();
     for cmd in &lx.commands {
         let Some((k, name)) = stage_command_name(&cmd.words) else {
             continue;
         };
-        let line = line_of(cmd.start);
+        let line = line_of(origin.get(cmd.start).copied().unwrap_or(chars.len()));
         let mut args = cmd
             .words
             .iter()
