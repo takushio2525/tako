@@ -1678,7 +1678,7 @@ pub(super) fn validate_known_params(tool_name: &str, args: &Value) -> Result<(),
     if let Some(obj) = args.as_object() {
         let unknown: Vec<&String> = obj.keys().filter(|k| !allowed.contains(*k)).collect();
         if !unknown.is_empty() {
-            let mut sorted: Vec<String> = allowed.iter().cloned().collect();
+            let mut sorted: Vec<String> = allowed.to_vec();
             sorted.sort_unstable();
             return Err((
                 -32602,
