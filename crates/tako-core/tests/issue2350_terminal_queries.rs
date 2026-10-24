@@ -112,19 +112,25 @@ impl Drop for TmuxServer {
     }
 }
 
-/// 子のスクリプト: `start` を待ってプローブ 1 回目 → `go` を待って 2 回目
+/// 子のスクリプト: `start` を待ってプローブ 1 回目 → `go` を待って 2 回目 → `go3` を待って 3 回目
 fn child_script(dir: &TempDir) -> String {
     let p = |n: &str| dir.path(n).display().to_string();
     format!(
         "while [ ! -f '{start}' ]; do sleep 0.05; done; perl '{probe}' '{out1}'; \
-         while [ ! -f '{go}' ]; do sleep 0.05; done; perl '{probe}' '{out2}'; sleep 60",
+         while [ ! -f '{go}' ]; do sleep 0.05; done; perl '{probe}' '{out2}'; \
+         while [ ! -f '{go3}' ]; do sleep 0.05; done; perl '{probe}' '{out3}'; sleep 60",
         start = p("start"),
         probe = p("probe.pl"),
         out1 = p("out1"),
         go = p("go"),
         out2 = p("out2"),
+        go3 = p("go3"),
+        out3 = p("out3"),
     )
 }
+
+/// ペインの寸法を変える（境界: 変わった直後の問い合わせ）。80 列 × 20 行・セル 10 × 20 px
+const RESIZED: (usize, usize, u16, u16) = (80, 20, 10, 20);
 
 /// UI 層の役をするペイン（tako-app の `on_term_event` と同じ手順でイベントを処理する）
 struct Pane {
@@ -254,16 +260,26 @@ fn touch(path: PathBuf) {
     std::fs::write(path, b"").expect("合図を書ける");
 }
 
-/// 寸法の答えが子へ見せている TIOCGWINSZ と一致する
-fn assert_sizes(r: &Probe, what: &str) {
+/// 寸法の答えが子へ見せている TIOCGWINSZ と一致する（`want` = 行・列・幅 px・高さ px の前提）
+fn assert_sizes(r: &Probe, what: &str, want: (u32, u32, u32, u32)) {
     let (rows, cols, xpix, ypix) = r.winsize();
-    assert_eq!(
-        (rows, cols, xpix, ypix),
-        (30, 100, 900, 540),
-        "{what}: 前提の寸法"
-    );
+    assert_eq!((rows, cols, xpix, ypix), want, "{what}: 前提の寸法");
     assert_eq!(r.reply("csi14t"), format!("^[[4;{ypix};{xpix}t"), "{what}");
     assert_eq!(r.reply("csi18t"), format!("^[[8;{rows};{cols}t"), "{what}");
+}
+
+/// 最初の寸法（[`Pane::spawn`] の 100 列 × 30 行・セル 9 × 18 px）
+const FIRST: (u32, u32, u32, u32) = (30, 100, 900, 540);
+
+/// [`RESIZED`] の寸法（行・列・幅 px・高さ px）
+fn resized() -> (u32, u32, u32, u32) {
+    let (cols, rows, cw, ch) = RESIZED;
+    (
+        rows as u32,
+        cols as u32,
+        cols as u32 * u32::from(cw),
+        rows as u32 * u32::from(ch),
+    )
 }
 
 #[test]
@@ -288,7 +304,7 @@ fn 直接のペインは色と明暗と寸法に答えosc52には答えない() 
         osc("4;200", Rgb::new(255, 0, 215), false)
     );
     assert_eq!(r.reply("dsr996"), "^[[?997;1n", "ダークのテーマ");
-    assert_sizes(&r, "直接");
+    assert_sizes(&r, "直接", FIRST);
     assert_eq!(r.reply("osc52"), "", "OSC 52 の読み出しには答えない");
     assert_eq!(r.reply("osc4_bad"), "", "範囲外の添字には答えない");
     assert_eq!(r.reply("osc11_bad"), "", "不正な問い合わせには答えない");
@@ -305,6 +321,13 @@ fn 直接のペインは色と明暗と寸法に答えosc52には答えない() 
         !pane.session.color_scheme_updates(),
         "購読していない子（perl）へは知らせない"
     );
+
+    // 境界: ペインの寸法を変えた直後の問い合わせには変えた後の寸法で答える
+    let (cols, rows, cw, ch) = RESIZED;
+    pane.session.resize(cols, rows, cw, ch);
+    touch(dir.path("go3"));
+    let r = pane.probe_result(&dir.path("out3"));
+    assert_sizes(&r, "直接（寸法を変えた直後）", resized());
 }
 
 #[test]
@@ -330,7 +353,7 @@ fn 器越しのペインはtmuxが学んだ色で答えテーマの切り替え�
     assert_eq!(r.reply("osc10"), osc("10", dark.foreground, false));
     assert_eq!(r.reply("osc4_1"), osc("4;1", dark.ansi[1], false));
     assert_eq!(r.reply("dsr996"), "^[[?997;1n");
-    assert_sizes(&r, "器越し");
+    assert_sizes(&r, "器越し", FIRST);
 
     // テーマを切り替える → 購読している tmux へ知らせる → tmux が背景色を問い合わせ直す
     let light = Theme::default_light();
@@ -348,4 +371,26 @@ fn 器越しのペインはtmuxが学んだ色で答えテーマの切り替え�
     );
     assert_eq!(r.reply("osc10"), osc("10", light.foreground, false));
     assert_eq!(r.reply("dsr996"), "^[[?997;2n");
+
+    // 境界: ペインの寸法を変えた直後。tmux が中のペインを変えたことを tmux 自身に尋ねて待つ
+    let (cols, rows, cw, ch) = RESIZED;
+    pane.session.resize(cols, rows, cw, ch);
+    let want = format!("{cols}x{rows}");
+    pane.wait_until("tmux の中のペインの寸法の追従", |_| {
+        std::process::Command::new(tako_core::tmux::tmux_bin())
+            .args([
+                "-L",
+                &server.0,
+                "display",
+                "-p",
+                "-t",
+                "q2350",
+                "#{pane_width}x#{pane_height}",
+            ])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == want)
+    });
+    touch(dir.path("go3"));
+    let r = pane.probe_result(&dir.path("out3"));
+    assert_sizes(&r, "器越し（寸法を変えた直後）", resized());
 }

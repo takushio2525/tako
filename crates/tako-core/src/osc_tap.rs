@@ -225,15 +225,11 @@ fn parse_osc(payload: &[u8]) -> Option<OscEvent> {
 fn parse_private_csi(params: &[u8], fin: u8, out: &mut Vec<OscEvent>) {
     let mut params = params.split(|&b| b == b';');
     match fin {
-        b'h' | b'l' => {
-            if params.any(|p| p == b"2031") {
-                out.push(OscEvent::ColorSchemeUpdates(fin == b'h'));
-            }
+        b'h' | b'l' if params.any(|p| p == b"2031") => {
+            out.push(OscEvent::ColorSchemeUpdates(fin == b'h'));
         }
-        b'n' => {
-            if params.next() == Some(b"996") && params.next().is_none() {
-                out.push(OscEvent::ColorSchemeQuery);
-            }
+        b'n' if params.next() == Some(b"996") && params.next().is_none() => {
+            out.push(OscEvent::ColorSchemeQuery);
         }
         _ => {}
     }
