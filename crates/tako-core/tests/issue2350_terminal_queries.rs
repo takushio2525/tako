@@ -330,9 +330,37 @@ fn 直接のペインは色と明暗と寸法に答えosc52には答えない() 
     assert_sizes(&r, "直接（寸法を変えた直後）", resized());
 }
 
+/// tmux がライト / ダークの通知（mode 2031）を扱う版か（3.6 以上。tako が確かめたのは 3.6b の
+/// `tty_start_tty` の購読と `server_client_report_theme` の問い合わせ直し）。読めなければ偽
+fn tmux_handles_theme_reports() -> bool {
+    let Ok(out) = std::process::Command::new(tako_core::tmux::tmux_bin())
+        .arg("-V")
+        .output()
+    else {
+        return false;
+    };
+    // `tmux 3.6b` / `tmux next-3.7` の数字の部分（major.minor）
+    let text = String::from_utf8_lossy(&out.stdout);
+    let digits: String = text
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = digits.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    (major, minor) >= (3, 6)
+}
+
 #[test]
 fn 器越しのペインはtmuxが学んだ色で答えテーマの切り替えに追従する() {
     if !tako_core::tmux_test_gate::container() {
+        return;
+    }
+    if !tmux_handles_theme_reports() {
+        // CI（TAKO_TEST_REQUIRE_TMUX）では skip が panic になる = 古い tmux を黙って通さない
+        tako_core::tmux_test_gate::skip(
+            "tmux 3.6 より前はライト / ダークの通知（mode 2031）を購読しない",
+        );
         return;
     }
     let dir = TempDir::new("tmux");
