@@ -38,10 +38,15 @@ check() { if [ "$2" = 1 ]; then pass "$1"; else fail "$1"; fi; }
 TMP="$(mktemp -d /tmp/tk2367-XXXX)"
 APP_PID=""
 cleanup() {
-  local p
+  local p name sockdir
   [ -n "$APP_PID" ] && stop_isolated_gui "$APP_PID"
+  # tmux は kill-server の後もソケットファイルを残すことがあるので、自分の名前のものは消す
+  sockdir="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
   for p in "$TMP"/*/tmux; do
-    [ -f "$p" ] && tmux -L "$(cat "$p")" kill-server >/dev/null 2>&1
+    [ -f "$p" ] || continue
+    name=$(cat "$p")
+    tmux -L "$name" kill-server >/dev/null 2>&1
+    rm -f "${sockdir:?}/${name:?}" "${sockdir:?}/${name:?}="
   done
   rm -rf "${TMP:?}"
 }
